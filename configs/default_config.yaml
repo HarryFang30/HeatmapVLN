@@ -1,0 +1,262 @@
+# VLN Project Configuration
+# Comprehensive configuration for first-person inter-frame heatmap generation
+
+# ============================================================================
+# Model Architecture Configuration
+# ============================================================================
+
+# DINOv3 Spatial Encoder (2D Path - processes only selected keyframes)
+dinov3:
+  model_name: "dinov3_vit_large"  # Options: dinov3_vit_base, dinov3_vit_large, dinov3_vit_giant
+  patch_size: 14
+  img_size: 518
+  embed_dim: 1024
+  freeze_backbone: true
+  pretrained: true
+
+# VGGT Spatial Encoder (3D Path - processes all frames for geometry extraction)
+vggt:
+  img_size: 518
+  patch_size: 14
+  embed_dim: 1024
+  geometry_head: true  # Enable geometry prediction head for space-aware sampling
+  camera_head: true   # Camera pose estimation
+  depth_head: true    # Depth map generation
+  track_head: true    # Tracking capabilities
+
+# LLM Backbone (Spatial-MLLM based)
+llm:
+  model_name: "./models/qwen_2.5_vl"
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  max_new_tokens: 1024
+  temperature: 0.1
+  top_p: 0.001
+  use_cache: true
+  trust_remote_code: true
+
+# ============================================================================
+# Video Processing & Frame Sampling Configuration
+# ============================================================================
+
+# Video processing parameters
+video:
+  total_frames: 32      # N_m frames - total input frames
+  keyframes: 16         # N_k frames - selected keyframes via space-aware sampling
+  frame_size: [224, 224]  # Resize frames to this size
+  fps: 30
+  max_duration: 10      # Maximum video duration in seconds
+  preprocessing:
+    normalize: true
+    mean: [0.485, 0.456, 0.406]  # ImageNet normalization
+    std: [0.229, 0.224, 0.225]
+
+# Space-aware frame sampling (CRITICAL - TO BE IMPLEMENTED)
+frame_sampling:
+  method: "spatial_novelty"  # Options: spatial_novelty, uniform, adaptive, geometry_based
+  novelty_threshold: 0.5     # Spatial novelty threshold for keyframe selection
+  temporal_window: 8         # Temporal context window for sampling decisions
+  spatial_grid_size: 7       # Grid size for spatial analysis
+  geometry_weight: 0.7       # Weight for geometry-based sampling
+  semantic_weight: 0.3       # Weight for semantic-based sampling
+  camera_pose_weight: 0.8    # Weight for camera pose changes in sampling
+  depth_change_weight: 0.6   # Weight for depth map changes
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+
+training:
+  batch_size: 4
+  learning_rate: 1e-4
+  num_epochs: 100
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  accumulation_steps: 4
+  weight_decay: 1e-4
+  optimizer: "AdamW"
+  scheduler: "cosine"
+  
+  # Multi-stage training
+  stages:
+    - name: "pretraining"
+      epochs: 30
+      focus: "heatmap_generation"
+      freeze_llm: true
+    - name: "finetuning"
+      epochs: 70
+      focus: "spatial_reasoning"
+      freeze_llm: false
+
+# Loss function weights
+loss:
+  heatmap_loss_weight: 1.0           # Primary heatmap generation loss
+  spatial_consistency_weight: 0.5    # Spatial consistency across frames
+  temporal_consistency_weight: 0.3   # Temporal consistency in heatmaps
+  llm_loss_weight: 1.0               # LLM language modeling loss
+  cross_frame_projection_weight: 0.8 # Inter-frame spatial projection loss
+  geometry_alignment_weight: 0.4     # Geometry-semantic alignment loss
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+
+data:
+  train_data_path: "/path/to/train/data"
+  val_data_path: "/path/to/val/data"
+  test_data_path: "/path/to/test/data"
+  cache_dir: "/path/to/cache"
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+
+# Data preprocessing
+preprocessing:
+  normalize: true
+  augmentation: true
+  resize_method: "bilinear"
+  random_crop: true
+  horizontal_flip: 0.5
+  color_jitter: 0.2
+
+# ============================================================================
+# Heatmap Generation Configuration
+# ============================================================================
+
+heatmap:
+  target_size: [224, 224]
+  sigma: 5.0                    # Gaussian kernel standard deviation
+  num_views: 3                  # Number of camera viewpoints for multi-view heatmaps
+  upsampling_method: "graph"    # Options: graph, bilinear, bicubic (TO BE IMPLEMENTED)
+  visualization: true
+  save_intermediate: false
+  multi_scale: true             # Enable multi-scale heatmap generation
+  scales: [2.0, 5.0, 10.0]     # Multiple sigma values for multi-scale
+  
+  # First-person inter-frame heatmap specific settings
+  inter_frame:
+    enable: true                # Enable cross-frame spatial projection
+    projection_method: "3d_transform"  # Method for viewpoint transformation
+    confidence_threshold: 0.3   # Confidence threshold for projections
+    temporal_window: 8          # Frames to consider for cross-frame projection
+    spatial_memory_size: 32     # Size of spatial memory buffer
+
+# ============================================================================
+# Feature Processing Configuration
+# ============================================================================
+
+# MLP configuration for token transformation
+mlp:
+  hidden_dims: [2048, 1024, 512]  # MLP layer dimensions
+  dropout: 0.1
+  activation: "ReLU"
+  layer_norm: true
+
+# Feature fusion configuration
+feature_fusion:
+  fusion_method: "concat"      # Options: concat, add, attention, gated
+  output_dim: 1024            # Fused feature dimension
+  normalize: true
+  dropout: 0.1
+
+# 3D/2D codec processing
+codecs:
+  enable_2d: true             # Enable 2D codec processing
+  enable_3d: true             # Enable 3D feature processing
+  compression_ratio: 0.5      # Feature compression ratio
+
+# ============================================================================
+# Evaluation & Benchmarking Configuration
+# ============================================================================
+
+evaluation:
+  benchmarks: ["RLBench", "COLOSSEUM", "GemBench", "VSI-Bench"]
+  metrics: ["success_rate", "spatial_accuracy", "temporal_consistency", "inter_frame_accuracy"]
+  save_predictions: true
+  save_heatmaps: true
+  save_visualizations: true
+  
+  # Evaluation specific settings
+  eval_batch_size: 1          # Batch size for evaluation
+  num_eval_episodes: 100      # Number of episodes per benchmark
+  confidence_analysis: true   # Analyze prediction confidence
+  error_analysis: true        # Detailed error analysis
+
+# ============================================================================
+# System Configuration
+# ============================================================================
+
+system:
+  device: "cuda"
+  num_gpus: 1
+  distributed: false
+  mixed_precision: true
+  compile_model: false
+  deterministic: false        # Set to true for reproducible results
+  benchmark: true             # Enable cudnn benchmark for performance
+  
+  # Memory management
+  memory_efficient: true
+  gradient_checkpointing: false
+  max_memory_gb: 24          # Maximum GPU memory usage
+
+# Logging configuration
+logging:
+  level: "INFO"
+  save_dir: "./logs"
+  experiment_name: "vln_spatial_mllm"
+  wandb_project: "vln-spatial-mllm"
+  wandb_entity: null
+  log_interval: 10           # Log every N steps
+  save_interval: 1000        # Save checkpoint every N steps
+  eval_interval: 5000        # Evaluate every N steps
+  
+  # What to log
+  log_gradients: false
+  log_weights: false
+  log_activations: false
+  log_heatmaps: true         # Log generated heatmaps
+
+# ============================================================================
+# Paths and Directories
+# ============================================================================
+
+paths:
+  project_root: "."
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  visualization_dir: "./visualizations"
+  results_dir: "./results"
+  
+  # Model paths - LOCAL MODELS
+  dinov3_model_path: "./models/dinov3"
+  vggt_model_path: "./models/vggt"
+  llm_model_path: "./models/qwen_2.5_vl"
+
+# ============================================================================
+# Debugging and Development
+# ============================================================================
+
+debug:
+  enabled: false
+  verbose: false
+  save_intermediate_features: false
+  profile_memory: false
+  profile_time: false
+  visualize_sampling: false   # Visualize space-aware sampling decisions
+  check_nan_inf: true        # Check for NaN/Inf values
+
+# Reproducibility
+seed: 42
+deterministic: true
+
+# ============================================================================
+# Experimental Features (TO BE IMPLEMENTED)
+# ============================================================================
+
+experimental:
+  attention_visualization: false     # Visualize attention patterns
+  spatial_reasoning_analysis: false # Analyze LLM spatial reasoning
+  cross_modal_alignment: false      # Cross-modal feature alignment analysis
+  temporal_modeling: false          # Advanced temporal modeling
+  uncertainty_estimation: false     # Uncertainty quantification

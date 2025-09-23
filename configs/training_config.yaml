@@ -1,0 +1,309 @@
+# VLN项目专用训练配置文件
+# 基于BridgeVLA架构，适配Frame-Indexed Heatmap生成
+
+# ================================
+# 两阶段训练策略
+# ================================
+training_stages:
+  # 阶段1: Spatial-Semantic Pretraining
+  pretrain:
+    stage_name: "spatial_semantic_pretrain"
+    objective: "学习3D空间关系和2D语义特征对应"
+    epochs: 50
+    learning_rate: 1e-4
+    batch_size: 8
+    data_type: "detection_spatial_data"  # 检测+空间标注数据
+    loss_weights:
+      heatmap_loss: 1.0
+      spatial_consistency: 0.5
+      cross_frame_alignment: 0.3
+
+  # 阶段2: VLN Task Finetuning
+  finetune:
+    stage_name: "vln_task_finetune"
+    objective: "端到端VLN导航和帧索引热力图生成"
+    epochs: 100
+    learning_rate: 5e-5
+    batch_size: 4
+    data_type: "vln_navigation_data"
+    loss_weights:
+      frame_indexed_heatmap: 1.0
+      navigation_accuracy: 0.8
+      temporal_consistency: 0.6
+      spatial_reasoning: 0.4
+
+# ================================
+# 网络架构配置
+# ================================
+model_architecture:
+  # LLM Backbone (基于Spatial-MLLM)
+  llm_backbone:
+    model_name: "Qwen2.5-VL-7B"
+    torch_dtype: "bfloat16"
+    attn_implementation: "eager"  # Turing GPU兼容
+    max_new_tokens: 1024
+
+  # 空间编码器配置
+  spatial_encoders:
+    # VGGT (3D编码器)
+    vggt:
+      model_type: "vggt_large"
+      embed_dim: 1024
+      patch_size: 14
+      img_size: 518
+      freeze_backbone: false  # 允许微调
+
+    # DINOv3 (2D编码器)
+    dinov3:
+      model_name: "dinov3_vit_large"
+      embed_dim: 1024
+      patch_size: 14
+      img_size: 518
+      freeze_backbone: true   # 冻结预训练权重
+
+  # 特征融合
+  feature_fusion:
+    fusion_method: "concatenation"  # 3D+2D特征拼接
+    fusion_dim: 2048               # 1024(VGGT) + 1024(DINOv3)
+    mlp_hidden_dim: 1024
+    output_dim: 1024               # 与LLM维度对齐
+
+  # 热力图生成模块 (参考BridgeVLA ConvexUpSample)
+  heatmap_generator:
+    upsampling_method: "convex_upsample"
+    in_dim: 1024                   # LLM hidden size
+    out_dim: 1                     # 单通道热力图
+    up_ratio: 14                   # 16x16 → 224x224
+    gaussian_sigma: 5.0
+    threshold_sigma_times: 3
+
+# ================================
+# 视频处理和帧采样
+# ================================
+video_processing:
+  # 帧采样策略
+  frame_sampling:
+    total_frames: 32               # N_m 总帧数
+    keyframes: 16                  # N_k 选择的关键帧
+    sampling_algorithm: "enhanced_submodular"  # 使用增强算法
+    spatial_coverage_weight: 0.4
+    temporal_diversity_weight: 0.3
+    semantic_novelty_weight: 0.3
+
+  # 帧处理配置
+  frame_processing:
+    frame_size: [224, 224]
+    fps: 30
+    normalize: true
+    augmentation: true
+
+# ================================
+# 损失函数设计 (基于BridgeVLA经验)
+# ================================
+loss_functions:
+  # 预训练阶段损失
+  pretrain_losses:
+    # 高斯热力图损失 (参考BridgeVLA)
+    gaussian_heatmap_loss:
+      loss_type: "cross_entropy"
+      weight: 1.0
+      sigma: 5.0
+
+    # 空间一致性损失
+    spatial_consistency_loss:
+      loss_type: "mse"
+      weight: 0.5
+
+    # 跨帧对齐损失
+    cross_frame_alignment_loss:
+      loss_type: "cosine_similarity"
+      weight: 0.3
+
+  # 微调阶段损失
+  finetune_losses:
+    # 帧索引热力图损失 (核心创新)
+    frame_indexed_heatmap_loss:
+      loss_type: "multi_frame_cross_entropy"
+      weight: 1.0
+      num_keyframes: 16
+      target_distinctness: 0.8  # 确保不同帧的热力图差异性
+
+    # 导航准确性损失
+    navigation_accuracy_loss:
+      loss_type: "action_prediction_loss"
+      weight: 0.8
+
+    # 时间一致性损失
+    temporal_consistency_loss:
+      loss_type: "temporal_smoothness"
+      weight: 0.6
+      window_size: 4
+
+    # 空间推理损失
+    spatial_reasoning_loss:
+      loss_type: "spatial_relationship_loss"
+      weight: 0.4
+
+# ================================
+# 数据集和预处理
+# ================================
+datasets:
+  # 预训练数据集
+  pretrain_data:
+    # 检测数据 (参考BridgeVLA RoboPoint)
+    detection_data:
+      format: "coco_detection"
+      annotation_type: "bbox_with_spatial_context"
+      augmentation:
+        geometric: true
+        photometric: true
+        spatial_transform: true
+
+    # 空间标注数据
+    spatial_data:
+      format: "3d_spatial_annotations"
+      annotation_type: "camera_pose_depth_objects"
+
+  # 微调数据集
+  finetune_data:
+    # VLN导航数据
+    vln_data:
+      datasets: ["R2R", "REVERIE", "SOON"]
+      format: "instruction_video_trajectory"
+      annotation_type: "step_by_step_navigation"
+
+    # 帧索引标注数据 (新数据类型)
+    frame_indexed_data:
+      format: "video_with_frame_correspondence"
+      annotation_type: "cross_frame_spatial_mapping"
+
+# ================================
+# 训练优化策略
+# ================================
+optimization:
+  # 优化器配置
+  optimizer:
+    type: "AdamW"
+    learning_rate: 1e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  # 学习率调度
+  lr_scheduler:
+    type: "cosine_annealing"
+    warmup_steps: 1000
+    max_steps: 50000
+    min_lr: 1e-6
+
+  # 梯度管理
+  gradient:
+    clip_norm: 1.0
+    accumulation_steps: 4
+
+  # 正则化
+  regularization:
+    dropout: 0.1
+    layer_norm: true
+    weight_decay: 0.01
+
+# ================================
+# 多GPU和分布式训练
+# ================================
+distributed_training:
+  # GPU分配策略 (基于现有硬件)
+  gpu_allocation:
+    num_gpus: 4
+    device_mapping:
+      vggt: "cuda:0"      # VGGT → GPU 0
+      dinov3: "cuda:1"    # DINOv3 → GPU 1
+      llm: "cuda:2,3"     # LLM → GPU 2,3 (模型并行)
+
+  # 分布式策略
+  distributed_strategy:
+    backend: "nccl"
+    find_unused_parameters: true
+    gradient_as_bucket_view: true
+
+  # 内存优化
+  memory_optimization:
+    gradient_checkpointing: true
+    mixed_precision: true
+    dynamic_loss_scaling: true
+    model_offloading: true  # 动态加载/卸载
+
+# ================================
+# 监控和日志
+# ================================
+monitoring:
+  # 训练监控
+  wandb:
+    project: "vln_frame_indexed_heatmaps"
+    entity: "spatial_reasoning_lab"
+    tags: ["vln", "heatmap", "spatial_reasoning"]
+
+  # 指标跟踪
+  metrics:
+    train_metrics:
+      - "total_loss"
+      - "heatmap_loss"
+      - "spatial_consistency"
+      - "frame_distinctness"
+    eval_metrics:
+      - "navigation_success_rate"
+      - "heatmap_accuracy"
+      - "spatial_reasoning_score"
+      - "temporal_consistency"
+
+  # 检查点保存
+  checkpointing:
+    save_frequency: 10  # 每10个epoch保存
+    keep_last_n: 5      # 保留最后5个检查点
+    save_best: true     # 保存最优模型
+
+# ================================
+# 评估和基准测试
+# ================================
+evaluation:
+  # 评估数据集
+  eval_datasets:
+    - "RLBench"
+    - "COLOSSEUM"
+    - "GemBench"
+    - "VSI-Bench"
+
+  # 评估指标
+  eval_metrics:
+    navigation:
+      - "success_rate"
+      - "path_efficiency"
+      - "collision_rate"
+    heatmap_quality:
+      - "frame_distinctness"  # 核心指标：不同帧热力图的差异性
+      - "spatial_accuracy"
+      - "temporal_consistency"
+    spatial_reasoning:
+      - "cross_frame_alignment"
+      - "3d_understanding_score"
+      - "viewpoint_invariance"
+
+  # 评估频率
+  eval_frequency:
+    during_training: 5   # 每5个epoch评估一次
+    final_evaluation: true
+
+# ================================
+# 实验和消融研究
+# ================================
+ablation_studies:
+  # 关键组件消融
+  component_ablation:
+    - "without_space_aware_sampling"
+    - "without_dinov3_integration"
+    - "without_frame_indexed_loss"
+    - "without_spatial_consistency"
+
+  # 算法比较
+  algorithm_comparison:
+    - "uniform_sampling_vs_space_aware"
+    - "single_encoder_vs_dual_encoder"
+    - "standard_heatmap_vs_frame_indexed"

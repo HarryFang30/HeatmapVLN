@@ -1,0 +1,6 @@
+{
+  "instruction": "You are a robot exploring a new indoor environment. Look around and identify where you would need to turn or move to reach different areas visible in other camera angles from your current position.",
+  "task_type": "navigation",
+  "difficulty": "intermediate",
+  "expected_outputs": ["spatial_heatmap", "navigation_waypoints"]
+}

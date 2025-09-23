@@ -1,0 +1,40 @@
+# VLN Pipeline Test Configuration
+# ================================
+
+# Video Processing
+video:
+  max_frames: 8
+  target_size: [224, 224]
+  device: "cuda"
+
+# Model Configuration
+model:
+  dinov3_model_size: "base"  # base, large, giant
+  target_keyframes: 4
+  img_size: 224
+  verbose: true
+
+# Test Videos (searched in multiple locations by path resolution)
+test_videos:
+  official_test: "test.mp4"
+  kitchen_scene: "kitchen.mp4"
+
+# Test Instructions (relative to tests/instructions/)
+test_instructions:
+  basic_navigation: "navigation_basic.txt"
+  detailed_exploration: "exploration_detailed.txt"
+
+# Output Settings
+output:
+  save_visualizations: true
+  save_metadata: true
+  save_intermediate: false
+  output_format: "png"
+  dpi: 150
+
+# Test Settings
+testing:
+  run_multiple_tests: true
+  compare_results: true
+  validate_outputs: true
+  timeout_seconds: 300

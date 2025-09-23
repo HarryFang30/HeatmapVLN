@@ -1,0 +1,92 @@
+# VLN Project Requirements - First-Person Inter-Frame Heatmap Generation
+# Updated with actual installed versions from working environment
+
+# ============================================================================
+# Core PyTorch & Deep Learning (Verified working versions)
+# ============================================================================
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+transformers==4.51.3
+accelerate==1.5.2
+flash-attn==2.5.8
+einops==0.8.1
+safetensors==0.6.2
+tokenizers==0.21.4
+
+# ============================================================================
+# Scientific Computing & Data Processing
+# ============================================================================
+numpy==2.2.2
+scipy==1.16.1
+pandas==2.3.2
+scikit-learn==1.7.1
+
+# ============================================================================
+# Computer Vision & Media Processing
+# ============================================================================
+opencv-python==4.12.0.88
+pillow==11.0.0
+decord==0.6.0
+
+# ============================================================================
+# Visualization & Heatmap Generation
+# ============================================================================
+matplotlib==3.10.6
+seaborn==0.13.2
+
+# ============================================================================
+# ML/AI Model Utilities
+# ============================================================================
+huggingface-hub==0.34.4
+qwen-vl-utils==0.0.11
+
+# ============================================================================
+# Configuration & Experiment Management
+# ============================================================================
+omegaconf==2.3.0
+wandb==0.21.3
+pyyaml==6.0.2
+
+# ============================================================================
+# Utilities & Development
+# ============================================================================
+tqdm==4.67.1
+click==8.1.8
+requests==2.32.3
+pydantic==2.11.7
+pytest==8.4.1
+
+# ============================================================================
+# System & Performance
+# ============================================================================
+psutil==6.1.1
+
+# ============================================================================
+# Additional Dependencies (from environment scan)
+# ============================================================================
+av==15.1.0
+GitPython==3.1.45
+jsonschema==4.23.0
+protobuf==6.32.0
+
+# ============================================================================
+# Installation Instructions
+# ============================================================================
+# 1. Create conda environment:
+#    conda create -n VLN python=3.10 -y
+#    conda activate VLN
+#
+# 2. Install PyTorch with CUDA 12.4 support first:
+#    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#
+# 3. Install flash attention (may need special handling):
+#    pip install flash-attn==2.5.8 --no-build-isolation
+#
+# 4. Install remaining requirements:
+#    pip install -r requirements.txt
+#
+# 5. Verify installation:
+#    python -c "import torch; print(f'PyTorch {torch.__version__} with CUDA {torch.version.cuda}')"
+#
+# Note: All versions tested and verified working in VLN environment

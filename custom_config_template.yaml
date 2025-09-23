@@ -1,0 +1,19 @@
+_template_info:
+  algorithm_type: enhanced_submodular
+  description: Configuration template for enhanced_submodular
+  usage: Modify the parameters below and save as your custom config
+algorithm_params:
+  coverage_weight: 0.4
+  diversity_weight: 0.3
+  optimization_method: submodular
+  temporal_weight: 0.2
+  uncertainty_weight: 0.1
+algorithm_type: enhanced_submodular
+candidate_frames: 128
+description: Advanced multi-objective submodular optimization
+device: cuda
+memory_limit_gb: null
+name: Enhanced Multi-Objective Submodular
+target_frames: 16
+timeout_seconds: null
+version: '1.0'

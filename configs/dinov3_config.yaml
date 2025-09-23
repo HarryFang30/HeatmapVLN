@@ -1,0 +1,152 @@
+# DINOv3 Integration Configuration
+# Similar to Spatial-MLLM's configuration but adapted for DINOv3
+
+model:
+  name: "dinov3_integrated"
+  
+  # DINOv3 backbone configuration
+  backbone:
+    dinov3_model: "dinov3_vitl14"  # Options: dinov3_vits16, dinov3_vitb16, dinov3_vitl16, dinov3_vitg16, dinov3_vitl14
+    img_size: 518
+    patch_size: 14
+    embed_dim: 1024
+    depth: 24
+    num_heads: 16
+    n_storage_tokens: 4  # DINOv3's storage tokens (similar to DINOv2's register tokens)
+    pretrained: true
+    weights_path: null  # Path to custom weights if needed
+    
+    # Advanced DINOv3 parameters
+    qkv_bias: true
+    drop_path_rate: 0.0
+    layerscale_init: null
+    norm_layer: "layernorm"  # Options: layernorm, rmsnorm
+    ffn_layer: "mlp"  # Options: mlp, swiglu
+    
+  # Aggregator configuration (for multi-frame processing)
+  aggregator:
+    enabled: true
+    aa_order: ["frame", "global"]  # Alternating attention order
+    aa_block_size: 1
+    qk_norm: true
+    rope_freq: 100  # Base frequency for RoPE
+    init_values: 0.01
+    
+  # Processing configuration
+  processing:
+    use_checkpoint: false  # Gradient checkpointing
+    multi_frame: true  # Enable multi-frame processing
+    max_frames: 8  # Maximum number of frames to process
+
+# Training configuration
+training:
+  batch_size: 4
+  learning_rate: 1e-4
+  warmup_steps: 1000
+  max_steps: 100000
+  
+  # Optimizer
+  optimizer:
+    type: "adamw"
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    
+  # Scheduler
+  scheduler:
+    type: "cosine"
+    warmup_steps: 1000
+    
+  # Mixed precision
+  mixed_precision: true
+  
+  # Gradient clipping
+  gradient_clip_norm: 1.0
+
+# Data configuration  
+data:
+  # Image preprocessing
+  image_size: [518, 518]
+  mean: [0.485, 0.456, 0.406]  # ImageNet normalization
+  std: [0.229, 0.224, 0.225]
+  
+  # Augmentation
+  augmentation:
+    random_crop: true
+    horizontal_flip: true
+    color_jitter: true
+    random_resize: true
+    
+  # Multi-frame settings (if applicable)
+  sequence_length: 4
+  frame_sampling: "uniform"  # Options: uniform, random
+
+# Evaluation configuration
+evaluation:
+  batch_size: 8
+  metrics: ["accuracy", "f1_score"]
+  
+# Hardware configuration
+hardware:
+  device: "cuda"
+  num_gpus: 1
+  distributed: false
+  
+# Logging
+logging:
+  level: "INFO"
+  log_dir: "./logs"
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: "dinov3_integration"
+    
+# Model variants for different use cases
+variants:
+  # Lightweight variant for fast inference
+  lightweight:
+    backbone:
+      dinov3_model: "dinov3_vits16"
+      img_size: 224
+      patch_size: 16
+      embed_dim: 384
+      depth: 12
+      num_heads: 6
+      n_storage_tokens: 0
+    aggregator:
+      enabled: false
+      
+  # High-performance variant for best accuracy  
+  high_performance:
+    backbone:
+      dinov3_model: "dinov3_vitg16"
+      img_size: 518
+      patch_size: 16
+      embed_dim: 1536
+      depth: 40
+      num_heads: 24
+      n_storage_tokens: 8
+    aggregator:
+      enabled: true
+      aa_order: ["frame", "global", "frame"]
+      rope_freq: 200
+      
+  # Video processing variant
+  video:
+    backbone:
+      dinov3_model: "dinov3_vitl16"
+      img_size: 224
+      patch_size: 16
+      embed_dim: 1024
+      depth: 24
+      num_heads: 16
+      n_storage_tokens: 4
+    aggregator:
+      enabled: true
+      aa_order: ["frame", "global"]
+    processing:
+      multi_frame: true
+      max_frames: 16
+    data:
+      sequence_length: 16
+      frame_sampling: "temporal"
