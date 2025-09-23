@@ -15,9 +15,6 @@ Architecture Pipeline (✅ FULLY WORKING):
 3. Qwen2.5-VL LLM - 空间推理和多模态理解
 4. Frame-Indexed Heatmap Generation - 每个关键帧的独特空间映射
 
-作者：VLN团队
-版本：2.0 - Production Ready
-更新：2025年1月 - 基于完整验证的pipeline实现
 """
 
 import argparse
