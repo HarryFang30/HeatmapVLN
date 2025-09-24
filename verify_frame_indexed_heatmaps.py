@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/conda/bin/python python3
 """
 Frame-Indexed Heatmap Verification Script
 ==========================================
