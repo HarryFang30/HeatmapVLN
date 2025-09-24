@@ -1,20 +1,53 @@
-# VLN训练完整指南 - 基于实际代码实现
-# Vision-Language Navigation with LLM-Enhanced Spatial Understanding
+# VLN帧索引热力图训练方法与数据采集整合方案
+## 基于Habitat仿真的完整训练管道设计
 
-## 1. 实际训练架构概述
+---
 
-### 1.1 核心创新
-本项目基于实际代码实现了多阶段VLN训练系统，包括：
+## **1. 整体架构与设计理念** 🏗️
+
+### **核心设计原则**
+
+**数据-训练-评估三位一体**：构建从数据采集到模型训练再到效果评估的完整闭环系统，确保每个环节紧密配合，优化整体性能。
+
+### **1.1 项目核心创新**
+本项目实现了基于Habitat仿真环境的完整VLN训练系统：
 - **真实LLM集成**: Qwen2.5-VL模型的多GPU分布式处理
+- **智能数据采集**: 基于Habitat仿真的大规模数据生成
 - **空间感知帧采样**: 基于VGGT几何信息的智能关键帧选择
 - **帧索引热力图生成**: 显示每个关键帧在当前视角中的空间位置
-- **多阶段训练流程**: 预训练→微调→端到端优化
+- **自适应训练策略**: 数据质量驱动的动态训练调整
 
-### 1.2 训练目标
-**终极目标**: 生成frame-indexed heatmaps，每个关键帧对应一个独特的空间热力图
+### **1.2 终极训练目标**
+**核心目标**: 生成frame-indexed heatmaps，每个历史帧生成独特热力图显示其在当前视角的空间位置
 
-**输入**: 视频序列 + VLN指令文本
-**输出**: 每个关键帧的空间热力图，显示该帧内容在当前观察中的位置
+**输入**: 视频序列 + VLN指令文本 + Habitat环境几何信息
+**输出**: 每个关键帧的空间热力图，展示跨帧空间关系理解能力
+
+### **1.3 完整训练管道概览**
+
+```python
+class IntegratedVLNTrainingPipeline:
+    """
+    VLN帧索引热力图完整训练管道
+
+    核心创新：
+    1. Habitat数据采集与训练目标深度对齐
+    2. 多层次损失函数与分层数据采集策略匹配
+    3. 自监督+弱监督混合训练模式
+    4. 实时质量监控与自适应调整
+    """
+
+    def __init__(self):
+        # === 核心组件初始化 ===
+        self.habitat_data_collector = HabitatSpatialDataCollector()  # Habitat数据采集器
+        self.loss_function = VLNSpatialHeatmapLoss()                 # 多层次损失函数
+        self.training_scheduler = AdaptiveTrainingScheduler()         # 自适应训练调度
+        self.quality_monitor = IntegratedQualityMonitor()            # 质量监控系统
+
+        # === 训练-数据适配映射 ===
+        self.loss_data_mapping = self._build_loss_data_mapping()
+        self.training_phases = self._design_training_phases()
+```
 
 ## 2. 实际训练脚本架构
 
