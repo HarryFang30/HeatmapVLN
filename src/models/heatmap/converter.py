@@ -5,7 +5,7 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Union
 
 from .upsampling import ConvexUpSample
 
@@ -413,6 +413,57 @@ class LLMToHeatmapConverter(nn.Module):
 
         return frame_heatmaps
 
+
+class FrameIndexedHeatmapConverter(LLMToHeatmapConverter):
+    """Compatibility wrapper that exposes the original FrameIndexed interface."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 1024,
+        output_size: Tuple[int, int] = (224, 224),
+        patch_size: int = 16,
+        enable_inter_frame_fusion: bool = True,
+        **kwargs,
+    ) -> None:
+        if isinstance(output_size, tuple):
+            if len(output_size) != 2:
+                raise ValueError("output_size must be a tuple of length 2")
+            if output_size[0] != output_size[1]:
+                raise ValueError("FrameIndexedHeatmapConverter requires square output_size")
+            target_size = output_size[0]
+        else:
+            target_size = int(output_size)
+            output_size = (target_size, target_size)
+
+        super().__init__(
+            vlm_dim=hidden_dim,
+            patch_size=patch_size,
+            target_size=target_size,
+            enable_inter_frame_fusion=enable_inter_frame_fusion,
+            **kwargs,
+        )
+        self.hidden_dim = hidden_dim
+        self.output_size = output_size
+
+    def convert(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        keyframe_indices: Optional[List[int]] = None,
+        current_obs_frame: Optional[int] = None,
+    ) -> Union[torch.Tensor, Dict[int, torch.Tensor]]:
+        """Convenience helper mirroring legacy converter behavior."""
+
+        if keyframe_indices is None:
+            heatmaps = super().forward(hidden_states, attention_mask, num_views=1)
+            return heatmaps.squeeze(1)
+
+        return self.generate_frame_indexed_heatmaps(
+            hidden_states,
+            attention_mask,
+            keyframe_indices,
+            current_obs_frame=current_obs_frame,
+        )
 
 if __name__ == "__main__":
     print("Testing LLMToHeatmapConverter...")

@@ -10,7 +10,7 @@
 # - Visualization tools: Comprehensive plotting and analysis utilities
 
 from .upsampling import ConvexUpSample
-from .converter import LLMToHeatmapConverter
+from .converter import LLMToHeatmapConverter, FrameIndexedHeatmapConverter
 from .generator import (
     generate_hm_from_pt, 
     generate_target_heatmap_from_annotation,
@@ -45,7 +45,8 @@ __author__ = "Adapted from BridgeVLA"
 __all__ = [
     # Core modules
     "ConvexUpSample",
-    "LLMToHeatmapConverter", 
+    "LLMToHeatmapConverter",
+    "FrameIndexedHeatmapConverter",
     
     # Generation utilities
     "generate_hm_from_pt",

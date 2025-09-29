@@ -30,6 +30,33 @@ from .qwen2_5_vl import (
 logger = logging.getLogger(__name__)
 
 
+class PathResolver:
+    """Utility helper for resolving model and asset paths across environments."""
+
+    def __init__(self, default_paths: Optional[Dict[str, str]] = None) -> None:
+        self._defaults = get_default_model_paths()
+        if default_paths:
+            self._defaults.update(default_paths)
+
+    def resolve(self, path: Optional[str], model_type: str = "model") -> Path:
+        if path:
+            return resolve_model_path(path, model_type)
+
+        if model_type in self._defaults:
+            return resolve_model_path(self._defaults[model_type], model_type)
+
+        raise FileNotFoundError(f"No default path configured for model type '{model_type}'")
+
+    def get_default(self, model_type: str) -> Optional[str]:
+        return self._defaults.get(model_type)
+
+    def available_paths(self) -> Dict[str, str]:
+        return dict(self._defaults)
+
+    def __call__(self, path: Optional[str], model_type: str = "model") -> Path:
+        return self.resolve(path, model_type)
+
+
 @dataclass
 class RealLLMConfig:
     """Configuration for real LLM integration."""

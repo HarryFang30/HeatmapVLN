@@ -348,10 +348,23 @@ class VLNProject:
 
         try:
             # 1. 初始化Spatial-MLLM Pipeline
+            max_frames = self.config.get('video.max_frames', 32)
+            vggt_precision = self.config.get('model.vggt_precision', 'float16')
+            precision_map = {
+                'float16': torch.float16,
+                'fp16': torch.float16,
+                'half': torch.float16,
+                'float32': torch.float32,
+                'fp32': torch.float32
+            }
+            vggt_dtype = precision_map.get(str(vggt_precision).lower(), torch.float16)
+
             spatial_config = SpatialMLLMIntegrationConfig(
                 use_real_llm=self.config.get('model.use_real_llm', True),
                 llm_model_path=self.config.get('model.llm_model_path'),
-                device_allocation=self.config.get('model.device_allocation', {})
+                device_allocation=self.config.get('model.device_allocation', {}),
+                total_frames=max_frames,
+                vggt_compute_dtype=vggt_dtype
             )
             self.spatial_pipeline = SpatialMLLMPipeline(spatial_config)
 
@@ -415,19 +428,48 @@ class VLNProject:
                 for frame in frames
             ]).unsqueeze(0)
 
-            # 通过pipeline处理
-            pipeline_outputs = self.spatial_pipeline.process_batch(
+            current_observation = video_tensor[:, -1]
+
+            pipeline_outputs = self.spatial_pipeline(
                 video_frames=video_tensor,
-                instructions=[instruction],
-                return_heatmaps=True,
-                return_hidden_states=True
+                instruction_text=instruction,
+                current_observation=current_observation,
+                return_intermediate=True,
+                return_heatmaps=True
             )
 
             pipeline_time = self.monitor.end_timer('pipeline_processing')
             self.monitor.record_memory('after_pipeline')
 
-            # 5. 提取结果
-            heatmaps = pipeline_outputs['heatmaps'].cpu().numpy()[0]  # (K, H, W)
+            frame_heatmaps = pipeline_outputs.get('frame_indexed_heatmaps', {}) or {}
+            selected_keyframes = pipeline_outputs.get('selected_keyframes')
+
+            if isinstance(selected_keyframes, torch.Tensor):
+                selected_keyframes = selected_keyframes.detach().cpu().tolist()
+            elif selected_keyframes is None:
+                selected_keyframes = sampled_indices
+            else:
+                selected_keyframes = list(selected_keyframes)
+
+            heatmap_size = self.spatial_pipeline.config.heatmap_size
+            heatmap_collection = []
+
+            for idx in selected_keyframes:
+                heatmap_tensor = frame_heatmaps.get(idx)
+                if heatmap_tensor is None:
+                    fallback_heatmap = pipeline_outputs.get('inter_frame_heatmap')
+                    if fallback_heatmap is not None:
+                        heatmap_tensor = fallback_heatmap.squeeze(1)
+                if heatmap_tensor is None:
+                    heatmap_tensor = torch.zeros(
+                        1,
+                        heatmap_size[0],
+                        heatmap_size[1],
+                        device=video_tensor.device,
+                    )
+                heatmap_collection.append(heatmap_tensor[0].detach().cpu().numpy())
+
+            heatmaps = np.stack(heatmap_collection, axis=0) if heatmap_collection else np.empty((0, *heatmap_size))
 
             # 6. 可视化和保存
             results = {
@@ -435,28 +477,29 @@ class VLNProject:
                 'instruction': instruction,
                 'algorithm_type': algorithm_type,
                 'num_frames': len(frames),
-                'num_keyframes': len(sampled_indices),
-                'keyframe_indices': sampled_indices,
+                'num_keyframes': len(selected_keyframes),
+                'keyframe_indices': selected_keyframes,
                 'heatmaps_shape': heatmaps.shape,
                 'processing_time': {
                     'video_loading': self.monitor.metrics.get('video_loading_duration', 0),
                     'frame_sampling': sampling_time,
                     'pipeline_processing': pipeline_time,
                     'total': self.monitor.end_timer('total_processing')
-                }
+                },
+                'fallback_sampled_indices': sampled_indices
             }
 
             # 保存可视化
             if self.config.get('output.save_heatmaps', True):
                 saved_files = self.visualizer.save_frame_indexed_heatmaps(
-                    frames, sampled_indices, heatmaps,
+                    frames, selected_keyframes, heatmaps,
                     prefix=f"video_{Path(video_path).stem}"
                 )
                 results['saved_heatmaps'] = saved_files
 
             if self.config.get('output.visualization', True):
                 summary_file = self.visualizer.create_summary_visualization(
-                    frames, sampled_indices, heatmaps, results['processing_time']
+                    frames, selected_keyframes, heatmaps, results['processing_time']
                 )
                 results['summary_visualization'] = summary_file
 
@@ -479,14 +522,19 @@ class VLNProject:
         """获取指定的采样算法"""
         try:
             if algorithm_type == 'enhanced':
-                return self.algorithm_factory.create_auto_configured('enhanced')
+                algorithm = self.algorithm_factory.create_auto_configured('enhanced')
             elif algorithm_type == 'quality':
-                return self.algorithm_factory.create_auto_configured('quality')
+                algorithm = self.algorithm_factory.create_auto_configured('quality')
             elif algorithm_type == 'fast':
-                return self.algorithm_factory.create_auto_configured('fast')
+                algorithm = self.algorithm_factory.create_auto_configured('fast')
             else:
                 logger.warning(f"未知算法类型: {algorithm_type}，使用默认enhanced算法")
-                return self.algorithm_factory.create_auto_configured('enhanced')
+                algorithm = self.algorithm_factory.create_auto_configured('enhanced')
+
+            if not hasattr(algorithm, 'sample_frames'):
+                raise AttributeError(f"算法 {getattr(algorithm, 'name', algorithm_type)} 缺少 sample_frames 方法")
+
+            return algorithm
         except Exception as e:
             logger.warning(f"算法初始化失败: {e}，使用简化版本")
             # 使用简化的均匀采样作为后备

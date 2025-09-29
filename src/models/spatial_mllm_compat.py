@@ -77,6 +77,7 @@ class SpatialMLLMIntegrationConfig:
     # Performance settings
     device: str = "cuda"
     dtype: torch.dtype = torch.float32
+    vggt_compute_dtype: torch.dtype = torch.float32
     enable_gradient_checkpointing: bool = False
 
     # Multi-GPU settings
@@ -88,6 +89,15 @@ class SpatialMLLMIntegrationConfig:
     # Debug and logging
     verbose: bool = True
     save_intermediate_features: bool = False
+    device_allocation: Optional[Dict[str, str]] = None
+
+    def __post_init__(self):
+        if self.device_allocation:
+            self.vggt_gpu = self.device_allocation.get('vggt', self.vggt_gpu)
+            self.dinov3_gpu = self.device_allocation.get('dinov3', self.dinov3_gpu)
+            self.llm_gpu = self.device_allocation.get('llm', self.llm_gpu)
+            if 'device' in self.device_allocation:
+                self.device = self.device_allocation['device']
 
 
 class SpatialMLLMPipeline(nn.Module):
@@ -112,7 +122,7 @@ class SpatialMLLMPipeline(nn.Module):
             vggt_model_path = "./models/vggt"
             try:
                 resolved_vggt_path = resolve_model_path(vggt_model_path, "VGGT")
-                self.vggt = VGGT.from_pretrained(str(resolved_vggt_path)).to(device=vggt_device, dtype=config.dtype)
+                self.vggt = VGGT.from_pretrained(str(resolved_vggt_path)).to(device=vggt_device)
                 print(f"Loaded pretrained VGGT from {resolved_vggt_path} on {vggt_device}")
             except FileNotFoundError:
                 print(f"VGGT model not found at {vggt_model_path}, will use random initialization")
@@ -124,7 +134,7 @@ class SpatialMLLMPipeline(nn.Module):
                 img_size=config.vggt_img_size,
                 patch_size=config.vggt_patch_size,
                 embed_dim=config.vggt_embed_dim
-            ).to(device=vggt_device, dtype=config.dtype)
+            ).to(device=vggt_device)
             print(f"Using randomly initialized VGGT weights on {vggt_device}")
         
         # Initialize keyframe selector with space-aware sampling
@@ -277,6 +287,8 @@ class SpatialMLLMPipeline(nn.Module):
                 - 'processing_metadata': Pipeline statistics
         """
         
+        if video_frames.shape[1] > self.config.total_frames:
+            video_frames = video_frames[:, :self.config.total_frames]
         total_frames = video_frames.shape[1]
         
         # Set current observation (use last frame if not provided - represents current view)
@@ -294,7 +306,7 @@ class SpatialMLLMPipeline(nn.Module):
         # Step 1: Process ALL frames through VGGT for geometry extraction
         logger.info("Step 1: VGGT processing for geometry extraction")
         vggt_device = torch.device(self.config.vggt_gpu if self.config.use_multi_gpu else self.config.device)
-        video_frames_vggt = video_frames.to(device=vggt_device, dtype=self.config.dtype)
+        video_frames_vggt = video_frames.to(device=vggt_device)
         vggt_predictions = self._process_all_frames_vggt(video_frames_vggt)
         
         # Step 2: Apply space-aware keyframe selection  
@@ -316,10 +328,10 @@ class SpatialMLLMPipeline(nn.Module):
         vggt_features = keyframe_result['vggt_features']
         # Move VGGT features to main device for fusion (handle dict of tensors)
         if isinstance(vggt_features, dict):
-            vggt_features = {k: v.to(device=self.device) if isinstance(v, torch.Tensor) else v
+            vggt_features = {k: v.to(device=self.device, dtype=self.config.dtype) if isinstance(v, torch.Tensor) else v
                            for k, v in vggt_features.items()}
         else:
-            vggt_features = vggt_features.to(device=self.device)
+            vggt_features = vggt_features.to(device=self.device, dtype=self.config.dtype)
         vggt_spatial_tokens = self._extract_vggt_spatial_features(vggt_features)
         
         # 2D path: Process selected frames through DINOv3 on dedicated GPU
@@ -439,7 +451,8 @@ class SpatialMLLMPipeline(nn.Module):
         # Reshape for VGGT processing: [B*N_m, C, H, W]
         frames_flat = video_frames.view(-1, *video_frames.shape[2:])
         
-        with torch.amp.autocast('cuda', enabled=True, dtype=self.config.dtype):
+        autocast_enabled = self.config.vggt_compute_dtype in (torch.float16, torch.bfloat16)
+        with torch.amp.autocast('cuda', enabled=autocast_enabled, dtype=self.config.vggt_compute_dtype):
             # VGGT processes all frames for geometry
             vggt_output = self.vggt(frames_flat)
             
