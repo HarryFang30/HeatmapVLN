@@ -1,0 +1,20 @@
+{
+  "total_clips_inspected": 1,
+  "total_heatmaps": 4,
+  "total_empty_heatmaps": 3,
+  "overall_empty_ratio": 0.75,
+  "output_directory": "outputs/inspect",
+  "clip_stats": [
+    {
+      "clip_dir": "data/habitat_vln/train/RoomA/clip_000001",
+      "scene": "RoomA",
+      "clip": "clip_000001",
+      "ref_idx": 7,
+      "total_heatmaps": 4,
+      "valid_heatmaps": 1,
+      "empty_heatmaps": 3,
+      "empty_ratio": 0.75,
+      "output_path": "outputs/inspect/RoomA/clip_000001_overlay.png"
+    }
+  ]
+}

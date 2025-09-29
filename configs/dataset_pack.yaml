@@ -1,0 +1,30 @@
+seed: 42
+
+data:
+  raw_root: ./raw_sequences                  # 原始序列目录（见 §3 输入约定）
+  save_root: ./data/habitat_vln              # 打包后的标准训练集输出根
+  splits:
+    train: {scenes: [RoomA], clips_per_scene: 8}
+    val:   {scenes: [RoomB], clips_per_scene: 2}
+    test:  {scenes: [RoomC], clips_per_scene: 2}
+
+pack:
+  frames_per_clip: 8                         # T
+  stride: 1                                  # 取帧步长（从原始序列下采样）
+  sampler: fps                               # uniform | fps
+  keyframes: 4                               # K
+  fps_alpha: 1.0                             # 位姿距离：平移权重
+  fps_beta: 0.7                              # 位姿距离：朝向权重
+  ref_policy: last                           # last | middle | index
+  ref_index: -1
+
+heatmap:
+  size: [64, 64]                             # (Hm, Wm)
+  gaussian_sigma_px: 3.0
+  occlusion_check: true
+  occlusion_eps: 0.05
+
+export:
+  rgb_format: png
+  depth_format: npy
+  heatmap_format: npy
