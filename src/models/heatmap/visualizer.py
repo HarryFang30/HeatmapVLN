@@ -9,6 +9,11 @@ from PIL import Image, ImageDraw
 from typing import List, Tuple, Optional, Union
 from itertools import cycle
 
+from ...utils.plotting_config import configure_matplotlib_fonts
+
+# Configure fonts once so titles can show Chinese characters when needed.
+configure_matplotlib_fonts()
+
 
 def masked_softmax(heatmap: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
@@ -94,9 +99,25 @@ def visualize_points_and_heatmap(
     ax2.axis('off')
     plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
     
-    # Overlay visualization
-    ax3.imshow(drawable_image, alpha=1.0 - heatmap_alpha)
-    im3 = ax3.imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha)
+    # Overlay visualization - ensure size alignment
+    # Resize base image to match heatmap dimensions exactly
+    heatmap_h, heatmap_w = heatmap_np.shape
+
+    # Ensure the base image matches heatmap dimensions
+    if hasattr(drawable_image, 'size'):  # PIL Image
+        aligned_image = drawable_image.resize((heatmap_w, heatmap_h), Image.Resampling.LANCZOS)
+        aligned_image = np.array(aligned_image)
+    else:  # numpy array
+        from scipy.ndimage import zoom
+        img_h, img_w = drawable_image.shape[:2]
+        zoom_factors = (heatmap_h / img_h, heatmap_w / img_w)
+        if len(drawable_image.shape) == 3:
+            zoom_factors = zoom_factors + (1,)  # Don't zoom color channels
+        aligned_image = zoom(drawable_image, zoom_factors, order=1)
+
+    # Display with consistent parameters and exact alignment
+    ax3.imshow(aligned_image, alpha=1.0 - heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
+    im3 = ax3.imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
     ax3.set_title('Heatmap Overlay')
     ax3.axis('off')
     plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
@@ -177,9 +198,23 @@ def visualize_bboxes_and_heatmap(
     ax2.axis('off')
     plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
     
-    # Overlay visualization  
-    ax3.imshow(resized_img, alpha=1.0 - heatmap_alpha)
-    im3 = ax3.imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha)
+    # Overlay visualization - ensure size alignment
+    # Align resized_img with heatmap dimensions
+    heatmap_h, heatmap_w = heatmap_np.shape
+    if isinstance(resized_img, Image.Image):
+        aligned_img = resized_img.resize((heatmap_w, heatmap_h), Image.Resampling.LANCZOS)
+        aligned_img = np.array(aligned_img)
+    else:
+        # resized_img should already be the right size due to line 144, but ensure consistency
+        from scipy.ndimage import zoom
+        img_h, img_w = resized_img.shape[:2]
+        zoom_factors = (heatmap_h / img_h, heatmap_w / img_w)
+        if len(resized_img.shape) == 3:
+            zoom_factors = zoom_factors + (1,)
+        aligned_img = zoom(np.array(resized_img), zoom_factors, order=1)
+
+    ax3.imshow(aligned_img, alpha=1.0 - heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
+    im3 = ax3.imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
     ax3.set_title('Heatmap Overlay')
     ax3.axis('off')
     plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
@@ -238,9 +273,13 @@ def visualize_multi_view_heatmaps(
         axes[0, i].set_title(f'{view_names[i]} - Original')
         axes[0, i].axis('off')
         
-        # Bottom row: heatmap overlays
-        axes[1, i].imshow(resized_img, alpha=1.0 - heatmap_alpha)
-        im = axes[1, i].imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha)
+        # Bottom row: heatmap overlays - ensure size alignment
+        heatmap_h, heatmap_w = heatmap_np.shape
+        aligned_img = resized_img.resize((heatmap_w, heatmap_h), Image.Resampling.LANCZOS)
+        aligned_img = np.array(aligned_img)
+
+        axes[1, i].imshow(aligned_img, alpha=1.0 - heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
+        im = axes[1, i].imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
         axes[1, i].set_title(f'{view_names[i]} - Heatmap')
         axes[1, i].axis('off')
         plt.colorbar(im, ax=axes[1, i], fraction=0.046, pad=0.04)
@@ -290,21 +329,28 @@ def visualize_attention_comparison(
     # Create visualization
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
-    # Top row: overlays
-    axes[0, 0].imshow(resized_img, alpha=0.3)
-    im1 = axes[0, 0].imshow(pred_np, cmap=colormap, alpha=0.7)
+    # Top row: overlays - ensure size alignment
+    # Align base image with heatmap dimensions
+    pred_h, pred_w = pred_np.shape
+    target_h, target_w = target_np.shape
+    aligned_img_pred = resized_img.resize((pred_w, pred_h), Image.Resampling.LANCZOS)
+    aligned_img_target = resized_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    aligned_img_diff = resized_img.resize((diff_np.shape[1], diff_np.shape[0]), Image.Resampling.LANCZOS)
+
+    axes[0, 0].imshow(np.array(aligned_img_pred), alpha=0.3, interpolation='bilinear', extent=[0, pred_w, pred_h, 0])
+    im1 = axes[0, 0].imshow(pred_np, cmap=colormap, alpha=0.7, interpolation='bilinear', extent=[0, pred_w, pred_h, 0])
     axes[0, 0].set_title('Predicted Heatmap Overlay')
     axes[0, 0].axis('off')
     plt.colorbar(im1, ax=axes[0, 0], fraction=0.046, pad=0.04)
-    
-    axes[0, 1].imshow(resized_img, alpha=0.3)
-    im2 = axes[0, 1].imshow(target_np, cmap=colormap, alpha=0.7)
+
+    axes[0, 1].imshow(np.array(aligned_img_target), alpha=0.3, interpolation='bilinear', extent=[0, target_w, target_h, 0])
+    im2 = axes[0, 1].imshow(target_np, cmap=colormap, alpha=0.7, interpolation='bilinear', extent=[0, target_w, target_h, 0])
     axes[0, 1].set_title('Target Heatmap Overlay')
     axes[0, 1].axis('off')
     plt.colorbar(im2, ax=axes[0, 1], fraction=0.046, pad=0.04)
-    
-    axes[0, 2].imshow(resized_img, alpha=0.3)
-    im3 = axes[0, 2].imshow(diff_np, cmap='Reds', alpha=0.7)
+
+    axes[0, 2].imshow(np.array(aligned_img_diff), alpha=0.3, interpolation='bilinear', extent=[0, diff_np.shape[1], diff_np.shape[0], 0])
+    im3 = axes[0, 2].imshow(diff_np, cmap='Reds', alpha=0.7, interpolation='bilinear', extent=[0, diff_np.shape[1], diff_np.shape[0], 0])
     axes[0, 2].set_title('Absolute Difference')
     axes[0, 2].axis('off')
     plt.colorbar(im3, ax=axes[0, 2], fraction=0.046, pad=0.04)
@@ -372,9 +418,14 @@ def create_heatmap_animation_frames(
         heatmap_np = heatmap_sequence[t].cpu().numpy()
         heatmap_np = (heatmap_np - heatmap_np.min()) / (heatmap_np.max() - heatmap_np.min() + 1e-8)
         
+        # Ensure size alignment
+        heatmap_h, heatmap_w = heatmap_np.shape
+        aligned_img = resized_img.resize((heatmap_w, heatmap_h), Image.Resampling.LANCZOS)
+        aligned_img = np.array(aligned_img)
+
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        ax.imshow(resized_img, alpha=1.0 - heatmap_alpha)
-        im = ax.imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha)
+        ax.imshow(aligned_img, alpha=1.0 - heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
+        im = ax.imshow(heatmap_np, cmap=colormap, alpha=heatmap_alpha, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
         ax.set_title(f'Heatmap Evolution - Frame {t+1}/{seq_len}')
         ax.axis('off')
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)

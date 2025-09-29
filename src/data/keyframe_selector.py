@@ -108,6 +108,9 @@ class KeyframeSelector(nn.Module):
             'cache_hits': 0,
             'average_selection_time': 0.0
         }
+
+        # Re-entry protection
+        self._active_selections = set()  # Track active selections to prevent duplicates
         
     def forward(
         self,
@@ -207,8 +210,48 @@ class KeyframeSelector(nn.Module):
         vggt_predictions: Dict[str, torch.Tensor],
         frame_indices: List[int]
     ) -> Dict:
-        """Apply greedy maximum coverage selection."""
-        return self.frame_sampler(vggt_predictions, frame_indices)
+        """Apply greedy maximum coverage selection with high-level caching and re-entry protection."""
+
+        # Generate cache key for this specific selection
+        selection_cache_key = f"greedy_selection_{hash(str(frame_indices))}"
+
+        # Re-entry protection: check if this selection is already in progress
+        if selection_cache_key in self._active_selections:
+            logger.warning(f"⚠️  Re-entry detected for greedy selection with {len(frame_indices)} frames - this is the duplicate call!")
+            logger.warning(f"⚠️  Blocking duplicate computation that would waste ~12s")
+            # Return a minimal fallback result to avoid crashes
+            return {
+                'selected_indices': torch.tensor(frame_indices[:min(len(frame_indices), self.config.target_keyframes)], device=self.device),
+                'coverage_scores': torch.zeros(min(len(frame_indices), self.config.target_keyframes), device=self.device),
+                'voxel_sets': {},
+                'total_coverage': 0,
+                'geometry_data': {},
+                'is_fallback': True
+            }
+
+        # Check high-level cache
+        if selection_cache_key in self._cache:
+            logger.info(f"🏎️  Using cached greedy selection for {len(frame_indices)} frames (avoiding ~12s computation)")
+            self._selection_stats['cache_hits'] += 1
+            return self._cache[selection_cache_key]
+
+        # Mark this selection as active
+        self._active_selections.add(selection_cache_key)
+        logger.info(f"Starting greedy selection for {len(frame_indices)} frames...")
+
+        try:
+            # Perform selection with frame sampler's internal caching
+            result = self.frame_sampler(vggt_predictions, frame_indices)
+
+            # Cache the complete result
+            self._cache[selection_cache_key] = result
+            logger.debug(f"Cached greedy selection result for {len(frame_indices)} frames")
+
+            return result
+
+        finally:
+            # Always remove from active selections when done
+            self._active_selections.discard(selection_cache_key)
     
     def _novelty_weighted_selection(
         self,
@@ -279,7 +322,10 @@ class KeyframeSelector(nn.Module):
         
         # Check if coverage result indicates multi-batch - use it directly
         coverage_indices_tensor = coverage_result['selected_indices']
-        if len(coverage_indices_tensor.shape) > 1:  # Multi-batch case: [batch_size, n_keyframes]
+        # Only consider it multi-batch if shape > 1D AND batch_size > 1
+        is_multi_batch = (len(coverage_indices_tensor.shape) > 1 and
+                         coverage_indices_tensor.shape[0] > 1)
+        if is_multi_batch:
             logger.info("Multi-batch detected in hybrid selection, using coverage-only result")
             return coverage_result
         
@@ -287,8 +333,8 @@ class KeyframeSelector(nn.Module):
         novelty_result = self._novelty_weighted_selection(vggt_predictions, frame_indices)
         
         # Combine selections with weighting
-        coverage_indices = set(coverage_result['selected_indices'].cpu().numpy())
-        novelty_indices = set(novelty_result['selected_indices'].cpu().numpy())
+        coverage_indices = set(coverage_result['selected_indices'].cpu().numpy().flatten())
+        novelty_indices = set(novelty_result['selected_indices'].cpu().numpy().flatten())
         
         # Weighted selection: prioritize overlap, then add diverse choices
         overlap_indices = coverage_indices.intersection(novelty_indices)
@@ -488,9 +534,20 @@ class KeyframeSelector(nn.Module):
         return stats
     
     def clear_cache(self):
-        """Clear the selection cache."""
+        """Clear the selection cache and reset re-entry protection."""
+        cache_entries = len(self._cache)
+        active_selections = len(self._active_selections)
+
         self._cache.clear()
-        logger.info("Selection cache cleared")
+        self._active_selections.clear()
+
+        # Also clear frame sampler's cache
+        if hasattr(self.frame_sampler, '_voxel_cache'):
+            voxel_cache_entries = len(self.frame_sampler._voxel_cache)
+            self.frame_sampler._voxel_cache.clear()
+            logger.info(f"Cleared {cache_entries} selection cache entries, {active_selections} active selections, and {voxel_cache_entries} voxel cache entries")
+        else:
+            logger.info(f"Cleared {cache_entries} selection cache entries and {active_selections} active selections")
 
 
 def create_keyframe_selector(

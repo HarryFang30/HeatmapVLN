@@ -41,6 +41,7 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import working project modules
+from src.utils.plotting_config import configure_matplotlib_fonts
 from src.models.spatial_mllm_compat import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
 from src.data.algorithm_factory import get_factory
 from src.data.enhanced_frame_sampler import EnhancedFrameSampler
@@ -54,6 +55,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Configure Matplotlib fonts once so CJK instructions render in generated plots.
+configure_matplotlib_fonts()
 
 
 class VLNConfig:
@@ -72,7 +76,7 @@ class VLNConfig:
         return {
             'model': {
                 'use_real_llm': True,
-                'llm_model_path': '/home/VLN/Project/models/qwen_2.5_vl',
+                'llm_model_path': './models/qwen_2.5_vl',  # 使用相对路径
                 'device_allocation': {
                     'vggt': 'cuda:0',
                     'dinov3': 'cuda:1',
@@ -80,9 +84,10 @@ class VLNConfig:
                 }
             },
             'video': {
-                'max_frames': 32,
+                'max_frames': 32,  # 候选帧池大小 (可通过--max_frames调整)
                 'target_size': (224, 224),
-                'fps_limit': 30
+                'fps_limit': 30,
+                'sample_fps': None  # 可选：基于FPS采样
             },
             'sampling': {
                 'algorithm': 'enhanced',  # fast, quality, enhanced
@@ -182,13 +187,33 @@ class VideoProcessor:
             raise ValueError(f"无法打开视频文件: {video_path}")
 
         frames = []
-        frame_count = 0
         max_frames = self.config.get('video.max_frames', 32)
         target_size = self.config.get('video.target_size', (224, 224))
+        sample_fps = self.config.get('video.sample_fps', None)
 
-        while True:
+        # 获取视频信息
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if sample_fps is not None and video_fps > 0:
+            # 基于FPS的采样
+            skip_rate = max(1, int(video_fps / sample_fps))
+            frame_indices = list(range(0, total_frames, skip_rate))[:max_frames]
+            logger.info(f"FPS采样: 原始{video_fps:.2f}fps → 采样{sample_fps:.2f}fps，跳帧率: {skip_rate}")
+        else:
+            # 均匀采样
+            if total_frames <= max_frames:
+                frame_indices = list(range(total_frames))
+            else:
+                step = total_frames // max_frames
+                frame_indices = list(range(0, total_frames, step))[:max_frames]
+            logger.info(f"均匀采样: 总{total_frames}帧 → 采样{len(frame_indices)}帧")
+
+        # 按索引提取帧
+        for frame_idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
-            if not ret or frame_count >= max_frames:
+            if not ret:
                 break
 
             # 转换BGR到RGB
@@ -196,7 +221,6 @@ class VideoProcessor:
             # 调整大小
             frame = cv2.resize(frame, target_size)
             frames.append(frame)
-            frame_count += 1
 
         cap.release()
 
@@ -250,27 +274,37 @@ class HeatmapVisualizer:
         saved_files = []
 
         for i, (frame_idx, heatmap) in enumerate(zip(keyframe_indices, heatmaps)):
-            # 创建可视化
+            # Create visualization
             fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
 
-            # 原始帧
+            # Original frame
             ax1.imshow(frames[frame_idx])
-            ax1.set_title(f'原始帧 {frame_idx}')
+            ax1.set_title(f'Original Frame {frame_idx}')
             ax1.axis('off')
 
-            # 热力图
+            # Heatmap
             im2 = ax2.imshow(heatmap, cmap='hot', interpolation='nearest')
-            ax2.set_title(f'热力图 {i}')
+            ax2.set_title(f'Heatmap {i}')
             ax2.axis('off')
             plt.colorbar(im2, ax=ax2, shrink=0.8)
 
-            # 叠加图
-            ax3.imshow(frames[frame_idx], alpha=0.7)
-            ax3.imshow(heatmap, cmap='jet', alpha=0.5, interpolation='nearest')
-            ax3.set_title(f'叠加图 {i}')
+            # Overlay - ensure size alignment
+            frame_img = frames[frame_idx]
+            heatmap_h, heatmap_w = heatmap.shape
+
+            # Resize frame to match heatmap dimensions exactly
+            if frame_img.shape[:2] != (heatmap_h, heatmap_w):
+                aligned_frame = cv2.resize(frame_img, (heatmap_w, heatmap_h))
+            else:
+                aligned_frame = frame_img
+
+            # Display with consistent parameters and exact alignment
+            ax3.imshow(aligned_frame, alpha=0.7, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
+            ax3.imshow(heatmap, cmap='jet', alpha=0.5, interpolation='bilinear', extent=[0, heatmap_w, heatmap_h, 0])
+            ax3.set_title(f'Overlay {i}')
             ax3.axis('off')
 
-            # 保存
+            # Save
             filename = f"{prefix}_frame_{frame_idx}_heatmap_{i}.png"
             save_path = self.output_dir / filename
             plt.tight_layout()
@@ -278,7 +312,7 @@ class HeatmapVisualizer:
             plt.close()
 
             saved_files.append(str(save_path))
-            logger.info(f"保存热力图: {save_path}")
+            logger.info(f"Saved heatmap: {save_path}")
 
         return saved_files
 
@@ -300,28 +334,28 @@ class HeatmapVisualizer:
             row = (i // cols) * 2
             col = i % cols
 
-            # 原始帧
+            # Original frame
             axes[row, col].imshow(frames[frame_idx])
-            axes[row, col].set_title(f'帧 {frame_idx}')
+            axes[row, col].set_title(f'Frame {frame_idx}')
             axes[row, col].axis('off')
 
-            # 热力图
+            # Heatmap
             im = axes[row + 1, col].imshow(heatmap, cmap='hot')
-            axes[row + 1, col].set_title(f'热力图 {i}')
+            axes[row + 1, col].set_title(f'Heatmap {i}')
             axes[row + 1, col].axis('off')
 
-        # 添加性能指标文本
+        # Add performance metrics text
         if 'total_time' in metrics:
-            fig.suptitle(f'Frame-Indexed Heatmaps (处理时间: {metrics["total_time"]:.2f}s)',
+            fig.suptitle(f'Frame-Indexed Heatmaps (Processing Time: {metrics["total_time"]:.2f}s)',
                         fontsize=16)
 
-        # 保存汇总图
+        # Save summary plot
         summary_path = self.output_dir / "summary_heatmaps.png"
         plt.tight_layout()
         plt.savefig(summary_path, dpi=150, bbox_inches='tight')
         plt.close()
 
-        logger.info(f"保存汇总可视化: {summary_path}")
+        logger.info(f"Saved summary visualization: {summary_path}")
         return str(summary_path)
 
 
@@ -359,13 +393,39 @@ class VLNProject:
             }
             vggt_dtype = precision_map.get(str(vggt_precision).lower(), torch.float16)
 
-            spatial_config = SpatialMLLMIntegrationConfig(
-                use_real_llm=self.config.get('model.use_real_llm', True),
-                llm_model_path=self.config.get('model.llm_model_path'),
-                device_allocation=self.config.get('model.device_allocation', {}),
-                total_frames=max_frames,
-                vggt_compute_dtype=vggt_dtype
-            )
+            # 创建与test_real_llm_pipeline.py相同的配置
+            gpu_count = torch.cuda.device_count()
+
+            if gpu_count >= 3:
+                # 多GPU配置 - 与test_real_llm_pipeline.py保持一致
+                spatial_config = SpatialMLLMIntegrationConfig(
+                    target_keyframes=self.config.get('sampling.num_keyframes', 8),  # 🔥 传递关键帧参数
+                    use_real_llm=self.config.get('model.use_real_llm', True),
+                    llm_model_path=self.config.get('model.llm_model_path'),
+                    use_multi_gpu=True,
+                    vggt_gpu='cuda:0',
+                    dinov3_gpu='cuda:1',
+                    llm_gpu='cuda:2',
+                    device='cuda:0',
+                    total_frames=max_frames,
+                    vggt_compute_dtype=vggt_dtype
+                )
+                logger.info("Multi-GPU configuration:")
+                logger.info(f"  - VGGT: cuda:0")
+                logger.info(f"  - DINOv3: cuda:1")
+                logger.info(f"  - LLM: cuda:2")
+            else:
+                # 单GPU配置
+                spatial_config = SpatialMLLMIntegrationConfig(
+                    target_keyframes=self.config.get('sampling.num_keyframes', 8),  # 🔥 传递关键帧参数
+                    use_real_llm=self.config.get('model.use_real_llm', True),
+                    llm_model_path=self.config.get('model.llm_model_path'),
+                    use_multi_gpu=False,
+                    device='cuda:0' if gpu_count > 0 else 'cpu',
+                    total_frames=max_frames,
+                    vggt_compute_dtype=vggt_dtype
+                )
+                logger.info(f"Single GPU configuration: {spatial_config.device}")
             self.spatial_pipeline = SpatialMLLMPipeline(spatial_config)
 
             # 2. 初始化算法工厂
@@ -405,19 +465,9 @@ class VLNProject:
             self.monitor.end_timer('video_loading')
             self.monitor.record_memory('after_video_loading')
 
-            # 2. 选择算法
-            algorithm_type = algorithm_type or self.config.get('sampling.algorithm', 'enhanced')
-            algorithm = self._get_sampling_algorithm(algorithm_type)
-
-            # 3. Space-aware采样
-            self.monitor.start_timer('frame_sampling')
-            num_keyframes = self.config.get('sampling.num_keyframes', 8)
-            sampled_indices = algorithm.sample_frames(frames, num_keyframes=num_keyframes)
-            sampling_time = self.monitor.end_timer('frame_sampling')
-
-            logger.info(f"采样算法: {algorithm_type}")
-            logger.info(f"选择的关键帧索引: {sampled_indices}")
-            logger.info(f"采样耗时: {sampling_time:.3f}s")
+            # 2. 使用与test_real_llm_pipeline.py相同的均匀采样策略
+            # 跳过额外的算法采样步骤，直接使用已加载的帧
+            logger.info(f"使用均匀采样策略，加载了 {len(frames)} 帧")
 
             # 4. Pipeline处理
             self.monitor.start_timer('pipeline_processing')
@@ -430,13 +480,14 @@ class VLNProject:
 
             current_observation = video_tensor[:, -1]
 
-            pipeline_outputs = self.spatial_pipeline(
-                video_frames=video_tensor,
-                instruction_text=instruction,
-                current_observation=current_observation,
-                return_intermediate=True,
-                return_heatmaps=True
-            )
+            # 使用与test_real_llm_pipeline.py相同的简洁调用方式
+            # 移除额外的内存消耗参数
+            with torch.no_grad():  # 添加内存优化
+                pipeline_outputs = self.spatial_pipeline(
+                    video_frames=video_tensor,
+                    instruction_text=instruction,
+                    current_observation=current_observation
+                )
 
             pipeline_time = self.monitor.end_timer('pipeline_processing')
             self.monitor.record_memory('after_pipeline')
@@ -447,9 +498,17 @@ class VLNProject:
             if isinstance(selected_keyframes, torch.Tensor):
                 selected_keyframes = selected_keyframes.detach().cpu().tolist()
             elif selected_keyframes is None:
-                selected_keyframes = sampled_indices
+                # 使用已加载的帧索引
+                selected_keyframes = list(range(len(frames)))
             else:
                 selected_keyframes = list(selected_keyframes)
+
+            # 修复嵌套列表问题 - flatten if needed
+            if selected_keyframes and isinstance(selected_keyframes[0], (list, tuple)):
+                selected_keyframes = selected_keyframes[0]  # 取第一个batch的keyframes
+
+            # 确保都是整数
+            selected_keyframes = [int(idx) for idx in selected_keyframes]
 
             heatmap_size = self.spatial_pipeline.config.heatmap_size
             heatmap_collection = []
@@ -482,11 +541,11 @@ class VLNProject:
                 'heatmaps_shape': heatmaps.shape,
                 'processing_time': {
                     'video_loading': self.monitor.metrics.get('video_loading_duration', 0),
-                    'frame_sampling': sampling_time,
+                    'frame_sampling': 0.0,  # 简化采样不需要额外时间
                     'pipeline_processing': pipeline_time,
                     'total': self.monitor.end_timer('total_processing')
                 },
-                'fallback_sampled_indices': sampled_indices
+                'fallback_sampled_indices': selected_keyframes
             }
 
             # 保存可视化
@@ -613,8 +672,11 @@ def parse_arguments() -> argparse.Namespace:
 # 单视频处理
 python main.py --video /path/to/video.mp4 --instruction "Navigate to the kitchen"
 
-# 指定算法
-python main.py --video /path/to/video.mp4 --algorithm enhanced
+# 指定算法和采样参数
+python main.py --video /path/to/video.mp4 --algorithm enhanced --keyframes 6 --max_frames 32
+
+# 基于FPS采样
+python main.py --video /path/to/video.mp4 --sample_fps 2.0 --keyframes 8
 
 # 批量处理
 python main.py --batch video1.mp4 video2.mp4 video3.mp4
@@ -644,6 +706,12 @@ python main.py --config configs/custom.yaml --video /path/to/video.mp4
     parser.add_argument("--keyframes", type=int, default=8,
                        help="关键帧数量")
 
+    # 视频采样参数
+    parser.add_argument("--max_frames", type=int, default=32,
+                       help="视频最大采样帧数 (候选帧池大小)")
+    parser.add_argument("--sample_fps", type=float, default=None,
+                       help="采样帧率 (如果指定，覆盖max_frames)")
+
     # 配置选项
     parser.add_argument("--config", type=str, help="YAML配置文件路径")
     parser.add_argument("--output_dir", type=str, default="./outputs",
@@ -662,6 +730,8 @@ python main.py --config configs/custom.yaml --video /path/to/video.mp4
                        help="启用性能分析")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="详细输出模式")
+    parser.add_argument("--optimize_memory", action="store_true",
+                       help="优化内存：设置Qwen VIDEO_TOTAL_PIXELS为实际需求")
 
     return parser.parse_args()
 
@@ -675,12 +745,28 @@ def main():
         if args.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
 
+        # 📊 内存优化：修复Qwen VIDEO_TOTAL_PIXELS误判
+        if args.optimize_memory:
+            # 基于实际张量大小计算合理的视频像素预算
+            max_frames = getattr(args, 'max_frames', 32)
+            target_keyframes = getattr(args, 'keyframes', 8)
+            # 计算：批大小×关键帧×通道×高×宽 + 缓冲
+            estimated_pixels = 1 * target_keyframes * 3 * 224 * 224 * 2  # 2×缓冲
+            os.environ['VIDEO_MAX_PIXELS'] = str(estimated_pixels)
+            logger.info(f"🚀 Memory optimization enabled:")
+            logger.info(f"   Setting VIDEO_MAX_PIXELS = {estimated_pixels:,}")
+            logger.info(f"   Default was: 90,316,800 (reduced by {90316800/estimated_pixels:.1f}×)")
+
         # 加载配置
         config = VLNConfig(args.config)
 
         # 更新配置
         if args.keyframes:
             config.config['sampling']['num_keyframes'] = args.keyframes
+        if args.max_frames:
+            config.config['video']['max_frames'] = args.max_frames
+        if args.sample_fps:
+            config.config['video']['sample_fps'] = args.sample_fps
         if args.output_dir:
             config.config['output']['output_dir'] = args.output_dir
         if args.no_visualization:

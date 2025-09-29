@@ -320,7 +320,7 @@ def load_safetensors_weights(model, safetensors_path: str):
             # Single safetensors file
             state_dict = load_file(safetensors_path)
 
-        print(f"Loaded {len(state_dict)} parameters from safetensors")
+        print(f"Loaded {len(state_dict)} tensor entries from safetensors")
 
         # Map HuggingFace DINOv3 keys to our implementation
         model_state_dict = {}
@@ -330,47 +330,85 @@ def load_safetensors_weights(model, safetensors_path: str):
             # Patch embedding
             "embeddings.patch_embeddings.projection.weight": "patch_embed.proj.weight",
             "embeddings.patch_embeddings.projection.bias": "patch_embed.proj.bias",
+            "embeddings.patch_embeddings.weight": "patch_embed.proj.weight",
+            "embeddings.patch_embeddings.bias": "patch_embed.proj.bias",
 
             # CLS token and register tokens
             "embeddings.cls_token": "cls_token",
             "embeddings.register_tokens": "storage_tokens",
 
-            # Mask token
+            # Mask token - handle shape mismatch [1,1,4096] -> [1,4096]
             "embeddings.mask_token": "mask_token",
 
             # Layer norm
             "layernorm.weight": "norm.weight",
             "layernorm.bias": "norm.bias",
+            "norm.weight": "norm.weight",
+            "norm.bias": "norm.bias",
+
+            # RoPE embeddings
+            "rope_embed.periods": "rope_embed.periods",
         }
 
         # Process transformer blocks
         for i in range(model.n_blocks):
-            block_prefix = f"encoder.layer.{i}"
+            # HF uses different naming conventions
+            hf_prefixes = [f"encoder.layer.{i}", f"layer.{i}"]
             target_prefix = f"blocks.{i}"
 
-            # Attention layers
-            key_mapping.update({
-                f"{block_prefix}.attention.attention.query.weight": f"{target_prefix}.attn.qkv.weight",
-                f"{block_prefix}.attention.attention.query.bias": f"{target_prefix}.attn.qkv.bias",
-                f"{block_prefix}.attention.output.dense.weight": f"{target_prefix}.attn.proj.weight",
-                f"{block_prefix}.attention.output.dense.bias": f"{target_prefix}.attn.proj.bias",
+            for block_prefix in hf_prefixes:
+                # Attention layers - multiple possible formats
+                key_mapping.update({
+                    # Standard attention mapping
+                    f"{block_prefix}.attention.attention.query.weight": f"{target_prefix}.attn.qkv.weight",
+                    f"{block_prefix}.attention.attention.key.weight": f"{target_prefix}.attn.qkv.weight",
+                    f"{block_prefix}.attention.attention.value.weight": f"{target_prefix}.attn.qkv.weight",
+                    f"{block_prefix}.attention.attention.query.bias": f"{target_prefix}.attn.qkv.bias",
+                    f"{block_prefix}.attention.attention.key.bias": f"{target_prefix}.attn.qkv.bias",
+                    f"{block_prefix}.attention.attention.value.bias": f"{target_prefix}.attn.qkv.bias",
+                    f"{block_prefix}.attention.output.dense.weight": f"{target_prefix}.attn.proj.weight",
+                    f"{block_prefix}.attention.output.dense.bias": f"{target_prefix}.attn.proj.bias",
 
-                # Layer norms
-                f"{block_prefix}.layernorm_before.weight": f"{target_prefix}.norm1.weight",
-                f"{block_prefix}.layernorm_before.bias": f"{target_prefix}.norm1.bias",
-                f"{block_prefix}.layernorm_after.weight": f"{target_prefix}.norm2.weight",
-                f"{block_prefix}.layernorm_after.bias": f"{target_prefix}.norm2.bias",
+                    # Alternative attention mapping
+                    f"{block_prefix}.attention.q_proj.weight": f"{target_prefix}.attn.qkv.weight",
+                    f"{block_prefix}.attention.k_proj.weight": f"{target_prefix}.attn.qkv.weight",
+                    f"{block_prefix}.attention.v_proj.weight": f"{target_prefix}.attn.qkv.weight",
+                    f"{block_prefix}.attention.o_proj.weight": f"{target_prefix}.attn.proj.weight",
+                    f"{block_prefix}.attention.q_proj.bias": f"{target_prefix}.attn.qkv.bias",
+                    f"{block_prefix}.attention.k_proj.bias": f"{target_prefix}.attn.qkv.bias",
+                    f"{block_prefix}.attention.v_proj.bias": f"{target_prefix}.attn.qkv.bias",
+                    f"{block_prefix}.attention.o_proj.bias": f"{target_prefix}.attn.proj.bias",
 
-                # MLP layers
-                f"{block_prefix}.mlp.fc1.weight": f"{target_prefix}.mlp.fc1.weight",
-                f"{block_prefix}.mlp.fc1.bias": f"{target_prefix}.mlp.fc1.bias",
-                f"{block_prefix}.mlp.fc2.weight": f"{target_prefix}.mlp.fc2.weight",
-                f"{block_prefix}.mlp.fc2.bias": f"{target_prefix}.mlp.fc2.bias",
+                    # Layer norms
+                    f"{block_prefix}.layernorm_before.weight": f"{target_prefix}.norm1.weight",
+                    f"{block_prefix}.layernorm_before.bias": f"{target_prefix}.norm1.bias",
+                    f"{block_prefix}.layernorm_after.weight": f"{target_prefix}.norm2.weight",
+                    f"{block_prefix}.layernorm_after.bias": f"{target_prefix}.norm2.bias",
+                    f"{block_prefix}.norm1.weight": f"{target_prefix}.norm1.weight",
+                    f"{block_prefix}.norm1.bias": f"{target_prefix}.norm1.bias",
+                    f"{block_prefix}.norm2.weight": f"{target_prefix}.norm2.weight",
+                    f"{block_prefix}.norm2.bias": f"{target_prefix}.norm2.bias",
 
-                # LayerScale parameters
-                f"{block_prefix}.layer_scale1.lambda1": f"{target_prefix}.ls1.gamma",
-                f"{block_prefix}.layer_scale2.lambda1": f"{target_prefix}.ls2.gamma",
-            })
+                    # MLP layers - standard format
+                    f"{block_prefix}.mlp.fc1.weight": f"{target_prefix}.mlp.fc1.weight",
+                    f"{block_prefix}.mlp.fc1.bias": f"{target_prefix}.mlp.fc1.bias",
+                    f"{block_prefix}.mlp.fc2.weight": f"{target_prefix}.mlp.fc2.weight",
+                    f"{block_prefix}.mlp.fc2.bias": f"{target_prefix}.mlp.fc2.bias",
+
+                    # MLP layers - SwiGLU format (for 7B model)
+                    f"{block_prefix}.mlp.gate_proj.weight": f"{target_prefix}.mlp.w1.weight",
+                    f"{block_prefix}.mlp.gate_proj.bias": f"{target_prefix}.mlp.w1.bias",
+                    f"{block_prefix}.mlp.up_proj.weight": f"{target_prefix}.mlp.w3.weight",
+                    f"{block_prefix}.mlp.up_proj.bias": f"{target_prefix}.mlp.w3.bias",
+                    f"{block_prefix}.mlp.down_proj.weight": f"{target_prefix}.mlp.w2.weight",
+                    f"{block_prefix}.mlp.down_proj.bias": f"{target_prefix}.mlp.w2.bias",
+
+                    # LayerScale parameters
+                    f"{block_prefix}.layer_scale1.lambda1": f"{target_prefix}.ls1.gamma",
+                    f"{block_prefix}.layer_scale2.lambda1": f"{target_prefix}.ls2.gamma",
+                    f"{block_prefix}.ls1.gamma": f"{target_prefix}.ls1.gamma",
+                    f"{block_prefix}.ls2.gamma": f"{target_prefix}.ls2.gamma",
+                })
 
         # Apply key mapping and filter compatible weights
         mapped_state_dict = {}
@@ -382,6 +420,17 @@ def load_safetensors_weights(model, safetensors_path: str):
                 our_key = key_mapping[hf_key]
                 if our_key in model_keys:
                     model_weight_shape = model.state_dict()[our_key].shape
+
+                    # Special handling for mask_token shape mismatch [1,1,D] -> [1,D]
+                    if our_key == "mask_token" and len(weight.shape) == 3 and weight.shape[1] == 1:
+                        weight = weight.squeeze(1)  # Remove middle dimension
+
+                    # Special handling for QKV weight concatenation
+                    if "qkv" in our_key and "weight" in our_key:
+                        # For QKV, we need to concatenate Q, K, V weights
+                        # Skip individual Q/K/V weights and handle them specially
+                        continue
+
                     if weight.shape == model_weight_shape:
                         mapped_state_dict[our_key] = weight
                     else:
@@ -399,13 +448,64 @@ def load_safetensors_weights(model, safetensors_path: str):
                 else:
                     skipped_keys.append(f"{hf_key} (no mapping found)")
 
+        # Handle QKV weight concatenation
+        for i in range(model.n_blocks):
+            for hf_prefix in [f"encoder.layer.{i}", f"layer.{i}"]:
+                target_prefix = f"blocks.{i}"
+
+                # Look for separate Q, K, V weights
+                q_key = f"{hf_prefix}.attention.q_proj.weight"
+                k_key = f"{hf_prefix}.attention.k_proj.weight"
+                v_key = f"{hf_prefix}.attention.v_proj.weight"
+                qkv_target = f"{target_prefix}.attn.qkv.weight"
+
+                if q_key in state_dict and k_key in state_dict and v_key in state_dict and qkv_target in model_keys:
+                    # Concatenate Q, K, V weights
+                    qkv_weight = torch.cat([state_dict[q_key], state_dict[k_key], state_dict[v_key]], dim=0)
+                    model_weight_shape = model.state_dict()[qkv_target].shape
+                    if qkv_weight.shape == model_weight_shape:
+                        mapped_state_dict[qkv_target] = qkv_weight
+
+                # Handle QKV bias if it exists
+                q_bias_key = f"{hf_prefix}.attention.q_proj.bias"
+                k_bias_key = f"{hf_prefix}.attention.k_proj.bias"
+                v_bias_key = f"{hf_prefix}.attention.v_proj.bias"
+                qkv_bias_target = f"{target_prefix}.attn.qkv.bias"
+
+                if (q_bias_key in state_dict and k_bias_key in state_dict and
+                    v_bias_key in state_dict and qkv_bias_target in model_keys):
+                    qkv_bias = torch.cat([state_dict[q_bias_key], state_dict[k_bias_key], state_dict[v_bias_key]], dim=0)
+                    model_bias_shape = model.state_dict()[qkv_bias_target].shape
+                    if qkv_bias.shape == model_bias_shape:
+                        mapped_state_dict[qkv_bias_target] = qkv_bias
+
+        # Initialize RoPE periods if missing (this is computed, not loaded from weights)
+        if hasattr(model, 'rope_embed') and model.rope_embed is not None:
+            if 'rope_embed.periods' not in mapped_state_dict:
+                # RoPE periods are computed during initialization, not loaded from weights
+                # This is normal and expected - the periods are calculated based on model config
+                print("INFO: rope_embed.periods will be initialized automatically (not loaded from weights)")
+                # Manually initialize RoPE weights to ensure they are properly set
+                model.rope_embed._init_weights()
+                print("INFO: Manually initialized rope_embed.periods")
+
         # Load mapped weights
         missing_keys, unexpected_keys = model.load_state_dict(mapped_state_dict, strict=False)
 
-        print(f"Successfully loaded {len(mapped_state_dict)}/{len(model_keys)} parameters")
+        # Filter out rope_embed.periods from missing keys since it's auto-initialized
+        filtered_missing_keys = [k for k in missing_keys if k != 'rope_embed.periods']
 
-        if missing_keys:
-            print(f"Missing keys ({len(missing_keys)}): {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+        # Calculate actual loaded parameters (excluding auto-initialized rope_embed.periods)
+        total_expected = len(model_keys) - (1 if 'rope_embed.periods' in model.state_dict() else 0)
+        actual_loaded = len(mapped_state_dict)
+
+        print(f"Successfully loaded {actual_loaded}/{total_expected} state_dict keys")
+        print(f"Missing keys: {len(filtered_missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+
+        if filtered_missing_keys:
+            print(f"Missing key details: {filtered_missing_keys[:5]}{'...' if len(filtered_missing_keys) > 5 else ''}")
+        elif 'rope_embed.periods' in missing_keys:
+            print("✅ All loadable parameters successfully loaded (rope_embed.periods auto-initialized)")
 
         if unexpected_keys:
             print(f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")

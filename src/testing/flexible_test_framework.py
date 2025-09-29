@@ -35,8 +35,12 @@ import pandas as pd
 
 from ..data.algorithm_registry import AlgorithmRegistry, AlgorithmConfig, AlgorithmType, get_registry
 from ..data.algorithm_factory import AlgorithmFactory, get_factory
+from ..utils.plotting_config import configure_matplotlib_fonts
 
 logger = logging.getLogger(__name__)
+
+# Ensure test visualizations render multilingual labels correctly.
+configure_matplotlib_fonts()
 
 
 class TestScenario(Enum):

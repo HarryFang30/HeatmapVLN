@@ -22,6 +22,7 @@ class Mlp(nn.Module):
         act_layer: Callable[..., nn.Module] = nn.GELU,
         drop: float = 0.0,
         bias: bool = True,
+        device: Optional[str] = None,
     ) -> None:
         super().__init__()
         out_features = out_features or in_features

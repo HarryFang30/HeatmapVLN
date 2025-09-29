@@ -13,6 +13,11 @@ from typing import Dict, Any, List, Optional, Tuple
 import torch
 from pathlib import Path
 
+from .plotting_config import configure_matplotlib_fonts
+
+# Ensure Matplotlib can render Chinese instructions when present in titles.
+configure_matplotlib_fonts()
+
 import logging
 logger = logging.getLogger(__name__)
 

@@ -140,13 +140,15 @@ class RealLLMIntegration(nn.Module):
             if self.config.use_vggt_model:
                 self.processor = Qwen2_5_VLProcessor.from_pretrained(
                     self.config.vggt_model_path,
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    use_fast=True
                 )
             else:
                 from transformers import Qwen2_5_VLProcessor as HFProcessor
                 self.processor = HFProcessor.from_pretrained(
                     self.config.model_path,
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    use_fast=True
                 )
 
             self.model.eval()  # Set to evaluation mode
@@ -293,10 +295,12 @@ class RealLLMIntegration(nn.Module):
             }
 
         except Exception as e:
-            logger.error(f"LLM processing failed: {e}")
+            # 🚨 CRITICAL FAILURE: Real LLM integration completely failed
+            logger.error(f"🚨 CRITICAL FAILURE: Real LLM integration failed: {e}")
             import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            logger.warning("Falling back to spatial feature projection")
+            logger.error(f"   📋 Full traceback: {traceback.format_exc()}")
+            logger.warning(f"   🔄 Emergency fallback: Using spatial feature projection only")
+            logger.warning(f"   ⚠️  No language-enhanced spatial reasoning available")
             return self._create_fallback_output(fused_features)
 
     def _process_through_llm(
@@ -307,6 +311,32 @@ class RealLLMIntegration(nn.Module):
         return_hidden_states: bool = True
     ) -> Dict[str, Any]:
         """Process inputs through the actual Qwen2.5-VL model."""
+
+        # 🔧 CRITICAL FIX: Calculate actual total pixels first (before any usage)
+        try:
+            _, T, _, H, W = video_frames.shape
+        except Exception as e:
+            logger.error("Video tensor shape invalid: %s", e)
+            raise
+
+        obs_pixels = int(current_observation.shape[-2] * current_observation.shape[-1]) if current_observation is not None else 0
+        actual_total_pixels = int(T * H * W + obs_pixels)  # ✅ Always available
+
+        # 🔧 Override Qwen's hardcoded pixel budget early (before qwen_vl_utils logging)
+        try:
+            import qwen_vl_utils.vision_process as vision_process
+            original_preset = getattr(vision_process, 'VIDEO_TOTAL_PIXELS', 90316800)
+            vision_process.VIDEO_TOTAL_PIXELS = actual_total_pixels
+
+            # 🔇 Temporarily suppress qwen_vl_utils logger to avoid conflicting messages
+            qwen_logger = logging.getLogger('qwen_vl_utils')
+            original_level = qwen_logger.level
+            qwen_logger.setLevel(logging.WARNING)  # Suppress INFO logs temporarily
+
+            logger.info(f"🔍 PIXEL BUDGET OVERRIDE: {original_preset:,} → {actual_total_pixels:,} "
+                       f"(ratio: {original_preset/actual_total_pixels:.1f}×)")
+        except Exception as e:
+            logger.warning("Failed to set VIDEO_TOTAL_PIXELS: %s", e)
 
         # Convert tensors to format expected by processor
         # video_frames: [B, N_k, C, H, W] -> list of PIL Images per video
@@ -331,6 +361,7 @@ class RealLLMIntegration(nn.Module):
             current_obs_list.append(pil_image)
 
         # Format messages for Qwen2.5-VL with THREE inputs: video, current observation, text instruction
+        # 🔧 CRITICAL: Pass total_pixels parameter to override Qwen's default
         messages = [
             {
                 "role": "user",
@@ -338,7 +369,8 @@ class RealLLMIntegration(nn.Module):
                     {
                         "type": "video",
                         "video": video_list[0],  # Use first batch item - historical keyframes
-                        "nframes": video_frames.shape[1]
+                        "nframes": video_frames.shape[1],
+                        "total_pixels": actual_total_pixels  # 🔥 Override Qwen's hardcoded default
                     },
                     {
                         "type": "image",
@@ -357,15 +389,24 @@ class RealLLMIntegration(nn.Module):
             messages, tokenize=False, add_generation_prompt=True
         )
 
-        # Process inputs
+        # 按照官方文档处理视频输入
         from qwen_vl_utils import process_vision_info
-        _, video_inputs = process_vision_info(messages)
+        image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
 
+        # 🔊 Restore qwen_vl_utils logger level after processing
+        try:
+            qwen_logger.setLevel(original_level)
+        except:
+            pass  # Ignore if logger restoration fails
+
+        # 使用官方推荐的处理方式
         inputs = self.processor(
             text=[text],
+            images=image_inputs,
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
+            **video_kwargs  # 重要：包含视频处理参数
         )
 
         # Add raw video input for VGGT processing (only if using VGGT model)
@@ -374,7 +415,7 @@ class RealLLMIntegration(nn.Module):
         inputs = inputs.to(self.device)
 
         # Generate with hidden states
-        with torch.cuda.amp.autocast(enabled=True, dtype=getattr(torch, self.config.torch_dtype)):
+        with torch.amp.autocast('cuda', enabled=True, dtype=getattr(torch, self.config.torch_dtype)):
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=self.config.max_new_tokens,
@@ -459,7 +500,7 @@ class RealLLMIntegration(nn.Module):
 
         return {
             'llm_tokens': projected_features,
-            'llm_output': "LLM processing failed - using spatial projection fallback",
+            'llm_output': "🔧 FALLBACK: LLM processing failed - using spatial projection only (no language reasoning)",
             'hidden_states': None,
             'attention_weights': None,
         }

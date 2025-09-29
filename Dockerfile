@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     libgoogle-perftools4 \
     libtcmalloc-minimal4 \
+    fonts-noto-cjk \
+    fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/*
 
 # PyTorch 2.6.0 is already installed in the base image with CUDA 12.4

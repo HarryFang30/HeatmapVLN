@@ -27,7 +27,7 @@ import logging
 from dataclasses import dataclass
 
 from .dinov3.vision_transformer import DinoVisionTransformer, vit_base, vit_large, vit_giant
-from .dinov3.hub import load_safetensors_weights, load_local_dinov3, dinov3_vit7b16
+from .dinov3.hub import load_safetensors_weights, load_local_dinov3, dinov3_vit7b16, load_dinov3_from_config
 from ..utils.path_utils import resolve_model_path
 
 logger = logging.getLogger(__name__)
@@ -117,10 +117,10 @@ class DINOv3CompatibilityLayer(nn.Module):
             logger.warning(f"Could not resolve DINOv3 path: {e}, using original: {model_path}")
 
         try:
-            # Use our working load_local_dinov3 function
+            # Use our updated and tested load_dinov3_from_config function
             logger.info(f"Loading DINOv3 from local safetensors: {model_path}")
-            model = load_local_dinov3(model_path)
-            logger.info("Successfully loaded DINOv3 model using load_local_dinov3()")
+            model = load_dinov3_from_config(model_path)
+            logger.info("Successfully loaded DINOv3 model using load_dinov3_from_config()")
             return model
 
         except Exception as e:

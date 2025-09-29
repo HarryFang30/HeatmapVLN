@@ -25,7 +25,11 @@ import json
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+from src.utils.plotting_config import configure_matplotlib_fonts
 from src.models.spatial_mllm_compat import create_spatial_mllm_pipeline
+
+# Ensure generated plots display multilingual instructions correctly.
+configure_matplotlib_fonts()
 
 
 def load_video_frames(video_path: str, max_frames: int = 16, target_size: tuple = (224, 224)) -> torch.Tensor:

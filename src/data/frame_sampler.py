@@ -96,19 +96,26 @@ class SpaceAwareFrameSampler(nn.Module):
         if frame_indices is None:
             frame_indices = list(range(num_frames))
             
-        # Step 1: Extract geometry and reconstruct 3D points
-        logger.info(f"Extracting geometry for {num_frames} frames")
-        geometry_data = self._extract_geometry(vggt_predictions, frame_indices)
-        
-        # Step 2: Compute voxel sets for each frame
-        logger.info("Computing voxel coverage for each frame")
-        voxel_sets = self._compute_voxel_sets(geometry_data)
-        
-        # Step 3: Apply greedy maximum coverage selection
-        logger.info(f"Selecting {self.config.target_frames} frames using greedy coverage")
-        selected_indices, coverage_scores = self._greedy_maximum_coverage(
-            voxel_sets, frame_indices
-        )
+        # Step 1: Extract geometry and reconstruct 3D points (check cache first)
+        cache_key = f"voxel_sets_{hash(str(frame_indices))}"
+        if cache_key in self._voxel_cache:
+            logger.debug(f"Using cached voxel sets for {num_frames} frames")
+            geometry_data = self._extract_geometry(vggt_predictions, frame_indices)
+            coverage_result = self._greedy_maximum_coverage(
+                geometry_data, frame_indices, cache=self._voxel_cache
+            )
+        else:
+            logger.info(f"Extracting geometry for {num_frames} frames")
+            geometry_data = self._extract_geometry(vggt_predictions, frame_indices)
+
+            # Step 2 & 3: Apply greedy maximum coverage selection with caching
+            logger.info(f"Selecting {self.config.target_frames} frames using greedy coverage")
+            coverage_result = self._greedy_maximum_coverage(
+                geometry_data, frame_indices, cache=self._voxel_cache
+            )
+        selected_indices = coverage_result['selected_indices']
+        coverage_scores = coverage_result['coverage_scores']
+        voxel_sets = coverage_result['voxel_sets']
         
         # Compute final statistics
         total_coverage = len(set().union(*[voxel_sets[i] for i in selected_indices]))
@@ -206,8 +213,8 @@ class SpaceAwareFrameSampler(nn.Module):
         # Extract geometry and reconstruct 3D points
         geometry_data = self._extract_geometry(vggt_predictions, frame_indices)
         
-        # Apply greedy maximum coverage algorithm
-        coverage_result = self._greedy_maximum_coverage(geometry_data, frame_indices)
+        # Apply greedy maximum coverage algorithm with caching
+        coverage_result = self._greedy_maximum_coverage(geometry_data, frame_indices, cache=self._voxel_cache)
         selected_indices = coverage_result['selected_indices']
         coverage_scores = coverage_result['coverage_scores'] 
         total_coverage = coverage_result['total_coverage']
@@ -260,16 +267,30 @@ class SpaceAwareFrameSampler(nn.Module):
     
     def _compute_voxel_sets(
         self,
-        geometry_data: Dict[str, torch.Tensor]
+        geometry_data: Dict[str, torch.Tensor],
+        cache: Optional[Dict] = None
     ) -> Dict[int, Set[Tuple[int, int, int]]]:
         """
         Compute voxel sets for each frame using adaptive voxelization.
-        
+
         Algorithm steps:
         1. Filter valid points by confidence
         2. Compute adaptive voxel size: Δ = (1/λ) · min(max(Pvalid) - min(Pvalid))
         3. Voxelize: V(fi^m) = {⌊(p - min(Pvalid))/Δ⌋ | p ∈ Pi^m ∩ Pvalid}
+
+        Args:
+            geometry_data: Dictionary containing geometry information
+            cache: Optional cache dictionary to avoid recomputation
         """
+
+        # Generate cache key from geometry data and frame indices
+        frame_indices = geometry_data['frame_indices']
+        cache_key = f"voxel_sets_{hash(str(frame_indices))}"
+
+        # Check cache first
+        if cache is not None and cache_key in cache:
+            logger.debug(f"Using cached voxel sets for {len(frame_indices)} frames")
+            return cache[cache_key]
         
         world_points = geometry_data['world_points']  # [S, H, W, 3]
         world_points_conf = geometry_data['world_points_conf']  # [S, H, W]
@@ -347,19 +368,25 @@ class SpaceAwareFrameSampler(nn.Module):
                 voxel_set.add(tuple(coord.cpu().numpy()))
             
             voxel_sets[frame_idx] = voxel_set
-            
+
             logger.debug(f"Frame {frame_idx}: {len(valid_points)} points -> {len(voxel_set)} voxels")
-        
+
+        # Cache the result
+        if cache is not None:
+            cache[cache_key] = voxel_sets
+            logger.debug(f"Cached voxel sets for {len(frame_indices)} frames")
+
         return voxel_sets
     
     def _greedy_maximum_coverage(
         self,
-        voxel_sets: Dict[int, Set[Tuple[int, int, int]]],
-        frame_indices: List[int]
-    ) -> Tuple[List[int], List[float]]:
+        geometry_data: Dict[str, torch.Tensor],
+        frame_indices: List[int],
+        cache: Optional[Dict] = None
+    ) -> Dict:
         """
         Apply greedy maximum coverage selection algorithm.
-        
+
         Algorithm implementation:
         1. Initialize: S ← ∅, C ← ∅, R ← {1, ..., Nm}
         2. For t = 1 to Nk:
@@ -368,16 +395,24 @@ class SpaceAwareFrameSampler(nn.Module):
             c) S ← S ∪ {i*}, C ← C ∪ V(fi*^m), R ← R \ {i*}
         3. Return S
         """
-        
+
+        # Compute voxel sets using cache to avoid re-computation
+        voxel_sets = self._compute_voxel_sets(geometry_data, cache)
+
         # Initialize algorithm state
         S = []  # Selected frames
         C = set()  # Covered voxels
         R = set(frame_indices)  # Remaining candidates
         coverage_scores = []  # Track coverage gain at each iteration
-        
+
         target_frames = min(self.config.target_frames, len(frame_indices))
-        
-        logger.info(f"Starting greedy selection: {len(R)} candidates -> {target_frames} targets")
+
+        # Only log if this isn't using cached voxel sets
+        cache_key = f"voxel_sets_{hash(str(frame_indices))}"
+        if cache is None or cache_key not in cache:
+            logger.info(f"Starting greedy selection: {len(R)} candidates -> {target_frames} targets")
+        else:
+            logger.debug(f"Using cached greedy selection: {len(R)} candidates -> {target_frames} targets")
         
         for t in range(target_frames):
             if not R:  # No remaining candidates
@@ -417,8 +452,14 @@ class SpaceAwareFrameSampler(nn.Module):
         
         logger.info(f"Greedy selection completed: {len(S)} frames selected, "
                    f"total coverage: {len(C)} voxels")
-        
-        return S, coverage_scores
+
+        # Return structured result
+        return {
+            'selected_indices': S,
+            'coverage_scores': coverage_scores,
+            'voxel_sets': voxel_sets,
+            'total_coverage': len(C)
+        }
 
     def get_sampling_statistics(
         self,

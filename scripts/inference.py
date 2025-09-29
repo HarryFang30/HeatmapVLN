@@ -19,7 +19,11 @@ import cv2
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.utils.plotting_config import configure_matplotlib_fonts
 from src.utils.logger import setup_logger
+
+# Ensure figure titles handle Chinese instructions during inference runs.
+configure_matplotlib_fonts()
 
 
 def load_video_frames(video_path: str, max_frames: int = 32, target_size: tuple = (224, 224)) -> torch.Tensor:

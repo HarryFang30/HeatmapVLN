@@ -319,7 +319,13 @@ class SpatialMLLMPipeline(nn.Module):
         selected_frames = keyframe_result.get('original_frames')
         
         if self.config.verbose:
-            logger.info(f"Selected {len(selected_indices)} keyframes: {selected_indices.tolist()}")
+            # Dynamic count handling for list or list[list] structures
+            idx = selected_indices
+            if isinstance(idx, (list, tuple)) and idx and isinstance(idx[0], (list, tuple)):
+                count = len(idx[0])
+            else:
+                count = len(idx)
+            logger.info("Selected %d keyframes: %s", count, idx.tolist() if hasattr(idx, 'tolist') else idx)
         
         # Step 3: Dual-path feature extraction
         logger.info("Step 3: Dual-path feature extraction")
@@ -381,14 +387,25 @@ class SpatialMLLMPipeline(nn.Module):
                 # Move LLM tokens back to main device and apply projection
                 raw_llm_tokens = raw_llm_tokens.to(device=self.device)
                 llm_tokens = self.llm_projector(raw_llm_tokens)  # 2048 -> 1024 for compatibility
-                logger.info(f"✅ REAL LLM processing successful! Generated text: {llm_result.get('llm_output', '')[:100]}...")
+
+                # 🎯 SUCCESS: Real LLM processing completed
+                generated_text = llm_result.get('llm_output', '')
+                text_preview = generated_text[:100] + "..." if len(generated_text) > 100 else generated_text
+                logger.info(f"🎯 SUCCESS: Real Qwen2.5-VL spatial reasoning completed")
+                logger.info(f"   📝 Generated text: {text_preview}")
+                logger.info(f"   🧠 Using authentic LLM hidden states for heatmap generation")
+
             except Exception as e:
-                logger.error(f"❌ REAL LLM processing failed: {e}")
-                logger.warning("Falling back to fake LLM projection")
+                # ⚠️ FAILURE: Real LLM processing failed, using projection fallback
+                logger.error(f"⚠️ FAILURE: Real LLM processing failed: {e}")
+                logger.warning(f"   🔄 Falling back to spatial feature projection (no genuine LLM reasoning)")
+                logger.warning(f"   ⚡ Heatmaps will be generated from VGGT+DINOv3 features only")
                 llm_tokens = self.llm_projector(fused_features)
         else:
-            # Fallback to fake projector
-            logger.warning("❌ Using FAKE LLM projection - no real spatial reasoning!")
+            # 🔧 FALLBACK: No real LLM integration available
+            logger.warning("🔧 FALLBACK: No real LLM integration available")
+            logger.warning("   📊 Using spatial feature projection only (no language-enhanced reasoning)")
+            logger.warning("   🎯 Heatmaps based on pure VGGT+DINOv3 spatial features")
             llm_tokens = self.llm_projector(fused_features)
         
         # Step 6: Generate frame-indexed inter-frame heatmaps
