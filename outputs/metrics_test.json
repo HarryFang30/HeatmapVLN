@@ -1,0 +1,37 @@
+{
+  "video_path": "/home/VLN/test.mp4",
+  "instruction": "Navigate and analyze spatial relationships",
+  "algorithm_type": "fast",
+  "num_frames": 32,
+  "num_keyframes": 4,
+  "keyframe_indices": [
+    0,
+    25,
+    26,
+    2
+  ],
+  "heatmaps_shape": [
+    4,
+    3136,
+    3136
+  ],
+  "processing_time": {
+    "video_loading": 1.3787038326263428,
+    "frame_sampling": 0.0,
+    "pipeline_processing": 24.82851505279541,
+    "total": 28.47686219215393
+  },
+  "fallback_sampled_indices": [
+    0,
+    25,
+    26,
+    2
+  ],
+  "saved_heatmaps": [
+    "outputs/video_test_frame_0_heatmap_0.png",
+    "outputs/video_test_frame_25_heatmap_1.png",
+    "outputs/video_test_frame_26_heatmap_2.png",
+    "outputs/video_test_frame_2_heatmap_3.png"
+  ],
+  "summary_visualization": "outputs/summary_heatmaps.png"
+}
