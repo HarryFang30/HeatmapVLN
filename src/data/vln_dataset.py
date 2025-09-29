@@ -511,3 +511,201 @@ if __name__ == "__main__":
         print("Video frames shape:", sample['video_frames'].shape)
         print("Target heatmap shape:", sample['target_heatmap'].shape)
         print("Instruction:", sample['instruction'][:100] + "..." if len(sample['instruction']) > 100 else sample['instruction'])
+
+
+class HeatmapDatasetAdapter(Dataset):
+    """
+    Thin adapter to convert VLNTrainingDataset output to train.md compatible format.
+
+    Maps:
+    - 'video_frames' -> 'frames'
+    - 'instruction' -> 'text'
+    - single target_heatmap -> K frame-indexed heatmaps
+    - adds 'mask' field for valid heatmaps
+    """
+
+    def __init__(
+        self,
+        base_dataset: VLNTrainingDataset,
+        frames_per_clip: int = 8,      # T frames
+        heatmap_per_clip: int = 4,     # K keyframes
+        hm_size: Tuple[int, int] = (64, 64)
+    ):
+        """
+        Args:
+            base_dataset: Existing VLNTrainingDataset instance
+            frames_per_clip: T frames to sample from video
+            heatmap_per_clip: K keyframes to generate heatmaps for
+            hm_size: Target heatmap size (Hm, Wm)
+        """
+        self.base_dataset = base_dataset
+        self.frames_per_clip = frames_per_clip  # T
+        self.heatmap_per_clip = heatmap_per_clip  # K
+        self.hm_size = hm_size  # (Hm, Wm)
+
+        logger.info(f"HeatmapDatasetAdapter: T={frames_per_clip}, K={heatmap_per_clip}, hm_size={hm_size}")
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Convert base dataset output to train.md compatible format.
+
+        Returns:
+            Dict with train.md compatible fields:
+            - "frames": Tensor[T,3,H,W]
+            - "text": Optional[str]
+            - "gt_heatmaps": Tensor[K,Hm,Wm]
+            - "mask": Tensor[K]
+            - "meta": Dict
+        """
+        # Get base sample
+        base_sample = self.base_dataset[idx]
+
+        # Extract frames: [N_m, 3, H, W] -> [T, 3, H, W]
+        video_frames = base_sample['video_frames']  # [N_m, 3, H, W]
+        N_m = video_frames.shape[0]
+
+        # Sample T frames from N_m total frames
+        if N_m >= self.frames_per_clip:
+            # Uniform sampling
+            indices = torch.linspace(0, N_m-1, self.frames_per_clip).long()
+            frames = video_frames[indices]  # [T, 3, H, W]
+        else:
+            # Pad if not enough frames
+            frames = video_frames
+            while frames.shape[0] < self.frames_per_clip:
+                frames = torch.cat([frames, frames[-1:]], dim=0)
+            frames = frames[:self.frames_per_clip]  # [T, 3, H, W]
+
+        # Generate K frame-indexed heatmaps from base target_heatmap
+        base_heatmap = base_sample['target_heatmap']  # [H, W]
+        H, W = base_heatmap.shape
+
+        # Resize to target heatmap size
+        base_heatmap_resized = F.interpolate(
+            base_heatmap.unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+            size=self.hm_size,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0).squeeze(0)  # [Hm, Wm]
+
+        # Generate K different heatmaps (mock implementation)
+        # TODO: Replace with real frame-indexed heatmap generation
+        gt_heatmaps = []
+        mask = []
+
+        for k in range(self.heatmap_per_clip):
+            if len(base_sample['target_points']) > 0:
+                # Create variation of base heatmap for different keyframes
+                # This is a placeholder - real implementation should use geometry projection
+                heatmap_k = base_heatmap_resized.clone()
+
+                # Add slight spatial shift to simulate different viewpoints
+                shift_x = int((k - self.heatmap_per_clip/2) * 2)  # Small shifts
+                shift_y = int((k - self.heatmap_per_clip/2) * 1)
+
+                if shift_x != 0 or shift_y != 0:
+                    # Apply spatial shift using roll
+                    heatmap_k = torch.roll(heatmap_k, shifts=(shift_y, shift_x), dims=(0, 1))
+
+                # Normalize to probability distribution
+                if heatmap_k.sum() > 1e-8:
+                    heatmap_k = heatmap_k / heatmap_k.sum()
+                    mask.append(1.0)  # Valid heatmap
+                else:
+                    heatmap_k = torch.zeros_like(heatmap_k)
+                    mask.append(0.0)  # Invalid heatmap
+
+                gt_heatmaps.append(heatmap_k)
+            else:
+                # No target points - create zero heatmap
+                gt_heatmaps.append(torch.zeros(self.hm_size))
+                mask.append(0.0)  # Invalid heatmap
+
+        gt_heatmaps = torch.stack(gt_heatmaps)  # [K, Hm, Wm]
+        mask = torch.tensor(mask, dtype=torch.float32)  # [K]
+
+        # Convert to train.md format
+        adapted_sample = {
+            "frames": frames,                           # [T, 3, H, W]
+            "text": base_sample['instruction'] if base_sample['instruction'] else None,  # Optional[str]
+            "gt_heatmaps": gt_heatmaps,                # [K, Hm, Wm]
+            "mask": mask,                              # [K]
+            "meta": {
+                **base_sample.get('metadata', {}),
+                'sample_id': base_sample.get('sample_id', idx),
+                'target_points': base_sample.get('target_points', []),
+                'original_frame_shape': (H, W),
+                'adapted_frame_count': self.frames_per_clip,
+                'keyframe_count': self.heatmap_per_clip
+            }
+        }
+
+        return adapted_sample
+
+
+def create_heatmap_dataloader(
+    base_dataset: VLNTrainingDataset,
+    frames_per_clip: int = 8,
+    heatmap_per_clip: int = 4,
+    hm_size: Tuple[int, int] = (64, 64),
+    batch_size: int = 16,
+    shuffle: bool = True,
+    num_workers: int = 8,
+    pin_memory: bool = True
+) -> DataLoader:
+    """
+    Create DataLoader with HeatmapDatasetAdapter for train.md compatible format.
+
+    Args:
+        base_dataset: Existing VLNTrainingDataset
+        frames_per_clip: T frames per sample
+        heatmap_per_clip: K heatmaps per sample
+        hm_size: Heatmap size (Hm, Wm)
+        batch_size: Batch size
+        shuffle: Whether to shuffle
+        num_workers: Number of workers
+        pin_memory: Pin memory for GPU transfer
+
+    Returns:
+        DataLoader with train.md compatible batches
+    """
+
+    # Create adapter
+    adapter = HeatmapDatasetAdapter(
+        base_dataset=base_dataset,
+        frames_per_clip=frames_per_clip,
+        heatmap_per_clip=heatmap_per_clip,
+        hm_size=hm_size
+    )
+
+    def heatmap_collate_fn(batch):
+        """Collate function for heatmap training format"""
+        # Stack tensors
+        frames = torch.stack([item['frames'] for item in batch])        # [B, T, 3, H, W]
+        gt_heatmaps = torch.stack([item['gt_heatmaps'] for item in batch])  # [B, K, Hm, Wm]
+        mask = torch.stack([item['mask'] for item in batch])            # [B, K]
+
+        # Collect text and metadata
+        texts = [item['text'] for item in batch]
+        metas = [item['meta'] for item in batch]
+
+        return {
+            'frames': frames,
+            'gt_heatmaps': gt_heatmaps,
+            'mask': mask,
+            'texts': texts,
+            'metas': metas
+        }
+
+    return DataLoader(
+        adapter,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=heatmap_collate_fn,
+        drop_last=True
+    )

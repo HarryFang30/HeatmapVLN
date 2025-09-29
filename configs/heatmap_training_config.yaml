@@ -1,0 +1,60 @@
+seed: 42
+
+# 数据
+data:
+  root: /path/to/habitat_dataset
+  frames_per_clip: 8             # T
+  heatmap_per_clip: 4            # K
+  image_size: [384, 384]
+  init_hm_size: [64, 64]         # 课程起始
+  num_workers: 8
+  pin_memory: true
+
+# 三阶段 + 课程
+training:
+  stages:
+    - name: warmup_head
+      epochs: 2
+      freeze_llm: true
+      lora: false
+      hm_size: [64, 64]
+    - name: finetune_all
+      epochs: 8
+      freeze_llm: false
+      lora: true
+      lora_rank: 16
+      hm_size: [128, 128]
+    - name: finetune_all_highres
+      epochs: 10
+      freeze_llm: false
+      lora: true
+      lora_rank: 16
+      hm_size: [224, 224]
+
+# 优化与调度
+optim:
+  optimizer: adamw
+  head_lr: 1.0e-3
+  lora_lr: 5.0e-5
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.05
+  batch_size: 16
+  grad_accum_steps: 1
+
+# 损失（仅主损失）
+loss:
+  type: kl_ce                   # kl_ce / mse 可切换
+  focal:
+    enabled: false
+    alpha: 0.25
+    gamma: 2.0
+
+# 日志/保存
+log:
+  out_dir: ./outputs
+  save_every_epochs: 1
+  vis_every_steps: 200
+  max_ckpts: 3
