@@ -1,0 +1,341 @@
+.
+|-- Dockerfile
+|-- FLEXIBLE_ALGORITHM_SELECTION.md
+|-- README.md
+|-- __init__.py
+|-- checkpoints
+|-- configs
+|   |-- default_config.yaml
+|   |-- dinov3_config.yaml
+|   `-- training_config.yaml
+|-- data
+|-- logs
+|   `-- vln_project.log
+|-- main.py
+|-- models
+|   |-- dinov3
+|   |   |-- LICENSE.md
+|   |   |-- README.md
+|   |   |-- config.json
+|   |   |-- model-00001-of-00006.safetensors
+|   |   |-- model-00002-of-00006.safetensors
+|   |   |-- model-00003-of-00006.safetensors
+|   |   |-- model-00004-of-00006.safetensors
+|   |   |-- model-00005-of-00006.safetensors
+|   |   |-- model-00006-of-00006.safetensors
+|   |   |-- model.safetensors.index.json
+|   |   `-- preprocessor_config.json
+|   |-- qwen_2.5_vl
+|   |   |-- README.md
+|   |   |-- chat_template.json
+|   |   |-- config.json
+|   |   |-- generation_config.json
+|   |   |-- merges.txt
+|   |   |-- model-00001-of-00005.safetensors
+|   |   |-- model-00002-of-00005.safetensors
+|   |   |-- model-00003-of-00005.safetensors
+|   |   |-- model-00004-of-00005.safetensors
+|   |   |-- model-00005-of-00005.safetensors
+|   |   |-- model.safetensors.index.json
+|   |   |-- preprocessor_config.json
+|   |   |-- tokenizer.json
+|   |   |-- tokenizer_config.json
+|   |   `-- vocab.json
+|   `-- vggt
+|       |-- README.md
+|       |-- config.json
+|       |-- model.pt
+|       `-- model.safetensors
+|-- outputs
+|   |-- metrics_test.json
+|   |-- summary_heatmaps.png
+|   |-- video_test_frame_0_heatmap_0.png
+|   |-- video_test_frame_1_heatmap_6.png
+|   |-- video_test_frame_2_heatmap_1.png
+|   |-- video_test_frame_32_heatmap_2.png
+|   |-- video_test_frame_33_heatmap_3.png
+|   |-- video_test_frame_36_heatmap_4.png
+|   |-- video_test_frame_38_heatmap_5.png
+|   `-- video_test_frame_3_heatmap_7.png
+|-- requirements.txt
+|-- scripts
+|   |-- __init__.py
+|   |-- evaluate.py
+|   |-- inference.py
+|   |-- preprocess.py
+|   |-- pretrain.py
+|   |-- train.py
+|   `-- train_finetune.py
+|-- src
+|   |-- __init__.py
+|   |-- __pycache__
+|   |   `-- __init__.cpython-311.pyc
+|   |-- data
+|   |   |-- __init__.py
+|   |   |-- __pycache__
+|   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |-- algorithm_factory.cpython-311.pyc
+|   |   |   |-- algorithm_registry.cpython-311.pyc
+|   |   |   |-- collate.cpython-311.pyc
+|   |   |   |-- dataloader.cpython-311.pyc
+|   |   |   |-- dataset.cpython-311.pyc
+|   |   |   |-- enhanced_frame_sampler.cpython-311.pyc
+|   |   |   |-- frame_sampler.cpython-311.pyc
+|   |   |   |-- keyframe_selector.cpython-311.pyc
+|   |   |   |-- spatial_analysis.cpython-311.pyc
+|   |   |   `-- transforms.cpython-311.pyc
+|   |   |-- algorithm_comparison.py
+|   |   |-- algorithm_factory.py
+|   |   |-- algorithm_registry.py
+|   |   |-- collate.py
+|   |   |-- dataloader.py
+|   |   |-- dataset.py
+|   |   |-- enhanced_frame_sampler.py
+|   |   |-- frame_sampler.py
+|   |   |-- keyframe_selector.py
+|   |   |-- spatial_analysis.py
+|   |   |-- transforms.py
+|   |   `-- vln_dataset.py
+|   |-- models
+|   |   |-- __init__.py
+|   |   |-- __pycache__
+|   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |-- dinov3_compatibility.cpython-311.pyc
+|   |   |   |-- memory_efficient_llm.cpython-311.pyc
+|   |   |   |-- performance_optimizer.cpython-311.pyc
+|   |   |   |-- real_llm_integration.cpython-311.pyc
+|   |   |   |-- spatial_mllm_compat.cpython-311.pyc
+|   |   |   `-- vggt_integration.cpython-311.pyc
+|   |   |-- diffusion
+|   |   |-- dinov3
+|   |   |   |-- README.md
+|   |   |   |-- __init__.py
+|   |   |   |-- __pycache__
+|   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |-- aggregator.cpython-311.pyc
+|   |   |   |   |-- hub.cpython-311.pyc
+|   |   |   |   `-- vision_transformer.cpython-311.pyc
+|   |   |   |-- aggregator.py
+|   |   |   |-- hub.py
+|   |   |   |-- layers
+|   |   |   |   |-- __init__.py
+|   |   |   |   |-- __pycache__
+|   |   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |   |-- attention.cpython-311.pyc
+|   |   |   |   |   |-- block.cpython-311.pyc
+|   |   |   |   |   |-- layer_scale.cpython-311.pyc
+|   |   |   |   |   |-- patch_embed.cpython-311.pyc
+|   |   |   |   |   `-- rope_position_encoding.cpython-311.pyc
+|   |   |   |   |-- attention.py
+|   |   |   |   |-- block.py
+|   |   |   |   |-- layer_scale.py
+|   |   |   |   |-- patch_embed.py
+|   |   |   |   `-- rope_position_encoding.py
+|   |   |   |-- vggt_compat
+|   |   |   |   |-- __init__.py
+|   |   |   |   |-- __pycache__
+|   |   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |   |-- layers.cpython-311.pyc
+|   |   |   |   |   `-- rope.cpython-311.pyc
+|   |   |   |   |-- layers.py
+|   |   |   |   `-- rope.py
+|   |   |   `-- vision_transformer.py
+|   |   |-- dinov3_compatibility.py
+|   |   |-- feature_fusion.py
+|   |   |-- heatmap
+|   |   |   |-- README.md
+|   |   |   |-- __init__.py
+|   |   |   |-- __pycache__
+|   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |-- converter.cpython-311.pyc
+|   |   |   |   |-- generator.cpython-311.pyc
+|   |   |   |   |-- upsampling.cpython-311.pyc
+|   |   |   |   `-- visualizer.cpython-311.pyc
+|   |   |   |-- converter.py
+|   |   |   |-- generator.py
+|   |   |   |-- upsampling.py
+|   |   |   `-- visualizer.py
+|   |   |-- llm
+|   |   |   |-- __init__.py
+|   |   |   |-- __pycache__
+|   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |-- configuration_qwen2_5_vl.cpython-311.pyc
+|   |   |   |   |-- modeling_qwen2_5_vl.cpython-311.pyc
+|   |   |   |   |-- modular_qwen2_5_vl.cpython-311.pyc
+|   |   |   |   `-- processing_qwen2_5_vl.cpython-311.pyc
+|   |   |   |-- configuration_qwen2_5_vl.py
+|   |   |   |-- modeling_qwen2_5_vl.py
+|   |   |   |-- modular_qwen2_5_vl.py
+|   |   |   `-- processing_qwen2_5_vl.py
+|   |   |-- memory_efficient_llm.py
+|   |   |-- mlp
+|   |   |   |-- __init__.py
+|   |   |   |-- __pycache__
+|   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   `-- mlp.cpython-311.pyc
+|   |   |   `-- mlp.py
+|   |   |-- performance_optimizer.py
+|   |   |-- qwen2_5_vl
+|   |   |   |-- __init__.py
+|   |   |   |-- __pycache__
+|   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |-- configuration_qwen2_5_vl.cpython-311.pyc
+|   |   |   |   |-- modeling_qwen2_5_vl.cpython-311.pyc
+|   |   |   |   `-- processing_qwen2_5_vl.cpython-311.pyc
+|   |   |   |-- configuration_qwen2_5_vl.py
+|   |   |   |-- modeling_qwen2_5_vl.py
+|   |   |   `-- processing_qwen2_5_vl.py
+|   |   |-- real_llm_integration.py
+|   |   |-- spatial_mllm_compat.py
+|   |   |-- spatial_mllm_enhanced.py
+|   |   |-- vggt
+|   |   |   |-- CODE_OF_CONDUCT.md
+|   |   |   |-- CONTRIBUTING.md
+|   |   |   |-- LICENSE.txt
+|   |   |   |-- README.md
+|   |   |   |-- docs
+|   |   |   |   `-- package.md
+|   |   |   |-- heads
+|   |   |   |   |-- __pycache__
+|   |   |   |   |   |-- camera_head.cpython-311.pyc
+|   |   |   |   |   |-- dpt_head.cpython-311.pyc
+|   |   |   |   |   |-- head_act.cpython-311.pyc
+|   |   |   |   |   |-- track_head.cpython-311.pyc
+|   |   |   |   |   `-- utils.cpython-311.pyc
+|   |   |   |   |-- camera_head.py
+|   |   |   |   |-- dpt_head.py
+|   |   |   |   |-- head_act.py
+|   |   |   |   |-- track_head.py
+|   |   |   |   |-- track_modules
+|   |   |   |   |   |-- __init__.py
+|   |   |   |   |   |-- __pycache__
+|   |   |   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |   |   |-- base_track_predictor.cpython-311.pyc
+|   |   |   |   |   |   |-- blocks.cpython-311.pyc
+|   |   |   |   |   |   |-- modules.cpython-311.pyc
+|   |   |   |   |   |   `-- utils.cpython-311.pyc
+|   |   |   |   |   |-- base_track_predictor.py
+|   |   |   |   |   |-- blocks.py
+|   |   |   |   |   |-- modules.py
+|   |   |   |   |   `-- utils.py
+|   |   |   |   `-- utils.py
+|   |   |   |-- layers
+|   |   |   |   |-- __init__.py
+|   |   |   |   |-- __pycache__
+|   |   |   |   |   |-- __init__.cpython-311.pyc
+|   |   |   |   |   |-- attention.cpython-311.pyc
+|   |   |   |   |   |-- block.cpython-311.pyc
+|   |   |   |   |   |-- drop_path.cpython-311.pyc
+|   |   |   |   |   |-- layer_scale.cpython-311.pyc
+|   |   |   |   |   |-- mlp.cpython-311.pyc
+|   |   |   |   |   |-- patch_embed.cpython-311.pyc
+|   |   |   |   |   |-- rope.cpython-311.pyc
+|   |   |   |   |   |-- swiglu_ffn.cpython-311.pyc
+|   |   |   |   |   `-- vision_transformer.cpython-311.pyc
+|   |   |   |   |-- attention.py
+|   |   |   |   |-- block.py
+|   |   |   |   |-- drop_path.py
+|   |   |   |   |-- layer_scale.py
+|   |   |   |   |-- mlp.py
+|   |   |   |   |-- patch_embed.py
+|   |   |   |   |-- rope.py
+|   |   |   |   |-- swiglu_ffn.py
+|   |   |   |   `-- vision_transformer.py
+|   |   |   |-- models
+|   |   |   |   |-- __pycache__
+|   |   |   |   |   |-- aggregator.cpython-311.pyc
+|   |   |   |   |   `-- vggt.cpython-311.pyc
+|   |   |   |   |-- aggregator.py
+|   |   |   |   `-- vggt.py
+|   |   |   |-- pyproject.toml
+|   |   |   |-- requirements.txt
+|   |   |   |-- training
+|   |   |   |   |-- README.md
+|   |   |   |   |-- __init__.py
+|   |   |   |   |-- config
+|   |   |   |   |   |-- default.yaml
+|   |   |   |   |   `-- default_dataset.yaml
+|   |   |   |   |-- data
+|   |   |   |   |   |-- __init__.py
+|   |   |   |   |   |-- augmentation.py
+|   |   |   |   |   |-- base_dataset.py
+|   |   |   |   |   |-- composed_dataset.py
+|   |   |   |   |   |-- dataset_util.py
+|   |   |   |   |   |-- datasets
+|   |   |   |   |   |   |-- co3d.py
+|   |   |   |   |   |   `-- vkitti.py
+|   |   |   |   |   |-- dynamic_dataloader.py
+|   |   |   |   |   |-- preprocess
+|   |   |   |   |   |   `-- vkitti.sh
+|   |   |   |   |   |-- track_util.py
+|   |   |   |   |   `-- worker_fn.py
+|   |   |   |   |-- launch.py
+|   |   |   |   |-- loss.py
+|   |   |   |   |-- train_utils
+|   |   |   |   |   |-- __init__.py
+|   |   |   |   |   |-- checkpoint.py
+|   |   |   |   |   |-- distributed.py
+|   |   |   |   |   |-- freeze.py
+|   |   |   |   |   |-- general.py
+|   |   |   |   |   |-- gradient_clip.py
+|   |   |   |   |   |-- logging.py
+|   |   |   |   |   |-- normalization.py
+|   |   |   |   |   |-- optimizer.py
+|   |   |   |   |   `-- tb_writer.py
+|   |   |   |   `-- trainer.py
+|   |   |   |-- utils
+|   |   |   |   |-- geometry.py
+|   |   |   |   |-- load_fn.py
+|   |   |   |   |-- pose_enc.py
+|   |   |   |   |-- rotation.py
+|   |   |   |   `-- visual_track.py
+|   |   |   |-- vggt
+|   |   |   `-- visual_util.py
+|   |   `-- vggt_integration.py
+|   |-- testing
+|   |   |-- __pycache__
+|   |   |   `-- flexible_test_framework.cpython-311.pyc
+|   |   `-- flexible_test_framework.py
+|   `-- utils
+|       |-- __init__.py
+|       |-- __pycache__
+|       |   |-- __init__.cpython-311.pyc
+|       |   |-- checkpoint.cpython-311.pyc
+|       |   |-- config.cpython-311.pyc
+|       |   |-- exceptions.cpython-311.pyc
+|       |   |-- logger.cpython-311.pyc
+|       |   |-- metrics.cpython-311.pyc
+|       |   |-- path_utils.cpython-311.pyc
+|       |   |-- plotting_config.cpython-311.pyc
+|       |   |-- validation.cpython-311.pyc
+|       |   `-- visualization.cpython-311.pyc
+|       |-- checkpoint.py
+|       |-- config.py
+|       |-- exceptions.py
+|       |-- logger.py
+|       |-- metrics.py
+|       |-- path_utils.py
+|       |-- plotting_config.py
+|       |-- validation.py
+|       `-- visualization.py
+|-- tests
+|   |-- README.md
+|   |-- configs
+|   |   `-- test_config.yaml
+|   |-- data
+|   |-- instructions
+|   |   |-- exploration_detailed.txt
+|   |   |-- navigation_basic.txt
+|   |   `-- robot_perspective.json
+|   |-- outputs
+|   |   `-- test_results
+|   |       |-- processing_metadata.json
+|   |       `-- vln_single_heatmap_results.png
+|   |-- results
+|   `-- scripts
+|       |-- run_all_tests.py
+|       `-- test_pipeline.py
+|-- tree.txt
+`-- visualizations
+
+62 directories, 276 files
