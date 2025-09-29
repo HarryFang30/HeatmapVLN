@@ -74,17 +74,20 @@ pip install -r requirements.txt
 ### 2. Basic Usage
 
 ```bash
-# Train the model
-python main.py --config configs/default_config.yaml --mode train
+# Single video processing (basic)
+python main.py --video /path/to/video.mp4
 
-# Run inference on a video
-python main.py --config configs/default_config.yaml --mode inference --video_path /path/to/video.mp4
+# Single video with custom instruction
+python main.py --video /path/to/video.mp4 --instruction "Navigate to the kitchen"
 
-# Evaluate on benchmarks
-python main.py --config configs/default_config.yaml --mode eval --benchmark VSI-Bench
+# Batch processing multiple videos
+python main.py --batch video1.mp4 video2.mp4 video3.mp4
 
-# Preprocess data
-python main.py --config configs/default_config.yaml --mode preprocess --input_dir /raw/data --output_dir /processed/data
+# Algorithm benchmarking
+python main.py --benchmark --video /path/to/video.mp4
+
+# Using configuration file
+python main.py --config configs/custom.yaml --video /path/to/video.mp4
 ```
 
 ## 📁 Project Structure
@@ -116,6 +119,152 @@ Project/
 ├── requirements.txt           # Python dependencies
 └── README.md                 # This file
 ```
+
+## 📋 Command Line Parameters
+
+The `main.py` script provides a comprehensive command-line interface for all VLN operations:
+
+### Core Input Options
+
+| Parameter | Type | Description | Examples |
+|-----------|------|-------------|----------|
+| `--video` | str | Single video file path | `--video /path/to/video.mp4` |
+| `--images` | str | Image sequence directory | `--images /path/to/frames/` |
+| `--batch` | list | Multiple video files for batch processing | `--batch video1.mp4 video2.mp4 video3.mp4` |
+
+### Processing Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--instruction` | str | "Navigate and analyze spatial relationships" | VLN navigation instruction text |
+| `--algorithm` | str | "enhanced" | Sampling algorithm: `fast`, `quality`, `enhanced` |
+| `--keyframes` | int | 8 | Number of keyframes to select from video |
+| `--max_frames` | int | 32 | Maximum frames to load from video (candidate pool) |
+| `--sample_fps` | float | None | Sample frames based on FPS (overrides max_frames) |
+
+### Configuration and Output
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--config` | str | None | YAML configuration file path |
+| `--output_dir` | str | "./outputs" | Output directory for results |
+| `--no_visualization` | flag | False | Disable visualization output |
+| `--no_save` | flag | False | Disable file saving |
+
+### Operation Modes
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `--benchmark` | flag | Run algorithm benchmark mode |
+| `--profile` | flag | Enable performance profiling |
+| `--verbose` / `-v` | flag | Enable verbose logging |
+| `--optimize_memory` | flag | Optimize LLM memory usage |
+
+### 🎮 Usage Examples
+
+#### Single Video Processing
+```bash
+# Basic processing with default settings
+python main.py --video test_video.mp4
+
+# Custom instruction with specific algorithm
+python main.py --video test_video.mp4 \
+    --instruction "Navigate to the kitchen and find objects" \
+    --algorithm enhanced \
+    --keyframes 6
+
+# High-resolution processing with more frames
+python main.py --video test_video.mp4 \
+    --max_frames 64 \
+    --keyframes 16 \
+    --verbose
+
+# FPS-based sampling
+python main.py --video test_video.mp4 \
+    --sample_fps 2.0 \
+    --keyframes 8
+```
+
+#### Batch Processing
+```bash
+# Process multiple videos with same settings
+python main.py --batch \
+    kitchen_video.mp4 \
+    bedroom_video.mp4 \
+    living_room.mp4 \
+    --instruction "Analyze spatial layout" \
+    --algorithm quality
+
+# Batch processing with custom output directory
+python main.py --batch *.mp4 \
+    --output_dir ./batch_results \
+    --keyframes 10
+```
+
+#### Algorithm Benchmarking
+```bash
+# Compare all algorithms on single video
+python main.py --benchmark --video test_video.mp4
+
+# Benchmark with performance profiling
+python main.py --benchmark --video test_video.mp4 \
+    --profile --verbose
+```
+
+#### Advanced Configuration
+```bash
+# Use custom configuration file
+python main.py --config configs/high_quality.yaml \
+    --video test_video.mp4
+
+# Memory optimization for large videos
+python main.py --video large_video.mp4 \
+    --optimize_memory \
+    --max_frames 24 \
+    --keyframes 6
+
+# Research mode with all outputs
+python main.py --video research_video.mp4 \
+    --verbose \
+    --profile \
+    --output_dir ./research_results
+```
+
+#### Image Sequence Processing
+```bash
+# Process image sequence (frames extracted from video)
+python main.py --images /path/to/frame_sequence/ \
+    --instruction "Navigate through the space"
+```
+
+### 🔍 Parameter Details
+
+#### Algorithm Types
+- **`fast`**: Quick uniform sampling, minimal computation
+- **`quality`**: Balanced quality-speed tradeoff with spatial analysis
+- **`enhanced`**: Advanced multi-objective submodular optimization
+
+#### Frame Sampling Strategy
+- **`max_frames`**: Sets candidate pool size (N_m frames loaded from video)
+- **`keyframes`**: Final selection count (N_k keyframes processed by pipeline)
+- **`sample_fps`**: Alternative sampling based on target framerate
+
+#### Memory Optimization
+- **`optimize_memory`**: Reduces LLM video pixel budget for large videos
+- Automatically calculates optimal memory allocation based on frame count
+
+#### Output Control
+- **`no_visualization`**: Skips heatmap overlay generation (faster processing)
+- **`no_save`**: Runs in preview mode without saving files
+- **`verbose`**: Detailed progress logging and debugging information
+
+### 💡 Pro Tips
+
+1. **For Large Videos**: Use `--optimize_memory --max_frames 24 --keyframes 6`
+2. **For Quality Results**: Use `--algorithm enhanced --keyframes 12 --max_frames 48`
+3. **For Speed**: Use `--algorithm fast --keyframes 4 --no_visualization`
+4. **For Debugging**: Add `--verbose --profile` to any command
+5. **For Batch Jobs**: Use `--no_visualization` to speed up processing
 
 ## 🔧 Configuration
 
@@ -163,108 +312,152 @@ training:
       freeze_llm: false
 ```
 
-## 🎮 Usage Examples
+## 🚀 Production-Ready VLN Pipeline
 
-### Training
+The main.py script provides a **production-ready implementation** for real-world VLN applications:
 
+### 🎯 Key Features
+
+- **Real-time inference**: Process videos and generate frame-indexed heatmaps
+- **Multi-algorithm support**: Fast, quality, and enhanced sampling algorithms
+- **Batch processing**: Handle multiple videos efficiently
+- **Memory optimization**: Handle large videos with smart memory management
+- **Comprehensive output**: Heatmaps, metrics, visualizations, and detailed logs
+- **Flexible input**: Support for videos, image sequences, and batch processing
+
+### 📊 Performance Characteristics
+
+| Mode | Speed | Quality | Memory Usage | Best For |
+|------|-------|---------|--------------|----------|
+| `fast` | ⚡⚡⚡ | ⭐⭐ | 🟢 Low | Quick prototyping, batch jobs |
+| `quality` | ⚡⚡ | ⭐⭐⭐ | 🟡 Medium | Balanced processing |
+| `enhanced` | ⚡ | ⭐⭐⭐⭐ | 🔴 High | Research, high-quality results |
+
+### 🔄 Typical Workflows
+
+#### Research Workflow
 ```bash
-# Basic training
-python main.py --config configs/default_config.yaml --mode train
+# 1. Single video analysis with full output
+python main.py --video research_sample.mp4 \
+    --algorithm enhanced \
+    --keyframes 12 \
+    --max_frames 48 \
+    --verbose \
+    --profile
 
-# Training with custom data path
-python main.py --config configs/default_config.yaml --mode train --data_path /path/to/training/data
+# 2. Algorithm comparison
+python main.py --benchmark --video research_sample.mp4
 
-# Resume from checkpoint
-python main.py --config configs/default_config.yaml --mode train --resume /path/to/checkpoint.pth
-
-# Debug mode
-python main.py --config configs/default_config.yaml --mode train --debug
+# 3. Parameter exploration
+python main.py --video research_sample.mp4 --keyframes 4 --algorithm fast
+python main.py --video research_sample.mp4 --keyframes 8 --algorithm quality
+python main.py --video research_sample.mp4 --keyframes 16 --algorithm enhanced
 ```
 
-### Inference
-
+#### Production Workflow
 ```bash
-# Basic inference
-python main.py --config configs/default_config.yaml --mode inference --video_path video.mp4
+# 1. Batch processing for deployment
+python main.py --batch *.mp4 \
+    --algorithm quality \
+    --keyframes 8 \
+    --output_dir ./production_results \
+    --optimize_memory
 
-# With custom instruction
-python main.py --config configs/default_config.yaml --mode inference \
-    --video_path video.mp4 \
-    --instruction "Navigate to the kitchen and find the red cup"
-
-# Save to specific directory
-python main.py --config configs/default_config.yaml --mode inference \
-    --video_path video.mp4 \
-    --output_dir /path/to/save/results
+# 2. High-throughput processing
+python main.py --batch video_dataset/*.mp4 \
+    --algorithm fast \
+    --keyframes 6 \
+    --no_visualization \
+    --max_frames 24
 ```
 
-### Evaluation
-
+#### Development Workflow
 ```bash
-# Evaluate on VSI-Bench (default)
-python main.py --config configs/default_config.yaml --mode eval
+# 1. Quick testing
+python main.py --video test_sample.mp4 --verbose
 
-# Evaluate on specific benchmark
-python main.py --config configs/default_config.yaml --mode eval --benchmark RLBench
+# 2. Memory-constrained development
+python main.py --video large_test.mp4 \
+    --optimize_memory \
+    --max_frames 16 \
+    --keyframes 4
 
-# All supported benchmarks
-python main.py --config configs/default_config.yaml --mode eval --benchmark RLBench
-python main.py --config configs/default_config.yaml --mode eval --benchmark COLOSSEUM  
-python main.py --config configs/default_config.yaml --mode eval --benchmark GemBench
-python main.py --config configs/default_config.yaml --mode eval --benchmark VSI-Bench
-```
-
-### Data Preprocessing
-
-```bash
-# Preprocess video dataset
-python main.py --config configs/default_config.yaml --mode preprocess \
-    --input_dir /path/to/raw/videos \
-    --output_dir /path/to/processed/data
-
-# This will:
-# - Extract frames from videos (N_m frames per video)  
-# - Validate video files
-# - Process annotations
-# - Create train/val/test splits
-# - Generate metadata
+# 3. Custom configuration testing
+python main.py --config configs/dev_config.yaml \
+    --video test_sample.mp4 \
+    --verbose
 ```
 
 ## 📊 Output Examples
 
-### Inference Results
+### Single Video Processing Results
 
-After running inference, you'll get:
-
-```
-outputs/inference/
-├── video_name_heatmaps.png          # Combined heatmap visualization
-├── video_name_heatmap_1.png         # Individual heatmaps
-├── video_name_heatmap_2.png         
-├── video_name_selected_indices.npy  # Selected keyframe indices
-├── video_name_geometry_info.npz     # Extracted geometry information
-└── video_name_summary.json          # Results summary
-```
-
-### Training Outputs
+After running `python main.py --video sample.mp4`, you'll get:
 
 ```
-logs/
-├── vln_project.log                  # Training logs
-├── checkpoints/                     # Model checkpoints
-│   ├── checkpoint_epoch_10.pth
-│   └── model_last.pth
-└── visualizations/                  # Training visualizations
+outputs/
+├── video_sample_frame_5_heatmap_0.png   # Individual frame heatmaps
+├── video_sample_frame_17_heatmap_1.png  # with overlay visualizations
+├── video_sample_frame_23_heatmap_2.png
+├── video_sample_frame_34_heatmap_3.png
+├── summary_heatmaps.png                 # Combined visualization
+├── metrics_sample.json                  # Processing metrics and results
+└── algorithm_benchmark.json             # (if --benchmark used)
 ```
 
-### Evaluation Results
+### Batch Processing Results
+
+After running `python main.py --batch *.mp4 --output_dir batch_results`:
 
 ```
-results/evaluation/
-├── RLBench_results.json            # Benchmark results
-├── COLOSSEUM_results.json
-├── GemBench_results.json
-└── VSI-Bench_results.json
+batch_results/
+├── video_kitchen_frame_12_heatmap_0.png
+├── video_kitchen_frame_28_heatmap_1.png
+├── video_bedroom_frame_8_heatmap_0.png
+├── video_bedroom_frame_15_heatmap_1.png
+├── summary_heatmaps.png
+├── metrics_kitchen.json
+├── metrics_bedroom.json
+└── batch_processing_summary.json
+```
+
+### Benchmark Results
+
+After running `python main.py --benchmark --video test.mp4`:
+
+```
+outputs/
+├── algorithm_benchmark.json         # Algorithm comparison results
+├── fast_algorithm_heatmaps.png     # Results for each algorithm
+├── quality_algorithm_heatmaps.png
+├── enhanced_algorithm_heatmaps.png
+└── benchmark_summary.json          # Performance comparison
+```
+
+### Sample Metrics Output
+
+The `metrics_*.json` files contain detailed processing information:
+
+```json
+{
+  "video_path": "/path/to/video.mp4",
+  "instruction": "Navigate and analyze spatial relationships",
+  "algorithm_type": "enhanced",
+  "num_frames": 32,
+  "num_keyframes": 8,
+  "keyframe_indices": [5, 17, 23, 34, 51, 78, 89, 95],
+  "heatmaps_shape": [8, 224, 224],
+  "processing_time": {
+    "video_loading": 1.23,
+    "pipeline_processing": 28.45,
+    "total": 29.68
+  },
+  "saved_heatmaps": [
+    "outputs/video_sample_frame_5_heatmap_0.png",
+    "outputs/video_sample_frame_17_heatmap_1.png"
+  ],
+  "summary_visualization": "outputs/summary_heatmaps.png"
+}
 ```
 
 ## 🔬 Core Algorithm: Space-Aware Frame Sampling
