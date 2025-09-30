@@ -13,7 +13,6 @@ Key features:
 """
 
 import sys
-import os
 import argparse
 import yaml
 from pathlib import Path
@@ -34,7 +33,6 @@ import logging
 from src.data.vln_heatmap_adapter import VLNHeatmapDataset
 from src.models.vln_heatmap_model import VLNHeatmapModel
 from src.utils.losses import kl_ce_loss, mse_heatmap_loss, focal_kl_ce_loss
-from src.utils.visualization import save_heatmap_visualization
 
 # Setup logger
 logging.basicConfig(
@@ -383,7 +381,7 @@ def main(args):
 
     # Gradient scaler for mixed precision
     use_amp = config['optim']['amp'] in ['bf16', 'fp16']
-    scaler = GradScaler() if use_amp else None
+    scaler = GradScaler('cuda') if use_amp else None
 
     # Loop through training stages
     for stage in config['training']['stages']:

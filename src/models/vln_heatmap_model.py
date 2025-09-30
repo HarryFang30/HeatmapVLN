@@ -74,13 +74,39 @@ class VLNHeatmapModel(nn.Module):
         # Real implementation should use build_qwen_vision_backbone from your existing code
         logger.warning("Using placeholder backbone - replace with real Qwen vision backbone")
 
-        # Placeholder: simple CNN backbone
+        # Stronger placeholder: Multi-layer CNN backbone that can actually learn
+        # NOTE: Removed BatchNorm because batch_size=1 causes issues
         self.backbone = nn.Sequential(
+            # Block 1: 384x384 -> 192x192
             nn.Conv2d(3, 64, 7, 2, 3),
             nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # -> 96x96
+
+            # Block 2: 96x96 -> 48x48
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # -> 48x48
+
+            # Block 3: 48x48 -> 24x24
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # -> 24x24
+
+            # Block 4: 24x24 -> 12x12
+            nn.Conv2d(256, 512, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # -> 12x12
+
+            # Global pooling and projection
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(64, self.vision_dim)
+            nn.Linear(512, self.vision_dim)
         )
 
         # TODO: Replace with real implementation:
