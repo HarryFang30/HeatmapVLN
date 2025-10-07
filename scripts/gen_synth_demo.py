@@ -31,6 +31,8 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.heatmap_builder import build_intrinsics
+from src.data.mesh_scenes import build_simple_room
+from src.data.mesh_renderer import rasterize_triangles, invert_se3
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +98,9 @@ class SyntheticSceneGenerator:
         # Up vector
         u = np.cross(s, f)
 
-        # Build rotation matrix [right, up, -forward]
-        # In camera coordinates: X=right, Y=up, Z=-forward
-        R = np.stack([s, u, -f], axis=1)
+        # Build rotation matrix [right, up, forward]
+        # In camera coordinates: X=right, Y=up, Z=forward (depth)
+        R = np.stack([s, u, f], axis=1)
 
         # Build 4x4 transformation matrix
         T = np.eye(4, dtype=np.float32)
@@ -342,7 +344,8 @@ def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, spl
                            T: int = 8, width: int = 384, height: int = 384, hfov_deg: float = 60.0,
                            path_mode: str = 'circular', arc_deg: float = 60.0, radius: float = 3.0,
                            pose_mode: str = 'look_center', target: Tuple[float, float, float] = (0, 0, 2),
-                           noise_rot_deg: float = 0.0, noise_trans: float = 0.0):
+                           noise_rot_deg: float = 0.0, noise_trans: float = 0.0,
+                           render_mode: str = 'points', mesh_grid: int = 32):
     """
     Generate one synthetic clip with T frames.
 
@@ -361,6 +364,8 @@ def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, spl
         target: Target position (x, y, z) for face_target mode
         noise_rot_deg: Rotation noise in degrees
         noise_trans: Translation noise magnitude
+        render_mode: 'mesh' (surface rendering) or 'points' (point cloud)
+        mesh_grid: Grid subdivision for mesh rendering (higher = denser)
     """
     # Create output directories
     clip_dir = Path(output_root) / split / scene_name / f"clip_{clip_id:06d}"
@@ -394,14 +399,33 @@ def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, spl
     depth_maps = []
     pose_matrices = []
 
+    # Build mesh scene if using mesh rendering
+    if render_mode == 'mesh':
+        logger.info(f"Building mesh scene with grid={mesh_grid}")
+        mesh_verts, mesh_faces, mesh_colors = build_simple_room(grid=mesh_grid)
+        logger.info(f"  Mesh: {len(mesh_verts)} vertices, {len(mesh_faces)} triangles")
+
     for t in range(T):
         logger.info(f"  Rendering frame {t+1}/{T}")
 
         T_w_c = poses[t]
 
-        # Render RGB and depth
-        rgb = scene.render_rgb_image(T_w_c, intrinsics, width, height)
-        depth = scene.render_depth_map(T_w_c, intrinsics, width, height)
+        if render_mode == 'mesh':
+            # Mesh surface rendering
+            T_c_w = invert_se3(T_w_c)
+            rgb, depth = rasterize_triangles(
+                mesh_verts, mesh_faces, mesh_colors,
+                K=intrinsics, T_c_w=T_c_w,
+                W=width, H=height,
+                z_near=0.05, z_far=100.0,
+                backface_cull=False
+            )
+            # Convert RGB from [0,1] float to [0,255] uint8
+            rgb = (rgb * 255).astype(np.uint8)
+        else:
+            # Original point cloud rendering
+            rgb = scene.render_rgb_image(T_w_c, intrinsics, width, height)
+            depth = scene.render_depth_map(T_w_c, intrinsics, width, height)
 
         # Save RGB
         rgb_path = rgb_dir / f"{t:06d}.png"
@@ -486,6 +510,13 @@ def main():
     parser.add_argument('--noise_trans', type=float, default=0.0,
                         help='Translation noise magnitude')
 
+    # Rendering parameters
+    parser.add_argument('--render_mode', type=str, default='mesh',
+                        choices=['mesh', 'points'],
+                        help='Rendering mode: mesh (surface rendering) or points (point cloud)')
+    parser.add_argument('--mesh_grid', type=int, default=32,
+                        help='Mesh grid subdivision density (higher = denser coverage)')
+
     args = parser.parse_args()
 
     # Parse target
@@ -506,6 +537,7 @@ def main():
     logger.info("🚀 Starting synthetic demo data generation")
     logger.info(f"Parameters:")
     logger.info(f"  Clips: {args.clips}, Frames: {args.T}, Size: {args.W}x{args.H}")
+    logger.info(f"  Render: {args.render_mode}" + (f" (grid={args.mesh_grid})" if args.render_mode == 'mesh' else ""))
     logger.info(f"  Path: {args.path_mode}, Pose: {args.pose_mode}")
     if args.path_mode == 'short_arc':
         logger.info(f"  Arc: {args.arc_deg}°, Radius: {args.radius}m")
@@ -532,7 +564,9 @@ def main():
             pose_mode=args.pose_mode,
             target=target,
             noise_rot_deg=args.noise_rot_deg,
-            noise_trans=args.noise_trans
+            noise_trans=args.noise_trans,
+            render_mode=args.render_mode,
+            mesh_grid=args.mesh_grid
         )
         generated_clips.append(clip_dir)
 

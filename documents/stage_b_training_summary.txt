@@ -1,0 +1,106 @@
+================================================================================
+Stage-B Training Summary (2025-10-07)
+================================================================================
+
+## Task Completion ✅
+
+All requirements from stage_b_fix_and_push.md have been successfully completed:
+
+### Code Fixes:
+1. ✅ train_multistage.py: model.backbone → model.encoder (line 150)
+2. ✅ vln_heatmap_model.py: Added fuse_proj layer for GRU post-projection
+3. ✅ train_multistage.py: Added --init-ckpt parameter support
+4. ✅ build_param_groups: Support use_gru and layer-wise unfreezing
+5. ✅ training_config.yaml: Added Stage-B two-phase training config
+6. ✅ Fixed torch.amp.autocast API compatibility
+
+### Training Configuration:
+- Stage-A (warmup_head):       3 epochs, frozen encoder
+- Stage-B(1) (warmup_head_gru): 3 epochs, GRU enabled, frozen encoder  
+- Stage-B(2) (finetune_lastblock): 6 epochs, GRU + encoder.layer4+proj unfrozen
+
+================================================================================
+Training Results
+================================================================================
+
+Stage-A: warmup_head (Frozen Encoder, No GRU)
+  Params: 17,843,203 (head_renderer only)
+  Epoch 1: Train=8.300, Val=8.293
+  Epoch 2: Train=8.286, Val=8.282
+  Epoch 3: Train=8.276, Val=8.277
+
+Stage-B(1): warmup_head_gru (Frozen Encoder, GRU Enabled)
+  Params: 23,617,539 (head_renderer + temporal_fuse)
+  Epoch 1: Train=8.266, Val=8.254  ⬇ -0.023 vs Stage-A
+  Epoch 2: Train=8.241, Val=8.231  ⬇ -0.046
+  Epoch 3: Train=8.222, Val=8.220  ⬇ -0.057
+
+Stage-B(2): finetune_lastblock (GRU + Partial Encoder Unfreeze)
+  Params: 24,142,851 (head_renderer + temporal_fuse + encoder_layer4_proj)
+  Epoch 1: Train=8.204, Val=8.182  ⬇ -0.038 vs Stage-B(1)
+  Epoch 2: Train=8.164, Val=8.140  ⬇ -0.080
+  Epoch 3: Train=8.122, Val=8.099  ⬇ -0.121
+  Epoch 4: Train=8.084, Val=8.066  ⬇ -0.154
+  Epoch 5: Train=8.056, Val=8.046  ⬇ -0.174
+  Epoch 6: Train=8.040, Val=8.036  ⬇ -0.184 ✅
+
+================================================================================
+Key Achievements
+================================================================================
+
+✅ Val NLL Improvement: 8.277 → 8.036 (0.241 reduction, 2.9% improvement)
+✅ Stage-A → Stage-B(2): 0.241 NLL reduction (exceeds 0.2 target)
+✅ GRU contribution: -0.057 NLL improvement
+✅ Partial unfreezing contribution: -0.184 additional improvement
+✅ No divergence or instability observed
+✅ Steady downward trend maintained throughout all stages
+
+================================================================================
+Parameter Groups Verified
+================================================================================
+
+Stage-A:
+  - head_renderer: 17.8M params @ lr=3e-3
+
+Stage-B(1):
+  - head_renderer: 17.8M params @ lr=3e-3
+  - temporal_fuse: 5.8M params @ lr=1e-3
+
+Stage-B(2):
+  - head_renderer: 17.8M params @ lr=3e-3
+  - temporal_fuse: 5.8M params @ lr=1e-3
+  - encoder_layer4_proj: 525K params @ lr=1e-4
+
+================================================================================
+Next Steps (Optional)
+================================================================================
+
+1. Run evaluation with visualization:
+   python scripts/eval_heatmap.py --config configs/training_config.yaml \
+     --ckpt outputs/checkpoints/checkpoint_finetune_lastblock_epoch_6.pt --save-vis
+
+2. (Optional) Continue training for higher resolution:
+   - Update config: hm_size=[128, 128] or [224, 224]
+   - Train additional 5-10 epochs
+
+3. (Optional) Further data optimization:
+   - Reduce sigma to 1.6 for lower entropy
+   - Generate more clips (60 train + 20 val)
+
+================================================================================
+Files Modified
+================================================================================
+
+Core Implementation:
+  - src/models/vln_heatmap_model.py (added fuse_proj)
+  - scripts/train_multistage.py (fixed encoder refs, added init-ckpt, updated param groups)
+  - configs/training_config.yaml (Stage-B config, agg=gru, amp=bf16)
+
+Generated Outputs:
+  - outputs/checkpoints/checkpoint_warmup_head_gru_epoch_*.pt
+  - outputs/checkpoints/checkpoint_finetune_lastblock_epoch_*.pt
+  - outputs/stage_b_training_v2.log
+
+================================================================================
+Status: ✅ ALL TASKS COMPLETED
+================================================================================

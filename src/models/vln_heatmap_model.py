@@ -129,8 +129,11 @@ class VLNHeatmapModel(nn.Module):
                 batch_first=True,
                 bidirectional=True
             )
+            # Projection after GRU fusion
+            self.fuse_proj = nn.Linear(vision_dim, vision_dim)
         else:
             self.temporal = None
+            self.fuse_proj = None
 
         # Multi-heatmap head
         self.head = MultiHeatmapHead(
@@ -169,7 +172,9 @@ class VLNHeatmapModel(nn.Module):
         if self.temporal is not None:
             # GRU aggregation
             feat, _ = self.temporal(feat)  # [B, T, vision_dim]
-            fused = feat[:, -1]  # Use final timestep [B, vision_dim]
+            fused = feat.mean(dim=1)  # Mean over temporal dim [B, vision_dim]
+            # Project after fusion
+            fused = self.fuse_proj(fused)  # [B, vision_dim]
         else:
             # Mean aggregation
             fused = feat.mean(dim=1)  # [B, vision_dim]
@@ -235,6 +240,7 @@ class VLNHeatmapModel(nn.Module):
         return {
             "encoder": count_params(self.encoder),
             "temporal": count_params(self.temporal) if self.temporal else 0,
+            "fuse_proj": count_params(self.fuse_proj) if self.fuse_proj else 0,
             "head": count_params(self.head),
             "renderer": count_params(self.renderer),
             "total": count_params(self)

@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import GradScaler
 import logging
 
 from src.data.vln_heatmap_adapter import VLNHeatmapDataset
@@ -117,14 +117,14 @@ def create_dataloaders(config: Dict, hm_size: Tuple[int, int]) -> Tuple[DataLoad
     return train_loader, val_loader
 
 
-def build_param_groups(model: nn.Module, config: Dict, freeze_backbone: bool) -> list:
+def build_param_groups(model: nn.Module, config: Dict, stage_cfg: Dict) -> list:
     """
     Build parameter groups with different learning rates.
 
     Args:
         model: VLNHeatmapModel
         config: Configuration dictionary
-        freeze_backbone: Whether backbone is frozen
+        stage_cfg: Current stage configuration (for use_gru and freeze_llm)
 
     Returns:
         List of parameter groups for optimizer
@@ -134,37 +134,64 @@ def build_param_groups(model: nn.Module, config: Dict, freeze_backbone: bool) ->
     lora_lr = optim_cfg['lora_lr']
     wd = optim_cfg['weight_decay']
 
-    param_groups = []
+    # First, freeze all parameters
+    for p in model.parameters():
+        p.requires_grad = False
 
-    # Head and renderer parameters (always trainable)
-    head_params = list(model.head.parameters()) + list(model.renderer.parameters())
+    param_groups = []
+    use_gru = stage_cfg.get('use_gru', False)
+    freeze_backbone = stage_cfg.get('freeze_llm', True)
+
+    # 1) Head and renderer parameters (always trainable)
+    head_params = []
+    renderer_params = []
+    for n, p in model.named_parameters():
+        if n.startswith('head'):
+            p.requires_grad = True
+            head_params.append(p)
+        elif 'renderer' in n:
+            p.requires_grad = True
+            renderer_params.append(p)
+
     param_groups.append({
-        'params': head_params,
+        'params': head_params + renderer_params,
         'lr': head_lr,
-        'weight_decay': wd,
+        'weight_decay': 1e-4,  # Lower WD for head/renderer
         'name': 'head_renderer'
     })
 
-    # Backbone parameters (only if not frozen)
-    if not freeze_backbone:
-        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-        if backbone_params:
-            param_groups.append({
-                'params': backbone_params,
-                'lr': lora_lr,
-                'weight_decay': wd,
-                'name': 'backbone'
-            })
-
-    # Temporal aggregation (if exists and trainable)
-    if model.temporal is not None:
-        temporal_params = [p for p in model.temporal.parameters() if p.requires_grad]
+    # 2) Temporal aggregation (GRU + fuse_proj, if use_gru=True)
+    temporal_params = []
+    if use_gru:
+        for n, p in model.named_parameters():
+            if n.startswith('temporal') or n.startswith('fuse_proj'):
+                p.requires_grad = True
+                temporal_params.append(p)
         if temporal_params:
             param_groups.append({
                 'params': temporal_params,
-                'lr': head_lr,
+                'lr': 1e-3,
+                'weight_decay': 1e-4,
+                'name': 'temporal_fuse'
+            })
+
+    # 3) Encoder parameters (only if not frozen; partial unfreeze for layer4+proj)
+    encoder_params = []
+    if not freeze_backbone:
+        for n, p in model.named_parameters():
+            # Only unfreeze encoder.layer4 and encoder.proj (last ResNet block + projection)
+            if 'encoder.backbone' in n and 'layer4' in n:
+                p.requires_grad = True
+                encoder_params.append(p)
+            elif n.startswith('encoder.proj'):
+                p.requires_grad = True
+                encoder_params.append(p)
+        if encoder_params:
+            param_groups.append({
+                'params': encoder_params,
+                'lr': lora_lr,
                 'weight_decay': wd,
-                'name': 'temporal'
+                'name': 'encoder_layer4_proj'
             })
 
     # Log parameter counts
@@ -279,7 +306,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
         dtype = torch.bfloat16 if config['optim']['amp'] == 'bf16' else torch.float16
 
         if use_amp and scaler is not None:
-            with autocast(device_type=device.type, dtype=dtype):
+            with torch.amp.autocast(device_type=device.type, dtype=dtype):
                 preds, _ = model(frames, return_logits=use_logits)
                 loss = loss_fn(preds, targets, mask=mask)
 
@@ -400,6 +427,20 @@ def main(args):
 
     logger.info(f"Model initialized: {model.get_trainable_parameters()['total']:,} parameters")
 
+    # Load initial checkpoint if provided
+    if args.init_ckpt and Path(args.init_ckpt).exists():
+        ckpt = torch.load(args.init_ckpt, map_location='cpu')
+        # Try different keys for checkpoint structure
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        elif 'state_dict' in ckpt:
+            model.load_state_dict(ckpt['state_dict'], strict=False)
+        else:
+            model.load_state_dict(ckpt, strict=False)
+        logger.info(f"Loaded init checkpoint: {args.init_ckpt}")
+    elif args.init_ckpt:
+        logger.warning(f"Init checkpoint not found: {args.init_ckpt}")
+
     # Gradient scaler for mixed precision
     use_amp = config['optim']['amp'] in ['bf16', 'fp16']
     scaler = GradScaler('cuda') if use_amp else None
@@ -425,8 +466,8 @@ def main(args):
         # Create dataloaders for this stage
         train_loader, val_loader = create_dataloaders(config, hm_size)
 
-        # Build parameter groups and optimizer
-        param_groups = build_param_groups(model, config, freeze_backbone)
+        # Build parameter groups and optimizer (pass stage config)
+        param_groups = build_param_groups(model, config, stage)
         optimizer = torch.optim.AdamW(
             param_groups,
             weight_decay=config['optim']['weight_decay']
@@ -469,6 +510,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-stage VLN heatmap training")
     parser.add_argument('--config', type=str, default='configs/training_config.yaml',
                        help='Path to config file')
+    parser.add_argument('--init-ckpt', type=str, default=None,
+                       help='Initialize model weights from this checkpoint (e.g., Stage-A best)')
 
     args = parser.parse_args()
     main(args)

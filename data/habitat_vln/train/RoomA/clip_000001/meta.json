@@ -3,21 +3,19 @@
   "episode_id": 1,
   "subsequence_id": 0,
   "T": 8,
-  "K": 4,
-  "K_eff": 1,
+  "K": 3,
+  "K_eff": 3,
   "low_quality": false,
   "ref_idx": 7,
   "key_indices": [
-    0,
-    2,
     4,
+    5,
     6
   ],
   "hm_entropy": [
-    -0.0,
-    -0.0,
-    -0.0,
-    5.391362190246582
+    5.538782119750977,
+    5.6230034828186035,
+    6.133852958679199
   ],
   "sampler": {
     "type": "visibility_fps",
@@ -34,6 +32,6 @@
     64
   ],
   "gaussian_sigma_px": 1.8,
-  "occlusion_check": false,
+  "occlusion_check": true,
   "occlusion_eps": 0.05
 }
