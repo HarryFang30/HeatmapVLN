@@ -34,7 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.heatmap_builder import (
     build_intrinsics, uniform_keyframe_indices, fps_keyframe_indices,
-    project_keyframe_to_ref, heatmap_from_points
+    project_keyframe_to_ref, heatmap_from_points, visible_ratio_for_keyframe
 )
 
 logger = logging.getLogger(__name__)
@@ -127,14 +127,17 @@ def extract_subsequences(rgb_frames: List[np.ndarray], depth_maps: List[np.ndarr
     return subsequences
 
 
-def select_keyframes(poses: List[np.ndarray], config: Dict, ref_idx: int) -> List[int]:
+def select_keyframes(poses: List[np.ndarray], depth_maps: List[np.ndarray],
+                     intrinsics_dict: Dict, ref_idx: int, config: Dict) -> List[int]:
     """
-    Select keyframes using configured sampling strategy.
+    Select keyframes using configured sampling strategy with visibility awareness.
 
     Args:
         poses: List of 4x4 transformation matrices
-        config: Pack configuration
+        depth_maps: List of depth maps (for visibility computation)
+        intrinsics_dict: Camera intrinsics dict {Kinv, fx, fy, cx, cy}
         ref_idx: Reference frame index
+        config: Pack configuration
 
     Returns:
         List[int]: Selected keyframe indices
@@ -144,6 +147,7 @@ def select_keyframes(poses: List[np.ndarray], config: Dict, ref_idx: int) -> Lis
 
     if sampler == 'uniform':
         return uniform_keyframe_indices(len(poses), K, ref_idx)
+
     elif sampler == 'fps':
         return fps_keyframe_indices(
             poses, K, ref_idx,
@@ -151,6 +155,73 @@ def select_keyframes(poses: List[np.ndarray], config: Dict, ref_idx: int) -> Lis
             beta=config['fps_beta'],
             seed=config.get('seed', 42)
         )
+
+    elif sampler in ['visibility', 'visibility_fps']:
+        # Visibility-based selection
+        lookback = config.get('lookback', 5)
+        min_visible_ratio = config.get('min_visible_ratio', 0.02)
+        depth_subsample = config.get('depth_subsample', 4)
+        occl_eps = config.get('occlusion_eps', 0.05)
+
+        # Define candidate frames (within lookback window)
+        start_idx = max(0, ref_idx - lookback)
+        cands = list(range(start_idx, ref_idx))
+
+        if len(cands) == 0:
+            # No candidates, fall back to uniform
+            return uniform_keyframe_indices(len(poses), K, ref_idx)
+
+        # Compute visibility scores for each candidate
+        T_c_ref_w = np.linalg.inv(poses[ref_idx])
+        depth_ref = depth_maps[ref_idx]
+        ref_h, ref_w = depth_ref.shape
+
+        vis_scores = []
+        for j in cands:
+            # CRITICAL FIX: Pass both Kj (keyframe intrinsics) and Ki (reference intrinsics)
+            score = visible_ratio_for_keyframe(
+                depth_maps[j], intrinsics_dict, intrinsics_dict,  # Kj, Ki (same if constant intrinsics)
+                poses[j], T_c_ref_w,
+                depth_ref, ref_w, ref_h, occl_eps, subsample=depth_subsample
+            )
+            vis_scores.append((j, score))
+
+        # Filter by minimum visibility
+        vis_scores = [(j, s) for (j, s) in vis_scores if s >= min_visible_ratio]
+
+        if len(vis_scores) == 0:
+            # No visible candidates, fall back to uniform
+            logger.warning(f"No visible keyframes found for ref_idx={ref_idx}, using uniform sampling")
+            return uniform_keyframe_indices(len(poses), K, ref_idx)
+
+        if sampler == 'visibility':
+            # Simple visibility-based: take top-K by visibility
+            vis_scores.sort(key=lambda x: x[1], reverse=True)
+            selected = [j for j, _ in vis_scores[:K]]
+            return sorted(selected)
+
+        else:  # visibility_fps
+            # Hybrid: take top-2K by visibility, then FPS among them
+            vis_scores.sort(key=lambda x: x[1], reverse=True)
+            shortlist_count = min(2 * K, len(vis_scores))
+            shortlist = [j for j, _ in vis_scores[:shortlist_count]]
+
+            # Apply FPS on shortlist
+            if len(shortlist) <= K:
+                return sorted(shortlist)
+            else:
+                # FPS on shortlist subset
+                shortlist_poses = [poses[j] for j in shortlist]
+                fps_indices_in_shortlist = fps_keyframe_indices(
+                    shortlist_poses, K, len(shortlist_poses) - 1,  # ref is last in shortlist
+                    alpha=config['fps_alpha'],
+                    beta=config['fps_beta'],
+                    seed=config.get('seed', 42)
+                )
+                # Map back to original indices
+                selected = [shortlist[i] for i in fps_indices_in_shortlist]
+                return sorted(selected)
+
     else:
         raise ValueError(f"Unknown sampler: {sampler}")
 
@@ -361,13 +432,44 @@ def pack_split(config: Dict, split: str):
 
                 logger.debug(f"    Clip {clip_dir.name}: {len(rgb_frames)} frames -> {len(subsequences)} subsequences")
 
+                # Build intrinsics dict once for the clip
+                ref_h, ref_w = depth_maps[0].shape
+                if 'K' in intrinsics:
+                    K_matrix = np.array(intrinsics['K'], dtype=np.float32)
+                    intrinsics_dict = {
+                        'K': K_matrix,
+                        'Kinv': np.linalg.inv(K_matrix),
+                        'fx': K_matrix[0, 0],
+                        'fy': K_matrix[1, 1],
+                        'cx': K_matrix[0, 2],
+                        'cy': K_matrix[1, 2]
+                    }
+                else:
+                    intrinsics_dict = build_intrinsics(
+                        ref_w, ref_h,
+                        fx=intrinsics['fx'], fy=intrinsics['fy'],
+                        cx=intrinsics['cx'], cy=intrinsics['cy']
+                    )
+
                 # Process each subsequence
                 for subseq_idx, (rgb_sub, depth_sub, poses_sub) in enumerate(subsequences):
                     T = len(rgb_sub)
                     ref_idx = determine_ref_index(T, config['pack']['ref_policy'], config['pack']['ref_index'])
 
-                    # Select keyframes
-                    keyframe_indices = select_keyframes(poses_sub, config['pack'], ref_idx)
+                    # Select keyframes (with visibility awareness if enabled)
+                    keyframe_indices = select_keyframes(
+                        poses_sub, depth_sub, intrinsics_dict, ref_idx, config['pack']
+                    )
+
+                    # Near-ref fallback: if no keyframes selected or too few, use frames near reference
+                    K = config['pack']['keyframes']
+                    if len(keyframe_indices) == 0:
+                        logger.warning(f"No keyframes selected for ref_idx={ref_idx}, using near-ref fallback")
+                        # Use K frames immediately before reference frame
+                        keyframe_indices = list(range(max(0, ref_idx - K), ref_idx))[-K:]
+                        if len(keyframe_indices) == 0:
+                            # Edge case: ref_idx = 0, use first K frames
+                            keyframe_indices = list(range(min(K, T)))
 
                     # Generate heatmaps
                     heatmaps, mask = generate_heatmaps(
@@ -375,15 +477,41 @@ def pack_split(config: Dict, split: str):
                         keyframe_indices, ref_idx, config
                     )
 
-                    # Create metadata
+                    # Quality filtering: compute effective K
+                    K_eff = int(mask.sum())
+                    min_effective_k = config['export'].get('drop_if_effective_k_below', None)
+                    mark_low_quality = config['export'].get('mark_low_quality', False)
+
+                    # Cold-start mode: mark low quality instead of dropping
+                    is_low_quality = False
+                    if min_effective_k is not None and K_eff < min_effective_k:
+                        if mark_low_quality:
+                            # Mark as low quality but keep the clip
+                            is_low_quality = True
+                            logger.debug(f"Marking clip as low quality: K_eff={K_eff} < {min_effective_k}")
+                        else:
+                            # Drop the clip
+                            logger.debug(f"Skipping clip with K_eff={K_eff} < {min_effective_k}")
+                            continue
+
+                    # Compute heatmap entropy for quality metrics
+                    import torch
+                    from src.data.quality_metrics import heatmap_entropy
+                    hm_torch = torch.from_numpy(heatmaps)
+                    H = heatmap_entropy(hm_torch)  # [K]
+
+                    # Create metadata with quality metrics
                     meta = {
                         'scene': scene_name,
                         'episode_id': int(clip_dir.name.split('_')[-1]),
                         'subsequence_id': subseq_idx,
                         'T': T,
                         'K': len(keyframe_indices),
+                        'K_eff': K_eff,
+                        'low_quality': is_low_quality,
                         'ref_idx': ref_idx,
                         'key_indices': keyframe_indices,
+                        'hm_entropy': [float(x) for x in H.tolist()],
                         'sampler': {
                             'type': config['pack']['sampler'],
                             'alpha': config['pack'].get('fps_alpha', 1.0),

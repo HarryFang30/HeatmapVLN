@@ -32,7 +32,7 @@ import logging
 
 from src.data.vln_heatmap_adapter import VLNHeatmapDataset
 from src.models.vln_heatmap_model import VLNHeatmapModel
-from src.utils.losses import kl_ce_loss, mse_heatmap_loss, focal_kl_ce_loss
+from src.utils.losses import kl_ce_loss, mse_heatmap_loss, focal_kl_ce_loss, heatmap_ce_from_logits
 
 # Setup logger
 logging.basicConfig(
@@ -216,31 +216,52 @@ def build_scheduler(optimizer, config: Dict, steps_per_epoch: int, stage_epochs:
     return scheduler
 
 
-def create_loss_fn(config: Dict):
-    """Create loss function based on config"""
+def create_loss_fn(config: Dict, use_logits: bool = True):
+    """
+    Create loss function based on config.
+
+    Args:
+        config: Configuration dictionary
+        use_logits: If True, use logits-space loss (RECOMMENDED for training)
+                   If False, use probability-space loss (for backward compatibility)
+    """
     loss_cfg = config['loss']
     loss_type = loss_cfg['type']
 
-    if loss_type == 'kl_ce':
-        if loss_cfg.get('focal', {}).get('enabled', False):
-            alpha = loss_cfg['focal']['alpha']
-            gamma = loss_cfg['focal']['gamma']
-            def loss_fn(pred, target, mask=None):
-                return focal_kl_ce_loss(pred, target, mask, alpha=alpha, gamma=gamma)
-            logger.info(f"Loss function: Focal KL-CE (alpha={alpha}, gamma={gamma})")
+    if use_logits:
+        # RECOMMENDED: Logits-space loss for better gradient flow
+        if loss_type == 'kl_ce':
+            loss_fn = heatmap_ce_from_logits
+            logger.info("Loss function: Logits-space CE (RECOMMENDED)")
+        elif loss_type == 'mse':
+            # For MSE, we still need probabilities
+            use_logits = False
+            loss_fn = mse_heatmap_loss
+            logger.info("Loss function: MSE (using probabilities)")
         else:
-            loss_fn = kl_ce_loss
-            logger.info("Loss function: KL-CE")
-    elif loss_type == 'mse':
-        loss_fn = mse_heatmap_loss
-        logger.info("Loss function: MSE")
+            raise ValueError(f"Unknown loss type: {loss_type}")
     else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
+        # Probability-space loss (for backward compatibility)
+        if loss_type == 'kl_ce':
+            if loss_cfg.get('focal', {}).get('enabled', False):
+                alpha = loss_cfg['focal']['alpha']
+                gamma = loss_cfg['focal']['gamma']
+                def loss_fn(pred, target, mask=None):
+                    return focal_kl_ce_loss(pred, target, mask, alpha=alpha, gamma=gamma)
+                logger.info(f"Loss function: Focal KL-CE (alpha={alpha}, gamma={gamma})")
+            else:
+                loss_fn = kl_ce_loss
+                logger.info("Loss function: KL-CE (probability space)")
+        elif loss_type == 'mse':
+            loss_fn = mse_heatmap_loss
+            logger.info("Loss function: MSE")
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
 
-    return loss_fn
+    return loss_fn, use_logits
 
 
-def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, config, scaler=None):
+def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, config, scaler=None, use_logits=True):
     """Train for one epoch"""
     model.train()
 
@@ -259,7 +280,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
 
         if use_amp and scaler is not None:
             with autocast(device_type=device.type, dtype=dtype):
-                preds, _ = model(frames)
+                preds, _ = model(frames, return_logits=use_logits)
                 loss = loss_fn(preds, targets, mask=mask)
 
             # Backward with gradient scaling
@@ -275,7 +296,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
             scaler.update()
         else:
             # Standard training
-            preds, _ = model(frames)
+            preds, _ = model(frames, return_logits=use_logits)
             loss = loss_fn(preds, targets, mask=mask)
 
             optimizer.zero_grad(set_to_none=True)
@@ -302,7 +323,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, conf
     return avg_loss
 
 
-def validate(model, val_loader, loss_fn, device):
+def validate(model, val_loader, loss_fn, device, use_logits=True):
     """Validate model"""
     model.eval()
 
@@ -315,7 +336,7 @@ def validate(model, val_loader, loss_fn, device):
             targets = batch['gt_heatmaps'].to(device)
             mask = batch['mask'].to(device)
 
-            preds, _ = model(frames)
+            preds, _ = model(frames, return_logits=use_logits)
             loss = loss_fn(preds, targets, mask=mask)
 
             total_loss += loss.item()
@@ -363,8 +384,8 @@ def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
 
-    # Create loss function
-    loss_fn = create_loss_fn(config)
+    # Create loss function (use logits-space loss for better gradient flow)
+    loss_fn, use_logits = create_loss_fn(config, use_logits=True)
 
     # Initialize model once (will update hm_size per stage)
     init_hm_size = tuple(config['data']['init_hm_size'])
@@ -425,11 +446,11 @@ def main(args):
             # Train
             train_loss = train_epoch(
                 model, train_loader, optimizer, scheduler,
-                loss_fn, device, config, scaler
+                loss_fn, device, config, scaler, use_logits=use_logits
             )
 
             # Validate
-            val_loss = validate(model, val_loader, loss_fn, device)
+            val_loss = validate(model, val_loader, loss_fn, device, use_logits=use_logits)
 
             logger.info(f"Epoch {epoch + 1} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
 

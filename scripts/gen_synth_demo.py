@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 class SyntheticSceneGenerator:
     """Generate synthetic 3D scenes with controlled geometry."""
 
-    def __init__(self, scene_size: float = 5.0, checkerboard_size: int = 8):
+    def __init__(self, scene_size: float = 5.0, checkerboard_size: int = 40):
         self.scene_size = scene_size
         self.checkerboard_size = checkerboard_size
         self.points_3d = self._generate_3d_points()
@@ -73,8 +73,135 @@ class SyntheticSceneGenerator:
 
         return np.array(points, dtype=np.float32)
 
-    def generate_camera_trajectory(self, T: int, radius: float = 3.0, height: float = 1.5) -> List[np.ndarray]:
-        """Generate circular camera trajectory around scene center."""
+    def look_at_matrix(self, pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+        """
+        Create a camera-to-world transformation matrix looking at target.
+
+        Args:
+            pos: Camera position [x, y, z]
+            target: Look-at target [x, y, z]
+
+        Returns:
+            4x4 camera-to-world transformation matrix
+        """
+        # Forward direction (from camera to target)
+        f = target - pos
+        f = f / (np.linalg.norm(f) + 1e-8)
+
+        # Right vector (cross product with world up)
+        up_world = np.array([0, 1, 0], dtype=np.float32)
+        s = np.cross(f, up_world)
+        s = s / (np.linalg.norm(s) + 1e-8)
+
+        # Up vector
+        u = np.cross(s, f)
+
+        # Build rotation matrix [right, up, -forward]
+        # In camera coordinates: X=right, Y=up, Z=-forward
+        R = np.stack([s, u, -f], axis=1)
+
+        # Build 4x4 transformation matrix
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R
+        T[:3, 3] = pos
+
+        return T
+
+    def generate_camera_trajectory(self, T: int, radius: float = 3.0, height: float = 1.5,
+                                  path_mode: str = 'circular', arc_deg: float = 60.0,
+                                  pose_mode: str = 'look_center', target: np.ndarray = None,
+                                  noise_rot_deg: float = 0.0, noise_trans: float = 0.0) -> List[np.ndarray]:
+        """
+        Generate camera trajectory with flexible path and pose modes.
+
+        Args:
+            T: Number of frames
+            radius: Distance from center
+            height: Camera height
+            path_mode: 'circular' (full circle) or 'short_arc' (limited arc)
+            arc_deg: Arc angle in degrees (for short_arc mode)
+            pose_mode: 'look_center' or 'face_target' (always look at target)
+            target: Target position [x, y, z] for face_target mode
+            noise_rot_deg: Rotation noise in degrees
+            noise_trans: Translation noise magnitude
+
+        Returns:
+            List of 4x4 camera-to-world transformation matrices
+        """
+        if target is None:
+            target = np.array([0.0, 0.5, 0.0], dtype=np.float32)
+
+        poses = []
+
+        if path_mode == 'short_arc':
+            # Generate short arc trajectory
+            angles = np.linspace(-np.deg2rad(arc_deg)/2, np.deg2rad(arc_deg)/2, T)
+        else:  # circular (full circle)
+            angles = np.linspace(0, 2 * np.pi, T, endpoint=False)
+
+        for t in range(T):
+            angle = angles[t]
+
+            # Camera position on arc/circle
+            cam_x = radius * np.sin(angle)
+            cam_z = radius * np.cos(angle)
+            cam_y = height
+
+            camera_pos = np.array([cam_x, cam_y, cam_z], dtype=np.float32)
+
+            # Add position noise
+            if noise_trans > 0:
+                camera_pos += np.random.randn(3).astype(np.float32) * noise_trans
+
+            # Determine look-at target
+            if pose_mode == 'face_target':
+                look_target = target
+            else:  # look_center
+                look_target = np.array([0.0, 0.5, 0.0], dtype=np.float32)
+
+            # Build camera-to-world matrix
+            T_w_c = self.look_at_matrix(camera_pos, look_target)
+
+            # Add rotation noise
+            if noise_rot_deg > 0:
+                # Small random rotation around each axis
+                noise_angles = np.random.randn(3) * np.deg2rad(noise_rot_deg)
+                R_noise = self._euler_to_rotation(noise_angles)
+                T_w_c[:3, :3] = T_w_c[:3, :3] @ R_noise
+
+            poses.append(T_w_c)
+
+        return poses
+
+    def _euler_to_rotation(self, angles: np.ndarray) -> np.ndarray:
+        """Convert Euler angles to rotation matrix."""
+        rx, ry, rz = angles
+
+        # Rotation around X
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx), -np.sin(rx)],
+            [0, np.sin(rx), np.cos(rx)]
+        ], dtype=np.float32)
+
+        # Rotation around Y
+        Ry = np.array([
+            [np.cos(ry), 0, np.sin(ry)],
+            [0, 1, 0],
+            [-np.sin(ry), 0, np.cos(ry)]
+        ], dtype=np.float32)
+
+        # Rotation around Z
+        Rz = np.array([
+            [np.cos(rz), -np.sin(rz), 0],
+            [np.sin(rz), np.cos(rz), 0],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        return Rz @ Ry @ Rx
+
+    def _generate_camera_trajectory_circular(self, T: int, radius: float = 3.0, height: float = 1.5) -> List[np.ndarray]:
+        """DEPRECATED: Generate circular camera trajectory around scene center."""
         poses = []
 
         for t in range(T):
@@ -211,12 +338,32 @@ class SyntheticSceneGenerator:
         return rgb
 
 
-def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, T: int = 8,
-                           width: int = 384, height: int = 384, hfov_deg: float = 60.0):
-    """Generate one synthetic clip with T frames."""
+def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, split: str = 'train',
+                           T: int = 8, width: int = 384, height: int = 384, hfov_deg: float = 60.0,
+                           path_mode: str = 'circular', arc_deg: float = 60.0, radius: float = 3.0,
+                           pose_mode: str = 'look_center', target: Tuple[float, float, float] = (0, 0, 2),
+                           noise_rot_deg: float = 0.0, noise_trans: float = 0.0):
+    """
+    Generate one synthetic clip with T frames.
 
+    Args:
+        output_root: Root directory for raw sequences
+        scene_name: Scene name (e.g., 'RoomA')
+        clip_id: Clip ID number
+        split: Dataset split ('train' or 'val')
+        T: Number of frames
+        width, height: Image dimensions
+        hfov_deg: Horizontal field of view
+        path_mode: 'circular' or 'short_arc'
+        arc_deg: Arc angle for short_arc mode
+        radius: Camera distance from center
+        pose_mode: 'look_center' or 'face_target'
+        target: Target position (x, y, z) for face_target mode
+        noise_rot_deg: Rotation noise in degrees
+        noise_trans: Translation noise magnitude
+    """
     # Create output directories
-    clip_dir = Path(output_root) / "train" / scene_name / f"clip_{clip_id:06d}"
+    clip_dir = Path(output_root) / split / scene_name / f"clip_{clip_id:06d}"
     rgb_dir = clip_dir / "rgb"
     depth_dir = clip_dir / "depth"
 
@@ -228,8 +375,16 @@ def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, T: 
     # Initialize scene generator
     scene = SyntheticSceneGenerator()
 
-    # Generate camera trajectory
-    poses = scene.generate_camera_trajectory(T, radius=3.0, height=1.5)
+    # Convert target to numpy array
+    target_np = np.array(target, dtype=np.float32)
+
+    # Generate camera trajectory with new parameters
+    poses = scene.generate_camera_trajectory(
+        T=T, radius=radius, height=1.2,  # Slightly lower camera for better visibility
+        path_mode=path_mode, arc_deg=arc_deg,
+        pose_mode=pose_mode, target=target_np,
+        noise_rot_deg=noise_rot_deg, noise_trans=noise_trans
+    )
 
     # Build camera intrinsics
     intrinsics = build_intrinsics(width, height, hfov_deg=hfov_deg)
@@ -289,11 +444,15 @@ def generate_synthetic_clip(output_root: str, scene_name: str, clip_id: int, T: 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate synthetic VLN demo data")
+    parser = argparse.ArgumentParser(description="Generate synthetic VLN demo data with flexible trajectories")
+
+    # Basic parameters
     parser.add_argument('--root', type=str, default='./raw_sequences',
                         help='Root directory for raw sequences')
     parser.add_argument('--scene', type=str, default='RoomA',
-                        help='Scene name')
+                        help='Scene name (e.g., RoomA, RoomB)')
+    parser.add_argument('--split', type=str, default=None,
+                        help='Dataset split (train/val). If None, infer from scene (RoomA→train, RoomB→val)')
     parser.add_argument('--clips', type=int, default=1,
                         help='Number of clips to generate')
     parser.add_argument('--T', type=int, default=8,
@@ -305,13 +464,55 @@ def main():
     parser.add_argument('--hfov', type=float, default=60.0,
                         help='Horizontal field of view in degrees')
 
+    # Trajectory parameters
+    parser.add_argument('--path_mode', type=str, default='circular',
+                        choices=['circular', 'short_arc'],
+                        help='Path mode: circular (full circle) or short_arc (limited arc)')
+    parser.add_argument('--arc_deg', type=float, default=60.0,
+                        help='Arc angle in degrees (for short_arc mode)')
+    parser.add_argument('--radius', type=float, default=3.0,
+                        help='Camera distance from center')
+
+    # Pose parameters
+    parser.add_argument('--pose_mode', type=str, default='look_center',
+                        choices=['look_center', 'face_target'],
+                        help='Pose mode: look_center (look at origin) or face_target (always look at target)')
+    parser.add_argument('--target', type=str, default='0,0,2',
+                        help='Target position as "x,y,z" (for face_target mode)')
+
+    # Noise parameters
+    parser.add_argument('--noise_rot_deg', type=float, default=0.0,
+                        help='Rotation noise in degrees')
+    parser.add_argument('--noise_trans', type=float, default=0.0,
+                        help='Translation noise magnitude')
+
     args = parser.parse_args()
+
+    # Parse target
+    target = tuple(float(x) for x in args.target.split(','))
+    if len(target) != 3:
+        raise ValueError("Target must be in format 'x,y,z'")
+
+    # Infer split from scene if not specified
+    if args.split is None:
+        if 'B' in args.scene or 'val' in args.scene.lower():
+            args.split = 'val'
+        else:
+            args.split = 'train'
 
     # Setup logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     logger.info("🚀 Starting synthetic demo data generation")
-    logger.info(f"Parameters: {args.clips} clips, {args.T} frames, {args.W}x{args.H}, hfov={args.hfov}°")
+    logger.info(f"Parameters:")
+    logger.info(f"  Clips: {args.clips}, Frames: {args.T}, Size: {args.W}x{args.H}")
+    logger.info(f"  Path: {args.path_mode}, Pose: {args.pose_mode}")
+    if args.path_mode == 'short_arc':
+        logger.info(f"  Arc: {args.arc_deg}°, Radius: {args.radius}m")
+    if args.pose_mode == 'face_target':
+        logger.info(f"  Target: {target}")
+    if args.noise_rot_deg > 0 or args.noise_trans > 0:
+        logger.info(f"  Noise: rot={args.noise_rot_deg}°, trans={args.noise_trans}")
 
     # Generate clips
     generated_clips = []
@@ -320,10 +521,18 @@ def main():
             output_root=args.root,
             scene_name=args.scene,
             clip_id=clip_id,
+            split=args.split,
             T=args.T,
             width=args.W,
             height=args.H,
-            hfov_deg=args.hfov
+            hfov_deg=args.hfov,
+            path_mode=args.path_mode,
+            arc_deg=args.arc_deg,
+            radius=args.radius,
+            pose_mode=args.pose_mode,
+            target=target,
+            noise_rot_deg=args.noise_rot_deg,
+            noise_trans=args.noise_trans
         )
         generated_clips.append(clip_dir)
 

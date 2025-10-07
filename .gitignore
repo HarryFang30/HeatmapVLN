@@ -1,5 +1,8 @@
 # Model files
 /models/
+/outputs/
+/data/
+/raw_sequences/
 
 # Python cache
 __pycache__/

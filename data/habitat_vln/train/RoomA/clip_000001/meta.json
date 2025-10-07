@@ -4,15 +4,23 @@
   "subsequence_id": 0,
   "T": 8,
   "K": 4,
+  "K_eff": 1,
+  "low_quality": false,
   "ref_idx": 7,
   "key_indices": [
-    1,
-    3,
-    5,
-    7
+    0,
+    2,
+    4,
+    6
+  ],
+  "hm_entropy": [
+    -0.0,
+    -0.0,
+    -0.0,
+    5.391362190246582
   ],
   "sampler": {
-    "type": "fps",
+    "type": "visibility_fps",
     "alpha": 1.0,
     "beta": 0.7,
     "seed": 42
@@ -25,7 +33,7 @@
     64,
     64
   ],
-  "gaussian_sigma_px": 3.0,
-  "occlusion_check": true,
+  "gaussian_sigma_px": 1.8,
+  "occlusion_check": false,
   "occlusion_eps": 0.05
 }

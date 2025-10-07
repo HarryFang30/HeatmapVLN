@@ -11,8 +11,13 @@ data:
 pack:
   frames_per_clip: 8                         # T
   stride: 1                                  # 取帧步长（从原始序列下采样）
-  sampler: fps                               # uniform | fps
+  sampler: visibility_fps                    # uniform | fps | visibility | visibility_fps
+  lookback: 5                                # 仅从 [ref_idx-lookback, ref_idx) 里选，提升可见性
   keyframes: 4                               # K
+  min_effective_k: 2                         # 如果有效K小于该值，丢弃或降采样概率
+  topk_by_visible_ratio: true                # 先按可见性排序再做 FPS
+  min_visible_ratio: 0.003                   # Lowered for sparse point cloud visibility (0.02 → 0.003)
+  depth_subsample: 1                         # 计算可见性时的深度子采样步长（1=no subsample，处理稀疏点云）
   fps_alpha: 1.0                             # 位姿距离：平移权重
   fps_beta: 0.7                              # 位姿距离：朝向权重
   ref_policy: last                           # last | middle | index
@@ -20,11 +25,13 @@ pack:
 
 heatmap:
   size: [64, 64]                             # (Hm, Wm)
-  gaussian_sigma_px: 3.0
-  occlusion_check: true
+  gaussian_sigma_px: 1.8                     # COLD-START: 2.0 → 1.8 (更尖锐，降低熵)
+  occlusion_check: false                     # COLD-START: 先关闭遮挡检查，保障可见性
   occlusion_eps: 0.05
 
 export:
   rgb_format: png
   depth_format: npy
   heatmap_format: npy
+  drop_if_effective_k_below: null            # COLD-START: 暂不丢弃，改为标记
+  mark_low_quality: true                     # COLD-START: 标记低质量样本，训练时mask控权重

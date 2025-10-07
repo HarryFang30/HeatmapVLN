@@ -23,9 +23,9 @@ data:
 # ================================
 training:
   stages:
-    # Stage A: Warmup - Train Head + Renderer only
+    # Stage A: Warmup - Train Head + Renderer only (BASELINE)
     - name: warmup_head
-      epochs: 2
+      epochs: 3                     # Baseline: 3 epochs for Stage-A
       freeze_llm: true              # Freeze backbone
       lora: false                   # No LoRA in warmup
       hm_size: [64, 64]             # Start with 64x64 resolution
@@ -51,11 +51,11 @@ training:
 # ================================
 optim:
   optimizer: adamw
-  head_lr: 1.0e-3                   # Learning rate for head/renderer
+  head_lr: 3.0e-3                   # Baseline: Higher LR for head/renderer
   lora_lr: 5.0e-5                   # Learning rate for LoRA/backbone
-  weight_decay: 1.0e-2
+  weight_decay: 1.0e-2              # Only for backbone; Head/Renderer use 1e-4/0 in param groups
   grad_clip: 1.0
-  amp: bf16                         # Mixed precision: bf16 or fp16
+  amp: off                          # Baseline: Disable AMP for stability
   scheduler: cosine
   warmup_ratio: 0.05
   batch_size: 8                     # Start with small batch for stability

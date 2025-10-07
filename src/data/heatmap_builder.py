@@ -418,6 +418,124 @@ def occlusion_filter(uv: np.ndarray, z: np.ndarray, depth_ref: np.ndarray, eps: 
 
 
 # =====================================
+# 4.5.5 Visibility Ratio for Keyframe Selection
+# =====================================
+
+def project_to_ref_pixels(pts_ci: np.ndarray, Ki: dict):
+    """
+    Project points in reference camera frame to pixel coordinates using reference intrinsics.
+
+    This helper ensures consistent projection to reference frame across visibility evaluation
+    and heatmap generation.
+
+    Args:
+        pts_ci: Points in reference camera frame [N, 3] (x, y, z)
+        Ki: Reference camera intrinsics dict with 'fx', 'fy', 'cx', 'cy'
+
+    Returns:
+        xi, yi, zi: Pixel x coords, pixel y coords, depths
+    """
+    zi = pts_ci[:, 2]
+    xi = Ki['fx'] * (pts_ci[:, 0] / zi) + Ki['cx']
+    yi = Ki['fy'] * (pts_ci[:, 1] / zi) + Ki['cy']
+    return xi, yi, zi
+
+
+def visible_ratio_for_keyframe(depth_j: np.ndarray, Kj: dict, Ki: dict,
+                               T_w_c_j: np.ndarray, T_c_ref_w: np.ndarray,
+                               depth_ref: np.ndarray, ref_w: int, ref_h: int,
+                               occl_eps: float, subsample: int = 4) -> float:
+    """
+    Compute visibility ratio of keyframe j in reference frame i.
+
+    Returns the fraction of keyframe j's points that are visible in the reference frame.
+    Uses subsampling for efficiency.
+
+    CRITICAL FIX: Uses Ki (reference frame intrinsics) for projection to reference frame,
+    not Kj (keyframe intrinsics).
+
+    Args:
+        depth_j: [H, W] depth map of keyframe j
+        Kj: Intrinsics dict for keyframe j {Kinv, fx, fy, cx, cy}
+        Ki: Intrinsics dict for reference frame i {fx, fy, cx, cy}
+        T_w_c_j: 4x4 camera-to-world transform for keyframe j
+        T_c_ref_w: 4x4 world-to-camera transform for reference frame i
+        depth_ref: [H, W] reference depth map (for occlusion check)
+        ref_w, ref_h: Reference frame dimensions
+        occl_eps: Occlusion tolerance
+        subsample: Subsample stride (e.g., 4 means sample every 4th pixel)
+
+    Returns:
+        float: Visibility ratio in [0, 1]
+    """
+    # Step 1: Generate sparse grid of sample points
+    H, W = depth_j.shape
+    ys = np.arange(0, H, subsample, dtype=np.int32)
+    xs = np.arange(0, W, subsample, dtype=np.int32)
+    grid_y, grid_x = np.meshgrid(ys, xs, indexing='ij')
+
+    # Get depths at grid points
+    z = depth_j[grid_y, grid_x]
+    valid = z > 0
+
+    if valid.sum() == 0:
+        return 0.0
+
+    total_sampled = valid.sum()
+
+    # Step 2: Unproject grid points to camera coordinates
+    u = grid_x[valid].astype(np.float32)
+    v = grid_y[valid].astype(np.float32)
+    z = z[valid].astype(np.float32)
+
+    Kinv = Kj['Kinv']
+    ones = np.ones_like(u)
+    pix = np.stack([u, v, ones], axis=-1)  # [N, 3]
+
+    rays = (Kinv @ pix.T).T  # [N, 3]
+    pts_cj = rays * z[:, None]  # [N, 3]
+
+    # Step 3: Transform to world → reference camera
+    pts_w = world_from_cam(pts_cj, T_w_c_j)
+    pts_ci = cam_from_world(pts_w, T_c_ref_w)
+
+    # Step 4: Project to reference image using Ki (reference frame intrinsics)
+    xi, yi, zi = project_to_ref_pixels(pts_ci, Ki)
+    infront = zi > 0
+
+    if infront.sum() == 0:
+        return 0.0
+
+    # Check bounds
+    inb = (xi >= 0) & (xi < ref_w) & (yi >= 0) & (yi < ref_h)
+    valid_proj = infront & inb
+
+    if valid_proj.sum() == 0:
+        return 0.0
+
+    # Step 5: Occlusion check
+    if depth_ref is not None:
+        # Sample nearest pixel depth
+        x0 = np.clip(np.round(xi[valid_proj]).astype(int), 0, ref_w - 1)
+        y0 = np.clip(np.round(yi[valid_proj]).astype(int), 0, ref_h - 1)
+
+        # Check occlusion: point is visible if its depth is close to reference depth
+        ref_depth_at_proj = depth_ref[y0, x0]
+        z_proj = zi[valid_proj]
+
+        # Point is occluded if reference depth + eps < projected depth
+        occluded = ref_depth_at_proj + occl_eps < z_proj
+
+        # Update valid mask
+        visible_count = (~occluded).sum()
+    else:
+        visible_count = valid_proj.sum()
+
+    # Return visibility ratio
+    return float(visible_count) / float(total_sampled)
+
+
+# =====================================
 # 4.6 Keyframe → Reference Integration
 # =====================================
 

@@ -1,13 +1,59 @@
 """
 Loss functions for heatmap training.
 
-Implements the KL-CE loss as specified in train.md section 6.
+Implements:
+- heatmap_ce_from_logits: Training loss in logits space (RECOMMENDED)
+- kl_ce_loss: Original KL-CE loss in probability space
+- focal_kl_ce_loss: Focal loss variant
+- mse_heatmap_loss: MSE alternative
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+
+
+def heatmap_ce_from_logits(logits: torch.Tensor, target_maps: torch.Tensor,
+                           mask: Optional[torch.Tensor] = None,
+                           tau: float = 1.0, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Cross-Entropy loss in logits space (RECOMMENDED for training).
+
+    This avoids double softmax and preserves gradient signal better than
+    computing loss in probability space.
+
+    Args:
+        logits: Raw logits from model [B, K, Hm, Wm]
+        target_maps: Target heatmaps [B, K, Hm, Wm] (raw values, will be normalized)
+        mask: Optional validity mask [B, K] where 1=valid, 0=invalid
+        tau: Temperature parameter (default 1.0)
+        eps: Numerical stability epsilon
+
+    Returns:
+        torch.Tensor: Scalar loss value
+    """
+    B, K, Hm, Wm = logits.shape
+
+    # Flatten spatial dimensions
+    logits_flat = logits.view(B * K, -1) / tau  # [B*K, Hm*Wm]
+    target_flat = target_maps.view(B * K, -1)   # [B*K, Hm*Wm]
+
+    # Compute log probabilities (stable)
+    log_p = F.log_softmax(logits_flat, dim=-1)  # [B*K, Hm*Wm]
+
+    # Normalize targets (don't apply softmax, just normalize)
+    q = target_flat / (target_flat.sum(dim=-1, keepdim=True) + eps)  # [B*K, Hm*Wm]
+
+    # Cross-entropy: -sum(q * log(p))
+    loss = -(q * log_p).sum(dim=-1)  # [B*K]
+
+    # Apply mask
+    if mask is not None:
+        m = mask.view(B * K).float()
+        return (loss * m).sum() / m.sum().clamp_min(1.0)
+    else:
+        return loss.mean()
 
 
 def kl_ce_loss(pred_probs: torch.Tensor, target_maps: torch.Tensor,

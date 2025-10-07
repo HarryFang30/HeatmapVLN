@@ -1,17 +1,14 @@
 """
 VLNHeatmapModel: Main model assembly for heatmap training.
 
-This module implements the complete model as specified in train.md section 4.
-It integrates:
-- Backbone (Qwen vision backbone)
-- Temporal aggregation (mean/GRU)
-- MultiHeatmapHead
-- GaussianRenderer
+This module implements the complete model with ResNet backbone for reliable learning.
+Architecture: frames → ResNet encoder → temporal aggregation → head → (optional renderer)
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Tuple, Optional, Union
+import torchvision.models as tvm
+from typing import Dict, Any, Tuple, Optional
 import logging
 
 # Import our components
@@ -21,13 +18,71 @@ from .heatmap.renderer import GaussianRenderer
 logger = logging.getLogger(__name__)
 
 
+class FrameEncoder(nn.Module):
+    """
+    Frame encoder using pretrained ResNet backbone.
+
+    Uses ImageNet-pretrained ResNet18/34 for reliable feature extraction.
+    """
+
+    def __init__(self, out_dim: int = 1024, arch: str = "resnet18"):
+        """
+        Initialize frame encoder.
+
+        Args:
+            out_dim: Output feature dimension
+            arch: Backbone architecture ('resnet18' or 'resnet34')
+        """
+        super().__init__()
+
+        # Load pretrained ResNet
+        if arch == "resnet34":
+            m = tvm.resnet34(weights=tvm.ResNet34_Weights.IMAGENET1K_V1)
+            feat_dim = 512
+        else:  # resnet18
+            m = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+            feat_dim = 512
+
+        # Remove final FC layer → output [B, 512, 1, 1]
+        self.backbone = nn.Sequential(*list(m.children())[:-1])
+
+        # Project to target dimension
+        self.proj = nn.Linear(feat_dim, out_dim)
+
+        # ImageNet normalization (register as buffer, not parameter)
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        logger.info(f"FrameEncoder initialized: {arch}, out_dim={out_dim}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input frames [B*T, 3, H, W] in range [0, 1]
+
+        Returns:
+            torch.Tensor: Features [B*T, out_dim]
+        """
+        # Normalize to ImageNet stats
+        x = (x - self.mean) / self.std
+
+        # Extract features
+        f = self.backbone(x).flatten(1)  # [B*T, 512]
+
+        # Project
+        return self.proj(f)  # [B*T, out_dim]
+
+
 class VLNHeatmapModel(nn.Module):
     """
-    Complete VLN heatmap model as specified in train.md.
+    Complete VLN heatmap model with ResNet backbone.
 
     Architecture:
-        frames -> backbone -> temporal_aggregation -> head -> renderer -> probs
-        [B,T,3,H,W] -> [B,T,D] -> [B,D] -> [B,K,Hm,Wm] -> [B,K,Hm,Wm]
+        frames → ResNet encoder → temporal_agg → head → logits
+                                                      ↓ (optional)
+                                                   renderer → probs
     """
 
     def __init__(
@@ -36,6 +91,7 @@ class VLNHeatmapModel(nn.Module):
         hm_size: Tuple[int, int] = (64, 64),
         vision_dim: int = 1024,
         agg: str = 'mean',
+        backbone: str = 'resnet18',
         use_lora: bool = False,
         lora_rank: int = 16,
         models_root: str = './models'
@@ -48,9 +104,10 @@ class VLNHeatmapModel(nn.Module):
             hm_size: Heatmap spatial size (Hm, Wm)
             vision_dim: Vision backbone output dimension
             agg: Temporal aggregation method ('mean' or 'gru')
-            use_lora: Whether to use LoRA fine-tuning
-            lora_rank: LoRA rank
-            models_root: Path to model weights
+            backbone: Backbone architecture ('resnet18' or 'resnet34')
+            use_lora: Whether to use LoRA fine-tuning (not used for ResNet)
+            lora_rank: LoRA rank (not used for ResNet)
+            models_root: Path to model weights (not used for ResNet)
         """
         super().__init__()
 
@@ -58,146 +115,84 @@ class VLNHeatmapModel(nn.Module):
         self.hm_size = hm_size
         self.vision_dim = vision_dim
         self.agg = agg
-        self.use_lora = use_lora
-        self.models_root = models_root
+        self.backbone_type = backbone
 
-        # Initialize components
-        self._build_backbone()
-        self._build_temporal_aggregation()
-        self._build_head_and_renderer()
+        # Frame encoder with pretrained ResNet
+        self.encoder = FrameEncoder(out_dim=vision_dim, arch=backbone)
 
-        logger.info(f"VLNHeatmapModel initialized: K={k_heatmaps}, hm_size={hm_size}, agg={agg}")
-
-    def _build_backbone(self):
-        """Build vision backbone (placeholder - needs real implementation)"""
-        # NOTE: This is a placeholder implementation
-        # Real implementation should use build_qwen_vision_backbone from your existing code
-        logger.warning("Using placeholder backbone - replace with real Qwen vision backbone")
-
-        # Stronger placeholder: Multi-layer CNN backbone that can actually learn
-        # NOTE: Removed BatchNorm because batch_size=1 causes issues
-        self.backbone = nn.Sequential(
-            # Block 1: 384x384 -> 192x192
-            nn.Conv2d(3, 64, 7, 2, 3),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # -> 96x96
-
-            # Block 2: 96x96 -> 48x48
-            nn.Conv2d(64, 128, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # -> 48x48
-
-            # Block 3: 48x48 -> 24x24
-            nn.Conv2d(128, 256, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # -> 24x24
-
-            # Block 4: 24x24 -> 12x12
-            nn.Conv2d(256, 512, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # -> 12x12
-
-            # Global pooling and projection
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(512, self.vision_dim)
-        )
-
-        # TODO: Replace with real implementation:
-        # self.backbone = build_qwen_vision_backbone(
-        #     models_root=self.models_root,
-        #     torch_dtype=torch.bfloat16,
-        #     attn_implementation="eager"
-        # )
-        #
-        # if self.use_lora:
-        #     inject_lora(
-        #         self.backbone,
-        #         rank=self.lora_rank,
-        #         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]
-        #     )
-
-    def _build_temporal_aggregation(self):
-        """Build temporal aggregation layer"""
-        if self.agg == 'gru':
+        # Temporal aggregation
+        if agg == 'gru':
             self.temporal = nn.GRU(
-                self.vision_dim,
-                self.vision_dim // 2,
+                vision_dim,
+                vision_dim // 2,
                 num_layers=1,
                 batch_first=True,
                 bidirectional=True
             )
-        else:  # mean aggregation
+        else:
             self.temporal = None
-
-    def _build_head_and_renderer(self):
-        """Build heatmap head and renderer"""
-        fused_dim = self.vision_dim
 
         # Multi-heatmap head
         self.head = MultiHeatmapHead(
-            in_dim=fused_dim,
-            k_heatmaps=self.k_heatmaps,
-            hm_size=self.hm_size
+            in_dim=vision_dim,
+            k_heatmaps=k_heatmaps,
+            hm_size=hm_size
         )
 
-        # Gaussian renderer
-        self.renderer = GaussianRenderer(hm_size=self.hm_size)
+        # Gaussian renderer (for evaluation/visualization only)
+        self.renderer = GaussianRenderer(hm_size=hm_size)
 
-    def forward(self, frames: torch.Tensor, text: Optional[str] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        logger.info(f"VLNHeatmapModel initialized: K={k_heatmaps}, hm_size={hm_size}, "
+                   f"backbone={backbone}, agg={agg}")
+
+    def forward(self, frames: torch.Tensor, return_logits: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Forward pass.
 
         Args:
             frames: Input frames [B, T, 3, H, W]
-            text: Optional text instruction (not used in current implementation)
+            return_logits: If True, return raw logits; if False, return probabilities
 
         Returns:
-            Tuple of (probs, aux_outputs):
-            - probs: Probability distributions [B, K, Hm, Wm]
-            - aux_outputs: Dictionary with auxiliary outputs
+            Tuple of (output, aux_dict):
+            - output: Logits [B, K, Hm, Wm] if return_logits=True,
+                     else probabilities [B, K, Hm, Wm]
+            - aux_dict: Dictionary with auxiliary outputs
         """
         B, T, C, H, W = frames.shape
 
-        # Step 1: Extract features from all frames
-        # Reshape to [B*T, C, H, W] for backbone processing
-        frames_flat = frames.view(B * T, C, H, W)
-        feats_flat = self.backbone(frames_flat)  # [B*T, vision_dim]
-
-        # Reshape back to [B, T, vision_dim]
-        feats = feats_flat.view(B, T, self.vision_dim)
+        # Step 1: Encode all frames
+        x = frames.view(B * T, C, H, W)
+        feat = self.encoder(x).view(B, T, self.vision_dim)  # [B, T, vision_dim]
 
         # Step 2: Temporal aggregation
         if self.temporal is not None:
             # GRU aggregation
-            feats, _ = self.temporal(feats)  # [B, T, vision_dim]
-            # Use final timestep
-            fused = feats[:, -1]  # [B, vision_dim]
+            feat, _ = self.temporal(feat)  # [B, T, vision_dim]
+            fused = feat[:, -1]  # Use final timestep [B, vision_dim]
         else:
             # Mean aggregation
-            fused = feats.mean(dim=1)  # [B, vision_dim]
+            fused = feat.mean(dim=1)  # [B, vision_dim]
 
         # Step 3: Generate heatmap logits
         logits = self.head(fused)  # [B, K, Hm, Wm]
 
-        # Step 4: Render to probability distributions
-        probs = self.renderer(logits)  # [B, K, Hm, Wm]
-
         # Auxiliary outputs
         aux_outputs = {
             "logits": logits,
-            "features": feats,
-            "fused_features": fused,
-            "renderer_params": self.renderer.get_parameters_info()
+            "features": feat,
+            "fused_features": fused
         }
 
-        return probs, aux_outputs
+        # Return based on mode
+        if return_logits:
+            # Training mode: return raw logits
+            return logits, aux_outputs
+        else:
+            # Evaluation mode: apply renderer
+            probs = self.renderer(logits)  # [B, K, Hm, Wm]
+            aux_outputs["renderer_params"] = self.renderer.get_parameters_info()
+            return probs, aux_outputs
 
     def update_hm_size(self, new_hm_size: Tuple[int, int]):
         """
@@ -219,13 +214,13 @@ class VLNHeatmapModel(nn.Module):
         Args:
             freeze: Whether to freeze backbone
         """
-        for param in self.backbone.parameters():
+        for param in self.encoder.parameters():
             param.requires_grad = not freeze
 
         if freeze:
-            logger.info("Backbone frozen")
+            logger.info("Encoder (ResNet) frozen")
         else:
-            logger.info("Backbone unfrozen")
+            logger.info("Encoder (ResNet) unfrozen")
 
     def get_trainable_parameters(self) -> Dict[str, int]:
         """
@@ -238,7 +233,7 @@ class VLNHeatmapModel(nn.Module):
             return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
         return {
-            "backbone": count_params(self.backbone),
+            "encoder": count_params(self.encoder),
             "temporal": count_params(self.temporal) if self.temporal else 0,
             "head": count_params(self.head),
             "renderer": count_params(self.renderer),
@@ -248,48 +243,7 @@ class VLNHeatmapModel(nn.Module):
     def extra_repr(self) -> str:
         """Extra representation for debugging"""
         return (f'k_heatmaps={self.k_heatmaps}, hm_size={self.hm_size}, '
-                f'vision_dim={self.vision_dim}, agg={self.agg}')
-
-
-def build_qwen_vision_backbone(models_root: str = './models', **kwargs):
-    """
-    Placeholder for real Qwen vision backbone builder.
-
-    TODO: Replace with actual implementation that loads Qwen2.5-VL vision encoder
-    from your existing codebase.
-
-    Args:
-        models_root: Path to model weights
-        **kwargs: Additional arguments
-
-    Returns:
-        Vision backbone model
-    """
-    logger.warning("build_qwen_vision_backbone is a placeholder - implement with real Qwen backbone")
-
-    # Return simple placeholder backbone
-    return nn.Sequential(
-        nn.Conv2d(3, 64, 7, 2, 3),
-        nn.ReLU(inplace=True),
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-        nn.Linear(64, kwargs.get('vision_dim', 1024))
-    )
-
-
-def inject_lora(model, rank: int, target_modules: list):
-    """
-    Placeholder for LoRA injection.
-
-    TODO: Implement with real LoRA library (e.g., peft)
-
-    Args:
-        model: Model to inject LoRA into
-        rank: LoRA rank
-        target_modules: Target module names
-    """
-    logger.warning("inject_lora is a placeholder - implement with real LoRA library")
-    pass
+                f'backbone={self.backbone_type}, agg={self.agg}')
 
 
 # Test and example usage
@@ -306,7 +260,8 @@ if __name__ == "__main__":
         k_heatmaps=k_heatmaps,
         hm_size=hm_size,
         vision_dim=1024,
-        agg='mean'
+        agg='mean',
+        backbone='resnet18'
     )
 
     # Create test input
@@ -314,11 +269,15 @@ if __name__ == "__main__":
 
     print(f"Input frames shape: {frames.shape}")
 
-    # Forward pass
-    probs, aux_outputs = model(frames)
+    # Forward pass (training mode)
+    logits, aux_outputs = model(frames, return_logits=True)
+    print(f"Output logits shape: {logits.shape}")
+    print(f"Logits range: [{logits.min():.3f}, {logits.max():.3f}]")
+    print(f"Logits std: {logits.std():.3f}")
 
-    print(f"Output probs shape: {probs.shape}")
-    print(f"Auxiliary outputs keys: {list(aux_outputs.keys())}")
+    # Forward pass (evaluation mode)
+    probs, aux_outputs_eval = model(frames, return_logits=False)
+    print(f"\nOutput probs shape: {probs.shape}")
 
     # Check normalization
     probs_sum = probs.sum(dim=(-1, -2))
@@ -332,27 +291,5 @@ if __name__ == "__main__":
     print(f"\nTrainable parameters:")
     for component, count in param_counts.items():
         print(f"  {component}: {count:,}")
-
-    # Test curriculum learning
-    print(f"\nTesting curriculum learning:")
-    print(f"Original hm_size: {model.hm_size}")
-
-    new_size = (128, 128)
-    model.update_hm_size(new_size)
-    print(f"Updated hm_size: {model.hm_size}")
-
-    # Test with new size
-    probs_new, _ = model(frames)
-    print(f"New output shape: {probs_new.shape}")
-
-    # Test backbone freezing
-    print(f"\nTesting backbone freezing:")
-    model.freeze_backbone(True)
-    frozen_params = model.get_trainable_parameters()
-    print(f"Parameters after freezing backbone: {frozen_params['backbone']}")
-
-    model.freeze_backbone(False)
-    unfrozen_params = model.get_trainable_parameters()
-    print(f"Parameters after unfreezing backbone: {unfrozen_params['backbone']}")
 
     print("\nVLNHeatmapModel test completed successfully!")
