@@ -61,6 +61,70 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
+def variable_length_collate_fn(batch):
+    """
+    Custom collate function to handle variable-length frame sequences and heatmaps.
+    Pads all sequences to the maximum length in the batch.
+    """
+    # Find max frame count and max heatmap count in this batch
+    max_T = max(sample['frames'].shape[0] for sample in batch)
+    max_K = max(sample['gt_heatmaps'].shape[0] for sample in batch)
+
+    # Prepare batched tensors
+    batch_frames = []
+    batch_text = []
+    batch_gt_heatmaps = []
+    batch_mask = []
+    batch_meta = []
+    batch_frame_mask = []  # mask indicating valid frames
+
+    for sample in batch:
+        frames = sample['frames']  # [T, 3, H, W]
+        T = frames.shape[0]
+
+        # Pad frames to max_T if needed
+        if T < max_T:
+            pad_size = max_T - T
+            pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)  # Repeat last frame
+            frames_padded = torch.cat([frames, pad_frames], dim=0)
+            frame_mask = torch.cat([torch.ones(T), torch.zeros(pad_size)])
+        else:
+            frames_padded = frames
+            frame_mask = torch.ones(T)
+
+        # Pad heatmaps to max_K if needed
+        gt_heatmaps = sample['gt_heatmaps']  # [K, Hm, Wm]
+        mask = sample['mask']  # [K]
+        K = gt_heatmaps.shape[0]
+
+        if K < max_K:
+            pad_size = max_K - K
+            Hm, Wm = gt_heatmaps.shape[1], gt_heatmaps.shape[2]
+            pad_heatmaps = torch.zeros(pad_size, Hm, Wm)
+            pad_mask = torch.zeros(pad_size)
+            gt_heatmaps_padded = torch.cat([gt_heatmaps, pad_heatmaps], dim=0)
+            mask_padded = torch.cat([mask, pad_mask], dim=0)
+        else:
+            gt_heatmaps_padded = gt_heatmaps
+            mask_padded = mask
+
+        batch_frames.append(frames_padded)
+        batch_text.append(sample['text'])
+        batch_gt_heatmaps.append(gt_heatmaps_padded)
+        batch_mask.append(mask_padded)
+        batch_meta.append(sample['meta'])
+        batch_frame_mask.append(frame_mask)
+
+    return {
+        'frames': torch.stack(batch_frames, dim=0),  # [B, max_T, 3, H, W]
+        'text': batch_text,                          # List of strings
+        'gt_heatmaps': torch.stack(batch_gt_heatmaps, dim=0),  # [B, max_K, Hm, Wm]
+        'mask': torch.stack(batch_mask, dim=0),      # [B, max_K]
+        'meta': batch_meta,                          # List of dicts
+        'frame_mask': torch.stack(batch_frame_mask, dim=0)  # [B, max_T]
+    }
+
+
 def create_dataloaders(config: Dict, hm_size: Tuple[int, int]) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and val dataloaders with specified heatmap size.
@@ -93,14 +157,15 @@ def create_dataloaders(config: Dict, hm_size: Tuple[int, int]) -> Tuple[DataLoad
         hm_size=hm_size
     )
 
-    # Create dataloaders
+    # Create dataloaders with custom collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['optim']['batch_size'],
         shuffle=True,
         num_workers=data_cfg['num_workers'],
         pin_memory=data_cfg['pin_memory'],
-        drop_last=True
+        drop_last=True,
+        collate_fn=variable_length_collate_fn  # Handle variable-length sequences
     )
 
     val_loader = DataLoader(
@@ -109,7 +174,8 @@ def create_dataloaders(config: Dict, hm_size: Tuple[int, int]) -> Tuple[DataLoad
         shuffle=False,
         num_workers=data_cfg['num_workers'],
         pin_memory=data_cfg['pin_memory'],
-        drop_last=False
+        drop_last=False,
+        collate_fn=variable_length_collate_fn  # Handle variable-length sequences
     )
 
     logger.info(f"Dataloaders created: train={len(train_dataset)}, val={len(val_dataset)}, hm_size={hm_size}")

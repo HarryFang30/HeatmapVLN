@@ -10,9 +10,9 @@ seed: 42
 # Data Configuration
 # ================================
 data:
-  root: ./data/habitat_vln
-  frames_per_clip: 8              # T: Number of frames per clip
-  heatmap_per_clip: 4             # K: Number of heatmaps per clip
+  root: /home/VLN/dataset_train   # NEW: Updated to actual dataset location (absolute path)
+  frames_per_clip: 8              # T: Number of frames per clip (model will subsample if needed)
+  heatmap_per_clip: 7             # K: Number of heatmaps per clip (NEW: max 7 reference_path points in dataset)
   image_size: [384, 384]          # Input image size (W, H)
   init_hm_size: [64, 64]          # Initial heatmap size for curriculum learning
   num_workers: 4

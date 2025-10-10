@@ -98,44 +98,54 @@ class VLNHeatmapDataset(Dataset):
 
         Returns:
             dict: {
-                "frames": Tensor[T, 3, H, W] - RGB frames
-                "text": None - No text instruction for this dataset
-                "gt_heatmaps": Tensor[K, Hm, Wm] - Ground truth heatmaps
+                "frames": Tensor[T, 3, H, W] - RGB frames (T is actual frame count)
+                "text": str - Navigation instruction from R2R dataset
+                "gt_heatmaps": Tensor[K, Hm, Wm] - Ground truth heatmaps (K=6 for new dataset)
                 "mask": Tensor[K] - Validity mask for heatmaps
-                "meta": Dict - Metadata
+                "meta": Dict - Metadata with keyframe indices and reference path
             }
         """
         clip_dir = self.clips[idx]
 
         try:
-            # Load frames
-            frames = self._load_frames(clip_dir)
+            # Load metadata first (needed for frame loading)
+            meta = self._load_metadata(clip_dir)
+
+            # Load frames (all frames, not truncated)
+            frames = self._load_frames(clip_dir, meta)
 
             # Load heatmaps and mask
             gt_heatmaps, mask = self._load_heatmaps(clip_dir)
 
-            # Load metadata
-            meta = self._load_metadata(clip_dir)
-
-            # Ensure correct tensor shapes
-            frames = self._validate_frames_shape(frames)
+            # Ensure correct tensor shapes (with flexible K)
+            frames = self._validate_frames_shape(frames, meta)
             gt_heatmaps, mask = self._validate_heatmaps_shape(gt_heatmaps, mask)
 
+            # Extract text instruction
+            text = meta.get("instruction", "")
+
             return {
-                "frames": frames,           # [T, 3, H, W]
-                "text": "",                # Empty string instead of None
-                "gt_heatmaps": gt_heatmaps, # [K, Hm, Wm]
+                "frames": frames,           # [T_actual, 3, H, W] - variable T
+                "text": text,              # R2R navigation instruction
+                "gt_heatmaps": gt_heatmaps, # [K, Hm, Wm] - K matches dataset
                 "mask": mask,              # [K]
-                "meta": meta               # Dict
+                "meta": meta               # Contains keyframe_indices, reference_path
             }
 
         except Exception as e:
             logger.error(f"Error loading clip {clip_dir}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             # Return dummy data to avoid crash
             return self._get_dummy_sample()
 
-    def _load_frames(self, clip_dir: Path) -> torch.Tensor:
-        """Load RGB frames from clip directory."""
+    def _load_frames(self, clip_dir: Path, meta: Optional[Dict] = None) -> torch.Tensor:
+        """
+        Load RGB frames from clip directory.
+
+        Uses actual number of frames from metadata, not hardcoded frames_per_clip.
+        This allows handling variable-length clips (e.g., 51 frames, 91 frames).
+        """
         rgb_dir = clip_dir / "rgb"
 
         if not rgb_dir.exists():
@@ -147,11 +157,12 @@ class VLNHeatmapDataset(Dataset):
         if len(rgb_files) == 0:
             raise FileNotFoundError(f"No RGB files found in {rgb_dir}")
 
-        # Load frames
+        # Load ALL frames (not just frames_per_clip)
+        # The model will handle temporal downsampling if needed
         frames = []
         target_w, target_h = self.image_size
 
-        for rgb_file in rgb_files[:self.frames_per_clip]:
+        for rgb_file in rgb_files:  # Load all frames
             # Load and resize image
             image = cv2.imread(str(rgb_file))
             if image is None:
@@ -171,7 +182,7 @@ class VLNHeatmapDataset(Dataset):
             frames.append(image_tensor)
 
         # Stack frames
-        frames_tensor = torch.stack(frames, dim=0)  # [T, C, H, W]
+        frames_tensor = torch.stack(frames, dim=0)  # [T_actual, C, H, W]
 
         return frames_tensor
 
@@ -240,43 +251,40 @@ class VLNHeatmapDataset(Dataset):
 
         return meta
 
-    def _validate_frames_shape(self, frames: torch.Tensor) -> torch.Tensor:
-        """Validate and adjust frames tensor shape."""
+    def _validate_frames_shape(self, frames: torch.Tensor, meta: Optional[Dict] = None) -> torch.Tensor:
+        """
+        Validate frames tensor shape.
+
+        NEW: Allow variable frame counts - don't force truncate/pad.
+        The model's temporal encoder (GRU) can handle variable-length sequences.
+        """
         T, C, H, W = frames.shape
 
-        if T != self.frames_per_clip:
-            logger.warning(f"Frame count mismatch: expected {self.frames_per_clip}, got {T}")
+        # Log frame count for debugging
+        if meta and 'num_frames' in meta:
+            expected_T = meta['num_frames']
+            if T != expected_T:
+                logger.warning(f"Frame count mismatch: expected {expected_T}, got {T}")
 
-            if T > self.frames_per_clip:
-                # Truncate extra frames
-                frames = frames[:self.frames_per_clip]
-            else:
-                # Pad with last frame
-                last_frame = frames[-1:].repeat(self.frames_per_clip - T, 1, 1, 1)
-                frames = torch.cat([frames, last_frame], dim=0)
-
+        # Don't truncate/pad - return actual frames
+        # The training collate_fn will handle batching variable-length sequences
         return frames
 
     def _validate_heatmaps_shape(self, heatmaps: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Validate and adjust heatmaps and mask tensor shapes."""
+        """
+        Validate heatmaps and mask tensor shapes.
+
+        NEW: Allow variable K (dataset has K=6 for 6 reference_path points).
+        Only warn if mismatch, but don't truncate - preserve all supervision signals.
+        """
         K = heatmaps.shape[0]
 
         if K != self.heatmap_per_clip:
-            logger.warning(f"Heatmap count mismatch: expected {self.heatmap_per_clip}, got {K}")
+            logger.debug(f"Heatmap count: dataset has {K}, config expects {self.heatmap_per_clip}")
+            # Update heatmap_per_clip to match dataset
+            self.heatmap_per_clip = K
 
-            if K > self.heatmap_per_clip:
-                # Truncate extra heatmaps
-                heatmaps = heatmaps[:self.heatmap_per_clip]
-                mask = mask[:self.heatmap_per_clip]
-            else:
-                # Pad with zero heatmaps
-                target_h, target_w = self.hm_size
-                zero_heatmaps = torch.zeros(self.heatmap_per_clip - K, target_h, target_w)
-                zero_mask = torch.zeros(self.heatmap_per_clip - K)
-
-                heatmaps = torch.cat([heatmaps, zero_heatmaps], dim=0)
-                mask = torch.cat([mask, zero_mask], dim=0)
-
+        # Don't truncate/pad - return actual heatmaps
         return heatmaps, mask
 
     def _get_dummy_sample(self) -> Dict[str, Union[torch.Tensor, Dict]]:

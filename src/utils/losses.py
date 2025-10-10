@@ -23,21 +23,36 @@ def heatmap_ce_from_logits(logits: torch.Tensor, target_maps: torch.Tensor,
     This avoids double softmax and preserves gradient signal better than
     computing loss in probability space.
 
+    **NEW**: Supports dynamic K - handles cases where logits.shape[1] != target_maps.shape[1]
+    by taking min(K_pred, K_target) to handle variable-length reference paths.
+
     Args:
-        logits: Raw logits from model [B, K, Hm, Wm]
-        target_maps: Target heatmaps [B, K, Hm, Wm] (raw values, will be normalized)
-        mask: Optional validity mask [B, K] where 1=valid, 0=invalid
+        logits: Raw logits from model [B, K_pred, Hm, Wm]
+        target_maps: Target heatmaps [B, K_target, Hm, Wm] (raw values, will be normalized)
+        mask: Optional validity mask [B, K_target] where 1=valid, 0=invalid
         tau: Temperature parameter (default 1.0)
         eps: Numerical stability epsilon
 
     Returns:
         torch.Tensor: Scalar loss value
     """
-    B, K, Hm, Wm = logits.shape
+    B_pred, K_pred, Hm_pred, Wm_pred = logits.shape
+    B_target, K_target, Hm_target, Wm_target = target_maps.shape
 
-    # Flatten spatial dimensions
-    logits_flat = logits.view(B * K, -1) / tau  # [B*K, Hm*Wm]
-    target_flat = target_maps.view(B * K, -1)   # [B*K, Hm*Wm]
+    # Handle K mismatch (variable reference path lengths)
+    if K_pred != K_target:
+        K_min = min(K_pred, K_target)
+        logits = logits[:, :K_min].contiguous()  # Truncate to min K and make contiguous
+        target_maps = target_maps[:, :K_min].contiguous()
+        if mask is not None:
+            mask = mask[:, :K_min].contiguous()
+        K = K_min
+    else:
+        K = K_pred
+
+    # Flatten spatial dimensions (use reshape for safety after slicing)
+    logits_flat = logits.reshape(B_pred * K, -1) / tau  # [B*K, Hm*Wm]
+    target_flat = target_maps.reshape(B_target * K, -1)   # [B*K, Hm*Wm]
 
     # Compute log probabilities (stable)
     log_p = F.log_softmax(logits_flat, dim=-1)  # [B*K, Hm*Wm]
@@ -50,7 +65,7 @@ def heatmap_ce_from_logits(logits: torch.Tensor, target_maps: torch.Tensor,
 
     # Apply mask
     if mask is not None:
-        m = mask.view(B * K).float()
+        m = mask.view(B_target * K).float()
         return (loss * m).sum() / m.sum().clamp_min(1.0)
     else:
         return loss.mean()
