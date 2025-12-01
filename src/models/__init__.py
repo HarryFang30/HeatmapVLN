@@ -47,12 +47,7 @@ from .dinov3.hub import (
     verify_model_integrity
 )
 
-# Integration layers
-from .vggt_integration import (
-    VGGTProcessor,
-    VGGTIntegrationConfig,
-    create_vggt_processor
-)
+# Integration layers (active components)
 from .dinov3_compatibility import (
     DINOv3CompatibilityLayer,
     DINOv3CompatConfig,
@@ -66,40 +61,33 @@ from .spatial_mllm_compat import (
     create_spatial_mllm_pipeline
 )
 
-# Performance optimizations
-from .performance_optimizer import (
-    DualEncoderPerformanceOptimizer,
-    PerformanceConfig,
-    create_performance_optimizer
-)
-
 # === EXISTING COMPONENTS ===
 
 # Import Spatial-MLLM components (existing)
 try:
-    from .llm import (
+    from .qwen2_5_vl import (
         # Main Spatial-MLLM model with VGGT integration
         Qwen2_5_VL_VGGTForConditionalGeneration,
         Qwen2_5_VLProcessor,
-        
+
         # Base Qwen2.5-VL models
         Qwen2_5_VLForConditionalGeneration,
         Qwen2_5_VLModel,
         Qwen2_5_VLPreTrainedModel,
-        
+
         # Configuration
         Qwen2_5_VLConfig,
         Qwen2_5_VLVisionConfig,
-        
+
         # Processing
         Qwen2_5_VLProcessorKwargs,
     )
 except ImportError as e:
     print(f"Warning: Spatial-MLLM components not available: {e}")
     # Set to None for graceful degradation
-    (Qwen2_5_VL_VGGTForConditionalGeneration, Qwen2_5_VLProcessor, 
-     Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel, 
-     Qwen2_5_VLPreTrainedModel, Qwen2_5_VLConfig, 
+    (Qwen2_5_VL_VGGTForConditionalGeneration, Qwen2_5_VLProcessor,
+     Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel,
+     Qwen2_5_VLPreTrainedModel, Qwen2_5_VLConfig,
      Qwen2_5_VLVisionConfig, Qwen2_5_VLProcessorKwargs) = [None] * 8
 
 # Import Heatmap components (with fallback for missing dependencies)
@@ -176,23 +164,15 @@ __all__ = [
     'load_pretrained_model',
     'verify_model_integrity',
     
-    # Integration Components
-    'VGGTProcessor',
-    'VGGTIntegrationConfig',
-    'create_vggt_processor',
+    # Integration Components (active)
     'DINOv3CompatibilityLayer',
     'DINOv3CompatConfig',
     'create_dinov3_compatibility_layer',
-    
+
     # Complete Pipeline
     'SpatialMLLMPipeline',
     'SpatialMLLMIntegrationConfig',
     'create_spatial_mllm_pipeline',
-    
-    # Performance Optimization
-    'DualEncoderPerformanceOptimizer',
-    'PerformanceConfig',
-    'create_performance_optimizer',
     
     # === EXISTING COMPONENTS ===
     # Spatial-MLLM Components
@@ -233,26 +213,23 @@ def create_optimized_vln_pipeline(
     target_keyframes: int = 16,
     total_frames: int = 128,
     dinov3_model_size: str = "large",
-    enable_optimizations: bool = True,
     device: str = "cuda"
 ):
     """
-    Create a complete, optimized VLN pipeline with performance enhancements.
-    
-    This is the recommended way to create a production-ready VLN pipeline
-    that includes all optimizations and compatibility layers.
-    
+    Create a complete VLN pipeline.
+
+    This is the recommended way to create a production-ready VLN pipeline.
+
     Args:
         target_keyframes: Number of keyframes to select (N_k)
         total_frames: Total input frames (N_m)
         dinov3_model_size: Size of DINOv3 model ("base", "large", "giant")
-        enable_optimizations: Enable performance optimizations
         device: Computing device
-        
+
     Returns:
-        Tuple of (pipeline, optimizer) for complete VLN processing
+        SpatialMLLMPipeline for complete VLN processing
     """
-    
+
     # Create main pipeline
     pipeline = create_spatial_mllm_pipeline(
         target_keyframes=target_keyframes,
@@ -261,17 +238,8 @@ def create_optimized_vln_pipeline(
         device=device,
         verbose=True
     )
-    
-    # Create performance optimizer if enabled
-    optimizer = None
-    if enable_optimizations:
-        optimizer = create_performance_optimizer(
-            enable_all_optimizations=True,
-            max_memory_mb=12000,
-            target_fps=25.0
-        )
-    
-    return pipeline, optimizer
+
+    return pipeline
 
 
 def get_model_info():

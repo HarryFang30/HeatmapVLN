@@ -158,19 +158,31 @@ class LLMToHeatmapConverter(nn.Module):
     def generate_heatmap(self, spatial_features: torch.Tensor) -> torch.Tensor:
         """
         Generate heatmaps from spatial features using ConvexUpSample.
-        
+
         Args:
             spatial_features (torch.Tensor): Features [batch*views, hidden_dim, 16, 16]
-            
+
         Returns:
             torch.Tensor: Generated heatmaps [batch*views, 1, target_size, target_size]
+                          Normalized as probability distributions (spatial softmax applied)
         """
         # Ensure float32 for stable computation
         spatial_features = spatial_features.to(torch.float32)
-        
-        # Generate heatmaps using learned upsampling
-        heatmaps = self.upsampler(spatial_features)
-        
+
+        # Generate heatmap logits using learned upsampling
+        logits = self.upsampler(spatial_features)  # [B, 1, H, W]
+
+        # ⭐ FIX: Apply spatial softmax to convert logits to probability distribution
+        # Reshape to [B, 1, H*W] for softmax across spatial dimensions
+        B, C, H, W = logits.shape
+        logits_flat = logits.view(B, C, -1)  # [B, 1, H*W]
+
+        # Apply softmax across spatial dimension to get probability distribution
+        probs_flat = torch.softmax(logits_flat, dim=-1)  # [B, 1, H*W], sum over spatial = 1
+
+        # Reshape back to spatial layout
+        heatmaps = probs_flat.view(B, C, H, W)  # [B, 1, H, W]
+
         return heatmaps
     
     def generate_single_inter_frame_heatmap(

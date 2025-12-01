@@ -1,0 +1,13 @@
+{
+  "my_robot_dataset": {
+    "action": {
+      "mean": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "std": [0.1, 0.1, 0.1, 0.3, 0.3, 0.3],
+      "min": [-0.5, -0.5, -0.5, -1.0, -1.0, -1.0],
+      "max": [0.5, 0.5, 0.5, 1.0, 1.0, 1.0],
+      "q01": [-0.3, -0.3, -0.3, -0.8, -0.8, -0.8],
+      "q99": [0.3, 0.3, 0.3, 0.8, 0.8, 0.8]
+    },
+    "description": "Replace this with your actual dataset statistics computed from training data"
+  }
+}

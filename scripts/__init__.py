@@ -1,11 +1,11 @@
 """
 Scripts package for VLN Project
-Contains training, inference, evaluation, and preprocessing scripts
+Contains training, inference, and evaluation scripts
 """
 
-from .train import train_pipeline
-from .inference import inference_pipeline  
-from .evaluate import evaluate_pipeline
-from .preprocess import preprocess_data
+# Core scripts are meant to be run directly, not imported as a package
+# Use: python scripts/train_multistage.py --config configs/training_config.yaml
+# Use: python scripts/inference.py --video path/to/video.mp4
+# Use: python scripts/evaluate.py --model path/to/model
 
-__all__ = ['train_pipeline', 'inference_pipeline', 'evaluate_pipeline', 'preprocess_data']
+__all__ = []

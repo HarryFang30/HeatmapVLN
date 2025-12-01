@@ -22,7 +22,7 @@ compatibility across all components.
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List
 import logging
 from dataclasses import dataclass
 
@@ -112,10 +112,24 @@ class SpatialMLLMPipeline(nn.Module):
     def __init__(self, config: SpatialMLLMIntegrationConfig):
         super().__init__()
         self.config = config
+        # In DDP mode (use_multi_gpu=False), use rank-specific device from config
+        # In multi-GPU mode (use_multi_gpu=True), use explicit GPU assignments
         self.device = torch.device(config.device)
-        
-        # Initialize VGGT for 3D geometry processing (all N_m frames) on dedicated GPU
+
+        # 🔍 DEBUG: Print device configuration
+        print(f"[DEBUG] SpatialMLLMPipeline.__init__")
+        print(f"[DEBUG] config.device: {config.device}")
+        print(f"[DEBUG] config.use_multi_gpu: {config.use_multi_gpu}")
+        print(f"[DEBUG] config.vggt_gpu: {config.vggt_gpu}")
+        print(f"[DEBUG] config.dinov3_gpu: {config.dinov3_gpu}")
+        print(f"[DEBUG] config.llm_gpu: {config.llm_gpu}")
+        print(f"[DEBUG] self.device: {self.device}")
+
+        # Initialize VGGT for 3D geometry processing (all N_m frames)
+        # In DDP mode: all modules on same device (self.device)
+        # In multi-GPU mode: on dedicated GPU
         vggt_device = torch.device(config.vggt_gpu if config.use_multi_gpu else config.device)
+        print(f"[DEBUG] vggt_device will be: {vggt_device}")
         try:
             # Try to load pretrained VGGT from local model directory
             from ..utils.path_utils import resolve_model_path
@@ -161,8 +175,9 @@ class SpatialMLLMPipeline(nn.Module):
             dtype=config.dtype
         )
         
-        # Initialize feature fusion module
-        self.feature_fusion = self._create_feature_fusion_module().to(device=self.device, dtype=config.dtype)
+        # Initialize feature fusion module (放在vggt_gpu上，因为VGGT占用小，llm_gpu已被Qwen占满)
+        fusion_device = torch.device(config.vggt_gpu if config.use_multi_gpu else config.device)
+        self.feature_fusion = self._create_feature_fusion_module().to(device=fusion_device, dtype=config.dtype)
         
         # Initialize REAL LLM integration (Qwen2.5-VL)
         if config.use_real_llm:
@@ -184,27 +199,40 @@ class SpatialMLLMPipeline(nn.Module):
                     device=llm_device,
                     torch_dtype=config.llm_torch_dtype
                 )
-            # Keep projector as fallback
+            # Keep projector as fallback (放在fusion同一GPU上，即vggt_gpu)
+            projector_device = fusion_device  # 与fusion module在同一GPU
             if config.enable_llm_projection:
-                self.llm_projector = self._create_llm_projection_module().to(device=self.device, dtype=config.dtype)
+                self.llm_projector = self._create_llm_projection_module().to(device=projector_device, dtype=config.dtype)
             else:
-                self.llm_projector = nn.Identity().to(device=self.device, dtype=config.dtype)
+                self.llm_projector = nn.Identity().to(device=projector_device, dtype=config.dtype)
         else:
             logger.warning("Using FAKE LLM projection - not real LLM processing!")
             self.llm_integration = None
+            projector_device = fusion_device  # 与fusion module在同一GPU
             if config.enable_llm_projection:
-                self.llm_projector = self._create_llm_projection_module().to(device=self.device, dtype=config.dtype)
+                self.llm_projector = self._create_llm_projection_module().to(device=projector_device, dtype=config.dtype)
             else:
-                self.llm_projector = nn.Identity().to(device=self.device, dtype=config.dtype)
+                self.llm_projector = nn.Identity().to(device=projector_device, dtype=config.dtype)
             
-        # Initialize heatmap converter for inter-frame heatmaps
+        # Initialize dual heatmap converters for inter-frame heatmaps (history + future) on llm_gpu
         if config.enable_inter_frame_heatmaps:
-            self.heatmap_converter = LLMHiddenStateConverter(
+            heatmap_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
+            self.history_heatmap_converter = LLMHiddenStateConverter(
                 vlm_dim=config.llm_token_dim,
                 target_size=config.heatmap_size[0]  # Use single dimension
-            ).to(device=self.device, dtype=config.dtype)
+            ).to(device=heatmap_device, dtype=config.dtype)
+            self.future_heatmap_converter = LLMHiddenStateConverter(
+                vlm_dim=config.llm_token_dim,
+                target_size=config.heatmap_size[0]
+            ).to(device=heatmap_device, dtype=config.dtype)
+            # Validity heads (one logit per keyframe)
+            self.history_validity_head = nn.Linear(config.llm_token_dim, 1).to(device=heatmap_device, dtype=config.dtype)
+            self.future_validity_head = nn.Linear(config.llm_token_dim, 1).to(device=heatmap_device, dtype=config.dtype)
         else:
-            self.heatmap_converter = None
+            self.history_heatmap_converter = None
+            self.future_heatmap_converter = None
+            self.history_validity_head = None
+            self.future_validity_head = None
             
         # Performance optimization
         if config.enable_gradient_checkpointing:
@@ -409,13 +437,25 @@ class SpatialMLLMPipeline(nn.Module):
             llm_tokens = self.llm_projector(fused_features)
         
         # Step 6: Generate frame-indexed inter-frame heatmaps
-        frame_indexed_heatmaps = None
-        if return_heatmaps and self.heatmap_converter is not None:
-            logger.info("Step 6: Frame-indexed inter-frame heatmap generation")
+        history_heatmaps = None
+        future_heatmaps = None
+        history_heatmap_dict = None
+        future_heatmap_dict = None
+        history_validity = None
+        future_validity = None
+        if return_heatmaps and self.history_heatmap_converter is not None and self.future_heatmap_converter is not None:
+            logger.info("Step 6: Frame-indexed inter-frame heatmap generation (history & future)")
             # Use last frame index as reference for spatial relationships (current observation)
             current_frame_idx = total_frames - 1
-            frame_indexed_heatmaps = self._generate_inter_frame_heatmaps(
-                llm_tokens, selected_indices, keyframe_result['geometry_data'], current_frame_idx=current_frame_idx
+            history_heatmap_dict, history_heatmaps, history_validity = self._generate_inter_frame_heatmaps(
+                llm_tokens, selected_indices, keyframe_result['geometry_data'],
+                converter=self.history_heatmap_converter, validity_head=self.history_validity_head,
+                current_frame_idx=current_frame_idx
+            )
+            future_heatmap_dict, future_heatmaps, future_validity = self._generate_inter_frame_heatmaps(
+                llm_tokens, selected_indices, keyframe_result['geometry_data'],
+                converter=self.future_heatmap_converter, validity_head=self.future_validity_head,
+                current_frame_idx=current_frame_idx
             )
         
         # Prepare output
@@ -439,12 +479,17 @@ class SpatialMLLMPipeline(nn.Module):
             }
         }
         
-        if frame_indexed_heatmaps is not None:
-            output['frame_indexed_heatmaps'] = frame_indexed_heatmaps
-            # For backward compatibility, also provide the first heatmap as 'inter_frame_heatmap'
-            if frame_indexed_heatmaps:
-                first_frame_idx = min(frame_indexed_heatmaps.keys())
-                output['inter_frame_heatmap'] = frame_indexed_heatmaps[first_frame_idx].unsqueeze(1)  # Add channel dim
+        if history_heatmaps is not None and future_heatmaps is not None:
+            output['history_heatmaps'] = history_heatmaps
+            output['future_heatmaps'] = future_heatmaps
+            output['history_heatmap_dict'] = history_heatmap_dict
+            output['future_heatmap_dict'] = future_heatmap_dict
+            output['history_validity'] = history_validity  # [B, K]
+            output['future_validity'] = future_validity    # [B, K]
+            # For backward compatibility, also提供第一张历史热力图
+            if history_heatmap_dict:
+                first_frame_idx = min(history_heatmap_dict.keys())
+                output['inter_frame_heatmap'] = history_heatmap_dict[first_frame_idx].unsqueeze(1)  # Add channel dim
             
         if return_intermediate:
             output['intermediate_features'] = {
@@ -568,50 +613,54 @@ class SpatialMLLMPipeline(nn.Module):
         dinov3_features: torch.Tensor
     ) -> torch.Tensor:
         """Fuse 3D VGGT and 2D DINOv3 features."""
-        
+        import torch.nn.functional as F  # Local import to avoid global namespace clutter
+
+        # Move features to fusion device (vggt_gpu/GPU 0, 因为VGGT占用小，llm_gpu已被Qwen占满)
+        fusion_device = next(self.feature_fusion.parameters()).device
+        if vggt_features.device != fusion_device:
+            vggt_features = vggt_features.to(fusion_device, dtype=self.config.dtype)
+        if dinov3_features.device != fusion_device:
+            dinov3_features = dinov3_features.to(fusion_device, dtype=self.config.dtype)
+
         if self.config.verbose:
             print(f"INFO: VGGT features shape: {vggt_features.shape}")
             print(f"INFO: DINOv3 features shape: {dinov3_features.shape}")
-        
+
         if self.config.fusion_method == "concatenate":
-            # Handle spatial dimension mismatch by projecting to common space
+            # Memory-safe fusion: downsample to capped square grid before MLP
             batch_size, num_keyframes = vggt_features.shape[:2]
             vggt_spatial_dim = vggt_features.shape[2]
             dinov3_spatial_dim = dinov3_features.shape[2]
             feature_dim = vggt_features.shape[-1]
-            
-            if vggt_spatial_dim != dinov3_spatial_dim:
-                # Use interpolation to resize DINOv3 features to match VGGT spatial dimensions
-                # This is more memory-efficient than creating a huge linear layer
-                
-                # Determine spatial layout for DINOv3 features
-                dinov3_h = int(dinov3_spatial_dim ** 0.5)
-                dinov3_w = dinov3_spatial_dim // dinov3_h
-                vggt_h = int(vggt_spatial_dim ** 0.5)
-                vggt_w = vggt_spatial_dim // vggt_h
-                
-                # Reshape DINOv3 features to [B, N_k, C, H, W] format
-                dinov3_spatial = dinov3_features.view(batch_size, num_keyframes, feature_dim, dinov3_h, dinov3_w)
-                dinov3_spatial = dinov3_spatial.permute(0, 1, 2, 3, 4).contiguous()
-                
-                # Interpolate to match VGGT spatial dimensions
-                dinov3_resized = torch.nn.functional.interpolate(
-                    dinov3_spatial.view(batch_size * num_keyframes, feature_dim, dinov3_h, dinov3_w),
-                    size=(vggt_h, vggt_w),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                
-                # Reshape back to [B, N_k, spatial_dim, feature_dim]
-                dinov3_features = dinov3_resized.view(batch_size, num_keyframes, feature_dim, vggt_h * vggt_w)
-                dinov3_features = dinov3_features.permute(0, 1, 3, 2).contiguous()
-                
-                if self.config.verbose:
-                    print(f"INFO: Resized DINOv3 features to shape: {dinov3_features.shape}")
-            
-            # Now concatenate along feature dimension
-            fused = torch.cat([vggt_features, dinov3_features], dim=-1)
-            return self.feature_fusion(fused)
+
+            # Use square grids only; cap to 64x64 tokens to avoid OOM
+            SAFE_MAX_TOKENS = 64 * 64
+            vggt_side = int(vggt_spatial_dim ** 0.5)
+            fusion_side = min(vggt_side, int(SAFE_MAX_TOKENS ** 0.5))
+
+            if self.config.verbose and fusion_side != vggt_side:
+                print(f"INFO: Fusion downsample {vggt_side}x{vggt_side} -> {fusion_side}x{fusion_side}")
+
+            # VGGT: [B, T, L, C] -> [B*T, C, H, W] -> pool to fusion_side
+            vggt_img = vggt_features.view(batch_size * num_keyframes, vggt_side, vggt_side, feature_dim)
+            vggt_img = vggt_img.permute(0, 3, 1, 2).contiguous()
+            vggt_resized = F.adaptive_avg_pool2d(vggt_img, (fusion_side, fusion_side))
+
+            # DINO: [B, T, L, C] -> [B*T, C, H, W] -> resize to fusion_side
+            dinov3_side = int(dinov3_spatial_dim ** 0.5)
+            dinov3_img = dinov3_features.view(batch_size * num_keyframes, dinov3_side, dinov3_side, feature_dim)
+            dinov3_img = dinov3_img.permute(0, 3, 1, 2).contiguous()
+            dinov3_resized = F.interpolate(
+                dinov3_img, size=(fusion_side, fusion_side),
+                mode='bilinear', align_corners=False
+            )
+
+            # Concatenate channel-wise and flatten back to sequence for fusion MLP
+            fused_img = torch.cat([vggt_resized, dinov3_resized], dim=1)  # [B*T, C_total, H, W]
+            fused_flat = fused_img.permute(0, 2, 3, 1).contiguous()  # [B*T, H, W, C_total]
+            fused_flat = fused_flat.view(batch_size, num_keyframes, fusion_side * fusion_side, -1)
+
+            return self.feature_fusion(fused_flat)
         else:
             # Use specialized fusion module
             return self.feature_fusion(vggt_features, dinov3_features)
@@ -621,8 +670,10 @@ class SpatialMLLMPipeline(nn.Module):
         llm_tokens: torch.Tensor,
         selected_indices: torch.Tensor,
         geometry_data: Dict[str, torch.Tensor],
+        converter: LLMHiddenStateConverter,
+        validity_head: nn.Module,
         current_frame_idx: int = 0
-    ) -> Dict[int, torch.Tensor]:
+    ) -> Tuple[Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
         """Generate frame-indexed heatmaps showing spatial relationships between keyframes and current observation."""
 
         # llm_tokens shape: [B, N_frames, N_patches, D]
@@ -640,7 +691,9 @@ class SpatialMLLMPipeline(nn.Module):
         logger.info(f"LLM tokens shape: {llm_tokens.shape}")
 
         # Generate frame-specific heatmaps
-        frame_indexed_heatmaps = {}
+        frame_indexed_heatmaps: Dict[int, torch.Tensor] = {}
+        stacked_heatmaps: List[torch.Tensor] = []
+        validity_list: List[torch.Tensor] = []
 
         for i, original_frame_idx in enumerate(keyframe_indices):
             if i >= num_frames:
@@ -663,11 +716,42 @@ class SpatialMLLMPipeline(nn.Module):
             try:
                 spatial_tokens = frame_tokens.permute(0, 2, 1).view(batch_size, token_dim, patch_h, patch_w)
 
+                # Move spatial_tokens to heatmap_converter device (llm_gpu) to avoid GPU0 OOM
+                converter_device = next(converter.parameters()).device
+                if spatial_tokens.device != converter_device:
+                    spatial_tokens = spatial_tokens.to(converter_device)
+
                 # Generate heatmap using the converter's upsampling
-                frame_heatmap = self.heatmap_converter.generate_heatmap(spatial_tokens)  # [B, 1, H, W]
+                frame_heatmap = converter.generate_heatmap(spatial_tokens)  # [B, 1, H, W]
+
+                # Resize to target heatmap size if needed
+                target_h, target_w = self.config.heatmap_size
+                current_h, current_w = frame_heatmap.shape[2], frame_heatmap.shape[3]
+                if current_h != target_h or current_w != target_w:
+                    frame_heatmap = torch.nn.functional.interpolate(
+                        frame_heatmap,
+                        size=(target_h, target_w),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    if self.config.verbose:
+                        logger.info(f"Resized heatmap from {current_h}×{current_w} to {target_h}×{target_w}")
+
+                    # ⭐ FIX: Re-normalize after resize (bilinear doesn't preserve sum)
+                    # Flatten spatial dimensions and renormalize to sum=1
+                    B, C = frame_heatmap.shape[:2]
+                    flat_hm = frame_heatmap.view(B, C, -1)  # [B, C, H*W]
+                    flat_hm = torch.softmax(flat_hm, dim=-1)  # Renormalize across spatial dimension
+                    frame_heatmap = flat_hm.view(B, C, target_h, target_w)
+
+                # Validity: 使用空间token平均池化后预测 [B, 1]
+                validity_input = spatial_tokens.flatten(2).mean(dim=2)  # [B, D]
+                validity = validity_head(validity_input)  # [B,1]
 
                 # Store with original frame index as key, remove channel dimension
                 frame_indexed_heatmaps[original_frame_idx] = frame_heatmap.squeeze(1)  # [B, H, W]
+                stacked_heatmaps.append(frame_indexed_heatmaps[original_frame_idx])
+                validity_list.append(validity.squeeze(-1))  # [B]
 
                 logger.info(f"Generated heatmap for frame {original_frame_idx}: shape {frame_heatmap.squeeze(1).shape}")
 
@@ -680,7 +764,35 @@ class SpatialMLLMPipeline(nn.Module):
                 )
 
         logger.info(f"Generated {len(frame_indexed_heatmaps)} frame-indexed heatmaps")
-        return frame_indexed_heatmaps  # Dict[int, torch.Tensor] - heatmaps indexed by original frame numbers
+        # 堆叠成 [B, K, H, W]，按keyframe_indices顺序
+        if stacked_heatmaps:
+            heatmap_tensor = torch.stack(stacked_heatmaps, dim=1)
+            validity_tensor = torch.stack(validity_list, dim=1)  # [B, K]
+        else:
+            heatmap_tensor = torch.zeros(
+                batch_size, 0, self.config.heatmap_size[0], self.config.heatmap_size[1],
+                device=llm_tokens.device, dtype=llm_tokens.dtype
+            )
+            validity_tensor = torch.zeros(batch_size, 0, device=llm_tokens.device, dtype=llm_tokens.dtype)
+        return frame_indexed_heatmaps, heatmap_tensor, validity_tensor  # Dict + stacked tensors
+
+    def update_heatmap_size(self, new_size: Tuple[int, int]):
+        """Rebuild heatmap converters to match new heatmap size (for curriculum)."""
+        self.config.heatmap_size = new_size
+        if self.history_heatmap_converter is not None:
+            device = next(self.history_heatmap_converter.parameters()).device
+            self.history_heatmap_converter = LLMHiddenStateConverter(
+                vlm_dim=self.config.llm_token_dim,
+                target_size=new_size[0]
+            ).to(device=device, dtype=self.config.dtype)
+            self.history_validity_head = nn.Linear(self.config.llm_token_dim, 1).to(device=device, dtype=self.config.dtype)
+        if self.future_heatmap_converter is not None:
+            device = next(self.future_heatmap_converter.parameters()).device
+            self.future_heatmap_converter = LLMHiddenStateConverter(
+                vlm_dim=self.config.llm_token_dim,
+                target_size=new_size[0]
+            ).to(device=device, dtype=self.config.dtype)
+            self.future_validity_head = nn.Linear(self.config.llm_token_dim, 1).to(device=device, dtype=self.config.dtype)
 
 
 class SpatialAttentionFusion(nn.Module):

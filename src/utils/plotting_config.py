@@ -80,11 +80,14 @@ def _register_additional_fonts(extra_font_dirs: Optional[Iterable[Path]] = None)
             registered += 1
         except Exception as exc:  # Matplotlib addfont can raise various errors
             logger.debug("Failed to register font %s: %s", font_path, exc)
-    if registered:
+    if registered and hasattr(font_manager, "_rebuild"):
         try:
             font_manager._rebuild()  # type: ignore[attr-defined]
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Matplotlib font cache rebuild failed: %s", exc)
+    elif registered:
+        # Newer Matplotlib versions rebuild cache lazily; just note the count.
+        logger.debug("Registered %d font(s); skipping explicit cache rebuild (not supported)", registered)
     return registered
 
 

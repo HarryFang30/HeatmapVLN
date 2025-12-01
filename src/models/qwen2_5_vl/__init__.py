@@ -15,14 +15,25 @@ from .modeling_qwen2_5_vl import (
     Qwen2_5_VL_VGGTForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
     Qwen2_5_VLModel,
+    Qwen2_5_VLPreTrainedModel,
+    VGGTEmbeddingMergerConfig,
 )
-from .processing_qwen2_5_vl import Qwen2_5_VLProcessor
-from .configuration_qwen2_5_vl import Qwen2_5_VLConfig
+from .processing_qwen2_5_vl import (
+    Qwen2_5_VLProcessor,
+    Qwen2_5_VLProcessorKwargs,
+    Qwen2_5_VLVideosProcessorKwargs,
+)
+from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
 __all__ = [
     "Qwen2_5_VL_VGGTForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen2_5_VLModel",
+    "Qwen2_5_VLPreTrainedModel",
+    "VGGTEmbeddingMergerConfig",
     "Qwen2_5_VLProcessor",
+    "Qwen2_5_VLProcessorKwargs",
+    "Qwen2_5_VLVideosProcessorKwargs",
     "Qwen2_5_VLConfig",
+    "Qwen2_5_VLVisionConfig",
 ]

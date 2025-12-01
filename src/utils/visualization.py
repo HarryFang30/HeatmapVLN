@@ -1,471 +1,326 @@
+#!/usr/bin/env python3
 """
-Visualization utilities for VLN Project
-Heatmap visualization, 3D spatial plotting, and result analysis
+Visualization utilities for VLN heatmap evaluation.
+
+Provides grid generation and thumbnail creation for frame-by-frame comparisons.
 """
 
-import os
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.colors import LinearSegmentedColormap
-import seaborn as sns
-from typing import Dict, Any, List, Optional, Tuple
+import cv2
 import torch
 from pathlib import Path
-
-from .plotting_config import configure_matplotlib_fonts
-
-# Ensure Matplotlib can render Chinese instructions when present in titles.
-configure_matplotlib_fonts()
-
-import logging
-logger = logging.getLogger(__name__)
+from typing import Dict, Tuple, Optional
+from .frame_vis_utils import (
+    create_frame_by_frame_overlay,
+    create_single_heatmap_overlay,
+    create_difference_map
+)
 
 
-class HeatmapVisualizer:
+def annotate_frame(
+    image: np.ndarray,
+    frame_idx: int,
+    validity_hist: bool,
+    validity_fut: bool,
+    font_scale: float = 0.7,
+    thickness: int = 2
+) -> np.ndarray:
     """
-    Comprehensive heatmap visualization for VLN spatial understanding
-    """
-    
-    def __init__(self, save_dir: str = "./visualizations"):
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Custom colormap for VLN heatmaps
-        self.vln_colormap = LinearSegmentedColormap.from_list(
-            'vln_heatmap',
-            ['#000428', '#004e92', '#009ffd', '#00d2ff', '#ffffff'],
-            N=256
-        )
-    
-    def visualize_inter_frame_heatmaps(self, heatmaps: torch.Tensor, 
-                                     selected_indices: List[int],
-                                     video_name: str = "video",
-                                     save: bool = True) -> plt.Figure:
-        """
-        Visualize first-person inter-frame heatmaps
-        
-        Args:
-            heatmaps: Tensor of shape [num_views, H, W] or [B, num_views, H, W]
-            selected_indices: List of selected keyframe indices
-            video_name: Name for saving files
-            save: Whether to save the figure
-            
-        Returns:
-            Matplotlib figure
-        """
-        if heatmaps.dim() == 4:
-            heatmaps = heatmaps[0]  # Take first batch if batched
-        
-        heatmaps = heatmaps.detach().cpu().numpy()
-        num_views = heatmaps.shape[0]
-        
-        # Create figure with subplots
-        cols = min(num_views, 4)
-        rows = (num_views + cols - 1) // cols
-        
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3.5))
-        if rows == 1 and cols == 1:
-            axes = np.array([axes])
-        elif rows == 1 or cols == 1:
-            axes = axes.reshape(-1)
-        else:
-            axes = axes.flatten()
-        
-        for i in range(num_views):
-            ax = axes[i] if num_views > 1 else axes
-            heatmap = heatmaps[i]
-            
-            # Normalize heatmap
-            heatmap_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-            
-            # Display heatmap
-            im = ax.imshow(heatmap_norm, cmap=self.vln_colormap, interpolation='bilinear')
-            
-            # Add title with frame index
-            frame_idx = selected_indices[i] if i < len(selected_indices) else i
-            ax.set_title(f'Inter-Frame Heatmap\nKeyframe {frame_idx}', 
-                        fontsize=12, fontweight='bold')
-            ax.axis('off')
-            
-            # Add colorbar
-            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label('Spatial Attention', rotation=270, labelpad=15)
-            
-            # Add grid for better spatial reference
-            ax.grid(True, alpha=0.3, linewidth=0.5)
-            
-        # Hide unused subplots
-        for i in range(num_views, len(axes)):
-            axes[i].axis('off')
-        
-        plt.suptitle(f'First-Person Inter-Frame Spatial Heatmaps: {video_name}', 
-                     fontsize=16, fontweight='bold', y=0.95)
-        plt.tight_layout()
-        
-        if save:
-            save_path = self.save_dir / f"{video_name}_inter_frame_heatmaps.png"
-            plt.savefig(save_path, dpi=300, bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-            logger.info(f"Inter-frame heatmaps saved to {save_path}")
-        
-        return fig
-    
-    def visualize_spatial_sampling(self, geometry_info: Dict[str, torch.Tensor],
-                                 selected_indices: List[int],
-                                 total_frames: int,
-                                 video_name: str = "video") -> plt.Figure:
-        """
-        Visualize space-aware frame sampling decisions
-        
-        Args:
-            geometry_info: Dictionary containing camera poses, depths, etc.
-            selected_indices: Selected keyframe indices
-            total_frames: Total number of frames
-            video_name: Video name for title
-            
-        Returns:
-            Matplotlib figure
-        """
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
-        # 1. Frame selection timeline
-        ax1 = axes[0, 0]
-        frame_indices = list(range(total_frames))
-        selection_mask = [i in selected_indices for i in frame_indices]
-        
-        colors = ['red' if selected else 'lightgray' for selected in selection_mask]
-        ax1.scatter(frame_indices, [1] * total_frames, c=colors, s=50, alpha=0.7)
-        
-        for idx in selected_indices:
-            ax1.axvline(x=idx, color='red', linestyle='--', alpha=0.5)
-            ax1.text(idx, 1.1, str(idx), ha='center', va='bottom', fontsize=8)
-        
-        ax1.set_xlabel('Frame Index')
-        ax1.set_ylabel('Selected')
-        ax1.set_title('Space-Aware Frame Sampling')
-        ax1.set_ylim(0.5, 1.5)
-        ax1.grid(True, alpha=0.3)
-        
-        # 2. Camera pose changes (if available)
-        ax2 = axes[0, 1]
-        if 'camera_poses' in geometry_info:
-            poses = geometry_info['camera_poses'].cpu().numpy()
-            # Calculate pose differences
-            pose_diffs = np.linalg.norm(np.diff(poses.reshape(poses.shape[0], -1), axis=0), axis=1)
-            
-            ax2.plot(range(1, len(pose_diffs) + 1), pose_diffs, 'b-', alpha=0.7)
-            
-            # Highlight selected frames
-            for idx in selected_indices:
-                if idx > 0 and idx <= len(pose_diffs):
-                    ax2.plot(idx, pose_diffs[idx-1], 'ro', markersize=8)
-            
-            ax2.set_xlabel('Frame Index')
-            ax2.set_ylabel('Pose Change')
-            ax2.set_title('Camera Pose Changes')
-            ax2.grid(True, alpha=0.3)
-        else:
-            ax2.text(0.5, 0.5, 'Camera poses not available', 
-                    ha='center', va='center', transform=ax2.transAxes)
-            ax2.set_title('Camera Pose Changes')
-        
-        # 3. Depth complexity (if available)
-        ax3 = axes[1, 0]
-        if 'depth_maps' in geometry_info:
-            depths = geometry_info['depth_maps'].cpu().numpy()
-            # Calculate depth variance as complexity measure
-            depth_complexity = np.var(depths.reshape(depths.shape[0], -1), axis=1)
-            
-            ax3.plot(range(len(depth_complexity)), depth_complexity, 'g-', alpha=0.7)
-            
-            # Highlight selected frames
-            for idx in selected_indices:
-                if idx < len(depth_complexity):
-                    ax3.plot(idx, depth_complexity[idx], 'ro', markersize=8)
-            
-            ax3.set_xlabel('Frame Index')
-            ax3.set_ylabel('Depth Complexity')
-            ax3.set_title('Scene Depth Complexity')
-            ax3.grid(True, alpha=0.3)
-        else:
-            ax3.text(0.5, 0.5, 'Depth maps not available', 
-                    ha='center', va='center', transform=ax3.transAxes)
-            ax3.set_title('Scene Depth Complexity')
-        
-        # 4. Spatial coverage (visualization of sampling efficiency)
-        ax4 = axes[1, 1]
-        
-        # Create a heatmap showing sampling efficiency
-        coverage_matrix = np.zeros((8, 8))  # 8x8 grid for visualization
-        
-        # Simulate spatial coverage (in real implementation, use actual voxel data)
-        for i, idx in enumerate(selected_indices):
-            # Map frame index to spatial grid position
-            row = (idx * 7) // total_frames
-            col = (idx * 7) % 8
-            coverage_matrix[row, col] += 1
-        
-        im4 = ax4.imshow(coverage_matrix, cmap='Blues', interpolation='nearest')
-        ax4.set_title('Spatial Coverage Grid')
-        ax4.set_xlabel('Spatial Grid X')
-        ax4.set_ylabel('Spatial Grid Y')
-        
-        # Add text annotations
-        for i in range(8):
-            for j in range(8):
-                if coverage_matrix[i, j] > 0:
-                    ax4.text(j, i, int(coverage_matrix[i, j]), 
-                            ha='center', va='center', color='white', fontweight='bold')
-        
-        plt.colorbar(im4, ax=ax4)
-        
-        plt.suptitle(f'Space-Aware Sampling Analysis: {video_name}', 
-                     fontsize=16, fontweight='bold')
-        plt.tight_layout()
-        
-        # Save visualization
-        save_path = self.save_dir / f"{video_name}_sampling_analysis.png"
-        plt.savefig(save_path, dpi=300, bbox_inches='tight', 
-                   facecolor='white', edgecolor='none')
-        logger.info(f"Sampling analysis saved to {save_path}")
-        
-        return fig
-    
-    def visualize_feature_fusion(self, vggt_features: torch.Tensor,
-                                dinov3_features: torch.Tensor,
-                                fused_features: torch.Tensor,
-                                video_name: str = "video") -> plt.Figure:
-        """
-        Visualize feature fusion between VGGT (3D) and DINOv3 (2D) features
-        
-        Args:
-            vggt_features: 3D features from VGGT
-            dinov3_features: 2D features from DINOv3  
-            fused_features: Combined features
-            video_name: Video name for title
-            
-        Returns:
-            Matplotlib figure
-        """
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        
-        # Convert to numpy for visualization
-        vggt_np = vggt_features.detach().cpu().numpy()
-        dinov3_np = dinov3_features.detach().cpu().numpy()
-        fused_np = fused_features.detach().cpu().numpy()
-        
-        # Take first frame and first 16x16 spatial dimensions for visualization
-        if len(vggt_np.shape) > 2:
-            vggt_vis = vggt_np[0][:256].reshape(16, 16)  # Assume first 256 dims
-        else:
-            vggt_vis = vggt_np[:256].reshape(16, 16)
-            
-        if len(dinov3_np.shape) > 2:
-            dinov3_vis = dinov3_np[0][:256].reshape(16, 16)
-        else:
-            dinov3_vis = dinov3_np[:256].reshape(16, 16)
-            
-        if len(fused_np.shape) > 2:
-            fused_vis = fused_np[0][:256].reshape(16, 16)
-        else:
-            fused_vis = fused_np[:256].reshape(16, 16)
-        
-        # VGGT features (3D geometry)
-        im1 = axes[0, 0].imshow(vggt_vis, cmap='viridis')
-        axes[0, 0].set_title('VGGT Features\n(3D Geometry)', fontweight='bold')
-        axes[0, 0].axis('off')
-        plt.colorbar(im1, ax=axes[0, 0])
-        
-        # DINOv3 features (2D semantics)
-        im2 = axes[0, 1].imshow(dinov3_vis, cmap='plasma')
-        axes[0, 1].set_title('DINOv3 Features\n(2D Semantics)', fontweight='bold')
-        axes[0, 1].axis('off')
-        plt.colorbar(im2, ax=axes[0, 1])
-        
-        # Fused features
-        im3 = axes[0, 2].imshow(fused_vis, cmap='coolwarm')
-        axes[0, 2].set_title('Fused Features\n(3D + 2D)', fontweight='bold')
-        axes[0, 2].axis('off')
-        plt.colorbar(im3, ax=axes[0, 2])
-        
-        # Feature statistics
-        axes[1, 0].hist(vggt_np.flatten(), bins=50, alpha=0.7, color='green', density=True)
-        axes[1, 0].set_title('VGGT Feature Distribution')
-        axes[1, 0].set_xlabel('Feature Value')
-        axes[1, 0].set_ylabel('Density')
-        
-        axes[1, 1].hist(dinov3_np.flatten(), bins=50, alpha=0.7, color='orange', density=True)
-        axes[1, 1].set_title('DINOv3 Feature Distribution')
-        axes[1, 1].set_xlabel('Feature Value')
-        axes[1, 1].set_ylabel('Density')
-        
-        axes[1, 2].hist(fused_np.flatten(), bins=50, alpha=0.7, color='purple', density=True)
-        axes[1, 2].set_title('Fused Feature Distribution')
-        axes[1, 2].set_xlabel('Feature Value')
-        axes[1, 2].set_ylabel('Density')
-        
-        plt.suptitle(f'Feature Fusion Visualization: {video_name}', 
-                     fontsize=16, fontweight='bold')
-        plt.tight_layout()
-        
-        # Save visualization
-        save_path = self.save_dir / f"{video_name}_feature_fusion.png"
-        plt.savefig(save_path, dpi=300, bbox_inches='tight', 
-                   facecolor='white', edgecolor='none')
-        logger.info(f"Feature fusion visualization saved to {save_path}")
-        
-        return fig
-    
-    def create_summary_dashboard(self, results: Dict[str, Any], 
-                               video_name: str = "video") -> plt.Figure:
-        """
-        Create a comprehensive dashboard summarizing VLN pipeline results
-        
-        Args:
-            results: Dictionary containing all pipeline outputs
-            video_name: Video name for title
-            
-        Returns:
-            Matplotlib figure
-        """
-        fig = plt.figure(figsize=(20, 12))
-        
-        # Create grid layout
-        gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
-        
-        # Main heatmap display
-        ax_main = fig.add_subplot(gs[0:2, 0:2])
-        if 'first_person_heatmaps' in results:
-            heatmaps = results['first_person_heatmaps']
-            if heatmaps.dim() == 4:
-                heatmaps = heatmaps[0]  # Take first batch
-            
-            # Show average heatmap
-            avg_heatmap = torch.mean(heatmaps, dim=0).detach().cpu().numpy()
-            im_main = ax_main.imshow(avg_heatmap, cmap=self.vln_colormap)
-            ax_main.set_title('Average Inter-Frame Heatmap', fontsize=14, fontweight='bold')
-            ax_main.axis('off')
-            plt.colorbar(im_main, ax=ax_main)
-        
-        # Selected frames timeline
-        ax_timeline = fig.add_subplot(gs[0, 2:])
-        if 'selected_indices' in results:
-            indices = results['selected_indices'][0] if isinstance(results['selected_indices'][0], list) else results['selected_indices']
-            total_frames = max(indices) + 5 if indices else 32
-            
-            all_frames = list(range(total_frames))
-            colors = ['red' if i in indices else 'lightgray' for i in all_frames]
-            ax_timeline.scatter(all_frames, [1] * len(all_frames), c=colors, s=30)
-            
-            ax_timeline.set_xlabel('Frame Index')
-            ax_timeline.set_title('Selected Keyframes')
-            ax_timeline.set_ylim(0.5, 1.5)
-            ax_timeline.grid(True, alpha=0.3)
-        
-        # Processing metrics
-        ax_metrics = fig.add_subplot(gs[1, 2:])
-        if 'processing_time' in results:
-            metrics = {
-                'Processing Time (s)': results.get('processing_time', 0),
-                'Selected Frames': len(results.get('selected_indices', [0])),
-                'Heatmap Views': results['first_person_heatmaps'].shape[1] if 'first_person_heatmaps' in results else 0
-            }
-            
-            bars = ax_metrics.bar(range(len(metrics)), list(metrics.values()), 
-                                color=['skyblue', 'lightgreen', 'coral'])
-            ax_metrics.set_xticks(range(len(metrics)))
-            ax_metrics.set_xticklabels(list(metrics.keys()), rotation=45, ha='right')
-            ax_metrics.set_title('Processing Metrics')
-            
-            # Add value labels on bars
-            for bar, value in zip(bars, metrics.values()):
-                height = bar.get_height()
-                ax_metrics.text(bar.get_x() + bar.get_width()/2., height,
-                              f'{value:.2f}' if isinstance(value, float) else str(value),
-                              ha='center', va='bottom')
-        
-        # Individual heatmap views
-        if 'first_person_heatmaps' in results:
-            heatmaps = results['first_person_heatmaps']
-            if heatmaps.dim() == 4:
-                heatmaps = heatmaps[0]
-            
-            num_views = min(heatmaps.shape[0], 4)
-            for i in range(num_views):
-                ax = fig.add_subplot(gs[2, i])
-                heatmap = heatmaps[i].detach().cpu().numpy()
-                
-                im = ax.imshow(heatmap, cmap=self.vln_colormap, interpolation='bilinear')
-                ax.set_title(f'View {i+1}', fontsize=10)
-                ax.axis('off')
-        
-        # Add overall title and summary text
-        plt.suptitle(f'VLN Pipeline Results Dashboard: {video_name}', 
-                     fontsize=18, fontweight='bold')
-        
-        # Add text summary
-        if 'geometry_info' in results or 'llm_outputs' in results:
-            summary_text = f"Video: {video_name}\n"
-            summary_text += f"Status: {'Success' if results.get('success', False) else 'Failed'}\n"
-            summary_text += f"Keyframes: {len(results.get('selected_indices', []))}\n"
-            summary_text += f"Processing: {results.get('processing_time', 0):.2f}s"
-            
-            fig.text(0.02, 0.02, summary_text, fontsize=10, 
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
-        
-        # Save dashboard
-        save_path = self.save_dir / f"{video_name}_dashboard.png"
-        plt.savefig(save_path, dpi=300, bbox_inches='tight', 
-                   facecolor='white', edgecolor='none')
-        logger.info(f"Results dashboard saved to {save_path}")
-        
-        return fig
+    Annotate frame with index and validity status.
 
-
-def create_quick_visualization(heatmaps: torch.Tensor, save_path: str = None) -> plt.Figure:
-    """
-    Quick utility function for basic heatmap visualization
-    
     Args:
-        heatmaps: Heatmap tensor
-        save_path: Optional path to save figure
-        
+        image: Image to annotate (BGR format)
+        frame_idx: Frame index
+        validity_hist: History validity (True/False)
+        validity_fut: Future validity (True/False)
+        font_scale: Font scale for text
+        thickness: Text thickness
+
     Returns:
-        Matplotlib figure
+        Annotated image
     """
-    if heatmaps.dim() == 4:
-        heatmaps = heatmaps[0]  # Take first batch
-    
-    num_views = heatmaps.shape[0]
-    cols = min(num_views, 4)
-    rows = (num_views + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 2.5))
-    if rows == 1 and cols == 1:
-        axes = [axes]
-    elif rows == 1 or cols == 1:
-        axes = axes.flatten()
-    else:
-        axes = axes.flatten()
-    
-    for i in range(num_views):
-        heatmap = heatmaps[i].detach().cpu().numpy()
-        ax = axes[i] if num_views > 1 else axes[0]
-        
-        im = ax.imshow(heatmap, cmap='viridis')
-        ax.set_title(f'Heatmap {i+1}')
-        ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    
-    # Hide unused subplots
-    for i in range(num_views, len(axes)):
-        axes[i].axis('off')
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Quick visualization saved to {save_path}")
-    
-    return fig
+    annotated = image.copy()
+
+    # Prepare text
+    frame_text = f"Frame {frame_idx}"
+    valid_hist_icon = "Y" if validity_hist else "N"
+    valid_fut_icon = "Y" if validity_fut else "N"
+    valid_text = f"H:{valid_hist_icon} F:{valid_fut_icon}"
+
+    # Position
+    text_pos = (10, 30)
+    valid_pos = (10, 60)
+
+    # Draw text with outline (white outline, black text)
+    cv2.putText(annotated, frame_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX,
+               font_scale, (255, 255, 255), thickness + 1, cv2.LINE_AA)
+    cv2.putText(annotated, frame_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX,
+               font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+    cv2.putText(annotated, valid_text, valid_pos, cv2.FONT_HERSHEY_SIMPLEX,
+               font_scale * 0.8, (255, 255, 255), thickness + 1, cv2.LINE_AA)
+    cv2.putText(annotated, valid_text, valid_pos, cv2.FONT_HERSHEY_SIMPLEX,
+               font_scale * 0.8, (0, 0, 0), thickness, cv2.LINE_AA)
+
+    return annotated
+
+
+def create_comparison_grid(
+    frames: torch.Tensor,
+    gt_hm_hist: torch.Tensor,
+    gt_hm_fut: torch.Tensor,
+    pred_hm_hist: torch.Tensor,
+    pred_hm_fut: torch.Tensor,
+    gt_val_hist: torch.Tensor,
+    gt_val_fut: torch.Tensor,
+    save_dir: Path,
+    overlay_mode: str = 'dual',
+    max_frames: int = 16,
+    alpha: float = 0.5,
+    threshold: float = 0.05
+) -> Dict[str, str]:
+    """
+    Generate comparison grids based on overlay mode.
+
+    Args:
+        frames: RGB frames [T, 3, H, W]
+        gt_hm_hist: GT history heatmaps [T, Hm, Wm]
+        gt_hm_fut: GT future heatmaps [T, Hm, Wm]
+        pred_hm_hist: Predicted history heatmaps [T, Hm, Wm] (interpolated)
+        pred_hm_fut: Predicted future heatmaps [T, Hm, Wm] (interpolated)
+        gt_val_hist: GT history validity [T]
+        gt_val_fut: GT future validity [T]
+        save_dir: Directory to save grids
+        overlay_mode: 'dual', 'separate', or 'full-separate'
+        max_frames: Maximum frames to show
+        alpha: Heatmap overlay transparency
+        threshold: Minimum heatmap value to display
+
+    Returns:
+        Dictionary of generated file paths (relative to eval_vis root)
+    """
+    T = min(frames.shape[0], max_frames)
+    paths = {}
+
+    # Convert to numpy and BGR
+    frames_np = []
+    for t in range(T):
+        frame = frames[t].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+        frame = (frame * 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frames_np.append(frame_bgr)
+
+    gt_hm_hist_np = gt_hm_hist[:T].cpu().numpy()
+    gt_hm_fut_np = gt_hm_fut[:T].cpu().numpy()
+    pred_hm_hist_np = pred_hm_hist[:T].cpu().numpy()
+    pred_hm_fut_np = pred_hm_fut[:T].cpu().numpy()
+    gt_val_hist_np = gt_val_hist[:T].cpu().numpy() > 0.5
+    gt_val_fut_np = gt_val_fut[:T].cpu().numpy() > 0.5
+
+    if overlay_mode == 'dual':
+        # Generate 4-column grid (RGB | GT dual | Pred dual | Diff)
+        grid_path = save_dir / 'grid_comparison.png'
+        _create_dual_grid(
+            frames_np, gt_hm_hist_np, gt_hm_fut_np,
+            pred_hm_hist_np, pred_hm_fut_np,
+            gt_val_hist_np, gt_val_fut_np,
+            grid_path, alpha, threshold
+        )
+        paths['dual'] = str(grid_path.relative_to(save_dir.parent.parent))
+
+    elif overlay_mode == 'separate':
+        # Generate two separate grids
+        hist_path = save_dir / 'grid_comparison_history.png'
+        fut_path = save_dir / 'grid_comparison_future.png'
+
+        _create_single_type_grid(
+            frames_np, gt_hm_hist_np, pred_hm_hist_np,
+            gt_val_hist_np, hist_path, 'History',
+            alpha, threshold, cv2.COLORMAP_WINTER
+        )
+        _create_single_type_grid(
+            frames_np, gt_hm_fut_np, pred_hm_fut_np,
+            gt_val_fut_np, fut_path, 'Future',
+            alpha, threshold, cv2.COLORMAP_HOT
+        )
+
+        paths['history'] = str(hist_path.relative_to(save_dir.parent.parent))
+        paths['future'] = str(fut_path.relative_to(save_dir.parent.parent))
+
+    elif overlay_mode == 'full-separate':
+        # Generate 7-column grid (RGB | Hist GT | Hist Pred | Hist Diff | Fut GT | Fut Pred | Fut Diff)
+        grid_path = save_dir / 'grid_comparison_full.png'
+        _create_full_separate_grid(
+            frames_np, gt_hm_hist_np, gt_hm_fut_np,
+            pred_hm_hist_np, pred_hm_fut_np,
+            gt_val_hist_np, gt_val_fut_np,
+            grid_path, alpha, threshold
+        )
+        paths['full'] = str(grid_path.relative_to(save_dir.parent.parent))
+
+    return paths
+
+
+def _create_dual_grid(
+    frames_np, gt_hm_hist, gt_hm_fut, pred_hm_hist, pred_hm_fut,
+    gt_val_hist, gt_val_fut, save_path, alpha, threshold
+):
+    """Create 4-column grid with dual overlays."""
+    T = len(frames_np)
+    rows = []
+
+    for t in range(T):
+        frame = frames_np[t]
+
+        # Column 1: Annotated RGB frame
+        col1 = annotate_frame(frame, t, gt_val_hist[t], gt_val_fut[t])
+
+        # Column 2: GT dual overlay
+        col2 = create_frame_by_frame_overlay(
+            frame, gt_hm_hist[t], gt_hm_fut[t],
+            alpha, threshold
+        )
+
+        # Column 3: Pred dual overlay
+        col3 = create_frame_by_frame_overlay(
+            frame, pred_hm_hist[t], pred_hm_fut[t],
+            alpha, threshold
+        )
+
+        # Column 4: Difference map (average of history and future diffs)
+        # Resize difference maps to match frame dimensions
+        h, w = frame.shape[:2]
+        diff_hist = create_difference_map(pred_hm_hist[t], gt_hm_hist[t])
+        diff_hist = cv2.resize(diff_hist, (w, h), interpolation=cv2.INTER_LINEAR)
+        diff_fut = create_difference_map(pred_hm_fut[t], gt_hm_fut[t])
+        diff_fut = cv2.resize(diff_fut, (w, h), interpolation=cv2.INTER_LINEAR)
+        col4 = cv2.addWeighted(diff_hist, 0.5, diff_fut, 0.5, 0)
+
+        # Concatenate columns
+        row = np.hstack([col1, col2, col3, col4])
+        rows.append(row)
+
+    # Concatenate rows
+    grid = np.vstack(rows)
+    cv2.imwrite(str(save_path), grid)
+
+
+def _create_single_type_grid(
+    frames_np, gt_hm, pred_hm, gt_val, save_path, label,
+    alpha, threshold, colormap
+):
+    """Create 4-column grid for single heatmap type (history or future)."""
+    T = len(frames_np)
+    rows = []
+
+    for t in range(T):
+        frame = frames_np[t]
+
+        # Column 1: Annotated RGB frame
+        col1 = annotate_frame(frame, t, gt_val[t], gt_val[t])
+
+        # Column 2: GT overlay
+        col2 = create_single_heatmap_overlay(
+            frame, gt_hm[t], alpha, threshold, colormap
+        )
+
+        # Column 3: Pred overlay
+        col3 = create_single_heatmap_overlay(
+            frame, pred_hm[t], alpha, threshold, colormap
+        )
+
+        # Column 4: Difference map (resize to match frame dimensions)
+        h, w = frame.shape[:2]
+        col4 = create_difference_map(pred_hm[t], gt_hm[t])
+        col4 = cv2.resize(col4, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Concatenate columns
+        row = np.hstack([col1, col2, col3, col4])
+        rows.append(row)
+
+    # Concatenate rows
+    grid = np.vstack(rows)
+    cv2.imwrite(str(save_path), grid)
+
+
+def _create_full_separate_grid(
+    frames_np, gt_hm_hist, gt_hm_fut, pred_hm_hist, pred_hm_fut,
+    gt_val_hist, gt_val_fut, save_path, alpha, threshold
+):
+    """Create 7-column grid with full separation."""
+    T = len(frames_np)
+    rows = []
+
+    for t in range(T):
+        frame = frames_np[t]
+
+        # Column 1: Annotated RGB frame
+        col1 = annotate_frame(frame, t, gt_val_hist[t], gt_val_fut[t])
+
+        # Get frame dimensions for resizing difference maps
+        h, w = frame.shape[:2]
+
+        # Columns 2-4: History (GT | Pred | Diff)
+        col2_hist = create_single_heatmap_overlay(
+            frame, gt_hm_hist[t], alpha, threshold, cv2.COLORMAP_WINTER
+        )
+        col3_hist = create_single_heatmap_overlay(
+            frame, pred_hm_hist[t], alpha, threshold, cv2.COLORMAP_WINTER
+        )
+        col4_hist = create_difference_map(pred_hm_hist[t], gt_hm_hist[t])
+        col4_hist = cv2.resize(col4_hist, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Columns 5-7: Future (GT | Pred | Diff)
+        col5_fut = create_single_heatmap_overlay(
+            frame, gt_hm_fut[t], alpha, threshold, cv2.COLORMAP_HOT
+        )
+        col6_fut = create_single_heatmap_overlay(
+            frame, pred_hm_fut[t], alpha, threshold, cv2.COLORMAP_HOT
+        )
+        col7_fut = create_difference_map(pred_hm_fut[t], gt_hm_fut[t])
+        col7_fut = cv2.resize(col7_fut, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Concatenate columns
+        row = np.hstack([col1, col2_hist, col3_hist, col4_hist,
+                        col5_fut, col6_fut, col7_fut])
+        rows.append(row)
+
+    # Concatenate rows
+    grid = np.vstack(rows)
+    cv2.imwrite(str(save_path), grid)
+
+
+def create_thumbnail(
+    rgb_frame: np.ndarray,
+    gt_hm_hist: Optional[np.ndarray],
+    gt_hm_fut: Optional[np.ndarray],
+    save_path: Path,
+    size: Tuple[int, int] = (256, 256),
+    alpha: float = 0.5,
+    threshold: float = 0.05
+) -> None:
+    """
+    Generate thumbnail from first frame with GT overlay.
+
+    Args:
+        rgb_frame: RGB frame [H, W, 3] (RGB format, not BGR)
+        gt_hm_hist: GT history heatmap [Hm, Wm], can be None
+        gt_hm_fut: GT future heatmap [Hm, Wm], can be None
+        save_path: Path to save thumbnail
+        size: Thumbnail size (width, height)
+        alpha: Overlay transparency
+        threshold: Minimum heatmap value to display
+    """
+    # Convert RGB to BGR for cv2
+    frame_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+
+    # Create dual overlay
+    overlay = create_frame_by_frame_overlay(
+        frame_bgr, gt_hm_hist, gt_hm_fut, alpha, threshold
+    )
+
+    # Resize to thumbnail size
+    thumbnail = cv2.resize(overlay, size, interpolation=cv2.INTER_AREA)
+
+    # Save
+    cv2.imwrite(str(save_path), thumbnail)

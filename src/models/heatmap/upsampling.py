@@ -45,9 +45,13 @@ class ConvexUpSample(nn.Module):
 
         assert (self.up_kernel % 2) == 1, "up_kernel must be odd"
 
+        # ✅ FIX: Replace BatchNorm2d with GroupNorm for DDP stability with small batches
+        # GroupNorm doesn't depend on batch statistics, works correctly with batch_size=1
         if with_bn:
-            self.net_out_bn1 = nn.BatchNorm2d(2 * in_dim)
-            self.net_out_bn2 = nn.BatchNorm2d(2 * in_dim)
+            # Use 32 groups (standard choice), or num_channels//16 if fewer channels
+            num_groups = min(32, (2 * in_dim) // 16) if (2 * in_dim) >= 32 else 1
+            self.net_out_bn1 = nn.GroupNorm(num_groups=num_groups, num_channels=2 * in_dim)
+            self.net_out_bn2 = nn.GroupNorm(num_groups=num_groups, num_channels=2 * in_dim)
 
         # Network for generating output features
         self.net_out = nn.Sequential(

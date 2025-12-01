@@ -1,0 +1,100 @@
+/root/miniconda3/envs/models/lib/python3.11/site-packages/tensorboard/default.py:30: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+TensorFlow installation not found - running with reduced feature set.
+
+NOTE: Using experimental fast data loading logic. To disable, pass
+    "--load_fast=false" and report issues on GitHub. More details:
+    https://github.com/tensorflow/tensorboard/issues/4784
+
+E1126 00:18:53.289066 139972812186240 program.py:300] TensorBoard could not bind to port 6007, it was already in use
+ERROR: TensorBoard could not bind to port 6007, it was already in use
+============================================================
+🚀 TensorBoard 一键启动脚本
+============================================================
+📂 工作目录: /root/VLN/Project
+📊 TensorBoard 日志目录: /root/tf-logs
+🌐 TensorBoard端口: 6007
+
+============================================================
+✅ 启动 TensorBoard...
+============================================================
+📍 本地访问: http://localhost:6007
+📍 远程访问: http://YOUR_SERVER_IP:6007
+
+💡 提示:
+   - 如需先清理旧进程: ps -ef | grep tensorboard | awk '{print $2}' | xargs kill -9
+   - 手工启动示例: tensorboard --port 6007 --logdir /root/tf-logs
+   - 如果是SSH连接，可以使用端口转发:
+     ssh -L 6007:localhost:6007 user@server
+============================================================
+
+
+❌ 启动失败: Command '['tensorboard', '--logdir', '/root/tf-logs', '--port', '6007', '--bind_all']' returned non-zero exit status 255.
+/root/miniconda3/envs/models/lib/python3.11/site-packages/tensorboard/default.py:30: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+TensorFlow installation not found - running with reduced feature set.
+
+NOTE: Using experimental fast data loading logic. To disable, pass
+    "--load_fast=false" and report issues on GitHub. More details:
+    https://github.com/tensorflow/tensorboard/issues/4784
+
+E1126 00:19:25.194693 140227389350528 program.py:300] TensorBoard could not bind to port 6007, it was already in use
+ERROR: TensorBoard could not bind to port 6007, it was already in use
+/root/miniconda3/envs/models/lib/python3.11/site-packages/tensorboard/default.py:30: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+TensorFlow installation not found - running with reduced feature set.
+
+NOTE: Using experimental fast data loading logic. To disable, pass
+    "--load_fast=false" and report issues on GitHub. More details:
+    https://github.com/tensorflow/tensorboard/issues/4784
+
+Serving TensorBoard on localhost; to expose to the network, use a proxy or pass --bind_all
+TensorBoard 2.20.0 at http://localhost:6007/ (Press CTRL+C to quit)
+/root/miniconda3/envs/models/lib/python3.11/site-packages/tensorboard/default.py:30: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+TensorFlow installation not found - running with reduced feature set.
+
+NOTE: Using experimental fast data loading logic. To disable, pass
+    "--load_fast=false" and report issues on GitHub. More details:
+    https://github.com/tensorflow/tensorboard/issues/4784
+
+Serving TensorBoard on localhost; to expose to the network, use a proxy or pass --bind_all
+TensorBoard 2.20.0 at http://localhost:6007/ (Press CTRL+C to quit)
+/root/miniconda3/envs/models/lib/python3.11/site-packages/tensorboard/default.py:30: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+TensorFlow installation not found - running with reduced feature set.
+
+NOTE: Using experimental fast data loading logic. To disable, pass
+    "--load_fast=false" and report issues on GitHub. More details:
+    https://github.com/tensorflow/tensorboard/issues/4784
+
+Serving TensorBoard on localhost; to expose to the network, use a proxy or pass --bind_all
+TensorBoard 2.20.0 at http://localhost:6007/ (Press CTRL+C to quit)
+W1126 00:21:34.786113 140553610065664 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 00:21:35.342817 140553610065664 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:21:35.692740 140553610065664 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 00:21:35.694995 140553601672960 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:25:53.246667 140553593280256 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 00:25:53.661554 140553593280256 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:25:53.864622 140553610065664 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 00:25:53.866850 140553568102144 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:35:06.679022 140553601672960 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 00:35:06.839932 140553601672960 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:35:07.127335 140553559709440 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:35:07.129562 140553601672960 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 00:41:40.301453 140553559709440 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 00:41:40.466646 140553559709440 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 00:41:40.705329 140553559709440 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 00:41:40.707746 140553568102144 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 01:26:11.035691 140553568102144 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 01:26:11.497013 140553568102144 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 01:26:11.945755 140552133670656 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 01:26:11.947526 140553593280256 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 01:31:15.013355 140553610065664 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 01:31:15.187563 140553610065664 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 01:31:15.372430 140553584887552 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 01:31:15.374018 140553601672960 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 01:32:54.689679 140553584887552 application.py:559] path /oMMgfZMQthOryQo9n22dcuvvDin1pK8aKteLpeZ5c0A.woff2 not found, sending 404
+W1126 01:32:54.752132 140553584887552 application.py:559] path /RxZJdnzeo3R5zSexge8UUZBw1xU1rKptJj_0jans920.woff2 not found, sending 404
+W1126 01:32:54.892627 140552133670656 application.py:559] path /vPcynSL0qHq_6dX7lKVByXYhjbSpvc47ee6xR_80Hnw.woff2 not found, sending 404
+W1126 01:32:54.893801 140553610065664 application.py:559] path /d-6IYplOFocCacKzxwXSOJBw1xU1rKptJj_0jans920.woff2 not found, sending 404

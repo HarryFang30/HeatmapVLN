@@ -1,5 +1,6 @@
-# Model files
-/models/
+# Model files (keep symlinks, ignore actual model files)
+/models/*/
+!/models/*.md
 /outputs/
 /data/
 /raw_sequences/

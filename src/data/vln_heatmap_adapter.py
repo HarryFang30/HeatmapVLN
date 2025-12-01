@@ -7,9 +7,16 @@ DataLoader for reading standard training format and returning train.md expected 
 This adapter reads the packed dataset format and provides the exact interface
 expected by the training pipeline as specified in train.md.
 
+NEW: Dual-head support - loads both history and future heatmaps with uniform sampling.
+
 Returns:
-    {"frames": Tensor[T,3,H,W], "text": None, "gt_heatmaps": Tensor[K,Hm,Wm],
-     "mask": Tensor[K], "meta": Dict}
+    {"frames": Tensor[T_sampled,3,H,W],
+     "text": str,
+     "gt_heatmap_history": Tensor[T_sampled,Hm,Wm],
+     "gt_heatmap_future": Tensor[T_sampled,Hm,Wm],
+     "gt_validity_history": Tensor[T_sampled],
+     "gt_validity_future": Tensor[T_sampled],
+     "meta": Dict}
 """
 
 import os
@@ -40,17 +47,19 @@ class VLNHeatmapDataset(Dataset):
                  frames_per_clip: int,
                  heatmap_per_clip: int,
                  image_size: Tuple[int, int] = (384, 384),
-                 hm_size: Tuple[int, int] = (64, 64)):
+                 hm_size: Tuple[int, int] = (64, 64),
+                 num_sample_frames: Optional[int] = None):
         """
         Initialize VLN Heatmap Dataset.
 
         Args:
             root: Root directory of standard training format
             split: Dataset split ('train', 'val', 'test')
-            frames_per_clip: Number of frames to load per clip (T)
-            heatmap_per_clip: Expected number of heatmaps per clip (K)
+            frames_per_clip: Number of frames to load per clip (T) - deprecated, use num_sample_frames
+            heatmap_per_clip: Expected number of heatmaps per clip (K) - deprecated
             image_size: Target image size (W, H)
             hm_size: Target heatmap size (W, H)
+            num_sample_frames: Number of frames to uniformly sample from each clip (None = use all)
         """
         self.root = Path(root)
         self.split = split
@@ -58,25 +67,35 @@ class VLNHeatmapDataset(Dataset):
         self.heatmap_per_clip = heatmap_per_clip
         self.image_size = image_size  # (W, H)
         self.hm_size = hm_size        # (W, H)
+        self.num_sample_frames = num_sample_frames  # NEW: uniform sampling
 
         # Enumerate all clips
         self.clips = self._enumerate_clips()
 
         logger.info(f"VLNHeatmapDataset initialized: {len(self.clips)} clips, "
-                   f"frames={frames_per_clip}, heatmaps={heatmap_per_clip}, "
+                   f"num_sample_frames={num_sample_frames}, "
                    f"image_size={image_size}, hm_size={hm_size}")
 
     def _enumerate_clips(self) -> List[Path]:
-        """Enumerate all clip directories in the split."""
+        """
+        Enumerate all clip directories in the split.
+
+        Directly scans the split directory (e.g., train/, val/) without relying on split.txt files.
+        """
         split_dir = self.root / self.split
 
         if not split_dir.exists():
             raise FileNotFoundError(f"Split directory not found: {split_dir}")
 
+        logger.info(f"Loading clips from split directory: {split_dir}")
         clips = []
 
         # Find all scene directories
         scene_dirs = [d for d in split_dir.iterdir() if d.is_dir()]
+
+        if len(scene_dirs) == 0:
+            logger.warning(f"No scene directories found in {split_dir}")
+            return clips
 
         for scene_dir in scene_dirs:
             # Find all clip directories in scene
@@ -85,8 +104,9 @@ class VLNHeatmapDataset(Dataset):
             clips.extend(clip_dirs)
 
         if len(clips) == 0:
-            logger.warning(f"No clips found in {split_dir}")
+            raise FileNotFoundError(f"No clips found in {split_dir}")
 
+        logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips
 
     def __len__(self) -> int:
@@ -98,10 +118,12 @@ class VLNHeatmapDataset(Dataset):
 
         Returns:
             dict: {
-                "frames": Tensor[T, 3, H, W] - RGB frames (T is actual frame count)
+                "frames": Tensor[T_sampled, 3, H, W] - RGB frames (uniformly sampled)
                 "text": str - Navigation instruction from R2R dataset
-                "gt_heatmaps": Tensor[K, Hm, Wm] - Ground truth heatmaps (K=6 for new dataset)
-                "mask": Tensor[K] - Validity mask for heatmaps
+                "gt_heatmap_history": Tensor[T_sampled, Hm, Wm] - History heatmaps
+                "gt_heatmap_future": Tensor[T_sampled, Hm, Wm] - Future heatmaps
+                "gt_validity_history": Tensor[T_sampled] - History validity mask
+                "gt_validity_future": Tensor[T_sampled] - Future validity mask
                 "meta": Dict - Metadata with keyframe indices and reference path
             }
         """
@@ -111,25 +133,25 @@ class VLNHeatmapDataset(Dataset):
             # Load metadata first (needed for frame loading)
             meta = self._load_metadata(clip_dir)
 
-            # Load frames (all frames, not truncated)
-            frames = self._load_frames(clip_dir, meta)
+            # Load frames with optional uniform sampling
+            frames, sample_indices = self._load_frames(clip_dir, meta)
 
-            # Load heatmaps and mask
-            gt_heatmaps, mask = self._load_heatmaps(clip_dir)
-
-            # Ensure correct tensor shapes (with flexible K)
-            frames = self._validate_frames_shape(frames, meta)
-            gt_heatmaps, mask = self._validate_heatmaps_shape(gt_heatmaps, mask)
+            # Load dual heatmaps and masks
+            gt_hm_hist, gt_hm_fut, mask_hist, mask_fut = self._load_dual_heatmaps(clip_dir, sample_indices)
 
             # Extract text instruction
             text = meta.get("instruction", "")
 
+            # ⭐ FIX: Don't return full meta dict - it contains variable-length lists that break collate
+            # Only return necessary scalar fields for training
             return {
-                "frames": frames,           # [T_actual, 3, H, W] - variable T
-                "text": text,              # R2R navigation instruction
-                "gt_heatmaps": gt_heatmaps, # [K, Hm, Wm] - K matches dataset
-                "mask": mask,              # [K]
-                "meta": meta               # Contains keyframe_indices, reference_path
+                "frames": frames,                      # [T_sampled, 3, H, W]
+                "text": text,                          # R2R navigation instruction
+                "gt_heatmap_history": gt_hm_hist,     # [T_sampled, Hm, Wm]
+                "gt_heatmap_future": gt_hm_fut,       # [T_sampled, Hm, Wm]
+                "gt_validity_history": mask_hist,      # [T_sampled]
+                "gt_validity_future": mask_fut,        # [T_sampled]
+                # "meta": meta                         # REMOVED: contains variable-length lists
             }
 
         except Exception as e:
@@ -139,12 +161,18 @@ class VLNHeatmapDataset(Dataset):
             # Return dummy data to avoid crash
             return self._get_dummy_sample()
 
-    def _load_frames(self, clip_dir: Path, meta: Optional[Dict] = None) -> torch.Tensor:
+    def _load_frames(self, clip_dir: Path, meta: Optional[Dict] = None) -> Tuple[torch.Tensor, np.ndarray]:
         """
-        Load RGB frames from clip directory.
+        Load RGB frames from clip directory with optional uniform sampling.
 
-        Uses actual number of frames from metadata, not hardcoded frames_per_clip.
-        This allows handling variable-length clips (e.g., 51 frames, 91 frames).
+        Args:
+            clip_dir: Clip directory path
+            meta: Metadata dictionary
+
+        Returns:
+            Tuple of (frames_tensor, sample_indices):
+                - frames_tensor: [T_sampled, 3, H, W] sampled frames
+                - sample_indices: [T_sampled] indices of sampled frames
         """
         rgb_dir = clip_dir / "rgb"
 
@@ -157,12 +185,30 @@ class VLNHeatmapDataset(Dataset):
         if len(rgb_files) == 0:
             raise FileNotFoundError(f"No RGB files found in {rgb_dir}")
 
-        # Load ALL frames (not just frames_per_clip)
-        # The model will handle temporal downsampling if needed
+        total_frames = len(rgb_files)
+
+        # Determine sampling strategy
+        if self.num_sample_frames is not None:
+            if total_frames >= self.num_sample_frames:
+                # Uniform sampling
+                sample_indices = np.linspace(0, total_frames - 1, self.num_sample_frames, dtype=int)
+            else:
+                # ⭐ FIX: If fewer frames than target, repeat last frame to maintain consistent batch size
+                sample_indices = np.concatenate([
+                    np.arange(total_frames),
+                    np.full(self.num_sample_frames - total_frames, total_frames - 1)
+                ]).astype(int)
+            sampled_files = [rgb_files[i] for i in sample_indices]
+        else:
+            # Use all frames (no sampling) - but this can cause variable batch sizes!
+            sample_indices = np.arange(total_frames, dtype=int)
+            sampled_files = rgb_files
+
+        # Load sampled frames
         frames = []
         target_w, target_h = self.image_size
 
-        for rgb_file in rgb_files:  # Load all frames
+        for rgb_file in sampled_files:
             # Load and resize image
             image = cv2.imread(str(rgb_file))
             if image is None:
@@ -182,58 +228,105 @@ class VLNHeatmapDataset(Dataset):
             frames.append(image_tensor)
 
         # Stack frames
-        frames_tensor = torch.stack(frames, dim=0)  # [T_actual, C, H, W]
+        frames_tensor = torch.stack(frames, dim=0)  # [T_sampled, C, H, W]
 
-        return frames_tensor
+        return frames_tensor, sample_indices
 
-    def _load_heatmaps(self, clip_dir: Path) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load heatmaps and mask from clip directory."""
-        heatmaps_file = clip_dir / "heatmaps.npy"
-        mask_file = clip_dir / "mask.npy"
+    def _load_dual_heatmaps(self, clip_dir: Path, sample_indices: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Load dual heatmaps (history and future) with sampling.
 
-        if not heatmaps_file.exists():
-            raise FileNotFoundError(f"Heatmaps file not found: {heatmaps_file}")
-        if not mask_file.exists():
-            raise FileNotFoundError(f"Mask file not found: {mask_file}")
+        Args:
+            clip_dir: Clip directory path
+            sample_indices: Indices of sampled frames
 
-        # Load heatmaps and mask
-        heatmaps = np.load(heatmaps_file).astype(np.float32)  # [K, Hm_orig, Wm_orig]
-        mask = np.load(mask_file).astype(np.float32)          # [K]
+        Returns:
+            Tuple of (hm_history, hm_future, mask_history, mask_future):
+                - hm_history: [T_sampled, Hm, Wm] history heatmaps
+                - hm_future: [T_sampled, Hm, Wm] future heatmaps
+                - mask_history: [T_sampled] history validity masks
+                - mask_future: [T_sampled] future validity masks
+        """
+        # File paths
+        hm_hist_file = clip_dir / "heatmaps_history.npy"
+        hm_fut_file = clip_dir / "heatmaps_future.npy"
+        mask_hist_file = clip_dir / "mask_history.npy"
+        mask_fut_file = clip_dir / "mask_future.npy"
+
+        # Check file existence
+        if not hm_hist_file.exists():
+            raise FileNotFoundError(f"History heatmaps not found: {hm_hist_file}")
+        if not hm_fut_file.exists():
+            raise FileNotFoundError(f"Future heatmaps not found: {hm_fut_file}")
+        if not mask_hist_file.exists():
+            raise FileNotFoundError(f"History mask not found: {mask_hist_file}")
+        if not mask_fut_file.exists():
+            raise FileNotFoundError(f"Future mask not found: {mask_fut_file}")
+
+        # Load arrays
+        hm_hist = np.load(hm_hist_file).astype(np.float32)  # [N, 64, 64]
+        hm_fut = np.load(hm_fut_file).astype(np.float32)    # [N, 64, 64]
+        mask_hist = np.load(mask_hist_file).astype(np.float32)  # [N]
+        mask_fut = np.load(mask_fut_file).astype(np.float32)    # [N]
+
+        # Apply sampling (align with frame sampling)
+        hm_hist_sampled = hm_hist[sample_indices]  # [T_sampled, 64, 64]
+        hm_fut_sampled = hm_fut[sample_indices]
+        mask_hist_sampled = mask_hist[sample_indices]  # [T_sampled]
+        mask_fut_sampled = mask_fut[sample_indices]
 
         # Convert to tensors
-        heatmaps_tensor = torch.from_numpy(heatmaps)
-        mask_tensor = torch.from_numpy(mask)
+        hm_hist_tensor = torch.from_numpy(hm_hist_sampled)
+        hm_fut_tensor = torch.from_numpy(hm_fut_sampled)
+        mask_hist_tensor = torch.from_numpy(mask_hist_sampled)
+        mask_fut_tensor = torch.from_numpy(mask_fut_sampled)
 
         # Resize heatmaps if needed
-        K, Hm_orig, Wm_orig = heatmaps_tensor.shape
+        T_sampled, Hm_orig, Wm_orig = hm_hist_tensor.shape
         target_w, target_h = self.hm_size
 
         if (Hm_orig, Wm_orig) != (target_h, target_w):
-            # Resize each heatmap individually and renormalize
-            resized_heatmaps = []
+            hm_hist_tensor = self._resize_heatmaps(hm_hist_tensor, mask_hist_tensor, (target_h, target_w))
+            hm_fut_tensor = self._resize_heatmaps(hm_fut_tensor, mask_fut_tensor, (target_h, target_w))
 
-            for k in range(K):
-                hm = heatmaps_tensor[k:k+1].unsqueeze(0)  # [1, 1, Hm_orig, Wm_orig]
+        return hm_hist_tensor, hm_fut_tensor, mask_hist_tensor, mask_fut_tensor
 
-                if mask_tensor[k] > 0.5:  # Valid heatmap
-                    # Resize using bilinear interpolation
-                    hm_resized = F.interpolate(hm, size=(target_h, target_w),
-                                             mode='bilinear', align_corners=False)
-                    hm_resized = hm_resized.squeeze(0).squeeze(0)  # [target_h, target_w]
+    def _resize_heatmaps(self, heatmaps: torch.Tensor, masks: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
+        """
+        Resize heatmaps to target size with proper normalization.
 
-                    # Renormalize to ensure sum=1
-                    hm_sum = hm_resized.sum()
-                    if hm_sum > 0:
-                        hm_resized = hm_resized / hm_sum
-                else:
-                    # Invalid heatmap - keep as zeros
-                    hm_resized = torch.zeros(target_h, target_w)
+        Args:
+            heatmaps: [T, H_orig, W_orig] heatmaps
+            masks: [T] validity masks
+            target_size: (H_target, W_target)
 
-                resized_heatmaps.append(hm_resized)
+        Returns:
+            torch.Tensor: [T, H_target, W_target] resized heatmaps
+        """
+        T = heatmaps.shape[0]
+        target_h, target_w = target_size
+        resized_heatmaps = []
 
-            heatmaps_tensor = torch.stack(resized_heatmaps, dim=0)
+        for t in range(T):
+            hm = heatmaps[t:t+1].unsqueeze(0)  # [1, 1, H_orig, W_orig]
 
-        return heatmaps_tensor, mask_tensor
+            if masks[t] > 0.5:  # Valid heatmap
+                # Resize using bilinear interpolation
+                hm_resized = F.interpolate(hm, size=(target_h, target_w),
+                                         mode='bilinear', align_corners=False)
+                hm_resized = hm_resized.squeeze(0).squeeze(0)  # [H_target, W_target]
+
+                # Renormalize to ensure sum=1 (probability distribution)
+                hm_sum = hm_resized.sum()
+                if hm_sum > 0:
+                    hm_resized = hm_resized / hm_sum
+            else:
+                # Invalid heatmap - keep as zeros
+                hm_resized = torch.zeros(target_h, target_w)
+
+            resized_heatmaps.append(hm_resized)
+
+        return torch.stack(resized_heatmaps, dim=0)
 
     def _load_metadata(self, clip_dir: Path) -> Dict:
         """Load metadata from clip directory."""
@@ -251,53 +344,22 @@ class VLNHeatmapDataset(Dataset):
 
         return meta
 
-    def _validate_frames_shape(self, frames: torch.Tensor, meta: Optional[Dict] = None) -> torch.Tensor:
-        """
-        Validate frames tensor shape.
-
-        NEW: Allow variable frame counts - don't force truncate/pad.
-        The model's temporal encoder (GRU) can handle variable-length sequences.
-        """
-        T, C, H, W = frames.shape
-
-        # Log frame count for debugging
-        if meta and 'num_frames' in meta:
-            expected_T = meta['num_frames']
-            if T != expected_T:
-                logger.warning(f"Frame count mismatch: expected {expected_T}, got {T}")
-
-        # Don't truncate/pad - return actual frames
-        # The training collate_fn will handle batching variable-length sequences
-        return frames
-
-    def _validate_heatmaps_shape(self, heatmaps: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Validate heatmaps and mask tensor shapes.
-
-        NEW: Allow variable K (dataset has K=6 for 6 reference_path points).
-        Only warn if mismatch, but don't truncate - preserve all supervision signals.
-        """
-        K = heatmaps.shape[0]
-
-        if K != self.heatmap_per_clip:
-            logger.debug(f"Heatmap count: dataset has {K}, config expects {self.heatmap_per_clip}")
-            # Update heatmap_per_clip to match dataset
-            self.heatmap_per_clip = K
-
-        # Don't truncate/pad - return actual heatmaps
-        return heatmaps, mask
-
     def _get_dummy_sample(self) -> Dict[str, Union[torch.Tensor, Dict]]:
         """Generate dummy sample for error cases."""
         target_w, target_h = self.image_size
         hm_w, hm_h = self.hm_size
 
+        # Use num_sample_frames if set, otherwise use frames_per_clip
+        T = self.num_sample_frames if self.num_sample_frames is not None else self.frames_per_clip
+
         return {
-            "frames": torch.zeros(self.frames_per_clip, 3, target_h, target_w),
+            "frames": torch.zeros(T, 3, target_h, target_w),
             "text": "",
-            "gt_heatmaps": torch.zeros(self.heatmap_per_clip, hm_h, hm_w),
-            "mask": torch.zeros(self.heatmap_per_clip),
-            "meta": {"error": "Failed to load clip"}
+            "gt_heatmap_history": torch.zeros(T, hm_h, hm_w),
+            "gt_heatmap_future": torch.zeros(T, hm_h, hm_w),
+            "gt_validity_history": torch.zeros(T),
+            "gt_validity_future": torch.zeros(T),
+            # "meta": {"error": "Failed to load clip"}  # REMOVED: for consistency with normal return
         }
 
 
