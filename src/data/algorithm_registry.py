@@ -292,7 +292,6 @@ class AlgorithmRegistry:
 
         # Import here to avoid circular imports
         from .frame_sampler import SpaceAwareFrameSampler, SamplingConfig
-        from .enhanced_frame_sampler import EnhancedFrameSampler, EnhancedSamplingConfig
 
         # Wrapper classes for built-in algorithms
         class GreedyCoverageSampler(BaseFrameSampler):
@@ -317,34 +316,6 @@ class AlgorithmRegistry:
             def _core_sampling(self, vggt_predictions, visual_features=None, frame_indices=None, **kwargs):
                 return self.sampler(vggt_predictions, frame_indices)
 
-        class EnhancedSubmodularSampler(BaseFrameSampler):
-            def __init__(self, config: AlgorithmConfig):
-                super().__init__(config)
-
-                # Filter parameters for EnhancedSamplingConfig
-                valid_params = {}
-                enhanced_config_params = [
-                    'coverage_weight', 'diversity_weight', 'temporal_weight', 'uncertainty_weight',
-                    'voxel_scales', 'adaptive_voxelization', 'use_visual_features', 'feature_diversity_threshold',
-                    'temporal_smoothness', 'min_temporal_gap', 'confidence_threshold', 'confidence_percentile',
-                    'uncertainty_boost', 'motion_importance', 'depth_variation_importance',
-                    'optimization_method', 'max_iterations', 'convergence_threshold'
-                ]
-                for param in enhanced_config_params:
-                    if param in config.algorithm_params:
-                        valid_params[param] = config.algorithm_params[param]
-
-                enhanced_config = EnhancedSamplingConfig(
-                    target_frames=config.target_frames,
-                    candidate_frames=config.candidate_frames,
-                    device=config.device,
-                    **valid_params
-                )
-                self.sampler = EnhancedFrameSampler(enhanced_config)
-
-            def _core_sampling(self, vggt_predictions, visual_features=None, frame_indices=None, **kwargs):
-                return self.sampler(vggt_predictions, visual_features, frame_indices)
-
         # Register algorithms
         self.register_algorithm(
             AlgorithmType.GREEDY_COVERAGE,
@@ -357,23 +328,6 @@ class AlgorithmRegistry:
                     'voxel_lambda': 20.0,
                     'confidence_threshold': 0.1,
                     'confidence_percentile': 50.0
-                }
-            )
-        )
-
-        self.register_algorithm(
-            AlgorithmType.ENHANCED_SUBMODULAR,
-            EnhancedSubmodularSampler,
-            AlgorithmConfig(
-                algorithm_type=AlgorithmType.ENHANCED_SUBMODULAR,
-                name="Enhanced Multi-Objective Submodular",
-                description="Advanced multi-objective submodular optimization",
-                algorithm_params={
-                    'coverage_weight': 0.4,
-                    'diversity_weight': 0.3,
-                    'temporal_weight': 0.2,
-                    'uncertainty_weight': 0.1,
-                    'optimization_method': 'submodular'
                 }
             )
         )
@@ -435,59 +389,20 @@ def create_predefined_configs():
     )
     registry.register_config("fast_greedy", fast_greedy)
 
-    # High quality submodular configuration
-    high_quality = AlgorithmConfig(
-        algorithm_type=AlgorithmType.ENHANCED_SUBMODULAR,
+    # Standard greedy configuration
+    standard_greedy = AlgorithmConfig(
+        algorithm_type=AlgorithmType.GREEDY_COVERAGE,
         target_frames=16,
         candidate_frames=128,
-        name="High Quality Submodular",
-        description="High quality multi-objective optimization",
+        name="Standard Greedy",
+        description="Standard greedy coverage with balanced parameters",
         algorithm_params={
-            'coverage_weight': 0.3,
-            'diversity_weight': 0.4,  # Higher diversity emphasis
-            'temporal_weight': 0.2,
-            'uncertainty_weight': 0.1,
-            'optimization_method': 'submodular',
-            'voxel_scales': [5.0, 15.0, 30.0],  # Finer scales
-            'use_visual_features': True
+            'voxel_lambda': 20.0,
+            'confidence_threshold': 0.1,
+            'confidence_percentile': 50.0
         }
     )
-    registry.register_config("high_quality", high_quality)
-
-    # Balanced configuration
-    balanced = AlgorithmConfig(
-        algorithm_type=AlgorithmType.ENHANCED_SUBMODULAR,
-        target_frames=12,
-        candidate_frames=64,
-        name="Balanced",
-        description="Balanced performance and quality",
-        algorithm_params={
-            'coverage_weight': 0.4,
-            'diversity_weight': 0.3,
-            'temporal_weight': 0.2,
-            'uncertainty_weight': 0.1,
-            'optimization_method': 'hybrid'
-        }
-    )
-    registry.register_config("balanced", balanced)
-
-    # Temporal-focused configuration
-    temporal_focus = AlgorithmConfig(
-        algorithm_type=AlgorithmType.ENHANCED_SUBMODULAR,
-        target_frames=16,
-        candidate_frames=128,
-        name="Temporal Focus",
-        description="Emphasizes temporal coherence",
-        algorithm_params={
-            'coverage_weight': 0.2,
-            'diversity_weight': 0.2,
-            'temporal_weight': 0.5,  # High temporal emphasis
-            'uncertainty_weight': 0.1,
-            'temporal_smoothness': 0.9,
-            'min_temporal_gap': 3
-        }
-    )
-    registry.register_config("temporal_focus", temporal_focus)
+    registry.register_config("standard_greedy", standard_greedy)
 
 
 # Initialize predefined configurations
@@ -511,15 +426,13 @@ if __name__ == "__main__":
     print("\nCreating algorithm instances...")
 
     greedy_alg = create_algorithm("greedy_coverage")
-    enhanced_alg = create_algorithm("enhanced_submodular")
 
     print(f"Greedy algorithm: {type(greedy_alg).__name__}")
-    print(f"Enhanced algorithm: {type(enhanced_alg).__name__}")
 
     # Test configuration loading
-    balanced_config = registry.get_config("balanced")
-    balanced_alg = create_algorithm(AlgorithmType.ENHANCED_SUBMODULAR, balanced_config)
+    fast_config = registry.get_config("fast_greedy")
+    fast_alg = create_algorithm(AlgorithmType.GREEDY_COVERAGE, fast_config)
 
-    print(f"Balanced algorithm config: {balanced_config.name}")
+    print(f"Fast greedy algorithm config: {fast_config.name}")
 
     print("Algorithm registry test completed successfully!")
