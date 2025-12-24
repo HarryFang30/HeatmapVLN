@@ -93,9 +93,10 @@ except ImportError as e:
 # Import Heatmap components (with fallback for missing dependencies)
 try:
     from .heatmap import (
-        # Core heatmap modules
-        ConvexUpSample,
-        LLMToHeatmapConverter,
+        # Diffusion heatmap modules
+        DiffusionHeatmapHead,
+        DiffusionHeatmapConfig,
+        create_diffusion_heatmap_head,
         
         # Generation utilities
         generate_hm_from_pt,
@@ -113,14 +114,11 @@ try:
         visualize_attention_comparison,
         create_heatmap_animation_frames,
         
-        # Convenience function
-        quick_heatmap_from_llm,
     )
 except ImportError as e:
     print(f"Warning: Heatmap visualization components not available due to missing dependencies: {e}")
-    # Core components should still work
-    from .heatmap.upsampling import ConvexUpSample
-    from .heatmap.converter import LLMToHeatmapConverter
+    from .heatmap.diffusion_heatmap_head import DiffusionHeatmapHead, create_diffusion_heatmap_head
+    from .heatmap.diffusion import DiffusionHeatmapConfig
     from .heatmap.generator import (
         generate_hm_from_pt,
         generate_target_heatmap_from_annotation,
@@ -130,7 +128,6 @@ except ImportError as e:
         create_multi_scale_heatmap,
         apply_heatmap_augmentation,
     )
-    from .heatmap import quick_heatmap_from_llm
     
     # Set visualization components to None
     visualize_points_and_heatmap = None
@@ -185,12 +182,12 @@ __all__ = [
     "Qwen2_5_VLVisionConfig",
     "Qwen2_5_VLProcessorKwargs",
     
-    # Heatmap Components
-    "ConvexUpSample",                           # BridgeVLA-style learned upsampling
-    "LLMToHeatmapConverter",                    # LLM token to heatmap pipeline
+    # Heatmap Components (Diffusion)
+    "DiffusionHeatmapHead",
+    "DiffusionHeatmapConfig",
+    "create_diffusion_heatmap_head",
     "generate_hm_from_pt",                      # Point to heatmap generation
     "generate_target_heatmap_from_annotation",  # Training target generation
-    "quick_heatmap_from_llm",                   # Convenience function
     
     # Heatmap utilities
     "masked_mean", "masked_softmax", "convert_xyxy_to_cxcywh",
