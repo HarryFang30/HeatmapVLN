@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from ..data import create_keyframe_selector
 from .dinov3_compatibility import create_dinov3_compatibility_layer
 from .vggt.models.vggt import VGGT
-from .heatmap.converter import LLMToHeatmapConverter as LLMHiddenStateConverter
 from .real_llm_integration import create_real_llm_integration
 from .memory_efficient_llm import create_memory_efficient_llm
 from .action import DiffusionActionHead, DiffusionActionConfig
@@ -229,26 +228,6 @@ class SpatialMLLMPipeline(nn.Module):
                 self.llm_projector = self._create_llm_projection_module().to(device=projector_device, dtype=config.dtype)
             else:
                 self.llm_projector = nn.Identity().to(device=projector_device, dtype=config.dtype)
-            
-        # Initialize dual heatmap converters for inter-frame heatmaps (history + future) on llm_gpu
-        if config.enable_inter_frame_heatmaps:
-            heatmap_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
-            self.history_heatmap_converter = LLMHiddenStateConverter(
-                vlm_dim=config.llm_token_dim,
-                target_size=config.heatmap_size[0]  # Use single dimension
-            ).to(device=heatmap_device, dtype=config.dtype)
-            self.future_heatmap_converter = LLMHiddenStateConverter(
-                vlm_dim=config.llm_token_dim,
-                target_size=config.heatmap_size[0]
-            ).to(device=heatmap_device, dtype=config.dtype)
-            # Validity heads (one logit per keyframe)
-            self.history_validity_head = nn.Linear(config.llm_token_dim, 1).to(device=heatmap_device, dtype=config.dtype)
-            self.future_validity_head = nn.Linear(config.llm_token_dim, 1).to(device=heatmap_device, dtype=config.dtype)
-        else:
-            self.history_heatmap_converter = None
-            self.future_heatmap_converter = None
-            self.history_validity_head = None
-            self.future_validity_head = None
             
         # Initialize Diffusion Action Head (parallel with heatmap output)
         if config.enable_action_head:
@@ -493,27 +472,23 @@ class SpatialMLLMPipeline(nn.Module):
             logger.warning("   🎯 Heatmaps based on pure VGGT+DINOv3 spatial features")
             llm_tokens = self.llm_projector(fused_features)
         
-        # Step 6: Generate frame-indexed inter-frame heatmaps
-        history_heatmaps = None
-        future_heatmaps = None
-        history_heatmap_dict = None
-        future_heatmap_dict = None
-        history_validity = None
-        future_validity = None
-        if return_heatmaps and self.history_heatmap_converter is not None and self.future_heatmap_converter is not None:
-            logger.info("Step 6: Frame-indexed inter-frame heatmap generation (history & future)")
-            # Use last frame index as reference for spatial relationships (current observation)
-            current_frame_idx = total_frames - 1
-            history_heatmap_dict, history_heatmaps, history_validity = self._generate_inter_frame_heatmaps(
-                llm_tokens, selected_indices, keyframe_result['geometry_data'],
-                converter=self.history_heatmap_converter, validity_head=self.history_validity_head,
-                current_frame_idx=current_frame_idx
-            )
-            future_heatmap_dict, future_heatmaps, future_validity = self._generate_inter_frame_heatmaps(
-                llm_tokens, selected_indices, keyframe_result['geometry_data'],
-                converter=self.future_heatmap_converter, validity_head=self.future_validity_head,
-                current_frame_idx=current_frame_idx
-            )
+        # Step 6: Generate heatmaps using Diffusion Heatmap Head
+        diffusion_heatmap = None
+        if return_heatmaps and self.diffusion_heatmap_head is not None:
+            logger.info("Step 6: Diffusion-based heatmap generation")
+            heatmap_device = next(self.diffusion_heatmap_head.parameters()).device
+            
+            # Prepare inputs for diffusion heatmap head
+            llm_tokens_for_heatmap = llm_tokens.to(heatmap_device)
+            observation_for_heatmap = current_observation.to(heatmap_device)
+            
+            # Generate heatmap
+            diffusion_heatmap = self.diffusion_heatmap_head(
+                llm_tokens=llm_tokens_for_heatmap,
+                observation=observation_for_heatmap,
+            )  # [B, Hm, Wm]
+            
+            logger.info(f"Diffusion heatmap generated: {diffusion_heatmap.shape}")
         
         # Prepare output
         output = {
@@ -536,17 +511,11 @@ class SpatialMLLMPipeline(nn.Module):
             }
         }
         
-        if history_heatmaps is not None and future_heatmaps is not None:
-            output['history_heatmaps'] = history_heatmaps
-            output['future_heatmaps'] = future_heatmaps
-            output['history_heatmap_dict'] = history_heatmap_dict
-            output['future_heatmap_dict'] = future_heatmap_dict
-            output['history_validity'] = history_validity  # [B, K]
-            output['future_validity'] = future_validity    # [B, K]
-            # For backward compatibility, also提供第一张历史热力图
-            if history_heatmap_dict:
-                first_frame_idx = min(history_heatmap_dict.keys())
-                output['inter_frame_heatmap'] = history_heatmap_dict[first_frame_idx].unsqueeze(1)  # Add channel dim
+        if diffusion_heatmap is not None:
+            output['heatmap'] = diffusion_heatmap  # [B, Hm, Wm]
+            # For backward compatibility
+            output['history_heatmaps'] = diffusion_heatmap.unsqueeze(1)  # [B, 1, Hm, Wm]
+            output['future_heatmaps'] = diffusion_heatmap.unsqueeze(1)   # [B, 1, Hm, Wm]
             
         # Step 7: Generate navigation actions using Diffusion Policy (parallel with heatmaps)
         if return_actions and self.action_head is not None:
@@ -757,134 +726,10 @@ class SpatialMLLMPipeline(nn.Module):
             # Use specialized fusion module
             return self.feature_fusion(vggt_features, dinov3_features)
     
-    def _generate_inter_frame_heatmaps(
-        self,
-        llm_tokens: torch.Tensor,
-        selected_indices: torch.Tensor,
-        geometry_data: Dict[str, torch.Tensor],
-        converter: LLMHiddenStateConverter,
-        validity_head: nn.Module,
-        current_frame_idx: int = 0
-    ) -> Tuple[Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Generate frame-indexed heatmaps showing spatial relationships between keyframes and current observation."""
-
-        # llm_tokens shape: [B, N_frames, N_patches, D]
-        batch_size, num_frames, num_patches, token_dim = llm_tokens.shape
-
-        # Convert selected indices to list of original frame numbers
-        if len(selected_indices.shape) == 1:
-            # Single batch case: [N_k] -> List[int]
-            keyframe_indices = selected_indices.cpu().tolist()
-        else:
-            # Multi-batch case: [B, N_k] -> use first batch for now
-            keyframe_indices = selected_indices[0].cpu().tolist()
-
-        logger.info(f"Generating frame-indexed heatmaps for keyframes: {keyframe_indices}")
-        logger.info(f"LLM tokens shape: {llm_tokens.shape}")
-
-        # Generate frame-specific heatmaps
-        frame_indexed_heatmaps: Dict[int, torch.Tensor] = {}
-        stacked_heatmaps: List[torch.Tensor] = []
-        validity_list: List[torch.Tensor] = []
-
-        for i, original_frame_idx in enumerate(keyframe_indices):
-            if i >= num_frames:
-                # Skip if we don't have enough frames
-                logger.warning(f"Skipping frame {original_frame_idx}: index {i} >= num_frames {num_frames}")
-                continue
-
-            # Extract tokens for this specific frame: [B, N_patches, D]
-            frame_tokens = llm_tokens[:, i]  # [B, N_patches, D]
-
-            # Reshape to 2D spatial layout for heatmap generation
-            # Assuming square patch layout: N_patches = H_patches * W_patches
-            patch_h = patch_w = int(num_patches ** 0.5)
-            if patch_h * patch_w != num_patches:
-                # Handle non-square case by finding closest square or use default
-                patch_h = patch_w = int(num_patches ** 0.5)
-                logger.warning(f"Non-square patch count {num_patches}, using {patch_h}x{patch_w}")
-
-            # Reshape to spatial layout: [B, D, H_patch, W_patch]
-            try:
-                spatial_tokens = frame_tokens.permute(0, 2, 1).view(batch_size, token_dim, patch_h, patch_w)
-
-                # Move spatial_tokens to heatmap_converter device (llm_gpu) to avoid GPU0 OOM
-                converter_device = next(converter.parameters()).device
-                if spatial_tokens.device != converter_device:
-                    spatial_tokens = spatial_tokens.to(converter_device)
-
-                # Generate heatmap using the converter's upsampling
-                frame_heatmap = converter.generate_heatmap(spatial_tokens)  # [B, 1, H, W]
-
-                # Resize to target heatmap size if needed
-                target_h, target_w = self.config.heatmap_size
-                current_h, current_w = frame_heatmap.shape[2], frame_heatmap.shape[3]
-                if current_h != target_h or current_w != target_w:
-                    frame_heatmap = torch.nn.functional.interpolate(
-                        frame_heatmap,
-                        size=(target_h, target_w),
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    if self.config.verbose:
-                        logger.info(f"Resized heatmap from {current_h}×{current_w} to {target_h}×{target_w}")
-
-                    # ⭐ FIX: Re-normalize after resize (bilinear doesn't preserve sum)
-                    # Flatten spatial dimensions and renormalize to sum=1
-                    B, C = frame_heatmap.shape[:2]
-                    flat_hm = frame_heatmap.view(B, C, -1)  # [B, C, H*W]
-                    flat_hm = torch.softmax(flat_hm, dim=-1)  # Renormalize across spatial dimension
-                    frame_heatmap = flat_hm.view(B, C, target_h, target_w)
-
-                # Validity: 使用空间token平均池化后预测 [B, 1]
-                validity_input = spatial_tokens.flatten(2).mean(dim=2)  # [B, D]
-                validity = validity_head(validity_input)  # [B,1]
-
-                # Store with original frame index as key, remove channel dimension
-                frame_indexed_heatmaps[original_frame_idx] = frame_heatmap.squeeze(1)  # [B, H, W]
-                stacked_heatmaps.append(frame_indexed_heatmaps[original_frame_idx])
-                validity_list.append(validity.squeeze(-1))  # [B]
-
-                logger.info(f"Generated heatmap for frame {original_frame_idx}: shape {frame_heatmap.squeeze(1).shape}")
-
-            except Exception as e:
-                logger.error(f"Failed to generate heatmap for frame {original_frame_idx}: {e}")
-                # Create zero heatmap as fallback
-                frame_indexed_heatmaps[original_frame_idx] = torch.zeros(
-                    batch_size, self.config.heatmap_size[0], self.config.heatmap_size[1],
-                    device=llm_tokens.device, dtype=llm_tokens.dtype
-                )
-
-        logger.info(f"Generated {len(frame_indexed_heatmaps)} frame-indexed heatmaps")
-        # 堆叠成 [B, K, H, W]，按keyframe_indices顺序
-        if stacked_heatmaps:
-            heatmap_tensor = torch.stack(stacked_heatmaps, dim=1)
-            validity_tensor = torch.stack(validity_list, dim=1)  # [B, K]
-        else:
-            heatmap_tensor = torch.zeros(
-                batch_size, 0, self.config.heatmap_size[0], self.config.heatmap_size[1],
-                device=llm_tokens.device, dtype=llm_tokens.dtype
-            )
-            validity_tensor = torch.zeros(batch_size, 0, device=llm_tokens.device, dtype=llm_tokens.dtype)
-        return frame_indexed_heatmaps, heatmap_tensor, validity_tensor  # Dict + stacked tensors
-
     def update_heatmap_size(self, new_size: Tuple[int, int]):
-        """Rebuild heatmap converters to match new heatmap size (for curriculum)."""
+        """Update heatmap size configuration (for curriculum training)."""
         self.config.heatmap_size = new_size
-        if self.history_heatmap_converter is not None:
-            device = next(self.history_heatmap_converter.parameters()).device
-            self.history_heatmap_converter = LLMHiddenStateConverter(
-                vlm_dim=self.config.llm_token_dim,
-                target_size=new_size[0]
-            ).to(device=device, dtype=self.config.dtype)
-            self.history_validity_head = nn.Linear(self.config.llm_token_dim, 1).to(device=device, dtype=self.config.dtype)
-        if self.future_heatmap_converter is not None:
-            device = next(self.future_heatmap_converter.parameters()).device
-            self.future_heatmap_converter = LLMHiddenStateConverter(
-                vlm_dim=self.config.llm_token_dim,
-                target_size=new_size[0]
-            ).to(device=device, dtype=self.config.dtype)
-            self.future_validity_head = nn.Linear(self.config.llm_token_dim, 1).to(device=device, dtype=self.config.dtype)
+        logger.info(f"Updated heatmap size to {new_size}")
 
 
 class SpatialAttentionFusion(nn.Module):

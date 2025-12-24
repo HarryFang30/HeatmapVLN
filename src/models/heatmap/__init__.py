@@ -1,16 +1,12 @@
-# BridgeVLA-style Heatmap Module
+# Heatmap Module
 # 
-# This module provides comprehensive heatmap generation and visualization utilities
-# adapted from BridgeVLA's approach to unified vision-language-action representation.
+# This module provides heatmap generation and visualization utilities.
 # 
 # Core Components:
-# - ConvexUpSample: Learned upsampling for generating high-resolution heatmaps
-# - LLMToHeatmapConverter: Convert LLM token outputs to 2D spatial heatmaps  
+# - DiffusionHeatmapHead: Diffusion-based heatmap generation from LLM tokens + observation
 # - Heatmap generators: Create target heatmaps from various annotation types
 # - Visualization tools: Comprehensive plotting and analysis utilities
 
-from .upsampling import ConvexUpSample
-from .converter import LLMToHeatmapConverter, FrameIndexedHeatmapConverter
 from .diffusion_heatmap_head import DiffusionHeatmapHead, create_diffusion_heatmap_head
 from .diffusion import DiffusionHeatmapConfig
 from .generator import (
@@ -22,6 +18,7 @@ from .generator import (
     create_multi_scale_heatmap,
     apply_heatmap_augmentation
 )
+
 # Visualization tools (optional import due to matplotlib dependency)
 try:
     from .visualizer import (
@@ -40,17 +37,11 @@ except ImportError:
     create_heatmap_animation_frames = None
 
 # Version info
-__version__ = "1.0.0"
-__author__ = "Adapted from BridgeVLA"
+__version__ = "2.0.0"
 
 # Main exports
 __all__ = [
-    # Core modules
-    "ConvexUpSample",
-    "LLMToHeatmapConverter",
-    "FrameIndexedHeatmapConverter",
-    
-    # Diffusion heatmap generation
+    # Diffusion heatmap generation (primary)
     "DiffusionHeatmapHead",
     "DiffusionHeatmapConfig",
     "create_diffusion_heatmap_head",
@@ -73,25 +64,4 @@ __all__ = [
     
     # Module metadata
     "__version__",
-    "__author__"
 ]
-
-# Convenience function for quick heatmap generation
-def quick_heatmap_from_llm(hidden_states, attention_mask, num_views=1, **kwargs):
-    """
-    Convenience function for quick heatmap generation from LLM outputs.
-    
-    Args:
-        hidden_states: LLM hidden states tensor
-        attention_mask: Attention mask tensor  
-        num_views: Number of camera views
-        **kwargs: Additional arguments for LLMToHeatmapConverter
-        
-    Returns:
-        Generated heatmaps tensor
-    """
-    converter = LLMToHeatmapConverter(**kwargs)
-    return converter(hidden_states, attention_mask, num_views)
-
-# Add convenience function to exports
-__all__.append("quick_heatmap_from_llm")
