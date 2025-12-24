@@ -45,6 +45,17 @@ __all__ = [
     'create_keyframe_selector',
 ]
 
-# Note: The following modules are imported directly by scripts and don't need __init__ exports:
-# - vln_heatmap_adapter (VLNHeatmapDataset) - used by train_full_model.py, evaluate.py
+# Training dataset classes
+from .vln_heatmap_adapter import VLNHeatmapDataset, create_heatmap_dataloader
+from .vln_sliding_window_dataset import VLNSlidingWindowDataset, create_sliding_window_dataloader
+
+__all__ += [
+    # Training Datasets
+    'VLNHeatmapDataset',
+    'create_heatmap_dataloader',
+    'VLNSlidingWindowDataset',
+    'create_sliding_window_dataloader',
+]
+
+# Note: The following modules are also available for direct import:
 # - algorithm_registry (AlgorithmRegistry, BaseFrameSampler) - used internally

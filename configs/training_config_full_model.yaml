@@ -13,6 +13,14 @@ data:
   num_workers: 12
   pin_memory: true
   prefetch_factor: 4
+  
+  # 滑动窗口数据集配置（可选）
+  dataset_type: heatmap_adapter         # heatmap_adapter | sliding_window
+  sliding_window:
+    min_history: 5                      # 最小历史帧数
+    num_history_sample: 8               # 从历史中采样的帧数
+    load_depth: true                    # 是否加载深度用于遮挡检测
+    cache_poses: true                   # 是否缓存位姿
 
 # ============================================
 # 模型配置
