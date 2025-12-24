@@ -11,13 +11,14 @@ This project implements a state-of-the-art VLN (Vision-Language Navigation) pipe
 ### ✅ **INFERENCE COMPLETE**
 - **Core Achievement**: Frame-indexed heatmaps showing where each historical keyframe appears in the current observation view
 - **Full Pipeline Working**: Video → VGGT/DINOv3 → Qwen2.5-VL → Heatmaps
-- **Production Ready**: CLI interface, multi-GPU optimization, comprehensive testing
-- **Performance Verified**: 4x RTX 8000 GPUs, 29.5s inference, 28/28 distinct heatmaps
+- **Production Ready**: Modular architecture with complete inference pipeline
+- **Performance Verified**: 4x RTX 8000 GPUs, efficient multi-GPU utilization
 
-### 🚧 **TRAINING DEVELOPMENT** (Current Phase)
-- Implementing training methodology for spatial reasoning enhancement
-- Multi-stage training pipeline (pre-training → fine-tuning)
-- Benchmark evaluation (RLBench, COLOSSEUM, GemBench, VSI-Bench)
+### ✅ **TRAINING INFRASTRUCTURE IMPLEMENTED**
+- **Multi-stage training pipeline**: 5-stage curriculum with history/future heatmap heads
+- **Dual-head architecture**: Separate history and future heatmap converters
+- **Training scripts**: Complete stage-by-stage training with DDP support
+- **Configuration system**: YAML-based training configuration with flexible GPU allocation
 
 ---
 
@@ -84,27 +85,45 @@ pip install -r requirements.txt
 ### 2. Basic Usage (Inference)
 
 ```bash
-# Single video processing
-python main.py --video /path/to/video.mp4 --instruction "Navigate and find the target"
-
-# Pipeline verification
-python test_real_llm_pipeline.py --video /home/VLN/test.mp4
-
-# Frame-indexed heatmap verification
-python verify_frame_indexed_heatmaps.py
-
-# Algorithm testing
-python test_flexible_algorithm_selection.py
+# Run inference with the full pipeline
+python scripts/inference.py --video /path/to/video.mp4 \
+    --instruction "Navigate and find the target" \
+    --config configs/training_config_full_model.yaml
 ```
 
-### 3. Training (🚧 In Development)
+### 3. Training
+
+The project implements a 5-stage training curriculum:
 
 ```bash
-# Training pipeline (TO IMPLEMENT)
-python scripts/train.py --config configs/train_config.yaml --data_path /path/to/data
+# Stage 1: History heatmap head warmup (64x64)
+python scripts/train_stage1_history_warmup.py \
+    --config configs/training_config_full_model.yaml
 
-# Benchmark evaluation (TO IMPLEMENT)
-python scripts/evaluate.py --benchmark RLBench --model_path /path/to/model
+# Stage 2: History heatmap with fusion (128x128)
+python scripts/train_stage2_history_mlp.py \
+    --config configs/training_config_full_model.yaml
+
+# Stage 3: History full model with encoder fine-tuning (128x128)
+python scripts/train_stage3_history_full.py \
+    --config configs/training_config_full_model.yaml
+
+# Stage 4: Future heatmap head warmup (128x128)
+python scripts/train_stage4_future_warmup.py \
+    --config configs/training_config_full_model.yaml
+
+# Stage 5: Joint training - dual heads + encoders (224x224)
+python scripts/train_stage5_joint_training.py \
+    --config configs/training_config_full_model.yaml
+
+# OR run the full training pipeline (all stages sequentially)
+python scripts/train_full_model.py \
+    --config configs/training_config_full_model.yaml \
+    --world_size 2  # For DDP training on 2 GPUs
+
+# Evaluation
+python scripts/evaluate.py --config configs/training_config_full_model.yaml \
+    --checkpoint /path/to/checkpoint.pth
 ```
 
 ---
@@ -113,82 +132,107 @@ python scripts/evaluate.py --benchmark RLBench --model_path /path/to/model
 
 ```
 Project/
-├── configs/                       # Configuration files
-│   ├── default_config.yaml       # Inference config
-│   └── training_config.yaml      # Training config (🚧 TODO)
+├── configs/                              # Configuration files
+│   └── training_config_full_model.yaml  # Complete training config ✅
 │
-├── src/                          # Source code
-│   ├── data/                     # Data processing (✅ CLEANED)
-│   │   ├── frame_sampler.py     # Space-aware frame sampling
-│   │   ├── spatial_analysis.py  # Spatial novelty detection
-│   │   ├── keyframe_selector.py # Keyframe selection
-│   │   ├── algorithm_registry.py # Algorithm registration
-│   │   └── vln_heatmap_adapter.py # Training dataset (🚧 TODO)
+├── src/                                  # Source code
+│   ├── data/                            # Data processing
+│   │   ├── frame_sampler.py            # Space-aware frame sampling ✅
+│   │   ├── spatial_analysis.py         # Spatial novelty detection ✅
+│   │   ├── keyframe_selector.py        # Keyframe selection ✅
+│   │   ├── algorithm_registry.py       # Algorithm registration ✅
+│   │   └── vln_heatmap_adapter.py      # Training dataset adapter ✅
 │   │
-│   ├── models/                   # Model implementations
-│   │   ├── spatial_mllm_compat.py # End-to-end VLN pipeline ✅
-│   │   ├── dinov3/              # DINOv3 2D semantic features
-│   │   ├── vggt/                # VGGT 3D geometry
-│   │   ├── heatmap/             # Frame-indexed heatmap generation
-│   │   ├── real_llm_integration.py # Qwen2.5-VL processing
-│   │   └── memory_efficient_llm.py # Dynamic GPU memory management
+│   ├── models/                          # Model implementations
+│   │   ├── spatial_mllm_compat.py      # End-to-end VLN pipeline ✅
+│   │   ├── dinov3/                     # DINOv3 2D semantic features ✅
+│   │   ├── vggt/                       # VGGT 3D geometry ✅
+│   │   ├── heatmap/                    # Heatmap generation modules ✅
+│   │   │   ├── converter.py           # LLM to heatmap converter ✅
+│   │   │   ├── multi_head.py          # Multi-heatmap MLP head ✅
+│   │   │   ├── renderer.py            # Gaussian renderer (τ, σ, α) ✅
+│   │   │   ├── upsampling.py          # Convex upsampling ✅
+│   │   │   └── generator.py           # Heatmap generation utilities ✅
+│   │   ├── qwen2_5_vl/                # Qwen2.5-VL model code ✅
+│   │   ├── real_llm_integration.py    # Qwen2.5-VL integration ✅
+│   │   └── memory_efficient_llm.py    # GPU memory management ✅
 │   │
-│   └── utils/                    # Utility functions
-│       ├── config.py            # Configuration management
-│       ├── logger.py            # Logging utilities
-│       ├── losses.py            # Loss functions (🚧 TODO)
-│       ├── metrics.py           # Evaluation metrics
-│       └── visualization.py     # Visualization tools
+│   └── utils/                           # Utility functions
+│       ├── logger.py                   # Logging utilities ✅
+│       └── path_utils.py               # Path management ✅
 │
-├── scripts/                      # Execution scripts
-│   ├── train.py                 # Training pipeline (🚧 TODO)
-│   ├── evaluate.py              # Evaluation pipeline (🚧 TODO)
-│   ├── train_full_model.py      # Full model training (🚧 TODO)
-│   └── train_utils_spatial.py   # Training utilities (🚧 TODO)
+├── scripts/                             # Training & evaluation scripts
+│   ├── train_full_model.py            # Complete 5-stage training ✅
+│   ├── train_stage1_history_warmup.py # Stage 1: History head ✅
+│   ├── train_stage2_history_mlp.py    # Stage 2: History + fusion ✅
+│   ├── train_stage3_history_full.py   # Stage 3: History full ✅
+│   ├── train_stage4_future_warmup.py  # Stage 4: Future head ✅
+│   ├── train_stage5_joint_training.py # Stage 5: Joint training ✅
+│   ├── train_utils_spatial.py         # Training utilities ✅
+│   ├── inference.py                   # Inference script ✅
+│   └── evaluate.py                    # Evaluation script ✅
 │
-├── models/                       # Model weights (HF cache)
-│   ├── Qwen2.5-VL-7B-Instruct/ # LLM weights
-│   ├── vggt/                    # VGGT weights
-│   └── dinov3/                  # DINOv3 weights
+├── models/                              # Model weights (HF cache)
+│   ├── qwen_2.5_vl/                   # Qwen2.5-VL weights
+│   ├── vggt/                          # VGGT weights
+│   └── dinov3/                        # DINOv3 weights
 │
-├── main.py                       # Production CLI interface ✅
-├── test_real_llm_pipeline.py    # Pipeline verification ✅
-├── verify_frame_indexed_heatmaps.py # Heatmap verification ✅
-├── requirements.txt              # Python dependencies ✅
-└── README.md                     # This file
+├── requirements.txt                     # Python dependencies ✅
+├── CLAUDE.md                           # Development instructions ✅
+└── README.md                           # This file
 ```
 
 ---
 
-## 📋 Working Commands (✅ Inference)
+## 📋 Commands
 
-### Inference & Verification
+### Inference
 
 ```bash
-# Main production interface
-python main.py --video /path/to/video.mp4 \
-    --instruction "Navigate and find the target"
-
-# Pipeline verification with real LLM
-python test_real_llm_pipeline.py --video /home/VLN/test.mp4
-
-# Verify frame-indexed heatmaps
-python verify_frame_indexed_heatmaps.py
-
-# Algorithm selection testing
-python test_flexible_algorithm_selection.py
+# Run inference with the full pipeline
+python scripts/inference.py \
+    --video /path/to/video.mp4 \
+    --instruction "Navigate and find the target" \
+    --config configs/training_config_full_model.yaml \
+    --checkpoint /path/to/checkpoint.pth  # Optional: use trained model
 ```
 
-### Command Parameters
+### Training Commands
+
+```bash
+# Single-GPU training (any stage)
+python scripts/train_stage1_history_warmup.py \
+    --config configs/training_config_full_model.yaml
+
+# Multi-GPU DDP training (recommended)
+torchrun --nproc_per_node=2 scripts/train_full_model.py \
+    --config configs/training_config_full_model.yaml
+
+# Resume training from checkpoint
+python scripts/train_full_model.py \
+    --config configs/training_config_full_model.yaml \
+    --resume /path/to/checkpoint.pth
+```
+
+### Evaluation
+
+```bash
+# Evaluate trained model
+python scripts/evaluate.py \
+    --config configs/training_config_full_model.yaml \
+    --checkpoint /path/to/checkpoint.pth \
+    --split val
+```
+
+### Key Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--video` | str | Required | Input video file path |
-| `--instruction` | str | "Navigate..." | VLN navigation instruction |
-| `--keyframes` | int | 8 | Number of keyframes (N_k) |
-| `--max_frames` | int | 32 | Candidate frames (N_m) |
-| `--output_dir` | str | "./outputs" | Output directory |
-| `--verbose` | flag | False | Enable verbose logging |
+| `--config` | str | Required | Path to YAML config file |
+| `--checkpoint` | str | None | Path to model checkpoint |
+| `--world_size` | int | 1 | Number of GPUs for DDP |
+| `--resume` | str | None | Resume training from checkpoint |
+| `--split` | str | "val" | Dataset split for evaluation |
 
 ---
 
@@ -226,38 +270,72 @@ frame_sampling:
   voxel_lambda: 20.0
 ```
 
-### Training Configuration (🚧 TODO)
+### Training Configuration
 
-Located in `configs/training_config.yaml`:
+Located in `configs/training_config_full_model.yaml`:
 
 ```yaml
-# Training Strategy
+# 5-Stage Training Curriculum
 training:
   stages:
-    - name: warmup_head
-      epochs: 2
-      freeze_llm: true
+    # Stage 1: History head warmup (64x64)
+    - name: stage1_history_warmup
+      epochs: 5
       hm_size: [64, 64]
-    - name: finetune_all
-      epochs: 8
-      freeze_llm: false
-      lora: true
-      hm_size: [128, 128]
-    - name: finetune_all_highres
-      epochs: 10
-      hm_size: [224, 224]
+      train_history: true
+      train_future: false
+      trainable_modules: [history_heatmap_converter, feature_fusion, llm_projector]
+      frozen_modules: [vggt, dinov3_compat]
 
-# Optimizer
+    # Stage 2: History + fusion (128x128)
+    - name: stage2_history_fusion
+      epochs: 8
+      hm_size: [128, 128]
+      train_history: true
+      trainable_modules: [history_heatmap_converter, feature_fusion, llm_projector]
+
+    # Stage 3: History full model (128x128) - unfreeze encoders
+    - name: stage3_history_full
+      epochs: 10
+      hm_size: [128, 128]
+      trainable_modules: [history_heatmap_converter, vggt, dinov3_compat]
+
+    # Stage 4: Future head warmup (128x128)
+    - name: stage4_future_warmup
+      epochs: 5
+      hm_size: [128, 128]
+      train_future: true
+      trainable_modules: [future_heatmap_converter, feature_fusion]
+
+    # Stage 5: Joint training - dual heads (224x224)
+    - name: stage5_joint_training
+      epochs: 15
+      hm_size: [224, 224]
+      train_history: true
+      train_future: true
+      trainable_modules: [all]
+
+# Optimizer (grouped learning rates)
 optim:
   optimizer: adamw
-  head_lr: 1.0e-3
-  lora_lr: 5.0e-5
-  batch_size: 16
+  history_heatmap_lr: 1.0e-3  # History converter
+  future_heatmap_lr: 1.0e-3   # Future converter
+  fusion_lr: 5.0e-4           # Fusion modules
+  encoder_lr: 1.0e-5          # VGGT + DINOv3
+  batch_size: 1
+  grad_accum_steps: 1
   amp: bf16
+  use_ddp: true
 
-# Loss Function
+# Loss Function (Dual-head navigation)
 loss:
-  type: kl_ce  # KL divergence + Cross-entropy
+  type: navigation_heatmap
+  alpha: 20.0          # Temperature scaling
+  lambda_mse: 1.0      # MSE loss weight
+  lambda_kl: 0.2       # KL divergence weight
+  lambda_valid: 0.1    # Valid mask weight
+  history_weight: 1.0  # History head weight
+  future_weight: 1.0   # Future head weight
 ```
 
 ---
@@ -284,37 +362,57 @@ GPU 3: Reserved for training           (free)
 
 ---
 
-## 🚧 Training Development (Current Focus)
+## 🚀 Training Architecture
 
-### Training Infrastructure Needed
+### 5-Stage Training Curriculum
 
-- [ ] **Training Scripts**: Multi-stage training pipeline
-- [ ] **Loss Functions**: Spatial reasoning losses, heatmap generation losses
-- [ ] **Data Loading**: Training data pipeline for video sequences
-- [ ] **Configuration**: Training-specific YAML configs
-- [ ] **Evaluation**: Benchmark evaluation on RLBench, COLOSSEUM, GemBench, VSI-Bench
+The training follows a carefully designed curriculum that progressively builds spatial reasoning:
 
-### Training Strategy
+#### **Stage 1: History Head Warmup** (64×64)
+- **Duration**: 5 epochs
+- **Train**: History heatmap converter + feature fusion + LLM projector
+- **Freeze**: VGGT + DINOv3 encoders
+- **Purpose**: Learn basic history-to-current frame spatial mapping
 
-1. **Stage 1**: Heatmap pre-training (frozen LLM, train Head + Renderer)
-   - Resolution: 64×64 → 128×128
-   - Loss: KL divergence + Cross-entropy
-   - Duration: 2 epochs
+#### **Stage 2: History + Fusion** (128×128)
+- **Duration**: 8 epochs
+- **Train**: History converter + fusion modules
+- **Freeze**: Encoders
+- **Purpose**: Refine spatial understanding with higher resolution
 
-2. **Stage 2**: End-to-end fine-tuning (unfrozen LLM with LoRA)
-   - Resolution: 128×128 → 224×224
-   - Loss: KL divergence + Cross-entropy
-   - Duration: 8-10 epochs
+#### **Stage 3: History Full Model** (128×128)
+- **Duration**: 10 epochs
+- **Train**: All modules including encoders
+- **Purpose**: End-to-end fine-tuning for history branch
 
-3. **Stage 3**: Benchmark validation
-   - Evaluate on RLBench, COLOSSEUM, GemBench, VSI-Bench
-   - Metrics: Navigation success rate, spatial accuracy
+#### **Stage 4: Future Head Warmup** (128×128)
+- **Duration**: 5 epochs
+- **Train**: Future heatmap converter + fusion
+- **Freeze**: Encoders + history head (preserve Stage 3 learning)
+- **Purpose**: Learn future spatial prediction
 
-### Data Requirements
+#### **Stage 5: Joint Training** (224×224)
+- **Duration**: 15 epochs
+- **Train**: All modules (dual-head + encoders)
+- **Purpose**: Final high-resolution joint optimization
 
-- **Input**: Video sequences (N_m frames) + Navigation instructions + Spatial annotations
-- **Output**: Frame-indexed heatmaps (224×224) + LLM spatial reasoning responses
-- **Format**: Habitat navigation dataset with pose/depth information
+### Loss Functions
+
+**Navigation Heatmap Loss** (dual-head):
+```python
+L_total = w_h * L_history + w_f * L_future
+
+where:
+  L_branch = λ_mse * MSE(pred, gt) + λ_kl * KL(pred || gt) + λ_valid * ValidMask
+```
+
+### Data Pipeline
+
+- **Input**: Video sequences (16 frames) from Habitat navigation episodes
+- **Output**:
+  - History heatmaps: Where content from past frames appears in current view
+  - Future heatmaps: Predicted spatial locations for future navigation
+- **Format**: Frame sequences + camera poses + depth maps → projected ground truth heatmaps
 
 ---
 
@@ -350,38 +448,60 @@ Frame t=20: Turned right, seeing a window
 
 1. **CUDA Out of Memory**
    ```bash
-   # Reduce number of frames
-   python main.py --video test.mp4 --max_frames 16 --keyframes 4
+   # Option 1: Reduce batch size in config
+   optim:
+     batch_size: 1
+     grad_accum_steps: 4  # Effective batch size = 4
+
+   # Option 2: Use single-GPU mode
+   model:
+     use_multi_gpu: false
    ```
 
-2. **Model Loading Errors**
+2. **DDP Initialization Errors**
    ```bash
-   # Check transformers version
-   pip install transformers==4.51.3
+   # Ensure CUDA devices are visible
+   echo $CUDA_VISIBLE_DEVICES
 
-   # Verify model weights exist
-   ls models/Qwen2.5-VL-7B-Instruct/
+   # Use correct world_size
+   torchrun --nproc_per_node=2 scripts/train_full_model.py ...
    ```
 
-3. **Video Loading Issues**
+3. **Model Loading Errors**
    ```bash
-   # Install opencv and decord
-   pip install opencv-python decord
+   # Check model paths in config
+   model:
+     llm:
+       model_path: /root/VLN/Project/models/qwen_2.5_vl
 
-   # Supported formats: .mp4, .avi, .mov, .mkv
+   # Verify weights exist
+   ls models/qwen_2.5_vl/
+   ls models/vggt/
+   ```
+
+4. **Dataset Issues**
+   ```bash
+   # Verify dataset path
+   data:
+     root: /path/to/habitat_dataset
+
+   # Check dataset structure
+   ls /path/to/habitat_dataset/
    ```
 
 ### Debug Mode
 
 ```bash
-# Enable verbose logging
-python main.py --video test.mp4 --verbose
+# Enable verbose logging in config
+log:
+  log_level: DEBUG
+  show_gpu_memory: true
 
-# Check GPU memory
-nvidia-smi
+# Monitor GPU memory during training
+watch -n 1 nvidia-smi
 
-# Verify pipeline components
-python test_real_llm_pipeline.py --video test.mp4
+# Test inference on single sample
+python scripts/inference.py --video test.mp4 --config configs/training_config_full_model.yaml
 ```
 
 ---
@@ -427,4 +547,26 @@ For issues, questions, or contributions:
 
 ---
 
-**Status**: Inference pipeline complete ✅ → Ready for training methodology development 🚧
+## 📈 Training Tips
+
+### GPU Memory Optimization
+- **4 GPUs**: Run full pipeline with multi-GPU mode (`use_multi_gpu: true`)
+- **2 GPUs**: Use DDP with single-GPU-per-rank mode (`use_multi_gpu: false`)
+- **1 GPU**: Reduce batch size and use gradient accumulation
+
+### Training Strategies
+1. **Start with Stage 1** to verify data pipeline
+2. **Monitor losses** in TensorBoard: `tensorboard --logdir /root/tf-logs`
+3. **Save checkpoints** regularly (configured in `log.save_every_epochs`)
+4. **Resume training** from any stage with `--resume` flag
+5. **Validate regularly** to catch overfitting early
+
+### Performance Expectations
+- **Stage 1-2**: Fast convergence (~1-2 hours per stage)
+- **Stage 3**: Slower due to encoder training (~3-4 hours)
+- **Stage 4**: Fast convergence for future head (~1-2 hours)
+- **Stage 5**: Longest stage with high-res training (~6-8 hours)
+
+---
+
+**Status**: Complete training infrastructure ✅ → Ready for large-scale training 🚀

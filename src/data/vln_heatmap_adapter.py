@@ -48,7 +48,8 @@ class VLNHeatmapDataset(Dataset):
                  heatmap_per_clip: int,
                  image_size: Tuple[int, int] = (384, 384),
                  hm_size: Tuple[int, int] = (64, 64),
-                 num_sample_frames: Optional[int] = None):
+                 num_sample_frames: Optional[int] = None,
+                 load_actions: bool = False):
         """
         Initialize VLN Heatmap Dataset.
 
@@ -60,6 +61,7 @@ class VLNHeatmapDataset(Dataset):
             image_size: Target image size (W, H)
             hm_size: Target heatmap size (W, H)
             num_sample_frames: Number of frames to uniformly sample from each clip (None = use all)
+            load_actions: Whether to load action data (actions.npy) if available
         """
         self.root = Path(root)
         self.split = split
@@ -68,13 +70,15 @@ class VLNHeatmapDataset(Dataset):
         self.image_size = image_size  # (W, H)
         self.hm_size = hm_size        # (W, H)
         self.num_sample_frames = num_sample_frames  # NEW: uniform sampling
+        self.load_actions = load_actions  # NEW: action loading
 
         # Enumerate all clips
         self.clips = self._enumerate_clips()
 
         logger.info(f"VLNHeatmapDataset initialized: {len(self.clips)} clips, "
                    f"num_sample_frames={num_sample_frames}, "
-                   f"image_size={image_size}, hm_size={hm_size}")
+                   f"image_size={image_size}, hm_size={hm_size}, "
+                   f"load_actions={load_actions}")
 
     def _enumerate_clips(self) -> List[Path]:
         """
@@ -144,7 +148,7 @@ class VLNHeatmapDataset(Dataset):
 
             # ⭐ FIX: Don't return full meta dict - it contains variable-length lists that break collate
             # Only return necessary scalar fields for training
-            return {
+            result = {
                 "frames": frames,                      # [T_sampled, 3, H, W]
                 "text": text,                          # R2R navigation instruction
                 "gt_heatmap_history": gt_hm_hist,     # [T_sampled, Hm, Wm]
@@ -153,6 +157,14 @@ class VLNHeatmapDataset(Dataset):
                 "gt_validity_future": mask_fut,        # [T_sampled]
                 # "meta": meta                         # REMOVED: contains variable-length lists
             }
+            
+            # 🆕 Load actions if requested and available
+            if self.load_actions:
+                actions, actions_mask = self._load_actions(clip_dir, sample_indices)
+                result["gt_actions"] = actions          # [T_sampled, 2] or None
+                result["gt_actions_mask"] = actions_mask  # [T_sampled] or None
+            
+            return result
 
         except Exception as e:
             logger.error(f"Error loading clip {clip_dir}: {e}")
@@ -328,6 +340,45 @@ class VLNHeatmapDataset(Dataset):
 
         return torch.stack(resized_heatmaps, dim=0)
 
+    def _load_actions(self, clip_dir: Path, sample_indices: np.ndarray) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Load 2D continuous actions from clip directory.
+
+        Args:
+            clip_dir: Clip directory path
+            sample_indices: Indices of sampled frames
+
+        Returns:
+            Tuple of (actions, actions_mask):
+                - actions: [T_sampled, 2] 2D actions (dx, dy) or None if not found
+                - actions_mask: [T_sampled] validity mask (all 1s if actions exist) or None
+        """
+        actions_file = clip_dir / "actions.npy"
+        
+        if not actions_file.exists():
+            # Actions not available for this clip
+            logger.debug(f"Actions file not found: {actions_file}")
+            return None, None
+        
+        try:
+            # Load actions array [T, 2]
+            actions = np.load(actions_file).astype(np.float32)
+            
+            # Apply sampling (align with frame sampling)
+            actions_sampled = actions[sample_indices]  # [T_sampled, 2]
+            
+            # Convert to tensor
+            actions_tensor = torch.from_numpy(actions_sampled)  # [T_sampled, 2]
+            
+            # Create validity mask (all valid if file exists)
+            actions_mask = torch.ones(len(sample_indices), dtype=torch.float32)
+            
+            return actions_tensor, actions_mask
+            
+        except Exception as e:
+            logger.warning(f"Error loading actions from {actions_file}: {e}")
+            return None, None
+
     def _load_metadata(self, clip_dir: Path) -> Dict:
         """Load metadata from clip directory."""
         meta_file = clip_dir / "meta.json"
@@ -352,7 +403,7 @@ class VLNHeatmapDataset(Dataset):
         # Use num_sample_frames if set, otherwise use frames_per_clip
         T = self.num_sample_frames if self.num_sample_frames is not None else self.frames_per_clip
 
-        return {
+        result = {
             "frames": torch.zeros(T, 3, target_h, target_w),
             "text": "",
             "gt_heatmap_history": torch.zeros(T, hm_h, hm_w),
@@ -361,6 +412,13 @@ class VLNHeatmapDataset(Dataset):
             "gt_validity_future": torch.zeros(T),
             # "meta": {"error": "Failed to load clip"}  # REMOVED: for consistency with normal return
         }
+        
+        # 🆕 Add dummy actions if load_actions is enabled
+        if self.load_actions:
+            result["gt_actions"] = torch.zeros(T, 2)
+            result["gt_actions_mask"] = torch.zeros(T)
+        
+        return result
 
 
 def create_heatmap_dataloader(

@@ -22,7 +22,7 @@ compatibility across all components.
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, Any, List
+from typing import Dict, Optional, Tuple, Any, List, Union
 import logging
 from dataclasses import dataclass
 
@@ -32,6 +32,7 @@ from .vggt.models.vggt import VGGT
 from .heatmap.converter import LLMToHeatmapConverter as LLMHiddenStateConverter
 from .real_llm_integration import create_real_llm_integration
 from .memory_efficient_llm import create_memory_efficient_llm
+from .action import DiffusionActionHead, DiffusionActionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,15 @@ class SpatialMLLMIntegrationConfig:
     # Heatmap generation
     heatmap_size: Tuple[int, int] = (224, 224)
     enable_inter_frame_heatmaps: bool = True
+    
+    # Action generation (Diffusion Policy)
+    enable_action_head: bool = False  # Enable diffusion action head
+    action_dim: int = 2  # 2D navigation (dx, dy)
+    action_pred_horizon: int = 1  # Number of action steps to predict
+    action_encoding_size: int = 768  # Condition projection dimension
+    action_num_diffusion_iters: int = 10  # Diffusion denoising steps
+    action_stats_min: List[float] = None  # Will use defaults if None
+    action_stats_max: List[float] = None  # Will use defaults if None
     
     # Performance settings
     device: str = "cuda"
@@ -234,6 +244,25 @@ class SpatialMLLMPipeline(nn.Module):
             self.history_validity_head = None
             self.future_validity_head = None
             
+        # Initialize Diffusion Action Head (parallel with heatmap output)
+        if config.enable_action_head:
+            logger.info("Initializing Diffusion Action Head for navigation actions")
+            action_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
+            action_config = DiffusionActionConfig(
+                action_dim=config.action_dim,
+                pred_horizon=config.action_pred_horizon,
+                cond_dim=config.feature_fusion_dim,  # Use fused features as condition
+                encoding_size=config.action_encoding_size,
+                num_diffusion_iters=config.action_num_diffusion_iters,
+                action_stats_min=config.action_stats_min or [-1.07, -1.05],
+                action_stats_max=config.action_stats_max or [1.07, 1.03],
+                device=str(action_device),
+            )
+            self.action_head = DiffusionActionHead(action_config).to(device=action_device, dtype=config.dtype)
+            logger.info(f"Diffusion Action Head initialized on {action_device}")
+        else:
+            self.action_head = None
+            
         # Performance optimization
         if config.enable_gradient_checkpointing:
             self.vggt.gradient_checkpointing_enable()
@@ -288,7 +317,9 @@ class SpatialMLLMPipeline(nn.Module):
         instruction_text: Optional[str] = None,
         current_observation: Optional[torch.Tensor] = None,
         return_intermediate: bool = False,
-        return_heatmaps: bool = True
+        return_heatmaps: bool = True,
+        return_actions: bool = True,
+        gt_actions: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
         """
         Complete forward pass of the Spatial-MLLM pipeline processing three inputs.
@@ -311,6 +342,8 @@ class SpatialMLLMPipeline(nn.Module):
                 - 'fused_features': Fused spatial features [B, N_k, D]
                 - 'llm_tokens': LLM-compatible tokens [B, N_k, D_llm]
                 - 'inter_frame_heatmap': Single first-person heatmap [B, 1, H, W] (if enabled)
+                - 'actions': Predicted navigation actions [B, pred_horizon, action_dim] (if enabled)
+                - 'action_loss': Action prediction loss (if gt_actions provided)
                 - 'intermediate_features': Debug information (if requested)
                 - 'processing_metadata': Pipeline statistics
         """
@@ -491,6 +524,41 @@ class SpatialMLLMPipeline(nn.Module):
                 first_frame_idx = min(history_heatmap_dict.keys())
                 output['inter_frame_heatmap'] = history_heatmap_dict[first_frame_idx].unsqueeze(1)  # Add channel dim
             
+        # Step 7: Generate navigation actions using Diffusion Policy (parallel with heatmaps)
+        if return_actions and self.action_head is not None:
+            logger.info("Step 7: Diffusion Policy action generation")
+            try:
+                # Use fused features as condition for action generation
+                # Pool over spatial and temporal dimensions: [B, N_k, L, D] -> [B, D]
+                action_cond = fused_features.mean(dim=(1, 2))  # [B, D]
+                
+                # Move to action head device
+                action_device = next(self.action_head.parameters()).device
+                action_cond = action_cond.to(device=action_device)
+                
+                if gt_actions is not None:
+                    # Training mode: compute action loss
+                    gt_actions_device = gt_actions.to(device=action_device)
+                    action_result = self.action_head(
+                        action_cond, 
+                        gt_actions=gt_actions_device,
+                        return_loss=True
+                    )
+                    output['actions'] = action_result['actions']
+                    output['action_loss'] = action_result['loss']
+                    output['normalized_actions'] = action_result['normalized_actions']
+                    logger.info(f"Action loss: {action_result['loss'].item():.4f}")
+                else:
+                    # Inference mode: generate actions
+                    actions = self.action_head(action_cond)
+                    output['actions'] = actions
+                    logger.info(f"Generated actions shape: {actions.shape}")
+                    
+            except Exception as e:
+                logger.error(f"Action generation failed: {e}")
+                output['actions'] = None
+                output['action_loss'] = None
+        
         if return_intermediate:
             output['intermediate_features'] = {
                 'vggt_predictions': vggt_predictions,
