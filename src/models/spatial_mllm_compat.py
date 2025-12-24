@@ -33,6 +33,7 @@ from .heatmap.converter import LLMToHeatmapConverter as LLMHiddenStateConverter
 from .real_llm_integration import create_real_llm_integration
 from .memory_efficient_llm import create_memory_efficient_llm
 from .action import DiffusionActionHead, DiffusionActionConfig
+from .heatmap import DiffusionHeatmapHead, DiffusionHeatmapConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,11 @@ class SpatialMLLMIntegrationConfig:
     action_num_diffusion_iters: int = 10  # Diffusion denoising steps
     action_stats_min: List[float] = None  # Will use defaults if None
     action_stats_max: List[float] = None  # Will use defaults if None
+    
+    # Diffusion Heatmap Generation (alternative to converter-based heatmaps)
+    enable_diffusion_heatmap: bool = False  # Enable diffusion-based heatmap generation
+    diffusion_heatmap_cond_dim: int = 512  # Condition dimension for diffusion
+    diffusion_heatmap_num_inference_steps: int = 10  # Diffusion inference steps
     
     # Performance settings
     device: str = "cuda"
@@ -262,6 +268,24 @@ class SpatialMLLMPipeline(nn.Module):
             logger.info(f"Diffusion Action Head initialized on {action_device}")
         else:
             self.action_head = None
+        
+        # Initialize Diffusion Heatmap Head (alternative to converter-based heatmaps)
+        if config.enable_diffusion_heatmap:
+            logger.info("Initializing Diffusion Heatmap Head for spatial heatmap generation")
+            heatmap_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
+            diffusion_heatmap_config = DiffusionHeatmapConfig(
+                llm_dim=config.llm_token_dim,
+                cond_dim=config.diffusion_heatmap_cond_dim,
+                heatmap_size=config.heatmap_size,
+                num_inference_steps=config.diffusion_heatmap_num_inference_steps,
+                image_size=(config.dinov3_img_size, config.dinov3_img_size),
+            )
+            self.diffusion_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
+                device=heatmap_device, dtype=config.dtype
+            )
+            logger.info(f"Diffusion Heatmap Head initialized on {heatmap_device}")
+        else:
+            self.diffusion_heatmap_head = None
             
         # Performance optimization
         if config.enable_gradient_checkpointing:

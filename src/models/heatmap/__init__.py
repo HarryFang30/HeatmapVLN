@@ -11,6 +11,8 @@
 
 from .upsampling import ConvexUpSample
 from .converter import LLMToHeatmapConverter, FrameIndexedHeatmapConverter
+from .diffusion_heatmap_head import DiffusionHeatmapHead, create_diffusion_heatmap_head
+from .diffusion import DiffusionHeatmapConfig
 from .generator import (
     generate_hm_from_pt, 
     generate_target_heatmap_from_annotation,
@@ -47,6 +49,11 @@ __all__ = [
     "ConvexUpSample",
     "LLMToHeatmapConverter",
     "FrameIndexedHeatmapConverter",
+    
+    # Diffusion heatmap generation
+    "DiffusionHeatmapHead",
+    "DiffusionHeatmapConfig",
+    "create_diffusion_heatmap_head",
     
     # Generation utilities
     "generate_hm_from_pt",
