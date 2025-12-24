@@ -4,18 +4,15 @@ seed: 42
 # 数据配置
 # ============================================
 data:
-  root: /root/autodl-tmp/dataset_train
-  num_sample_frames: 16                 # 从变长序列均匀采样16帧
-  frames_per_clip: 16
-  heatmap_per_clip: 16
+  root: /root/autodl-tmp/dataset_with_actions
   image_size: [224, 224]
   init_hm_size: [64, 64]                # 起始分辨率
-  num_workers: 12
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 2
   
-  # 滑动窗口数据集配置（可选）
-  dataset_type: heatmap_adapter         # heatmap_adapter | sliding_window
+  # 滑动窗口数据集配置
+  dataset_type: sliding_window          # heatmap_adapter | sliding_window
   sliding_window:
     min_history: 5                      # 最小历史帧数
     num_history_sample: 8               # 从历史中采样的帧数
@@ -27,106 +24,129 @@ data:
 # ============================================
 model:
   type: spatial_mllm_pipeline
-  # 是否跨卡拆分模块（true=按下方GPU分配，false=同卡/每rank一张卡）
   use_multi_gpu: false
-  # GPU 分配（按需修改）
-  # DDP模式：所有模块使用相同设备（"cuda"），DDP会自动分配到各rank的local_rank设备
-  # 两卡推荐：vggt_gpu/dinov3_gpu=cuda:0，llm_gpu=cuda:1
-  # 三卡推荐：vggt_gpu=cuda:0，dinov3_gpu=cuda:1，llm_gpu=cuda:2
   vggt_gpu: cuda
   dinov3_gpu: cuda
   llm_gpu: cuda
 
-  # LLM 配置（train_full_model.py 需要）
+  # LLM 配置
   llm:
     model_path: /root/VLN/Project/models/qwen_2.5_vl
     use_real_llm: true
 
+  # 动作头配置
+  action_head:
+    enable: true
+    cond_dim: 2048                      # LLM 输出维度
+    action_dim: 2                       # 2D 动作 (dx, dy)
+    pred_horizon: 1                     # 预测步数
+    num_diffusion_iters: 10             # 扩散步数
+    encoding_size: 768                  # 条件投影维度
+
 # ============================================
-# 训练策略（SpatialMLLMPipeline）
+# 训练策略（两阶段：History+Action → Future+Action）
 # ============================================
 training:
   stages:
-    # Stage 1: History 头预热 (64x64)
-    - name: stage1_history_warmup
+    # ============ 阶段 A: History + Action ============
+    
+    # A1: History + Action 头预热 (64x64)
+    - name: stage_a1_history_action_warmup
       epochs: 5
       hm_size: [64, 64]
       train_history: true
       train_future: false
+      train_action: true
       trainable_modules:
         - history_heatmap_converter
+        - action_head
         - feature_fusion
         - llm_projector
       frozen_modules:
         - vggt
         - dinov3_compat
+        - future_heatmap_converter
 
-    # Stage 2: History + 融合 (64→128)
-    - name: stage2_history_fusion
+    # A2: History + Action 提升分辨率 (64→128)
+    - name: stage_a2_history_action_128
       epochs: 8
       hm_size: [128, 128]
       train_history: true
       train_future: false
+      train_action: true
       trainable_modules:
         - history_heatmap_converter
+        - action_head
         - feature_fusion
         - llm_projector
       frozen_modules:
         - vggt
         - dinov3_compat
+        - future_heatmap_converter
 
-    # Stage 3: History 全模块 (128) - 解冻编码器
-    - name: stage3_history_full
+    # A3: History + Action 全模块微调 (128)
+    - name: stage_a3_history_action_full
       epochs: 10
       hm_size: [128, 128]
       train_history: true
       train_future: false
+      train_action: true
       trainable_modules:
         - history_heatmap_converter
+        - action_head
         - feature_fusion
         - llm_projector
         - vggt
         - dinov3_compat
-      frozen_modules: []
+      frozen_modules:
+        - future_heatmap_converter
 
-    # Stage 4: Future 头预热 (128)
-    - name: stage4_future_warmup
+    # ============ 阶段 B: Future + Action ============
+    
+    # B1: Future + Action 头预热 (128)
+    - name: stage_b1_future_action_warmup
       epochs: 5
       hm_size: [128, 128]
       train_history: false
       train_future: true
+      train_action: true
       trainable_modules:
         - future_heatmap_converter
+        - action_head
         - feature_fusion
         - llm_projector
       frozen_modules:
         - vggt
         - dinov3_compat
-
-    # Stage 5: 联合训练 (128→224) - 双头+编码器
-    - name: stage5_joint_training
-      epochs: 15
-      hm_size: [224, 224]
-      train_history: true
-      train_future: true
-      trainable_modules:
         - history_heatmap_converter
+
+    # B2: Future + Action 提升分辨率 (128→224)
+    - name: stage_b2_future_action_224
+      epochs: 10
+      hm_size: [224, 224]
+      train_history: false
+      train_future: true
+      train_action: true
+      trainable_modules:
         - future_heatmap_converter
+        - action_head
         - feature_fusion
         - llm_projector
         - vggt
         - dinov3_compat
-      frozen_modules: []
+      frozen_modules:
+        - history_heatmap_converter
 
 # ============================================
 # 优化器配置
 # ============================================
 optim:
   optimizer: adamw
-  # train_full_model.py 需要的分组学习率
-  heatmap_lr: 1.0e-3               # 默认热力图 converter 学习率
-  history_heatmap_lr: 1.0e-3       # 可单独覆盖历史头
-  future_heatmap_lr: 1.0e-3        # 可单独覆盖未来头
+  # 分组学习率
+  heatmap_lr: 1.0e-3               # 热力图 converter 学习率
+  history_heatmap_lr: 1.0e-3       # 历史头
+  future_heatmap_lr: 1.0e-3        # 未来头
+  action_lr: 1.0e-3                # 动作头学习率
   fusion_lr: 5.0e-4                # feature_fusion + llm_projector
   encoder_lr: 1.0e-5               # vggt + dinov3_compat
 
@@ -135,9 +155,9 @@ optim:
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.05
-  batch_size: 1                     # 根据显存调整；必要时配合grad_accum_steps
-  grad_accum_steps: 1               # 
-  use_ddp: true
+  batch_size: 2                     # 滑动窗口数据集可以用更大 batch
+  grad_accum_steps: 4               # 有效 batch = 2 × 4 = 8
+  use_ddp: false
 
 # ============================================
 # 损失函数
@@ -148,36 +168,33 @@ loss:
   lambda_mse: 1.0
   lambda_kl: 0.2
   lambda_valid: 0.1
-  history_weight: 1.0               # History损失权重
-  future_weight: 1.0                # Future损失权重
+  
+  # 各头损失权重
+  history_weight: 1.0               # History 热力图损失权重
+  future_weight: 1.0                # Future 热力图损失权重
+  action_weight: 0.5                # 动作损失权重
 
 # ============================================
 # GPU配置
 # ============================================
 gpu:
-  devices: [0, 1]
+  devices: [0]
   backend: nccl
 
 # ============================================
 # 日志与保存
 # ============================================
 log:
-  out_dir: /root/autodl-tmp/vln_dual_head_outputs
+  out_dir: /root/autodl-tmp/vln_history_action_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   max_ckpts: 3
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs
-  log_every_steps: 10
-  log_images_every_steps: 50
-  use_wandb: false
-
-  # 训练日志配置
-  log_interval: 10              # 每 N 个 optimizer step 输出一次日志
-  show_gpu_memory: true         # 是否在日志中显示 GPU 内存
-  show_lr_all_groups: false     # 是否显示所有参数组的学习率（否则只显示第一个）
-  tqdm_ncols: 120              # tqdm 进度条宽度
-  log_level: INFO               # 日志级别：DEBUG/INFO/WARNING/ERROR
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
 
 # ============================================
 # 验证配置
