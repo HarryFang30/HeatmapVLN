@@ -39,10 +39,108 @@ warnings.filterwarnings("ignore")
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.models.spatial_mllm_compat import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
 from src.models.action import DiffusionActionHead, DiffusionActionConfig
-from src.utils.loss import NavigationHeatmapLoss
+from src.utils.loss import (
+    NavigationHeatmapLoss,
+    NeRFRippleHeatmapLoss,
+    SimplifiedHeatmapLoss,
+)
 from src.utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
+
+
+def build_heatmap_loss(loss_cfg: Dict, loss_type: str = None) -> nn.Module:
+    """
+    根据配置构建热力图损失函数。
+    
+    Args:
+        loss_cfg: 完整的 loss 配置字典
+        loss_type: 损失类型，覆盖配置中的默认值
+        
+    Returns:
+        nn.Module: 热力图损失函数
+    """
+    # 优先使用传入的 loss_type，否则使用配置默认值
+    loss_type = loss_type or loss_cfg.get('heatmap_loss_type', 'simplified')
+    
+    if loss_type == 'simplified':
+        params = loss_cfg.get('simplified', {})
+        return SimplifiedHeatmapLoss(
+            lambda_mse=params.get('lambda_mse', 1.0),
+            lambda_grad=params.get('lambda_grad', 0.3),
+            peak_weight=params.get('peak_weight', 5.0),
+        )
+    
+    elif loss_type == 'nerf_ripple':
+        params = loss_cfg.get('nerf_ripple', {})
+        return NeRFRippleHeatmapLoss(
+            lambda_mse=params.get('lambda_mse', 1.0),
+            lambda_fft=params.get('lambda_fft', 0.3),
+            lambda_radial=params.get('lambda_radial', 0.2),
+            lambda_peak=params.get('lambda_peak', 1.0),
+            fft_weight_decay=params.get('fft_weight_decay', 0.5),
+        )
+    
+    elif loss_type == 'navigation':
+        params = loss_cfg.get('navigation', {})
+        return NavigationHeatmapLoss(
+            alpha=params.get('alpha', 20.0),
+            lambda_mse=params.get('lambda_mse', 1.0),
+            lambda_kl=params.get('lambda_kl', 0.2),
+            lambda_valid=params.get('lambda_valid', 0.1),
+        )
+    
+    else:
+        raise ValueError(f"Unknown heatmap loss type: {loss_type}")
+
+
+def compute_heatmap_loss(
+    heatmap_criterion: nn.Module,
+    pred_heatmap: torch.Tensor,
+    gt_heatmap: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    """
+    统一的热力图损失计算函数，适配不同 Loss 类的接口。
+    
+    Args:
+        heatmap_criterion: 热力图损失函数
+        pred_heatmap: [B, H, W] 或 [B, 1, H, W] 预测热力图
+        gt_heatmap: [B, H, W] 或 [B, 1, H, W] GT 热力图
+        loss_type: 损失类型
+        
+    Returns:
+        torch.Tensor: 损失值
+    """
+    # 确保维度一致
+    if pred_heatmap.dim() == 3:
+        pred_hm = pred_heatmap.unsqueeze(1)
+    else:
+        pred_hm = pred_heatmap
+    
+    if gt_heatmap.dim() == 3:
+        gt_hm = gt_heatmap.unsqueeze(1)
+    else:
+        gt_hm = gt_heatmap
+    
+    if loss_type == 'navigation':
+        # NavigationHeatmapLoss 需要额外的 validity 参数
+        B = gt_hm.shape[0]
+        gt_validity = (gt_hm.view(B, -1).sum(dim=1) > 0.1).float().unsqueeze(1)
+        pred_validity = torch.ones_like(gt_validity)
+        
+        loss, _ = heatmap_criterion(
+            pred_logits=pred_hm,
+            gt_heatmap_raw=gt_hm,
+            pred_validity=pred_validity,
+            gt_validity=gt_validity,
+            smooth_gt=False,  # 保留波纹
+        )
+    else:
+        # SimplifiedHeatmapLoss 和 NeRFRippleHeatmapLoss 使用简单接口
+        loss, _ = heatmap_criterion(pred_hm, gt_hm)
+    
+    return loss
 
 
 # ============================================
@@ -451,9 +549,9 @@ def train_one_epoch(
             
             # ========== 热力图损失 ==========
             heatmap_loss = torch.tensor(0.0, device=device)
+            loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
             
             if train_history:
-                # 使用 history_heatmaps 的第一帧（当前帧中历史帧的位置）
                 pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
                 if pred_heatmap is not None:
                     # 取最后一帧的预测（对应当前帧）
@@ -468,25 +566,14 @@ def train_one_epoch(
                             align_corners=False
                         ).squeeze(1)
                     
-                    # 准备 NavigationHeatmapLoss 输入
-                    pred_logits = pred_hm.unsqueeze(1)  # [B, 1, H, W]
-                    gt_hm_input = gt_heatmap.unsqueeze(1)  # [B, 1, H, W]
-                    
-                    # 有效性标签（热力图非空则有效）
-                    gt_validity = (gt_heatmap.view(B, -1).sum(dim=1) > 0.1).float().unsqueeze(1)  # [B, 1]
-                    pred_validity = torch.ones_like(gt_validity)  # 假设预测总是有效
-                    
-                    heatmap_loss, _ = heatmap_criterion(
-                        pred_logits=pred_logits,
-                        gt_heatmap_raw=gt_hm_input,
-                        pred_validity=pred_validity,
-                        gt_validity=gt_validity
+                    # 使用统一的损失计算函数
+                    heatmap_loss = compute_heatmap_loss(
+                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
                     )
             
             if train_future:
                 pred_fut = output.get('future_heatmaps')
                 if pred_fut is not None:
-                    # 类似处理（这里暂时使用相同 GT，实际应该有不同的 GT）
                     pred_hm = pred_fut[:, -1, :, :]
                     if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
                         pred_hm = torch.nn.functional.interpolate(
@@ -496,16 +583,8 @@ def train_one_epoch(
                             align_corners=False
                         ).squeeze(1)
                     
-                    pred_logits = pred_hm.unsqueeze(1)
-                    gt_hm_input = gt_heatmap.unsqueeze(1)
-                    gt_validity = (gt_heatmap.view(B, -1).sum(dim=1) > 0.1).float().unsqueeze(1)
-                    pred_validity = torch.ones_like(gt_validity)
-                    
-                    fut_loss, _ = heatmap_criterion(
-                        pred_logits=pred_logits,
-                        gt_heatmap_raw=gt_hm_input,
-                        pred_validity=pred_validity,
-                        gt_validity=gt_validity
+                    fut_loss = compute_heatmap_loss(
+                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
                     )
                     heatmap_loss = heatmap_loss + fut_loss
             
@@ -605,7 +684,7 @@ def validate(
     model: SpatialMLLMPipeline,
     val_loader: DataLoader,
     cfg: Dict,
-    heatmap_criterion: NavigationHeatmapLoss,
+    heatmap_criterion: nn.Module,
     logger,
     stage_cfg: Dict,
     tb_writer: Optional[SummaryWriter] = None,
@@ -623,6 +702,7 @@ def validate(
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
+    loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
     
     device = torch.device(cfg['model']['llm_gpu'])
     
@@ -669,16 +749,8 @@ def validate(
                         align_corners=False
                     ).squeeze(1)
                 
-                pred_logits = pred_hm.unsqueeze(1)
-                gt_hm_input = gt_heatmap.unsqueeze(1)
-                gt_validity = (gt_heatmap.view(B, -1).sum(dim=1) > 0.1).float().unsqueeze(1)
-                pred_validity = torch.ones_like(gt_validity)
-                
-                heatmap_loss, _ = heatmap_criterion(
-                    pred_logits=pred_logits,
-                    gt_heatmap_raw=gt_hm_input,
-                    pred_validity=pred_validity,
-                    gt_validity=gt_validity
+                heatmap_loss = compute_heatmap_loss(
+                    heatmap_criterion, pred_hm, gt_heatmap, loss_type
                 )
             
             action_loss = torch.tensor(0.0, device=device)
@@ -781,14 +853,10 @@ def main():
         tb_writer = SummaryWriter(log_dir=str(tb_dir / f'history_action_{timestamp}'))
         logger.info(f"📊 TensorBoard: {tb_dir / f'history_action_{timestamp}'}")
     
-    # 损失函数
+    # 损失函数配置（每个阶段可能不同）
     loss_cfg = cfg['loss']
-    heatmap_criterion = NavigationHeatmapLoss(
-        alpha=loss_cfg['alpha'],
-        lambda_mse=loss_cfg['lambda_mse'],
-        lambda_kl=loss_cfg['lambda_kl'],
-        lambda_valid=loss_cfg['lambda_valid']
-    )
+    default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
+    logger.info(f"📊 Default heatmap loss type: {default_loss_type}")
     
     logger.info("=" * 60)
     logger.info("History + Action 训练")
@@ -840,6 +908,12 @@ def main():
         val_dataset.hm_size = hm_size
         if hasattr(model, 'update_heatmap_size'):
             model.update_heatmap_size(hm_size)
+        
+        # 构建本阶段的热力图损失函数
+        stage_loss_type = stage_cfg.get('heatmap_loss_type', default_loss_type)
+        heatmap_criterion = build_heatmap_loss(loss_cfg, stage_loss_type)
+        logger.info(f"  🎯 Heatmap loss: {stage_loss_type} ({type(heatmap_criterion).__name__})")
+        
         logger.info(f"  Heatmap size: {hm_size}")
         logger.info(f"  Train history: {stage_cfg.get('train_history', True)}")
         logger.info(f"  Train future: {stage_cfg.get('train_future', False)}")

@@ -56,10 +56,11 @@ model:
 training:
   stages:
     # ============ Stage 1: Warmup (64x64) ============
-    # 预热阶段：小分辨率，只训练 heads
+    # 预热阶段：小分辨率，只训练 heads，使用简化 Loss
     - name: warmup_64
       epochs: 5
       hm_size: [64, 64]
+      heatmap_loss_type: simplified     # Warmup 使用简化 Loss
       train_history: true
       train_future: false
       train_action: true
@@ -74,10 +75,11 @@ training:
         - llm_projector
       
     # ============ Stage 2: Mid (128x128) ============
-    # 中间阶段：提升分辨率，解冻更多模块
+    # 中间阶段：提升分辨率，解冻更多模块，使用完整 Loss
     - name: mid_128
       epochs: 10
       hm_size: [128, 128]
+      heatmap_loss_type: nerf_ripple    # 切换到 NeRF 波纹 Loss
       train_history: true
       train_future: true
       train_action: true
@@ -96,6 +98,7 @@ training:
     - name: full_224
       epochs: 20
       hm_size: [224, 224]
+      heatmap_loss_type: nerf_ripple    # 继续使用 NeRF 波纹 Loss
       train_history: true
       train_future: true
       train_action: true
@@ -135,11 +138,33 @@ optim:
 # 损失函数
 # ============================================
 loss:
-  type: navigation_heatmap
-  alpha: 20.0
-  lambda_mse: 1.0
-  lambda_kl: 0.2
-  lambda_valid: 0.1
+  # 热力图损失类型选择：
+  # - simplified: SimplifiedHeatmapLoss (warmup 推荐)
+  # - nerf_ripple: NeRFRippleHeatmapLoss (完整训练推荐)
+  # - navigation: NavigationHeatmapLoss (原版，会平滑 GT)
+  heatmap_loss_type: simplified         # 默认使用简化版
+  
+  # SimplifiedHeatmapLoss 参数
+  simplified:
+    lambda_mse: 1.0
+    lambda_grad: 0.3
+    peak_weight: 5.0
+  
+  # NeRFRippleHeatmapLoss 参数
+  nerf_ripple:
+    lambda_mse: 1.0
+    lambda_fft: 0.3                     # 频域损失（保持波纹结构）
+    lambda_radial: 0.2                  # 径向梯度损失（同心圆）
+    lambda_peak: 1.0                    # 峰值定位损失
+    fft_weight_decay: 0.5               # 高频权重衰减
+  
+  # NavigationHeatmapLoss 参数（原版，不推荐）
+  navigation:
+    alpha: 20.0
+    lambda_mse: 1.0
+    lambda_kl: 0.2
+    lambda_valid: 0.1
+    smooth_gt: false                    # 设为 false 保留波纹
   
   # 各头损失权重
   history_weight: 1.0                   # History 热力图损失权重
