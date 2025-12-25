@@ -61,7 +61,7 @@ training:
     # ============ Stage 1: History 预热 (64x64) ============
     # 预热 History head + Action head + Fusion
     - name: warmup_history_64
-      epochs: 3
+      epochs: 2                         # 减少: 3 → 2
       hm_size: [64, 64]
       heatmap_loss_type: simplified     # Warmup 使用简化 Loss
       train_history: true
@@ -80,7 +80,7 @@ training:
     # ============ Stage 2: Future 预热 (64x64) ============
     # 预热 Future head，冻结 History 让 Future 赶上
     - name: warmup_future_64
-      epochs: 3
+      epochs: 2                         # 减少: 3 → 2
       hm_size: [64, 64]
       heatmap_loss_type: simplified     # 继续使用简化 Loss
       train_history: false              # 冻结 History，让 Future 赶上
@@ -99,7 +99,7 @@ training:
     # ============ Stage 3: 联合训练 (128x128) ============
     # 中间阶段：提升分辨率，双 head 联合训练，使用完整 Loss
     - name: joint_128
-      epochs: 10
+      epochs: 5                         # 减少: 10 → 5
       hm_size: [128, 128]
       heatmap_loss_type: nerf_ripple    # 切换到 NeRF 波纹 Loss
       train_history: true
@@ -118,7 +118,7 @@ training:
     # ============ Stage 4: 精细训练 (224x224) ============
     # 完整训练：大分辨率，解冻 LLM Projector
     - name: full_224
-      epochs: 20
+      epochs: 10                        # 减少: 20 → 10
       hm_size: [224, 224]
       heatmap_loss_type: nerf_ripple    # 继续使用 NeRF 波纹 Loss
       train_history: true

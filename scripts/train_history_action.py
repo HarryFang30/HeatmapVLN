@@ -625,7 +625,7 @@ def build_model(cfg: Dict) -> nn.Module:
         action_encoding_size=model_cfg['action_head']['encoding_size'],
         action_num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
 
-        verbose=True
+        verbose=False  # 关闭冗余日志，加快训练
     )
     
     model = SpatialMLLMPipeline(pipeline_config)
