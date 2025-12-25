@@ -119,7 +119,7 @@ class DiffusionHeatmapHead(nn.Module):
         Forward pass for heatmap generation.
         
         Args:
-            llm_tokens: (B, seq_len, llm_dim) or (B, llm_dim) LLM features
+            llm_tokens: (B, ..., llm_dim) LLM features (any shape, will be pooled)
             observation: (B, C, H, W) observation image
             gt_heatmap: Optional (B, Hm, Wm) ground truth heatmap for training
             return_loss: If True and gt_heatmap provided, return loss dict
@@ -130,14 +130,22 @@ class DiffusionHeatmapHead(nn.Module):
             Else:
                 (B, Hm, Wm) predicted heatmap
         """
-        # 1. Encode conditions
+        # 1. Preprocess llm_tokens to (B, D) by mean pooling
+        if llm_tokens.dim() > 2:
+            # Pool all intermediate dimensions: (B, K, seq_len, D) -> (B, D)
+            # or (B, seq_len, D) -> (B, D)
+            B = llm_tokens.shape[0]
+            D = llm_tokens.shape[-1]
+            llm_tokens = llm_tokens.reshape(B, -1, D).mean(dim=1)  # (B, D)
+        
+        # 2. Encode conditions
         cond = self.condition_encoder(llm_tokens, observation)  # (B, cond_dim)
         
-        # 2. Training mode
+        # 3. Training mode
         if gt_heatmap is not None and return_loss:
             return self._compute_training_loss(cond, gt_heatmap)
         
-        # 3. Inference mode
+        # 4. Inference mode
         heatmap = self._diffusion_inference(cond)
         
         if return_loss:

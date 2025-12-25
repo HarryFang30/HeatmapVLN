@@ -51,14 +51,14 @@ model:
     encoding_size: 768                  # 条件投影维度
 
 # ============================================
-# 训练策略（Warmup → Full 三阶段）
+# 训练策略（4 阶段渐进式训练）
 # ============================================
 training:
   stages:
-    # ============ Stage 1: Warmup (64x64) ============
-    # 预热阶段：小分辨率，训练 heads + fusion（heads 需要适配的输入）
-    - name: warmup_64
-      epochs: 5
+    # ============ Stage 1: History 预热 (64x64) ============
+    # 预热 History head + Action head + Fusion
+    - name: warmup_history_64
+      epochs: 3
       hm_size: [64, 64]
       heatmap_loss_type: simplified     # Warmup 使用简化 Loss
       train_history: true
@@ -74,9 +74,28 @@ training:
         - future_heatmap_head
         - llm_projector
       
-    # ============ Stage 2: Mid (128x128) ============
-    # 中间阶段：提升分辨率，解冻更多模块，使用完整 Loss
-    - name: mid_128
+    # ============ Stage 2: Future 预热 (64x64) ============
+    # 预热 Future head，冻结 History 让 Future 赶上
+    - name: warmup_future_64
+      epochs: 3
+      hm_size: [64, 64]
+      heatmap_loss_type: simplified     # 继续使用简化 Loss
+      train_history: false              # 冻结 History，让 Future 赶上
+      train_future: true
+      train_action: true
+      trainable_modules:
+        - future_heatmap_head
+        - action_head
+        - feature_fusion
+      frozen_modules:
+        - vggt
+        - dinov3_compat
+        - history_heatmap_head          # 暂时冻结 History
+        - llm_projector
+      
+    # ============ Stage 3: 联合训练 (128x128) ============
+    # 中间阶段：提升分辨率，双 head 联合训练，使用完整 Loss
+    - name: joint_128
       epochs: 10
       hm_size: [128, 128]
       heatmap_loss_type: nerf_ripple    # 切换到 NeRF 波纹 Loss
@@ -93,8 +112,8 @@ training:
         - dinov3_compat
         - llm_projector
       
-    # ============ Stage 3: Full (224x224) ============
-    # 完整训练：大分辨率，解冻所有可训练模块
+    # ============ Stage 4: 精细训练 (224x224) ============
+    # 完整训练：大分辨率，解冻 LLM Projector
     - name: full_224
       epochs: 20
       hm_size: [224, 224]

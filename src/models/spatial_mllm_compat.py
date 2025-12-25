@@ -237,7 +237,7 @@ class SpatialMLLMPipeline(nn.Module):
             action_config = DiffusionActionConfig(
                 action_dim=config.action_dim,
                 pred_horizon=config.action_pred_horizon,
-                cond_dim=config.feature_fusion_dim,  # Use fused features as condition
+                cond_dim=config.llm_token_dim,  # Use projected LLM tokens as condition
                 encoding_size=config.action_encoding_size,
                 num_diffusion_iters=config.action_num_diffusion_iters,
                 action_stats_min=config.action_stats_min or [-1.07, -1.05],

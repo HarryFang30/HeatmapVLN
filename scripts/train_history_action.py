@@ -772,8 +772,9 @@ def validate(
             
             action_loss = torch.tensor(0.0, device=device)
             if train_action and 'action_loss' in output:
-                if action_valid.sum() > 0:
-                    action_loss = output['action_loss']
+                action_loss_val = output.get('action_loss')
+                if action_loss_val is not None and action_valid.sum() > 0:
+                    action_loss = action_loss_val
             
             heatmap_weight = loss_cfg.get('history_weight', 1.0)
             action_weight = loss_cfg.get('action_weight', 0.5)
