@@ -420,12 +420,30 @@ def train_one_epoch(
         action_valid = batch['action_valid'].to(device) # [B]
         text = batch['text']
         
+        # 处理导航指令
+        # 注意：Qwen2.5-VL 当前只支持单一指令输入
+        # 如果 batch 中有不同指令，合并为一个（用分隔符连接）
+        if text and len(text) > 0:
+            unique_texts = list(set(t for t in text if t))  # 去重非空指令
+            if len(unique_texts) == 0:
+                instruction_text = None
+            elif len(unique_texts) == 1:
+                instruction_text = unique_texts[0]
+            else:
+                # 多个不同指令：合并（实际场景中同一 batch 的指令通常相同）
+                instruction_text = unique_texts[0]  # 使用第一个非空指令
+                if i == 0:  # 只在第一个 batch 警告一次
+                    logger.warning(f"Batch contains {len(unique_texts)} different instructions, using first one")
+        else:
+            instruction_text = None
+        
         # 前向传播
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             # 模型前向
             output = model(
                 video_frames=video_frames,
-                instruction_text=text[0] if (text and len(text) > 0) else None,
+                instruction_text=instruction_text,
+                current_observation=current_frame.to(device),  # 显式传递当前观测
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,  # [B, 1, 2]
@@ -623,10 +641,18 @@ def validate(
         action_valid = batch['action_valid'].to(device)
         text = batch['text']
         
+        # 处理导航指令（与训练一致）
+        if text and len(text) > 0:
+            unique_texts = list(set(t for t in text if t))
+            instruction_text = unique_texts[0] if unique_texts else None
+        else:
+            instruction_text = None
+        
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             output = model(
                 video_frames=video_frames,
-                instruction_text=text[0] if (text and len(text) > 0) else None,
+                instruction_text=instruction_text,
+                current_observation=current_frame.to(device),
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,

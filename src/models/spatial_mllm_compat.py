@@ -550,9 +550,10 @@ class SpatialMLLMPipeline(nn.Module):
         if return_actions and self.action_head is not None:
             logger.info("Step 7: Diffusion Policy action generation")
             try:
-                # Use fused features as condition for action generation
+                # Use LLM tokens as condition for action generation (same as heatmap heads)
+                # This ensures actions are based on language-enhanced spatial reasoning
                 # Pool over spatial and temporal dimensions: [B, N_k, L, D] -> [B, D]
-                action_cond = fused_features.mean(dim=(1, 2))  # [B, D]
+                action_cond = llm_tokens.mean(dim=(1, 2))  # [B, D]
                 
                 # Move to action head device
                 action_device = next(self.action_head.parameters()).device
