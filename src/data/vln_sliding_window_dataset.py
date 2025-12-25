@@ -276,6 +276,7 @@ class VLNSlidingWindowDataset(Dataset):
         hm_size: Tuple[int, int] = (64, 64),
         load_depth: bool = True,
         cache_poses: bool = True,
+        sample_stride: int = 1,  # 采样步长：每隔 N 帧采样一次，1 表示不跳过
     ):
         self.root = Path(root)
         self.split = split
@@ -285,6 +286,7 @@ class VLNSlidingWindowDataset(Dataset):
         self.hm_size = hm_size        # (W, H)
         self.load_depth = load_depth
         self.cache_poses = cache_poses
+        self.sample_stride = max(1, sample_stride)  # 采样步长
         
         # 枚举所有 clips
         self.clips = self._enumerate_clips()
@@ -299,7 +301,7 @@ class VLNSlidingWindowDataset(Dataset):
         logger.info(
             f"VLNSlidingWindowDataset initialized: {len(self.clips)} clips, "
             f"{len(self.sample_index)} samples, min_history={min_history}, "
-            f"num_history_sample={num_history_sample}"
+            f"num_history_sample={num_history_sample}, sample_stride={self.sample_stride}"
         )
     
     def _enumerate_clips(self) -> List[Path]:
@@ -364,7 +366,12 @@ class VLNSlidingWindowDataset(Dataset):
         return poses
     
     def _build_sample_index(self):
-        """预计算所有样本的全局索引"""
+        """预计算所有样本的全局索引
+        
+        使用 sample_stride 控制采样密度：
+        - stride=1: 每帧都作为样本（默认）
+        - stride=5: 每隔 5 帧采样一次（样本数减少 5 倍）
+        """
         self.sample_index = []
         
         for clip_idx, clip_dir in enumerate(self.clips):
@@ -373,15 +380,19 @@ class VLNSlidingWindowDataset(Dataset):
                 T = meta["num_frames"]
                 
                 # 每个 clip 可生成 T - min_history 个样本
-                # 当前帧从 min_history 开始，到 T-1 结束（最后一帧可以没有动作）
-                for t in range(self.min_history, T):
+                # 当前帧从 min_history 开始，到 T-1 结束
+                # 使用 sample_stride 跳过部分帧
+                for t in range(self.min_history, T, self.sample_stride):
                     self.sample_index.append((clip_idx, t))
                     
             except Exception as e:
                 logger.warning(f"Failed to index clip {clip_dir}: {e}")
                 continue
         
-        logger.info(f"Built sample index: {len(self.sample_index)} samples from {len(self.clips)} clips")
+        logger.info(
+            f"Built sample index: {len(self.sample_index)} samples from {len(self.clips)} clips "
+            f"(stride={self.sample_stride})"
+        )
     
     def __len__(self) -> int:
         return len(self.sample_index)

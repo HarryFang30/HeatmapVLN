@@ -20,6 +20,7 @@ data:
     num_history_sample: 8               # 从历史中采样的帧数
     load_depth: true                    # 是否加载深度用于遮挡检测
     cache_poses: true                   # 是否缓存位姿
+    sample_stride: 5                    # 采样步长：每隔 N 帧采样一次，减少训练时间
 
 # ============================================
 # 模型配置

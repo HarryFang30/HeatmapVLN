@@ -1479,6 +1479,9 @@ def main():
     logger.info("📂 Loading datasets (VLNSlidingWindowDataset)...")
     sw_cfg = cfg['data']['sliding_window']
     
+    # 采样步长：控制训练速度（stride=5 表示样本数减少 5 倍）
+    sample_stride = sw_cfg.get('sample_stride', 1)
+    
     train_dataset = VLNSlidingWindowDataset(
         root=cfg['data']['root'],
         split='train',
@@ -1488,6 +1491,7 @@ def main():
         hm_size=tuple(cfg['data']['init_hm_size']),
         load_depth=sw_cfg.get('load_depth', True),
         cache_poses=sw_cfg.get('cache_poses', True),
+        sample_stride=sample_stride,
     )
     
     val_split = cfg['data'].get('val_split', 'val')  # 支持 val_unseen 等
@@ -1500,6 +1504,7 @@ def main():
         hm_size=tuple(cfg['data']['init_hm_size']),
         load_depth=sw_cfg.get('load_depth', True),
         cache_poses=sw_cfg.get('cache_poses', True),
+        sample_stride=sample_stride,  # 验证集也使用相同步长
     )
     
     logger.info(f"  Train: {len(train_dataset)} samples")
