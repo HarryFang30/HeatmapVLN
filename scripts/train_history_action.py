@@ -25,12 +25,10 @@ import yaml
 import torch
 
 # ============================================
-# CUDA 性能优化 (针对大显存 GPU 如 H100/A100)
+# CUDA 性能优化
 # ============================================
 torch.backends.cudnn.benchmark = True  # 自动选择最优卷积算法
-torch.backends.cuda.matmul.allow_tf32 = True  # 启用 TF32 矩阵乘法（A100/H100）
-torch.backends.cudnn.allow_tf32 = True  # 启用 TF32 卷积
-torch.set_float32_matmul_precision('high')  # 矩阵乘法精度（high 更快，medium 更精确）
+torch.set_float32_matmul_precision('medium')  # 矩阵乘法精度优化（A100/H100）
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
