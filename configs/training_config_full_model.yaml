@@ -7,7 +7,7 @@ data:
   root: /root/autodl-tmp/dataset_with_actions
   image_size: [224, 224]
   init_hm_size: [64, 64]                # 起始分辨率
-  num_workers: 8
+  num_workers: 4                        # 减少 workers 避免 CPU 竞争
   pin_memory: true
   prefetch_factor: 2
   
@@ -56,7 +56,7 @@ model:
 training:
   stages:
     # ============ Stage 1: Warmup (64x64) ============
-    # 预热阶段：小分辨率，只训练 heads，使用简化 Loss
+    # 预热阶段：小分辨率，训练 heads + fusion（heads 需要适配的输入）
     - name: warmup_64
       epochs: 5
       hm_size: [64, 64]
@@ -67,11 +67,11 @@ training:
       trainable_modules:
         - history_heatmap_head
         - action_head
+        - feature_fusion                # 解冻 fusion，让 heads 有合适的输入
       frozen_modules:
         - vggt
         - dinov3_compat
         - future_heatmap_head
-        - feature_fusion
         - llm_projector
       
     # ============ Stage 2: Mid (128x128) ============
@@ -117,20 +117,22 @@ training:
 # ============================================
 optim:
   optimizer: adamw
-  # 分组学习率
-  heatmap_lr: 1.0e-3                    # 热力图头默认学习率
-  history_heatmap_lr: 1.0e-3            # 历史头
-  future_heatmap_lr: 1.0e-3             # 未来头
-  action_lr: 1.0e-3                     # 动作头学习率
-  fusion_lr: 5.0e-4                     # feature_fusion + llm_projector
-  encoder_lr: 1.0e-5                    # vggt + dinov3_compat
+  
+  # 分组学习率（针对 Diffusion 模型调优）
+  # Diffusion 模型推荐 LR: 1e-4 ~ 3e-4
+  heatmap_lr: 3.0e-4                    # 热力图头默认学习率
+  history_heatmap_lr: 3.0e-4            # 历史头（Diffusion）
+  future_heatmap_lr: 3.0e-4             # 未来头（Diffusion）
+  action_lr: 3.0e-4                     # 动作头（Diffusion）
+  fusion_lr: 1.0e-4                     # feature_fusion + llm_projector
+  encoder_lr: 1.0e-5                    # vggt + dinov3_compat（冻结或微调）
 
-  weight_decay: 1.0e-2
+  weight_decay: 1.0e-4                   # 降低 weight decay，对 Diffusion 更友好
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
-  warmup_ratio: 0.05
-  batch_size: 2                         # 滑动窗口数据集可以用更大 batch
+  warmup_ratio: 0.1                     # Warmup 比例 10%
+  batch_size: 2                         # 滑动窗口数据集
   grad_accum_steps: 4                   # 有效 batch = 2 × 4 = 8
   use_ddp: false
 
