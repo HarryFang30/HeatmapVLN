@@ -84,8 +84,9 @@ class SpatialMLLMIntegrationConfig:
     action_stats_min: List[float] = None  # Will use defaults if None
     action_stats_max: List[float] = None  # Will use defaults if None
     
-    # Diffusion Heatmap Generation (alternative to converter-based heatmaps)
-    enable_diffusion_heatmap: bool = False  # Enable diffusion-based heatmap generation
+    # Diffusion Heatmap Generation (dual-head architecture)
+    enable_history_heatmap_head: bool = False  # Enable history diffusion heatmap head
+    enable_future_heatmap_head: bool = False   # Enable future diffusion heatmap head
     diffusion_heatmap_cond_dim: int = 512  # Condition dimension for diffusion
     diffusion_heatmap_num_inference_steps: int = 10  # Diffusion inference steps
     
@@ -248,23 +249,35 @@ class SpatialMLLMPipeline(nn.Module):
         else:
             self.action_head = None
         
-        # Initialize Diffusion Heatmap Head (alternative to converter-based heatmaps)
-        if config.enable_diffusion_heatmap:
-            logger.info("Initializing Diffusion Heatmap Head for spatial heatmap generation")
-            heatmap_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
-            diffusion_heatmap_config = DiffusionHeatmapConfig(
-                llm_dim=config.llm_token_dim,
-                cond_dim=config.diffusion_heatmap_cond_dim,
-                heatmap_size=config.heatmap_size,
-                num_inference_steps=config.diffusion_heatmap_num_inference_steps,
-                image_size=(config.dinov3_img_size, config.dinov3_img_size),
-            )
-            self.diffusion_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
+        # Initialize Dual Diffusion Heatmap Heads (history and future)
+        heatmap_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
+        diffusion_heatmap_config = DiffusionHeatmapConfig(
+            llm_dim=config.llm_token_dim,
+            cond_dim=config.diffusion_heatmap_cond_dim,
+            heatmap_size=config.heatmap_size,
+            num_inference_steps=config.diffusion_heatmap_num_inference_steps,
+            image_size=(config.dinov3_img_size, config.dinov3_img_size),
+        )
+        
+        # History Heatmap Head
+        if config.enable_history_heatmap_head:
+            logger.info("Initializing History Diffusion Heatmap Head")
+            self.history_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
                 device=heatmap_device, dtype=config.dtype
             )
-            logger.info(f"Diffusion Heatmap Head initialized on {heatmap_device}")
+            logger.info(f"History Heatmap Head initialized on {heatmap_device}")
         else:
-            self.diffusion_heatmap_head = None
+            self.history_heatmap_head = None
+            
+        # Future Heatmap Head
+        if config.enable_future_heatmap_head:
+            logger.info("Initializing Future Diffusion Heatmap Head")
+            self.future_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
+                device=heatmap_device, dtype=config.dtype
+            )
+            logger.info(f"Future Heatmap Head initialized on {heatmap_device}")
+        else:
+            self.future_heatmap_head = None
             
         # Performance optimization
         if config.enable_gradient_checkpointing:
@@ -472,23 +485,39 @@ class SpatialMLLMPipeline(nn.Module):
             logger.warning("   🎯 Heatmaps based on pure VGGT+DINOv3 spatial features")
             llm_tokens = self.llm_projector(fused_features)
         
-        # Step 6: Generate heatmaps using Diffusion Heatmap Head
-        diffusion_heatmap = None
-        if return_heatmaps and self.diffusion_heatmap_head is not None:
-            logger.info("Step 6: Diffusion-based heatmap generation")
-            heatmap_device = next(self.diffusion_heatmap_head.parameters()).device
+        # Step 6: Generate heatmaps using Dual Diffusion Heatmap Heads
+        history_heatmap = None
+        future_heatmap = None
+        
+        if return_heatmaps:
+            # Prepare inputs for heatmap heads
+            if self.history_heatmap_head is not None or self.future_heatmap_head is not None:
+                # Get device from whichever head is available
+                if self.history_heatmap_head is not None:
+                    heatmap_device = next(self.history_heatmap_head.parameters()).device
+                else:
+                    heatmap_device = next(self.future_heatmap_head.parameters()).device
+                    
+                llm_tokens_for_heatmap = llm_tokens.to(heatmap_device)
+                observation_for_heatmap = current_observation.to(heatmap_device)
             
-            # Prepare inputs for diffusion heatmap head
-            llm_tokens_for_heatmap = llm_tokens.to(heatmap_device)
-            observation_for_heatmap = current_observation.to(heatmap_device)
+            # Generate History Heatmap
+            if self.history_heatmap_head is not None:
+                logger.info("Step 6a: History heatmap generation")
+                history_heatmap = self.history_heatmap_head(
+                    llm_tokens=llm_tokens_for_heatmap,
+                    observation=observation_for_heatmap,
+                )  # [B, Hm, Wm]
+                logger.info(f"History heatmap generated: {history_heatmap.shape}")
             
-            # Generate heatmap
-            diffusion_heatmap = self.diffusion_heatmap_head(
-                llm_tokens=llm_tokens_for_heatmap,
-                observation=observation_for_heatmap,
-            )  # [B, Hm, Wm]
-            
-            logger.info(f"Diffusion heatmap generated: {diffusion_heatmap.shape}")
+            # Generate Future Heatmap
+            if self.future_heatmap_head is not None:
+                logger.info("Step 6b: Future heatmap generation")
+                future_heatmap = self.future_heatmap_head(
+                    llm_tokens=llm_tokens_for_heatmap,
+                    observation=observation_for_heatmap,
+                )  # [B, Hm, Wm]
+                logger.info(f"Future heatmap generated: {future_heatmap.shape}")
         
         # Prepare output
         output = {
@@ -511,11 +540,11 @@ class SpatialMLLMPipeline(nn.Module):
             }
         }
         
-        if diffusion_heatmap is not None:
-            output['heatmap'] = diffusion_heatmap  # [B, Hm, Wm]
-            # For backward compatibility
-            output['history_heatmaps'] = diffusion_heatmap.unsqueeze(1)  # [B, 1, Hm, Wm]
-            output['future_heatmaps'] = diffusion_heatmap.unsqueeze(1)   # [B, 1, Hm, Wm]
+        # Add heatmaps to output
+        if history_heatmap is not None:
+            output['history_heatmaps'] = history_heatmap.unsqueeze(1)  # [B, 1, Hm, Wm]
+        if future_heatmap is not None:
+            output['future_heatmaps'] = future_heatmap.unsqueeze(1)    # [B, 1, Hm, Wm]
             
         # Step 7: Generate navigation actions using Diffusion Policy (parallel with heatmaps)
         if return_actions and self.action_head is not None:

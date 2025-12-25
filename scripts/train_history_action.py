@@ -119,9 +119,14 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
 
 def build_model(cfg: Dict) -> nn.Module:
     """
-    构建完整模型（SpatialMLLMPipeline + DiffusionActionHead）
+    构建完整模型（SpatialMLLMPipeline + Dual Heatmap Heads + ActionHead）
     """
     model_cfg = cfg['model']
+    
+    # 获取热力图头配置
+    heatmap_cfg = model_cfg.get('heatmap_head', {})
+    enable_history = heatmap_cfg.get('enable_history', True)
+    enable_future = heatmap_cfg.get('enable_future', True)
     
     # 构建 SpatialMLLMPipeline 配置
     pipeline_config = SpatialMLLMIntegrationConfig(
@@ -144,6 +149,12 @@ def build_model(cfg: Dict) -> nn.Module:
         # Heatmap settings
         heatmap_size=tuple(cfg['data']['init_hm_size']),
         enable_inter_frame_heatmaps=True,
+        
+        # Dual Heatmap Heads (Diffusion-based)
+        enable_history_heatmap_head=enable_history,
+        enable_future_heatmap_head=enable_future,
+        diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
+        diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
 
         # Image sizes
         dinov3_img_size=cfg['data']['image_size'][0],
@@ -153,24 +164,23 @@ def build_model(cfg: Dict) -> nn.Module:
         enable_gradient_checkpointing=cfg['optim'].get('gradient_checkpointing', False),
 
         # Diffusion Action Head
-        enable_diffusion_action_head=model_cfg['action_head']['enable'],
-        diffusion_action_config=DiffusionActionConfig(
-            cond_dim=model_cfg['action_head']['cond_dim'],
-            action_dim=model_cfg['action_head']['action_dim'],
-            pred_horizon=model_cfg['action_head']['pred_horizon'],
-            num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
-            encoding_size=model_cfg['action_head']['encoding_size'],
-        ),
+        enable_action_head=model_cfg['action_head']['enable'],
+        action_dim=model_cfg['action_head']['action_dim'],
+        action_pred_horizon=model_cfg['action_head']['pred_horizon'],
+        action_encoding_size=model_cfg['action_head']['encoding_size'],
+        action_num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
 
         verbose=True
     )
     
     model = SpatialMLLMPipeline(pipeline_config)
     
-    print(f"✅ 模型已构建：SpatialMLLMPipeline + DiffusionActionHead")
+    print(f"✅ 模型已构建：SpatialMLLMPipeline + Dual Heatmap Heads + ActionHead")
     print(f"   VGGT → {model_cfg['vggt_gpu']}")
     print(f"   DINOv3 → {model_cfg['dinov3_gpu']}")
     print(f"   Qwen2.5-VL → {model_cfg['llm_gpu']} (frozen)")
+    print(f"   HistoryHeatmapHead → enabled={enable_history}")
+    print(f"   FutureHeatmapHead → enabled={enable_future}")
     print(f"   ActionHead → enabled={model_cfg['action_head']['enable']}")
     
     return model
@@ -190,22 +200,23 @@ def set_trainable_modules(model: SpatialMLLMPipeline, stage_cfg: Dict, logger):
     # 2) 根据配置解冻特定模块
     trainable = stage_cfg.get('trainable_modules', [])
     
-    # Heatmap converters
-    if 'history_heatmap_converter' in trainable:
-        if hasattr(model, 'history_heatmap_converter'):
-            freeze_module(model.history_heatmap_converter, freeze=False)
-            logger.info("  ✓ Unfrozen: history_heatmap_converter")
+    # History Heatmap Head (Diffusion)
+    if 'history_heatmap_head' in trainable:
+        if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
+            freeze_module(model.history_heatmap_head, freeze=False)
+            logger.info("  ✓ Unfrozen: history_heatmap_head")
             
-    if 'future_heatmap_converter' in trainable:
-        if hasattr(model, 'future_heatmap_converter'):
-            freeze_module(model.future_heatmap_converter, freeze=False)
-            logger.info("  ✓ Unfrozen: future_heatmap_converter")
+    # Future Heatmap Head (Diffusion)
+    if 'future_heatmap_head' in trainable:
+        if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
+            freeze_module(model.future_heatmap_head, freeze=False)
+            logger.info("  ✓ Unfrozen: future_heatmap_head")
     
     # Action head
     if 'action_head' in trainable:
-        if hasattr(model, 'diffusion_action_head') and model.diffusion_action_head is not None:
-            freeze_module(model.diffusion_action_head, freeze=False)
-            logger.info("  ✓ Unfrozen: diffusion_action_head")
+        if hasattr(model, 'action_head') and model.action_head is not None:
+            freeze_module(model.action_head, freeze=False)
+            logger.info("  ✓ Unfrozen: action_head")
     
     # Feature fusion & projector
     if 'feature_fusion' in trainable:
@@ -239,34 +250,34 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
     optim_cfg = cfg['optim']
     param_groups = []
     
-    # 1) 热力图转换器
-    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg['heatmap_lr'])
-    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg['heatmap_lr'])
+    # 1) 热力图头 (Diffusion-based)
+    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-3))
+    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-3))
     
-    if hasattr(model, 'history_heatmap_converter'):
-        hist_params = [p for p in model.history_heatmap_converter.parameters() if p.requires_grad]
+    if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
+        hist_params = [p for p in model.history_heatmap_head.parameters() if p.requires_grad]
         if hist_params:
             param_groups.append({
                 'params': hist_params,
                 'lr': hist_lr,
-                'name': 'history_heatmap_converter'
+                'name': 'history_heatmap_head'
             })
-            print(f"  Param group: history_heatmap_converter (lr={hist_lr})")
+            print(f"  Param group: history_heatmap_head (lr={hist_lr})")
     
-    if hasattr(model, 'future_heatmap_converter'):
-        fut_params = [p for p in model.future_heatmap_converter.parameters() if p.requires_grad]
+    if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
+        fut_params = [p for p in model.future_heatmap_head.parameters() if p.requires_grad]
         if fut_params:
             param_groups.append({
                 'params': fut_params,
                 'lr': fut_lr,
-                'name': 'future_heatmap_converter'
+                'name': 'future_heatmap_head'
             })
-            print(f"  Param group: future_heatmap_converter (lr={fut_lr})")
+            print(f"  Param group: future_heatmap_head (lr={fut_lr})")
     
     # 2) 动作头
     action_lr = optim_cfg.get('action_lr', 1e-3)
-    if hasattr(model, 'diffusion_action_head') and model.diffusion_action_head is not None:
-        action_params = [p for p in model.diffusion_action_head.parameters() if p.requires_grad]
+    if hasattr(model, 'action_head') and model.action_head is not None:
+        action_params = [p for p in model.action_head.parameters() if p.requires_grad]
         if action_params:
             param_groups.append({
                 'params': action_params,
