@@ -33,11 +33,20 @@ from ..utils.path_utils import resolve_model_path
 logger = logging.getLogger(__name__)
 
 
+# DINOv3 embedding dimensions by model size
+DINOV3_EMBED_DIMS = {
+    "base": 768,
+    "large": 1024,
+    "giant": 1536,
+    "7b": 4096,  # Local 7B model
+}
+
+
 @dataclass
 class DINOv3CompatConfig:
     """Configuration for DINOv3 compatibility layer."""
     # Model selection
-    model_size: str = "base"  # Options: base, large, giant
+    model_size: str = "base"  # Options: base, large, giant, 7b
     patch_size: int = 14  # DINOv3 default patch size
     img_size: int = 518  # DINOv3 default image size
     
@@ -154,29 +163,16 @@ class DINOv3CompatibilityLayer(nn.Module):
                 )
                 return model
     
+    def _get_embed_dim(self) -> int:
+        """Get embedding dimension from model or config."""
+        try:
+            return self.dinov3_model.embed_dim
+        except AttributeError:
+            return DINOV3_EMBED_DIMS.get(self.config.model_size, 4096)
+
     def _create_feature_adapter(self) -> nn.Module:
         """Create feature adaptation layer for dimension compatibility."""
-
-        # DINOv3 embedding dimensions (updated with 7B model)
-        embed_dims = {
-            "base": 768,
-            "large": 1024,
-            "giant": 1536,
-            "7b": 4096  # Your local model
-        }
-
-        # Determine current dimension based on actual model
-        try:
-            # First, try to get from actual model (most reliable)
-            current_dim = self.dinov3_model.embed_dim
-        except:
-            # Fallback to config mapping
-            if self.config.model_size in embed_dims:
-                current_dim = embed_dims[self.config.model_size]
-            else:
-                # Default to 7B model size since that's what we're loading
-                current_dim = 4096
-
+        current_dim = self._get_embed_dim()
         target_dim = self.config.target_embed_dim
 
         if current_dim == target_dim:
@@ -192,25 +188,7 @@ class DINOv3CompatibilityLayer(nn.Module):
     
     def _create_multi_scale_extractor(self) -> nn.Module:
         """Create multi-scale feature extraction module."""
-
-        embed_dims = {
-            "base": 768,
-            "large": 1024,
-            "giant": 1536,
-            "7b": 4096  # Your local model
-        }
-
-        # Determine current dimension based on actual model
-        try:
-            # First, try to get from actual model (most reliable)
-            current_dim = self.dinov3_model.embed_dim
-        except:
-            # Fallback to config mapping
-            if self.config.model_size in embed_dims:
-                current_dim = embed_dims[self.config.model_size]
-            else:
-                # Default to 7B model size since that's what we're loading
-                current_dim = 4096
+        current_dim = self._get_embed_dim()
         
         # Multi-scale pooling for different spatial resolutions
         return nn.ModuleDict({
@@ -339,47 +317,48 @@ class DINOv3CompatibilityLayer(nn.Module):
         return combined
     
     def _extract_attention_maps(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Extract attention maps for visualization."""
+        """Extract attention maps for visualization.
         
-        # This is a simplified implementation
-        # Full implementation would require modifying the forward pass
-        # to return attention weights from each layer
+        Note: This is a placeholder. Full implementation requires modifying
+        the DINOv3 forward pass to return attention weights.
+        """
+        logger.warning(
+            "_extract_attention_maps returns placeholder zeros. "
+            "For real attention maps, modify DINOv3 forward pass."
+        )
+        
+        try:
+            num_heads = self.dinov3_model.blocks[-1].attn.num_heads
+            num_patches = self._get_num_patches()
+        except AttributeError:
+            num_heads = 16  # Default for ViT
+            num_patches = self._get_num_patches()
         
         return {
             'last_layer_attention': torch.zeros(
-                images.shape[0], self.dinov3_model.blocks[-1].attn.num_heads,
-                self.dinov3_model.patch_embed.num_patches + 1,
-                self.dinov3_model.patch_embed.num_patches + 1,
-                device=images.device
+                images.shape[0], 
+                num_heads,
+                num_patches + 1,  # +1 for CLS token
+                num_patches + 1,
+                device=images.device,
+                dtype=images.dtype
             )
         }
     
+    def _get_num_patches(self) -> int:
+        """Get number of patches from model or calculate from config."""
+        try:
+            return self.dinov3_model.patch_embed.num_patches
+        except AttributeError:
+            patches_per_side = self.config.img_size // self.config.patch_size
+            return patches_per_side * patches_per_side
+
     def get_feature_dimensions(self) -> Dict[str, int]:
         """Get output feature dimensions for downstream components."""
-
-        embed_dims = {
-            "base": 768,
-            "large": 1024,
-            "giant": 1536,
-            "7b": 4096  # Your local model
-        }
-
-        # Get actual original dimension
-        try:
-            original_dim = self.dinov3_model.embed_dim
-        except:
-            original_dim = embed_dims.get(self.config.model_size, 4096)
-
+        original_dim = self._get_embed_dim()
         adapted_dim = self.config.target_embed_dim
         vggt_aligned_dim = adapted_dim * 2 if self.config.align_with_vggt else adapted_dim
-
-        # Get number of patches safely
-        try:
-            num_patches = self.dinov3_model.patch_embed.num_patches
-        except:
-            # Calculate from image size and patch size
-            patches_per_side = self.config.img_size // self.config.patch_size
-            num_patches = patches_per_side * patches_per_side
+        num_patches = self._get_num_patches()
 
         return {
             'original_dim': original_dim,
