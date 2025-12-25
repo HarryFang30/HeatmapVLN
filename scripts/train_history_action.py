@@ -461,16 +461,21 @@ def train_one_epoch(
     scheduler,
     scaler: GradScaler,
     cfg: Dict,
-    heatmap_criterion: NavigationHeatmapLoss,
+    heatmap_criterion: nn.Module,
     epoch: int,
     logger,
     tb_writer: Optional[SummaryWriter] = None,
     global_step_offset: int = 0,
     stage_idx: int = 0,
     stage_name: str = "",
-    stage_cfg: Dict = None
+    stage_cfg: Dict = None,
+    max_batches: int = None,
 ) -> Dict[str, float]:
-    """训练一个 epoch"""
+    """训练一个 epoch
+    
+    Args:
+        max_batches: 最大 batch 数（用于快速调试，None 表示不限制）
+    """
     
     model.train()
     total_loss = 0.0
@@ -488,10 +493,17 @@ def train_one_epoch(
     
     device = torch.device(cfg['model']['llm_gpu'])
     
+    # 确定实际的 batch 数量
+    total_batches = len(train_loader)
+    if max_batches is not None:
+        total_batches = min(total_batches, max_batches)
+        logger.info(f"  ⚡ 快速调试模式: 只处理 {total_batches} batches")
+    
     # 进度条
     pbar = tqdm(
         train_loader,
         desc=f"[Stage {stage_idx+1}] Epoch {epoch}/{stage_cfg['epochs']}",
+        total=total_batches,
         ncols=cfg['log'].get('tqdm_ncols', 120)
     )
     
@@ -499,6 +511,11 @@ def train_one_epoch(
     valid_batch_count = 0
     
     for i, batch in enumerate(pbar):
+        # 快速调试模式：限制 batch 数量
+        if max_batches is not None and i >= max_batches:
+            logger.info(f"  ⚡ 达到 max_batches={max_batches}，提前结束 epoch")
+            break
+        
         # 准备数据
         # 将 history_frames 和 current_frame 合并为视频帧序列
         history_frames = batch['history_frames']  # [B, K, 3, H, W]
@@ -829,9 +846,30 @@ def save_checkpoint(
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/training_config_full_model.yaml')
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser = argparse.ArgumentParser(description="History + Action 训练脚本")
+    parser.add_argument('--config', type=str, default='configs/training_config_full_model.yaml',
+                        help='配置文件路径')
+    parser.add_argument('--resume', type=str, default=None, 
+                        help='从检查点恢复（自动检测阶段和 epoch）')
+    
+    # 阶段控制参数
+    parser.add_argument('--stage', type=str, default=None,
+                        help='指定运行的阶段名称（如 warmup_64, mid_128, full_224）')
+    parser.add_argument('--stage-index', type=int, default=None,
+                        help='指定运行的阶段索引（0, 1, 2...）')
+    parser.add_argument('--stage-only', action='store_true',
+                        help='只运行指定的单个阶段，不继续后续阶段')
+    parser.add_argument('--start-epoch', type=int, default=1,
+                        help='从指定 epoch 开始训练（默认 1）')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='覆盖配置中的 epoch 数量')
+    
+    # 调试参数
+    parser.add_argument('--dry-run', action='store_true',
+                        help='只构建模型和数据，不实际训练（用于测试配置）')
+    parser.add_argument('--max-batches', type=int, default=None,
+                        help='每个 epoch 最多处理的 batch 数（用于快速调试）')
+    
     args = parser.parse_args()
     
     # 加载配置
@@ -895,11 +933,61 @@ def main():
     logger.info("🏗️  Building model...")
     model = build_model(cfg)
     
-    # 多阶段训练
-    for stage_idx, stage_cfg in enumerate(cfg['training']['stages']):
-        stage_name = stage_cfg['name']
+    # Dry run 模式
+    if args.dry_run:
         logger.info("=" * 60)
-        logger.info(f"🚀 Stage {stage_idx + 1}: {stage_name}")
+        logger.info("🧪 Dry run 模式：模型和数据构建成功，退出")
+        logger.info("=" * 60)
+        return
+    
+    # 确定要运行的阶段
+    all_stages = cfg['training']['stages']
+    stage_names = [s['name'] for s in all_stages]
+    
+    # 确定起始阶段
+    start_stage_idx = 0
+    if args.stage_index is not None:
+        start_stage_idx = args.stage_index
+        logger.info(f"📌 使用阶段索引: {start_stage_idx}")
+    elif args.stage is not None:
+        if args.stage in stage_names:
+            start_stage_idx = stage_names.index(args.stage)
+            logger.info(f"📌 使用阶段名称: {args.stage} (index={start_stage_idx})")
+        else:
+            logger.error(f"❌ 未知阶段名称: {args.stage}")
+            logger.error(f"   可用阶段: {stage_names}")
+            return
+    
+    # 确定结束阶段
+    if args.stage_only:
+        end_stage_idx = start_stage_idx + 1
+        logger.info(f"📌 只运行单个阶段: {stage_names[start_stage_idx]}")
+    else:
+        end_stage_idx = len(all_stages)
+        if start_stage_idx > 0:
+            logger.info(f"📌 从阶段 {start_stage_idx} 运行到最后")
+    
+    # 打印阶段信息
+    logger.info("=" * 60)
+    logger.info("📋 训练阶段计划:")
+    for i, s in enumerate(all_stages):
+        marker = "▶" if start_stage_idx <= i < end_stage_idx else "○"
+        logger.info(f"  {marker} Stage {i}: {s['name']} ({s['epochs']} epochs, hm={s['hm_size']})")
+    logger.info("=" * 60)
+    
+    # 多阶段训练
+    for stage_idx in range(start_stage_idx, end_stage_idx):
+        stage_cfg = all_stages[stage_idx]
+        stage_name = stage_cfg['name']
+        
+        # 覆盖 epoch 数量
+        if args.epochs is not None:
+            stage_cfg = stage_cfg.copy()
+            stage_cfg['epochs'] = args.epochs
+            logger.info(f"📌 覆盖 epochs: {args.epochs}")
+        
+        logger.info("=" * 60)
+        logger.info(f"🚀 Stage {stage_idx + 1}/{len(all_stages)}: {stage_name}")
         logger.info("=" * 60)
         
         # 更新热力图分辨率
@@ -964,12 +1052,16 @@ def main():
         global_step_offset = 0
         
         for prev_idx in range(stage_idx):
-            prev_epochs = cfg['training']['stages'][prev_idx]['epochs']
+            prev_epochs = all_stages[prev_idx]['epochs']
             global_step_offset += prev_epochs * steps_per_epoch
         
-        for epoch in range(1, stage_cfg['epochs'] + 1):
+        # 确定起始 epoch
+        start_epoch = args.start_epoch if (stage_idx == start_stage_idx) else 1
+        total_epochs = stage_cfg['epochs']
+        
+        for epoch in range(start_epoch, total_epochs + 1):
             logger.info("=" * 80)
-            logger.info(f"[Stage {stage_idx+1}: {stage_name}] Epoch {epoch}/{stage_cfg['epochs']}")
+            logger.info(f"[Stage {stage_idx+1}: {stage_name}] Epoch {epoch}/{total_epochs}")
             logger.info("=" * 80)
             
             # 训练
@@ -977,7 +1069,8 @@ def main():
             train_metrics = train_one_epoch(
                 model, train_loader, optimizer, scheduler, scaler,
                 cfg, heatmap_criterion, epoch, logger, tb_writer, epoch_offset,
-                stage_idx=stage_idx, stage_name=stage_name, stage_cfg=stage_cfg
+                stage_idx=stage_idx, stage_name=stage_name, stage_cfg=stage_cfg,
+                max_batches=args.max_batches
             )
             
             # 验证
