@@ -23,7 +23,6 @@ class Mlp(nn.Module):
         act_layer: Callable[..., nn.Module] = nn.GELU,
         drop: float = 0.0,
         bias: bool = True,
-        device: Optional[str] = None,
     ) -> None:
         super().__init__()
         out_features = out_features or in_features
@@ -107,8 +106,11 @@ class TimeAwareConnector(nn.Module):
         # Hidden layer dimension
         hidden_features = int(actual_input_width * hidden_multiplier)
 
-        # C. MLP Projection Layers
-        # Linear -> GELU -> Dropout -> Linear -> Dropout
+        # C. LayerNorm for training stability
+        self.norm = nn.LayerNorm(actual_input_width)
+
+        # D. MLP Projection Layers
+        # LayerNorm -> Linear -> GELU -> Dropout -> Linear -> Dropout
         self.fc1 = nn.Linear(actual_input_width, hidden_features, bias=bias)
         self.act = nn.GELU()
         self.drop1 = nn.Dropout(dropout)
@@ -142,16 +144,22 @@ class TimeAwareConnector(nn.Module):
         assert frame_indices.shape == (batch_size, num_keyframes), \
             f"frame_indices shape mismatch: expected {(batch_size, num_keyframes)}, got {frame_indices.shape}"
 
-        # Step 1: Lookup time embeddings
+        # Step 1: Prepare frame indices (ensure long type and clamp to valid range)
+        frame_indices = frame_indices.long().clamp(0, self.max_frames - 1)
+
+        # Step 2: Lookup time embeddings
         # frame_indices: [Batch, Nk] -> time_vec: [Batch, Nk, time_embed_dim]
         time_vec = self.time_embed(frame_indices)
 
-        # Step 2: Concatenate all features along last dimension
+        # Step 3: Concatenate all features along last dimension
         # [Batch, Nk, dim_2d] + [Batch, Nk, dim_3d] + [Batch, Nk, time_embed_dim]
         # -> [Batch, Nk, dim_2d + dim_3d + time_embed_dim]
         fused = torch.cat([x_2d, x_3d, time_vec], dim=-1)
 
-        # Step 3: Project through MLP
+        # Step 4: LayerNorm for training stability
+        fused = self.norm(fused)
+
+        # Step 5: Project through MLP
         # Linear -> GELU -> Dropout -> Linear -> Dropout
         x = self.fc1(fused)
         x = self.act(x)
