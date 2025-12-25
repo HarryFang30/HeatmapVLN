@@ -452,3 +452,279 @@ class DiffusionHeatmapLoss(nn.Module):
             "peak": peak_loss.item(),
             "edge": edge_loss.item(),
         }
+
+
+class NeRFRippleHeatmapLoss(nn.Module):
+    """
+    专门针对 NeRF 波纹热力图的损失函数。
+    
+    适用场景：采集脚本使用 draw_nerf_ripple_point 生成的热力图
+    - 高斯包络 + 多频率余弦波纹调制
+    - 波纹携带时间/距离编码信息
+    - 不应该平滑 GT
+    
+    包含：
+    - MSE: 基础像素损失
+    - 频域损失: 约束频率分量（保留波纹结构）
+    - 径向梯度损失: 强化同心圆结构
+    - 峰值定位损失: 精确定位中心
+    """
+    
+    def __init__(
+        self,
+        lambda_mse: float = 1.0,
+        lambda_fft: float = 0.3,
+        lambda_radial: float = 0.2,
+        lambda_peak: float = 1.0,
+        fft_weight_decay: float = 0.5,  # 高频权重衰减
+    ):
+        """
+        Args:
+            lambda_mse: MSE 损失权重
+            lambda_fft: 频域损失权重
+            lambda_radial: 径向梯度损失权重
+            lambda_peak: 峰值定位损失权重
+            fft_weight_decay: FFT 高频分量的权重衰减因子
+        """
+        super().__init__()
+        self.lambda_mse = lambda_mse
+        self.lambda_fft = lambda_fft
+        self.lambda_radial = lambda_radial
+        self.lambda_peak = lambda_peak
+        self.fft_weight_decay = fft_weight_decay
+        
+        # Laplacian kernel for ripple detection
+        laplacian_kernel = torch.tensor([
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('laplacian_kernel', laplacian_kernel)
+        
+        # Sobel for gradient
+        sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = sobel_x.transpose(2, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+    
+    def _compute_fft_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        计算频域损失。
+        
+        约束预测和 GT 在频域中的分布相似。
+        使用权重衰减来平衡低频（整体结构）和高频（波纹细节）。
+        """
+        # 2D FFT
+        pred_fft = torch.fft.fft2(pred)
+        target_fft = torch.fft.fft2(target)
+        
+        # 计算幅度谱
+        pred_mag = torch.abs(pred_fft)
+        target_mag = torch.abs(target_fft)
+        
+        # 创建频率权重矩阵
+        # 低频区域权重高，高频区域权重递减（但不为零）
+        B, C, H, W = pred.shape
+        freq_y = torch.fft.fftfreq(H, device=pred.device).view(1, 1, H, 1)
+        freq_x = torch.fft.fftfreq(W, device=pred.device).view(1, 1, 1, W)
+        freq_dist = torch.sqrt(freq_y ** 2 + freq_x ** 2)
+        
+        # 权重: 1 / (1 + decay * freq_dist)
+        # 低频权重 ≈ 1，高频权重递减但保留
+        weights = 1.0 / (1.0 + self.fft_weight_decay * freq_dist * max(H, W))
+        
+        # 加权 L1 损失
+        fft_loss = (weights * torch.abs(pred_mag - target_mag)).mean()
+        
+        return fft_loss
+    
+    def _compute_radial_gradient_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        计算径向梯度损失。
+        
+        波纹是同心圆结构，径向梯度应该匹配。
+        这有助于保持波纹的"周期性"。
+        """
+        # 计算梯度
+        pred_gx = F.conv2d(pred, self.sobel_x.to(pred.device), padding=1)
+        pred_gy = F.conv2d(pred, self.sobel_y.to(pred.device), padding=1)
+        
+        target_gx = F.conv2d(target, self.sobel_x.to(target.device), padding=1)
+        target_gy = F.conv2d(target, self.sobel_y.to(target.device), padding=1)
+        
+        # 梯度幅度
+        pred_grad_mag = torch.sqrt(pred_gx ** 2 + pred_gy ** 2 + 1e-6)
+        target_grad_mag = torch.sqrt(target_gx ** 2 + target_gy ** 2 + 1e-6)
+        
+        # L1 loss on gradient magnitude
+        radial_loss = F.l1_loss(pred_grad_mag, target_grad_mag)
+        
+        return radial_loss
+    
+    def _compute_peak_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        计算峰值定位损失。
+        
+        确保峰值位置准确。
+        使用 soft-argmax 获取峰值坐标，然后计算距离。
+        """
+        B, C, H, W = pred.shape
+        
+        # 创建坐标网格
+        y_coords = torch.arange(H, device=pred.device, dtype=pred.dtype).view(1, 1, H, 1)
+        x_coords = torch.arange(W, device=pred.device, dtype=pred.dtype).view(1, 1, 1, W)
+        
+        # Softmax 加权坐标 (soft-argmax)
+        pred_flat = pred.view(B, -1)
+        target_flat = target.view(B, -1)
+        
+        pred_weights = F.softmax(pred_flat * 10, dim=-1).view(B, 1, H, W)  # Temperature scaling
+        target_weights = F.softmax(target_flat * 10, dim=-1).view(B, 1, H, W)
+        
+        pred_y = (pred_weights * y_coords).sum(dim=(2, 3))  # [B, 1]
+        pred_x = (pred_weights * x_coords).sum(dim=(2, 3))
+        
+        target_y = (target_weights * y_coords).sum(dim=(2, 3))
+        target_x = (target_weights * x_coords).sum(dim=(2, 3))
+        
+        # 坐标距离损失（归一化到 [0, 1]）
+        peak_loss = (
+            ((pred_y - target_y) / H) ** 2 +
+            ((pred_x - target_x) / W) ** 2
+        ).mean()
+        
+        return peak_loss
+    
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            pred: [B, H, W] 或 [B, 1, H, W] 预测热力图
+            target: [B, H, W] 或 [B, 1, H, W] GT 热力图（带波纹）
+            
+        Returns:
+            total_loss, loss_dict
+        """
+        # 确保维度正确
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        
+        # 归一化（保持波纹结构，只调整范围）
+        B = target.shape[0]
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
+        target_norm = target / target_max
+        
+        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
+        pred_norm = pred / pred_max
+        pred_norm = pred_norm.clamp(0, 1)
+        
+        # 1. MSE 损失（基础像素匹配）
+        mse_loss = F.mse_loss(pred_norm, target_norm)
+        
+        # 2. 频域损失（保持波纹频率结构）
+        fft_loss = self._compute_fft_loss(pred_norm, target_norm)
+        
+        # 3. 径向梯度损失（保持同心圆结构）
+        radial_loss = self._compute_radial_gradient_loss(pred_norm, target_norm)
+        
+        # 4. 峰值定位损失（精确定位中心）
+        peak_loss = self._compute_peak_loss(pred_norm, target_norm)
+        
+        # 总损失
+        total_loss = (
+            self.lambda_mse * mse_loss +
+            self.lambda_fft * fft_loss +
+            self.lambda_radial * radial_loss +
+            self.lambda_peak * peak_loss
+        )
+        
+        return total_loss, {
+            "mse": mse_loss.item(),
+            "fft": fft_loss.item(),
+            "radial": radial_loss.item(),
+            "peak": peak_loss.item(),
+        }
+
+
+class SimplifiedHeatmapLoss(nn.Module):
+    """
+    简化版热力图损失 - 推荐用于初始训练。
+    
+    如果完整的 NeRFRippleHeatmapLoss 训练困难，
+    可以先用这个简化版本进行 warmup。
+    
+    只包含：
+    - MSE: 基础像素匹配
+    - 峰值加权: 强调中心区域
+    - 梯度匹配: 保持边缘结构
+    """
+    
+    def __init__(
+        self,
+        lambda_mse: float = 1.0,
+        lambda_grad: float = 0.3,
+        peak_weight: float = 5.0,
+    ):
+        super().__init__()
+        self.lambda_mse = lambda_mse
+        self.lambda_grad = lambda_grad
+        self.peak_weight = peak_weight
+        
+        # Sobel kernels
+        sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = sobel_x.transpose(2, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+    
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            pred: [B, H, W] 预测
+            target: [B, H, W] GT
+        """
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        
+        # 归一化
+        B = target.shape[0]
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
+        target_norm = target / target_max
+        pred_norm = pred.clamp(0, 1)
+        
+        # 1. 峰值加权 MSE
+        weight_map = 1.0 + self.peak_weight * target_norm
+        mse_loss = (weight_map * (pred_norm - target_norm) ** 2).mean()
+        
+        # 2. 梯度匹配
+        pred_gx = F.conv2d(pred_norm, self.sobel_x.to(pred.device), padding=1)
+        pred_gy = F.conv2d(pred_norm, self.sobel_y.to(pred.device), padding=1)
+        target_gx = F.conv2d(target_norm, self.sobel_x.to(target.device), padding=1)
+        target_gy = F.conv2d(target_norm, self.sobel_y.to(target.device), padding=1)
+        
+        grad_loss = F.l1_loss(pred_gx, target_gx) + F.l1_loss(pred_gy, target_gy)
+        
+        total_loss = self.lambda_mse * mse_loss + self.lambda_grad * grad_loss
+        
+        return total_loss, {
+            "mse": mse_loss.item(),
+            "grad": grad_loss.item(),
+        }
