@@ -154,6 +154,7 @@ class DiffusionActionHead(nn.Module):
         self,
         llm_features: torch.Tensor,
         gt_actions: Optional[torch.Tensor] = None,
+        action_valid: Optional[torch.Tensor] = None,  # 🆕 添加 mask 参数
         return_loss: bool = False,
         cumulative: bool = True,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -163,6 +164,7 @@ class DiffusionActionHead(nn.Module):
         Args:
             llm_features: (B, seq_len, cond_dim) or (B, cond_dim) LLM output features
             gt_actions: Optional (B, pred_horizon, action_dim) ground truth actions for training
+            action_valid: Optional (B,) mask indicating which samples have valid actions
             return_loss: If True and gt_actions provided, return loss dict
             cumulative: If True, return cumulative positions; else return deltas
             
@@ -180,7 +182,7 @@ class DiffusionActionHead(nn.Module):
         
         # 2. Training mode: compute diffusion loss
         if gt_actions is not None and return_loss:
-            return self._compute_training_loss(global_cond, gt_actions)
+            return self._compute_training_loss(global_cond, gt_actions, action_valid)
         
         # 3. Inference mode: iterative denoising
         actions = self._diffusion_inference(global_cond, batch_size, device)
@@ -203,13 +205,15 @@ class DiffusionActionHead(nn.Module):
         self,
         global_cond: torch.Tensor,
         gt_actions: torch.Tensor,
+        action_valid: Optional[torch.Tensor] = None,  # 🆕 添加 mask 参数
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute diffusion training loss.
+        Compute diffusion training loss with proper masking.
         
         Args:
             global_cond: (B, encoding_size) conditioning
             gt_actions: (B, pred_horizon, action_dim) ground truth actions
+            action_valid: Optional (B,) mask indicating which samples have valid actions
             
         Returns:
             Dict with 'loss', 'actions', 'normalized_actions'
@@ -240,8 +244,22 @@ class DiffusionActionHead(nn.Module):
             global_cond=global_cond,
         )
         
-        # Compute loss (MSE between predicted and actual noise)
-        loss = nn.functional.mse_loss(noise_pred, noise)
+        # 🔧 关键修复：使用 action_valid mask 计算 loss
+        # 计算逐样本的 MSE loss
+        per_sample_loss = nn.functional.mse_loss(noise_pred, noise, reduction='none')
+        per_sample_loss = per_sample_loss.mean(dim=(1, 2))  # [B]
+        
+        if action_valid is not None:
+            # 只对有效样本计算 loss
+            mask = action_valid.float().to(device)
+            if mask.sum() > 0:
+                loss = (per_sample_loss * mask).sum() / mask.sum()
+            else:
+                # 没有有效样本，返回 0 loss
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+        else:
+            # 无 mask，使用全部样本
+            loss = per_sample_loss.mean()
         
         # Generate actions for monitoring (optional, can be disabled for speed)
         with torch.no_grad():

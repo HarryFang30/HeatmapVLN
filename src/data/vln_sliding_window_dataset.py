@@ -473,7 +473,7 @@ class VLNSlidingWindowDataset(Dataset):
             return None
     
     def _load_actions(self, clip_dir: Path) -> Optional[np.ndarray]:
-        """加载动作数据"""
+        """加载连续动作数据 (dx, dy)"""
         actions_path = clip_dir / "actions.npy"
         
         if not actions_path.exists():
@@ -484,6 +484,20 @@ class VLNSlidingWindowDataset(Dataset):
             return actions
         except Exception as e:
             logger.warning(f"Failed to load actions: {actions_path}: {e}")
+            return None
+    
+    def _load_discrete_actions(self, clip_dir: Path) -> Optional[np.ndarray]:
+        """加载离散动作数据 (STOP=0, FORWARD=1, LEFT=2, RIGHT=3)"""
+        discrete_path = clip_dir / "discrete_actions.npy"
+        
+        if not discrete_path.exists():
+            return None
+        
+        try:
+            discrete_actions = np.load(discrete_path)
+            return discrete_actions
+        except Exception as e:
+            logger.warning(f"Failed to load discrete actions: {discrete_path}: {e}")
             return None
     
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str, float]]:
@@ -549,7 +563,7 @@ class VLNSlidingWindowDataset(Dataset):
             )
             heatmap_tensor = torch.from_numpy(heatmap).float()
             
-            # 8. 加载动作
+            # 8. 加载连续动作
             actions = self._load_actions(clip_dir)
             if actions is not None and current_t < T - 1:
                 # 动作定义：从 current_t 到 current_t+1 的位移
@@ -562,12 +576,24 @@ class VLNSlidingWindowDataset(Dataset):
             
             action_tensor = torch.from_numpy(action.astype(np.float32))
             
+            # 9. 加载离散动作（用于 Stop Prediction）
+            discrete_actions = self._load_discrete_actions(clip_dir)
+            if discrete_actions is not None and current_t < len(discrete_actions):
+                discrete_action = int(discrete_actions[current_t])
+                # is_stop: 1 if STOP action, 0 otherwise
+                is_stop = 1.0 if discrete_action == 0 else 0.0
+            else:
+                discrete_action = 1  # Default to FORWARD
+                is_stop = 0.0
+            
             return {
                 "history_frames": history_frames,      # [K, 3, H, W]
                 "current_frame": current_frame,        # [3, H, W]
                 "heatmap": heatmap_tensor,             # [Hm, Wm]
                 "action": action_tensor,               # [2]
                 "action_valid": action_valid,          # float
+                "discrete_action": discrete_action,    # int (0-3)
+                "is_stop": is_stop,                    # float (0 or 1)
                 "text": text,                          # str
             }
             
@@ -577,7 +603,7 @@ class VLNSlidingWindowDataset(Dataset):
             logger.error(traceback.format_exc())
             return self._get_dummy_sample()
     
-    def _get_dummy_sample(self) -> Dict[str, Union[torch.Tensor, str, float]]:
+    def _get_dummy_sample(self) -> Dict[str, Union[torch.Tensor, str, float, int]]:
         """生成虚拟样本（用于错误处理）"""
         target_w, target_h = self.image_size
         hm_w, hm_h = self.hm_size
@@ -589,6 +615,8 @@ class VLNSlidingWindowDataset(Dataset):
             "heatmap": torch.zeros(hm_h, hm_w),
             "action": torch.zeros(2),
             "action_valid": 0.0,
+            "discrete_action": 1,  # Default to FORWARD
+            "is_stop": 0.0,
             "text": "",
         }
 

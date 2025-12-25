@@ -555,6 +555,9 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     heatmap = torch.stack([s['heatmap'] for s in batch], dim=0)                # [B, Hm, Wm]
     action = torch.stack([s['action'] for s in batch], dim=0)                  # [B, 2]
     action_valid = torch.tensor([s['action_valid'] for s in batch])            # [B]
+    # 🆕 Stop Prediction 相关字段
+    discrete_action = torch.tensor([s.get('discrete_action', 1) for s in batch])  # [B]
+    is_stop = torch.tensor([s.get('is_stop', 0.0) for s in batch])                 # [B]
     text = [s['text'] for s in batch]
     
     return {
@@ -564,6 +567,8 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'heatmap': heatmap,
         'action': action,
         'action_valid': action_valid,
+        'discrete_action': discrete_action,   # 🆕 离散动作 (0-3)
+        'is_stop': is_stop,                   # 🆕 是否停止 (0/1)
         'text': text,
     }
 
@@ -624,6 +629,15 @@ def build_model(cfg: Dict) -> nn.Module:
         action_pred_horizon=model_cfg['action_head']['pred_horizon'],
         action_encoding_size=model_cfg['action_head']['encoding_size'],
         action_num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
+        # 🔧 关键修复：使用实际数据集统计值进行归一化
+        action_stats_min=model_cfg['action_head'].get('action_stats_min', [-0.17, -0.03]),
+        action_stats_max=model_cfg['action_head'].get('action_stats_max', [0.19, 0.31]),
+
+        # 🆕 Stop Prediction Head
+        enable_stop_head=model_cfg.get('stop_head', {}).get('enable', False),
+        stop_hidden_dim=model_cfg.get('stop_head', {}).get('hidden_dim', 512),
+        stop_focal_gamma=model_cfg.get('stop_head', {}).get('focal_gamma', 2.0),
+        stop_focal_alpha=model_cfg.get('stop_head', {}).get('focal_alpha', 0.75),
 
         verbose=False  # 关闭冗余日志，加快训练
     )
@@ -637,6 +651,7 @@ def build_model(cfg: Dict) -> nn.Module:
     print(f"   HistoryHeatmapHead → enabled={enable_history}")
     print(f"   FutureHeatmapHead → enabled={enable_future}")
     print(f"   ActionHead → enabled={model_cfg['action_head']['enable']}")
+    print(f"   StopHead → enabled={model_cfg.get('stop_head', {}).get('enable', False)}")
     
     return model
 
@@ -672,6 +687,12 @@ def set_trainable_modules(model: SpatialMLLMPipeline, stage_cfg: Dict, logger):
         if hasattr(model, 'action_head') and model.action_head is not None:
             freeze_module(model.action_head, freeze=False)
             logger.info("  ✓ Unfrozen: action_head")
+    
+    # 🆕 Stop head
+    if 'stop_head' in trainable:
+        if hasattr(model, 'stop_head') and model.stop_head is not None:
+            freeze_module(model.stop_head, freeze=False)
+            logger.info("  ✓ Unfrozen: stop_head")
     
     # Feature fusion & projector
     if 'feature_fusion' in trainable:
@@ -740,6 +761,18 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
                 'name': 'action_head'
             })
             print(f"  Param group: action_head (lr={action_lr})")
+    
+    # 🆕 2.5) Stop 预测头
+    stop_lr = optim_cfg.get('stop_lr', action_lr)  # 默认使用 action_lr
+    if hasattr(model, 'stop_head') and model.stop_head is not None:
+        stop_params = [p for p in model.stop_head.parameters() if p.requires_grad]
+        if stop_params:
+            param_groups.append({
+                'params': stop_params,
+                'lr': stop_lr,
+                'name': 'stop_head'
+            })
+            print(f"  Param group: stop_head (lr={stop_lr})")
     
     # 3) 融合模块+投影器
     fusion_params = []
@@ -838,6 +871,7 @@ def train_one_epoch(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
+    total_stop_loss = 0.0  # 🆕
     num_batches = 0
     
     optim_cfg = cfg['optim']
@@ -890,6 +924,8 @@ def train_one_epoch(
         gt_heatmap = batch['heatmap'].to(device)        # [B, Hm, Wm]
         gt_action = batch['action'].to(device)          # [B, 2]
         action_valid = batch['action_valid'].to(device) # [B]
+        # 🆕 Stop Prediction
+        is_stop = batch['is_stop'].to(device)           # [B]
         text = batch['text']
         
         # 处理导航指令
@@ -919,6 +955,8 @@ def train_one_epoch(
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,  # [B, 1, 2]
+                action_valid=action_valid if train_action else None,  # action mask
+                gt_stop=is_stop if train_action else None,  # 🆕 Stop 标签
             )
             
             # ========== 热力图损失 ==========
@@ -973,19 +1011,24 @@ def train_one_epoch(
                     if action_valid.sum() > 0:
                         action_loss = action_loss_from_model
             
+            # ========== Stop 损失 ==========
+            stop_loss = torch.tensor(0.0, device=device)
+            if train_action and 'stop_loss' in output:
+                stop_loss_from_model = output.get('stop_loss')
+                if stop_loss_from_model is not None:
+                    stop_loss = stop_loss_from_model
+            
             # ========== 总损失 ==========
             heatmap_weight = loss_cfg.get('history_weight', 1.0) if train_history else loss_cfg.get('future_weight', 1.0)
             action_weight = loss_cfg.get('action_weight', 0.5)
+            stop_weight = loss_cfg.get('stop_weight', 0.5)  # 🆕 Stop 损失权重
             
-            loss = heatmap_weight * heatmap_loss + action_weight * action_loss
+            loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
             loss = loss / grad_accum_steps
         
         # 反向传播
         scaler.scale(loss).backward()
         valid_batch_count += 1
-        
-        # 清理
-        del output
         
         # 梯度累积
         if valid_batch_count % grad_accum_steps == 0:
@@ -1007,7 +1050,7 @@ def train_one_epoch(
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}) | "
+                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}, stop: {stop_loss.item():.4f}) | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e} | "
                     f"GPU: {mem_alloc:.1f}GB"
                 )
@@ -1017,6 +1060,7 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                     tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                     tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
+                    tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)  # 🆕
                     tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
             
             # 定期可视化热力图预测
@@ -1043,6 +1087,9 @@ def train_one_epoch(
                     except Exception as e:
                         pass  # 忽略可视化写入错误
         
+        # 清理 output 释放显存
+        del output
+        
         # 定期清理显存
         if (i + 1) % 4 == 0:
             gc.collect()
@@ -1051,6 +1098,7 @@ def train_one_epoch(
         total_loss += loss.item() * grad_accum_steps
         total_heatmap_loss += heatmap_loss.item()
         total_action_loss += action_loss.item()
+        total_stop_loss += stop_loss.item()  # 🆕
         num_batches += 1
         
         # 更新进度条
@@ -1058,6 +1106,7 @@ def train_one_epoch(
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
             'hm': f"{heatmap_loss.item():.4f}",
             'act': f"{action_loss.item():.4f}",
+            'stop': f"{stop_loss.item():.4f}",  # 🆕
         })
     
     # 处理剩余梯度
@@ -1074,6 +1123,7 @@ def train_one_epoch(
         'total_loss': total_loss / max(num_batches, 1),
         'heatmap_loss': total_heatmap_loss / max(num_batches, 1),
         'action_loss': total_action_loss / max(num_batches, 1),
+        'stop_loss': total_stop_loss / max(num_batches, 1),  # 🆕
     }
 
 
@@ -1094,6 +1144,7 @@ def validate(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
+    total_stop_loss = 0.0  # 🆕
     num_batches = 0
     
     loss_cfg = cfg['loss']
@@ -1117,6 +1168,7 @@ def validate(
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
+        is_stop = batch['is_stop'].to(device)  # 🆕
         text = batch['text']
         
         # 处理导航指令（与训练一致）
@@ -1134,6 +1186,8 @@ def validate(
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                action_valid=action_valid if train_action else None,
+                gt_stop=is_stop if train_action else None,  # 🆕 Stop 标签
             )
             
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -1157,29 +1211,41 @@ def validate(
                 if action_loss_val is not None and action_valid.sum() > 0:
                     action_loss = action_loss_val
             
+            # 🆕 Stop Loss
+            stop_loss = torch.tensor(0.0, device=device)
+            if train_action and 'stop_loss' in output:
+                stop_loss_val = output.get('stop_loss')
+                if stop_loss_val is not None:
+                    stop_loss = stop_loss_val
+            
             heatmap_weight = loss_cfg.get('history_weight', 1.0)
             action_weight = loss_cfg.get('action_weight', 0.5)
-            loss = heatmap_weight * heatmap_loss + action_weight * action_loss
+            stop_weight = loss_cfg.get('stop_weight', 0.5)  # 🆕
+            loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
         
         total_loss += loss.item()
         total_heatmap_loss += heatmap_loss.item()
         total_action_loss += action_loss.item()
+        total_stop_loss += stop_loss.item()  # 🆕
         num_batches += 1
     
     avg_loss = total_loss / max(num_batches, 1)
     avg_hm = total_heatmap_loss / max(num_batches, 1)
     avg_act = total_action_loss / max(num_batches, 1)
+    avg_stop = total_stop_loss / max(num_batches, 1)  # 🆕
     
     if tb_writer is not None:
         tb_writer.add_scalar('val/loss', avg_loss, epoch)
         tb_writer.add_scalar('val/heatmap_loss', avg_hm, epoch)
         tb_writer.add_scalar('val/action_loss', avg_act, epoch)
+        tb_writer.add_scalar('val/stop_loss', avg_stop, epoch)  # 🆕
         tb_writer.flush()
     
     return {
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
         'val_action_loss': avg_act,
+        'val_stop_loss': avg_stop,  # 🆕
     }
 
 

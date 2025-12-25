@@ -234,7 +234,7 @@ def evaluate(
 ) -> Dict[str, float]:
     """Run evaluation."""
     model.eval()
-    
+
     totals = {
         'hist_peak_error': 0.0,
         'hist_iou': 0.0,
@@ -249,12 +249,12 @@ def evaluate(
         'action_dy_error': 0.0,
     }
     counts = {'hist': 0, 'fut': 0, 'action': 0}
-    
+
     for idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
         if args and args.max_samples is not None and idx >= args.max_samples:
             logger.info(f"Reached max_samples={args.max_samples}, stopping")
             break
-        
+
         # Prepare data
         history_frames = batch['history_frames']
         current_frame = batch['current_frame']
@@ -305,7 +305,7 @@ def evaluate(
                     totals['hist_cosine_sim'] += metrics['cosine_sim']
                     totals['hist_mae'] += metrics['mae']
                     counts['hist'] += 1
-        
+
         # Evaluate future heatmap
         if eval_future and 'future_heatmaps' in outputs:
             pred_hm = outputs['future_heatmaps'][:, -1].cpu().numpy()
@@ -319,7 +319,7 @@ def evaluate(
                     totals['fut_cosine_sim'] += metrics['cosine_sim']
                     totals['fut_mae'] += metrics['mae']
                     counts['fut'] += 1
-        
+
         # Evaluate action
         if eval_action and 'actions' in outputs and outputs['actions'] is not None:
             pred_act = outputs['actions'].cpu().numpy()
@@ -336,11 +336,11 @@ def evaluate(
         # Visualization
         if save_dir is not None and idx < num_vis:
             save_dir.mkdir(parents=True, exist_ok=True)
-            visualize_sample(
+                visualize_sample(
                 idx, batch, outputs, save_dir, 
                 eval_history, eval_future, eval_action
-            )
-    
+                )
+
     # Average metrics
     results = {}
     for k, v in totals.items():
@@ -371,14 +371,14 @@ def visualize_sample(
     current_frame = batch['current_frame'][0].permute(1, 2, 0).cpu().numpy()
     gt_heatmap = batch['heatmap'][0].cpu().numpy()
     gt_action = batch['action'][0].cpu().numpy()
-    
+
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
+
     # Row 1: Frame and GT
     axes[0, 0].imshow(current_frame)
     axes[0, 0].set_title("Current Frame")
     axes[0, 0].axis('off')
-    
+
     im = axes[0, 1].imshow(gt_heatmap, cmap='hot')
     axes[0, 1].set_title("GT Heatmap")
     axes[0, 1].axis('off')
@@ -414,7 +414,7 @@ def visualize_sample(
                         ha='center', va='center', fontsize=14, transform=axes[1, 2].transAxes)
         axes[1, 2].set_title("Pred Action")
     axes[1, 2].axis('off')
-    
+
     plt.tight_layout()
     plt.savefig(save_dir / f"sample_{idx:04d}.png", dpi=150, bbox_inches='tight')
     plt.close()

@@ -52,6 +52,16 @@ model:
     pred_horizon: 1                     # 预测步数
     num_diffusion_iters: 10             # 扩散步数
     encoding_size: 768                  # 条件投影维度
+    # 🔧 关键修复：使用实际数据统计值（而非 DifNav 默认值）
+    action_stats_min: [-0.17, -0.03]    # 从数据集计算，加 10% 余量
+    action_stats_max: [0.19, 0.31]      # 从数据集计算，加 10% 余量
+
+  # 🆕 Stop 预测头配置（二分类器）
+  stop_head:
+    enable: true                        # 启用 Stop 预测
+    hidden_dim: 512                     # 隐藏层维度
+    focal_gamma: 2.0                    # Focal Loss gamma（越大越关注困难样本）
+    focal_alpha: 0.75                   # Focal Loss alpha（STOP 类权重，因为极不平衡）
 
 # ============================================
 # 训练策略（4 阶段渐进式训练）
@@ -70,6 +80,7 @@ training:
       trainable_modules:
         - history_heatmap_head
         - action_head
+        - stop_head                     # 🆕 Stop 预测头
         - feature_fusion                # 解冻 fusion，让 heads 有合适的输入
       frozen_modules:
         - vggt
@@ -89,6 +100,7 @@ training:
       trainable_modules:
         - future_heatmap_head
         - action_head
+        - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
       frozen_modules:
         - vggt
@@ -109,6 +121,7 @@ training:
         - history_heatmap_head
         - future_heatmap_head
         - action_head
+        - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
       frozen_modules:
         - vggt
@@ -128,6 +141,7 @@ training:
         - history_heatmap_head
         - future_heatmap_head
         - action_head
+        - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
         - llm_projector
       frozen_modules:
@@ -193,7 +207,8 @@ loss:
   # 各头损失权重
   history_weight: 1.0                   # History 热力图损失权重
   future_weight: 1.0                    # Future 热力图损失权重
-  action_weight: 0.5                    # 动作损失权重
+  action_weight: 0.5                    # 连续动作损失权重
+  stop_weight: 0.5                      # 🆕 Stop 预测损失权重
 
 # ============================================
 # GPU配置

@@ -30,7 +30,7 @@ from ..data import create_keyframe_selector
 from .dinov3 import create_dinov3_compatibility_layer
 from .vggt.models.vggt import VGGT
 from .llm import create_real_llm_integration, create_memory_efficient_llm
-from .action import DiffusionActionHead, DiffusionActionConfig
+from .action import DiffusionActionHead, DiffusionActionConfig, StopPredictionHead
 from .heatmap import DiffusionHeatmapHead, DiffusionHeatmapConfig
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,12 @@ class SpatialMLLMIntegrationConfig:
     action_dim: int = 2  # 2D navigation (dx, dy)
     action_pred_horizon: int = 1  # Number of action steps to predict
     action_encoding_size: int = 768  # Condition projection dimension
+    
+    # Stop prediction (binary classifier)
+    enable_stop_head: bool = False  # Enable stop prediction head
+    stop_hidden_dim: int = 512  # Hidden dimension for stop classifier
+    stop_focal_gamma: float = 2.0  # Focal loss gamma (focus on hard examples)
+    stop_focal_alpha: float = 0.75  # Focal loss alpha (weight for STOP class)
     action_num_diffusion_iters: int = 10  # Diffusion denoising steps
     action_stats_min: List[float] = None  # Will use defaults if None
     action_stats_max: List[float] = None  # Will use defaults if None
@@ -239,14 +245,30 @@ class SpatialMLLMPipeline(nn.Module):
                 cond_dim=config.llm_token_dim,  # Use projected LLM tokens as condition
                 encoding_size=config.action_encoding_size,
                 num_diffusion_iters=config.action_num_diffusion_iters,
-                action_stats_min=config.action_stats_min or [-1.07, -1.05],
-                action_stats_max=config.action_stats_max or [1.07, 1.03],
+                # 🔧 使用实际数据集统计值（加 10% 余量）
+                action_stats_min=config.action_stats_min or [-0.17, -0.03],
+                action_stats_max=config.action_stats_max or [0.19, 0.31],
                 device=str(action_device),
             )
             self.action_head = DiffusionActionHead(action_config).to(device=action_device, dtype=config.dtype)
             logger.info(f"Diffusion Action Head initialized on {action_device}")
         else:
             self.action_head = None
+        
+        # Initialize Stop Prediction Head (binary classifier for STOP action)
+        if config.enable_stop_head:
+            logger.info("Initializing Stop Prediction Head")
+            stop_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
+            self.stop_head = StopPredictionHead(
+                input_dim=config.llm_token_dim,
+                hidden_dim=config.stop_hidden_dim,
+                dropout=0.1,
+                focal_gamma=config.stop_focal_gamma,
+                focal_alpha=config.stop_focal_alpha,
+            ).to(device=stop_device, dtype=config.dtype)
+            logger.info(f"Stop Prediction Head initialized on {stop_device}")
+        else:
+            self.stop_head = None
         
         # Initialize Dual Diffusion Heatmap Heads (history and future)
         heatmap_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
@@ -334,7 +356,9 @@ class SpatialMLLMPipeline(nn.Module):
         return_intermediate: bool = False,
         return_heatmaps: bool = True,
         return_actions: bool = True,
-        gt_actions: Optional[torch.Tensor] = None
+        gt_actions: Optional[torch.Tensor] = None,
+        action_valid: Optional[torch.Tensor] = None,  # action mask for continuous actions
+        gt_stop: Optional[torch.Tensor] = None,  # 🆕 ground truth stop labels (0/1)
     ) -> Dict[str, Any]:
         """
         Complete forward pass of the Spatial-MLLM pipeline processing three inputs.
@@ -559,11 +583,14 @@ class SpatialMLLMPipeline(nn.Module):
                 action_cond = action_cond.to(device=action_device)
                 
                 if gt_actions is not None:
-                    # Training mode: compute action loss
+                    # Training mode: compute action loss with masking
                     gt_actions_device = gt_actions.to(device=action_device)
+                    # 🆕 传递 action_valid mask 给 action_head
+                    action_valid_device = action_valid.to(device=action_device) if action_valid is not None else None
                     action_result = self.action_head(
                         action_cond, 
                         gt_actions=gt_actions_device,
+                        action_valid=action_valid_device,  # 🆕 传递 mask
                         return_loss=True
                     )
                     output['actions'] = action_result['actions']
@@ -580,6 +607,39 @@ class SpatialMLLMPipeline(nn.Module):
                 logger.error(f"Action generation failed: {e}")
                 output['actions'] = None
                 output['action_loss'] = None
+        
+        # Step 8: Stop prediction (binary classification)
+        if self.stop_head is not None:
+            logger.info("Step 8: Stop prediction")
+            try:
+                # Use pooled LLM tokens as condition
+                stop_cond = llm_tokens.mean(dim=(1, 2))  # [B, D]
+                stop_device = next(self.stop_head.parameters()).device
+                stop_cond = stop_cond.to(device=stop_device)
+                
+                if gt_stop is not None:
+                    # Training mode: compute stop loss
+                    gt_stop_device = gt_stop.to(device=stop_device)
+                    action_valid_device = action_valid.to(device=stop_device) if action_valid is not None else None
+                    stop_result = self.stop_head(
+                        stop_cond,
+                        gt_stop=gt_stop_device,
+                        action_valid=action_valid_device,
+                        return_loss=True,
+                    )
+                    output['stop_prob'] = stop_result['stop_prob']
+                    output['stop_loss'] = stop_result['loss']
+                    logger.info(f"Stop loss: {stop_result['loss'].item():.4f}")
+                else:
+                    # Inference mode: predict stop
+                    stop_prob = self.stop_head(stop_cond)
+                    output['stop_prob'] = stop_prob
+                    logger.info(f"Stop probabilities: mean={stop_prob.mean().item():.4f}")
+                    
+            except Exception as e:
+                logger.error(f"Stop prediction failed: {e}")
+                output['stop_prob'] = None
+                output['stop_loss'] = None
         
         if return_intermediate:
             output['intermediate_features'] = {

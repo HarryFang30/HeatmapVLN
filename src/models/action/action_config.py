@@ -64,9 +64,11 @@ class DiffusionActionConfig:
     device: str = "cuda"
     dtype: torch.dtype = torch.float32
     
-    # Action statistics for normalization (will be updated from data)
-    action_stats_min: List[float] = field(default_factory=lambda: [-1.07, -1.05])
-    action_stats_max: List[float] = field(default_factory=lambda: [1.07, 1.03])
+    # Action statistics for normalization (computed from actual dataset)
+    # 🔧 修复：使用实际数据集统计值，而非 DifNav 默认值
+    # 实际范围: dx ∈ [-0.14, 0.16], dy ∈ [0, 0.28]，加 10% 余量
+    action_stats_min: List[float] = field(default_factory=lambda: [-0.17, -0.03])
+    action_stats_max: List[float] = field(default_factory=lambda: [0.19, 0.31])
     
     def __post_init__(self):
         """Validate configuration."""

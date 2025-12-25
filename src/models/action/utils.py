@@ -179,9 +179,11 @@ def get_action_from_diffusion_output(
     return actions
 
 
-# Default action statistics (from DifNav R2R-CE dataset)
+# Default action statistics (computed from actual VLN-CE dataset)
+# 🔧 修复：使用实际数据集统计值
+# 实际范围: dx ∈ [-0.14, 0.16], dy ∈ [0, 0.28]，加 10% 余量
 DEFAULT_ACTION_STATS = ActionStats(
-    min=[-1.07, -1.05],
-    max=[1.07, 1.03]
+    min=[-0.17, -0.03],
+    max=[0.19, 0.31]
 )
 
