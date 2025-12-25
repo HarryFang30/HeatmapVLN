@@ -1,7 +1,7 @@
 seed: 42
 
 # ============================================
-# 数据配置
+# 数据配置 (针对 96GB 显存优化)
 # ============================================
 data:
   root: /root/autodl-tmp/dataset_with_actions
@@ -9,21 +9,21 @@ data:
   val_split: val_unseen                 # 验证集目录名 (VLN-CE 使用 val_unseen)
   image_size: [224, 224]
   init_hm_size: [64, 64]                # 起始分辨率
-  num_workers: 4                        # 减少 workers 避免 CPU 竞争
+  num_workers: 8                        # 96GB 显存配置，增加 workers
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4                    # 增大预取
   
   # 滑动窗口数据集配置
   dataset_type: sliding_window          # heatmap_adapter | sliding_window
   sliding_window:
     min_history: 5                      # 最小历史帧数
-    num_history_sample: 8               # 从历史中采样的帧数
+    num_history_sample: 12              # 增加历史帧数 8 → 12（更多上下文）
     load_depth: true                    # 是否加载深度用于遮挡检测
     cache_poses: true                   # 是否缓存位姿
-    sample_stride: 5                    # 采样步长：每隔 N 帧采样一次，减少训练时间
+    sample_stride: 3                    # 减少步长 5 → 3（更多训练样本）
 
 # ============================================
-# 模型配置
+# 模型配置 (针对 96GB 显存优化)
 # ============================================
 model:
   type: spatial_mllm_pipeline
@@ -41,7 +41,7 @@ model:
   heatmap_head:
     enable_history: true                # 启用历史热力图头
     enable_future: true                 # 启用未来热力图头
-    cond_dim: 512                       # 条件维度
+    cond_dim: 768                       # 增大条件维度 512 → 768（更强表达能力）
     num_inference_steps: 10             # 推理时扩散步数
 
   # 动作头配置
@@ -51,7 +51,7 @@ model:
     action_dim: 2                       # 2D 动作 (dx, dy)
     pred_horizon: 1                     # 预测步数
     num_diffusion_iters: 10             # 扩散步数
-    encoding_size: 768                  # 条件投影维度
+    encoding_size: 1024                 # 增大条件投影维度 768 → 1024
 
 # ============================================
 # 训练策略（4 阶段渐进式训练）
@@ -135,18 +135,18 @@ training:
         - dinov3_compat
 
 # ============================================
-# 优化器配置
+# 优化器配置 (针对 96GB 显存优化)
 # ============================================
 optim:
   optimizer: adamw
   
   # 分组学习率（针对 Diffusion 模型调优）
-  # Diffusion 模型推荐 LR: 1e-4 ~ 3e-4
-  heatmap_lr: 3.0e-4                    # 热力图头默认学习率
-  history_heatmap_lr: 3.0e-4            # 历史头（Diffusion）
-  future_heatmap_lr: 3.0e-4             # 未来头（Diffusion）
-  action_lr: 3.0e-4                     # 动作头（Diffusion）
-  fusion_lr: 1.0e-4                     # feature_fusion + llm_projector
+  # 大 batch 可以使用更高的学习率
+  heatmap_lr: 5.0e-4                    # 热力图头默认学习率（提高）
+  history_heatmap_lr: 5.0e-4            # 历史头（Diffusion）
+  future_heatmap_lr: 5.0e-4             # 未来头（Diffusion）
+  action_lr: 5.0e-4                     # 动作头（Diffusion）
+  fusion_lr: 2.0e-4                     # feature_fusion + llm_projector
   encoder_lr: 1.0e-5                    # vggt + dinov3_compat（冻结或微调）
 
   weight_decay: 1.0e-4                   # 降低 weight decay，对 Diffusion 更友好
@@ -154,9 +154,12 @@ optim:
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1                     # Warmup 比例 10%
-  batch_size: 2                         # 滑动窗口数据集
-  grad_accum_steps: 4                   # 有效 batch = 2 × 4 = 8
+  batch_size: 16                        # 96GB 显存: 2 → 16（8倍提升）
+  grad_accum_steps: 1                   # batch 够大，无需梯度累积
   use_ddp: false
+  
+  # 梯度检查点（可选，如果 OOM 可开启）
+  gradient_checkpointing: false
 
 # ============================================
 # 损失函数
@@ -196,11 +199,14 @@ loss:
   action_weight: 0.5                    # 动作损失权重
 
 # ============================================
-# GPU配置
+# GPU配置 (96GB 显存)
 # ============================================
 gpu:
   devices: [0]
   backend: nccl
+  # 显存优化选项
+  allow_tf32: true                      # 启用 TF32（A100/H100 加速）
+  cudnn_benchmark: true                 # 自动选择最优卷积算法
 
 # ============================================
 # 日志与保存
