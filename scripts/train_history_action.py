@@ -23,16 +23,28 @@ sys.path.insert(0, str(project_root))
 
 import yaml
 import torch
+
+# ============================================
+# CUDA 性能优化
+# ============================================
+torch.backends.cudnn.benchmark = True  # 自动选择最优卷积算法
+torch.set_float32_matmul_precision('medium')  # 矩阵乘法精度优化（A100/H100）
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import argparse
 from tqdm import tqdm
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import warnings
 import gc
 import logging
+import time
+from datetime import datetime, timedelta
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # 非交互式后端
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
@@ -45,8 +57,353 @@ from src.utils.loss import (
     SimplifiedHeatmapLoss,
 )
 from src.utils.logger import setup_logger
+from src.utils.notifier import FeishuNotifier, create_notifier
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================
+# 训练 ETA 估算器
+# ============================================
+
+class TrainingTimer:
+    """训练时间和 ETA 估算器"""
+    
+    def __init__(self, total_epochs: int, total_stages: int = 1):
+        self.total_epochs = total_epochs
+        self.total_stages = total_stages
+        self.start_time = None
+        self.epoch_times = []
+        self.stage_start_time = None
+        
+    def start(self):
+        """开始计时"""
+        self.start_time = time.time()
+        self.stage_start_time = time.time()
+        
+    def start_stage(self):
+        """开始新阶段"""
+        self.stage_start_time = time.time()
+        self.epoch_times = []
+        
+    def end_epoch(self):
+        """记录 epoch 结束"""
+        if self.stage_start_time is None:
+            return
+        elapsed = time.time() - self.stage_start_time
+        self.epoch_times.append(elapsed)
+        self.stage_start_time = time.time()
+        
+    def get_eta(self, current_epoch: int, total_epochs: int) -> str:
+        """获取预估剩余时间"""
+        if not self.epoch_times:
+            return "计算中..."
+        
+        avg_epoch_time = np.mean(self.epoch_times[-5:])  # 最近 5 个 epoch 的平均
+        remaining_epochs = total_epochs - current_epoch
+        eta_seconds = avg_epoch_time * remaining_epochs
+        
+        if eta_seconds < 60:
+            return f"{eta_seconds:.0f}秒"
+        elif eta_seconds < 3600:
+            return f"{eta_seconds/60:.1f}分钟"
+        else:
+            return f"{eta_seconds/3600:.1f}小时"
+    
+    def get_epoch_time(self) -> str:
+        """获取上一个 epoch 的用时"""
+        if not self.epoch_times:
+            return "N/A"
+        last_time = self.epoch_times[-1]
+        if last_time < 60:
+            return f"{last_time:.1f}s"
+        else:
+            return f"{last_time/60:.1f}min"
+    
+    def get_total_elapsed(self) -> str:
+        """获取总用时"""
+        if self.start_time is None:
+            return "N/A"
+        elapsed = time.time() - self.start_time
+        return str(timedelta(seconds=int(elapsed)))
+
+
+# ============================================
+# 训练曲线绘制器
+# ============================================
+
+class TrainingPlotter:
+    """训练曲线绘制器，每个 epoch 后更新保存图表"""
+    
+    def __init__(self, out_dir: Path, figsize: Tuple[int, int] = (14, 10)):
+        """
+        初始化绘制器
+        
+        Args:
+            out_dir: 输出目录
+            figsize: 图表尺寸
+        """
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.figsize = figsize
+        
+        # 存储历史数据
+        self.history = {
+            'epoch': [],
+            'stage': [],
+            'train_loss': [],
+            'val_loss': [],
+            'train_heatmap_loss': [],
+            'val_heatmap_loss': [],
+            'train_action_loss': [],
+            'val_action_loss': [],
+            'lr': [],
+            'is_best': [],
+        }
+        
+        # 阶段边界（用于绘制竖线）
+        self.stage_boundaries = []
+        self.current_stage = None
+        
+    def update(
+        self,
+        epoch: int,
+        stage_name: str,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+        lr: float = None,
+        is_best: bool = False,
+    ):
+        """
+        更新历史数据并保存图表
+        
+        Args:
+            epoch: 当前 epoch（全局编号）
+            stage_name: 阶段名称
+            train_metrics: 训练指标
+            val_metrics: 验证指标
+            lr: 当前学习率
+            is_best: 是否是最佳模型
+        """
+        # 记录阶段边界
+        if stage_name != self.current_stage:
+            if self.current_stage is not None:
+                self.stage_boundaries.append(len(self.history['epoch']))
+            self.current_stage = stage_name
+        
+        # 追加数据
+        self.history['epoch'].append(epoch)
+        self.history['stage'].append(stage_name)
+        self.history['train_loss'].append(train_metrics.get('total_loss', 0))
+        self.history['val_loss'].append(val_metrics.get('val_loss', 0))
+        self.history['train_heatmap_loss'].append(train_metrics.get('heatmap_loss', 0))
+        self.history['val_heatmap_loss'].append(val_metrics.get('val_heatmap_loss', 0))
+        self.history['train_action_loss'].append(train_metrics.get('action_loss', 0))
+        self.history['val_action_loss'].append(val_metrics.get('val_action_loss', 0))
+        self.history['lr'].append(lr or 0)
+        self.history['is_best'].append(is_best)
+        
+        # 保存图表
+        self.save_plot()
+        
+    def save_plot(self):
+        """生成并保存训练曲线图"""
+        if len(self.history['epoch']) == 0:
+            return
+        
+        epochs = self.history['epoch']
+        
+        # 创建图表：2x2 布局
+        fig, axes = plt.subplots(2, 2, figsize=self.figsize)
+        fig.suptitle('VLN Training Progress', fontsize=14, fontweight='bold')
+        
+        # 绘制阶段边界竖线的辅助函数
+        def draw_stage_lines(ax):
+            for idx in self.stage_boundaries:
+                if idx < len(epochs):
+                    ax.axvline(x=epochs[idx], color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        
+        # ========== 子图 1: Total Loss ==========
+        ax1 = axes[0, 0]
+        ax1.plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=1.5)
+        ax1.plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=1.5)
+        
+        # 标注最佳点
+        best_indices = [i for i, is_best in enumerate(self.history['is_best']) if is_best]
+        if best_indices:
+            best_epochs = [epochs[i] for i in best_indices]
+            best_vals = [self.history['val_loss'][i] for i in best_indices]
+            ax1.scatter(best_epochs, best_vals, c='gold', marker='*', s=100, zorder=5, label='Best Model')
+        
+        draw_stage_lines(ax1)
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Total Loss')
+        ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        
+        # ========== 子图 2: Heatmap Loss ==========
+        ax2 = axes[0, 1]
+        ax2.plot(epochs, self.history['train_heatmap_loss'], 'b-', label='Train Heatmap', linewidth=1.5)
+        ax2.plot(epochs, self.history['val_heatmap_loss'], 'r-', label='Val Heatmap', linewidth=1.5)
+        draw_stage_lines(ax2)
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss')
+        ax2.set_title('Heatmap Loss')
+        ax2.legend(loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        
+        # ========== 子图 3: Action Loss ==========
+        ax3 = axes[1, 0]
+        ax3.plot(epochs, self.history['train_action_loss'], 'b-', label='Train Action', linewidth=1.5)
+        ax3.plot(epochs, self.history['val_action_loss'], 'r-', label='Val Action', linewidth=1.5)
+        draw_stage_lines(ax3)
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Loss')
+        ax3.set_title('Action Loss')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, alpha=0.3)
+        
+        # ========== 子图 4: Learning Rate ==========
+        ax4 = axes[1, 1]
+        if any(lr > 0 for lr in self.history['lr']):
+            ax4.plot(epochs, self.history['lr'], 'g-', linewidth=1.5)
+            ax4.set_yscale('log')
+        draw_stage_lines(ax4)
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('Learning Rate')
+        ax4.set_title('Learning Rate Schedule')
+        ax4.grid(True, alpha=0.3)
+        
+        # 添加阶段标签
+        if self.stage_boundaries:
+            # 在底部添加阶段标注
+            unique_stages = []
+            seen = set()
+            for s in self.history['stage']:
+                if s not in seen:
+                    unique_stages.append(s)
+                    seen.add(s)
+            stage_text = " → ".join(unique_stages)
+            fig.text(0.5, 0.02, f"Stages: {stage_text}", ha='center', fontsize=10, style='italic')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+        
+        # 保存
+        save_path = self.out_dir / 'training_curves.png'
+        plt.savefig(save_path, dpi=120, bbox_inches='tight')
+        plt.close(fig)
+        
+        # 同时保存 JSON 数据（方便后续分析）
+        json_path = self.out_dir / 'training_history.json'
+        import json
+        with open(json_path, 'w') as f:
+            json.dump(self.history, f, indent=2)
+    
+    def get_summary(self) -> Dict:
+        """获取训练摘要"""
+        if not self.history['epoch']:
+            return {}
+        
+        best_idx = None
+        best_val = float('inf')
+        for i, (val, is_best) in enumerate(zip(self.history['val_loss'], self.history['is_best'])):
+            if is_best and val < best_val:
+                best_val = val
+                best_idx = i
+        
+        return {
+            'total_epochs': len(self.history['epoch']),
+            'best_epoch': self.history['epoch'][best_idx] if best_idx else None,
+            'best_val_loss': best_val if best_idx else None,
+            'final_train_loss': self.history['train_loss'][-1],
+            'final_val_loss': self.history['val_loss'][-1],
+        }
+
+
+# ============================================
+# 热力图可视化
+# ============================================
+
+def visualize_heatmap_predictions(
+    model: nn.Module,
+    batch: Dict,
+    output: Dict,
+    epoch: int,
+    step: int,
+    output_dir: Path,
+    num_samples: int = 2,
+):
+    """
+    可视化热力图预测结果
+    
+    Args:
+        model: 模型
+        batch: 输入 batch
+        output: 模型输出
+        epoch: 当前 epoch
+        step: 当前 step
+        output_dir: 输出目录
+        num_samples: 可视化样本数
+    """
+    vis_dir = output_dir / "visualizations"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # 获取数据
+        current_frames = batch['current_frame']  # [B, 3, H, W]
+        gt_heatmaps = batch['heatmap']           # [B, Hm, Wm]
+        
+        pred_heatmaps = output.get('history_heatmaps')  # [B, K, Hm, Wm]
+        if pred_heatmaps is None:
+            pred_heatmaps = output.get('future_heatmaps')
+        
+        if pred_heatmaps is None:
+            return
+        
+        # 取最后一个预测（对应当前帧）
+        if pred_heatmaps.dim() == 4:
+            pred_heatmaps = pred_heatmaps[:, -1]  # [B, Hm, Wm]
+        
+        B = min(num_samples, current_frames.shape[0])
+        
+        fig, axes = plt.subplots(B, 3, figsize=(12, 4 * B))
+        if B == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i in range(B):
+            # RGB 图像
+            rgb = current_frames[i].cpu().numpy().transpose(1, 2, 0)
+            rgb = np.clip(rgb, 0, 1)
+            axes[i, 0].imshow(rgb)
+            axes[i, 0].set_title(f"Input Frame")
+            axes[i, 0].axis('off')
+            
+            # GT 热力图
+            gt_hm = gt_heatmaps[i].cpu().numpy()
+            axes[i, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=1)
+            axes[i, 1].set_title(f"GT Heatmap (max={gt_hm.max():.2f})")
+            axes[i, 1].axis('off')
+            
+            # 预测热力图
+            pred_hm = pred_heatmaps[i].detach().cpu().numpy()
+            pred_hm = np.clip(pred_hm, 0, 1)
+            axes[i, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
+            axes[i, 2].set_title(f"Pred Heatmap (max={pred_hm.max():.2f})")
+            axes[i, 2].axis('off')
+        
+        plt.suptitle(f"Epoch {epoch}, Step {step}")
+        plt.tight_layout()
+        
+        save_path = vis_dir / f"epoch_{epoch:03d}_step_{step:05d}.png"
+        plt.savefig(save_path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        
+        return save_path
+        
+    except Exception as e:
+        logger.warning(f"Visualization failed: {e}")
+        return None
 
 
 def build_heatmap_loss(loss_cfg: Dict, loss_type: str = None) -> nn.Module:
@@ -661,6 +1018,30 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                     tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
                     tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
+            
+            # 定期可视化热力图预测
+            vis_interval = cfg['log'].get('vis_every_steps', 500)
+            if global_step % vis_interval == 0 and global_step > 0:
+                vis_path = visualize_heatmap_predictions(
+                    model=model,
+                    batch=batch,
+                    output=output,
+                    epoch=epoch,
+                    step=global_step,
+                    output_dir=Path(cfg['log']['out_dir']),
+                    num_samples=2,
+                )
+                if vis_path and tb_writer is not None:
+                    # 读取可视化图像并写入 TensorBoard
+                    try:
+                        import cv2
+                        vis_img = cv2.imread(str(vis_path))
+                        if vis_img is not None:
+                            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+                            vis_img = vis_img.transpose(2, 0, 1)  # HWC -> CHW
+                            tb_writer.add_image('train/heatmap_viz', vis_img, actual_step)
+                    except Exception as e:
+                        pass  # 忽略可视化写入错误
         
         # 定期清理显存
         if (i + 1) % 4 == 0:
@@ -696,7 +1077,7 @@ def train_one_epoch(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()  # 比 no_grad 更高效，禁用所有梯度跟踪
 def validate(
     model: SpatialMLLMPipeline,
     val_loader: DataLoader,
@@ -802,6 +1183,198 @@ def validate(
     }
 
 
+class CheckpointManager:
+    """管理检查点的保存、加载和清理"""
+    
+    def __init__(self, out_dir: str, max_ckpts: int = 3):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.max_ckpts = max_ckpts
+        self.best_val_loss = float('inf')
+        self.best_ckpt_path = None
+        self.ckpt_history = []  # [(path, val_loss, epoch)]
+    
+    def save(
+        self,
+        model: SpatialMLLMPipeline,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        epoch: int,
+        stage_idx: int,
+        stage_name: str,
+        metrics: Dict,
+        cfg: Dict,
+        is_best: bool = False,
+        scaler: GradScaler = None,
+    ) -> Path:
+        """保存检查点
+        
+        Args:
+            is_best: 是否是当前最佳模型
+            scaler: GradScaler 用于 AMP 断点续训
+        
+        Returns:
+            保存的检查点路径
+        """
+        stage_dir = self.out_dir / stage_name
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 收集可训练参数名
+        trainable_params = set()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_params.add(name)
+        
+        # 只保存可训练参数（节省空间）
+        trainable_state_dict = {
+            k: v for k, v in model.state_dict().items()
+            if k in trainable_params
+        }
+        
+        # 构建检查点
+        ckpt = {
+            'epoch': epoch,
+            'stage_idx': stage_idx,
+            'stage_name': stage_name,
+            'trainable_state_dict': trainable_state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'metrics': metrics,
+            'config': cfg,
+            'best_val_loss': self.best_val_loss,
+        }
+        
+        # 保存 GradScaler 状态（AMP）
+        if scaler is not None:
+            ckpt['scaler_state_dict'] = scaler.state_dict()
+        
+        # 保存定期检查点
+        ckpt_path = stage_dir / f"epoch_{epoch:03d}.pth"
+        torch.save(ckpt, ckpt_path)
+        file_size_mb = ckpt_path.stat().st_size / (1024**2)
+        print(f"💾 Checkpoint: {ckpt_path.name} ({file_size_mb:.1f} MB)")
+        
+        # 记录历史
+        val_loss = metrics.get('val_loss', float('inf'))
+        self.ckpt_history.append((ckpt_path, val_loss, epoch))
+        
+        # 保存最佳模型（全局最佳，放在根目录）
+        if is_best:
+            self.best_val_loss = val_loss
+            best_path = self.out_dir / "best_model.pth"
+            torch.save(ckpt, best_path)
+            self.best_ckpt_path = best_path
+            print(f"⭐ Best model updated: val_loss={val_loss:.4f}")
+        
+        # 保存最新检查点（用于恢复训练）
+        latest_path = self.out_dir / "latest.pth"
+        torch.save(ckpt, latest_path)
+        
+        # 清理旧检查点（每个阶段保留 max_ckpts 个）
+        self._cleanup_old_ckpts(stage_dir)
+        
+        return ckpt_path
+    
+    def _cleanup_old_ckpts(self, stage_dir: Path):
+        """清理旧的检查点，只保留最新的 max_ckpts 个"""
+        ckpts = sorted(stage_dir.glob("epoch_*.pth"), key=lambda p: p.stat().st_mtime)
+        while len(ckpts) > self.max_ckpts:
+            old_ckpt = ckpts.pop(0)
+            old_ckpt.unlink()
+            print(f"🗑️  Removed old checkpoint: {old_ckpt.name}")
+    
+    def load(self, ckpt_path: str) -> Dict:
+        """加载检查点"""
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        return ckpt
+    
+    def get_latest(self) -> Optional[Path]:
+        """获取最新检查点路径"""
+        latest = self.out_dir / "latest.pth"
+        return latest if latest.exists() else None
+    
+    def get_best(self) -> Optional[Path]:
+        """获取最佳检查点路径"""
+        best = self.out_dir / "best_model.pth"
+        return best if best.exists() else None
+
+
+def load_checkpoint_for_resume(
+    ckpt_path: str,
+    model: SpatialMLLMPipeline,
+    optimizer: torch.optim.Optimizer = None,
+    scheduler = None,
+    scaler: GradScaler = None,
+    logger = None,
+) -> Dict:
+    """加载检查点用于断点续训
+    
+    Args:
+        ckpt_path: 检查点路径
+        model: 模型
+        optimizer: 优化器（可选）
+        scheduler: 调度器（可选）
+        scaler: GradScaler（可选，用于 AMP）
+        logger: 日志器
+    
+    Returns:
+        包含 epoch, stage_idx, stage_name, metrics, best_val_loss 的字典
+    """
+    if logger:
+        logger.info(f"📂 Loading checkpoint: {ckpt_path}")
+    
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    
+    # 加载模型参数
+    state_dict = ckpt.get('trainable_state_dict', {})
+    if state_dict:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if logger:
+            logger.info(f"  ✓ Loaded {len(state_dict)} trainable parameters")
+            if missing:
+                logger.info(f"  Missing keys: {len(missing)} (using pretrained)")
+    
+    # 加载优化器状态
+    if optimizer is not None and 'optimizer_state_dict' in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if logger:
+                logger.info("  ✓ Optimizer state restored")
+        except Exception as e:
+            if logger:
+                logger.warning(f"  ⚠ Failed to restore optimizer: {e}")
+    
+    # 加载调度器状态
+    if scheduler is not None and 'scheduler_state_dict' in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            if logger:
+                logger.info("  ✓ Scheduler state restored")
+        except Exception as e:
+            if logger:
+                logger.warning(f"  ⚠ Failed to restore scheduler: {e}")
+    
+    # 加载 GradScaler 状态（AMP）
+    if scaler is not None and 'scaler_state_dict' in ckpt:
+        try:
+            scaler.load_state_dict(ckpt['scaler_state_dict'])
+            if logger:
+                logger.info("  ✓ GradScaler state restored")
+        except Exception as e:
+            if logger:
+                logger.warning(f"  ⚠ Failed to restore scaler: {e}")
+    
+    return {
+        'epoch': ckpt.get('epoch', 0),
+        'stage_idx': ckpt.get('stage_idx', 0),
+        'stage_name': ckpt.get('stage_name', ''),
+        'metrics': ckpt.get('metrics', {}),
+        'best_val_loss': ckpt.get('best_val_loss', float('inf')),
+    }
+
+
+# Legacy function for compatibility
 def save_checkpoint(
     model: SpatialMLLMPipeline,
     optimizer: torch.optim.Optimizer,
@@ -811,13 +1384,12 @@ def save_checkpoint(
     metrics: Dict,
     cfg: Dict
 ):
-    """保存检查点"""
+    """保存检查点（旧接口，保持兼容）"""
     out_dir = Path(cfg['log']['out_dir']) / stage_name
     out_dir.mkdir(parents=True, exist_ok=True)
     
     ckpt_path = out_dir / f"epoch_{epoch}.pth"
     
-    # 只保存可训练参数
     trainable_params = set()
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -851,7 +1423,9 @@ def main():
     parser.add_argument('--config', type=str, default='configs/training_config_full_model.yaml',
                         help='配置文件路径')
     parser.add_argument('--resume', type=str, default=None, 
-                        help='从检查点恢复（自动检测阶段和 epoch）')
+                        help='从检查点恢复（路径或 "latest"）')
+    parser.add_argument('--auto-resume', action='store_true',
+                        help='自动从最新检查点恢复（如果存在）')
     
     # 阶段控制参数
     parser.add_argument('--stage', type=str, default=None,
@@ -916,9 +1490,10 @@ def main():
         cache_poses=sw_cfg.get('cache_poses', True),
     )
     
+    val_split = cfg['data'].get('val_split', 'val')  # 支持 val_unseen 等
     val_dataset = VLNSlidingWindowDataset(
         root=cfg['data']['root'],
-        split='val',
+        split=val_split,
         min_history=sw_cfg['min_history'],
         num_history_sample=sw_cfg['num_history_sample'],
         image_size=tuple(cfg['data']['image_size']),
@@ -934,6 +1509,53 @@ def main():
     logger.info("🏗️  Building model...")
     model = build_model(cfg)
     
+    # 创建检查点管理器
+    ckpt_manager = CheckpointManager(
+        out_dir=cfg['log']['out_dir'],
+        max_ckpts=cfg['log'].get('max_ckpts', 3)
+    )
+    
+    # 创建通知器
+    notifier = create_notifier(cfg)
+    if notifier:
+        logger.info("📢 飞书通知已启用")
+    
+    # 创建训练曲线绘制器
+    plotter = TrainingPlotter(out_dir=log_dir)
+    logger.info(f"📈 训练曲线将保存至: {log_dir / 'training_curves.png'}")
+    
+    # 断点续训
+    resume_epoch = 0
+    resume_stage_idx = 0
+    resume_path = None
+    
+    # 确定恢复路径
+    if args.resume:
+        # 显式指定检查点路径
+        if args.resume == 'latest':
+            resume_path = ckpt_manager.get_latest()
+            if resume_path is None:
+                logger.warning("⚠️ No latest checkpoint found, starting from scratch")
+        else:
+            resume_path = Path(args.resume)
+    elif args.auto_resume:
+        # 自动检测最新检查点
+        resume_path = ckpt_manager.get_latest()
+        if resume_path:
+            logger.info(f"🔄 Auto-resume: Found checkpoint {resume_path}")
+        else:
+            logger.info("🆕 Auto-resume: No checkpoint found, starting fresh")
+    
+    if resume_path and Path(resume_path).exists():
+        resume_info = load_checkpoint_for_resume(
+            str(resume_path), model, optimizer=None, scheduler=None, logger=logger
+        )
+        resume_epoch = resume_info['epoch']
+        resume_stage_idx = resume_info['stage_idx']
+        ckpt_manager.best_val_loss = resume_info['best_val_loss']
+        logger.info(f"  📌 Resuming from epoch {resume_epoch}, stage {resume_stage_idx}")
+        logger.info(f"  📊 Best val_loss so far: {ckpt_manager.best_val_loss:.4f}")
+    
     # Dry run 模式
     if args.dry_run:
         logger.info("=" * 60)
@@ -946,7 +1568,7 @@ def main():
     stage_names = [s['name'] for s in all_stages]
     
     # 确定起始阶段
-    start_stage_idx = 0
+    start_stage_idx = resume_stage_idx  # 默认使用恢复的阶段
     if args.stage_index is not None:
         start_stage_idx = args.stage_index
         logger.info(f"📌 使用阶段索引: {start_stage_idx}")
@@ -975,6 +1597,21 @@ def main():
         marker = "▶" if start_stage_idx <= i < end_stage_idx else "○"
         logger.info(f"  {marker} Stage {i}: {s['name']} ({s['epochs']} epochs, hm={s['hm_size']})")
     logger.info("=" * 60)
+    
+    # 计算总 epoch 数
+    total_all_epochs = sum(s['epochs'] for s in all_stages[start_stage_idx:end_stage_idx])
+    global_epoch_counter = 0  # 全局 epoch 计数器
+    
+    # 发送训练开始通知
+    if notifier:
+        try:
+            notifier.send_training_start(
+                config_name=Path(args.config).stem,
+                stages=all_stages[start_stage_idx:end_stage_idx],
+                total_epochs=total_all_epochs,
+            )
+        except Exception as e:
+            logger.warning(f"发送开始通知失败: {e}")
     
     # 多阶段训练
     for stage_idx in range(start_stage_idx, end_stage_idx):
@@ -1009,23 +1646,32 @@ def main():
         logger.info(f"  Train action: {stage_cfg.get('train_action', True)}")
         
         # 构建数据加载器
+        # DataLoader 性能优化参数
+        num_workers = cfg['data']['num_workers']
+        prefetch_factor = cfg['data'].get('prefetch_factor', 2)
+        persistent_workers = num_workers > 0  # 保持 worker 进程，减少启动开销
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg['optim']['batch_size'],
             shuffle=True,
-            num_workers=cfg['data']['num_workers'],
+            num_workers=num_workers,
             pin_memory=cfg['data']['pin_memory'],
             collate_fn=collate_fn,
             drop_last=True,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers,
         )
         
         val_loader = DataLoader(
             val_dataset,
             batch_size=cfg['optim']['batch_size'],
             shuffle=False,
-            num_workers=cfg['data']['num_workers'],
+            num_workers=num_workers,
             pin_memory=cfg['data']['pin_memory'],
             collate_fn=collate_fn,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers,
         )
         
         # 设置可训练模块
@@ -1047,8 +1693,19 @@ def main():
         scheduler = build_scheduler(optimizer, cfg, total_steps)
         scaler = GradScaler()
         
+        # 断点续训：加载优化器、调度器和 scaler 状态
+        if resume_path and stage_idx == resume_stage_idx:
+            if Path(resume_path).exists():
+                load_checkpoint_for_resume(
+                    str(resume_path), model, 
+                    optimizer=optimizer, 
+                    scheduler=scheduler, 
+                    scaler=scaler,  # 恢复 AMP 状态
+                    logger=logger
+                )
+        
         # 训练循环
-        best_val_loss = float('inf')
+        best_val_loss = ckpt_manager.best_val_loss  # 使用全局最佳
         steps_per_epoch = len(train_loader) // grad_accum_steps
         global_step_offset = 0
         
@@ -1057,12 +1714,34 @@ def main():
             global_step_offset += prev_epochs * steps_per_epoch
         
         # 确定起始 epoch
-        start_epoch = args.start_epoch if (stage_idx == start_stage_idx) else 1
+        if stage_idx == start_stage_idx and resume_epoch > 0:
+            start_epoch = resume_epoch + 1  # 从恢复的下一个 epoch 开始
+        elif stage_idx == start_stage_idx:
+            start_epoch = args.start_epoch
+        else:
+            start_epoch = 1
         total_epochs = stage_cfg['epochs']
         
+        # Early stopping
+        patience = cfg['validation'].get('patience', 5)
+        no_improve_count = 0
+        
+        # 训练计时器
+        timer = TrainingTimer(total_epochs=total_epochs)
+        timer.start()
+        
+        # 可视化配置
+        vis_interval = cfg['log'].get('vis_every_steps', 500)
+        vis_dir = Path(cfg['log']['out_dir'])
+        
         for epoch in range(start_epoch, total_epochs + 1):
+            timer.start_stage()  # 开始计时
+            
             logger.info("=" * 80)
             logger.info(f"[Stage {stage_idx+1}: {stage_name}] Epoch {epoch}/{total_epochs}")
+            if epoch > start_epoch:
+                eta = timer.get_eta(epoch - 1, total_epochs)
+                logger.info(f"  ⏱️  Last epoch: {timer.get_epoch_time()} | ETA: {eta} | Total: {timer.get_total_elapsed()}")
             logger.info("=" * 80)
             
             # 训练
@@ -1073,6 +1752,8 @@ def main():
                 stage_idx=stage_idx, stage_name=stage_name, stage_cfg=stage_cfg,
                 max_batches=args.max_batches
             )
+            
+            timer.end_epoch()  # 记录 epoch 结束
             
             # 验证
             val_metrics = validate(
@@ -1088,25 +1769,103 @@ def main():
                 f"(hm: {val_metrics['val_heatmap_loss']:.4f}, act: {val_metrics['val_action_loss']:.4f})"
             )
             
-            # 保存检查点
-            if epoch % cfg['log']['save_every_epochs'] == 0:
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, stage_name,
-                    {**train_metrics, **val_metrics}, cfg
+            # 显示 ETA
+            eta = timer.get_eta(epoch, total_epochs)
+            logger.info(f"  ⏱️  Epoch time: {timer.get_epoch_time()} | ETA: {eta}")
+            
+            # 检查是否为最佳模型
+            is_best = val_metrics['val_loss'] < best_val_loss
+            if is_best:
+                best_val_loss = val_metrics['val_loss']
+                no_improve_count = 0
+                logger.info(f"  ⭐ New best val_loss: {best_val_loss:.4f}")
+            else:
+                no_improve_count += 1
+                logger.info(f"  No improvement for {no_improve_count}/{patience} epochs")
+            
+            # 更新全局 epoch 计数器
+            global_epoch_counter += 1
+            
+            # 获取当前学习率
+            current_lr = scheduler.get_last_lr()[0] if scheduler else 0
+            
+            # 更新训练曲线图
+            plotter.update(
+                epoch=global_epoch_counter,
+                stage_name=stage_name,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                lr=current_lr,
+                is_best=is_best,
+            )
+            logger.info(f"  📈 训练曲线已更新: {log_dir / 'training_curves.png'}")
+            
+            # 发送飞书通知
+            if notifier:
+                try:
+                    notifier.send_epoch_report(
+                        epoch=epoch,
+                        total_epochs=total_epochs,
+                        stage_name=stage_name,
+                        stage_idx=stage_idx,
+                        total_stages=len(all_stages),
+                        train_metrics=train_metrics,
+                        val_metrics=val_metrics,
+                        eta=eta,
+                        epoch_time=timer.get_epoch_time(),
+                        is_best=is_best,
+                        best_val_loss=best_val_loss,
+                    )
+                except Exception as e:
+                    logger.warning(f"发送通知失败: {e}")
+            
+            # 保存检查点（使用 CheckpointManager，包含 scaler 状态）
+            if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
+                ckpt_manager.save(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    stage_idx=stage_idx,
+                    stage_name=stage_name,
+                    metrics={**train_metrics, **val_metrics},
+                    cfg=cfg,
+                    is_best=is_best,
+                    scaler=scaler,  # 保存 AMP 状态
                 )
             
-            # 保存最佳模型
-            if val_metrics['val_loss'] < best_val_loss:
-                best_val_loss = val_metrics['val_loss']
-                logger.info(f"  ✨ New best val_loss: {best_val_loss:.4f}")
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, stage_name + '_best',
-                    {**train_metrics, **val_metrics}, cfg
-                )
+            # Early stopping
+            if no_improve_count >= patience:
+                logger.info(f"  🛑 Early stopping triggered after {patience} epochs without improvement")
+                break
+        
+        # 阶段结束日志
+        logger.info(f"  📊 Stage {stage_name} completed in {timer.get_total_elapsed()}")
     
     logger.info("=" * 60)
     logger.info("✅ 训练完成！")
     logger.info("=" * 60)
+    
+    # 输出训练摘要
+    summary = plotter.get_summary()
+    if summary:
+        logger.info(f"📊 训练摘要:")
+        logger.info(f"   总 Epochs: {summary.get('total_epochs', 'N/A')}")
+        logger.info(f"   最佳 Epoch: {summary.get('best_epoch', 'N/A')}")
+        logger.info(f"   最佳 val_loss: {summary.get('best_val_loss', 'N/A'):.4f}" if summary.get('best_val_loss') else "")
+        logger.info(f"   最终 train_loss: {summary.get('final_train_loss', 0):.4f}")
+        logger.info(f"   最终 val_loss: {summary.get('final_val_loss', 0):.4f}")
+    
+    # 发送训练完成通知
+    if notifier:
+        try:
+            notifier.send_training_complete(
+                total_time=timer.get_total_elapsed() if timer else "N/A",
+                best_val_loss=best_val_loss,
+                final_stage=stage_name if 'stage_name' in dir() else "完成",
+            )
+        except Exception as e:
+            logger.warning(f"发送完成通知失败: {e}")
     
     if tb_writer is not None:
         tb_writer.close()
