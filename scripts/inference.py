@@ -28,7 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.plotting_config import configure_matplotlib_fonts
 from src.utils.logger import setup_logger
-from src.models.spatial_mllm_compat import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
+from src.models.pipeline import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
 
 configure_matplotlib_fonts()
 logger = logging.getLogger("inference")

@@ -1,6 +1,6 @@
 """
 Memory-Efficient LLM Integration
-===============================
+================================
 
 This module provides memory-efficient loading of large LLMs like Qwen2.5-VL
 that can work alongside other large models (DINOv3) by dynamically loading
@@ -17,10 +17,11 @@ import torch
 import torch.nn as nn
 import logging
 import gc
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from contextlib import contextmanager
 
-from .real_llm_integration import RealLLMIntegration, RealLLMConfig
+from .config import RealLLMConfig
+from .integration import RealLLMIntegration
 
 logger = logging.getLogger(__name__)
 
@@ -147,33 +148,3 @@ def create_memory_efficient_llm(
 
     return MemoryEfficientLLM(config)
 
-
-# Testing and validation
-if __name__ == "__main__":
-    # Test memory-efficient LLM
-    memory_llm = create_memory_efficient_llm(
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    print("Memory-efficient LLM created successfully!")
-
-    # Test with dummy inputs
-    batch_size, num_keyframes, num_patches, feature_dim = 1, 4, 196, 2048
-    dummy_features = torch.randn(batch_size, num_keyframes, num_patches, feature_dim)
-    dummy_observation = torch.randn(1, 3, 224, 224)
-    dummy_video = torch.randn(1, 4, 3, 224, 224)
-
-    with torch.no_grad():
-        output = memory_llm(
-            fused_features=dummy_features,
-            instruction_text="Navigate through this space",
-            current_observation=dummy_observation,
-            video_frames=dummy_video
-        )
-
-    print(f"Output keys: {list(output.keys())}")
-    for key, value in output.items():
-        if isinstance(value, torch.Tensor):
-            print(f"{key}: {value.shape}")
-        else:
-            print(f"{key}: {type(value)}")

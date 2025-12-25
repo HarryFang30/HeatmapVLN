@@ -27,10 +27,9 @@ import logging
 from dataclasses import dataclass
 
 from ..data import create_keyframe_selector
-from .dinov3_compatibility import create_dinov3_compatibility_layer
+from .dinov3 import create_dinov3_compatibility_layer
 from .vggt.models.vggt import VGGT
-from .real_llm_integration import create_real_llm_integration
-from .memory_efficient_llm import create_memory_efficient_llm
+from .llm import create_real_llm_integration, create_memory_efficient_llm
 from .action import DiffusionActionHead, DiffusionActionConfig
 from .heatmap import DiffusionHeatmapHead, DiffusionHeatmapConfig
 

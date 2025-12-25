@@ -22,6 +22,12 @@ from .hub import (
     DINOV3_MODELS,
 )
 from . import vggt_compat
+from .compatibility import (
+    DINOv3CompatibilityLayer,
+    DINOv3CompatConfig,
+    create_dinov3_compatibility_layer,
+    DINOV3_EMBED_DIMS,
+)
 
 __all__ = [
     'DinoVisionTransformer',
@@ -39,4 +45,9 @@ __all__ = [
     'load_local_dinov3',
     'DINOV3_MODELS',
     'vggt_compat',
+    # Compatibility layer
+    'DINOv3CompatibilityLayer',
+    'DINOv3CompatConfig',
+    'create_dinov3_compatibility_layer',
+    'DINOV3_EMBED_DIMS',
 ]

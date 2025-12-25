@@ -26,9 +26,9 @@ from typing import Dict, List, Optional, Tuple, Union
 import logging
 from dataclasses import dataclass
 
-from .dinov3.vision_transformer import DinoVisionTransformer, vit_base, vit_large, vit_giant
-from .dinov3.hub import load_safetensors_weights, load_local_dinov3, dinov3_vit7b16, load_dinov3_from_config
-from ..utils.path_utils import resolve_model_path
+from .vision_transformer import DinoVisionTransformer, vit_base, vit_large, vit_giant
+from .hub import load_safetensors_weights, load_local_dinov3, dinov3_vit7b16, load_dinov3_from_config
+from ...utils.path_utils import resolve_model_path
 
 logger = logging.getLogger(__name__)
 

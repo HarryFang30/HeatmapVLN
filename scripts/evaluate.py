@@ -27,7 +27,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.spatial_mllm_compat import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
+from src.models.pipeline import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.utils.loss import SimplifiedHeatmapLoss, NeRFRippleHeatmapLoss
 

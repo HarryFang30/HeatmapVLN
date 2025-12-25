@@ -48,14 +48,24 @@ from .dinov3.hub import (
 )
 
 # Integration layers (active components)
-from .dinov3_compatibility import (
+from .dinov3 import (
     DINOv3CompatibilityLayer,
     DINOv3CompatConfig,
-    create_dinov3_compatibility_layer
+    create_dinov3_compatibility_layer,
+    DINOV3_EMBED_DIMS,
+)
+
+# LLM Integration
+from .llm import (
+    RealLLMConfig,
+    RealLLMIntegration,
+    create_real_llm_integration,
+    MemoryEfficientLLM,
+    create_memory_efficient_llm,
 )
 
 # Complete pipeline integration
-from .spatial_mllm_compat import (
+from .pipeline import (
     SpatialMLLMPipeline,
     SpatialMLLMIntegrationConfig,
     create_spatial_mllm_pipeline
@@ -165,6 +175,14 @@ __all__ = [
     'DINOv3CompatibilityLayer',
     'DINOv3CompatConfig',
     'create_dinov3_compatibility_layer',
+    'DINOV3_EMBED_DIMS',
+    
+    # LLM Integration
+    'RealLLMConfig',
+    'RealLLMIntegration',
+    'create_real_llm_integration',
+    'MemoryEfficientLLM',
+    'create_memory_efficient_llm',
 
     # Complete Pipeline
     'SpatialMLLMPipeline',

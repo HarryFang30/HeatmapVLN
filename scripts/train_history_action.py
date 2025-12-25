@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
-from src.models.spatial_mllm_compat import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
+from src.models.pipeline import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
 from src.models.action import DiffusionActionHead, DiffusionActionConfig
 from src.utils.loss import (
     NavigationHeatmapLoss,
