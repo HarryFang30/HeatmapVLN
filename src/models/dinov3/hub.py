@@ -209,20 +209,38 @@ def dinov3_vit7b16(
 
     Returns:
         DinoVisionTransformer: The model instance
+        
+    NOTE: All parameters are aligned with config.json in models/dinov3/:
+        - hidden_size: 4096
+        - num_hidden_layers: 40  
+        - num_attention_heads: 32
+        - intermediate_size: 8192 (ffn_ratio = 8192/4096 = 2.0)
+        - patch_size: 16
+        - image_size: 224
+        - query_bias/key_bias/value_bias: false
+        - layerscale_value: 1.0
+        - use_gated_mlp: true (SwiGLU)
+        - num_register_tokens: 4
+        - rope_theta: 100.0
+        - pos_embed_rescale: 2.0
     """
+    # Use kwargs to allow override, but default to config.json values
     model_args = {
-        "patch_size": 16,
-        "embed_dim": 4096,
-        "depth": 40,
-        "num_heads": 32,
-        "ffn_ratio": 2.0,  # 8192 / 4096 = 2.0 based on config
-        "qkv_bias": False,  # Based on config
-        "layerscale_init": 1.0,  # Based on config
-        "norm_layer": "layernormbf16",
-        "ffn_layer": "swiglu" if kwargs.get('use_gated_mlp', True) else "mlp",
-        "n_storage_tokens": 4,
-        "pos_embed_rope_base": 100.0,
-        "pos_embed_rope_rescale_coords": 2.0,
+        "img_size": kwargs.pop('img_size', 224),  # From config.json image_size
+        "patch_size": kwargs.pop('patch_size', 16),  # From config.json patch_size
+        "embed_dim": 4096,  # From config.json hidden_size
+        "depth": 40,  # From config.json num_hidden_layers
+        "num_heads": 32,  # From config.json num_attention_heads
+        "ffn_ratio": 2.0,  # 8192 / 4096 = 2.0 (intermediate_size / hidden_size)
+        "qkv_bias": False,  # From config.json query_bias/key_bias/value_bias = false
+        "proj_bias": True,  # From config.json proj_bias = true
+        "ffn_bias": True,  # From config.json mlp_bias = true
+        "layerscale_init": 1.0,  # From config.json layerscale_value
+        "norm_layer": "layernormbf16",  # layer_norm_eps: 1e-05
+        "ffn_layer": "swiglu",  # From config.json use_gated_mlp = true
+        "n_storage_tokens": 4,  # From config.json num_register_tokens
+        "pos_embed_rope_base": 100.0,  # From config.json rope_theta
+        "pos_embed_rope_rescale_coords": 2.0,  # From config.json pos_embed_rescale
         **kwargs
     }
 

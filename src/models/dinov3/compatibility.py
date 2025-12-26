@@ -33,6 +33,80 @@ from ...utils.path_utils import resolve_model_path
 logger = logging.getLogger(__name__)
 
 
+def validate_dinov3_config(config_path: str = "./models/dinov3") -> Dict:
+    """
+    Validate DINOv3 configuration by reading config.json.
+    
+    Args:
+        config_path: Path to DINOv3 model directory containing config.json
+        
+    Returns:
+        Dictionary with validated configuration values
+        
+    Raises:
+        FileNotFoundError: If config.json not found
+        ValueError: If configuration values are inconsistent
+    """
+    import json
+    from pathlib import Path
+    
+    config_file = Path(config_path) / "config.json"
+    if not config_file.exists():
+        # Try to resolve path
+        try:
+            resolved_path = resolve_model_path(config_path, "DINOv3")
+            config_file = Path(resolved_path) / "config.json"
+        except FileNotFoundError:
+            logger.warning(f"DINOv3 config.json not found at {config_path}")
+            # Return defaults matching the expected 7B model
+            return {
+                'image_size': 224,
+                'patch_size': 16,
+                'hidden_size': 4096,
+                'num_hidden_layers': 40,
+                'num_attention_heads': 32,
+                'intermediate_size': 8192,
+                'num_register_tokens': 4,
+                'use_gated_mlp': True,
+                'qkv_bias': False,
+                'layerscale_value': 1.0,
+                'rope_theta': 100.0,
+                'torch_dtype': 'float32',
+            }
+    
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    
+    # Validate and return key parameters
+    validated = {
+        'image_size': config.get('image_size', 224),
+        'patch_size': config.get('patch_size', 16),
+        'hidden_size': config.get('hidden_size', 4096),
+        'num_hidden_layers': config.get('num_hidden_layers', 40),
+        'num_attention_heads': config.get('num_attention_heads', 32),
+        'intermediate_size': config.get('intermediate_size', 8192),
+        'num_register_tokens': config.get('num_register_tokens', 4),
+        'use_gated_mlp': config.get('use_gated_mlp', True),
+        'qkv_bias': config.get('query_bias', False) or config.get('key_bias', False) or config.get('value_bias', False),
+        'layerscale_value': config.get('layerscale_value', 1.0),
+        'rope_theta': config.get('rope_theta', 100.0),
+        'torch_dtype': config.get('torch_dtype', 'float32'),
+    }
+    
+    # Log any warnings for common misconfigurations
+    if validated['patch_size'] not in [14, 16]:
+        logger.warning(f"Unusual patch_size: {validated['patch_size']}")
+    
+    if validated['hidden_size'] == 4096 and validated['num_hidden_layers'] == 40:
+        logger.info("Detected DINOv3-7B model configuration")
+    elif validated['hidden_size'] == 1024 and validated['num_hidden_layers'] == 24:
+        logger.info("Detected DINOv3-Large model configuration")
+    elif validated['hidden_size'] == 768 and validated['num_hidden_layers'] == 12:
+        logger.info("Detected DINOv3-Base model configuration")
+    
+    return validated
+
+
 # DINOv3 embedding dimensions by model size
 DINOV3_EMBED_DIMS = {
     "base": 768,
@@ -44,11 +118,17 @@ DINOV3_EMBED_DIMS = {
 
 @dataclass
 class DINOv3CompatConfig:
-    """Configuration for DINOv3 compatibility layer."""
+    """Configuration for DINOv3 compatibility layer.
+    
+    NOTE: Default values are aligned with the local model config.json:
+    - image_size: 224 (from config.json)
+    - patch_size: 16 (from config.json)
+    - dtype: float32 (from config.json torch_dtype)
+    """
     # Model selection
-    model_size: str = "base"  # Options: base, large, giant, 7b
-    patch_size: int = 14  # DINOv3 default patch size
-    img_size: int = 518  # DINOv3 default image size
+    model_size: str = "7b"  # Options: base, large, giant, 7b (local model is 7b)
+    patch_size: int = 16  # DINOv3 patch size (MUST match config.json: 16)
+    img_size: int = 224  # DINOv3 image size (MUST match config.json: 224)
     
     # Compatibility settings
     target_embed_dim: int = 1024  # Target embedding dimension for VGGT compatibility
@@ -65,7 +145,7 @@ class DINOv3CompatConfig:
     
     # Device settings
     device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.float32  # Match config.json torch_dtype
 
 
 class DINOv3CompatibilityLayer(nn.Module):
@@ -370,28 +450,33 @@ class DINOv3CompatibilityLayer(nn.Module):
 
 
 def create_dinov3_compatibility_layer(
-    model_size: str = "large",
-    patch_size: int = 14,
-    img_size: int = 518,
+    model_size: str = "7b",  # Default to local 7B model
+    patch_size: int = 16,  # MUST match config.json
+    img_size: int = 224,  # MUST match config.json
     target_embed_dim: int = 1024,
     align_with_vggt: bool = True,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.float32  # Match config.json torch_dtype
 ) -> DINOv3CompatibilityLayer:
     """
     Factory function to create DINOv3 compatibility layer.
     
     Args:
-        model_size: DINOv3 model size ("base", "large", "giant")
-        patch_size: Patch size for vision transformer
-        img_size: Input image size  
+        model_size: DINOv3 model size ("base", "large", "giant", "7b")
+                   Default is "7b" to match local model.
+        patch_size: Patch size for vision transformer (default 16, from config.json)
+        img_size: Input image size (default 224, from config.json)
         target_embed_dim: Target embedding dimension for compatibility
         align_with_vggt: Enable VGGT feature alignment
         device: Computing device
-        dtype: Model precision
+        dtype: Model precision (default float32, from config.json)
         
     Returns:
         Configured DINOv3CompatibilityLayer
+        
+    NOTE: Default values are aligned with models/dinov3/config.json.
+          If using different image sizes (e.g., 518), RoPE interpolation
+          will be applied automatically, but may affect quality.
     """
     config = DINOv3CompatConfig(
         model_size=model_size,

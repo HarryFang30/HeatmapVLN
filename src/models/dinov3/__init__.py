@@ -27,6 +27,7 @@ from .compatibility import (
     DINOv3CompatConfig,
     create_dinov3_compatibility_layer,
     DINOV3_EMBED_DIMS,
+    validate_dinov3_config,
 )
 
 __all__ = [
@@ -50,4 +51,5 @@ __all__ = [
     'DINOv3CompatConfig',
     'create_dinov3_compatibility_layer',
     'DINOV3_EMBED_DIMS',
+    'validate_dinov3_config',  # Config validation utility
 ]

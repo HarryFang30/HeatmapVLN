@@ -168,7 +168,7 @@ __all__ = [
     
     # Model Loading & Utilities
     'load_dinov3_model',
-    'load_pretrained_model',
+    'load_local_dinov3',  # Replaced undefined load_pretrained_model
     'verify_model_integrity',
     
     # Integration Components (active)

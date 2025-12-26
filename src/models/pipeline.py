@@ -45,13 +45,14 @@ class SpatialMLLMIntegrationConfig:
     sampling_method: str = "hybrid"  # greedy_coverage, novelty_weighted, hybrid
     
     # Model configurations
-    dinov3_model_size: str = "large"  # base, large, giant
-    dinov3_patch_size: int = 14
-    dinov3_img_size: int = 518
+    # NOTE: DINOv3 defaults aligned with models/dinov3/config.json
+    dinov3_model_size: str = "7b"  # base, large, giant, 7b (local model is 7b)
+    dinov3_patch_size: int = 16  # From config.json patch_size
+    dinov3_img_size: int = 224  # From config.json image_size
     
     # VGGT configuration
-    vggt_img_size: int = 518
-    vggt_patch_size: int = 14
+    vggt_img_size: int = 518  # VGGT uses 518
+    vggt_patch_size: int = 14  # VGGT uses 14
     vggt_embed_dim: int = 1024
     
     # Feature fusion configuration  
@@ -98,7 +99,8 @@ class SpatialMLLMIntegrationConfig:
     
     # Performance settings
     device: str = "cuda"
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype = torch.float32  # Match DINOv3 config.json torch_dtype
+    dinov3_dtype: torch.dtype = torch.float32  # Separate dtype for DINOv3 (from config.json)
     vggt_compute_dtype: torch.dtype = torch.float32
     enable_gradient_checkpointing: bool = False
 
@@ -186,15 +188,15 @@ class SpatialMLLMPipeline(nn.Module):
         dinov3_device = config.dinov3_gpu if config.use_multi_gpu else config.device
         # Note: The actual model in /models/dinov3 is 7B size (4096 hidden, 40 layers)
         # The compatibility layer will automatically load from the local safetensors
-        actual_dinov3_model_size = "7b"  # Based on actual local model analysis
+        # Config values are aligned with models/dinov3/config.json
         self.dinov3_compat = create_dinov3_compatibility_layer(
-            model_size=actual_dinov3_model_size,
-            patch_size=config.dinov3_patch_size,
-            img_size=config.dinov3_img_size,
+            model_size=config.dinov3_model_size,  # "7b" by default
+            patch_size=config.dinov3_patch_size,  # 16 (from config.json)
+            img_size=config.dinov3_img_size,  # 224 (from config.json)
             target_embed_dim=config.vggt_embed_dim,  # Match VGGT dimensions
             align_with_vggt=True,
             device=dinov3_device,
-            dtype=config.dtype
+            dtype=config.dinov3_dtype  # Use separate DINOv3 dtype (float32 from config.json)
         )
         
         # Initialize feature fusion module (放在vggt_gpu上，因为VGGT占用小，llm_gpu已被Qwen占满)
@@ -869,9 +871,10 @@ def create_spatial_mllm_pipeline(
     target_keyframes: int = 16,
     total_frames: int = 128,
     sampling_method: str = "hybrid",
-    dinov3_model_size: str = "7b",  # Updated to match local model
+    dinov3_model_size: str = "7b",  # Match local model
     fusion_method: str = "concatenate",
-    img_size: int = 518,  # Add img_size parameter
+    dinov3_img_size: int = 224,  # From config.json (DINOv3 native resolution)
+    vggt_img_size: int = 518,  # VGGT uses 518
     device: str = "cuda",
     verbose: bool = True
 ) -> SpatialMLLMPipeline:
@@ -886,8 +889,8 @@ def create_spatial_mllm_pipeline(
         total_frames=total_frames,
         sampling_method=sampling_method,
         dinov3_model_size=dinov3_model_size,
-        dinov3_img_size=img_size,
-        vggt_img_size=img_size,
+        dinov3_img_size=dinov3_img_size,  # 224 for DINOv3 (from config.json)
+        vggt_img_size=vggt_img_size,  # 518 for VGGT
         fusion_method=fusion_method,
         device=device,
         verbose=verbose
