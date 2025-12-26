@@ -23,8 +23,6 @@ cd Heatmap
 conda create -n models python=3.11 -y
 conda activate models
 
-python -V
-
 pip install -U pip
 pip install -r requirements.txt
 ```
@@ -239,24 +237,54 @@ python scripts/evaluate.py \
 
 ---
 
-## 目录结构（Project/）
+## 关键文件结构（重要部分）
+
+下面只列 **跑通训练/评估/推理最关键** 的文件与目录（像 `utils/` 这类辅助模块默认不展开）：
 
 ```text
 Project/
   configs/
-    training_config_full_model.yaml
-  scripts/
-    train_history_action.py
-    evaluate.py
-    inference.py
+    training_config_full_model.yaml          # 唯一配置：数据路径、训练阶段、损失、日志等
+
+  scripts/                                   # 三个入口脚本（README 命令都以它们为准）
+    train_history_action.py                   # 训练：四阶段 curriculum（history/future heatmap + action + stop）
+    evaluate.py                               # 评估：history/future/action + 可视化
+    inference.py                              # 推理：对 video 或 dataset clip 生成 heatmap/actions
+
   src/
     data/
-      vln_sliding_window_dataset.py
+      vln_sliding_window_dataset.py           # 数据集：VLNSlidingWindowDataset（读取 meta/poses/rgb/depth/actions）
+      keyframe_selector.py                    # 关键帧选择（与 pipeline 的采样策略相关）
+      spatial_analysis.py                     # 空间新颖性/覆盖分析
+
     models/
-      pipeline.py
+      pipeline.py                             # 核心模型：SpatialMLLMPipeline + SpatialMLLMIntegrationConfig
+
       heatmap/
+        diffusion_heatmap_head.py             # DiffusionHeatmapHead（history/future 双头）
+        diffusion/                            # 扩散网络细节/组件
+        generator.py                          # 热力图生成相关工具
+        visualizer.py                         # 热力图可视化
+
       action/
-    utils/
+        diffusion_action_head.py              # DiffusionActionHead（连续动作 dx,dy）
+        stop_head.py                          # StopPredictionHead（二分类 STOP）
+        action_config.py                      # 动作 head 配置/超参
+        diffusion/                            # 扩散网络细节/组件
+
+      llm/
+        integration.py                        # LLM 兼容层/集成逻辑
+        memory_efficient.py                   # 显存友好模式（可选）
+
+      qwen2_5_vl/                             # Qwen2.5-VL 本地实现/适配（HF-style）
+        modeling_qwen2_5_vl.py
+        processing_qwen2_5_vl.py
+
+      dinov3/                                 # DINOv3 特征抽取与兼容层
+        compatibility.py
+
+      vggt/                                   # VGGT 3D 编码器（第三方代码集成）
+        vggt/                                 # VGGT 包主体
 ```
 
 
