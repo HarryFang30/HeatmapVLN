@@ -1,13 +1,12 @@
-# HeatmapVLN（Project）
+# HeatmapVLN
 
-本目录（`Project/`）实现了一个用于 **第一人称跨帧热力图（inter-frame heatmap）** 与 **动作预测** 的训练/评估/推理流水线。
+本目录实现了一个用于 **第一人称跨帧热力图（inter-frame heatmap）** 与 **动作预测** 的训练/评估/推理流水线。
 当前仓库内真实可用的入口脚本为：
 
 - `scripts/train_history_action.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
 - `scripts/evaluate.py`：评估（支持 history/future/action，支持保存可视化）
 - `scripts/inference.py`：推理（支持对视频或数据集 clip 运行并保存热力图/动作）
 
-> 说明：本 README **只对齐当前代码仓库的真实文件与参数**。如果你看到和旧文档/外部笔记不一致，以本 README 与代码为准。
 
 ---
 
@@ -15,12 +14,16 @@
 
 ### 1) 环境安装
 
-建议在 `Project/` 目录下安装依赖：
+建议在 `Heatmap/` 目录下安装依赖：
 
 ```bash
-cd /root/VLN/Project
-python -m venv .venv
-source .venv/bin/activate
+cd Heatmap
+
+# 建议 Python 3.11+（与本项目依赖/代码路径更匹配）
+conda create -n models python=3.11 -y
+conda activate models
+
+python -V
 
 pip install -U pip
 pip install -r requirements.txt
