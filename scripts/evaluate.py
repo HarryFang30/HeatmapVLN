@@ -336,10 +336,10 @@ def evaluate(
         # Visualization
         if save_dir is not None and idx < num_vis:
             save_dir.mkdir(parents=True, exist_ok=True)
-                visualize_sample(
-                idx, batch, outputs, save_dir, 
+            visualize_sample(
+                idx, batch, outputs, save_dir,
                 eval_history, eval_future, eval_action
-                )
+            )
 
     # Average metrics
     results = {}
