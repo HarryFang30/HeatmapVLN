@@ -17,7 +17,7 @@
 建议在 `HeatmapVLN/` 目录下安装依赖：
 
 ```bash
-cd Heatmap
+cd HeatmapVLN
 
 # 建议 Python 3.11+（与本项目依赖/代码路径更匹配）
 conda create -n models python=3.11 -y
