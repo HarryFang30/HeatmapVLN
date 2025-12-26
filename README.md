@@ -96,7 +96,7 @@ pip install -r requirements.txt
 cd /root/VLN/Project
 
 python scripts/inference.py \
-  --clip /root/autodl-tmp/dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
+  --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
   --config configs/training_config_full_model.yaml \
   --output-dir ./outputs_inference
 ```
@@ -177,7 +177,7 @@ python scripts/train_history_action.py \
 
 训练输出目录由配置控制：
 
-- `log.out_dir`（默认：`/root/autodl-tmp/vln_history_action_outputs`）
+- `log.out_dir`（默认：`vln_history_action_outputs`）
 
 其中会包含 `train.log`、checkpoint、可视化图片、以及（可选）TensorBoard 日志。
 
@@ -211,7 +211,7 @@ python scripts/evaluate.py \
 
 - `data.root`：数据集根目录
 - `data.val_split`：验证 split（例如 `val_unseen`）
-- `model.llm.model_path`：本地 Qwen2.5-VL 权重路径（默认写在 `Project/models/qwen_2.5_vl`）
+- `model.llm.model_path`：本地 Qwen2.5-VL 权重路径（默认写在 `models/qwen_2.5_vl`）
 - `log.out_dir` / `log.tensorboard_dir`：输出与日志目录
 
 ---
@@ -239,7 +239,7 @@ python scripts/evaluate.py \
 
 ## 关键文件结构（重要部分）
 
-下面只列 **跑通训练/评估/推理最关键** 的文件与目录（像 `utils/` 这类辅助模块默认不展开）：
+下面只列 **跑通训练/评估/推理最关键** 的文件与目）：
 
 ```text
 Project/
