@@ -15,5 +15,5 @@ Architecture:
 """
 
 __version__ = "0.1.0"
-__author__ = "VLN Research Team"
+__author__ = "Jialei Fang"
 __description__ = "First-Person Inter-Frame Spatial Understanding for VLN"
