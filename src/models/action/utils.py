@@ -179,11 +179,10 @@ def get_action_from_diffusion_output(
     return actions
 
 
-# Default action statistics (computed from actual VLN-CE dataset)
-# 🔧 修复：使用实际数据集统计值
-# 实际范围: dx ∈ [-0.14, 0.16], dy ∈ [0, 0.28]，加 10% 余量
+# Default action statistics
+# 🔧 扩大边界，覆盖更多动作场景（避免测试时超出范围）
 DEFAULT_ACTION_STATS = ActionStats(
-    min=[-0.17, -0.03],
-    max=[0.19, 0.31]
+    min=[-0.5, -0.2],
+    max=[0.5, 1.0]
 )
 

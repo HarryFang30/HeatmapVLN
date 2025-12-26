@@ -9,7 +9,7 @@ data:
   val_split: val_unseen                 # 验证集目录名 (VLN-CE 使用 val_unseen)
   image_size: [224, 224]
   init_hm_size: [64, 64]                # 起始分辨率
-  num_workers: 4                        # 减少 workers 避免 CPU 竞争
+  num_workers: 8                        # 减少 workers 避免 CPU 竞争
   pin_memory: true
   prefetch_factor: 2
   
@@ -53,9 +53,9 @@ model:
     num_diffusion_iters: 10             # 扩散步数
     encoding_size: 256                  # 条件投影维度（简化：768 → 256）
     down_dims: [128, 256]               # UNet 通道维度（简化：[192,384,768] → [128,256]）
-    # 🔧 关键修复：使用实际数据统计值（而非 DifNav 默认值）
-    action_stats_min: [-0.17, -0.03]    # 从数据集计算，加 10% 余量
-    action_stats_max: [0.19, 0.31]      # 从数据集计算，加 10% 余量
+    # 🔧 扩大边界，覆盖更多动作场景（原值基于数据集统计过紧）
+    action_stats_min: [-0.5, -0.2]      # 扩大边界，允许更大幅度转弯和后退
+    action_stats_max: [0.5, 1.0]        # 扩大边界，允许更大幅度前进
 
   # 🆕 Stop 预测头配置（二分类器）
   stop_head:
@@ -92,7 +92,7 @@ training:
     # ============ Stage 2: Future 预热 (64x64) ============
     # 预热 Future head，冻结 History 让 Future 赶上
     - name: warmup_future_64
-      epochs: 2                         # 减少: 3 → 2
+      epochs: 5                         
       hm_size: [64, 64]
       heatmap_loss_type: simplified     # 继续使用简化 Loss
       train_history: false              # 冻结 History，让 Future 赶上
@@ -112,7 +112,7 @@ training:
     # ============ Stage 3: 联合训练 (128x128) ============
     # 中间阶段：提升分辨率，双 head 联合训练，使用完整 Loss
     - name: joint_128
-      epochs: 5                         # 减少: 10 → 5
+      epochs: 10                         # 减少: 10 → 5
       hm_size: [128, 128]
       heatmap_loss_type: nerf_ripple    # 切换到 NeRF 波纹 Loss
       train_history: true
@@ -132,7 +132,7 @@ training:
     # ============ Stage 4: 精细训练 (224x224) ============
     # 完整训练：大分辨率，解冻 LLM Projector
     - name: full_224
-      epochs: 10                        # 减少: 20 → 10
+      epochs: 20                        # 减少: 20 → 10
       hm_size: [224, 224]
       heatmap_loss_type: nerf_ripple    # 继续使用 NeRF 波纹 Loss
       train_history: true
