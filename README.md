@@ -191,7 +191,7 @@ python scripts/train_history_action.py \
 如果你不传 `--use-history/--use-future/--use-action`，脚本会默认全部评估。
 
 ```bash
-cd /root/VLN/Project
+cd HeatmapVLN
 
 python scripts/evaluate.py \
   --config configs/training_config_full_model.yaml \
@@ -242,7 +242,7 @@ python scripts/evaluate.py \
 下面只列 **跑通训练/评估/推理最关键** 的文件与目）：
 
 ```text
-Project/
+HeatmapVLN/
   configs/
     training_config_full_model.yaml          # 唯一配置：数据路径、训练阶段、损失、日志等
 
