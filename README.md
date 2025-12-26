@@ -93,7 +93,7 @@ pip install -r requirements.txt
 ### 对数据集 clip 推理（推荐）
 
 ```bash
-cd /root/VLN/Project
+cd /HeatmapVLN
 
 python scripts/inference.py \
   --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
@@ -104,7 +104,7 @@ python scripts/inference.py \
 ### 对视频推理
 
 ```bash
-cd /root/VLN/Project
+cd HeatmapVLN
 
 python scripts/inference.py \
   --video /path/to/video.mp4 \
@@ -131,7 +131,7 @@ python scripts/inference.py \
 ### 一键按配置跑完整四阶段
 
 ```bash
-cd /root/VLN/Project
+cd HeatmapVLN
 
 python scripts/train_history_action.py \
   --config configs/training_config_full_model.yaml
