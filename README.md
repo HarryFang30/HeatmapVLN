@@ -1,572 +1,259 @@
-# HeatmapVLN: Vision-Language Navigation with Frame-Indexed Heatmaps
+# HeatmapVLN（Project）
 
-**Using Large Language Models to Boost 3D Spatial Reasoning for VLN**
+本目录（`Project/`）实现了一个用于 **第一人称跨帧热力图（inter-frame heatmap）** 与 **动作预测** 的训练/评估/推理流水线。
+当前仓库内真实可用的入口脚本为：
 
-This project implements a state-of-the-art VLN (Vision-Language Navigation) pipeline that generates frame-indexed heatmaps showing spatial relationships across temporal viewpoints. The system uses LLM-enhanced spatial reasoning with dual-encoder architecture (3D geometry + 2D semantics) for intelligent keyframe selection.
+- `scripts/train_history_action.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
+- `scripts/evaluate.py`：评估（支持 history/future/action，支持保存可视化）
+- `scripts/inference.py`：推理（支持对视频或数据集 clip 运行并保存热力图/动作）
 
----
-
-## 🎯 Project Status
-
-### ✅ **INFERENCE COMPLETE**
-- **Core Achievement**: Frame-indexed heatmaps showing where each historical keyframe appears in the current observation view
-- **Full Pipeline Working**: Video → VGGT/DINOv3 → Qwen2.5-VL → Heatmaps
-- **Production Ready**: Modular architecture with complete inference pipeline
-- **Performance Verified**: 4x RTX 8000 GPUs, efficient multi-GPU utilization
-
-### ✅ **TRAINING INFRASTRUCTURE IMPLEMENTED**
-- **Multi-stage training pipeline**: 5-stage curriculum with history/future heatmap heads
-- **Dual-head architecture**: Separate history and future heatmap converters
-- **Training scripts**: Complete stage-by-stage training with DDP support
-- **Configuration system**: YAML-based training configuration with flexible GPU allocation
+> 说明：本 README **只对齐当前代码仓库的真实文件与参数**。如果你看到和旧文档/外部笔记不一致，以本 README 与代码为准。
 
 ---
 
-## 🏗️ Architecture Overview
+## 快速开始
 
-### Core Pipeline: N_m → N_k → Frame-Indexed Heatmaps
+### 1) 环境安装
 
-```
-📹 Video Input (N_m frames)
-    ↓
-🔍 VGGT (3D) → Geometry analysis → Intelligent keyframe selection (N_k frames)
-    ↓
-🖼️ DINOv3 (2D) → Process selected N_k keyframes → Semantic features
-    ↓
-🧠 Qwen2.5-VL LLM → Dual features (3D + 2D) → Spatial reasoning
-    ↓
-🗺️ Frame-Indexed Heatmaps (224×224) per keyframe
-```
-
-### Key Components
-
-- **VGGT (3D Path)**: Processes ALL N_m frames for geometry extraction and intelligent sampling
-- **DINOv3 (2D Path)**: Processes ONLY N_k selected keyframes for semantic features
-- **Qwen2.5-VL LLM**: LLM-enhanced spatial reasoning for cross-frame understanding
-- **Multi-GPU Architecture**: VGGT→cuda:0, DINOv3→cuda:1, LLM→cuda:2
-
-### Efficiency Principle
-**N_m → N_k efficiency**: VGGT processes all frames for intelligent sampling, DINOv3 only processes selected keyframes.
-
----
-
-## 🚀 Quick Start
-
-### 1. Environment Setup
-
-**Prerequisites**:
-- Python 3.11+
-- CUDA 12.1+
-- Conda package manager
-
-**Setup Instructions**:
+建议在 `Project/` 目录下安装依赖：
 
 ```bash
-# Create and activate conda environment
-conda create -n models python=3.11 -y
-conda activate models
+cd /root/VLN/Project
+python -m venv .venv
+source .venv/bin/activate
 
-# Install PyTorch with CUDA 12.8
-pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-    --index-url https://download.pytorch.org/whl/cu128
-
-# Install Transformers and core dependencies
-pip install transformers==4.51.3 accelerate==1.5.2 \
-    qwen-vl-utils decord
-
-# Install Flash Attention (optional, for speed)
-pip install flash-attn --no-build-isolation
-
-# Install project requirements
-cd Project
+pip install -U pip
 pip install -r requirements.txt
 ```
 
-### 2. Basic Usage (Inference)
-
-```bash
-# Run inference with the full pipeline
-python scripts/inference.py --video /path/to/video.mp4 \
-    --instruction "Navigate and find the target" \
-    --config configs/training_config_full_model.yaml
-```
-
-### 3. Training
-
-The project implements a 5-stage training curriculum:
-
-```bash
-# Stage 1: History heatmap head warmup (64x64)
-python scripts/train_stage1_history_warmup.py \
-    --config configs/training_config_full_model.yaml
-
-# Stage 2: History heatmap with fusion (128x128)
-python scripts/train_stage2_history_mlp.py \
-    --config configs/training_config_full_model.yaml
-
-# Stage 3: History full model with encoder fine-tuning (128x128)
-python scripts/train_stage3_history_full.py \
-    --config configs/training_config_full_model.yaml
-
-# Stage 4: Future heatmap head warmup (128x128)
-python scripts/train_stage4_future_warmup.py \
-    --config configs/training_config_full_model.yaml
-
-# Stage 5: Joint training - dual heads + encoders (224x224)
-python scripts/train_stage5_joint_training.py \
-    --config configs/training_config_full_model.yaml
-
-# OR run the full training pipeline (all stages sequentially)
-python scripts/train_full_model.py \
-    --config configs/training_config_full_model.yaml \
-    --world_size 2  # For DDP training on 2 GPUs
-
-# Evaluation
-python scripts/evaluate.py --config configs/training_config_full_model.yaml \
-    --checkpoint /path/to/checkpoint.pth
-```
+如果你需要安装带 CUDA 的 PyTorch，请按你机器 CUDA 版本选择对应 wheel（`requirements.txt` 内也有注释提示）。
 
 ---
 
-## 📁 Project Structure
+## 数据集准备（VLNSlidingWindowDataset）
 
+训练/评估使用 `src/data/vln_sliding_window_dataset.py` 的 `VLNSlidingWindowDataset`。
+配置文件中通过 `data.root` 指定数据集根目录，默认是：
+
+- `configs/training_config_full_model.yaml` 里的 `data.root: /root/autodl-tmp/dataset_with_actions`
+
+### 目录结构要求（非常重要）
+
+数据按 split 组织（训练脚本固定 train 为 `train`，验证 split 可通过 `data.val_split` 指定，例如 `val_unseen`）：
+
+```text
+<data.root>/
+  train/
+    <scene_id>/
+      clip_000000/
+        meta.json
+        poses.json
+        rgb/
+          000000.png
+          000001.png
+          ...
+        depth/                    (可选)
+          000000.npy
+          000001.npy
+          ...
+        intrinsics.json           (可选)
+        actions.npy               (可选，但训练 action head 强烈建议提供)
+        discrete_actions.npy      (可选，训练 stop head 时建议提供)
+  val_unseen/                     (或 val/)
+    <scene_id>/
+      clip_000000/
+        ...
 ```
-Project/
-├── configs/                              # Configuration files
-│   └── training_config_full_model.yaml  # Complete training config ✅
-│
-├── src/                                  # Source code
-│   ├── data/                            # Data processing
-│   │   ├── frame_sampler.py            # Space-aware frame sampling ✅
-│   │   ├── spatial_analysis.py         # Spatial novelty detection ✅
-│   │   ├── keyframe_selector.py        # Keyframe selection ✅
-│   │   ├── algorithm_registry.py       # Algorithm registration ✅
-│   │   └── vln_heatmap_adapter.py      # Training dataset adapter ✅
-│   │
-│   ├── models/                          # Model implementations
-│   │   ├── spatial_mllm_compat.py      # End-to-end VLN pipeline ✅
-│   │   ├── dinov3/                     # DINOv3 2D semantic features ✅
-│   │   ├── vggt/                       # VGGT 3D geometry ✅
-│   │   ├── heatmap/                    # Heatmap generation modules ✅
-│   │   │   ├── converter.py           # LLM to heatmap converter ✅
-│   │   │   ├── multi_head.py          # Multi-heatmap MLP head ✅
-│   │   │   ├── renderer.py            # Gaussian renderer (τ, σ, α) ✅
-│   │   │   ├── upsampling.py          # Convex upsampling ✅
-│   │   │   └── generator.py           # Heatmap generation utilities ✅
-│   │   ├── qwen2_5_vl/                # Qwen2.5-VL model code ✅
-│   │   ├── real_llm_integration.py    # Qwen2.5-VL integration ✅
-│   │   └── memory_efficient_llm.py    # GPU memory management ✅
-│   │
-│   └── utils/                           # Utility functions
-│       ├── logger.py                   # Logging utilities ✅
-│       └── path_utils.py               # Path management ✅
-│
-├── scripts/                             # Training & evaluation scripts
-│   ├── train_full_model.py            # Complete 5-stage training ✅
-│   ├── train_stage1_history_warmup.py # Stage 1: History head ✅
-│   ├── train_stage2_history_mlp.py    # Stage 2: History + fusion ✅
-│   ├── train_stage3_history_full.py   # Stage 3: History full ✅
-│   ├── train_stage4_future_warmup.py  # Stage 4: Future head ✅
-│   ├── train_stage5_joint_training.py # Stage 5: Joint training ✅
-│   ├── train_utils_spatial.py         # Training utilities ✅
-│   ├── inference.py                   # Inference script ✅
-│   └── evaluate.py                    # Evaluation script ✅
-│
-├── models/                              # Model weights (HF cache)
-│   ├── qwen_2.5_vl/                   # Qwen2.5-VL weights
-│   ├── vggt/                          # VGGT weights
-│   └── dinov3/                        # DINOv3 weights
-│
-├── requirements.txt                     # Python dependencies ✅
-├── CLAUDE.md                           # Development instructions ✅
-└── README.md                           # This file
-```
+
+### 必需/可选文件说明
+
+- **必需**
+  - **`meta.json`**：至少包含 `num_frames`；可包含 `instruction`
+  - **`poses.json`**：长度为 `num_frames` 的 4×4 位姿矩阵列表
+  - **`rgb/000000.png`**：按 6 位零填充命名的 RGB 帧
+- **可选**
+  - **`depth/xxxxxx.npy`**：用于遮挡检测；缺失时会跳过遮挡判断
+  - **`intrinsics.json`**：若存在用于提供原始图像宽高；否则默认 `(512, 256)`（全景图常见尺寸）
+  - **`actions.npy`**：连续动作（dx, dy）。缺失时该样本 `action_valid=0`，动作置 0
+  - **`discrete_actions.npy`**：离散动作（STOP=0, FORWARD=1, LEFT=2, RIGHT=3）。缺失时 stop 标签默认为非 stop
 
 ---
 
-## 📋 Commands
+## 推理（Inference）
 
-### Inference
+推理脚本：`scripts/inference.py`  
+支持两种输入：
+
+- **视频文件**：`--video /path/to/video.mp4`
+- **数据集 clip 目录**：`--clip <data.root>/<split>/<scene>/clip_xxxxxx`
+
+如果你不传 `--use-history/--use-future/--use-actions`，脚本会默认全部输出。
+
+### 对数据集 clip 推理（推荐）
 
 ```bash
-# Run inference with the full pipeline
+cd /root/VLN/Project
+
 python scripts/inference.py \
-    --video /path/to/video.mp4 \
-    --instruction "Navigate and find the target" \
-    --config configs/training_config_full_model.yaml \
-    --checkpoint /path/to/checkpoint.pth  # Optional: use trained model
+  --clip /root/autodl-tmp/dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
+  --config configs/training_config_full_model.yaml \
+  --output-dir ./outputs_inference
 ```
 
-### Training Commands
+### 对视频推理
 
 ```bash
-# Single-GPU training (any stage)
-python scripts/train_stage1_history_warmup.py \
-    --config configs/training_config_full_model.yaml
+cd /root/VLN/Project
 
-# Multi-GPU DDP training (recommended)
-torchrun --nproc_per_node=2 scripts/train_full_model.py \
-    --config configs/training_config_full_model.yaml
-
-# Resume training from checkpoint
-python scripts/train_full_model.py \
-    --config configs/training_config_full_model.yaml \
-    --resume /path/to/checkpoint.pth
+python scripts/inference.py \
+  --video /path/to/video.mp4 \
+  --instruction "从起点出发，沿走廊前进并找到目标" \
+  --config configs/training_config_full_model.yaml \
+  --output-dir ./outputs_inference
 ```
 
-### Evaluation
+### 推理输出
+
+默认会在 `--output-dir` 下生成：
+
+- `*_history_heatmaps.png`（若启用 history）
+- `*_future_heatmaps.png`（若启用 future）
+- `*_actions.npy`（若启用 action）
+
+---
+
+## 训练（Training）
+
+训练脚本：`scripts/train_history_action.py`  
+默认读取：`--config configs/training_config_full_model.yaml`
+
+### 一键按配置跑完整四阶段
 
 ```bash
-# Evaluate trained model
+cd /root/VLN/Project
+
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml
+```
+
+### 常用训练参数
+
+- **从检查点恢复**
+
+```bash
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
+  --resume /path/to/ckpt.pth
+```
+
+- **自动从最新检查点恢复**
+
+```bash
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
+  --auto-resume
+```
+
+- **只跑某个阶段（按名称或索引）**
+
+```bash
+# 例：只跑 joint_128 阶段
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
+  --stage joint_128 \
+  --stage-only
+```
+
+- **调试：只构建模型与数据，不实际训练**
+
+```bash
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
+  --dry-run
+```
+
+### 训练输出
+
+训练输出目录由配置控制：
+
+- `log.out_dir`（默认：`/root/autodl-tmp/vln_history_action_outputs`）
+
+其中会包含 `train.log`、checkpoint、可视化图片、以及（可选）TensorBoard 日志。
+
+---
+
+## 评估（Evaluate）
+
+评估脚本：`scripts/evaluate.py`  
+必须提供 `--checkpoint`。
+
+如果你不传 `--use-history/--use-future/--use-action`，脚本会默认全部评估。
+
+```bash
+cd /root/VLN/Project
+
 python scripts/evaluate.py \
-    --config configs/training_config_full_model.yaml \
-    --checkpoint /path/to/checkpoint.pth \
-    --split val
-```
-
-### Key Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--config` | str | Required | Path to YAML config file |
-| `--checkpoint` | str | None | Path to model checkpoint |
-| `--world_size` | int | 1 | Number of GPUs for DDP |
-| `--resume` | str | None | Resume training from checkpoint |
-| `--split` | str | "val" | Dataset split for evaluation |
-
----
-
-## 🔧 Configuration
-
-### Inference Configuration
-
-Located in `configs/default_config.yaml`:
-
-```yaml
-# Model Architecture
-dinov3:
-  model_name: "dinov3_vit_large"
-  device: "cuda:1"
-
-vggt:
-  img_size: 518
-  device: "cuda:0"
-
-llm:
-  model_name: "Qwen2.5-VL-7B-Instruct"
-  device: "cuda:2"
-  torch_dtype: "bfloat16"
-
-# Video Processing
-video:
-  total_frames: 32      # N_m candidate frames
-  keyframes: 8          # N_k selected keyframes
-  frame_size: [224, 224]
-
-# Frame Sampling
-frame_sampling:
-  method: "spatial_novelty"
-  geometry_weight: 0.7
-  voxel_lambda: 20.0
-```
-
-### Training Configuration
-
-Located in `configs/training_config_full_model.yaml`:
-
-```yaml
-# 5-Stage Training Curriculum
-training:
-  stages:
-    # Stage 1: History head warmup (64x64)
-    - name: stage1_history_warmup
-      epochs: 5
-      hm_size: [64, 64]
-      train_history: true
-      train_future: false
-      trainable_modules: [history_heatmap_converter, feature_fusion, llm_projector]
-      frozen_modules: [vggt, dinov3_compat]
-
-    # Stage 2: History + fusion (128x128)
-    - name: stage2_history_fusion
-      epochs: 8
-      hm_size: [128, 128]
-      train_history: true
-      trainable_modules: [history_heatmap_converter, feature_fusion, llm_projector]
-
-    # Stage 3: History full model (128x128) - unfreeze encoders
-    - name: stage3_history_full
-      epochs: 10
-      hm_size: [128, 128]
-      trainable_modules: [history_heatmap_converter, vggt, dinov3_compat]
-
-    # Stage 4: Future head warmup (128x128)
-    - name: stage4_future_warmup
-      epochs: 5
-      hm_size: [128, 128]
-      train_future: true
-      trainable_modules: [future_heatmap_converter, feature_fusion]
-
-    # Stage 5: Joint training - dual heads (224x224)
-    - name: stage5_joint_training
-      epochs: 15
-      hm_size: [224, 224]
-      train_history: true
-      train_future: true
-      trainable_modules: [all]
-
-# Optimizer (grouped learning rates)
-optim:
-  optimizer: adamw
-  history_heatmap_lr: 1.0e-3  # History converter
-  future_heatmap_lr: 1.0e-3   # Future converter
-  fusion_lr: 5.0e-4           # Fusion modules
-  encoder_lr: 1.0e-5          # VGGT + DINOv3
-  batch_size: 1
-  grad_accum_steps: 1
-  amp: bf16
-  use_ddp: true
-
-# Loss Function (Dual-head navigation)
-loss:
-  type: navigation_heatmap
-  alpha: 20.0          # Temperature scaling
-  lambda_mse: 1.0      # MSE loss weight
-  lambda_kl: 0.2       # KL divergence weight
-  lambda_valid: 0.1    # Valid mask weight
-  history_weight: 1.0  # History head weight
-  future_weight: 1.0   # Future head weight
+  --config configs/training_config_full_model.yaml \
+  --checkpoint /path/to/ckpt.pth \
+  --split val \
+  --save-vis \
+  --num-vis 20
 ```
 
 ---
 
-## 📊 Performance Verified
+## 配置文件说明（configs/training_config_full_model.yaml）
 
-### Hardware & Benchmarks
+当前 `configs/` 目录只有一个配置：`training_config_full_model.yaml`。
 
-- **Hardware**: 4x Quadro RTX 8000 (192GB total VRAM)
-- **Memory Usage**: 29.6GB per GPU (efficient utilization)
-- **Speed**:
-  - Setup time: 62s (model loading)
-  - Inference time: 29.5s per video
-- **Quality**: 28/28 distinct frame-indexed heatmaps verified
+你通常需要优先检查并修改：
 
-### Multi-GPU Allocation
-
-```
-GPU 0 (cuda:0): VGGT 3D Encoder       (~30GB)
-GPU 1 (cuda:1): DINOv3 2D Encoder     (~30GB)
-GPU 2 (cuda:2): Qwen2.5-VL LLM        (~30GB)
-GPU 3: Reserved for training           (free)
-```
+- `data.root`：数据集根目录
+- `data.val_split`：验证 split（例如 `val_unseen`）
+- `model.llm.model_path`：本地 Qwen2.5-VL 权重路径（默认写在 `Project/models/qwen_2.5_vl`）
+- `log.out_dir` / `log.tensorboard_dir`：输出与日志目录
 
 ---
 
-## 🚀 Training Architecture
+## 常见问题（FAQ）
 
-### 5-Stage Training Curriculum
+### 1) 报错：找不到 split 目录 / clips
 
-The training follows a carefully designed curriculum that progressively builds spatial reasoning:
+检查：
 
-#### **Stage 1: History Head Warmup** (64×64)
-- **Duration**: 5 epochs
-- **Train**: History heatmap converter + feature fusion + LLM projector
-- **Freeze**: VGGT + DINOv3 encoders
-- **Purpose**: Learn basic history-to-current frame spatial mapping
+- `data.root` 是否指向正确路径
+- split 是否存在：训练固定用 `train`；验证用 `data.val_split`
+- clip 目录是否以 `clip_` 开头（数据集枚举逻辑依赖该前缀）
 
-#### **Stage 2: History + Fusion** (128×128)
-- **Duration**: 8 epochs
-- **Train**: History converter + fusion modules
-- **Freeze**: Encoders
-- **Purpose**: Refine spatial understanding with higher resolution
+### 2) 动作一直是 0 或者 `action_valid=0`
 
-#### **Stage 3: History Full Model** (128×128)
-- **Duration**: 10 epochs
-- **Train**: All modules including encoders
-- **Purpose**: End-to-end fine-tuning for history branch
+这通常意味着 clip 下缺失 `actions.npy`，或当前帧索引超出动作数组长度。
+如果你要训练 action head，建议确保每个 clip 都有 `actions.npy`。
 
-#### **Stage 4: Future Head Warmup** (128×128)
-- **Duration**: 5 epochs
-- **Train**: Future heatmap converter + fusion
-- **Freeze**: Encoders + history head (preserve Stage 3 learning)
-- **Purpose**: Learn future spatial prediction
+### 3) 深度缺失会怎样？
 
-#### **Stage 5: Joint Training** (224×224)
-- **Duration**: 15 epochs
-- **Train**: All modules (dual-head + encoders)
-- **Purpose**: Final high-resolution joint optimization
+深度是可选的。缺失时不会做遮挡检测，热力图仍然会生成。
 
-### Loss Functions
+---
 
-**Navigation Heatmap Loss** (dual-head):
-```python
-L_total = w_h * L_history + w_f * L_future
+## 目录结构（Project/）
 
-where:
-  L_branch = λ_mse * MSE(pred, gt) + λ_kl * KL(pred || gt) + λ_valid * ValidMask
+```text
+Project/
+  configs/
+    training_config_full_model.yaml
+  scripts/
+    train_history_action.py
+    evaluate.py
+    inference.py
+  src/
+    data/
+      vln_sliding_window_dataset.py
+    models/
+      pipeline.py
+      heatmap/
+      action/
+    utils/
 ```
 
-### Data Pipeline
 
-- **Input**: Video sequences (16 frames) from Habitat navigation episodes
-- **Output**:
-  - History heatmaps: Where content from past frames appears in current view
-  - Future heatmaps: Predicted spatial locations for future navigation
-- **Format**: Frame sequences + camera poses + depth maps → projected ground truth heatmaps
-
----
-
-## 🎯 Core Features
-
-### Frame-Indexed Heatmaps
-
-Our system generates **frame-indexed heatmaps** that show:
-
-1. **Current View**: What the model sees from the current frame
-2. **Historical Projections**: Where content from PREVIOUS keyframes appears in current view
-3. **Cross-Frame Understanding**: Spatial relationships across temporal viewpoints
-4. **3D Mental Model**: Evidence of coherent 3D scene understanding
-
-### Example
-
-```
-Frame t=5:  Looking at a table
-Frame t=12: Turned left, seeing a chair
-Frame t=20: Turned right, seeing a window
-
-→ Heatmap for Frame t=20 shows:
-  - High activation on window (current view)
-  - Medium activation where table appeared (from t=5)
-  - Medium activation where chair appeared (from t=12)
-```
-
----
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **CUDA Out of Memory**
-   ```bash
-   # Option 1: Reduce batch size in config
-   optim:
-     batch_size: 1
-     grad_accum_steps: 4  # Effective batch size = 4
-
-   # Option 2: Use single-GPU mode
-   model:
-     use_multi_gpu: false
-   ```
-
-2. **DDP Initialization Errors**
-   ```bash
-   # Ensure CUDA devices are visible
-   echo $CUDA_VISIBLE_DEVICES
-
-   # Use correct world_size
-   torchrun --nproc_per_node=2 scripts/train_full_model.py ...
-   ```
-
-3. **Model Loading Errors**
-   ```bash
-   # Check model paths in config
-   model:
-     llm:
-       model_path: /root/VLN/Project/models/qwen_2.5_vl
-
-   # Verify weights exist
-   ls models/qwen_2.5_vl/
-   ls models/vggt/
-   ```
-
-4. **Dataset Issues**
-   ```bash
-   # Verify dataset path
-   data:
-     root: /path/to/habitat_dataset
-
-   # Check dataset structure
-   ls /path/to/habitat_dataset/
-   ```
-
-### Debug Mode
-
-```bash
-# Enable verbose logging in config
-log:
-  log_level: DEBUG
-  show_gpu_memory: true
-
-# Monitor GPU memory during training
-watch -n 1 nvidia-smi
-
-# Test inference on single sample
-python scripts/inference.py --video test.mp4 --config configs/training_config_full_model.yaml
-```
-
----
-
-## 📚 Key Research Foundations
-
-This project builds upon:
-
-- **Qwen2.5-VL**: Advanced vision-language model for spatial reasoning
-- **BridgeVLA**: 3D VLA framework and heatmap generation methodology
-- **DINOv3**: Self-supervised vision transformer for semantic understanding
-- **VGGT**: Visual Geometry and Geometry Transformer for 3D analysis
-- **Space-aware Sampling**: Novel contribution for efficient keyframe selection
-
-### Core Innovation
-
-**LLM-Enhanced Spatial Reasoning**: Using Large Language Models to boost 3D spatial understanding through frame-indexed heatmaps that demonstrate cross-frame spatial relationships.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-1. Check the project status section to see current development focus
-2. Follow the existing code structure and style
-3. Test with `test_real_llm_pipeline.py` before submitting
-4. Update documentation as needed
-
----
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0.
-
----
-
-## 📞 Contact & Support
-
-For issues, questions, or contributions:
-- Open an issue on GitHub
-- Check existing documentation in `CLAUDE.md`
-- Review test scripts for usage examples
-
----
-
-## 📈 Training Tips
-
-### GPU Memory Optimization
-- **4 GPUs**: Run full pipeline with multi-GPU mode (`use_multi_gpu: true`)
-- **2 GPUs**: Use DDP with single-GPU-per-rank mode (`use_multi_gpu: false`)
-- **1 GPU**: Reduce batch size and use gradient accumulation
-
-### Training Strategies
-1. **Start with Stage 1** to verify data pipeline
-2. **Monitor losses** in TensorBoard: `tensorboard --logdir /root/tf-logs`
-3. **Save checkpoints** regularly (configured in `log.save_every_epochs`)
-4. **Resume training** from any stage with `--resume` flag
-5. **Validate regularly** to catch overfitting early
-
-### Performance Expectations
-- **Stage 1-2**: Fast convergence (~1-2 hours per stage)
-- **Stage 3**: Slower due to encoder training (~3-4 hours)
-- **Stage 4**: Fast convergence for future head (~1-2 hours)
-- **Stage 5**: Longest stage with high-res training (~6-8 hours)
-
----
-
-**Status**: Complete training infrastructure ✅ → Ready for large-scale training 🚀
