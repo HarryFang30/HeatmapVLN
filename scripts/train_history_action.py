@@ -928,6 +928,21 @@ def train_one_epoch(
         is_stop = batch['is_stop'].to(device)           # [B]
         text = batch['text']
         
+        # 🔍 [DIAG] 诊断打印：第一个 epoch 的第一个 batch 打印 action 分布信息
+        if epoch == 0 and i == 0:
+            from src.models.action.utils import normalize_actions, ActionStats
+            action_stats_min = cfg.get('model', {}).get('action_head', {}).get('action_stats_min', [-0.17, -0.03])
+            action_stats_max = cfg.get('model', {}).get('action_head', {}).get('action_stats_max', [0.19, 0.31])
+            stats = ActionStats(min=action_stats_min, max=action_stats_max)
+            normalized = normalize_actions(gt_action, stats)
+            
+            logger.info(f"[DIAG] ========== Action Diagnostics ==========")
+            logger.info(f"[DIAG] action_valid distribution: valid={action_valid.sum().item():.0f}/{len(action_valid)} ({action_valid.float().mean().item()*100:.1f}%)")
+            logger.info(f"[DIAG] gt_action range: min=[{gt_action[:, 0].min().item():.4f}, {gt_action[:, 1].min().item():.4f}], max=[{gt_action[:, 0].max().item():.4f}, {gt_action[:, 1].max().item():.4f}]")
+            logger.info(f"[DIAG] normalized_action range: min=[{normalized[:, 0].min().item():.4f}, {normalized[:, 1].min().item():.4f}], max=[{normalized[:, 0].max().item():.4f}, {normalized[:, 1].max().item():.4f}]")
+            logger.info(f"[DIAG] action_stats: min={action_stats_min}, max={action_stats_max}")
+            logger.info(f"[DIAG] ===========================================")
+        
         # 处理导航指令
         # 注意：Qwen2.5-VL 当前只支持单一指令输入
         # 如果 batch 中有不同指令，合并为一个（用分隔符连接）
@@ -1062,6 +1077,20 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
                     tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)  # 🆕
                     tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
+                    
+                    # 🔍 [DIAG] 额外监控指标
+                    # Action valid ratio - 监控有效样本比例
+                    tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
+                    
+                    # 归一化后的 action 分布（每 100 步记录一次直方图，避免日志过大）
+                    if global_step % 100 == 0 and 'normalized_actions' in output:
+                        norm_act = output['normalized_actions']
+                        if norm_act is not None:
+                            tb_writer.add_histogram('train/normalized_actions', norm_act.flatten().cpu(), actual_step)
+                    
+                    # GT action 分布
+                    if global_step % 100 == 0:
+                        tb_writer.add_histogram('train/gt_actions', gt_action.flatten().cpu(), actual_step)
             
             # 定期可视化热力图预测
             vis_interval = cfg['log'].get('vis_every_steps', 500)

@@ -221,6 +221,20 @@ class DiffusionActionHead(nn.Module):
         device = global_cond.device
         batch_size = global_cond.shape[0]
         
+        # 🔍 [DIAG] 验证输入维度
+        # gt_actions 应该是 [B, pred_horizon, action_dim]
+        if gt_actions.dim() == 2:
+            # 如果是 [B, action_dim]，自动添加 pred_horizon 维度
+            gt_actions = gt_actions.unsqueeze(1)
+            logger.debug(f"[DIAG] gt_actions reshaped from 2D to 3D: {gt_actions.shape}")
+        
+        expected_shape = (batch_size, self.pred_horizon, self.action_dim)
+        if gt_actions.shape != expected_shape:
+            logger.warning(
+                f"[DIAG] gt_actions shape mismatch: got {gt_actions.shape}, "
+                f"expected {expected_shape}"
+            )
+        
         # Normalize ground truth actions
         from .utils import normalize_actions
         normalized_gt = normalize_actions(gt_actions, self.action_stats)
@@ -267,6 +281,24 @@ class DiffusionActionHead(nn.Module):
             final_actions = get_action_from_diffusion_output(
                 pred_actions, self.action_stats, cumulative=True
             )
+        
+        # 🔍 [DIAG] 噪声预测质量监控（1% 概率打印，避免日志过多）
+        import random
+        if random.random() < 0.01:
+            with torch.no_grad():
+                noise_std = noise.std().item()
+                noise_pred_std = noise_pred.std().item()
+                noise_mean = noise.mean().item()
+                noise_pred_mean = noise_pred.mean().item()
+                # 计算相关性
+                correlation = ((noise_pred - noise_pred_mean) * (noise - noise_mean)).mean().item()
+                correlation = correlation / (noise_std * noise_pred_std + 1e-8)
+                # 计算 MSE
+                mse = nn.functional.mse_loss(noise_pred, noise).item()
+                logger.info(
+                    f"[DIAG-Noise] noise_std={noise_std:.3f}, pred_std={noise_pred_std:.3f}, "
+                    f"corr={correlation:.3f}, mse={mse:.4f}"
+                )
         
         return {
             'loss': loss,

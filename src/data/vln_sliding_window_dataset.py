@@ -500,6 +500,74 @@ class VLNSlidingWindowDataset(Dataset):
             logger.warning(f"Failed to load discrete actions: {discrete_path}: {e}")
             return None
     
+    def compute_action_stats(self, margin: float = 0.1) -> Tuple[List[float], List[float]]:
+        """
+        遍历数据集计算 action 的 min/max 统计值
+        
+        Args:
+            margin: 安全余量百分比，默认 10%
+            
+        Returns:
+            (min_vals, max_vals): 每个维度的最小值和最大值列表
+        """
+        logger.info(f"Computing action statistics from {len(self.clips)} clips...")
+        
+        all_actions = []
+        valid_clips = 0
+        
+        for clip_dir in self.clips:
+            actions = self._load_actions(clip_dir)
+            if actions is not None and len(actions) > 0:
+                all_actions.append(actions)
+                valid_clips += 1
+        
+        if all_actions:
+            all_actions = np.concatenate(all_actions, axis=0)
+            
+            # 计算 min/max
+            raw_min = all_actions.min(axis=0)
+            raw_max = all_actions.max(axis=0)
+            range_size = raw_max - raw_min
+            
+            # 添加安全余量
+            min_val = raw_min - margin * range_size
+            max_val = raw_max + margin * range_size
+            
+            logger.info(
+                f"Action stats computed from {valid_clips} clips, {len(all_actions)} actions:\n"
+                f"  Raw range: min={raw_min.tolist()}, max={raw_max.tolist()}\n"
+                f"  With {margin*100:.0f}% margin: min={min_val.tolist()}, max={max_val.tolist()}"
+            )
+            
+            return min_val.tolist(), max_val.tolist()
+        
+        # Fallback 默认值
+        logger.warning("No actions found in dataset, using default action stats")
+        return [-0.17, -0.03], [0.19, 0.31]
+    
+    def get_action_valid_ratio(self) -> float:
+        """
+        计算数据集中有效动作的比例
+        
+        Returns:
+            有效动作占总样本的比例 (0.0 - 1.0)
+        """
+        valid_count = 0
+        total_count = len(self.sample_index)
+        
+        for clip_idx, current_t in self.sample_index:
+            clip_dir = self.clips[clip_idx]
+            meta = self._load_meta(clip_idx)
+            T = meta["num_frames"]
+            actions = self._load_actions(clip_dir)
+            
+            if actions is not None and current_t < T - 1:
+                valid_count += 1
+        
+        ratio = valid_count / max(total_count, 1)
+        logger.info(f"Action valid ratio: {valid_count}/{total_count} = {ratio*100:.1f}%")
+        return ratio
+    
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str, float]]:
         """
         加载一个训练样本
