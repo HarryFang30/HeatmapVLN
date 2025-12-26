@@ -78,7 +78,8 @@ class SpatialMLLMIntegrationConfig:
     enable_action_head: bool = False  # Enable diffusion action head
     action_dim: int = 2  # 2D navigation (dx, dy)
     action_pred_horizon: int = 1  # Number of action steps to predict
-    action_encoding_size: int = 768  # Condition projection dimension
+    action_encoding_size: int = 256  # Condition projection dimension (简化：768 → 256)
+    action_down_dims: List[int] = None  # UNet channel dims (默认使用 action_config.py 中的值)
     
     # Stop prediction (binary classifier)
     enable_stop_head: bool = False  # Enable stop prediction head
@@ -239,19 +240,26 @@ class SpatialMLLMPipeline(nn.Module):
         if config.enable_action_head:
             logger.info("Initializing Diffusion Action Head for navigation actions")
             action_device = torch.device(config.llm_gpu if config.use_multi_gpu else config.device)
-            action_config = DiffusionActionConfig(
-                action_dim=config.action_dim,
-                pred_horizon=config.action_pred_horizon,
-                cond_dim=config.llm_token_dim,  # Use projected LLM tokens as condition
-                encoding_size=config.action_encoding_size,
-                num_diffusion_iters=config.action_num_diffusion_iters,
+            
+            # 构建 action config 参数
+            action_config_kwargs = {
+                'action_dim': config.action_dim,
+                'pred_horizon': config.action_pred_horizon,
+                'cond_dim': config.llm_token_dim,  # Use projected LLM tokens as condition
+                'encoding_size': config.action_encoding_size,
+                'num_diffusion_iters': config.action_num_diffusion_iters,
                 # 🔧 使用实际数据集统计值（加 10% 余量）
-                action_stats_min=config.action_stats_min or [-0.17, -0.03],
-                action_stats_max=config.action_stats_max or [0.19, 0.31],
-                device=str(action_device),
-            )
+                'action_stats_min': config.action_stats_min or [-0.17, -0.03],
+                'action_stats_max': config.action_stats_max or [0.19, 0.31],
+                'device': str(action_device),
+            }
+            # 可选：传递 down_dims（如果在 config 中指定）
+            if config.action_down_dims is not None:
+                action_config_kwargs['down_dims'] = config.action_down_dims
+            
+            action_config = DiffusionActionConfig(**action_config_kwargs)
             self.action_head = DiffusionActionHead(action_config).to(device=action_device, dtype=config.dtype)
-            logger.info(f"Diffusion Action Head initialized on {action_device}")
+            logger.info(f"Diffusion Action Head initialized on {action_device}, down_dims={action_config.down_dims}")
         else:
             self.action_head = None
         

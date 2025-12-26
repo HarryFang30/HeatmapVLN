@@ -44,14 +44,15 @@ model:
     cond_dim: 512                       # 条件维度
     num_inference_steps: 10             # 推理时扩散步数
 
-  # 动作头配置
+  # 动作头配置（简化 UNet 架构，适合 2D 低维动作）
   action_head:
     enable: true
     cond_dim: 2048                      # LLM 输出维度
     action_dim: 2                       # 2D 动作 (dx, dy)
     pred_horizon: 1                     # 预测步数
     num_diffusion_iters: 10             # 扩散步数
-    encoding_size: 768                  # 条件投影维度
+    encoding_size: 256                  # 条件投影维度（简化：768 → 256）
+    down_dims: [128, 256]               # UNet 通道维度（简化：[192,384,768] → [128,256]）
     # 🔧 关键修复：使用实际数据统计值（而非 DifNav 默认值）
     action_stats_min: [-0.17, -0.03]    # 从数据集计算，加 10% 余量
     action_stats_max: [0.19, 0.31]      # 从数据集计算，加 10% 余量
@@ -71,7 +72,7 @@ training:
     # ============ Stage 1: History 预热 (64x64) ============
     # 预热 History head + Action head + Fusion
     - name: warmup_history_64
-      epochs: 2                         # 减少: 3 → 2
+      epochs: 5                        
       hm_size: [64, 64]
       heatmap_loss_type: simplified     # Warmup 使用简化 Loss
       train_history: true

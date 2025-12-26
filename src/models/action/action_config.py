@@ -45,10 +45,11 @@ class DiffusionActionConfig:
     
     # Conditioning from LLM
     cond_dim: int = 2048  # Qwen2.5-VL output dimension
-    encoding_size: int = 768  # Projected dimension
+    encoding_size: int = 256  # Projected dimension (简化：768 → 256)
     
-    # U-Net architecture (matching DifNav defaults)
-    down_dims: List[int] = field(default_factory=lambda: [192, 384, 768])
+    # U-Net architecture (简化：适合低维 2D action)
+    # 原 DifNav 默认 [192, 384, 768]，对 2D 动作过于复杂
+    down_dims: List[int] = field(default_factory=lambda: [128, 256])
     diffusion_step_embed_dim: int = 256
     kernel_size: int = 3
     n_groups: int = 8

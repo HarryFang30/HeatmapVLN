@@ -623,11 +623,12 @@ def build_model(cfg: Dict) -> nn.Module:
         # Memory optimization
         enable_gradient_checkpointing=cfg['optim'].get('gradient_checkpointing', False),
 
-        # Diffusion Action Head
+        # Diffusion Action Head（简化 UNet 架构）
         enable_action_head=model_cfg['action_head']['enable'],
         action_dim=model_cfg['action_head']['action_dim'],
         action_pred_horizon=model_cfg['action_head']['pred_horizon'],
-        action_encoding_size=model_cfg['action_head']['encoding_size'],
+        action_encoding_size=model_cfg['action_head'].get('encoding_size', 256),  # 简化：768 → 256
+        action_down_dims=model_cfg['action_head'].get('down_dims', None),  # 简化：[128, 256]
         action_num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
         # 🔧 关键修复：使用实际数据集统计值进行归一化
         action_stats_min=model_cfg['action_head'].get('action_stats_min', [-0.17, -0.03]),
