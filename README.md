@@ -14,7 +14,7 @@
 
 ### 1) 环境安装
 
-建议在 `Heatmap/` 目录下安装依赖：
+建议在 `HeatmapVLN/` 目录下安装依赖：
 
 ```bash
 cd Heatmap
