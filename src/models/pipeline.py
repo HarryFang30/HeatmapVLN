@@ -337,12 +337,15 @@ class SpatialMLLMPipeline(nn.Module):
         fusion_dim = self.config.feature_fusion_dim
         
         if self.config.fusion_method == "concatenate":
+            # Bottleneck structure: expand then compress for better capacity
+            # Added output LayerNorm for training stability (aligned with SpatialMLPFusion)
             return nn.Sequential(
                 nn.LayerNorm(vggt_dim + dinov3_dim),
-                nn.Linear(vggt_dim + dinov3_dim, fusion_dim),
+                nn.Linear(vggt_dim + dinov3_dim, fusion_dim * 2),  # Expand
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear(fusion_dim, fusion_dim)
+                nn.Linear(fusion_dim * 2, fusion_dim),  # Compress
+                nn.LayerNorm(fusion_dim)  # Output normalization
             )
         elif self.config.fusion_method == "attention":
             return SpatialAttentionFusion(
@@ -938,54 +941,14 @@ class SpatialAttentionFusion(nn.Module):
         """
         Cross-attention fusion: DINOv3 semantic features query VGGT geometric features.
         
-        Handles spatial dimension mismatch by aligning to common resolution.
-        
         Args:
-            vggt_features: [B, N_k, L_vggt, D_vggt] - 3D geometric features
-            dinov3_features: [B, N_k, L_dinov3, D_dinov3] - 2D semantic features
+            vggt_features: [B, N_k, L, D_vggt] - 3D geometric features
+            dinov3_features: [B, N_k, L, D_dinov3] - 2D semantic features
             
         Returns:
-            Fused features [B, N_k, L_aligned, output_dim]
+            Fused features [B, N_k, L, output_dim]
         """
-        import torch.nn.functional as F
-        
-        batch_size, num_keyframes = vggt_features.shape[:2]
-        vggt_spatial_dim = vggt_features.shape[2]
-        dinov3_spatial_dim = dinov3_features.shape[2]
-        
-        # Handle spatial dimension mismatch
-        if vggt_spatial_dim != dinov3_spatial_dim:
-            # Calculate spatial grid sizes
-            vggt_side = int(vggt_spatial_dim ** 0.5)
-            dinov3_side = int(dinov3_spatial_dim ** 0.5)
-            
-            # Use the smaller resolution as target
-            target_side = min(vggt_side, dinov3_side)
-            
-            # Reshape VGGT to spatial grid for pooling
-            vggt_img = vggt_features.view(batch_size * num_keyframes, vggt_side, vggt_side, -1)
-            vggt_img = vggt_img.permute(0, 3, 1, 2).contiguous()
-            
-            # Reshape DINOv3 to spatial grid
-            dinov3_img = dinov3_features.view(batch_size * num_keyframes, dinov3_side, dinov3_side, -1)
-            dinov3_img = dinov3_img.permute(0, 3, 1, 2).contiguous()
-            
-            # Resize to target resolution
-            if vggt_side != target_side:
-                vggt_img = F.adaptive_avg_pool2d(vggt_img, (target_side, target_side))
-            if dinov3_side != target_side:
-                dinov3_img = F.interpolate(dinov3_img, size=(target_side, target_side),
-                                           mode='bilinear', align_corners=False)
-            
-            # Reshape back: [B*N_k, D, H, W] -> [B, N_k, L, D]
-            vggt_features = vggt_img.permute(0, 2, 3, 1).contiguous()
-            vggt_features = vggt_features.view(batch_size, num_keyframes, target_side * target_side, -1)
-            
-            dinov3_features = dinov3_img.permute(0, 2, 3, 1).contiguous()
-            dinov3_features = dinov3_features.view(batch_size, num_keyframes, target_side * target_side, -1)
-        
-        # Now both have aligned spatial dimensions
-        seq_len = dinov3_features.shape[2]
+        batch_size, num_keyframes, seq_len, _ = dinov3_features.shape
         
         # Flatten batch and keyframes for attention: [B*N_k, L, D]
         vggt_flat = vggt_features.view(batch_size * num_keyframes, seq_len, -1)
@@ -1016,13 +979,10 @@ class SpatialAttentionFusion(nn.Module):
 
 
 class SpatialMLPFusion(nn.Module):
-    """MLP-based fusion of 3D and 2D spatial features with automatic spatial alignment."""
+    """MLP-based fusion of 3D and 2D spatial features."""
     
     def __init__(self, vggt_dim: int, dinov3_dim: int, output_dim: int):
         super().__init__()
-        self.vggt_dim = vggt_dim
-        self.dinov3_dim = dinov3_dim
-        self.output_dim = output_dim
         self.fusion_mlp = nn.Sequential(
             nn.Linear(vggt_dim + dinov3_dim, output_dim * 2),
             nn.GELU(),
@@ -1032,55 +992,6 @@ class SpatialMLPFusion(nn.Module):
         )
         
     def forward(self, vggt_features: torch.Tensor, dinov3_features: torch.Tensor) -> torch.Tensor:
-        """
-        MLP fusion with automatic spatial alignment.
-        
-        Args:
-            vggt_features: [B, N_k, L_vggt, D_vggt] - VGGT spatial features
-            dinov3_features: [B, N_k, L_dinov3, D_dinov3] - DINOv3 spatial features
-            
-        Returns:
-            Fused features [B, N_k, L_aligned, output_dim]
-        """
-        import torch.nn.functional as F
-        
-        batch_size, num_keyframes = vggt_features.shape[:2]
-        vggt_spatial_dim = vggt_features.shape[2]
-        dinov3_spatial_dim = dinov3_features.shape[2]
-        
-        # If spatial dimensions differ, align them
-        if vggt_spatial_dim != dinov3_spatial_dim:
-            # Calculate spatial grid sizes
-            vggt_side = int(vggt_spatial_dim ** 0.5)
-            dinov3_side = int(dinov3_spatial_dim ** 0.5)
-            
-            # Use the smaller resolution as target (typically DINOv3's 14x14)
-            target_side = min(vggt_side, dinov3_side)
-            
-            # Reshape to spatial grid for pooling/interpolation
-            # VGGT: [B, N_k, L, D] -> [B*N_k, D, H, W]
-            vggt_img = vggt_features.view(batch_size * num_keyframes, vggt_side, vggt_side, -1)
-            vggt_img = vggt_img.permute(0, 3, 1, 2).contiguous()
-            
-            # DINOv3: [B, N_k, L, D] -> [B*N_k, D, H, W]
-            dinov3_img = dinov3_features.view(batch_size * num_keyframes, dinov3_side, dinov3_side, -1)
-            dinov3_img = dinov3_img.permute(0, 3, 1, 2).contiguous()
-            
-            # Resize both to target resolution
-            if vggt_side != target_side:
-                vggt_img = F.adaptive_avg_pool2d(vggt_img, (target_side, target_side))
-            if dinov3_side != target_side:
-                dinov3_img = F.interpolate(dinov3_img, size=(target_side, target_side), 
-                                           mode='bilinear', align_corners=False)
-            
-            # Reshape back to sequence format: [B*N_k, D, H, W] -> [B, N_k, L, D]
-            vggt_features = vggt_img.permute(0, 2, 3, 1).contiguous()
-            vggt_features = vggt_features.view(batch_size, num_keyframes, target_side * target_side, -1)
-            
-            dinov3_features = dinov3_img.permute(0, 2, 3, 1).contiguous()
-            dinov3_features = dinov3_features.view(batch_size, num_keyframes, target_side * target_side, -1)
-        
-        # Now both have same spatial dimensions, safe to concatenate
         concatenated = torch.cat([vggt_features, dinov3_features], dim=-1)
         return self.fusion_mlp(concatenated)
 
