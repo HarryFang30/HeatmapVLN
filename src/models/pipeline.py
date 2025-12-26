@@ -153,27 +153,9 @@ class SpatialMLLMPipeline(nn.Module):
         # In DDP mode: all modules on same device (self.device)
         # In multi-GPU mode: on dedicated GPU
         vggt_device = torch.device(config.vggt_gpu if config.use_multi_gpu else config.device)
-        print(f"[DEBUG] vggt_device will be: {vggt_device}")
-        try:
-            # Try to load pretrained VGGT from local model directory
-            from ..utils.path_utils import resolve_model_path
-            vggt_model_path = "./models/vggt"
-            try:
-                resolved_vggt_path = resolve_model_path(vggt_model_path, "VGGT")
-                self.vggt = VGGT.from_pretrained(str(resolved_vggt_path)).to(device=vggt_device)
-                print(f"Loaded pretrained VGGT from {resolved_vggt_path} on {vggt_device}")
-            except FileNotFoundError:
-                print(f"VGGT model not found at {vggt_model_path}, will use random initialization")
-                raise  # Re-raise to trigger fallback
-        except Exception as e:
-            print(f"Could not load pretrained VGGT from local path: {e}")
-            # Fallback to random initialization
-            self.vggt = VGGT(
-                img_size=config.vggt_img_size,
-                patch_size=config.vggt_patch_size,
-                embed_dim=config.vggt_embed_dim
-            ).to(device=vggt_device)
-            print(f"Using randomly initialized VGGT weights on {vggt_device}")
+        logger.info(f"[VGGT] Target device: {vggt_device}")
+        
+        self.vggt = self._load_vggt_model(config, vggt_device)
         
         # Initialize keyframe selector with space-aware sampling
         self.keyframe_selector = create_keyframe_selector(
@@ -328,6 +310,95 @@ class SpatialMLLMPipeline(nn.Module):
         # Performance optimization
         if config.enable_gradient_checkpointing:
             self.vggt.gradient_checkpointing_enable()
+    
+    def _load_vggt_model(self, config: SpatialMLLMIntegrationConfig, device: torch.device) -> VGGT:
+        """
+        Load VGGT model with comprehensive path checking and error handling.
+        
+        This method tries multiple loading strategies:
+        1. Load from local pretrained model directory (./models/vggt)
+        2. Fall back to random initialization if model files not found
+        
+        Args:
+            config: Pipeline configuration
+            device: Target device for the model
+            
+        Returns:
+            Initialized VGGT model on the specified device
+        """
+        from pathlib import Path
+        from ..utils.path_utils import resolve_model_path
+        
+        vggt_model_path = "./models/vggt"
+        
+        # Step 1: Try to resolve and validate model path
+        try:
+            resolved_path = resolve_model_path(vggt_model_path, "VGGT")
+            resolved_path = Path(resolved_path)
+            
+            # Step 2: Verify required files exist
+            required_files = ['config.json']
+            weight_files = ['model.safetensors', 'model.pt', 'pytorch_model.bin']
+            
+            # Check config.json
+            if not (resolved_path / 'config.json').exists():
+                raise FileNotFoundError(f"Missing config.json in {resolved_path}")
+            
+            # Check for at least one weight file
+            weight_file_found = any((resolved_path / wf).exists() for wf in weight_files)
+            if not weight_file_found:
+                raise FileNotFoundError(
+                    f"No weight file found in {resolved_path}. "
+                    f"Expected one of: {weight_files}"
+                )
+            
+            # Step 3: Validate config matches expected parameters
+            import json
+            with open(resolved_path / 'config.json', 'r') as f:
+                vggt_config = json.load(f)
+            
+            config_mismatch = []
+            if vggt_config.get('img_size') != config.vggt_img_size:
+                config_mismatch.append(
+                    f"img_size: config={config.vggt_img_size}, model={vggt_config.get('img_size')}"
+                )
+            if vggt_config.get('patch_size') != config.vggt_patch_size:
+                config_mismatch.append(
+                    f"patch_size: config={config.vggt_patch_size}, model={vggt_config.get('patch_size')}"
+                )
+            if vggt_config.get('embed_dim') != config.vggt_embed_dim:
+                config_mismatch.append(
+                    f"embed_dim: config={config.vggt_embed_dim}, model={vggt_config.get('embed_dim')}"
+                )
+            
+            if config_mismatch:
+                logger.warning(f"[VGGT] Config mismatch detected: {'; '.join(config_mismatch)}")
+                logger.warning("[VGGT] Using model's config values for loading")
+            
+            # Step 4: Load the model
+            logger.info(f"[VGGT] Loading pretrained model from {resolved_path}")
+            model = VGGT.from_pretrained(str(resolved_path)).to(device=device)
+            logger.info(f"[VGGT] Successfully loaded pretrained model on {device}")
+            
+            return model
+            
+        except FileNotFoundError as e:
+            logger.warning(f"[VGGT] Model files not found: {e}")
+            logger.warning(f"[VGGT] Falling back to random initialization")
+        except Exception as e:
+            logger.error(f"[VGGT] Failed to load pretrained model: {e}")
+            logger.warning(f"[VGGT] Falling back to random initialization")
+        
+        # Fallback: Create model with random weights
+        logger.info(f"[VGGT] Creating model with random initialization")
+        model = VGGT(
+            img_size=config.vggt_img_size,
+            patch_size=config.vggt_patch_size,
+            embed_dim=config.vggt_embed_dim
+        ).to(device=device)
+        logger.info(f"[VGGT] Model initialized on {device}")
+        
+        return model
             
     def _create_feature_fusion_module(self) -> nn.Module:
         """Create module for fusing 3D VGGT and 2D DINOv3 features."""
