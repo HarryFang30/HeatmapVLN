@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from .aggregator import Aggregator
@@ -23,6 +24,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+        
+        # Gradient checkpointing flag
+        self._gradient_checkpointing = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -30,6 +34,49 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         `torch.dtype`: The dtype of the module (assuming that all the module parameters have the same dtype).
         """
         return get_parameter_dtype(self)
+    
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Enable gradient checkpointing for memory-efficient training.
+        
+        This reduces memory usage by recomputing intermediate activations
+        during the backward pass instead of storing them.
+        
+        Args:
+            gradient_checkpointing_kwargs: Optional kwargs for checkpoint function.
+        """
+        self._gradient_checkpointing = True
+        self._gradient_checkpointing_kwargs = gradient_checkpointing_kwargs or {}
+        
+        # Enable gradient checkpointing for aggregator blocks if they support it
+        if hasattr(self.aggregator, 'frame_blocks'):
+            for block in self.aggregator.frame_blocks:
+                if hasattr(block, 'gradient_checkpointing_enable'):
+                    block.gradient_checkpointing_enable()
+        if hasattr(self.aggregator, 'global_blocks'):
+            for block in self.aggregator.global_blocks:
+                if hasattr(block, 'gradient_checkpointing_enable'):
+                    block.gradient_checkpointing_enable()
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self._gradient_checkpointing = False
+        self._gradient_checkpointing_kwargs = {}
+        
+        # Disable for aggregator blocks
+        if hasattr(self.aggregator, 'frame_blocks'):
+            for block in self.aggregator.frame_blocks:
+                if hasattr(block, 'gradient_checkpointing_disable'):
+                    block.gradient_checkpointing_disable()
+        if hasattr(self.aggregator, 'global_blocks'):
+            for block in self.aggregator.global_blocks:
+                if hasattr(block, 'gradient_checkpointing_disable'):
+                    block.gradient_checkpointing_disable()
+    
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        """Check if gradient checkpointing is enabled."""
+        return getattr(self, '_gradient_checkpointing', False)
     
     def forward(
         self,
