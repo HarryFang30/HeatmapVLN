@@ -83,11 +83,11 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion                # 解冻 fusion，让 heads 有合适的输入
+        - llm_projector                 # 🔧 解冻 llm_projector，避免随机投影导致特征不对齐
       frozen_modules:
         - vggt
         - dinov3_compat
         - future_heatmap_head
-        - llm_projector
       
     # ============ Stage 2: Future 预热 (64x64) ============
     # 预热 Future head，冻结 History 让 Future 赶上
@@ -103,11 +103,11 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
+        - llm_projector                 # 🔧 解冻 llm_projector，保持特征对齐
       frozen_modules:
         - vggt
         - dinov3_compat
         - history_heatmap_head          # 暂时冻结 History
-        - llm_projector
       
     # ============ Stage 3: 联合训练 (128x128) ============
     # 中间阶段：提升分辨率，双 head 联合训练，使用完整 Loss
@@ -124,10 +124,10 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
+        - llm_projector                 # 🔧 解冻 llm_projector，保持特征对齐
       frozen_modules:
         - vggt
         - dinov3_compat
-        - llm_projector
       
     # ============ Stage 4: 精细训练 (224x224) ============
     # 完整训练：大分辨率，解冻 LLM Projector
@@ -161,7 +161,8 @@ optim:
   history_heatmap_lr: 3.0e-4            # 历史头（Diffusion）
   future_heatmap_lr: 3.0e-4             # 未来头（Diffusion）
   action_lr: 3.0e-4                     # 动作头（Diffusion）
-  fusion_lr: 1.0e-4                     # feature_fusion + llm_projector
+  fusion_lr: 1.0e-4                     # feature_fusion
+  llm_projector_lr: 5.0e-5              # 🔧 llm_projector 独立学习率（更低，训练更稳定）
   encoder_lr: 1.0e-5                    # vggt + dinov3_compat（冻结或微调）
 
   weight_decay: 1.0e-4                   # 降低 weight decay，对 Diffusion 更友好

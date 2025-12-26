@@ -775,21 +775,30 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: stop_head (lr={stop_lr})")
     
-    # 3) 融合模块+投影器
-    fusion_params = []
+    # 3) feature_fusion 模块
     if hasattr(model, 'feature_fusion'):
-        fusion_params.extend([p for p in model.feature_fusion.parameters() if p.requires_grad])
-    if hasattr(model, 'llm_projector'):
-        fusion_params.extend([p for p in model.llm_projector.parameters() if p.requires_grad])
-    if fusion_params:
-        param_groups.append({
-            'params': fusion_params,
-            'lr': optim_cfg['fusion_lr'],
-            'name': 'fusion'
-        })
-        print(f"  Param group: fusion (lr={optim_cfg['fusion_lr']})")
+        fusion_params = [p for p in model.feature_fusion.parameters() if p.requires_grad]
+        if fusion_params:
+            param_groups.append({
+                'params': fusion_params,
+                'lr': optim_cfg['fusion_lr'],
+                'name': 'feature_fusion'
+            })
+            print(f"  Param group: feature_fusion (lr={optim_cfg['fusion_lr']})")
     
-    # 4) 编码器
+    # 4) llm_projector 模块（独立学习率，更稳定）
+    if hasattr(model, 'llm_projector'):
+        proj_lr = optim_cfg.get('llm_projector_lr', optim_cfg['fusion_lr'])
+        proj_params = [p for p in model.llm_projector.parameters() if p.requires_grad]
+        if proj_params:
+            param_groups.append({
+                'params': proj_params,
+                'lr': proj_lr,
+                'name': 'llm_projector'
+            })
+            print(f"  Param group: llm_projector (lr={proj_lr})")
+    
+    # 5) 编码器
     encoder_params = []
     if hasattr(model, 'vggt'):
         encoder_params.extend([p for p in model.vggt.parameters() if p.requires_grad])
