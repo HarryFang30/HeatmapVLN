@@ -93,7 +93,7 @@ pip install -r requirements.txt
 ### 对数据集 clip 推理（推荐）
 
 ```bash
-cd /HeatmapVLN
+cd HeatmapVLN
 
 python scripts/inference.py \
   --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
