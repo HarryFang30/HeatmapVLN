@@ -215,8 +215,23 @@ class DiffusionHeatmapHead(nn.Module):
             global_cond=cond,
         )
         
-        # Compute loss (MSE between predicted and actual noise)
-        loss = F.mse_loss(noise_pred, noise)
+        # 🔧 [FIX] 加权 MSE Loss：峰值区域权重更高
+        # 问题：GT热力图93.5%是黑色，如果用普通MSE，模型学会"输出全黑"就能获得极低Loss
+        # 解决：增加峰值区域（热力图高值区域）的权重，强制模型学习空间结构
+        
+        # 计算权重：峰值区域权重 x10，背景权重 x1
+        # gt_heatmap: [B, 1, H, W] in [0, 1]
+        weight = 1.0 + 9.0 * gt_heatmap.clamp(0, 1)  # 范围：[1.0, 10.0]
+        
+        # 加权 MSE
+        squared_error = (noise_pred - noise).pow(2)
+        weighted_loss = (weight * squared_error).mean()
+        
+        loss = weighted_loss
+        
+        # 🔍 诊断信息：记录噪声预测质量
+        noise_std = noise.std().item()
+        noise_pred_std = noise_pred.std().item()
         
         # Generate heatmap for monitoring (optional, controlled by interval)
         pred_heatmap = None
@@ -231,6 +246,8 @@ class DiffusionHeatmapHead(nn.Module):
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
+            'noise_std': noise_std,
+            'noise_pred_std': noise_pred_std,
         }
     
     def _diffusion_inference(self, cond: torch.Tensor) -> torch.Tensor:

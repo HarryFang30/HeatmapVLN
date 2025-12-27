@@ -644,6 +644,11 @@ class SpatialMLLMPipeline(nn.Module):
                     history_heatmap_loss = result['loss']
                     history_heatmap = result.get('heatmap')  # May be None if skipped
                     logger.info(f"History heatmap diffusion loss: {history_heatmap_loss.item():.4f}")
+                    
+                    # 🔍 提取热力图扩散诊断信息
+                    if 'noise_std' in result:
+                        output['history_heatmap_noise_std'] = result['noise_std']
+                        output['history_heatmap_noise_pred_std'] = result['noise_pred_std']
                 else:
                     # Inference mode
                     history_heatmap = self.history_heatmap_head(
@@ -669,6 +674,11 @@ class SpatialMLLMPipeline(nn.Module):
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')  # May be None if skipped
                     logger.info(f"Future heatmap diffusion loss: {future_heatmap_loss.item():.4f}")
+                    
+                    # 🔍 提取热力图扩散诊断信息
+                    if 'noise_std' in result:
+                        output['future_heatmap_noise_std'] = result['noise_std']
+                        output['future_heatmap_noise_pred_std'] = result['noise_pred_std']
                 else:
                     # Inference mode
                     future_heatmap = self.future_heatmap_head(

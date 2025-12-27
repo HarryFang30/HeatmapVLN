@@ -1052,6 +1052,7 @@ def train_one_epoch(
             # ========== 统一 Loss 计算 ==========
             # 1. Heatmap Loss（优先使用 diffusion loss）
             heatmap_loss = torch.tensor(0.0, device=device)
+            heatmap_diag = {}  # 🔍 热力图诊断信息
             loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
             
             if train_history:
@@ -1059,6 +1060,10 @@ def train_one_epoch(
                 if 'history_heatmap_loss' in output:
                     heatmap_loss = output['history_heatmap_loss']
                     logger.info(f"  使用 History Diffusion Loss: {heatmap_loss.item():.4f}")
+                    # 提取诊断信息
+                    if 'history_heatmap_noise_std' in output:
+                        heatmap_diag['noise_std'] = output['history_heatmap_noise_std']
+                        heatmap_diag['noise_pred_std'] = output['history_heatmap_noise_pred_std']
                 else:
                     # 回退到外部 MSE loss（兼容模式）
                     pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
@@ -1203,25 +1208,63 @@ def train_one_epoch(
                     # 🆕 固定间隔诊断信息记录
                     diag_interval = cfg['log'].get('diag_interval', 100)
                     if global_step % diag_interval == 0:
+                        # 🔍 [DIAG-HM-DIFF] Heatmap Diffusion diagnostics - 检查噪声预测质量
+                        if heatmap_diag:
+                            if heatmap_diag.get('noise_std') is not None:
+                                tb_writer.add_scalar('diag/heatmap_noise_std', heatmap_diag['noise_std'], actual_step)
+                                tb_writer.add_scalar('diag/heatmap_noise_pred_std', heatmap_diag['noise_pred_std'], actual_step)
+                                logger.info(
+                                    f"[DIAG-HM-DIFF] heatmap noise_std={heatmap_diag['noise_std']:.3f}, "
+                                    f"pred_std={heatmap_diag['noise_pred_std']:.3f}"
+                                )
+                                # 如果预测的噪声标准差远小于真实噪声（应该是~1.0），说明模型没有有效学习
+                                if heatmap_diag['noise_pred_std'] < 0.5:
+                                    logger.warning(
+                                        f"[DIAG-HM-DIFF] ⚠️ 热力图噪声预测质量差！"
+                                        f"pred_std={heatmap_diag['noise_pred_std']:.3f} < 0.5"
+                                    )
+                        
                         # Action diffusion diagnostics
                         if action_diag:
                             if action_diag.get('noise_std') is not None:
-                                tb_writer.add_scalar('diag/noise_std', action_diag['noise_std'].item(), actual_step)
-                                tb_writer.add_scalar('diag/noise_pred_std', action_diag['noise_pred_std'].item(), actual_step)
+                                tb_writer.add_scalar('diag/action_noise_std', action_diag['noise_std'].item(), actual_step)
+                                tb_writer.add_scalar('diag/action_noise_pred_std', action_diag['noise_pred_std'].item(), actual_step)
                                 tb_writer.add_scalar('diag/action_mse', action_diag['mse'].item(), actual_step)
                                 # 固定间隔日志打印
                                 logger.info(
-                                    f"[DIAG] noise_std={action_diag['noise_std'].item():.3f}, "
+                                    f"[DIAG-ACTION] noise_std={action_diag['noise_std'].item():.3f}, "
                                     f"pred_std={action_diag['noise_pred_std'].item():.3f}, "
                                     f"mse={action_diag['mse'].item():.4f}"
                                 )
                         
-                        # Heatmap output diagnostics
+                        # 🔍 [DIAG-HM] Heatmap output diagnostics - 检查是否坍缩为全黑
                         if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
                             pred_hm = output['history_heatmaps'].detach()
-                            tb_writer.add_scalar('diag/pred_heatmap_mean', pred_hm.mean().item(), actual_step)
-                            tb_writer.add_scalar('diag/pred_heatmap_max', pred_hm.max().item(), actual_step)
-                            tb_writer.add_scalar('diag/pred_heatmap_std', pred_hm.std().item(), actual_step)
+                            pred_mean = pred_hm.mean().item()
+                            pred_max = pred_hm.max().item()
+                            pred_std = pred_hm.std().item()
+                            
+                            tb_writer.add_scalar('diag/pred_heatmap_mean', pred_mean, actual_step)
+                            tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
+                            tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
+                            
+                            # 与 GT 对比
+                            gt_mean = gt_heatmap.mean().item()
+                            gt_max = gt_heatmap.max().item()
+                            
+                            # 诊断日志
+                            logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
+                            logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
+                            
+                            # ⚠️ 坍缩检测：如果预测热力图最大值 < 0.1，警告
+                            if pred_max < 0.1:
+                                logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
+                            
+                            # 检查是否都接近 0（全黑）
+                            non_zero_ratio = (pred_hm > 0.01).float().mean().item()
+                            tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
+                            if non_zero_ratio < 0.05:  # 少于 5% 的像素 > 0.01
+                                logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
                         
                         # Stop prediction diagnostics
                         if 'stop_logits' in output:
