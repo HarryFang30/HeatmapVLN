@@ -2,24 +2,21 @@
 Data loading and preprocessing utilities for VLN datasets
 
 Active components used by the pipeline:
-- vln_heatmap_adapter: Training dataset for heatmap generation
+- vln_sliding_window_dataset: Core training dataset (滑动窗口)
 - keyframe_selector: Keyframe selection (used by spatial_mllm_compat)
 - frame_sampler: Space-aware sampling (dependency of keyframe_selector)
-- spatial_analysis: Spatial novelty detection (dependency of keyframe_selector)
-- algorithm_registry: Algorithm registration and base classes
+
+Removed modules:
+- vln_heatmap_adapter: Deprecated, functionality merged into sliding_window
+- spatial_analysis: Removed, novelty strategies fallback to greedy_coverage
+- algorithm_registry: Removed, over-engineered for single algorithm use
 """
 
-# Core frame sampling components (used by keyframe_selector and algorithm_registry)
+# Core frame sampling components
 from .frame_sampler import (
     SpaceAwareFrameSampler,
     SamplingConfig,
     create_frame_sampler
-)
-
-from .spatial_analysis import (
-    SpatialNoveltyDetector,
-    SpatialAnalysisConfig,
-    create_spatial_analyzer
 )
 
 from .keyframe_selector import (
@@ -29,15 +26,10 @@ from .keyframe_selector import (
 )
 
 __all__ = [
-    # Frame Sampling Components (active dependencies)
+    # Frame Sampling Components
     'SpaceAwareFrameSampler',
     'SamplingConfig',
     'create_frame_sampler',
-
-    # Spatial Analysis (active dependency)
-    'SpatialNoveltyDetector',
-    'SpatialAnalysisConfig',
-    'create_spatial_analyzer',
 
     # Keyframe Selector (used by spatial_mllm_compat)
     'KeyframeSelector',
@@ -46,16 +38,10 @@ __all__ = [
 ]
 
 # Training dataset classes
-from .vln_heatmap_adapter import VLNHeatmapDataset, create_heatmap_dataloader
 from .vln_sliding_window_dataset import VLNSlidingWindowDataset, create_sliding_window_dataloader
 
 __all__ += [
     # Training Datasets
-    'VLNHeatmapDataset',
-    'create_heatmap_dataloader',
     'VLNSlidingWindowDataset',
     'create_sliding_window_dataloader',
 ]
-
-# Note: The following modules are also available for direct import:
-# - algorithm_registry (AlgorithmRegistry, BaseFrameSampler) - used internally

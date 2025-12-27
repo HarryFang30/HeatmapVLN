@@ -30,7 +30,9 @@ import logging
 import time
 
 from .frame_sampler import SpaceAwareFrameSampler, SamplingConfig, create_frame_sampler
-from .spatial_analysis import SpatialNoveltyDetector, create_spatial_analyzer
+
+# Note: spatial_analysis module removed - novelty_weighted and hybrid strategies 
+# now fallback to greedy_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ class KeyframeSelectionConfig:
     
     # Sampling strategy
     sampling_method: str = "greedy_coverage"  # Options: greedy_coverage, novelty_weighted, hybrid
-    use_spatial_analysis: bool = True  # Enable spatial novelty analysis
+    use_spatial_analysis: bool = False  # Spatial analysis disabled (module removed)
     
     # Hybrid sampling parameters (when sampling_method="hybrid")
     coverage_weight: float = 0.7  # Weight for coverage-based selection
@@ -88,11 +90,9 @@ class KeyframeSelector(nn.Module):
         )
         self.frame_sampler = SpaceAwareFrameSampler(sampling_config)
         
-        # Initialize spatial analysis if enabled
-        if config.use_spatial_analysis:
-            self.spatial_analyzer = create_spatial_analyzer()
-        else:
-            self.spatial_analyzer = None
+        # Spatial analysis disabled (module removed)
+        # novelty_weighted and hybrid strategies will fallback to greedy_coverage
+        self.spatial_analyzer = None
             
         # Initialize caching system
         self._cache = {}
@@ -554,7 +554,7 @@ def create_keyframe_selector(
     target_keyframes: int = 16,
     total_frames: int = 128,
     sampling_method: str = "greedy_coverage",
-    use_spatial_analysis: bool = True,
+    use_spatial_analysis: bool = False,  # Disabled - module removed
     device: str = "cuda",
     enable_caching: bool = True,
     verbose: bool = True
@@ -566,7 +566,7 @@ def create_keyframe_selector(
         target_keyframes: Number of keyframes to select (N_k)
         total_frames: Total number of input frames (N_m)
         sampling_method: Selection strategy ("greedy_coverage", "novelty_weighted", "hybrid")
-        use_spatial_analysis: Enable spatial novelty analysis
+        use_spatial_analysis: Deprecated - spatial analysis module removed
         device: Computing device
         enable_caching: Enable result caching
         verbose: Enable detailed logging
@@ -578,7 +578,7 @@ def create_keyframe_selector(
         target_keyframes=target_keyframes,
         total_frames=total_frames,
         sampling_method=sampling_method,
-        use_spatial_analysis=use_spatial_analysis,
+        use_spatial_analysis=False,  # Always False - module removed
         device=device,
         enable_caching=enable_caching,
         verbose=verbose
