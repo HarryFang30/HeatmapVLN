@@ -603,6 +603,11 @@ is_stop = 1.0 if discrete_action == 0 else 0.0
 
 ## 推理（Inference）
 
+> ⚠️ **运行前请确保激活 conda 环境**：
+> ```bash
+> conda activate models
+> ```
+
 推理脚本：`scripts/inference.py`  
 支持两种输入：
 
@@ -645,6 +650,11 @@ python scripts/inference.py \
 ---
 
 ## 训练（Training）
+
+> ⚠️ **运行前请确保激活 conda 环境**：
+> ```bash
+> conda activate models
+> ```
 
 训练脚本：`scripts/train.py`  
 默认读取：`--config configs/train_config.yaml`
@@ -870,6 +880,11 @@ python scripts/train.py \
 ---
 
 ## 评估（Evaluate）
+
+> ⚠️ **运行前请确保激活 conda 环境**：
+> ```bash
+> conda activate models
+> ```
 
 评估脚本：`scripts/evaluate.py`  
 必须提供 `--checkpoint`。

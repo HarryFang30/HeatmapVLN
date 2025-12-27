@@ -299,7 +299,7 @@ class DiffusionActionHead(nn.Module):
     
     def compute_loss(
         self,
-        global_cond: torch.Tensor,
+        llm_features: torch.Tensor,
         gt_actions: torch.Tensor,
         action_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -307,13 +307,16 @@ class DiffusionActionHead(nn.Module):
         供外部调用的 loss 计算方法（不做推理监控，更快）。
         
         Args:
-            global_cond: (B, encoding_size) 条件向量
+            llm_features: (B, cond_dim) 或 (B, seq_len, cond_dim) LLM 输出特征
             gt_actions: (B, pred_horizon, action_dim) ground truth actions
             action_valid: Optional (B,) mask indicating which samples have valid actions
             
         Returns:
             Dict with 'loss' and diagnostic info
         """
+        # 先通过 condition_projector 投影到 encoding_size
+        global_cond = self.condition_projector(llm_features)  # (B, encoding_size)
+        
         device = global_cond.device
         batch_size = global_cond.shape[0]
         

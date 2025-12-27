@@ -844,12 +844,22 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: dinov3_adapters (lr={dinov3_adapter_lr})")
     
-    # 5) 编码器
+    # 5) 编码器（排除已添加到其他参数组的子模块）
+    # 收集已添加的参数 id，避免重复
+    added_param_ids = set()
+    for pg in param_groups:
+        for p in pg['params']:
+            added_param_ids.add(id(p))
+    
     encoder_params = []
     if hasattr(model, 'vggt'):
-        encoder_params.extend([p for p in model.vggt.parameters() if p.requires_grad])
+        for p in model.vggt.parameters():
+            if p.requires_grad and id(p) not in added_param_ids:
+                encoder_params.append(p)
     if hasattr(model, 'dinov3_compat'):
-        encoder_params.extend([p for p in model.dinov3_compat.parameters() if p.requires_grad])
+        for p in model.dinov3_compat.parameters():
+            if p.requires_grad and id(p) not in added_param_ids:
+                encoder_params.append(p)
     if encoder_params:
         param_groups.append({
             'params': encoder_params,

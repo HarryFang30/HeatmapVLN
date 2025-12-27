@@ -178,8 +178,8 @@ optim:
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1                     # Warmup 比例 10%
-  batch_size: 4                         # 96GB 显存实测可用
-  grad_accum_steps: 4                   # 有效 batch = 4 × 4 = 16
+  batch_size: 2                         # 减小 batch size 节省显存
+  grad_accum_steps: 8                   # 有效 batch = 2 × 8 = 16
   use_ddp: false
   
   # 🆕 训练优化配置
