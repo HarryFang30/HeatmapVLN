@@ -173,10 +173,9 @@ VLNSlidingWindowDataset(
       clip_000000/
         ...
 ```
-```
 
 ### 必需/可选文件说明
-
+```
 | 文件 | 类型 | 说明 |
 |------|------|------|
 | `meta.json` | 必需 | 至少包含 `num_frames`（帧数）；可包含 `instruction`（导航指令） |
@@ -186,7 +185,7 @@ VLNSlidingWindowDataset(
 | `actions.npy` | 可选 | 连续动作 [T, 2] (dx, dy)；缺失时 `action_valid=0` |
 | `discrete_actions.npy` | 可选 | 离散动作 [T] (STOP/FORWARD/LEFT/RIGHT)；缺失时 stop 标签默认非 stop |
 | `intrinsics.json` | 可选 | 相机内参；缺失时使用默认全景图尺寸 (512, 256) |
-
+```
 **建议**：训练 action/stop head 时务必提供对应的动作文件。
 
 ---
