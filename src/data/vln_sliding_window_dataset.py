@@ -245,6 +245,12 @@ class VLNSlidingWindowDataset(Dataset):
     将一段 T 帧的视频序列扩展为 T - min_history 个独立训练样本。
     每个样本由"历史帧 + 当前帧"构成。
     
+    动作语义（重要）：
+    - actions.npy: action[i] = 从 frame[i] 到 frame[i+1] 的 agent-local 2D 位移 (dx, dy)
+    - discrete_actions.npy: discrete_action[i] = 从 frame[i] 到 frame[i+1] 的离散动作
+      (0=STOP, 1=MOVE_FORWARD, 2=TURN_LEFT, 3=TURN_RIGHT)
+    - 最后一帧 action[T-1] = (0, 0) 且 discrete_action[T-1] = STOP，因为没有后续帧
+    
     Args:
         root: 数据集根目录
         split: 数据集划分 ('train', 'val')
@@ -262,6 +268,8 @@ class VLNSlidingWindowDataset(Dataset):
             "heatmap": [Hm, Wm],               # 历史帧在当前帧的位置
             "action": [2],                     # 下一步动作 (dx, dy)
             "action_valid": float,             # 是否有有效动作 (0 or 1)
+            "discrete_action": int,            # 离散动作 (0-3)
+            "is_stop": float,                  # 是否为STOP动作 (0 or 1)
             "text": str,                       # 指令
         }
     """
@@ -633,11 +641,12 @@ class VLNSlidingWindowDataset(Dataset):
             
             # 8. 加载连续动作
             actions = self._load_actions(clip_dir)
-            if actions is not None and current_t < T - 1:
-                # 动作定义：从 current_t 到 current_t+1 的位移
-                # actions[t] 存储的是从 t-1 到 t 的位移，所以取 actions[current_t + 1]
-                action = actions[current_t + 1] if current_t + 1 < len(actions) else np.zeros(2)
-                action_valid = 1.0
+            if actions is not None and current_t < len(actions):
+                # 动作语义（来自 collect.py）：
+                # actions[i] = 从 frame[i] 到 frame[i+1] 的 agent-local 2D 位移 (dx, dy)
+                # 因此对于 current_t 帧，应该加载 actions[current_t]
+                action = actions[current_t]
+                action_valid = 1.0 if current_t < T - 1 else 0.0  # 最后一帧动作无效（为(0,0)）
             else:
                 action = np.zeros(2, dtype=np.float32)
                 action_valid = 0.0
@@ -647,6 +656,8 @@ class VLNSlidingWindowDataset(Dataset):
             # 9. 加载离散动作（用于 Stop Prediction）
             discrete_actions = self._load_discrete_actions(clip_dir)
             if discrete_actions is not None and current_t < len(discrete_actions):
+                # 动作语义：discrete_actions[i] = 从 frame[i] 到 frame[i+1] 的离散动作
+                # 0=STOP, 1=MOVE_FORWARD, 2=TURN_LEFT, 3=TURN_RIGHT
                 discrete_action = int(discrete_actions[current_t])
                 # is_stop: 1 if STOP action, 0 otherwise
                 is_stop = 1.0 if discrete_action == 0 else 0.0
