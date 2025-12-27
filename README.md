@@ -228,16 +228,16 @@ python scripts/inference.py \
 
 ## 训练（Training）
 
-训练脚本：`scripts/train_history_action.py`  
-默认读取：`--config configs/training_config_full_model.yaml`
+训练脚本：`scripts/train.py`  
+默认读取：`--config configs/train_config.yaml`
 
 ### 一键按配置跑完整四阶段
 
 ```bash
 cd HeatmapVLN
 
-python scripts/train_history_action.py \
-  --config configs/training_config_full_model.yaml
+python scripts/train.py \
+  --config configs/train_config.yaml
 ```
 
 ### 常用训练参数
@@ -245,16 +245,16 @@ python scripts/train_history_action.py \
 - **从检查点恢复**
 
 ```bash
-python scripts/train_history_action.py \
-  --config configs/training_config_full_model.yaml \
+python scripts/train.py \
+  --config configs/train_config.yaml \
   --resume /path/to/ckpt.pth
 ```
 
 - **自动从最新检查点恢复**
 
 ```bash
-python scripts/train_history_action.py \
-  --config configs/training_config_full_model.yaml \
+python scripts/train.py \
+  --config configs/train_config.yaml \
   --auto-resume
 ```
 
@@ -262,8 +262,8 @@ python scripts/train_history_action.py \
 
 ```bash
 # 例：只跑 joint_128 阶段
-python scripts/train_history_action.py \
-  --config configs/training_config_full_model.yaml \
+python scripts/train.py \
+  --config configs/train_config.yaml \
   --stage joint_128 \
   --stage-only
 ```
@@ -271,8 +271,8 @@ python scripts/train_history_action.py \
 - **调试：只构建模型与数据，不实际训练**
 
 ```bash
-python scripts/train_history_action.py \
-  --config configs/training_config_full_model.yaml \
+python scripts/train.py \
+  --config configs/train_config.yaml \
   --dry-run
 
 # 快速测试训练流程（每 epoch 只跑 5 个 batch）
@@ -445,7 +445,7 @@ python scripts/train.py \
 cd HeatmapVLN
 
 python scripts/evaluate.py \
-  --config configs/training_config_full_model.yaml \
+  --config configs/train_config.yaml \
   --checkpoint /path/to/ckpt.pth \
   --split val \
   --save-vis \
@@ -454,9 +454,9 @@ python scripts/evaluate.py \
 
 ---
 
-## 配置文件说明（configs/training_config_full_model.yaml）
+## 配置文件说明（configs/train_config.yaml）
 
-当前 `configs/` 目录只有一个配置：`training_config_full_model.yaml`。
+当前 `configs/` 目录只有一个配置：`train_config.yaml`。
 
 你通常需要优先检查并修改：
 
