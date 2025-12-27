@@ -260,11 +260,6 @@ h = h × (1 + scale) + shift
 
 ### 训练与推理
 
-**训练代码**
-```bash
-cd /root/VLN/Project && source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && nohup python scripts/train.py --config configs/train_config.yaml --stage-index 0 --stage-only > train_stage1.log 2>&1 &
-```
-
 **训练模式**:
 ```python
 # 前向扩散：给 GT 热力图加噪
@@ -729,6 +724,11 @@ python scripts/train.py \
   --start-epoch 4 \
   --stage warmup_history_64 \
   --stage-only
+```
+
+**训练代码**
+```bash
+cd /root/VLN/Project && source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && nohup python scripts/train.py --config configs/train_config.yaml --stage-index 0 --stage-only > train_stage1.log 2>&1 &
 ```
 
 ### 训练配置说明
