@@ -30,6 +30,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# ==================== 体素编码工具函数 ====================
+
+def encode_voxel_coords(voxel_coords: torch.Tensor, max_coord: int = 100000) -> torch.Tensor:
+    """
+    将 3D 体素坐标编码为单个整数，大幅减少内存占用
+    
+    内存优化：
+    - 原始 set(tuple): ~80 bytes per voxel
+    - 编码后 set(int64): ~8 bytes per voxel
+    - 内存减少约 90%
+    
+    Args:
+        voxel_coords: [N, 3] 体素坐标张量
+        max_coord: 单维度最大坐标值（默认 100000 足够大）
+    
+    Returns:
+        [N] 编码后的整数张量
+    """
+    x, y, z = voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]
+    # 编码公式: x * M^2 + y * M + z
+    encoded = x * (max_coord * max_coord) + y * max_coord + z
+    return encoded.cpu()  # 移到 CPU 以避免 GPU 内存占用
+
+
 @dataclass
 class SamplingConfig:
     """Configuration for space-aware frame sampling."""
@@ -40,6 +64,7 @@ class SamplingConfig:
     confidence_percentile: float = 50.0  # Percentile threshold for point filtering
     early_termination: bool = True  # Stop when no new coverage gained
     device: str = "cuda"
+    max_cache_size: int = 100  # Maximum number of cached voxel sets (memory limit)
 
 
 class SpaceAwareFrameSampler(nn.Module):
@@ -58,8 +83,9 @@ class SpaceAwareFrameSampler(nn.Module):
         self.config = config
         self.device = torch.device(config.device)
         
-        # Cache for intermediate computations
-        self._voxel_cache = {}
+        # 🧹 MEMORY: LRU cache with size limit to prevent unbounded growth
+        from collections import OrderedDict
+        self._voxel_cache = OrderedDict()  # LRU cache with max_cache_size limit
         self._geometry_cache = {}
         
     def forward(
@@ -257,12 +283,39 @@ class SpaceAwareFrameSampler(nn.Module):
             Dictionary containing extracted geometry data
         """
         
+        # 🔍 VALIDATION: Verify VGGT output dimensions
+        required_keys = ['depth', 'depth_conf', 'world_points', 'world_points_conf', 'pose_enc']
+        for key in required_keys:
+            if key not in vggt_predictions:
+                raise ValueError(f"Missing required VGGT output: {key}")
+        
         # Extract tensors (remove batch dimension for processing)
         depth_maps = vggt_predictions['depth'].squeeze(0)  # [S, H, W, 1]
         depth_conf = vggt_predictions['depth_conf'].squeeze(0)  # [S, H, W]
         world_points = vggt_predictions['world_points'].squeeze(0)  # [S, H, W, 3]
         world_points_conf = vggt_predictions['world_points_conf'].squeeze(0)  # [S, H, W]
         pose_enc = vggt_predictions['pose_enc'].squeeze(0)  # [S, 9]
+        
+        # 🔍 VALIDATION: Verify dimension consistency
+        num_frames = world_points.shape[0]
+        H, W = world_points.shape[1:3]
+        
+        if world_points_conf.shape != (num_frames, H, W):
+            raise ValueError(
+                f"Dimension mismatch: world_points {world_points.shape} vs "
+                f"world_points_conf {world_points_conf.shape}"
+            )
+        
+        if depth_conf.shape != (num_frames, H, W):
+            logger.warning(
+                f"Depth confidence shape {depth_conf.shape} doesn't match "
+                f"world_points shape {world_points.shape[:3]}"
+            )
+        
+        if world_points.shape[-1] != 3:
+            raise ValueError(f"world_points should have 3 channels (x,y,z), got {world_points.shape[-1]}")
+        
+        logger.debug(f"VGGT geometry validated: {num_frames} frames, {H}x{W} spatial resolution")
         
         geometry_data = {
             'depth_maps': depth_maps,
@@ -274,6 +327,27 @@ class SpaceAwareFrameSampler(nn.Module):
         }
         
         return geometry_data
+    
+    def _manage_cache(self, cache_key: str, voxel_sets: Dict):
+        """
+        Manage LRU cache with size limit to prevent unbounded memory growth.
+        
+        Args:
+            cache_key: Key for the cache entry
+            voxel_sets: Voxel sets to cache
+        """
+        # Move to end (most recently used)
+        if cache_key in self._voxel_cache:
+            self._voxel_cache.move_to_end(cache_key)
+        else:
+            # Add new entry
+            self._voxel_cache[cache_key] = voxel_sets
+            
+            # Evict oldest entry if cache is full
+            if len(self._voxel_cache) > self.config.max_cache_size:
+                evicted_key = next(iter(self._voxel_cache))
+                evicted_entry = self._voxel_cache.pop(evicted_key)
+                logger.debug(f"Evicted cache entry: {evicted_key} (cache size: {len(self._voxel_cache)})")
     
     def _compute_voxel_sets(
         self,
@@ -314,9 +388,31 @@ class SpaceAwareFrameSampler(nn.Module):
         num_frames = world_points.shape[0]
         
         # Step 1: Collect all valid points across frames for adaptive voxel sizing
-        all_valid_points = []
-        frame_valid_points = {}
+        # 🚀 OPTIMIZATION: Batch compute percentiles for all frames at once
+        # 🧹 MEMORY: Process in two passes to release intermediate data early
         
+        # First pass: Collect points for global statistics only
+        all_valid_points = []
+        
+        # Batch compute percentile values for all frames
+        valid_frame_indices = [idx for idx in frame_indices if idx < num_frames]
+        if not valid_frame_indices:
+            raise ValueError("No valid frame indices in range")
+        
+        # Stack confidence maps: [N_valid_frames, H, W]
+        conf_maps = torch.stack([world_points_conf[idx] for idx in valid_frame_indices], dim=0)
+        # Flatten spatial dimensions: [N_valid_frames, H*W]
+        conf_flat = conf_maps.view(len(valid_frame_indices), -1)
+        # Compute percentiles for all frames at once: [N_valid_frames]
+        percentile_vals = torch.quantile(conf_flat, self.config.confidence_percentile / 100.0, dim=1)
+        
+        # Create index mapping for quick lookup
+        percentile_map = dict(zip(valid_frame_indices, percentile_vals))
+        
+        # Release confidence maps immediately after percentile computation
+        del conf_maps, conf_flat
+        
+        # First pass: collect points for global min/max computation
         for frame_idx in frame_indices:
             if frame_idx >= num_frames:
                 continue
@@ -324,20 +420,17 @@ class SpaceAwareFrameSampler(nn.Module):
             points = world_points[frame_idx]  # [H, W, 3]
             conf = world_points_conf[frame_idx]  # [H, W]
             
-            # Apply confidence thresholds as per algorithm specification
+            # Apply confidence thresholds
             conf_threshold = self.config.confidence_threshold
-            conf_percentile_val = torch.quantile(conf.flatten(), self.config.confidence_percentile / 100.0)
+            conf_percentile_val = percentile_map[frame_idx]
             
             # Valid points: confidence > threshold AND >= percentile
             valid_mask = (conf > conf_threshold) & (conf >= conf_percentile_val)
             
             if valid_mask.sum() == 0:
-                logger.warning(f"No valid points found for frame {frame_idx}")
-                frame_valid_points[frame_idx] = torch.empty((0, 3), device=self.device)
                 continue
                 
             valid_points = points[valid_mask]  # [N_valid, 3]
-            frame_valid_points[frame_idx] = valid_points
             all_valid_points.append(valid_points)
         
         if not all_valid_points:
@@ -352,6 +445,9 @@ class SpaceAwareFrameSampler(nn.Module):
         point_max = all_points.max(dim=0)[0]  # [3]
         scene_extents = point_max - point_min  # [3]
         
+        # 🧹 MEMORY: Release all_valid_points immediately after computing statistics
+        del all_valid_points, all_points
+        
         # Use minimum extent dimension for isotropic voxels
         # Add safety check to prevent division by zero in degenerate scenes
         min_extent = max(scene_extents.min().item(), 1e-6)
@@ -360,37 +456,57 @@ class SpaceAwareFrameSampler(nn.Module):
         logger.info(f"Scene extents: {scene_extents.tolist()}")
         logger.info(f"Adaptive voxel size: {voxel_size:.4f} (safe minimum applied)")
         
-        # Step 3: Voxelize each frame's point cloud
+        # Step 3: Second pass - Voxelize each frame's point cloud with memory-efficient encoding
+        # Process one frame at a time and immediately convert to compact voxel representation
         voxel_sets = {}
         
         for frame_idx in frame_indices:
-            if frame_idx not in frame_valid_points:
+            if frame_idx >= num_frames:
                 voxel_sets[frame_idx] = set()
                 continue
                 
-            valid_points = frame_valid_points[frame_idx]
+            points = world_points[frame_idx]  # [H, W, 3]
+            conf = world_points_conf[frame_idx]  # [H, W]
             
-            if len(valid_points) == 0:
+            # Apply confidence thresholds (reuse percentile_map)
+            conf_threshold = self.config.confidence_threshold
+            conf_percentile_val = percentile_map.get(frame_idx)
+            
+            if conf_percentile_val is None:
                 voxel_sets[frame_idx] = set()
                 continue
+            
+            # Valid points: confidence > threshold AND >= percentile
+            valid_mask = (conf > conf_threshold) & (conf >= conf_percentile_val)
+            
+            if valid_mask.sum() == 0:
+                logger.warning(f"No valid points found for frame {frame_idx}")
+                voxel_sets[frame_idx] = set()
+                continue
+            
+            valid_points = points[valid_mask]  # [N_valid, 3]
             
             # Voxelization: V(fi^m) = {⌊(p - min(Pvalid))/Δ⌋}
             normalized_points = (valid_points - point_min.unsqueeze(0)) / voxel_size
             voxel_coords = torch.floor(normalized_points).long()
             
-            # Optimized: Use torch.unique for efficient deduplication on GPU
+            # 🚀 MEMORY OPTIMIZATION: Use integer encoding instead of tuple set
+            # Reduces memory by ~90% (from ~80 bytes to ~8 bytes per voxel)
             unique_voxels = torch.unique(voxel_coords, dim=0)
-            # Convert to set of tuples for set operations (only on unique voxels)
-            voxel_set = set(map(tuple, unique_voxels.cpu().numpy().tolist()))
+            encoded_voxels = encode_voxel_coords(unique_voxels)
+            # Use frozenset of integers for efficient set operations
+            voxel_set = set(encoded_voxels.numpy().tolist())
             
             voxel_sets[frame_idx] = voxel_set
+            
+            # 🧹 MEMORY: valid_points and intermediate tensors are automatically released here
+            
+            logger.debug(f"Frame {frame_idx}: {valid_mask.sum()} points -> {len(voxel_set)} voxels (encoded)")
 
-            logger.debug(f"Frame {frame_idx}: {len(valid_points)} points -> {len(voxel_set)} voxels")
-
-        # Cache the result
+        # 🧹 MEMORY: Cache with LRU management
         if cache is not None:
-            cache[cache_key] = voxel_sets
-            logger.debug(f"Cached voxel sets for {len(frame_indices)} frames")
+            self._manage_cache(cache_key, voxel_sets)
+            logger.debug(f"Cached voxel sets for {len(frame_indices)} frames (cache size: {len(self._voxel_cache)})")
 
         return voxel_sets
     
@@ -401,14 +517,20 @@ class SpaceAwareFrameSampler(nn.Module):
         cache: Optional[Dict] = None
     ) -> Dict:
         """
-        Apply greedy maximum coverage selection algorithm.
+        Apply greedy maximum coverage selection algorithm with incremental updates.
+
+        🚀 PERFORMANCE OPTIMIZATION:
+        - Use incremental gain tracking instead of recomputing from scratch
+        - Only update frames affected by newly covered voxels
+        - Reduces complexity from O(N_k × N_m × V) to O(N_k × affected_frames × V)
 
         Algorithm implementation:
-        1. Initialize: S ← ∅, C ← ∅, R ← {1, ..., Nm}
+        1. Initialize: S ← ∅, C ← ∅, R ← {1, ..., Nm}, gains ← {i: |V(fi^m)|}
         2. For t = 1 to Nk:
-            a) i* ← argmax_{i∈R} |V(fi^m) \ C|
-            b) If |V(fi*^m) \ C| = 0: break
-            c) S ← S ∪ {i*}, C ← C ∪ V(fi*^m), R ← R \ {i*}
+            a) i* ← argmax_{i∈R} gains[i]
+            b) If gains[i*] = 0: break
+            c) S ← S ∪ {i*}, new_voxels ← V(fi*^m) \ C, C ← C ∪ new_voxels, R ← R \ {i*}
+            d) For i in R: if V(fi) ∩ new_voxels: gains[i] = |V(fi^m) \ C|
         3. Return S
         """
 
@@ -421,33 +543,35 @@ class SpaceAwareFrameSampler(nn.Module):
         R = set(frame_indices)  # Remaining candidates
         coverage_scores = []  # Track coverage gain at each iteration
 
+        # 🚀 OPTIMIZATION: Pre-compute initial gains (avoids redundant set operations)
+        gains = {i: len(voxel_sets[i]) for i in frame_indices}
+
         target_frames = min(self.config.target_frames, len(frame_indices))
 
         # Only log if this isn't using cached voxel sets
         cache_key = f"voxel_sets_{hash(str(frame_indices))}"
         if cache is None or cache_key not in cache:
-            logger.info(f"Starting greedy selection: {len(R)} candidates -> {target_frames} targets")
+            logger.info(f"Starting greedy selection (incremental): {len(R)} candidates -> {target_frames} targets")
         else:
-            logger.debug(f"Using cached greedy selection: {len(R)} candidates -> {target_frames} targets")
+            logger.debug(f"Using cached greedy selection (incremental): {len(R)} candidates -> {target_frames} targets")
         
         for t in range(target_frames):
             if not R:  # No remaining candidates
                 logger.info(f"Early termination: no remaining candidates at iteration {t}")
                 break
             
-            # Find frame with maximum coverage gain: i* ← argmax_{i∈R} |V(fi^m) \ C|
+            # 🚀 OPTIMIZATION: Find frame with maximum gain from pre-computed gains
             best_frame = None
             best_coverage_gain = 0
             
             for frame_idx in R:
-                frame_voxels = voxel_sets[frame_idx]
-                coverage_gain = len(frame_voxels - C)  # |V(fi^m) \ C|
+                gain = gains[frame_idx]
                 
-                # Prefer higher coverage gain, or earlier frame in case of tie
-                if coverage_gain > best_coverage_gain or \
-                   (coverage_gain == best_coverage_gain and 
+                # Prefer higher gain, or earlier frame in case of tie
+                if gain > best_coverage_gain or \
+                   (gain == best_coverage_gain and 
                     (best_frame is None or frame_idx < best_frame)):
-                    best_coverage_gain = coverage_gain
+                    best_coverage_gain = gain
                     best_frame = frame_idx
             
             # Check early termination condition
@@ -462,12 +586,25 @@ class SpaceAwareFrameSampler(nn.Module):
             
             # Update algorithm state
             S.append(best_frame)  # S ← S ∪ {i*}
-            C.update(voxel_sets[best_frame])  # C ← C ∪ V(fi*^m)
+            
+            # 🚀 OPTIMIZATION: Track only NEW voxels for incremental updates
+            new_voxels = voxel_sets[best_frame] - C
+            C.update(new_voxels)  # C ← C ∪ V(fi*^m)
             R.remove(best_frame)  # R ← R \ {i*}
             coverage_scores.append(best_coverage_gain)
             
+            # 🚀 OPTIMIZATION: Incremental gain update - only affected frames
+            # Only frames with voxels overlapping new_voxels need updating
+            if new_voxels:
+                for frame_idx in R:
+                    # Check if frame has any voxels in the newly covered set
+                    if voxel_sets[frame_idx] & new_voxels:
+                        # Recompute gain only for affected frame
+                        gains[frame_idx] = len(voxel_sets[frame_idx] - C)
+            
             logger.debug(f"Iteration {t+1}: selected frame {best_frame}, "
-                        f"gain={best_coverage_gain}, total_coverage={len(C)}")
+                        f"gain={best_coverage_gain}, total_coverage={len(C)}, "
+                        f"new_voxels={len(new_voxels)}")
         
         logger.info(f"Greedy selection completed: {len(S)} frames selected, "
                    f"total coverage: {len(C)} voxels")
