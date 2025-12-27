@@ -701,6 +701,11 @@ def set_trainable_modules(model: SpatialMLLMPipeline, stage_cfg: Dict, logger):
             freeze_module(model.feature_fusion, freeze=False)
             logger.info("  ✓ Unfrozen: feature_fusion")
     
+    if 'vggt_feature_projection' in trainable:
+        if hasattr(model, 'vggt_feature_projection'):
+            freeze_module(model.vggt_feature_projection, freeze=False)
+            logger.info("  ✓ Unfrozen: vggt_feature_projection")
+    
     if 'llm_projector' in trainable:
         if hasattr(model, 'llm_projector'):
             freeze_module(model.llm_projector, freeze=False)
@@ -716,6 +721,19 @@ def set_trainable_modules(model: SpatialMLLMPipeline, stage_cfg: Dict, logger):
         if hasattr(model, 'dinov3_compat'):
             freeze_module(model.dinov3_compat, freeze=False)
             logger.info("  ✓ Unfrozen: dinov3_compat")
+    
+    # 🔧 DINOv3 适配器层：只解冻 feature_adapter 和 vggt_aligner，保持 ViT backbone 冻结
+    if 'dinov3_adapters' in trainable:
+        if hasattr(model, 'dinov3_compat'):
+            # 先全部冻结 dinov3_compat
+            freeze_module(model.dinov3_compat, freeze=True)
+            # 只解冻适配器层
+            if hasattr(model.dinov3_compat, 'feature_adapter'):
+                freeze_module(model.dinov3_compat.feature_adapter, freeze=False)
+                logger.info("  ✓ Unfrozen: dinov3_compat.feature_adapter")
+            if hasattr(model.dinov3_compat, 'vggt_aligner'):
+                freeze_module(model.dinov3_compat.vggt_aligner, freeze=False)
+                logger.info("  ✓ Unfrozen: dinov3_compat.vggt_aligner")
     
     # 3) LLM 始终冻结
     if hasattr(model, 'llm_integration') and model.llm_integration is not None:
@@ -786,6 +804,18 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: feature_fusion (lr={optim_cfg['fusion_lr']})")
     
+    # 3.5) vggt_feature_projection 模块（VGGT 3D特征投影，使用与 fusion 相同的学习率）
+    if hasattr(model, 'vggt_feature_projection'):
+        vggt_proj_lr = optim_cfg.get('vggt_projection_lr', optim_cfg['fusion_lr'])
+        vggt_proj_params = [p for p in model.vggt_feature_projection.parameters() if p.requires_grad]
+        if vggt_proj_params:
+            param_groups.append({
+                'params': vggt_proj_params,
+                'lr': vggt_proj_lr,
+                'name': 'vggt_feature_projection'
+            })
+            print(f"  Param group: vggt_feature_projection (lr={vggt_proj_lr})")
+    
     # 4) llm_projector 模块（独立学习率，更稳定）
     if hasattr(model, 'llm_projector'):
         proj_lr = optim_cfg.get('llm_projector_lr', optim_cfg['fusion_lr'])
@@ -797,6 +827,22 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
                 'name': 'llm_projector'
             })
             print(f"  Param group: llm_projector (lr={proj_lr})")
+    
+    # 4.5) DINOv3 适配器层（feature_adapter + vggt_aligner）
+    if hasattr(model, 'dinov3_compat'):
+        dinov3_adapter_lr = optim_cfg.get('dinov3_adapter_lr', optim_cfg['fusion_lr'])
+        dinov3_adapter_params = []
+        if hasattr(model.dinov3_compat, 'feature_adapter'):
+            dinov3_adapter_params.extend([p for p in model.dinov3_compat.feature_adapter.parameters() if p.requires_grad])
+        if hasattr(model.dinov3_compat, 'vggt_aligner'):
+            dinov3_adapter_params.extend([p for p in model.dinov3_compat.vggt_aligner.parameters() if p.requires_grad])
+        if dinov3_adapter_params:
+            param_groups.append({
+                'params': dinov3_adapter_params,
+                'lr': dinov3_adapter_lr,
+                'name': 'dinov3_adapters'
+            })
+            print(f"  Param group: dinov3_adapters (lr={dinov3_adapter_lr})")
     
     # 5) 编码器
     encoder_params = []

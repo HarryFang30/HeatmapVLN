@@ -83,6 +83,8 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion                # 解冻 fusion，让 heads 有合适的输入
+        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
+        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
         - llm_projector                 # 🔧 解冻 llm_projector，避免随机投影导致特征不对齐
       frozen_modules:
         - vggt
@@ -103,6 +105,8 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
+        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
+        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
         - llm_projector                 # 🔧 解冻 llm_projector，保持特征对齐
       frozen_modules:
         - vggt
@@ -124,6 +128,8 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
+        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
+        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
         - llm_projector                 # 🔧 解冻 llm_projector，保持特征对齐
       frozen_modules:
         - vggt
@@ -144,6 +150,8 @@ training:
         - action_head
         - stop_head                     # 🆕 Stop 预测头
         - feature_fusion
+        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
+        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
         - llm_projector
       frozen_modules:
         - vggt
