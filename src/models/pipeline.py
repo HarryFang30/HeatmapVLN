@@ -723,13 +723,18 @@ class SpatialMLLMPipeline(nn.Module):
                 action_device = next(self.action_head.parameters()).device
                 action_cond = action_cond.to(device=action_device)
                 
-                # 🔧 修改：只返回条件向量和预测，loss 在外部计算
+                # 🔧 修改：只返回条件向量，loss 在外部计算
                 output['action_cond'] = action_cond  # 供外部 loss 计算使用
                 
-                # Inference mode: generate actions (无论训练还是推理都生成)
-                actions = self.action_head(action_cond)
-                output['actions'] = actions
-                logger.info(f"Generated actions shape: {actions.shape}")
+                # 训练模式：跳过推理，只返回条件向量（避免冗余 10 步扩散）
+                if self.training:
+                    output['actions'] = None  # 训练时不生成 actions
+                    logger.info("Training mode: skipping action inference")
+                else:
+                    # 推理模式：执行完整扩散推理
+                    actions = self.action_head(action_cond)
+                    output['actions'] = actions
+                    logger.info(f"Generated actions shape: {actions.shape}")
                     
             except Exception as e:
                 logger.error(f"Action generation failed: {e}")

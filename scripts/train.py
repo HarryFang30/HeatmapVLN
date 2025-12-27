@@ -630,9 +630,9 @@ def build_model(cfg: Dict) -> nn.Module:
         action_encoding_size=model_cfg['action_head'].get('encoding_size', 256),  # 简化：768 → 256
         action_down_dims=model_cfg['action_head'].get('down_dims', None),  # 简化：[128, 256]
         action_num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
-        # 🔧 关键修复：使用实际数据集统计值进行归一化
-        action_stats_min=model_cfg['action_head'].get('action_stats_min', [-0.17, -0.03]),
-        action_stats_max=model_cfg['action_head'].get('action_stats_max', [0.19, 0.31]),
+        # 🔧 关键修复：使用实际数据集统计值进行归一化（与配置文件一致）
+        action_stats_min=model_cfg['action_head'].get('action_stats_min', [-0.5, -0.2]),
+        action_stats_max=model_cfg['action_head'].get('action_stats_max', [0.5, 1.0]),
 
         # 🆕 Stop Prediction Head
         enable_stop_head=model_cfg.get('stop_head', {}).get('enable', False),
@@ -987,8 +987,8 @@ def train_one_epoch(
         # 🔍 [DIAG] 诊断打印：第一个 epoch 的第一个 batch 打印 action 分布信息
         if epoch == 0 and i == 0:
             from src.models.action.utils import normalize_actions, ActionStats
-            action_stats_min = cfg.get('model', {}).get('action_head', {}).get('action_stats_min', [-0.17, -0.03])
-            action_stats_max = cfg.get('model', {}).get('action_head', {}).get('action_stats_max', [0.19, 0.31])
+            action_stats_min = cfg.get('model', {}).get('action_head', {}).get('action_stats_min', [-0.5, -0.2])
+            action_stats_max = cfg.get('model', {}).get('action_head', {}).get('action_stats_max', [0.5, 1.0])
             stats = ActionStats(min=action_stats_min, max=action_stats_max)
             normalized = normalize_actions(gt_action, stats)
             
