@@ -31,6 +31,39 @@ pip install -r requirements.txt
 
 ---
 
+## 关键帧选取算法
+
+推理时，模型使用 **Greedy Maximum Coverage** 算法从输入视频中智能选取关键帧：
+
+### 算法流程
+
+1. **3D 几何提取**：所有帧通过 VGGT 提取 3D 世界点云 + 置信度
+2. **自适应体素化**：将点云转换为统一的体素表示
+3. **贪心选择**：迭代选择覆盖最多新体素的帧，最大化空间覆盖
+
+### 配置参数
+
+在 `configs/training_config_full_model.yaml` 中：
+
+```yaml
+model:
+  target_keyframes: 16      # 选取的关键帧数 (N_k)
+  total_frames: 128         # 输入候选帧数 (N_m)
+  sampling_method: greedy_coverage  # 采样策略
+```
+
+### 数据流
+
+```
+视频 [N_m 帧] → VGGT → 3D 点云 → 体素化 → 贪心选择 → [N_k 关键帧]
+                ↓
+        关键帧 → DINOv3 + VGGT → 特征融合 → LLM → 热力图/动作
+```
+
+**注**：训练时由于显存限制通常加载帧数较少，关键帧选取会自动跳过。
+
+---
+
 ## 数据集准备（VLNSlidingWindowDataset）
 
 训练/评估使用 `src/data/vln_sliding_window_dataset.py` 的 `VLNSlidingWindowDataset`。
@@ -254,8 +287,8 @@ HeatmapVLN/
   src/
     data/
       vln_sliding_window_dataset.py           # 数据集：VLNSlidingWindowDataset（读取 meta/poses/rgb/depth/actions）
-      keyframe_selector.py                    # 关键帧选择（与 pipeline 的采样策略相关）
-      spatial_analysis.py                     # 空间新颖性/覆盖分析
+      keyframe_selector.py                    # 关键帧选择器（空间感知采样）
+      frame_sampler.py                        # 贪心最大覆盖算法（体素化 + 增量选择）
 
     models/
       pipeline.py                             # 核心模型：SpatialMLLMPipeline + SpatialMLLMIntegrationConfig
