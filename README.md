@@ -310,6 +310,244 @@ model:
 
 ---
 
+## 动作预测模块（DiffusionActionHead）
+
+动作预测模块使用 **条件扩散模型** 从 LLM 特征中生成导航动作（2D 连续位移）。
+
+### 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       DiffusionActionHead 架构                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐                                                            │
+│  │ LLM Tokens  │                                                            │
+│  │ [B,seq,2048]│                                                            │
+│  └──────┬──────┘                                                            │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐                                                            │
+│  │  Mean Pool  │  ← ConditionProjector                                     │
+│  │  [B, 2048]  │    Pool + Linear + LayerNorm + GELU + Linear              │
+│  └──────┬──────┘                                                            │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐                                                            │
+│  │ Projection  │                                                            │
+│  │  [B, 256]   │  ← 条件向量（encoding_size=256，简化架构）                │
+│  └──────┬──────┘                                                            │
+│         │                                                                   │
+│         └─────────────────────┐                                             │
+│                               │                                             │
+│                               ▼                                             │
+│                        ┌─────────────┐                                      │
+│                        │Conditional  │                                      │
+│         ┌─────────────▶│   Unet1D    │  ← 1D 卷积 U-Net                     │
+│         │              │(噪声预测)  │    down_dims=[128,256]               │
+│         │              └──────┬──────┘                                      │
+│         │                     │                                             │
+│         │         ┌───────────┴───────────┐                                 │
+│         │         │                       │                                 │
+│         │         ▼                       ▼                                 │
+│  ┌──────┴─────┐ ┌─────────────┐   ┌─────────────┐                          │
+│  │条件向量    │ │ Noisy Action│   │ DDPM 10步   │                          │
+│  │[B,256]    │ │ [B,1,2]     │◀──│  采样器     │                          │
+│  └───────────┘ └─────────────┘   └──────┬──────┘                          │
+│                   迭代去噪              │                                   │
+│                                         ▼                                   │
+│                                  ┌─────────────┐                            │
+│                                  │  Actions    │                            │
+│                                  │  [B,1,2]    │                            │
+│                                  │ (归一化后)  │                            │
+│                                  └──────┬──────┘                            │
+│                                         │                                   │
+│                                         ▼                                   │
+│                                  ┌─────────────┐                            │
+│                                  │Unnormalize  │                            │
+│                                  │& Postprocess│                            │
+│                                  └──────┬──────┘                            │
+│                                         │                                   │
+│                                         ▼                                   │
+│                                  ┌─────────────┐                            │
+│                                  │ Final Action│                            │
+│                                  │   (dx, dy)  │                            │
+│                                  └─────────────┘                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 模块组件
+
+#### 1. 条件投影器（ConditionProjector）
+
+将 LLM 特征投影为扩散模型的条件向量：
+
+| 组件 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `Mean Pool` | [B, seq, 2048] | [B, 2048] | 时序维度平均池化 |
+| `Projection` | [B, 2048] | [B, 256] | Linear → LayerNorm → GELU → Linear |
+
+**架构简化**：相比 Heatmap Head，Action Head 使用更小的 encoding_size（256 vs 512），因为 2D 动作维度低，不需要过大的条件空间。
+
+#### 2. 噪声预测网络（ConditionalUnet1D）
+
+基于 1D U-Net 的条件去噪网络，专门处理低维时序数据：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `input_dim` | 2 | 输入维度（dx, dy） |
+| `global_cond_dim` | 256 | 条件向量维度 |
+| `down_dims` | [128, 256] | U-Net 通道数（简化架构） |
+| `kernel_size` | 3 | 1D 卷积核大小 |
+| `n_groups` | 8 | GroupNorm 分组数 |
+
+**1D vs 2D**：Action 使用 1D 卷积处理序列数据 [B, pred_horizon, action_dim]，比 2D 卷积更高效。
+
+#### 3. 动作归一化（ActionStats）
+
+为确保扩散模型训练稳定，动作被归一化到 [-1, 1] 范围：
+
+```python
+# 归一化公式
+normalized = (action - min_val) / (max_val - min_val) * 2.0 - 1.0
+
+# 反归一化公式
+action = (normalized + 1.0) / 2.0 * (max_val - min_val) + min_val
+```
+
+**默认统计值**（来自数据集统计）：
+- `action_stats_min`: [-0.5, -0.2]（允许后退和左转）
+- `action_stats_max`: [0.5, 1.0]（允许前进和右转）
+
+#### 4. 扩散调度器（DDPMScheduler）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_train_timesteps` | 100 | 训练扩散步数 |
+| `num_diffusion_iters` | 10 | 推理采样步数 |
+| `beta_schedule` | `squaredcos_cap_v2` | 余弦噪声调度 |
+| `prediction_type` | `epsilon` | 预测噪声（非直接预测动作） |
+
+### 数据流
+
+```
+条件流: LLM Tokens [B,seq,2048] → Mean Pool → Projection → [B,256]
+                                                              ↓
+生成流: 随机噪声 [B,pred_horizon,2] → ConditionalUnet1D + 条件 → 迭代去噪
+                                                              ↓
+后处理: 归一化动作 [-1,1] → Unnormalize → 实际动作 (dx,dy)
+```
+
+### 训练与推理
+
+**训练模式**：
+```python
+# 归一化 GT 动作到 [-1, 1]
+normalized_gt = normalize_actions(gt_actions, action_stats)
+
+# 前向扩散：给 GT 动作加噪
+noisy_actions = scheduler.add_noise(normalized_gt, noise, timesteps)
+
+# 预测噪声
+noise_pred = unet(noisy_actions, timesteps, global_cond)
+
+# 计算 Loss（带 action_valid mask）
+per_sample_loss = F.mse_loss(noise_pred, noise, reduction='none')
+if action_valid is not None:
+    loss = (per_sample_loss * action_valid).sum() / action_valid.sum()
+else:
+    loss = per_sample_loss.mean()
+```
+
+**推理模式**：
+```python
+# 从纯噪声开始
+noisy_actions = torch.randn(B, pred_horizon, action_dim)
+
+# 迭代去噪
+for t in scheduler.timesteps:
+    noise_pred = unet(noisy_actions, t, global_cond)
+    noisy_actions = scheduler.step(noise_pred, t, noisy_actions).prev_sample
+
+# 反归一化得到实际动作
+actions = unnormalize_actions(noisy_actions, action_stats)
+```
+
+**训练优化**：训练时 pipeline 跳过 action 推理，只返回条件向量 `action_cond`，由 `train.py` 外部计算 diffusion loss，避免冗余的 10 步扩散采样。
+
+### Action Valid Mask
+
+数据集中最后一帧的 `action_valid=0`（因为没有下一帧），训练时使用 mask 过滤这些样本：
+
+```python
+# Dataset 返回
+action_valid = 1.0 if current_t < T - 1 else 0.0
+
+# 训练时应用 mask
+if action_valid.sum() > 0:
+    loss = (per_sample_loss * action_valid).sum() / action_valid.sum()
+else:
+    loss = 0.0  # 无有效样本
+```
+
+### 配置参数
+
+在 `configs/train_config.yaml` 中：
+
+```yaml
+model:
+  action_head:
+    enable: true                    # 启用动作预测
+    action_dim: 2                   # 2D 动作 (dx, dy)
+    pred_horizon: 1                 # 预测步数
+    num_diffusion_iters: 10         # 扩散步数
+    encoding_size: 256              # 条件维度（简化架构）
+    down_dims: [128, 256]           # U-Net 通道数
+    action_stats_min: [-0.5, -0.2]  # 归一化最小值
+    action_stats_max: [0.5, 1.0]    # 归一化最大值
+
+loss:
+  action_weight: 0.5                # 动作损失权重
+```
+
+### Stop 预测头（StopPredictionHead）
+
+Stop 预测是一个独立的二分类器，判断是否应该执行 STOP 动作：
+
+**架构**：
+```
+LLM Tokens [B,seq,2048] → Mean Pool → MLP [2048→512→1] → Sigmoid → Stop Prob
+```
+
+**训练**：使用 Focal Loss 处理类别不平衡（STOP 样本稀少）：
+```python
+focal_loss = -alpha * (1 - pt)^gamma * log(pt)
+
+# 默认参数
+gamma = 2.0  # 越大越关注困难样本
+alpha = 0.75 # STOP 类权重（因为极不平衡）
+```
+
+**数据来源**：
+```python
+# Dataset 从 discrete_actions 中提取
+discrete_action = discrete_actions[current_t]  # 0=STOP, 1=FORWARD, 2=LEFT, 3=RIGHT
+is_stop = 1.0 if discrete_action == 0 else 0.0
+```
+
+### 源代码位置
+
+| 文件 | 说明 |
+|------|------|
+| `src/models/action/diffusion_action_head.py` | 主模块：`DiffusionActionHead` |
+| `src/models/action/action_config.py` | 配置：`DiffusionActionConfig` |
+| `src/models/action/diffusion/unet1d.py` | 噪声预测：`ConditionalUnet1D` |
+| `src/models/action/utils.py` | 工具：`normalize_actions`, `ActionStats` |
+| `src/models/action/stop_head.py` | Stop 预测：`StopPredictionHead` |
+
+---
+
 ## 数据集准备
 
 ### 数据集结构
