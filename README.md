@@ -726,10 +726,15 @@ python scripts/train.py \
   --stage-only
 ```
 
-**训练代码**
+**训练代码（后台运行）**
 ```bash
-cd /root/VLN/Project && source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && nohup python scripts/train.py --config configs/train_config.yaml --stage-index 0 --stage-only > train_stage1.log 2>&1 &
+cd /root/VLN/Project && source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && nohup python -u scripts/train.py --config configs/train_config.yaml --stage-index 0 --stage-only > train_stage1.log 2>&1 &
+
+# 实时查看日志
+tail -f train_stage1.log
 ```
+
+> 💡 **提示**：`python -u` 禁用输出缓冲，确保日志实时写入文件。
 
 ### 训练配置说明
 
