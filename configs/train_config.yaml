@@ -221,10 +221,14 @@ loss:
     smooth_gt: false                    # 设为 false 保留波纹
   
   # 各头损失权重
+  # 🔧 [FIX] 修复后各 Loss 量级更接近，调整权重使其更平衡
+  # - Heatmap: 核心任务，保持权重1.0
+  # - Action: 同等重要，提升到1.0
+  # - Stop: 样本稀少但关键，权重0.5（内部已有10x类别权重）
   history_weight: 1.0                   # History 热力图损失权重
   future_weight: 1.0                    # Future 热力图损失权重
-  action_weight: 0.5                    # 连续动作损失权重
-  stop_weight: 0.5                      # 🆕 Stop 预测损失权重
+  action_weight: 1.0                    # 连续动作损失权重（提升：0.5 → 1.0）
+  stop_weight: 0.5                      # Stop 预测损失权重（内部已有10x类别权重）
 
 # ============================================
 # GPU配置
