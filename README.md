@@ -64,52 +64,122 @@ model:
 
 ---
 
-## 数据集准备（VLNSlidingWindowDataset）
+## 数据集加载逻辑（VLNSlidingWindowDataset）
 
-训练/评估使用 `src/data/vln_sliding_window_dataset.py` 的 `VLNSlidingWindowDataset`。
-配置文件中通过 `data.root` 指定数据集根目录，默认是：
+### 核心思想：滑动窗口扩展
 
-- `configs/training_config_full_model.yaml` 里的 `data.root: /root/autodl-tmp/dataset_with_actions`
+**一段 T 帧视频 → 生成 (T - min_history) 个训练样本**
 
-### 目录结构要求（非常重要）
+每个样本包含：
+- **历史帧**：从视频开始到当前帧之前的帧（采样 K 帧）
+- **当前帧**：第 i 帧作为当前观测
+- **热力图**：历史帧相机位置在当前帧中的投影（高斯热力图）
+- **动作标签**：从当前帧到下一帧的动作 (dx, dy) 和 stop 信号
 
-数据按 split 组织（训练脚本固定 train 为 `train`，验证 split 可通过 `data.val_split` 指定，例如 `val_unseen`）：
+### 数据流
+
+```
+视频 [T 帧]
+    ↓ 滑动窗口
+样本 0: 历史[0:0]  + 当前[0]  + 热力图 + 动作[0→1]
+样本 1: 历史[0:1]  + 当前[1]  + 热力图 + 动作[1→2]
+样本 2: 历史[0:2]  + 当前[2]  + 热力图 + 动作[2→3]
+...
+样本 T-1: 历史[0:T-1] + 当前[T-1] + 热力图 + 动作[T-1→T] (STOP)
+```
+
+### 关键参数
+
+```python
+VLNSlidingWindowDataset(
+    root="/path/to/dataset",
+    split="train",
+    min_history=5,          # 最小历史帧数（T >= 5 才生成样本）
+    num_history_sample=8,   # 从历史中采样的帧数 K
+    image_size=(224, 224),  # 图像尺寸
+    hm_size=(64, 64),       # 热力图尺寸
+    sample_stride=1,        # 采样步长（1=每帧，5=每5帧）
+)
+```
+
+### 返回格式
+
+```python
+{
+    "history_frames": [K, 3, H, W],    # K 帧历史（均匀采样）
+    "current_frame": [3, H, W],        # 当前观测
+    "heatmap": [Hm, Wm],               # 历史位置热力图
+    "action": [2],                     # 连续动作 (dx, dy)
+    "action_valid": float,             # 是否有效（最后一帧=0）
+    "discrete_action": int,            # 离散动作 (0=STOP, 1=FORWARD, 2=LEFT, 3=RIGHT)
+    "is_stop": float,                  # 是否 STOP (0 or 1)
+    "text": str,                       # 导航指令
+}
+```
+
+### 热力图生成
+
+热力图通过 **3D → 2D 投影 + 高斯模糊** 生成：
+
+1. 读取历史帧和当前帧的 **相机位姿**（4×4 矩阵）
+2. 将历史相机中心转换到当前相机坐标系
+3. 投影到 Equirectangular 图像坐标
+4. 绘制 **自适应高斯点**（距离越远，sigma 越小）
+5. （可选）使用 **深度图** 进行遮挡检测
+
+---
+
+## 数据集准备
+
+### 数据集结构
+
+训练/评估使用 `VLNSlidingWindowDataset`，配置文件通过 `data.root` 指定数据集根目录：
+
+- 默认：`configs/training_config_full_model.yaml` 中的 `data.root: /root/autodl-tmp/dataset_with_actions`
+- Split: 训练用 `train`，验证用 `data.val_split`（如 `val_unseen`）
+
+### 目录结构（示例）
 
 ```text
 <data.root>/
   train/
     <scene_id>/
       clip_000000/
-        meta.json
-        poses.json
-        rgb/
+        meta.json                     # 必需：包含 num_frames, instruction
+        poses.json                    # 必需：T 个 4×4 位姿矩阵
+        rgb/                          # 必需：RGB 图像序列
           000000.png
           000001.png
           ...
-        depth/                    (可选)
+        depth/                        # 可选：深度图（用于遮挡检测）
           000000.npy
           000001.npy
           ...
-        intrinsics.json           (可选)
-        actions.npy               (可选，但训练 action head 强烈建议提供)
-        discrete_actions.npy      (可选，训练 stop head 时建议提供)
-  val_unseen/                     (或 val/)
+        actions.npy                   # 可选：连续动作 [T, 2] (dx, dy)
+        discrete_actions.npy          # 可选：离散动作 [T] (0-3)
+        intrinsics.json               # 可选：相机内参
+      clip_000001/
+        ...
+  val_unseen/
     <scene_id>/
       clip_000000/
         ...
 ```
+```
 
 ### 必需/可选文件说明
 
-- **必需**
-  - **`meta.json`**：至少包含 `num_frames`；可包含 `instruction`
-  - **`poses.json`**：长度为 `num_frames` 的 4×4 位姿矩阵列表
-  - **`rgb/000000.png`**：按 6 位零填充命名的 RGB 帧
-- **可选**
-  - **`depth/xxxxxx.npy`**：用于遮挡检测；缺失时会跳过遮挡判断
-  - **`intrinsics.json`**：若存在用于提供原始图像宽高；否则默认 `(512, 256)`（全景图常见尺寸）
-  - **`actions.npy`**：连续动作（dx, dy）。缺失时该样本 `action_valid=0`，动作置 0
-  - **`discrete_actions.npy`**：离散动作（STOP=0, FORWARD=1, LEFT=2, RIGHT=3）。缺失时 stop 标签默认为非 stop
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `meta.json` | 必需 | 至少包含 `num_frames`（帧数）；可包含 `instruction`（导航指令） |
+| `poses.json` | 必需 | 长度为 T 的 4×4 位姿矩阵列表 |
+| `rgb/000000.png` | 必需 | 按 6 位零填充命名的 RGB 帧 |
+| `depth/000000.npy` | 可选 | 用于遮挡检测；缺失时跳过遮挡判断 |
+| `actions.npy` | 可选 | 连续动作 [T, 2] (dx, dy)；缺失时 `action_valid=0` |
+| `discrete_actions.npy` | 可选 | 离散动作 [T] (STOP/FORWARD/LEFT/RIGHT)；缺失时 stop 标签默认非 stop |
+| `intrinsics.json` | 可选 | 相机内参；缺失时使用默认全景图尺寸 (512, 256) |
+
+**建议**：训练 action/stop head 时务必提供对应的动作文件。
 
 ---
 
