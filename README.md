@@ -3,7 +3,7 @@
 本目录实现了一个用于 **第一人称跨帧热力图（inter-frame heatmap）** 与 **动作预测** 的训练/评估/推理流水线。
 当前仓库内真实可用的入口脚本为：
 
-- `scripts/train_history_action.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
+- `scripts/train.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
 - `scripts/evaluate.py`：评估（支持 history/future/action，支持保存可视化）
 - `scripts/inference.py`：推理（支持对视频或数据集 clip 运行并保存热力图/动作）
 
@@ -14,7 +14,7 @@
 
 ### 1) 环境安装
 
-建议在 `HeatmapVLN/` 目录下安装依赖：
+建议在 `HeatmapVLN` 目录下安装依赖：
 
 ```bash
 cd HeatmapVLN
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 ### 配置参数
 
-在 `configs/training_config_full_model.yaml` 中：
+在 `configs/train_config.yaml` 中：
 
 ```yaml
 model:
@@ -135,7 +135,7 @@ VLNSlidingWindowDataset(
 
 训练/评估使用 `VLNSlidingWindowDataset`，配置文件通过 `data.root` 指定数据集根目录：
 
-- 默认：`configs/training_config_full_model.yaml` 中的 `data.root: /root/autodl-tmp/dataset_with_actions`
+- 默认：`configs/train_config.yaml` 中的 `data.root: dataset_with_actions`
 - Split: 训练用 `train`，验证用 `data.val_split`（如 `val_unseen`）
 
 ### 目录结构（示例）
@@ -200,7 +200,7 @@ cd HeatmapVLN
 
 python scripts/inference.py \
   --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
-  --config configs/training_config_full_model.yaml \
+  --config configs/train_config.yaml \
   --output-dir ./outputs_inference
 ```
 
@@ -212,7 +212,7 @@ cd HeatmapVLN
 python scripts/inference.py \
   --video /path/to/video.mp4 \
   --instruction "从起点出发，沿走廊前进并找到目标" \
-  --config configs/training_config_full_model.yaml \
+  --config configs/train_config.yaml \
   --output-dir ./outputs_inference
 ```
 
@@ -356,7 +356,7 @@ python scripts/train.py \
 
 ```yaml
 data:
-  root: /root/autodl-tmp/dataset_with_actions  # 数据集路径
+  root: dataset_with_actions  # 数据集路径
   sliding_window:
     num_history_sample: 8     # 历史帧采样数
     sample_stride: 5          # 采样步长（5 = 样本数减少 5 倍）
@@ -374,7 +374,7 @@ optim:
   action_lr: 3.0e-4           # 动作头学习率
 
 log:
-  out_dir: /root/autodl-tmp/vln_history_action_outputs
+  out_dir: vln_history_action_outputs
   use_tensorboard: true
 ```
 
@@ -532,10 +532,10 @@ python scripts/evaluate.py \
 ```text
 HeatmapVLN/
   configs/
-    training_config_full_model.yaml          # 唯一配置：数据路径、训练阶段、损失、日志等
+    train_config.yaml          # 唯一配置：数据路径、训练阶段、损失、日志等
 
   scripts/                                   # 三个入口脚本（README 命令都以它们为准）
-    train_history_action.py                   # 训练：四阶段 curriculum（history/future heatmap + action + stop）
+    train.py                   # 训练：四阶段 curriculum（history/future heatmap + action + stop）
     evaluate.py                               # 评估：history/future/action + 可视化
     inference.py                              # 推理：对 video 或 dataset clip 生成 heatmap/actions
 
