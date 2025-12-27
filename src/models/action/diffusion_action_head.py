@@ -262,39 +262,69 @@ class DiffusionActionHead(nn.Module):
             global_cond=global_cond,
         )
         
-        # 🔧 关键修复：使用 action_valid mask 计算 loss
-        # 计算逐样本的 MSE loss
-        per_sample_loss = nn.functional.mse_loss(noise_pred, noise, reduction='none')
-        per_sample_loss = per_sample_loss.mean(dim=(1, 2))  # [B]
+        # 🔧 [FIX] 加权 MSE Loss：非零动作权重更高
+        # 问题：数据集中95.5%的转向动作是0，模型学会"输出0"就能获得极低Loss
+        # 解决：增加非零动作的权重，强制模型学习转向
+        
+        # 计算动作的绝对值作为权重（非零动作权重更高）
+        # normalized_gt: [B, pred_horizon, action_dim]
+        action_magnitude = normalized_gt.abs()  # [B, H, D]
+        # 权重：1 + 9 * |action|，范围 [1, 10]（因为归一化后action在[-1,1]）
+        weight = 1.0 + 9.0 * action_magnitude.clamp(0, 1)
+        
+        # 加权 MSE
+        squared_error = (noise_pred - noise).pow(2)
+        weighted_error = weight * squared_error
+        
+        # 计算逐样本的加权 MSE loss
+        per_sample_loss = weighted_error.mean(dim=(1, 2))  # [B]
         
         if action_valid is not None:
             # 只对有效样本计算 loss
             mask = action_valid.float().to(device)
             if mask.sum() > 0:
-                loss = (per_sample_loss * mask).sum() / mask.sum()
+                diffusion_loss = (per_sample_loss * mask).sum() / mask.sum()
             else:
                 # 没有有效样本，返回 0 loss
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
+                diffusion_loss = torch.tensor(0.0, device=device, requires_grad=True)
         else:
             # 无 mask，使用全部样本
-            loss = per_sample_loss.mean()
+            diffusion_loss = per_sample_loss.mean()
         
-        # Generate actions for monitoring (controlled by inference_interval)
+        # 🔧 [FIX-2] 方差约束：确保模型输出有变化，不能全是同一个值
+        # 每10步计算一次
         self._training_step_counter += 1
-        if self._inference_interval == 0 or self._training_step_counter % self._inference_interval == 0:
+        variance_loss = torch.tensor(0.0, device=device)
+        final_actions = None
+        pred_actions = None
+        
+        compute_variance_loss = (self._training_step_counter % 10 == 0)
+        
+        if compute_variance_loss or self._inference_interval == 0 or self._training_step_counter % self._inference_interval == 0:
             with torch.no_grad():
                 pred_actions = self._diffusion_inference(global_cond, batch_size, device)
                 final_actions = get_action_from_diffusion_output(
                     pred_actions, self.action_stats, cumulative=True
                 )
-        else:
-            # Skip inference to save time
-            final_actions = None
+            
+            if compute_variance_loss and pred_actions is not None:
+                # 方差约束：预测动作的标准差必须 >= 0.1
+                # 如果 batch 内所有预测都一样（全零），则产生惩罚
+                pred_std = pred_actions.std()
+                variance_loss = nn.functional.relu(0.1 - pred_std)
+        
+        # 总损失 = 扩散损失 + 方差约束
+        loss = diffusion_loss + 0.3 * variance_loss
         
         return {
             'loss': loss,
+            'diffusion_loss': diffusion_loss,
+            'variance_loss': variance_loss,
             'actions': final_actions,
             'normalized_actions': pred_actions,
+            'noise_std': noise.std(),
+            'noise_pred_std': noise_pred.std(),
+            'mse': squared_error.mean(),
         }
     
     def compute_loss(
@@ -353,9 +383,21 @@ class DiffusionActionHead(nn.Module):
             global_cond=global_cond,
         )
         
-        # Compute per-sample MSE loss
-        per_sample_loss = nn.functional.mse_loss(noise_pred, noise, reduction='none')
-        per_sample_loss = per_sample_loss.mean(dim=(1, 2))  # [B]
+        # 🔧 [FIX] 加权 MSE Loss：非零动作权重更高
+        # 问题：数据集中95.5%的转向动作是0，模型学会"输出0"就能获得极低Loss
+        # 解决：增加非零动作的权重，强制模型学习转向
+        
+        # 计算动作的绝对值作为权重（非零动作权重更高）
+        action_magnitude = normalized_gt.abs()  # [B, H, D]
+        # 权重：1 + 9 * |action|，范围 [1, 10]
+        weight = 1.0 + 9.0 * action_magnitude.clamp(0, 1)
+        
+        # 加权 MSE
+        squared_error = (noise_pred - noise).pow(2)
+        weighted_error = weight * squared_error
+        
+        # 计算逐样本的加权 MSE loss
+        per_sample_loss = weighted_error.mean(dim=(1, 2))  # [B]
         
         # Apply action_valid mask
         if action_valid is not None:
@@ -371,7 +413,7 @@ class DiffusionActionHead(nn.Module):
         with torch.no_grad():
             noise_std = noise.std()
             noise_pred_std = noise_pred.std()
-            mse = per_sample_loss.mean()
+            mse = squared_error.mean()
         
         return {
             'loss': loss,
