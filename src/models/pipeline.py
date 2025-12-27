@@ -681,31 +681,18 @@ class SpatialMLLMPipeline(nn.Module):
                 action_device = next(self.action_head.parameters()).device
                 action_cond = action_cond.to(device=action_device)
                 
-                if gt_actions is not None:
-                    # Training mode: compute action loss with masking
-                    gt_actions_device = gt_actions.to(device=action_device)
-                    # 🆕 传递 action_valid mask 给 action_head
-                    action_valid_device = action_valid.to(device=action_device) if action_valid is not None else None
-                    action_result = self.action_head(
-                        action_cond, 
-                        gt_actions=gt_actions_device,
-                        action_valid=action_valid_device,  # 🆕 传递 mask
-                        return_loss=True
-                    )
-                    output['actions'] = action_result['actions']
-                    output['action_loss'] = action_result['loss']
-                    output['normalized_actions'] = action_result['normalized_actions']
-                    logger.info(f"Action loss: {action_result['loss'].item():.4f}")
-                else:
-                    # Inference mode: generate actions
-                    actions = self.action_head(action_cond)
-                    output['actions'] = actions
-                    logger.info(f"Generated actions shape: {actions.shape}")
+                # 🔧 修改：只返回条件向量和预测，loss 在外部计算
+                output['action_cond'] = action_cond  # 供外部 loss 计算使用
+                
+                # Inference mode: generate actions (无论训练还是推理都生成)
+                actions = self.action_head(action_cond)
+                output['actions'] = actions
+                logger.info(f"Generated actions shape: {actions.shape}")
                     
             except Exception as e:
                 logger.error(f"Action generation failed: {e}")
                 output['actions'] = None
-                output['action_loss'] = None
+                output['action_cond'] = None
         
         # Step 8: Stop prediction (binary classification)
         if self.stop_head is not None:
@@ -716,29 +703,16 @@ class SpatialMLLMPipeline(nn.Module):
                 stop_device = next(self.stop_head.parameters()).device
                 stop_cond = stop_cond.to(device=stop_device)
                 
-                if gt_stop is not None:
-                    # Training mode: compute stop loss
-                    gt_stop_device = gt_stop.to(device=stop_device)
-                    action_valid_device = action_valid.to(device=stop_device) if action_valid is not None else None
-                    stop_result = self.stop_head(
-                        stop_cond,
-                        gt_stop=gt_stop_device,
-                        action_valid=action_valid_device,
-                        return_loss=True,
-                    )
-                    output['stop_prob'] = stop_result['stop_prob']
-                    output['stop_loss'] = stop_result['loss']
-                    logger.info(f"Stop loss: {stop_result['loss'].item():.4f}")
-                else:
-                    # Inference mode: predict stop
-                    stop_prob = self.stop_head(stop_cond)
-                    output['stop_prob'] = stop_prob
-                    logger.info(f"Stop probabilities: mean={stop_prob.mean().item():.4f}")
+                # 🔧 修改：只返回 logits 和 prob，loss 在外部计算
+                stop_logits = self.stop_head.classifier(stop_cond).squeeze(-1)  # [B]
+                output['stop_logits'] = stop_logits
+                output['stop_prob'] = torch.sigmoid(stop_logits)
+                logger.info(f"Stop probabilities: mean={output['stop_prob'].mean().item():.4f}")
                     
             except Exception as e:
                 logger.error(f"Stop prediction failed: {e}")
                 output['stop_prob'] = None
-                output['stop_loss'] = None
+                output['stop_logits'] = None
         
         if return_intermediate:
             output['intermediate_features'] = {

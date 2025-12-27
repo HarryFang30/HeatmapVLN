@@ -110,6 +110,25 @@ class StopPredictionHead(nn.Module):
         
         return stop_prob
     
+    def compute_loss(
+        self,
+        logits: torch.Tensor,
+        gt_stop: torch.Tensor,
+        action_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        供外部调用的 loss 计算方法。
+        
+        Args:
+            logits: (B,) raw logits from classifier
+            gt_stop: (B,) ground truth stop labels (1=STOP, 0=other)
+            action_valid: Optional (B,) mask for valid actions
+            
+        Returns:
+            Scalar focal loss
+        """
+        return self._compute_focal_loss(logits, gt_stop, action_valid)
+    
     def _compute_focal_loss(
         self,
         logits: torch.Tensor,

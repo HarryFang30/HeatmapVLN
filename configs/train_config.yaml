@@ -173,6 +173,9 @@ optim:
   batch_size: 4                         # 96GB 显存实测可用
   grad_accum_steps: 4                   # 有效 batch = 4 × 4 = 16
   use_ddp: false
+  
+  # 🆕 训练优化配置
+  action_inference_interval: 100        # 训练时每N步做一次动作推理监控（0=每步都做）
 
 # ============================================
 # 损失函数
@@ -233,6 +236,9 @@ log:
   show_gpu_memory: true
   tqdm_ncols: 120
   log_level: INFO
+  
+  # 🆕 诊断日志配置
+  diag_interval: 100                    # 诊断信息记录间隔（TensorBoard + 日志）
   
   # 飞书通知配置
   notify:

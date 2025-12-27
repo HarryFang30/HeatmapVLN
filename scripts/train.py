@@ -1025,23 +1025,75 @@ def train_one_epoch(
                     )
                     heatmap_loss = heatmap_loss + fut_loss
             
-            # ========== 动作损失 ==========
+            # ========== 统一 Loss 计算（风格一致） ==========
+            # 1. Heatmap Loss
+            heatmap_loss = torch.tensor(0.0, device=device)
+            loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
+            
+            if train_history:
+                pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
+                if pred_heatmap is not None:
+                    # 取最后一帧的预测（对应当前帧）
+                    pred_hm = pred_heatmap[:, -1, :, :]  # [B, H, W]
+                    
+                    # 调整尺寸如果需要
+                    if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
+                        pred_hm = torch.nn.functional.interpolate(
+                            pred_hm.unsqueeze(1),
+                            size=gt_heatmap.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(1)
+                    
+                    # 使用统一的损失计算函数
+                    heatmap_loss = compute_heatmap_loss(
+                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
+                    )
+            
+            if train_future:
+                pred_fut = output.get('future_heatmaps')
+                if pred_fut is not None:
+                    pred_hm = pred_fut[:, -1, :, :]
+                    if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
+                        pred_hm = torch.nn.functional.interpolate(
+                            pred_hm.unsqueeze(1),
+                            size=gt_heatmap.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(1)
+                    
+                    fut_loss = compute_heatmap_loss(
+                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
+                    )
+                    heatmap_loss = heatmap_loss + fut_loss
+            
+            # 2. Action Loss（统一在外部计算）
             action_loss = torch.tensor(0.0, device=device)
+            action_diag = {}  # 诊断信息
             
-            if train_action:
-                # 动作损失已经在模型前向中计算
-                action_loss_from_model = output.get('action_loss')
-                if action_loss_from_model is not None:
-                    # 只对有效动作计算损失
-                    if action_valid.sum() > 0:
-                        action_loss = action_loss_from_model
+            if train_action and 'action_cond' in output:
+                # 使用 action_head.compute_loss() 统一计算
+                action_result = model.action_head.compute_loss(
+                    output['action_cond'], 
+                    gt_action.unsqueeze(1),
+                    action_valid
+                )
+                action_loss = action_result['loss']
+                action_diag = {
+                    'noise_std': action_result.get('noise_std'),
+                    'noise_pred_std': action_result.get('noise_pred_std'),
+                    'mse': action_result.get('mse'),
+                }
             
-            # ========== Stop 损失 ==========
+            # 3. Stop Loss（统一在外部计算）
             stop_loss = torch.tensor(0.0, device=device)
-            if train_action and 'stop_loss' in output:
-                stop_loss_from_model = output.get('stop_loss')
-                if stop_loss_from_model is not None:
-                    stop_loss = stop_loss_from_model
+            if train_action and 'stop_logits' in output:
+                # 使用 stop_head.compute_loss() 统一计算
+                stop_loss = model.stop_head.compute_loss(
+                    output['stop_logits'],
+                    is_stop,
+                    action_valid
+                )
             
             # ========== 总损失 ==========
             heatmap_weight = loss_cfg.get('history_weight', 1.0) if train_history else loss_cfg.get('future_weight', 1.0)
@@ -1085,18 +1137,31 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                     tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                     tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
-                    tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)  # 🆕
+                    tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)
                     tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
                     
-                    # 🔍 [DIAG] 额外监控指标
                     # Action valid ratio - 监控有效样本比例
                     tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
                     
+                    # 🆕 固定间隔诊断信息记录
+                    diag_interval = cfg['log'].get('diag_interval', 100)
+                    if global_step % diag_interval == 0 and action_diag:
+                        if action_diag.get('noise_std') is not None:
+                            tb_writer.add_scalar('diag/noise_std', action_diag['noise_std'].item(), actual_step)
+                            tb_writer.add_scalar('diag/noise_pred_std', action_diag['noise_pred_std'].item(), actual_step)
+                            tb_writer.add_scalar('diag/action_mse', action_diag['mse'].item(), actual_step)
+                            # 固定间隔日志打印
+                            logger.info(
+                                f"[DIAG] noise_std={action_diag['noise_std'].item():.3f}, "
+                                f"pred_std={action_diag['noise_pred_std'].item():.3f}, "
+                                f"mse={action_diag['mse'].item():.4f}"
+                            )
+                    
                     # 归一化后的 action 分布（每 100 步记录一次直方图，避免日志过大）
-                    if global_step % 100 == 0 and 'normalized_actions' in output:
-                        norm_act = output['normalized_actions']
-                        if norm_act is not None:
-                            tb_writer.add_histogram('train/normalized_actions', norm_act.flatten().cpu(), actual_step)
+                    if global_step % 100 == 0 and 'actions' in output:
+                        actions_tensor = output['actions']
+                        if actions_tensor is not None:
+                            tb_writer.add_histogram('train/predicted_actions', actions_tensor.flatten().cpu(), actual_step)
                     
                     # GT action 分布
                     if global_step % 100 == 0:
@@ -1244,18 +1309,24 @@ def validate(
                     heatmap_criterion, pred_hm, gt_heatmap, loss_type
                 )
             
+            # 统一在外部计算 action loss
             action_loss = torch.tensor(0.0, device=device)
-            if train_action and 'action_loss' in output:
-                action_loss_val = output.get('action_loss')
-                if action_loss_val is not None and action_valid.sum() > 0:
-                    action_loss = action_loss_val
+            if train_action and 'action_cond' in output:
+                action_result = model.action_head.compute_loss(
+                    output['action_cond'],
+                    gt_action.unsqueeze(1),
+                    action_valid
+                )
+                action_loss = action_result['loss']
             
-            # 🆕 Stop Loss
+            # 统一在外部计算 stop loss
             stop_loss = torch.tensor(0.0, device=device)
-            if train_action and 'stop_loss' in output:
-                stop_loss_val = output.get('stop_loss')
-                if stop_loss_val is not None:
-                    stop_loss = stop_loss_val
+            if train_action and 'stop_logits' in output:
+                stop_loss = model.stop_head.compute_loss(
+                    output['stop_logits'],
+                    is_stop,
+                    action_valid
+                )
             
             heatmap_weight = loss_cfg.get('history_weight', 1.0)
             action_weight = loss_cfg.get('action_weight', 0.5)

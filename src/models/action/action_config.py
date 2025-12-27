@@ -70,6 +70,9 @@ class DiffusionActionConfig:
     action_stats_min: List[float] = field(default_factory=lambda: [-0.5, -0.2])
     action_stats_max: List[float] = field(default_factory=lambda: [0.5, 1.0])
     
+    # Training optimization
+    inference_interval: int = 100  # 训练时每N步做一次推理监控（0=每步都做）
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.action_dim > 0, "action_dim must be positive"

@@ -113,6 +113,10 @@ class DiffusionActionHead(nn.Module):
         self.action_dim = config.action_dim
         self.pred_horizon = config.pred_horizon
         
+        # Training optimization: inference frequency control
+        self._training_step_counter = 0
+        self._inference_interval = config.inference_interval
+        
         # Action statistics for normalization
         self.action_stats = ActionStats(
             min=config.action_stats_min,
@@ -275,35 +279,102 @@ class DiffusionActionHead(nn.Module):
             # 无 mask，使用全部样本
             loss = per_sample_loss.mean()
         
-        # Generate actions for monitoring (optional, can be disabled for speed)
-        with torch.no_grad():
-            pred_actions = self._diffusion_inference(global_cond, batch_size, device)
-            final_actions = get_action_from_diffusion_output(
-                pred_actions, self.action_stats, cumulative=True
-            )
-        
-        # 🔍 [DIAG] 噪声预测质量监控（1% 概率打印，避免日志过多）
-        import random
-        if random.random() < 0.01:
+        # Generate actions for monitoring (controlled by inference_interval)
+        self._training_step_counter += 1
+        if self._inference_interval == 0 or self._training_step_counter % self._inference_interval == 0:
             with torch.no_grad():
-                noise_std = noise.std().item()
-                noise_pred_std = noise_pred.std().item()
-                noise_mean = noise.mean().item()
-                noise_pred_mean = noise_pred.mean().item()
-                # 计算相关性
-                correlation = ((noise_pred - noise_pred_mean) * (noise - noise_mean)).mean().item()
-                correlation = correlation / (noise_std * noise_pred_std + 1e-8)
-                # 计算 MSE
-                mse = nn.functional.mse_loss(noise_pred, noise).item()
-                logger.info(
-                    f"[DIAG-Noise] noise_std={noise_std:.3f}, pred_std={noise_pred_std:.3f}, "
-                    f"corr={correlation:.3f}, mse={mse:.4f}"
+                pred_actions = self._diffusion_inference(global_cond, batch_size, device)
+                final_actions = get_action_from_diffusion_output(
+                    pred_actions, self.action_stats, cumulative=True
                 )
+        else:
+            # Skip inference to save time
+            final_actions = None
         
         return {
             'loss': loss,
             'actions': final_actions,
             'normalized_actions': pred_actions,
+        }
+    
+    def compute_loss(
+        self,
+        global_cond: torch.Tensor,
+        gt_actions: torch.Tensor,
+        action_valid: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        供外部调用的 loss 计算方法（不做推理监控，更快）。
+        
+        Args:
+            global_cond: (B, encoding_size) 条件向量
+            gt_actions: (B, pred_horizon, action_dim) ground truth actions
+            action_valid: Optional (B,) mask indicating which samples have valid actions
+            
+        Returns:
+            Dict with 'loss' and diagnostic info
+        """
+        device = global_cond.device
+        batch_size = global_cond.shape[0]
+        
+        # Validate and reshape gt_actions if needed
+        if gt_actions.dim() == 2:
+            gt_actions = gt_actions.unsqueeze(1)
+        
+        expected_shape = (batch_size, self.pred_horizon, self.action_dim)
+        if gt_actions.shape != expected_shape:
+            logger.warning(
+                f"gt_actions shape mismatch: got {gt_actions.shape}, expected {expected_shape}"
+            )
+        
+        # Normalize ground truth actions
+        from .utils import normalize_actions
+        normalized_gt = normalize_actions(gt_actions, self.action_stats)
+        
+        # Sample random timesteps
+        timesteps = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps,
+            (batch_size,), device=device, dtype=torch.long
+        )
+        
+        # Sample noise
+        noise = torch.randn_like(normalized_gt)
+        
+        # Add noise to actions (forward diffusion)
+        noisy_actions = self.noise_scheduler.add_noise(normalized_gt, noise, timesteps)
+        
+        # Predict noise
+        noise_pred = self.noise_pred_net(
+            sample=noisy_actions,
+            timestep=timesteps,
+            global_cond=global_cond,
+        )
+        
+        # Compute per-sample MSE loss
+        per_sample_loss = nn.functional.mse_loss(noise_pred, noise, reduction='none')
+        per_sample_loss = per_sample_loss.mean(dim=(1, 2))  # [B]
+        
+        # Apply action_valid mask
+        if action_valid is not None:
+            mask = action_valid.float().to(device)
+            if mask.sum() > 0:
+                loss = (per_sample_loss * mask).sum() / mask.sum()
+            else:
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+        else:
+            loss = per_sample_loss.mean()
+        
+        # Return loss with diagnostic info
+        with torch.no_grad():
+            noise_std = noise.std()
+            noise_pred_std = noise_pred.std()
+            mse = per_sample_loss.mean()
+        
+        return {
+            'loss': loss,
+            'noise_std': noise_std,
+            'noise_pred_std': noise_pred_std,
+            'mse': mse,
         }
     
     def _diffusion_inference(

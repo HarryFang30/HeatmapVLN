@@ -342,6 +342,23 @@ log:
   use_tensorboard: true
 ```
 
+### Loss 设计
+
+训练使用多任务联合 Loss：
+
+$$\mathcal{L} = \lambda_h \cdot \mathcal{L}_{heatmap} + \lambda_a \cdot \mathcal{L}_{action} + \lambda_s \cdot \mathcal{L}_{stop}$$
+
+默认权重：$\lambda_h=1.0$, $\lambda_a=0.5$, $\lambda_s=0.5$
+
+| 任务 | Loss 类型 | 设计要点 |
+|------|-----------|----------|
+| 热力图 | SimplifiedHeatmapLoss (warmup) | MSE + 峰值加权 + 梯度匹配 |
+| 热力图 | NeRFRippleHeatmapLoss (完整训练) | MSE + FFT频域 + 径向梯度 + 峰值定位 |
+| 动作 | Diffusion Noise Prediction | L2 噪声预测损失，动作归一化到 [-1, 1] |
+| 停止 | Focal Loss | γ=2.0, α=0.75，处理 STOP 类别不平衡 |
+
+**分阶段策略**：Warmup 阶段使用简化 Loss 稳定训练；后续阶段切换到 NeRF 波纹 Loss 保留热力图高频细节。
+
 ### 输出文件结构
 
 训练输出保存在 `log.out_dir` 指定路径:
