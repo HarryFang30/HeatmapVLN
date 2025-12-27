@@ -137,6 +137,179 @@ VLNSlidingWindowDataset(
 
 ---
 
+## 热力图生成模块（DiffusionHeatmapHead）
+
+热力图生成模块使用 **条件扩散模型** 从 LLM 特征和视觉观测中生成空间热力图。
+
+### 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        DiffusionHeatmapHead 架构                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐    ┌─────────────┐                                         │
+│  │ LLM Tokens  │    │  观测帧     │                                         │
+│  │[B,seq,2048] │    │[B,3,H,W]    │                                         │
+│  └──────┬──────┘    └──────┬──────┘                                         │
+│         │                  │                                                │
+│         ▼                  ▼                                                │
+│  ┌─────────────┐    ┌─────────────┐                                         │
+│  │  Mean Pool  │    │ CNN Encoder │  ← ImageConditionEncoder                │
+│  └──────┬──────┘    │ (轻量级)    │    [32,64,128,256] 通道                 │
+│         │           └──────┬──────┘                                         │
+│         ▼                  │                                                │
+│  ┌─────────────┐           │                                                │
+│  │   Linear    │           │                                                │
+│  │ Projection  │           │                                                │
+│  └──────┬──────┘           │                                                │
+│         │                  │                                                │
+│         └───────┬──────────┘                                                │
+│                 ▼                                                           │
+│          ┌─────────────┐                                                    │
+│          │ Concat + MLP│  ← MultiModalConditionEncoder                      │
+│          │  (融合层)   │    输出 [B, cond_dim]                              │
+│          └──────┬──────┘                                                    │
+│                 │                                                           │
+│     ┌───────────┴───────────┐                                               │
+│     │                       │                                               │
+│     ▼                       ▼                                               │
+│ ┌────────┐           ┌─────────────┐                                        │
+│ │条件向量│──────────▶│ConditionalU │                                        │
+│ │[B,512] │  global   │   Net2D     │  ← FiLM 条件调制                       │
+│ └────────┘   cond    │ (噪声预测)  │                                        │
+│                      └──────┬──────┘                                        │
+│                             │                                               │
+│                 ┌───────────┴───────────┐                                   │
+│                 │                       │                                   │
+│                 ▼                       ▼                                   │
+│          ┌─────────────┐         ┌─────────────┐                            │
+│          │  Noisy HM   │  ←───── │ DDPM 10步   │                            │
+│          │[B,1,Hm,Wm]  │  迭代   │  采样器     │                            │
+│          └─────────────┘  去噪   └──────┬──────┘                            │
+│                                         │                                   │
+│                                         ▼                                   │
+│                                  ┌─────────────┐                            │
+│                                  │  Heatmap    │                            │
+│                                  │ [B,Hm,Wm]   │                            │
+│                                  └─────────────┘                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 模块组件
+
+#### 1. 条件编码器（MultiModalConditionEncoder）
+
+负责融合文本和视觉信息：
+
+| 组件 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `LLMConditionProjector` | [B, seq, 2048] | [B, cond_dim] | Mean Pool → Linear → LayerNorm → GELU → Linear |
+| `ImageConditionEncoder` | [B, 3, H, W] | [B, cond_dim] | 轻量级 CNN (Stem + 3 Stages + GAP + Projection) |
+| `Fusion MLP` | [B, cond_dim×2] | [B, cond_dim] | Concat → Linear → LayerNorm → GELU → Linear |
+
+**ImageConditionEncoder 架构**:
+```python
+Stem:     Conv 7×7 stride 2 → BatchNorm → ReLU → MaxPool
+Stage 1:  ConvBlock(32→64, stride=2) + ResidualBlock(64)
+Stage 2:  ConvBlock(64→128, stride=2) + ResidualBlock(128)
+Stage 3:  ConvBlock(128→256, stride=2) + ResidualBlock(256)
+Pool:     Global Average Pooling → [B, 256]
+Project:  Linear(256, cond_dim) → LayerNorm → GELU → Linear
+```
+
+#### 2. 噪声预测网络（ConditionalUnet2D）
+
+基于 2D U-Net 的条件去噪网络，使用 FiLM 调制：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `in_channels` | 1 | 输入通道（热力图单通道） |
+| `out_channels` | 1 | 输出通道（预测噪声） |
+| `block_out_channels` | (64, 128, 256) | 各层通道数 |
+| `layers_per_block` | 2 | 每层残差块数量 |
+| `attention_levels` | (2,) | 添加注意力的层级 |
+
+**FiLM 条件调制**:
+```
+h = h × (1 + scale) + shift
+```
+其中 `scale, shift = MLP(timestep_emb + global_cond)`
+
+#### 3. 扩散调度器（DDPMScheduler）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_train_timesteps` | 100 | 训练扩散步数 |
+| `num_inference_steps` | 10 | 推理采样步数 |
+| `beta_schedule` | `squaredcos_cap_v2` | 余弦噪声调度 |
+| `prediction_type` | `epsilon` | 预测噪声（非直接预测样本） |
+
+### 数据流
+
+```
+文本流: LLM Token [B,seq,2048] → Mean Pool → Linear → [B, cond_dim]
+                                                          ↓
+视觉流: 观测帧 [B,3,H,W] → CNN Encoder → [B, cond_dim] → Concat
+                                                          ↓
+条件流: [B, cond_dim×2] → Fusion MLP → [B, cond_dim] → ConditionalUnet2D
+                                                          ↓
+生成流: 随机噪声 [B,1,Hm,Wm] → 迭代去噪 (10步) → Heatmap [B,Hm,Wm]
+```
+
+### 训练与推理
+
+**训练模式**:
+```python
+# 前向扩散：给 GT 热力图加噪
+noisy_heatmap = scheduler.add_noise(gt_heatmap, noise, timesteps)
+
+# 预测噪声
+noise_pred = unet(noisy_heatmap, timesteps, global_cond)
+
+# 计算 Loss
+loss = F.mse_loss(noise_pred, noise)
+```
+
+**推理模式**:
+```python
+# 从纯噪声开始
+noisy_heatmap = torch.randn(B, 1, Hm, Wm)
+
+# 迭代去噪
+for t in scheduler.timesteps:
+    noise_pred = unet(noisy_heatmap, t, global_cond)
+    noisy_heatmap = scheduler.step(noise_pred, t, noisy_heatmap).prev_sample
+
+# 输出热力图
+heatmap = denormalize(noisy_heatmap)  # [-1,1] → [0,1] → softmax
+```
+
+### 配置参数
+
+在 `configs/train_config.yaml` 中：
+
+```yaml
+model:
+  heatmap_head:
+    enable_history: true        # 启用历史热力图头
+    enable_future: true         # 启用未来热力图头
+    cond_dim: 512               # 条件向量维度
+    num_inference_steps: 10     # 推理扩散步数
+```
+
+### 源代码位置
+
+| 文件 | 说明 |
+|------|------|
+| `src/models/heatmap/diffusion_heatmap_head.py` | 主模块：`DiffusionHeatmapHead` |
+| `src/models/heatmap/diffusion/config.py` | 配置：`DiffusionHeatmapConfig` |
+| `src/models/heatmap/diffusion/unet2d.py` | 噪声预测：`ConditionalUnet2D` |
+| `src/models/heatmap/diffusion/image_encoder.py` | 条件编码：`MultiModalConditionEncoder` |
+
+---
+
 ## 数据集准备
 
 ### 数据集结构
@@ -346,9 +519,9 @@ log:
 
 训练使用多任务联合 Loss：
 
-$$\mathcal{L} = \lambda_h \cdot \mathcal{L}_{heatmap} + \lambda_a \cdot \mathcal{L}_{action} + \lambda_s \cdot \mathcal{L}_{stop}$$
+$\mathcal{L} = \lambda_h \cdot \mathcal{L}_{heatmap} + \lambda_a \cdot \mathcal{L}_{action} + \lambda_s \cdot \mathcal{L}_{stop}$
 
-默认权重：$\lambda_h=1.0$, $\lambda_a=0.5$, $\lambda_s=0.5$
+默认权重：$$\lambda_h=1.0$, $\lambda_a=0.5$, $\lambda_s=0.5$$
 
 | 任务 | Loss 类型 | 设计要点 |
 |------|-----------|----------|
@@ -537,9 +710,10 @@ HeatmapVLN/
 
       heatmap/
         diffusion_heatmap_head.py             # DiffusionHeatmapHead（history/future 双头）
-        diffusion/                            # 扩散网络细节/组件
-        generator.py                          # 热力图生成相关工具
-        visualizer.py                         # 热力图可视化
+        diffusion/                            # 扩散网络组件
+          config.py                           # DiffusionHeatmapConfig（超参配置）
+          unet2d.py                           # ConditionalUnet2D（噪声预测网络）
+          image_encoder.py                    # MultiModalConditionEncoder（条件编码）
 
       action/
         diffusion_action_head.py              # DiffusionActionHead（连续动作 dx,dy）
