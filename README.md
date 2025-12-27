@@ -3,7 +3,7 @@
 本目录实现了一个用于 **第一人称跨帧热力图（inter-frame heatmap）** 与 **动作预测** 的训练/评估/推理流水线。
 当前仓库内真实可用的入口脚本为：
 
-- `scripts/train_history_action.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
+- `scripts/train.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
 - `scripts/evaluate.py`：评估（支持 history/future/action，支持保存可视化）
 - `scripts/inference.py`：推理（支持对视频或数据集 clip 运行并保存热力图/动作）
 
@@ -14,7 +14,7 @@
 
 ### 1) 环境安装
 
-建议在 `HeatmapVLN/` 目录下安装依赖：
+建议在 `HeatmapVLN` 目录下安装依赖：
 
 ```bash
 cd HeatmapVLN
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 ### 配置参数
 
-在 `configs/training_config_full_model.yaml` 中：
+在 `configs/train_config.yaml` 中：
 
 ```yaml
 model:
@@ -135,7 +135,7 @@ VLNSlidingWindowDataset(
 
 训练/评估使用 `VLNSlidingWindowDataset`，配置文件通过 `data.root` 指定数据集根目录：
 
-- 默认：`configs/training_config_full_model.yaml` 中的 `data.root: /root/autodl-tmp/dataset_with_actions`
+- 默认：`configs/train_config.yaml` 中的 `data.root: dataset_with_actions`
 - Split: 训练用 `train`，验证用 `data.val_split`（如 `val_unseen`）
 
 ### 目录结构（示例）
@@ -200,7 +200,7 @@ cd HeatmapVLN
 
 python scripts/inference.py \
   --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
-  --config configs/training_config_full_model.yaml \
+  --config configs/train_config.yaml \
   --output-dir ./outputs_inference
 ```
 
@@ -212,7 +212,7 @@ cd HeatmapVLN
 python scripts/inference.py \
   --video /path/to/video.mp4 \
   --instruction "从起点出发，沿走廊前进并找到目标" \
-  --config configs/training_config_full_model.yaml \
+  --config configs/train_config.yaml \
   --output-dir ./outputs_inference
 ```
 
@@ -274,15 +274,163 @@ python scripts/train_history_action.py \
 python scripts/train_history_action.py \
   --config configs/training_config_full_model.yaml \
   --dry-run
+
+# 快速测试训练流程（每 epoch 只跑 5 个 batch）
+python scripts/train.py \
+  --config configs/train_config.yaml \
+  --max-batches 5 \
+  --epochs 2
 ```
 
-### 训练输出
+#### 5. 高级用法
 
-训练输出目录由配置控制：
+```bash
+# 从阶段 2 开始，一直训练到最后
+python scripts/train.py \
+  --config configs/train_config.yaml \
+  --stage-index 1
 
-- `log.out_dir`（默认：`vln_history_action_outputs`）
+# 跳过前 3 个 epoch，从第 4 个开始
+python scripts/train.py \
+  --config configs/train_config.yaml \
+  --start-epoch 4 \
+  --stage warmup_history_64 \
+  --stage-only
+```
 
-其中会包含 `train.log`、checkpoint、可视化图片、以及（可选）TensorBoard 日志。
+### 训练配置说明
+
+配置文件 `configs/train_config.yaml` 包含 **4 阶段渐进式训练**策略:
+
+| 阶段 | 名称 | Epochs | 分辨率 | 训练目标 | Loss 类型 |
+|------|------|--------|--------|----------|-----------|
+| 0 | `warmup_history_64` | 5 | 64×64 | History Head + Action Head | Simplified |
+| 1 | `warmup_future_64` | 5 | 64×64 | Future Head（冻结 History） | Simplified |
+| 2 | `joint_128` | 10 | 128×128 | 双 Head 联合训练 | NeRF Ripple |
+| 3 | `full_224` | 20 | 224×224 | 完整训练 + 解冻 Projector | NeRF Ripple |
+
+**关键配置项**:
+
+```yaml
+data:
+  root: dataset_with_actions  # 数据集路径
+  sliding_window:
+    num_history_sample: 8     # 历史帧采样数
+    sample_stride: 5          # 采样步长（5 = 样本数减少 5 倍）
+
+model:
+  action_head:
+    enable: true              # 启用动作预测
+  stop_head:
+    enable: true              # 启用 Stop 预测
+
+optim:
+  batch_size: 4               # 单卡 batch size
+  grad_accum_steps: 4         # 梯度累积（有效 batch = 16）
+  heatmap_lr: 3.0e-4          # 热力图头学习率
+  action_lr: 3.0e-4           # 动作头学习率
+
+log:
+  out_dir: vln_history_action_outputs
+  use_tensorboard: true
+```
+
+### 输出文件结构
+
+训练输出保存在 `log.out_dir` 指定路径:
+
+```text
+vln_history_action_outputs/
+  ├── train.log                     # 训练日志
+  ├── training_curves.png           # 训练曲线图（实时更新）
+  ├── training_history.json         # 训练历史数据
+  ├── best_model.pth                # 最佳模型（全局）
+  ├── latest.pth                    # 最新检查点（用于续训）
+  ├── warmup_history_64/            # 阶段 1 检查点
+  │   ├── epoch_001.pth
+  │   ├── epoch_002.pth
+  │   └── ...
+  ├── joint_128/                    # 阶段 3 检查点
+  ├── full_224/                     # 阶段 4 检查点
+  └── visualizations/               # 热力图可视化
+      └── epoch_001_step_00100.png
+```
+
+### 监控与调试
+
+#### TensorBoard
+
+```bash
+tensorboard --logdir=/root/tf-logs --port=6006
+
+# 查看指标:
+# - train/loss, train/heatmap_loss, train/action_loss, train/stop_loss
+# - val/loss, val/heatmap_loss, val/action_loss
+# - train/lr, train/action_valid_ratio
+# - train/heatmap_viz（热力图可视化）
+```
+
+#### 飞书通知
+
+配置文件中启用飞书通知后，自动发送训练报告:
+
+```yaml
+log:
+  notify:
+    enabled: true
+    platform: feishu
+    webhook_url: "YOUR_WEBHOOK_URL"
+```
+
+---
+
+## 常见问题 (FAQ)
+
+### Q1: 显存不足 (CUDA Out of Memory)
+
+**方案 1**: 减小 batch size
+
+```yaml
+optim:
+  batch_size: 2          # 4 → 2
+  grad_accum_steps: 8    # 保持有效 batch = 16
+```
+
+**方案 2**: 增大采样步长（减少样本数）
+
+```yaml
+data:
+  sliding_window:
+    sample_stride: 10    # 5 → 10，样本数减半
+```
+
+### Q2: 训练速度慢
+
+**优化**: 使用更大的采样步长
+
+```yaml
+data:
+  sliding_window:
+    sample_stride: 10    # 每隔 10 帧采样
+```
+
+或使用快速测试模式:
+
+```bash
+python scripts/train.py \
+  --config configs/train_config.yaml \
+  --max-batches 50
+```
+
+### Q3: 如何恢复中断的训练？
+
+```bash
+python scripts/train.py \
+  --config configs/train_config.yaml \
+  --auto-resume
+```
+
+恢复内容包括: 模型参数、优化器、调度器、GradScaler、最佳 val_loss
 
 ---
 
@@ -347,10 +495,10 @@ python scripts/evaluate.py \
 ```text
 HeatmapVLN/
   configs/
-    training_config_full_model.yaml          # 唯一配置：数据路径、训练阶段、损失、日志等
+    train_config.yaml          # 唯一配置：数据路径、训练阶段、损失、日志等
 
   scripts/                                   # 三个入口脚本（README 命令都以它们为准）
-    train_history_action.py                   # 训练：四阶段 curriculum（history/future heatmap + action + stop）
+    train.py                   # 训练：四阶段 curriculum（history/future heatmap + action + stop）
     evaluate.py                               # 评估：history/future/action + 可视化
     inference.py                              # 推理：对 video 或 dataset clip 生成 heatmap/actions
 
