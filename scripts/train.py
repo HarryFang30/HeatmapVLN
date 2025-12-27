@@ -1028,92 +1028,66 @@ def train_one_epoch(
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,  # [B, 1, 2]
                 action_valid=action_valid if train_action else None,  # action mask
                 gt_stop=is_stop if train_action else None,  # 🆕 Stop 标签
+                gt_history_heatmap=gt_heatmap if train_history else None,  # 🆕 GT history heatmap
+                gt_future_heatmap=gt_heatmap if train_future else None,    # 🆕 GT future heatmap
             )
             
-            # ========== 热力图损失 ==========
+            # ========== 统一 Loss 计算 ==========
+            # 1. Heatmap Loss（优先使用 diffusion loss）
             heatmap_loss = torch.tensor(0.0, device=device)
             loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
             
             if train_history:
-                pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
-                if pred_heatmap is not None:
-                    # 取最后一帧的预测（对应当前帧）
-                    pred_hm = pred_heatmap[:, -1, :, :]  # [B, H, W]
-                    
-                    # 调整尺寸如果需要
-                    if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                        pred_hm = torch.nn.functional.interpolate(
-                            pred_hm.unsqueeze(1),
-                            size=gt_heatmap.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(1)
-                    
-                    # 使用统一的损失计算函数
-                    heatmap_loss = compute_heatmap_loss(
-                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                    )
+                # 优先使用 diffusion loss
+                if 'history_heatmap_loss' in output:
+                    heatmap_loss = output['history_heatmap_loss']
+                    logger.info(f"  使用 History Diffusion Loss: {heatmap_loss.item():.4f}")
+                else:
+                    # 回退到外部 MSE loss（兼容模式）
+                    pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
+                    if pred_heatmap is not None:
+                        # 取最后一帧的预测（对应当前帧）
+                        pred_hm = pred_heatmap[:, -1, :, :]  # [B, H, W]
+                        
+                        # 调整尺寸如果需要
+                        if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
+                            pred_hm = torch.nn.functional.interpolate(
+                                pred_hm.unsqueeze(1),
+                                size=gt_heatmap.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze(1)
+                        
+                        # 使用统一的损失计算函数
+                        heatmap_loss = compute_heatmap_loss(
+                            heatmap_criterion, pred_hm, gt_heatmap, loss_type
+                        )
+                        logger.info(f"  使用外部 MSE Loss (fallback): {heatmap_loss.item():.4f}")
             
             if train_future:
-                pred_fut = output.get('future_heatmaps')
-                if pred_fut is not None:
-                    pred_hm = pred_fut[:, -1, :, :]
-                    if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                        pred_hm = torch.nn.functional.interpolate(
-                            pred_hm.unsqueeze(1),
-                            size=gt_heatmap.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(1)
-                    
-                    fut_loss = compute_heatmap_loss(
-                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                    )
+                # 优先使用 diffusion loss
+                if 'future_heatmap_loss' in output:
+                    fut_loss = output['future_heatmap_loss']
+                    logger.info(f"  使用 Future Diffusion Loss: {fut_loss.item():.4f}")
                     heatmap_loss = heatmap_loss + fut_loss
-            
-            # ========== 统一 Loss 计算（风格一致） ==========
-            # 1. Heatmap Loss
-            heatmap_loss = torch.tensor(0.0, device=device)
-            loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
-            
-            if train_history:
-                pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
-                if pred_heatmap is not None:
-                    # 取最后一帧的预测（对应当前帧）
-                    pred_hm = pred_heatmap[:, -1, :, :]  # [B, H, W]
-                    
-                    # 调整尺寸如果需要
-                    if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                        pred_hm = torch.nn.functional.interpolate(
-                            pred_hm.unsqueeze(1),
-                            size=gt_heatmap.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(1)
-                    
-                    # 使用统一的损失计算函数
-                    heatmap_loss = compute_heatmap_loss(
-                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                    )
-            
-            if train_future:
-                pred_fut = output.get('future_heatmaps')
-                if pred_fut is not None:
-                    pred_hm = pred_fut[:, -1, :, :]
-                    if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                        pred_hm = torch.nn.functional.interpolate(
-                            pred_hm.unsqueeze(1),
-                            size=gt_heatmap.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(1)
-                    
-                    fut_loss = compute_heatmap_loss(
-                        heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                    )
-                    heatmap_loss = heatmap_loss + fut_loss
-            
-            # 2. Action Loss（统一在外部计算）
+                else:
+                    # 回退到外部 MSE loss（兼容模式）
+                    pred_fut = output.get('future_heatmaps')
+                    if pred_fut is not None:
+                        pred_hm = pred_fut[:, -1, :, :]
+                        if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
+                            pred_hm = torch.nn.functional.interpolate(
+                                pred_hm.unsqueeze(1),
+                                size=gt_heatmap.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze(1)
+                        
+                        fut_loss = compute_heatmap_loss(
+                            heatmap_criterion, pred_hm, gt_heatmap, loss_type
+                        )
+                        heatmap_loss = heatmap_loss + fut_loss
+                        logger.info(f"  使用外部 MSE Loss (fallback): {fut_loss.item():.4f}")
             action_loss = torch.tensor(0.0, device=device)
             action_diag = {}  # 诊断信息
             

@@ -68,6 +68,10 @@ class DiffusionHeatmapHead(nn.Module):
         self.config = config
         self.heatmap_size = config.heatmap_size
         
+        # Training optimization: inference monitoring control
+        self._training_step_counter = 0
+        self._inference_interval = 100  # Generate heatmap every N steps during training
+        
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
             llm_dim=config.llm_dim,
@@ -114,6 +118,7 @@ class DiffusionHeatmapHead(nn.Module):
         observation: torch.Tensor,
         gt_heatmap: Optional[torch.Tensor] = None,
         return_loss: bool = False,
+        skip_inference: bool = False,  # 🆕 训练时跳过推理以提升速度
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass for heatmap generation.
@@ -123,6 +128,7 @@ class DiffusionHeatmapHead(nn.Module):
             observation: (B, C, H, W) observation image
             gt_heatmap: Optional (B, Hm, Wm) ground truth heatmap for training
             return_loss: If True and gt_heatmap provided, return loss dict
+            skip_inference: If True, skip inference during training for speed
             
         Returns:
             If return_loss and gt_heatmap provided:
@@ -143,7 +149,7 @@ class DiffusionHeatmapHead(nn.Module):
         
         # 3. Training mode
         if gt_heatmap is not None and return_loss:
-            return self._compute_training_loss(cond, gt_heatmap)
+            return self._compute_training_loss(cond, gt_heatmap, skip_inference)
         
         # 4. Inference mode
         heatmap = self._diffusion_inference(cond)
@@ -160,6 +166,7 @@ class DiffusionHeatmapHead(nn.Module):
         self,
         cond: torch.Tensor,
         gt_heatmap: torch.Tensor,
+        skip_inference: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute diffusion training loss.
@@ -167,6 +174,7 @@ class DiffusionHeatmapHead(nn.Module):
         Args:
             cond: (B, cond_dim) conditioning vector
             gt_heatmap: (B, Hm, Wm) ground truth heatmap
+            skip_inference: If True, skip inference for monitoring (faster training)
             
         Returns:
             Dict with 'loss', 'heatmap', 'noise_pred', 'noise_target'
@@ -210,9 +218,13 @@ class DiffusionHeatmapHead(nn.Module):
         # Compute loss (MSE between predicted and actual noise)
         loss = F.mse_loss(noise_pred, noise)
         
-        # Generate heatmap for monitoring (optional)
-        with torch.no_grad():
-            pred_heatmap = self._diffusion_inference(cond)
+        # Generate heatmap for monitoring (optional, controlled by interval)
+        pred_heatmap = None
+        if not skip_inference:
+            self._training_step_counter += 1
+            if self._inference_interval == 0 or self._training_step_counter % self._inference_interval == 0:
+                with torch.no_grad():
+                    pred_heatmap = self._diffusion_inference(cond)
         
         return {
             'loss': loss,

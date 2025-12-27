@@ -458,6 +458,8 @@ class SpatialMLLMPipeline(nn.Module):
         gt_actions: Optional[torch.Tensor] = None,
         action_valid: Optional[torch.Tensor] = None,  # action mask for continuous actions
         gt_stop: Optional[torch.Tensor] = None,  # 🆕 ground truth stop labels (0/1)
+        gt_history_heatmap: Optional[torch.Tensor] = None,  # 🆕 GT history heatmap for training
+        gt_future_heatmap: Optional[torch.Tensor] = None,   # 🆕 GT future heatmap for training
     ) -> Dict[str, Any]:
         """
         Complete forward pass of the Spatial-MLLM pipeline processing three inputs.
@@ -610,6 +612,8 @@ class SpatialMLLMPipeline(nn.Module):
         # Step 6: Generate heatmaps using Dual Diffusion Heatmap Heads
         history_heatmap = None
         future_heatmap = None
+        history_heatmap_loss = None
+        future_heatmap_loss = None
         
         if return_heatmaps:
             # Prepare inputs for heatmap heads
@@ -626,20 +630,52 @@ class SpatialMLLMPipeline(nn.Module):
             # Generate History Heatmap
             if self.history_heatmap_head is not None:
                 logger.info("Step 6a: History heatmap generation")
-                history_heatmap = self.history_heatmap_head(
-                    llm_tokens=llm_tokens_for_heatmap,
-                    observation=observation_for_heatmap,
-                )  # [B, Hm, Wm]
-                logger.info(f"History heatmap generated: {history_heatmap.shape}")
+                
+                # Training mode: use diffusion loss
+                if gt_history_heatmap is not None and self.training:
+                    gt_history_hm = gt_history_heatmap.to(heatmap_device)
+                    result = self.history_heatmap_head(
+                        llm_tokens=llm_tokens_for_heatmap,
+                        observation=observation_for_heatmap,
+                        gt_heatmap=gt_history_hm,
+                        return_loss=True,
+                        skip_inference=True,  # Skip inference during training for speed
+                    )
+                    history_heatmap_loss = result['loss']
+                    history_heatmap = result.get('heatmap')  # May be None if skipped
+                    logger.info(f"History heatmap diffusion loss: {history_heatmap_loss.item():.4f}")
+                else:
+                    # Inference mode
+                    history_heatmap = self.history_heatmap_head(
+                        llm_tokens=llm_tokens_for_heatmap,
+                        observation=observation_for_heatmap,
+                    )  # [B, Hm, Wm]
+                    logger.info(f"History heatmap generated: {history_heatmap.shape}")
             
             # Generate Future Heatmap
             if self.future_heatmap_head is not None:
                 logger.info("Step 6b: Future heatmap generation")
-                future_heatmap = self.future_heatmap_head(
-                    llm_tokens=llm_tokens_for_heatmap,
-                    observation=observation_for_heatmap,
-                )  # [B, Hm, Wm]
-                logger.info(f"Future heatmap generated: {future_heatmap.shape}")
+                
+                # Training mode: use diffusion loss
+                if gt_future_heatmap is not None and self.training:
+                    gt_future_hm = gt_future_heatmap.to(heatmap_device)
+                    result = self.future_heatmap_head(
+                        llm_tokens=llm_tokens_for_heatmap,
+                        observation=observation_for_heatmap,
+                        gt_heatmap=gt_future_hm,
+                        return_loss=True,
+                        skip_inference=True,  # Skip inference during training for speed
+                    )
+                    future_heatmap_loss = result['loss']
+                    future_heatmap = result.get('heatmap')  # May be None if skipped
+                    logger.info(f"Future heatmap diffusion loss: {future_heatmap_loss.item():.4f}")
+                else:
+                    # Inference mode
+                    future_heatmap = self.future_heatmap_head(
+                        llm_tokens=llm_tokens_for_heatmap,
+                        observation=observation_for_heatmap,
+                    )  # [B, Hm, Wm]
+                    logger.info(f"Future heatmap generated: {future_heatmap.shape}")
         
         # Prepare output
         output = {
@@ -667,6 +703,12 @@ class SpatialMLLMPipeline(nn.Module):
             output['history_heatmaps'] = history_heatmap.unsqueeze(1)  # [B, 1, Hm, Wm]
         if future_heatmap is not None:
             output['future_heatmaps'] = future_heatmap.unsqueeze(1)    # [B, 1, Hm, Wm]
+        
+        # Add diffusion losses to output
+        if history_heatmap_loss is not None:
+            output['history_heatmap_loss'] = history_heatmap_loss
+        if future_heatmap_loss is not None:
+            output['future_heatmap_loss'] = future_heatmap_loss
             
         # Step 7: Generate navigation actions using Diffusion Policy (parallel with heatmaps)
         if return_actions and self.action_head is not None:
