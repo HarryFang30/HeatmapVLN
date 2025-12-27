@@ -994,20 +994,27 @@ def train_one_epoch(
         is_stop = batch['is_stop'].to(device)           # [B]
         text = batch['text']
         
-        # 🔍 [DIAG] 诊断打印：第一个 epoch 的第一个 batch 打印 action 分布信息
-        if epoch == 0 and i == 0:
+        # 🔍 [DIAG] 诊断打印：第一个 epoch 的第一个 batch 打印完整数据分布
+        if epoch == 1 and i == 0:
             from src.models.action.utils import normalize_actions, ActionStats
             action_stats_min = cfg.get('model', {}).get('action_head', {}).get('action_stats_min', [-0.5, -0.2])
             action_stats_max = cfg.get('model', {}).get('action_head', {}).get('action_stats_max', [0.5, 1.0])
             stats = ActionStats(min=action_stats_min, max=action_stats_max)
             normalized = normalize_actions(gt_action, stats)
             
-            logger.info(f"[DIAG] ========== Action Diagnostics ==========")
-            logger.info(f"[DIAG] action_valid distribution: valid={action_valid.sum().item():.0f}/{len(action_valid)} ({action_valid.float().mean().item()*100:.1f}%)")
-            logger.info(f"[DIAG] gt_action range: min=[{gt_action[:, 0].min().item():.4f}, {gt_action[:, 1].min().item():.4f}], max=[{gt_action[:, 0].max().item():.4f}, {gt_action[:, 1].max().item():.4f}]")
-            logger.info(f"[DIAG] normalized_action range: min=[{normalized[:, 0].min().item():.4f}, {normalized[:, 1].min().item():.4f}], max=[{normalized[:, 0].max().item():.4f}, {normalized[:, 1].max().item():.4f}]")
-            logger.info(f"[DIAG] action_stats: min={action_stats_min}, max={action_stats_max}")
-            logger.info(f"[DIAG] ===========================================")
+            logger.info(f"[DIAG] ========== Data Distribution Diagnostics ==========")
+            logger.info(f"[DIAG] 1. Action Statistics:")
+            logger.info(f"[DIAG]    action_valid: {action_valid.sum().item():.0f}/{len(action_valid)} ({action_valid.float().mean().item()*100:.1f}%)")
+            logger.info(f"[DIAG]    gt_action range: min=[{gt_action[:, 0].min().item():.4f}, {gt_action[:, 1].min().item():.4f}], max=[{gt_action[:, 0].max().item():.4f}, {gt_action[:, 1].max().item():.4f}]")
+            logger.info(f"[DIAG]    gt_action mean/std: mean=[{gt_action[:, 0].mean().item():.4f}, {gt_action[:, 1].mean().item():.4f}], std=[{gt_action[:, 0].std().item():.4f}, {gt_action[:, 1].std().item():.4f}]")
+            logger.info(f"[DIAG]    normalized range: min=[{normalized[:, 0].min().item():.4f}, {normalized[:, 1].min().item():.4f}], max=[{normalized[:, 0].max().item():.4f}, {normalized[:, 1].max().item():.4f}]")
+            logger.info(f"[DIAG]    config action_stats: min={action_stats_min}, max={action_stats_max}")
+            logger.info(f"[DIAG] 2. Stop Label Distribution:")
+            logger.info(f"[DIAG]    is_stop: {is_stop.sum().item():.0f}/{len(is_stop)} = {is_stop.mean().item()*100:.2f}% (STOP samples)")
+            logger.info(f"[DIAG] 3. Heatmap Statistics:")
+            logger.info(f"[DIAG]    gt_heatmap: mean={gt_heatmap.mean().item():.4f}, max={gt_heatmap.max().item():.4f}, std={gt_heatmap.std().item():.4f}")
+            logger.info(f"[DIAG]    gt_heatmap non-zero ratio: {(gt_heatmap > 0.01).float().mean().item()*100:.2f}%")
+            logger.info(f"[DIAG] ========================================================")
         
         # 处理导航指令
         # 注意：Qwen2.5-VL 当前只支持单一指令输入
@@ -1132,6 +1139,26 @@ def train_one_epoch(
             
             loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
             loss = loss / grad_accum_steps
+            
+            # 🔍 [DIAG] 模型输出诊断：检查是否坍缩为全零
+            if epoch == 1 and i == 0:
+                logger.info(f"[DIAG] ========== Model Output Diagnostics ==========")
+                if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
+                    pred_hm = output['history_heatmaps']
+                    logger.info(f"[DIAG] pred_heatmap: mean={pred_hm.mean().item():.4f}, max={pred_hm.max().item():.4f}, std={pred_hm.std().item():.4f}")
+                    logger.info(f"[DIAG] pred_heatmap non-zero: {(pred_hm > 0.01).float().mean().item()*100:.2f}%")
+                
+                if 'stop_logits' in output:
+                    stop_logits = output['stop_logits']
+                    stop_probs = torch.sigmoid(stop_logits)
+                    logger.info(f"[DIAG] stop_logits: mean={stop_logits.mean().item():.4f}, std={stop_logits.std().item():.4f}")
+                    logger.info(f"[DIAG] stop_prob: mean={stop_probs.mean().item():.4f}, max={stop_probs.max().item():.4f}")
+                    logger.info(f"[DIAG] stop predictions: {(stop_probs > 0.5).sum().item()}/{len(stop_probs)} samples predict STOP")
+                
+                if action_diag:
+                    logger.info(f"[DIAG] action noise_std: {action_diag.get('noise_std', 'N/A')}")
+                    logger.info(f"[DIAG] action noise_pred_std: {action_diag.get('noise_pred_std', 'N/A')}")
+                logger.info(f"[DIAG] ======================================================")
         
         # 反向传播
         scaler.scale(loss).backward()
@@ -1175,17 +1202,42 @@ def train_one_epoch(
                     
                     # 🆕 固定间隔诊断信息记录
                     diag_interval = cfg['log'].get('diag_interval', 100)
-                    if global_step % diag_interval == 0 and action_diag:
-                        if action_diag.get('noise_std') is not None:
-                            tb_writer.add_scalar('diag/noise_std', action_diag['noise_std'].item(), actual_step)
-                            tb_writer.add_scalar('diag/noise_pred_std', action_diag['noise_pred_std'].item(), actual_step)
-                            tb_writer.add_scalar('diag/action_mse', action_diag['mse'].item(), actual_step)
-                            # 固定间隔日志打印
-                            logger.info(
-                                f"[DIAG] noise_std={action_diag['noise_std'].item():.3f}, "
-                                f"pred_std={action_diag['noise_pred_std'].item():.3f}, "
-                                f"mse={action_diag['mse'].item():.4f}"
-                            )
+                    if global_step % diag_interval == 0:
+                        # Action diffusion diagnostics
+                        if action_diag:
+                            if action_diag.get('noise_std') is not None:
+                                tb_writer.add_scalar('diag/noise_std', action_diag['noise_std'].item(), actual_step)
+                                tb_writer.add_scalar('diag/noise_pred_std', action_diag['noise_pred_std'].item(), actual_step)
+                                tb_writer.add_scalar('diag/action_mse', action_diag['mse'].item(), actual_step)
+                                # 固定间隔日志打印
+                                logger.info(
+                                    f"[DIAG] noise_std={action_diag['noise_std'].item():.3f}, "
+                                    f"pred_std={action_diag['noise_pred_std'].item():.3f}, "
+                                    f"mse={action_diag['mse'].item():.4f}"
+                                )
+                        
+                        # Heatmap output diagnostics
+                        if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
+                            pred_hm = output['history_heatmaps'].detach()
+                            tb_writer.add_scalar('diag/pred_heatmap_mean', pred_hm.mean().item(), actual_step)
+                            tb_writer.add_scalar('diag/pred_heatmap_max', pred_hm.max().item(), actual_step)
+                            tb_writer.add_scalar('diag/pred_heatmap_std', pred_hm.std().item(), actual_step)
+                        
+                        # Stop prediction diagnostics
+                        if 'stop_logits' in output:
+                            stop_logits = output['stop_logits'].detach()
+                            stop_probs = torch.sigmoid(stop_logits)
+                            tb_writer.add_scalar('diag/stop_prob_mean', stop_probs.mean().item(), actual_step)
+                            tb_writer.add_scalar('diag/stop_prob_max', stop_probs.max().item(), actual_step)
+                            # Calculate stop recall (if any GT stops exist)
+                            if is_stop.sum() > 0:
+                                predicted_stops = (stop_probs > 0.5).float()
+                                stop_recall = (predicted_stops * is_stop).sum() / is_stop.sum()
+                                tb_writer.add_scalar('diag/stop_recall', stop_recall.item(), actual_step)
+                            # Calculate precision (if any predictions exist)
+                            if (stop_probs > 0.5).sum() > 0:
+                                stop_precision = ((stop_probs > 0.5).float() * is_stop).sum() / (stop_probs > 0.5).sum()
+                                tb_writer.add_scalar('diag/stop_precision', stop_precision.item(), actual_step)
                     
                     # 归一化后的 action 分布（每 100 步记录一次直方图，避免日志过大）
                     if global_step % 100 == 0 and 'actions' in output:
