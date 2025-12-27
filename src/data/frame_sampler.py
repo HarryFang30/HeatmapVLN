@@ -97,7 +97,13 @@ class SpaceAwareFrameSampler(nn.Module):
             frame_indices = list(range(num_frames))
             
         # Step 1: Extract geometry and reconstruct 3D points (check cache first)
-        cache_key = f"voxel_sets_{hash(str(frame_indices))}"
+        # Include data characteristics in cache key to prevent collisions
+        world_points = vggt_predictions['world_points']
+        data_hash = hash((
+            tuple(world_points.shape),
+            float(world_points.sum().item()) if world_points.numel() > 0 else 0.0
+        ))
+        cache_key = f"voxel_sets_{hash(str(frame_indices))}_{data_hash}"
         if cache_key in self._voxel_cache:
             logger.debug(f"Using cached voxel sets for {num_frames} frames")
             geometry_data = self._extract_geometry(vggt_predictions, frame_indices)
@@ -117,8 +123,12 @@ class SpaceAwareFrameSampler(nn.Module):
         coverage_scores = coverage_result['coverage_scores']
         voxel_sets = coverage_result['voxel_sets']
         
-        # Compute final statistics
-        total_coverage = len(set().union(*[voxel_sets[i] for i in selected_indices]))
+        # Compute final statistics with safety check for empty selection
+        if selected_indices:
+            total_coverage = len(set().union(*[voxel_sets[i] for i in selected_indices]))
+        else:
+            total_coverage = 0
+            logger.warning("No frames selected, total coverage is 0")
         
         logger.info(f"Selected {len(selected_indices)} frames with total coverage: {total_coverage}")
         
@@ -285,14 +295,19 @@ class SpaceAwareFrameSampler(nn.Module):
 
         # Generate cache key from geometry data and frame indices
         frame_indices = geometry_data['frame_indices']
-        cache_key = f"voxel_sets_{hash(str(frame_indices))}"
+        # Include data characteristics in cache key to prevent collisions
+        world_points = geometry_data['world_points']
+        data_hash = hash((
+            tuple(world_points.shape),
+            float(world_points.sum().item()) if world_points.numel() > 0 else 0.0
+        ))
+        cache_key = f"voxel_sets_{hash(str(frame_indices))}_{data_hash}"
 
         # Check cache first
         if cache is not None and cache_key in cache:
             logger.debug(f"Using cached voxel sets for {len(frame_indices)} frames")
             return cache[cache_key]
         
-        world_points = geometry_data['world_points']  # [S, H, W, 3]
         world_points_conf = geometry_data['world_points_conf']  # [S, H, W]
         frame_indices = geometry_data['frame_indices']
         
@@ -338,11 +353,12 @@ class SpaceAwareFrameSampler(nn.Module):
         scene_extents = point_max - point_min  # [3]
         
         # Use minimum extent dimension for isotropic voxels
-        min_extent = scene_extents.min().item()
-        voxel_size = min_extent / self.config.voxel_lambda
+        # Add safety check to prevent division by zero in degenerate scenes
+        min_extent = max(scene_extents.min().item(), 1e-6)
+        voxel_size = max(min_extent / self.config.voxel_lambda, 1e-6)
         
         logger.info(f"Scene extents: {scene_extents.tolist()}")
-        logger.info(f"Adaptive voxel size: {voxel_size:.4f}")
+        logger.info(f"Adaptive voxel size: {voxel_size:.4f} (safe minimum applied)")
         
         # Step 3: Voxelize each frame's point cloud
         voxel_sets = {}
@@ -362,10 +378,10 @@ class SpaceAwareFrameSampler(nn.Module):
             normalized_points = (valid_points - point_min.unsqueeze(0)) / voxel_size
             voxel_coords = torch.floor(normalized_points).long()
             
-            # Convert to set of tuples for efficient set operations
-            voxel_set = set()
-            for coord in voxel_coords:
-                voxel_set.add(tuple(coord.cpu().numpy()))
+            # Optimized: Use torch.unique for efficient deduplication on GPU
+            unique_voxels = torch.unique(voxel_coords, dim=0)
+            # Convert to set of tuples for set operations (only on unique voxels)
+            voxel_set = set(map(tuple, unique_voxels.cpu().numpy().tolist()))
             
             voxel_sets[frame_idx] = voxel_set
 
@@ -427,7 +443,10 @@ class SpaceAwareFrameSampler(nn.Module):
                 frame_voxels = voxel_sets[frame_idx]
                 coverage_gain = len(frame_voxels - C)  # |V(fi^m) \ C|
                 
-                if coverage_gain > best_coverage_gain:
+                # Prefer higher coverage gain, or earlier frame in case of tie
+                if coverage_gain > best_coverage_gain or \
+                   (coverage_gain == best_coverage_gain and 
+                    (best_frame is None or frame_idx < best_frame)):
                     best_coverage_gain = coverage_gain
                     best_frame = frame_idx
             
