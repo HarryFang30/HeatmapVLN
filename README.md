@@ -1,6 +1,14 @@
 # HeatmapVLN
 
 本目录实现了一个用于 **第一人称跨帧热力图（inter-frame heatmap）** 与 **动作预测** 的训练/评估/推理流水线。
+
+以下是设计架构图：
+
+<img src="assets/architecture.png" width="800">
+
+*N_m帧照片构成的视频序列先通过Spatial Encoder (VGGT) 生成高维向量，通过几何预测头提取相机位姿和深度图，然后（通过Space-aware Frame Sample每次选包含未知信息量最大的图片） 算法来选出N_k张最有价值的图片，这Nk张图片一部分通过3D特征提取头给MLP，另一部分通过索引在原N_m帧里选出来，通过2D编解码器提取2D特征, 与3D特征输入MLP层转化为大模型可识别的token, 然后与当前观测，动作指令一起输入LLM，LLM输出token通过重排生成二维向量，最终通过ConditionalUnet2D生成热力图。我们只要求模型在当前观测的Nk帧中能准确抓住空间关系以解决时间累计造成的数据量溢出的问题。最终我们希望生成的热力图能为导航提供重要的位置信息以供参考。*
+
+
 当前仓库内真实可用的入口脚本为：
 
 - `scripts/train.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
