@@ -228,252 +228,61 @@ python scripts/inference.py \
 
 ## 训练（Training）
 
-### 快速开始
+训练脚本：`scripts/train_history_action.py`  
+默认读取：`--config configs/training_config_full_model.yaml`
 
-**训练脚本**：`scripts/train.py`  
-**默认配置**：`configs/train_config.yaml`
+### 一键按配置跑完整四阶段
 
 ```bash
-# 基础训练（4 阶段渐进式）
-cd /root/VLN/Project
-python scripts/train.py --config configs/train_config.yaml
+cd HeatmapVLN
+
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml
 ```
 
-### 命令行参数详解
+### 常用训练参数
 
-#### 基础参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--config` | str | `configs/train_config.yaml` | 配置文件路径 |
-| `--dry-run` | flag | False | 只构建模型和数据，不训练（测试配置） |
-
-#### 断点续训
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--resume` | str | None | 从指定检查点恢复（路径或 `"latest"`） |
-| `--auto-resume` | flag | False | 自动从最新检查点恢复 |
-
-#### 阶段控制
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--stage` | str | None | 指定阶段名称（如 `warmup_history_64`） |
-| `--stage-index` | int | None | 指定阶段索引（0, 1, 2, 3） |
-| `--stage-only` | flag | False | 只运行指定阶段，不继续后续 |
-| `--start-epoch` | int | 1 | 从指定 epoch 开始 |
-| `--epochs` | int | None | 覆盖配置中的 epoch 数 |
-
-#### 调试参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--max-batches` | int | None | 每 epoch 最多处理的 batch 数（快速测试） |
-
-### 训练示例
-
-#### 1. 完整训练（推荐）
+- **从检查点恢复**
 
 ```bash
-# 4 阶段渐进式训练：64x64 → 128x128 → 224x224
-python scripts/train.py --config configs/train_config.yaml
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
+  --resume /path/to/ckpt.pth
 ```
 
-#### 2. 断点续训
+- **自动从最新检查点恢复**
 
 ```bash
-# 从最新检查点恢复
-python scripts/train.py \
-  --config configs/train_config.yaml \
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
   --auto-resume
-
-# 从指定检查点恢复
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --resume /path/to/epoch_010.pth
 ```
 
-#### 3. 单阶段训练
+- **只跑某个阶段（按名称或索引）**
 
 ```bash
-# 只训练第 3 阶段 (joint_128)
-python scripts/train.py \
-  --config configs/train_config.yaml \
+# 例：只跑 joint_128 阶段
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
   --stage joint_128 \
   --stage-only
-
-# 或使用索引（0-based）
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --stage-index 2 \
-  --stage-only
 ```
 
-#### 4. 调试模式
+- **调试：只构建模型与数据，不实际训练**
 
 ```bash
-# 快速测试配置（不训练）
-python scripts/train.py \
-  --config configs/train_config.yaml \
+python scripts/train_history_action.py \
+  --config configs/training_config_full_model.yaml \
   --dry-run
-
-# 快速测试训练流程（每 epoch 只跑 5 个 batch）
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --max-batches 5 \
-  --epochs 2
 ```
 
-#### 5. 高级用法
+### 训练输出
 
-```bash
-# 从阶段 2 开始，一直训练到最后
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --stage-index 1
+训练输出目录由配置控制：
 
-# 跳过前 3 个 epoch，从第 4 个开始
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --start-epoch 4 \
-  --stage warmup_history_64 \
-  --stage-only
-```
+- `log.out_dir`（默认：`vln_history_action_outputs`）
 
-### 训练配置说明
-
-配置文件 `configs/train_config.yaml` 包含 **4 阶段渐进式训练**策略:
-
-| 阶段 | 名称 | Epochs | 分辨率 | 训练目标 | Loss 类型 |
-|------|------|--------|--------|----------|-----------|
-| 0 | `warmup_history_64` | 5 | 64×64 | History Head + Action Head | Simplified |
-| 1 | `warmup_future_64` | 5 | 64×64 | Future Head（冻结 History） | Simplified |
-| 2 | `joint_128` | 10 | 128×128 | 双 Head 联合训练 | NeRF Ripple |
-| 3 | `full_224` | 20 | 224×224 | 完整训练 + 解冻 Projector | NeRF Ripple |
-
-**关键配置项**:
-
-```yaml
-data:
-  root: /root/autodl-tmp/dataset_with_actions  # 数据集路径
-  sliding_window:
-    num_history_sample: 8     # 历史帧采样数
-    sample_stride: 5          # 采样步长（5 = 样本数减少 5 倍）
-
-model:
-  action_head:
-    enable: true              # 启用动作预测
-  stop_head:
-    enable: true              # 启用 Stop 预测
-
-optim:
-  batch_size: 4               # 单卡 batch size
-  grad_accum_steps: 4         # 梯度累积（有效 batch = 16）
-  heatmap_lr: 3.0e-4          # 热力图头学习率
-  action_lr: 3.0e-4           # 动作头学习率
-
-log:
-  out_dir: /root/autodl-tmp/vln_history_action_outputs
-  use_tensorboard: true
-```
-
-### 输出文件结构
-
-训练输出保存在 `log.out_dir` 指定路径:
-
-```text
-vln_history_action_outputs/
-  ├── train.log                     # 训练日志
-  ├── training_curves.png           # 训练曲线图（实时更新）
-  ├── training_history.json         # 训练历史数据
-  ├── best_model.pth                # 最佳模型（全局）
-  ├── latest.pth                    # 最新检查点（用于续训）
-  ├── warmup_history_64/            # 阶段 1 检查点
-  │   ├── epoch_001.pth
-  │   ├── epoch_002.pth
-  │   └── ...
-  ├── joint_128/                    # 阶段 3 检查点
-  ├── full_224/                     # 阶段 4 检查点
-  └── visualizations/               # 热力图可视化
-      └── epoch_001_step_00100.png
-```
-
-### 监控与调试
-
-#### TensorBoard
-
-```bash
-tensorboard --logdir=/root/tf-logs --port=6006
-
-# 查看指标:
-# - train/loss, train/heatmap_loss, train/action_loss, train/stop_loss
-# - val/loss, val/heatmap_loss, val/action_loss
-# - train/lr, train/action_valid_ratio
-# - train/heatmap_viz（热力图可视化）
-```
-
-#### 飞书通知
-
-配置文件中启用飞书通知后，自动发送训练报告:
-
-```yaml
-log:
-  notify:
-    enabled: true
-    platform: feishu
-    webhook_url: "YOUR_WEBHOOK_URL"
-```
-
----
-
-## 常见问题 (FAQ)
-
-### Q1: 显存不足 (CUDA Out of Memory)
-
-**方案 1**: 减小 batch size
-
-```yaml
-optim:
-  batch_size: 2          # 4 → 2
-  grad_accum_steps: 8    # 保持有效 batch = 16
-```
-
-**方案 2**: 增大采样步长（减少样本数）
-
-```yaml
-data:
-  sliding_window:
-    sample_stride: 10    # 5 → 10，样本数减半
-```
-
-### Q2: 训练速度慢
-
-**优化**: 使用更大的采样步长
-
-```yaml
-data:
-  sliding_window:
-    sample_stride: 10    # 每隔 10 帧采样
-```
-
-或使用快速测试模式:
-
-```bash
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --max-batches 50
-```
-
-### Q3: 如何恢复中断的训练？
-
-```bash
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --auto-resume
-```
-
-恢复内容包括: 模型参数、优化器、调度器、GradScaler、最佳 val_loss
+其中会包含 `train.log`、checkpoint、可视化图片、以及（可选）TensorBoard 日志。
 
 ---
 
@@ -482,24 +291,30 @@ python scripts/train.py \
 评估脚本：`scripts/evaluate.py`  
 必须提供 `--checkpoint`。
 
+如果你不传 `--use-history/--use-future/--use-action`，脚本会默认全部评估。
+
 ```bash
+cd HeatmapVLN
+
 python scripts/evaluate.py \
-  --config configs/train_config.yaml \
-  --checkpoint /path/to/best_model.pth \
-  --split val_unseen \
+  --config configs/training_config_full_model.yaml \
+  --checkpoint /path/to/ckpt.pth \
+  --split val \
   --save-vis \
   --num-vis 20
 ```
 
 ---
 
-## 配置文件说明（configs/train_config.yaml）
+## 配置文件说明（configs/training_config_full_model.yaml）
 
-你通常需要检查并修改：
+当前 `configs/` 目录只有一个配置：`training_config_full_model.yaml`。
+
+你通常需要优先检查并修改：
 
 - `data.root`：数据集根目录
 - `data.val_split`：验证 split（例如 `val_unseen`）
-- `model.llm.model_path`：本地 Qwen2.5-VL 权重路径
+- `model.llm.model_path`：本地 Qwen2.5-VL 权重路径（默认写在 `models/qwen_2.5_vl`）
 - `log.out_dir` / `log.tensorboard_dir`：输出与日志目录
 
 ---
