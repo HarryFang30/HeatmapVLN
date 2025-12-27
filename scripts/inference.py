@@ -361,8 +361,16 @@ def main():
 
     # Load checkpoint (optional)
     if args.checkpoint and Path(args.checkpoint).exists():
-    logger.info(f"Loading checkpoint from: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+        logger.info(f"Loading checkpoint from: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
+        if list(state_dict.keys())[0].startswith('module.'):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            logger.info(f"Missing keys (using pretrained): {len(missing_keys)}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys: {len(unexpected_keys)}")
         state = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
     if list(state.keys())[0].startswith('module.'):
         state = {k.replace('module.', ''): v for k, v in state.items()}
