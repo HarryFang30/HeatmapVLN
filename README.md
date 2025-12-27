@@ -779,16 +779,166 @@ log:
 
 $\mathcal{L} = \lambda_h \cdot \mathcal{L}_{heatmap} + \lambda_a \cdot \mathcal{L}_{action} + \lambda_s \cdot \mathcal{L}_{stop}$
 
-默认权重：$$\lambda_h=1.0$, $\lambda_a=0.5$, $\lambda_s=0.5$$
+默认权重：$\lambda_h=1.0$, $\lambda_a=1.0$, $\lambda_s=0.5$
 
 | 任务 | Loss 类型 | 设计要点 |
 |------|-----------|----------|
-| 热力图 | SimplifiedHeatmapLoss (warmup) | MSE + 峰值加权 + 梯度匹配 |
-| 热力图 | NeRFRippleHeatmapLoss (完整训练) | MSE + FFT频域 + 径向梯度 + 峰值定位 |
-| 动作 | Diffusion Noise Prediction | L2 噪声预测损失，动作归一化到 [-1, 1] |
-| 停止 | Focal Loss | γ=2.0, α=0.75，处理 STOP 类别不平衡 |
+| 热力图 | Diffusion + 加权MSE | 峰值区域权重x10 + 峰值保持损失 + 方差约束 |
+| 动作 | Diffusion + 加权MSE | 非零动作权重x10 + 方差约束 |
+| 停止 | 混合Loss (BCE + Focal) | 10x类别权重 + gamma限制 |
 
-**分阶段策略**：Warmup 阶段使用简化 Loss 稳定训练；后续阶段切换到 NeRF 波纹 Loss 保留热力图高频细节。
+---
+
+#### Loss 收敛问题修复详解
+
+**问题发现**：训练初期（<100步）所有 Loss 都异常快速下降到极低值：
+- Heatmap Loss: 1.2 → 0.02
+- Action Loss: 1.4 → 0.02  
+- Stop Loss: 0.045（起点就很低）
+
+**根因分析**：
+
+| Loss | 数据特点 | 模型行为 |
+|------|---------|---------|
+| Heatmap | GT热力图93.5%是0（背景） | 输出全黑即可获得极低Loss |
+| Action | 95.5%转向=0，40.3%前进=0 | 输出全零即可获得极低Loss |
+| Stop | STOP样本仅3%（极度不平衡） | Focal Loss过度压低梯度 |
+
+---
+
+#### 1. Heatmap Loss 修复
+
+**文件**: `src/models/heatmap/diffusion_heatmap_head.py`
+
+**问题**：GT热力图极度稀疏（93.5%背景），普通MSE让模型学会"输出全黑"
+
+**修复方案（三层防线）**：
+
+```python
+# 1. 加权 MSE Loss：峰值区域权重x10
+weight = 1.0 + 9.0 * gt_heatmap.clamp(0, 1)  # [1, 10]
+weighted_loss = (weight * squared_error).mean()
+
+# 2. 峰值保持损失：确保输出有峰值
+peak_loss = F.relu(0.3 - pred_heatmap.max())
+
+# 3. 方差约束：确保输出有空间变化
+variance_loss = F.relu(0.01 - pred_heatmap.std())
+
+# 总损失
+loss = diffusion_loss + 0.5 * (peak_loss + variance_loss)
+```
+
+**归一化改进**：使用对数变换让信号分布更均匀
+
+```python
+# 原归一化：[0,1] -> [-1,1]，导致93.5%的值都是-1
+# 改进：对数空间归一化
+log_heatmap = torch.log(heatmap * 6 + 1)  # [0, ~1.95]
+normalized = (log_heatmap / max_log) * 2 - 1  # [-1, 1]
+```
+
+---
+
+#### 2. Action Loss 修复
+
+**文件**: `src/models/action/diffusion_action_head.py`
+
+**问题**：动作数据分布极不均匀
+- 维度0（转向）：95.5% 是 0
+- 维度1（前进）：40.3% 是 0
+
+**修复方案**：
+
+```python
+# 1. 加权 MSE Loss：非零动作权重更高
+action_magnitude = normalized_gt.abs()
+weight = 1.0 + 9.0 * action_magnitude.clamp(0, 1)  # [1, 10]
+weighted_loss = (weight * squared_error).mean()
+
+# 2. 方差约束：确保预测动作有变化
+variance_loss = F.relu(0.1 - pred_actions.std())
+
+# 总损失
+loss = diffusion_loss + 0.3 * variance_loss
+```
+
+---
+
+#### 3. Stop Loss 修复
+
+**文件**: `src/models/action/stop_head.py`
+
+**问题**：
+- STOP 样本仅 3%（极度不平衡）
+- 纯 Focal Loss 在此场景下过度压低梯度
+- 初始 stop_loss = 0.045（正常BCE应为~0.69）
+
+**修复方案**：
+
+```python
+# 1. 类别权重：STOP 类权重10x
+pos_weight = torch.tensor([10.0], device=device)
+bce_loss = F.binary_cross_entropy_with_logits(
+    logits, targets, pos_weight=pos_weight
+)
+
+# 2. 限制 gamma 避免过度压低
+gamma = min(self.focal_gamma, 2.0)
+
+# 3. 混合 Loss = 0.3 * BCE + 0.7 * Focal
+# BCE 保持基础梯度，Focal 聚焦困难样本
+mixed_loss = 0.3 * bce_loss + 0.7 * focal_loss
+```
+
+---
+
+#### 4. 总 Loss 权重调整
+
+**文件**: `configs/train_config.yaml`
+
+```yaml
+loss:
+  history_weight: 1.0   # Heatmap（核心任务）
+  future_weight: 1.0    # Heatmap
+  action_weight: 1.0    # Action（提升：0.5 → 1.0）
+  stop_weight: 0.5      # Stop（内部已有10x类别权重）
+```
+
+---
+
+#### 预期效果
+
+| 指标 | 修复前 | 修复后预期 |
+|------|--------|-----------|
+| Heatmap Loss | 0.02 | 0.1-0.5 |
+| Action Loss | 0.02 | 0.1-0.5 |
+| Stop Loss | 0.045 | 0.3-0.5 |
+| 热力图可视化 | 全黑 | 有明显峰值 |
+| Stop 预测 | 全猜0.5 | 能区分STOP |
+
+---
+
+#### 诊断指标（TensorBoard）
+
+修复后新增以下诊断指标：
+
+```
+diag/pred_heatmap_mean     # 预测热力图均值
+diag/pred_heatmap_max      # 预测热力图最大值（<0.1说明坍缩）
+diag/pred_heatmap_std      # 预测热力图标准差
+diag/pred_heatmap_nonzero_ratio  # 非零像素比例
+diag/heatmap_noise_std     # 热力图噪声标准差
+diag/heatmap_noise_pred_std # 热力图噪声预测标准差
+diag/action_noise_std      # 动作噪声标准差
+diag/action_noise_pred_std # 动作噪声预测标准差
+```
+
+**坍缩检测**：如果 `pred_heatmap_max < 0.1`，日志会输出警告。
+
+---
+
+**分阶段策略**：Warmup 阶段使用 Diffusion Loss 稳定训练；后续阶段可切换到 NeRF 波纹 Loss 保留热力图高频细节。
 
 ### 输出文件结构
 
