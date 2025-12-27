@@ -227,22 +227,44 @@ class DiffusionHeatmapHead(nn.Module):
         squared_error = (noise_pred - noise).pow(2)
         weighted_loss = (weight * squared_error).mean()
         
-        loss = weighted_loss
+        diffusion_loss = weighted_loss
         
         # 🔍 诊断信息：记录噪声预测质量
         noise_std = noise.std().item()
         noise_pred_std = noise_pred.std().item()
         
-        # Generate heatmap for monitoring (optional, controlled by interval)
+        # 🔧 [FIX-2] 峰值保持损失：确保输出热力图有明显峰值，不能全黑
+        # 每隔一定步数生成预测热力图用于计算峰值损失
+        self._training_step_counter += 1
         pred_heatmap = None
-        if not skip_inference:
-            self._training_step_counter += 1
-            if self._inference_interval == 0 or self._training_step_counter % self._inference_interval == 0:
-                with torch.no_grad():
-                    pred_heatmap = self._diffusion_inference(cond)
+        peak_loss = torch.tensor(0.0, device=device)
+        variance_loss = torch.tensor(0.0, device=device)
+        
+        # 每10步计算一次峰值保持损失（平衡训练速度和效果）
+        compute_peak_loss = (self._training_step_counter % 10 == 0)
+        
+        if compute_peak_loss or not skip_inference:
+            with torch.no_grad():
+                pred_heatmap = self._diffusion_inference(cond)
+            
+            if compute_peak_loss and pred_heatmap is not None:
+                # 峰值约束：pred_heatmap.max() 必须 >= 0.3
+                # 如果最大值小于0.3，则产生惩罚
+                peak_loss = F.relu(0.3 - pred_heatmap.max())
+                
+                # 方差约束：输出必须有空间变化（不能全是同一个值）
+                # 如果标准差小于0.01，则产生惩罚
+                variance_loss = F.relu(0.01 - pred_heatmap.std())
+        
+        # 总损失 = 扩散损失 + 峰值保持损失
+        # 峰值损失权重设为0.5，避免过度影响扩散训练
+        loss = diffusion_loss + 0.5 * (peak_loss + variance_loss)
         
         return {
             'loss': loss,
+            'diffusion_loss': diffusion_loss,
+            'peak_loss': peak_loss,
+            'variance_loss': variance_loss,
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
@@ -298,36 +320,65 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _normalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        Normalize heatmap from [0, 1] to [-1, 1] for diffusion.
+        🔧 [FIX-3] 对数空间归一化：更好地保留峰值信息
+        
+        原问题：线性归一化 [0,1] -> [-1,1] 导致：
+          - 93.5%的背景(值~0) 全部映射到 -1
+          - 模型学会输出全-1就能获得极低Loss
+        
+        解决方案：对数变换
+          - 背景(~0) -> log(eps) ≈ -13.8 -> 归一化后更分散
+          - 峰值(~1) -> log(1) = 0 -> 归一化后在较高区域
+          - 信号分布更均匀，扩散模型更容易学习
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [0, 1]
             
         Returns:
-            (B, 1, H, W) heatmap in [-1, 1]
+            (B, 1, H, W) heatmap in [-1, 1] (对数空间)
         """
         # Clamp to [0, 1] first
         heatmap = heatmap.clamp(0, 1)
-        # Map to [-1, 1]
-        return heatmap * 2 - 1
+        
+        # 对数变换：[0, 1] -> [log(eps), log(1+eps)] ≈ [-13.8, 0]
+        eps = 1e-6
+        log_scale = 6.0  # 使用较小的对数范围以保持数值稳定性
+        
+        # 使用 log1p 风格的变换：log(x * scale + 1) 更稳定
+        # x=0 -> log(1)=0, x=1 -> log(scale+1)
+        # 然后归一化到 [-1, 1]
+        log_heatmap = torch.log(heatmap * log_scale + 1)  # [0, log(7)] ≈ [0, 1.95]
+        max_log = torch.log(torch.tensor(log_scale + 1))  # ≈ 1.95
+        
+        # 归一化到 [-1, 1]
+        normalized = (log_heatmap / max_log) * 2 - 1
+        
+        return normalized
     
     def _denormalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        Denormalize heatmap from [-1, 1] to probability distribution.
+        🔧 [FIX-3] 从对数空间反归一化到概率分布
         
         Args:
-            heatmap: (B, 1, H, W) heatmap in [-1, 1]
+            heatmap: (B, 1, H, W) heatmap in [-1, 1] (对数空间)
             
         Returns:
             (B, 1, H, W) probability heatmap (sums to 1)
         """
-        # Map from [-1, 1] to [0, 1]
-        heatmap = (heatmap + 1) / 2
-        heatmap = heatmap.clamp(0, 1)
+        log_scale = 6.0
+        max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device))  # ≈ 1.95
+        
+        # 从 [-1, 1] 反归一化到 [0, max_log]
+        log_heatmap = (heatmap + 1) / 2 * max_log
+        log_heatmap = log_heatmap.clamp(0, max_log)
+        
+        # 从对数空间恢复：exp(log_heatmap) - 1 然后除以 scale
+        recovered = (torch.exp(log_heatmap) - 1) / log_scale
+        recovered = recovered.clamp(0, 1)
         
         # Normalize to probability distribution
         B = heatmap.shape[0]
-        flat = heatmap.view(B, -1)  # (B, H*W)
+        flat = recovered.view(B, -1)  # (B, H*W)
         probs = F.softmax(flat * 10, dim=-1)  # Temperature scaling for sharper peaks
         
         return probs.view_as(heatmap)
