@@ -379,8 +379,12 @@ class VLNSlidingWindowDataset(Dataset):
         使用 sample_stride 控制采样密度：
         - stride=1: 每帧都作为样本（默认）
         - stride=5: 每隔 5 帧采样一次（样本数减少 5 倍）
+        
+        ⚠️ 重要优化：确保每个 clip 的最后一帧（STOP 动作）被采样，
+        以避免 STOP 样本过度稀疏（原本只有 0.6%）
         """
         self.sample_index = []
+        stop_frames_added = 0
         
         for clip_idx, clip_dir in enumerate(self.clips):
             try:
@@ -392,6 +396,15 @@ class VLNSlidingWindowDataset(Dataset):
                 # 使用 sample_stride 跳过部分帧
                 for t in range(self.min_history, T, self.sample_stride):
                     self.sample_index.append((clip_idx, t))
+                
+                # 🔧 确保最后一帧（STOP）被采样
+                # 最后一帧 = T-1，包含 discrete_action=0 (STOP)
+                last_frame = T - 1
+                if last_frame >= self.min_history:
+                    # 检查最后一帧是否已经被采样
+                    if (last_frame - self.min_history) % self.sample_stride != 0:
+                        self.sample_index.append((clip_idx, last_frame))
+                        stop_frames_added += 1
                     
             except Exception as e:
                 logger.warning(f"Failed to index clip {clip_dir}: {e}")
@@ -399,7 +412,7 @@ class VLNSlidingWindowDataset(Dataset):
         
         logger.info(
             f"Built sample index: {len(self.sample_index)} samples from {len(self.clips)} clips "
-            f"(stride={self.sample_stride})"
+            f"(stride={self.sample_stride}, added {stop_frames_added} STOP frames)"
         )
     
     def __len__(self) -> int:
@@ -646,7 +659,17 @@ class VLNSlidingWindowDataset(Dataset):
                 # actions[i] = 从 frame[i] 到 frame[i+1] 的 agent-local 2D 位移 (dx, dy)
                 # 因此对于 current_t 帧，应该加载 actions[current_t]
                 action = actions[current_t]
-                action_valid = 1.0 if current_t < T - 1 else 0.0  # 最后一帧动作无效（为(0,0)）
+                # 🔧 修复：对于最后一帧，如果是 STOP 动作，action_valid 应该为 1
+                # 因为 STOP 是一个有效的决策，不应该被 mask 掉
+                if current_t == T - 1:
+                    # 最后一帧：检查是否是 STOP 动作
+                    discrete_actions = self._load_discrete_actions(clip_dir)
+                    is_last_frame_stop = (discrete_actions is not None and 
+                                          current_t < len(discrete_actions) and 
+                                          int(discrete_actions[current_t]) == 0)
+                    action_valid = 1.0 if is_last_frame_stop else 0.0
+                else:
+                    action_valid = 1.0
             else:
                 action = np.zeros(2, dtype=np.float32)
                 action_valid = 0.0

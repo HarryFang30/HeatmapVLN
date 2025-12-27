@@ -62,10 +62,10 @@ model:
   stop_head:
     enable: true                        # 启用 Stop 预测
     hidden_dim: 512                     # 隐藏层维度
-    focal_gamma: 2.0                    # Focal Loss gamma（越大越关注困难样本）
-    focal_alpha: 0.75                   # Focal Loss alpha（STOP 类权重，因为极不平衡）
-    # ⚠️ 注意：数据集中 STOP 样本极度稀疏（< 0.01%），模型可能始终预测"不停止"
-    # 建议：检查数据集中 is_stop 标签是否正确，或考虑过采样 STOP 样本
+    focal_gamma: 3.0                    # Focal Loss gamma（提高到 3.0，更聚焦困难的 STOP 样本）
+    focal_alpha: 0.9                    # Focal Loss alpha（提高到 0.9，进一步提升 STOP 类权重）
+    # ⚠️ 注意：原始数据集中 STOP 样本极度稀疏（0.6%）
+    # 已优化：确保每个 clip 的 STOP 帧被采样，预计提升到 ~2.5%
 
 # ============================================
 # 训练策略（4 阶段渐进式训练）
