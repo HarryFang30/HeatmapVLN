@@ -1119,7 +1119,7 @@ HeatmapVLN/
       frame_sampler.py                        # 贪心最大覆盖算法（体素化 + 增量选择）
 
     models/
-      pipeline.py                             # 核心模型：SpatialMLLMPipeline + SpatialMLLMIntegrationConfig
+      pipeline.py                             # 核心模型：VLNPipeline + VLNPipelineConfig
 
       heatmap/
         diffusion_heatmap_head.py             # DiffusionHeatmapHead（history/future 双头）

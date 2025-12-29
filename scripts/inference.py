@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Inference for SpatialMLLMPipeline (dual-head + action).
-支持通过参数选择输出历史头/未来头/动作头。
+VLN Pipeline 推理脚本
+======================
 
-更新：
-- 适配新的双 DiffusionHeatmapHead 架构
-- 支持 DiffusionActionHead 动作输出
-- 移除已删除的 validity head 引用
+使用 Qwen3-VL 进行视觉语言导航推理。
+
+支持：
+- 历史热力图头 (History Heatmap)
+- 未来热力图头 (Future Heatmap)
+- 动作头 (Action Head)
+- 停止预测头 (Stop Head)
 """
 
 import os
@@ -28,14 +31,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.plotting_config import configure_matplotlib_fonts
 from src.utils.logger import setup_logger
-from src.models.pipeline import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
 configure_matplotlib_fonts()
 logger = logging.getLogger("inference")
 
 
 def load_video_frames(video_path: str, max_frames: int = 32, target_size: tuple = (224, 224)) -> torch.Tensor:
-    """Load and preprocess video frames with robust error handling.
+    """Load and preprocess video frames.
 
     Args:
         video_path: Path to video file
@@ -43,12 +46,7 @@ def load_video_frames(video_path: str, max_frames: int = 32, target_size: tuple 
         target_size: Target resolution (H, W)
 
     Returns:
-        Tensor of shape [T, 3, H, W] with T = max_frames
-
-    Raises:
-        FileNotFoundError: If video file doesn't exist
-        RuntimeError: If video can't be opened
-        ValueError: If video has no valid frames
+        Tensor of shape [T, 3, H, W]
     """
     if not Path(video_path).exists():
         raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -105,7 +103,6 @@ def load_clip_frames(clip_dir: str, max_frames: int = 32, target_size: tuple = (
     if not rgb_dir.exists():
         raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
     
-    # Find all PNG files
     png_files = sorted(rgb_dir.glob("*.png"))
     if len(png_files) == 0:
         raise ValueError(f"No PNG files found in: {rgb_dir}")
@@ -127,7 +124,6 @@ def load_clip_frames(clip_dir: str, max_frames: int = 32, target_size: tuple = (
     if len(frames) == 0:
         raise ValueError(f"Could not load any frames from: {rgb_dir}")
     
-    # Pad if needed
     while len(frames) < max_frames:
         frames.append(frames[-1].clone())
     
@@ -185,64 +181,63 @@ def visualize_heatmaps(heatmaps: torch.Tensor, output_dir: str, name: str, prefi
     logger.info(f"Saved {prefix} heatmaps to {save_path}")
 
 
-def build_model(cfg: Dict, device: str = 'cuda:0') -> SpatialMLLMPipeline:
-    """Build model for inference.
+def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
+    """Build VLN pipeline for inference.
 
     Args:
         cfg: Configuration dictionary
         device: Target device
 
     Returns:
-        SpatialMLLMPipeline model ready for inference
+        VLNPipeline model ready for inference
     """
     model_cfg = cfg['model']
     data_cfg = cfg['data']
-    
-    # 获取热力图头配置
+    llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap_head', {})
     action_cfg = model_cfg.get('action_head', {})
+    stop_cfg = model_cfg.get('stop_head', {})
     
-    # 使用 sliding_window 配置（新格式）
-    sw_cfg = data_cfg.get('sliding_window', {})
-    num_history = sw_cfg.get('num_history_sample', 8)
-    
-    integration_cfg = SpatialMLLMIntegrationConfig(
-        target_keyframes=num_history,
-        total_frames=num_history + 1,  # history + current
-        sampling_method="hybrid",
-        llm_model_path=model_cfg['llm']['model_path'],
-        # Single GPU mode for inference
-        vggt_gpu=device,
-        dinov3_gpu=device,
-        llm_gpu=device,
-        use_multi_gpu=False,
-        use_real_llm=model_cfg['llm']['use_real_llm'],
-        llm_memory_efficient=False,
+    config = VLNPipelineConfig(
+        # Qwen3-VL
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_token_dim=llm_cfg.get('token_dim', 1024),
+        llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        max_video_frames=llm_cfg.get('max_video_frames', 16),
+        
+        # Device
+        device=device,
+        
+        # Heatmap
         heatmap_size=tuple(data_cfg['init_hm_size']),
-        enable_inter_frame_heatmaps=True,
-        # 启用双热力图头
         enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
         enable_future_heatmap_head=heatmap_cfg.get('enable_future', True),
         diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        # 启用动作头
+        image_size=data_cfg['image_size'][0],
+        
+        # Action
         enable_action_head=action_cfg.get('enable', True),
         action_dim=action_cfg.get('action_dim', 2),
         action_pred_horizon=action_cfg.get('pred_horizon', 1),
-        action_encoding_size=action_cfg.get('encoding_size', 768),
+        action_encoding_size=action_cfg.get('encoding_size', 256),
         action_num_diffusion_iters=action_cfg.get('num_diffusion_iters', 10),
-        # 图像尺寸
-        dinov3_img_size=data_cfg['image_size'][0],
-        vggt_img_size=data_cfg['image_size'][0],
-        enable_gradient_checkpointing=False,
-        verbose=True
+        
+        # Stop
+        enable_stop_head=stop_cfg.get('enable', True),
+        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        
+        verbose=True,
     )
-    return SpatialMLLMPipeline(integration_cfg)
+    
+    return VLNPipeline(config)
 
 
 @torch.no_grad()
 def run_inference(
-    model: SpatialMLLMPipeline,
+    model: VLNPipeline,
     frames: torch.Tensor,
     instruction: str,
     current_observation: Optional[torch.Tensor] = None,
@@ -254,7 +249,7 @@ def run_inference(
     """Run inference.
 
     Args:
-        model: SpatialMLLMPipeline model
+        model: VLNPipeline model
         frames: Input frames [1, T, 3, H, W]
         instruction: Navigation instruction text
         current_observation: Current observation [1, 3, H, W], uses last frame if None
@@ -266,9 +261,8 @@ def run_inference(
     Returns:
         Dictionary with heatmaps and actions
     """
-    # 使用最后一帧作为当前观测（如果未指定）
     if current_observation is None:
-        current_observation = frames[:, -1]  # [1, 3, H, W]
+        current_observation = frames[:, -1]
     
     if amp_dtype is not None:
         with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -290,19 +284,20 @@ def run_inference(
 
     results = {}
     
-    # 热力图输出
     if use_history and 'history_heatmaps' in outputs:
         results['history_heatmaps'] = outputs['history_heatmaps']
     
     if use_future and 'future_heatmaps' in outputs:
         results['future_heatmaps'] = outputs['future_heatmaps']
     
-    # 动作输出
     if use_actions and 'actions' in outputs:
         results['actions'] = outputs['actions']
         logger.info(f"Predicted actions: {outputs['actions'].cpu().numpy()}")
     
-    # 元数据
+    if 'stop_prob' in outputs:
+        results['stop_prob'] = outputs['stop_prob']
+        logger.info(f"Stop probability: {outputs['stop_prob'].cpu().numpy()}")
+    
     if 'processing_metadata' in outputs:
         results['metadata'] = outputs['processing_metadata']
     
@@ -310,8 +305,8 @@ def run_inference(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SpatialMLLMPipeline Inference (Dual-Head + Action)")
-    parser.add_argument('--config', type=str, default='configs/training_config_full_model.yaml')
+    parser = argparse.ArgumentParser(description="VLN Pipeline Inference")
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml')
     parser.add_argument('--video', type=str, default=None, help='Path to video file')
     parser.add_argument('--clip', type=str, default=None, help='Path to dataset clip directory')
     parser.add_argument('--instruction', type=str, default=None, help='Navigation instruction')
@@ -325,14 +320,12 @@ def main():
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     args = parser.parse_args()
 
-    # Logging
     logging.basicConfig(
         level=logging.INFO,
         format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # Validate inputs
     if args.video is None and args.clip is None:
         logger.error("Either --video or --clip must be specified")
         return
@@ -349,7 +342,6 @@ def main():
         args.use_future = True
         args.use_actions = True
 
-    # Device
     if not torch.cuda.is_available():
         logger.warning("CUDA not available, using CPU (this will be slow)")
         args.device = 'cpu'
@@ -369,18 +361,8 @@ def main():
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         if missing_keys:
             logger.info(f"Missing keys (using pretrained): {len(missing_keys)}")
-            if unexpected_keys:
-                logger.warning(f"Unexpected keys: {len(unexpected_keys)}")
-        state = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
-    if list(state.keys())[0].startswith('module.'):
-        state = {k.replace('module.', ''): v for k, v in state.items()}
-
-        # Load with strict=False to allow partial loading
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing:
-            logger.info(f"Missing keys (using pretrained): {len(missing)}")
-        if unexpected:
-            logger.warning(f"Unexpected keys: {len(unexpected)}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys: {len(unexpected_keys)}")
         logger.info("Checkpoint loaded successfully")
     elif args.checkpoint:
         logger.warning(f"Checkpoint not found: {args.checkpoint}, using pretrained weights only")
@@ -450,7 +432,6 @@ def main():
     if 'actions' in results:
         actions = results['actions'].cpu().numpy()
         logger.info(f"Predicted actions shape: {actions.shape}")
-        # Save actions to file
         np.save(out_dir / f"{name}_actions.npy", actions)
         logger.info(f"Saved actions to {out_dir}/{name}_actions.npy")
 

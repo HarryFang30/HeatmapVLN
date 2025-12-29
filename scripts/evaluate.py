@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Evaluation for SpatialMLLMPipeline (Dual DiffusionHeatmapHead + DiffusionActionHead).
-支持评估历史热力图头、未来热力图头和动作头。
+VLN Pipeline 评估脚本
+======================
 
-更新：
-- 适配新的 VLNSlidingWindowDataset
-- 适配新的双 DiffusionHeatmapHead 架构
-- 适配 DiffusionActionHead 动作输出
-- 移除已删除的 validity head 引用
+使用 Qwen3-VL 评估视觉语言导航模型。
+
+支持评估：
+- 历史热力图头 (History Heatmap)
+- 未来热力图头 (Future Heatmap)
+- 动作头 (Action Head)
+- 停止预测头 (Stop Head)
 """
 
 import sys
@@ -27,7 +29,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.pipeline import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.utils.loss import SimplifiedHeatmapLoss, NeRFRippleHeatmapLoss
 
@@ -74,50 +76,55 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'heatmap': torch.stack([s['heatmap'] for s in batch], dim=0),
         'action': torch.stack([s['action'] for s in batch], dim=0),
         'action_valid': torch.tensor([s['action_valid'] for s in batch]),
+        'is_stop': torch.tensor([s.get('is_stop', 0.0) for s in batch]),
         'text': [s['text'] for s in batch],
     }
 
 
-def build_model(cfg: Dict, device: str = 'cuda:0') -> SpatialMLLMPipeline:
-    """Build model for evaluation."""
+def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
+    """Build VLN pipeline for evaluation."""
     model_cfg = cfg['model']
     data_cfg = cfg['data']
-    
+    llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap_head', {})
     action_cfg = model_cfg.get('action_head', {})
-    sw_cfg = data_cfg.get('sliding_window', {})
+    stop_cfg = model_cfg.get('stop_head', {})
     
-    integration_cfg = SpatialMLLMIntegrationConfig(
-        target_keyframes=sw_cfg.get('num_history_sample', 8),
-        total_frames=sw_cfg.get('num_history_sample', 8) + 1,
-        sampling_method="hybrid",
-        llm_model_path=model_cfg['llm']['model_path'],
-        vggt_gpu=device,
-        dinov3_gpu=device,
-        llm_gpu=device,
-        use_multi_gpu=False,
-        use_real_llm=model_cfg['llm']['use_real_llm'],
-        llm_memory_efficient=False,
+    config = VLNPipelineConfig(
+        # Qwen3-VL
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_token_dim=llm_cfg.get('token_dim', 1024),
+        llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        max_video_frames=llm_cfg.get('max_video_frames', 16),
+        
+        # Device
+        device=device,
+        
+        # Heatmap
         heatmap_size=tuple(data_cfg['init_hm_size']),
-        enable_inter_frame_heatmaps=True,
-        # Dual Heatmap Heads
         enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
         enable_future_heatmap_head=heatmap_cfg.get('enable_future', True),
         diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        # Action Head
+        image_size=data_cfg['image_size'][0],
+        
+        # Action
         enable_action_head=action_cfg.get('enable', True),
         action_dim=action_cfg.get('action_dim', 2),
         action_pred_horizon=action_cfg.get('pred_horizon', 1),
-        action_encoding_size=action_cfg.get('encoding_size', 768),
+        action_encoding_size=action_cfg.get('encoding_size', 256),
         action_num_diffusion_iters=action_cfg.get('num_diffusion_iters', 10),
-        # Image sizes
-        dinov3_img_size=data_cfg['image_size'][0],
-        vggt_img_size=data_cfg['image_size'][0],
-        enable_gradient_checkpointing=False,
-        verbose=True
+        
+        # Stop
+        enable_stop_head=stop_cfg.get('enable', True),
+        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        
+        verbose=True,
     )
-    return SpatialMLLMPipeline(integration_cfg)
+    
+    return VLNPipeline(config)
 
 
 def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.device):
@@ -131,7 +138,7 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
     logger.info(f"Loaded checkpoint: {checkpoint_path}")
-    logger.info(f"  Epoch: {ckpt.get('epoch', 'N/A')}  Stage: {ckpt.get('stage', 'N/A')}")
+    logger.info(f"  Epoch: {ckpt.get('epoch', 'N/A')}  Stage: {ckpt.get('stage_name', 'N/A')}")
     if missing_keys:
         logger.info(f"  Missing keys (using pretrained): {len(missing_keys)}")
     if unexpected_keys:
@@ -204,10 +211,7 @@ def compute_spatial_metrics(pred_hm: np.ndarray, gt_hm: np.ndarray) -> Dict[str,
 
 def compute_action_metrics(pred_action: np.ndarray, gt_action: np.ndarray) -> Dict[str, float]:
     """Compute action prediction metrics."""
-    # L2 error
     l2_error = np.sqrt(((pred_action - gt_action) ** 2).sum(axis=-1)).mean()
-    
-    # Per-dimension error
     dx_error = np.abs(pred_action[..., 0] - gt_action[..., 0]).mean()
     dy_error = np.abs(pred_action[..., 1] - gt_action[..., 1]).mean()
     
@@ -218,9 +222,31 @@ def compute_action_metrics(pred_action: np.ndarray, gt_action: np.ndarray) -> Di
     }
 
 
+def compute_stop_metrics(pred_stop: np.ndarray, gt_stop: np.ndarray) -> Dict[str, float]:
+    """Compute stop prediction metrics."""
+    pred_binary = (pred_stop > 0.5).astype(float)
+    accuracy = (pred_binary == gt_stop).mean()
+    
+    # Precision, Recall, F1
+    tp = ((pred_binary == 1) & (gt_stop == 1)).sum()
+    fp = ((pred_binary == 1) & (gt_stop == 0)).sum()
+    fn = ((pred_binary == 0) & (gt_stop == 1)).sum()
+    
+    precision = tp / (tp + fp + 1e-6)
+    recall = tp / (tp + fn + 1e-6)
+    f1 = 2 * precision * recall / (precision + recall + 1e-6)
+    
+    return {
+        'stop_accuracy': float(accuracy),
+        'stop_precision': float(precision),
+        'stop_recall': float(recall),
+        'stop_f1': float(f1),
+    }
+
+
 @torch.no_grad()
 def evaluate(
-    model: SpatialMLLMPipeline,
+    model: VLNPipeline,
     dataloader: DataLoader,
     cfg: Dict,
     device: torch.device,
@@ -229,6 +255,7 @@ def evaluate(
     eval_history: bool = True,
     eval_future: bool = True,
     eval_action: bool = True,
+    eval_stop: bool = True,
     amp_dtype=None,
     args=None
 ) -> Dict[str, float]:
@@ -247,8 +274,12 @@ def evaluate(
         'action_l2_error': 0.0,
         'action_dx_error': 0.0,
         'action_dy_error': 0.0,
+        'stop_accuracy': 0.0,
+        'stop_precision': 0.0,
+        'stop_recall': 0.0,
+        'stop_f1': 0.0,
     }
-    counts = {'hist': 0, 'fut': 0, 'action': 0}
+    counts = {'hist': 0, 'fut': 0, 'action': 0, 'stop': 0}
 
     for idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
         if args and args.max_samples is not None and idx >= args.max_samples:
@@ -268,6 +299,7 @@ def evaluate(
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
+        gt_stop = batch['is_stop'].to(device)
         
         # Get instruction
         text = batch['text']
@@ -294,7 +326,7 @@ def evaluate(
         
         # Evaluate history heatmap
         if eval_history and 'history_heatmaps' in outputs:
-            pred_hm = outputs['history_heatmaps'][:, -1].cpu().numpy()  # Last frame
+            pred_hm = outputs['history_heatmaps'][:, -1].cpu().numpy()
             gt_hm = gt_heatmap.cpu().numpy()
             
             for b in range(B):
@@ -333,6 +365,20 @@ def evaluate(
                     totals['action_dy_error'] += metrics['action_dy_error']
                     counts['action'] += 1
         
+        # Evaluate stop prediction
+        if eval_stop and 'stop_prob' in outputs:
+            pred_stop = outputs['stop_prob'].cpu().numpy()
+            gt_stop_np = gt_stop.cpu().numpy()
+            
+            for b in range(B):
+                if action_valid[b]:
+                    metrics = compute_stop_metrics(pred_stop[b:b+1], gt_stop_np[b:b+1])
+                    totals['stop_accuracy'] += metrics['stop_accuracy']
+                    totals['stop_precision'] += metrics['stop_precision']
+                    totals['stop_recall'] += metrics['stop_recall']
+                    totals['stop_f1'] += metrics['stop_f1']
+                    counts['stop'] += 1
+        
         # Visualization
         if save_dir is not None and idx < num_vis:
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -350,10 +396,13 @@ def evaluate(
             results[k] = v / max(counts['fut'], 1)
         elif k.startswith('action_'):
             results[k] = v / max(counts['action'], 1)
+        elif k.startswith('stop_'):
+            results[k] = v / max(counts['stop'], 1)
     
     results['num_hist_samples'] = counts['hist']
     results['num_fut_samples'] = counts['fut']
     results['num_action_samples'] = counts['action']
+    results['num_stop_samples'] = counts['stop']
     
     return results
 
@@ -421,8 +470,8 @@ def visualize_sample(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate SpatialMLLMPipeline (Dual Heatmap + Action)')
-    parser.add_argument('--config', type=str, default='configs/training_config_full_model.yaml')
+    parser = argparse.ArgumentParser(description='VLN Pipeline Evaluation')
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--split', type=str, default='val', choices=['train', 'val'])
     parser.add_argument('--save-vis', action='store_true', help='Save visualizations')
@@ -431,6 +480,7 @@ def main():
     parser.add_argument('--use-history', action='store_true', help='Evaluate history heatmap')
     parser.add_argument('--use-future', action='store_true', help='Evaluate future heatmap')
     parser.add_argument('--use-action', action='store_true', help='Evaluate action')
+    parser.add_argument('--use-stop', action='store_true', help='Evaluate stop prediction')
     parser.add_argument('--amp', type=str, default='bf16', choices=['none', 'fp16', 'bf16'])
     parser.add_argument('--device', type=str, default='cuda:0')
     args = parser.parse_args()
@@ -446,10 +496,11 @@ def main():
     cfg = load_config(args.config)
 
     # Default: evaluate all
-    if not args.use_history and not args.use_future and not args.use_action:
+    if not args.use_history and not args.use_future and not args.use_action and not args.use_stop:
         args.use_history = True
         args.use_future = True
         args.use_action = True
+        args.use_stop = True
 
     if not torch.cuda.is_available():
         logger.warning("CUDA not available, using CPU")
@@ -488,11 +539,12 @@ def main():
     logger.info(f"  History: {args.use_history}")
     logger.info(f"  Future: {args.use_future}")
     logger.info(f"  Action: {args.use_action}")
+    logger.info(f"  Stop: {args.use_stop}")
     logger.info("=" * 60)
 
     metrics = evaluate(
         model, dataloader, cfg, device, save_dir,
-        args.num_vis, args.use_history, args.use_future, args.use_action,
+        args.num_vis, args.use_history, args.use_future, args.use_action, args.use_stop,
         amp_dtype, args
     )
 
@@ -520,6 +572,13 @@ def main():
         logger.info(f"  L2 Error:   {metrics['action_l2_error']:.4f}")
         logger.info(f"  dx Error:   {metrics['action_dx_error']:.4f}")
         logger.info(f"  dy Error:   {metrics['action_dy_error']:.4f}")
+    
+    if args.use_stop:
+        logger.info(f"Stop Prediction ({metrics['num_stop_samples']} samples):")
+        logger.info(f"  Accuracy:   {metrics['stop_accuracy']:.4f}")
+        logger.info(f"  Precision:  {metrics['stop_precision']:.4f}")
+        logger.info(f"  Recall:     {metrics['stop_recall']:.4f}")
+        logger.info(f"  F1:         {metrics['stop_f1']:.4f}")
 
     # Save metrics
     metrics_file = Path(cfg['log']['out_dir']) / f'metrics_{args.split}.yaml'
