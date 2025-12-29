@@ -58,3 +58,4 @@ logs/
 *.temp
 .DS_Store
 nohup.out
+/plans/*

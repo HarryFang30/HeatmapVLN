@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-History + Action 训练脚本
-==========================
+VLN 训练脚本
+==============
 
-两阶段训练流程：
-- 阶段 A：训练 History 热力图头 + 动作头
-- 阶段 B：训练 Future 热力图头 + 动作头
+使用 Qwen3-VL 进行视觉语言导航训练。
 
-使用 VLNSlidingWindowDataset 进行数据加载。
+训练阶段：
+- Stage 1: History 热力图头预热 (64x64)
+- Stage 2: Future 热力图头预热 (64x64)
+- Stage 3: 联合训练 (128x128)
+- Stage 4: 精细训练 (224x224)
 """
 
 import sys
@@ -27,8 +29,8 @@ import torch
 # ============================================
 # CUDA 性能优化
 # ============================================
-torch.backends.cudnn.benchmark = True  # 自动选择最优卷积算法
-torch.set_float32_matmul_precision('medium')  # 矩阵乘法精度优化（A100/H100）
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('medium')
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
@@ -43,14 +45,13 @@ import time
 from datetime import datetime, timedelta
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # 非交互式后端
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
-from src.models.pipeline import SpatialMLLMPipeline, SpatialMLLMIntegrationConfig
-from src.models.action import DiffusionActionHead, DiffusionActionConfig
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.loss import (
     NavigationHeatmapLoss,
     NeRFRippleHeatmapLoss,
@@ -99,7 +100,7 @@ class TrainingTimer:
         if not self.epoch_times:
             return "计算中..."
         
-        avg_epoch_time = np.mean(self.epoch_times[-5:])  # 最近 5 个 epoch 的平均
+        avg_epoch_time = np.mean(self.epoch_times[-5:])
         remaining_epochs = total_epochs - current_epoch
         eta_seconds = avg_epoch_time * remaining_epochs
         
@@ -133,21 +134,13 @@ class TrainingTimer:
 # ============================================
 
 class TrainingPlotter:
-    """训练曲线绘制器，每个 epoch 后更新保存图表"""
+    """训练曲线绘制器"""
     
     def __init__(self, out_dir: Path, figsize: Tuple[int, int] = (14, 10)):
-        """
-        初始化绘制器
-        
-        Args:
-            out_dir: 输出目录
-            figsize: 图表尺寸
-        """
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.figsize = figsize
         
-        # 存储历史数据
         self.history = {
             'epoch': [],
             'stage': [],
@@ -161,7 +154,6 @@ class TrainingPlotter:
             'is_best': [],
         }
         
-        # 阶段边界（用于绘制竖线）
         self.stage_boundaries = []
         self.current_stage = None
         
@@ -174,24 +166,12 @@ class TrainingPlotter:
         lr: float = None,
         is_best: bool = False,
     ):
-        """
-        更新历史数据并保存图表
-        
-        Args:
-            epoch: 当前 epoch（全局编号）
-            stage_name: 阶段名称
-            train_metrics: 训练指标
-            val_metrics: 验证指标
-            lr: 当前学习率
-            is_best: 是否是最佳模型
-        """
-        # 记录阶段边界
+        """更新历史数据并保存图表"""
         if stage_name != self.current_stage:
             if self.current_stage is not None:
                 self.stage_boundaries.append(len(self.history['epoch']))
             self.current_stage = stage_name
         
-        # 追加数据
         self.history['epoch'].append(epoch)
         self.history['stage'].append(stage_name)
         self.history['train_loss'].append(train_metrics.get('total_loss', 0))
@@ -203,7 +183,6 @@ class TrainingPlotter:
         self.history['lr'].append(lr or 0)
         self.history['is_best'].append(is_best)
         
-        # 保存图表
         self.save_plot()
         
     def save_plot(self):
@@ -213,22 +192,19 @@ class TrainingPlotter:
         
         epochs = self.history['epoch']
         
-        # 创建图表：2x2 布局
         fig, axes = plt.subplots(2, 2, figsize=self.figsize)
         fig.suptitle('VLN Training Progress', fontsize=14, fontweight='bold')
         
-        # 绘制阶段边界竖线的辅助函数
         def draw_stage_lines(ax):
             for idx in self.stage_boundaries:
                 if idx < len(epochs):
                     ax.axvline(x=epochs[idx], color='gray', linestyle='--', alpha=0.5, linewidth=1)
         
-        # ========== 子图 1: Total Loss ==========
+        # Total Loss
         ax1 = axes[0, 0]
         ax1.plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=1.5)
         ax1.plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=1.5)
         
-        # 标注最佳点
         best_indices = [i for i, is_best in enumerate(self.history['is_best']) if is_best]
         if best_indices:
             best_epochs = [epochs[i] for i in best_indices]
@@ -242,7 +218,7 @@ class TrainingPlotter:
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
         
-        # ========== 子图 2: Heatmap Loss ==========
+        # Heatmap Loss
         ax2 = axes[0, 1]
         ax2.plot(epochs, self.history['train_heatmap_loss'], 'b-', label='Train Heatmap', linewidth=1.5)
         ax2.plot(epochs, self.history['val_heatmap_loss'], 'r-', label='Val Heatmap', linewidth=1.5)
@@ -253,7 +229,7 @@ class TrainingPlotter:
         ax2.legend(loc='upper right')
         ax2.grid(True, alpha=0.3)
         
-        # ========== 子图 3: Action Loss ==========
+        # Action Loss
         ax3 = axes[1, 0]
         ax3.plot(epochs, self.history['train_action_loss'], 'b-', label='Train Action', linewidth=1.5)
         ax3.plot(epochs, self.history['val_action_loss'], 'r-', label='Val Action', linewidth=1.5)
@@ -264,7 +240,7 @@ class TrainingPlotter:
         ax3.legend(loc='upper right')
         ax3.grid(True, alpha=0.3)
         
-        # ========== 子图 4: Learning Rate ==========
+        # Learning Rate
         ax4 = axes[1, 1]
         if any(lr > 0 for lr in self.history['lr']):
             ax4.plot(epochs, self.history['lr'], 'g-', linewidth=1.5)
@@ -275,9 +251,7 @@ class TrainingPlotter:
         ax4.set_title('Learning Rate Schedule')
         ax4.grid(True, alpha=0.3)
         
-        # 添加阶段标签
         if self.stage_boundaries:
-            # 在底部添加阶段标注
             unique_stages = []
             seen = set()
             for s in self.history['stage']:
@@ -289,12 +263,11 @@ class TrainingPlotter:
         
         plt.tight_layout(rect=[0, 0.03, 1, 0.97])
         
-        # 保存
         save_path = self.out_dir / 'training_curves.png'
         plt.savefig(save_path, dpi=120, bbox_inches='tight')
         plt.close(fig)
         
-        # 同时保存 JSON 数据（方便后续分析）
+        # 保存 JSON 数据
         json_path = self.out_dir / 'training_history.json'
         import json
         with open(json_path, 'w') as f:
@@ -334,36 +307,23 @@ def visualize_heatmap_predictions(
     output_dir: Path,
     num_samples: int = 2,
 ):
-    """
-    可视化热力图预测结果
-    
-    Args:
-        model: 模型
-        batch: 输入 batch
-        output: 模型输出
-        epoch: 当前 epoch
-        step: 当前 step
-        output_dir: 输出目录
-        num_samples: 可视化样本数
-    """
+    """可视化热力图预测结果"""
     vis_dir = output_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        # 获取数据
-        current_frames = batch['current_frame']  # [B, 3, H, W]
-        gt_heatmaps = batch['heatmap']           # [B, Hm, Wm]
+        current_frames = batch['current_frame']
+        gt_heatmaps = batch['heatmap']
         
-        pred_heatmaps = output.get('history_heatmaps')  # [B, K, Hm, Wm]
+        pred_heatmaps = output.get('history_heatmaps')
         if pred_heatmaps is None:
             pred_heatmaps = output.get('future_heatmaps')
         
         if pred_heatmaps is None:
             return
         
-        # 取最后一个预测（对应当前帧）
         if pred_heatmaps.dim() == 4:
-            pred_heatmaps = pred_heatmaps[:, -1]  # [B, Hm, Wm]
+            pred_heatmaps = pred_heatmaps[:, -1]
         
         B = min(num_samples, current_frames.shape[0])
         
@@ -372,20 +332,17 @@ def visualize_heatmap_predictions(
             axes = axes.reshape(1, -1)
         
         for i in range(B):
-            # RGB 图像
             rgb = current_frames[i].cpu().numpy().transpose(1, 2, 0)
             rgb = np.clip(rgb, 0, 1)
             axes[i, 0].imshow(rgb)
             axes[i, 0].set_title(f"Input Frame")
             axes[i, 0].axis('off')
             
-            # GT 热力图
             gt_hm = gt_heatmaps[i].cpu().numpy()
             axes[i, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=1)
             axes[i, 1].set_title(f"GT Heatmap (max={gt_hm.max():.2f})")
             axes[i, 1].axis('off')
             
-            # 预测热力图
             pred_hm = pred_heatmaps[i].detach().cpu().numpy()
             pred_hm = np.clip(pred_hm, 0, 1)
             axes[i, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
@@ -407,17 +364,7 @@ def visualize_heatmap_predictions(
 
 
 def build_heatmap_loss(loss_cfg: Dict, loss_type: str = None) -> nn.Module:
-    """
-    根据配置构建热力图损失函数。
-    
-    Args:
-        loss_cfg: 完整的 loss 配置字典
-        loss_type: 损失类型，覆盖配置中的默认值
-        
-    Returns:
-        nn.Module: 热力图损失函数
-    """
-    # 优先使用传入的 loss_type，否则使用配置默认值
+    """根据配置构建热力图损失函数"""
     loss_type = loss_type or loss_cfg.get('heatmap_loss_type', 'simplified')
     
     if loss_type == 'simplified':
@@ -457,19 +404,7 @@ def compute_heatmap_loss(
     gt_heatmap: torch.Tensor,
     loss_type: str,
 ) -> torch.Tensor:
-    """
-    统一的热力图损失计算函数，适配不同 Loss 类的接口。
-    
-    Args:
-        heatmap_criterion: 热力图损失函数
-        pred_heatmap: [B, H, W] 或 [B, 1, H, W] 预测热力图
-        gt_heatmap: [B, H, W] 或 [B, 1, H, W] GT 热力图
-        loss_type: 损失类型
-        
-    Returns:
-        torch.Tensor: 损失值
-    """
-    # 确保维度一致
+    """统一的热力图损失计算函数"""
     if pred_heatmap.dim() == 3:
         pred_hm = pred_heatmap.unsqueeze(1)
     else:
@@ -481,7 +416,6 @@ def compute_heatmap_loss(
         gt_hm = gt_heatmap
     
     if loss_type == 'navigation':
-        # NavigationHeatmapLoss 需要额外的 validity 参数
         B = gt_hm.shape[0]
         gt_validity = (gt_hm.view(B, -1).sum(dim=1) > 0.1).float().unsqueeze(1)
         pred_validity = torch.ones_like(gt_validity)
@@ -491,10 +425,9 @@ def compute_heatmap_loss(
             gt_heatmap_raw=gt_hm,
             pred_validity=pred_validity,
             gt_validity=gt_validity,
-            smooth_gt=False,  # 保留波纹
+            smooth_gt=False,
         )
     else:
-        # SimplifiedHeatmapLoss 和 NeRFRippleHeatmapLoss 使用简单接口
         loss, _ = heatmap_criterion(pred_hm, gt_hm)
     
     return loss
@@ -521,23 +454,17 @@ def set_seed(seed: int):
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
-    """
-    滑动窗口数据集的 collate 函数
-    处理可变长度的历史帧
-    """
-    # 找到最大历史帧数
+    """滑动窗口数据集的 collate 函数"""
     max_K = max(s['history_frames'].shape[0] for s in batch)
     
-    # 对历史帧进行 padding
     history_frames_padded = []
     history_mask = []
     
     for s in batch:
-        frames = s['history_frames']  # [K, 3, H, W]
+        frames = s['history_frames']
         K = frames.shape[0]
         
         if K < max_K:
-            # Padding：用最后一帧填充
             pad_size = max_K - K
             pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
             frames_padded = torch.cat([frames, pad_frames], dim=0)
@@ -549,15 +476,14 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         history_frames_padded.append(frames_padded)
         history_mask.append(mask)
     
-    history_frames = torch.stack(history_frames_padded, dim=0)  # [B, max_K, 3, H, W]
-    history_mask = torch.stack(history_mask, dim=0)              # [B, max_K]
-    current_frame = torch.stack([s['current_frame'] for s in batch], dim=0)    # [B, 3, H, W]
-    heatmap = torch.stack([s['heatmap'] for s in batch], dim=0)                # [B, Hm, Wm]
-    action = torch.stack([s['action'] for s in batch], dim=0)                  # [B, 2]
-    action_valid = torch.tensor([s['action_valid'] for s in batch])            # [B]
-    # 🆕 Stop Prediction 相关字段
-    discrete_action = torch.tensor([s.get('discrete_action', 1) for s in batch])  # [B]
-    is_stop = torch.tensor([s.get('is_stop', 0.0) for s in batch])                 # [B]
+    history_frames = torch.stack(history_frames_padded, dim=0)
+    history_mask = torch.stack(history_mask, dim=0)
+    current_frame = torch.stack([s['current_frame'] for s in batch], dim=0)
+    heatmap = torch.stack([s['heatmap'] for s in batch], dim=0)
+    action = torch.stack([s['action'] for s in batch], dim=0)
+    action_valid = torch.tensor([s['action_valid'] for s in batch])
+    discrete_action = torch.tensor([s.get('discrete_action', 1) for s in batch])
+    is_stop = torch.tensor([s.get('is_stop', 0.0) for s in batch])
     text = [s['text'] for s in batch]
     
     return {
@@ -567,8 +493,8 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'heatmap': heatmap,
         'action': action,
         'action_valid': action_valid,
-        'discrete_action': discrete_action,   # 🆕 离散动作 (0-3)
-        'is_stop': is_stop,                   # 🆕 是否停止 (0/1)
+        'discrete_action': discrete_action,
+        'is_stop': is_stop,
         'text': text,
     }
 
@@ -578,81 +504,60 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
 # ============================================
 
 def build_model(cfg: Dict) -> nn.Module:
-    """
-    构建完整模型（SpatialMLLMPipeline + Dual Heatmap Heads + ActionHead）
-    """
+    """构建 VLN Pipeline"""
     model_cfg = cfg['model']
-    
-    # 获取热力图头配置
+    llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap_head', {})
-    enable_history = heatmap_cfg.get('enable_history', True)
-    enable_future = heatmap_cfg.get('enable_future', True)
+    action_cfg = model_cfg.get('action_head', {})
+    stop_cfg = model_cfg.get('stop_head', {})
     
-    # 构建 SpatialMLLMPipeline 配置
-    pipeline_config = SpatialMLLMIntegrationConfig(
-        # Frame sampling
-        target_keyframes=cfg['data']['sliding_window']['num_history_sample'],
-        total_frames=cfg['data']['sliding_window']['num_history_sample'] + 1,  # history + current
-        sampling_method="hybrid",
-
-        # Model paths and GPU
-        llm_model_path=model_cfg['llm']['model_path'],
-        vggt_gpu=model_cfg['vggt_gpu'],
-        dinov3_gpu=model_cfg['dinov3_gpu'],
-        llm_gpu=model_cfg['llm_gpu'],
-        use_multi_gpu=model_cfg.get('use_multi_gpu', False),
-
-        # LLM settings
-        use_real_llm=model_cfg['llm']['use_real_llm'],
-        llm_memory_efficient=False,
-
-        # Heatmap settings
-        heatmap_size=tuple(cfg['data']['init_hm_size']),
-        enable_inter_frame_heatmaps=True,
+    config = VLNPipelineConfig(
+        # Qwen3-VL
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_token_dim=llm_cfg.get('token_dim', 1024),
+        llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        max_video_frames=llm_cfg.get('max_video_frames', 16),
         
-        # Dual Heatmap Heads (Diffusion-based)
-        enable_history_heatmap_head=enable_history,
-        enable_future_heatmap_head=enable_future,
+        # Device
+        device=model_cfg.get('device', 'cuda'),
+        
+        # Heatmap
+        heatmap_size=tuple(cfg['data']['init_hm_size']),
+        enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
+        enable_future_heatmap_head=heatmap_cfg.get('enable_future', True),
         diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-
-        # Image sizes
-        dinov3_img_size=cfg['data']['image_size'][0],
-        vggt_img_size=cfg['data']['image_size'][0],
-
-        # Memory optimization
-        enable_gradient_checkpointing=cfg['optim'].get('gradient_checkpointing', False),
-
-        # Diffusion Action Head（简化 UNet 架构）
-        enable_action_head=model_cfg['action_head']['enable'],
-        action_dim=model_cfg['action_head']['action_dim'],
-        action_pred_horizon=model_cfg['action_head']['pred_horizon'],
-        action_encoding_size=model_cfg['action_head'].get('encoding_size', 256),  # 简化：768 → 256
-        action_down_dims=model_cfg['action_head'].get('down_dims', None),  # 简化：[128, 256]
-        action_num_diffusion_iters=model_cfg['action_head']['num_diffusion_iters'],
-        # 🔧 关键修复：使用实际数据集统计值进行归一化（与配置文件一致）
-        action_stats_min=model_cfg['action_head'].get('action_stats_min', [-0.5, -0.2]),
-        action_stats_max=model_cfg['action_head'].get('action_stats_max', [0.5, 1.0]),
-
-        # 🆕 Stop Prediction Head
-        enable_stop_head=model_cfg.get('stop_head', {}).get('enable', False),
-        stop_hidden_dim=model_cfg.get('stop_head', {}).get('hidden_dim', 512),
-        stop_focal_gamma=model_cfg.get('stop_head', {}).get('focal_gamma', 2.0),
-        stop_focal_alpha=model_cfg.get('stop_head', {}).get('focal_alpha', 0.75),
-
-        verbose=False  # 关闭冗余日志，加快训练
+        image_size=cfg['data']['image_size'][0],
+        
+        # Action
+        enable_action_head=action_cfg.get('enable', True),
+        action_dim=action_cfg.get('action_dim', 2),
+        action_pred_horizon=action_cfg.get('pred_horizon', 1),
+        action_encoding_size=action_cfg.get('encoding_size', 256),
+        action_down_dims=action_cfg.get('down_dims', None),
+        action_num_diffusion_iters=action_cfg.get('num_diffusion_iters', 10),
+        action_stats_min=action_cfg.get('action_stats_min', [-0.17, -0.03]),
+        action_stats_max=action_cfg.get('action_stats_max', [0.19, 0.31]),
+        
+        # Stop
+        enable_stop_head=stop_cfg.get('enable', True),
+        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
+        stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
+        
+        verbose=True,
     )
     
-    model = SpatialMLLMPipeline(pipeline_config)
+    model = VLNPipeline(config)
     
-    print(f"✅ 模型已构建：SpatialMLLMPipeline + Dual Heatmap Heads + ActionHead")
-    print(f"   VGGT → {model_cfg['vggt_gpu']}")
-    print(f"   DINOv3 → {model_cfg['dinov3_gpu']}")
-    print(f"   Qwen2.5-VL → {model_cfg['llm_gpu']} (frozen)")
-    print(f"   HistoryHeatmapHead → enabled={enable_history}")
-    print(f"   FutureHeatmapHead → enabled={enable_future}")
-    print(f"   ActionHead → enabled={model_cfg['action_head']['enable']}")
-    print(f"   StopHead → enabled={model_cfg.get('stop_head', {}).get('enable', False)}")
+    print(f"✅ VLN Pipeline 已构建")
+    print(f"   Qwen3-VL → {llm_cfg.get('model_path', './models/qwen_3_vl')}")
+    print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}")
+    print(f"   FutureHeatmapHead → enabled={heatmap_cfg.get('enable_future', True)}")
+    print(f"   ActionHead → enabled={action_cfg.get('enable', True)}")
+    print(f"   StopHead → enabled={stop_cfg.get('enable', True)}")
     
     return model
 
@@ -663,21 +568,20 @@ def freeze_module(module: nn.Module, freeze: bool = True):
         param.requires_grad = not freeze
 
 
-def set_trainable_modules(model: SpatialMLLMPipeline, stage_cfg: Dict, logger):
+def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
     """根据阶段配置设置可训练模块"""
-    # 1) 先全部冻结
+    # 先全部冻结
     freeze_module(model, freeze=True)
     
-    # 2) 根据配置解冻特定模块
     trainable = stage_cfg.get('trainable_modules', [])
     
-    # History Heatmap Head (Diffusion)
+    # History Heatmap Head
     if 'history_heatmap_head' in trainable:
         if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
             freeze_module(model.history_heatmap_head, freeze=False)
             logger.info("  ✓ Unfrozen: history_heatmap_head")
             
-    # Future Heatmap Head (Diffusion)
+    # Future Heatmap Head
     if 'future_heatmap_head' in trainable:
         if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
             freeze_module(model.future_heatmap_head, freeze=False)
@@ -689,66 +593,30 @@ def set_trainable_modules(model: SpatialMLLMPipeline, stage_cfg: Dict, logger):
             freeze_module(model.action_head, freeze=False)
             logger.info("  ✓ Unfrozen: action_head")
     
-    # 🆕 Stop head
+    # Stop head
     if 'stop_head' in trainable:
         if hasattr(model, 'stop_head') and model.stop_head is not None:
             freeze_module(model.stop_head, freeze=False)
             logger.info("  ✓ Unfrozen: stop_head")
     
-    # Feature fusion & projector
-    if 'feature_fusion' in trainable:
-        if hasattr(model, 'feature_fusion'):
-            freeze_module(model.feature_fusion, freeze=False)
-            logger.info("  ✓ Unfrozen: feature_fusion")
-    
-    if 'vggt_feature_projection' in trainable:
-        if hasattr(model, 'vggt_feature_projection'):
-            freeze_module(model.vggt_feature_projection, freeze=False)
-            logger.info("  ✓ Unfrozen: vggt_feature_projection")
-    
+    # LLM Projector
     if 'llm_projector' in trainable:
         if hasattr(model, 'llm_projector'):
             freeze_module(model.llm_projector, freeze=False)
             logger.info("  ✓ Unfrozen: llm_projector")
     
-    # Encoders
-    if 'vggt' in trainable:
-        if hasattr(model, 'vggt'):
-            freeze_module(model.vggt, freeze=False)
-            logger.info("  ✓ Unfrozen: vggt")
-    
-    if 'dinov3_compat' in trainable:
-        if hasattr(model, 'dinov3_compat'):
-            freeze_module(model.dinov3_compat, freeze=False)
-            logger.info("  ✓ Unfrozen: dinov3_compat")
-    
-    # 🔧 DINOv3 适配器层：只解冻 feature_adapter 和 vggt_aligner，保持 ViT backbone 冻结
-    if 'dinov3_adapters' in trainable:
-        if hasattr(model, 'dinov3_compat'):
-            # 先全部冻结 dinov3_compat
-            freeze_module(model.dinov3_compat, freeze=True)
-            # 只解冻适配器层
-            if hasattr(model.dinov3_compat, 'feature_adapter'):
-                freeze_module(model.dinov3_compat.feature_adapter, freeze=False)
-                logger.info("  ✓ Unfrozen: dinov3_compat.feature_adapter")
-            if hasattr(model.dinov3_compat, 'vggt_aligner'):
-                freeze_module(model.dinov3_compat.vggt_aligner, freeze=False)
-                logger.info("  ✓ Unfrozen: dinov3_compat.vggt_aligner")
-    
-    # 3) LLM 始终冻结
-    if hasattr(model, 'llm_integration') and model.llm_integration is not None:
-        freeze_module(model.llm_integration, freeze=True)
+    # Qwen3-VL 始终冻结
+    if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
+        freeze_module(model.qwen3_vl, freeze=True)
 
 
-def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
+def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
     """构建分层学习率优化器"""
     optim_cfg = cfg['optim']
     param_groups = []
     
-    # 1) 热力图头 (Diffusion-based)
-    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-3))
-    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-3))
-    
+    # History Heatmap Head
+    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 3e-4))
     if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
         hist_params = [p for p in model.history_heatmap_head.parameters() if p.requires_grad]
         if hist_params:
@@ -759,6 +627,8 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: history_heatmap_head (lr={hist_lr})")
     
+    # Future Heatmap Head
+    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 3e-4))
     if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
         fut_params = [p for p in model.future_heatmap_head.parameters() if p.requires_grad]
         if fut_params:
@@ -769,8 +639,8 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: future_heatmap_head (lr={fut_lr})")
     
-    # 2) 动作头
-    action_lr = optim_cfg.get('action_lr', 1e-3)
+    # Action Head
+    action_lr = optim_cfg.get('action_lr', 3e-4)
     if hasattr(model, 'action_head') and model.action_head is not None:
         action_params = [p for p in model.action_head.parameters() if p.requires_grad]
         if action_params:
@@ -781,8 +651,8 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: action_head (lr={action_lr})")
     
-    # 🆕 2.5) Stop 预测头
-    stop_lr = optim_cfg.get('stop_lr', action_lr)  # 默认使用 action_lr
+    # Stop Head
+    stop_lr = optim_cfg.get('stop_lr', action_lr)
     if hasattr(model, 'stop_head') and model.stop_head is not None:
         stop_params = [p for p in model.stop_head.parameters() if p.requires_grad]
         if stop_params:
@@ -793,32 +663,9 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
             })
             print(f"  Param group: stop_head (lr={stop_lr})")
     
-    # 3) feature_fusion 模块
-    if hasattr(model, 'feature_fusion'):
-        fusion_params = [p for p in model.feature_fusion.parameters() if p.requires_grad]
-        if fusion_params:
-            param_groups.append({
-                'params': fusion_params,
-                'lr': optim_cfg['fusion_lr'],
-                'name': 'feature_fusion'
-            })
-            print(f"  Param group: feature_fusion (lr={optim_cfg['fusion_lr']})")
-    
-    # 3.5) vggt_feature_projection 模块（VGGT 3D特征投影，使用与 fusion 相同的学习率）
-    if hasattr(model, 'vggt_feature_projection'):
-        vggt_proj_lr = optim_cfg.get('vggt_projection_lr', optim_cfg['fusion_lr'])
-        vggt_proj_params = [p for p in model.vggt_feature_projection.parameters() if p.requires_grad]
-        if vggt_proj_params:
-            param_groups.append({
-                'params': vggt_proj_params,
-                'lr': vggt_proj_lr,
-                'name': 'vggt_feature_projection'
-            })
-            print(f"  Param group: vggt_feature_projection (lr={vggt_proj_lr})")
-    
-    # 4) llm_projector 模块（独立学习率，更稳定）
+    # LLM Projector
+    proj_lr = optim_cfg.get('llm_projector_lr', 1e-4)
     if hasattr(model, 'llm_projector'):
-        proj_lr = optim_cfg.get('llm_projector_lr', optim_cfg['fusion_lr'])
         proj_params = [p for p in model.llm_projector.parameters() if p.requires_grad]
         if proj_params:
             param_groups.append({
@@ -827,46 +674,6 @@ def build_optimizer(model: SpatialMLLMPipeline, cfg: Dict, stage_cfg: Dict) -> t
                 'name': 'llm_projector'
             })
             print(f"  Param group: llm_projector (lr={proj_lr})")
-    
-    # 4.5) DINOv3 适配器层（feature_adapter + vggt_aligner）
-    if hasattr(model, 'dinov3_compat'):
-        dinov3_adapter_lr = optim_cfg.get('dinov3_adapter_lr', optim_cfg['fusion_lr'])
-        dinov3_adapter_params = []
-        if hasattr(model.dinov3_compat, 'feature_adapter'):
-            dinov3_adapter_params.extend([p for p in model.dinov3_compat.feature_adapter.parameters() if p.requires_grad])
-        if hasattr(model.dinov3_compat, 'vggt_aligner'):
-            dinov3_adapter_params.extend([p for p in model.dinov3_compat.vggt_aligner.parameters() if p.requires_grad])
-        if dinov3_adapter_params:
-            param_groups.append({
-                'params': dinov3_adapter_params,
-                'lr': dinov3_adapter_lr,
-                'name': 'dinov3_adapters'
-            })
-            print(f"  Param group: dinov3_adapters (lr={dinov3_adapter_lr})")
-    
-    # 5) 编码器（排除已添加到其他参数组的子模块）
-    # 收集已添加的参数 id，避免重复
-    added_param_ids = set()
-    for pg in param_groups:
-        for p in pg['params']:
-            added_param_ids.add(id(p))
-    
-    encoder_params = []
-    if hasattr(model, 'vggt'):
-        for p in model.vggt.parameters():
-            if p.requires_grad and id(p) not in added_param_ids:
-                encoder_params.append(p)
-    if hasattr(model, 'dinov3_compat'):
-        for p in model.dinov3_compat.parameters():
-            if p.requires_grad and id(p) not in added_param_ids:
-                encoder_params.append(p)
-    if encoder_params:
-        param_groups.append({
-            'params': encoder_params,
-            'lr': optim_cfg['encoder_lr'],
-            'name': 'encoders'
-        })
-        print(f"  Param group: encoders (lr={optim_cfg['encoder_lr']})")
     
     if not param_groups:
         raise ValueError("No trainable parameters found!")
@@ -911,7 +718,7 @@ def build_scheduler(optimizer, cfg: Dict, total_steps: int):
 # ============================================
 
 def train_one_epoch(
-    model: SpatialMLLMPipeline,
+    model: VLNPipeline,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler,
@@ -927,17 +734,13 @@ def train_one_epoch(
     stage_cfg: Dict = None,
     max_batches: int = None,
 ) -> Dict[str, float]:
-    """训练一个 epoch
-    
-    Args:
-        max_batches: 最大 batch 数（用于快速调试，None 表示不限制）
-    """
+    """训练一个 epoch"""
     
     model.train()
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
-    total_stop_loss = 0.0  # 🆕
+    total_stop_loss = 0.0
     num_batches = 0
     
     optim_cfg = cfg['optim']
@@ -948,15 +751,13 @@ def train_one_epoch(
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
     
-    device = torch.device(cfg['model']['llm_gpu'])
+    device = torch.device(cfg['model'].get('device', 'cuda'))
     
-    # 确定实际的 batch 数量
     total_batches = len(train_loader)
     if max_batches is not None:
         total_batches = min(total_batches, max_batches)
         logger.info(f"  ⚡ 快速调试模式: 只处理 {total_batches} batches")
     
-    # 进度条
     pbar = tqdm(
         train_loader,
         desc=f"[Stage {stage_idx+1}] Epoch {epoch}/{stage_cfg['epochs']}",
@@ -968,202 +769,84 @@ def train_one_epoch(
     valid_batch_count = 0
     
     for i, batch in enumerate(pbar):
-        # 快速调试模式：限制 batch 数量
         if max_batches is not None and i >= max_batches:
-            logger.info(f"  ⚡ 达到 max_batches={max_batches}，提前结束 epoch")
             break
         
         # 准备数据
-        # 将 history_frames 和 current_frame 合并为视频帧序列
-        history_frames = batch['history_frames']  # [B, K, 3, H, W]
-        current_frame = batch['current_frame']    # [B, 3, H, W]
+        history_frames = batch['history_frames']
+        current_frame = batch['current_frame']
         
         B, K, C, H, W = history_frames.shape
         
-        # 合并为 [B, K+1, 3, H, W]
         video_frames = torch.cat([
             history_frames,
             current_frame.unsqueeze(1)
         ], dim=1)
         
-        # GT 热力图和动作
-        gt_heatmap = batch['heatmap'].to(device)        # [B, Hm, Wm]
-        gt_action = batch['action'].to(device)          # [B, 2]
-        action_valid = batch['action_valid'].to(device) # [B]
-        # 🆕 Stop Prediction
-        is_stop = batch['is_stop'].to(device)           # [B]
+        gt_heatmap = batch['heatmap'].to(device)
+        gt_action = batch['action'].to(device)
+        action_valid = batch['action_valid'].to(device)
+        is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
-        # 🔍 [DIAG] 诊断打印：第一个 epoch 的第一个 batch 打印完整数据分布
-        if epoch == 1 and i == 0:
-            from src.models.action.utils import normalize_actions, ActionStats
-            action_stats_min = cfg.get('model', {}).get('action_head', {}).get('action_stats_min', [-0.5, -0.2])
-            action_stats_max = cfg.get('model', {}).get('action_head', {}).get('action_stats_max', [0.5, 1.0])
-            stats = ActionStats(min=action_stats_min, max=action_stats_max)
-            normalized = normalize_actions(gt_action, stats)
-            
-            logger.info(f"[DIAG] ========== Data Distribution Diagnostics ==========")
-            logger.info(f"[DIAG] 1. Action Statistics:")
-            logger.info(f"[DIAG]    action_valid: {action_valid.sum().item():.0f}/{len(action_valid)} ({action_valid.float().mean().item()*100:.1f}%)")
-            logger.info(f"[DIAG]    gt_action range: min=[{gt_action[:, 0].min().item():.4f}, {gt_action[:, 1].min().item():.4f}], max=[{gt_action[:, 0].max().item():.4f}, {gt_action[:, 1].max().item():.4f}]")
-            logger.info(f"[DIAG]    gt_action mean/std: mean=[{gt_action[:, 0].mean().item():.4f}, {gt_action[:, 1].mean().item():.4f}], std=[{gt_action[:, 0].std().item():.4f}, {gt_action[:, 1].std().item():.4f}]")
-            logger.info(f"[DIAG]    normalized range: min=[{normalized[:, 0].min().item():.4f}, {normalized[:, 1].min().item():.4f}], max=[{normalized[:, 0].max().item():.4f}, {normalized[:, 1].max().item():.4f}]")
-            logger.info(f"[DIAG]    config action_stats: min={action_stats_min}, max={action_stats_max}")
-            logger.info(f"[DIAG] 2. Stop Label Distribution:")
-            logger.info(f"[DIAG]    is_stop: {is_stop.sum().item():.0f}/{len(is_stop)} = {is_stop.mean().item()*100:.2f}% (STOP samples)")
-            logger.info(f"[DIAG] 3. Heatmap Statistics:")
-            logger.info(f"[DIAG]    gt_heatmap: mean={gt_heatmap.mean().item():.4f}, max={gt_heatmap.max().item():.4f}, std={gt_heatmap.std().item():.4f}")
-            logger.info(f"[DIAG]    gt_heatmap non-zero ratio: {(gt_heatmap > 0.01).float().mean().item()*100:.2f}%")
-            logger.info(f"[DIAG] ========================================================")
-        
         # 处理导航指令
-        # 注意：Qwen2.5-VL 当前只支持单一指令输入
-        # 如果 batch 中有不同指令，合并为一个（用分隔符连接）
         if text and len(text) > 0:
-            unique_texts = list(set(t for t in text if t))  # 去重非空指令
-            if len(unique_texts) == 0:
-                instruction_text = None
-            elif len(unique_texts) == 1:
-                instruction_text = unique_texts[0]
-            else:
-                # 多个不同指令：合并（实际场景中同一 batch 的指令通常相同）
-                instruction_text = unique_texts[0]  # 使用第一个非空指令
-                if i == 0:  # 只在第一个 batch 警告一次
-                    logger.warning(f"Batch contains {len(unique_texts)} different instructions, using first one")
+            unique_texts = list(set(t for t in text if t))
+            instruction_text = unique_texts[0] if unique_texts else None
         else:
             instruction_text = None
         
         # 前向传播
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            # 模型前向
             output = model(
                 video_frames=video_frames,
                 instruction_text=instruction_text,
-                current_observation=current_frame.to(device),  # 显式传递当前观测
+                current_observation=current_frame.to(device),
                 return_heatmaps=True,
                 return_actions=train_action,
-                gt_actions=gt_action.unsqueeze(1) if train_action else None,  # [B, 1, 2]
-                action_valid=action_valid if train_action else None,  # action mask
-                gt_stop=is_stop if train_action else None,  # 🆕 Stop 标签
-                gt_history_heatmap=gt_heatmap if train_history else None,  # 🆕 GT history heatmap
-                gt_future_heatmap=gt_heatmap if train_future else None,    # 🆕 GT future heatmap
+                gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                action_valid=action_valid if train_action else None,
+                gt_stop=is_stop if train_action else None,
+                gt_history_heatmap=gt_heatmap if train_history else None,
+                gt_future_heatmap=gt_heatmap if train_future else None,
             )
             
-            # ========== 统一 Loss 计算 ==========
-            # 1. Heatmap Loss（优先使用 diffusion loss）
+            # Heatmap Loss
             heatmap_loss = torch.tensor(0.0, device=device)
-            heatmap_diag = {}  # 🔍 热力图诊断信息
             loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
             
-            if train_history:
-                # 优先使用 diffusion loss
-                if 'history_heatmap_loss' in output:
-                    heatmap_loss = output['history_heatmap_loss']
-                    logger.info(f"  使用 History Diffusion Loss: {heatmap_loss.item():.4f}")
-                    # 提取诊断信息
-                    if 'history_heatmap_noise_std' in output:
-                        heatmap_diag['noise_std'] = output['history_heatmap_noise_std']
-                        heatmap_diag['noise_pred_std'] = output['history_heatmap_noise_pred_std']
-                else:
-                    # 回退到外部 MSE loss（兼容模式）
-                    pred_heatmap = output.get('history_heatmaps')  # [B, K, H, W]
-                    if pred_heatmap is not None:
-                        # 取最后一帧的预测（对应当前帧）
-                        pred_hm = pred_heatmap[:, -1, :, :]  # [B, H, W]
-                        
-                        # 调整尺寸如果需要
-                        if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                            pred_hm = torch.nn.functional.interpolate(
-                                pred_hm.unsqueeze(1),
-                                size=gt_heatmap.shape[-2:],
-                                mode='bilinear',
-                                align_corners=False
-                            ).squeeze(1)
-                        
-                        # 使用统一的损失计算函数
-                        heatmap_loss = compute_heatmap_loss(
-                            heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                        )
-                        logger.info(f"  使用外部 MSE Loss (fallback): {heatmap_loss.item():.4f}")
+            if train_history and 'history_heatmap_loss' in output:
+                heatmap_loss = output['history_heatmap_loss']
             
-            if train_future:
-                # 优先使用 diffusion loss
-                if 'future_heatmap_loss' in output:
-                    fut_loss = output['future_heatmap_loss']
-                    logger.info(f"  使用 Future Diffusion Loss: {fut_loss.item():.4f}")
-                    heatmap_loss = heatmap_loss + fut_loss
-                else:
-                    # 回退到外部 MSE loss（兼容模式）
-                    pred_fut = output.get('future_heatmaps')
-                    if pred_fut is not None:
-                        pred_hm = pred_fut[:, -1, :, :]
-                        if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                            pred_hm = torch.nn.functional.interpolate(
-                                pred_hm.unsqueeze(1),
-                                size=gt_heatmap.shape[-2:],
-                                mode='bilinear',
-                                align_corners=False
-                            ).squeeze(1)
-                        
-                        fut_loss = compute_heatmap_loss(
-                            heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                        )
-                        heatmap_loss = heatmap_loss + fut_loss
-                        logger.info(f"  使用外部 MSE Loss (fallback): {fut_loss.item():.4f}")
+            if train_future and 'future_heatmap_loss' in output:
+                heatmap_loss = heatmap_loss + output['future_heatmap_loss']
+            
+            # Action Loss
             action_loss = torch.tensor(0.0, device=device)
-            action_diag = {}  # 诊断信息
-            
             if train_action and 'action_cond' in output:
-                # 使用 action_head.compute_loss() 统一计算
                 action_result = model.action_head.compute_loss(
                     output['action_cond'], 
                     gt_action.unsqueeze(1),
                     action_valid
                 )
                 action_loss = action_result['loss']
-                action_diag = {
-                    'noise_std': action_result.get('noise_std'),
-                    'noise_pred_std': action_result.get('noise_pred_std'),
-                    'mse': action_result.get('mse'),
-                }
             
-            # 3. Stop Loss（统一在外部计算）
+            # Stop Loss
             stop_loss = torch.tensor(0.0, device=device)
             if train_action and 'stop_logits' in output:
-                # 使用 stop_head.compute_loss() 统一计算
                 stop_loss = model.stop_head.compute_loss(
                     output['stop_logits'],
                     is_stop,
                     action_valid
                 )
             
-            # ========== 总损失 ==========
+            # 总损失
             heatmap_weight = loss_cfg.get('history_weight', 1.0) if train_history else loss_cfg.get('future_weight', 1.0)
-            action_weight = loss_cfg.get('action_weight', 0.5)
-            stop_weight = loss_cfg.get('stop_weight', 0.5)  # 🆕 Stop 损失权重
+            action_weight = loss_cfg.get('action_weight', 1.0)
+            stop_weight = loss_cfg.get('stop_weight', 0.5)
             
             loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
             loss = loss / grad_accum_steps
-            
-            # 🔍 [DIAG] 模型输出诊断：检查是否坍缩为全零
-            if epoch == 1 and i == 0:
-                logger.info(f"[DIAG] ========== Model Output Diagnostics ==========")
-                if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
-                    pred_hm = output['history_heatmaps']
-                    logger.info(f"[DIAG] pred_heatmap: mean={pred_hm.mean().item():.4f}, max={pred_hm.max().item():.4f}, std={pred_hm.std().item():.4f}")
-                    logger.info(f"[DIAG] pred_heatmap non-zero: {(pred_hm > 0.01).float().mean().item()*100:.2f}%")
-                
-                if 'stop_logits' in output:
-                    stop_logits = output['stop_logits']
-                    stop_probs = torch.sigmoid(stop_logits)
-                    logger.info(f"[DIAG] stop_logits: mean={stop_logits.mean().item():.4f}, std={stop_logits.std().item():.4f}")
-                    logger.info(f"[DIAG] stop_prob: mean={stop_probs.mean().item():.4f}, max={stop_probs.max().item():.4f}")
-                    logger.info(f"[DIAG] stop predictions: {(stop_probs > 0.5).sum().item()}/{len(stop_probs)} samples predict STOP")
-                
-                if action_diag:
-                    logger.info(f"[DIAG] action noise_std: {action_diag.get('noise_std', 'N/A')}")
-                    logger.info(f"[DIAG] action noise_pred_std: {action_diag.get('noise_pred_std', 'N/A')}")
-                logger.info(f"[DIAG] ======================================================")
         
         # 反向传播
         scaler.scale(loss).backward()
@@ -1201,125 +884,9 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
                     tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)
                     tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
-                    
-                    # Action valid ratio - 监控有效样本比例
-                    tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
-                    
-                    # 🆕 固定间隔诊断信息记录
-                    diag_interval = cfg['log'].get('diag_interval', 100)
-                    if global_step % diag_interval == 0:
-                        # 🔍 [DIAG-HM-DIFF] Heatmap Diffusion diagnostics - 检查噪声预测质量
-                        if heatmap_diag:
-                            if heatmap_diag.get('noise_std') is not None:
-                                tb_writer.add_scalar('diag/heatmap_noise_std', heatmap_diag['noise_std'], actual_step)
-                                tb_writer.add_scalar('diag/heatmap_noise_pred_std', heatmap_diag['noise_pred_std'], actual_step)
-                                logger.info(
-                                    f"[DIAG-HM-DIFF] heatmap noise_std={heatmap_diag['noise_std']:.3f}, "
-                                    f"pred_std={heatmap_diag['noise_pred_std']:.3f}"
-                                )
-                                # 如果预测的噪声标准差远小于真实噪声（应该是~1.0），说明模型没有有效学习
-                                if heatmap_diag['noise_pred_std'] < 0.5:
-                                    logger.warning(
-                                        f"[DIAG-HM-DIFF] ⚠️ 热力图噪声预测质量差！"
-                                        f"pred_std={heatmap_diag['noise_pred_std']:.3f} < 0.5"
-                                    )
-                        
-                        # Action diffusion diagnostics
-                        if action_diag:
-                            if action_diag.get('noise_std') is not None:
-                                tb_writer.add_scalar('diag/action_noise_std', action_diag['noise_std'].item(), actual_step)
-                                tb_writer.add_scalar('diag/action_noise_pred_std', action_diag['noise_pred_std'].item(), actual_step)
-                                tb_writer.add_scalar('diag/action_mse', action_diag['mse'].item(), actual_step)
-                                # 固定间隔日志打印
-                                logger.info(
-                                    f"[DIAG-ACTION] noise_std={action_diag['noise_std'].item():.3f}, "
-                                    f"pred_std={action_diag['noise_pred_std'].item():.3f}, "
-                                    f"mse={action_diag['mse'].item():.4f}"
-                                )
-                        
-                        # 🔍 [DIAG-HM] Heatmap output diagnostics - 检查是否坍缩为全黑
-                        if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
-                            pred_hm = output['history_heatmaps'].detach()
-                            pred_mean = pred_hm.mean().item()
-                            pred_max = pred_hm.max().item()
-                            pred_std = pred_hm.std().item()
-                            
-                            tb_writer.add_scalar('diag/pred_heatmap_mean', pred_mean, actual_step)
-                            tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
-                            tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
-                            
-                            # 与 GT 对比
-                            gt_mean = gt_heatmap.mean().item()
-                            gt_max = gt_heatmap.max().item()
-                            
-                            # 诊断日志
-                            logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
-                            logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
-                            
-                            # ⚠️ 坍缩检测：如果预测热力图最大值 < 0.1，警告
-                            if pred_max < 0.1:
-                                logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
-                            
-                            # 检查是否都接近 0（全黑）
-                            non_zero_ratio = (pred_hm > 0.01).float().mean().item()
-                            tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
-                            if non_zero_ratio < 0.05:  # 少于 5% 的像素 > 0.01
-                                logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
-                        
-                        # Stop prediction diagnostics
-                        if 'stop_logits' in output:
-                            stop_logits = output['stop_logits'].detach()
-                            stop_probs = torch.sigmoid(stop_logits)
-                            tb_writer.add_scalar('diag/stop_prob_mean', stop_probs.mean().item(), actual_step)
-                            tb_writer.add_scalar('diag/stop_prob_max', stop_probs.max().item(), actual_step)
-                            # Calculate stop recall (if any GT stops exist)
-                            if is_stop.sum() > 0:
-                                predicted_stops = (stop_probs > 0.5).float()
-                                stop_recall = (predicted_stops * is_stop).sum() / is_stop.sum()
-                                tb_writer.add_scalar('diag/stop_recall', stop_recall.item(), actual_step)
-                            # Calculate precision (if any predictions exist)
-                            if (stop_probs > 0.5).sum() > 0:
-                                stop_precision = ((stop_probs > 0.5).float() * is_stop).sum() / (stop_probs > 0.5).sum()
-                                tb_writer.add_scalar('diag/stop_precision', stop_precision.item(), actual_step)
-                    
-                    # 归一化后的 action 分布（每 100 步记录一次直方图，避免日志过大）
-                    if global_step % 100 == 0 and 'actions' in output:
-                        actions_tensor = output['actions']
-                        if actions_tensor is not None:
-                            tb_writer.add_histogram('train/predicted_actions', actions_tensor.flatten().cpu(), actual_step)
-                    
-                    # GT action 分布
-                    if global_step % 100 == 0:
-                        tb_writer.add_histogram('train/gt_actions', gt_action.flatten().cpu(), actual_step)
-            
-            # 定期可视化热力图预测
-            vis_interval = cfg['log'].get('vis_every_steps', 500)
-            if global_step % vis_interval == 0 and global_step > 0:
-                vis_path = visualize_heatmap_predictions(
-                    model=model,
-                    batch=batch,
-                    output=output,
-                    epoch=epoch,
-                    step=global_step,
-                    output_dir=Path(cfg['log']['out_dir']),
-                    num_samples=2,
-                )
-                if vis_path and tb_writer is not None:
-                    # 读取可视化图像并写入 TensorBoard
-                    try:
-                        import cv2
-                        vis_img = cv2.imread(str(vis_path))
-                        if vis_img is not None:
-                            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
-                            vis_img = vis_img.transpose(2, 0, 1)  # HWC -> CHW
-                            tb_writer.add_image('train/heatmap_viz', vis_img, actual_step)
-                    except Exception as e:
-                        pass  # 忽略可视化写入错误
         
-        # 清理 output 释放显存
         del output
         
-        # 定期清理显存
         if (i + 1) % 4 == 0:
             gc.collect()
             torch.cuda.empty_cache()
@@ -1327,15 +894,14 @@ def train_one_epoch(
         total_loss += loss.item() * grad_accum_steps
         total_heatmap_loss += heatmap_loss.item()
         total_action_loss += action_loss.item()
-        total_stop_loss += stop_loss.item()  # 🆕
+        total_stop_loss += stop_loss.item()
         num_batches += 1
         
-        # 更新进度条
         pbar.set_postfix({
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
             'hm': f"{heatmap_loss.item():.4f}",
             'act': f"{action_loss.item():.4f}",
-            'stop': f"{stop_loss.item():.4f}",  # 🆕
+            'stop': f"{stop_loss.item():.4f}",
         })
     
     # 处理剩余梯度
@@ -1352,13 +918,13 @@ def train_one_epoch(
         'total_loss': total_loss / max(num_batches, 1),
         'heatmap_loss': total_heatmap_loss / max(num_batches, 1),
         'action_loss': total_action_loss / max(num_batches, 1),
-        'stop_loss': total_stop_loss / max(num_batches, 1),  # 🆕
+        'stop_loss': total_stop_loss / max(num_batches, 1),
     }
 
 
-@torch.inference_mode()  # 比 no_grad 更高效，禁用所有梯度跟踪
+@torch.inference_mode()
 def validate(
-    model: SpatialMLLMPipeline,
+    model: VLNPipeline,
     val_loader: DataLoader,
     cfg: Dict,
     heatmap_criterion: nn.Module,
@@ -1373,7 +939,7 @@ def validate(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
-    total_stop_loss = 0.0  # 🆕
+    total_stop_loss = 0.0
     num_batches = 0
     
     loss_cfg = cfg['loss']
@@ -1382,7 +948,7 @@ def validate(
     train_action = stage_cfg.get('train_action', True)
     loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
     
-    device = torch.device(cfg['model']['llm_gpu'])
+    device = torch.device(cfg['model'].get('device', 'cuda'))
     
     for batch in tqdm(val_loader, desc="Validating"):
         history_frames = batch['history_frames']
@@ -1397,10 +963,9 @@ def validate(
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
-        is_stop = batch['is_stop'].to(device)  # 🆕
+        is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
-        # 处理导航指令（与训练一致）
         if text and len(text) > 0:
             unique_texts = list(set(t for t in text if t))
             instruction_text = unique_texts[0] if unique_texts else None
@@ -1416,7 +981,7 @@ def validate(
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
                 action_valid=action_valid if train_action else None,
-                gt_stop=is_stop if train_action else None,  # 🆕 Stop 标签
+                gt_stop=is_stop if train_action else None,
             )
             
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -1434,7 +999,6 @@ def validate(
                     heatmap_criterion, pred_hm, gt_heatmap, loss_type
                 )
             
-            # 统一在外部计算 action loss
             action_loss = torch.tensor(0.0, device=device)
             if train_action and 'action_cond' in output:
                 action_result = model.action_head.compute_loss(
@@ -1444,7 +1008,6 @@ def validate(
                 )
                 action_loss = action_result['loss']
             
-            # 统一在外部计算 stop loss
             stop_loss = torch.tensor(0.0, device=device)
             if train_action and 'stop_logits' in output:
                 stop_loss = model.stop_head.compute_loss(
@@ -1454,33 +1017,33 @@ def validate(
                 )
             
             heatmap_weight = loss_cfg.get('history_weight', 1.0)
-            action_weight = loss_cfg.get('action_weight', 0.5)
-            stop_weight = loss_cfg.get('stop_weight', 0.5)  # 🆕
+            action_weight = loss_cfg.get('action_weight', 1.0)
+            stop_weight = loss_cfg.get('stop_weight', 0.5)
             loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
         
         total_loss += loss.item()
         total_heatmap_loss += heatmap_loss.item()
         total_action_loss += action_loss.item()
-        total_stop_loss += stop_loss.item()  # 🆕
+        total_stop_loss += stop_loss.item()
         num_batches += 1
     
     avg_loss = total_loss / max(num_batches, 1)
     avg_hm = total_heatmap_loss / max(num_batches, 1)
     avg_act = total_action_loss / max(num_batches, 1)
-    avg_stop = total_stop_loss / max(num_batches, 1)  # 🆕
+    avg_stop = total_stop_loss / max(num_batches, 1)
     
     if tb_writer is not None:
         tb_writer.add_scalar('val/loss', avg_loss, epoch)
         tb_writer.add_scalar('val/heatmap_loss', avg_hm, epoch)
         tb_writer.add_scalar('val/action_loss', avg_act, epoch)
-        tb_writer.add_scalar('val/stop_loss', avg_stop, epoch)  # 🆕
+        tb_writer.add_scalar('val/stop_loss', avg_stop, epoch)
         tb_writer.flush()
     
     return {
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
         'val_action_loss': avg_act,
-        'val_stop_loss': avg_stop,  # 🆕
+        'val_stop_loss': avg_stop,
     }
 
 
@@ -1493,11 +1056,11 @@ class CheckpointManager:
         self.max_ckpts = max_ckpts
         self.best_val_loss = float('inf')
         self.best_ckpt_path = None
-        self.ckpt_history = []  # [(path, val_loss, epoch)]
+        self.ckpt_history = []
     
     def save(
         self,
-        model: SpatialMLLMPipeline,
+        model: VLNPipeline,
         optimizer: torch.optim.Optimizer,
         scheduler,
         epoch: int,
@@ -1508,31 +1071,20 @@ class CheckpointManager:
         is_best: bool = False,
         scaler: GradScaler = None,
     ) -> Path:
-        """保存检查点
-        
-        Args:
-            is_best: 是否是当前最佳模型
-            scaler: GradScaler 用于 AMP 断点续训
-        
-        Returns:
-            保存的检查点路径
-        """
+        """保存检查点"""
         stage_dir = self.out_dir / stage_name
         stage_dir.mkdir(parents=True, exist_ok=True)
         
-        # 收集可训练参数名
         trainable_params = set()
         for name, param in model.named_parameters():
             if param.requires_grad:
                 trainable_params.add(name)
         
-        # 只保存可训练参数（节省空间）
         trainable_state_dict = {
             k: v for k, v in model.state_dict().items()
             if k in trainable_params
         }
         
-        # 构建检查点
         ckpt = {
             'epoch': epoch,
             'stage_idx': stage_idx,
@@ -1545,21 +1097,17 @@ class CheckpointManager:
             'best_val_loss': self.best_val_loss,
         }
         
-        # 保存 GradScaler 状态（AMP）
         if scaler is not None:
             ckpt['scaler_state_dict'] = scaler.state_dict()
         
-        # 保存定期检查点
         ckpt_path = stage_dir / f"epoch_{epoch:03d}.pth"
         torch.save(ckpt, ckpt_path)
         file_size_mb = ckpt_path.stat().st_size / (1024**2)
         print(f"💾 Checkpoint: {ckpt_path.name} ({file_size_mb:.1f} MB)")
         
-        # 记录历史
         val_loss = metrics.get('val_loss', float('inf'))
         self.ckpt_history.append((ckpt_path, val_loss, epoch))
         
-        # 保存最佳模型（全局最佳，放在根目录）
         if is_best:
             self.best_val_loss = val_loss
             best_path = self.out_dir / "best_model.pth"
@@ -1567,17 +1115,15 @@ class CheckpointManager:
             self.best_ckpt_path = best_path
             print(f"⭐ Best model updated: val_loss={val_loss:.4f}")
         
-        # 保存最新检查点（用于恢复训练）
         latest_path = self.out_dir / "latest.pth"
         torch.save(ckpt, latest_path)
         
-        # 清理旧检查点（每个阶段保留 max_ckpts 个）
         self._cleanup_old_ckpts(stage_dir)
         
         return ckpt_path
     
     def _cleanup_old_ckpts(self, stage_dir: Path):
-        """清理旧的检查点，只保留最新的 max_ckpts 个"""
+        """清理旧的检查点"""
         ckpts = sorted(stage_dir.glob("epoch_*.pth"), key=lambda p: p.stat().st_mtime)
         while len(ckpts) > self.max_ckpts:
             old_ckpt = ckpts.pop(0)
@@ -1603,40 +1149,24 @@ class CheckpointManager:
 
 def load_checkpoint_for_resume(
     ckpt_path: str,
-    model: SpatialMLLMPipeline,
+    model: VLNPipeline,
     optimizer: torch.optim.Optimizer = None,
     scheduler = None,
     scaler: GradScaler = None,
     logger = None,
 ) -> Dict:
-    """加载检查点用于断点续训
-    
-    Args:
-        ckpt_path: 检查点路径
-        model: 模型
-        optimizer: 优化器（可选）
-        scheduler: 调度器（可选）
-        scaler: GradScaler（可选，用于 AMP）
-        logger: 日志器
-    
-    Returns:
-        包含 epoch, stage_idx, stage_name, metrics, best_val_loss 的字典
-    """
+    """加载检查点用于断点续训"""
     if logger:
         logger.info(f"📂 Loading checkpoint: {ckpt_path}")
     
     ckpt = torch.load(ckpt_path, map_location='cpu')
     
-    # 加载模型参数
     state_dict = ckpt.get('trainable_state_dict', {})
     if state_dict:
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if logger:
             logger.info(f"  ✓ Loaded {len(state_dict)} trainable parameters")
-            if missing:
-                logger.info(f"  Missing keys: {len(missing)} (using pretrained)")
     
-    # 加载优化器状态
     if optimizer is not None and 'optimizer_state_dict' in ckpt:
         try:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -1646,7 +1176,6 @@ def load_checkpoint_for_resume(
             if logger:
                 logger.warning(f"  ⚠ Failed to restore optimizer: {e}")
     
-    # 加载调度器状态
     if scheduler is not None and 'scheduler_state_dict' in ckpt:
         try:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
@@ -1656,7 +1185,6 @@ def load_checkpoint_for_resume(
             if logger:
                 logger.warning(f"  ⚠ Failed to restore scheduler: {e}")
     
-    # 加载 GradScaler 状态（AMP）
     if scaler is not None and 'scaler_state_dict' in ckpt:
         try:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
@@ -1675,76 +1203,34 @@ def load_checkpoint_for_resume(
     }
 
 
-# Legacy function for compatibility
-def save_checkpoint(
-    model: SpatialMLLMPipeline,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    stage_name: str,
-    metrics: Dict,
-    cfg: Dict
-):
-    """保存检查点（旧接口，保持兼容）"""
-    out_dir = Path(cfg['log']['out_dir']) / stage_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    ckpt_path = out_dir / f"epoch_{epoch}.pth"
-    
-    trainable_params = set()
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            trainable_params.add(name)
-    
-    trainable_state_dict = {
-        k: v for k, v in model.state_dict().items()
-        if k in trainable_params
-    }
-    
-    torch.save({
-        'epoch': epoch,
-        'stage': stage_name,
-        'trainable_state_dict': trainable_state_dict,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'metrics': metrics,
-        'config': cfg
-    }, ckpt_path)
-    
-    file_size_mb = ckpt_path.stat().st_size / (1024**2)
-    print(f"💾 Checkpoint saved: {ckpt_path} ({file_size_mb:.1f} MB)")
-
-
 # ============================================
 # 主函数
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="History + Action 训练脚本")
-    parser.add_argument('--config', type=str, default='configs/training_config_full_model.yaml',
+    parser = argparse.ArgumentParser(description="VLN 训练脚本")
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                         help='配置文件路径')
     parser.add_argument('--resume', type=str, default=None, 
                         help='从检查点恢复（路径或 "latest"）')
     parser.add_argument('--auto-resume', action='store_true',
-                        help='自动从最新检查点恢复（如果存在）')
+                        help='自动从最新检查点恢复')
     
-    # 阶段控制参数
     parser.add_argument('--stage', type=str, default=None,
-                        help='指定运行的阶段名称（如 warmup_64, mid_128, full_224）')
+                        help='指定运行的阶段名称')
     parser.add_argument('--stage-index', type=int, default=None,
-                        help='指定运行的阶段索引（0, 1, 2...）')
+                        help='指定运行的阶段索引')
     parser.add_argument('--stage-only', action='store_true',
-                        help='只运行指定的单个阶段，不继续后续阶段')
+                        help='只运行指定的单个阶段')
     parser.add_argument('--start-epoch', type=int, default=1,
-                        help='从指定 epoch 开始训练（默认 1）')
+                        help='从指定 epoch 开始训练')
     parser.add_argument('--epochs', type=int, default=None,
                         help='覆盖配置中的 epoch 数量')
     
-    # 调试参数
     parser.add_argument('--dry-run', action='store_true',
-                        help='只构建模型和数据，不实际训练（用于测试配置）')
+                        help='只构建模型和数据，不实际训练')
     parser.add_argument('--max-batches', type=int, default=None,
-                        help='每个 epoch 最多处理的 batch 数（用于快速调试）')
+                        help='每个 epoch 最多处理的 batch 数')
     
     args = parser.parse_args()
     
@@ -1762,25 +1248,20 @@ def main():
     if cfg['log'].get('use_tensorboard', False):
         tb_dir = Path(cfg['log'].get('tensorboard_dir', './runs'))
         tb_dir.mkdir(parents=True, exist_ok=True)
-        from datetime import datetime
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        tb_writer = SummaryWriter(log_dir=str(tb_dir / f'history_action_{timestamp}'))
-        logger.info(f"📊 TensorBoard: {tb_dir / f'history_action_{timestamp}'}")
+        tb_writer = SummaryWriter(log_dir=str(tb_dir / f'vln_training_{timestamp}'))
+        logger.info(f"📊 TensorBoard: {tb_dir / f'vln_training_{timestamp}'}")
     
-    # 损失函数配置（每个阶段可能不同）
     loss_cfg = cfg['loss']
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
-    logger.info(f"📊 Default heatmap loss type: {default_loss_type}")
     
     logger.info("=" * 60)
-    logger.info("History + Action 训练")
+    logger.info("VLN 训练 (Qwen3-VL)")
     logger.info("=" * 60)
     
     # 构建数据集
-    logger.info("📂 Loading datasets (VLNSlidingWindowDataset)...")
+    logger.info("📂 Loading datasets...")
     sw_cfg = cfg['data']['sliding_window']
-    
-    # 采样步长：控制训练速度（stride=5 表示样本数减少 5 倍）
     sample_stride = sw_cfg.get('sample_stride', 1)
     
     train_dataset = VLNSlidingWindowDataset(
@@ -1795,7 +1276,7 @@ def main():
         sample_stride=sample_stride,
     )
     
-    val_split = cfg['data'].get('val_split', 'val')  # 支持 val_unseen 等
+    val_split = cfg['data'].get('val_split', 'val')
     val_dataset = VLNSlidingWindowDataset(
         root=cfg['data']['root'],
         split=val_split,
@@ -1805,7 +1286,7 @@ def main():
         hm_size=tuple(cfg['data']['init_hm_size']),
         load_depth=sw_cfg.get('load_depth', True),
         cache_poses=sw_cfg.get('cache_poses', True),
-        sample_stride=sample_stride,  # 验证集也使用相同步长
+        sample_stride=sample_stride,
     )
     
     logger.info(f"  Train: {len(train_dataset)} samples")
@@ -1823,34 +1304,22 @@ def main():
     
     # 创建通知器
     notifier = create_notifier(cfg)
-    if notifier:
-        logger.info("📢 飞书通知已启用")
     
     # 创建训练曲线绘制器
     plotter = TrainingPlotter(out_dir=log_dir)
-    logger.info(f"📈 训练曲线将保存至: {log_dir / 'training_curves.png'}")
     
     # 断点续训
     resume_epoch = 0
     resume_stage_idx = 0
     resume_path = None
     
-    # 确定恢复路径
     if args.resume:
-        # 显式指定检查点路径
         if args.resume == 'latest':
             resume_path = ckpt_manager.get_latest()
-            if resume_path is None:
-                logger.warning("⚠️ No latest checkpoint found, starting from scratch")
         else:
             resume_path = Path(args.resume)
     elif args.auto_resume:
-        # 自动检测最新检查点
         resume_path = ckpt_manager.get_latest()
-        if resume_path:
-            logger.info(f"🔄 Auto-resume: Found checkpoint {resume_path}")
-        else:
-            logger.info("🆕 Auto-resume: No checkpoint found, starting fresh")
     
     if resume_path and Path(resume_path).exists():
         resume_info = load_checkpoint_for_resume(
@@ -1859,13 +1328,10 @@ def main():
         resume_epoch = resume_info['epoch']
         resume_stage_idx = resume_info['stage_idx']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
-        logger.info(f"  📌 Resuming from epoch {resume_epoch}, stage {resume_stage_idx}")
-        logger.info(f"  📊 Best val_loss so far: {ckpt_manager.best_val_loss:.4f}")
     
-    # Dry run 模式
     if args.dry_run:
         logger.info("=" * 60)
-        logger.info("🧪 Dry run 模式：模型和数据构建成功，退出")
+        logger.info("🧪 Dry run 模式：模型和数据构建成功")
         logger.info("=" * 60)
         return
     
@@ -1873,30 +1339,21 @@ def main():
     all_stages = cfg['training']['stages']
     stage_names = [s['name'] for s in all_stages]
     
-    # 确定起始阶段
-    start_stage_idx = resume_stage_idx  # 默认使用恢复的阶段
+    start_stage_idx = resume_stage_idx
     if args.stage_index is not None:
         start_stage_idx = args.stage_index
-        logger.info(f"📌 使用阶段索引: {start_stage_idx}")
     elif args.stage is not None:
         if args.stage in stage_names:
             start_stage_idx = stage_names.index(args.stage)
-            logger.info(f"📌 使用阶段名称: {args.stage} (index={start_stage_idx})")
         else:
             logger.error(f"❌ 未知阶段名称: {args.stage}")
-            logger.error(f"   可用阶段: {stage_names}")
             return
     
-    # 确定结束阶段
     if args.stage_only:
         end_stage_idx = start_stage_idx + 1
-        logger.info(f"📌 只运行单个阶段: {stage_names[start_stage_idx]}")
     else:
         end_stage_idx = len(all_stages)
-        if start_stage_idx > 0:
-            logger.info(f"📌 从阶段 {start_stage_idx} 运行到最后")
     
-    # 打印阶段信息
     logger.info("=" * 60)
     logger.info("📋 训练阶段计划:")
     for i, s in enumerate(all_stages):
@@ -1904,31 +1361,17 @@ def main():
         logger.info(f"  {marker} Stage {i}: {s['name']} ({s['epochs']} epochs, hm={s['hm_size']})")
     logger.info("=" * 60)
     
-    # 计算总 epoch 数
     total_all_epochs = sum(s['epochs'] for s in all_stages[start_stage_idx:end_stage_idx])
-    global_epoch_counter = 0  # 全局 epoch 计数器
-    
-    # 发送训练开始通知
-    if notifier:
-        try:
-            notifier.send_training_start(
-                config_name=Path(args.config).stem,
-                stages=all_stages[start_stage_idx:end_stage_idx],
-                total_epochs=total_all_epochs,
-            )
-        except Exception as e:
-            logger.warning(f"发送开始通知失败: {e}")
+    global_epoch_counter = 0
     
     # 多阶段训练
     for stage_idx in range(start_stage_idx, end_stage_idx):
         stage_cfg = all_stages[stage_idx]
         stage_name = stage_cfg['name']
         
-        # 覆盖 epoch 数量
         if args.epochs is not None:
             stage_cfg = stage_cfg.copy()
             stage_cfg['epochs'] = args.epochs
-            logger.info(f"📌 覆盖 epochs: {args.epochs}")
         
         logger.info("=" * 60)
         logger.info(f"🚀 Stage {stage_idx + 1}/{len(all_stages)}: {stage_name}")
@@ -1944,18 +1387,14 @@ def main():
         # 构建本阶段的热力图损失函数
         stage_loss_type = stage_cfg.get('heatmap_loss_type', default_loss_type)
         heatmap_criterion = build_heatmap_loss(loss_cfg, stage_loss_type)
-        logger.info(f"  🎯 Heatmap loss: {stage_loss_type} ({type(heatmap_criterion).__name__})")
         
         logger.info(f"  Heatmap size: {hm_size}")
-        logger.info(f"  Train history: {stage_cfg.get('train_history', True)}")
-        logger.info(f"  Train future: {stage_cfg.get('train_future', False)}")
-        logger.info(f"  Train action: {stage_cfg.get('train_action', True)}")
+        logger.info(f"  Heatmap loss: {stage_loss_type}")
         
         # 构建数据加载器
-        # DataLoader 性能优化参数
         num_workers = cfg['data']['num_workers']
         prefetch_factor = cfg['data'].get('prefetch_factor', 2)
-        persistent_workers = num_workers > 0  # 保持 worker 进程，减少启动开销
+        persistent_workers = num_workers > 0
         
         train_loader = DataLoader(
             train_dataset,
@@ -1984,7 +1423,6 @@ def main():
         logger.info("🔧 Setting trainable modules...")
         set_trainable_modules(model, stage_cfg, logger)
         
-        # 统计参数
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"  Total params: {total_params:,}")
@@ -1995,23 +1433,20 @@ def main():
         grad_accum_steps = cfg['optim'].get('grad_accum_steps', 1)
         total_batches = len(train_loader) * stage_cfg['epochs']
         total_steps = total_batches // grad_accum_steps
-        logger.info(f"  Total steps: {total_steps}")
         scheduler = build_scheduler(optimizer, cfg, total_steps)
         scaler = GradScaler()
         
-        # 断点续训：加载优化器、调度器和 scaler 状态
         if resume_path and stage_idx == resume_stage_idx:
             if Path(resume_path).exists():
                 load_checkpoint_for_resume(
                     str(resume_path), model, 
                     optimizer=optimizer, 
                     scheduler=scheduler, 
-                    scaler=scaler,  # 恢复 AMP 状态
+                    scaler=scaler,
                     logger=logger
                 )
         
-        # 训练循环
-        best_val_loss = ckpt_manager.best_val_loss  # 使用全局最佳
+        best_val_loss = ckpt_manager.best_val_loss
         steps_per_epoch = len(train_loader) // grad_accum_steps
         global_step_offset = 0
         
@@ -2019,38 +1454,27 @@ def main():
             prev_epochs = all_stages[prev_idx]['epochs']
             global_step_offset += prev_epochs * steps_per_epoch
         
-        # 确定起始 epoch
         if stage_idx == start_stage_idx and resume_epoch > 0:
-            start_epoch = resume_epoch + 1  # 从恢复的下一个 epoch 开始
+            start_epoch = resume_epoch + 1
         elif stage_idx == start_stage_idx:
             start_epoch = args.start_epoch
         else:
             start_epoch = 1
         total_epochs = stage_cfg['epochs']
         
-        # Early stopping
         patience = cfg['validation'].get('patience', 5)
         no_improve_count = 0
         
-        # 训练计时器
         timer = TrainingTimer(total_epochs=total_epochs)
         timer.start()
         
-        # 可视化配置
-        vis_interval = cfg['log'].get('vis_every_steps', 500)
-        vis_dir = Path(cfg['log']['out_dir'])
-        
         for epoch in range(start_epoch, total_epochs + 1):
-            timer.start_stage()  # 开始计时
+            timer.start_stage()
             
             logger.info("=" * 80)
             logger.info(f"[Stage {stage_idx+1}: {stage_name}] Epoch {epoch}/{total_epochs}")
-            if epoch > start_epoch:
-                eta = timer.get_eta(epoch - 1, total_epochs)
-                logger.info(f"  ⏱️  Last epoch: {timer.get_epoch_time()} | ETA: {eta} | Total: {timer.get_total_elapsed()}")
             logger.info("=" * 80)
             
-            # 训练
             epoch_offset = global_step_offset + (epoch - 1) * steps_per_epoch
             train_metrics = train_one_epoch(
                 model, train_loader, optimizer, scheduler, scaler,
@@ -2059,9 +1483,8 @@ def main():
                 max_batches=args.max_batches
             )
             
-            timer.end_epoch()  # 记录 epoch 结束
+            timer.end_epoch()
             
-            # 验证
             val_metrics = validate(
                 model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch
             )
@@ -2075,11 +1498,9 @@ def main():
                 f"(hm: {val_metrics['val_heatmap_loss']:.4f}, act: {val_metrics['val_action_loss']:.4f})"
             )
             
-            # 显示 ETA
             eta = timer.get_eta(epoch, total_epochs)
             logger.info(f"  ⏱️  Epoch time: {timer.get_epoch_time()} | ETA: {eta}")
             
-            # 检查是否为最佳模型
             is_best = val_metrics['val_loss'] < best_val_loss
             if is_best:
                 best_val_loss = val_metrics['val_loss']
@@ -2087,15 +1508,10 @@ def main():
                 logger.info(f"  ⭐ New best val_loss: {best_val_loss:.4f}")
             else:
                 no_improve_count += 1
-                logger.info(f"  No improvement for {no_improve_count}/{patience} epochs")
             
-            # 更新全局 epoch 计数器
             global_epoch_counter += 1
-            
-            # 获取当前学习率
             current_lr = scheduler.get_last_lr()[0] if scheduler else 0
             
-            # 更新训练曲线图
             plotter.update(
                 epoch=global_epoch_counter,
                 stage_name=stage_name,
@@ -2104,28 +1520,7 @@ def main():
                 lr=current_lr,
                 is_best=is_best,
             )
-            logger.info(f"  📈 训练曲线已更新: {log_dir / 'training_curves.png'}")
             
-            # 发送飞书通知
-            if notifier:
-                try:
-                    notifier.send_epoch_report(
-                        epoch=epoch,
-                        total_epochs=total_epochs,
-                        stage_name=stage_name,
-                        stage_idx=stage_idx,
-                        total_stages=len(all_stages),
-                        train_metrics=train_metrics,
-                        val_metrics=val_metrics,
-                        eta=eta,
-                        epoch_time=timer.get_epoch_time(),
-                        is_best=is_best,
-                        best_val_loss=best_val_loss,
-                    )
-                except Exception as e:
-                    logger.warning(f"发送通知失败: {e}")
-            
-            # 保存检查点（使用 CheckpointManager，包含 scaler 状态）
             if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
                 ckpt_manager.save(
                     model=model,
@@ -2137,41 +1532,26 @@ def main():
                     metrics={**train_metrics, **val_metrics},
                     cfg=cfg,
                     is_best=is_best,
-                    scaler=scaler,  # 保存 AMP 状态
+                    scaler=scaler,
                 )
             
-            # Early stopping
             if no_improve_count >= patience:
-                logger.info(f"  🛑 Early stopping triggered after {patience} epochs without improvement")
+                logger.info(f"  🛑 Early stopping")
                 break
         
-        # 阶段结束日志
         logger.info(f"  📊 Stage {stage_name} completed in {timer.get_total_elapsed()}")
     
     logger.info("=" * 60)
     logger.info("✅ 训练完成！")
     logger.info("=" * 60)
     
-    # 输出训练摘要
     summary = plotter.get_summary()
     if summary:
         logger.info(f"📊 训练摘要:")
         logger.info(f"   总 Epochs: {summary.get('total_epochs', 'N/A')}")
         logger.info(f"   最佳 Epoch: {summary.get('best_epoch', 'N/A')}")
-        logger.info(f"   最佳 val_loss: {summary.get('best_val_loss', 'N/A'):.4f}" if summary.get('best_val_loss') else "")
-        logger.info(f"   最终 train_loss: {summary.get('final_train_loss', 0):.4f}")
-        logger.info(f"   最终 val_loss: {summary.get('final_val_loss', 0):.4f}")
-    
-    # 发送训练完成通知
-    if notifier:
-        try:
-            notifier.send_training_complete(
-                total_time=timer.get_total_elapsed() if timer else "N/A",
-                best_val_loss=best_val_loss,
-                final_stage=stage_name if 'stage_name' in dir() else "完成",
-            )
-        except Exception as e:
-            logger.warning(f"发送完成通知失败: {e}")
+        if summary.get('best_val_loss'):
+            logger.info(f"   最佳 val_loss: {summary.get('best_val_loss'):.4f}")
     
     if tb_writer is not None:
         tb_writer.close()
@@ -2179,4 +1559,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

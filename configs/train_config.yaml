@@ -4,68 +4,65 @@ seed: 42
 # 数据配置
 # ============================================
 data:
-  root: /root/autodl-tmp/dataset_with_actions
-  train_split: train                    # 训练集目录名
-  val_split: val_unseen                 # 验证集目录名 (VLN-CE 使用 val_unseen)
+  root: ~/dataset
+  train_split: train
+  val_split: val
   image_size: [224, 224]
-  init_hm_size: [64, 64]                # 起始分辨率
-  num_workers: 8                        # 减少 workers 避免 CPU 竞争
+  init_hm_size: [64, 64]
+  num_workers: 8
   pin_memory: true
   prefetch_factor: 2
   
   # 滑动窗口数据集配置
-  dataset_type: sliding_window          # heatmap_adapter | sliding_window
+  dataset_type: sliding_window
   sliding_window:
-    min_history: 5                      # 最小历史帧数
-    num_history_sample: 8               # 从历史中采样的帧数
-    load_depth: true                    # 是否加载深度用于遮挡检测
-    cache_poses: true                   # 是否缓存位姿
-    sample_stride: 5                    # 采样步长：每隔 N 帧采样一次，减少训练时间
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 5
 
 # ============================================
 # 模型配置
 # ============================================
 model:
-  type: spatial_mllm_pipeline
-  use_multi_gpu: false
-  vggt_gpu: cuda
-  dinov3_gpu: cuda
-  llm_gpu: cuda
+  type: vln_pipeline
+  device: cuda
 
-  # LLM 配置
+  # Qwen3-VL 配置
   llm:
-    model_path: /root/VLN/Project/models/qwen_2.5_vl
-    use_real_llm: true
+    model_path: ./models/qwen_3_vl
+    hidden_dim: 2048
+    token_dim: 1024
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    max_video_frames: 16
 
   # 热力图头配置 (Diffusion-based dual heads)
   heatmap_head:
-    enable_history: true                # 启用历史热力图头
-    enable_future: true                 # 启用未来热力图头
-    cond_dim: 512                       # 条件维度
-    num_inference_steps: 10             # 推理时扩散步数
+    enable_history: true
+    enable_future: true
+    cond_dim: 512
+    num_inference_steps: 10
 
-  # 动作头配置（简化 UNet 架构，适合 2D 低维动作）
+  # 动作头配置
   action_head:
     enable: true
-    cond_dim: 2048                      # LLM 输出维度
-    action_dim: 2                       # 2D 动作 (dx, dy)
-    pred_horizon: 1                     # 预测步数
-    num_diffusion_iters: 10             # 扩散步数
-    encoding_size: 256                  # 条件投影维度（简化：768 → 256）
-    down_dims: [128, 256]               # UNet 通道维度（简化：[192,384,768] → [128,256]）
-    # 🔧 基于数据集统计的归一化范围（添加 10% 余量）
-    # 实际数据范围: [-0.1646, 0.1850] 和 [-0.0281, 0.3087]
-    action_stats_min: [-0.1646, -0.0281]  # 修正：从数据集统计计算
-    action_stats_max: [0.1850, 0.3087]    # 修正：从数据集统计计算
+    cond_dim: 1024
+    action_dim: 2
+    pred_horizon: 1
+    num_diffusion_iters: 10
+    encoding_size: 256
+    down_dims: [128, 256]
+    action_stats_min: [-0.1646, -0.0281]
+    action_stats_max: [0.1850, 0.3087]
 
-  # 🆕 Stop 预测头配置（二分类器）
+  # Stop 预测头配置
   stop_head:
-    enable: true                        # 启用 Stop 预测
-    hidden_dim: 512                     # 隐藏层维度
-    focal_gamma: 3.0                    # Focal Loss gamma（提高到 3.0，更聚焦困难的 STOP 样本）
-    focal_alpha: 0.9                    # Focal Loss alpha（提高到 0.9，进一步提升 STOP 类权重）
-    # ⚠️ 注意：原始数据集中 STOP 样本极度稀疏（0.6%）
-    # 已优化：确保每个 clip 的 STOP 帧被采样，预计提升到 ~2.5%
+    enable: true
+    hidden_dim: 512
+    focal_gamma: 3.0
+    focal_alpha: 0.9
 
 # ============================================
 # 训练策略（4 阶段渐进式训练）
@@ -73,92 +70,72 @@ model:
 training:
   stages:
     # ============ Stage 1: History 预热 (64x64) ============
-    # 预热 History head + Action head + Fusion
     - name: warmup_history_64
       epochs: 5                        
       hm_size: [64, 64]
-      heatmap_loss_type: simplified     # Warmup 使用简化 Loss
+      heatmap_loss_type: simplified
       train_history: true
       train_future: false
       train_action: true
       trainable_modules:
         - history_heatmap_head
         - action_head
-        - stop_head                     # 🆕 Stop 预测头
-        - feature_fusion                # 解冻 fusion，让 heads 有合适的输入
-        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
-        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
-        - llm_projector                 # 🔧 解冻 llm_projector，避免随机投影导致特征不对齐
+        - stop_head
+        - llm_projector
       frozen_modules:
-        - vggt
-        - dinov3_compat
+        - qwen3_vl
         - future_heatmap_head
       
     # ============ Stage 2: Future 预热 (64x64) ============
-    # 预热 Future head，冻结 History 让 Future 赶上
     - name: warmup_future_64
       epochs: 5                         
       hm_size: [64, 64]
-      heatmap_loss_type: simplified     # 继续使用简化 Loss
-      train_history: false              # 冻结 History，让 Future 赶上
+      heatmap_loss_type: simplified
+      train_history: false
       train_future: true
       train_action: true
       trainable_modules:
         - future_heatmap_head
         - action_head
-        - stop_head                     # 🆕 Stop 预测头
-        - feature_fusion
-        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
-        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
-        - llm_projector                 # 🔧 解冻 llm_projector，保持特征对齐
-      frozen_modules:
-        - vggt
-        - dinov3_compat
-        - history_heatmap_head          # 暂时冻结 History
-      
-    # ============ Stage 3: 联合训练 (128x128) ============
-    # 中间阶段：提升分辨率，双 head 联合训练，使用完整 Loss
-    - name: joint_128
-      epochs: 10                         # 减少: 10 → 5
-      hm_size: [128, 128]
-      heatmap_loss_type: nerf_ripple    # 切换到 NeRF 波纹 Loss
-      train_history: true
-      train_future: true
-      train_action: true
-      trainable_modules:
-        - history_heatmap_head
-        - future_heatmap_head
-        - action_head
-        - stop_head                     # 🆕 Stop 预测头
-        - feature_fusion
-        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
-        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
-        - llm_projector                 # 🔧 解冻 llm_projector，保持特征对齐
-      frozen_modules:
-        - vggt
-        - dinov3_compat
-      
-    # ============ Stage 4: 精细训练 (224x224) ============
-    # 完整训练：大分辨率，解冻 LLM Projector
-    - name: full_224
-      epochs: 20                        # 减少: 20 → 10
-      hm_size: [224, 224]
-      heatmap_loss_type: nerf_ripple    # 继续使用 NeRF 波纹 Loss
-      train_history: true
-      train_future: true
-      train_action: true
-      trainable_modules:
-        - history_heatmap_head
-        - future_heatmap_head
-        - action_head
-        - stop_head                     # 🆕 Stop 预测头
-        - feature_fusion
-        - vggt_feature_projection       # 🔧 解冻 VGGT 3D特征投影层（关键！）
-        - dinov3_adapters               # 🔧 解冻 DINOv3 适配器层（feature_adapter + vggt_aligner）
+        - stop_head
         - llm_projector
       frozen_modules:
-        - vggt
-        - dinov3_compat
+        - qwen3_vl
+        - history_heatmap_head
+      
+    # ============ Stage 3: 联合训练 (128x128) ============
+    - name: joint_128
+      epochs: 10
+      hm_size: [128, 128]
+      heatmap_loss_type: nerf_ripple
+      train_history: true
+      train_future: true
+      train_action: true
+      trainable_modules:
+        - history_heatmap_head
+        - future_heatmap_head
+        - action_head
+        - stop_head
+        - llm_projector
+      frozen_modules:
+        - qwen3_vl
+      
+    # ============ Stage 4: 精细训练 (224x224) ============
+    - name: full_224
+      epochs: 20
+      hm_size: [224, 224]
+      heatmap_loss_type: nerf_ripple
+      train_history: true
+      train_future: true
+      train_action: true
+      trainable_modules:
+        - history_heatmap_head
+        - future_heatmap_head
+        - action_head
+        - stop_head
+        - llm_projector
+      frozen_modules:
+        - qwen3_vl
 
 # ============================================
 # 优化器配置
@@ -166,69 +143,44 @@ training:
 optim:
   optimizer: adamw
   
-  # 分组学习率（针对 Diffusion 模型调优）
-  # Diffusion 模型推荐 LR: 1e-4 ~ 3e-4
-  heatmap_lr: 3.0e-4                    # 热力图头默认学习率
-  history_heatmap_lr: 3.0e-4            # 历史头（Diffusion）
-  future_heatmap_lr: 3.0e-4             # 未来头（Diffusion）
-  action_lr: 3.0e-4                     # 动作头（Diffusion）
-  fusion_lr: 1.0e-4                     # feature_fusion
-  llm_projector_lr: 5.0e-5              # 🔧 llm_projector 独立学习率（更低，训练更稳定）
-  encoder_lr: 1.0e-5                    # vggt + dinov3_compat（冻结或微调）
+  # 分组学习率
+  heatmap_lr: 3.0e-4
+  history_heatmap_lr: 3.0e-4
+  future_heatmap_lr: 3.0e-4
+  action_lr: 3.0e-4
+  llm_projector_lr: 1.0e-4
 
-  weight_decay: 1.0e-4                   # 降低 weight decay，对 Diffusion 更友好
+  weight_decay: 1.0e-4
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
-  warmup_ratio: 0.1                     # Warmup 比例 10%
-  batch_size: 2                         # 减小 batch size 节省显存
-  grad_accum_steps: 8                   # 有效 batch = 2 × 8 = 16
-  use_ddp: false
-  
-  # 🆕 训练优化配置
-  action_inference_interval: 100        # 训练时每N步做一次动作推理监控（0=每步都做）
+  warmup_ratio: 0.1
+  batch_size: 2
+  grad_accum_steps: 8
 
 # ============================================
 # 损失函数
 # ============================================
 loss:
-  # 热力图损失类型选择：
-  # - simplified: SimplifiedHeatmapLoss (warmup 推荐)
-  # - nerf_ripple: NeRFRippleHeatmapLoss (完整训练推荐)
-  # - navigation: NavigationHeatmapLoss (原版，会平滑 GT)
-  heatmap_loss_type: simplified         # 默认使用简化版
+  heatmap_loss_type: simplified
   
-  # SimplifiedHeatmapLoss 参数
   simplified:
     lambda_mse: 1.0
     lambda_grad: 0.3
     peak_weight: 5.0
   
-  # NeRFRippleHeatmapLoss 参数
   nerf_ripple:
     lambda_mse: 1.0
-    lambda_fft: 0.3                     # 频域损失（保持波纹结构）
-    lambda_radial: 0.2                  # 径向梯度损失（同心圆）
-    lambda_peak: 1.0                    # 峰值定位损失
-    fft_weight_decay: 0.5               # 高频权重衰减
-  
-  # NavigationHeatmapLoss 参数（原版，不推荐）
-  navigation:
-    alpha: 20.0
-    lambda_mse: 1.0
-    lambda_kl: 0.2
-    lambda_valid: 0.1
-    smooth_gt: false                    # 设为 false 保留波纹
+    lambda_fft: 0.3
+    lambda_radial: 0.2
+    lambda_peak: 1.0
+    fft_weight_decay: 0.5
   
   # 各头损失权重
-  # 🔧 [FIX] 修复后各 Loss 量级更接近，调整权重使其更平衡
-  # - Heatmap: 核心任务，保持权重1.0
-  # - Action: 同等重要，提升到1.0
-  # - Stop: 样本稀少但关键，权重0.5（内部已有10x类别权重）
-  history_weight: 1.0                   # History 热力图损失权重
-  future_weight: 1.0                    # Future 热力图损失权重
-  action_weight: 1.0                    # 连续动作损失权重（提升：0.5 → 1.0）
-  stop_weight: 0.5                      # Stop 预测损失权重（内部已有10x类别权重）
+  history_weight: 1.0
+  future_weight: 1.0
+  action_weight: 1.0
+  stop_weight: 0.5
 
 # ============================================
 # GPU配置
@@ -241,25 +193,17 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /root/autodl-tmp/vln_history_action_outputs
+  out_dir: ./outputs/vln_training
   save_every_epochs: 1
   vis_every_steps: 100
   max_ckpts: 3
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs
+  tensorboard_dir: ./runs
   log_interval: 10
   show_gpu_memory: true
   tqdm_ncols: 120
   log_level: INFO
-  
-  # 🆕 诊断日志配置
-  diag_interval: 100                    # 诊断信息记录间隔（TensorBoard + 日志）
-  
-  # 飞书通知配置
-  notify:
-    enabled: true                              # 是否启用通知
-    platform: feishu                           # 通知平台: feishu
-    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+  diag_interval: 100
 
 # ============================================
 # 验证配置
