@@ -74,27 +74,39 @@ model:
 
 ## 数据集加载逻辑（VLNSlidingWindowDataset）
 
-### 核心思想：滑动窗口扩展
+### 核心思想：Clip-level 采样（推荐）
 
-**一段 T 帧视频 → 生成 (T - min_history) 个训练样本**
+为解决滑动窗口采样导致的**样本高度相关性**问题（相邻帧生成的样本非常相似，容易过拟合），我们采用 **Clip-level 采样策略**：
 
-每个样本包含：
-- **历史帧**：从视频开始到当前帧之前的帧（采样 K 帧）
-- **当前帧**：第 i 帧作为当前观测
-- **热力图**：历史帧相机位置在当前帧中的投影（高斯热力图）
-- **动作标签**：从当前帧到下一帧的动作 (dx, dy) 和 stop 信号
+**每个 epoch 从每个 clip 随机选择 N 个样本，而不是使用所有滑动窗口样本**
 
-### 数据流
+| 采样方式 | 样本数 | 样本相关性 | 每epoch变化 |
+|---------|--------|-----------|-------------|
+| 滑动窗口(stride=5) | ~大量 | 高（相邻帧相似） | 固定 |
+| **Clip-level(N=2)** | clips数×2 | **低** | **每epoch重新采样** |
+
+### Clip-level 采样流程
 
 ```
-视频 [T 帧]
-    ↓ 滑动窗口
-样本 0: 历史[0:0]  + 当前[0]  + 热力图 + 动作[0→1]
-样本 1: 历史[0:1]  + 当前[1]  + 热力图 + 动作[1→2]
-样本 2: 历史[0:2]  + 当前[2]  + 热力图 + 动作[2→3]
-...
-样本 T-1: 历史[0:T-1] + 当前[T-1] + 热力图 + 动作[T-1→T] (STOP)
+Epoch 1:                          Epoch 2:
+  Clip A → 随机选帧[5, 12]          Clip A → 随机选帧[3, 18]
+  Clip B → 随机选帧[8, 15]          Clip B → 随机选帧[6, 11]
+  ...                               ...（不同的随机组合）
 ```
+
+**关键特性**：
+- 每个 clip 的**最后一帧（STOP）始终被采样**，确保 STOP 样本不丢失
+- 通过 `set_epoch()` 触发重新采样，每个 epoch 看到不同的样本组合
+- 验证集使用固定采样（禁用 clip-level），确保指标可比
+
+### 数据增强
+
+训练集自动启用数据增强（仅影响图像，不影响热力图和动作标签）：
+
+| 增强类型 | 参数 | 说明 |
+|---------|------|------|
+| **ColorJitter** | brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1, p=0.5 | 颜色抖动，增加光照鲁棒性 |
+| **GaussianNoise** | std=8.0, p=0.3 | 高斯噪声，增加噪声鲁棒性 |
 
 ### 关键参数
 
@@ -102,12 +114,36 @@ model:
 VLNSlidingWindowDataset(
     root="/path/to/dataset",
     split="train",
-    min_history=5,          # 最小历史帧数（T >= 5 才生成样本）
-    num_history_sample=8,   # 从历史中采样的帧数 K
-    image_size=(224, 224),  # 图像尺寸
-    hm_size=(64, 64),       # 热力图尺寸
-    sample_stride=1,        # 采样步长（1=每帧，5=每5帧）
+    min_history=5,              # 最小历史帧数（T >= 5 才生成样本）
+    num_history_sample=8,       # 从历史中采样的帧数 K
+    image_size=(224, 224),      # 图像尺寸
+    hm_size=(64, 64),           # 热力图尺寸
+    sample_stride=1,            # 采样步长（滑动窗口模式使用）
+    # Clip-level 采样配置
+    clip_level_sampling=True,   # 启用 clip-level 采样（推荐）
+    samples_per_clip=2,         # 每个 clip 每 epoch 采样数（1 STOP + 1 正常）
+    enable_augmentation=True,   # 启用数据增强（仅训练集）
 )
+```
+
+### 配置文件
+
+```yaml
+data:
+  sliding_window:
+    min_history: 5
+    num_history_sample: 8
+    sample_stride: 1
+    # Clip-level 采样（解决样本相关性问题）
+    clip_level_sampling: true   # 启用
+    samples_per_clip: 2         # 每 clip 采样 2 个样本
+```
+
+### 训练时调用
+
+```python
+# 每个 epoch 开始时调用，触发重新采样
+train_loader.dataset.set_epoch(epoch)
 ```
 
 ### 返回格式
@@ -754,24 +790,45 @@ data:
   root: dataset_with_actions  # 数据集路径
   sliding_window:
     num_history_sample: 8     # 历史帧采样数
-    sample_stride: 5          # 采样步长（5 = 样本数减少 5 倍）
+    sample_stride: 1          # 采样步长
+    # Clip-level 采样（防止过拟合）
+    clip_level_sampling: true # 启用 clip-level 采样
+    samples_per_clip: 2       # 每 clip 每 epoch 采样 2 个样本
 
 model:
+  llm:
+    model_path: ./models/qwen_3_vl  # Qwen3-VL 模型路径
   action_head:
     enable: true              # 启用动作预测
   stop_head:
     enable: true              # 启用 Stop 预测
 
 optim:
-  batch_size: 4               # 单卡 batch size
-  grad_accum_steps: 4         # 梯度累积（有效 batch = 16）
-  heatmap_lr: 3.0e-4          # 热力图头学习率
-  action_lr: 3.0e-4           # 动作头学习率
+  batch_size: 32              # 单卡 batch size
+  grad_accum_steps: 4         # 梯度累积（有效 batch = 128）
+  # 分组学习率（降低以防止过拟合）
+  heatmap_lr: 1.0e-4          # 热力图头学习率
+  action_lr: 1.0e-4           # 动作头学习率
+  llm_projector_lr: 3.0e-5    # LLM 投影层学习率
+  weight_decay: 1.0e-2        # 增加正则化
 
 log:
   out_dir: vln_history_action_outputs
   use_tensorboard: true
 ```
+
+### 防止过拟合策略
+
+本项目采用多重策略防止模型过拟合：
+
+| 策略 | 实现位置 | 说明 |
+|------|---------|------|
+| **Clip-level 采样** | Dataset | 每 epoch 从每个 clip 随机选 N 个样本，降低样本相关性 |
+| **数据增强** | Dataset | ColorJitter + GaussianNoise，增加数据多样性 |
+| **降低学习率** | Config | heatmap/action: 1e-4, projector: 3e-5 |
+| **增加 weight_decay** | Config | 1e-2（原 1e-3） |
+| **增加 Dropout** | Pipeline/Heads | LLM projector 和 ConditionProjector 中使用 0.2 dropout |
+| **峰值/方差约束** | Diffusion Heads | 每 3 步检查输出，防止坍缩到全黑/全零 |
 
 ### Loss 设计
 
@@ -1001,22 +1058,22 @@ optim:
   grad_accum_steps: 8    # 保持有效 batch = 16
 ```
 
-**方案 2**: 增大采样步长（减少样本数）
+**方案 2**: 减少每 clip 采样数（推荐，使用 clip-level 采样时）
 
 ```yaml
 data:
   sliding_window:
-    sample_stride: 10    # 5 → 10，样本数减半
+    samples_per_clip: 1    # 2 → 1，样本数减半
 ```
 
 ### Q2: 训练速度慢
 
-**优化**: 使用更大的采样步长
+**优化**: 减少每 clip 采样数
 
 ```yaml
 data:
   sliding_window:
-    sample_stride: 10    # 每隔 10 帧采样
+    samples_per_clip: 1    # 每 clip 只采样 1 个样本
 ```
 
 或使用快速测试模式:
@@ -1036,6 +1093,20 @@ python scripts/train.py \
 ```
 
 恢复内容包括: 模型参数、优化器、调度器、GradScaler、最佳 val_loss
+
+### Q4: 模型过拟合（val loss 上升，train loss 下降）
+
+**可能原因及解决方案**：
+
+| 原因 | 解决方案 |
+|------|---------|
+| 样本高度相关（滑动窗口） | 启用 `clip_level_sampling: true` |
+| 学习率过高 | 降低至 `1e-4` 或更低 |
+| 正则化不足 | 增加 `weight_decay: 1e-2` |
+| 数据增强不足 | 确保 `enable_augmentation: true`（默认启用） |
+| 每 clip 采样过多 | 减少 `samples_per_clip` |
+
+**诊断方法**：查看 TensorBoard 中的 `diag/pred_heatmap_max`，如果持续 < 0.1 说明热力图坍缩
 
 ---
 
@@ -1072,7 +1143,7 @@ python scripts/evaluate.py \
 
 - `data.root`：数据集根目录
 - `data.val_split`：验证 split（例如 `val_unseen`）
-- `model.llm.model_path`：本地 Qwen2.5-VL 权重路径（默认写在 `models/qwen_2.5_vl`）
+- `model.llm.model_path`：本地 Qwen3-VL 权重路径（默认 `models/qwen_3_vl`）
 - `log.out_dir` / `log.tensorboard_dir`：输出与日志目录
 
 ---
@@ -1134,19 +1205,12 @@ HeatmapVLN/
         action_config.py                      # 动作 head 配置/超参
         diffusion/                            # 扩散网络细节/组件
 
-      llm/
-        integration.py                        # LLM 兼容层/集成逻辑
-        memory_efficient.py                   # 显存友好模式（可选）
+      qwen3_vl/                               # Qwen3-VL 集成模块
+        integration.py                        # Qwen3VLIntegration（视觉语言特征提取）
 
-      qwen2_5_vl/                             # Qwen2.5-VL 本地实现/适配（HF-style）
-        modeling_qwen2_5_vl.py
-        processing_qwen2_5_vl.py
-
-      dinov3/                                 # DINOv3 特征抽取与兼容层
-        compatibility.py
-
-      vggt/                                   # VGGT 3D 编码器（第三方代码集成）
-        vggt/                                 # VGGT 包主体
+    utils/
+      loss.py                                 # 损失函数（SimplifiedHeatmapLoss 等）
+      visualization.py                        # 可视化工具
 ```
 
 
