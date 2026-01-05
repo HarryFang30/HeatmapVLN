@@ -30,12 +30,13 @@ class SinusoidalPosEmb(nn.Module):
             x: (B,) tensor of timestep values
             
         Returns:
-            (B, dim) tensor of positional embeddings
+            (B, dim) tensor of positional embeddings (same dtype as input)
         """
         device = x.device
+        dtype = x.dtype
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb

@@ -41,7 +41,7 @@ class VLNPipelineConfig:
     llm_hidden_dim: int = 2048  # Qwen3-VL hidden size
     llm_token_dim: int = 1024   # Projected dimension for output heads
     llm_torch_dtype: str = "bfloat16"
-    llm_attn_implementation: str = "flash_attention_2"
+    llm_attn_implementation: str = "sdpa"  # sdpa works without flash_attn
     max_video_frames: int = 16
     
     # Device configuration
@@ -267,8 +267,8 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         
         if return_heatmaps:
-            observation_for_heatmap = current_observation.to(self.device)
-            llm_tokens_for_heatmap = llm_tokens
+            observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
+            llm_tokens_for_heatmap = llm_tokens.to(dtype=self.config.dtype)
             
             # History Heatmap
             if self.history_heatmap_head is not None:

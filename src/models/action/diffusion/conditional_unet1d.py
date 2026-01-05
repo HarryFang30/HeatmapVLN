@@ -256,9 +256,11 @@ class ConditionalUnet1D(nn.Module):
         # 1. Encode timestep
         timesteps = timestep
         if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+            timesteps = torch.tensor([timesteps], dtype=sample.dtype, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+            timesteps = timesteps[None].to(device=sample.device, dtype=sample.dtype)
+        else:
+            timesteps = timesteps.to(dtype=sample.dtype)
         # Broadcast to batch dimension
         timesteps = timesteps.expand(sample.shape[0])
 

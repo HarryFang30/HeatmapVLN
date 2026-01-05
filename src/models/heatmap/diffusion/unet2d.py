@@ -34,17 +34,18 @@ class SinusoidalPositionEmbeddings(nn.Module):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            timesteps: (batch_size,) integer timesteps
+            timesteps: (batch_size,) float timesteps (same dtype as model)
             
         Returns:
             (batch_size, dim) position embeddings
         """
         device = timesteps.device
+        dtype = timesteps.dtype
         half_dim = self.dim // 2
         
         embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = timesteps[:, None].float() * embeddings[None, :]
+        embeddings = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -embeddings)
+        embeddings = timesteps[:, None] * embeddings[None, :]
         embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
         
         return embeddings
@@ -383,8 +384,9 @@ class ConditionalUnet2D(nn.Module):
         Returns:
             (B, out_channels, H, W) predicted noise
         """
-        # Timestep embedding
-        t_emb = self.time_embed(timestep)  # (B, cond_dim)
+        # Timestep embedding - convert to float dtype matching model weights
+        timestep_float = timestep.to(dtype=sample.dtype)
+        t_emb = self.time_embed(timestep_float)  # (B, cond_dim)
         
         # Combine timestep and global condition
         cond = t_emb + global_cond  # (B, cond_dim)

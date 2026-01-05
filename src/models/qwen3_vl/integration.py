@@ -33,8 +33,8 @@ class Qwen3VLConfig:
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
     
-    # Attention implementation
-    attn_implementation: str = "flash_attention_2"
+    # Attention implementation (flash_attention_2, sdpa, or eager)
+    attn_implementation: str = "sdpa"  # Default to sdpa (works without flash_attn)
     
     # Generation settings (for inference mode)
     max_new_tokens: int = 128
