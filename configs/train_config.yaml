@@ -6,7 +6,7 @@ seed: 42
 data:
   root: ~/dataset
   train_split: train
-  val_split: val
+  val_split: train  # 暂时用 train 作为验证集（数据集无 val 目录）
   image_size: [224, 224]
   init_hm_size: [64, 64]
   num_workers: 8
@@ -35,7 +35,7 @@ model:
     hidden_dim: 2048
     token_dim: 1024
     torch_dtype: bfloat16
-    attn_implementation: flash_attention_2
+    attn_implementation: sdpa  # sdpa 无需额外安装 flash_attn
     max_video_frames: 16
 
   # 热力图头配置 (Diffusion-based dual heads)

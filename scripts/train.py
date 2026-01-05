@@ -849,15 +849,22 @@ def train_one_epoch(
             loss = loss / grad_accum_steps
         
         # 反向传播
-        scaler.scale(loss).backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         valid_batch_count += 1
         
         # 梯度累积
         if valid_batch_count % grad_accum_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             global_step += 1
@@ -907,10 +914,14 @@ def train_one_epoch(
     # 处理剩余梯度
     remaining = valid_batch_count % grad_accum_steps
     if remaining > 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
     
@@ -1434,7 +1445,9 @@ def main():
         total_batches = len(train_loader) * stage_cfg['epochs']
         total_steps = total_batches // grad_accum_steps
         scheduler = build_scheduler(optimizer, cfg, total_steps)
-        scaler = GradScaler()
+        # GradScaler 仅用于 fp16，bf16 不需要（动态范围更大）
+        amp_type = cfg['optim'].get('amp', 'bf16')
+        scaler = GradScaler() if amp_type == 'fp16' else None
         
         if resume_path and stage_idx == resume_stage_idx:
             if Path(resume_path).exists():

@@ -286,7 +286,7 @@ class VLNSlidingWindowDataset(Dataset):
         cache_poses: bool = True,
         sample_stride: int = 1,  # 采样步长：每隔 N 帧采样一次，1 表示不跳过
     ):
-        self.root = Path(root)
+        self.root = Path(root).expanduser()
         self.split = split
         self.min_history = min_history
         self.num_history_sample = num_history_sample
