@@ -107,6 +107,10 @@ class Qwen3VLIntegration(nn.Module):
             )
             self.model.eval()
             
+            # Freeze all Qwen3-VL parameters (never train the backbone)
+            for param in self.model.parameters():
+                param.requires_grad = False
+            
             # Load processor
             self.processor = AutoProcessor.from_pretrained(
                 self.config.model_path,
@@ -118,7 +122,8 @@ class Qwen3VLIntegration(nn.Module):
             
             # Log model info
             total_params = sum(p.numel() for p in self.model.parameters())
-            logger.info(f"Model parameters: {total_params:,}")
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
             
         except Exception as e:
             logger.error(f"Failed to load Qwen3-VL: {e}")

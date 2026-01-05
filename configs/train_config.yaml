@@ -4,9 +4,9 @@ seed: 42
 # 数据配置
 # ============================================
 data:
-  root: ~/dataset
+  root: /root/autodl-tmp/dataset_with_actions
   train_split: train
-  val_split: train  # 暂时用 train 作为验证集（数据集无 val 目录）
+  val_split: val_unseen
   image_size: [224, 224]
   init_hm_size: [64, 64]
   num_workers: 8
@@ -32,16 +32,16 @@ model:
   # Qwen3-VL 配置
   llm:
     model_path: ./models/qwen_3_vl
-    hidden_dim: 2048
+    hidden_dim: 4096
     token_dim: 1024
     torch_dtype: bfloat16
     attn_implementation: sdpa  # sdpa 无需额外安装 flash_attn
     max_video_frames: 16
 
-  # 热力图头配置 (Diffusion-based dual heads)
+  # 热力图头配置 (只训练 history head)
   heatmap_head:
     enable_history: true
-    enable_future: true
+    enable_future: false  # 禁用 future head 以节省内存
     cond_dim: 512
     num_inference_steps: 10
 
@@ -65,13 +65,13 @@ model:
     focal_alpha: 0.9
 
 # ============================================
-# 训练策略（4 阶段渐进式训练）
+# 训练策略（单阶段全量训练 64x64）
 # ============================================
 training:
   stages:
-    # ============ Stage 1: History 预热 (64x64) ============
-    - name: warmup_history_64
-      epochs: 5                        
+    # ============ 单阶段训练 history_head (64x64) ============
+    - name: history_only_64
+      epochs: 50
       hm_size: [64, 64]
       heatmap_loss_type: simplified
       train_history: true
@@ -85,57 +85,6 @@ training:
       frozen_modules:
         - qwen3_vl
         - future_heatmap_head
-      
-    # ============ Stage 2: Future 预热 (64x64) ============
-    - name: warmup_future_64
-      epochs: 5                         
-      hm_size: [64, 64]
-      heatmap_loss_type: simplified
-      train_history: false
-      train_future: true
-      train_action: true
-      trainable_modules:
-        - future_heatmap_head
-        - action_head
-        - stop_head
-        - llm_projector
-      frozen_modules:
-        - qwen3_vl
-        - history_heatmap_head
-      
-    # ============ Stage 3: 联合训练 (128x128) ============
-    - name: joint_128
-      epochs: 10
-      hm_size: [128, 128]
-      heatmap_loss_type: nerf_ripple
-      train_history: true
-      train_future: true
-      train_action: true
-      trainable_modules:
-        - history_heatmap_head
-        - future_heatmap_head
-        - action_head
-        - stop_head
-        - llm_projector
-      frozen_modules:
-        - qwen3_vl
-      
-    # ============ Stage 4: 精细训练 (224x224) ============
-    - name: full_224
-      epochs: 20
-      hm_size: [224, 224]
-      heatmap_loss_type: nerf_ripple
-      train_history: true
-      train_future: true
-      train_action: true
-      trainable_modules:
-        - history_heatmap_head
-        - future_heatmap_head
-        - action_head
-        - stop_head
-        - llm_projector
-      frozen_modules:
-        - qwen3_vl
 
 # ============================================
 # 优化器配置
@@ -155,8 +104,11 @@ optim:
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1
-  batch_size: 2
-  grad_accum_steps: 8
+  
+  # 内存优化配置（容器 110GB RAM 限制）
+  # 有效批量: 64 * 2 = 128
+  batch_size: 64
+  grad_accum_steps: 2
 
 # ============================================
 # 损失函数
@@ -193,17 +145,23 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: ./outputs/vln_training
+  out_dir: /root/autodl-tmp/vln_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   max_ckpts: 3
   use_tensorboard: true
-  tensorboard_dir: ./runs
+  tensorboard_dir: /root/tf-logs
   log_interval: 10
   show_gpu_memory: true
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
+  
+  # 飞书通知配置
+  notify:
+    enabled: true
+    platform: feishu
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
 
 # ============================================
 # 验证配置
@@ -211,4 +169,4 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 5
+  patience: 10

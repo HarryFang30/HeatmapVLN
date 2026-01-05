@@ -38,7 +38,7 @@ class VLNPipelineConfig:
     
     # Qwen3-VL configuration
     llm_model_path: str = "./models/qwen_3_vl"
-    llm_hidden_dim: int = 2048  # Qwen3-VL hidden size
+    llm_hidden_dim: int = 4096  # Qwen3-VL 7B hidden size
     llm_token_dim: int = 1024   # Projected dimension for output heads
     llm_torch_dtype: str = "bfloat16"
     llm_attn_implementation: str = "sdpa"  # sdpa works without flash_attn
@@ -381,9 +381,30 @@ class VLNPipeline(nn.Module):
         return output
     
     def update_heatmap_size(self, new_size: Tuple[int, int]):
-        """Update heatmap size configuration (for curriculum training)."""
+        """Update heatmap size configuration (for curriculum training).
+        
+        This updates both the config and the actual heatmap heads to ensure
+        the model generates heatmaps at the correct resolution.
+        
+        Args:
+            new_size: New heatmap size as (H, W) tuple
+        """
+        old_size = self.config.heatmap_size
         self.config.heatmap_size = new_size
-        logger.info(f"Updated heatmap size to {new_size}")
+        
+        # Update history heatmap head
+        if self.history_heatmap_head is not None:
+            self.history_heatmap_head.heatmap_size = new_size
+            self.history_heatmap_head.config.heatmap_size = new_size
+            logger.info(f"  ✓ History heatmap head: {old_size} → {new_size}")
+        
+        # Update future heatmap head
+        if self.future_heatmap_head is not None:
+            self.future_heatmap_head.heatmap_size = new_size
+            self.future_heatmap_head.config.heatmap_size = new_size
+            logger.info(f"  ✓ Future heatmap head: {old_size} → {new_size}")
+        
+        logger.info(f"Updated heatmap size: {old_size} → {new_size}")
 
 
 def create_vln_pipeline(

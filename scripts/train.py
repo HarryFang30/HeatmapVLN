@@ -47,6 +47,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import cv2
 
 warnings.filterwarnings("ignore")
 
@@ -891,6 +892,84 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
                     tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)
                     tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
+                    
+                    # Action valid ratio - 监控有效样本比例
+                    tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
+                    
+                    # 诊断信息记录（固定间隔）
+                    diag_interval = cfg['log'].get('diag_interval', 100)
+                    if global_step % diag_interval == 0:
+                        # 热力图输出诊断 - 检查是否坍缩为全黑
+                        if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
+                            pred_hm = output['history_heatmaps'].detach()
+                            pred_mean = pred_hm.mean().item()
+                            pred_max = pred_hm.max().item()
+                            pred_std = pred_hm.std().item()
+                            
+                            tb_writer.add_scalar('diag/pred_heatmap_mean', pred_mean, actual_step)
+                            tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
+                            tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
+                            
+                            # 与 GT 对比
+                            gt_mean = gt_heatmap.mean().item()
+                            gt_max = gt_heatmap.max().item()
+                            
+                            logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
+                            logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
+                            
+                            # 坍缩检测：如果预测热力图最大值 < 0.1，警告
+                            if pred_max < 0.1:
+                                logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
+                            
+                            # 检查是否都接近 0（全黑）
+                            non_zero_ratio = (pred_hm > 0.01).float().mean().item()
+                            tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
+                            if non_zero_ratio < 0.05:
+                                logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
+                        
+                        # Stop prediction 诊断
+                        if 'stop_logits' in output:
+                            stop_logits = output['stop_logits'].detach()
+                            stop_probs = torch.sigmoid(stop_logits)
+                            tb_writer.add_scalar('diag/stop_prob_mean', stop_probs.mean().item(), actual_step)
+                            tb_writer.add_scalar('diag/stop_prob_max', stop_probs.max().item(), actual_step)
+                            # 计算 stop recall
+                            if is_stop.sum() > 0:
+                                predicted_stops = (stop_probs > 0.5).float()
+                                stop_recall = (predicted_stops * is_stop).sum() / is_stop.sum()
+                                tb_writer.add_scalar('diag/stop_recall', stop_recall.item(), actual_step)
+                            # 计算 precision
+                            if (stop_probs > 0.5).sum() > 0:
+                                stop_precision = ((stop_probs > 0.5).float() * is_stop).sum() / (stop_probs > 0.5).sum()
+                                tb_writer.add_scalar('diag/stop_precision', stop_precision.item(), actual_step)
+                    
+                    # 动作分布直方图（每 100 步记录一次，避免日志过大）
+                    if global_step % 100 == 0:
+                        if 'actions' in output and output['actions'] is not None:
+                            tb_writer.add_histogram('train/predicted_actions', output['actions'].flatten().cpu(), actual_step)
+                        tb_writer.add_histogram('train/gt_actions', gt_action.flatten().cpu(), actual_step)
+        
+        # 定期可视化热力图预测并记录到 TensorBoard
+        vis_interval = cfg['log'].get('vis_every_steps', 500)
+        if tb_writer is not None and global_step % vis_interval == 0 and global_step > 0:
+            vis_path = visualize_heatmap_predictions(
+                model=model,
+                batch=batch,
+                output=output,
+                epoch=epoch,
+                step=global_step,
+                output_dir=Path(cfg['log']['out_dir']),
+                num_samples=2,
+            )
+            if vis_path:
+                try:
+                    vis_img = cv2.imread(str(vis_path))
+                    if vis_img is not None:
+                        vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+                        vis_img = vis_img.transpose(2, 0, 1)  # HWC -> CHW
+                        tb_writer.add_image('train/heatmap_viz', vis_img, global_step_offset + global_step)
+                except Exception as e:
+                    pass  # 忽略可视化写入错误
         
         del output
         
@@ -1043,12 +1122,8 @@ def validate(
     avg_act = total_action_loss / max(num_batches, 1)
     avg_stop = total_stop_loss / max(num_batches, 1)
     
-    if tb_writer is not None:
-        tb_writer.add_scalar('val/loss', avg_loss, epoch)
-        tb_writer.add_scalar('val/heatmap_loss', avg_hm, epoch)
-        tb_writer.add_scalar('val/action_loss', avg_act, epoch)
-        tb_writer.add_scalar('val/stop_loss', avg_stop, epoch)
-        tb_writer.flush()
+    # 注意：TensorBoard 记录移至主循环中使用 global_epoch_counter
+    # 避免多阶段训练时 epoch 重复导致数据覆盖
     
     return {
         'val_loss': avg_loss,
@@ -1375,6 +1450,18 @@ def main():
     total_all_epochs = sum(s['epochs'] for s in all_stages[start_stage_idx:end_stage_idx])
     global_epoch_counter = 0
     
+    # 发送训练开始通知
+    if notifier:
+        try:
+            notifier.send_training_start(
+                config_name=Path(args.config).stem,
+                stages=all_stages[start_stage_idx:end_stage_idx],
+                total_epochs=total_all_epochs,
+            )
+            logger.info("📢 飞书通知已发送: 训练开始")
+        except Exception as e:
+            logger.warning(f"飞书通知发送失败: {e}")
+    
     # 多阶段训练
     for stage_idx in range(start_stage_idx, end_stage_idx):
         stage_cfg = all_stages[stage_idx]
@@ -1534,6 +1621,60 @@ def main():
                 is_best=is_best,
             )
             
+            # 记录 epoch 级别的 loss 到 TensorBoard（使用全局 epoch，避免多阶段覆盖）
+            if tb_writer is not None:
+                # 总损失对比
+                tb_writer.add_scalars('loss/total', {
+                    'train': train_metrics['total_loss'],
+                    'val': val_metrics['val_loss'],
+                }, global_epoch_counter)
+                
+                # 热力图损失对比
+                tb_writer.add_scalars('loss/heatmap', {
+                    'train': train_metrics['heatmap_loss'],
+                    'val': val_metrics['val_heatmap_loss'],
+                }, global_epoch_counter)
+                
+                # 动作损失对比
+                tb_writer.add_scalars('loss/action', {
+                    'train': train_metrics['action_loss'],
+                    'val': val_metrics['val_action_loss'],
+                }, global_epoch_counter)
+                
+                # 停止损失对比
+                tb_writer.add_scalars('loss/stop', {
+                    'train': train_metrics.get('stop_loss', 0),
+                    'val': val_metrics.get('val_stop_loss', 0),
+                }, global_epoch_counter)
+                
+                # 学习率
+                tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)
+                
+                # 单独的指标（方便筛选）
+                tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
+                tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
+                
+                tb_writer.flush()
+            
+            # 发送飞书通知
+            if notifier:
+                try:
+                    notifier.send_epoch_report(
+                        epoch=epoch,
+                        total_epochs=total_epochs,
+                        stage_name=stage_name,
+                        stage_idx=stage_idx,
+                        total_stages=len(all_stages),
+                        train_metrics=train_metrics,
+                        val_metrics=val_metrics,
+                        eta=eta,
+                        epoch_time=timer.get_epoch_time(),
+                        is_best=is_best,
+                        best_val_loss=best_val_loss,
+                    )
+                except Exception as e:
+                    logger.warning(f"飞书通知发送失败: {e}")
+            
             if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
                 ckpt_manager.save(
                     model=model,
@@ -1565,6 +1706,18 @@ def main():
         logger.info(f"   最佳 Epoch: {summary.get('best_epoch', 'N/A')}")
         if summary.get('best_val_loss'):
             logger.info(f"   最佳 val_loss: {summary.get('best_val_loss'):.4f}")
+    
+    # 发送训练完成通知
+    if notifier:
+        try:
+            notifier.send_training_complete(
+                total_time=timer.get_total_elapsed() if timer else "N/A",
+                best_val_loss=best_val_loss if 'best_val_loss' in dir() else 0.0,
+                final_stage=stage_name if 'stage_name' in dir() else "完成",
+            )
+            logger.info("📢 飞书通知已发送: 训练完成")
+        except Exception as e:
+            logger.warning(f"飞书通知发送失败: {e}")
     
     if tb_writer is not None:
         tb_writer.close()
