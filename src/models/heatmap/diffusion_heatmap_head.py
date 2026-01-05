@@ -320,35 +320,28 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _normalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        🔧 [FIX-3] 对数空间归一化：更好地保留峰值信息
+        对数空间归一化：更好地保留峰值信息
         
-        原问题：线性归一化 [0,1] -> [-1,1] 导致：
-          - 93.5%的背景(值~0) 全部映射到 -1
-          - 模型学会输出全-1就能获得极低Loss
-        
-        解决方案：对数变换
-          - 背景(~0) -> log(eps) ≈ -13.8 -> 归一化后更分散
-          - 峰值(~1) -> log(1) = 0 -> 归一化后在较高区域
-          - 信号分布更均匀，扩散模型更容易学习
+        使用对数变换让信号分布更均匀，扩散模型更容易学习。
+        不截断小值，保留所有信息。
         
         Args:
-            heatmap: (B, 1, H, W) heatmap in [0, 1]
+            heatmap: (B, 1, H, W) heatmap (非负值)
             
         Returns:
             (B, 1, H, W) heatmap in [-1, 1] (对数空间)
         """
-        # Clamp to [0, 1] first
-        heatmap = heatmap.clamp(0, 1)
+        # 先做 max-to-1 归一化，确保输入范围一致
+        B = heatmap.shape[0]
+        max_vals = heatmap.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
+        max_vals = max_vals.clamp(min=1e-6)  # 仅避免除零
+        heatmap_norm = heatmap / max_vals
         
-        # 对数变换：[0, 1] -> [log(eps), log(1+eps)] ≈ [-13.8, 0]
-        eps = 1e-6
-        log_scale = 6.0  # 使用较小的对数范围以保持数值稳定性
-        
-        # 使用 log1p 风格的变换：log(x * scale + 1) 更稳定
+        # 对数变换：使用 log1p 风格的变换更稳定
         # x=0 -> log(1)=0, x=1 -> log(scale+1)
-        # 然后归一化到 [-1, 1]
-        log_heatmap = torch.log(heatmap * log_scale + 1)  # [0, log(7)] ≈ [0, 1.95]
-        max_log = torch.log(torch.tensor(log_scale + 1))  # ≈ 1.95
+        log_scale = 6.0
+        log_heatmap = torch.log(heatmap_norm * log_scale + 1)
+        max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device, dtype=heatmap.dtype))
         
         # 归一化到 [-1, 1]
         normalized = (log_heatmap / max_log) * 2 - 1
@@ -357,31 +350,32 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _denormalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        🔧 [FIX-3] 从对数空间反归一化到概率分布
+        从对数空间反归一化到热力图
+        
+        使用 max-to-1 归一化，不截断小值，保持相对比例。
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [-1, 1] (对数空间)
             
         Returns:
-            (B, 1, H, W) probability heatmap (sums to 1)
+            (B, 1, H, W) normalized heatmap (max value = 1)
         """
         log_scale = 6.0
-        max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device))  # ≈ 1.95
+        max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device, dtype=heatmap.dtype))
         
         # 从 [-1, 1] 反归一化到 [0, max_log]
         log_heatmap = (heatmap + 1) / 2 * max_log
-        log_heatmap = log_heatmap.clamp(0, max_log)
         
         # 从对数空间恢复：exp(log_heatmap) - 1 然后除以 scale
         recovered = (torch.exp(log_heatmap) - 1) / log_scale
-        recovered = recovered.clamp(0, 1)
         
-        # Normalize to probability distribution
+        # Max-to-1 归一化（不截断小值，保持相对比例）
         B = heatmap.shape[0]
-        flat = recovered.view(B, -1)  # (B, H*W)
-        probs = F.softmax(flat * 10, dim=-1)  # Temperature scaling for sharper peaks
+        max_vals = recovered.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
+        max_vals = max_vals.clamp(min=1e-6)  # 仅避免除零
+        normalized = recovered / max_vals
         
-        return probs.view_as(heatmap)
+        return normalized
     
     def forward_llm_only(
         self,

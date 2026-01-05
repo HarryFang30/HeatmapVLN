@@ -174,28 +174,28 @@ class HighFreqHeatmapLoss(nn.Module):
         Returns:
             total_loss, loss_dict
         """
-        # 确保在 [0, 1] 范围
-        pred = pred.clamp(0, 1)
-        
-        # 归一化 target
+        # 两者都用各自的 max 归一化（不截断小值）
         B = target.shape[0]
-        max_vals = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
-        target_norm = target / max_vals
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        target_norm = target / target_max
+        
+        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        pred_norm = pred / pred_max
         
         # 1. Focal-weighted MSE
         # 越接近峰值，权重越高；难样本（预测偏差大）权重也越高
-        diff = (pred - target_norm).abs()
+        diff = (pred_norm - target_norm).abs()
         focal_weight = (1 + diff) ** self.focal_gamma
         peak_weight = 1 + self.peak_weight * target_norm
         weighted_mse = (focal_weight * peak_weight * diff ** 2).mean()
         
         # 2. Laplacian (高频) 损失
-        pred_laplacian = self._compute_laplacian(pred)
+        pred_laplacian = self._compute_laplacian(pred_norm)
         target_laplacian = self._compute_laplacian(target_norm)
         laplacian_loss = F.l1_loss(pred_laplacian, target_laplacian)
         
         # 3. KL Divergence
-        flat_pred = pred.view(B, -1)
+        flat_pred = pred_norm.view(B, -1)
         flat_target = target_norm.view(B, -1)
         log_prob_pred = F.log_softmax(flat_pred * 10, dim=1)  # Temperature
         target_sum = flat_target.sum(dim=1, keepdim=True) + 1e-6
@@ -270,15 +270,18 @@ class FocalHeatmapLoss(nn.Module):
             pred: [B, 1, H, W] 预测（sigmoid 后）
             target: [B, 1, H, W] GT
         """
-        pred = pred.clamp(1e-6, 1 - 1e-6)
-        
-        # 归一化 target
+        # 两者都用各自的 max 归一化（不截断小值）
         B = target.shape[0]
-        max_vals = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
-        target_norm = target / max_vals
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        target_norm = target / target_max
         
-        focal = self._focal_loss(pred, target_norm)
-        dice = self._dice_loss(pred, target_norm)
+        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        pred_norm = pred / pred_max
+        # Clamp for numerical stability in focal loss
+        pred_norm = pred_norm.clamp(1e-6, 1 - 1e-6)
+        
+        focal = self._focal_loss(pred_norm, target_norm)
+        dice = self._dice_loss(pred_norm, target_norm)
         
         total_loss = self.lambda_focal * focal + self.lambda_dice * dice
         
@@ -417,11 +420,13 @@ class DiffusionHeatmapLoss(nn.Module):
         if target.dim() == 3:
             target = target.unsqueeze(1)
         
-        # 归一化 target
+        # 两者都用各自的 max 归一化（不截断小值）
         B = target.shape[0]
-        max_vals = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
-        target_norm = target / max_vals
-        pred_norm = pred.clamp(0, 1)
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        target_norm = target / target_max
+        
+        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        pred_norm = pred / pred_max
         
         # 1. 基础 MSE
         mse_loss = F.mse_loss(pred_norm, target_norm)
@@ -618,14 +623,13 @@ class NeRFRippleHeatmapLoss(nn.Module):
         if target.dim() == 3:
             target = target.unsqueeze(1)
         
-        # 归一化（保持波纹结构，只调整范围）
+        # 两者都用各自的 max 归一化（不截断小值，保持波纹结构）
         B = target.shape[0]
-        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
         target_norm = target / target_max
         
-        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
+        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
         pred_norm = pred / pred_max
-        pred_norm = pred_norm.clamp(0, 1)
         
         # 1. MSE 损失（基础像素匹配）
         mse_loss = F.mse_loss(pred_norm, target_norm)
@@ -704,11 +708,13 @@ class SimplifiedHeatmapLoss(nn.Module):
         if target.dim() == 3:
             target = target.unsqueeze(1)
         
-        # 归一化
+        # 两者都用各自的 max 归一化（不截断小值）
         B = target.shape[0]
-        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1) + 1e-6
+        target_max = target.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
         target_norm = target / target_max
-        pred_norm = pred.clamp(0, 1)
+        
+        pred_max = pred.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=1e-6)
+        pred_norm = pred / pred_max
         
         # 1. 峰值加权 MSE
         weight_map = 1.0 + self.peak_weight * target_norm
