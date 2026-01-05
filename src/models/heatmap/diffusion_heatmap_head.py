@@ -239,26 +239,26 @@ class DiffusionHeatmapHead(nn.Module):
         pred_heatmap = None
         peak_loss = torch.tensor(0.0, device=device)
         variance_loss = torch.tensor(0.0, device=device)
-        
-        # 每10步计算一次峰值保持损失（平衡训练速度和效果）
-        compute_peak_loss = (self._training_step_counter % 10 == 0)
-        
+
+        # 每3步计算一次峰值保持损失（更频繁以更好地防止坍缩）
+        compute_peak_loss = (self._training_step_counter % 3 == 0)
+
         if compute_peak_loss or not skip_inference:
             with torch.no_grad():
                 pred_heatmap = self._diffusion_inference(cond)
-            
+
             if compute_peak_loss and pred_heatmap is not None:
                 # 峰值约束：pred_heatmap.max() 必须 >= 0.3
                 # 如果最大值小于0.3，则产生惩罚
                 peak_loss = F.relu(0.3 - pred_heatmap.max())
-                
+
                 # 方差约束：输出必须有空间变化（不能全是同一个值）
-                # 如果标准差小于0.01，则产生惩罚
-                variance_loss = F.relu(0.01 - pred_heatmap.std())
-        
+                # 如果标准差小于0.05，则产生惩罚（提高阈值）
+                variance_loss = F.relu(0.05 - pred_heatmap.std())
+
         # 总损失 = 扩散损失 + 峰值保持损失
-        # 峰值损失权重设为0.5，避免过度影响扩散训练
-        loss = diffusion_loss + 0.5 * (peak_loss + variance_loss)
+        # 增加峰值损失权重以更好地防止过拟合到全黑
+        loss = diffusion_loss + 1.0 * (peak_loss + variance_loss)
         
         return {
             'loss': loss,

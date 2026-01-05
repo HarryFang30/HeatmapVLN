@@ -151,29 +151,25 @@ class Qwen3VLIntegration(nn.Module):
         
         return images
     
-    def _prepare_messages(
+    def _prepare_messages_single(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
         instruction: Optional[str] = None,
-    ) -> List[Dict]:
+    ) -> Tuple[List[Dict], List[Image.Image], Image.Image]:
         """
-        Prepare messages for Qwen3-VL chat template.
+        Prepare messages for a single sample.
         
         Args:
-            history_frames: (B, K, C, H, W) history video frames
-            current_frame: (B, C, H, W) current observation
+            history_frames: (K, C, H, W) history video frames for ONE sample
+            current_frame: (C, H, W) current observation for ONE sample
             instruction: Navigation instruction text
             
         Returns:
-            List of message dicts for chat template
+            Tuple of (messages, history_pil, current_pil)
         """
-        # For batch processing, we only use the first sample
-        # (Qwen3-VL processes one conversation at a time)
-        batch_idx = 0
-        
         # Convert history frames to PIL images
-        history_pil = self._tensor_to_pil_images(history_frames[batch_idx])
+        history_pil = self._tensor_to_pil_images(history_frames)
         
         # Limit number of frames
         if len(history_pil) > self.config.max_video_frames:
@@ -182,7 +178,7 @@ class Qwen3VLIntegration(nn.Module):
             history_pil = [history_pil[i] for i in indices]
         
         # Convert current frame to PIL
-        current_pil = self._tensor_to_pil_images(current_frame[batch_idx:batch_idx+1])[0]
+        current_pil = self._tensor_to_pil_images(current_frame.unsqueeze(0))[0]
         
         # Build instruction text
         if instruction is None or instruction == "":
@@ -206,38 +202,27 @@ class Qwen3VLIntegration(nn.Module):
         
         return messages, history_pil, current_pil
     
-    def forward(
+    def _forward_single(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
         instruction: Optional[str] = None,
         return_hidden_states: bool = True,
-        generate_text: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Forward pass through Qwen3-VL.
+        Forward pass for a single sample.
         
         Args:
-            history_frames: (B, K, C, H, W) history video frames
-            current_frame: (B, C, H, W) current observation
+            history_frames: (K, C, H, W) history video frames
+            current_frame: (C, H, W) current observation
             instruction: Navigation instruction text
             return_hidden_states: Whether to return hidden states
-            generate_text: Whether to generate text output
             
         Returns:
-            Dict containing:
-                - hidden_states: (B, seq_len, hidden_dim) LLM hidden states
-                - vision_hidden_states: (B, num_vision_tokens, hidden_dim) vision token hidden states
-                - generated_text: Generated text (if generate_text=True)
+            Tuple of (hidden_states, vision_hidden_states)
         """
-        # Ensure model is loaded
-        if not self._model_loaded:
-            self._load_model()
-        
-        batch_size = history_frames.shape[0]
-        
-        # Prepare messages
-        messages, history_pil, current_pil = self._prepare_messages(
+        # Prepare messages for single sample
+        messages, _, _ = self._prepare_messages_single(
             history_frames, current_frame, instruction
         )
         
@@ -251,53 +236,23 @@ class Qwen3VLIntegration(nn.Module):
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        # Store input_ids for vision token extraction
         input_ids = inputs["input_ids"]
         
         # Forward pass
         with torch.no_grad():
-            if generate_text:
-                # Generation mode
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.config.max_new_tokens,
-                    temperature=self.config.temperature,
-                    output_hidden_states=return_hidden_states,
-                    return_dict_in_generate=True,
-                )
-                
-                # Decode generated text
-                generated_ids = outputs.sequences[:, inputs["input_ids"].shape[1]:]
-                generated_text = self.processor.batch_decode(
-                    generated_ids, skip_special_tokens=True
-                )[0]
-                
-                # Get hidden states from generation
-                if return_hidden_states and hasattr(outputs, 'hidden_states'):
-                    # outputs.hidden_states is a tuple of tuples
-                    # Each inner tuple has hidden states for each layer
-                    # We take the last generation step, last layer
-                    hidden_states = self._extract_hidden_from_generation(outputs.hidden_states)
-                else:
-                    hidden_states = None
+            outputs = self.model(
+                **inputs,
+                output_hidden_states=return_hidden_states,
+                return_dict=True,
+            )
+            
+            if return_hidden_states:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                hidden_states = outputs.hidden_states[layer_idx]
             else:
-                # Encoder-only mode (for training)
-                outputs = self.model(
-                    **inputs,
-                    output_hidden_states=return_hidden_states,
-                    return_dict=True,
-                )
-                
-                generated_text = None
-                
-                if return_hidden_states:
-                    # Get hidden states from the specified layer
-                    layer_idx = self.config.hidden_layer_for_features
-                    if layer_idx == -1:
-                        layer_idx = len(outputs.hidden_states) - 1
-                    hidden_states = outputs.hidden_states[layer_idx]
-                else:
-                    hidden_states = None
+                hidden_states = None
         
         # Extract vision token hidden states
         vision_hidden_states = None
@@ -306,18 +261,148 @@ class Qwen3VLIntegration(nn.Module):
                 hidden_states, input_ids
             )
         
-        # Expand to batch size if needed
-        if hidden_states is not None and hidden_states.shape[0] == 1 and batch_size > 1:
-            hidden_states = hidden_states.expand(batch_size, -1, -1)
-        if vision_hidden_states is not None and vision_hidden_states.shape[0] == 1 and batch_size > 1:
-            vision_hidden_states = vision_hidden_states.expand(batch_size, -1, -1)
+        return hidden_states, vision_hidden_states
+    
+    def forward(
+        self,
+        history_frames: torch.Tensor,
+        current_frame: torch.Tensor,
+        instruction: Optional[Union[str, List[str]]] = None,
+        return_hidden_states: bool = True,
+        generate_text: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Forward pass through Qwen3-VL.
+        
+        IMPORTANT: This processes each sample in the batch individually to ensure
+        each sample gets its own LLM features (not copied from sample 0).
+        
+        Args:
+            history_frames: (B, K, C, H, W) history video frames
+            current_frame: (B, C, H, W) current observation
+            instruction: Navigation instruction text (str for all samples, or List[str] per sample)
+            return_hidden_states: Whether to return hidden states
+            generate_text: Whether to generate text output (only for first sample)
+            
+        Returns:
+            Dict containing:
+                - hidden_states: (B, seq_len, hidden_dim) LLM hidden states
+                - vision_hidden_states: (B, num_vision_tokens, hidden_dim) vision token hidden states
+                - generated_text: Generated text (if generate_text=True, only first sample)
+        """
+        # Ensure model is loaded
+        if not self._model_loaded:
+            self._load_model()
+        
+        batch_size = history_frames.shape[0]
+        
+        # Process each sample individually
+        all_hidden_states = []
+        all_vision_hidden_states = []
+        generated_text = None
+        
+        for b in range(batch_size):
+            # Get instruction for this sample
+            if instruction is None:
+                sample_instruction = None
+            elif isinstance(instruction, list):
+                sample_instruction = instruction[b] if b < len(instruction) else instruction[0]
+            else:
+                sample_instruction = instruction
+            
+            # Forward single sample
+            hidden_states, vision_hidden_states = self._forward_single(
+                history_frames[b],  # (K, C, H, W)
+                current_frame[b],   # (C, H, W)
+                sample_instruction,
+                return_hidden_states,
+            )
+            
+            if hidden_states is not None:
+                all_hidden_states.append(hidden_states)
+            if vision_hidden_states is not None:
+                all_vision_hidden_states.append(vision_hidden_states)
+            
+            # Generate text only for first sample (if requested)
+            if generate_text and b == 0:
+                generated_text = self._generate_text_single(
+                    history_frames[b], current_frame[b], sample_instruction
+                )
+        
+        # Concatenate results
+        if all_hidden_states:
+            # Pad to same sequence length and concatenate
+            max_seq_len = max(h.shape[1] for h in all_hidden_states)
+            hidden_dim = all_hidden_states[0].shape[-1]
+            
+            padded_hidden = torch.zeros(
+                batch_size, max_seq_len, hidden_dim,
+                device=all_hidden_states[0].device,
+                dtype=all_hidden_states[0].dtype
+            )
+            for b, h in enumerate(all_hidden_states):
+                padded_hidden[b, :h.shape[1]] = h[0]  # h is (1, seq, dim)
+            
+            hidden_states = padded_hidden
+        else:
+            hidden_states = None
+        
+        if all_vision_hidden_states:
+            # Pad to same number of vision tokens and concatenate
+            max_vision_tokens = max(v.shape[1] for v in all_vision_hidden_states)
+            hidden_dim = all_vision_hidden_states[0].shape[-1]
+            
+            padded_vision = torch.zeros(
+                batch_size, max_vision_tokens, hidden_dim,
+                device=all_vision_hidden_states[0].device,
+                dtype=all_vision_hidden_states[0].dtype
+            )
+            for b, v in enumerate(all_vision_hidden_states):
+                padded_vision[b, :v.shape[1]] = v[0]  # v is (1, num_tokens, dim)
+            
+            vision_hidden_states = padded_vision
+        else:
+            vision_hidden_states = None
         
         return {
             "hidden_states": hidden_states,
             "vision_hidden_states": vision_hidden_states,
             "generated_text": generated_text,
-            "input_ids": input_ids,
         }
+    
+    def _generate_text_single(
+        self,
+        history_frames: torch.Tensor,
+        current_frame: torch.Tensor,
+        instruction: Optional[str] = None,
+    ) -> str:
+        """Generate text for a single sample."""
+        messages, _, _ = self._prepare_messages_single(
+            history_frames, current_frame, instruction
+        )
+        
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.config.max_new_tokens,
+                temperature=self.config.temperature,
+            )
+        
+        generated_ids = outputs[:, inputs["input_ids"].shape[1]:]
+        generated_text = self.processor.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )[0]
+        
+        return generated_text
     
     def _extract_hidden_from_generation(
         self,

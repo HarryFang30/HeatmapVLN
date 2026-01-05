@@ -112,7 +112,10 @@ class VLNPipeline(nn.Module):
             nn.LayerNorm(config.llm_hidden_dim),
             nn.Linear(config.llm_hidden_dim, config.llm_token_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),  # 增加dropout防止过拟合
+            nn.Linear(config.llm_token_dim, config.llm_token_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
             nn.LayerNorm(config.llm_token_dim),
         ).to(device=self.device, dtype=config.dtype)
         logger.info(f"✓ LLM projector: {config.llm_hidden_dim} → {config.llm_token_dim}")

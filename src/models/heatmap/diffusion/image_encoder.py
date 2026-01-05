@@ -15,8 +15,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _get_num_groups(num_channels: int, max_groups: int = 32) -> int:
+    """Calculate number of groups for GroupNorm, ensuring divisibility."""
+    for g in [max_groups, 16, 8, 4, 2, 1]:
+        if num_channels % g == 0:
+            return g
+    return 1
+
+
 class ConvBlock(nn.Module):
-    """Basic convolutional block with BatchNorm and ReLU."""
+    """Basic convolutional block with GroupNorm and ReLU.
+    
+    Uses GroupNorm instead of BatchNorm for better stability with small batch sizes.
+    """
     
     def __init__(
         self,
@@ -34,7 +45,9 @@ class ConvBlock(nn.Module):
             padding=padding,
             bias=False,
         )
-        self.bn = nn.BatchNorm2d(out_channels)
+        # Use GroupNorm instead of BatchNorm for better stability with small batches
+        num_groups = _get_num_groups(out_channels)
+        self.bn = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
         self.act = nn.ReLU(inplace=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -42,14 +55,18 @@ class ConvBlock(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Residual block with two convolutions."""
+    """Residual block with two convolutions.
+    
+    Uses GroupNorm instead of BatchNorm for better stability with small batch sizes.
+    """
     
     def __init__(self, channels: int):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
+        num_groups = _get_num_groups(channels)
+        self.bn1 = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
+        self.bn2 = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
         self.act = nn.ReLU(inplace=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -96,9 +113,11 @@ class ImageConditionEncoder(nn.Module):
         self.image_size = image_size
         
         # ==================== Stem ====================
+        # Use GroupNorm instead of BatchNorm for better stability with small batches
+        stem_num_groups = _get_num_groups(hidden_channels[0])
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels[0], 7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(hidden_channels[0]),
+            nn.GroupNorm(num_groups=stem_num_groups, num_channels=hidden_channels[0]),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(3, stride=2, padding=1),
         )

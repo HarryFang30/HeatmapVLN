@@ -30,8 +30,89 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import cv2
 import logging
+import random
 
 logger = logging.getLogger(__name__)
+
+
+# ==================== 数据增强工具 ====================
+
+class ColorJitterAugmentation:
+    """
+    颜色抖动增强 - 不影响几何关系，安全用于VLN任务
+    """
+
+    def __init__(
+        self,
+        brightness: float = 0.2,
+        contrast: float = 0.2,
+        saturation: float = 0.2,
+        hue: float = 0.1,
+        p: float = 0.5,
+    ):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+        self.p = p
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        """
+        Args:
+            image: [H, W, 3] RGB image, uint8
+        Returns:
+            augmented image
+        """
+        if random.random() > self.p:
+            return image
+
+        image = image.astype(np.float32)
+
+        # Brightness
+        if self.brightness > 0:
+            factor = 1.0 + random.uniform(-self.brightness, self.brightness)
+            image = image * factor
+
+        # Contrast
+        if self.contrast > 0:
+            factor = 1.0 + random.uniform(-self.contrast, self.contrast)
+            mean = image.mean()
+            image = (image - mean) * factor + mean
+
+        # Saturation (convert to HSV)
+        if self.saturation > 0:
+            factor = 1.0 + random.uniform(-self.saturation, self.saturation)
+            hsv = cv2.cvtColor(image.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv[:, :, 1] = hsv[:, :, 1] * factor
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+            image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+
+        # Hue shift
+        if self.hue > 0:
+            shift = random.uniform(-self.hue, self.hue) * 180  # OpenCV hue range is 0-180
+            hsv = cv2.cvtColor(image.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
+            image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+
+        return np.clip(image, 0, 255).astype(np.uint8)
+
+
+class GaussianNoiseAugmentation:
+    """
+    高斯噪声增强 - 增加模型对噪声的鲁棒性
+    """
+
+    def __init__(self, std: float = 10.0, p: float = 0.3):
+        self.std = std
+        self.p = p
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        if random.random() > self.p:
+            return image
+
+        noise = np.random.normal(0, self.std, image.shape).astype(np.float32)
+        noisy = image.astype(np.float32) + noise
+        return np.clip(noisy, 0, 255).astype(np.uint8)
 
 
 # ==================== 热力图计算工具函数 ====================
@@ -285,6 +366,10 @@ class VLNSlidingWindowDataset(Dataset):
         load_depth: bool = True,
         cache_poses: bool = True,
         sample_stride: int = 1,  # 采样步长：每隔 N 帧采样一次，1 表示不跳过
+        enable_augmentation: bool = True,  # 是否启用数据增强
+        # Clip-level 采样策略（解决样本高度相关性问题）
+        samples_per_clip: int = 2,  # 每个 clip 每 epoch 采样的样本数
+        clip_level_sampling: bool = True,  # 是否启用 clip-level 采样
     ):
         self.root = Path(root).expanduser()
         self.split = split
@@ -296,8 +381,27 @@ class VLNSlidingWindowDataset(Dataset):
         self.cache_poses = cache_poses
         self.sample_stride = max(1, sample_stride)  # 采样步长
         
+        # Clip-level 采样配置
+        self.samples_per_clip = samples_per_clip
+        self.clip_level_sampling = clip_level_sampling
+        self._epoch = 0  # 当前 epoch，用于随机采样
+        self._rng = np.random.RandomState(42)  # 可重复的随机数生成器
+
+        # 数据增强 (仅训练集启用)
+        self.enable_augmentation = enable_augmentation and (split == 'train')
+        if self.enable_augmentation:
+            self.color_jitter = ColorJitterAugmentation(
+                brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1, p=0.5
+            )
+            self.gaussian_noise = GaussianNoiseAugmentation(std=8.0, p=0.3)
+            logger.info("Data augmentation enabled: ColorJitter + GaussianNoise")
+        
         # 枚举所有 clips
         self.clips = self._enumerate_clips()
+        
+        # 预计算每个 clip 的有效帧范围（用于 clip-level 采样）
+        self._clip_valid_frames = {}  # clip_idx -> list of valid frame indices
+        self._precompute_valid_frames()
         
         # 预计算样本索引
         self.sample_index = []  # [(clip_idx, current_frame_idx), ...]
@@ -306,10 +410,11 @@ class VLNSlidingWindowDataset(Dataset):
         
         self._build_sample_index()
         
+        sampling_mode = "clip-level" if self.clip_level_sampling else "sliding-window"
         logger.info(
             f"VLNSlidingWindowDataset initialized: {len(self.clips)} clips, "
-            f"{len(self.sample_index)} samples, min_history={min_history}, "
-            f"num_history_sample={num_history_sample}, sample_stride={self.sample_stride}"
+            f"{len(self.sample_index)} samples, mode={sampling_mode}, "
+            f"samples_per_clip={self.samples_per_clip}, min_history={min_history}"
         )
     
     def _enumerate_clips(self) -> List[Path]:
@@ -334,6 +439,52 @@ class VLNSlidingWindowDataset(Dataset):
         
         logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips
+    
+    def _precompute_valid_frames(self):
+        """预计算每个 clip 的有效帧索引列表（用于 clip-level 采样）
+        
+        有效帧 = 有足够历史帧的帧 (frame_idx >= min_history)
+        """
+        self._clip_valid_frames = {}
+        
+        for clip_idx, clip_dir in enumerate(self.clips):
+            try:
+                meta_file = clip_dir / "meta.json"
+                if not meta_file.exists():
+                    continue
+                    
+                with open(meta_file, 'r') as f:
+                    meta = json.load(f)
+                
+                T = meta["num_frames"]
+                # 有效帧：从 min_history 到 T-1
+                valid_frames = list(range(self.min_history, T))
+                
+                if len(valid_frames) > 0:
+                    self._clip_valid_frames[clip_idx] = valid_frames
+                    
+            except Exception as e:
+                logger.warning(f"Failed to precompute valid frames for clip {clip_dir}: {e}")
+                continue
+        
+        logger.info(f"Precomputed valid frames for {len(self._clip_valid_frames)} clips")
+    
+    def set_epoch(self, epoch: int):
+        """设置当前 epoch，触发 clip-level 重新采样
+        
+        每个 epoch 从每个 clip 随机选择不同的样本，
+        确保模型看到不同的训练数据，减少过拟合。
+        
+        Args:
+            epoch: 当前 epoch 编号
+        """
+        if not self.clip_level_sampling:
+            return
+            
+        self._epoch = epoch
+        self._rng = np.random.RandomState(42 + epoch)  # 每个 epoch 不同的随机种子
+        self._build_sample_index()
+        logger.info(f"[Epoch {epoch}] Resampled {len(self.sample_index)} samples from {len(self.clips)} clips")
     
     def _load_meta(self, clip_idx: int) -> Dict:
         """加载并缓存 clip 元数据"""
@@ -376,44 +527,84 @@ class VLNSlidingWindowDataset(Dataset):
     def _build_sample_index(self):
         """预计算所有样本的全局索引
         
-        使用 sample_stride 控制采样密度：
-        - stride=1: 每帧都作为样本（默认）
-        - stride=5: 每隔 5 帧采样一次（样本数减少 5 倍）
+        两种采样模式：
+        1. Clip-level 采样（推荐）：每个 clip 每 epoch 随机选择 N 个样本
+           - 解决样本高度相关性问题
+           - 每个 epoch 看到不同的样本组合
+           - 通过 set_epoch() 触发重新采样
         
-        ⚠️ 重要优化：确保每个 clip 的最后一帧（STOP 动作）被采样，
-        以避免 STOP 样本过度稀疏（原本只有 0.6%）
+        2. 滑动窗口采样（传统）：使用 sample_stride 控制采样密度
+           - stride=1: 每帧都作为样本
+           - stride=5: 每隔 5 帧采样一次
         """
         self.sample_index = []
-        stop_frames_added = 0
         
-        for clip_idx, clip_dir in enumerate(self.clips):
-            try:
-                meta = self._load_meta(clip_idx)
-                T = meta["num_frames"]
+        if self.clip_level_sampling:
+            # ========== Clip-level 采样 ==========
+            stop_samples = 0
+            normal_samples = 0
+            
+            for clip_idx in self._clip_valid_frames:
+                valid_frames = self._clip_valid_frames[clip_idx]
+                if len(valid_frames) == 0:
+                    continue
                 
-                # 每个 clip 可生成 T - min_history 个样本
-                # 当前帧从 min_history 开始，到 T-1 结束
-                # 使用 sample_stride 跳过部分帧
-                for t in range(self.min_history, T, self.sample_stride):
-                    self.sample_index.append((clip_idx, t))
+                # 最后一帧是 STOP 帧，需要特殊处理
+                last_frame = valid_frames[-1]
+                non_stop_frames = valid_frames[:-1] if len(valid_frames) > 1 else []
                 
-                # 🔧 确保最后一帧（STOP）被采样
-                # 最后一帧 = T-1，包含 discrete_action=0 (STOP)
-                last_frame = T - 1
-                if last_frame >= self.min_history:
-                    # 检查最后一帧是否已经被采样
-                    if (last_frame - self.min_history) % self.sample_stride != 0:
-                        self.sample_index.append((clip_idx, last_frame))
-                        stop_frames_added += 1
+                # 1. 始终包含 STOP 帧（最后一帧）
+                self.sample_index.append((clip_idx, last_frame))
+                stop_samples += 1
+                
+                # 2. 从非 STOP 帧中随机采样 (samples_per_clip - 1) 个
+                num_normal_samples = min(self.samples_per_clip - 1, len(non_stop_frames))
+                if num_normal_samples > 0:
+                    sampled_indices = self._rng.choice(
+                        non_stop_frames, 
+                        size=num_normal_samples, 
+                        replace=False
+                    )
+                    for frame_idx in sampled_indices:
+                        self.sample_index.append((clip_idx, frame_idx))
+                        normal_samples += 1
+            
+            # 打乱样本顺序
+            self._rng.shuffle(self.sample_index)
+            
+            logger.info(
+                f"Built clip-level sample index: {len(self.sample_index)} samples "
+                f"({stop_samples} STOP + {normal_samples} normal) from {len(self._clip_valid_frames)} clips, "
+                f"epoch={self._epoch}"
+            )
+        else:
+            # ========== 滑动窗口采样（传统模式） ==========
+            stop_frames_added = 0
+            
+            for clip_idx, clip_dir in enumerate(self.clips):
+                try:
+                    meta = self._load_meta(clip_idx)
+                    T = meta["num_frames"]
                     
-            except Exception as e:
-                logger.warning(f"Failed to index clip {clip_dir}: {e}")
-                continue
-        
-        logger.info(
-            f"Built sample index: {len(self.sample_index)} samples from {len(self.clips)} clips "
-            f"(stride={self.sample_stride}, added {stop_frames_added} STOP frames)"
-        )
+                    # 每个 clip 可生成 T - min_history 个样本
+                    for t in range(self.min_history, T, self.sample_stride):
+                        self.sample_index.append((clip_idx, t))
+                    
+                    # 确保最后一帧（STOP）被采样
+                    last_frame = T - 1
+                    if last_frame >= self.min_history:
+                        if (last_frame - self.min_history) % self.sample_stride != 0:
+                            self.sample_index.append((clip_idx, last_frame))
+                            stop_frames_added += 1
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to index clip {clip_dir}: {e}")
+                    continue
+            
+            logger.info(
+                f"Built sliding-window sample index: {len(self.sample_index)} samples from {len(self.clips)} clips "
+                f"(stride={self.sample_stride}, added {stop_frames_added} STOP frames)"
+            )
     
     def __len__(self) -> int:
         return len(self.sample_index)
@@ -442,29 +633,34 @@ class VLNSlidingWindowDataset(Dataset):
             indices = np.linspace(start, end - 1, num_samples, dtype=int)
             return indices
     
-    def _load_frame(self, clip_dir: Path, frame_idx: int) -> torch.Tensor:
+    def _load_frame(self, clip_dir: Path, frame_idx: int, apply_augmentation: bool = True) -> torch.Tensor:
         """加载单帧图像"""
         rgb_path = clip_dir / "rgb" / f"{frame_idx:06d}.png"
-        
+
         if not rgb_path.exists():
             raise FileNotFoundError(f"RGB file not found: {rgb_path}")
-        
+
         image = cv2.imread(str(rgb_path))
         if image is None:
             raise ValueError(f"Failed to load image: {rgb_path}")
-        
+
         # BGR -> RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
+
         # 调整尺寸
         target_w, target_h = self.image_size
         if image.shape[:2] != (target_h, target_w):
             image = cv2.resize(image, (target_w, target_h))
-        
+
+        # 应用数据增强 (仅训练集)
+        if apply_augmentation and self.enable_augmentation:
+            image = self.color_jitter(image)
+            image = self.gaussian_noise(image)
+
         # 转换为 tensor 并归一化
         image_tensor = torch.from_numpy(image).float() / 255.0
         image_tensor = image_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
-        
+
         return image_tensor
     
     def _load_frames(self, clip_dir: Path, frame_indices: np.ndarray) -> torch.Tensor:

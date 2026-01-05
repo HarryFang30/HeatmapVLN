@@ -21,6 +21,11 @@ data:
     load_depth: true
     cache_poses: true
     sample_stride: 5
+    
+    # Clip-level 采样策略（解决样本高度相关性问题）
+    # 每个 epoch 从每个 clip 随机选择 N 个样本，而不是使用所有滑动窗口样本
+    clip_level_sampling: true  # 启用 clip-level 采样
+    samples_per_clip: 2        # 每个 clip 每 epoch 采样 2 个样本（1 个 STOP + 1 个正常）
 
 # ============================================
 # 模型配置
@@ -91,24 +96,25 @@ training:
 # ============================================
 optim:
   optimizer: adamw
-  
-  # 分组学习率
-  heatmap_lr: 3.0e-4
-  history_heatmap_lr: 3.0e-4
-  future_heatmap_lr: 3.0e-4
-  action_lr: 3.0e-4
-  llm_projector_lr: 1.0e-4
 
-  weight_decay: 1.0e-4
+  # 分组学习率 (降低以防止过拟合)
+  heatmap_lr: 1.0e-4
+  history_heatmap_lr: 1.0e-4
+  future_heatmap_lr: 1.0e-4
+  action_lr: 1.0e-4
+  llm_projector_lr: 3.0e-5
+
+  weight_decay: 1.0e-2  # 增加正则化
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1
   
-  # 内存优化配置（容器 110GB RAM 限制）
-  # 有效批量: 64 * 2 = 128
-  batch_size: 64
-  grad_accum_steps: 2
+  # 批量配置（每个样本单独过 Qwen3-VL）
+  # 110GB RAM，激进配置
+  # 有效批量: 32 * 4 = 128
+  batch_size: 32
+  grad_accum_steps: 4
 
 # ============================================
 # 损失函数

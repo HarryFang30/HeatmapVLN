@@ -29,29 +29,33 @@ logger = logging.getLogger(__name__)
 class ConditionProjector(nn.Module):
     """
     Projects LLM features to conditioning dimension for diffusion.
-    
+
     Handles variable-length sequences by pooling or selecting.
-    
+
     Args:
         input_dim: Input dimension from LLM
         output_dim: Output conditioning dimension
         pool_method: How to aggregate sequence ('mean', 'first', 'last')
     """
-    
+
     def __init__(
         self,
         input_dim: int = 2048,
         output_dim: int = 768,
-        pool_method: str = 'mean'
+        pool_method: str = 'mean',
+        dropout: float = 0.2,  # 增加默认dropout
     ):
         super().__init__()
-        
+
         self.pool_method = pool_method
         self.projector = nn.Sequential(
             nn.Linear(input_dim, output_dim),
             nn.LayerNorm(output_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.Dropout(dropout),  # 增加第二层dropout
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:

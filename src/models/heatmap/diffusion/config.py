@@ -85,7 +85,7 @@ class DiffusionHeatmapConfig:
     heatmap_size: Tuple[int, int] = (64, 64)  # Output heatmap resolution
     
     # ==================== Training ====================
-    dropout: float = 0.0                   # Dropout rate
+    dropout: float = 0.1                   # Dropout rate for regularization
     
     def __post_init__(self):
         """Validate configuration."""

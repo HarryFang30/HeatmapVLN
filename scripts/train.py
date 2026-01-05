@@ -790,10 +790,9 @@ def train_one_epoch(
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
-        # 处理导航指令
+        # 处理导航指令 - 传递整个 list 让模型处理每个样本
         if text and len(text) > 0:
-            unique_texts = list(set(t for t in text if t))
-            instruction_text = unique_texts[0] if unique_texts else None
+            instruction_text = list(text)  # 保持为 list，每个样本一个指令
         else:
             instruction_text = None
         
@@ -1056,9 +1055,9 @@ def validate(
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
+        # 处理导航指令 - 传递整个 list 让模型处理每个样本
         if text and len(text) > 0:
-            unique_texts = list(set(t for t in text if t))
-            instruction_text = unique_texts[0] if unique_texts else None
+            instruction_text = list(text)
         else:
             instruction_text = None
         
@@ -1349,6 +1348,8 @@ def main():
     logger.info("📂 Loading datasets...")
     sw_cfg = cfg['data']['sliding_window']
     sample_stride = sw_cfg.get('sample_stride', 1)
+    clip_level_sampling = sw_cfg.get('clip_level_sampling', True)  # 默认启用
+    samples_per_clip = sw_cfg.get('samples_per_clip', 2)
     
     train_dataset = VLNSlidingWindowDataset(
         root=cfg['data']['root'],
@@ -1360,6 +1361,8 @@ def main():
         load_depth=sw_cfg.get('load_depth', True),
         cache_poses=sw_cfg.get('cache_poses', True),
         sample_stride=sample_stride,
+        clip_level_sampling=clip_level_sampling,  # 启用 clip-level 采样
+        samples_per_clip=samples_per_clip,        # 每 clip 采样数
     )
     
     val_split = cfg['data'].get('val_split', 'val')
@@ -1373,6 +1376,8 @@ def main():
         load_depth=sw_cfg.get('load_depth', True),
         cache_poses=sw_cfg.get('cache_poses', True),
         sample_stride=sample_stride,
+        clip_level_sampling=False,  # 验证集使用固定采样，确保可比较
+        samples_per_clip=samples_per_clip,
     )
     
     logger.info(f"  Train: {len(train_dataset)} samples")
@@ -1570,6 +1575,10 @@ def main():
         
         for epoch in range(start_epoch, total_epochs + 1):
             timer.start_stage()
+            
+            # Clip-level 采样：每个 epoch 重新采样，减少样本相关性
+            if hasattr(train_loader.dataset, 'set_epoch'):
+                train_loader.dataset.set_epoch(epoch + stage_idx * 1000)  # 不同 stage 使用不同种子
             
             logger.info("=" * 80)
             logger.info(f"[Stage {stage_idx+1}: {stage_name}] Epoch {epoch}/{total_epochs}")
