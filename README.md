@@ -80,24 +80,31 @@ model:
 
 **每个 epoch 从每个 clip 随机选择 N 个样本，而不是使用所有滑动窗口样本**
 
-| 采样方式 | 样本数 | 样本相关性 | 每epoch变化 |
-|---------|--------|-----------|-------------|
-| 滑动窗口(stride=5) | ~大量 | 高（相邻帧相似） | 固定 |
-| **Clip-level(N=2)** | clips数×2 | **低** | **每epoch重新采样** |
+| 采样方式 | 样本数（假设1400 clips） | 样本相关性 | 每 epoch 变化 |
+|---------|-------------------------|-----------|---------------|
+| 滑动窗口(stride=1) | ~133,000 | 极高（>90%帧重叠） | 固定 |
+| 滑动窗口(stride=5) | ~26,600 | 高（相邻帧相似） | 固定 |
+| **Clip-level(N=2)** | ~2,800/epoch | **低** | **每 epoch 重新采样** |
+
+**为什么 clip-level 采样有效？**
+- 单 epoch 样本数虽少，但 50 epochs 累计可看到 ~140,000 个不同样本
+- 每 epoch 从每个 clip 随机选择不同时刻，增加数据多样性
+- 避免相邻帧高度相关导致的过拟合
 
 ### Clip-level 采样流程
 
 ```
 Epoch 1:                          Epoch 2:
-  Clip A → 随机选帧[5, 12]          Clip A → 随机选帧[3, 18]
-  Clip B → 随机选帧[8, 15]          Clip B → 随机选帧[6, 11]
+  Clip A → [STOP帧] + 随机选帧[12]    Clip A → [STOP帧] + 随机选帧[8]
+  Clip B → [STOP帧] + 随机选帧[15]    Clip B → [STOP帧] + 随机选帧[23]
   ...                               ...（不同的随机组合）
 ```
 
 **关键特性**：
 - 每个 clip 的**最后一帧（STOP）始终被采样**，确保 STOP 样本不丢失
+- 从非 STOP 帧中随机选择 `samples_per_clip - 1` 个样本
 - 通过 `set_epoch()` 触发重新采样，每个 epoch 看到不同的样本组合
-- 验证集使用固定采样（禁用 clip-level），确保指标可比
+- 验证集使用固定滑动窗口采样（禁用 clip-level），确保指标可比
 
 ### 数据增强
 
@@ -118,10 +125,10 @@ VLNSlidingWindowDataset(
     num_history_sample=8,       # 从历史中采样的帧数 K
     image_size=(224, 224),      # 图像尺寸
     hm_size=(64, 64),           # 热力图尺寸
-    sample_stride=1,            # 采样步长（滑动窗口模式使用）
-    # Clip-level 采样配置
+    sample_stride=5,            # 采样步长（滑动窗口模式使用）
+    # Clip-level 采样配置（防止过拟合的关键）
     clip_level_sampling=True,   # 启用 clip-level 采样（推荐）
-    samples_per_clip=2,         # 每个 clip 每 epoch 采样数（1 STOP + 1 正常）
+    samples_per_clip=2,         # 每个 clip 每 epoch 采样数（1 STOP + N-1 正常）
     enable_augmentation=True,   # 启用数据增强（仅训练集）
 )
 ```
@@ -133,11 +140,19 @@ data:
   sliding_window:
     min_history: 5
     num_history_sample: 8
-    sample_stride: 1
-    # Clip-level 采样（解决样本相关性问题）
-    clip_level_sampling: true   # 启用
-    samples_per_clip: 2         # 每 clip 采样 2 个样本
+    sample_stride: 5            # 滑动窗口模式的步长
+    # Clip-level 采样（解决样本高度相关性问题，防止过拟合）
+    clip_level_sampling: true   # 启用（训练集自动使用，验证集自动禁用）
+    samples_per_clip: 2         # 每 clip 每 epoch 采样 2 个样本（1 STOP + 1 正常）
 ```
+
+### 采样数量估算
+
+| 配置 | 单 epoch 样本数 | 50 epochs 累计 | 说明 |
+|------|----------------|----------------|------|
+| `samples_per_clip=2` | clips × 2 | clips × 100 | 推荐，平衡效率与覆盖 |
+| `samples_per_clip=3` | clips × 3 | clips × 150 | 更多覆盖，略慢 |
+| `samples_per_clip=1` | clips × 1 | clips × 50 | 最快，可能欠拟合 |
 
 ### 训练时调用
 
@@ -823,11 +838,13 @@ log:
 
 | 策略 | 实现位置 | 说明 |
 |------|---------|------|
-| **Clip-level 采样** | Dataset | 每 epoch 从每个 clip 随机选 N 个样本，降低样本相关性 |
-| **数据增强** | Dataset | ColorJitter + GaussianNoise，增加数据多样性 |
+| **Clip-level 采样** | Dataset | 每 epoch 从每个 clip 随机选 N 个样本，彻底解决滑动窗口样本高度相关性问题 |
+| **每 epoch 重采样** | Dataset | 通过 `set_epoch()` 每 epoch 重建索引，保证看到不同样本组合 |
+| **数据增强** | Dataset | ColorJitter(p=0.5) + GaussianNoise(p=0.3)，增加数据多样性 |
 | **降低学习率** | Config | heatmap/action: 1e-4, projector: 3e-5 |
-| **增加 weight_decay** | Config | 1e-2（原 1e-3） |
-| **增加 Dropout** | Pipeline/Heads | LLM projector 和 ConditionProjector 中使用 0.2 dropout |
+| **增加 weight_decay** | Config | 1e-2（增强 L2 正则化） |
+| **增加 Dropout** | Pipeline/Heads | LLM projector (0.1) 和 ConditionProjector (0.1) |
+| **GroupNorm 替代 BatchNorm** | ImageEncoder | 小 batch 下统计量更稳定，避免 BatchNorm 导致的训练不稳定 |
 | **峰值/方差约束** | Diffusion Heads | 每 3 步检查输出，防止坍缩到全黑/全零 |
 
 ### Loss 设计
@@ -1100,13 +1117,27 @@ python scripts/train.py \
 
 | 原因 | 解决方案 |
 |------|---------|
-| 样本高度相关（滑动窗口） | 启用 `clip_level_sampling: true` |
+| 样本高度相关（滑动窗口） | 启用 `clip_level_sampling: true`（最重要！） |
 | 学习率过高 | 降低至 `1e-4` 或更低 |
 | 正则化不足 | 增加 `weight_decay: 1e-2` |
 | 数据增强不足 | 确保 `enable_augmentation: true`（默认启用） |
-| 每 clip 采样过多 | 减少 `samples_per_clip` |
+| 每 clip 采样过多 | 减少 `samples_per_clip`（但不要低于 2） |
+| BatchNorm 不稳定 | 已改用 GroupNorm |
 
-**诊断方法**：查看 TensorBoard 中的 `diag/pred_heatmap_max`，如果持续 < 0.1 说明热力图坍缩
+**诊断方法**：
+- 查看 TensorBoard 中的 `diag/pred_heatmap_max`，如果持续 < 0.1 说明热力图坍缩
+- 检查 `epoch/train_loss` vs `epoch/val_loss` 曲线，如果 gap 过大说明过拟合
+
+### Q5: 训练集样本数减少很多，会不会欠拟合？
+
+**不会**，因为：
+1. Clip-level 采样每 epoch 重新随机采样，50 epochs 累计可覆盖大量不同样本
+2. 数据增强（ColorJitter + GaussianNoise）进一步增加多样性
+3. 相比"看很多高度相关的样本"，"看较少但多样化的样本"更有利于泛化
+
+**如果担心欠拟合**：
+- 可以增加 `samples_per_clip` 到 3-4
+- 观察 train loss 是否能正常下降
 
 ---
 
