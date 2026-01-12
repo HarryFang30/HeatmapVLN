@@ -102,16 +102,17 @@ class ImageConditionEncoder(nn.Module):
         out_dim: int = 512,
         hidden_channels: List[int] = None,
         image_size: Tuple[int, int] = (224, 224),
+        dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         if hidden_channels is None:
             hidden_channels = [32, 64, 128, 256]
-        
+
         self.in_channels = in_channels
         self.out_dim = out_dim
         self.image_size = image_size
-        
+
         # ==================== Stem ====================
         # Use GroupNorm instead of BatchNorm for better stability with small batches
         stem_num_groups = _get_num_groups(hidden_channels[0])
@@ -121,10 +122,10 @@ class ImageConditionEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(3, stride=2, padding=1),
         )
-        
+
         # ==================== Stages ====================
         self.stages = nn.ModuleList()
-        
+
         in_ch = hidden_channels[0]
         for out_ch in hidden_channels[1:]:
             stage = nn.Sequential(
@@ -133,16 +134,19 @@ class ImageConditionEncoder(nn.Module):
             )
             self.stages.append(stage)
             in_ch = out_ch
-        
+
         # ==================== Pooling ====================
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        
+
         # ==================== Projection ====================
+        # Added Dropout for regularization to prevent overfitting
         self.projection = nn.Sequential(
             nn.Linear(hidden_channels[-1], out_dim),
+            nn.Dropout(dropout),
             nn.LayerNorm(out_dim),
             nn.GELU(),
             nn.Linear(out_dim, out_dim),
+            nn.Dropout(dropout),
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -189,16 +193,20 @@ class LLMConditionProjector(nn.Module):
         output_dim: int = 512,
         hidden_dim: int = 1024,
         pool_method: str = 'mean',
+        dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         self.pool_method = pool_method
-        
+
+        # Added Dropout for regularization to prevent overfitting
         self.projector = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.Dropout(dropout),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim),
+            nn.Dropout(dropout),
             nn.LayerNorm(output_dim),
         )
     
@@ -256,59 +264,79 @@ class MultiModalConditionEncoder(nn.Module):
         llm_hidden_dim: int = 1024,
         pool_method: str = 'mean',
         image_size: Tuple[int, int] = (224, 224),
+        dropout: float = 0.1,
+        use_image_encoder: bool = True,
     ):
         super().__init__()
-        
+
         if image_encoder_channels is None:
             image_encoder_channels = [32, 64, 128, 256]
-        
+
+        self.use_image_encoder = use_image_encoder
+
         # LLM projector
         self.llm_projector = LLMConditionProjector(
             input_dim=llm_dim,
             output_dim=cond_dim,
             hidden_dim=llm_hidden_dim,
             pool_method=pool_method,
+            dropout=dropout,
         )
-        
-        # Image encoder
-        self.image_encoder = ImageConditionEncoder(
-            in_channels=image_channels,
-            out_dim=cond_dim,
-            hidden_channels=image_encoder_channels,
-            image_size=image_size,
-        )
-        
-        # Fusion MLP
-        self.fusion = nn.Sequential(
-            nn.Linear(cond_dim * 2, cond_dim),
-            nn.LayerNorm(cond_dim),
-            nn.GELU(),
-            nn.Linear(cond_dim, cond_dim),
-        )
+
+        # Image encoder (only created if use_image_encoder=True)
+        if use_image_encoder:
+            self.image_encoder = ImageConditionEncoder(
+                in_channels=image_channels,
+                out_dim=cond_dim,
+                hidden_channels=image_encoder_channels,
+                image_size=image_size,
+                dropout=dropout,
+            )
+            # Fusion MLP for LLM + Image features
+            self.fusion = nn.Sequential(
+                nn.Linear(cond_dim * 2, cond_dim),
+                nn.Dropout(dropout),
+                nn.LayerNorm(cond_dim),
+                nn.GELU(),
+                nn.Linear(cond_dim, cond_dim),
+            )
+        else:
+            # LLM-only mode: simple projection for LLM features
+            self.image_encoder = None
+            self.fusion = nn.Sequential(
+                nn.Linear(cond_dim, cond_dim),
+                nn.Dropout(dropout),
+                nn.LayerNorm(cond_dim),
+                nn.GELU(),
+                nn.Linear(cond_dim, cond_dim),
+            )
     
     def forward(
         self,
         llm_tokens: torch.Tensor,
-        observation: torch.Tensor,
+        observation: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Fuse LLM tokens and observation into conditioning vector.
-        
+
         Args:
             llm_tokens: (B, seq_len, llm_dim) or (B, llm_dim) LLM features
-            observation: (B, C, H, W) observation image
-            
+            observation: (B, C, H, W) observation image (ignored if use_image_encoder=False)
+
         Returns:
             (B, cond_dim) fused conditioning vector
         """
         # Encode LLM tokens
         llm_cond = self.llm_projector(llm_tokens)  # (B, cond_dim)
-        
-        # Encode observation
-        img_cond = self.image_encoder(observation)  # (B, cond_dim)
-        
-        # Fuse
-        fused = torch.cat([llm_cond, img_cond], dim=-1)  # (B, cond_dim * 2)
+
+        if self.use_image_encoder and self.image_encoder is not None:
+            # Encode observation and fuse with LLM features
+            img_cond = self.image_encoder(observation)  # (B, cond_dim)
+            fused = torch.cat([llm_cond, img_cond], dim=-1)  # (B, cond_dim * 2)
+        else:
+            # LLM-only mode: use only LLM features
+            fused = llm_cond  # (B, cond_dim)
+
         return self.fusion(fused)  # (B, cond_dim)
     
     def forward_llm_only(self, llm_tokens: torch.Tensor) -> torch.Tensor:

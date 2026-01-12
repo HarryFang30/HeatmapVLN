@@ -81,6 +81,8 @@ class DiffusionHeatmapHead(nn.Module):
             llm_hidden_dim=config.llm_hidden_dim,
             pool_method=config.llm_pool_method,
             image_size=config.image_size,
+            dropout=config.dropout,
+            use_image_encoder=config.use_image_encoder,
         )
         
         # ==================== Noise Predictor ====================

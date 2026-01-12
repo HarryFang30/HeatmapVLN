@@ -811,9 +811,39 @@ log:
 | **数据增强** | Dataset | ColorJitter(p=0.5) + GaussianNoise(p=0.3)，增加数据多样性 |
 | **降低学习率** | Config | heatmap/action: 1e-4, projector: 3e-5 |
 | **增加 weight_decay** | Config | 1e-2（增强 L2 正则化） |
-| **增加 Dropout** | Pipeline/Heads | LLM projector (0.1) 和 ConditionProjector (0.1) |
+| **Dropout 正则化** | 条件编码器 + UNet | ImageConditionEncoder、LLMConditionProjector、Fusion MLP、UNet 均使用 Dropout(0.1) |
 | **GroupNorm 替代 BatchNorm** | ImageEncoder | 小 batch 下统计量更稳定，避免 BatchNorm 导致的训练不稳定 |
 | **峰值/方差约束** | Diffusion Heads | 每 3 步检查输出，防止坍缩到全黑/全零 |
+
+### CNN 消融实验
+
+热力图头包含一个 `ImageConditionEncoder` (CNN) 用于编码当前观测。由于 Qwen3-VL 已经处理了当前帧，CNN 可能是冗余的。
+
+**消融开关**：通过配置文件控制是否使用 CNN：
+
+```yaml
+model:
+  heatmap_head:
+    use_image_encoder: true   # true: LLM+CNN（默认），false: LLM-only
+```
+
+**实验对比**：
+
+| 配置 | 描述 | 预期效果 |
+|------|------|----------|
+| `use_image_encoder: true` | LLM + CNN（默认） | 基线 |
+| `use_image_encoder: false` | 仅 LLM 特征 | 如果效果相近，说明 CNN 冗余 |
+
+**运行消融实验**：
+
+```bash
+# 基线（LLM + CNN）
+python scripts/train.py --config configs/train_config.yaml --max-batches 100
+
+# LLM-only（禁用 CNN）
+# 修改 configs/train_config.yaml 中 use_image_encoder: false
+python scripts/train.py --config configs/train_config.yaml --max-batches 100
+```
 
 ### Loss 设计
 

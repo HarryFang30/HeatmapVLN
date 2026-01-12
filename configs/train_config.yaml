@@ -49,6 +49,8 @@ model:
     enable_future: false  # 禁用 future head 以节省内存
     cond_dim: 512
     num_inference_steps: 10
+    # CNN 消融实验开关：设为 false 禁用 ImageConditionEncoder，只用 LLM 特征
+    use_image_encoder: true
 
   # 动作头配置
   action_head:

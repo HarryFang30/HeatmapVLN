@@ -57,6 +57,10 @@ class DiffusionHeatmapConfig:
         default_factory=lambda: [32, 64, 128, 256]
     )
     image_encoder_use_pretrained: bool = False  # Use pretrained ResNet
+
+    # Ablation: disable image encoder to test LLM-only mode
+    # Set to False to use only LLM features (no CNN encoding of observation)
+    use_image_encoder: bool = True
     
     # ==================== UNet2D Architecture ====================
     in_channels: int = 1                   # Heatmap is single channel
@@ -85,7 +89,9 @@ class DiffusionHeatmapConfig:
     heatmap_size: Tuple[int, int] = (64, 64)  # Output heatmap resolution
     
     # ==================== Training ====================
-    dropout: float = 0.1                   # Dropout rate for regularization
+    # Dropout rate for regularization (used in UNet and condition encoders)
+    # Applied to: ImageConditionEncoder, LLMConditionProjector, Fusion MLP, ConditionalUnet2D
+    dropout: float = 0.1
     
     def __post_init__(self):
         """Validate configuration."""
