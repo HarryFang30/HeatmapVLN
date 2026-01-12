@@ -6,7 +6,7 @@
 
 <img src="assets/architecture.png" width="800">
 
-*N_m帧照片构成的视频序列先通过Spatial Encoder (VGGT) 生成高维向量，通过几何预测头提取相机位姿和深度图，然后（通过Space-aware Frame Sample每次选包含未知信息量最大的图片） 算法来选出N_k张最有价值的图片，这Nk张图片一部分通过3D特征提取头给MLP，另一部分通过索引在原N_m帧里选出来，通过2D编解码器提取2D特征, 与3D特征输入MLP层转化为大模型可识别的token, 然后与当前观测，动作指令一起输入LLM，LLM输出token通过重排生成二维向量，最终通过ConditionalUnet2D生成热力图。我们只要求模型在当前观测的Nk帧中能准确抓住空间关系以解决时间累计造成的数据量溢出的问题。最终我们希望生成的热力图能为导航提供重要的位置信息以供参考。*
+*N帧照片构成的视频序列，与当前观测，动作指令一起输入LLM，LLM输出token通过重排生成二维向量，最终通过ConditionalUnet2D生成热力图。我们只要求模型在当前观测的Nk帧中能准确抓住空间关系以解决时间累计造成的数据量溢出的问题。最终我们希望生成的热力图能为导航提供重要的位置信息以供参考。*
 
 
 当前仓库内真实可用的入口脚本为：
@@ -39,38 +39,6 @@ pip install -r requirements.txt
 
 ---
 
-## 关键帧选取算法
-
-推理时，模型使用 **Greedy Maximum Coverage** 算法从输入视频中智能选取关键帧：
-
-### 算法流程
-
-1. **3D 几何提取**：所有帧通过 VGGT 提取 3D 世界点云 + 置信度
-2. **自适应体素化**：将点云转换为统一的体素表示
-3. **贪心选择**：迭代选择覆盖最多新体素的帧，最大化空间覆盖
-
-### 配置参数
-
-在 `configs/train_config.yaml` 中：
-
-```yaml
-model:
-  target_keyframes: 16      # 选取的关键帧数 (N_k)
-  total_frames: 128         # 输入候选帧数 (N_m)
-  sampling_method: greedy_coverage  # 采样策略
-```
-
-### 数据流
-
-```
-视频 [N_m 帧] → VGGT → 3D 点云 → 体素化 → 贪心选择 → [N_k 关键帧]
-                ↓
-        关键帧 → DINOv3 + VGGT → 特征融合 → LLM → 热力图/动作
-```
-
-**注**：训练时由于显存限制通常加载帧数较少，关键帧选取会自动跳过。
-
----
 
 ## 数据集加载逻辑（VLNSlidingWindowDataset）
 
