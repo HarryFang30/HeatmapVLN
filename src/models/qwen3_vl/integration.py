@@ -177,8 +177,8 @@ class Qwen3VLIntegration(nn.Module):
         # Convert history frames to PIL images
         history_pil = self._tensor_to_pil_images(history_frames)
         
-        # Limit number of frames
-        if len(history_pil) > self.config.max_video_frames:
+        # Limit number of frames (max_video_frames == -1 means no limit)
+        if self.config.max_video_frames > 0 and len(history_pil) > self.config.max_video_frames:
             # Uniform sampling
             indices = np.linspace(0, len(history_pil) - 1, self.config.max_video_frames, dtype=int)
             history_pil = [history_pil[i] for i in indices]

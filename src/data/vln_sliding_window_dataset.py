@@ -616,7 +616,7 @@ class VLNSlidingWindowDataset(Dataset):
         Args:
             start: 起始索引（包含）
             end: 结束索引（不包含）
-            num_samples: 采样数量
+            num_samples: 采样数量，-1 表示使用全部帧
         
         Returns:
             采样的索引数组
@@ -625,8 +625,9 @@ class VLNSlidingWindowDataset(Dataset):
         if available <= 0:
             return np.array([], dtype=int)
         
-        if available <= num_samples:
-            # 帧数不够，返回所有可用帧
+        # num_samples == -1 表示使用全部帧
+        if num_samples == -1 or available <= num_samples:
+            # 返回所有可用帧
             return np.arange(start, end, dtype=int)
         else:
             # 均匀采样
