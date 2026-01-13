@@ -38,6 +38,7 @@ class ConditionalResidualBlock1D(nn.Module):
         kernel_size: Convolution kernel size
         n_groups: Number of groups for GroupNorm
         cond_predict_scale: If True, predict both scale and bias for FiLM
+        dropout: Dropout rate for regularization
     """
     
     def __init__(
@@ -47,13 +48,14 @@ class ConditionalResidualBlock1D(nn.Module):
         cond_dim: int,
         kernel_size: int = 3,
         n_groups: int = 8,
-        cond_predict_scale: bool = False
+        cond_predict_scale: bool = False,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
         self.blocks = nn.ModuleList([
-            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
-            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups, dropout=dropout),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups, dropout=dropout),
         ])
 
         # FiLM modulation https://arxiv.org/abs/1709.07871
@@ -121,6 +123,7 @@ class ConditionalUnet1D(nn.Module):
         kernel_size: Convolution kernel size
         n_groups: Number of groups for GroupNorm
         cond_predict_scale: If True, use scale+bias FiLM, else just bias
+        dropout: Dropout rate for regularization (applied in Conv1dBlocks)
     """
     
     def __init__(
@@ -132,7 +135,8 @@ class ConditionalUnet1D(nn.Module):
         down_dims: List[int] = [256, 512, 1024],
         kernel_size: int = 3,
         n_groups: int = 8,
-        cond_predict_scale: bool = False
+        cond_predict_scale: bool = False,
+        dropout: float = 0.1,
     ):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
@@ -160,12 +164,12 @@ class ConditionalUnet1D(nn.Module):
                 ConditionalResidualBlock1D(
                     dim_in, dim_out, cond_dim=cond_dim, 
                     kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale),
+                    cond_predict_scale=cond_predict_scale, dropout=dropout),
                 # up encoder
                 ConditionalResidualBlock1D(
                     dim_in, dim_out, cond_dim=cond_dim, 
                     kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale)
+                    cond_predict_scale=cond_predict_scale, dropout=dropout)
             ])
 
         mid_dim = all_dims[-1]
@@ -173,12 +177,12 @@ class ConditionalUnet1D(nn.Module):
             ConditionalResidualBlock1D(
                 mid_dim, mid_dim, cond_dim=cond_dim,
                 kernel_size=kernel_size, n_groups=n_groups,
-                cond_predict_scale=cond_predict_scale
+                cond_predict_scale=cond_predict_scale, dropout=dropout
             ),
             ConditionalResidualBlock1D(
                 mid_dim, mid_dim, cond_dim=cond_dim,
                 kernel_size=kernel_size, n_groups=n_groups,
-                cond_predict_scale=cond_predict_scale
+                cond_predict_scale=cond_predict_scale, dropout=dropout
             ),
         ])
 
@@ -189,11 +193,11 @@ class ConditionalUnet1D(nn.Module):
                 ConditionalResidualBlock1D(
                     dim_in, dim_out, cond_dim=cond_dim, 
                     kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale),
+                    cond_predict_scale=cond_predict_scale, dropout=dropout),
                 ConditionalResidualBlock1D(
                     dim_out, dim_out, cond_dim=cond_dim, 
                     kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale),
+                    cond_predict_scale=cond_predict_scale, dropout=dropout),
                 # Note: DifNav uses Identity instead of actual downsampling
                 nn.Identity()
             ]))
@@ -205,11 +209,11 @@ class ConditionalUnet1D(nn.Module):
                 ConditionalResidualBlock1D(
                     dim_out * 2, dim_in, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale),
+                    cond_predict_scale=cond_predict_scale, dropout=dropout),
                 ConditionalResidualBlock1D(
                     dim_in, dim_in, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale),
+                    cond_predict_scale=cond_predict_scale, dropout=dropout),
                 # Note: DifNav uses Identity instead of actual upsampling
                 nn.Identity()
             ]))

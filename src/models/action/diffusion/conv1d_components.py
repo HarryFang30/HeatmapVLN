@@ -38,15 +38,16 @@ class Upsample1d(nn.Module):
 
 class Conv1dBlock(nn.Module):
     """
-    Conv1d --> GroupNorm --> Mish
+    Conv1d --> GroupNorm --> Mish --> Dropout
     
-    Standard convolution block with normalization and activation.
+    Standard convolution block with normalization, activation, and optional dropout.
     
     Args:
         inp_channels: Number of input channels
         out_channels: Number of output channels
         kernel_size: Convolution kernel size
         n_groups: Number of groups for GroupNorm
+        dropout: Dropout rate (0.0 = no dropout)
     """
 
     def __init__(
@@ -54,15 +55,19 @@ class Conv1dBlock(nn.Module):
         inp_channels: int, 
         out_channels: int, 
         kernel_size: int, 
-        n_groups: int = 8
+        n_groups: int = 8,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
-        self.block = nn.Sequential(
+        layers = [
             nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
             nn.GroupNorm(n_groups, out_channels),
             nn.Mish(),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)

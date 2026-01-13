@@ -25,7 +25,7 @@ data:
     # Clip-level 采样策略（解决样本高度相关性问题）
     # 每个 epoch 从每个 clip 随机选择 N 个样本，而不是使用所有滑动窗口样本
     clip_level_sampling: true  # 启用 clip-level 采样
-    samples_per_clip: 4        # 训练集：每个 clip 每 epoch 采样 4 个样本（增加训练量）
+    samples_per_clip: 8        # 训练集：每个 clip 每 epoch 采样 4 个样本（增加训练量）
     val_samples_per_clip: 2    # 验证集：每个 clip 采样 2 个样本（固定种子，确保可比较）
 
 # ============================================
@@ -78,7 +78,7 @@ model:
 training:
   stages:
     - name: history_only_64
-      epochs: 50
+      epochs: 30  # 配合 samples_per_clip=8，30 epochs 足够
       hm_size: [64, 64]
       heatmap_loss_type: simplified
       train_history: true
