@@ -557,11 +557,15 @@ def build_model(cfg: Dict) -> nn.Module:
         # Transformer Action (TransformerActionHead, InternNav style)
         transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
         transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
-        transformer_token_dim=transformer_action_cfg.get('token_dim', 384),
-        transformer_temporal_depth=transformer_action_cfg.get('temporal_depth', 16),
-        transformer_heads=transformer_action_cfg.get('heads', 8),
+        transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
+        transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
+        transformer_n_head=transformer_action_cfg.get('n_head', 8),
+        transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
         transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
         transformer_action_scale=transformer_action_cfg.get('action_scale', 4.0),
+        transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
+        transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
+        transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
         
         # Stop (Legacy)
         enable_stop_head=stop_cfg.get('enable', False),

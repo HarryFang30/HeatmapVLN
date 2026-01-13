@@ -1,12 +1,19 @@
 """
 Transformer-based Action Head for VLN Navigation
 
-参考 InternNav/internnav/model/basemodel/internvla_n1/navdp.py 实现
+参考 InternNav/internnav/model/basemodel/diffusion_policy_modified/transformer_for_diffusion_modified.py
 使用 Transformer Decoder + Diffusion Policy 生成导航轨迹
+
+修复问题（参考 InternNav）：
+1. 完整的权重初始化 (_init_weights)
+2. 条件编码器 (TransformerEncoder 预处理条件)
+3. 简化 VLM 嵌入投影 (单层线性)
+4. 完整的因果掩码 (tgt_mask + memory_mask)
+5. 位置嵌入正态初始化
 
 Architecture:
     LLM Features (B, seq_len, vlm_token_dim) 
-        -> VLM Embed MLP (B, 1, token_dim)
+        -> Condition Encoder (TransformerEncoder)
         -> Transformer Decoder (noise prediction)
         -> DDPM Denoising Loop
         -> Trajectory (B, pred_horizon, action_dim)
@@ -14,7 +21,7 @@ Architecture:
 
 import math
 import logging
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,91 +51,124 @@ class TransformerActionHead(nn.Module):
     """
     Transformer Decoder based Action Head with Diffusion Policy.
     
-    参考 InternNav 的 NavDP_Policy_DPT_CriticSum_DAT 实现，
-    但简化为只使用 VLM 特征作为条件（不使用 RGBD encoder）。
+    参考 InternNav 的 TransformerForDiffusion 实现，包含完整的：
+    - 权重初始化
+    - 条件编码器
+    - 因果掩码
     
     Args:
         vlm_token_dim: VLM (Qwen3-VL) 输出的 token 维度
-        token_dim: 内部 token 维度
-        predict_size: 预测的轨迹步数
-        temporal_depth: Transformer Decoder 层数
-        heads: 注意力头数
-        dropout: Dropout 比例
+        n_emb: 内部嵌入维度 (对应 InternNav 的 n_emb)
+        predict_size: 预测的轨迹步数 (horizon)
+        n_layer: Transformer Decoder 层数
+        n_head: 注意力头数
+        n_cond_layers: 条件编码器层数 (0 表示不使用)
+        p_drop_emb: Embedding dropout
+        p_drop_attn: Attention dropout
         action_dim: 动作维度 (3 for x, y, theta)
         num_train_timesteps: 扩散训练步数
         action_scale: 动作放大倍数
+        causal_attn: 是否使用因果注意力
     """
     
     def __init__(
         self,
         vlm_token_dim: int = 1024,
-        token_dim: int = 384,
+        n_emb: int = 384,
         predict_size: int = 24,
-        temporal_depth: int = 16,
-        heads: int = 8,
-        dropout: float = 0.1,
+        n_layer: int = 16,
+        n_head: int = 8,
+        n_cond_layers: int = 4,  # 条件编码器层数
+        p_drop_emb: float = 0.1,
+        p_drop_attn: float = 0.1,
         action_dim: int = 3,
         num_train_timesteps: int = 20,
         action_scale: float = 4.0,
+        causal_attn: bool = True,
+        n_obs_steps: int = 1,  # 观测步数（VLM pooled = 1）
         input_dtype: str = "bf16",
     ):
         super().__init__()
         
         self.predict_size = predict_size
-        self.token_dim = token_dim
+        self.n_emb = n_emb
         self.vlm_token_dim = vlm_token_dim
         self.action_dim = action_dim
         self.action_scale = action_scale
-        self.temporal_depth = temporal_depth
+        self.n_layer = n_layer
+        self.n_obs_steps = n_obs_steps
+        self.causal_attn = causal_attn
+        self.use_encoder = n_cond_layers > 0
         
         if input_dtype == "bf16":
             self.input_dtype = torch.bfloat16
         else:
             self.input_dtype = torch.float32
         
-        # VLM token 投影 (参考 InternNav)
-        self.vlm_embed_mlp = nn.Sequential(
-            nn.Linear(vlm_token_dim, vlm_token_dim // 4),
-            nn.ReLU(),
-            nn.Linear(vlm_token_dim // 4, vlm_token_dim // 8),
-            nn.ReLU(),
-            nn.Linear(vlm_token_dim // 8, token_dim),
-        )
+        # ==================== 计算 token 数量 ====================
+        T = predict_size  # 预测 horizon
+        T_cond = 1 + n_obs_steps  # time + obs
         
-        # 动作输入嵌入
-        self.input_embed = nn.Linear(action_dim, token_dim)
+        self.T = T
+        self.T_cond = T_cond
         
-        # 位置嵌入
-        # cond_pos_embed: [time_embed, goal_embed] = 2 个 token
-        self.cond_pos_embed = nn.Parameter(torch.zeros((1, 2, token_dim)))
-        self.out_pos_embed = nn.Parameter(torch.zeros((1, predict_size, token_dim)))
+        # ==================== Input Embedding ====================
+        # 动作输入嵌入（参考 InternNav self.input_emb）
+        self.input_emb = nn.Linear(action_dim, n_emb)
+        
+        # 位置嵌入（后面会用正态分布初始化）
+        self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
         
         # Dropout
-        self.drop = nn.Dropout(dropout)
+        self.drop = nn.Dropout(p_drop_emb)
         
+        # ==================== Condition Encoder ====================
         # 时间步嵌入
-        self.time_emb = SinusoidalPosEmb(token_dim)
+        self.time_emb = SinusoidalPosEmb(n_emb)
         
-        # Transformer Decoder
+        # VLM 条件嵌入（简化为单层线性，参考 InternNav self.cond_obs_emb）
+        self.cond_obs_emb = nn.Linear(vlm_token_dim, n_emb)
+        
+        # 条件位置嵌入
+        self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
+        
+        # 条件编码器（TransformerEncoder，参考 InternNav）
+        self.encoder = None
+        if self.use_encoder and n_cond_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * n_emb,
+                dropout=p_drop_attn,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer=encoder_layer, 
+                num_layers=n_cond_layers
+            )
+        
+        # ==================== Transformer Decoder ====================
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=token_dim,
-            nhead=heads,
-            dim_feedforward=4 * token_dim,
-            dropout=dropout,
+            d_model=n_emb,
+            nhead=n_head,
+            dim_feedforward=4 * n_emb,
+            dropout=p_drop_attn,
             activation='gelu',
             batch_first=True,
-            norm_first=True,
+            norm_first=True,  # 重要：稳定性
         )
         self.decoder = nn.TransformerDecoder(
             decoder_layer=decoder_layer, 
-            num_layers=temporal_depth
+            num_layers=n_layer
         )
         
-        # 输出层
-        self.layernorm = nn.LayerNorm(token_dim)
-        self.action_head = nn.Linear(token_dim, action_dim)
+        # ==================== Output Head ====================
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.head = nn.Linear(n_emb, action_dim)
         
-        # Diffusion Scheduler
+        # ==================== Diffusion Scheduler ====================
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_schedule='squaredcos_cap_v2',
@@ -136,95 +176,145 @@ class TransformerActionHead(nn.Module):
             prediction_type='epsilon',
         )
         
-        # 因果掩码 (下三角)
-        self.register_buffer(
-            'tgt_mask',
-            self._generate_causal_mask(predict_size)
-        )
+        # ==================== Attention Masks ====================
+        # 因果掩码 (tgt_mask)
+        if causal_attn:
+            sz = T
+            mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+            mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+            self.register_buffer('tgt_mask', mask)
+            
+            # Memory mask（交叉注意力掩码）
+            # 参考 InternNav: t >= (s - 1) 确保因果性
+            t_idx, s_idx = torch.meshgrid(
+                torch.arange(T), 
+                torch.arange(T_cond), 
+                indexing='ij'
+            )
+            memory_mask = t_idx >= (s_idx - 1)
+            memory_mask = memory_mask.float().masked_fill(memory_mask == 0, float('-inf')).masked_fill(memory_mask == 1, float(0.0))
+            self.register_buffer('memory_mask', memory_mask)
+        else:
+            self.tgt_mask = None
+            self.memory_mask = None
+        
+        # ==================== 权重初始化 ====================
+        self.apply(self._init_weights)
         
         logger.info(
             f"TransformerActionHead initialized: "
-            f"predict_size={predict_size}, token_dim={token_dim}, "
-            f"temporal_depth={temporal_depth}, action_dim={action_dim}"
+            f"predict_size={predict_size}, n_emb={n_emb}, "
+            f"n_layer={n_layer}, n_cond_layers={n_cond_layers}, "
+            f"action_dim={action_dim}, causal_attn={causal_attn}"
         )
+        logger.info(f"  Total parameters: {sum(p.numel() for p in self.parameters()):,}")
     
-    def _generate_causal_mask(self, size: int) -> torch.Tensor:
-        """生成因果掩码（下三角）"""
-        mask = torch.triu(torch.ones(size, size), diagonal=1)
-        mask = mask.masked_fill(mask == 1, float('-inf'))
-        return mask
-    
-    def sample_noise(self, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _init_weights(self, module):
         """
-        采样噪声用于训练
+        权重初始化（参考 InternNav TransformerForDiffusion._init_weights）
+        """
+        ignore_types = (
+            nn.Dropout,
+            SinusoidalPosEmb,
+            nn.TransformerEncoderLayer,
+            nn.TransformerDecoderLayer,
+            nn.TransformerEncoder,
+            nn.TransformerDecoder,
+            nn.ModuleList,
+            nn.Sequential,
+        )
         
-        参考 InternNav navdp.py sample_noise()
-        
-        Args:
-            action: (B, predict_size, action_dim) 真实轨迹
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.MultiheadAttention):
+            # 初始化注意力权重
+            weight_names = ['in_proj_weight', 'q_proj_weight', 'k_proj_weight', 'v_proj_weight']
+            for name in weight_names:
+                weight = getattr(module, name, None)
+                if weight is not None:
+                    torch.nn.init.normal_(weight, mean=0.0, std=0.02)
             
-        Returns:
-            noise: 采样的噪声
-            time_embeds: 时间步嵌入
-            noisy_action_embed: 加噪后的动作嵌入
-        """
-        noise = torch.randn(action.shape, dtype=action.dtype, device=action.device)
-        
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (action.shape[0],), device=action.device
-        ).long()
-        
-        time_embeds = self.time_emb(timesteps).unsqueeze(1)
-        
-        noisy_action = self.noise_scheduler.add_noise(action, noise, timesteps)
-        noisy_action_embed = self.input_embed(noisy_action)
-        
-        return noise, time_embeds, noisy_action_embed
+            bias_names = ['in_proj_bias', 'bias_k', 'bias_v']
+            for name in bias_names:
+                bias = getattr(module, name, None)
+                if bias is not None:
+                    torch.nn.init.zeros_(bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, TransformerActionHead):
+            # 位置嵌入使用正态分布初始化
+            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
+        elif isinstance(module, ignore_types):
+            pass
+        # 不抛出异常，允许其他模块使用默认初始化
     
-    def predict_noise(
-        self, 
-        last_actions: torch.Tensor, 
-        timestep: torch.Tensor, 
-        goal_embed: torch.Tensor,
+    def forward_diffusion(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        cond: torch.Tensor,
     ) -> torch.Tensor:
         """
-        预测噪声
+        Diffusion 前向传播（预测噪声）
         
-        参考 InternNav navdp.py predict_noise()
+        参考 InternNav TransformerForDiffusion.forward()
         
         Args:
-            last_actions: (B, predict_size, action_dim) 当前动作
-            timestep: (1,) 当前时间步
-            goal_embed: (B, 1, token_dim) VLM 条件嵌入
+            sample: (B, T, action_dim) 加噪的动作序列
+            timestep: (B,) 或标量 时间步
+            cond: (B, n_obs_steps, vlm_token_dim) 条件（VLM 特征）
             
         Returns:
-            noise_pred: (B, predict_size, action_dim) 预测的噪声
+            noise_pred: (B, T, action_dim) 预测的噪声
         """
-        action_embeds = self.input_embed(last_actions)
-        time_embeds = self.time_emb(timestep.to(last_actions.device)).unsqueeze(1)
+        device = sample.device
+        batch_size = sample.shape[0]
         
-        # 扩展 time_embeds 到 batch size
-        if time_embeds.shape[0] == 1 and action_embeds.shape[0] > 1:
-            time_embeds = time_embeds.expand(action_embeds.shape[0], -1, -1)
+        # 1. 处理时间步
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(device)
+        timestep = timestep.expand(batch_size)
         
-        # 条件嵌入: [time, goal]
-        cond_embedding = torch.cat([time_embeds, goal_embed], dim=1)
-        cond_embedding = cond_embedding + self.cond_pos_embed[:, :cond_embedding.size(1), :]
+        time_emb = self.time_emb(timestep).unsqueeze(1)  # (B, 1, n_emb)
         
-        # 动作嵌入 + 位置编码
-        input_embedding = action_embeds + self.out_pos_embed[:, :self.predict_size, :]
+        # 2. 处理条件
+        cond_obs_emb = self.cond_obs_emb(cond)  # (B, n_obs_steps, n_emb)
+        cond_embeddings = torch.cat([time_emb, cond_obs_emb], dim=1)  # (B, T_cond, n_emb)
         
-        # Transformer Decoder
-        output = self.decoder(
-            tgt=input_embedding, 
-            memory=cond_embedding, 
-            tgt_mask=self.tgt_mask.to(input_embedding.device)
+        # 添加条件位置嵌入
+        tc = cond_embeddings.shape[1]
+        cond_embeddings = self.drop(cond_embeddings + self.cond_pos_emb[:, :tc, :])
+        
+        # 3. 条件编码器
+        if self.encoder is not None:
+            memory = self.encoder(cond_embeddings)
+        else:
+            memory = cond_embeddings
+        
+        # 4. 处理输入
+        input_emb = self.input_emb(sample)  # (B, T, n_emb)
+        t = input_emb.shape[1]
+        input_emb = self.drop(input_emb + self.pos_emb[:, :t, :])
+        
+        # 5. Transformer Decoder
+        x = self.decoder(
+            tgt=input_emb,
+            memory=memory,
+            tgt_mask=self.tgt_mask.to(device) if self.tgt_mask is not None else None,
+            memory_mask=self.memory_mask.to(device) if self.memory_mask is not None else None,
         )
-        output = self.layernorm(output)
-        output = self.action_head(output)
         
-        return output
+        # 6. Output head
+        x = self.ln_f(x)
+        x = self.head(x)
+        
+        return x
     
     def forward(
         self,
@@ -246,21 +336,22 @@ class TransformerActionHead(nn.Module):
         device = llm_features.device
         batch_size = llm_features.shape[0]
         
-        # 1. 处理 LLM 特征
-        if llm_features.dim() == 3:
-            # (B, seq_len, dim) -> (B, dim) -> (B, 1, token_dim)
-            llm_pooled = llm_features.mean(dim=1)
+        # 1. 处理 LLM 特征 -> (B, n_obs_steps, vlm_token_dim)
+        if llm_features.dim() == 2:
+            # (B, dim) -> (B, 1, dim)
+            cond = llm_features.unsqueeze(1)
+        elif llm_features.dim() == 3:
+            # (B, seq_len, dim) -> (B, 1, dim) 池化
+            cond = llm_features.mean(dim=1, keepdim=True)
         else:
-            llm_pooled = llm_features
-        
-        vlm_embed = self.vlm_embed_mlp(llm_pooled).unsqueeze(1)  # (B, 1, token_dim)
+            cond = llm_features
         
         # 2. 训练模式：计算 diffusion loss
         if gt_trajectory is not None and return_loss:
-            return self._compute_training_loss(vlm_embed, gt_trajectory)
+            return self._compute_training_loss(cond, gt_trajectory)
         
         # 3. 推理模式：迭代去噪
-        trajectory = self._diffusion_inference(vlm_embed, batch_size, device)
+        trajectory = self._diffusion_inference(cond, batch_size, device)
         
         return {
             'trajectory': trajectory,
@@ -269,34 +360,29 @@ class TransformerActionHead(nn.Module):
     
     def _compute_training_loss(
         self,
-        vlm_embed: torch.Tensor,
+        cond: torch.Tensor,
         gt_trajectory: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         计算训练 loss
-        
-        参考 InternNav forward_vlm_traj()
         """
-        device = vlm_embed.device
+        device = cond.device
+        batch_size = cond.shape[0]
         
         # 采样噪声
-        noise, time_embed, noisy_action_embed = self.sample_noise(gt_trajectory)
+        noise = torch.randn_like(gt_trajectory)
         
-        # 条件嵌入
-        cond_embed = torch.cat([time_embed, vlm_embed], dim=1)
-        cond_embeddings = self.drop(cond_embed + self.cond_pos_embed[:, :cond_embed.size(1), :])
+        # 采样时间步
+        timesteps = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps,
+            (batch_size,), device=device
+        ).long()
         
-        # 动作嵌入
-        action_embeddings = self.drop(noisy_action_embed + self.out_pos_embed[:, :self.predict_size, :])
+        # 加噪
+        noisy_trajectory = self.noise_scheduler.add_noise(gt_trajectory, noise, timesteps)
         
-        # Transformer Decoder
-        output = self.decoder(
-            tgt=action_embeddings, 
-            memory=cond_embeddings, 
-            tgt_mask=self.tgt_mask.to(device)
-        )
-        output = self.layernorm(output)
-        noise_pred = self.action_head(output)
+        # 预测噪声
+        noise_pred = self.forward_diffusion(noisy_trajectory, timesteps, cond)
         
         # MSE Loss
         loss = F.mse_loss(noise_pred, noise)
@@ -309,37 +395,33 @@ class TransformerActionHead(nn.Module):
     
     def _diffusion_inference(
         self,
-        vlm_embed: torch.Tensor,
+        cond: torch.Tensor,
         batch_size: int,
         device: torch.device,
     ) -> torch.Tensor:
         """
         Diffusion 推理：迭代去噪生成轨迹
-        
-        参考 InternNav predict_pointgoal_action()
         """
         # 初始化随机噪声
-        noisy_action = torch.randn(
+        noisy_trajectory = torch.randn(
             (batch_size, self.predict_size, self.action_dim),
-            dtype=vlm_embed.dtype,
+            dtype=cond.dtype,
             device=device,
         )
-        
-        naction = noisy_action
         
         # 设置时间步
         self.noise_scheduler.set_timesteps(self.noise_scheduler.config.num_train_timesteps)
         
         # 迭代去噪
         for k in self.noise_scheduler.timesteps:
-            noise_pred = self.predict_noise(naction, k.unsqueeze(0), vlm_embed)
-            naction = self.noise_scheduler.step(
+            noise_pred = self.forward_diffusion(noisy_trajectory, k, cond)
+            noisy_trajectory = self.noise_scheduler.step(
                 model_output=noise_pred, 
                 timestep=k, 
-                sample=naction
+                sample=noisy_trajectory
             ).prev_sample
         
-        return naction
+        return noisy_trajectory
     
     def compute_loss(
         self,
@@ -364,7 +446,7 @@ class TransformerActionHead(nn.Module):
         if trajectory_valid is not None:
             mask = trajectory_valid.float()
             if mask.sum() > 0:
-                # 需要重新计算 per-sample loss
+                # 重新计算 per-sample loss
                 noise_pred = result['noise_pred']
                 noise = result['noise']
                 per_sample_loss = F.mse_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2))
@@ -394,11 +476,11 @@ class TransformerActionHead(nn.Module):
 
 def create_transformer_action_head(
     vlm_token_dim: int = 1024,
-    token_dim: int = 384,
+    n_emb: int = 384,
     predict_size: int = 24,
-    temporal_depth: int = 16,
-    heads: int = 8,
-    dropout: float = 0.1,
+    n_layer: int = 16,
+    n_head: int = 8,
+    n_cond_layers: int = 4,
     action_dim: int = 3,
     num_train_timesteps: int = 20,
     action_scale: float = 4.0,
@@ -408,11 +490,11 @@ def create_transformer_action_head(
     
     model = TransformerActionHead(
         vlm_token_dim=vlm_token_dim,
-        token_dim=token_dim,
+        n_emb=n_emb,
         predict_size=predict_size,
-        temporal_depth=temporal_depth,
-        heads=heads,
-        dropout=dropout,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_cond_layers=n_cond_layers,
         action_dim=action_dim,
         num_train_timesteps=num_train_timesteps,
         action_scale=action_scale,

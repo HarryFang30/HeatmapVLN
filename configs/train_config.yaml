@@ -90,14 +90,17 @@ model:
     # Transformer (InternNav style) 配置 - 仅当 type: transformer 时使用
     transformer:
       vlm_token_dim: 1024        # VLM 输出维度
-      token_dim: 384             # 内部 token 维度
+      n_emb: 384                 # 内部嵌入维度 (原 token_dim)
       predict_size: 24           # 预测 24 步轨迹
-      temporal_depth: 16         # Transformer Decoder 层数
-      heads: 8                   # 注意力头数
+      n_layer: 16                # Transformer Decoder 层数 (原 temporal_depth)
+      n_head: 8                  # 注意力头数 (原 heads)
+      n_cond_layers: 4           # 条件编码器层数 (参考 InternNav)
       action_dim: 3              # 动作维度 (dx, dy, delta_yaw)
       num_train_timesteps: 20    # 扩散训练步数
       action_scale: 4.0          # 动作放大倍数
-      dropout: 0.1
+      p_drop_emb: 0.1            # Embedding dropout
+      p_drop_attn: 0.1           # Attention dropout
+      causal_attn: true          # 使用因果注意力
 
   # Progress 预测头配置（替代 Stop Head）
   progress_head:

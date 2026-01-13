@@ -82,11 +82,15 @@ class VLNPipelineConfig:
     # Transformer action head settings (TransformerActionHead, InternNav style)
     transformer_action_dim: int = 3  # (dx, dy, delta_yaw)
     transformer_predict_size: int = 24  # 24 step trajectory
-    transformer_token_dim: int = 384  # Internal token dimension
-    transformer_temporal_depth: int = 16  # Transformer decoder layers
-    transformer_heads: int = 8
+    transformer_n_emb: int = 384  # Internal embedding dimension
+    transformer_n_layer: int = 16  # Transformer decoder layers
+    transformer_n_head: int = 8
+    transformer_n_cond_layers: int = 4  # Condition encoder layers
     transformer_num_train_timesteps: int = 20
     transformer_action_scale: float = 4.0  # Action scaling factor
+    transformer_p_drop_emb: float = 0.1  # Embedding dropout
+    transformer_p_drop_attn: float = 0.1  # Attention dropout
+    transformer_causal_attn: bool = True  # Use causal attention
     
     # Stop/Progress prediction
     enable_stop_head: bool = False  # Deprecated, use progress_head instead
@@ -181,18 +185,23 @@ class VLNPipeline(nn.Module):
                 # New: TransformerActionHead (InternNav style)
                 self.transformer_action_head = TransformerActionHead(
                     vlm_token_dim=config.llm_token_dim,
-                    token_dim=config.transformer_token_dim,
+                    n_emb=config.transformer_n_emb,
                     predict_size=config.transformer_predict_size,
-                    temporal_depth=config.transformer_temporal_depth,
-                    heads=config.transformer_heads,
-                    dropout=0.1,
+                    n_layer=config.transformer_n_layer,
+                    n_head=config.transformer_n_head,
+                    n_cond_layers=config.transformer_n_cond_layers,
+                    p_drop_emb=config.transformer_p_drop_emb,
+                    p_drop_attn=config.transformer_p_drop_attn,
                     action_dim=config.transformer_action_dim,
                     num_train_timesteps=config.transformer_num_train_timesteps,
                     action_scale=config.transformer_action_scale,
+                    causal_attn=config.transformer_causal_attn,
                 ).to(device=self.device, dtype=config.dtype)
                 logger.info(
                     f"✓ TransformerActionHead initialized: "
                     f"predict_size={config.transformer_predict_size}, "
+                    f"n_layer={config.transformer_n_layer}, "
+                    f"n_cond_layers={config.transformer_n_cond_layers}, "
                     f"action_dim={config.transformer_action_dim}"
                 )
             else:
