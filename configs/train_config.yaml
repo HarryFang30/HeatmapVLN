@@ -20,7 +20,7 @@ data:
   
   sliding_window:
     min_history: 5
-    num_history_sample: 8
+    num_history_sample: 12       # 增加历史帧数量 (8 → 12)
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -33,7 +33,7 @@ data:
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
     min_history: 5
-    num_history_sample: 8
+    num_history_sample: 12       # 增加历史帧数量 (8 → 12)，提供更多上下文
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -162,10 +162,10 @@ optim:
   warmup_ratio: 0.1
   
   # 批量配置（每个样本单独过 Qwen3-VL）
-  # 110GB RAM，激进配置
-  # 有效批量: 32 * 4 = 128
-  batch_size: 32
-  grad_accum_steps: 4
+  # RTX 5090 32GB 显存优化配置
+  # 有效批量: 48 * 3 = 144
+  batch_size: 48
+  grad_accum_steps: 3
 
 # ============================================
 # 损失函数
