@@ -359,13 +359,14 @@ class DiffusionHeatmapHead(nn.Module):
         """
         从对数空间反归一化到热力图
         
-        使用 max-to-1 归一化，不截断小值，保持相对比例。
+        直接 clamp 到 [0, 1]，不再做 max-to-1 归一化，
+        确保训练和推理时的行为一致。
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [-1, 1] (对数空间)
             
         Returns:
-            (B, 1, H, W) normalized heatmap (max value = 1)
+            (B, 1, H, W) heatmap in [0, 1]
         """
         log_scale = 6.0
         max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device, dtype=heatmap.dtype))
@@ -376,11 +377,10 @@ class DiffusionHeatmapHead(nn.Module):
         # 从对数空间恢复：exp(log_heatmap) - 1 然后除以 scale
         recovered = (torch.exp(log_heatmap) - 1) / log_scale
         
-        # Max-to-1 归一化（不截断小值，保持相对比例）
-        B = heatmap.shape[0]
-        max_vals = recovered.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
-        max_vals = max_vals.clamp(min=1e-6)  # 仅避免除零
-        normalized = recovered / max_vals
+        # 直接 clamp 到 [0, 1]，不再做 max-to-1
+        # 因为训练时 GT 已经是 [0, 1] 范围，推理时也应该输出相同范围
+        # 这样训练和推理时的行为完全一致
+        normalized = recovered.clamp(0, 1)
         
         return normalized
     
