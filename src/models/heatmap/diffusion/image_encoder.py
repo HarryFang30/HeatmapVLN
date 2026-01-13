@@ -9,10 +9,85 @@ Architecture options:
 2. ResNet-based encoder (optional)
 """
 
+import math
 from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ==================== Attention Pooling ====================
+
+class AttentionPooling(nn.Module):
+    """
+    Attention-based pooling for sequence features.
+    
+    使用可学习的 query 向量通过 attention 机制聚合序列特征，
+    比 mean pooling 更好地保留重要信息。
+    
+    Args:
+        dim: Feature dimension
+        num_heads: Number of attention heads (default 4)
+    """
+    
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        # 可学习的 query 向量
+        self.query = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        
+        # 投影层
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        # 输出投影
+        self.out_proj = nn.Linear(dim, dim)
+        
+        # LayerNorm
+        self.norm = nn.LayerNorm(dim)
+        
+        self.scale = self.head_dim ** -0.5
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, seq_len, dim) sequence features
+            
+        Returns:
+            (B, dim) pooled features
+        """
+        B, seq_len, dim = x.shape
+        
+        # Normalize input
+        x = self.norm(x)
+        
+        # Expand query for batch
+        query = self.query.expand(B, -1, -1)  # (B, 1, dim)
+        
+        # Compute key and value
+        key = self.k_proj(x)    # (B, seq_len, dim)
+        value = self.v_proj(x)  # (B, seq_len, dim)
+        
+        # Reshape for multi-head attention
+        query = query.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(B, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(B, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # query: (B, num_heads, 1, head_dim)
+        # key/value: (B, num_heads, seq_len, head_dim)
+        
+        # Attention
+        attn = torch.matmul(query, key.transpose(-1, -2)) * self.scale  # (B, num_heads, 1, seq_len)
+        attn = F.softmax(attn, dim=-1)
+        
+        # Aggregate
+        out = torch.matmul(attn, value)  # (B, num_heads, 1, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, 1, dim)  # (B, 1, dim)
+        out = self.out_proj(out)
+        
+        return out.squeeze(1)  # (B, dim)
 
 
 def _get_num_groups(num_channels: int, max_groups: int = 32) -> int:
@@ -184,7 +259,8 @@ class LLMConditionProjector(nn.Module):
         input_dim: LLM hidden dimension
         output_dim: Output conditioning dimension
         hidden_dim: Intermediate dimension
-        pool_method: How to pool sequence ('mean', 'first', 'last', 'max')
+        pool_method: How to pool sequence ('mean', 'first', 'last', 'max', 'attention')
+        num_attention_heads: Number of heads for attention pooling (only used when pool_method='attention')
     """
     
     def __init__(
@@ -192,12 +268,19 @@ class LLMConditionProjector(nn.Module):
         input_dim: int = 2048,
         output_dim: int = 512,
         hidden_dim: int = 1024,
-        pool_method: str = 'mean',
+        pool_method: str = 'attention',  # 默认改为 attention
         dropout: float = 0.1,
+        num_attention_heads: int = 4,
     ):
         super().__init__()
 
         self.pool_method = pool_method
+
+        # Attention pooling (推荐，更好地保留空间信息)
+        if pool_method == 'attention':
+            self.attention_pool = AttentionPooling(input_dim, num_heads=num_attention_heads)
+        else:
+            self.attention_pool = None
 
         # Added Dropout for regularization to prevent overfitting
         self.projector = nn.Sequential(
@@ -223,7 +306,9 @@ class LLMConditionProjector(nn.Module):
             return self.projector(x)
         
         # Pool sequence dimension
-        if self.pool_method == 'mean':
+        if self.pool_method == 'attention':
+            x = self.attention_pool(x)
+        elif self.pool_method == 'mean':
             x = x.mean(dim=1)
         elif self.pool_method == 'first':
             x = x[:, 0]
@@ -252,7 +337,8 @@ class MultiModalConditionEncoder(nn.Module):
         cond_dim: Output conditioning dimension
         image_encoder_channels: Channel dims for image encoder
         llm_hidden_dim: Intermediate dim for LLM projector
-        pool_method: How to pool LLM sequence
+        pool_method: How to pool LLM sequence ('attention', 'mean', 'first', 'last', 'max')
+        pool_num_heads: Number of attention heads for attention pooling
     """
     
     def __init__(
@@ -262,7 +348,8 @@ class MultiModalConditionEncoder(nn.Module):
         cond_dim: int = 512,
         image_encoder_channels: List[int] = None,
         llm_hidden_dim: int = 1024,
-        pool_method: str = 'mean',
+        pool_method: str = 'attention',
+        pool_num_heads: int = 4,
         image_size: Tuple[int, int] = (224, 224),
         dropout: float = 0.1,
         use_image_encoder: bool = True,
@@ -274,13 +361,14 @@ class MultiModalConditionEncoder(nn.Module):
 
         self.use_image_encoder = use_image_encoder
 
-        # LLM projector
+        # LLM projector with attention pooling support
         self.llm_projector = LLMConditionProjector(
             input_dim=llm_dim,
             output_dim=cond_dim,
             hidden_dim=llm_hidden_dim,
             pool_method=pool_method,
             dropout=dropout,
+            num_attention_heads=pool_num_heads,
         )
 
         # Image encoder (only created if use_image_encoder=True)

@@ -69,6 +69,10 @@ model:
     num_inference_steps: 10
     # CNN 消融实验开关：设为 false 禁用 ImageConditionEncoder，只用 LLM 特征
     use_image_encoder: false
+    # LLM token pooling 方式：'attention' (推荐) 或 'mean', 'first', 'last', 'max'
+    # attention pooling 更好地保留空间信息，比 mean pooling 效果更好
+    pool_method: attention
+    pool_num_heads: 4
 
   # 动作头配置
   action_head:

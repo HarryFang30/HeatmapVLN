@@ -71,6 +71,7 @@ class DiffusionHeatmapHead(nn.Module):
         # Training optimization: inference monitoring control
         self._training_step_counter = 0
         self._inference_interval = 100  # Generate heatmap every N steps during training
+        self._peak_loss_interval = 20   # Compute peak loss every N steps (was 3, now 20 for efficiency)
         
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
@@ -80,6 +81,7 @@ class DiffusionHeatmapHead(nn.Module):
             image_encoder_channels=config.image_encoder_channels,
             llm_hidden_dim=config.llm_hidden_dim,
             pool_method=config.llm_pool_method,
+            pool_num_heads=config.llm_pool_num_heads,
             image_size=config.image_size,
             dropout=config.dropout,
             use_image_encoder=config.use_image_encoder,
@@ -242,8 +244,8 @@ class DiffusionHeatmapHead(nn.Module):
         peak_loss = torch.tensor(0.0, device=device)
         variance_loss = torch.tensor(0.0, device=device)
 
-        # 每3步计算一次峰值保持损失（更频繁以更好地防止坍缩）
-        compute_peak_loss = (self._training_step_counter % 3 == 0)
+        # 每20步计算一次峰值保持损失（优化训练效率，原为每3步）
+        compute_peak_loss = (self._training_step_counter % self._peak_loss_interval == 0)
 
         if compute_peak_loss or not skip_inference:
             with torch.no_grad():

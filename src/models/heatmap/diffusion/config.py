@@ -50,7 +50,8 @@ class DiffusionHeatmapConfig:
     
     # LLM projection
     llm_hidden_dim: int = 1024             # Intermediate projection dim
-    llm_pool_method: str = 'mean'          # How to pool LLM sequence
+    llm_pool_method: str = 'attention'     # How to pool LLM sequence ('attention', 'mean', 'first', 'last', 'max')
+    llm_pool_num_heads: int = 4            # Number of attention heads for attention pooling
     
     # Image encoder
     image_encoder_channels: List[int] = field(
