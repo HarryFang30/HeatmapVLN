@@ -11,6 +11,12 @@ Features:
 - Extract hidden states for heatmap/action/stop heads
 """
 
+import warnings
+# Suppress Qwen3-VL internal warnings
+warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
+warnings.filterwarnings("ignore", message=".*fps.*frames per second.*")
+warnings.filterwarnings("ignore", message=".*video_metadata.*")
+
 import torch
 import torch.nn as nn
 import logging
