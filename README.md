@@ -11,8 +11,8 @@
 
 当前仓库内真实可用的入口脚本为：
 
-- `scripts/train.py`：训练（四阶段 curriculum，包含 history/future 热力图 + action + stop）
-- `scripts/evaluate.py`：评估（支持 history/future/action，支持保存可视化）
+- `scripts/train.py`：训练（单阶段训练 history 热力图 + action + stop）
+- `scripts/evaluate.py`：评估（支持 history/action，支持保存可视化）
 - `scripts/inference.py`：推理（支持对视频或数据集 clip 运行并保存热力图/动作）
 
 
@@ -678,13 +678,12 @@ python scripts/inference.py \
 训练脚本：`scripts/train.py`  
 默认读取：`--config configs/train_config.yaml`
 
-### 一键按配置跑完整四阶段
+### 开始训练
 
 ```bash
 cd HeatmapVLN
 
-python scripts/train.py \
-  --config configs/train_config.yaml
+python scripts/train.py --config configs/train_config.yaml
 ```
 
 ### 常用训练参数
@@ -705,16 +704,6 @@ python scripts/train.py \
   --auto-resume
 ```
 
-- **只跑某个阶段（按名称或索引）**
-
-```bash
-# 例：只跑 joint_128 阶段
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --stage joint_128 \
-  --stage-only
-```
-
 - **调试：只构建模型与数据，不实际训练**
 
 ```bash
@@ -729,42 +718,23 @@ python scripts/train.py \
   --epochs 2
 ```
 
-#### 5. 高级用法
-
-```bash
-# 从阶段 2 开始，一直训练到最后
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --stage-index 1
-
-# 跳过前 3 个 epoch，从第 4 个开始
-python scripts/train.py \
-  --config configs/train_config.yaml \
-  --start-epoch 4 \
-  --stage warmup_history_64 \
-  --stage-only
-```
-
 **训练代码（后台运行）**
 ```bash
-cd /root/VLN/Project && source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && nohup python -u scripts/train.py --config configs/train_config.yaml --stage-index 0 --stage-only > train_stage1.log 2>&1 &
+cd /root/HeatmapVLN && source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && nohup python -u scripts/train.py --config configs/train_config.yaml > train.log 2>&1 &
 
 # 实时查看日志
-tail -f train_stage1.log
+tail -f train.log
 ```
 
 > 💡 **提示**：`python -u` 禁用输出缓冲，确保日志实时写入文件。
 
 ### 训练配置说明
 
-配置文件 `configs/train_config.yaml` 包含 **4 阶段渐进式训练**策略:
+配置文件 `configs/train_config.yaml` 包含单阶段训练配置:
 
-| 阶段 | 名称 | Epochs | 分辨率 | 训练目标 | Loss 类型 |
-|------|------|--------|--------|----------|-----------|
-| 0 | `warmup_history_64` | 5 | 64×64 | History Head + Action Head | Simplified |
-| 1 | `warmup_future_64` | 5 | 64×64 | Future Head（冻结 History） | Simplified |
-| 2 | `joint_128` | 10 | 128×128 | 双 Head 联合训练 | NeRF Ripple |
-| 3 | `full_224` | 20 | 224×224 | 完整训练 + 解冻 Projector | NeRF Ripple |
+| 名称 | Epochs | 分辨率 | 训练目标 | Loss 类型 |
+|------|--------|--------|----------|-----------|
+| `history_only_64` | 50 | 64×64 | History Head + Action Head + Stop Head | Simplified |
 
 **关键配置项**:
 
@@ -773,7 +743,7 @@ data:
   root: dataset_with_actions  # 数据集路径
   sliding_window:
     num_history_sample: 8     # 历史帧采样数
-    sample_stride: 1          # 采样步长
+    sample_stride: 5          # 采样步长
     # Clip-level 采样（防止过拟合）
     clip_level_sampling: true # 启用 clip-level 采样
     samples_per_clip: 2       # 每 clip 每 epoch 采样 2 个样本
@@ -781,6 +751,9 @@ data:
 model:
   llm:
     model_path: ./models/qwen_3_vl  # Qwen3-VL 模型路径
+  heatmap_head:
+    enable_history: true      # 启用历史热力图头
+    enable_future: false      # 禁用未来热力图头
   action_head:
     enable: true              # 启用动作预测
   stop_head:
@@ -796,7 +769,7 @@ optim:
   weight_decay: 1.0e-2        # 增加正则化
 
 log:
-  out_dir: vln_history_action_outputs
+  out_dir: vln_training_outputs
   use_tensorboard: true
 ```
 
@@ -1022,18 +995,16 @@ diag/action_noise_pred_std # 动作噪声预测标准差
 训练输出保存在 `log.out_dir` 指定路径:
 
 ```text
-vln_history_action_outputs/
+vln_training_outputs/
   ├── train.log                     # 训练日志
   ├── training_curves.png           # 训练曲线图（实时更新）
   ├── training_history.json         # 训练历史数据
-  ├── best_model.pth                # 最佳模型（全局）
+  ├── best_model.pth                # 最佳模型
   ├── latest.pth                    # 最新检查点（用于续训）
-  ├── warmup_history_64/            # 阶段 1 检查点
+  ├── history_only_64/              # 检查点目录
   │   ├── epoch_001.pth
   │   ├── epoch_002.pth
   │   └── ...
-  ├── joint_128/                    # 阶段 3 检查点
-  ├── full_224/                     # 阶段 4 检查点
   └── visualizations/               # 热力图可视化
       └── epoch_001_step_00100.png
 ```

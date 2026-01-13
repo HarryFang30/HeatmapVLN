@@ -4,12 +4,7 @@ VLN 训练脚本
 ==============
 
 使用 Qwen3-VL 进行视觉语言导航训练。
-
-训练阶段：
-- Stage 1: History 热力图头预热 (64x64)
-- Stage 2: Future 热力图头预热 (64x64)
-- Stage 3: 联合训练 (128x128)
-- Stage 4: 精细训练 (224x224)
+单阶段训练：History 热力图头 + Action Head + Stop Head
 """
 
 import sys
@@ -71,30 +66,28 @@ logger = logging.getLogger(__name__)
 class TrainingTimer:
     """训练时间和 ETA 估算器"""
     
-    def __init__(self, total_epochs: int, total_stages: int = 1):
+    def __init__(self, total_epochs: int):
         self.total_epochs = total_epochs
-        self.total_stages = total_stages
         self.start_time = None
         self.epoch_times = []
-        self.stage_start_time = None
+        self.epoch_start_time = None
         
     def start(self):
         """开始计时"""
         self.start_time = time.time()
-        self.stage_start_time = time.time()
+        self.epoch_start_time = time.time()
         
-    def start_stage(self):
-        """开始新阶段"""
-        self.stage_start_time = time.time()
-        self.epoch_times = []
+    def start_epoch(self):
+        """开始新 epoch"""
+        self.epoch_start_time = time.time()
         
     def end_epoch(self):
         """记录 epoch 结束"""
-        if self.stage_start_time is None:
+        if self.epoch_start_time is None:
             return
-        elapsed = time.time() - self.stage_start_time
+        elapsed = time.time() - self.epoch_start_time
         self.epoch_times.append(elapsed)
-        self.stage_start_time = time.time()
+        self.epoch_start_time = time.time()
         
     def get_eta(self, current_epoch: int, total_epochs: int) -> str:
         """获取预估剩余时间"""
@@ -761,7 +754,7 @@ def train_one_epoch(
     
     pbar = tqdm(
         train_loader,
-        desc=f"[Stage {stage_idx+1}] Epoch {epoch}/{stage_cfg['epochs']}",
+        desc=f"Epoch {epoch}/{stage_cfg['epochs']}",
         total=total_batches,
         ncols=cfg['log'].get('tqdm_ncols', 120)
     )
@@ -870,19 +863,19 @@ def train_one_epoch(
             global_step += 1
             
             # 日志
-            log_interval = cfg['log'].get('log_interval', 10)
-            if global_step % log_interval == 0 or global_step <= 3:
-                mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
-                logger.info(
-                    f"[Stage {stage_idx+1}: {stage_name}] "
-                    f"Epoch {epoch}/{stage_cfg['epochs']} | "
-                    f"Batch {i+1}/{len(train_loader)} | "
-                    f"Step {global_step} | "
-                    f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}, stop: {stop_loss.item():.4f}) | "
-                    f"LR: {scheduler.get_last_lr()[0]:.2e} | "
-                    f"GPU: {mem_alloc:.1f}GB"
-                )
+                            log_interval = cfg['log'].get('log_interval', 10)
+                            if global_step % log_interval == 0 or global_step <= 3:
+                                mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
+                                logger.info(
+                                    f"[{stage_name}] "
+                                    f"Epoch {epoch}/{stage_cfg['epochs']} | "
+                                    f"Batch {i+1}/{len(train_loader)} | "
+                                    f"Step {global_step} | "
+                                    f"Loss: {loss.item()*grad_accum_steps:.4f} "
+                                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}, stop: {stop_loss.item():.4f}) | "
+                                    f"LR: {scheduler.get_last_lr()[0]:.2e} | "
+                                    f"GPU: {mem_alloc:.1f}GB"
+                                )
                 
                 if tb_writer is not None:
                     actual_step = global_step_offset + global_step
@@ -1293,25 +1286,17 @@ def load_checkpoint_for_resume(
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="VLN 训练脚本")
+    parser = argparse.ArgumentParser(description="VLN 训练脚本（单阶段）")
     parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                         help='配置文件路径')
     parser.add_argument('--resume', type=str, default=None, 
                         help='从检查点恢复（路径或 "latest"）')
     parser.add_argument('--auto-resume', action='store_true',
                         help='自动从最新检查点恢复')
-    
-    parser.add_argument('--stage', type=str, default=None,
-                        help='指定运行的阶段名称')
-    parser.add_argument('--stage-index', type=int, default=None,
-                        help='指定运行的阶段索引')
-    parser.add_argument('--stage-only', action='store_true',
-                        help='只运行指定的单个阶段')
     parser.add_argument('--start-epoch', type=int, default=1,
                         help='从指定 epoch 开始训练')
     parser.add_argument('--epochs', type=int, default=None,
                         help='覆盖配置中的 epoch 数量')
-    
     parser.add_argument('--dry-run', action='store_true',
                         help='只构建模型和数据，不实际训练')
     parser.add_argument('--max-batches', type=int, default=None,
@@ -1401,7 +1386,6 @@ def main():
     
     # 断点续训
     resume_epoch = 0
-    resume_stage_idx = 0
     resume_path = None
     
     if args.resume:
@@ -1417,7 +1401,6 @@ def main():
             str(resume_path), model, optimizer=None, scheduler=None, logger=logger
         )
         resume_epoch = resume_info['epoch']
-        resume_stage_idx = resume_info['stage_idx']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
     
     if args.dry_run:
@@ -1426,283 +1409,253 @@ def main():
         logger.info("=" * 60)
         return
     
-    # 确定要运行的阶段
+    # 获取训练配置（单阶段）
     all_stages = cfg['training']['stages']
-    stage_names = [s['name'] for s in all_stages]
+    if not all_stages:
+        logger.error("❌ 配置文件中没有定义训练阶段")
+        return
     
-    start_stage_idx = resume_stage_idx
-    if args.stage_index is not None:
-        start_stage_idx = args.stage_index
-    elif args.stage is not None:
-        if args.stage in stage_names:
-            start_stage_idx = stage_names.index(args.stage)
-        else:
-            logger.error(f"❌ 未知阶段名称: {args.stage}")
-            return
+    stage_cfg = all_stages[0]  # 使用第一个（也是唯一的）阶段
+    stage_name = stage_cfg['name']
     
-    if args.stage_only:
-        end_stage_idx = start_stage_idx + 1
-    else:
-        end_stage_idx = len(all_stages)
+    if args.epochs is not None:
+        stage_cfg = stage_cfg.copy()
+        stage_cfg['epochs'] = args.epochs
     
-    logger.info("=" * 60)
-    logger.info("📋 训练阶段计划:")
-    for i, s in enumerate(all_stages):
-        marker = "▶" if start_stage_idx <= i < end_stage_idx else "○"
-        logger.info(f"  {marker} Stage {i}: {s['name']} ({s['epochs']} epochs, hm={s['hm_size']})")
-    logger.info("=" * 60)
-    
-    total_all_epochs = sum(s['epochs'] for s in all_stages[start_stage_idx:end_stage_idx])
+    total_epochs = stage_cfg['epochs']
     global_epoch_counter = 0
+    
+    logger.info("=" * 60)
+    logger.info(f"📋 训练配置: {stage_name}")
+    logger.info(f"   Epochs: {total_epochs}, Heatmap Size: {stage_cfg['hm_size']}")
+    logger.info("=" * 60)
     
     # 发送训练开始通知
     if notifier:
         try:
             notifier.send_training_start(
                 config_name=Path(args.config).stem,
-                stages=all_stages[start_stage_idx:end_stage_idx],
-                total_epochs=total_all_epochs,
+                stages=[stage_cfg],
+                total_epochs=total_epochs,
             )
             logger.info("📢 飞书通知已发送: 训练开始")
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
+        
+    # 更新热力图分辨率
+    hm_size = tuple(stage_cfg['hm_size'])
+    train_dataset.hm_size = hm_size
+    val_dataset.hm_size = hm_size
+    if hasattr(model, 'update_heatmap_size'):
+        model.update_heatmap_size(hm_size)
     
-    # 多阶段训练
-    for stage_idx in range(start_stage_idx, end_stage_idx):
-        stage_cfg = all_stages[stage_idx]
-        stage_name = stage_cfg['name']
+    # 构建热力图损失函数
+    stage_loss_type = stage_cfg.get('heatmap_loss_type', default_loss_type)
+    heatmap_criterion = build_heatmap_loss(loss_cfg, stage_loss_type)
+    
+    logger.info(f"  Heatmap size: {hm_size}")
+    logger.info(f"  Heatmap loss: {stage_loss_type}")
+    
+    # 构建数据加载器
+    num_workers = cfg['data']['num_workers']
+    prefetch_factor = cfg['data'].get('prefetch_factor', 2)
+    persistent_workers = num_workers > 0
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg['optim']['batch_size'],
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=cfg['data']['pin_memory'],
+        collate_fn=collate_fn,
+        drop_last=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers,
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg['optim']['batch_size'],
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=cfg['data']['pin_memory'],
+        collate_fn=collate_fn,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers,
+    )
+    
+    # 设置可训练模块
+    logger.info("🔧 Setting trainable modules...")
+    set_trainable_modules(model, stage_cfg, logger)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"  Total params: {total_params:,}")
+    logger.info(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    
+    # 构建优化器和调度器
+    optimizer = build_optimizer(model, cfg, stage_cfg)
+    grad_accum_steps = cfg['optim'].get('grad_accum_steps', 1)
+    total_batches = len(train_loader) * total_epochs
+    total_steps = total_batches // grad_accum_steps
+    scheduler = build_scheduler(optimizer, cfg, total_steps)
+    # GradScaler 仅用于 fp16，bf16 不需要（动态范围更大）
+    amp_type = cfg['optim'].get('amp', 'bf16')
+    scaler = GradScaler() if amp_type == 'fp16' else None
+    
+    if resume_path and Path(resume_path).exists():
+        load_checkpoint_for_resume(
+            str(resume_path), model, 
+            optimizer=optimizer, 
+            scheduler=scheduler, 
+            scaler=scaler,
+            logger=logger
+        )
+    
+    best_val_loss = ckpt_manager.best_val_loss
+    steps_per_epoch = len(train_loader) // grad_accum_steps
+    
+    if resume_epoch > 0:
+        start_epoch = resume_epoch + 1
+    else:
+        start_epoch = args.start_epoch
+    
+    patience = cfg['validation'].get('patience', 5)
+    no_improve_count = 0
+    
+    timer = TrainingTimer(total_epochs=total_epochs)
+    timer.start()
+    
+    for epoch in range(start_epoch, total_epochs + 1):
+        timer.start_epoch()
+            
+        # Clip-level 采样：每个 epoch 重新采样，减少样本相关性
+        if hasattr(train_loader.dataset, 'set_epoch'):
+            train_loader.dataset.set_epoch(epoch)
         
-        if args.epochs is not None:
-            stage_cfg = stage_cfg.copy()
-            stage_cfg['epochs'] = args.epochs
+        logger.info("=" * 80)
+        logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
+        logger.info("=" * 80)
         
-        logger.info("=" * 60)
-        logger.info(f"🚀 Stage {stage_idx + 1}/{len(all_stages)}: {stage_name}")
-        logger.info("=" * 60)
-        
-        # 更新热力图分辨率
-        hm_size = tuple(stage_cfg['hm_size'])
-        train_dataset.hm_size = hm_size
-        val_dataset.hm_size = hm_size
-        if hasattr(model, 'update_heatmap_size'):
-            model.update_heatmap_size(hm_size)
-        
-        # 构建本阶段的热力图损失函数
-        stage_loss_type = stage_cfg.get('heatmap_loss_type', default_loss_type)
-        heatmap_criterion = build_heatmap_loss(loss_cfg, stage_loss_type)
-        
-        logger.info(f"  Heatmap size: {hm_size}")
-        logger.info(f"  Heatmap loss: {stage_loss_type}")
-        
-        # 构建数据加载器
-        num_workers = cfg['data']['num_workers']
-        prefetch_factor = cfg['data'].get('prefetch_factor', 2)
-        persistent_workers = num_workers > 0
-        
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg['optim']['batch_size'],
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=cfg['data']['pin_memory'],
-            collate_fn=collate_fn,
-            drop_last=True,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            persistent_workers=persistent_workers,
+        epoch_offset = (epoch - 1) * steps_per_epoch
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, scheduler, scaler,
+            cfg, heatmap_criterion, epoch, logger, tb_writer, epoch_offset,
+            stage_idx=0, stage_name=stage_name, stage_cfg=stage_cfg,
+            max_batches=args.max_batches
         )
         
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=cfg['optim']['batch_size'],
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=cfg['data']['pin_memory'],
-            collate_fn=collate_fn,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            persistent_workers=persistent_workers,
+        timer.end_epoch()
+        
+        val_metrics = validate(
+            model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch
         )
         
-        # 设置可训练模块
-        logger.info("🔧 Setting trainable modules...")
-        set_trainable_modules(model, stage_cfg, logger)
+        logger.info(
+            f"  Train Loss: {train_metrics['total_loss']:.4f} "
+            f"(hm: {train_metrics['heatmap_loss']:.4f}, act: {train_metrics['action_loss']:.4f})"
+        )
+        logger.info(
+            f"  Val Loss: {val_metrics['val_loss']:.4f} "
+            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, act: {val_metrics['val_action_loss']:.4f})"
+        )
         
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"  Total params: {total_params:,}")
-        logger.info(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+        eta = timer.get_eta(epoch, total_epochs)
+        logger.info(f"  ⏱️  Epoch time: {timer.get_epoch_time()} | ETA: {eta}")
         
-        # 构建优化器和调度器
-        optimizer = build_optimizer(model, cfg, stage_cfg)
-        grad_accum_steps = cfg['optim'].get('grad_accum_steps', 1)
-        total_batches = len(train_loader) * stage_cfg['epochs']
-        total_steps = total_batches // grad_accum_steps
-        scheduler = build_scheduler(optimizer, cfg, total_steps)
-        # GradScaler 仅用于 fp16，bf16 不需要（动态范围更大）
-        amp_type = cfg['optim'].get('amp', 'bf16')
-        scaler = GradScaler() if amp_type == 'fp16' else None
-        
-        if resume_path and stage_idx == resume_stage_idx:
-            if Path(resume_path).exists():
-                load_checkpoint_for_resume(
-                    str(resume_path), model, 
-                    optimizer=optimizer, 
-                    scheduler=scheduler, 
-                    scaler=scaler,
-                    logger=logger
-                )
-        
-        best_val_loss = ckpt_manager.best_val_loss
-        steps_per_epoch = len(train_loader) // grad_accum_steps
-        global_step_offset = 0
-        
-        for prev_idx in range(stage_idx):
-            prev_epochs = all_stages[prev_idx]['epochs']
-            global_step_offset += prev_epochs * steps_per_epoch
-        
-        if stage_idx == start_stage_idx and resume_epoch > 0:
-            start_epoch = resume_epoch + 1
-        elif stage_idx == start_stage_idx:
-            start_epoch = args.start_epoch
+        is_best = val_metrics['val_loss'] < best_val_loss
+        if is_best:
+            best_val_loss = val_metrics['val_loss']
+            no_improve_count = 0
+            logger.info(f"  ⭐ New best val_loss: {best_val_loss:.4f}")
         else:
-            start_epoch = 1
-        total_epochs = stage_cfg['epochs']
+            no_improve_count += 1
         
-        patience = cfg['validation'].get('patience', 5)
-        no_improve_count = 0
+        global_epoch_counter += 1
+        current_lr = scheduler.get_last_lr()[0] if scheduler else 0
         
-        timer = TrainingTimer(total_epochs=total_epochs)
-        timer.start()
+        plotter.update(
+            epoch=global_epoch_counter,
+            stage_name=stage_name,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            lr=current_lr,
+            is_best=is_best,
+        )
         
-        for epoch in range(start_epoch, total_epochs + 1):
-            timer.start_stage()
+        # 记录 epoch 级别的 loss 到 TensorBoard
+        if tb_writer is not None:
+            # 总损失对比
+            tb_writer.add_scalars('loss/total', {
+                'train': train_metrics['total_loss'],
+                'val': val_metrics['val_loss'],
+            }, global_epoch_counter)
             
-            # Clip-level 采样：每个 epoch 重新采样，减少样本相关性
-            if hasattr(train_loader.dataset, 'set_epoch'):
-                train_loader.dataset.set_epoch(epoch + stage_idx * 1000)  # 不同 stage 使用不同种子
+            # 热力图损失对比
+            tb_writer.add_scalars('loss/heatmap', {
+                'train': train_metrics['heatmap_loss'],
+                'val': val_metrics['val_heatmap_loss'],
+            }, global_epoch_counter)
             
-            logger.info("=" * 80)
-            logger.info(f"[Stage {stage_idx+1}: {stage_name}] Epoch {epoch}/{total_epochs}")
-            logger.info("=" * 80)
+            # 动作损失对比
+            tb_writer.add_scalars('loss/action', {
+                'train': train_metrics['action_loss'],
+                'val': val_metrics['val_action_loss'],
+            }, global_epoch_counter)
             
-            epoch_offset = global_step_offset + (epoch - 1) * steps_per_epoch
-            train_metrics = train_one_epoch(
-                model, train_loader, optimizer, scheduler, scaler,
-                cfg, heatmap_criterion, epoch, logger, tb_writer, epoch_offset,
-                stage_idx=stage_idx, stage_name=stage_name, stage_cfg=stage_cfg,
-                max_batches=args.max_batches
-            )
+            # 停止损失对比
+            tb_writer.add_scalars('loss/stop', {
+                'train': train_metrics.get('stop_loss', 0),
+                'val': val_metrics.get('val_stop_loss', 0),
+            }, global_epoch_counter)
             
-            timer.end_epoch()
+            # 学习率
+            tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)
             
-            val_metrics = validate(
-                model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch
-            )
+            # 单独的指标（方便筛选）
+            tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
+            tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
             
-            logger.info(
-                f"  Train Loss: {train_metrics['total_loss']:.4f} "
-                f"(hm: {train_metrics['heatmap_loss']:.4f}, act: {train_metrics['action_loss']:.4f})"
-            )
-            logger.info(
-                f"  Val Loss: {val_metrics['val_loss']:.4f} "
-                f"(hm: {val_metrics['val_heatmap_loss']:.4f}, act: {val_metrics['val_action_loss']:.4f})"
-            )
-            
-            eta = timer.get_eta(epoch, total_epochs)
-            logger.info(f"  ⏱️  Epoch time: {timer.get_epoch_time()} | ETA: {eta}")
-            
-            is_best = val_metrics['val_loss'] < best_val_loss
-            if is_best:
-                best_val_loss = val_metrics['val_loss']
-                no_improve_count = 0
-                logger.info(f"  ⭐ New best val_loss: {best_val_loss:.4f}")
-            else:
-                no_improve_count += 1
-            
-            global_epoch_counter += 1
-            current_lr = scheduler.get_last_lr()[0] if scheduler else 0
-            
-            plotter.update(
-                epoch=global_epoch_counter,
-                stage_name=stage_name,
-                train_metrics=train_metrics,
-                val_metrics=val_metrics,
-                lr=current_lr,
-                is_best=is_best,
-            )
-            
-            # 记录 epoch 级别的 loss 到 TensorBoard（使用全局 epoch，避免多阶段覆盖）
-            if tb_writer is not None:
-                # 总损失对比
-                tb_writer.add_scalars('loss/total', {
-                    'train': train_metrics['total_loss'],
-                    'val': val_metrics['val_loss'],
-                }, global_epoch_counter)
-                
-                # 热力图损失对比
-                tb_writer.add_scalars('loss/heatmap', {
-                    'train': train_metrics['heatmap_loss'],
-                    'val': val_metrics['val_heatmap_loss'],
-                }, global_epoch_counter)
-                
-                # 动作损失对比
-                tb_writer.add_scalars('loss/action', {
-                    'train': train_metrics['action_loss'],
-                    'val': val_metrics['val_action_loss'],
-                }, global_epoch_counter)
-                
-                # 停止损失对比
-                tb_writer.add_scalars('loss/stop', {
-                    'train': train_metrics.get('stop_loss', 0),
-                    'val': val_metrics.get('val_stop_loss', 0),
-                }, global_epoch_counter)
-                
-                # 学习率
-                tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)
-                
-                # 单独的指标（方便筛选）
-                tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
-                tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
-                
-                tb_writer.flush()
-            
-            # 发送飞书通知
-            if notifier:
-                try:
-                    notifier.send_epoch_report(
-                        epoch=epoch,
-                        total_epochs=total_epochs,
-                        stage_name=stage_name,
-                        stage_idx=stage_idx,
-                        total_stages=len(all_stages),
-                        train_metrics=train_metrics,
-                        val_metrics=val_metrics,
-                        eta=eta,
-                        epoch_time=timer.get_epoch_time(),
-                        is_best=is_best,
-                        best_val_loss=best_val_loss,
-                    )
-                except Exception as e:
-                    logger.warning(f"飞书通知发送失败: {e}")
-            
-            if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
-                ckpt_manager.save(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
+            tb_writer.flush()
+        
+        # 发送飞书通知
+        if notifier:
+            try:
+                notifier.send_epoch_report(
                     epoch=epoch,
-                    stage_idx=stage_idx,
+                    total_epochs=total_epochs,
                     stage_name=stage_name,
-                    metrics={**train_metrics, **val_metrics},
-                    cfg=cfg,
+                    stage_idx=0,
+                    total_stages=1,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                    eta=eta,
+                    epoch_time=timer.get_epoch_time(),
                     is_best=is_best,
-                    scaler=scaler,
+                    best_val_loss=best_val_loss,
                 )
-            
-            if no_improve_count >= patience:
-                logger.info(f"  🛑 Early stopping")
-                break
+            except Exception as e:
+                logger.warning(f"飞书通知发送失败: {e}")
         
-        logger.info(f"  📊 Stage {stage_name} completed in {timer.get_total_elapsed()}")
+        if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
+            ckpt_manager.save(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                stage_idx=0,
+                stage_name=stage_name,
+                metrics={**train_metrics, **val_metrics},
+                cfg=cfg,
+                is_best=is_best,
+                scaler=scaler,
+            )
+        
+        if no_improve_count >= patience:
+            logger.info(f"  🛑 Early stopping")
+            break
+    
+    logger.info(f"  📊 训练完成，耗时: {timer.get_total_elapsed()}")
     
     logger.info("=" * 60)
     logger.info("✅ 训练完成！")
