@@ -26,7 +26,13 @@ import logging
 from dataclasses import dataclass
 
 from .qwen3_vl import Qwen3VLIntegration, Qwen3VLConfig
-from .action import DiffusionActionHead, DiffusionActionConfig, StopPredictionHead
+from .action import (
+    DiffusionActionHead, 
+    DiffusionActionConfig, 
+    StopPredictionHead,
+    TransformerActionHead,
+    ProgressPredictionHead,
+)
 from .heatmap import DiffusionHeatmapHead, DiffusionHeatmapConfig
 
 logger = logging.getLogger(__name__)
@@ -58,7 +64,12 @@ class VLNPipelineConfig:
     # Image size for heatmap encoder
     image_size: int = 224
     
-    # Action generation (Diffusion Policy)
+    # Action generation - Mode selection
+    # 'legacy': DiffusionActionHead (UNet1D)
+    # 'transformer': TransformerActionHead (InternNav style)
+    action_head_type: str = "transformer"  # 'legacy' or 'transformer'
+    
+    # Legacy action head settings (DiffusionActionHead)
     enable_action_head: bool = True
     action_dim: int = 2
     action_pred_horizon: int = 1
@@ -68,11 +79,24 @@ class VLNPipelineConfig:
     action_stats_min: List[float] = None
     action_stats_max: List[float] = None
     
-    # Stop prediction
-    enable_stop_head: bool = True
+    # Transformer action head settings (TransformerActionHead, InternNav style)
+    transformer_action_dim: int = 3  # (dx, dy, delta_yaw)
+    transformer_predict_size: int = 24  # 24 step trajectory
+    transformer_token_dim: int = 384  # Internal token dimension
+    transformer_temporal_depth: int = 16  # Transformer decoder layers
+    transformer_heads: int = 8
+    transformer_num_train_timesteps: int = 20
+    transformer_action_scale: float = 4.0  # Action scaling factor
+    
+    # Stop/Progress prediction
+    enable_stop_head: bool = False  # Deprecated, use progress_head instead
     stop_hidden_dim: int = 512
     stop_focal_gamma: float = 2.0
     stop_focal_alpha: float = 0.75
+    
+    # Progress prediction (replaces stop prediction)
+    enable_progress_head: bool = True
+    progress_hidden_dim: int = 512
     
     # Performance settings
     enable_gradient_checkpointing: bool = False
@@ -149,29 +173,50 @@ class VLNPipeline(nn.Module):
             self.future_heatmap_head = None
         
         # ==================== Action Head ====================
-        if config.enable_action_head:
-            action_config_kwargs = {
-                'action_dim': config.action_dim,
-                'pred_horizon': config.action_pred_horizon,
-                'cond_dim': config.llm_token_dim,
-                'encoding_size': config.action_encoding_size,
-                'num_diffusion_iters': config.action_num_diffusion_iters,
-                'action_stats_min': config.action_stats_min or [-0.17, -0.03],
-                'action_stats_max': config.action_stats_max or [0.19, 0.31],
-                'device': str(self.device),
-            }
-            if config.action_down_dims is not None:
-                action_config_kwargs['down_dims'] = config.action_down_dims
-            
-            action_config = DiffusionActionConfig(**action_config_kwargs)
-            self.action_head = DiffusionActionHead(action_config).to(
-                device=self.device, dtype=config.dtype
-            )
-            logger.info(f"✓ Action Head initialized")
-        else:
-            self.action_head = None
+        self.action_head = None
+        self.transformer_action_head = None
         
-        # ==================== Stop Head ====================
+        if config.enable_action_head:
+            if config.action_head_type == "transformer":
+                # New: TransformerActionHead (InternNav style)
+                self.transformer_action_head = TransformerActionHead(
+                    vlm_token_dim=config.llm_token_dim,
+                    token_dim=config.transformer_token_dim,
+                    predict_size=config.transformer_predict_size,
+                    temporal_depth=config.transformer_temporal_depth,
+                    heads=config.transformer_heads,
+                    dropout=0.1,
+                    action_dim=config.transformer_action_dim,
+                    num_train_timesteps=config.transformer_num_train_timesteps,
+                    action_scale=config.transformer_action_scale,
+                ).to(device=self.device, dtype=config.dtype)
+                logger.info(
+                    f"✓ TransformerActionHead initialized: "
+                    f"predict_size={config.transformer_predict_size}, "
+                    f"action_dim={config.transformer_action_dim}"
+                )
+            else:
+                # Legacy: DiffusionActionHead
+                action_config_kwargs = {
+                    'action_dim': config.action_dim,
+                    'pred_horizon': config.action_pred_horizon,
+                    'cond_dim': config.llm_token_dim,
+                    'encoding_size': config.action_encoding_size,
+                    'num_diffusion_iters': config.action_num_diffusion_iters,
+                    'action_stats_min': config.action_stats_min or [-0.17, -0.03],
+                    'action_stats_max': config.action_stats_max or [0.19, 0.31],
+                    'device': str(self.device),
+                }
+                if config.action_down_dims is not None:
+                    action_config_kwargs['down_dims'] = config.action_down_dims
+                
+                action_config = DiffusionActionConfig(**action_config_kwargs)
+                self.action_head = DiffusionActionHead(action_config).to(
+                    device=self.device, dtype=config.dtype
+                )
+                logger.info(f"✓ DiffusionActionHead (legacy) initialized")
+        
+        # ==================== Stop Head (Legacy) ====================
         if config.enable_stop_head:
             self.stop_head = StopPredictionHead(
                 input_dim=config.llm_token_dim,
@@ -183,6 +228,17 @@ class VLNPipeline(nn.Module):
             logger.info(f"✓ Stop Head initialized")
         else:
             self.stop_head = None
+        
+        # ==================== Progress Head (New) ====================
+        if config.enable_progress_head:
+            self.progress_head = ProgressPredictionHead(
+                input_dim=config.llm_token_dim,
+                hidden_dim=config.progress_hidden_dim,
+                dropout=0.1,
+            ).to(device=self.device, dtype=config.dtype)
+            logger.info(f"✓ Progress Head initialized")
+        else:
+            self.progress_head = None
         
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")
@@ -316,25 +372,34 @@ class VLNPipeline(nn.Module):
                     )
         
         # ==================== Step 4: Action Generation ====================
-        if return_actions and self.action_head is not None:
-            action_cond = llm_tokens.mean(dim=1)  # [B, llm_token_dim]
-            
-            if self.training:
-                pass
-            else:
-                actions = self.action_head(action_cond)
-        else:
-            action_cond = llm_tokens.mean(dim=1) if self.action_head is not None else None
-            actions = None
+        actions = None
+        trajectory = None
+        action_cond = llm_tokens.mean(dim=1)  # [B, llm_token_dim]
         
-        # ==================== Step 5: Stop Prediction ====================
+        if return_actions:
+            # New: TransformerActionHead (trajectory prediction)
+            if self.transformer_action_head is not None:
+                if not self.training:
+                    trajectory = self.transformer_action_head.get_trajectory(llm_tokens)
+            # Legacy: DiffusionActionHead
+            elif self.action_head is not None:
+                if not self.training:
+                    actions = self.action_head(action_cond)
+        
+        # ==================== Step 5: Stop/Progress Prediction ====================
+        stop_logits = None
+        stop_prob = None
+        progress = None
+        
+        # Progress prediction (new)
+        if self.progress_head is not None:
+            progress = self.progress_head.get_progress(llm_tokens)
+        
+        # Stop prediction (legacy)
         if self.stop_head is not None:
             stop_cond = llm_tokens.mean(dim=1)
             stop_logits = self.stop_head.classifier(stop_cond).squeeze(-1)
             stop_prob = torch.sigmoid(stop_logits)
-        else:
-            stop_logits = None
-            stop_prob = None
         
         # ==================== Build Output ====================
         output = {
@@ -364,13 +429,23 @@ class VLNPipeline(nn.Module):
                 output['future_heatmap_noise_std'] = future_heatmap_noise_std
                 output['future_heatmap_noise_pred_std'] = future_heatmap_noise_pred_std
         
-        # Actions
-        if self.action_head is not None:
-            output['action_cond'] = action_cond
+        # Actions / Trajectory
+        output['action_cond'] = action_cond
+        
+        if self.transformer_action_head is not None:
+            output['has_transformer_action_head'] = True
+            if not self.training and trajectory is not None:
+                output['trajectory'] = trajectory
+        elif self.action_head is not None:
+            output['has_action_head'] = True
             if not self.training and actions is not None:
                 output['actions'] = actions
         
-        # Stop prediction
+        # Progress prediction
+        if progress is not None:
+            output['progress'] = progress
+        
+        # Stop prediction (legacy)
         if stop_logits is not None:
             output['stop_logits'] = stop_logits
             output['stop_prob'] = stop_prob

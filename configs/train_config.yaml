@@ -13,8 +13,11 @@ data:
   pin_memory: true
   prefetch_factor: 2
   
-  # 滑动窗口数据集配置
-  dataset_type: sliding_window
+  # 数据集配置
+  # 'sliding_window': 原始滑动窗口数据集（单步动作）
+  # 'trajectory': 轨迹数据集（24步轨迹预测，参考 InternNav）
+  dataset_type: trajectory
+  
   sliding_window:
     min_history: 5
     num_history_sample: 8
@@ -23,10 +26,24 @@ data:
     sample_stride: 5
     
     # Clip-level 采样策略（解决样本高度相关性问题）
-    # 每个 epoch 从每个 clip 随机选择 N 个样本，而不是使用所有滑动窗口样本
-    clip_level_sampling: true  # 启用 clip-level 采样
-    samples_per_clip: 8        # 训练集：每个 clip 每 epoch 采样 4 个样本（增加训练量）
-    val_samples_per_clip: 2    # 验证集：每个 clip 采样 2 个样本（固定种子，确保可比较）
+    clip_level_sampling: true
+    samples_per_clip: 8
+    val_samples_per_clip: 2
+  
+  # 轨迹数据集配置（参考 InternNav）
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 5
+    clip_level_sampling: true
+    samples_per_clip: 8
+    val_samples_per_clip: 2
+    # 轨迹预测配置
+    predict_horizon: 24          # 预测 24 步轨迹
+    action_scale: 4.0            # 动作放大 4 倍（参考 InternNav）
+    enable_trajectory_augmentation: true  # 启用轨迹增强
 
 # ============================================
 # 模型配置
@@ -56,18 +73,41 @@ model:
   # 动作头配置
   action_head:
     enable: true
-    cond_dim: 1024
-    action_dim: 2
-    pred_horizon: 1
-    num_diffusion_iters: 10
-    encoding_size: 256
-    down_dims: [128, 256]
-    action_stats_min: [-0.1646, -0.0281]
-    action_stats_max: [0.1850, 0.3087]
+    # 动作头类型：'legacy' (UNet1D) 或 'transformer' (InternNav style)
+    type: transformer
+    
+    # Legacy (DiffusionActionHead) 配置 - 仅当 type: legacy 时使用
+    legacy:
+      cond_dim: 1024
+      action_dim: 2
+      pred_horizon: 1
+      num_diffusion_iters: 10
+      encoding_size: 256
+      down_dims: [128, 256]
+      action_stats_min: [-0.1646, -0.0281]
+      action_stats_max: [0.1850, 0.3087]
+    
+    # Transformer (InternNav style) 配置 - 仅当 type: transformer 时使用
+    transformer:
+      vlm_token_dim: 1024        # VLM 输出维度
+      token_dim: 384             # 内部 token 维度
+      predict_size: 24           # 预测 24 步轨迹
+      temporal_depth: 16         # Transformer Decoder 层数
+      heads: 8                   # 注意力头数
+      action_dim: 3              # 动作维度 (dx, dy, delta_yaw)
+      num_train_timesteps: 20    # 扩散训练步数
+      action_scale: 4.0          # 动作放大倍数
+      dropout: 0.1
 
-  # Stop 预测头配置
-  stop_head:
+  # Progress 预测头配置（替代 Stop Head）
+  progress_head:
     enable: true
+    hidden_dim: 512
+    dropout: 0.1
+
+  # Stop 预测头配置（已弃用，使用 progress_head 替代）
+  stop_head:
+    enable: false
     hidden_dim: 512
     focal_gamma: 3.0
     focal_alpha: 0.9
@@ -86,12 +126,14 @@ training:
       train_action: true
       trainable_modules:
         - history_heatmap_head
-        - action_head
-        - stop_head
+        - transformer_action_head  # 新的 Transformer 动作头
+        - progress_head            # 新的进度预测头
         - llm_projector
       frozen_modules:
         - qwen3_vl
         - future_heatmap_head
+        - action_head              # Legacy action head（如果存在）
+        - stop_head                # Legacy stop head
 
 # ============================================
 # 优化器配置
@@ -139,8 +181,10 @@ loss:
   # 各头损失权重
   history_weight: 1.0
   future_weight: 1.0
-  action_weight: 1.0
-  stop_weight: 0.5
+  action_weight: 1.0        # Legacy action head
+  trajectory_weight: 1.0    # Transformer action head (24 step trajectory)
+  progress_weight: 0.5      # Progress prediction head
+  stop_weight: 0.5          # Legacy stop head (disabled)
 
 # ============================================
 # GPU配置

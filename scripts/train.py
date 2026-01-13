@@ -46,7 +46,7 @@ import cv2
 
 warnings.filterwarnings("ignore")
 
-from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
+from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.loss import (
     NavigationHeatmapLoss,
@@ -448,7 +448,7 @@ def set_seed(seed: int):
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
-    """滑动窗口数据集的 collate 函数"""
+    """滑动窗口/轨迹数据集的 collate 函数"""
     max_K = max(s['history_frames'].shape[0] for s in batch)
     
     history_frames_padded = []
@@ -480,7 +480,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     is_stop = torch.tensor([s.get('is_stop', 0.0) for s in batch])
     text = [s['text'] for s in batch]
     
-    return {
+    result = {
         'history_frames': history_frames,
         'history_mask': history_mask,
         'current_frame': current_frame,
@@ -491,6 +491,14 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'is_stop': is_stop,
         'text': text,
     }
+    
+    # 轨迹数据集的额外字段
+    if 'trajectory' in batch[0]:
+        result['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
+        result['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
+        result['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
+    
+    return result
 
 
 # ============================================
@@ -504,6 +512,14 @@ def build_model(cfg: Dict) -> nn.Module:
     heatmap_cfg = model_cfg.get('heatmap_head', {})
     action_cfg = model_cfg.get('action_head', {})
     stop_cfg = model_cfg.get('stop_head', {})
+    progress_cfg = model_cfg.get('progress_head', {})
+    
+    # 确定动作头类型
+    action_head_type = action_cfg.get('type', 'transformer')
+    
+    # 获取 Legacy 和 Transformer 配置
+    legacy_action_cfg = action_cfg.get('legacy', {})
+    transformer_action_cfg = action_cfg.get('transformer', {})
     
     config = VLNPipelineConfig(
         # Qwen3-VL
@@ -525,21 +541,37 @@ def build_model(cfg: Dict) -> nn.Module:
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
         image_size=cfg['data']['image_size'][0],
         
-        # Action
+        # Action Head Type
+        action_head_type=action_head_type,
         enable_action_head=action_cfg.get('enable', True),
-        action_dim=action_cfg.get('action_dim', 2),
-        action_pred_horizon=action_cfg.get('pred_horizon', 1),
-        action_encoding_size=action_cfg.get('encoding_size', 256),
-        action_down_dims=action_cfg.get('down_dims', None),
-        action_num_diffusion_iters=action_cfg.get('num_diffusion_iters', 10),
-        action_stats_min=action_cfg.get('action_stats_min', [-0.17, -0.03]),
-        action_stats_max=action_cfg.get('action_stats_max', [0.19, 0.31]),
         
-        # Stop
-        enable_stop_head=stop_cfg.get('enable', True),
+        # Legacy Action (DiffusionActionHead)
+        action_dim=legacy_action_cfg.get('action_dim', 2),
+        action_pred_horizon=legacy_action_cfg.get('pred_horizon', 1),
+        action_encoding_size=legacy_action_cfg.get('encoding_size', 256),
+        action_down_dims=legacy_action_cfg.get('down_dims', None),
+        action_num_diffusion_iters=legacy_action_cfg.get('num_diffusion_iters', 10),
+        action_stats_min=legacy_action_cfg.get('action_stats_min', [-0.17, -0.03]),
+        action_stats_max=legacy_action_cfg.get('action_stats_max', [0.19, 0.31]),
+        
+        # Transformer Action (TransformerActionHead, InternNav style)
+        transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
+        transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
+        transformer_token_dim=transformer_action_cfg.get('token_dim', 384),
+        transformer_temporal_depth=transformer_action_cfg.get('temporal_depth', 16),
+        transformer_heads=transformer_action_cfg.get('heads', 8),
+        transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
+        transformer_action_scale=transformer_action_cfg.get('action_scale', 4.0),
+        
+        # Stop (Legacy)
+        enable_stop_head=stop_cfg.get('enable', False),
         stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
         stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
         stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
+        
+        # Progress (New)
+        enable_progress_head=progress_cfg.get('enable', True),
+        progress_hidden_dim=progress_cfg.get('hidden_dim', 512),
         
         verbose=True,
     )
@@ -550,8 +582,9 @@ def build_model(cfg: Dict) -> nn.Module:
     print(f"   Qwen3-VL → {llm_cfg.get('model_path', './models/qwen_3_vl')}")
     print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}")
     print(f"   FutureHeatmapHead → enabled={heatmap_cfg.get('enable_future', True)}")
-    print(f"   ActionHead → enabled={action_cfg.get('enable', True)}")
-    print(f"   StopHead → enabled={stop_cfg.get('enable', True)}")
+    print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
+    print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
+    print(f"   StopHead (legacy) → enabled={stop_cfg.get('enable', False)}")
     
     return model
 
@@ -581,17 +614,29 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             freeze_module(model.future_heatmap_head, freeze=False)
             logger.info("  ✓ Unfrozen: future_heatmap_head")
     
-    # Action head
+    # Action head (Legacy)
     if 'action_head' in trainable:
         if hasattr(model, 'action_head') and model.action_head is not None:
             freeze_module(model.action_head, freeze=False)
-            logger.info("  ✓ Unfrozen: action_head")
+            logger.info("  ✓ Unfrozen: action_head (legacy)")
     
-    # Stop head
+    # Transformer Action Head (New)
+    if 'transformer_action_head' in trainable:
+        if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+            freeze_module(model.transformer_action_head, freeze=False)
+            logger.info("  ✓ Unfrozen: transformer_action_head")
+    
+    # Stop head (Legacy)
     if 'stop_head' in trainable:
         if hasattr(model, 'stop_head') and model.stop_head is not None:
             freeze_module(model.stop_head, freeze=False)
             logger.info("  ✓ Unfrozen: stop_head")
+    
+    # Progress Head (New)
+    if 'progress_head' in trainable:
+        if hasattr(model, 'progress_head') and model.progress_head is not None:
+            freeze_module(model.progress_head, freeze=False)
+            logger.info("  ✓ Unfrozen: progress_head")
     
     # LLM Projector
     if 'llm_projector' in trainable:
@@ -633,7 +678,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             })
             print(f"  Param group: future_heatmap_head (lr={fut_lr})")
     
-    # Action Head
+    # Action Head (Legacy)
     action_lr = optim_cfg.get('action_lr', 3e-4)
     if hasattr(model, 'action_head') and model.action_head is not None:
         action_params = [p for p in model.action_head.parameters() if p.requires_grad]
@@ -645,7 +690,19 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             })
             print(f"  Param group: action_head (lr={action_lr})")
     
-    # Stop Head
+    # Transformer Action Head (New)
+    transformer_action_lr = optim_cfg.get('transformer_action_lr', action_lr)
+    if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+        transformer_action_params = [p for p in model.transformer_action_head.parameters() if p.requires_grad]
+        if transformer_action_params:
+            param_groups.append({
+                'params': transformer_action_params,
+                'lr': transformer_action_lr,
+                'name': 'transformer_action_head'
+            })
+            print(f"  Param group: transformer_action_head (lr={transformer_action_lr})")
+    
+    # Stop Head (Legacy)
     stop_lr = optim_cfg.get('stop_lr', action_lr)
     if hasattr(model, 'stop_head') and model.stop_head is not None:
         stop_params = [p for p in model.stop_head.parameters() if p.requires_grad]
@@ -656,6 +713,18 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
                 'name': 'stop_head'
             })
             print(f"  Param group: stop_head (lr={stop_lr})")
+    
+    # Progress Head (New)
+    progress_lr = optim_cfg.get('progress_lr', action_lr)
+    if hasattr(model, 'progress_head') and model.progress_head is not None:
+        progress_params = [p for p in model.progress_head.parameters() if p.requires_grad]
+        if progress_params:
+            param_groups.append({
+                'params': progress_params,
+                'lr': progress_lr,
+                'name': 'progress_head'
+            })
+            print(f"  Param group: progress_head (lr={progress_lr})")
     
     # LLM Projector
     proj_lr = optim_cfg.get('llm_projector_lr', 1e-4)
@@ -814,31 +883,66 @@ def train_one_epoch(
             if train_future and 'future_heatmap_loss' in output:
                 heatmap_loss = heatmap_loss + output['future_heatmap_loss']
             
-            # Action Loss
+            # Action Loss / Trajectory Loss
             action_loss = torch.tensor(0.0, device=device)
-            if train_action and 'action_cond' in output:
-                action_result = model.action_head.compute_loss(
-                    output['action_cond'], 
-                    gt_action.unsqueeze(1),
-                    action_valid
-                )
-                action_loss = action_result['loss']
+            trajectory_loss = torch.tensor(0.0, device=device)
             
-            # Stop Loss
+            if train_action:
+                # Transformer Action Head (new) - 使用 trajectory
+                if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+                    if 'trajectory' in batch:
+                        gt_trajectory = batch['trajectory'].to(device)
+                        trajectory_valid = batch['trajectory_valid'].to(device)
+                        traj_result = model.transformer_action_head.compute_loss(
+                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            gt_trajectory,
+                            trajectory_valid,
+                        )
+                        trajectory_loss = traj_result['loss']
+                # Legacy Action Head - 使用单步动作
+                elif hasattr(model, 'action_head') and model.action_head is not None and 'action_cond' in output:
+                    action_result = model.action_head.compute_loss(
+                        output['action_cond'], 
+                        gt_action.unsqueeze(1),
+                        action_valid
+                    )
+                    action_loss = action_result['loss']
+            
+            # Progress Loss / Stop Loss
             stop_loss = torch.tensor(0.0, device=device)
-            if train_action and 'stop_logits' in output:
-                stop_loss = model.stop_head.compute_loss(
-                    output['stop_logits'],
-                    is_stop,
-                    action_valid
-                )
+            progress_loss = torch.tensor(0.0, device=device)
+            
+            if train_action:
+                # Progress Head (new)
+                if hasattr(model, 'progress_head') and model.progress_head is not None:
+                    if 'progress' in batch:
+                        gt_progress = batch['progress'].to(device)
+                        progress_result = model.progress_head(
+                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            gt_progress=gt_progress,
+                            return_loss=True,
+                        )
+                        progress_loss = progress_result['loss']
+                # Legacy Stop Head
+                elif hasattr(model, 'stop_head') and model.stop_head is not None and 'stop_logits' in output:
+                    stop_loss = model.stop_head.compute_loss(
+                        output['stop_logits'],
+                        is_stop,
+                        action_valid
+                    )
             
             # 总损失
             heatmap_weight = loss_cfg.get('history_weight', 1.0) if train_history else loss_cfg.get('future_weight', 1.0)
             action_weight = loss_cfg.get('action_weight', 1.0)
+            trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
             stop_weight = loss_cfg.get('stop_weight', 0.5)
+            progress_weight = loss_cfg.get('progress_weight', 0.5)
             
-            loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
+            # 使用 trajectory_loss 或 action_loss（根据哪个有效）
+            action_total_loss = trajectory_loss if trajectory_loss.item() > 0 else action_loss
+            stop_total_loss = progress_loss if progress_loss.item() > 0 else stop_loss
+            
+            loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
             loss = loss / grad_accum_steps
         
         # 反向传播
@@ -866,13 +970,23 @@ def train_one_epoch(
             log_interval = cfg['log'].get('log_interval', 10)
             if global_step % log_interval == 0 or global_step <= 3:
                 mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
+                # 选择合适的 loss 标签
+                if trajectory_loss.item() > 0:
+                    act_label, act_val = "traj", trajectory_loss.item()
+                else:
+                    act_label, act_val = "act", action_loss.item()
+                if progress_loss.item() > 0:
+                    stop_label, stop_val = "prog", progress_loss.item()
+                else:
+                    stop_label, stop_val = "stop", stop_loss.item()
+                
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}, stop: {stop_loss.item():.4f}) | "
+                    f"(hm: {heatmap_loss.item():.4f}, {act_label}: {act_val:.4f}, {stop_label}: {stop_val:.4f}) | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e} | "
                     f"GPU: {mem_alloc:.1f}GB"
                 )
@@ -1081,32 +1195,67 @@ def validate(
                     heatmap_criterion, pred_hm, gt_heatmap, loss_type
                 )
             
+            # Action Loss / Trajectory Loss (验证)
             action_loss = torch.tensor(0.0, device=device)
-            if train_action and 'action_cond' in output:
-                action_result = model.action_head.compute_loss(
-                    output['action_cond'],
-                    gt_action.unsqueeze(1),
-                    action_valid
-                )
-                action_loss = action_result['loss']
+            trajectory_loss = torch.tensor(0.0, device=device)
             
+            if train_action:
+                # Transformer Action Head (new) - 使用 trajectory
+                if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+                    if 'trajectory' in batch:
+                        gt_trajectory = batch['trajectory'].to(device)
+                        trajectory_valid = batch['trajectory_valid'].to(device)
+                        traj_result = model.transformer_action_head.compute_loss(
+                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            gt_trajectory,
+                            trajectory_valid,
+                        )
+                        trajectory_loss = traj_result['loss']
+                # Legacy Action Head
+                elif hasattr(model, 'action_head') and model.action_head is not None and 'action_cond' in output:
+                    action_result = model.action_head.compute_loss(
+                        output['action_cond'],
+                        gt_action.unsqueeze(1),
+                        action_valid
+                    )
+                    action_loss = action_result['loss']
+            
+            # Progress Loss / Stop Loss (验证)
             stop_loss = torch.tensor(0.0, device=device)
-            if train_action and 'stop_logits' in output:
-                stop_loss = model.stop_head.compute_loss(
-                    output['stop_logits'],
-                    is_stop,
-                    action_valid
-                )
+            progress_loss = torch.tensor(0.0, device=device)
+            
+            if train_action:
+                # Progress Head (new)
+                if hasattr(model, 'progress_head') and model.progress_head is not None:
+                    if 'progress' in batch:
+                        gt_progress = batch['progress'].to(device)
+                        progress_result = model.progress_head(
+                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            gt_progress=gt_progress,
+                            return_loss=True,
+                        )
+                        progress_loss = progress_result['loss']
+                # Legacy Stop Head
+                elif hasattr(model, 'stop_head') and model.stop_head is not None and 'stop_logits' in output:
+                    stop_loss = model.stop_head.compute_loss(
+                        output['stop_logits'],
+                        is_stop,
+                        action_valid
+                    )
             
             heatmap_weight = loss_cfg.get('history_weight', 1.0)
-            action_weight = loss_cfg.get('action_weight', 1.0)
-            stop_weight = loss_cfg.get('stop_weight', 0.5)
-            loss = heatmap_weight * heatmap_loss + action_weight * action_loss + stop_weight * stop_loss
+            trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
+            progress_weight = loss_cfg.get('progress_weight', 0.5)
+            
+            action_total_loss = trajectory_loss if trajectory_loss.item() > 0 else action_loss
+            stop_total_loss = progress_loss if progress_loss.item() > 0 else stop_loss
+            
+            loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
         
         total_loss += loss.item()
         total_heatmap_loss += heatmap_loss.item()
-        total_action_loss += action_loss.item()
-        total_stop_loss += stop_loss.item()
+        total_action_loss += action_total_loss.item()  # trajectory or action
+        total_stop_loss += stop_total_loss.item()      # progress or stop
         num_batches += 1
     
     avg_loss = total_loss / max(num_batches, 1)
@@ -1120,8 +1269,8 @@ def validate(
     return {
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
-        'val_action_loss': avg_act,
-        'val_stop_loss': avg_stop,
+        'val_action_loss': avg_act,  # 可能是 trajectory_loss 或 action_loss
+        'val_stop_loss': avg_stop,   # 可能是 progress_loss 或 stop_loss
     }
 
 
@@ -1331,41 +1480,88 @@ def main():
     
     # 构建数据集
     logger.info("📂 Loading datasets...")
-    sw_cfg = cfg['data']['sliding_window']
-    sample_stride = sw_cfg.get('sample_stride', 1)
-    clip_level_sampling = sw_cfg.get('clip_level_sampling', True)  # 默认启用
-    samples_per_clip = sw_cfg.get('samples_per_clip', 2)
+    dataset_type = cfg['data'].get('dataset_type', 'sliding_window')
+    logger.info(f"  Dataset type: {dataset_type}")
     
-    train_dataset = VLNSlidingWindowDataset(
-        root=cfg['data']['root'],
-        split='train',
-        min_history=sw_cfg['min_history'],
-        num_history_sample=sw_cfg['num_history_sample'],
-        image_size=tuple(cfg['data']['image_size']),
-        hm_size=tuple(cfg['data']['init_hm_size']),
-        load_depth=sw_cfg.get('load_depth', True),
-        cache_poses=sw_cfg.get('cache_poses', True),
-        sample_stride=sample_stride,
-        clip_level_sampling=clip_level_sampling,  # 启用 clip-level 采样
-        samples_per_clip=samples_per_clip,        # 每 clip 采样数
-    )
+    if dataset_type == 'trajectory':
+        # 使用新的轨迹数据集（支持 24 步预测）
+        traj_cfg = cfg['data'].get('trajectory', cfg['data'].get('sliding_window', {}))
+        sample_stride = traj_cfg.get('sample_stride', 1)
+        clip_level_sampling = traj_cfg.get('clip_level_sampling', True)
+        samples_per_clip = traj_cfg.get('samples_per_clip', 8)
+        
+        train_dataset = VLNTrajectoryDataset(
+            root=cfg['data']['root'],
+            split='train',
+            min_history=traj_cfg.get('min_history', 5),
+            num_history_sample=traj_cfg.get('num_history_sample', 8),
+            image_size=tuple(cfg['data']['image_size']),
+            hm_size=tuple(cfg['data']['init_hm_size']),
+            load_depth=traj_cfg.get('load_depth', True),
+            cache_poses=traj_cfg.get('cache_poses', True),
+            sample_stride=sample_stride,
+            clip_level_sampling=clip_level_sampling,
+            samples_per_clip=samples_per_clip,
+            predict_horizon=traj_cfg.get('predict_horizon', 24),
+            action_scale=traj_cfg.get('action_scale', 4.0),
+            enable_trajectory_augmentation=traj_cfg.get('enable_trajectory_augmentation', True),
+        )
+        
+        val_split = cfg['data'].get('val_split', 'val')
+        val_samples_per_clip = traj_cfg.get('val_samples_per_clip', 2)
+        val_dataset = VLNTrajectoryDataset(
+            root=cfg['data']['root'],
+            split=val_split,
+            min_history=traj_cfg.get('min_history', 5),
+            num_history_sample=traj_cfg.get('num_history_sample', 8),
+            image_size=tuple(cfg['data']['image_size']),
+            hm_size=tuple(cfg['data']['init_hm_size']),
+            load_depth=traj_cfg.get('load_depth', True),
+            cache_poses=traj_cfg.get('cache_poses', True),
+            sample_stride=sample_stride,
+            clip_level_sampling=clip_level_sampling,
+            samples_per_clip=val_samples_per_clip,
+            predict_horizon=traj_cfg.get('predict_horizon', 24),
+            action_scale=traj_cfg.get('action_scale', 4.0),
+            enable_trajectory_augmentation=False,  # 验证集不增强
+        )
+    else:
+        # 使用原始滑动窗口数据集
+        sw_cfg = cfg['data']['sliding_window']
+        sample_stride = sw_cfg.get('sample_stride', 1)
+        clip_level_sampling = sw_cfg.get('clip_level_sampling', True)
+        samples_per_clip = sw_cfg.get('samples_per_clip', 2)
+        
+        train_dataset = VLNSlidingWindowDataset(
+            root=cfg['data']['root'],
+            split='train',
+            min_history=sw_cfg['min_history'],
+            num_history_sample=sw_cfg['num_history_sample'],
+            image_size=tuple(cfg['data']['image_size']),
+            hm_size=tuple(cfg['data']['init_hm_size']),
+            load_depth=sw_cfg.get('load_depth', True),
+            cache_poses=sw_cfg.get('cache_poses', True),
+            sample_stride=sample_stride,
+            clip_level_sampling=clip_level_sampling,
+            samples_per_clip=samples_per_clip,
+        )
+        
+        val_split = cfg['data'].get('val_split', 'val')
+        val_samples_per_clip = sw_cfg.get('val_samples_per_clip', 2)
+        val_dataset = VLNSlidingWindowDataset(
+            root=cfg['data']['root'],
+            split=val_split,
+            min_history=sw_cfg['min_history'],
+            num_history_sample=sw_cfg['num_history_sample'],
+            image_size=tuple(cfg['data']['image_size']),
+            hm_size=tuple(cfg['data']['init_hm_size']),
+            load_depth=sw_cfg.get('load_depth', True),
+            cache_poses=sw_cfg.get('cache_poses', True),
+            sample_stride=sample_stride,
+            clip_level_sampling=clip_level_sampling,
+            samples_per_clip=val_samples_per_clip,
+        )
     
-    val_split = cfg['data'].get('val_split', 'val')
-    # 验证集也使用 clip-level 采样，但使用固定种子确保可比较
-    val_samples_per_clip = sw_cfg.get('val_samples_per_clip', 2)  # 验证集每 clip 采样数
-    val_dataset = VLNSlidingWindowDataset(
-        root=cfg['data']['root'],
-        split=val_split,
-        min_history=sw_cfg['min_history'],
-        num_history_sample=sw_cfg['num_history_sample'],
-        image_size=tuple(cfg['data']['image_size']),
-        hm_size=tuple(cfg['data']['init_hm_size']),
-        load_depth=sw_cfg.get('load_depth', True),
-        cache_poses=sw_cfg.get('cache_poses', True),
-        sample_stride=sample_stride,
-        clip_level_sampling=clip_level_sampling,  # 验证集也使用 clip-level 采样
-        samples_per_clip=val_samples_per_clip,
-    )
     # 验证集使用固定 epoch=0，确保每次验证样本一致
     if hasattr(val_dataset, 'set_epoch'):
         val_dataset.set_epoch(0)

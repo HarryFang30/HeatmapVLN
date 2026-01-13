@@ -969,3 +969,552 @@ def create_sliding_window_dataloader(
         drop_last=drop_last,
     )
 
+
+# ==================== 轨迹处理工具函数（参考 InternNav）====================
+
+def get_trajectory_relative_to_frame(extrinsics: np.ndarray, camera_deg: float = 0) -> np.ndarray:
+    """
+    计算相对于参考帧的轨迹位姿 (x, y, yaw)
+    
+    参考 InternNav/internnav/dataset/internvla_n1_lerobot_dataset.py
+    
+    Args:
+        extrinsics: 4x4 外参矩阵序列 [T_world2camera], shape: (n, 4, 4)
+        camera_deg: 相机俯仰角度
+    
+    Returns:
+        relative_xyyaw: 相对于参考帧的位姿序列 (x, y, yaw), shape: (n, 3)
+    """
+    # T_world2camera
+    # 坐标变换矩阵
+    T_camera2robot = np.array([
+        [[0.0, -1.0, 0.0, 0.0],
+         [0.0, 0.0, -1.0, 0.0],
+         [1.0, 0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0, 1.0]]
+    ])
+    
+    T_robot2camera = np.array([
+        [[0.0, 0.0, 1.0, 0.0],
+         [-1.0, 0.0, 0.0, 0.0],
+         [0.0, -1.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0, 1.0]]
+    ])
+    
+    # 应用相机俯仰角度变换
+    if camera_deg is not None and camera_deg != 0:
+        camera_rad = np.radians(camera_deg)
+        T_deg = np.array([
+            [[1.0, 0.0, 0.0, 0.0],
+             [0.0, np.cos(-camera_rad), -np.sin(-camera_rad), 0.0],
+             [0.0, np.sin(-camera_rad), np.cos(-camera_rad), 0.0],
+             [0.0, 0.0, 0.0, 1.0]]
+        ], dtype=np.float32)
+        T_robot2camera = np.matmul(T_robot2camera, T_deg)
+        T_camera2robot = np.linalg.inv(T_robot2camera[0])[np.newaxis]
+    
+    # 转换到机器人坐标系
+    extrinsics_robot = np.matmul(extrinsics, T_camera2robot[0])
+    
+    # 获取参考帧的变换矩阵并计算其逆
+    T_ref = extrinsics_robot[0]
+    T_ref_inv = np.linalg.inv(T_ref)
+    
+    # 计算所有帧相对于参考帧的变换
+    relative_to_ref = np.matmul(T_ref_inv[np.newaxis, :, :], extrinsics_robot)
+    
+    # 提取相对位姿
+    relative_translations = relative_to_ref[:, :2, 3]  # (x, y)
+    relative_yaws = np.arctan2(relative_to_ref[:, 1, 0], relative_to_ref[:, 0, 0])
+    
+    relative_xyyaw = np.concatenate((relative_translations, relative_yaws.reshape(-1, 1)), axis=-1)
+    
+    return relative_xyyaw
+
+
+def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 25, interval: float = 0.1) -> np.ndarray:
+    """
+    对轨迹进行平滑和重采样
+    
+    参考 InternNav/internnav/dataset/internvla_n1_lerobot_dataset.py
+    
+    Args:
+        points: 2D 轨迹点, shape: (n, 2)
+        sample_length: 采样长度
+        interval: 采样间隔（米）
+    
+    Returns:
+        resampled: 重采样后的轨迹点, shape: (sample_length, 2)
+    """
+    try:
+        from scipy.interpolate import CubicSpline
+    except ImportError:
+        logger.warning("scipy not available, using linear interpolation")
+        # Fallback to linear interpolation
+        if len(points) == 0:
+            return np.zeros((sample_length, 2))
+        if len(points) == 1:
+            return np.tile(points[0], (sample_length, 1))
+        indices = np.linspace(0, len(points) - 1, sample_length)
+        return np.array([points[int(i)] for i in indices])
+    
+    total_distance = sample_length * interval
+    
+    if len(points) == 0:
+        return np.zeros((sample_length, 2))
+    
+    if len(points) == 1:
+        return np.tile(points[0], (sample_length, 1))
+    
+    # 计算原始轨迹的累积距离
+    diff = np.diff(points, axis=0)
+    segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
+    cumulative_distances = np.cumsum(segment_lengths)
+    cumulative_distances = np.insert(cumulative_distances, 0, 0)
+    
+    # 使用三次样条插值进行平滑
+    if len(points) > 3:
+        cs_x = CubicSpline(cumulative_distances, points[:, 0])
+        cs_y = CubicSpline(cumulative_distances, points[:, 1])
+        
+        dense_distances = np.linspace(0, cumulative_distances[-1], max(50, len(points) * 2))
+        x_smooth = cs_x(dense_distances)
+        y_smooth = cs_y(dense_distances)
+        smoothed_points = np.column_stack((x_smooth, y_smooth))
+        
+        smooth_diff = np.diff(smoothed_points, axis=0)
+        smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
+        smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
+        smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
+    else:
+        smoothed_points = points
+        smooth_cumulative_distances = cumulative_distances
+    
+    target_distances = np.linspace(0, total_distance, sample_length)
+    resampled = np.zeros((sample_length, 2))
+    
+    for i, target_dist in enumerate(target_distances):
+        if target_dist >= smooth_cumulative_distances[-1]:
+            resampled[i] = smoothed_points[-1]
+            continue
+        
+        segment_idx = np.searchsorted(smooth_cumulative_distances, target_dist, side='right') - 1
+        segment_idx = max(0, min(segment_idx, len(smooth_cumulative_distances) - 2))
+        
+        start_dist = smooth_cumulative_distances[segment_idx]
+        end_dist = smooth_cumulative_distances[segment_idx + 1]
+        
+        if end_dist > start_dist:
+            t = (target_dist - start_dist) / (end_dist - start_dist)
+        else:
+            t = 0
+        
+        resampled[i] = smoothed_points[segment_idx] + t * (
+            smoothed_points[min(segment_idx + 1, len(smoothed_points) - 1)] - smoothed_points[segment_idx]
+        )
+    
+    return resampled
+
+
+def xy_to_delta_xyt(xy_actions: np.ndarray) -> np.ndarray:
+    """
+    计算 (dx, dy, delta_yaw)
+    
+    参考 InternNav/internnav/dataset/internvla_n1_lerobot_dataset.py
+    
+    Args:
+        xy_actions: 绝对位置序列, shape: (N, 2)
+    
+    Returns:
+        delta_xyt: 增量动作, shape: (N-1, 3)
+    """
+    if len(xy_actions) < 2:
+        return np.zeros((max(0, len(xy_actions) - 1), 3), dtype=np.float32)
+    
+    vectors = np.diff(xy_actions, axis=0)  # [N-1, 2]
+    yaw = np.arctan2(vectors[:, 1], vectors[:, 0])  # [N-1]
+    
+    if len(yaw) < 2:
+        delta_yaw = yaw.copy() if len(yaw) > 0 else np.array([0.0])
+    else:
+        delta_yaw = np.diff(yaw)
+        delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi
+        delta_yaw = np.concatenate([[yaw[0]], delta_yaw])
+    
+    delta_xyt = np.concatenate([vectors, delta_yaw[:, None]], axis=1)
+    return delta_xyt.astype(np.float32)
+
+
+def interpolate_and_resample_trajectory(
+    absolute_trajectories: np.ndarray, 
+    predict_step_num: int = 24,
+    action_scale: float = 4.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    插值和重采样轨迹
+    
+    参考 InternNav/internnav/dataset/internvla_n1_lerobot_dataset.py
+    
+    Args:
+        absolute_trajectories: 绝对轨迹 (x, y, yaw), shape: (N, 3)
+        predict_step_num: 预测步数
+        action_scale: 动作放大倍数
+    
+    Returns:
+        resampled_trajectories: 重采样后的绝对轨迹, shape: (predict_step_num+1, 2)
+        resampled_relative_poses: 重采样后的相对位姿, shape: (predict_step_num, 3)
+    """
+    start_point = np.array([[0.0, 0.0]])
+    
+    traj = absolute_trajectories[..., :2]
+    
+    # 过滤有效步（距离平方 > 0.05）
+    if len(traj) > 1:
+        steps = traj[1:] - traj[:-1]
+        steps_sq = (steps**2).sum(axis=-1)
+        mask = steps_sq > 0.05
+        
+        filtered_traj = traj[1:][mask]
+        filtered_traj = np.concatenate([start_point, filtered_traj], axis=0)
+    else:
+        filtered_traj = start_point
+    
+    resampled_trajectories = smooth_and_resample_trajectory(
+        filtered_traj, sample_length=predict_step_num + 1
+    )
+    resampled_relative_poses = xy_to_delta_xyt(resampled_trajectories)
+    
+    # 放大动作（参考 InternNav）
+    resampled_relative_poses[:, 0:2] *= action_scale
+    
+    return resampled_trajectories, resampled_relative_poses
+
+
+def apply_trajectory_augmentation(
+    trajectory: np.ndarray,
+    rotation_range: float = 0.3,  # 旋转范围（弧度）
+    scale_range: Tuple[float, float] = (0.8, 1.2),  # 缩放范围
+    p: float = 0.5,  # 应用概率
+) -> np.ndarray:
+    """
+    轨迹增强：随机旋转和缩放
+    
+    Args:
+        trajectory: 轨迹 (N, 3) - (dx, dy, delta_yaw)
+        rotation_range: 旋转范围
+        scale_range: 缩放范围
+        p: 应用概率
+    
+    Returns:
+        augmented: 增强后的轨迹
+    """
+    if random.random() > p:
+        return trajectory
+    
+    augmented = trajectory.copy()
+    
+    # 随机旋转
+    if random.random() > 0.5:
+        angle = random.uniform(-rotation_range, rotation_range)
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        
+        # 旋转 dx, dy
+        dx = augmented[:, 0].copy()
+        dy = augmented[:, 1].copy()
+        augmented[:, 0] = dx * cos_a - dy * sin_a
+        augmented[:, 1] = dx * sin_a + dy * cos_a
+        
+        # 调整 yaw
+        augmented[:, 2] += angle
+        augmented[:, 2] = (augmented[:, 2] + np.pi) % (2 * np.pi) - np.pi
+    
+    # 随机缩放
+    if random.random() > 0.5:
+        scale = random.uniform(*scale_range)
+        augmented[:, 0:2] *= scale
+    
+    return augmented
+
+
+# ==================== 轨迹数据集（支持 24 步预测）====================
+
+class VLNTrajectoryDataset(VLNSlidingWindowDataset):
+    """
+    轨迹数据集：支持多步轨迹预测
+    
+    基于 VLNSlidingWindowDataset，增加以下功能：
+    1. 24 步轨迹预测（参考 InternNav）
+    2. 3D 动作表示 (dx, dy, delta_yaw) + 4x 放大
+    3. 轨迹增强
+    4. Progress 预测
+    
+    Args:
+        predict_horizon: 预测步数（默认 24）
+        action_scale: 动作放大倍数（默认 4.0）
+        enable_trajectory_augmentation: 是否启用轨迹增强
+        其他参数继承自 VLNSlidingWindowDataset
+    
+    Returns:
+        {
+            "history_frames": [K, 3, H, W],    # K 帧历史
+            "current_frame": [3, H, W],        # 当前观测
+            "heatmap": [Hm, Wm],               # 历史帧在当前帧的位置
+            "trajectory": [predict_horizon, 3], # 24 步轨迹 (dx, dy, yaw)
+            "trajectory_valid": float,          # 轨迹是否有效
+            "progress": float,                  # 任务完成进度 (0-1)
+            "text": str,                        # 指令
+        }
+    """
+    
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        min_history: int = 5,
+        num_history_sample: int = 8,
+        image_size: Tuple[int, int] = (224, 224),
+        hm_size: Tuple[int, int] = (64, 64),
+        load_depth: bool = True,
+        cache_poses: bool = True,
+        sample_stride: int = 1,
+        enable_augmentation: bool = True,
+        samples_per_clip: int = 2,
+        clip_level_sampling: bool = True,
+        # 轨迹预测相关配置
+        predict_horizon: int = 24,
+        action_scale: float = 4.0,
+        enable_trajectory_augmentation: bool = True,
+    ):
+        super().__init__(
+            root=root,
+            split=split,
+            min_history=min_history,
+            num_history_sample=num_history_sample,
+            image_size=image_size,
+            hm_size=hm_size,
+            load_depth=load_depth,
+            cache_poses=cache_poses,
+            sample_stride=sample_stride,
+            enable_augmentation=enable_augmentation,
+            samples_per_clip=samples_per_clip,
+            clip_level_sampling=clip_level_sampling,
+        )
+        
+        self.predict_horizon = predict_horizon
+        self.action_scale = action_scale
+        self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
+        
+        logger.info(
+            f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
+            f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}"
+        )
+    
+    def _compute_trajectory(
+        self, 
+        poses: List[np.ndarray], 
+        current_t: int, 
+        T: int,
+    ) -> Tuple[np.ndarray, float, float]:
+        """
+        从位姿计算轨迹
+        
+        Args:
+            poses: 所有帧的位姿列表
+            current_t: 当前帧索引
+            T: 总帧数
+        
+        Returns:
+            trajectory: (predict_horizon, 3) 轨迹
+            trajectory_valid: 轨迹是否有效
+            progress: 任务完成进度 (0-1)
+        """
+        # 计算 progress
+        progress = float(current_t) / max(T - 1, 1)
+        
+        # 获取从当前帧到结束的所有位姿
+        future_poses = poses[current_t:]
+        
+        if len(future_poses) < 2:
+            # 没有足够的未来帧，返回零轨迹
+            return np.zeros((self.predict_horizon, 3), dtype=np.float32), 0.0, progress
+        
+        # 转换为 numpy 数组
+        future_poses_np = np.array(future_poses, dtype=np.float32)
+        
+        # 计算相对于当前帧的轨迹
+        try:
+            relative_xyyaw = get_trajectory_relative_to_frame(future_poses_np, camera_deg=0)
+            
+            # 插值和重采样到 predict_horizon 步
+            _, resampled_poses = interpolate_and_resample_trajectory(
+                relative_xyyaw,
+                predict_step_num=self.predict_horizon,
+                action_scale=self.action_scale,
+            )
+            
+            # 确保形状正确
+            if len(resampled_poses) < self.predict_horizon:
+                # 填充
+                pad_size = self.predict_horizon - len(resampled_poses)
+                resampled_poses = np.concatenate([
+                    resampled_poses,
+                    np.zeros((pad_size, 3), dtype=np.float32)
+                ], axis=0)
+            else:
+                resampled_poses = resampled_poses[:self.predict_horizon]
+            
+            trajectory_valid = 1.0
+            
+        except Exception as e:
+            logger.warning(f"Failed to compute trajectory: {e}")
+            resampled_poses = np.zeros((self.predict_horizon, 3), dtype=np.float32)
+            trajectory_valid = 0.0
+        
+        return resampled_poses.astype(np.float32), trajectory_valid, progress
+    
+    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str, float]]:
+        """
+        加载一个训练样本（带轨迹）
+        """
+        clip_idx, current_t = self.sample_index[idx]
+        clip_dir = self.clips[clip_idx]
+        
+        try:
+            # 1. 加载元数据
+            meta = self._load_meta(clip_idx)
+            T = meta["num_frames"]
+            text = meta.get("instruction", "")
+            
+            # 2. 采样历史帧索引
+            history_indices = self._sample_history_indices(0, current_t, self.num_history_sample)
+            
+            # 3. 加载历史帧
+            history_frames = self._load_frames(clip_dir, history_indices)
+            
+            # 4. 加载当前帧
+            current_frame = self._load_frame(clip_dir, current_t)
+            
+            # 5. 加载位姿
+            poses = self._load_poses(clip_idx)
+            history_poses = [poses[i] for i in history_indices]
+            current_pose = poses[current_t]
+            
+            # 6. 加载当前帧深度（用于遮挡检测）
+            current_depth = self._load_depth(clip_dir, current_t)
+            
+            # 7. 计算热力图
+            intrinsics_path = clip_dir / "intrinsics.json"
+            if intrinsics_path.exists():
+                with open(intrinsics_path) as f:
+                    intrinsics = json.load(f)
+                img_size = (intrinsics["width"], intrinsics["height"])
+            else:
+                img_size = (512, 256)
+            
+            hm_w, hm_h = self.hm_size
+            heatmap, visibility = compute_history_heatmap(
+                history_poses=history_poses,
+                current_pose=current_pose,
+                current_depth=current_depth,
+                hm_size=(hm_h, hm_w),
+                img_size=img_size,
+            )
+            heatmap_tensor = torch.from_numpy(heatmap).float()
+            
+            # 8. 计算轨迹
+            trajectory, trajectory_valid, progress = self._compute_trajectory(poses, current_t, T)
+            
+            # 9. 应用轨迹增强
+            if self.enable_trajectory_augmentation and trajectory_valid > 0:
+                trajectory = apply_trajectory_augmentation(trajectory, p=0.5)
+            
+            trajectory_tensor = torch.from_numpy(trajectory).float()
+            
+            # 10. 保留旧的 action 接口用于兼容
+            actions = self._load_actions(clip_dir)
+            if actions is not None and current_t < len(actions):
+                action = actions[current_t]
+                action_valid = 1.0 if current_t < T - 1 else 0.0
+            else:
+                action = np.zeros(2, dtype=np.float32)
+                action_valid = 0.0
+            
+            action_tensor = torch.from_numpy(action.astype(np.float32))
+            
+            # 11. 离散动作
+            discrete_actions = self._load_discrete_actions(clip_dir)
+            if discrete_actions is not None and current_t < len(discrete_actions):
+                discrete_action = int(discrete_actions[current_t])
+                is_stop = 1.0 if discrete_action == 0 else 0.0
+            else:
+                discrete_action = 1
+                is_stop = 0.0
+            
+            return {
+                "history_frames": history_frames,        # [K, 3, H, W]
+                "current_frame": current_frame,          # [3, H, W]
+                "heatmap": heatmap_tensor,               # [Hm, Wm]
+                "trajectory": trajectory_tensor,         # [predict_horizon, 3]
+                "trajectory_valid": trajectory_valid,    # float
+                "progress": progress,                    # float (0-1)
+                # 兼容旧接口
+                "action": action_tensor,                 # [2]
+                "action_valid": action_valid,            # float
+                "discrete_action": discrete_action,      # int
+                "is_stop": is_stop,                      # float
+                "text": text,                            # str
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return self._get_dummy_sample_trajectory()
+    
+    def _get_dummy_sample_trajectory(self) -> Dict[str, Union[torch.Tensor, str, float, int]]:
+        """生成虚拟样本（用于错误处理）"""
+        base_sample = self._get_dummy_sample()
+        base_sample["trajectory"] = torch.zeros(self.predict_horizon, 3)
+        base_sample["trajectory_valid"] = 0.0
+        base_sample["progress"] = 0.0
+        return base_sample
+
+
+def create_trajectory_dataloader(
+    root: str,
+    split: str,
+    min_history: int = 5,
+    num_history_sample: int = 8,
+    image_size: Tuple[int, int] = (224, 224),
+    hm_size: Tuple[int, int] = (64, 64),
+    predict_horizon: int = 24,
+    action_scale: float = 4.0,
+    batch_size: int = 8,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    drop_last: bool = False,
+) -> DataLoader:
+    """
+    创建轨迹数据集的 DataLoader
+    """
+    dataset = VLNTrajectoryDataset(
+        root=root,
+        split=split,
+        min_history=min_history,
+        num_history_sample=num_history_sample,
+        image_size=image_size,
+        hm_size=hm_size,
+        predict_horizon=predict_horizon,
+        action_scale=action_scale,
+    )
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+    )
+
