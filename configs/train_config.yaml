@@ -20,7 +20,7 @@ data:
   
   sliding_window:
     min_history: 5
-    num_history_sample: 12       # 增加历史帧数量 (8 → 12)
+    num_history_sample: 8        # 从历史中均匀采样 8 帧（配合 max_video_frames=16）
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -33,7 +33,7 @@ data:
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
     min_history: 5
-    num_history_sample: 12       # 增加历史帧数量 (8 → 12)，提供更多上下文
+    num_history_sample: 8        # 从历史中均匀采样 8 帧（配合 max_video_frames=16）
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -163,9 +163,10 @@ optim:
   
   # 批量配置（每个样本单独过 Qwen3-VL）
   # RTX 5090 32GB 显存优化配置
-  # 有效批量: 48 * 3 = 144
-  batch_size: 48
-  grad_accum_steps: 3
+  # 当前 20GB 用 batch_size=32，32GB 可支持 ~50-56
+  # 有效批量: 56 * 2 = 112
+  batch_size: 56
+  grad_accum_steps: 2
 
 # ============================================
 # 损失函数
