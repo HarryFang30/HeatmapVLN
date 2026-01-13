@@ -824,24 +824,29 @@ log:
 ```yaml
 model:
   heatmap_head:
-    use_image_encoder: true   # true: LLM+CNN（默认），false: LLM-only
+    use_image_encoder: false  # 推荐设为 false（LLM-only），true 为 LLM+CNN
 ```
 
-**实验对比**：
+**实验结果**（2 epochs, 30 batches/epoch）：
 
-| 配置 | 描述 | 预期效果 |
-|------|------|----------|
-| `use_image_encoder: true` | LLM + CNN（默认） | 基线 |
-| `use_image_encoder: false` | 仅 LLM 特征 | 如果效果相近，说明 CNN 冗余 |
+| 配置 | Val Loss | 热力图 Loss | 动作 Loss | 结论 |
+|------|----------|-------------|-----------|------|
+| `use_image_encoder: true` | 2.5045 | 0.6032 | 1.7213 | 基线 |
+| **`use_image_encoder: false`** | **2.1924** | **0.3477** | **1.6760** | **推荐** ✅ |
+
+**关键发现**：
+- **LLM-only 模式效果更好**：Val Loss 下降 12.5%，热力图 Loss 下降 42.4%
+- **CNN 是冗余的**：Qwen3-VL 已经处理了当前帧，CNN 重复编码反而增加过拟合风险
+- **建议保持 `use_image_encoder: false`**：移除 CNN 后模型更简洁，泛化能力更好，参数量减少约 2.3M
 
 **运行消融实验**：
 
 ```bash
-# 基线（LLM + CNN）
+# LLM-only（推荐，当前默认）
 python scripts/train.py --config configs/train_config.yaml --max-batches 100
 
-# LLM-only（禁用 CNN）
-# 修改 configs/train_config.yaml 中 use_image_encoder: false
+# LLM + CNN（对比基线）
+# 修改 configs/train_config.yaml 中 use_image_encoder: true
 python scripts/train.py --config configs/train_config.yaml --max-batches 100
 ```
 

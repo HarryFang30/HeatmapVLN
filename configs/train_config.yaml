@@ -50,7 +50,7 @@ model:
     cond_dim: 512
     num_inference_steps: 10
     # CNN 消融实验开关：设为 false 禁用 ImageConditionEncoder，只用 LLM 特征
-    use_image_encoder: true
+    use_image_encoder: false
 
   # 动作头配置
   action_head:
