@@ -25,7 +25,8 @@ data:
     # Clip-level 采样策略（解决样本高度相关性问题）
     # 每个 epoch 从每个 clip 随机选择 N 个样本，而不是使用所有滑动窗口样本
     clip_level_sampling: true  # 启用 clip-level 采样
-    samples_per_clip: 2        # 每个 clip 每 epoch 采样 2 个样本（1 个 STOP + 1 个正常）
+    samples_per_clip: 2        # 训练集：每个 clip 每 epoch 采样 2 个样本
+    val_samples_per_clip: 2    # 验证集：每个 clip 采样 2 个样本（固定种子，确保可比较）
 
 # ============================================
 # 模型配置

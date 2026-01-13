@@ -1351,6 +1351,8 @@ def main():
     )
     
     val_split = cfg['data'].get('val_split', 'val')
+    # 验证集也使用 clip-level 采样，但使用固定种子确保可比较
+    val_samples_per_clip = sw_cfg.get('val_samples_per_clip', 2)  # 验证集每 clip 采样数
     val_dataset = VLNSlidingWindowDataset(
         root=cfg['data']['root'],
         split=val_split,
@@ -1361,9 +1363,12 @@ def main():
         load_depth=sw_cfg.get('load_depth', True),
         cache_poses=sw_cfg.get('cache_poses', True),
         sample_stride=sample_stride,
-        clip_level_sampling=False,  # 验证集使用固定采样，确保可比较
-        samples_per_clip=samples_per_clip,
+        clip_level_sampling=clip_level_sampling,  # 验证集也使用 clip-level 采样
+        samples_per_clip=val_samples_per_clip,
     )
+    # 验证集使用固定 epoch=0，确保每次验证样本一致
+    if hasattr(val_dataset, 'set_epoch'):
+        val_dataset.set_epoch(0)
     
     logger.info(f"  Train: {len(train_dataset)} samples")
     logger.info(f"  Val: {len(val_dataset)} samples")
