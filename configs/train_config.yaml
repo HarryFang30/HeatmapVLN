@@ -20,7 +20,7 @@ data:
   
   sliding_window:
     min_history: 5
-    num_history_sample: 8        # 从历史中均匀采样 8 帧（配合 max_video_frames=16）
+    num_history_sample: 32       # 传入更多历史帧，热力图信号更密集
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -33,7 +33,7 @@ data:
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
     min_history: 5
-    num_history_sample: 8        # 从历史中均匀采样 8 帧（配合 max_video_frames=16）
+    num_history_sample: 32       # 传入更多历史帧，热力图信号更密集
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -59,7 +59,7 @@ model:
     token_dim: 1024
     torch_dtype: bfloat16
     attn_implementation: sdpa  # sdpa 无需额外安装 flash_attn
-    max_video_frames: 16
+    max_video_frames: 64       # Qwen3-VL 可处理长视频，增大到 64 帧
 
   # 热力图头配置 (只训练 history head)
   heatmap_head:
@@ -163,10 +163,10 @@ optim:
   
   # 批量配置（每个样本单独过 Qwen3-VL）
   # RTX 5090 32GB 显存优化配置
-  # 当前 20GB 用 batch_size=32，32GB 可支持 ~50-56
-  # 有效批量: 56 * 2 = 112
-  batch_size: 56
-  grad_accum_steps: 2
+  # 增加历史帧数 (8→32) 后，需要降低 batch_size
+  # 有效批量: 16 * 8 = 128
+  batch_size: 16
+  grad_accum_steps: 8
 
 # ============================================
 # 损失函数
