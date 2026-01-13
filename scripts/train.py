@@ -863,83 +863,83 @@ def train_one_epoch(
             global_step += 1
             
             # 日志
-                            log_interval = cfg['log'].get('log_interval', 10)
-                            if global_step % log_interval == 0 or global_step <= 3:
-                                mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
-                                logger.info(
-                                    f"[{stage_name}] "
-                                    f"Epoch {epoch}/{stage_cfg['epochs']} | "
-                                    f"Batch {i+1}/{len(train_loader)} | "
-                                    f"Step {global_step} | "
-                                    f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}, stop: {stop_loss.item():.4f}) | "
-                                    f"LR: {scheduler.get_last_lr()[0]:.2e} | "
-                                    f"GPU: {mem_alloc:.1f}GB"
-                                )
+            log_interval = cfg['log'].get('log_interval', 10)
+            if global_step % log_interval == 0 or global_step <= 3:
+                mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
+                logger.info(
+                    f"[{stage_name}] "
+                    f"Epoch {epoch}/{stage_cfg['epochs']} | "
+                    f"Batch {i+1}/{len(train_loader)} | "
+                    f"Step {global_step} | "
+                    f"Loss: {loss.item()*grad_accum_steps:.4f} "
+                    f"(hm: {heatmap_loss.item():.4f}, act: {action_loss.item():.4f}, stop: {stop_loss.item():.4f}) | "
+                    f"LR: {scheduler.get_last_lr()[0]:.2e} | "
+                    f"GPU: {mem_alloc:.1f}GB"
+                )
                 
-                if tb_writer is not None:
-                    actual_step = global_step_offset + global_step
-                    tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
-                    tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
-                    tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
-                    tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)
-                    tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
-                    
-                    # Action valid ratio - 监控有效样本比例
-                    tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
-                    
-                    # 诊断信息记录（固定间隔）
-                    diag_interval = cfg['log'].get('diag_interval', 100)
-                    if global_step % diag_interval == 0:
-                        # 热力图输出诊断 - 检查是否坍缩为全黑
-                        if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
-                            pred_hm = output['history_heatmaps'].detach()
-                            pred_mean = pred_hm.mean().item()
-                            pred_max = pred_hm.max().item()
-                            pred_std = pred_hm.std().item()
-                            
-                            tb_writer.add_scalar('diag/pred_heatmap_mean', pred_mean, actual_step)
-                            tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
-                            tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
-                            
-                            # 与 GT 对比
-                            gt_mean = gt_heatmap.mean().item()
-                            gt_max = gt_heatmap.max().item()
-                            
-                            logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
-                            logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
-                            
-                            # 坍缩检测：如果预测热力图最大值 < 0.1，警告
-                            if pred_max < 0.1:
-                                logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
-                            
-                            # 检查是否都接近 0（全黑）
-                            non_zero_ratio = (pred_hm > 0.01).float().mean().item()
-                            tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
-                            if non_zero_ratio < 0.05:
-                                logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
+            if tb_writer is not None:
+                actual_step = global_step_offset + global_step
+                tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
+                tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
+                tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
+                tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)
+                tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
+                
+                # Action valid ratio - 监控有效样本比例
+                tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
+                
+                # 诊断信息记录（固定间隔）
+                diag_interval = cfg['log'].get('diag_interval', 100)
+                if global_step % diag_interval == 0:
+                    # 热力图输出诊断 - 检查是否坍缩为全黑
+                    if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
+                        pred_hm = output['history_heatmaps'].detach()
+                        pred_mean = pred_hm.mean().item()
+                        pred_max = pred_hm.max().item()
+                        pred_std = pred_hm.std().item()
                         
-                        # Stop prediction 诊断
-                        if 'stop_logits' in output:
-                            stop_logits = output['stop_logits'].detach()
-                            stop_probs = torch.sigmoid(stop_logits)
-                            tb_writer.add_scalar('diag/stop_prob_mean', stop_probs.mean().item(), actual_step)
-                            tb_writer.add_scalar('diag/stop_prob_max', stop_probs.max().item(), actual_step)
-                            # 计算 stop recall
-                            if is_stop.sum() > 0:
-                                predicted_stops = (stop_probs > 0.5).float()
-                                stop_recall = (predicted_stops * is_stop).sum() / is_stop.sum()
-                                tb_writer.add_scalar('diag/stop_recall', stop_recall.item(), actual_step)
-                            # 计算 precision
-                            if (stop_probs > 0.5).sum() > 0:
-                                stop_precision = ((stop_probs > 0.5).float() * is_stop).sum() / (stop_probs > 0.5).sum()
-                                tb_writer.add_scalar('diag/stop_precision', stop_precision.item(), actual_step)
+                        tb_writer.add_scalar('diag/pred_heatmap_mean', pred_mean, actual_step)
+                        tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
+                        tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
+                        
+                        # 与 GT 对比
+                        gt_mean = gt_heatmap.mean().item()
+                        gt_max = gt_heatmap.max().item()
+                        
+                        logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
+                        logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
+                        
+                        # 坍缩检测：如果预测热力图最大值 < 0.1，警告
+                        if pred_max < 0.1:
+                            logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
+                        
+                        # 检查是否都接近 0（全黑）
+                        non_zero_ratio = (pred_hm > 0.01).float().mean().item()
+                        tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
+                        if non_zero_ratio < 0.05:
+                            logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
                     
-                    # 动作分布直方图（每 100 步记录一次，避免日志过大）
-                    if global_step % 100 == 0:
-                        if 'actions' in output and output['actions'] is not None:
-                            tb_writer.add_histogram('train/predicted_actions', output['actions'].flatten().cpu(), actual_step)
-                        tb_writer.add_histogram('train/gt_actions', gt_action.flatten().cpu(), actual_step)
+                    # Stop prediction 诊断
+                    if 'stop_logits' in output:
+                        stop_logits = output['stop_logits'].detach()
+                        stop_probs = torch.sigmoid(stop_logits)
+                        tb_writer.add_scalar('diag/stop_prob_mean', stop_probs.mean().item(), actual_step)
+                        tb_writer.add_scalar('diag/stop_prob_max', stop_probs.max().item(), actual_step)
+                        # 计算 stop recall
+                        if is_stop.sum() > 0:
+                            predicted_stops = (stop_probs > 0.5).float()
+                            stop_recall = (predicted_stops * is_stop).sum() / is_stop.sum()
+                            tb_writer.add_scalar('diag/stop_recall', stop_recall.item(), actual_step)
+                        # 计算 precision
+                        if (stop_probs > 0.5).sum() > 0:
+                            stop_precision = ((stop_probs > 0.5).float() * is_stop).sum() / (stop_probs > 0.5).sum()
+                            tb_writer.add_scalar('diag/stop_precision', stop_precision.item(), actual_step)
+                
+                # 动作分布直方图（每 100 步记录一次，避免日志过大）
+                if global_step % 100 == 0:
+                    if 'actions' in output and output['actions'] is not None:
+                        tb_writer.add_histogram('train/predicted_actions', output['actions'].flatten().cpu(), actual_step)
+                    tb_writer.add_histogram('train/gt_actions', gt_action.flatten().cpu(), actual_step)
         
         # 定期可视化热力图预测并记录到 TensorBoard
         vis_interval = cfg['log'].get('vis_every_steps', 500)
