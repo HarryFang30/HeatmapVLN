@@ -1005,8 +1005,9 @@ def train_one_epoch(
                 actual_step = global_step_offset + global_step
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
-                tb_writer.add_scalar('train/action_loss', action_loss.item(), actual_step)
-                tb_writer.add_scalar('train/stop_loss', stop_loss.item(), actual_step)
+                # 🔧 修复：记录实际使用的损失（trajectory/progress 或 action/stop）
+                tb_writer.add_scalar('train/action_loss', action_total_loss.item(), actual_step)
+                tb_writer.add_scalar('train/stop_loss', stop_total_loss.item(), actual_step)
                 tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
                 
                 # Action valid ratio - 监控有效样本比例
