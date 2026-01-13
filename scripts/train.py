@@ -540,6 +540,10 @@ def build_model(cfg: Dict) -> nn.Module:
         diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
         image_size=cfg['data']['image_size'][0],
+        # Heatmap head ablation settings
+        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', True),
+        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
+        heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
         
         # Action Head Type
         action_head_type=action_head_type,
@@ -584,7 +588,9 @@ def build_model(cfg: Dict) -> nn.Module:
     
     print(f"✅ VLN Pipeline 已构建")
     print(f"   Qwen3-VL → {llm_cfg.get('model_path', './models/qwen_3_vl')}")
-    print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}")
+    print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}, "
+          f"use_image_encoder={heatmap_cfg.get('use_image_encoder', True)}, "
+          f"pool_method={heatmap_cfg.get('pool_method', 'attention')}")
     print(f"   FutureHeatmapHead → enabled={heatmap_cfg.get('enable_future', True)}")
     print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
     print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")

@@ -71,7 +71,7 @@ class DiffusionHeatmapHead(nn.Module):
         # Training optimization: inference monitoring control
         self._training_step_counter = 0
         self._inference_interval = 100  # Generate heatmap every N steps during training
-        self._peak_loss_interval = 20   # Compute peak loss every N steps (was 3, now 20 for efficiency)
+        self._peak_loss_interval = 5    # Compute peak loss every N steps (restored to more frequent)
         
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
@@ -113,6 +113,8 @@ class DiffusionHeatmapHead(nn.Module):
             f"DiffusionHeatmapHead initialized: "
             f"heatmap_size={config.heatmap_size}, "
             f"cond_dim={config.cond_dim}, "
+            f"use_image_encoder={config.use_image_encoder}, "
+            f"pool_method={config.llm_pool_method}, "
             f"params={total_params:,}"
         )
     
@@ -140,15 +142,16 @@ class DiffusionHeatmapHead(nn.Module):
             Else:
                 (B, Hm, Wm) predicted heatmap
         """
-        # 1. Preprocess llm_tokens to (B, D) by mean pooling
-        if llm_tokens.dim() > 2:
-            # Pool all intermediate dimensions: (B, K, seq_len, D) -> (B, D)
-            # or (B, seq_len, D) -> (B, D)
+        # 1. Preprocess llm_tokens: flatten intermediate dimensions to (B, seq_len, D)
+        # Keep sequence dimension for attention pooling in condition_encoder
+        if llm_tokens.dim() > 3:
+            # (B, K, seq_len, D) -> (B, K*seq_len, D)
             B = llm_tokens.shape[0]
             D = llm_tokens.shape[-1]
-            llm_tokens = llm_tokens.reshape(B, -1, D).mean(dim=1)  # (B, D)
+            llm_tokens = llm_tokens.reshape(B, -1, D)
+        # Now llm_tokens is (B, seq_len, D) - let condition_encoder handle pooling
         
-        # 2. Encode conditions
+        # 2. Encode conditions (condition_encoder will pool based on configured pool_method)
         cond = self.condition_encoder(llm_tokens, observation)  # (B, cond_dim)
         
         # 3. Training mode

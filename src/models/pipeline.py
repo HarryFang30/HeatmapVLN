@@ -64,6 +64,11 @@ class VLNPipelineConfig:
     # Image size for heatmap encoder
     image_size: int = 224
     
+    # Heatmap head ablation settings
+    heatmap_use_image_encoder: bool = True  # Set to False to disable CNN encoder (LLM-only mode)
+    heatmap_pool_method: str = "attention"  # 'attention', 'mean', 'first', 'last', 'max'
+    heatmap_pool_num_heads: int = 4  # Number of attention heads for attention pooling
+    
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
     # 'transformer': TransformerActionHead (InternNav style)
@@ -156,6 +161,10 @@ class VLNPipeline(nn.Module):
             heatmap_size=config.heatmap_size,
             num_inference_steps=config.diffusion_heatmap_num_inference_steps,
             image_size=(config.image_size, config.image_size),
+            # Ablation settings - now correctly passed from config
+            use_image_encoder=config.heatmap_use_image_encoder,
+            llm_pool_method=config.heatmap_pool_method,
+            llm_pool_num_heads=config.heatmap_pool_num_heads,
         )
         
         # History Heatmap Head
@@ -163,7 +172,11 @@ class VLNPipeline(nn.Module):
             self.history_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
                 device=heatmap_device, dtype=config.dtype
             )
-            logger.info(f"✓ History Heatmap Head initialized")
+            logger.info(
+                f"✓ History Heatmap Head initialized "
+                f"(use_image_encoder={config.heatmap_use_image_encoder}, "
+                f"pool_method={config.heatmap_pool_method})"
+            )
         else:
             self.history_heatmap_head = None
         
@@ -172,7 +185,11 @@ class VLNPipeline(nn.Module):
             self.future_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
                 device=heatmap_device, dtype=config.dtype
             )
-            logger.info(f"✓ Future Heatmap Head initialized")
+            logger.info(
+                f"✓ Future Heatmap Head initialized "
+                f"(use_image_encoder={config.heatmap_use_image_encoder}, "
+                f"pool_method={config.heatmap_pool_method})"
+            )
         else:
             self.future_heatmap_head = None
         
