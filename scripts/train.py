@@ -1095,15 +1095,17 @@ def train_one_epoch(
         
         total_loss += loss.item() * grad_accum_steps
         total_heatmap_loss += heatmap_loss.item()
-        total_action_loss += action_loss.item()
-        total_stop_loss += stop_loss.item()
+        # 🔧 修复：使用 action_total_loss 和 stop_total_loss（包含 trajectory/progress loss）
+        total_action_loss += action_total_loss.item()
+        total_stop_loss += stop_total_loss.item()
         num_batches += 1
         
         pbar.set_postfix({
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
             'hm': f"{heatmap_loss.item():.4f}",
-            'act': f"{action_loss.item():.4f}",
-            'stop': f"{stop_loss.item():.4f}",
+            # 🔧 修复：显示实际使用的损失（traj/prog 或 act/stop）
+            'act': f"{action_total_loss.item():.4f}",
+            'stop': f"{stop_total_loss.item():.4f}",
         })
     
     # 处理剩余梯度
