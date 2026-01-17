@@ -14,6 +14,9 @@ from pathlib import Path
 # 启用 expandable_segments 减少显存碎片
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
+# 禁用 tokenizers 并行，避免多进程 fork 冲突导致死锁
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 # 添加项目路径
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
@@ -47,6 +50,7 @@ import cv2
 warnings.filterwarnings("ignore")
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
+from src.data.packing_collator import PackingCollatorForVLN
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.loss import (
     NavigationHeatmapLoss,
@@ -530,6 +534,11 @@ def build_model(cfg: Dict) -> nn.Module:
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
         
+        # Sequence Packing (based on official Qwen3-VL fine-tuning)
+        enable_packing=llm_cfg.get('enable_packing', False),
+        max_seq_length=llm_cfg.get('max_seq_length', 4096),
+        spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
+        
         # Device
         device=model_cfg.get('device', 'cuda'),
         
@@ -586,8 +595,13 @@ def build_model(cfg: Dict) -> nn.Module:
     
     model = VLNPipeline(config)
     
+    packing_enabled = llm_cfg.get('enable_packing', False)
     print(f"✅ VLN Pipeline 已构建")
     print(f"   Qwen3-VL → {llm_cfg.get('model_path', './models/qwen_3_vl')}")
+    if packing_enabled:
+        print(f"   SequencePacking → enabled=True, max_seq_length={llm_cfg.get('max_seq_length', 4096)}")
+    else:
+        print(f"   SequencePacking → enabled=False (使用传统 padding)")
     print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}, "
           f"use_image_encoder={heatmap_cfg.get('use_image_encoder', True)}, "
           f"pool_method={heatmap_cfg.get('pool_method', 'attention')}")
@@ -806,6 +820,7 @@ def train_one_epoch(
     stage_name: str = "",
     stage_cfg: Dict = None,
     max_batches: int = None,
+    packing_enabled: bool = False,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     
@@ -851,37 +866,51 @@ def train_one_epoch(
         
         B, K, C, H, W = history_frames.shape
         
-        video_frames = torch.cat([
-            history_frames,
-            current_frame.unsqueeze(1)
-        ], dim=1)
-        
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
-        # 处理导航指令 - 传递整个 list 让模型处理每个样本
-        if text and len(text) > 0:
-            instruction_text = list(text)  # 保持为 list，每个样本一个指令
-        else:
-            instruction_text = None
-        
         # 前向传播
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            output = model(
-                video_frames=video_frames,
-                instruction_text=instruction_text,
-                current_observation=current_frame.to(device),
-                return_heatmaps=True,
-                return_actions=train_action,
-                gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                action_valid=action_valid if train_action else None,
-                gt_stop=is_stop if train_action else None,
-                gt_history_heatmap=gt_heatmap if train_history else None,
-                gt_future_heatmap=gt_heatmap if train_future else None,
-            )
+            if packing_enabled:
+                # Packing 模式: 直接传递 packed batch
+                output = model.forward_packed(
+                    packed_batch=batch,
+                    return_heatmaps=True,
+                    return_actions=train_action,
+                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                    action_valid=action_valid if train_action else None,
+                    gt_stop=is_stop if train_action else None,
+                    gt_history_heatmap=gt_heatmap if train_history else None,
+                    gt_future_heatmap=gt_heatmap if train_future else None,
+                )
+            else:
+                # 传统模式: 构建 video_frames
+                video_frames = torch.cat([
+                    history_frames,
+                    current_frame.unsqueeze(1)
+                ], dim=1)
+                
+                # 处理导航指令
+                if text and len(text) > 0:
+                    instruction_text = list(text)
+                else:
+                    instruction_text = None
+                
+                output = model(
+                    video_frames=video_frames,
+                    instruction_text=instruction_text,
+                    current_observation=current_frame.to(device),
+                    return_heatmaps=True,
+                    return_actions=train_action,
+                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                    action_valid=action_valid if train_action else None,
+                    gt_stop=is_stop if train_action else None,
+                    gt_history_heatmap=gt_heatmap if train_history else None,
+                    gt_future_heatmap=gt_heatmap if train_future else None,
+                )
             
             # Heatmap Loss
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -1010,8 +1039,13 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/stop_loss', stop_total_loss.item(), actual_step)
                 tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
                 
-                # Action valid ratio - 监控有效样本比例
-                tb_writer.add_scalar('train/action_valid_ratio', action_valid.float().mean().item(), actual_step)
+                # 🔧 修复：优先使用 trajectory_valid（trajectory 数据集），否则使用 action_valid
+                # 监控有效样本比例
+                if 'trajectory_valid' in batch:
+                    valid_ratio = batch['trajectory_valid'].float().mean().item()
+                else:
+                    valid_ratio = action_valid.float().mean().item()
+                tb_writer.add_scalar('train/action_valid_ratio', valid_ratio, actual_step)
                 
                 # 诊断信息记录（固定间隔）
                 diag_interval = cfg['log'].get('diag_interval', 100)
@@ -1141,6 +1175,7 @@ def validate(
     stage_cfg: Dict,
     tb_writer: Optional[SummaryWriter] = None,
     epoch: int = 0,
+    packing_enabled: bool = False,
 ) -> Dict[str, float]:
     """验证"""
     model.eval()
@@ -1164,34 +1199,45 @@ def validate(
         current_frame = batch['current_frame']
         B, K, C, H, W = history_frames.shape
         
-        video_frames = torch.cat([
-            history_frames,
-            current_frame.unsqueeze(1)
-        ], dim=1)
-        
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
-        # 处理导航指令 - 传递整个 list 让模型处理每个样本
-        if text and len(text) > 0:
-            instruction_text = list(text)
-        else:
-            instruction_text = None
-        
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            output = model(
-                video_frames=video_frames,
-                instruction_text=instruction_text,
-                current_observation=current_frame.to(device),
-                return_heatmaps=True,
-                return_actions=train_action,
-                gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                action_valid=action_valid if train_action else None,
-                gt_stop=is_stop if train_action else None,
-            )
+            if packing_enabled:
+                # Packing 模式
+                output = model.forward_packed(
+                    packed_batch=batch,
+                    return_heatmaps=True,
+                    return_actions=train_action,
+                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                    action_valid=action_valid if train_action else None,
+                    gt_stop=is_stop if train_action else None,
+                )
+            else:
+                # 传统模式
+                video_frames = torch.cat([
+                    history_frames,
+                    current_frame.unsqueeze(1)
+                ], dim=1)
+                
+                if text and len(text) > 0:
+                    instruction_text = list(text)
+                else:
+                    instruction_text = None
+                
+                output = model(
+                    video_frames=video_frames,
+                    instruction_text=instruction_text,
+                    current_observation=current_frame.to(device),
+                    return_heatmaps=True,
+                    return_actions=train_action,
+                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                    action_valid=action_valid if train_action else None,
+                    gt_stop=is_stop if train_action else None,
+                )
             
             heatmap_loss = torch.tensor(0.0, device=device)
             if train_history and 'history_heatmaps' in output:
@@ -1673,7 +1719,38 @@ def main():
     # 构建数据加载器
     num_workers = cfg['data']['num_workers']
     prefetch_factor = cfg['data'].get('prefetch_factor', 2)
+    
+    # 检查是否启用 Sequence Packing
+    packing_enabled = cfg['model']['llm'].get('enable_packing', False)
+    
+    if packing_enabled:
+        # Packing 模式：需要在 collate 中进行 tokenization
+        # 必须先加载模型以获取 processor
+        logger.info("📦 Sequence Packing enabled - loading model for processor...")
+        if not model.qwen3_vl._model_loaded:
+            model.qwen3_vl._load_model()
+        
+        # 创建 Packing Collator
+        packing_collator = PackingCollatorForVLN(
+            processor=model.qwen3_vl.processor,
+            spatial_merge_size=cfg['model']['llm'].get('spatial_merge_size', 2),
+            max_seq_length=cfg['model']['llm'].get('max_seq_length', 8192),
+        )
+        actual_collate_fn = packing_collator
+        
+        # Packing 模式强制 num_workers=0（tokenization 在主进程）
+        # 这避免了在 worker 中复制 processor 的开销
+        num_workers = 0
+        logger.info("   Packing mode: num_workers forced to 0 (tokenization in main process)")
+    else:
+        actual_collate_fn = collate_fn
+    
     persistent_workers = num_workers > 0
+    
+    # 使用 spawn 而不是 fork，避免 tokenizers 多进程死锁
+    # fork 会继承父进程的 tokenizers 锁状态，导致死锁
+    # spawn 创建全新进程，避免这个问题
+    mp_context = 'spawn' if num_workers > 0 else None
     
     train_loader = DataLoader(
         train_dataset,
@@ -1681,10 +1758,11 @@ def main():
         shuffle=True,
         num_workers=num_workers,
         pin_memory=cfg['data']['pin_memory'],
-        collate_fn=collate_fn,
+        collate_fn=actual_collate_fn,
         drop_last=True,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
+        multiprocessing_context=mp_context,
     )
     
     val_loader = DataLoader(
@@ -1693,9 +1771,10 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=cfg['data']['pin_memory'],
-        collate_fn=collate_fn,
+        collate_fn=actual_collate_fn,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
+        multiprocessing_context=mp_context,
     )
     
     # 设置可训练模块
@@ -1756,13 +1835,15 @@ def main():
             model, train_loader, optimizer, scheduler, scaler,
             cfg, heatmap_criterion, epoch, logger, tb_writer, epoch_offset,
             stage_idx=0, stage_name=stage_name, stage_cfg=stage_cfg,
-            max_batches=args.max_batches
+            max_batches=args.max_batches,
+            packing_enabled=packing_enabled,
         )
         
         timer.end_epoch()
         
         val_metrics = validate(
-            model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch
+            model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch,
+            packing_enabled=packing_enabled,
         )
         
         logger.info(

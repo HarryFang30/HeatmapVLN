@@ -1435,10 +1435,12 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             actions = self._load_actions(clip_dir)
             if actions is not None and current_t < len(actions):
                 action = actions[current_t]
-                action_valid = 1.0 if current_t < T - 1 else 0.0
             else:
                 action = np.zeros(2, dtype=np.float32)
-                action_valid = 0.0
+            
+            # 🔧 修复：让 action_valid 与 trajectory_valid 保持一致
+            # 这样 tensorboard 记录的 action_valid_ratio 能正确反映有效样本比例
+            action_valid = trajectory_valid
             
             action_tensor = torch.from_numpy(action.astype(np.float32))
             

@@ -9,7 +9,7 @@ data:
   val_split: val_unseen
   image_size: [224, 224]
   init_hm_size: [64, 64]
-  num_workers: 8
+  num_workers: 4    # 批量处理下可以启用多进程数据加载
   pin_memory: true
   prefetch_factor: 2
   
@@ -33,7 +33,7 @@ data:
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
     min_history: 5
-    num_history_sample: -1       # -1 表示使用全部历史帧（不采样）
+    num_history_sample: 96       # 限制历史帧为一半 (平均167帧)
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -58,8 +58,15 @@ model:
     hidden_dim: 4096
     token_dim: 1024
     torch_dtype: bfloat16
-    attn_implementation: sdpa  # sdpa 无需额外安装 flash_attn
+    attn_implementation: flash_attention_2  # 使用 flash_attention_2
     max_video_frames: -1       # -1 表示不限制帧数，使用全部历史帧
+    
+    # Sequence Packing 配置（基于 Qwen3-VL 官方 fine-tuning 框架）
+    # 将多个样本打包成一个长序列，使用 flash_attn_varlen_func 处理
+    # 显著提高显存利用率，减少 padding 浪费
+    enable_packing: true       # 启用 sequence packing
+    max_seq_length: 8192       # 打包后的最大序列长度
+    spatial_merge_size: 2      # 视觉空间合并大小
 
   # 热力图头配置 (只训练 history head)
   heatmap_head:
@@ -161,12 +168,13 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.1
   
-  # 批量配置（每个样本单独过 Qwen3-VL）
-  # RTX 5090 32GB 显存优化配置
-  # 当前 batch_size=8 只用 16.7GB (52%)，可大幅增加
-  # 有效批量: 14 * 9 = 126 (接近 128)
-  batch_size: 14
-  grad_accum_steps: 9
+  # 批量配置（真正批量处理已启用）
+  # 现在 Qwen3-VL 使用 sequence packing 批量处理
+  # batch_size 增加会增加显存使用（期望行为）
+  # RTX 5090 32GB - 激进配置，目标 ~85% 显存利用率
+  # 有效批量: 7 * 4 = 28
+  batch_size: 7
+  grad_accum_steps: 4
 
 # ============================================
 # 损失函数

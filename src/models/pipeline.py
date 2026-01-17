@@ -50,6 +50,11 @@ class VLNPipelineConfig:
     llm_attn_implementation: str = "sdpa"  # sdpa works without flash_attn
     max_video_frames: int = 16
     
+    # Sequence Packing configuration (based on official Qwen3-VL fine-tuning)
+    enable_packing: bool = False   # Whether to use sequence packing
+    max_seq_length: int = 4096     # Maximum packed sequence length
+    spatial_merge_size: int = 2    # Vision spatial merge size for position IDs
+    
     # Device configuration
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
@@ -136,9 +141,16 @@ class VLNPipeline(nn.Module):
             torch_dtype=config.llm_torch_dtype,
             attn_implementation=config.llm_attn_implementation,
             max_video_frames=config.max_video_frames,
+            # Sequence packing settings
+            enable_packing=config.enable_packing,
+            max_seq_length=config.max_seq_length,
+            spatial_merge_size=config.spatial_merge_size,
         )
         self.qwen3_vl = Qwen3VLIntegration(qwen_config)
-        logger.info(f"✓ Qwen3-VL integration initialized")
+        if config.enable_packing:
+            logger.info(f"✓ Qwen3-VL integration initialized (packing enabled, max_seq={config.max_seq_length})")
+        else:
+            logger.info(f"✓ Qwen3-VL integration initialized")
         
         # ==================== LLM Projector ====================
         self.llm_projector = nn.Sequential(
@@ -434,6 +446,222 @@ class VLNPipeline(nn.Module):
                 'num_input_frames': num_frames,
                 'batch_size': batch_size,
                 'llm_token_shape': llm_tokens.shape,
+            }
+        }
+        
+        # Heatmaps
+        if history_heatmap is not None:
+            output['history_heatmaps'] = history_heatmap.unsqueeze(1)
+        if future_heatmap is not None:
+            output['future_heatmaps'] = future_heatmap.unsqueeze(1)
+        
+        # Heatmap losses
+        if history_heatmap_loss is not None:
+            output['history_heatmap_loss'] = history_heatmap_loss
+            if history_heatmap_noise_std is not None:
+                output['history_heatmap_noise_std'] = history_heatmap_noise_std
+                output['history_heatmap_noise_pred_std'] = history_heatmap_noise_pred_std
+        if future_heatmap_loss is not None:
+            output['future_heatmap_loss'] = future_heatmap_loss
+            if future_heatmap_noise_std is not None:
+                output['future_heatmap_noise_std'] = future_heatmap_noise_std
+                output['future_heatmap_noise_pred_std'] = future_heatmap_noise_pred_std
+        
+        # Actions / Trajectory
+        output['action_cond'] = action_cond
+        
+        if self.transformer_action_head is not None:
+            output['has_transformer_action_head'] = True
+            if not self.training and trajectory is not None:
+                output['trajectory'] = trajectory
+        elif self.action_head is not None:
+            output['has_action_head'] = True
+            if not self.training and actions is not None:
+                output['actions'] = actions
+        
+        # Progress prediction
+        if progress is not None:
+            output['progress'] = progress
+        
+        # Stop prediction (legacy)
+        if stop_logits is not None:
+            output['stop_logits'] = stop_logits
+            output['stop_prob'] = stop_prob
+        
+        if return_intermediate:
+            output['intermediate_features'] = {
+                'raw_hidden_states': raw_hidden_states,
+                'qwen_output': qwen_output,
+            }
+        
+        return output
+    
+    def forward_packed(
+        self,
+        packed_batch: Dict[str, Any],
+        return_intermediate: bool = False,
+        return_heatmaps: bool = True,
+        return_actions: bool = True,
+        gt_actions: Optional[torch.Tensor] = None,
+        action_valid: Optional[torch.Tensor] = None,
+        gt_stop: Optional[torch.Tensor] = None,
+        gt_history_heatmap: Optional[torch.Tensor] = None,
+        gt_future_heatmap: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """
+        Forward pass with packed batch (Sequence Packing mode).
+        
+        基于 Qwen3-VL 官方 fine-tuning 框架的 Sequence Packing 实现。
+        所有样本被打包成一个长序列，使用 flash_attn_varlen_func 处理。
+        
+        Args:
+            packed_batch: Dict from PackingCollatorForVLN, containing:
+                - input_ids: (1, total_seq_len)
+                - attention_mask: cumsum_seq_lens (num_samples + 1,)
+                - position_ids: (3, 1, total_seq_len)
+                - pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
+                - seq_lens: List[int]
+                - num_samples: int
+                - current_frame: (B, C, H, W) for heatmap heads
+                - heatmap, action, etc.
+            
+        Returns:
+            Dictionary containing predictions and losses (same format as forward)
+        """
+        batch_size = packed_batch["num_samples"]
+        seq_lens = packed_batch["seq_lens"]
+        
+        current_observation = packed_batch["current_frame"].to(self.device)
+        
+        if self.config.verbose:
+            total_seq_len = packed_batch["input_ids"].shape[1]
+            logger.info(f"[PACKED] Processing {batch_size} samples, total_seq_len={total_seq_len}")
+        
+        # ==================== Step 1: Qwen3-VL Processing (Packed) ====================
+        qwen_output = self.qwen3_vl.forward_packed(
+            packed_batch=packed_batch,
+            return_hidden_states=True,
+        )
+        
+        # Get hidden states: (num_samples, hidden_dim) after pooling
+        raw_hidden_states = qwen_output.get('hidden_states')
+        vision_hidden_states = qwen_output.get('vision_hidden_states')
+        
+        if raw_hidden_states is None:
+            raise RuntimeError("Failed to extract hidden states from Qwen3-VL (packed mode)")
+        
+        # Move to device
+        raw_hidden_states = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
+        
+        # 对于 packed mode，hidden_states 是 (B, hidden_dim)，需要 unsqueeze 成 (B, 1, hidden_dim)
+        # 以匹配下游 heads 的期望输入格式
+        if raw_hidden_states.dim() == 2:
+            raw_hidden_states = raw_hidden_states.unsqueeze(1)  # (B, 1, hidden_dim)
+        
+        # ==================== Step 2: Project Hidden States ====================
+        llm_tokens = self.llm_projector(raw_hidden_states)  # [B, 1, llm_token_dim]
+        
+        if self.config.verbose:
+            logger.info(f"[PACKED] LLM tokens shape: {llm_tokens.shape}")
+        
+        # ==================== Step 3: Heatmap Generation ====================
+        # 使用 vision_hidden_states 如果可用（更丰富的视觉信息）
+        if vision_hidden_states is not None:
+            vision_hidden_states = vision_hidden_states.to(device=self.device, dtype=self.config.dtype)
+            llm_tokens_for_heatmap = self.llm_projector(vision_hidden_states)
+        else:
+            llm_tokens_for_heatmap = llm_tokens
+        
+        history_heatmap = None
+        future_heatmap = None
+        history_heatmap_loss = None
+        future_heatmap_loss = None
+        history_heatmap_noise_std = None
+        history_heatmap_noise_pred_std = None
+        future_heatmap_noise_std = None
+        future_heatmap_noise_pred_std = None
+        
+        if return_heatmaps:
+            observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
+            llm_tokens_hm = llm_tokens_for_heatmap.to(dtype=self.config.dtype)
+            
+            # History Heatmap
+            if self.history_heatmap_head is not None:
+                if gt_history_heatmap is not None and self.training:
+                    gt_history_hm = gt_history_heatmap.to(self.device)
+                    result = self.history_heatmap_head(
+                        llm_tokens=llm_tokens_hm,
+                        observation=observation_for_heatmap,
+                        gt_heatmap=gt_history_hm,
+                        return_loss=True,
+                        skip_inference=True,
+                    )
+                    history_heatmap_loss = result['loss']
+                    history_heatmap = result.get('heatmap')
+                    history_heatmap_noise_std = result.get('noise_std')
+                    history_heatmap_noise_pred_std = result.get('noise_pred_std')
+                else:
+                    history_heatmap = self.history_heatmap_head(
+                        llm_tokens=llm_tokens_hm,
+                        observation=observation_for_heatmap,
+                    )
+            
+            # Future Heatmap
+            if self.future_heatmap_head is not None:
+                if gt_future_heatmap is not None and self.training:
+                    gt_future_hm = gt_future_heatmap.to(self.device)
+                    result = self.future_heatmap_head(
+                        llm_tokens=llm_tokens_hm,
+                        observation=observation_for_heatmap,
+                        gt_heatmap=gt_future_hm,
+                        return_loss=True,
+                        skip_inference=True,
+                    )
+                    future_heatmap_loss = result['loss']
+                    future_heatmap = result.get('heatmap')
+                    future_heatmap_noise_std = result.get('noise_std')
+                    future_heatmap_noise_pred_std = result.get('noise_pred_std')
+                else:
+                    future_heatmap = self.future_heatmap_head(
+                        llm_tokens=llm_tokens_hm,
+                        observation=observation_for_heatmap,
+                    )
+        
+        # ==================== Step 4: Action Generation ====================
+        actions = None
+        trajectory = None
+        action_cond = llm_tokens.mean(dim=1)  # [B, llm_token_dim]
+        
+        if return_actions:
+            if self.transformer_action_head is not None:
+                if not self.training:
+                    trajectory = self.transformer_action_head.get_trajectory(llm_tokens)
+            elif self.action_head is not None:
+                if not self.training:
+                    actions = self.action_head(action_cond)
+        
+        # ==================== Step 5: Stop/Progress Prediction ====================
+        stop_logits = None
+        stop_prob = None
+        progress = None
+        
+        if self.progress_head is not None:
+            progress = self.progress_head.get_progress(llm_tokens)
+        
+        if self.stop_head is not None:
+            stop_cond = llm_tokens.mean(dim=1)
+            stop_logits = self.stop_head.classifier(stop_cond).squeeze(-1)
+            stop_prob = torch.sigmoid(stop_logits)
+        
+        # ==================== Build Output ====================
+        output = {
+            'llm_tokens': llm_tokens,
+            'processing_metadata': {
+                'num_samples': batch_size,
+                'seq_lens': seq_lens,
+                'total_seq_len': packed_batch["input_ids"].shape[1],
+                'llm_token_shape': llm_tokens.shape,
+                'mode': 'packed',
             }
         }
         

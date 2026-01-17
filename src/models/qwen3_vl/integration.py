@@ -9,6 +9,13 @@ Features:
 - Load Qwen3-VL model with flash attention support
 - Process video frames + current observation + instruction text
 - Extract hidden states for heatmap/action/stop heads
+- Sequence Packing support for efficient batch training (based on official implementation)
+
+Sequence Packing (New):
+- 基于 Qwen3-VL 官方 fine-tuning 框架实现
+- 使用 FlattenedDataCollator 将多个样本拼接成一个长序列
+- 使用 flash_attn_varlen_func 处理变长序列
+- 显著提高显存利用率，减少 padding 浪费
 """
 
 import warnings
@@ -26,6 +33,22 @@ from PIL import Image
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Import sequence packing utilities
+try:
+    from .sequence_packing import (
+        FlattenedDataCollatorForVLN,
+        split_packed_hidden_states,
+        split_packed_vision_hidden_states,
+        replace_attention_with_varlen,
+        get_rope_index_3,
+        IMAGE_TOKEN_ID,
+        VIDEO_TOKEN_ID,
+    )
+    PACKING_AVAILABLE = True
+except ImportError:
+    PACKING_AVAILABLE = False
+    logger.warning("Sequence packing module not available")
 
 
 @dataclass
@@ -51,6 +74,11 @@ class Qwen3VLConfig:
     
     # Video processing
     max_video_frames: int = 16  # Maximum frames to process
+    
+    # Sequence Packing settings (based on official Qwen3-VL fine-tuning)
+    enable_packing: bool = False  # Whether to use sequence packing
+    max_seq_length: int = 4096    # Maximum packed sequence length
+    spatial_merge_size: int = 2   # Vision spatial merge size for position IDs
     
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
@@ -91,7 +119,13 @@ class Qwen3VLIntegration(nn.Module):
         self.vision_start_id = 151652  # <|vision_start|>
         self.vision_end_id = 151653  # <|vision_end|>
         
+        # Sequence packing state
+        self._packing_enabled = config.enable_packing
+        self._varlen_attention_replaced = False
+        
         logger.info(f"Qwen3VLIntegration initialized (model will be loaded on first forward)")
+        if self._packing_enabled:
+            logger.info(f"Sequence packing enabled (max_seq_length={config.max_seq_length})")
     
     def _load_model(self):
         """Load the Qwen3-VL model and processor."""
@@ -124,16 +158,187 @@ class Qwen3VLIntegration(nn.Module):
             )
             
             self._model_loaded = True
+            
+            # 设置 padding_side 为 left，用于批量处理
+            self.processor.tokenizer.padding_side = 'left'
+            
             logger.info(f"Qwen3-VL loaded successfully on {self.device}")
             
             # Log model info
             total_params = sum(p.numel() for p in self.model.parameters())
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
+            logger.info(f"Batch processing enabled (padding_side='left')")
+            
+            # Enable sequence packing if configured
+            if self._packing_enabled:
+                self.enable_sequence_packing()
             
         except Exception as e:
             logger.error(f"Failed to load Qwen3-VL: {e}")
             raise
+    
+    def enable_sequence_packing(self) -> bool:
+        """
+        启用 Sequence Packing 模式
+        
+        基于 Qwen3-VL 官方 fine-tuning 框架：
+        1. 替换 attention forward 函数以支持 flash_attn_varlen_func
+        2. 使用 cumulative sequence lengths 作为 attention mask
+        
+        Returns:
+            bool: 是否成功启用
+        """
+        if not PACKING_AVAILABLE:
+            logger.warning("Sequence packing not available (missing dependencies)")
+            return False
+        
+        if self._varlen_attention_replaced:
+            logger.info("Varlen attention already enabled")
+            return True
+        
+        if not self._model_loaded:
+            logger.warning("Model not loaded yet, packing will be enabled after loading")
+            self._packing_enabled = True
+            return True
+        
+        # Check if flash_attn is available
+        try:
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func
+            has_flash_attn = True
+        except ImportError:
+            has_flash_attn = False
+            logger.warning(
+                "flash_attn not installed. Sequence packing will use standard attention. "
+                "For best performance, install with: pip install flash-attn --no-build-isolation"
+            )
+        
+        if has_flash_attn:
+            # Replace attention with varlen version
+            replace_attention_with_varlen(self.model)
+            self._varlen_attention_replaced = True
+            logger.info("Sequence packing enabled with flash_attn_varlen_func")
+        else:
+            # Fallback: still enable packing but without varlen attention
+            self._packing_enabled = True
+            logger.info("Sequence packing enabled (without varlen attention)")
+        
+        return True
+    
+    def forward_packed(
+        self,
+        packed_batch: Dict[str, Any],
+        return_hidden_states: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        处理 packed batch 的 forward pass
+        
+        这是 Sequence Packing 模式的核心方法，处理由 FlattenedDataCollatorForVLN 
+        生成的 packed batch。
+        
+        Args:
+            packed_batch: 由 FlattenedDataCollatorForVLN 生成的 packed batch，包含：
+                - input_ids: (1, total_seq_len)
+                - attention_mask: cumsum_seq_lens, shape (num_samples + 1,)
+                - position_ids: (3, 1, total_seq_len)
+                - pixel_values: optional
+                - image_grid_thw: optional
+                - pixel_values_videos: optional
+                - video_grid_thw: optional
+                - seq_lens: List[int], 每个样本的序列长度
+                - num_samples: int
+            return_hidden_states: 是否返回 hidden states
+        
+        Returns:
+            Dict containing:
+                - hidden_states: (num_samples, hidden_dim) 每个样本的表示
+                - vision_hidden_states: (num_samples, max_vision_tokens, hidden_dim)
+                - seq_lens: List[int], 每个样本的序列长度
+        """
+        if not self._model_loaded:
+            self._load_model()
+        
+        # 准备 inputs
+        input_ids = packed_batch["input_ids"].to(self.device)
+        attention_mask = packed_batch["attention_mask"].to(self.device)
+        position_ids = packed_batch.get("position_ids")
+        if position_ids is not None:
+            position_ids = position_ids.to(self.device)
+        
+        seq_lens = packed_batch["seq_lens"]
+        num_samples = packed_batch["num_samples"]
+        
+        # 处理视觉数据
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        
+        if position_ids is not None:
+            model_inputs["position_ids"] = position_ids
+        
+        if "pixel_values" in packed_batch and packed_batch["pixel_values"] is not None:
+            model_inputs["pixel_values"] = packed_batch["pixel_values"].to(self.device)
+        if "image_grid_thw" in packed_batch and packed_batch["image_grid_thw"] is not None:
+            model_inputs["image_grid_thw"] = packed_batch["image_grid_thw"].to(self.device)
+        if "pixel_values_videos" in packed_batch and packed_batch["pixel_values_videos"] is not None:
+            model_inputs["pixel_values_videos"] = packed_batch["pixel_values_videos"].to(self.device)
+        if "video_grid_thw" in packed_batch and packed_batch["video_grid_thw"] is not None:
+            model_inputs["video_grid_thw"] = packed_batch["video_grid_thw"].to(self.device)
+        
+        # Forward pass
+        with torch.no_grad():
+            outputs = self.model(
+                **model_inputs,
+                output_hidden_states=return_hidden_states,
+                return_dict=True,
+            )
+            
+            if return_hidden_states:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                packed_hidden_states = outputs.hidden_states[layer_idx]  # (1, total_seq_len, hidden_dim)
+            else:
+                packed_hidden_states = None
+        
+        # 拆分 packed hidden states
+        if packed_hidden_states is not None and PACKING_AVAILABLE:
+            # 提取每个样本的表示（使用 last token pooling）
+            sample_hidden_states = split_packed_hidden_states(
+                packed_hidden_states, seq_lens, pool_method="last"
+            )
+            
+            # 提取视觉 token hidden states
+            vision_hidden_states = split_packed_vision_hidden_states(
+                packed_hidden_states, input_ids, seq_lens
+            )
+        else:
+            sample_hidden_states = packed_hidden_states
+            vision_hidden_states = None
+        
+        return {
+            "hidden_states": sample_hidden_states,  # (num_samples, hidden_dim)
+            "vision_hidden_states": vision_hidden_states,  # (num_samples, max_vision_tokens, hidden_dim)
+            "packed_hidden_states": packed_hidden_states,  # (1, total_seq_len, hidden_dim) 原始输出
+            "seq_lens": seq_lens,
+            "num_samples": num_samples,
+        }
+    
+    def get_data_collator(self) -> "FlattenedDataCollatorForVLN":
+        """
+        获取用于 Sequence Packing 的 Data Collator
+        
+        Returns:
+            FlattenedDataCollatorForVLN instance
+        """
+        if not self._model_loaded:
+            self._load_model()
+        
+        if not PACKING_AVAILABLE:
+            raise ImportError("Sequence packing module not available")
+        
+        return FlattenedDataCollatorForVLN(tokenizer=self.processor.tokenizer)
     
     def _tensor_to_pil_images(self, tensor: torch.Tensor) -> List[Image.Image]:
         """
@@ -208,6 +413,111 @@ class Qwen3VLIntegration(nn.Module):
         
         return messages, history_pil, current_pil
     
+    def _prepare_conversations_batch(
+        self,
+        history_frames: torch.Tensor,
+        current_frame: torch.Tensor,
+        instruction: Optional[Union[str, List[str]]] = None,
+    ) -> List[List[Dict]]:
+        """
+        Prepare conversations for batch processing.
+        
+        Args:
+            history_frames: (B, K, C, H, W) history video frames
+            current_frame: (B, C, H, W) current observation
+            instruction: Navigation instruction (str for all, or List[str] per sample)
+            
+        Returns:
+            List of conversations, each conversation is a list of messages
+        """
+        batch_size = history_frames.shape[0]
+        conversations = []
+        
+        for b in range(batch_size):
+            # Get instruction for this sample
+            if instruction is None:
+                sample_instruction = None
+            elif isinstance(instruction, list):
+                sample_instruction = instruction[b] if b < len(instruction) else instruction[0]
+            else:
+                sample_instruction = instruction
+            
+            # Prepare single sample messages
+            messages, _, _ = self._prepare_messages_single(
+                history_frames[b],  # (K, C, H, W)
+                current_frame[b],   # (C, H, W)
+                sample_instruction,
+            )
+            conversations.append(messages)
+        
+        return conversations
+    
+    def _forward_batch(
+        self,
+        history_frames: torch.Tensor,
+        current_frame: torch.Tensor,
+        instruction: Optional[Union[str, List[str]]] = None,
+        return_hidden_states: bool = True,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Batch forward pass through Qwen3-VL.
+        
+        This processes all samples in a single forward pass for efficiency.
+        
+        Args:
+            history_frames: (B, K, C, H, W) history video frames
+            current_frame: (B, C, H, W) current observation
+            instruction: Navigation instruction text
+            return_hidden_states: Whether to return hidden states
+            
+        Returns:
+            Tuple of (hidden_states, vision_hidden_states)
+        """
+        batch_size = history_frames.shape[0]
+        
+        # Prepare conversations for all samples
+        conversations = self._prepare_conversations_batch(
+            history_frames, current_frame, instruction
+        )
+        
+        # Apply chat template with padding for batch processing
+        inputs = self.processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,  # 关键：启用 padding 用于批量处理
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        input_ids = inputs["input_ids"]  # (B, seq_len)
+        
+        # Batch forward pass
+        with torch.no_grad():
+            outputs = self.model(
+                **inputs,
+                output_hidden_states=return_hidden_states,
+                return_dict=True,
+            )
+            
+            if return_hidden_states:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                hidden_states = outputs.hidden_states[layer_idx]  # (B, seq_len, hidden_dim)
+            else:
+                hidden_states = None
+        
+        # Extract vision token hidden states for each sample
+        vision_hidden_states = None
+        if hidden_states is not None:
+            vision_hidden_states = self._extract_vision_hidden_states(
+                hidden_states, input_ids
+            )
+        
+        return hidden_states, vision_hidden_states
+    
     def _forward_single(
         self,
         history_frames: torch.Tensor,
@@ -278,10 +588,10 @@ class Qwen3VLIntegration(nn.Module):
         generate_text: bool = False,
     ) -> Dict[str, Any]:
         """
-        Forward pass through Qwen3-VL.
+        Forward pass through Qwen3-VL with true batch processing.
         
-        IMPORTANT: This processes each sample in the batch individually to ensure
-        each sample gets its own LLM features (not copied from sample 0).
+        Uses native batch processing with padding for efficiency.
+        All samples are processed in a single forward pass.
         
         Args:
             history_frames: (B, K, C, H, W) history video frames
@@ -302,73 +612,28 @@ class Qwen3VLIntegration(nn.Module):
         
         batch_size = history_frames.shape[0]
         
-        # Process each sample individually
-        all_hidden_states = []
-        all_vision_hidden_states = []
-        generated_text = None
+        # Use batch forward for efficiency
+        hidden_states, vision_hidden_states = self._forward_batch(
+            history_frames,
+            current_frame,
+            instruction,
+            return_hidden_states,
+        )
         
-        for b in range(batch_size):
-            # Get instruction for this sample
+        # Generate text only for first sample (if requested)
+        generated_text = None
+        if generate_text:
+            # Get instruction for first sample
             if instruction is None:
                 sample_instruction = None
             elif isinstance(instruction, list):
-                sample_instruction = instruction[b] if b < len(instruction) else instruction[0]
+                sample_instruction = instruction[0] if len(instruction) > 0 else None
             else:
                 sample_instruction = instruction
-            
-            # Forward single sample
-            hidden_states, vision_hidden_states = self._forward_single(
-                history_frames[b],  # (K, C, H, W)
-                current_frame[b],   # (C, H, W)
-                sample_instruction,
-                return_hidden_states,
+                
+            generated_text = self._generate_text_single(
+                history_frames[0], current_frame[0], sample_instruction
             )
-            
-            if hidden_states is not None:
-                all_hidden_states.append(hidden_states)
-            if vision_hidden_states is not None:
-                all_vision_hidden_states.append(vision_hidden_states)
-            
-            # Generate text only for first sample (if requested)
-            if generate_text and b == 0:
-                generated_text = self._generate_text_single(
-                    history_frames[b], current_frame[b], sample_instruction
-                )
-        
-        # Concatenate results
-        if all_hidden_states:
-            # Pad to same sequence length and concatenate
-            max_seq_len = max(h.shape[1] for h in all_hidden_states)
-            hidden_dim = all_hidden_states[0].shape[-1]
-            
-            padded_hidden = torch.zeros(
-                batch_size, max_seq_len, hidden_dim,
-                device=all_hidden_states[0].device,
-                dtype=all_hidden_states[0].dtype
-            )
-            for b, h in enumerate(all_hidden_states):
-                padded_hidden[b, :h.shape[1]] = h[0]  # h is (1, seq, dim)
-            
-            hidden_states = padded_hidden
-        else:
-            hidden_states = None
-        
-        if all_vision_hidden_states:
-            # Pad to same number of vision tokens and concatenate
-            max_vision_tokens = max(v.shape[1] for v in all_vision_hidden_states)
-            hidden_dim = all_vision_hidden_states[0].shape[-1]
-            
-            padded_vision = torch.zeros(
-                batch_size, max_vision_tokens, hidden_dim,
-                device=all_vision_hidden_states[0].device,
-                dtype=all_vision_hidden_states[0].dtype
-            )
-            for b, v in enumerate(all_vision_hidden_states):
-                padded_vision[b, :v.shape[1]] = v[0]  # v is (1, num_tokens, dim)
-            
-            vision_hidden_states = padded_vision
-        else:
-            vision_hidden_states = None
         
         return {
             "hidden_states": hidden_states,
