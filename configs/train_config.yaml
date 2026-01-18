@@ -182,14 +182,14 @@ training:
 optim:
   optimizer: adamw
 
-  # 分组学习率
-  heatmap_lr: 8.0e-5               # 从零训练小型 UNet 的合理范围
-  history_heatmap_lr: 8.0e-5       # 从零训练小型 UNet 的合理范围
-  future_heatmap_lr: 8.0e-5        # 从零训练小型 UNet 的合理范围
-  action_lr: 5.0e-5                # 保持
-  transformer_action_lr: 5.0e-5    # 保持
-  progress_lr: 5.0e-5              # 保持
-  llm_projector_lr: 1.5e-5         # 略提高
+  # 分组学习率 - 对齐 InternNav 基线 1e-4
+  heatmap_lr: 1.0e-4               # 对齐 InternNav 基线
+  history_heatmap_lr: 1.0e-4       # 对齐 InternNav 基线
+  future_heatmap_lr: 1.0e-4        # 对齐 InternNav 基线
+  action_lr: 1.0e-4                # 对齐 InternNav 基线
+  transformer_action_lr: 1.0e-4    # 对齐 InternNav 基线 (必须)
+  progress_lr: 1.0e-4              # 对齐 InternNav DistanceNetwork
+  llm_projector_lr: 5.0e-5         # 连接层，略低于下游头
 
   # 正则化 (增强以防过拟合)
   weight_decay: 5.0e-2             # 1e-2 → 5e-2 (增加5倍)
