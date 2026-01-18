@@ -179,6 +179,24 @@ tensorboard --logdir=/root/tf-logs --port=6006
 nohup tensorboard --logdir=/root/tf-logs/latest --port=6006 > /dev/null 2>&1 &
 ```
 
+**TensorBoard 关键指标**：
+
+| 分类 | 指标 | 说明 |
+|------|------|------|
+| **训练损失** | `train/loss` | 总损失 |
+| | `train/heatmap_loss` | 热力图损失（Diffusion MSE） |
+| | `train/trajectory_loss` | 轨迹损失 |
+| | `train/progress_loss` | 进度损失 |
+| **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
+| | `diag/heatmap_base_loss` | 标准 MSE（全局） |
+| | `diag/heatmap_focal_loss` | 峰值加权 MSE（稀疏区域） |
+| | `diag/heatmap_focal_ratio` | focal/base 比值（>1 表示峰值难） |
+| **进度诊断** | `diag/progress_mae` | 进度预测误差 |
+| | `diag/progress_boundary_error` | 边界点误差（0/1附近） |
+| **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
+| | `diag/trajectory_fde` | 终点位移误差 |
+| **系统** | `diag/gpu_memory_gb` | GPU 显存使用 |
+
 **输出目录结构**：
 
 ```
@@ -513,11 +531,17 @@ hidden_states = outputs["hidden_states"]  # [B, seq, 2048]
 
 ### 热力图生成模块（DiffusionHeatmapHead）
 
-使用条件扩散模型生成空间热力图。
+使用条件扩散模型生成空间热力图，标记历史帧在当前视野中的位置。
 
 **架构**：
 ```
-LLM Tokens → Attention Pooling → Condition Encoder → ConditionalUnet2D → DDPM → Heatmap
+LLM Tokens → Attention Pooling → Condition Encoder
+                                        ↓
+         ┌──────────────────────────────┘
+         ↓
+ConditionalUnet2D (with Cross-Attention + FiLM)
+         ↓
+    DDPM + CFG → Heatmap (64×64)
 ```
 
 **关键组件**：
@@ -525,17 +549,41 @@ LLM Tokens → Attention Pooling → Condition Encoder → ConditionalUnet2D →
 |------|------|
 | `AttentionPooling` | 可学习 query + 多头注意力聚合 |
 | `MultiModalConditionEncoder` | LLM + Image 特征融合（推荐 LLM-only） |
-| `ConditionalUnet2D` | FiLM 条件调制的 2D U-Net |
-| `DDPMScheduler` | 100 步训练，10 步推理 |
+| `ConditionalUnet2D` | FiLM + **Cross-Attention** 条件调制 |
+| `DDPMScheduler` | 100 步训练，20 步推理 |
+
+**优化技术**：
+| 技术 | 说明 |
+|------|------|
+| **Cross-Attention** | 在 UNet middle block 添加，让每个空间位置查询条件 |
+| **Classifier-Free Guidance (CFG)** | 训练时 10% drop 条件，推理时引导增强 |
+| **Focal Loss** | 70% 标准 MSE + 30% 峰值加权，关注稀疏峰值区域 |
+| **平方根归一化** | 缓解稀疏热力图的分布不均匀问题 |
+| **360° Circular Padding** | 支持全景图的水平边界连续性 |
 
 **配置**：
 ```yaml
 model:
   heatmap_head:
     enable_history: true
-    cond_dim: 512
+    cond_dim: 1024              # 条件编码维度
     use_image_encoder: false    # 推荐 LLM-only 模式
-    llm_pool_method: attention
+    pool_method: attention
+    
+    # UNet 架构
+    block_out_channels: [128, 256, 512, 512]
+    attention_levels: [2, 3]
+    
+    # Diffusion
+    num_inference_steps: 20
+    num_train_timesteps: 100
+    
+    # Classifier-Free Guidance
+    cfg_drop_prob: 0.1          # 训练时 drop 条件概率
+    cfg_scale: 3.0              # 推理时引导强度
+    
+    # 360° 全景图
+    use_circular_padding: true
 ```
 
 <details>
@@ -543,9 +591,10 @@ model:
 
 | 文件 | 说明 |
 |------|------|
-| `src/models/heatmap/diffusion_heatmap_head.py` | `DiffusionHeatmapHead` |
-| `src/models/heatmap/diffusion/unet2d.py` | `ConditionalUnet2D` |
+| `src/models/heatmap/diffusion_heatmap_head.py` | `DiffusionHeatmapHead` 主模块 |
+| `src/models/heatmap/diffusion/unet2d.py` | `ConditionalUnet2D` + `CrossAttention2D` |
 | `src/models/heatmap/diffusion/image_encoder.py` | `MultiModalConditionEncoder` |
+| `src/models/heatmap/diffusion/config.py` | `DiffusionHeatmapConfig` |
 
 </details>
 
