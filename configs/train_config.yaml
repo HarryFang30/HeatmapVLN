@@ -189,7 +189,7 @@ optim:
   action_lr: 1.0e-4                # 对齐 InternNav 基线
   transformer_action_lr: 1.0e-4    # 对齐 InternNav 基线 (必须)
   progress_lr: 1.0e-4              # 对齐 InternNav DistanceNetwork
-  llm_projector_lr: 5.0e-5         # 连接层，略低于下游头
+  llm_projector_lr: 1.0e-4         # 与下游头一致（参考 InternNav）
 
   # 正则化 (增强以防过拟合)
   weight_decay: 5.0e-2             # 1e-2 → 5e-2 (增加5倍)
