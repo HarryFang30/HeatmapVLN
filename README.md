@@ -51,8 +51,8 @@
 ```bash
 cd HeatmapVLN
 
-# 创建 conda 环境（Python 3.11+）
-conda create -n models python=3.11 -y
+# 创建 conda 环境（Python 3.12）
+conda create -n models python=3.12 -y
 conda activate models
 
 # 安装依赖
@@ -71,10 +71,10 @@ pip install flash-attn --no-build-isolation
 
 ```bash
 # 方式 1：从 HuggingFace 下载
-huggingface-cli download Qwen/Qwen3-VL-2B --local-dir models/qwen_3_vl
+huggingface-cli download Qwen/Qwen3-VL-8B --local-dir models/qwen_3_vl
 
 # 方式 2：从 ModelScope 下载
-modelscope download Qwen/Qwen3-VL-2B --local_dir models/qwen_3_vl
+modelscope download Qwen/Qwen3-VL-8B --local_dir models/qwen_3_vl
 ```
 
 ### 快速验证
