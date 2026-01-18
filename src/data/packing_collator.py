@@ -222,8 +222,9 @@ class PackingCollatorForVLN:
         )
         
         # 构建 messages
+        # 使用 nframes 明确指定帧数，避免 fps 采样警告
         content = [
-            {"type": "video", "video": history_pil},
+            {"type": "video", "video": history_pil, "nframes": len(history_pil)},
             {"type": "image", "image": current_pil},
             {"type": "text", "text": prompt_text},
         ]
