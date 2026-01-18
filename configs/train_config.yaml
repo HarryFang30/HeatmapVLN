@@ -87,11 +87,11 @@ model:
     attention_levels: [2, 3]                   # 在 512 层加 attention
     
     # Diffusion 配置
-    num_inference_steps: 30                    # 10 → 30，更精细的去噪
+    num_inference_steps: 50                    # 30 → 50，更精细的去噪
     num_train_timesteps: 100
     
     # 正则化
-    dropout: 0.2                   # 默认0.1 → 0.2 (防过拟合)
+    dropout: 0.1                   # 0.2 → 0.1 (降低，让模型更好地学习条件)
     
     # 360° 全景图支持：水平方向循环填充，处理左右边界连续性
     use_circular_padding: true
@@ -178,14 +178,14 @@ training:
 optim:
   optimizer: adamw
 
-  # 分组学习率 (降低以防过拟合)
-  heatmap_lr: 5.0e-5               # 1e-4 → 5e-5
-  history_heatmap_lr: 5.0e-5       # 1e-4 → 5e-5
-  future_heatmap_lr: 5.0e-5        # 1e-4 → 5e-5
-  action_lr: 5.0e-5                # 1e-4 → 5e-5
-  transformer_action_lr: 5.0e-5    # 1e-4 → 5e-5
-  progress_lr: 5.0e-5              # 1e-4 → 5e-5
-  llm_projector_lr: 1.0e-5         # 3e-5 → 1e-5
+  # 分组学习率
+  heatmap_lr: 1.0e-4               # 5e-5 → 1e-4 (提高，加速热力图学习)
+  history_heatmap_lr: 1.0e-4       # 5e-5 → 1e-4
+  future_heatmap_lr: 1.0e-4        # 5e-5 → 1e-4
+  action_lr: 5.0e-5                # 保持
+  transformer_action_lr: 5.0e-5    # 保持
+  progress_lr: 5.0e-5              # 保持
+  llm_projector_lr: 2.0e-5         # 1e-5 → 2e-5 (略提高)
 
   # 正则化 (增强以防过拟合)
   weight_decay: 5.0e-2             # 1e-2 → 5e-2 (增加5倍)

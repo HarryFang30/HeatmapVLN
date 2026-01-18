@@ -299,62 +299,36 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _normalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        对数空间归一化：更好地保留峰值信息
+        简单线性归一化：[0, 1] -> [-1, 1]
         
-        使用对数变换让信号分布更均匀，扩散模型更容易学习。
-        不截断小值，保留所有信息。
+        简化归一化，减少学习难度。
+        DDPM 期望输入在 [-1, 1] 范围。
         
         Args:
-            heatmap: (B, 1, H, W) heatmap (非负值)
+            heatmap: (B, 1, H, W) heatmap in [0, 1]
             
         Returns:
-            (B, 1, H, W) heatmap in [-1, 1] (对数空间)
+            (B, 1, H, W) heatmap in [-1, 1]
         """
-        # 先做 max-to-1 归一化，确保输入范围一致
-        B = heatmap.shape[0]
-        max_vals = heatmap.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
-        max_vals = max_vals.clamp(min=1e-6)  # 仅避免除零
-        heatmap_norm = heatmap / max_vals
-        
-        # 对数变换：使用 log1p 风格的变换更稳定
-        # x=0 -> log(1)=0, x=1 -> log(scale+1)
-        log_scale = 6.0
-        log_heatmap = torch.log(heatmap_norm * log_scale + 1)
-        max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device, dtype=heatmap.dtype))
-        
-        # 归一化到 [-1, 1]
-        normalized = (log_heatmap / max_log) * 2 - 1
-        
-        return normalized
+        # 确保输入在 [0, 1] 范围
+        heatmap = heatmap.clamp(0, 1)
+        # 线性映射: [0, 1] -> [-1, 1]
+        return heatmap * 2 - 1
     
     def _denormalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        从对数空间反归一化到热力图
-        
-        直接 clamp 到 [0, 1]，不再做 max-to-1 归一化，
-        确保训练和推理时的行为一致。
+        简单线性反归一化：[-1, 1] -> [0, 1]
         
         Args:
-            heatmap: (B, 1, H, W) heatmap in [-1, 1] (对数空间)
+            heatmap: (B, 1, H, W) heatmap in [-1, 1]
             
         Returns:
             (B, 1, H, W) heatmap in [0, 1]
         """
-        log_scale = 6.0
-        max_log = torch.log(torch.tensor(log_scale + 1, device=heatmap.device, dtype=heatmap.dtype))
-        
-        # 从 [-1, 1] 反归一化到 [0, max_log]
-        log_heatmap = (heatmap + 1) / 2 * max_log
-        
-        # 从对数空间恢复：exp(log_heatmap) - 1 然后除以 scale
-        recovered = (torch.exp(log_heatmap) - 1) / log_scale
-        
-        # 直接 clamp 到 [0, 1]，不再做 max-to-1
-        # 因为训练时 GT 已经是 [0, 1] 范围，推理时也应该输出相同范围
-        # 这样训练和推理时的行为完全一致
-        normalized = recovered.clamp(0, 1)
-        
-        return normalized
+        # 线性映射: [-1, 1] -> [0, 1]
+        recovered = (heatmap + 1) / 2
+        # 确保输出在 [0, 1] 范围
+        return recovered.clamp(0, 1)
     
     def forward_llm_only(
         self,
