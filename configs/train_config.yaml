@@ -199,6 +199,7 @@ optim:
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1
+  min_lr: 1.0e-6               # 最小学习率，避免训练后期 LR 降到 0
   
   # 批量配置
   # RTX 5090 32GB - 优化显存利用率

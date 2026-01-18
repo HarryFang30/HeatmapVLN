@@ -744,7 +744,8 @@ def build_scheduler(optimizer, cfg: Dict, total_steps: int):
     
     cosine = CosineAnnealingLR(
         optimizer,
-        T_max=max(1, total_steps - warmup_steps)
+        T_max=max(1, total_steps - warmup_steps),
+        eta_min=optim_cfg.get('min_lr', 1e-6)  # 最小学习率，避免降到 0
     )
     
     scheduler = SequentialLR(
