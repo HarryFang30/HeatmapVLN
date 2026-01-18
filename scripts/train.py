@@ -957,9 +957,12 @@ def train_one_epoch(
                 if hasattr(model, 'progress_head') and model.progress_head is not None:
                     if 'progress' in batch:
                         gt_progress = batch['progress'].to(device)
+                        # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
+                        progress_valid = batch.get('trajectory_valid', action_valid).to(device)
                         progress_result = model.progress_head(
                             output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
                             gt_progress=gt_progress,
+                            action_valid=progress_valid,
                             return_loss=True,
                         )
                         progress_loss = progress_result['loss']
@@ -1290,9 +1293,12 @@ def validate(
                 if hasattr(model, 'progress_head') and model.progress_head is not None:
                     if 'progress' in batch:
                         gt_progress = batch['progress'].to(device)
+                        # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
+                        progress_valid = batch.get('trajectory_valid', action_valid).to(device)
                         progress_result = model.progress_head(
                             output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
                             gt_progress=gt_progress,
+                            action_valid=progress_valid,
                             return_loss=True,
                         )
                         progress_loss = progress_result['loss']

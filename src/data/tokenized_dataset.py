@@ -240,6 +240,7 @@ class TokenizedVLNDataset(Dataset):
             "video_grid_thw": video_grid_thw,
             
             # VLN specific data (用于 downstream heads)
+            "history_frames": history_frames,          # [K, 3, H, W] 保留用于可视化/调试
             "current_frame": current_frame,            # [3, H, W]
             "heatmap": sample['heatmap'],              # [Hm, Wm]
             "action": sample['action'],                # [2]
@@ -299,7 +300,20 @@ class FlattenedCollatorForVLN:
         video_grid_thw = [inst["video_grid_thw"] for inst in instances if inst.get("video_grid_thw") is not None]
         video_grid_thw = torch.cat(video_grid_thw, dim=0) if video_grid_thw else None
         
-        # 5. 构建 packed batch
+        # 5. 处理 history_frames（需要 padding 到相同长度）
+        history_frames_list = [inst['history_frames'] for inst in instances]
+        max_K = max(hf.shape[0] for hf in history_frames_list)
+        
+        history_frames_padded = []
+        for hf in history_frames_list:
+            K, C, H, W = hf.shape
+            if K < max_K:
+                # Padding: 复制最后一帧
+                pad = hf[-1:].expand(max_K - K, C, H, W)
+                hf = torch.cat([hf, pad], dim=0)
+            history_frames_padded.append(hf)
+        
+        # 6. 构建 packed batch
         batch = {
             # Packed LLM inputs
             "input_ids": input_ids,                  # (1, total_seq_len)
@@ -315,6 +329,7 @@ class FlattenedCollatorForVLN:
             "video_grid_thw": video_grid_thw,
             
             # VLN data (batched)
+            "history_frames": torch.stack(history_frames_padded, dim=0),  # (B, K, C, H, W) 用于可视化
             "current_frame": torch.stack([inst['current_frame'] for inst in instances], dim=0),
             "heatmap": torch.stack([inst['heatmap'] for inst in instances], dim=0),
             "action": torch.stack([inst['action'] for inst in instances], dim=0),
