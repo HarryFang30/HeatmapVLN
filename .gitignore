@@ -52,6 +52,7 @@ venv/
 # Logs
 *.log
 logs/
+tf-logs-archive/
 
 # Temporary files
 *.tmp
