@@ -183,9 +183,9 @@ optim:
   optimizer: adamw
 
   # 分组学习率
-  heatmap_lr: 4.0e-5               # 8e-5 → 4e-5 (20M参数UNet需要更低LR)
-  history_heatmap_lr: 4.0e-5       # 8e-5 → 4e-5
-  future_heatmap_lr: 4.0e-5        # 8e-5 → 4e-5
+  heatmap_lr: 8.0e-5               # 从零训练小型 UNet 的合理范围
+  history_heatmap_lr: 8.0e-5       # 从零训练小型 UNet 的合理范围
+  future_heatmap_lr: 8.0e-5        # 从零训练小型 UNet 的合理范围
   action_lr: 5.0e-5                # 保持
   transformer_action_lr: 5.0e-5    # 保持
   progress_lr: 5.0e-5              # 保持
