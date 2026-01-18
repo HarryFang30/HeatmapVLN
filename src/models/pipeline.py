@@ -400,7 +400,7 @@ class VLNPipeline(nn.Module):
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_history_hm,
                         return_loss=True,
-                        skip_inference=True,
+                        skip_inference=False,  # 允许内部 _inference_interval 控制
                     )
                     history_heatmap_loss = result['loss']
                     history_heatmap = result.get('heatmap')
@@ -423,7 +423,7 @@ class VLNPipeline(nn.Module):
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_future_hm,
                         return_loss=True,
-                        skip_inference=True,
+                        skip_inference=False,  # 允许内部 _inference_interval 控制
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
@@ -625,7 +625,7 @@ class VLNPipeline(nn.Module):
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_history_hm,
                         return_loss=True,
-                        skip_inference=True,
+                        skip_inference=False,  # 允许内部 _inference_interval 控制
                     )
                     history_heatmap_loss = result['loss']
                     history_heatmap = result.get('heatmap')
@@ -648,7 +648,7 @@ class VLNPipeline(nn.Module):
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_future_hm,
                         return_loss=True,
-                        skip_inference=True,
+                        skip_inference=False,  # 允许内部 _inference_interval 控制
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
