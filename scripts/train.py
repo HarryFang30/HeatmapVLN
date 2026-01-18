@@ -1032,6 +1032,17 @@ def train_one_epoch(
                         if non_zero_ratio < 0.05:
                             logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
                     
+                    # Focal Loss 诊断 (新增)
+                    if 'history_heatmap_base_loss' in output and output['history_heatmap_base_loss'] is not None:
+                        base_loss_val = output['history_heatmap_base_loss']
+                        focal_loss_val = output['history_heatmap_focal_loss']
+                        tb_writer.add_scalar('diag/heatmap_base_loss', base_loss_val, actual_step)
+                        tb_writer.add_scalar('diag/heatmap_focal_loss', focal_loss_val, actual_step)
+                        # 比值：如果 focal_loss > base_loss，说明峰值区域预测更差
+                        if base_loss_val > 0:
+                            focal_ratio = focal_loss_val / base_loss_val
+                            tb_writer.add_scalar('diag/heatmap_focal_ratio', focal_ratio, actual_step)
+                    
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
                         pred_progress = output['progress'].detach()

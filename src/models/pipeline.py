@@ -384,6 +384,8 @@ class VLNPipeline(nn.Module):
         history_heatmap_noise_pred_std = None
         future_heatmap_noise_std = None
         future_heatmap_noise_pred_std = None
+        history_heatmap_base_loss = None
+        history_heatmap_focal_loss = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
@@ -404,6 +406,8 @@ class VLNPipeline(nn.Module):
                     history_heatmap = result.get('heatmap')
                     history_heatmap_noise_std = result.get('noise_std')
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
+                    history_heatmap_base_loss = result.get('base_loss')
+                    history_heatmap_focal_loss = result.get('focal_loss')
                 else:
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
@@ -483,6 +487,9 @@ class VLNPipeline(nn.Module):
             if history_heatmap_noise_std is not None:
                 output['history_heatmap_noise_std'] = history_heatmap_noise_std
                 output['history_heatmap_noise_pred_std'] = history_heatmap_noise_pred_std
+            if history_heatmap_base_loss is not None:
+                output['history_heatmap_base_loss'] = history_heatmap_base_loss
+                output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:
@@ -602,6 +609,8 @@ class VLNPipeline(nn.Module):
         history_heatmap_noise_pred_std = None
         future_heatmap_noise_std = None
         future_heatmap_noise_pred_std = None
+        history_heatmap_base_loss = None
+        history_heatmap_focal_loss = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
@@ -622,6 +631,8 @@ class VLNPipeline(nn.Module):
                     history_heatmap = result.get('heatmap')
                     history_heatmap_noise_std = result.get('noise_std')
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
+                    history_heatmap_base_loss = result.get('base_loss')
+                    history_heatmap_focal_loss = result.get('focal_loss')
                 else:
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
@@ -699,6 +710,9 @@ class VLNPipeline(nn.Module):
             if history_heatmap_noise_std is not None:
                 output['history_heatmap_noise_std'] = history_heatmap_noise_std
                 output['history_heatmap_noise_pred_std'] = history_heatmap_noise_pred_std
+            if history_heatmap_base_loss is not None:
+                output['history_heatmap_base_loss'] = history_heatmap_base_loss
+                output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:

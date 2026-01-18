@@ -279,6 +279,8 @@ class DiffusionHeatmapHead(nn.Module):
         return {
             'loss': diffusion_loss,
             'diffusion_loss': diffusion_loss,
+            'base_loss': base_loss.item(),      # 标准 MSE
+            'focal_loss': focal_loss.item(),    # 峰值加权 MSE
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
