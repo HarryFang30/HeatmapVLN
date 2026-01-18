@@ -342,7 +342,7 @@ def visualize_heatmap_predictions(
             axes[i, 1].set_title(f"GT Heatmap (max={gt_hm.max():.2f})")
             axes[i, 1].axis('off')
             
-            pred_hm = pred_heatmaps[i].detach().cpu().numpy()
+            pred_hm = pred_heatmaps[i].detach().float().cpu().numpy()  # float() 避免 BFloat16 错误
             pred_hm = np.clip(pred_hm, 0, 1)
             axes[i, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
             axes[i, 2].set_title(f"Pred Heatmap (max={pred_hm.max():.2f})")
