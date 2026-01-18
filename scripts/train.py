@@ -1077,27 +1077,48 @@ def train_one_epoch(
                         if non_zero_ratio < 0.05:
                             logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
                     
-                    # Stop prediction 诊断
-                    if 'stop_logits' in output:
-                        stop_logits = output['stop_logits'].detach()
-                        stop_probs = torch.sigmoid(stop_logits)
-                        tb_writer.add_scalar('diag/stop_prob_mean', stop_probs.mean().item(), actual_step)
-                        tb_writer.add_scalar('diag/stop_prob_max', stop_probs.max().item(), actual_step)
-                        # 计算 stop recall
-                        if is_stop.sum() > 0:
-                            predicted_stops = (stop_probs > 0.5).float()
-                            stop_recall = (predicted_stops * is_stop).sum() / is_stop.sum()
-                            tb_writer.add_scalar('diag/stop_recall', stop_recall.item(), actual_step)
-                        # 计算 precision
-                        if (stop_probs > 0.5).sum() > 0:
-                            stop_precision = ((stop_probs > 0.5).float() * is_stop).sum() / (stop_probs > 0.5).sum()
-                            tb_writer.add_scalar('diag/stop_precision', stop_precision.item(), actual_step)
+                    # Progress prediction 诊断
+                    if 'progress' in output and output['progress'] is not None:
+                        pred_progress = output['progress'].detach()
+                        gt_progress = batch.get('progress')
+                        if gt_progress is not None:
+                            gt_progress = gt_progress.to(pred_progress.device)
+                            progress_mae = (pred_progress - gt_progress).abs().mean().item()
+                            tb_writer.add_scalar('diag/progress_mae', progress_mae, actual_step)
+                            tb_writer.add_scalar('diag/progress_pred_mean', pred_progress.mean().item(), actual_step)
+                            tb_writer.add_scalar('diag/progress_gt_mean', gt_progress.mean().item(), actual_step)
+                            # 边界检测准确率 (progress < 0.1 或 > 0.9)
+                            boundary_mask = (gt_progress < 0.1) | (gt_progress > 0.9)
+                            if boundary_mask.sum() > 0:
+                                boundary_error = (pred_progress[boundary_mask] - gt_progress[boundary_mask]).abs().mean().item()
+                                tb_writer.add_scalar('diag/progress_boundary_error', boundary_error, actual_step)
+                    
+                    # 轨迹预测诊断
+                    if 'trajectory' in output and output['trajectory'] is not None:
+                        pred_traj = output['trajectory'].detach()
+                        gt_traj = batch.get('trajectory')
+                        if gt_traj is not None:
+                            gt_traj = gt_traj.to(pred_traj.device)
+                            # ADE (Average Displacement Error)
+                            displacement = torch.sqrt(((pred_traj[..., :2] - gt_traj[..., :2]) ** 2).sum(dim=-1))
+                            ade = displacement.mean().item()
+                            tb_writer.add_scalar('diag/trajectory_ade', ade, actual_step)
+                            # FDE (Final Displacement Error)
+                            fde = displacement[:, -1].mean().item()
+                            tb_writer.add_scalar('diag/trajectory_fde', fde, actual_step)
+                    
+                    # GPU 显存监控
+                    tb_writer.add_scalar('diag/gpu_memory_gb', torch.cuda.memory_allocated(0) / 1024**3, actual_step)
+                    tb_writer.add_scalar('diag/gpu_memory_reserved_gb', torch.cuda.memory_reserved(0) / 1024**3, actual_step)
                 
-                # 动作分布直方图（每 100 步记录一次，避免日志过大）
+                # 轨迹分布直方图（每 100 步记录一次，避免日志过大）
                 if global_step % 100 == 0:
-                    if 'actions' in output and output['actions'] is not None:
-                        tb_writer.add_histogram('train/predicted_actions', output['actions'].flatten().cpu(), actual_step)
-                    tb_writer.add_histogram('train/gt_actions', gt_action.flatten().cpu(), actual_step)
+                    if 'trajectory' in output and output['trajectory'] is not None:
+                        tb_writer.add_histogram('train/pred_trajectory_dx', output['trajectory'][..., 0].flatten().cpu(), actual_step)
+                        tb_writer.add_histogram('train/pred_trajectory_dy', output['trajectory'][..., 1].flatten().cpu(), actual_step)
+                    if 'trajectory' in batch and batch['trajectory'] is not None:
+                        tb_writer.add_histogram('train/gt_trajectory_dx', batch['trajectory'][..., 0].flatten().cpu(), actual_step)
+                        tb_writer.add_histogram('train/gt_trajectory_dy', batch['trajectory'][..., 1].flatten().cpu(), actual_step)
         
         # 定期可视化热力图预测并记录到 TensorBoard
         vis_interval = cfg['log'].get('vis_every_steps', 500)
