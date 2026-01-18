@@ -40,6 +40,10 @@ data:
     clip_level_sampling: true
     samples_per_clip: 100        # 50 → 100 (达到 ~150K 样本)
     val_samples_per_clip: 10     # 5 → 10 (验证集增加)
+    # 随机子序列采样（大幅增加数据多样性）
+    random_subsequence: true          # 启用随机子序列采样
+    min_subsequence_length: 30        # 最小子序列长度
+    subsequence_samples_per_clip: 5   # 每个 clip 生成 5 个子序列
     # 轨迹预测配置
     predict_horizon: 24          # 预测 24 步轨迹
     action_scale: 4.0            # 动作放大 4 倍（参考 InternNav）

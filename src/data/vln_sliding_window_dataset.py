@@ -370,6 +370,10 @@ class VLNSlidingWindowDataset(Dataset):
         # Clip-level 采样策略（解决样本高度相关性问题）
         samples_per_clip: int = 2,  # 每个 clip 每 epoch 采样的样本数
         clip_level_sampling: bool = True,  # 是否启用 clip-level 采样
+        # 随机子序列采样（大幅增加数据多样性）
+        random_subsequence: bool = False,  # 是否启用随机子序列采样
+        min_subsequence_length: int = 30,  # 最小子序列长度
+        subsequence_samples_per_clip: int = 3,  # 每个 clip 生成的子序列数量
     ):
         self.root = Path(root).expanduser()
         self.split = split
@@ -386,6 +390,11 @@ class VLNSlidingWindowDataset(Dataset):
         self.clip_level_sampling = clip_level_sampling
         self._epoch = 0  # 当前 epoch，用于随机采样
         self._rng = np.random.RandomState(42)  # 可重复的随机数生成器
+        
+        # 随机子序列采样配置
+        self.random_subsequence = random_subsequence and (split == 'train')  # 仅训练集启用
+        self.min_subsequence_length = min_subsequence_length
+        self.subsequence_samples_per_clip = subsequence_samples_per_clip
 
         # 数据增强 (仅训练集启用)
         self.enable_augmentation = enable_augmentation and (split == 'train')
@@ -410,7 +419,12 @@ class VLNSlidingWindowDataset(Dataset):
         
         self._build_sample_index()
         
-        sampling_mode = "clip-level" if self.clip_level_sampling else "sliding-window"
+        if self.random_subsequence:
+            sampling_mode = "random-subsequence"
+        elif self.clip_level_sampling:
+            sampling_mode = "clip-level"
+        else:
+            sampling_mode = "sliding-window"
         logger.info(
             f"VLNSlidingWindowDataset initialized: {len(self.clips)} clips, "
             f"{len(self.sample_index)} samples, mode={sampling_mode}, "
@@ -527,19 +541,101 @@ class VLNSlidingWindowDataset(Dataset):
     def _build_sample_index(self):
         """预计算所有样本的全局索引
         
-        两种采样模式：
-        1. Clip-level 采样（推荐）：每个 clip 每 epoch 随机选择 N 个样本
+        三种采样模式：
+        1. 随机子序列采样（新增，推荐）：每个 clip 生成多个随机子序列
+           - 大幅增加数据多样性
+           - 同一个 100 帧 clip 可以生成无数种子序列组合
+        
+        2. Clip-level 采样：每个 clip 每 epoch 随机选择 N 个样本
            - 解决样本高度相关性问题
            - 每个 epoch 看到不同的样本组合
            - 通过 set_epoch() 触发重新采样
         
-        2. 滑动窗口采样（传统）：使用 sample_stride 控制采样密度
+        3. 滑动窗口采样（传统）：使用 sample_stride 控制采样密度
            - stride=1: 每帧都作为样本
            - stride=5: 每隔 5 帧采样一次
         """
         self.sample_index = []
+        # 存储每个样本的子序列范围：{idx: (subseq_start, subseq_end)}
+        self._sample_subsequence_range = {}
         
-        if self.clip_level_sampling:
+        if self.random_subsequence:
+            # ========== 随机子序列采样（新增） ==========
+            total_subsequences = 0
+            total_samples = 0
+            
+            for clip_idx in self._clip_valid_frames:
+                valid_frames = self._clip_valid_frames[clip_idx]
+                if len(valid_frames) == 0:
+                    continue
+                
+                clip_start = valid_frames[0] - self.min_history  # 原始起始帧
+                clip_end = valid_frames[-1] + 1  # 原始结束帧（不含）
+                clip_length = clip_end - clip_start
+                
+                # 如果 clip 太短，不做子序列采样
+                if clip_length < self.min_subsequence_length:
+                    # 退化为普通采样
+                    for frame_idx in valid_frames:
+                        sample_idx = len(self.sample_index)
+                        self.sample_index.append((clip_idx, frame_idx))
+                        self._sample_subsequence_range[sample_idx] = (clip_start, clip_end)
+                        total_samples += 1
+                    continue
+                
+                # 生成多个随机子序列
+                for _ in range(self.subsequence_samples_per_clip):
+                    # 随机选择子序列长度
+                    max_subseq_len = clip_length
+                    min_subseq_len = self.min_subsequence_length
+                    subseq_length = self._rng.randint(min_subseq_len, max_subseq_len + 1)
+                    
+                    # 随机选择子序列起始位置
+                    max_start = clip_end - subseq_length
+                    subseq_start = self._rng.randint(clip_start, max_start + 1)
+                    subseq_end = subseq_start + subseq_length
+                    
+                    # 在子序列范围内采样
+                    subseq_valid_start = subseq_start + self.min_history
+                    subseq_valid_end = subseq_end
+                    
+                    if subseq_valid_end <= subseq_valid_start:
+                        continue
+                    
+                    # 每个子序列采样 samples_per_clip 个样本
+                    subseq_valid_frames = list(range(subseq_valid_start, subseq_valid_end))
+                    num_samples = min(self.samples_per_clip, len(subseq_valid_frames))
+                    
+                    if num_samples > 0:
+                        sampled_frames = self._rng.choice(
+                            subseq_valid_frames,
+                            size=num_samples,
+                            replace=False
+                        )
+                        for frame_idx in sampled_frames:
+                            sample_idx = len(self.sample_index)
+                            self.sample_index.append((clip_idx, frame_idx))
+                            self._sample_subsequence_range[sample_idx] = (subseq_start, subseq_end)
+                            total_samples += 1
+                    
+                    total_subsequences += 1
+            
+            # 打乱样本顺序（需要同时打乱 sample_index 和 _sample_subsequence_range）
+            indices = list(range(len(self.sample_index)))
+            self._rng.shuffle(indices)
+            self.sample_index = [self.sample_index[i] for i in indices]
+            new_range = {}
+            for new_idx, old_idx in enumerate(indices):
+                new_range[new_idx] = self._sample_subsequence_range[old_idx]
+            self._sample_subsequence_range = new_range
+            
+            logger.info(
+                f"Built random subsequence sample index: {len(self.sample_index)} samples "
+                f"from {total_subsequences} subsequences, {len(self._clip_valid_frames)} clips, "
+                f"min_subseq_len={self.min_subsequence_length}, epoch={self._epoch}"
+            )
+        
+        elif self.clip_level_sampling:
             # ========== Clip-level 采样 ==========
             stop_samples = 0
             normal_samples = 0
@@ -1281,6 +1377,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         enable_augmentation: bool = True,
         samples_per_clip: int = 2,
         clip_level_sampling: bool = True,
+        # 随机子序列采样配置
+        random_subsequence: bool = False,
+        min_subsequence_length: int = 30,
+        subsequence_samples_per_clip: int = 3,
         # 轨迹预测相关配置
         predict_horizon: int = 24,
         action_scale: float = 4.0,
@@ -1299,6 +1399,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             enable_augmentation=enable_augmentation,
             samples_per_clip=samples_per_clip,
             clip_level_sampling=clip_level_sampling,
+            random_subsequence=random_subsequence,
+            min_subsequence_length=min_subsequence_length,
+            subsequence_samples_per_clip=subsequence_samples_per_clip,
         )
         
         self.predict_horizon = predict_horizon
@@ -1307,14 +1410,16 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         
         logger.info(
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
-            f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}"
+            f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}, "
+            f"random_subseq={self.random_subsequence}"
         )
     
     def _compute_trajectory(
         self, 
         poses: List[np.ndarray], 
         current_t: int, 
-        T: int,
+        subseq_end: int,
+        subseq_start: int = 0,
     ) -> Tuple[np.ndarray, float, float]:
         """
         从位姿计算轨迹
@@ -1322,15 +1427,18 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         Args:
             poses: 所有帧的位姿列表
             current_t: 当前帧索引
-            T: 总帧数
+            subseq_end: 子序列结束帧（不含）
+            subseq_start: 子序列起始帧（用于计算 progress）
         
         Returns:
             trajectory: (predict_horizon, 3) 轨迹
             trajectory_valid: 轨迹是否有效
-            progress: 任务完成进度 (0-1)
+            progress: 任务完成进度 (0-1)，基于子序列范围
         """
-        # 计算 progress
-        progress = float(current_t) / max(T - 1, 1)
+        # 计算 progress（基于子序列范围）
+        subseq_length = subseq_end - subseq_start
+        relative_pos = current_t - subseq_start
+        progress = float(relative_pos) / max(subseq_length - 1, 1)
         
         # 获取从当前帧到结束的所有位姿
         future_poses = poses[current_t:]
@@ -1388,8 +1496,14 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             T = meta["num_frames"]
             text = meta.get("instruction", "")
             
-            # 2. 采样历史帧索引
-            history_indices = self._sample_history_indices(0, current_t, self.num_history_sample)
+            # 获取子序列范围（如果启用了随机子序列采样）
+            if self.random_subsequence and idx in self._sample_subsequence_range:
+                subseq_start, subseq_end = self._sample_subsequence_range[idx]
+            else:
+                subseq_start, subseq_end = 0, T
+            
+            # 2. 采样历史帧索引（使用子序列范围）
+            history_indices = self._sample_history_indices(subseq_start, current_t, self.num_history_sample)
             
             # 3. 加载历史帧
             history_frames = self._load_frames(clip_dir, history_indices)
@@ -1424,8 +1538,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             )
             heatmap_tensor = torch.from_numpy(heatmap).float()
             
-            # 8. 计算轨迹
-            trajectory, trajectory_valid, progress = self._compute_trajectory(poses, current_t, T)
+            # 8. 计算轨迹（使用子序列范围计算 progress）
+            trajectory, trajectory_valid, progress = self._compute_trajectory(
+                poses, current_t, subseq_end, subseq_start
+            )
             
             # 9. 应用轨迹增强
             if self.enable_trajectory_augmentation and trajectory_valid > 0:

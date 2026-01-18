@@ -1619,6 +1619,11 @@ def main():
         clip_level_sampling = traj_cfg.get('clip_level_sampling', True)
         samples_per_clip = traj_cfg.get('samples_per_clip', 8)
         
+        # 随机子序列采样配置
+        random_subsequence = traj_cfg.get('random_subsequence', False)
+        min_subsequence_length = traj_cfg.get('min_subsequence_length', 30)
+        subsequence_samples_per_clip = traj_cfg.get('subsequence_samples_per_clip', 3)
+        
         train_dataset = VLNTrajectoryDataset(
             root=cfg['data']['root'],
             split='train',
@@ -1631,6 +1636,9 @@ def main():
             sample_stride=sample_stride,
             clip_level_sampling=clip_level_sampling,
             samples_per_clip=samples_per_clip,
+            random_subsequence=random_subsequence,
+            min_subsequence_length=min_subsequence_length,
+            subsequence_samples_per_clip=subsequence_samples_per_clip,
             predict_horizon=traj_cfg.get('predict_horizon', 24),
             action_scale=traj_cfg.get('action_scale', 4.0),
             enable_trajectory_augmentation=traj_cfg.get('enable_trajectory_augmentation', True),
@@ -1650,6 +1658,7 @@ def main():
             sample_stride=sample_stride,
             clip_level_sampling=clip_level_sampling,
             samples_per_clip=val_samples_per_clip,
+            random_subsequence=False,  # 验证集不使用随机子序列
             predict_horizon=traj_cfg.get('predict_horizon', 24),
             action_scale=traj_cfg.get('action_scale', 4.0),
             enable_trajectory_augmentation=False,  # 验证集不增强
