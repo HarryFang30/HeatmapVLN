@@ -35,14 +35,7 @@ class FeishuNotifier:
             logger.info("📢 FeishuNotifier disabled (no webhook_url)")
     
     def _send_message(self, content: Dict) -> bool:
-        """发送消息到飞书
-        
-        Args:
-            content: 消息内容（飞书卡片格式）
-            
-        Returns:
-            是否发送成功
-        """
+        """发送消息到飞书"""
         if not self.enabled:
             return False
         
@@ -83,39 +76,26 @@ class FeishuNotifier:
         is_best: bool = False,
         best_val_loss: float = None,
     ) -> bool:
-        """
-        发送 epoch 训练报告
-        
-        Args:
-            epoch: 当前 epoch
-            total_epochs: 总 epoch 数
-            stage_name: 阶段名称
-            stage_idx: 阶段索引
-            total_stages: 总阶段数
-            train_metrics: 训练指标
-            val_metrics: 验证指标
-            eta: 预估剩余时间
-            epoch_time: 本 epoch 用时
-            is_best: 是否是最佳模型
-            best_val_loss: 历史最佳验证损失
-            
-        Returns:
-            是否发送成功
-        """
-        # 构建飞书卡片消息
+        """发送 epoch 训练报告"""
         now = datetime.now().strftime('%H:%M:%S')
         
         # 状态标识
-        status_emoji = "⭐" if is_best else "✅"
-        status_text = "🎉 新最佳模型！" if is_best else ""
+        status_emoji = "⭐" if is_best else "📊"
         
-        # 提取指标
+        # 提取指标 - 使用新术语
         train_loss = train_metrics.get('total_loss', 0)
         train_hm = train_metrics.get('heatmap_loss', 0)
-        train_act = train_metrics.get('action_loss', 0)
+        train_traj = train_metrics.get('action_loss', 0)  # trajectory
+        train_prog = train_metrics.get('stop_loss', 0)    # progress
+        
         val_loss = val_metrics.get('val_loss', 0)
         val_hm = val_metrics.get('val_heatmap_loss', 0)
-        val_act = val_metrics.get('val_action_loss', 0)
+        val_traj = val_metrics.get('val_action_loss', 0)
+        val_prog = val_metrics.get('val_stop_loss', 0)
+        
+        # 进度条
+        progress_pct = epoch / total_epochs * 100
+        progress_bar = "█" * int(progress_pct / 10) + "░" * (10 - int(progress_pct / 10))
         
         # 构建消息内容
         content = {
@@ -124,7 +104,7 @@ class FeishuNotifier:
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": f"{status_emoji} VLN 训练进度 - Epoch {epoch}/{total_epochs}"
+                        "content": f"{status_emoji} Epoch {epoch}/{total_epochs} {'🎉 Best!' if is_best else ''}"
                     },
                     "template": "green" if is_best else "blue"
                 },
@@ -133,13 +113,11 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**阶段**: {stage_name} ({stage_idx+1}/{total_stages})\n"
-                                       f"**时间**: {now} | 用时: {epoch_time} | ETA: {eta}"
+                            "content": f"**{stage_name}** | {now} | ⏱️ {epoch_time} | ETA: {eta}\n"
+                                       f"[{progress_bar}] {progress_pct:.0f}%"
                         }
                     },
-                    {
-                        "tag": "hr"
-                    },
+                    {"tag": "hr"},
                     {
                         "tag": "div",
                         "fields": [
@@ -147,14 +125,20 @@ class FeishuNotifier:
                                 "is_short": True,
                                 "text": {
                                     "tag": "lark_md",
-                                    "content": f"**📊 Train Loss**\n{train_loss:.4f}\n(hm: {train_hm:.4f}, act: {train_act:.4f})"
+                                    "content": f"**Train** `{train_loss:.4f}`\n"
+                                               f"hm: {train_hm:.4f}\n"
+                                               f"traj: {train_traj:.4f}\n"
+                                               f"prog: {train_prog:.4f}"
                                 }
                             },
                             {
                                 "is_short": True,
                                 "text": {
                                     "tag": "lark_md",
-                                    "content": f"**📈 Val Loss**\n{val_loss:.4f}\n(hm: {val_hm:.4f}, act: {val_act:.4f})"
+                                    "content": f"**Val** `{val_loss:.4f}`\n"
+                                               f"hm: {val_hm:.4f}\n"
+                                               f"traj: {val_traj:.4f}\n"
+                                               f"prog: {val_prog:.4f}"
                                 }
                             }
                         ]
@@ -174,16 +158,6 @@ class FeishuNotifier:
                     }
                 ]
             })
-        elif status_text:
-            content["card"]["elements"].append({
-                "tag": "note",
-                "elements": [
-                    {
-                        "tag": "plain_text",
-                        "content": status_text
-                    }
-                ]
-            })
         
         return self._send_message(content)
     
@@ -192,9 +166,26 @@ class FeishuNotifier:
         config_name: str,
         stages: list,
         total_epochs: int,
+        extra_info: Dict = None,
     ) -> bool:
         """发送训练开始通知"""
-        stage_info = "\n".join([f"  - {s['name']} ({s['epochs']} epochs)" for s in stages])
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        stage_info = ""
+        for s in stages:
+            name = s.get('name', 'unknown')
+            epochs = s.get('epochs', '?')
+            stage_info += f"• {name} ({epochs} epochs)\n"
+        
+        # 额外信息
+        extra_text = ""
+        if extra_info:
+            if 'batch_size' in extra_info:
+                extra_text += f"**Batch**: {extra_info['batch_size']}\n"
+            if 'gpu' in extra_info:
+                extra_text += f"**GPU**: {extra_info['gpu']}\n"
+            if 'dataset_size' in extra_info:
+                extra_text += f"**Samples**: {extra_info['dataset_size']}\n"
         
         content = {
             "msg_type": "interactive",
@@ -202,7 +193,7 @@ class FeishuNotifier:
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": "🚀 VLN 训练开始"
+                        "content": "🚀 训练开始"
                     },
                     "template": "wathet"
                 },
@@ -211,9 +202,11 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**配置**: {config_name}\n"
-                                       f"**总 Epochs**: {total_epochs}\n"
-                                       f"**训练阶段**:\n{stage_info}"
+                            "content": f"**Config**: `{config_name}`\n"
+                                       f"**Time**: {now}\n"
+                                       f"**Epochs**: {total_epochs}\n"
+                                       f"{extra_text}"
+                                       f"\n**Stages**:\n{stage_info}"
                         }
                     }
                 ]
@@ -227,15 +220,20 @@ class FeishuNotifier:
         total_time: str,
         best_val_loss: float,
         final_stage: str,
+        final_epoch: int = None,
     ) -> bool:
         """发送训练完成通知"""
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        epoch_info = f" (Epoch {final_epoch})" if final_epoch else ""
+        
         content = {
             "msg_type": "interactive",
             "card": {
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": "✅ VLN 训练完成"
+                        "content": "✅ 训练完成"
                     },
                     "template": "green"
                 },
@@ -244,9 +242,10 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**总用时**: {total_time}\n"
-                                       f"**最佳 val_loss**: {best_val_loss:.4f}\n"
-                                       f"**最终阶段**: {final_stage}"
+                            "content": f"**Time**: {now}\n"
+                                       f"**Duration**: {total_time}\n"
+                                       f"**Best val_loss**: `{best_val_loss:.4f}`{epoch_info}\n"
+                                       f"**Stage**: {final_stage}"
                         }
                     }
                 ]
@@ -255,15 +254,21 @@ class FeishuNotifier:
         
         return self._send_message(content)
     
-    def send_training_error(self, error_msg: str, stage: str = None) -> bool:
+    def send_training_error(self, error_msg: str, stage: str = None, epoch: int = None) -> bool:
         """发送训练错误通知"""
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        location = stage or 'Unknown'
+        if epoch:
+            location += f" (Epoch {epoch})"
+        
         content = {
             "msg_type": "interactive",
             "card": {
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": "❌ VLN 训练错误"
+                        "content": "❌ 训练错误"
                     },
                     "template": "red"
                 },
@@ -272,8 +277,9 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**阶段**: {stage or 'Unknown'}\n"
-                                       f"**错误**: {error_msg[:500]}"  # 限制长度
+                            "content": f"**Time**: {now}\n"
+                                       f"**Location**: {location}\n"
+                                       f"**Error**:\n```\n{error_msg[:500]}\n```"
                         }
                     }
                 ]
@@ -281,18 +287,24 @@ class FeishuNotifier:
         }
         
         return self._send_message(content)
+    
+    def send_checkpoint_saved(self, epoch: int, val_loss: float, is_best: bool = False) -> bool:
+        """发送检查点保存通知（可选，避免太多通知可以不调用）"""
+        if not is_best:
+            return True  # 只通知 best 模型
+        
+        content = {
+            "msg_type": "text",
+            "content": {
+                "text": f"💾 Best model saved: Epoch {epoch}, val_loss={val_loss:.4f}"
+            }
+        }
+        
+        return self._send_message(content)
 
 
 def create_notifier(cfg: Dict) -> Optional[FeishuNotifier]:
-    """
-    根据配置创建通知器
-    
-    Args:
-        cfg: 完整配置字典
-        
-    Returns:
-        FeishuNotifier 或 None
-    """
+    """根据配置创建通知器"""
     notify_cfg = cfg.get('log', {}).get('notify', {})
     
     if not notify_cfg.get('enabled', False):
@@ -312,4 +324,3 @@ def create_notifier(cfg: Dict) -> Optional[FeishuNotifier]:
     else:
         logger.warning(f"Unsupported notification platform: {platform}")
         return None
-
