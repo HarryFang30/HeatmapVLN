@@ -265,12 +265,12 @@ class TrainingPlotter:
         
         plt.tight_layout(rect=[0, 0.03, 1, 0.97])
         
-        save_path = self.out_dir / 'training_curves.png'
+        save_path = self.out_dir / 'curves.png'
         plt.savefig(save_path, dpi=120, bbox_inches='tight')
         plt.close(fig)
         
         # 保存 JSON 数据
-        json_path = self.out_dir / 'training_history.json'
+        json_path = self.out_dir / 'history.json'
         import json
         with open(json_path, 'w') as f:
             json.dump(self.history, f, indent=2)
@@ -310,8 +310,7 @@ def visualize_heatmap_predictions(
     num_samples: int = 2,
 ):
     """可视化热力图预测结果"""
-    vis_dir = output_dir / "visualizations"
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     try:
         current_frames = batch['current_frame']
@@ -354,7 +353,8 @@ def visualize_heatmap_predictions(
         plt.suptitle(f"Epoch {epoch}, Step {step}")
         plt.tight_layout()
         
-        save_path = vis_dir / f"epoch_{epoch:03d}_step_{step:05d}.png"
+        # 简洁命名: e001_s00100.png
+        save_path = output_dir / f"e{epoch:03d}_s{step:05d}.png"
         plt.savefig(save_path, dpi=100, bbox_inches='tight')
         plt.close(fig)
         
@@ -828,6 +828,7 @@ def train_one_epoch(
     stage_cfg: Dict = None,
     max_batches: int = None,
     packing_enabled: bool = False,
+    vis_dir: Optional[Path] = None,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     
@@ -1135,7 +1136,7 @@ def train_one_epoch(
                 output=output,
                 epoch=epoch,
                 step=global_step,
-                output_dir=Path(cfg['log']['out_dir']),
+                output_dir=vis_dir if vis_dir else Path('.'),
                 num_samples=2,
             )
             if vis_path:
@@ -1201,7 +1202,7 @@ def validate(
     tb_writer: Optional[SummaryWriter] = None,
     epoch: int = 0,
     packing_enabled: bool = False,
-    output_dir: Optional[Path] = None,
+    vis_dir: Optional[Path] = None,
 ) -> Dict[str, float]:
     """验证（带可视化）"""
     model.eval()
@@ -1353,7 +1354,7 @@ def validate(
         
         # ==================== 验证可视化（前几个 batch）====================
         num_vis_batches = cfg['log'].get('val_vis_batches', 2)  # 可视化几个 batch
-        if num_batches <= num_vis_batches and output_dir is not None:
+        if num_batches <= num_vis_batches and vis_dir is not None:
             try:
                 # 使用纯推理模式生成热力图（不传 gt_heatmap）
                 if packing_enabled:
@@ -1383,15 +1384,14 @@ def validate(
                     output=vis_output,
                     epoch=epoch,
                     step=num_batches,
-                    output_dir=output_dir,
+                    output_dir=vis_dir,
                     num_samples=4,  # 验证时多显示几个样本
                 )
                 
-                # 保存到验证专用目录
+                # 验证可视化直接保存在 vis_dir (已经是 vis/val/)
                 if vis_path is not None:
-                    val_vis_dir = output_dir / "val_visualizations"
-                    val_vis_dir.mkdir(parents=True, exist_ok=True)
-                    new_path = val_vis_dir / f"epoch_{epoch:03d}_batch_{num_batches:02d}.png"
+                    # 重命名为更简洁的格式
+                    new_path = vis_dir / f"e{epoch:03d}_b{num_batches:02d}.png"
                     import shutil
                     shutil.copy(vis_path, new_path)
                     
@@ -1476,20 +1476,20 @@ class CheckpointManager:
         if scaler is not None:
             ckpt['scaler_state_dict'] = scaler.state_dict()
         
-        ckpt_path = stage_dir / f"epoch_{epoch:03d}.pth"
+        ckpt_path = stage_dir / f"e{epoch:03d}.pth"
         torch.save(ckpt, ckpt_path)
         file_size_mb = ckpt_path.stat().st_size / (1024**2)
-        print(f"💾 Checkpoint: {ckpt_path.name} ({file_size_mb:.1f} MB)")
+        print(f"💾 Saved: {ckpt_path.name} ({file_size_mb:.1f} MB)")
         
         val_loss = metrics.get('val_loss', float('inf'))
         self.ckpt_history.append((ckpt_path, val_loss, epoch))
         
         if is_best:
             self.best_val_loss = val_loss
-            best_path = self.out_dir / "best_model.pth"
+            best_path = self.out_dir / "best.pth"
             torch.save(ckpt, best_path)
             self.best_ckpt_path = best_path
-            print(f"⭐ Best model updated: val_loss={val_loss:.4f}")
+            print(f"⭐ Best model: val_loss={val_loss:.4f}")
         
         latest_path = self.out_dir / "latest.pth"
         torch.save(ckpt, latest_path)
@@ -1519,7 +1519,7 @@ class CheckpointManager:
     
     def get_best(self) -> Optional[Path]:
         """获取最佳检查点路径"""
-        best = self.out_dir / "best_model.pth"
+        best = self.out_dir / "best.pth"
         return best if best.exists() else None
 
 
@@ -1732,7 +1732,7 @@ def main():
     notifier = create_notifier(cfg)
     
     # 创建训练曲线绘制器
-    plotter = TrainingPlotter(out_dir=log_dir)
+    plotter = TrainingPlotter(out_dir=plots_dir)
     
     # 断点续训
     resume_epoch = 0
@@ -1944,6 +1944,7 @@ def main():
             stage_idx=0, stage_name=stage_name, stage_cfg=stage_cfg,
             max_batches=args.max_batches,
             packing_enabled=packing_enabled,
+            vis_dir=vis_train_dir,
         )
         
         timer.end_epoch()
@@ -1951,7 +1952,7 @@ def main():
         val_metrics = validate(
             model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch,
             packing_enabled=packing_enabled,
-            output_dir=log_dir,
+            vis_dir=vis_val_dir,
         )
         
         logger.info(
