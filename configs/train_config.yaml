@@ -23,12 +23,12 @@ data:
     num_history_sample: 32       # 历史帧采样数量（与 trajectory 配置保持一致）
     load_depth: true
     cache_poses: true
-    sample_stride: 2             # 3 → 2 (更密集采样，增加数据量)
+    sample_stride: 2             # 采样步长
     
     # Clip-level 采样策略（解决样本高度相关性问题）
     clip_level_sampling: true
-    samples_per_clip: 100        # 50 → 100 (达到 ~150K 样本)
-    val_samples_per_clip: 10     # 5 → 10 (验证集也增加)
+    samples_per_clip: 30         # 每 clip 采样 30 个样本
+    val_samples_per_clip: 10     # 验证集采样数
   
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
@@ -36,14 +36,15 @@ data:
     num_history_sample: 32       # 减少历史帧数量以加速（32帧足够）
     load_depth: true
     cache_poses: true
-    sample_stride: 2             # 3 → 2 (更密集采样，增加数据量)
+    sample_stride: 2             # 采样步长
     clip_level_sampling: true
-    samples_per_clip: 100        # 50 → 100 (达到 ~150K 样本)
-    val_samples_per_clip: 10     # 5 → 10 (验证集增加)
+    samples_per_clip: 30         # 每子序列采样 30 个样本（减少邻近帧重复）
+    val_samples_per_clip: 10     # 验证集采样数
     # 随机子序列采样（大幅增加数据多样性）
     random_subsequence: true          # 启用随机子序列采样
     min_subsequence_length: 30        # 最小子序列长度
     subsequence_samples_per_clip: 5   # 每个 clip 生成 5 个子序列
+    # 数据量: 1000 clips × 5 subseq × 30 samples = 150K/epoch
     # 轨迹预测配置
     predict_horizon: 24          # 预测 24 步轨迹
     action_scale: 4.0            # 动作放大 4 倍（参考 InternNav）
@@ -154,7 +155,7 @@ model:
 training:
   stages:
     - name: history_only_64
-      epochs: 12  # samples_per_clip=100 (~150K样本)，12 epochs 足够
+      epochs: 10  # 150K/epoch × 10 = 1.5M 总样本，数据/参数=37×
       hm_size: [64, 64]
       heatmap_loss_type: simplified
       train_history: true
