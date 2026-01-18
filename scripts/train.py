@@ -68,6 +68,18 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================
+# Worker 初始化函数（模块级别，支持 spawn 多进程）
+# ============================================
+
+def _worker_init_fn(worker_id):
+    """Worker 进程初始化函数 - 抑制警告"""
+    import warnings
+    warnings.filterwarnings("ignore")
+    warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
+    warnings.filterwarnings("ignore", message="Asked to sample")
+
+
+# ============================================
 # 训练 ETA 估算器
 # ============================================
 
@@ -1872,13 +1884,6 @@ def main():
     # spawn 创建全新进程，避免这个问题
     mp_context = 'spawn' if num_workers > 0 else None
     
-    def worker_init_fn(worker_id):
-        """Worker 进程初始化函数 - 抑制警告"""
-        import warnings
-        warnings.filterwarnings("ignore")
-        warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
-        warnings.filterwarnings("ignore", message="Asked to sample")
-    
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg['optim']['batch_size'],
@@ -1890,7 +1895,7 @@ def main():
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     
     val_loader = DataLoader(
@@ -1903,7 +1908,7 @@ def main():
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     
     # 设置可训练模块
