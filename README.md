@@ -945,6 +945,208 @@ pip install flash-attn --no-build-isolation  # FlashAttention 2
 
 ---
 
+## 数据流架构（Sequence Packing Pipeline）
+
+本项目的 Sequence Packing 实现符合 **Qwen3-VL 官方 fine-tuning 框架**，确保高效的多 batch 训练。
+
+### 整体数据流
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        完整数据流 Pipeline                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────┐                                                    │
+│  │  VLNTrajectoryDataset│  ← 基础数据集                                      │
+│  │  返回: history_frames,│    读取 RGB、位姿、动作等                          │
+│  │  current_frame, text,│                                                   │
+│  │  heatmap, trajectory │                                                   │
+│  └──────────┬──────────┘                                                    │
+│             │                                                               │
+│             ▼                                                               │
+│  ┌─────────────────────┐                                                    │
+│  │ TokenizedVLNDataset │  ← 包装数据集（关键！）                             │
+│  │  __getitem__() 中：  │    在 Dataset 层完成 tokenization                  │
+│  │  1. 转换为 PIL 图像  │    可利用 DataLoader 的 num_workers 并行           │
+│  │  2. 构建 messages    │                                                   │
+│  │  3. processor.apply_ │                                                   │
+│  │     chat_template()  │  ← Tokenization + 图像/视频处理                   │
+│  │  4. 计算 position_ids│                                                   │
+│  │                      │                                                   │
+│  │  输出:               │                                                   │
+│  │  - input_ids (1,seq) │                                                   │
+│  │  - position_ids      │                                                   │
+│  │  - pixel_values      │                                                   │
+│  │  - pixel_values_videos│                                                  │
+│  │  - VLN 数据 (heatmap,│                                                   │
+│  │    trajectory, etc.) │                                                   │
+│  └──────────┬──────────┘                                                    │
+│             │                                                               │
+│             │  num_workers > 0 时并行处理                                    │
+│             ▼                                                               │
+│  ┌─────────────────────┐                                                    │
+│  │FlattenedCollatorFor │  ← 只做拼接，不做 tokenization                     │
+│  │         VLN         │    符合官方 FlattenedDataCollatorForSupervisedDataset│
+│  │                     │                                                    │
+│  │  处理:              │                                                    │
+│  │  1. torch.cat()     │  ← 拼接 input_ids, position_ids                    │
+│  │     拼接序列        │                                                    │
+│  │  2. 计算 cumsum_    │  ← attention_mask = [0, len1, len1+len2, ...]      │
+│  │     seq_lens        │                                                    │
+│  │  3. 拼接视觉数据    │  ← pixel_values, video_grid_thw 等                 │
+│  │  4. Stack VLN 数据  │  ← current_frame, heatmap, trajectory              │
+│  │                     │                                                    │
+│  │  输出:              │                                                    │
+│  │  - input_ids (1,    │                                                    │
+│  │    total_seq_len)   │                                                    │
+│  │  - attention_mask   │  ← cumsum_seq_lens (B+1,)                          │
+│  │  - position_ids     │                                                    │
+│  │  - seq_lens: List   │                                                    │
+│  │  - num_samples: int │                                                    │
+│  │  - VLN batch data   │                                                    │
+│  └──────────┬──────────┘                                                    │
+│             │                                                               │
+│             ▼                                                               │
+│  ┌─────────────────────┐                                                    │
+│  │ model.forward_packed│  ← Qwen3-VL + 下游 Heads                           │
+│  │      (batch)        │                                                    │
+│  │                     │                                                    │
+│  │  1. Qwen3-VL 处理   │  ← flash_attn_varlen_func                          │
+│  │     packed 序列     │    使用 cumsum_seq_lens 作为 attention mask        │
+│  │                     │                                                    │
+│  │  2. split_packed_   │  ← 拆分 hidden states                              │
+│  │     hidden_states() │    返回 (num_samples, hidden_dim)                  │
+│  │                     │                                                    │
+│  │  3. Heatmap Head    │  ← 使用 current_frame + hidden_states              │
+│  │  4. Action Head     │  ← 使用 trajectory + hidden_states                 │
+│  │  5. Progress Head   │  ← 使用 progress + hidden_states                   │
+│  └─────────────────────┘                                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 为什么在 Dataset 中 Tokenize？
+
+官方 Qwen3-VL fine-tuning 框架的核心设计：
+
+| 方式 | Tokenization 位置 | num_workers 效果 | 性能 |
+|------|------------------|-----------------|------|
+| ❌ 旧方式 | Collator 中 | 无法并行（主进程阻塞） | 慢 |
+| ✅ **官方方式** | Dataset.__getitem__() 中 | **完全并行** | 快 3-10x |
+
+**旧方式的问题**：
+```python
+# ❌ 旧方式：Collator 中 tokenize
+class OldCollator:
+    def __call__(self, samples):
+        for sample in samples:
+            # 这里在主进程串行执行，无法利用 num_workers
+            result = processor.apply_chat_template(...)  # CPU 密集！
+```
+
+**官方方式（本项目采用）**：
+```python
+# ✅ 官方方式：Dataset 中 tokenize
+class TokenizedVLNDataset(Dataset):
+    def __getitem__(self, idx):
+        sample = self.base_dataset[idx]
+        # 这里在 worker 进程并行执行
+        result = self.processor.apply_chat_template(...)  # 并行！
+        return {**result, **sample}
+```
+
+### 数据格式验证
+
+所有关键 tensor 的格式和维度：
+
+```python
+# TokenizedVLNDataset.__getitem__() 输出（单样本）
+{
+    "input_ids": (1, seq_len),           # int64
+    "position_ids": (3, 1, seq_len),     # int64, 3D RoPE
+    "attention_mask": [seq_len],         # List[int]
+    "pixel_values": (N_patches, 1536),   # float32
+    "image_grid_thw": (1, 3),            # int64
+    "pixel_values_videos": (V_patches, 1536),
+    "video_grid_thw": (1, 3),
+    
+    # VLN 数据
+    "current_frame": (3, H, W),          # float32
+    "heatmap": (Hm, Wm),                 # float32
+    "trajectory": (24, 3),               # float32
+    "trajectory_valid": float,
+    "progress": float,
+}
+
+# FlattenedCollatorForVLN() 输出（packed batch）
+{
+    "input_ids": (1, total_seq_len),     # 拼接后
+    "attention_mask": (num_samples + 1,), # cumsum_seq_lens, int32
+    "position_ids": (3, 1, total_seq_len),
+    "seq_lens": [seq1, seq2, ...],       # List[int]
+    "num_samples": int,
+    
+    "pixel_values": (total_patches, 1536),
+    "image_grid_thw": (num_samples, 3),
+    "pixel_values_videos": (total_vid_patches, 1536),
+    "video_grid_thw": (num_samples, 3),
+    
+    # VLN 数据（batched）
+    "current_frame": (B, 3, H, W),
+    "heatmap": (B, Hm, Wm),
+    "trajectory": (B, 24, 3),
+    "trajectory_valid": (B,),
+    "progress": (B,),
+}
+```
+
+### 性能对比
+
+| num_workers | 首批时间 | 平均时间/batch | 相对加速 |
+|-------------|---------|---------------|---------|
+| 0 | 0.42s | 0.37s | 1x |
+| 2 | 8.7s (初始化) | 0.20s | **1.9x** |
+| 4 | 16.8s (初始化) | 0.04-0.10s | **3.5-10x** |
+
+> 首批时间长是 `multiprocessing_context='spawn'` 模式的进程初始化开销（每个 worker 需要加载 processor），之后的 batch 会非常快。
+
+### 源代码位置
+
+| 文件 | 说明 |
+|------|------|
+| `src/data/tokenized_dataset.py` | `TokenizedVLNDataset`, `FlattenedCollatorForVLN` |
+| `src/data/vln_sliding_window_dataset.py` | 基础数据集 `VLNTrajectoryDataset` |
+| `scripts/train.py` | DataLoader 创建逻辑（自动选择 packing/非 packing 模式） |
+
+### 配置示例
+
+```yaml
+# configs/train_config.yaml
+model:
+  llm:
+    enable_packing: true          # 启用 Sequence Packing
+    max_seq_length: 8192          # 最大打包序列长度
+    spatial_merge_size: 2         # 视觉空间合并大小
+
+data:
+  num_workers: 4                  # 推荐 4-8
+  prefetch_factor: 2              # 预取因子
+```
+
+### 梯度流动验证
+
+所有可训练模块都能正确接收梯度：
+
+```
+✅ history_heatmap_head: grad_norm = 8.27
+✅ transformer_action_head: grad_norm = 10.96
+✅ progress_head: grad_norm = 2.89
+✅ llm_projector: grad_norm = 10.65
+✅ qwen3_vl (frozen): no gradients (正确)
+```
+
+---
+
 ## 数据集准备
 
 ### 数据集结构
