@@ -1936,7 +1936,7 @@ def main():
         val_metrics = validate(
             model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch,
             packing_enabled=packing_enabled,
-            output_dir=output_dir,
+            output_dir=log_dir,
         )
         
         logger.info(
