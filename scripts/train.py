@@ -571,6 +571,8 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
         # 360° panorama support: circular padding for horizontal edges
         heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
+        # Regularization
+        heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
         
         # Action Head Type
         action_head_type=action_head_type,

@@ -74,6 +74,7 @@ class VLNPipelineConfig:
     heatmap_pool_method: str = "attention"  # 'attention', 'mean', 'first', 'last', 'max'
     heatmap_pool_num_heads: int = 4  # Number of attention heads for attention pooling
     heatmap_use_circular_padding: bool = False  # 360° panorama: circular padding for horizontal edges
+    heatmap_dropout: float = 0.1  # Dropout rate for heatmap head
     
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
@@ -180,6 +181,8 @@ class VLNPipeline(nn.Module):
             llm_pool_num_heads=config.heatmap_pool_num_heads,
             # 360° panorama support
             use_circular_padding=config.heatmap_use_circular_padding,
+            # Regularization
+            dropout=config.heatmap_dropout,
         )
         
         # History Heatmap Head
