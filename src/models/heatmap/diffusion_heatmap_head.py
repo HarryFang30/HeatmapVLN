@@ -299,10 +299,15 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _normalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        简单线性归一化：[0, 1] -> [-1, 1]
+        平方根归一化：缓解稀疏热力图的分布不均匀问题
         
-        简化归一化，减少学习难度。
-        DDPM 期望输入在 [-1, 1] 范围。
+        热力图特点：大部分是 0（背景），少数峰值接近 1
+        平方根变换让小值变大，使分布更均匀，同时保持简单
+        
+        变换: sqrt(x) * 2 - 1
+        - x=0 -> sqrt(0)*2-1 = -1
+        - x=0.25 -> sqrt(0.25)*2-1 = 0  (中点移动到 0.25)
+        - x=1 -> sqrt(1)*2-1 = 1
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [0, 1]
@@ -310,14 +315,17 @@ class DiffusionHeatmapHead(nn.Module):
         Returns:
             (B, 1, H, W) heatmap in [-1, 1]
         """
-        # 确保输入在 [0, 1] 范围
         heatmap = heatmap.clamp(0, 1)
-        # 线性映射: [0, 1] -> [-1, 1]
-        return heatmap * 2 - 1
+        # 平方根变换让小值放大，使分布更均匀
+        sqrt_heatmap = torch.sqrt(heatmap)
+        # 映射到 [-1, 1]
+        return sqrt_heatmap * 2 - 1
     
     def _denormalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        简单线性反归一化：[-1, 1] -> [0, 1]
+        平方根反归一化：还原热力图
+        
+        反变换: ((x+1)/2)^2
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [-1, 1]
@@ -325,10 +333,12 @@ class DiffusionHeatmapHead(nn.Module):
         Returns:
             (B, 1, H, W) heatmap in [0, 1]
         """
-        # 线性映射: [-1, 1] -> [0, 1]
-        recovered = (heatmap + 1) / 2
-        # 确保输出在 [0, 1] 范围
-        return recovered.clamp(0, 1)
+        # 先映射到 [0, 1]
+        sqrt_recovered = (heatmap + 1) / 2
+        sqrt_recovered = sqrt_recovered.clamp(0, 1)
+        # 平方还原
+        recovered = sqrt_recovered ** 2
+        return recovered
     
     def forward_llm_only(
         self,

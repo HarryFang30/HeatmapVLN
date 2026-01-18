@@ -87,7 +87,7 @@ model:
     attention_levels: [2, 3]                   # 在 512 层加 attention
     
     # Diffusion 配置
-    num_inference_steps: 50                    # 30 → 50，更精细的去噪
+    num_inference_steps: 20                    # 20 步推理，效率和质量平衡
     num_train_timesteps: 100
     
     # 正则化
@@ -179,13 +179,13 @@ optim:
   optimizer: adamw
 
   # 分组学习率
-  heatmap_lr: 1.0e-4               # 5e-5 → 1e-4 (提高，加速热力图学习)
-  history_heatmap_lr: 1.0e-4       # 5e-5 → 1e-4
-  future_heatmap_lr: 1.0e-4        # 5e-5 → 1e-4
+  heatmap_lr: 8.0e-5               # 适中的学习率
+  history_heatmap_lr: 8.0e-5       # 适中的学习率
+  future_heatmap_lr: 8.0e-5        # 适中的学习率
   action_lr: 5.0e-5                # 保持
   transformer_action_lr: 5.0e-5    # 保持
   progress_lr: 5.0e-5              # 保持
-  llm_projector_lr: 2.0e-5         # 1e-5 → 2e-5 (略提高)
+  llm_projector_lr: 1.5e-5         # 略提高
 
   # 正则化 (增强以防过拟合)
   weight_decay: 5.0e-2             # 1e-2 → 5e-2 (增加5倍)
