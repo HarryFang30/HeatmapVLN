@@ -97,6 +97,7 @@ class DiffusionHeatmapHead(nn.Module):
             attention_levels=config.attention_levels,
             n_groups=config.norm_num_groups,
             dropout=config.dropout,
+            use_circular_padding=config.use_circular_padding,  # 360° 全景图支持
         )
         
         # ==================== Noise Scheduler ====================
@@ -222,56 +223,27 @@ class DiffusionHeatmapHead(nn.Module):
             global_cond=cond,
         )
         
-        # 🔧 [FIX] 加权 MSE Loss：峰值区域权重更高
-        # 问题：GT热力图93.5%是黑色，如果用普通MSE，模型学会"输出全黑"就能获得极低Loss
-        # 解决：增加峰值区域（热力图高值区域）的权重，强制模型学习空间结构
+        # ✅ 标准 DDPM Loss：无加权 MSE
+        # 原理：Diffusion 的去噪过程自然会学习数据分布
+        #       不需要人为约束（peak_loss/variance_loss 反而有害）
+        #       噪声 ε 在空间上均匀分布，加权会破坏这个假设
+        diffusion_loss = F.mse_loss(noise_pred, noise)
         
-        # 计算权重：峰值区域权重 x10，背景权重 x1
-        # gt_heatmap: [B, 1, H, W] in [0, 1]
-        weight = 1.0 + 9.0 * gt_heatmap.clamp(0, 1)  # 范围：[1.0, 10.0]
-        
-        # 加权 MSE
-        squared_error = (noise_pred - noise).pow(2)
-        weighted_loss = (weight * squared_error).mean()
-        
-        diffusion_loss = weighted_loss
-        
-        # 🔍 诊断信息：记录噪声预测质量
+        # 诊断信息：记录噪声预测质量
         noise_std = noise.std().item()
         noise_pred_std = noise_pred.std().item()
         
-        # 🔧 [FIX-2] 峰值保持损失：确保输出热力图有明显峰值，不能全黑
-        # 每隔一定步数生成预测热力图用于计算峰值损失
+        # 定期生成预测热力图用于可视化（不参与 loss 计算）
         self._training_step_counter += 1
         pred_heatmap = None
-        peak_loss = torch.tensor(0.0, device=device)
-        variance_loss = torch.tensor(0.0, device=device)
-
-        # 每 _peak_loss_interval 步计算一次峰值保持损失（默认5步，可通过配置调整）
-        compute_peak_loss = (self._training_step_counter % self._peak_loss_interval == 0)
-
-        if compute_peak_loss or not skip_inference:
+        
+        if not skip_inference and (self._training_step_counter % self._inference_interval == 0):
             with torch.no_grad():
                 pred_heatmap = self._diffusion_inference(cond)
-
-            if compute_peak_loss and pred_heatmap is not None:
-                # 峰值约束：pred_heatmap.max() 必须 >= 0.3
-                # 如果最大值小于0.3，则产生惩罚
-                peak_loss = F.relu(0.3 - pred_heatmap.max())
-
-                # 方差约束：输出必须有空间变化（不能全是同一个值）
-                # 如果标准差小于0.05，则产生惩罚（提高阈值）
-                variance_loss = F.relu(0.05 - pred_heatmap.std())
-
-        # 总损失 = 扩散损失 + 峰值保持损失
-        # 增加峰值损失权重以更好地防止过拟合到全黑
-        loss = diffusion_loss + 1.0 * (peak_loss + variance_loss)
         
         return {
-            'loss': loss,
+            'loss': diffusion_loss,
             'diffusion_loss': diffusion_loss,
-            'peak_loss': peak_loss,
-            'variance_loss': variance_loss,
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,

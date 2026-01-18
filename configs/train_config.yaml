@@ -23,12 +23,12 @@ data:
     num_history_sample: 32       # 历史帧采样数量（与 trajectory 配置保持一致）
     load_depth: true
     cache_poses: true
-    sample_stride: 5
+    sample_stride: 3             # 5 → 3 (更密集采样，增加多样性)
     
     # Clip-level 采样策略（解决样本高度相关性问题）
     clip_level_sampling: true
-    samples_per_clip: 8
-    val_samples_per_clip: 2
+    samples_per_clip: 50         # 8 → 50 (达到 50K 样本)
+    val_samples_per_clip: 5      # 2 → 5 (验证集也增加)
   
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
@@ -36,10 +36,10 @@ data:
     num_history_sample: 32       # 减少历史帧数量以加速（32帧足够）
     load_depth: true
     cache_poses: true
-    sample_stride: 5
+    sample_stride: 3             # 5 → 3 (更密集采样)
     clip_level_sampling: true
-    samples_per_clip: 8
-    val_samples_per_clip: 2
+    samples_per_clip: 50         # 8 → 50 (达到 50K 样本)
+    val_samples_per_clip: 5      # 2 → 5 (验证集增加)
     # 轨迹预测配置
     predict_horizon: 24          # 预测 24 步轨迹
     action_scale: 4.0            # 动作放大 4 倍（参考 InternNav）
@@ -74,6 +74,9 @@ model:
     enable_future: false  # 禁用 future head 以节省内存
     cond_dim: 512
     num_inference_steps: 10
+    dropout: 0.2                   # 默认0.1 → 0.2 (防过拟合)
+    # 360° 全景图支持：水平方向循环填充，处理左右边界连续性
+    use_circular_padding: true
     # CNN 消融实验开关：设为 false 禁用 ImageConditionEncoder，只用 LLM 特征
     use_image_encoder: false
     # LLM token pooling 方式：'attention' (推荐) 或 'mean', 'first', 'last', 'max'
@@ -109,15 +112,15 @@ model:
       action_dim: 3              # 动作维度 (dx, dy, delta_yaw)
       num_train_timesteps: 20    # 扩散训练步数
       action_scale: 4.0          # 动作放大倍数
-      p_drop_emb: 0.1            # Embedding dropout
-      p_drop_attn: 0.1           # Attention dropout
+      p_drop_emb: 0.2            # Embedding dropout (0.1 → 0.2 防过拟合)
+      p_drop_attn: 0.2           # Attention dropout (0.1 → 0.2 防过拟合)
       causal_attn: true          # 使用因果注意力
 
   # Progress 预测头配置（替代 Stop Head）
   progress_head:
     enable: true
     hidden_dim: 512
-    dropout: 0.1
+    dropout: 0.3                 # 0.1 → 0.3 (最简单的头，增加最多 dropout)
 
   # Stop 预测头配置（已弃用，使用 progress_head 替代）
   stop_head:
@@ -132,7 +135,7 @@ model:
 training:
   stages:
     - name: history_only_64
-      epochs: 30  # 配合 samples_per_clip=8，30 epochs 足够
+      epochs: 15  # samples_per_clip=50 (50K样本)，15 epochs 足够
       hm_size: [64, 64]
       heatmap_loss_type: simplified
       train_history: true
@@ -155,18 +158,18 @@ training:
 optim:
   optimizer: adamw
 
-  # 分组学习率
-  heatmap_lr: 1.0e-4
-  history_heatmap_lr: 1.0e-4
-  future_heatmap_lr: 1.0e-4
-  action_lr: 1.0e-4
-  transformer_action_lr: 1.0e-4   # 显式配置 Transformer Action Head
-  progress_lr: 1.0e-4              # 显式配置 Progress Head
-  llm_projector_lr: 3.0e-5         # Projector 使用较低 LR
+  # 分组学习率 (降低以防过拟合)
+  heatmap_lr: 5.0e-5               # 1e-4 → 5e-5
+  history_heatmap_lr: 5.0e-5       # 1e-4 → 5e-5
+  future_heatmap_lr: 5.0e-5        # 1e-4 → 5e-5
+  action_lr: 5.0e-5                # 1e-4 → 5e-5
+  transformer_action_lr: 5.0e-5    # 1e-4 → 5e-5
+  progress_lr: 5.0e-5              # 1e-4 → 5e-5
+  llm_projector_lr: 1.0e-5         # 3e-5 → 1e-5
 
-  # 正则化
-  weight_decay: 1.0e-2             # 主模块 weight decay
-  projector_weight_decay: 1.0e-3   # Projector 使用更小的 weight decay
+  # 正则化 (增强以防过拟合)
+  weight_decay: 5.0e-2             # 1e-2 → 5e-2 (增加5倍)
+  projector_weight_decay: 5.0e-3   # 1e-3 → 5e-3 (增加5倍)
   
   grad_clip: 1.0
   amp: bf16
@@ -242,4 +245,4 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 10
+  patience: 5                      # 10 → 5 (更早停止防过拟合)

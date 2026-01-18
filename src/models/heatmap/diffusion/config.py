@@ -89,6 +89,12 @@ class DiffusionHeatmapConfig:
     # ==================== Heatmap Output ====================
     heatmap_size: Tuple[int, int] = (64, 64)  # Output heatmap resolution
     
+    # ==================== 360° Panorama Support ====================
+    # Enable circular padding for equirectangular (360°) panorama images
+    # Horizontal: circular padding (left-right boundary is continuous)
+    # Vertical: replicate padding (top-bottom is not continuous)
+    use_circular_padding: bool = False
+    
     # ==================== Training ====================
     # Dropout rate for regularization (used in UNet and condition encoders)
     # Applied to: ImageConditionEncoder, LLMConditionProjector, Fusion MLP, ConditionalUnet2D

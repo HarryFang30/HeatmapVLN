@@ -54,6 +54,8 @@ class SinusoidalPositionEmbeddings(nn.Module):
 class Conv2dBlock(nn.Module):
     """
     Basic Conv2d block with GroupNorm and activation.
+    
+    Supports 360° panorama images with circular padding in horizontal direction.
     """
     
     def __init__(
@@ -63,14 +65,29 @@ class Conv2dBlock(nn.Module):
         kernel_size: int = 3,
         n_groups: int = 8,
         dropout: float = 0.0,
+        use_circular_padding: bool = False,
     ):
         super().__init__()
         
-        self.conv = nn.Conv2d(
-            in_channels, out_channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-        )
+        self.use_circular_padding = use_circular_padding
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        
+        if use_circular_padding:
+            # 360° 全景图：水平方向 circular，垂直方向 replicate
+            # Conv2d 不使用内置 padding，我们手动处理
+            self.conv = nn.Conv2d(
+                in_channels, out_channels,
+                kernel_size=kernel_size,
+                padding=0,  # 手动 padding
+            )
+        else:
+            # 标准 padding
+            self.conv = nn.Conv2d(
+                in_channels, out_channels,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+            )
         
         # Ensure n_groups is valid
         n_groups = min(n_groups, out_channels)
@@ -82,6 +99,12 @@ class Conv2dBlock(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_circular_padding:
+            # 水平方向 circular padding (左右边界连续)
+            x = F.pad(x, (self.padding, self.padding, 0, 0), mode='circular')
+            # 垂直方向 replicate padding (上下边界复制)
+            x = F.pad(x, (0, 0, self.padding, self.padding), mode='replicate')
+        
         x = self.conv(x)
         x = self.norm(x)
         x = self.act(x)
@@ -95,6 +118,8 @@ class ConditionalResidualBlock2D(nn.Module):
     
     Uses Feature-wise Linear Modulation (FiLM) to condition the block
     on the timestep embedding and global condition.
+    
+    Supports 360° panorama images with circular padding.
     """
     
     def __init__(
@@ -105,12 +130,19 @@ class ConditionalResidualBlock2D(nn.Module):
         kernel_size: int = 3,
         n_groups: int = 8,
         dropout: float = 0.0,
+        use_circular_padding: bool = False,
     ):
         super().__init__()
         
-        # Convolution blocks
-        self.block1 = Conv2dBlock(in_channels, out_channels, kernel_size, n_groups, dropout)
-        self.block2 = Conv2dBlock(out_channels, out_channels, kernel_size, n_groups, dropout)
+        # Convolution blocks with optional circular padding for 360° panorama
+        self.block1 = Conv2dBlock(
+            in_channels, out_channels, kernel_size, n_groups, dropout,
+            use_circular_padding=use_circular_padding
+        )
+        self.block2 = Conv2dBlock(
+            out_channels, out_channels, kernel_size, n_groups, dropout,
+            use_circular_padding=use_circular_padding
+        )
         
         # FiLM modulation: predict scale and shift from condition
         self.cond_mlp = nn.Sequential(
@@ -260,12 +292,14 @@ class ConditionalUnet2D(nn.Module):
         n_groups: int = 8,
         dropout: float = 0.0,
         timestep_embed_dim: int = 256,
+        use_circular_padding: bool = False,
     ):
         super().__init__()
         
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.cond_dim = cond_dim
+        self.use_circular_padding = use_circular_padding
         
         # Timestep embedding
         self.time_embed = nn.Sequential(
@@ -275,8 +309,11 @@ class ConditionalUnet2D(nn.Module):
             nn.Linear(cond_dim, cond_dim),
         )
         
-        # Initial convolution
-        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], 3, padding=1)
+        # Initial convolution (with optional circular padding for 360° panorama)
+        if use_circular_padding:
+            self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], 3, padding=0)
+        else:
+            self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], 3, padding=1)
         
         # ==================== Encoder ====================
         self.down_blocks = nn.ModuleList()
@@ -285,7 +322,7 @@ class ConditionalUnet2D(nn.Module):
         
         in_ch = block_out_channels[0]
         for i, out_ch in enumerate(block_out_channels):
-            # Residual blocks
+            # Residual blocks (with optional circular padding for 360° panorama)
             blocks = nn.ModuleList([
                 ConditionalResidualBlock2D(
                     in_ch if j == 0 else out_ch,
@@ -293,6 +330,7 @@ class ConditionalUnet2D(nn.Module):
                     cond_dim,
                     n_groups=n_groups,
                     dropout=dropout,
+                    use_circular_padding=use_circular_padding,
                 )
                 for j in range(layers_per_block)
             ])
@@ -315,11 +353,13 @@ class ConditionalUnet2D(nn.Module):
         # ==================== Middle ====================
         mid_channels = block_out_channels[-1]
         self.mid_block1 = ConditionalResidualBlock2D(
-            mid_channels, mid_channels, cond_dim, n_groups=n_groups, dropout=dropout
+            mid_channels, mid_channels, cond_dim, n_groups=n_groups, dropout=dropout,
+            use_circular_padding=use_circular_padding
         )
         self.mid_attn = Attention2D(mid_channels)
         self.mid_block2 = ConditionalResidualBlock2D(
-            mid_channels, mid_channels, cond_dim, n_groups=n_groups, dropout=dropout
+            mid_channels, mid_channels, cond_dim, n_groups=n_groups, dropout=dropout,
+            use_circular_padding=use_circular_padding
         )
         
         # ==================== Decoder ====================
@@ -340,6 +380,7 @@ class ConditionalUnet2D(nn.Module):
                     cond_dim,
                     n_groups=n_groups,
                     dropout=dropout,
+                    use_circular_padding=use_circular_padding,
                 )
                 for j in range(layers_per_block)
             ])
@@ -391,8 +432,13 @@ class ConditionalUnet2D(nn.Module):
         # Combine timestep and global condition
         cond = t_emb + global_cond  # (B, cond_dim)
         
-        # Initial conv
-        h = self.conv_in(sample)  # (B, block_out_channels[0], H, W)
+        # Initial conv (with optional circular padding for 360° panorama)
+        if self.use_circular_padding:
+            h = F.pad(sample, (1, 1, 0, 0), mode='circular')  # 水平 circular
+            h = F.pad(h, (0, 0, 1, 1), mode='replicate')       # 垂直 replicate
+            h = self.conv_in(h)
+        else:
+            h = self.conv_in(sample)  # (B, block_out_channels[0], H, W)
         
         # ==================== Encoder ====================
         skip_connections = []

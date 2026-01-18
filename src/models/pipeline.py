@@ -73,6 +73,7 @@ class VLNPipelineConfig:
     heatmap_use_image_encoder: bool = True  # Set to False to disable CNN encoder (LLM-only mode)
     heatmap_pool_method: str = "attention"  # 'attention', 'mean', 'first', 'last', 'max'
     heatmap_pool_num_heads: int = 4  # Number of attention heads for attention pooling
+    heatmap_use_circular_padding: bool = False  # 360° panorama: circular padding for horizontal edges
     
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
@@ -177,6 +178,8 @@ class VLNPipeline(nn.Module):
             use_image_encoder=config.heatmap_use_image_encoder,
             llm_pool_method=config.heatmap_pool_method,
             llm_pool_num_heads=config.heatmap_pool_num_heads,
+            # 360° panorama support
+            use_circular_padding=config.heatmap_use_circular_padding,
         )
         
         # History Heatmap Head
