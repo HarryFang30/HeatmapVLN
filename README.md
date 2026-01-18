@@ -132,19 +132,68 @@ python scripts/train.py --config configs/train_config.yaml
 **后台训练**：
 
 ```bash
+# 方式 1: nohup（简单）
 cd /root/HeatmapVLN && \
   source /root/miniconda3/etc/profile.d/conda.sh && \
   conda activate models && \
   nohup python -u scripts/train.py --config configs/train_config.yaml > train.log 2>&1 &
 
-# 查看日志
-tail -f train.log
+# 方式 2: tmux（推荐，可随时 attach）
+tmux new -s train
+conda activate models
+python scripts/train.py --config configs/train_config.yaml
+# Ctrl+B D 退出 tmux，训练继续运行
+# tmux attach -t train 重新进入
+
+# 方式 3: screen
+screen -S train
+conda activate models
+python scripts/train.py --config configs/train_config.yaml
+# Ctrl+A D 退出 screen
+# screen -r train 重新进入
+```
+
+**查看日志**：
+
+```bash
+# 查看训练日志
+tail -f /root/autodl-tmp/vln_training_outputs/train.log
+
+# 查看进程
+ps aux | grep train.py
+
+# 停止训练
+kill $(pgrep -f "train.py")
 ```
 
 **TensorBoard 监控**：
 
 ```bash
+# 只看当前运行（推荐）
+tensorboard --logdir=/root/tf-logs/latest --port=6006
+
+# 查看所有历史运行
 tensorboard --logdir=/root/tf-logs --port=6006
+
+# 后台运行 TensorBoard
+nohup tensorboard --logdir=/root/tf-logs/latest --port=6006 > /dev/null 2>&1 &
+```
+
+**输出目录结构**：
+
+```
+/root/autodl-tmp/vln_training_outputs/
+├── train.log              # 训练日志
+├── ckpts/                 # 检查点
+│   ├── best.pth           # 最佳模型
+│   ├── latest.pth         # 最新模型
+│   └── e010.pth           # Epoch 检查点
+├── vis/                   # 可视化
+│   ├── train/             # 训练热力图
+│   └── val/               # 验证热力图
+└── plots/
+    ├── curves.png         # 训练曲线
+    └── history.json       # 历史数据
 ```
 
 ### 推理
