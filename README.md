@@ -321,20 +321,70 @@ python scripts/evaluate.py \
 
 ### 数据采样策略
 
-为防止过拟合，训练集使用 **Clip-level 采样**：
+#### 三种采样模式
+
+| 模式 | 描述 | 数据多样性 | 推荐场景 |
+|------|------|:----------:|---------|
+| 滑动窗口 | 固定步长遍历所有帧 | ⭐ | 小数据集调试 |
+| Clip-level | 每 clip 随机采样 N 个样本 | ⭐⭐ | 一般训练 |
+| **随机子序列** | 每 clip 生成多个随机子序列 | ⭐⭐⭐ | **推荐** |
+
+#### 随机子序列采样（推荐）
+
+同一个视频片段可以生成无限种子序列组合，大幅增加数据多样性：
+
+```
+原始 Clip: [帧0, 帧1, ..., 帧99] (100帧)
+
+传统采样: 固定使用整个 clip
+  → progress 范围: 0% → 100%
+  → 多样性有限
+
+随机子序列采样: 每次随机选择不同的子序列
+  → 子序列1: [10, 50]  → progress: 0% → 100% (相对于子序列)
+  → 子序列2: [30, 80]  → progress: 0% → 100%
+  → 子序列3: [5, 70]   → progress: 0% → 100%
+  → 同一帧在不同子序列中有不同的 progress 值！
+```
+
+#### 配置示例
 
 ```yaml
 # configs/train_config.yaml
 data:
-  sliding_window:
-    clip_level_sampling: true   # 启用 clip-level 采样
-    samples_per_clip: 2         # 每 clip 每 epoch 采样 2 个
+  trajectory:
+    # 基础采样
+    clip_level_sampling: true
+    samples_per_clip: 30              # 每子序列采样 30 个样本
+    
+    # 随机子序列采样（大幅增加多样性）
+    random_subsequence: true          # 启用随机子序列
+    min_subsequence_length: 30        # 最小子序列长度
+    subsequence_samples_per_clip: 5   # 每 clip 生成 5 个子序列
 ```
 
-| 采样方式 | 单 epoch 样本数 | 样本相关性 | 推荐 |
-|---------|---------------|-----------|:----:|
-| 滑动窗口 (stride=1) | ~133,000 | 极高 | ❌ |
-| **Clip-level (N=2)** | ~2,800 | 低 | ✅ |
+#### 数据量计算
+
+| 配置 | 计算公式 | 每 epoch 样本数 |
+|------|----------|---------------:|
+| 滑动窗口 | clips × avg_frames | ~133,000 |
+| Clip-level | clips × samples_per_clip | ~30,000 |
+| **随机子序列** | clips × subseq × samples | **~150,000** |
+
+以当前配置为例（1000 clips）：
+```
+每 epoch = 1000 × 5 × 30 = 150,000 样本
+10 epochs = 1,500,000 总样本
+可训练参数 ≈ 40M
+数据/参数比 = 37× ✅ (充足)
+```
+
+#### 注意事项
+
+- **仅训练集启用** - 验证集使用固定范围，保证评估一致性
+- **热力图不变** - 同一帧的热力图（历史位置）保持不变
+- **Progress 动态** - 同一帧在不同子序列中有不同的 progress 值
+- **每 epoch 重采样** - `set_epoch()` 会触发重新生成子序列
 
 ---
 
