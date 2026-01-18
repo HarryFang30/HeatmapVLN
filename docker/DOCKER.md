@@ -29,12 +29,15 @@ docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
 ### 方式一：使用快速启动脚本（推荐）
 
 ```bash
-# 赋予执行权限
-chmod +x docker-run.sh
+# 从项目根目录运行
+./docker/docker-run.sh
 
-# 运行脚本
+# 或进入 docker 目录运行
+cd docker
 ./docker-run.sh
 ```
+
+脚本会自动处理路径问题，无论从哪里运行都能正常工作。
 
 脚本提供以下功能：
 - 构建镜像
@@ -48,6 +51,9 @@ chmod +x docker-run.sh
 ### 方式二：使用 docker-compose
 
 ```bash
+# 进入 docker 目录
+cd docker
+
 # 构建镜像
 docker-compose build
 
@@ -65,8 +71,8 @@ docker-compose up tensorboard
 ### 方式三：使用原生 Docker 命令
 
 ```bash
-# 1. 构建镜像
-docker build -t heatmapvln:latest .
+# 1. 从项目根目录构建镜像
+docker build -f docker/Dockerfile -t heatmapvln:latest .
 
 # 2. 运行容器
 docker run --gpus all -it --rm \

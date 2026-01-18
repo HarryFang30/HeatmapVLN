@@ -3,6 +3,13 @@
 
 set -e
 
+# 获取脚本所在目录的父目录（项目根目录）
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+
+# 切换到项目根目录
+cd "$PROJECT_ROOT"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,6 +19,7 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}======================================${NC}"
 echo -e "${GREEN}  HeatmapVLN Docker 快速启动工具${NC}"
 echo -e "${GREEN}======================================${NC}"
+echo -e "${YELLOW}项目根目录: $PROJECT_ROOT${NC}"
 echo ""
 
 # 检查 Docker 是否安装
@@ -44,17 +52,17 @@ read -p "请输入选项 (0-9): " choice
 case $choice in
     1)
         echo -e "${GREEN}开始构建镜像...${NC}"
-        docker build -t heatmapvln:latest .
+        docker build -f docker/Dockerfile -t heatmapvln:latest .
         echo -e "${GREEN}构建完成！${NC}"
         ;;
     2)
         echo -e "${GREEN}启动交互式容器...${NC}"
         docker run --gpus all -it --rm \
-            -v $(pwd)/models:/root/HeatmapVLN/models \
-            -v $(pwd)/dataset_with_actions:/root/HeatmapVLN/dataset_with_actions \
-            -v $(pwd)/vln_training_outputs:/root/HeatmapVLN/vln_training_outputs \
-            -v $(pwd)/tf-logs:/root/tf-logs \
-            -v $(pwd)/outputs_inference:/root/HeatmapVLN/outputs_inference \
+            -v "$PROJECT_ROOT/models":/root/HeatmapVLN/models \
+            -v "$PROJECT_ROOT/dataset_with_actions":/root/HeatmapVLN/dataset_with_actions \
+            -v "$PROJECT_ROOT/vln_training_outputs":/root/HeatmapVLN/vln_training_outputs \
+            -v "$PROJECT_ROOT/tf-logs":/root/tf-logs \
+            -v "$PROJECT_ROOT/outputs_inference":/root/HeatmapVLN/outputs_inference \
             -p 6006:6006 \
             --shm-size 8g \
             heatmapvln:latest
@@ -68,10 +76,10 @@ case $choice in
             RESUME_FLAG=""
         fi
         docker run --gpus all -d --name heatmapvln-train \
-            -v $(pwd)/models:/root/HeatmapVLN/models \
-            -v $(pwd)/dataset_with_actions:/root/HeatmapVLN/dataset_with_actions \
-            -v $(pwd)/vln_training_outputs:/root/HeatmapVLN/vln_training_outputs \
-            -v $(pwd)/tf-logs:/root/tf-logs \
+            -v "$PROJECT_ROOT/models":/root/HeatmapVLN/models \
+            -v "$PROJECT_ROOT/dataset_with_actions":/root/HeatmapVLN/dataset_with_actions \
+            -v "$PROJECT_ROOT/vln_training_outputs":/root/HeatmapVLN/vln_training_outputs \
+            -v "$PROJECT_ROOT/tf-logs":/root/tf-logs \
             --shm-size 8g \
             heatmapvln:latest \
             bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/train.py --config configs/train_config.yaml $RESUME_FLAG"
@@ -81,7 +89,7 @@ case $choice in
     4)
         echo -e "${GREEN}启动 TensorBoard...${NC}"
         docker run --gpus all -d --name heatmapvln-tensorboard \
-            -v $(pwd)/tf-logs:/root/tf-logs \
+            -v "$PROJECT_ROOT/tf-logs":/root/tf-logs \
             -p 6006:6006 \
             heatmapvln:latest \
             bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && tensorboard --logdir=/root/tf-logs --host=0.0.0.0 --port=6006"
@@ -93,10 +101,10 @@ case $choice in
         read -p "请输入 checkpoint 路径: " ckpt_path
         read -p "请输入 clip 路径: " clip_path
         docker run --gpus all -it --rm \
-            -v $(pwd)/models:/root/HeatmapVLN/models \
-            -v $(pwd)/dataset_with_actions:/root/HeatmapVLN/dataset_with_actions \
-            -v $(pwd)/vln_training_outputs:/root/HeatmapVLN/vln_training_outputs \
-            -v $(pwd)/outputs_inference:/root/HeatmapVLN/outputs_inference \
+            -v "$PROJECT_ROOT/models":/root/HeatmapVLN/models \
+            -v "$PROJECT_ROOT/dataset_with_actions":/root/HeatmapVLN/dataset_with_actions \
+            -v "$PROJECT_ROOT/vln_training_outputs":/root/HeatmapVLN/vln_training_outputs \
+            -v "$PROJECT_ROOT/outputs_inference":/root/HeatmapVLN/outputs_inference \
             heatmapvln:latest \
             bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/inference.py --clip $clip_path --config configs/train_config.yaml --checkpoint $ckpt_path --output-dir ./outputs_inference"
         ;;
@@ -105,9 +113,9 @@ case $choice in
         read -p "请输入 checkpoint 路径: " ckpt_path
         read -p "请输入 split (train/val_seen/val_unseen): " split
         docker run --gpus all -it --rm \
-            -v $(pwd)/models:/root/HeatmapVLN/models \
-            -v $(pwd)/dataset_with_actions:/root/HeatmapVLN/dataset_with_actions \
-            -v $(pwd)/vln_training_outputs:/root/HeatmapVLN/vln_training_outputs \
+            -v "$PROJECT_ROOT/models":/root/HeatmapVLN/models \
+            -v "$PROJECT_ROOT/dataset_with_actions":/root/HeatmapVLN/dataset_with_actions \
+            -v "$PROJECT_ROOT/vln_training_outputs":/root/HeatmapVLN/vln_training_outputs \
             heatmapvln:latest \
             bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/evaluate.py --config configs/train_config.yaml --checkpoint $ckpt_path --split $split"
         ;;

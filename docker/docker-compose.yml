@@ -3,8 +3,8 @@ version: '3.8'
 services:
   heatmapvln:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     image: heatmapvln:latest
     container_name: heatmapvln
     runtime: nvidia
@@ -13,15 +13,15 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1,2,3
     volumes:
       # 挂载模型目录
-      - ./models:/root/HeatmapVLN/models
+      - ../models:/root/HeatmapVLN/models
       # 挂载数据集目录
-      - ./dataset_with_actions:/root/HeatmapVLN/dataset_with_actions
+      - ../dataset_with_actions:/root/HeatmapVLN/dataset_with_actions
       # 挂载训练输出目录
-      - ./vln_training_outputs:/root/HeatmapVLN/vln_training_outputs
+      - ../vln_training_outputs:/root/HeatmapVLN/vln_training_outputs
       # 挂载 TensorBoard 日志
-      - ./tf-logs:/root/tf-logs
+      - ../tf-logs:/root/tf-logs
       # 挂载推理输出目录
-      - ./outputs_inference:/root/HeatmapVLN/outputs_inference
+      - ../outputs_inference:/root/HeatmapVLN/outputs_inference
     ports:
       - "6006:6006"  # TensorBoard
     stdin_open: true
@@ -34,7 +34,7 @@ services:
     image: heatmapvln:latest
     container_name: heatmapvln-tensorboard
     volumes:
-      - ./tf-logs:/root/tf-logs
+      - ../tf-logs:/root/tf-logs
     ports:
       - "6006:6006"
     command: /bin/bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && tensorboard --logdir=/root/tf-logs --host=0.0.0.0 --port=6006"

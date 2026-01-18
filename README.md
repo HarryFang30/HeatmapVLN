@@ -12,7 +12,8 @@
 
 - [功能特性](#功能特性)
 - [快速开始](#快速开始)
-  - [环境安装](#环境安装)
+  - [方式一：Docker 部署（推荐）](#方式一docker-部署推荐)
+  - [方式二：本地环境安装](#方式二本地环境安装)
   - [模型准备](#模型准备)
   - [快速验证](#快速验证)
 - [使用指南](#使用指南)
@@ -46,7 +47,23 @@
 
 ## 快速开始
 
-### 环境安装
+### 方式一：Docker 部署（推荐）
+
+使用 Docker 可以快速搭建环境，无需手动安装依赖。
+
+```bash
+# 1. 使用快速启动脚本（最简单）
+./docker/docker-run.sh
+
+# 2. 或使用 docker-compose
+cd docker
+docker-compose build
+docker-compose run --rm heatmapvln
+```
+
+详细的 Docker 使用说明请查看 [docker/DOCKER.md](docker/DOCKER.md)
+
+### 方式二：本地环境安装
 
 ```bash
 cd HeatmapVLN
