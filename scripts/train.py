@@ -56,11 +56,6 @@ from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTraj
 from src.data.packing_collator import PackingCollatorForVLN
 from src.data.tokenized_dataset import TokenizedVLNDataset, FlattenedCollatorForVLN
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
-from src.utils.loss import (
-    NavigationHeatmapLoss,
-    NeRFRippleHeatmapLoss,
-    SimplifiedHeatmapLoss,
-)
 from src.utils.logger import setup_logger
 from src.utils.notifier import FeishuNotifier, create_notifier
 
@@ -375,76 +370,6 @@ def visualize_heatmap_predictions(
     except Exception as e:
         logger.warning(f"Visualization failed: {e}")
         return None
-
-
-def build_heatmap_loss(loss_cfg: Dict, loss_type: str = None) -> nn.Module:
-    """根据配置构建热力图损失函数"""
-    loss_type = loss_type or loss_cfg.get('heatmap_loss_type', 'simplified')
-    
-    if loss_type == 'simplified':
-        params = loss_cfg.get('simplified', {})
-        return SimplifiedHeatmapLoss(
-            lambda_mse=params.get('lambda_mse', 1.0),
-            lambda_grad=params.get('lambda_grad', 0.3),
-            peak_weight=params.get('peak_weight', 5.0),
-        )
-    
-    elif loss_type == 'nerf_ripple':
-        params = loss_cfg.get('nerf_ripple', {})
-        return NeRFRippleHeatmapLoss(
-            lambda_mse=params.get('lambda_mse', 1.0),
-            lambda_fft=params.get('lambda_fft', 0.3),
-            lambda_radial=params.get('lambda_radial', 0.2),
-            lambda_peak=params.get('lambda_peak', 1.0),
-            fft_weight_decay=params.get('fft_weight_decay', 0.5),
-        )
-    
-    elif loss_type == 'navigation':
-        params = loss_cfg.get('navigation', {})
-        return NavigationHeatmapLoss(
-            alpha=params.get('alpha', 20.0),
-            lambda_mse=params.get('lambda_mse', 1.0),
-            lambda_kl=params.get('lambda_kl', 0.2),
-            lambda_valid=params.get('lambda_valid', 0.1),
-        )
-    
-    else:
-        raise ValueError(f"Unknown heatmap loss type: {loss_type}")
-
-
-def compute_heatmap_loss(
-    heatmap_criterion: nn.Module,
-    pred_heatmap: torch.Tensor,
-    gt_heatmap: torch.Tensor,
-    loss_type: str,
-) -> torch.Tensor:
-    """统一的热力图损失计算函数"""
-    if pred_heatmap.dim() == 3:
-        pred_hm = pred_heatmap.unsqueeze(1)
-    else:
-        pred_hm = pred_heatmap
-    
-    if gt_heatmap.dim() == 3:
-        gt_hm = gt_heatmap.unsqueeze(1)
-    else:
-        gt_hm = gt_heatmap
-    
-    if loss_type == 'navigation':
-        B = gt_hm.shape[0]
-        gt_validity = (gt_hm.view(B, -1).sum(dim=1) > 0.1).float().unsqueeze(1)
-        pred_validity = torch.ones_like(gt_validity)
-        
-        loss, _ = heatmap_criterion(
-            pred_logits=pred_hm,
-            gt_heatmap_raw=gt_hm,
-            pred_validity=pred_validity,
-            gt_validity=gt_validity,
-            smooth_gt=False,
-        )
-    else:
-        loss, _ = heatmap_criterion(pred_hm, gt_hm)
-    
-    return loss
 
 
 # ============================================
@@ -834,7 +759,6 @@ def train_one_epoch(
     scheduler,
     scaler: GradScaler,
     cfg: Dict,
-    heatmap_criterion: nn.Module,
     epoch: int,
     logger,
     tb_writer: Optional[SummaryWriter] = None,
@@ -1212,7 +1136,6 @@ def validate(
     model: VLNPipeline,
     val_loader: DataLoader,
     cfg: Dict,
-    heatmap_criterion: nn.Module,
     logger,
     stage_cfg: Dict,
     tb_writer: Optional[SummaryWriter] = None,
@@ -1298,9 +1221,8 @@ def validate(
                         align_corners=False
                     ).squeeze(1)
                 
-                heatmap_loss = compute_heatmap_loss(
-                    heatmap_criterion, pred_hm, gt_heatmap, loss_type
-                )
+                # 使用简单 MSE，与训练时的 Diffusion loss 保持一致的量级
+                heatmap_loss = F.mse_loss(pred_hm, gt_heatmap)
             
             # Action Loss / Trajectory Loss (验证)
             action_loss = torch.tensor(0.0, device=device)
@@ -1852,12 +1774,7 @@ def main():
     if hasattr(model, 'update_heatmap_size'):
         model.update_heatmap_size(hm_size)
     
-    # 构建热力图损失函数
-    stage_loss_type = stage_cfg.get('heatmap_loss_type', default_loss_type)
-    heatmap_criterion = build_heatmap_loss(loss_cfg, stage_loss_type)
-    
     logger.info(f"  Heatmap size: {hm_size}")
-    logger.info(f"  Heatmap loss: {stage_loss_type}")
     
     # 构建数据加载器
     num_workers = cfg['data']['num_workers']
@@ -1986,7 +1903,7 @@ def main():
         epoch_offset = (epoch - 1) * steps_per_epoch
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
-            cfg, heatmap_criterion, epoch, logger, tb_writer, epoch_offset,
+            cfg, epoch, logger, tb_writer, epoch_offset,
             stage_idx=0, stage_name=stage_name, stage_cfg=stage_cfg,
             max_batches=args.max_batches,
             packing_enabled=packing_enabled,
@@ -1996,7 +1913,7 @@ def main():
         timer.end_epoch()
         
         val_metrics = validate(
-            model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch,
+            model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
             packing_enabled=packing_enabled,
             vis_dir=vis_val_dir,
         )
