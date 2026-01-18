@@ -14,11 +14,12 @@ torchaudio==2.7.0
 # ============================================
 # Transformers & LLM Support
 # ============================================
-transformers==4.51.3
+transformers==4.57.6
 accelerate==1.5.2
 qwen-vl-utils==0.0.11
 huggingface-hub>=0.34.0
 safetensors>=0.4.0
+diffusers==0.36.0
 
 # ============================================
 # Vision & Video Processing
