@@ -63,7 +63,8 @@ class Qwen3VLConfig:
     torch_dtype: str = "bfloat16"
     
     # Attention implementation (flash_attention_2, sdpa, or eager)
-    attn_implementation: str = "sdpa"  # Default to sdpa (works without flash_attn)
+    # 推荐使用 flash_attention_2 以获得最佳性能
+    attn_implementation: str = "flash_attention_2"
     
     # Generation settings (for inference mode)
     max_new_tokens: int = 128
@@ -133,6 +134,18 @@ class Qwen3VLIntegration(nn.Module):
             return
         
         try:
+            # 如果启用 packing，需要在导入模型前替换 attention
+            # 这是官方实现的做法，确保 varlen attention 正确生效
+            if self._packing_enabled and not self._varlen_attention_replaced:
+                if PACKING_AVAILABLE:
+                    try:
+                        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+                        replace_attention_with_varlen(None)  # 替换类方法，不需要模型实例
+                        self._varlen_attention_replaced = True
+                        logger.info("Pre-replaced attention with varlen version before model loading")
+                    except ImportError:
+                        logger.warning("flash_attn not available, skipping varlen attention replacement")
+            
             from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
             
             logger.info(f"Loading Qwen3-VL from {self.config.model_path}")
@@ -170,9 +183,10 @@ class Qwen3VLIntegration(nn.Module):
             logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
             logger.info(f"Batch processing enabled (padding_side='left')")
             
-            # Enable sequence packing if configured
-            if self._packing_enabled:
-                self.enable_sequence_packing()
+            # 注意：varlen attention 已经在模型导入前替换过了
+            # 不需要再次调用 enable_sequence_packing()
+            if self._packing_enabled and self._varlen_attention_replaced:
+                logger.info("Sequence packing with varlen attention is active")
             
         except Exception as e:
             logger.error(f"Failed to load Qwen3-VL: {e}")
@@ -287,20 +301,22 @@ class Qwen3VLIntegration(nn.Module):
             model_inputs["video_grid_thw"] = packed_batch["video_grid_thw"].to(self.device)
         
         # Forward pass
-        with torch.no_grad():
-            outputs = self.model(
-                **model_inputs,
-                output_hidden_states=return_hidden_states,
-                return_dict=True,
-            )
-            
-            if return_hidden_states:
-                layer_idx = self.config.hidden_layer_for_features
-                if layer_idx == -1:
-                    layer_idx = len(outputs.hidden_states) - 1
-                packed_hidden_states = outputs.hidden_states[layer_idx]  # (1, total_seq_len, hidden_dim)
-            else:
-                packed_hidden_states = None
+        # 注意：不能使用 torch.no_grad()！
+        # 虽然 Qwen3-VL 参数被冻结 (requires_grad=False)，但需要保留计算图
+        # 以便梯度可以回传到下游的 llm_projector 和 heads
+        outputs = self.model(
+            **model_inputs,
+            output_hidden_states=return_hidden_states,
+            return_dict=True,
+        )
+        
+        if return_hidden_states:
+            layer_idx = self.config.hidden_layer_for_features
+            if layer_idx == -1:
+                layer_idx = len(outputs.hidden_states) - 1
+            packed_hidden_states = outputs.hidden_states[layer_idx]  # (1, total_seq_len, hidden_dim)
+        else:
+            packed_hidden_states = None
         
         # 拆分 packed hidden states
         if packed_hidden_states is not None and PACKING_AVAILABLE:
@@ -494,20 +510,21 @@ class Qwen3VLIntegration(nn.Module):
         input_ids = inputs["input_ids"]  # (B, seq_len)
         
         # Batch forward pass
-        with torch.no_grad():
-            outputs = self.model(
-                **inputs,
-                output_hidden_states=return_hidden_states,
-                return_dict=True,
-            )
-            
-            if return_hidden_states:
-                layer_idx = self.config.hidden_layer_for_features
-                if layer_idx == -1:
-                    layer_idx = len(outputs.hidden_states) - 1
-                hidden_states = outputs.hidden_states[layer_idx]  # (B, seq_len, hidden_dim)
-            else:
-                hidden_states = None
+        # 注意：不能使用 torch.no_grad()！
+        # 虽然 Qwen3-VL 参数被冻结，但需要保留计算图以便梯度回传到下游模块
+        outputs = self.model(
+            **inputs,
+            output_hidden_states=return_hidden_states,
+            return_dict=True,
+        )
+        
+        if return_hidden_states:
+            layer_idx = self.config.hidden_layer_for_features
+            if layer_idx == -1:
+                layer_idx = len(outputs.hidden_states) - 1
+            hidden_states = outputs.hidden_states[layer_idx]  # (B, seq_len, hidden_dim)
+        else:
+            hidden_states = None
         
         # Extract vision token hidden states for each sample
         vision_hidden_states = None
@@ -555,20 +572,20 @@ class Qwen3VLIntegration(nn.Module):
         input_ids = inputs["input_ids"]
         
         # Forward pass
-        with torch.no_grad():
-            outputs = self.model(
-                **inputs,
-                output_hidden_states=return_hidden_states,
-                return_dict=True,
-            )
-            
-            if return_hidden_states:
-                layer_idx = self.config.hidden_layer_for_features
-                if layer_idx == -1:
-                    layer_idx = len(outputs.hidden_states) - 1
-                hidden_states = outputs.hidden_states[layer_idx]
-            else:
-                hidden_states = None
+        # 注意：不能使用 torch.no_grad()！需要保留计算图以便梯度回传
+        outputs = self.model(
+            **inputs,
+            output_hidden_states=return_hidden_states,
+            return_dict=True,
+        )
+        
+        if return_hidden_states:
+            layer_idx = self.config.hidden_layer_for_features
+            if layer_idx == -1:
+                layer_idx = len(outputs.hidden_states) - 1
+            hidden_states = outputs.hidden_states[layer_idx]
+        else:
+            hidden_states = None
         
         # Extract vision token hidden states
         vision_hidden_states = None

@@ -400,14 +400,17 @@ def get_rope_index_3(
         return position_ids, mrope_position_deltas
 
 
-def replace_attention_with_varlen(model: nn.Module) -> None:
+def replace_attention_with_varlen(model: nn.Module = None) -> None:
     """
     替换 Qwen3-VL 的 attention forward 函数以支持 varlen FlashAttention
     
     这允许模型处理 packed sequences，使用 cumulative sequence lengths 作为 attention mask。
     
+    注意：应该在模型导入前调用此函数（model 参数可以为 None）。
+    这是官方 Qwen3-VL fine-tuning 框架的做法。
+    
     Args:
-        model: Qwen3-VL 模型
+        model: Qwen3-VL 模型（可选，用于向后兼容）
     """
     try:
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
