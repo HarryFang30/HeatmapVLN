@@ -503,6 +503,9 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
         heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
         heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
+        # Classifier-Free Guidance (CFG) for heatmap
+        heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
+        heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
         
         # Action Head Type
         action_head_type=action_head_type,

@@ -100,6 +100,12 @@ class DiffusionHeatmapConfig:
     # Applied to: ImageConditionEncoder, LLMConditionProjector, Fusion MLP, ConditionalUnet2D
     dropout: float = 0.1
     
+    # ==================== Classifier-Free Guidance (CFG) ====================
+    # CFG 用于增强条件效果，让模型更好地利用条件信息
+    # 训练时随机 drop 条件，推理时用无条件预测引导有条件预测
+    cfg_drop_prob: float = 0.1       # 训练时随机 drop 条件的概率
+    cfg_scale: float = 3.0           # 推理时的引导强度 (1.0 = 无引导)
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"

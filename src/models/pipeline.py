@@ -81,6 +81,8 @@ class VLNPipelineConfig:
     heatmap_layers_per_block: int = 2  # ResBlocks per level
     heatmap_attention_levels: Tuple[int, ...] = (2,)  # Which levels have attention
     heatmap_num_train_timesteps: int = 100  # Diffusion training steps
+    heatmap_cfg_drop_prob: float = 0.1  # CFG: drop condition probability during training
+    heatmap_cfg_scale: float = 3.0  # CFG: guidance scale during inference
     
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
@@ -194,6 +196,9 @@ class VLNPipeline(nn.Module):
             layers_per_block=config.heatmap_layers_per_block,
             attention_levels=config.heatmap_attention_levels,
             num_train_timesteps=config.heatmap_num_train_timesteps,
+            # Classifier-Free Guidance (CFG)
+            cfg_drop_prob=config.heatmap_cfg_drop_prob,
+            cfg_scale=config.heatmap_cfg_scale,
         )
         
         # History Heatmap Head

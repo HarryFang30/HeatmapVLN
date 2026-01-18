@@ -235,6 +235,78 @@ class Attention2D(nn.Module):
         return out + residual
 
 
+class CrossAttention2D(nn.Module):
+    """
+    Cross-attention block for conditioning 2D feature maps.
+    
+    让 UNet 的每个空间位置都能"查询"条件向量，
+    比 FiLM 更强的条件注入方式。
+    """
+    
+    def __init__(
+        self,
+        channels: int,
+        cond_dim: int,
+        num_heads: int = 4,
+        head_dim: int = 32,
+    ):
+        super().__init__()
+        
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        inner_dim = num_heads * head_dim
+        
+        self.norm = nn.GroupNorm(8, channels)
+        self.norm_cond = nn.LayerNorm(cond_dim)
+        
+        # Q 来自特征图，K/V 来自条件
+        self.to_q = nn.Conv2d(channels, inner_dim, 1)
+        self.to_k = nn.Linear(cond_dim, inner_dim)
+        self.to_v = nn.Linear(cond_dim, inner_dim)
+        self.to_out = nn.Conv2d(inner_dim, channels, 1)
+        
+        self.scale = head_dim ** -0.5
+    
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) 特征图
+            cond: (B, cond_dim) 条件向量
+            
+        Returns:
+            (B, C, H, W) 条件增强后的特征图
+        """
+        B, C, H, W = x.shape
+        
+        residual = x
+        x = self.norm(x)
+        cond = self.norm_cond(cond)
+        
+        # Q from spatial features: (B, inner_dim, H, W) -> (B, heads, H*W, head_dim)
+        q = self.to_q(x)  # (B, inner_dim, H, W)
+        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
+        q = q.permute(0, 1, 3, 2)  # (B, heads, H*W, head_dim)
+        
+        # K, V from condition: (B, cond_dim) -> (B, heads, 1, head_dim)
+        k = self.to_k(cond)  # (B, inner_dim)
+        v = self.to_v(cond)  # (B, inner_dim)
+        k = k.reshape(B, self.num_heads, self.head_dim, 1)
+        v = v.reshape(B, self.num_heads, self.head_dim, 1)
+        k = k.permute(0, 1, 3, 2)  # (B, heads, 1, head_dim)
+        v = v.permute(0, 1, 3, 2)  # (B, heads, 1, head_dim)
+        
+        # Attention: 每个空间位置都查询条件
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, heads, H*W, 1)
+        attn = F.softmax(attn, dim=-1)
+        
+        out = torch.matmul(attn, v)  # (B, heads, H*W, head_dim)
+        out = out.permute(0, 1, 3, 2)  # (B, heads, head_dim, H*W)
+        out = out.reshape(B, -1, H, W)  # (B, inner_dim, H, W)
+        out = self.to_out(out)
+        
+        return out + residual
+
+
 class Downsample2D(nn.Module):
     """Downsampling block using strided convolution."""
     
@@ -357,6 +429,13 @@ class ConditionalUnet2D(nn.Module):
             use_circular_padding=use_circular_padding
         )
         self.mid_attn = Attention2D(mid_channels)
+        # Cross-Attention: 让每个空间位置都能查询条件向量
+        self.mid_cross_attn = CrossAttention2D(
+            channels=mid_channels,
+            cond_dim=cond_dim,
+            num_heads=4,
+            head_dim=32,
+        )
         self.mid_block2 = ConditionalResidualBlock2D(
             mid_channels, mid_channels, cond_dim, n_groups=n_groups, dropout=dropout,
             use_circular_padding=use_circular_padding
@@ -455,6 +534,7 @@ class ConditionalUnet2D(nn.Module):
         # ==================== Middle ====================
         h = self.mid_block1(h, cond)
         h = self.mid_attn(h)
+        h = self.mid_cross_attn(h, global_cond)  # Cross-Attention with original condition
         h = self.mid_block2(h, cond)
         
         # ==================== Decoder ====================

@@ -73,6 +73,10 @@ class DiffusionHeatmapHead(nn.Module):
         self._inference_interval = 100  # Generate heatmap every N steps during training
         self._peak_loss_interval = 5    # Compute peak loss every N steps (restored to more frequent)
         
+        # Classifier-Free Guidance (CFG) 参数
+        self.cfg_drop_prob = config.cfg_drop_prob
+        self.cfg_scale = config.cfg_scale
+        
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
             llm_dim=config.llm_dim,
@@ -216,18 +220,49 @@ class DiffusionHeatmapHead(nn.Module):
         # Add noise to heatmap (forward diffusion)
         noisy_heatmap = self.noise_scheduler.add_noise(gt_normalized, noise, timesteps)
         
+        # Classifier-Free Guidance: 训练时随机 drop 条件
+        # 让模型学会无条件生成，用于推理时的引导
+        if self.training and self.cfg_drop_prob > 0:
+            # 创建 drop mask
+            drop_mask = torch.rand(batch_size, device=device) < self.cfg_drop_prob
+            # 将 drop 的样本条件设为零向量
+            cond_for_pred = cond.clone()
+            cond_for_pred[drop_mask] = 0.0
+        else:
+            cond_for_pred = cond
+        
         # Predict noise
         noise_pred = self.noise_predictor(
             sample=noisy_heatmap,
             timestep=timesteps,
-            global_cond=cond,
+            global_cond=cond_for_pred,
         )
         
-        # ✅ 标准 DDPM Loss：无加权 MSE
-        # 原理：Diffusion 的去噪过程自然会学习数据分布
-        #       不需要人为约束（peak_loss/variance_loss 反而有害）
-        #       噪声 ε 在空间上均匀分布，加权会破坏这个假设
-        diffusion_loss = F.mse_loss(noise_pred, noise)
+        # ==================== Focal-style 混合损失 ====================
+        # 主损失：标准 MSE（无加权，保持 DDPM 理论正确性）
+        base_loss = F.mse_loss(noise_pred, noise)
+        
+        # Focal 损失：让模型更关注峰值区域的噪声预测
+        # 注意：这是一个温和的加权，不会破坏 DDPM 的理论基础
+        # 权重基于 GT 热力图（归一化前）的值，峰值区域权重略高
+        with torch.no_grad():
+            # 使用 GT 热力图作为注意力权重
+            # gt_heatmap 在 [0,1] 范围，峰值接近 1
+            gt_weight = gt_heatmap.clamp(0, 1)
+            # 温和加权：1.0 + alpha * gt_weight
+            # alpha=1.0 表示峰值区域权重最多是背景的 2 倍
+            focal_alpha = 1.0
+            weight_map = 1.0 + focal_alpha * gt_weight
+            # 归一化权重使其均值为 1
+            weight_map = weight_map / weight_map.mean()
+        
+        # 计算加权 MSE（逐元素）
+        focal_loss = (weight_map * (noise_pred - noise) ** 2).mean()
+        
+        # 混合损失：base_loss 占主导，focal_loss 作为辅助
+        # focal_weight=0.3 表示 30% 的梯度来自 focal 损失
+        focal_weight = 0.3
+        diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
         
         # 诊断信息：记录噪声预测质量
         noise_std = noise.std().item()
@@ -251,12 +286,13 @@ class DiffusionHeatmapHead(nn.Module):
             'noise_pred_std': noise_pred_std,
         }
     
-    def _diffusion_inference(self, cond: torch.Tensor) -> torch.Tensor:
+    def _diffusion_inference(self, cond: torch.Tensor, use_cfg: bool = True) -> torch.Tensor:
         """
-        Iterative denoising to generate heatmap.
+        Iterative denoising to generate heatmap with Classifier-Free Guidance.
         
         Args:
             cond: (B, cond_dim) conditioning vector
+            use_cfg: 是否使用 CFG 引导（推理时建议开启）
             
         Returns:
             (B, Hm, Wm) predicted heatmap (probability distribution)
@@ -272,17 +308,42 @@ class DiffusionHeatmapHead(nn.Module):
             dtype=cond.dtype,
         )
         
+        # 准备无条件向量（零向量）
+        uncond = torch.zeros_like(cond)
+        
+        # 是否使用 CFG
+        do_cfg = use_cfg and self.cfg_scale > 1.0
+        
         # Set scheduler timesteps
         self.noise_scheduler.set_timesteps(self.config.num_inference_steps)
         
         # Iterative denoising
         for t in self.noise_scheduler.timesteps:
-            # Predict noise
-            noise_pred = self.noise_predictor(
-                sample=noisy_heatmap,
-                timestep=t.unsqueeze(-1).repeat(batch_size).to(device),
-                global_cond=cond,
-            )
+            timestep_batch = t.unsqueeze(-1).repeat(batch_size).to(device)
+            
+            if do_cfg:
+                # CFG: 同时预测有条件和无条件的噪声
+                # 有条件预测
+                noise_pred_cond = self.noise_predictor(
+                    sample=noisy_heatmap,
+                    timestep=timestep_batch,
+                    global_cond=cond,
+                )
+                # 无条件预测
+                noise_pred_uncond = self.noise_predictor(
+                    sample=noisy_heatmap,
+                    timestep=timestep_batch,
+                    global_cond=uncond,
+                )
+                # CFG 公式：noise = uncond + scale * (cond - uncond)
+                noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                # 不使用 CFG
+                noise_pred = self.noise_predictor(
+                    sample=noisy_heatmap,
+                    timestep=timestep_batch,
+                    global_cond=cond,
+                )
             
             # Remove noise (reverse diffusion step)
             noisy_heatmap = self.noise_scheduler.step(
