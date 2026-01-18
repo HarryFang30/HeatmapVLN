@@ -1,0 +1,58 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist
+build
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 模型文件（应通过 volume 挂载）
+models/
+*.pth
+*.pt
+*.safetensors
+*.bin
+
+# 数据集（应通过 volume 挂载）
+dataset_with_actions/
+data/
+
+# 训练输出（应通过 volume 挂载）
+vln_training_outputs/
+outputs_inference/
+checkpoints/
+
+# 日志
+*.log
+train.log
+nohup.out
+/root/tf-logs
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+*~
+
+# IDE
+.vscode
+.idea
+*.code-workspace
+
+# macOS
+.DS_Store
+
+# 其他
+*.zip
+*.tar.gz
+*.rar

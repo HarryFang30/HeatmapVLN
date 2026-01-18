@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  heatmapvln:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: heatmapvln:latest
+    container_name: heatmapvln
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
+    volumes:
+      # 挂载模型目录
+      - ./models:/root/HeatmapVLN/models
+      # 挂载数据集目录
+      - ./dataset_with_actions:/root/HeatmapVLN/dataset_with_actions
+      # 挂载训练输出目录
+      - ./vln_training_outputs:/root/HeatmapVLN/vln_training_outputs
+      # 挂载 TensorBoard 日志
+      - ./tf-logs:/root/tf-logs
+      # 挂载推理输出目录
+      - ./outputs_inference:/root/HeatmapVLN/outputs_inference
+    ports:
+      - "6006:6006"  # TensorBoard
+    stdin_open: true
+    tty: true
+    shm_size: '8gb'  # 增加共享内存，避免 DataLoader 问题
+    command: /bin/bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && exec bash"
+
+  # TensorBoard 服务
+  tensorboard:
+    image: heatmapvln:latest
+    container_name: heatmapvln-tensorboard
+    volumes:
+      - ./tf-logs:/root/tf-logs
+    ports:
+      - "6006:6006"
+    command: /bin/bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && tensorboard --logdir=/root/tf-logs --host=0.0.0.0 --port=6006"
+
+# 使用说明：
+#
+# 1. 构建镜像：
+#    docker-compose build
+#
+# 2. 启动容器（交互式）：
+#    docker-compose run --rm heatmapvln
+#
+# 3. 后台运行训练：
+#    docker-compose run -d --name heatmapvln-train heatmapvln \
+#      bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/train.py --config configs/train_config.yaml"
+#
+# 4. 查看训练日志：
+#    docker logs -f heatmapvln-train
+#
+# 5. 启动 TensorBoard：
+#    docker-compose up tensorboard
+#
+# 6. 停止所有服务：
+#    docker-compose down
