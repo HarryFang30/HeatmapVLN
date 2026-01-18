@@ -1640,13 +1640,28 @@ def main():
     if cfg['log'].get('use_tensorboard', False):
         tb_base = Path(cfg['log'].get('tensorboard_dir', './runs'))
         tb_base.mkdir(parents=True, exist_ok=True)
+        
+        # 归档旧的 TensorBoard 日志（移动到项目目录下的 tf-logs-archive）
+        tb_archive = Path(__file__).parent.parent / 'tf-logs-archive'
+        tb_archive.mkdir(parents=True, exist_ok=True)
+        
+        latest_link = tb_base / 'latest'
+        for old_dir in tb_base.iterdir():
+            if old_dir.is_dir() and old_dir.name != 'latest':
+                # 移动旧目录到归档
+                dest = tb_archive / old_dir.name
+                if not dest.exists():
+                    import shutil
+                    shutil.move(str(old_dir), str(dest))
+                    logger.info(f"📦 归档旧日志: {old_dir.name} → tf-logs-archive/")
+        
+        # 创建新的运行目录
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         tb_run_dir = tb_base / timestamp
         tb_writer = SummaryWriter(log_dir=str(tb_run_dir))
         
         # 创建 'latest' 符号链接，方便只查看当前训练
         # tensorboard --logdir /root/tf-logs/latest
-        latest_link = tb_base / 'latest'
         if latest_link.is_symlink() or latest_link.exists():
             latest_link.unlink()
         latest_link.symlink_to(tb_run_dir.name)
