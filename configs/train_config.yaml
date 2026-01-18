@@ -9,9 +9,9 @@ data:
   val_split: val_unseen
   image_size: [224, 224]
   init_hm_size: [64, 64]
-  num_workers: 4    # 批量处理下可以启用多进程数据加载
+  num_workers: 8    # 增加 worker 数量以匹配更大 batch
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4  # 增加预取量
   
   # 数据集配置
   # 'sliding_window': 原始滑动窗口数据集（单步动作）
@@ -169,9 +169,10 @@ optim:
   warmup_ratio: 0.1
   
   # 批量配置
-  # RTX 5090 32GB - 使用传统批量处理
-  # 有效批量: 4 * 4 = 16
-  batch_size: 4
+  # RTX 5090 32GB - 优化显存利用率
+  # 当前使用 ~17GB，目标 ~28GB
+  # 有效批量: 8 * 4 = 32
+  batch_size: 8
   grad_accum_steps: 4
 
 # ============================================
