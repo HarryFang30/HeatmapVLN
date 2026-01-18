@@ -1606,19 +1606,41 @@ def main():
     cfg = load_config(args.config)
     set_seed(cfg['seed'])
     
+    # 设置输出目录结构
+    out_dir = Path(cfg['log']['out_dir'])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 子目录
+    ckpt_dir = out_dir / 'ckpts'
+    vis_train_dir = out_dir / 'vis' / 'train'
+    vis_val_dir = out_dir / 'vis' / 'val'
+    plots_dir = out_dir / 'plots'
+    
+    for d in [ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+    
     # 设置日志
-    log_dir = Path(cfg['log']['out_dir'])
-    log_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logger(str(log_dir / 'train.log'))
+    logger = setup_logger(str(out_dir / 'train.log'))
+    logger.info(f"📁 Output: {out_dir}")
     
     # TensorBoard
     tb_writer = None
     if cfg['log'].get('use_tensorboard', False):
-        tb_dir = Path(cfg['log'].get('tensorboard_dir', './runs'))
-        tb_dir.mkdir(parents=True, exist_ok=True)
+        tb_base = Path(cfg['log'].get('tensorboard_dir', './runs'))
+        tb_base.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        tb_writer = SummaryWriter(log_dir=str(tb_dir / f'vln_training_{timestamp}'))
-        logger.info(f"📊 TensorBoard: {tb_dir / f'vln_training_{timestamp}'}")
+        tb_run_dir = tb_base / timestamp
+        tb_writer = SummaryWriter(log_dir=str(tb_run_dir))
+        
+        # 创建 'latest' 符号链接，方便只查看当前训练
+        # tensorboard --logdir /root/tf-logs/latest
+        latest_link = tb_base / 'latest'
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(tb_run_dir.name)
+        
+        logger.info(f"📊 TensorBoard: {tb_run_dir}")
+        logger.info(f"   只看当前: tensorboard --logdir {latest_link}")
     
     loss_cfg = cfg['loss']
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
@@ -1724,7 +1746,7 @@ def main():
     
     # 创建检查点管理器
     ckpt_manager = CheckpointManager(
-        out_dir=cfg['log']['out_dir'],
+        out_dir=str(ckpt_dir),
         max_ckpts=cfg['log'].get('max_ckpts', 3)
     )
     
