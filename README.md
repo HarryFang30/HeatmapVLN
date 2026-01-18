@@ -132,11 +132,14 @@ tensorboard --logdir=/root/tf-logs --port=6006
 
 ### 推理
 
+推理脚本支持热力图、轨迹预测和进度预测：
+
 ```bash
-# 对数据集 clip 推理
+# 对数据集 clip 推理（默认输出所有预测）
 python scripts/inference.py \
   --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 \
   --config configs/train_config.yaml \
+  --checkpoint /path/to/best_model.pth \
   --output-dir ./outputs_inference
 
 # 对视频文件推理
@@ -144,23 +147,75 @@ python scripts/inference.py \
   --video /path/to/video.mp4 \
   --instruction "沿走廊前进并在门口右转" \
   --config configs/train_config.yaml \
+  --checkpoint /path/to/best_model.pth \
   --output-dir ./outputs_inference
+
+# 只输出特定预测
+python scripts/inference.py \
+  --clip /path/to/clip \
+  --output-heatmap \
+  --output-trajectory \
+  --output-progress
 ```
 
 **输出文件**：
-- `*_history_heatmaps.png` - 历史位置热力图可视化
-- `*_actions.npy` - 预测的动作序列
+
+| 文件 | 说明 |
+|------|------|
+| `*_combined.png` | 综合可视化（热力图 + 轨迹 + 进度） |
+| `*_heatmap.png` | 历史位置热力图可视化 |
+| `*_heatmap.npy` | 热力图原始数据 |
+| `*_trajectory.png` | 24 步轨迹可视化 |
+| `*_trajectory.npy` | 轨迹原始数据 [24, 3] (dx, dy, dyaw) |
+| `*_trajectory.txt` | 轨迹文本格式 |
+| `*_summary.yaml` | 推理摘要（进度、热力图最大值等） |
 
 ### 评估
 
+评估脚本计算热力图、轨迹和进度的定量指标：
+
 ```bash
+# 完整评估（热力图 + 轨迹 + 进度）
 python scripts/evaluate.py \
   --config configs/train_config.yaml \
   --checkpoint /path/to/best_model.pth \
   --split val_unseen \
   --save-vis \
   --num-vis 20
+
+# 只评估特定指标
+python scripts/evaluate.py \
+  --checkpoint /path/to/best_model.pth \
+  --eval-heatmap \
+  --eval-trajectory \
+  --eval-progress
+
+# 使用 Sequence Packing 加速
+python scripts/evaluate.py \
+  --checkpoint /path/to/best_model.pth \
+  --use-packing
 ```
+
+**评估指标**：
+
+| 类别 | 指标 | 说明 |
+|------|------|------|
+| **热力图** | Peak Error | 峰值位置误差（像素） |
+| | IoU | 阈值交并比 (threshold=0.3) |
+| | Cosine Sim | 余弦相似度 |
+| | MAE | 平均绝对误差 |
+| **轨迹** | ADE | 平均位移误差 (Average Displacement Error) |
+| | FDE | 最终位移误差 (Final Displacement Error) |
+| **进度** | MAE | 平均绝对误差 |
+| | Accuracy | 阈值准确率 (threshold=0.1) |
+| | Boundary Acc | 边界准确率 (progress ≈ 0 或 1) |
+
+**可视化输出**：
+
+评估时使用 `--save-vis` 会保存到 `<out_dir>/eval_vis/`，每个样本包含：
+- 当前帧、GT 热力图、预测热力图
+- GT 轨迹 vs 预测轨迹对比
+- 进度预测对比
 
 ---
 

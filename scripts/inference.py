@@ -6,10 +6,9 @@ VLN Pipeline 推理脚本
 使用 Qwen3-VL 进行视觉语言导航推理。
 
 支持：
-- 历史热力图头 (History Heatmap)
-- 未来热力图头 (Future Heatmap)
-- 动作头 (Action Head)
-- 停止预测头 (Stop Head)
+- 历史热力图生成 (History Heatmap)
+- 轨迹预测 (Trajectory - 24 步)
+- 进度预测 (Progress)
 """
 
 import os
@@ -29,11 +28,13 @@ import cv2
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.plotting_config import configure_matplotlib_fonts
-from src.utils.logger import setup_logger
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
-configure_matplotlib_fonts()
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger("inference")
 
 
@@ -143,44 +144,6 @@ def load_instruction_from_clip(clip_dir: str) -> Optional[str]:
     return meta.get("instruction", None)
 
 
-def visualize_heatmaps(heatmaps: torch.Tensor, output_dir: str, name: str, prefix: str):
-    """Visualize heatmaps and save to file."""
-    os.makedirs(output_dir, exist_ok=True)
-    if heatmaps.dim() == 4:
-        heatmaps = heatmaps[0]  # Remove batch dim
-    
-    num_views = heatmaps.shape[0]
-    cols = min(num_views, 4)
-    rows = (num_views + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
-    if rows == 1 and cols == 1:
-        axes = np.array([[axes]])
-    elif rows == 1:
-        axes = np.array([axes])
-    elif cols == 1:
-        axes = axes.reshape(-1, 1)
-    
-    for i in range(num_views):
-        r, c = i // cols, i % cols
-        ax = axes[r, c]
-        hm = heatmaps[i].cpu().numpy()
-        im = ax.imshow(hm, cmap='viridis', interpolation='bilinear')
-        ax.set_title(f'{prefix} {i+1}')
-        ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    
-    for i in range(num_views, rows * cols):
-        r, c = i // cols, i % cols
-        axes[r, c].axis('off')
-    
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, f"{name}_{prefix}_heatmaps.png")
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved {prefix} heatmaps to {save_path}")
-
-
 def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     """Build VLN pipeline for inference.
 
@@ -196,16 +159,15 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap_head', {})
     action_cfg = model_cfg.get('action_head', {})
-    stop_cfg = model_cfg.get('stop_head', {})
     
     config = VLNPipelineConfig(
         # Qwen3-VL
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
-        max_video_frames=llm_cfg.get('max_video_frames', 16),
+        max_video_frames=llm_cfg.get('max_video_frames', -1),
         
         # Device
         device=device,
@@ -213,26 +175,132 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         # Heatmap
         heatmap_size=tuple(data_cfg['init_hm_size']),
         enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
-        enable_future_heatmap_head=heatmap_cfg.get('enable_future', True),
+        enable_future_heatmap_head=heatmap_cfg.get('enable_future', False),
         diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
         image_size=data_cfg['image_size'][0],
+        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', False),
+        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
         
-        # Action
+        # Action Head (Transformer)
+        action_head_type=action_cfg.get('type', 'transformer'),
         enable_action_head=action_cfg.get('enable', True),
-        action_dim=action_cfg.get('action_dim', 2),
-        action_pred_horizon=action_cfg.get('pred_horizon', 1),
-        action_encoding_size=action_cfg.get('encoding_size', 256),
-        action_num_diffusion_iters=action_cfg.get('num_diffusion_iters', 10),
+        transformer_action_dim=action_cfg.get('action_dim', 3),
+        transformer_predict_size=action_cfg.get('predict_size', 24),
+        transformer_n_emb=action_cfg.get('n_emb', 384),
+        transformer_n_layer=action_cfg.get('n_layer', 16),
+        transformer_n_head=action_cfg.get('n_head', 8),
         
-        # Stop
-        enable_stop_head=stop_cfg.get('enable', True),
-        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        # Progress Head
+        enable_progress_head=model_cfg.get('progress_head', {}).get('enable', True),
+        
+        # Legacy heads disabled
+        enable_stop_head=False,
         
         verbose=True,
     )
     
     return VLNPipeline(config)
+
+
+def visualize_heatmap(heatmap: np.ndarray, output_path: str, title: str = "Heatmap"):
+    """Visualize and save a single heatmap."""
+    plt.figure(figsize=(8, 6))
+    plt.imshow(heatmap, cmap='inferno', vmin=0, vmax=1)
+    plt.colorbar(label='Probability')
+    plt.title(f"{title} (max={heatmap.max():.3f})")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved heatmap to {output_path}")
+
+
+def visualize_trajectory(trajectory: np.ndarray, output_path: str, title: str = "Trajectory"):
+    """Visualize and save trajectory prediction."""
+    # Cumulative sum to get positions
+    positions = np.cumsum(trajectory[:, :2], axis=0)
+    
+    plt.figure(figsize=(10, 8))
+    
+    # Plot trajectory
+    plt.plot(positions[:, 0], positions[:, 1], 'b-o', markersize=4, linewidth=2, label='Trajectory')
+    
+    # Mark start and end
+    plt.scatter([0], [0], c='green', s=200, marker='*', zorder=5, label='Start')
+    plt.scatter([positions[-1, 0]], [positions[-1, 1]], c='red', s=200, marker='X', zorder=5, label='End')
+    
+    # Add step numbers
+    for i, (x, y) in enumerate(positions[::4]):  # Every 4th point
+        plt.annotate(str(i*4), (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
+    
+    plt.xlabel('X displacement')
+    plt.ylabel('Y displacement')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved trajectory to {output_path}")
+
+
+def visualize_combined(
+    current_frame: np.ndarray,
+    heatmap: Optional[np.ndarray],
+    trajectory: Optional[np.ndarray],
+    progress: Optional[float],
+    output_path: str,
+    instruction: str = "",
+):
+    """Create combined visualization."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # Current frame
+    axes[0, 0].imshow(current_frame)
+    axes[0, 0].set_title("Current Observation")
+    axes[0, 0].axis('off')
+    
+    # Heatmap
+    if heatmap is not None:
+        im = axes[0, 1].imshow(heatmap, cmap='inferno', vmin=0, vmax=1)
+        axes[0, 1].set_title(f"History Heatmap (max={heatmap.max():.3f})")
+        axes[0, 1].axis('off')
+        plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+    else:
+        axes[0, 1].text(0.5, 0.5, "No heatmap", ha='center', va='center', fontsize=14)
+        axes[0, 1].axis('off')
+    
+    # Trajectory
+    if trajectory is not None:
+        positions = np.cumsum(trajectory[:, :2], axis=0)
+        axes[1, 0].plot(positions[:, 0], positions[:, 1], 'b-o', markersize=3, linewidth=2)
+        axes[1, 0].scatter([0], [0], c='green', s=150, marker='*', zorder=5, label='Start')
+        axes[1, 0].scatter([positions[-1, 0]], [positions[-1, 1]], c='red', s=150, marker='X', zorder=5, label='End')
+        axes[1, 0].set_title(f"Predicted Trajectory ({len(trajectory)} steps)")
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].set_aspect('equal')
+    else:
+        axes[1, 0].text(0.5, 0.5, "No trajectory", ha='center', va='center', fontsize=14)
+        axes[1, 0].axis('off')
+    
+    # Info panel
+    info_text = f"Instruction: {instruction[:100]}..." if len(instruction) > 100 else f"Instruction: {instruction}"
+    if progress is not None:
+        info_text += f"\n\nProgress: {progress:.2%}"
+    
+    axes[1, 1].text(0.1, 0.7, info_text, fontsize=12, verticalalignment='top',
+                    transform=axes[1, 1].transAxes, wrap=True,
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    axes[1, 1].axis('off')
+    axes[1, 1].set_title("Inference Info")
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved combined visualization to {output_path}")
 
 
 @torch.no_grad()
@@ -241,10 +309,9 @@ def run_inference(
     frames: torch.Tensor,
     instruction: str,
     current_observation: Optional[torch.Tensor] = None,
-    use_history: bool = True,
-    use_future: bool = True,
-    use_actions: bool = True,
-    amp_dtype=None
+    output_heatmap: bool = True,
+    output_trajectory: bool = True,
+    output_progress: bool = True,
 ) -> Dict[str, Any]:
     """Run inference.
 
@@ -253,50 +320,50 @@ def run_inference(
         frames: Input frames [1, T, 3, H, W]
         instruction: Navigation instruction text
         current_observation: Current observation [1, 3, H, W], uses last frame if None
-        use_history: Whether to return history heatmaps
-        use_future: Whether to return future heatmaps
-        use_actions: Whether to return predicted actions
-        amp_dtype: AMP dtype (None, torch.float16, or torch.bfloat16)
+        output_heatmap: Whether to generate heatmap
+        output_trajectory: Whether to generate trajectory
+        output_progress: Whether to predict progress
 
     Returns:
-        Dictionary with heatmaps and actions
+        Dictionary with predictions
     """
     if current_observation is None:
         current_observation = frames[:, -1]
     
-    if amp_dtype is not None:
-        with torch.autocast(device_type='cuda', dtype=amp_dtype):
-            outputs = model(
-                video_frames=frames,
-                instruction_text=instruction,
-                current_observation=current_observation,
-                return_heatmaps=True,
-                return_actions=use_actions,
-            )
-    else:
+    device = next(model.parameters()).device
+    
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         outputs = model(
-            video_frames=frames,
+            video_frames=frames.to(device),
             instruction_text=instruction,
-            current_observation=current_observation,
-            return_heatmaps=True,
-            return_actions=use_actions,
+            current_observation=current_observation.to(device),
+            return_heatmaps=output_heatmap,
+            return_actions=output_trajectory,
         )
 
     results = {}
     
-    if use_history and 'history_heatmaps' in outputs:
-        results['history_heatmaps'] = outputs['history_heatmaps']
+    # Heatmap
+    if output_heatmap and 'history_heatmaps' in outputs:
+        hm = outputs['history_heatmaps'][0, -1].cpu().numpy()
+        results['heatmap'] = np.clip(hm, 0, 1)
+        logger.info(f"Generated heatmap: shape={hm.shape}, max={hm.max():.3f}")
     
-    if use_future and 'future_heatmaps' in outputs:
-        results['future_heatmaps'] = outputs['future_heatmaps']
+    # Trajectory
+    if output_trajectory and hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+        action_cond = outputs.get('action_cond')
+        if action_cond is not None:
+            if action_cond.dim() == 2:
+                action_cond = action_cond.unsqueeze(1)
+            trajectory = model.transformer_action_head.get_trajectory(action_cond)
+            results['trajectory'] = trajectory[0].cpu().numpy()
+            logger.info(f"Generated trajectory: shape={results['trajectory'].shape}")
     
-    if use_actions and 'actions' in outputs:
-        results['actions'] = outputs['actions']
-        logger.info(f"Predicted actions: {outputs['actions'].cpu().numpy()}")
-    
-    if 'stop_prob' in outputs:
-        results['stop_prob'] = outputs['stop_prob']
-        logger.info(f"Stop probability: {outputs['stop_prob'].cpu().numpy()}")
+    # Progress
+    if output_progress and 'progress' in outputs:
+        progress = outputs['progress'][0].item()
+        results['progress'] = progress
+        logger.info(f"Predicted progress: {progress:.2%}")
     
     if 'processing_metadata' in outputs:
         results['metadata'] = outputs['processing_metadata']
@@ -311,20 +378,12 @@ def main():
     parser.add_argument('--clip', type=str, default=None, help='Path to dataset clip directory')
     parser.add_argument('--instruction', type=str, default=None, help='Navigation instruction')
     parser.add_argument('--output-dir', type=str, default='./outputs_inference')
-    parser.add_argument('--use-history', action='store_true', help='Output history heatmaps')
-    parser.add_argument('--use-future', action='store_true', help='Output future heatmaps')
-    parser.add_argument('--use-actions', action='store_true', help='Output predicted actions')
+    parser.add_argument('--output-heatmap', action='store_true', help='Output history heatmap')
+    parser.add_argument('--output-trajectory', action='store_true', help='Output predicted trajectory')
+    parser.add_argument('--output-progress', action='store_true', help='Output progress prediction')
     parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load')
-    parser.add_argument('--amp', type=str, default='bf16', choices=['none', 'fp16', 'bf16'],
-                       help='AMP precision')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
 
     if args.video is None and args.clip is None:
         logger.error("Either --video or --clip must be specified")
@@ -336,11 +395,11 @@ def main():
 
     cfg = yaml.safe_load(open(args.config))
 
-    # Default: output all heads
-    if not args.use_history and not args.use_future and not args.use_actions:
-        args.use_history = True
-        args.use_future = True
-        args.use_actions = True
+    # Default: output all
+    if not args.output_heatmap and not args.output_trajectory and not args.output_progress:
+        args.output_heatmap = True
+        args.output_trajectory = True
+        args.output_progress = True
 
     if not torch.cuda.is_available():
         logger.warning("CUDA not available, using CPU (this will be slow)")
@@ -354,7 +413,7 @@ def main():
     # Load checkpoint (optional)
     if args.checkpoint and Path(args.checkpoint).exists():
         logger.info(f"Loading checkpoint from: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
         if list(state_dict.keys())[0].startswith('module.'):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -373,7 +432,8 @@ def main():
     # Load frames
     data_cfg = cfg['data']
     sw_cfg = data_cfg.get('sliding_window', {})
-    max_frames = sw_cfg.get('num_history_sample', 8) + 1
+    traj_cfg = data_cfg.get('trajectory', {})
+    max_frames = traj_cfg.get('num_history_sample', sw_cfg.get('num_history_sample', 32)) + 1
     target_size = tuple(data_cfg['image_size'])
     
     if args.video:
@@ -391,16 +451,11 @@ def main():
     else:
         logger.info(f"Instruction: '{instruction}'")
     
-    frames = frames.unsqueeze(0).to(args.device)  # [1, T, 3, H, W]
-
-    # AMP dtype
-    amp_dtype = None
-    if args.amp == 'bf16':
-        amp_dtype = torch.bfloat16
-        logger.info("Using BF16 AMP")
-    elif args.amp == 'fp16':
-        amp_dtype = torch.float16
-        logger.info("Using FP16 AMP")
+    # Get current frame for visualization
+    current_frame_np = frames[-1].permute(1, 2, 0).numpy()
+    current_frame_np = np.clip(current_frame_np, 0, 1)
+    
+    frames = frames.unsqueeze(0)  # [1, T, 3, H, W]
 
     # Run inference
     logger.info("=" * 60)
@@ -409,31 +464,50 @@ def main():
     
     results = run_inference(
         model, frames, instruction,
-        use_history=args.use_history,
-        use_future=args.use_future,
-        use_actions=args.use_actions,
-        amp_dtype=amp_dtype
+        output_heatmap=args.output_heatmap,
+        output_trajectory=args.output_trajectory,
+        output_progress=args.output_progress,
     )
 
     # Save results
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if 'history_heatmaps' in results:
-        hm = results['history_heatmaps']
-        logger.info(f"Generated history heatmaps: shape={hm.shape}")
-        visualize_heatmaps(hm, str(out_dir), name, 'history')
+    # Save individual outputs
+    if 'heatmap' in results:
+        visualize_heatmap(results['heatmap'], str(out_dir / f"{name}_heatmap.png"), "History Heatmap")
+        np.save(out_dir / f"{name}_heatmap.npy", results['heatmap'])
 
-    if 'future_heatmaps' in results:
-        hm = results['future_heatmaps']
-        logger.info(f"Generated future heatmaps: shape={hm.shape}")
-        visualize_heatmaps(hm, str(out_dir), name, 'future')
+    if 'trajectory' in results:
+        visualize_trajectory(results['trajectory'], str(out_dir / f"{name}_trajectory.png"), "Predicted Trajectory")
+        np.save(out_dir / f"{name}_trajectory.npy", results['trajectory'])
+        
+        # Also save as readable format
+        with open(out_dir / f"{name}_trajectory.txt", 'w') as f:
+            f.write(f"# Predicted trajectory ({len(results['trajectory'])} steps)\n")
+            f.write("# dx, dy, dyaw\n")
+            for step in results['trajectory']:
+                f.write(f"{step[0]:.6f}, {step[1]:.6f}, {step[2]:.6f}\n")
 
-    if 'actions' in results:
-        actions = results['actions'].cpu().numpy()
-        logger.info(f"Predicted actions shape: {actions.shape}")
-        np.save(out_dir / f"{name}_actions.npy", actions)
-        logger.info(f"Saved actions to {out_dir}/{name}_actions.npy")
+    # Save combined visualization
+    visualize_combined(
+        current_frame_np,
+        results.get('heatmap'),
+        results.get('trajectory'),
+        results.get('progress'),
+        str(out_dir / f"{name}_combined.png"),
+        instruction,
+    )
+
+    # Save summary
+    summary = {
+        'instruction': instruction,
+        'progress': results.get('progress'),
+        'heatmap_max': float(results['heatmap'].max()) if 'heatmap' in results else None,
+        'trajectory_steps': len(results['trajectory']) if 'trajectory' in results else None,
+    }
+    with open(out_dir / f"{name}_summary.yaml", 'w') as f:
+        yaml.dump(summary, f)
 
     logger.info("=" * 60)
     logger.info(f"Inference complete! Results saved to: {out_dir}")
