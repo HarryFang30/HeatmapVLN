@@ -675,101 +675,104 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
 
 
 def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
-    """构建分层学习率优化器"""
+    """构建分层学习率优化器，支持分组 weight_decay"""
     optim_cfg = cfg['optim']
     param_groups = []
     
-    # History Heatmap Head
-    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 3e-4))
-    if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
-        hist_params = [p for p in model.history_heatmap_head.parameters() if p.requires_grad]
-        if hist_params:
-            param_groups.append({
-                'params': hist_params,
-                'lr': hist_lr,
-                'name': 'history_heatmap_head'
+    default_wd = optim_cfg.get('weight_decay', 1e-2)
+    projector_wd = optim_cfg.get('projector_weight_decay', default_wd)
+    
+    def get_param_groups_with_wd(module, lr, name, wd):
+        """分离需要和不需要 weight_decay 的参数"""
+        decay_params = []
+        no_decay_params = []
+        for n, p in module.named_parameters():
+            if not p.requires_grad:
+                continue
+            # bias 和 LayerNorm 不使用 weight_decay
+            if 'bias' in n or 'norm' in n.lower() or 'ln' in n.lower():
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        
+        groups = []
+        if decay_params:
+            groups.append({
+                'params': decay_params,
+                'lr': lr,
+                'weight_decay': wd,
+                'name': f'{name}_decay'
             })
-            print(f"  Param group: history_heatmap_head (lr={hist_lr})")
+        if no_decay_params:
+            groups.append({
+                'params': no_decay_params,
+                'lr': lr,
+                'weight_decay': 0.0,
+                'name': f'{name}_no_decay'
+            })
+        return groups
+    
+    # History Heatmap Head
+    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
+    if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
+        groups = get_param_groups_with_wd(model.history_heatmap_head, hist_lr, 'history_heatmap_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd})")
     
     # Future Heatmap Head
-    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 3e-4))
+    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
     if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
-        fut_params = [p for p in model.future_heatmap_head.parameters() if p.requires_grad]
-        if fut_params:
-            param_groups.append({
-                'params': fut_params,
-                'lr': fut_lr,
-                'name': 'future_heatmap_head'
-            })
-            print(f"  Param group: future_heatmap_head (lr={fut_lr})")
+        groups = get_param_groups_with_wd(model.future_heatmap_head, fut_lr, 'future_heatmap_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: future_heatmap_head (lr={fut_lr}, wd={default_wd})")
     
     # Action Head (Legacy)
-    action_lr = optim_cfg.get('action_lr', 3e-4)
+    action_lr = optim_cfg.get('action_lr', 1e-4)
     if hasattr(model, 'action_head') and model.action_head is not None:
-        action_params = [p for p in model.action_head.parameters() if p.requires_grad]
-        if action_params:
-            param_groups.append({
-                'params': action_params,
-                'lr': action_lr,
-                'name': 'action_head'
-            })
-            print(f"  Param group: action_head (lr={action_lr})")
+        groups = get_param_groups_with_wd(model.action_head, action_lr, 'action_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: action_head (lr={action_lr}, wd={default_wd})")
     
     # Transformer Action Head (New)
     transformer_action_lr = optim_cfg.get('transformer_action_lr', action_lr)
     if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
-        transformer_action_params = [p for p in model.transformer_action_head.parameters() if p.requires_grad]
-        if transformer_action_params:
-            param_groups.append({
-                'params': transformer_action_params,
-                'lr': transformer_action_lr,
-                'name': 'transformer_action_head'
-            })
-            print(f"  Param group: transformer_action_head (lr={transformer_action_lr})")
+        groups = get_param_groups_with_wd(model.transformer_action_head, transformer_action_lr, 'transformer_action_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: transformer_action_head (lr={transformer_action_lr}, wd={default_wd})")
     
     # Stop Head (Legacy)
     stop_lr = optim_cfg.get('stop_lr', action_lr)
     if hasattr(model, 'stop_head') and model.stop_head is not None:
-        stop_params = [p for p in model.stop_head.parameters() if p.requires_grad]
-        if stop_params:
-            param_groups.append({
-                'params': stop_params,
-                'lr': stop_lr,
-                'name': 'stop_head'
-            })
-            print(f"  Param group: stop_head (lr={stop_lr})")
+        groups = get_param_groups_with_wd(model.stop_head, stop_lr, 'stop_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: stop_head (lr={stop_lr}, wd={default_wd})")
     
     # Progress Head (New)
     progress_lr = optim_cfg.get('progress_lr', action_lr)
     if hasattr(model, 'progress_head') and model.progress_head is not None:
-        progress_params = [p for p in model.progress_head.parameters() if p.requires_grad]
-        if progress_params:
-            param_groups.append({
-                'params': progress_params,
-                'lr': progress_lr,
-                'name': 'progress_head'
-            })
-            print(f"  Param group: progress_head (lr={progress_lr})")
+        groups = get_param_groups_with_wd(model.progress_head, progress_lr, 'progress_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: progress_head (lr={progress_lr}, wd={default_wd})")
     
-    # LLM Projector
-    proj_lr = optim_cfg.get('llm_projector_lr', 1e-4)
+    # LLM Projector (使用更小的 weight_decay)
+    proj_lr = optim_cfg.get('llm_projector_lr', 3e-5)
     if hasattr(model, 'llm_projector'):
-        proj_params = [p for p in model.llm_projector.parameters() if p.requires_grad]
-        if proj_params:
-            param_groups.append({
-                'params': proj_params,
-                'lr': proj_lr,
-                'name': 'llm_projector'
-            })
-            print(f"  Param group: llm_projector (lr={proj_lr})")
+        groups = get_param_groups_with_wd(model.llm_projector, proj_lr, 'llm_projector', projector_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: llm_projector (lr={proj_lr}, wd={projector_wd})")
     
     if not param_groups:
         raise ValueError("No trainable parameters found!")
     
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        weight_decay=optim_cfg['weight_decay']
-    )
+    # 创建优化器（不在这里设置 weight_decay，因为已经在参数组中设置）
+    optimizer = torch.optim.AdamW(param_groups)
     
     return optimizer
 

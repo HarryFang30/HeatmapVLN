@@ -155,14 +155,19 @@ training:
 optim:
   optimizer: adamw
 
-  # 分组学习率 (降低以防止过拟合)
+  # 分组学习率
   heatmap_lr: 1.0e-4
   history_heatmap_lr: 1.0e-4
   future_heatmap_lr: 1.0e-4
   action_lr: 1.0e-4
-  llm_projector_lr: 3.0e-5
+  transformer_action_lr: 1.0e-4   # 显式配置 Transformer Action Head
+  progress_lr: 1.0e-4              # 显式配置 Progress Head
+  llm_projector_lr: 3.0e-5         # Projector 使用较低 LR
 
-  weight_decay: 1.0e-2  # 增加正则化
+  # 正则化
+  weight_decay: 1.0e-2             # 主模块 weight decay
+  projector_weight_decay: 1.0e-3   # Projector 使用更小的 weight decay
+  
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
