@@ -861,11 +861,17 @@ def train_one_epoch(
         if max_batches is not None and i >= max_batches:
             break
         
-        # 准备数据
-        history_frames = batch['history_frames']
-        current_frame = batch['current_frame']
-        
-        B, K, C, H, W = history_frames.shape
+        # 准备数据 - Packing 模式和传统模式的 batch 结构不同
+        if packing_enabled:
+            # Packing 模式: batch 来自 FlattenedCollatorForVLN
+            # 没有 history_frames，直接使用 packed batch
+            B = batch['num_samples']
+            current_frame = batch['current_frame']
+        else:
+            # 传统模式: batch 来自普通 collate_fn
+            history_frames = batch['history_frames']
+            current_frame = batch['current_frame']
+            B, K, C, H, W = history_frames.shape
         
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
@@ -1200,9 +1206,14 @@ def validate(
     device = torch.device(cfg['model'].get('device', 'cuda'))
     
     for batch in tqdm(val_loader, desc="Validating"):
-        history_frames = batch['history_frames']
-        current_frame = batch['current_frame']
-        B, K, C, H, W = history_frames.shape
+        # Packing 模式和传统模式的 batch 结构不同
+        if packing_enabled:
+            B = batch['num_samples']
+            current_frame = batch['current_frame']
+        else:
+            history_frames = batch['history_frames']
+            current_frame = batch['current_frame']
+            B, K, C, H, W = history_frames.shape
         
         gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
