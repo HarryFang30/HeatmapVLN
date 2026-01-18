@@ -51,6 +51,7 @@ warnings.filterwarnings("ignore")
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
 from src.data.packing_collator import PackingCollatorForVLN
+from src.data.tokenized_dataset import TokenizedVLNDataset, FlattenedCollatorForVLN
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.loss import (
     NavigationHeatmapLoss,
@@ -1724,24 +1725,32 @@ def main():
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
     
     if packing_enabled:
-        # Packing 模式：需要在 collate 中进行 tokenization
+        # Packing 模式：符合官方实现
+        # Tokenization 在 Dataset.__getitem__() 中完成，可以利用 num_workers 并行
+        logger.info("📦 Sequence Packing enabled (official implementation)")
+        
         # 必须先加载模型以获取 processor
-        logger.info("📦 Sequence Packing enabled - loading model for processor...")
         if not model.qwen3_vl._model_loaded:
             model.qwen3_vl._load_model()
         
-        # 创建 Packing Collator
-        packing_collator = PackingCollatorForVLN(
+        # 包装数据集，在 __getitem__ 中做 tokenization
+        spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
+        train_dataset = TokenizedVLNDataset(
+            base_dataset=train_dataset,
             processor=model.qwen3_vl.processor,
-            spatial_merge_size=cfg['model']['llm'].get('spatial_merge_size', 2),
-            max_seq_length=cfg['model']['llm'].get('max_seq_length', 8192),
+            spatial_merge_size=spatial_merge_size,
         )
-        actual_collate_fn = packing_collator
+        val_dataset = TokenizedVLNDataset(
+            base_dataset=val_dataset,
+            processor=model.qwen3_vl.processor,
+            spatial_merge_size=spatial_merge_size,
+        )
         
-        # Packing 模式强制 num_workers=0（tokenization 在主进程）
-        # 这避免了在 worker 中复制 processor 的开销
-        num_workers = 0
-        logger.info("   Packing mode: num_workers forced to 0 (tokenization in main process)")
+        # 使用官方的 FlattenedCollator（只做拼接，不做 tokenization）
+        actual_collate_fn = FlattenedCollatorForVLN()
+        
+        logger.info("   Tokenization in Dataset.__getitem__() - can use num_workers")
+        logger.info(f"   num_workers: {num_workers}")
     else:
         actual_collate_fn = collate_fn
     

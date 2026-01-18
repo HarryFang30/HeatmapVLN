@@ -62,10 +62,9 @@ model:
     max_video_frames: -1       # -1 表示不限制帧数，使用全部历史帧
     
     # Sequence Packing 配置（基于 Qwen3-VL 官方 fine-tuning 框架）
-    # 将多个样本打包成一个长序列，使用 flash_attn_varlen_func 处理
-    # 注意：当前实现在 collate 阶段做 tokenization，会成为 CPU 瓶颈
-    # 建议：先禁用 packing，使用传统批量处理
-    enable_packing: false      # 暂时禁用（CPU tokenization 是瓶颈）
+    # 符合官方实现：tokenization 在 Dataset.__getitem__() 中完成
+    # 可以利用 num_workers 并行预处理
+    enable_packing: true       # 启用 sequence packing（官方实现）
     max_seq_length: 8192       # 打包后的最大序列长度
     spatial_merge_size: 2      # 视觉空间合并大小
 
