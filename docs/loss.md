@@ -145,43 +145,48 @@ $$L_{trajectory} = \mathbb{E}_{t, \epsilon} \left[ ||\epsilon - \epsilon_\theta(
 - **输出**: 1维标量 [0, 1]，表示导航进度
 - **GT分布**: 均匀分布，但边界点 (0 和 1) 是关键决策点
 
-### 4.2 采用的 Loss: 边界加权 MSE
+### 4.2 采用的 Loss: 简单 MSE (对齐 InternNav)
 
 ```python
-# 基础 MSE
-mse_loss = F.mse_loss(progress, targets, reduction='none')
-
-# 边界增强权重
-# target=0 或 1 时权重=2，target=0.5 时权重=1
-boundary_weight = 1.0 + 2.0 * torch.abs(targets - 0.5)
-
-# 加权 Loss
-loss = (mse_loss * boundary_weight).mean()
+# 简单 MSE，无加权
+loss = F.mse_loss(progress, targets)
 ```
 
 **公式**:
-$$L_{progress} = \frac{1}{N} \sum_{i} w_i \cdot (p_i - \hat{p}_i)^2$$
+$$L_{progress} = \frac{1}{N} \sum_{i} (p_i - \hat{p}_i)^2$$
 
-其中权重:
-$$w_i = 1.0 + 2.0 \cdot |p_i - 0.5|$$
+### 4.3 网络结构 (对齐 InternNav DistanceNetwork)
 
-### 4.3 权重分布
-
-| GT Progress | 权重 | 说明 |
-|-------------|------|------|
-| 0.0 (开始) | 2.0 | 最高权重 |
-| 0.25 | 1.5 | 中等权重 |
-| 0.5 (中间) | 1.0 | 最低权重 |
-| 0.75 | 1.5 | 中等权重 |
-| 1.0 (结束) | 2.0 | 最高权重 |
+```python
+# 简单 3 层 MLP
+nn.Sequential(
+    nn.Linear(input_dim, input_dim // 4),
+    nn.ReLU(),
+    nn.Linear(input_dim // 4, input_dim // 16),
+    nn.ReLU(),
+    nn.Linear(input_dim // 16, 1),
+    nn.Sigmoid(),
+)
+```
 
 ### 4.4 设计理由
 
 | 选择 | 理由 |
 |------|------|
-| MSE | 连续回归任务，MSE 是自然选择 |
-| 边界加权 | 开始/结束是关键决策点，需要更高精度 |
-| 权重范围 [1,2] | 温和的加权，不过度扭曲分布 |
+| 简单 MSE | 对齐 InternNav，progress 均匀分布无需加权 |
+| 3 层 MLP | InternNav 验证过的简单有效结构 |
+| ReLU | 简单激活函数，避免过拟合 |
+| 无 LayerNorm/Dropout | 简单回归任务不需要复杂正则化 |
+
+### 4.5 为什么不用边界加权
+
+之前使用 `boundary_weight = 1 + 2 * |target - 0.5|` 导致 loss 不收敛。
+
+**原因分析**：
+- Progress 是均匀分布的 (0 → 1)
+- 边界加权让 0 和 1 附近样本权重翻倍
+- 导致训练在边界和中间之间"拉扯"，无法稳定收敛
+- InternNav 验证了简单 MSE 足够有效
 
 ---
 

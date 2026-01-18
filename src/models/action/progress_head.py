@@ -9,7 +9,9 @@ Progress Prediction Head for VLN Navigation
 2. 提供更丰富的监督信号（不只是 0/1）
 3. 可以预测中间状态（如 "快到了" = 0.8）
 
-参考 InternNav 的 pg_pred_mlp (progress prediction)
+对齐 InternNav 的 DistanceNetwork 实现：
+- 简单 3 层 MLP + ReLU + Sigmoid
+- 简单 MSE loss，无加权
 
 Architecture:
     LLM Features (B, seq_len, D) -> Pooling -> MLP -> Progress (0-1)
@@ -26,47 +28,39 @@ logger = logging.getLogger(__name__)
 
 class ProgressPredictionHead(nn.Module):
     """
-    Progress Prediction Head.
+    Progress Prediction Head (InternNav DistanceNetwork style).
     
     预测任务完成进度 (0-1)，替代二分类的 Stop 预测。
     
     进度定义：
         progress = 当前步数 / 总步数
-        或
-        progress = 1 - 到目标的距离 / 初始距离
     
     Args:
         input_dim: Input dimension from LLM features
-        hidden_dim: Hidden layer dimension
-        token_dim: Internal token dimension (参考 InternNav)
-        dropout: Dropout rate
+        hidden_dim: Hidden layer dimension (unused, kept for compatibility)
+        token_dim: Internal token dimension (unused, kept for compatibility)
+        dropout: Dropout rate (unused, kept for compatibility)
     """
     
     def __init__(
         self,
         input_dim: int = 1024,
-        hidden_dim: int = 512,
-        token_dim: int = 384,
-        dropout: float = 0.1,
+        hidden_dim: int = 512,  # 保持接口兼容，但不使用
+        token_dim: int = 384,   # 保持接口兼容，但不使用
+        dropout: float = 0.1,   # 保持接口兼容，但不使用
     ):
         super().__init__()
         
         self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
         
-        # 参考 InternNav 的 pg_pred_mlp 结构
+        # 对齐 InternNav 的 DistanceNetwork 结构
+        # 简单 3 层 MLP: input -> input/4 -> input/16 -> 1
         self.progress_mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 4, 1),
+            nn.Linear(input_dim, input_dim // 4),
+            nn.ReLU(),
+            nn.Linear(input_dim // 4, input_dim // 16),
+            nn.ReLU(),
+            nn.Linear(input_dim // 16, 1),
             nn.Sigmoid(),  # 输出 0-1
         )
         
@@ -74,8 +68,8 @@ class ProgressPredictionHead(nn.Module):
         self._init_weights()
         
         logger.info(
-            f"ProgressPredictionHead initialized: input_dim={input_dim}, "
-            f"hidden_dim={hidden_dim}"
+            f"ProgressPredictionHead initialized (InternNav style): "
+            f"input_dim={input_dim}, structure={input_dim}->{input_dim//4}->{input_dim//16}->1"
         )
     
     def _init_weights(self):
@@ -152,11 +146,10 @@ class ProgressPredictionHead(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute progress loss.
+        Compute progress loss (InternNav style).
         
-        使用 MSE loss + 边界增强。
-        边界增强：对接近 0 或 1 的样本给予更高权重，
-        因为这些是关键决策点（开始和停止）。
+        使用简单 MSE loss，对齐 InternNav 实现。
+        不使用边界加权，因为 progress 是均匀分布的。
         
         Args:
             progress: (B,) predicted progress
@@ -169,26 +162,16 @@ class ProgressPredictionHead(nn.Module):
         device = progress.device
         targets = targets.float().to(device)
         
-        # 基础 MSE loss
-        mse_loss = F.mse_loss(progress, targets, reduction='none')
-        
-        # 边界增强权重：接近 0 或 1 的样本权重更高
-        # weight = 1 + 2 * |target - 0.5|  => 范围 [1, 2]
-        # 即 target=0 或 1 时权重=2，target=0.5 时权重=1
-        boundary_weight = 1.0 + 2.0 * torch.abs(targets - 0.5)
-        
-        # 加权 loss
-        weighted_loss = mse_loss * boundary_weight
-        
-        # Apply mask if provided
+        # 简单 MSE loss，对齐 InternNav
         if mask is not None:
             mask = mask.float().to(device)
             if mask.sum() > 0:
-                loss = (weighted_loss * mask).sum() / mask.sum()
+                mse_loss = F.mse_loss(progress, targets, reduction='none')
+                loss = (mse_loss * mask).sum() / mask.sum()
             else:
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
         else:
-            loss = weighted_loss.mean()
+            loss = F.mse_loss(progress, targets)
         
         return loss
     
