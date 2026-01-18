@@ -183,9 +183,9 @@ optim:
   optimizer: adamw
 
   # 分组学习率
-  heatmap_lr: 8.0e-5               # 适中的学习率
-  history_heatmap_lr: 8.0e-5       # 适中的学习率
-  future_heatmap_lr: 8.0e-5        # 适中的学习率
+  heatmap_lr: 4.0e-5               # 8e-5 → 4e-5 (20M参数UNet需要更低LR)
+  history_heatmap_lr: 4.0e-5       # 8e-5 → 4e-5
+  future_heatmap_lr: 4.0e-5        # 8e-5 → 4e-5
   action_lr: 5.0e-5                # 保持
   transformer_action_lr: 5.0e-5    # 保持
   progress_lr: 5.0e-5              # 保持
@@ -230,7 +230,7 @@ loss:
   future_weight: 1.0
   action_weight: 1.0        # Legacy action head
   trajectory_weight: 1.0    # Transformer action head (24 step trajectory)
-  progress_weight: 0.5      # Progress prediction head
+  progress_weight: 1.0      # 0.5 → 1.0 (与其他头相同权重)
   stop_weight: 0.5          # Legacy stop head (disabled)
 
 # ============================================
