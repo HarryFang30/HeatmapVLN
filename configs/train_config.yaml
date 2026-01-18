@@ -33,7 +33,7 @@ data:
   # 轨迹数据集配置（参考 InternNav）
   trajectory:
     min_history: 5
-    num_history_sample: 96       # 限制历史帧为一半 (平均167帧)
+    num_history_sample: 32       # 减少历史帧数量以加速（32帧足够）
     load_depth: true
     cache_poses: true
     sample_stride: 5
@@ -63,8 +63,9 @@ model:
     
     # Sequence Packing 配置（基于 Qwen3-VL 官方 fine-tuning 框架）
     # 将多个样本打包成一个长序列，使用 flash_attn_varlen_func 处理
-    # 显著提高显存利用率，减少 padding 浪费
-    enable_packing: true       # 启用 sequence packing
+    # 注意：当前实现在 collate 阶段做 tokenization，会成为 CPU 瓶颈
+    # 建议：先禁用 packing，使用传统批量处理
+    enable_packing: false      # 暂时禁用（CPU tokenization 是瓶颈）
     max_seq_length: 8192       # 打包后的最大序列长度
     spatial_merge_size: 2      # 视觉空间合并大小
 
@@ -168,12 +169,10 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.1
   
-  # 批量配置（真正批量处理已启用）
-  # 现在 Qwen3-VL 使用 sequence packing 批量处理
-  # batch_size 增加会增加显存使用（期望行为）
-  # RTX 5090 32GB - 激进配置，目标 ~85% 显存利用率
-  # 有效批量: 7 * 4 = 28
-  batch_size: 7
+  # 批量配置
+  # RTX 5090 32GB - 使用传统批量处理
+  # 有效批量: 4 * 4 = 16
+  batch_size: 4
   grad_accum_steps: 4
 
 # ============================================
