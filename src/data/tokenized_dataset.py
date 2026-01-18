@@ -16,6 +16,10 @@ Tokenization 在 Dataset.__getitem__() 中完成，可以利用 num_workers 并�
         → 计算 cumsum_seq_lens
 """
 
+import warnings
+# 抑制 Qwen-VL 的 fps 警告（我们使用 nframes 而不是 fps 采样）
+warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
+
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Any, Optional, Tuple, Union

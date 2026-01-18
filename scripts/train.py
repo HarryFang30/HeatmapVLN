@@ -48,6 +48,9 @@ import matplotlib.pyplot as plt
 import cv2
 
 warnings.filterwarnings("ignore")
+# 特别抑制 Qwen-VL 的 fps 警告（我们使用 nframes 而不是 fps 采样）
+warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
+warnings.filterwarnings("ignore", message="Asked to sample")
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
 from src.data.packing_collator import PackingCollatorForVLN
@@ -1847,6 +1850,13 @@ def main():
     # spawn 创建全新进程，避免这个问题
     mp_context = 'spawn' if num_workers > 0 else None
     
+    def worker_init_fn(worker_id):
+        """Worker 进程初始化函数 - 抑制警告"""
+        import warnings
+        warnings.filterwarnings("ignore")
+        warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
+        warnings.filterwarnings("ignore", message="Asked to sample")
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg['optim']['batch_size'],
@@ -1858,6 +1868,7 @@ def main():
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
     )
     
     val_loader = DataLoader(
@@ -1870,6 +1881,7 @@ def main():
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
     )
     
     # 设置可训练模块
