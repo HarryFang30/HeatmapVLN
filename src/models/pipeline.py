@@ -295,8 +295,9 @@ class VLNPipeline(nn.Module):
                 input_dim=config.llm_token_dim,
                 hidden_dim=config.progress_hidden_dim,
                 dropout=0.1,
+                concat_state_txt=True,  # 对齐 InternNav: state + text_embed 拼接
             ).to(device=self.device, dtype=config.dtype)
-            logger.info(f"✓ Progress Head initialized")
+            logger.info(f"✓ Progress Head initialized (InternNav concat_state_txt mode)")
         else:
             self.progress_head = None
         

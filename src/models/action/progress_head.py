@@ -4,17 +4,21 @@ Progress Prediction Head for VLN Navigation
 替代二分类的 Stop 预测，使用连续值 (0-1) 表示任务完成进度。
 当进度接近 1 时，表示应该停止。
 
-这种方法的优势：
-1. 连续值更容易学习（MSE loss vs Binary CE）
-2. 提供更丰富的监督信号（不只是 0/1）
-3. 可以预测中间状态（如 "快到了" = 0.8）
-
 对齐 InternNav 的 DistanceNetwork 实现：
+- 使用 state + text_embed 拼接 (concat_state_txt 模式)
 - 简单 3 层 MLP + ReLU + Sigmoid
-- 简单 MSE loss，无加权
+- 简单 MSE loss
+
+InternNav 参考代码 (rdp_policy.py:651-656):
+```python
+if self.model_config.progress_monitor.concat_state_txt:
+    progress_pred = self.progress_monitor(
+        torch.cat([state.squeeze(1), fused_update_txt_embeds[:, 0, :]], dim=1)
+    )
+```
 
 Architecture:
-    LLM Features (B, seq_len, D) -> Pooling -> MLP -> Progress (0-1)
+    LLM Features (B, seq_len, D) -> [mean_pool, first_token] -> concat -> MLP -> Progress (0-1)
 """
 
 import logging
@@ -28,18 +32,22 @@ logger = logging.getLogger(__name__)
 
 class ProgressPredictionHead(nn.Module):
     """
-    Progress Prediction Head (InternNav DistanceNetwork style).
+    Progress Prediction Head (InternNav DistanceNetwork style with concat_state_txt).
     
     预测任务完成进度 (0-1)，替代二分类的 Stop 预测。
     
-    进度定义：
-        progress = 当前步数 / 总步数
+    对齐 InternNav 的关键设计：
+    1. 使用 state + text_embed 拼接 (input_dim * 2)
+    2. 3 层 MLP + ReLU + Sigmoid
+    3. 简单 MSE loss
+    
+    在我们的架构中：
+    - state = LLM 的 mean pooling (全局信息)
+    - text_embed = LLM 的第一个 token (通常包含指令信息)
     
     Args:
-        input_dim: Input dimension from LLM features
-        hidden_dim: Hidden layer dimension (unused, kept for compatibility)
-        token_dim: Internal token dimension (unused, kept for compatibility)
-        dropout: Dropout rate (unused, kept for compatibility)
+        input_dim: Input dimension from LLM features (single feature)
+        concat_state_txt: 是否使用 state + text 拼接模式 (default: True, 对齐 InternNav)
     """
     
     def __init__(
@@ -48,19 +56,26 @@ class ProgressPredictionHead(nn.Module):
         hidden_dim: int = 512,  # 保持接口兼容，但不使用
         token_dim: int = 384,   # 保持接口兼容，但不使用
         dropout: float = 0.1,   # 保持接口兼容，但不使用
+        concat_state_txt: bool = True,  # 对齐 InternNav
     ):
         super().__init__()
         
         self.input_dim = input_dim
+        self.concat_state_txt = concat_state_txt
+        
+        # 对齐 InternNav: 如果 concat_state_txt，input_dim 翻倍
+        # state (mean pooling) + text_embed (first token) 拼接
+        mlp_input_dim = input_dim * 2 if concat_state_txt else input_dim
         
         # 对齐 InternNav 的 DistanceNetwork 结构
         # 简单 3 层 MLP: input -> input/4 -> input/16 -> 1
+        # 注意：这里的 input 是拼接后的维度
         self.progress_mlp = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 4),
+            nn.Linear(mlp_input_dim, mlp_input_dim // 4),
             nn.ReLU(),
-            nn.Linear(input_dim // 4, input_dim // 16),
+            nn.Linear(mlp_input_dim // 4, mlp_input_dim // 16),
             nn.ReLU(),
-            nn.Linear(input_dim // 16, 1),
+            nn.Linear(mlp_input_dim // 16, 1),
             nn.Sigmoid(),  # 输出 0-1
         )
         
@@ -69,7 +84,9 @@ class ProgressPredictionHead(nn.Module):
         
         logger.info(
             f"ProgressPredictionHead initialized (InternNav style): "
-            f"input_dim={input_dim}, structure={input_dim}->{input_dim//4}->{input_dim//16}->1"
+            f"input_dim={input_dim}, concat_state_txt={concat_state_txt}, "
+            f"mlp_input_dim={mlp_input_dim}, "
+            f"structure={mlp_input_dim}->{mlp_input_dim//4}->{mlp_input_dim//16}->1"
         )
     
     def _init_weights(self):
@@ -79,6 +96,36 @@ class ProgressPredictionHead(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+    
+    def _pool_features(self, llm_features: torch.Tensor) -> torch.Tensor:
+        """
+        Pool LLM features to fixed-size representation.
+        
+        对齐 InternNav 的 concat_state_txt 模式：
+        - state = mean pooling (全局信息)
+        - text_embed = first token (指令信息)
+        
+        Args:
+            llm_features: (B, seq_len, D) or (B, D) LLM output features
+            
+        Returns:
+            (B, D) or (B, 2*D) pooled features
+        """
+        if llm_features.dim() == 2:
+            # 已经是 (B, D)，无法拼接
+            return llm_features
+        
+        # (B, seq_len, D)
+        if self.concat_state_txt:
+            # 对齐 InternNav: state + text_embed 拼接
+            state = llm_features.mean(dim=1)  # (B, D) - 全局信息
+            text_embed = llm_features[:, 0, :]  # (B, D) - 第一个 token (指令)
+            pooled = torch.cat([state, text_embed], dim=-1)  # (B, 2*D)
+        else:
+            # 简单 mean pooling
+            pooled = llm_features.mean(dim=1)  # (B, D)
+        
+        return pooled
     
     def forward(
         self,
@@ -102,13 +149,10 @@ class ProgressPredictionHead(nn.Module):
             Else:
                 (B,) progress values
         """
-        # Pool if needed: (B, seq_len, D) -> (B, D)
-        if llm_features.dim() == 3:
-            pooled = llm_features.mean(dim=1)
-        else:
-            pooled = llm_features
+        # Pool features (对齐 InternNav concat_state_txt)
+        pooled = self._pool_features(llm_features)
         
-        # Predict progress: (B, D) -> (B, 1) -> (B,)
+        # Predict progress: (B, 2*D) -> (B, 1) -> (B,)
         progress = self.progress_mlp(pooled).squeeze(-1)
         
         if gt_progress is not None and return_loss:
@@ -149,7 +193,6 @@ class ProgressPredictionHead(nn.Module):
         Compute progress loss (InternNav style).
         
         使用简单 MSE loss，对齐 InternNav 实现。
-        不使用边界加权，因为 progress 是均匀分布的。
         
         Args:
             progress: (B,) predicted progress
@@ -214,6 +257,7 @@ def create_progress_head(
     input_dim: int = 1024,
     hidden_dim: int = 512,
     dropout: float = 0.1,
+    concat_state_txt: bool = True,
     device: str = "cuda",
 ) -> ProgressPredictionHead:
     """Factory function to create ProgressPredictionHead"""
@@ -222,6 +266,7 @@ def create_progress_head(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         dropout=dropout,
+        concat_state_txt=concat_state_txt,
     )
     
     model = model.to(device)

@@ -140,11 +140,12 @@ model:
       p_drop_attn: 0.2           # Attention dropout (0.1 → 0.2 防过拟合)
       causal_attn: true          # 使用因果注意力
 
-  # Progress 预测头配置（替代 Stop Head）
+  # Progress 预测头配置（替代 Stop Head，对齐 InternNav）
   progress_head:
     enable: true
     hidden_dim: 512
     dropout: 0.3                 # 0.1 → 0.3 (最简单的头，增加最多 dropout)
+    concat_state_txt: true       # 对齐 InternNav: state + text_embed 拼接
 
   # Stop 预测头配置（已弃用，使用 progress_head 替代）
   stop_head:
