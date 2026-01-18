@@ -471,11 +471,27 @@ model:
 
 ---
 
-## 动作预测模块（DiffusionActionHead）
+## 动作预测模块
 
-动作预测模块使用 **条件扩散模型** 从 LLM 特征中生成导航动作（2D 连续位移）。
+动作预测模块提供多种动作生成方式，包括基于扩散模型的连续动作生成和离散动作分类。
 
-### 架构概览
+### 模块概览
+
+| 组件 | 类型 | 输出 | 说明 |
+|------|------|------|------|
+| `DiffusionActionHead` | 连续动作 | (dx, dy) | 基于 1D U-Net 扩散模型，生成 2D 位移 |
+| `TransformerActionHead` | 连续轨迹 | (x, y, θ) × T | 基于 Transformer Decoder 扩散模型，生成多步轨迹 |
+| `StopPredictionHead` | 二分类 | STOP/继续 | 独立的停止动作预测器 |
+| `ProgressPredictionHead` | 回归 | 0-1 | 任务完成进度预测，替代 STOP 分类 |
+| `DiscreteActionHead` | 多分类 | 4 类 | STOP/FORWARD/LEFT/RIGHT 离散动作 |
+
+---
+
+### DiffusionActionHead（2D 连续动作）
+
+使用 **条件扩散模型** 从 LLM 特征中生成导航动作（2D 连续位移）。
+
+#### 架构概览
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -490,8 +506,8 @@ model:
 │         ▼                                                                   │
 │  ┌─────────────┐                                                            │
 │  │  Mean Pool  │  ← ConditionProjector                                     │
-│  │  [B, 2048]  │    Pool + Linear + LayerNorm + GELU + Linear              │
-│  └──────┬──────┘                                                            │
+│  │  [B, 2048]  │    Pool + Linear + LayerNorm + GELU + Dropout             │
+│  └──────┬──────┘    + Linear + LayerNorm + Dropout                          │
 │         │                                                                   │
 │         ▼                                                                   │
 │  ┌─────────────┐                                                            │
@@ -503,8 +519,8 @@ model:
 │                               │                                             │
 │                               ▼                                             │
 │                        ┌─────────────┐                                      │
-│                        │Conditional  │                                      │
-│         ┌─────────────▶│   Unet1D    │  ← 1D 卷积 U-Net                     │
+│                        │Conditional  │  ← ConditionalResidualBlock1D        │
+│         ┌─────────────▶│   Unet1D    │    FiLM 条件调制                     │
 │         │              │(噪声预测)  │    down_dims=[128,256]               │
 │         │              └──────┬──────┘                                      │
 │         │                     │                                             │
@@ -518,15 +534,14 @@ model:
 │                   迭代去噪              │                                   │
 │                                         ▼                                   │
 │                                  ┌─────────────┐                            │
-│                                  │  Actions    │                            │
-│                                  │  [B,1,2]    │                            │
-│                                  │ (归一化后)  │                            │
+│                                  │  Actions    │  加权 MSE Loss             │
+│                                  │  [B,1,2]    │  + 方差约束                │
 │                                  └──────┬──────┘                            │
 │                                         │                                   │
 │                                         ▼                                   │
 │                                  ┌─────────────┐                            │
 │                                  │Unnormalize  │                            │
-│                                  │& Postprocess│                            │
+│                                  │& Cumsum     │                            │
 │                                  └──────┬──────┘                            │
 │                                         │                                   │
 │                                         ▼                                   │
@@ -538,38 +553,63 @@ model:
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 模块组件
+#### 条件投影器（ConditionProjector）
 
-#### 1. 条件投影器（ConditionProjector）
+将 LLM 特征投影为扩散模型的条件向量，增加 Dropout 正则化：
 
-将 LLM 特征投影为扩散模型的条件向量：
+```python
+class ConditionProjector(nn.Module):
+    def __init__(self, input_dim=2048, output_dim=256, dropout=0.2):
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),      # 第一层 Dropout
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.Dropout(dropout),      # 第二层 Dropout
+        )
+```
 
-| 组件 | 输入 | 输出 | 说明 |
-|------|------|------|------|
-| `Mean Pool` | [B, seq, 2048] | [B, 2048] | 时序维度平均池化 |
-| `Projection` | [B, 2048] | [B, 256] | Linear → LayerNorm → GELU → Linear |
+#### 噪声预测网络（ConditionalUnet1D）
 
-**架构简化**：相比 Heatmap Head，Action Head 使用更小的 encoding_size（256 vs 512），因为 2D 动作维度低，不需要过大的条件空间。
+基于 1D U-Net 的条件去噪网络，使用 FiLM 调制：
 
-#### 2. 噪声预测网络（ConditionalUnet1D）
+```
+架构：
+  Encoder: [ConditionalResidualBlock1D × 2] × N levels
+  Middle:  ConditionalResidualBlock1D × 2
+  Decoder: [ConditionalResidualBlock1D × 2 + Skip Connection] × N levels
+  Output:  Conv1dBlock → Conv1d
 
-基于 1D U-Net 的条件去噪网络，专门处理低维时序数据：
+FiLM 调制:
+  cond = SinusoidalPosEmb(timestep) + global_cond
+  if cond_predict_scale:
+      out = scale * out + bias  # scale, bias from MLP(cond)
+  else:
+      out = out + bias          # bias only
+```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `input_dim` | 2 | 输入维度（dx, dy） |
-| `global_cond_dim` | 256 | 条件向量维度 |
+| `global_cond_dim` | 256 | 全局条件维度 |
 | `down_dims` | [128, 256] | U-Net 通道数（简化架构） |
+| `diffusion_step_embed_dim` | 256 | 时间步嵌入维度 |
 | `kernel_size` | 3 | 1D 卷积核大小 |
 | `n_groups` | 8 | GroupNorm 分组数 |
+| `dropout` | 0.1 | Dropout 正则化 |
 
-**1D vs 2D**：Action 使用 1D 卷积处理序列数据 [B, pred_horizon, action_dim]，比 2D 卷积更高效。
+#### 动作归一化（ActionStats）
 
-#### 3. 动作归一化（ActionStats）
-
-为确保扩散模型训练稳定，动作被归一化到 [-1, 1] 范围：
+动作被归一化到 [-1, 1] 范围：
 
 ```python
+@dataclass
+class ActionStats:
+    min: List[float] = [-0.5, -0.2]  # 允许后退和左转
+    max: List[float] = [0.5, 1.0]    # 允许前进和右转
+
 # 归一化公式
 normalized = (action - min_val) / (max_val - min_val) * 2.0 - 1.0
 
@@ -577,51 +617,34 @@ normalized = (action - min_val) / (max_val - min_val) * 2.0 - 1.0
 action = (normalized + 1.0) / 2.0 * (max_val - min_val) + min_val
 ```
 
-**默认统计值**（来自数据集统计）：
-- `action_stats_min`: [-0.5, -0.2]（允许后退和左转）
-- `action_stats_max`: [0.5, 1.0]（允许前进和右转）
+#### 训练与推理
 
-#### 4. 扩散调度器（DDPMScheduler）
+**训练模式（加权 MSE + 方差约束）**：
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `num_train_timesteps` | 100 | 训练扩散步数 |
-| `num_diffusion_iters` | 10 | 推理采样步数 |
-| `beta_schedule` | `squaredcos_cap_v2` | 余弦噪声调度 |
-| `prediction_type` | `epsilon` | 预测噪声（非直接预测动作） |
-
-### 数据流
-
-```
-条件流: LLM Tokens [B,seq,2048] → Mean Pool → Projection → [B,256]
-                                                              ↓
-生成流: 随机噪声 [B,pred_horizon,2] → ConditionalUnet1D + 条件 → 迭代去噪
-                                                              ↓
-后处理: 归一化动作 [-1,1] → Unnormalize → 实际动作 (dx,dy)
-```
-
-### 训练与推理
-
-**训练模式**：
 ```python
-# 归一化 GT 动作到 [-1, 1]
+# 1. 归一化 GT 动作到 [-1, 1]
 normalized_gt = normalize_actions(gt_actions, action_stats)
 
-# 前向扩散：给 GT 动作加噪
+# 2. 前向扩散：给 GT 动作加噪
 noisy_actions = scheduler.add_noise(normalized_gt, noise, timesteps)
 
-# 预测噪声
+# 3. 预测噪声
 noise_pred = unet(noisy_actions, timesteps, global_cond)
 
-# 计算 Loss（带 action_valid mask）
-per_sample_loss = F.mse_loss(noise_pred, noise, reduction='none')
-if action_valid is not None:
-    loss = (per_sample_loss * action_valid).sum() / action_valid.sum()
-else:
-    loss = per_sample_loss.mean()
+# 4. 加权 MSE Loss：非零动作权重更高
+# 问题：95.5% 的转向动作是 0，模型学会"输出 0"就能获得极低 Loss
+# 解决：增加非零动作的权重
+action_magnitude = normalized_gt.abs()
+weight = 1.0 + 9.0 * action_magnitude.clamp(0, 1)  # [1, 10]
+diffusion_loss = (weight * (noise_pred - noise).pow(2)).mean()
+
+# 5. 方差约束：防止输出全零
+variance_loss = F.relu(0.1 - pred_actions.std())
+loss = diffusion_loss + 0.3 * variance_loss
 ```
 
 **推理模式**：
+
 ```python
 # 从纯噪声开始
 noisy_actions = torch.randn(B, pred_horizon, action_dim)
@@ -631,26 +654,228 @@ for t in scheduler.timesteps:
     noise_pred = unet(noisy_actions, t, global_cond)
     noisy_actions = scheduler.step(noise_pred, t, noisy_actions).prev_sample
 
-# 反归一化得到实际动作
+# 反归一化 + 累积求和得到位置
 actions = unnormalize_actions(noisy_actions, action_stats)
+positions = torch.cumsum(actions, dim=1)  # delta → position
 ```
 
-**训练优化**：训练时 pipeline 跳过 action 推理，只返回条件向量 `action_cond`，由 `train.py` 外部计算 diffusion loss，避免冗余的 10 步扩散采样。
+---
 
-### Action Valid Mask
+### TransformerActionHead（多步轨迹生成）
 
-数据集中最后一帧的 `action_valid=0`（因为没有下一帧），训练时使用 mask 过滤这些样本：
+参考 **InternNav** 实现，使用 Transformer Decoder + Diffusion Policy 生成多步导航轨迹。
+
+#### 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TransformerActionHead 架构                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐                                                            │
+│  │ LLM Tokens  │                                                            │
+│  │[B,seq,1024] │  ← vlm_token_dim (可配置)                                  │
+│  └──────┬──────┘                                                            │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐    ┌─────────────┐                                        │
+│  │ Mean Pool   │    │ Time Embed  │                                        │
+│  │  [B,1,1024] │    │ [B,1,384]   │  ← SinusoidalPosEmb                    │
+│  └──────┬──────┘    └──────┬──────┘                                        │
+│         │                  │                                                │
+│         ▼                  │                                                │
+│  ┌─────────────┐           │                                                │
+│  │ cond_obs_emb│           │                                                │
+│  │  [B,1,384]  │ ──────────┼────────────────────────────┐                  │
+│  └──────┬──────┘           │                            │                  │
+│         │                  │                            │                  │
+│         └────────┬─────────┘                            │                  │
+│                  ▼                                      │                  │
+│           ┌─────────────┐                               │                  │
+│           │   Concat    │                               │                  │
+│           │ [B,2,384]   │ ← T_cond = 1 + n_obs_steps   │                  │
+│           └──────┬──────┘                               │                  │
+│                  │                                      │                  │
+│                  ▼                                      │                  │
+│           ┌─────────────┐                               │                  │
+│           │ Transformer │ ← n_cond_layers=4            │                  │
+│           │  Encoder    │   条件编码器                  │                  │
+│           └──────┬──────┘                               │                  │
+│                  │                                      │                  │
+│                  │   memory                             │                  │
+│                  ▼                                      ▼                  │
+│           ┌─────────────┐                        ┌─────────────┐           │
+│           │ Transformer │◀───────────────────────│Noisy Action │           │
+│           │  Decoder    │  cross-attention       │[B,24,3]     │           │
+│           │ n_layer=16  │  + causal mask         │(x,y,θ)×T    │           │
+│           └──────┬──────┘                        └─────────────┘           │
+│                  │                                      ▲                  │
+│                  ▼                                      │                  │
+│           ┌─────────────┐                               │                  │
+│           │  Output MLP │                               │                  │
+│           │ [B,24,3]    │  ← noise_pred                │                  │
+│           └──────┬──────┘                               │                  │
+│                  │                                      │                  │
+│                  └──────────────────────────────────────┘                  │
+│                           DDPM 迭代去噪                                     │
+│                                                                             │
+│                                  ▼                                          │
+│                           ┌─────────────┐                                   │
+│                           │ Trajectory  │                                   │
+│                           │ [B,24,3]    │  ← (x, y, theta) × 24 steps      │
+│                           └─────────────┘                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键特性
+
+| 特性 | 说明 |
+|------|------|
+| **完整权重初始化** | 参考 InternNav `_init_weights`，正态分布初始化 |
+| **条件编码器** | TransformerEncoder 预处理条件（n_cond_layers=4） |
+| **因果掩码** | `tgt_mask` + `memory_mask` 确保因果性 |
+| **位置嵌入** | 正态分布初始化的可学习嵌入 |
+| **多步预测** | predict_size=24 步轨迹 |
+
+#### 配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `vlm_token_dim` | 1024 | VLM 输出维度 |
+| `n_emb` | 384 | 内部嵌入维度 |
+| `predict_size` | 24 | 预测步数 |
+| `n_layer` | 16 | Decoder 层数 |
+| `n_head` | 8 | 注意力头数 |
+| `n_cond_layers` | 4 | Encoder 层数 |
+| `action_dim` | 3 | 动作维度 (x, y, θ) |
+| `num_train_timesteps` | 20 | 扩散训练步数 |
+
+---
+
+### StopPredictionHead（停止动作预测）
+
+独立的二分类器，判断是否应该执行 STOP 动作。使用 **混合 Loss** 处理极度类别不平衡（STOP 样本仅 3%）。
+
+#### 架构
 
 ```python
-# Dataset 返回
-action_valid = 1.0 if current_t < T - 1 else 0.0
-
-# 训练时应用 mask
-if action_valid.sum() > 0:
-    loss = (per_sample_loss * action_valid).sum() / action_valid.sum()
-else:
-    loss = 0.0  # 无有效样本
+class StopPredictionHead(nn.Module):
+    def __init__(self, input_dim=2048, hidden_dim=512, dropout=0.1):
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),  # Binary output
+        )
 ```
+
+#### 混合 Loss（BCE + Focal）
+
+```python
+# 问题：纯 Focal Loss 在极度不平衡时过度压低梯度
+# 解决：混合 Loss = 0.3 * BCE + 0.7 * Focal
+
+# 1. 类别权重：STOP 类权重 10x
+pos_weight = torch.tensor([10.0])
+bce_loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+# 2. Focal Loss（限制 gamma）
+gamma = min(self.focal_gamma, 2.0)  # 限制最大 gamma=2
+focal_weight = (1 - p_t) ** gamma
+focal_loss = alpha_weight * focal_weight * bce_loss
+
+# 3. 混合
+loss = 0.3 * bce_loss + 0.7 * focal_loss
+```
+
+---
+
+### ProgressPredictionHead（任务进度预测）
+
+替代二分类的 STOP 预测，使用连续值 (0-1) 表示任务完成进度。参考 **InternNav** 的 `pg_pred_mlp`。
+
+#### 优势
+
+| 对比项 | StopPredictionHead | ProgressPredictionHead |
+|--------|-------------------|------------------------|
+| 输出类型 | 二分类 (0/1) | 连续值 (0-1) |
+| 损失函数 | Focal + BCE | MSE + 边界增强 |
+| 监督信号 | 只有终点有信号 | 每步都有进度信号 |
+| 中间状态 | 无法表达 | 可表达（如 0.8 = "快到了"） |
+
+#### 架构
+
+```python
+class ProgressPredictionHead(nn.Module):
+    def __init__(self, input_dim=1024, hidden_dim=512, dropout=0.1):
+        self.progress_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Sigmoid(),  # 输出 0-1
+        )
+```
+
+#### 边界增强 Loss
+
+```python
+# 对接近 0 或 1 的样本给予更高权重（开始和停止是关键决策点）
+boundary_weight = 1.0 + 2.0 * torch.abs(targets - 0.5)  # [1, 2]
+loss = (mse_loss * boundary_weight).mean()
+```
+
+#### 使用
+
+```python
+progress_head = ProgressPredictionHead(input_dim=2048)
+
+# 训练
+loss = progress_head(llm_features, gt_progress=gt_progress, return_loss=True)['loss']
+
+# 推理
+progress = progress_head.get_progress(llm_features)  # (B,) in [0, 1]
+should_stop = progress_head.predict_stop(llm_features, threshold=0.9)  # (B,) binary
+```
+
+---
+
+### DiscreteActionHead（离散动作分类）
+
+可选的全离散动作分类器，预测 {STOP, FORWARD, LEFT, RIGHT}。
+
+```python
+class DiscreteActionHead(nn.Module):
+    ACTION_NAMES = ['STOP', 'FORWARD', 'LEFT', 'RIGHT']
+    
+    def __init__(self, input_dim=2048, hidden_dim=512, num_actions=4):
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_actions),
+        )
+```
+
+---
 
 ### 配置参数
 
@@ -663,49 +888,36 @@ model:
     action_dim: 2                   # 2D 动作 (dx, dy)
     pred_horizon: 1                 # 预测步数
     num_diffusion_iters: 10         # 扩散步数
-    encoding_size: 256              # 条件维度（简化架构）
+    encoding_size: 256              # 条件维度
     down_dims: [128, 256]           # U-Net 通道数
     action_stats_min: [-0.5, -0.2]  # 归一化最小值
     action_stats_max: [0.5, 1.0]    # 归一化最大值
 
+  stop_head:
+    enable: true                    # 启用 Stop 预测
+    hidden_dim: 512
+    focal_gamma: 2.0
+    focal_alpha: 0.75
+
 loss:
-  action_weight: 0.5                # 动作损失权重
-```
-
-### Stop 预测头（StopPredictionHead）
-
-Stop 预测是一个独立的二分类器，判断是否应该执行 STOP 动作：
-
-**架构**：
-```
-LLM Tokens [B,seq,2048] → Mean Pool → MLP [2048→512→1] → Sigmoid → Stop Prob
-```
-
-**训练**：使用 Focal Loss 处理类别不平衡（STOP 样本稀少）：
-```python
-focal_loss = -alpha * (1 - pt)^gamma * log(pt)
-
-# 默认参数
-gamma = 2.0  # 越大越关注困难样本
-alpha = 0.75 # STOP 类权重（因为极不平衡）
-```
-
-**数据来源**：
-```python
-# Dataset 从 discrete_actions 中提取
-discrete_action = discrete_actions[current_t]  # 0=STOP, 1=FORWARD, 2=LEFT, 3=RIGHT
-is_stop = 1.0 if discrete_action == 0 else 0.0
+  action_weight: 1.0                # 动作损失权重
+  stop_weight: 0.5                  # Stop 损失权重
 ```
 
 ### 源代码位置
 
 | 文件 | 说明 |
 |------|------|
-| `src/models/action/diffusion_action_head.py` | 主模块：`DiffusionActionHead` |
-| `src/models/action/action_config.py` | 配置：`DiffusionActionConfig` |
-| `src/models/action/diffusion/unet1d.py` | 噪声预测：`ConditionalUnet1D` |
-| `src/models/action/utils.py` | 工具：`normalize_actions`, `ActionStats` |
-| `src/models/action/stop_head.py` | Stop 预测：`StopPredictionHead` |
+| `src/models/action/__init__.py` | 模块导出 |
+| `src/models/action/diffusion_action_head.py` | `DiffusionActionHead`, `ConditionProjector` |
+| `src/models/action/transformer_action_head.py` | `TransformerActionHead` (InternNav 风格) |
+| `src/models/action/stop_head.py` | `StopPredictionHead`, `DiscreteActionHead` |
+| `src/models/action/progress_head.py` | `ProgressPredictionHead` |
+| `src/models/action/action_config.py` | `DiffusionActionConfig` |
+| `src/models/action/utils.py` | `ActionStats`, `normalize_actions`, `unnormalize_actions` |
+| `src/models/action/diffusion/conditional_unet1d.py` | `ConditionalUnet1D`, `ConditionalResidualBlock1D` |
+| `src/models/action/diffusion/conv1d_components.py` | `Conv1dBlock`, `Downsample1d`, `Upsample1d` |
+| `src/models/action/diffusion/positional_embedding.py` | `SinusoidalPosEmb` |
 
 ---
 
