@@ -76,6 +76,12 @@ class VLNPipelineConfig:
     heatmap_use_circular_padding: bool = False  # 360° panorama: circular padding for horizontal edges
     heatmap_dropout: float = 0.1  # Dropout rate for heatmap head
     
+    # Heatmap UNet architecture (controls model capacity)
+    heatmap_block_out_channels: Tuple[int, ...] = (64, 128, 256)  # UNet channel dims per level
+    heatmap_layers_per_block: int = 2  # ResBlocks per level
+    heatmap_attention_levels: Tuple[int, ...] = (2,)  # Which levels have attention
+    heatmap_num_train_timesteps: int = 100  # Diffusion training steps
+    
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
     # 'transformer': TransformerActionHead (InternNav style)
@@ -183,6 +189,11 @@ class VLNPipeline(nn.Module):
             use_circular_padding=config.heatmap_use_circular_padding,
             # Regularization
             dropout=config.heatmap_dropout,
+            # UNet architecture (model capacity)
+            block_out_channels=config.heatmap_block_out_channels,
+            layers_per_block=config.heatmap_layers_per_block,
+            attention_levels=config.heatmap_attention_levels,
+            num_train_timesteps=config.heatmap_num_train_timesteps,
         )
         
         # History Heatmap Head

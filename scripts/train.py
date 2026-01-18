@@ -498,6 +498,11 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
         # Regularization
         heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
+        # UNet architecture (model capacity) - ~20M params with [128, 256, 512, 512]
+        heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
+        heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
+        heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
+        heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
         
         # Action Head Type
         action_head_type=action_head_type,

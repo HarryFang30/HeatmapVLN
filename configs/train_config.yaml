@@ -72,17 +72,32 @@ model:
   heatmap_head:
     enable_history: true
     enable_future: false  # 禁用 future head 以节省内存
-    cond_dim: 512
-    num_inference_steps: 10
+    
+    # 条件编码维度 (512 → 1024，更好地编码空间信息)
+    cond_dim: 1024
+    
+    # UNet 架构配置 (~20M 参数，适合 64×64 条件热力图生成)
+    block_out_channels: [128, 256, 512, 512]  # 4 层，更大容量
+    layers_per_block: 2
+    attention_levels: [2, 3]                   # 在 512 层加 attention
+    
+    # Diffusion 配置
+    num_inference_steps: 30                    # 10 → 30，更精细的去噪
+    num_train_timesteps: 100
+    
+    # 正则化
     dropout: 0.2                   # 默认0.1 → 0.2 (防过拟合)
+    
     # 360° 全景图支持：水平方向循环填充，处理左右边界连续性
     use_circular_padding: true
+    
     # CNN 消融实验开关：设为 false 禁用 ImageConditionEncoder，只用 LLM 特征
     use_image_encoder: false
+    
     # LLM token pooling 方式：'attention' (推荐) 或 'mean', 'first', 'last', 'max'
     # attention pooling 更好地保留空间信息，比 mean pooling 效果更好
     pool_method: attention
-    pool_num_heads: 4
+    pool_num_heads: 8              # 4 → 8，配合更大的 cond_dim
 
   # 动作头配置
   action_head:
