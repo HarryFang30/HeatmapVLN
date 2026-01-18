@@ -1019,23 +1019,13 @@ def train_one_epoch(
             log_interval = cfg['log'].get('log_interval', 10)
             if global_step % log_interval == 0 or global_step <= 3:
                 mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
-                # 选择合适的 loss 标签
-                if trajectory_loss.item() > 0:
-                    act_label, act_val = "traj", trajectory_loss.item()
-                else:
-                    act_label, act_val = "act", action_loss.item()
-                if progress_loss.item() > 0:
-                    stop_label, stop_val = "prog", progress_loss.item()
-                else:
-                    stop_label, stop_val = "stop", stop_loss.item()
-                
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}, {act_label}: {act_val:.4f}, {stop_label}: {stop_val:.4f}) | "
+                    f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e} | "
                     f"GPU: {mem_alloc:.1f}GB"
                 )
@@ -1044,9 +1034,8 @@ def train_one_epoch(
                 actual_step = global_step_offset + global_step
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
-                # 🔧 修复：记录实际使用的损失（trajectory/progress 或 action/stop）
-                tb_writer.add_scalar('train/action_loss', action_total_loss.item(), actual_step)
-                tb_writer.add_scalar('train/stop_loss', stop_total_loss.item(), actual_step)
+                tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
+                tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
                 tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
                 
                 # 🔧 修复：优先使用 trajectory_valid（trajectory 数据集），否则使用 action_valid
@@ -1148,9 +1137,8 @@ def train_one_epoch(
         pbar.set_postfix({
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
             'hm': f"{heatmap_loss.item():.4f}",
-            # 🔧 修复：显示实际使用的损失（traj/prog 或 act/stop）
-            'act': f"{action_total_loss.item():.4f}",
-            'stop': f"{stop_total_loss.item():.4f}",
+            'traj': f"{action_total_loss.item():.4f}",
+            'prog': f"{stop_total_loss.item():.4f}",
         })
     
     # 处理剩余梯度
@@ -1932,11 +1920,11 @@ def main():
         
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f}, act: {train_metrics['action_loss']:.4f})"
+            f"(hm: {train_metrics['heatmap_loss']:.4f}, traj: {train_metrics['action_loss']:.4f}, prog: {train_metrics.get('stop_loss', 0):.4f})"
         )
         logger.info(
             f"  Val Loss: {val_metrics['val_loss']:.4f} "
-            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, act: {val_metrics['val_action_loss']:.4f})"
+            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, traj: {val_metrics['val_action_loss']:.4f}, prog: {val_metrics.get('val_stop_loss', 0):.4f})"
         )
         
         eta = timer.get_eta(epoch, total_epochs)
@@ -1976,14 +1964,14 @@ def main():
                 'val': val_metrics['val_heatmap_loss'],
             }, global_epoch_counter)
             
-            # 动作损失对比
-            tb_writer.add_scalars('loss/action', {
+            # 轨迹损失对比
+            tb_writer.add_scalars('loss/trajectory', {
                 'train': train_metrics['action_loss'],
                 'val': val_metrics['val_action_loss'],
             }, global_epoch_counter)
             
-            # 停止损失对比
-            tb_writer.add_scalars('loss/stop', {
+            # 进度损失对比
+            tb_writer.add_scalars('loss/progress', {
                 'train': train_metrics.get('stop_loss', 0),
                 'val': val_metrics.get('val_stop_loss', 0),
             }, global_epoch_counter)
