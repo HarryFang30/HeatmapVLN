@@ -20,7 +20,7 @@ data:
   
   sliding_window:
     min_history: 5
-    num_history_sample: -1       # -1 表示使用全部历史帧（不采样）
+    num_history_sample: 32       # 历史帧采样数量（与 trajectory 配置保持一致）
     load_depth: true
     cache_poses: true
     sample_stride: 5

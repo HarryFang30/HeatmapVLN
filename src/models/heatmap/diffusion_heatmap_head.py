@@ -247,7 +247,7 @@ class DiffusionHeatmapHead(nn.Module):
         peak_loss = torch.tensor(0.0, device=device)
         variance_loss = torch.tensor(0.0, device=device)
 
-        # 每20步计算一次峰值保持损失（优化训练效率，原为每3步）
+        # 每 _peak_loss_interval 步计算一次峰值保持损失（默认5步，可通过配置调整）
         compute_peak_loss = (self._training_step_counter % self._peak_loss_interval == 0)
 
         if compute_peak_loss or not skip_inference:

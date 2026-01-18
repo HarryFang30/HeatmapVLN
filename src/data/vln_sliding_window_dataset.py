@@ -1336,8 +1336,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         future_poses = poses[current_t:]
         
         if len(future_poses) < 2:
-            # 没有足够的未来帧，返回零轨迹
-            return np.zeros((self.predict_horizon, 3), dtype=np.float32), 0.0, progress
+            # 最后一帧或没有足够的未来帧 - 返回零轨迹（静止/STOP）
+            # 注意：对于 STOP 帧，零轨迹是有意义的（表示静止不动）
+            # 因此标记为有效 (trajectory_valid=1.0)，让模型学习 "停止时输出零轨迹"
+            return np.zeros((self.predict_horizon, 3), dtype=np.float32), 1.0, progress
         
         # 转换为 numpy 数组
         future_poses_np = np.array(future_poses, dtype=np.float32)

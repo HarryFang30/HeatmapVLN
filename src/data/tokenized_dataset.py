@@ -324,9 +324,10 @@ class FlattenedCollatorForVLN:
             "text": [inst['text'] for inst in instances],
         }
         
-        # 轨迹数据（如果有）
-        if instances[0].get('trajectory') is not None:
-            batch['trajectory'] = torch.stack([inst['trajectory'] for inst in instances], dim=0)
+        # 轨迹数据（如果有）- 健壮性检查：确保所有样本都有轨迹
+        trajectories = [inst.get('trajectory') for inst in instances]
+        if all(t is not None for t in trajectories):
+            batch['trajectory'] = torch.stack(trajectories, dim=0)
             batch['trajectory_valid'] = torch.tensor([inst.get('trajectory_valid', 0.0) for inst in instances])
             batch['progress'] = torch.tensor([inst.get('progress', 0.0) for inst in instances])
         

@@ -1211,7 +1211,9 @@ HeatmapVLN/
         diffusion/                            # 扩散网络细节/组件
 
       qwen3_vl/                               # Qwen3-VL 集成模块
+        __init__.py                           # 模块导出和 PACKING_AVAILABLE 检查
         integration.py                        # Qwen3VLIntegration（视觉语言特征提取）
+        sequence_packing.py                   # Sequence Packing 高效批量训练
 
     utils/
       loss.py                                 # 损失函数（SimplifiedHeatmapLoss 等）
