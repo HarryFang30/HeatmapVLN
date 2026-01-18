@@ -567,6 +567,242 @@ is_stop = 1.0 if discrete_action == 0 else 0.0
 
 ---
 
+## Qwen3-VL 集成模块
+
+本项目使用 **Qwen3-VL** 作为视觉语言骨干网络，替代传统的 VGGT + DINOv3 组合。该模块封装了 Qwen3-VL 的加载、推理和特征提取功能。
+
+### 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Qwen3-VL Integration 架构                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                     │
+│  │ History     │    │  Current    │    │ Instruction │                     │
+│  │ Video Frames│    │  Frame      │    │   Text      │                     │
+│  │[B,K,C,H,W]  │    │[B,C,H,W]    │    │   string    │                     │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                     │
+│         │                  │                  │                            │
+│         └──────────────────┴──────────────────┘                            │
+│                            │                                               │
+│                            ▼                                               │
+│                    ┌───────────────┐                                       │
+│                    │  Qwen3-VL     │  ← Flash Attention 2                  │
+│                    │  Processor    │    (apply_chat_template)              │
+│                    └───────┬───────┘                                       │
+│                            │                                               │
+│                            ▼                                               │
+│                    ┌───────────────┐                                       │
+│                    │  Qwen3-VL     │  ← 参数冻结 (不训练)                   │
+│                    │  Model        │    output_hidden_states=True          │
+│                    └───────┬───────┘                                       │
+│                            │                                               │
+│            ┌───────────────┼───────────────┐                               │
+│            ▼               ▼               ▼                               │
+│     ┌─────────────┐ ┌─────────────┐ ┌─────────────┐                       │
+│     │Hidden States│ │ Vision      │ │ Generated   │                       │
+│     │[B,seq,2048] │ │ Hidden      │ │ Text        │                       │
+│     └──────┬──────┘ │[B,V,2048]   │ │ (optional)  │                       │
+│            │        └──────┬──────┘ └─────────────┘                       │
+│            │               │                                               │
+│            └───────┬───────┘                                               │
+│                    │                                                       │
+│                    ▼                                                       │
+│            ┌─────────────────────────────────────┐                         │
+│            │         Downstream Heads            │                         │
+│            ├─────────────┬───────────┬───────────┤                         │
+│            │ Heatmap     │  Action   │   Stop    │                         │
+│            │   Head      │   Head    │   Head    │                         │
+│            └─────────────┴───────────┴───────────┘                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 核心组件
+
+#### 1. Qwen3VLConfig（配置类）
+
+```python
+@dataclass
+class Qwen3VLConfig:
+    model_path: str = "./models/qwen_3_vl"      # 模型路径
+    device: str = "cuda"                         # 设备
+    torch_dtype: str = "bfloat16"               # 数据类型
+    attn_implementation: str = "flash_attention_2"  # 推荐使用 FA2
+    max_video_frames: int = 16                   # 最大视频帧数
+    hidden_layer_for_features: int = -1          # 提取哪一层 hidden states
+    
+    # Sequence Packing 设置
+    enable_packing: bool = False                 # 是否启用 Sequence Packing
+    max_seq_length: int = 4096                   # 最大打包序列长度
+    spatial_merge_size: int = 2                  # 视觉空间合并大小
+```
+
+#### 2. Qwen3VLIntegration（主集成类）
+
+| 方法 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `forward()` | history_frames, current_frame, instruction | hidden_states, vision_hidden_states | 标准批量推理 |
+| `forward_packed()` | packed_batch | hidden_states, vision_hidden_states, seq_lens | Sequence Packing 推理 |
+| `get_data_collator()` | - | FlattenedDataCollatorForVLN | 获取 Packing 专用 Collator |
+| `enable_sequence_packing()` | - | bool | 启用 varlen attention |
+
+**关键特性**：
+- **参数冻结**：Qwen3-VL 所有参数冻结，不参与训练
+- **批量处理**：支持 left padding 的真正批量推理
+- **梯度流动**：虽然参数冻结，但保留计算图以便梯度回传到下游模块
+
+#### 3. Sequence Packing（高效批量训练）
+
+基于 Qwen3-VL 官方 fine-tuning 框架实现，显著提高显存利用率。
+
+**传统 Padding vs Sequence Packing**：
+
+```
+传统 Padding（浪费显存）：
+┌──────────────────────────────────────────────┐
+│ [样本A, PAD, PAD, PAD, PAD, PAD, PAD, PAD]   │  ← 50% 是 PAD
+│ [样本B, PAD, PAD, PAD, PAD, PAD, PAD, PAD]   │  ← 50% 是 PAD
+│ [样本C, PAD, PAD, PAD, PAD, PAD, PAD, PAD]   │  ← 50% 是 PAD
+└──────────────────────────────────────────────┘
+
+Sequence Packing（最大化利用）：
+┌──────────────────────────────────────────────┐
+│ [样本A, 样本B, 样本C, 样本D, 样本E, ...]     │  ← 无 PAD
+└──────────────────────────────────────────────┘
+  ↑      ↑      ↑
+  cumsum_seq_lens = [0, len_A, len_A+len_B, ...]
+```
+
+**核心技术**：
+
+| 技术 | 说明 |
+|------|------|
+| **Bin Packing** | 将多个变长样本打包到固定长度序列 |
+| **Flattened Attention Mask** | 使用 cumulative sequence lengths 代替 2D mask |
+| **flash_attn_varlen_func** | 高效处理变长序列的 FlashAttention |
+| **3D RoPE Position IDs** | 正确处理视觉和文本的位置编码 |
+
+#### 4. FlattenedDataCollatorForVLN
+
+专门为 VLN 任务设计的 Data Collator：
+
+```python
+@dataclass
+class FlattenedDataCollatorForVLN:
+    tokenizer: Any
+    
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        """
+        输入：每个 instance 包含 input_ids, position_ids, pixel_values, ...
+        输出：packed batch，包含：
+            - input_ids: (1, total_seq_len)
+            - attention_mask: cumsum_seq_lens, shape (num_samples + 1,)
+            - position_ids: (3, 1, total_seq_len) for M-RoPE
+            - seq_lens: List[int]，用于拆分 hidden states
+        """
+```
+
+### 使用示例
+
+#### 基本推理
+
+```python
+from src.models.qwen3_vl import Qwen3VLIntegration, Qwen3VLConfig
+
+# 初始化
+config = Qwen3VLConfig(model_path="./models/qwen_3_vl")
+qwen_vl = Qwen3VLIntegration(config)
+
+# 准备输入
+history_frames = torch.randn(2, 8, 3, 224, 224)  # [B, K, C, H, W]
+current_frame = torch.randn(2, 3, 224, 224)      # [B, C, H, W]
+instruction = "Walk forward and turn left at the door."
+
+# 推理
+outputs = qwen_vl(history_frames, current_frame, instruction)
+hidden_states = outputs["hidden_states"]          # [B, seq_len, 2048]
+vision_hidden = outputs["vision_hidden_states"]   # [B, V, 2048]
+```
+
+#### Sequence Packing 模式
+
+```python
+from src.models.qwen3_vl import Qwen3VLIntegration, Qwen3VLConfig
+
+# 启用 packing
+config = Qwen3VLConfig(
+    model_path="./models/qwen_3_vl",
+    enable_packing=True,
+    max_seq_length=4096,
+)
+qwen_vl = Qwen3VLIntegration(config)
+
+# 获取 collator
+collator = qwen_vl.get_data_collator()
+
+# 准备样本（每个样本独立 tokenize）
+samples = [preprocess_sample(s) for s in batch]
+packed_batch = collator(samples)
+
+# Packed 推理
+outputs = qwen_vl.forward_packed(packed_batch)
+sample_hidden = outputs["hidden_states"]       # [num_samples, hidden_dim]
+vision_hidden = outputs["vision_hidden_states"]  # [num_samples, max_V, hidden_dim]
+```
+
+### 辅助函数
+
+| 函数 | 说明 |
+|------|------|
+| `split_packed_hidden_states()` | 将 packed hidden states 拆分为各样本表示（支持 last/mean/first pooling） |
+| `split_packed_vision_hidden_states()` | 提取各样本的视觉 token hidden states |
+| `get_rope_index_3()` | 计算 Qwen3-VL 的 3D RoPE position IDs |
+| `replace_attention_with_varlen()` | 替换 attention forward 以支持 varlen FlashAttention |
+
+### 配置参数
+
+在 `configs/train_config.yaml` 中：
+
+```yaml
+model:
+  llm:
+    model_path: ./models/qwen_3_vl        # Qwen3-VL 模型路径
+    device: cuda
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2  # 推荐使用 FA2
+    max_video_frames: 16                    # 最大视频帧数（-1 表示不限制）
+    hidden_layer_for_features: -1           # -1 = 最后一层
+    
+    # Sequence Packing（可选，高效训练）
+    enable_packing: false                   # 是否启用
+    max_seq_length: 4096                    # 最大打包序列长度
+```
+
+### 源代码位置
+
+| 文件 | 说明 |
+|------|------|
+| `src/models/qwen3_vl/__init__.py` | 模块导出，PACKING_AVAILABLE 检查 |
+| `src/models/qwen3_vl/integration.py` | 主模块：`Qwen3VLIntegration`, `Qwen3VLConfig` |
+| `src/models/qwen3_vl/sequence_packing.py` | Packing 支持：`FlattenedDataCollatorForVLN`, `PackedSequenceProcessor` |
+
+### 依赖要求
+
+```bash
+# 必需
+pip install transformers>=4.45.0
+pip install torch>=2.0
+
+# 推荐（性能优化）
+pip install flash-attn --no-build-isolation  # FlashAttention 2
+```
+
+> **注意**：如果未安装 `flash-attn`，Sequence Packing 的 varlen attention 将不可用，但基本功能仍可正常使用。
+
+---
+
 ## 数据集准备
 
 ### 数据集结构
