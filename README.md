@@ -174,20 +174,24 @@ train_loader.dataset.set_epoch(epoch)
 │         │                  │                                                │
 │         ▼                  ▼                                                │
 │  ┌─────────────┐    ┌─────────────┐                                         │
-│  │  Mean Pool  │    │ CNN Encoder │  ← ImageConditionEncoder                │
-│  └──────┬──────┘    │ (轻量级)    │    [32,64,128,256] 通道                 │
+│  │ Attention   │    │ CNN Encoder │  ← ImageConditionEncoder (可选)         │
+│  │  Pooling    │    │ (GroupNorm) │    use_image_encoder=True/False         │
+│  │ (可学习Q)   │    │[32,64,128,  │                                         │
+│  └──────┬──────┘    │   256]通道  │                                         │
 │         │           └──────┬──────┘                                         │
 │         ▼                  │                                                │
 │  ┌─────────────┐           │                                                │
-│  │   Linear    │           │                                                │
-│  │ Projection  │           │                                                │
-│  └──────┬──────┘           │                                                │
-│         │                  │                                                │
+│  │LLMCondition │           │    ┌─────────────────────────────────┐         │
+│  │ Projector   │           │    │ LLM-only 模式 (推荐)            │         │
+│  │ +Dropout    │           │    │ use_image_encoder=False         │         │
+│  └──────┬──────┘           │    │ 只使用 LLM 特征，无 CNN 编码    │         │
+│         │                  │    └─────────────────────────────────┘         │
 │         └───────┬──────────┘                                                │
 │                 ▼                                                           │
 │          ┌─────────────┐                                                    │
 │          │ Concat + MLP│  ← MultiModalConditionEncoder                      │
-│          │  (融合层)   │    输出 [B, cond_dim]                              │
+│          │  (融合层)   │    LLM+Image 或 LLM-only                           │
+│          │  +Dropout   │    输出 [B, cond_dim]                              │
 │          └──────┬──────┘                                                    │
 │                 │                                                           │
 │     ┌───────────┴───────────┐                                               │
@@ -196,7 +200,7 @@ train_loader.dataset.set_epoch(epoch)
 │ ┌────────┐           ┌─────────────┐                                        │
 │ │条件向量│──────────▶│ConditionalU │                                        │
 │ │[B,512] │  global   │   Net2D     │  ← FiLM 条件调制                       │
-│ └────────┘   cond    │ (噪声预测)  │                                        │
+│ └────────┘   cond    │ (噪声预测)  │    Sinusoidal Timestep Embedding       │
 │                      └──────┬──────┘                                        │
 │                             │                                               │
 │                 ┌───────────┴───────────┐                                   │
@@ -209,8 +213,8 @@ train_loader.dataset.set_epoch(epoch)
 │                                         │                                   │
 │                                         ▼                                   │
 │                                  ┌─────────────┐                            │
-│                                  │  Heatmap    │                            │
-│                                  │ [B,Hm,Wm]   │                            │
+│                                  │  Heatmap    │  对数空间归一化            │
+│                                  │ [B,Hm,Wm]   │  → [0, 1]                  │
 │                                  └─────────────┘                            │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -220,25 +224,72 @@ train_loader.dataset.set_epoch(epoch)
 
 #### 1. 条件编码器（MultiModalConditionEncoder）
 
-负责融合文本和视觉信息：
+负责融合文本和视觉信息，支持两种模式：
+
+**LLM + Image 模式**（`use_image_encoder=True`）：
 
 | 组件 | 输入 | 输出 | 说明 |
 |------|------|------|------|
-| `LLMConditionProjector` | [B, seq, 2048] | [B, cond_dim] | Mean Pool → Linear → LayerNorm → GELU → Linear |
+| `LLMConditionProjector` | [B, seq, 2048] | [B, cond_dim] | AttentionPool → Linear → Dropout → LayerNorm → GELU → Linear |
 | `ImageConditionEncoder` | [B, 3, H, W] | [B, cond_dim] | 轻量级 CNN (Stem + 3 Stages + GAP + Projection) |
-| `Fusion MLP` | [B, cond_dim×2] | [B, cond_dim] | Concat → Linear → LayerNorm → GELU → Linear |
+| `Fusion MLP` | [B, cond_dim×2] | [B, cond_dim] | Concat → Linear → Dropout → LayerNorm → GELU → Linear |
 
-**ImageConditionEncoder 架构**:
+**LLM-only 模式**（`use_image_encoder=False`，推荐）：
+
+| 组件 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `LLMConditionProjector` | [B, seq, 2048] | [B, cond_dim] | AttentionPool → Linear → Dropout → LayerNorm → GELU → Linear |
+| `Fusion MLP` | [B, cond_dim] | [B, cond_dim] | Linear → Dropout → LayerNorm → GELU → Linear |
+
+> **消融实验结论**：LLM-only 模式效果更好（Val Loss 下降 12.5%），因为 Qwen3-VL 已经处理了当前帧，CNN 重复编码反而增加过拟合风险。
+
+#### 2. Attention Pooling（序列聚合）
+
+使用可学习的 query 向量通过 attention 机制聚合 LLM 序列特征：
+
 ```python
-Stem:     Conv 7×7 stride 2 → BatchNorm → ReLU → MaxPool
+class AttentionPooling(nn.Module):
+    """
+    比 mean pooling 更好地保留空间和语义信息
+    
+    Args:
+        dim: 特征维度 (2048)
+        num_heads: 注意力头数 (默认 4)
+    """
+    # 可学习的 query 向量
+    self.query = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+    
+    # 多头注意力聚合
+    # query: (B, 1, dim) 与 key/value: (B, seq_len, dim) 计算 attention
+    # 输出: (B, dim) 聚合后的特征
+```
+
+**池化方法选项**：
+| 方法 | 说明 | 推荐场景 |
+|------|------|---------|
+| `attention` | 可学习 query + 多头注意力（默认） | 最佳效果，推荐使用 |
+| `mean` | 平均池化 | 简单场景 |
+| `last` | 取最后一个 token | 自回归模型 |
+| `first` | 取第一个 token | CLS token 场景 |
+| `max` | 最大池化 | 快速实验 |
+
+#### 3. ImageConditionEncoder（观测图像编码器）
+
+轻量级 CNN 编码器，使用 **GroupNorm** 替代 BatchNorm 以提高小 batch 稳定性：
+
+```python
+# 架构（使用 GroupNorm）
+Stem:     Conv 7×7 stride 2 → GroupNorm → ReLU → MaxPool
 Stage 1:  ConvBlock(32→64, stride=2) + ResidualBlock(64)
 Stage 2:  ConvBlock(64→128, stride=2) + ResidualBlock(128)
 Stage 3:  ConvBlock(128→256, stride=2) + ResidualBlock(256)
 Pool:     Global Average Pooling → [B, 256]
-Project:  Linear(256, cond_dim) → LayerNorm → GELU → Linear
+Project:  Linear(256, cond_dim) → Dropout → LayerNorm → GELU → Linear → Dropout
 ```
 
-#### 2. 噪声预测网络（ConditionalUnet2D）
+**参数量**：约 2.3M（可通过 `use_image_encoder=False` 禁用）
+
+#### 4. 噪声预测网络（ConditionalUnet2D）
 
 基于 2D U-Net 的条件去噪网络，使用 FiLM 调制：
 
@@ -248,61 +299,133 @@ Project:  Linear(256, cond_dim) → LayerNorm → GELU → Linear
 | `out_channels` | 1 | 输出通道（预测噪声） |
 | `block_out_channels` | (64, 128, 256) | 各层通道数 |
 | `layers_per_block` | 2 | 每层残差块数量 |
-| `attention_levels` | (2,) | 添加注意力的层级 |
+| `attention_levels` | (2,) | 添加注意力的层级（最深层） |
+| `dropout` | 0.1 | Dropout 正则化 |
 
-**FiLM 条件调制**:
+**架构详情**：
 ```
+Encoder: [ConditionalResidualBlock2D × 2 + Downsample2D] × 3 levels
+Middle:  ConditionalResidualBlock2D → Attention2D → ConditionalResidualBlock2D
+Decoder: [Upsample2D + ConditionalResidualBlock2D × 2 + Skip Connection] × 3 levels
+Output:  GroupNorm → SiLU → Conv2d
+```
+
+**FiLM 条件调制**（Feature-wise Linear Modulation）：
+```python
+# 时间步嵌入 + 全局条件
+cond = time_embed(timestep) + global_cond  # (B, cond_dim)
+
+# 预测 scale 和 shift
+scale, shift = MLP(cond).chunk(2)  # 各 (B, channels)
+
+# 调制特征
 h = h × (1 + scale) + shift
 ```
-其中 `scale, shift = MLP(timestep_emb + global_cond)`
 
-#### 3. 扩散调度器（DDPMScheduler）
+#### 5. 扩散调度器（DDPMScheduler）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `num_train_timesteps` | 100 | 训练扩散步数 |
-| `num_inference_steps` | 10 | 推理采样步数 |
-| `beta_schedule` | `squaredcos_cap_v2` | 余弦噪声调度 |
+| `num_inference_steps` | 10 | 推理采样步数（可调，更少更快） |
+| `beta_schedule` | `squaredcos_cap_v2` | 余弦噪声调度（比 linear 更平滑） |
 | `prediction_type` | `epsilon` | 预测噪声（非直接预测样本） |
+| `clip_sample` | True | 采样时裁剪到合理范围 |
 
 ### 数据流
 
 ```
-文本流: LLM Token [B,seq,2048] → Mean Pool → Linear → [B, cond_dim]
-                                                          ↓
-视觉流: 观测帧 [B,3,H,W] → CNN Encoder → [B, cond_dim] → Concat
-                                                          ↓
+                    ┌─────────────────────────────────────────┐
+                    │         LLM-only 模式（推荐）           │
+                    └─────────────────────────────────────────┘
+文本流: LLM Token [B,seq,2048] → Attention Pool → Projection → [B, cond_dim]
+                                                                    ↓
+条件流: [B, cond_dim] → Fusion MLP → [B, cond_dim] → ConditionalUnet2D
+                                                                    ↓
+生成流: 随机噪声 [B,1,Hm,Wm] → 迭代去噪 (10步) → 对数反归一化 → Heatmap [B,Hm,Wm]
+
+                    ┌─────────────────────────────────────────┐
+                    │         LLM + Image 模式                │
+                    └─────────────────────────────────────────┘
+文本流: LLM Token [B,seq,2048] → Attention Pool → Projection → [B, cond_dim]
+                                                                    ↓
+视觉流: 观测帧 [B,3,H,W] → CNN Encoder → [B, cond_dim] ────────→ Concat
+                                                                    ↓
 条件流: [B, cond_dim×2] → Fusion MLP → [B, cond_dim] → ConditionalUnet2D
-                                                          ↓
-生成流: 随机噪声 [B,1,Hm,Wm] → 迭代去噪 (10步) → Heatmap [B,Hm,Wm]
+                                                                    ↓
+生成流: 随机噪声 [B,1,Hm,Wm] → 迭代去噪 (10步) → 对数反归一化 → Heatmap [B,Hm,Wm]
 ```
+
+### 对数空间归一化
+
+热力图使用对数空间归一化，更好地保留峰值信息：
+
+```python
+# 归一化（训练时）
+def _normalize_heatmap(heatmap):
+    # 1. Max-to-1 归一化
+    heatmap_norm = heatmap / heatmap.max()
+    
+    # 2. 对数变换：让信号分布更均匀
+    log_scale = 6.0
+    log_heatmap = torch.log(heatmap_norm * log_scale + 1)
+    
+    # 3. 归一化到 [-1, 1]
+    normalized = (log_heatmap / log(log_scale + 1)) * 2 - 1
+    return normalized
+
+# 反归一化（推理时）
+def _denormalize_heatmap(heatmap):
+    # 逆对数变换 + clamp 到 [0, 1]
+    recovered = (exp((heatmap + 1) / 2 * log(7)) - 1) / 6
+    return recovered.clamp(0, 1)
+```
+
+**为什么用对数归一化**：
+- 原始热力图 93.5% 是 0（背景），直接归一化后信号集中在 -1 附近
+- 对数变换让信号分布更均匀，扩散模型更容易学习
 
 ### 训练与推理
 
-**训练模式**:
-```python
-# 前向扩散：给 GT 热力图加噪
-noisy_heatmap = scheduler.add_noise(gt_heatmap, noise, timesteps)
+**训练模式**（加权 MSE + 峰值保持损失）：
 
-# 预测噪声
+```python
+# 1. 前向扩散：给 GT 热力图加噪
+gt_normalized = normalize_heatmap(gt_heatmap)  # 对数空间归一化
+noisy_heatmap = scheduler.add_noise(gt_normalized, noise, timesteps)
+
+# 2. 预测噪声
 noise_pred = unet(noisy_heatmap, timesteps, global_cond)
 
-# 计算 Loss
-loss = F.mse_loss(noise_pred, noise)
+# 3. 加权 MSE Loss：峰值区域权重 x10
+weight = 1.0 + 9.0 * gt_heatmap.clamp(0, 1)  # [1.0, 10.0]
+diffusion_loss = (weight * (noise_pred - noise).pow(2)).mean()
+
+# 4. 峰值保持损失：确保输出不是全黑
+pred_heatmap = diffusion_inference(cond)
+peak_loss = F.relu(0.3 - pred_heatmap.max())      # 最大值必须 >= 0.3
+variance_loss = F.relu(0.05 - pred_heatmap.std())  # 必须有空间变化
+
+# 5. 总损失
+loss = diffusion_loss + 1.0 * (peak_loss + variance_loss)
 ```
 
-**推理模式**:
+**推理模式**：
+
 ```python
 # 从纯噪声开始
 noisy_heatmap = torch.randn(B, 1, Hm, Wm)
+
+# 设置推理步数
+scheduler.set_timesteps(num_inference_steps=10)
 
 # 迭代去噪
 for t in scheduler.timesteps:
     noise_pred = unet(noisy_heatmap, t, global_cond)
     noisy_heatmap = scheduler.step(noise_pred, t, noisy_heatmap).prev_sample
 
-# 输出热力图
-heatmap = denormalize(noisy_heatmap)  # [-1,1] → [0,1] → softmax
+# 对数反归一化到 [0, 1]
+heatmap = denormalize_heatmap(noisy_heatmap).squeeze(1)  # [B, Hm, Wm]
 ```
 
 ### 配置参数
@@ -312,20 +435,39 @@ heatmap = denormalize(noisy_heatmap)  # [-1,1] → [0,1] → softmax
 ```yaml
 model:
   heatmap_head:
-    enable_history: true        # 启用历史热力图头
-    enable_future: true         # 启用未来热力图头
-    cond_dim: 512               # 条件向量维度
-    num_inference_steps: 10     # 推理扩散步数
+    enable_history: true          # 启用历史热力图头
+    enable_future: false          # 禁用未来热力图头（可选）
+    cond_dim: 512                 # 条件向量维度
+    num_inference_steps: 10       # 推理扩散步数
+    use_image_encoder: false      # 推荐 false（LLM-only 模式）
+    llm_pool_method: attention    # 推荐 attention pooling
+    dropout: 0.1                  # Dropout 正则化
 ```
+
+**DiffusionHeatmapConfig 完整参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `llm_dim` | 2048 | Qwen3-VL hidden dimension |
+| `cond_dim` | 512 | 条件向量维度 |
+| `heatmap_size` | (64, 64) | 输出热力图尺寸 |
+| `use_image_encoder` | True | 是否使用 CNN 编码观测（推荐 False） |
+| `llm_pool_method` | 'attention' | LLM 序列池化方法 |
+| `llm_pool_num_heads` | 4 | Attention pooling 头数 |
+| `block_out_channels` | (64, 128, 256) | UNet 各层通道数 |
+| `num_train_timesteps` | 100 | 训练扩散步数 |
+| `num_inference_steps` | 10 | 推理扩散步数 |
+| `dropout` | 0.1 | Dropout 正则化率 |
 
 ### 源代码位置
 
 | 文件 | 说明 |
 |------|------|
-| `src/models/heatmap/diffusion_heatmap_head.py` | 主模块：`DiffusionHeatmapHead` |
+| `src/models/heatmap/__init__.py` | 模块导出 |
+| `src/models/heatmap/diffusion_heatmap_head.py` | 主模块：`DiffusionHeatmapHead`, `create_diffusion_heatmap_head` |
 | `src/models/heatmap/diffusion/config.py` | 配置：`DiffusionHeatmapConfig` |
-| `src/models/heatmap/diffusion/unet2d.py` | 噪声预测：`ConditionalUnet2D` |
-| `src/models/heatmap/diffusion/image_encoder.py` | 条件编码：`MultiModalConditionEncoder` |
+| `src/models/heatmap/diffusion/unet2d.py` | 噪声预测：`ConditionalUnet2D`, `ConditionalResidualBlock2D`, `Attention2D` |
+| `src/models/heatmap/diffusion/image_encoder.py` | 条件编码：`MultiModalConditionEncoder`, `LLMConditionProjector`, `ImageConditionEncoder`, `AttentionPooling` |
 
 ---
 
