@@ -1177,8 +1177,9 @@ def validate(
     tb_writer: Optional[SummaryWriter] = None,
     epoch: int = 0,
     packing_enabled: bool = False,
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, float]:
-    """验证"""
+    """验证（带可视化）"""
     model.eval()
     
     total_loss = 0.0
@@ -1317,6 +1318,62 @@ def validate(
         total_action_loss += action_total_loss.item()  # trajectory or action
         total_stop_loss += stop_total_loss.item()      # progress or stop
         num_batches += 1
+        
+        # ==================== 验证可视化（前几个 batch）====================
+        num_vis_batches = cfg['log'].get('val_vis_batches', 2)  # 可视化几个 batch
+        if num_batches <= num_vis_batches and output_dir is not None:
+            try:
+                # 使用纯推理模式生成热力图（不传 gt_heatmap）
+                if packing_enabled:
+                    vis_output = model.forward_packed(
+                        packed_batch=batch,
+                        return_heatmaps=True,
+                        return_actions=False,
+                        # 不传 gt_history_heatmap，触发纯推理模式
+                    )
+                else:
+                    video_frames = torch.cat([
+                        history_frames,
+                        current_frame.unsqueeze(1)
+                    ], dim=1)
+                    vis_output = model(
+                        video_frames=video_frames,
+                        instruction_text=list(text) if text else None,
+                        current_observation=current_frame.to(device),
+                        return_heatmaps=True,
+                        return_actions=False,
+                    )
+                
+                # 可视化并保存
+                vis_path = visualize_heatmap_predictions(
+                    model=model,
+                    batch=batch,
+                    output=vis_output,
+                    epoch=epoch,
+                    step=num_batches,
+                    output_dir=output_dir,
+                    num_samples=4,  # 验证时多显示几个样本
+                )
+                
+                # 保存到验证专用目录
+                if vis_path is not None:
+                    val_vis_dir = output_dir / "val_visualizations"
+                    val_vis_dir.mkdir(parents=True, exist_ok=True)
+                    new_path = val_vis_dir / f"epoch_{epoch:03d}_batch_{num_batches:02d}.png"
+                    import shutil
+                    shutil.copy(vis_path, new_path)
+                    
+                    # 记录到 TensorBoard
+                    if tb_writer is not None:
+                        vis_img = cv2.imread(str(new_path))
+                        if vis_img is not None:
+                            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+                            vis_img = vis_img.transpose(2, 0, 1)  # HWC -> CHW
+                            tb_writer.add_image(f'val/heatmap_viz_batch{num_batches}', vis_img, epoch)
+                    
+                    logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
+            except Exception as e:
+                logger.warning(f"Validation visualization failed: {e}")
     
     avg_loss = total_loss / max(num_batches, 1)
     avg_hm = total_heatmap_loss / max(num_batches, 1)
@@ -1853,6 +1910,7 @@ def main():
         val_metrics = validate(
             model, val_loader, cfg, heatmap_criterion, logger, stage_cfg, tb_writer, epoch,
             packing_enabled=packing_enabled,
+            output_dir=output_dir,
         )
         
         logger.info(

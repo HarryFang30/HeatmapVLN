@@ -213,7 +213,8 @@ gpu:
 log:
   out_dir: /root/autodl-tmp/vln_training_outputs
   save_every_epochs: 1
-  vis_every_steps: 100
+  vis_every_steps: 100       # 训练时每 N 步可视化
+  val_vis_batches: 2         # 验证时可视化前 N 个 batch
   max_ckpts: 3
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs
