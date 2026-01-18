@@ -1435,10 +1435,12 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             trajectory_valid: 轨迹是否有效
             progress: 任务完成进度 (0-1)，基于子序列范围
         """
-        # 计算 progress（基于子序列范围）
+        # 计算 progress（对齐 InternNav 的定义）
+        # InternNav: stop_progress = (np.arange(total_steps) + 1) / total_steps
+        # 即 progress = (step + 1) / total_steps，从 1/N 开始，到 N/N=1 结束
         subseq_length = subseq_end - subseq_start
         relative_pos = current_t - subseq_start
-        progress = float(relative_pos) / max(subseq_length - 1, 1)
+        progress = float(relative_pos + 1) / max(subseq_length, 1)
         
         # 获取从当前帧到结束的所有位姿
         future_poses = poses[current_t:]
