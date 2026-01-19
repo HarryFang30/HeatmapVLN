@@ -1843,26 +1843,36 @@ def main():
     else:
         actual_collate_fn = collate_fn
     
-    persistent_workers = num_workers > 0
-    
     # 使用 spawn 而不是 fork，避免 tokenizers 多进程死锁
     # fork 会继承父进程的 tokenizers 锁状态，导致死锁
     # spawn 创建全新进程，避免这个问题
     mp_context = 'spawn' if num_workers > 0 else None
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg['optim']['batch_size'],
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=cfg['data']['pin_memory'],
-        collate_fn=actual_collate_fn,
-        drop_last=True,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=persistent_workers,
-        multiprocessing_context=mp_context,
-        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
-    )
+    # 检查是否使用动态采样（set_epoch）
+    # 如果使用动态采样，需要每个 epoch 重新创建 DataLoader，
+    # 因为 persistent_workers=True 时 workers 不会看到 set_epoch 的更新
+    uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
+    
+    # 动态采样时禁用 persistent_workers，避免 sample_index 不同步问题
+    persistent_workers = num_workers > 0 and not uses_dynamic_sampling
+    
+    def create_train_loader():
+        """创建训练 DataLoader（支持动态采样时重新创建）"""
+        return DataLoader(
+            train_dataset,
+            batch_size=cfg['optim']['batch_size'],
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=cfg['data']['pin_memory'],
+            collate_fn=actual_collate_fn,
+            drop_last=True,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers,
+            multiprocessing_context=mp_context,
+            worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+        )
+    
+    train_loader = create_train_loader()
     
     val_loader = DataLoader(
         val_dataset,
@@ -1872,10 +1882,13 @@ def main():
         pin_memory=cfg['data']['pin_memory'],
         collate_fn=actual_collate_fn,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=persistent_workers,
+        persistent_workers=num_workers > 0,  # 验证集不需要动态采样，可以保持 persistent
         multiprocessing_context=mp_context,
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
+    
+    if uses_dynamic_sampling:
+        logger.info("   ⚠️  Dynamic sampling enabled - DataLoader will be recreated each epoch")
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
@@ -1923,8 +1936,13 @@ def main():
         timer.start_epoch()
             
         # Clip-level 采样：每个 epoch 重新采样，减少样本相关性
-        if hasattr(train_loader.dataset, 'set_epoch'):
-            train_loader.dataset.set_epoch(epoch)
+        if uses_dynamic_sampling:
+            train_dataset.set_epoch(epoch)
+            # 重新创建 DataLoader 以确保 workers 获取更新后的 sample_index
+            train_loader = create_train_loader()
+            # 更新 steps_per_epoch（动态采样可能改变样本数量）
+            steps_per_epoch = len(train_loader) // grad_accum_steps
+            logger.info(f"   Recreated DataLoader with {len(train_dataset)} samples for epoch {epoch}")
         
         logger.info("=" * 80)
         logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
