@@ -30,6 +30,7 @@ import torch
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
