@@ -106,6 +106,14 @@ class DiffusionHeatmapConfig:
     cfg_drop_prob: float = 0.1       # 训练时随机 drop 条件的概率
     cfg_scale: float = 3.0           # 推理时的引导强度 (1.0 = 无引导)
     
+    # ==================== 区域感知损失 (Regional Focal Loss) ====================
+    # 针对热力图分布不均匀问题：89% 集中在垂直中间，80% 集中在水平两侧（后方）
+    # 对稀疏区域（前方、上下）给予更高权重，提升模型对这些区域的预测能力
+    regional_loss_enabled: bool = True       # 是否启用区域感知损失
+    regional_center_alpha: float = 2.0       # 中心区域（前方）权重倍数
+    regional_vertical_alpha: float = 1.5     # 上下区域权重倍数
+    regional_loss_weight: float = 0.2        # 区域损失在总损失中的权重
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"

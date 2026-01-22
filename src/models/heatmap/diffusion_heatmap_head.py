@@ -77,6 +77,12 @@ class DiffusionHeatmapHead(nn.Module):
         self.cfg_drop_prob = config.cfg_drop_prob
         self.cfg_scale = config.cfg_scale
         
+        # 区域感知损失参数
+        self.regional_loss_enabled = config.regional_loss_enabled
+        self.regional_center_alpha = config.regional_center_alpha
+        self.regional_vertical_alpha = config.regional_vertical_alpha
+        self.regional_loss_weight = config.regional_loss_weight
+        
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
             llm_dim=config.llm_dim,
@@ -264,6 +270,45 @@ class DiffusionHeatmapHead(nn.Module):
         focal_weight = 0.3
         diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
         
+        # ==================== 区域感知损失 (Regional Focal Loss) ====================
+        # 针对热力图分布不均匀问题：
+        # - 89% 集中在垂直中间（因为室内导航高度固定）
+        # - 80% 集中在左右边缘/后方（因为历史点在 agent 后面）
+        # 对稀疏区域（前方、上下）给予更高权重
+        regional_loss = torch.tensor(0.0, device=device)
+        if self.regional_loss_enabled:
+            with torch.no_grad():
+                B, C, H, W = noise.shape
+                
+                # 创建区域权重图
+                regional_weight = torch.ones(1, 1, H, W, device=device)
+                
+                # 1. 中心区域（前方）权重增加
+                # 全景图中心 1/3 = agent 正前方（phi ≈ 0）
+                center_start = W // 3
+                center_end = 2 * W // 3
+                regional_weight[:, :, :, center_start:center_end] *= self.regional_center_alpha
+                
+                # 2. 上下区域权重增加
+                # 垂直方向上 1/3 和下 1/3 是稀疏区域
+                top_end = H // 3
+                bottom_start = 2 * H // 3
+                regional_weight[:, :, :top_end, :] *= self.regional_vertical_alpha
+                regional_weight[:, :, bottom_start:, :] *= self.regional_vertical_alpha
+                
+                # 归一化权重使其均值为 1（保持损失量级）
+                regional_weight = regional_weight / regional_weight.mean()
+            
+            # 计算区域加权 MSE
+            regional_loss = (regional_weight * (noise_pred - noise) ** 2).mean()
+        
+        # 合并所有损失
+        # 总损失 = (1 - regional_weight) * diffusion_loss + regional_weight * regional_loss
+        if self.regional_loss_enabled:
+            total_loss = (1 - self.regional_loss_weight) * diffusion_loss + self.regional_loss_weight * regional_loss
+        else:
+            total_loss = diffusion_loss
+        
         # 诊断信息：记录噪声预测质量
         noise_std = noise.std().item()
         noise_pred_std = noise_pred.std().item()
@@ -277,10 +322,11 @@ class DiffusionHeatmapHead(nn.Module):
                 pred_heatmap = self._diffusion_inference(cond)
         
         return {
-            'loss': diffusion_loss,
+            'loss': total_loss,                     # 🆕 使用合并后的总损失
             'diffusion_loss': diffusion_loss,
-            'base_loss': base_loss.item(),      # 标准 MSE
-            'focal_loss': focal_loss.item(),    # 峰值加权 MSE
+            'base_loss': base_loss.item(),          # 标准 MSE
+            'focal_loss': focal_loss.item(),        # 峰值加权 MSE
+            'regional_loss': regional_loss.item() if self.regional_loss_enabled else 0.0,  # 🆕 区域感知损失
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
