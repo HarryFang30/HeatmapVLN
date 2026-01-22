@@ -1557,8 +1557,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         relative_pos = current_t - subseq_start
         progress = float(relative_pos + 1) / max(subseq_length, 1)
         
-        # 获取从当前帧到结束的所有位姿
-        future_poses = poses[current_t:]
+        # 获取从当前帧到子序列结束的位姿
+        # ⚠️ 重要：必须使用 subseq_end 而不是整个 clip 结束
+        # 否则 progress 和轨迹会不一致（progress=1 但轨迹非零）
+        future_poses = poses[current_t:subseq_end]
         
         if len(future_poses) < 2:
             # 最后一帧或没有足够的未来帧 - 返回零轨迹（静止/STOP）
