@@ -1658,6 +1658,9 @@ def main():
             predict_horizon=traj_cfg.get('predict_horizon', 24),
             action_scale=traj_cfg.get('action_scale', 4.0),
             enable_trajectory_augmentation=traj_cfg.get('enable_trajectory_augmentation', True),
+            # FGR2R 子指令配置
+            use_subinstruction=traj_cfg.get('use_subinstruction', False),
+            fgr2r_subinstr_path=traj_cfg.get('fgr2r_subinstr_path', None),
         )
         
         val_split = cfg['data'].get('val_split', 'val')
@@ -1678,6 +1681,7 @@ def main():
             predict_horizon=traj_cfg.get('predict_horizon', 24),
             action_scale=traj_cfg.get('action_scale', 4.0),
             enable_trajectory_augmentation=False,  # 验证集不增强
+            use_subinstruction=False,  # 验证集使用完整指令
         )
     else:
         # 使用原始滑动窗口数据集
