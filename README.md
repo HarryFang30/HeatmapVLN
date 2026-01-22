@@ -499,6 +499,34 @@ HeatmapVLN/
 └── README.md
 ```
 
+### 训练输出结构
+
+每次训练创建独立目录，便于管理和对比：
+
+```
+/root/autodl-tmp/vln_training_outputs/
+├── run_20260123_001234/            # 训练 1
+│   ├── ckpts/                      # 检查点
+│   │   ├── epoch_001.pth
+│   │   ├── best.pth
+│   │   └── latest.pth
+│   ├── vis/                        # 可视化
+│   │   ├── train/                  # 训练热力图
+│   │   └── val/                    # 验证热力图
+│   ├── plots/
+│   │   ├── curves.png              # 训练曲线
+│   │   └── history.json
+│   └── train.log
+├── run_20260123_120000/            # 训练 2
+│   └── ...
+└── latest → run_20260123_120000    # 符号链接指向最新
+```
+
+**断点续训**会自动继续使用之前的目录：
+```bash
+python scripts/train.py --config configs/train_config.yaml --auto-resume
+```
+
 ---
 
 ## 🙏 致谢
