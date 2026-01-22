@@ -173,6 +173,16 @@ tensorboard --logdir=/root/tf-logs/latest --port=6006
 | **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
 | | `diag/heatmap_focal_ratio` | focal/base 比值 |
 | | `diag/heatmap_regional_ratio` | 区域损失比值 |
+| **区域损失细化** | `diag/hm_loss_center` | 中心区域(前方)损失 |
+| | `diag/hm_loss_left` | 左侧区域(后方左)损失 |
+| | `diag/hm_loss_right` | 右侧区域(后方右)损失 |
+| | `diag/hm_loss_top` | 上部区域损失 |
+| | `diag/hm_loss_bottom` | 下部区域损失 |
+| **热力图质量** | `diag/hm_peak_distance` | Peak 位置误差(像素) |
+| | `diag/hm_peak_dx` | Peak X 方向误差 |
+| | `diag/hm_peak_dy` | Peak Y 方向误差 |
+| | `diag/hm_peak_iou` | Peak 区域 IoU |
+| | `diag/hm_peak_conf_ratio` | 峰值置信度比值(pred/gt) |
 | **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
 | | `diag/trajectory_fde` | 终点位移误差 |
 

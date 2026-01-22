@@ -1038,6 +1038,97 @@ def train_one_epoch(
                         tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
                         if non_zero_ratio < 0.05:
                             logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
+                        
+                        # ==================== 区域损失细化 ====================
+                        # 计算各区域的 MSE 损失，用于定位问题区域
+                        B, C, H, W = pred_hm.shape
+                        gt_hm_diag = gt_heatmap.to(pred_hm.device)
+                        
+                        # 定义区域边界 (基于全景图特性)
+                        w_third = W // 3
+                        h_third = H // 3
+                        
+                        # 左侧区域 (后方左) - 宽度 [0, W/3)
+                        left_pred = pred_hm[:, :, :, :w_third]
+                        left_gt = gt_hm_diag[:, :, :, :w_third]
+                        left_loss = F.mse_loss(left_pred, left_gt).item()
+                        tb_writer.add_scalar('diag/hm_loss_left', left_loss, actual_step)
+                        
+                        # 中心区域 (前方) - 宽度 [W/3, 2W/3)
+                        center_pred = pred_hm[:, :, :, w_third:2*w_third]
+                        center_gt = gt_hm_diag[:, :, :, w_third:2*w_third]
+                        center_loss = F.mse_loss(center_pred, center_gt).item()
+                        tb_writer.add_scalar('diag/hm_loss_center', center_loss, actual_step)
+                        
+                        # 右侧区域 (后方右) - 宽度 [2W/3, W)
+                        right_pred = pred_hm[:, :, :, 2*w_third:]
+                        right_gt = gt_hm_diag[:, :, :, 2*w_third:]
+                        right_loss = F.mse_loss(right_pred, right_gt).item()
+                        tb_writer.add_scalar('diag/hm_loss_right', right_loss, actual_step)
+                        
+                        # 上部区域 - 高度 [0, H/3)
+                        top_pred = pred_hm[:, :, :h_third, :]
+                        top_gt = gt_hm_diag[:, :, :h_third, :]
+                        top_loss = F.mse_loss(top_pred, top_gt).item()
+                        tb_writer.add_scalar('diag/hm_loss_top', top_loss, actual_step)
+                        
+                        # 下部区域 - 高度 [2H/3, H)
+                        bottom_pred = pred_hm[:, :, 2*h_third:, :]
+                        bottom_gt = gt_hm_diag[:, :, 2*h_third:, :]
+                        bottom_loss = F.mse_loss(bottom_pred, bottom_gt).item()
+                        tb_writer.add_scalar('diag/hm_loss_bottom', bottom_loss, actual_step)
+                        
+                        # ==================== 热力图质量指标 ====================
+                        # 1. Peak 位置误差 (像素距离)
+                        # 找到 pred 和 gt 的最大值位置
+                        pred_flat = pred_hm.view(B, -1)
+                        gt_flat = gt_hm_diag.view(B, -1)
+                        
+                        pred_peak_idx = pred_flat.argmax(dim=1)  # (B,)
+                        gt_peak_idx = gt_flat.argmax(dim=1)      # (B,)
+                        
+                        # 转换为 (y, x) 坐标
+                        pred_peak_y = (pred_peak_idx // W).float()
+                        pred_peak_x = (pred_peak_idx % W).float()
+                        gt_peak_y = (gt_peak_idx // W).float()
+                        gt_peak_x = (gt_peak_idx % W).float()
+                        
+                        # 考虑全景图的环形连续性计算 x 距离
+                        dx = torch.abs(pred_peak_x - gt_peak_x)
+                        dx = torch.min(dx, W - dx)  # 取环形最短距离
+                        dy = torch.abs(pred_peak_y - gt_peak_y)
+                        
+                        peak_distance = torch.sqrt(dx**2 + dy**2).mean().item()
+                        tb_writer.add_scalar('diag/hm_peak_distance', peak_distance, actual_step)
+                        tb_writer.add_scalar('diag/hm_peak_dx', dx.mean().item(), actual_step)
+                        tb_writer.add_scalar('diag/hm_peak_dy', dy.mean().item(), actual_step)
+                        
+                        # 2. Peak IoU (交并比) - 使用阈值化后的区域计算
+                        # 阈值取 max 的 50%
+                        pred_threshold = pred_hm.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] * 0.5
+                        gt_threshold = gt_hm_diag.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] * 0.5
+                        
+                        pred_mask = (pred_hm > pred_threshold).float()
+                        gt_mask = (gt_hm_diag > gt_threshold).float()
+                        
+                        intersection = (pred_mask * gt_mask).sum(dim=(1, 2, 3))
+                        union = ((pred_mask + gt_mask) > 0).float().sum(dim=(1, 2, 3))
+                        
+                        # 避免除零
+                        iou = (intersection / (union + 1e-6)).mean().item()
+                        tb_writer.add_scalar('diag/hm_peak_iou', iou, actual_step)
+                        
+                        # 3. 峰值置信度对比
+                        pred_peak_conf = pred_hm.max(dim=-1)[0].max(dim=-1)[0].mean().item()  # pred 峰值
+                        gt_peak_conf = gt_hm_diag.max(dim=-1)[0].max(dim=-1)[0].mean().item()  # gt 峰值
+                        
+                        tb_writer.add_scalar('diag/hm_pred_peak_conf', pred_peak_conf, actual_step)
+                        tb_writer.add_scalar('diag/hm_gt_peak_conf', gt_peak_conf, actual_step)
+                        
+                        # 置信度比值 (越接近 1 越好)
+                        if gt_peak_conf > 0:
+                            conf_ratio = pred_peak_conf / gt_peak_conf
+                            tb_writer.add_scalar('diag/hm_peak_conf_ratio', conf_ratio, actual_step)
                     
                     # Focal Loss 诊断 (新增)
                     if 'history_heatmap_base_loss' in output and output['history_heatmap_base_loss'] is not None:
