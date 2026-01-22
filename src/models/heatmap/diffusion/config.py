@@ -108,10 +108,10 @@ class DiffusionHeatmapConfig:
     
     # ==================== 区域感知损失 (Regional Focal Loss) ====================
     # 针对热力图分布不均匀问题：89% 集中在垂直中间，80% 集中在水平两侧（后方）
-    # 对稀疏区域（前方、上下）给予更高权重，提升模型对这些区域的预测能力
+    # 对前方区域给予更高权重（上下区域几乎没有有效数据，不增加权重避免过拟合）
     regional_loss_enabled: bool = True       # 是否启用区域感知损失
-    regional_center_alpha: float = 2.0       # 中心区域（前方）权重倍数
-    regional_vertical_alpha: float = 1.5     # 上下区域权重倍数
+    regional_center_alpha: float = 2.5       # 中心区域（前方）权重倍数 (20% → 39%)
+    regional_vertical_alpha: float = 1.0     # 上下区域权重倍数 (1.0=不加权)
     regional_loss_weight: float = 0.2        # 区域损失在总损失中的权重
     
     def __post_init__(self):

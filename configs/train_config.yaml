@@ -99,10 +99,10 @@ model:
     
     # 区域感知损失 (Regional Focal Loss) - 解决热力图分布不均匀问题
     # 问题：89% 点集中在垂直中间，80% 在水平两侧（后方）
-    # 方案：对稀疏区域（前方、上下）给予更高权重
+    # 方案：对前方区域给予更高权重（上下区域几乎没有有效数据，不增加权重）
     regional_loss_enabled: true    # 启用区域感知损失
-    regional_center_alpha: 2.0     # 中心区域（前方）权重倍数
-    regional_vertical_alpha: 1.5   # 上下区域权重倍数
+    regional_center_alpha: 2.5     # 中心区域（前方）权重倍数 (20% → 39%)
+    regional_vertical_alpha: 1.0   # 上下区域权重倍数 (1.0=不加权，避免过拟合噪声)
     regional_loss_weight: 0.2      # 区域损失在总损失中的权重
     
     # 正则化

@@ -86,8 +86,8 @@ class VLNPipelineConfig:
     
     # 区域感知损失 (Regional Focal Loss) - 解决热力图分布不均匀问题
     heatmap_regional_loss_enabled: bool = True      # 启用区域感知损失
-    heatmap_regional_center_alpha: float = 2.0      # 中心区域（前方）权重倍数
-    heatmap_regional_vertical_alpha: float = 1.5    # 上下区域权重倍数
+    heatmap_regional_center_alpha: float = 2.5      # 中心区域（前方）权重倍数 (20% → 39%)
+    heatmap_regional_vertical_alpha: float = 1.0    # 上下区域权重倍数 (1.0=不加权)
     heatmap_regional_loss_weight: float = 0.2       # 区域损失在总损失中的权重
     
     # Action generation - Mode selection
