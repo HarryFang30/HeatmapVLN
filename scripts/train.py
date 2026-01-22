@@ -2056,6 +2056,14 @@ def main():
         # Clip-level 采样：每个 epoch 重新采样，减少样本相关性
         if uses_dynamic_sampling:
             train_dataset.set_epoch(epoch)
+            # 显式关闭旧的 DataLoader workers，避免警告
+            if hasattr(train_loader, '_iterator') and train_loader._iterator is not None:
+                try:
+                    train_loader._iterator._shutdown_workers()
+                except Exception:
+                    pass
+            del train_loader
+            gc.collect()
             # 重新创建 DataLoader 以确保 workers 获取更新后的 sample_index
             train_loader = create_train_loader()
             # 更新 steps_per_epoch（动态采样可能改变样本数量）
