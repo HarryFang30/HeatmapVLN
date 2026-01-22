@@ -1782,7 +1782,6 @@ def main():
         stage_cfg['epochs'] = args.epochs
     
     total_epochs = stage_cfg['epochs']
-    global_epoch_counter = 0
     
     logger.info("=" * 60)
     logger.info(f"📋 训练配置: {stage_name}")
@@ -1927,8 +1926,10 @@ def main():
     
     if resume_epoch > 0:
         start_epoch = resume_epoch + 1
+        global_epoch_counter = resume_epoch  # 断点续训时从 resume_epoch 开始计数
     else:
         start_epoch = args.start_epoch
+        global_epoch_counter = start_epoch - 1  # 确保第一个 epoch 记录为 start_epoch
     
     patience = cfg['validation'].get('patience', 5)
     no_improve_count = 0
