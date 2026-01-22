@@ -2,7 +2,6 @@
 /models/*/
 !/models/*.md
 /outputs/
-/data/
 /raw_sequences/
 
 # Python cache

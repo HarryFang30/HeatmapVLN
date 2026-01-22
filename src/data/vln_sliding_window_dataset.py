@@ -1423,16 +1423,34 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         )
     
     def _load_fgr2r_mapping(self, fgr2r_path: Optional[str] = None):
-        """加载 FGR2R 子指令映射表"""
+        """加载 FGR2R 子指令映射表（支持 .json 和 .json.gz 格式）"""
+        import gzip
+        
         if fgr2r_path is None:
-            fgr2r_path = "/root/autodl-tmp/fgr2r_cache/subinstr_mapping.json"
+            # 默认路径：项目目录下的 data/fgr2r/subinstr_mapping.json.gz
+            fgr2r_path = Path(__file__).parent.parent.parent / "data/fgr2r/subinstr_mapping.json.gz"
+        else:
+            fgr2r_path = Path(fgr2r_path)
+            # 如果是相对路径，相对于项目根目录
+            if not fgr2r_path.is_absolute():
+                fgr2r_path = Path(__file__).parent.parent.parent / fgr2r_path
+        
+        # 检查是否存在 .gz 版本
+        if not fgr2r_path.exists() and not str(fgr2r_path).endswith('.gz'):
+            gz_path = Path(str(fgr2r_path) + '.gz')
+            if gz_path.exists():
+                fgr2r_path = gz_path
         
         try:
-            with open(fgr2r_path, 'r') as f:
-                mapping = json.load(f)
+            if str(fgr2r_path).endswith('.gz'):
+                with gzip.open(fgr2r_path, 'rt', encoding='utf-8') as f:
+                    mapping = json.load(f)
+            else:
+                with open(fgr2r_path, 'r') as f:
+                    mapping = json.load(f)
             # 转换 key 为 int（JSON 键是字符串）
             self._fgr2r_mapping = {int(k): v for k, v in mapping.items()}
-            logger.info(f"Loaded FGR2R subinstruction mapping: {len(self._fgr2r_mapping)} trajectories")
+            logger.info(f"Loaded FGR2R subinstruction mapping: {len(self._fgr2r_mapping)} trajectories from {fgr2r_path}")
         except FileNotFoundError:
             logger.warning(f"FGR2R mapping file not found: {fgr2r_path}")
             self._fgr2r_mapping = {}

@@ -51,7 +51,7 @@ data:
     enable_trajectory_augmentation: true  # 启用轨迹增强
     # FGR2R 子指令配置（使指令与子序列同步）
     use_subinstruction: true     # 启用 FGR2R 子指令
-    fgr2r_subinstr_path: /root/autodl-tmp/fgr2r_cache/subinstr_mapping.json
+    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
 
 # ============================================
 # 模型配置
