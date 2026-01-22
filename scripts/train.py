@@ -1268,6 +1268,7 @@ def validate(
     epoch: int = 0,
     packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
+    max_batches: int = None,
 ) -> Dict[str, float]:
     """验证（带可视化）"""
     model.eval()
@@ -1286,7 +1287,14 @@ def validate(
     
     device = torch.device(cfg['model'].get('device', 'cuda'))
     
-    for batch in tqdm(val_loader, desc="Validating"):
+    total_val_batches = len(val_loader)
+    if max_batches is not None:
+        total_val_batches = min(total_val_batches, max_batches)
+        logger.info(f"  ⚡ 快速调试模式(验证): 只处理 {total_val_batches} batches")
+    
+    for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
+        if max_batches is not None and i >= max_batches:
+            break
         # Packing 模式和传统模式的 batch 结构不同
         if packing_enabled:
             B = batch['num_samples']
@@ -2074,6 +2082,7 @@ def main():
             model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
             packing_enabled=packing_enabled,
             vis_dir=vis_val_dir,
+            max_batches=args.max_batches,
         )
         
         logger.info(
