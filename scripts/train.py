@@ -1662,7 +1662,7 @@ def main():
     parser.add_argument('--resume', type=str, default=None, 
                         help='从检查点恢复（路径或 "latest"）')
     parser.add_argument('--auto-resume', action='store_true',
-                        help='自动从最新检查点恢复')
+                        help='自动从最新检查点恢复（继续使用之前的输出目录）')
     parser.add_argument('--start-epoch', type=int, default=1,
                         help='从指定 epoch 开始训练')
     parser.add_argument('--epochs', type=int, default=None,
@@ -1678,56 +1678,106 @@ def main():
     cfg = load_config(args.config)
     set_seed(cfg['seed'])
     
-    # 设置输出目录结构
-    out_dir = Path(cfg['log']['out_dir'])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # ==================== 输出目录结构（每次训练独立文件夹）====================
+    base_out_dir = Path(cfg['log']['out_dir'])
+    base_out_dir.mkdir(parents=True, exist_ok=True)
+    
+    latest_link = base_out_dir / 'latest'
+    is_resuming = False
+    
+    # 判断是否断点续训
+    if args.auto_resume and latest_link.exists():
+        # 断点续训：使用之前的运行目录
+        if latest_link.is_symlink():
+            run_dir = base_out_dir / latest_link.resolve().name
+        else:
+            run_dir = latest_link
+        
+        # 检查是否有可恢复的检查点
+        ckpt_dir_check = run_dir / 'ckpts'
+        latest_ckpt = ckpt_dir_check / 'latest.pth' if ckpt_dir_check.exists() else None
+        if latest_ckpt and latest_ckpt.exists():
+            is_resuming = True
+            print(f"🔄 断点续训: 继续使用 {run_dir.name}")
+        else:
+            # 没有可恢复的检查点，创建新目录
+            run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_dir = base_out_dir / f'run_{run_timestamp}'
+            print(f"📁 新训练: {run_dir.name}")
+    else:
+        # 新训练：创建新的运行目录
+        run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = base_out_dir / f'run_{run_timestamp}'
+    
+    run_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 更新 'latest' 符号链接
+    if latest_link.is_symlink() or latest_link.exists():
+        latest_link.unlink()
+    latest_link.symlink_to(run_dir.name)
     
     # 子目录
-    ckpt_dir = out_dir / 'ckpts'
-    vis_train_dir = out_dir / 'vis' / 'train'
-    vis_val_dir = out_dir / 'vis' / 'val'
-    plots_dir = out_dir / 'plots'
+    ckpt_dir = run_dir / 'ckpts'
+    vis_train_dir = run_dir / 'vis' / 'train'
+    vis_val_dir = run_dir / 'vis' / 'val'
+    plots_dir = run_dir / 'plots'
     
     for d in [ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
         d.mkdir(parents=True, exist_ok=True)
     
     # 设置日志
-    logger = setup_logger(str(out_dir / 'train.log'))
-    logger.info(f"📁 Output: {out_dir}")
+    logger = setup_logger(str(run_dir / 'train.log'))
+    logger.info(f"📁 Output: {run_dir}")
+    logger.info(f"   Latest: {latest_link} → {run_dir.name}")
     
-    # TensorBoard
+    # ==================== TensorBoard ====================
     tb_writer = None
     if cfg['log'].get('use_tensorboard', False):
         tb_base = Path(cfg['log'].get('tensorboard_dir', './runs'))
         tb_base.mkdir(parents=True, exist_ok=True)
         
-        # 归档旧的 TensorBoard 日志（移动到项目目录下的 tf-logs-archive）
-        tb_archive = Path(__file__).parent.parent / 'tf-logs-archive'
-        tb_archive.mkdir(parents=True, exist_ok=True)
+        tb_latest_link = tb_base / 'latest'
         
-        latest_link = tb_base / 'latest'
-        for old_dir in tb_base.iterdir():
-            if old_dir.is_dir() and old_dir.name != 'latest':
-                # 移动旧目录到归档
-                dest = tb_archive / old_dir.name
-                if not dest.exists():
-                    import shutil
-                    shutil.move(str(old_dir), str(dest))
-                    logger.info(f"📦 归档旧日志: {old_dir.name} → tf-logs-archive/")
+        # 从 run_dir 名字中提取时间戳 (run_YYYYMMDD_HHMMSS -> YYYYMMDD_HHMMSS)
+        run_dir_name = run_dir.name
+        if run_dir_name.startswith('run_'):
+            tb_timestamp = run_dir_name[4:]  # 去掉 "run_" 前缀
+        else:
+            tb_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # 创建新的运行目录
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        tb_run_dir = tb_base / timestamp
+        if is_resuming:
+            # 断点续训：使用之前的 TensorBoard 目录
+            tb_run_dir = tb_base / tb_timestamp
+            if not tb_run_dir.exists():
+                # 如果不存在，创建新目录
+                tb_run_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"🔄 TensorBoard: 继续使用 {tb_run_dir}")
+        else:
+            # 新训练：归档旧日志
+            tb_archive = Path(__file__).parent.parent / 'tf-logs-archive'
+            tb_archive.mkdir(parents=True, exist_ok=True)
+            
+            for old_dir in tb_base.iterdir():
+                if old_dir.is_dir() and old_dir.name != 'latest':
+                    # 移动旧目录到归档
+                    dest = tb_archive / old_dir.name
+                    if not dest.exists():
+                        import shutil
+                        shutil.move(str(old_dir), str(dest))
+                        logger.info(f"📦 归档旧TensorBoard: {old_dir.name} → tf-logs-archive/")
+            
+            # 创建新的运行目录
+            tb_run_dir = tb_base / tb_timestamp
+        
         tb_writer = SummaryWriter(log_dir=str(tb_run_dir))
         
-        # 创建 'latest' 符号链接，方便只查看当前训练
-        # tensorboard --logdir /root/tf-logs/latest
-        if latest_link.is_symlink() or latest_link.exists():
-            latest_link.unlink()
-        latest_link.symlink_to(tb_run_dir.name)
+        # 更新 'latest' 符号链接
+        if tb_latest_link.is_symlink() or tb_latest_link.exists():
+            tb_latest_link.unlink()
+        tb_latest_link.symlink_to(tb_run_dir.name)
         
         logger.info(f"📊 TensorBoard: {tb_run_dir}")
-        logger.info(f"   只看当前: tensorboard --logdir {latest_link}")
+        logger.info(f"   只看当前: tensorboard --logdir {tb_latest_link}")
     
     loss_cfg = cfg['loss']
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')

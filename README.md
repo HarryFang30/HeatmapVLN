@@ -3,7 +3,7 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue.svg)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.6+-ee4c2c.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![CUDA](https://img.shields.io/badge/CUDA-12.0+-76b900.svg)
 
