@@ -172,7 +172,6 @@ tensorboard --logdir=/root/tf-logs/latest --port=6006
 | | `train/progress_loss` | 进度损失 |
 | **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
 | | `diag/heatmap_focal_ratio` | focal/base 比值 |
-| | `diag/heatmap_regional_ratio` | 区域损失比值 |
 | **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
 | | `diag/trajectory_fde` | 终点位移误差 |
 
@@ -273,34 +272,7 @@ ConditionalUnet2D (Cross-Attention + FiLM) → DDPM + CFG → Heatmap
 | **Cross-Attention** | UNet 中间层添加交叉注意力，增强条件注入 |
 | **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 |
 | **Focal Loss** | 70% 标准 MSE + 30% 峰值加权 |
-| **区域感知损失** | 对稀疏区域（前方、上下）增加权重 |
 | **360° Circular Padding** | 支持全景图水平边界连续性 |
-
-<details>
-<summary>📐 区域感知损失详解</summary>
-
-针对 R2R 数据集热力图分布不均问题（89% 集中在垂直中间，80% 集中在后方），对稀疏区域给予更高权重：
-
-```
-全景图 64×64 热力图区域权重:
-
-         ┌───────────────────────────────────────┐
-   上    │  ×1.5   │  ×3.0 (1.5×2.0)   │  ×1.5   │
-(稀疏)   │  左后   │     中心/前方     │  右后   │
-         ├─────────┼───────────────────┼─────────┤
-   中    │  ×1.0   │       ×2.0        │  ×1.0   │  ← 89% 分布
-(密集)   │ 后方左  │      正前方       │ 后方右  │
-         ├─────────┼───────────────────┼─────────┤
-   下    │  ×1.5   │  ×3.0 (1.5×2.0)   │  ×1.5   │
-(稀疏)   │  左后   │     中心/前方     │  右后   │
-         └───────────────────────────────────────┘
-```
-
-- **中心区域（前方）**：权重 ×2.0
-- **上下区域**：权重 ×1.5
-- **区域损失权重**：占总损失 20%
-
-</details>
 
 ### 轨迹预测模块
 
@@ -405,10 +377,6 @@ model:
     num_inference_steps: 20
     cfg_drop_prob: 0.1
     cfg_scale: 3.0
-    regional_loss_enabled: true
-    regional_center_alpha: 2.0
-    regional_vertical_alpha: 1.5
-    regional_loss_weight: 0.2
 
 # 优化器配置
 optim:

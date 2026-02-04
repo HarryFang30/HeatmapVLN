@@ -507,11 +507,6 @@ def build_model(cfg: Dict) -> nn.Module:
         # Classifier-Free Guidance (CFG) for heatmap
         heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
         heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
-        # 区域感知损失 (Regional Focal Loss)
-        heatmap_regional_loss_enabled=heatmap_cfg.get('regional_loss_enabled', True),
-        heatmap_regional_center_alpha=heatmap_cfg.get('regional_center_alpha', 2.0),
-        heatmap_regional_vertical_alpha=heatmap_cfg.get('regional_vertical_alpha', 1.5),
-        heatmap_regional_loss_weight=heatmap_cfg.get('regional_loss_weight', 0.2),
         
         # Action Head Type
         action_head_type=action_head_type,
@@ -1049,15 +1044,6 @@ def train_one_epoch(
                         if base_loss_val > 0:
                             focal_ratio = focal_loss_val / base_loss_val
                             tb_writer.add_scalar('diag/heatmap_focal_ratio', focal_ratio, actual_step)
-                    
-                    # 区域感知损失诊断 (Regional Focal Loss)
-                    if 'history_heatmap_regional_loss' in output and output['history_heatmap_regional_loss'] is not None:
-                        regional_loss_val = output['history_heatmap_regional_loss']
-                        tb_writer.add_scalar('diag/heatmap_regional_loss', regional_loss_val, actual_step)
-                        # 区域损失与基础损失的比值
-                        if 'history_heatmap_base_loss' in output and output['history_heatmap_base_loss'] > 0:
-                            regional_ratio = regional_loss_val / output['history_heatmap_base_loss']
-                            tb_writer.add_scalar('diag/heatmap_regional_ratio', regional_ratio, actual_step)
                     
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
