@@ -1038,6 +1038,9 @@ def train_one_epoch(
                         # 计算各区域的 MSE 损失，用于定位问题区域
                         B, C, H, W = pred_hm.shape
                         gt_hm_diag = gt_heatmap.to(pred_hm.device)
+                        # 确保 gt_hm_diag 是 4D [B, 1, H, W] 以匹配 pred_hm
+                        if gt_hm_diag.dim() == 3:
+                            gt_hm_diag = gt_hm_diag.unsqueeze(1)
                         
                         # 定义区域边界 (基于全景图特性)
                         w_third = W // 3
