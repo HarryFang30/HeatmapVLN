@@ -1034,47 +1034,12 @@ def train_one_epoch(
                         if non_zero_ratio < 0.05:
                             logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
                         
-                        # ==================== 区域损失细化 ====================
-                        # 计算各区域的 MSE 损失，用于定位问题区域
+                        # ==================== 热力图质量指标 ====================
                         B, C, H, W = pred_hm.shape
                         gt_hm_diag = gt_heatmap.to(pred_hm.device)
                         # 确保 gt_hm_diag 是 4D [B, 1, H, W] 以匹配 pred_hm
                         if gt_hm_diag.dim() == 3:
                             gt_hm_diag = gt_hm_diag.unsqueeze(1)
-                        
-                        # 定义区域边界 (基于全景图特性)
-                        w_third = W // 3
-                        h_third = H // 3
-                        
-                        # 左侧区域 (后方左) - 宽度 [0, W/3)
-                        left_pred = pred_hm[:, :, :, :w_third]
-                        left_gt = gt_hm_diag[:, :, :, :w_third]
-                        left_loss = F.mse_loss(left_pred, left_gt).item()
-                        tb_writer.add_scalar('diag/hm_loss_left', left_loss, actual_step)
-                        
-                        # 中心区域 (前方) - 宽度 [W/3, 2W/3)
-                        center_pred = pred_hm[:, :, :, w_third:2*w_third]
-                        center_gt = gt_hm_diag[:, :, :, w_third:2*w_third]
-                        center_loss = F.mse_loss(center_pred, center_gt).item()
-                        tb_writer.add_scalar('diag/hm_loss_center', center_loss, actual_step)
-                        
-                        # 右侧区域 (后方右) - 宽度 [2W/3, W)
-                        right_pred = pred_hm[:, :, :, 2*w_third:]
-                        right_gt = gt_hm_diag[:, :, :, 2*w_third:]
-                        right_loss = F.mse_loss(right_pred, right_gt).item()
-                        tb_writer.add_scalar('diag/hm_loss_right', right_loss, actual_step)
-                        
-                        # 上部区域 - 高度 [0, H/3)
-                        top_pred = pred_hm[:, :, :h_third, :]
-                        top_gt = gt_hm_diag[:, :, :h_third, :]
-                        top_loss = F.mse_loss(top_pred, top_gt).item()
-                        tb_writer.add_scalar('diag/hm_loss_top', top_loss, actual_step)
-                        
-                        # 下部区域 - 高度 [2H/3, H)
-                        bottom_pred = pred_hm[:, :, 2*h_third:, :]
-                        bottom_gt = gt_hm_diag[:, :, 2*h_third:, :]
-                        bottom_loss = F.mse_loss(bottom_pred, bottom_gt).item()
-                        tb_writer.add_scalar('diag/hm_loss_bottom', bottom_loss, actual_step)
                         
                         # ==================== 热力图质量指标 ====================
                         # 1. Peak 位置误差 (像素距离)
