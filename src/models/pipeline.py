@@ -84,12 +84,6 @@ class VLNPipelineConfig:
     heatmap_cfg_drop_prob: float = 0.1  # CFG: drop condition probability during training
     heatmap_cfg_scale: float = 3.0  # CFG: guidance scale during inference
     
-    # 区域感知损失 (Regional Focal Loss) - 解决热力图分布不均匀问题
-    heatmap_regional_loss_enabled: bool = True      # 启用区域感知损失
-    heatmap_regional_center_alpha: float = 2.5      # 中心区域（前方）权重倍数 (20% → 39%)
-    heatmap_regional_vertical_alpha: float = 1.0    # 上下区域权重倍数 (1.0=不加权)
-    heatmap_regional_loss_weight: float = 0.2       # 区域损失在总损失中的权重
-    
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
     # 'transformer': TransformerActionHead (InternNav style)
@@ -205,11 +199,6 @@ class VLNPipeline(nn.Module):
             # Classifier-Free Guidance (CFG)
             cfg_drop_prob=config.heatmap_cfg_drop_prob,
             cfg_scale=config.heatmap_cfg_scale,
-            # 区域感知损失 (Regional Focal Loss)
-            regional_loss_enabled=config.heatmap_regional_loss_enabled,
-            regional_center_alpha=config.heatmap_regional_center_alpha,
-            regional_vertical_alpha=config.heatmap_regional_vertical_alpha,
-            regional_loss_weight=config.heatmap_regional_loss_weight,
         )
         
         # History Heatmap Head
@@ -398,7 +387,6 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
-        history_heatmap_regional_loss = None  # 🆕 区域感知损失
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
@@ -421,7 +409,6 @@ class VLNPipeline(nn.Module):
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
-                    history_heatmap_regional_loss = result.get('regional_loss')  # 🆕
                 else:
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
@@ -504,8 +491,6 @@ class VLNPipeline(nn.Module):
             if history_heatmap_base_loss is not None:
                 output['history_heatmap_base_loss'] = history_heatmap_base_loss
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
-            if history_heatmap_regional_loss is not None:  # 🆕 区域感知损失
-                output['history_heatmap_regional_loss'] = history_heatmap_regional_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:
@@ -627,7 +612,6 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
-        history_heatmap_regional_loss = None  # 🆕 区域感知损失
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
@@ -650,7 +634,6 @@ class VLNPipeline(nn.Module):
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
-                    history_heatmap_regional_loss = result.get('regional_loss')  # 🆕
                 else:
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
@@ -731,8 +714,6 @@ class VLNPipeline(nn.Module):
             if history_heatmap_base_loss is not None:
                 output['history_heatmap_base_loss'] = history_heatmap_base_loss
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
-            if history_heatmap_regional_loss is not None:  # 🆕 区域感知损失
-                output['history_heatmap_regional_loss'] = history_heatmap_regional_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:

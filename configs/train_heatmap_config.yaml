@@ -1,0 +1,262 @@
+seed: 42
+
+# ============================================
+# 数据配置 - 使用 patrol_data 数据集
+# ============================================
+data:
+  root: /root/autodl-tmp/patrol_data
+  train_split: train
+  val_split: val
+  image_size: [224, 224]
+  init_hm_size: [64, 64]
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  
+  # 使用 sliding_window 数据集（patrol_data 没有 trajectory 数据）
+  dataset_type: sliding_window
+  
+  sliding_window:
+    min_history: 5
+    num_history_sample: 32       # 历史帧采样数量
+    load_depth: true             # 加载深度图用于遮挡检测
+    cache_poses: true
+    sample_stride: 2             # 采样步长
+    
+    # Clip-level 采样策略
+    clip_level_sampling: true
+    samples_per_clip: 30         # 每 clip 采样 30 个样本
+    val_samples_per_clip: 10     # 验证集采样数
+  
+  # 轨迹数据集配置（未使用，保留以兼容代码）
+  trajectory:
+    min_history: 5
+    num_history_sample: 32
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: true
+    samples_per_clip: 30
+    val_samples_per_clip: 10
+    random_subsequence: false
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    predict_horizon: 24
+    action_scale: 4.0
+    enable_trajectory_augmentation: false
+    use_subinstruction: false
+    fgr2r_subinstr_path: null
+
+# ============================================
+# 模型配置
+# ============================================
+model:
+  type: vln_pipeline
+  device: cuda
+
+  # Qwen3-VL 配置
+  llm:
+    model_path: ./models/qwen_3_vl
+    hidden_dim: 4096
+    token_dim: 1024
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    max_video_frames: -1       # -1 表示不限制帧数
+    
+    # Sequence Packing 配置
+    enable_packing: true
+    max_seq_length: 8192
+    spatial_merge_size: 2
+
+  # 热力图头配置 (只训练 history head)
+  heatmap_head:
+    enable_history: true
+    enable_future: false       # 禁用 future head
+    
+    # 条件编码维度
+    cond_dim: 1024
+    
+    # UNet 架构配置
+    block_out_channels: [128, 256, 512, 512]
+    layers_per_block: 2
+    attention_levels: [2, 3]
+    
+    # Diffusion 配置
+    num_inference_steps: 20
+    num_train_timesteps: 100
+    
+    # Classifier-Free Guidance
+    cfg_drop_prob: 0.1
+    cfg_scale: 3.0
+    
+    # 正则化
+    dropout: 0.1
+    
+    # Pinhole 相机不需要循环填充（非 360° 全景）
+    use_circular_padding: false
+    
+    # 禁用 CNN encoder，只用 LLM 特征
+    use_image_encoder: false
+    
+    # LLM token pooling
+    pool_method: attention
+    pool_num_heads: 8
+
+  # 动作头配置 - 禁用（不训练动作）
+  action_head:
+    enable: false              # 完全禁用动作头
+    type: transformer
+    
+    legacy:
+      cond_dim: 1024
+      action_dim: 2
+      pred_horizon: 1
+      num_diffusion_iters: 10
+      encoding_size: 256
+      down_dims: [128, 256]
+      action_stats_min: [-0.1646, -0.0281]
+      action_stats_max: [0.1850, 0.3087]
+    
+    transformer:
+      vlm_token_dim: 1024
+      n_emb: 384
+      predict_size: 24
+      n_layer: 16
+      n_head: 8
+      n_cond_layers: 4
+      action_dim: 3
+      num_train_timesteps: 20
+      action_scale: 4.0
+      p_drop_emb: 0.2
+      p_drop_attn: 0.2
+      causal_attn: true
+
+  # Progress 预测头 - 禁用
+  progress_head:
+    enable: false              # 禁用进度预测
+    hidden_dim: 512
+    dropout: 0.3
+    concat_state_txt: true
+
+  # Stop 预测头 - 禁用
+  stop_head:
+    enable: false
+    hidden_dim: 512
+    focal_gamma: 3.0
+    focal_alpha: 0.9
+
+# ============================================
+# 训练策略 - 只训练热力图头
+# ============================================
+training:
+  stages:
+    - name: heatmap_only_64
+      epochs: 20               # 增加 epoch 数（只训练一个头）
+      hm_size: [64, 64]
+      heatmap_loss_type: simplified
+      train_history: true
+      train_future: false
+      train_action: false      # 不训练动作
+      trainable_modules:
+        - history_heatmap_head # 只训练热力图头
+        - llm_projector        # 训练投影层
+      frozen_modules:
+        - qwen3_vl             # 冻结 VLM
+        - future_heatmap_head
+        - transformer_action_head
+        - action_head
+        - progress_head
+        - stop_head
+
+# ============================================
+# 优化器配置
+# ============================================
+optim:
+  optimizer: adamw
+
+  # 分组学习率
+  heatmap_lr: 1.0e-4
+  history_heatmap_lr: 1.0e-4
+  future_heatmap_lr: 1.0e-4
+  action_lr: 1.0e-4
+  transformer_action_lr: 1.0e-4
+  progress_lr: 1.0e-4
+  llm_projector_lr: 1.0e-4
+
+  # 正则化
+  weight_decay: 5.0e-2
+  projector_weight_decay: 5.0e-3
+  
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.1
+  min_lr: 1.0e-6
+  
+  # 批量配置（单头训练可以用更大 batch）
+  batch_size: 16              # 只训练热力图头，可以增加 batch
+  grad_accum_steps: 2         # 有效 batch = 32
+
+# ============================================
+# 损失函数
+# ============================================
+loss:
+  heatmap_loss_type: simplified
+  
+  simplified:
+    lambda_mse: 1.0
+    lambda_grad: 0.3
+    peak_weight: 5.0
+  
+  nerf_ripple:
+    lambda_mse: 1.0
+    lambda_fft: 0.3
+    lambda_radial: 0.2
+    lambda_peak: 1.0
+    fft_weight_decay: 0.5
+  
+  # 只有热力图损失有效
+  history_weight: 1.0
+  future_weight: 0.0
+  action_weight: 0.0
+  trajectory_weight: 0.0
+  progress_weight: 0.0
+  stop_weight: 0.0
+
+# ============================================
+# GPU配置
+# ============================================
+gpu:
+  devices: [0]
+  backend: nccl
+
+# ============================================
+# 日志与保存
+# ============================================
+log:
+  out_dir: /root/autodl-tmp/heatmap_training_outputs
+  save_every_epochs: 1
+  vis_every_steps: 100
+  val_vis_batches: 2
+  max_ckpts: 5
+  use_tensorboard: true
+  tensorboard_dir: /root/tf-logs/heatmap_only
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  
+  # 飞书通知配置
+  notify:
+    enabled: true
+    platform: feishu
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+
+# ============================================
+# 验证配置
+# ============================================
+validation:
+  eval_every_epochs: 1
+  save_best_metric: val_total_loss
+  patience: 10                 # 只训练一个头，可以更耐心

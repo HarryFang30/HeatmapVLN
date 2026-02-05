@@ -97,14 +97,6 @@ model:
     cfg_drop_prob: 0.1             # 训练时随机 drop 条件的概率
     cfg_scale: 3.0                 # 推理时的引导强度 (1.0=无引导, 3.0=推荐)
     
-    # 区域感知损失 (Regional Focal Loss) - 解决热力图分布不均匀问题
-    # 问题：89% 点集中在垂直中间，80% 在水平两侧（后方）
-    # 方案：对前方区域给予更高权重（上下区域几乎没有有效数据，不增加权重）
-    regional_loss_enabled: true    # 启用区域感知损失
-    regional_center_alpha: 2.5     # 中心区域（前方）权重倍数 (20% → 39%)
-    regional_vertical_alpha: 1.0   # 上下区域权重倍数 (1.0=不加权，避免过拟合噪声)
-    regional_loss_weight: 0.2      # 区域损失在总损失中的权重
-    
     # 正则化
     dropout: 0.1                   # 0.2 → 0.1 (降低，让模型更好地学习条件)
     

@@ -114,52 +114,95 @@ class GaussianNoiseAugmentation:
         return np.clip(noisy, 0, 255).astype(np.uint8)
 
 
-# ==================== 热力图计算工具函数 ====================
+# ==================== 热力图计算工具函数 (Pinhole 投影) ====================
 
-def project_point_equirect(p_cam: np.ndarray, width: int, height: int) -> Optional[Tuple[float, float]]:
+def project_point_pinhole(
+    p_cam: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int
+) -> Optional[Tuple[float, float, float]]:
     """
-    将相机坐标系下的3D点投影到Equirectangular图像坐标
+    将相机坐标系下的3D点投影到Pinhole图像坐标
     
     Args:
         p_cam: [x, y, z] 或 [x, y, z, 1] 相机坐标系下的点
+        K: 3x3 相机内参矩阵
         width: 图像宽度
         height: 图像高度
     
     Returns:
-        (u, v) 像素坐标，或 None 如果点太近
+        (u, v, z_depth) 像素坐标和深度，或 None 如果点在相机后方或太近
+    
+    Note:
+        Habitat 相机坐标系：X 右，Y 上，-Z 前
+        因此相机前方是 z < 0
     """
     x, y, z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
-    r = math.sqrt(x * x + y * y + z * z)
-    if r < 1e-6:
+    
+    # 相机前方是 -Z 方向，所以 z < 0 才是在相机前方
+    if z >= -0.1:  # 在相机后方或太近
         return None
+    
+    # 转换深度为正值
+    z_depth = -z
+    
+    # Pinhole 投影
+    # 注意 Y 轴方向：相机 Y 向上，图像 v 向下
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    
+    u = fx * x / z_depth + cx
+    v = fy * (-y) / z_depth + cy  # Y 轴翻转
+    
+    # 检查是否在图像范围内
+    if not (0 <= u < width and 0 <= v < height):
+        return None
+    
+    return float(u), float(v), float(z_depth)
 
-    phi = math.atan2(x, -z)  # 水平角
-    theta = math.asin(np.clip(y / r, -1.0, 1.0))  # 垂直角
 
-    u = (phi + math.pi) / (2.0 * math.pi) * width
-    v = (0.5 - (theta / math.pi)) * height
-
-    u = u % width
-    v = np.clip(v, 0.0, height - 1e-6)
-    return float(u), float(v)
-
-
-def compute_adaptive_sigma(
-    distance: float,
-    object_size_3d: float = 0.3,
+def compute_adaptive_sigma_pinhole(
+    z_depth: float,
+    fx: float,
+    object_size_3d: float = 0.5,
     heatmap_width: int = 64,
-    min_sigma: float = 0.5,
-    max_sigma: float = 5.0
+    img_width: int = 640,
+    min_sigma: float = 0.8,
+    max_sigma: float = 6.0
 ) -> float:
-    """计算Equirectangular坐标系下的自适应sigma"""
-    if distance <= 1e-4:
+    """
+    计算 Pinhole 投影下的自适应 sigma
+    
+    透视投影：物体在图像中的大小 = object_size * fx / z_depth
+    sigma 约为投影大小的 1/3
+    
+    Args:
+        z_depth: 点到相机的深度（米）
+        fx: 相机焦距（像素）
+        object_size_3d: 3D 物体大小（米）
+        heatmap_width: 热力图宽度
+        img_width: 原始图像宽度
+        min_sigma: 最小 sigma
+        max_sigma: 最大 sigma
+    
+    Returns:
+        sigma 值
+    """
+    if z_depth <= 0.1:
         return float(max_sigma)
-
-    angular_radius = math.atan2(object_size_3d, distance)
-    pixels_per_rad = heatmap_width / (2.0 * math.pi)
-    projected_radius_heatmap = angular_radius * pixels_per_rad
-    sigma = projected_radius_heatmap / 3.0
+    
+    # 在原图中的投影大小（像素）
+    projected_size_img = object_size_3d * fx / z_depth
+    
+    # 转换到热力图坐标系
+    scale = heatmap_width / img_width
+    projected_size_hm = projected_size_img * scale
+    
+    # sigma 约为投影大小的 1/3
+    sigma = projected_size_hm / 3.0
     sigma = np.clip(sigma, min_sigma, max_sigma)
+    
     return float(sigma)
 
 
@@ -206,15 +249,16 @@ def compute_history_heatmap(
     current_pose: np.ndarray,
     current_depth: Optional[np.ndarray],
     hm_size: Tuple[int, int] = (64, 64),
-    img_size: Tuple[int, int] = (512, 256),
+    img_size: Tuple[int, int] = (640, 480),
+    K: Optional[np.ndarray] = None,
     depth_normalize: bool = True,
     depth_min: float = 0.0,
     depth_max: float = 10.0,
-    occlusion_tolerance: float = 0.25,
+    occlusion_tolerance: float = 0.5,
     max_visible_distance: float = 15.0,
 ) -> Tuple[np.ndarray, int]:
     """
-    计算当前帧中历史帧相机位置的热力图
+    计算当前帧中历史帧相机位置的热力图 (Pinhole 投影版本)
     
     Args:
         history_poses: 历史帧的 4x4 位姿矩阵列表
@@ -222,6 +266,7 @@ def compute_history_heatmap(
         current_depth: 当前帧的深度图（用于遮挡检测），可选
         hm_size: 热力图尺寸 (H, W)
         img_size: 原始图像尺寸 (W, H)
+        K: 3x3 相机内参矩阵，如果为 None 则根据 img_size 和默认 HFOV=90° 计算
         depth_normalize: 深度是否归一化到 [0, 1]
         depth_min/max: 深度范围
         occlusion_tolerance: 遮挡容差（米）
@@ -236,6 +281,23 @@ def compute_history_heatmap(
     
     heatmap = np.zeros((Hm, Wm), dtype=np.float32)
     visibility_count = 0
+    
+    # 如果没有提供内参，使用默认值（HFOV=90°）
+    if K is None:
+        hfov_rad = math.radians(90.0)
+        fx = img_w / (2.0 * math.tan(hfov_rad / 2.0))
+        fy = fx
+        cx = img_w / 2.0
+        cy = img_h / 2.0
+        K = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    else:
+        K = np.array(K, dtype=np.float32)
+    
+    fx = K[0, 0]
     
     # 当前帧位姿的逆（用于将历史帧位置转换到当前帧坐标系）
     T_current = np.array(current_pose, dtype=np.float32)
@@ -265,14 +327,11 @@ def compute_history_heatmap(
         if distance < 1e-4 or distance > max_visible_distance:
             continue
         
-        # 投影到图像坐标
-        projection = project_point_equirect(p_cam, img_w, img_h)
+        # 投影到图像坐标 (Pinhole)
+        projection = project_point_pinhole(p_cam, K, img_w, img_h)
         if projection is None:
             continue
-        u, v = projection
-        
-        if not (0.0 <= v < img_h):
-            continue
+        u, v, z_depth = projection
         
         # 遮挡检测
         if depth_plane is not None:
@@ -288,14 +347,16 @@ def compute_history_heatmap(
             
             if not np.isfinite(observed_depth) or observed_depth <= 0:
                 continue
-            if observed_depth < distance - occlusion_tolerance:
+            if observed_depth < z_depth - occlusion_tolerance:
                 continue  # 被遮挡
         
-        # 计算自适应 sigma
-        sigma = compute_adaptive_sigma(
-            distance=distance,
+        # 计算自适应 sigma (Pinhole 版本)
+        sigma = compute_adaptive_sigma_pinhole(
+            z_depth=z_depth,
+            fx=fx,
             object_size_3d=0.5,
             heatmap_width=Wm,
+            img_width=img_w,
             min_sigma=0.8,
             max_sigma=6.0
         )
@@ -431,14 +492,27 @@ class VLNSlidingWindowDataset(Dataset):
         )
     
     def _enumerate_clips(self) -> List[Path]:
-        """枚举所有 clip 目录"""
+        """枚举所有 clip 目录
+        
+        支持两种目录结构：
+        1. root/split/scene/clip_xxx（标准结构）
+        2. root/scene/clip_xxx（patrol_data 结构，无 split 层）
+        """
         split_dir = self.root / self.split
         
-        if not split_dir.exists():
-            raise FileNotFoundError(f"Split directory not found: {split_dir}")
+        # 检查是否存在 split 目录
+        if split_dir.exists():
+            search_dir = split_dir
+        else:
+            # 尝试直接使用 root 目录（patrol_data 格式）
+            logger.info(f"Split directory {split_dir} not found, using root directory directly")
+            search_dir = self.root
+        
+        if not search_dir.exists():
+            raise FileNotFoundError(f"Data directory not found: {search_dir}")
         
         clips = []
-        scene_dirs = [d for d in split_dir.iterdir() if d.is_dir()]
+        scene_dirs = [d for d in search_dir.iterdir() if d.is_dir()]
         
         for scene_dir in scene_dirs:
             clip_dirs = sorted([
@@ -448,7 +522,7 @@ class VLNSlidingWindowDataset(Dataset):
             clips.extend(clip_dirs)
         
         if len(clips) == 0:
-            raise FileNotFoundError(f"No clips found in {split_dir}")
+            raise FileNotFoundError(f"No clips found in {search_dir}")
         
         logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips
@@ -731,10 +805,13 @@ class VLNSlidingWindowDataset(Dataset):
     
     def _load_frame(self, clip_dir: Path, frame_idx: int, apply_augmentation: bool = True) -> torch.Tensor:
         """加载单帧图像"""
-        rgb_path = clip_dir / "rgb" / f"{frame_idx:06d}.png"
+        # 支持 .jpg 和 .png 两种格式（patrol_data 使用 .jpg）
+        rgb_path = clip_dir / "rgb" / f"{frame_idx:06d}.jpg"
+        if not rgb_path.exists():
+            rgb_path = clip_dir / "rgb" / f"{frame_idx:06d}.png"
 
         if not rgb_path.exists():
-            raise FileNotFoundError(f"RGB file not found: {rgb_path}")
+            raise FileNotFoundError(f"RGB file not found: {clip_dir / 'rgb' / f'{frame_idx:06d}.{{jpg,png}}'}")
 
         image = cv2.imread(str(rgb_path))
         if image is None:
@@ -925,14 +1002,17 @@ class VLNSlidingWindowDataset(Dataset):
             current_depth = self._load_depth(clip_dir, current_t)
             
             # 7. 计算热力图
-            # 获取原始图像尺寸（从 intrinsics 或使用默认值）
+            # 获取原始图像尺寸和相机内参
             intrinsics_path = clip_dir / "intrinsics.json"
+            K = None
             if intrinsics_path.exists():
                 with open(intrinsics_path) as f:
                     intrinsics = json.load(f)
                 img_size = (intrinsics["width"], intrinsics["height"])
+                if "K" in intrinsics:
+                    K = np.array(intrinsics["K"], dtype=np.float32)
             else:
-                img_size = (512, 256)  # 默认全景图尺寸
+                img_size = (640, 480)  # 默认 Pinhole 图像尺寸
             
             hm_w, hm_h = self.hm_size
             heatmap, visibility = compute_history_heatmap(
@@ -941,6 +1021,7 @@ class VLNSlidingWindowDataset(Dataset):
                 current_depth=current_depth,
                 hm_size=(hm_h, hm_w),
                 img_size=img_size,
+                K=K,
             )
             heatmap_tensor = torch.from_numpy(heatmap).float()
             
@@ -1654,12 +1735,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             
             # 7. 计算热力图
             intrinsics_path = clip_dir / "intrinsics.json"
+            K = None
             if intrinsics_path.exists():
                 with open(intrinsics_path) as f:
                     intrinsics = json.load(f)
                 img_size = (intrinsics["width"], intrinsics["height"])
+                if "K" in intrinsics:
+                    K = np.array(intrinsics["K"], dtype=np.float32)
             else:
-                img_size = (512, 256)
+                img_size = (640, 480)  # 默认 Pinhole 图像尺寸
             
             hm_w, hm_h = self.hm_size
             heatmap, visibility = compute_history_heatmap(
@@ -1668,6 +1752,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 current_depth=current_depth,
                 hm_size=(hm_h, hm_w),
                 img_size=img_size,
+                K=K,
             )
             heatmap_tensor = torch.from_numpy(heatmap).float()
             
