@@ -58,6 +58,7 @@ from src.data.packing_collator import PackingCollatorForVLN
 from src.data.tokenized_dataset import TokenizedVLNDataset, FlattenedCollatorForVLN
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.logger import setup_logger
+from src.utils.gpu_heatmap import GPUHeatmapComputer
 from src.utils.notifier import FeishuNotifier, create_notifier
 
 logger = logging.getLogger(__name__)
@@ -779,6 +780,7 @@ def train_one_epoch(
     max_batches: int = None,
     packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
+    gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     
@@ -830,11 +832,33 @@ def train_one_epoch(
             current_frame = batch['current_frame']
             B, K, C, H, W = history_frames.shape
         
-        gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
+        
+        # GPU 热力图计算（如果启用）
+        if gpu_heatmap_computer is not None and 'history_poses' in batch:
+            history_poses = batch['history_poses'].to(device)  # [B, K, 4, 4]
+            current_poses = batch['current_pose'].to(device)   # [B, 4, 4]
+            
+            # 检查是否有深度图
+            has_depth = batch.get('has_depth', False)
+            current_depths = batch['current_depth'].to(device) if has_depth else None
+            
+            # 检查是否有内参
+            has_intrinsics = batch.get('has_intrinsics', False)
+            intrinsics = batch['intrinsics'].to(device) if has_intrinsics else None
+            
+            # 在 GPU 上计算热力图
+            gt_heatmap = gpu_heatmap_computer.compute_batch(
+                history_poses=history_poses,
+                current_poses=current_poses,
+                current_depths=current_depths,
+                intrinsics=intrinsics,
+            )  # [B, Hm, Wm]
+        else:
+            gt_heatmap = batch['heatmap'].to(device)
         
         # 前向传播
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -1223,6 +1247,7 @@ def validate(
     packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
     max_batches: int = None,
+    gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
 ) -> Dict[str, float]:
     """验证（带可视化）"""
     model.eval()
@@ -1258,11 +1283,30 @@ def validate(
             current_frame = batch['current_frame']
             B, K, C, H, W = history_frames.shape
         
-        gt_heatmap = batch['heatmap'].to(device)
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
+        
+        # GPU 热力图计算（如果启用）
+        if gpu_heatmap_computer is not None and 'history_poses' in batch:
+            history_poses = batch['history_poses'].to(device)
+            current_poses = batch['current_pose'].to(device)
+            
+            has_depth = batch.get('has_depth', False)
+            current_depths = batch['current_depth'].to(device) if has_depth else None
+            
+            has_intrinsics = batch.get('has_intrinsics', False)
+            intrinsics = batch['intrinsics'].to(device) if has_intrinsics else None
+            
+            gt_heatmap = gpu_heatmap_computer.compute_batch(
+                history_poses=history_poses,
+                current_poses=current_poses,
+                current_depths=current_depths,
+                intrinsics=intrinsics,
+            )
+        else:
+            gt_heatmap = batch['heatmap'].to(device)
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             if packing_enabled:
@@ -1806,6 +1850,7 @@ def main():
         sample_stride = sw_cfg.get('sample_stride', 1)
         clip_level_sampling = sw_cfg.get('clip_level_sampling', True)
         samples_per_clip = sw_cfg.get('samples_per_clip', 2)
+        defer_heatmap_to_gpu = sw_cfg.get('defer_heatmap_to_gpu', False)
         
         train_dataset = VLNSlidingWindowDataset(
             root=cfg['data']['root'],
@@ -1819,6 +1864,7 @@ def main():
             sample_stride=sample_stride,
             clip_level_sampling=clip_level_sampling,
             samples_per_clip=samples_per_clip,
+            defer_heatmap_to_gpu=defer_heatmap_to_gpu,
         )
         
         val_split = cfg['data'].get('val_split', 'val')
@@ -1835,6 +1881,7 @@ def main():
             sample_stride=sample_stride,
             clip_level_sampling=clip_level_sampling,
             samples_per_clip=val_samples_per_clip,
+            defer_heatmap_to_gpu=defer_heatmap_to_gpu,
         )
     
     # 验证集使用固定 epoch=0，确保每次验证样本一致
@@ -2051,6 +2098,25 @@ def main():
     patience = cfg['validation'].get('patience', 5)
     no_improve_count = 0
     
+    # GPU 热力图计算器（减少 CPU 瓶颈）
+    data_cfg = cfg['data']
+    sliding_cfg = data_cfg.get('sliding_window', {})
+    defer_heatmap_to_gpu = sliding_cfg.get('defer_heatmap_to_gpu', False)
+    
+    if defer_heatmap_to_gpu:
+        hm_size = tuple(data_cfg.get('init_hm_size', [64, 64]))
+        # 从 intrinsics 或默认值获取图像尺寸
+        img_size = (640, 480)  # 默认 Pinhole 尺寸
+        
+        gpu_heatmap_computer = GPUHeatmapComputer(
+            hm_size=hm_size,
+            img_size=img_size,
+            device='cuda',
+        )
+        logger.info(f"🚀 GPU heatmap computation enabled (hm_size={hm_size})")
+    else:
+        gpu_heatmap_computer = None
+    
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
     
@@ -2086,6 +2152,7 @@ def main():
             max_batches=args.max_batches,
             packing_enabled=packing_enabled,
             vis_dir=vis_train_dir,
+            gpu_heatmap_computer=gpu_heatmap_computer,
         )
         
         timer.end_epoch()
@@ -2095,6 +2162,7 @@ def main():
             packing_enabled=packing_enabled,
             vis_dir=vis_val_dir,
             max_batches=args.max_batches,
+            gpu_heatmap_computer=gpu_heatmap_computer,
         )
         
         logger.info(

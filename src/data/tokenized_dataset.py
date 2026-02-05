@@ -234,7 +234,7 @@ class TokenizedVLNDataset(Dataset):
         )
         
         # 7. 返回 tokenized 数据 + 原始 VLN 数据
-        return {
+        output = {
             # Tokenized LLM inputs
             "input_ids": input_ids,                    # (1, seq_len)
             "position_ids": position_ids,              # (3, 1, seq_len)
@@ -259,6 +259,18 @@ class TokenizedVLNDataset(Dataset):
             "trajectory_valid": sample.get('trajectory_valid', 0.0),
             "progress": sample.get('progress', 0.0),
         }
+        
+        # GPU 热力图计算数据（如果有）
+        if 'history_poses' in sample:
+            output['history_poses'] = sample['history_poses']
+            output['current_pose'] = sample['current_pose']
+            output['current_depth'] = sample['current_depth']
+            output['intrinsics'] = sample['intrinsics']
+            output['has_depth'] = sample['has_depth']
+            output['has_intrinsics'] = sample['has_intrinsics']
+            output['img_size'] = sample['img_size']
+        
+        return output
 
 
 class FlattenedCollatorForVLN:
@@ -350,5 +362,16 @@ class FlattenedCollatorForVLN:
             batch['trajectory'] = torch.stack(trajectories, dim=0)
             batch['trajectory_valid'] = torch.tensor([inst.get('trajectory_valid', 0.0) for inst in instances])
             batch['progress'] = torch.tensor([inst.get('progress', 0.0) for inst in instances])
+        
+        # GPU 热力图计算数据（如果有）
+        if 'history_poses' in instances[0]:
+            batch['history_poses'] = torch.stack([inst['history_poses'] for inst in instances], dim=0)
+            batch['current_pose'] = torch.stack([inst['current_pose'] for inst in instances], dim=0)
+            batch['current_depth'] = torch.stack([inst['current_depth'] for inst in instances], dim=0)
+            batch['intrinsics'] = torch.stack([inst['intrinsics'] for inst in instances], dim=0)
+            # has_depth 和 has_intrinsics: 取第一个样本的值（假设 batch 内一致）
+            batch['has_depth'] = instances[0].get('has_depth', False)
+            batch['has_intrinsics'] = instances[0].get('has_intrinsics', False)
+            batch['img_size'] = instances[0].get('img_size', (640, 480))
         
         return batch

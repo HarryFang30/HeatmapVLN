@@ -434,6 +434,8 @@ class VLNSlidingWindowDataset(Dataset):
         random_subsequence: bool = False,  # 是否启用随机子序列采样
         min_subsequence_length: int = 30,  # 最小子序列长度
         subsequence_samples_per_clip: int = 3,  # 每个 clip 生成的子序列数量
+        # GPU 热力图计算（将热力图计算延迟到 GPU）
+        defer_heatmap_to_gpu: bool = False,  # 是否返回 poses 而非预计算的热力图
     ):
         self.root = Path(root).expanduser()
         self.split = split
@@ -455,6 +457,11 @@ class VLNSlidingWindowDataset(Dataset):
         self.random_subsequence = random_subsequence and (split == 'train')  # 仅训练集启用
         self.min_subsequence_length = min_subsequence_length
         self.subsequence_samples_per_clip = subsequence_samples_per_clip
+        
+        # GPU 热力图计算配置
+        self.defer_heatmap_to_gpu = defer_heatmap_to_gpu
+        if defer_heatmap_to_gpu:
+            logger.info("GPU heatmap computation enabled: returning poses instead of heatmaps")
 
         # 数据增强 (仅训练集启用)
         self.enable_augmentation = enable_augmentation and (split == 'train')
@@ -1001,8 +1008,7 @@ class VLNSlidingWindowDataset(Dataset):
             # 6. 加载当前帧深度（用于遮挡检测）
             current_depth = self._load_depth(clip_dir, current_t)
             
-            # 7. 计算热力图
-            # 获取原始图像尺寸和相机内参
+            # 7. 获取相机内参
             intrinsics_path = clip_dir / "intrinsics.json"
             K = None
             if intrinsics_path.exists():
@@ -1014,16 +1020,50 @@ class VLNSlidingWindowDataset(Dataset):
             else:
                 img_size = (640, 480)  # 默认 Pinhole 图像尺寸
             
+            # 7b. 计算热力图或返回 poses（GPU 延迟计算模式）
             hm_w, hm_h = self.hm_size
-            heatmap, visibility = compute_history_heatmap(
-                history_poses=history_poses,
-                current_pose=current_pose,
-                current_depth=current_depth,
-                hm_size=(hm_h, hm_w),
-                img_size=img_size,
-                K=K,
-            )
-            heatmap_tensor = torch.from_numpy(heatmap).float()
+            if self.defer_heatmap_to_gpu:
+                # GPU 模式：返回 poses，在训练循环中用 GPU 计算热力图
+                history_poses_np = np.stack(history_poses, axis=0)  # [K, 4, 4]
+                current_pose_np = np.array(current_pose)            # [4, 4]
+                history_poses_tensor = torch.from_numpy(history_poses_np).float()
+                current_pose_tensor = torch.from_numpy(current_pose_np).float()
+                
+                # 深度图转 tensor（如果有）
+                if current_depth is not None:
+                    depth_tensor = torch.from_numpy(current_depth).float()
+                else:
+                    # placeholder: 使用与热力图相同尺寸，避免 stack 时形状不匹配
+                    depth_tensor = torch.zeros(hm_h, hm_w)
+                
+                # 内参转 tensor
+                if K is not None:
+                    intrinsics_tensor = torch.from_numpy(K).float()
+                else:
+                    intrinsics_tensor = torch.zeros(3, 3)  # 使用默认值的标志
+                
+                # 返回占位热力图（实际计算在 GPU 上完成）
+                heatmap_tensor = torch.zeros(hm_h, hm_w)
+                has_depth = current_depth is not None
+                has_intrinsics = K is not None
+            else:
+                # CPU 模式：直接计算热力图
+                heatmap, visibility = compute_history_heatmap(
+                    history_poses=history_poses,
+                    current_pose=current_pose,
+                    current_depth=current_depth,
+                    hm_size=(hm_h, hm_w),
+                    img_size=img_size,
+                    K=K,
+                )
+                heatmap_tensor = torch.from_numpy(heatmap).float()
+                # GPU 模式所需的 placeholder
+                history_poses_tensor = torch.zeros(1)
+                current_pose_tensor = torch.zeros(1)
+                depth_tensor = torch.zeros(1)
+                intrinsics_tensor = torch.zeros(1)
+                has_depth = False
+                has_intrinsics = False
             
             # 8. 加载连续动作
             actions = self._load_actions(clip_dir)
@@ -1061,7 +1101,7 @@ class VLNSlidingWindowDataset(Dataset):
                 discrete_action = 1  # Default to FORWARD
                 is_stop = 0.0
             
-            return {
+            result = {
                 "history_frames": history_frames,      # [K, 3, H, W]
                 "current_frame": current_frame,        # [3, H, W]
                 "heatmap": heatmap_tensor,             # [Hm, Wm]
@@ -1071,6 +1111,18 @@ class VLNSlidingWindowDataset(Dataset):
                 "is_stop": is_stop,                    # float (0 or 1)
                 "text": text,                          # str
             }
+            
+            # GPU 热力图计算所需的额外字段
+            if self.defer_heatmap_to_gpu:
+                result["history_poses"] = history_poses_tensor  # [K, 4, 4]
+                result["current_pose"] = current_pose_tensor    # [4, 4]
+                result["current_depth"] = depth_tensor          # [Hd, Wd] or [1]
+                result["intrinsics"] = intrinsics_tensor        # [3, 3] or [1]
+                result["has_depth"] = has_depth                 # bool
+                result["has_intrinsics"] = has_intrinsics       # bool
+                result["img_size"] = img_size                   # (W, H) tuple
+            
+            return result
             
         except Exception as e:
             logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
@@ -1084,7 +1136,7 @@ class VLNSlidingWindowDataset(Dataset):
         hm_w, hm_h = self.hm_size
         K = self.num_history_sample
         
-        return {
+        result = {
             "history_frames": torch.zeros(K, 3, target_h, target_w),
             "current_frame": torch.zeros(3, target_h, target_w),
             "heatmap": torch.zeros(hm_h, hm_w),
@@ -1094,6 +1146,18 @@ class VLNSlidingWindowDataset(Dataset):
             "is_stop": 0.0,
             "text": "",
         }
+        
+        # GPU 热力图计算所需的额外字段
+        if self.defer_heatmap_to_gpu:
+            result["history_poses"] = torch.zeros(K, 4, 4)
+            result["current_pose"] = torch.zeros(4, 4)
+            result["current_depth"] = torch.zeros(1)
+            result["intrinsics"] = torch.zeros(3, 3)
+            result["has_depth"] = False
+            result["has_intrinsics"] = False
+            result["img_size"] = (640, 480)
+        
+        return result
 
 
 def create_sliding_window_dataloader(

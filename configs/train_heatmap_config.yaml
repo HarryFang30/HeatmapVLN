@@ -23,6 +23,9 @@ data:
     cache_poses: true
     sample_stride: 2             # 采样步长
     
+    # GPU 热力图计算（大幅提升训练速度）
+    defer_heatmap_to_gpu: true   # 在 GPU 上计算热力图，减少 CPU 瓶颈
+    
     # Clip-level 采样策略
     clip_level_sampling: true
     samples_per_clip: 45         # 每 clip 采样 45 个样本 (9:1 比例)
