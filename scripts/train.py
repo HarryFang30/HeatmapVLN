@@ -561,10 +561,9 @@ def build_model(cfg: Dict) -> nn.Module:
         transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
         transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
         transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
-        transformer_n_head=transformer_action_cfg.get('n_head', 8),
+        transformer_n_head=transformer_action_cfg.get('n_head', 6),  # 对齐 InternNav: 384 // 64 = 6
         transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
         transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
-        transformer_action_scale=transformer_action_cfg.get('action_scale', 4.0),
         transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
         transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
         transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
@@ -977,8 +976,9 @@ def train_one_epoch(
                     if 'trajectory' in batch:
                         gt_trajectory = batch['trajectory'].to(device)
                         trajectory_valid = batch['trajectory_valid'].to(device)
+                        # 传入完整 llm_tokens 序列
                         traj_result = model.transformer_action_head.compute_loss(
-                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            output['llm_tokens'],
                             gt_trajectory,
                             trajectory_valid,
                         )
@@ -998,13 +998,15 @@ def train_one_epoch(
             
             if train_action:
                 # Progress Head (new)
+                # 修复：传入完整 llm_tokens 序列，确保 concat_state_txt 中
+                # last_token 和 mean_pool 是不同的表示（对齐 InternNav）
                 if hasattr(model, 'progress_head') and model.progress_head is not None:
                     if 'progress' in batch:
                         gt_progress = batch['progress'].to(device)
                         # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
                         progress_valid = batch.get('trajectory_valid', action_valid).to(device)
                         progress_result = model.progress_head(
-                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            output['llm_tokens'],  # 传入完整序列 (B, seq_len, D)
                             gt_progress=gt_progress,
                             action_valid=progress_valid,
                             return_loss=True,
@@ -1427,8 +1429,9 @@ def validate(
                     if 'trajectory' in batch:
                         gt_trajectory = batch['trajectory'].to(device)
                         trajectory_valid = batch['trajectory_valid'].to(device)
+                        # 传入完整 llm_tokens 序列
                         traj_result = model.transformer_action_head.compute_loss(
-                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            output['llm_tokens'],
                             gt_trajectory,
                             trajectory_valid,
                         )
@@ -1448,13 +1451,14 @@ def validate(
             
             if train_action:
                 # Progress Head (new)
+                # 修复：传入完整 llm_tokens 序列（对齐 InternNav）
                 if hasattr(model, 'progress_head') and model.progress_head is not None:
                     if 'progress' in batch:
                         gt_progress = batch['progress'].to(device)
                         # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
                         progress_valid = batch.get('trajectory_valid', action_valid).to(device)
                         progress_result = model.progress_head(
-                            output['action_cond'].unsqueeze(1) if output['action_cond'].dim() == 2 else output['action_cond'],
+                            output['llm_tokens'],  # 传入完整序列 (B, seq_len, D)
                             gt_progress=gt_progress,
                             action_valid=progress_valid,
                             return_loss=True,

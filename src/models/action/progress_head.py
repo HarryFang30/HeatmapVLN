@@ -17,8 +17,17 @@ if self.model_config.progress_monitor.concat_state_txt:
     )
 ```
 
+在 InternNav 中，state 和 fused_update_txt_embeds 是两个不同的表示：
+- state: GRU 隐藏状态（包含视觉+动作历史信息）
+- fused_update_txt_embeds: 跨模态融合后的文本嵌入
+
+在我们的架构中，必须传入完整的 LLM 序列 (B, seq_len, D)，seq_len > 1，
+以确保 last_token 和 mean_pool 是不同的表示：
+- state = LLM 的 last token（最后一个位置，包含最新状态信息）
+- text_embed = LLM 的 mean pooling（全局聚合信息）
+
 Architecture:
-    LLM Features (B, seq_len, D) -> [mean_pool, first_token] -> concat -> MLP -> Progress (0-1)
+    LLM Features (B, seq_len, D) -> [last_token, mean_pool] -> concat -> MLP -> Progress (0-1)
 """
 
 import logging
@@ -40,10 +49,14 @@ class ProgressPredictionHead(nn.Module):
     1. 使用 state + text_embed 拼接 (input_dim * 2)
     2. 3 层 MLP + ReLU + Sigmoid
     3. 简单 MSE loss
+    4. Kaiming 初始化（对齐 InternNav _init_pm_layers）
     
-    在我们的架构中：
-    - state = LLM 的 mean pooling (全局信息)
-    - text_embed = LLM 的第一个 token (通常包含指令信息)
+    在我们的架构中（需要传入完整 LLM 序列以保证两个表示不同）：
+    - state = LLM 的 last token（包含最新上下文信息，类似 GRU 隐藏状态）
+    - text_embed = LLM 的 mean pooling（全局聚合信息，类似文本嵌入）
+    
+    注意：必须传入 (B, seq_len, D) 且 seq_len > 1 才能使 concat_state_txt 有效。
+    如果 seq_len == 1，两个表示会相同，失去拼接的意义。
     
     Args:
         input_dim: Input dimension from LLM features (single feature)
@@ -64,7 +77,7 @@ class ProgressPredictionHead(nn.Module):
         self.concat_state_txt = concat_state_txt
         
         # 对齐 InternNav: 如果 concat_state_txt，input_dim 翻倍
-        # state (mean pooling) + text_embed (first token) 拼接
+        # state (last token) + text_embed (mean pooling) 拼接
         mlp_input_dim = input_dim * 2 if concat_state_txt else input_dim
         
         # 对齐 InternNav 的 DistanceNetwork 结构
@@ -79,7 +92,7 @@ class ProgressPredictionHead(nn.Module):
             nn.Sigmoid(),  # 输出 0-1
         )
         
-        # 初始化
+        # 对齐 InternNav _init_pm_layers: Kaiming 初始化
         self._init_weights()
         
         logger.info(
@@ -90,20 +103,30 @@ class ProgressPredictionHead(nn.Module):
         )
     
     def _init_weights(self):
-        """Initialize weights"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        """
+        Initialize weights (对齐 InternNav _init_pm_layers)
+        
+        InternNav 使用 Kaiming 初始化:
+        - 2D params (weights): kaiming_normal_ with relu
+        - 1D params (biases): constant 0
+        """
+        for param in self.parameters():
+            if param.ndim == 2:  # Typically weights are 2D
+                nn.init.kaiming_normal_(param, nonlinearity='relu')
+            elif param.ndim == 1:  # Typically biases are 1D
+                nn.init.constant_(param, 0)
     
     def _pool_features(self, llm_features: torch.Tensor) -> torch.Tensor:
         """
         Pool LLM features to fixed-size representation.
         
         对齐 InternNav 的 concat_state_txt 模式：
-        - state = mean pooling (全局信息)
-        - text_embed = first token (指令信息)
+        - state = last token (最新上下文，类似 InternNav GRU hidden state)
+        - text_embed = mean pooling (全局信息，类似 InternNav fused text embed)
+        
+        注意：InternNav 中 state 和 text_embed 来自不同的模块
+        (GRU vs 跨模态融合器)，天然是不同的表示。
+        在我们的架构中使用 last_token 和 mean_pool 来产生不同的表示。
         
         Args:
             llm_features: (B, seq_len, D) or (B, D) LLM output features
@@ -112,14 +135,22 @@ class ProgressPredictionHead(nn.Module):
             (B, D) or (B, 2*D) pooled features
         """
         if llm_features.dim() == 2:
-            # 已经是 (B, D)，无法拼接
+            if self.concat_state_txt:
+                # (B, D) -> 退化为重复拼接，发出警告
+                logger.warning(
+                    "ProgressPredictionHead: concat_state_txt=True but input is 2D. "
+                    "Pass (B, seq_len, D) with seq_len > 1 for proper effect."
+                )
+                return torch.cat([llm_features, llm_features], dim=-1)
             return llm_features
         
         # (B, seq_len, D)
         if self.concat_state_txt:
             # 对齐 InternNav: state + text_embed 拼接
-            state = llm_features.mean(dim=1)  # (B, D) - 全局信息
-            text_embed = llm_features[:, 0, :]  # (B, D) - 第一个 token (指令)
+            # state = last token (最新上下文，类似 GRU hidden state)
+            # text_embed = mean pooling (全局聚合，类似融合后的文本嵌入)
+            state = llm_features[:, -1, :]     # (B, D) - 最后一个 token
+            text_embed = llm_features.mean(dim=1)  # (B, D) - 全局均值
             pooled = torch.cat([state, text_embed], dim=-1)  # (B, 2*D)
         else:
             # 简单 mean pooling

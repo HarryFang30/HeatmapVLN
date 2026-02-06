@@ -116,10 +116,9 @@ class VLNPipelineConfig:
     transformer_predict_size: int = 24  # 24 step trajectory
     transformer_n_emb: int = 384  # Internal embedding dimension
     transformer_n_layer: int = 16  # Transformer decoder layers
-    transformer_n_head: int = 8
+    transformer_n_head: int = 6  # 对齐 InternNav: n_emb // head_dim = 384 // 64 = 6
     transformer_n_cond_layers: int = 4  # Condition encoder layers
     transformer_num_train_timesteps: int = 20
-    transformer_action_scale: float = 4.0  # Action scaling factor
     transformer_p_drop_emb: float = 0.1  # Embedding dropout
     transformer_p_drop_attn: float = 0.1  # Attention dropout
     transformer_causal_attn: bool = True  # Use causal attention
@@ -267,7 +266,6 @@ class VLNPipeline(nn.Module):
                     p_drop_attn=config.transformer_p_drop_attn,
                     action_dim=config.transformer_action_dim,
                     num_train_timesteps=config.transformer_num_train_timesteps,
-                    action_scale=config.transformer_action_scale,
                     causal_attn=config.transformer_causal_attn,
                 ).to(device=self.device, dtype=config.dtype)
                 logger.info(
