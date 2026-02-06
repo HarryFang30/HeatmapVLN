@@ -137,11 +137,10 @@ model:
       n_emb: 384
       predict_size: 24
       n_layer: 16
-      n_head: 8
+      n_head: 6               # 对齐 InternNav: n_emb // head_dim = 384 // 64 = 6
       n_cond_layers: 4
       action_dim: 3
       num_train_timesteps: 20
-      action_scale: 4.0
       p_drop_emb: 0.2
       p_drop_attn: 0.2
       causal_attn: true

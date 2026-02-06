@@ -134,11 +134,10 @@ model:
       n_emb: 384                 # 内部嵌入维度 (原 token_dim)
       predict_size: 24           # 预测 24 步轨迹
       n_layer: 16                # Transformer Decoder 层数 (原 temporal_depth)
-      n_head: 8                  # 注意力头数 (原 heads)
+      n_head: 6                  # 对齐 InternNav: n_emb // head_dim = 384 // 64 = 6
       n_cond_layers: 4           # 条件编码器层数 (参考 InternNav)
       action_dim: 3              # 动作维度 (dx, dy, delta_yaw)
       num_train_timesteps: 20    # 扩散训练步数
-      action_scale: 4.0          # 动作放大倍数
       p_drop_emb: 0.2            # Embedding dropout (0.1 → 0.2 防过拟合)
       p_drop_attn: 0.2           # Attention dropout (0.1 → 0.2 防过拟合)
       causal_attn: true          # 使用因果注意力

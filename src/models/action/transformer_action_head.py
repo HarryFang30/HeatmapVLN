@@ -4,12 +4,13 @@ Transformer-based Action Head for VLN Navigation
 参考 InternNav/internnav/model/basemodel/diffusion_policy_modified/transformer_for_diffusion_modified.py
 使用 Transformer Decoder + Diffusion Policy 生成导航轨迹
 
-修复问题（参考 InternNav）：
+对齐 InternNav TransformerForDiffusion 的关键设计：
 1. 完整的权重初始化 (_init_weights)
 2. 条件编码器 (TransformerEncoder 预处理条件)
 3. 简化 VLM 嵌入投影 (单层线性)
-4. 完整的因果掩码 (tgt_mask + memory_mask)
+4. 因果掩码 (仅 tgt_mask，对齐 InternNav 不使用 memory_mask)
 5. 位置嵌入正态初始化
+6. Weight decay 参数分组 (get_optim_groups)
 
 Architecture:
     LLM Features (B, seq_len, vlm_token_dim) 
@@ -21,7 +22,7 @@ Architecture:
 
 import math
 import logging
-from typing import Optional, Dict, Tuple, Union
+from typing import Optional, Dict, List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,23 +52,23 @@ class TransformerActionHead(nn.Module):
     """
     Transformer Decoder based Action Head with Diffusion Policy.
     
-    参考 InternNav 的 TransformerForDiffusion 实现，包含完整的：
-    - 权重初始化
-    - 条件编码器
-    - 因果掩码
+    对齐 InternNav 的 TransformerForDiffusion 实现：
+    - 完整的权重初始化 (_init_weights)
+    - 条件编码器 (TransformerEncoder)
+    - 因果掩码 (仅 tgt_mask，对齐 InternNav 不使用 memory_mask)
+    - Weight decay 参数分组 (get_optim_groups)
     
     Args:
         vlm_token_dim: VLM (Qwen3-VL) 输出的 token 维度
         n_emb: 内部嵌入维度 (对应 InternNav 的 n_emb)
         predict_size: 预测的轨迹步数 (horizon)
         n_layer: Transformer Decoder 层数
-        n_head: 注意力头数
+        n_head: 注意力头数 (默认 6，对齐 InternNav head_dim=64)
         n_cond_layers: 条件编码器层数 (0 表示不使用)
         p_drop_emb: Embedding dropout
         p_drop_attn: Attention dropout
         action_dim: 动作维度 (3 for x, y, theta)
         num_train_timesteps: 扩散训练步数
-        action_scale: 动作放大倍数
         causal_attn: 是否使用因果注意力
     """
     
@@ -77,13 +78,12 @@ class TransformerActionHead(nn.Module):
         n_emb: int = 384,
         predict_size: int = 24,
         n_layer: int = 16,
-        n_head: int = 8,
+        n_head: int = 6,  # 对齐 InternNav: n_emb // head_dim = 384 // 64 = 6
         n_cond_layers: int = 4,  # 条件编码器层数
         p_drop_emb: float = 0.1,
         p_drop_attn: float = 0.1,
         action_dim: int = 3,
         num_train_timesteps: int = 20,
-        action_scale: float = 4.0,
         causal_attn: bool = True,
         n_obs_steps: int = 1,  # 观测步数（VLM pooled = 1）
         input_dtype: str = "bf16",
@@ -94,8 +94,8 @@ class TransformerActionHead(nn.Module):
         self.n_emb = n_emb
         self.vlm_token_dim = vlm_token_dim
         self.action_dim = action_dim
-        self.action_scale = action_scale
         self.n_layer = n_layer
+        self.n_head = n_head
         self.n_obs_steps = n_obs_steps
         self.causal_attn = causal_attn
         self.use_encoder = n_cond_layers > 0
@@ -177,26 +177,16 @@ class TransformerActionHead(nn.Module):
         )
         
         # ==================== Attention Masks ====================
-        # 因果掩码 (tgt_mask)
+        # 对齐 InternNav: 仅使用 tgt_mask (decoder self-attention causal mask)
+        # 注意：InternNav 虽然注册了 memory_mask 但在 forward 中不使用它
+        # InternNav 使用 memory_key_padding_mask (cond_mask) 用于 classifier-free guidance
         if causal_attn:
             sz = T
             mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
             mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-            self.register_buffer('tgt_mask', mask)
-            
-            # Memory mask（交叉注意力掩码）
-            # 参考 InternNav: t >= (s - 1) 确保因果性
-            t_idx, s_idx = torch.meshgrid(
-                torch.arange(T), 
-                torch.arange(T_cond), 
-                indexing='ij'
-            )
-            memory_mask = t_idx >= (s_idx - 1)
-            memory_mask = memory_mask.float().masked_fill(memory_mask == 0, float('-inf')).masked_fill(memory_mask == 1, float(0.0))
-            self.register_buffer('memory_mask', memory_mask)
+            self.register_buffer('mask', mask)  # 对齐 InternNav 命名: self.mask
         else:
-            self.tgt_mask = None
-            self.memory_mask = None
+            self.mask = None
         
         # ==================== 权重初始化 ====================
         self.apply(self._init_weights)
@@ -211,7 +201,7 @@ class TransformerActionHead(nn.Module):
     
     def _init_weights(self, module):
         """
-        权重初始化（参考 InternNav TransformerForDiffusion._init_weights）
+        权重初始化（对齐 InternNav TransformerForDiffusion._init_weights）
         """
         ignore_types = (
             nn.Dropout,
@@ -232,13 +222,13 @@ class TransformerActionHead(nn.Module):
             # 初始化注意力权重
             weight_names = ['in_proj_weight', 'q_proj_weight', 'k_proj_weight', 'v_proj_weight']
             for name in weight_names:
-                weight = getattr(module, name, None)
+                weight = getattr(module, name)
                 if weight is not None:
                     torch.nn.init.normal_(weight, mean=0.0, std=0.02)
             
             bias_names = ['in_proj_bias', 'bias_k', 'bias_v']
             for name in bias_names:
-                bias = getattr(module, name, None)
+                bias = getattr(module, name)
                 if bias is not None:
                     torch.nn.init.zeros_(bias)
         elif isinstance(module, nn.LayerNorm):
@@ -247,26 +237,33 @@ class TransformerActionHead(nn.Module):
         elif isinstance(module, TransformerActionHead):
             # 位置嵌入使用正态分布初始化
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
-            torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
+            if module.cond_obs_emb is not None:
+                torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
         elif isinstance(module, ignore_types):
+            # no param
             pass
-        # 不抛出异常，允许其他模块使用默认初始化
+        else:
+            # 对齐 InternNav: 对未知模块发出警告（开发阶段有助于发现遗漏）
+            logger.warning(f'Unaccounted module in _init_weights: {type(module).__name__}')
     
     def forward_diffusion(
         self,
         sample: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
         cond: torch.Tensor,
+        cond_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Diffusion 前向传播（预测噪声）
         
-        参考 InternNav TransformerForDiffusion.forward()
+        对齐 InternNav TransformerForDiffusion.forward()
         
         Args:
             sample: (B, T, action_dim) 加噪的动作序列
             timestep: (B,) 或标量 时间步
             cond: (B, n_obs_steps, vlm_token_dim) 条件（VLM 特征）
+            cond_mask: Optional (B, T_cond) 条件 padding mask
+                       (用于 classifier-free guidance，对齐 InternNav)
             
         Returns:
             noise_pred: (B, T, action_dim) 预测的噪声
@@ -274,47 +271,120 @@ class TransformerActionHead(nn.Module):
         device = sample.device
         batch_size = sample.shape[0]
         
-        # 1. 处理时间步
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], dtype=torch.long, device=device)
-        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
-            timestep = timestep[None].to(device)
-        timestep = timestep.expand(batch_size)
+        # 1. 处理时间步（对齐 InternNav）
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(device)
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        timesteps = timesteps.expand(sample.shape[0])
+        time_emb = self.time_emb(timesteps).unsqueeze(1)  # (B, 1, n_emb)
         
-        time_emb = self.time_emb(timestep).unsqueeze(1)  # (B, 1, n_emb)
-        
-        # 2. 处理条件
+        # 2. 条件编码器（对齐 InternNav encoder 路径）
+        cond_embeddings = time_emb
         cond_obs_emb = self.cond_obs_emb(cond)  # (B, n_obs_steps, n_emb)
-        cond_embeddings = torch.cat([time_emb, cond_obs_emb], dim=1)  # (B, T_cond, n_emb)
+        cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)  # (B, T_cond, n_emb)
         
-        # 添加条件位置嵌入
         tc = cond_embeddings.shape[1]
-        cond_embeddings = self.drop(cond_embeddings + self.cond_pos_emb[:, :tc, :])
+        position_embeddings = self.cond_pos_emb[:, :tc, :]
+        x = self.drop(cond_embeddings + position_embeddings)
+        if self.use_encoder and self.encoder is not None:
+            x = self.encoder(x)
+        memory = x
+        # (B, T_cond, n_emb)
         
-        # 3. 条件编码器
-        if self.encoder is not None:
-            memory = self.encoder(cond_embeddings)
-        else:
-            memory = cond_embeddings
+        # 3. Decoder 输入
+        token_embeddings = self.input_emb(sample)  # (B, T, n_emb)
+        t = token_embeddings.shape[1]
+        position_embeddings = self.pos_emb[:, :t, :]
+        x = self.drop(token_embeddings + position_embeddings)
+        # (B, T, n_emb)
         
-        # 4. 处理输入
-        input_emb = self.input_emb(sample)  # (B, T, n_emb)
-        t = input_emb.shape[1]
-        input_emb = self.drop(input_emb + self.pos_emb[:, :t, :])
-        
-        # 5. Transformer Decoder
+        # 4. Transformer Decoder
+        # 对齐 InternNav: 仅使用 tgt_mask，不使用 memory_mask
+        # memory_key_padding_mask 用于 classifier-free guidance (可选)
         x = self.decoder(
-            tgt=input_emb,
+            tgt=x,
             memory=memory,
-            tgt_mask=self.tgt_mask.to(device) if self.tgt_mask is not None else None,
-            memory_mask=self.memory_mask.to(device) if self.memory_mask is not None else None,
+            tgt_mask=self.mask,
+            memory_key_padding_mask=cond_mask,
         )
+        # (B, T, n_emb)
         
-        # 6. Output head
+        # 5. Output head
         x = self.ln_f(x)
         x = self.head(x)
+        # (B, T, action_dim)
         
         return x
+    
+    def get_optim_groups(self, weight_decay: float = 1e-3) -> List[Dict]:
+        """
+        参数分组（对齐 InternNav TransformerForDiffusion.get_optim_groups）
+        
+        将参数分为两组：
+        - decay: Linear weights, MultiheadAttention weights
+        - no_decay: biases, LayerNorm weights, Embedding weights, 位置嵌入
+        
+        Args:
+            weight_decay: Weight decay value for decay group
+            
+        Returns:
+            List of param group dicts for optimizer
+        """
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (
+            torch.nn.Linear,
+            torch.nn.MultiheadAttention,
+        )
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
+                
+                if pn.endswith('bias'):
+                    no_decay.add(fpn)
+                elif pn.startswith('bias'):
+                    # MultiheadAttention bias starts with "bias"
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+        
+        # 位置嵌入参数不做 weight decay
+        no_decay.add('pos_emb')
+        if self.cond_pos_emb is not None:
+            no_decay.add('cond_pos_emb')
+        
+        # 验证所有参数都被分组
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        
+        if len(inter_params) > 0:
+            logger.warning(f'Parameters in both decay/no_decay sets: {inter_params}')
+        
+        unaccounted = param_dict.keys() - union_params
+        if len(unaccounted) > 0:
+            logger.warning(f'Parameters not in decay/no_decay sets: {unaccounted}')
+            # 未分类的参数默认不做 decay
+            no_decay.update(unaccounted)
+        
+        optim_groups = [
+            {
+                'params': [param_dict[pn] for pn in sorted(list(decay)) if pn in param_dict],
+                'weight_decay': weight_decay,
+            },
+            {
+                'params': [param_dict[pn] for pn in sorted(list(no_decay)) if pn in param_dict],
+                'weight_decay': 0.0,
+            },
+        ]
+        return optim_groups
     
     def forward(
         self,
@@ -479,11 +549,10 @@ def create_transformer_action_head(
     n_emb: int = 384,
     predict_size: int = 24,
     n_layer: int = 16,
-    n_head: int = 8,
+    n_head: int = 6,
     n_cond_layers: int = 4,
     action_dim: int = 3,
     num_train_timesteps: int = 20,
-    action_scale: float = 4.0,
     device: str = "cuda",
 ) -> TransformerActionHead:
     """Factory function to create TransformerActionHead"""
@@ -497,7 +566,6 @@ def create_transformer_action_head(
         n_cond_layers=n_cond_layers,
         action_dim=action_dim,
         num_train_timesteps=num_train_timesteps,
-        action_scale=action_scale,
     )
     
     model = model.to(device)
