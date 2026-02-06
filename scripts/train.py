@@ -2127,16 +2127,20 @@ def main():
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     
-    # 🔧 验证集不使用 workers，节省内存
-    # 验证集很短（10000 样本），0 workers 足够
+    # 验证集也需要 workers 加速 tokenization（否则主进程串行处理会极慢）
+    # 使用与训练相同的 workers 配置，persistent_workers=False 保证验证结束后释放内存
+    val_num_workers = min(num_workers, 4)  # 验证用 4 workers 足够
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg['optim']['batch_size'],
         shuffle=False,
-        num_workers=0,
+        num_workers=val_num_workers,
         pin_memory=cfg['data']['pin_memory'],
         collate_fn=actual_collate_fn,
+        prefetch_factor=prefetch_factor if val_num_workers > 0 else None,
+        persistent_workers=False,  # 验证结束后释放内存
     )
+    logger.info(f"   📊 验证 DataLoader: num_workers={val_num_workers}, prefetch={prefetch_factor}")
     
     if uses_dynamic_sampling:
         if persistent_workers:
