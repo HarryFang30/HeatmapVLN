@@ -218,15 +218,25 @@ class Qwen3VLIntegration(nn.Module):
             raise ImportError("peft is required for LoRA. Install with: pip install peft")
         
         # Determine total number of LLM layers
-        # Qwen3-VL has a text model (language_model) with transformer layers
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            num_layers = len(self.model.model.layers)
-        elif hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
+        # Qwen3-VL 结构: model.model.language_model.layers (Qwen2_5_VLTextModel)
+        num_layers = None
+        if hasattr(self.model, 'model'):
+            m = self.model.model
+            # 路径 1: model.model.language_model.layers (Qwen3-VL / Qwen2.5-VL)
+            if hasattr(m, 'language_model') and hasattr(m.language_model, 'layers'):
+                num_layers = len(m.language_model.layers)
+            # 路径 2: model.model.layers (部分 Qwen 变体)
+            elif hasattr(m, 'layers'):
+                num_layers = len(m.layers)
+        # 路径 3: model.language_model.model.layers
+        if num_layers is None and hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
             num_layers = len(self.model.language_model.model.layers)
-        else:
-            # Fallback: try to get from config
+        
+        if num_layers is None:
             num_layers = 36  # Qwen3-VL 7B default
             logger.warning(f"Could not detect layer count, using default: {num_layers}")
+        else:
+            logger.info(f"Detected {num_layers} LLM layers")
         
         # Apply LoRA to the last N layers
         lora_layers = list(range(
