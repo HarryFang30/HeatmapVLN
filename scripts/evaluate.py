@@ -67,17 +67,23 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
 
 
 def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
-    """Build VLN pipeline for evaluation."""
+    """Build VLN pipeline for evaluation (与 train.py 保持一致)."""
     model_cfg = cfg['model']
     data_cfg = cfg['data']
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap_head', {})
     action_cfg = model_cfg.get('action_head', {})
+    stop_cfg = model_cfg.get('stop_head', {})
+    progress_cfg = model_cfg.get('progress_head', {})
+    
+    action_head_type = action_cfg.get('type', 'transformer')
+    legacy_action_cfg = action_cfg.get('legacy', {})
+    transformer_action_cfg = action_cfg.get('transformer', {})
     
     config = VLNPipelineConfig(
         # Qwen3-VL
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
@@ -98,23 +104,57 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
         diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
         image_size=data_cfg['image_size'][0],
-        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', False),
+        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', True),
         heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
+        heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
+        heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
+        heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
+        heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
+        heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
+        heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
+        heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
+        heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
+        heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
+        # Sequence cross-attention conditioning
+        heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
+        heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
+        heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
         
-        # Action Head (Transformer)
-        action_head_type=action_cfg.get('type', 'transformer'),
+        # LoRA
+        use_lora=llm_cfg.get('use_lora', False),
+        lora_rank=llm_cfg.get('lora_rank', 16),
+        lora_alpha=llm_cfg.get('lora_alpha', 32),
+        lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_dropout=llm_cfg.get('lora_dropout', 0.05),
+        
+        # Action Head
+        action_head_type=action_head_type,
         enable_action_head=action_cfg.get('enable', True),
-        transformer_action_dim=action_cfg.get('action_dim', 3),
-        transformer_predict_size=action_cfg.get('predict_size', 24),
-        transformer_n_emb=action_cfg.get('n_emb', 384),
-        transformer_n_layer=action_cfg.get('n_layer', 16),
-        transformer_n_head=action_cfg.get('n_head', 8),
+        action_dim=legacy_action_cfg.get('action_dim', 2),
+        action_pred_horizon=legacy_action_cfg.get('pred_horizon', 1),
+        action_encoding_size=legacy_action_cfg.get('encoding_size', 256),
+        action_down_dims=legacy_action_cfg.get('down_dims', None),
+        action_num_diffusion_iters=legacy_action_cfg.get('num_diffusion_iters', 10),
+        action_stats_min=legacy_action_cfg.get('action_stats_min', [-0.17, -0.03]),
+        action_stats_max=legacy_action_cfg.get('action_stats_max', [0.19, 0.31]),
+        transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
+        transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
+        transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
+        transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
+        transformer_n_head=transformer_action_cfg.get('n_head', 6),
+        transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
+        transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
+        transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
+        transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
+        transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
         
-        # Progress Head
-        enable_progress_head=model_cfg.get('progress_head', {}).get('enable', True),
-        
-        # Legacy heads disabled
-        enable_stop_head=False,
+        # Stop / Progress
+        enable_stop_head=stop_cfg.get('enable', False),
+        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
+        stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
+        enable_progress_head=progress_cfg.get('enable', False),
+        progress_hidden_dim=progress_cfg.get('hidden_dim', 512),
         
         verbose=False,
     )

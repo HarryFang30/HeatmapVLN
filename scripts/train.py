@@ -340,13 +340,19 @@ def visualize_heatmap_predictions(
     step: int,
     output_dir: Path,
     num_samples: int = 2,
+    gt_heatmap_override: Optional[torch.Tensor] = None,
 ):
-    """可视化热力图预测结果"""
+    """可视化热力图预测结果
+    
+    Args:
+        gt_heatmap_override: 当使用 defer_heatmap_to_gpu 时，传入 GPU 计算的 GT 热力图，
+                            替代 batch['heatmap']（后者是零占位符）
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     
     try:
         current_frames = batch['current_frame']
-        gt_heatmaps = batch['heatmap']
+        gt_heatmaps = gt_heatmap_override if gt_heatmap_override is not None else batch['heatmap']
         
         pred_heatmaps = output.get('history_heatmaps')
         if pred_heatmaps is None:
@@ -1241,6 +1247,7 @@ def train_one_epoch(
                 step=global_step,
                 output_dir=vis_dir if vis_dir else Path('.'),
                 num_samples=2,
+                gt_heatmap_override=gt_heatmap if gpu_heatmap_computer is not None else None,
             )
             if vis_path:
                 try:
@@ -1537,6 +1544,7 @@ def validate(
                         step=num_batches,
                         output_dir=vis_dir,
                         num_samples=4,
+                        gt_heatmap_override=gt_heatmap if gpu_heatmap_computer is not None else None,
                     )
                     
                     if vis_path is not None:

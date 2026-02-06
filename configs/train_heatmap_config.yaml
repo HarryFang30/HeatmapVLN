@@ -71,8 +71,8 @@ model:
     max_seq_length: 8192
     spatial_merge_size: 2
     
-    # LoRA 配置（默认关闭，代码已就绪）
-    use_lora: false
+    # LoRA 配置 — 开启以让 LLM 产生更适合空间推理的特征
+    use_lora: true
     lora_rank: 16
     lora_alpha: 32
     lora_num_layers: 4         # 最后 4 层
@@ -96,11 +96,11 @@ model:
     num_train_timesteps: 100
     
     # Classifier-Free Guidance
-    cfg_drop_prob: 0.1
-    cfg_scale: 3.0
+    cfg_drop_prob: 0.15         # 提高 drop 比例，让模型更好地学习无条件生成
+    cfg_scale: 1.5              # 降低推理引导强度，减少假阳性（3.0 → 1.5）
     
     # 正则化
-    dropout: 0.1
+    dropout: 0.15               # 增加 dropout 抑制过拟合（0.1 → 0.15）
     
     # Pinhole 相机不需要循环填充（非 360° 全景）
     use_circular_padding: false
@@ -165,17 +165,18 @@ model:
 training:
   stages:
     - name: heatmap_only_64
-      epochs: 20               # 增加 epoch 数（只训练一个头）
+      epochs: 15               # 15 epoch（上轮 5 epoch 就到 best）
       hm_size: [64, 64]
       heatmap_loss_type: simplified
       train_history: true
       train_future: false
       train_action: false      # 不训练动作
       trainable_modules:
-        - history_heatmap_head # 只训练热力图头
+        - history_heatmap_head # 训练热力图头
         - llm_projector        # 训练投影层
+        - lora                 # 训练 LoRA 层（微调 LLM 最后 4 层）
       frozen_modules:
-        - qwen3_vl             # 冻结 VLM
+        - qwen3_vl             # 冻结 VLM（LoRA 层除外）
         - future_heatmap_head
         - transformer_action_head
         - action_head
@@ -188,19 +189,19 @@ training:
 optim:
   optimizer: adamw
 
-  # 分组学习率
-  heatmap_lr: 1.0e-4
-  history_heatmap_lr: 1.0e-4
-  future_heatmap_lr: 1.0e-4
+  # 分组学习率（降低以提升泛化）
+  heatmap_lr: 5.0e-5               # 1e-4 → 5e-5，防止快速过拟合
+  history_heatmap_lr: 5.0e-5
+  future_heatmap_lr: 5.0e-5
   action_lr: 1.0e-4
   transformer_action_lr: 1.0e-4
   progress_lr: 1.0e-4
-  llm_projector_lr: 5.0e-5         # 投影层降低 LR，更稳定地适配冻结 LLM
-  lora_lr: 1.0e-5                  # LoRA 使用极低 LR（仅当 use_lora=true 时有效）
+  llm_projector_lr: 3.0e-5         # 5e-5 → 3e-5，更稳定
+  lora_lr: 1.0e-5                  # LoRA 使用极低 LR
 
-  # 正则化
-  weight_decay: 5.0e-2
-  projector_weight_decay: 5.0e-3
+  # 正则化（增强）
+  weight_decay: 1.0e-1             # 5e-2 → 1e-1
+  projector_weight_decay: 1.0e-2   # 5e-3 → 1e-2
   
   grad_clip: 1.0
   amp: bf16
