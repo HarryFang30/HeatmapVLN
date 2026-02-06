@@ -275,3 +275,5 @@ validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
   patience: 5               # 只训练一个头，可以更耐心
+  val_inference_batches: 10  # 完整扩散推理的 batch 数（计算真实 heatmap MSE）
+                             # 其余 batch 用噪声预测 loss（快 ~40x）

@@ -1319,6 +1319,8 @@ def validate(
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
     total_stop_loss = 0.0
+    total_heatmap_mse = 0.0      # 完整推理的 heatmap MSE（采样）
+    num_heatmap_mse_batches = 0  # MSE 采样 batch 计数
     num_batches = 0
     
     loss_cfg = cfg['loss']
@@ -1329,10 +1331,16 @@ def validate(
     
     device = torch.device(cfg['model'].get('device', 'cuda'))
     
+    # 验证推理 batch 数限制：只对前 N 个 batch 做完整扩散推理计算 heatmap MSE
+    val_inference_batches = cfg.get('validation', {}).get('val_inference_batches', 10)
+    
     total_val_batches = len(val_loader)
     if max_batches is not None:
         total_val_batches = min(total_val_batches, max_batches)
         logger.info(f"  ⚡ 快速调试模式(验证): 只处理 {total_val_batches} batches")
+    
+    logger.info(f"  📊 验证: {total_val_batches} batches (噪声预测 loss), "
+                f"{val_inference_batches} batches (完整推理 MSE)")
     
     for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
         if max_batches is not None and i >= max_batches:
@@ -1373,7 +1381,7 @@ def validate(
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             if packing_enabled:
-                # Packing 模式
+                # Packing 模式 — 传入 GT 热力图用噪声预测 loss（快速，1 次 UNet）
                 output = model.forward_packed(
                     packed_batch=batch,
                     return_heatmaps=True,
@@ -1381,6 +1389,7 @@ def validate(
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
                     action_valid=action_valid if train_action else None,
                     gt_stop=is_stop if train_action else None,
+                    gt_history_heatmap=gt_heatmap if train_history else None,
                 )
             else:
                 # 传统模式
@@ -1403,21 +1412,13 @@ def validate(
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
                     action_valid=action_valid if train_action else None,
                     gt_stop=is_stop if train_action else None,
+                    gt_history_heatmap=gt_heatmap if train_history else None,
                 )
             
+            # 使用噪声预测 loss（与训练一致，且速度快 ~40x）
             heatmap_loss = torch.tensor(0.0, device=device)
-            if train_history and 'history_heatmaps' in output:
-                pred_hm = output['history_heatmaps'][:, -1, :, :]
-                if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-                    pred_hm = torch.nn.functional.interpolate(
-                        pred_hm.unsqueeze(1),
-                        size=gt_heatmap.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(1)
-                
-                # 使用简单 MSE，与训练时的 Diffusion loss 保持一致的量级
-                heatmap_loss = F.mse_loss(pred_hm, gt_heatmap)
+            if train_history and 'history_heatmap_loss' in output:
+                heatmap_loss = output['history_heatmap_loss']
             
             # Action Loss / Trajectory Loss (验证)
             action_loss = torch.tensor(0.0, device=device)
@@ -1487,17 +1488,18 @@ def validate(
         total_stop_loss += stop_total_loss.item()      # progress or stop
         num_batches += 1
         
-        # ==================== 验证可视化（前几个 batch）====================
-        num_vis_batches = cfg['log'].get('val_vis_batches', 2)  # 可视化几个 batch
-        if num_batches <= num_vis_batches and vis_dir is not None:
+        # ==================== 完整推理 + 可视化（前几个 batch）====================
+        # 对前 val_inference_batches 个 batch 做完整扩散推理，计算真实 heatmap MSE
+        # 其中前 val_vis_batches 个 batch 额外保存可视化图片
+        num_vis_batches = cfg['log'].get('val_vis_batches', 2)
+        if num_batches <= val_inference_batches:
             try:
-                # 使用纯推理模式生成热力图（不传 gt_heatmap）
+                # 使用纯推理模式生成热力图（不传 gt_heatmap，触发完整扩散推理）
                 if packing_enabled:
                     vis_output = model.forward_packed(
                         packed_batch=batch,
                         return_heatmaps=True,
                         return_actions=False,
-                        # 不传 gt_history_heatmap，触发纯推理模式
                     )
                 else:
                     video_frames = torch.cat([
@@ -1512,49 +1514,66 @@ def validate(
                         return_actions=False,
                     )
                 
-                # 可视化并保存
-                vis_path = visualize_heatmap_predictions(
-                    model=model,
-                    batch=batch,
-                    output=vis_output,
-                    epoch=epoch,
-                    step=num_batches,
-                    output_dir=vis_dir,
-                    num_samples=4,  # 验证时多显示几个样本
-                )
+                # 计算完整推理的 heatmap MSE（真实生成质量指标）
+                if train_history and 'history_heatmaps' in vis_output:
+                    infer_pred_hm = vis_output['history_heatmaps'][:, -1, :, :]
+                    if infer_pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
+                        infer_pred_hm = F.interpolate(
+                            infer_pred_hm.unsqueeze(1),
+                            size=gt_heatmap.shape[-2:],
+                            mode='bilinear', align_corners=False
+                        ).squeeze(1)
+                    batch_mse = F.mse_loss(infer_pred_hm, gt_heatmap).item()
+                    total_heatmap_mse += batch_mse
+                    num_heatmap_mse_batches += 1
                 
-                # 验证可视化直接保存在 vis_dir (已经是 vis/val/)
-                if vis_path is not None:
-                    # 重命名为更简洁的格式
-                    new_path = vis_dir / f"e{epoch:03d}_b{num_batches:02d}.png"
-                    import shutil
-                    shutil.copy(vis_path, new_path)
+                # 前几个 batch 保存可视化图片
+                if num_batches <= num_vis_batches and vis_dir is not None:
+                    vis_path = visualize_heatmap_predictions(
+                        model=model,
+                        batch=batch,
+                        output=vis_output,
+                        epoch=epoch,
+                        step=num_batches,
+                        output_dir=vis_dir,
+                        num_samples=4,
+                    )
                     
-                    # 记录到 TensorBoard
-                    if tb_writer is not None:
-                        vis_img = cv2.imread(str(new_path))
-                        if vis_img is not None:
-                            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
-                            vis_img = vis_img.transpose(2, 0, 1)  # HWC -> CHW
-                            tb_writer.add_image(f'val/heatmap_viz_batch{num_batches}', vis_img, epoch)
-                    
-                    logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
+                    if vis_path is not None:
+                        new_path = vis_dir / f"e{epoch:03d}_b{num_batches:02d}.png"
+                        import shutil
+                        shutil.copy(vis_path, new_path)
+                        
+                        if tb_writer is not None:
+                            vis_img = cv2.imread(str(new_path))
+                            if vis_img is not None:
+                                vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+                                vis_img = vis_img.transpose(2, 0, 1)
+                                tb_writer.add_image(f'val/heatmap_viz_batch{num_batches}', vis_img, epoch)
+                        
+                        logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
             except Exception as e:
-                logger.warning(f"Validation visualization failed: {e}")
+                logger.warning(f"Validation inference/visualization failed: {e}")
     
     avg_loss = total_loss / max(num_batches, 1)
     avg_hm = total_heatmap_loss / max(num_batches, 1)
     avg_act = total_action_loss / max(num_batches, 1)
     avg_stop = total_stop_loss / max(num_batches, 1)
+    avg_hm_mse = total_heatmap_mse / max(num_heatmap_mse_batches, 1) if num_heatmap_mse_batches > 0 else 0.0
     
     # 注意：TensorBoard 记录移至主循环中使用 global_epoch_counter
     # 避免多阶段训练时 epoch 重复导致数据覆盖
     
+    if num_heatmap_mse_batches > 0:
+        logger.info(f"  📊 Heatmap 推理 MSE (采样 {num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
+    
     return {
         'val_loss': avg_loss,
-        'val_heatmap_loss': avg_hm,
-        'val_action_loss': avg_act,  # 可能是 trajectory_loss 或 action_loss
-        'val_stop_loss': avg_stop,   # 可能是 progress_loss 或 stop_loss
+        'val_heatmap_loss': avg_hm,           # 噪声预测 loss（全量 batch）
+        'val_heatmap_mse': avg_hm_mse,        # 完整推理 MSE（采样 batch）
+        'val_action_loss': avg_act,
+        'val_stop_loss': avg_stop,
+        'val_total_loss': avg_loss,            # 兼容 save_best_metric
     }
 
 
@@ -2246,9 +2265,10 @@ def main():
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
             f"(hm: {train_metrics['heatmap_loss']:.4f}, traj: {train_metrics['action_loss']:.4f}, prog: {train_metrics.get('stop_loss', 0):.4f})"
         )
+        val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
         logger.info(
             f"  Val Loss: {val_metrics['val_loss']:.4f} "
-            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, traj: {val_metrics['val_action_loss']:.4f}, prog: {val_metrics.get('val_stop_loss', 0):.4f})"
+            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, traj: {val_metrics['val_action_loss']:.4f}, prog: {val_metrics.get('val_stop_loss', 0):.4f}{val_hm_mse_str})"
         )
         
         eta = timer.get_eta(epoch, total_epochs)
@@ -2299,6 +2319,10 @@ def main():
                 'train': train_metrics.get('stop_loss', 0),
                 'val': val_metrics.get('val_stop_loss', 0),
             }, global_epoch_counter)
+            
+            # 完整推理 heatmap MSE（真实生成质量）
+            if val_metrics.get('val_heatmap_mse', 0) > 0:
+                tb_writer.add_scalar('loss/heatmap_inference_mse', val_metrics['val_heatmap_mse'], global_epoch_counter)
             
             # 学习率
             tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)

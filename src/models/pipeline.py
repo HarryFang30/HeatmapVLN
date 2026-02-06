@@ -414,14 +414,15 @@ class VLNPipeline(nn.Module):
             
             # History Heatmap
             if self.history_heatmap_head is not None:
-                if gt_history_heatmap is not None and self.training:
+                if gt_history_heatmap is not None:
+                    # 有 GT 时用噪声预测（训练和验证均可用，只需 1 次 UNet 前向）
                     gt_history_hm = gt_history_heatmap.to(self.device)
                     result = self.history_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_history_hm,
                         return_loss=True,
-                        skip_inference=False,  # 允许内部 _inference_interval 控制
+                        skip_inference=not self.training,  # eval 模式跳过推理（验证加速）
                     )
                     history_heatmap_loss = result['loss']
                     history_heatmap = result.get('heatmap')
@@ -430,6 +431,7 @@ class VLNPipeline(nn.Module):
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
                 else:
+                    # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
                         observation=observation_for_heatmap,
@@ -437,14 +439,15 @@ class VLNPipeline(nn.Module):
             
             # Future Heatmap
             if self.future_heatmap_head is not None:
-                if gt_future_heatmap is not None and self.training:
+                if gt_future_heatmap is not None:
+                    # 有 GT 时用噪声预测
                     gt_future_hm = gt_future_heatmap.to(self.device)
                     result = self.future_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_future_hm,
                         return_loss=True,
-                        skip_inference=False,  # 允许内部 _inference_interval 控制
+                        skip_inference=not self.training,  # eval 模式跳过推理
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
@@ -639,14 +642,15 @@ class VLNPipeline(nn.Module):
             
             # History Heatmap
             if self.history_heatmap_head is not None:
-                if gt_history_heatmap is not None and self.training:
+                if gt_history_heatmap is not None:
+                    # 有 GT 时用噪声预测（训练和验证均可用，只需 1 次 UNet 前向）
                     gt_history_hm = gt_history_heatmap.to(self.device)
                     result = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_history_hm,
                         return_loss=True,
-                        skip_inference=False,  # 允许内部 _inference_interval 控制
+                        skip_inference=not self.training,  # eval 模式跳过推理（验证加速）
                     )
                     history_heatmap_loss = result['loss']
                     history_heatmap = result.get('heatmap')
@@ -655,6 +659,7 @@ class VLNPipeline(nn.Module):
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
                 else:
+                    # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
@@ -662,14 +667,15 @@ class VLNPipeline(nn.Module):
             
             # Future Heatmap
             if self.future_heatmap_head is not None:
-                if gt_future_heatmap is not None and self.training:
+                if gt_future_heatmap is not None:
+                    # 有 GT 时用噪声预测
                     gt_future_hm = gt_future_heatmap.to(self.device)
                     result = self.future_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_future_hm,
                         return_loss=True,
-                        skip_inference=False,  # 允许内部 _inference_interval 控制
+                        skip_inference=not self.training,  # eval 模式跳过推理
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
