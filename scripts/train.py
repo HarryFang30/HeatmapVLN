@@ -105,10 +105,13 @@ def _worker_init_fn(worker_id):
 
 class EMAModel:
     """
-    Exponential Moving Average for model parameters.
+    Exponential Moving Average for model parameters (with warmup).
     
     扩散模型标准技术：用参数的滑动平均做推理，
     避免训练末期的参数波动，显著提升泛化性能。
+    
+    Warmup 策略：前 warmup_steps 步使用自适应 decay = 1 - 1/(step+1)，
+    避免初始随机权重污染 EMA shadow。
     
     用法：
         ema = EMAModel(model, decay=0.999)
@@ -119,9 +122,11 @@ class EMAModel:
             validate(model, ...)
     """
     
-    def __init__(self, model: nn.Module, decay: float = 0.999):
+    def __init__(self, model: nn.Module, decay: float = 0.999, warmup_steps: int = 2000):
         self.model = model
-        self.decay = decay
+        self.target_decay = decay
+        self.warmup_steps = warmup_steps
+        self.step_count = 0
         self.shadow = {}
         self.backup = {}
         
@@ -130,23 +135,39 @@ class EMAModel:
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
     
+    def _get_decay(self) -> float:
+        """获取当前 decay 值（含 warmup）"""
+        # Warmup: decay 从 0 逐步增加到 target_decay
+        # 公式: min(target_decay, 1 - 1/(step+1))
+        # step=0 → decay=0 (直接复制当前参数)
+        # step=999 → decay=0.999 (达到目标)
+        warmup_decay = 1.0 - 1.0 / (self.step_count + 1)
+        return min(self.target_decay, warmup_decay)
+    
     @torch.no_grad()
     def update(self):
         """更新 EMA 参数：shadow = decay * shadow + (1 - decay) * param"""
+        decay = self._get_decay()
         for name, param in self.model.named_parameters():
             if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+                self.shadow[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+        self.step_count += 1
     
     def apply(self):
         """Context manager：临时将模型参数替换为 EMA 参数"""
         return _EMAContext(self)
     
+    @property
+    def decay(self):
+        return self._get_decay()
+    
     def state_dict(self):
-        return {'shadow': self.shadow, 'decay': self.decay}
+        return {'shadow': self.shadow, 'target_decay': self.target_decay, 'step_count': self.step_count}
     
     def load_state_dict(self, state_dict):
         self.shadow = state_dict['shadow']
-        self.decay = state_dict.get('decay', self.decay)
+        self.target_decay = state_dict.get('target_decay', self.target_decay)
+        self.step_count = state_dict.get('step_count', 0)
 
 
 class _EMAContext:
@@ -2308,8 +2329,9 @@ def main():
     # EMA (Exponential Moving Average) — 扩散模型标准技术
     # 用参数的滑动平均做推理，减少训练波动，提升泛化
     ema_decay = cfg.get('optim', {}).get('ema_decay', 0.999)
-    ema = EMAModel(model, decay=ema_decay)
-    logger.info(f"📐 EMA enabled: decay={ema_decay}")
+    ema_warmup = cfg.get('optim', {}).get('ema_warmup_steps', 2000)
+    ema = EMAModel(model, decay=ema_decay, warmup_steps=ema_warmup)
+    logger.info(f"📐 EMA enabled: decay={ema_decay}, warmup_steps={ema_warmup}")
     
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
