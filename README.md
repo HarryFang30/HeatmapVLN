@@ -31,10 +31,10 @@ HeatmapVLN 是一个用于视觉语言导航（VLN）任务的深度学习框架
 
 | 特性 | 描述 |
 |:-----|:-----|
-| 🔥 **热力图生成** | 基于条件扩散模型生成历史位置热力图 |
+| 🔥 **热力图生成** | 双路径条件扩散模型：序列 Cross-Attention + FiLM 条件注入 |
 | 🎯 **轨迹预测** | 24 步连续轨迹预测 (x, y, θ) |
 | 📊 **进度估计** | 任务完成进度回归 (0-1) |
-| 🧠 **Qwen3-VL 骨干** | 利用强大的视觉语言预训练模型 |
+| 🧠 **Qwen3-VL 骨干** | 视觉语言预训练模型，支持可选 LoRA 微调 |
 | ⚡ **Sequence Packing** | 高效批量训练，消除 padding 浪费 |
 | 🎛️ **模块化设计** | 可独立启用/禁用各预测头 |
 
@@ -221,58 +221,73 @@ python scripts/evaluate.py \
 ### 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         VLN Pipeline                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  输入                                                           │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ History [K帧]│  │ Current Frame│  │ Instruction  │          │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
-│         └─────────────────┴─────────────────┘                   │
-│                           │                                     │
-│                           ▼                                     │
-│                  ┌─────────────────┐                            │
-│                  │    Qwen3-VL     │  ← 参数冻结                │
-│                  │   (Backbone)    │                            │
-│                  └────────┬────────┘                            │
-│                           │                                     │
-│              hidden_states [B, seq, 2048]                       │
-│                           │                                     │
-│         ┌─────────────────┼─────────────────┐                   │
-│         ▼                 ▼                 ▼                   │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
-│  │   Heatmap   │   │ Trajectory  │   │  Progress   │           │
-│  │    Head     │   │    Head     │   │    Head     │           │
-│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘           │
-│         │                 │                 │                   │
-│         ▼                 ▼                 ▼                   │
-│    Heatmap          Trajectory          Progress                │
-│    [64×64]         [24, 3]              [0, 1]                  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           VLN Pipeline                               │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  输入                                                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│  │ History [K帧]│  │ Current Frame│  │ Instruction  │               │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘               │
+│         └─────────────────┴─────────────────┘                        │
+│                           │                                          │
+│                           ▼                                          │
+│                  ┌─────────────────┐                                 │
+│                  │    Qwen3-VL     │  ← 冻结 (可选 LoRA 微调)        │
+│                  │   (Backbone)    │                                 │
+│                  └────────┬────────┘                                 │
+│                           │                                          │
+│              hidden_states [B, seq, 4096]                            │
+│                           │                                          │
+│                  ┌────────┴────────┐                                 │
+│                  │  LLM Projector  │  4096 → 1024                    │
+│                  └────────┬────────┘                                 │
+│                           │                                          │
+│              llm_tokens [B, seq, 1024]                               │
+│                           │                                          │
+│         ┌─────────────────┼─────────────────┐                        │
+│         ▼                 ▼                 ▼                        │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                │
+│  │   Heatmap   │   │ Trajectory  │   │  Progress   │                │
+│  │    Head     │   │    Head     │   │    Head     │                │
+│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘                │
+│         │                 │                 │                        │
+│         ▼                 ▼                 ▼                        │
+│    Heatmap          Trajectory          Progress                     │
+│    [64×64]         [24, 3]              [0, 1]                       │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 热力图生成模块
 
-基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史位置在当前视野中的分布。
+基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史相机位置在当前观测中的投影分布。
+
+采用**双路径条件注入**架构，解决将整个 LLM token 序列压缩为单向量的信息瓶颈：
 
 **架构：**
 
 ```
-LLM Tokens → Attention Pooling → Condition Encoder
-                                        ↓
-ConditionalUnet2D (Cross-Attention + FiLM) → DDPM + CFG → Heatmap
+LLM Tokens (B, ~900, 1024)
+    ├─→ AttentionPooling → global_cond (B, 1024)     ──→ FiLM (所有 ResBlock)
+    │                                                      ↓
+    └─→ LinearProj → seq_cond (B, ~900, 1024)        ──→ Cross-Attention
+                                                           ↓
+Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2D
+                                                           ↓
+                                                     DDPM + CFG → Heatmap [64×64]
 ```
 
 **关键技术：**
 
 | 技术 | 说明 |
 |:-----|:-----|
-| **Cross-Attention** | UNet 中间层添加交叉注意力，增强条件注入 |
-| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 |
-| **Focal Loss** | 70% 标准 MSE + 30% 峰值加权 |
-| **360° Circular Padding** | 支持全景图水平边界连续性 |
+| **双路径条件注入** | FiLM (全局向量) + 序列 Cross-Attention (保留完整 LLM token 序列) |
+| **序列 Cross-Attention** | UNet 各空间位置 attend 到完整 LLM 序列，避免信息瓶颈 |
+| **Image Encoder** | CNN 编码当前图像，提供像素级空间特征辅助热力图定位 |
+| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=3.0) |
+| **Focal Loss** | 70% 标准 MSE + 30% 峰值加权，关注关键区域 |
+| **LoRA 微调 (可选)** | 对 Qwen3-VL 最后 N 层加 LoRA，增强空间推理能力 |
 
 ### 轨迹预测模块
 
@@ -348,26 +363,25 @@ data:
 
 ## ⚙️ 配置说明
 
-主配置文件：`configs/train_config.yaml`
+主配置文件：`configs/train_heatmap_config.yaml`
 
 <details>
 <summary>📋 完整配置示例</summary>
 
 ```yaml
-# 数据配置
-data:
-  root: dataset_with_actions
-  val_split: val_unseen
-  trajectory:
-    random_subsequence: true
-    min_subsequence_length: 30
-    subsequence_samples_per_clip: 5
-
 # 模型配置
 model:
   llm:
     model_path: ./models/qwen_3_vl
     attn_implementation: flash_attention_2
+    enable_packing: true          # Sequence Packing 高效训练
+    max_seq_length: 8192
+    
+    # LoRA 微调（可选，默认关闭）
+    use_lora: false
+    lora_rank: 16
+    lora_alpha: 32
+    lora_num_layers: 4            # 最后 4 层
   
   heatmap_head:
     enable_history: true
@@ -377,20 +391,20 @@ model:
     num_inference_steps: 20
     cfg_drop_prob: 0.1
     cfg_scale: 3.0
+    
+    # 双路径条件注入
+    use_image_encoder: true             # CNN 编码当前图像
+    use_sequence_conditioning: true     # 序列级 Cross-Attention
+    seq_cross_attn_heads: 8
+    seq_cross_attn_head_dim: 64
 
 # 优化器配置
 optim:
-  batch_size: 32
-  grad_accum_steps: 4
+  batch_size: 16
+  grad_accum_steps: 2             # 有效 batch = 32
   heatmap_lr: 1.0e-4
-  action_lr: 1.0e-4
-  progress_lr: 1.0e-4
-
-# 损失权重
-loss:
-  history_weight: 1.0
-  trajectory_weight: 1.0
-  progress_weight: 1.0
+  llm_projector_lr: 5.0e-5        # 投影层使用更低 LR
+  lora_lr: 1.0e-5                 # LoRA 使用极低 LR
 ```
 
 </details>
@@ -417,7 +431,8 @@ optim:
 
 检查 TensorBoard 中 `diag/pred_heatmap_max`：
 - 如果 < 0.1，说明热力图坍缩
-- 确保使用 `use_image_encoder: false`（LLM-only 模式）
+- 确保 `use_image_encoder: true` 和 `use_sequence_conditioning: true` 已启用
+- 检查 `cfg_scale` 是否过高（推荐 2.0-4.0）
 
 </details>
 
@@ -437,22 +452,30 @@ python scripts/train.py --config configs/train_config.yaml --auto-resume
 ```
 HeatmapVLN/
 ├── configs/
-│   └── train_config.yaml           # 训练配置
+│   └── train_heatmap_config.yaml   # 热力图训练配置
 ├── scripts/
 │   ├── train.py                    # 训练脚本
 │   ├── evaluate.py                 # 评估脚本
 │   └── inference.py                # 推理脚本
 ├── src/
 │   ├── data/                       # 数据加载
-│   │   ├── vln_sliding_window_dataset.py
-│   │   └── tokenized_dataset.py
-│   └── models/                     # 模型定义
-│       ├── pipeline.py             # VLNPipeline 主模块
-│       ├── qwen3_vl/               # Qwen3-VL 集成
-│       ├── heatmap/                # 热力图模块
-│       └── action/                 # 动作模块
+│   │   ├── vln_sliding_window_dataset.py  # 滑动窗口 + 轨迹数据集
+│   │   ├── tokenized_dataset.py    # Qwen3-VL tokenization 数据集
+│   │   └── packing_collator.py     # Sequence Packing collator
+│   ├── models/                     # 模型定义
+│   │   ├── pipeline.py             # VLNPipeline 主模块
+│   │   ├── qwen3_vl/               # Qwen3-VL 集成 (含 LoRA 支持)
+│   │   ├── heatmap/                # 热力图模块
+│   │   │   ├── diffusion_heatmap_head.py  # Diffusion 热力图头
+│   │   │   └── diffusion/
+│   │   │       ├── config.py       # 配置 (含序列 Cross-Attention)
+│   │   │       ├── unet2d.py       # UNet2D (双路径条件注入)
+│   │   │       └── image_encoder.py # 条件编码器 (全局+序列)
+│   │   └── action/                 # 动作模块
+│   └── utils/                      # 工具函数
+│       ├── gpu_heatmap.py          # GPU 热力图计算
+│       └── notifier.py             # 飞书通知
 ├── docker/                         # Docker 配置
-├── docs/                           # 文档
 ├── requirements.txt
 └── README.md
 ```
