@@ -59,3 +59,4 @@ tf-logs-archive/
 .DS_Store
 nohup.out
 /plans/*
+.cursor/
