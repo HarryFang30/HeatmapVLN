@@ -60,3 +60,4 @@ tf-logs-archive/
 nohup.out
 /plans/*
 .cursor/*
+!.cursor/rules/
