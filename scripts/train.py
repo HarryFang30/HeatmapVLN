@@ -531,6 +531,17 @@ def build_model(cfg: Dict) -> nn.Module:
         # Classifier-Free Guidance (CFG) for heatmap
         heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
         heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
+        # Sequence cross-attention conditioning
+        heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
+        heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
+        heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
+        
+        # LoRA configuration
+        use_lora=llm_cfg.get('use_lora', False),
+        lora_rank=llm_cfg.get('lora_rank', 16),
+        lora_alpha=llm_cfg.get('lora_alpha', 32),
+        lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         
         # Action Head Type
         action_head_type=action_head_type,
@@ -646,9 +657,18 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             freeze_module(model.llm_projector, freeze=False)
             logger.info("  ✓ Unfrozen: llm_projector")
     
-    # Qwen3-VL 始终冻结
+    # Qwen3-VL: 冻结基座，但保留 LoRA 参数可训练
     if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
         freeze_module(model.qwen3_vl, freeze=True)
+        # 如果配置了 LoRA 且在 trainable_modules 中，解冻 LoRA 参数
+        if 'qwen3_vl_lora' in trainable:
+            lora_count = 0
+            for name, param in model.qwen3_vl.named_parameters():
+                if 'lora_' in name:
+                    param.requires_grad = True
+                    lora_count += 1
+            if lora_count > 0:
+                logger.info(f"  ✓ Unfrozen: qwen3_vl LoRA ({lora_count} parameter tensors)")
 
 
 def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
@@ -744,6 +764,20 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         if groups:
             param_groups.extend(groups)
             print(f"  Param group: llm_projector (lr={proj_lr}, wd={projector_wd})")
+    
+    # Qwen3-VL LoRA parameters (very low LR for backbone fine-tuning)
+    lora_lr = optim_cfg.get('lora_lr', 1e-5)
+    if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
+        lora_params = [p for n, p in model.qwen3_vl.named_parameters() 
+                       if p.requires_grad and 'lora_' in n]
+        if lora_params:
+            param_groups.append({
+                'params': lora_params,
+                'lr': lora_lr,
+                'weight_decay': 0.0,  # LoRA 通常不使用 weight_decay
+                'name': 'qwen3_vl_lora'
+            })
+            print(f"  Param group: qwen3_vl_lora (lr={lora_lr}, wd=0.0, params={len(lora_params)})")
     
     if not param_groups:
         raise ValueError("No trainable parameters found!")

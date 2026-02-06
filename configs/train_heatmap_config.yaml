@@ -70,6 +70,13 @@ model:
     enable_packing: true
     max_seq_length: 8192
     spatial_merge_size: 2
+    
+    # LoRA 配置（默认关闭，代码已就绪）
+    use_lora: false
+    lora_rank: 16
+    lora_alpha: 32
+    lora_num_layers: 4         # 最后 4 层
+    lora_dropout: 0.05
 
   # 热力图头配置 (只训练 history head)
   heatmap_head:
@@ -98,12 +105,17 @@ model:
     # Pinhole 相机不需要循环填充（非 360° 全景）
     use_circular_padding: false
     
-    # 禁用 CNN encoder，只用 LLM 特征
-    use_image_encoder: false
+    # 启用 CNN encoder，提供当前图像的空间特征
+    use_image_encoder: true
     
-    # LLM token pooling
+    # LLM token pooling（全局路径）
     pool_method: attention
     pool_num_heads: 8
+    
+    # 序列级 Cross-Attention 条件注入（解决单向量信息瓶颈）
+    use_sequence_conditioning: true
+    seq_cross_attn_heads: 8
+    seq_cross_attn_head_dim: 64
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:
@@ -184,7 +196,8 @@ optim:
   action_lr: 1.0e-4
   transformer_action_lr: 1.0e-4
   progress_lr: 1.0e-4
-  llm_projector_lr: 1.0e-4
+  llm_projector_lr: 5.0e-5         # 投影层降低 LR，更稳定地适配冻结 LLM
+  lora_lr: 1.0e-5                  # LoRA 使用极低 LR（仅当 use_lora=true 时有效）
 
   # 正则化
   weight_decay: 5.0e-2

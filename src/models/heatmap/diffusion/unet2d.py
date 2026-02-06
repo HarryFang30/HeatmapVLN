@@ -239,8 +239,12 @@ class CrossAttention2D(nn.Module):
     """
     Cross-attention block for conditioning 2D feature maps.
     
-    让 UNet 的每个空间位置都能"查询"条件向量，
-    比 FiLM 更强的条件注入方式。
+    支持两种条件输入:
+    - (B, cond_dim): 单向量条件 -> K/V 长度为 1 (向后兼容)
+    - (B, seq_len, cond_dim): 序列条件 -> K/V 长度为 seq_len (序列级 cross-attention)
+    
+    序列模式下，每个空间位置可以 attend 到 LLM token 序列的不同部分，
+    显著缓解单向量条件的信息瓶颈。
     """
     
     def __init__(
@@ -271,7 +275,7 @@ class CrossAttention2D(nn.Module):
         """
         Args:
             x: (B, C, H, W) 特征图
-            cond: (B, cond_dim) 条件向量
+            cond: (B, cond_dim) 单向量条件 或 (B, seq_len, cond_dim) 序列条件
             
         Returns:
             (B, C, H, W) 条件增强后的特征图
@@ -280,23 +284,28 @@ class CrossAttention2D(nn.Module):
         
         residual = x
         x = self.norm(x)
-        cond = self.norm_cond(cond)
+        
+        # 自适应处理: 将 (B, cond_dim) 统一为 (B, seq_len, cond_dim)
+        if cond.dim() == 2:
+            cond = cond.unsqueeze(1)  # (B, 1, cond_dim)
+        
+        cond = self.norm_cond(cond)  # (B, seq_len, cond_dim)
+        seq_len = cond.shape[1]
         
         # Q from spatial features: (B, inner_dim, H, W) -> (B, heads, H*W, head_dim)
         q = self.to_q(x)  # (B, inner_dim, H, W)
         q = q.reshape(B, self.num_heads, self.head_dim, H * W)
         q = q.permute(0, 1, 3, 2)  # (B, heads, H*W, head_dim)
         
-        # K, V from condition: (B, cond_dim) -> (B, heads, 1, head_dim)
-        k = self.to_k(cond)  # (B, inner_dim)
-        v = self.to_v(cond)  # (B, inner_dim)
-        k = k.reshape(B, self.num_heads, self.head_dim, 1)
-        v = v.reshape(B, self.num_heads, self.head_dim, 1)
-        k = k.permute(0, 1, 3, 2)  # (B, heads, 1, head_dim)
-        v = v.permute(0, 1, 3, 2)  # (B, heads, 1, head_dim)
+        # K, V from condition: (B, seq_len, cond_dim) -> (B, heads, seq_len, head_dim)
+        k = self.to_k(cond)  # (B, seq_len, inner_dim)
+        v = self.to_v(cond)  # (B, seq_len, inner_dim)
+        k = k.reshape(B, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(B, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # k, v: (B, heads, seq_len, head_dim)
         
-        # Attention: 每个空间位置都查询条件
-        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, heads, H*W, 1)
+        # Attention: 每个空间位置查询条件序列
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, heads, H*W, seq_len)
         attn = F.softmax(attn, dim=-1)
         
         out = torch.matmul(attn, v)  # (B, heads, H*W, head_dim)
@@ -365,6 +374,10 @@ class ConditionalUnet2D(nn.Module):
         dropout: float = 0.0,
         timestep_embed_dim: int = 256,
         use_circular_padding: bool = False,
+        # Sequence cross-attention conditioning
+        use_sequence_conditioning: bool = False,
+        seq_cross_attn_heads: int = 8,
+        seq_cross_attn_head_dim: int = 64,
     ):
         super().__init__()
         
@@ -372,6 +385,7 @@ class ConditionalUnet2D(nn.Module):
         self.out_channels = out_channels
         self.cond_dim = cond_dim
         self.use_circular_padding = use_circular_padding
+        self.use_sequence_conditioning = use_sequence_conditioning
         
         # Timestep embedding
         self.time_embed = nn.Sequential(
@@ -390,6 +404,7 @@ class ConditionalUnet2D(nn.Module):
         # ==================== Encoder ====================
         self.down_blocks = nn.ModuleList()
         self.down_attentions = nn.ModuleList()
+        self.down_cross_attentions = nn.ModuleList()
         self.downsamplers = nn.ModuleList()
         
         in_ch = block_out_channels[0]
@@ -408,11 +423,22 @@ class ConditionalUnet2D(nn.Module):
             ])
             self.down_blocks.append(blocks)
             
-            # Attention
+            # Self-Attention
             if i in attention_levels:
                 self.down_attentions.append(Attention2D(out_ch))
             else:
                 self.down_attentions.append(nn.Identity())
+            
+            # Sequence Cross-Attention (only at attention levels, when enabled)
+            if use_sequence_conditioning and i in attention_levels:
+                self.down_cross_attentions.append(CrossAttention2D(
+                    channels=out_ch,
+                    cond_dim=cond_dim,
+                    num_heads=seq_cross_attn_heads,
+                    head_dim=seq_cross_attn_head_dim,
+                ))
+            else:
+                self.down_cross_attentions.append(nn.Identity())
             
             # Downsampler (except for last level)
             if i < len(block_out_channels) - 1:
@@ -429,12 +455,15 @@ class ConditionalUnet2D(nn.Module):
             use_circular_padding=use_circular_padding
         )
         self.mid_attn = Attention2D(mid_channels)
-        # Cross-Attention: 让每个空间位置都能查询条件向量
+        # Cross-Attention: 让每个空间位置都能查询条件
+        # 序列模式下使用更大的 head 配置
+        mid_cross_heads = seq_cross_attn_heads if use_sequence_conditioning else 4
+        mid_cross_head_dim = seq_cross_attn_head_dim if use_sequence_conditioning else 32
         self.mid_cross_attn = CrossAttention2D(
             channels=mid_channels,
             cond_dim=cond_dim,
-            num_heads=4,
-            head_dim=32,
+            num_heads=mid_cross_heads,
+            head_dim=mid_cross_head_dim,
         )
         self.mid_block2 = ConditionalResidualBlock2D(
             mid_channels, mid_channels, cond_dim, n_groups=n_groups, dropout=dropout,
@@ -444,6 +473,7 @@ class ConditionalUnet2D(nn.Module):
         # ==================== Decoder ====================
         self.up_blocks = nn.ModuleList()
         self.up_attentions = nn.ModuleList()
+        self.up_cross_attentions = nn.ModuleList()
         self.upsamplers = nn.ModuleList()
         
         reversed_channels = list(reversed(block_out_channels))
@@ -465,12 +495,23 @@ class ConditionalUnet2D(nn.Module):
             ])
             self.up_blocks.append(blocks)
             
-            # Attention
+            # Self-Attention
             level_idx = len(block_out_channels) - 1 - i
             if level_idx in attention_levels:
                 self.up_attentions.append(Attention2D(out_ch))
             else:
                 self.up_attentions.append(nn.Identity())
+            
+            # Sequence Cross-Attention (mirror encoder)
+            if use_sequence_conditioning and level_idx in attention_levels:
+                self.up_cross_attentions.append(CrossAttention2D(
+                    channels=out_ch,
+                    cond_dim=cond_dim,
+                    num_heads=seq_cross_attn_heads,
+                    head_dim=seq_cross_attn_head_dim,
+                ))
+            else:
+                self.up_cross_attentions.append(nn.Identity())
             
             # Upsampler (except for last level)
             if i < len(reversed_channels) - 1:
@@ -492,6 +533,7 @@ class ConditionalUnet2D(nn.Module):
         sample: torch.Tensor,
         timestep: torch.Tensor,
         global_cond: torch.Tensor,
+        seq_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for noise prediction.
@@ -499,7 +541,9 @@ class ConditionalUnet2D(nn.Module):
         Args:
             sample: (B, in_channels, H, W) noisy heatmap
             timestep: (B,) diffusion timesteps
-            global_cond: (B, cond_dim) conditioning vector
+            global_cond: (B, cond_dim) conditioning vector (for FiLM)
+            seq_cond: Optional (B, seq_len, cond_dim) sequence conditioning (for cross-attention)
+                      If None, cross-attention uses global_cond (backward compatible)
             
         Returns:
             (B, out_channels, H, W) predicted noise
@@ -508,8 +552,11 @@ class ConditionalUnet2D(nn.Module):
         timestep_float = timestep.to(dtype=sample.dtype)
         t_emb = self.time_embed(timestep_float)  # (B, cond_dim)
         
-        # Combine timestep and global condition
+        # Combine timestep and global condition for FiLM
         cond = t_emb + global_cond  # (B, cond_dim)
+        
+        # Determine cross-attention condition: use seq_cond if available, else global_cond
+        cross_cond = seq_cond if seq_cond is not None else global_cond
         
         # Initial conv (with optional circular padding for 360° panorama)
         if self.use_circular_padding:
@@ -522,24 +569,29 @@ class ConditionalUnet2D(nn.Module):
         # ==================== Encoder ====================
         skip_connections = []
         
-        for blocks, attn, downsample in zip(
-            self.down_blocks, self.down_attentions, self.downsamplers
+        for blocks, attn, cross_attn, downsample in zip(
+            self.down_blocks, self.down_attentions,
+            self.down_cross_attentions, self.downsamplers
         ):
             for block in blocks:
-                h = block(h, cond)
-            h = attn(h)
+                h = block(h, cond)  # FiLM conditioning
+            h = attn(h)  # Self-attention
+            # Sequence cross-attention (at attention_levels when enabled)
+            if isinstance(cross_attn, CrossAttention2D):
+                h = cross_attn(h, cross_cond)
             skip_connections.append(h)
             h = downsample(h)
         
         # ==================== Middle ====================
         h = self.mid_block1(h, cond)
         h = self.mid_attn(h)
-        h = self.mid_cross_attn(h, global_cond)  # Cross-Attention with original condition
+        h = self.mid_cross_attn(h, cross_cond)  # Cross-Attention with sequence or global
         h = self.mid_block2(h, cond)
         
         # ==================== Decoder ====================
-        for blocks, attn, upsample in zip(
-            self.up_blocks, self.up_attentions, self.upsamplers
+        for blocks, attn, cross_attn, upsample in zip(
+            self.up_blocks, self.up_attentions,
+            self.up_cross_attentions, self.upsamplers
         ):
             # Skip connection
             if skip_connections:
@@ -550,8 +602,11 @@ class ConditionalUnet2D(nn.Module):
                 h = torch.cat([h, skip], dim=1)
             
             for block in blocks:
-                h = block(h, cond)
-            h = attn(h)
+                h = block(h, cond)  # FiLM conditioning
+            h = attn(h)  # Self-attention
+            # Sequence cross-attention (mirror encoder)
+            if isinstance(cross_attn, CrossAttention2D):
+                h = cross_attn(h, cross_cond)
             h = upsample(h)
         
         # ==================== Output ====================

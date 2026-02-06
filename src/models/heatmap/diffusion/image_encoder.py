@@ -324,12 +324,11 @@ class LLMConditionProjector(nn.Module):
 
 class MultiModalConditionEncoder(nn.Module):
     """
-    Fuses LLM tokens and observation image into a single conditioning vector.
+    Fuses LLM tokens and observation image into conditioning signals.
     
-    Architecture:
-        LLM Tokens -> LLMConditionProjector -> (B, cond_dim)
-        Observation -> ImageConditionEncoder -> (B, cond_dim)
-        Concat -> MLP -> (B, cond_dim)
+    Supports two conditioning paths:
+        1. Global path (FiLM): LLM pool + image -> (B, cond_dim) single vector
+        2. Sequence path (Cross-Attention): LLM project -> (B, seq_len, cond_dim) token sequence
     
     Args:
         llm_dim: LLM hidden dimension
@@ -339,6 +338,7 @@ class MultiModalConditionEncoder(nn.Module):
         llm_hidden_dim: Intermediate dim for LLM projector
         pool_method: How to pool LLM sequence ('attention', 'mean', 'first', 'last', 'max')
         pool_num_heads: Number of attention heads for attention pooling
+        use_sequence_conditioning: Enable dual-path conditioning (global + sequence)
     """
     
     def __init__(
@@ -353,6 +353,7 @@ class MultiModalConditionEncoder(nn.Module):
         image_size: Tuple[int, int] = (224, 224),
         dropout: float = 0.1,
         use_image_encoder: bool = True,
+        use_sequence_conditioning: bool = False,
     ):
         super().__init__()
 
@@ -360,8 +361,9 @@ class MultiModalConditionEncoder(nn.Module):
             image_encoder_channels = [32, 64, 128, 256]
 
         self.use_image_encoder = use_image_encoder
+        self.use_sequence_conditioning = use_sequence_conditioning
 
-        # LLM projector with attention pooling support
+        # LLM projector with attention pooling support (global path)
         self.llm_projector = LLMConditionProjector(
             input_dim=llm_dim,
             output_dim=cond_dim,
@@ -398,6 +400,19 @@ class MultiModalConditionEncoder(nn.Module):
                 nn.GELU(),
                 nn.Linear(cond_dim, cond_dim),
             )
+        
+        # Sequence projector (sequence path - no pooling, keeps full sequence)
+        if use_sequence_conditioning:
+            self.seq_projector = nn.Sequential(
+                nn.LayerNorm(llm_dim),
+                nn.Linear(llm_dim, cond_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(cond_dim, cond_dim),
+                nn.LayerNorm(cond_dim),
+            )
+        else:
+            self.seq_projector = None
     
     def forward(
         self,
@@ -405,7 +420,7 @@ class MultiModalConditionEncoder(nn.Module):
         observation: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Fuse LLM tokens and observation into conditioning vector.
+        Fuse LLM tokens and observation into global conditioning vector.
 
         Args:
             llm_tokens: (B, seq_len, llm_dim) or (B, llm_dim) LLM features
@@ -426,6 +441,35 @@ class MultiModalConditionEncoder(nn.Module):
             fused = llm_cond  # (B, cond_dim)
 
         return self.fusion(fused)  # (B, cond_dim)
+    
+    def forward_dual(
+        self,
+        llm_tokens: torch.Tensor,
+        observation: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Dual-path conditioning: returns both global vector and sequence.
+        
+        Args:
+            llm_tokens: (B, seq_len, llm_dim) LLM features
+            observation: (B, C, H, W) observation image
+            
+        Returns:
+            global_cond: (B, cond_dim) pooled conditioning vector (for FiLM)
+            seq_cond: (B, seq_len, cond_dim) projected sequence (for cross-attention)
+                      None if use_sequence_conditioning is False
+        """
+        # Global path (existing)
+        global_cond = self.forward(llm_tokens, observation)  # (B, cond_dim)
+        
+        # Sequence path (new)
+        seq_cond = None
+        if self.use_sequence_conditioning and self.seq_projector is not None:
+            if llm_tokens.dim() == 2:
+                llm_tokens = llm_tokens.unsqueeze(1)  # (B, 1, dim)
+            seq_cond = self.seq_projector(llm_tokens)  # (B, seq_len, cond_dim)
+        
+        return global_cond, seq_cond
     
     def forward_llm_only(self, llm_tokens: torch.Tensor) -> torch.Tensor:
         """Encode only LLM tokens (for cases without observation)."""

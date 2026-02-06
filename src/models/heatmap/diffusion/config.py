@@ -106,6 +106,13 @@ class DiffusionHeatmapConfig:
     cfg_drop_prob: float = 0.1       # 训练时随机 drop 条件的概率
     cfg_scale: float = 3.0           # 推理时的引导强度 (1.0 = 无引导)
     
+    # ==================== Sequence Cross-Attention Conditioning ====================
+    # 双路径条件注入: FiLM (全局向量) + Cross-Attention (序列)
+    # 解决 AttentionPooling 将整个 LLM 序列压缩为单个向量的信息瓶颈
+    use_sequence_conditioning: bool = False    # 是否启用序列级 cross-attention
+    seq_cross_attn_heads: int = 8             # cross-attention head 数
+    seq_cross_attn_head_dim: int = 64         # 每个 head 的维度
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"

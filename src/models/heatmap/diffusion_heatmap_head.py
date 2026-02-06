@@ -77,6 +77,9 @@ class DiffusionHeatmapHead(nn.Module):
         self.cfg_drop_prob = config.cfg_drop_prob
         self.cfg_scale = config.cfg_scale
         
+        # Sequence conditioning flag
+        self.use_sequence_conditioning = config.use_sequence_conditioning
+        
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
             llm_dim=config.llm_dim,
@@ -89,6 +92,7 @@ class DiffusionHeatmapHead(nn.Module):
             image_size=config.image_size,
             dropout=config.dropout,
             use_image_encoder=config.use_image_encoder,
+            use_sequence_conditioning=config.use_sequence_conditioning,
         )
         
         # ==================== Noise Predictor ====================
@@ -102,6 +106,10 @@ class DiffusionHeatmapHead(nn.Module):
             n_groups=config.norm_num_groups,
             dropout=config.dropout,
             use_circular_padding=config.use_circular_padding,  # 360° 全景图支持
+            # Sequence cross-attention conditioning
+            use_sequence_conditioning=config.use_sequence_conditioning,
+            seq_cross_attn_heads=config.seq_cross_attn_heads,
+            seq_cross_attn_head_dim=config.seq_cross_attn_head_dim,
         )
         
         # ==================== Noise Scheduler ====================
@@ -156,15 +164,19 @@ class DiffusionHeatmapHead(nn.Module):
             llm_tokens = llm_tokens.reshape(B, -1, D)
         # Now llm_tokens is (B, seq_len, D) - let condition_encoder handle pooling
         
-        # 2. Encode conditions (condition_encoder will pool based on configured pool_method)
-        cond = self.condition_encoder(llm_tokens, observation)  # (B, cond_dim)
+        # 2. Encode conditions (dual-path if sequence conditioning enabled)
+        if self.use_sequence_conditioning:
+            cond, seq_cond = self.condition_encoder.forward_dual(llm_tokens, observation)
+        else:
+            cond = self.condition_encoder(llm_tokens, observation)  # (B, cond_dim)
+            seq_cond = None
         
         # 3. Training mode
         if gt_heatmap is not None and return_loss:
-            return self._compute_training_loss(cond, gt_heatmap, skip_inference)
+            return self._compute_training_loss(cond, gt_heatmap, skip_inference, seq_cond=seq_cond)
         
         # 4. Inference mode
-        heatmap = self._diffusion_inference(cond)
+        heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
         
         if return_loss:
             return {
@@ -179,6 +191,7 @@ class DiffusionHeatmapHead(nn.Module):
         cond: torch.Tensor,
         gt_heatmap: torch.Tensor,
         skip_inference: bool = False,
+        seq_cond: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute diffusion training loss.
@@ -187,6 +200,7 @@ class DiffusionHeatmapHead(nn.Module):
             cond: (B, cond_dim) conditioning vector
             gt_heatmap: (B, Hm, Wm) ground truth heatmap
             skip_inference: If True, skip inference for monitoring (faster training)
+            seq_cond: Optional (B, seq_len, cond_dim) sequence conditioning
             
         Returns:
             Dict with 'loss', 'heatmap', 'noise_pred', 'noise_target'
@@ -228,14 +242,21 @@ class DiffusionHeatmapHead(nn.Module):
             # 将 drop 的样本条件设为零向量
             cond_for_pred = cond.clone()
             cond_for_pred[drop_mask] = 0.0
+            # 序列条件也需要 drop
+            seq_cond_for_pred = seq_cond
+            if seq_cond is not None:
+                seq_cond_for_pred = seq_cond.clone()
+                seq_cond_for_pred[drop_mask] = 0.0
         else:
             cond_for_pred = cond
+            seq_cond_for_pred = seq_cond
         
         # Predict noise
         noise_pred = self.noise_predictor(
             sample=noisy_heatmap,
             timestep=timesteps,
             global_cond=cond_for_pred,
+            seq_cond=seq_cond_for_pred,
         )
         
         # ==================== Focal-style 混合损失 ====================
@@ -276,7 +297,7 @@ class DiffusionHeatmapHead(nn.Module):
         
         if not skip_inference and (self._training_step_counter % self._inference_interval == 0):
             with torch.no_grad():
-                pred_heatmap = self._diffusion_inference(cond)
+                pred_heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
         
         return {
             'loss': total_loss,                     # 🆕 使用合并后的总损失
@@ -290,13 +311,19 @@ class DiffusionHeatmapHead(nn.Module):
             'noise_pred_std': noise_pred_std,
         }
     
-    def _diffusion_inference(self, cond: torch.Tensor, use_cfg: bool = True) -> torch.Tensor:
+    def _diffusion_inference(
+        self,
+        cond: torch.Tensor,
+        use_cfg: bool = True,
+        seq_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Iterative denoising to generate heatmap with Classifier-Free Guidance.
         
         Args:
             cond: (B, cond_dim) conditioning vector
             use_cfg: 是否使用 CFG 引导（推理时建议开启）
+            seq_cond: Optional (B, seq_len, cond_dim) sequence conditioning
             
         Returns:
             (B, Hm, Wm) predicted heatmap (probability distribution)
@@ -314,6 +341,7 @@ class DiffusionHeatmapHead(nn.Module):
         
         # 准备无条件向量（零向量）
         uncond = torch.zeros_like(cond)
+        uncond_seq = torch.zeros_like(seq_cond) if seq_cond is not None else None
         
         # 是否使用 CFG
         do_cfg = use_cfg and self.cfg_scale > 1.0
@@ -332,12 +360,14 @@ class DiffusionHeatmapHead(nn.Module):
                     sample=noisy_heatmap,
                     timestep=timestep_batch,
                     global_cond=cond,
+                    seq_cond=seq_cond,
                 )
                 # 无条件预测
                 noise_pred_uncond = self.noise_predictor(
                     sample=noisy_heatmap,
                     timestep=timestep_batch,
                     global_cond=uncond,
+                    seq_cond=uncond_seq,
                 )
                 # CFG 公式：noise = uncond + scale * (cond - uncond)
                 noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_cond - noise_pred_uncond)
@@ -347,6 +377,7 @@ class DiffusionHeatmapHead(nn.Module):
                     sample=noisy_heatmap,
                     timestep=timestep_batch,
                     global_cond=cond,
+                    seq_cond=seq_cond,
                 )
             
             # Remove noise (reverse diffusion step)

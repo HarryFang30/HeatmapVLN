@@ -84,6 +84,18 @@ class VLNPipelineConfig:
     heatmap_cfg_drop_prob: float = 0.1  # CFG: drop condition probability during training
     heatmap_cfg_scale: float = 3.0  # CFG: guidance scale during inference
     
+    # Sequence cross-attention conditioning (dual-path: FiLM + sequence cross-attn)
+    heatmap_use_sequence_conditioning: bool = False  # Enable sequence-level cross-attention
+    heatmap_seq_cross_attn_heads: int = 8            # Cross-attention heads
+    heatmap_seq_cross_attn_head_dim: int = 64        # Head dimension
+    
+    # LoRA configuration for Qwen3-VL fine-tuning
+    use_lora: bool = False           # Enable LoRA on Qwen3-VL
+    lora_rank: int = 16              # LoRA rank
+    lora_alpha: int = 32             # LoRA alpha (typically 2x rank)
+    lora_num_layers: int = 4         # Number of last LLM layers to apply LoRA
+    lora_dropout: float = 0.05       # LoRA dropout
+    
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
     # 'transformer': TransformerActionHead (InternNav style)
@@ -155,6 +167,12 @@ class VLNPipeline(nn.Module):
             enable_packing=config.enable_packing,
             max_seq_length=config.max_seq_length,
             spatial_merge_size=config.spatial_merge_size,
+            # LoRA settings
+            use_lora=config.use_lora,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_num_layers=config.lora_num_layers,
+            lora_dropout=config.lora_dropout,
         )
         self.qwen3_vl = Qwen3VLIntegration(qwen_config)
         if config.enable_packing:
@@ -199,6 +217,10 @@ class VLNPipeline(nn.Module):
             # Classifier-Free Guidance (CFG)
             cfg_drop_prob=config.heatmap_cfg_drop_prob,
             cfg_scale=config.heatmap_cfg_scale,
+            # Sequence cross-attention conditioning
+            use_sequence_conditioning=config.heatmap_use_sequence_conditioning,
+            seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
+            seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
         )
         
         # History Heatmap Head

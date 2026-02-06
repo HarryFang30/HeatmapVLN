@@ -81,6 +81,13 @@ class Qwen3VLConfig:
     max_seq_length: int = 4096    # Maximum packed sequence length
     spatial_merge_size: int = 2   # Vision spatial merge size for position IDs
     
+    # LoRA configuration
+    use_lora: bool = False        # Enable LoRA adapters
+    lora_rank: int = 16           # LoRA rank
+    lora_alpha: int = 32          # LoRA alpha
+    lora_num_layers: int = 4      # Number of last LLM layers to apply LoRA
+    lora_dropout: float = 0.05    # LoRA dropout
+    
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
         dtype_map = {
@@ -164,6 +171,10 @@ class Qwen3VLIntegration(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
             
+            # Apply LoRA if configured (after freezing base model)
+            if self.config.use_lora:
+                self._apply_lora()
+            
             # Load processor
             self.processor = AutoProcessor.from_pretrained(
                 self.config.model_path,
@@ -191,6 +202,61 @@ class Qwen3VLIntegration(nn.Module):
         except Exception as e:
             logger.error(f"Failed to load Qwen3-VL: {e}")
             raise
+    
+    def _apply_lora(self):
+        """
+        Apply LoRA adapters to the last N layers of Qwen3-VL's language model.
+        
+        Uses PEFT library to add low-rank adapters to q_proj and v_proj
+        in the specified layers. LoRA parameters are trainable while
+        the base model remains frozen.
+        """
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError:
+            logger.error("peft not installed. Install with: pip install peft")
+            raise ImportError("peft is required for LoRA. Install with: pip install peft")
+        
+        # Determine total number of LLM layers
+        # Qwen3-VL has a text model (language_model) with transformer layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            num_layers = len(self.model.model.layers)
+        elif hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
+            num_layers = len(self.model.language_model.model.layers)
+        else:
+            # Fallback: try to get from config
+            num_layers = 36  # Qwen3-VL 7B default
+            logger.warning(f"Could not detect layer count, using default: {num_layers}")
+        
+        # Apply LoRA to the last N layers
+        lora_layers = list(range(
+            num_layers - self.config.lora_num_layers,
+            num_layers
+        ))
+        
+        lora_config = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            target_modules=["q_proj", "v_proj"],
+            layers_to_transform=lora_layers,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        
+        self.model = get_peft_model(self.model, lora_config)
+        
+        # Log LoRA info
+        lora_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(
+            f"LoRA applied to layers {lora_layers} (q_proj, v_proj), "
+            f"rank={self.config.lora_rank}, alpha={self.config.lora_alpha}"
+        )
+        logger.info(
+            f"LoRA trainable: {lora_params:,} / {total_params:,} "
+            f"({100 * lora_params / total_params:.4f}%)"
+        )
     
     def enable_sequence_packing(self) -> bool:
         """
