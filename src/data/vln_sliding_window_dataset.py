@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import cv2
 import logging
@@ -1024,14 +1025,39 @@ class VLNSlidingWindowDataset(Dataset):
             hm_w, hm_h = self.hm_size
             if self.defer_heatmap_to_gpu:
                 # GPU 模式：返回 poses，在训练循环中用 GPU 计算热力图
-                history_poses_np = np.stack(history_poses, axis=0)  # [K, 4, 4]
+                # 将 history_poses 填充到固定长度 num_history_sample，以便 batch 时可以 stack
+                num_actual = len(history_poses)
+                target_num = self.num_history_sample
+                
+                if num_actual < target_num:
+                    # 需要填充：重复最后一个 pose 直到达到目标长度
+                    history_poses_padded = list(history_poses)
+                    last_pose = history_poses[-1] if history_poses else np.eye(4, dtype=np.float32)
+                    for _ in range(target_num - num_actual):
+                        history_poses_padded.append(last_pose)
+                    history_poses_np = np.stack(history_poses_padded, axis=0)  # [target_num, 4, 4]
+                else:
+                    history_poses_np = np.stack(history_poses[:target_num], axis=0)  # [target_num, 4, 4]
+                
                 current_pose_np = np.array(current_pose)            # [4, 4]
                 history_poses_tensor = torch.from_numpy(history_poses_np).float()
                 current_pose_tensor = torch.from_numpy(current_pose_np).float()
                 
                 # 深度图转 tensor（如果有）
+                # 统一调整到热力图尺寸，保证 batch 时形状一致
                 if current_depth is not None:
-                    depth_tensor = torch.from_numpy(current_depth).float()
+                    # 深度图可能有不同尺寸，统一调整到 (hm_h, hm_w)
+                    if current_depth.ndim == 3:
+                        # 如果是 (H, W, 1) 格式，转为 (H, W)
+                        current_depth = current_depth[:, :, 0]
+                    depth_h, depth_w = current_depth.shape
+                    if depth_h != hm_h or depth_w != hm_w:
+                        # 使用 bilinear 插值调整尺寸
+                        depth_tensor = torch.from_numpy(current_depth).float().unsqueeze(0).unsqueeze(0)
+                        depth_tensor = F.interpolate(depth_tensor, size=(hm_h, hm_w), mode='bilinear', align_corners=False)
+                        depth_tensor = depth_tensor.squeeze(0).squeeze(0)  # [hm_h, hm_w]
+                    else:
+                        depth_tensor = torch.from_numpy(current_depth).float()
                 else:
                     # placeholder: 使用与热力图相同尺寸，避免 stack 时形状不匹配
                     depth_tensor = torch.zeros(hm_h, hm_w)
@@ -1149,9 +1175,10 @@ class VLNSlidingWindowDataset(Dataset):
         
         # GPU 热力图计算所需的额外字段
         if self.defer_heatmap_to_gpu:
+            hm_w, hm_h = self.hm_size
             result["history_poses"] = torch.zeros(K, 4, 4)
             result["current_pose"] = torch.zeros(4, 4)
-            result["current_depth"] = torch.zeros(1)
+            result["current_depth"] = torch.zeros(hm_h, hm_w)  # 与热力图尺寸一致
             result["intrinsics"] = torch.zeros(3, 3)
             result["has_depth"] = False
             result["has_intrinsics"] = False

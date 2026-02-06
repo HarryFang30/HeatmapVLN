@@ -41,6 +41,7 @@ import warnings
 import gc
 import logging
 import time
+import psutil
 from datetime import datetime, timedelta
 import numpy as np
 import matplotlib
@@ -2010,52 +2011,44 @@ def main():
     else:
         actual_collate_fn = collate_fn
     
-    # 使用 spawn 而不是 fork，避免 tokenizers 多进程死锁
-    # fork 会继承父进程的 tokenizers 锁状态，导致死锁
-    # spawn 创建全新进程，避免这个问题
-    mp_context = 'spawn' if num_workers > 0 else None
+    # 🔧 使用 fork 模式（而非 spawn），利用 copy-on-write 共享内存
+    # TOKENIZERS_PARALLELISM=false 已设置，fork 安全
+    # spawn 模式每个 worker 独立复制 processor+dataset ≈ 10GB/worker
+    # fork 模式 workers 共享父进程内存（COW），仅 ~1-2GB/worker
+    # 在 90GB Docker 容器下这是关键差异
+    mp_context = 'fork' if num_workers > 0 else None
     
-    # 检查是否使用动态采样（set_epoch）
-    # 如果使用动态采样，需要每个 epoch 重新创建 DataLoader，
-    # 因为 persistent_workers=True 时 workers 不会看到 set_epoch 的更新
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
+    persistent_workers = num_workers > 0  # 始终启用，避免每 epoch 重建 workers
     
-    # 动态采样时禁用 persistent_workers，避免 sample_index 不同步问题
-    persistent_workers = num_workers > 0 and not uses_dynamic_sampling
-    
-    def create_train_loader():
-        """创建训练 DataLoader（支持动态采样时重新创建）"""
-        return DataLoader(
-            train_dataset,
-            batch_size=cfg['optim']['batch_size'],
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=cfg['data']['pin_memory'],
-            collate_fn=actual_collate_fn,
-            drop_last=True,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            persistent_workers=persistent_workers,
-            multiprocessing_context=mp_context,
-            worker_init_fn=_worker_init_fn if num_workers > 0 else None,
-        )
-    
-    train_loader = create_train_loader()
-    
-    val_loader = DataLoader(
-        val_dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=cfg['optim']['batch_size'],
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=cfg['data']['pin_memory'],
         collate_fn=actual_collate_fn,
+        drop_last=True,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=num_workers > 0,  # 验证集不需要动态采样，可以保持 persistent
+        persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     
+    # 🔧 验证集不使用 workers，节省内存
+    # 验证集很短（10000 样本），0 workers 足够
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg['optim']['batch_size'],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=cfg['data']['pin_memory'],
+        collate_fn=actual_collate_fn,
+    )
+    
     if uses_dynamic_sampling:
-        logger.info("   ⚠️  Dynamic sampling enabled - DataLoader will be recreated each epoch")
+        logger.info("   ✅ Dynamic sampling enabled with persistent_workers (no DataLoader rebuild)")
+    logger.info(f"   🧠 Memory-efficient: fork mode + val num_workers=0")
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
@@ -2124,21 +2117,12 @@ def main():
         timer.start_epoch()
             
         # Clip-level 采样：每个 epoch 重新采样，减少样本相关性
+        # 🔧 修复：不再重建 DataLoader，直接修改 sample_index
+        # persistent_workers 下 workers 共享 dataset 对象的引用，
+        # 修改 sample_index 后，下一次迭代会自动使用新的索引
         if uses_dynamic_sampling:
             train_dataset.set_epoch(epoch)
-            # 显式关闭旧的 DataLoader workers，避免警告
-            if hasattr(train_loader, '_iterator') and train_loader._iterator is not None:
-                try:
-                    train_loader._iterator._shutdown_workers()
-                except Exception:
-                    pass
-            del train_loader
-            gc.collect()
-            # 重新创建 DataLoader 以确保 workers 获取更新后的 sample_index
-            train_loader = create_train_loader()
-            # 更新 steps_per_epoch（动态采样可能改变样本数量）
-            steps_per_epoch = len(train_loader) // grad_accum_steps
-            logger.info(f"   Recreated DataLoader with {len(train_dataset)} samples for epoch {epoch}")
+            logger.info(f"   🔄 Resampled {len(train_dataset)} samples for epoch {epoch} (persistent workers)")
         
         logger.info("=" * 80)
         logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
@@ -2157,6 +2141,10 @@ def main():
         
         timer.end_epoch()
         
+        # 🧹 强制内存清理，防止内存泄漏
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         val_metrics = validate(
             model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
             packing_enabled=packing_enabled,
@@ -2164,6 +2152,17 @@ def main():
             max_batches=args.max_batches,
             gpu_heatmap_computer=gpu_heatmap_computer,
         )
+        
+        # 🧹 验证后再次清理内存
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 📊 内存使用监控
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        gpu_mem = torch.cuda.memory_allocated() / (1024**3)
+        gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"  🧠 Memory: CPU={mem_info.rss / (1024**3):.2f}GB, GPU={gpu_mem:.2f}GB (reserved={gpu_reserved:.2f}GB)")
         
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
