@@ -9,9 +9,9 @@ data:
   val_split: val
   image_size: [224, 224]
   init_hm_size: [64, 64]
-  num_workers: 8          # fork 模式下 COW 共享内存，8 workers ≈ 16GB
+  num_workers: 4          # packing 模式下 tokenization 很重，4 workers 平衡速度和内存
   pin_memory: true
-  prefetch_factor: 4      # 多预取，掩盖 IO 延迟
+  prefetch_factor: 2      # 减少预取避免内存碎片化积累
   
   # 使用 sliding_window 数据集（patrol_data 没有 trajectory 数据）
   dataset_type: sliding_window

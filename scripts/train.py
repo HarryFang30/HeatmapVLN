@@ -69,12 +69,34 @@ logger = logging.getLogger(__name__)
 # Worker 初始化函数（模块级别，支持 spawn 多进程）
 # ============================================
 
+def _malloc_trim():
+    """强制 glibc 将释放的内存归还操作系统（解决 Python 内存碎片化问题）"""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _worker_init_fn(worker_id):
-    """Worker 进程初始化函数 - 抑制警告"""
+    """Worker 进程初始化函数 - 抑制警告 + 内存管理"""
     import warnings
     warnings.filterwarnings("ignore")
     warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
     warnings.filterwarnings("ignore", message="Asked to sample")
+    
+    # 设置 worker 级别的内存管理：降低 glibc 的 mmap 阈值
+    # 使得大块内存分配使用 mmap，释放后可以直接归还 OS
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        # M_MMAP_THRESHOLD = -3, 设置为 32KB，让更多分配走 mmap
+        libc.mallopt(-3, 32 * 1024)
+        # M_TRIM_THRESHOLD = -1, 设置为 64KB，更积极地归还内存
+        libc.mallopt(-1, 64 * 1024)
+    except Exception:
+        pass
 
 
 # ============================================
@@ -1196,9 +1218,13 @@ def train_one_epoch(
         
         del output
         
+        # 🔧 显式释放 batch 引用（尤其是 packing 模式下 pixel_values_videos 很大）
         if (i + 1) % 4 == 0:
+            del batch
             gc.collect()
             torch.cuda.empty_cache()
+            # 强制 glibc 归还释放的内存给 OS
+            _malloc_trim()
         
         total_loss += loss.item() * grad_accum_steps
         total_heatmap_loss += heatmap_loss.item()
@@ -2019,7 +2045,16 @@ def main():
     mp_context = 'fork' if num_workers > 0 else None
     
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
-    persistent_workers = num_workers > 0  # 始终启用，避免每 epoch 重建 workers
+    
+    # 🔧 内存优化：packing 模式下禁用 persistent_workers
+    # 原因：packing 模式每个 __getitem__ 执行 tokenization（分配/释放 ~20MB），
+    # Python pymalloc 不归还内存给 OS，persistent_workers 下内存碎片化持续增长。
+    # 禁用后每个 epoch 重建 workers，回收碎片化内存。
+    if packing_enabled:
+        persistent_workers = False
+        logger.info("   ⚠️ Packing mode: persistent_workers=False (防止 tokenization 内存碎片化)")
+    else:
+        persistent_workers = num_workers > 0
     
     train_loader = DataLoader(
         train_dataset,
@@ -2047,8 +2082,11 @@ def main():
     )
     
     if uses_dynamic_sampling:
-        logger.info("   ✅ Dynamic sampling enabled with persistent_workers (no DataLoader rebuild)")
-    logger.info(f"   🧠 Memory-efficient: fork mode + val num_workers=0")
+        if persistent_workers:
+            logger.info("   ✅ Dynamic sampling enabled with persistent_workers")
+        else:
+            logger.info("   ✅ Dynamic sampling enabled (workers rebuilt each epoch to reclaim memory)")
+    logger.info(f"   🧠 Memory config: num_workers={num_workers}, prefetch={prefetch_factor}, persistent={persistent_workers}")
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
@@ -2144,6 +2182,7 @@ def main():
         # 🧹 强制内存清理，防止内存泄漏
         gc.collect()
         torch.cuda.empty_cache()
+        _malloc_trim()  # 归还碎片化内存给 OS
         
         val_metrics = validate(
             model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
@@ -2156,6 +2195,7 @@ def main():
         # 🧹 验证后再次清理内存
         gc.collect()
         torch.cuda.empty_cache()
+        _malloc_trim()  # 归还碎片化内存给 OS
         
         # 📊 内存使用监控
         process = psutil.Process()

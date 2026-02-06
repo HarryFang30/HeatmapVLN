@@ -145,6 +145,7 @@ class TokenizedVLNDataset(Dataset):
         self.base_dataset = base_dataset
         self.processor = processor
         self.spatial_merge_size = spatial_merge_size
+        self._call_count = 0  # 用于周期性内存清理
     
     def __len__(self):
         return len(self.base_dataset)
@@ -269,6 +270,20 @@ class TokenizedVLNDataset(Dataset):
             output['has_depth'] = sample['has_depth']
             output['has_intrinsics'] = sample['has_intrinsics']
             output['img_size'] = sample['img_size']
+        
+        # 🔧 内存管理：显式释放中间变量，周期性 malloc_trim
+        # tokenization 产生大量临时内存，Python 不会自动归还 OS
+        del sample, history_pil, current_pil, messages, content, result
+        
+        self._call_count += 1
+        if self._call_count % 50 == 0:
+            import gc
+            gc.collect()
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
         
         return output
 
