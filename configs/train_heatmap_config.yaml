@@ -93,7 +93,7 @@ model:
     
     # Diffusion 配置
     num_inference_steps: 20
-    num_train_timesteps: 100
+    num_train_timesteps: 200       # 100 → 200，更精细的噪声调度
     
     # Classifier-Free Guidance
     cfg_drop_prob: 0.15         # 提高 drop 比例，让模型更好地学习无条件生成
@@ -202,6 +202,9 @@ optim:
   # 正则化（增强）
   weight_decay: 1.0e-1             # 5e-2 → 1e-1
   projector_weight_decay: 1.0e-2   # 5e-3 → 1e-2
+  
+  # EMA (Exponential Moving Average)
+  ema_decay: 0.999                   # 滑动平均衰减率，验证和保存使用 EMA 参数
   
   grad_clip: 1.0
   amp: bf16

@@ -100,6 +100,77 @@ def _worker_init_fn(worker_id):
 
 
 # ============================================
+# EMA (Exponential Moving Average)
+# ============================================
+
+class EMAModel:
+    """
+    Exponential Moving Average for model parameters.
+    
+    扩散模型标准技术：用参数的滑动平均做推理，
+    避免训练末期的参数波动，显著提升泛化性能。
+    
+    用法：
+        ema = EMAModel(model, decay=0.999)
+        # 每次 optimizer.step() 后调用
+        ema.update()
+        # 验证时用 EMA 参数
+        with ema.apply():
+            validate(model, ...)
+    """
+    
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+        # 只追踪需要训练的参数（节省内存）
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    @torch.no_grad()
+    def update(self):
+        """更新 EMA 参数：shadow = decay * shadow + (1 - decay) * param"""
+        for name, param in self.model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+    
+    def apply(self):
+        """Context manager：临时将模型参数替换为 EMA 参数"""
+        return _EMAContext(self)
+    
+    def state_dict(self):
+        return {'shadow': self.shadow, 'decay': self.decay}
+    
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict['shadow']
+        self.decay = state_dict.get('decay', self.decay)
+
+
+class _EMAContext:
+    """EMA 上下文管理器：进入时替换为 EMA 参数，退出时恢复原始参数"""
+    
+    def __init__(self, ema: EMAModel):
+        self.ema = ema
+    
+    def __enter__(self):
+        self.ema.backup = {}
+        for name, param in self.ema.model.named_parameters():
+            if name in self.ema.shadow:
+                self.ema.backup[name] = param.data.clone()
+                param.data.copy_(self.ema.shadow[name])
+        return self.ema.model
+    
+    def __exit__(self, *args):
+        for name, param in self.ema.model.named_parameters():
+            if name in self.ema.backup:
+                param.data.copy_(self.ema.backup[name])
+        self.ema.backup = {}
+
+
+# ============================================
 # 训练 ETA 估算器
 # ============================================
 
@@ -467,6 +538,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'is_stop': is_stop,
         'text': text,
     }
+    
+    # 水平翻转标记
+    if 'is_flipped' in batch[0]:
+        result['is_flipped'] = torch.tensor([s.get('is_flipped', False) for s in batch], dtype=torch.bool)
     
     # 轨迹数据集的额外字段
     if 'trajectory' in batch[0]:
@@ -843,6 +918,7 @@ def train_one_epoch(
     packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
+    ema: Optional[EMAModel] = None,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     
@@ -919,6 +995,14 @@ def train_one_epoch(
                 current_depths=current_depths,
                 intrinsics=intrinsics,
             )  # [B, Hm, Wm]
+            
+            # 水平翻转增强：对翻转的样本也翻转 GT 热力图
+            if 'is_flipped' in batch:
+                flip_mask = batch['is_flipped']  # [B] bool tensor
+                if flip_mask.any():
+                    for b_idx in range(gt_heatmap.shape[0]):
+                        if flip_mask[b_idx]:
+                            gt_heatmap[b_idx] = gt_heatmap[b_idx].flip(dims=[-1])
         else:
             gt_heatmap = batch['heatmap'].to(device)
         
@@ -1059,6 +1143,8 @@ def train_one_epoch(
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+            if ema is not None:
+                ema.update()
             global_step += 1
             
             # 日志
@@ -1296,6 +1382,8 @@ def train_one_epoch(
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+        if ema is not None:
+            ema.update()
     
     return {
         'total_loss': total_loss / max(num_batches, 1),
@@ -2217,6 +2305,12 @@ def main():
     else:
         gpu_heatmap_computer = None
     
+    # EMA (Exponential Moving Average) — 扩散模型标准技术
+    # 用参数的滑动平均做推理，减少训练波动，提升泛化
+    ema_decay = cfg.get('optim', {}).get('ema_decay', 0.999)
+    ema = EMAModel(model, decay=ema_decay)
+    logger.info(f"📐 EMA enabled: decay={ema_decay}")
+    
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
     
@@ -2244,6 +2338,7 @@ def main():
             packing_enabled=packing_enabled,
             vis_dir=vis_train_dir,
             gpu_heatmap_computer=gpu_heatmap_computer,
+            ema=ema,
         )
         
         timer.end_epoch()
@@ -2253,13 +2348,15 @@ def main():
         torch.cuda.empty_cache()
         _malloc_trim()  # 归还碎片化内存给 OS
         
-        val_metrics = validate(
-            model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
-            packing_enabled=packing_enabled,
-            vis_dir=vis_val_dir,
-            max_batches=args.max_batches,
-            gpu_heatmap_computer=gpu_heatmap_computer,
-        )
+        # 使用 EMA 参数进行验证（滑动平均参数更稳定，泛化更好）
+        with ema.apply():
+            val_metrics = validate(
+                model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
+                packing_enabled=packing_enabled,
+                vis_dir=vis_val_dir,
+                max_batches=args.max_batches,
+                gpu_heatmap_computer=gpu_heatmap_computer,
+            )
         
         # 🧹 验证后再次清理内存
         gc.collect()
@@ -2365,18 +2462,20 @@ def main():
                 logger.warning(f"飞书通知发送失败: {e}")
         
         if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
-            ckpt_manager.save(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                stage_idx=0,
-                stage_name=stage_name,
-                metrics={**train_metrics, **val_metrics},
-                cfg=cfg,
-                is_best=is_best,
-                scaler=scaler,
-            )
+            # 使用 EMA 参数保存（推理时直接使用，无需额外处理）
+            with ema.apply():
+                ckpt_manager.save(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    stage_idx=0,
+                    stage_name=stage_name,
+                    metrics={**train_metrics, **val_metrics},
+                    cfg=cfg,
+                    is_best=is_best,
+                    scaler=scaler,
+                )
         
         if no_improve_count >= patience:
             logger.info(f"  🛑 Early stopping")

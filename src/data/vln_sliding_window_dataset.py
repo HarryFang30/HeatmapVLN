@@ -1127,6 +1127,18 @@ class VLNSlidingWindowDataset(Dataset):
                 discrete_action = 1  # Default to FORWARD
                 is_stop = 0.0
             
+            # 随机水平翻转增强（训练集，p=0.5）
+            # 翻转图像的同时必须翻转热力图，保持空间一致性
+            # 注意：深度图不翻转，因为 GPU heatmap 用原始深度做遮挡检测，
+            #       翻转操作延迟到训练循环中，在 GPU 计算完热力图后翻转
+            is_flipped = False
+            if self.enable_augmentation and random.random() < 0.5:
+                is_flipped = True
+                history_frames = history_frames.flip(dims=[-1])       # [K, 3, H, W] → flip W
+                current_frame = current_frame.flip(dims=[-1])         # [3, H, W] → flip W
+                if not self.defer_heatmap_to_gpu:
+                    heatmap_tensor = heatmap_tensor.flip(dims=[-1])    # [Hm, Wm] → flip W
+            
             result = {
                 "history_frames": history_frames,      # [K, 3, H, W]
                 "current_frame": current_frame,        # [3, H, W]
@@ -1136,6 +1148,7 @@ class VLNSlidingWindowDataset(Dataset):
                 "discrete_action": discrete_action,    # int (0-3)
                 "is_stop": is_stop,                    # float (0 or 1)
                 "text": text,                          # str
+                "is_flipped": is_flipped,              # bool: 是否做了水平翻转
             }
             
             # GPU 热力图计算所需的额外字段
@@ -1170,6 +1183,7 @@ class VLNSlidingWindowDataset(Dataset):
             "action_valid": 0.0,
             "discrete_action": 1,  # Default to FORWARD
             "is_stop": 0.0,
+            "is_flipped": False,
             "text": "",
         }
         
@@ -1880,6 +1894,14 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 discrete_action = 1
                 is_stop = 0.0
             
+            # 随机水平翻转增强
+            is_flipped = False
+            if self.enable_augmentation and random.random() < 0.5:
+                is_flipped = True
+                history_frames = history_frames.flip(dims=[-1])
+                current_frame = current_frame.flip(dims=[-1])
+                heatmap_tensor = heatmap_tensor.flip(dims=[-1])
+            
             return {
                 "history_frames": history_frames,        # [K, 3, H, W]
                 "current_frame": current_frame,          # [3, H, W]
@@ -1892,6 +1914,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 "action_valid": action_valid,            # float
                 "discrete_action": discrete_action,      # int
                 "is_stop": is_stop,                      # float
+                "is_flipped": is_flipped,                # bool
                 "text": text,                            # str
             }
             

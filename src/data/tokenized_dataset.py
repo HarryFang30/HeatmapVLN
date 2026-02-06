@@ -253,6 +253,7 @@ class TokenizedVLNDataset(Dataset):
             "action_valid": sample['action_valid'],
             "discrete_action": sample.get('discrete_action', 1),
             "is_stop": sample.get('is_stop', 0.0),
+            "is_flipped": sample.get('is_flipped', False),
             "text": text,
             
             # 轨迹数据（如果有）
@@ -368,6 +369,7 @@ class FlattenedCollatorForVLN:
             "action_valid": torch.tensor([inst['action_valid'] for inst in instances]),
             "discrete_action": torch.tensor([inst.get('discrete_action', 1) for inst in instances]),
             "is_stop": torch.tensor([inst.get('is_stop', 0.0) for inst in instances]),
+            "is_flipped": torch.tensor([inst.get('is_flipped', False) for inst in instances], dtype=torch.bool),
             "text": [inst['text'] for inst in instances],
         }
         
