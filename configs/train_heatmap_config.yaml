@@ -92,12 +92,12 @@ model:
     attention_levels: [2, 3]
     
     # Diffusion 配置
-    num_inference_steps: 20
-    num_train_timesteps: 200       # 100 → 200，更精细的噪声调度
+    num_inference_steps: 50        # 20 → 50，更精细的去噪恢复锐利峰值
+    num_train_timesteps: 200       # 200 训练步，50 推理步 = 4:1 比例
     
     # Classifier-Free Guidance
     cfg_drop_prob: 0.15         # 提高 drop 比例，让模型更好地学习无条件生成
-    cfg_scale: 1.5              # 降低推理引导强度，减少假阳性（3.0 → 1.5）
+    cfg_scale: 2.0              # 1.5 → 2.0，增强条件引导使峰值更锐利（配合 visibility head 控制假阳性）
     
     # 正则化
     dropout: 0.15               # 增加 dropout 抑制过拟合（0.1 → 0.15）
