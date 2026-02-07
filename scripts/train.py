@@ -110,6 +110,10 @@ class EMAModel:
     扩散模型标准技术：用参数的滑动平均做推理，
     避免训练末期的参数波动，显著提升泛化性能。
     
+    ⚠️ 关键实现细节：shadow 参数必须使用 float32 存储和计算。
+    bfloat16 只有 7 位尾数（精度 ~0.78%），而 EMA alpha=0.001，
+    远低于 bfloat16 精度阈值，会导致 add_(param, alpha=0.001) 完全无效。
+    
     Warmup 策略：前 warmup_steps 步使用自适应 decay = 1 - 1/(step+1)，
     避免初始随机权重污染 EMA shadow。
     
@@ -131,9 +135,10 @@ class EMAModel:
         self.backup = {}
         
         # 只追踪需要训练的参数（节省内存）
+        # ⚠️ 必须使用 float32！bfloat16 精度不足，EMA 更新会完全无效
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                self.shadow[name] = param.data.float().clone()
     
     def _get_decay(self) -> float:
         """获取当前 decay 值（含 warmup）"""
@@ -146,11 +151,12 @@ class EMAModel:
     
     @torch.no_grad()
     def update(self):
-        """更新 EMA 参数：shadow = decay * shadow + (1 - decay) * param"""
+        """更新 EMA 参数：shadow = decay * shadow + (1 - decay) * param（float32 精度）"""
         decay = self._get_decay()
         for name, param in self.model.named_parameters():
             if name in self.shadow:
-                self.shadow[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+                # param 可能是 bfloat16，必须转 float32 再做 EMA 运算
+                self.shadow[name].mul_(decay).add_(param.data.float(), alpha=1.0 - decay)
         self.step_count += 1
     
     def apply(self):
@@ -166,6 +172,10 @@ class EMAModel:
     
     def load_state_dict(self, state_dict):
         self.shadow = state_dict['shadow']
+        # 确保加载的 shadow 也是 float32
+        for name in self.shadow:
+            if self.shadow[name].dtype != torch.float32:
+                self.shadow[name] = self.shadow[name].float()
         self.target_decay = state_dict.get('target_decay', self.target_decay)
         self.step_count = state_dict.get('step_count', 0)
 
@@ -181,7 +191,8 @@ class _EMAContext:
         for name, param in self.ema.model.named_parameters():
             if name in self.ema.shadow:
                 self.ema.backup[name] = param.data.clone()
-                param.data.copy_(self.ema.shadow[name])
+                # EMA shadow 是 float32，需要转回模型原始 dtype
+                param.data.copy_(self.ema.shadow[name].to(dtype=param.dtype))
         return self.ema.model
     
     def __exit__(self, *args):
