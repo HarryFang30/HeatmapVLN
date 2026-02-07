@@ -1304,7 +1304,7 @@ def train_one_epoch(
                             conf_ratio = pred_peak_conf / gt_peak_conf
                             tb_writer.add_scalar('diag/hm_peak_conf_ratio', conf_ratio, actual_step)
                     
-                    # Focal Loss 诊断 (新增)
+                    # Focal Loss 诊断
                     if 'history_heatmap_base_loss' in output and output['history_heatmap_base_loss'] is not None:
                         base_loss_val = output['history_heatmap_base_loss']
                         focal_loss_val = output['history_heatmap_focal_loss']
@@ -1314,6 +1314,11 @@ def train_one_epoch(
                         if base_loss_val > 0:
                             focal_ratio = focal_loss_val / base_loss_val
                             tb_writer.add_scalar('diag/heatmap_focal_ratio', focal_ratio, actual_step)
+                    
+                    # Visibility Loss 诊断
+                    if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
+                        vis_loss_val = output['history_heatmap_visibility_loss']
+                        tb_writer.add_scalar('diag/heatmap_visibility_loss', vis_loss_val, actual_step)
                     
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:

@@ -1,0 +1,16 @@
+---
+description: 完成功能或修复后自动 git commit & push
+alwaysApply: true
+---
+
+# Git 自动提交推送
+
+每次完成一个功能开发或 bug 修复后，必须立即执行 git commit 和 git push：
+
+1. `git add` 相关变更文件
+2. `git commit` 用简洁中文描述变更内容
+3. `git push` 推送到远程
+
+- 不要等用户要求才提交，改完即推
+- 不要把多个不相关的改动混在一个 commit 里
+- commit message 用中文，简明扼要说明改了什么

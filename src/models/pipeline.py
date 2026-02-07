@@ -416,6 +416,7 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
+        history_heatmap_visibility_loss = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
@@ -439,6 +440,7 @@ class VLNPipeline(nn.Module):
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
+                    history_heatmap_visibility_loss = result.get('visibility_loss')
                 else:
                     # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
@@ -523,6 +525,8 @@ class VLNPipeline(nn.Module):
             if history_heatmap_base_loss is not None:
                 output['history_heatmap_base_loss'] = history_heatmap_base_loss
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
+            if history_heatmap_visibility_loss is not None:
+                output['history_heatmap_visibility_loss'] = history_heatmap_visibility_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:
@@ -644,6 +648,7 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
+        history_heatmap_visibility_loss = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
@@ -667,6 +672,7 @@ class VLNPipeline(nn.Module):
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
+                    history_heatmap_visibility_loss = result.get('visibility_loss')
                 else:
                     # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
@@ -749,6 +755,8 @@ class VLNPipeline(nn.Module):
             if history_heatmap_base_loss is not None:
                 output['history_heatmap_base_loss'] = history_heatmap_base_loss
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
+            if history_heatmap_visibility_loss is not None:
+                output['history_heatmap_visibility_loss'] = history_heatmap_visibility_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:

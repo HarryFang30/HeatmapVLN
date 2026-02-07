@@ -192,19 +192,33 @@ class DiffusionHeatmapHead(nn.Module):
         if gt_heatmap is not None and return_loss:
             return self._compute_training_loss(cond, gt_heatmap, skip_inference, seq_cond=seq_cond)
         
-        # 4. Inference mode
-        heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
-        
-        # 5. Visibility gating: 不可见样本直接输出全零
+        # 4. Inference mode (with visibility gating)
+        B = cond.shape[0]
+        Hm, Wm = self.heatmap_size
         visibility_score = None
+        
         if self.use_visibility_head:
+            # 先判可见性，不可见样本直接跳过扩散推理（省时 + 消除假阳性）
             with torch.no_grad():
                 vis_logit = self.visibility_head(cond)  # (B, 1)
                 visibility_score = torch.sigmoid(vis_logit).squeeze(-1)  # (B,)
-                # 不可见的样本 → 全零热力图
-                invisible_mask = visibility_score < self.visibility_threshold  # (B,)
-                if invisible_mask.any():
-                    heatmap[invisible_mask] = 0.0
+                visible_mask = visibility_score >= self.visibility_threshold  # (B,)
+            
+            if visible_mask.any() and not visible_mask.all():
+                # 混合 batch：只对可见样本跑扩散
+                heatmap = torch.zeros(B, Hm, Wm, device=cond.device, dtype=cond.dtype)
+                visible_cond = cond[visible_mask]
+                visible_seq = seq_cond[visible_mask] if seq_cond is not None else None
+                heatmap[visible_mask] = self._diffusion_inference(visible_cond, seq_cond=visible_seq)
+            elif visible_mask.all():
+                # 全部可见：正常跑扩散
+                heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
+            else:
+                # 全部不可见：直接全零
+                heatmap = torch.zeros(B, Hm, Wm, device=cond.device, dtype=cond.dtype)
+        else:
+            # 无 visibility head：正常跑扩散
+            heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
         
         if return_loss:
             result = {
