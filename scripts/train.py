@@ -777,7 +777,8 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
     if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
         freeze_module(model.qwen3_vl, freeze=True)
         # 如果配置了 LoRA 且在 trainable_modules 中，解冻 LoRA 参数
-        if 'qwen3_vl_lora' in trainable:
+        # 兼容 'lora' 和 'qwen3_vl_lora' 两种写法
+        if 'lora' in trainable or 'qwen3_vl_lora' in trainable:
             lora_count = 0
             for name, param in model.qwen3_vl.named_parameters():
                 if 'lora_' in name:
@@ -785,6 +786,8 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
                     lora_count += 1
             if lora_count > 0:
                 logger.info(f"  ✓ Unfrozen: qwen3_vl LoRA ({lora_count} parameter tensors)")
+            else:
+                logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
 
 
 def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
@@ -2285,6 +2288,13 @@ def main():
         else:
             logger.info("   ✅ Dynamic sampling enabled (workers rebuilt each epoch to reclaim memory)")
     logger.info(f"   🧠 Memory config: num_workers={num_workers}, prefetch={prefetch_factor}, persistent={persistent_workers}")
+    
+    # ⚠️ 强制加载 Qwen3-VL（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
+    # 否则 LoRA 参数（懒加载，首次前向才创建）不会被 optimizer 捕获
+    if hasattr(model, 'qwen3_vl') and hasattr(model.qwen3_vl, '_load_model'):
+        if model.qwen3_vl.model is None:
+            logger.info("🔄 Pre-loading Qwen3-VL (ensure LoRA params available for optimizer)...")
+            model.qwen3_vl._load_model()
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
