@@ -648,6 +648,10 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
         heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
         heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
+        # Visibility head (suppress false positives)
+        heatmap_use_visibility_head=heatmap_cfg.get('use_visibility_head', False),
+        heatmap_visibility_loss_weight=heatmap_cfg.get('visibility_loss_weight', 0.5),
+        heatmap_visibility_threshold=heatmap_cfg.get('visibility_threshold', 0.5),
         
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),

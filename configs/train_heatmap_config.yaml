@@ -116,6 +116,12 @@ model:
     use_sequence_conditioning: true
     seq_cross_attn_heads: 8
     seq_cross_attn_head_dim: 64
+    
+    # 可见性预测头（消除假阳性）
+    # 当预测为不可见时跳过扩散推理，直接输出全零热力图
+    use_visibility_head: true
+    visibility_loss_weight: 0.5       # BCE loss 权重
+    visibility_threshold: 0.5         # 推理阈值
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:

@@ -80,6 +80,11 @@ class DiffusionHeatmapHead(nn.Module):
         # Sequence conditioning flag
         self.use_sequence_conditioning = config.use_sequence_conditioning
         
+        # Visibility head flag
+        self.use_visibility_head = config.use_visibility_head
+        self.visibility_threshold = config.visibility_threshold
+        self.visibility_loss_weight = config.visibility_loss_weight
+        
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
             llm_dim=config.llm_dim,
@@ -111,6 +116,18 @@ class DiffusionHeatmapHead(nn.Module):
             seq_cross_attn_heads=config.seq_cross_attn_heads,
             seq_cross_attn_head_dim=config.seq_cross_attn_head_dim,
         )
+        
+        # ==================== Visibility Head ====================
+        # 可见性预测头：判断当前视角是否能看到历史点
+        # 当预测为不可见时跳过扩散推理，直接输出全零热力图
+        if self.use_visibility_head:
+            self.visibility_head = nn.Sequential(
+                nn.Linear(config.cond_dim, config.cond_dim // 4),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.cond_dim // 4, 1),
+            )
+            logger.info("VisibilityHead enabled: cond_dim=%d -> 1 (binary)", config.cond_dim)
         
         # ==================== Noise Scheduler ====================
         self.noise_scheduler = DDPMScheduler(
@@ -178,11 +195,25 @@ class DiffusionHeatmapHead(nn.Module):
         # 4. Inference mode
         heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
         
+        # 5. Visibility gating: 不可见样本直接输出全零
+        visibility_score = None
+        if self.use_visibility_head:
+            with torch.no_grad():
+                vis_logit = self.visibility_head(cond)  # (B, 1)
+                visibility_score = torch.sigmoid(vis_logit).squeeze(-1)  # (B,)
+                # 不可见的样本 → 全零热力图
+                invisible_mask = visibility_score < self.visibility_threshold  # (B,)
+                if invisible_mask.any():
+                    heatmap[invisible_mask] = 0.0
+        
         if return_loss:
-            return {
+            result = {
                 'heatmap': heatmap,
                 'loss': torch.tensor(0.0, device=heatmap.device),
             }
+            if visibility_score is not None:
+                result['visibility_score'] = visibility_score
+            return result
         
         return heatmap
     
@@ -287,6 +318,20 @@ class DiffusionHeatmapHead(nn.Module):
         
         total_loss = diffusion_loss
         
+        # ==================== Visibility Loss ====================
+        # 可见性预测：判断当前样本的 GT 热力图是否有峰值
+        visibility_loss_val = 0.0
+        if self.use_visibility_head:
+            # GT 标签：热力图最大值 > 0.01 为"可见"
+            with torch.no_grad():
+                gt_has_peak = (gt_heatmap.flatten(1).max(dim=1).values > 0.01).float()  # (B,)
+            
+            vis_logit = self.visibility_head(cond).squeeze(-1)  # (B,)
+            visibility_loss = F.binary_cross_entropy_with_logits(vis_logit, gt_has_peak)
+            visibility_loss_val = visibility_loss.item()
+            
+            total_loss = total_loss + self.visibility_loss_weight * visibility_loss
+        
         # 诊断信息：记录噪声预测质量
         noise_std = noise.std().item()
         noise_pred_std = noise_pred.std().item()
@@ -300,10 +345,11 @@ class DiffusionHeatmapHead(nn.Module):
                 pred_heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
         
         return {
-            'loss': total_loss,                     # 🆕 使用合并后的总损失
+            'loss': total_loss,
             'diffusion_loss': diffusion_loss,
             'base_loss': base_loss.item(),          # 标准 MSE
             'focal_loss': focal_loss.item(),        # 峰值加权 MSE
+            'visibility_loss': visibility_loss_val, # 可见性 BCE loss
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,

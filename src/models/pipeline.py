@@ -89,6 +89,11 @@ class VLNPipelineConfig:
     heatmap_seq_cross_attn_heads: int = 8            # Cross-attention heads
     heatmap_seq_cross_attn_head_dim: int = 64        # Head dimension
     
+    # Visibility head (suppress false positives for invisible history points)
+    heatmap_use_visibility_head: bool = False         # Enable visibility prediction head
+    heatmap_visibility_loss_weight: float = 0.5       # Visibility BCE loss weight
+    heatmap_visibility_threshold: float = 0.5         # Inference visibility threshold
+    
     # LoRA configuration for Qwen3-VL fine-tuning
     use_lora: bool = False           # Enable LoRA on Qwen3-VL
     lora_rank: int = 16              # LoRA rank
@@ -220,6 +225,10 @@ class VLNPipeline(nn.Module):
             use_sequence_conditioning=config.heatmap_use_sequence_conditioning,
             seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
             seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
+            # Visibility head (suppress false positives)
+            use_visibility_head=config.heatmap_use_visibility_head,
+            visibility_loss_weight=config.heatmap_visibility_loss_weight,
+            visibility_threshold=config.heatmap_visibility_threshold,
         )
         
         # History Heatmap Head
