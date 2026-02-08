@@ -1391,6 +1391,19 @@ def train_one_epoch(
                 except Exception as e:
                     pass  # 忽略可视化写入错误
         
+        # 拆分记录：扩散 loss 和 visibility loss（必须在 del output 之前）
+        total_loss += loss.item() * grad_accum_steps
+        total_heatmap_loss += heatmap_loss.item()
+        if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
+            total_visibility_loss += output['history_heatmap_visibility_loss']
+            vis_weight = cfg['model']['heatmap_head'].get('visibility_loss_weight', 0.5)
+            total_diffusion_loss += heatmap_loss.item() - vis_weight * output['history_heatmap_visibility_loss']
+        else:
+            total_diffusion_loss += heatmap_loss.item()
+        total_action_loss += action_total_loss.item()
+        total_stop_loss += stop_total_loss.item()
+        num_batches += 1
+        
         del output
         
         # 🔧 显式释放 batch 引用（尤其是 packing 模式下 pixel_values_videos 很大）
@@ -1398,23 +1411,7 @@ def train_one_epoch(
             del batch
             gc.collect()
             torch.cuda.empty_cache()
-            # 强制 glibc 归还释放的内存给 OS
             _malloc_trim()
-        
-        total_loss += loss.item() * grad_accum_steps
-        total_heatmap_loss += heatmap_loss.item()
-        # 拆分记录：扩散 loss 和 visibility loss
-        if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
-            total_visibility_loss += output['history_heatmap_visibility_loss']
-            # diffusion_loss = heatmap_loss - visibility_weight * visibility_loss
-            vis_weight = cfg['model']['heatmap_head'].get('visibility_loss_weight', 0.5)
-            total_diffusion_loss += heatmap_loss.item() - vis_weight * output['history_heatmap_visibility_loss']
-        else:
-            total_diffusion_loss += heatmap_loss.item()
-        # 🔧 修复：使用 action_total_loss 和 stop_total_loss（包含 trajectory/progress loss）
-        total_action_loss += action_total_loss.item()
-        total_stop_loss += stop_total_loss.item()
-        num_batches += 1
         
         # 进度条显示拆分的 loss：diff=扩散, vis=可见性
         diff_loss_display = total_diffusion_loss / num_batches
