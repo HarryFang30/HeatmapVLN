@@ -964,6 +964,8 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     total_heatmap_loss = 0.0
+    total_diffusion_loss = 0.0      # 纯扩散 loss（不含 visibility）
+    total_visibility_loss = 0.0     # visibility head BCE loss
     total_action_loss = 0.0
     total_stop_loss = 0.0
     num_batches = 0
@@ -1401,16 +1403,27 @@ def train_one_epoch(
         
         total_loss += loss.item() * grad_accum_steps
         total_heatmap_loss += heatmap_loss.item()
+        # 拆分记录：扩散 loss 和 visibility loss
+        if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
+            total_visibility_loss += output['history_heatmap_visibility_loss']
+            # diffusion_loss = heatmap_loss - visibility_weight * visibility_loss
+            vis_weight = cfg['model']['heatmap_head'].get('visibility_loss_weight', 0.5)
+            total_diffusion_loss += heatmap_loss.item() - vis_weight * output['history_heatmap_visibility_loss']
+        else:
+            total_diffusion_loss += heatmap_loss.item()
         # 🔧 修复：使用 action_total_loss 和 stop_total_loss（包含 trajectory/progress loss）
         total_action_loss += action_total_loss.item()
         total_stop_loss += stop_total_loss.item()
         num_batches += 1
         
+        # 进度条显示拆分的 loss：diff=扩散, vis=可见性
+        diff_loss_display = total_diffusion_loss / num_batches
+        vis_loss_display = total_visibility_loss / num_batches
         pbar.set_postfix({
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
-            'hm': f"{heatmap_loss.item():.4f}",
+            'diff': f"{diff_loss_display:.4f}",
+            'vis': f"{vis_loss_display:.4f}",
             'traj': f"{action_total_loss.item():.4f}",
-            'prog': f"{stop_total_loss.item():.4f}",
         })
     
     # 处理剩余梯度
@@ -1432,6 +1445,8 @@ def train_one_epoch(
     return {
         'total_loss': total_loss / max(num_batches, 1),
         'heatmap_loss': total_heatmap_loss / max(num_batches, 1),
+        'diffusion_loss': total_diffusion_loss / max(num_batches, 1),       # 纯扩散 loss
+        'visibility_loss': total_visibility_loss / max(num_batches, 1),     # visibility BCE
         'action_loss': total_action_loss / max(num_batches, 1),
         'stop_loss': total_stop_loss / max(num_batches, 1),
     }
@@ -1456,6 +1471,8 @@ def validate(
     
     total_loss = 0.0
     total_heatmap_loss = 0.0
+    total_diffusion_loss = 0.0      # 纯扩散 loss（不含 visibility）
+    total_visibility_loss = 0.0     # visibility head BCE loss
     total_action_loss = 0.0
     total_stop_loss = 0.0
     total_heatmap_mse = 0.0      # 完整推理的 heatmap MSE（采样）
@@ -1623,6 +1640,13 @@ def validate(
         
         total_loss += loss.item()
         total_heatmap_loss += heatmap_loss.item()
+        # 拆分记录：扩散 loss 和 visibility loss
+        if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
+            total_visibility_loss += output['history_heatmap_visibility_loss']
+            vis_weight = cfg['model']['heatmap_head'].get('visibility_loss_weight', 0.5)
+            total_diffusion_loss += heatmap_loss.item() - vis_weight * output['history_heatmap_visibility_loss']
+        else:
+            total_diffusion_loss += heatmap_loss.item()
         total_action_loss += action_total_loss.item()  # trajectory or action
         total_stop_loss += stop_total_loss.item()      # progress or stop
         num_batches += 1
@@ -1707,9 +1731,14 @@ def validate(
     if num_heatmap_mse_batches > 0:
         logger.info(f"  📊 Heatmap 推理 MSE (采样 {num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
     
+    avg_diff = total_diffusion_loss / max(num_batches, 1)
+    avg_vis = total_visibility_loss / max(num_batches, 1)
+    
     return {
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,           # 噪声预测 loss（全量 batch）
+        'val_diffusion_loss': avg_diff,       # 纯扩散 loss（不含 visibility）
+        'val_visibility_loss': avg_vis,       # visibility BCE loss
         'val_heatmap_mse': avg_hm_mse,        # 完整推理 MSE（采样 batch）
         'val_action_loss': avg_act,
         'val_stop_loss': avg_stop,
@@ -2424,12 +2453,16 @@ def main():
         
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f}, traj: {train_metrics['action_loss']:.4f}, prog: {train_metrics.get('stop_loss', 0):.4f})"
+            f"(diff: {train_metrics.get('diffusion_loss', 0):.4f}, "
+            f"vis: {train_metrics.get('visibility_loss', 0):.4f}, "
+            f"traj: {train_metrics['action_loss']:.4f})"
         )
         val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
         logger.info(
             f"  Val Loss: {val_metrics['val_loss']:.4f} "
-            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, traj: {val_metrics['val_action_loss']:.4f}, prog: {val_metrics.get('val_stop_loss', 0):.4f}{val_hm_mse_str})"
+            f"(diff: {val_metrics.get('val_diffusion_loss', 0):.4f}, "
+            f"vis: {val_metrics.get('val_visibility_loss', 0):.4f}, "
+            f"traj: {val_metrics['val_action_loss']:.4f}{val_hm_mse_str})"
         )
         
         eta = timer.get_eta(epoch, total_epochs)
@@ -2463,11 +2496,21 @@ def main():
                 'val': val_metrics['val_loss'],
             }, global_epoch_counter)
             
-            # 热力图损失对比
+            # 热力图损失对比（含 visibility）
             tb_writer.add_scalars('loss/heatmap', {
                 'train': train_metrics['heatmap_loss'],
                 'val': val_metrics['val_heatmap_loss'],
             }, global_epoch_counter)
+            
+            # 🔑 纯扩散损失对比（不含 visibility，与旧版本可比）
+            tb_writer.add_scalars('loss/diffusion_only', {
+                'train': train_metrics.get('diffusion_loss', train_metrics['heatmap_loss']),
+                'val': val_metrics.get('val_diffusion_loss', val_metrics['val_heatmap_loss']),
+            }, global_epoch_counter)
+            
+            # Visibility Loss
+            if train_metrics.get('visibility_loss', 0) > 0:
+                tb_writer.add_scalar('loss/visibility_bce', train_metrics['visibility_loss'], global_epoch_counter)
             
             # 轨迹损失对比
             tb_writer.add_scalars('loss/trajectory', {
@@ -2491,6 +2534,8 @@ def main():
             # 单独的指标（方便筛选）
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
             tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
+            tb_writer.add_scalar('epoch/train_diffusion_loss', train_metrics.get('diffusion_loss', 0), global_epoch_counter)
+            tb_writer.add_scalar('epoch/visibility_loss', train_metrics.get('visibility_loss', 0), global_epoch_counter)
             
             tb_writer.flush()
         

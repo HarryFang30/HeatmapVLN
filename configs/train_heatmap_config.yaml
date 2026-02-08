@@ -120,7 +120,7 @@ model:
     # 可见性预测头（消除假阳性）
     # 当预测为不可见时跳过扩散推理，直接输出全零热力图
     use_visibility_head: true
-    visibility_loss_weight: 0.5       # BCE loss 权重
+    visibility_loss_weight: 0.1       # BCE loss 权重（0.5→0.1，避免 visibility 梯度主导训练）
     visibility_threshold: 0.5         # 推理阈值
 
   # 动作头配置 - 禁用（不训练动作）
