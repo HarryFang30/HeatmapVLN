@@ -72,11 +72,16 @@ model:
     spatial_merge_size: 2
     
     # LoRA 配置 — 开启以让 LLM 产生更适合空间推理的特征
+    # 扩展覆盖范围：空间理解在 VLM 中间层(12-24层)形成，仅最后4层不够
     use_lora: true
-    lora_rank: 16
-    lora_alpha: 32
-    lora_num_layers: 4         # 最后 4 层
+    lora_rank: 32              # 16 → 32，增强表达能力
+    lora_alpha: 64             # 保持 alpha/rank = 2 的比例
+    lora_num_layers: 8         # 4 → 8，覆盖更多空间理解层
     lora_dropout: 0.05
+    lora_target_modules:       # 增加 k_proj，完整覆盖注意力矩阵
+      - q_proj
+      - k_proj
+      - v_proj
 
   # 热力图头配置 (只训练 history head)
   heatmap_head:
@@ -89,7 +94,7 @@ model:
     # UNet 架构配置
     block_out_channels: [128, 256, 512, 512]
     layers_per_block: 2
-    attention_levels: [2, 3]
+    attention_levels: [1, 2, 3]    # [2,3] → [1,2,3]，在 32x32 层增加注意力改善锐度
     
     # Diffusion 配置
     num_inference_steps: 50        # 20 → 50，更精细的去噪恢复锐利峰值
@@ -121,7 +126,7 @@ model:
     # 当预测为不可见时跳过扩散推理，直接输出全零热力图
     use_visibility_head: true
     visibility_loss_weight: 0.1       # BCE loss 权重（0.5→0.1，避免 visibility 梯度主导训练）
-    visibility_threshold: 0.5         # 推理阈值
+    visibility_threshold: 0.7         # 推理阈值（0.5→0.7，更保守地判定可见，减少假阳性）
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:

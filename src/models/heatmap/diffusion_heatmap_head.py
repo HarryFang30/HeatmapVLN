@@ -304,29 +304,35 @@ class DiffusionHeatmapHead(nn.Module):
             seq_cond=seq_cond_for_pred,
         )
         
-        # ==================== Focal-style 混合损失 ====================
-        # 主损失：标准 MSE（无加权，保持 DDPM 理论正确性）
-        base_loss = F.mse_loss(noise_pred, noise)
+        # ==================== Focal-style 混合损失 + 负样本降权 ====================
+        with torch.no_grad():
+            # 检测每个样本是否为负样本（GT 全零，即不可见目标）
+            # gt_heatmap: (B, 1, H, W), 按样本维度 flatten 后取 max
+            sample_max = gt_heatmap.flatten(1).max(dim=1).values  # (B,)
+            is_negative = (sample_max < 0.01).float()  # (B,)
+            
+            # 负样本扩散 loss 权重降低到 0.1（避免扩散头学习"恢复全零"）
+            # 正样本权重 1.0，负样本权重 0.1
+            sample_weight = 1.0 - 0.9 * is_negative  # (B,) = 1.0 or 0.1
+            # 重塑为 (B, 1, 1, 1) 以广播到空间维度
+            sample_weight = sample_weight.view(-1, 1, 1, 1)
+        
+        # 逐样本 MSE（不做 reduction）
+        per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
+        
+        # 主损失：标准 MSE（无空间加权，保持 DDPM 理论正确性）+ 样本级负样本降权
+        base_loss = (sample_weight * per_pixel_mse).mean()
         
         # Focal 损失：让模型更关注峰值区域的噪声预测
-        # 注意：这是一个温和的加权，不会破坏 DDPM 的理论基础
-        # 权重基于 GT 热力图（归一化前）的值，峰值区域权重略高
         with torch.no_grad():
-            # 使用 GT 热力图作为注意力权重
-            # gt_heatmap 在 [0,1] 范围，峰值接近 1
             gt_weight = gt_heatmap.clamp(0, 1)
-            # 温和加权：1.0 + alpha * gt_weight
-            # alpha=1.0 表示峰值区域权重最多是背景的 2 倍
             focal_alpha = 1.0
             weight_map = 1.0 + focal_alpha * gt_weight
-            # 归一化权重使其均值为 1
             weight_map = weight_map / weight_map.mean()
         
-        # 计算加权 MSE（逐元素）
-        focal_loss = (weight_map * (noise_pred - noise) ** 2).mean()
+        focal_loss = (sample_weight * weight_map * per_pixel_mse).mean()
         
-        # 混合损失：base_loss 占主导，focal_loss 作为辅助
-        # focal_weight=0.3 表示 30% 的梯度来自 focal 损失
+        # 混合损失
         focal_weight = 0.3
         diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
         
@@ -455,15 +461,16 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _normalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        平方根归一化：缓解稀疏热力图的分布不均匀问题
+        线性归一化：将 [0, 1] 热力图映射到 [-1, 1]
         
-        热力图特点：大部分是 0（背景），少数峰值接近 1
-        平方根变换让小值变大，使分布更均匀，同时保持简单
+        使用线性变换保持误差在所有值域上均匀分布，避免 sqrt 变换导致的：
+        1. 峰值压缩（反变换时小误差被放大）
+        2. 背景弥散（sqrt 让接近 0 的值被显著放大，模型难以区分纯背景和微弱信号）
         
-        变换: sqrt(x) * 2 - 1
-        - x=0 -> sqrt(0)*2-1 = -1
-        - x=0.25 -> sqrt(0.25)*2-1 = 0  (中点移动到 0.25)
-        - x=1 -> sqrt(1)*2-1 = 1
+        变换: x * 2 - 1
+        - x=0   -> -1
+        - x=0.5 -> 0
+        - x=1   -> 1
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [0, 1]
@@ -472,16 +479,13 @@ class DiffusionHeatmapHead(nn.Module):
             (B, 1, H, W) heatmap in [-1, 1]
         """
         heatmap = heatmap.clamp(0, 1)
-        # 平方根变换让小值放大，使分布更均匀
-        sqrt_heatmap = torch.sqrt(heatmap)
-        # 映射到 [-1, 1]
-        return sqrt_heatmap * 2 - 1
+        return heatmap * 2 - 1
     
     def _denormalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
-        平方根反归一化：还原热力图
+        线性反归一化：将 [-1, 1] 还原到 [0, 1]
         
-        反变换: ((x+1)/2)^2
+        反变换: (x + 1) / 2
         
         Args:
             heatmap: (B, 1, H, W) heatmap in [-1, 1]
@@ -489,12 +493,8 @@ class DiffusionHeatmapHead(nn.Module):
         Returns:
             (B, 1, H, W) heatmap in [0, 1]
         """
-        # 先映射到 [0, 1]
-        sqrt_recovered = (heatmap + 1) / 2
-        sqrt_recovered = sqrt_recovered.clamp(0, 1)
-        # 平方还原
-        recovered = sqrt_recovered ** 2
-        return recovered
+        recovered = (heatmap + 1) / 2
+        return recovered.clamp(0, 1)
     
     def forward_llm_only(
         self,

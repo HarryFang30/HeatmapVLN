@@ -130,6 +130,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         lora_alpha=llm_cfg.get('lora_alpha', 32),
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
+        lora_target_modules=llm_cfg.get('lora_target_modules', None),
         
         # Action Head
         action_head_type=action_head_type,

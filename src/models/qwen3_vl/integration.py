@@ -87,6 +87,7 @@ class Qwen3VLConfig:
     lora_alpha: int = 32          # LoRA alpha
     lora_num_layers: int = 4      # Number of last LLM layers to apply LoRA
     lora_dropout: float = 0.05    # LoRA dropout
+    lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
     
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
@@ -244,10 +245,13 @@ class Qwen3VLIntegration(nn.Module):
             num_layers
         ))
         
+        # 使用配置中的 target_modules，默认 ["q_proj", "v_proj"]
+        target_modules = self.config.lora_target_modules or ["q_proj", "v_proj"]
+        
         lora_config = LoraConfig(
             r=self.config.lora_rank,
             lora_alpha=self.config.lora_alpha,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=target_modules,
             layers_to_transform=lora_layers,
             lora_dropout=self.config.lora_dropout,
             bias="none",
@@ -260,7 +264,7 @@ class Qwen3VLIntegration(nn.Module):
         lora_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
         logger.info(
-            f"LoRA applied to layers {lora_layers} (q_proj, v_proj), "
+            f"LoRA applied to layers {lora_layers} ({target_modules}), "
             f"rank={self.config.lora_rank}, alpha={self.config.lora_alpha}"
         )
         logger.info(
