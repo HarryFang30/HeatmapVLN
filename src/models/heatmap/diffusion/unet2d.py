@@ -412,6 +412,7 @@ class ConditionalUnet2D(nn.Module):
         self.down_blocks = nn.ModuleList()
         self.down_attentions = nn.ModuleList()
         self.down_cross_attentions = nn.ModuleList()
+        self.down_spatial_cross_attentions = nn.ModuleList()
         self.downsamplers = nn.ModuleList()
         
         in_ch = block_out_channels[0]
@@ -447,6 +448,19 @@ class ConditionalUnet2D(nn.Module):
             else:
                 self.down_cross_attentions.append(nn.Identity())
             
+            # CNN Spatial Cross-Attention (at attention levels, when spatial injection enabled)
+            # Q=UNet features, K/V=CNN spatial features flattened as sequence
+            if spatial_injection_channels is not None and i in attention_levels:
+                cnn_ch = spatial_injection_channels[i]
+                self.down_spatial_cross_attentions.append(CrossAttention2D(
+                    channels=out_ch,
+                    cond_dim=cnn_ch,
+                    num_heads=min(4, out_ch // 32),  # moderate head count
+                    head_dim=min(64, out_ch // 4),
+                ))
+            else:
+                self.down_spatial_cross_attentions.append(nn.Identity())
+            
             # Downsampler (except for last level)
             if i < len(block_out_channels) - 1:
                 self.downsamplers.append(Downsample2D(out_ch))
@@ -481,6 +495,7 @@ class ConditionalUnet2D(nn.Module):
         self.up_blocks = nn.ModuleList()
         self.up_attentions = nn.ModuleList()
         self.up_cross_attentions = nn.ModuleList()
+        self.up_spatial_cross_attentions = nn.ModuleList()
         self.upsamplers = nn.ModuleList()
         
         reversed_channels = list(reversed(block_out_channels))
@@ -520,6 +535,18 @@ class ConditionalUnet2D(nn.Module):
             else:
                 self.up_cross_attentions.append(nn.Identity())
             
+            # CNN Spatial Cross-Attention (mirror encoder)
+            if spatial_injection_channels is not None and level_idx in attention_levels:
+                cnn_ch = spatial_injection_channels[level_idx]
+                self.up_spatial_cross_attentions.append(CrossAttention2D(
+                    channels=out_ch,
+                    cond_dim=cnn_ch,
+                    num_heads=min(4, out_ch // 32),
+                    head_dim=min(64, out_ch // 4),
+                ))
+            else:
+                self.up_spatial_cross_attentions.append(nn.Identity())
+            
             # Upsampler (except for last level)
             if i < len(reversed_channels) - 1:
                 self.upsamplers.append(Upsample2D(out_ch))
@@ -552,6 +579,27 @@ class ConditionalUnet2D(nn.Module):
             nn.SiLU(),
             nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1),
         )
+    
+    @staticmethod
+    def _prepare_spatial_seq(
+        cnn_feat: torch.Tensor, target_size: tuple
+    ) -> torch.Tensor:
+        """Resize CNN feature map to target spatial size and flatten to sequence.
+        
+        Args:
+            cnn_feat: (B, C, H_cnn, W_cnn) CNN feature map
+            target_size: (H, W) target spatial dimensions to match UNet
+            
+        Returns:
+            (B, H*W, C) sequence suitable as cross-attention key/value
+        """
+        if cnn_feat.shape[-2:] != target_size:
+            cnn_feat = F.interpolate(
+                cnn_feat, size=target_size, mode='bilinear', align_corners=False
+            )
+        B, C, H, W = cnn_feat.shape
+        # (B, C, H, W) -> (B, H*W, C) -- sequence of spatial positions
+        return cnn_feat.flatten(2).permute(0, 2, 1)
     
     def forward(
         self,
@@ -598,30 +646,34 @@ class ConditionalUnet2D(nn.Module):
         # ==================== Encoder ====================
         skip_connections = []
         
-        for blocks, attn, cross_attn, downsample in zip(
+        for i, (blocks, attn, cross_attn, spatial_xattn, downsample) in enumerate(zip(
             self.down_blocks, self.down_attentions,
-            self.down_cross_attentions, self.downsamplers
-        ):
+            self.down_cross_attentions, self.down_spatial_cross_attentions,
+            self.downsamplers
+        )):
             for block in blocks:
                 h = block(h, cond)  # FiLM conditioning
             h = attn(h)  # Self-attention
-            # Sequence cross-attention (at attention_levels when enabled)
+            # LLM Sequence cross-attention (at attention_levels when enabled)
             if isinstance(cross_attn, CrossAttention2D):
                 h = cross_attn(h, cross_cond)
+            # CNN Spatial cross-attention: Q=UNet, K/V=CNN features as spatial sequence
+            if isinstance(spatial_xattn, CrossAttention2D) and spatial_features is not None:
+                cnn_feat = spatial_features[i]
+                # Resize CNN feature to match UNet spatial size, flatten to sequence
+                cnn_seq = self._prepare_spatial_seq(cnn_feat, h.shape[-2:])
+                h = spatial_xattn(h, cnn_seq)
             skip_connections.append(h)
             h = downsample(h)
         
-        # ==================== Spatial Feature Injection ====================
+        # ==================== Spatial Feature Injection (additive) ====================
         # Add projected CNN features to skip connections before decoder uses them
         if self.use_spatial_injection and spatial_features is not None and self.spatial_projectors is not None:
             for i, (projector, cnn_feat) in enumerate(zip(self.spatial_projectors, spatial_features)):
-                # Project CNN channels to match UNet skip channels
-                projected = projector(cnn_feat)  # (B, unet_ch, H_cnn, W_cnn)
-                # Resize to match skip connection spatial size
+                projected = projector(cnn_feat)
                 skip_size = skip_connections[i].shape[-2:]
                 if projected.shape[-2:] != skip_size:
                     projected = F.interpolate(projected, size=skip_size, mode='bilinear', align_corners=False)
-                # Add to skip connection (additive fusion, preserves gradient flow)
                 skip_connections[i] = skip_connections[i] + projected
         
         # ==================== Middle ====================
@@ -631,14 +683,15 @@ class ConditionalUnet2D(nn.Module):
         h = self.mid_block2(h, cond)
         
         # ==================== Decoder ====================
-        for blocks, attn, cross_attn, upsample in zip(
+        num_levels = len(self.up_blocks)
+        for i, (blocks, attn, cross_attn, spatial_xattn, upsample) in enumerate(zip(
             self.up_blocks, self.up_attentions,
-            self.up_cross_attentions, self.upsamplers
-        ):
+            self.up_cross_attentions, self.up_spatial_cross_attentions,
+            self.upsamplers
+        )):
             # Skip connection
             if skip_connections:
                 skip = skip_connections.pop()
-                # Handle size mismatch from downsampling
                 if h.shape[-2:] != skip.shape[-2:]:
                     h = F.interpolate(h, size=skip.shape[-2:], mode='nearest')
                 h = torch.cat([h, skip], dim=1)
@@ -646,9 +699,15 @@ class ConditionalUnet2D(nn.Module):
             for block in blocks:
                 h = block(h, cond)  # FiLM conditioning
             h = attn(h)  # Self-attention
-            # Sequence cross-attention (mirror encoder)
+            # LLM Sequence cross-attention (mirror encoder)
             if isinstance(cross_attn, CrossAttention2D):
                 h = cross_attn(h, cross_cond)
+            # CNN Spatial cross-attention (mirror encoder)
+            if isinstance(spatial_xattn, CrossAttention2D) and spatial_features is not None:
+                level_idx = num_levels - 1 - i  # map decoder index back to encoder level
+                cnn_feat = spatial_features[level_idx]
+                cnn_seq = self._prepare_spatial_seq(cnn_feat, h.shape[-2:])
+                h = spatial_xattn(h, cnn_seq)
             h = upsample(h)
         
         # ==================== Output ====================
