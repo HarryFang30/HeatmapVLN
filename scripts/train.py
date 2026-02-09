@@ -654,6 +654,8 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_visibility_threshold=heatmap_cfg.get('visibility_threshold', 0.5),
         # Spatial feature injection
         heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
+        # Image encoder backbone (pretrained ResNet-18 vs lightweight CNN)
+        heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
         
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),
@@ -831,13 +833,50 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             })
         return groups
     
-    # History Heatmap Head
+    # History Heatmap Head — split ResNet backbone (low lr) from rest (normal lr)
     hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
+    resnet_backbone_lr = optim_cfg.get('resnet_backbone_lr', 1e-5)
     if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
-        groups = get_param_groups_with_wd(model.history_heatmap_head, hist_lr, 'history_heatmap_head', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd})")
+        head = model.history_heatmap_head
+        # Check if this head uses a pretrained ResNet encoder
+        has_resnet = (hasattr(head, 'condition_encoder') and 
+                      hasattr(head.condition_encoder, 'image_encoder') and
+                      hasattr(head.condition_encoder.image_encoder, 'img_mean'))  # ResNet marker
+        
+        if has_resnet:
+            resnet_encoder = head.condition_encoder.image_encoder
+            resnet_param_ids = set(id(p) for p in resnet_encoder.parameters())
+            
+            # ResNet backbone params (low lr)
+            resnet_groups = get_param_groups_with_wd(
+                resnet_encoder, resnet_backbone_lr, 'resnet_backbone', default_wd)
+            if resnet_groups:
+                param_groups.extend(resnet_groups)
+                n_resnet = sum(len(g['params']) for g in resnet_groups)
+                print(f"  Param group: resnet_backbone (lr={resnet_backbone_lr}, wd={default_wd}, params={n_resnet})")
+            
+            # Rest of heatmap head (normal lr) — exclude ResNet params
+            rest_decay, rest_no_decay = [], []
+            for name, p in head.named_parameters():
+                if not p.requires_grad or id(p) in resnet_param_ids:
+                    continue
+                if p.dim() <= 1 or name.endswith('.bias'):
+                    rest_no_decay.append(p)
+                else:
+                    rest_decay.append(p)
+            if rest_decay:
+                param_groups.append({'params': rest_decay, 'lr': hist_lr, 
+                                     'weight_decay': default_wd, 'name': 'history_heatmap_head'})
+            if rest_no_decay:
+                param_groups.append({'params': rest_no_decay, 'lr': hist_lr,
+                                     'weight_decay': 0.0, 'name': 'history_heatmap_head_no_decay'})
+            n_rest = len(rest_decay) + len(rest_no_decay)
+            print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd}, params={n_rest})")
+        else:
+            groups = get_param_groups_with_wd(head, hist_lr, 'history_heatmap_head', default_wd)
+            if groups:
+                param_groups.extend(groups)
+                print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd})")
     
     # Future Heatmap Head
     fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))

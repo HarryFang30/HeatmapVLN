@@ -112,6 +112,10 @@ model:
     
     # 启用 CNN encoder，提供当前图像的空间特征
     use_image_encoder: true
+    # 使用 ImageNet 预训练 ResNet-18 替代自建浅层 CNN
+    # 通道数 [64, 128, 256, 512]（自动覆盖 image_encoder_channels）
+    # 提供更丰富的多尺度语义特征（纹理→物体部件→物体→场景）
+    image_encoder_use_pretrained: true
     # CNN 多尺度空间特征注入 UNet skip connections
     # 解决全局池化导致的空间信息丢失，让 UNet 知道"目标在哪里"
     use_spatial_injection: true
@@ -206,6 +210,7 @@ optim:
   # 分组学习率（降低以提升泛化）
   heatmap_lr: 5.0e-5               # 1e-4 → 5e-5，防止快速过拟合
   history_heatmap_lr: 5.0e-5
+  resnet_backbone_lr: 1.0e-5       # ResNet-18 预训练 backbone 用更低 LR 防止破坏预训练特征
   future_heatmap_lr: 5.0e-5
   action_lr: 1.0e-4
   transformer_action_lr: 1.0e-4

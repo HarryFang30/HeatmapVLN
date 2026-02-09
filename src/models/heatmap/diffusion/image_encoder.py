@@ -6,14 +6,17 @@ conditioning vectors for the diffusion process.
 
 Architecture options:
 1. Lightweight CNN encoder (default)
-2. ResNet-based encoder (optional)
+2. ResNet-18 pretrained encoder (recommended for spatial features)
 """
 
+import logging
 import math
 from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # ==================== Attention Pooling ====================
@@ -284,6 +287,144 @@ class ImageConditionEncoder(nn.Module):
         return global_cond, spatial_features
 
 
+class ResNetImageConditionEncoder(nn.Module):
+    """
+    ImageNet-pretrained ResNet-18 encoder for observation images.
+    
+    Provides significantly richer spatial features than the lightweight CNN:
+    - Channel dims [64, 128, 256, 512] (vs [32, 64, 128, 256])
+    - Each stage has 2 BasicBlocks (4 conv layers, vs 1 ConvBlock + 1 ResBlock)
+    - Pretrained on ImageNet: already understands edges, textures, objects, scenes
+    
+    Multi-scale feature output matches UNet 4-level architecture:
+        [0] layer1: (B, 64, 56, 56)   — textures, edges
+        [1] layer2: (B, 128, 28, 28)  — object parts
+        [2] layer3: (B, 256, 14, 14)  — object semantics
+        [3] layer4: (B, 512, 7, 7)    — scene semantics
+    
+    Args:
+        out_dim: Output conditioning dimension for global vector
+        dropout: Dropout rate for projection head
+        pretrained: Whether to load ImageNet pretrained weights
+    """
+    
+    # Fixed channel dimensions matching ResNet-18 architecture
+    CHANNELS = [64, 128, 256, 512]
+    
+    def __init__(
+        self,
+        out_dim: int = 512,
+        dropout: float = 0.1,
+        pretrained: bool = True,
+        # Accept but ignore these params for API compatibility with ImageConditionEncoder
+        in_channels: int = 3,
+        hidden_channels: List[int] = None,
+        image_size: Tuple[int, int] = (224, 224),
+    ):
+        super().__init__()
+        
+        from torchvision.models import resnet18, ResNet18_Weights
+        
+        self.out_dim = out_dim
+        
+        # ImageNet normalization (input images are [0,1], ResNet expects ImageNet-normalized)
+        # Using register_buffer so these move with .to(device) but aren't parameters
+        self.register_buffer('img_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('img_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        
+        # Load ResNet-18 backbone
+        if pretrained:
+            backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+            logger.info("ResNetImageConditionEncoder: loaded ImageNet pretrained weights")
+        else:
+            backbone = resnet18(weights=None)
+            logger.info("ResNetImageConditionEncoder: random initialization (no pretrained)")
+        
+        # Extract stages (discard fc and avgpool)
+        self.stem = nn.Sequential(
+            backbone.conv1,   # 7x7, stride 2 → 112x112
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,  # 3x3 maxpool, stride 2 → 56x56
+        )
+        self.layer1 = backbone.layer1  # 56x56, 64ch (no spatial downsampling)
+        self.layer2 = backbone.layer2  # 28x28, 128ch
+        self.layer3 = backbone.layer3  # 14x14, 256ch
+        self.layer4 = backbone.layer4  # 7x7, 512ch
+        
+        # Global pooling + projection to cond_dim
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.projection = nn.Sequential(
+            nn.Linear(512, out_dim),
+            nn.Dropout(dropout),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+            nn.Dropout(dropout),
+        )
+        
+        total = sum(p.numel() for p in self.parameters())
+        logger.info(f"ResNetImageConditionEncoder: {total:,} params, channels={self.CHANNELS}")
+    
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply ImageNet normalization: [0,1] -> ImageNet mean/std."""
+        return (x - self.img_mean) / self.img_std
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode observation image to conditioning vector.
+        
+        Args:
+            x: (B, 3, H, W) observation image in [0, 1] range
+            
+        Returns:
+            (B, out_dim) conditioning vector
+        """
+        x = self._normalize(x)
+        h = self.stem(x)
+        h = self.layer1(h)
+        h = self.layer2(h)
+        h = self.layer3(h)
+        h = self.layer4(h)
+        
+        h = self.pool(h).flatten(1)  # (B, 512)
+        return self.projection(h)
+    
+    def forward_multiscale(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Encode observation image, returning global vector AND multi-scale feature maps.
+        
+        Returns:
+            global_cond: (B, out_dim) global conditioning vector
+            spatial_features: List of 4 feature maps:
+                [0] layer1: (B, 64, 56, 56)
+                [1] layer2: (B, 128, 28, 28)
+                [2] layer3: (B, 256, 14, 14)
+                [3] layer4: (B, 512, 7, 7)
+        """
+        spatial_features = []
+        
+        x = self._normalize(x)
+        h = self.stem(x)
+        h = self.layer1(h)
+        spatial_features.append(h)  # (B, 64, 56, 56)
+        
+        h = self.layer2(h)
+        spatial_features.append(h)  # (B, 128, 28, 28)
+        
+        h = self.layer3(h)
+        spatial_features.append(h)  # (B, 256, 14, 14)
+        
+        h = self.layer4(h)
+        spatial_features.append(h)  # (B, 512, 7, 7)
+        
+        # Global pooling + projection
+        pooled = self.pool(h).flatten(1)  # (B, 512)
+        global_cond = self.projection(pooled)
+        
+        return global_cond, spatial_features
+
+
 class LLMConditionProjector(nn.Module):
     """
     Projects LLM token features to conditioning dimension.
@@ -389,6 +530,7 @@ class MultiModalConditionEncoder(nn.Module):
         dropout: float = 0.1,
         use_image_encoder: bool = True,
         use_sequence_conditioning: bool = False,
+        image_encoder_use_pretrained: bool = False,
     ):
         super().__init__()
 
@@ -410,13 +552,25 @@ class MultiModalConditionEncoder(nn.Module):
 
         # Image encoder (only created if use_image_encoder=True)
         if use_image_encoder:
-            self.image_encoder = ImageConditionEncoder(
-                in_channels=image_channels,
-                out_dim=cond_dim,
-                hidden_channels=image_encoder_channels,
-                image_size=image_size,
-                dropout=dropout,
-            )
+            if image_encoder_use_pretrained:
+                # ResNet-18 pretrained backbone — richer spatial features
+                self.image_encoder = ResNetImageConditionEncoder(
+                    out_dim=cond_dim,
+                    dropout=dropout,
+                    pretrained=True,
+                )
+                # Override channels to match ResNet-18 architecture
+                image_encoder_channels = ResNetImageConditionEncoder.CHANNELS
+                logger.info(f"Using ResNet-18 pretrained encoder, channels={image_encoder_channels}")
+            else:
+                # Lightweight custom CNN encoder
+                self.image_encoder = ImageConditionEncoder(
+                    in_channels=image_channels,
+                    out_dim=cond_dim,
+                    hidden_channels=image_encoder_channels,
+                    image_size=image_size,
+                    dropout=dropout,
+                )
             # Fusion MLP for LLM + Image features
             self.fusion = nn.Sequential(
                 nn.Linear(cond_dim * 2, cond_dim),

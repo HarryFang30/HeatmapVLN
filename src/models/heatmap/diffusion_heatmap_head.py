@@ -98,6 +98,7 @@ class DiffusionHeatmapHead(nn.Module):
             dropout=config.dropout,
             use_image_encoder=config.use_image_encoder,
             use_sequence_conditioning=config.use_sequence_conditioning,
+            image_encoder_use_pretrained=config.image_encoder_use_pretrained,
         )
         
         # Spatial injection flag
@@ -105,9 +106,14 @@ class DiffusionHeatmapHead(nn.Module):
         
         # ==================== Noise Predictor ====================
         # If spatial injection enabled, pass CNN encoder channel dims to UNet
+        # When using pretrained ResNet-18, channels are fixed to [64, 128, 256, 512]
         spatial_injection_channels = None
         if config.use_spatial_injection and config.use_image_encoder:
-            spatial_injection_channels = config.image_encoder_channels
+            if config.image_encoder_use_pretrained:
+                from .diffusion.image_encoder import ResNetImageConditionEncoder
+                spatial_injection_channels = list(ResNetImageConditionEncoder.CHANNELS)
+            else:
+                spatial_injection_channels = config.image_encoder_channels
             logger.info(f"SpatialInjection enabled: CNN channels {spatial_injection_channels} -> UNet skips")
         
         self.noise_predictor = ConditionalUnet2D(

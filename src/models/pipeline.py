@@ -97,6 +97,9 @@ class VLNPipelineConfig:
     # Spatial feature injection (CNN multi-scale features -> UNet skip connections)
     heatmap_use_spatial_injection: bool = False       # Enable spatial feature injection
     
+    # Image encoder backbone selection
+    heatmap_image_encoder_use_pretrained: bool = False  # Use pretrained ResNet-18 (vs lightweight CNN)
+    
     # LoRA configuration for Qwen3-VL fine-tuning
     use_lora: bool = False           # Enable LoRA on Qwen3-VL
     lora_rank: int = 16              # LoRA rank
@@ -236,6 +239,8 @@ class VLNPipeline(nn.Module):
             visibility_threshold=config.heatmap_visibility_threshold,
             # Spatial feature injection
             use_spatial_injection=config.heatmap_use_spatial_injection,
+            # Image encoder backbone
+            image_encoder_use_pretrained=config.heatmap_image_encoder_use_pretrained,
         )
         
         # History Heatmap Head

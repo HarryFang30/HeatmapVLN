@@ -573,33 +573,110 @@ class ConditionalUnet2D(nn.Module):
         else:
             self.spatial_projectors = None
         
+        # ==================== Zero-Init Spatial Cross-Attention Outputs ====================
+        # 让新增的 CNN spatial cross-attention 初始时不改变 UNet 特征（恒等映射）
+        # 随着训练逐渐学习有意义的贡献 (ControlNet / IP-Adapter 最佳实践)
+        if spatial_injection_channels is not None:
+            for module_list in [self.down_spatial_cross_attentions, self.up_spatial_cross_attentions]:
+                for module in module_list:
+                    if isinstance(module, CrossAttention2D):
+                        nn.init.zeros_(module.to_out.weight)
+                        nn.init.zeros_(module.to_out.bias)
+        
         # ==================== Output ====================
         self.conv_out = nn.Sequential(
             nn.GroupNorm(n_groups, block_out_channels[0]),
             nn.SiLU(),
             nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1),
         )
+        
+        # Cache for 2D positional encodings (generated lazily per spatial size)
+        self._pos_enc_cache: dict = {}
     
     @staticmethod
+    def _build_2d_sincos_pos_enc(H: int, W: int, C: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Generate 2D sinusoidal positional encoding.
+        
+        Creates sin/cos positional encoding along both spatial axes, concatenated
+        to form a C-dimensional vector for each spatial position.
+        
+        Args:
+            H, W: Spatial dimensions
+            C: Channel dimension of the CNN features (encoding uses all C dims)
+            device, dtype: Tensor device and dtype
+            
+        Returns:
+            (1, H*W, C) positional encoding, broadcastable over batch
+        """
+        assert C >= 4, f"Channel dim {C} too small for 2D pos encoding"
+        half_C = C // 2  # split channels between H-axis and W-axis
+        
+        # Frequency bands (same as transformer sinusoidal encoding)
+        dim_h = torch.arange(0, half_C, 2, device=device, dtype=torch.float32)
+        dim_w = torch.arange(0, half_C, 2, device=device, dtype=torch.float32)
+        freq_h = 1.0 / (10000 ** (dim_h / max(half_C, 1)))  # (half_C//2,)
+        freq_w = 1.0 / (10000 ** (dim_w / max(half_C, 1)))  # (half_C//2,)
+        
+        # Position indices
+        pos_h = torch.arange(H, device=device, dtype=torch.float32)  # (H,)
+        pos_w = torch.arange(W, device=device, dtype=torch.float32)  # (W,)
+        
+        # Outer product: position x frequency
+        enc_h = pos_h.unsqueeze(1) * freq_h.unsqueeze(0)  # (H, half_C//2)
+        enc_w = pos_w.unsqueeze(1) * freq_w.unsqueeze(0)  # (W, half_C//2)
+        
+        # Sin and cos: (H, half_C) and (W, half_C)
+        enc_h = torch.cat([enc_h.sin(), enc_h.cos()], dim=-1)  # (H, half_C)
+        enc_w = torch.cat([enc_w.sin(), enc_w.cos()], dim=-1)  # (W, half_C)
+        
+        # Broadcast to 2D grid: (H, W, C)
+        enc_h = enc_h.unsqueeze(1).expand(-1, W, -1)  # (H, W, half_C)
+        enc_w = enc_w.unsqueeze(0).expand(H, -1, -1)  # (H, W, half_C)
+        
+        # Handle odd C: if C is odd, pad the last dim
+        pos_enc = torch.cat([enc_h, enc_w], dim=-1)  # (H, W, half_C*2)
+        if pos_enc.shape[-1] < C:
+            pos_enc = F.pad(pos_enc, (0, C - pos_enc.shape[-1]))
+        elif pos_enc.shape[-1] > C:
+            pos_enc = pos_enc[..., :C]
+        
+        # Flatten spatial and add batch dim
+        pos_enc = pos_enc.reshape(H * W, C).unsqueeze(0)  # (1, H*W, C)
+        return pos_enc.to(dtype=dtype)
+    
     def _prepare_spatial_seq(
-        cnn_feat: torch.Tensor, target_size: tuple
+        self, cnn_feat: torch.Tensor, target_size: tuple
     ) -> torch.Tensor:
-        """Resize CNN feature map to target spatial size and flatten to sequence.
+        """Resize CNN feature map, add 2D positional encoding, flatten to sequence.
         
         Args:
             cnn_feat: (B, C, H_cnn, W_cnn) CNN feature map
             target_size: (H, W) target spatial dimensions to match UNet
             
         Returns:
-            (B, H*W, C) sequence suitable as cross-attention key/value
+            (B, H*W, C) sequence with positional encoding, for cross-attention K/V
         """
         if cnn_feat.shape[-2:] != target_size:
             cnn_feat = F.interpolate(
                 cnn_feat, size=target_size, mode='bilinear', align_corners=False
             )
         B, C, H, W = cnn_feat.shape
-        # (B, C, H, W) -> (B, H*W, C) -- sequence of spatial positions
-        return cnn_feat.flatten(2).permute(0, 2, 1)
+        
+        # Flatten: (B, C, H, W) -> (B, H*W, C)
+        seq = cnn_feat.flatten(2).permute(0, 2, 1)
+        
+        # Add 2D sinusoidal positional encoding (cached per spatial size)
+        cache_key = (H, W, C)
+        if cache_key not in self._pos_enc_cache or self._pos_enc_cache[cache_key].device != seq.device:
+            self._pos_enc_cache[cache_key] = self._build_2d_sincos_pos_enc(
+                H, W, C, seq.device, seq.dtype
+            )
+        pos_enc = self._pos_enc_cache[cache_key]
+        if pos_enc.dtype != seq.dtype:
+            pos_enc = pos_enc.to(dtype=seq.dtype)
+            self._pos_enc_cache[cache_key] = pos_enc
+        
+        return seq + pos_enc  # (B, H*W, C) with spatial position info
     
     def forward(
         self,
