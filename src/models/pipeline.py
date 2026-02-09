@@ -100,6 +100,7 @@ class VLNPipelineConfig:
     lora_alpha: int = 32             # LoRA alpha (typically 2x rank)
     lora_num_layers: int = 4         # Number of last LLM layers to apply LoRA
     lora_dropout: float = 0.05       # LoRA dropout
+    lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
     
     # Action generation - Mode selection
     # 'legacy': DiffusionActionHead (UNet1D)
@@ -177,6 +178,7 @@ class VLNPipeline(nn.Module):
             lora_alpha=config.lora_alpha,
             lora_num_layers=config.lora_num_layers,
             lora_dropout=config.lora_dropout,
+            lora_target_modules=config.lora_target_modules,
         )
         self.qwen3_vl = Qwen3VLIntegration(qwen_config)
         if config.enable_packing:
