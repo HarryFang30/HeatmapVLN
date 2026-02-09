@@ -247,6 +247,41 @@ class ImageConditionEncoder(nn.Module):
         
         # Projection
         return self.projection(h)
+    
+    def forward_multiscale(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Encode observation image, returning both global vector AND multi-scale feature maps.
+        
+        Used for spatial feature injection into UNet skip connections.
+        
+        Args:
+            x: (B, C, H, W) observation image
+            
+        Returns:
+            global_cond: (B, out_dim) global conditioning vector (same as forward())
+            spatial_features: List of feature maps at each scale:
+                [0] after stem:   (B, hidden_channels[0], H/4, W/4)    e.g. (B, 32, 56, 56)
+                [1] after stage0: (B, hidden_channels[1], H/8, W/8)    e.g. (B, 64, 28, 28)
+                [2] after stage1: (B, hidden_channels[2], H/16, W/16)  e.g. (B, 128, 14, 14)
+                [3] after stage2: (B, hidden_channels[3], H/32, W/32)  e.g. (B, 256, 7, 7)
+        """
+        spatial_features = []
+        
+        # Stem
+        h = self.stem(x)
+        spatial_features.append(h)  # (B, 32, 56, 56) for 224x224 input
+        
+        # Stages
+        for stage in self.stages:
+            h = stage(h)
+            spatial_features.append(h)
+        
+        # Global pooling + projection (same as forward)
+        pooled = self.pool(h)  # (B, C, 1, 1)
+        pooled = pooled.flatten(1)  # (B, C)
+        global_cond = self.projection(pooled)
+        
+        return global_cond, spatial_features
 
 
 class LLMConditionProjector(nn.Module):
@@ -470,6 +505,47 @@ class MultiModalConditionEncoder(nn.Module):
             seq_cond = self.seq_projector(llm_tokens)  # (B, seq_len, cond_dim)
         
         return global_cond, seq_cond
+    
+    def forward_with_spatial(
+        self,
+        llm_tokens: torch.Tensor,
+        observation: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[torch.Tensor]]]:
+        """
+        Full conditioning: global vector + optional sequence + multi-scale spatial features.
+        
+        Combines forward_dual() with spatial feature extraction from CNN encoder.
+        
+        Args:
+            llm_tokens: (B, seq_len, llm_dim) LLM features
+            observation: (B, C, H, W) observation image
+            
+        Returns:
+            global_cond: (B, cond_dim) pooled conditioning vector (for FiLM)
+            seq_cond: (B, seq_len, cond_dim) projected sequence (for cross-attention), or None
+            spatial_features: List of CNN feature maps at each scale, or None
+        """
+        # LLM global path
+        llm_cond = self.llm_projector(llm_tokens)  # (B, cond_dim)
+        
+        spatial_features = None
+        if self.use_image_encoder and self.image_encoder is not None and observation is not None:
+            # Get both global vector and spatial features from CNN
+            img_cond, spatial_features = self.image_encoder.forward_multiscale(observation)
+            fused = torch.cat([llm_cond, img_cond], dim=-1)
+        else:
+            fused = llm_cond
+        
+        global_cond = self.fusion(fused)
+        
+        # Sequence path
+        seq_cond = None
+        if self.use_sequence_conditioning and self.seq_projector is not None:
+            if llm_tokens.dim() == 2:
+                llm_tokens = llm_tokens.unsqueeze(1)
+            seq_cond = self.seq_projector(llm_tokens)
+        
+        return global_cond, seq_cond, spatial_features
     
     def forward_llm_only(self, llm_tokens: torch.Tensor) -> torch.Tensor:
         """Encode only LLM tokens (for cases without observation)."""

@@ -94,6 +94,9 @@ class VLNPipelineConfig:
     heatmap_visibility_loss_weight: float = 0.5       # Visibility BCE loss weight
     heatmap_visibility_threshold: float = 0.5         # Inference visibility threshold
     
+    # Spatial feature injection (CNN multi-scale features -> UNet skip connections)
+    heatmap_use_spatial_injection: bool = False       # Enable spatial feature injection
+    
     # LoRA configuration for Qwen3-VL fine-tuning
     use_lora: bool = False           # Enable LoRA on Qwen3-VL
     lora_rank: int = 16              # LoRA rank
@@ -231,6 +234,8 @@ class VLNPipeline(nn.Module):
             use_visibility_head=config.heatmap_use_visibility_head,
             visibility_loss_weight=config.heatmap_visibility_loss_weight,
             visibility_threshold=config.heatmap_visibility_threshold,
+            # Spatial feature injection
+            use_spatial_injection=config.heatmap_use_spatial_injection,
         )
         
         # History Heatmap Head

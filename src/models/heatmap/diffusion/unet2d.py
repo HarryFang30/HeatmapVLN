@@ -350,6 +350,7 @@ class ConditionalUnet2D(nn.Module):
         - Encoder: ConditionalResidualBlock2D + Downsample
         - Middle: ConditionalResidualBlock2D + Attention
         - Decoder: ConditionalResidualBlock2D + Upsample + Skip connections
+        - Spatial Injection: CNN multi-scale features added to skip connections
     
     Args:
         in_channels: Input channels (1 for heatmap)
@@ -360,6 +361,9 @@ class ConditionalUnet2D(nn.Module):
         attention_levels: Which levels to add attention (0-indexed)
         n_groups: Groups for GroupNorm
         dropout: Dropout rate
+        spatial_injection_channels: If provided, channel dims of CNN multi-scale features
+            to inject into skip connections via 1x1 conv projection + bilinear resize.
+            Length must match block_out_channels. E.g. [32, 64, 128, 256] for 4-level UNet.
     """
     
     def __init__(
@@ -378,6 +382,8 @@ class ConditionalUnet2D(nn.Module):
         use_sequence_conditioning: bool = False,
         seq_cross_attn_heads: int = 8,
         seq_cross_attn_head_dim: int = 64,
+        # Spatial feature injection from CNN encoder
+        spatial_injection_channels: Optional[List[int]] = None,
     ):
         super().__init__()
         
@@ -386,6 +392,7 @@ class ConditionalUnet2D(nn.Module):
         self.cond_dim = cond_dim
         self.use_circular_padding = use_circular_padding
         self.use_sequence_conditioning = use_sequence_conditioning
+        self.use_spatial_injection = spatial_injection_channels is not None
         
         # Timestep embedding
         self.time_embed = nn.Sequential(
@@ -521,6 +528,24 @@ class ConditionalUnet2D(nn.Module):
             
             in_ch = out_ch
         
+        # ==================== Spatial Feature Injection ====================
+        # 1x1 conv projectors to align CNN multi-scale features with UNet skip channels
+        # CNN features are added to encoder skip connections before decoder consumes them
+        if spatial_injection_channels is not None:
+            assert len(spatial_injection_channels) == len(block_out_channels), \
+                f"spatial_injection_channels ({len(spatial_injection_channels)}) must match " \
+                f"block_out_channels ({len(block_out_channels)})"
+            self.spatial_projectors = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(src_ch, tgt_ch, 1, bias=False),  # 1x1 projection
+                    nn.GroupNorm(min(n_groups, tgt_ch), tgt_ch),
+                    nn.SiLU(),
+                )
+                for src_ch, tgt_ch in zip(spatial_injection_channels, block_out_channels)
+            ])
+        else:
+            self.spatial_projectors = None
+        
         # ==================== Output ====================
         self.conv_out = nn.Sequential(
             nn.GroupNorm(n_groups, block_out_channels[0]),
@@ -534,6 +559,7 @@ class ConditionalUnet2D(nn.Module):
         timestep: torch.Tensor,
         global_cond: torch.Tensor,
         seq_cond: Optional[torch.Tensor] = None,
+        spatial_features: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Forward pass for noise prediction.
@@ -544,6 +570,9 @@ class ConditionalUnet2D(nn.Module):
             global_cond: (B, cond_dim) conditioning vector (for FiLM)
             seq_cond: Optional (B, seq_len, cond_dim) sequence conditioning (for cross-attention)
                       If None, cross-attention uses global_cond (backward compatible)
+            spatial_features: Optional list of CNN multi-scale feature maps to inject
+                      into skip connections. Length must match number of encoder levels.
+                      Each tensor: (B, cnn_ch, H_cnn, W_cnn), projected + resized to match.
             
         Returns:
             (B, out_channels, H, W) predicted noise
@@ -581,6 +610,19 @@ class ConditionalUnet2D(nn.Module):
                 h = cross_attn(h, cross_cond)
             skip_connections.append(h)
             h = downsample(h)
+        
+        # ==================== Spatial Feature Injection ====================
+        # Add projected CNN features to skip connections before decoder uses them
+        if self.use_spatial_injection and spatial_features is not None and self.spatial_projectors is not None:
+            for i, (projector, cnn_feat) in enumerate(zip(self.spatial_projectors, spatial_features)):
+                # Project CNN channels to match UNet skip channels
+                projected = projector(cnn_feat)  # (B, unet_ch, H_cnn, W_cnn)
+                # Resize to match skip connection spatial size
+                skip_size = skip_connections[i].shape[-2:]
+                if projected.shape[-2:] != skip_size:
+                    projected = F.interpolate(projected, size=skip_size, mode='bilinear', align_corners=False)
+                # Add to skip connection (additive fusion, preserves gradient flow)
+                skip_connections[i] = skip_connections[i] + projected
         
         # ==================== Middle ====================
         h = self.mid_block1(h, cond)

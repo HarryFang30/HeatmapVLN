@@ -112,6 +112,9 @@ model:
     
     # 启用 CNN encoder，提供当前图像的空间特征
     use_image_encoder: true
+    # CNN 多尺度空间特征注入 UNet skip connections
+    # 解决全局池化导致的空间信息丢失，让 UNet 知道"目标在哪里"
+    use_spatial_injection: true
     
     # LLM token pooling（全局路径）
     pool_method: attention

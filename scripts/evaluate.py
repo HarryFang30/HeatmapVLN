@@ -123,6 +123,8 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_use_visibility_head=heatmap_cfg.get('use_visibility_head', False),
         heatmap_visibility_loss_weight=heatmap_cfg.get('visibility_loss_weight', 0.5),
         heatmap_visibility_threshold=heatmap_cfg.get('visibility_threshold', 0.5),
+        # Spatial feature injection
+        heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
         
         # LoRA
         use_lora=llm_cfg.get('use_lora', False),

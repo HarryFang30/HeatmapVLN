@@ -100,7 +100,16 @@ class DiffusionHeatmapHead(nn.Module):
             use_sequence_conditioning=config.use_sequence_conditioning,
         )
         
+        # Spatial injection flag
+        self.use_spatial_injection = config.use_spatial_injection
+        
         # ==================== Noise Predictor ====================
+        # If spatial injection enabled, pass CNN encoder channel dims to UNet
+        spatial_injection_channels = None
+        if config.use_spatial_injection and config.use_image_encoder:
+            spatial_injection_channels = config.image_encoder_channels
+            logger.info(f"SpatialInjection enabled: CNN channels {spatial_injection_channels} -> UNet skips")
+        
         self.noise_predictor = ConditionalUnet2D(
             in_channels=config.in_channels,
             out_channels=config.out_channels,
@@ -115,6 +124,8 @@ class DiffusionHeatmapHead(nn.Module):
             use_sequence_conditioning=config.use_sequence_conditioning,
             seq_cross_attn_heads=config.seq_cross_attn_heads,
             seq_cross_attn_head_dim=config.seq_cross_attn_head_dim,
+            # Spatial feature injection from CNN encoder
+            spatial_injection_channels=spatial_injection_channels,
         )
         
         # ==================== Visibility Head ====================
@@ -181,8 +192,14 @@ class DiffusionHeatmapHead(nn.Module):
             llm_tokens = llm_tokens.reshape(B, -1, D)
         # Now llm_tokens is (B, seq_len, D) - let condition_encoder handle pooling
         
-        # 2. Encode conditions (dual-path if sequence conditioning enabled)
-        if self.use_sequence_conditioning:
+        # 2. Encode conditions (with spatial features if enabled)
+        spatial_features = None
+        if self.use_spatial_injection:
+            # Get global + sequence + spatial features in one pass
+            cond, seq_cond, spatial_features = self.condition_encoder.forward_with_spatial(
+                llm_tokens, observation
+            )
+        elif self.use_sequence_conditioning:
             cond, seq_cond = self.condition_encoder.forward_dual(llm_tokens, observation)
         else:
             cond = self.condition_encoder(llm_tokens, observation)  # (B, cond_dim)
@@ -190,7 +207,10 @@ class DiffusionHeatmapHead(nn.Module):
         
         # 3. Training mode
         if gt_heatmap is not None and return_loss:
-            return self._compute_training_loss(cond, gt_heatmap, skip_inference, seq_cond=seq_cond)
+            return self._compute_training_loss(
+                cond, gt_heatmap, skip_inference, 
+                seq_cond=seq_cond, spatial_features=spatial_features,
+            )
         
         # 4. Inference mode (with visibility gating)
         B = cond.shape[0]
@@ -209,16 +229,25 @@ class DiffusionHeatmapHead(nn.Module):
                 heatmap = torch.zeros(B, Hm, Wm, device=cond.device, dtype=cond.dtype)
                 visible_cond = cond[visible_mask]
                 visible_seq = seq_cond[visible_mask] if seq_cond is not None else None
-                heatmap[visible_mask] = self._diffusion_inference(visible_cond, seq_cond=visible_seq)
+                visible_spatial = None
+                if spatial_features is not None:
+                    visible_spatial = [f[visible_mask] for f in spatial_features]
+                heatmap[visible_mask] = self._diffusion_inference(
+                    visible_cond, seq_cond=visible_seq, spatial_features=visible_spatial,
+                )
             elif visible_mask.all():
                 # 全部可见：正常跑扩散
-                heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
+                heatmap = self._diffusion_inference(
+                    cond, seq_cond=seq_cond, spatial_features=spatial_features,
+                )
             else:
                 # 全部不可见：直接全零
                 heatmap = torch.zeros(B, Hm, Wm, device=cond.device, dtype=cond.dtype)
         else:
             # 无 visibility head：正常跑扩散
-            heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
+            heatmap = self._diffusion_inference(
+                cond, seq_cond=seq_cond, spatial_features=spatial_features,
+            )
         
         if return_loss:
             result = {
@@ -237,6 +266,7 @@ class DiffusionHeatmapHead(nn.Module):
         gt_heatmap: torch.Tensor,
         skip_inference: bool = False,
         seq_cond: Optional[torch.Tensor] = None,
+        spatial_features: Optional[list] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute diffusion training loss.
@@ -246,6 +276,7 @@ class DiffusionHeatmapHead(nn.Module):
             gt_heatmap: (B, Hm, Wm) ground truth heatmap
             skip_inference: If True, skip inference for monitoring (faster training)
             seq_cond: Optional (B, seq_len, cond_dim) sequence conditioning
+            spatial_features: Optional CNN multi-scale feature maps for spatial injection
             
         Returns:
             Dict with 'loss', 'heatmap', 'noise_pred', 'noise_target'
@@ -296,12 +327,15 @@ class DiffusionHeatmapHead(nn.Module):
             cond_for_pred = cond
             seq_cond_for_pred = seq_cond
         
-        # Predict noise
+        # Predict noise (with spatial features if available)
+        # Note: spatial_features use original cond (not CFG-dropped), since spatial info
+        # is from the observation image and should always be available
         noise_pred = self.noise_predictor(
             sample=noisy_heatmap,
             timestep=timesteps,
             global_cond=cond_for_pred,
             seq_cond=seq_cond_for_pred,
+            spatial_features=spatial_features,
         )
         
         # ==================== Focal-style 混合损失 + 负样本降权 ====================
@@ -362,7 +396,9 @@ class DiffusionHeatmapHead(nn.Module):
         
         if not skip_inference and (self._training_step_counter % self._inference_interval == 0):
             with torch.no_grad():
-                pred_heatmap = self._diffusion_inference(cond, seq_cond=seq_cond)
+                pred_heatmap = self._diffusion_inference(
+                    cond, seq_cond=seq_cond, spatial_features=spatial_features,
+                )
         
         return {
             'loss': total_loss,
@@ -382,6 +418,7 @@ class DiffusionHeatmapHead(nn.Module):
         cond: torch.Tensor,
         use_cfg: bool = True,
         seq_cond: Optional[torch.Tensor] = None,
+        spatial_features: Optional[list] = None,
     ) -> torch.Tensor:
         """
         Iterative denoising to generate heatmap with Classifier-Free Guidance.
@@ -390,6 +427,7 @@ class DiffusionHeatmapHead(nn.Module):
             cond: (B, cond_dim) conditioning vector
             use_cfg: 是否使用 CFG 引导（推理时建议开启）
             seq_cond: Optional (B, seq_len, cond_dim) sequence conditioning
+            spatial_features: Optional CNN multi-scale feature maps for spatial injection
             
         Returns:
             (B, Hm, Wm) predicted heatmap (probability distribution)
@@ -421,19 +459,21 @@ class DiffusionHeatmapHead(nn.Module):
             
             if do_cfg:
                 # CFG: 同时预测有条件和无条件的噪声
-                # 有条件预测
+                # 有条件预测（spatial_features 始终传递，因为它来自观察图像）
                 noise_pred_cond = self.noise_predictor(
                     sample=noisy_heatmap,
                     timestep=timestep_batch,
                     global_cond=cond,
                     seq_cond=seq_cond,
+                    spatial_features=spatial_features,
                 )
-                # 无条件预测
+                # 无条件预测（不传 spatial_features，保持 CFG 的"无条件"语义）
                 noise_pred_uncond = self.noise_predictor(
                     sample=noisy_heatmap,
                     timestep=timestep_batch,
                     global_cond=uncond,
                     seq_cond=uncond_seq,
+                    spatial_features=None,
                 )
                 # CFG 公式：noise = uncond + scale * (cond - uncond)
                 noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_cond - noise_pred_uncond)
@@ -444,6 +484,7 @@ class DiffusionHeatmapHead(nn.Module):
                     timestep=timestep_batch,
                     global_cond=cond,
                     seq_cond=seq_cond,
+                    spatial_features=spatial_features,
                 )
             
             # Remove noise (reverse diffusion step)

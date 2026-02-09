@@ -121,6 +121,12 @@ class DiffusionHeatmapConfig:
     visibility_loss_weight: float = 0.5       # 可见性 BCE loss 的权重
     visibility_threshold: float = 0.5         # 推理时的可见性阈值
     
+    # ==================== Spatial Feature Injection ====================
+    # 将 CNN encoder 的多尺度空间特征注入 UNet skip connections
+    # 解决全局池化导致的空间信息丢失，让 UNet 知道"目标在哪里"
+    # 实现方式: CNN 各层特征 -> 1x1 conv 投影 -> bilinear resize -> 加到 skip connection
+    use_spatial_injection: bool = False       # 是否启用空间特征注入
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"
