@@ -1388,6 +1388,69 @@ def train_one_epoch(
                         if gt_peak_conf > 0:
                             conf_ratio = pred_peak_conf / gt_peak_conf
                             tb_writer.add_scalar('diag/hm_peak_conf_ratio', conf_ratio, actual_step)
+                        
+                        # 4. 多峰评估指标 —— 检测 GT 中所有峰并逐一匹配
+                        # 弥补 global argmax 只看最强峰的缺陷
+                        try:
+                            # NMS 检测 GT 峰值
+                            nms_kernel = 5
+                            pad = nms_kernel // 2
+                            gt_padded = F.pad(gt_hm_diag, [pad] * 4, mode='replicate')
+                            local_max = F.max_pool2d(gt_padded, kernel_size=nms_kernel, stride=1, padding=0)
+                            is_gt_peak = (gt_hm_diag == local_max) & (gt_hm_diag > 0.1)
+                            
+                            # 同样检测 pred 峰值
+                            pred_padded = F.pad(pred_hm, [pad] * 4, mode='replicate')
+                            pred_local_max = F.max_pool2d(pred_padded, kernel_size=nms_kernel, stride=1, padding=0)
+                            is_pred_peak = (pred_hm == pred_local_max) & (pred_hm > pred_hm.max() * 0.2)
+                            
+                            total_gt_peaks = 0
+                            total_matched = 0
+                            total_multi_dist = 0.0
+                            multi_peak_count = 0
+                            
+                            for bi in range(B):
+                                gt_peaks_bi = is_gt_peak[bi, 0].nonzero(as_tuple=False)  # (N_gt, 2) yx
+                                pred_peaks_bi = is_pred_peak[bi, 0].nonzero(as_tuple=False)  # (N_pred, 2)
+                                
+                                n_gt = len(gt_peaks_bi)
+                                total_gt_peaks += n_gt
+                                
+                                if n_gt == 0 or len(pred_peaks_bi) == 0:
+                                    continue
+                                
+                                # 贪心匹配：对每个 GT 峰找最近的 pred 峰
+                                for gi in range(min(n_gt, 8)):  # 最多 8 个峰
+                                    gt_y, gt_x = gt_peaks_bi[gi].float()
+                                    
+                                    # 计算到所有 pred 峰的距离（考虑全景环形）
+                                    pred_y = pred_peaks_bi[:, 0].float()
+                                    pred_x = pred_peaks_bi[:, 1].float()
+                                    dx_mp = torch.abs(pred_x - gt_x)
+                                    dx_mp = torch.min(dx_mp, W - dx_mp)
+                                    dy_mp = torch.abs(pred_y - gt_y)
+                                    dists = torch.sqrt(dx_mp**2 + dy_mp**2)
+                                    
+                                    min_dist = dists.min().item()
+                                    total_multi_dist += min_dist
+                                    multi_peak_count += 1
+                                    
+                                    if min_dist < 5.0:  # 5px 内算匹配成功
+                                        total_matched += 1
+                            
+                            if multi_peak_count > 0:
+                                avg_multi_peak_dist = total_multi_dist / multi_peak_count
+                                tb_writer.add_scalar('diag/hm_multi_peak_distance', avg_multi_peak_dist, actual_step)
+                            
+                            if total_gt_peaks > 0:
+                                peak_recall = total_matched / total_gt_peaks
+                                tb_writer.add_scalar('diag/hm_peak_recall_5px', peak_recall, actual_step)
+                            
+                            # 记录平均 GT 峰数量
+                            tb_writer.add_scalar('diag/hm_avg_gt_peaks', total_gt_peaks / B, actual_step)
+                            
+                        except Exception as e:
+                            logger.debug(f"Multi-peak eval error (non-critical): {e}")
                     
                     # Focal Loss 诊断
                     if 'history_heatmap_base_loss' in output and output['history_heatmap_base_loss'] is not None:

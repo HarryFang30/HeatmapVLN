@@ -670,22 +670,37 @@ class DiffusionHeatmapHead(nn.Module):
     
     def _sharpen_heatmap(self, heatmap: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
         """
-        空间 Softmax 锐化后处理：集中能量到峰值区域。
+        多峰安全的锐化后处理：抑制背景噪声，保留所有峰值。
         
-        将热力图通过低温度 softmax 转换，使峰值更突出、背景更接近 0。
-        temperature=0.1 时，只有峰值附近 ~10px 区域被保留。
+        旧方法（全局 softmax）会指数级放大峰间差异，把弱峰压成 0：
+          exp(0.8/0.1) / exp(0.5/0.1) = 2981/148 = 20:1（原始比仅 1.6:1）
+        
+        新方法：自适应阈值 + ReLU 背景抑制
+        1. 对每个样本计算自适应阈值 = max * temperature
+        2. ReLU(x - threshold) 抑制背景，保留所有超过阈值的峰
+        3. 归一化到 [0, 1]，保持峰间高度比不变
         
         Args:
             heatmap: (B, H, W) heatmap in [0, 1]
-            temperature: Softmax temperature (lower = sharper)
+            temperature: 阈值比例（0.1 = 低于 max 的 10% 被清零）
             
         Returns:
-            (B, H, W) sharpened heatmap (sums to 1 per sample)
+            (B, H, W) sharpened heatmap in [0, 1]，多峰结构完整保留
         """
         B, H, W = heatmap.shape
-        flat = heatmap.view(B, -1)  # (B, H*W)
-        sharp = F.softmax(flat / temperature, dim=-1)
-        return sharp.view(B, H, W)
+        
+        # 每样本自适应阈值 = max * temperature
+        max_vals = heatmap.flatten(1).max(dim=1).values  # (B,)
+        thresholds = (max_vals * temperature).view(B, 1, 1)  # (B, 1, 1)
+        
+        # ReLU 背景抑制：低于阈值的像素清零，保留所有峰
+        sharpened = F.relu(heatmap - thresholds)
+        
+        # 归一化到 [0, 1]：保持峰间高度比不变
+        new_max = sharpened.flatten(1).max(dim=1).values.view(B, 1, 1)  # (B, 1, 1)
+        sharpened = sharpened / (new_max + 1e-8)
+        
+        return sharpened
     
     def _find_gt_peaks(self, gt_heatmap: torch.Tensor, min_value: float = 0.1, nms_kernel: int = 5) -> list:
         """
