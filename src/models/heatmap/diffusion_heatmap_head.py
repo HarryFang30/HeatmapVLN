@@ -450,30 +450,20 @@ class DiffusionHeatmapHead(nn.Module):
                 neg_zero_loss_val = neg_zero_loss.item()
                 total_loss = total_loss + 0.5 * neg_zero_loss
         
-        # ==================== Peak Distance Loss ====================
-        # 可微分峰值距离损失：通过 Spatial Soft-Argmax 直接优化峰值位置
-        # 只对正样本（有峰值的 GT）计算，跳过负样本（GT=全零无意义峰值）
+        # ==================== Peak Distance Loss (Multi-Peak Aware) ====================
+        # 多峰感知的可微分峰值距离损失：
+        # 1. NMS 检测 GT 中的所有峰值（非微分）
+        # 2. 对每个 GT 峰值创建高斯注意力窗口
+        # 3. 在窗口内对预测 x0 做 soft-argmax → 提取对应预测位置
+        # 4. 计算每峰的 L2 距离并平均
+        # 正确处理多峰：避免全局 soft-argmax 返回"重心"的问题
         peak_dist_loss_val = 0.0
         
         if self.peak_distance_loss_weight > 0 and x0_hat is not None:
-            # 只对正样本计算
-            pos_mask = ~is_negative.bool()  # (B,)
-            if pos_mask.any():
-                pos_x0 = x0_hat[pos_mask]           # (N_pos, 1, H, W)，[-1,1] 空间
-                pos_gt = gt_normalized[pos_mask]     # (N_pos, 1, H, W)，[-1,1] 空间
-                
-                # soft-argmax 提取峰值坐标
-                pred_y, pred_x = self._soft_argmax(pos_x0, self.peak_loss_temperature)
-                gt_y, gt_x = self._soft_argmax(pos_gt, self.peak_loss_temperature)
-                
-                # L2 距离，归一化到 [0, 1]（除以对角线长度）
-                Hm, Wm = self.heatmap_size
-                diag = (Hm ** 2 + Wm ** 2) ** 0.5  # 64x64 → diag ≈ 90.5
-                peak_dist = ((pred_y - gt_y) ** 2 + (pred_x - gt_x) ** 2).sqrt()  # (N_pos,)
-                peak_dist_normalized = peak_dist / diag  # 归一化到 [0, 1]
-                
-                peak_dist_loss = peak_dist_normalized.mean()
-                peak_dist_loss_val = peak_dist_loss.item()
+            peak_dist_loss, peak_dist_loss_val = self._multi_peak_distance_loss(
+                x0_hat, gt_heatmap, is_negative
+            )
+            if peak_dist_loss.requires_grad:
                 total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
         
         # ==================== Visibility Loss (B3: 增强权重) ====================
@@ -670,35 +660,147 @@ class DiffusionHeatmapHead(nn.Module):
         sharp = F.softmax(flat / temperature, dim=-1)
         return sharp.view(B, H, W)
     
-    def _soft_argmax(self, heatmap: torch.Tensor, temperature: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _find_gt_peaks(self, gt_heatmap: torch.Tensor, min_value: float = 0.1, nms_kernel: int = 5) -> list:
         """
-        可微分的 Spatial Soft-Argmax：提取热力图的峰值坐标。
+        非极大值抑制（NMS）检测 GT 热力图中的所有峰值位置。
         
-        通过低温度 softmax 将热力图转换为概率分布，然后计算坐标期望值。
-        温度越低，结果越接近真实 argmax（但梯度越集中）。
+        使用 max_pool2d 进行局部极大值检测：
+        一个像素如果等于其 nms_kernel × nms_kernel 邻域内的最大值，
+        且值大于 min_value，则被视为峰值。
         
         Args:
-            heatmap: (B, 1, H, W) heatmap (any range, will be softmax-normalized)
-            temperature: Softmax temperature
+            gt_heatmap: (B, 1, H, W) GT heatmap in [0, 1]
+            min_value: 最小峰值阈值
+            nms_kernel: NMS 窗口大小
             
         Returns:
-            (pred_y, pred_x): 每个 shape 为 (B,)，坐标范围 [0, H-1] 和 [0, W-1]
+            List[Tensor]: 每个样本的峰值坐标列表，每个元素 shape (num_peaks, 2) = [(y, x), ...]
+                          如果无峰值则为空 tensor
         """
-        B, C, H, W = heatmap.shape
+        B, _, H, W = gt_heatmap.shape
+        pad = nms_kernel // 2
         
-        # 创建坐标网格
-        y_coords = torch.arange(H, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
-        x_coords = torch.arange(W, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        # Max pooling NMS
+        gt_padded = F.pad(gt_heatmap, [pad] * 4, mode='replicate')
+        local_max = F.max_pool2d(gt_padded, kernel_size=nms_kernel, stride=1, padding=0)
         
-        # Softmax over spatial dims → 概率分布
-        flat = heatmap.view(B, -1)  # (B, H*W)
-        weights = F.softmax(flat / temperature, dim=-1).view(B, 1, H, W)
+        # 峰值 = 局部最大值 且 大于阈值
+        is_peak = (gt_heatmap == local_max) & (gt_heatmap > min_value)  # (B, 1, H, W)
+        is_peak = is_peak.squeeze(1)  # (B, H, W)
+        
+        peaks_per_sample = []
+        for i in range(B):
+            peak_coords = is_peak[i].nonzero(as_tuple=False)  # (num_peaks, 2)
+            
+            # 限制每个样本最多 8 个峰值，按 GT 值排序保留最强的
+            if len(peak_coords) > 8:
+                gt_vals = gt_heatmap[i, 0, peak_coords[:, 0], peak_coords[:, 1]]
+                top_k_idx = gt_vals.topk(8).indices
+                peak_coords = peak_coords[top_k_idx]
+            
+            peaks_per_sample.append(peak_coords)
+        
+        return peaks_per_sample
+    
+    def _multi_peak_distance_loss(
+        self,
+        x0_hat: torch.Tensor,
+        gt_heatmap: torch.Tensor,
+        is_negative: torch.Tensor,
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        多峰感知的可微分峰值距离损失。
+        
+        处理流程：
+        1. 用 NMS 在 GT 上检测所有峰值位置（非微分，仅获取坐标）
+        2. 对每个 GT 峰值，创建高斯注意力窗口（sigma=5, 覆盖 ~15px）
+        3. 用窗口加权预测 x0，在窗口区域内做 soft-argmax → 预测位置
+        4. 计算每个峰值的 L2 距离并平均
+        5. 归一化到 [0, 1]
+        
+        向量化实现：所有峰值打包为一个 batch 一次性计算 soft-argmax。
+        
+        Args:
+            x0_hat: (B, 1, H, W) 预测的 x0 估计，[-1, 1] 空间
+            gt_heatmap: (B, 1, H, W) GT 热力图，[0, 1] 空间
+            is_negative: (B,) float tensor，1.0 = 负样本
+            
+        Returns:
+            (loss_tensor, loss_value): 可微分的 loss tensor 和 float 值
+        """
+        device = x0_hat.device
+        dtype = x0_hat.dtype
+        B, _, H, W = x0_hat.shape
+        diag = (H ** 2 + W ** 2) ** 0.5
+        
+        # Step 1: 只处理正样本
+        pos_mask = ~is_negative.bool()
+        if not pos_mask.any():
+            return torch.tensor(0.0, device=device, requires_grad=False), 0.0
+        
+        pos_indices = pos_mask.nonzero(as_tuple=False).squeeze(1)  # (N_pos,)
+        pos_gt = gt_heatmap[pos_indices]    # (N_pos, 1, H, W)
+        pos_x0 = x0_hat[pos_indices]        # (N_pos, 1, H, W)
+        
+        # Step 2: 检测所有正样本中的 GT 峰值
+        with torch.no_grad():
+            peaks_per_sample = self._find_gt_peaks(pos_gt)
+        
+        # 收集所有峰值 → 向量化处理
+        # 记录: (样本在 pos 中的 index, peak_y, peak_x)
+        sample_ids = []
+        peak_ys = []
+        peak_xs = []
+        
+        for i, peaks in enumerate(peaks_per_sample):
+            if len(peaks) == 0:
+                continue
+            for j in range(len(peaks)):
+                sample_ids.append(i)
+                peak_ys.append(peaks[j, 0].float())
+                peak_xs.append(peaks[j, 1].float())
+        
+        if len(sample_ids) == 0:
+            return torch.tensor(0.0, device=device, requires_grad=False), 0.0
+        
+        K = len(sample_ids)  # 总峰值数
+        sample_ids_t = torch.tensor(sample_ids, device=device, dtype=torch.long)
+        peak_ys_t = torch.stack(peak_ys)  # (K,)
+        peak_xs_t = torch.stack(peak_xs)  # (K,)
+        
+        # Step 3: 创建 K 个高斯注意力窗口（向量化）
+        # window[k, y, x] = exp(-((y - peak_y_k)^2 + (x - peak_x_k)^2) / (2 * sigma^2))
+        window_sigma = 5.0  # 覆盖 GT blob (sigma~3) 及其周围区域
+        
+        y_grid = torch.arange(H, device=device, dtype=dtype).view(1, H, 1)  # (1, H, 1)
+        x_grid = torch.arange(W, device=device, dtype=dtype).view(1, 1, W)  # (1, 1, W)
+        
+        # (K, 1, 1) broadcast with (1, H, 1) and (1, 1, W) → (K, H, W)
+        dy = y_grid - peak_ys_t.view(K, 1, 1)  # (K, H, W)
+        dx = x_grid - peak_xs_t.view(K, 1, 1)  # (K, H, W)
+        windows = torch.exp(-(dy ** 2 + dx ** 2) / (2 * window_sigma ** 2))  # (K, H, W)
+        
+        # Step 4: 提取每个峰值对应样本的预测 x0
+        pred_for_peaks = pos_x0[sample_ids_t, 0]  # (K, H, W)
+        
+        # 反归一化到 [0, 1] 让 softmax 更自然（-1 背景 → 0，+1 峰值 → 1）
+        pred_denorm = (pred_for_peaks + 1) / 2  # (K, H, W)
+        
+        # Step 5: 窗口加权预测 + soft-argmax（向量化）
+        windowed_pred = pred_denorm * windows  # (K, H, W)
+        
+        flat = windowed_pred.view(K, -1)  # (K, H*W)
+        weights = F.softmax(flat / self.peak_loss_temperature, dim=-1).view(K, H, W)
         
         # 坐标期望值
-        pred_y = (weights * y_coords).sum(dim=[1, 2, 3])  # (B,)
-        pred_x = (weights * x_coords).sum(dim=[1, 2, 3])  # (B,)
+        pred_peak_y = (weights * y_grid.expand(K, H, W)).sum(dim=[1, 2])  # (K,)
+        pred_peak_x = (weights * x_grid.expand(K, H, W)).sum(dim=[1, 2])  # (K,)
         
-        return pred_y, pred_x
+        # Step 6: L2 距离，归一化到 [0, 1]
+        dists = ((pred_peak_y - peak_ys_t) ** 2 + (pred_peak_x - peak_xs_t) ** 2).sqrt()
+        peak_dist_loss = (dists / diag).mean()
+        
+        return peak_dist_loss, peak_dist_loss.item()
     
     def forward_llm_only(
         self,
