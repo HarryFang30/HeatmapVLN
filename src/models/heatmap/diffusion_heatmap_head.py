@@ -178,6 +178,10 @@ class DiffusionHeatmapHead(nn.Module):
         # Negative sample config
         self.negative_sample_weight = config.negative_sample_weight
         
+        # Peak distance loss config
+        self.peak_distance_loss_weight = config.peak_distance_loss_weight
+        self.peak_loss_temperature = config.peak_loss_temperature
+        
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
         logger.info(
@@ -407,8 +411,13 @@ class DiffusionHeatmapHead(nn.Module):
         x0_loss_val = 0.0
         sparsity_loss_val = 0.0
         neg_zero_loss_val = 0.0
+        x0_hat = None
         
-        if self.x0_loss_weight > 0 or self.sparsity_loss_weight > 0:
+        # 需要 x0 估计的条件：x0 loss、sparsity loss、或 peak distance loss
+        need_x0 = (self.x0_loss_weight > 0 or self.sparsity_loss_weight > 0 
+                    or self.peak_distance_loss_weight > 0)
+        
+        if need_x0:
             with torch.no_grad():
                 alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
                 alpha_bar = alpha_bar.view(-1, 1, 1, 1)
@@ -440,6 +449,32 @@ class DiffusionHeatmapHead(nn.Module):
                 neg_zero_loss = F.mse_loss(neg_x0, neg_target)
                 neg_zero_loss_val = neg_zero_loss.item()
                 total_loss = total_loss + 0.5 * neg_zero_loss
+        
+        # ==================== Peak Distance Loss ====================
+        # 可微分峰值距离损失：通过 Spatial Soft-Argmax 直接优化峰值位置
+        # 只对正样本（有峰值的 GT）计算，跳过负样本（GT=全零无意义峰值）
+        peak_dist_loss_val = 0.0
+        
+        if self.peak_distance_loss_weight > 0 and x0_hat is not None:
+            # 只对正样本计算
+            pos_mask = ~is_negative.bool()  # (B,)
+            if pos_mask.any():
+                pos_x0 = x0_hat[pos_mask]           # (N_pos, 1, H, W)，[-1,1] 空间
+                pos_gt = gt_normalized[pos_mask]     # (N_pos, 1, H, W)，[-1,1] 空间
+                
+                # soft-argmax 提取峰值坐标
+                pred_y, pred_x = self._soft_argmax(pos_x0, self.peak_loss_temperature)
+                gt_y, gt_x = self._soft_argmax(pos_gt, self.peak_loss_temperature)
+                
+                # L2 距离，归一化到 [0, 1]（除以对角线长度）
+                Hm, Wm = self.heatmap_size
+                diag = (Hm ** 2 + Wm ** 2) ** 0.5  # 64x64 → diag ≈ 90.5
+                peak_dist = ((pred_y - gt_y) ** 2 + (pred_x - gt_x) ** 2).sqrt()  # (N_pos,)
+                peak_dist_normalized = peak_dist / diag  # 归一化到 [0, 1]
+                
+                peak_dist_loss = peak_dist_normalized.mean()
+                peak_dist_loss_val = peak_dist_loss.item()
+                total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
         
         # ==================== Visibility Loss (B3: 增强权重) ====================
         # 可见性预测：判断当前样本的 GT 热力图是否有峰值
@@ -478,6 +513,7 @@ class DiffusionHeatmapHead(nn.Module):
             'x0_loss': x0_loss_val,                 # x0 重构损失
             'sparsity_loss': sparsity_loss_val,     # L1 稀疏性损失
             'neg_zero_loss': neg_zero_loss_val,     # 负样本零目标损失
+            'peak_dist_loss': peak_dist_loss_val,   # 可微分峰值距离损失
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
@@ -633,6 +669,36 @@ class DiffusionHeatmapHead(nn.Module):
         flat = heatmap.view(B, -1)  # (B, H*W)
         sharp = F.softmax(flat / temperature, dim=-1)
         return sharp.view(B, H, W)
+    
+    def _soft_argmax(self, heatmap: torch.Tensor, temperature: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        可微分的 Spatial Soft-Argmax：提取热力图的峰值坐标。
+        
+        通过低温度 softmax 将热力图转换为概率分布，然后计算坐标期望值。
+        温度越低，结果越接近真实 argmax（但梯度越集中）。
+        
+        Args:
+            heatmap: (B, 1, H, W) heatmap (any range, will be softmax-normalized)
+            temperature: Softmax temperature
+            
+        Returns:
+            (pred_y, pred_x): 每个 shape 为 (B,)，坐标范围 [0, H-1] 和 [0, W-1]
+        """
+        B, C, H, W = heatmap.shape
+        
+        # 创建坐标网格
+        y_coords = torch.arange(H, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        x_coords = torch.arange(W, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        
+        # Softmax over spatial dims → 概率分布
+        flat = heatmap.view(B, -1)  # (B, H*W)
+        weights = F.softmax(flat / temperature, dim=-1).view(B, 1, H, W)
+        
+        # 坐标期望值
+        pred_y = (weights * y_coords).sum(dim=[1, 2, 3])  # (B,)
+        pred_x = (weights * x_coords).sum(dim=[1, 2, 3])  # (B,)
+        
+        return pred_y, pred_x
     
     def forward_llm_only(
         self,

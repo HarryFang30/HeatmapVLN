@@ -157,6 +157,12 @@ model:
     
     # 负样本（GT=全零）的扩散 loss 权重（0.1→0.3，让模型有效学习负样本）
     negative_sample_weight: 0.3
+    
+    # 可微分峰值距离损失：通过 Spatial Soft-Argmax 直接优化 peak_distance
+    # 唯一直接优化峰值位置准确度的 loss（其他 loss 都是间接的）
+    # 只对正样本计算，归一化到 [0,1] 范围
+    peak_distance_loss_weight: 2.0    # 权重（0 = 禁用）
+    peak_loss_temperature: 0.1        # soft-argmax 温度（越低越接近真实 argmax）
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:

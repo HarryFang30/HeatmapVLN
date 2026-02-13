@@ -148,6 +148,14 @@ class DiffusionHeatmapConfig:
     # 之前为 0.1（太低，模型无法有效学习负样本）
     negative_sample_weight: float = 0.3      # 负样本权重 (0.1~1.0)
     
+    # ==================== Peak Distance Loss ====================
+    # 可微分峰值距离损失：通过 Spatial Soft-Argmax 直接优化峰值位置
+    # 这是唯一直接优化 peak_distance 指标的 loss
+    # 注意：只对正样本（有峰值的 GT）计算，跳过负样本
+    # 归一化到 [0,1] 范围（除以 heatmap 对角线长度），与其他 loss 尺度一致
+    peak_distance_loss_weight: float = 2.0   # 峰值距离损失权重 (0 = 禁用)
+    peak_loss_temperature: float = 0.1       # soft-argmax 温度（越低越接近真实 argmax）
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"

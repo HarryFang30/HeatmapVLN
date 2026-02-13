@@ -664,6 +664,9 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_sparsity_loss_weight=heatmap_cfg.get('sparsity_loss_weight', 0.5),
         # Negative sample diffusion loss weight
         heatmap_negative_sample_weight=heatmap_cfg.get('negative_sample_weight', 0.3),
+        # Peak distance loss (differentiable soft-argmax)
+        heatmap_peak_distance_loss_weight=heatmap_cfg.get('peak_distance_loss_weight', 2.0),
+        heatmap_peak_loss_temperature=heatmap_cfg.get('peak_loss_temperature', 0.1),
         
         # Multi-layer feature extraction
         multi_layer_features=llm_cfg.get('multi_layer_features', False),
@@ -1413,6 +1416,10 @@ def train_one_epoch(
                     # Negative Zero Loss 诊断
                     if 'history_heatmap_neg_zero_loss' in output and output['history_heatmap_neg_zero_loss'] is not None:
                         tb_writer.add_scalar('diag/heatmap_neg_zero_loss', output['history_heatmap_neg_zero_loss'], actual_step)
+                    
+                    # Peak Distance Loss 诊断
+                    if 'history_heatmap_peak_dist_loss' in output and output['history_heatmap_peak_dist_loss'] is not None:
+                        tb_writer.add_scalar('diag/heatmap_peak_dist_loss', output['history_heatmap_peak_dist_loss'], actual_step)
                     
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
