@@ -127,6 +127,27 @@ class DiffusionHeatmapConfig:
     # 实现方式: CNN 各层特征 -> 1x1 conv 投影 -> bilinear resize -> 加到 skip connection
     use_spatial_injection: bool = False       # 是否启用空间特征注入
     
+    # ==================== Inference Sharpening ====================
+    # 推理后处理：空间 Softmax 温度锐化
+    # 将热力图通过低温度 softmax 集中能量到峰值区域
+    # 设为 0 禁用锐化；推荐值 0.1（保留峰值附近 ~10px 区域）
+    sharpen_temperature: float = 0.1
+    
+    # ==================== x0 Reconstruction Loss ====================
+    # 从噪声预测反推 x0 估计，直接监督输出质量
+    # epsilon loss 只关心噪声预测准确度，x0 loss 直接约束重构热力图质量
+    x0_loss_weight: float = 1.0              # x0 重构损失权重 (0 = 禁用)
+    
+    # ==================== Sparsity Regularization ====================
+    # L1 稀疏性正则化：鼓励 x0 估计中大部分像素为 0
+    # 使预测热力图更锐利、更集中
+    sparsity_loss_weight: float = 0.5        # 稀疏性正则化权重 (0 = 禁用)
+    
+    # ==================== Negative Sample Config ====================
+    # 负样本（GT=全零）的扩散 loss 权重
+    # 之前为 0.1（太低，模型无法有效学习负样本）
+    negative_sample_weight: float = 0.3      # 负样本权重 (0.1~1.0)
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"

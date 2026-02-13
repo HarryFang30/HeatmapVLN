@@ -656,6 +656,14 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
         # Image encoder backbone (pretrained ResNet-18 vs lightweight CNN)
         heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
+        # Inference sharpening (spatial softmax with temperature)
+        heatmap_sharpen_temperature=heatmap_cfg.get('sharpen_temperature', 0.1),
+        # x0 reconstruction loss (direct output quality supervision)
+        heatmap_x0_loss_weight=heatmap_cfg.get('x0_loss_weight', 1.0),
+        # L1 sparsity regularization
+        heatmap_sparsity_loss_weight=heatmap_cfg.get('sparsity_loss_weight', 0.5),
+        # Negative sample diffusion loss weight
+        heatmap_negative_sample_weight=heatmap_cfg.get('negative_sample_weight', 0.3),
         
         # Multi-layer feature extraction
         multi_layer_features=llm_cfg.get('multi_layer_features', False),
@@ -1393,6 +1401,18 @@ def train_one_epoch(
                     if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
                         vis_loss_val = output['history_heatmap_visibility_loss']
                         tb_writer.add_scalar('diag/heatmap_visibility_loss', vis_loss_val, actual_step)
+                    
+                    # x0 Reconstruction Loss 诊断
+                    if 'history_heatmap_x0_loss' in output and output['history_heatmap_x0_loss'] is not None:
+                        tb_writer.add_scalar('diag/heatmap_x0_loss', output['history_heatmap_x0_loss'], actual_step)
+                    
+                    # Sparsity Loss 诊断
+                    if 'history_heatmap_sparsity_loss' in output and output['history_heatmap_sparsity_loss'] is not None:
+                        tb_writer.add_scalar('diag/heatmap_sparsity_loss', output['history_heatmap_sparsity_loss'], actual_step)
+                    
+                    # Negative Zero Loss 诊断
+                    if 'history_heatmap_neg_zero_loss' in output and output['history_heatmap_neg_zero_loss'] is not None:
+                        tb_writer.add_scalar('diag/heatmap_neg_zero_loss', output['history_heatmap_neg_zero_loss'], actual_step)
                     
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:

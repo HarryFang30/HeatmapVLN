@@ -100,6 +100,18 @@ class VLNPipelineConfig:
     # Image encoder backbone selection
     heatmap_image_encoder_use_pretrained: bool = False  # Use pretrained ResNet-18 (vs lightweight CNN)
     
+    # Inference sharpening (spatial softmax with temperature)
+    heatmap_sharpen_temperature: float = 0.1  # 0 = disabled, 0.1 = sharp
+    
+    # x0 reconstruction loss (direct output quality supervision)
+    heatmap_x0_loss_weight: float = 1.0       # 0 = disabled
+    
+    # L1 sparsity regularization (encourage sparse output)
+    heatmap_sparsity_loss_weight: float = 0.5  # 0 = disabled
+    
+    # Negative sample diffusion loss weight
+    heatmap_negative_sample_weight: float = 0.3  # 0.1~1.0
+    
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
     multi_layer_features: bool = False
@@ -330,6 +342,14 @@ class VLNPipeline(nn.Module):
             use_spatial_injection=config.heatmap_use_spatial_injection,
             # Image encoder backbone
             image_encoder_use_pretrained=config.heatmap_image_encoder_use_pretrained,
+            # Inference sharpening
+            sharpen_temperature=config.heatmap_sharpen_temperature,
+            # x0 reconstruction loss
+            x0_loss_weight=config.heatmap_x0_loss_weight,
+            # L1 sparsity regularization
+            sparsity_loss_weight=config.heatmap_sparsity_loss_weight,
+            # Negative sample weight
+            negative_sample_weight=config.heatmap_negative_sample_weight,
         )
         
         # History Heatmap Head
@@ -527,6 +547,9 @@ class VLNPipeline(nn.Module):
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
         history_heatmap_visibility_loss = None
+        history_heatmap_x0_loss = None
+        history_heatmap_sparsity_loss = None
+        history_heatmap_neg_zero_loss = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
@@ -551,6 +574,9 @@ class VLNPipeline(nn.Module):
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
                     history_heatmap_visibility_loss = result.get('visibility_loss')
+                    history_heatmap_x0_loss = result.get('x0_loss')
+                    history_heatmap_sparsity_loss = result.get('sparsity_loss')
+                    history_heatmap_neg_zero_loss = result.get('neg_zero_loss')
                 else:
                     # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
@@ -626,7 +652,7 @@ class VLNPipeline(nn.Module):
         if future_heatmap is not None:
             output['future_heatmaps'] = future_heatmap.unsqueeze(1)
         
-        # Heatmap losses
+        # Heatmap losses (forward path)
         if history_heatmap_loss is not None:
             output['history_heatmap_loss'] = history_heatmap_loss
             if history_heatmap_noise_std is not None:
@@ -637,6 +663,12 @@ class VLNPipeline(nn.Module):
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
             if history_heatmap_visibility_loss is not None:
                 output['history_heatmap_visibility_loss'] = history_heatmap_visibility_loss
+            if history_heatmap_x0_loss is not None:
+                output['history_heatmap_x0_loss'] = history_heatmap_x0_loss
+            if history_heatmap_sparsity_loss is not None:
+                output['history_heatmap_sparsity_loss'] = history_heatmap_sparsity_loss
+            if history_heatmap_neg_zero_loss is not None:
+                output['history_heatmap_neg_zero_loss'] = history_heatmap_neg_zero_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:
@@ -775,6 +807,9 @@ class VLNPipeline(nn.Module):
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
         history_heatmap_visibility_loss = None
+        history_heatmap_x0_loss = None
+        history_heatmap_sparsity_loss = None
+        history_heatmap_neg_zero_loss = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
@@ -799,6 +834,9 @@ class VLNPipeline(nn.Module):
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
                     history_heatmap_visibility_loss = result.get('visibility_loss')
+                    history_heatmap_x0_loss = result.get('x0_loss')
+                    history_heatmap_sparsity_loss = result.get('sparsity_loss')
+                    history_heatmap_neg_zero_loss = result.get('neg_zero_loss')
                 else:
                     # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
@@ -872,7 +910,7 @@ class VLNPipeline(nn.Module):
         if future_heatmap is not None:
             output['future_heatmaps'] = future_heatmap.unsqueeze(1)
         
-        # Heatmap losses
+        # Heatmap losses (forward_packed path)
         if history_heatmap_loss is not None:
             output['history_heatmap_loss'] = history_heatmap_loss
             if history_heatmap_noise_std is not None:
@@ -883,6 +921,12 @@ class VLNPipeline(nn.Module):
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
             if history_heatmap_visibility_loss is not None:
                 output['history_heatmap_visibility_loss'] = history_heatmap_visibility_loss
+            if history_heatmap_x0_loss is not None:
+                output['history_heatmap_x0_loss'] = history_heatmap_x0_loss
+            if history_heatmap_sparsity_loss is not None:
+                output['history_heatmap_sparsity_loss'] = history_heatmap_sparsity_loss
+            if history_heatmap_neg_zero_loss is not None:
+                output['history_heatmap_neg_zero_loss'] = history_heatmap_neg_zero_loss
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:

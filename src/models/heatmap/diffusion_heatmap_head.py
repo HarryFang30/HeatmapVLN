@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from .diffusion.config import DiffusionHeatmapConfig
 from .diffusion.unet2d import ConditionalUnet2D
@@ -137,22 +138,45 @@ class DiffusionHeatmapHead(nn.Module):
         # ==================== Visibility Head ====================
         # 可见性预测头：判断当前视角是否能看到历史点
         # 当预测为不可见时跳过扩散推理，直接输出全零热力图
+        # 增强版：3 层 MLP，增加容量以更好区分正/负样本
         if self.use_visibility_head:
             self.visibility_head = nn.Sequential(
-                nn.Linear(config.cond_dim, config.cond_dim // 4),
+                nn.Linear(config.cond_dim, config.cond_dim // 2),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.cond_dim // 2, config.cond_dim // 4),
                 nn.GELU(),
                 nn.Dropout(config.dropout),
                 nn.Linear(config.cond_dim // 4, 1),
             )
-            logger.info("VisibilityHead enabled: cond_dim=%d -> 1 (binary)", config.cond_dim)
+            logger.info("VisibilityHead (enhanced 3-layer) enabled: cond_dim=%d -> 1 (binary)", config.cond_dim)
         
         # ==================== Noise Scheduler ====================
+        # Training: DDPM (stochastic, standard for training)
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=config.num_train_timesteps,
             beta_schedule=config.beta_schedule,
             clip_sample=config.clip_sample,
             prediction_type=config.prediction_type,
         )
+        # Inference: DDIM (deterministic, sharper output than stochastic DDPM)
+        # Uses same trained model, no retraining needed
+        self.inference_scheduler = DDIMScheduler(
+            num_train_timesteps=config.num_train_timesteps,
+            beta_schedule=config.beta_schedule,
+            clip_sample=config.clip_sample,
+            prediction_type=config.prediction_type,
+        )
+        
+        # Sharpening config
+        self.sharpen_temperature = config.sharpen_temperature
+        
+        # x0 loss config
+        self.x0_loss_weight = config.x0_loss_weight
+        self.sparsity_loss_weight = config.sparsity_loss_weight
+        
+        # Negative sample config
+        self.negative_sample_weight = config.negative_sample_weight
         
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
@@ -351,9 +375,8 @@ class DiffusionHeatmapHead(nn.Module):
             sample_max = gt_heatmap.flatten(1).max(dim=1).values  # (B,)
             is_negative = (sample_max < 0.01).float()  # (B,)
             
-            # 负样本扩散 loss 权重降低到 0.1（避免扩散头学习"恢复全零"）
-            # 正样本权重 1.0，负样本权重 0.1
-            sample_weight = 1.0 - 0.9 * is_negative  # (B,) = 1.0 or 0.1
+            # 负样本扩散 loss 权重（可配置，默认 0.3，之前是 0.1）
+            sample_weight = 1.0 - (1.0 - self.negative_sample_weight) * is_negative  # (B,)
             # 重塑为 (B, 1, 1, 1) 以广播到空间维度
             sample_weight = sample_weight.view(-1, 1, 1, 1)
         
@@ -378,7 +401,47 @@ class DiffusionHeatmapHead(nn.Module):
         
         total_loss = diffusion_loss
         
-        # ==================== Visibility Loss ====================
+        # ==================== B1: x0 重构损失 ====================
+        # 从噪声预测反推 x0 估计，直接监督输出质量
+        # epsilon loss 只关心噪声预测是否准确，x0 loss 直接关心重构热力图是否像 GT
+        x0_loss_val = 0.0
+        sparsity_loss_val = 0.0
+        neg_zero_loss_val = 0.0
+        
+        if self.x0_loss_weight > 0 or self.sparsity_loss_weight > 0:
+            with torch.no_grad():
+                alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
+                alpha_bar = alpha_bar.view(-1, 1, 1, 1)
+            
+            # x0 估计: x0 = (noisy - sqrt(1-alpha_bar) * noise_pred) / sqrt(alpha_bar)
+            x0_hat = (noisy_heatmap - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
+            x0_hat = x0_hat.clamp(-1, 1)
+            
+            if self.x0_loss_weight > 0:
+                # x0 重构损失：直接监督重构质量（带样本权重）
+                x0_loss = F.mse_loss(x0_hat * sample_weight, gt_normalized * sample_weight)
+                x0_loss_val = x0_loss.item()
+                total_loss = total_loss + self.x0_loss_weight * x0_loss
+            
+            # ==================== B2: L1 稀疏性正则化 ====================
+            # 鼓励 x0 估计中大部分像素为 0（在 [0,1] 空间中）
+            if self.sparsity_loss_weight > 0:
+                x0_denorm = (x0_hat + 1) / 2  # 还原到 [0, 1]
+                sparsity_loss = x0_denorm.mean()  # 鼓励整体值接近 0
+                sparsity_loss_val = sparsity_loss.item()
+                total_loss = total_loss + self.sparsity_loss_weight * sparsity_loss
+            
+            # ==================== B4: 负样本显式零目标损失 ====================
+            # 对负样本（GT=全零），额外约束 x0 应为全 -1（即 [0,1] 空间中的全 0）
+            if is_negative.any():
+                neg_mask = is_negative.bool()
+                neg_x0 = x0_hat[neg_mask]
+                neg_target = torch.full_like(neg_x0, -1.0)  # [-1,1] 空间中，全零 = -1
+                neg_zero_loss = F.mse_loss(neg_x0, neg_target)
+                neg_zero_loss_val = neg_zero_loss.item()
+                total_loss = total_loss + 0.5 * neg_zero_loss
+        
+        # ==================== Visibility Loss (B3: 增强权重) ====================
         # 可见性预测：判断当前样本的 GT 热力图是否有峰值
         visibility_loss_val = 0.0
         if self.use_visibility_head:
@@ -412,6 +475,9 @@ class DiffusionHeatmapHead(nn.Module):
             'base_loss': base_loss.item(),          # 标准 MSE
             'focal_loss': focal_loss.item(),        # 峰值加权 MSE
             'visibility_loss': visibility_loss_val, # 可见性 BCE loss
+            'x0_loss': x0_loss_val,                 # x0 重构损失
+            'sparsity_loss': sparsity_loss_val,     # L1 稀疏性损失
+            'neg_zero_loss': neg_zero_loss_val,     # 负样本零目标损失
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
@@ -456,11 +522,11 @@ class DiffusionHeatmapHead(nn.Module):
         # 是否使用 CFG
         do_cfg = use_cfg and self.cfg_scale > 1.0
         
-        # Set scheduler timesteps
-        self.noise_scheduler.set_timesteps(self.config.num_inference_steps)
+        # Set scheduler timesteps (use DDIM for sharper, deterministic inference)
+        self.inference_scheduler.set_timesteps(self.config.num_inference_steps)
         
         # Iterative denoising
-        for t in self.noise_scheduler.timesteps:
+        for t in self.inference_scheduler.timesteps:
             timestep_batch = t.unsqueeze(-1).repeat(batch_size).to(device)
             
             if do_cfg:
@@ -493,8 +559,8 @@ class DiffusionHeatmapHead(nn.Module):
                     spatial_features=spatial_features,
                 )
             
-            # Remove noise (reverse diffusion step)
-            noisy_heatmap = self.noise_scheduler.step(
+            # Remove noise (reverse diffusion step) - DDIM is deterministic
+            noisy_heatmap = self.inference_scheduler.step(
                 model_output=noise_pred,
                 timestep=t,
                 sample=noisy_heatmap,
@@ -504,7 +570,13 @@ class DiffusionHeatmapHead(nn.Module):
         heatmap = self._denormalize_heatmap(noisy_heatmap)
         
         # Remove channel dimension: (B, 1, Hm, Wm) -> (B, Hm, Wm)
-        return heatmap.squeeze(1)
+        heatmap = heatmap.squeeze(1)
+        
+        # Post-denoising sharpening: spatial softmax with temperature
+        if self.sharpen_temperature > 0:
+            heatmap = self._sharpen_heatmap(heatmap, self.sharpen_temperature)
+        
+        return heatmap
     
     def _normalize_heatmap(self, heatmap: torch.Tensor) -> torch.Tensor:
         """
@@ -542,6 +614,25 @@ class DiffusionHeatmapHead(nn.Module):
         """
         recovered = (heatmap + 1) / 2
         return recovered.clamp(0, 1)
+    
+    def _sharpen_heatmap(self, heatmap: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+        """
+        空间 Softmax 锐化后处理：集中能量到峰值区域。
+        
+        将热力图通过低温度 softmax 转换，使峰值更突出、背景更接近 0。
+        temperature=0.1 时，只有峰值附近 ~10px 区域被保留。
+        
+        Args:
+            heatmap: (B, H, W) heatmap in [0, 1]
+            temperature: Softmax temperature (lower = sharper)
+            
+        Returns:
+            (B, H, W) sharpened heatmap (sums to 1 per sample)
+        """
+        B, H, W = heatmap.shape
+        flat = heatmap.view(B, -1)  # (B, H*W)
+        sharp = F.softmax(flat / temperature, dim=-1)
+        return sharp.view(B, H, W)
     
     def forward_llm_only(
         self,
