@@ -428,7 +428,9 @@ class DiffusionHeatmapHead(nn.Module):
             
             if self.x0_loss_weight > 0:
                 # x0 重构损失：直接监督重构质量（带样本权重）
-                x0_loss = F.mse_loss(x0_hat * sample_weight, gt_normalized * sample_weight)
+                # 注意：用 w × MSE 而非 MSE(w*x, w*y)，后者会导致权重变成 w²
+                per_pixel_x0_mse = (x0_hat - gt_normalized) ** 2  # (B, 1, H, W)
+                x0_loss = (sample_weight * per_pixel_x0_mse).mean()
                 x0_loss_val = x0_loss.item()
                 total_loss = total_loss + self.x0_loss_weight * x0_loss
             
@@ -440,31 +442,56 @@ class DiffusionHeatmapHead(nn.Module):
                 sparsity_loss_val = sparsity_loss.item()
                 total_loss = total_loss + self.sparsity_loss_weight * sparsity_loss
             
-            # ==================== B4: 负样本显式零目标损失 ====================
+            # ==================== B4: 负样本显式零目标损失（SNR 门控） ====================
             # 对负样本（GT=全零），额外约束 x0 应为全 -1（即 [0,1] 空间中的全 0）
+            # 同样使用 SNR 门控：高时间步的 x0_hat 接近随机噪声，强加零约束会产生噪声梯度
             if is_negative.any():
                 neg_mask = is_negative.bool()
-                neg_x0 = x0_hat[neg_mask]
-                neg_target = torch.full_like(neg_x0, -1.0)  # [-1,1] 空间中，全零 = -1
-                neg_zero_loss = F.mse_loss(neg_x0, neg_target)
-                neg_zero_loss_val = neg_zero_loss.item()
-                total_loss = total_loss + 0.5 * neg_zero_loss
+                
+                # SNR 门控：只对 x0 估计质量好的样本施加零约束
+                with torch.no_grad():
+                    alpha_flat_neg = alpha_bar.view(batch_size)
+                    snr_neg = alpha_flat_neg / (1 - alpha_flat_neg + 1e-8)
+                    high_snr_neg = neg_mask & (snr_neg > 1.0)
+                
+                if high_snr_neg.any():
+                    neg_x0 = x0_hat[high_snr_neg]
+                    neg_target = torch.full_like(neg_x0, -1.0)  # [-1,1] 空间中，全零 = -1
+                    neg_zero_loss = F.mse_loss(neg_x0, neg_target)
+                    neg_zero_loss_val = neg_zero_loss.item()
+                    total_loss = total_loss + 0.5 * neg_zero_loss
         
-        # ==================== Peak Distance Loss (Multi-Peak Aware) ====================
+        # ==================== Peak Distance Loss (Multi-Peak Aware, SNR-gated) ====================
         # 多峰感知的可微分峰值距离损失：
         # 1. NMS 检测 GT 中的所有峰值（非微分）
         # 2. 对每个 GT 峰值创建高斯注意力窗口
         # 3. 在窗口内对预测 x0 做 soft-argmax → 提取对应预测位置
         # 4. 计算每峰的 L2 距离并平均
-        # 正确处理多峰：避免全局 soft-argmax 返回"重心"的问题
+        #
+        # SNR 门控：只在 x0 估计质量足够好时（低时间步，高 SNR）计算
+        # 高时间步的 x0_hat 接近随机噪声，peak 位置无意义，梯度有害
         peak_dist_loss_val = 0.0
         
         if self.peak_distance_loss_weight > 0 and x0_hat is not None:
-            peak_dist_loss, peak_dist_loss_val = self._multi_peak_distance_loss(
-                x0_hat, gt_heatmap, is_negative
-            )
-            if peak_dist_loss.requires_grad:
-                total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
+            with torch.no_grad():
+                # SNR = alpha_bar / (1 - alpha_bar)
+                # 只对 SNR > 1 的样本（即 alpha_bar > 0.5，约 t < T/2）计算
+                # 这些样本的 x0 估计信噪比足够高，peak 位置有意义
+                alpha_flat = alpha_bar.view(batch_size)  # (B,) 安全的 reshape
+                snr = alpha_flat / (1 - alpha_flat + 1e-8)  # (B,)
+                snr_mask = (snr > 1.0)  # alpha_bar > 0.5
+            
+            if snr_mask.any():
+                # 只对高 SNR 样本计算 peak loss
+                snr_x0 = x0_hat[snr_mask]
+                snr_gt = gt_heatmap[snr_mask]
+                snr_is_neg = is_negative[snr_mask]
+                
+                peak_dist_loss, peak_dist_loss_val = self._multi_peak_distance_loss(
+                    snr_x0, snr_gt, snr_is_neg
+                )
+                if peak_dist_loss.requires_grad:
+                    total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
         
         # ==================== Visibility Loss (B3: 增强权重) ====================
         # 可见性预测：判断当前样本的 GT 热力图是否有峰值
