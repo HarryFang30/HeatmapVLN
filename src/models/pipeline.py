@@ -100,6 +100,12 @@ class VLNPipelineConfig:
     # Image encoder backbone selection
     heatmap_image_encoder_use_pretrained: bool = False  # Use pretrained ResNet-18 (vs lightweight CNN)
     
+    # Multi-layer feature extraction (CVPR 2025 best practice)
+    # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
+    multi_layer_features: bool = False
+    feature_layer_indices: Optional[List[int]] = None  # e.g. [4, 18, 32]
+    feature_fusion_method: str = "weighted_sum"  # "weighted_sum" or "concat_project"
+    
     # LoRA configuration for Qwen3-VL fine-tuning
     use_lora: bool = False           # Enable LoRA on Qwen3-VL
     lora_rank: int = 16              # LoRA rank
@@ -150,6 +156,70 @@ class VLNPipelineConfig:
     verbose: bool = False
 
 
+class MultiLayerFusion(nn.Module):
+    """
+    Multi-layer feature fusion module.
+    
+    Fuses hidden states from multiple LLM layers into a single representation.
+    Based on CVPR 2025 "Multi-Layer Visual Feature Fusion in Multimodal LLMs":
+    - External Direct Fusion (weighted sum) is consistently the best strategy
+    - Select one layer from each representational similarity stage
+    
+    Supports two fusion methods:
+    - "weighted_sum": Learnable per-layer weights, same output dim as input
+    - "concat_project": Concatenate all layers, project back to hidden_dim
+    """
+    
+    def __init__(self, hidden_dim: int, num_layers: int, method: str = "weighted_sum"):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.method = method
+        
+        if method == "weighted_sum":
+            # Learnable weights for each layer (initialized to equal weights)
+            self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
+        elif method == "concat_project":
+            # Concatenate + project back
+            self.projector = nn.Sequential(
+                nn.Linear(hidden_dim * num_layers, hidden_dim),
+                nn.GELU(),
+            )
+        else:
+            raise ValueError(f"Unknown fusion method: {method}")
+        
+        logger.info(
+            f"MultiLayerFusion: {num_layers} layers, method={method}, "
+            f"hidden_dim={hidden_dim}"
+        )
+    
+    def forward(self, hidden_states_list: list) -> torch.Tensor:
+        """
+        Fuse multiple hidden states into one.
+        
+        Args:
+            hidden_states_list: List of tensors, each (B, seq_len, hidden_dim)
+                                or (B, hidden_dim) for pooled states
+        Returns:
+            Fused tensor with same shape as each input
+        """
+        if self.method == "weighted_sum":
+            # Softmax over layer weights for stable training
+            weights = torch.softmax(self.layer_weights, dim=0)
+            fused = sum(w * hs for w, hs in zip(weights, hidden_states_list))
+            return fused
+        elif self.method == "concat_project":
+            # Concatenate along feature dimension
+            concatenated = torch.cat(hidden_states_list, dim=-1)
+            return self.projector(concatenated)
+    
+    def get_layer_weights(self) -> list:
+        """Return current fusion weights (for logging)."""
+        with torch.no_grad():
+            weights = torch.softmax(self.layer_weights, dim=0)
+            return weights.cpu().tolist()
+
+
 class VLNPipeline(nn.Module):
     """
     VLN Pipeline with Qwen3-VL.
@@ -185,12 +255,31 @@ class VLNPipeline(nn.Module):
             lora_num_layers=config.lora_num_layers,
             lora_dropout=config.lora_dropout,
             lora_target_modules=config.lora_target_modules,
+            # Multi-layer feature extraction
+            multi_layer_features=config.multi_layer_features,
+            feature_layer_indices=config.feature_layer_indices,
         )
         self.qwen3_vl = Qwen3VLIntegration(qwen_config)
         if config.enable_packing:
             logger.info(f"✓ Qwen3-VL integration initialized (packing enabled, max_seq={config.max_seq_length})")
         else:
             logger.info(f"✓ Qwen3-VL integration initialized")
+        if config.multi_layer_features and config.feature_layer_indices:
+            logger.info(f"  Multi-layer features: layers {config.feature_layer_indices}, fusion={config.feature_fusion_method}")
+        
+        # ==================== Multi-Layer Fusion (before projection) ====================
+        self.multi_layer_fusion = None
+        if config.multi_layer_features and config.feature_layer_indices:
+            num_feature_layers = len(config.feature_layer_indices)
+            self.multi_layer_fusion = MultiLayerFusion(
+                hidden_dim=config.llm_hidden_dim,
+                num_layers=num_feature_layers,
+                method=config.feature_fusion_method,
+            ).to(device=self.device, dtype=config.dtype)
+            logger.info(
+                f"✓ Multi-layer fusion: {num_feature_layers} layers → {config.llm_hidden_dim}d "
+                f"(method={config.feature_fusion_method})"
+            )
         
         # ==================== LLM Projector ====================
         self.llm_projector = nn.Sequential(
@@ -408,8 +497,17 @@ class VLNPipeline(nn.Module):
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states from Qwen3-VL")
         
-        # Move to device
-        raw_hidden_states = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
+        # ==================== Step 1.5: Multi-Layer Fusion ====================
+        if isinstance(raw_hidden_states, list) and self.multi_layer_fusion is not None:
+            # Multi-layer: fuse before projecting
+            raw_hidden_states = [hs.to(device=self.device, dtype=self.config.dtype) for hs in raw_hidden_states]
+            raw_hidden_states = self.multi_layer_fusion(raw_hidden_states)
+        else:
+            if isinstance(raw_hidden_states, list):
+                # Fallback: use last layer if fusion module not available
+                raw_hidden_states = raw_hidden_states[-1]
+            # Move to device
+            raw_hidden_states = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
         
         # ==================== Step 2: Project Hidden States ====================
         llm_tokens = self.llm_projector(raw_hidden_states)  # [B, seq_len, llm_token_dim]
@@ -628,13 +726,27 @@ class VLNPipeline(nn.Module):
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states from Qwen3-VL (packed mode)")
         
-        # Move to device
-        raw_hidden_states = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
+        # ==================== Step 1.5: Multi-Layer Fusion (packed mode) ====================
+        if isinstance(raw_hidden_states, list) and self.multi_layer_fusion is not None:
+            raw_hidden_states = [hs.to(device=self.device, dtype=self.config.dtype) for hs in raw_hidden_states]
+            # Ensure all have same shape
+            for i in range(len(raw_hidden_states)):
+                if raw_hidden_states[i].dim() == 2:
+                    raw_hidden_states[i] = raw_hidden_states[i].unsqueeze(1)
+            raw_hidden_states = self.multi_layer_fusion(raw_hidden_states)
+        else:
+            if isinstance(raw_hidden_states, list):
+                raw_hidden_states = raw_hidden_states[-1]
+            raw_hidden_states = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
+            if raw_hidden_states.dim() == 2:
+                raw_hidden_states = raw_hidden_states.unsqueeze(1)
         
-        # 对于 packed mode，hidden_states 是 (B, hidden_dim)，需要 unsqueeze 成 (B, 1, hidden_dim)
-        # 以匹配下游 heads 的期望输入格式
-        if raw_hidden_states.dim() == 2:
-            raw_hidden_states = raw_hidden_states.unsqueeze(1)  # (B, 1, hidden_dim)
+        # Fuse vision hidden states similarly
+        if isinstance(vision_hidden_states, list) and self.multi_layer_fusion is not None:
+            vision_hidden_states = [hs.to(device=self.device, dtype=self.config.dtype) for hs in vision_hidden_states]
+            vision_hidden_states = self.multi_layer_fusion(vision_hidden_states)
+        elif isinstance(vision_hidden_states, list):
+            vision_hidden_states = vision_hidden_states[-1]
         
         # ==================== Step 2: Project Hidden States ====================
         llm_tokens = self.llm_projector(raw_hidden_states)  # [B, 1, llm_token_dim]
@@ -645,6 +757,8 @@ class VLNPipeline(nn.Module):
         # ==================== Step 3: Heatmap Generation ====================
         # 使用 vision_hidden_states 如果可用（更丰富的视觉信息）
         if vision_hidden_states is not None:
+            if not isinstance(vision_hidden_states, torch.Tensor):
+                vision_hidden_states = vision_hidden_states  # already fused above
             vision_hidden_states = vision_hidden_states.to(device=self.device, dtype=self.config.dtype)
             llm_tokens_for_heatmap = self.llm_projector(vision_hidden_states)
         else:

@@ -127,6 +127,11 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
         heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
         
+        # Multi-layer feature extraction
+        multi_layer_features=llm_cfg.get('multi_layer_features', False),
+        feature_layer_indices=llm_cfg.get('feature_layer_indices', None),
+        feature_fusion_method=llm_cfg.get('feature_fusion_method', 'weighted_sum'),
+        
         # LoRA
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),

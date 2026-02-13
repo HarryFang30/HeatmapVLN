@@ -71,6 +71,15 @@ model:
     max_seq_length: 8192
     spatial_merge_size: 2
     
+    # 多层特征提取 (CVPR 2025 best practice)
+    # 从 LLM 的不同深度提取特征并融合，同时保留空间和语义信息
+    # Layer 4  = DeepStack 注入后的早期特征（空间信息最丰富）
+    # Layer 18 = 中间层（空间-语义平衡，~50% depth）
+    # Layer 32 = 深层（语义信息丰富，用于高层理解）
+    multi_layer_features: true
+    feature_layer_indices: [4, 18, 32]
+    feature_fusion_method: weighted_sum   # "weighted_sum" 或 "concat_project"
+    
     # LoRA 配置 — 开启以让 LLM 产生更适合空间推理的特征
     # 扩展覆盖范围：空间理解在 VLM 中间层(12-24层)形成，仅最后4层不够
     use_lora: true
@@ -190,9 +199,10 @@ training:
       train_future: false
       train_action: false      # 不训练动作
       trainable_modules:
-        - history_heatmap_head # 训练热力图头
-        - llm_projector        # 训练投影层
-        - lora                 # 训练 LoRA 层（微调 LLM 最后 4 层）
+        - history_heatmap_head    # 训练热力图头
+        - llm_projector           # 训练投影层
+        - multi_layer_fusion      # 训练多层融合权重
+        - lora                    # 训练 LoRA 层（微调 LLM 最后 8 层）
       frozen_modules:
         - qwen3_vl             # 冻结 VLM（LoRA 层除外）
         - future_heatmap_head
@@ -216,6 +226,7 @@ optim:
   transformer_action_lr: 1.0e-4
   progress_lr: 1.0e-4
   llm_projector_lr: 3.0e-5         # 5e-5 → 3e-5，更稳定
+  multi_layer_fusion_lr: 1.0e-4    # 融合模块只有少量参数，可以用较高 LR
   lora_lr: 1.0e-5                  # LoRA 使用极低 LR
 
   # 正则化（增强）

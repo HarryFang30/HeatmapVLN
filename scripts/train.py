@@ -657,6 +657,11 @@ def build_model(cfg: Dict) -> nn.Module:
         # Image encoder backbone (pretrained ResNet-18 vs lightweight CNN)
         heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
         
+        # Multi-layer feature extraction
+        multi_layer_features=llm_cfg.get('multi_layer_features', False),
+        feature_layer_indices=llm_cfg.get('feature_layer_indices', None),
+        feature_fusion_method=llm_cfg.get('feature_fusion_method', 'weighted_sum'),
+        
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
@@ -777,6 +782,12 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
         if hasattr(model, 'llm_projector'):
             freeze_module(model.llm_projector, freeze=False)
             logger.info("  ✓ Unfrozen: llm_projector")
+    
+    # Multi-layer Fusion module
+    if 'multi_layer_fusion' in trainable:
+        if hasattr(model, 'multi_layer_fusion') and model.multi_layer_fusion is not None:
+            freeze_module(model.multi_layer_fusion, freeze=False)
+            logger.info("  ✓ Unfrozen: multi_layer_fusion")
     
     # Qwen3-VL: 冻结基座，但保留 LoRA 参数可训练
     if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
@@ -925,6 +936,14 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         if groups:
             param_groups.extend(groups)
             print(f"  Param group: llm_projector (lr={proj_lr}, wd={projector_wd})")
+    
+    # Multi-layer Fusion module
+    fusion_lr = optim_cfg.get('multi_layer_fusion_lr', 1e-4)
+    if hasattr(model, 'multi_layer_fusion') and model.multi_layer_fusion is not None:
+        groups = get_param_groups_with_wd(model.multi_layer_fusion, fusion_lr, 'multi_layer_fusion', projector_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: multi_layer_fusion (lr={fusion_lr}, wd={projector_wd})")
     
     # Qwen3-VL LoRA parameters (very low LR for backbone fine-tuning)
     lora_lr = optim_cfg.get('lora_lr', 1e-5)
@@ -1264,6 +1283,14 @@ def train_one_epoch(
                 # 诊断信息记录（固定间隔）
                 diag_interval = cfg['log'].get('diag_interval', 100)
                 if global_step % diag_interval == 0:
+                    # 多层融合权重诊断
+                    if hasattr(model, 'multi_layer_fusion') and model.multi_layer_fusion is not None:
+                        fusion_weights = model.multi_layer_fusion.get_layer_weights()
+                        layer_indices = cfg['model']['llm'].get('feature_layer_indices', [])
+                        for i, (li, w) in enumerate(zip(layer_indices, fusion_weights)):
+                            tb_writer.add_scalar(f'diag/fusion_weight_layer{li}', w, actual_step)
+                        logger.info(f"[DIAG-FUSION] layer_weights: {dict(zip(layer_indices, [f'{w:.3f}' for w in fusion_weights]))}")
+                    
                     # 热力图输出诊断 - 检查是否坍缩为全黑
                     if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
                         pred_hm = output['history_heatmaps'].detach()

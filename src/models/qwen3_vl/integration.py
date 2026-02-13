@@ -71,7 +71,12 @@ class Qwen3VLConfig:
     temperature: float = 0.7
     
     # Hidden state extraction
-    hidden_layer_for_features: int = -1  # -1 = last layer
+    hidden_layer_for_features: int = -1  # -1 = last layer (deprecated when multi_layer_features=True)
+    
+    # Multi-layer feature extraction (CVPR 2025 best practice)
+    # 从 LLM 的不同深度提取特征并融合，保留空间+语义信息
+    multi_layer_features: bool = False
+    feature_layer_indices: Optional[List[int]] = None  # e.g. [4, 18, 32] for 36-layer LLM
     
     # Video processing
     max_video_frames: int = 16  # Maximum frames to process
@@ -391,32 +396,56 @@ class Qwen3VLIntegration(nn.Module):
         )
         
         if return_hidden_states:
-            layer_idx = self.config.hidden_layer_for_features
-            if layer_idx == -1:
-                layer_idx = len(outputs.hidden_states) - 1
-            packed_hidden_states = outputs.hidden_states[layer_idx]  # (1, total_seq_len, hidden_dim)
+            if self.config.multi_layer_features and self.config.feature_layer_indices:
+                # Multi-layer extraction for packed mode
+                multi_packed = []
+                for li in self.config.feature_layer_indices:
+                    idx = li if li >= 0 else len(outputs.hidden_states) + li
+                    idx = min(idx, len(outputs.hidden_states) - 1)
+                    multi_packed.append(outputs.hidden_states[idx])
+                packed_hidden_states = multi_packed  # List[(1, total_seq_len, hidden_dim)]
+            else:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                packed_hidden_states = outputs.hidden_states[layer_idx]  # (1, total_seq_len, hidden_dim)
         else:
             packed_hidden_states = None
         
         # 拆分 packed hidden states
         if packed_hidden_states is not None and PACKING_AVAILABLE:
-            # 提取每个样本的表示（使用 last token pooling）
-            sample_hidden_states = split_packed_hidden_states(
-                packed_hidden_states, seq_lens, pool_method="last"
-            )
-            
-            # 提取视觉 token hidden states
-            vision_hidden_states = split_packed_vision_hidden_states(
-                packed_hidden_states, input_ids, seq_lens
-            )
+            if isinstance(packed_hidden_states, list):
+                # Multi-layer: split each layer separately
+                multi_sample_hs = []
+                multi_vision_hs = []
+                for phs in packed_hidden_states:
+                    sample_hs = split_packed_hidden_states(
+                        phs, seq_lens, pool_method="last"
+                    )
+                    vision_hs = split_packed_vision_hidden_states(
+                        phs, input_ids, seq_lens
+                    )
+                    multi_sample_hs.append(sample_hs)
+                    multi_vision_hs.append(vision_hs)
+                sample_hidden_states = multi_sample_hs  # List[(num_samples, hidden_dim)]
+                vision_hidden_states = multi_vision_hs  # List[(num_samples, max_vision_tokens, hidden_dim)]
+            else:
+                # 提取每个样本的表示（使用 last token pooling）
+                sample_hidden_states = split_packed_hidden_states(
+                    packed_hidden_states, seq_lens, pool_method="last"
+                )
+                # 提取视觉 token hidden states
+                vision_hidden_states = split_packed_vision_hidden_states(
+                    packed_hidden_states, input_ids, seq_lens
+                )
         else:
             sample_hidden_states = packed_hidden_states
             vision_hidden_states = None
         
         return {
-            "hidden_states": sample_hidden_states,  # (num_samples, hidden_dim)
-            "vision_hidden_states": vision_hidden_states,  # (num_samples, max_vision_tokens, hidden_dim)
-            "packed_hidden_states": packed_hidden_states,  # (1, total_seq_len, hidden_dim) 原始输出
+            "hidden_states": sample_hidden_states,  # (num_samples, hidden_dim) or List
+            "vision_hidden_states": vision_hidden_states,  # (num_samples, max_vision_tokens, hidden_dim) or List
+            "packed_hidden_states": packed_hidden_states,  # original packed output
             "seq_lens": seq_lens,
             "num_samples": num_samples,
         }
@@ -600,19 +629,36 @@ class Qwen3VLIntegration(nn.Module):
         )
         
         if return_hidden_states:
-            layer_idx = self.config.hidden_layer_for_features
-            if layer_idx == -1:
-                layer_idx = len(outputs.hidden_states) - 1
-            hidden_states = outputs.hidden_states[layer_idx]  # (B, seq_len, hidden_dim)
+            if self.config.multi_layer_features and self.config.feature_layer_indices:
+                # Multi-layer extraction: return list of hidden states from specified layers
+                multi_hidden = []
+                for li in self.config.feature_layer_indices:
+                    idx = li if li >= 0 else len(outputs.hidden_states) + li
+                    idx = min(idx, len(outputs.hidden_states) - 1)
+                    multi_hidden.append(outputs.hidden_states[idx])
+                hidden_states = multi_hidden  # List[(B, seq_len, hidden_dim)]
+            else:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                hidden_states = outputs.hidden_states[layer_idx]  # (B, seq_len, hidden_dim)
         else:
             hidden_states = None
         
         # Extract vision token hidden states for each sample
         vision_hidden_states = None
         if hidden_states is not None:
-            vision_hidden_states = self._extract_vision_hidden_states(
-                hidden_states, input_ids
-            )
+            if isinstance(hidden_states, list):
+                # Multi-layer: extract vision tokens from each layer
+                vision_hidden_list = []
+                for hs in hidden_states:
+                    vis_hs = self._extract_vision_hidden_states(hs, input_ids)
+                    vision_hidden_list.append(vis_hs)
+                vision_hidden_states = vision_hidden_list  # List[(B, num_vision_tokens, hidden_dim)]
+            else:
+                vision_hidden_states = self._extract_vision_hidden_states(
+                    hidden_states, input_ids
+                )
         
         return hidden_states, vision_hidden_states
     
@@ -661,19 +707,34 @@ class Qwen3VLIntegration(nn.Module):
         )
         
         if return_hidden_states:
-            layer_idx = self.config.hidden_layer_for_features
-            if layer_idx == -1:
-                layer_idx = len(outputs.hidden_states) - 1
-            hidden_states = outputs.hidden_states[layer_idx]
+            if self.config.multi_layer_features and self.config.feature_layer_indices:
+                multi_hidden = []
+                for li in self.config.feature_layer_indices:
+                    idx = li if li >= 0 else len(outputs.hidden_states) + li
+                    idx = min(idx, len(outputs.hidden_states) - 1)
+                    multi_hidden.append(outputs.hidden_states[idx])
+                hidden_states = multi_hidden
+            else:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                hidden_states = outputs.hidden_states[layer_idx]
         else:
             hidden_states = None
         
         # Extract vision token hidden states
         vision_hidden_states = None
         if hidden_states is not None:
-            vision_hidden_states = self._extract_vision_hidden_states(
-                hidden_states, input_ids
-            )
+            if isinstance(hidden_states, list):
+                vision_hidden_list = []
+                for hs in hidden_states:
+                    vis_hs = self._extract_vision_hidden_states(hs, input_ids)
+                    vision_hidden_list.append(vis_hs)
+                vision_hidden_states = vision_hidden_list
+            else:
+                vision_hidden_states = self._extract_vision_hidden_states(
+                    hidden_states, input_ids
+                )
         
         return hidden_states, vision_hidden_states
     
@@ -772,6 +833,16 @@ class Qwen3VLIntegration(nn.Module):
         )[0]
         
         return generated_text
+    
+    def is_multi_layer(self) -> bool:
+        """Check if multi-layer feature extraction is enabled."""
+        return self.config.multi_layer_features and bool(self.config.feature_layer_indices)
+    
+    def get_num_feature_layers(self) -> int:
+        """Get number of feature layers being extracted."""
+        if self.is_multi_layer():
+            return len(self.config.feature_layer_indices)
+        return 1
     
     def _extract_hidden_from_generation(
         self,
