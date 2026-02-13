@@ -170,20 +170,26 @@ tensorboard --logdir=/root/tf-logs/latest --port=6006
 |:-----|:-----|:-----|
 | **训练损失** | `train/loss` | 总损失 |
 | | `train/history_heatmap_loss` | 历史热力图损失 |
-| | `train/history_heatmap_base_loss` | base MSE 损失 |
-| | `train/history_heatmap_focal_loss` | focal 加权损失 |
-| | `train/history_heatmap_x0_loss` | x0 重构损失 |
-| | `train/history_heatmap_sparsity_loss` | 稀疏性正则化损失 |
-| | `train/history_heatmap_peak_dist_loss` | 峰值距离损失 |
-| | `train/history_heatmap_visibility_loss` | 可见性 BCE 损失 |
 | | `train/trajectory_loss` | 轨迹损失 |
 | | `train/progress_loss` | 进度损失 |
-| | `train/stop_loss` | 停止预测损失 |
 | **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
+| | `diag/pred_heatmap_mean` | 预测均值 |
+| | `diag/pred_heatmap_nonzero_ratio` | 非零像素比例 |
+| | `diag/heatmap_base_loss` | base MSE 损失 |
+| | `diag/heatmap_focal_loss` | focal 加权损失 |
 | | `diag/heatmap_focal_ratio` | focal/base 比值 |
-| | `diag/heatmap_noise_std` | 预测噪声标准差 |
+| | `diag/heatmap_x0_loss` | x0 重构损失 |
+| | `diag/heatmap_sparsity_loss` | 稀疏性正则化损失 |
+| | `diag/heatmap_peak_dist_loss` | 峰值距离损失 |
+| | `diag/heatmap_visibility_loss` | 可见性 BCE 损失 |
+| | `diag/hm_peak_distance` | 峰值位置误差（像素） |
+| | `diag/hm_peak_iou` | 峰值 IoU |
+| | `diag/hm_multi_peak_distance` | 多峰平均距离 |
+| | `diag/hm_peak_recall_5px` | 5像素内召回率 |
 | **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
 | | `diag/trajectory_fde` | 终点位移误差 |
+| **进度诊断** | `diag/progress_mae` | 进度 MAE |
+| **资源监控** | `diag/gpu_memory_gb` | GPU 显存使用量 |
 
 </details>
 
@@ -272,7 +278,9 @@ python scripts/evaluate.py \
 
 ### 热力图生成模块
 
-基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史相机位置在当前观测中的投影分布。
+基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史相机位置在当前观测中的投影分布。支持两种热力图：
+- **历史热力图** (History Heatmap)：历史相机位置在当前视角的投影
+- **未来热力图** (Future Heatmap)：预测的未来位置在当前视角的投影（可选）
 
 采用**双路径条件注入**架构，解决将整个 LLM token 序列压缩为单向量的信息瓶颈：
 
@@ -284,8 +292,8 @@ LLM Tokens (B, ~900, 1024)
     │                                                      ↓
     └─→ LinearProj → seq_cond (B, ~900, 1024)        ──→ Cross-Attention
                                                            ↓
-Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2D
-                                                           ↓
+Current Frame → CNN Encoder (ResNet-18) → img_cond → Fusion ──→ ConditionalUnet2D
+                                                           ↓          ↓
                                                      DDPM + CFG → Heatmap [64×64]
                                                            ↓
                                                    Visibility Head → [0, 1] (是否可见)
@@ -302,11 +310,14 @@ Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2
 | **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=2.0) |
 | **Focal Loss** | 70% 标准 MSE + 30% 峰值加权，关注关键区域 |
 | **x0 重构损失** | 直接监督输出质量，补充 epsilon loss |
-| **峰值距离损失** | 可微分 Soft-Argmax，直接优化峰值位置准确度 |
-| **负样本零目标损失** | SNR 门控：只对高质量样本施加零约束 |
-| **可见性预测头** | 预测目标是否可见，消除假阳性 |
-| **空间 Softmax 锐化** | 推理后处理，集中能量到峰值区域 |
+| **稀疏性正则化** | L1 正则化，鼓励大部分像素为 0 |
+| **峰值距离损失** | 可微分 Soft-Argmax + NMS，多峰感知优化峰值位置准确度 |
+| **负样本零目标损失** | SNR 门控：只对高质量样本（低时间步）施加零约束 |
+| **可见性预测头** | 3层MLP预测目标是否可见，消除假阳性 |
+| **空间 Softmax 锐化** | 推理后处理，温度 0.1 集中能量到峰值区域 |
 | **LoRA 微调 (可选)** | 对 Qwen3-VL 最后 N 层加 LoRA，增强空间推理能力 |
+| **轨迹增强** | 训练时随机旋转/缩放轨迹，提升泛化能力 |
+| **FGR2R 子指令** | 支持动态子指令，适应子序列采样 |
 
 ### 轨迹预测模块
 
@@ -371,6 +382,8 @@ data:
     min_subsequence_length: 30
     subsequence_samples_per_clip: 5
     samples_per_clip: 30
+    use_subinstruction: true     # 启用 FGR2R 子指令
+    enable_trajectory_augmentation: true  # 轨迹增强（旋转/缩放）
 ```
 
 **数据量计算：**
@@ -493,6 +506,65 @@ optim:
 
 ```bash
 python scripts/train.py --config configs/train_config.yaml --auto-resume
+```
+
+</details>
+
+<details>
+<summary><b>如何启用/禁用特定预测头？</b></summary>
+
+```yaml
+# 热力图头
+model:
+  heatmap_head:
+    enable_history: true    # 历史热力图
+    enable_future: false    # 未来热力图
+
+# 动作头
+model:
+  action_head:
+    enable: true
+    type: transformer      # transformer (推荐) 或 legacy
+
+# 停止预测头 (legacy，已弃用)
+model:
+  stop_head:
+    enable: true
+
+# 进度预测头
+model:
+  progress_head:
+    enable: true
+```
+
+</details>
+
+<details>
+<summary><b>Diffusion 训练/推理步数如何配置？</b></summary>
+
+推荐配置（4:1 比例）：
+```yaml
+model:
+  heatmap_head:
+    num_train_timesteps: 200    # 训练步数
+    num_inference_steps: 50     # 推理步数 (训练步数的 1/4)
+```
+
+</details>
+
+<details>
+<summary><b>如何配置 LoRA 微调？</b></summary>
+
+```yaml
+model:
+  llm:
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_num_layers: 4      # 最后 4 层
+
+optim:
+  lora_lr: 1.0e-5          # LoRA 使用极低学习率
 ```
 
 </details>
