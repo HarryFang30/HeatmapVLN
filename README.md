@@ -31,9 +31,11 @@ HeatmapVLN 是一个用于视觉语言导航（VLN）任务的深度学习框架
 
 | 特性 | 描述 |
 |:-----|:-----|
-| 🔥 **热力图生成** | 双路径条件扩散模型：序列 Cross-Attention + FiLM 条件注入 |
+| 🔥 **历史热力图** | 基于 Diffusion 生成历史相机位置在当前视角的热力图投影 |
 | 🎯 **轨迹预测** | 24 步连续轨迹预测 (x, y, θ) |
 | 📊 **进度估计** | 任务完成进度回归 (0-1) |
+| 🛑 **停止预测** | 基于 Focal Loss 的二分类，判断是否到达目标 |
+| 👁️ **可见性预测** | 预测目标位置是否在当前视角可见，控制假阳性 |
 | 🧠 **Qwen3-VL 骨干** | 视觉语言预训练模型，支持可选 LoRA 微调 |
 | ⚡ **Sequence Packing** | 高效批量训练，消除 padding 浪费 |
 | 🎛️ **模块化设计** | 可独立启用/禁用各预测头 |
@@ -167,11 +169,19 @@ tensorboard --logdir=/root/tf-logs/latest --port=6006
 | 分类 | 指标 | 说明 |
 |:-----|:-----|:-----|
 | **训练损失** | `train/loss` | 总损失 |
-| | `train/heatmap_loss` | 热力图损失 |
+| | `train/history_heatmap_loss` | 历史热力图损失 |
+| | `train/history_heatmap_base_loss` | base MSE 损失 |
+| | `train/history_heatmap_focal_loss` | focal 加权损失 |
+| | `train/history_heatmap_x0_loss` | x0 重构损失 |
+| | `train/history_heatmap_sparsity_loss` | 稀疏性正则化损失 |
+| | `train/history_heatmap_peak_dist_loss` | 峰值距离损失 |
+| | `train/history_heatmap_visibility_loss` | 可见性 BCE 损失 |
 | | `train/trajectory_loss` | 轨迹损失 |
 | | `train/progress_loss` | 进度损失 |
+| | `train/stop_loss` | 停止预测损失 |
 | **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
 | | `diag/heatmap_focal_ratio` | focal/base 比值 |
+| | `diag/heatmap_noise_std` | 预测噪声标准差 |
 | **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
 | | `diag/trajectory_fde` | 终点位移误差 |
 
@@ -209,10 +219,11 @@ python scripts/evaluate.py \
 | 类别 | 指标 | 说明 |
 |:-----|:-----|:-----|
 | **热力图** | Peak Error | 峰值位置误差（像素） |
-| | IoU | 阈值交并比 |
+| | IoU@0.1/0.3/0.5 | 多阈值交并比 |
 | **轨迹** | ADE | 平均位移误差 |
 | | FDE | 终点位移误差 |
 | **进度** | MAE | 平均绝对误差 |
+| **停止预测** | Accuracy/F1 | 分类准确率与 F1 分数 |
 
 ---
 
@@ -276,6 +287,8 @@ LLM Tokens (B, ~900, 1024)
 Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2D
                                                            ↓
                                                      DDPM + CFG → Heatmap [64×64]
+                                                           ↓
+                                                   Visibility Head → [0, 1] (是否可见)
 ```
 
 **关键技术：**
@@ -284,9 +297,15 @@ Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2
 |:-----|:-----|
 | **双路径条件注入** | FiLM (全局向量) + 序列 Cross-Attention (保留完整 LLM token 序列) |
 | **序列 Cross-Attention** | UNet 各空间位置 attend 到完整 LLM 序列，避免信息瓶颈 |
-| **Image Encoder** | CNN 编码当前图像，提供像素级空间特征辅助热力图定位 |
-| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=3.0) |
+| **Image Encoder** | CNN (ResNet-18) 编码当前图像，提供像素级空间特征辅助热力图定位 |
+| **空间特征注入** | CNN 多尺度特征注入 UNet skip connections，解决全局池化导致的空间信息丢失 |
+| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=2.0) |
 | **Focal Loss** | 70% 标准 MSE + 30% 峰值加权，关注关键区域 |
+| **x0 重构损失** | 直接监督输出质量，补充 epsilon loss |
+| **峰值距离损失** | 可微分 Soft-Argmax，直接优化峰值位置准确度 |
+| **负样本零目标损失** | SNR 门控：只对高质量样本施加零约束 |
+| **可见性预测头** | 预测目标是否可见，消除假阳性 |
+| **空间 Softmax 锐化** | 推理后处理，集中能量到峰值区域 |
 | **LoRA 微调 (可选)** | 对 Qwen3-VL 最后 N 层加 LoRA，增强空间推理能力 |
 
 ### 轨迹预测模块
@@ -295,8 +314,10 @@ Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2
 
 | 组件 | 输出 | 说明 |
 |:-----|:-----|:-----|
-| `TransformerActionHead` | (x, y, θ) × 24 | Transformer Decoder + DDPM |
+| `TransformerActionHead` | (x, y, θ) × 24 | Transformer Decoder + DDPM (推荐) |
+| `DiffusionActionHead` | (x, y, θ) × 24 | UNet1D + DDPM (legacy) |
 | `ProgressPredictionHead` | [0, 1] | 3 层 MLP 回归 |
+| `StopHead` | binary | 基于 Focal Loss 的二分类，判断是否到达目标 |
 
 ---
 
@@ -314,7 +335,8 @@ Current Frame → CNN Encoder → img_cond → Fusion ──→ ConditionalUnet2
 │           ├── rgb/               # RGB 图像序列
 │           │   ├── 000000.png
 │           │   └── ...
-│           └── actions.npy        # 连续动作 [T, 2]
+│           ├── actions.npy        # 连续动作 [T, 2] (agent-local 2D 位移 dx, dy)
+│           └── discrete_actions.npy  # 离散动作 [T] (前进/左转/右转/停止)
 └── val_unseen/
     └── ...
 ```
@@ -363,7 +385,7 @@ data:
 
 ## ⚙️ 配置说明
 
-主配置文件：`configs/train_heatmap_config.yaml`
+主配置文件：`configs/train_config.yaml`（通用配置）或 `configs/train_heatmap_config.yaml`（热力图专用配置）
 
 <details>
 <summary>📋 完整配置示例</summary>
@@ -376,27 +398,57 @@ model:
     attn_implementation: flash_attention_2
     enable_packing: true          # Sequence Packing 高效训练
     max_seq_length: 8192
-    
+
     # LoRA 微调（可选，默认关闭）
     use_lora: false
     lora_rank: 16
     lora_alpha: 32
     lora_num_layers: 4            # 最后 4 层
-  
+
+  # 热力图头配置
   heatmap_head:
-    enable_history: true
+    enable_history: true           # 生成历史位置热力图
+    enable_future: false          # 生成未来位置热力图
     cond_dim: 1024
     block_out_channels: [128, 256, 512, 512]
-    attention_levels: [2, 3]
-    num_inference_steps: 20
-    cfg_drop_prob: 0.1
-    cfg_scale: 3.0
-    
+    attention_levels: [1, 2, 3]
+    num_inference_steps: 50
+    cfg_drop_prob: 0.15
+    cfg_scale: 2.0
+
     # 双路径条件注入
     use_image_encoder: true             # CNN 编码当前图像
+    use_spatial_injection: true         # CNN 多尺度特征注入 skip connections
     use_sequence_conditioning: true     # 序列级 Cross-Attention
     seq_cross_attn_heads: 8
     seq_cross_attn_head_dim: 64
+
+    # 可见性预测头
+    use_visibility_head: true
+    visibility_loss_weight: 1.0
+    visibility_threshold: 0.7
+
+    # 推理后处理
+    sharpen_temperature: 0.1            # 空间 Softmax 锐化
+
+    # 损失函数权重
+    x0_loss_weight: 1.0                  # x0 重构损失
+    sparsity_loss_weight: 0.5           # L1 稀疏性正则化
+    peak_distance_loss_weight: 2.0      # 可微分峰值距离损失
+    negative_sample_weight: 0.3         # 负样本权重
+
+  # 动作头配置
+  action_head:
+    enable: true
+    type: transformer                   # transformer (推荐) 或 legacy
+
+    # 停止预测头
+    stop_head:
+      enable: true
+
+  # 进度预测头
+  progress_head:
+    enable: true
 
 # 优化器配置
 optim:
@@ -452,11 +504,15 @@ python scripts/train.py --config configs/train_config.yaml --auto-resume
 ```
 HeatmapVLN/
 ├── configs/
-│   └── train_heatmap_config.yaml   # 热力图训练配置
+│   ├── train_config.yaml           # 通用训练配置
+│   └── train_heatmap_config.yaml  # 热力图训练配置
 ├── scripts/
 │   ├── train.py                    # 训练脚本
 │   ├── evaluate.py                 # 评估脚本
-│   └── inference.py                # 推理脚本
+│   ├── inference.py                # 推理脚本
+│   ├── eval_heatmap.py             # 热力图专用评估脚本
+│   ├── visualize_heatmap.py       # 热力图可视化脚本
+│   └── visualize_trajectory_heatmaps.py  # 轨迹热力图可视化
 ├── src/
 │   ├── data/                       # 数据加载
 │   │   ├── vln_sliding_window_dataset.py  # 滑动窗口 + 轨迹数据集
@@ -470,12 +526,23 @@ HeatmapVLN/
 │   │   │   └── diffusion/
 │   │   │       ├── config.py       # 配置 (含序列 Cross-Attention)
 │   │   │       ├── unet2d.py       # UNet2D (双路径条件注入)
-│   │   │       └── image_encoder.py # 条件编码器 (全局+序列)
+│   │   │       ├── image_encoder.py # 条件编码器 (ResNet-18)
+│   │   │       └── positional_embedding.py
 │   │   └── action/                 # 动作模块
+│   │       ├── transformer_action_head.py  # Transformer DDPM (推荐)
+│   │       ├── diffusion_action_head.py    # UNet1D DDPM (legacy)
+│   │       ├── progress_head.py     # 进度预测头
+│   │       ├── stop_head.py         # 停止预测头
+│   │       └── utils.py
 │   └── utils/                      # 工具函数
-│       ├── gpu_heatmap.py          # GPU 热力图计算
-│       └── notifier.py             # 飞书通知
+│       ├── gpu_heatmap.py           # GPU 热力图计算
+│       ├── loss.py                  # 损失函数 (Focal, SNR-gated)
+│       ├── notifier.py              # 飞书通知
+│       ├── visualization.py         # 可视化工具
+│       └── frame_vis_utils.py       # 帧可视化工具
 ├── docker/                         # Docker 配置
+├── assets/                        # 资源文件
+│   └── architecture.png            # 架构图
 ├── requirements.txt
 └── README.md
 ```
