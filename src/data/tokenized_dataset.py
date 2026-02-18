@@ -367,7 +367,7 @@ class FlattenedCollatorForVLN:
             "heatmap": torch.stack([inst['heatmap'] for inst in instances], dim=0),
             "action": torch.stack([inst['action'] for inst in instances], dim=0),
             "action_valid": torch.tensor([inst['action_valid'] for inst in instances]),
-            "discrete_action": torch.tensor([inst.get('discrete_action', 1) for inst in instances]),
+            "discrete_action": torch.tensor([inst.get('discrete_action', 1) for inst in instances], dtype=torch.long),
             "is_stop": torch.tensor([inst.get('is_stop', 0.0) for inst in instances]),
             "is_flipped": torch.tensor([inst.get('is_flipped', False) for inst in instances], dtype=torch.bool),
             "text": [inst['text'] for inst in instances],

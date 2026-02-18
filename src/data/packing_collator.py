@@ -356,10 +356,10 @@ class PackingCollatorForVLN:
                 pad_size = max_K - K
                 pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
                 frames_padded = torch.cat([frames, pad_frames], dim=0)
-                mask = torch.cat([torch.ones(K), torch.zeros(pad_size)])
+                mask = torch.cat([torch.ones(K, dtype=torch.bool), torch.zeros(pad_size, dtype=torch.bool)])
             else:
                 frames_padded = frames
-                mask = torch.ones(K)
+                mask = torch.ones(K, dtype=torch.bool)
             history_frames_padded.append(frames_padded)
             history_mask.append(mask)
         
@@ -385,7 +385,7 @@ class PackingCollatorForVLN:
             "heatmap": torch.stack([s['heatmap'] for s in batch], dim=0),
             "action": torch.stack([s['action'] for s in batch], dim=0),
             "action_valid": torch.tensor([s['action_valid'] for s in batch]),
-            "discrete_action": torch.tensor([s.get('discrete_action', 1) for s in batch]),
+            "discrete_action": torch.tensor([s.get('discrete_action', 1) for s in batch], dtype=torch.long),
             "is_stop": torch.tensor([s.get('is_stop', 0.0) for s in batch]),
             "text": [s['text'] for s in batch],
         }
