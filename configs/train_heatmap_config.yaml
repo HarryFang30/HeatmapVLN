@@ -23,7 +23,7 @@ data:
     cache_poses: true
     sample_stride: 2             # 采样步长
     
-    # GPU 热力图计算 — 全景模式下关闭（4 视角热力图在 CPU 生成更简单）
+    # GPU 热力图计算 — 全景模式下必须关闭（GPU 版只支持单视角，4 视角热力图由 CPU 在 DataLoader 中生成）
     defer_heatmap_to_gpu: false
     
     # Clip-level 采样策略
@@ -212,7 +212,7 @@ model:
 training:
   stages:
     - name: heatmap_only_64
-      epochs: 15               # 15 epoch（上轮 5 epoch 就到 best）
+      epochs: 15               # 15 epoch 正式训练
       hm_size: [64, 64]
       heatmap_loss_type: simplified
       train_history: true

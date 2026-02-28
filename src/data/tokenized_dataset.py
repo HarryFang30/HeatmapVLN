@@ -282,10 +282,8 @@ class TokenizedVLNDataset(Dataset):
             output['history_poses'] = sample['history_poses']
             output['current_pose'] = sample['current_pose']
             output['current_depth'] = sample['current_depth']
-            output['intrinsics'] = sample['intrinsics']
-            output['has_depth'] = sample['has_depth']
-            output['has_intrinsics'] = sample['has_intrinsics']
-            output['img_size'] = sample['img_size']
+            if 'intrinsics' in sample:
+                output['intrinsics'] = sample['intrinsics']
         
         # 🔧 内存管理：显式释放中间变量，周期性 malloc_trim
         # tokenization 产生大量临时内存，Python 不会自动归还 OS
@@ -404,10 +402,7 @@ class FlattenedCollatorForVLN:
             batch['history_poses'] = torch.stack([inst['history_poses'] for inst in instances], dim=0)
             batch['current_pose'] = torch.stack([inst['current_pose'] for inst in instances], dim=0)
             batch['current_depth'] = torch.stack([inst['current_depth'] for inst in instances], dim=0)
-            batch['intrinsics'] = torch.stack([inst['intrinsics'] for inst in instances], dim=0)
-            # has_depth 和 has_intrinsics: 取第一个样本的值（假设 batch 内一致）
-            batch['has_depth'] = instances[0].get('has_depth', False)
-            batch['has_intrinsics'] = instances[0].get('has_intrinsics', False)
-            batch['img_size'] = instances[0].get('img_size', (640, 480))
+            if 'intrinsics' in instances[0]:
+                batch['intrinsics'] = torch.stack([inst['intrinsics'] for inst in instances], dim=0)
         
         return batch

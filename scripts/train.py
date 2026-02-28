@@ -1049,6 +1049,8 @@ def train_one_epoch(
     packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
+    gpu_has_depth: bool = False,
+    gpu_depth_normalized: bool = True,
     ema: Optional[EMAModel] = None,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
@@ -1640,6 +1642,8 @@ def validate(
     vis_dir: Optional[Path] = None,
     max_batches: int = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
+    gpu_has_depth: bool = False,
+    gpu_depth_normalized: bool = True,
 ) -> Dict[str, float]:
     """验证（带可视化）"""
     model.eval()
@@ -2605,6 +2609,8 @@ def main():
             packing_enabled=packing_enabled,
             vis_dir=vis_train_dir,
             gpu_heatmap_computer=gpu_heatmap_computer,
+            gpu_has_depth=gpu_has_depth,
+            gpu_depth_normalized=gpu_depth_normalized,
             ema=ema,
         )
         
@@ -2623,6 +2629,8 @@ def main():
                 vis_dir=vis_val_dir,
                 max_batches=args.max_batches,
                 gpu_heatmap_computer=gpu_heatmap_computer,
+                gpu_has_depth=gpu_has_depth,
+                gpu_depth_normalized=gpu_depth_normalized,
             )
         
         # 🧹 验证后再次清理内存
