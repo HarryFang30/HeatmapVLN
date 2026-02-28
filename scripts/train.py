@@ -1113,20 +1113,15 @@ def train_one_epoch(
             history_poses = batch['history_poses'].to(device)  # [B, K, 4, 4]
             current_poses = batch['current_pose'].to(device)   # [B, 4, 4]
             
-            # 检查是否有深度图
-            has_depth = batch.get('has_depth', False)
-            current_depths = batch['current_depth'].to(device) if has_depth else None
+            current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
+            intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
             
-            # 检查是否有内参
-            has_intrinsics = batch.get('has_intrinsics', False)
-            intrinsics = batch['intrinsics'].to(device) if has_intrinsics else None
-            
-            # 在 GPU 上计算热力图
             gt_heatmap = gpu_heatmap_computer.compute_batch(
                 history_poses=history_poses,
                 current_poses=current_poses,
                 current_depths=current_depths,
                 intrinsics=intrinsics,
+                depth_normalized=gpu_depth_normalized,
             )  # [B, Hm, Wm]
             
             # 水平翻转增强：对翻转的样本也翻转 GT 热力图
@@ -1700,17 +1695,15 @@ def validate(
             history_poses = batch['history_poses'].to(device)
             current_poses = batch['current_pose'].to(device)
             
-            has_depth = batch.get('has_depth', False)
-            current_depths = batch['current_depth'].to(device) if has_depth else None
-            
-            has_intrinsics = batch.get('has_intrinsics', False)
-            intrinsics = batch['intrinsics'].to(device) if has_intrinsics else None
+            current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
+            intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
             
             gt_heatmap = gpu_heatmap_computer.compute_batch(
                 history_poses=history_poses,
                 current_poses=current_poses,
                 current_depths=current_depths,
                 intrinsics=intrinsics,
+                depth_normalized=gpu_depth_normalized,
             )
         else:
             gt_heatmap = batch['heatmap'].to(device)
@@ -2569,9 +2562,14 @@ def main():
             img_size=img_size,
             device='cuda',
         )
-        logger.info(f"🚀 GPU heatmap computation enabled (hm_size={hm_size})")
+        gpu_depth_normalized = not getattr(train_dataset, 'depth_is_meters', False)
+        gpu_has_depth = getattr(train_dataset, 'load_depth', True)
+        logger.info(f"🚀 GPU heatmap computation enabled (hm_size={hm_size}, "
+                     f"depth_normalized={gpu_depth_normalized}, has_depth={gpu_has_depth})")
     else:
         gpu_heatmap_computer = None
+        gpu_depth_normalized = True
+        gpu_has_depth = False
     
     # EMA (Exponential Moving Average) — 扩散模型标准技术
     # 用参数的滑动平均做推理，减少训练波动，提升泛化

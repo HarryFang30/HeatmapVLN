@@ -596,6 +596,12 @@ class VLNSlidingWindowDataset(Dataset):
             logger.warning(f"Could not detect panoramic format: {e}, assuming single-view")
             return False
     
+
+    @property
+    def depth_is_meters(self) -> bool:
+        """Whether depth data is in meters (True) or normalized [0,1] (False)"""
+        return self._depth_is_meters
+
     def _enumerate_clips(self) -> List[Path]:
         """枚举所有 clip 目录
         
@@ -1381,7 +1387,9 @@ class VLNSlidingWindowDataset(Dataset):
             
             hm_w, hm_h = self.hm_size
             
-            if self._is_panoramic:
+            if self.defer_heatmap_to_gpu:
+                heatmap_tensor = torch.zeros(hm_h, hm_w)
+            elif self._is_panoramic:
                 heatmap_tensor, visibility = self._compute_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
@@ -1451,6 +1459,23 @@ class VLNSlidingWindowDataset(Dataset):
             }
             if current_views is not None:
                 result["current_views"] = current_views  # [4, 3, H, W]
+            
+            if self.defer_heatmap_to_gpu:
+                result["history_poses"] = torch.from_numpy(
+                    np.stack(history_poses, axis=0)).float()       # [K, 4, 4]
+                result["current_pose"] = torch.from_numpy(
+                    current_pose).float()                          # [4, 4]
+                if current_depth is not None:
+                    d = current_depth
+                    if d.ndim == 3 and d.shape[-1] == 1:
+                        d = d[:, :, 0]
+                    result["current_depth"] = torch.from_numpy(
+                        d.astype(np.float32))                      # [Hd, Wd]
+                else:
+                    result["current_depth"] = torch.zeros(1, 1)
+                if K is not None:
+                    result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
+            
             return result
             
         except Exception as e:
@@ -1488,6 +1513,10 @@ class VLNSlidingWindowDataset(Dataset):
                 "is_stop": 0.0,
                 "text": "",
             }
+        if self.defer_heatmap_to_gpu:
+            result["history_poses"] = torch.zeros(K, 4, 4)
+            result["current_pose"] = torch.zeros(4, 4)
+            result["current_depth"] = torch.zeros(1, 1)
         return result
 
 
@@ -2147,7 +2176,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             
             hm_w, hm_h = self.hm_size
             
-            if self._is_panoramic:
+            if self.defer_heatmap_to_gpu:
+                heatmap_tensor = torch.zeros(hm_h, hm_w)
+            elif self._is_panoramic:
                 heatmap_tensor, visibility = self._compute_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
@@ -2217,6 +2248,23 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             }
             if current_views is not None:
                 result["current_views"] = current_views  # [4, 3, H, W]
+            
+            if self.defer_heatmap_to_gpu:
+                result["history_poses"] = torch.from_numpy(
+                    np.stack(history_poses, axis=0)).float()       # [K, 4, 4]
+                result["current_pose"] = torch.from_numpy(
+                    current_pose).float()                          # [4, 4]
+                if current_depth is not None:
+                    d = current_depth
+                    if d.ndim == 3 and d.shape[-1] == 1:
+                        d = d[:, :, 0]
+                    result["current_depth"] = torch.from_numpy(
+                        d.astype(np.float32))                      # [Hd, Wd]
+                else:
+                    result["current_depth"] = torch.zeros(1, 1)
+                if K is not None:
+                    result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
+            
             return result
             
         except Exception as e:
