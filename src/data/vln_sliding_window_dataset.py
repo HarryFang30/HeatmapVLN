@@ -788,27 +788,30 @@ class VLNSlidingWindowDataset(Dataset):
         key_map: Dict[str, str] = {}
         
         for chunk_path in chunk_files:
-            with np.load(chunk_path, allow_pickle=False) as chunk_data:
-                if "frame_ids" not in chunk_data:
-                    raise KeyError(f"frame_ids missing in chunk: {chunk_path}")
-                frame_ids = np.array(chunk_data["frame_ids"], dtype=np.int32)
-                for local_idx, frame_id in enumerate(frame_ids.tolist()):
-                    frame_lookup[int(frame_id)] = (str(chunk_path), int(local_idx))
-                
-                if not key_map:
-                    files = set(chunk_data.files)
-                    # 单视角 chunks（rgb/depth/pose）或多视角 chunks（rgb_front/...）
-                    for base_key in ("rgb", "depth", "pose"):
-                        if base_key in files:
-                            key_map[base_key] = base_key
-                            continue
-                        preferred_key = f"{base_key}_{self.chunk_direction}"
-                        if preferred_key in files:
-                            key_map[base_key] = preferred_key
-                            continue
-                        candidates = sorted([k for k in files if k.startswith(f"{base_key}_")])
-                        if len(candidates) > 0:
-                            key_map[base_key] = candidates[0]
+            try:
+                with np.load(chunk_path, allow_pickle=True) as chunk_data:
+                    if "frame_ids" not in chunk_data:
+                        logger.warning(f"frame_ids missing in chunk, skipping: {chunk_path}")
+                        continue
+                    frame_ids = np.array(chunk_data["frame_ids"], dtype=np.int32)
+                    for local_idx, frame_id in enumerate(frame_ids.tolist()):
+                        frame_lookup[int(frame_id)] = (str(chunk_path), int(local_idx))
+                    
+                    if not key_map:
+                        files = set(chunk_data.files)
+                        for base_key in ("rgb", "depth", "pose"):
+                            if base_key in files:
+                                key_map[base_key] = base_key
+                                continue
+                            preferred_key = f"{base_key}_{self.chunk_direction}"
+                            if preferred_key in files:
+                                key_map[base_key] = preferred_key
+                                continue
+                            candidates = sorted([k for k in files if k.startswith(f"{base_key}_")])
+                            if len(candidates) > 0:
+                                key_map[base_key] = candidates[0]
+            except Exception as e:
+                logger.warning(f"Corrupted chunk file, skipping: {chunk_path} ({e})")
         
         if "rgb" not in key_map or "pose" not in key_map:
             raise KeyError(f"Chunk keys missing (need rgb/pose): clip={clip_dir}, key_map={key_map}")
