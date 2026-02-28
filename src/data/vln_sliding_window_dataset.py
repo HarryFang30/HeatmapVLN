@@ -1080,6 +1080,38 @@ class VLNSlidingWindowDataset(Dataset):
             indices = np.linspace(start, end - 1, num_samples, dtype=int)
             return indices
     
+    def _decode_chunk_rgb(self, raw, clip_dir, frame_idx) -> np.ndarray:
+        """将 chunk 中的 rgb 数据解码为 RGB numpy 数组 [H, W, 3]
+        
+        支持多种存储格式：
+        - [H, W, C] uint8 数组（已解码）
+        - [N,] uint8 数组（JPEG 字节流）
+        - [N,] object 数组（JPEG 字节以 int 对象存储，pickle 导致）
+        - bytes / bytearray（原始 JPEG）
+        """
+        if isinstance(raw, np.ndarray):
+            if raw.ndim == 3 and raw.shape[2] >= 3:
+                return cv2.cvtColor(raw[:, :, :3], cv2.COLOR_BGR2RGB)
+            if raw.ndim == 1 and raw.dtype == np.uint8:
+                img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError(f"Failed to decode JPEG at clip={clip_dir}, frame={frame_idx}")
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if raw.ndim == 1 and raw.dtype == object:
+                arr = np.array(raw, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if isinstance(raw, (bytes, bytearray)):
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        raise ValueError(
+            f"Cannot decode chunk rgb at clip={clip_dir}, frame={frame_idx}, "
+            f"type={type(raw).__name__}, shape={getattr(raw, 'shape', '?')}, dtype={getattr(raw, 'dtype', '?')}"
+        )
+
     def _load_frame(self, clip_dir: Path, frame_idx: int,
                     apply_augmentation: bool = True,
                     direction: Optional[str] = None) -> torch.Tensor:
@@ -1093,15 +1125,7 @@ class VLNSlidingWindowDataset(Dataset):
         
         if storage_format == "chunks":
             raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction=direction)
-            if isinstance(raw, np.ndarray) and raw.ndim == 1 and raw.dtype == np.uint8:
-                image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-                if image is None:
-                    raise ValueError(f"Failed to decode JPEG at clip={clip_dir}, frame={frame_idx}")
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            elif isinstance(raw, np.ndarray) and raw.ndim == 3 and raw.shape[2] >= 3:
-                image = cv2.cvtColor(raw[:, :, :3], cv2.COLOR_BGR2RGB)
-            else:
-                raise ValueError(f"Invalid chunk rgb at clip={clip_dir}, frame={frame_idx}, shape={getattr(raw, 'shape', '?')}, dtype={getattr(raw, 'dtype', '?')}")
+            image = self._decode_chunk_rgb(raw, clip_dir, frame_idx)
         else:
             dir_name = direction or self.chunk_direction
             rgb_candidates = [
