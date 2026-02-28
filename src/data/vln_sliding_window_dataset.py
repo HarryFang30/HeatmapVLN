@@ -2117,8 +2117,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # 3. 加载历史帧
             history_frames = self._load_frames(clip_dir, history_indices)
             
-            # 4. 加载当前帧
-            current_frame = self._load_frame(clip_dir, current_t)
+            # 4. 加载当前帧（全景 / 单视角）
+            if self._is_panoramic:
+                current_frame = self._load_panoramic_grid(clip_dir, current_t)
+                current_views = self._load_all_views(clip_dir, current_t)
+            else:
+                current_frame = self._load_frame(clip_dir, current_t)
+                current_views = None
             
             # 5. 加载位姿
             poses = self._load_poses(clip_idx)
@@ -2138,19 +2143,31 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 if "K" in intrinsics:
                     K = np.array(intrinsics["K"], dtype=np.float32)
             else:
-                img_size = (640, 480)  # 默认 Pinhole 图像尺寸
+                img_size = (640, 480)
             
             hm_w, hm_h = self.hm_size
-            heatmap, visibility = compute_history_heatmap(
-                history_poses=history_poses,
-                current_pose=current_pose,
-                current_depth=current_depth,
-                hm_size=(hm_h, hm_w),
-                img_size=img_size,
-                K=K,
-                depth_normalize=not self._depth_is_meters,
-            )
-            heatmap_tensor = torch.from_numpy(heatmap).float()
+            
+            if self._is_panoramic:
+                heatmap_tensor, visibility = self._compute_multiview_heatmaps(
+                    clip_idx=clip_idx,
+                    clip_dir=clip_dir,
+                    history_poses=history_poses,
+                    current_t=current_t,
+                    img_size=img_size,
+                    K=K,
+                    hm_size=(hm_h, hm_w),
+                )
+            else:
+                heatmap, visibility = compute_history_heatmap(
+                    history_poses=history_poses,
+                    current_pose=current_pose,
+                    current_depth=current_depth,
+                    hm_size=(hm_h, hm_w),
+                    img_size=img_size,
+                    K=K,
+                    depth_normalize=not self._depth_is_meters,
+                )
+                heatmap_tensor = torch.from_numpy(heatmap).float()
             
             # 8. 计算轨迹（使用子序列范围计算 progress）
             trajectory, trajectory_valid, progress = self._compute_trajectory(
@@ -2185,20 +2202,22 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 discrete_action = 1
                 is_stop = 0.0
             
-            return {
+            result = {
                 "history_frames": history_frames,        # [K, 3, H, W]
-                "current_frame": current_frame,          # [3, H, W]
-                "heatmap": heatmap_tensor,               # [Hm, Wm]
+                "current_frame": current_frame,          # [3, H, W] or [3, 2H, 2W] (panoramic)
+                "heatmap": heatmap_tensor,               # [Hm, Wm] or [4, Hm, Wm] (panoramic)
                 "trajectory": trajectory_tensor,         # [predict_horizon, 3]
                 "trajectory_valid": trajectory_valid,    # float
                 "progress": progress,                    # float (0-1)
-                # 兼容旧接口
                 "action": action_tensor,                 # [2]
                 "action_valid": action_valid,            # float
                 "discrete_action": discrete_action,      # int
                 "is_stop": is_stop,                      # float
                 "text": text,                            # str
             }
+            if current_views is not None:
+                result["current_views"] = current_views  # [4, 3, H, W]
+            return result
             
         except Exception as e:
             logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
