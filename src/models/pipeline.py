@@ -655,11 +655,11 @@ class VLNPipeline(nn.Module):
             }
         }
         
-        # Heatmaps
+        # Heatmaps — single-view [B,H,W] 需要 unsqueeze；multi-view [B,4,H,W] 已有 views 维度
         if history_heatmap is not None:
-            output['history_heatmaps'] = history_heatmap.unsqueeze(1)
+            output['history_heatmaps'] = history_heatmap.unsqueeze(1) if history_heatmap.dim() == 3 else history_heatmap
         if future_heatmap is not None:
-            output['future_heatmaps'] = future_heatmap.unsqueeze(1)
+            output['future_heatmaps'] = future_heatmap.unsqueeze(1) if future_heatmap.dim() == 3 else future_heatmap
         
         # Heatmap losses (forward path)
         if history_heatmap_loss is not None:
@@ -938,11 +938,11 @@ class VLNPipeline(nn.Module):
             }
         }
         
-        # Heatmaps
+        # Heatmaps — single-view [B,H,W] 需要 unsqueeze；multi-view [B,4,H,W] 已有 views 维度
         if history_heatmap is not None:
-            output['history_heatmaps'] = history_heatmap.unsqueeze(1)
+            output['history_heatmaps'] = history_heatmap.unsqueeze(1) if history_heatmap.dim() == 3 else history_heatmap
         if future_heatmap is not None:
-            output['future_heatmaps'] = future_heatmap.unsqueeze(1)
+            output['future_heatmaps'] = future_heatmap.unsqueeze(1) if future_heatmap.dim() == 3 else future_heatmap
         
         # Heatmap losses (forward_packed path)
         if history_heatmap_loss is not None:

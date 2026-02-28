@@ -464,13 +464,15 @@ def visualize_heatmap_predictions(
         if pred_heatmaps is None:
             return
         
-        # 多视角：提取 front 视角用于可视化
-        if pred_heatmaps.dim() == 5:  # [B, num_views, C, H, W]
+        # 提取 2D 热力图用于可视化
+        # 多视角 [B, 4, H, W]: 取 front (index 0)
+        # 单视角 [B, 1, H, W]: 取唯一通道 (index 0 或 -1 均可)
+        if pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
             pred_heatmaps = pred_heatmaps[:, 0]  # front view
-        if pred_heatmaps.dim() == 4:
-            pred_heatmaps = pred_heatmaps[:, -1]
+        elif pred_heatmaps.dim() == 4:
+            pred_heatmaps = pred_heatmaps[:, -1]  # single channel
         
-        if gt_heatmaps.dim() == 4 and gt_heatmaps.shape[1] == 4:  # [B, 4, H, W]
+        if gt_heatmaps.dim() == 4 and gt_heatmaps.shape[1] == 4:
             gt_heatmaps = gt_heatmaps[:, 0]  # front view
         
         # 全景网格：裁剪左上角作为 front view 显示
@@ -584,6 +586,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'is_stop': is_stop,
         'text': text,
     }
+    
+    # 多视角数据
+    if 'current_views' in batch[0]:
+        result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
     
     # 水平翻转标记
     if 'is_flipped' in batch[0]:
@@ -1320,9 +1326,9 @@ def train_one_epoch(
                     if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
                         pred_hm = output['history_heatmaps'].detach()
                         
-                        # 多视角数据：只用 front 视角 (索引 0) 计算诊断指标
-                        if pred_hm.dim() == 5:  # [B, num_views, C, H, W]
-                            pred_hm = pred_hm[:, 0]  # [B, C, H, W] front view
+                        # 多视角 [B, 4, H, W]: 取 front 视角；单视角 [B, 1, H, W]: 不变
+                        if pred_hm.dim() == 4 and pred_hm.shape[1] == 4:
+                            pred_hm = pred_hm[:, 0].unsqueeze(1)  # [B, 1, H, W] front view
                         gt_hm_for_diag = gt_heatmap
                         if gt_hm_for_diag.dim() == 4 and gt_hm_for_diag.shape[1] == 4:  # [B, 4, H, W]
                             gt_hm_for_diag = gt_hm_for_diag[:, 0]  # [B, H, W] front view
@@ -1854,11 +1860,11 @@ def validate(
                 # 计算完整推理的 heatmap MSE（真实生成质量指标）
                 if train_history and 'history_heatmaps' in vis_output:
                     infer_pred_hm = vis_output['history_heatmaps']
-                    # 多视角：用 front 视角计算 MSE
-                    if infer_pred_hm.dim() == 5:  # [B, num_views, C, H, W]
-                        infer_pred_hm = infer_pred_hm[:, 0, -1, :, :]
-                    else:
-                        infer_pred_hm = infer_pred_hm[:, -1, :, :]
+                    # 多视角 [B, 4, H, W]: 取 front；单视角 [B, 1, H, W]: 取唯一通道
+                    if infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
+                        infer_pred_hm = infer_pred_hm[:, 0, :, :]   # front view
+                    elif infer_pred_hm.dim() == 4:
+                        infer_pred_hm = infer_pred_hm[:, -1, :, :]  # single channel
                     gt_hm_eval = gt_heatmap
                     if gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
                         gt_hm_eval = gt_hm_eval[:, 0]
