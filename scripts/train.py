@@ -464,8 +464,22 @@ def visualize_heatmap_predictions(
         if pred_heatmaps is None:
             return
         
+        # 多视角：提取 front 视角用于可视化
+        if pred_heatmaps.dim() == 5:  # [B, num_views, C, H, W]
+            pred_heatmaps = pred_heatmaps[:, 0]  # front view
         if pred_heatmaps.dim() == 4:
             pred_heatmaps = pred_heatmaps[:, -1]
+        
+        if gt_heatmaps.dim() == 4 and gt_heatmaps.shape[1] == 4:  # [B, 4, H, W]
+            gt_heatmaps = gt_heatmaps[:, 0]  # front view
+        
+        # 全景网格：裁剪左上角作为 front view 显示
+        if current_frames.shape[-1] > 300:
+            h = current_frames.shape[-2] // 2
+            w = current_frames.shape[-1] // 2
+            current_frames = current_frames[:, :, :h, :w]
+        elif 'current_views' in batch:
+            current_frames = batch['current_views'][:, 0]  # front view
         
         B = min(num_samples, current_frames.shape[0])
         
@@ -477,7 +491,7 @@ def visualize_heatmap_predictions(
             rgb = current_frames[i].cpu().numpy().transpose(1, 2, 0)
             rgb = np.clip(rgb, 0, 1)
             axes[i, 0].imshow(rgb)
-            axes[i, 0].set_title(f"Input Frame")
+            axes[i, 0].set_title(f"Input Frame (Front)")
             axes[i, 0].axis('off')
             
             gt_hm = gt_heatmaps[i].cpu().numpy()
@@ -485,7 +499,7 @@ def visualize_heatmap_predictions(
             axes[i, 1].set_title(f"GT Heatmap (max={gt_hm.max():.2f})")
             axes[i, 1].axis('off')
             
-            pred_hm = pred_heatmaps[i].detach().float().cpu().numpy()  # float() 避免 BFloat16 错误
+            pred_hm = pred_heatmaps[i].detach().float().cpu().numpy()
             pred_hm = np.clip(pred_hm, 0, 1)
             axes[i, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
             axes[i, 2].set_title(f"Pred Heatmap (max={pred_hm.max():.2f})")
@@ -1305,6 +1319,14 @@ def train_one_epoch(
                     # 热力图输出诊断 - 检查是否坍缩为全黑
                     if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
                         pred_hm = output['history_heatmaps'].detach()
+                        
+                        # 多视角数据：只用 front 视角 (索引 0) 计算诊断指标
+                        if pred_hm.dim() == 5:  # [B, num_views, C, H, W]
+                            pred_hm = pred_hm[:, 0]  # [B, C, H, W] front view
+                        gt_hm_for_diag = gt_heatmap
+                        if gt_hm_for_diag.dim() == 4 and gt_hm_for_diag.shape[1] == 4:  # [B, 4, H, W]
+                            gt_hm_for_diag = gt_hm_for_diag[:, 0]  # [B, H, W] front view
+                        
                         pred_mean = pred_hm.mean().item()
                         pred_max = pred_hm.max().item()
                         pred_std = pred_hm.std().item()
@@ -1313,18 +1335,15 @@ def train_one_epoch(
                         tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
                         tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
                         
-                        # 与 GT 对比
-                        gt_mean = gt_heatmap.mean().item()
-                        gt_max = gt_heatmap.max().item()
+                        gt_mean = gt_hm_for_diag.mean().item()
+                        gt_max = gt_hm_for_diag.max().item()
                         
                         logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
                         logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
                         
-                        # 坍缩检测：如果预测热力图最大值 < 0.1，警告
                         if pred_max < 0.1:
                             logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
                         
-                        # 检查是否都接近 0（全黑）
                         non_zero_ratio = (pred_hm > 0.01).float().mean().item()
                         tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
                         if non_zero_ratio < 0.05:
@@ -1332,8 +1351,7 @@ def train_one_epoch(
                         
                         # ==================== 热力图质量指标 ====================
                         B, C, H, W = pred_hm.shape
-                        gt_hm_diag = gt_heatmap.to(pred_hm.device)
-                        # 确保 gt_hm_diag 是 4D [B, 1, H, W] 以匹配 pred_hm
+                        gt_hm_diag = gt_hm_for_diag.to(pred_hm.device)
                         if gt_hm_diag.dim() == 3:
                             gt_hm_diag = gt_hm_diag.unsqueeze(1)
                         
@@ -1835,14 +1853,22 @@ def validate(
                 
                 # 计算完整推理的 heatmap MSE（真实生成质量指标）
                 if train_history and 'history_heatmaps' in vis_output:
-                    infer_pred_hm = vis_output['history_heatmaps'][:, -1, :, :]
-                    if infer_pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
+                    infer_pred_hm = vis_output['history_heatmaps']
+                    # 多视角：用 front 视角计算 MSE
+                    if infer_pred_hm.dim() == 5:  # [B, num_views, C, H, W]
+                        infer_pred_hm = infer_pred_hm[:, 0, -1, :, :]
+                    else:
+                        infer_pred_hm = infer_pred_hm[:, -1, :, :]
+                    gt_hm_eval = gt_heatmap
+                    if gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
+                        gt_hm_eval = gt_hm_eval[:, 0]
+                    if infer_pred_hm.shape[-2:] != gt_hm_eval.shape[-2:]:
                         infer_pred_hm = F.interpolate(
                             infer_pred_hm.unsqueeze(1),
-                            size=gt_heatmap.shape[-2:],
+                            size=gt_hm_eval.shape[-2:],
                             mode='bilinear', align_corners=False
                         ).squeeze(1)
-                    batch_mse = F.mse_loss(infer_pred_hm, gt_heatmap).item()
+                    batch_mse = F.mse_loss(infer_pred_hm, gt_hm_eval).item()
                     total_heatmap_mse += batch_mse
                     num_heatmap_mse_batches += 1
                 

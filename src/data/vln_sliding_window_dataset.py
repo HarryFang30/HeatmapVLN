@@ -473,8 +473,10 @@ class VLNSlidingWindowDataset(Dataset):
         subsequence_samples_per_clip: int = 3,  # 每个 clip 生成的子序列数量
         chunk_direction: str = "front",  # chunks 模式下读取的视角
         chunk_cache_size: int = 6,  # chunks 模式下缓存的数组个数（worker 内）
+        defer_heatmap_to_gpu: bool = False,  # 兼容 train.py 传入（由 GPUHeatmapComputer 处理）
     ):
         self.root = Path(root).expanduser()
+        self.defer_heatmap_to_gpu = defer_heatmap_to_gpu
         self.split = split
         self.min_history = min_history
         self.num_history_sample = num_history_sample
@@ -527,6 +529,9 @@ class VLNSlidingWindowDataset(Dataset):
         self._chunk_key_map_cache: Dict[int, Dict[str, str]] = {}
         self._chunk_array_cache: "OrderedDict[Tuple[int, str, str], np.ndarray]" = OrderedDict()
         
+        self._depth_is_meters = self._detect_depth_format()
+        self._is_panoramic = self._detect_panoramic()
+        
         if self.random_subsequence:
             sampling_mode = "random-subsequence"
         elif self.clip_level_sampling:
@@ -539,29 +544,100 @@ class VLNSlidingWindowDataset(Dataset):
             f"samples_per_clip={self.samples_per_clip}, min_history={min_history}"
         )
     
+    def _detect_depth_format(self) -> bool:
+        """自动检测深度图格式：米制 (True) 或归一化 [0,1] (False)"""
+        if not self.load_depth or len(self.clips) == 0:
+            return False
+        try:
+            clip_dir = self.clips[0]
+            depth_npy = clip_dir / "depth" / "000000.npy"
+            if depth_npy.exists():
+                d = np.load(str(depth_npy))
+                is_meters = float(d.max()) > 2.0
+            else:
+                chunk_dir = clip_dir / "chunks"
+                if chunk_dir.exists():
+                    chunk_file = sorted(chunk_dir.glob("chunk_*.npz"))[0]
+                    with np.load(str(chunk_file), allow_pickle=False) as data:
+                        for k in data.files:
+                            if k.startswith("depth"):
+                                d = data[k][0]
+                                is_meters = float(d.max()) > 2.0
+                                break
+                        else:
+                            return False
+                else:
+                    return False
+            logger.info(f"Depth format: {'meters (no normalization)' if is_meters else 'normalized [0,1]'}")
+            return is_meters
+        except Exception as e:
+            logger.warning(f"Could not detect depth format: {e}, assuming normalized")
+            return False
+    
+    def _detect_panoramic(self) -> bool:
+        """检测数据集是否包含全景多视角数据 (rgb_front, rgb_right, rgb_back, rgb_left)"""
+        if len(self.clips) == 0:
+            return False
+        try:
+            clip_dir = self.clips[0]
+            chunk_dir = clip_dir / "chunks"
+            if chunk_dir.exists():
+                chunk_file = sorted(chunk_dir.glob("chunk_*.npz"))[0]
+                with np.load(str(chunk_file), allow_pickle=False) as data:
+                    keys = set(data.files)
+                    required = {"rgb_front", "rgb_right", "rgb_back", "rgb_left"}
+                    is_pano = required.issubset(keys)
+            else:
+                rgb_dir = clip_dir / "rgb"
+                is_pano = all((rgb_dir / d).exists() for d in ["front", "right", "back", "left"])
+            logger.info(f"Panoramic dataset: {is_pano}")
+            return is_pano
+        except Exception as e:
+            logger.warning(f"Could not detect panoramic format: {e}, assuming single-view")
+            return False
+    
     def _enumerate_clips(self) -> List[Path]:
         """枚举所有 clip 目录
         
         支持两种目录结构：
         1. root/split/scene/clip_xxx（标准结构）
-        2. root/scene/clip_xxx（heatmap_train_data 结构，无 split 层）
+        2. root/scene/clip_xxx（无 split 层，自动按 scene 名 hash 划分 90% train / 10% val）
         """
         split_dir = self.root / self.split
+        use_auto_split = False
         
-        # 检查是否存在 split 目录
         if split_dir.exists():
             search_dir = split_dir
         else:
-            # 尝试直接使用 root 目录（heatmap_train_data 格式）
-            logger.info(f"Split directory {split_dir} not found, using root directory directly")
+            logger.info(f"Split directory {split_dir} not found, using root with auto-split")
             search_dir = self.root
+            use_auto_split = True
         
         if not search_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {search_dir}")
         
-        clips = []
-        scene_dirs = [d for d in search_dir.iterdir() if d.is_dir()]
+        scene_dirs = sorted([d for d in search_dir.iterdir() if d.is_dir()])
         
+        if use_auto_split:
+            import hashlib
+            val_ratio = 0.1
+            train_scenes, val_scenes = [], []
+            for sd in scene_dirs:
+                h = int(hashlib.md5(sd.name.encode()).hexdigest(), 16) % 100
+                if h < int(val_ratio * 100):
+                    val_scenes.append(sd)
+                else:
+                    train_scenes.append(sd)
+            if not val_scenes and len(train_scenes) > 1:
+                val_scenes.append(train_scenes.pop())
+            
+            if self.split in ('val', 'test'):
+                scene_dirs = val_scenes
+            else:
+                scene_dirs = train_scenes
+            logger.info(f"Auto-split: {len(train_scenes)} train scenes, {len(val_scenes)} val scenes (split={self.split})")
+        
+        clips = []
         for scene_dir in scene_dirs:
             clip_dirs = sorted([
                 d for d in scene_dir.iterdir()
@@ -570,7 +646,7 @@ class VLNSlidingWindowDataset(Dataset):
             clips.extend(clip_dirs)
         
         if len(clips) == 0:
-            raise FileNotFoundError(f"No clips found in {search_dir}")
+            raise FileNotFoundError(f"No clips found in {search_dir} (split={self.split})")
         
         logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips
@@ -741,10 +817,12 @@ class VLNSlidingWindowDataset(Dataset):
             self._chunk_array_cache.move_to_end(cache_key)
             return self._chunk_array_cache[cache_key]
         
-        with np.load(chunk_path, allow_pickle=False) as chunk_data:
+        with np.load(chunk_path, allow_pickle=True) as chunk_data:
             if array_key not in chunk_data:
                 raise KeyError(f"Key {array_key} not found in chunk: {chunk_path}")
-            arr = np.array(chunk_data[array_key])
+            arr = chunk_data[array_key]
+            if not isinstance(arr, np.ndarray):
+                arr = np.array(arr)
         
         self._chunk_array_cache[cache_key] = arr
         self._chunk_array_cache.move_to_end(cache_key)
@@ -754,8 +832,14 @@ class VLNSlidingWindowDataset(Dataset):
         
         return arr
 
-    def _get_chunk_frame_array(self, clip_idx: int, frame_idx: int, base_key: str) -> np.ndarray:
-        """读取 chunks 模式下指定帧的单个字段（rgb/depth/pose）。"""
+    def _get_chunk_frame_array(self, clip_idx: int, frame_idx: int, base_key: str,
+                               direction: Optional[str] = None) -> np.ndarray:
+        """读取 chunks 模式下指定帧的单个字段（rgb/depth/pose）。
+        
+        Args:
+            direction: 如果指定，直接用 '{base_key}_{direction}' 作为键，
+                      绕过 key_map（用于加载非默认方向的数据）。
+        """
         self._ensure_chunk_index(clip_idx)
         
         frame_lookup = self._chunk_frame_lookup_cache[clip_idx]
@@ -763,11 +847,16 @@ class VLNSlidingWindowDataset(Dataset):
             raise KeyError(f"frame {frame_idx} not found in chunk index for clip {clip_idx}")
         
         chunk_path, local_idx = frame_lookup[frame_idx]
-        key_map = self._chunk_key_map_cache[clip_idx]
-        if base_key not in key_map:
-            raise KeyError(f"{base_key} key not found in chunk key_map for clip {clip_idx}")
         
-        arr = self._load_chunk_array(clip_idx, chunk_path, key_map[base_key])
+        if direction:
+            actual_key = f"{base_key}_{direction}"
+        else:
+            key_map = self._chunk_key_map_cache[clip_idx]
+            if base_key not in key_map:
+                raise KeyError(f"{base_key} key not found in chunk key_map for clip {clip_idx}")
+            actual_key = key_map[base_key]
+        
+        arr = self._load_chunk_array(clip_idx, chunk_path, actual_key)
         return arr[local_idx]
     
     def _build_sample_index(self):
@@ -962,25 +1051,35 @@ class VLNSlidingWindowDataset(Dataset):
             indices = np.linspace(start, end - 1, num_samples, dtype=int)
             return indices
     
-    def _load_frame(self, clip_dir: Path, frame_idx: int, apply_augmentation: bool = True) -> torch.Tensor:
-        """加载单帧图像"""
+    def _load_frame(self, clip_dir: Path, frame_idx: int,
+                    apply_augmentation: bool = True,
+                    direction: Optional[str] = None) -> torch.Tensor:
+        """加载单帧图像
+        
+        Args:
+            direction: 指定方向 (front/right/back/left)，None 使用默认 chunk_direction
+        """
         clip_idx = self._get_clip_idx(clip_dir)
         storage_format = self._get_storage_format(clip_idx)
         
         if storage_format == "chunks":
-            image = np.array(self._get_chunk_frame_array(clip_idx, frame_idx, "rgb"))
-            if image.ndim == 3 and image.shape[2] >= 3:
-                # 与 cv2.imread 对齐：按 BGR 存储读取后转成 RGB
-                image = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2RGB)
+            raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction=direction)
+            if isinstance(raw, np.ndarray) and raw.ndim == 1 and raw.dtype == np.uint8:
+                image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                if image is None:
+                    raise ValueError(f"Failed to decode JPEG at clip={clip_dir}, frame={frame_idx}")
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            elif isinstance(raw, np.ndarray) and raw.ndim == 3 and raw.shape[2] >= 3:
+                image = cv2.cvtColor(raw[:, :, :3], cv2.COLOR_BGR2RGB)
             else:
-                raise ValueError(f"Invalid chunk rgb shape at clip={clip_dir}, frame={frame_idx}, shape={image.shape}")
+                raise ValueError(f"Invalid chunk rgb at clip={clip_dir}, frame={frame_idx}, shape={getattr(raw, 'shape', '?')}, dtype={getattr(raw, 'dtype', '?')}")
         else:
-            # 支持 flat 与方向子目录两种布局
+            dir_name = direction or self.chunk_direction
             rgb_candidates = [
                 clip_dir / "rgb" / f"{frame_idx:06d}.jpg",
                 clip_dir / "rgb" / f"{frame_idx:06d}.png",
-                clip_dir / "rgb" / self.chunk_direction / f"{frame_idx:06d}.jpg",
-                clip_dir / "rgb" / self.chunk_direction / f"{frame_idx:06d}.png",
+                clip_dir / "rgb" / dir_name / f"{frame_idx:06d}.jpg",
+                clip_dir / "rgb" / dir_name / f"{frame_idx:06d}.png",
             ]
             rgb_path = next((p for p in rgb_candidates if p.exists()), None)
             if rgb_path is None:
@@ -989,20 +1088,16 @@ class VLNSlidingWindowDataset(Dataset):
             image = cv2.imread(str(rgb_path))
             if image is None:
                 raise ValueError(f"Failed to load image: {rgb_path}")
-            # BGR -> RGB
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # 调整尺寸
         target_w, target_h = self.image_size
         if image.shape[:2] != (target_h, target_w):
             image = cv2.resize(image, (target_w, target_h))
 
-        # 应用数据增强 (仅训练集)
         if apply_augmentation and self.enable_augmentation:
             image = self.color_jitter(image)
             image = self.gaussian_noise(image)
 
-        # 转换为 tensor 并归一化
         image_tensor = torch.from_numpy(image).float() / 255.0
         image_tensor = image_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
 
@@ -1017,8 +1112,88 @@ class VLNSlidingWindowDataset(Dataset):
         
         return torch.stack(frames, dim=0)  # [K, C, H, W]
     
-    def _load_depth(self, clip_dir: Path, frame_idx: int) -> Optional[np.ndarray]:
-        """加载深度图"""
+    PANORAMIC_DIRECTIONS = ["front", "right", "back", "left"]
+    
+    def _load_panoramic_grid(self, clip_dir: Path, frame_idx: int) -> torch.Tensor:
+        """加载 4 个方向的图像并拼成 2x2 全景网格。
+        
+        布局: top-left=Front, top-right=Right, bottom-left=Back, bottom-right=Left
+        
+        Returns:
+            [3, 2*H, 2*W] tensor (e.g. [3, 448, 448] for image_size=224)
+        """
+        views = []
+        for d in self.PANORAMIC_DIRECTIONS:
+            view = self._load_frame(clip_dir, frame_idx, apply_augmentation=True, direction=d)
+            views.append(view)  # each [C, H, W]
+        
+        top = torch.cat([views[0], views[1]], dim=2)    # [C, H, 2W]
+        bottom = torch.cat([views[2], views[3]], dim=2)  # [C, H, 2W]
+        grid = torch.cat([top, bottom], dim=1)           # [C, 2H, 2W]
+        return grid
+    
+    def _load_all_views(self, clip_dir: Path, frame_idx: int) -> torch.Tensor:
+        """加载 4 个方向的独立图像。
+        
+        Returns:
+            [4, C, H, W] tensor
+        """
+        views = []
+        for d in self.PANORAMIC_DIRECTIONS:
+            view = self._load_frame(clip_dir, frame_idx, apply_augmentation=True, direction=d)
+            views.append(view)
+        return torch.stack(views, dim=0)
+    
+    def _compute_multiview_heatmaps(
+        self,
+        clip_idx: int,
+        clip_dir: Path,
+        history_poses: List[np.ndarray],
+        current_t: int,
+        img_size: Tuple[int, int],
+        K: Optional[np.ndarray],
+        hm_size: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, int]:
+        """为 4 个方向分别计算热力图。
+        
+        Returns:
+            heatmaps: [4, Hm, Wm] tensor
+            total_visibility: 所有方向可见的历史帧总数
+        """
+        heatmaps = []
+        total_visibility = 0
+        
+        for d in self.PANORAMIC_DIRECTIONS:
+            try:
+                pose = self._get_chunk_frame_array(clip_idx, current_t, "pose", direction=d)
+                current_pose = np.array(pose, dtype=np.float32)
+            except (KeyError, Exception):
+                current_pose = self._load_poses(clip_idx)[current_t]
+            
+            current_depth = self._load_depth(clip_dir, current_t, direction=d)
+            
+            hm_h, hm_w = hm_size
+            hm, vis = compute_history_heatmap(
+                history_poses=history_poses,
+                current_pose=current_pose,
+                current_depth=current_depth,
+                hm_size=(hm_h, hm_w),
+                img_size=img_size,
+                K=K,
+                depth_normalize=not self._depth_is_meters,
+            )
+            heatmaps.append(torch.from_numpy(hm).float())
+            total_visibility += vis
+        
+        return torch.stack(heatmaps, dim=0), total_visibility
+    
+    def _load_depth(self, clip_dir: Path, frame_idx: int,
+                    direction: Optional[str] = None) -> Optional[np.ndarray]:
+        """加载深度图
+        
+        Args:
+            direction: 指定方向 (front/right/back/left)，None 使用默认 chunk_direction
+        """
         if not self.load_depth:
             return None
         
@@ -1027,13 +1202,15 @@ class VLNSlidingWindowDataset(Dataset):
         
         if storage_format == "chunks":
             try:
-                return np.array(self._get_chunk_frame_array(clip_idx, frame_idx, "depth"))
+                return np.array(self._get_chunk_frame_array(clip_idx, frame_idx, "depth",
+                                                            direction=direction))
             except KeyError:
                 return None
         
+        dir_name = direction or self.chunk_direction
         depth_candidates = [
             clip_dir / "depth" / f"{frame_idx:06d}.npy",
-            clip_dir / "depth" / self.chunk_direction / f"{frame_idx:06d}.npy",
+            clip_dir / "depth" / dir_name / f"{frame_idx:06d}.npy",
         ]
         depth_path = next((p for p in depth_candidates if p.exists()), None)
         if depth_path is None:
@@ -1175,7 +1352,12 @@ class VLNSlidingWindowDataset(Dataset):
             history_frames = self._load_frames(clip_dir, history_indices)
             
             # 4. 加载当前帧
-            current_frame = self._load_frame(clip_dir, current_t)
+            if self._is_panoramic:
+                current_frame = self._load_panoramic_grid(clip_dir, current_t)
+                current_views = self._load_all_views(clip_dir, current_t)
+            else:
+                current_frame = self._load_frame(clip_dir, current_t)
+                current_views = None
             
             # 5. 加载位姿
             poses = self._load_poses(clip_idx)
@@ -1186,7 +1368,6 @@ class VLNSlidingWindowDataset(Dataset):
             current_depth = self._load_depth(clip_dir, current_t)
             
             # 7. 计算热力图
-            # 获取原始图像尺寸和相机内参
             intrinsics_path = clip_dir / "intrinsics.json"
             K = None
             if intrinsics_path.exists():
@@ -1196,18 +1377,31 @@ class VLNSlidingWindowDataset(Dataset):
                 if "K" in intrinsics:
                     K = np.array(intrinsics["K"], dtype=np.float32)
             else:
-                img_size = (640, 480)  # 默认 Pinhole 图像尺寸
+                img_size = (640, 480)
             
             hm_w, hm_h = self.hm_size
-            heatmap, visibility = compute_history_heatmap(
-                history_poses=history_poses,
-                current_pose=current_pose,
-                current_depth=current_depth,
-                hm_size=(hm_h, hm_w),
-                img_size=img_size,
-                K=K,
-            )
-            heatmap_tensor = torch.from_numpy(heatmap).float()
+            
+            if self._is_panoramic:
+                heatmap_tensor, visibility = self._compute_multiview_heatmaps(
+                    clip_idx=clip_idx,
+                    clip_dir=clip_dir,
+                    history_poses=history_poses,
+                    current_t=current_t,
+                    img_size=img_size,
+                    K=K,
+                    hm_size=(hm_h, hm_w),
+                )
+            else:
+                heatmap, visibility = compute_history_heatmap(
+                    history_poses=history_poses,
+                    current_pose=current_pose,
+                    current_depth=current_depth,
+                    hm_size=(hm_h, hm_w),
+                    img_size=img_size,
+                    K=K,
+                    depth_normalize=not self._depth_is_meters,
+                )
+                heatmap_tensor = torch.from_numpy(heatmap).float()
             
             # 8. 加载连续动作
             actions = self._load_actions(clip_dir)
@@ -1245,16 +1439,19 @@ class VLNSlidingWindowDataset(Dataset):
                 discrete_action = 1  # Default to FORWARD
                 is_stop = 0.0
             
-            return {
+            result = {
                 "history_frames": history_frames,      # [K, 3, H, W]
-                "current_frame": current_frame,        # [3, H, W]
-                "heatmap": heatmap_tensor,             # [Hm, Wm]
+                "current_frame": current_frame,        # [3, H, W] or [3, 2H, 2W] (panoramic)
+                "heatmap": heatmap_tensor,             # [Hm, Wm] or [4, Hm, Wm] (panoramic)
                 "action": action_tensor,               # [2]
                 "action_valid": action_valid,          # float
                 "discrete_action": discrete_action,    # int (0-3)
                 "is_stop": is_stop,                    # float (0 or 1)
                 "text": text,                          # str
             }
+            if current_views is not None:
+                result["current_views"] = current_views  # [4, 3, H, W]
+            return result
             
         except Exception as e:
             logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
@@ -1268,16 +1465,30 @@ class VLNSlidingWindowDataset(Dataset):
         hm_w, hm_h = self.hm_size
         K = self.num_history_sample
         
-        return {
-            "history_frames": torch.zeros(K, 3, target_h, target_w),
-            "current_frame": torch.zeros(3, target_h, target_w),
-            "heatmap": torch.zeros(hm_h, hm_w),
-            "action": torch.zeros(2),
-            "action_valid": 0.0,
-            "discrete_action": 1,  # Default to FORWARD
-            "is_stop": 0.0,
-            "text": "",
-        }
+        if self._is_panoramic:
+            result = {
+                "history_frames": torch.zeros(K, 3, target_h, target_w),
+                "current_frame": torch.zeros(3, target_h * 2, target_w * 2),
+                "current_views": torch.zeros(4, 3, target_h, target_w),
+                "heatmap": torch.zeros(4, hm_h, hm_w),
+                "action": torch.zeros(2),
+                "action_valid": 0.0,
+                "discrete_action": 1,
+                "is_stop": 0.0,
+                "text": "",
+            }
+        else:
+            result = {
+                "history_frames": torch.zeros(K, 3, target_h, target_w),
+                "current_frame": torch.zeros(3, target_h, target_w),
+                "heatmap": torch.zeros(hm_h, hm_w),
+                "action": torch.zeros(2),
+                "action_valid": 0.0,
+                "discrete_action": 1,
+                "is_stop": 0.0,
+                "text": "",
+            }
+        return result
 
 
 def create_sliding_window_dataloader(
@@ -1937,6 +2148,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 hm_size=(hm_h, hm_w),
                 img_size=img_size,
                 K=K,
+                depth_normalize=not self._depth_is_meters,
             )
             heatmap_tensor = torch.from_numpy(heatmap).float()
             

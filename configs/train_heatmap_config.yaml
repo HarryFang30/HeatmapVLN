@@ -23,8 +23,8 @@ data:
     cache_poses: true
     sample_stride: 2             # 采样步长
     
-    # GPU 热力图计算（大幅提升训练速度）
-    defer_heatmap_to_gpu: true   # 在 GPU 上计算热力图，减少 CPU 瓶颈
+    # GPU 热力图计算 — 全景模式下关闭（4 视角热力图在 CPU 生成更简单）
+    defer_heatmap_to_gpu: false
     
     # Clip-level 采样策略
     clip_level_sampling: true
@@ -262,9 +262,9 @@ optim:
   warmup_ratio: 0.1
   min_lr: 1.0e-6
   
-  # 批量配置（单头训练可以用更大 batch）
-  batch_size: 16              # 只训练热力图头，可以增加 batch
-  grad_accum_steps: 2         # 有效 batch = 32
+  # 批量配置 — 全景 4 视角模式下 heatmap head 有效 batch = 4*4 = 16
+  batch_size: 4               # 4 视角展开后 heatmap head 实际处理 B*4=16
+  grad_accum_steps: 4         # 有效 batch = 4*4 = 16
 
 # ============================================
 # 损失函数

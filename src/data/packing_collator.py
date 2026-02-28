@@ -214,12 +214,24 @@ class PackingCollatorForVLN:
         if not instruction:
             instruction = "Navigate according to the visual observations."
         
-        prompt_text = (
-            f"You are a navigation assistant. "
-            f"The video shows the historical trajectory, and the image shows your current view. "
-            f"Instruction: {instruction}. "
-            f"Understand the spatial layout and identify where you came from."
-        )
+        is_panoramic = (current_frame.shape[-1] != current_frame.shape[-2] or
+                        current_frame.shape[-1] > 300)
+        if is_panoramic:
+            prompt_text = (
+                "You are a navigation assistant. "
+                "The video shows the historical trajectory from a forward-facing camera. "
+                "The image shows your current panoramic observation in a 2x2 grid: "
+                "top-left=Front, top-right=Right, bottom-left=Back, bottom-right=Left. "
+                f"Instruction: {instruction}. "
+                "Understand the full 360-degree spatial layout and identify where you came from."
+            )
+        else:
+            prompt_text = (
+                f"You are a navigation assistant. "
+                f"The video shows the historical trajectory, and the image shows your current view. "
+                f"Instruction: {instruction}. "
+                f"Understand the spatial layout and identify where you came from."
+            )
         
         # 构建 messages
         # 使用 nframes 明确指定帧数，避免 fps 采样警告
@@ -389,6 +401,10 @@ class PackingCollatorForVLN:
             "is_stop": torch.tensor([s.get('is_stop', 0.0) for s in batch]),
             "text": [s['text'] for s in batch],
         }
+        
+        if 'current_views' in batch[0]:
+            packed_batch['current_views'] = torch.stack(
+                [s['current_views'] for s in batch], dim=0)  # [B, 4, C, H, W]
         
         # 轨迹数据集的额外字段
         if 'trajectory' in batch[0]:

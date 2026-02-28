@@ -824,23 +824,41 @@ class VLNPipeline(nn.Module):
         history_heatmap_peak_dist_loss = None
         
         if return_heatmaps:
-            observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
             llm_tokens_hm = llm_tokens_for_heatmap.to(dtype=self.config.dtype)
+            
+            current_views = packed_batch.get("current_views")
+            
+            if current_views is not None:
+                current_views = current_views.to(device=self.device, dtype=self.config.dtype)
+                B, num_views, C, H, W = current_views.shape
+                observation_for_heatmap = current_views.reshape(B * num_views, C, H, W)
+                llm_tokens_hm = llm_tokens_hm.unsqueeze(1).expand(
+                    -1, num_views, -1, -1).reshape(B * num_views, -1, llm_tokens_hm.shape[-1])
+            else:
+                observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
+                num_views = 0
             
             # History Heatmap
             if self.history_heatmap_head is not None:
                 if gt_history_heatmap is not None:
-                    # 有 GT 时用噪声预测（训练和验证均可用，只需 1 次 UNet 前向）
                     gt_history_hm = gt_history_heatmap.to(self.device)
+                    if current_views is not None and gt_history_hm.dim() == 4:
+                        gt_history_hm = gt_history_hm.reshape(
+                            B * num_views, *gt_history_hm.shape[2:])
+                    
                     result = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_history_hm,
                         return_loss=True,
-                        skip_inference=not self.training,  # eval 模式跳过推理（验证加速）
+                        skip_inference=not self.training,
                     )
                     history_heatmap_loss = result['loss']
-                    history_heatmap = result.get('heatmap')
+                    raw_heatmap = result.get('heatmap')
+                    if raw_heatmap is not None and num_views > 0:
+                        history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
+                    else:
+                        history_heatmap = raw_heatmap
                     history_heatmap_noise_std = result.get('noise_std')
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
@@ -851,11 +869,14 @@ class VLNPipeline(nn.Module):
                     history_heatmap_neg_zero_loss = result.get('neg_zero_loss')
                     history_heatmap_peak_dist_loss = result.get('peak_dist_loss')
                 else:
-                    # 无 GT 时走完整扩散推理（纯推理/可视化）
-                    history_heatmap = self.history_heatmap_head(
+                    raw_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
                     )
+                    if raw_heatmap is not None and num_views > 0:
+                        history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
+                    else:
+                        history_heatmap = raw_heatmap
             
             # Future Heatmap
             if self.future_heatmap_head is not None:
