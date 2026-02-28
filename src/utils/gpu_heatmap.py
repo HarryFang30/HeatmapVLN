@@ -39,9 +39,12 @@ class GPUHeatmapComputer:
         occlusion_tolerance: float = 0.5,
         depth_min: float = 0.0,
         depth_max: float = 10.0,
-        min_sigma: float = 0.8,
+        min_sigma: float = 1.5,
         max_sigma: float = 6.0,
         object_size_3d: float = 0.5,
+        use_distance_decay: bool = True,
+        distance_decay_ref: float = 5.0,
+        min_peak_value: float = 0.3,
     ):
         self.hm_size = hm_size  # (H, W)
         self.img_size = img_size  # (W, H)
@@ -53,6 +56,9 @@ class GPUHeatmapComputer:
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
         self.object_size_3d = object_size_3d
+        self.use_distance_decay = use_distance_decay
+        self.distance_decay_ref = distance_decay_ref
+        self.min_peak_value = min_peak_value
         
         # Pre-compute default intrinsics (HFOV=90°)
         img_w, img_h = img_size
@@ -137,23 +143,24 @@ class GPUHeatmapComputer:
         # Compute distances
         distances = torch.sqrt(x_cam**2 + y_cam**2 + z_cam**2)  # [B, K]
         
+        # Habitat camera: X right, Y up, -Z forward
+        # Points in front of camera have z < 0; convert to positive depth
+        z_depth = -z_cam  # [B, K] positive depth values
+        
         # Validity masks
         valid_distance = (distances > 1e-4) & (distances < self.max_visible_distance)
-        valid_in_front = z_cam > 1e-4  # Must be in front of camera
+        valid_in_front = z_depth > 0.1  # at least 0.1m in front
         
-        # Project to image coordinates (Pinhole projection)
-        # u = fx * x / z + cx
-        # v = fy * y / z + cy
+        # Pinhole projection with Habitat conventions
         fx_batch = K_mat[:, 0, 0].unsqueeze(1)  # [B, 1]
         fy_batch = K_mat[:, 1, 1].unsqueeze(1)  # [B, 1]
         cx_batch = K_mat[:, 0, 2].unsqueeze(1)  # [B, 1]
         cy_batch = K_mat[:, 1, 2].unsqueeze(1)  # [B, 1]
         
-        # Avoid division by zero
-        z_safe = torch.where(z_cam > 1e-4, z_cam, torch.ones_like(z_cam))
+        z_safe = torch.where(z_depth > 0.1, z_depth, torch.ones_like(z_depth))
         
-        u = fx_batch * x_cam / z_safe + cx_batch  # [B, K]
-        v = fy_batch * y_cam / z_safe + cy_batch  # [B, K]
+        u = fx_batch * x_cam / z_safe + cx_batch           # [B, K]
+        v = fy_batch * (-y_cam) / z_safe + cy_batch        # [B, K] Y axis flipped
         
         # Check if projected points are within image bounds
         valid_bounds = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
@@ -165,89 +172,81 @@ class GPUHeatmapComputer:
         if current_depths is not None:
             depth_h, depth_w = current_depths.shape[1], current_depths.shape[2]
             
-            # Map image coordinates to depth map coordinates
             u_d = u * (depth_w / img_w)
             v_d = v * (depth_h / img_h)
             
-            # Clamp to valid range
             u_d = torch.clamp(u_d, 0, depth_w - 1).long()
             v_d = torch.clamp(v_d, 0, depth_h - 1).long()
             
-            # Sample depth values
-            # Create batch indices
-            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K)  # [B, K]
+            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, K)
             observed_depth = current_depths[batch_idx, v_d, u_d]  # [B, K]
             
-            # Denormalize if needed
             if depth_normalized:
                 observed_depth = self.depth_min + observed_depth * (self.depth_max - self.depth_min)
             
-            # Check occlusion
             valid_depth = (observed_depth > 0) & torch.isfinite(observed_depth)
-            not_occluded = observed_depth >= (z_cam - self.occlusion_tolerance)
+            not_occluded = observed_depth >= (z_depth - self.occlusion_tolerance)
             
             valid = valid & valid_depth & not_occluded
         
-        # Compute adaptive sigma for each point
-        # sigma = (object_size_3d * fx / z) * (heatmap_width / img_width)
+        # Adaptive sigma (in heatmap coordinate space)
         sigma = (self.object_size_3d * fx_batch / z_safe) * (Wm / img_w)  # [B, K]
         sigma = torch.clamp(sigma, self.min_sigma, self.max_sigma)
+        
+        # Distance decay: near points have peak ~1.0, far points decay to min_peak_value
+        if self.use_distance_decay:
+            decay = 1.0 / (1.0 + distances / self.distance_decay_ref)
+            peak_values = self.min_peak_value + (1.0 - self.min_peak_value) * decay  # [B, K]
+        else:
+            peak_values = torch.ones_like(distances)
         
         # Convert to heatmap coordinates
         u_hm = u * Wm / img_w  # [B, K]
         v_hm = v * Hm / img_h  # [B, K]
         
-        # Render Gaussians
-        heatmaps = self._render_gaussians_batch(u_hm, v_hm, sigma, valid)  # [B, Hm, Wm]
-        
-        # Normalize each heatmap
-        max_vals = heatmaps.view(B, -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)  # [B, 1, 1]
-        max_vals = torch.where(max_vals > 0, max_vals, torch.ones_like(max_vals))
-        heatmaps = heatmaps / max_vals
+        # Render Gaussians (max merge, with per-point peak values)
+        heatmaps = self._render_gaussians_batch(u_hm, v_hm, sigma, valid, peak_values)
         
         return heatmaps
     
     def _render_gaussians_batch(
         self,
-        u_hm: torch.Tensor,    # [B, K]
-        v_hm: torch.Tensor,    # [B, K]
-        sigma: torch.Tensor,   # [B, K]
-        valid: torch.Tensor,   # [B, K]
+        u_hm: torch.Tensor,       # [B, K]
+        v_hm: torch.Tensor,       # [B, K]
+        sigma: torch.Tensor,      # [B, K]
+        valid: torch.Tensor,      # [B, K]
+        peak_values: torch.Tensor, # [B, K]
     ) -> torch.Tensor:
         """
-        Render batch of Gaussian heatmaps.
-        
-        Uses vectorized computation to render all K Gaussians per sample
-        in a single operation.
+        Render batch of Gaussian heatmaps using max merge.
+
+        Each Gaussian is scaled by its peak_value (from distance decay),
+        then combined via element-wise max to avoid saturation in
+        overlapping regions.
         """
         B, K = u_hm.shape
         Hm, Wm = self.hm_size
         device = u_hm.device
         
-        # Expand grid for batch computation
-        # grid_x, grid_y: [Hm, Wm] -> [1, 1, Hm, Wm]
         grid_x = self.grid_x.to(device).unsqueeze(0).unsqueeze(0)  # [1, 1, Hm, Wm]
         grid_y = self.grid_y.to(device).unsqueeze(0).unsqueeze(0)  # [1, 1, Hm, Wm]
         
-        # Reshape centers and sigma for broadcasting
-        # [B, K] -> [B, K, 1, 1]
-        u_hm = u_hm.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
-        v_hm = v_hm.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
-        sigma = sigma.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+        u_hm = u_hm.unsqueeze(-1).unsqueeze(-1)           # [B, K, 1, 1]
+        v_hm = v_hm.unsqueeze(-1).unsqueeze(-1)           # [B, K, 1, 1]
+        sigma = sigma.unsqueeze(-1).unsqueeze(-1)          # [B, K, 1, 1]
         valid = valid.unsqueeze(-1).unsqueeze(-1).float()  # [B, K, 1, 1]
+        peak_values = peak_values.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
         
-        # Compute Gaussian: exp(-((x - cx)^2 + (y - cy)^2) / (2 * sigma^2))
         dx = grid_x - u_hm  # [B, K, Hm, Wm]
         dy = grid_y - v_hm  # [B, K, Hm, Wm]
         
-        # Avoid division by zero
         sigma_safe = torch.where(sigma > 1e-6, sigma, torch.ones_like(sigma))
         
-        gaussians = torch.exp(-(dx**2 + dy**2) / (2 * sigma_safe**2))  # [B, K, Hm, Wm]
-        
-        # Apply validity mask and sum over K
+        gaussians = peak_values * torch.exp(-(dx**2 + dy**2) / (2 * sigma_safe**2))
         gaussians = gaussians * valid  # [B, K, Hm, Wm]
-        heatmaps = gaussians.sum(dim=1)  # [B, Hm, Wm]
+        
+        # Max merge over K history points (consistent with CPU version)
+        heatmaps = gaussians.max(dim=1)[0]  # [B, Hm, Wm]
         
         return heatmaps
     
