@@ -661,8 +661,10 @@ class VLNSlidingWindowDataset(Dataset):
         """预计算每个 clip 的有效帧索引列表（用于 clip-level 采样）
         
         有效帧 = 有足够历史帧的帧 (frame_idx >= min_history)
+        同时验证 chunk 完整性，排除有损坏文件的 clip。
         """
         self._clip_valid_frames = {}
+        skipped_corrupted = 0
         
         for clip_idx, clip_dir in enumerate(self.clips):
             try:
@@ -674,7 +676,23 @@ class VLNSlidingWindowDataset(Dataset):
                     meta = json.load(f)
                 
                 T = meta["num_frames"]
-                # 有效帧：从 min_history 到 T-1
+                
+                chunks_dir = clip_dir / "chunks"
+                if chunks_dir.exists():
+                    chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
+                    has_corrupted = False
+                    for cf in chunk_files:
+                        try:
+                            with np.load(cf, allow_pickle=True) as _:
+                                pass
+                        except Exception:
+                            logger.warning(f"Corrupted chunk, excluding clip: {cf}")
+                            has_corrupted = True
+                            break
+                    if has_corrupted:
+                        skipped_corrupted += 1
+                        continue
+                
                 valid_frames = list(range(self.min_history, T))
                 
                 if len(valid_frames) > 0:
@@ -684,6 +702,8 @@ class VLNSlidingWindowDataset(Dataset):
                 logger.warning(f"Failed to precompute valid frames for clip {clip_dir}: {e}")
                 continue
         
+        if skipped_corrupted > 0:
+            logger.warning(f"Excluded {skipped_corrupted} clips with corrupted chunk files")
         logger.info(f"Precomputed valid frames for {len(self._clip_valid_frames)} clips")
     
     def set_epoch(self, epoch: int):
