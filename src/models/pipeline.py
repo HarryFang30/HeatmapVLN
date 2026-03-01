@@ -828,12 +828,14 @@ class VLNPipeline(nn.Module):
             
             current_views = packed_batch.get("current_views")
             
+            direction_indices = None
             if current_views is not None:
                 current_views = current_views.to(device=self.device, dtype=self.config.dtype)
                 B, num_views, C, H, W = current_views.shape
                 observation_for_heatmap = current_views.reshape(B * num_views, C, H, W)
                 llm_tokens_hm = llm_tokens_hm.unsqueeze(1).expand(
                     -1, num_views, -1, -1).reshape(B * num_views, -1, llm_tokens_hm.shape[-1])
+                direction_indices = torch.arange(num_views, device=self.device).unsqueeze(0).expand(B, -1).reshape(B * num_views)
             else:
                 observation_for_heatmap = current_observation.to(dtype=self.config.dtype)
                 num_views = 0
@@ -852,6 +854,7 @@ class VLNPipeline(nn.Module):
                         gt_heatmap=gt_history_hm,
                         return_loss=True,
                         skip_inference=not self.training,
+                        direction_indices=direction_indices,
                     )
                     history_heatmap_loss = result['loss']
                     raw_heatmap = result.get('heatmap')
@@ -872,6 +875,7 @@ class VLNPipeline(nn.Module):
                     raw_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
+                        direction_indices=direction_indices,
                     )
                     if raw_heatmap is not None and num_views > 0:
                         history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
@@ -888,7 +892,8 @@ class VLNPipeline(nn.Module):
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_future_hm,
                         return_loss=True,
-                        skip_inference=not self.training,  # eval 模式跳过推理
+                        skip_inference=not self.training,
+                        direction_indices=direction_indices,
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
@@ -898,6 +903,7 @@ class VLNPipeline(nn.Module):
                     future_heatmap = self.future_heatmap_head(
                         llm_tokens=llm_tokens_hm,
                         observation=observation_for_heatmap,
+                        direction_indices=direction_indices,
                     )
         
         # ==================== Step 4: Action Generation ====================

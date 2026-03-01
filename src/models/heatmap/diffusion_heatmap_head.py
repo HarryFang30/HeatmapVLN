@@ -151,6 +151,13 @@ class DiffusionHeatmapHead(nn.Module):
             )
             logger.info("VisibilityHead (enhanced 3-layer) enabled: cond_dim=%d -> 1 (binary)", config.cond_dim)
         
+        # ==================== Direction Embedding ====================
+        # 多视角模式下为 front/right/back/left 注入可学习方向嵌入
+        # 零初始化：起步等价于无嵌入，作为残差逐步学习方向特征
+        self.direction_embedding = nn.Embedding(config.num_directions, config.cond_dim)
+        nn.init.zeros_(self.direction_embedding.weight)
+        logger.info("DirectionEmbedding: %d directions x %d dim (zero-init)", config.num_directions, config.cond_dim)
+        
         # ==================== Noise Scheduler ====================
         # Training: DDPM (stochastic, standard for training)
         self.noise_scheduler = DDPMScheduler(
@@ -199,7 +206,8 @@ class DiffusionHeatmapHead(nn.Module):
         observation: torch.Tensor,
         gt_heatmap: Optional[torch.Tensor] = None,
         return_loss: bool = False,
-        skip_inference: bool = False,  # 🆕 训练时跳过推理以提升速度
+        skip_inference: bool = False,
+        direction_indices: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass for heatmap generation.
@@ -238,6 +246,13 @@ class DiffusionHeatmapHead(nn.Module):
         else:
             cond = self.condition_encoder(llm_tokens, observation)  # (B, cond_dim)
             seq_cond = None
+        
+        # 2.5 Inject direction embedding for multi-view differentiation
+        if direction_indices is not None:
+            dir_emb = self.direction_embedding(direction_indices)  # (B, cond_dim)
+            cond = cond + dir_emb
+            if seq_cond is not None:
+                seq_cond = seq_cond + dir_emb.unsqueeze(1)
         
         # 3. Training mode
         if gt_heatmap is not None and return_loss:

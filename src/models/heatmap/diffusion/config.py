@@ -156,6 +156,11 @@ class DiffusionHeatmapConfig:
     peak_distance_loss_weight: float = 2.0   # 峰值距离损失权重 (0 = 禁用)
     peak_loss_temperature: float = 0.1       # soft-argmax 温度（越低越接近真实 argmax）
     
+    # ==================== Direction Embedding ====================
+    # 多视角（全景）模式下为每个方向注入可学习嵌入
+    # 解决 LLM tokens 被复制 4 份后无法区分视角的问题
+    num_directions: int = 4                  # 方向数（front=0, right=1, back=2, left=3）
+    
     def __post_init__(self):
         """Validate configuration."""
         assert self.llm_dim > 0, "llm_dim must be positive"
