@@ -32,13 +32,17 @@ HeatmapVLN 是一个用于视觉语言导航（VLN）任务的深度学习框架
 | 特性 | 描述 |
 |:-----|:-----|
 | 🔥 **历史热力图** | 基于 Diffusion 生成历史相机位置在当前视角的热力图投影 |
-| 🎯 **轨迹预测** | 24 步连续轨迹预测 (x, y, θ) |
-| 📊 **进度估计** | 任务完成进度回归 (0-1) |
-| 🛑 **停止预测** | 基于 Focal Loss 的二分类，判断是否到达目标 |
+| 🔮 **未来热力图** | 基于 Diffusion 预测未来位置在当前视角的投影（可选） |
+| 👁️ **多视图支持** | 360° 全景图：4个方向同时预测，支持 circular_padding |
+| 🎯 **轨迹预测** | 24 步连续轨迹预测 (x, y, θ)，Transformer + Diffusion |
+| 📊 **进度估计** | 任务完成进度回归 (0-1)，3层 MLP |
+| 🛑 **停止预测** | 基于 Focal Loss 的二分类（已弃用，用 Progress 替代） |
 | 👁️ **可见性预测** | 预测目标位置是否在当前视角可见，控制假阳性 |
 | 🧠 **Qwen3-VL 骨干** | 视觉语言预训练模型，支持可选 LoRA 微调 |
+| 📡 **Multi-Layer Features** | 从 LLM 多层提取特征并融合 (CVPR 2025 最佳实践) |
 | ⚡ **Sequence Packing** | 高效批量训练，消除 padding 浪费 |
 | 🎛️ **模块化设计** | 可独立启用/禁用各预测头 |
+| 🔄 **360° 全景支持** | circular_padding 处理左右边界连续性 |
 
 ---
 
@@ -170,26 +174,39 @@ tensorboard --logdir=/root/tf-logs/latest --port=6006
 |:-----|:-----|:-----|
 | **训练损失** | `train/loss` | 总损失 |
 | | `train/history_heatmap_loss` | 历史热力图损失 |
-| | `train/trajectory_loss` | 轨迹损失 |
+| | `train/trajectory_loss` | 轨迹损失 (Transformer Diffusion) |
 | | `train/progress_loss` | 进度损失 |
+| **Multi-Layer Fusion** | `diag/fusion_weight_layer{i}` | 各层融合权重 |
 | **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
 | | `diag/pred_heatmap_mean` | 预测均值 |
+| | `diag/pred_heatmap_std` | 预测标准差 |
 | | `diag/pred_heatmap_nonzero_ratio` | 非零像素比例 |
 | | `diag/heatmap_base_loss` | base MSE 损失 |
 | | `diag/heatmap_focal_loss` | focal 加权损失 |
 | | `diag/heatmap_focal_ratio` | focal/base 比值 |
 | | `diag/heatmap_x0_loss` | x0 重构损失 |
-| | `diag/heatmap_sparsity_loss` | 稀疏性正则化损失 |
+| | `diag/heatmap_sparsity_loss` | L1 稀疏性正则化损失 |
+| | `diag/heatmap_dice_loss` | Dice 损失 |
+| | `diag/heatmap_neg_zero_loss` | 负样本零目标损失 (SNR门控) |
 | | `diag/heatmap_peak_dist_loss` | 峰值距离损失 |
 | | `diag/heatmap_visibility_loss` | 可见性 BCE 损失 |
 | | `diag/hm_peak_distance` | 峰值位置误差（像素） |
+| | `diag/hm_peak_dx/dy` | 峰值位置 X/Y 偏差 |
 | | `diag/hm_peak_iou` | 峰值 IoU |
+| | `diag/hm_pred_peak_conf` | 预测峰值置信度 |
+| | `diag/hm_gt_peak_conf` | 真实峰值置信度 |
+| | `diag/hm_peak_conf_ratio` | 预测/真实峰值置信度比值 |
 | | `diag/hm_multi_peak_distance` | 多峰平均距离 |
 | | `diag/hm_peak_recall_5px` | 5像素内召回率 |
+| | `diag/hm_avg_gt_peaks` | 平均真实峰值数量 |
 | **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
 | | `diag/trajectory_fde` | 终点位移误差 |
 | **进度诊断** | `diag/progress_mae` | 进度 MAE |
+| | `diag/progress_pred_mean` | 预测进度均值 |
+| | `diag/progress_gt_mean` | 真实进度均值 |
+| | `diag/progress_boundary_error` | 进度边界误差 (0/1附件) |
 | **资源监控** | `diag/gpu_memory_gb` | GPU 显存使用量 |
+| | `diag/gpu_memory_reserved_gb` | GPU 预留显存 |
 
 </details>
 
@@ -238,49 +255,73 @@ python scripts/evaluate.py \
 ### 整体架构
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                           VLN Pipeline                               │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  输入                                                                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
-│  │ History [K帧]│  │ Current Frame│  │ Instruction  │               │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘               │
-│         └─────────────────┴─────────────────┘                        │
-│                           │                                          │
-│                           ▼                                          │
-│                  ┌─────────────────┐                                 │
-│                  │    Qwen3-VL     │  ← 冻结 (可选 LoRA 微调)        │
-│                  │   (Backbone)    │                                 │
-│                  └────────┬────────┘                                 │
-│                           │                                          │
-│              hidden_states [B, seq, 4096]                            │
-│                           │                                          │
-│                  ┌────────┴────────┐                                 │
-│                  │  LLM Projector  │  4096 → 1024                    │
-│                  └────────┬────────┘                                 │
-│                           │                                          │
-│              llm_tokens [B, seq, 1024]                               │
-│                           │                                          │
-│         ┌─────────────────┼─────────────────┐                        │
-│         ▼                 ▼                 ▼                        │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                │
-│  │   Heatmap   │   │ Trajectory  │   │  Progress   │                │
-│  │    Head     │   │    Head     │   │    Head     │                │
-│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘                │
-│         │                 │                 │                        │
-│         ▼                 ▼                 ▼                        │
-│    Heatmap          Trajectory          Progress                     │
-│    [64×64]         [24, 3]              [0, 1]                       │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              VLN Pipeline (Qwen3-VL)                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  输入                                                                                │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐                     │
+│  │ History [K帧]  │  │ Current Frame  │  │  Instruction   │                     │
+│  │  (多视图可选)   │  │   (224×224)    │  │    (文本)       │                     │
+│  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘                     │
+│          └───────────────────┬┴───────────────────┘                                │
+│                              │                                                     │
+│                              ▼                                                     │
+│                    ┌──────────────────┐                                           │
+│                    │    Qwen3-VL      │  ← 冻结 (可选 LoRA 微调)                   │
+│                    │   (Vision+LLM)   │     支持 Multi-Layer Features              │
+│                    └────────┬─────────┘                                           │
+│                             │                                                      │
+│              hidden_states [B, seq, 4096]                                          │
+│                             │                                                      │
+│         ┌────────────────────┼────────────────────┐                                │
+│         ▼                    ▼                    ▼                                │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                          │
+│  │ Multi-Layer │    │    LLM      │    │    LLM      │                          │
+│  │   Fusion    │    │  Projector  │    │  Projector  │                          │
+│  │ (可选)       │    │ 4096→1024   │    │ (Vision)    │                          │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                          │
+│         │                   │                   │                                  │
+│         └───────────────────┼───────────────────┘                                  │
+│                             │                                                      │
+│                     llm_tokens [B, seq, 1024]                                      │
+│                             │                                                      │
+│         ┌────────────────────┼────────────────────┐                                │
+│         ▼                    ▼                    ▼                                │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                          │
+│  │   Heatmap   │    │ Trajectory  │    │  Progress   │                          │
+│  │    Head     │    │    Head     │    │    Head     │                          │
+│  │  (Diffusion)│    │ (Transformer│    │    (MLP)    │                          │
+│  │  +Visible   │    │   +Diffusion)│    │             │                          │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                          │
+│         │                 │                 │                                   │
+│         ▼                 ▼                 ▼                                   │
+│    Heatmap          Trajectory          Progress                                  │
+│    [64×64]         [24, 3] (x,y,θ)      [0, 1]                                   │
+│    + Visibility                                                                    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**训练模式：**
+- **标准模式**: 逐样本处理
+- **Sequence Packing**: 多样本打包成单一长序列 (FlashAttention Varlen)
+
+**预测头输出：**
+| 预测头 | 输出维度 | 方法 |
+|:-------|:---------|:-----|
+| History Heatmap | [B, 64, 64] | Conditional UNet2D + DDPM |
+| Future Heatmap | [B, 64, 64] | Conditional UNet2D + DDPM |
+| Visibility | [B, 1] | 3层MLP (可选) |
+| Trajectory | [B, 24, 3] | Transformer Decoder + DDPM |
+| Progress | [B, 1] | 3层MLP |
 
 ### 热力图生成模块
 
-基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史相机位置在当前观测中的投影分布。支持两种热力图：
+基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史相机位置在当前观测中的投影分布。支持多种热力图：
 - **历史热力图** (History Heatmap)：历史相机位置在当前视角的投影
 - **未来热力图** (Future Heatmap)：预测的未来位置在当前视角的投影（可选）
+- **多视图热力图** (Multi-view)：4个方向的全景视图热力图
 
 采用**双路径条件注入**架构，解决将整个 LLM token 序列压缩为单向量的信息瓶颈：
 
@@ -288,15 +329,18 @@ python scripts/evaluate.py \
 
 ```
 LLM Tokens (B, ~900, 1024)
-    ├─→ AttentionPooling → global_cond (B, 1024)     ──→ FiLM (所有 ResBlock)
+    │
+    ├──→ AttentionPooling ──→ global_cond (B, 1024) ──→ FiLM (所有 ResBlock)
     │                                                      ↓
-    └─→ LinearProj → seq_cond (B, ~900, 1024)        ──→ Cross-Attention
-                                                           ↓
-Current Frame → CNN Encoder (ResNet-18) → img_cond → Fusion ──→ ConditionalUnet2D
-                                                           ↓          ↓
-                                                     DDPM + CFG → Heatmap [64×64]
-                                                           ↓
-                                                   Visibility Head → [0, 1] (是否可见)
+    ├──→ LinearProj ──→ seq_cond (B, ~900, 1024) ──→ Cross-Attention
+    │                                                      ↓
+Current Frame(s) → CNN Encoder (ResNet-18/轻量CNN) ──→ img_cond ──→ Fusion
+    │                                                                 ↓
+    │                                                     ConditionalUnet2D
+    │                                                                 ↓
+    │                                                    DDPM + CFG → Heatmap
+    │                                                                 ↓
+    └──→ [可选] Visibility Head → 3层MLP → Visibility Score (是否可见)
 ```
 
 **关键技术：**
@@ -305,11 +349,14 @@ Current Frame → CNN Encoder (ResNet-18) → img_cond → Fusion ──→ Cond
 |:-----|:-----|
 | **双路径条件注入** | FiLM (全局向量) + 序列 Cross-Attention (保留完整 LLM token 序列) |
 | **序列 Cross-Attention** | UNet 各空间位置 attend 到完整 LLM 序列，避免信息瓶颈 |
-| **Image Encoder** | CNN (ResNet-18) 编码当前图像，提供像素级空间特征辅助热力图定位 |
+| **Image Encoder** | CNN (ResNet-18 或轻量 CNN) 编码当前图像，提供像素级空间特征 |
 | **空间特征注入** | CNN 多尺度特征注入 UNet skip connections，解决全局池化导致的空间信息丢失 |
-| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=2.0) |
+| **Multi-View 支持** | 360° 全景图：4个方向同时预测，支持 circular_padding 处理边界连续性 |
+| **Multi-Layer Features** | 从 LLM 多层提取特征并融合 (CVPR 2025 最佳实践) |
+| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=2.0-4.0) |
 | **Focal Loss** | 70% 标准 MSE + 30% 峰值加权，关注关键区域 |
 | **x0 重构损失** | 直接监督输出质量，补充 epsilon loss |
+| **Dice Loss** | treats sparse signal correctly，无背景梯度浪费 |
 | **稀疏性正则化** | L1 正则化，鼓励大部分像素为 0 |
 | **峰值距离损失** | 可微分 Soft-Argmax + NMS，多峰感知优化峰值位置准确度 |
 | **负样本零目标损失** | SNR 门控：只对高质量样本（低时间步）施加零约束 |
@@ -318,6 +365,7 @@ Current Frame → CNN Encoder (ResNet-18) → img_cond → Fusion ──→ Cond
 | **LoRA 微调 (可选)** | 对 Qwen3-VL 最后 N 层加 LoRA，增强空间推理能力 |
 | **轨迹增强** | 训练时随机旋转/缩放轨迹，提升泛化能力 |
 | **FGR2R 子指令** | 支持动态子指令，适应子序列采样 |
+| **Sequence Packing** | 批量训练优化，多样本打包成长序列 |
 
 ### 轨迹预测模块
 
