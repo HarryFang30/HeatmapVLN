@@ -141,7 +141,7 @@ model:
     # 可见性预测头（消除假阳性）- 增强版 3 层 MLP
     # 当预测为不可见时跳过扩散推理，直接输出全零热力图
     use_visibility_head: true
-    visibility_loss_weight: 1.0       # BCE loss 权重（0.1→1.0，增强 10 倍，让 visibility 训练更充分）
+    visibility_loss_weight: 0.1       # BCE loss 权重，过高会主导总 loss（0.69=ln2 地板效应）
     visibility_threshold: 0.7         # 推理阈值（0.5→0.7，更保守地判定可见，减少假阳性）
     
     # 推理后处理：空间 Softmax 锐化
