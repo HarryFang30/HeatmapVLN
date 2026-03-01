@@ -1083,6 +1083,17 @@ def train_one_epoch(
     global_step = 0
     valid_batch_count = 0
     
+    # 同步 diffusion head 的推理计数器，确保与 global_step 对齐
+    # _training_step_counter 每 batch +1, global_step 每 grad_accum_steps batch +1
+    # 设 _inference_interval = grad_accum * diag_interval, 并每 epoch 重置计数器
+    diag_interval = cfg['log'].get('diag_interval', 100)
+    aligned_interval = grad_accum_steps * diag_interval
+    for head_attr in ['history_heatmap_head', 'future_heatmap_head']:
+        head = getattr(model, head_attr, None)
+        if head is not None and hasattr(head, '_training_step_counter'):
+            head._training_step_counter = 0
+            head._inference_interval = aligned_interval
+    
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
