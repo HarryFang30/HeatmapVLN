@@ -111,7 +111,7 @@ model:
     
     # Classifier-Free Guidance
     cfg_drop_prob: 0.15         # 提高 drop 比例，让模型更好地学习无条件生成
-    cfg_scale: 2.0              # 1.5 → 2.0，增强条件引导使峰值更锐利（配合 visibility head 控制假阳性）
+    cfg_scale: 2.0              # 1.5 → 2.0，增强条件引导使峰值更锐利
     
     # 正则化
     dropout: 0.15               # 增加 dropout 抑制过拟合（0.1 → 0.15）
@@ -137,12 +137,6 @@ model:
     use_sequence_conditioning: true
     seq_cross_attn_heads: 8
     seq_cross_attn_head_dim: 64
-    
-    # 可见性预测头（消除假阳性）- 增强版 3 层 MLP
-    # 当预测为不可见时跳过扩散推理，直接输出全零热力图
-    use_visibility_head: true
-    visibility_loss_weight: 0.5       # 方向嵌入修复后 vis head 能有效学习，恢复合理权重
-    visibility_threshold: 0.7         # 推理阈值（0.5→0.7，更保守地判定可见，减少假阳性）
     
     # 推理后处理：空间 Softmax 锐化
     # 集中能量到峰值区域，消除弥散问题
@@ -242,7 +236,6 @@ optim:
   heatmap_lr: 5.0e-5               # 1e-4 → 5e-5，防止快速过拟合
   history_heatmap_lr: 5.0e-5
   resnet_backbone_lr: 1.0e-5       # ResNet-18 预训练 backbone 用更低 LR 防止破坏预训练特征
-  visibility_head_lr: 1.0e-3       # Visibility head 需要高 LR 跟上 cond 编码器变化
   future_heatmap_lr: 5.0e-5
   action_lr: 1.0e-4
   transformer_action_lr: 1.0e-4

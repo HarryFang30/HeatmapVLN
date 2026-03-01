@@ -89,11 +89,6 @@ class VLNPipelineConfig:
     heatmap_seq_cross_attn_heads: int = 8            # Cross-attention heads
     heatmap_seq_cross_attn_head_dim: int = 64        # Head dimension
     
-    # Visibility head (suppress false positives for invisible history points)
-    heatmap_use_visibility_head: bool = False         # Enable visibility prediction head
-    heatmap_visibility_loss_weight: float = 0.5       # Visibility BCE loss weight
-    heatmap_visibility_threshold: float = 0.5         # Inference visibility threshold
-    
     # Spatial feature injection (CNN multi-scale features -> UNet skip connections)
     heatmap_use_spatial_injection: bool = False       # Enable spatial feature injection
     
@@ -342,10 +337,6 @@ class VLNPipeline(nn.Module):
             use_sequence_conditioning=config.heatmap_use_sequence_conditioning,
             seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
             seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
-            # Visibility head (suppress false positives)
-            use_visibility_head=config.heatmap_use_visibility_head,
-            visibility_loss_weight=config.heatmap_visibility_loss_weight,
-            visibility_threshold=config.heatmap_visibility_threshold,
             # Spatial feature injection
             use_spatial_injection=config.heatmap_use_spatial_injection,
             # Image encoder backbone
@@ -560,7 +551,6 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
-        history_heatmap_visibility_loss = None
         history_heatmap_x0_loss = None
         history_heatmap_sparsity_loss = None
         history_heatmap_dice_loss = None
@@ -589,7 +579,6 @@ class VLNPipeline(nn.Module):
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
-                    history_heatmap_visibility_loss = result.get('visibility_loss')
                     history_heatmap_x0_loss = result.get('x0_loss')
                     history_heatmap_sparsity_loss = result.get('sparsity_loss')
                     history_heatmap_dice_loss = result.get('dice_loss')
@@ -679,8 +668,6 @@ class VLNPipeline(nn.Module):
             if history_heatmap_base_loss is not None:
                 output['history_heatmap_base_loss'] = history_heatmap_base_loss
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
-            if history_heatmap_visibility_loss is not None:
-                output['history_heatmap_visibility_loss'] = history_heatmap_visibility_loss
             if history_heatmap_x0_loss is not None:
                 output['history_heatmap_x0_loss'] = history_heatmap_x0_loss
             if history_heatmap_sparsity_loss is not None:
@@ -828,7 +815,6 @@ class VLNPipeline(nn.Module):
         future_heatmap_noise_pred_std = None
         history_heatmap_base_loss = None
         history_heatmap_focal_loss = None
-        history_heatmap_visibility_loss = None
         history_heatmap_x0_loss = None
         history_heatmap_sparsity_loss = None
         history_heatmap_dice_loss = None
@@ -878,7 +864,6 @@ class VLNPipeline(nn.Module):
                     history_heatmap_noise_pred_std = result.get('noise_pred_std')
                     history_heatmap_base_loss = result.get('base_loss')
                     history_heatmap_focal_loss = result.get('focal_loss')
-                    history_heatmap_visibility_loss = result.get('visibility_loss')
                     history_heatmap_x0_loss = result.get('x0_loss')
                     history_heatmap_sparsity_loss = result.get('sparsity_loss')
                     history_heatmap_dice_loss = result.get('dice_loss')
@@ -972,8 +957,6 @@ class VLNPipeline(nn.Module):
             if history_heatmap_base_loss is not None:
                 output['history_heatmap_base_loss'] = history_heatmap_base_loss
                 output['history_heatmap_focal_loss'] = history_heatmap_focal_loss
-            if history_heatmap_visibility_loss is not None:
-                output['history_heatmap_visibility_loss'] = history_heatmap_visibility_loss
             if history_heatmap_x0_loss is not None:
                 output['history_heatmap_x0_loss'] = history_heatmap_x0_loss
             if history_heatmap_sparsity_loss is not None:

@@ -668,10 +668,6 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
         heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
         heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
-        # Visibility head (suppress false positives)
-        heatmap_use_visibility_head=heatmap_cfg.get('use_visibility_head', False),
-        heatmap_visibility_loss_weight=heatmap_cfg.get('visibility_loss_weight', 0.5),
-        heatmap_visibility_threshold=heatmap_cfg.get('visibility_threshold', 0.5),
         # Spatial feature injection
         heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
         # Image encoder backbone (pretrained ResNet-18 vs lightweight CNN)
@@ -878,33 +874,19 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             })
         return groups
     
-    # History Heatmap Head — split into 3 groups: ResNet (low lr), visibility head (high lr), rest (normal lr)
+    # History Heatmap Head — split ResNet backbone (low lr) from rest (normal lr)
     hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
     resnet_backbone_lr = optim_cfg.get('resnet_backbone_lr', 1e-5)
-    visibility_lr = optim_cfg.get('visibility_head_lr', 1e-3)
     if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
         head = model.history_heatmap_head
-        # Check if this head uses a pretrained ResNet encoder
         has_resnet = (hasattr(head, 'condition_encoder') and 
                       hasattr(head.condition_encoder, 'image_encoder') and
                       hasattr(head.condition_encoder.image_encoder, 'img_mean'))  # ResNet marker
-        
-        # Collect visibility head param ids for exclusion
-        vis_param_ids = set()
-        if hasattr(head, 'visibility_head'):
-            vis_param_ids = set(id(p) for p in head.visibility_head.parameters())
-            vis_groups = get_param_groups_with_wd(
-                head.visibility_head, visibility_lr, 'visibility_head', default_wd)
-            if vis_groups:
-                param_groups.extend(vis_groups)
-                n_vis = sum(len(g['params']) for g in vis_groups)
-                print(f"  Param group: visibility_head (lr={visibility_lr}, wd={default_wd}, params={n_vis})")
         
         if has_resnet:
             resnet_encoder = head.condition_encoder.image_encoder
             resnet_param_ids = set(id(p) for p in resnet_encoder.parameters())
             
-            # ResNet backbone params (low lr)
             resnet_groups = get_param_groups_with_wd(
                 resnet_encoder, resnet_backbone_lr, 'resnet_backbone', default_wd)
             if resnet_groups:
@@ -912,12 +894,9 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
                 n_resnet = sum(len(g['params']) for g in resnet_groups)
                 print(f"  Param group: resnet_backbone (lr={resnet_backbone_lr}, wd={default_wd}, params={n_resnet})")
             
-            excluded_ids = resnet_param_ids | vis_param_ids
-            
-            # Rest of heatmap head (normal lr) — exclude ResNet + visibility head params
             rest_decay, rest_no_decay = [], []
             for name, p in head.named_parameters():
-                if not p.requires_grad or id(p) in excluded_ids:
+                if not p.requires_grad or id(p) in resnet_param_ids:
                     continue
                 if p.dim() <= 1 or name.endswith('.bias'):
                     rest_no_decay.append(p)
@@ -932,23 +911,10 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             n_rest = len(rest_decay) + len(rest_no_decay)
             print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd}, params={n_rest})")
         else:
-            # No ResNet, but still exclude visibility head
-            rest_decay, rest_no_decay = [], []
-            for name, p in head.named_parameters():
-                if not p.requires_grad or id(p) in vis_param_ids:
-                    continue
-                if p.dim() <= 1 or name.endswith('.bias'):
-                    rest_no_decay.append(p)
-                else:
-                    rest_decay.append(p)
-            if rest_decay:
-                param_groups.append({'params': rest_decay, 'lr': hist_lr, 
-                                     'weight_decay': default_wd, 'name': 'history_heatmap_head'})
-            if rest_no_decay:
-                param_groups.append({'params': rest_no_decay, 'lr': hist_lr,
-                                     'weight_decay': 0.0, 'name': 'history_heatmap_head_no_decay'})
-            n_rest = len(rest_decay) + len(rest_no_decay)
-            print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd}, params={n_rest})")
+            groups = get_param_groups_with_wd(head, hist_lr, 'history_heatmap_head', default_wd)
+            if groups:
+                param_groups.extend(groups)
+                print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd})")
     
     # Future Heatmap Head
     fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
@@ -1088,8 +1054,6 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     total_heatmap_loss = 0.0
-    total_diffusion_loss = 0.0      # 纯扩散 loss（不含 visibility）
-    total_visibility_loss = 0.0     # visibility head BCE loss
     total_action_loss = 0.0
     total_stop_loss = 0.0
     num_batches = 0
@@ -1118,10 +1082,6 @@ def train_one_epoch(
     
     global_step = 0
     valid_batch_count = 0
-    
-    # 分组参数：visibility head 单独裁剪，避免被 UNet 大梯度淹没
-    vis_params = [p for n, p in model.named_parameters() if 'visibility_head' in n and p.requires_grad]
-    other_params = [p for n, p in model.named_parameters() if 'visibility_head' not in n and p.requires_grad]
     
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
@@ -1299,15 +1259,11 @@ def train_one_epoch(
         if valid_batch_count % grad_accum_steps == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
-                if vis_params:
-                    torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
-                if vis_params:
-                    torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -1522,11 +1478,6 @@ def train_one_epoch(
                             focal_ratio = focal_loss_val / base_loss_val
                             tb_writer.add_scalar('diag/heatmap_focal_ratio', focal_ratio, actual_step)
                     
-                    # Visibility Loss 诊断
-                    if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
-                        vis_loss_val = output['history_heatmap_visibility_loss']
-                        tb_writer.add_scalar('diag/heatmap_visibility_loss', vis_loss_val, actual_step)
-                    
                     # x0 Reconstruction Loss 诊断
                     if 'history_heatmap_x0_loss' in output and output['history_heatmap_x0_loss'] is not None:
                         tb_writer.add_scalar('diag/heatmap_x0_loss', output['history_heatmap_x0_loss'], actual_step)
@@ -1613,15 +1564,8 @@ def train_one_epoch(
                 except Exception as e:
                     pass  # 忽略可视化写入错误
         
-        # 拆分记录：扩散 loss 和 visibility loss（必须在 del output 之前）
         total_loss += loss.item() * grad_accum_steps
         total_heatmap_loss += heatmap_loss.item()
-        if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
-            total_visibility_loss += output['history_heatmap_visibility_loss']
-            vis_weight = cfg['model']['heatmap_head'].get('visibility_loss_weight', 0.5)
-            total_diffusion_loss += heatmap_loss.item() - vis_weight * output['history_heatmap_visibility_loss']
-        else:
-            total_diffusion_loss += heatmap_loss.item()
         total_action_loss += action_total_loss.item()
         total_stop_loss += stop_total_loss.item()
         num_batches += 1
@@ -1635,13 +1579,9 @@ def train_one_epoch(
             torch.cuda.empty_cache()
             _malloc_trim()
         
-        # 进度条显示拆分的 loss：diff=扩散, vis=可见性
-        diff_loss_display = total_diffusion_loss / num_batches
-        vis_loss_display = total_visibility_loss / num_batches
         pbar.set_postfix({
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
-            'diff': f"{diff_loss_display:.4f}",
-            'vis': f"{vis_loss_display:.4f}",
+            'hm': f"{total_heatmap_loss / num_batches:.4f}",
             'traj': f"{action_total_loss.item():.4f}",
         })
     
@@ -1650,15 +1590,11 @@ def train_one_epoch(
     if remaining > 0:
         if scaler is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
-            if vis_params:
-                torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
+            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
             scaler.step(optimizer)
             scaler.update()
         else:
-            torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
-            if vis_params:
-                torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
+            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
@@ -1668,8 +1604,6 @@ def train_one_epoch(
     return {
         'total_loss': total_loss / max(num_batches, 1),
         'heatmap_loss': total_heatmap_loss / max(num_batches, 1),
-        'diffusion_loss': total_diffusion_loss / max(num_batches, 1),       # 纯扩散 loss
-        'visibility_loss': total_visibility_loss / max(num_batches, 1),     # visibility BCE
         'action_loss': total_action_loss / max(num_batches, 1),
         'stop_loss': total_stop_loss / max(num_batches, 1),
     }
@@ -1696,8 +1630,6 @@ def validate(
     
     total_loss = 0.0
     total_heatmap_loss = 0.0
-    total_diffusion_loss = 0.0      # 纯扩散 loss（不含 visibility）
-    total_visibility_loss = 0.0     # visibility head BCE loss
     total_action_loss = 0.0
     total_stop_loss = 0.0
     total_heatmap_mse = 0.0      # 完整推理的 heatmap MSE（采样）
@@ -1863,13 +1795,6 @@ def validate(
         
         total_loss += loss.item()
         total_heatmap_loss += heatmap_loss.item()
-        # 拆分记录：扩散 loss 和 visibility loss
-        if 'history_heatmap_visibility_loss' in output and output['history_heatmap_visibility_loss'] is not None:
-            total_visibility_loss += output['history_heatmap_visibility_loss']
-            vis_weight = cfg['model']['heatmap_head'].get('visibility_loss_weight', 0.5)
-            total_diffusion_loss += heatmap_loss.item() - vis_weight * output['history_heatmap_visibility_loss']
-        else:
-            total_diffusion_loss += heatmap_loss.item()
         total_action_loss += action_total_loss.item()  # trajectory or action
         total_stop_loss += stop_total_loss.item()      # progress or stop
         num_batches += 1
@@ -1962,18 +1887,13 @@ def validate(
     if num_heatmap_mse_batches > 0:
         logger.info(f"  📊 Heatmap 推理 MSE (采样 {num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
     
-    avg_diff = total_diffusion_loss / max(num_batches, 1)
-    avg_vis = total_visibility_loss / max(num_batches, 1)
-    
     return {
         'val_loss': avg_loss,
-        'val_heatmap_loss': avg_hm,           # 噪声预测 loss（全量 batch）
-        'val_diffusion_loss': avg_diff,       # 纯扩散 loss（不含 visibility）
-        'val_visibility_loss': avg_vis,       # visibility BCE loss
-        'val_heatmap_mse': avg_hm_mse,        # 完整推理 MSE（采样 batch）
+        'val_heatmap_loss': avg_hm,
+        'val_heatmap_mse': avg_hm_mse,
         'val_action_loss': avg_act,
         'val_stop_loss': avg_stop,
-        'val_total_loss': avg_loss,            # 兼容 save_best_metric
+        'val_total_loss': avg_loss,
     }
 
 
@@ -2693,15 +2613,13 @@ def main():
         
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(diff: {train_metrics.get('diffusion_loss', 0):.4f}, "
-            f"vis: {train_metrics.get('visibility_loss', 0):.4f}, "
+            f"(hm: {train_metrics['heatmap_loss']:.4f}, "
             f"traj: {train_metrics['action_loss']:.4f})"
         )
         val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
         logger.info(
             f"  Val Loss: {val_metrics['val_loss']:.4f} "
-            f"(diff: {val_metrics.get('val_diffusion_loss', 0):.4f}, "
-            f"vis: {val_metrics.get('val_visibility_loss', 0):.4f}, "
+            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, "
             f"traj: {val_metrics['val_action_loss']:.4f}{val_hm_mse_str})"
         )
         
@@ -2736,21 +2654,11 @@ def main():
                 'val': val_metrics['val_loss'],
             }, global_epoch_counter)
             
-            # 热力图损失对比（含 visibility）
+            # 热力图损失对比
             tb_writer.add_scalars('loss/heatmap', {
                 'train': train_metrics['heatmap_loss'],
                 'val': val_metrics['val_heatmap_loss'],
             }, global_epoch_counter)
-            
-            # 🔑 纯扩散损失对比（不含 visibility，与旧版本可比）
-            tb_writer.add_scalars('loss/diffusion_only', {
-                'train': train_metrics.get('diffusion_loss', train_metrics['heatmap_loss']),
-                'val': val_metrics.get('val_diffusion_loss', val_metrics['val_heatmap_loss']),
-            }, global_epoch_counter)
-            
-            # Visibility Loss
-            if train_metrics.get('visibility_loss', 0) > 0:
-                tb_writer.add_scalar('loss/visibility_bce', train_metrics['visibility_loss'], global_epoch_counter)
             
             # 轨迹损失对比
             tb_writer.add_scalars('loss/trajectory', {
@@ -2774,8 +2682,6 @@ def main():
             # 单独的指标（方便筛选）
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
             tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
-            tb_writer.add_scalar('epoch/train_diffusion_loss', train_metrics.get('diffusion_loss', 0), global_epoch_counter)
-            tb_writer.add_scalar('epoch/visibility_loss', train_metrics.get('visibility_loss', 0), global_epoch_counter)
             
             tb_writer.flush()
         

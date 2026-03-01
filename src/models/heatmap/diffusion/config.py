@@ -113,14 +113,6 @@ class DiffusionHeatmapConfig:
     seq_cross_attn_heads: int = 8             # cross-attention head 数
     seq_cross_attn_head_dim: int = 64         # 每个 head 的维度
     
-    # ==================== Visibility Head ====================
-    # 可见性预测头：判断当前视角是否能看到历史轨迹点
-    # 当预测为不可见时，跳过扩散推理直接输出全零热力图
-    # 彻底解决假阳性问题（扩散模型从噪声开始，天然倾向于生成非零输出）
-    use_visibility_head: bool = False         # 是否启用可见性预测头
-    visibility_loss_weight: float = 0.5       # 可见性 BCE loss 的权重
-    visibility_threshold: float = 0.5         # 推理时的可见性阈值
-    
     # ==================== Spatial Feature Injection ====================
     # 将 CNN encoder 的多尺度空间特征注入 UNet skip connections
     # 解决全局池化导致的空间信息丢失，让 UNet 知道"目标在哪里"

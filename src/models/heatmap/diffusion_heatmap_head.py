@@ -81,11 +81,6 @@ class DiffusionHeatmapHead(nn.Module):
         # Sequence conditioning flag
         self.use_sequence_conditioning = config.use_sequence_conditioning
         
-        # Visibility head flag
-        self.use_visibility_head = config.use_visibility_head
-        self.visibility_threshold = config.visibility_threshold
-        self.visibility_loss_weight = config.visibility_loss_weight
-        
         # ==================== Condition Encoder ====================
         self.condition_encoder = MultiModalConditionEncoder(
             llm_dim=config.llm_dim,
@@ -134,22 +129,6 @@ class DiffusionHeatmapHead(nn.Module):
             # Spatial feature injection from CNN encoder
             spatial_injection_channels=spatial_injection_channels,
         )
-        
-        # ==================== Visibility Head ====================
-        # 可见性预测头：判断当前视角是否能看到历史点
-        # 当预测为不可见时跳过扩散推理，直接输出全零热力图
-        # 增强版：3 层 MLP，增加容量以更好区分正/负样本
-        if self.use_visibility_head:
-            self.visibility_head = nn.Sequential(
-                nn.Linear(config.cond_dim, config.cond_dim // 2),
-                nn.GELU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.cond_dim // 2, config.cond_dim // 4),
-                nn.GELU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.cond_dim // 4, 1),
-            )
-            logger.info("VisibilityHead (enhanced 3-layer) enabled: cond_dim=%d -> 1 (binary)", config.cond_dim)
         
         # ==================== Direction Embedding ====================
         # 多视角模式下为 front/right/back/left 注入可学习方向嵌入
@@ -263,51 +242,16 @@ class DiffusionHeatmapHead(nn.Module):
                 seq_cond=seq_cond, spatial_features=spatial_features,
             )
         
-        # 4. Inference mode (with visibility gating)
-        B = cond.shape[0]
-        Hm, Wm = self.heatmap_size
-        visibility_score = None
-        
-        if self.use_visibility_head:
-            # 先判可见性，不可见样本直接跳过扩散推理（省时 + 消除假阳性）
-            with torch.no_grad():
-                vis_logit = self.visibility_head(cond)  # (B, 1)
-                visibility_score = torch.sigmoid(vis_logit).squeeze(-1)  # (B,)
-                visible_mask = visibility_score >= self.visibility_threshold  # (B,)
-            
-            if visible_mask.any() and not visible_mask.all():
-                # 混合 batch：只对可见样本跑扩散
-                heatmap = torch.zeros(B, Hm, Wm, device=cond.device, dtype=cond.dtype)
-                visible_cond = cond[visible_mask]
-                visible_seq = seq_cond[visible_mask] if seq_cond is not None else None
-                visible_spatial = None
-                if spatial_features is not None:
-                    visible_spatial = [f[visible_mask] for f in spatial_features]
-                heatmap[visible_mask] = self._diffusion_inference(
-                    visible_cond, seq_cond=visible_seq, spatial_features=visible_spatial,
-                )
-            elif visible_mask.all():
-                # 全部可见：正常跑扩散
-                heatmap = self._diffusion_inference(
-                    cond, seq_cond=seq_cond, spatial_features=spatial_features,
-                )
-            else:
-                # 全部不可见：直接全零
-                heatmap = torch.zeros(B, Hm, Wm, device=cond.device, dtype=cond.dtype)
-        else:
-            # 无 visibility head：正常跑扩散
-            heatmap = self._diffusion_inference(
-                cond, seq_cond=seq_cond, spatial_features=spatial_features,
-            )
+        # 4. Inference mode
+        heatmap = self._diffusion_inference(
+            cond, seq_cond=seq_cond, spatial_features=spatial_features,
+        )
         
         if return_loss:
-            result = {
+            return {
                 'heatmap': heatmap,
                 'loss': torch.tensor(0.0, device=heatmap.device),
             }
-            if visibility_score is not None:
-                result['visibility_score'] = visibility_score
-            return result
         
         return heatmap
     
@@ -492,16 +436,6 @@ class DiffusionHeatmapHead(nn.Module):
                 if peak_dist_loss.requires_grad:
                     total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
 
-        # ==================== 7. Visibility Loss ====================
-        visibility_loss_val = 0.0
-        if self.use_visibility_head:
-            with torch.no_grad():
-                gt_has_peak = (gt_heatmap.flatten(1).max(dim=1).values > 0.01).float()
-            vis_logit = self.visibility_head(cond).squeeze(-1)
-            visibility_loss = F.binary_cross_entropy_with_logits(vis_logit, gt_has_peak)
-            visibility_loss_val = visibility_loss.item()
-            total_loss = total_loss + self.visibility_loss_weight * visibility_loss
-
         # ==================== 诊断信息 ====================
         noise_std = noise.std().item()
         noise_pred_std = noise_pred.std().item()
@@ -519,7 +453,6 @@ class DiffusionHeatmapHead(nn.Module):
             'diffusion_loss': diffusion_loss,
             'base_loss': base_loss.item(),
             'focal_loss': focal_loss.item(),
-            'visibility_loss': visibility_loss_val,
             'x0_loss': x0_loss_val,
             'dice_loss': dice_loss_val,
             'sparsity_loss': sparsity_loss_val,
