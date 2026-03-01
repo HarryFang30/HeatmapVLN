@@ -1275,6 +1275,12 @@ def train_one_epoch(
             log_interval = cfg['log'].get('log_interval', 10)
             if global_step % log_interval == 0 or global_step <= 3:
                 mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
+                all_lrs = scheduler.get_last_lr()
+                lr_strs = []
+                for gi, lr_val in enumerate(all_lrs):
+                    gname = optimizer.param_groups[gi].get('name', f'g{gi}')
+                    lr_strs.append(f"{gname}={lr_val:.2e}")
+                lr_display = ", ".join(lr_strs)
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
@@ -1282,7 +1288,7 @@ def train_one_epoch(
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
                     f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
-                    f"LR: {scheduler.get_last_lr()[0]:.2e} | "
+                    f"LR: [{lr_display}] | "
                     f"GPU: {mem_alloc:.1f}GB"
                 )
                 
@@ -1292,7 +1298,9 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
                 tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
-                tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0], actual_step)
+                for gi, lr_val in enumerate(scheduler.get_last_lr()):
+                    gname = optimizer.param_groups[gi].get('name', f'g{gi}')
+                    tb_writer.add_scalar(f'lr/{gname}', lr_val, actual_step)
                 
                 # 🔧 修复：优先使用 trajectory_valid（trajectory 数据集），否则使用 action_valid
                 # 监控有效样本比例
