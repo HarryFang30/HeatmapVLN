@@ -347,8 +347,8 @@ class DiffusionHeatmapHead(nn.Module):
         # ==================== 空间 focal 权重（所有 loss 共用）====================
         with torch.no_grad():
             gt_clamped = gt_heatmap.clamp(0, 1)
-            focal_alpha = 20.0
-            spatial_focal = 1.0 + focal_alpha * gt_clamped  # 峰值处 15-21x
+            focal_alpha = 6.0
+            spatial_focal = 1.0 + focal_alpha * gt_clamped  # 峰值处 ~7x（20→6，保证背景去噪质量）
             spatial_focal = spatial_focal / spatial_focal.mean()  # 归一化保持 loss 尺度
 
         # ==================== 1. Epsilon Loss（aggressive focal）====================
@@ -357,7 +357,7 @@ class DiffusionHeatmapHead(nn.Module):
         base_loss = (sample_weight_4d * per_pixel_mse).mean()
         focal_loss = (sample_weight_4d * spatial_focal * per_pixel_mse).mean()
 
-        focal_weight = 0.8
+        focal_weight = 0.5
         diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
 
         total_loss = diffusion_loss
@@ -519,13 +519,15 @@ class DiffusionHeatmapHead(nn.Module):
                     seq_cond=seq_cond,
                     spatial_features=spatial_features,
                 )
-                # 无条件预测（不传 spatial_features，保持 CFG 的"无条件"语义）
+                # 无条件预测（保留 spatial_features，与训练时 CFG drop 行为一致）
+                # 训练时 CFG drop 只将 cond/seq_cond 置零，spatial_features 始终保留
+                # 推理时必须匹配，否则模型收到从未见过的输入分布，产生垃圾预测
                 noise_pred_uncond = self.noise_predictor(
                     sample=noisy_heatmap,
                     timestep=timestep_batch,
                     global_cond=uncond,
                     seq_cond=uncond_seq,
-                    spatial_features=None,
+                    spatial_features=spatial_features,
                 )
                 # CFG 公式：noise = uncond + scale * (cond - uncond)
                 noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_cond - noise_pred_uncond)
