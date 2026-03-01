@@ -270,7 +270,7 @@ def compute_history_heatmap(
     use_max_merge: bool = True,           # 使用 max 合并（避免累加饱和）
     use_distance_decay: bool = True,      # 启用距离衰减
     distance_decay_ref: float = 5.0,      # 距离衰减参考值（米），越小衰减越快
-    min_peak_value: float = 0.3,          # 最远处的最小峰值
+    min_peak_value: float = 0.7,          # 最远处的最小峰值（0.3→0.7，减少学习负担）
 ) -> Tuple[np.ndarray, int]:
     """
     计算当前帧中历史帧相机位置的热力图 (Pinhole 投影版本)
@@ -380,11 +380,11 @@ def compute_history_heatmap(
         sigma = compute_adaptive_sigma_pinhole(
             z_depth=z_depth,
             fx=fx,
-            object_size_3d=0.5,
+            object_size_3d=1.5,
             heatmap_width=Wm,
             img_width=img_w,
-            min_sigma=1.5,  # 增大，让远处点更可见
-            max_sigma=6.0
+            min_sigma=4.0,
+            max_sigma=8.0,
         )
         
         # 计算距离衰减的峰值

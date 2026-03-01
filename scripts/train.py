@@ -679,13 +679,16 @@ def build_model(cfg: Dict) -> nn.Module:
         # Inference sharpening (spatial softmax with temperature)
         heatmap_sharpen_temperature=heatmap_cfg.get('sharpen_temperature', 0.1),
         # x0 reconstruction loss (direct output quality supervision)
-        heatmap_x0_loss_weight=heatmap_cfg.get('x0_loss_weight', 1.0),
+        heatmap_x0_loss_weight=heatmap_cfg.get('x0_loss_weight', 3.0),
         # L1 sparsity regularization
-        heatmap_sparsity_loss_weight=heatmap_cfg.get('sparsity_loss_weight', 0.5),
-        # Negative sample diffusion loss weight
+        heatmap_sparsity_loss_weight=heatmap_cfg.get('sparsity_loss_weight', 0.1),
+        # Dice loss
+        heatmap_dice_loss_weight=heatmap_cfg.get('dice_loss_weight', 2.0),
+        # Sample weighting
         heatmap_negative_sample_weight=heatmap_cfg.get('negative_sample_weight', 0.3),
+        heatmap_positive_sample_boost=heatmap_cfg.get('positive_sample_boost', 3.0),
         # Peak distance loss (differentiable soft-argmax)
-        heatmap_peak_distance_loss_weight=heatmap_cfg.get('peak_distance_loss_weight', 2.0),
+        heatmap_peak_distance_loss_weight=heatmap_cfg.get('peak_distance_loss_weight', 5.0),
         heatmap_peak_loss_temperature=heatmap_cfg.get('peak_loss_temperature', 0.1),
         
         # Multi-layer feature extraction
@@ -1496,6 +1499,10 @@ def train_one_epoch(
                     # Sparsity Loss 诊断
                     if 'history_heatmap_sparsity_loss' in output and output['history_heatmap_sparsity_loss'] is not None:
                         tb_writer.add_scalar('diag/heatmap_sparsity_loss', output['history_heatmap_sparsity_loss'], actual_step)
+                    
+                    # Dice Loss 诊断
+                    if 'history_heatmap_dice_loss' in output and output['history_heatmap_dice_loss'] is not None:
+                        tb_writer.add_scalar('diag/heatmap_dice_loss', output['history_heatmap_dice_loss'], actual_step)
                     
                     # Negative Zero Loss 诊断
                     if 'history_heatmap_neg_zero_loss' in output and output['history_heatmap_neg_zero_loss'] is not None:

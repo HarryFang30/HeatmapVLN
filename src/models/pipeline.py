@@ -104,16 +104,20 @@ class VLNPipelineConfig:
     heatmap_sharpen_temperature: float = 0.1  # 0 = disabled, 0.1 = sharp
     
     # x0 reconstruction loss (direct output quality supervision)
-    heatmap_x0_loss_weight: float = 1.0       # 0 = disabled
+    heatmap_x0_loss_weight: float = 3.0       # 主力 loss
     
     # L1 sparsity regularization (encourage sparse output)
-    heatmap_sparsity_loss_weight: float = 0.5  # 0 = disabled
+    heatmap_sparsity_loss_weight: float = 0.1  # 0 = disabled
     
-    # Negative sample diffusion loss weight
-    heatmap_negative_sample_weight: float = 0.3  # 0.1~1.0
+    # Dice loss (treats sparse signal correctly - no background gradient waste)
+    heatmap_dice_loss_weight: float = 2.0  # 0 = disabled
+    
+    # Sample weighting
+    heatmap_negative_sample_weight: float = 0.3  # 负样本权重
+    heatmap_positive_sample_boost: float = 3.0   # 正样本 boost
     
     # Peak distance loss (differentiable soft-argmax peak localization)
-    heatmap_peak_distance_loss_weight: float = 2.0  # 0 = disabled
+    heatmap_peak_distance_loss_weight: float = 5.0  # 加大位置优化
     heatmap_peak_loss_temperature: float = 0.1       # soft-argmax temperature
     
     # Multi-layer feature extraction (CVPR 2025 best practice)
@@ -352,8 +356,11 @@ class VLNPipeline(nn.Module):
             x0_loss_weight=config.heatmap_x0_loss_weight,
             # L1 sparsity regularization
             sparsity_loss_weight=config.heatmap_sparsity_loss_weight,
-            # Negative sample weight
+            # Dice loss
+            dice_loss_weight=config.heatmap_dice_loss_weight,
+            # Sample weighting
             negative_sample_weight=config.heatmap_negative_sample_weight,
+            positive_sample_boost=config.heatmap_positive_sample_boost,
             # Peak distance loss
             peak_distance_loss_weight=config.heatmap_peak_distance_loss_weight,
             peak_loss_temperature=config.heatmap_peak_loss_temperature,
@@ -556,6 +563,7 @@ class VLNPipeline(nn.Module):
         history_heatmap_visibility_loss = None
         history_heatmap_x0_loss = None
         history_heatmap_sparsity_loss = None
+        history_heatmap_dice_loss = None
         history_heatmap_neg_zero_loss = None
         history_heatmap_peak_dist_loss = None
         
@@ -584,6 +592,7 @@ class VLNPipeline(nn.Module):
                     history_heatmap_visibility_loss = result.get('visibility_loss')
                     history_heatmap_x0_loss = result.get('x0_loss')
                     history_heatmap_sparsity_loss = result.get('sparsity_loss')
+                    history_heatmap_dice_loss = result.get('dice_loss')
                     history_heatmap_neg_zero_loss = result.get('neg_zero_loss')
                     history_heatmap_peak_dist_loss = result.get('peak_dist_loss')
                 else:
@@ -676,6 +685,8 @@ class VLNPipeline(nn.Module):
                 output['history_heatmap_x0_loss'] = history_heatmap_x0_loss
             if history_heatmap_sparsity_loss is not None:
                 output['history_heatmap_sparsity_loss'] = history_heatmap_sparsity_loss
+            if history_heatmap_dice_loss is not None:
+                output['history_heatmap_dice_loss'] = history_heatmap_dice_loss
             if history_heatmap_neg_zero_loss is not None:
                 output['history_heatmap_neg_zero_loss'] = history_heatmap_neg_zero_loss
             if history_heatmap_peak_dist_loss is not None:
@@ -820,6 +831,7 @@ class VLNPipeline(nn.Module):
         history_heatmap_visibility_loss = None
         history_heatmap_x0_loss = None
         history_heatmap_sparsity_loss = None
+        history_heatmap_dice_loss = None
         history_heatmap_neg_zero_loss = None
         history_heatmap_peak_dist_loss = None
         
@@ -869,6 +881,7 @@ class VLNPipeline(nn.Module):
                     history_heatmap_visibility_loss = result.get('visibility_loss')
                     history_heatmap_x0_loss = result.get('x0_loss')
                     history_heatmap_sparsity_loss = result.get('sparsity_loss')
+                    history_heatmap_dice_loss = result.get('dice_loss')
                     history_heatmap_neg_zero_loss = result.get('neg_zero_loss')
                     history_heatmap_peak_dist_loss = result.get('peak_dist_loss')
                 else:
@@ -965,6 +978,8 @@ class VLNPipeline(nn.Module):
                 output['history_heatmap_x0_loss'] = history_heatmap_x0_loss
             if history_heatmap_sparsity_loss is not None:
                 output['history_heatmap_sparsity_loss'] = history_heatmap_sparsity_loss
+            if history_heatmap_dice_loss is not None:
+                output['history_heatmap_dice_loss'] = history_heatmap_dice_loss
             if history_heatmap_neg_zero_loss is not None:
                 output['history_heatmap_neg_zero_loss'] = history_heatmap_neg_zero_loss
             if history_heatmap_peak_dist_loss is not None:

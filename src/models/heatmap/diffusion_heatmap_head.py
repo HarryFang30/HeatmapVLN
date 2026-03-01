@@ -178,12 +178,14 @@ class DiffusionHeatmapHead(nn.Module):
         # Sharpening config
         self.sharpen_temperature = config.sharpen_temperature
         
-        # x0 loss config
+        # x0 / dice / sparsity loss config
         self.x0_loss_weight = config.x0_loss_weight
         self.sparsity_loss_weight = config.sparsity_loss_weight
+        self.dice_loss_weight = config.dice_loss_weight
         
-        # Negative sample config
+        # Sample weighting config
         self.negative_sample_weight = config.negative_sample_weight
+        self.positive_sample_boost = config.positive_sample_boost
         
         # Peak distance loss config
         self.peak_distance_loss_weight = config.peak_distance_loss_weight
@@ -387,165 +389,142 @@ class DiffusionHeatmapHead(nn.Module):
             spatial_features=spatial_features,
         )
         
-        # ==================== Focal-style 混合损失 + 负样本降权 ====================
+        # ==================== 样本级权重 ====================
         with torch.no_grad():
-            # 检测每个样本是否为负样本（GT 全零，即不可见目标）
-            # gt_heatmap: (B, 1, H, W), 按样本维度 flatten 后取 max
             sample_max = gt_heatmap.flatten(1).max(dim=1).values  # (B,)
             is_negative = (sample_max < 0.01).float()  # (B,)
-            
-            # 负样本扩散 loss 权重（可配置，默认 0.3，之前是 0.1）
-            sample_weight = 1.0 - (1.0 - self.negative_sample_weight) * is_negative  # (B,)
-            # 重塑为 (B, 1, 1, 1) 以广播到空间维度
-            sample_weight = sample_weight.view(-1, 1, 1, 1)
-        
-        # 逐样本 MSE（不做 reduction）
-        per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
-        
-        # 主损失：标准 MSE（无空间加权，保持 DDPM 理论正确性）+ 样本级负样本降权
-        base_loss = (sample_weight * per_pixel_mse).mean()
-        
-        # Focal 损失：让模型更关注峰值区域的噪声预测
+            is_positive = 1.0 - is_negative
+            sample_weight = (
+                self.positive_sample_boost * is_positive
+                + self.negative_sample_weight * is_negative
+            )  # (B,)
+            sample_weight_4d = sample_weight.view(-1, 1, 1, 1)
+
+        # ==================== 空间 focal 权重（所有 loss 共用）====================
         with torch.no_grad():
-            gt_weight = gt_heatmap.clamp(0, 1)
-            focal_alpha = 1.0
-            weight_map = 1.0 + focal_alpha * gt_weight
-            weight_map = weight_map / weight_map.mean()
-        
-        focal_loss = (sample_weight * weight_map * per_pixel_mse).mean()
-        
-        # 混合损失
-        focal_weight = 0.3
+            gt_clamped = gt_heatmap.clamp(0, 1)
+            focal_alpha = 20.0
+            spatial_focal = 1.0 + focal_alpha * gt_clamped  # 峰值处 15-21x
+            spatial_focal = spatial_focal / spatial_focal.mean()  # 归一化保持 loss 尺度
+
+        # ==================== 1. Epsilon Loss（aggressive focal）====================
+        per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
+
+        base_loss = (sample_weight_4d * per_pixel_mse).mean()
+        focal_loss = (sample_weight_4d * spatial_focal * per_pixel_mse).mean()
+
+        focal_weight = 0.8
         diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
-        
+
         total_loss = diffusion_loss
-        
-        # ==================== B1: x0 重构损失 ====================
-        # 从噪声预测反推 x0 估计，直接监督输出质量
-        # epsilon loss 只关心噪声预测是否准确，x0 loss 直接关心重构热力图是否像 GT
+
+        # ==================== Alpha bar (x0 估计用) ====================
+        with torch.no_grad():
+            alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
+            alpha_bar = alpha_bar.view(-1, 1, 1, 1)
+            snr = alpha_bar / (1 - alpha_bar + 1e-8)  # (B, 1, 1, 1)
+
+        x0_hat = (noisy_heatmap - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
+        x0_hat = x0_hat.clamp(-1, 1)
+
+        # ==================== 2. x0 重构损失 (focal + SNR 门控) ====================
         x0_loss_val = 0.0
+        if self.x0_loss_weight > 0:
+            per_pixel_x0_mse = (x0_hat - gt_normalized) ** 2
+            # SNR 软权重：低时间步(高 SNR)权重大，高时间步权重趋零
+            snr_weight = (snr / (snr + 1.0)).detach()  # sigmoid-like, [0,1]
+            x0_loss = (snr_weight * sample_weight_4d * spatial_focal * per_pixel_x0_mse).mean()
+            x0_loss_val = x0_loss.item()
+            total_loss = total_loss + self.x0_loss_weight * x0_loss
+
+        # ==================== 3. Dice Loss (专治稀疏信号) ====================
+        dice_loss_val = 0.0
+        if self.dice_loss_weight > 0:
+            # 只在低噪声时计算（SNR > 1），否则 x0_hat 无意义
+            snr_flat = snr.view(batch_size)
+            snr_mask_dice = (snr_flat > 1.0)
+            if snr_mask_dice.any():
+                x0_pos = ((x0_hat[snr_mask_dice] + 1) / 2).clamp(0, 1)  # [0,1]
+                gt_pos = gt_heatmap[snr_mask_dice].clamp(0, 1)
+                p_flat = x0_pos.flatten(1)
+                g_flat = gt_pos.flatten(1)
+                intersection = (p_flat * g_flat).sum(1)
+                union = p_flat.sum(1) + g_flat.sum(1)
+                dice = (2 * intersection + 1) / (union + 1)
+                dice_loss = (1 - dice).mean()
+                dice_loss_val = dice_loss.item()
+                total_loss = total_loss + self.dice_loss_weight * dice_loss
+
+        # ==================== 4. L1 稀疏性正则化 ====================
         sparsity_loss_val = 0.0
+        if self.sparsity_loss_weight > 0:
+            x0_denorm = (x0_hat + 1) / 2
+            sparsity_loss = x0_denorm.mean()
+            sparsity_loss_val = sparsity_loss.item()
+            total_loss = total_loss + self.sparsity_loss_weight * sparsity_loss
+
+        # ==================== 5. 负样本零目标损失 (SNR 门控) ====================
         neg_zero_loss_val = 0.0
-        x0_hat = None
-        
-        # 需要 x0 估计的条件：x0 loss、sparsity loss、或 peak distance loss
-        need_x0 = (self.x0_loss_weight > 0 or self.sparsity_loss_weight > 0 
-                    or self.peak_distance_loss_weight > 0)
-        
-        if need_x0:
+        if is_negative.any():
+            neg_mask = is_negative.bool()
             with torch.no_grad():
-                alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
-                alpha_bar = alpha_bar.view(-1, 1, 1, 1)
-            
-            # x0 估计: x0 = (noisy - sqrt(1-alpha_bar) * noise_pred) / sqrt(alpha_bar)
-            x0_hat = (noisy_heatmap - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
-            x0_hat = x0_hat.clamp(-1, 1)
-            
-            if self.x0_loss_weight > 0:
-                # x0 重构损失：直接监督重构质量（带样本权重）
-                # 注意：用 w × MSE 而非 MSE(w*x, w*y)，后者会导致权重变成 w²
-                per_pixel_x0_mse = (x0_hat - gt_normalized) ** 2  # (B, 1, H, W)
-                x0_loss = (sample_weight * per_pixel_x0_mse).mean()
-                x0_loss_val = x0_loss.item()
-                total_loss = total_loss + self.x0_loss_weight * x0_loss
-            
-            # ==================== B2: L1 稀疏性正则化 ====================
-            # 鼓励 x0 估计中大部分像素为 0（在 [0,1] 空间中）
-            if self.sparsity_loss_weight > 0:
-                x0_denorm = (x0_hat + 1) / 2  # 还原到 [0, 1]
-                sparsity_loss = x0_denorm.mean()  # 鼓励整体值接近 0
-                sparsity_loss_val = sparsity_loss.item()
-                total_loss = total_loss + self.sparsity_loss_weight * sparsity_loss
-            
-            # ==================== B4: 负样本显式零目标损失（SNR 门控） ====================
-            # 对负样本（GT=全零），额外约束 x0 应为全 -1（即 [0,1] 空间中的全 0）
-            # 同样使用 SNR 门控：高时间步的 x0_hat 接近随机噪声，强加零约束会产生噪声梯度
-            if is_negative.any():
-                neg_mask = is_negative.bool()
-                
-                # SNR 门控：只对 x0 估计质量好的样本施加零约束
-                with torch.no_grad():
-                    alpha_flat_neg = alpha_bar.view(batch_size)
-                    snr_neg = alpha_flat_neg / (1 - alpha_flat_neg + 1e-8)
-                    high_snr_neg = neg_mask & (snr_neg > 1.0)
-                
-                if high_snr_neg.any():
-                    neg_x0 = x0_hat[high_snr_neg]
-                    neg_target = torch.full_like(neg_x0, -1.0)  # [-1,1] 空间中，全零 = -1
-                    neg_zero_loss = F.mse_loss(neg_x0, neg_target)
-                    neg_zero_loss_val = neg_zero_loss.item()
-                    total_loss = total_loss + 0.5 * neg_zero_loss
-        
-        # ==================== Peak Distance Loss (Multi-Peak Aware, SNR-gated) ====================
-        # 多峰感知的可微分峰值距离损失：
-        # 1. NMS 检测 GT 中的所有峰值（非微分）
-        # 2. 对每个 GT 峰值创建高斯注意力窗口
-        # 3. 在窗口内对预测 x0 做 soft-argmax → 提取对应预测位置
-        # 4. 计算每峰的 L2 距离并平均
-        #
-        # SNR 门控：只在 x0 估计质量足够好时（低时间步，高 SNR）计算
-        # 高时间步的 x0_hat 接近随机噪声，peak 位置无意义，梯度有害
+                snr_flat_neg = snr.view(batch_size)
+                high_snr_neg = neg_mask & (snr_flat_neg > 1.0)
+            if high_snr_neg.any():
+                neg_x0 = x0_hat[high_snr_neg]
+                neg_zero_loss = F.mse_loss(neg_x0, torch.full_like(neg_x0, -1.0))
+                neg_zero_loss_val = neg_zero_loss.item()
+                total_loss = total_loss + 0.5 * neg_zero_loss
+
+        # ==================== 6. Peak Distance Loss (SNR 门控) ====================
         peak_dist_loss_val = 0.0
-        
-        if self.peak_distance_loss_weight > 0 and x0_hat is not None:
+        if self.peak_distance_loss_weight > 0:
             with torch.no_grad():
-                # SNR = alpha_bar / (1 - alpha_bar)
-                # 只对 SNR > 1 的样本（即 alpha_bar > 0.5，约 t < T/2）计算
-                # 这些样本的 x0 估计信噪比足够高，peak 位置有意义
-                alpha_flat = alpha_bar.view(batch_size)  # (B,) 安全的 reshape
-                snr = alpha_flat / (1 - alpha_flat + 1e-8)  # (B,)
-                snr_mask = (snr > 1.0)  # alpha_bar > 0.5
-            
-            if snr_mask.any():
-                # 只对高 SNR 样本计算 peak loss
-                snr_x0 = x0_hat[snr_mask]
-                snr_gt = gt_heatmap[snr_mask]
-                snr_is_neg = is_negative[snr_mask]
-                
+                snr_flat_pk = snr.view(batch_size)
+                snr_mask_pk = (snr_flat_pk > 1.0)
+            if snr_mask_pk.any():
+                snr_x0 = x0_hat[snr_mask_pk]
+                snr_gt = gt_heatmap[snr_mask_pk]
+                snr_is_neg = is_negative[snr_mask_pk]
                 peak_dist_loss, peak_dist_loss_val = self._multi_peak_distance_loss(
                     snr_x0, snr_gt, snr_is_neg
                 )
                 if peak_dist_loss.requires_grad:
                     total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
-        
-        # ==================== Visibility Loss (B3: 增强权重) ====================
-        # 可见性预测：判断当前样本的 GT 热力图是否有峰值
+
+        # ==================== 7. Visibility Loss ====================
         visibility_loss_val = 0.0
         if self.use_visibility_head:
-            # GT 标签：热力图最大值 > 0.01 为"可见"
             with torch.no_grad():
-                gt_has_peak = (gt_heatmap.flatten(1).max(dim=1).values > 0.01).float()  # (B,)
-            
-            vis_logit = self.visibility_head(cond).squeeze(-1)  # (B,)
+                gt_has_peak = (gt_heatmap.flatten(1).max(dim=1).values > 0.01).float()
+            vis_logit = self.visibility_head(cond).squeeze(-1)
             visibility_loss = F.binary_cross_entropy_with_logits(vis_logit, gt_has_peak)
             visibility_loss_val = visibility_loss.item()
-            
             total_loss = total_loss + self.visibility_loss_weight * visibility_loss
-        
-        # 诊断信息：记录噪声预测质量
+
+        # ==================== 诊断信息 ====================
         noise_std = noise.std().item()
         noise_pred_std = noise_pred.std().item()
-        
-        # 定期生成预测热力图用于可视化（不参与 loss 计算）
+
         self._training_step_counter += 1
         pred_heatmap = None
-        
         if not skip_inference and (self._training_step_counter % self._inference_interval == 0):
             with torch.no_grad():
                 pred_heatmap = self._diffusion_inference(
                     cond, seq_cond=seq_cond, spatial_features=spatial_features,
                 )
-        
+
         return {
             'loss': total_loss,
             'diffusion_loss': diffusion_loss,
-            'base_loss': base_loss.item(),          # 标准 MSE
-            'focal_loss': focal_loss.item(),        # 峰值加权 MSE
-            'visibility_loss': visibility_loss_val, # 可见性 BCE loss
-            'x0_loss': x0_loss_val,                 # x0 重构损失
-            'sparsity_loss': sparsity_loss_val,     # L1 稀疏性损失
-            'neg_zero_loss': neg_zero_loss_val,     # 负样本零目标损失
-            'peak_dist_loss': peak_dist_loss_val,   # 可微分峰值距离损失
+            'base_loss': base_loss.item(),
+            'focal_loss': focal_loss.item(),
+            'visibility_loss': visibility_loss_val,
+            'x0_loss': x0_loss_val,
+            'dice_loss': dice_loss_val,
+            'sparsity_loss': sparsity_loss_val,
+            'neg_zero_loss': neg_zero_loss_val,
+            'peak_dist_loss': peak_dist_loss_val,
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
