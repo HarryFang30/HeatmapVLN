@@ -16,40 +16,75 @@
 
 ### 2.1 任务特点
 
-- **输入**: Qwen3-VL 提取的视觉语言特征 (1024维)
+- **输入**: Qwen3-VL 提取的视觉语言特征 (1024维) + 观察图像
 - **输出**: 64×64 热力图，表示位置概率分布
-- **GT特点**: 
+- **模型**: DiffusionHeatmapHead (ConditionalUnet2D + DDPM)
+- **GT特点**:
   - 高斯分布形状（可能多峰，取决于导航场景）
   - ~93.5% 是黑色背景 (值接近0)
   - ~6.5% 是峰值区域 (中心最大值~1.0)
-- **特殊处理**: 360° 全景图，左右边界连续
+- **特殊处理**: 360° 全景图，左右边界连续 (Circular Padding)
 
-### 2.2 采用的 Loss: 标准 DDPM 无加权 MSE
+### 2.2 采用的 Loss: 混合 Diffusion + 辅助损失
 
 ```python
-# 标准 DDPM Loss：无加权 MSE
-# Diffusion 的去噪过程自然会学习数据分布
-# 不需要人为约束（peak_loss/variance_loss 反而有害）
+# 1. 主损失：标准 DDPM MSE + Focal 峰值加权
+per_pixel_mse = (noise_pred - noise) ** 2
+base_loss = (sample_weight * per_pixel_mse).mean()
 
-diffusion_loss = F.mse_loss(noise_pred, noise)
+# Focal 损失：让模型更关注峰值区域
+gt_weight = gt_heatmap.clamp(0, 1)
+weight_map = 1.0 + focal_alpha * gt_weight
+focal_loss = (sample_weight * weight_map * per_pixel_mse).mean()
+
+focal_weight = 0.3
+diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
 ```
 
 **公式**:
 $$L_{diffusion} = \mathbb{E}_{t, \epsilon} \left[ ||\epsilon - \epsilon_\theta(x_t, t, c)||^2 \right]$$
 
-### 2.3 为什么使用 Diffusion 而不是 CNN + KL？
+### 2.3 辅助损失
 
-对于可能出现 **多峰分布** 的热力图（1个峰、3个峰、7个峰都可能），Diffusion 是最佳选择：
+```python
+# 2. x0 重构损失：从噪声预测反推 x0 估计，直接监督输出质量
+alpha_bar = self.noise_scheduler.alphas_cumprod[timesteps]
+x0_hat = (noisy_heatmap - sqrt(1-alpha_bar) * noise_pred) / sqrt(alpha_bar)
+x0_loss = MSE(x0_hat, gt_normalized)
 
-| 方案 | 单峰 | 多峰 | 原因 |
-|------|------|------|------|
-| CNN + KL | ✅ | ❌ | 多峰时学到"糊状"输出 |
-| CNN + 固定K点 | ❌ | ❌ | 峰数量不匹配 |
-| **Diffusion** | ✅ | ✅ | 去噪过程自然"雕刻"任意数量的峰 |
+# 3. L1 稀疏性正则化：鼓励输出大部分为 0
+x0_denorm = (x0_hat + 1) / 2  # 还原到 [0, 1]
+sparsity_loss = x0_denorm.mean()
 
-### 2.4 360° 全景图支持 (Circular Padding)
+# 4. 负样本显式零目标损失 (SNR 门控)
+# 对负样本（GT=全零），约束 x0 应为全 -1
+neg_zero_loss = MSE(neg_x0, -1.0)
 
-由于输入是 Equirectangular 投影的 360° 全景图，左右边界在空间上是连续的：
+# 5. 多峰感知峰值距离损失 (SNR 门控)
+# 检测 GT 中的所有峰值，计算预测位置与 GT 的 L2 距离
+peak_dist_loss = multi_peak_distance(snr_x0, snr_gt)
+```
+
+### 2.4 可见性预测损失
+
+```python
+# 可见性预测头：判断当前视角是否能看到历史点
+gt_has_peak = (gt_heatmap.max() > 0.01).float()
+vis_logit = visibility_head(cond)
+visibility_loss = F.binary_cross_entropy_with_logits(vis_logit, gt_has_peak)
+```
+
+### 2.5 负样本处理
+
+```python
+# 检测负样本（GT 全零，即不可见目标）
+is_negative = (gt_heatmap.max() < 0.01).float()
+
+# 负样本扩散 loss 降权
+sample_weight = 1.0 - (1.0 - negative_sample_weight) * is_negative
+```
+
+### 2.6 360° 全景图支持 (Circular Padding)
 
 ```python
 # UNet Conv 层使用循环填充
@@ -67,31 +102,43 @@ model:
     use_circular_padding: true
 ```
 
-### 2.5 设计理由
+### 2.7 为什么使用 Diffusion？
+
+对于可能出现 **多峰分布** 的热力图（1个峰、3个峰、7个峰都可能），Diffusion 是最佳选择：
+
+| 方案 | 单峰 | 多峰 | 原因 |
+|------|------|------|------|
+| CNN + KL | ✅ | ❌ | 多峰时学到"糊状"输出 |
+| CNN + 固定K点 | ❌ | ❌ | 峰数量不匹配 |
+| **Diffusion** | ✅ | ✅ | 去噪过程自然"雕刻"任意数量的峰 |
+
+### 2.8 设计理由
 
 | 选择 | 理由 |
 |------|------|
-| 标准无加权 MSE | 噪声 ε 在空间上均匀分布，加权会破坏这个假设 |
-| 移除 peak_loss | `max()` 只给 1 个像素梯度，导致随机噪点 |
-| 移除 variance_loss | 模型学会输出高频噪声来满足约束 |
+| DDPM MSE + Focal | 基础扩散损失保证收敛，Focal 聚焦峰值区域 |
+| x0 重构损失 | 直接监督输出质量，补充噪声预测 |
+| 稀疏性正则化 | 鼓励大部分像素为 0，符合热力图分布 |
+| 峰值距离损失 | 可微分地约束峰值位置准确 |
+| SNR 门控 | 高时间步 x0 估计质量差，梯度有害，动态跳过 |
+| 可见性头 | 显式建模"是否可见"，消除假阳性 |
 | Circular Padding | 360° 全景图左右边界连续 |
 
-### 2.6 之前有害设计的问题
+### 2.9 当前权重配置
 
-```python
-# ❌ 已删除的有害设计
+```yaml
+model:
+  heatmap_head:
+    use_circular_padding: true   # 360° 全景图支持
+    x0_loss_weight: 1.0           # x0 重构损失权重
+    sparsity_loss_weight: 0.5     # 稀疏性损失权重
+    visibility_loss_weight: 0.5  # 可见性损失权重
+    negative_sample_weight: 0.3   # 负样本降权
+    peak_distance_loss_weight: 2.0 # 峰值距离损失权重
 
-# 1. 加权 MSE - 破坏噪声均匀性假设
-weight = 1.0 + 9.0 * gt_heatmap  # 峰值区域权重 x10
-# 问题：模型在峰值区域预测过大噪声，去噪时崩溃
-
-# 2. 峰值约束 - 只提供单点梯度
-peak_loss = F.relu(0.3 - pred_heatmap.max())
-# 问题：模型随便拉高一个像素满足约束 → 噪点
-
-# 3. 方差约束 - 鼓励高频噪声
-variance_loss = F.relu(0.05 - pred_heatmap.std())
-# 问题：输出白噪声是最简单的高方差输出
+loss:
+  history_weight: 1.0
+  future_weight: 1.0
 ```
 
 ---
@@ -102,25 +149,27 @@ variance_loss = F.relu(0.05 - pred_heatmap.std())
 
 - **输入**: Qwen3-VL 特征 (1024维)
 - **输出**: 24步 × 3维 轨迹 (dx, dy, delta_yaw)
-- **模型**: Transformer Decoder + Diffusion
+- **模型**: TransformerActionHead 或 DiffusionActionHead
 - **GT**: 归一化的相对运动序列
 
-### 3.2 采用的 Loss: 标准 DDPM 噪声预测 MSE
+### 3.2 采用的 Loss
 
+根据配置使用以下两种之一：
+
+**TransformerActionHead (推荐)**:
 ```python
-# 采样噪声
+# 使用交叉熵或 MSE 计算动作预测损失
+result = model.transformer_action_head.compute_loss(pred_actions, gt_actions)
+trajectory_loss = result['loss']
+```
+
+**DiffusionActionHead**:
+```python
+# 标准 DDPM 噪声预测 MSE
 noise = torch.randn_like(gt_trajectory)
-
-# 采样时间步
 timesteps = torch.randint(0, num_train_timesteps, (batch_size,))
-
-# 加噪
 noisy_trajectory = noise_scheduler.add_noise(gt_trajectory, noise, timesteps)
-
-# 预测噪声
 noise_pred = model.forward_diffusion(noisy_trajectory, timesteps, cond)
-
-# 标准 MSE Loss
 loss = F.mse_loss(noise_pred, noise)
 ```
 
@@ -143,9 +192,10 @@ $$L_{trajectory} = \mathbb{E}_{t, \epsilon} \left[ ||\epsilon - \epsilon_\theta(
 
 - **输入**: Qwen3-VL 特征 (1024维)
 - **输出**: 1维标量 [0, 1]，表示导航进度
+- **模型**: ProgressHead (MLP)
 - **GT分布**: 均匀分布，但边界点 (0 和 1) 是关键决策点
 
-### 4.2 采用的 Loss: 简单 MSE (对齐 InternNav)
+### 4.2 采用的 Loss: 简单 MSE
 
 ```python
 # 简单 MSE，无加权
@@ -155,10 +205,10 @@ loss = F.mse_loss(progress, targets)
 **公式**:
 $$L_{progress} = \frac{1}{N} \sum_{i} (p_i - \hat{p}_i)^2$$
 
-### 4.3 网络结构 (对齐 InternNav DistanceNetwork)
+### 4.3 网络结构
 
 ```python
-# 简单 3 层 MLP
+# 3 层 MLP (对齐 InternNav DistanceNetwork)
 nn.Sequential(
     nn.Linear(input_dim, input_dim // 4),
     nn.ReLU(),
@@ -178,72 +228,103 @@ nn.Sequential(
 | ReLU | 简单激活函数，避免过拟合 |
 | 无 LayerNorm/Dropout | 简单回归任务不需要复杂正则化 |
 
-### 4.5 为什么不用边界加权
+---
 
-之前使用 `boundary_weight = 1 + 2 * |target - 0.5|` 导致 loss 不收敛。
+## 5. 停止预测 Loss
 
-**原因分析**：
-- Progress 是均匀分布的 (0 → 1)
-- 边界加权让 0 和 1 附近样本权重翻倍
-- 导致训练在边界和中间之间"拉扯"，无法稳定收敛
-- InternNav 验证了简单 MSE 足够有效
+### 5.1 任务特点
+
+- **输入**: Qwen3-VL 特征 (1024维)
+- **输出**: 1维标量 (0 或 1)，表示是否停止
+- **模型**: StopHead
+- **GT**: 二进制标签
+
+### 5.2 采用的 Loss: BCE
+
+```python
+# 二元交叉熵
+loss = F.binary_cross_entropy_with_logits(stop_logit, stop_target)
+```
 
 ---
 
-## 5. 总体 Loss 组合
+## 6. 总体 Loss 组合
 
-### 5.1 总 Loss 公式
+### 6.1 总 Loss 公式
 
-$$L_{total} = \lambda_h \cdot L_{heatmap} + \lambda_t \cdot L_{trajectory} + \lambda_p \cdot L_{progress}$$
+$$L_{total} = \lambda_h \cdot L_{heatmap} + \lambda_t \cdot L_{trajectory} + \lambda_p \cdot L_{progress} + \lambda_s \cdot L_{stop}$$
 
-### 5.2 当前权重配置
+### 6.2 当前权重配置
 
 ```yaml
 loss:
-  history_weight: 1.0      # λ_h
-  trajectory_weight: 1.0   # λ_t
-  progress_weight: 0.5     # λ_p
+  history_weight: 1.0       # λ_h (热力图)
+  future_weight: 1.0        # λ_f (未来热力图)
+  trajectory_weight: 1.0    # λ_t
+  progress_weight: 0.5      # λ_p
+  stop_weight: 0.5          # λ_s
 ```
 
-### 5.3 权重设计理由
+### 6.3 权重设计理由
 
 | 任务 | 权重 | 理由 |
 |------|------|------|
 | 热力图 | 1.0 | 核心任务，输出维度最大 |
 | 轨迹 | 1.0 | 核心任务，直接影响导航 |
 | 进度 | 0.5 | 辅助任务，相对简单 |
+| 停止 | 0.5 | 辅助任务，二分类简单 |
 
 ---
 
-## 6. 修复历史
+## 7. 实际 Loss 输出监控
 
-### 6.1 2024-01 Loss 重构
+训练时监控以下 loss 分量：
 
-**问题**: 热力图输出为噪点，模型"作弊"满足约束而不学习分布
-
-**原因分析**:
-1. `peak_loss = F.relu(0.3 - max())` - `max()` 只给 1 个像素梯度
-2. `variance_loss = F.relu(0.05 - std())` - 高频噪声是最简单的高方差输出
-3. 加权 MSE 破坏噪声均匀性假设
-
-**修复**:
-- ✅ 移除 `peak_loss` 和 `variance_loss`
-- ✅ 使用标准无加权 MSE: `F.mse_loss(noise_pred, noise)`
-- ✅ 添加 360° Circular Padding 支持
+```python
+{
+    'loss': total_loss,                    # 总 loss
+    'heatmap_loss': heatmap_loss,          # 热力图噪声预测 loss
+    'diffusion_loss': diffusion_loss,      # 纯扩散 loss（不含 visibility）
+    'visibility_loss': visibility_loss,    # 可见性 BCE loss
+    'base_loss': base_loss,                # 标准 MSE
+    'focal_loss': focal_loss,              # 峰值加权 MSE
+    'x0_loss': x0_loss,                    # x0 重构损失
+    'sparsity_loss': sparsity_loss,        # 稀疏性损失
+    'neg_zero_loss': neg_zero_loss,       # 负样本零目标损失
+    'peak_dist_loss': peak_dist_loss,      # 峰值距离损失
+    'action_loss': action_loss,            # 轨迹/动作 loss
+    'stop_loss': stop_loss,                # 停止 loss
+}
+```
 
 ---
 
-## 7. 配置参考
+## 8. 配置参考
 
 ```yaml
 model:
   heatmap_head:
     use_circular_padding: true   # 360° 全景图支持
-    dropout: 0.2
+    use_visibility_head: true    # 可见性预测头
+    x0_loss_weight: 1.0
+    sparsity_loss_weight: 0.5
+    visibility_loss_weight: 0.5
+    negative_sample_weight: 0.3
+    peak_distance_loss_weight: 2.0
+
+  action_head:
+    use_diffusion: true          # 使用 DiffusionActionHead
+
+  progress_head:
+    hidden_dim: 256
+
+  stop_head:
+    hidden_dim: 256
 
 loss:
-  heatmap_loss_type: simplified  # 后处理 loss（可选）
   history_weight: 1.0
+  future_weight: 1.0
   trajectory_weight: 1.0
   progress_weight: 0.5
+  stop_weight: 0.5
 ```
