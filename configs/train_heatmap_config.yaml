@@ -242,6 +242,7 @@ optim:
   heatmap_lr: 5.0e-5               # 1e-4 → 5e-5，防止快速过拟合
   history_heatmap_lr: 5.0e-5
   resnet_backbone_lr: 1.0e-5       # ResNet-18 预训练 backbone 用更低 LR 防止破坏预训练特征
+  visibility_head_lr: 1.0e-3       # Visibility head 需要高 LR 跟上 cond 编码器变化
   future_heatmap_lr: 5.0e-5
   action_lr: 1.0e-4
   transformer_action_lr: 1.0e-4

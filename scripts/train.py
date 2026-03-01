@@ -878,15 +878,27 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             })
         return groups
     
-    # History Heatmap Head — split ResNet backbone (low lr) from rest (normal lr)
+    # History Heatmap Head — split into 3 groups: ResNet (low lr), visibility head (high lr), rest (normal lr)
     hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
     resnet_backbone_lr = optim_cfg.get('resnet_backbone_lr', 1e-5)
+    visibility_lr = optim_cfg.get('visibility_head_lr', 1e-3)
     if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
         head = model.history_heatmap_head
         # Check if this head uses a pretrained ResNet encoder
         has_resnet = (hasattr(head, 'condition_encoder') and 
                       hasattr(head.condition_encoder, 'image_encoder') and
                       hasattr(head.condition_encoder.image_encoder, 'img_mean'))  # ResNet marker
+        
+        # Collect visibility head param ids for exclusion
+        vis_param_ids = set()
+        if hasattr(head, 'visibility_head'):
+            vis_param_ids = set(id(p) for p in head.visibility_head.parameters())
+            vis_groups = get_param_groups_with_wd(
+                head.visibility_head, visibility_lr, 'visibility_head', default_wd)
+            if vis_groups:
+                param_groups.extend(vis_groups)
+                n_vis = sum(len(g['params']) for g in vis_groups)
+                print(f"  Param group: visibility_head (lr={visibility_lr}, wd={default_wd}, params={n_vis})")
         
         if has_resnet:
             resnet_encoder = head.condition_encoder.image_encoder
@@ -900,10 +912,12 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
                 n_resnet = sum(len(g['params']) for g in resnet_groups)
                 print(f"  Param group: resnet_backbone (lr={resnet_backbone_lr}, wd={default_wd}, params={n_resnet})")
             
-            # Rest of heatmap head (normal lr) — exclude ResNet params
+            excluded_ids = resnet_param_ids | vis_param_ids
+            
+            # Rest of heatmap head (normal lr) — exclude ResNet + visibility head params
             rest_decay, rest_no_decay = [], []
             for name, p in head.named_parameters():
-                if not p.requires_grad or id(p) in resnet_param_ids:
+                if not p.requires_grad or id(p) in excluded_ids:
                     continue
                 if p.dim() <= 1 or name.endswith('.bias'):
                     rest_no_decay.append(p)
@@ -918,10 +932,23 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             n_rest = len(rest_decay) + len(rest_no_decay)
             print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd}, params={n_rest})")
         else:
-            groups = get_param_groups_with_wd(head, hist_lr, 'history_heatmap_head', default_wd)
-            if groups:
-                param_groups.extend(groups)
-                print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd})")
+            # No ResNet, but still exclude visibility head
+            rest_decay, rest_no_decay = [], []
+            for name, p in head.named_parameters():
+                if not p.requires_grad or id(p) in vis_param_ids:
+                    continue
+                if p.dim() <= 1 or name.endswith('.bias'):
+                    rest_no_decay.append(p)
+                else:
+                    rest_decay.append(p)
+            if rest_decay:
+                param_groups.append({'params': rest_decay, 'lr': hist_lr, 
+                                     'weight_decay': default_wd, 'name': 'history_heatmap_head'})
+            if rest_no_decay:
+                param_groups.append({'params': rest_no_decay, 'lr': hist_lr,
+                                     'weight_decay': 0.0, 'name': 'history_heatmap_head_no_decay'})
+            n_rest = len(rest_decay) + len(rest_no_decay)
+            print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd}, params={n_rest})")
     
     # Future Heatmap Head
     fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
@@ -1091,6 +1118,10 @@ def train_one_epoch(
     
     global_step = 0
     valid_batch_count = 0
+    
+    # 分组参数：visibility head 单独裁剪，避免被 UNet 大梯度淹没
+    vis_params = [p for n, p in model.named_parameters() if 'visibility_head' in n and p.requires_grad]
+    other_params = [p for n, p in model.named_parameters() if 'visibility_head' not in n and p.requires_grad]
     
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
@@ -1268,11 +1299,15 @@ def train_one_epoch(
         if valid_batch_count % grad_accum_steps == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
+                if vis_params:
+                    torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
+                if vis_params:
+                    torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -1615,11 +1650,15 @@ def train_one_epoch(
     if remaining > 0:
         if scaler is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+            torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
+            if vis_params:
+                torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
             scaler.step(optimizer)
             scaler.update()
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+            torch.nn.utils.clip_grad_norm_(other_params, optim_cfg['grad_clip'])
+            if vis_params:
+                torch.nn.utils.clip_grad_norm_(vis_params, optim_cfg['grad_clip'])
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
