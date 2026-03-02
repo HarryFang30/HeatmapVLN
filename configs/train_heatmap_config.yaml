@@ -142,22 +142,9 @@ model:
     # 集中能量到峰值区域，消除弥散问题
     sharpen_temperature: 0.1          # 温度越低越锐利（0 = 禁用）
     
-    # x0 重构损失（focal + SNR 门控：直接监督峰值区域的重构质量）
-    x0_loss_weight: 1.0               # 3→1，辅助 loss 不应压过 epsilon
-    
-    # L1 稀疏性正则化（大 sigma 下减弱，避免惩罚正确的宽高斯）
-    sparsity_loss_weight: 0.1         # 0.5→0.1
-    
-    # Dice Loss（专治稀疏信号：天然归一化，不受背景像素数量影响）
-    dice_loss_weight: 0.5              # 2→0.5，Dice 基于单步 x0 估计，不应主导
-    
     # 正负样本权重平衡（数据集 ~69% 负样本）
     negative_sample_weight: 0.3       # 负样本权重
-    positive_sample_boost: 3.0        # 正样本权重提升（2→3）
-    
-    # 可微分峰值距离损失（直接优化峰值位置准确度）
-    peak_distance_loss_weight: 1.0    # 5→1，辅助 loss 不应压过 epsilon
-    peak_loss_temperature: 0.1        # soft-argmax 温度
+    positive_sample_boost: 3.0        # 正样本权重提升
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:

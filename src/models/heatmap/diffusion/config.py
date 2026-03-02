@@ -125,33 +125,10 @@ class DiffusionHeatmapConfig:
     # 设为 0 禁用锐化；推荐值 0.1（保留峰值附近 ~10px 区域）
     sharpen_temperature: float = 0.1
     
-    # ==================== x0 Reconstruction Loss (focal + SNR 门控) ====================
-    # 主力 loss：focal 空间加权 + SNR 软门控
-    # 低时间步权重大（x0 估计好），峰值区域权重大（focal 20x）
-    x0_loss_weight: float = 3.0              # x0 重构损失权重
-    
-    # ==================== Sparsity Regularization ====================
-    sparsity_loss_weight: float = 0.1        # 稀疏性正则化权重 (0.5→0.1, 大 sigma 下不能太强)
-    
-    # ==================== Dice Loss ====================
-    # Dice loss 天然归一化：不受背景像素数量影响
-    # 解决 MSE 在稀疏信号上 95% 梯度浪费在背景的根本问题
-    dice_loss_weight: float = 2.0            # Dice 损失权重 (0 = 禁用)
-    
     # ==================== Sample Weighting ====================
-    # 正负样本 loss 权重平衡
-    # 数据集中约 69% 为负样本（GT=全零），31% 为正样本
-    # 正样本 boost 补偿数据不平衡，让模型有更强的动力学习画峰值
-    negative_sample_weight: float = 0.3      # 负样本权重 (0.1~1.0)
+    # 正负样本 loss 权重平衡（数据集 ~69% 负样本）
+    negative_sample_weight: float = 0.3      # 负样本权重
     positive_sample_boost: float = 3.0       # 正样本权重提升倍数
-    
-    # ==================== Peak Distance Loss ====================
-    # 可微分峰值距离损失：通过 Spatial Soft-Argmax 直接优化峰值位置
-    # 这是唯一直接优化 peak_distance 指标的 loss
-    # 注意：只对正样本（有峰值的 GT）计算，跳过负样本
-    # 归一化到 [0,1] 范围（除以 heatmap 对角线长度），与其他 loss 尺度一致
-    peak_distance_loss_weight: float = 5.0   # 峰值距离损失权重
-    peak_loss_temperature: float = 0.1       # soft-argmax 温度（越低越接近真实 argmax）
     
     # ==================== Direction Embedding ====================
     # 多视角（全景）模式下为每个方向注入可学习嵌入

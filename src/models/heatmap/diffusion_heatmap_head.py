@@ -157,18 +157,9 @@ class DiffusionHeatmapHead(nn.Module):
         # Sharpening config
         self.sharpen_temperature = config.sharpen_temperature
         
-        # x0 / dice / sparsity loss config
-        self.x0_loss_weight = config.x0_loss_weight
-        self.sparsity_loss_weight = config.sparsity_loss_weight
-        self.dice_loss_weight = config.dice_loss_weight
-        
         # Sample weighting config
         self.negative_sample_weight = config.negative_sample_weight
         self.positive_sample_boost = config.positive_sample_boost
-        
-        # Peak distance loss config
-        self.peak_distance_loss_weight = config.peak_distance_loss_weight
-        self.peak_loss_temperature = config.peak_loss_temperature
         
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
@@ -333,7 +324,7 @@ class DiffusionHeatmapHead(nn.Module):
             spatial_features=spatial_features,
         )
         
-        # ==================== 样本级权重 ====================
+        # ==================== 样本级权重（正负样本平衡）====================
         with torch.no_grad():
             sample_max = gt_heatmap.flatten(1).max(dim=1).values  # (B,)
             is_negative = (sample_max < 0.01).float()  # (B,)
@@ -344,120 +335,53 @@ class DiffusionHeatmapHead(nn.Module):
             )  # (B,)
             sample_weight_4d = sample_weight.view(-1, 1, 1, 1)
 
-        # ==================== 空间 focal 权重（所有 loss 共用）====================
-        with torch.no_grad():
-            gt_clamped = gt_heatmap.clamp(0, 1)
-            focal_alpha = 6.0
-            spatial_focal = 1.0 + focal_alpha * gt_clamped  # 峰值处 ~7x（20→6，保证背景去噪质量）
-            spatial_focal = spatial_focal / spatial_focal.mean()  # 归一化保持 loss 尺度
-
-        # ==================== 1. Epsilon Loss（aggressive focal）====================
+        # ==================== Epsilon MSE Loss（扩散模型唯一需要的 loss）====================
+        # 标准扩散模型只需要 epsilon MSE：在所有时间步、所有像素上均匀训练噪声预测
+        # DDIM 推理链的质量完全取决于 epsilon 预测精度，任何偏重都会破坏链条
         per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
-
-        base_loss = (sample_weight_4d * per_pixel_mse).mean()
-        focal_loss = (sample_weight_4d * spatial_focal * per_pixel_mse).mean()
-
-        focal_weight = 0.5
-        diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
+        diffusion_loss = (sample_weight_4d * per_pixel_mse).mean()
 
         total_loss = diffusion_loss
 
-        # ==================== Alpha bar (x0 估计用) ====================
+        # ==================== 诊断信息（不参与梯度，仅用于监控）====================
+        noise_std = noise.std().item()
+        noise_pred_std = noise_pred.std().item()
+
         with torch.no_grad():
             alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
             alpha_bar = alpha_bar.view(-1, 1, 1, 1)
-            snr = alpha_bar / (1 - alpha_bar + 1e-8)  # (B, 1, 1, 1)
+            snr = alpha_bar / (1 - alpha_bar + 1e-8)
 
-        x0_hat = (noisy_heatmap - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
-        x0_hat = x0_hat.clamp(-1, 1)
-
-        # ==================== 2. x0 重构损失 (focal + SNR 门控) ====================
-        x0_loss_val = 0.0
-        if self.x0_loss_weight > 0:
-            per_pixel_x0_mse = (x0_hat - gt_normalized) ** 2
-            # SNR 软权重：低时间步(高 SNR)权重大，高时间步权重趋零
-            snr_weight = (snr / (snr + 1.0)).detach()  # sigmoid-like, [0,1]
-            x0_loss = (snr_weight * sample_weight_4d * spatial_focal * per_pixel_x0_mse).mean()
-            x0_loss_val = x0_loss.item()
-            total_loss = total_loss + self.x0_loss_weight * x0_loss
-
-        # ==================== 3. Dice Loss (专治稀疏信号) ====================
-        dice_loss_val = 0.0
-        if self.dice_loss_weight > 0:
-            # 只在低噪声时计算（SNR > 1），否则 x0_hat 无意义
+            # 按噪声水平分层的 epsilon MSE（真实反映模型能力）
             snr_flat = snr.view(batch_size)
-            snr_mask_dice = (snr_flat > 1.0)
-            if snr_mask_dice.any():
-                x0_pos = ((x0_hat[snr_mask_dice] + 1) / 2).clamp(0, 1)  # [0,1]
-                gt_pos = gt_heatmap[snr_mask_dice].clamp(0, 1)
-                p_flat = x0_pos.flatten(1)
-                g_flat = gt_pos.flatten(1)
-                intersection = (p_flat * g_flat).sum(1)
-                union = p_flat.sum(1) + g_flat.sum(1)
-                dice = (2 * intersection + 1) / (union + 1)
-                dice_loss = (1 - dice).mean()
-                dice_loss_val = dice_loss.item()
-                total_loss = total_loss + self.dice_loss_weight * dice_loss
+            per_sample_mse = per_pixel_mse.flatten(1).mean(dim=1)  # (B,)
 
-        # ==================== 4. L1 稀疏性正则化 ====================
-        sparsity_loss_val = 0.0
-        if self.sparsity_loss_weight > 0:
-            x0_denorm = (x0_hat + 1) / 2
-            sparsity_loss = x0_denorm.mean()
-            sparsity_loss_val = sparsity_loss.item()
-            total_loss = total_loss + self.sparsity_loss_weight * sparsity_loss
+            high_snr_mask = snr_flat > 5.0    # 低噪声（t < 50）
+            mid_snr_mask = (snr_flat >= 0.5) & (snr_flat <= 5.0)  # 中噪声
+            low_snr_mask = snr_flat < 0.5     # 高噪声（t > 120）
 
-        # ==================== 5. 负样本零目标损失 (SNR 门控) ====================
-        neg_zero_loss_val = 0.0
-        if is_negative.any():
-            neg_mask = is_negative.bool()
-            with torch.no_grad():
-                snr_flat_neg = snr.view(batch_size)
-                high_snr_neg = neg_mask & (snr_flat_neg > 1.0)
-            if high_snr_neg.any():
-                neg_x0 = x0_hat[high_snr_neg]
-                neg_zero_loss = F.mse_loss(neg_x0, torch.full_like(neg_x0, -1.0))
-                neg_zero_loss_val = neg_zero_loss.item()
-                total_loss = total_loss + 0.5 * neg_zero_loss
-
-        # ==================== 6. Peak Distance Loss (SNR 门控) ====================
-        peak_dist_loss_val = 0.0
-        if self.peak_distance_loss_weight > 0:
-            with torch.no_grad():
-                snr_flat_pk = snr.view(batch_size)
-                snr_mask_pk = (snr_flat_pk > 1.0)
-            if snr_mask_pk.any():
-                snr_x0 = x0_hat[snr_mask_pk]
-                snr_gt = gt_heatmap[snr_mask_pk]
-                snr_is_neg = is_negative[snr_mask_pk]
-                peak_dist_loss, peak_dist_loss_val = self._multi_peak_distance_loss(
-                    snr_x0, snr_gt, snr_is_neg
-                )
-                if peak_dist_loss.requires_grad:
-                    total_loss = total_loss + self.peak_distance_loss_weight * peak_dist_loss
-
-        # ==================== 诊断信息 ====================
-        noise_std = noise.std().item()
-        noise_pred_std = noise_pred.std().item()
+            eps_mse_high_snr = per_sample_mse[high_snr_mask].mean().item() if high_snr_mask.any() else 0.0
+            eps_mse_mid_snr = per_sample_mse[mid_snr_mask].mean().item() if mid_snr_mask.any() else 0.0
+            eps_mse_low_snr = per_sample_mse[low_snr_mask].mean().item() if low_snr_mask.any() else 0.0
 
         self._training_step_counter += 1
         pred_heatmap = None
         if not skip_inference and (self._training_step_counter % self._inference_interval == 0):
-            with torch.no_grad():
-                pred_heatmap = self._diffusion_inference(
-                    cond, seq_cond=seq_cond, spatial_features=spatial_features,
-                )
+            # 推理时临时禁用 dropout 以获得准确的诊断指标
+            was_training = self.training
+            self.eval()
+            pred_heatmap = self._diffusion_inference(
+                cond, seq_cond=seq_cond, spatial_features=spatial_features,
+            )
+            if was_training:
+                self.train()
 
         return {
             'loss': total_loss,
             'diffusion_loss': diffusion_loss,
-            'base_loss': base_loss.item(),
-            'focal_loss': focal_loss.item(),
-            'x0_loss': x0_loss_val,
-            'dice_loss': dice_loss_val,
-            'sparsity_loss': sparsity_loss_val,
-            'neg_zero_loss': neg_zero_loss_val,
-            'peak_dist_loss': peak_dist_loss_val,
+            'eps_mse_high_snr': eps_mse_high_snr,
+            'eps_mse_mid_snr': eps_mse_mid_snr,
+            'eps_mse_low_snr': eps_mse_low_snr,
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
@@ -761,7 +685,8 @@ class DiffusionHeatmapHead(nn.Module):
         windowed_pred = pred_denorm * windows  # (K, H, W)
         
         flat = windowed_pred.view(K, -1)  # (K, H*W)
-        weights = F.softmax(flat / self.peak_loss_temperature, dim=-1).view(K, H, W)
+        peak_temp = getattr(self, 'peak_loss_temperature', 0.1)
+        weights = F.softmax(flat / peak_temp, dim=-1).view(K, H, W)
         
         # 坐标期望值
         pred_peak_y = (weights * y_grid.expand(K, H, W)).sum(dim=[1, 2])  # (K,)
