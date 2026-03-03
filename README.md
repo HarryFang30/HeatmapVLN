@@ -372,21 +372,71 @@ Current Frame(s) → CNN Encoder (ResNet-18/轻量CNN) ──→ img_cond ──
 
 ### 数据格式
 
+支持两种存储格式，通过 `meta.json` 中的 `storage_format` 字段自动识别：
+
+**格式一：Frames（逐帧文件）**
+
 ```
 <data_root>/
 ├── train/
 │   └── <scene_id>/
 │       └── clip_000000/
-│           ├── meta.json          # 元信息
-│           ├── poses.json         # T 个 4×4 位姿矩阵
-│           ├── rgb/               # RGB 图像序列
-│           │   ├── 000000.png
-│           │   └── ...
-│           ├── actions.npy        # 连续动作 [T, 2] (agent-local 2D 位移 dx, dy)
-│           └── discrete_actions.npy  # 离散动作 [T] (前进/左转/右转/停止)
+│           ├── meta.json             # 元信息（见下方字段说明）
+│           ├── poses.json            # T 个 4×4 位姿矩阵
+│           ├── intrinsics.json       # 相机内参（可选）
+│           ├── rgb/                  # RGB 图像序列
+│           │   ├── 000000.jpg        # 单视角：直接存放
+│           │   ├── front/            # 全景模式：按方向分子目录
+│           │   │   └── 000000.jpg
+│           │   ├── right/
+│           │   ├── back/
+│           │   └── left/
+│           ├── depth/                # 深度图序列（可选，用于遮挡检测）
+│           │   └── 000000.npy
+│           ├── actions.npy           # 连续动作 [T, 2] (dx, dy)
+│           └── discrete_actions.npy  # 离散动作 [T]
 └── val_unseen/
     └── ...
 ```
+
+**格式二：Chunks（分块 NPZ，推荐）**
+
+```
+<data_root>/
+├── train/
+│   └── <scene_id>/
+│       └── clip_000000/
+│           ├── meta.json             # 元信息（storage_format="chunks"）
+│           ├── intrinsics.json       # 相机内参（可选）
+│           ├── chunks/               # 分块 NPZ 文件
+│           │   ├── chunk_000000.npz  # 每块包含：frame_ids, rgb[/方向], depth[/方向], pose
+│           │   └── chunk_000001.npz
+│           ├── actions.npy           # 连续动作 [T, 2] (dx, dy)
+│           └── discrete_actions.npy  # 离散动作 [T]
+└── val_unseen/
+    └── ...
+```
+
+**meta.json 字段说明：**
+
+| 字段 | 类型 | 说明 |
+|:-----|:-----|:-----|
+| `num_frames` | int | 总帧数 T |
+| `instruction` | str | 导航指令文本 |
+| `trajectory_id` | int | 轨迹 ID（用于 FGR2R 子指令匹配） |
+| `storage_format` | str | `"frames"` 或 `"chunks"` |
+
+**intrinsics.json 字段说明（可选）：**
+
+```json
+{
+  "width": 640,
+  "height": 480,
+  "K": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+}
+```
+
+> **提示：** 若数据根目录下不存在 `train/` 子目录，系统会自动按场景名哈希值划分 90% 训练集 / 10% 验证集。
 
 ### 采样策略
 
