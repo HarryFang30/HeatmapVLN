@@ -2055,6 +2055,8 @@ def main():
                         help='配置文件路径')
     parser.add_argument('--resume', type=str, default=None, 
                         help='从检查点恢复（路径或 "latest"）')
+    parser.add_argument('--load-weights', type=str, default=None,
+                        help='仅加载模型权重（不恢复 optimizer/scheduler/epoch），用于加载预训练权重后从头训练')
     parser.add_argument('--auto-resume', action='store_true',
                         help='自动从最新检查点恢复（继续使用之前的输出目录）')
     parser.add_argument('--start-epoch', type=int, default=1,
@@ -2302,6 +2304,26 @@ def main():
     
     # 创建训练曲线绘制器
     plotter = TrainingPlotter(out_dir=plots_dir)
+    
+    # 仅加载模型权重（不恢复训练状态）
+    if args.load_weights:
+        weights_path = Path(args.load_weights)
+        if weights_path.exists():
+            ckpt = torch.load(str(weights_path), map_location='cpu')
+            state_dict = ckpt.get('trainable_state_dict', {})
+            if state_dict:
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                logger.info(f"✓ Loaded {len(state_dict)} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
+                if missing:
+                    logger.info(f"  Missing keys: {len(missing)}")
+                if unexpected:
+                    logger.info(f"  Unexpected keys: {len(unexpected)}")
+            else:
+                logger.warning(f"⚠ No trainable_state_dict found in {weights_path}")
+            del ckpt
+            torch.cuda.empty_cache()
+        else:
+            logger.error(f"✗ Weights file not found: {weights_path}")
     
     # 断点续训
     resume_epoch = 0
