@@ -34,6 +34,7 @@ from .action import (
     ProgressPredictionHead,
 )
 from .heatmap import DiffusionHeatmapHead, DiffusionHeatmapConfig
+from .heatmap import DirectHeatmapHead, DirectHeatmapConfig
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,15 @@ class VLNPipelineConfig:
     
     # Spatial importance weighting
     heatmap_peak_spatial_weight: float = 10.0    # 峰值区域空间加权倍数
+    
+    # Head type switch: "diffusion" or "direct"
+    heatmap_head_type: str = "diffusion"
+    
+    # Direct head specific config (only used when heatmap_head_type == "direct")
+    direct_heatmap_hidden_dim: int = 128
+    direct_heatmap_num_decoder_blocks: int = 3
+    direct_heatmap_lambda_dice: float = 0.5
+    direct_heatmap_lambda_peak: float = 1.0
     
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
@@ -301,53 +311,69 @@ class VLNPipeline(nn.Module):
         
         # ==================== Heatmap Heads ====================
         heatmap_device = self.device
-        diffusion_heatmap_config = DiffusionHeatmapConfig(
-            llm_dim=config.llm_token_dim,
-            cond_dim=config.diffusion_heatmap_cond_dim,
-            heatmap_size=config.heatmap_size,
-            num_inference_steps=config.diffusion_heatmap_num_inference_steps,
-            image_size=(config.image_size, config.image_size),
-            # Ablation settings - now correctly passed from config
-            use_image_encoder=config.heatmap_use_image_encoder,
-            llm_pool_method=config.heatmap_pool_method,
-            llm_pool_num_heads=config.heatmap_pool_num_heads,
-            # 360° panorama support
-            use_circular_padding=config.heatmap_use_circular_padding,
-            # Regularization
-            dropout=config.heatmap_dropout,
-            # UNet architecture (model capacity)
-            block_out_channels=config.heatmap_block_out_channels,
-            layers_per_block=config.heatmap_layers_per_block,
-            attention_levels=config.heatmap_attention_levels,
-            num_train_timesteps=config.heatmap_num_train_timesteps,
-            # Classifier-Free Guidance (CFG)
-            cfg_drop_prob=config.heatmap_cfg_drop_prob,
-            cfg_scale=config.heatmap_cfg_scale,
-            # Sequence cross-attention conditioning
-            use_sequence_conditioning=config.heatmap_use_sequence_conditioning,
-            seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
-            seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
-            # Spatial feature injection
-            use_spatial_injection=config.heatmap_use_spatial_injection,
-            # Image encoder backbone
-            image_encoder_use_pretrained=config.heatmap_image_encoder_use_pretrained,
-            # Inference sharpening
-            sharpen_temperature=config.heatmap_sharpen_temperature,
-            # Sample weighting
-            negative_sample_weight=config.heatmap_negative_sample_weight,
-            positive_sample_boost=config.heatmap_positive_sample_boost,
-            # Spatial importance weighting
-            peak_spatial_weight=config.heatmap_peak_spatial_weight,
-        )
+        head_type = config.heatmap_head_type
+        
+        def _build_heatmap_head():
+            if head_type == "direct":
+                return DirectHeatmapHead(DirectHeatmapConfig(
+                    llm_dim=config.llm_token_dim,
+                    cond_dim=config.diffusion_heatmap_cond_dim,
+                    heatmap_size=config.heatmap_size,
+                    image_size=(config.image_size, config.image_size),
+                    use_image_encoder=config.heatmap_use_image_encoder,
+                    llm_pool_method=config.heatmap_pool_method,
+                    llm_pool_num_heads=config.heatmap_pool_num_heads,
+                    dropout=config.heatmap_dropout,
+                    use_sequence_conditioning=config.heatmap_use_sequence_conditioning,
+                    seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
+                    seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
+                    image_encoder_use_pretrained=config.heatmap_image_encoder_use_pretrained,
+                    # Direct head specific
+                    hidden_dim=config.direct_heatmap_hidden_dim,
+                    num_decoder_blocks=config.direct_heatmap_num_decoder_blocks,
+                    lambda_dice=config.direct_heatmap_lambda_dice,
+                    lambda_peak=config.direct_heatmap_lambda_peak,
+                    # Shared loss config
+                    peak_spatial_weight=config.heatmap_peak_spatial_weight,
+                    negative_sample_weight=config.heatmap_negative_sample_weight,
+                    positive_sample_boost=config.heatmap_positive_sample_boost,
+                )).to(device=heatmap_device, dtype=config.dtype)
+            else:
+                return DiffusionHeatmapHead(DiffusionHeatmapConfig(
+                    llm_dim=config.llm_token_dim,
+                    cond_dim=config.diffusion_heatmap_cond_dim,
+                    heatmap_size=config.heatmap_size,
+                    num_inference_steps=config.diffusion_heatmap_num_inference_steps,
+                    image_size=(config.image_size, config.image_size),
+                    use_image_encoder=config.heatmap_use_image_encoder,
+                    llm_pool_method=config.heatmap_pool_method,
+                    llm_pool_num_heads=config.heatmap_pool_num_heads,
+                    use_circular_padding=config.heatmap_use_circular_padding,
+                    dropout=config.heatmap_dropout,
+                    block_out_channels=config.heatmap_block_out_channels,
+                    layers_per_block=config.heatmap_layers_per_block,
+                    attention_levels=config.heatmap_attention_levels,
+                    num_train_timesteps=config.heatmap_num_train_timesteps,
+                    cfg_drop_prob=config.heatmap_cfg_drop_prob,
+                    cfg_scale=config.heatmap_cfg_scale,
+                    use_sequence_conditioning=config.heatmap_use_sequence_conditioning,
+                    seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
+                    seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
+                    use_spatial_injection=config.heatmap_use_spatial_injection,
+                    image_encoder_use_pretrained=config.heatmap_image_encoder_use_pretrained,
+                    sharpen_temperature=config.heatmap_sharpen_temperature,
+                    negative_sample_weight=config.heatmap_negative_sample_weight,
+                    positive_sample_boost=config.heatmap_positive_sample_boost,
+                    peak_spatial_weight=config.heatmap_peak_spatial_weight,
+                )).to(device=heatmap_device, dtype=config.dtype)
         
         # History Heatmap Head
         if config.enable_history_heatmap_head:
-            self.history_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
-                device=heatmap_device, dtype=config.dtype
-            )
+            self.history_heatmap_head = _build_heatmap_head()
             logger.info(
                 f"✓ History Heatmap Head initialized "
-                f"(use_image_encoder={config.heatmap_use_image_encoder}, "
+                f"(type={head_type}, "
+                f"use_image_encoder={config.heatmap_use_image_encoder}, "
                 f"pool_method={config.heatmap_pool_method})"
             )
         else:
@@ -355,12 +381,11 @@ class VLNPipeline(nn.Module):
         
         # Future Heatmap Head
         if config.enable_future_heatmap_head:
-            self.future_heatmap_head = DiffusionHeatmapHead(diffusion_heatmap_config).to(
-                device=heatmap_device, dtype=config.dtype
-            )
+            self.future_heatmap_head = _build_heatmap_head()
             logger.info(
                 f"✓ Future Heatmap Head initialized "
-                f"(use_image_encoder={config.heatmap_use_image_encoder}, "
+                f"(type={head_type}, "
+                f"use_image_encoder={config.heatmap_use_image_encoder}, "
                 f"pool_method={config.heatmap_pool_method})"
             )
         else:
@@ -528,15 +553,8 @@ class VLNPipeline(nn.Module):
         future_heatmap = None
         history_heatmap_loss = None
         future_heatmap_loss = None
-        history_heatmap_noise_std = None
-        history_heatmap_noise_pred_std = None
-        future_heatmap_noise_std = None
-        future_heatmap_noise_pred_std = None
-        history_heatmap_eps_mse_high_snr = None
-        history_heatmap_eps_mse_mid_snr = None
-        history_heatmap_eps_mse_low_snr = None
-        history_heatmap_eps_mse_peak = None
-        history_heatmap_eps_mse_bg = None
+        history_head_result = {}
+        future_head_result = {}
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
@@ -555,15 +573,8 @@ class VLNPipeline(nn.Module):
                     )
                     history_heatmap_loss = result['loss']
                     history_heatmap = result.get('heatmap')
-                    history_heatmap_noise_std = result.get('noise_std')
-                    history_heatmap_noise_pred_std = result.get('noise_pred_std')
-                    history_heatmap_eps_mse_high_snr = result.get('eps_mse_high_snr')
-                    history_heatmap_eps_mse_mid_snr = result.get('eps_mse_mid_snr')
-                    history_heatmap_eps_mse_low_snr = result.get('eps_mse_low_snr')
-                    history_heatmap_eps_mse_peak = result.get('eps_mse_peak')
-                    history_heatmap_eps_mse_bg = result.get('eps_mse_bg')
+                    history_head_result = result
                 else:
-                    # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
                         observation=observation_for_heatmap,
@@ -572,19 +583,17 @@ class VLNPipeline(nn.Module):
             # Future Heatmap
             if self.future_heatmap_head is not None:
                 if gt_future_heatmap is not None:
-                    # 有 GT 时用噪声预测
                     gt_future_hm = gt_future_heatmap.to(self.device)
                     result = self.future_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
                         observation=observation_for_heatmap,
                         gt_heatmap=gt_future_hm,
                         return_loss=True,
-                        skip_inference=not self.training,  # eval 模式跳过推理
+                        skip_inference=not self.training,
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
-                    future_heatmap_noise_std = result.get('noise_std')
-                    future_heatmap_noise_pred_std = result.get('noise_pred_std')
+                    future_head_result = result
                 else:
                     future_heatmap = self.future_heatmap_head(
                         llm_tokens=llm_tokens_for_heatmap,
@@ -637,24 +646,24 @@ class VLNPipeline(nn.Module):
         if future_heatmap is not None:
             output['future_heatmaps'] = future_heatmap.unsqueeze(1) if future_heatmap.dim() == 3 else future_heatmap
         
-        # Heatmap losses
+        # Heatmap losses and diagnostics (generic forwarding for both head types)
         if history_heatmap_loss is not None:
             output['history_heatmap_loss'] = history_heatmap_loss
-            if history_heatmap_noise_std is not None:
-                output['history_heatmap_noise_std'] = history_heatmap_noise_std
-                output['history_heatmap_noise_pred_std'] = history_heatmap_noise_pred_std
-            if history_heatmap_eps_mse_high_snr is not None:
-                output['history_heatmap_eps_mse_high_snr'] = history_heatmap_eps_mse_high_snr
-                output['history_heatmap_eps_mse_mid_snr'] = history_heatmap_eps_mse_mid_snr
-                output['history_heatmap_eps_mse_low_snr'] = history_heatmap_eps_mse_low_snr
-            if history_heatmap_eps_mse_peak is not None:
-                output['history_heatmap_eps_mse_peak'] = history_heatmap_eps_mse_peak
-                output['history_heatmap_eps_mse_bg'] = history_heatmap_eps_mse_bg
+            for key in ('noise_std', 'noise_pred_std',
+                        'eps_mse_high_snr', 'eps_mse_mid_snr', 'eps_mse_low_snr',
+                        'eps_mse_peak', 'eps_mse_bg',
+                        'direct_mse', 'direct_dice_loss', 'direct_peak_loss',
+                        'direct_mse_peak', 'direct_mse_bg',
+                        'direct_pred_max', 'direct_pred_mean'):
+                val = history_head_result.get(key)
+                if val is not None:
+                    output[f'history_heatmap_{key}'] = val
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
-            if future_heatmap_noise_std is not None:
-                output['future_heatmap_noise_std'] = future_heatmap_noise_std
-                output['future_heatmap_noise_pred_std'] = future_heatmap_noise_pred_std
+            for key in ('noise_std', 'noise_pred_std'):
+                val = future_head_result.get(key)
+                if val is not None:
+                    output[f'future_heatmap_{key}'] = val
         
         # Actions / Trajectory
         output['action_cond'] = action_cond
@@ -781,15 +790,8 @@ class VLNPipeline(nn.Module):
         future_heatmap = None
         history_heatmap_loss = None
         future_heatmap_loss = None
-        history_heatmap_noise_std = None
-        history_heatmap_noise_pred_std = None
-        future_heatmap_noise_std = None
-        future_heatmap_noise_pred_std = None
-        history_heatmap_eps_mse_high_snr = None
-        history_heatmap_eps_mse_mid_snr = None
-        history_heatmap_eps_mse_low_snr = None
-        history_heatmap_eps_mse_peak = None
-        history_heatmap_eps_mse_bg = None
+        history_head_result = {}
+        future_head_result = {}
         
         if return_heatmaps:
             llm_tokens_hm = llm_tokens_for_heatmap.to(dtype=self.config.dtype)
@@ -830,13 +832,7 @@ class VLNPipeline(nn.Module):
                         history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
                     else:
                         history_heatmap = raw_heatmap
-                    history_heatmap_noise_std = result.get('noise_std')
-                    history_heatmap_noise_pred_std = result.get('noise_pred_std')
-                    history_heatmap_eps_mse_high_snr = result.get('eps_mse_high_snr')
-                    history_heatmap_eps_mse_mid_snr = result.get('eps_mse_mid_snr')
-                    history_heatmap_eps_mse_low_snr = result.get('eps_mse_low_snr')
-                    history_heatmap_eps_mse_peak = result.get('eps_mse_peak')
-                    history_heatmap_eps_mse_bg = result.get('eps_mse_bg')
+                    history_head_result = result
                 else:
                     raw_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
@@ -851,7 +847,6 @@ class VLNPipeline(nn.Module):
             # Future Heatmap
             if self.future_heatmap_head is not None:
                 if gt_future_heatmap is not None:
-                    # 有 GT 时用噪声预测
                     gt_future_hm = gt_future_heatmap.to(self.device)
                     result = self.future_heatmap_head(
                         llm_tokens=llm_tokens_hm,
@@ -863,8 +858,7 @@ class VLNPipeline(nn.Module):
                     )
                     future_heatmap_loss = result['loss']
                     future_heatmap = result.get('heatmap')
-                    future_heatmap_noise_std = result.get('noise_std')
-                    future_heatmap_noise_pred_std = result.get('noise_pred_std')
+                    future_head_result = result
                 else:
                     future_heatmap = self.future_heatmap_head(
                         llm_tokens=llm_tokens_hm,
@@ -916,24 +910,24 @@ class VLNPipeline(nn.Module):
         if future_heatmap is not None:
             output['future_heatmaps'] = future_heatmap.unsqueeze(1) if future_heatmap.dim() == 3 else future_heatmap
         
-        # Heatmap losses (forward_packed path)
+        # Heatmap losses and diagnostics (forward_packed path, generic forwarding)
         if history_heatmap_loss is not None:
             output['history_heatmap_loss'] = history_heatmap_loss
-            if history_heatmap_noise_std is not None:
-                output['history_heatmap_noise_std'] = history_heatmap_noise_std
-                output['history_heatmap_noise_pred_std'] = history_heatmap_noise_pred_std
-            if history_heatmap_eps_mse_high_snr is not None:
-                output['history_heatmap_eps_mse_high_snr'] = history_heatmap_eps_mse_high_snr
-                output['history_heatmap_eps_mse_mid_snr'] = history_heatmap_eps_mse_mid_snr
-                output['history_heatmap_eps_mse_low_snr'] = history_heatmap_eps_mse_low_snr
-            if history_heatmap_eps_mse_peak is not None:
-                output['history_heatmap_eps_mse_peak'] = history_heatmap_eps_mse_peak
-                output['history_heatmap_eps_mse_bg'] = history_heatmap_eps_mse_bg
+            for key in ('noise_std', 'noise_pred_std',
+                        'eps_mse_high_snr', 'eps_mse_mid_snr', 'eps_mse_low_snr',
+                        'eps_mse_peak', 'eps_mse_bg',
+                        'direct_mse', 'direct_dice_loss', 'direct_peak_loss',
+                        'direct_mse_peak', 'direct_mse_bg',
+                        'direct_pred_max', 'direct_pred_mean'):
+                val = history_head_result.get(key)
+                if val is not None:
+                    output[f'history_heatmap_{key}'] = val
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
-            if future_heatmap_noise_std is not None:
-                output['future_heatmap_noise_std'] = future_heatmap_noise_std
-                output['future_heatmap_noise_pred_std'] = future_heatmap_noise_pred_std
+            for key in ('noise_std', 'noise_pred_std'):
+                val = future_head_result.get(key)
+                if val is not None:
+                    output[f'future_heatmap_{key}'] = val
         
         # Actions / Trajectory
         output['action_cond'] = action_cond

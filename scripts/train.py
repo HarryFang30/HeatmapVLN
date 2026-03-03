@@ -680,6 +680,14 @@ def build_model(cfg: Dict) -> nn.Module:
         # Spatial importance weighting
         heatmap_peak_spatial_weight=heatmap_cfg.get('peak_spatial_weight', 10.0),
         
+        # Head type switch: "diffusion" or "direct"
+        heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
+        # Direct head specific config
+        direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 128),
+        direct_heatmap_num_decoder_blocks=heatmap_cfg.get('direct', {}).get('num_decoder_blocks', 3),
+        direct_heatmap_lambda_dice=heatmap_cfg.get('direct', {}).get('lambda_dice', 0.5),
+        direct_heatmap_lambda_peak=heatmap_cfg.get('direct', {}).get('lambda_peak', 1.0),
+        
         # Multi-layer feature extraction
         multi_layer_features=llm_cfg.get('multi_layer_features', False),
         feature_layer_indices=llm_cfg.get('feature_layer_indices', None),
@@ -740,7 +748,9 @@ def build_model(cfg: Dict) -> nn.Module:
         print(f"   SequencePacking → enabled=True, max_seq_length={llm_cfg.get('max_seq_length', 4096)}")
     else:
         print(f"   SequencePacking → enabled=False (使用传统 padding)")
+    hm_head_type = heatmap_cfg.get('head_type', 'diffusion')
     print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}, "
+          f"type={hm_head_type}, "
           f"use_image_encoder={heatmap_cfg.get('use_image_encoder', True)}, "
           f"pool_method={heatmap_cfg.get('pool_method', 'attention')}")
     print(f"   FutureHeatmapHead → enabled={heatmap_cfg.get('enable_future', True)}")
@@ -1490,6 +1500,16 @@ def train_one_epoch(
                         tb_writer.add_scalar('diag/eps_mse_peak', output['history_heatmap_eps_mse_peak'], actual_step)
                         tb_writer.add_scalar('diag/eps_mse_bg', output['history_heatmap_eps_mse_bg'], actual_step)
                     
+                    # Direct head 诊断指标（仅 head_type="direct" 时存在）
+                    if 'history_heatmap_direct_mse' in output and output['history_heatmap_direct_mse'] is not None:
+                        tb_writer.add_scalar('diag/direct_mse', output['history_heatmap_direct_mse'], actual_step)
+                        tb_writer.add_scalar('diag/direct_dice_loss', output['history_heatmap_direct_dice_loss'], actual_step)
+                        tb_writer.add_scalar('diag/direct_peak_loss', output['history_heatmap_direct_peak_loss'], actual_step)
+                        tb_writer.add_scalar('diag/direct_mse_peak', output['history_heatmap_direct_mse_peak'], actual_step)
+                        tb_writer.add_scalar('diag/direct_mse_bg', output['history_heatmap_direct_mse_bg'], actual_step)
+                        tb_writer.add_scalar('diag/direct_pred_max', output['history_heatmap_direct_pred_max'], actual_step)
+                        tb_writer.add_scalar('diag/direct_pred_mean', output['history_heatmap_direct_pred_mean'], actual_step)
+                    
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
                         pred_progress = output['progress'].detach()
@@ -1636,7 +1656,7 @@ def validate(
     
     device = torch.device(cfg['model'].get('device', 'cuda'))
     
-    # 验证推理 batch 数限制：只对前 N 个 batch 做完整扩散推理计算 heatmap MSE
+    # 验证推理 batch 数限制：只对前 N 个 batch 做完整推理计算 heatmap MSE
     val_inference_batches = cfg.get('validation', {}).get('val_inference_batches', 10)
     
     total_val_batches = len(val_loader)
@@ -1644,8 +1664,8 @@ def validate(
         total_val_batches = min(total_val_batches, max_batches)
         logger.info(f"  ⚡ 快速调试模式(验证): 只处理 {total_val_batches} batches")
     
-    logger.info(f"  📊 验证: {total_val_batches} batches (噪声预测 loss), "
-                f"{val_inference_batches} batches (完整推理 MSE)")
+    logger.info(f"  📊 验证: {total_val_batches} batches (training loss), "
+                f"{val_inference_batches} batches (推理 MSE)")
     
     for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
         if max_batches is not None and i >= max_batches:
@@ -1684,7 +1704,7 @@ def validate(
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             if packing_enabled:
-                # Packing 模式 — 传入 GT 热力图用噪声预测 loss（快速，1 次 UNet）
+                # Packing 模式 — 传入 GT 热力图计算 training loss
                 output = model.forward_packed(
                     packed_batch=batch,
                     return_heatmaps=True,
@@ -1718,7 +1738,7 @@ def validate(
                     gt_history_heatmap=gt_heatmap if train_history else None,
                 )
             
-            # 使用噪声预测 loss（与训练一致，且速度快 ~40x）
+            # Training loss（与训练一致）
             heatmap_loss = torch.tensor(0.0, device=device)
             if train_history and 'history_heatmap_loss' in output:
                 heatmap_loss = output['history_heatmap_loss']
@@ -1792,12 +1812,12 @@ def validate(
         num_batches += 1
         
         # ==================== 完整推理 + 可视化（前几个 batch）====================
-        # 对前 val_inference_batches 个 batch 做完整扩散推理，计算真实 heatmap MSE
+        # 对前 val_inference_batches 个 batch 做纯推理，计算真实 heatmap MSE
         # 其中前 val_vis_batches 个 batch 额外保存可视化图片
         num_vis_batches = cfg['log'].get('val_vis_batches', 2)
         if num_batches <= val_inference_batches:
             try:
-                # 使用纯推理模式生成热力图（不传 gt_heatmap，触发完整扩散推理）
+                # 纯推理模式生成热力图（不传 gt_heatmap）
                 if packing_enabled:
                     vis_output = model.forward_packed(
                         packed_batch=batch,

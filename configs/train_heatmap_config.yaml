@@ -97,6 +97,9 @@ model:
     enable_history: true
     enable_future: false       # 禁用 future head
     
+    # Head 类型切换: "diffusion" (扩散去噪) 或 "direct" (FPN 直接预测)
+    head_type: direct
+    
     # 条件编码维度
     cond_dim: 1024
     
@@ -148,6 +151,13 @@ model:
     
     # 空间重要性加权（像素维度梯度引导）
     peak_spatial_weight: 10.0         # 峰值区域获得 10x 梯度优先级
+    
+    # Direct head 专属配置（仅 head_type: direct 时生效）
+    direct:
+      hidden_dim: 128                 # FPN 解码器通道数
+      num_decoder_blocks: 3           # 解码块数量（7→14→28→56）
+      lambda_dice: 0.5               # Dice loss 权重
+      lambda_peak: 1.0               # Peak location loss 权重
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:
