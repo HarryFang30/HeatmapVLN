@@ -371,12 +371,18 @@ class DiffusionHeatmapHead(nn.Module):
         self._training_step_counter += 1
         pred_heatmap = None
         if not skip_inference and (self._training_step_counter % self._inference_interval == 0):
-            # 推理时临时禁用 dropout 以获得准确的诊断指标
             was_training = self.training
             self.eval()
-            pred_heatmap = self._diffusion_inference(
-                cond, seq_cond=seq_cond, spatial_features=spatial_features,
-            )
+            with torch.no_grad():
+                diag_max_samples = 2
+                diag_cond = cond[:diag_max_samples].detach()
+                diag_seq = seq_cond[:diag_max_samples].detach() if seq_cond is not None else None
+                diag_spatial = [f[:diag_max_samples].detach() for f in spatial_features] if spatial_features is not None else None
+                pred_heatmap_small = self._diffusion_inference(
+                    diag_cond, seq_cond=diag_seq, spatial_features=diag_spatial,
+                )
+                pred_heatmap = torch.zeros(batch_size, *pred_heatmap_small.shape[1:], device=device)
+                pred_heatmap[:diag_max_samples] = pred_heatmap_small
             if was_training:
                 self.train()
 
