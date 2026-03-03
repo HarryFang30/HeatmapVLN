@@ -842,8 +842,8 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         for n, p in module.named_parameters():
             if not p.requires_grad:
                 continue
-            # bias 和 LayerNorm 不使用 weight_decay
-            if 'bias' in n or 'norm' in n.lower() or 'ln' in n.lower():
+            # bias、LayerNorm、以及 softmax 前的混合权重不使用 weight_decay
+            if 'bias' in n or 'norm' in n.lower() or 'ln' in n.lower() or n == 'layer_weights':
                 no_decay_params.append(p)
             else:
                 decay_params.append(p)
