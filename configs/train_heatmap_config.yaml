@@ -145,6 +145,9 @@ model:
     # 正负样本权重平衡（数据集 ~69% 负样本）
     negative_sample_weight: 0.3       # 负样本权重
     positive_sample_boost: 3.0        # 正样本权重提升
+    
+    # 空间重要性加权（像素维度梯度引导）
+    peak_spatial_weight: 10.0         # 峰值区域获得 10x 梯度优先级
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:

@@ -677,6 +677,8 @@ def build_model(cfg: Dict) -> nn.Module:
         # Sample weighting (positive/negative balance)
         heatmap_negative_sample_weight=heatmap_cfg.get('negative_sample_weight', 0.3),
         heatmap_positive_sample_boost=heatmap_cfg.get('positive_sample_boost', 3.0),
+        # Spatial importance weighting
+        heatmap_peak_spatial_weight=heatmap_cfg.get('peak_spatial_weight', 10.0),
         
         # Multi-layer feature extraction
         multi_layer_features=llm_cfg.get('multi_layer_features', False),
@@ -1482,6 +1484,11 @@ def train_one_epoch(
                         tb_writer.add_scalar('diag/eps_mse_high_snr', output['history_heatmap_eps_mse_high_snr'], actual_step)
                         tb_writer.add_scalar('diag/eps_mse_mid_snr', output['history_heatmap_eps_mse_mid_snr'], actual_step)
                         tb_writer.add_scalar('diag/eps_mse_low_snr', output['history_heatmap_eps_mse_low_snr'], actual_step)
+                    
+                    # 空间分段 Epsilon MSE（验证空间加权是否将学习能力集中到峰值区域）
+                    if 'history_heatmap_eps_mse_peak' in output and output['history_heatmap_eps_mse_peak'] is not None:
+                        tb_writer.add_scalar('diag/eps_mse_peak', output['history_heatmap_eps_mse_peak'], actual_step)
+                        tb_writer.add_scalar('diag/eps_mse_bg', output['history_heatmap_eps_mse_bg'], actual_step)
                     
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:

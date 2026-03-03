@@ -130,6 +130,12 @@ class DiffusionHeatmapConfig:
     negative_sample_weight: float = 0.3      # 负样本权重
     positive_sample_boost: float = 3.0       # 正样本权重提升倍数
     
+    # ==================== Spatial Importance Weighting ====================
+    # GT 驱动的像素级空间加权，解决 85-95% 梯度浪费在背景的问题
+    # 背景像素 (GT=0) → 权重 1.0，峰值像素 (GT=1) → 权重 peak_spatial_weight
+    # 权重随 GT 高斯平滑衰减，不引入梯度不连续
+    peak_spatial_weight: float = 10.0
+    
     # ==================== Direction Embedding ====================
     # 多视角（全景）模式下为每个方向注入可学习嵌入
     # 解决 LLM tokens 被复制 4 份后无法区分视角的问题

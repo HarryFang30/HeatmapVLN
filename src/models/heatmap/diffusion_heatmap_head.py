@@ -161,6 +161,9 @@ class DiffusionHeatmapHead(nn.Module):
         self.negative_sample_weight = config.negative_sample_weight
         self.positive_sample_boost = config.positive_sample_boost
         
+        # Spatial importance weighting
+        self.peak_spatial_weight = config.peak_spatial_weight
+        
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
         logger.info(
@@ -346,9 +349,15 @@ class DiffusionHeatmapHead(nn.Module):
             min_snr_gamma = 5.0
             snr_weight = torch.clamp(snr, max=min_snr_gamma) / (snr + 1e-8)  # (B, 1, 1, 1)
 
-        # ==================== Epsilon MSE Loss + Min-SNR + 样本权重 ====================
+        # ==================== 空间重要性加权（像素维度梯度引导）====================
+        # GT 热力图驱动：背景 (0) → 1.0，峰值 (1) → peak_spatial_weight
+        # 权重随高斯平滑衰减，不引入梯度不连续
+        with torch.no_grad():
+            spatial_weight = 1.0 + gt_heatmap * (self.peak_spatial_weight - 1.0)  # (B, 1, H, W)
+
+        # ==================== Epsilon MSE Loss + Min-SNR + 样本权重 + 空间加权 ====================
         per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
-        diffusion_loss = (snr_weight * sample_weight_4d * per_pixel_mse).mean()
+        diffusion_loss = (snr_weight * sample_weight_4d * spatial_weight * per_pixel_mse).mean()
 
         total_loss = diffusion_loss
 
@@ -367,6 +376,14 @@ class DiffusionHeatmapHead(nn.Module):
             eps_mse_high_snr = per_sample_mse[high_snr_mask].mean().item() if high_snr_mask.any() else 0.0
             eps_mse_mid_snr = per_sample_mse[mid_snr_mask].mean().item() if mid_snr_mask.any() else 0.0
             eps_mse_low_snr = per_sample_mse[low_snr_mask].mean().item() if low_snr_mask.any() else 0.0
+
+            # 分段空间 MSE：验证空间加权是否将学习能力集中到峰值区域
+            peak_mask = (gt_heatmap > 0.1).float()  # (B, 1, H, W)
+            bg_mask = 1.0 - peak_mask
+            peak_px = peak_mask.sum()
+            bg_px = bg_mask.sum()
+            eps_mse_peak = (per_pixel_mse * peak_mask).sum().item() / (peak_px.item() + 1e-8)
+            eps_mse_bg = (per_pixel_mse * bg_mask).sum().item() / (bg_px.item() + 1e-8)
 
         self._training_step_counter += 1
         pred_heatmap = None
@@ -392,6 +409,8 @@ class DiffusionHeatmapHead(nn.Module):
             'eps_mse_high_snr': eps_mse_high_snr,
             'eps_mse_mid_snr': eps_mse_mid_snr,
             'eps_mse_low_snr': eps_mse_low_snr,
+            'eps_mse_peak': eps_mse_peak,
+            'eps_mse_bg': eps_mse_bg,
             'heatmap': pred_heatmap,
             'noise_pred': noise_pred,
             'noise_target': noise,
@@ -535,12 +554,10 @@ class DiffusionHeatmapHead(nn.Module):
         """
         多峰安全的锐化后处理：抑制背景噪声，保留所有峰值。
         
-        旧方法（全局 softmax）会指数级放大峰间差异，把弱峰压成 0：
-          exp(0.8/0.1) / exp(0.5/0.1) = 2981/148 = 20:1（原始比仅 1.6:1）
-        
-        新方法：自适应阈值 + ReLU 背景抑制
-        1. 对每个样本计算自适应阈值 = max * temperature
-        2. ReLU(x - threshold) 抑制背景，保留所有超过阈值的峰
+        处理流程：
+        1. 绝对阈值保护：原始 max < min_peak_threshold 的样本直接输出全零
+           （避免纯噪声被归一化放大成假峰值）
+        2. 对有峰值的样本：自适应阈值 = max * temperature → ReLU 抑制背景
         3. 归一化到 [0, 1]，保持峰间高度比不变
         
         Args:
@@ -551,17 +568,25 @@ class DiffusionHeatmapHead(nn.Module):
             (B, H, W) sharpened heatmap in [0, 1]，多峰结构完整保留
         """
         B, H, W = heatmap.shape
+        min_peak_threshold = 0.15
         
-        # 每样本自适应阈值 = max * temperature
         max_vals = heatmap.flatten(1).max(dim=1).values  # (B,)
+        
+        # 低于绝对阈值的样本视为无峰值，直接输出全零
+        has_peak = (max_vals > min_peak_threshold).float().view(B, 1, 1)  # (B, 1, 1)
+        
+        # 自适应阈值 = max * temperature
         thresholds = (max_vals * temperature).view(B, 1, 1)  # (B, 1, 1)
         
-        # ReLU 背景抑制：低于阈值的像素清零，保留所有峰
+        # ReLU 背景抑制
         sharpened = F.relu(heatmap - thresholds)
         
-        # 归一化到 [0, 1]：保持峰间高度比不变
+        # 归一化到 [0, 1]
         new_max = sharpened.flatten(1).max(dim=1).values.view(B, 1, 1)  # (B, 1, 1)
         sharpened = sharpened / (new_max + 1e-8)
+        
+        # 无峰值样本清零
+        sharpened = sharpened * has_peak
         
         return sharpened
     

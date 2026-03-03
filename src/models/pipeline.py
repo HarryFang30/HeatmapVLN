@@ -102,6 +102,9 @@ class VLNPipelineConfig:
     heatmap_negative_sample_weight: float = 0.3  # 负样本权重
     heatmap_positive_sample_boost: float = 3.0   # 正样本 boost
     
+    # Spatial importance weighting
+    heatmap_peak_spatial_weight: float = 10.0    # 峰值区域空间加权倍数
+    
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
     multi_layer_features: bool = False
@@ -333,6 +336,8 @@ class VLNPipeline(nn.Module):
             # Sample weighting
             negative_sample_weight=config.heatmap_negative_sample_weight,
             positive_sample_boost=config.heatmap_positive_sample_boost,
+            # Spatial importance weighting
+            peak_spatial_weight=config.heatmap_peak_spatial_weight,
         )
         
         # History Heatmap Head
@@ -530,6 +535,8 @@ class VLNPipeline(nn.Module):
         history_heatmap_eps_mse_high_snr = None
         history_heatmap_eps_mse_mid_snr = None
         history_heatmap_eps_mse_low_snr = None
+        history_heatmap_eps_mse_peak = None
+        history_heatmap_eps_mse_bg = None
         
         if return_heatmaps:
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
@@ -553,6 +560,8 @@ class VLNPipeline(nn.Module):
                     history_heatmap_eps_mse_high_snr = result.get('eps_mse_high_snr')
                     history_heatmap_eps_mse_mid_snr = result.get('eps_mse_mid_snr')
                     history_heatmap_eps_mse_low_snr = result.get('eps_mse_low_snr')
+                    history_heatmap_eps_mse_peak = result.get('eps_mse_peak')
+                    history_heatmap_eps_mse_bg = result.get('eps_mse_bg')
                 else:
                     # 无 GT 时走完整扩散推理（纯推理/可视化）
                     history_heatmap = self.history_heatmap_head(
@@ -638,6 +647,9 @@ class VLNPipeline(nn.Module):
                 output['history_heatmap_eps_mse_high_snr'] = history_heatmap_eps_mse_high_snr
                 output['history_heatmap_eps_mse_mid_snr'] = history_heatmap_eps_mse_mid_snr
                 output['history_heatmap_eps_mse_low_snr'] = history_heatmap_eps_mse_low_snr
+            if history_heatmap_eps_mse_peak is not None:
+                output['history_heatmap_eps_mse_peak'] = history_heatmap_eps_mse_peak
+                output['history_heatmap_eps_mse_bg'] = history_heatmap_eps_mse_bg
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:
@@ -776,6 +788,8 @@ class VLNPipeline(nn.Module):
         history_heatmap_eps_mse_high_snr = None
         history_heatmap_eps_mse_mid_snr = None
         history_heatmap_eps_mse_low_snr = None
+        history_heatmap_eps_mse_peak = None
+        history_heatmap_eps_mse_bg = None
         
         if return_heatmaps:
             llm_tokens_hm = llm_tokens_for_heatmap.to(dtype=self.config.dtype)
@@ -821,6 +835,8 @@ class VLNPipeline(nn.Module):
                     history_heatmap_eps_mse_high_snr = result.get('eps_mse_high_snr')
                     history_heatmap_eps_mse_mid_snr = result.get('eps_mse_mid_snr')
                     history_heatmap_eps_mse_low_snr = result.get('eps_mse_low_snr')
+                    history_heatmap_eps_mse_peak = result.get('eps_mse_peak')
+                    history_heatmap_eps_mse_bg = result.get('eps_mse_bg')
                 else:
                     raw_heatmap = self.history_heatmap_head(
                         llm_tokens=llm_tokens_hm,
@@ -910,6 +926,9 @@ class VLNPipeline(nn.Module):
                 output['history_heatmap_eps_mse_high_snr'] = history_heatmap_eps_mse_high_snr
                 output['history_heatmap_eps_mse_mid_snr'] = history_heatmap_eps_mse_mid_snr
                 output['history_heatmap_eps_mse_low_snr'] = history_heatmap_eps_mse_low_snr
+            if history_heatmap_eps_mse_peak is not None:
+                output['history_heatmap_eps_mse_peak'] = history_heatmap_eps_mse_peak
+                output['history_heatmap_eps_mse_bg'] = history_heatmap_eps_mse_bg
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             if future_heatmap_noise_std is not None:
