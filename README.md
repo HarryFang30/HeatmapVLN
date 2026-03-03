@@ -177,28 +177,16 @@ tensorboard --logdir=/root/tf-logs/latest --port=6006
 | | `train/trajectory_loss` | 轨迹损失 (Transformer Diffusion) |
 | | `train/progress_loss` | 进度损失 |
 | **Multi-Layer Fusion** | `diag/fusion_weight_layer{i}` | 各层融合权重 |
+| **热力图损失** | `diag/heatmap_diffusion_loss` | Min-SNR 加权 epsilon MSE 损失 |
+| | `diag/heatmap_eps_mse_high_snr` | 低噪声区 (SNR>5) epsilon MSE |
+| | `diag/heatmap_eps_mse_mid_snr` | 中噪声区 (0.5≤SNR≤5) epsilon MSE |
+| | `diag/heatmap_eps_mse_low_snr` | 高噪声区 (SNR<0.5) epsilon MSE |
 | **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
 | | `diag/pred_heatmap_mean` | 预测均值 |
 | | `diag/pred_heatmap_std` | 预测标准差 |
 | | `diag/pred_heatmap_nonzero_ratio` | 非零像素比例 |
-| | `diag/heatmap_base_loss` | base MSE 损失 |
-| | `diag/heatmap_focal_loss` | focal 加权损失 |
-| | `diag/heatmap_focal_ratio` | focal/base 比值 |
-| | `diag/heatmap_x0_loss` | x0 重构损失 |
-| | `diag/heatmap_sparsity_loss` | L1 稀疏性正则化损失 |
-| | `diag/heatmap_dice_loss` | Dice 损失 |
-| | `diag/heatmap_neg_zero_loss` | 负样本零目标损失 (SNR门控) |
-| | `diag/heatmap_peak_dist_loss` | 峰值距离损失 |
-| | `diag/heatmap_visibility_loss` | 可见性 BCE 损失 |
-| | `diag/hm_peak_distance` | 峰值位置误差（像素） |
-| | `diag/hm_peak_dx/dy` | 峰值位置 X/Y 偏差 |
-| | `diag/hm_peak_iou` | 峰值 IoU |
-| | `diag/hm_pred_peak_conf` | 预测峰值置信度 |
-| | `diag/hm_gt_peak_conf` | 真实峰值置信度 |
-| | `diag/hm_peak_conf_ratio` | 预测/真实峰值置信度比值 |
-| | `diag/hm_multi_peak_distance` | 多峰平均距离 |
-| | `diag/hm_peak_recall_5px` | 5像素内召回率 |
-| | `diag/hm_avg_gt_peaks` | 平均真实峰值数量 |
+| | `diag/noise_std` | 真实噪声标准差 |
+| | `diag/noise_pred_std` | 预测噪声标准差（应与 noise_std 接近） |
 | **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
 | | `diag/trajectory_fde` | 终点位移误差 |
 | **进度诊断** | `diag/progress_mae` | 进度 MAE |
