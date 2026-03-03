@@ -44,128 +44,53 @@ sample_weight = (
 | 正样本 (有峰值) | 3.0 | 峰值区域是导航的关键信息，需要重点学习 |
 | 负样本 (全零) | 0.3 | 负样本信号稀疏，过度学习会导致热力图全黑 |
 
-### 2.3 空间 Focal 权重
+### 2.3 Min-SNR 时间步加权 (ICCV 2023)
 
 ```python
-# 所有像素共用的空间 focal 权重
-focal_alpha = 20.0
-spatial_focal = 1.0 + focal_alpha * gt_clamped  # 峰值处 15-21x
-spatial_focal = spatial_focal / spatial_focal.mean()  # 归一化保持 loss 尺度
+# 计算每个时间步的信噪比 (SNR)
+alpha_bar = noise_scheduler.alphas_cumprod[timesteps]  # (B,)
+snr = alpha_bar / (1 - alpha_bar)                      # (B, 1, 1, 1)
+
+# Min-SNR 加权：clamp(SNR, max=gamma) / SNR
+min_snr_gamma = 5.0
+snr_weight = torch.clamp(snr, max=min_snr_gamma) / snr  # (B, 1, 1, 1)
 ```
 
-**核心思想**：让模型更关注峰值区域，峰值处 focal 权重高达 15-21x。
+**核心思想**：标准 DDPM 对所有时间步等权重训练，但不同时间步的学习效率差异巨大：
 
-### 2.4 主损失：Epsilon Loss (Aggressive Focal)
+| 时间步区间 | SNR | 噪声预测难度 | 权重行为 |
+|-----------|-----|-------------|---------|
+| 低噪声步 (t < 50) | SNR > 5 (高) | 简单 | **压低** (snr_weight < 1)，减少梯度浪费 |
+| 中噪声步 | 0.5 ≤ SNR ≤ 5 | 适中 | **保持** (snr_weight ≈ 1) |
+| 高噪声步 (t > 120) | SNR < 0.5 (低) | 困难但对推理链至关重要 | **保持全权重** (snr_weight = 1) |
+
+**参考论文**: "Efficient Diffusion Training via Min-SNR Weighting Strategy" (ICCV 2023)
+
+### 2.4 主损失：Epsilon MSE + Min-SNR + 样本权重
 
 ```python
-# 1. Epsilon Loss（噪声预测损失）
-per_pixel_mse = (noise_pred - noise) ** 2
+# Epsilon Loss（噪声预测损失）
+per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
 
-# 基础 MSE + 空间 focal + 样本权重
-base_loss = (sample_weight_4d * per_pixel_mse).mean()
-focal_loss = (sample_weight_4d * spatial_focal * per_pixel_mse).mean()
+# 综合加权：Min-SNR 时间步权重 × 正负样本权重
+diffusion_loss = (snr_weight * sample_weight_4d * per_pixel_mse).mean()
 
-# Aggressive focal: 80% focal + 20% base
-focal_weight = 0.8
-diffusion_loss = (1 - focal_weight) * base_loss + focal_weight * focal_loss
+total_loss = diffusion_loss
 ```
 
 **公式**:
-$$L_{\epsilon} = \mathbb{E}_{t, \epsilon} \left[ ||\epsilon - \epsilon_\theta(x_t, t, c)||^2 \right]$$
+$$L = \mathbb{E}_{t, \epsilon} \left[ w_{snr}(t) \cdot w_{sample} \cdot ||\epsilon - \epsilon_\theta(x_t, t, c)||^2 \right]$$
+
+其中：
+- $w_{snr}(t) = \min(\text{SNR}(t), \gamma) / \text{SNR}(t)$，$\gamma = 5.0$
+- $w_{sample}$ = 正样本 boost × is_positive + 负样本 weight × is_negative
 
 **设计理由**：
-- focal_weight 从 0.3 提升到 **0.8**，更 aggressive 地聚焦峰值区域
-- 配合样本级权重 (正样本 3x)，形成双重 focal 机制
+- 移除了所有辅助损失（x0、dice、sparsity、neg_zero、peak_distance、visibility）
+- 仅保留 **单一 epsilon MSE**，通过 Min-SNR 加权实现高效训练
+- 简化后的 loss 更稳定，避免多 loss 之间的权重调参和梯度冲突
 
-### 2.5 辅助损失
-
-#### 2.5.1 x0 重构损失 (SNR 门控 + Focal)
-
-```python
-# 从噪声预测反推 x0 估计
-x0_hat = (noisy_heatmap - sqrt(1-alpha_bar) * noise_pred) / sqrt(alpha_bar)
-
-# SNR 软权重：低时间步(高 SNR)权重大，高时间步权重趋零
-snr_weight = (snr / (snr + 1.0)).detach()  # sigmoid-like, [0,1]
-
-# x0 loss + focal + SNR 门控 + 样本权重
-x0_loss = (snr_weight * sample_weight_4d * spatial_focal * per_pixel_x0_mse).mean()
-```
-
-**设计理由**：
-- x0_loss_weight 从 1.0 提升到 **3.0**，成为主力 loss
-- SNR 门控：高时间步 x0_hat 接近噪声，梯度有害，动态跳过
-- Focal 权重：峰值区域更关注
-
-#### 2.5.2 Dice Loss (新增！专治稀疏信号)
-
-```python
-# 只在低噪声时计算（SNR > 1），否则 x0_hat 无意义
-x0_pos = ((x0_hat + 1) / 2).clamp(0, 1)  # 预测
-gt_pos = gt_heatmap.clamp(0, 1)            # GT
-
-intersection = (p_flat * g_flat).sum(1)
-union = p_flat.sum(1) + g_flat.sum(1)
-dice = (2 * intersection + 1) / (union + 1)
-dice_loss = (1 - dice).mean()
-```
-
-**设计理由**：
-- 专治稀疏信号：Dice Loss 直接优化交集/并集，比 MSE 更适合稀疏分布
-- SNR 门控：只对低噪声样本计算
-- dice_loss_weight = **2.0**
-
-#### 2.5.3 L1 稀疏性正则化
-
-```python
-# 鼓励输出大部分为 0
-x0_denorm = (x0_hat + 1) / 2  # 还原到 [0, 1]
-sparsity_loss = x0_denorm.mean()
-```
-
-**设计理由**：
-- sparsity_loss_weight 从 0.5 降低到 **0.1**，避免过度稀疏化
-
-#### 2.5.4 负样本零目标损失 (SNR 门控)
-
-```python
-# 对负样本（GT=全零），约束 x0 应为全 -1
-neg_zero_loss = MSE(neg_x0, -1.0)
-```
-
-**设计理由**：
-- SNR 门控：只对 SNR > 1 的样本施加
-- 帮助模型学习"不可见区域应输出全零"
-
-#### 2.5.5 多峰感知峰值距离损失 (SNR 门控)
-
-```python
-# 检测 GT 中的所有峰值，计算预测位置与 GT 的 L2 距离
-# 1. NMS 检测 GT 峰值
-# 2. 创建高斯注意力窗口
-# 3. Soft-argmax 提取预测位置
-# 4. 计算 L2 距离
-peak_dist_loss = multi_peak_distance(snr_x0, snr_gt)
-```
-
-**设计理由**：
-- peak_distance_loss_weight 从 2.0 提升到 **5.0**
-- SNR 门控：只对低噪声样本计算
-- 多峰感知：每个峰独立计算距离
-
-### 2.6 可见性预测损失
-
-```python
-# 可见性预测头：判断当前视角是否能看到历史点
-gt_has_peak = (gt_heatmap.max() > 0.01).float()
-visibility_loss = F.binary_cross_entropy_with_logits(vis_logit, gt_has_peak)
-```
-
-**设计理由**：
-- 显式建模"是否可见"，消除假阳性
-- visibility_loss_weight = **0.5**
-
-### 2.7 为什么使用 Diffusion？
+### 2.5 为什么使用 Diffusion？
 
 对于可能出现 **多峰分布** 的热力图（1个峰、3个峰、7个峰都可能），Diffusion 是最佳选择：
 
@@ -175,33 +100,23 @@ visibility_loss = F.binary_cross_entropy_with_logits(vis_logit, gt_has_peak)
 | CNN + 固定K点 | ❌ | ❌ | 峰数量不匹配 |
 | **Diffusion** | ✅ | ✅ | 去噪过程自然"雕刻"任意数量的峰 |
 
-### 2.8 完整 Loss 组合
+### 2.6 完整 Loss 组合
 
 ```
-Total Loss = diffusion_loss (80% focal)
-           + x0_loss × 3.0
-           + dice_loss × 2.0
-           + sparsity_loss × 0.1
-           + neg_zero_loss × 0.5
-           + peak_dist_loss × 5.0
-           + visibility_loss × 0.5
+Total Loss = diffusion_loss
+           = (Min-SNR权重 × 样本权重 × epsilon_MSE).mean()
 ```
 
-### 2.9 当前权重配置
+无辅助损失，单一目标函数。
+
+### 2.7 当前权重配置
 
 ```yaml
 model:
   heatmap_head:
     use_circular_padding: true   # 360° 全景图支持
-    positive_sample_boost: 3.0  # 正样本权重提升
-    negative_sample_weight: 0.3 # 负样本降权
-
-    x0_loss_weight: 3.0         # x0 重构损失权重 (1→3，主力)
-    dice_loss_weight: 2.0       # Dice Loss (新增)
-    sparsity_loss_weight: 0.1   # 稀疏性损失权重 (0.5→0.1)
-    visibility_loss_weight: 0.5  # 可见性损失权重
+    positive_sample_boost: 3.0   # 正样本权重提升
     negative_sample_weight: 0.3  # 负样本降权
-    peak_distance_loss_weight: 5.0 # 峰值距离损失权重 (2→5)
 
 loss:
   history_weight: 1.0
@@ -347,49 +262,60 @@ loss:
 
 ## 7. 实际 Loss 输出监控
 
-训练时监控以下 loss 分量：
+训练时监控以下指标：
 
 ```python
 {
-    'loss': total_loss,                    # 总 loss
-    'diffusion_loss': diffusion_loss,      # 纯扩散 loss（80% focal）
-    'base_loss': base_loss,                # 标准 MSE (20%)
-    'focal_loss': focal_loss,              # 空间 focal MSE (80%)
-    'x0_loss': x0_loss,                    # x0 重构损失 (×3.0)
-    'dice_loss': dice_loss,                 # Dice Loss (×2.0，新增)
-    'sparsity_loss': sparsity_loss,        # 稀疏性损失 (×0.1)
-    'neg_zero_loss': neg_zero_loss,        # 负样本零目标损失 (×0.5)
-    'peak_dist_loss': peak_dist_loss,      # 峰值距离损失 (×5.0)
-    'visibility_loss': visibility_loss,    # 可见性 BCE loss (×0.5)
-    'action_loss': action_loss,            # 轨迹/动作 loss
-    'stop_loss': stop_loss,                # 停止 loss
+    'loss': total_loss,                    # 总 loss = diffusion_loss
+    'diffusion_loss': diffusion_loss,      # Min-SNR 加权 epsilon MSE
+    'eps_mse_high_snr': float,             # 低噪声区 (SNR>5) 的 epsilon MSE
+    'eps_mse_mid_snr': float,              # 中噪声区 (0.5≤SNR≤5) 的 epsilon MSE
+    'eps_mse_low_snr': float,              # 高噪声区 (SNR<0.5) 的 epsilon MSE
+    'heatmap': pred_heatmap,               # 推理热力图（每 100 步生成一次）
+    'noise_pred': noise_pred,              # 模型预测的噪声
+    'noise_target': noise,                 # 真实噪声
+    'noise_std': float,                    # 真实噪声的标准差
+    'noise_pred_std': float,               # 预测噪声的标准差
 }
 ```
+
+**SNR 分段诊断**：通过对比三个 SNR 区间的 epsilon MSE，可以判断模型在不同噪声水平下的去噪能力：
+- `eps_mse_high_snr` 高 → 模型在简单（低噪声）时间步表现差
+- `eps_mse_low_snr` 高 → 模型在困难（高噪声）时间步表现差（正常，这些步本身困难）
+- `noise_std` vs `noise_pred_std` → 预测噪声的尺度是否与真实噪声匹配
 
 ---
 
 ## 8. Loss 设计演进总结
 
-### v1 (旧版)
+### v1
 - focal_weight: 0.3
 - x0_loss_weight: 1.0
 - 无 Dice Loss
 - sparsity_loss_weight: 0.5
 - peak_distance_loss_weight: 2.0
 
-### v2 (新版)
-- focal_weight: **0.8** (aggressive)
-- x0_loss_weight: **3.0** (主力)
-- **新增 Dice Loss (×2.0)**
-- sparsity_loss_weight: **0.1** (降低)
-- peak_distance_loss_weight: **5.0** (加强)
-- **新增 positive_sample_boost: 3.0**
+### v2
+- focal_weight: 0.8 (aggressive)
+- x0_loss_weight: 3.0 (主力)
+- 新增 Dice Loss (×2.0)
+- sparsity_loss_weight: 0.1
+- peak_distance_loss_weight: 5.0
+- 新增 positive_sample_boost: 3.0
+- 双重 Focal 机制 + 6 个辅助 loss
 
-### 核心改进
-1. **双重 Focal 机制**：样本级 (正样本 3x) + 空间级 (峰值 15-21x)
-2. **Dice Loss**：专治稀疏信号，比 MSE 更适合热力图
-3. **x0 主力化**：x0_loss 成为主要优化目标
-4. **更激进的峰值定位**：peak_distance_loss_weight 提升到 5.0
+### v3 (当前版本)
+- **移除所有辅助 loss**（x0、dice、sparsity、neg_zero、peak_distance、visibility）
+- **移除空间 Focal 权重**
+- **新增 Min-SNR 时间步加权** (gamma=5.0)
+- 仅保留 epsilon MSE + 样本权重 + Min-SNR 加权
+- 新增 SNR 分段诊断监控
+
+### 核心改进 (v2 → v3)
+1. **极简化**：从 7 个 loss 分量精简为 **单一 loss**，消除多 loss 权重调参问题
+2. **Min-SNR 加权**：让模型在不同时间步上获得更均匀的学习信号，替代手工设计的 focal/SNR 门控
+3. **训练稳定性**：移除辅助 loss 的梯度冲突，收敛更稳定
+4. **诊断升级**：通过 SNR 分段 epsilon MSE 监控模型在不同噪声水平的表现
 
 ---
 
@@ -399,16 +325,8 @@ loss:
 model:
   heatmap_head:
     use_circular_padding: true   # 360° 全景图支持
-    use_visibility_head: true    # 可见性预测头
-
     positive_sample_boost: 3.0   # 正样本权重提升
     negative_sample_weight: 0.3  # 负样本降权
-
-    x0_loss_weight: 3.0          # x0 重构损失 (主力)
-    dice_loss_weight: 2.0         # Dice Loss (新增)
-    sparsity_loss_weight: 0.1     # 稀疏性损失
-    visibility_loss_weight: 0.5   # 可见性损失
-    peak_distance_loss_weight: 5.0 # 峰值距离损失
 
   action_head:
     type: transformer           # Transformer DDPM (推荐)
