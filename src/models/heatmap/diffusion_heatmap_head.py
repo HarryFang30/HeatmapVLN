@@ -335,11 +335,20 @@ class DiffusionHeatmapHead(nn.Module):
             )  # (B,)
             sample_weight_4d = sample_weight.view(-1, 1, 1, 1)
 
-        # ==================== Epsilon MSE Loss（扩散模型唯一需要的 loss）====================
-        # 标准扩散模型只需要 epsilon MSE：在所有时间步、所有像素上均匀训练噪声预测
-        # DDIM 推理链的质量完全取决于 epsilon 预测精度，任何偏重都会破坏链条
+        # ==================== Min-SNR 时间步加权 (ICCV 2023) ====================
+        # 低噪声步（高 SNR）epsilon 预测简单 → 压低权重，减少梯度浪费
+        # 高噪声步（低 SNR）epsilon 预测困难但对推理链至关重要 → 保持全权重
+        # 参考: "Efficient Diffusion Training via Min-SNR Weighting Strategy"
+        with torch.no_grad():
+            alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
+            alpha_bar = alpha_bar.view(-1, 1, 1, 1)
+            snr = alpha_bar / (1 - alpha_bar + 1e-8)  # (B, 1, 1, 1)
+            min_snr_gamma = 5.0
+            snr_weight = torch.clamp(snr, max=min_snr_gamma) / (snr + 1e-8)  # (B, 1, 1, 1)
+
+        # ==================== Epsilon MSE Loss + Min-SNR + 样本权重 ====================
         per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
-        diffusion_loss = (sample_weight_4d * per_pixel_mse).mean()
+        diffusion_loss = (snr_weight * sample_weight_4d * per_pixel_mse).mean()
 
         total_loss = diffusion_loss
 
@@ -348,11 +357,6 @@ class DiffusionHeatmapHead(nn.Module):
         noise_pred_std = noise_pred.std().item()
 
         with torch.no_grad():
-            alpha_bar = self.noise_scheduler.alphas_cumprod.to(device)[timesteps]
-            alpha_bar = alpha_bar.view(-1, 1, 1, 1)
-            snr = alpha_bar / (1 - alpha_bar + 1e-8)
-
-            # 按噪声水平分层的 epsilon MSE（真实反映模型能力）
             snr_flat = snr.view(batch_size)
             per_sample_mse = per_pixel_mse.flatten(1).mean(dim=1)  # (B,)
 
