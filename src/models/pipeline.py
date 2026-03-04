@@ -110,8 +110,10 @@ class VLNPipelineConfig:
     heatmap_head_type: str = "diffusion"
     
     # Direct head specific config (only used when heatmap_head_type == "direct")
-    direct_heatmap_hidden_dim: int = 128
+    direct_heatmap_hidden_dim: int = 256
     direct_heatmap_num_decoder_blocks: int = 3
+    direct_heatmap_decoder_num_heads: int = 8
+    direct_heatmap_decoder_head_dim: int = 64
     direct_heatmap_lambda_dice: float = 0.5
     direct_heatmap_lambda_peak: float = 1.0
     direct_heatmap_focal_gamma: float = 2.0
@@ -333,6 +335,8 @@ class VLNPipeline(nn.Module):
                     # Direct head specific
                     hidden_dim=config.direct_heatmap_hidden_dim,
                     num_decoder_blocks=config.direct_heatmap_num_decoder_blocks,
+                    decoder_num_heads=config.direct_heatmap_decoder_num_heads,
+                    decoder_head_dim=config.direct_heatmap_decoder_head_dim,
                     lambda_dice=config.direct_heatmap_lambda_dice,
                     lambda_peak=config.direct_heatmap_lambda_peak,
                     focal_gamma=config.direct_heatmap_focal_gamma,

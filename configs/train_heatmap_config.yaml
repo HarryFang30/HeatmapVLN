@@ -154,8 +154,10 @@ model:
     
     # Direct head 专属配置（仅 head_type: direct 时生效）
     direct:
-      hidden_dim: 128                 # FPN 解码器通道数
+      hidden_dim: 256                 # FPN 解码器通道数（128→256 扩大空间表示容量）
       num_decoder_blocks: 3           # 解码块数量（7→14→28→56）
+      decoder_num_heads: 8            # Cross-attention heads
+      decoder_head_dim: 64            # 每头维度（16→64，inner_dim 128→512，匹配能力 4x）
       lambda_dice: 0.5               # Dice loss 权重
       lambda_peak: 1.0               # Peak location loss 权重
       focal_gamma: 2.0               # Focal loss gamma (0=禁用)

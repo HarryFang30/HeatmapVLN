@@ -683,8 +683,10 @@ def build_model(cfg: Dict) -> nn.Module:
         # Head type switch: "diffusion" or "direct"
         heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
         # Direct head specific config
-        direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 128),
+        direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 256),
         direct_heatmap_num_decoder_blocks=heatmap_cfg.get('direct', {}).get('num_decoder_blocks', 3),
+        direct_heatmap_decoder_num_heads=heatmap_cfg.get('direct', {}).get('decoder_num_heads', 8),
+        direct_heatmap_decoder_head_dim=heatmap_cfg.get('direct', {}).get('decoder_head_dim', 64),
         direct_heatmap_lambda_dice=heatmap_cfg.get('direct', {}).get('lambda_dice', 0.5),
         direct_heatmap_lambda_peak=heatmap_cfg.get('direct', {}).get('lambda_peak', 1.0),
         direct_heatmap_focal_gamma=heatmap_cfg.get('direct', {}).get('focal_gamma', 2.0),

@@ -79,10 +79,10 @@ class DirectHeatmapConfig:
     heatmap_size: Tuple[int, int] = (64, 64)
 
     # ==================== FPN Decoder =========================================
-    hidden_dim: int = 128
+    hidden_dim: int = 256
     num_decoder_blocks: int = 3
     decoder_num_heads: int = 8
-    decoder_head_dim: int = 16
+    decoder_head_dim: int = 64
 
     # ==================== Loss Weights ========================================
     lambda_dice: float = 0.5
