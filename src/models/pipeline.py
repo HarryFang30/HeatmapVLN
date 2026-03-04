@@ -114,6 +114,8 @@ class VLNPipelineConfig:
     direct_heatmap_num_decoder_blocks: int = 3
     direct_heatmap_lambda_dice: float = 0.5
     direct_heatmap_lambda_peak: float = 1.0
+    direct_heatmap_focal_gamma: float = 2.0
+    direct_heatmap_init_bias: float = -5.0
     
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
@@ -333,6 +335,8 @@ class VLNPipeline(nn.Module):
                     num_decoder_blocks=config.direct_heatmap_num_decoder_blocks,
                     lambda_dice=config.direct_heatmap_lambda_dice,
                     lambda_peak=config.direct_heatmap_lambda_peak,
+                    focal_gamma=config.direct_heatmap_focal_gamma,
+                    init_bias=config.direct_heatmap_init_bias,
                     # Shared loss config
                     peak_spatial_weight=config.heatmap_peak_spatial_weight,
                     negative_sample_weight=config.heatmap_negative_sample_weight,
@@ -649,15 +653,9 @@ class VLNPipeline(nn.Module):
         # Heatmap losses and diagnostics (generic forwarding for both head types)
         if history_heatmap_loss is not None:
             output['history_heatmap_loss'] = history_heatmap_loss
-            for key in ('noise_std', 'noise_pred_std',
-                        'eps_mse_high_snr', 'eps_mse_mid_snr', 'eps_mse_low_snr',
-                        'eps_mse_peak', 'eps_mse_bg',
-                        'direct_mse', 'direct_dice_loss', 'direct_peak_loss',
-                        'direct_mse_peak', 'direct_mse_bg',
-                        'direct_pred_max', 'direct_pred_mean'):
-                val = history_head_result.get(key)
-                if val is not None:
-                    output[f'history_heatmap_{key}'] = val
+            for key in history_head_result:
+                if key not in ('loss', 'heatmap'):
+                    output[f'history_heatmap_{key}'] = history_head_result[key]
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             for key in ('noise_std', 'noise_pred_std'):
@@ -913,15 +911,9 @@ class VLNPipeline(nn.Module):
         # Heatmap losses and diagnostics (forward_packed path, generic forwarding)
         if history_heatmap_loss is not None:
             output['history_heatmap_loss'] = history_heatmap_loss
-            for key in ('noise_std', 'noise_pred_std',
-                        'eps_mse_high_snr', 'eps_mse_mid_snr', 'eps_mse_low_snr',
-                        'eps_mse_peak', 'eps_mse_bg',
-                        'direct_mse', 'direct_dice_loss', 'direct_peak_loss',
-                        'direct_mse_peak', 'direct_mse_bg',
-                        'direct_pred_max', 'direct_pred_mean'):
-                val = history_head_result.get(key)
-                if val is not None:
-                    output[f'history_heatmap_{key}'] = val
+            for key in history_head_result:
+                if key not in ('loss', 'heatmap'):
+                    output[f'history_heatmap_{key}'] = history_head_result[key]
         if future_heatmap_loss is not None:
             output['future_heatmap_loss'] = future_heatmap_loss
             for key in ('noise_std', 'noise_pred_std'):

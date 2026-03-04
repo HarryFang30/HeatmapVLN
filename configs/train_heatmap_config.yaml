@@ -146,7 +146,7 @@ model:
     sharpen_temperature: 0.1          # 温度越低越锐利（0 = 禁用）
     
     # 正负样本权重平衡（数据集 ~69% 负样本）
-    negative_sample_weight: 0.3       # 负样本权重
+    negative_sample_weight: 1.0       # 负样本权重（与正样本同等重要）
     positive_sample_boost: 3.0        # 正样本权重提升
     
     # 空间重要性加权（像素维度梯度引导）
@@ -158,6 +158,8 @@ model:
       num_decoder_blocks: 3           # 解码块数量（7→14→28→56）
       lambda_dice: 0.5               # Dice loss 权重
       lambda_peak: 1.0               # Peak location loss 权重
+      focal_gamma: 2.0               # Focal loss gamma (0=禁用)
+      init_bias: -5.0                # 全局门控初始偏置（sigmoid(-5)≈0.007）
 
   # 动作头配置 - 禁用（不训练动作）
   action_head:

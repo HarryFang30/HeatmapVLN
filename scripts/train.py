@@ -687,6 +687,8 @@ def build_model(cfg: Dict) -> nn.Module:
         direct_heatmap_num_decoder_blocks=heatmap_cfg.get('direct', {}).get('num_decoder_blocks', 3),
         direct_heatmap_lambda_dice=heatmap_cfg.get('direct', {}).get('lambda_dice', 0.5),
         direct_heatmap_lambda_peak=heatmap_cfg.get('direct', {}).get('lambda_peak', 1.0),
+        direct_heatmap_focal_gamma=heatmap_cfg.get('direct', {}).get('focal_gamma', 2.0),
+        direct_heatmap_init_bias=heatmap_cfg.get('direct', {}).get('init_bias', -5.0),
         
         # Multi-layer feature extraction
         multi_layer_features=llm_cfg.get('multi_layer_features', False),
@@ -1502,13 +1504,14 @@ def train_one_epoch(
                     
                     # Direct head 诊断指标（仅 head_type="direct" 时存在）
                     if 'history_heatmap_direct_mse' in output and output['history_heatmap_direct_mse'] is not None:
-                        tb_writer.add_scalar('diag/direct_mse', output['history_heatmap_direct_mse'], actual_step)
-                        tb_writer.add_scalar('diag/direct_dice_loss', output['history_heatmap_direct_dice_loss'], actual_step)
-                        tb_writer.add_scalar('diag/direct_peak_loss', output['history_heatmap_direct_peak_loss'], actual_step)
-                        tb_writer.add_scalar('diag/direct_mse_peak', output['history_heatmap_direct_mse_peak'], actual_step)
-                        tb_writer.add_scalar('diag/direct_mse_bg', output['history_heatmap_direct_mse_bg'], actual_step)
-                        tb_writer.add_scalar('diag/direct_pred_max', output['history_heatmap_direct_pred_max'], actual_step)
-                        tb_writer.add_scalar('diag/direct_pred_mean', output['history_heatmap_direct_pred_mean'], actual_step)
+                        for dkey in ('direct_mse', 'direct_bce', 'direct_dice_loss',
+                                     'direct_peak_loss', 'direct_mse_peak', 'direct_mse_bg',
+                                     'direct_pred_max', 'direct_pred_mean',
+                                     'direct_gate_bias', 'direct_neg_pred_mean',
+                                     'direct_pos_pred_mean'):
+                            val = output.get(f'history_heatmap_{dkey}')
+                            if val is not None:
+                                tb_writer.add_scalar(f'diag/{dkey}', val, actual_step)
                     
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
