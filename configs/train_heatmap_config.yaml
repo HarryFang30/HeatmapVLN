@@ -102,8 +102,8 @@ model:
 
     # DPT 配置 — 从 LLM 中间层 visual tokens 直接解码热力图
     dpt:
-      out_channels: [256, 512, 1024, 1024]
-      features: 256
+      proj_dim: 256       # 每层投影维度
+      features: 256       # 解码器通道数
 
     # 以下配置仅在 diffusion/direct 模式下生效，DPT 模式不使用
     cond_dim: 1024

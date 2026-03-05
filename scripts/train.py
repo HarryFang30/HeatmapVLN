@@ -684,7 +684,7 @@ def build_model(cfg: Dict) -> nn.Module:
         # Head type switch: "diffusion", "direct", or "dpt"
         heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
         # DPT head config
-        dpt_out_channels=heatmap_cfg.get('dpt', {}).get('out_channels', None),
+        dpt_proj_dim=heatmap_cfg.get('dpt', {}).get('proj_dim', 256),
         dpt_features=heatmap_cfg.get('dpt', {}).get('features', 256),
         # Direct head specific config
         direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 256),

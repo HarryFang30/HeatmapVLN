@@ -95,7 +95,7 @@ def build_model(cfg: Dict) -> VLNPipeline:
         heatmap_positive_sample_boost=heatmap_cfg.get('positive_sample_boost', 3.0),
         heatmap_peak_spatial_weight=heatmap_cfg.get('peak_spatial_weight', 10.0),
         heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
-        dpt_out_channels=heatmap_cfg.get('dpt', {}).get('out_channels', None),
+        dpt_proj_dim=heatmap_cfg.get('dpt', {}).get('proj_dim', 256),
         dpt_features=heatmap_cfg.get('dpt', {}).get('features', 256),
         multi_layer_features=llm_cfg.get('multi_layer_features', False),
         feature_layer_indices=llm_cfg.get('feature_layer_indices', None),

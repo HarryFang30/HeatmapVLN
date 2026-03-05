@@ -122,7 +122,7 @@ class VLNPipelineConfig:
     direct_heatmap_init_bias: float = -5.0
     
     # DPT head config (only used when heatmap_head_type == "dpt")
-    dpt_out_channels: Optional[List[int]] = None  # default: [256, 512, 1024, 1024]
+    dpt_proj_dim: int = 256
     dpt_features: int = 256
     
     # Multi-layer feature extraction (CVPR 2025 best practice)
@@ -325,22 +325,22 @@ class VLNPipeline(nn.Module):
         
         def _build_heatmap_head():
             if head_type == "dpt":
-                # Compute patch dimensions from image_size
                 patch_size = 14
                 spatial_merge = 2
                 effective_patch = patch_size * spatial_merge
                 patch_h = config.image_size // effective_patch
                 patch_w = config.image_size // effective_patch
                 num_image_tokens = patch_h * patch_w
-                dpt_oc = config.dpt_out_channels or [256, 512, 1024, 1024]
+                n_layers = len(config.feature_layer_indices) if config.feature_layer_indices else 4
                 return DPTHeatmapHead(DPTHeatmapConfig(
                     dim_in=config.llm_hidden_dim,
                     heatmap_size=config.heatmap_size,
                     patch_h=patch_h,
                     patch_w=patch_w,
-                    out_channels=dpt_oc,
+                    proj_dim=config.dpt_proj_dim,
                     features=config.dpt_features,
                     num_image_tokens=num_image_tokens,
+                    num_layers=n_layers,
                 )).to(device=heatmap_device, dtype=config.dtype)
             elif head_type == "direct":
                 return DirectHeatmapHead(DirectHeatmapConfig(
@@ -793,10 +793,15 @@ class VLNPipeline(nn.Module):
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states from Qwen3-VL (packed mode)")
         
+        # For DPT: save per-layer vision tokens BEFORE fusion destroys them
+        dpt_vision_tokens = None
+        if self.config.heatmap_head_type == "dpt" and isinstance(vision_hidden_states, list):
+            dpt_vision_tokens = [hs.to(device=self.device, dtype=self.config.dtype)
+                                 for hs in vision_hidden_states]
+        
         # ==================== Step 1.5: Multi-Layer Fusion (packed mode) ====================
         if isinstance(raw_hidden_states, list) and self.multi_layer_fusion is not None:
             raw_hidden_states = [hs.to(device=self.device, dtype=self.config.dtype) for hs in raw_hidden_states]
-            # Ensure all have same shape
             for i in range(len(raw_hidden_states)):
                 if raw_hidden_states[i].dim() == 2:
                     raw_hidden_states[i] = raw_hidden_states[i].unsqueeze(1)
@@ -808,7 +813,7 @@ class VLNPipeline(nn.Module):
             if raw_hidden_states.dim() == 2:
                 raw_hidden_states = raw_hidden_states.unsqueeze(1)
         
-        # Fuse vision hidden states similarly
+        # Fuse vision hidden states similarly (for non-DPT heads)
         if isinstance(vision_hidden_states, list) and self.multi_layer_fusion is not None:
             vision_hidden_states = [hs.to(device=self.device, dtype=self.config.dtype) for hs in vision_hidden_states]
             vision_hidden_states = self.multi_layer_fusion(vision_hidden_states)
@@ -856,38 +861,74 @@ class VLNPipeline(nn.Module):
                 num_views = 0
             
             # History Heatmap
+            is_dpt = self.config.heatmap_head_type == "dpt"
             if self.history_heatmap_head is not None:
-                if gt_history_heatmap is not None:
-                    gt_history_hm = gt_history_heatmap.to(self.device)
-                    if current_views is not None and gt_history_hm.dim() == 4:
-                        gt_history_hm = gt_history_hm.reshape(
-                            B * num_views, *gt_history_hm.shape[2:])
-                    
-                    result = self.history_heatmap_head(
-                        llm_tokens=llm_tokens_hm,
-                        observation=observation_for_heatmap,
-                        gt_heatmap=gt_history_hm,
-                        return_loss=True,
-                        skip_inference=not self.training,
-                        direction_indices=direction_indices,
-                    )
-                    history_heatmap_loss = result['loss']
-                    raw_heatmap = result.get('heatmap')
+                if is_dpt and dpt_vision_tokens is not None:
+                    # DPT path: pass per-layer vision tokens directly
+                    dpt_tokens_for_head = dpt_vision_tokens
+                    if current_views is not None:
+                        # Multi-view: expand each layer's tokens for all views
+                        expanded = []
+                        for lt in dpt_vision_tokens:
+                            lt_exp = lt.unsqueeze(1).expand(-1, num_views, -1, -1)
+                            lt_exp = lt_exp.reshape(B * num_views, lt.shape[1], lt.shape[2])
+                            expanded.append(lt_exp)
+                        dpt_tokens_for_head = expanded
+
+                    if gt_history_heatmap is not None:
+                        gt_history_hm = gt_history_heatmap.to(self.device)
+                        if current_views is not None and gt_history_hm.dim() == 4:
+                            gt_history_hm = gt_history_hm.reshape(
+                                B * num_views, *gt_history_hm.shape[2:])
+                        result = self.history_heatmap_head(
+                            multi_layer_vision_tokens=dpt_tokens_for_head,
+                            gt_heatmap=gt_history_hm,
+                            return_loss=True,
+                        )
+                        history_heatmap_loss = result['loss']
+                        raw_heatmap = result.get('heatmap')
+                    else:
+                        raw_heatmap = self.history_heatmap_head(
+                            multi_layer_vision_tokens=dpt_tokens_for_head,
+                        )
                     if raw_heatmap is not None and num_views > 0:
                         history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
                     else:
                         history_heatmap = raw_heatmap
-                    history_head_result = result
+                    if gt_history_heatmap is not None:
+                        history_head_result = result
                 else:
-                    raw_heatmap = self.history_heatmap_head(
-                        llm_tokens=llm_tokens_hm,
-                        observation=observation_for_heatmap,
-                        direction_indices=direction_indices,
-                    )
-                    if raw_heatmap is not None and num_views > 0:
-                        history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
+                    # Non-DPT path (diffusion / direct)
+                    if gt_history_heatmap is not None:
+                        gt_history_hm = gt_history_heatmap.to(self.device)
+                        if current_views is not None and gt_history_hm.dim() == 4:
+                            gt_history_hm = gt_history_hm.reshape(
+                                B * num_views, *gt_history_hm.shape[2:])
+                        result = self.history_heatmap_head(
+                            llm_tokens=llm_tokens_hm,
+                            observation=observation_for_heatmap,
+                            gt_heatmap=gt_history_hm,
+                            return_loss=True,
+                            skip_inference=not self.training,
+                            direction_indices=direction_indices,
+                        )
+                        history_heatmap_loss = result['loss']
+                        raw_heatmap = result.get('heatmap')
+                        if raw_heatmap is not None and num_views > 0:
+                            history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
+                        else:
+                            history_heatmap = raw_heatmap
+                        history_head_result = result
                     else:
-                        history_heatmap = raw_heatmap
+                        raw_heatmap = self.history_heatmap_head(
+                            llm_tokens=llm_tokens_hm,
+                            observation=observation_for_heatmap,
+                            direction_indices=direction_indices,
+                        )
+                        if raw_heatmap is not None and num_views > 0:
+                            history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])
+                        else:
+                            history_heatmap = raw_heatmap
             
             # Future Heatmap
             if self.future_heatmap_head is not None:
