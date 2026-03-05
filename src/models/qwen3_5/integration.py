@@ -1,25 +1,20 @@
 """
-Qwen3-VL Integration Module
+Qwen3.5 Integration Module
 ===========================
 
-This module provides the Qwen3-VL integration for the VLN pipeline.
+This module provides the Qwen3.5 integration for the VLN pipeline.
 It handles video processing and hidden state extraction for downstream heads.
 
 Features:
-- Load Qwen3-VL model with flash attention support
+- Load Qwen3.5 model with flash attention support
 - Process video frames + current observation + instruction text
 - Extract hidden states for heatmap/action/stop heads
-- Sequence Packing support for efficient batch training (based on official implementation)
 
-Sequence Packing (New):
-- 基于 Qwen3-VL 官方 fine-tuning 框架实现
-- 使用 FlattenedDataCollator 将多个样本拼接成一个长序列
-- 使用 flash_attn_varlen_func 处理变长序列
-- 显著提高显存利用率，减少 padding 浪费
+Note: Sequence packing is disabled for Qwen3.5 due to the hybrid
+linear+full attention architecture (GatedDeltaNet does not support varlen).
 """
 
 import warnings
-# Suppress Qwen3-VL internal warnings
 warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*")
 warnings.filterwarnings("ignore", message=".*video_metadata.*")
@@ -52,19 +47,19 @@ except ImportError:
 
 
 @dataclass
-class Qwen3VLConfig:
-    """Configuration for Qwen3-VL integration."""
+class Qwen3_5Config:
+    """Configuration for Qwen3.5 integration."""
     
     # Model path
-    model_path: str = "./models/qwen_3_vl"
+    model_path: str = "./models/qwen_3.5"
     
     # Device and dtype
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
     
-    # Attention implementation (flash_attention_2, sdpa, or eager)
-    # 推荐使用 flash_attention_2 以获得最佳性能
-    attn_implementation: str = "flash_attention_2"
+    # Attention implementation (sdpa, flash_attention_2, or eager)
+    # Blackwell GPU (RTX 5090) 需使用 sdpa，flash_attention_2 不支持 sm_120
+    attn_implementation: str = "sdpa"
     
     # Generation settings (for inference mode)
     max_new_tokens: int = 128
@@ -76,7 +71,7 @@ class Qwen3VLConfig:
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 的不同深度提取特征并融合，保留空间+语义信息
     multi_layer_features: bool = False
-    feature_layer_indices: Optional[List[int]] = None  # e.g. [4, 18, 32] for 36-layer LLM
+    feature_layer_indices: Optional[List[int]] = None  # e.g. [3, 11, 19, 27] for 32-layer LLM
     
     # Video processing
     max_video_frames: int = 16  # Maximum frames to process
@@ -107,20 +102,20 @@ class Qwen3VLConfig:
         return dtype_map.get(self.torch_dtype, torch.bfloat16)
 
 
-class Qwen3VLIntegration(nn.Module):
+class Qwen3_5Integration(nn.Module):
     """
-    Qwen3-VL Integration for VLN Pipeline.
+    Qwen3.5 Integration for VLN Pipeline.
     
-    This class wraps the Qwen3-VL model to:
+    This class wraps the Qwen3.5 model to:
     1. Process video frames and text instructions
     2. Extract hidden states for downstream heads
     3. Provide a clean interface for the pipeline
     
     Args:
-        config: Qwen3VLConfig with model settings
+        config: Qwen3_5Config with model settings
     """
     
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: Qwen3_5Config):
         super().__init__()
         self.config = config
         self.device = torch.device(config.device)
@@ -130,11 +125,11 @@ class Qwen3VLIntegration(nn.Module):
         self.processor = None
         self._model_loaded = False
         
-        # Special token IDs (from tokenizer_config.json)
-        self.video_token_id = 151656  # <|video_pad|>
-        self.image_token_id = 151655  # <|image_pad|>
-        self.vision_start_id = 151652  # <|vision_start|>
-        self.vision_end_id = 151653  # <|vision_end|>
+        # Special token IDs (Qwen3.5 tokenizer)
+        self.video_token_id = 248057  # <|video_pad|>
+        self.image_token_id = 248056  # <|image_pad|>
+        self.vision_start_id = 248053  # <|vision_start|>
+        self.vision_end_id = 248054  # <|vision_end|>
         
         # Sequence packing state
         self._packing_enabled = config.enable_packing
@@ -145,34 +140,19 @@ class Qwen3VLIntegration(nn.Module):
         self._vit_hook_handles: List = []
         self._vit_block_features: Dict[int, List[torch.Tensor]] = {}
         
-        logger.info(f"Qwen3VLIntegration initialized (model will be loaded on first forward)")
-        if self._packing_enabled:
-            logger.info(f"Sequence packing enabled (max_seq_length={config.max_seq_length})")
+        logger.info(f"Qwen3_5Integration initialized (model will be loaded on first forward)")
     
     def _load_model(self):
-        """Load the Qwen3-VL model and processor."""
+        """Load the Qwen3.5 model and processor."""
         if self._model_loaded:
             return
         
         try:
-            # 如果启用 packing，需要在导入模型前替换 attention
-            # 这是官方实现的做法，确保 varlen attention 正确生效
-            if self._packing_enabled and not self._varlen_attention_replaced:
-                if PACKING_AVAILABLE:
-                    try:
-                        from flash_attn.flash_attn_interface import flash_attn_varlen_func
-                        replace_attention_with_varlen(None)  # 替换类方法，不需要模型实例
-                        self._varlen_attention_replaced = True
-                        logger.info("Pre-replaced attention with varlen version before model loading")
-                    except ImportError:
-                        logger.warning("flash_attn not available, skipping varlen attention replacement")
+            from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
             
-            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+            logger.info(f"Loading Qwen3.5 from {self.config.model_path}")
             
-            logger.info(f"Loading Qwen3-VL from {self.config.model_path}")
-            
-            # Load model
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
                 self.config.model_path,
                 torch_dtype=self.config.get_torch_dtype(),
                 attn_implementation=self.config.attn_implementation,
@@ -181,7 +161,7 @@ class Qwen3VLIntegration(nn.Module):
             )
             self.model.eval()
             
-            # Freeze all Qwen3-VL parameters (never train the backbone)
+            # Freeze all parameters (never train the backbone)
             for param in self.model.parameters():
                 param.requires_grad = False
             
@@ -200,7 +180,7 @@ class Qwen3VLIntegration(nn.Module):
             # 设置 padding_side 为 left，用于批量处理
             self.processor.tokenizer.padding_side = 'left'
             
-            logger.info(f"Qwen3-VL loaded successfully on {self.device}")
+            logger.info(f"Qwen3.5 loaded successfully on {self.device}")
             
             # Log model info
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -208,17 +188,12 @@ class Qwen3VLIntegration(nn.Module):
             logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
             logger.info(f"Batch processing enabled (padding_side='left')")
             
-            # 注意：varlen attention 已经在模型导入前替换过了
-            # 不需要再次调用 enable_sequence_packing()
-            if self._packing_enabled and self._varlen_attention_replaced:
-                logger.info("Sequence packing with varlen attention is active")
-            
             # Register ViT block hooks for pre-merge spatial features
             if self._vit_hook_indices:
                 self._register_vit_hooks()
             
         except Exception as e:
-            logger.error(f"Failed to load Qwen3-VL: {e}")
+            logger.error(f"Failed to load Qwen3.5: {e}")
             raise
     
     # ------------------------------------------------------------------
@@ -226,16 +201,21 @@ class Qwen3VLIntegration(nn.Module):
     # ------------------------------------------------------------------
 
     def _get_visual_module(self):
-        """Resolve the Qwen3VLVisionModel regardless of LoRA wrapping."""
+        """Resolve the Qwen3_5VisionModel regardless of LoRA wrapping."""
         model = self.model
-        # PeftModel wraps in base_model
+        # PeftModel wraps: peft_model.base_model (LoraModel) .model (Qwen3_5ForConditionalGeneration)
         if hasattr(model, 'base_model'):
             model = model.base_model
-        if hasattr(model, 'model') and hasattr(model.model, 'visual'):
-            return model.model.visual
+        if hasattr(model, 'model'):
+            inner = model.model
+            # inner may be Qwen3_5ForConditionalGeneration or Qwen3_5Model
+            if hasattr(inner, 'visual'):
+                return inner.visual
+            if hasattr(inner, 'model') and hasattr(inner.model, 'visual'):
+                return inner.model.visual
         if hasattr(model, 'visual'):
             return model.visual
-        raise RuntimeError("Cannot locate Qwen3VLVisionModel in model hierarchy")
+        raise RuntimeError("Cannot locate vision model in model hierarchy")
 
     def _register_vit_hooks(self):
         """Register forward hooks on ViT blocks to capture pre-merge features."""
@@ -318,7 +298,7 @@ class Qwen3VLIntegration(nn.Module):
 
     def _apply_lora(self):
         """
-        Apply LoRA adapters to the last N layers of Qwen3-VL's language model.
+        Apply LoRA adapters to the last N layers of Qwen3.5's language model.
         
         Uses PEFT library to add low-rank adapters to q_proj and v_proj
         in the specified layers. LoRA parameters are trainable while
@@ -330,23 +310,18 @@ class Qwen3VLIntegration(nn.Module):
             logger.error("peft not installed. Install with: pip install peft")
             raise ImportError("peft is required for LoRA. Install with: pip install peft")
         
-        # Determine total number of LLM layers
-        # Qwen3-VL 结构: model.model.language_model.layers (Qwen2_5_VLTextModel)
         num_layers = None
         if hasattr(self.model, 'model'):
             m = self.model.model
-            # 路径 1: model.model.language_model.layers (Qwen3-VL / Qwen2.5-VL)
             if hasattr(m, 'language_model') and hasattr(m.language_model, 'layers'):
                 num_layers = len(m.language_model.layers)
-            # 路径 2: model.model.layers (部分 Qwen 变体)
             elif hasattr(m, 'layers'):
                 num_layers = len(m.layers)
-        # 路径 3: model.language_model.model.layers
         if num_layers is None and hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
             num_layers = len(self.model.language_model.model.layers)
         
         if num_layers is None:
-            num_layers = 36  # Qwen3-VL 7B default
+            num_layers = 32  # Qwen3.5 7B default
             logger.warning(f"Could not detect layer count, using default: {num_layers}")
         else:
             logger.info(f"Detected {num_layers} LLM layers")
@@ -385,192 +360,19 @@ class Qwen3VLIntegration(nn.Module):
         )
     
     def enable_sequence_packing(self) -> bool:
-        """
-        启用 Sequence Packing 模式
-        
-        基于 Qwen3-VL 官方 fine-tuning 框架：
-        1. 替换 attention forward 函数以支持 flash_attn_varlen_func
-        2. 使用 cumulative sequence lengths 作为 attention mask
-        
-        Returns:
-            bool: 是否成功启用
-        """
-        if not PACKING_AVAILABLE:
-            logger.warning("Sequence packing not available (missing dependencies)")
-            return False
-        
-        if self._varlen_attention_replaced:
-            logger.info("Varlen attention already enabled")
-            return True
-        
-        if not self._model_loaded:
-            logger.warning("Model not loaded yet, packing will be enabled after loading")
-            self._packing_enabled = True
-            return True
-        
-        # Check if flash_attn is available
-        try:
-            from flash_attn.flash_attn_interface import flash_attn_varlen_func
-            has_flash_attn = True
-        except ImportError:
-            has_flash_attn = False
-            logger.warning(
-                "flash_attn not installed. Sequence packing will use standard attention. "
-                "For best performance, install with: pip install flash-attn --no-build-isolation"
-            )
-        
-        if has_flash_attn:
-            # Replace attention with varlen version
-            replace_attention_with_varlen(self.model)
-            self._varlen_attention_replaced = True
-            logger.info("Sequence packing enabled with flash_attn_varlen_func")
-        else:
-            # Fallback: still enable packing but without varlen attention
-            self._packing_enabled = True
-            logger.info("Sequence packing enabled (without varlen attention)")
-        
-        return True
-    
-    def forward_packed(
-        self,
-        packed_batch: Dict[str, Any],
-        return_hidden_states: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        处理 packed batch 的 forward pass
-        
-        这是 Sequence Packing 模式的核心方法，处理由 FlattenedDataCollatorForVLN 
-        生成的 packed batch。
-        
-        Args:
-            packed_batch: 由 FlattenedDataCollatorForVLN 生成的 packed batch，包含：
-                - input_ids: (1, total_seq_len)
-                - attention_mask: cumsum_seq_lens, shape (num_samples + 1,)
-                - position_ids: (3, 1, total_seq_len)
-                - pixel_values: optional
-                - image_grid_thw: optional
-                - pixel_values_videos: optional
-                - video_grid_thw: optional
-                - seq_lens: List[int], 每个样本的序列长度
-                - num_samples: int
-            return_hidden_states: 是否返回 hidden states
-        
-        Returns:
-            Dict containing:
-                - hidden_states: (num_samples, hidden_dim) 每个样本的表示
-                - vision_hidden_states: (num_samples, max_vision_tokens, hidden_dim)
-                - seq_lens: List[int], 每个样本的序列长度
-        """
-        if not self._model_loaded:
-            self._load_model()
-        
-        # 准备 inputs
-        input_ids = packed_batch["input_ids"].to(self.device)
-        attention_mask = packed_batch["attention_mask"].to(self.device)
-        position_ids = packed_batch.get("position_ids")
-        if position_ids is not None:
-            position_ids = position_ids.to(self.device)
-        
-        seq_lens = packed_batch["seq_lens"]
-        num_samples = packed_batch["num_samples"]
-        
-        # 处理视觉数据
-        model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
-        
-        if position_ids is not None:
-            model_inputs["position_ids"] = position_ids
-        
-        if "pixel_values" in packed_batch and packed_batch["pixel_values"] is not None:
-            model_inputs["pixel_values"] = packed_batch["pixel_values"].to(self.device)
-        if "image_grid_thw" in packed_batch and packed_batch["image_grid_thw"] is not None:
-            model_inputs["image_grid_thw"] = packed_batch["image_grid_thw"].to(self.device)
-        if "pixel_values_videos" in packed_batch and packed_batch["pixel_values_videos"] is not None:
-            model_inputs["pixel_values_videos"] = packed_batch["pixel_values_videos"].to(self.device)
-        if "video_grid_thw" in packed_batch and packed_batch["video_grid_thw"] is not None:
-            model_inputs["video_grid_thw"] = packed_batch["video_grid_thw"].to(self.device)
-        
-        # Clear ViT hook captures before forward
-        if self._vit_hook_indices:
-            self._clear_vit_hooks()
-        
-        # Forward pass
-        # 注意：不能使用 torch.no_grad()！
-        # 虽然 Qwen3-VL 参数被冻结 (requires_grad=False)，但需要保留计算图
-        # 以便梯度可以回传到下游的 llm_projector 和 heads
-        outputs = self.model(
-            **model_inputs,
-            output_hidden_states=return_hidden_states,
-            return_dict=True,
+        """Sequence packing is disabled for Qwen3.5 (hybrid attention)."""
+        logger.warning(
+            "Sequence packing is not supported for Qwen3.5 due to hybrid "
+            "linear+full attention architecture. Use standard batching instead."
         )
-        
-        # Extract pre-merge ViT features from hooks
-        vit_pre_merge = None
-        if self._vit_hook_indices:
-            image_grid_thw = packed_batch.get("image_grid_thw")
-            if image_grid_thw is not None:
-                if not isinstance(image_grid_thw, torch.Tensor):
-                    image_grid_thw = torch.tensor(image_grid_thw)
-                image_grid_thw = image_grid_thw.to(self.device)
-            vit_pre_merge = self._extract_image_vit_features(image_grid_thw)
-        
-        if return_hidden_states:
-            if self.config.multi_layer_features and self.config.feature_layer_indices:
-                # Multi-layer extraction for packed mode
-                multi_packed = []
-                for li in self.config.feature_layer_indices:
-                    idx = li if li >= 0 else len(outputs.hidden_states) + li
-                    idx = min(idx, len(outputs.hidden_states) - 1)
-                    multi_packed.append(outputs.hidden_states[idx])
-                packed_hidden_states = multi_packed  # List[(1, total_seq_len, hidden_dim)]
-            else:
-                layer_idx = self.config.hidden_layer_for_features
-                if layer_idx == -1:
-                    layer_idx = len(outputs.hidden_states) - 1
-                packed_hidden_states = outputs.hidden_states[layer_idx]  # (1, total_seq_len, hidden_dim)
-        else:
-            packed_hidden_states = None
-        
-        # 拆分 packed hidden states
-        if packed_hidden_states is not None and PACKING_AVAILABLE:
-            if isinstance(packed_hidden_states, list):
-                # Multi-layer: split each layer separately
-                multi_sample_hs = []
-                multi_vision_hs = []
-                for phs in packed_hidden_states:
-                    sample_hs = split_packed_hidden_states(
-                        phs, seq_lens, pool_method="last"
-                    )
-                    vision_hs = split_packed_vision_hidden_states(
-                        phs, input_ids, seq_lens
-                    )
-                    multi_sample_hs.append(sample_hs)
-                    multi_vision_hs.append(vision_hs)
-                sample_hidden_states = multi_sample_hs  # List[(num_samples, hidden_dim)]
-                vision_hidden_states = multi_vision_hs  # List[(num_samples, max_vision_tokens, hidden_dim)]
-            else:
-                # 提取每个样本的表示（使用 last token pooling）
-                sample_hidden_states = split_packed_hidden_states(
-                    packed_hidden_states, seq_lens, pool_method="last"
-                )
-                # 提取视觉 token hidden states
-                vision_hidden_states = split_packed_vision_hidden_states(
-                    packed_hidden_states, input_ids, seq_lens
-                )
-        else:
-            sample_hidden_states = packed_hidden_states
-            vision_hidden_states = None
-        
-        return {
-            "hidden_states": sample_hidden_states,  # (num_samples, hidden_dim) or List
-            "vision_hidden_states": vision_hidden_states,  # (num_samples, max_vision_tokens, hidden_dim) or List
-            "packed_hidden_states": packed_hidden_states,  # original packed output
-            "seq_lens": seq_lens,
-            "num_samples": num_samples,
-            "vit_pre_merge_features": vit_pre_merge,
-        }
+        return False
+    
+    def forward_packed(self, packed_batch: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        """Disabled for Qwen3.5 — use forward() with standard batching."""
+        raise NotImplementedError(
+            "Sequence packing is not supported for Qwen3.5. "
+            "Set enable_packing=false in config and use standard forward()."
+        )
     
     def get_data_collator(self) -> "FlattenedDataCollatorForVLN":
         """
@@ -720,91 +522,72 @@ class Qwen3VLIntegration(nn.Module):
         return_hidden_states: bool = True,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
         """
-        Batch forward pass through Qwen3-VL.
-        
-        This processes all samples in a single forward pass for efficiency.
-        
-        Args:
-            history_frames: (B, K, C, H, W) history video frames
-            current_frame: (B, C, H, W) current observation
-            instruction: Navigation instruction text
-            return_hidden_states: Whether to return hidden states
-            
-        Returns:
-            Tuple of (hidden_states, vision_hidden_states, num_image_tokens)
+        Batch forward by processing each sample individually and stacking.
+        Qwen3.5's internal position ID computation does not handle
+        padded batches correctly, so we loop over samples.
         """
         batch_size = history_frames.shape[0]
-        
-        # Prepare conversations for all samples
-        conversations = self._prepare_conversations_batch(
-            history_frames, current_frame, instruction
-        )
-        
-        # Apply chat template with padding for batch processing
-        inputs = self.processor.apply_chat_template(
-            conversations,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding=True,
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        input_ids = inputs["input_ids"]  # (B, seq_len)
-        
-        # Count image-only tokens (current frame, not video history)
-        image_mask = input_ids == self.image_token_id
-        num_image_tokens = int(image_mask.sum(dim=1).max().item())
-        
-        # Clear ViT hook captures before forward
-        if self._vit_hook_indices:
-            self._clear_vit_hooks()
-        
-        outputs = self.model(
-            **inputs,
-            output_hidden_states=return_hidden_states,
-            return_dict=True,
-        )
-        
-        # Extract pre-merge ViT features from hooks
-        vit_pre_merge = None
-        if self._vit_hook_indices:
-            vit_pre_merge = self._extract_image_vit_features(
-                inputs.get("image_grid_thw")
+
+        all_hidden = []
+        all_vision = []
+        all_vit_pre = []
+        max_image_tokens = 0
+
+        for b in range(batch_size):
+            instr_b = (
+                instruction[b] if isinstance(instruction, list) else instruction
             )
-        
+            hs, vis, n_img, vit_pre = self._forward_single(
+                history_frames[b], current_frame[b], instr_b, return_hidden_states,
+            )
+            all_hidden.append(hs)
+            all_vision.append(vis)
+            all_vit_pre.append(vit_pre)
+            max_image_tokens = max(max_image_tokens, n_img)
+
+        # Stack results
+        def _pad_and_stack(tensors, pad_dim=1):
+            """Pad variable-length dim and stack into batch."""
+            max_len = max(t.shape[pad_dim] for t in tensors)
+            padded = []
+            for t in tensors:
+                diff = max_len - t.shape[pad_dim]
+                if diff > 0:
+                    pad_shape = list(t.shape)
+                    pad_shape[pad_dim] = diff
+                    t = torch.cat([t, torch.zeros(*pad_shape, device=t.device, dtype=t.dtype)], dim=pad_dim)
+                padded.append(t)
+            return torch.cat(padded, dim=0)
+
         if return_hidden_states:
-            if self.config.multi_layer_features and self.config.feature_layer_indices:
-                multi_hidden = []
-                for li in self.config.feature_layer_indices:
-                    idx = li if li >= 0 else len(outputs.hidden_states) + li
-                    idx = min(idx, len(outputs.hidden_states) - 1)
-                    multi_hidden.append(outputs.hidden_states[idx])
-                hidden_states = multi_hidden  # List[(B, seq_len, hidden_dim)]
+            if isinstance(all_hidden[0], list):
+                # Multi-layer: list of tensors per layer
+                n_layers = len(all_hidden[0])
+                hidden_states = []
+                for li in range(n_layers):
+                    layer_tensors = [h[li] for h in all_hidden]
+                    hidden_states.append(_pad_and_stack(layer_tensors))
+                vision_hidden_states = []
+                for li in range(n_layers):
+                    layer_vis = [v[li] for v in all_vision]
+                    vision_hidden_states.append(_pad_and_stack(layer_vis))
             else:
-                layer_idx = self.config.hidden_layer_for_features
-                if layer_idx == -1:
-                    layer_idx = len(outputs.hidden_states) - 1
-                hidden_states = outputs.hidden_states[layer_idx]  # (B, seq_len, hidden_dim)
+                hidden_states = _pad_and_stack(all_hidden)
+                vision_hidden_states = _pad_and_stack(all_vision) if all_vision[0] is not None else None
         else:
             hidden_states = None
-        
-        # Extract vision token hidden states for each sample
-        vision_hidden_states = None
-        if hidden_states is not None:
-            if isinstance(hidden_states, list):
-                vision_hidden_list = []
-                for hs in hidden_states:
-                    vis_hs = self._extract_vision_hidden_states(hs, input_ids)
-                    vision_hidden_list.append(vis_hs)
-                vision_hidden_states = vision_hidden_list  # List[(B, num_vision_tokens, hidden_dim)]
-            else:
-                vision_hidden_states = self._extract_vision_hidden_states(
-                    hidden_states, input_ids
-                )
-        
-        return hidden_states, vision_hidden_states, num_image_tokens, vit_pre_merge
+            vision_hidden_states = None
+
+        # Stack ViT pre-merge features
+        vit_pre_merge = None
+        if all_vit_pre[0] is not None:
+            n_vit_layers = len(all_vit_pre[0])
+            vit_pre_merge = []
+            for li in range(n_vit_layers):
+                layer_feats = [vp[li] for vp in all_vit_pre]
+                vit_pre_merge.append(torch.cat(layer_feats, dim=0))
+
+        return hidden_states, vision_hidden_states, max_image_tokens, vit_pre_merge
     
     def _forward_single(
         self,
@@ -843,6 +626,17 @@ class Qwen3VLIntegration(nn.Module):
         image_mask = input_ids == self.image_token_id
         num_image_tokens = int(image_mask.sum().item())
         
+        # Expand video_grid_thw temporal dimension to match mm_token_type_ids groups
+        # [[t, h, w]] → t copies of [[1, h, w]] since the processor splits
+        # multi-temporal video tokens into separate groups in mm_token_type_ids
+        if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+            vgt = inputs["video_grid_thw"]
+            if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
+                inputs["video_grid_thw"] = torch.repeat_interleave(
+                    vgt, vgt[:, 0], dim=0
+                )
+                inputs["video_grid_thw"][:, 0] = 1
+
         if self._vit_hook_indices:
             self._clear_vit_hooks()
         
@@ -897,25 +691,7 @@ class Qwen3VLIntegration(nn.Module):
         return_hidden_states: bool = True,
         generate_text: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Forward pass through Qwen3-VL with true batch processing.
-        
-        Uses native batch processing with padding for efficiency.
-        All samples are processed in a single forward pass.
-        
-        Args:
-            history_frames: (B, K, C, H, W) history video frames
-            current_frame: (B, C, H, W) current observation
-            instruction: Navigation instruction text (str for all samples, or List[str] per sample)
-            return_hidden_states: Whether to return hidden states
-            generate_text: Whether to generate text output (only for first sample)
-            
-        Returns:
-            Dict containing:
-                - hidden_states: (B, seq_len, hidden_dim) LLM hidden states
-                - vision_hidden_states: (B, num_vision_tokens, hidden_dim) vision token hidden states
-                - generated_text: Generated text (if generate_text=True, only first sample)
-        """
+        """Forward pass through Qwen3.5 with batch processing."""
         # Ensure model is loaded
         if not self._model_loaded:
             self._load_model()
@@ -1073,8 +849,8 @@ class Qwen3VLIntegration(nn.Module):
         """Get the hidden dimension of the model."""
         if self._model_loaded and self.model is not None:
             return self.model.config.hidden_size
-        # Default for Qwen3-VL-2B
-        return 2048
+        # Default for Qwen3.5 7B
+        return 4096
     
     def freeze(self):
         """Freeze all model parameters."""

@@ -3,7 +3,7 @@
 VLN Pipeline 评估脚本
 ======================
 
-使用 Qwen3-VL 评估视觉语言导航模型。
+使用 Qwen3.5 评估视觉语言导航模型。
 
 支持评估：
 - 历史热力图头 (History Heatmap)
@@ -81,8 +81,8 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     transformer_action_cfg = action_cfg.get('transformer', {})
     
     config = VLNPipelineConfig(
-        # Qwen3-VL
-        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        # Qwen3.5
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
@@ -216,13 +216,13 @@ def build_dataloader(
     
     if packing_enabled and model is not None:
         # Ensure model is loaded for processor
-        if not model.qwen3_vl._model_loaded:
-            model.qwen3_vl._load_model()
+        if not model.qwen3_5._model_loaded:
+            model.qwen3_5._load_model()
         
         spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
         dataset = TokenizedVLNDataset(
             base_dataset=base_dataset,
-            processor=model.qwen3_vl.processor,
+            processor=model.qwen3_5.processor,
             spatial_merge_size=spatial_merge_size,
         )
         actual_collate_fn = FlattenedCollatorForVLN()

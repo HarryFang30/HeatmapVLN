@@ -1,19 +1,18 @@
 """
-Qwen3-VL Integration for VLN Pipeline
-======================================
+Qwen3.5 Integration for VLN Pipeline
+=====================================
 
-This module provides Qwen3-VL model integration for the simplified VLN pipeline.
-It replaces VGGT and DINOv3 with Qwen3-VL's native vision encoder.
+This module provides Qwen3.5 model integration for the VLN pipeline.
 
 Key Components:
-- Qwen3VLIntegration: Main integration class for video processing
-- Qwen3VLConfig: Configuration dataclass
-- Sequence Packing: 基于官方 fine-tuning 框架的高效批量训练支持
+- Qwen3_5Integration: Main integration class for video processing
+- Qwen3_5Config: Configuration dataclass
+- Sequence Packing: (disabled for Qwen3.5 due to hybrid attention)
 """
 
-from .integration import Qwen3VLIntegration, Qwen3VLConfig
+from .integration import Qwen3_5Integration, Qwen3_5Config
 
-# Sequence packing utilities
+# Sequence packing utilities (kept for reference, disabled by default)
 try:
     from .sequence_packing import (
         FlattenedDataCollatorForVLN,
@@ -28,8 +27,8 @@ except ImportError:
     PACKING_AVAILABLE = False
 
 __all__ = [
-    "Qwen3VLIntegration",
-    "Qwen3VLConfig",
+    "Qwen3_5Integration",
+    "Qwen3_5Config",
     "PACKING_AVAILABLE",
 ]
 
@@ -42,4 +41,3 @@ if PACKING_AVAILABLE:
         "get_rope_index_3",
         "PackedSequenceProcessor",
     ])
-

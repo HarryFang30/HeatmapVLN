@@ -412,13 +412,13 @@ def main():
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
     
     if packing_enabled:
-        if not model.qwen3_vl._model_loaded:
-            model.qwen3_vl._load_model()
+        if not model.qwen3_5._model_loaded:
+            model.qwen3_5._load_model()
         
         spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
         tokenized_dataset = TokenizedVLNDataset(
             base_dataset=dataset,
-            processor=model.qwen3_vl.processor,
+            processor=model.qwen3_5.processor,
             spatial_merge_size=spatial_merge_size,
         )
         collate_fn = FlattenedCollatorForVLN()

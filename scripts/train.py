@@ -3,7 +3,7 @@
 VLN 训练脚本
 ==============
 
-使用 Qwen3-VL 进行视觉语言导航训练。
+使用 Qwen3.5 进行视觉语言导航训练。
 单阶段训练：History 热力图头 + Action Head + Stop Head
 """
 
@@ -625,15 +625,15 @@ def build_model(cfg: Dict) -> nn.Module:
     transformer_action_cfg = action_cfg.get('transformer', {})
     
     config = VLNPipelineConfig(
-        # Qwen3-VL
-        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        # Qwen3.5
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
         
-        # Sequence Packing (based on official Qwen3-VL fine-tuning)
+        # Sequence Packing (disabled for Qwen3.5)
         enable_packing=llm_cfg.get('enable_packing', False),
         max_seq_length=llm_cfg.get('max_seq_length', 4096),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
@@ -756,7 +756,7 @@ def build_model(cfg: Dict) -> nn.Module:
     
     packing_enabled = llm_cfg.get('enable_packing', False)
     print(f"✅ VLN Pipeline 已构建")
-    print(f"   Qwen3-VL → {llm_cfg.get('model_path', './models/qwen_3_vl')}")
+    print(f"   Qwen3.5 → {llm_cfg.get('model_path', './models/qwen_3.5')}")
     if packing_enabled:
         print(f"   SequencePacking → enabled=True, max_seq_length={llm_cfg.get('max_seq_length', 4096)}")
     else:
@@ -835,19 +835,19 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             freeze_module(model.multi_layer_fusion, freeze=False)
             logger.info("  ✓ Unfrozen: multi_layer_fusion")
     
-    # Qwen3-VL: 冻结基座，但保留 LoRA 参数可训练
-    if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
-        freeze_module(model.qwen3_vl, freeze=True)
+    # Qwen3.5: 冻结基座，但保留 LoRA 参数可训练
+    if hasattr(model, 'qwen3_5') and model.qwen3_5 is not None:
+        freeze_module(model.qwen3_5, freeze=True)
         # 如果配置了 LoRA 且在 trainable_modules 中，解冻 LoRA 参数
-        # 兼容 'lora' 和 'qwen3_vl_lora' 两种写法
-        if 'lora' in trainable or 'qwen3_vl_lora' in trainable:
+        # 兼容 'lora' 和 'qwen3_5_lora' 两种写法
+        if 'lora' in trainable or 'qwen3_5_lora' in trainable:
             lora_count = 0
-            for name, param in model.qwen3_vl.named_parameters():
+            for name, param in model.qwen3_5.named_parameters():
                 if 'lora_' in name:
                     param.requires_grad = True
                     lora_count += 1
             if lora_count > 0:
-                logger.info(f"  ✓ Unfrozen: qwen3_vl LoRA ({lora_count} parameter tensors)")
+                logger.info(f"  ✓ Unfrozen: qwen3_5 LoRA ({lora_count} parameter tensors)")
             else:
                 logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
 
@@ -988,19 +988,19 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             param_groups.extend(groups)
             print(f"  Param group: multi_layer_fusion (lr={fusion_lr}, wd={projector_wd})")
     
-    # Qwen3-VL LoRA parameters (very low LR for backbone fine-tuning)
+    # Qwen3.5 LoRA parameters (very low LR for backbone fine-tuning)
     lora_lr = optim_cfg.get('lora_lr', 1e-5)
-    if hasattr(model, 'qwen3_vl') and model.qwen3_vl is not None:
-        lora_params = [p for n, p in model.qwen3_vl.named_parameters() 
+    if hasattr(model, 'qwen3_5') and model.qwen3_5 is not None:
+        lora_params = [p for n, p in model.qwen3_5.named_parameters() 
                        if p.requires_grad and 'lora_' in n]
         if lora_params:
             param_groups.append({
                 'params': lora_params,
                 'lr': lora_lr,
                 'weight_decay': 0.0,  # LoRA 通常不使用 weight_decay
-                'name': 'qwen3_vl_lora'
+                'name': 'qwen3_5_lora'
             })
-            print(f"  Param group: qwen3_vl_lora (lr={lora_lr}, wd=0.0, params={len(lora_params)})")
+            print(f"  Param group: qwen3_5_lora (lr={lora_lr}, wd=0.0, params={len(lora_params)})")
     
     if not param_groups:
         raise ValueError("No trainable parameters found!")
@@ -1172,10 +1172,13 @@ def train_one_epoch(
                     gt_future_heatmap=gt_heatmap if train_future else None,
                 )
             else:
-                # 传统模式: 构建 video_frames
+                # Standard mode: build video_frames from history only
+                # (current_frame may have different spatial size in panoramic mode)
+                # Append a duplicate of the last history frame as placeholder;
+                # pipeline.forward() will ignore it when current_observation is provided
                 video_frames = torch.cat([
                     history_frames,
-                    current_frame.unsqueeze(1)
+                    history_frames[:, -1:],
                 ], dim=1)
                 
                 # 处理导航指令
@@ -1738,10 +1741,10 @@ def validate(
                     gt_history_heatmap=gt_heatmap if train_history else None,
                 )
             else:
-                # 传统模式
+                # 传统模式: current_frame 可能与 history_frames 尺寸不同（全景模式）
                 video_frames = torch.cat([
                     history_frames,
-                    current_frame.unsqueeze(1)
+                    history_frames[:, -1:],
                 ], dim=1)
                 
                 if text and len(text) > 0:
@@ -1850,7 +1853,7 @@ def validate(
                 else:
                     video_frames = torch.cat([
                         history_frames,
-                        current_frame.unsqueeze(1)
+                        history_frames[:, -1:],
                     ], dim=1)
                     vis_output = model(
                         video_frames=video_frames,
@@ -2222,7 +2225,7 @@ def main():
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
     
     logger.info("=" * 60)
-    logger.info("VLN 训练 (Qwen3-VL)")
+    logger.info("VLN 训练 (Qwen3.5)")
     logger.info("=" * 60)
     
     # 构建数据集
@@ -2447,19 +2450,19 @@ def main():
         logger.info("📦 Sequence Packing enabled (official implementation)")
         
         # 必须先加载模型以获取 processor
-        if not model.qwen3_vl._model_loaded:
-            model.qwen3_vl._load_model()
+        if not model.qwen3_5._model_loaded:
+            model.qwen3_5._load_model()
         
         # 包装数据集，在 __getitem__ 中做 tokenization
         spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
         train_dataset = TokenizedVLNDataset(
             base_dataset=train_dataset,
-            processor=model.qwen3_vl.processor,
+            processor=model.qwen3_5.processor,
             spatial_merge_size=spatial_merge_size,
         )
         val_dataset = TokenizedVLNDataset(
             base_dataset=val_dataset,
-            processor=model.qwen3_vl.processor,
+            processor=model.qwen3_5.processor,
             spatial_merge_size=spatial_merge_size,
         )
         
@@ -2526,12 +2529,12 @@ def main():
             logger.info("   ✅ Dynamic sampling enabled (workers rebuilt each epoch to reclaim memory)")
     logger.info(f"   🧠 Memory config: num_workers={num_workers}, prefetch={prefetch_factor}, persistent={persistent_workers}")
     
-    # ⚠️ 强制加载 Qwen3-VL（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
+    # ⚠️ 强制加载 Qwen3.5（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
     # 否则 LoRA 参数（懒加载，首次前向才创建）不会被 optimizer 捕获
-    if hasattr(model, 'qwen3_vl') and hasattr(model.qwen3_vl, '_load_model'):
-        if model.qwen3_vl.model is None:
-            logger.info("🔄 Pre-loading Qwen3-VL (ensure LoRA params available for optimizer)...")
-            model.qwen3_vl._load_model()
+    if hasattr(model, 'qwen3_5') and hasattr(model.qwen3_5, '_load_model'):
+        if model.qwen3_5.model is None:
+            logger.info("🔄 Pre-loading Qwen3.5 (ensure LoRA params available for optimizer)...")
+            model.qwen3_5._load_model()
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")

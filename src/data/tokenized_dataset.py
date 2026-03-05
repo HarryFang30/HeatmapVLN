@@ -2,18 +2,7 @@
 Tokenized VLN Dataset
 =======================
 
-符合 Qwen3-VL 官方实现的数据集。
 Tokenization 在 Dataset.__getitem__() 中完成，可以利用 num_workers 并行。
-
-官方流程：
-    Dataset.__getitem__(i):
-        → 读取图片/视频
-        → processor.apply_chat_template()  # tokenization
-        → 返回 tokenized 数据
-    
-    Collator(batch):
-        → 只做拼接 (torch.cat)
-        → 计算 cumsum_seq_lens
 """
 
 import warnings
@@ -29,10 +18,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Qwen3-VL Special Token IDs
-IMAGE_TOKEN_ID = 151655
-VIDEO_TOKEN_ID = 151656
-VISION_START_ID = 151652
+# Qwen3.5 Special Token IDs
+IMAGE_TOKEN_ID = 248056
+VIDEO_TOKEN_ID = 248057
+VISION_START_ID = 248053
 
 
 def get_rope_index_3(
@@ -42,7 +31,7 @@ def get_rope_index_3(
     video_grid_thw: torch.LongTensor = None,
     attention_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """计算 Qwen3-VL 的 3D RoPE position IDs（复制自官方实现）"""
+    """计算 3D RoPE position IDs"""
     if video_grid_thw is not None:
         video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
         video_grid_thw[:, 0] = 1
@@ -138,9 +127,9 @@ class TokenizedVLNDataset(Dataset):
     ):
         """
         Args:
-            base_dataset: 基础数据集 (VLNTrajectoryDataset 或 VLNSlidingWindowDataset)
-            processor: Qwen3-VL processor
-            spatial_merge_size: 视觉空间合并大小
+            base_dataset: base dataset (VLNTrajectoryDataset or VLNSlidingWindowDataset)
+            processor: Qwen3.5 processor
+            spatial_merge_size: vision spatial merge size
         """
         self.base_dataset = base_dataset
         self.processor = processor

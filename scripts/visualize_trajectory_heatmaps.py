@@ -57,7 +57,7 @@ def build_model(cfg: Dict) -> VLNPipeline:
     action_head_type = action_cfg.get('type', 'transformer')
 
     config = VLNPipelineConfig(
-        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),

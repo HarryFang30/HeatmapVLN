@@ -1,18 +1,10 @@
 """
-Qwen3-VL Sequence Packing Module
-=================================
+Sequence Packing Module (legacy, disabled for Qwen3.5)
+======================================================
 
-基于 Qwen3-VL 官方 fine-tuning 框架实现的 Sequence Packing 功能。
-参考：/root/Qwen3-VL/qwen-vl-finetune/
-
-核心技术：
-1. Bin Packing: 将多个变长样本打包到固定长度，减少 padding 浪费
-2. Flattened Attention Mask: 使用 cumulative sequence lengths 代替 2D mask
-3. FlashAttention Varlen: 支持变长序列的高效 attention 计算
-
-与传统 Padding 的对比：
-- Padding: [样本A, PAD, PAD, ...], [样本B, PAD, PAD, ...] -> 大量 PAD 浪费显存
-- Packing: [样本A, 样本B, 样本C, ...] -> 无 PAD，显存利用率最大化
+Note: Sequence packing is disabled for Qwen3.5 due to its hybrid
+linear+full attention architecture. This module is kept for reference
+and backward compatibility but should NOT be used with Qwen3.5.
 """
 
 import torch
@@ -24,11 +16,11 @@ import itertools
 
 logger = logging.getLogger(__name__)
 
-# Qwen3-VL Special Token IDs
-IMAGE_TOKEN_ID = 151655  # <|image_pad|>
-VIDEO_TOKEN_ID = 151656  # <|video_pad|>
-VISION_START_ID = 151652  # <|vision_start|>
-VISION_END_ID = 151653  # <|vision_end|>
+# Qwen3.5 Special Token IDs
+IMAGE_TOKEN_ID = 248056  # <|image_pad|>
+VIDEO_TOKEN_ID = 248057  # <|video_pad|>
+VISION_START_ID = 248053  # <|vision_start|>
+VISION_END_ID = 248054  # <|vision_end|>
 IGNORE_INDEX = -100
 
 
@@ -402,131 +394,13 @@ def get_rope_index_3(
 
 def replace_attention_with_varlen(model: nn.Module = None) -> None:
     """
-    替换 Qwen3-VL 的 attention forward 函数以支持 varlen FlashAttention
-    
-    这允许模型处理 packed sequences，使用 cumulative sequence lengths 作为 attention mask。
-    
-    注意：应该在模型导入前调用此函数（model 参数可以为 None）。
-    这是官方 Qwen3-VL fine-tuning 框架的做法。
-    
-    Args:
-        model: Qwen3-VL 模型（可选，用于向后兼容）
+    Disabled for Qwen3.5 — hybrid attention (GatedDeltaNet + full attention)
+    does not support varlen packing.
     """
-    try:
-        from flash_attn.flash_attn_interface import flash_attn_varlen_func
-    except ImportError:
-        logger.warning(
-            "flash_attn not installed, varlen attention not available. "
-            "Install with: pip install flash-attn --no-build-isolation"
-        )
-        return
-    
-    import transformers
-    from transformers.utils.deprecation import deprecate_kwarg
-    from transformers.processing_utils import Unpack
-    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-    from transformers.cache_utils import Cache
-    
-    try:
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
-    except ImportError:
-        logger.warning("Could not import Qwen3-VL modeling, skipping attention replacement")
-        return
-    
-    def flash_attention_forward_varlen(
-        module: nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: torch.Tensor,
-        dropout: float = 0.0,
-        scaling: float = None,
-        sliding_window: int = None,
-        softcap: float = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, None]:
-        """使用 flash_attn_varlen_func 的 attention forward"""
-        
-        # FA2 uses non-transposed inputs: batch, head, seq_len, dim -> batch, seq_len, head, dim
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        
-        # Squeeze batch dimension for varlen
-        query = query.squeeze(0)
-        key = key.squeeze(0)
-        value = value.squeeze(0)
-        cu_seqlens = attention_mask
-        
-        with torch.no_grad():
-            max_seqlen = max(
-                cu_seqlens[idx + 1] - cu_seqlens[idx]
-                for idx in range(cu_seqlens.size(0) - 1)
-            ).item()
-        
-        attn_output = flash_attn_varlen_func(
-            query, key, value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=True,
-        )
-        
-        attn_output = attn_output.unsqueeze(0)
-        return attn_output, None
-    
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def qwen3vl_attention_forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor,
-        past_key_values: Cache = None,
-        cache_position: torch.LongTensor = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, None]:
-        """Qwen3-VL attention forward with varlen support"""
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-        
-        attn_output, attn_weights = flash_attention_forward_varlen(
-            self,
-            query_states, key_states, value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-        
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-    
-    def return_mask(config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs):
-        """直接返回 attention_mask（cumsum_seq_lens）"""
-        return attention_mask
-    
-    # Apply monkey patches
-    try:
-        transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextAttention.forward = qwen3vl_attention_forward
-        transformers.models.qwen3_vl.modeling_qwen3_vl.create_causal_mask = return_mask
-        logger.info("Successfully replaced Qwen3-VL attention with varlen version")
-    except Exception as e:
-        logger.warning(f"Failed to replace attention: {e}")
+    logger.warning(
+        "replace_attention_with_varlen is not supported for Qwen3.5. "
+        "Use standard batching instead of sequence packing."
+    )
 
 
 class PackedSequenceProcessor:
@@ -545,10 +419,10 @@ class PackedSequenceProcessor:
     ):
         """
         Args:
-            processor: Qwen3-VL processor
-            max_seq_length: 打包后的最大序列长度
-            enable_packing: 是否启用 packing
-            spatial_merge_size: 视觉空间合并大小（用于 position IDs 计算）
+            processor: Qwen3.5 processor
+            max_seq_length: max packed sequence length
+            enable_packing: whether to enable packing (disabled for Qwen3.5)
+            spatial_merge_size: vision spatial merge size for position IDs
         """
         self.processor = processor
         self.tokenizer = processor.tokenizer

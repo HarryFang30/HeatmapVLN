@@ -60,21 +60,19 @@ model:
   type: vln_pipeline
   device: cuda
 
-  # Qwen3-VL 配置
+  # Qwen3.5 配置
   llm:
-    model_path: ./models/qwen_3_vl
+    model_path: ./models/qwen_3.5
     hidden_dim: 4096
     token_dim: 1024
     torch_dtype: bfloat16
-    attn_implementation: flash_attention_2  # 使用 flash_attention_2
+    attn_implementation: sdpa
     max_video_frames: -1       # -1 表示不限制帧数，使用全部历史帧
     
-    # Sequence Packing 配置（基于 Qwen3-VL 官方 fine-tuning 框架）
-    # 符合官方实现：tokenization 在 Dataset.__getitem__() 中完成
-    # 可以利用 num_workers 并行预处理
-    enable_packing: true       # 启用 sequence packing（官方实现）
-    max_seq_length: 8192       # 打包后的最大序列长度
-    spatial_merge_size: 2      # 视觉空间合并大小
+    # Sequence Packing (disabled for Qwen3.5 hybrid attention)
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
 
   # 热力图头配置 (只训练 history head)
   heatmap_head:
@@ -174,7 +172,7 @@ training:
         - progress_head            # 新的进度预测头
         - llm_projector
       frozen_modules:
-        - qwen3_vl
+        - qwen3_5
         - future_heatmap_head
         - action_head              # Legacy action head（如果存在）
         - stop_head                # Legacy stop head

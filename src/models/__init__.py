@@ -2,28 +2,26 @@
 VLN Models Module
 =================
 
-This module provides a VLN pipeline that uses Qwen3-VL for video understanding.
+This module provides a VLN pipeline that uses Qwen3.5 for video understanding.
 
 Architecture:
 ```
 Video Frames + Instruction
-        ↓
-    Qwen3-VL (Vision Encoder + LLM)
-        ↓
-    Hidden States Projection (2048 → 1024)
-        ↓
+        |
+    Qwen3.5 (Vision Encoder + LLM)
+        |
+    Hidden States Projection (4096 -> 1024)
+        |
     Output Heads:
-        - History Heatmap (Diffusion)
-        - Future Heatmap (Diffusion)
-        - Action Head (Diffusion Policy)
-        - Stop Head (Binary Classifier)
+        - History Heatmap (Spatial-Semantic Fusion)
+        - Action Head
 ```
 """
 
-# === Qwen3-VL Integration ===
-from .qwen3_vl import (
-    Qwen3VLIntegration,
-    Qwen3VLConfig,
+# === Qwen3.5 Integration ===
+from .qwen3_5 import (
+    Qwen3_5Integration,
+    Qwen3_5Config,
 )
 
 # === VLN Pipeline ===
@@ -55,9 +53,9 @@ except ImportError:
 
 
 __all__ = [
-    # Qwen3-VL Integration
-    'Qwen3VLIntegration',
-    'Qwen3VLConfig',
+    # Qwen3.5 Integration
+    'Qwen3_5Integration',
+    'Qwen3_5Config',
     
     # VLN Pipeline
     'VLNPipeline',

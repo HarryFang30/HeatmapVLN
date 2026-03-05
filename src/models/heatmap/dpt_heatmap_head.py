@@ -35,7 +35,7 @@ class DPTHeatmapConfig:
     # ViT side
     vit_dim: int = 1152          # ViT hidden size (pre-merge)
     num_vit_layers: int = 4      # number of hooked ViT blocks
-    spatial_merge_size: int = 2  # Qwen3-VL merge factor
+    spatial_merge_size: int = 2  # Qwen3.5 merge factor
 
     # Shared
     proj_dim: int = 256          # projection / channel dimension
@@ -152,7 +152,7 @@ class DPTHeatmapHead(nn.Module):
 
         logits = self._decode(vit_features, llm_tokens)
 
-        # Qwen3-VL processor may resize images dynamically, so the actual
+        # Qwen processor may resize images dynamically, so the actual
         # spatial resolution from ViT hooks can differ from config.
         # Always resize logits to the target heatmap_size for consistency.
         Hm, Wm = self.heatmap_size
@@ -284,20 +284,31 @@ class DPTHeatmapHead(nn.Module):
         logits: torch.Tensor,
         gt_heatmap: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        B = logits.shape[0]
         Hm, Wm = self.heatmap_size
 
+        if logits.dim() == 4:
+            logits = logits.squeeze(1)
+        if logits.shape[-2:] != (Hm, Wm):
+            logits = F.interpolate(
+                logits.unsqueeze(1).float(), size=(Hm, Wm),
+                mode='bilinear', align_corners=False,
+            ).squeeze(1)
+
+        B = logits.shape[0]
+
         gt = gt_heatmap
-        if gt.dim() == 4:
+        if gt.dim() == 4 and gt.shape[1] > 1:
+            gt = gt.amax(dim=1)
+        elif gt.dim() == 4:
             gt = gt.squeeze(1)
         if gt.shape[-2:] != (Hm, Wm):
             gt = F.interpolate(
-                gt.unsqueeze(1), size=(Hm, Wm),
+                gt.unsqueeze(1).float(), size=(Hm, Wm),
                 mode='bilinear', align_corners=False,
             ).squeeze(1)
 
         # ---- KL divergence ----
-        log_q = F.log_softmax(logits.view(B, -1), dim=-1)
+        log_q = F.log_softmax(logits.reshape(B, -1), dim=-1)
         target = self._normalize_gt(gt)
         kl_loss = F.kl_div(log_q, target, reduction="batchmean")
 

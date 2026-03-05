@@ -3,7 +3,7 @@
 VLN Pipeline 推理脚本
 ======================
 
-使用 Qwen3-VL 进行视觉语言导航推理。
+使用 Qwen3.5 进行视觉语言导航推理。
 
 支持：
 - 历史热力图生成 (History Heatmap)
@@ -161,8 +161,8 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     action_cfg = model_cfg.get('action_head', {})
     
     config = VLNPipelineConfig(
-        # Qwen3-VL
-        llm_model_path=llm_cfg.get('model_path', './models/qwen_3_vl'),
+        # Qwen3.5
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),

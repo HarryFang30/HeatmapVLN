@@ -1,22 +1,20 @@
 """
-VLN Pipeline with Qwen3-VL
+VLN Pipeline with Qwen3.5
 ==========================
 
-This module provides a VLN pipeline that uses Qwen3-VL directly
+This module provides a VLN pipeline that uses Qwen3.5 directly
 for video understanding.
 
 Architecture:
     Input: history_frames + current_frame + instruction
-        ↓
-    Qwen3-VL (Vision Encoder + LLM)
-        ↓
-    Hidden States Projection (2048 → 1024)
-        ↓
+        |
+    Qwen3.5 (Vision Encoder + LLM)
+        |
+    Hidden States Projection (4096 -> 1024)
+        |
     Output Heads:
-        - History Heatmap Head (Diffusion)
-        - Future Heatmap Head (Diffusion)
-        - Action Head (Diffusion Policy)
-        - Stop Head (Binary Classifier)
+        - History Heatmap Head (Spatial-Semantic Fusion)
+        - Action Head (Transformer)
 """
 
 import torch
@@ -25,7 +23,7 @@ from typing import Dict, Optional, Tuple, Any, List
 import logging
 from dataclasses import dataclass
 
-from .qwen3_vl import Qwen3VLIntegration, Qwen3VLConfig
+from .qwen3_5 import Qwen3_5Integration, Qwen3_5Config
 from .action import (
     DiffusionActionHead, 
     DiffusionActionConfig, 
@@ -44,15 +42,15 @@ logger = logging.getLogger(__name__)
 class VLNPipelineConfig:
     """Configuration for VLN pipeline."""
     
-    # Qwen3-VL configuration
-    llm_model_path: str = "./models/qwen_3_vl"
-    llm_hidden_dim: int = 4096  # Qwen3-VL 7B hidden size
+    # Qwen3.5 configuration
+    llm_model_path: str = "./models/qwen_3.5"
+    llm_hidden_dim: int = 4096  # Qwen3.5 7B hidden size
     llm_token_dim: int = 1024   # Projected dimension for output heads
     llm_torch_dtype: str = "bfloat16"
     llm_attn_implementation: str = "sdpa"  # sdpa works without flash_attn
     max_video_frames: int = 16
     
-    # Sequence Packing configuration (based on official Qwen3-VL fine-tuning)
+    # Sequence Packing configuration (disabled for Qwen3.5)
     enable_packing: bool = False   # Whether to use sequence packing
     max_seq_length: int = 4096     # Maximum packed sequence length
     spatial_merge_size: int = 2    # Vision spatial merge size for position IDs
@@ -133,11 +131,11 @@ class VLNPipelineConfig:
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
     multi_layer_features: bool = False
-    feature_layer_indices: Optional[List[int]] = None  # e.g. [4, 18, 32]
+    feature_layer_indices: Optional[List[int]] = None  # e.g. [3, 11, 19, 27] for 32-layer LLM
     feature_fusion_method: str = "weighted_sum"  # "weighted_sum" or "concat_project"
     
-    # LoRA configuration for Qwen3-VL fine-tuning
-    use_lora: bool = False           # Enable LoRA on Qwen3-VL
+    # LoRA configuration for Qwen3.5 fine-tuning
+    use_lora: bool = False           # Enable LoRA on Qwen3.5
     lora_rank: int = 16              # LoRA rank
     lora_alpha: int = 32             # LoRA alpha (typically 2x rank)
     lora_num_layers: int = 4         # Number of last LLM layers to apply LoRA
@@ -252,9 +250,9 @@ class MultiLayerFusion(nn.Module):
 
 class VLNPipeline(nn.Module):
     """
-    VLN Pipeline with Qwen3-VL.
+    VLN Pipeline with Qwen3.5.
     
-    This pipeline uses Qwen3-VL for video understanding,
+    This pipeline uses Qwen3.5 for video understanding,
     extracting hidden states for downstream prediction heads.
     """
     
@@ -264,11 +262,11 @@ class VLNPipeline(nn.Module):
         self.device = torch.device(config.device)
         
         logger.info("=" * 60)
-        logger.info("Initializing VLN Pipeline with Qwen3-VL")
+        logger.info("Initializing VLN Pipeline with Qwen3.5")
         logger.info("=" * 60)
         
-        # ==================== Qwen3-VL Integration ====================
-        qwen_config = Qwen3VLConfig(
+        # ==================== Qwen3.5 Integration ====================
+        qwen_config = Qwen3_5Config(
             model_path=config.llm_model_path,
             device=config.device,
             torch_dtype=config.llm_torch_dtype,
@@ -291,11 +289,8 @@ class VLNPipeline(nn.Module):
             # ViT pre-merge feature hooks for spatial-semantic fusion
             vit_hook_layers=config.dpt_vit_hook_layers if config.heatmap_head_type == "dpt" else None,
         )
-        self.qwen3_vl = Qwen3VLIntegration(qwen_config)
-        if config.enable_packing:
-            logger.info(f"✓ Qwen3-VL integration initialized (packing enabled, max_seq={config.max_seq_length})")
-        else:
-            logger.info(f"✓ Qwen3-VL integration initialized")
+        self.qwen3_5 = Qwen3_5Integration(qwen_config)
+        logger.info(f"Qwen3.5 integration initialized")
         if config.multi_layer_features and config.feature_layer_indices:
             logger.info(f"  Multi-layer features: layers {config.feature_layer_indices}, fusion={config.feature_fusion_method}")
         
@@ -555,8 +550,8 @@ class VLNPipeline(nn.Module):
         if self.config.verbose:
             logger.info(f"Processing: {num_frames} frames, batch_size={batch_size}")
         
-        # ==================== Step 1: Qwen3-VL Processing ====================
-        qwen_output = self.qwen3_vl(
+        # ==================== Step 1: Qwen3.5 Processing ====================
+        qwen_output = self.qwen3_5(
             history_frames=history_frames,
             current_frame=current_observation,
             instruction=instruction_text,
@@ -570,7 +565,7 @@ class VLNPipeline(nn.Module):
             raw_hidden_states = qwen_output.get('hidden_states')
         
         if raw_hidden_states is None:
-            raise RuntimeError("Failed to extract hidden states from Qwen3-VL")
+            raise RuntimeError("Failed to extract hidden states from Qwen3.5")
         
         # ViT pre-merge features for spatial-semantic fusion head
         vit_pre_merge = qwen_output.get('vit_pre_merge_features')
@@ -769,8 +764,7 @@ class VLNPipeline(nn.Module):
         """
         Forward pass with packed batch (Sequence Packing mode).
         
-        基于 Qwen3-VL 官方 fine-tuning 框架的 Sequence Packing 实现。
-        所有样本被打包成一个长序列，使用 flash_attn_varlen_func 处理。
+        Note: Packing is disabled for Qwen3.5 due to hybrid attention.
         
         Args:
             packed_batch: Dict from PackingCollatorForVLN, containing:
@@ -795,8 +789,8 @@ class VLNPipeline(nn.Module):
             total_seq_len = packed_batch["input_ids"].shape[1]
             logger.info(f"[PACKED] Processing {batch_size} samples, total_seq_len={total_seq_len}")
         
-        # ==================== Step 1: Qwen3-VL Processing (Packed) ====================
-        qwen_output = self.qwen3_vl.forward_packed(
+        # ==================== Step 1: Qwen3.5 Processing (Packed) ====================
+        qwen_output = self.qwen3_5.forward_packed(
             packed_batch=packed_batch,
             return_hidden_states=True,
         )
@@ -806,7 +800,7 @@ class VLNPipeline(nn.Module):
         vision_hidden_states = qwen_output.get('vision_hidden_states')
         
         if raw_hidden_states is None:
-            raise RuntimeError("Failed to extract hidden states from Qwen3-VL (packed mode)")
+            raise RuntimeError("Failed to extract hidden states from Qwen3.5 (packed mode)")
         
         # ViT pre-merge features for spatial-semantic fusion head
         vit_pre_merge = qwen_output.get('vit_pre_merge_features')
@@ -1091,7 +1085,7 @@ class VLNPipeline(nn.Module):
 
 
 def create_vln_pipeline(
-    llm_model_path: str = "./models/qwen_3_vl",
+    llm_model_path: str = "./models/qwen_3.5",
     heatmap_size: Tuple[int, int] = (64, 64),
     device: str = "cuda",
     verbose: bool = True,

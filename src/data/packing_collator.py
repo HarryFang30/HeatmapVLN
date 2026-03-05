@@ -2,15 +2,9 @@
 Packing Collator for VLN Training
 ==================================
 
-基于 Qwen3-VL 官方 fine-tuning 框架实现的 Packing Collator。
-将多个样本打包成一个长序列，使用 flash_attn_varlen_func 处理。
-
-核心流程：
-1. 接收 batch 的 raw tensors (history_frames, current_frame, ...)
-2. 对每个样本调用 processor 进行 tokenization
-3. 计算 3D RoPE position IDs
-4. 拼接成 packed sequence (1, total_seq_len)
-5. 生成 cumsum_seq_lens 作为 attention_mask
+Note: Packing is disabled for Qwen3.5 due to hybrid attention.
+This module is kept for reference but should use standard batching
+(TokenizedVLNDataset + FlattenedCollatorForVLN) instead.
 """
 
 import torch
@@ -22,9 +16,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Qwen3-VL Special Token IDs
-IMAGE_TOKEN_ID = 151655  # <|image_pad|>
-VIDEO_TOKEN_ID = 151656  # <|video_pad|>
+# Qwen3.5 Special Token IDs
+IMAGE_TOKEN_ID = 248056  # <|image_pad|>
+VIDEO_TOKEN_ID = 248057  # <|video_pad|>
 
 
 def get_rope_index_3(
@@ -34,13 +28,10 @@ def get_rope_index_3(
     video_grid_thw: torch.LongTensor = None,
     attention_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    计算 Qwen3-VL 的 3D RoPE position IDs
-    复制自官方实现
-    """
+    """计算 3D RoPE position IDs"""
     image_token_id = IMAGE_TOKEN_ID
     video_token_id = VIDEO_TOKEN_ID
-    vision_start_token_id = 151652  # <|vision_start|>
+    vision_start_token_id = 248053  # <|vision_start|>
     
     if video_grid_thw is not None:
         video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
@@ -168,9 +159,9 @@ class PackingCollatorForVLN:
     ):
         """
         Args:
-            processor: Qwen3-VL processor (AutoProcessor)
-            spatial_merge_size: 视觉空间合并大小
-            max_seq_length: 最大打包序列长度
+            processor: Qwen3.5 processor (AutoProcessor)
+            spatial_merge_size: vision spatial merge size
+            max_seq_length: max packed sequence length
         """
         self.processor = processor
         self.tokenizer = processor.tokenizer
