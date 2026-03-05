@@ -121,9 +121,14 @@ class VLNPipelineConfig:
     direct_heatmap_focal_gamma: float = 2.0
     direct_heatmap_init_bias: float = -5.0
     
-    # DPT head config (only used when heatmap_head_type == "dpt")
+    # DPT / Spatial-Semantic Fusion head config (heatmap_head_type == "dpt")
     dpt_proj_dim: int = 256
     dpt_features: int = 256
+    dpt_vit_dim: int = 1152
+    dpt_vit_hook_layers: Optional[List[int]] = None   # e.g. [6, 13, 20, 26]
+    dpt_spatial_merge_size: int = 2
+    dpt_n_cross_attn_heads: int = 4
+    dpt_lambda_spatial: float = 0.5
     
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
@@ -283,6 +288,8 @@ class VLNPipeline(nn.Module):
             # Multi-layer feature extraction
             multi_layer_features=config.multi_layer_features,
             feature_layer_indices=config.feature_layer_indices,
+            # ViT pre-merge feature hooks for spatial-semantic fusion
+            vit_hook_layers=config.dpt_vit_hook_layers if config.heatmap_head_type == "dpt" else None,
         )
         self.qwen3_vl = Qwen3VLIntegration(qwen_config)
         if config.enable_packing:
@@ -325,13 +332,13 @@ class VLNPipeline(nn.Module):
         
         def _build_heatmap_head():
             if head_type == "dpt":
-                patch_size = 14
-                spatial_merge = 2
-                effective_patch = patch_size * spatial_merge
+                patch_size = 16
+                merge_s = config.dpt_spatial_merge_size
+                effective_patch = patch_size * merge_s
                 patch_h = config.image_size // effective_patch
                 patch_w = config.image_size // effective_patch
                 num_image_tokens = patch_h * patch_w
-                n_layers = len(config.feature_layer_indices) if config.feature_layer_indices else 4
+                n_vit = len(config.dpt_vit_hook_layers) if config.dpt_vit_hook_layers else 4
                 return DPTHeatmapHead(DPTHeatmapConfig(
                     dim_in=config.llm_hidden_dim,
                     heatmap_size=config.heatmap_size,
@@ -340,7 +347,11 @@ class VLNPipeline(nn.Module):
                     proj_dim=config.dpt_proj_dim,
                     features=config.dpt_features,
                     num_image_tokens=num_image_tokens,
-                    num_layers=n_layers,
+                    vit_dim=config.dpt_vit_dim,
+                    num_vit_layers=n_vit,
+                    spatial_merge_size=merge_s,
+                    n_cross_attn_heads=config.dpt_n_cross_attn_heads,
+                    lambda_spatial=config.dpt_lambda_spatial,
                 )).to(device=heatmap_device, dtype=config.dtype)
             elif head_type == "direct":
                 return DirectHeatmapHead(DirectHeatmapConfig(
@@ -561,11 +572,8 @@ class VLNPipeline(nn.Module):
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states from Qwen3-VL")
         
-        # For DPT: keep per-layer vision tokens before fusion
-        dpt_vision_tokens = None
-        if self.config.heatmap_head_type == "dpt" and isinstance(raw_hidden_states, list):
-            dpt_vision_tokens = [hs.to(device=self.device, dtype=self.config.dtype)
-                                 for hs in raw_hidden_states]
+        # ViT pre-merge features for spatial-semantic fusion head
+        vit_pre_merge = qwen_output.get('vit_pre_merge_features')
         
         # ==================== Step 1.5: Multi-Layer Fusion ====================
         if isinstance(raw_hidden_states, list) and self.multi_layer_fusion is not None:
@@ -597,11 +605,17 @@ class VLNPipeline(nn.Module):
             
             # History Heatmap
             if self.history_heatmap_head is not None:
-                if is_dpt and dpt_vision_tokens is not None:
+                if is_dpt and vit_pre_merge is not None:
+                    # Spatial-Semantic Fusion path
+                    vit_feats = [f.to(device=self.device, dtype=self.config.dtype)
+                                 for f in vit_pre_merge]
+                    llm_vis = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
+
                     if gt_history_heatmap is not None:
                         gt_history_hm = gt_history_heatmap.to(self.device)
                         result = self.history_heatmap_head(
-                            multi_layer_vision_tokens=dpt_vision_tokens,
+                            vit_features=vit_feats,
+                            llm_tokens=llm_vis,
                             gt_heatmap=gt_history_hm,
                             return_loss=True,
                         )
@@ -610,7 +624,8 @@ class VLNPipeline(nn.Module):
                         history_head_result = result
                     else:
                         history_heatmap = self.history_heatmap_head(
-                            multi_layer_vision_tokens=dpt_vision_tokens,
+                            vit_features=vit_feats,
+                            llm_tokens=llm_vis,
                         )
                 else:
                     if gt_history_heatmap is not None:
@@ -793,11 +808,8 @@ class VLNPipeline(nn.Module):
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states from Qwen3-VL (packed mode)")
         
-        # For DPT: save per-layer vision tokens BEFORE fusion destroys them
-        dpt_vision_tokens = None
-        if self.config.heatmap_head_type == "dpt" and isinstance(vision_hidden_states, list):
-            dpt_vision_tokens = [hs.to(device=self.device, dtype=self.config.dtype)
-                                 for hs in vision_hidden_states]
+        # ViT pre-merge features for spatial-semantic fusion head
+        vit_pre_merge = qwen_output.get('vit_pre_merge_features')
         
         # ==================== Step 1.5: Multi-Layer Fusion (packed mode) ====================
         if isinstance(raw_hidden_states, list) and self.multi_layer_fusion is not None:
@@ -863,17 +875,28 @@ class VLNPipeline(nn.Module):
             # History Heatmap
             is_dpt = self.config.heatmap_head_type == "dpt"
             if self.history_heatmap_head is not None:
-                if is_dpt and dpt_vision_tokens is not None:
-                    # DPT path: pass per-layer vision tokens directly
-                    dpt_tokens_for_head = dpt_vision_tokens
+                if is_dpt and vit_pre_merge is not None:
+                    # Spatial-Semantic Fusion path
+                    vit_feats = [f.to(device=self.device, dtype=self.config.dtype)
+                                 for f in vit_pre_merge]
+                    # Use fused vision hidden states as LLM semantic tokens
+                    if vision_hidden_states is not None:
+                        llm_vis = vision_hidden_states.to(
+                            device=self.device, dtype=self.config.dtype)
+                    else:
+                        llm_vis = raw_hidden_states.to(
+                            device=self.device, dtype=self.config.dtype)
+
                     if current_views is not None:
-                        # Multi-view: expand each layer's tokens for all views
-                        expanded = []
-                        for lt in dpt_vision_tokens:
-                            lt_exp = lt.unsqueeze(1).expand(-1, num_views, -1, -1)
-                            lt_exp = lt_exp.reshape(B * num_views, lt.shape[1], lt.shape[2])
-                            expanded.append(lt_exp)
-                        dpt_tokens_for_head = expanded
+                        # Multi-view expansion for both paths
+                        vit_feats = [
+                            f.unsqueeze(1).expand(-1, num_views, -1, -1, -1)
+                             .reshape(B * num_views, *f.shape[1:])
+                            for f in vit_feats
+                        ]
+                        llm_vis = (llm_vis.unsqueeze(1)
+                                   .expand(-1, num_views, -1, -1)
+                                   .reshape(B * num_views, llm_vis.shape[1], llm_vis.shape[2]))
 
                     if gt_history_heatmap is not None:
                         gt_history_hm = gt_history_heatmap.to(self.device)
@@ -881,7 +904,8 @@ class VLNPipeline(nn.Module):
                             gt_history_hm = gt_history_hm.reshape(
                                 B * num_views, *gt_history_hm.shape[2:])
                         result = self.history_heatmap_head(
-                            multi_layer_vision_tokens=dpt_tokens_for_head,
+                            vit_features=vit_feats,
+                            llm_tokens=llm_vis,
                             gt_heatmap=gt_history_hm,
                             return_loss=True,
                         )
@@ -889,7 +913,8 @@ class VLNPipeline(nn.Module):
                         raw_heatmap = result.get('heatmap')
                     else:
                         raw_heatmap = self.history_heatmap_head(
-                            multi_layer_vision_tokens=dpt_tokens_for_head,
+                            vit_features=vit_feats,
+                            llm_tokens=llm_vis,
                         )
                     if raw_heatmap is not None and num_views > 0:
                         history_heatmap = raw_heatmap.reshape(B, num_views, *raw_heatmap.shape[1:])

@@ -100,10 +100,16 @@ model:
     # Head 类型: "dpt" (DPT 直接预测), "diffusion", "direct"
     head_type: dpt
 
-    # DPT 配置 — 从 LLM 中间层 visual tokens 直接解码热力图
+    # Spatial-Semantic Fusion Head 配置 (head_type == "dpt")
+    # ViT pre-merge 特征提供 16x16 空间精度, LLM token 提供语义引导
     dpt:
-      proj_dim: 256       # 每层投影维度
-      features: 256       # 解码器通道数
+      proj_dim: 256               # 投影 / cross-attention 维度
+      features: 256               # 同 proj_dim (兼容旧键名)
+      vit_dim: 1152               # ViT hidden size (Qwen3-VL)
+      vit_hook_layers: [6, 13, 20, 26]  # 要 hook 的 ViT block 索引
+      spatial_merge_size: 2       # Qwen3-VL spatial merge factor
+      n_cross_attn_heads: 4       # cross-attention heads
+      lambda_spatial: 0.5         # soft-argmax peak 位移损失权重
 
     # 以下配置仅在 diffusion/direct 模式下生效，DPT 模式不使用
     cond_dim: 1024

@@ -683,9 +683,14 @@ def build_model(cfg: Dict) -> nn.Module:
         
         # Head type switch: "diffusion", "direct", or "dpt"
         heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
-        # DPT head config
+        # DPT / Spatial-Semantic Fusion head config
         dpt_proj_dim=heatmap_cfg.get('dpt', {}).get('proj_dim', 256),
         dpt_features=heatmap_cfg.get('dpt', {}).get('features', 256),
+        dpt_vit_dim=heatmap_cfg.get('dpt', {}).get('vit_dim', 1152),
+        dpt_vit_hook_layers=heatmap_cfg.get('dpt', {}).get('vit_hook_layers', None),
+        dpt_spatial_merge_size=heatmap_cfg.get('dpt', {}).get('spatial_merge_size', 2),
+        dpt_n_cross_attn_heads=heatmap_cfg.get('dpt', {}).get('n_cross_attn_heads', 4),
+        dpt_lambda_spatial=heatmap_cfg.get('dpt', {}).get('lambda_spatial', 0.5),
         # Direct head specific config
         direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 256),
         direct_heatmap_num_decoder_blocks=heatmap_cfg.get('direct', {}).get('num_decoder_blocks', 3),
@@ -1507,6 +1512,15 @@ def train_one_epoch(
                     if 'history_heatmap_eps_mse_peak' in output and output['history_heatmap_eps_mse_peak'] is not None:
                         tb_writer.add_scalar('diag/eps_mse_peak', output['history_heatmap_eps_mse_peak'], actual_step)
                         tb_writer.add_scalar('diag/eps_mse_bg', output['history_heatmap_eps_mse_bg'], actual_step)
+                    
+                    # Spatial-Semantic Fusion head 诊断指标 (head_type="dpt")
+                    if 'history_heatmap_dpt_kl_loss' in output:
+                        for dkey in ('dpt_kl_loss', 'dpt_spatial_loss',
+                                     'dpt_pred_max', 'dpt_pred_mean',
+                                     'dpt_n_pos', 'dpt_n_neg'):
+                            val = output.get(f'history_heatmap_{dkey}')
+                            if val is not None:
+                                tb_writer.add_scalar(f'diag/{dkey}', val, actual_step)
                     
                     # Direct head 诊断指标（仅 head_type="direct" 时存在）
                     if 'history_heatmap_direct_mse' in output and output['history_heatmap_direct_mse'] is not None:

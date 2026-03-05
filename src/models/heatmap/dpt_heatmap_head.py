@@ -1,17 +1,15 @@
 """
-DPT Heatmap Head (Simplified)
+Spatial-Semantic Fusion Head
 ==============================
 
-Direct heatmap regression from multi-layer LLM visual tokens.
+Heatmap regression via spatial-semantic fusion:
+    - ViT multi-scale pre-merge features (16x16, 1152-dim) provide spatial precision.
+    - LLM fused vision tokens (8x8, 4096-dim) provide instruction-aware semantics.
+    - Cross-attention fuses "where to look" (LLM query) with
+      "precise spatial detail" (ViT key/value).
+    - 2-stage ConvTranspose decoder: 16 -> 32 -> 64.
 
-Architecture:
-    1. Extract current-frame visual tokens from 4 intermediate LLM layers
-    2. Per-layer: LayerNorm -> reshape to 2D (8x8) -> 1x1 Conv projection
-    3. Concat all layers -> fusion conv
-    4. 3-stage ConvTranspose upsampling: 8 -> 16 -> 32 -> 64
-    5. 1x1 conv -> single-channel logits
-    6. Training: KL divergence loss
-    7. Inference: softmax -> probability map
+Loss:  KL divergence  +  lambda * soft-argmax spatial MSE (positive samples only).
 """
 
 import logging
@@ -27,16 +25,34 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DPTHeatmapConfig:
-    """Configuration for DPTHeatmapHead."""
-    dim_in: int = 4096
+    """Configuration for SpatialSemanticFusionHead."""
+    # LLM side
+    dim_in: int = 4096           # LLM hidden size
+    num_image_tokens: int = 64   # post-merge tokens per image (8x8)
+    patch_h: int = 8             # post-merge spatial height
+    patch_w: int = 8             # post-merge spatial width
+
+    # ViT side
+    vit_dim: int = 1152          # ViT hidden size (pre-merge)
+    num_vit_layers: int = 4      # number of hooked ViT blocks
+    spatial_merge_size: int = 2  # Qwen3-VL merge factor
+
+    # Shared
+    proj_dim: int = 256          # projection / channel dimension
+    features: int = 256          # synonym kept for config compat
+    n_cross_attn_heads: int = 4
     heatmap_size: Tuple[int, int] = (64, 64)
-    patch_h: int = 8
-    patch_w: int = 8
-    proj_dim: int = 256
-    features: int = 256
-    num_image_tokens: int = 64
+
+    # Loss
+    lambda_spatial: float = 0.5
+
+    # Legacy (unused, kept so old configs don't crash)
     num_layers: int = 4
 
+
+# ------------------------------------------------------------------
+# Building blocks
+# ------------------------------------------------------------------
 
 class UpsampleBlock(nn.Module):
     """ConvTranspose 2x upsample + Conv3x3 refinement."""
@@ -49,20 +65,21 @@ class UpsampleBlock(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        return x
+        return self.act(self.norm(self.conv(self.up(x))))
 
+
+# ------------------------------------------------------------------
+# Head
+# ------------------------------------------------------------------
 
 class DPTHeatmapHead(nn.Module):
     """
-    Simplified heatmap head: concat multi-layer tokens + ConvTranspose decoder.
+    Spatial-Semantic Fusion Head.
 
-    Replaces the DPT RefineNet pyramid with a straightforward
-    concat-and-upsample architecture. Same forward interface for
-    drop-in replacement in the pipeline.
+    Despite the class name (kept for pipeline compatibility), this is *not*
+    a classic DPT head.  It fuses frozen ViT spatial features with
+    instruction-aware LLM tokens via cross-attention, then decodes to a
+    64x64 heatmap.
     """
 
     def __init__(self, config: DPTHeatmapConfig):
@@ -74,56 +91,76 @@ class DPTHeatmapHead(nn.Module):
         self.num_image_tokens = config.num_image_tokens
         self._training_step_counter = 0
 
-        dim_in = config.dim_in
-        proj_dim = config.proj_dim
-        features = config.features
-        n_layers = config.num_layers
+        proj = config.proj_dim
+        vit_dim = config.vit_dim
+        llm_dim = config.dim_in
+        n_vit = config.num_vit_layers
 
-        # Per-layer: LayerNorm + 1x1 Conv projection
-        self.norms = nn.ModuleList([nn.LayerNorm(dim_in) for _ in range(n_layers)])
-        self.projects = nn.ModuleList([
-            nn.Conv2d(dim_in, proj_dim, kernel_size=1) for _ in range(n_layers)
+        # ---------- ViT multi-scale projection ----------
+        self.vit_norms = nn.ModuleList([nn.LayerNorm(vit_dim) for _ in range(n_vit)])
+        self.vit_projs = nn.ModuleList([
+            nn.Conv2d(vit_dim, proj, kernel_size=1) for _ in range(n_vit)
         ])
-
-        # Fusion: concat all layers -> reduce channels
-        self.fusion = nn.Sequential(
-            nn.Conv2d(proj_dim * n_layers, features, kernel_size=1),
-            nn.BatchNorm2d(features),
+        self.vit_fusion = nn.Sequential(
+            nn.Conv2d(proj * n_vit, proj, kernel_size=1),
+            nn.BatchNorm2d(proj),
             nn.GELU(),
         )
 
-        # Decoder: 3-stage upsample  8 -> 16 -> 32 -> 64
-        self.decoder = nn.Sequential(
-            UpsampleBlock(features, features),
-            UpsampleBlock(features, features // 2),
-            UpsampleBlock(features // 2, features // 4),
-        )
+        # ---------- LLM semantic projection ----------
+        self.llm_norm = nn.LayerNorm(llm_dim)
+        self.llm_proj = nn.Conv2d(llm_dim, proj, kernel_size=1)
 
-        # Output head
-        self.head = nn.Conv2d(features // 4, 1, kernel_size=1)
+        # ---------- Cross-attention ----------
+        self.cross_attn = nn.MultiheadAttention(
+            proj, config.n_cross_attn_heads, batch_first=True,
+        )
+        self.post_attn_norm = nn.LayerNorm(proj)
+
+        # ---------- Decoder: 16 -> 32 -> 64 ----------
+        self.decoder = nn.Sequential(
+            UpsampleBlock(proj, proj // 2),
+            UpsampleBlock(proj // 2, proj // 4),
+        )
+        self.head = nn.Conv2d(proj // 4, 1, kernel_size=1)
 
         total_params = sum(p.numel() for p in self.parameters())
         logger.info(
-            "DPTHeatmapHead(simplified): dim_in=%d, patch=%dx%d, "
-            "proj_dim=%d, features=%d, heatmap=%s, params=%s",
-            dim_in, config.patch_h, config.patch_w,
-            proj_dim, features, config.heatmap_size, f"{total_params:,}",
+            "SpatialSemanticFusionHead: vit_dim=%d, llm_dim=%d, proj=%d, "
+            "n_vit_layers=%d, attn_heads=%d, heatmap=%s, params=%s",
+            vit_dim, llm_dim, proj, n_vit, config.n_cross_attn_heads,
+            config.heatmap_size, f"{total_params:,}",
         )
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def forward(
         self,
-        multi_layer_vision_tokens: List[torch.Tensor],
+        vit_features: Optional[List[torch.Tensor]] = None,
+        llm_tokens: Optional[torch.Tensor] = None,
         gt_heatmap: Optional[torch.Tensor] = None,
         return_loss: bool = False,
-        # Unused args kept for interface compatibility
-        llm_tokens: Optional[torch.Tensor] = None,
+        # Legacy args (ignored)
+        multi_layer_vision_tokens: Optional[List[torch.Tensor]] = None,
         observation: Optional[torch.Tensor] = None,
         skip_inference: bool = False,
         direction_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        logits = self._decode(multi_layer_vision_tokens)
+        logits = self._decode(vit_features, llm_tokens)
+
+        # Qwen3-VL processor may resize images dynamically, so the actual
+        # spatial resolution from ViT hooks can differ from config.
+        # Always resize logits to the target heatmap_size for consistency.
+        Hm, Wm = self.heatmap_size
+        if logits.shape[-2:] != (Hm, Wm):
+            logits = F.interpolate(
+                logits.unsqueeze(1), size=(Hm, Wm),
+                mode='bilinear', align_corners=False,
+            ).squeeze(1)
 
         if gt_heatmap is not None and return_loss:
             return self._compute_loss(logits, gt_heatmap)
@@ -142,24 +179,68 @@ class DPTHeatmapHead(nn.Module):
     # Internals
     # ------------------------------------------------------------------
 
-    def _decode(self, multi_layer_vision_tokens: List[torch.Tensor]) -> torch.Tensor:
-        B = multi_layer_vision_tokens[0].shape[0]
-        ph, pw = self.patch_h, self.patch_w
-        n_img = self.num_image_tokens
+    def _decode(
+        self,
+        vit_features: Optional[List[torch.Tensor]],
+        llm_tokens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            vit_features: ``num_vit_layers`` tensors of ``(B, vit_dim, h_pre, w_pre)``.
+            llm_tokens:   ``(B, N_vision, llm_dim)``  (fused LLM vision tokens).
+        """
+        # ---------- ViT path: project each layer then concat ----------
+        B = vit_features[0].shape[0]
+        h_pre = vit_features[0].shape[2]
+        w_pre = vit_features[0].shape[3]
 
         parts = []
-        for i, layer_tokens in enumerate(multi_layer_vision_tokens):
-            x = layer_tokens[:, -n_img:]              # (B, 64, D)
-            x = self.norms[i](x)
-            x = x.permute(0, 2, 1).reshape(B, -1, ph, pw)  # (B, D, 8, 8)
-            x = self.projects[i](x)                   # (B, proj_dim, 8, 8)
+        for i, feat in enumerate(vit_features):
+            # feat: (B, vit_dim, h_pre, w_pre)
+            x = feat.permute(0, 2, 3, 1)                   # (B, h, w, D)
+            x = self.vit_norms[i](x)
+            x = x.permute(0, 3, 1, 2)                      # (B, D, h, w)
+            x = self.vit_projs[i](x)                        # (B, proj, h, w)
             parts.append(x)
 
-        fused = torch.cat(parts, dim=1)               # (B, 4*proj_dim, 8, 8)
-        fused = self.fusion(fused)                     # (B, features, 8, 8)
-        fused = self.decoder(fused)                    # (B, features//4, 64, 64)
-        logits = self.head(fused).squeeze(1)           # (B, 64, 64)
+        vit_fused = torch.cat(parts, dim=1)                 # (B, n*proj, h, w)
+        vit_fused = self.vit_fusion(vit_fused)              # (B, proj, h, w)
+
+        # Flatten spatial for cross-attention K/V
+        N_vit = h_pre * w_pre
+        kv = vit_fused.flatten(2).permute(0, 2, 1)         # (B, N_vit, proj)
+
+        # ---------- LLM path: project + upsample to ViT resolution ----------
+        # Derive post-merge spatial dims from actual pre-merge resolution
+        merge_s = self.config.spatial_merge_size
+        ph = h_pre // merge_s
+        pw = w_pre // merge_s
+        n_img = ph * pw
+        llm = llm_tokens[:, -n_img:]                        # (B, ph*pw, llm_dim)
+        llm = self.llm_norm(llm)
+        llm_2d = llm.permute(0, 2, 1).reshape(B, -1, ph, pw)  # (B, llm_dim, ph, pw)
+        llm_2d = self.llm_proj(llm_2d)                     # (B, proj, 8, 8)
+        llm_up = F.interpolate(
+            llm_2d, size=(h_pre, w_pre),
+            mode='bilinear', align_corners=False,
+        )                                                    # (B, proj, h_pre, w_pre)
+        q = llm_up.flatten(2).permute(0, 2, 1)             # (B, N_vit, proj)
+
+        # ---------- Cross-attention: Q=LLM, K=V=ViT ----------
+        attn_out, _ = self.cross_attn(q, kv, kv)           # (B, N_vit, proj)
+        fused = self.post_attn_norm(attn_out + q)           # residual + LN
+
+        # Reshape back to 2-D
+        fused = fused.permute(0, 2, 1).reshape(B, -1, h_pre, w_pre)  # (B, proj, h, w)
+
+        # ---------- Decode: 16 -> 32 -> 64 ----------
+        fused = self.decoder(fused)                         # (B, proj//4, 64, 64)
+        logits = self.head(fused).squeeze(1)                # (B, 64, 64)
         return logits
+
+    # ------------------------------------------------------------------
+    # Heatmap / loss utilities
+    # ------------------------------------------------------------------
 
     def _logits_to_heatmap(self, logits: torch.Tensor) -> torch.Tensor:
         B = logits.shape[0]
@@ -168,14 +249,30 @@ class DPTHeatmapHead(nn.Module):
         max_val = probs.flatten(1).max(dim=1).values.clamp(min=1e-8)
         return probs / max_val.view(B, 1, 1)
 
+    @staticmethod
+    def _soft_argmax_2d(logits: torch.Tensor) -> torch.Tensor:
+        """Differentiable peak coordinate extraction.
+
+        Args:
+            logits: ``(B, H, W)`` raw logits *or* normalised heatmap.
+        Returns:
+            ``(B, 2)``  — (y, x) coordinates.
+        """
+        B, H, W = logits.shape
+        probs = F.softmax(logits.reshape(B, -1), dim=-1).view(B, H, W)
+        dev = logits.device
+        y_grid = torch.arange(H, device=dev, dtype=torch.float).view(1, -1, 1)
+        x_grid = torch.arange(W, device=dev, dtype=torch.float).view(1, 1, -1)
+        y = (probs * y_grid).sum(dim=[1, 2])
+        x = (probs * x_grid).sum(dim=[1, 2])
+        return torch.stack([y, x], dim=-1)
+
     def _normalize_gt(self, gt_heatmap: torch.Tensor) -> torch.Tensor:
         B = gt_heatmap.shape[0]
         gt_flat = gt_heatmap.view(B, -1).float()
         gt_sum = gt_flat.sum(dim=1, keepdim=True)
-
         is_negative = (gt_sum < 1e-6)
         uniform = torch.ones_like(gt_flat) / gt_flat.shape[1]
-
         return torch.where(
             is_negative.expand_as(gt_flat),
             uniform,
@@ -199,24 +296,40 @@ class DPTHeatmapHead(nn.Module):
                 mode='bilinear', align_corners=False,
             ).squeeze(1)
 
+        # ---- KL divergence ----
         log_q = F.log_softmax(logits.view(B, -1), dim=-1)
         target = self._normalize_gt(gt)
         kl_loss = F.kl_div(log_q, target, reduction="batchmean")
 
+        # ---- Spatial peak loss (positive samples only) ----
         with torch.no_grad():
-            pred_heatmap = self._logits_to_heatmap(logits)
-
             sample_max = gt.flatten(1).max(dim=1).values
             is_positive = (sample_max > 0.01).float()
             n_pos = is_positive.sum().item()
             n_neg = B - n_pos
 
+        spatial_loss = torch.tensor(0.0, device=logits.device)
+        if n_pos > 0:
+            pred_coords = self._soft_argmax_2d(logits)  # (B, 2) differentiable
+            with torch.no_grad():
+                gt_coords = self._soft_argmax_2d(gt)    # (B, 2)
+            # Normalise to [0, 1] then MSE; mask negatives
+            diff = (pred_coords - gt_coords) / Hm
+            sq_dist = (diff ** 2).sum(dim=-1)            # (B,)
+            spatial_loss = (sq_dist * is_positive).sum() / max(n_pos, 1)
+
+        total_loss = kl_loss + self.config.lambda_spatial * spatial_loss
+
+        with torch.no_grad():
+            pred_heatmap = self._logits_to_heatmap(logits)
+
         self._training_step_counter += 1
 
         return {
-            'loss': kl_loss,
+            'loss': total_loss,
             'heatmap': pred_heatmap.detach(),
             'dpt_kl_loss': kl_loss.item(),
+            'dpt_spatial_loss': spatial_loss.item(),
             'dpt_pred_max': pred_heatmap.max().item(),
             'dpt_pred_mean': pred_heatmap.mean().item(),
             'dpt_n_pos': n_pos,

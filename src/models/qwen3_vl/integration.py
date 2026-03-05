@@ -94,6 +94,9 @@ class Qwen3VLConfig:
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
     
+    # ViT pre-merge feature extraction for spatial-semantic fusion
+    vit_hook_layers: Optional[List[int]] = None  # ViT block indices (e.g. [6, 13, 20, 26])
+    
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
         dtype_map = {
@@ -136,6 +139,11 @@ class Qwen3VLIntegration(nn.Module):
         # Sequence packing state
         self._packing_enabled = config.enable_packing
         self._varlen_attention_replaced = False
+        
+        # ViT pre-merge feature hooks
+        self._vit_hook_indices = config.vit_hook_layers or []
+        self._vit_hook_handles: List = []
+        self._vit_block_features: Dict[int, List[torch.Tensor]] = {}
         
         logger.info(f"Qwen3VLIntegration initialized (model will be loaded on first forward)")
         if self._packing_enabled:
@@ -205,10 +213,109 @@ class Qwen3VLIntegration(nn.Module):
             if self._packing_enabled and self._varlen_attention_replaced:
                 logger.info("Sequence packing with varlen attention is active")
             
+            # Register ViT block hooks for pre-merge spatial features
+            if self._vit_hook_indices:
+                self._register_vit_hooks()
+            
         except Exception as e:
             logger.error(f"Failed to load Qwen3-VL: {e}")
             raise
     
+    # ------------------------------------------------------------------
+    # ViT pre-merge feature hooks
+    # ------------------------------------------------------------------
+
+    def _get_visual_module(self):
+        """Resolve the Qwen3VLVisionModel regardless of LoRA wrapping."""
+        model = self.model
+        # PeftModel wraps in base_model
+        if hasattr(model, 'base_model'):
+            model = model.base_model
+        if hasattr(model, 'model') and hasattr(model.model, 'visual'):
+            return model.model.visual
+        if hasattr(model, 'visual'):
+            return model.visual
+        raise RuntimeError("Cannot locate Qwen3VLVisionModel in model hierarchy")
+
+    def _register_vit_hooks(self):
+        """Register forward hooks on ViT blocks to capture pre-merge features."""
+        visual = self._get_visual_module()
+        num_blocks = len(visual.blocks)
+        for idx in self._vit_hook_indices:
+            if idx >= num_blocks:
+                logger.warning(
+                    f"ViT hook block {idx} out of range (max {num_blocks - 1}), skipping"
+                )
+                continue
+
+            def _make_hook(layer_idx: int):
+                def _hook(module, _input, output):
+                    self._vit_block_features[layer_idx].append(output.detach())
+                return _hook
+
+            handle = visual.blocks[idx].register_forward_hook(_make_hook(idx))
+            self._vit_hook_handles.append(handle)
+        logger.info(f"Registered ViT pre-merge hooks on blocks {self._vit_hook_indices}")
+
+    def _clear_vit_hooks(self):
+        """Reset captured features before each forward pass."""
+        self._vit_block_features = {idx: [] for idx in self._vit_hook_indices}
+
+    def _extract_image_vit_features(
+        self,
+        image_grid_thw: Optional[torch.Tensor],
+    ) -> Optional[List[torch.Tensor]]:
+        """
+        Extract per-image pre-merge ViT features from hook captures,
+        un-shuffle the pixel-shuffle ordering, and reshape to 2-D feature maps.
+
+        Returns:
+            List of ``len(vit_hook_indices)`` tensors, each
+            ``(num_images, vit_dim, h_pre, w_pre)``, or *None*.
+        """
+        if not self._vit_hook_indices or image_grid_thw is None:
+            return None
+
+        merge_s = self.config.spatial_merge_size
+        num_images = image_grid_thw.shape[0]
+
+        # Per-image pre-merge patch counts
+        per_image_sizes = (
+            image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+        ).tolist()
+
+        result_layers: List[torch.Tensor] = []
+        for idx in self._vit_hook_indices:
+            captures = self._vit_block_features.get(idx, [])
+            if not captures:
+                return None
+            # First capture = images (get_image_features is called before get_video_features)
+            features = captures[0]  # (total_image_patches, vit_dim)
+
+            per_image = torch.split(features, [int(s) for s in per_image_sizes])
+            images_2d = []
+            for img_i in range(num_images):
+                patches = per_image[img_i]  # (t*h*w, dim)
+                t_val, h_val, w_val = (int(v) for v in image_grid_thw[img_i].tolist())
+                dim = patches.shape[-1]
+                h_m = h_val // merge_s
+                w_m = w_val // merge_s
+                # Un-shuffle: (h_m, w_m, merge, merge, dim) → (h_pre, w_pre, dim)
+                patches = patches.view(t_val, h_m, w_m, merge_s, merge_s, dim)
+                patches = patches.permute(0, 1, 3, 2, 4, 5).contiguous()
+                patches = patches.view(t_val, h_m * merge_s, w_m * merge_s, dim)
+                patches = patches.squeeze(0)          # (h_pre, w_pre, dim)
+                patches = patches.permute(2, 0, 1)    # (dim, h_pre, w_pre)
+                images_2d.append(patches)
+
+            result_layers.append(torch.stack(images_2d, dim=0))
+
+        return result_layers  # List[(num_images, vit_dim, h_pre, w_pre)]
+
+    # ------------------------------------------------------------------
+    # LoRA
+    # ------------------------------------------------------------------
+
     def _apply_lora(self):
         """
         Apply LoRA adapters to the last N layers of Qwen3-VL's language model.
@@ -385,6 +492,10 @@ class Qwen3VLIntegration(nn.Module):
         if "video_grid_thw" in packed_batch and packed_batch["video_grid_thw"] is not None:
             model_inputs["video_grid_thw"] = packed_batch["video_grid_thw"].to(self.device)
         
+        # Clear ViT hook captures before forward
+        if self._vit_hook_indices:
+            self._clear_vit_hooks()
+        
         # Forward pass
         # 注意：不能使用 torch.no_grad()！
         # 虽然 Qwen3-VL 参数被冻结 (requires_grad=False)，但需要保留计算图
@@ -394,6 +505,16 @@ class Qwen3VLIntegration(nn.Module):
             output_hidden_states=return_hidden_states,
             return_dict=True,
         )
+        
+        # Extract pre-merge ViT features from hooks
+        vit_pre_merge = None
+        if self._vit_hook_indices:
+            image_grid_thw = packed_batch.get("image_grid_thw")
+            if image_grid_thw is not None:
+                if not isinstance(image_grid_thw, torch.Tensor):
+                    image_grid_thw = torch.tensor(image_grid_thw)
+                image_grid_thw = image_grid_thw.to(self.device)
+            vit_pre_merge = self._extract_image_vit_features(image_grid_thw)
         
         if return_hidden_states:
             if self.config.multi_layer_features and self.config.feature_layer_indices:
@@ -448,6 +569,7 @@ class Qwen3VLIntegration(nn.Module):
             "packed_hidden_states": packed_hidden_states,  # original packed output
             "seq_lens": seq_lens,
             "num_samples": num_samples,
+            "vit_pre_merge_features": vit_pre_merge,
         }
     
     def get_data_collator(self) -> "FlattenedDataCollatorForVLN":
@@ -635,11 +757,22 @@ class Qwen3VLIntegration(nn.Module):
         image_mask = input_ids == self.image_token_id
         num_image_tokens = int(image_mask.sum(dim=1).max().item())
         
+        # Clear ViT hook captures before forward
+        if self._vit_hook_indices:
+            self._clear_vit_hooks()
+        
         outputs = self.model(
             **inputs,
             output_hidden_states=return_hidden_states,
             return_dict=True,
         )
+        
+        # Extract pre-merge ViT features from hooks
+        vit_pre_merge = None
+        if self._vit_hook_indices:
+            vit_pre_merge = self._extract_image_vit_features(
+                inputs.get("image_grid_thw")
+            )
         
         if return_hidden_states:
             if self.config.multi_layer_features and self.config.feature_layer_indices:
@@ -671,7 +804,7 @@ class Qwen3VLIntegration(nn.Module):
                     hidden_states, input_ids
                 )
         
-        return hidden_states, vision_hidden_states, num_image_tokens
+        return hidden_states, vision_hidden_states, num_image_tokens, vit_pre_merge
     
     def _forward_single(
         self,
@@ -710,11 +843,20 @@ class Qwen3VLIntegration(nn.Module):
         image_mask = input_ids == self.image_token_id
         num_image_tokens = int(image_mask.sum().item())
         
+        if self._vit_hook_indices:
+            self._clear_vit_hooks()
+        
         outputs = self.model(
             **inputs,
             output_hidden_states=return_hidden_states,
             return_dict=True,
         )
+        
+        vit_pre_merge = None
+        if self._vit_hook_indices:
+            vit_pre_merge = self._extract_image_vit_features(
+                inputs.get("image_grid_thw")
+            )
         
         if return_hidden_states:
             if self.config.multi_layer_features and self.config.feature_layer_indices:
@@ -745,7 +887,7 @@ class Qwen3VLIntegration(nn.Module):
                     hidden_states, input_ids
                 )
         
-        return hidden_states, vision_hidden_states, num_image_tokens
+        return hidden_states, vision_hidden_states, num_image_tokens, vit_pre_merge
     
     def forward(
         self,
@@ -781,11 +923,10 @@ class Qwen3VLIntegration(nn.Module):
         batch_size = history_frames.shape[0]
         
         # Use batch forward for efficiency
-        hidden_states, vision_hidden_states, num_image_tokens = self._forward_batch(
-            history_frames,
-            current_frame,
-            instruction,
-            return_hidden_states,
+        hidden_states, vision_hidden_states, num_image_tokens, vit_pre_merge = (
+            self._forward_batch(
+                history_frames, current_frame, instruction, return_hidden_states,
+            )
         )
         
         # Generate text only for first sample (if requested)
@@ -808,6 +949,7 @@ class Qwen3VLIntegration(nn.Module):
             "vision_hidden_states": vision_hidden_states,
             "generated_text": generated_text,
             "num_image_tokens": num_image_tokens,
+            "vit_pre_merge_features": vit_pre_merge,
         }
     
     def _generate_text_single(
