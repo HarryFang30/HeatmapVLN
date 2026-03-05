@@ -596,7 +596,7 @@ class Qwen3VLIntegration(nn.Module):
         current_frame: torch.Tensor,
         instruction: Optional[Union[str, List[str]]] = None,
         return_hidden_states: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
         """
         Batch forward pass through Qwen3-VL.
         
@@ -609,7 +609,7 @@ class Qwen3VLIntegration(nn.Module):
             return_hidden_states: Whether to return hidden states
             
         Returns:
-            Tuple of (hidden_states, vision_hidden_states)
+            Tuple of (hidden_states, vision_hidden_states, num_image_tokens)
         """
         batch_size = history_frames.shape[0]
         
@@ -625,15 +625,16 @@ class Qwen3VLIntegration(nn.Module):
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            padding=True,  # 关键：启用 padding 用于批量处理
+            padding=True,
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
         input_ids = inputs["input_ids"]  # (B, seq_len)
         
-        # Batch forward pass
-        # 注意：不能使用 torch.no_grad()！
-        # 虽然 Qwen3-VL 参数被冻结，但需要保留计算图以便梯度回传到下游模块
+        # Count image-only tokens (current frame, not video history)
+        image_mask = input_ids == self.image_token_id
+        num_image_tokens = int(image_mask.sum(dim=1).max().item())
+        
         outputs = self.model(
             **inputs,
             output_hidden_states=return_hidden_states,
@@ -642,7 +643,6 @@ class Qwen3VLIntegration(nn.Module):
         
         if return_hidden_states:
             if self.config.multi_layer_features and self.config.feature_layer_indices:
-                # Multi-layer extraction: return list of hidden states from specified layers
                 multi_hidden = []
                 for li in self.config.feature_layer_indices:
                     idx = li if li >= 0 else len(outputs.hidden_states) + li
@@ -661,7 +661,6 @@ class Qwen3VLIntegration(nn.Module):
         vision_hidden_states = None
         if hidden_states is not None:
             if isinstance(hidden_states, list):
-                # Multi-layer: extract vision tokens from each layer
                 vision_hidden_list = []
                 for hs in hidden_states:
                     vis_hs = self._extract_vision_hidden_states(hs, input_ids)
@@ -672,7 +671,7 @@ class Qwen3VLIntegration(nn.Module):
                     hidden_states, input_ids
                 )
         
-        return hidden_states, vision_hidden_states
+        return hidden_states, vision_hidden_states, num_image_tokens
     
     def _forward_single(
         self,
@@ -680,7 +679,7 @@ class Qwen3VLIntegration(nn.Module):
         current_frame: torch.Tensor,
         instruction: Optional[str] = None,
         return_hidden_states: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
         """
         Forward pass for a single sample.
         
@@ -691,14 +690,12 @@ class Qwen3VLIntegration(nn.Module):
             return_hidden_states: Whether to return hidden states
             
         Returns:
-            Tuple of (hidden_states, vision_hidden_states)
+            Tuple of (hidden_states, vision_hidden_states, num_image_tokens)
         """
-        # Prepare messages for single sample
         messages, _, _ = self._prepare_messages_single(
             history_frames, current_frame, instruction
         )
         
-        # Apply chat template and get inputs
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -710,8 +707,9 @@ class Qwen3VLIntegration(nn.Module):
         
         input_ids = inputs["input_ids"]
         
-        # Forward pass
-        # 注意：不能使用 torch.no_grad()！需要保留计算图以便梯度回传
+        image_mask = input_ids == self.image_token_id
+        num_image_tokens = int(image_mask.sum().item())
+        
         outputs = self.model(
             **inputs,
             output_hidden_states=return_hidden_states,
@@ -734,7 +732,6 @@ class Qwen3VLIntegration(nn.Module):
         else:
             hidden_states = None
         
-        # Extract vision token hidden states
         vision_hidden_states = None
         if hidden_states is not None:
             if isinstance(hidden_states, list):
@@ -748,7 +745,7 @@ class Qwen3VLIntegration(nn.Module):
                     hidden_states, input_ids
                 )
         
-        return hidden_states, vision_hidden_states
+        return hidden_states, vision_hidden_states, num_image_tokens
     
     def forward(
         self,
@@ -784,7 +781,7 @@ class Qwen3VLIntegration(nn.Module):
         batch_size = history_frames.shape[0]
         
         # Use batch forward for efficiency
-        hidden_states, vision_hidden_states = self._forward_batch(
+        hidden_states, vision_hidden_states, num_image_tokens = self._forward_batch(
             history_frames,
             current_frame,
             instruction,
@@ -810,6 +807,7 @@ class Qwen3VLIntegration(nn.Module):
             "hidden_states": hidden_states,
             "vision_hidden_states": vision_hidden_states,
             "generated_text": generated_text,
+            "num_image_tokens": num_image_tokens,
         }
     
     def _generate_text_single(

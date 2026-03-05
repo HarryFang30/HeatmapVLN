@@ -356,11 +356,11 @@ class ResNetImageConditionEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.projection = nn.Sequential(
             nn.Linear(512, out_dim),
-            nn.Dropout(dropout),
+            nn.Dropout(0.0),
             nn.LayerNorm(out_dim),
             nn.GELU(),
             nn.Linear(out_dim, out_dim),
-            nn.Dropout(dropout),
+            nn.Dropout(min(dropout, 0.1)),
         )
         
         total = sum(p.numel() for p in self.parameters())
@@ -458,14 +458,13 @@ class LLMConditionProjector(nn.Module):
         else:
             self.attention_pool = None
 
-        # Added Dropout for regularization to prevent overfitting
         self.projector = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.Dropout(dropout),
+            nn.Dropout(min(dropout, 0.1)),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim),
-            nn.Dropout(dropout),
+            nn.Dropout(0.0),
             nn.LayerNorm(output_dim),
         )
     
@@ -574,7 +573,7 @@ class MultiModalConditionEncoder(nn.Module):
             # Fusion MLP for LLM + Image features
             self.fusion = nn.Sequential(
                 nn.Linear(cond_dim * 2, cond_dim),
-                nn.Dropout(dropout),
+                nn.Dropout(0.0),
                 nn.LayerNorm(cond_dim),
                 nn.GELU(),
                 nn.Linear(cond_dim, cond_dim),
@@ -584,7 +583,7 @@ class MultiModalConditionEncoder(nn.Module):
             self.image_encoder = None
             self.fusion = nn.Sequential(
                 nn.Linear(cond_dim, cond_dim),
-                nn.Dropout(dropout),
+                nn.Dropout(0.0),
                 nn.LayerNorm(cond_dim),
                 nn.GELU(),
                 nn.Linear(cond_dim, cond_dim),
@@ -596,7 +595,7 @@ class MultiModalConditionEncoder(nn.Module):
                 nn.LayerNorm(llm_dim),
                 nn.Linear(llm_dim, cond_dim),
                 nn.GELU(),
-                nn.Dropout(dropout),
+                nn.Dropout(0.0),
                 nn.Linear(cond_dim, cond_dim),
                 nn.LayerNorm(cond_dim),
             )

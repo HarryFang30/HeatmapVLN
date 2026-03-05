@@ -128,6 +128,8 @@ class DiffusionHeatmapHead(nn.Module):
             seq_cross_attn_head_dim=config.seq_cross_attn_head_dim,
             # Spatial feature injection from CNN encoder
             spatial_injection_channels=spatial_injection_channels,
+            # Cross-attention at extra levels (e.g. Level 0 for fine-grained spatial guidance)
+            cross_attention_levels=config.cross_attention_levels,
         )
         
         # ==================== Direction Embedding ====================

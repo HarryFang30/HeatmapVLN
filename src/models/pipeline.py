@@ -35,6 +35,7 @@ from .action import (
 )
 from .heatmap import DiffusionHeatmapHead, DiffusionHeatmapConfig
 from .heatmap import DirectHeatmapHead, DirectHeatmapConfig
+from .heatmap import DPTHeatmapHead, DPTHeatmapConfig
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,8 @@ class VLNPipelineConfig:
     # Heatmap UNet architecture (controls model capacity)
     heatmap_block_out_channels: Tuple[int, ...] = (64, 128, 256)  # UNet channel dims per level
     heatmap_layers_per_block: int = 2  # ResBlocks per level
-    heatmap_attention_levels: Tuple[int, ...] = (2,)  # Which levels have attention
+    heatmap_attention_levels: Tuple[int, ...] = (2,)  # Which levels have self-attention
+    heatmap_cross_attention_levels: Tuple[int, ...] = None  # Cross-attention levels (None = follow attention_levels)
     heatmap_num_train_timesteps: int = 100  # Diffusion training steps
     heatmap_cfg_drop_prob: float = 0.1  # CFG: drop condition probability during training
     heatmap_cfg_scale: float = 3.0  # CFG: guidance scale during inference
@@ -106,7 +108,7 @@ class VLNPipelineConfig:
     # Spatial importance weighting
     heatmap_peak_spatial_weight: float = 10.0    # 峰值区域空间加权倍数
     
-    # Head type switch: "diffusion" or "direct"
+    # Head type switch: "diffusion", "direct", or "dpt"
     heatmap_head_type: str = "diffusion"
     
     # Direct head specific config (only used when heatmap_head_type == "direct")
@@ -118,6 +120,10 @@ class VLNPipelineConfig:
     direct_heatmap_lambda_peak: float = 1.0
     direct_heatmap_focal_gamma: float = 2.0
     direct_heatmap_init_bias: float = -5.0
+    
+    # DPT head config (only used when heatmap_head_type == "dpt")
+    dpt_out_channels: Optional[List[int]] = None  # default: [256, 512, 1024, 1024]
+    dpt_features: int = 256
     
     # Multi-layer feature extraction (CVPR 2025 best practice)
     # 从 LLM 不同深度提取特征并融合，同时保留空间和语义信息
@@ -305,10 +311,10 @@ class VLNPipeline(nn.Module):
             nn.LayerNorm(config.llm_hidden_dim),
             nn.Linear(config.llm_hidden_dim, config.llm_token_dim),
             nn.GELU(),
-            nn.Dropout(0.2),  # 增加dropout防止过拟合
+            nn.Dropout(0.1),
             nn.Linear(config.llm_token_dim, config.llm_token_dim),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.0),
             nn.LayerNorm(config.llm_token_dim),
         ).to(device=self.device, dtype=config.dtype)
         logger.info(f"✓ LLM projector: {config.llm_hidden_dim} → {config.llm_token_dim}")
@@ -318,7 +324,25 @@ class VLNPipeline(nn.Module):
         head_type = config.heatmap_head_type
         
         def _build_heatmap_head():
-            if head_type == "direct":
+            if head_type == "dpt":
+                # Compute patch dimensions from image_size
+                patch_size = 14
+                spatial_merge = 2
+                effective_patch = patch_size * spatial_merge
+                patch_h = config.image_size // effective_patch
+                patch_w = config.image_size // effective_patch
+                num_image_tokens = patch_h * patch_w
+                dpt_oc = config.dpt_out_channels or [256, 512, 1024, 1024]
+                return DPTHeatmapHead(DPTHeatmapConfig(
+                    dim_in=config.llm_hidden_dim,
+                    heatmap_size=config.heatmap_size,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                    out_channels=dpt_oc,
+                    features=config.dpt_features,
+                    num_image_tokens=num_image_tokens,
+                )).to(device=heatmap_device, dtype=config.dtype)
+            elif head_type == "direct":
                 return DirectHeatmapHead(DirectHeatmapConfig(
                     llm_dim=config.llm_token_dim,
                     cond_dim=config.diffusion_heatmap_cond_dim,
@@ -332,7 +356,6 @@ class VLNPipeline(nn.Module):
                     seq_cross_attn_heads=config.heatmap_seq_cross_attn_heads,
                     seq_cross_attn_head_dim=config.heatmap_seq_cross_attn_head_dim,
                     image_encoder_use_pretrained=config.heatmap_image_encoder_use_pretrained,
-                    # Direct head specific
                     hidden_dim=config.direct_heatmap_hidden_dim,
                     num_decoder_blocks=config.direct_heatmap_num_decoder_blocks,
                     decoder_num_heads=config.direct_heatmap_decoder_num_heads,
@@ -341,7 +364,6 @@ class VLNPipeline(nn.Module):
                     lambda_peak=config.direct_heatmap_lambda_peak,
                     focal_gamma=config.direct_heatmap_focal_gamma,
                     init_bias=config.direct_heatmap_init_bias,
-                    # Shared loss config
                     peak_spatial_weight=config.heatmap_peak_spatial_weight,
                     negative_sample_weight=config.heatmap_negative_sample_weight,
                     positive_sample_boost=config.heatmap_positive_sample_boost,
@@ -361,6 +383,7 @@ class VLNPipeline(nn.Module):
                     block_out_channels=config.heatmap_block_out_channels,
                     layers_per_block=config.heatmap_layers_per_block,
                     attention_levels=config.heatmap_attention_levels,
+                    cross_attention_levels=config.heatmap_cross_attention_levels,
                     num_train_timesteps=config.heatmap_num_train_timesteps,
                     cfg_drop_prob=config.heatmap_cfg_drop_prob,
                     cfg_scale=config.heatmap_cfg_scale,
@@ -538,16 +561,19 @@ class VLNPipeline(nn.Module):
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states from Qwen3-VL")
         
+        # For DPT: keep per-layer vision tokens before fusion
+        dpt_vision_tokens = None
+        if self.config.heatmap_head_type == "dpt" and isinstance(raw_hidden_states, list):
+            dpt_vision_tokens = [hs.to(device=self.device, dtype=self.config.dtype)
+                                 for hs in raw_hidden_states]
+        
         # ==================== Step 1.5: Multi-Layer Fusion ====================
         if isinstance(raw_hidden_states, list) and self.multi_layer_fusion is not None:
-            # Multi-layer: fuse before projecting
             raw_hidden_states = [hs.to(device=self.device, dtype=self.config.dtype) for hs in raw_hidden_states]
             raw_hidden_states = self.multi_layer_fusion(raw_hidden_states)
         else:
             if isinstance(raw_hidden_states, list):
-                # Fallback: use last layer if fusion module not available
                 raw_hidden_states = raw_hidden_states[-1]
-            # Move to device
             raw_hidden_states = raw_hidden_states.to(device=self.device, dtype=self.config.dtype)
         
         # ==================== Step 2: Project Hidden States ====================
@@ -565,28 +591,45 @@ class VLNPipeline(nn.Module):
         future_head_result = {}
         
         if return_heatmaps:
+            is_dpt = self.config.heatmap_head_type == "dpt"
             observation_for_heatmap = current_observation.to(device=self.device, dtype=self.config.dtype)
             llm_tokens_for_heatmap = llm_tokens.to(dtype=self.config.dtype)
             
             # History Heatmap
             if self.history_heatmap_head is not None:
-                if gt_history_heatmap is not None:
-                    gt_history_hm = gt_history_heatmap.to(self.device)
-                    result = self.history_heatmap_head(
-                        llm_tokens=llm_tokens_for_heatmap,
-                        observation=observation_for_heatmap,
-                        gt_heatmap=gt_history_hm,
-                        return_loss=True,
-                        skip_inference=not self.training,
-                    )
-                    history_heatmap_loss = result['loss']
-                    history_heatmap = result.get('heatmap')
-                    history_head_result = result
+                if is_dpt and dpt_vision_tokens is not None:
+                    if gt_history_heatmap is not None:
+                        gt_history_hm = gt_history_heatmap.to(self.device)
+                        result = self.history_heatmap_head(
+                            multi_layer_vision_tokens=dpt_vision_tokens,
+                            gt_heatmap=gt_history_hm,
+                            return_loss=True,
+                        )
+                        history_heatmap_loss = result['loss']
+                        history_heatmap = result.get('heatmap')
+                        history_head_result = result
+                    else:
+                        history_heatmap = self.history_heatmap_head(
+                            multi_layer_vision_tokens=dpt_vision_tokens,
+                        )
                 else:
-                    history_heatmap = self.history_heatmap_head(
-                        llm_tokens=llm_tokens_for_heatmap,
-                        observation=observation_for_heatmap,
-                    )
+                    if gt_history_heatmap is not None:
+                        gt_history_hm = gt_history_heatmap.to(self.device)
+                        result = self.history_heatmap_head(
+                            llm_tokens=llm_tokens_for_heatmap,
+                            observation=observation_for_heatmap,
+                            gt_heatmap=gt_history_hm,
+                            return_loss=True,
+                            skip_inference=not self.training,
+                        )
+                        history_heatmap_loss = result['loss']
+                        history_heatmap = result.get('heatmap')
+                        history_head_result = result
+                    else:
+                        history_heatmap = self.history_heatmap_head(
+                            llm_tokens=llm_tokens_for_heatmap,
+                            observation=observation_for_heatmap,
+                        )
             
             # Future Heatmap
             if self.future_heatmap_head is not None:

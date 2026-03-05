@@ -384,6 +384,9 @@ class ConditionalUnet2D(nn.Module):
         seq_cross_attn_head_dim: int = 64,
         # Spatial feature injection from CNN encoder
         spatial_injection_channels: Optional[List[int]] = None,
+        # Cross-attention levels (separate from self-attention)
+        # None = follow attention_levels (backward compatible)
+        cross_attention_levels: Optional[Tuple[int, ...]] = None,
     ):
         super().__init__()
         
@@ -393,6 +396,9 @@ class ConditionalUnet2D(nn.Module):
         self.use_circular_padding = use_circular_padding
         self.use_sequence_conditioning = use_sequence_conditioning
         self.use_spatial_injection = spatial_injection_channels is not None
+        
+        # Cross-attention levels: defaults to attention_levels if not specified
+        effective_cross_attn_levels = cross_attention_levels if cross_attention_levels is not None else attention_levels
         
         # Timestep embedding
         self.time_embed = nn.Sequential(
@@ -437,8 +443,8 @@ class ConditionalUnet2D(nn.Module):
             else:
                 self.down_attentions.append(nn.Identity())
             
-            # Sequence Cross-Attention (only at attention levels, when enabled)
-            if use_sequence_conditioning and i in attention_levels:
+            # Sequence Cross-Attention (at cross_attention_levels, when enabled)
+            if use_sequence_conditioning and i in effective_cross_attn_levels:
                 self.down_cross_attentions.append(CrossAttention2D(
                     channels=out_ch,
                     cond_dim=cond_dim,
@@ -448,8 +454,9 @@ class ConditionalUnet2D(nn.Module):
             else:
                 self.down_cross_attentions.append(nn.Identity())
             
-            # CNN Spatial Cross-Attention (at attention levels, when spatial injection enabled)
-            # Q=UNet features, K/V=CNN spatial features flattened as sequence
+            # CNN Spatial Cross-Attention (at attention_levels only, NOT extra cross_attention_levels)
+            # Level 0 的 CNN spatial cross-attn 会产生 4096×4096 attention matrix 导致 OOM
+            # CNN 特征已通过 additive spatial injection 注入，无需额外 cross-attention
             if spatial_injection_channels is not None and i in attention_levels:
                 cnn_ch = spatial_injection_channels[i]
                 self.down_spatial_cross_attentions.append(CrossAttention2D(
@@ -524,8 +531,8 @@ class ConditionalUnet2D(nn.Module):
             else:
                 self.up_attentions.append(nn.Identity())
             
-            # Sequence Cross-Attention (mirror encoder)
-            if use_sequence_conditioning and level_idx in attention_levels:
+            # Sequence Cross-Attention (mirror encoder, at cross_attention_levels)
+            if use_sequence_conditioning and level_idx in effective_cross_attn_levels:
                 self.up_cross_attentions.append(CrossAttention2D(
                     channels=out_ch,
                     cond_dim=cond_dim,
@@ -535,7 +542,7 @@ class ConditionalUnet2D(nn.Module):
             else:
                 self.up_cross_attentions.append(nn.Identity())
             
-            # CNN Spatial Cross-Attention (mirror encoder)
+            # CNN Spatial Cross-Attention (mirror encoder, at attention_levels only)
             if spatial_injection_channels is not None and level_idx in attention_levels:
                 cnn_ch = spatial_injection_channels[level_idx]
                 self.up_spatial_cross_attentions.append(CrossAttention2D(
@@ -573,15 +580,17 @@ class ConditionalUnet2D(nn.Module):
         else:
             self.spatial_projectors = None
         
-        # ==================== Zero-Init Spatial Cross-Attention Outputs ====================
-        # 让新增的 CNN spatial cross-attention 初始时不改变 UNet 特征（恒等映射）
-        # 随着训练逐渐学习有意义的贡献 (ControlNet / IP-Adapter 最佳实践)
-        if spatial_injection_channels is not None:
-            for module_list in [self.down_spatial_cross_attentions, self.up_spatial_cross_attentions]:
-                for module in module_list:
-                    if isinstance(module, CrossAttention2D):
-                        nn.init.zeros_(module.to_out.weight)
-                        nn.init.zeros_(module.to_out.bias)
+        # ==================== Zero-Init Cross-Attention Outputs ====================
+        # 所有 cross-attention 的输出层 zero-init：
+        # - 新增 level 的 cross-attention 初始时不改变 UNet 特征（恒等映射）
+        # - 已训练 level 的权重会被 checkpoint 覆盖
+        # (ControlNet / IP-Adapter 最佳实践)
+        for module_list in [self.down_cross_attentions, self.up_cross_attentions,
+                            self.down_spatial_cross_attentions, self.up_spatial_cross_attentions]:
+            for module in module_list:
+                if isinstance(module, CrossAttention2D):
+                    nn.init.zeros_(module.to_out.weight)
+                    nn.init.zeros_(module.to_out.bias)
         
         # ==================== Output ====================
         self.conv_out = nn.Sequential(

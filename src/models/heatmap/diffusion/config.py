@@ -74,7 +74,12 @@ class DiffusionHeatmapConfig:
     layers_per_block: int = 2
     
     # Attention at deepest levels (indices into block_out_channels)
-    attention_levels: Tuple[int, ...] = (2,)  # Attention at 256-channel level
+    attention_levels: Tuple[int, ...] = (2,)  # Self-attention at these levels
+    
+    # Cross-attention levels (LLM + CNN spatial cross-attention)
+    # 允许在更多分辨率层添加 cross-attention 而不添加 self-attention
+    # None = 跟随 attention_levels（向后兼容）
+    cross_attention_levels: Tuple[int, ...] = None
     
     # Normalization
     norm_num_groups: int = 8               # Groups for GroupNorm

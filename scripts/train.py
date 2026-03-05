@@ -660,6 +660,7 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
         heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
         heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
+        heatmap_cross_attention_levels=tuple(heatmap_cfg['cross_attention_levels']) if heatmap_cfg.get('cross_attention_levels') else None,
         heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
         # Classifier-Free Guidance (CFG) for heatmap
         heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
@@ -680,8 +681,11 @@ def build_model(cfg: Dict) -> nn.Module:
         # Spatial importance weighting
         heatmap_peak_spatial_weight=heatmap_cfg.get('peak_spatial_weight', 10.0),
         
-        # Head type switch: "diffusion" or "direct"
+        # Head type switch: "diffusion", "direct", or "dpt"
         heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
+        # DPT head config
+        dpt_out_channels=heatmap_cfg.get('dpt', {}).get('out_channels', None),
+        dpt_features=heatmap_cfg.get('dpt', {}).get('features', 256),
         # Direct head specific config
         direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 256),
         direct_heatmap_num_decoder_blocks=heatmap_cfg.get('direct', {}).get('num_decoder_blocks', 3),
