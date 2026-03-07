@@ -33,6 +33,7 @@ from .action import (
 from .heatmap import HeatmapVLN, HeatmapVLNLoss
 
 logger = logging.getLogger(__name__)
+VIEW_NAMES = ("front", "right", "back", "left")
 
 
 @dataclass
@@ -273,6 +274,73 @@ class VLNPipeline(nn.Module):
 
         logger.info("HeatmapVLN v2 constructed (Coarse-to-Fine)")
 
+    @staticmethod
+    def _views_tensor_to_dict(views: torch.Tensor) -> Dict[str, Any]:
+        if views.dim() != 4 or views.shape[0] != 4:
+            raise ValueError(f"Expected views tensor [4, C, H, W], got {tuple(views.shape)}")
+        return {name: views[idx] for idx, name in enumerate(VIEW_NAMES)}
+
+    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> List[Dict[str, Any]]:
+        if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
+            raise ValueError(
+                f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
+            )
+        return [
+            self._views_tensor_to_dict(history_panoramas[idx])
+            for idx in range(history_panoramas.shape[0])
+        ]
+
+    def _forward_heatmap_batch(
+        self,
+        current_views: Any,
+        history_panoramas: Any,
+        instruction_text: Optional[Any] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if self.heatmap_vln is None:
+            raise RuntimeError("HeatmapVLN has not been constructed")
+
+        if torch.is_tensor(current_views):
+            if current_views.dim() == 4:
+                instruction = instruction_text if isinstance(instruction_text, str) else None
+                return self.heatmap_vln(
+                    self._views_tensor_to_dict(current_views),
+                    self._history_tensor_to_list(history_panoramas),
+                    instruction=instruction,
+                )
+
+            if current_views.dim() != 5:
+                raise ValueError(
+                    f"Expected current_views [B, 4, C, H, W], got {tuple(current_views.shape)}"
+                )
+            if not torch.is_tensor(history_panoramas) or history_panoramas.dim() != 6:
+                raise ValueError("Batched history_panoramas must be a tensor of shape [B, N, 4, C, H, W]")
+
+            all_visibility = []
+            all_heatmaps = []
+            for b in range(current_views.shape[0]):
+                if isinstance(instruction_text, list):
+                    instruction = instruction_text[b] if b < len(instruction_text) else instruction_text[0]
+                else:
+                    instruction = instruction_text
+                sample_output = self.heatmap_vln(
+                    self._views_tensor_to_dict(current_views[b]),
+                    self._history_tensor_to_list(history_panoramas[b]),
+                    instruction=instruction,
+                )
+                all_visibility.append(sample_output["visibility"])
+                all_heatmaps.append(sample_output["heatmaps"])
+
+            return {
+                "visibility": torch.stack(all_visibility, dim=0),
+                "heatmaps": torch.stack(all_heatmaps, dim=0),
+            }
+
+        return self.heatmap_vln(
+            current_views,
+            history_panoramas,
+            instruction=instruction_text if isinstance(instruction_text, str) else None,
+        )
+
     def forward(
         self,
         video_frames: torch.Tensor,
@@ -332,7 +400,11 @@ class VLNPipeline(nn.Module):
         if return_heatmaps and current_views is not None and history_panoramas is not None:
             self._ensure_heatmap_vln()
             if self.heatmap_vln is not None:
-                heatmap_output = self.heatmap_vln(current_views, history_panoramas)
+                heatmap_output = self._forward_heatmap_batch(
+                    current_views=current_views,
+                    history_panoramas=history_panoramas,
+                    instruction_text=instruction_text,
+                )
 
         # ==================== Step 4: Action Generation ====================
         actions = None

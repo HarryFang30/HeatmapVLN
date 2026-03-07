@@ -9,7 +9,7 @@ Text annotations encode scene context, group structure, and spatial orientation.
 Reference: HeatmapVLN设计文档 Section 3
 """
 
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 from PIL import Image
 import torch
 import numpy as np
@@ -22,6 +22,7 @@ VIEW_ANGLES = ["0°正前方", "90°右侧", "180°正后方", "270°左侧"]
 def construct_input(
     current_views: Dict[str, Union[Image.Image, torch.Tensor]],
     history_panoramas: List[Dict[str, Union[Image.Image, torch.Tensor]]],
+    instruction: Optional[str] = None,
 ) -> List[Dict]:
     """
     Construct text-annotated multi-image messages for Qwen3.5.
@@ -30,6 +31,7 @@ def construct_input(
         current_views: dict with keys 'front', 'right', 'back', 'left',
             values are PIL Images or tensors (C,H,W) in [0,1].
         history_panoramas: list of dicts with same structure, ordered by time.
+        instruction: optional navigation instruction for task grounding.
 
     Returns:
         messages: list of message dicts compatible with Qwen3.5 processor.
@@ -42,6 +44,11 @@ def construct_input(
         "type": "text",
         "text": "以下是一个室内导航场景。",
     })
+    if instruction:
+        content.append({
+            "type": "text",
+            "text": f"导航指令：{instruction}",
+        })
     content.append({
         "type": "text",
         "text": f"当前位置的全景观测（朝向{orientation_str}）：",

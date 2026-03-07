@@ -106,6 +106,7 @@ class HeatmapVLN(nn.Module):
         self,
         current_views: Dict[str, object],
         history_panoramas: List[Dict[str, object]],
+        instruction: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         End-to-end forward pass.
@@ -113,6 +114,7 @@ class HeatmapVLN(nn.Module):
         Args:
             current_views:     dict ``{'front': img, 'right': img, 'back': img, 'left': img}``
             history_panoramas: list of dicts with same structure.
+            instruction:       optional navigation instruction.
 
         Returns:
             dict with keys:
@@ -123,7 +125,11 @@ class HeatmapVLN(nn.Module):
         device = next(self.fine.parameters()).device
 
         # === Step 1: construct multi-image input with text annotations ===
-        messages = construct_input(current_views, history_panoramas)
+        messages = construct_input(
+            current_views,
+            history_panoramas,
+            instruction=instruction,
+        )
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,

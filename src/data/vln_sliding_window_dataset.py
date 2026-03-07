@@ -1167,24 +1167,6 @@ class VLNSlidingWindowDataset(Dataset):
     
     PANORAMIC_DIRECTIONS = ["front", "right", "back", "left"]
     
-    def _load_panoramic_grid(self, clip_dir: Path, frame_idx: int) -> torch.Tensor:
-        """加载 4 个方向的图像并拼成 2x2 全景网格。
-        
-        布局: top-left=Front, top-right=Right, bottom-left=Back, bottom-right=Left
-        
-        Returns:
-            [3, 2*H, 2*W] tensor (e.g. [3, 448, 448] for image_size=224)
-        """
-        views = []
-        for d in self.PANORAMIC_DIRECTIONS:
-            view = self._load_frame(clip_dir, frame_idx, apply_augmentation=True, direction=d)
-            views.append(view)  # each [C, H, W]
-        
-        top = torch.cat([views[0], views[1]], dim=2)    # [C, H, 2W]
-        bottom = torch.cat([views[2], views[3]], dim=2)  # [C, H, 2W]
-        grid = torch.cat([top, bottom], dim=1)           # [C, 2H, 2W]
-        return grid
-    
     def _load_all_views(self, clip_dir: Path, frame_idx: int) -> torch.Tensor:
         """加载 4 个方向的独立图像。
         
@@ -1196,6 +1178,65 @@ class VLNSlidingWindowDataset(Dataset):
             view = self._load_frame(clip_dir, frame_idx, apply_augmentation=True, direction=d)
             views.append(view)
         return torch.stack(views, dim=0)
+
+    def _load_history_panoramas(
+        self,
+        clip_dir: Path,
+        frame_indices: np.ndarray,
+    ) -> torch.Tensor:
+        """加载历史全景观测，返回 [N, 4, C, H, W]。"""
+        panoramas = [
+            self._load_all_views(clip_dir, int(frame_idx))
+            for frame_idx in frame_indices
+        ]
+        return torch.stack(panoramas, dim=0)
+
+    def _compute_per_history_multiview_heatmaps(
+        self,
+        clip_idx: int,
+        clip_dir: Path,
+        history_poses: List[np.ndarray],
+        current_t: int,
+        img_size: Tuple[int, int],
+        K: Optional[np.ndarray],
+        hm_size: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """按历史位置分别计算 4 视角 GT，返回 [N, 4, H, W] 和 [N, 4]。"""
+        current_poses = {}
+        current_depths = {}
+        fallback_pose = self._load_poses(clip_idx)[current_t]
+        hm_h, hm_w = hm_size
+
+        for direction in self.PANORAMIC_DIRECTIONS:
+            try:
+                pose = self._get_chunk_frame_array(clip_idx, current_t, "pose", direction=direction)
+                current_poses[direction] = np.array(pose, dtype=np.float32)
+            except (KeyError, Exception):
+                current_poses[direction] = fallback_pose
+            current_depths[direction] = self._load_depth(clip_dir, current_t, direction=direction)
+
+        per_history_heatmaps = []
+        per_history_visibility = []
+        for hist_pose in history_poses:
+            view_heatmaps = []
+            view_visibility = []
+            for direction in self.PANORAMIC_DIRECTIONS:
+                heatmap, visibility = compute_history_heatmap(
+                    history_poses=[hist_pose],
+                    current_pose=current_poses[direction],
+                    current_depth=current_depths[direction],
+                    hm_size=(hm_h, hm_w),
+                    img_size=img_size,
+                    K=K,
+                    depth_normalize=not self._depth_is_meters,
+                )
+                view_heatmaps.append(torch.from_numpy(heatmap).float())
+                view_visibility.append(float(visibility > 0))
+
+            per_history_heatmaps.append(torch.stack(view_heatmaps, dim=0))
+            per_history_visibility.append(torch.tensor(view_visibility, dtype=torch.float32))
+
+        return torch.stack(per_history_heatmaps, dim=0), torch.stack(per_history_visibility, dim=0)
     
     def _compute_multiview_heatmaps(
         self,
@@ -1406,11 +1447,13 @@ class VLNSlidingWindowDataset(Dataset):
             
             # 4. 加载当前帧
             if self._is_panoramic:
-                current_frame = self._load_panoramic_grid(clip_dir, current_t)
+                current_frame = self._load_frame(clip_dir, current_t, direction="front")
                 current_views = self._load_all_views(clip_dir, current_t)
+                history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
             else:
                 current_frame = self._load_frame(clip_dir, current_t)
                 current_views = None
+                history_panoramas = None
             
             # 5. 加载位姿
             poses = self._load_poses(clip_idx)
@@ -1435,9 +1478,12 @@ class VLNSlidingWindowDataset(Dataset):
             hm_w, hm_h = self.hm_size
             
             if self.defer_heatmap_to_gpu:
-                heatmap_tensor = torch.zeros(hm_h, hm_w)
+                if self._is_panoramic:
+                    heatmap_tensor = torch.zeros(len(history_poses), 4, hm_h, hm_w)
+                else:
+                    heatmap_tensor = torch.zeros(hm_h, hm_w)
             elif self._is_panoramic:
-                heatmap_tensor, visibility = self._compute_multiview_heatmaps(
+                heatmap_tensor, visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
                     history_poses=history_poses,
@@ -1496,7 +1542,7 @@ class VLNSlidingWindowDataset(Dataset):
             
             result = {
                 "history_frames": history_frames,      # [K, 3, H, W]
-                "current_frame": current_frame,        # [3, H, W] or [3, 2H, 2W] (panoramic)
+                "current_frame": current_frame,        # [3, H, W] (front view)
                 "heatmap": heatmap_tensor,             # [Hm, Wm] or [4, Hm, Wm] (panoramic)
                 "action": action_tensor,               # [2]
                 "action_valid": action_valid,          # float
@@ -1506,6 +1552,8 @@ class VLNSlidingWindowDataset(Dataset):
             }
             if current_views is not None:
                 result["current_views"] = current_views  # [4, 3, H, W]
+            if history_panoramas is not None:
+                result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
             
             if self.defer_heatmap_to_gpu:
                 result["history_poses"] = torch.from_numpy(
@@ -1540,9 +1588,10 @@ class VLNSlidingWindowDataset(Dataset):
         if self._is_panoramic:
             result = {
                 "history_frames": torch.zeros(K, 3, target_h, target_w),
-                "current_frame": torch.zeros(3, target_h * 2, target_w * 2),
+                "current_frame": torch.zeros(3, target_h, target_w),
                 "current_views": torch.zeros(4, 3, target_h, target_w),
-                "heatmap": torch.zeros(4, hm_h, hm_w),
+                "history_panoramas": torch.zeros(K, 4, 3, target_h, target_w),
+                "heatmap": torch.zeros(K, 4, hm_h, hm_w),
                 "action": torch.zeros(2),
                 "action_valid": 0.0,
                 "discrete_action": 1,
@@ -2193,13 +2242,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # 3. 加载历史帧
             history_frames = self._load_frames(clip_dir, history_indices)
             
-            # 4. 加载当前帧（全景 / 单视角）
+            # 4. 加载当前帧（全景时取 front 视角，不再拼接 2x2）
             if self._is_panoramic:
-                current_frame = self._load_panoramic_grid(clip_dir, current_t)
+                current_frame = self._load_frame(clip_dir, current_t, direction="front")
                 current_views = self._load_all_views(clip_dir, current_t)
+                history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
             else:
                 current_frame = self._load_frame(clip_dir, current_t)
                 current_views = None
+                history_panoramas = None
             
             # 5. 加载位姿
             poses = self._load_poses(clip_idx)
@@ -2224,9 +2275,12 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             hm_w, hm_h = self.hm_size
             
             if self.defer_heatmap_to_gpu:
-                heatmap_tensor = torch.zeros(hm_h, hm_w)
+                if self._is_panoramic:
+                    heatmap_tensor = torch.zeros(len(history_poses), 4, hm_h, hm_w)
+                else:
+                    heatmap_tensor = torch.zeros(hm_h, hm_w)
             elif self._is_panoramic:
-                heatmap_tensor, visibility = self._compute_multiview_heatmaps(
+                heatmap_tensor, visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
                     history_poses=history_poses,
@@ -2282,7 +2336,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             
             result = {
                 "history_frames": history_frames,        # [K, 3, H, W]
-                "current_frame": current_frame,          # [3, H, W] or [3, 2H, 2W] (panoramic)
+                "current_frame": current_frame,          # [3, H, W] (front view)
                 "heatmap": heatmap_tensor,               # [Hm, Wm] or [4, Hm, Wm] (panoramic)
                 "trajectory": trajectory_tensor,         # [predict_horizon, 3]
                 "trajectory_valid": trajectory_valid,    # float
@@ -2295,6 +2349,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             }
             if current_views is not None:
                 result["current_views"] = current_views  # [4, 3, H, W]
+            if history_panoramas is not None:
+                result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
             
             if self.defer_heatmap_to_gpu:
                 result["history_poses"] = torch.from_numpy(

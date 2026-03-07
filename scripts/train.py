@@ -458,31 +458,25 @@ def visualize_heatmap_predictions(
         gt_heatmaps = gt_heatmap_override if gt_heatmap_override is not None else batch['heatmap']
         
         pred_heatmaps = output.get('heatmaps')
-        if pred_heatmaps is None:
-            pred_heatmaps = output.get('history_heatmaps')
-        if pred_heatmaps is None:
-            pred_heatmaps = output.get('future_heatmaps')
         
         if pred_heatmaps is None:
             return
         
-        # 提取 2D 热力图用于可视化
-        # 多视角 [B, 4, H, W]: 取 front (index 0)
-        # 单视角 [B, 1, H, W]: 取唯一通道 (index 0 或 -1 均可)
-        if pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
-            pred_heatmaps = pred_heatmaps[:, 0]  # front view
+        # 提取 2D 热力图用于可视化：优先显示第一个历史位置的 front view。
+        if pred_heatmaps.dim() == 5:
+            pred_heatmaps = pred_heatmaps[:, 0, 0]
+        elif pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
+            pred_heatmaps = pred_heatmaps[:, 0]
         elif pred_heatmaps.dim() == 4:
-            pred_heatmaps = pred_heatmaps[:, -1]  # single channel
+            pred_heatmaps = pred_heatmaps[:, -1]
         
-        if gt_heatmaps.dim() == 4 and gt_heatmaps.shape[1] == 4:
-            gt_heatmaps = gt_heatmaps[:, 0]  # front view
+        if gt_heatmaps.dim() == 5:
+            gt_heatmaps = gt_heatmaps[:, 0, 0]
+        elif gt_heatmaps.dim() == 4 and gt_heatmaps.shape[1] == 4:
+            gt_heatmaps = gt_heatmaps[:, 0]
         
-        # 全景网格：裁剪左上角作为 front view 显示
-        if current_frames.shape[-1] > 300:
-            h = current_frames.shape[-2] // 2
-            w = current_frames.shape[-1] // 2
-            current_frames = current_frames[:, :, :h, :w]
-        elif 'current_views' in batch:
+        # 全景模式：取 current_views 的 front 视角
+        if 'current_views' in batch:
             current_frames = batch['current_views'][:, 0]  # front view
         
         B = min(num_samples, current_frames.shape[0])
@@ -592,6 +586,8 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     # 多视角数据
     if 'current_views' in batch[0]:
         result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
+    if 'history_panoramas' in batch[0]:
+        result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
     
     # 水平翻转标记
     if 'is_flipped' in batch[0]:
@@ -707,16 +703,16 @@ def build_model(cfg: Dict) -> nn.Module:
     packing_enabled = llm_cfg.get('enable_packing', False)
     print(f"✅ VLN Pipeline 已构建")
     print(f"   Qwen3.5 → {llm_cfg.get('model_path', './models/qwen_3.5')}")
-    if packing_enabled:
-        print(f"   SequencePacking → enabled=True, max_seq_length={llm_cfg.get('max_seq_length', 4096)}")
-    else:
-        print(f"   SequencePacking → enabled=False (使用传统 padding)")
-    hm_head_type = heatmap_cfg.get('head_type', 'diffusion')
-    print(f"   HistoryHeatmapHead → enabled={heatmap_cfg.get('enable_history', True)}, "
-          f"type={hm_head_type}, "
-          f"use_image_encoder={heatmap_cfg.get('use_image_encoder', True)}, "
-          f"pool_method={heatmap_cfg.get('pool_method', 'attention')}")
-    print(f"   FutureHeatmapHead → enabled={heatmap_cfg.get('enable_future', True)}")
+    print(f"   SequencePacking → enabled={packing_enabled} (Qwen3.5 不支持启用)")
+    print(
+        "   HeatmapVLN → "
+        f"enabled={heatmap_cfg.get('enable', True)}, "
+        f"c_vit={heatmap_cfg.get('c_vit', 1152)}, "
+        f"c_llm={heatmap_cfg.get('c_llm', 4096)}, "
+        f"c_fused={heatmap_cfg.get('c_fused', 256)}, "
+        f"vit_layers={heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24])}, "
+        f"llm_layer={heatmap_cfg.get('llm_layer_idx', 24)}"
+    )
     print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
     print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
     print(f"   StopHead (legacy) → enabled={stop_cfg.get('enable', False)}")
@@ -1083,11 +1079,19 @@ def train_one_epoch(
                     instruction_text = list(text)
                 else:
                     instruction_text = None
+                current_views_batch = batch.get('current_views')
+                if current_views_batch is not None:
+                    current_views_batch = current_views_batch.to(device)
+                history_panoramas_batch = batch.get('history_panoramas')
+                if history_panoramas_batch is not None:
+                    history_panoramas_batch = history_panoramas_batch.to(device)
                 
                 output = model(
                     video_frames=video_frames,
                     instruction_text=instruction_text,
                     current_observation=current_frame.to(device),
+                    current_views=current_views_batch,
+                    history_panoramas=history_panoramas_batch,
                     return_heatmaps=True,
                     return_actions=train_action,
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
@@ -1171,7 +1175,7 @@ def train_one_epoch(
                     )
             
             # 总损失
-            heatmap_weight = loss_cfg.get('history_weight', 1.0) if train_history else loss_cfg.get('future_weight', 1.0)
+            heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             action_weight = loss_cfg.get('action_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
             stop_weight = loss_cfg.get('stop_weight', 0.5)
@@ -1249,21 +1253,19 @@ def train_one_epoch(
                 # 诊断信息记录（固定间隔）
                 diag_interval = cfg['log'].get('diag_interval', 100)
                 if global_step % diag_interval == 0:
-                    # 多层融合权重诊断 (legacy, removed in v2)
-                    if False:
-                        pass
-                    
                     # 热力图输出诊断 - 检查是否坍缩为全黑
-                    pred_hm_key = 'heatmaps' if 'heatmaps' in output else 'history_heatmaps'
-                    if pred_hm_key in output and output[pred_hm_key] is not None:
-                        pred_hm = output[pred_hm_key].detach()
+                    if 'heatmaps' in output and output['heatmaps'] is not None:
+                        pred_hm = output['heatmaps'].detach()
                         
-                        # 多视角 [B, 4, H, W]: 取 front 视角；单视角 [B, 1, H, W]: 不变
-                        if pred_hm.dim() == 4 and pred_hm.shape[1] == 4:
-                            pred_hm = pred_hm[:, 0].unsqueeze(1)  # [B, 1, H, W] front view
+                        if pred_hm.dim() == 5:
+                            pred_hm = pred_hm[:, 0, 0].unsqueeze(1)
+                        elif pred_hm.dim() == 4 and pred_hm.shape[1] == 4:
+                            pred_hm = pred_hm[:, 0].unsqueeze(1)
                         gt_hm_for_diag = gt_heatmap
-                        if gt_hm_for_diag.dim() == 4 and gt_hm_for_diag.shape[1] == 4:  # [B, 4, H, W]
-                            gt_hm_for_diag = gt_hm_for_diag[:, 0]  # [B, H, W] front view
+                        if gt_hm_for_diag.dim() == 5:
+                            gt_hm_for_diag = gt_hm_for_diag[:, 0, 0]
+                        elif gt_hm_for_diag.dim() == 4 and gt_hm_for_diag.shape[1] == 4:
+                            gt_hm_for_diag = gt_hm_for_diag[:, 0]
                         
                         pred_mean = pred_hm.mean().item()
                         pred_max = pred_hm.max().item()
@@ -1645,11 +1647,19 @@ def validate(
                     instruction_text = list(text)
                 else:
                     instruction_text = None
+                current_views_batch = batch.get('current_views')
+                if current_views_batch is not None:
+                    current_views_batch = current_views_batch.to(device)
+                history_panoramas_batch = batch.get('history_panoramas')
+                if history_panoramas_batch is not None:
+                    history_panoramas_batch = history_panoramas_batch.to(device)
                 
                 output = model(
                     video_frames=video_frames,
                     instruction_text=instruction_text,
                     current_observation=current_frame.to(device),
+                    current_views=current_views_batch,
+                    history_panoramas=history_panoramas_batch,
                     return_heatmaps=True,
                     return_actions=train_action,
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
@@ -1725,7 +1735,7 @@ def validate(
                         action_valid
                     )
             
-            heatmap_weight = loss_cfg.get('history_weight', 1.0)
+            heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
             progress_weight = loss_cfg.get('progress_weight', 0.5)
             
@@ -1758,10 +1768,18 @@ def validate(
                         history_frames,
                         history_frames[:, -1:],
                     ], dim=1)
+                    current_views_batch = batch.get('current_views')
+                    if current_views_batch is not None:
+                        current_views_batch = current_views_batch.to(device)
+                    history_panoramas_batch = batch.get('history_panoramas')
+                    if history_panoramas_batch is not None:
+                        history_panoramas_batch = history_panoramas_batch.to(device)
                     vis_output = model(
                         video_frames=video_frames,
                         instruction_text=list(text) if text else None,
                         current_observation=current_frame.to(device),
+                        current_views=current_views_batch,
+                        history_panoramas=history_panoramas_batch,
                         return_heatmaps=True,
                         return_actions=False,
                     )
@@ -1770,13 +1788,16 @@ def validate(
                 vis_hm_key = 'heatmaps' if 'heatmaps' in vis_output else 'history_heatmaps'
                 if train_history and vis_hm_key in vis_output:
                     infer_pred_hm = vis_output[vis_hm_key]
-                    # 多视角 [B, 4, H, W]: 取 front；单视角 [B, 1, H, W]: 取唯一通道
-                    if infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
-                        infer_pred_hm = infer_pred_hm[:, 0, :, :]   # front view
+                    if infer_pred_hm.dim() == 5:
+                        infer_pred_hm = infer_pred_hm[:, 0, 0, :, :]
+                    elif infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
+                        infer_pred_hm = infer_pred_hm[:, 0, :, :]
                     elif infer_pred_hm.dim() == 4:
-                        infer_pred_hm = infer_pred_hm[:, -1, :, :]  # single channel
+                        infer_pred_hm = infer_pred_hm[:, -1, :, :]
                     gt_hm_eval = gt_heatmap
-                    if gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
+                    if gt_hm_eval.dim() == 5:
+                        gt_hm_eval = gt_hm_eval[:, 0, 0]
+                    elif gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
                         gt_hm_eval = gt_hm_eval[:, 0]
                     if infer_pred_hm.shape[-2:] != gt_hm_eval.shape[-2:]:
                         infer_pred_hm = F.interpolate(
@@ -2439,6 +2460,9 @@ def main():
         if model.qwen3_5.model is None:
             logger.info("🔄 Pre-loading Qwen3.5 (ensure LoRA params available for optimizer)...")
             model.qwen3_5._load_model()
+    if getattr(model.config, 'enable_heatmap', False):
+        logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")
+        model._ensure_heatmap_vln()
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
