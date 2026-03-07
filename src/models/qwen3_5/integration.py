@@ -428,17 +428,31 @@ class Qwen3_5Integration(nn.Module):
         self,
         inputs: Dict[str, torch.Tensor],
         return_hidden_states: bool,
+        skip_lm_head: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
-        """Run Qwen on already prepared multimodal inputs."""
+        """Run Qwen on already prepared multimodal inputs.
+
+        Args:
+            skip_lm_head: If True, call ``model.model()`` (the base
+                Qwen3_5Model) instead of ``model()`` (ForConditionalGeneration)
+                to avoid the 1-billion-parameter LM head matmul.  Use this
+                when only hooked features are needed (heatmap-only training).
+        """
         input_ids = inputs["input_ids"]
         image_mask = input_ids == self.image_token_id
         num_image_tokens = int(image_mask.sum().item())
 
-        outputs = self.model(
+        fwd_kwargs = dict(
             **inputs,
             output_hidden_states=return_hidden_states,
             return_dict=True,
+            use_cache=False,
         )
+
+        if skip_lm_head:
+            outputs = self.model.model(**fwd_kwargs)
+        else:
+            outputs = self.model(**fwd_kwargs)
 
         if return_hidden_states:
             layer_idx = self.config.hidden_layer_for_features
@@ -491,7 +505,7 @@ class Qwen3_5Integration(nn.Module):
         else:
             with torch.no_grad():
                 hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
-                    inputs, False,
+                    inputs, False, skip_lm_head=True,
                 )
 
         heatmap_output = heatmap_vln.decode_from_inputs(inputs, num_history)

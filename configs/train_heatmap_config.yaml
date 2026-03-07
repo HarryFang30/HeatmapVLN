@@ -17,7 +17,7 @@ data:
   
   sliding_window:
     min_history: 5
-    num_history_sample: 8        # 每场景采样 8 个历史时间步 (全景模式)
+    num_history_sample: 4        # 每场景采样 4 个历史时间步 (全景模式)
     load_depth: true
     cache_poses: true
     sample_stride: 2
