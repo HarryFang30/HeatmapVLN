@@ -1,36 +1,30 @@
-# Heatmap Module
-# 
-# This module provides heatmap generation heads for VLN navigation.
-# 
-# Core Components:
-# - DiffusionHeatmapHead: Diffusion-based heatmap generation (iterative denoising)
-# - DirectHeatmapHead: Direct prediction heatmap generation (single-pass FPN decoder)
-# - DPTHeatmapHead: DPT-style dense prediction from LLM visual tokens
-# - Diffusion components: UNet2D, MultiModalConditionEncoder, Configuration
+# Heatmap Module — HeatmapVLN v2
+#
+# Coarse-to-Fine spatial projection system:
+#   - CoarseLocalization: zero-param dot-product matching (visibility + 8x8 heatmap)
+#   - DPTLiteFusion: multi-layer ViT feature fusion (16x16)
+#   - FineLocalization: FiLM modulation + CNN upsample (64x64)
+#   - HeatmapVLN: complete model assembly
+#   - HeatmapVLNLoss: three-component loss
 
-from .diffusion_heatmap_head import DiffusionHeatmapHead, create_diffusion_heatmap_head
-from .diffusion import DiffusionHeatmapConfig
-from .direct_heatmap_head import DirectHeatmapHead, DirectHeatmapConfig
-from .dpt_heatmap_head import DPTHeatmapHead, DPTHeatmapConfig
+from .heatmap_vln import HeatmapVLN
+from .heatmap_vln_loss import HeatmapVLNLoss
+from .coarse_localization import CoarseLocalization
+from .dpt_lite_fusion import DPTLiteFusion
+from .fine_localization import FineLocalization
+from .feature_extractor import FeatureExtractor
+from .input_constructor import construct_input, find_text_anchor_positions
 
-# Version info
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 
-# Main exports
 __all__ = [
-    # Diffusion heatmap generation
-    "DiffusionHeatmapHead",
-    "DiffusionHeatmapConfig",
-    "create_diffusion_heatmap_head",
-    
-    # Direct prediction heatmap generation (Plan C)
-    "DirectHeatmapHead",
-    "DirectHeatmapConfig",
-    
-    # DPT heatmap generation
-    "DPTHeatmapHead",
-    "DPTHeatmapConfig",
-    
-    # Module metadata
+    "HeatmapVLN",
+    "HeatmapVLNLoss",
+    "CoarseLocalization",
+    "DPTLiteFusion",
+    "FineLocalization",
+    "FeatureExtractor",
+    "construct_input",
+    "find_text_anchor_positions",
     "__version__",
 ]

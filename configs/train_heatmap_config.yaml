@@ -1,40 +1,34 @@
 seed: 42
 
 # ============================================
-# 数据配置 - 使用 patrol_data 数据集
+# 数据配置 - 热力图专用训练
 # ============================================
 data:
   root: /root/autodl-tmp/heatmap_train_data
   train_split: train
   val_split: val
-  image_size: [224, 224]
+  image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8          # persistent_workers=False 保护下可安全使用 8 workers
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4      # 多预取掩盖 IO 延迟，配合 persistent=False 不会碎片化泄漏
+  prefetch_factor: 4
   
-  # 使用 sliding_window 数据集（patrol_data 没有 trajectory 数据）
   dataset_type: sliding_window
   
   sliding_window:
     min_history: 5
-    num_history_sample: 32       # 历史帧采样数量
-    load_depth: true             # 加载深度图用于遮挡检测
+    num_history_sample: 8        # 每场景采样 8 个历史时间步 (全景模式)
+    load_depth: true
     cache_poses: true
-    sample_stride: 2             # 采样步长
-    
-    # GPU 热力图计算 — 全景模式下必须关闭（GPU 版只支持单视角，4 视角热力图由 CPU 在 DataLoader 中生成）
+    sample_stride: 2
     defer_heatmap_to_gpu: false
-    
-    # Clip-level 采样策略
     clip_level_sampling: true
-    samples_per_clip: 45         # 每 clip 采样 45 个样本 (9:1 比例)
-    val_samples_per_clip: 5      # 验证集采样数
+    samples_per_clip: 45
+    val_samples_per_clip: 5
   
-  # 轨迹数据集配置（未使用，保留以兼容代码）
   trajectory:
     min_history: 5
-    num_history_sample: 32
+    num_history_sample: 8
     load_depth: true
     cache_poses: true
     sample_stride: 2
@@ -64,93 +58,31 @@ model:
     token_dim: 1024
     torch_dtype: bfloat16
     attn_implementation: sdpa
-    max_video_frames: -1       # -1 表示不限制帧数
-    
-    # Sequence Packing (disabled for Qwen3.5 hybrid attention)
+    max_video_frames: -1
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
-    
-    # 多层特征提取 — 4 层均匀分布于 32 层 LLM (Qwen3.5)
-    # Layer 3  = 浅层（空间信息最丰富，~10% depth）
-    # Layer 11 = 中浅层（空间-低级语义，~34% depth）
-    # Layer 19 = 中深层（语义信息增强，~59% depth）
-    # Layer 27 = 深层（高级语义，~84% depth）
-    multi_layer_features: true
-    feature_layer_indices: [3, 11, 19, 27]
-    feature_fusion_method: weighted_sum   # DPT 模式下不使用此项，但保留兼容性
-    
-    # LoRA 配置 — 开启以让 LLM 产生更适合空间推理的特征
-    # 扩展覆盖范围：空间理解在 VLM 中间层(12-24层)形成，仅最后4层不够
-    use_lora: true
-    lora_rank: 32              # 16 → 32，增强表达能力
-    lora_alpha: 64             # 保持 alpha/rank = 2 的比例
-    lora_num_layers: 8         # 4 → 8，覆盖更多空间理解层
-    lora_dropout: 0.05
-    lora_target_modules:       # 增加 k_proj，完整覆盖注意力矩阵
-      - q_proj
-      - k_proj
-      - v_proj
 
-  # 热力图头配置 (只训练 history head)
-  heatmap_head:
-    enable_history: true
-    enable_future: false
+  # HeatmapVLN v2 Coarse-to-Fine 配置
+  heatmap:
+    enable: true
+    c_vit: 1152               # ViT hidden dimension (Qwen3.5)
+    c_llm: 4096               # LLM hidden dimension
+    c_fused: 256               # DPT-Lite fusion output dim
+    vit_layer_indices: [6, 12, 18, 24]   # ViT blocks to hook
+    llm_layer_idx: 24          # LLM layer to hook (24/32)
+    heatmap_size: [64, 64]
+    image_size: 256            # 输入图像尺寸
 
-    # Head 类型: "dpt" (DPT 直接预测), "diffusion", "direct"
-    head_type: dpt
+    # 损失权重
+    lambda_vis: 1.0
+    lambda_pos: 1.0
+    lambda_neg: 0.1
 
-    # Spatial-Semantic Fusion Head 配置 (head_type == "dpt")
-    # ViT pre-merge 特征提供 16x16 空间精度, LLM token 提供语义引导
-    dpt:
-      proj_dim: 256               # 投影 / cross-attention 维度
-      features: 256               # 同 proj_dim (兼容旧键名)
-      vit_dim: 1152               # ViT hidden size (Qwen3.5)
-      vit_hook_layers: [6, 13, 20, 26]  # 要 hook 的 ViT block 索引
-      spatial_merge_size: 2       # Qwen3.5 spatial merge factor
-      n_cross_attn_heads: 4       # cross-attention heads
-      lambda_spatial: 0.5         # soft-argmax peak 位移损失权重
-
-    # 以下配置仅在 diffusion/direct 模式下生效，DPT 模式不使用
-    cond_dim: 1024
-    block_out_channels: [128, 256, 512, 512]
-    layers_per_block: 2
-    attention_levels: [1, 2, 3]
-    cross_attention_levels: [0, 1, 2, 3]
-    num_inference_steps: 50
-    num_train_timesteps: 200
-    cfg_drop_prob: 0.15
-    cfg_scale: 2.0
-    dropout: 0.1
-    use_circular_padding: false
-    use_image_encoder: true
-    image_encoder_use_pretrained: true
-    use_spatial_injection: true
-    pool_method: attention
-    pool_num_heads: 8
-    use_sequence_conditioning: true
-    seq_cross_attn_heads: 8
-    seq_cross_attn_head_dim: 64
-    sharpen_temperature: 0.1
-    negative_sample_weight: 1.0
-    positive_sample_boost: 3.0
-    peak_spatial_weight: 10.0
-
-    direct:
-      hidden_dim: 256
-      num_decoder_blocks: 3
-      decoder_num_heads: 8
-      decoder_head_dim: 64
-      lambda_dice: 0.5
-      lambda_peak: 1.0
-      focal_gamma: 2.0
-      init_bias: -5.0
-
-  # 动作头配置 - 禁用（不训练动作）
+  # 动作头 - 禁用
   action_head:
-    enable: false              # 完全禁用动作头
+    enable: false
     type: transformer
-    
     legacy:
       cond_dim: 1024
       action_dim: 2
@@ -160,13 +92,12 @@ model:
       down_dims: [128, 256]
       action_stats_min: [-0.1646, -0.0281]
       action_stats_max: [0.1850, 0.3087]
-    
     transformer:
       vlm_token_dim: 1024
       n_emb: 384
       predict_size: 24
       n_layer: 16
-      n_head: 6               # 对齐 InternNav: n_emb // head_dim = 384 // 64 = 6
+      n_head: 6
       n_cond_layers: 4
       action_dim: 3
       num_train_timesteps: 20
@@ -176,7 +107,7 @@ model:
 
   # Progress 预测头 - 禁用
   progress_head:
-    enable: false              # 禁用进度预测
+    enable: false
     hidden_dim: 512
     dropout: 0.3
     concat_state_txt: true
@@ -189,25 +120,21 @@ model:
     focal_alpha: 0.9
 
 # ============================================
-# 训练策略 - 只训练热力图头
+# 训练策略 - 只训练热力图 (~2M 参数)
 # ============================================
 training:
   stages:
     - name: heatmap_only_64
-      epochs: 15               # 15 epoch 正式训练
+      epochs: 15
       hm_size: [64, 64]
-      heatmap_loss_type: simplified
-      train_history: true
-      train_future: false
-      train_action: false      # 不训练动作
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
+      train_action: false
       trainable_modules:
-        - history_heatmap_head    # 训练 DPT 热力图头
-        - llm_projector           # 训练投影层（非 DPT 头仍需要）
-        - multi_layer_fusion      # 训练多层融合权重（非 DPT 头仍需要）
-        - lora                    # 训练 LoRA 层（微调 LLM）
+        - heatmap_vln          # DPTLiteFusion + FineLocalization (~2M)
+        - llm_projector        # 投影层
       frozen_modules:
-        - qwen3_5              # 冻结 VLM（LoRA 层除外）
-        - future_heatmap_head
+        - qwen3_5              # 冻结 VLM
         - transformer_action_head
         - action_head
         - progress_head
@@ -218,60 +145,33 @@ training:
 # ============================================
 optim:
   optimizer: adamw
-
-  # 分组学习率
-  heatmap_lr: 5.0e-5
-  history_heatmap_lr: 5.0e-5
-  future_heatmap_lr: 5.0e-5
-  action_lr: 1.0e-4
-  transformer_action_lr: 1.0e-4
-  progress_lr: 1.0e-4
-  llm_projector_lr: 3.0e-5         # 5e-5 → 3e-5，更稳定
-  multi_layer_fusion_lr: 1.0e-4    # 融合模块只有少量参数，可以用较高 LR
-  lora_lr: 1.0e-5                  # LoRA 使用极低 LR
-
-  # 正则化（增强）
-  weight_decay: 1.0e-1             # 5e-2 → 1e-1
-  projector_weight_decay: 1.0e-2   # 5e-3 → 1e-2
-  
-  # EMA (Exponential Moving Average)
-  ema_decay: 0.999                   # 滑动平均衰减率，验证和保存使用 EMA 参数
-  
+  learning_rate: 2.0e-4
+  heatmap_lr: 2.0e-4
+  llm_projector_lr: 5.0e-5
+  weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1
+  warmup_steps: 500
   min_lr: 1.0e-6
-  
-  # 批量配置 — 全景 4 视角模式下 heatmap head 有效 batch = 4*4 = 16
-  batch_size: 4               # 4 视角展开后 heatmap head 实际处理 B*4=16
-  grad_accum_steps: 4         # 有效 batch = 4*4 = 16
+  batch_size: 4
+  grad_accum_steps: 2
 
 # ============================================
 # 损失函数
 # ============================================
 loss:
-  heatmap_loss_type: simplified
+  heatmap_loss_type: heatmap_vln
   
-  simplified:
-    lambda_mse: 1.0
-    lambda_grad: 0.3
-    peak_weight: 5.0
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_pos: 1.0
+    lambda_neg: 0.1
   
-  nerf_ripple:
-    lambda_mse: 1.0
-    lambda_fft: 0.3
-    lambda_radial: 0.2
-    lambda_peak: 1.0
-    fft_weight_decay: 0.5
-  
-  # 只有热力图损失有效
-  history_weight: 1.0
-  future_weight: 0.0
-  action_weight: 0.0
+  heatmap_weight: 1.0
   trajectory_weight: 0.0
   progress_weight: 0.0
-  stop_weight: 0.0
 
 # ============================================
 # GPU配置
@@ -297,7 +197,6 @@ log:
   log_level: INFO
   diag_interval: 100
   
-  # 飞书通知配置
   notify:
     enabled: true
     platform: feishu
@@ -309,6 +208,4 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 5               # 只训练一个头，可以更耐心
-  val_inference_batches: 10  # 完整扩散推理的 batch 数（计算真实 heatmap MSE）
-                             # 其余 batch 用噪声预测 loss（快 ~40x）
+  patience: 5

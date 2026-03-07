@@ -7,50 +7,40 @@ data:
   root: /root/autodl-tmp/dataset_with_actions
   train_split: train
   val_split: val_unseen
-  image_size: [224, 224]
+  image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8    # 增加 worker 数量以匹配更大 batch
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4  # 增加预取量
+  prefetch_factor: 4
   
-  # 数据集配置
-  # 'sliding_window': 原始滑动窗口数据集（单步动作）
-  # 'trajectory': 轨迹数据集（24步轨迹预测，参考 InternNav）
   dataset_type: trajectory
   
   sliding_window:
     min_history: 5
-    num_history_sample: 32       # 历史帧采样数量（与 trajectory 配置保持一致）
+    num_history_sample: 32
     load_depth: true
     cache_poses: true
-    sample_stride: 2             # 采样步长
-    
-    # Clip-level 采样策略（解决样本高度相关性问题）
+    sample_stride: 2
     clip_level_sampling: true
-    samples_per_clip: 30         # 每 clip 采样 30 个样本
-    val_samples_per_clip: 10     # 验证集采样数
+    samples_per_clip: 30
+    val_samples_per_clip: 10
   
-  # 轨迹数据集配置（参考 InternNav）
   trajectory:
     min_history: 5
-    num_history_sample: 32       # 减少历史帧数量以加速（32帧足够）
+    num_history_sample: 8
     load_depth: true
     cache_poses: true
-    sample_stride: 2             # 采样步长
+    sample_stride: 2
     clip_level_sampling: true
-    samples_per_clip: 30         # 每子序列采样 30 个样本（减少邻近帧重复）
-    val_samples_per_clip: 10     # 验证集采样数
-    # 随机子序列采样（大幅增加数据多样性）
-    random_subsequence: true          # 启用随机子序列采样
-    min_subsequence_length: 30        # 最小子序列长度
-    subsequence_samples_per_clip: 5   # 每个 clip 生成 5 个子序列
-    # 数据量: 1000 clips × 5 subseq × 30 samples = 150K/epoch
-    # 轨迹预测配置
-    predict_horizon: 24          # 预测 24 步轨迹
-    action_scale: 4.0            # 动作放大 4 倍（参考 InternNav）
-    enable_trajectory_augmentation: true  # 启用轨迹增强
-    # FGR2R 子指令配置（使指令与子序列同步）
-    use_subinstruction: true     # 启用 FGR2R 子指令
+    samples_per_clip: 30
+    val_samples_per_clip: 10
+    random_subsequence: true
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    predict_horizon: 24
+    action_scale: 4.0
+    enable_trajectory_augmentation: true
+    use_subinstruction: true
     fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
 
 # ============================================
@@ -67,55 +57,31 @@ model:
     token_dim: 1024
     torch_dtype: bfloat16
     attn_implementation: sdpa
-    max_video_frames: -1       # -1 表示不限制帧数，使用全部历史帧
-    
-    # Sequence Packing (disabled for Qwen3.5 hybrid attention)
+    max_video_frames: -1
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
 
-  # 热力图头配置 (只训练 history head)
-  heatmap_head:
-    enable_history: true
-    enable_future: false  # 禁用 future head 以节省内存
-    
-    # 条件编码维度 (512 → 1024，更好地编码空间信息)
-    cond_dim: 1024
-    
-    # UNet 架构配置 (~20M 参数，适合 64×64 条件热力图生成)
-    block_out_channels: [128, 256, 512, 512]  # 4 层，更大容量
-    layers_per_block: 2
-    attention_levels: [2, 3]                   # 在 512 层加 attention
-    
-    # Diffusion 配置
-    num_inference_steps: 20                    # 20 步推理，效率和质量平衡
-    num_train_timesteps: 100
-    
-    # Classifier-Free Guidance (CFG) - 增强条件效果
-    cfg_drop_prob: 0.1             # 训练时随机 drop 条件的概率
-    cfg_scale: 3.0                 # 推理时的引导强度 (1.0=无引导, 3.0=推荐)
-    
-    # 正则化
-    dropout: 0.1                   # 0.2 → 0.1 (降低，让模型更好地学习条件)
-    
-    # 360° 全景图支持：水平方向循环填充，处理左右边界连续性
-    use_circular_padding: true
-    
-    # CNN 消融实验开关：设为 false 禁用 ImageConditionEncoder，只用 LLM 特征
-    use_image_encoder: false
-    
-    # LLM token pooling 方式：'attention' (推荐) 或 'mean', 'first', 'last', 'max'
-    # attention pooling 更好地保留空间信息，比 mean pooling 效果更好
-    pool_method: attention
-    pool_num_heads: 8              # 4 → 8，配合更大的 cond_dim
+  # HeatmapVLN v2 Coarse-to-Fine 配置
+  heatmap:
+    enable: true
+    c_vit: 1152
+    c_llm: 4096
+    c_fused: 256
+    vit_layer_indices: [6, 12, 18, 24]
+    llm_layer_idx: 24
+    heatmap_size: [64, 64]
+    image_size: 256
+    # 损失权重
+    lambda_vis: 1.0
+    lambda_pos: 1.0
+    lambda_neg: 0.1
 
   # 动作头配置
   action_head:
     enable: true
-    # 动作头类型：'legacy' (UNet1D) 或 'transformer' (InternNav style)
     type: transformer
     
-    # Legacy (DiffusionActionHead) 配置 - 仅当 type: legacy 时使用
     legacy:
       cond_dim: 1024
       action_dim: 2
@@ -126,28 +92,27 @@ model:
       action_stats_min: [-0.1646, -0.0281]
       action_stats_max: [0.1850, 0.3087]
     
-    # Transformer (InternNav style) 配置 - 仅当 type: transformer 时使用
     transformer:
-      vlm_token_dim: 1024        # VLM 输出维度
-      n_emb: 384                 # 内部嵌入维度 (原 token_dim)
-      predict_size: 24           # 预测 24 步轨迹
-      n_layer: 16                # Transformer Decoder 层数 (原 temporal_depth)
-      n_head: 6                  # 对齐 InternNav: n_emb // head_dim = 384 // 64 = 6
-      n_cond_layers: 4           # 条件编码器层数 (参考 InternNav)
-      action_dim: 3              # 动作维度 (dx, dy, delta_yaw)
-      num_train_timesteps: 20    # 扩散训练步数
-      p_drop_emb: 0.2            # Embedding dropout (0.1 → 0.2 防过拟合)
-      p_drop_attn: 0.2           # Attention dropout (0.1 → 0.2 防过拟合)
-      causal_attn: true          # 使用因果注意力
+      vlm_token_dim: 1024
+      n_emb: 384
+      predict_size: 24
+      n_layer: 16
+      n_head: 6
+      n_cond_layers: 4
+      action_dim: 3
+      num_train_timesteps: 20
+      p_drop_emb: 0.2
+      p_drop_attn: 0.2
+      causal_attn: true
 
-  # Progress 预测头配置（替代 Stop Head，对齐 InternNav）
+  # Progress 预测头配置
   progress_head:
     enable: true
     hidden_dim: 512
-    dropout: 0.3                 # 0.1 → 0.3 (最简单的头，增加最多 dropout)
-    concat_state_txt: true       # 对齐 InternNav: state + text_embed 拼接
+    dropout: 0.3
+    concat_state_txt: true
 
-  # Stop 预测头配置（已弃用，使用 progress_head 替代）
+  # Stop 预测头配置（已弃用）
   stop_head:
     enable: false
     hidden_dim: 512
@@ -155,85 +120,62 @@ model:
     focal_alpha: 0.9
 
 # ============================================
-# 训练策略（单阶段训练）
+# 训练策略
 # ============================================
 training:
   stages:
-    - name: history_only_64
-      epochs: 10  # 150K/epoch × 10 = 1.5M 总样本，数据/参数=37×
+    - name: coarse_to_fine_64
+      epochs: 10
       hm_size: [64, 64]
-      heatmap_loss_type: simplified
-      train_history: true
-      train_future: false
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
       train_action: true
       trainable_modules:
-        - history_heatmap_head
-        - transformer_action_head  # 新的 Transformer 动作头
-        - progress_head            # 新的进度预测头
+        - heatmap_vln          # DPTLiteFusion + FineLocalization (~2M params)
+        - transformer_action_head
+        - progress_head
         - llm_projector
       frozen_modules:
-        - qwen3_5
-        - future_heatmap_head
-        - action_head              # Legacy action head（如果存在）
-        - stop_head                # Legacy stop head
+        - qwen3_5              # 冻结 VLM 全部参数
+        - action_head
+        - stop_head
 
 # ============================================
 # 优化器配置
 # ============================================
 optim:
   optimizer: adamw
-
-  # 分组学习率 - 对齐 InternNav 基线 1e-4
-  heatmap_lr: 1.0e-4               # 对齐 InternNav 基线
-  history_heatmap_lr: 1.0e-4       # 对齐 InternNav 基线
-  future_heatmap_lr: 1.0e-4        # 对齐 InternNav 基线
-  action_lr: 1.0e-4                # 对齐 InternNav 基线
-  transformer_action_lr: 1.0e-4    # 对齐 InternNav 基线 (必须)
-  progress_lr: 1.0e-4              # 对齐 InternNav DistanceNetwork
-  llm_projector_lr: 1.0e-4         # 与下游头一致（参考 InternNav）
-
-  # 正则化 (增强以防过拟合)
-  weight_decay: 5.0e-2             # 1e-2 → 5e-2 (增加5倍)
-  projector_weight_decay: 5.0e-3   # 1e-3 → 5e-3 (增加5倍)
-  
+  learning_rate: 2.0e-4
+  heatmap_lr: 2.0e-4
+  action_lr: 1.0e-4
+  transformer_action_lr: 1.0e-4
+  progress_lr: 1.0e-4
+  llm_projector_lr: 1.0e-4
+  weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.1
-  min_lr: 1.0e-6               # 最小学习率，避免训练后期 LR 降到 0
-  
-  # 批量配置
-  # RTX 5090 32GB - 优化显存利用率
-  # 当前使用 ~17GB，目标 ~28GB
-  # 有效批量: 8 * 4 = 32
-  batch_size: 8
-  grad_accum_steps: 4
+  warmup_steps: 500
+  min_lr: 1.0e-6
+  batch_size: 4
+  grad_accum_steps: 2
 
 # ============================================
 # 损失函数
 # ============================================
 loss:
-  heatmap_loss_type: simplified
+  heatmap_loss_type: heatmap_vln
   
-  simplified:
-    lambda_mse: 1.0
-    lambda_grad: 0.3
-    peak_weight: 5.0
-  
-  nerf_ripple:
-    lambda_mse: 1.0
-    lambda_fft: 0.3
-    lambda_radial: 0.2
-    lambda_peak: 1.0
-    fft_weight_decay: 0.5
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_pos: 1.0
+    lambda_neg: 0.1
   
   # 各头损失权重
-  history_weight: 1.0
-  future_weight: 1.0
-  action_weight: 1.0        # Legacy action head
-  trajectory_weight: 1.0    # Transformer action head (24 step trajectory)
-  progress_weight: 1.0      # 0.5 → 1.0 (与其他头相同权重)
-  stop_weight: 0.5          # Legacy stop head (disabled)
+  heatmap_weight: 1.0
+  trajectory_weight: 1.0
+  progress_weight: 1.0
 
 # ============================================
 # GPU配置
@@ -248,8 +190,8 @@ gpu:
 log:
   out_dir: /root/autodl-tmp/vln_training_outputs
   save_every_epochs: 1
-  vis_every_steps: 100       # 训练时每 N 步可视化
-  val_vis_batches: 2         # 验证时可视化前 N 个 batch
+  vis_every_steps: 100
+  val_vis_batches: 2
   max_ckpts: 3
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs
@@ -259,7 +201,6 @@ log:
   log_level: INFO
   diag_interval: 100
   
-  # 飞书通知配置
   notify:
     enabled: true
     platform: feishu
@@ -271,4 +212,4 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 5                      # 10 → 5 (更早停止防过拟合)
+  patience: 5

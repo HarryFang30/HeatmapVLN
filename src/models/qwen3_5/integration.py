@@ -68,11 +68,6 @@ class Qwen3_5Config:
     # Hidden state extraction
     hidden_layer_for_features: int = -1  # -1 = last layer (deprecated when multi_layer_features=True)
     
-    # Multi-layer feature extraction (CVPR 2025 best practice)
-    # 从 LLM 的不同深度提取特征并融合，保留空间+语义信息
-    multi_layer_features: bool = False
-    feature_layer_indices: Optional[List[int]] = None  # e.g. [3, 11, 19, 27] for 32-layer LLM
-    
     # Video processing
     max_video_frames: int = 16  # Maximum frames to process
     
@@ -88,9 +83,6 @@ class Qwen3_5Config:
     lora_num_layers: int = 4      # Number of last LLM layers to apply LoRA
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
-    
-    # ViT pre-merge feature extraction for spatial-semantic fusion
-    vit_hook_layers: Optional[List[int]] = None  # ViT block indices (e.g. [6, 13, 20, 26])
     
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
@@ -134,11 +126,6 @@ class Qwen3_5Integration(nn.Module):
         # Sequence packing state
         self._packing_enabled = config.enable_packing
         self._varlen_attention_replaced = False
-        
-        # ViT pre-merge feature hooks
-        self._vit_hook_indices = config.vit_hook_layers or []
-        self._vit_hook_handles: List = []
-        self._vit_block_features: Dict[int, List[torch.Tensor]] = {}
         
         logger.info(f"Qwen3_5Integration initialized (model will be loaded on first forward)")
     
@@ -188,110 +175,10 @@ class Qwen3_5Integration(nn.Module):
             logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
             logger.info(f"Batch processing enabled (padding_side='left')")
             
-            # Register ViT block hooks for pre-merge spatial features
-            if self._vit_hook_indices:
-                self._register_vit_hooks()
-            
         except Exception as e:
             logger.error(f"Failed to load Qwen3.5: {e}")
             raise
     
-    # ------------------------------------------------------------------
-    # ViT pre-merge feature hooks
-    # ------------------------------------------------------------------
-
-    def _get_visual_module(self):
-        """Resolve the Qwen3_5VisionModel regardless of LoRA wrapping."""
-        model = self.model
-        # PeftModel wraps: peft_model.base_model (LoraModel) .model (Qwen3_5ForConditionalGeneration)
-        if hasattr(model, 'base_model'):
-            model = model.base_model
-        if hasattr(model, 'model'):
-            inner = model.model
-            # inner may be Qwen3_5ForConditionalGeneration or Qwen3_5Model
-            if hasattr(inner, 'visual'):
-                return inner.visual
-            if hasattr(inner, 'model') and hasattr(inner.model, 'visual'):
-                return inner.model.visual
-        if hasattr(model, 'visual'):
-            return model.visual
-        raise RuntimeError("Cannot locate vision model in model hierarchy")
-
-    def _register_vit_hooks(self):
-        """Register forward hooks on ViT blocks to capture pre-merge features."""
-        visual = self._get_visual_module()
-        num_blocks = len(visual.blocks)
-        for idx in self._vit_hook_indices:
-            if idx >= num_blocks:
-                logger.warning(
-                    f"ViT hook block {idx} out of range (max {num_blocks - 1}), skipping"
-                )
-                continue
-
-            def _make_hook(layer_idx: int):
-                def _hook(module, _input, output):
-                    self._vit_block_features[layer_idx].append(output.detach())
-                return _hook
-
-            handle = visual.blocks[idx].register_forward_hook(_make_hook(idx))
-            self._vit_hook_handles.append(handle)
-        logger.info(f"Registered ViT pre-merge hooks on blocks {self._vit_hook_indices}")
-
-    def _clear_vit_hooks(self):
-        """Reset captured features before each forward pass."""
-        self._vit_block_features = {idx: [] for idx in self._vit_hook_indices}
-
-    def _extract_image_vit_features(
-        self,
-        image_grid_thw: Optional[torch.Tensor],
-    ) -> Optional[List[torch.Tensor]]:
-        """
-        Extract per-image pre-merge ViT features from hook captures,
-        un-shuffle the pixel-shuffle ordering, and reshape to 2-D feature maps.
-
-        Returns:
-            List of ``len(vit_hook_indices)`` tensors, each
-            ``(num_images, vit_dim, h_pre, w_pre)``, or *None*.
-        """
-        if not self._vit_hook_indices or image_grid_thw is None:
-            return None
-
-        merge_s = self.config.spatial_merge_size
-        num_images = image_grid_thw.shape[0]
-
-        # Per-image pre-merge patch counts
-        per_image_sizes = (
-            image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
-        ).tolist()
-
-        result_layers: List[torch.Tensor] = []
-        for idx in self._vit_hook_indices:
-            captures = self._vit_block_features.get(idx, [])
-            if not captures:
-                return None
-            # First capture = images (get_image_features is called before get_video_features)
-            features = captures[0]  # (total_image_patches, vit_dim)
-
-            per_image = torch.split(features, [int(s) for s in per_image_sizes])
-            images_2d = []
-            for img_i in range(num_images):
-                patches = per_image[img_i]  # (t*h*w, dim)
-                t_val, h_val, w_val = (int(v) for v in image_grid_thw[img_i].tolist())
-                dim = patches.shape[-1]
-                h_m = h_val // merge_s
-                w_m = w_val // merge_s
-                # Un-shuffle: (h_m, w_m, merge, merge, dim) → (h_pre, w_pre, dim)
-                patches = patches.view(t_val, h_m, w_m, merge_s, merge_s, dim)
-                patches = patches.permute(0, 1, 3, 2, 4, 5).contiguous()
-                patches = patches.view(t_val, h_m * merge_s, w_m * merge_s, dim)
-                patches = patches.squeeze(0)          # (h_pre, w_pre, dim)
-                patches = patches.permute(2, 0, 1)    # (dim, h_pre, w_pre)
-                images_2d.append(patches)
-
-            result_layers.append(torch.stack(images_2d, dim=0))
-
-        return result_layers  # List[(num_images, vit_dim, h_pre, w_pre)]
-
     # ------------------------------------------------------------------
     # LoRA
     # ------------------------------------------------------------------
@@ -530,19 +417,17 @@ class Qwen3_5Integration(nn.Module):
 
         all_hidden = []
         all_vision = []
-        all_vit_pre = []
         max_image_tokens = 0
 
         for b in range(batch_size):
             instr_b = (
                 instruction[b] if isinstance(instruction, list) else instruction
             )
-            hs, vis, n_img, vit_pre = self._forward_single(
+            hs, vis, n_img, _ = self._forward_single(
                 history_frames[b], current_frame[b], instr_b, return_hidden_states,
             )
             all_hidden.append(hs)
             all_vision.append(vis)
-            all_vit_pre.append(vit_pre)
             max_image_tokens = max(max_image_tokens, n_img)
 
         # Stack results
@@ -560,34 +445,13 @@ class Qwen3_5Integration(nn.Module):
             return torch.cat(padded, dim=0)
 
         if return_hidden_states:
-            if isinstance(all_hidden[0], list):
-                # Multi-layer: list of tensors per layer
-                n_layers = len(all_hidden[0])
-                hidden_states = []
-                for li in range(n_layers):
-                    layer_tensors = [h[li] for h in all_hidden]
-                    hidden_states.append(_pad_and_stack(layer_tensors))
-                vision_hidden_states = []
-                for li in range(n_layers):
-                    layer_vis = [v[li] for v in all_vision]
-                    vision_hidden_states.append(_pad_and_stack(layer_vis))
-            else:
-                hidden_states = _pad_and_stack(all_hidden)
-                vision_hidden_states = _pad_and_stack(all_vision) if all_vision[0] is not None else None
+            hidden_states = _pad_and_stack(all_hidden)
+            vision_hidden_states = _pad_and_stack(all_vision) if all_vision[0] is not None else None
         else:
             hidden_states = None
             vision_hidden_states = None
 
-        # Stack ViT pre-merge features
-        vit_pre_merge = None
-        if all_vit_pre[0] is not None:
-            n_vit_layers = len(all_vit_pre[0])
-            vit_pre_merge = []
-            for li in range(n_vit_layers):
-                layer_feats = [vp[li] for vp in all_vit_pre]
-                vit_pre_merge.append(torch.cat(layer_feats, dim=0))
-
-        return hidden_states, vision_hidden_states, max_image_tokens, vit_pre_merge
+        return hidden_states, vision_hidden_states, max_image_tokens, None
     
     def _forward_single(
         self,
@@ -637,51 +501,27 @@ class Qwen3_5Integration(nn.Module):
                 )
                 inputs["video_grid_thw"][:, 0] = 1
 
-        if self._vit_hook_indices:
-            self._clear_vit_hooks()
-        
         outputs = self.model(
             **inputs,
             output_hidden_states=return_hidden_states,
             return_dict=True,
         )
         
-        vit_pre_merge = None
-        if self._vit_hook_indices:
-            vit_pre_merge = self._extract_image_vit_features(
-                inputs.get("image_grid_thw")
-            )
-        
         if return_hidden_states:
-            if self.config.multi_layer_features and self.config.feature_layer_indices:
-                multi_hidden = []
-                for li in self.config.feature_layer_indices:
-                    idx = li if li >= 0 else len(outputs.hidden_states) + li
-                    idx = min(idx, len(outputs.hidden_states) - 1)
-                    multi_hidden.append(outputs.hidden_states[idx])
-                hidden_states = multi_hidden
-            else:
-                layer_idx = self.config.hidden_layer_for_features
-                if layer_idx == -1:
-                    layer_idx = len(outputs.hidden_states) - 1
-                hidden_states = outputs.hidden_states[layer_idx]
+            layer_idx = self.config.hidden_layer_for_features
+            if layer_idx == -1:
+                layer_idx = len(outputs.hidden_states) - 1
+            hidden_states = outputs.hidden_states[layer_idx]
         else:
             hidden_states = None
         
         vision_hidden_states = None
         if hidden_states is not None:
-            if isinstance(hidden_states, list):
-                vision_hidden_list = []
-                for hs in hidden_states:
-                    vis_hs = self._extract_vision_hidden_states(hs, input_ids)
-                    vision_hidden_list.append(vis_hs)
-                vision_hidden_states = vision_hidden_list
-            else:
-                vision_hidden_states = self._extract_vision_hidden_states(
-                    hidden_states, input_ids
-                )
+            vision_hidden_states = self._extract_vision_hidden_states(
+                hidden_states, input_ids
+            )
         
-        return hidden_states, vision_hidden_states, num_image_tokens, vit_pre_merge
+        return hidden_states, vision_hidden_states, num_image_tokens, None
     
     def forward(
         self,
@@ -699,7 +539,7 @@ class Qwen3_5Integration(nn.Module):
         batch_size = history_frames.shape[0]
         
         # Use batch forward for efficiency
-        hidden_states, vision_hidden_states, num_image_tokens, vit_pre_merge = (
+        hidden_states, vision_hidden_states, num_image_tokens, _ = (
             self._forward_batch(
                 history_frames, current_frame, instruction, return_hidden_states,
             )
@@ -725,7 +565,6 @@ class Qwen3_5Integration(nn.Module):
             "vision_hidden_states": vision_hidden_states,
             "generated_text": generated_text,
             "num_image_tokens": num_image_tokens,
-            "vit_pre_merge_features": vit_pre_merge,
         }
     
     def _generate_text_single(
@@ -761,16 +600,6 @@ class Qwen3_5Integration(nn.Module):
         )[0]
         
         return generated_text
-    
-    def is_multi_layer(self) -> bool:
-        """Check if multi-layer feature extraction is enabled."""
-        return self.config.multi_layer_features and bool(self.config.feature_layer_indices)
-    
-    def get_num_feature_layers(self) -> int:
-        """Get number of feature layers being extracted."""
-        if self.is_multi_layer():
-            return len(self.config.feature_layer_indices)
-        return 1
     
     def _extract_hidden_from_generation(
         self,

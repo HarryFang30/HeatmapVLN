@@ -4,18 +4,16 @@ VLN Models Module
 
 This module provides a VLN pipeline that uses Qwen3.5 for video understanding.
 
-Architecture:
-```
-Video Frames + Instruction
+Architecture (v2 — Coarse-to-Fine):
+    Current panorama (4 views) + N history panoramas (N*4 views) + text
         |
-    Qwen3.5 (Vision Encoder + LLM)
+    Qwen3.5 (Vision Encoder + LLM, frozen)
         |
-    Hidden States Projection (4096 -> 1024)
+    ViT features (16x16) + LLM features (8x8) + text hidden states
         |
-    Output Heads:
-        - History Heatmap (Spatial-Semantic Fusion)
-        - Action Head
-```
+    Coarse Localisation (zero params) -> visibility + 8x8 heatmap
+        |
+    Fine Localisation (~2M params) -> 64x64 heatmap
 """
 
 # === Qwen3.5 Integration ===
@@ -31,11 +29,14 @@ from .pipeline import (
     create_vln_pipeline,
 )
 
-# === Heatmap Components (Diffusion-based) ===
+# === Heatmap Components (v2 Coarse-to-Fine) ===
 from .heatmap import (
-    DiffusionHeatmapHead,
-    DiffusionHeatmapConfig,
-    create_diffusion_heatmap_head,
+    HeatmapVLN,
+    HeatmapVLNLoss,
+    CoarseLocalization,
+    DPTLiteFusion,
+    FineLocalization,
+    FeatureExtractor,
 )
 
 # === Action Components ===
@@ -56,22 +57,25 @@ __all__ = [
     # Qwen3.5 Integration
     'Qwen3_5Integration',
     'Qwen3_5Config',
-    
+
     # VLN Pipeline
     'VLNPipeline',
     'VLNPipelineConfig',
     'create_vln_pipeline',
-    
-    # Heatmap Components
-    'DiffusionHeatmapHead',
-    'DiffusionHeatmapConfig',
-    'create_diffusion_heatmap_head',
-    
+
+    # Heatmap Components (v2)
+    'HeatmapVLN',
+    'HeatmapVLNLoss',
+    'CoarseLocalization',
+    'DPTLiteFusion',
+    'FineLocalization',
+    'FeatureExtractor',
+
     # Action Components
     'DiffusionActionHead',
     'DiffusionActionConfig',
     'StopPredictionHead',
-    
+
     # Other
     'MLP',
 ]

@@ -457,7 +457,9 @@ def visualize_heatmap_predictions(
         current_frames = batch['current_frame']
         gt_heatmaps = gt_heatmap_override if gt_heatmap_override is not None else batch['heatmap']
         
-        pred_heatmaps = output.get('history_heatmaps')
+        pred_heatmaps = output.get('heatmaps')
+        if pred_heatmaps is None:
+            pred_heatmaps = output.get('history_heatmaps')
         if pred_heatmaps is None:
             pred_heatmaps = output.get('future_heatmaps')
         
@@ -612,7 +614,7 @@ def build_model(cfg: Dict) -> nn.Module:
     """构建 VLN Pipeline"""
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
-    heatmap_cfg = model_cfg.get('heatmap_head', {})
+    heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     stop_cfg = model_cfg.get('stop_head', {})
     progress_cfg = model_cfg.get('progress_head', {})
@@ -627,10 +629,10 @@ def build_model(cfg: Dict) -> nn.Module:
     config = VLNPipelineConfig(
         # Qwen3.5
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
-        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
         
         # Sequence Packing (disabled for Qwen3.5)
@@ -641,70 +643,18 @@ def build_model(cfg: Dict) -> nn.Module:
         # Device
         device=model_cfg.get('device', 'cuda'),
         
-        # Heatmap
-        heatmap_size=tuple(cfg['data']['init_hm_size']),
-        enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
-        enable_future_heatmap_head=heatmap_cfg.get('enable_future', True),
-        diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
-        diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        image_size=cfg['data']['image_size'][0],
-        # Heatmap head ablation settings
-        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', True),
-        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
-        heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
-        # 360° panorama support: circular padding for horizontal edges
-        heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
-        # Regularization
-        heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
-        # UNet architecture (model capacity) - ~20M params with [128, 256, 512, 512]
-        heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
-        heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
-        heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
-        heatmap_cross_attention_levels=tuple(heatmap_cfg['cross_attention_levels']) if heatmap_cfg.get('cross_attention_levels') else None,
-        heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
-        # Classifier-Free Guidance (CFG) for heatmap
-        heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
-        heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
-        # Sequence cross-attention conditioning
-        heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
-        heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
-        heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
-        # Spatial feature injection
-        heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
-        # Image encoder backbone (pretrained ResNet-18 vs lightweight CNN)
-        heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
-        # Inference sharpening (spatial softmax with temperature)
-        heatmap_sharpen_temperature=heatmap_cfg.get('sharpen_temperature', 0.1),
-        # Sample weighting (positive/negative balance)
-        heatmap_negative_sample_weight=heatmap_cfg.get('negative_sample_weight', 0.3),
-        heatmap_positive_sample_boost=heatmap_cfg.get('positive_sample_boost', 3.0),
-        # Spatial importance weighting
-        heatmap_peak_spatial_weight=heatmap_cfg.get('peak_spatial_weight', 10.0),
-        
-        # Head type switch: "diffusion", "direct", or "dpt"
-        heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
-        # DPT / Spatial-Semantic Fusion head config
-        dpt_proj_dim=heatmap_cfg.get('dpt', {}).get('proj_dim', 256),
-        dpt_features=heatmap_cfg.get('dpt', {}).get('features', 256),
-        dpt_vit_dim=heatmap_cfg.get('dpt', {}).get('vit_dim', 1152),
-        dpt_vit_hook_layers=heatmap_cfg.get('dpt', {}).get('vit_hook_layers', None),
-        dpt_spatial_merge_size=heatmap_cfg.get('dpt', {}).get('spatial_merge_size', 2),
-        dpt_n_cross_attn_heads=heatmap_cfg.get('dpt', {}).get('n_cross_attn_heads', 4),
-        dpt_lambda_spatial=heatmap_cfg.get('dpt', {}).get('lambda_spatial', 0.5),
-        # Direct head specific config
-        direct_heatmap_hidden_dim=heatmap_cfg.get('direct', {}).get('hidden_dim', 256),
-        direct_heatmap_num_decoder_blocks=heatmap_cfg.get('direct', {}).get('num_decoder_blocks', 3),
-        direct_heatmap_decoder_num_heads=heatmap_cfg.get('direct', {}).get('decoder_num_heads', 8),
-        direct_heatmap_decoder_head_dim=heatmap_cfg.get('direct', {}).get('decoder_head_dim', 64),
-        direct_heatmap_lambda_dice=heatmap_cfg.get('direct', {}).get('lambda_dice', 0.5),
-        direct_heatmap_lambda_peak=heatmap_cfg.get('direct', {}).get('lambda_peak', 1.0),
-        direct_heatmap_focal_gamma=heatmap_cfg.get('direct', {}).get('focal_gamma', 2.0),
-        direct_heatmap_init_bias=heatmap_cfg.get('direct', {}).get('init_bias', -5.0),
-        
-        # Multi-layer feature extraction
-        multi_layer_features=llm_cfg.get('multi_layer_features', False),
-        feature_layer_indices=llm_cfg.get('feature_layer_indices', None),
-        feature_fusion_method=llm_cfg.get('feature_fusion_method', 'weighted_sum'),
+        # HeatmapVLN v2 (Coarse-to-Fine)
+        enable_heatmap=heatmap_cfg.get('enable', True),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
+        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
+        image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
+        heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
+        heatmap_lambda_pos=heatmap_cfg.get('lambda_pos', 1.0),
+        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 0.1),
         
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),
@@ -787,17 +737,12 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
     
     trainable = stage_cfg.get('trainable_modules', [])
     
-    # History Heatmap Head
-    if 'history_heatmap_head' in trainable:
-        if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
-            freeze_module(model.history_heatmap_head, freeze=False)
-            logger.info("  ✓ Unfrozen: history_heatmap_head")
-            
-    # Future Heatmap Head
-    if 'future_heatmap_head' in trainable:
-        if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
-            freeze_module(model.future_heatmap_head, freeze=False)
-            logger.info("  ✓ Unfrozen: future_heatmap_head")
+    # HeatmapVLN v2 (DPTLiteFusion + FineLocalization)
+    if 'heatmap_vln' in trainable:
+        if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
+            freeze_module(model.heatmap_vln.dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.fine, freeze=False)
+            logger.info("  ✓ Unfrozen: heatmap_vln (dpt_fusion + fine)")
     
     # Action head (Legacy)
     if 'action_head' in trainable:
@@ -829,11 +774,6 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             freeze_module(model.llm_projector, freeze=False)
             logger.info("  ✓ Unfrozen: llm_projector")
     
-    # Multi-layer Fusion module
-    if 'multi_layer_fusion' in trainable:
-        if hasattr(model, 'multi_layer_fusion') and model.multi_layer_fusion is not None:
-            freeze_module(model.multi_layer_fusion, freeze=False)
-            logger.info("  ✓ Unfrozen: multi_layer_fusion")
     
     # Qwen3.5: 冻结基座，但保留 LoRA 参数可训练
     if hasattr(model, 'qwen3_5') and model.qwen3_5 is not None:
@@ -891,54 +831,18 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         return groups
     
     # History Heatmap Head — split ResNet backbone (low lr) from rest (normal lr)
-    hist_lr = optim_cfg.get('history_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
-    resnet_backbone_lr = optim_cfg.get('resnet_backbone_lr', 1e-5)
-    if hasattr(model, 'history_heatmap_head') and model.history_heatmap_head is not None:
-        head = model.history_heatmap_head
-        has_resnet = (hasattr(head, 'condition_encoder') and 
-                      hasattr(head.condition_encoder, 'image_encoder') and
-                      hasattr(head.condition_encoder.image_encoder, 'img_mean'))  # ResNet marker
-        
-        if has_resnet:
-            resnet_encoder = head.condition_encoder.image_encoder
-            resnet_param_ids = set(id(p) for p in resnet_encoder.parameters())
-            
-            resnet_groups = get_param_groups_with_wd(
-                resnet_encoder, resnet_backbone_lr, 'resnet_backbone', default_wd)
-            if resnet_groups:
-                param_groups.extend(resnet_groups)
-                n_resnet = sum(len(g['params']) for g in resnet_groups)
-                print(f"  Param group: resnet_backbone (lr={resnet_backbone_lr}, wd={default_wd}, params={n_resnet})")
-            
-            rest_decay, rest_no_decay = [], []
-            for name, p in head.named_parameters():
-                if not p.requires_grad or id(p) in resnet_param_ids:
-                    continue
-                if p.dim() <= 1 or name.endswith('.bias'):
-                    rest_no_decay.append(p)
-                else:
-                    rest_decay.append(p)
-            if rest_decay:
-                param_groups.append({'params': rest_decay, 'lr': hist_lr, 
-                                     'weight_decay': default_wd, 'name': 'history_heatmap_head'})
-            if rest_no_decay:
-                param_groups.append({'params': rest_no_decay, 'lr': hist_lr,
-                                     'weight_decay': 0.0, 'name': 'history_heatmap_head_no_decay'})
-            n_rest = len(rest_decay) + len(rest_no_decay)
-            print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd}, params={n_rest})")
-        else:
-            groups = get_param_groups_with_wd(head, hist_lr, 'history_heatmap_head', default_wd)
-            if groups:
-                param_groups.extend(groups)
-                print(f"  Param group: history_heatmap_head (lr={hist_lr}, wd={default_wd})")
-    
-    # Future Heatmap Head
-    fut_lr = optim_cfg.get('future_heatmap_lr', optim_cfg.get('heatmap_lr', 1e-4))
-    if hasattr(model, 'future_heatmap_head') and model.future_heatmap_head is not None:
-        groups = get_param_groups_with_wd(model.future_heatmap_head, fut_lr, 'future_heatmap_head', default_wd)
+    # HeatmapVLN v2 param groups
+    heatmap_lr = optim_cfg.get('heatmap_lr', 2e-4)
+    if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
+        groups = get_param_groups_with_wd(model.heatmap_vln.dpt_fusion, heatmap_lr, 'heatmap_dpt_fusion', default_wd)
         if groups:
             param_groups.extend(groups)
-            print(f"  Param group: future_heatmap_head (lr={fut_lr}, wd={default_wd})")
+            print(f"  Param group: heatmap_dpt_fusion (lr={heatmap_lr}, wd={default_wd})")
+        groups = get_param_groups_with_wd(model.heatmap_vln.fine, heatmap_lr, 'heatmap_fine', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: heatmap_fine (lr={heatmap_lr}, wd={default_wd})")
+    
     
     # Action Head (Legacy)
     action_lr = optim_cfg.get('action_lr', 1e-4)
@@ -980,13 +884,6 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             param_groups.extend(groups)
             print(f"  Param group: llm_projector (lr={proj_lr}, wd={projector_wd})")
     
-    # Multi-layer Fusion module
-    fusion_lr = optim_cfg.get('multi_layer_fusion_lr', 1e-4)
-    if hasattr(model, 'multi_layer_fusion') and model.multi_layer_fusion is not None:
-        groups = get_param_groups_with_wd(model.multi_layer_fusion, fusion_lr, 'multi_layer_fusion', projector_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: multi_layer_fusion (lr={fusion_lr}, wd={projector_wd})")
     
     # Qwen3.5 LoRA parameters (very low LR for backbone fine-tuning)
     lora_lr = optim_cfg.get('lora_lr', 1e-5)
@@ -1104,7 +1001,7 @@ def train_one_epoch(
     # 设 _inference_interval = grad_accum * diag_interval, 并每 epoch 重置计数器
     diag_interval = cfg['log'].get('diag_interval', 100)
     aligned_interval = grad_accum_steps * diag_interval
-    for head_attr in ['history_heatmap_head', 'future_heatmap_head']:
+    for head_attr in ['heatmap_vln']:
         head = getattr(model, head_attr, None)
         if head is not None and hasattr(head, '_training_step_counter'):
             head._training_step_counter = 0
@@ -1200,15 +1097,24 @@ def train_one_epoch(
                     gt_future_heatmap=gt_heatmap if train_future else None,
                 )
             
-            # Heatmap Loss
+            # Heatmap Loss (v2: HeatmapVLNLoss computed externally)
             heatmap_loss = torch.tensor(0.0, device=device)
-            loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
             
-            if train_history and 'history_heatmap_loss' in output:
-                heatmap_loss = output['history_heatmap_loss']
-            
-            if train_future and 'future_heatmap_loss' in output:
-                heatmap_loss = heatmap_loss + output['future_heatmap_loss']
+            if train_history and 'visibility' in output and 'heatmaps' in output:
+                from src.models.heatmap import HeatmapVLNLoss
+                hm_loss_fn = HeatmapVLNLoss(
+                    lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
+                    lambda_pos=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+                    lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
+                ).to(device)
+                if gt_heatmap is not None:
+                    loss_dict = hm_loss_fn(
+                        output['visibility'],
+                        output['heatmaps'],
+                        gt_vis=gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device),
+                        gt_heatmaps=gt_heatmap.to(device),
+                    )
+                    heatmap_loss = loss_dict['total']
             
             # Action Loss / Trajectory Loss
             action_loss = torch.tensor(0.0, device=device)
@@ -1343,17 +1249,14 @@ def train_one_epoch(
                 # 诊断信息记录（固定间隔）
                 diag_interval = cfg['log'].get('diag_interval', 100)
                 if global_step % diag_interval == 0:
-                    # 多层融合权重诊断
-                    if hasattr(model, 'multi_layer_fusion') and model.multi_layer_fusion is not None:
-                        fusion_weights = model.multi_layer_fusion.get_layer_weights()
-                        layer_indices = cfg['model']['llm'].get('feature_layer_indices', [])
-                        for i, (li, w) in enumerate(zip(layer_indices, fusion_weights)):
-                            tb_writer.add_scalar(f'diag/fusion_weight_layer{li}', w, actual_step)
-                        logger.info(f"[DIAG-FUSION] layer_weights: {dict(zip(layer_indices, [f'{w:.3f}' for w in fusion_weights]))}")
+                    # 多层融合权重诊断 (legacy, removed in v2)
+                    if False:
+                        pass
                     
                     # 热力图输出诊断 - 检查是否坍缩为全黑
-                    if 'history_heatmaps' in output and output['history_heatmaps'] is not None:
-                        pred_hm = output['history_heatmaps'].detach()
+                    pred_hm_key = 'heatmaps' if 'heatmaps' in output else 'history_heatmaps'
+                    if pred_hm_key in output and output[pred_hm_key] is not None:
+                        pred_hm = output[pred_hm_key].detach()
                         
                         # 多视角 [B, 4, H, W]: 取 front 视角；单视角 [B, 1, H, W]: 不变
                         if pred_hm.dim() == 4 and pred_hm.shape[1] == 4:
@@ -1505,19 +1408,10 @@ def train_one_epoch(
                         except Exception as e:
                             logger.debug(f"Multi-peak eval error (non-critical): {e}")
                     
-                    # 按噪声水平分层的 Epsilon MSE（真实反映模型在不同时间步的噪声预测能力）
-                    if 'history_heatmap_eps_mse_high_snr' in output and output['history_heatmap_eps_mse_high_snr'] is not None:
-                        tb_writer.add_scalar('diag/eps_mse_high_snr', output['history_heatmap_eps_mse_high_snr'], actual_step)
-                        tb_writer.add_scalar('diag/eps_mse_mid_snr', output['history_heatmap_eps_mse_mid_snr'], actual_step)
-                        tb_writer.add_scalar('diag/eps_mse_low_snr', output['history_heatmap_eps_mse_low_snr'], actual_step)
                     
-                    # 空间分段 Epsilon MSE（验证空间加权是否将学习能力集中到峰值区域）
-                    if 'history_heatmap_eps_mse_peak' in output and output['history_heatmap_eps_mse_peak'] is not None:
-                        tb_writer.add_scalar('diag/eps_mse_peak', output['history_heatmap_eps_mse_peak'], actual_step)
-                        tb_writer.add_scalar('diag/eps_mse_bg', output['history_heatmap_eps_mse_bg'], actual_step)
                     
-                    # Spatial-Semantic Fusion head 诊断指标 (head_type="dpt")
-                    if 'history_heatmap_dpt_kl_loss' in output:
+                    # Legacy DPT head diagnostics (removed in v2)
+                    if False:
                         for dkey in ('dpt_kl_loss', 'dpt_spatial_loss',
                                      'dpt_pred_max', 'dpt_pred_mean',
                                      'dpt_n_pos', 'dpt_n_neg'):
@@ -1525,8 +1419,8 @@ def train_one_epoch(
                             if val is not None:
                                 tb_writer.add_scalar(f'diag/{dkey}', val, actual_step)
                     
-                    # Direct head 诊断指标（仅 head_type="direct" 时存在）
-                    if 'history_heatmap_direct_mse' in output and output['history_heatmap_direct_mse'] is not None:
+                    # Legacy direct head diagnostics (removed in v2)
+                    if False:
                         for dkey in ('direct_mse', 'direct_bce', 'direct_dice_loss',
                                      'direct_peak_loss', 'direct_mse_peak', 'direct_mse_bg',
                                      'direct_pred_max', 'direct_pred_mean',
@@ -1764,10 +1658,19 @@ def validate(
                     gt_history_heatmap=gt_heatmap if train_history else None,
                 )
             
-            # Training loss（与训练一致）
+            # Heatmap loss (v2)
             heatmap_loss = torch.tensor(0.0, device=device)
-            if train_history and 'history_heatmap_loss' in output:
-                heatmap_loss = output['history_heatmap_loss']
+            if train_history and 'visibility' in output and 'heatmaps' in output:
+                from src.models.heatmap import HeatmapVLNLoss
+                hm_loss_fn = HeatmapVLNLoss().to(device)
+                if gt_heatmap is not None:
+                    loss_dict = hm_loss_fn(
+                        output['visibility'],
+                        output['heatmaps'],
+                        gt_vis=gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device),
+                        gt_heatmaps=gt_heatmap.to(device),
+                    )
+                    heatmap_loss = loss_dict['total']
             
             # Action Loss / Trajectory Loss (验证)
             action_loss = torch.tensor(0.0, device=device)
@@ -1864,8 +1767,9 @@ def validate(
                     )
                 
                 # 计算完整推理的 heatmap MSE（真实生成质量指标）
-                if train_history and 'history_heatmaps' in vis_output:
-                    infer_pred_hm = vis_output['history_heatmaps']
+                vis_hm_key = 'heatmaps' if 'heatmaps' in vis_output else 'history_heatmaps'
+                if train_history and vis_hm_key in vis_output:
+                    infer_pred_hm = vis_output[vis_hm_key]
                     # 多视角 [B, 4, H, W]: 取 front；单视角 [B, 1, H, W]: 取唯一通道
                     if infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
                         infer_pred_hm = infer_pred_hm[:, 0, :, :]   # front view
