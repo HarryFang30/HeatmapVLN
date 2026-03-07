@@ -370,6 +370,10 @@ class VLNPipeline(nn.Module):
             current_observation = video_frames[:, -1]
 
         history_frames = video_frames[:, :-1] if num_frames > 1 else video_frames
+        use_panoramic_chain = current_views is not None and history_panoramas is not None
+        if use_panoramic_chain:
+            self._ensure_heatmap_vln()
+
         need_sequence_features = (
             return_intermediate
             or return_actions
@@ -380,41 +384,44 @@ class VLNPipeline(nn.Module):
         qwen_output = None
         raw_hidden_states = None
         llm_tokens = None
-        if need_sequence_features:
+        heatmap_output = None
+        should_run_qwen = need_sequence_features or use_panoramic_chain
+        if should_run_qwen:
             # ==================== Step 1: Qwen3.5 Processing ====================
             qwen_output = self.qwen3_5(
                 history_frames=history_frames,
                 current_frame=current_observation,
                 instruction=instruction_text,
-                return_hidden_states=True,
+                return_hidden_states=need_sequence_features,
                 generate_text=False,
+                current_views=current_views,
+                history_panoramas=history_panoramas,
+                heatmap_vln=self.heatmap_vln if use_panoramic_chain else None,
             )
 
-            raw_hidden_states = qwen_output.get('vision_hidden_states')
-            if raw_hidden_states is None:
-                raw_hidden_states = qwen_output.get('hidden_states')
-            if raw_hidden_states is None:
-                raise RuntimeError("Failed to extract hidden states from Qwen3.5")
+            if need_sequence_features:
+                raw_hidden_states = qwen_output.get('vision_hidden_states')
+                if raw_hidden_states is None:
+                    raw_hidden_states = qwen_output.get('hidden_states')
+                if raw_hidden_states is None:
+                    raise RuntimeError("Failed to extract hidden states from Qwen3.5")
 
-            if isinstance(raw_hidden_states, list):
-                raw_hidden_states = raw_hidden_states[-1]
-            raw_hidden_states = raw_hidden_states.to(
-                device=self.device, dtype=self.config.dtype,
-            )
-
-            # ==================== Step 2: Project Hidden States ====================
-            llm_tokens = self.llm_projector(raw_hidden_states)
-
-        # ==================== Step 3: HeatmapVLN v2 ====================
-        heatmap_output = None
-        if return_heatmaps and current_views is not None and history_panoramas is not None:
-            self._ensure_heatmap_vln()
-            if self.heatmap_vln is not None:
-                heatmap_output = self._forward_heatmap_batch(
-                    current_views=current_views,
-                    history_panoramas=history_panoramas,
-                    instruction_text=instruction_text,
+                if isinstance(raw_hidden_states, list):
+                    raw_hidden_states = raw_hidden_states[-1]
+                raw_hidden_states = raw_hidden_states.to(
+                    device=self.device, dtype=self.config.dtype,
                 )
+
+                # ==================== Step 2: Project Hidden States ====================
+                llm_tokens = self.llm_projector(raw_hidden_states)
+
+            if return_heatmaps and use_panoramic_chain:
+                if 'visibility' not in qwen_output or 'heatmaps' not in qwen_output:
+                    raise RuntimeError("Panoramic Qwen path did not return HeatmapVLN outputs")
+                heatmap_output = {
+                    'visibility': qwen_output['visibility'],
+                    'heatmaps': qwen_output['heatmaps'],
+                }
 
         # ==================== Step 4: Action Generation ====================
         actions = None

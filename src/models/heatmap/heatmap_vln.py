@@ -99,6 +99,152 @@ class HeatmapVLN(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # Qwen input / decode helpers
+    # ------------------------------------------------------------------
+
+    def prepare_qwen_inputs(
+        self,
+        current_views: Dict[str, object],
+        history_panoramas: List[Dict[str, object]],
+        instruction: Optional[str] = None,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        """Build processor inputs for the panoramic single-chain forward."""
+        if device is None:
+            device = next(self.fine.parameters()).device
+
+        messages = construct_input(
+            current_views,
+            history_panoramas,
+            instruction=instruction,
+        )
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        self._normalize_multimodal_inputs(inputs)
+        return inputs, len(history_panoramas)
+
+    @staticmethod
+    def _normalize_multimodal_inputs(inputs: Dict[str, torch.Tensor]) -> None:
+        """Normalize processor outputs to match Qwen's multimodal expectations."""
+        if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+            vgt = inputs["video_grid_thw"]
+            if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
+                inputs["video_grid_thw"] = torch.repeat_interleave(
+                    vgt, vgt[:, 0], dim=0,
+                )
+                inputs["video_grid_thw"][:, 0] = 1
+
+    def decode_from_inputs(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        num_history: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Decode heatmaps from the most recent hooked Qwen forward."""
+        device = next(self.fine.parameters()).device
+
+        image_positions = self._find_image_positions(inputs)
+        text_anchors = find_text_anchor_positions(
+            inputs["input_ids"],
+            self.processor.tokenizer,
+            num_history=num_history,
+        )
+
+        image_grid_thw = inputs.get("image_grid_thw")
+        current_vit, current_llm, history_queries, _ = self.feat_extractor.extract(
+            image_positions, text_anchors, image_grid_thw,
+        )
+
+        if len(history_queries) != num_history:
+            raise RuntimeError(
+                f"Expected {num_history} history queries, got {len(history_queries)}"
+            )
+
+        return self._decode_features(
+            current_vit=current_vit,
+            current_llm=current_llm,
+            history_queries=history_queries,
+            num_history=num_history,
+            device=device,
+        )
+
+    def _decode_features(
+        self,
+        current_vit: Dict[int, Dict[int, torch.Tensor]],
+        current_llm: Dict[int, torch.Tensor],
+        history_queries: List[torch.Tensor],
+        num_history: int,
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Run coarse-to-fine decoding from pre-extracted features."""
+        coarse_results = self.coarse(current_llm, history_queries)
+
+        fused_vit: Dict[int, torch.Tensor] = {}
+        for view_idx in range(4):
+            multi_layer = []
+            template_feat = None
+            for layer_idx in self.vit_layer_indices:
+                feat = current_vit[view_idx].get(layer_idx)
+                if feat is None:
+                    continue
+                feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
+                template_feat = feat
+                multi_layer.append(feat)
+            if template_feat is not None and len(multi_layer) != len(self.vit_layer_indices):
+                multi_layer = []
+                for layer_idx in self.vit_layer_indices:
+                    feat = current_vit[view_idx].get(layer_idx)
+                    if feat is None:
+                        multi_layer.append(torch.zeros_like(template_feat))
+                        continue
+                    feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
+                    multi_layer.append(feat)
+            if multi_layer:
+                fused_vit[view_idx] = self.dpt_fusion(multi_layer)
+
+        if num_history == 0:
+            return {
+                "visibility": torch.empty(0, 4, device=device),
+                "heatmaps": torch.empty(0, 4, 64, 64, device=device),
+            }
+
+        all_visibility = []
+        all_heatmaps = []
+        for hist_idx in range(num_history):
+            coarse = coarse_results[hist_idx]
+            vis = coarse["visibility"]
+            query = history_queries[hist_idx]
+            all_visibility.append(vis)
+
+            view_heatmaps = []
+            for view_idx in range(4):
+                if view_idx in fused_vit:
+                    fine_hm = self.fine(
+                        vit_fused=fused_vit[view_idx],
+                        coarse_heatmap=coarse["coarse_heatmap"][view_idx],
+                        query_vector=query,
+                    )
+                else:
+                    fine_hm = torch.zeros(64, 64, device=device)
+
+                if self.training:
+                    view_heatmaps.append(fine_hm)
+                else:
+                    view_heatmaps.append(fine_hm * torch.sigmoid(vis[view_idx]))
+
+            all_heatmaps.append(torch.stack(view_heatmaps))
+
+        return {
+            "visibility": torch.stack(all_visibility),
+            "heatmaps": torch.stack(all_heatmaps),
+        }
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -121,127 +267,21 @@ class HeatmapVLN(nn.Module):
                 ``visibility``:  ``(N_hist, 4)``
                 ``heatmaps``:    ``(N_hist, 4, 64, 64)``
         """
-        N_hist = len(history_panoramas)
         device = next(self.fine.parameters()).device
-
-        # === Step 1: construct multi-image input with text annotations ===
-        messages = construct_input(
-            current_views,
-            history_panoramas,
+        inputs, num_history = self.prepare_qwen_inputs(
+            current_views=current_views,
+            history_panoramas=history_panoramas,
             instruction=instruction,
-        )
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # Locate image and text-anchor positions
-        image_positions = self._find_image_positions(inputs)
-        text_anchors = find_text_anchor_positions(
-            inputs["input_ids"],
-            self.processor.tokenizer,
-            num_history=N_hist,
+            device=device,
         )
 
         # === Step 2: Qwen3.5 forward (frozen, no grad) ===
         self.feat_extractor.clear()
 
-        # Expand video_grid_thw if needed (same fix as integration.py)
-        if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
-            vgt = inputs["video_grid_thw"]
-            if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
-                inputs["video_grid_thw"] = torch.repeat_interleave(
-                    vgt, vgt[:, 0], dim=0,
-                )
-                inputs["video_grid_thw"][:, 0] = 1
-
         with torch.no_grad():
             self.qwen(**inputs, output_hidden_states=False, return_dict=True)
 
-        # === Step 3: extract grouped features ===
-        image_grid_thw = inputs.get("image_grid_thw")
-        current_vit, current_llm, history_queries, _ = (
-            self.feat_extractor.extract(
-                image_positions, text_anchors, image_grid_thw,
-            )
-        )
-
-        if len(history_queries) != N_hist:
-            raise RuntimeError(
-                f"Expected {N_hist} history queries, got {len(history_queries)}"
-            )
-
-        # === Step 4: coarse localisation (zero params) ===
-        coarse_results = self.coarse(current_llm, history_queries)
-
-        # === Step 5: ViT feature fusion (trainable) ===
-        fused_vit: Dict[int, torch.Tensor] = {}
-        for view_idx in range(4):
-            multi_layer = []
-            template_feat = None
-            for layer_idx in self.vit_layer_indices:
-                feat = current_vit[view_idx].get(layer_idx)
-                if feat is None:
-                    continue
-                # (H, W, C_vit) -> (1, C_vit, H, W)
-                feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
-                template_feat = feat
-                multi_layer.append(feat)
-            if template_feat is not None and len(multi_layer) != len(self.vit_layer_indices):
-                multi_layer = []
-                for layer_idx in self.vit_layer_indices:
-                    feat = current_vit[view_idx].get(layer_idx)
-                    if feat is None:
-                        multi_layer.append(torch.zeros_like(template_feat))
-                        continue
-                    feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
-                    multi_layer.append(feat)
-            if multi_layer:
-                fused_vit[view_idx] = self.dpt_fusion(multi_layer)  # (1, C_fused, H, W)
-
-        # === Step 6: fine localisation (trainable) ===
-        all_visibility = []
-        all_heatmaps = []
-
-        if N_hist == 0:
-            return {
-                "visibility": torch.empty(0, 4, device=device),
-                "heatmaps": torch.empty(0, 4, 64, 64, device=device),
-            }
-
-        for hist_idx in range(N_hist):
-            coarse = coarse_results[hist_idx]
-            vis = coarse["visibility"]            # (4,)
-            query = history_queries[hist_idx]      # (C_llm,)
-
-            all_visibility.append(vis)
-
-            view_heatmaps = []
-            for view_idx in range(4):
-                if view_idx in fused_vit:
-                    fine_hm = self.fine(
-                        vit_fused=fused_vit[view_idx],
-                        coarse_heatmap=coarse["coarse_heatmap"][view_idx],
-                        query_vector=query,
-                    )  # (64, 64)
-                else:
-                    fine_hm = torch.zeros(64, 64, device=device)
-
-                if self.training:
-                    view_heatmaps.append(fine_hm)
-                else:
-                    view_heatmaps.append(fine_hm * torch.sigmoid(vis[view_idx]))
-
-            all_heatmaps.append(torch.stack(view_heatmaps))  # (4, 64, 64)
-
-        return {
-            "visibility": torch.stack(all_visibility),   # (N_hist, 4)
-            "heatmaps": torch.stack(all_heatmaps),       # (N_hist, 4, 64, 64)
-        }
+        return self.decode_from_inputs(inputs, num_history)
 
     # ------------------------------------------------------------------
     # Position helpers

@@ -28,6 +28,7 @@ from PIL import Image
 import numpy as np
 
 logger = logging.getLogger(__name__)
+VIEW_NAMES = ("front", "right", "back", "left")
 
 # Import sequence packing utilities
 try:
@@ -389,6 +390,145 @@ class Qwen3_5Integration(nn.Module):
             conversations.append(messages)
         
         return conversations
+
+    @staticmethod
+    def _views_tensor_to_dict(views: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if views.dim() != 4 or views.shape[0] != 4:
+            raise ValueError(f"Expected views tensor [4, C, H, W], got {tuple(views.shape)}")
+        return {name: views[idx] for idx, name in enumerate(VIEW_NAMES)}
+
+    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> List[Dict[str, torch.Tensor]]:
+        if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
+            raise ValueError(
+                f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
+            )
+        return [
+            self._views_tensor_to_dict(history_panoramas[idx])
+            for idx in range(history_panoramas.shape[0])
+        ]
+
+    @staticmethod
+    def _pad_and_stack(tensors: List[torch.Tensor], pad_dim: int = 1) -> torch.Tensor:
+        """Pad a variable-length dimension and stack into a batch tensor."""
+        max_len = max(t.shape[pad_dim] for t in tensors)
+        padded = []
+        for t in tensors:
+            diff = max_len - t.shape[pad_dim]
+            if diff > 0:
+                pad_shape = list(t.shape)
+                pad_shape[pad_dim] = diff
+                t = torch.cat(
+                    [t, torch.zeros(*pad_shape, device=t.device, dtype=t.dtype)],
+                    dim=pad_dim,
+                )
+            padded.append(t)
+        return torch.cat(padded, dim=0)
+
+    def _forward_model_inputs(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        return_hidden_states: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        """Run Qwen on already prepared multimodal inputs."""
+        input_ids = inputs["input_ids"]
+        image_mask = input_ids == self.image_token_id
+        num_image_tokens = int(image_mask.sum().item())
+
+        outputs = self.model(
+            **inputs,
+            output_hidden_states=return_hidden_states,
+            return_dict=True,
+        )
+
+        if return_hidden_states:
+            layer_idx = self.config.hidden_layer_for_features
+            if layer_idx == -1:
+                layer_idx = len(outputs.hidden_states) - 1
+            hidden_states = outputs.hidden_states[layer_idx]
+        else:
+            hidden_states = None
+
+        vision_hidden_states = None
+        if hidden_states is not None:
+            vision_hidden_states = self._extract_vision_hidden_states(
+                hidden_states, input_ids,
+            )
+
+        return hidden_states, vision_hidden_states, num_image_tokens
+
+    def _forward_single_panorama(
+        self,
+        current_views: torch.Tensor,
+        history_panoramas: torch.Tensor,
+        instruction: Optional[str] = None,
+        return_hidden_states: bool = True,
+        heatmap_vln: Optional[nn.Module] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
+        """Forward a single panoramic sample through one Qwen pass."""
+        current_views_dict = self._views_tensor_to_dict(current_views)
+        history_panoramas_list = self._history_tensor_to_list(history_panoramas)
+
+        if heatmap_vln is not None:
+            inputs, num_history = heatmap_vln.prepare_qwen_inputs(
+                current_views=current_views_dict,
+                history_panoramas=history_panoramas_list,
+                instruction=instruction,
+                device=self.device,
+            )
+            heatmap_vln.feat_extractor.clear()
+        else:
+            raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for single-chain decoding.")
+
+        hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+            inputs, return_hidden_states,
+        )
+        heatmap_output = heatmap_vln.decode_from_inputs(inputs, num_history)
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
+
+    def _forward_batch_panorama(
+        self,
+        current_views: torch.Tensor,
+        history_panoramas: torch.Tensor,
+        instruction: Optional[Union[str, List[str]]] = None,
+        return_hidden_states: bool = True,
+        heatmap_vln: Optional[nn.Module] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
+        """Batch forward for panoramic input using one Qwen pass per sample."""
+        batch_size = current_views.shape[0]
+        all_hidden = []
+        all_vision = []
+        all_visibility = []
+        all_heatmaps = []
+        max_image_tokens = 0
+
+        for b in range(batch_size):
+            instr_b = instruction[b] if isinstance(instruction, list) else instruction
+            hs, vis, n_img, hm = self._forward_single_panorama(
+                current_views=current_views[b],
+                history_panoramas=history_panoramas[b],
+                instruction=instr_b,
+                return_hidden_states=return_hidden_states,
+                heatmap_vln=heatmap_vln,
+            )
+            if hs is not None:
+                all_hidden.append(hs)
+            if vis is not None:
+                all_vision.append(vis)
+            if hm is not None:
+                all_visibility.append(hm["visibility"])
+                all_heatmaps.append(hm["heatmaps"])
+            max_image_tokens = max(max_image_tokens, n_img)
+
+        hidden_states = self._pad_and_stack(all_hidden) if all_hidden else None
+        vision_hidden_states = self._pad_and_stack(all_vision) if all_vision else None
+        heatmap_output = None
+        if all_visibility and all_heatmaps:
+            heatmap_output = {
+                "visibility": torch.stack(all_visibility, dim=0),
+                "heatmaps": torch.stack(all_heatmaps, dim=0),
+            }
+
+        return hidden_states, vision_hidden_states, max_image_tokens, heatmap_output
     
     def _forward_batch(
         self,
@@ -419,23 +559,9 @@ class Qwen3_5Integration(nn.Module):
             all_vision.append(vis)
             max_image_tokens = max(max_image_tokens, n_img)
 
-        # Stack results
-        def _pad_and_stack(tensors, pad_dim=1):
-            """Pad variable-length dim and stack into batch."""
-            max_len = max(t.shape[pad_dim] for t in tensors)
-            padded = []
-            for t in tensors:
-                diff = max_len - t.shape[pad_dim]
-                if diff > 0:
-                    pad_shape = list(t.shape)
-                    pad_shape[pad_dim] = diff
-                    t = torch.cat([t, torch.zeros(*pad_shape, device=t.device, dtype=t.dtype)], dim=pad_dim)
-                padded.append(t)
-            return torch.cat(padded, dim=0)
-
         if return_hidden_states:
-            hidden_states = _pad_and_stack(all_hidden)
-            vision_hidden_states = _pad_and_stack(all_vision) if all_vision[0] is not None else None
+            hidden_states = self._pad_and_stack(all_hidden)
+            vision_hidden_states = self._pad_and_stack(all_vision) if all_vision[0] is not None else None
         else:
             hidden_states = None
             vision_hidden_states = None
@@ -474,11 +600,6 @@ class Qwen3_5Integration(nn.Module):
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        input_ids = inputs["input_ids"]
-        
-        image_mask = input_ids == self.image_token_id
-        num_image_tokens = int(image_mask.sum().item())
-        
         # Expand video_grid_thw temporal dimension to match mm_token_type_ids groups
         # [[t, h, w]] → t copies of [[1, h, w]] since the processor splits
         # multi-temporal video tokens into separate groups in mm_token_type_ids
@@ -490,26 +611,9 @@ class Qwen3_5Integration(nn.Module):
                 )
                 inputs["video_grid_thw"][:, 0] = 1
 
-        outputs = self.model(
-            **inputs,
-            output_hidden_states=return_hidden_states,
-            return_dict=True,
+        hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+            inputs, return_hidden_states,
         )
-        
-        if return_hidden_states:
-            layer_idx = self.config.hidden_layer_for_features
-            if layer_idx == -1:
-                layer_idx = len(outputs.hidden_states) - 1
-            hidden_states = outputs.hidden_states[layer_idx]
-        else:
-            hidden_states = None
-        
-        vision_hidden_states = None
-        if hidden_states is not None:
-            vision_hidden_states = self._extract_vision_hidden_states(
-                hidden_states, input_ids
-            )
-        
         return hidden_states, vision_hidden_states, num_image_tokens, None
     
     def forward(
@@ -519,20 +623,33 @@ class Qwen3_5Integration(nn.Module):
         instruction: Optional[Union[str, List[str]]] = None,
         return_hidden_states: bool = True,
         generate_text: bool = False,
+        current_views: Optional[torch.Tensor] = None,
+        history_panoramas: Optional[torch.Tensor] = None,
+        heatmap_vln: Optional[nn.Module] = None,
     ) -> Dict[str, Any]:
         """Forward pass through Qwen3.5 with batch processing."""
         # Ensure model is loaded
         if not self._model_loaded:
             self._load_model()
         
-        batch_size = history_frames.shape[0]
-        
-        # Use batch forward for efficiency
-        hidden_states, vision_hidden_states, num_image_tokens, _ = (
-            self._forward_batch(
-                history_frames, current_frame, instruction, return_hidden_states,
+        batch_size = current_views.shape[0] if current_views is not None else history_frames.shape[0]
+
+        if current_views is not None and history_panoramas is not None:
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
+                self._forward_batch_panorama(
+                    current_views=current_views,
+                    history_panoramas=history_panoramas,
+                    instruction=instruction,
+                    return_hidden_states=return_hidden_states,
+                    heatmap_vln=heatmap_vln,
+                )
             )
-        )
+        else:
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
+                self._forward_batch(
+                    history_frames, current_frame, instruction, return_hidden_states,
+                )
+            )
         
         # Generate text only for first sample (if requested)
         generated_text = None
@@ -549,12 +666,15 @@ class Qwen3_5Integration(nn.Module):
                 history_frames[0], current_frame[0], sample_instruction
             )
         
-        return {
+        result = {
             "hidden_states": hidden_states,
             "vision_hidden_states": vision_hidden_states,
             "generated_text": generated_text,
             "num_image_tokens": num_image_tokens,
         }
+        if heatmap_output is not None:
+            result.update(heatmap_output)
+        return result
     
     def _generate_text_single(
         self,
