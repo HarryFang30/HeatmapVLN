@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Heatmap 推理可视化
-==================
+Heatmap 推理可视化 (v2 — 全景 4 视角)
+========================================
 
 加载训练好的模型权重，使用与训练完全相同的数据加载流程，
-进行完整扩散推理，生成 predicted heatmap vs GT heatmap 的对比可视化。
+进行推理，生成 4 视角 predicted heatmap vs GT heatmap 的对比可视化。
+
+每个样本输出一张大图：
+    4 行（front / right / back / left）× 4 列（视角图 | GT 热力图 | Pred 热力图 | Overlay）
 
 用法:
     python scripts/visualize_heatmap.py \
-        --checkpoint /root/autodl-tmp/heatmap_training_outputs/run_20260209_025529/ckpts/best.pth \
+        --checkpoint /root/autodl-tmp/heatmap_training_outputs/run_.../ckpts/best.pth \
         --num-samples 10 \
-        --output-dir ./vis_heatmap_12epoch
+        --output-dir ./vis_heatmap_4view
 """
 
 import os
 import sys
-import json
 import argparse
 import logging
 from pathlib import Path
@@ -42,54 +44,37 @@ from src.utils.gpu_heatmap import GPUHeatmapComputer
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("visualize")
 
+VIEW_NAMES = ["Front", "Right", "Back", "Left"]
 
-# ==================== 与 train.py 完全一致的 build_model ====================
+
+# ==================== 与 train.py 一致的 build_model ====================
 def build_model(cfg: Dict) -> VLNPipeline:
-    """构建 VLN Pipeline（复制自 train.py）"""
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
-    heatmap_cfg = model_cfg.get('heatmap_head', {})
+    heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
-    progress_cfg = model_cfg.get('progress_head', {})
 
     action_head_type = action_cfg.get('type', 'transformer')
-    legacy_action_cfg = action_cfg.get('legacy', {})
-    transformer_action_cfg = action_cfg.get('transformer', {})
 
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
-        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
-        # 推理时关闭 packing
         enable_packing=False,
         max_seq_length=llm_cfg.get('max_seq_length', 4096),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
         device=model_cfg.get('device', 'cuda'),
-        heatmap_size=tuple(cfg['data']['init_hm_size']),
-        enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
-        enable_future_heatmap_head=heatmap_cfg.get('enable_future', False),
-        diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
-        diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        image_size=cfg['data']['image_size'][0],
-        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', True),
-        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
-        heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
-        heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
-        heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
-        heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
-        heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
-        heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
-        heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
-        heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
-        heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
-        heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
-        heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
-        heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
-        heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
-        heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
+        enable_heatmap=heatmap_cfg.get('enable', True),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
+        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
+        image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
@@ -97,18 +82,16 @@ def build_model(cfg: Dict) -> VLNPipeline:
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
         action_head_type=action_head_type,
-        enable_action_head=action_cfg.get('enable', False),  # 推理只看热力图
+        enable_action_head=False,
         enable_stop_head=False,
         enable_progress_head=False,
         verbose=False,
     )
-
     return VLNPipeline(config)
 
 
-# ==================== 与 train.py 完全一致的 collate_fn ====================
+# ==================== collate_fn ====================
 def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
-    """滑动窗口数据集的 collate 函数（复制自 train.py）"""
     max_K = max(s['history_frames'].shape[0] for s in batch)
 
     history_frames_padded = []
@@ -148,7 +131,6 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'text': text,
     }
 
-    # GPU 热力图所需字段
     if 'history_poses' in batch[0]:
         result['history_poses'] = torch.stack([s['history_poses'] for s in batch], dim=0)
         result['current_pose'] = torch.stack([s['current_pose'] for s in batch], dim=0)
@@ -158,97 +140,103 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         result['has_intrinsics'] = batch[0].get('has_intrinsics', False)
         if result['has_intrinsics']:
             result['intrinsics'] = torch.stack([s['intrinsics'] for s in batch], dim=0)
+    if 'current_views' in batch[0]:
+        result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
+    if 'history_panoramas' in batch[0]:
+        result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
 
     return result
 
 
-# ==================== 可视化函数 ====================
-def visualize_sample(
+# ==================== 4-View Panoramic Visualization ====================
+def visualize_panoramic_sample(
     sample_idx: int,
-    current_frame: np.ndarray,
-    pred_heatmap: np.ndarray,
-    gt_heatmap: np.ndarray,
+    current_views: np.ndarray,
+    pred_heatmaps: np.ndarray,
+    gt_heatmaps: np.ndarray,
+    visibility: Optional[np.ndarray],
     instruction: str,
     output_path: str,
     metrics: Dict = None,
 ):
-    """生成对比可视化：当前帧 | GT 热力图 | 预测热力图 (与 train.py 布局类似)"""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    """
+    全景 4 视角可视化。
 
-    # Row 0: 当前帧 | GT | 预测
-    rgb = np.clip(current_frame, 0, 1)
-    axes[0, 0].imshow(rgb)
-    axes[0, 0].set_title("Current Frame", fontsize=13)
-    axes[0, 0].axis('off')
+    Args:
+        current_views:  (4, H, W, 3) — 4 个方向的 RGB 图
+        pred_heatmaps:  (4, Hm, Wm) — 4 个方向的预测热力图
+        gt_heatmaps:    (4, Hm, Wm) — 4 个方向的 GT 热力图
+        visibility:     (4,) — 4 个方向的可见性 logit（可选）
+        instruction:    导航指令文本
+        output_path:    输出文件路径
+        metrics:        指标字典
+    """
+    n_views = 4
+    # 4 rows x 4 cols: View | GT | Pred | Overlay
+    fig, axes = plt.subplots(n_views, 4, figsize=(20, 5 * n_views))
 
-    axes[0, 1].imshow(gt_heatmap, cmap='inferno', vmin=0, vmax=1)
-    axes[0, 1].set_title(f"GT Heatmap (max={gt_heatmap.max():.3f})", fontsize=13)
-    axes[0, 1].axis('off')
+    for v in range(n_views):
+        rgb = np.clip(current_views[v], 0, 1)
+        gt_hm = gt_heatmaps[v]
+        pred_hm = np.clip(pred_heatmaps[v], 0, 1)
 
-    pred_max = max(pred_heatmap.max(), 0.001)
-    axes[0, 2].imshow(pred_heatmap, cmap='inferno', vmin=0, vmax=max(pred_max, 0.1))
-    axes[0, 2].set_title(f"Pred Heatmap (max={pred_heatmap.max():.3f})", fontsize=13)
-    axes[0, 2].axis('off')
+        vis_str = ""
+        if visibility is not None:
+            vis_val = visibility[v]
+            vis_str = f" (vis={vis_val:.2f})"
 
-    # Row 1: 叠加对比 | 差异图 | 指标面板
-    # 叠加: 热力图 overlay 在帧上
-    H, W = rgb.shape[:2]
-    hm_h, hm_w = pred_heatmap.shape
-    pred_up = cv2.resize(pred_heatmap, (W, H), interpolation=cv2.INTER_CUBIC)
-    gt_up = cv2.resize(gt_heatmap, (W, H), interpolation=cv2.INTER_CUBIC)
+        # Col 0: View
+        axes[v, 0].imshow(rgb)
+        axes[v, 0].set_title(f"{VIEW_NAMES[v]}{vis_str}", fontsize=12, fontweight='bold')
+        axes[v, 0].axis('off')
 
-    # 热力图叠加
-    overlay = rgb.copy()
-    pred_color = plt.cm.inferno(pred_up / max(pred_up.max(), 0.01))[:, :, :3]
-    alpha = np.clip(pred_up * 3, 0, 0.7)[:, :, None]
-    overlay = overlay * (1 - alpha) + pred_color * alpha
-    overlay = np.clip(overlay, 0, 1)
-    axes[1, 0].imshow(overlay)
-    axes[1, 0].set_title("Pred Overlay on Frame", fontsize=13)
-    axes[1, 0].axis('off')
+        # Col 1: GT Heatmap
+        axes[v, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(gt_hm.max(), 0.01))
+        axes[v, 1].set_title(f"GT (max={gt_hm.max():.3f})", fontsize=11)
+        axes[v, 1].axis('off')
+        if gt_hm.max() > 0.01:
+            gy, gx = np.unravel_index(gt_hm.argmax(), gt_hm.shape)
+            axes[v, 1].plot(gx, gy, 'g+', markersize=12, markeredgewidth=2)
 
-    # 差异图
-    diff = np.abs(gt_heatmap - pred_heatmap)
-    im_diff = axes[1, 1].imshow(diff, cmap='hot', vmin=0, vmax=max(diff.max(), 0.01))
-    axes[1, 1].set_title(f"|GT - Pred| (max={diff.max():.3f})", fontsize=13)
-    axes[1, 1].axis('off')
-    plt.colorbar(im_diff, ax=axes[1, 1], fraction=0.046)
+        # Col 2: Pred Heatmap
+        axes[v, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=max(pred_hm.max(), 0.01))
+        axes[v, 2].set_title(f"Pred (max={pred_hm.max():.3f})", fontsize=11)
+        axes[v, 2].axis('off')
+        if pred_hm.max() > 0.01:
+            py, px = np.unravel_index(pred_hm.argmax(), pred_hm.shape)
+            axes[v, 2].plot(px, py, 'r+', markersize=12, markeredgewidth=2)
 
-    # 在 GT 和 Pred 上标注峰值位置
-    if gt_heatmap.max() > 0.01:
-        gt_peak_y, gt_peak_x = np.unravel_index(gt_heatmap.argmax(), gt_heatmap.shape)
-        axes[0, 1].plot(gt_peak_x, gt_peak_y, 'g+', markersize=15, markeredgewidth=2)
-    if pred_heatmap.max() > 0.01:
-        pred_peak_y, pred_peak_x = np.unravel_index(pred_heatmap.argmax(), pred_heatmap.shape)
-        axes[0, 2].plot(pred_peak_x, pred_peak_y, 'r+', markersize=15, markeredgewidth=2)
+        # Col 3: Overlay
+        H, W = rgb.shape[:2]
+        pred_up = cv2.resize(pred_hm, (W, H), interpolation=cv2.INTER_CUBIC)
+        pred_color = plt.cm.inferno(pred_up / max(pred_up.max(), 0.001))[:, :, :3]
+        alpha = np.clip(pred_up * 3, 0, 0.7)[:, :, None]
+        overlay = rgb * (1 - alpha) + pred_color * alpha
+        overlay = np.clip(overlay, 0, 1)
+        axes[v, 3].imshow(overlay)
+        axes[v, 3].set_title("Overlay", fontsize=11)
+        axes[v, 3].axis('off')
 
-    # 指标面板
-    info_lines = [f"Instruction: {instruction[:100]}"]
+    # Title with instruction
+    title_text = f"Sample {sample_idx}"
     if metrics:
-        info_lines.append("")
-        for k, v in metrics.items():
-            info_lines.append(f"{k}: {v}")
-    info_text = "\n".join(info_lines)
-    axes[1, 2].text(0.05, 0.95, info_text, fontsize=11, verticalalignment='top',
-                    transform=axes[1, 2].transAxes, wrap=True, family='monospace',
-                    bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-    axes[1, 2].axis('off')
-    axes[1, 2].set_title("Metrics", fontsize=13)
-
-    fig.suptitle(f"Sample {sample_idx}", fontsize=15, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+        summary_parts = []
+        for k, val in metrics.items():
+            summary_parts.append(f"{k}={val}")
+        title_text += "  |  " + ", ".join(summary_parts[:4])
+    instr_short = instruction[:120] + ("..." if len(instruction) > 120 else "")
+    fig.suptitle(f"{title_text}\n{instr_short}", fontsize=13, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(output_path, dpi=120, bbox_inches='tight')
     plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Heatmap 推理可视化")
+    parser = argparse.ArgumentParser(description="Heatmap 推理可视化 (4-view panoramic)")
     parser.add_argument('--checkpoint', type=str, required=True, help='模型 checkpoint 路径')
     parser.add_argument('--num-samples', type=int, default=10, help='可视化样本数')
-    parser.add_argument('--output-dir', type=str, default='./vis_heatmap_output', help='输出目录')
+    parser.add_argument('--output-dir', type=str, default='./vis_heatmap_4view', help='输出目录')
     parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--inference-steps', type=int, default=None,
-                        help='Override num_inference_steps (default: use checkpoint config)')
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -263,7 +251,7 @@ def main():
     best_val = ckpt.get('best_val_loss', '?')
     logger.info(f"  Epoch: {epoch}, Best val loss: {best_val}")
 
-    # ==================== 构建数据集（与 train.py 一致）====================
+    # ==================== 构建数据集 ====================
     logger.info("Loading dataset...")
     sw_cfg = cfg['data']['sliding_window']
     defer_heatmap_to_gpu = sw_cfg.get('defer_heatmap_to_gpu', False)
@@ -305,15 +293,9 @@ def main():
         logger.info(f"  GPU heatmap computer enabled (hm_size={hm_size})")
 
     # ==================== 构建模型 ====================
-    # Override inference steps if specified
-    if args.inference_steps is not None:
-        cfg['model']['heatmap_head']['num_inference_steps'] = args.inference_steps
-        logger.info(f"  Override num_inference_steps = {args.inference_steps}")
-
     logger.info("Building model...")
     model = build_model(cfg)
 
-    # 加载权重
     state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', {}))
     if state_dict:
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -335,14 +317,12 @@ def main():
         if count >= args.num_samples:
             break
 
-        # 和 train.py 验证循环完全一样的流程
         history_frames = batch['history_frames']
         current_frame = batch['current_frame']
         text = batch['text']
-        B, K, C, H, W = history_frames.shape
 
         # GT 热力图
-        if gpu_heatmap_computer is not None and 'history_poses' in batch:
+        if gpu_heatmap_computer is not None and 'history_poses' in batch and 'current_views' not in batch:
             history_poses = batch['history_poses'].to(device)
             current_poses = batch['current_pose'].to(device)
             has_depth = batch.get('has_depth', False)
@@ -354,88 +334,126 @@ def main():
                 current_poses=current_poses,
                 current_depths=current_depths,
                 intrinsics=intrinsics,
-            )  # [B, Hm, Wm]
+            )
         else:
-            gt_heatmap = batch['heatmap'].to(device)  # [B, Hm, Wm]
+            gt_heatmap = batch['heatmap'].to(device)
 
-        # 跳过空 GT
-        if gt_heatmap[0].max() < 0.01:
+        # 检查是否有全景数据
+        has_panoramic = 'current_views' in batch and 'history_panoramas' in batch
+        current_views = batch.get('current_views')
+        history_panoramas = batch.get('history_panoramas')
+
+        if current_views is not None:
+            current_views = current_views.to(device)
+        if history_panoramas is not None:
+            history_panoramas = history_panoramas.to(device)
+
+        # 跳过 GT 全空的样本
+        if gt_heatmap.max() < 0.01:
             continue
 
-        # 完整扩散推理（与 train.py 验证可视化一致）
-        video_frames = torch.cat([history_frames, current_frame.unsqueeze(1)], dim=1)
-        instruction_text = list(text) if text and len(text) > 0 else None
+        video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
+        instruction_text = list(text) if text else None
 
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             vis_output = model(
                 video_frames=video_frames,
                 instruction_text=instruction_text,
                 current_observation=current_frame.to(device),
+                current_views=current_views,
+                history_panoramas=history_panoramas,
                 return_heatmaps=True,
                 return_actions=False,
             )
 
-        # 提取预测热力图
-        if 'history_heatmaps' not in vis_output or vis_output['history_heatmaps'] is None:
+        if 'heatmaps' not in vis_output or vis_output['heatmaps'] is None:
             logger.warning(f"  Sample {i}: no heatmap output")
             continue
 
-        pred_hm = vis_output['history_heatmaps'][:, -1, :, :]  # [B, Hm, Wm]
-        # 如果尺寸不匹配，resize
-        if pred_hm.shape[-2:] != gt_heatmap.shape[-2:]:
-            pred_hm = F.interpolate(
-                pred_hm.unsqueeze(1), size=gt_heatmap.shape[-2:],
-                mode='bilinear', align_corners=False
-            ).squeeze(1)
+        # pred shape: (B, N_hist, 4, 64, 64) — 取第一个历史位置
+        pred_all = vis_output['heatmaps']  # (B, N_hist, 4, H, W)
+        visibility = vis_output.get('visibility')  # (B, N_hist, 4)
 
-        # 转 numpy
-        gt_hm_np = gt_heatmap[0].float().cpu().numpy()
-        pred_hm_np = pred_hm[0].detach().float().cpu().numpy()
-        pred_hm_np = np.clip(pred_hm_np, 0, 1)
-        current_frame_np = current_frame[0].cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
-
-        # 计算指标
-        gt_peak = np.unravel_index(gt_hm_np.argmax(), gt_hm_np.shape)
-        if pred_hm_np.max() > 0.01:
-            pred_peak = np.unravel_index(pred_hm_np.argmax(), pred_hm_np.shape)
-            peak_dist = np.sqrt((gt_peak[0] - pred_peak[0])**2 + (gt_peak[1] - pred_peak[1])**2)
+        if pred_all.dim() == 5:
+            pred_4view = pred_all[0, 0]  # (4, H, W)
+            vis_4 = visibility[0, 0].float().cpu().numpy() if visibility is not None else None
+        elif pred_all.dim() == 4 and pred_all.shape[1] == 4:
+            pred_4view = pred_all[0]  # (4, H, W)
+            vis_4 = visibility[0].float().cpu().numpy() if visibility is not None and visibility.dim() >= 2 else None
         else:
-            pred_peak = None
-            peak_dist = float('inf')
+            pred_4view = pred_all[0].unsqueeze(0).expand(4, -1, -1)
+            vis_4 = None
 
-        # IoU（threshold=0.5*max）
-        gt_mask = gt_hm_np > 0.5 * gt_hm_np.max()
-        pred_mask = pred_hm_np > 0.5 * max(pred_hm_np.max(), 0.01)
+        # GT shape: (B, N_hist, 4, Hm, Wm) or (B, 4, Hm, Wm) or (B, Hm, Wm)
+        gt = gt_heatmap[0]
+        if gt.dim() == 3 and gt.shape[0] == 4:
+            gt_4view = gt  # (4, Hm, Wm)
+        elif gt.dim() == 4:
+            gt_4view = gt[0]  # (4, Hm, Wm)  first history position
+        else:
+            gt_4view = gt.unsqueeze(0).expand(4, -1, -1)
+
+        # Resize pred to match GT if needed
+        if pred_4view.shape[-2:] != gt_4view.shape[-2:]:
+            pred_4view = F.interpolate(
+                pred_4view.unsqueeze(0), size=gt_4view.shape[-2:],
+                mode='bilinear', align_corners=False,
+            ).squeeze(0)
+
+        # Convert to numpy
+        pred_np = pred_4view.detach().float().cpu().numpy()  # (4, Hm, Wm)
+        gt_np = gt_4view.float().cpu().numpy()                # (4, Hm, Wm)
+
+        # Current views: (B, 4, C, H, W) -> (4, H, W, C)
+        if has_panoramic:
+            views_np = batch['current_views'][0].cpu().numpy().transpose(0, 2, 3, 1)  # (4, H, W, 3)
+        else:
+            cf_np = current_frame[0].cpu().numpy().transpose(1, 2, 0)  # (H, W, 3)
+            views_np = np.stack([cf_np] * 4, axis=0)
+
+        # Per-view metrics
+        best_view = -1
+        best_peak_dist = float('inf')
+        for v in range(4):
+            gt_v = gt_np[v]
+            pred_v = pred_np[v]
+            if gt_v.max() > 0.01 and pred_v.max() > 0.01:
+                gt_peak = np.unravel_index(gt_v.argmax(), gt_v.shape)
+                pred_peak = np.unravel_index(pred_v.argmax(), pred_v.shape)
+                dist = np.sqrt((gt_peak[0] - pred_peak[0])**2 + (gt_peak[1] - pred_peak[1])**2)
+                if dist < best_peak_dist:
+                    best_peak_dist = dist
+                    best_view = v
+
+        # Summary IoU across all views
+        gt_mask = gt_np > 0.5 * max(gt_np.max(), 0.01)
+        pred_mask = pred_np > 0.5 * max(pred_np.max(), 0.01)
         intersection = (gt_mask & pred_mask).sum()
         union = (gt_mask | pred_mask).sum()
         iou = intersection / max(union, 1)
 
-        mse = np.mean((gt_hm_np - pred_hm_np) ** 2)
+        mse = np.mean((gt_np - np.clip(pred_np, 0, 1)) ** 2)
 
-        all_peak_dists.append(peak_dist)
+        all_peak_dists.append(best_peak_dist)
         all_ious.append(iou)
 
         metrics = {
-            'peak_distance': f"{peak_dist:.1f}px",
-            'peak_iou': f"{iou:.3f}",
+            'peak_dist': f"{best_peak_dist:.1f}px",
+            'best_view': VIEW_NAMES[best_view] if best_view >= 0 else "N/A",
+            'iou': f"{iou:.3f}",
             'mse': f"{mse:.4f}",
-            'pred_max': f"{pred_hm_np.max():.3f}",
-            'gt_max': f"{gt_hm_np.max():.3f}",
-            'gt_peak': f"({gt_peak[1]}, {gt_peak[0]})",
-            'pred_peak': f"({pred_peak[1]}, {pred_peak[0]})" if pred_peak else "N/A",
         }
 
         instr = text[0] if text else "N/A"
-        logger.info(f"  [{count+1:>2}] peak_dist={peak_dist:>5.1f}px, iou={iou:.3f}, "
-                     f"pred_max={pred_hm_np.max():.3f}, gt_max={gt_hm_np.max():.3f}")
+        logger.info(
+            f"  [{count+1:>2}] peak_dist={best_peak_dist:>5.1f}px ({VIEW_NAMES[best_view] if best_view >= 0 else 'N/A'}), "
+            f"iou={iou:.3f}, pred_max={pred_np.max():.3f}, gt_max={gt_np.max():.3f}"
+        )
 
-        # 保存可视化
         out_path = output_dir / f"sample_{count:03d}.png"
-        visualize_sample(
-            count + 1, current_frame_np,
-            pred_hm_np, gt_hm_np,
-            instr, str(out_path),
-            metrics=metrics,
+        visualize_panoramic_sample(
+            count + 1, views_np, pred_np, gt_np,
+            vis_4, instr, str(out_path), metrics=metrics,
         )
 
         count += 1
@@ -449,7 +467,8 @@ def main():
 
     finite_dists = [d for d in all_peak_dists if d != float('inf')]
     if finite_dists:
-        logger.info(f"Peak Distance ({cfg['data']['init_hm_size'][0]}x{cfg['data']['init_hm_size'][1]}):")
+        hm_size = cfg['data']['init_hm_size']
+        logger.info(f"Peak Distance ({hm_size[0]}x{hm_size[1]}):")
         logger.info(f"  Mean:   {np.mean(finite_dists):.1f} px")
         logger.info(f"  Median: {np.median(finite_dists):.1f} px")
         logger.info(f"  Min:    {np.min(finite_dists):.1f} px")
@@ -458,7 +477,7 @@ def main():
         logger.info(f"  < 10px: {sum(1 for d in finite_dists if d < 10)}/{len(finite_dists)}")
 
     if all_ious:
-        logger.info(f"Peak IoU:")
+        logger.info(f"IoU:")
         logger.info(f"  Mean:   {np.mean(all_ious):.3f}")
         logger.info(f"  Median: {np.median(all_ious):.3f}")
 

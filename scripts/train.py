@@ -450,57 +450,98 @@ def visualize_heatmap_predictions(
                             替代 batch['heatmap']（后者是零占位符）
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    VIEW_LABELS = ["Front", "Right", "Back", "Left"]
     
     try:
-        current_frames = batch['current_frame']
         gt_heatmaps = gt_heatmap_override if gt_heatmap_override is not None else batch['heatmap']
-        
         pred_heatmaps = output.get('heatmaps')
         
         if pred_heatmaps is None:
             return
-        
-        # 提取 2D 热力图用于可视化：默认显示第一个历史位置的 front view。
-        pred_heatmaps = _select_primary_heatmap_slice(pred_heatmaps)
-        gt_heatmaps = _select_primary_heatmap_slice(gt_heatmaps)
-        
-        # 全景模式：取 current_views 的 front 视角
-        if 'current_views' in batch:
-            current_frames = batch['current_views'][:, 0]  # front view
-        
-        B = min(num_samples, current_frames.shape[0])
-        
-        fig, axes = plt.subplots(B, 3, figsize=(12, 4 * B))
-        if B == 1:
-            axes = axes.reshape(1, -1)
-        
-        for i in range(B):
-            rgb = current_frames[i].cpu().numpy().transpose(1, 2, 0)
-            rgb = np.clip(rgb, 0, 1)
-            axes[i, 0].imshow(rgb)
-            axes[i, 0].set_title(f"Input Frame (Front)")
-            axes[i, 0].axis('off')
-            
-            gt_hm = gt_heatmaps[i].cpu().numpy()
-            axes[i, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=1)
-            axes[i, 1].set_title(f"GT Heatmap (max={gt_hm.max():.2f})")
-            axes[i, 1].axis('off')
-            
-            pred_hm = pred_heatmaps[i].detach().float().cpu().numpy()
-            pred_hm = np.clip(pred_hm, 0, 1)
-            axes[i, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
-            axes[i, 2].set_title(f"Pred Heatmap (max={pred_hm.max():.2f})")
-            axes[i, 2].axis('off')
-        
-        plt.suptitle(f"Epoch {epoch}, Step {step}")
-        plt.tight_layout()
-        
-        # 简洁命名: e001_s00100.png
-        save_path = output_dir / f"e{epoch:03d}_s{step:05d}.png"
-        plt.savefig(save_path, dpi=100, bbox_inches='tight')
-        plt.close(fig)
-        
-        return save_path
+
+        has_panoramic = 'current_views' in batch
+        B = min(num_samples, batch['current_frame'].shape[0])
+
+        if has_panoramic:
+            # 4-view panoramic: 4 rows (views) x 3 cols (RGB | GT | Pred) per sample
+            for b in range(B):
+                views = batch['current_views'][b]  # (4, C, H, W)
+
+                # pred: (B, N_hist, 4, Hm, Wm) or (B, 4, Hm, Wm)
+                if pred_heatmaps.dim() == 5:
+                    pred_4 = pred_heatmaps[b, 0]  # (4, Hm, Wm)
+                elif pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
+                    pred_4 = pred_heatmaps[b]
+                else:
+                    pred_4 = pred_heatmaps[b].unsqueeze(0).expand(4, -1, -1)
+
+                # gt: (B, N, 4, Hm, Wm) or (B, 4, Hm, Wm) or (B, Hm, Wm)
+                gt_b = gt_heatmaps[b]
+                if gt_b.dim() == 3 and gt_b.shape[0] == 4:
+                    gt_4 = gt_b
+                elif gt_b.dim() == 4:
+                    gt_4 = gt_b[0]
+                else:
+                    gt_4 = gt_b.unsqueeze(0).expand(4, -1, -1)
+
+                fig, axes = plt.subplots(4, 3, figsize=(12, 16))
+                for v in range(4):
+                    rgb = views[v].cpu().numpy().transpose(1, 2, 0)
+                    rgb = np.clip(rgb, 0, 1)
+                    axes[v, 0].imshow(rgb)
+                    axes[v, 0].set_title(f"{VIEW_LABELS[v]}", fontweight='bold')
+                    axes[v, 0].axis('off')
+
+                    gt_hm = gt_4[v].float().cpu().numpy()
+                    axes[v, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(gt_hm.max(), 0.01))
+                    axes[v, 1].set_title(f"GT (max={gt_hm.max():.2f})")
+                    axes[v, 1].axis('off')
+
+                    pred_hm = pred_4[v].detach().float().cpu().numpy()
+                    pred_hm = np.clip(pred_hm, 0, 1)
+                    axes[v, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=max(pred_hm.max(), 0.01))
+                    axes[v, 2].set_title(f"Pred (max={pred_hm.max():.2f})")
+                    axes[v, 2].axis('off')
+
+                plt.suptitle(f"Epoch {epoch}, Step {step}, Sample {b}", fontsize=13)
+                plt.tight_layout(rect=[0, 0, 1, 0.97])
+                save_path = output_dir / f"e{epoch:03d}_s{step:05d}_b{b}.png"
+                plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                plt.close(fig)
+
+            return save_path
+
+        else:
+            # Legacy single-view fallback
+            current_frames = batch['current_frame']
+            pred_heatmaps_2d = _select_primary_heatmap_slice(pred_heatmaps)
+            gt_heatmaps_2d = _select_primary_heatmap_slice(gt_heatmaps)
+
+            fig, axes = plt.subplots(B, 3, figsize=(12, 4 * B))
+            if B == 1:
+                axes = axes.reshape(1, -1)
+            for i in range(B):
+                rgb = current_frames[i].cpu().numpy().transpose(1, 2, 0)
+                rgb = np.clip(rgb, 0, 1)
+                axes[i, 0].imshow(rgb)
+                axes[i, 0].set_title("Input Frame")
+                axes[i, 0].axis('off')
+                gt_hm = gt_heatmaps_2d[i].cpu().numpy()
+                axes[i, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=1)
+                axes[i, 1].set_title(f"GT (max={gt_hm.max():.2f})")
+                axes[i, 1].axis('off')
+                pred_hm = pred_heatmaps_2d[i].detach().float().cpu().numpy()
+                pred_hm = np.clip(pred_hm, 0, 1)
+                axes[i, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
+                axes[i, 2].set_title(f"Pred (max={pred_hm.max():.2f})")
+                axes[i, 2].axis('off')
+
+            plt.suptitle(f"Epoch {epoch}, Step {step}")
+            plt.tight_layout()
+            save_path = output_dir / f"e{epoch:03d}_s{step:05d}.png"
+            plt.savefig(save_path, dpi=100, bbox_inches='tight')
+            plt.close(fig)
+            return save_path
         
     except Exception as e:
         logger.warning(f"Visualization failed: {e}")
