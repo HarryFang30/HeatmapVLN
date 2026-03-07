@@ -370,30 +370,40 @@ class VLNPipeline(nn.Module):
             current_observation = video_frames[:, -1]
 
         history_frames = video_frames[:, :-1] if num_frames > 1 else video_frames
-
-        # ==================== Step 1: Qwen3.5 Processing ====================
-        qwen_output = self.qwen3_5(
-            history_frames=history_frames,
-            current_frame=current_observation,
-            instruction=instruction_text,
-            return_hidden_states=True,
-            generate_text=False,
+        need_sequence_features = (
+            return_intermediate
+            or return_actions
+            or (return_actions and self.progress_head is not None)
+            or (return_actions and self.stop_head is not None)
         )
 
-        raw_hidden_states = qwen_output.get('vision_hidden_states')
-        if raw_hidden_states is None:
-            raw_hidden_states = qwen_output.get('hidden_states')
-        if raw_hidden_states is None:
-            raise RuntimeError("Failed to extract hidden states from Qwen3.5")
+        qwen_output = None
+        raw_hidden_states = None
+        llm_tokens = None
+        if need_sequence_features:
+            # ==================== Step 1: Qwen3.5 Processing ====================
+            qwen_output = self.qwen3_5(
+                history_frames=history_frames,
+                current_frame=current_observation,
+                instruction=instruction_text,
+                return_hidden_states=True,
+                generate_text=False,
+            )
 
-        if isinstance(raw_hidden_states, list):
-            raw_hidden_states = raw_hidden_states[-1]
-        raw_hidden_states = raw_hidden_states.to(
-            device=self.device, dtype=self.config.dtype,
-        )
+            raw_hidden_states = qwen_output.get('vision_hidden_states')
+            if raw_hidden_states is None:
+                raw_hidden_states = qwen_output.get('hidden_states')
+            if raw_hidden_states is None:
+                raise RuntimeError("Failed to extract hidden states from Qwen3.5")
 
-        # ==================== Step 2: Project Hidden States ====================
-        llm_tokens = self.llm_projector(raw_hidden_states)
+            if isinstance(raw_hidden_states, list):
+                raw_hidden_states = raw_hidden_states[-1]
+            raw_hidden_states = raw_hidden_states.to(
+                device=self.device, dtype=self.config.dtype,
+            )
+
+            # ==================== Step 2: Project Hidden States ====================
+            llm_tokens = self.llm_projector(raw_hidden_states)
 
         # ==================== Step 3: HeatmapVLN v2 ====================
         heatmap_output = None
@@ -409,9 +419,9 @@ class VLNPipeline(nn.Module):
         # ==================== Step 4: Action Generation ====================
         actions = None
         trajectory = None
-        action_cond = llm_tokens.mean(dim=1)
+        action_cond = llm_tokens.mean(dim=1) if llm_tokens is not None else None
 
-        if return_actions:
+        if return_actions and llm_tokens is not None:
             if self.transformer_action_head is not None:
                 if not self.training:
                     trajectory = self.transformer_action_head.get_trajectory(llm_tokens)
@@ -424,29 +434,32 @@ class VLNPipeline(nn.Module):
         stop_logits = None
         stop_prob = None
 
-        if self.progress_head is not None:
+        if self.progress_head is not None and llm_tokens is not None:
             progress = self.progress_head.get_progress(llm_tokens)
 
-        if self.stop_head is not None:
+        if self.stop_head is not None and llm_tokens is not None:
             stop_cond = llm_tokens.mean(dim=1)
             stop_logits = self.stop_head.classifier(stop_cond).squeeze(-1)
             stop_prob = torch.sigmoid(stop_logits)
 
         # ==================== Build Output ====================
         output: Dict[str, Any] = {
-            'llm_tokens': llm_tokens,
             'processing_metadata': {
                 'num_input_frames': num_frames,
                 'batch_size': batch_size,
-                'llm_token_shape': llm_tokens.shape,
+                'llm_token_shape': None if llm_tokens is None else llm_tokens.shape,
             },
         }
+
+        if llm_tokens is not None:
+            output['llm_tokens'] = llm_tokens
 
         if heatmap_output is not None:
             output['visibility'] = heatmap_output['visibility']
             output['heatmaps'] = heatmap_output['heatmaps']
 
-        output['action_cond'] = action_cond
+        if action_cond is not None:
+            output['action_cond'] = action_cond
 
         if self.transformer_action_head is not None:
             output['has_transformer_action_head'] = True
@@ -463,7 +476,7 @@ class VLNPipeline(nn.Module):
             output['stop_logits'] = stop_logits
             output['stop_prob'] = stop_prob
 
-        if return_intermediate:
+        if return_intermediate and raw_hidden_states is not None and qwen_output is not None:
             output['intermediate_features'] = {
                 'raw_hidden_states': raw_hidden_states,
                 'qwen_output': qwen_output,

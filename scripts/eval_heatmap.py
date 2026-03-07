@@ -39,7 +39,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import build_model
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
-from src.data.tokenized_dataset import TokenizedVLNDataset, FlattenedCollatorForVLN
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
 logging.basicConfig(
@@ -70,6 +69,26 @@ def load_checkpoint(ckpt_path: str, model: torch.nn.Module, device: torch.device
     logger.info(f"  Loaded {len(state_dict)} params, missing={len(missing)}, unexpected={len(unexpected)}")
     
     return model
+
+
+def should_use_gpu_gt(batch: Dict[str, Any]) -> bool:
+    return 'history_poses' in batch and 'current_views' not in batch
+
+
+def flatten_heatmap_slices(heatmaps: torch.Tensor) -> torch.Tensor:
+    if heatmaps.dim() <= 3:
+        return heatmaps
+    return heatmaps.reshape(-1, heatmaps.shape[-2], heatmaps.shape[-1])
+
+
+def select_primary_heatmap_slice(heatmaps: torch.Tensor) -> torch.Tensor:
+    if heatmaps.dim() == 5:
+        return heatmaps[:, 0, 0]
+    if heatmaps.dim() == 4 and heatmaps.shape[1] == 4:
+        return heatmaps[:, 0]
+    if heatmaps.dim() == 4:
+        return heatmaps[:, -1]
+    return heatmaps
 
 
 def compute_metrics(pred_hm: np.ndarray, gt_hm: np.ndarray) -> Dict[str, float]:
@@ -212,7 +231,6 @@ def evaluate_heatmap(
     save_dir: Path,
     max_samples: int = 200,
     num_vis: int = 20,
-    packing_enabled: bool = False,
 ):
     """运行完整的热力图评估"""
     model.eval()
@@ -238,7 +256,7 @@ def evaluate_heatmap(
         B = current_frame.shape[0]
         
         # GPU 计算 GT 热力图
-        if 'history_poses' in batch:
+        if should_use_gpu_gt(batch):
             history_poses = batch['history_poses'].to(device)
             current_poses = batch['current_pose'].to(device)
             
@@ -257,46 +275,56 @@ def evaluate_heatmap(
         else:
             gt_heatmap = batch['heatmap'].to(device)
         
+        history_frames = batch['history_frames']
+        video_frames = torch.cat([
+            history_frames,
+            history_frames[:, -1:]
+        ], dim=1).to(device)
+        text = batch['text']
+        instruction = list(text) if text else None
+        current_views = batch.get('current_views')
+        history_panoramas = batch.get('history_panoramas')
+        if current_views is not None:
+            current_views = current_views.to(device)
+        if history_panoramas is not None:
+            history_panoramas = history_panoramas.to(device)
+
         # 模型推理（完整扩散）
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            if packing_enabled:
-                output = model.forward_packed(
-                    packed_batch=batch,
-                    return_heatmaps=True,
-                )
-            else:
-                history_frames = batch['history_frames']
-                video_frames = torch.cat([
-                    history_frames,
-                    current_frame.unsqueeze(1)
-                ], dim=1).to(device)
-                
-                text = batch['text']
-                instruction = list(text) if text else None
-                
-                output = model(
-                    video_frames=video_frames,
-                    instruction_text=instruction,
-                    current_observation=current_frame.to(device),
-                    return_heatmaps=True,
-                )
+            output = model(
+                video_frames=video_frames,
+                instruction_text=instruction,
+                current_observation=current_frame.to(device),
+                current_views=current_views,
+                history_panoramas=history_panoramas,
+                return_heatmaps=True,
+            )
         
         # 获取预测热力图
-        pred_heatmap = output.get('history_heatmaps')
+        pred_heatmap = output.get('heatmaps')
         if pred_heatmap is None:
             continue
         
-        if pred_heatmap.dim() == 4:
-            pred_heatmap = pred_heatmap[:, -1]  # [B, H, W]
-        
         pred_heatmap = pred_heatmap.float()
+
+        metric_pred_heatmap = flatten_heatmap_slices(pred_heatmap)
+        metric_gt_heatmap = flatten_heatmap_slices(gt_heatmap)
         
         # 计算指标
         batch_metrics = []
-        for b in range(B):
+        if metric_pred_heatmap.shape != metric_gt_heatmap.shape:
+            logger.warning(
+                "Skip batch %d due to heatmap shape mismatch: pred=%s gt=%s",
+                num_batches,
+                tuple(metric_pred_heatmap.shape),
+                tuple(metric_gt_heatmap.shape),
+            )
+            continue
+
+        for b in range(metric_pred_heatmap.shape[0]):
             m = compute_metrics(
-                pred_heatmap[b].cpu().numpy(),
-                gt_heatmap[b].cpu().numpy()
+                metric_pred_heatmap[b].cpu().numpy(),
+                metric_gt_heatmap[b].cpu().numpy()
             )
             all_metrics.append(m)
             batch_metrics.append(m)
@@ -310,7 +338,9 @@ def evaluate_heatmap(
         if num_batches <= num_vis:
             vis_path = vis_dir / f"batch_{num_batches:04d}.png"
             visualize_batch(
-                current_frame, gt_heatmap, pred_heatmap,
+                current_frame,
+                select_primary_heatmap_slice(gt_heatmap),
+                select_primary_heatmap_slice(pred_heatmap),
                 vis_path, num_batches, batch_metrics,
                 num_samples=min(4, B),
             )
@@ -408,25 +438,12 @@ def main():
         defer_heatmap_to_gpu=True,  # 始终使用 GPU 计算 GT
     )
     
-    # Determine if packing mode
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
-    
     if packing_enabled:
-        if not model.qwen3_5._model_loaded:
-            model.qwen3_5._load_model()
-        
-        spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
-        tokenized_dataset = TokenizedVLNDataset(
-            base_dataset=dataset,
-            processor=model.qwen3_5.processor,
-            spatial_merge_size=spatial_merge_size,
-        )
-        collate_fn = FlattenedCollatorForVLN()
-        actual_dataset = tokenized_dataset
-    else:
-        from scripts.train import collate_fn as train_collate_fn
-        collate_fn = train_collate_fn
-        actual_dataset = dataset
+        raise ValueError("Qwen3.5 v2 热力图评估不支持 sequence packing，请关闭 enable_packing。")
+    from scripts.train import collate_fn as train_collate_fn
+    collate_fn = train_collate_fn
+    actual_dataset = dataset
     
     dataloader = DataLoader(
         actual_dataset,
@@ -439,7 +456,7 @@ def main():
     )
     
     logger.info(f"Dataset: {len(dataset)} samples")
-    logger.info(f"Packing: {packing_enabled}")
+    logger.info("Packing: False")
     
     # GPU heatmap computer
     hm_size = tuple(cfg['data'].get('init_hm_size', [64, 64]))
@@ -466,7 +483,6 @@ def main():
         save_dir=save_dir,
         max_samples=args.max_samples,
         num_vis=args.num_vis,
-        packing_enabled=packing_enabled,
     )
     
     # Print results

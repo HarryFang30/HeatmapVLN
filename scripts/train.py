@@ -55,8 +55,6 @@ warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metad
 warnings.filterwarnings("ignore", message="Asked to sample")
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
-from src.data.packing_collator import PackingCollatorForVLN
-from src.data.tokenized_dataset import TokenizedVLNDataset, FlattenedCollatorForVLN
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.logger import setup_logger
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -462,18 +460,9 @@ def visualize_heatmap_predictions(
         if pred_heatmaps is None:
             return
         
-        # 提取 2D 热力图用于可视化：优先显示第一个历史位置的 front view。
-        if pred_heatmaps.dim() == 5:
-            pred_heatmaps = pred_heatmaps[:, 0, 0]
-        elif pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
-            pred_heatmaps = pred_heatmaps[:, 0]
-        elif pred_heatmaps.dim() == 4:
-            pred_heatmaps = pred_heatmaps[:, -1]
-        
-        if gt_heatmaps.dim() == 5:
-            gt_heatmaps = gt_heatmaps[:, 0, 0]
-        elif gt_heatmaps.dim() == 4 and gt_heatmaps.shape[1] == 4:
-            gt_heatmaps = gt_heatmaps[:, 0]
+        # 提取 2D 热力图用于可视化：默认显示第一个历史位置的 front view。
+        pred_heatmaps = _select_primary_heatmap_slice(pred_heatmaps)
+        gt_heatmaps = _select_primary_heatmap_slice(gt_heatmaps)
         
         # 全景模式：取 current_views 的 front 视角
         if 'current_views' in batch:
@@ -516,6 +505,24 @@ def visualize_heatmap_predictions(
     except Exception as e:
         logger.warning(f"Visualization failed: {e}")
         return None
+
+
+def _should_use_gpu_gt(batch: Dict[str, Any], gpu_heatmap_computer: Optional[GPUHeatmapComputer]) -> bool:
+    if gpu_heatmap_computer is None or 'history_poses' not in batch:
+        return False
+    # Panoramic v2 GT is produced per history position and per view in the dataset.
+    # The GPU helper only supports the legacy single-view layout.
+    return 'current_views' not in batch
+
+
+def _select_primary_heatmap_slice(heatmaps: torch.Tensor) -> torch.Tensor:
+    if heatmaps.dim() == 5:
+        return heatmaps[:, 0, 0]
+    if heatmaps.dim() == 4 and heatmaps.shape[1] == 4:
+        return heatmaps[:, 0]
+    if heatmaps.dim() == 4:
+        return heatmaps[:, -1]
+    return heatmaps
 
 
 # ============================================
@@ -951,7 +958,6 @@ def train_one_epoch(
     stage_name: str = "",
     stage_cfg: Dict = None,
     max_batches: int = None,
-    packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
     gpu_has_depth: bool = False,
@@ -1007,17 +1013,9 @@ def train_one_epoch(
         if max_batches is not None and i >= max_batches:
             break
         
-        # 准备数据 - Packing 模式和传统模式的 batch 结构不同
-        if packing_enabled:
-            # Packing 模式: batch 来自 FlattenedCollatorForVLN
-            # 没有 history_frames，直接使用 packed batch
-            B = batch['num_samples']
-            current_frame = batch['current_frame']
-        else:
-            # 传统模式: batch 来自普通 collate_fn
-            history_frames = batch['history_frames']
-            current_frame = batch['current_frame']
-            B, K, C, H, W = history_frames.shape
+        history_frames = batch['history_frames']
+        current_frame = batch['current_frame']
+        B, K, C, H, W = history_frames.shape
         
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
@@ -1025,7 +1023,7 @@ def train_one_epoch(
         text = batch['text']
         
         # GPU 热力图计算（如果启用）
-        if gpu_heatmap_computer is not None and 'history_poses' in batch:
+        if _should_use_gpu_gt(batch, gpu_heatmap_computer):
             history_poses = batch['history_poses'].to(device)  # [B, K, 4, 4]
             current_poses = batch['current_pose'].to(device)   # [B, 4, 4]
             
@@ -1052,54 +1050,39 @@ def train_one_epoch(
         
         # 前向传播
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            if packing_enabled:
-                # Packing 模式: 直接传递 packed batch
-                output = model.forward_packed(
-                    packed_batch=batch,
-                    return_heatmaps=True,
-                    return_actions=train_action,
-                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                    action_valid=action_valid if train_action else None,
-                    gt_stop=is_stop if train_action else None,
-                    gt_history_heatmap=gt_heatmap if train_history else None,
-                    gt_future_heatmap=gt_heatmap if train_future else None,
-                )
+            # Build video_frames from history only. Append a duplicate of the
+            # last history frame as placeholder; pipeline.forward() ignores it
+            # when current_observation is provided.
+            video_frames = torch.cat([
+                history_frames,
+                history_frames[:, -1:],
+            ], dim=1)
+            
+            if text and len(text) > 0:
+                instruction_text = list(text)
             else:
-                # Standard mode: build video_frames from history only
-                # (current_frame may have different spatial size in panoramic mode)
-                # Append a duplicate of the last history frame as placeholder;
-                # pipeline.forward() will ignore it when current_observation is provided
-                video_frames = torch.cat([
-                    history_frames,
-                    history_frames[:, -1:],
-                ], dim=1)
-                
-                # 处理导航指令
-                if text and len(text) > 0:
-                    instruction_text = list(text)
-                else:
-                    instruction_text = None
-                current_views_batch = batch.get('current_views')
-                if current_views_batch is not None:
-                    current_views_batch = current_views_batch.to(device)
-                history_panoramas_batch = batch.get('history_panoramas')
-                if history_panoramas_batch is not None:
-                    history_panoramas_batch = history_panoramas_batch.to(device)
-                
-                output = model(
-                    video_frames=video_frames,
-                    instruction_text=instruction_text,
-                    current_observation=current_frame.to(device),
-                    current_views=current_views_batch,
-                    history_panoramas=history_panoramas_batch,
-                    return_heatmaps=True,
-                    return_actions=train_action,
-                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                    action_valid=action_valid if train_action else None,
-                    gt_stop=is_stop if train_action else None,
-                    gt_history_heatmap=gt_heatmap if train_history else None,
-                    gt_future_heatmap=gt_heatmap if train_future else None,
-                )
+                instruction_text = None
+            current_views_batch = batch.get('current_views')
+            if current_views_batch is not None:
+                current_views_batch = current_views_batch.to(device)
+            history_panoramas_batch = batch.get('history_panoramas')
+            if history_panoramas_batch is not None:
+                history_panoramas_batch = history_panoramas_batch.to(device)
+            
+            output = model(
+                video_frames=video_frames,
+                instruction_text=instruction_text,
+                current_observation=current_frame.to(device),
+                current_views=current_views_batch,
+                history_panoramas=history_panoramas_batch,
+                return_heatmaps=True,
+                return_actions=train_action,
+                gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                action_valid=action_valid if train_action else None,
+                gt_stop=is_stop if train_action else None,
+                gt_history_heatmap=gt_heatmap if train_history else None,
+                gt_future_heatmap=gt_heatmap if train_future else None,
+            )
             
             # Heatmap Loss (v2: HeatmapVLNLoss computed externally)
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -1257,15 +1240,9 @@ def train_one_epoch(
                     if 'heatmaps' in output and output['heatmaps'] is not None:
                         pred_hm = output['heatmaps'].detach()
                         
-                        if pred_hm.dim() == 5:
-                            pred_hm = pred_hm[:, 0, 0].unsqueeze(1)
-                        elif pred_hm.dim() == 4 and pred_hm.shape[1] == 4:
-                            pred_hm = pred_hm[:, 0].unsqueeze(1)
+                        pred_hm = _select_primary_heatmap_slice(pred_hm).unsqueeze(1)
                         gt_hm_for_diag = gt_heatmap
-                        if gt_hm_for_diag.dim() == 5:
-                            gt_hm_for_diag = gt_hm_for_diag[:, 0, 0]
-                        elif gt_hm_for_diag.dim() == 4 and gt_hm_for_diag.shape[1] == 4:
-                            gt_hm_for_diag = gt_hm_for_diag[:, 0]
+                        gt_hm_for_diag = _select_primary_heatmap_slice(gt_hm_for_diag)
                         
                         pred_mean = pred_hm.mean().item()
                         pred_max = pred_hm.max().item()
@@ -1412,26 +1389,6 @@ def train_one_epoch(
                     
                     
                     
-                    # Legacy DPT head diagnostics (removed in v2)
-                    if False:
-                        for dkey in ('dpt_kl_loss', 'dpt_spatial_loss',
-                                     'dpt_pred_max', 'dpt_pred_mean',
-                                     'dpt_n_pos', 'dpt_n_neg'):
-                            val = output.get(f'history_heatmap_{dkey}')
-                            if val is not None:
-                                tb_writer.add_scalar(f'diag/{dkey}', val, actual_step)
-                    
-                    # Legacy direct head diagnostics (removed in v2)
-                    if False:
-                        for dkey in ('direct_mse', 'direct_bce', 'direct_dice_loss',
-                                     'direct_peak_loss', 'direct_mse_peak', 'direct_mse_bg',
-                                     'direct_pred_max', 'direct_pred_mean',
-                                     'direct_gate_bias', 'direct_neg_pred_mean',
-                                     'direct_pos_pred_mean'):
-                            val = output.get(f'history_heatmap_{dkey}')
-                            if val is not None:
-                                tb_writer.add_scalar(f'diag/{dkey}', val, actual_step)
-                    
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
                         pred_progress = output['progress'].detach()
@@ -1486,7 +1443,7 @@ def train_one_epoch(
                 step=global_step,
                 output_dir=vis_dir if vis_dir else Path('.'),
                 num_samples=2,
-                gt_heatmap_override=gt_heatmap if gpu_heatmap_computer is not None else None,
+                gt_heatmap_override=gt_heatmap if _should_use_gpu_gt(batch, gpu_heatmap_computer) else None,
             )
             if vis_path:
                 try:
@@ -1552,7 +1509,6 @@ def validate(
     stage_cfg: Dict,
     tb_writer: Optional[SummaryWriter] = None,
     epoch: int = 0,
-    packing_enabled: bool = False,
     vis_dir: Optional[Path] = None,
     max_batches: int = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
@@ -1592,14 +1548,9 @@ def validate(
     for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
         if max_batches is not None and i >= max_batches:
             break
-        # Packing 模式和传统模式的 batch 结构不同
-        if packing_enabled:
-            B = batch['num_samples']
-            current_frame = batch['current_frame']
-        else:
-            history_frames = batch['history_frames']
-            current_frame = batch['current_frame']
-            B, K, C, H, W = history_frames.shape
+        history_frames = batch['history_frames']
+        current_frame = batch['current_frame']
+        B, K, C, H, W = history_frames.shape
         
         gt_action = batch['action'].to(device)
         action_valid = batch['action_valid'].to(device)
@@ -1607,7 +1558,7 @@ def validate(
         text = batch['text']
         
         # GPU 热力图计算（如果启用）
-        if gpu_heatmap_computer is not None and 'history_poses' in batch:
+        if _should_use_gpu_gt(batch, gpu_heatmap_computer):
             history_poses = batch['history_poses'].to(device)
             current_poses = batch['current_pose'].to(device)
             
@@ -1625,48 +1576,35 @@ def validate(
             gt_heatmap = batch['heatmap'].to(device)
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            if packing_enabled:
-                # Packing 模式 — 传入 GT 热力图计算 training loss
-                output = model.forward_packed(
-                    packed_batch=batch,
-                    return_heatmaps=True,
-                    return_actions=train_action,
-                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                    action_valid=action_valid if train_action else None,
-                    gt_stop=is_stop if train_action else None,
-                    gt_history_heatmap=gt_heatmap if train_history else None,
-                )
+            video_frames = torch.cat([
+                history_frames,
+                history_frames[:, -1:],
+            ], dim=1)
+            
+            if text and len(text) > 0:
+                instruction_text = list(text)
             else:
-                # 传统模式: current_frame 可能与 history_frames 尺寸不同（全景模式）
-                video_frames = torch.cat([
-                    history_frames,
-                    history_frames[:, -1:],
-                ], dim=1)
-                
-                if text and len(text) > 0:
-                    instruction_text = list(text)
-                else:
-                    instruction_text = None
-                current_views_batch = batch.get('current_views')
-                if current_views_batch is not None:
-                    current_views_batch = current_views_batch.to(device)
-                history_panoramas_batch = batch.get('history_panoramas')
-                if history_panoramas_batch is not None:
-                    history_panoramas_batch = history_panoramas_batch.to(device)
-                
-                output = model(
-                    video_frames=video_frames,
-                    instruction_text=instruction_text,
-                    current_observation=current_frame.to(device),
-                    current_views=current_views_batch,
-                    history_panoramas=history_panoramas_batch,
-                    return_heatmaps=True,
-                    return_actions=train_action,
-                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                    action_valid=action_valid if train_action else None,
-                    gt_stop=is_stop if train_action else None,
-                    gt_history_heatmap=gt_heatmap if train_history else None,
-                )
+                instruction_text = None
+            current_views_batch = batch.get('current_views')
+            if current_views_batch is not None:
+                current_views_batch = current_views_batch.to(device)
+            history_panoramas_batch = batch.get('history_panoramas')
+            if history_panoramas_batch is not None:
+                history_panoramas_batch = history_panoramas_batch.to(device)
+            
+            output = model(
+                video_frames=video_frames,
+                instruction_text=instruction_text,
+                current_observation=current_frame.to(device),
+                current_views=current_views_batch,
+                history_panoramas=history_panoramas_batch,
+                return_heatmaps=True,
+                return_actions=train_action,
+                gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                action_valid=action_valid if train_action else None,
+                gt_stop=is_stop if train_action else None,
+                gt_history_heatmap=gt_heatmap if train_history else None,
+            )
             
             # Heatmap loss (v2)
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -1757,37 +1695,29 @@ def validate(
         if num_batches <= val_inference_batches:
             try:
                 # 纯推理模式生成热力图（不传 gt_heatmap）
-                if packing_enabled:
-                    vis_output = model.forward_packed(
-                        packed_batch=batch,
-                        return_heatmaps=True,
-                        return_actions=False,
-                    )
-                else:
-                    video_frames = torch.cat([
-                        history_frames,
-                        history_frames[:, -1:],
-                    ], dim=1)
-                    current_views_batch = batch.get('current_views')
-                    if current_views_batch is not None:
-                        current_views_batch = current_views_batch.to(device)
-                    history_panoramas_batch = batch.get('history_panoramas')
-                    if history_panoramas_batch is not None:
-                        history_panoramas_batch = history_panoramas_batch.to(device)
-                    vis_output = model(
-                        video_frames=video_frames,
-                        instruction_text=list(text) if text else None,
-                        current_observation=current_frame.to(device),
-                        current_views=current_views_batch,
-                        history_panoramas=history_panoramas_batch,
-                        return_heatmaps=True,
-                        return_actions=False,
-                    )
+                video_frames = torch.cat([
+                    history_frames,
+                    history_frames[:, -1:],
+                ], dim=1)
+                current_views_batch = batch.get('current_views')
+                if current_views_batch is not None:
+                    current_views_batch = current_views_batch.to(device)
+                history_panoramas_batch = batch.get('history_panoramas')
+                if history_panoramas_batch is not None:
+                    history_panoramas_batch = history_panoramas_batch.to(device)
+                vis_output = model(
+                    video_frames=video_frames,
+                    instruction_text=list(text) if text else None,
+                    current_observation=current_frame.to(device),
+                    current_views=current_views_batch,
+                    history_panoramas=history_panoramas_batch,
+                    return_heatmaps=True,
+                    return_actions=False,
+                )
                 
                 # 计算完整推理的 heatmap MSE（真实生成质量指标）
-                vis_hm_key = 'heatmaps' if 'heatmaps' in vis_output else 'history_heatmaps'
-                if train_history and vis_hm_key in vis_output:
-                    infer_pred_hm = vis_output[vis_hm_key]
+                if train_history and 'heatmaps' in vis_output:
+                    infer_pred_hm = vis_output['heatmaps']
                     if infer_pred_hm.dim() == 5:
                         infer_pred_hm = infer_pred_hm[:, 0, 0, :, :]
                     elif infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
@@ -1819,7 +1749,7 @@ def validate(
                         step=num_batches,
                         output_dir=vis_dir,
                         num_samples=4,
-                        gt_heatmap_override=gt_heatmap if gpu_heatmap_computer is not None else None,
+                        gt_heatmap_override=gt_heatmap if _should_use_gpu_gt(batch, gpu_heatmap_computer) else None,
                     )
                     
                     if vis_path is not None:
@@ -2370,34 +2300,11 @@ def main():
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
     
     if packing_enabled:
-        # Packing 模式：符合官方实现
-        # Tokenization 在 Dataset.__getitem__() 中完成，可以利用 num_workers 并行
-        logger.info("📦 Sequence Packing enabled (official implementation)")
-        
-        # 必须先加载模型以获取 processor
-        if not model.qwen3_5._model_loaded:
-            model.qwen3_5._load_model()
-        
-        # 包装数据集，在 __getitem__ 中做 tokenization
-        spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
-        train_dataset = TokenizedVLNDataset(
-            base_dataset=train_dataset,
-            processor=model.qwen3_5.processor,
-            spatial_merge_size=spatial_merge_size,
+        raise ValueError(
+            "Qwen3.5 路径已移除 Sequence Packing 兼容代码，请在配置中设置 "
+            "model.llm.enable_packing=false。"
         )
-        val_dataset = TokenizedVLNDataset(
-            base_dataset=val_dataset,
-            processor=model.qwen3_5.processor,
-            spatial_merge_size=spatial_merge_size,
-        )
-        
-        # 使用官方的 FlattenedCollator（只做拼接，不做 tokenization）
-        actual_collate_fn = FlattenedCollatorForVLN()
-        
-        logger.info("   Tokenization in Dataset.__getitem__() - can use num_workers")
-        logger.info(f"   num_workers: {num_workers}")
-    else:
-        actual_collate_fn = collate_fn
+    actual_collate_fn = collate_fn
     
     # 🔧 使用 fork 模式（而非 spawn），利用 copy-on-write 共享内存
     # TOKENIZERS_PARALLELISM=false 已设置，fork 安全
@@ -2408,15 +2315,7 @@ def main():
     
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
     
-    # 🔧 内存优化：packing 模式下禁用 persistent_workers
-    # 原因：packing 模式每个 __getitem__ 执行 tokenization（分配/释放 ~20MB），
-    # Python pymalloc 不归还内存给 OS，persistent_workers 下内存碎片化持续增长。
-    # 禁用后每个 epoch 重建 workers，回收碎片化内存。
-    if packing_enabled:
-        persistent_workers = False
-        logger.info("   ⚠️ Packing mode: persistent_workers=False (防止 tokenization 内存碎片化)")
-    else:
-        persistent_workers = num_workers > 0
+    persistent_workers = num_workers > 0
     
     train_loader = DataLoader(
         train_dataset,
@@ -2560,7 +2459,6 @@ def main():
             cfg, epoch, logger, tb_writer, epoch_offset,
             stage_idx=0, stage_name=stage_name, stage_cfg=stage_cfg,
             max_batches=args.max_batches,
-            packing_enabled=packing_enabled,
             vis_dir=vis_train_dir,
             gpu_heatmap_computer=gpu_heatmap_computer,
             gpu_has_depth=gpu_has_depth,
@@ -2579,7 +2477,6 @@ def main():
         with ema.apply():
             val_metrics = validate(
                 model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
-                packing_enabled=packing_enabled,
                 vis_dir=vis_val_dir,
                 max_batches=args.max_batches,
                 gpu_heatmap_computer=gpu_heatmap_computer,

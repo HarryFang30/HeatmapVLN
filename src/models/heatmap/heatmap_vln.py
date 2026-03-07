@@ -142,7 +142,9 @@ class HeatmapVLN(nn.Module):
         # Locate image and text-anchor positions
         image_positions = self._find_image_positions(inputs)
         text_anchors = find_text_anchor_positions(
-            inputs["input_ids"], self.processor.tokenizer,
+            inputs["input_ids"],
+            self.processor.tokenizer,
+            num_history=N_hist,
         )
 
         # === Step 2: Qwen3.5 forward (frozen, no grad) ===
@@ -168,6 +170,11 @@ class HeatmapVLN(nn.Module):
             )
         )
 
+        if len(history_queries) != N_hist:
+            raise RuntimeError(
+                f"Expected {N_hist} history queries, got {len(history_queries)}"
+            )
+
         # === Step 4: coarse localisation (zero params) ===
         coarse_results = self.coarse(current_llm, history_queries)
 
@@ -175,19 +182,36 @@ class HeatmapVLN(nn.Module):
         fused_vit: Dict[int, torch.Tensor] = {}
         for view_idx in range(4):
             multi_layer = []
+            template_feat = None
             for layer_idx in self.vit_layer_indices:
                 feat = current_vit[view_idx].get(layer_idx)
                 if feat is None:
                     continue
                 # (H, W, C_vit) -> (1, C_vit, H, W)
                 feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
+                template_feat = feat
                 multi_layer.append(feat)
+            if template_feat is not None and len(multi_layer) != len(self.vit_layer_indices):
+                multi_layer = []
+                for layer_idx in self.vit_layer_indices:
+                    feat = current_vit[view_idx].get(layer_idx)
+                    if feat is None:
+                        multi_layer.append(torch.zeros_like(template_feat))
+                        continue
+                    feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
+                    multi_layer.append(feat)
             if multi_layer:
                 fused_vit[view_idx] = self.dpt_fusion(multi_layer)  # (1, C_fused, H, W)
 
         # === Step 6: fine localisation (trainable) ===
         all_visibility = []
         all_heatmaps = []
+
+        if N_hist == 0:
+            return {
+                "visibility": torch.empty(0, 4, device=device),
+                "heatmaps": torch.empty(0, 4, 64, 64, device=device),
+            }
 
         for hist_idx in range(N_hist):
             coarse = coarse_results[hist_idx]
@@ -207,8 +231,10 @@ class HeatmapVLN(nn.Module):
                 else:
                     fine_hm = torch.zeros(64, 64, device=device)
 
-                gated_hm = fine_hm * torch.sigmoid(vis[view_idx])
-                view_heatmaps.append(gated_hm)
+                if self.training:
+                    view_heatmaps.append(fine_hm)
+                else:
+                    view_heatmaps.append(fine_hm * torch.sigmoid(vis[view_idx]))
 
             all_heatmaps.append(torch.stack(view_heatmaps))  # (4, 64, 64)
 

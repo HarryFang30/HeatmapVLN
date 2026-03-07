@@ -1238,49 +1238,6 @@ class VLNSlidingWindowDataset(Dataset):
 
         return torch.stack(per_history_heatmaps, dim=0), torch.stack(per_history_visibility, dim=0)
     
-    def _compute_multiview_heatmaps(
-        self,
-        clip_idx: int,
-        clip_dir: Path,
-        history_poses: List[np.ndarray],
-        current_t: int,
-        img_size: Tuple[int, int],
-        K: Optional[np.ndarray],
-        hm_size: Tuple[int, int],
-    ) -> Tuple[torch.Tensor, int]:
-        """为 4 个方向分别计算热力图。
-        
-        Returns:
-            heatmaps: [4, Hm, Wm] tensor
-            total_visibility: 所有方向可见的历史帧总数
-        """
-        heatmaps = []
-        total_visibility = 0
-        
-        for d in self.PANORAMIC_DIRECTIONS:
-            try:
-                pose = self._get_chunk_frame_array(clip_idx, current_t, "pose", direction=d)
-                current_pose = np.array(pose, dtype=np.float32)
-            except (KeyError, Exception):
-                current_pose = self._load_poses(clip_idx)[current_t]
-            
-            current_depth = self._load_depth(clip_dir, current_t, direction=d)
-            
-            hm_h, hm_w = hm_size
-            hm, vis = compute_history_heatmap(
-                history_poses=history_poses,
-                current_pose=current_pose,
-                current_depth=current_depth,
-                hm_size=(hm_h, hm_w),
-                img_size=img_size,
-                K=K,
-                depth_normalize=not self._depth_is_meters,
-            )
-            heatmaps.append(torch.from_numpy(hm).float())
-            total_visibility += vis
-        
-        return torch.stack(heatmaps, dim=0), total_visibility
-    
     def _load_depth(self, clip_dir: Path, frame_idx: int,
                     direction: Optional[str] = None) -> Optional[np.ndarray]:
         """加载深度图
@@ -1477,12 +1434,7 @@ class VLNSlidingWindowDataset(Dataset):
             
             hm_w, hm_h = self.hm_size
             
-            if self.defer_heatmap_to_gpu:
-                if self._is_panoramic:
-                    heatmap_tensor = torch.zeros(len(history_poses), 4, hm_h, hm_w)
-                else:
-                    heatmap_tensor = torch.zeros(hm_h, hm_w)
-            elif self._is_panoramic:
+            if self._is_panoramic:
                 heatmap_tensor, visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
@@ -1492,6 +1444,8 @@ class VLNSlidingWindowDataset(Dataset):
                     K=K,
                     hm_size=(hm_h, hm_w),
                 )
+            elif self.defer_heatmap_to_gpu:
+                heatmap_tensor = torch.zeros(hm_h, hm_w)
             else:
                 heatmap, visibility = compute_history_heatmap(
                     history_poses=history_poses,
@@ -2274,12 +2228,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             
             hm_w, hm_h = self.hm_size
             
-            if self.defer_heatmap_to_gpu:
-                if self._is_panoramic:
-                    heatmap_tensor = torch.zeros(len(history_poses), 4, hm_h, hm_w)
-                else:
-                    heatmap_tensor = torch.zeros(hm_h, hm_w)
-            elif self._is_panoramic:
+            if self._is_panoramic:
                 heatmap_tensor, visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
@@ -2289,6 +2238,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     K=K,
                     hm_size=(hm_h, hm_w),
                 )
+            elif self.defer_heatmap_to_gpu:
+                heatmap_tensor = torch.zeros(hm_h, hm_w)
             else:
                 heatmap, visibility = compute_history_heatmap(
                     history_poses=history_poses,

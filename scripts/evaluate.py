@@ -30,7 +30,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.data.vln_sliding_window_dataset import VLNTrajectoryDataset
-from src.data.tokenized_dataset import TokenizedVLNDataset, FlattenedCollatorForVLN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +42,12 @@ logger = logging.getLogger("evaluate")
 def load_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def flatten_heatmap_slices(heatmaps: torch.Tensor) -> torch.Tensor:
+    if heatmaps.dim() <= 3:
+        return heatmaps
+    return heatmaps.reshape(-1, heatmaps.shape[-2], heatmaps.shape[-1])
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
@@ -62,6 +67,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         result['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
         result['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
         result['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
+    if 'current_views' in batch[0]:
+        result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
+    if 'history_panoramas' in batch[0]:
+        result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
     
     return result
 
@@ -71,7 +80,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     model_cfg = cfg['model']
     data_cfg = cfg['data']
     llm_cfg = model_cfg.get('llm', {})
-    heatmap_cfg = model_cfg.get('heatmap_head', {})
+    heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     stop_cfg = model_cfg.get('stop_head', {})
     progress_cfg = model_cfg.get('progress_head', {})
@@ -97,36 +106,15 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         # Device
         device=device,
         
-        # Heatmap
-        heatmap_size=tuple(data_cfg['init_hm_size']),
-        enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
-        enable_future_heatmap_head=heatmap_cfg.get('enable_future', False),
-        diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
-        diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        image_size=data_cfg['image_size'][0],
-        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', True),
-        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
-        heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
-        heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
-        heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
-        heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
-        heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
-        heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
-        heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
-        heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
-        heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
-        # Sequence cross-attention conditioning
-        heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
-        heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
-        heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
-        # Spatial feature injection
-        heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
-        heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
-        
-        # Multi-layer feature extraction
-        multi_layer_features=llm_cfg.get('multi_layer_features', False),
-        feature_layer_indices=llm_cfg.get('feature_layer_indices', None),
-        feature_fusion_method=llm_cfg.get('feature_fusion_method', 'weighted_sum'),
+        # HeatmapVLN v2
+        enable_heatmap=heatmap_cfg.get('enable', True),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
+        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', data_cfg['init_hm_size'])),
+        image_size=heatmap_cfg.get('image_size', data_cfg['image_size'][0]),
         
         # LoRA
         use_lora=llm_cfg.get('use_lora', False),
@@ -192,10 +180,8 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.
 
 
 def build_dataloader(
-    cfg: Dict, 
+    cfg: Dict,
     split: str = 'val',
-    model: Optional[VLNPipeline] = None,
-    packing_enabled: bool = False,
 ) -> DataLoader:
     """Build dataloader using VLNTrajectoryDataset."""
     sw_cfg = cfg['data']['sliding_window']
@@ -214,23 +200,9 @@ def build_dataloader(
         enable_augmentation=False,  # No augmentation for evaluation
     )
     
-    if packing_enabled and model is not None:
-        # Ensure model is loaded for processor
-        if not model.qwen3_5._model_loaded:
-            model.qwen3_5._load_model()
-        
-        spatial_merge_size = cfg['model']['llm'].get('spatial_merge_size', 2)
-        dataset = TokenizedVLNDataset(
-            base_dataset=base_dataset,
-            processor=model.qwen3_5.processor,
-            spatial_merge_size=spatial_merge_size,
-        )
-        actual_collate_fn = FlattenedCollatorForVLN()
-        num_workers = 0  # Packing mode uses main process
-    else:
-        dataset = base_dataset
-        actual_collate_fn = collate_fn
-        num_workers = 4
+    dataset = base_dataset
+    actual_collate_fn = collate_fn
+    num_workers = 4
     
     return DataLoader(
         dataset,
@@ -348,7 +320,6 @@ def evaluate(
     eval_heatmap: bool = True,
     eval_trajectory: bool = True,
     eval_progress: bool = True,
-    packing_enabled: bool = False,
     args=None
 ) -> Dict[str, float]:
     """Run evaluation."""
@@ -376,45 +347,51 @@ def evaluate(
         current_frame = batch['current_frame']
         B = current_frame.shape[0]
         
+        history_frames = batch['history_frames']
+        video_frames = torch.cat([
+            history_frames,
+            history_frames[:, -1:]
+        ], dim=1).to(device)
+        text = batch['text']
+        instruction = list(text) if text and len(text) > 0 else None
+        current_views = batch.get('current_views')
+        history_panoramas = batch.get('history_panoramas')
+        if current_views is not None:
+            current_views = current_views.to(device)
+        if history_panoramas is not None:
+            history_panoramas = history_panoramas.to(device)
+
         # Forward pass
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            if packing_enabled:
-                outputs = model.forward_packed(
-                    packed_batch=batch,
-                    return_heatmaps=eval_heatmap,
-                    return_actions=eval_trajectory,
-                )
-            else:
-                history_frames = batch['history_frames']
-                video_frames = torch.cat([
-                    history_frames,
-                    current_frame.unsqueeze(1)
-                ], dim=1).to(device)
-                
-                text = batch['text']
-                instruction = list(text) if text and len(text) > 0 else None
-                
-                outputs = model(
-                    video_frames=video_frames,
-                    instruction_text=instruction,
-                    current_observation=current_frame.to(device),
-                    return_heatmaps=eval_heatmap,
-                    return_actions=eval_trajectory,
-                )
+            outputs = model(
+                video_frames=video_frames,
+                instruction_text=instruction,
+                current_observation=current_frame.to(device),
+                current_views=current_views,
+                history_panoramas=history_panoramas,
+                return_heatmaps=eval_heatmap,
+                return_actions=eval_trajectory,
+            )
         
         # Evaluate heatmap
-        if eval_heatmap and 'history_heatmaps' in outputs:
-            pred_hm = outputs['history_heatmaps'][:, -1].cpu().numpy()
-            gt_hm = gt_heatmap.cpu().numpy()
-            
-            for b in range(B):
-                if gt_hm[b].sum() > 0:
-                    metrics = compute_spatial_metrics(pred_hm[b], gt_hm[b])
-                    totals['hm_peak_error'] += metrics['peak_error']
-                    totals['hm_iou'] += metrics['iou']
-                    totals['hm_cosine_sim'] += metrics['cosine_sim']
-                    totals['hm_mae'] += metrics['mae']
-                    counts['hm'] += 1
+        if eval_heatmap and 'heatmaps' in outputs:
+            pred_hm = flatten_heatmap_slices(outputs['heatmaps'].detach().cpu()).numpy()
+            gt_hm = flatten_heatmap_slices(gt_heatmap.cpu()).numpy()
+
+            if pred_hm.shape != gt_hm.shape:
+                logger.warning(
+                    "Skip heatmap metrics due to shape mismatch: pred=%s gt=%s",
+                    pred_hm.shape, gt_hm.shape,
+                )
+            else:
+                for hm_idx in range(pred_hm.shape[0]):
+                    if gt_hm[hm_idx].sum() > 0:
+                        metrics = compute_spatial_metrics(pred_hm[hm_idx], gt_hm[hm_idx])
+                        totals['hm_peak_error'] += metrics['peak_error']
+                        totals['hm_iou'] += metrics['iou']
+                        totals['hm_cosine_sim'] += metrics['cosine_sim']
+                        totals['hm_mae'] += metrics['mae']
+                        counts['hm'] += 1
 
         # Evaluate trajectory
         if eval_trajectory and 'trajectory' in batch:
@@ -497,6 +474,10 @@ def visualize_sample(
     current_frame = batch['current_frame'][0].permute(1, 2, 0).cpu().numpy()
     current_frame = np.clip(current_frame, 0, 1)
     gt_heatmap = batch['heatmap'][0].cpu().numpy()
+    if gt_heatmap.ndim == 4:
+        gt_heatmap = gt_heatmap[0, 0]
+    elif gt_heatmap.ndim == 3:
+        gt_heatmap = gt_heatmap[0]
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
@@ -510,8 +491,8 @@ def visualize_sample(
     axes[0, 1].axis('off')
     plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
     
-    if eval_heatmap and 'history_heatmaps' in outputs:
-        pred_hm = outputs['history_heatmaps'][0, -1].cpu().numpy()
+    if eval_heatmap and 'heatmaps' in outputs:
+        pred_hm = outputs['heatmaps'][0, 0, 0].cpu().numpy()
         pred_hm = np.clip(pred_hm, 0, 1)
         im = axes[0, 2].imshow(pred_hm, cmap='inferno', vmin=0, vmax=1)
         axes[0, 2].set_title(f"Pred Heatmap (max={pred_hm.max():.2f})")
@@ -624,7 +605,9 @@ def main():
 
     # Build dataloader
     packing_enabled = args.use_packing or cfg['model']['llm'].get('enable_packing', False)
-    dataloader = build_dataloader(cfg, split=args.split, model=model, packing_enabled=packing_enabled)
+    if packing_enabled:
+        raise ValueError("Qwen3.5 v2 评估路径不支持 sequence packing，请关闭 enable_packing。")
+    dataloader = build_dataloader(cfg, split=args.split)
     logger.info(f"Dataset: {len(dataloader.dataset)} samples")
 
     # Save directory
@@ -639,13 +622,13 @@ def main():
     logger.info(f"  Heatmap: {args.eval_heatmap}")
     logger.info(f"  Trajectory: {args.eval_trajectory}")
     logger.info(f"  Progress: {args.eval_progress}")
-    logger.info(f"  Packing: {packing_enabled}")
+    logger.info("  Packing: False")
     logger.info("=" * 60)
 
     metrics = evaluate(
         model, dataloader, cfg, device, save_dir,
         args.num_vis, args.eval_heatmap, args.eval_trajectory, args.eval_progress,
-        packing_enabled, args
+        args=args
     )
 
     # Print results

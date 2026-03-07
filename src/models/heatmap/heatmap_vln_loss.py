@@ -104,16 +104,15 @@ class HeatmapVLNLoss(nn.Module):
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
-        # Visibility is produced by a frozen zero-parameter branch, so it is
-        # tracked as a monitoring metric instead of affecting trainable grads.
         total = (
-            self.lambda_pos * pos_loss
+            self.lambda_vis * vis_loss
+            + self.lambda_pos * pos_loss
             + self.lambda_neg * neg_loss
         )
 
         return {
             "total": total,
-            "monitor_total": total + self.lambda_vis * vis_loss.detach(),
+            "monitor_total": total.detach(),
             "vis_loss": vis_loss.detach(),
             "pos_loss": pos_loss.detach(),
             "neg_loss": neg_loss.detach(),

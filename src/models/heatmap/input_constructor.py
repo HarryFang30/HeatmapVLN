@@ -17,6 +17,7 @@ import numpy as np
 
 VIEW_NAMES = ["front", "right", "back", "left"]
 VIEW_ANGLES = ["0°正前方", "90°右侧", "180°正后方", "270°左侧"]
+ORIENTATION_STR = "、".join(VIEW_ANGLES)
 
 
 def construct_input(
@@ -38,8 +39,6 @@ def construct_input(
     """
     content = []
 
-    orientation_str = "、".join(VIEW_ANGLES)
-
     content.append({
         "type": "text",
         "text": "以下是一个室内导航场景。",
@@ -51,7 +50,7 @@ def construct_input(
         })
     content.append({
         "type": "text",
-        "text": f"当前位置的全景观测（朝向{orientation_str}）：",
+        "text": f"当前位置的全景观测（朝向{ORIENTATION_STR}）：",
     })
     for view_name in VIEW_NAMES:
         img = _ensure_pil(current_views[view_name])
@@ -60,7 +59,7 @@ def construct_input(
     for i, hist in enumerate(history_panoramas):
         content.append({
             "type": "text",
-            "text": f"历史位置{i + 1}的全景观测（朝向{orientation_str}）：",
+            "text": _build_history_anchor_text(i),
         })
         for view_name in VIEW_NAMES:
             img = _ensure_pil(hist[view_name])
@@ -92,9 +91,13 @@ def _ensure_pil(img: Union[Image.Image, torch.Tensor, np.ndarray]) -> Image.Imag
     raise TypeError(f"Unsupported image type: {type(img)}")
 
 
-def find_text_anchor_positions(input_ids: torch.Tensor, tokenizer) -> Dict[int, int]:
+def find_text_anchor_positions(
+    input_ids: torch.Tensor,
+    tokenizer,
+    num_history: int,
+) -> Dict[int, int]:
     """
-    Locate the last token of each "历史位置X的全景观测（...）：" annotation.
+    Locate the end token of each exact history-anchor annotation.
 
     After LLM attention, these token positions aggregate visual information
     from the following 4 images, serving as compact query vectors.
@@ -102,28 +105,35 @@ def find_text_anchor_positions(input_ids: torch.Tensor, tokenizer) -> Dict[int, 
     Returns:
         dict mapping history_index -> token position in the sequence.
     """
-    colon_ids = set(tokenizer.encode("：", add_special_tokens=False))
     ids = input_ids.squeeze().tolist()
 
-    history_keyword_ids = tokenizer.encode("历史位置", add_special_tokens=False)
-
     anchors: Dict[int, int] = {}
-    hist_counter = 0
     i = 0
-    while i < len(ids):
-        if _sublist_match(ids, i, history_keyword_ids):
-            for j in range(i, min(i + 60, len(ids))):
-                if ids[j] in colon_ids:
-                    anchors[hist_counter] = j
-                    hist_counter += 1
-                    i = j + 1
-                    break
-            else:
-                i += 1
-        else:
+    for hist_idx in range(num_history):
+        anchor_text = _build_history_anchor_text(hist_idx)
+        anchor_ids = tokenizer.encode(anchor_text, add_special_tokens=False)
+        if not anchor_ids:
+            raise RuntimeError(f"Failed to tokenize anchor text: {anchor_text}")
+
+        found = False
+        while i < len(ids):
+            if _sublist_match(ids, i, anchor_ids):
+                anchors[hist_idx] = i + len(anchor_ids) - 1
+                i += len(anchor_ids)
+                found = True
+                break
             i += 1
+        if not found:
+            raise RuntimeError(
+                f"Failed to locate history anchor {hist_idx + 1} in tokenized prompt. "
+                "Prompt layout and tokenizer output are inconsistent."
+            )
 
     return anchors
+
+
+def _build_history_anchor_text(hist_idx: int) -> str:
+    return f"历史位置{hist_idx + 1}的全景观测（朝向{ORIENTATION_STR}）："
 
 
 def _sublist_match(seq: list, start: int, pattern: list) -> bool:

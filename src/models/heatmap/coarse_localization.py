@@ -33,6 +33,10 @@ class CoarseLocalization(nn.Module):
             - ``coarse_heatmap``: ``(4, H, W)`` — per-view coarse heatmaps
     """
 
+    def __init__(self, visibility_scale: float = 4.0):
+        super().__init__()
+        self.visibility_scale = visibility_scale
+
     def forward(
         self,
         current_llm: Dict[int, torch.Tensor],
@@ -52,7 +56,7 @@ class CoarseLocalization(nn.Module):
 
                 heatmap = torch.einsum("c, hwc -> hw", q_norm, v_feat_norm)
 
-                visibility = heatmap.max()
+                visibility = heatmap.max() * self.visibility_scale
 
                 view_vis.append(visibility)
                 view_heatmaps.append(heatmap)
