@@ -144,6 +144,8 @@ class FeatureExtractor:
             history_queries: list of ``(C_llm,)`` tensors (from deepest layer)
             history_llm_views: list of ``{view_idx: (8,8,C_llm)}`` (deepest)
         """
+        self._validate_llm_layers_captured()
+
         deepest_layer = max(self.llm_layer_indices)
         hidden_deepest = self.llm_hidden_states.get(deepest_layer)
         if hidden_deepest is None:
@@ -158,14 +160,18 @@ class FeatureExtractor:
         current_llm: Dict[int, Dict[int, torch.Tensor]] = {}
         for view_idx in range(4):
             current_llm[view_idx] = {}
+            if view_idx not in image_token_positions:
+                raise RuntimeError(
+                    f"Current panoramic view {view_idx} missing from image_token_positions. "
+                    "Prompt/image layout and image token spans are inconsistent."
+                )
             start, end = image_token_positions[view_idx]
             for layer_idx in self.llm_layer_indices:
                 hidden = self.llm_hidden_states.get(layer_idx)
                 if hidden is None:
                     continue
                 tokens = hidden[0, start:end, :]  # (n_tokens, C_llm)
-                n = tokens.shape[0]
-                h = w = int(n ** 0.5)
+                h, w = self._resolve_llm_spatial_shape(tokens.shape[0], layer_idx, view_idx, "current")
                 current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
 
         # --- current 4 views: ViT features (16x16, multi-layer) ---
@@ -200,12 +206,46 @@ class FeatureExtractor:
                     continue
                 start, end = image_token_positions[img_idx]
                 tokens = hidden_deepest[0, start:end, :]
-                n = tokens.shape[0]
-                h = w = int(n ** 0.5)
+                h, w = self._resolve_llm_spatial_shape(
+                    tokens.shape[0], deepest_layer, img_idx, f"history[{hist_idx}]"
+                )
                 views[v] = tokens.reshape(h, w, -1)
             history_llm_views.append(views)
 
         return current_vit, current_llm, history_queries, history_llm_views
+
+    def _validate_llm_layers_captured(self) -> None:
+        missing_layers = [
+            layer_idx for layer_idx in self.llm_layer_indices
+            if self.llm_hidden_states.get(layer_idx) is None
+        ]
+        if missing_layers:
+            raise RuntimeError(
+                "Missing hooked LLM hidden states for layers "
+                f"{missing_layers}. Requested layers={self.llm_layer_indices}. "
+                "This usually means the hook indices no longer match the Qwen model layout."
+            )
+
+    @staticmethod
+    def _resolve_llm_spatial_shape(
+        num_tokens: int,
+        layer_idx: int,
+        image_idx: int,
+        tag: str,
+    ) -> Tuple[int, int]:
+        side = int(num_tokens ** 0.5)
+        if side * side != num_tokens:
+            raise RuntimeError(
+                f"LLM layer {layer_idx} image {image_idx} ({tag}) produced {num_tokens} tokens, "
+                "which is not a square grid and cannot be reshaped into 8x8-style spatial features."
+            )
+        if num_tokens != TOKENS_PER_IMAGE_LLM:
+            raise RuntimeError(
+                f"LLM layer {layer_idx} image {image_idx} ({tag}) produced {num_tokens} tokens "
+                f"(expected {TOKENS_PER_IMAGE_LLM} for an 8x8 grid). "
+                "Check spatial_merge_size, image layout, or hook placement."
+            )
+        return side, side
 
     # ------------------------------------------------------------------
     # Helpers
@@ -252,16 +292,30 @@ class FeatureExtractor:
 
     @staticmethod
     def _get_llm_layers(model):
-        """Resolve the list of LLM transformer layers."""
-        m = model
-        if hasattr(m, "base_model"):
-            m = m.base_model
-        if hasattr(m, "model"):
-            inner = m.model
-            if hasattr(inner, "model") and hasattr(inner.model, "layers"):
-                return inner.model.layers
-            if hasattr(inner, "layers"):
-                return inner.layers
-        if hasattr(m, "model") and hasattr(m.model, "layers"):
-            return m.model.layers
+        """Resolve the list of LLM transformer layers.
+
+        Walks through common Qwen3.5 wrapping patterns, checking each
+        candidate node for a ``language_model.layers`` or ``layers``
+        attribute.
+        """
+        candidates = [model]
+        if hasattr(model, "base_model"):
+            candidates.append(model.base_model)
+        if hasattr(model, "model"):
+            candidates.append(model.model)
+
+        for node in candidates:
+            if hasattr(node, "language_model") and hasattr(node.language_model, "layers"):
+                return node.language_model.layers
+            if hasattr(node, "model"):
+                inner = node.model
+                if hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+                    return inner.language_model.layers
+                if hasattr(inner, "model") and hasattr(inner.model, "layers"):
+                    return inner.model.layers
+                if hasattr(inner, "layers"):
+                    return inner.layers
+            if hasattr(node, "layers"):
+                return node.layers
+
         raise RuntimeError("Cannot locate LLM layers in model hierarchy")
