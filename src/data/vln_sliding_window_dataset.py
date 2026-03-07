@@ -1434,8 +1434,9 @@ class VLNSlidingWindowDataset(Dataset):
             
             hm_w, hm_h = self.hm_size
             
+            gt_visibility = None
             if self._is_panoramic:
-                heatmap_tensor, visibility = self._compute_per_history_multiview_heatmaps(
+                heatmap_tensor, gt_visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
                     history_poses=history_poses,
@@ -1447,7 +1448,7 @@ class VLNSlidingWindowDataset(Dataset):
             elif self.defer_heatmap_to_gpu:
                 heatmap_tensor = torch.zeros(hm_h, hm_w)
             else:
-                heatmap, visibility = compute_history_heatmap(
+                heatmap, _ = compute_history_heatmap(
                     history_poses=history_poses,
                     current_pose=current_pose,
                     current_depth=current_depth,
@@ -1461,14 +1462,8 @@ class VLNSlidingWindowDataset(Dataset):
             # 8. 加载连续动作
             actions = self._load_actions(clip_dir)
             if actions is not None and current_t < len(actions):
-                # 动作语义（来自 collect.py）：
-                # actions[i] = 从 frame[i] 到 frame[i+1] 的 agent-local 2D 位移 (dx, dy)
-                # 因此对于 current_t 帧，应该加载 actions[current_t]
                 action = actions[current_t]
-                # 🔧 修复：对于最后一帧，如果是 STOP 动作，action_valid 应该为 1
-                # 因为 STOP 是一个有效的决策，不应该被 mask 掉
                 if current_t == T - 1:
-                    # 最后一帧：检查是否是 STOP 动作
                     discrete_actions = self._load_discrete_actions(clip_dir)
                     is_last_frame_stop = (discrete_actions is not None and 
                                           current_t < len(discrete_actions) and 
@@ -1485,25 +1480,24 @@ class VLNSlidingWindowDataset(Dataset):
             # 9. 加载离散动作（用于 Stop Prediction）
             discrete_actions = self._load_discrete_actions(clip_dir)
             if discrete_actions is not None and current_t < len(discrete_actions):
-                # 动作语义：discrete_actions[i] = 从 frame[i] 到 frame[i+1] 的离散动作
-                # 0=STOP, 1=MOVE_FORWARD, 2=TURN_LEFT, 3=TURN_RIGHT
                 discrete_action = int(discrete_actions[current_t])
-                # is_stop: 1 if STOP action, 0 otherwise
                 is_stop = 1.0 if discrete_action == 0 else 0.0
             else:
-                discrete_action = 1  # Default to FORWARD
+                discrete_action = 1
                 is_stop = 0.0
             
             result = {
                 "history_frames": history_frames,      # [K, 3, H, W]
                 "current_frame": current_frame,        # [3, H, W] (front view)
-                "heatmap": heatmap_tensor,             # [Hm, Wm] or [4, Hm, Wm] (panoramic)
+                "heatmap": heatmap_tensor,             # [Hm, Wm] or [N, 4, Hm, Wm] (panoramic)
                 "action": action_tensor,               # [2]
                 "action_valid": action_valid,          # float
                 "discrete_action": discrete_action,    # int (0-3)
                 "is_stop": is_stop,                    # float (0 or 1)
                 "text": text,                          # str
             }
+            if gt_visibility is not None:
+                result["gt_visibility"] = gt_visibility  # [N, 4]
             if current_views is not None:
                 result["current_views"] = current_views  # [4, 3, H, W]
             if history_panoramas is not None:
@@ -1546,6 +1540,7 @@ class VLNSlidingWindowDataset(Dataset):
                 "current_views": torch.zeros(4, 3, target_h, target_w),
                 "history_panoramas": torch.zeros(K, 4, 3, target_h, target_w),
                 "heatmap": torch.zeros(K, 4, hm_h, hm_w),
+                "gt_visibility": torch.zeros(K, 4),
                 "action": torch.zeros(2),
                 "action_valid": 0.0,
                 "discrete_action": 1,
@@ -2228,8 +2223,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             
             hm_w, hm_h = self.hm_size
             
+            gt_visibility = None
             if self._is_panoramic:
-                heatmap_tensor, visibility = self._compute_per_history_multiview_heatmaps(
+                heatmap_tensor, gt_visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
                     history_poses=history_poses,
@@ -2241,7 +2237,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             elif self.defer_heatmap_to_gpu:
                 heatmap_tensor = torch.zeros(hm_h, hm_w)
             else:
-                heatmap, visibility = compute_history_heatmap(
+                heatmap, _ = compute_history_heatmap(
                     history_poses=history_poses,
                     current_pose=current_pose,
                     current_depth=current_depth,
@@ -2270,8 +2266,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             else:
                 action = np.zeros(2, dtype=np.float32)
             
-            # 🔧 修复：让 action_valid 与 trajectory_valid 保持一致
-            # 这样 tensorboard 记录的 action_valid_ratio 能正确反映有效样本比例
             action_valid = trajectory_valid
             
             action_tensor = torch.from_numpy(action.astype(np.float32))
@@ -2288,7 +2282,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             result = {
                 "history_frames": history_frames,        # [K, 3, H, W]
                 "current_frame": current_frame,          # [3, H, W] (front view)
-                "heatmap": heatmap_tensor,               # [Hm, Wm] or [4, Hm, Wm] (panoramic)
+                "heatmap": heatmap_tensor,               # [Hm, Wm] or [N, 4, Hm, Wm] (panoramic)
                 "trajectory": trajectory_tensor,         # [predict_horizon, 3]
                 "trajectory_valid": trajectory_valid,    # float
                 "progress": progress,                    # float (0-1)
@@ -2298,6 +2292,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 "is_stop": is_stop,                      # float
                 "text": text,                            # str
             }
+            if gt_visibility is not None:
+                result["gt_visibility"] = gt_visibility  # [N, 4]
             if current_views is not None:
                 result["current_views"] = current_views  # [4, 3, H, W]
             if history_panoramas is not None:

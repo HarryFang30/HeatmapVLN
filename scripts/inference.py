@@ -15,6 +15,7 @@ import os
 import sys
 import argparse
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Any, Optional
 import yaml
@@ -157,45 +158,78 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     model_cfg = cfg['model']
     data_cfg = cfg['data']
     llm_cfg = model_cfg.get('llm', {})
-    heatmap_cfg = model_cfg.get('heatmap_head', {})
+    heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
+    stop_cfg = model_cfg.get('stop_head', {})
+    progress_cfg = model_cfg.get('progress_head', {})
+    action_head_type = action_cfg.get('type', 'transformer')
+    legacy_action_cfg = action_cfg.get('legacy', {})
+    transformer_action_cfg = action_cfg.get('transformer', {})
     
     config = VLNPipelineConfig(
         # Qwen3.5
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
-        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', -1),
+        enable_packing=llm_cfg.get('enable_packing', False),
+        max_seq_length=llm_cfg.get('max_seq_length', 4096),
+        spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
         
         # Device
         device=device,
         
-        # Heatmap
-        heatmap_size=tuple(data_cfg['init_hm_size']),
-        enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
-        enable_future_heatmap_head=heatmap_cfg.get('enable_future', False),
-        diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
-        diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        image_size=data_cfg['image_size'][0],
-        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', False),
-        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
+        # HeatmapVLN v2
+        enable_heatmap=heatmap_cfg.get('enable', True),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
+        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', data_cfg['init_hm_size'])),
+        image_size=heatmap_cfg.get('image_size', data_cfg['image_size'][0]),
+        heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
+        heatmap_lambda_pos=heatmap_cfg.get('lambda_pos', 1.0),
+        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 0.1),
         
-        # Action Head (Transformer)
-        action_head_type=action_cfg.get('type', 'transformer'),
+        # LoRA
+        use_lora=llm_cfg.get('use_lora', False),
+        lora_rank=llm_cfg.get('lora_rank', 16),
+        lora_alpha=llm_cfg.get('lora_alpha', 32),
+        lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_dropout=llm_cfg.get('lora_dropout', 0.05),
+        lora_target_modules=llm_cfg.get('lora_target_modules', None),
+        
+        # Action Head
+        action_head_type=action_head_type,
         enable_action_head=action_cfg.get('enable', True),
-        transformer_action_dim=action_cfg.get('action_dim', 3),
-        transformer_predict_size=action_cfg.get('predict_size', 24),
-        transformer_n_emb=action_cfg.get('n_emb', 384),
-        transformer_n_layer=action_cfg.get('n_layer', 16),
-        transformer_n_head=action_cfg.get('n_head', 8),
+        action_dim=legacy_action_cfg.get('action_dim', 2),
+        action_pred_horizon=legacy_action_cfg.get('pred_horizon', 1),
+        action_encoding_size=legacy_action_cfg.get('encoding_size', 256),
+        action_down_dims=legacy_action_cfg.get('down_dims', None),
+        action_num_diffusion_iters=legacy_action_cfg.get('num_diffusion_iters', 10),
+        action_stats_min=legacy_action_cfg.get('action_stats_min', [-0.17, -0.03]),
+        action_stats_max=legacy_action_cfg.get('action_stats_max', [0.19, 0.31]),
+        transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
+        transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
+        transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
+        transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
+        transformer_n_head=transformer_action_cfg.get('n_head', 6),
+        transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
+        transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
+        transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
+        transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
+        transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
         
         # Progress Head
-        enable_progress_head=model_cfg.get('progress_head', {}).get('enable', True),
-        
-        # Legacy heads disabled
-        enable_stop_head=False,
+        enable_stop_head=stop_cfg.get('enable', False),
+        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
+        stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
+        enable_progress_head=progress_cfg.get('enable', True),
+        progress_hidden_dim=progress_cfg.get('hidden_dim', 512),
         
         verbose=True,
     )
@@ -329,10 +363,21 @@ def run_inference(
     """
     if current_observation is None:
         current_observation = frames[:, -1]
+    if output_heatmap:
+        raise ValueError(
+            "当前 `scripts/inference.py` 只接受单路视频/clip 帧，无法为 HeatmapVLN v2 "
+            "构造 `current_views` 和 `history_panoramas`。请改用 `scripts/visualize_heatmap.py` "
+            "或基于数据集批次进行热力图推理。"
+        )
     
     device = next(model.parameters()).device
     
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    autocast_context = (
+        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        if device.type == 'cuda'
+        else nullcontext()
+    )
+    with autocast_context:
         outputs = model(
             video_frames=frames.to(device),
             instruction_text=instruction,
@@ -343,21 +388,20 @@ def run_inference(
 
     results = {}
     
-    # Heatmap
-    if output_heatmap and 'history_heatmaps' in outputs:
-        hm = outputs['history_heatmaps'][0, -1].cpu().numpy()
-        results['heatmap'] = np.clip(hm, 0, 1)
-        logger.info(f"Generated heatmap: shape={hm.shape}, max={hm.max():.3f}")
-    
     # Trajectory
-    if output_trajectory and hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
-        action_cond = outputs.get('action_cond')
-        if action_cond is not None:
-            if action_cond.dim() == 2:
-                action_cond = action_cond.unsqueeze(1)
-            trajectory = model.transformer_action_head.get_trajectory(action_cond)
+    if output_trajectory:
+        trajectory = outputs.get('trajectory')
+        if trajectory is not None:
             results['trajectory'] = trajectory[0].cpu().numpy()
             logger.info(f"Generated trajectory: shape={results['trajectory'].shape}")
+        elif hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+            action_cond = outputs.get('action_cond')
+            if action_cond is not None:
+                if action_cond.dim() == 2:
+                    action_cond = action_cond.unsqueeze(1)
+                trajectory = model.transformer_action_head.get_trajectory(action_cond)
+                results['trajectory'] = trajectory[0].cpu().numpy()
+                logger.info(f"Generated trajectory: shape={results['trajectory'].shape}")
     
     # Progress
     if output_progress and 'progress' in outputs:
@@ -378,7 +422,7 @@ def main():
     parser.add_argument('--clip', type=str, default=None, help='Path to dataset clip directory')
     parser.add_argument('--instruction', type=str, default=None, help='Navigation instruction')
     parser.add_argument('--output-dir', type=str, default='./outputs_inference')
-    parser.add_argument('--output-heatmap', action='store_true', help='Output history heatmap')
+    parser.add_argument('--output-heatmap', action='store_true', help='Output heatmap (需要全景 dataset 输入，当前脚本默认不支持)')
     parser.add_argument('--output-trajectory', action='store_true', help='Output predicted trajectory')
     parser.add_argument('--output-progress', action='store_true', help='Output progress prediction')
     parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load')
@@ -395,9 +439,8 @@ def main():
 
     cfg = yaml.safe_load(open(args.config))
 
-    # Default: output all
+    # Default: output trajectory + progress
     if not args.output_heatmap and not args.output_trajectory and not args.output_progress:
-        args.output_heatmap = True
         args.output_trajectory = True
         args.output_progress = True
 

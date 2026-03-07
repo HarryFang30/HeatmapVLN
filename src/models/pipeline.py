@@ -271,6 +271,8 @@ class VLNPipeline(nn.Module):
         # Move trainable parts to correct device/dtype
         self.heatmap_vln.dpt_fusion.to(device=self.device, dtype=cfg.dtype)
         self.heatmap_vln.fine.to(device=self.device, dtype=cfg.dtype)
+        if self.heatmap_vln.coarse.vis_head is not None:
+            self.heatmap_vln.coarse.vis_head.to(device=self.device, dtype=cfg.dtype)
 
         logger.info("HeatmapVLN v2 constructed (Coarse-to-Fine)")
 
@@ -374,12 +376,7 @@ class VLNPipeline(nn.Module):
         if use_panoramic_chain:
             self._ensure_heatmap_vln()
 
-        need_sequence_features = (
-            return_intermediate
-            or return_actions
-            or (return_actions and self.progress_head is not None)
-            or (return_actions and self.stop_head is not None)
-        )
+        need_sequence_features = return_intermediate or return_actions
 
         qwen_output = None
         raw_hidden_states = None

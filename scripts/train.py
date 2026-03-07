@@ -636,6 +636,8 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
     if 'history_panoramas' in batch[0]:
         result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
+    if 'gt_visibility' in batch[0]:
+        result['gt_visibility'] = torch.stack([s['gt_visibility'] for s in batch], dim=0)
     
     # 水平翻转标记
     if 'is_flipped' in batch[0]:
@@ -1024,6 +1026,13 @@ def train_one_epoch(
     
     device = torch.device(cfg['model'].get('device', 'cuda'))
     
+    from src.models.heatmap import HeatmapVLNLoss
+    hm_loss_fn = HeatmapVLNLoss(
+        lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
+        lambda_pos=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
+    ).to(device)
+    
     total_batches = len(train_loader)
     if max_batches is not None:
         total_batches = min(total_batches, max_batches)
@@ -1129,17 +1138,15 @@ def train_one_epoch(
             heatmap_loss = torch.tensor(0.0, device=device)
             
             if train_history and 'visibility' in output and 'heatmaps' in output:
-                from src.models.heatmap import HeatmapVLNLoss
-                hm_loss_fn = HeatmapVLNLoss(
-                    lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-                    lambda_pos=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
-                    lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
-                ).to(device)
                 if gt_heatmap is not None:
+                    if 'gt_visibility' in batch:
+                        gt_vis = batch['gt_visibility'].to(device)
+                    else:
+                        gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
                     loss_dict = hm_loss_fn(
                         output['visibility'],
                         output['heatmaps'],
-                        gt_vis=gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device),
+                        gt_vis=gt_vis,
                         gt_heatmaps=gt_heatmap.to(device),
                     )
                     heatmap_loss = loss_dict['total']
@@ -1575,6 +1582,13 @@ def validate(
     
     device = torch.device(cfg['model'].get('device', 'cuda'))
     
+    from src.models.heatmap import HeatmapVLNLoss
+    hm_loss_fn = HeatmapVLNLoss(
+        lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
+        lambda_pos=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
+    ).to(device)
+    
     # 验证推理 batch 数限制：只对前 N 个 batch 做完整推理计算 heatmap MSE
     val_inference_batches = cfg.get('validation', {}).get('val_inference_batches', 10)
     
@@ -1650,13 +1664,15 @@ def validate(
             # Heatmap loss (v2)
             heatmap_loss = torch.tensor(0.0, device=device)
             if train_history and 'visibility' in output and 'heatmaps' in output:
-                from src.models.heatmap import HeatmapVLNLoss
-                hm_loss_fn = HeatmapVLNLoss().to(device)
                 if gt_heatmap is not None:
+                    if 'gt_visibility' in batch:
+                        gt_vis = batch['gt_visibility'].to(device)
+                    else:
+                        gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
                     loss_dict = hm_loss_fn(
                         output['visibility'],
                         output['heatmaps'],
-                        gt_vis=gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device),
+                        gt_vis=gt_vis,
                         gt_heatmaps=gt_heatmap.to(device),
                     )
                     heatmap_loss = loss_dict['total']

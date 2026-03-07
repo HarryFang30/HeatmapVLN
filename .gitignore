@@ -61,3 +61,4 @@ nohup.out
 /plans/*
 .cursor/*
 !.cursor/rules/
+/xyc/*

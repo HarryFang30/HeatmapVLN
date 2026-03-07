@@ -2,12 +2,16 @@
 Coarse Localization Module
 ============================
 
-Zero trainable parameters.  Relies entirely on Qwen3.5's frozen features.
-
 Computes dot-product matching between text query vectors (history position
 hidden states) and current view LLM features (8x8 spatial grids) to produce:
-  - visibility logits  (scalar per view, 4 total)
-  - coarse heatmaps    (8x8 per view)
+  - visibility logits  (scalar per view, 4 total)  — via trainable MLP
+  - coarse heatmaps    (8x8 per view)              — zero-parameter cosine sim
+
+The coarse heatmaps remain zero-parameter (pure cosine similarity), preserving
+the design principle that spatial correspondence comes from Qwen3.5.
+
+The visibility prediction adds a lightweight trainable MLP (~66K params) so
+that the visibility BCE loss can provide gradient signal during training.
 
 Reference: HeatmapVLN设计文档 Section 5
 """
@@ -21,21 +25,33 @@ import torch.nn.functional as F
 
 class CoarseLocalization(nn.Module):
     """
-    Zero-parameter coarse localisation via cosine-similarity response maps.
+    Coarse localisation with trainable visibility head.
 
-    Inputs:
-        current_llm:     ``{0: (H,W,C), 1: (H,W,C), 2: (H,W,C), 3: (H,W,C)}``
-        history_queries: list of ``(C,)`` tensors (text token hidden states)
+    The coarse heatmap (8x8 cosine-similarity response map) is zero-parameter.
+    The visibility head is a small MLP that takes the heatmap statistics and
+    the query-view dot-product features to produce a trainable visibility logit,
+    enabling the visibility BCE loss to propagate gradients.
 
-    Outputs:
-        list of dicts, each containing:
-            - ``visibility``: ``(4,)``  — per-view visibility logits
-            - ``coarse_heatmap``: ``(4, H, W)`` — per-view coarse heatmaps
+    Args:
+        c_llm: LLM hidden dimension (for the trainable visibility head).
+               Set to 0 to disable the trainable head and fall back to
+               the original zero-parameter ``heatmap.max() * scale`` mode.
+        visibility_scale: scale factor for the zero-parameter fallback.
     """
 
-    def __init__(self, visibility_scale: float = 4.0):
+    def __init__(self, c_llm: int = 4096, visibility_scale: float = 4.0):
         super().__init__()
         self.visibility_scale = visibility_scale
+        self.c_llm = c_llm
+
+        if c_llm > 0:
+            self.vis_head = nn.Sequential(
+                nn.Linear(c_llm + 3, 128),
+                nn.GELU(),
+                nn.Linear(128, 1),
+            )
+        else:
+            self.vis_head = None
 
     def forward(
         self,
@@ -55,11 +71,19 @@ class CoarseLocalization(nn.Module):
                 v_feat_norm = F.normalize(v_feat, dim=-1)
 
                 heatmap = torch.einsum("c, hwc -> hw", q_norm, v_feat_norm)
+                view_heatmaps.append(heatmap)
 
-                visibility = heatmap.max() * self.visibility_scale
+                if self.vis_head is not None:
+                    hm_max = heatmap.max()
+                    hm_mean = heatmap.mean()
+                    hm_std = heatmap.std()
+                    stats = torch.stack([hm_max, hm_mean, hm_std])  # (3,)
+                    vis_input = torch.cat([q, stats])  # (C+3,)
+                    visibility = self.vis_head(vis_input).squeeze(-1)  # scalar
+                else:
+                    visibility = heatmap.max() * self.visibility_scale
 
                 view_vis.append(visibility)
-                view_heatmaps.append(heatmap)
 
             results.append({
                 "visibility": torch.stack(view_vis),          # (4,)

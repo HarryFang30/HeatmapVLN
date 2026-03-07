@@ -464,7 +464,12 @@ class Qwen3_5Integration(nn.Module):
         return_hidden_states: bool = True,
         heatmap_vln: Optional[nn.Module] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
-        """Forward a single panoramic sample through one Qwen pass."""
+        """Forward a single panoramic sample through one Qwen pass.
+
+        When ``return_hidden_states`` is False (heatmap-only training), the
+        Qwen forward is wrapped in ``torch.no_grad()`` to avoid storing
+        intermediate activations for the frozen backbone, saving ~4-8 GB VRAM.
+        """
         current_views_dict = self._views_tensor_to_dict(current_views)
         history_panoramas_list = self._history_tensor_to_list(history_panoramas)
 
@@ -479,9 +484,16 @@ class Qwen3_5Integration(nn.Module):
         else:
             raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for single-chain decoding.")
 
-        hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
-            inputs, return_hidden_states,
-        )
+        if return_hidden_states:
+            hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                inputs, return_hidden_states,
+            )
+        else:
+            with torch.no_grad():
+                hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                    inputs, False,
+                )
+
         heatmap_output = heatmap_vln.decode_from_inputs(inputs, num_history)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
 

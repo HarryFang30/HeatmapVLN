@@ -1,110 +1,71 @@
 #!/usr/bin/env python3
 """
-轨迹热力图可视化
-================
+轨迹热力图可视化（HeatmapVLN v2）
+=================================
 
-沿着一条完整轨迹，可视化每个采样位置的：
-- RGB 帧 + GT 热力图叠加
-- RGB 帧 + 预测热力图叠加
-
-支持 chunks 数据格式（npz 文件）。
-
-用法:
-    python scripts/visualize_trajectory_heatmaps.py \
-        --checkpoint /path/to/best.pth \
-        --num-clips 3 \
-        --frames-per-clip 12 \
-        --output-dir ./vis_trajectory \
-        --inference-steps 50
+沿着一条完整轨迹抽样多个位置，对每个位置聚合所有历史时间步热力图，
+并在当前 4 视角中选择 GT 信号最强的视角进行对比可视化。
 """
 
-import os
-import sys
-import json
-import random
 import argparse
 import logging
-import math
+import random
+import sys
+from contextlib import nullcontext
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import yaml
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import cv2
 import matplotlib
 matplotlib.use('Agg')
-import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
-from src.data.vln_sliding_window_dataset import compute_history_heatmap
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("vis_traj")
 
+VIEW_NAMES = ["Front", "Right", "Back", "Left"]
 
-# ==================== build_model (与 train.py 一致) ====================
-def build_model(cfg: Dict) -> VLNPipeline:
+
+def build_model(cfg: Dict, device: str) -> VLNPipeline:
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
-    heatmap_cfg = model_cfg.get('heatmap_head', {})
+    heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     action_head_type = action_cfg.get('type', 'transformer')
 
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 2048),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
-        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
         enable_packing=False,
         max_seq_length=llm_cfg.get('max_seq_length', 4096),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
-        device=model_cfg.get('device', 'cuda'),
-        heatmap_size=tuple(cfg['data']['init_hm_size']),
-        enable_history_heatmap_head=heatmap_cfg.get('enable_history', True),
-        enable_future_heatmap_head=heatmap_cfg.get('enable_future', False),
-        diffusion_heatmap_cond_dim=heatmap_cfg.get('cond_dim', 512),
-        diffusion_heatmap_num_inference_steps=heatmap_cfg.get('num_inference_steps', 10),
-        image_size=cfg['data']['image_size'][0],
-        heatmap_use_image_encoder=heatmap_cfg.get('use_image_encoder', True),
-        heatmap_pool_method=heatmap_cfg.get('pool_method', 'attention'),
-        heatmap_pool_num_heads=heatmap_cfg.get('pool_num_heads', 4),
-        heatmap_use_circular_padding=heatmap_cfg.get('use_circular_padding', False),
-        heatmap_dropout=heatmap_cfg.get('dropout', 0.1),
-        heatmap_block_out_channels=tuple(heatmap_cfg.get('block_out_channels', [64, 128, 256])),
-        heatmap_layers_per_block=heatmap_cfg.get('layers_per_block', 2),
-        heatmap_attention_levels=tuple(heatmap_cfg.get('attention_levels', [2])),
-        heatmap_cross_attention_levels=tuple(heatmap_cfg['cross_attention_levels']) if heatmap_cfg.get('cross_attention_levels') else None,
-        heatmap_num_train_timesteps=heatmap_cfg.get('num_train_timesteps', 100),
-        heatmap_cfg_drop_prob=heatmap_cfg.get('cfg_drop_prob', 0.1),
-        heatmap_cfg_scale=heatmap_cfg.get('cfg_scale', 3.0),
-        heatmap_use_sequence_conditioning=heatmap_cfg.get('use_sequence_conditioning', False),
-        heatmap_seq_cross_attn_heads=heatmap_cfg.get('seq_cross_attn_heads', 8),
-        heatmap_seq_cross_attn_head_dim=heatmap_cfg.get('seq_cross_attn_head_dim', 64),
-        heatmap_use_spatial_injection=heatmap_cfg.get('use_spatial_injection', False),
-        heatmap_image_encoder_use_pretrained=heatmap_cfg.get('image_encoder_use_pretrained', False),
-        heatmap_sharpen_temperature=heatmap_cfg.get('sharpen_temperature', 0.1),
-        heatmap_negative_sample_weight=heatmap_cfg.get('negative_sample_weight', 0.3),
-        heatmap_positive_sample_boost=heatmap_cfg.get('positive_sample_boost', 3.0),
-        heatmap_peak_spatial_weight=heatmap_cfg.get('peak_spatial_weight', 10.0),
-        heatmap_head_type=heatmap_cfg.get('head_type', 'diffusion'),
-        dpt_proj_dim=heatmap_cfg.get('dpt', {}).get('proj_dim', 256),
-        dpt_features=heatmap_cfg.get('dpt', {}).get('features', 256),
-        dpt_vit_dim=heatmap_cfg.get('dpt', {}).get('vit_dim', 1152),
-        dpt_vit_hook_layers=heatmap_cfg.get('dpt', {}).get('vit_hook_layers', None),
-        dpt_spatial_merge_size=heatmap_cfg.get('dpt', {}).get('spatial_merge_size', 2),
-        dpt_n_cross_attn_heads=heatmap_cfg.get('dpt', {}).get('n_cross_attn_heads', 4),
-        dpt_lambda_spatial=heatmap_cfg.get('dpt', {}).get('lambda_spatial', 0.5),
-        multi_layer_features=llm_cfg.get('multi_layer_features', False),
-        feature_layer_indices=llm_cfg.get('feature_layer_indices', None),
-        feature_fusion_method=llm_cfg.get('feature_fusion_method', 'weighted_sum'),
+        device=device,
+        enable_heatmap=heatmap_cfg.get('enable', True),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
+        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
+        image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
+        heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
+        heatmap_lambda_pos=heatmap_cfg.get('lambda_pos', 1.0),
+        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 0.1),
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
@@ -120,494 +81,352 @@ def build_model(cfg: Dict) -> VLNPipeline:
     return VLNPipeline(config)
 
 
-# ==================== Chunks 数据加载 ====================
-
-def decode_chunk_rgb(raw: np.ndarray) -> np.ndarray:
-    """解码 chunk 中的 JPEG 压缩 RGB 数据"""
-    if isinstance(raw, np.ndarray):
-        if raw.ndim == 3 and raw.shape[2] >= 3:
-            return cv2.cvtColor(raw[:, :, :3], cv2.COLOR_BGR2RGB)
-        if raw.ndim == 1:
-            if raw.dtype == np.uint8:
-                img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-            else:
-                arr = np.array(raw, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is not None:
-                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    if isinstance(raw, (bytes, bytearray)):
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is not None:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return None
-
-
-def load_clip_chunks(clip_dir: Path) -> Dict:
-    """加载一个 clip 的所有 chunk 数据"""
-    chunks_dir = clip_dir / "chunks"
-    chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
-
-    all_rgbs = []
-    all_poses = []
-    all_depths = []
-
-    for cf in chunk_files:
-        data = np.load(str(cf), allow_pickle=True)
-        keys = set(data.files)
-
-        rgb_key = 'rgb_front' if 'rgb_front' in keys else 'rgb'
-        pose_key = 'pose_front' if 'pose_front' in keys else 'pose'
-        depth_key = 'depth_front' if 'depth_front' in keys else 'depth'
-
-        n_frames = len(data['frame_ids'])
-        for i in range(n_frames):
-            all_rgbs.append(data[rgb_key][i])
-            all_poses.append(data[pose_key][i].astype(np.float32))
-            if depth_key in keys:
-                all_depths.append(data[depth_key][i].astype(np.float32))
-
-    # Meta
-    meta_file = clip_dir / "meta.json"
-    instruction = "Navigate to the destination."
-    if meta_file.exists():
-        with open(meta_file) as f:
-            meta = json.load(f)
-        instruction = meta.get("instruction", instruction)
-
-    # Intrinsics
-    intrinsics = None
-    intrinsics_file = clip_dir / "intrinsics.json"
-    if intrinsics_file.exists():
-        with open(intrinsics_file) as f:
-            intr = json.load(f)
-        if "K" in intr:
-            intrinsics = np.array(intr["K"], dtype=np.float32)
-
-    return {
-        "clip_dir": clip_dir,
-        "raw_rgbs": all_rgbs,
-        "poses": all_poses,
-        "depths": all_depths if all_depths else None,
-        "intrinsics": intrinsics,
-        "instruction": instruction,
-        "n_frames": len(all_rgbs),
-    }
-
-
-def find_good_clips(data_root: str, min_frames: int = 60, num_clips: int = 3, seed: int = 42):
-    """找到足够长的 clips"""
-    data_root = Path(data_root)
-    good_clips = []
-    for scene_dir in sorted(data_root.iterdir()):
-        if not scene_dir.is_dir():
-            continue
-        for clip_dir in sorted(scene_dir.iterdir()):
-            if not clip_dir.is_dir():
-                continue
-            chunks_dir = clip_dir / "chunks"
-            meta_file = clip_dir / "meta.json"
-            if not chunks_dir.exists() or not meta_file.exists():
-                continue
-            with open(meta_file) as f:
-                meta = json.load(f)
-            n_frames = int(meta.get("num_frames", 0))
-            if n_frames >= min_frames:
-                good_clips.append((clip_dir, n_frames))
-
-    random.seed(seed)
-    random.shuffle(good_clips)
-    return good_clips[:num_clips]
-
-
-def overlay_heatmap_on_frame(frame: np.ndarray, heatmap: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-    """将热力图叠加到 RGB 帧上 (frame: HWC 0-1, heatmap: HxW 0-1)"""
-    H, W = frame.shape[:2]
-    hm_resized = cv2.resize(heatmap, (W, H), interpolation=cv2.INTER_CUBIC)
-
+def overlay_heatmap_on_frame(frame: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6) -> np.ndarray:
+    height, width = frame.shape[:2]
+    hm_resized = cv2.resize(heatmap, (width, height), interpolation=cv2.INTER_CUBIC)
     hm_uint8 = (np.clip(hm_resized, 0, 1) * 255).astype(np.uint8)
-    hm_colored = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_INFERNO)
-    hm_colored = cv2.cvtColor(hm_colored, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
-    threshold = 0.05
-    mask = hm_resized > threshold
-    mask_3d = np.stack([mask, mask, mask], axis=-1).astype(np.float32)
-
-    blended = frame * (1 - alpha) + hm_colored * alpha
-    result = np.where(mask_3d > 0, blended, frame)
-    return np.clip(result, 0, 1)
+    hm_color = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_INFERNO)
+    hm_color = cv2.cvtColor(hm_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    mask = np.clip(hm_resized * 3.0, 0.0, 1.0)[..., None]
+    mixed = frame * (1.0 - alpha * mask) + hm_color * (alpha * mask)
+    return np.clip(mixed, 0, 1)
 
 
-def render_birdseye_view(
-    all_poses: List[np.ndarray],
-    sample_positions: List[int],
-    peak_dists: List[float],
-    view_w: int,
-    view_h: int,
-    margin: int = 30,
-) -> np.ndarray:
-    """渲染俯视图"""
-    positions = []
-    for p in all_poses:
-        pos = np.array(p, dtype=np.float32)
-        x, z = pos[0, 3], pos[2, 3]
-        positions.append((x, z))
+def to_bgr_image(image: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor((np.clip(image, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
-    positions = np.array(positions)
 
-    x_min, x_max = positions[:, 0].min(), positions[:, 0].max()
-    z_min, z_max = positions[:, 1].min(), positions[:, 1].max()
+def aggregate_history_heatmaps(heatmaps: torch.Tensor) -> torch.Tensor:
+    if heatmaps.dim() == 4:
+        return heatmaps.max(dim=0).values
+    if heatmaps.dim() == 3:
+        return heatmaps
+    raise ValueError(f"Unsupported heatmap shape: {tuple(heatmaps.shape)}")
 
-    x_range = max(x_max - x_min, 0.1)
-    z_range = max(z_max - z_min, 0.1)
-    scale = min((view_w - 2 * margin) / x_range, (view_h - 2 * margin) / z_range)
 
-    def world_to_px(wx, wz):
-        px = int(margin + (wx - x_min) * scale)
-        py = int(margin + (wz - z_min) * scale)
-        py = view_h - py
-        return px, py
+def choose_view(gt_heatmaps: np.ndarray, pred_heatmaps: np.ndarray) -> Tuple[int, float]:
+    gt_strength = gt_heatmaps.reshape(gt_heatmaps.shape[0], -1).max(axis=1)
+    pred_strength = pred_heatmaps.reshape(pred_heatmaps.shape[0], -1).max(axis=1)
+    if gt_strength.max() <= 1e-6:
+        view_idx = int(pred_strength.argmax())
+    else:
+        view_idx = int(gt_strength.argmax())
 
-    canvas = np.ones((view_h, view_w, 3), dtype=np.uint8) * 245
+    gt_view = gt_heatmaps[view_idx]
+    pred_view = pred_heatmaps[view_idx]
+    if gt_view.max() > 0.01 and pred_view.max() > 0.01:
+        gt_peak = np.unravel_index(gt_view.argmax(), gt_view.shape)
+        pred_peak = np.unravel_index(pred_view.argmax(), pred_view.shape)
+        peak_dist = float(np.sqrt((gt_peak[0] - pred_peak[0]) ** 2 + (gt_peak[1] - pred_peak[1]) ** 2))
+    elif gt_view.max() <= 0.01 and pred_view.max() <= 0.01:
+        peak_dist = 0.0
+    else:
+        peak_dist = float('inf')
 
-    pts = [world_to_px(x, z) for x, z in positions]
-    for i in range(len(pts) - 1):
-        cv2.line(canvas, pts[i], pts[i + 1], (180, 180, 180), 1, cv2.LINE_AA)
+    return view_idx, peak_dist
 
-    cv2.drawMarker(canvas, pts[0], (0, 180, 0), cv2.MARKER_STAR, 16, 2)
-    cv2.drawMarker(canvas, pts[-1], (0, 0, 200), cv2.MARKER_SQUARE, 10, 2)
 
-    for idx, (pos_frame, dist) in enumerate(zip(sample_positions, peak_dists)):
-        if pos_frame >= len(positions):
-            continue
-        px, py = world_to_px(positions[pos_frame, 0], positions[pos_frame, 1])
-
-        if dist < 5:
-            color = (0, 200, 0)
-        elif dist < 15:
-            color = (0, 200, 255)
-        elif dist == float('inf'):
-            color = (200, 200, 200)
+def wrap_text(text: str, max_chars: int) -> List[str]:
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    current = []
+    current_len = 0
+    for token in text.split():
+        extra = 1 if current else 0
+        if current_len + len(token) + extra > max_chars:
+            chunks.append(" ".join(current))
+            current = [token]
+            current_len = len(token)
         else:
-            color = (0, 0, 220)
-
-        cv2.circle(canvas, (px, py), 7, color, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (px, py), 7, (0, 0, 0), 1, cv2.LINE_AA)
-
-        pose = np.array(all_poses[pos_frame], dtype=np.float32)
-        fwd_world = -pose[:3, 2]
-        fwd_xz = np.array([fwd_world[0], fwd_world[2]])
-        fwd_len = np.linalg.norm(fwd_xz)
-        if fwd_len > 1e-6:
-            fwd_xz = fwd_xz / fwd_len
-            arrow_len = 18
-            dx = int(fwd_xz[0] * arrow_len)
-            dy = int(-fwd_xz[1] * arrow_len)
-            cv2.arrowedLine(canvas, (px, py), (px + dx, py + dy),
-                           color, 2, cv2.LINE_AA, tipLength=0.35)
-
-        label = f"F{pos_frame}"
-        cv2.putText(canvas, label, (px + 10, py - 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (60, 60, 60), 1, cv2.LINE_AA)
-
-    legend_x = 5
-    legend_y = view_h - 60
-    cv2.putText(canvas, "Bird's-Eye View", (legend_x, 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    cv2.circle(canvas, (legend_x + 8, legend_y), 5, (0, 200, 0), -1)
-    cv2.putText(canvas, "<5px", (legend_x + 18, legend_y + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.circle(canvas, (legend_x + 8, legend_y + 16), 5, (0, 200, 255), -1)
-    cv2.putText(canvas, "<15px", (legend_x + 18, legend_y + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.circle(canvas, (legend_x + 8, legend_y + 32), 5, (0, 0, 220), -1)
-    cv2.putText(canvas, ">=15px", (legend_x + 18, legend_y + 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.drawMarker(canvas, (legend_x + 70, legend_y), (0, 180, 0), cv2.MARKER_STAR, 10, 1)
-    cv2.putText(canvas, "Start", (legend_x + 80, legend_y + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.drawMarker(canvas, (legend_x + 70, legend_y + 16), (0, 0, 200), cv2.MARKER_SQUARE, 8, 1)
-    cv2.putText(canvas, "End", (legend_x + 80, legend_y + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-
-    return canvas
+            current.append(token)
+            current_len += len(token) + extra
+    if current:
+        chunks.append(" ".join(current))
+    return chunks[:3]
 
 
 def make_trajectory_grid(
     clip_name: str,
     instruction: str,
-    sample_positions: List[int],
-    frames_np: List[np.ndarray],
-    gt_heatmaps: List[np.ndarray],
-    pred_heatmaps: List[np.ndarray],
-    peak_dists: List[float],
-    all_poses: List[np.ndarray],
+    position_labels: Sequence[str],
+    frames_np: Sequence[np.ndarray],
+    gt_heatmaps: Sequence[np.ndarray],
+    pred_heatmaps: Sequence[np.ndarray],
+    chosen_views: Sequence[int],
+    peak_dists: Sequence[float],
     output_path: str,
-):
-    """生成轨迹 grid 可视化"""
-    N = len(sample_positions)
-    H, W = frames_np[0].shape[:2]
+) -> None:
+    if not frames_np:
+        return
 
-    n_rows = 3
-    row_labels = ["RGB Frame", "GT Heatmap", "Pred Heatmap"]
+    rows = 3
+    cols = len(frames_np)
+    tile_h, tile_w = frames_np[0].shape[:2]
+    top_margin = 90
+    left_margin = 16
+    bottom_margin = 20
+    canvas = np.full(
+        (top_margin + rows * tile_h + bottom_margin, left_margin * 2 + cols * tile_w, 3),
+        20,
+        dtype=np.uint8,
+    )
 
-    left_margin = 120
-    top_margin = 60
-    grid_h = n_rows * H
-    grid_w = N * W
+    cv2.putText(canvas, clip_name[:100], (left_margin, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    y = 52
+    for line in wrap_text(instruction, max_chars=max(48, cols * 18)):
+        cv2.putText(canvas, line, (left_margin, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1)
+        y += 20
 
-    bev_w = max(300, int(grid_h * 0.8))
-    bev_h = grid_h
+    row_titles = ["View", "GT Overlay", "Pred Overlay"]
+    for row_idx, row_title in enumerate(row_titles):
+        y_pos = top_margin + row_idx * tile_h + 22
+        cv2.putText(canvas, row_title, (4, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
 
-    canvas_w = left_margin + grid_w + 20 + bev_w + 10
-    canvas_h = top_margin + grid_h + 10
-    canvas = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 255
-
-    title = f"{clip_name} | {instruction[:90]}{'...' if len(instruction) > 90 else ''}"
-    cv2.putText(canvas, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
-
-    for row_idx in range(n_rows):
-        y_start = top_margin + row_idx * H
-        label_y = y_start + H // 2
-        cv2.putText(canvas, row_labels[row_idx], (5, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-    for col_idx in range(N):
-        pos = sample_positions[col_idx]
+    for col_idx in range(cols):
         frame = frames_np[col_idx]
         gt_hm = gt_heatmaps[col_idx]
         pred_hm = pred_heatmaps[col_idx]
-        dist = peak_dists[col_idx]
+        view_idx = chosen_views[col_idx]
+        peak_dist = peak_dists[col_idx]
+        x_start = left_margin + col_idx * tile_w
 
-        x_start = left_margin + col_idx * W
+        view_img = to_bgr_image(frame)
+        gt_img = to_bgr_image(overlay_heatmap_on_frame(frame, gt_hm))
+        pred_img = to_bgr_image(overlay_heatmap_on_frame(frame, pred_hm))
 
-        for row_idx in range(n_rows):
-            y_start = top_margin + row_idx * H
+        labels = [
+            f"{position_labels[col_idx]} | {VIEW_NAMES[view_idx]}",
+            f"GT max={gt_hm.max():.3f}",
+            f"Pred max={pred_hm.max():.3f}",
+        ]
+        if peak_dist == float('inf'):
+            labels[-1] += " | dist=N/A"
+        else:
+            labels[-1] += f" | dist={peak_dist:.1f}px"
 
-            if row_idx == 0:
-                img = (frame * 255).astype(np.uint8)
-                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            elif row_idx == 1:
-                overlay = overlay_heatmap_on_frame(frame, gt_hm, alpha=0.6)
-                img_bgr = cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            else:
-                overlay = overlay_heatmap_on_frame(frame, pred_hm, alpha=0.6)
-                img_bgr = cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-
-            cv2.putText(img_bgr, f"F{pos}", (3, 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-            if row_idx == 2:
-                dist_str = f"{dist:.1f}px" if dist != float('inf') else "N/A"
-                color = (0, 255, 0) if dist < 5 else (0, 255, 255) if dist < 15 else (0, 0, 255)
-                cv2.putText(img_bgr, dist_str, (3, H - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-
-            canvas[y_start:y_start + H, x_start:x_start + W] = img_bgr
-
-    bev_x_start = left_margin + grid_w + 20
-    bev_y_start = top_margin
-    bev_img = render_birdseye_view(
-        all_poses=all_poses,
-        sample_positions=sample_positions,
-        peak_dists=peak_dists,
-        view_w=bev_w,
-        view_h=bev_h,
-    )
-    canvas[bev_y_start:bev_y_start + bev_h, bev_x_start:bev_x_start + bev_w] = bev_img
-
-    cv2.rectangle(canvas, (bev_x_start, bev_y_start),
-                  (bev_x_start + bev_w - 1, bev_y_start + bev_h - 1),
-                  (150, 150, 150), 1)
+        for row_idx, img in enumerate((view_img, gt_img, pred_img)):
+            y_start = top_margin + row_idx * tile_h
+            canvas[y_start:y_start + tile_h, x_start:x_start + tile_w] = img
+            cv2.putText(
+                canvas,
+                labels[row_idx],
+                (x_start + 4, y_start + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     cv2.imwrite(output_path, canvas)
     logger.info(f"  Saved: {output_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="轨迹热力图可视化")
+def collect_clip_samples(
+    dataset: VLNSlidingWindowDataset,
+    num_clips: int,
+    frames_per_clip: int,
+    seed: int,
+) -> List[Tuple[int, List[Tuple[int, int]]]]:
+    by_clip: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for dataset_idx, (clip_idx, frame_idx) in enumerate(dataset.sample_index):
+        by_clip[int(clip_idx)].append((int(frame_idx), int(dataset_idx)))
+
+    clip_items = [(clip_idx, sorted(items, key=lambda x: x[0])) for clip_idx, items in by_clip.items() if items]
+    rng = random.Random(seed)
+    rng.shuffle(clip_items)
+
+    selected = []
+    for clip_idx, items in clip_items[:num_clips]:
+        if len(items) <= frames_per_clip:
+            sampled = items
+        else:
+            positions = np.linspace(0, len(items) - 1, frames_per_clip, dtype=int)
+            sampled = [items[pos] for pos in sorted(set(positions.tolist()))]
+        selected.append((clip_idx, sampled))
+    return selected
+
+
+def infer_sample(model: VLNPipeline, sample: Dict[str, Any], device: torch.device) -> np.ndarray:
+    history_frames = sample['history_frames'].unsqueeze(0).to(device)
+    current_frame = sample['current_frame'].unsqueeze(0).to(device)
+    current_views = sample.get('current_views')
+    history_panoramas = sample.get('history_panoramas')
+    if current_views is None or history_panoramas is None:
+        raise ValueError("当前数据集不包含全景 current_views/history_panoramas，无法运行 v2 热力图可视化。")
+
+    current_views = current_views.unsqueeze(0).to(device)
+    history_panoramas = history_panoramas.unsqueeze(0).to(device)
+    video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
+    autocast_context = (
+        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        if device.type == 'cuda'
+        else nullcontext()
+    )
+
+    with torch.no_grad(), autocast_context:
+        outputs = model(
+            video_frames=video_frames,
+            instruction_text=[sample['text']],
+            current_observation=current_frame,
+            current_views=current_views,
+            history_panoramas=history_panoramas,
+            return_heatmaps=True,
+            return_actions=False,
+        )
+
+    heatmaps = outputs.get('heatmaps')
+    if heatmaps is None:
+        raise RuntimeError("模型未返回 heatmaps。")
+    return heatmaps[0].float().cpu()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="轨迹热力图可视化 (HeatmapVLN v2)")
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--num-clips', type=int, default=3, help='可视化的 clip 数')
-    parser.add_argument('--frames-per-clip', type=int, default=12, help='每个 clip 采样的帧数')
+    parser.add_argument('--num-clips', type=int, default=3, help='可视化 clip 数')
+    parser.add_argument('--frames-per-clip', type=int, default=12, help='每个 clip 抽样的位置数')
     parser.add_argument('--output-dir', type=str, default='./vis_trajectory')
     parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--inference-steps', type=int, default=None)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split', type=str, default=None, help='默认使用配置里的 val_split')
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ==================== 加载 checkpoint ====================
     logger.info(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     cfg = ckpt['config']
-    epoch = ckpt.get('epoch', '?')
-    logger.info(f"  Epoch: {epoch}")
+    logger.info(f"  Epoch: {ckpt.get('epoch', '?')}")
 
-    if args.inference_steps is not None:
-        cfg['model']['heatmap_head']['num_inference_steps'] = args.inference_steps
-        logger.info(f"  Override inference_steps = {args.inference_steps}")
+    split = args.split or cfg['data'].get('val_split', 'val')
+    sw_cfg = cfg['data']['sliding_window']
 
-    data_root = cfg['data']['root']
-    image_size = tuple(cfg['data']['image_size'])
-    hm_size = tuple(cfg['data']['init_hm_size'])
-    num_history = cfg['data'].get('sliding_window', {}).get('num_history_sample', 32)
-    stride = cfg['data'].get('sliding_window', {}).get('sample_stride', 2)
+    logger.info("Loading dataset...")
+    dataset = VLNSlidingWindowDataset(
+        root=cfg['data']['root'],
+        split=split,
+        min_history=sw_cfg['min_history'],
+        num_history_sample=sw_cfg['num_history_sample'],
+        image_size=tuple(cfg['data']['image_size']),
+        hm_size=tuple(cfg['data']['init_hm_size']),
+        load_depth=sw_cfg.get('load_depth', True),
+        cache_poses=sw_cfg.get('cache_poses', True),
+        sample_stride=sw_cfg.get('sample_stride', 2),
+        clip_level_sampling=False,
+        samples_per_clip=sw_cfg.get('val_samples_per_clip', 2),
+        enable_augmentation=False,
+        defer_heatmap_to_gpu=False,
+    )
 
-    # ==================== 构建模型 ====================
+    if not getattr(dataset, '_is_panoramic', False):
+        logger.error("当前数据集不是全景 4 视角格式，无法运行 v2 轨迹热力图可视化。")
+        return 1
+
+    selected_clips = collect_clip_samples(
+        dataset=dataset,
+        num_clips=args.num_clips,
+        frames_per_clip=args.frames_per_clip,
+        seed=args.seed,
+    )
+    if not selected_clips:
+        logger.error("没有找到可用样本。")
+        return 1
+
     logger.info("Building model...")
-    model = build_model(cfg)
-    state_dict = ckpt.get('trainable_state_dict', {})
+    model = build_model(cfg, device=str(device))
+    state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', {}))
     if state_dict:
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         logger.info(f"  Loaded: {len(state_dict)} params, missing={len(missing)}, unexpected={len(unexpected)}")
+    else:
+        logger.warning("  No trainable weights in checkpoint!")
     model = model.to(device)
     model.eval()
 
-    # ==================== 找 clips ====================
-    min_frames_needed = num_history * stride + 10
-    logger.info(f"Finding clips with >= {min_frames_needed} frames...")
-    clips = find_good_clips(data_root, min_frames=min_frames_needed,
-                            num_clips=args.num_clips, seed=args.seed)
-    logger.info(f"  Found {len(clips)} clips")
-
-    if len(clips) == 0:
-        logger.error("No clips found! Check data_root and min_frames requirement.")
-        return
-
-    # ==================== 处理每个 clip ====================
-    for clip_idx, (clip_dir, n_total) in enumerate(clips):
+    logger.info(f"Visualizing {len(selected_clips)} clips...")
+    for clip_order, (clip_idx, items) in enumerate(selected_clips):
+        clip_dir = dataset.clips[clip_idx]
         clip_name = f"{clip_dir.parent.name}/{clip_dir.name}"
-        logger.info(f"\n[Clip {clip_idx+1}/{len(clips)}] {clip_name} ({n_total} frames)")
+        logger.info(f"[Clip {clip_order + 1}/{len(selected_clips)}] {clip_name} ({len(items)} samples)")
 
-        clip_data = load_clip_chunks(clip_dir)
-        n = clip_data["n_frames"]
-        logger.info(f"  Loaded {n} frames, instruction: {clip_data['instruction'][:80]}...")
+        frames_np: List[np.ndarray] = []
+        gt_heatmaps: List[np.ndarray] = []
+        pred_heatmaps: List[np.ndarray] = []
+        chosen_views: List[int] = []
+        peak_dists: List[float] = []
+        position_labels: List[str] = []
+        instruction = ""
 
-        min_pos = num_history * stride
-        max_pos = n - 1
-        if max_pos <= min_pos:
-            logger.warning(f"  Clip too short ({n} frames, need >{min_pos}), skipping")
-            continue
+        for frame_idx, dataset_idx in items:
+            sample = dataset[dataset_idx]
+            instruction = sample['text']
 
-        sample_positions = np.linspace(min_pos, max_pos, args.frames_per_clip, dtype=int).tolist()
-        sample_positions = sorted(set(sample_positions))
+            pred_all = infer_sample(model, sample, device=device)
+            gt_all = sample['heatmap'].float().cpu()
 
-        logger.info(f"  Sampling {len(sample_positions)} positions: {sample_positions[:5]}...{sample_positions[-3:]}")
+            pred_agg = aggregate_history_heatmaps(pred_all)
+            gt_agg = aggregate_history_heatmaps(gt_all)
 
-        frames_for_vis = []
-        gt_heatmaps = []
-        pred_heatmaps = []
-        peak_dists = []
+            if pred_agg.shape[-2:] != gt_agg.shape[-2:]:
+                pred_agg = F.interpolate(
+                    pred_agg.unsqueeze(0),
+                    size=gt_agg.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0)
 
-        for pos_idx, pos in enumerate(sample_positions):
-            # 均匀采样历史帧索引 [0, pos)
-            history_indices = np.linspace(0, pos - 1, num_history, dtype=int).tolist()
-            current_idx = pos
+            pred_np = np.clip(pred_agg.numpy(), 0, 1)
+            gt_np = np.clip(gt_agg.numpy(), 0, 1)
+            current_views_np = sample['current_views'].cpu().numpy().transpose(0, 2, 3, 1)
 
-            # 解码当前帧 RGB
-            current_rgb = decode_chunk_rgb(clip_data["raw_rgbs"][current_idx])
-            if current_rgb is None:
-                logger.warning(f"    Failed to decode frame {current_idx}")
-                continue
-            current_rgb_resized = cv2.resize(current_rgb, image_size)
-            current_frame_np = current_rgb_resized.astype(np.float32) / 255.0
-            current_frame_tensor = torch.from_numpy(current_frame_np).float().permute(2, 0, 1)
+            view_idx, peak_dist = choose_view(gt_np, pred_np)
+            frames_np.append(np.clip(current_views_np[view_idx], 0, 1))
+            gt_heatmaps.append(gt_np[view_idx])
+            pred_heatmaps.append(pred_np[view_idx])
+            chosen_views.append(view_idx)
+            peak_dists.append(peak_dist)
+            position_labels.append(f"F{frame_idx}")
 
-            # 解码历史帧 RGB
-            history_tensors = []
-            for hi in history_indices:
-                rgb = decode_chunk_rgb(clip_data["raw_rgbs"][hi])
-                if rgb is None:
-                    rgb = current_rgb
-                rgb_resized = cv2.resize(rgb, image_size)
-                t = torch.from_numpy(rgb_resized).float() / 255.0
-                history_tensors.append(t.permute(2, 0, 1))
-
-            # video_frames = history + current (模型期望最后一帧是 current)
-            all_frame_tensors = history_tensors + [current_frame_tensor]
-            video_frames = torch.stack(all_frame_tensors).unsqueeze(0).to(device)  # [1, T, C, H, W]
-
-            # GT 热力图
-            history_poses = [clip_data["poses"][hi] for hi in history_indices]
-            current_pose = clip_data["poses"][current_idx]
-
-            current_depth = None
-            if clip_data["depths"] is not None and current_idx < len(clip_data["depths"]):
-                current_depth = clip_data["depths"][current_idx]
-
-            gt_hm, vis_count = compute_history_heatmap(
-                history_poses=history_poses,
-                current_pose=current_pose,
-                current_depth=current_depth,
-                hm_size=hm_size,
-                img_size=(640, 480),
-                K=clip_data["intrinsics"],
+            logger.info(
+                "  frame=%4d view=%s peak_dist=%s gt_max=%.3f pred_max=%.3f",
+                frame_idx,
+                VIEW_NAMES[view_idx],
+                "N/A" if peak_dist == float('inf') else f"{peak_dist:.1f}px",
+                float(gt_np[view_idx].max()),
+                float(pred_np[view_idx].max()),
             )
 
-            # 模型推理
-            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                vis_output = model(
-                    video_frames=video_frames,
-                    instruction_text=[clip_data["instruction"]],
-                    current_observation=video_frames[:, -1],
-                    return_heatmaps=True,
-                    return_actions=False,
-                )
-
-            if 'history_heatmaps' in vis_output and vis_output['history_heatmaps'] is not None:
-                pred_hm = vis_output['history_heatmaps'][0, -1].float().cpu().numpy()
-                pred_hm = np.clip(pred_hm, 0, 1)
-            else:
-                pred_hm = np.zeros(hm_size, dtype=np.float32)
-
-            # Peak distance
-            if gt_hm.max() > 0.01 and pred_hm.max() > 0.01:
-                gt_peak = np.unravel_index(gt_hm.argmax(), gt_hm.shape)
-                pred_peak = np.unravel_index(pred_hm.argmax(), pred_hm.shape)
-                dist = np.sqrt((gt_peak[0] - pred_peak[0])**2 + (gt_peak[1] - pred_peak[1])**2)
-            elif gt_hm.max() <= 0.01 and pred_hm.max() <= 0.01:
-                dist = 0.0
-            else:
-                dist = float('inf')
-
-            frames_for_vis.append(current_frame_np)
-            gt_heatmaps.append(gt_hm)
-            pred_heatmaps.append(pred_hm)
-            peak_dists.append(dist)
-
-            gt_type = "pos" if gt_hm.max() > 0.01 else "neg"
-            logger.info(f"    Pos {pos:>4d} [{gt_type}]: peak_dist={dist:>6.1f}px, "
-                         f"pred_max={pred_hm.max():.3f}, gt_max={gt_hm.max():.3f}, vis={vis_count}")
-
-        if not frames_for_vis:
-            logger.warning(f"  No valid frames for clip, skipping")
-            continue
-
-        out_path = output_dir / f"clip_{clip_idx:02d}_{clip_dir.name}.png"
+        out_path = output_dir / f"clip_{clip_order:02d}_{clip_dir.name}.png"
         make_trajectory_grid(
             clip_name=clip_name,
-            instruction=clip_data["instruction"],
-            sample_positions=sample_positions,
-            frames_np=frames_for_vis,
+            instruction=instruction,
+            position_labels=position_labels,
+            frames_np=frames_np,
             gt_heatmaps=gt_heatmaps,
             pred_heatmaps=pred_heatmaps,
+            chosen_views=chosen_views,
             peak_dists=peak_dists,
-            all_poses=clip_data["poses"],
             output_path=str(out_path),
         )
 
-        finite = [d for d in peak_dists if d != float('inf')]
+        finite = [dist for dist in peak_dists if dist != float('inf')]
         if finite:
-            logger.info(f"  Clip summary: mean_dist={np.mean(finite):.1f}px, "
-                         f"median={np.median(finite):.1f}px, <5px: {sum(1 for d in finite if d<5)}/{len(finite)}")
-
+            logger.info(
+                "  Summary: mean_dist=%.1fpx, median=%.1fpx, <5px=%d/%d",
+                float(np.mean(finite)),
+                float(np.median(finite)),
+                sum(1 for dist in finite if dist < 5),
+                len(finite),
+            )
         torch.cuda.empty_cache()
 
-    logger.info(f"\nAll done! Output: {output_dir}")
+    logger.info(f"All done! Output: {output_dir}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

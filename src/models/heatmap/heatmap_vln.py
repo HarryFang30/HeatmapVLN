@@ -79,8 +79,8 @@ class HeatmapVLN(nn.Module):
             self.qwen, vit_layer_indices, llm_layer_idx,
         )
 
-        # Coarse localisation (zero parameters)
-        self.coarse = CoarseLocalization()
+        # Coarse localisation (trainable visibility head)
+        self.coarse = CoarseLocalization(c_llm=c_llm)
 
         # Trainable modules
         n_vit_layers = len(vit_layer_indices)
@@ -294,10 +294,21 @@ class HeatmapVLN(nn.Module):
         Find start/end positions of each image's vision tokens in the LLM
         input sequence.
 
-        Qwen3.5 uses ``<|image_pad|>`` (ID 248056) tokens as placeholders.
-        Each contiguous block of image_pad tokens corresponds to one image.
+        Uses the tokenizer's ``<|image_pad|>`` token ID dynamically so that
+        we are robust to tokenizer changes.
         """
-        IMAGE_PAD_ID = 248056
+        if not hasattr(self, '_image_pad_id'):
+            tokenizer = self.processor.tokenizer
+            pad_token = "<|image_pad|>"
+            self._image_pad_id = tokenizer.convert_tokens_to_ids(pad_token)
+            if self._image_pad_id is None:
+                logger.warning(
+                    "Could not resolve %s from tokenizer, falling back to 248056",
+                    pad_token,
+                )
+                self._image_pad_id = 248056
+
+        image_pad_id = self._image_pad_id
         input_ids = inputs["input_ids"].squeeze().tolist()
 
         positions: Dict[int, Tuple[int, int]] = {}
@@ -306,9 +317,9 @@ class HeatmapVLN(nn.Module):
         n = len(input_ids)
 
         while i < n:
-            if input_ids[i] == IMAGE_PAD_ID:
+            if input_ids[i] == image_pad_id:
                 start = i
-                while i < n and input_ids[i] == IMAGE_PAD_ID:
+                while i < n and input_ids[i] == image_pad_id:
                     i += 1
                 positions[img_idx] = (start, i)
                 img_idx += 1
