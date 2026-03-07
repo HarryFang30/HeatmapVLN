@@ -3,17 +3,21 @@ HeatmapVLN — Complete Model Assembly
 =======================================
 
 Frozen:    Qwen3.5-9B  (~9B parameters)
-Trainable: DPTLiteFusion + FineLocalization  (~2M parameters, 0.02%)
+Trainable: DPTLiteFusion (ViT) + DPTLiteFusion (LLM)
+           + CoarseLocalization (query_proj + vis_head)
+           + FineLocalization
 
 Data flow:
     Multi-image + text input  →  Qwen3.5 forward (frozen)
-    →  ViT intermediate features (16x16)
-       + LLM intermediate features (8x8)
-       + text hidden states
-    →  Coarse localisation (zero params):
-         text query × current views  →  visibility + 8x8 coarse heatmap
+    →  ViT intermediate features (16x16, multi-layer)
+       + LLM intermediate features (8x8, multi-layer from full_attention)
+       + text hidden states (deepest layer)
+    →  DPT-Lite fusion for ViT features   →  (16x16, C_fused)
+    →  DPT-Lite fusion for LLM features   →  (8x8,  C_fused)
+    →  Coarse localisation (query_proj + cosine sim):
+         query_proj(text) × fused_llm  →  visibility + 8x8 coarse heatmap
     →  Fine localisation (trainable):
-         ViT features + coarse heatmap + text query  →  64x64 fine heatmap
+         fused_vit + coarse heatmap + text query  →  64x64 fine heatmap
 
 Reference: HeatmapVLN设计文档 Section 7
 """
@@ -38,13 +42,13 @@ class HeatmapVLN(nn.Module):
     HeatmapVLN complete model.
 
     Args:
-        qwen_model:        Qwen3.5-9B model instance (will be frozen).
-        processor:         Qwen3.5 processor / tokenizer.
-        c_vit:             ViT hidden dimension (1152 for Qwen3.5).
-        c_llm:             LLM hidden dimension (4096 for Qwen3.5 7B).
-        c_fused:           Fused feature dimension for DPT / fine head.
-        vit_layer_indices: ViT block indices to hook.
-        llm_layer_idx:     LLM layer index to hook.
+        qwen_model:         Qwen3.5-9B model instance (will be frozen).
+        processor:          Qwen3.5 processor / tokenizer.
+        c_vit:              ViT hidden dimension (1152 for Qwen3.5).
+        c_llm:              LLM hidden dimension (4096 for Qwen3.5).
+        c_fused:            Fused feature dimension for DPT / fine head.
+        vit_layer_indices:  ViT block indices to hook.
+        llm_layer_indices:  LLM layer indices to hook (full_attention layers).
     """
 
     def __init__(
@@ -55,12 +59,14 @@ class HeatmapVLN(nn.Module):
         c_llm: int = 4096,
         c_fused: int = 256,
         vit_layer_indices: Optional[List[int]] = None,
-        llm_layer_idx: int = 24,
+        llm_layer_indices: Optional[List[int]] = None,
     ):
         super().__init__()
 
         if vit_layer_indices is None:
             vit_layer_indices = [6, 12, 18, 24]
+        if llm_layer_indices is None:
+            llm_layer_indices = [7, 15, 23]
 
         self.qwen = qwen_model
         self.processor = processor
@@ -68,7 +74,7 @@ class HeatmapVLN(nn.Module):
         self.c_llm = c_llm
         self.c_fused = c_fused
         self.vit_layer_indices = vit_layer_indices
-        self.llm_layer_idx = llm_layer_idx
+        self.llm_layer_indices = llm_layer_indices
 
         # Freeze Qwen3.5
         for param in self.qwen.parameters():
@@ -76,15 +82,21 @@ class HeatmapVLN(nn.Module):
 
         # Feature extractor (hooks, no parameters)
         self.feat_extractor = FeatureExtractor(
-            self.qwen, vit_layer_indices, llm_layer_idx,
+            self.qwen, vit_layer_indices, llm_layer_indices,
         )
 
-        # Coarse localisation (trainable visibility head)
-        self.coarse = CoarseLocalization(c_llm=c_llm)
-
-        # Trainable modules
+        # DPT-Lite fusion for ViT 16x16 multi-layer features
         n_vit_layers = len(vit_layer_indices)
-        self.dpt_fusion = DPTLiteFusion(c_vit, c_fused, n_vit_layers)
+        self.vit_dpt_fusion = DPTLiteFusion(c_vit, c_fused, n_vit_layers)
+
+        # DPT-Lite fusion for LLM 8x8 multi-layer features
+        n_llm_layers = len(llm_layer_indices)
+        self.llm_dpt_fusion = DPTLiteFusion(c_llm, c_fused, n_llm_layers)
+
+        # Coarse localisation (query_proj + vis_head)
+        self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
+
+        # Fine localisation head
         self.fine = FineLocalization(c_fused, c_llm)
 
         trainable = sum(
@@ -92,9 +104,9 @@ class HeatmapVLN(nn.Module):
         )
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
-            "vit_layers=%s, llm_layer=%d, trainable=%s",
+            "vit_layers=%s, llm_layers=%s, trainable=%s",
             c_vit, c_llm, c_fused,
-            vit_layer_indices, llm_layer_idx,
+            vit_layer_indices, llm_layer_indices,
             f"{trainable:,}",
         )
 
@@ -176,14 +188,14 @@ class HeatmapVLN(nn.Module):
     def _decode_features(
         self,
         current_vit: Dict[int, Dict[int, torch.Tensor]],
-        current_llm: Dict[int, torch.Tensor],
+        current_llm: Dict[int, Dict[int, torch.Tensor]],
         history_queries: List[torch.Tensor],
         num_history: int,
         device: torch.device,
     ) -> Dict[str, torch.Tensor]:
         """Run coarse-to-fine decoding from pre-extracted features."""
-        coarse_results = self.coarse(current_llm, history_queries)
 
+        # ---- Fuse multi-layer ViT features per view (16x16) ----
         fused_vit: Dict[int, torch.Tensor] = {}
         for view_idx in range(4):
             multi_layer = []
@@ -205,7 +217,36 @@ class HeatmapVLN(nn.Module):
                     feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
                     multi_layer.append(feat)
             if multi_layer:
-                fused_vit[view_idx] = self.dpt_fusion(multi_layer)
+                fused_vit[view_idx] = self.vit_dpt_fusion(multi_layer)
+
+        # ---- Fuse multi-layer LLM features per view (8x8) ----
+        fused_llm: Dict[int, torch.Tensor] = {}
+        for view_idx in range(4):
+            multi_layer = []
+            template_feat = None
+            for layer_idx in self.llm_layer_indices:
+                feat = current_llm[view_idx].get(layer_idx)
+                if feat is None:
+                    continue
+                feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)  # (1, C_llm, H, W)
+                template_feat = feat
+                multi_layer.append(feat)
+            if template_feat is not None and len(multi_layer) != len(self.llm_layer_indices):
+                multi_layer = []
+                for layer_idx in self.llm_layer_indices:
+                    feat = current_llm[view_idx].get(layer_idx)
+                    if feat is None:
+                        multi_layer.append(torch.zeros_like(template_feat))
+                        continue
+                    feat = feat.permute(2, 0, 1).unsqueeze(0).to(device)
+                    multi_layer.append(feat)
+            if multi_layer:
+                fused = self.llm_dpt_fusion(multi_layer)         # (1, C_fused, 8, 8)
+                # reshape back to (H, W, C_fused) for CoarseLocalization
+                fused_llm[view_idx] = fused.squeeze(0).permute(1, 2, 0)
+
+        # ---- Coarse localisation ----
+        coarse_results = self.coarse(fused_llm, history_queries)
 
         if num_history == 0:
             return {
@@ -213,6 +254,7 @@ class HeatmapVLN(nn.Module):
                 "heatmaps": torch.empty(0, 4, 64, 64, device=device),
             }
 
+        # ---- Fine localisation ----
         all_visibility = []
         all_heatmaps = []
         for hist_idx in range(num_history):

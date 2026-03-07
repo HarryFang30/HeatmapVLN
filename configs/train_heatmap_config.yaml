@@ -69,8 +69,8 @@ model:
     c_vit: 1152               # ViT hidden dimension (Qwen3.5)
     c_llm: 4096               # LLM hidden dimension
     c_fused: 256               # DPT-Lite fusion output dim
-    vit_layer_indices: [6, 12, 18, 24]   # ViT blocks to hook
-    llm_layer_idx: 24          # LLM layer to hook (24/32)
+    vit_layer_indices: [6, 12, 18, 24]   # ViT blocks to hook (depth=27)
+    llm_layer_indices: [7, 15, 23]     # LLM full_attention layers to hook (multi-layer fusion)
     heatmap_size: [64, 64]
     image_size: 256            # 输入图像尺寸
 

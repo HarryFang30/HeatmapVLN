@@ -71,7 +71,7 @@ class VLNPipelineConfig:
     heatmap_c_llm: int = 4096
     heatmap_c_fused: int = 256
     heatmap_vit_layer_indices: Optional[List[int]] = None   # e.g. [6, 12, 18, 24]
-    heatmap_llm_layer_idx: int = 24
+    heatmap_llm_layer_indices: Optional[List[int]] = None  # e.g. [7, 15, 23] (full_attention)
     heatmap_size: Tuple[int, int] = (64, 64)
 
     # HeatmapVLNLoss weights
@@ -257,6 +257,7 @@ class VLNPipeline(nn.Module):
 
         cfg = self.config
         vit_indices = cfg.heatmap_vit_layer_indices or [6, 12, 18, 24]
+        llm_indices = cfg.heatmap_llm_layer_indices or [7, 15, 23]
 
         self.heatmap_vln = HeatmapVLN(
             qwen_model=self.qwen3_5.model,
@@ -265,16 +266,22 @@ class VLNPipeline(nn.Module):
             c_llm=cfg.heatmap_c_llm,
             c_fused=cfg.heatmap_c_fused,
             vit_layer_indices=vit_indices,
-            llm_layer_idx=cfg.heatmap_llm_layer_idx,
+            llm_layer_indices=llm_indices,
         )
 
-        # Move trainable parts to correct device/dtype
-        self.heatmap_vln.dpt_fusion.to(device=self.device, dtype=cfg.dtype)
-        self.heatmap_vln.fine.to(device=self.device, dtype=cfg.dtype)
-        if self.heatmap_vln.coarse.vis_head is not None:
-            self.heatmap_vln.coarse.vis_head.to(device=self.device, dtype=cfg.dtype)
+        # Move all trainable parts to correct device/dtype
+        for module in [
+            self.heatmap_vln.vit_dpt_fusion,
+            self.heatmap_vln.llm_dpt_fusion,
+            self.heatmap_vln.fine,
+            self.heatmap_vln.coarse,
+        ]:
+            module.to(device=self.device, dtype=cfg.dtype)
 
-        logger.info("HeatmapVLN v2 constructed (Coarse-to-Fine)")
+        logger.info(
+            "HeatmapVLN v2 constructed (Coarse-to-Fine, LLM layers=%s)",
+            llm_indices,
+        )
 
     @staticmethod
     def _views_tensor_to_dict(views: torch.Tensor) -> Dict[str, Any]:

@@ -4,8 +4,13 @@ Feature Extractor for HeatmapVLN
 
 Registers forward hooks on Qwen3.5-9B to capture:
   1. ViT intermediate-layer features (16x16 per image, pre-merge)
-  2. LLM intermediate-layer hidden states (8x8 per image, post-merge)
+  2. LLM multi-layer hidden states (8x8 per image, post-merge)
   3. Text token hidden states (query vectors for each history position)
+
+Qwen3.5 uses alternating linear_attention and full_attention layers
+(full_attention_interval=4).  We hook only **full_attention** layers
+(e.g. 7, 15, 23) because they have global cross-token interaction,
+producing spatially richer 8x8 visual features.
 
 Reference: HeatmapVLN设计文档 Section 4
 """
@@ -30,19 +35,29 @@ class FeatureExtractor:
 
     After the model forward pass, call ``extract()`` to retrieve
     grouped features for downstream coarse / fine localisation heads.
+
+    Args:
+        model:             Qwen3.5 model instance.
+        vit_layer_indices: ViT block indices to hook (e.g. [6, 12, 18, 24]).
+        llm_layer_indices: LLM layer indices to hook.  Should be
+                           **full_attention** layers (e.g. [7, 15, 23]).
+        spatial_merge_size: Qwen3.5 spatial merge factor (default 2).
     """
 
     def __init__(
         self,
         model,
         vit_layer_indices: List[int],
-        llm_layer_idx: int = 24,
+        llm_layer_indices: Optional[List[int]] = None,
         spatial_merge_size: int = 2,
     ):
+        if llm_layer_indices is None:
+            llm_layer_indices = [7, 15, 23]
+
         self.vit_features: Dict[int, torch.Tensor] = {}
-        self.llm_hidden_states: Optional[torch.Tensor] = None
+        self.llm_hidden_states: Dict[int, Optional[torch.Tensor]] = {}
         self.vit_layer_indices = list(vit_layer_indices)
-        self.llm_layer_idx = llm_layer_idx
+        self.llm_layer_indices = sorted(llm_layer_indices)
         self.spatial_merge_size = spatial_merge_size
         self._handles: list = []
 
@@ -59,18 +74,21 @@ class FeatureExtractor:
             self._handles.append(h)
 
         llm_layers = self._get_llm_layers(model)
-        if llm_layer_idx < len(llm_layers):
-            h = llm_layers[llm_layer_idx].register_forward_hook(self._make_llm_hook())
-            self._handles.append(h)
-        else:
-            logger.warning(
-                "LLM hook layer %d out of range (max %d)",
-                llm_layer_idx, len(llm_layers) - 1,
-            )
+        for layer_idx in self.llm_layer_indices:
+            if layer_idx < len(llm_layers):
+                h = llm_layers[layer_idx].register_forward_hook(
+                    self._make_llm_hook(layer_idx),
+                )
+                self._handles.append(h)
+            else:
+                logger.warning(
+                    "LLM hook layer %d out of range (max %d)",
+                    layer_idx, len(llm_layers) - 1,
+                )
 
         logger.info(
-            "FeatureExtractor: ViT hooks %s, LLM hook layer %d",
-            self.vit_layer_indices, llm_layer_idx,
+            "FeatureExtractor: ViT hooks %s, LLM hooks %s",
+            self.vit_layer_indices, self.llm_layer_indices,
         )
 
     # ------------------------------------------------------------------
@@ -82,18 +100,18 @@ class FeatureExtractor:
             self.vit_features[idx] = output.detach()
         return hook
 
-    def _make_llm_hook(self):
+    def _make_llm_hook(self, layer_idx: int):
         def hook(_module, _input, output):
             if isinstance(output, tuple):
-                self.llm_hidden_states = output[0].detach()
+                self.llm_hidden_states[layer_idx] = output[0].detach()
             else:
-                self.llm_hidden_states = output.detach()
+                self.llm_hidden_states[layer_idx] = output.detach()
         return hook
 
     def clear(self):
         """Reset captured features before each forward pass."""
         self.vit_features = {}
-        self.llm_hidden_states = None
+        self.llm_hidden_states = {}
 
     def remove_hooks(self):
         for h in self._handles:
@@ -122,24 +140,33 @@ class FeatureExtractor:
 
         Returns:
             current_vit:  ``{view_idx: {layer: (16,16,C_vit)}}``
-            current_llm:  ``{view_idx: (8,8,C_llm)}``
-            history_queries: list of ``(C_llm,)`` tensors
-            history_llm_views: list of ``{view_idx: (8,8,C_llm)}``
+            current_llm:  ``{view_idx: {layer: (8,8,C_llm)}}``
+            history_queries: list of ``(C_llm,)`` tensors (from deepest layer)
+            history_llm_views: list of ``{view_idx: (8,8,C_llm)}`` (deepest)
         """
-        hidden = self.llm_hidden_states  # (1, seq_len, C_llm)
-        if hidden is None:
-            raise RuntimeError("LLM hidden states not captured. Did you run model forward?")
+        deepest_layer = max(self.llm_layer_indices)
+        hidden_deepest = self.llm_hidden_states.get(deepest_layer)
+        if hidden_deepest is None:
+            raise RuntimeError(
+                f"LLM hidden states for layer {deepest_layer} not captured. "
+                "Did you run model forward?"
+            )
 
         n_hist = len(text_anchor_positions)
 
-        # --- current 4 views: LLM features (8x8) ---
-        current_llm: Dict[int, torch.Tensor] = {}
+        # --- current 4 views: multi-layer LLM features (8x8) ---
+        current_llm: Dict[int, Dict[int, torch.Tensor]] = {}
         for view_idx in range(4):
+            current_llm[view_idx] = {}
             start, end = image_token_positions[view_idx]
-            tokens = hidden[0, start:end, :]  # (n_tokens, C_llm)
-            n = tokens.shape[0]
-            h = w = int(n ** 0.5)
-            current_llm[view_idx] = tokens.reshape(h, w, -1)
+            for layer_idx in self.llm_layer_indices:
+                hidden = self.llm_hidden_states.get(layer_idx)
+                if hidden is None:
+                    continue
+                tokens = hidden[0, start:end, :]  # (n_tokens, C_llm)
+                n = tokens.shape[0]
+                h = w = int(n ** 0.5)
+                current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
 
         # --- current 4 views: ViT features (16x16, multi-layer) ---
         current_vit: Dict[int, Dict[int, torch.Tensor]] = {}
@@ -156,14 +183,14 @@ class FeatureExtractor:
                     h = w = int(vit_tokens.shape[0] ** 0.5)
                     current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
 
-        # --- history query vectors (text-token hidden states) ---
+        # --- history query vectors (from deepest LLM layer) ---
         history_queries: List[torch.Tensor] = []
         for hist_idx in range(n_hist):
             pos = text_anchor_positions[hist_idx]
-            q = hidden[0, pos, :]  # (C_llm,)
+            q = hidden_deepest[0, pos, :]  # (C_llm,)
             history_queries.append(q)
 
-        # --- history LLM visual features (for ablation) ---
+        # --- history LLM visual features (deepest layer, for ablation) ---
         history_llm_views: List[Dict[int, torch.Tensor]] = []
         for hist_idx in range(n_hist):
             views: Dict[int, torch.Tensor] = {}
@@ -172,7 +199,7 @@ class FeatureExtractor:
                 if img_idx not in image_token_positions:
                     continue
                 start, end = image_token_positions[img_idx]
-                tokens = hidden[0, start:end, :]
+                tokens = hidden_deepest[0, start:end, :]
                 n = tokens.shape[0]
                 h = w = int(n ** 0.5)
                 views[v] = tokens.reshape(h, w, -1)

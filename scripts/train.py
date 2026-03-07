@@ -695,7 +695,7 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
         heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
         heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
-        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [7, 15, 23]),
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
@@ -761,7 +761,7 @@ def build_model(cfg: Dict) -> nn.Module:
         f"c_llm={heatmap_cfg.get('c_llm', 4096)}, "
         f"c_fused={heatmap_cfg.get('c_fused', 256)}, "
         f"vit_layers={heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24])}, "
-        f"llm_layer={heatmap_cfg.get('llm_layer_idx', 24)}"
+        f"llm_layers={heatmap_cfg.get('llm_layer_indices', [7, 15, 23])}"
     )
     print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
     print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
@@ -783,12 +783,14 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
     
     trainable = stage_cfg.get('trainable_modules', [])
     
-    # HeatmapVLN v2 (DPTLiteFusion + FineLocalization)
+    # HeatmapVLN v2 (DPT fusions + CoarseLocalization + FineLocalization)
     if 'heatmap_vln' in trainable:
         if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
-            freeze_module(model.heatmap_vln.dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.coarse, freeze=False)
             freeze_module(model.heatmap_vln.fine, freeze=False)
-            logger.info("  ✓ Unfrozen: heatmap_vln (dpt_fusion + fine)")
+            logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
     
     # Action head (Legacy)
     if 'action_head' in trainable:
@@ -880,14 +882,16 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
     # HeatmapVLN v2 param groups
     heatmap_lr = optim_cfg.get('heatmap_lr', 2e-4)
     if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
-        groups = get_param_groups_with_wd(model.heatmap_vln.dpt_fusion, heatmap_lr, 'heatmap_dpt_fusion', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: heatmap_dpt_fusion (lr={heatmap_lr}, wd={default_wd})")
-        groups = get_param_groups_with_wd(model.heatmap_vln.fine, heatmap_lr, 'heatmap_fine', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: heatmap_fine (lr={heatmap_lr}, wd={default_wd})")
+        for name, submodule in [
+            ('vit_dpt_fusion', model.heatmap_vln.vit_dpt_fusion),
+            ('llm_dpt_fusion', model.heatmap_vln.llm_dpt_fusion),
+            ('coarse',         model.heatmap_vln.coarse),
+            ('fine',           model.heatmap_vln.fine),
+        ]:
+            groups = get_param_groups_with_wd(submodule, heatmap_lr, f'heatmap_{name}', default_wd)
+            if groups:
+                param_groups.extend(groups)
+                print(f"  Param group: heatmap_{name} (lr={heatmap_lr}, wd={default_wd})")
     
     
     # Action Head (Legacy)

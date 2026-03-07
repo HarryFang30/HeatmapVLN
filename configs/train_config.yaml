@@ -69,7 +69,7 @@ model:
     c_llm: 4096
     c_fused: 256
     vit_layer_indices: [6, 12, 18, 24]
-    llm_layer_idx: 24
+    llm_layer_indices: [7, 15, 23]
     heatmap_size: [64, 64]
     image_size: 256
     # 损失权重

@@ -60,7 +60,7 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
         heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
         heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
         heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
-        heatmap_llm_layer_idx=heatmap_cfg.get('llm_layer_idx', 24),
+        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [7, 15, 23]),
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
