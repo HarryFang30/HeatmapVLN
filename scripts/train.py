@@ -46,6 +46,7 @@ import warnings
 import gc
 import logging
 import time
+import math
 import psutil
 from datetime import datetime, timedelta
 import numpy as np
@@ -1076,6 +1077,33 @@ def build_scheduler(optimizer, cfg: Dict, total_steps: int):
     return scheduler
 
 
+def get_heatmap_temperature(cfg: Dict, step: int, total_steps: int) -> float:
+    """按优化步数返回当前 soft-argmax temperature。"""
+    heatmap_loss_cfg = cfg.get('loss', {}).get('heatmap_vln', {})
+    base_temperature = float(heatmap_loss_cfg.get('temperature', 3.0))
+    schedule_cfg = heatmap_loss_cfg.get('temperature_schedule', {})
+
+    if not schedule_cfg or not schedule_cfg.get('enabled', False):
+        return base_temperature
+
+    start_temp = float(schedule_cfg.get('start', base_temperature))
+    end_temp = float(schedule_cfg.get('end', start_temp))
+    mode = str(schedule_cfg.get('mode', 'cosine')).lower()
+
+    if total_steps <= 1:
+        return end_temp
+
+    progress = min(max(step / max(total_steps - 1, 1), 0.0), 1.0)
+
+    if mode == 'linear':
+        interp = progress
+    else:
+        # 默认用 cosine 插值，与学习率主调度节奏一致。
+        interp = 0.5 * (1.0 - math.cos(math.pi * progress))
+
+    return start_temp + (end_temp - start_temp) * interp
+
+
 # ============================================
 # 训练与验证
 # ============================================
@@ -1101,6 +1129,7 @@ def train_one_epoch(
     gpu_depth_normalized: bool = True,
     ema: Optional[EMAModel] = None,
     metrics_jsonl_path: Optional[Path] = None,
+    total_train_steps: int = 1,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     
@@ -1133,6 +1162,9 @@ def train_one_epoch(
         temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
+    hm_loss_fn.set_temperature(
+        get_heatmap_temperature(cfg, global_step_offset, total_train_steps)
+    )
     
     total_batches = len(train_loader)
     if max_batches is not None:
@@ -1390,6 +1422,12 @@ def train_one_epoch(
             if enable_timing:
                 timing_stats['optimizer_s'] += time.perf_counter() - opt_start
             global_step += 1
+            current_heatmap_temperature = get_heatmap_temperature(
+                cfg,
+                global_step_offset + global_step,
+                total_train_steps,
+            )
+            hm_loss_fn.set_temperature(current_heatmap_temperature)
             
             # 日志
             log_interval = cfg['log'].get('log_interval', 10)
@@ -1408,6 +1446,7 @@ def train_one_epoch(
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
                     f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
+                    f"Temp: {current_heatmap_temperature:.3f} | "
                     f"LR: [{lr_display}] | "
                     f"GPU: {mem_alloc:.1f}GB"
                     + (
@@ -1438,6 +1477,7 @@ def train_one_epoch(
                             "heatmap_loss": heatmap_loss.item(),
                             "trajectory_loss": trajectory_loss.item(),
                             "progress_loss": progress_loss.item(),
+                            "heatmap_temperature": current_heatmap_temperature,
                             "gpu_memory_gb": mem_alloc,
                             "lrs": {
                                 optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
@@ -1452,6 +1492,7 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
                 tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
+                tb_writer.add_scalar('train/heatmap_temperature', current_heatmap_temperature, actual_step)
                 if enable_timing:
                     tb_writer.add_scalar('timing/data_wait_s', _mean_timing(timing_stats, profiled_steps, 'data_wait_s'), actual_step)
                     tb_writer.add_scalar('timing/gt_s', _mean_timing(timing_stats, profiled_steps, 'gt_s'), actual_step)
@@ -1736,12 +1777,22 @@ def train_one_epoch(
         scheduler.step()
         if ema is not None:
             ema.update()
+        global_step += 1
+        hm_loss_fn.set_temperature(
+            get_heatmap_temperature(
+                cfg,
+                global_step_offset + global_step,
+                total_train_steps,
+            )
+        )
     
     return {
         'total_loss': total_loss / max(num_batches, 1),
         'heatmap_loss': total_heatmap_loss / max(num_batches, 1),
         'action_loss': total_action_loss / max(num_batches, 1),
         'stop_loss': total_stop_loss / max(num_batches, 1),
+        'optimizer_steps': global_step,
+        'heatmap_temperature': hm_loss_fn.temperature,
     }
 
 
@@ -1759,6 +1810,7 @@ def validate(
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
     gpu_has_depth: bool = False,
     gpu_depth_normalized: bool = True,
+    heatmap_temperature: Optional[float] = None,
 ) -> Dict[str, float]:
     """验证（带可视化）"""
     model.eval()
@@ -1788,7 +1840,7 @@ def validate(
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
         lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
-        temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
+        temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
     
@@ -1802,6 +1854,7 @@ def validate(
     
     logger.info(f"  📊 验证: {total_val_batches} batches (training loss), "
                 f"{val_inference_batches} batches (推理 MSE)")
+    logger.info(f"  🌡️ Heatmap temperature: {hm_loss_fn.temperature:.3f}")
     
     with torch.inference_mode():
         for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
@@ -2817,6 +2870,7 @@ def main():
             gpu_depth_normalized=gpu_depth_normalized,
             ema=ema,
             metrics_jsonl_path=metrics_jsonl_path,
+            total_train_steps=total_steps,
         )
         
         timer.end_epoch()
@@ -2835,6 +2889,7 @@ def main():
                 gpu_heatmap_computer=gpu_heatmap_computer,
                 gpu_has_depth=gpu_has_depth,
                 gpu_depth_normalized=gpu_depth_normalized,
+                heatmap_temperature=train_metrics.get('heatmap_temperature'),
             )
         
         # 🧹 验证后再次清理内存

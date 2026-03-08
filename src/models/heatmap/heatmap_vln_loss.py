@@ -68,6 +68,10 @@ class HeatmapVLNLoss(nn.Module):
                 f"Heatmap size mismatch: expected {self.heatmap_size}, got {actual_size}"
             )
 
+    def set_temperature(self, temperature: float) -> None:
+        """Update soft-argmax temperature during training."""
+        self.temperature = float(temperature)
+
     def soft_argmax_coord_loss(
         self,
         pred: torch.Tensor,

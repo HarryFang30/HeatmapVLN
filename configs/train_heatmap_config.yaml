@@ -175,7 +175,12 @@ loss:
     lambda_coord: 5.0
     lambda_kl: 1.0
     lambda_neg: 0.1
-    temperature: 3.0
+    temperature: 1.0
+    temperature_schedule:
+      enabled: true
+      mode: cosine
+      start: 1.0
+      end: 7.0
   
   heatmap_weight: 1.0
   trajectory_weight: 0.0
