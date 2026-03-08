@@ -191,6 +191,9 @@ loss:
 gpu:
   devices: [0]
   backend: nccl
+  multi_gpu:
+    enabled: false
+    find_unused_parameters: false
 
 # ============================================
 # 日志与保存

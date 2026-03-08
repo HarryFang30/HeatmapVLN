@@ -37,8 +37,11 @@ torch.set_float32_matmul_precision('medium')
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import argparse
 from tqdm import tqdm
 from typing import Dict, List, Optional, Any, Tuple
@@ -68,6 +71,47 @@ from src.utils.gpu_heatmap import GPUHeatmapComputer
 from src.utils.notifier import FeishuNotifier, create_notifier
 
 logger = logging.getLogger(__name__)
+
+
+class DistributedContext:
+    """Minimal distributed runtime context."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        rank: int = 0,
+        local_rank: int = 0,
+        world_size: int = 1,
+        device: Optional[torch.device] = None,
+    ):
+        self.enabled = enabled
+        self.rank = rank
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
+def _dist_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def _dist_barrier() -> None:
+    if _dist_is_initialized():
+        dist.barrier()
+
+
+def _dist_all_reduce_in_place(tensor: torch.Tensor) -> torch.Tensor:
+    if _dist_is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor
 
 
 # ============================================
@@ -741,7 +785,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
 # 模型构建
 # ============================================
 
-def build_model(cfg: Dict) -> nn.Module:
+def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
     """构建 VLN Pipeline"""
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
@@ -842,21 +886,22 @@ def build_model(cfg: Dict) -> nn.Module:
     model = VLNPipeline(config)
     
     packing_enabled = llm_cfg.get('enable_packing', False)
-    print(f"✅ VLN Pipeline 已构建")
-    print(f"   Qwen3.5 → {llm_cfg.get('model_path', './models/qwen_3.5')}")
-    print(f"   SequencePacking → enabled={packing_enabled} (Qwen3.5 不支持启用)")
-    print(
-        "   HeatmapVLN → "
-        f"enabled={heatmap_cfg.get('enable', True)}, "
-        f"c_vit={heatmap_cfg.get('c_vit', 1152)}, "
-        f"c_llm={heatmap_cfg.get('c_llm', 4096)}, "
-        f"c_fused={heatmap_cfg.get('c_fused', 256)}, "
-        f"vit_layers={heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24])}, "
-        f"llm_layers={heatmap_cfg.get('llm_layer_indices', [7, 15, 23])}"
-    )
-    print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
-    print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
-    print(f"   StopHead (legacy) → enabled={stop_cfg.get('enable', False)}")
+    if verbose:
+        print(f"✅ VLN Pipeline 已构建")
+        print(f"   Qwen3.5 → {llm_cfg.get('model_path', './models/qwen_3.5')}")
+        print(f"   SequencePacking → enabled={packing_enabled} (Qwen3.5 不支持启用)")
+        print(
+            "   HeatmapVLN → "
+            f"enabled={heatmap_cfg.get('enable', True)}, "
+            f"c_vit={heatmap_cfg.get('c_vit', 1152)}, "
+            f"c_llm={heatmap_cfg.get('c_llm', 4096)}, "
+            f"c_fused={heatmap_cfg.get('c_fused', 256)}, "
+            f"vit_layers={heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24])}, "
+            f"llm_layers={heatmap_cfg.get('llm_layer_indices', [7, 15, 23])}"
+        )
+        print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
+        print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
+        print(f"   StopHead (legacy) → enabled={stop_cfg.get('enable', False)}")
     
     return model
 
@@ -1104,6 +1149,72 @@ def get_heatmap_temperature(cfg: Dict, step: int, total_steps: int) -> float:
     return start_temp + (end_temp - start_temp) * interp
 
 
+def init_distributed_context(cfg: Dict) -> DistributedContext:
+    """Initialize optional DDP runtime from config + torchrun env."""
+    gpu_cfg = cfg.get("gpu", {})
+    multi_gpu_cfg = gpu_cfg.get("multi_gpu", {})
+    enabled = bool(multi_gpu_cfg.get("enabled", False))
+    configured_devices = list(gpu_cfg.get("devices", [0]))
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+
+    if not enabled:
+        if world_size_env > 1:
+            raise RuntimeError(
+                "Detected torchrun distributed environment, but gpu.multi_gpu.enabled is false. "
+                "Please enable the multi-GPU switch or launch with plain python for single-card training."
+            )
+        if torch.cuda.is_available():
+            device_id = int(configured_devices[0]) if configured_devices else 0
+            torch.cuda.set_device(device_id)
+            device = torch.device(f"cuda:{device_id}")
+        else:
+            device = torch.device("cpu")
+        return DistributedContext(enabled=False, device=device)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Multi-GPU training requires CUDA, but CUDA is unavailable.")
+
+    world_size = world_size_env
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size <= 1:
+        requested = len(configured_devices)
+        raise RuntimeError(
+            "Detected gpu.multi_gpu.enabled=true but no torchrun distributed environment. "
+            f"Please launch with torchrun --nproc_per_node={requested} scripts/train.py ..."
+        )
+
+    if configured_devices and world_size != len(configured_devices):
+        raise RuntimeError(
+            f"WORLD_SIZE={world_size} does not match configured gpu.devices={configured_devices}."
+        )
+
+    if local_rank >= len(configured_devices):
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} exceeds configured gpu.devices={configured_devices}."
+        )
+
+    device_id = int(configured_devices[local_rank])
+    torch.cuda.set_device(device_id)
+    dist.init_process_group(
+        backend=gpu_cfg.get("backend", "nccl"),
+        init_method="env://",
+    )
+    return DistributedContext(
+        enabled=True,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        device=torch.device(f"cuda:{device_id}"),
+    )
+
+
+def cleanup_distributed() -> None:
+    if _dist_is_initialized():
+        dist.destroy_process_group()
+
+
 # ============================================
 # 训练与验证
 # ============================================
@@ -1130,9 +1241,14 @@ def train_one_epoch(
     ema: Optional[EMAModel] = None,
     metrics_jsonl_path: Optional[Path] = None,
     total_train_steps: int = 1,
+    dist_context: Optional[DistributedContext] = None,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
-    
+    dist_context = dist_context or DistributedContext(
+        enabled=False,
+        device=torch.device(cfg['model'].get('device', 'cuda')),
+    )
+    model_module = _unwrap_model(model)
     model.train()
     total_loss = 0.0
     total_heatmap_loss = 0.0
@@ -1148,7 +1264,7 @@ def train_one_epoch(
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
     
-    device = torch.device(cfg['model'].get('device', 'cuda'))
+    device = dist_context.device
     
     from src.models.heatmap import HeatmapVLNLoss
     hm_loss_fn = HeatmapVLNLoss(
@@ -1175,7 +1291,8 @@ def train_one_epoch(
         train_loader,
         desc=f"Epoch {epoch}/{stage_cfg['epochs']}",
         total=total_batches,
-        ncols=cfg['log'].get('tqdm_ncols', 120)
+        ncols=cfg['log'].get('tqdm_ncols', 120),
+        disable=not dist_context.is_main,
     )
     
     global_step = 0
@@ -1206,7 +1323,7 @@ def train_one_epoch(
             head._training_step_counter = 0
             head._inference_interval = aligned_interval
     
-    trainable_params = _get_trainable_params(model)
+    trainable_params = _get_trainable_params(model_module)
 
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
@@ -1319,20 +1436,20 @@ def train_one_epoch(
             
             if train_action:
                 # Transformer Action Head (new) - 使用 trajectory
-                if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+                if hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
                     if 'trajectory' in batch:
                         gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
                         trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
                         # 传入完整 llm_tokens 序列
-                        traj_result = model.transformer_action_head.compute_loss(
+                        traj_result = model_module.transformer_action_head.compute_loss(
                             output['llm_tokens'],
                             gt_trajectory,
                             trajectory_valid,
                         )
                         trajectory_loss = traj_result['loss']
                 # Legacy Action Head - 使用单步动作
-                elif hasattr(model, 'action_head') and model.action_head is not None and 'action_cond' in output:
-                    action_result = model.action_head.compute_loss(
+                elif hasattr(model_module, 'action_head') and model_module.action_head is not None and 'action_cond' in output:
+                    action_result = model_module.action_head.compute_loss(
                         output['action_cond'], 
                         gt_action.unsqueeze(1),
                         action_valid
@@ -1347,12 +1464,12 @@ def train_one_epoch(
                 # Progress Head (new)
                 # 修复：传入完整 llm_tokens 序列，确保 concat_state_txt 中
                 # last_token 和 mean_pool 是不同的表示（对齐 InternNav）
-                if hasattr(model, 'progress_head') and model.progress_head is not None:
+                if hasattr(model_module, 'progress_head') and model_module.progress_head is not None:
                     if 'progress' in batch:
                         gt_progress = batch['progress'].to(device, non_blocking=True)
                         # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
                         progress_valid = batch.get('trajectory_valid', action_valid).to(device)
-                        progress_result = model.progress_head(
+                        progress_result = model_module.progress_head(
                             output['llm_tokens'],  # 传入完整序列 (B, seq_len, D)
                             gt_progress=gt_progress,
                             action_valid=progress_valid,
@@ -1360,8 +1477,8 @@ def train_one_epoch(
                         )
                         progress_loss = progress_result['loss']
                 # Legacy Stop Head
-                elif hasattr(model, 'stop_head') and model.stop_head is not None and 'stop_logits' in output:
-                    stop_loss = model.stop_head.compute_loss(
+                elif hasattr(model_module, 'stop_head') and model_module.stop_head is not None and 'stop_logits' in output:
+                    stop_loss = model_module.stop_head.compute_loss(
                         output['stop_logits'],
                         is_stop,
                         action_valid
@@ -1432,7 +1549,7 @@ def train_one_epoch(
             # 日志
             log_interval = cfg['log'].get('log_interval', 10)
             if global_step % log_interval == 0 or global_step <= 3:
-                mem_alloc = torch.cuda.memory_allocated(0) / 1024**3
+                mem_alloc = torch.cuda.memory_allocated() / 1024**3
                 all_lrs = scheduler.get_last_lr()
                 lr_strs = []
                 for gi, lr_val in enumerate(all_lrs):
@@ -1710,8 +1827,8 @@ def train_one_epoch(
                             tb_writer.add_scalar('diag/trajectory_fde', fde, actual_step)
                     
                     # GPU 显存监控
-                    tb_writer.add_scalar('diag/gpu_memory_gb', torch.cuda.memory_allocated(0) / 1024**3, actual_step)
-                    tb_writer.add_scalar('diag/gpu_memory_reserved_gb', torch.cuda.memory_reserved(0) / 1024**3, actual_step)
+                    tb_writer.add_scalar('diag/gpu_memory_gb', torch.cuda.memory_allocated() / 1024**3, actual_step)
+                    tb_writer.add_scalar('diag/gpu_memory_reserved_gb', torch.cuda.memory_reserved() / 1024**3, actual_step)
                 
                 # 轨迹分布直方图（每 100 步记录一次，避免日志过大）
                 if global_step % 100 == 0:
@@ -1726,7 +1843,7 @@ def train_one_epoch(
         vis_interval = cfg['log'].get('vis_every_steps', 500)
         if tb_writer is not None and global_step % vis_interval == 0 and global_step > 0:
             vis_path = visualize_heatmap_predictions(
-                model=model,
+                model=model_module,
                 batch=batch,
                 output=output,
                 epoch=epoch,
@@ -1786,11 +1903,25 @@ def train_one_epoch(
             )
         )
     
+    totals = torch.tensor(
+        [
+            total_loss,
+            total_heatmap_loss,
+            total_action_loss,
+            total_stop_loss,
+            float(num_batches),
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    _dist_all_reduce_in_place(totals)
+
+    reduced_num_batches = max(int(totals[4].item()), 1)
     return {
-        'total_loss': total_loss / max(num_batches, 1),
-        'heatmap_loss': total_heatmap_loss / max(num_batches, 1),
-        'action_loss': total_action_loss / max(num_batches, 1),
-        'stop_loss': total_stop_loss / max(num_batches, 1),
+        'total_loss': (totals[0] / reduced_num_batches).item(),
+        'heatmap_loss': (totals[1] / reduced_num_batches).item(),
+        'action_loss': (totals[2] / reduced_num_batches).item(),
+        'stop_loss': (totals[3] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
         'heatmap_temperature': hm_loss_fn.temperature,
     }
@@ -1811,8 +1942,14 @@ def validate(
     gpu_has_depth: bool = False,
     gpu_depth_normalized: bool = True,
     heatmap_temperature: Optional[float] = None,
+    dist_context: Optional[DistributedContext] = None,
 ) -> Dict[str, float]:
     """验证（带可视化）"""
+    dist_context = dist_context or DistributedContext(
+        enabled=False,
+        device=torch.device(cfg['model'].get('device', 'cuda')),
+    )
+    model_module = _unwrap_model(model)
     model.eval()
     
     total_loss = 0.0
@@ -1829,7 +1966,7 @@ def validate(
     train_action = stage_cfg.get('train_action', True)
     loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
     
-    device = torch.device(cfg['model'].get('device', 'cuda'))
+    device = dist_context.device
     
     from src.models.heatmap import HeatmapVLNLoss
     hm_loss_fn = HeatmapVLNLoss(
@@ -1857,7 +1994,7 @@ def validate(
     logger.info(f"  🌡️ Heatmap temperature: {hm_loss_fn.temperature:.3f}")
     
     with torch.inference_mode():
-        for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
+        for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches, disable=not dist_context.is_main)):
             if max_batches is not None and i >= max_batches:
                 break
             history_frames = batch['history_frames']
@@ -1944,20 +2081,20 @@ def validate(
             
             if train_action:
                 # Transformer Action Head (new) - 使用 trajectory
-                if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+                if hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
                     if 'trajectory' in batch:
                         gt_trajectory = batch['trajectory'].to(device)
                         trajectory_valid = batch['trajectory_valid'].to(device)
                         # 传入完整 llm_tokens 序列
-                        traj_result = model.transformer_action_head.compute_loss(
+                        traj_result = model_module.transformer_action_head.compute_loss(
                             output['llm_tokens'],
                             gt_trajectory,
                             trajectory_valid,
                         )
                         trajectory_loss = traj_result['loss']
                 # Legacy Action Head
-                elif hasattr(model, 'action_head') and model.action_head is not None and 'action_cond' in output:
-                    action_result = model.action_head.compute_loss(
+                elif hasattr(model_module, 'action_head') and model_module.action_head is not None and 'action_cond' in output:
+                    action_result = model_module.action_head.compute_loss(
                         output['action_cond'],
                         gt_action.unsqueeze(1),
                         action_valid
@@ -1971,12 +2108,12 @@ def validate(
             if train_action:
                 # Progress Head (new)
                 # 修复：传入完整 llm_tokens 序列（对齐 InternNav）
-                if hasattr(model, 'progress_head') and model.progress_head is not None:
+                if hasattr(model_module, 'progress_head') and model_module.progress_head is not None:
                     if 'progress' in batch:
                         gt_progress = batch['progress'].to(device)
                         # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
                         progress_valid = batch.get('trajectory_valid', action_valid).to(device)
-                        progress_result = model.progress_head(
+                        progress_result = model_module.progress_head(
                             output['llm_tokens'],  # 传入完整序列 (B, seq_len, D)
                             gt_progress=gt_progress,
                             action_valid=progress_valid,
@@ -1984,8 +2121,8 @@ def validate(
                         )
                         progress_loss = progress_result['loss']
                 # Legacy Stop Head
-                elif hasattr(model, 'stop_head') and model.stop_head is not None and 'stop_logits' in output:
-                    stop_loss = model.stop_head.compute_loss(
+                elif hasattr(model_module, 'stop_head') and model_module.stop_head is not None and 'stop_logits' in output:
+                    stop_loss = model_module.stop_head.compute_loss(
                         output['stop_logits'],
                         is_stop,
                         action_valid
@@ -2034,9 +2171,9 @@ def validate(
                         total_heatmap_mse += batch_mse
                         num_heatmap_mse_batches += 1
                     
-                    if num_batches <= num_vis_batches and vis_dir is not None:
+                    if dist_context.is_main and num_batches <= num_vis_batches and vis_dir is not None:
                         vis_path = visualize_heatmap_predictions(
-                            model=model,
+                            model=model_module,
                             batch=batch,
                             output=vis_output,
                             epoch=epoch,
@@ -2058,17 +2195,34 @@ def validate(
                 except Exception as e:
                     logger.warning(f"Validation inference/visualization failed: {e}")
     
-    avg_loss = total_loss / max(num_batches, 1)
-    avg_hm = total_heatmap_loss / max(num_batches, 1)
-    avg_act = total_action_loss / max(num_batches, 1)
-    avg_stop = total_stop_loss / max(num_batches, 1)
-    avg_hm_mse = total_heatmap_mse / max(num_heatmap_mse_batches, 1) if num_heatmap_mse_batches > 0 else 0.0
+    totals = torch.tensor(
+        [
+            total_loss,
+            total_heatmap_loss,
+            total_action_loss,
+            total_stop_loss,
+            total_heatmap_mse,
+            float(num_batches),
+            float(num_heatmap_mse_batches),
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    _dist_all_reduce_in_place(totals)
+
+    reduced_num_batches = max(int(totals[5].item()), 1)
+    reduced_num_heatmap_mse_batches = int(totals[6].item())
+    avg_loss = (totals[0] / reduced_num_batches).item()
+    avg_hm = (totals[1] / reduced_num_batches).item()
+    avg_act = (totals[2] / reduced_num_batches).item()
+    avg_stop = (totals[3] / reduced_num_batches).item()
+    avg_hm_mse = (totals[4] / max(reduced_num_heatmap_mse_batches, 1)).item() if reduced_num_heatmap_mse_batches > 0 else 0.0
     
     # 注意：TensorBoard 记录移至主循环中使用 global_epoch_counter
     # 避免多阶段训练时 epoch 重复导致数据覆盖
     
-    if num_heatmap_mse_batches > 0:
-        logger.info(f"  📊 Heatmap 推理 MSE (采样 {num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
+    if reduced_num_heatmap_mse_batches > 0:
+        logger.info(f"  📊 Heatmap 推理 MSE (采样 {reduced_num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
     
     return {
         'val_loss': avg_loss,
@@ -2379,29 +2533,47 @@ def main():
                         help='只构建模型和数据，不实际训练')
     parser.add_argument('--max-batches', type=int, default=None,
                         help='每个 epoch 最多处理的 batch 数')
+    parser.add_argument('--distributed', action='store_true',
+                        help='启用 DDP（需配合 torchrun；也可在配置 gpu.multi_gpu.enabled 中开启）')
     
     args = parser.parse_args()
     
     # 加载配置
     cfg = load_config(args.config)
+    if args.distributed:
+        cfg.setdefault('gpu', {}).setdefault('multi_gpu', {})['enabled'] = True
+
+    dist_context = init_distributed_context(cfg)
+    cfg.setdefault('model', {})['device'] = str(dist_context.device)
     set_seed(cfg['seed'])
     
     # ==================== 输出目录结构（每次训练独立文件夹）====================
     base_out_dir = Path(cfg['log']['out_dir'])
-    base_out_dir.mkdir(parents=True, exist_ok=True)
+    if dist_context.is_main:
+        base_out_dir.mkdir(parents=True, exist_ok=True)
 
     latest_link = base_out_dir / 'latest'
+    run_dir = None
     is_resuming = False
-    if args.auto_resume and latest_link.exists():
-        run_dir = latest_link.resolve() if latest_link.is_symlink() else latest_link
-        if _find_resume_checkpoint(run_dir) is not None:
-            is_resuming = True
-            print(f"🔄 断点续训: 继续使用 {run_dir.name}")
+    if dist_context.is_main:
+        if args.auto_resume and latest_link.exists():
+            run_dir = latest_link.resolve() if latest_link.is_symlink() else latest_link
+            if _find_resume_checkpoint(run_dir) is not None:
+                is_resuming = True
+                print(f"🔄 断点续训: 继续使用 {run_dir.name}")
+            else:
+                run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                run_dir = base_out_dir / f'run_{run_timestamp}'
+                print(f"📁 新训练: {run_dir.name}")
         else:
             run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             run_dir = base_out_dir / f'run_{run_timestamp}'
-            print(f"📁 新训练: {run_dir.name}")
-    else:
+    if dist_context.enabled:
+        shared = [str(run_dir) if run_dir is not None else "", bool(is_resuming)]
+        dist.broadcast_object_list(shared, src=0)
+        run_dir = Path(shared[0])
+        is_resuming = bool(shared[1])
+    elif run_dir is None:
         run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = base_out_dir / f'run_{run_timestamp}'
 
@@ -2414,41 +2586,49 @@ def main():
     tb_run_dir = run_dir / 'tensorboard'
     metrics_jsonl_path = logs_dir / 'metrics.jsonl'
 
-    for d in [manifest_dir, logs_dir, ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    _safe_symlink(latest_link, run_dir.name)
+    if dist_context.is_main:
+        for d in [manifest_dir, logs_dir, ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+        _safe_symlink(latest_link, run_dir.name)
+    _dist_barrier()
 
     logger = setup_logger(
-        name=f"train.{run_dir.name}",
-        level=cfg['log'].get('log_level', 'INFO'),
-        log_file=str(logs_dir / 'train.log'),
+        name=f"train.{run_dir.name}.r{dist_context.rank}",
+        level=cfg['log'].get('log_level', 'INFO') if dist_context.is_main else 'WARNING',
+        log_file=str(logs_dir / 'train.log') if dist_context.is_main else None,
     )
-    logger.info(f"📁 Output: {run_dir}")
-    logger.info(f"   Latest: {latest_link} → {run_dir.name}")
-    logger.info(f"   Logs: {logs_dir}")
-    logger.info(f"   Checkpoints: {ckpt_dir}")
+    if dist_context.is_main:
+        logger.info(f"📁 Output: {run_dir}")
+        logger.info(f"   Latest: {latest_link} → {run_dir.name}")
+        logger.info(f"   Logs: {logs_dir}")
+        logger.info(f"   Checkpoints: {ckpt_dir}")
+        if dist_context.enabled:
+            logger.info(
+                f"   DDP: enabled=True, world_size={dist_context.world_size}, local_rank={dist_context.local_rank}, device={dist_context.device}"
+            )
 
-    _write_yaml(manifest_dir / "config.yaml", cfg)
-    _write_json(manifest_dir / "args.json", vars(args))
-    _write_json(manifest_dir / "git.json", _capture_git_state(project_root))
-    _write_json(
-        manifest_dir / "env.json",
-        _capture_env_state(args=args, run_dir=run_dir, cfg=cfg, is_resuming=is_resuming),
-    )
-    _append_jsonl(
-        metrics_jsonl_path,
-        {
-            "record_type": "run_start",
-            "run_name": run_dir.name,
-            "is_resuming": is_resuming,
-            "output_dir": str(run_dir),
-        },
-    )
+        _write_yaml(manifest_dir / "config.yaml", cfg)
+        _write_json(manifest_dir / "args.json", vars(args))
+        _write_json(manifest_dir / "git.json", _capture_git_state(project_root))
+        _write_json(
+            manifest_dir / "env.json",
+            _capture_env_state(args=args, run_dir=run_dir, cfg=cfg, is_resuming=is_resuming),
+        )
+        _append_jsonl(
+            metrics_jsonl_path,
+            {
+                "record_type": "run_start",
+                "run_name": run_dir.name,
+                "is_resuming": is_resuming,
+                "output_dir": str(run_dir),
+                "distributed": dist_context.enabled,
+                "world_size": dist_context.world_size,
+            },
+        )
 
     # ==================== TensorBoard ====================
     tb_writer = None
-    if cfg['log'].get('use_tensorboard', False):
+    if dist_context.is_main and cfg['log'].get('use_tensorboard', False):
         tb_base_cfg = cfg['log'].get('tensorboard_dir')
         live_tb_dir = Path(tb_base_cfg) if tb_base_cfg else tb_run_dir
         if not is_resuming:
@@ -2461,6 +2641,8 @@ def main():
         logger.info(f"📊 TensorBoard: {tb_run_dir}")
         logger.info(f"   实时监控目录: {live_tb_dir}")
         logger.info(f"   autodl入口: tensorboard --logdir {live_tb_dir}")
+    if not dist_context.is_main:
+        metrics_jsonl_path = None
     
     loss_cfg = cfg['loss']
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
@@ -2581,7 +2763,7 @@ def main():
     
     # 构建模型
     logger.info("🏗️  Building model...")
-    model = build_model(cfg)
+    model = build_model(cfg, verbose=dist_context.is_main)
     
     # 创建检查点管理器
     ckpt_manager = CheckpointManager(
@@ -2590,10 +2772,10 @@ def main():
     )
     
     # 创建通知器
-    notifier = create_notifier(cfg)
+    notifier = create_notifier(cfg) if dist_context.is_main else None
     
     # 创建训练曲线绘制器
-    plotter = TrainingPlotter(out_dir=plots_dir)
+    plotter = TrainingPlotter(out_dir=plots_dir) if dist_context.is_main else None
     
     # 仅加载模型权重（不恢复训练状态）
     if args.load_weights:
@@ -2718,11 +2900,26 @@ def main():
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
     
     persistent_workers = num_workers > 0
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=dist_context.world_size,
+        rank=dist_context.rank,
+        shuffle=True,
+        drop_last=True,
+    ) if dist_context.enabled else None
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=dist_context.world_size,
+        rank=dist_context.rank,
+        shuffle=False,
+        drop_last=False,
+    ) if dist_context.enabled else None
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg['optim']['batch_size'],
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=cfg['data']['pin_memory'],
         collate_fn=actual_collate_fn,
@@ -2741,6 +2938,7 @@ def main():
         val_dataset,
         batch_size=cfg['optim']['batch_size'],
         shuffle=False,
+        sampler=val_sampler,
         num_workers=val_num_workers,
         pin_memory=cfg['data']['pin_memory'],
         collate_fn=actual_collate_fn,
@@ -2755,32 +2953,37 @@ def main():
         else:
             logger.info("   ✅ Dynamic sampling enabled (workers rebuilt each epoch to reclaim memory)")
     logger.info(f"   🧠 Memory config: num_workers={num_workers}, prefetch={prefetch_factor}, persistent={persistent_workers}")
+    if dist_context.enabled:
+        logger.info(
+            f"   🔀 DistributedSampler enabled: world_size={dist_context.world_size}, rank={dist_context.rank}"
+        )
     
     # ⚠️ 强制加载 Qwen3.5（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
     # 否则 LoRA 参数（懒加载，首次前向才创建）不会被 optimizer 捕获
-    if hasattr(model, 'qwen3_5') and hasattr(model.qwen3_5, '_load_model'):
-        if model.qwen3_5.model is None:
+    raw_model = model
+    if hasattr(raw_model, 'qwen3_5') and hasattr(raw_model.qwen3_5, '_load_model'):
+        if raw_model.qwen3_5.model is None:
             logger.info("🔄 Pre-loading Qwen3.5 (ensure LoRA params available for optimizer)...")
-            model.qwen3_5._load_model()
+            raw_model.qwen3_5._load_model()
         logger.info(
             "   🧠 Qwen attention implementation: %s",
-            getattr(model.qwen3_5.config, 'attn_implementation', 'unknown'),
+            getattr(raw_model.qwen3_5.config, 'attn_implementation', 'unknown'),
         )
-    if getattr(model.config, 'enable_heatmap', False):
+    if getattr(raw_model.config, 'enable_heatmap', False):
         logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")
-        model._ensure_heatmap_vln()
+        raw_model._ensure_heatmap_vln()
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
-    set_trainable_modules(model, stage_cfg, logger)
+    set_trainable_modules(raw_model, stage_cfg, logger)
     
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in raw_model.parameters())
+    trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     logger.info(f"  Total params: {total_params:,}")
     logger.info(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
     
     # 构建优化器和调度器
-    optimizer = build_optimizer(model, cfg, stage_cfg)
+    optimizer = build_optimizer(raw_model, cfg, stage_cfg)
     grad_accum_steps = cfg['optim'].get('grad_accum_steps', 1)
     total_batches = len(train_loader) * total_epochs
     total_steps = total_batches // grad_accum_steps
@@ -2791,7 +2994,7 @@ def main():
     
     if resume_path and Path(resume_path).exists():
         load_checkpoint_for_resume(
-            str(resume_path), model, 
+            str(resume_path), raw_model, 
             optimizer=optimizer, 
             scheduler=scheduler, 
             scaler=scaler,
@@ -2824,7 +3027,7 @@ def main():
         gpu_heatmap_computer = GPUHeatmapComputer(
             hm_size=hm_size,
             img_size=img_size,
-            device='cuda',
+            device=str(dist_context.device),
         )
         gpu_depth_normalized = not getattr(train_dataset, 'depth_is_meters', False)
         gpu_has_depth = getattr(train_dataset, 'load_depth', True)
@@ -2839,8 +3042,17 @@ def main():
     # 用参数的滑动平均做推理，减少训练波动，提升泛化
     ema_decay = cfg.get('optim', {}).get('ema_decay', 0.999)
     ema_warmup = cfg.get('optim', {}).get('ema_warmup_steps', 2000)
-    ema = EMAModel(model, decay=ema_decay, warmup_steps=ema_warmup)
+    ema = EMAModel(raw_model, decay=ema_decay, warmup_steps=ema_warmup)
     logger.info(f"📐 EMA enabled: decay={ema_decay}, warmup_steps={ema_warmup}")
+
+    if dist_context.enabled:
+        ddp_cfg = cfg.get('gpu', {}).get('multi_gpu', {})
+        model = DDP(
+            raw_model,
+            device_ids=[dist_context.device.index],
+            output_device=dist_context.device.index,
+            find_unused_parameters=ddp_cfg.get('find_unused_parameters', False),
+        )
     
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
@@ -2855,6 +3067,8 @@ def main():
         if uses_dynamic_sampling:
             train_dataset.set_epoch(epoch)
             logger.info(f"   🔄 Resampled {len(train_dataset)} samples for epoch {epoch} (persistent workers)")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         
         logger.info("=" * 80)
         logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
@@ -2873,6 +3087,7 @@ def main():
             ema=ema,
             metrics_jsonl_path=metrics_jsonl_path,
             total_train_steps=total_steps,
+            dist_context=dist_context,
         )
         
         timer.end_epoch()
@@ -2892,6 +3107,7 @@ def main():
                 gpu_has_depth=gpu_has_depth,
                 gpu_depth_normalized=gpu_depth_normalized,
                 heatmap_temperature=train_metrics.get('heatmap_temperature'),
+                dist_context=dist_context,
             )
         
         # 🧹 验证后再次清理内存
@@ -2932,30 +3148,32 @@ def main():
         global_epoch_counter += 1
         current_lr = scheduler.get_last_lr()[0] if scheduler else 0
 
-        _append_jsonl(
-            metrics_jsonl_path,
-            {
-                "record_type": "epoch_summary",
-                "epoch": epoch,
-                "global_epoch": global_epoch_counter,
-                "stage": stage_name,
-                "is_best": is_best,
-                "learning_rate": current_lr,
-                "train": train_metrics,
-                "val": val_metrics,
-                "epoch_time": timer.get_epoch_time(),
-                "eta": eta,
-            },
-        )
+        if dist_context.is_main:
+            _append_jsonl(
+                metrics_jsonl_path,
+                {
+                    "record_type": "epoch_summary",
+                    "epoch": epoch,
+                    "global_epoch": global_epoch_counter,
+                    "stage": stage_name,
+                    "is_best": is_best,
+                    "learning_rate": current_lr,
+                    "train": train_metrics,
+                    "val": val_metrics,
+                    "epoch_time": timer.get_epoch_time(),
+                    "eta": eta,
+                },
+            )
         
-        plotter.update(
-            epoch=global_epoch_counter,
-            stage_name=stage_name,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            lr=current_lr,
-            is_best=is_best,
-        )
+        if plotter is not None:
+            plotter.update(
+                epoch=global_epoch_counter,
+                stage_name=stage_name,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                lr=current_lr,
+                is_best=is_best,
+            )
         
         # 记录 epoch 级别的 loss 到 TensorBoard
         if tb_writer is not None:
@@ -3017,19 +3235,21 @@ def main():
         
         if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
             # 使用 EMA 参数保存（推理时直接使用，无需额外处理）
-            with ema.apply():
-                ckpt_manager.save(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    epoch=epoch,
-                    stage_idx=0,
-                    stage_name=stage_name,
-                    metrics={**train_metrics, **val_metrics},
-                    cfg=cfg,
-                    is_best=is_best,
-                    scaler=scaler,
-                )
+            if dist_context.is_main:
+                with ema.apply():
+                    ckpt_manager.save(
+                        model=raw_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        stage_idx=0,
+                        stage_name=stage_name,
+                        metrics={**train_metrics, **val_metrics},
+                        cfg=cfg,
+                        is_best=is_best,
+                        scaler=scaler,
+                    )
+            _dist_barrier()
         
         if no_improve_count >= patience:
             logger.info(f"  🛑 Early stopping")
@@ -3041,7 +3261,7 @@ def main():
     logger.info("✅ 训练完成！")
     logger.info("=" * 60)
     
-    summary = plotter.get_summary()
+    summary = plotter.get_summary() if plotter is not None else {}
     if summary:
         logger.info(f"📊 训练摘要:")
         logger.info(f"   总 Epochs: {summary.get('total_epochs', 'N/A')}")
@@ -3055,16 +3275,17 @@ def main():
         "best_val_loss_runtime": best_val_loss,
         "run_dir": str(run_dir),
     }
-    _write_json(manifest_dir / "summary.json", final_summary)
-    _append_jsonl(
-        metrics_jsonl_path,
-        {
-            "record_type": "run_complete",
-            "summary": final_summary,
-            "elapsed_time": timer.get_total_elapsed(),
-            "best_val_loss": best_val_loss,
-        },
-    )
+    if dist_context.is_main:
+        _write_json(manifest_dir / "summary.json", final_summary)
+        _append_jsonl(
+            metrics_jsonl_path,
+            {
+                "record_type": "run_complete",
+                "summary": final_summary,
+                "elapsed_time": timer.get_total_elapsed(),
+                "best_val_loss": best_val_loss,
+            },
+        )
     
     # 发送训练完成通知
     if notifier:
@@ -3080,6 +3301,7 @@ def main():
     
     if tb_writer is not None:
         tb_writer.close()
+    cleanup_distributed()
 
 
 if __name__ == '__main__':
