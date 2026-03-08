@@ -5,7 +5,7 @@
 #   - DPTLiteFusion: multi-layer ViT feature fusion (16x16)
 #   - FineLocalization: FiLM modulation + CNN upsample (64x64)
 #   - HeatmapVLN: complete model assembly
-#   - HeatmapVLNLoss: three-component loss
+#   - HeatmapVLNLoss: four-component task-priority loss
 
 from .heatmap_vln import HeatmapVLN
 from .heatmap_vln_loss import HeatmapVLNLoss

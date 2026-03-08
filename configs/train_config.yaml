@@ -74,7 +74,8 @@ model:
     image_size: 256
     # 损失权重
     lambda_vis: 1.0
-    lambda_pos: 1.0
+    lambda_coord: 5.0
+    lambda_kl: 1.0
     lambda_neg: 0.1
 
   # 动作头配置
@@ -169,8 +170,10 @@ loss:
   
   heatmap_vln:
     lambda_vis: 1.0
-    lambda_pos: 1.0
+    lambda_coord: 5.0
+    lambda_kl: 1.0
     lambda_neg: 0.1
+    temperature: 3.0
   
   # 各头损失权重
   heatmap_weight: 1.0

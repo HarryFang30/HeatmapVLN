@@ -788,7 +788,8 @@ def build_model(cfg: Dict) -> nn.Module:
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
-        heatmap_lambda_pos=heatmap_cfg.get('lambda_pos', 1.0),
+        heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 5.0),
+        heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
         heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 0.1),
         
         # LoRA configuration
@@ -1123,8 +1124,14 @@ def train_one_epoch(
     from src.models.heatmap import HeatmapVLNLoss
     hm_loss_fn = HeatmapVLNLoss(
         lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-        lambda_pos=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 5.0),
+        lambda_kl=cfg.get('loss', {}).get('heatmap_vln', {}).get(
+            'lambda_kl',
+            cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+        ),
         lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
+        temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
+        heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
     
     total_batches = len(train_loader)
@@ -1775,8 +1782,14 @@ def validate(
     from src.models.heatmap import HeatmapVLNLoss
     hm_loss_fn = HeatmapVLNLoss(
         lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-        lambda_pos=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 5.0),
+        lambda_kl=cfg.get('loss', {}).get('heatmap_vln', {}).get(
+            'lambda_kl',
+            cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
+        ),
         lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
+        temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
+        heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
     
     # 验证推理 batch 数限制：只对前 N 个 batch 做完整推理计算 heatmap MSE

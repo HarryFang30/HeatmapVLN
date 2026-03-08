@@ -82,7 +82,8 @@ class VLNPipelineConfig:
 
     # HeatmapVLNLoss weights
     heatmap_lambda_vis: float = 1.0
-    heatmap_lambda_pos: float = 1.0
+    heatmap_lambda_coord: float = 5.0
+    heatmap_lambda_kl: float = 1.0
     heatmap_lambda_neg: float = 0.1
 
     # ==================== Action Head ====================

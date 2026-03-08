@@ -195,7 +195,8 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', data_cfg['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', data_cfg['image_size'][0]),
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
-        heatmap_lambda_pos=heatmap_cfg.get('lambda_pos', 1.0),
+        heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 5.0),
+        heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
         heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 0.1),
         
         # LoRA
