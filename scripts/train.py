@@ -23,6 +23,11 @@ sys.path.insert(0, str(project_root))
 
 import yaml
 import torch
+import json
+import platform
+import socket
+import subprocess
+import shutil
 
 # ============================================
 # CUDA 性能优化
@@ -423,8 +428,8 @@ class TrainingPlotter:
         
         return {
             'total_epochs': len(self.history['epoch']),
-            'best_epoch': self.history['epoch'][best_idx] if best_idx else None,
-            'best_val_loss': best_val if best_idx else None,
+            'best_epoch': self.history['epoch'][best_idx] if best_idx is not None else None,
+            'best_val_loss': best_val if best_idx is not None else None,
             'final_train_loss': self.history['train_loss'][-1],
             'final_val_loss': self.history['val_loss'][-1],
         }
@@ -1094,6 +1099,7 @@ def train_one_epoch(
     gpu_has_depth: bool = False,
     gpu_depth_normalized: bool = True,
     ema: Optional[EMAModel] = None,
+    metrics_jsonl_path: Optional[Path] = None,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     
@@ -1412,6 +1418,26 @@ def train_one_epoch(
                         ) if enable_timing else ""
                     )
                 )
+                if metrics_jsonl_path is not None:
+                    _append_jsonl(
+                        metrics_jsonl_path,
+                        {
+                            "record_type": "train_step",
+                            "stage": stage_name,
+                            "epoch": epoch,
+                            "batch": i + 1,
+                            "global_step": global_step,
+                            "loss": loss.item() * grad_accum_steps,
+                            "heatmap_loss": heatmap_loss.item(),
+                            "trajectory_loss": trajectory_loss.item(),
+                            "progress_loss": progress_loss.item(),
+                            "gpu_memory_gb": mem_alloc,
+                            "lrs": {
+                                optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
+                                for gi, lr_val in enumerate(all_lrs)
+                            },
+                        },
+                    )
                 
             if tb_writer is not None:
                 actual_step = global_step_offset + global_step
@@ -2013,9 +2039,6 @@ class CheckpointManager:
         scaler: GradScaler = None,
     ) -> Path:
         """保存检查点"""
-        stage_dir = self.out_dir / stage_name
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        
         trainable_params = set()
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -2040,8 +2063,8 @@ class CheckpointManager:
         
         if scaler is not None:
             ckpt['scaler_state_dict'] = scaler.state_dict()
-        
-        ckpt_path = stage_dir / f"e{epoch:03d}.pth"
+
+        ckpt_path = self.out_dir / f"epoch_{epoch:03d}.pth"
         torch.save(ckpt, ckpt_path)
         file_size_mb = ckpt_path.stat().st_size / (1024**2)
         print(f"💾 Saved: {ckpt_path.name} ({file_size_mb:.1f} MB)")
@@ -2058,14 +2081,14 @@ class CheckpointManager:
         
         latest_path = self.out_dir / "latest.pth"
         torch.save(ckpt, latest_path)
-        
-        self._cleanup_old_ckpts(stage_dir)
+
+        self._cleanup_old_ckpts()
         
         return ckpt_path
     
-    def _cleanup_old_ckpts(self, stage_dir: Path):
+    def _cleanup_old_ckpts(self):
         """清理旧的检查点"""
-        ckpts = sorted(stage_dir.glob("epoch_*.pth"), key=lambda p: p.stat().st_mtime)
+        ckpts = sorted(self.out_dir.glob("epoch_*.pth"), key=lambda p: p.stat().st_mtime)
         while len(ckpts) > self.max_ckpts:
             old_ckpt = ckpts.pop(0)
             old_ckpt.unlink()
@@ -2080,12 +2103,18 @@ class CheckpointManager:
     def get_latest(self) -> Optional[Path]:
         """获取最新检查点路径"""
         latest = self.out_dir / "latest.pth"
-        return latest if latest.exists() else None
+        if latest.exists():
+            return latest
+        legacy_latest = self.out_dir.parent / "ckpts" / "latest.pth"
+        return legacy_latest if legacy_latest.exists() else None
     
     def get_best(self) -> Optional[Path]:
         """获取最佳检查点路径"""
         best = self.out_dir / "best.pth"
-        return best if best.exists() else None
+        if best.exists():
+            return best
+        legacy_best = self.out_dir.parent / "ckpts" / "best.pth"
+        return legacy_best if legacy_best.exists() else None
 
 
 def load_checkpoint_for_resume(
@@ -2144,6 +2173,115 @@ def load_checkpoint_for_resume(
     }
 
 
+def _make_json_safe(value: Any) -> Any:
+    """Convert common training objects into JSON-serializable values."""
+    if isinstance(value, dict):
+        return {str(k): _make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    return value
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_make_json_safe(payload), f, indent=2, ensure_ascii=False)
+
+
+def _write_yaml(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"timestamp": datetime.now().isoformat(), **_make_json_safe(payload)}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _safe_symlink(link_path: Path, target: Any) -> None:
+    if link_path.is_symlink() or link_path.exists():
+        if link_path.is_dir() and not link_path.is_symlink():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink()
+    link_path.symlink_to(target)
+
+
+def _run_git_command(project_dir: Path, args: List[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=project_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _capture_git_state(project_dir: Path) -> Dict[str, Any]:
+    commit = _run_git_command(project_dir, ["rev-parse", "HEAD"])
+    short_commit = _run_git_command(project_dir, ["rev-parse", "--short", "HEAD"])
+    branch = _run_git_command(project_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
+    status_short = _run_git_command(project_dir, ["status", "--short"])
+    return {
+        "commit": commit or None,
+        "short_commit": short_commit or None,
+        "branch": branch or None,
+        "is_dirty": bool(status_short),
+        "status_short": status_short.splitlines() if status_short else [],
+    }
+
+
+def _capture_env_state(
+    args: argparse.Namespace,
+    run_dir: Path,
+    cfg: Dict[str, Any],
+    is_resuming: bool,
+) -> Dict[str, Any]:
+    return {
+        "run_dir": str(run_dir),
+        "is_resuming": is_resuming,
+        "argv": sys.argv,
+        "config_path": args.config,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "configured_device": cfg.get("model", {}).get("device", "cuda"),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+def _find_resume_checkpoint(run_dir: Path) -> Optional[Path]:
+    candidates = [
+        run_dir / "checkpoints" / "latest.pth",
+        run_dir / "ckpts" / "latest.pth",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 # ============================================
 # 主函数
 # ============================================
@@ -2176,103 +2314,85 @@ def main():
     # ==================== 输出目录结构（每次训练独立文件夹）====================
     base_out_dir = Path(cfg['log']['out_dir'])
     base_out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     latest_link = base_out_dir / 'latest'
     is_resuming = False
-    
-    # 判断是否断点续训
     if args.auto_resume and latest_link.exists():
-        # 断点续训：使用之前的运行目录
-        if latest_link.is_symlink():
-            run_dir = base_out_dir / latest_link.resolve().name
-        else:
-            run_dir = latest_link
-        
-        # 检查是否有可恢复的检查点
-        ckpt_dir_check = run_dir / 'ckpts'
-        latest_ckpt = ckpt_dir_check / 'latest.pth' if ckpt_dir_check.exists() else None
-        if latest_ckpt and latest_ckpt.exists():
+        run_dir = latest_link.resolve() if latest_link.is_symlink() else latest_link
+        if _find_resume_checkpoint(run_dir) is not None:
             is_resuming = True
             print(f"🔄 断点续训: 继续使用 {run_dir.name}")
         else:
-            # 没有可恢复的检查点，创建新目录
             run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             run_dir = base_out_dir / f'run_{run_timestamp}'
             print(f"📁 新训练: {run_dir.name}")
     else:
-        # 新训练：创建新的运行目录
         run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = base_out_dir / f'run_{run_timestamp}'
-    
-    run_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 更新 'latest' 符号链接
-    if latest_link.is_symlink() or latest_link.exists():
-        latest_link.unlink()
-    latest_link.symlink_to(run_dir.name)
-    
-    # 子目录
-    ckpt_dir = run_dir / 'ckpts'
-    vis_train_dir = run_dir / 'vis' / 'train'
-    vis_val_dir = run_dir / 'vis' / 'val'
+
+    manifest_dir = run_dir / 'manifest'
+    logs_dir = run_dir / 'logs'
+    ckpt_dir = run_dir / 'checkpoints'
+    vis_train_dir = run_dir / 'visualizations' / 'train'
+    vis_val_dir = run_dir / 'visualizations' / 'val'
     plots_dir = run_dir / 'plots'
-    
-    for d in [ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
+    tb_run_dir = run_dir / 'tensorboard'
+    metrics_jsonl_path = logs_dir / 'metrics.jsonl'
+
+    for d in [manifest_dir, logs_dir, ckpt_dir, vis_train_dir, vis_val_dir, plots_dir, tb_run_dir]:
         d.mkdir(parents=True, exist_ok=True)
-    
-    # 设置日志
-    logger = setup_logger(str(run_dir / 'train.log'))
+
+    _safe_symlink(latest_link, run_dir.name)
+
+    logger = setup_logger(
+        name=f"train.{run_dir.name}",
+        level=cfg['log'].get('log_level', 'INFO'),
+        log_file=str(logs_dir / 'train.log'),
+    )
     logger.info(f"📁 Output: {run_dir}")
     logger.info(f"   Latest: {latest_link} → {run_dir.name}")
-    
+    logger.info(f"   Logs: {logs_dir}")
+    logger.info(f"   Checkpoints: {ckpt_dir}")
+
+    _write_yaml(manifest_dir / "config.yaml", cfg)
+    _write_json(manifest_dir / "args.json", vars(args))
+    _write_json(manifest_dir / "git.json", _capture_git_state(project_root))
+    _write_json(
+        manifest_dir / "env.json",
+        _capture_env_state(args=args, run_dir=run_dir, cfg=cfg, is_resuming=is_resuming),
+    )
+    _append_jsonl(
+        metrics_jsonl_path,
+        {
+            "record_type": "run_start",
+            "run_name": run_dir.name,
+            "is_resuming": is_resuming,
+            "output_dir": str(run_dir),
+        },
+    )
+
     # ==================== TensorBoard ====================
     tb_writer = None
     if cfg['log'].get('use_tensorboard', False):
-        tb_base = Path(cfg['log'].get('tensorboard_dir', './runs'))
-        tb_base.mkdir(parents=True, exist_ok=True)
-        
-        tb_latest_link = tb_base / 'latest'
-        
-        # 从 run_dir 名字中提取时间戳 (run_YYYYMMDD_HHMMSS -> YYYYMMDD_HHMMSS)
-        run_dir_name = run_dir.name
-        if run_dir_name.startswith('run_'):
-            tb_timestamp = run_dir_name[4:]  # 去掉 "run_" 前缀
-        else:
-            tb_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        if is_resuming:
-            # 断点续训：使用之前的 TensorBoard 目录
-            tb_run_dir = tb_base / tb_timestamp
-            if not tb_run_dir.exists():
-                # 如果不存在，创建新目录
-                tb_run_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"🔄 TensorBoard: 继续使用 {tb_run_dir}")
-        else:
-            # 新训练：归档旧日志
-            tb_archive = Path(__file__).parent.parent / 'tf-logs-archive'
-            tb_archive.mkdir(parents=True, exist_ok=True)
-            
-            for old_dir in tb_base.iterdir():
-                if old_dir.is_dir() and old_dir.name != 'latest':
-                    # 移动旧目录到归档
-                    dest = tb_archive / old_dir.name
-                    if not dest.exists():
-                        import shutil
-                        shutil.move(str(old_dir), str(dest))
-                        logger.info(f"📦 归档旧TensorBoard: {old_dir.name} → tf-logs-archive/")
-            
-            # 创建新的运行目录
-            tb_run_dir = tb_base / tb_timestamp
-        
         tb_writer = SummaryWriter(log_dir=str(tb_run_dir))
-        
-        # 更新 'latest' 符号链接
-        if tb_latest_link.is_symlink() or tb_latest_link.exists():
-            tb_latest_link.unlink()
-        tb_latest_link.symlink_to(tb_run_dir.name)
-        
         logger.info(f"📊 TensorBoard: {tb_run_dir}")
-        logger.info(f"   只看当前: tensorboard --logdir {tb_latest_link}")
+
+        tb_base_cfg = cfg['log'].get('tensorboard_dir')
+        if tb_base_cfg:
+            tb_base = Path(tb_base_cfg)
+            tb_base.mkdir(parents=True, exist_ok=True)
+            compat_run_link = tb_base / run_dir.name
+            _safe_symlink(compat_run_link, tb_run_dir)
+            _safe_symlink(tb_base / 'latest', tb_run_dir)
+            logger.info(f"   兼容入口: tensorboard --logdir {tb_base / 'latest'}")
+
+            # 额外在 /root/tf-logs 下保留一份根级入口，方便 autodl 端口实时监控。
+            root_tb_base = Path("/root/tf-logs")
+            if root_tb_base.resolve() != tb_base.resolve():
+                root_tb_base.mkdir(parents=True, exist_ok=True)
+                _safe_symlink(root_tb_base / run_dir.name, tb_run_dir)
+                _safe_symlink(root_tb_base / 'latest', tb_run_dir)
+            logger.info(f"   autodl入口: tensorboard --logdir {root_tb_base / 'latest'}")
     
     loss_cfg = cfg['loss']
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
@@ -2433,11 +2553,11 @@ def main():
     
     if args.resume:
         if args.resume == 'latest':
-            resume_path = ckpt_manager.get_latest()
+            resume_path = _find_resume_checkpoint(run_dir) or ckpt_manager.get_latest()
         else:
             resume_path = Path(args.resume)
     elif args.auto_resume:
-        resume_path = ckpt_manager.get_latest()
+        resume_path = _find_resume_checkpoint(run_dir) or ckpt_manager.get_latest()
     
     if resume_path and Path(resume_path).exists():
         resume_info = load_checkpoint_for_resume(
@@ -2683,6 +2803,7 @@ def main():
             gpu_has_depth=gpu_has_depth,
             gpu_depth_normalized=gpu_depth_normalized,
             ema=ema,
+            metrics_jsonl_path=metrics_jsonl_path,
         )
         
         timer.end_epoch()
@@ -2740,6 +2861,22 @@ def main():
         
         global_epoch_counter += 1
         current_lr = scheduler.get_last_lr()[0] if scheduler else 0
+
+        _append_jsonl(
+            metrics_jsonl_path,
+            {
+                "record_type": "epoch_summary",
+                "epoch": epoch,
+                "global_epoch": global_epoch_counter,
+                "stage": stage_name,
+                "is_best": is_best,
+                "learning_rate": current_lr,
+                "train": train_metrics,
+                "val": val_metrics,
+                "epoch_time": timer.get_epoch_time(),
+                "eta": eta,
+            },
+        )
         
         plotter.update(
             epoch=global_epoch_counter,
@@ -2841,6 +2978,23 @@ def main():
         logger.info(f"   最佳 Epoch: {summary.get('best_epoch', 'N/A')}")
         if summary.get('best_val_loss'):
             logger.info(f"   最佳 val_loss: {summary.get('best_val_loss'):.4f}")
+
+    final_summary = {
+        **summary,
+        "elapsed_time": timer.get_total_elapsed(),
+        "best_val_loss_runtime": best_val_loss,
+        "run_dir": str(run_dir),
+    }
+    _write_json(manifest_dir / "summary.json", final_summary)
+    _append_jsonl(
+        metrics_jsonl_path,
+        {
+            "record_type": "run_complete",
+            "summary": final_summary,
+            "elapsed_time": timer.get_total_elapsed(),
+            "best_val_loss": best_val_loss,
+        },
+    )
     
     # 发送训练完成通知
     if notifier:

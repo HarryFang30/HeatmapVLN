@@ -195,7 +195,7 @@ log:
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs/heatmap_only
+  tensorboard_dir: /root/tf-logs
   enable_timing: false
   log_interval: 10
   show_gpu_memory: true
