@@ -82,9 +82,9 @@ class VLNPipelineConfig:
 
     # HeatmapVLNLoss weights
     heatmap_lambda_vis: float = 1.0
-    heatmap_lambda_coord: float = 5.0
+    heatmap_lambda_coord: float = 1.0
     heatmap_lambda_kl: float = 1.0
-    heatmap_lambda_neg: float = 0.1
+    heatmap_lambda_neg: float = 1.0
 
     # ==================== Action Head ====================
     action_head_type: str = "transformer"

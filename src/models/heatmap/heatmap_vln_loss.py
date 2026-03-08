@@ -4,9 +4,9 @@ HeatmapVLN Loss
 
 Task-priority loss for navigation-oriented heatmap prediction:
   1. Visibility BCE       — classify whether a history view is visible
-  2. Coordinate loss      — directly supervise peak location
+  2. Coordinate loss      — directly supervise peak location (soft-argmax)
   3. KL distribution loss — shape matching after normalization
-  4. Negative suppression — invisible views should stay near zero
+  4. Negative suppression — BCE per-pixel + max-activation penalty on invisible views
 
 Reference: HeatmapVLN设计文档 Section 8
 """
@@ -26,18 +26,18 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for positive-sample coordinate loss.
         lambda_kl: weight for positive-sample KL shape loss.
-        lambda_neg: weight for negative-sample suppression.
-        temperature: soft-argmax temperature.
+        lambda_neg: weight for negative-sample suppression (BCE + max penalty).
+        temperature: soft-argmax temperature (fixed, no annealing recommended).
         heatmap_size: expected heatmap resolution.
     """
 
     def __init__(
         self,
         lambda_vis: float = 1.0,
-        lambda_coord: float = 5.0,
+        lambda_coord: float = 1.0,
         lambda_kl: float = 1.0,
-        lambda_neg: float = 0.1,
-        temperature: float = 3.0,
+        lambda_neg: float = 1.0,
+        temperature: float = 1.0,
         heatmap_size: Tuple[int, int] = (64, 64),
     ):
         super().__init__()
@@ -198,10 +198,20 @@ class HeatmapVLNLoss(nn.Module):
             coord_loss = torch.tensor(0.0, device=device)
             kl_loss = torch.tensor(0.0, device=device)
 
-        # (4) Negative-sample suppression (invisible views should be all-zero)
+        # (4) Negative-sample suppression: BCE + max-activation penalty
+        #     BCE penalizes any deviation from zero more aggressively than L2
+        #     for small values (gradient ≈ 1/(1-p) vs 2p for L2).
+        #     Max penalty directly targets the brightest false positive per view.
         neg_mask = ~pos_mask
         if neg_mask.any():
-            neg_loss = pred_heatmaps[neg_mask].float().square().mean()
+            neg_pred = pred_heatmaps[neg_mask].float()
+            neg_bce = F.binary_cross_entropy(
+                neg_pred.clamp(1e-6, 1.0 - 1e-6),
+                torch.zeros_like(neg_pred),
+                reduction="mean",
+            )
+            neg_max = neg_pred.reshape(neg_pred.shape[0], -1).amax(dim=-1).mean()
+            neg_loss = neg_bce + neg_max
         else:
             neg_loss = torch.tensor(0.0, device=device)
 

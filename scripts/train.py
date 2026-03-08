@@ -964,9 +964,9 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
-        heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 5.0),
+        heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
-        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 0.1),
+        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 1.0),
         
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),
@@ -1256,7 +1256,7 @@ def build_scheduler(optimizer, cfg: Dict, total_steps: int):
 def get_heatmap_temperature(cfg: Dict, step: int, total_steps: int) -> float:
     """按优化步数返回当前 soft-argmax temperature。"""
     heatmap_loss_cfg = cfg.get('loss', {}).get('heatmap_vln', {})
-    base_temperature = float(heatmap_loss_cfg.get('temperature', 3.0))
+    base_temperature = float(heatmap_loss_cfg.get('temperature', 1.0))
     schedule_cfg = heatmap_loss_cfg.get('temperature_schedule', {})
 
     if not schedule_cfg or not schedule_cfg.get('enabled', False):
@@ -1405,13 +1405,13 @@ def train_one_epoch(
     from src.models.heatmap import HeatmapVLNLoss
     hm_loss_fn = HeatmapVLNLoss(
         lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 5.0),
+        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 1.0),
         lambda_kl=cfg.get('loss', {}).get('heatmap_vln', {}).get(
             'lambda_kl',
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
-        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
-        temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
+        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 1.0),
+        temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
     hm_loss_fn.set_temperature(
@@ -2109,13 +2109,13 @@ def validate(
     from src.models.heatmap import HeatmapVLNLoss
     hm_loss_fn = HeatmapVLNLoss(
         lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 5.0),
+        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 1.0),
         lambda_kl=cfg.get('loss', {}).get('heatmap_vln', {}).get(
             'lambda_kl',
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
-        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.1),
-        temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 3.0),
+        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 1.0),
+        temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
     
