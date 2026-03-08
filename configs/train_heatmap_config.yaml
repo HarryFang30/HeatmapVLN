@@ -192,7 +192,7 @@ log:
   out_dir: /root/autodl-tmp/heatmap_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
-  val_vis_batches: 2
+  val_vis_batches: 1
   max_ckpts: 5
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs/heatmap_only
@@ -214,3 +214,4 @@ validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
   patience: 5
+  val_inference_batches: 4

@@ -567,6 +567,64 @@ def _select_primary_heatmap_slice(heatmaps: torch.Tensor) -> torch.Tensor:
     return heatmaps
 
 
+def _get_trainable_params(model: nn.Module) -> List[torch.nn.Parameter]:
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _mean_timing(stats: Dict[str, float], count: int, key: str) -> float:
+    if count <= 0:
+        return 0.0
+    return stats.get(key, 0.0) / count
+
+
+def _format_qwen_internal_timing(stats: Dict[str, float], count: int) -> str:
+    if count <= 0:
+        return ""
+
+    def avg(key: str) -> float:
+        return _mean_timing(stats, count, key)
+
+    qwen_vis = avg('qwen_visual_encode_s')
+    qwen_lm = avg('qwen_language_model_s')
+    qwen_layers = avg('qwen_llm_layers_s')
+    qwen_full = avg('qwen_llm_full_attn_s')
+    qwen_linear = avg('qwen_llm_linear_attn_s')
+    qwen_mlp = avg('qwen_llm_mlp_s')
+    qwen_norm = avg('qwen_llm_norm_s')
+    qwen_patch = avg('qwen_visual_patch_embed_s')
+    qwen_pos = avg('qwen_visual_pos_embed_s')
+    qwen_rot = avg('qwen_visual_rotary_s')
+    qwen_blocks = avg('qwen_visual_blocks_s')
+    qwen_attn = avg('qwen_visual_attn_s')
+    qwen_vmlp = avg('qwen_visual_mlp_s')
+    qwen_vnorm = avg('qwen_visual_norm_s')
+    qwen_merger = avg('qwen_visual_merger_s')
+
+    sections = []
+    if any(v > 0 for v in [qwen_vis, qwen_lm, qwen_layers, qwen_full, qwen_linear, qwen_mlp, qwen_norm]):
+        qwen_nonlayer = max(qwen_lm - qwen_layers, 0.0)
+        qwen_lres = max(qwen_layers - qwen_full - qwen_linear - qwen_mlp - qwen_norm, 0.0)
+        qwen_residual = max(avg('qwen_forward_s') - qwen_vis - qwen_lm, 0.0)
+        sections.append(
+            f"Q[s] vis={qwen_vis:.3f} lm={qwen_lm:.3f} layers={qwen_layers:.3f} "
+            f"full={qwen_full:.3f} linear={qwen_linear:.3f} mlp={qwen_mlp:.3f} "
+            f"norm={qwen_norm:.3f} lres={qwen_lres:.3f} nonlayer={qwen_nonlayer:.3f} "
+            f"residual={qwen_residual:.3f}"
+        )
+
+    if any(v > 0 for v in [qwen_patch, qwen_pos, qwen_rot, qwen_blocks, qwen_attn, qwen_vmlp, qwen_vnorm, qwen_merger]):
+        qwen_vres = max(qwen_blocks - qwen_attn - qwen_vmlp - qwen_vnorm, 0.0)
+        qwen_vnon = max(qwen_vis - qwen_patch - qwen_pos - qwen_rot - qwen_blocks - qwen_merger, 0.0)
+        sections.append(
+            f"QV[s] patch={qwen_patch:.3f} pos={qwen_pos:.3f} rot={qwen_rot:.3f} "
+            f"blocks={qwen_blocks:.3f} attn={qwen_attn:.3f} mlp={qwen_vmlp:.3f} "
+            f"norm={qwen_vnorm:.3f} merger={qwen_merger:.3f} vres={qwen_vres:.3f} "
+            f"vnon={qwen_vnon:.3f}"
+        )
+
+    return " | ".join(sections)
+
+
 # ============================================
 # 配置加载与工具函数
 # ============================================
@@ -1056,6 +1114,19 @@ def train_one_epoch(
     
     global_step = 0
     valid_batch_count = 0
+    timing_stats = {
+        'data_wait_s': 0.0,
+        'gt_s': 0.0,
+        'forward_s': 0.0,
+        'backward_s': 0.0,
+        'optimizer_s': 0.0,
+        'prepare_inputs_s': 0.0,
+        'qwen_forward_s': 0.0,
+        'heatmap_decode_s': 0.0,
+        'pipeline_qwen_total_s': 0.0,
+    }
+    profiled_steps = 0
+    prev_step_end = time.perf_counter()
     
     # 同步 diffusion head 的推理计数器，确保与 global_step 对齐
     # _training_step_counter 每 batch +1, global_step 每 grad_accum_steps batch +1
@@ -1073,6 +1144,8 @@ def train_one_epoch(
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
+        loop_start = time.perf_counter()
+        timing_stats['data_wait_s'] += max(loop_start - prev_step_end, 0.0)
         
         history_frames = batch['history_frames']
         current_frame = batch['current_frame']
@@ -1083,6 +1156,7 @@ def train_one_epoch(
         is_stop = batch['is_stop'].to(device)
         text = batch['text']
         
+        gt_start = time.perf_counter()
         # GPU 热力图计算（如果启用）
         if _should_use_gpu_gt(batch, gpu_heatmap_computer):
             history_poses = batch['history_poses'].to(device)  # [B, K, 4, 4]
@@ -1108,8 +1182,10 @@ def train_one_epoch(
                             gt_heatmap[b_idx] = gt_heatmap[b_idx].flip(dims=[-1])
         else:
             gt_heatmap = batch['heatmap'].to(device)
+        timing_stats['gt_s'] += time.perf_counter() - gt_start
         
         # 前向传播
+        forward_start = time.perf_counter()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             # Build video_frames from history only. Append a duplicate of the
             # last history frame as placeholder; pipeline.forward() ignores it
@@ -1233,16 +1309,27 @@ def train_one_epoch(
             
             loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
             loss = loss / grad_accum_steps
+        timing_stats['forward_s'] += time.perf_counter() - forward_start
+        profiled_steps += 1
+
+        metadata = output.get('processing_metadata', {}) if isinstance(output, dict) else {}
+        model_timings = metadata.get('timings') or {}
+        for key, value in model_timings.items():
+            if isinstance(value, (int, float)):
+                timing_stats[key] = timing_stats.get(key, 0.0) + float(value)
         
         # 反向传播
+        backward_start = time.perf_counter()
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        timing_stats['backward_s'] += time.perf_counter() - backward_start
         valid_batch_count += 1
         
         # 梯度累积
         if valid_batch_count % grad_accum_steps == 0:
+            opt_start = time.perf_counter()
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 if trainable_params:
@@ -1257,6 +1344,7 @@ def train_one_epoch(
             scheduler.step()
             if ema is not None:
                 ema.update()
+            timing_stats['optimizer_s'] += time.perf_counter() - opt_start
             global_step += 1
             
             # 日志
@@ -1269,6 +1357,15 @@ def train_one_epoch(
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     lr_strs.append(f"{gname}={lr_val:.2e}")
                 lr_display = ", ".join(lr_strs)
+                avg_data_wait = _mean_timing(timing_stats, profiled_steps, 'data_wait_s')
+                avg_gt = _mean_timing(timing_stats, profiled_steps, 'gt_s')
+                avg_forward = _mean_timing(timing_stats, profiled_steps, 'forward_s')
+                avg_backward = _mean_timing(timing_stats, profiled_steps, 'backward_s')
+                avg_opt = _mean_timing(timing_stats, max(global_step, 1), 'optimizer_s')
+                avg_prepare = _mean_timing(timing_stats, profiled_steps, 'prepare_inputs_s')
+                avg_qwen = _mean_timing(timing_stats, profiled_steps, 'qwen_forward_s')
+                avg_decode = _mean_timing(timing_stats, profiled_steps, 'heatmap_decode_s')
+                qwen_internal_log = _format_qwen_internal_timing(timing_stats, profiled_steps)
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
@@ -1277,7 +1374,11 @@ def train_one_epoch(
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
                     f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
                     f"LR: [{lr_display}] | "
-                    f"GPU: {mem_alloc:.1f}GB"
+                    f"GPU: {mem_alloc:.1f}GB | "
+                    f"T[s] data={avg_data_wait:.3f} gt={avg_gt:.3f} fwd={avg_forward:.3f} "
+                    f"(prep={avg_prepare:.3f} qwen={avg_qwen:.3f} decode={avg_decode:.3f}) "
+                    f"bwd={avg_backward:.3f} opt={avg_opt:.3f}"
+                    f"{' | ' + qwen_internal_log if qwen_internal_log else ''}"
                 )
                 
             if tb_writer is not None:
@@ -1286,6 +1387,20 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
                 tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
+                tb_writer.add_scalar('timing/data_wait_s', _mean_timing(timing_stats, profiled_steps, 'data_wait_s'), actual_step)
+                tb_writer.add_scalar('timing/gt_s', _mean_timing(timing_stats, profiled_steps, 'gt_s'), actual_step)
+                tb_writer.add_scalar('timing/forward_s', _mean_timing(timing_stats, profiled_steps, 'forward_s'), actual_step)
+                tb_writer.add_scalar('timing/backward_s', _mean_timing(timing_stats, profiled_steps, 'backward_s'), actual_step)
+                tb_writer.add_scalar('timing/optimizer_s', _mean_timing(timing_stats, max(global_step, 1), 'optimizer_s'), actual_step)
+                if profiled_steps > 0:
+                    tb_writer.add_scalar('timing/prepare_inputs_s', _mean_timing(timing_stats, profiled_steps, 'prepare_inputs_s'), actual_step)
+                    tb_writer.add_scalar('timing/qwen_forward_s', _mean_timing(timing_stats, profiled_steps, 'qwen_forward_s'), actual_step)
+                    tb_writer.add_scalar('timing/heatmap_decode_s', _mean_timing(timing_stats, profiled_steps, 'heatmap_decode_s'), actual_step)
+                    for key in sorted(timing_stats.keys()):
+                        if key.startswith('qwen_') and key not in {
+                            'qwen_forward_s',
+                        }:
+                            tb_writer.add_scalar(f'timing/{key}', _mean_timing(timing_stats, profiled_steps, key), actual_step)
                 for gi, lr_val in enumerate(scheduler.get_last_lr()):
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     tb_writer.add_scalar(f'lr/{gname}', lr_val, actual_step)
@@ -1528,29 +1643,25 @@ def train_one_epoch(
         
         del output
         
-        # 🔧 显式释放 batch 引用（尤其是 packing 模式下 pixel_values_videos 很大）
-        if (i + 1) % 4 == 0:
-            del batch
-            gc.collect()
-            torch.cuda.empty_cache()
-            _malloc_trim()
-        
         pbar.set_postfix({
             'loss': f"{loss.item()*grad_accum_steps:.4f}",
             'hm': f"{total_heatmap_loss / num_batches:.4f}",
             'traj': f"{action_total_loss.item():.4f}",
         })
+        prev_step_end = time.perf_counter()
     
     # 处理剩余梯度
     remaining = valid_batch_count % grad_accum_steps
     if remaining > 0:
         if scaler is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+            if trainable_params:
+                torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
             scaler.step(optimizer)
             scaler.update()
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+            if trainable_params:
+                torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
@@ -1617,70 +1728,71 @@ def validate(
     logger.info(f"  📊 验证: {total_val_batches} batches (training loss), "
                 f"{val_inference_batches} batches (推理 MSE)")
     
-    for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
-        if max_batches is not None and i >= max_batches:
-            break
-        history_frames = batch['history_frames']
-        current_frame = batch['current_frame']
-        B, K, C, H, W = history_frames.shape
-        
-        gt_action = batch['action'].to(device)
-        action_valid = batch['action_valid'].to(device)
-        is_stop = batch['is_stop'].to(device)
-        text = batch['text']
-        
-        # GPU 热力图计算（如果启用）
-        if _should_use_gpu_gt(batch, gpu_heatmap_computer):
-            history_poses = batch['history_poses'].to(device)
-            current_poses = batch['current_pose'].to(device)
+    with torch.inference_mode():
+        for i, batch in enumerate(tqdm(val_loader, desc="Validating", total=total_val_batches)):
+            if max_batches is not None and i >= max_batches:
+                break
+            history_frames = batch['history_frames']
+            current_frame = batch['current_frame']
+            B, K, C, H, W = history_frames.shape
             
-            current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
-            intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
+            gt_action = batch['action'].to(device)
+            action_valid = batch['action_valid'].to(device)
+            is_stop = batch['is_stop'].to(device)
+            text = batch['text']
             
-            gt_heatmap = gpu_heatmap_computer.compute_batch(
-                history_poses=history_poses,
-                current_poses=current_poses,
-                current_depths=current_depths,
-                intrinsics=intrinsics,
-                depth_normalized=gpu_depth_normalized,
-            )
-        else:
-            gt_heatmap = batch['heatmap'].to(device)
-        
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            video_frames = torch.cat([
-                history_frames,
-                history_frames[:, -1:],
-            ], dim=1)
-            
-            if text and len(text) > 0:
-                instruction_text = list(text)
+            # GPU 热力图计算（如果启用）
+            if _should_use_gpu_gt(batch, gpu_heatmap_computer):
+                history_poses = batch['history_poses'].to(device)
+                current_poses = batch['current_pose'].to(device)
+                
+                current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
+                intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
+                
+                gt_heatmap = gpu_heatmap_computer.compute_batch(
+                    history_poses=history_poses,
+                    current_poses=current_poses,
+                    current_depths=current_depths,
+                    intrinsics=intrinsics,
+                    depth_normalized=gpu_depth_normalized,
+                )
             else:
-                instruction_text = None
-            current_views_batch = batch.get('current_views')
-            history_panoramas_batch = batch.get('history_panoramas')
-            panoramic_inputs_batch = batch.get('pano_inputs')
-            panoramic_num_histories = batch.get('pano_num_histories')
-            panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
-            if panoramic_inputs_batch is not None and not train_action:
-                video_frames = current_frame.unsqueeze(1)
+                gt_heatmap = batch['heatmap'].to(device)
             
-            output = model(
-                video_frames=video_frames,
-                instruction_text=instruction_text,
-                current_observation=current_frame,
-                current_views=current_views_batch,
-                history_panoramas=history_panoramas_batch,
-                panoramic_inputs=panoramic_inputs_batch,
-                panoramic_num_histories=panoramic_num_histories,
-                panoramic_text_anchor_positions=panoramic_text_anchor_positions,
-                return_heatmaps=True,
-                return_actions=train_action,
-                gt_actions=gt_action.unsqueeze(1) if train_action else None,
-                action_valid=action_valid if train_action else None,
-                gt_stop=is_stop if train_action else None,
-                gt_history_heatmap=gt_heatmap if train_history else None,
-            )
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                video_frames = torch.cat([
+                    history_frames,
+                    history_frames[:, -1:],
+                ], dim=1)
+                
+                if text and len(text) > 0:
+                    instruction_text = list(text)
+                else:
+                    instruction_text = None
+                current_views_batch = batch.get('current_views')
+                history_panoramas_batch = batch.get('history_panoramas')
+                panoramic_inputs_batch = batch.get('pano_inputs')
+                panoramic_num_histories = batch.get('pano_num_histories')
+                panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
+                if panoramic_inputs_batch is not None and not train_action:
+                    video_frames = current_frame.unsqueeze(1)
+                
+                output = model(
+                    video_frames=video_frames,
+                    instruction_text=instruction_text,
+                    current_observation=current_frame,
+                    current_views=current_views_batch,
+                    history_panoramas=history_panoramas_batch,
+                    panoramic_inputs=panoramic_inputs_batch,
+                    panoramic_num_histories=panoramic_num_histories,
+                    panoramic_text_anchor_positions=panoramic_text_anchor_positions,
+                    return_heatmaps=True,
+                    return_actions=train_action,
+                    gt_actions=gt_action.unsqueeze(1) if train_action else None,
+                    action_valid=action_valid if train_action else None,
+                    gt_stop=is_stop if train_action else None,
+                    gt_history_heatmap=gt_heatmap if train_history else None,
+                )
             
             # Heatmap loss (v2)
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -1760,95 +1872,63 @@ def validate(
             
             loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
         
-        total_loss += loss.item()
-        total_heatmap_loss += heatmap_loss.item()
-        total_action_loss += action_total_loss.item()  # trajectory or action
-        total_stop_loss += stop_total_loss.item()      # progress or stop
-        num_batches += 1
-        
-        # ==================== 完整推理 + 可视化（前几个 batch）====================
-        # 对前 val_inference_batches 个 batch 做纯推理，计算真实 heatmap MSE
-        # 其中前 val_vis_batches 个 batch 额外保存可视化图片
-        num_vis_batches = cfg['log'].get('val_vis_batches', 2)
-        if num_batches <= val_inference_batches:
-            try:
-                # 纯推理模式生成热力图（不传 gt_heatmap）
-                video_frames = torch.cat([
-                    history_frames,
-                    history_frames[:, -1:],
-                ], dim=1)
-                current_views_batch = batch.get('current_views')
-                history_panoramas_batch = batch.get('history_panoramas')
-                panoramic_inputs_batch = batch.get('pano_inputs')
-                panoramic_num_histories = batch.get('pano_num_histories')
-                panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
-                if panoramic_inputs_batch is not None:
-                    video_frames = current_frame.unsqueeze(1)
-                vis_output = model(
-                    video_frames=video_frames,
-                    instruction_text=list(text) if text else None,
-                    current_observation=current_frame,
-                    current_views=current_views_batch,
-                    history_panoramas=history_panoramas_batch,
-                    panoramic_inputs=panoramic_inputs_batch,
-                    panoramic_num_histories=panoramic_num_histories,
-                    panoramic_text_anchor_positions=panoramic_text_anchor_positions,
-                    return_heatmaps=True,
-                    return_actions=False,
-                )
-                
-                # 计算完整推理的 heatmap MSE（真实生成质量指标）
-                if train_history and 'heatmaps' in vis_output:
-                    infer_pred_hm = vis_output['heatmaps']
-                    if infer_pred_hm.dim() == 5:
-                        infer_pred_hm = infer_pred_hm[:, 0, 0, :, :]
-                    elif infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
-                        infer_pred_hm = infer_pred_hm[:, 0, :, :]
-                    elif infer_pred_hm.dim() == 4:
-                        infer_pred_hm = infer_pred_hm[:, -1, :, :]
-                    gt_hm_eval = gt_heatmap
-                    if gt_hm_eval.dim() == 5:
-                        gt_hm_eval = gt_hm_eval[:, 0, 0]
-                    elif gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
-                        gt_hm_eval = gt_hm_eval[:, 0]
-                    if infer_pred_hm.shape[-2:] != gt_hm_eval.shape[-2:]:
-                        infer_pred_hm = F.interpolate(
-                            infer_pred_hm.unsqueeze(1),
-                            size=gt_hm_eval.shape[-2:],
-                            mode='bilinear', align_corners=False
-                        ).squeeze(1)
-                    batch_mse = F.mse_loss(infer_pred_hm, gt_hm_eval).item()
-                    total_heatmap_mse += batch_mse
-                    num_heatmap_mse_batches += 1
-                
-                # 前几个 batch 保存可视化图片
-                if num_batches <= num_vis_batches and vis_dir is not None:
-                    vis_path = visualize_heatmap_predictions(
-                        model=model,
-                        batch=batch,
-                        output=vis_output,
-                        epoch=epoch,
-                        step=num_batches,
-                        output_dir=vis_dir,
-                        num_samples=4,
-                        gt_heatmap_override=gt_heatmap if _should_use_gpu_gt(batch, gpu_heatmap_computer) else None,
-                    )
+            total_loss += loss.item()
+            total_heatmap_loss += heatmap_loss.item()
+            total_action_loss += action_total_loss.item()  # trajectory or action
+            total_stop_loss += stop_total_loss.item()      # progress or stop
+            num_batches += 1
+            
+            # ==================== 复用当前 output 做推理 MSE + 可视化 ====================
+            num_vis_batches = cfg['log'].get('val_vis_batches', 2)
+            if num_batches <= val_inference_batches:
+                try:
+                    vis_output = output
+                    if train_history and 'heatmaps' in vis_output:
+                        infer_pred_hm = vis_output['heatmaps']
+                        if infer_pred_hm.dim() == 5:
+                            infer_pred_hm = infer_pred_hm[:, 0, 0, :, :]
+                        elif infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
+                            infer_pred_hm = infer_pred_hm[:, 0, :, :]
+                        elif infer_pred_hm.dim() == 4:
+                            infer_pred_hm = infer_pred_hm[:, -1, :, :]
+                        gt_hm_eval = gt_heatmap
+                        if gt_hm_eval.dim() == 5:
+                            gt_hm_eval = gt_hm_eval[:, 0, 0]
+                        elif gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
+                            gt_hm_eval = gt_hm_eval[:, 0]
+                        if infer_pred_hm.shape[-2:] != gt_hm_eval.shape[-2:]:
+                            infer_pred_hm = F.interpolate(
+                                infer_pred_hm.unsqueeze(1),
+                                size=gt_hm_eval.shape[-2:],
+                                mode='bilinear', align_corners=False
+                            ).squeeze(1)
+                        batch_mse = F.mse_loss(infer_pred_hm, gt_hm_eval).item()
+                        total_heatmap_mse += batch_mse
+                        num_heatmap_mse_batches += 1
                     
-                    if vis_path is not None:
-                        new_path = vis_dir / f"e{epoch:03d}_b{num_batches:02d}.png"
-                        import shutil
-                        shutil.copy(vis_path, new_path)
+                    if num_batches <= num_vis_batches and vis_dir is not None:
+                        vis_path = visualize_heatmap_predictions(
+                            model=model,
+                            batch=batch,
+                            output=vis_output,
+                            epoch=epoch,
+                            step=num_batches,
+                            output_dir=vis_dir,
+                            num_samples=2,
+                            gt_heatmap_override=gt_heatmap if _should_use_gpu_gt(batch, gpu_heatmap_computer) else None,
+                        )
                         
-                        if tb_writer is not None:
-                            vis_img = cv2.imread(str(new_path))
-                            if vis_img is not None:
-                                vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
-                                vis_img = vis_img.transpose(2, 0, 1)
-                                tb_writer.add_image(f'val/heatmap_viz_batch{num_batches}', vis_img, epoch)
-                        
-                        logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
-            except Exception as e:
-                logger.warning(f"Validation inference/visualization failed: {e}")
+                        if vis_path is not None:
+                            if tb_writer is not None:
+                                vis_img = cv2.imread(str(vis_path))
+                                if vis_img is not None:
+                                    vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+                                    vis_img = vis_img.transpose(2, 0, 1)
+                                    tb_writer.add_image(f'val/heatmap_viz_batch{num_batches}', vis_img, epoch)
+                            
+                            logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
+                except Exception as e:
+                    logger.warning(f"Validation inference/visualization failed: {e}")
     
     avg_loss = total_loss / max(num_batches, 1)
     avg_hm = total_heatmap_loss / max(num_batches, 1)

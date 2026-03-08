@@ -92,6 +92,43 @@ class FineLocalization(nn.Module):
         query_vector: torch.Tensor,
     ) -> torch.Tensor:
         """Batched fine localization."""
+        if coarse_heatmap.dim() == 5:
+            batch_size, num_hist, num_views = coarse_heatmap.shape[:3]
+            if num_hist == 0:
+                return coarse_heatmap.new_empty((batch_size, 0, num_views, 64, 64))
+
+            spatial_size = vit_fused.shape[-2:]
+            attn = F.interpolate(
+                coarse_heatmap.reshape(
+                    batch_size * num_hist * num_views,
+                    1,
+                    coarse_heatmap.shape[-2],
+                    coarse_heatmap.shape[-1],
+                ),
+                size=spatial_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            attn = torch.sigmoid(attn)
+
+            q = self.query_proj(query_vector)[:, :, None, :].expand(-1, -1, num_views, -1)
+            q = q.reshape(batch_size * num_hist * num_views, -1, 1, 1)
+
+            vit_expanded = vit_fused[:, None, :, :, :, :].expand(-1, num_hist, -1, -1, -1, -1)
+            vit_expanded = vit_expanded.reshape(
+                batch_size * num_hist * num_views,
+                vit_fused.shape[2],
+                *spatial_size,
+            )
+
+            modulated = vit_expanded * q
+            modulated = modulated * attn
+            x = torch.cat([modulated, attn], dim=1)
+
+            out = self.refine(x)
+            out = torch.sigmoid(out)
+            return out.squeeze(1).reshape(batch_size, num_hist, num_views, out.shape[-2], out.shape[-1])
+
         num_hist, num_views = coarse_heatmap.shape[:2]
         if num_hist == 0:
             return coarse_heatmap.new_empty((0, num_views, 64, 64))

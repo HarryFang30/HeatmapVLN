@@ -2,7 +2,7 @@
 /models/*/
 !/models/*.md
 /outputs/
-/raw_sequences/
+/models/qwen_3.5/*/
 
 # Python cache
 __pycache__/

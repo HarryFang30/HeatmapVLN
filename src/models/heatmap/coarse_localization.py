@@ -98,6 +98,30 @@ class CoarseLocalization(nn.Module):
         else:
             history_queries_tensor = history_queries
 
+        if current_llm_tensor.dim() == 5:
+            q_proj = self.query_proj(history_queries_tensor)
+            q_norm = F.normalize(q_proj, dim=-1)
+            v_feat_norm = F.normalize(current_llm_tensor, dim=-1)
+            heatmaps = torch.einsum("bnc,bvhwc->bnvhw", q_norm, v_feat_norm)
+
+            if self.vis_head is not None:
+                hm_max = heatmaps.amax(dim=(-2, -1))
+                hm_mean = heatmaps.mean(dim=(-2, -1))
+                hm_std = heatmaps.std(dim=(-2, -1))
+                stats = torch.stack([hm_max, hm_mean, hm_std], dim=-1)
+                query_expand = history_queries_tensor[:, :, None, :].expand(-1, -1, current_llm_tensor.shape[1], -1)
+                vis_input = torch.cat([query_expand, stats], dim=-1)
+                visibility = self.vis_head(vis_input.reshape(-1, vis_input.shape[-1])).reshape(
+                    history_queries_tensor.shape[0], history_queries_tensor.shape[1], current_llm_tensor.shape[1]
+                )
+            else:
+                visibility = heatmaps.amax(dim=(-2, -1)) * self.visibility_scale
+
+            return {
+                "visibility": visibility,
+                "coarse_heatmap": heatmaps,
+            }
+
         q_proj = self.query_proj(history_queries_tensor)
         q_norm = F.normalize(q_proj, dim=-1)
         v_feat_norm = F.normalize(current_llm_tensor, dim=-1)

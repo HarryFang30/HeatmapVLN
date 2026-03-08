@@ -102,6 +102,60 @@ class Qwen3_5Config:
         return dtype_map.get(self.torch_dtype, torch.bfloat16)
 
 
+class _ModuleTimingProfiler:
+    """Lightweight forward hook profiler for selected Qwen submodules."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._handles: List[Any] = []
+        self._starts: Dict[int, float] = {}
+        self._totals: Dict[str, float] = {}
+        self._registered: set[Tuple[int, str]] = set()
+
+    def _sync(self) -> None:
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def register(self, module: Optional[nn.Module], key: str) -> None:
+        if module is None or not isinstance(module, nn.Module):
+            return
+        reg_key = (id(module), key)
+        if reg_key in self._registered:
+            return
+        self._registered.add(reg_key)
+
+        def _pre_hook(mod: nn.Module, _inputs: Tuple[Any, ...]) -> None:
+            self._sync()
+            self._starts[id(mod)] = time.perf_counter()
+
+        def _post_hook(mod: nn.Module, _inputs: Tuple[Any, ...], _output: Any) -> None:
+            start = self._starts.pop(id(mod), None)
+            self._sync()
+            if start is None:
+                return
+            self._totals[key] = self._totals.get(key, 0.0) + (time.perf_counter() - start)
+
+        self._handles.append(module.register_forward_pre_hook(_pre_hook))
+        self._handles.append(module.register_forward_hook(_post_hook))
+
+    def reset(self) -> None:
+        self._starts.clear()
+        self._totals = {}
+
+    def snapshot(self) -> Dict[str, float]:
+        totals = dict(self._totals)
+        self.reset()
+        return totals
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        self._starts.clear()
+        self._totals = {}
+        self._registered.clear()
+
+
 class Qwen3_5Integration(nn.Module):
     """
     Qwen3.5 Integration for VLN Pipeline.
@@ -134,6 +188,8 @@ class Qwen3_5Integration(nn.Module):
         # Sequence packing state
         self._packing_enabled = config.enable_packing
         self._varlen_attention_replaced = False
+        self._internal_profiler: Optional[_ModuleTimingProfiler] = None
+        self._last_internal_timings: Dict[str, float] = {}
         
         logger.info(f"Qwen3_5Integration initialized (model will be loaded on first forward)")
     
@@ -182,10 +238,154 @@ class Qwen3_5Integration(nn.Module):
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
             logger.info(f"Batch processing enabled (padding_side='left')")
+            self._setup_internal_profiler()
+            self._maybe_enable_compile()
             
         except Exception as e:
             logger.error(f"Failed to load Qwen3.5: {e}")
             raise
+
+    @staticmethod
+    def _get_nested_module(root: Any, path: str) -> Optional[nn.Module]:
+        module = root
+        for part in path.split("."):
+            module = getattr(module, part, None)
+            if module is None:
+                return None
+        return module if isinstance(module, nn.Module) else None
+
+    def _setup_internal_profiler(self) -> None:
+        if not self.config.enable_internal_profiling:
+            return
+        if self._internal_profiler is not None:
+            return
+
+        base_model = getattr(self.model, "model", self.model)
+        profiler = _ModuleTimingProfiler(self.device)
+
+        def register_first(root: Any, key: str, candidates: List[str]) -> Optional[nn.Module]:
+            for path in candidates:
+                module = self._get_nested_module(root, path)
+                if module is not None:
+                    profiler.register(module, key)
+                    return module
+            return None
+
+        visual_root = register_first(base_model, "qwen_visual_encode_s", ["visual", "visual_module"])
+        if visual_root is not None:
+            register_first(visual_root, "qwen_visual_patch_embed_s", ["patch_embed"])
+            register_first(
+                visual_root,
+                "qwen_visual_pos_embed_s",
+                ["pos_embed", "position_embedding", "positional_embedding"],
+            )
+            register_first(
+                visual_root,
+                "qwen_visual_rotary_s",
+                ["rot_pos_emb", "rotary_pos_emb"],
+            )
+            register_first(visual_root, "qwen_visual_merger_s", ["merger", "proj", "projector"])
+
+            visual_blocks = getattr(visual_root, "blocks", None)
+            if isinstance(visual_blocks, (nn.ModuleList, list, tuple)):
+                for block in visual_blocks:
+                    if not isinstance(block, nn.Module):
+                        continue
+                    profiler.register(block, "qwen_visual_blocks_s")
+                    for attr in ("attn", "self_attn"):
+                        profiler.register(getattr(block, attr, None), "qwen_visual_attn_s")
+                    profiler.register(getattr(block, "mlp", None), "qwen_visual_mlp_s")
+                    for attr in ("norm", "norm1", "norm2"):
+                        profiler.register(getattr(block, attr, None), "qwen_visual_norm_s")
+
+        language_root = register_first(base_model, "qwen_language_model_s", ["language_model"])
+        if language_root is not None:
+            language_layers = getattr(language_root, "layers", None)
+            if language_layers is None:
+                language_layers = getattr(getattr(language_root, "model", None), "layers", None)
+
+            if isinstance(language_layers, (nn.ModuleList, list, tuple)):
+                for layer in language_layers:
+                    if not isinstance(layer, nn.Module):
+                        continue
+                    profiler.register(layer, "qwen_llm_layers_s")
+                    for attr in ("self_attn", "attention", "full_attn"):
+                        profiler.register(getattr(layer, attr, None), "qwen_llm_full_attn_s")
+                    for attr in ("linear_attn", "delta_net"):
+                        profiler.register(getattr(layer, attr, None), "qwen_llm_linear_attn_s")
+                    profiler.register(getattr(layer, "mlp", None), "qwen_llm_mlp_s")
+                    for attr in ("input_layernorm", "post_attention_layernorm", "norm", "norm1", "norm2"):
+                        profiler.register(getattr(layer, attr, None), "qwen_llm_norm_s")
+
+        if profiler._handles:
+            self._internal_profiler = profiler
+            logger.info("Enabled Qwen internal profiling hooks")
+        else:
+            logger.warning("Qwen internal profiling requested, but no matching modules were found")
+
+    def _consume_internal_timings(self) -> Dict[str, float]:
+        timings = dict(self._last_internal_timings)
+        self._last_internal_timings = {}
+        return timings
+
+    def _compile_attr(self, root: Any, attr_name: str, label: str) -> bool:
+        module = getattr(root, attr_name, None)
+        if module is None or not isinstance(module, nn.Module):
+            return False
+        try:
+            compiled = torch.compile(
+                module,
+                mode=self.config.compile_mode,
+                backend=self.config.compile_backend,
+            )
+            setattr(root, attr_name, compiled)
+            logger.info(
+                "Compiled Qwen submodule `%s` with torch.compile(mode=%s, backend=%s)",
+                label,
+                self.config.compile_mode,
+                self.config.compile_backend,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Failed to compile Qwen submodule `%s`: %s", label, exc)
+            return False
+
+    def _compile_backend_available(self) -> bool:
+        if self.config.compile_backend != "inductor":
+            return True
+        try:
+            from triton.compiler.compiler import triton_key  # noqa: F401
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Skip torch.compile backend `%s` because runtime dependency check failed: %s",
+                self.config.compile_backend,
+                exc,
+            )
+            return False
+
+    def _maybe_enable_compile(self) -> None:
+        if not self.config.enable_compile:
+            return
+        if self.config.enable_internal_profiling:
+            logger.info("Skip torch.compile because internal profiling is enabled")
+            return
+        if self.config.use_lora:
+            logger.info("Skip torch.compile because LoRA is enabled")
+            return
+        if not self._compile_backend_available():
+            return
+
+        base_model = getattr(self.model, "model", self.model)
+        compiled_any = False
+        compiled_any |= self._compile_attr(base_model, "visual", "model.visual")
+        compiled_any |= self._compile_attr(base_model, "visual_module", "model.visual_module")
+        compiled_any |= self._compile_attr(base_model, "language_model", "model.language_model")
+
+        if compiled_any:
+            logger.info("Qwen torch.compile enabled")
+        else:
+            logger.warning("torch.compile requested, but no Qwen submodules were compiled")
     
     # ------------------------------------------------------------------
     # LoRA
@@ -455,11 +655,17 @@ class Qwen3_5Integration(nn.Module):
             return_dict=True,
             use_cache=False,
         )
+        if self._internal_profiler is not None:
+            self._internal_profiler.reset()
 
         if skip_lm_head:
             outputs = self.model.model(**fwd_kwargs)
         else:
             outputs = self.model(**fwd_kwargs)
+        if self._internal_profiler is not None:
+            self._last_internal_timings = self._internal_profiler.snapshot()
+        else:
+            self._last_internal_timings = {}
 
         if return_hidden_states:
             layer_idx = self.config.hidden_layer_for_features
@@ -567,6 +773,7 @@ class Qwen3_5Integration(nn.Module):
                     inputs, False, skip_lm_head=True,
                 )
         t2 = time.perf_counter()
+        internal_timings = self._consume_internal_timings()
 
         heatmap_output = heatmap_vln.decode_from_inputs_batch(
             inputs,
@@ -581,6 +788,7 @@ class Qwen3_5Integration(nn.Module):
             "heatmap_decode_s": t3 - t2,
             "panorama_total_s": t3 - t0,
         }
+        heatmap_output["timings"].update(internal_timings)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
 
     def _forward_batch_panorama_tokenized(
@@ -629,6 +837,7 @@ class Qwen3_5Integration(nn.Module):
                     inputs, False, skip_lm_head=True,
                 )
         t2 = time.perf_counter()
+        internal_timings = self._consume_internal_timings()
 
         heatmap_output = heatmap_vln.decode_from_inputs_batch(
             inputs,
@@ -643,6 +852,7 @@ class Qwen3_5Integration(nn.Module):
             "heatmap_decode_s": t3 - t2,
             "panorama_total_s": t3 - t0,
         }
+        heatmap_output["timings"].update(internal_timings)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
     
     def _forward_batch(
@@ -804,6 +1014,10 @@ class Qwen3_5Integration(nn.Module):
         }
         if heatmap_output is not None:
             result.update(heatmap_output)
+        else:
+            timings = self._consume_internal_timings()
+            if timings:
+                result["timings"] = timings
         return result
     
     def _generate_text_single(

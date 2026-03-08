@@ -283,30 +283,11 @@ class HeatmapVLN(nn.Module):
             text_anchor_positions_batch=text_anchors_batch,
             image_grid_thw=inputs.get("image_grid_thw"),
         )
-
-        all_visibility = []
-        all_heatmaps = []
-        for batch_idx, (current_vit, current_llm, history_queries) in enumerate(extracted):
-            self._validate_and_log_current_llm(current_llm)
-            expected_hist = num_histories[batch_idx]
-            if len(history_queries) != expected_hist:
-                raise RuntimeError(
-                    f"Expected {expected_hist} history queries for batch item {batch_idx}, got {len(history_queries)}"
-                )
-            decoded = self._decode_features(
-                current_vit=current_vit,
-                current_llm=current_llm,
-                history_queries=history_queries,
-                num_history=expected_hist,
-                device=device,
-            )
-            all_visibility.append(decoded["visibility"])
-            all_heatmaps.append(decoded["heatmaps"])
-
-        return {
-            "visibility": torch.stack(all_visibility, dim=0),
-            "heatmaps": torch.stack(all_heatmaps, dim=0),
-        }
+        return self._decode_features_batch(
+            extracted=extracted,
+            num_histories=num_histories,
+            device=device,
+        )
 
     def _decode_features(
         self,
@@ -342,6 +323,94 @@ class HeatmapVLN(nn.Module):
 
         return {"visibility": all_visibility, "heatmaps": all_heatmaps}
 
+    def _decode_features_batch(
+        self,
+        extracted: List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]],
+        num_histories: List[int],
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size = len(extracted)
+        if batch_size == 0:
+            return {
+                "visibility": torch.empty(0, 0, 4, device=device),
+                "heatmaps": torch.empty(0, 0, 4, 64, 64, device=device),
+            }
+
+        max_hist = max(num_histories) if num_histories else 0
+        if max_hist == 0:
+            return {
+                "visibility": torch.empty(batch_size, 0, 4, device=device),
+                "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
+            }
+
+        current_vit_batch = []
+        current_llm_batch = []
+        history_queries_tensor = None
+        history_mask = None
+
+        for batch_idx, (current_vit, current_llm, history_queries) in enumerate(extracted):
+            self._validate_and_log_current_llm(current_llm)
+            expected_hist = num_histories[batch_idx]
+            if len(history_queries) != expected_hist:
+                raise RuntimeError(
+                    f"Expected {expected_hist} history queries for batch item {batch_idx}, got {len(history_queries)}"
+                )
+            current_vit_batch.append(current_vit)
+            current_llm_batch.append(current_llm)
+
+            if history_queries_tensor is None:
+                if len(history_queries) == 0:
+                    raise RuntimeError("No history queries found in batched decode.")
+                query_dim = history_queries[0].shape[-1]
+                query_dtype = history_queries[0].dtype
+                history_queries_tensor = torch.zeros(
+                    batch_size,
+                    max_hist,
+                    query_dim,
+                    device=device,
+                    dtype=query_dtype,
+                )
+                history_mask = torch.zeros(batch_size, max_hist, device=device, dtype=torch.bool)
+
+            if history_queries:
+                query_stack = torch.stack(history_queries, dim=0).to(device=device, dtype=history_queries_tensor.dtype)
+                history_queries_tensor[batch_idx, :expected_hist] = query_stack
+                history_mask[batch_idx, :expected_hist] = True
+
+        if history_queries_tensor is None or history_mask is None:
+            raise RuntimeError("Failed to build batched history query tensor.")
+
+        fused_vit = self._fuse_view_features_multi_batch(
+            feature_maps=current_vit_batch,
+            layer_indices=self.vit_layer_indices,
+            fusion_module=self.vit_dpt_fusion,
+            device=device,
+            output_layout="nchw",
+        )
+        fused_llm = self._fuse_view_features_multi_batch(
+            feature_maps=current_llm_batch,
+            layer_indices=self.llm_layer_indices,
+            fusion_module=self.llm_dpt_fusion,
+            device=device,
+            output_layout="hwc",
+        )
+
+        coarse_results = self.coarse.forward_batched(fused_llm, history_queries_tensor)
+        all_visibility = coarse_results["visibility"]
+        all_heatmaps = self.fine.forward_batched(
+            vit_fused=fused_vit,
+            coarse_heatmap=coarse_results["coarse_heatmap"],
+            query_vector=history_queries_tensor,
+        )
+
+        history_mask_f = history_mask.to(all_visibility.dtype)
+        all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
+        all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        if not self.training:
+            all_heatmaps = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+
+        return {"visibility": all_visibility, "heatmaps": all_heatmaps}
+
     @staticmethod
     def _find_first_feature(
         feature_map: Dict[int, Dict[int, torch.Tensor]],
@@ -352,6 +421,17 @@ class HeatmapVLN(nn.Module):
                 feat = feature_map.get(view_idx, {}).get(layer_idx)
                 if feat is not None:
                     return feat
+        return None
+
+    def _find_first_feature_multi_batch(
+        self,
+        feature_maps: List[Dict[int, Dict[int, torch.Tensor]]],
+        layer_indices: List[int],
+    ) -> Optional[torch.Tensor]:
+        for feature_map in feature_maps:
+            feat = self._find_first_feature(feature_map, layer_indices)
+            if feat is not None:
+                return feat
         return None
 
     def _fuse_view_features_batched(
@@ -380,6 +460,37 @@ class HeatmapVLN(nn.Module):
             return fused
         if output_layout == "hwc":
             return fused.permute(0, 2, 3, 1)
+        raise ValueError(f"Unsupported output_layout: {output_layout}")
+
+    def _fuse_view_features_multi_batch(
+        self,
+        feature_maps: List[Dict[int, Dict[int, torch.Tensor]]],
+        layer_indices: List[int],
+        fusion_module: nn.Module,
+        device: torch.device,
+        output_layout: str,
+    ) -> torch.Tensor:
+        template = self._find_first_feature_multi_batch(feature_maps, layer_indices)
+        if template is None:
+            raise RuntimeError("No features available for multi-sample batched DPT fusion.")
+
+        per_layer_batches = []
+        for layer_idx in layer_indices:
+            view_tensors = []
+            for feature_map in feature_maps:
+                for view_idx in range(4):
+                    feat = feature_map.get(view_idx, {}).get(layer_idx)
+                    feat_tensor = torch.zeros_like(template) if feat is None else feat
+                    view_tensors.append(feat_tensor.permute(2, 0, 1).unsqueeze(0).to(device))
+            per_layer_batches.append(torch.cat(view_tensors, dim=0))
+
+        fused = fusion_module(per_layer_batches)
+        batch_size = len(feature_maps)
+        fused = fused.reshape(batch_size, 4, fused.shape[1], fused.shape[2], fused.shape[3])
+        if output_layout == "nchw":
+            return fused
+        if output_layout == "hwc":
+            return fused.permute(0, 1, 3, 4, 2)
         raise ValueError(f"Unsupported output_layout: {output_layout}")
 
     def _validate_and_log_current_llm(
