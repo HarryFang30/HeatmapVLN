@@ -58,15 +58,49 @@ class HeatmapVLNLoss(nn.Module):
         self.register_buffer("coords_y", coords_y, persistent=False)
 
     def _validate_heatmap_shape(self, heatmaps: torch.Tensor) -> None:
-        if heatmaps.ndim != 4:
+        if heatmaps.ndim not in (4, 5):
             raise ValueError(
-                f"Expected pred_heatmaps with shape (N_hist, 4, H, W), got {tuple(heatmaps.shape)}"
+                f"Expected heatmaps with shape (N_hist, 4, H, W) or (B, N_hist, 4, H, W), got {tuple(heatmaps.shape)}"
+            )
+        if heatmaps.shape[-3] != 4:
+            raise ValueError(
+                f"Expected 4 view channels before spatial dims, got shape {tuple(heatmaps.shape)}"
             )
         actual_size = tuple(int(v) for v in heatmaps.shape[-2:])
         if actual_size != self.heatmap_size:
             raise ValueError(
                 f"Heatmap size mismatch: expected {self.heatmap_size}, got {actual_size}"
             )
+
+    def _flatten_inputs(
+        self,
+        pred_vis: torch.Tensor,
+        pred_heatmaps: torch.Tensor,
+        gt_vis: torch.Tensor,
+        gt_heatmaps: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._validate_heatmap_shape(pred_heatmaps)
+        self._validate_heatmap_shape(gt_heatmaps)
+
+        pred_vis = pred_vis.reshape(-1, pred_vis.shape[-1])
+        gt_vis = gt_vis.reshape(-1, gt_vis.shape[-1])
+        pred_heatmaps = pred_heatmaps.reshape(-1, pred_heatmaps.shape[-3], pred_heatmaps.shape[-2], pred_heatmaps.shape[-1])
+        gt_heatmaps = gt_heatmaps.reshape(-1, gt_heatmaps.shape[-3], gt_heatmaps.shape[-2], gt_heatmaps.shape[-1])
+
+        if pred_vis.shape != gt_vis.shape:
+            raise ValueError(
+                f"Visibility shape mismatch: pred {tuple(pred_vis.shape)} vs gt {tuple(gt_vis.shape)}"
+            )
+        if pred_heatmaps.shape != gt_heatmaps.shape:
+            raise ValueError(
+                f"Heatmap shape mismatch: pred {tuple(pred_heatmaps.shape)} vs gt {tuple(gt_heatmaps.shape)}"
+            )
+        if pred_heatmaps.shape[:2] != pred_vis.shape:
+            raise ValueError(
+                f"Visibility/heatmap leading shape mismatch: vis {tuple(pred_vis.shape)} vs heatmaps {tuple(pred_heatmaps.shape)}"
+            )
+
+        return pred_vis, pred_heatmaps, gt_vis, gt_heatmaps
 
     def set_temperature(self, temperature: float) -> None:
         """Update soft-argmax temperature during training."""
@@ -137,13 +171,18 @@ class HeatmapVLNLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            pred_vis:      ``(N_hist, 4)``          — predicted visibility (raw logits).
-            pred_heatmaps: ``(N_hist, 4, 64, 64)``  — predicted heatmaps (after sigmoid).
-            gt_vis:        ``(N_hist, 4)``           — GT visibility (0 or 1).
-            gt_heatmaps:   ``(N_hist, 4, 64, 64)``  — GT heatmaps.
+            pred_vis:      ``(N_hist, 4)`` or ``(B, N_hist, 4)``.
+            pred_heatmaps: ``(N_hist, 4, H, W)`` or ``(B, N_hist, 4, H, W)``.
+            gt_vis:        ``(N_hist, 4)`` or ``(B, N_hist, 4)``.
+            gt_heatmaps:   ``(N_hist, 4, H, W)`` or ``(B, N_hist, 4, H, W)``.
         """
         device = pred_vis.device
-        self._validate_heatmap_shape(pred_heatmaps)
+        pred_vis, pred_heatmaps, gt_vis, gt_heatmaps = self._flatten_inputs(
+            pred_vis,
+            pred_heatmaps,
+            gt_vis,
+            gt_heatmaps,
+        )
 
         # (1) Visibility loss
         vis_loss = F.binary_cross_entropy_with_logits(pred_vis, gt_vis.float())
