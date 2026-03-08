@@ -103,14 +103,145 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _dist_backend() -> Optional[str]:
+    return dist.get_backend() if _dist_is_initialized() else None
+
+
+def _normalize_state_key(name: str) -> str:
+    if name.startswith("module."):
+        name = name[len("module."):]
+    return name.replace(".module.", ".")
+
+
+def _normalized_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {
+        _normalize_state_key(name): value
+        for name, value in model.state_dict().items()
+    }
+
+
+def _normalized_trainable_param_names(model: nn.Module) -> set[str]:
+    return {
+        _normalize_state_key(name)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+def _load_normalized_state_dict(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> Tuple[List[str], List[str], int]:
+    current_state = model.state_dict()
+    normalized_to_actual = {
+        _normalize_state_key(name): name
+        for name in current_state.keys()
+    }
+    remapped_state_dict = {}
+    for name, value in state_dict.items():
+        actual_name = normalized_to_actual.get(_normalize_state_key(name))
+        if actual_name is not None:
+            remapped_state_dict[actual_name] = value
+    missing, unexpected = model.load_state_dict(remapped_state_dict, strict=False)
+    return missing, unexpected, len(remapped_state_dict)
+
+
+def _get_supported_trainable_sync_modules(
+    model: VLNPipeline,
+    stage_cfg: Dict[str, Any],
+) -> List[Tuple[str, nn.Module]]:
+    trainable = set(stage_cfg.get("trainable_modules", []))
+    supported_trainable = {"heatmap_vln", "llm_projector"}
+    unsupported = sorted(trainable - supported_trainable)
+    if unsupported:
+        raise RuntimeError(
+            "Current multi-GPU trainable-module sync only supports trainable_modules "
+            f"{sorted(supported_trainable)}. Unsupported entries: {unsupported}. "
+            "Please keep other heads/backbone frozen in distributed mode."
+        )
+
+    sync_modules: List[Tuple[str, nn.Module]] = []
+
+    if "llm_projector" in trainable and getattr(model, "llm_projector", None) is not None:
+        if any(param.requires_grad for param in model.llm_projector.parameters()):
+            sync_modules.append(("llm_projector", model.llm_projector))
+
+    if "heatmap_vln" in trainable:
+        if model.heatmap_vln is None:
+            raise RuntimeError("heatmap_vln is trainable but has not been constructed before distributed sync.")
+        for attr_name in ["vit_dpt_fusion", "llm_dpt_fusion", "coarse", "fine"]:
+            module = getattr(model.heatmap_vln, attr_name, None)
+            if module is not None and any(param.requires_grad for param in module.parameters()):
+                sync_modules.append((f"heatmap_vln.{attr_name}", module))
+
+    if not sync_modules:
+        raise RuntimeError(
+            "Distributed mode is enabled, but no supported trainable submodules were found for synchronization."
+        )
+
+    return sync_modules
+
+
+def initialize_trainable_module_sync(
+    model: VLNPipeline,
+    stage_cfg: Dict[str, Any],
+    dist_context: "DistributedContext",
+    logger: logging.Logger,
+) -> List[Tuple[str, nn.Module]]:
+    sync_modules = _get_supported_trainable_sync_modules(model, stage_cfg)
+    for module_name, module in sync_modules:
+        logger.info("🔄 Broadcasting trainable module: %s", module_name)
+        for _, param in module.named_parameters():
+            if param.requires_grad:
+                _dist_broadcast_in_place(param.data, src=0)
+    _dist_barrier()
+    logger.info(
+        "🔗 Distributed trainable-module sync enabled for: %s",
+        ", ".join(name for name, _ in sync_modules),
+    )
+    return sync_modules
+
+
+def synchronize_trainable_module_gradients(
+    sync_modules: List[Tuple[str, nn.Module]],
+    dist_context: "DistributedContext",
+) -> None:
+    if not dist_context.enabled or dist_context.world_size <= 1:
+        return
+    for _, module in sync_modules:
+        for param in module.parameters():
+            if param.requires_grad and param.grad is not None:
+                _dist_all_reduce_in_place(param.grad)
+                param.grad.div_(dist_context.world_size)
+
+
 def _dist_barrier() -> None:
     if _dist_is_initialized():
         dist.barrier()
 
 
+def _dist_broadcast_in_place(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+    if not _dist_is_initialized():
+        return tensor
+    backend = _dist_backend()
+    if tensor.is_cuda and backend != "nccl":
+        cpu_tensor = tensor.detach().cpu()
+        dist.broadcast(cpu_tensor, src=src)
+        tensor.copy_(cpu_tensor.to(device=tensor.device, dtype=tensor.dtype))
+        return tensor
+    dist.broadcast(tensor, src=src)
+    return tensor
+
+
 def _dist_all_reduce_in_place(tensor: torch.Tensor) -> torch.Tensor:
     if _dist_is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        backend = _dist_backend()
+        if tensor.is_cuda and backend != "nccl":
+            cpu_tensor = tensor.detach().cpu()
+            dist.all_reduce(cpu_tensor, op=dist.ReduceOp.SUM)
+            tensor.copy_(cpu_tensor.to(device=tensor.device, dtype=tensor.dtype))
+        else:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return tensor
 
 
@@ -1250,6 +1381,11 @@ def train_one_epoch(
     )
     model_module = _unwrap_model(model)
     model.train()
+    synced_trainable_modules = (
+        _get_supported_trainable_sync_modules(model_module, stage_cfg)
+        if dist_context.enabled
+        else []
+    )
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
@@ -1524,11 +1660,13 @@ def train_one_epoch(
                 opt_start = time.perf_counter()
             if scaler is not None:
                 scaler.unscale_(optimizer)
+                synchronize_trainable_module_gradients(synced_trainable_modules, dist_context)
                 if trainable_params:
                     torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                synchronize_trainable_module_gradients(synced_trainable_modules, dist_context)
                 if trainable_params:
                     torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
                 optimizer.step()
@@ -2259,13 +2397,10 @@ class CheckpointManager:
         scaler: GradScaler = None,
     ) -> Path:
         """保存检查点"""
-        trainable_params = set()
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                trainable_params.add(name)
-        
+        trainable_params = _normalized_trainable_param_names(model)
+        normalized_state_dict = _normalized_model_state_dict(model)
         trainable_state_dict = {
-            k: v for k, v in model.state_dict().items()
+            k: v for k, v in normalized_state_dict.items()
             if k in trainable_params
         }
         
@@ -2353,9 +2488,9 @@ def load_checkpoint_for_resume(
     
     state_dict = ckpt.get('trainable_state_dict', {})
     if state_dict:
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing, unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
         if logger:
-            logger.info(f"  ✓ Loaded {len(state_dict)} trainable parameters")
+            logger.info(f"  ✓ Loaded {loaded_count} trainable parameters")
     
     if optimizer is not None and 'optimizer_state_dict' in ckpt:
         try:
@@ -2784,8 +2919,8 @@ def main():
             ckpt = torch.load(str(weights_path), map_location='cpu')
             state_dict = ckpt.get('trainable_state_dict', {})
             if state_dict:
-                missing, unexpected = model.load_state_dict(state_dict, strict=False)
-                logger.info(f"✓ Loaded {len(state_dict)} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
+                missing, unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
+                logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
                 if missing:
                     logger.info(f"  Missing keys: {len(missing)}")
                 if unexpected:
@@ -3041,21 +3176,20 @@ def main():
         gpu_depth_normalized = True
         gpu_has_depth = False
     
+    if dist_context.enabled:
+        initialize_trainable_module_sync(
+            raw_model,
+            stage_cfg=stage_cfg,
+            dist_context=dist_context,
+            logger=logger,
+        )
+
     # EMA (Exponential Moving Average) — 扩散模型标准技术
     # 用参数的滑动平均做推理，减少训练波动，提升泛化
     ema_decay = cfg.get('optim', {}).get('ema_decay', 0.999)
     ema_warmup = cfg.get('optim', {}).get('ema_warmup_steps', 2000)
     ema = EMAModel(raw_model, decay=ema_decay, warmup_steps=ema_warmup)
     logger.info(f"📐 EMA enabled: decay={ema_decay}, warmup_steps={ema_warmup}")
-
-    if dist_context.enabled:
-        ddp_cfg = cfg.get('gpu', {}).get('multi_gpu', {})
-        model = DDP(
-            raw_model,
-            device_ids=[dist_context.device.index],
-            output_device=dist_context.device.index,
-            find_unused_parameters=ddp_cfg.get('find_unused_parameters', False),
-        )
     
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()

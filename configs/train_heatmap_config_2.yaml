@@ -9,7 +9,7 @@ data:
   val_split: val
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8
+  num_workers: 12
   pin_memory: true
   prefetch_factor: 4
   
@@ -162,8 +162,9 @@ optim:
   warmup_steps: 500
   min_lr: 1.0e-6
   # 注意：DDP 下这里是每个进程 / 每张卡的 local batch size。
-  # 2 卡时 5 x 2 = 总 batch 10，和当前单卡配置接近，最稳妥。
-  batch_size: 5
+  # 2 卡时 10 x 2 = 总 batch 20，进一步利用 5090 显存，
+  # 同时保持 grad_accum_steps=1，减少同步和调度开销。
+  batch_size: 10
   grad_accum_steps: 1
 
 # ============================================
@@ -182,7 +183,7 @@ loss:
       enabled: true
       mode: cosine
       start: 1.0
-      end: 7.0
+      end: 4.0
   
   heatmap_weight: 1.0
   trajectory_weight: 0.0
@@ -193,7 +194,7 @@ loss:
 # ============================================
 gpu:
   devices: [0, 1]
-  backend: nccl
+  backend: gloo
   multi_gpu:
     enabled: true
     find_unused_parameters: false

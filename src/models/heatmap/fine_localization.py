@@ -60,6 +60,9 @@ class FineLocalization(nn.Module):
         Returns:
             ``(64, 64)`` heatmap in [0, 1].
         """
+        if coarse_heatmap.dim() >= 4:
+            return self.forward_batched(vit_fused, coarse_heatmap, query_vector)
+
         # Spatial attention from coarse heatmap
         attn = F.interpolate(
             coarse_heatmap[None, None],  # (1, 1, H_c, W_c)

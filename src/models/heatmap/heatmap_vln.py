@@ -329,9 +329,9 @@ class HeatmapVLN(nn.Module):
         )
         history_queries_tensor = torch.stack(history_queries, dim=0)
 
-        coarse_results = self.coarse.forward_batched(fused_llm, history_queries_tensor)
+        coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
-        all_heatmaps = self.fine.forward_batched(
+        all_heatmaps = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             query_vector=history_queries_tensor,
@@ -413,9 +413,9 @@ class HeatmapVLN(nn.Module):
             output_layout="hwc",
         )
 
-        coarse_results = self.coarse.forward_batched(fused_llm, history_queries_tensor)
+        coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
-        all_heatmaps = self.fine.forward_batched(
+        all_heatmaps = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             query_vector=history_queries_tensor,
@@ -506,7 +506,7 @@ class HeatmapVLN(nn.Module):
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             t_coarse0 = time.perf_counter()
-        coarse_results = self.coarse.forward_batched(fused_llm, history_queries_tensor)
+        coarse_results = self.coarse(fused_llm, history_queries_tensor)
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             timings["decode_coarse_s"] = time.perf_counter() - t_coarse0
@@ -515,7 +515,7 @@ class HeatmapVLN(nn.Module):
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             t_fine0 = time.perf_counter()
-        all_heatmaps = self.fine.forward_batched(
+        all_heatmaps = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             query_vector=history_queries_tensor,
