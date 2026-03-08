@@ -2899,7 +2899,9 @@ def main():
     
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
     
-    persistent_workers = num_workers > 0
+    # Disable persistent workers so each epoch gets a fresh worker pool.
+    # This avoids worker-side memory accumulation across epoch boundaries.
+    persistent_workers = False
     train_sampler = DistributedSampler(
         train_dataset,
         num_replicas=dist_context.world_size,
@@ -3013,6 +3015,7 @@ def main():
     
     patience = cfg['validation'].get('patience', 5)
     no_improve_count = 0
+    epoch_boundary_cooldown_s = float(cfg.get('log', {}).get('epoch_boundary_cooldown_s', 0.0) or 0.0)
     
     # GPU 热力图计算器（减少 CPU 瓶颈）
     data_cfg = cfg['data']
@@ -3254,6 +3257,19 @@ def main():
         if no_improve_count >= patience:
             logger.info(f"  🛑 Early stopping")
             break
+
+        if epoch < total_epochs and epoch_boundary_cooldown_s > 0:
+            logger.info(
+                f"  💤 Epoch boundary cooldown: sleep {epoch_boundary_cooldown_s:.1f}s "
+                "to let workers exit and memory settle"
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            _malloc_trim()
+            time.sleep(epoch_boundary_cooldown_s)
+            gc.collect()
+            torch.cuda.empty_cache()
+            _malloc_trim()
     
     logger.info(f"  📊 训练完成，耗时: {timer.get_total_elapsed()}")
     
