@@ -2284,6 +2284,15 @@ def _safe_symlink(link_path: Path, target: Any) -> None:
     link_path.symlink_to(target)
 
 
+def _clear_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for child in path.iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
+
+
 def _run_git_command(project_dir: Path, args: List[str]) -> str:
     try:
         result = subprocess.run(
@@ -2405,7 +2414,7 @@ def main():
     tb_run_dir = run_dir / 'tensorboard'
     metrics_jsonl_path = logs_dir / 'metrics.jsonl'
 
-    for d in [manifest_dir, logs_dir, ckpt_dir, vis_train_dir, vis_val_dir, plots_dir, tb_run_dir]:
+    for d in [manifest_dir, logs_dir, ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     _safe_symlink(latest_link, run_dir.name)
@@ -2440,25 +2449,18 @@ def main():
     # ==================== TensorBoard ====================
     tb_writer = None
     if cfg['log'].get('use_tensorboard', False):
-        tb_writer = SummaryWriter(log_dir=str(tb_run_dir))
-        logger.info(f"📊 TensorBoard: {tb_run_dir}")
-
         tb_base_cfg = cfg['log'].get('tensorboard_dir')
-        if tb_base_cfg:
-            tb_base = Path(tb_base_cfg)
-            tb_base.mkdir(parents=True, exist_ok=True)
-            compat_run_link = tb_base / run_dir.name
-            _safe_symlink(compat_run_link, tb_run_dir)
-            _safe_symlink(tb_base / 'latest', tb_run_dir)
-            logger.info(f"   兼容入口: tensorboard --logdir {tb_base / 'latest'}")
+        live_tb_dir = Path(tb_base_cfg) if tb_base_cfg else tb_run_dir
+        if not is_resuming:
+            _clear_directory(live_tb_dir)
+        else:
+            live_tb_dir.mkdir(parents=True, exist_ok=True)
 
-            # 额外在 /root/tf-logs 下保留一份根级入口，方便 autodl 端口实时监控。
-            root_tb_base = Path("/root/tf-logs")
-            if root_tb_base.resolve() != tb_base.resolve():
-                root_tb_base.mkdir(parents=True, exist_ok=True)
-                _safe_symlink(root_tb_base / run_dir.name, tb_run_dir)
-                _safe_symlink(root_tb_base / 'latest', tb_run_dir)
-            logger.info(f"   autodl入口: tensorboard --logdir {root_tb_base / 'latest'}")
+        _safe_symlink(tb_run_dir, live_tb_dir)
+        tb_writer = SummaryWriter(log_dir=str(live_tb_dir))
+        logger.info(f"📊 TensorBoard: {tb_run_dir}")
+        logger.info(f"   实时监控目录: {live_tb_dir}")
+        logger.info(f"   autodl入口: tensorboard --logdir {live_tb_dir}")
     
     loss_cfg = cfg['loss']
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')

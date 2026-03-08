@@ -37,13 +37,13 @@ run_YYYYMMDD_HHMMSS/
 - `checkpoints/`: epoch 检查点，以及 `best.pth` 和 `latest.pth`。
 - `visualizations/train/` 与 `visualizations/val/`: 训练/验证阶段导出的热力图可视化。
 - `plots/`: 训练曲线图和 epoch 级历史指标。
-- `tensorboard/`: 当前 run 对应的 TensorBoard 事件文件。
+- `tensorboard/`: 当前 run 的 TensorBoard 入口；默认指向实时监控目录。
 
-兼容入口：
+实时监控约定：
 
-- 主入口仍然是当前 run 下的 `tensorboard/`
-- 如果配置了 `log.tensorboard_dir`，会在该目录下维护 `latest`
-- 同时会在 `/root/tf-logs/latest` 下保留一个根级入口，方便通过 autodl 端口实时监控
+- 当前训练的 TensorBoard 实际写入 `log.tensorboard_dir`
+- 新训练开始时会清空该目录，保证里面只保留当前训练的 TensorBoard 内容
+- `run_dir/tensorboard` 会作为当前 run 的入口，指向这个实时监控目录
 
 常用查看方式：
 
@@ -52,4 +52,4 @@ run_YYYYMMDD_HHMMSS/
 - 看最佳模型：`checkpoints/best.pth`
 - 看结构化指标：`logs/metrics.jsonl`
 - 启动 TensorBoard：`tensorboard --logdir <run_dir>/tensorboard`
-- autodl 端口监控：`tensorboard --logdir /root/tf-logs/latest`
+- autodl 端口监控：`tensorboard --logdir /root/tf-logs`
