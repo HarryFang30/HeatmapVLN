@@ -51,6 +51,10 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
+        llm_enable_internal_profiling=llm_cfg.get('enable_internal_profiling', False),
+        llm_enable_compile=llm_cfg.get('enable_compile', False),
+        llm_compile_mode=llm_cfg.get('compile_mode', 'reduce-overhead'),
+        llm_compile_backend=llm_cfg.get('compile_backend', 'inductor'),
         enable_packing=False,
         max_seq_length=llm_cfg.get('max_seq_length', 4096),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
@@ -320,6 +324,7 @@ def main() -> int:
         samples_per_clip=sw_cfg.get('val_samples_per_clip', 2),
         enable_augmentation=False,
         defer_heatmap_to_gpu=False,
+        load_history_frames=sw_cfg.get('load_history_frames', True),
     )
 
     if not getattr(dataset, '_is_panoramic', False):
