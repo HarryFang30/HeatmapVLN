@@ -16,6 +16,7 @@ Architecture:
         - progress    (optional, from ProgressPredictionHead)
 """
 
+import time
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, Any, List
@@ -47,6 +48,10 @@ class VLNPipelineConfig:
     llm_torch_dtype: str = "bfloat16"
     llm_attn_implementation: str = "sdpa"
     max_video_frames: int = 16
+    llm_enable_internal_profiling: bool = False
+    llm_enable_compile: bool = False
+    llm_compile_mode: str = "reduce-overhead"
+    llm_compile_backend: str = "inductor"
 
     # Sequence Packing configuration (disabled for Qwen3.5)
     enable_packing: bool = False
@@ -139,6 +144,10 @@ class VLNPipeline(nn.Module):
             torch_dtype=config.llm_torch_dtype,
             attn_implementation=config.llm_attn_implementation,
             max_video_frames=config.max_video_frames,
+            enable_internal_profiling=config.llm_enable_internal_profiling,
+            enable_compile=config.llm_enable_compile,
+            compile_mode=config.llm_compile_mode,
+            compile_backend=config.llm_compile_backend,
             enable_packing=config.enable_packing,
             max_seq_length=config.max_seq_length,
             spatial_merge_size=config.spatial_merge_size,
@@ -365,6 +374,9 @@ class VLNPipeline(nn.Module):
         gt_future_heatmap: Optional[torch.Tensor] = None,
         current_views: Optional[Dict[str, Any]] = None,
         history_panoramas: Optional[List[Dict[str, Any]]] = None,
+        panoramic_inputs: Optional[Dict[str, torch.Tensor]] = None,
+        panoramic_num_histories: Optional[List[int]] = None,
+        panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
     ) -> Dict[str, Any]:
         """
         Forward pass.
@@ -379,7 +391,9 @@ class VLNPipeline(nn.Module):
             current_observation = video_frames[:, -1]
 
         history_frames = video_frames[:, :-1] if num_frames > 1 else video_frames
-        use_panoramic_chain = current_views is not None and history_panoramas is not None
+        use_panoramic_chain = panoramic_inputs is not None or (
+            current_views is not None and history_panoramas is not None
+        )
         if use_panoramic_chain:
             self._ensure_heatmap_vln()
 
@@ -389,9 +403,11 @@ class VLNPipeline(nn.Module):
         raw_hidden_states = None
         llm_tokens = None
         heatmap_output = None
+        qwen_timings = None
         should_run_qwen = need_sequence_features or use_panoramic_chain
         if should_run_qwen:
             # ==================== Step 1: Qwen3.5 Processing ====================
+            qwen_start = time.perf_counter()
             qwen_output = self.qwen3_5(
                 history_frames=history_frames,
                 current_frame=current_observation,
@@ -400,8 +416,14 @@ class VLNPipeline(nn.Module):
                 generate_text=False,
                 current_views=current_views,
                 history_panoramas=history_panoramas,
+                panoramic_inputs=panoramic_inputs,
+                panoramic_num_histories=panoramic_num_histories,
+                panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                 heatmap_vln=self.heatmap_vln if use_panoramic_chain else None,
             )
+            qwen_end = time.perf_counter()
+            qwen_timings = dict(qwen_output.get('timings', {}) or {})
+            qwen_timings.setdefault('pipeline_qwen_total_s', qwen_end - qwen_start)
 
             if need_sequence_features:
                 raw_hidden_states = qwen_output.get('vision_hidden_states')
@@ -459,6 +481,7 @@ class VLNPipeline(nn.Module):
                 'num_input_frames': num_frames,
                 'batch_size': batch_size,
                 'llm_token_shape': None if llm_tokens is None else llm_tokens.shape,
+                'timings': qwen_timings,
             },
         }
 

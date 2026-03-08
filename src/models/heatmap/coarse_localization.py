@@ -69,37 +69,54 @@ class CoarseLocalization(nn.Module):
         Returns:
             list of dicts with ``visibility`` (4,) and ``coarse_heatmap`` (4, H, W).
         """
-        results: List[Dict[str, torch.Tensor]] = []
+        batch = self.forward_batched(current_llm, history_queries)
+        return [
+            {
+                "visibility": batch["visibility"][hist_idx],
+                "coarse_heatmap": batch["coarse_heatmap"][hist_idx],
+            }
+            for hist_idx in range(batch["visibility"].shape[0])
+        ]
 
-        for q in history_queries:
-            q_proj = self.query_proj(q)                   # (C_fused,)
-            q_norm = F.normalize(q_proj, dim=-1)          # (C_fused,)
+    def forward_batched(self, current_llm, history_queries) -> Dict[str, torch.Tensor]:
+        """Batched coarse localization."""
+        if isinstance(current_llm, dict):
+            current_llm_tensor = torch.stack([current_llm[view_idx] for view_idx in range(4)], dim=0)
+        else:
+            current_llm_tensor = current_llm
 
-            view_vis = []
-            view_heatmaps = []
+        if isinstance(history_queries, list):
+            if len(history_queries) == 0:
+                device = current_llm_tensor.device
+                num_views = current_llm_tensor.shape[0]
+                height, width = current_llm_tensor.shape[1:3]
+                return {
+                    "visibility": torch.empty(0, num_views, device=device),
+                    "coarse_heatmap": torch.empty(0, num_views, height, width, device=device),
+                }
+            history_queries_tensor = torch.stack(history_queries, dim=0)
+        else:
+            history_queries_tensor = history_queries
 
-            for view_idx in range(4):
-                v_feat = current_llm[view_idx]            # (H, W, C_fused)
-                v_feat_norm = F.normalize(v_feat, dim=-1)
+        q_proj = self.query_proj(history_queries_tensor)
+        q_norm = F.normalize(q_proj, dim=-1)
+        v_feat_norm = F.normalize(current_llm_tensor, dim=-1)
+        heatmaps = torch.einsum("nc,vhwc->nvhw", q_norm, v_feat_norm)
 
-                heatmap = torch.einsum("c, hwc -> hw", q_norm, v_feat_norm)
-                view_heatmaps.append(heatmap)
+        if self.vis_head is not None:
+            hm_max = heatmaps.amax(dim=(-2, -1))
+            hm_mean = heatmaps.mean(dim=(-2, -1))
+            hm_std = heatmaps.std(dim=(-2, -1))
+            stats = torch.stack([hm_max, hm_mean, hm_std], dim=-1)
+            query_expand = history_queries_tensor[:, None, :].expand(-1, current_llm_tensor.shape[0], -1)
+            vis_input = torch.cat([query_expand, stats], dim=-1)
+            visibility = self.vis_head(vis_input.reshape(-1, vis_input.shape[-1])).reshape(
+                history_queries_tensor.shape[0], current_llm_tensor.shape[0]
+            )
+        else:
+            visibility = heatmaps.amax(dim=(-2, -1)) * self.visibility_scale
 
-                if self.vis_head is not None:
-                    hm_max = heatmap.max()
-                    hm_mean = heatmap.mean()
-                    hm_std = heatmap.std()
-                    stats = torch.stack([hm_max, hm_mean, hm_std])  # (3,)
-                    vis_input = torch.cat([q, stats])     # (C_llm + 3,)
-                    visibility = self.vis_head(vis_input).squeeze(-1)
-                else:
-                    visibility = heatmap.max() * self.visibility_scale
-
-                view_vis.append(visibility)
-
-            results.append({
-                "visibility": torch.stack(view_vis),          # (4,)
-                "coarse_heatmap": torch.stack(view_heatmaps), # (4, H, W)
-            })
-
-        return results
+        return {
+            "visibility": visibility,
+            "coarse_heatmap": heatmaps,
+        }

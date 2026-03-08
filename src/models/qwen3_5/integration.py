@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*")
 warnings.filterwarnings("ignore", message=".*video_metadata.*")
 
+import time
 import torch
 import torch.nn as nn
 import logging
@@ -26,6 +27,8 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from dataclasses import dataclass, field
 from PIL import Image
 import numpy as np
+
+from ..heatmap.input_constructor import find_text_anchor_positions
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -84,6 +87,10 @@ class Qwen3_5Config:
     lora_num_layers: int = 4      # Number of last LLM layers to apply LoRA
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
+    enable_internal_profiling: bool = False
+    enable_compile: bool = False
+    compile_mode: str = "reduce-overhead"
+    compile_backend: str = "inductor"
     
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
@@ -503,7 +510,7 @@ class Qwen3_5Integration(nn.Module):
                 inputs, return_hidden_states,
             )
         else:
-            with torch.no_grad():
+            with torch.inference_mode():
                 hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
@@ -519,42 +526,124 @@ class Qwen3_5Integration(nn.Module):
         return_hidden_states: bool = True,
         heatmap_vln: Optional[nn.Module] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
-        """Batch forward for panoramic input using one Qwen pass per sample."""
-        batch_size = current_views.shape[0]
-        all_hidden = []
-        all_vision = []
-        all_visibility = []
-        all_heatmaps = []
-        max_image_tokens = 0
+        """Batch forward for panoramic input using one batched Qwen pass."""
+        if heatmap_vln is None:
+            raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for batched decoding.")
 
-        for b in range(batch_size):
-            instr_b = instruction[b] if isinstance(instruction, list) else instruction
-            hs, vis, n_img, hm = self._forward_single_panorama(
-                current_views=current_views[b],
-                history_panoramas=history_panoramas[b],
-                instruction=instr_b,
-                return_hidden_states=return_hidden_states,
-                heatmap_vln=heatmap_vln,
+        t0 = time.perf_counter()
+        inputs, num_histories = heatmap_vln.prepare_qwen_inputs_batch(
+            current_views=current_views,
+            history_panoramas=history_panoramas,
+            instruction=instruction,
+            device=self.device,
+        )
+        image_positions_batch = [
+            heatmap_vln._find_image_positions_from_ids(inputs["input_ids"][b])
+            for b in range(inputs["input_ids"].shape[0])
+        ]
+        text_anchors_batch = [
+            find_text_anchor_positions(
+                inputs["input_ids"][b:b + 1],
+                heatmap_vln.processor.tokenizer,
+                num_history=num_histories[b],
             )
-            if hs is not None:
-                all_hidden.append(hs)
-            if vis is not None:
-                all_vision.append(vis)
-            if hm is not None:
-                all_visibility.append(hm["visibility"])
-                all_heatmaps.append(hm["heatmaps"])
-            max_image_tokens = max(max_image_tokens, n_img)
+            for b in range(inputs["input_ids"].shape[0])
+        ]
+        t1 = time.perf_counter()
+        heatmap_vln.feat_extractor.clear()
+        heatmap_vln.feat_extractor.prepare_batch_capture(
+            image_token_positions_batch=image_positions_batch,
+            text_anchor_positions_batch=text_anchors_batch,
+            image_grid_thw=inputs.get("image_grid_thw"),
+        )
 
-        hidden_states = self._pad_and_stack(all_hidden) if all_hidden else None
-        vision_hidden_states = self._pad_and_stack(all_vision) if all_vision else None
-        heatmap_output = None
-        if all_visibility and all_heatmaps:
-            heatmap_output = {
-                "visibility": torch.stack(all_visibility, dim=0),
-                "heatmaps": torch.stack(all_heatmaps, dim=0),
-            }
+        if return_hidden_states:
+            hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                inputs, return_hidden_states,
+            )
+        else:
+            with torch.inference_mode():
+                hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                    inputs, False, skip_lm_head=True,
+                )
+        t2 = time.perf_counter()
 
-        return hidden_states, vision_hidden_states, max_image_tokens, heatmap_output
+        heatmap_output = heatmap_vln.decode_from_inputs_batch(
+            inputs,
+            num_histories,
+            image_positions_batch=image_positions_batch,
+            text_anchors_batch=text_anchors_batch,
+        )
+        t3 = time.perf_counter()
+        heatmap_output["timings"] = {
+            "prepare_inputs_s": t1 - t0,
+            "qwen_forward_s": t2 - t1,
+            "heatmap_decode_s": t3 - t2,
+            "panorama_total_s": t3 - t0,
+        }
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
+
+    def _forward_batch_panorama_tokenized(
+        self,
+        panoramic_inputs: Dict[str, torch.Tensor],
+        num_histories: List[int],
+        text_anchor_positions_batch: Optional[List[Dict[int, int]]] = None,
+        return_hidden_states: bool = True,
+        heatmap_vln: Optional[nn.Module] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
+        """Forward already-tokenized panoramic batch through one Qwen pass."""
+        if heatmap_vln is None:
+            raise RuntimeError("Tokenized panoramic forward requires a HeatmapVLN instance.")
+
+        t0 = time.perf_counter()
+        inputs = {k: v.to(self.device, non_blocking=True) for k, v in panoramic_inputs.items()}
+        heatmap_vln._normalize_multimodal_inputs(inputs)
+        image_positions_batch = [
+            heatmap_vln._find_image_positions_from_ids(inputs["input_ids"][b])
+            for b in range(inputs["input_ids"].shape[0])
+        ]
+        if text_anchor_positions_batch is None:
+            text_anchor_positions_batch = [
+                find_text_anchor_positions(
+                    inputs["input_ids"][b:b + 1],
+                    heatmap_vln.processor.tokenizer,
+                    num_history=num_histories[b],
+                )
+                for b in range(inputs["input_ids"].shape[0])
+            ]
+        t1 = time.perf_counter()
+        heatmap_vln.feat_extractor.clear()
+        heatmap_vln.feat_extractor.prepare_batch_capture(
+            image_token_positions_batch=image_positions_batch,
+            text_anchor_positions_batch=text_anchor_positions_batch,
+            image_grid_thw=inputs.get("image_grid_thw"),
+        )
+
+        if return_hidden_states:
+            hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                inputs, return_hidden_states,
+            )
+        else:
+            with torch.inference_mode():
+                hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                    inputs, False, skip_lm_head=True,
+                )
+        t2 = time.perf_counter()
+
+        heatmap_output = heatmap_vln.decode_from_inputs_batch(
+            inputs,
+            num_histories,
+            image_positions_batch=image_positions_batch,
+            text_anchors_batch=text_anchor_positions_batch,
+        )
+        t3 = time.perf_counter()
+        heatmap_output["timings"] = {
+            "prepare_inputs_s": t1 - t0,
+            "qwen_forward_s": t2 - t1,
+            "heatmap_decode_s": t3 - t2,
+            "panorama_total_s": t3 - t0,
+        }
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
     
     def _forward_batch(
         self,
@@ -651,6 +740,9 @@ class Qwen3_5Integration(nn.Module):
         generate_text: bool = False,
         current_views: Optional[torch.Tensor] = None,
         history_panoramas: Optional[torch.Tensor] = None,
+        panoramic_inputs: Optional[Dict[str, torch.Tensor]] = None,
+        panoramic_num_histories: Optional[List[int]] = None,
+        panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
         heatmap_vln: Optional[nn.Module] = None,
     ) -> Dict[str, Any]:
         """Forward pass through Qwen3.5 with batch processing."""
@@ -660,7 +752,19 @@ class Qwen3_5Integration(nn.Module):
         
         batch_size = current_views.shape[0] if current_views is not None else history_frames.shape[0]
 
-        if current_views is not None and history_panoramas is not None:
+        if panoramic_inputs is not None:
+            if panoramic_num_histories is None:
+                raise ValueError("panoramic_num_histories is required with panoramic_inputs")
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
+                self._forward_batch_panorama_tokenized(
+                    panoramic_inputs=panoramic_inputs,
+                    num_histories=panoramic_num_histories,
+                    text_anchor_positions_batch=panoramic_text_anchor_positions,
+                    return_hidden_states=return_hidden_states,
+                    heatmap_vln=heatmap_vln,
+                )
+            )
+        elif current_views is not None and history_panoramas is not None:
             hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
                 self._forward_batch_panorama(
                     current_views=current_views,

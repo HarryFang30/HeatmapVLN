@@ -54,6 +54,7 @@ warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
 warnings.filterwarnings("ignore", message="Asked to sample")
 
+from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.logger import setup_logger
@@ -680,6 +681,10 @@ def build_model(cfg: Dict) -> nn.Module:
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
+        llm_enable_internal_profiling=llm_cfg.get('enable_internal_profiling', False),
+        llm_enable_compile=llm_cfg.get('enable_compile', False),
+        llm_compile_mode=llm_cfg.get('compile_mode', 'reduce-overhead'),
+        llm_compile_backend=llm_cfg.get('compile_backend', 'inductor'),
         
         # Sequence Packing (disabled for Qwen3.5)
         enable_packing=llm_cfg.get('enable_packing', False),
@@ -1063,6 +1068,8 @@ def train_one_epoch(
             head._training_step_counter = 0
             head._inference_interval = aligned_interval
     
+    trainable_params = _get_trainable_params(model)
+
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
@@ -1117,18 +1124,22 @@ def train_one_epoch(
             else:
                 instruction_text = None
             current_views_batch = batch.get('current_views')
-            if current_views_batch is not None:
-                current_views_batch = current_views_batch.to(device)
             history_panoramas_batch = batch.get('history_panoramas')
-            if history_panoramas_batch is not None:
-                history_panoramas_batch = history_panoramas_batch.to(device)
+            panoramic_inputs_batch = batch.get('pano_inputs')
+            panoramic_num_histories = batch.get('pano_num_histories')
+            panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
+            if panoramic_inputs_batch is not None and not train_action:
+                video_frames = current_frame.unsqueeze(1)
             
             output = model(
                 video_frames=video_frames,
                 instruction_text=instruction_text,
-                current_observation=current_frame.to(device),
+                current_observation=current_frame,
                 current_views=current_views_batch,
                 history_panoramas=history_panoramas_batch,
+                panoramic_inputs=panoramic_inputs_batch,
+                panoramic_num_histories=panoramic_num_histories,
+                panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
@@ -1234,11 +1245,13 @@ def train_one_epoch(
         if valid_batch_count % grad_accum_steps == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), optim_cfg['grad_clip'])
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -1645,18 +1658,22 @@ def validate(
             else:
                 instruction_text = None
             current_views_batch = batch.get('current_views')
-            if current_views_batch is not None:
-                current_views_batch = current_views_batch.to(device)
             history_panoramas_batch = batch.get('history_panoramas')
-            if history_panoramas_batch is not None:
-                history_panoramas_batch = history_panoramas_batch.to(device)
+            panoramic_inputs_batch = batch.get('pano_inputs')
+            panoramic_num_histories = batch.get('pano_num_histories')
+            panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
+            if panoramic_inputs_batch is not None and not train_action:
+                video_frames = current_frame.unsqueeze(1)
             
             output = model(
                 video_frames=video_frames,
                 instruction_text=instruction_text,
-                current_observation=current_frame.to(device),
+                current_observation=current_frame,
                 current_views=current_views_batch,
                 history_panoramas=history_panoramas_batch,
+                panoramic_inputs=panoramic_inputs_batch,
+                panoramic_num_histories=panoramic_num_histories,
+                panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
@@ -1761,17 +1778,21 @@ def validate(
                     history_frames[:, -1:],
                 ], dim=1)
                 current_views_batch = batch.get('current_views')
-                if current_views_batch is not None:
-                    current_views_batch = current_views_batch.to(device)
                 history_panoramas_batch = batch.get('history_panoramas')
-                if history_panoramas_batch is not None:
-                    history_panoramas_batch = history_panoramas_batch.to(device)
+                panoramic_inputs_batch = batch.get('pano_inputs')
+                panoramic_num_histories = batch.get('pano_num_histories')
+                panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
+                if panoramic_inputs_batch is not None:
+                    video_frames = current_frame.unsqueeze(1)
                 vis_output = model(
                     video_frames=video_frames,
                     instruction_text=list(text) if text else None,
-                    current_observation=current_frame.to(device),
+                    current_observation=current_frame,
                     current_views=current_views_batch,
                     history_panoramas=history_panoramas_batch,
+                    panoramic_inputs=panoramic_inputs_batch,
+                    panoramic_num_histories=panoramic_num_histories,
+                    panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                     return_heatmaps=True,
                     return_actions=False,
                 )
@@ -2211,6 +2232,7 @@ def main():
         clip_level_sampling = sw_cfg.get('clip_level_sampling', True)
         samples_per_clip = sw_cfg.get('samples_per_clip', 2)
         defer_heatmap_to_gpu = sw_cfg.get('defer_heatmap_to_gpu', False)
+        load_history_frames = sw_cfg.get('load_history_frames', True)
         
         train_dataset = VLNSlidingWindowDataset(
             root=cfg['data']['root'],
@@ -2225,6 +2247,7 @@ def main():
             clip_level_sampling=clip_level_sampling,
             samples_per_clip=samples_per_clip,
             defer_heatmap_to_gpu=defer_heatmap_to_gpu,
+            load_history_frames=load_history_frames,
         )
         
         val_split = cfg['data'].get('val_split', 'val')
@@ -2242,6 +2265,7 @@ def main():
             clip_level_sampling=clip_level_sampling,
             samples_per_clip=val_samples_per_clip,
             defer_heatmap_to_gpu=defer_heatmap_to_gpu,
+            load_history_frames=load_history_frames,
         )
     
     # 验证集使用固定 epoch=0，确保每次验证样本一致
@@ -2366,6 +2390,19 @@ def main():
             "model.llm.enable_packing=false。"
         )
     actual_collate_fn = collate_fn
+    use_panoramic_tokenized_collator = (
+        cfg['model'].get('heatmap', {}).get('enable', True)
+        and getattr(train_dataset, '_is_panoramic', False)
+        and getattr(val_dataset, '_is_panoramic', False)
+    )
+    if use_panoramic_tokenized_collator:
+        from transformers import AutoProcessor
+
+        llm_model_path = cfg['model'].get('llm', {}).get('model_path', './models/qwen_3.5')
+        logger.info("🔄 Loading Qwen processor for panoramic worker-side tokenization...")
+        pano_processor = AutoProcessor.from_pretrained(llm_model_path, trust_remote_code=True)
+        actual_collate_fn = PanoramicTokenizedCollator(pano_processor)
+        logger.info("   ✅ Panoramic tokenized collator enabled")
     
     # 🔧 使用 fork 模式（而非 spawn），利用 copy-on-write 共享内存
     # TOKENIZERS_PARALLELISM=false 已设置，fork 安全

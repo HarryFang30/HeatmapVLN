@@ -474,9 +474,11 @@ class VLNSlidingWindowDataset(Dataset):
         chunk_direction: str = "front",  # chunks 模式下读取的视角
         chunk_cache_size: int = 6,  # chunks 模式下缓存的数组个数（worker 内）
         defer_heatmap_to_gpu: bool = False,  # 兼容 train.py 传入（由 GPUHeatmapComputer 处理）
+        load_history_frames: bool = True,
     ):
         self.root = Path(root).expanduser()
         self.defer_heatmap_to_gpu = defer_heatmap_to_gpu
+        self.load_history_frames = load_history_frames
         self.split = split
         self.min_history = min_history
         self.num_history_sample = num_history_sample
@@ -528,6 +530,7 @@ class VLNSlidingWindowDataset(Dataset):
         self._chunk_frame_lookup_cache: Dict[int, Dict[int, Tuple[str, int]]] = {}
         self._chunk_key_map_cache: Dict[int, Dict[str, str]] = {}
         self._chunk_array_cache: "OrderedDict[Tuple[int, str, str], np.ndarray]" = OrderedDict()
+        self._intrinsics_cache: Dict[int, Tuple[Tuple[int, int], Optional[np.ndarray]]] = {}
         
         self._depth_is_meters = self._detect_depth_format()
         self._is_panoramic = self._detect_panoramic()
@@ -573,6 +576,24 @@ class VLNSlidingWindowDataset(Dataset):
         except Exception as e:
             logger.warning(f"Could not detect depth format: {e}, assuming normalized")
             return False
+
+    def _load_intrinsics(self, clip_idx: int, clip_dir: Path) -> Tuple[Tuple[int, int], Optional[np.ndarray]]:
+        if clip_idx in self._intrinsics_cache:
+            return self._intrinsics_cache[clip_idx]
+
+        intrinsics_path = clip_dir / "intrinsics.json"
+        K = None
+        if intrinsics_path.exists():
+            with open(intrinsics_path) as f:
+                intrinsics = json.load(f)
+            img_size = (intrinsics["width"], intrinsics["height"])
+            if "K" in intrinsics:
+                K = np.array(intrinsics["K"], dtype=np.float32)
+        else:
+            img_size = (640, 480)
+
+        self._intrinsics_cache[clip_idx] = (img_size, K)
+        return self._intrinsics_cache[clip_idx]
     
     def _detect_panoramic(self) -> bool:
         """检测数据集是否包含全景多视角数据 (rgb_front, rgb_right, rgb_back, rgb_left)"""
@@ -1400,12 +1421,16 @@ class VLNSlidingWindowDataset(Dataset):
             history_indices = self._sample_history_indices(0, current_t, self.num_history_sample)
             
             # 3. 加载历史帧
-            history_frames = self._load_frames(clip_dir, history_indices)
+            history_frames = (
+                self._load_frames(clip_dir, history_indices)
+                if self.load_history_frames else
+                torch.zeros(1, 3, self.image_size[1], self.image_size[0])
+            )
             
             # 4. 加载当前帧
             if self._is_panoramic:
-                current_frame = self._load_frame(clip_dir, current_t, direction="front")
                 current_views = self._load_all_views(clip_dir, current_t)
+                current_frame = current_views[0]
                 history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
             else:
                 current_frame = self._load_frame(clip_dir, current_t)
@@ -1418,19 +1443,10 @@ class VLNSlidingWindowDataset(Dataset):
             current_pose = poses[current_t]
             
             # 6. 加载当前帧深度（用于遮挡检测）
-            current_depth = self._load_depth(clip_dir, current_t)
+            current_depth = self._load_depth(clip_dir, current_t) if (self.load_depth and not self._is_panoramic and not self.defer_heatmap_to_gpu) else None
             
             # 7. 计算热力图
-            intrinsics_path = clip_dir / "intrinsics.json"
-            K = None
-            if intrinsics_path.exists():
-                with open(intrinsics_path) as f:
-                    intrinsics = json.load(f)
-                img_size = (intrinsics["width"], intrinsics["height"])
-                if "K" in intrinsics:
-                    K = np.array(intrinsics["K"], dtype=np.float32)
-            else:
-                img_size = (640, 480)
+            img_size, K = self._load_intrinsics(clip_idx, clip_dir)
             
             hm_w, hm_h = self.hm_size
             
@@ -1531,16 +1547,17 @@ class VLNSlidingWindowDataset(Dataset):
         """生成虚拟样本（用于错误处理）"""
         target_w, target_h = self.image_size
         hm_w, hm_h = self.hm_size
-        K = self.num_history_sample
+        K_heatmap = self.num_history_sample
+        K_frames = self.num_history_sample if self.load_history_frames else 1
         
         if self._is_panoramic:
             result = {
-                "history_frames": torch.zeros(K, 3, target_h, target_w),
+                "history_frames": torch.zeros(K_frames, 3, target_h, target_w),
                 "current_frame": torch.zeros(3, target_h, target_w),
                 "current_views": torch.zeros(4, 3, target_h, target_w),
-                "history_panoramas": torch.zeros(K, 4, 3, target_h, target_w),
-                "heatmap": torch.zeros(K, 4, hm_h, hm_w),
-                "gt_visibility": torch.zeros(K, 4),
+                "history_panoramas": torch.zeros(K_heatmap, 4, 3, target_h, target_w),
+                "heatmap": torch.zeros(K_heatmap, 4, hm_h, hm_w),
+                "gt_visibility": torch.zeros(K_heatmap, 4),
                 "action": torch.zeros(2),
                 "action_valid": 0.0,
                 "discrete_action": 1,
@@ -1549,7 +1566,7 @@ class VLNSlidingWindowDataset(Dataset):
             }
         else:
             result = {
-                "history_frames": torch.zeros(K, 3, target_h, target_w),
+                "history_frames": torch.zeros(K_frames, 3, target_h, target_w),
                 "current_frame": torch.zeros(3, target_h, target_w),
                 "heatmap": torch.zeros(hm_h, hm_w),
                 "action": torch.zeros(2),
@@ -1559,7 +1576,7 @@ class VLNSlidingWindowDataset(Dataset):
                 "text": "",
             }
         if self.defer_heatmap_to_gpu:
-            result["history_poses"] = torch.zeros(K, 4, 4)
+            result["history_poses"] = torch.zeros(K_heatmap, 4, 4)
             result["current_pose"] = torch.zeros(4, 4)
             result["current_depth"] = torch.zeros(1, 1)
         return result

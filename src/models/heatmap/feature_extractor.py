@@ -60,6 +60,10 @@ class FeatureExtractor:
         self.llm_layer_indices = sorted(llm_layer_indices)
         self.spatial_merge_size = spatial_merge_size
         self._handles: list = []
+        self._batch_capture_plan = None
+        self._captured_batch_vit: Dict[int, List[Dict[int, torch.Tensor]]] = {}
+        self._captured_batch_llm: Dict[int, List[Dict[int, torch.Tensor]]] = {}
+        self._captured_batch_queries: Optional[List[List[torch.Tensor]]] = None
 
         visual = self._get_visual_module(model)
         num_blocks = len(visual.blocks)
@@ -97,21 +101,98 @@ class FeatureExtractor:
 
     def _make_vit_hook(self, idx: int):
         def hook(_module, _input, output):
-            self.vit_features[idx] = output.detach()
+            if self._batch_capture_plan is not None:
+                captured = []
+                for view_ranges in self._batch_capture_plan["vit_ranges_batch"]:
+                    sample_views = {
+                        view_idx: output[start:end].detach()
+                        for view_idx, (start, end) in view_ranges.items()
+                    }
+                    captured.append(sample_views)
+                self._captured_batch_vit[idx] = captured
+            else:
+                self.vit_features[idx] = output.detach()
         return hook
 
     def _make_llm_hook(self, layer_idx: int):
         def hook(_module, _input, output):
-            if isinstance(output, tuple):
-                self.llm_hidden_states[layer_idx] = output[0].detach()
+            hidden = output[0] if isinstance(output, tuple) else output
+            if self._batch_capture_plan is not None:
+                captured = []
+                for batch_idx, image_positions in enumerate(self._batch_capture_plan["image_token_positions_batch"]):
+                    sample_views = {
+                        view_idx: hidden[batch_idx, start:end, :].detach()
+                        for view_idx, (start, end) in image_positions.items()
+                        if view_idx < 4
+                    }
+                    captured.append(sample_views)
+                self._captured_batch_llm[layer_idx] = captured
+
+                if layer_idx == self._batch_capture_plan["deepest_layer"]:
+                    self._captured_batch_queries = []
+                    for batch_idx, anchors in enumerate(self._batch_capture_plan["text_anchor_positions_batch"]):
+                        sample_queries = [
+                            hidden[batch_idx, anchors[hist_idx], :].detach()
+                            for hist_idx in range(len(anchors))
+                        ]
+                        self._captured_batch_queries.append(sample_queries)
             else:
-                self.llm_hidden_states[layer_idx] = output.detach()
+                self.llm_hidden_states[layer_idx] = hidden.detach()
         return hook
 
     def clear(self):
         """Reset captured features before each forward pass."""
         self.vit_features = {}
         self.llm_hidden_states = {}
+        self._batch_capture_plan = None
+        self._captured_batch_vit = {}
+        self._captured_batch_llm = {}
+        self._captured_batch_queries = None
+
+    def prepare_batch_capture(
+        self,
+        image_token_positions_batch: List[Dict[int, Tuple[int, int]]],
+        text_anchor_positions_batch: List[Dict[int, int]],
+        image_grid_thw: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Prepare compact token capture plan for batched panoramic forward."""
+        sample_image_counts = [len(pos) for pos in image_token_positions_batch]
+        sample_offsets: List[int] = []
+        running = 0
+        for count in sample_image_counts:
+            sample_offsets.append(running)
+            running += count
+
+        if image_grid_thw is not None:
+            per_image_sizes = (
+                image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+            ).tolist()
+        else:
+            per_image_sizes = [TOKENS_PER_IMAGE_VIT] * running
+
+        prefix = [0]
+        for size in per_image_sizes:
+            prefix.append(prefix[-1] + int(size))
+
+        vit_ranges_batch: List[Dict[int, Tuple[int, int]]] = []
+        for image_offset in sample_offsets:
+            sample_views = {}
+            for view_idx in range(4):
+                global_img_idx = image_offset + view_idx
+                start = prefix[global_img_idx]
+                end = prefix[global_img_idx + 1]
+                sample_views[view_idx] = (start, end)
+            vit_ranges_batch.append(sample_views)
+
+        self._batch_capture_plan = {
+            "image_token_positions_batch": image_token_positions_batch,
+            "text_anchor_positions_batch": text_anchor_positions_batch,
+            "vit_ranges_batch": vit_ranges_batch,
+            "deepest_layer": max(self.llm_layer_indices),
+        }
+        self._captured_batch_vit = {}
+        self._captured_batch_llm = {}
+        self._captured_batch_queries = None
 
     def remove_hooks(self):
         for h in self._handles:
@@ -214,11 +295,126 @@ class FeatureExtractor:
 
         return current_vit, current_llm, history_queries, history_llm_views
 
+    def extract_batch(
+        self,
+        image_token_positions_batch: List[Dict[int, Tuple[int, int]]],
+        text_anchor_positions_batch: List[Dict[int, int]],
+        image_grid_thw: Optional[torch.Tensor] = None,
+    ) -> List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]]:
+        """Batched variant of ``extract()`` for panoramic single-chain inputs."""
+        if self._batch_capture_plan is not None:
+            return self._extract_batch_compact()
+
+        self._validate_llm_layers_captured()
+
+        deepest_layer = max(self.llm_layer_indices)
+        hidden_deepest = self.llm_hidden_states.get(deepest_layer)
+        if hidden_deepest is None:
+            raise RuntimeError(
+                f"LLM hidden states for layer {deepest_layer} not captured. "
+                "Did you run model forward?"
+            )
+
+        sample_image_counts = [len(pos) for pos in image_token_positions_batch]
+        sample_image_offsets: List[int] = []
+        running = 0
+        for count in sample_image_counts:
+            sample_image_offsets.append(running)
+            running += count
+
+        extracted = []
+        for batch_idx, image_token_positions in enumerate(image_token_positions_batch):
+            n_hist = len(text_anchor_positions_batch[batch_idx])
+
+            current_llm: Dict[int, Dict[int, torch.Tensor]] = {}
+            for view_idx in range(4):
+                current_llm[view_idx] = {}
+                if view_idx not in image_token_positions:
+                    raise RuntimeError(
+                        f"Current panoramic view {view_idx} missing from image_token_positions "
+                        f"for batch item {batch_idx}."
+                    )
+                start, end = image_token_positions[view_idx]
+                for layer_idx in self.llm_layer_indices:
+                    hidden = self.llm_hidden_states.get(layer_idx)
+                    if hidden is None:
+                        continue
+                    tokens = hidden[batch_idx, start:end, :]
+                    h, w = self._resolve_llm_spatial_shape(
+                        tokens.shape[0], layer_idx, view_idx, f"batch[{batch_idx}]-current"
+                    )
+                    current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
+
+            current_vit: Dict[int, Dict[int, torch.Tensor]] = {}
+            image_offset = sample_image_offsets[batch_idx]
+            for view_idx in range(4):
+                current_vit[view_idx] = {}
+                global_img_idx = image_offset + view_idx
+                for layer_idx in self.vit_layer_indices:
+                    vit_out = self.vit_features.get(layer_idx)
+                    if vit_out is None:
+                        continue
+                    vit_tokens = self._get_vit_for_image(vit_out, global_img_idx, image_grid_thw)
+                    if vit_tokens is not None:
+                        h = w = int(vit_tokens.shape[0] ** 0.5)
+                        current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
+
+            history_queries: List[torch.Tensor] = []
+            for hist_idx in range(n_hist):
+                pos = text_anchor_positions_batch[batch_idx][hist_idx]
+                q = hidden_deepest[batch_idx, pos, :]
+                history_queries.append(q)
+
+            extracted.append((current_vit, current_llm, history_queries))
+
+        return extracted
+
+    def _extract_batch_compact(
+        self,
+    ) -> List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]]:
+        self._validate_llm_layers_captured()
+
+        if self._captured_batch_queries is None:
+            raise RuntimeError("Deepest-layer history queries were not captured in compact batch mode.")
+
+        batch_size = len(self._captured_batch_queries)
+        extracted = []
+        for batch_idx in range(batch_size):
+            current_llm: Dict[int, Dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
+            for layer_idx in self.llm_layer_indices:
+                layer_samples = self._captured_batch_llm.get(layer_idx)
+                if layer_samples is None:
+                    continue
+                for view_idx, tokens in layer_samples[batch_idx].items():
+                    h, w = self._resolve_llm_spatial_shape(
+                        tokens.shape[0], layer_idx, view_idx, f"batch[{batch_idx}]-current"
+                    )
+                    current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
+
+            current_vit: Dict[int, Dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
+            for layer_idx in self.vit_layer_indices:
+                layer_samples = self._captured_batch_vit.get(layer_idx)
+                if layer_samples is None:
+                    continue
+                for view_idx, vit_tokens in layer_samples[batch_idx].items():
+                    h = w = int(vit_tokens.shape[0] ** 0.5)
+                    current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
+
+            extracted.append((current_vit, current_llm, self._captured_batch_queries[batch_idx]))
+
+        return extracted
+
     def _validate_llm_layers_captured(self) -> None:
-        missing_layers = [
-            layer_idx for layer_idx in self.llm_layer_indices
-            if self.llm_hidden_states.get(layer_idx) is None
-        ]
+        if self._batch_capture_plan is not None:
+            missing_layers = [
+                layer_idx for layer_idx in self.llm_layer_indices
+                if self._captured_batch_llm.get(layer_idx) is None
+            ]
+        else:
+            missing_layers = [
+                layer_idx for layer_idx in self.llm_layer_indices
+                if self.llm_hidden_states.get(layer_idx) is None
+            ]
         if missing_layers:
             raise RuntimeError(
                 "Missing hooked LLM hidden states for layers "

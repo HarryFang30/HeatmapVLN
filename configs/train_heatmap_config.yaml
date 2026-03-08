@@ -17,8 +17,9 @@ data:
   
   sliding_window:
     min_history: 5
-    num_history_sample: 4        # 每场景采样 4 个历史时间步 (全景模式)
+    num_history_sample: 8
     load_depth: true
+    load_history_frames: false
     cache_poses: true
     sample_stride: 2
     defer_heatmap_to_gpu: false
@@ -58,6 +59,10 @@ model:
     token_dim: 1024
     torch_dtype: bfloat16
     attn_implementation: sdpa
+    enable_internal_profiling: false
+    enable_compile: true
+    compile_mode: reduce-overhead
+    compile_backend: inductor
     max_video_frames: -1
     enable_packing: false
     max_seq_length: 8192
