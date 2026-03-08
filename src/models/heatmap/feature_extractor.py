@@ -404,6 +404,50 @@ class FeatureExtractor:
 
         return extracted
 
+    def extract_batch_compact_tensors(
+        self,
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor], List[List[torch.Tensor]]]:
+        self._validate_llm_layers_captured()
+
+        if self._captured_batch_queries is None:
+            raise RuntimeError("Deepest-layer history queries were not captured in compact batch mode.")
+
+        batch_size = len(self._captured_batch_queries)
+        llm_tensors: Dict[int, torch.Tensor] = {}
+        vit_tensors: Dict[int, torch.Tensor] = {}
+
+        for layer_idx in self.llm_layer_indices:
+            layer_samples = self._captured_batch_llm.get(layer_idx)
+            if layer_samples is None:
+                continue
+            batch_views = []
+            for batch_idx in range(batch_size):
+                view_tensors = []
+                for view_idx in range(4):
+                    tokens = layer_samples[batch_idx][view_idx]
+                    h, w = self._resolve_llm_spatial_shape(
+                        tokens.shape[0], layer_idx, view_idx, f"batch[{batch_idx}]-current"
+                    )
+                    view_tensors.append(tokens.reshape(h, w, -1))
+                batch_views.append(torch.stack(view_tensors, dim=0))
+            llm_tensors[layer_idx] = torch.stack(batch_views, dim=0)
+
+        for layer_idx in self.vit_layer_indices:
+            layer_samples = self._captured_batch_vit.get(layer_idx)
+            if layer_samples is None:
+                continue
+            batch_views = []
+            for batch_idx in range(batch_size):
+                view_tensors = []
+                for view_idx in range(4):
+                    vit_tokens = layer_samples[batch_idx][view_idx]
+                    h = w = int(vit_tokens.shape[0] ** 0.5)
+                    view_tensors.append(vit_tokens.reshape(h, w, -1))
+                batch_views.append(torch.stack(view_tensors, dim=0))
+            vit_tensors[layer_idx] = torch.stack(batch_views, dim=0)
+
+        return vit_tensors, llm_tensors, self._captured_batch_queries
+
     def _validate_llm_layers_captured(self) -> None:
         if self._batch_capture_plan is not None:
             missing_layers = [

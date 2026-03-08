@@ -23,6 +23,7 @@ Reference: HeatmapVLN设计文档 Section 7
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -60,6 +61,7 @@ class HeatmapVLN(nn.Module):
         c_fused: int = 256,
         vit_layer_indices: Optional[List[int]] = None,
         llm_layer_indices: Optional[List[int]] = None,
+        enable_runtime_timing: bool = False,
     ):
         super().__init__()
 
@@ -75,6 +77,7 @@ class HeatmapVLN(nn.Module):
         self.c_fused = c_fused
         self.vit_layer_indices = vit_layer_indices
         self.llm_layer_indices = llm_layer_indices
+        self.enable_runtime_timing = enable_runtime_timing
         self._logged_llm_feature_stats = False
 
         # Freeze Qwen3.5
@@ -114,6 +117,11 @@ class HeatmapVLN(nn.Module):
     # ------------------------------------------------------------------
     # Qwen input / decode helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sync_for_timing(device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
 
     def prepare_qwen_inputs(
         self,
@@ -278,6 +286,16 @@ class HeatmapVLN(nn.Module):
                 for b in range(input_ids.shape[0])
             ]
 
+        if self.feat_extractor._batch_capture_plan is not None:
+            vit_tensors, llm_tensors, history_queries_batch = self.feat_extractor.extract_batch_compact_tensors()
+            return self._decode_feature_tensors_batch(
+                vit_layer_tensors=vit_tensors,
+                llm_layer_tensors=llm_tensors,
+                history_queries_batch=history_queries_batch,
+                num_histories=num_histories,
+                device=device,
+            )
+
         extracted = self.feat_extractor.extract_batch(
             image_token_positions_batch=image_positions_batch,
             text_anchor_positions_batch=text_anchors_batch,
@@ -411,6 +429,118 @@ class HeatmapVLN(nn.Module):
 
         return {"visibility": all_visibility, "heatmaps": all_heatmaps}
 
+    def _decode_feature_tensors_batch(
+        self,
+        vit_layer_tensors: Dict[int, torch.Tensor],
+        llm_layer_tensors: Dict[int, torch.Tensor],
+        history_queries_batch: List[List[torch.Tensor]],
+        num_histories: List[int],
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        timings: Dict[str, float] = {}
+        batch_size = len(history_queries_batch)
+        if batch_size == 0:
+            return {
+                "visibility": torch.empty(0, 0, 4, device=device),
+                "heatmaps": torch.empty(0, 0, 4, 64, 64, device=device),
+            }
+
+        max_hist = max(num_histories) if num_histories else 0
+        if max_hist == 0:
+            return {
+                "visibility": torch.empty(batch_size, 0, 4, device=device),
+                "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
+            }
+
+        self._validate_and_log_current_llm_layer_tensors(llm_layer_tensors)
+
+        first_query = next((queries[0] for queries in history_queries_batch if queries), None)
+        if first_query is None:
+            raise RuntimeError("No history queries found in compact batched decode.")
+
+        history_queries_tensor = torch.zeros(
+            batch_size,
+            max_hist,
+            first_query.shape[-1],
+            device=device,
+            dtype=first_query.dtype,
+        )
+        history_mask = torch.zeros(batch_size, max_hist, device=device, dtype=torch.bool)
+        for batch_idx, history_queries in enumerate(history_queries_batch):
+            expected_hist = num_histories[batch_idx]
+            if len(history_queries) != expected_hist:
+                raise RuntimeError(
+                    f"Expected {expected_hist} history queries for batch item {batch_idx}, got {len(history_queries)}"
+                )
+            if history_queries:
+                query_stack = torch.stack(history_queries, dim=0).to(device=device, dtype=history_queries_tensor.dtype)
+                history_queries_tensor[batch_idx, :expected_hist] = query_stack
+                history_mask[batch_idx, :expected_hist] = True
+
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            t_vit0 = time.perf_counter()
+        fused_vit = self._fuse_layer_tensor_batch(
+            layer_tensors=vit_layer_tensors,
+            layer_indices=self.vit_layer_indices,
+            fusion_module=self.vit_dpt_fusion,
+            output_layout="nchw",
+        )
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            timings["decode_vit_fusion_s"] = time.perf_counter() - t_vit0
+
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            t_llm0 = time.perf_counter()
+        fused_llm = self._fuse_layer_tensor_batch(
+            layer_tensors=llm_layer_tensors,
+            layer_indices=self.llm_layer_indices,
+            fusion_module=self.llm_dpt_fusion,
+            output_layout="hwc",
+        )
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            timings["decode_llm_fusion_s"] = time.perf_counter() - t_llm0
+
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            t_coarse0 = time.perf_counter()
+        coarse_results = self.coarse.forward_batched(fused_llm, history_queries_tensor)
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            timings["decode_coarse_s"] = time.perf_counter() - t_coarse0
+        all_visibility = coarse_results["visibility"]
+
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            t_fine0 = time.perf_counter()
+        all_heatmaps = self.fine.forward_batched(
+            vit_fused=fused_vit,
+            coarse_heatmap=coarse_results["coarse_heatmap"],
+            query_vector=history_queries_tensor,
+        )
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            timings["decode_fine_s"] = time.perf_counter() - t_fine0
+
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            t_post0 = time.perf_counter()
+        history_mask_f = history_mask.to(all_visibility.dtype)
+        all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
+        all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        if not self.training:
+            all_heatmaps = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+        if self.enable_runtime_timing:
+            self._sync_for_timing(device)
+            timings["decode_post_s"] = time.perf_counter() - t_post0
+
+        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        if self.enable_runtime_timing:
+            result["timings"] = timings
+        return result
+
     @staticmethod
     def _find_first_feature(
         feature_map: Dict[int, Dict[int, torch.Tensor]],
@@ -493,6 +623,44 @@ class HeatmapVLN(nn.Module):
             return fused.permute(0, 1, 3, 4, 2)
         raise ValueError(f"Unsupported output_layout: {output_layout}")
 
+    def _fuse_layer_tensor_batch(
+        self,
+        layer_tensors: Dict[int, torch.Tensor],
+        layer_indices: List[int],
+        fusion_module: nn.Module,
+        output_layout: str,
+    ) -> torch.Tensor:
+        per_layer_batches = []
+        batch_size = None
+        for layer_idx in layer_indices:
+            layer_tensor = layer_tensors.get(layer_idx)
+            if layer_tensor is None:
+                raise RuntimeError(f"Missing batched tensor for layer {layer_idx}.")
+            if layer_tensor.dim() != 5:
+                raise RuntimeError(
+                    f"Expected layer tensor [B, 4, H, W, C] for layer {layer_idx}, got {tuple(layer_tensor.shape)}"
+                )
+            if batch_size is None:
+                batch_size = layer_tensor.shape[0]
+            per_layer_batches.append(
+                layer_tensor.permute(0, 1, 4, 2, 3).reshape(
+                    layer_tensor.shape[0] * layer_tensor.shape[1],
+                    layer_tensor.shape[4],
+                    layer_tensor.shape[2],
+                    layer_tensor.shape[3],
+                )
+            )
+
+        fused = fusion_module(per_layer_batches)
+        if batch_size is None:
+            raise RuntimeError("No layer tensors available for batched DPT fusion.")
+        fused = fused.reshape(batch_size, 4, fused.shape[1], fused.shape[2], fused.shape[3])
+        if output_layout == "nchw":
+            return fused
+        if output_layout == "hwc":
+            return fused.permute(0, 1, 3, 4, 2)
+        raise ValueError(f"Unsupported output_layout: {output_layout}")
+
     def _validate_and_log_current_llm(
         self,
         current_llm: Dict[int, Dict[int, torch.Tensor]],
@@ -530,6 +698,36 @@ class HeatmapVLN(nn.Module):
                 )
             stats_lines.append(
                 f"L{layer_idx + 1}: shape={tuple(stacked.shape[1:])}, abs_mean={abs_mean:.3e}, abs_max={abs_max:.3e}, std={std:.3e}"
+            )
+
+        if not self._logged_llm_feature_stats and stats_lines:
+            logger.info("Captured LLM 8x8 multi-layer features:\n  %s", "\n  ".join(stats_lines))
+            self._logged_llm_feature_stats = True
+
+    def _validate_and_log_current_llm_layer_tensors(
+        self,
+        llm_layer_tensors: Dict[int, torch.Tensor],
+    ) -> None:
+        stats_lines = []
+        for layer_idx in self.llm_layer_indices:
+            feats = llm_layer_tensors.get(layer_idx)
+            if feats is None:
+                raise RuntimeError(f"LLM layer {layer_idx} missing from compact batched tensor decode.")
+            if feats.shape[1:4] != (4, 8, 8):
+                raise RuntimeError(
+                    f"LLM layer {layer_idx} batched features have shape {tuple(feats.shape)}, expected [B, 4, 8, 8, C]."
+                )
+            if not torch.isfinite(feats).all():
+                raise RuntimeError(f"LLM layer {layer_idx} batched features contain non-finite values.")
+            abs_mean = float(feats.abs().mean().item())
+            abs_max = float(feats.abs().max().item())
+            std = float(feats.std().item())
+            if abs_max <= 1e-8:
+                raise RuntimeError(
+                    f"LLM layer {layer_idx} batched 8x8 features are effectively all-zero after hooking (abs_max={abs_max:.3e})."
+                )
+            stats_lines.append(
+                f"L{layer_idx + 1}: shape={tuple(feats.shape[1:])}, abs_mean={abs_mean:.3e}, abs_max={abs_max:.3e}, std={std:.3e}"
             )
 
         if not self._logged_llm_feature_stats and stats_lines:

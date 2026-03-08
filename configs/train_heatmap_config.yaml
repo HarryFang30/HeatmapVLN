@@ -9,7 +9,7 @@ data:
   val_split: val
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8
+  num_workers: 12
   pin_memory: true
   prefetch_factor: 4
   
@@ -58,7 +58,7 @@ model:
     hidden_dim: 4096
     token_dim: 1024
     torch_dtype: bfloat16
-    attn_implementation: sdpa
+    attn_implementation: flash_attention_2
     enable_internal_profiling: false
     enable_compile: true
     compile_mode: reduce-overhead
@@ -160,8 +160,8 @@ optim:
   warmup_ratio: 0.1
   warmup_steps: 500
   min_lr: 1.0e-6
-  batch_size: 4
-  grad_accum_steps: 2
+  batch_size: 10
+  grad_accum_steps: 1
 
 # ============================================
 # 损失函数
@@ -192,10 +192,11 @@ log:
   out_dir: /root/autodl-tmp/heatmap_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
-  val_vis_batches: 1
+  val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs/heatmap_only
+  enable_timing: false
   log_interval: 10
   show_gpu_memory: true
   tqdm_ncols: 120
@@ -214,4 +215,4 @@ validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
   patience: 5
-  val_inference_batches: 4
+  val_inference_batches: 10

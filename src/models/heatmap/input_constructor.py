@@ -9,7 +9,7 @@ Text annotations encode scene context, group structure, and spatial orientation.
 Reference: HeatmapVLN设计文档 Section 3
 """
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from PIL import Image
 import torch
 import numpy as np
@@ -18,6 +18,7 @@ import numpy as np
 VIEW_NAMES = ["front", "right", "back", "left"]
 VIEW_ANGLES = ["0°正前方", "90°右侧", "180°正后方", "270°左侧"]
 ORIENTATION_STR = "、".join(VIEW_ANGLES)
+_ANCHOR_TOKEN_CACHE: Dict[Tuple[int, int], List[List[int]]] = {}
 
 
 def construct_input(
@@ -109,11 +110,20 @@ def find_text_anchor_positions(
 
     anchors: Dict[int, int] = {}
     i = 0
+    cache_key = (id(tokenizer), num_history)
+    anchor_token_ids = _ANCHOR_TOKEN_CACHE.get(cache_key)
+    if anchor_token_ids is None:
+        anchor_token_ids = []
+        for hist_idx in range(num_history):
+            anchor_text = _build_history_anchor_text(hist_idx)
+            anchor_ids = tokenizer.encode(anchor_text, add_special_tokens=False)
+            if not anchor_ids:
+                raise RuntimeError(f"Failed to tokenize anchor text: {anchor_text}")
+            anchor_token_ids.append(anchor_ids)
+        _ANCHOR_TOKEN_CACHE[cache_key] = anchor_token_ids
+
     for hist_idx in range(num_history):
-        anchor_text = _build_history_anchor_text(hist_idx)
-        anchor_ids = tokenizer.encode(anchor_text, add_special_tokens=False)
-        if not anchor_ids:
-            raise RuntimeError(f"Failed to tokenize anchor text: {anchor_text}")
+        anchor_ids = anchor_token_ids[hist_idx]
 
         found = False
         while i < len(ids):

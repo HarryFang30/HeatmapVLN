@@ -625,6 +625,26 @@ def _format_qwen_internal_timing(stats: Dict[str, float], count: int) -> str:
     return " | ".join(sections)
 
 
+def _format_decode_internal_timing(stats: Dict[str, float], count: int) -> str:
+    if count <= 0:
+        return ""
+
+    def avg(key: str) -> float:
+        return _mean_timing(stats, count, key)
+
+    vit = avg('decode_vit_fusion_s')
+    llm = avg('decode_llm_fusion_s')
+    coarse = avg('decode_coarse_s')
+    fine = avg('decode_fine_s')
+    post = avg('decode_post_s')
+    if not any(v > 0 for v in [vit, llm, coarse, fine, post]):
+        return ""
+    return (
+        f"D[s] vit={vit:.3f} llm={llm:.3f} coarse={coarse:.3f} "
+        f"fine={fine:.3f} post={post:.3f}"
+    )
+
+
 # ============================================
 # 配置加载与工具函数
 # ============================================
@@ -740,6 +760,7 @@ def build_model(cfg: Dict) -> nn.Module:
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
         llm_enable_internal_profiling=llm_cfg.get('enable_internal_profiling', False),
+        enable_runtime_timing=cfg.get('log', {}).get('enable_timing', False),
         llm_enable_compile=llm_cfg.get('enable_compile', False),
         llm_compile_mode=llm_cfg.get('compile_mode', 'reduce-overhead'),
         llm_compile_backend=llm_cfg.get('compile_backend', 'inductor'),
@@ -1114,6 +1135,7 @@ def train_one_epoch(
     
     global_step = 0
     valid_batch_count = 0
+    enable_timing = cfg.get('log', {}).get('enable_timing', False)
     timing_stats = {
         'data_wait_s': 0.0,
         'gt_s': 0.0,
@@ -1124,9 +1146,9 @@ def train_one_epoch(
         'qwen_forward_s': 0.0,
         'heatmap_decode_s': 0.0,
         'pipeline_qwen_total_s': 0.0,
-    }
+    } if enable_timing else {}
     profiled_steps = 0
-    prev_step_end = time.perf_counter()
+    prev_step_end = time.perf_counter() if enable_timing else 0.0
     
     # 同步 diffusion head 的推理计数器，确保与 global_step 对齐
     # _training_step_counter 每 batch +1, global_step 每 grad_accum_steps batch +1
@@ -1144,26 +1166,28 @@ def train_one_epoch(
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
-        loop_start = time.perf_counter()
-        timing_stats['data_wait_s'] += max(loop_start - prev_step_end, 0.0)
+        if enable_timing:
+            loop_start = time.perf_counter()
+            timing_stats['data_wait_s'] += max(loop_start - prev_step_end, 0.0)
         
         history_frames = batch['history_frames']
         current_frame = batch['current_frame']
         B, K, C, H, W = history_frames.shape
         
-        gt_action = batch['action'].to(device)
-        action_valid = batch['action_valid'].to(device)
-        is_stop = batch['is_stop'].to(device)
+        gt_action = batch['action'].to(device, non_blocking=True)
+        action_valid = batch['action_valid'].to(device, non_blocking=True)
+        is_stop = batch['is_stop'].to(device, non_blocking=True)
         text = batch['text']
         
-        gt_start = time.perf_counter()
+        if enable_timing:
+            gt_start = time.perf_counter()
         # GPU 热力图计算（如果启用）
         if _should_use_gpu_gt(batch, gpu_heatmap_computer):
-            history_poses = batch['history_poses'].to(device)  # [B, K, 4, 4]
-            current_poses = batch['current_pose'].to(device)   # [B, 4, 4]
+            history_poses = batch['history_poses'].to(device, non_blocking=True)  # [B, K, 4, 4]
+            current_poses = batch['current_pose'].to(device, non_blocking=True)   # [B, 4, 4]
             
-            current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
-            intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
+            current_depths = batch['current_depth'].to(device, non_blocking=True) if gpu_has_depth and 'current_depth' in batch else None
+            intrinsics = batch['intrinsics'].to(device, non_blocking=True) if 'intrinsics' in batch else None
             
             gt_heatmap = gpu_heatmap_computer.compute_batch(
                 history_poses=history_poses,
@@ -1181,11 +1205,13 @@ def train_one_epoch(
                         if flip_mask[b_idx]:
                             gt_heatmap[b_idx] = gt_heatmap[b_idx].flip(dims=[-1])
         else:
-            gt_heatmap = batch['heatmap'].to(device)
-        timing_stats['gt_s'] += time.perf_counter() - gt_start
+            gt_heatmap = batch['heatmap'].to(device, non_blocking=True)
+        if enable_timing:
+            timing_stats['gt_s'] += time.perf_counter() - gt_start
         
         # 前向传播
-        forward_start = time.perf_counter()
+        if enable_timing:
+            forward_start = time.perf_counter()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             # Build video_frames from history only. Append a duplicate of the
             # last history frame as placeholder; pipeline.forward() ignores it
@@ -1231,14 +1257,14 @@ def train_one_epoch(
             if train_history and 'visibility' in output and 'heatmaps' in output:
                 if gt_heatmap is not None:
                     if 'gt_visibility' in batch:
-                        gt_vis = batch['gt_visibility'].to(device)
+                        gt_vis = batch['gt_visibility'].to(device, non_blocking=True)
                     else:
                         gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
                     loss_dict = hm_loss_fn(
                         output['visibility'],
                         output['heatmaps'],
                         gt_vis=gt_vis,
-                        gt_heatmaps=gt_heatmap.to(device),
+                        gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
                     )
                     heatmap_loss = loss_dict['total']
             
@@ -1250,8 +1276,8 @@ def train_one_epoch(
                 # Transformer Action Head (new) - 使用 trajectory
                 if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
                     if 'trajectory' in batch:
-                        gt_trajectory = batch['trajectory'].to(device)
-                        trajectory_valid = batch['trajectory_valid'].to(device)
+                        gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
+                        trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
                         # 传入完整 llm_tokens 序列
                         traj_result = model.transformer_action_head.compute_loss(
                             output['llm_tokens'],
@@ -1278,7 +1304,7 @@ def train_one_epoch(
                 # last_token 和 mean_pool 是不同的表示（对齐 InternNav）
                 if hasattr(model, 'progress_head') and model.progress_head is not None:
                     if 'progress' in batch:
-                        gt_progress = batch['progress'].to(device)
+                        gt_progress = batch['progress'].to(device, non_blocking=True)
                         # 使用 trajectory_valid 作为 mask（更准确）或 action_valid 作为备选
                         progress_valid = batch.get('trajectory_valid', action_valid).to(device)
                         progress_result = model.progress_head(
@@ -1309,27 +1335,31 @@ def train_one_epoch(
             
             loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
             loss = loss / grad_accum_steps
-        timing_stats['forward_s'] += time.perf_counter() - forward_start
-        profiled_steps += 1
+        if enable_timing:
+            timing_stats['forward_s'] += time.perf_counter() - forward_start
+            profiled_steps += 1
 
-        metadata = output.get('processing_metadata', {}) if isinstance(output, dict) else {}
-        model_timings = metadata.get('timings') or {}
-        for key, value in model_timings.items():
-            if isinstance(value, (int, float)):
-                timing_stats[key] = timing_stats.get(key, 0.0) + float(value)
+            metadata = output.get('processing_metadata', {}) if isinstance(output, dict) else {}
+            model_timings = metadata.get('timings') or {}
+            for key, value in model_timings.items():
+                if isinstance(value, (int, float)):
+                    timing_stats[key] = timing_stats.get(key, 0.0) + float(value)
         
         # 反向传播
-        backward_start = time.perf_counter()
+        if enable_timing:
+            backward_start = time.perf_counter()
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        timing_stats['backward_s'] += time.perf_counter() - backward_start
+        if enable_timing:
+            timing_stats['backward_s'] += time.perf_counter() - backward_start
         valid_batch_count += 1
         
         # 梯度累积
         if valid_batch_count % grad_accum_steps == 0:
-            opt_start = time.perf_counter()
+            if enable_timing:
+                opt_start = time.perf_counter()
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 if trainable_params:
@@ -1344,7 +1374,8 @@ def train_one_epoch(
             scheduler.step()
             if ema is not None:
                 ema.update()
-            timing_stats['optimizer_s'] += time.perf_counter() - opt_start
+            if enable_timing:
+                timing_stats['optimizer_s'] += time.perf_counter() - opt_start
             global_step += 1
             
             # 日志
@@ -1357,15 +1388,6 @@ def train_one_epoch(
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     lr_strs.append(f"{gname}={lr_val:.2e}")
                 lr_display = ", ".join(lr_strs)
-                avg_data_wait = _mean_timing(timing_stats, profiled_steps, 'data_wait_s')
-                avg_gt = _mean_timing(timing_stats, profiled_steps, 'gt_s')
-                avg_forward = _mean_timing(timing_stats, profiled_steps, 'forward_s')
-                avg_backward = _mean_timing(timing_stats, profiled_steps, 'backward_s')
-                avg_opt = _mean_timing(timing_stats, max(global_step, 1), 'optimizer_s')
-                avg_prepare = _mean_timing(timing_stats, profiled_steps, 'prepare_inputs_s')
-                avg_qwen = _mean_timing(timing_stats, profiled_steps, 'qwen_forward_s')
-                avg_decode = _mean_timing(timing_stats, profiled_steps, 'heatmap_decode_s')
-                qwen_internal_log = _format_qwen_internal_timing(timing_stats, profiled_steps)
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
@@ -1374,11 +1396,21 @@ def train_one_epoch(
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
                     f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
                     f"LR: [{lr_display}] | "
-                    f"GPU: {mem_alloc:.1f}GB | "
-                    f"T[s] data={avg_data_wait:.3f} gt={avg_gt:.3f} fwd={avg_forward:.3f} "
-                    f"(prep={avg_prepare:.3f} qwen={avg_qwen:.3f} decode={avg_decode:.3f}) "
-                    f"bwd={avg_backward:.3f} opt={avg_opt:.3f}"
-                    f"{' | ' + qwen_internal_log if qwen_internal_log else ''}"
+                    f"GPU: {mem_alloc:.1f}GB"
+                    + (
+                        (
+                            f" | T[s] data={_mean_timing(timing_stats, profiled_steps, 'data_wait_s'):.3f} "
+                            f"gt={_mean_timing(timing_stats, profiled_steps, 'gt_s'):.3f} "
+                            f"fwd={_mean_timing(timing_stats, profiled_steps, 'forward_s'):.3f} "
+                            f"(prep={_mean_timing(timing_stats, profiled_steps, 'prepare_inputs_s'):.3f} "
+                            f"qwen={_mean_timing(timing_stats, profiled_steps, 'qwen_forward_s'):.3f} "
+                            f"decode={_mean_timing(timing_stats, profiled_steps, 'heatmap_decode_s'):.3f}) "
+                            f"bwd={_mean_timing(timing_stats, profiled_steps, 'backward_s'):.3f} "
+                            f"opt={_mean_timing(timing_stats, max(global_step, 1), 'optimizer_s'):.3f}"
+                            f"{' | ' + _format_decode_internal_timing(timing_stats, profiled_steps) if _format_decode_internal_timing(timing_stats, profiled_steps) else ''}"
+                            f"{' | ' + _format_qwen_internal_timing(timing_stats, profiled_steps) if _format_qwen_internal_timing(timing_stats, profiled_steps) else ''}"
+                        ) if enable_timing else ""
+                    )
                 )
                 
             if tb_writer is not None:
@@ -1387,20 +1419,24 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
                 tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
-                tb_writer.add_scalar('timing/data_wait_s', _mean_timing(timing_stats, profiled_steps, 'data_wait_s'), actual_step)
-                tb_writer.add_scalar('timing/gt_s', _mean_timing(timing_stats, profiled_steps, 'gt_s'), actual_step)
-                tb_writer.add_scalar('timing/forward_s', _mean_timing(timing_stats, profiled_steps, 'forward_s'), actual_step)
-                tb_writer.add_scalar('timing/backward_s', _mean_timing(timing_stats, profiled_steps, 'backward_s'), actual_step)
-                tb_writer.add_scalar('timing/optimizer_s', _mean_timing(timing_stats, max(global_step, 1), 'optimizer_s'), actual_step)
-                if profiled_steps > 0:
-                    tb_writer.add_scalar('timing/prepare_inputs_s', _mean_timing(timing_stats, profiled_steps, 'prepare_inputs_s'), actual_step)
-                    tb_writer.add_scalar('timing/qwen_forward_s', _mean_timing(timing_stats, profiled_steps, 'qwen_forward_s'), actual_step)
-                    tb_writer.add_scalar('timing/heatmap_decode_s', _mean_timing(timing_stats, profiled_steps, 'heatmap_decode_s'), actual_step)
-                    for key in sorted(timing_stats.keys()):
-                        if key.startswith('qwen_') and key not in {
-                            'qwen_forward_s',
-                        }:
-                            tb_writer.add_scalar(f'timing/{key}', _mean_timing(timing_stats, profiled_steps, key), actual_step)
+                if enable_timing:
+                    tb_writer.add_scalar('timing/data_wait_s', _mean_timing(timing_stats, profiled_steps, 'data_wait_s'), actual_step)
+                    tb_writer.add_scalar('timing/gt_s', _mean_timing(timing_stats, profiled_steps, 'gt_s'), actual_step)
+                    tb_writer.add_scalar('timing/forward_s', _mean_timing(timing_stats, profiled_steps, 'forward_s'), actual_step)
+                    tb_writer.add_scalar('timing/backward_s', _mean_timing(timing_stats, profiled_steps, 'backward_s'), actual_step)
+                    tb_writer.add_scalar('timing/optimizer_s', _mean_timing(timing_stats, max(global_step, 1), 'optimizer_s'), actual_step)
+                    if profiled_steps > 0:
+                        tb_writer.add_scalar('timing/prepare_inputs_s', _mean_timing(timing_stats, profiled_steps, 'prepare_inputs_s'), actual_step)
+                        tb_writer.add_scalar('timing/qwen_forward_s', _mean_timing(timing_stats, profiled_steps, 'qwen_forward_s'), actual_step)
+                        tb_writer.add_scalar('timing/heatmap_decode_s', _mean_timing(timing_stats, profiled_steps, 'heatmap_decode_s'), actual_step)
+                        for key in ('decode_vit_fusion_s', 'decode_llm_fusion_s', 'decode_coarse_s', 'decode_fine_s', 'decode_post_s'):
+                            if key in timing_stats:
+                                tb_writer.add_scalar(f'timing/{key}', _mean_timing(timing_stats, profiled_steps, key), actual_step)
+                        for key in sorted(timing_stats.keys()):
+                            if key.startswith('qwen_') and key not in {
+                                'qwen_forward_s',
+                            }:
+                                tb_writer.add_scalar(f'timing/{key}', _mean_timing(timing_stats, profiled_steps, key), actual_step)
                 for gi, lr_val in enumerate(scheduler.get_last_lr()):
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     tb_writer.add_scalar(f'lr/{gname}', lr_val, actual_step)
@@ -1914,7 +1950,7 @@ def validate(
                             epoch=epoch,
                             step=num_batches,
                             output_dir=vis_dir,
-                            num_samples=2,
+                            num_samples=4,
                             gt_heatmap_override=gt_heatmap if _should_use_gpu_gt(batch, gpu_heatmap_computer) else None,
                         )
                         
@@ -2507,6 +2543,7 @@ def main():
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+        in_order=False if num_workers > 0 else True,
     )
     
     # 验证集也需要 workers 加速 tokenization（否则主进程串行处理会极慢）
@@ -2537,6 +2574,10 @@ def main():
         if model.qwen3_5.model is None:
             logger.info("🔄 Pre-loading Qwen3.5 (ensure LoRA params available for optimizer)...")
             model.qwen3_5._load_model()
+        logger.info(
+            "   🧠 Qwen attention implementation: %s",
+            getattr(model.qwen3_5.config, 'attn_implementation', 'unknown'),
+        )
     if getattr(model.config, 'enable_heatmap', False):
         logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")
         model._ensure_heatmap_vln()

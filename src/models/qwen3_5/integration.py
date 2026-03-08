@@ -88,6 +88,7 @@ class Qwen3_5Config:
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
     enable_internal_profiling: bool = False
+    enable_runtime_timing: bool = False
     enable_compile: bool = False
     compile_mode: str = "reduce-overhead"
     compile_backend: str = "inductor"
@@ -202,14 +203,43 @@ class Qwen3_5Integration(nn.Module):
             from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
             
             logger.info(f"Loading Qwen3.5 from {self.config.model_path}")
-            
-            self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
-                self.config.model_path,
-                torch_dtype=self.config.get_torch_dtype(),
-                attn_implementation=self.config.attn_implementation,
-                device_map=self.device,
-                trust_remote_code=True,
-            )
+
+            requested_attn_impl = self.config.attn_implementation
+            tried_impls = [requested_attn_impl]
+            model_load_error = None
+            self.model = None
+
+            for attn_impl in tried_impls + (["sdpa"] if requested_attn_impl != "sdpa" else []):
+                if attn_impl in tried_impls[:-1]:
+                    continue
+                try:
+                    logger.info("Trying Qwen attention implementation: %s", attn_impl)
+                    self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
+                        self.config.model_path,
+                        torch_dtype=self.config.get_torch_dtype(),
+                        attn_implementation=attn_impl,
+                        device_map=self.device,
+                        trust_remote_code=True,
+                    )
+                    if attn_impl != requested_attn_impl:
+                        logger.warning(
+                            "Qwen attention fallback: requested `%s`, using `%s`",
+                            requested_attn_impl,
+                            attn_impl,
+                        )
+                    self.config.attn_implementation = attn_impl
+                    break
+                except Exception as exc:
+                    model_load_error = exc
+                    logger.warning(
+                        "Failed to load Qwen with attention implementation `%s`: %s",
+                        attn_impl,
+                        exc,
+                    )
+
+            if self.model is None:
+                raise model_load_error if model_load_error is not None else RuntimeError("Failed to load Qwen3.5 model")
+
             self.model.eval()
             
             # Freeze all parameters (never train the backbone)
@@ -232,6 +262,7 @@ class Qwen3_5Integration(nn.Module):
             self.processor.tokenizer.padding_side = 'left'
             
             logger.info(f"Qwen3.5 loaded successfully on {self.device}")
+            logger.info("Qwen attention implementation in use: %s", self.config.attn_implementation)
             
             # Log model info
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -375,17 +406,12 @@ class Qwen3_5Integration(nn.Module):
             return
         if not self._compile_backend_available():
             return
-
-        base_model = getattr(self.model, "model", self.model)
-        compiled_any = False
-        compiled_any |= self._compile_attr(base_model, "visual", "model.visual")
-        compiled_any |= self._compile_attr(base_model, "visual_module", "model.visual_module")
-        compiled_any |= self._compile_attr(base_model, "language_model", "model.language_model")
-
-        if compiled_any:
-            logger.info("Qwen torch.compile enabled")
-        else:
-            logger.warning("torch.compile requested, but no Qwen submodules were compiled")
+        logger.info(
+            "Skip torch.compile for Qwen3.5 on this stack: "
+            "visual submodules are unstable with dynamic shapes and "
+            "the language model depends on FLA Triton kernels that are not "
+            "reliably compatible with Inductor here"
+        )
     
     # ------------------------------------------------------------------
     # LoRA
@@ -736,7 +762,7 @@ class Qwen3_5Integration(nn.Module):
         if heatmap_vln is None:
             raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for batched decoding.")
 
-        t0 = time.perf_counter()
+        t0 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         inputs, num_histories = heatmap_vln.prepare_qwen_inputs_batch(
             current_views=current_views,
             history_panoramas=history_panoramas,
@@ -755,7 +781,7 @@ class Qwen3_5Integration(nn.Module):
             )
             for b in range(inputs["input_ids"].shape[0])
         ]
-        t1 = time.perf_counter()
+        t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         heatmap_vln.feat_extractor.clear()
         heatmap_vln.feat_extractor.prepare_batch_capture(
             image_token_positions_batch=image_positions_batch,
@@ -772,8 +798,8 @@ class Qwen3_5Integration(nn.Module):
                 hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
-        t2 = time.perf_counter()
-        internal_timings = self._consume_internal_timings()
+        t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
+        internal_timings = self._consume_internal_timings() if self.config.enable_runtime_timing else {}
 
         heatmap_output = heatmap_vln.decode_from_inputs_batch(
             inputs,
@@ -781,14 +807,17 @@ class Qwen3_5Integration(nn.Module):
             image_positions_batch=image_positions_batch,
             text_anchors_batch=text_anchors_batch,
         )
-        t3 = time.perf_counter()
-        heatmap_output["timings"] = {
-            "prepare_inputs_s": t1 - t0,
-            "qwen_forward_s": t2 - t1,
-            "heatmap_decode_s": t3 - t2,
-            "panorama_total_s": t3 - t0,
-        }
-        heatmap_output["timings"].update(internal_timings)
+        if self.config.enable_runtime_timing:
+            t3 = time.perf_counter()
+            decode_timings = dict(heatmap_output.get("timings", {}) or {})
+            heatmap_output["timings"] = {
+                "prepare_inputs_s": t1 - t0,
+                "qwen_forward_s": t2 - t1,
+                "heatmap_decode_s": t3 - t2,
+                "panorama_total_s": t3 - t0,
+            }
+            heatmap_output["timings"].update(decode_timings)
+            heatmap_output["timings"].update(internal_timings)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
 
     def _forward_batch_panorama_tokenized(
@@ -803,7 +832,7 @@ class Qwen3_5Integration(nn.Module):
         if heatmap_vln is None:
             raise RuntimeError("Tokenized panoramic forward requires a HeatmapVLN instance.")
 
-        t0 = time.perf_counter()
+        t0 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         inputs = {k: v.to(self.device, non_blocking=True) for k, v in panoramic_inputs.items()}
         heatmap_vln._normalize_multimodal_inputs(inputs)
         image_positions_batch = [
@@ -819,7 +848,7 @@ class Qwen3_5Integration(nn.Module):
                 )
                 for b in range(inputs["input_ids"].shape[0])
             ]
-        t1 = time.perf_counter()
+        t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         heatmap_vln.feat_extractor.clear()
         heatmap_vln.feat_extractor.prepare_batch_capture(
             image_token_positions_batch=image_positions_batch,
@@ -836,8 +865,8 @@ class Qwen3_5Integration(nn.Module):
                 hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
-        t2 = time.perf_counter()
-        internal_timings = self._consume_internal_timings()
+        t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
+        internal_timings = self._consume_internal_timings() if self.config.enable_runtime_timing else {}
 
         heatmap_output = heatmap_vln.decode_from_inputs_batch(
             inputs,
@@ -845,14 +874,17 @@ class Qwen3_5Integration(nn.Module):
             image_positions_batch=image_positions_batch,
             text_anchors_batch=text_anchor_positions_batch,
         )
-        t3 = time.perf_counter()
-        heatmap_output["timings"] = {
-            "prepare_inputs_s": t1 - t0,
-            "qwen_forward_s": t2 - t1,
-            "heatmap_decode_s": t3 - t2,
-            "panorama_total_s": t3 - t0,
-        }
-        heatmap_output["timings"].update(internal_timings)
+        if self.config.enable_runtime_timing:
+            t3 = time.perf_counter()
+            decode_timings = dict(heatmap_output.get("timings", {}) or {})
+            heatmap_output["timings"] = {
+                "prepare_inputs_s": t1 - t0,
+                "qwen_forward_s": t2 - t1,
+                "heatmap_decode_s": t3 - t2,
+                "panorama_total_s": t3 - t0,
+            }
+            heatmap_output["timings"].update(decode_timings)
+            heatmap_output["timings"].update(internal_timings)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
     
     def _forward_batch(

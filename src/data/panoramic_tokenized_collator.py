@@ -49,10 +49,34 @@ class PanoramicTokenizedCollator:
             "history_mask": torch.stack(history_mask, dim=0),
         }
 
+    @staticmethod
+    def _stack_padded_first_dim(
+        batch: List[Dict[str, Any]],
+        key: str,
+        pad_value: float = 0.0,
+    ) -> torch.Tensor:
+        max_k = max(sample[key].shape[0] for sample in batch)
+        padded_tensors = []
+
+        for sample in batch:
+            tensor = sample[key]
+            k = tensor.shape[0]
+            if k < max_k:
+                pad_shape = (max_k - k, *tensor.shape[1:])
+                pad_tensor = torch.full(
+                    pad_shape,
+                    fill_value=pad_value,
+                    dtype=tensor.dtype,
+                )
+                tensor = torch.cat([tensor, pad_tensor], dim=0)
+            padded_tensors.append(tensor)
+
+        return torch.stack(padded_tensors, dim=0)
+
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         result = self._stack_padded_history_frames(batch)
         result["current_frame"] = torch.stack([sample["current_frame"] for sample in batch], dim=0)
-        result["heatmap"] = torch.stack([sample["heatmap"] for sample in batch], dim=0)
+        result["heatmap"] = self._stack_padded_first_dim(batch, "heatmap")
         result["action"] = torch.stack([sample["action"] for sample in batch], dim=0)
         result["action_valid"] = torch.tensor([sample["action_valid"] for sample in batch])
         result["discrete_action"] = torch.tensor([sample.get("discrete_action", 1) for sample in batch])
@@ -62,9 +86,8 @@ class PanoramicTokenizedCollator:
         current_views = self._stack_optional(batch, "current_views")
         if current_views is not None:
             result["current_views"] = current_views
-        gt_visibility = self._stack_optional(batch, "gt_visibility")
-        if gt_visibility is not None:
-            result["gt_visibility"] = gt_visibility
+        if "gt_visibility" in batch[0]:
+            result["gt_visibility"] = self._stack_padded_first_dim(batch, "gt_visibility")
         if "is_flipped" in batch[0]:
             result["is_flipped"] = torch.tensor([sample.get("is_flipped", False) for sample in batch], dtype=torch.bool)
         if "trajectory" in batch[0]:
