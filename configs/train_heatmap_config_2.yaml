@@ -1,0 +1,232 @@
+seed: 42
+
+# ============================================
+# 数据配置 - 热力图专用训练（2 卡版）
+# ============================================
+data:
+  root: /root/autodl-tmp/heatmap_train_data
+  train_split: train
+  val_split: val
+  image_size: [256, 256]
+  init_hm_size: [64, 64]
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  
+  dataset_type: sliding_window
+  
+  sliding_window:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    load_history_frames: false
+    cache_poses: true
+    sample_stride: 2
+    defer_heatmap_to_gpu: false
+    clip_level_sampling: true
+    samples_per_clip: 45
+    val_samples_per_clip: 5
+  
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: true
+    samples_per_clip: 30
+    val_samples_per_clip: 10
+    random_subsequence: false
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    predict_horizon: 24
+    action_scale: 4.0
+    enable_trajectory_augmentation: false
+    use_subinstruction: false
+    fgr2r_subinstr_path: null
+
+# ============================================
+# 模型配置
+# ============================================
+model:
+  type: vln_pipeline
+  device: cuda
+
+  # Qwen3.5 配置
+  llm:
+    model_path: ./models/qwen_3.5
+    hidden_dim: 4096
+    token_dim: 1024
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    enable_internal_profiling: false
+    enable_compile: true
+    compile_mode: reduce-overhead
+    compile_backend: inductor
+    max_video_frames: -1
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+
+  # HeatmapVLN v2 Coarse-to-Fine 配置
+  heatmap:
+    enable: true
+    c_vit: 1152
+    c_llm: 4096
+    c_fused: 256
+    vit_layer_indices: [6, 12, 18, 24]
+    llm_layer_indices: [7, 15, 23]
+    heatmap_size: [64, 64]
+    image_size: 256
+
+    # 损失权重
+    lambda_vis: 1.0
+    lambda_coord: 5.0
+    lambda_kl: 1.0
+    lambda_neg: 0.1
+
+  # 动作头 - 禁用
+  action_head:
+    enable: false
+    type: transformer
+    legacy:
+      cond_dim: 1024
+      action_dim: 2
+      pred_horizon: 1
+      num_diffusion_iters: 10
+      encoding_size: 256
+      down_dims: [128, 256]
+      action_stats_min: [-0.1646, -0.0281]
+      action_stats_max: [0.1850, 0.3087]
+    transformer:
+      vlm_token_dim: 1024
+      n_emb: 384
+      predict_size: 24
+      n_layer: 16
+      n_head: 6
+      n_cond_layers: 4
+      action_dim: 3
+      num_train_timesteps: 20
+      p_drop_emb: 0.2
+      p_drop_attn: 0.2
+      causal_attn: true
+
+  # Progress 预测头 - 禁用
+  progress_head:
+    enable: false
+    hidden_dim: 512
+    dropout: 0.3
+    concat_state_txt: true
+
+  # Stop 预测头 - 禁用
+  stop_head:
+    enable: false
+    hidden_dim: 512
+    focal_gamma: 3.0
+    focal_alpha: 0.9
+
+# ============================================
+# 训练策略 - 只训练热力图 (~2M 参数)
+# ============================================
+training:
+  stages:
+    - name: heatmap_only_64_2gpu
+      epochs: 8
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
+      train_action: false
+      trainable_modules:
+        - heatmap_vln
+        - llm_projector
+      frozen_modules:
+        - qwen3_5
+        - transformer_action_head
+        - action_head
+        - progress_head
+        - stop_head
+
+# ============================================
+# 优化器配置
+# ============================================
+optim:
+  optimizer: adamw
+  learning_rate: 2.0e-4
+  heatmap_lr: 2.0e-4
+  llm_projector_lr: 5.0e-5
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.1
+  warmup_steps: 500
+  min_lr: 1.0e-6
+  # 注意：DDP 下这里是每个进程 / 每张卡的 local batch size。
+  # 2 卡时 5 x 2 = 总 batch 10，和当前单卡配置接近，最稳妥。
+  batch_size: 5
+  grad_accum_steps: 1
+
+# ============================================
+# 损失函数
+# ============================================
+loss:
+  heatmap_loss_type: heatmap_vln
+  
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 5.0
+    lambda_kl: 1.0
+    lambda_neg: 0.1
+    temperature: 1.0
+    temperature_schedule:
+      enabled: true
+      mode: cosine
+      start: 1.0
+      end: 7.0
+  
+  heatmap_weight: 1.0
+  trajectory_weight: 0.0
+  progress_weight: 0.0
+
+# ============================================
+# GPU配置
+# ============================================
+gpu:
+  devices: [0, 1]
+  backend: nccl
+  multi_gpu:
+    enabled: true
+    find_unused_parameters: false
+
+# ============================================
+# 日志与保存
+# ============================================
+log:
+  out_dir: /root/autodl-tmp/heatmap_training_outputs
+  save_every_epochs: 1
+  vis_every_steps: 100
+  val_vis_batches: 1
+  max_ckpts: 5
+  use_tensorboard: true
+  tensorboard_dir: /root/tf-logs
+  enable_timing: false
+  epoch_boundary_cooldown_s: 8
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  
+  notify:
+    enabled: true
+    platform: feishu
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+
+# ============================================
+# 验证配置
+# ============================================
+validation:
+  eval_every_epochs: 1
+  save_best_metric: val_total_loss
+  patience: 5
+  val_inference_batches: 6
