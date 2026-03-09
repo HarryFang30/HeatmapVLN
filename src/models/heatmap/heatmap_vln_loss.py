@@ -215,10 +215,16 @@ class HeatmapVLNLoss(nn.Module):
             gt_heatmaps,
         )
 
-        # Flatten history_mask to (N,) matching pred_vis leading dim
+        # Flatten history_mask to (N,) matching pred_vis leading dim.
+        # Guard against shape mismatch (e.g. load_history_frames=false makes
+        # batch history_mask track dummy frames, not actual heatmap histories).
         if history_mask is not None:
             valid = history_mask.reshape(-1).bool()
-            valid_4 = valid.unsqueeze(-1).expand_as(pred_vis)
+            if valid.shape[0] != pred_vis.shape[0]:
+                valid = None
+                valid_4 = None
+            else:
+                valid_4 = valid.unsqueeze(-1).expand_as(pred_vis)
         else:
             valid = None
             valid_4 = None

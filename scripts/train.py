@@ -2311,7 +2311,12 @@ def validate(
                                 mode='bilinear', align_corners=False,
                             ).reshape(*orig[:-2], *gt_hm_eval.shape[-2:])
                         hm_mask = batch.get('history_mask')
-                        if hm_mask is not None:
+                        mask_usable = (
+                            hm_mask is not None
+                            and infer_pred_hm.dim() >= 4
+                            and tuple(hm_mask.shape) == tuple(infer_pred_hm.shape[:2])
+                        )
+                        if mask_usable:
                             m = hm_mask.to(device).float()
                             while m.dim() < infer_pred_hm.dim():
                                 m = m.unsqueeze(-1)
