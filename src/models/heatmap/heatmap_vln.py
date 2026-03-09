@@ -336,7 +336,7 @@ class HeatmapVLN(nn.Module):
             coarse_heatmap=coarse_results["coarse_heatmap"],
             query_vector=history_queries_tensor,
         )
-        vis_gate = torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+        vis_gate = torch.sigmoid(all_visibility).detach().unsqueeze(-1).unsqueeze(-1)
         all_heatmaps = all_heatmaps * vis_gate
 
         return {"visibility": all_visibility, "heatmaps": all_heatmaps}
@@ -424,7 +424,7 @@ class HeatmapVLN(nn.Module):
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        vis_gate = torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+        vis_gate = torch.sigmoid(all_visibility).detach().unsqueeze(-1).unsqueeze(-1)
         all_heatmaps = all_heatmaps * vis_gate
 
         return {"visibility": all_visibility, "heatmaps": all_heatmaps}
@@ -530,7 +530,7 @@ class HeatmapVLN(nn.Module):
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        vis_gate = torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+        vis_gate = torch.sigmoid(all_visibility).detach().unsqueeze(-1).unsqueeze(-1)
         all_heatmaps = all_heatmaps * vis_gate
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
