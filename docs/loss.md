@@ -1,343 +1,124 @@
-# VLN 任务 Loss 设计文档
+# HeatmapVLN Loss 设计
 
-## 1. 任务概述
+## 任务定义
 
-本项目是一个 **视觉语言导航 (VLN)** 系统，基于冻结的 Qwen3-VL-8B 视觉语言模型，训练三个任务头：
+给定当前全景观测（前/右/后/左四个方向），预测每个历史帧拍摄位置在当前视图中的投影热力图。
 
-| 任务头 | 输出 | 目的 |
-|--------|------|------|
-| **热力图生成头** | 64×64 概率分布图 | 预测当前位置在历史轨迹中的可能位置 |
-| **轨迹预测头** | 24步 × 3维 (dx, dy, yaw) | 预测未来24步的运动轨迹 |
-| **进度预测头** | 1维标量 [0, 1] | 预测当前在整体导航任务中的进度 |
+模型输出：
+- `visibility`: `(N_hist, 4)` — 每个历史帧在 4 个方向上是否可见（logits）
+- `heatmaps`: `(N_hist, 4, 64, 64)` — 每个方向上的定位热力图（sigmoid 激活，值域 0\~1）
 
----
+核心难点：模型必须区分"看过的场景"和"历史帧拍摄的位置"，不应把视觉相似的区域也激活。
 
-## 2. 热力图生成 Loss
+## 设计思路
 
-### 2.1 任务特点
+两个不同的子问题，用不同的 loss：
 
-- **输入**: Qwen3-VL 提取的视觉语言特征 (1024维) + 观察图像
-- **输出**: 64×64 热力图，表示位置概率分布
-- **模型**: DiffusionHeatmapHead (ConditionalUnet2D + DDPM)
-- **GT特点**:
-  - 高斯分布形状（可能多峰，取决于导航场景）
-  - ~93.5% 是黑色背景 (值接近0)
-  - ~6.5% 是峰值区域 (中心最大值~1.0)
-- **特殊处理**: 360° 全景图，左右边界连续 (Circular Padding)
+| 子问题 | 适用视图 | Loss 类型 |
+|--------|----------|-----------|
+| "目标在哪里？" | gt\_vis > 0（可见） | Softmax Cross-Entropy |
+| "这里不该亮" | gt\_vis = 0（不可见） | Per-pixel BCE → 0 |
 
-### 2.2 样本级权重设计
+## 四项 Loss
 
-```python
-# 检测正/负样本
-is_negative = (gt_heatmap.max() < 0.01).float()  # 负样本：GT全零（不可见）
-is_positive = 1.0 - is_negative
-
-# 样本级权重：正样本提升 + 负样本降权
-sample_weight = (
-    positive_sample_boost * is_positive      # 正样本: 3.0x
-    + negative_sample_weight * is_negative   # 负样本: 0.3x
-)
-```
-
-| 样本类型 | 权重 | 理由 |
-|----------|------|------|
-| 正样本 (有峰值) | 3.0 | 峰值区域是导航的关键信息，需要重点学习 |
-| 负样本 (全零) | 0.3 | 负样本信号稀疏，过度学习会导致热力图全黑 |
-
-### 2.3 Min-SNR 时间步加权 (ICCV 2023)
-
-```python
-# 计算每个时间步的信噪比 (SNR)
-alpha_bar = noise_scheduler.alphas_cumprod[timesteps]  # (B,)
-snr = alpha_bar / (1 - alpha_bar)                      # (B, 1, 1, 1)
-
-# Min-SNR 加权：clamp(SNR, max=gamma) / SNR
-min_snr_gamma = 5.0
-snr_weight = torch.clamp(snr, max=min_snr_gamma) / snr  # (B, 1, 1, 1)
-```
-
-**核心思想**：标准 DDPM 对所有时间步等权重训练，但不同时间步的学习效率差异巨大：
-
-| 时间步区间 | SNR | 噪声预测难度 | 权重行为 |
-|-----------|-----|-------------|---------|
-| 低噪声步 (t < 50) | SNR > 5 (高) | 简单 | **压低** (snr_weight < 1)，减少梯度浪费 |
-| 中噪声步 | 0.5 ≤ SNR ≤ 5 | 适中 | **保持** (snr_weight ≈ 1) |
-| 高噪声步 (t > 120) | SNR < 0.5 (低) | 困难但对推理链至关重要 | **保持全权重** (snr_weight = 1) |
-
-**参考论文**: "Efficient Diffusion Training via Min-SNR Weighting Strategy" (ICCV 2023)
-
-### 2.4 主损失：Epsilon MSE + Min-SNR + 样本权重
-
-```python
-# Epsilon Loss（噪声预测损失）
-per_pixel_mse = (noise_pred - noise) ** 2  # (B, 1, H, W)
-
-# 综合加权：Min-SNR 时间步权重 × 正负样本权重
-diffusion_loss = (snr_weight * sample_weight_4d * per_pixel_mse).mean()
-
-total_loss = diffusion_loss
-```
-
-**公式**:
-$$L = \mathbb{E}_{t, \epsilon} \left[ w_{snr}(t) \cdot w_{sample} \cdot ||\epsilon - \epsilon_\theta(x_t, t, c)||^2 \right]$$
-
-其中：
-- $w_{snr}(t) = \min(\text{SNR}(t), \gamma) / \text{SNR}(t)$，$\gamma = 5.0$
-- $w_{sample}$ = 正样本 boost × is_positive + 负样本 weight × is_negative
-
-**设计理由**：
-- 移除了所有辅助损失（x0、dice、sparsity、neg_zero、peak_distance、visibility）
-- 仅保留 **单一 epsilon MSE**，通过 Min-SNR 加权实现高效训练
-- 简化后的 loss 更稳定，避免多 loss 之间的权重调参和梯度冲突
-
-### 2.5 为什么使用 Diffusion？
-
-对于可能出现 **多峰分布** 的热力图（1个峰、3个峰、7个峰都可能），Diffusion 是最佳选择：
-
-| 方案 | 单峰 | 多峰 | 原因 |
-|------|------|------|------|
-| CNN + KL | ✅ | ❌ | 多峰时学到"糊状"输出 |
-| CNN + 固定K点 | ❌ | ❌ | 峰数量不匹配 |
-| **Diffusion** | ✅ | ✅ | 去噪过程自然"雕刻"任意数量的峰 |
-
-### 2.6 完整 Loss 组合
+### 1. Visibility BCE — "这个方向看得到吗？"
 
 ```
-Total Loss = diffusion_loss
-           = (Min-SNR权重 × 样本权重 × epsilon_MSE).mean()
+vis_loss = BCEWithLogits(pred_vis, gt_vis)
 ```
 
-无辅助损失，单一目标函数。
+- 作用于所有真实（非 padding）视图
+- 训练 visibility head 区分可见/不可见方向
+- 推理时用 `sigmoid(vis)` 作为门控乘到热力图上
 
-### 2.7 当前权重配置
+### 2. Softmax Cross-Entropy — "可见的方向里，目标在哪个像素？"
+
+```
+gt_prob = gt / gt.sum()          # GT 归一化为概率分布（和为1）
+logits = logit(pred_sigmoid)     # sigmoid 输出还原为 raw logits
+log_probs = log_softmax(logits)  # 4096 个像素类的对数概率
+ce_loss = -Σ gt_prob(x) · log_probs(x)
+```
+
+- 只作用于 gt\_vis > 0 的视图
+- 将 64×64 = 4096 个像素视为 4096 类分类问题
+- GT 高斯热力图归一化为概率分布（所有像素和为 1）
+
+**为什么比 QFL/L2 更适合定位：**
+
+- **像素竞争**：softmax 保证概率和为 1，提高一个像素必然压低其他，结构性防止正样本内的假阳性
+- **无坍缩风险**：概率质量必须放在某个位置，不会收敛到全零
+- **无条带伪影**：把质量铺成条带的代价等同于正确高斯，没有偷懒激励
+- **梯度干净**：∂L/∂z\_i = softmax(z\_i) - gt\_prob(i)，每个像素自动获得正确方向和大小的梯度
+
+### 3. Negative BCE — "不可见的方向，热力图必须全黑"
+
+```
+neg_logits = logit(pred_sigmoid)
+neg_loss = BCEWithLogits(neg_logits, zeros)
+```
+
+- 只作用于 gt\_vis = 0 的视图
+- Softmax CE 无法覆盖不可见视图（GT 全零，无法归一化为概率分布）
+- 用 per-pixel BCE 直接推所有像素趋近 0
+- 梯度 = sigmoid(z) = pred：pred=0.9 时梯度 0.9（强压），pred=0.01 时梯度 0.01（几乎不扰动）
+- 对 visibility gate 的纵深防御——即使 vis head 判断失误，h\_loc 自身也被训练为全暗
+
+### 4. Coordinate Loss — 辅助定位微调
+
+```
+pred_xy = soft_argmax(pred, temperature=1.0)
+gt_xy   = soft_argmax(gt,   temperature=1.0)
+coord_loss = euclidean_distance(pred_xy, gt_xy)
+```
+
+- 只作用于 gt\_vis > 0 的视图
+- 低权重辅助项，提供显式的坐标级监督
+- 补充 softmax CE：CE 监督分布形状，coord 监督峰值位置
+
+## 权重配置
 
 ```yaml
-model:
-  heatmap_head:
-    use_circular_padding: true   # 360° 全景图支持
-    positive_sample_boost: 3.0   # 正样本权重提升
-    negative_sample_weight: 0.3  # 负样本降权
-
-loss:
-  history_weight: 1.0
-  future_weight: 0.0   # 关闭未来热力图
+lambda_vis:   1.0   # visibility BCE
+lambda_peak:  1.0   # softmax CE（正样本定位）
+lambda_neg:   1.0   # negative BCE（负样本压零）
+lambda_coord: 0.2   # soft-argmax 坐标距离（辅助）
+lambda_kl:    0.0   # 未使用，保留兼容
 ```
 
----
-
-## 3. 轨迹预测 Loss
-
-### 3.1 任务特点
-
-- **输入**: Qwen3-VL 特征 (1024维)
-- **输出**: 24步 × 3维 轨迹 (dx, dy, delta_yaw)
-- **模型**: TransformerActionHead 或 DiffusionActionHead
-- **GT**: 归一化的相对运动序列
-
-### 3.2 采用的 Loss
-
-根据配置使用以下两种之一：
-
-**TransformerActionHead (推荐)**:
-```python
-# 使用交叉熵或 MSE 计算动作预测损失
-result = model.transformer_action_head.compute_loss(pred_actions, gt_actions)
-trajectory_loss = result['loss']
+```
+total = 1.0 × vis_loss + 1.0 × ce_loss + 1.0 × neg_loss + 0.2 × coord_loss
 ```
 
-**DiffusionActionHead**:
-```python
-# 标准 DDPM 噪声预测 MSE
-noise = torch.randn_like(gt_trajectory)
-timesteps = torch.randint(0, num_train_timesteps, (batch_size,))
-noisy_trajectory = noise_scheduler.add_noise(gt_trajectory, noise, timesteps)
-noise_pred = model.forward_diffusion(noisy_trajectory, timesteps, cond)
-loss = F.mse_loss(noise_pred, noise)
+## 工程细节
+
+### Train/Eval 一致性
+
+模型始终在 `heatmaps` 键返回 raw h\_loc（未门控）。eval 模式下额外返回 `heatmaps_gated = h_loc × sigmoid(vis)`。Loss 始终作用在 raw h\_loc 上，确保训练和验证的损失语义一致。
+
+### Padding 屏蔽
+
+通过 `history_mask` 排除 padding 历史帧对所有 loss 的污染：
+- vis\_loss 中排除 padding 位（否则 `BCEWithLogits(0, 0) = 0.693` 常数噪声）
+- pos\_mask / neg\_mask 中排除 padding 位
+- 当 `load_history_frames=false` 导致 mask 形状与模型输出不匹配时，安全跳过 masking
+
+### 推理时的门控
+
+推理时热力图最终输出为：
+
+```
+h_final = sigmoid(visibility) × h_loc
 ```
 
-**公式**:
-$$L_{trajectory} = \mathbb{E}_{t, \epsilon} \left[ ||\epsilon - \epsilon_\theta(x_t, t, c)||^2 \right]$$
+不可见方向由 visibility gate 压制，可见方向保留 raw h\_loc 的定位结果。
 
-### 3.3 设计理由
+## Loss 演进历史
 
-| 选择 | 理由 |
-|------|------|
-| Diffusion | 生成多样轨迹，处理多模态输出 |
-| MSE on noise | 标准 DDPM 训练目标，稳定收敛 |
-| 无加权 | 轨迹各点同等重要，无类别不平衡 |
-
----
-
-## 4. 进度预测 Loss
-
-### 4.1 任务特点
-
-- **输入**: Qwen3-VL 特征 (1024维)
-- **输出**: 1维标量 [0, 1]，表示导航进度
-- **模型**: ProgressHead (MLP)
-- **GT分布**: 均匀分布，但边界点 (0 和 1) 是关键决策点
-
-### 4.2 采用的 Loss: 简单 MSE
-
-```python
-# 简单 MSE，无加权
-loss = F.mse_loss(progress, targets)
-```
-
-**公式**:
-$$L_{progress} = \frac{1}{N} \sum_{i} (p_i - \hat{p}_i)^2$$
-
-### 4.3 网络结构
-
-```python
-# 3 层 MLP (对齐 InternNav DistanceNetwork)
-nn.Sequential(
-    nn.Linear(input_dim, input_dim // 4),
-    nn.ReLU(),
-    nn.Linear(input_dim // 4, input_dim // 16),
-    nn.ReLU(),
-    nn.Linear(input_dim // 16, 1),
-    nn.Sigmoid(),
-)
-```
-
-### 4.4 设计理由
-
-| 选择 | 理由 |
-|------|------|
-| 简单 MSE | 对齐 InternNav，progress 均匀分布无需加权 |
-| 3 层 MLP | InternNav 验证过的简单有效结构 |
-| ReLU | 简单激活函数，避免过拟合 |
-| 无 LayerNorm/Dropout | 简单回归任务不需要复杂正则化 |
-
----
-
-## 5. 停止预测 Loss
-
-### 5.1 任务特点
-
-- **输入**: Qwen3-VL 特征 (1024维)
-- **输出**: 1维标量 (0 或 1)，表示是否停止
-- **模型**: StopHead
-- **GT**: 二进制标签
-
-### 5.2 采用的 Loss: BCE
-
-```python
-# 二元交叉熵
-loss = F.binary_cross_entropy_with_logits(stop_logit, stop_target)
-```
-
----
-
-## 6. 总体 Loss 组合
-
-### 6.1 总 Loss 公式
-
-$$L_{total} = \lambda_h \cdot L_{heatmap} + \lambda_t \cdot L_{trajectory} + \lambda_p \cdot L_{progress} + \lambda_s \cdot L_{stop}$$
-
-### 6.2 当前权重配置
-
-```yaml
-loss:
-  history_weight: 1.0       # λ_h (热力图)
-  future_weight: 0.0        # λ_f (未来热力图，已关闭)
-  trajectory_weight: 0.0    # λ_t (轨迹，已关闭)
-  progress_weight: 0.0      # λ_p (进度，已关闭)
-  stop_weight: 0.0          # λ_s (停止，已关闭)
-```
-
-**注意**：当前配置只训练热力图任务，其他任务头已关闭。
-
-### 6.3 权重设计理由
-
-| 任务 | 权重 | 理由 |
-|------|------|------|
-| 热力图 | 1.0 | 核心任务，输出维度最大，多重 loss 联合优化 |
-| 轨迹 | 0.0 | 单独训练 |
-| 进度 | 0.0 | 单独训练 |
-| 停止 | 0.0 | 辅助任务，已被进度预测替代 |
-
----
-
-## 7. 实际 Loss 输出监控
-
-训练时监控以下指标：
-
-```python
-{
-    'loss': total_loss,                    # 总 loss = diffusion_loss
-    'diffusion_loss': diffusion_loss,      # Min-SNR 加权 epsilon MSE
-    'eps_mse_high_snr': float,             # 低噪声区 (SNR>5) 的 epsilon MSE
-    'eps_mse_mid_snr': float,              # 中噪声区 (0.5≤SNR≤5) 的 epsilon MSE
-    'eps_mse_low_snr': float,              # 高噪声区 (SNR<0.5) 的 epsilon MSE
-    'heatmap': pred_heatmap,               # 推理热力图（每 100 步生成一次）
-    'noise_pred': noise_pred,              # 模型预测的噪声
-    'noise_target': noise,                 # 真实噪声
-    'noise_std': float,                    # 真实噪声的标准差
-    'noise_pred_std': float,               # 预测噪声的标准差
-}
-```
-
-**SNR 分段诊断**：通过对比三个 SNR 区间的 epsilon MSE，可以判断模型在不同噪声水平下的去噪能力：
-- `eps_mse_high_snr` 高 → 模型在简单（低噪声）时间步表现差
-- `eps_mse_low_snr` 高 → 模型在困难（高噪声）时间步表现差（正常，这些步本身困难）
-- `noise_std` vs `noise_pred_std` → 预测噪声的尺度是否与真实噪声匹配
-
----
-
-## 8. Loss 设计演进总结
-
-### v1
-- focal_weight: 0.3
-- x0_loss_weight: 1.0
-- 无 Dice Loss
-- sparsity_loss_weight: 0.5
-- peak_distance_loss_weight: 2.0
-
-### v2
-- focal_weight: 0.8 (aggressive)
-- x0_loss_weight: 3.0 (主力)
-- 新增 Dice Loss (×2.0)
-- sparsity_loss_weight: 0.1
-- peak_distance_loss_weight: 5.0
-- 新增 positive_sample_boost: 3.0
-- 双重 Focal 机制 + 6 个辅助 loss
-
-### v3 (当前版本)
-- **移除所有辅助 loss**（x0、dice、sparsity、neg_zero、peak_distance、visibility）
-- **移除空间 Focal 权重**
-- **新增 Min-SNR 时间步加权** (gamma=5.0)
-- 仅保留 epsilon MSE + 样本权重 + Min-SNR 加权
-- 新增 SNR 分段诊断监控
-
-### 核心改进 (v2 → v3)
-1. **极简化**：从 7 个 loss 分量精简为 **单一 loss**，消除多 loss 权重调参问题
-2. **Min-SNR 加权**：让模型在不同时间步上获得更均匀的学习信号，替代手工设计的 focal/SNR 门控
-3. **训练稳定性**：移除辅助 loss 的梯度冲突，收敛更稳定
-4. **诊断升级**：通过 SNR 分段 epsilon MSE 监控模型在不同噪声水平的表现
-
----
-
-## 9. 配置参考
-
-```yaml
-model:
-  heatmap_head:
-    use_circular_padding: true   # 360° 全景图支持
-    positive_sample_boost: 3.0   # 正样本权重提升
-    negative_sample_weight: 0.3  # 负样本降权
-
-  action_head:
-    type: transformer           # Transformer DDPM (推荐)
-
-  progress_head:
-    hidden_dim: 512
-
-loss:
-  history_weight: 1.0
-  future_weight: 0.0            # 关闭未来热力图
-  trajectory_weight: 0.0       # 单独训练
-  progress_weight: 0.0          # 单独训练
-  stop_weight: 0.0              # 关闭
-```
+| 版本 | 正样本定位 | 负样本抑制 | 问题 |
+|------|-----------|-----------|------|
+| v1 | KL + L2 + coord(λ=5) | L2(λ=0.1) + temp annealing | 权重失衡 50:1，假阳性爆炸 |
+| v2 | coord + BCE peak | BCE + max penalty | AMP 不兼容，热力图坍缩 |
+| v3 | coord + L1 peak(top-k) | pixel-level L2 | 梯度失衡（15000↓ vs 40↑），不收敛 |
+| v4 | QFL(β=2) | QFL 统一处理 | 假阳性 pred≈0.9 时 L2 梯度仍不够强 |
+| **v5（当前）** | **Softmax CE** | **per-pixel BCE** | — |
