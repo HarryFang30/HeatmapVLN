@@ -162,9 +162,8 @@ optim:
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   # 注意：DDP 下这里是每个进程 / 每张卡的 local batch size。
-  # 2 卡时 10 x 2 = 总 batch 20，进一步利用 5090 显存，
-  # 同时保持 grad_accum_steps=1，减少同步和调度开销。
-  batch_size: 10
+  # softmax CE + neg BCE 比旧 QFL 多占显存，batch 10 会 OOM。
+  batch_size: 8
   grad_accum_steps: 1
 
 # ============================================
