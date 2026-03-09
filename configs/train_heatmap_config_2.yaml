@@ -151,15 +151,14 @@ training:
 # ============================================
 optim:
   optimizer: adamw
-  learning_rate: 2.0e-4
-  heatmap_lr: 2.0e-4
-  llm_projector_lr: 5.0e-5
+  learning_rate: 1.0e-4
+  heatmap_lr: 1.0e-4
+  llm_projector_lr: 2.0e-5
   weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
-  warmup_ratio: 0.1
-  warmup_steps: 500
+  warmup_ratio: 0.05
   min_lr: 1.0e-6
   # 注意：DDP 下这里是每个进程 / 每张卡的 local batch size。
   # 2 卡时 10 x 2 = 总 batch 20，进一步利用 5090 显存，
