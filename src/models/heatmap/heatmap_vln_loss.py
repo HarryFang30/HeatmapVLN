@@ -4,25 +4,27 @@ HeatmapVLN Loss
 
 Loss for navigation-oriented heatmap prediction:
   1. Visibility BCE        — classify whether a history view is visible
-  2. Softmax Cross-Entropy — pixel-space classification (H×W = 4096 classes)
-  3. Coordinate loss       — low-weight auxiliary for peak position refinement
+  2. Softmax Cross-Entropy — pixel-space classification on visible views
+  3. Negative BCE          — push invisible-view heatmaps toward zero
+  4. Coordinate loss       — low-weight auxiliary for peak position refinement
 
-The heatmap is treated as a discrete probability distribution over the pixel
-grid.  GT is L1-normalized (sum=1) to form the target distribution; the model's
-sigmoid output is converted to logits → log_softmax to form the predicted
-distribution.  Cross-entropy between them provides:
+Design rationale — two distinct sub-problems require different losses:
 
-  - Inherent pixel competition:  increasing one pixel's probability necessarily
-    decreases others, preventing false positives structurally.
-  - No collapse risk:  the model MUST place probability mass *somewhere*, so it
-    cannot converge to all-zero output.
-  - No artifact risk:  spreading mass over a stripe costs the same as a correct
-    Gaussian — no incentive to cheat.
-  - Strong, balanced gradients:  softmax CE gradient = pred_prob - gt_prob,
-    automatically scaled and sign-correct for every pixel.
+  "Where is it?"  (visible views, gt_vis > 0)
+      Softmax CE over H×W = 4096 pixel classes.  GT L1-normalized to a
+      probability distribution.  Pixel competition prevents false positives
+      *within* visible views; no-collapse guarantee; clean gradients.
 
-Only computed on visible views (pos_mask).  Invisible views receive no heatmap
-loss — they are handled by the visibility gate at inference.
+  "It's NOT here." (invisible views, gt_vis = 0)
+      Per-pixel BCE pushing all sigmoid outputs toward 0.
+      Gradient = sigmoid(z) = pred: strong push-down on false positives
+      (grad 0.9 at pred=0.9), negligible on already-correct pixels
+      (grad 0.01 at pred=0.01).
+
+Softmax CE alone cannot suppress false positives on invisible views because
+those views are skipped (GT is all-zero, cannot be normalised).  The negative
+BCE provides direct h_loc supervision on these views — defense in depth beyond
+the visibility gate.
 """
 
 from typing import Dict, Tuple
@@ -40,8 +42,8 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for soft-argmax coordinate loss (auxiliary).
         lambda_kl: (unused, kept for config compatibility).
-        lambda_neg: (unused, kept for config compatibility).
-        lambda_peak: weight for softmax cross-entropy on heatmaps.
+        lambda_neg: weight for invisible-view negative suppression BCE.
+        lambda_peak: weight for softmax cross-entropy on visible-view heatmaps.
         temperature: soft-argmax temperature (only affects coord_loss).
         heatmap_size: expected heatmap resolution (H, W).
     """
@@ -51,7 +53,7 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: float = 1.0,
         lambda_coord: float = 0.2,
         lambda_kl: float = 0.0,
-        lambda_neg: float = 0.0,
+        lambda_neg: float = 1.0,
         lambda_peak: float = 1.0,
         temperature: float = 1.0,
         heatmap_size: Tuple[int, int] = (64, 64),
@@ -60,6 +62,7 @@ class HeatmapVLNLoss(nn.Module):
         super().__init__()
         self.lambda_vis = lambda_vis
         self.lambda_coord = lambda_coord
+        self.lambda_neg = lambda_neg
         self.lambda_peak = lambda_peak
         self.temperature = temperature
         self.heatmap_size = tuple(int(v) for v in heatmap_size)
@@ -212,19 +215,30 @@ class HeatmapVLNLoss(nn.Module):
         # (1) Visibility loss — all views
         vis_loss = F.binary_cross_entropy_with_logits(pred_vis, gt_vis.float())
 
-        # Select visible views for heatmap losses
         pos_mask = gt_vis.bool()
+        neg_mask = ~pos_mask
         has_pos = pos_mask.any()
+        has_neg = neg_mask.any()
         pred_pos = pred_heatmaps[pos_mask] if has_pos else None
         gt_pos = gt_heatmaps[pos_mask] if has_pos else None
 
-        # (2) Softmax CE — pixel-space classification on visible views only
+        # (2) Softmax CE — pixel-space classification on visible views
         if has_pos and self.lambda_peak > 0:
             ce_loss = self.softmax_ce_loss(pred_pos, gt_pos)
         else:
             ce_loss = torch.tensor(0.0, device=device)
 
-        # (3) Coordinate loss — auxiliary peak-position refinement
+        # (3) Negative BCE — push invisible-view h_loc toward zero
+        if has_neg and self.lambda_neg > 0:
+            pred_neg = pred_heatmaps[neg_mask]
+            neg_logits = torch.logit(pred_neg.float().clamp(1e-6, 1 - 1e-6))
+            neg_loss = F.binary_cross_entropy_with_logits(
+                neg_logits, torch.zeros_like(neg_logits), reduction="mean",
+            )
+        else:
+            neg_loss = torch.tensor(0.0, device=device)
+
+        # (4) Coordinate loss — auxiliary peak-position refinement
         if has_pos and self.lambda_coord > 0:
             coord_loss = self.soft_argmax_coord_loss(pred_pos, gt_pos)
         else:
@@ -233,6 +247,7 @@ class HeatmapVLNLoss(nn.Module):
         total = (
             self.lambda_vis * vis_loss
             + self.lambda_peak * ce_loss
+            + self.lambda_neg * neg_loss
             + self.lambda_coord * coord_loss
         )
 
@@ -242,6 +257,6 @@ class HeatmapVLNLoss(nn.Module):
             "vis_loss": vis_loss.detach(),
             "coord_loss": coord_loss.detach(),
             "kl_loss": torch.tensor(0.0, device=device),
-            "neg_loss": torch.tensor(0.0, device=device),
+            "neg_loss": neg_loss.detach(),
             "peak_loss": ce_loss.detach(),
         }
