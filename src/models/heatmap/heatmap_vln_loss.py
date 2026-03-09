@@ -205,9 +205,10 @@ class HeatmapVLNLoss(nn.Module):
         neg_mask = ~pos_mask
         if neg_mask.any():
             neg_pred = pred_heatmaps[neg_mask].float()
-            neg_bce = F.binary_cross_entropy(
-                neg_pred.clamp(1e-6, 1.0 - 1e-6),
-                torch.zeros_like(neg_pred),
+            neg_logits = torch.logit(neg_pred.clamp(1e-6, 1.0 - 1e-6))
+            neg_bce = F.binary_cross_entropy_with_logits(
+                neg_logits,
+                torch.zeros_like(neg_logits),
                 reduction="mean",
             )
             neg_max = neg_pred.reshape(neg_pred.shape[0], -1).amax(dim=-1).mean()
