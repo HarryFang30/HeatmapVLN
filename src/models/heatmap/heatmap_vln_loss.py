@@ -198,21 +198,12 @@ class HeatmapVLNLoss(nn.Module):
             coord_loss = torch.tensor(0.0, device=device)
             kl_loss = torch.tensor(0.0, device=device)
 
-        # (4) Negative-sample suppression: BCE + max-activation penalty
-        #     BCE penalizes any deviation from zero more aggressively than L2
-        #     for small values (gradient ≈ 1/(1-p) vs 2p for L2).
-        #     Max penalty directly targets the brightest false positive per view.
+        # (4) Negative-sample suppression: L2
+        #     L2 gradient (2p) naturally relaxes near zero, preventing output
+        #     collapse. Weight ratio coord:neg = 1:1 (was 50:1) is the key fix.
         neg_mask = ~pos_mask
         if neg_mask.any():
-            neg_pred = pred_heatmaps[neg_mask].float()
-            neg_logits = torch.logit(neg_pred.clamp(1e-6, 1.0 - 1e-6))
-            neg_bce = F.binary_cross_entropy_with_logits(
-                neg_logits,
-                torch.zeros_like(neg_logits),
-                reduction="mean",
-            )
-            neg_max = neg_pred.reshape(neg_pred.shape[0], -1).amax(dim=-1).mean()
-            neg_loss = neg_bce + neg_max
+            neg_loss = pred_heatmaps[neg_mask].float().square().mean()
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
