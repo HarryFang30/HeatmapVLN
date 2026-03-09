@@ -1552,6 +1552,7 @@ def train_one_epoch(
             
             # Heatmap Loss (v2: HeatmapVLNLoss computed externally)
             heatmap_loss = torch.tensor(0.0, device=device)
+            loss_dict = None
             
             if train_history and 'visibility' in output and 'heatmaps' in output:
                 if gt_heatmap is not None:
@@ -2009,19 +2010,36 @@ def train_one_epoch(
                 except Exception as e:
                     pass  # 忽略可视化写入错误
         
-        total_loss += loss.item() * grad_accum_steps
-        total_heatmap_loss += heatmap_loss.item()
-        total_action_loss += action_total_loss.item()
-        total_stop_loss += stop_total_loss.item()
+        _iter_loss = loss.item() * grad_accum_steps
+        _iter_hm = heatmap_loss.item()
+        _iter_traj = action_total_loss.item()
+        _iter_stop = stop_total_loss.item()
+
+        total_loss += _iter_loss
+        total_heatmap_loss += _iter_hm
+        total_action_loss += _iter_traj
+        total_stop_loss += _iter_stop
         num_batches += 1
-        
-        del output
-        
+
+        del output, loss, heatmap_loss, gt_heatmap
+        del action_total_loss, stop_total_loss
+        del trajectory_loss, action_loss, progress_loss, stop_loss
+        loss_dict = None
+
         pbar.set_postfix({
-            'loss': f"{loss.item()*grad_accum_steps:.4f}",
+            'loss': f"{_iter_loss:.4f}",
             'hm': f"{total_heatmap_loss / num_batches:.4f}",
-            'traj': f"{action_total_loss.item():.4f}",
+            'traj': f"{_iter_traj:.4f}",
         })
+
+        if num_batches % 50 == 0:
+            gc.collect()
+            _malloc_trim()
+            if num_batches % 200 == 0:
+                torch.cuda.empty_cache()
+                if tb_writer is not None:
+                    tb_writer.flush()
+
         prev_step_end = time.perf_counter()
     
     # 处理剩余梯度
@@ -2351,6 +2369,8 @@ def validate(
                             logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
                 except Exception as e:
                     logger.warning(f"Validation inference/visualization failed: {e}")
+
+            del output, gt_heatmap
     
     totals = torch.tensor(
         [
