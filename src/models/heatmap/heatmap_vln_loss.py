@@ -212,18 +212,19 @@ class HeatmapVLNLoss(nn.Module):
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
-        # (5) Peak region reconstruction: dense supervision on GT's bright
-        #     area (~top 1% pixels ≈ 41 for 64×64).  Provides both magnitude
-        #     AND spatial structure — the model must reproduce the Gaussian
-        #     decay pattern, not just a single pixel or a stripe.
+        # (5) Peak region reconstruction: L1 on ALL GT-bright pixels.
+        #     Covers the full Gaussian blob (~250 pixels for sigma≈3) instead
+        #     of just top-40.  L1 (not Smooth-L1) gives constant gradient
+        #     magnitude regardless of error size, crucial for escaping the
+        #     near-zero collapse state.
         if pos_mask.any():
-            K = pred_pos.shape[0]
-            gt_flat = gt_pos.float().reshape(K, -1)
-            pred_flat = pred_pos.float().reshape(K, -1)
-            top_n = max(1, gt_flat.shape[-1] // 100)
-            gt_topk = gt_flat.topk(top_n, dim=-1)
-            pred_at_bright = pred_flat.gather(1, gt_topk.indices)
-            peak_loss = F.smooth_l1_loss(pred_at_bright, gt_topk.values)
+            bright = gt_pos >= 0.01
+            if bright.any():
+                peak_loss = F.l1_loss(
+                    pred_pos[bright].float(), gt_pos[bright].float()
+                )
+            else:
+                peak_loss = torch.tensor(0.0, device=device)
         else:
             peak_loss = torch.tensor(0.0, device=device)
 
