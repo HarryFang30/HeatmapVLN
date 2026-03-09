@@ -336,10 +336,10 @@ class HeatmapVLN(nn.Module):
             coarse_heatmap=coarse_results["coarse_heatmap"],
             query_vector=history_queries_tensor,
         )
+        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
         if not self.training:
-            all_heatmaps = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
-
-        return {"visibility": all_visibility, "heatmaps": all_heatmaps}
+            result["heatmaps_gated"] = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+        return result
 
     def _decode_features_batch(
         self,
@@ -424,10 +424,11 @@ class HeatmapVLN(nn.Module):
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        if not self.training:
-            all_heatmaps = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
 
-        return {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        if not self.training:
+            result["heatmaps_gated"] = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+        return result
 
     def _decode_feature_tensors_batch(
         self,
@@ -530,13 +531,13 @@ class HeatmapVLN(nn.Module):
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        if not self.training:
-            all_heatmaps = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             timings["decode_post_s"] = time.perf_counter() - t_post0
 
         result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        if not self.training:
+            result["heatmaps_gated"] = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
         if self.enable_runtime_timing:
             result["timings"] = timings
         return result

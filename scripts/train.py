@@ -1559,11 +1559,15 @@ def train_one_epoch(
                         gt_vis = batch['gt_visibility'].to(device, non_blocking=True)
                     else:
                         gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
+                    hm_history_mask = batch.get('history_mask')
+                    if hm_history_mask is not None:
+                        hm_history_mask = hm_history_mask.to(device, non_blocking=True)
                     loss_dict = hm_loss_fn(
                         output['visibility'],
                         output['heatmaps'],
                         gt_vis=gt_vis,
                         gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
+                        history_mask=hm_history_mask,
                     )
                     heatmap_loss = loss_dict['total']
             
@@ -2211,11 +2215,15 @@ def validate(
                         gt_vis = batch['gt_visibility'].to(device)
                     else:
                         gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
+                    hm_history_mask = batch.get('history_mask')
+                    if hm_history_mask is not None:
+                        hm_history_mask = hm_history_mask.to(device)
                     loss_dict = hm_loss_fn(
                         output['visibility'],
                         output['heatmaps'],
                         gt_vis=gt_vis,
                         gt_heatmaps=gt_heatmap.to(device),
+                        history_mask=hm_history_mask,
                     )
                     heatmap_loss = loss_dict['total']
             
@@ -2293,7 +2301,7 @@ def validate(
                 try:
                     vis_output = output
                     if train_history and 'heatmaps' in vis_output:
-                        infer_pred_hm = vis_output['heatmaps']
+                        infer_pred_hm = vis_output.get('heatmaps_gated', vis_output['heatmaps'])
                         if infer_pred_hm.dim() == 5:
                             infer_pred_hm = infer_pred_hm[:, 0, 0, :, :]
                         elif infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:

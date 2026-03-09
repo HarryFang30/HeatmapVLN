@@ -282,7 +282,7 @@ def infer_sample(model: VLNPipeline, sample: Dict[str, Any], device: torch.devic
             return_actions=False,
         )
 
-    heatmaps = outputs.get('heatmaps')
+    heatmaps = outputs.get('heatmaps_gated', outputs.get('heatmaps'))
     if heatmaps is None:
         raise RuntimeError("模型未返回 heatmaps。")
     return heatmaps[0].float().cpu()

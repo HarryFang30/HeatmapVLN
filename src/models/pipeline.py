@@ -353,10 +353,14 @@ class VLNPipeline(nn.Module):
                 all_visibility.append(sample_output["visibility"])
                 all_heatmaps.append(sample_output["heatmaps"])
 
-            return {
+            result = {
                 "visibility": torch.stack(all_visibility, dim=0),
                 "heatmaps": torch.stack(all_heatmaps, dim=0),
             }
+            if not self.training:
+                vis_gate = torch.sigmoid(result["visibility"]).unsqueeze(-1).unsqueeze(-1)
+                result["heatmaps_gated"] = result["heatmaps"] * vis_gate
+            return result
 
         return self.heatmap_vln(
             current_views,
@@ -497,6 +501,8 @@ class VLNPipeline(nn.Module):
         if heatmap_output is not None:
             output['visibility'] = heatmap_output['visibility']
             output['heatmaps'] = heatmap_output['heatmaps']
+            if 'heatmaps_gated' in heatmap_output:
+                output['heatmaps_gated'] = heatmap_output['heatmaps_gated']
 
         if action_cond is not None:
             output['action_cond'] = action_cond

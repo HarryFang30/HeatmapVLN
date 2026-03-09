@@ -196,6 +196,7 @@ class HeatmapVLNLoss(nn.Module):
         pred_heatmaps: torch.Tensor,
         gt_vis: torch.Tensor,
         gt_heatmaps: torch.Tensor,
+        history_mask: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -203,6 +204,8 @@ class HeatmapVLNLoss(nn.Module):
             pred_heatmaps: ``(N_hist, 4, H, W)`` or ``(B, N_hist, 4, H, W)``.
             gt_vis:        ``(N_hist, 4)`` or ``(B, N_hist, 4)``.
             gt_heatmaps:   ``(N_hist, 4, H, W)`` or ``(B, N_hist, 4, H, W)``.
+            history_mask:  ``(N_hist,)`` or ``(B, N_hist)``.  Optional mask to
+                           exclude padded history positions from all losses.
         """
         device = pred_vis.device
         pred_vis, pred_heatmaps, gt_vis, gt_heatmaps = self._flatten_inputs(
@@ -212,11 +215,31 @@ class HeatmapVLNLoss(nn.Module):
             gt_heatmaps,
         )
 
-        # (1) Visibility loss — all views
-        vis_loss = F.binary_cross_entropy_with_logits(pred_vis, gt_vis.float())
+        # Flatten history_mask to (N,) matching pred_vis leading dim
+        if history_mask is not None:
+            valid = history_mask.reshape(-1).bool()
+            valid_4 = valid.unsqueeze(-1).expand_as(pred_vis)
+        else:
+            valid = None
+            valid_4 = None
 
+        # (1) Visibility loss — real (non-padded) views only
+        vis_bce = F.binary_cross_entropy_with_logits(
+            pred_vis, gt_vis.float(), reduction="none",
+        )
+        if valid_4 is not None:
+            vis_loss = (vis_bce * valid_4).sum() / valid_4.float().sum().clamp(min=1)
+        else:
+            vis_loss = vis_bce.mean()
+
+        # Build pos/neg masks, excluding padding
         pos_mask = gt_vis.bool()
-        neg_mask = ~pos_mask
+        if valid is not None:
+            real_view = valid.unsqueeze(-1).expand_as(pos_mask)
+            neg_mask = ~pos_mask & real_view
+            pos_mask = pos_mask & real_view
+        else:
+            neg_mask = ~pos_mask
         has_pos = pos_mask.any()
         has_neg = neg_mask.any()
         pred_pos = pred_heatmaps[pos_mask] if has_pos else None
