@@ -6,8 +6,8 @@ Task-priority loss for navigation-oriented heatmap prediction:
   1. Visibility BCE       — classify whether a history view is visible
   2. Coordinate loss      — directly supervise peak location (soft-argmax)
   3. KL distribution loss — shape matching after normalization
-  4. Negative suppression — L2 penalty on invisible views
-  5. Peak magnitude loss  — prevent magnitude collapse (L1 on pred vs GT peak)
+  4. Background suppression — pixel-level L2 on all GT-dark pixels (visible + invisible)
+  5. Peak region reconstruction — dense Smooth-L1 on GT's brightest pixels (anti-collapse)
 
 Reference: HeatmapVLN设计文档 Section 8
 """
@@ -27,8 +27,8 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for positive-sample coordinate loss.
         lambda_kl: weight for positive-sample KL shape loss.
-        lambda_neg: weight for negative-sample suppression (L2 penalty).
-        lambda_peak: weight for peak magnitude loss (anti-collapse).
+        lambda_neg: weight for background suppression (pixel-level L2).
+        lambda_peak: weight for peak region reconstruction (Smooth-L1).
         temperature: soft-argmax temperature (fixed, no annealing recommended).
         heatmap_size: expected heatmap resolution.
     """
@@ -202,27 +202,28 @@ class HeatmapVLNLoss(nn.Module):
             coord_loss = torch.tensor(0.0, device=device)
             kl_loss = torch.tensor(0.0, device=device)
 
-        # (4) Negative-sample suppression: L2
-        #     L2 gradient (2p) naturally relaxes near zero, preventing output
-        #     collapse. Weight ratio coord:neg = 1:1 (was 50:1) is the key fix.
-        neg_mask = ~pos_mask
-        if neg_mask.any():
-            neg_loss = pred_heatmaps[neg_mask].float().square().mean()
+        # (4) Background suppression: pixel-level L2 on ALL GT-dark pixels.
+        #     Unlike the old view-level approach (~pos_mask), this also
+        #     suppresses false activation in visible views' dark regions
+        #     (e.g., stripe artifacts that pass through a visible view).
+        gt_dark = gt_heatmaps.float() < 0.01
+        if gt_dark.any():
+            neg_loss = pred_heatmaps[gt_dark].float().square().mean()
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
-        # (5) Peak magnitude loss — location-aware.
-        #     Sample pred at GT's peak location (not pred's own argmax) so the
-        #     gradient pushes up the correct pixel, preventing a self-reinforcing
-        #     bright dot at a random wrong position.
+        # (5) Peak region reconstruction: dense supervision on GT's bright
+        #     area (~top 1% pixels ≈ 41 for 64×64).  Provides both magnitude
+        #     AND spatial structure — the model must reproduce the Gaussian
+        #     decay pattern, not just a single pixel or a stripe.
         if pos_mask.any():
             K = pred_pos.shape[0]
             gt_flat = gt_pos.float().reshape(K, -1)
             pred_flat = pred_pos.float().reshape(K, -1)
-            gt_peak_idx = gt_flat.argmax(dim=-1, keepdim=True)
-            pred_at_gt = pred_flat.gather(1, gt_peak_idx).squeeze(1)
-            gt_peak_val = gt_flat.amax(dim=-1)
-            peak_loss = F.l1_loss(pred_at_gt, gt_peak_val)
+            top_n = max(1, gt_flat.shape[-1] // 100)
+            gt_topk = gt_flat.topk(top_n, dim=-1)
+            pred_at_bright = pred_flat.gather(1, gt_topk.indices)
+            peak_loss = F.smooth_l1_loss(pred_at_bright, gt_topk.values)
         else:
             peak_loss = torch.tensor(0.0, device=device)
 
