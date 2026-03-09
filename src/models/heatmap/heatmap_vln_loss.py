@@ -172,6 +172,9 @@ class HeatmapVLNLoss(nn.Module):
         where gt_prob = gt / Σgt  (L1-normalised to a probability distribution)
         and logits = logit(sigmoid_output) = raw network output before sigmoid.
 
+        Uses F.cross_entropy with soft targets for a fused log_softmax+nll
+        kernel, reducing intermediate tensors and autograd nodes.
+
         pred:   [K, H, W]  sigmoid-activated values in (0, 1)
         target: [K, H, W]  GT heatmap values in [0, 1]
         Returns: scalar CE averaged over K views.
@@ -181,14 +184,11 @@ class HeatmapVLNLoss(nn.Module):
         K = pred.shape[0]
 
         logits = torch.logit(pred.clamp(1e-6, 1 - 1e-6)).reshape(K, -1)
-        log_probs = F.log_softmax(logits, dim=-1)
 
         gt_flat = target.reshape(K, -1)
-        gt_sum = gt_flat.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        gt_prob = gt_flat / gt_sum
+        gt_prob = gt_flat / gt_flat.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        ce = -(gt_prob * log_probs).sum(dim=-1)
-        return ce.mean()
+        return F.cross_entropy(logits, gt_prob)
 
     def forward(
         self,
@@ -258,12 +258,12 @@ class HeatmapVLNLoss(nn.Module):
             ce_loss = torch.tensor(0.0, device=device)
 
         # (3) Negative BCE — push invisible-view h_loc toward zero
+        # BCE(p, 0) = -log(1 - p) = -log1p(-p).  Direct formulation avoids
+        # the logit→zeros_like→bce_with_logits roundtrip and its extra
+        # autograd nodes / tensor allocations.
         if has_neg and self.lambda_neg > 0:
-            pred_neg = pred_heatmaps[neg_mask]
-            neg_logits = torch.logit(pred_neg.float().clamp(1e-6, 1 - 1e-6))
-            neg_loss = F.binary_cross_entropy_with_logits(
-                neg_logits, torch.zeros_like(neg_logits), reduction="mean",
-            )
+            pred_neg = pred_heatmaps[neg_mask].float().clamp(max=1 - 1e-6)
+            neg_loss = -torch.log1p(-pred_neg).mean()
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
