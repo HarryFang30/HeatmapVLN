@@ -2301,26 +2301,26 @@ def validate(
                 try:
                     vis_output = output
                     if train_history and 'heatmaps' in vis_output:
-                        infer_pred_hm = vis_output.get('heatmaps_gated', vis_output['heatmaps'])
-                        if infer_pred_hm.dim() == 5:
-                            infer_pred_hm = infer_pred_hm[:, 0, 0, :, :]
-                        elif infer_pred_hm.dim() == 4 and infer_pred_hm.shape[1] == 4:
-                            infer_pred_hm = infer_pred_hm[:, 0, :, :]
-                        elif infer_pred_hm.dim() == 4:
-                            infer_pred_hm = infer_pred_hm[:, -1, :, :]
-                        gt_hm_eval = gt_heatmap
-                        if gt_hm_eval.dim() == 5:
-                            gt_hm_eval = gt_hm_eval[:, 0, 0]
-                        elif gt_hm_eval.dim() == 4 and gt_hm_eval.shape[1] == 4:
-                            gt_hm_eval = gt_hm_eval[:, 0]
+                        infer_pred_hm = vis_output.get('heatmaps_gated', vis_output['heatmaps']).to(device)
+                        gt_hm_eval = gt_heatmap.to(device)
                         if infer_pred_hm.shape[-2:] != gt_hm_eval.shape[-2:]:
+                            orig = infer_pred_hm.shape
                             infer_pred_hm = F.interpolate(
-                                infer_pred_hm.unsqueeze(1),
+                                infer_pred_hm.reshape(-1, 1, *orig[-2:]),
                                 size=gt_hm_eval.shape[-2:],
-                                mode='bilinear', align_corners=False
-                            ).squeeze(1)
-                        batch_mse = F.mse_loss(infer_pred_hm, gt_hm_eval).item()
-                        total_heatmap_mse += batch_mse
+                                mode='bilinear', align_corners=False,
+                            ).reshape(*orig[:-2], *gt_hm_eval.shape[-2:])
+                        hm_mask = batch.get('history_mask')
+                        if hm_mask is not None:
+                            m = hm_mask.to(device).float()
+                            while m.dim() < infer_pred_hm.dim():
+                                m = m.unsqueeze(-1)
+                            m = m.expand_as(infer_pred_hm)
+                            sq_err = (infer_pred_hm - gt_hm_eval).square()
+                            batch_mse = (sq_err * m).sum() / m.sum().clamp(min=1)
+                        else:
+                            batch_mse = F.mse_loss(infer_pred_hm, gt_hm_eval)
+                        total_heatmap_mse += batch_mse.item()
                         num_heatmap_mse_batches += 1
                     
                     if dist_context.is_main and num_batches <= num_vis_batches and vis_dir is not None:
