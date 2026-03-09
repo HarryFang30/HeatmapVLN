@@ -5,26 +5,29 @@ HeatmapVLN Loss
 Loss for navigation-oriented heatmap prediction:
   1. Visibility BCE        — classify whether a history view is visible
   2. Softmax Cross-Entropy — pixel-space classification on visible views
-  3. Negative BCE          — push invisible-view heatmaps toward zero
-  4. Coordinate loss       — low-weight auxiliary for peak position refinement
+  3. Magnitude L1          — sigmoid-space absolute-value supervision
+  4. Negative BCE          — push invisible-view heatmaps toward zero
+  5. Coordinate loss       — low-weight auxiliary for peak position refinement
 
-Design rationale — two distinct sub-problems require different losses:
+Design rationale — three distinct sub-problems require different losses:
 
   "Where is it?"  (visible views, gt_vis > 0)
       Softmax CE over H×W = 4096 pixel classes.  GT L1-normalized to a
       probability distribution.  Pixel competition prevents false positives
-      *within* visible views; no-collapse guarantee; clean gradients.
+      *within* visible views; clean gradients.
+
+  "How bright should it be?"  (visible views, gt_vis > 0)
+      Pixel-level L1 between predicted and GT heatmap values in sigmoid
+      space.  Softmax CE is scale-invariant (shifting all logits by a
+      constant doesn't change the softmax distribution), so without this
+      loss the model can satisfy CE while having all sigmoid outputs ≈ 0.
+      The magnitude loss provides the only direct upward gradient on
+      positive-view activations.
 
   "It's NOT here." (invisible views, gt_vis = 0)
       Per-pixel BCE pushing all sigmoid outputs toward 0.
-      Gradient = sigmoid(z) = pred: strong push-down on false positives
-      (grad 0.9 at pred=0.9), negligible on already-correct pixels
-      (grad 0.01 at pred=0.01).
-
-Softmax CE alone cannot suppress false positives on invisible views because
-those views are skipped (GT is all-zero, cannot be normalised).  The negative
-BCE provides direct h_loc supervision on these views — defense in depth beyond
-the visibility gate.
+      Gradient ≈ pred: strong push-down on false positives, negligible
+      on already-correct pixels.
 """
 
 from typing import Dict, Tuple
@@ -41,7 +44,8 @@ class HeatmapVLNLoss(nn.Module):
     Args:
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for soft-argmax coordinate loss (auxiliary).
-        lambda_kl: (unused, kept for config compatibility).
+        lambda_kl: weight for magnitude L1 loss on visible-view heatmaps.
+            Prevents sigmoid collapse by providing direct upward gradient.
         lambda_neg: weight for invisible-view negative suppression BCE.
         lambda_peak: weight for softmax cross-entropy on visible-view heatmaps.
         temperature: soft-argmax temperature (only affects coord_loss).
@@ -52,7 +56,7 @@ class HeatmapVLNLoss(nn.Module):
         self,
         lambda_vis: float = 1.0,
         lambda_coord: float = 0.2,
-        lambda_kl: float = 0.0,
+        lambda_kl: float = 1.0,
         lambda_neg: float = 1.0,
         lambda_peak: float = 1.0,
         temperature: float = 1.0,
@@ -62,6 +66,7 @@ class HeatmapVLNLoss(nn.Module):
         super().__init__()
         self.lambda_vis = lambda_vis
         self.lambda_coord = lambda_coord
+        self.lambda_mag = lambda_kl
         self.lambda_neg = lambda_neg
         self.lambda_peak = lambda_peak
         self.temperature = temperature
@@ -257,7 +262,17 @@ class HeatmapVLNLoss(nn.Module):
         else:
             ce_loss = torch.tensor(0.0, device=device)
 
-        # (3) Negative BCE — push invisible-view h_loc toward zero
+        # (3) Magnitude L1 — sigmoid-space absolute-value supervision
+        # Softmax CE is scale-invariant: shifting all logits by a constant
+        # doesn't change the loss.  Without magnitude supervision the model
+        # can satisfy CE while collapsing all sigmoid outputs toward 0.
+        # L1 on positive views provides the only direct "push up" force.
+        if has_pos and self.lambda_mag > 0:
+            mag_loss = F.l1_loss(pred_pos.float(), gt_pos.float())
+        else:
+            mag_loss = torch.tensor(0.0, device=device)
+
+        # (4) Negative BCE — push invisible-view h_loc toward zero
         # BCE(p, 0) = -log(1 - p) = -log1p(-p).  Direct formulation avoids
         # the logit→zeros_like→bce_with_logits roundtrip and its extra
         # autograd nodes / tensor allocations.
@@ -267,7 +282,7 @@ class HeatmapVLNLoss(nn.Module):
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
-        # (4) Coordinate loss — auxiliary peak-position refinement
+        # (5) Coordinate loss — auxiliary peak-position refinement
         if has_pos and self.lambda_coord > 0:
             coord_loss = self.soft_argmax_coord_loss(pred_pos, gt_pos)
         else:
@@ -276,6 +291,7 @@ class HeatmapVLNLoss(nn.Module):
         total = (
             self.lambda_vis * vis_loss
             + self.lambda_peak * ce_loss
+            + self.lambda_mag * mag_loss
             + self.lambda_neg * neg_loss
             + self.lambda_coord * coord_loss
         )
@@ -285,7 +301,7 @@ class HeatmapVLNLoss(nn.Module):
             "monitor_total": total.detach(),
             "vis_loss": vis_loss.detach(),
             "coord_loss": coord_loss.detach(),
-            "kl_loss": torch.tensor(0.0, device=device),
+            "kl_loss": mag_loss.detach(),
             "neg_loss": neg_loss.detach(),
             "peak_loss": ce_loss.detach(),
         }

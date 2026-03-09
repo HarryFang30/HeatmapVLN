@@ -6,20 +6,21 @@
 
 模型输出：
 - `visibility`: `(N_hist, 4)` — 每个历史帧在 4 个方向上是否可见（logits）
-- `heatmaps`: `(N_hist, 4, 64, 64)` — 每个方向上的定位热力图（sigmoid 激活，值域 0\~1）
+- `heatmaps`: `(N_hist, 4, 64, 64)` — 每个方向上的定位热力图（sigmoid 激活，值域 0~1）
 
 核心难点：模型必须区分"看过的场景"和"历史帧拍摄的位置"，不应把视觉相似的区域也激活。
 
 ## 设计思路
 
-两个不同的子问题，用不同的 loss：
+三个不同的子问题，用不同的 loss：
 
 | 子问题 | 适用视图 | Loss 类型 |
 |--------|----------|-----------|
 | "目标在哪里？" | gt\_vis > 0（可见） | Softmax Cross-Entropy |
+| "应该多亮？" | gt\_vis > 0（可见） | Pixel-level L1 |
 | "这里不该亮" | gt\_vis = 0（不可见） | Per-pixel BCE → 0 |
 
-## 四项 Loss
+## 五项 Loss
 
 ### 1. Visibility BCE — "这个方向看得到吗？"
 
@@ -34,84 +35,76 @@ vis_loss = BCEWithLogits(pred_vis, gt_vis)
 ### 2. Softmax Cross-Entropy — "可见的方向里，目标在哪个像素？"
 
 ```
-gt_prob = gt / gt.sum()          # GT 归一化为概率分布（和为1）
-logits = logit(pred_sigmoid)     # sigmoid 输出还原为 raw logits
-log_probs = log_softmax(logits)  # 4096 个像素类的对数概率
-ce_loss = -Σ gt_prob(x) · log_probs(x)
+gt_prob = gt / gt.sum()      # GT 归一化为概率分布
+logits = logit(pred_sigmoid)  # 还原 raw logits
+ce_loss = F.cross_entropy(logits, gt_prob)  # fused kernel
 ```
 
 - 只作用于 gt\_vis > 0 的视图
 - 将 64×64 = 4096 个像素视为 4096 类分类问题
-- GT 高斯热力图归一化为概率分布（所有像素和为 1）
+- 像素竞争机制防止正样本内假阳性
+- **尺度不变**：softmax 只看相对差异，不约束 sigmoid 绝对值
 
-**为什么比 QFL/L2 更适合定位：**
-
-- **像素竞争**：softmax 保证概率和为 1，提高一个像素必然压低其他，结构性防止正样本内的假阳性
-- **无坍缩风险**：概率质量必须放在某个位置，不会收敛到全零
-- **无条带伪影**：把质量铺成条带的代价等同于正确高斯，没有偷懒激励
-- **梯度干净**：∂L/∂z\_i = softmax(z\_i) - gt\_prob(i)，每个像素自动获得正确方向和大小的梯度
-
-### 3. Negative BCE — "不可见的方向，热力图必须全黑"
+### 3. Magnitude L1 — "可见方向的输出应该多亮？"
 
 ```
-neg_logits = logit(pred_sigmoid)
-neg_loss = BCEWithLogits(neg_logits, zeros)
-```
-
-- 只作用于 gt\_vis = 0 的视图
-- Softmax CE 无法覆盖不可见视图（GT 全零，无法归一化为概率分布）
-- 用 per-pixel BCE 直接推所有像素趋近 0
-- 梯度 = sigmoid(z) = pred：pred=0.9 时梯度 0.9（强压），pred=0.01 时梯度 0.01（几乎不扰动）
-- 对 visibility gate 的纵深防御——即使 vis head 判断失误，h\_loc 自身也被训练为全暗
-
-### 4. Coordinate Loss — 辅助定位微调
-
-```
-pred_xy = soft_argmax(pred, temperature=1.0)
-gt_xy   = soft_argmax(gt,   temperature=1.0)
-coord_loss = euclidean_distance(pred_xy, gt_xy)
+mag_loss = L1(pred_pos, gt_pos)
 ```
 
 - 只作用于 gt\_vis > 0 的视图
-- 低权重辅助项，提供显式的坐标级监督
-- 补充 softmax CE：CE 监督分布形状，coord 监督峰值位置
+- **防坍缩的关键**：Softmax CE 是尺度不变的——所有 logit 同时下移不改变 CE。
+  neg\_loss 持续在 ~75% 视图推输出向 0。没有 magnitude loss，没有任何力量推正样本向上，
+  导致所有 sigmoid 输出坍缩到 ~0.01。
+- L1 直接在 sigmoid 空间监督绝对值，提供唯一的上推梯度
+- 坍缩时 L1 ≈ 0.015（有梯度），正确时 L1 ≈ 0（不扰动）
+
+### 4. Negative BCE — "不可见的方向，热力图必须全黑"
+
+```
+neg_loss = -log1p(-pred)  # 等价于 BCE(pred, 0)，但更高效
+```
+
+- 只作用于 gt\_vis = 0 的视图
+- 用 `torch.log1p` 直接计算，避免 logit→zeros\_like→bce\_with\_logits 的冗余链
+- 梯度 ≈ pred：pred=0.9 时梯度强（0.9），pred=0.01 时几乎不扰动（0.01）
+
+### 5. Coordinate Loss — 辅助定位微调
+
+```
+coord_loss = euclidean_distance(soft_argmax(pred), soft_argmax(gt))
+```
+
+- 低权重辅助项，补充 CE 的坐标级监督
 
 ## 权重配置
 
 ```yaml
 lambda_vis:   1.0   # visibility BCE
-lambda_peak:  1.0   # softmax CE（正样本定位）
+lambda_peak:  1.0   # softmax CE（分布定位）
+lambda_kl:    2.0   # magnitude L1（防坍缩）
 lambda_neg:   1.0   # negative BCE（负样本压零）
-lambda_coord: 0.2   # soft-argmax 坐标距离（辅助）
-lambda_kl:    0.0   # 未使用，保留兼容
+lambda_coord: 0.2   # soft-argmax 坐标距离
 ```
 
 ```
-total = 1.0 × vis_loss + 1.0 × ce_loss + 1.0 × neg_loss + 0.2 × coord_loss
+total = vis + ce + 2.0×mag + neg + 0.2×coord
 ```
 
 ## 工程细节
 
 ### Train/Eval 一致性
 
-模型始终在 `heatmaps` 键返回 raw h\_loc（未门控）。eval 模式下额外返回 `heatmaps_gated = h_loc × sigmoid(vis)`。Loss 始终作用在 raw h\_loc 上，确保训练和验证的损失语义一致。
+模型始终在 `heatmaps` 键返回 raw h\_loc（未门控）。eval 模式下额外返回 `heatmaps_gated = h_loc × sigmoid(vis)`。Loss 始终作用在 raw h\_loc 上。
 
 ### Padding 屏蔽
 
-通过 `history_mask` 排除 padding 历史帧对所有 loss 的污染：
-- vis\_loss 中排除 padding 位（否则 `BCEWithLogits(0, 0) = 0.693` 常数噪声）
-- pos\_mask / neg\_mask 中排除 padding 位
-- 当 `load_history_frames=false` 导致 mask 形状与模型输出不匹配时，安全跳过 masking
+通过 `history_mask` 排除 padding 历史帧的 loss 污染。
 
 ### 推理时的门控
-
-推理时热力图最终输出为：
 
 ```
 h_final = sigmoid(visibility) × h_loc
 ```
-
-不可见方向由 visibility gate 压制，可见方向保留 raw h\_loc 的定位结果。
 
 ## Loss 演进历史
 
@@ -121,4 +114,5 @@ h_final = sigmoid(visibility) × h_loc
 | v2 | coord + BCE peak | BCE + max penalty | AMP 不兼容，热力图坍缩 |
 | v3 | coord + L1 peak(top-k) | pixel-level L2 | 梯度失衡（15000↓ vs 40↑），不收敛 |
 | v4 | QFL(β=2) | QFL 统一处理 | 假阳性 pred≈0.9 时 L2 梯度仍不够强 |
-| **v5（当前）** | **Softmax CE** | **per-pixel BCE** | — |
+| v5 | Softmax CE | per-pixel BCE | sigmoid 坍缩（CE 尺度不变，无上推力） |
+| **v6（当前）** | **Softmax CE + L1** | **per-pixel BCE** | CE 管分布 + L1 管幅值 |

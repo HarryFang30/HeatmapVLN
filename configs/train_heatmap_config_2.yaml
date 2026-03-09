@@ -82,7 +82,7 @@ model:
     # 损失权重
     lambda_vis: 1.0
     lambda_coord: 0.2
-    lambda_kl: 0.0
+    lambda_kl: 2.0
     lambda_neg: 1.0
     lambda_peak: 1.0
 
@@ -175,7 +175,7 @@ loss:
   heatmap_vln:
     lambda_vis: 1.0
     lambda_coord: 0.2
-    lambda_kl: 0.0
+    lambda_kl: 2.0
     lambda_neg: 1.0
     lambda_peak: 1.0
     temperature: 1.0
