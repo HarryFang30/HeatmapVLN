@@ -358,8 +358,10 @@ class VLNPipeline(nn.Module):
                 "heatmaps": torch.stack(all_heatmaps, dim=0),
             }
             if not self.training:
-                vis_gate = torch.sigmoid(result["visibility"]).unsqueeze(-1).unsqueeze(-1)
-                result["heatmaps_gated"] = result["heatmaps"] * vis_gate
+                from src.models.heatmap.heatmap_vln import HeatmapVLN
+                result["heatmaps_gated"] = HeatmapVLN._gated_softmax_heatmaps(
+                    result["heatmaps"], result["visibility"],
+                )
             return result
 
         return self.heatmap_vln(

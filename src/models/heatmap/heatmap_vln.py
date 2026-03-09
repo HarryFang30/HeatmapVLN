@@ -338,7 +338,7 @@ class HeatmapVLN(nn.Module):
         )
         result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
         if not self.training:
-            result["heatmaps_gated"] = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
         return result
 
     def _decode_features_batch(
@@ -427,7 +427,7 @@ class HeatmapVLN(nn.Module):
 
         result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
         if not self.training:
-            result["heatmaps_gated"] = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
         return result
 
     def _decode_feature_tensors_batch(
@@ -537,10 +537,36 @@ class HeatmapVLN(nn.Module):
 
         result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
         if not self.training:
-            result["heatmaps_gated"] = all_heatmaps * torch.sigmoid(all_visibility).unsqueeze(-1).unsqueeze(-1)
+            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
         if self.enable_runtime_timing:
             result["timings"] = timings
         return result
+
+    @staticmethod
+    def _gated_softmax_heatmaps(
+        heatmaps: torch.Tensor,
+        visibility: torch.Tensor,
+    ) -> torch.Tensor:
+        """Produce inference-time probability heatmaps.
+
+        1. Convert sigmoid outputs back to logits.
+        2. Apply spatial softmax over each view's H×W pixels to get a
+           probability distribution — semantically aligned with the
+           Softmax CE training objective.
+        3. Gate by sigmoid(visibility) to suppress invisible views.
+
+        Returns tensor with same shape as *heatmaps*.
+        """
+        # (..., H, W) → logits → spatial softmax probability
+        H, W = heatmaps.shape[-2], heatmaps.shape[-1]
+        logits = torch.logit(heatmaps.float().clamp(1e-6, 1 - 1e-6))
+        probs = torch.softmax(logits.reshape(*logits.shape[:-2], -1), dim=-1)
+        probs = probs.reshape_as(heatmaps).to(heatmaps.dtype)
+        # Visibility gate
+        vis_gate = torch.sigmoid(visibility)
+        while vis_gate.dim() < probs.dim():
+            vis_gate = vis_gate.unsqueeze(-1)
+        return probs * vis_gate
 
     @staticmethod
     def _find_first_feature(

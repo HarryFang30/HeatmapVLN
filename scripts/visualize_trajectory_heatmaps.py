@@ -90,10 +90,12 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
 def overlay_heatmap_on_frame(frame: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6) -> np.ndarray:
     height, width = frame.shape[:2]
     hm_resized = cv2.resize(heatmap, (width, height), interpolation=cv2.INTER_CUBIC)
-    hm_uint8 = (np.clip(hm_resized, 0, 1) * 255).astype(np.uint8)
+    hm_max = hm_resized.max()
+    hm_norm = hm_resized / hm_max if hm_max > 1e-8 else hm_resized
+    hm_uint8 = (np.clip(hm_norm, 0, 1) * 255).astype(np.uint8)
     hm_color = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_INFERNO)
     hm_color = cv2.cvtColor(hm_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mask = np.clip(hm_resized * 3.0, 0.0, 1.0)[..., None]
+    mask = np.clip(hm_norm * 3.0, 0.0, 1.0)[..., None]
     mixed = frame * (1.0 - alpha * mask) + hm_color * (alpha * mask)
     return np.clip(mixed, 0, 1)
 

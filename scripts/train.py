@@ -1791,35 +1791,42 @@ def train_one_epoch(
                 # 诊断信息记录（固定间隔）
                 diag_interval = cfg['log'].get('diag_interval', 100)
                 if global_step % diag_interval == 0:
-                    # 热力图输出诊断 - 检查是否坍缩为全黑
+                    # 热力图输出诊断 — 在 softmax 概率空间评估
                     if 'heatmaps' in output and output['heatmaps'] is not None:
-                        pred_hm = output['heatmaps'].detach()
+                        pred_hm_raw = output['heatmaps'].detach()
                         
-                        pred_hm = _select_primary_heatmap_slice(pred_hm).unsqueeze(1)
+                        pred_hm_raw = _select_primary_heatmap_slice(pred_hm_raw).unsqueeze(1)
                         gt_hm_for_diag = gt_heatmap
                         gt_hm_for_diag = _select_primary_heatmap_slice(gt_hm_for_diag)
+                        
+                        # Convert to softmax probability (aligned with CE training objective)
+                        _B, _C, _H, _W = pred_hm_raw.shape
+                        _logits = torch.logit(pred_hm_raw.float().clamp(1e-6, 1 - 1e-6))
+                        pred_hm = torch.softmax(_logits.reshape(_B, _C, -1), dim=-1).reshape(_B, _C, _H, _W)
                         
                         pred_mean = pred_hm.mean().item()
                         pred_max = pred_hm.max().item()
                         pred_std = pred_hm.std().item()
+                        # Sigmoid-space stats for reference
+                        sig_max = pred_hm_raw.max().item()
                         
                         tb_writer.add_scalar('diag/pred_heatmap_mean', pred_mean, actual_step)
                         tb_writer.add_scalar('diag/pred_heatmap_max', pred_max, actual_step)
                         tb_writer.add_scalar('diag/pred_heatmap_std', pred_std, actual_step)
+                        tb_writer.add_scalar('diag/pred_sigmoid_max', sig_max, actual_step)
                         
                         gt_mean = gt_hm_for_diag.mean().item()
                         gt_max = gt_hm_for_diag.max().item()
                         
-                        logger.info(f"[DIAG-HM] pred: mean={pred_mean:.4f}, max={pred_max:.4f}, std={pred_std:.4f}")
-                        logger.info(f"[DIAG-HM] gt:   mean={gt_mean:.4f}, max={gt_max:.4f}")
+                        # softmax max 的健康基线 ≈ 1/4096 = 0.00024（均匀分布）
+                        # 正常训练的模型应显著高于此值
+                        uniform_baseline = 1.0 / (_H * _W)
+                        peak_ratio = pred_max / uniform_baseline if uniform_baseline > 0 else 0
+                        logger.info(f"[DIAG-HM] softmax: max={pred_max:.6f} ({peak_ratio:.1f}× uniform), sig_max={sig_max:.4f}")
+                        logger.info(f"[DIAG-HM] gt:      mean={gt_mean:.4f}, max={gt_max:.4f}")
                         
-                        if pred_max < 0.1:
-                            logger.warning(f"[DIAG-HM] ⚠️ 热力图输出疑似坍缩！pred_max={pred_max:.4f} < 0.1")
-                        
-                        non_zero_ratio = (pred_hm > 0.01).float().mean().item()
-                        tb_writer.add_scalar('diag/pred_heatmap_nonzero_ratio', non_zero_ratio, actual_step)
-                        if non_zero_ratio < 0.05:
-                            logger.warning(f"[DIAG-HM] ⚠️ 热力图几乎全黑！non_zero_ratio={non_zero_ratio*100:.2f}%")
+                        if peak_ratio < 2.0:
+                            logger.warning(f"[DIAG-HM] ⚠️ softmax 分布接近均匀！peak_ratio={peak_ratio:.1f}×")
                         
                         # ==================== 热力图质量指标 ====================
                         B, C, H, W = pred_hm.shape
