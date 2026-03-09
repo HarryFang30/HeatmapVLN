@@ -2,14 +2,17 @@
 HeatmapVLN Loss
 =================
 
-Task-priority loss for navigation-oriented heatmap prediction:
+Simplified loss for navigation-oriented heatmap prediction:
   1. Visibility BCE       — classify whether a history view is visible
   2. Coordinate loss      — directly supervise peak location (soft-argmax)
-  3. KL distribution loss — shape matching after normalization
-  4. Background suppression — pixel-level L2 on all GT-dark pixels (visible + invisible)
-  5. Peak region reconstruction — dense Smooth-L1 on GT's brightest pixels (anti-collapse)
+  3. Quality Focal Loss   — per-pixel heatmap regression with focal weighting
 
-Reference: HeatmapVLN设计文档 Section 8
+The model outputs sigmoid-activated heatmaps in (0, 1).  QFL provides:
+  - 5.5× stronger false-positive gradient than L2  (BCE vs L2 at pred=0.9)
+  - Automatic hard-example focus  (focal scale → 0 for correct pixels)
+  - Unified push-up + push-down in a single per-pixel loss
+
+Reference: Quality Focal Loss — Generalized Focal Loss (Li et al., NeurIPS 2020)
 """
 
 from typing import Dict, Tuple
@@ -26,30 +29,31 @@ class HeatmapVLNLoss(nn.Module):
     Args:
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for positive-sample coordinate loss.
-        lambda_kl: weight for positive-sample KL shape loss.
-        lambda_neg: weight for background suppression (pixel-level L2).
-        lambda_peak: weight for peak region reconstruction (Smooth-L1).
+        lambda_kl: (unused, kept for config compatibility).
+        lambda_neg: (unused, kept for config compatibility).
+        lambda_peak: weight for Quality Focal Loss on heatmaps.
         temperature: soft-argmax temperature (fixed, no annealing recommended).
         heatmap_size: expected heatmap resolution.
+        qfl_beta: focal exponent for QFL (default 2.0).
     """
 
     def __init__(
         self,
         lambda_vis: float = 1.0,
         lambda_coord: float = 1.0,
-        lambda_kl: float = 1.0,
-        lambda_neg: float = 1.0,
+        lambda_kl: float = 0.0,
+        lambda_neg: float = 0.0,
         lambda_peak: float = 1.0,
         temperature: float = 1.0,
         heatmap_size: Tuple[int, int] = (64, 64),
+        qfl_beta: float = 2.0,
     ):
         super().__init__()
         self.lambda_vis = lambda_vis
         self.lambda_coord = lambda_coord
-        self.lambda_kl = lambda_kl
-        self.lambda_neg = lambda_neg
         self.lambda_peak = lambda_peak
         self.temperature = temperature
+        self.qfl_beta = qfl_beta
         self.heatmap_size = tuple(int(v) for v in heatmap_size)
 
         height, width = self.heatmap_size
@@ -143,28 +147,39 @@ class HeatmapVLNLoss(nn.Module):
         )
         return coord_dist.mean()
 
-    @staticmethod
-    def normalized_kl_loss(
+    def quality_focal_loss(
+        self,
         pred: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compare normalized heatmaps as probability distributions.
+        Quality Focal Loss for continuous-valued heatmap GT.
 
-        pred/target: [K, H, W]
+        QFL(p, y) = |p - y|^β × BCE(p, y)
+
+        - False positive  (p=0.9, y=0):  scale=0.81, loss=1.87, grad≈12
+        - Missed detection (p=0.01, y=0.9): scale=0.79, loss=3.27, grad≈71
+        - Correct pred     (p≈y):          scale≈0,    loss≈0             ← no wasted gradient
+        - Easy negative    (p=0.01, y=0):  scale≈0,    loss≈0             ← no wasted gradient
+
+        pred/target: arbitrary shape, values in (0, 1).
+        Returns: scalar loss normalized per positive pixel.
         """
-        eps = 1e-8
-        pred = pred.float().reshape(pred.shape[0], -1)
-        target = target.float().reshape(target.shape[0], -1)
+        pred = pred.float().clamp(1e-6, 1 - 1e-6)
+        target = target.float()
 
-        pred_prob = pred + eps
-        pred_prob = pred_prob / pred_prob.sum(dim=-1, keepdim=True)
+        scale = (pred - target).abs().pow(self.qfl_beta)
 
-        target_prob = target + eps
-        target_prob = target_prob / target_prob.sum(dim=-1, keepdim=True)
+        # AMP-safe BCE: convert sigmoid output to logits
+        pred_logits = torch.logit(pred)
+        bce = F.binary_cross_entropy_with_logits(
+            pred_logits, target, reduction="none"
+        )
 
-        kl = target_prob * (target_prob.log() - pred_prob.log())
-        return kl.sum(dim=-1).mean()
+        focal = scale * bce
+
+        num_pos = (target >= 0.01).float().sum().clamp(min=1)
+        return focal.sum() / num_pos
 
     def forward(
         self,
@@ -191,49 +206,23 @@ class HeatmapVLNLoss(nn.Module):
         # (1) Visibility loss
         vis_loss = F.binary_cross_entropy_with_logits(pred_vis, gt_vis.float())
 
-        # (2) + (3) Positive-sample coordinate and distribution losses
+        # (2) Coordinate loss for position refinement
         pos_mask = gt_vis.bool()
-        if pos_mask.any():
+        if pos_mask.any() and self.lambda_coord > 0:
             pred_pos = pred_heatmaps[pos_mask]
             gt_pos = gt_heatmaps[pos_mask]
             coord_loss = self.soft_argmax_coord_loss(pred_pos, gt_pos)
-            kl_loss = self.normalized_kl_loss(pred_pos, gt_pos)
         else:
             coord_loss = torch.tensor(0.0, device=device)
-            kl_loss = torch.tensor(0.0, device=device)
 
-        # (4) Background suppression: pixel-level L2 on ALL GT-dark pixels.
-        #     Unlike the old view-level approach (~pos_mask), this also
-        #     suppresses false activation in visible views' dark regions
-        #     (e.g., stripe artifacts that pass through a visible view).
-        gt_dark = gt_heatmaps.float() < 0.01
-        if gt_dark.any():
-            neg_loss = pred_heatmaps[gt_dark].float().square().mean()
-        else:
-            neg_loss = torch.tensor(0.0, device=device)
-
-        # (5) Peak region reconstruction: L1 on ALL GT-bright pixels.
-        #     Covers the full Gaussian blob (~250 pixels for sigma≈3) instead
-        #     of just top-40.  L1 (not Smooth-L1) gives constant gradient
-        #     magnitude regardless of error size, crucial for escaping the
-        #     near-zero collapse state.
-        if pos_mask.any():
-            bright = gt_pos >= 0.01
-            if bright.any():
-                peak_loss = F.l1_loss(
-                    pred_pos[bright].float(), gt_pos[bright].float()
-                )
-            else:
-                peak_loss = torch.tensor(0.0, device=device)
-        else:
-            peak_loss = torch.tensor(0.0, device=device)
+        # (3) Quality Focal Loss — unified per-pixel heatmap regression.
+        #     Replaces the old separate neg_loss (L2) + peak_loss (L1).
+        qfl_loss = self.quality_focal_loss(pred_heatmaps, gt_heatmaps)
 
         total = (
             self.lambda_vis * vis_loss
             + self.lambda_coord * coord_loss
-            + self.lambda_kl * kl_loss
-            + self.lambda_neg * neg_loss
-            + self.lambda_peak * peak_loss
+            + self.lambda_peak * qfl_loss
         )
 
         return {
@@ -241,7 +230,7 @@ class HeatmapVLNLoss(nn.Module):
             "monitor_total": total.detach(),
             "vis_loss": vis_loss.detach(),
             "coord_loss": coord_loss.detach(),
-            "kl_loss": kl_loss.detach(),
-            "neg_loss": neg_loss.detach(),
-            "peak_loss": peak_loss.detach(),
+            "kl_loss": torch.tensor(0.0, device=device),
+            "neg_loss": torch.tensor(0.0, device=device),
+            "peak_loss": qfl_loss.detach(),
         }

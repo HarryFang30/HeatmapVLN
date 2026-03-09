@@ -83,7 +83,7 @@ model:
     lambda_vis: 1.0
     lambda_coord: 0.5
     lambda_kl: 0.0
-    lambda_neg: 1.0
+    lambda_neg: 0.0
     lambda_peak: 1.0
 
   # 动作头 - 禁用
@@ -177,7 +177,7 @@ loss:
     lambda_vis: 1.0
     lambda_coord: 0.5
     lambda_kl: 0.0
-    lambda_neg: 1.0
+    lambda_neg: 0.0
     lambda_peak: 1.0
     temperature: 1.0
     temperature_schedule:
