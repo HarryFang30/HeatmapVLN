@@ -211,15 +211,18 @@ class HeatmapVLNLoss(nn.Module):
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
-        # (5) Peak magnitude loss: penalizes when GT has a strong peak but
-        #     prediction peak is weak.  Without this, coord_loss (softmax) and
-        #     kl_loss (normalized) are both scale-invariant — they cannot
-        #     prevent the model from collapsing all values toward zero.
+        # (5) Peak magnitude loss — location-aware.
+        #     Sample pred at GT's peak location (not pred's own argmax) so the
+        #     gradient pushes up the correct pixel, preventing a self-reinforcing
+        #     bright dot at a random wrong position.
         if pos_mask.any():
             K = pred_pos.shape[0]
-            pred_peak = pred_pos.float().reshape(K, -1).amax(dim=-1)
-            gt_peak = gt_pos.float().reshape(K, -1).amax(dim=-1)
-            peak_loss = F.l1_loss(pred_peak, gt_peak)
+            gt_flat = gt_pos.float().reshape(K, -1)
+            pred_flat = pred_pos.float().reshape(K, -1)
+            gt_peak_idx = gt_flat.argmax(dim=-1, keepdim=True)
+            pred_at_gt = pred_flat.gather(1, gt_peak_idx).squeeze(1)
+            gt_peak_val = gt_flat.amax(dim=-1)
+            peak_loss = F.l1_loss(pred_at_gt, gt_peak_val)
         else:
             peak_loss = torch.tensor(0.0, device=device)
 
