@@ -1411,6 +1411,7 @@ def train_one_epoch(
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
         lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 1.0),
+        lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
         temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)
@@ -1745,6 +1746,10 @@ def train_one_epoch(
                 actual_step = global_step_offset + global_step
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
+                if isinstance(loss_dict, dict):
+                    for k in ('vis_loss', 'coord_loss', 'kl_loss', 'neg_loss', 'peak_loss'):
+                        if k in loss_dict:
+                            tb_writer.add_scalar(f'train/hm_{k}', loss_dict[k].item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
                 tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
                 tb_writer.add_scalar('train/heatmap_temperature', current_heatmap_temperature, actual_step)
@@ -2115,6 +2120,7 @@ def validate(
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
         lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 1.0),
+        lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
         temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
     ).to(device)

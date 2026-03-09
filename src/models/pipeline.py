@@ -85,6 +85,7 @@ class VLNPipelineConfig:
     heatmap_lambda_coord: float = 1.0
     heatmap_lambda_kl: float = 1.0
     heatmap_lambda_neg: float = 1.0
+    heatmap_lambda_peak: float = 1.0
 
     # ==================== Action Head ====================
     action_head_type: str = "transformer"

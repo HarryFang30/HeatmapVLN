@@ -6,7 +6,8 @@ Task-priority loss for navigation-oriented heatmap prediction:
   1. Visibility BCE       — classify whether a history view is visible
   2. Coordinate loss      — directly supervise peak location (soft-argmax)
   3. KL distribution loss — shape matching after normalization
-  4. Negative suppression — BCE per-pixel + max-activation penalty on invisible views
+  4. Negative suppression — L2 penalty on invisible views
+  5. Peak magnitude loss  — prevent magnitude collapse (L1 on pred vs GT peak)
 
 Reference: HeatmapVLN设计文档 Section 8
 """
@@ -26,7 +27,8 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for positive-sample coordinate loss.
         lambda_kl: weight for positive-sample KL shape loss.
-        lambda_neg: weight for negative-sample suppression (BCE + max penalty).
+        lambda_neg: weight for negative-sample suppression (L2 penalty).
+        lambda_peak: weight for peak magnitude loss (anti-collapse).
         temperature: soft-argmax temperature (fixed, no annealing recommended).
         heatmap_size: expected heatmap resolution.
     """
@@ -37,6 +39,7 @@ class HeatmapVLNLoss(nn.Module):
         lambda_coord: float = 1.0,
         lambda_kl: float = 1.0,
         lambda_neg: float = 1.0,
+        lambda_peak: float = 1.0,
         temperature: float = 1.0,
         heatmap_size: Tuple[int, int] = (64, 64),
     ):
@@ -45,6 +48,7 @@ class HeatmapVLNLoss(nn.Module):
         self.lambda_coord = lambda_coord
         self.lambda_kl = lambda_kl
         self.lambda_neg = lambda_neg
+        self.lambda_peak = lambda_peak
         self.temperature = temperature
         self.heatmap_size = tuple(int(v) for v in heatmap_size)
 
@@ -207,11 +211,24 @@ class HeatmapVLNLoss(nn.Module):
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
+        # (5) Peak magnitude loss: penalizes when GT has a strong peak but
+        #     prediction peak is weak.  Without this, coord_loss (softmax) and
+        #     kl_loss (normalized) are both scale-invariant — they cannot
+        #     prevent the model from collapsing all values toward zero.
+        if pos_mask.any():
+            K = pred_pos.shape[0]
+            pred_peak = pred_pos.float().reshape(K, -1).amax(dim=-1)
+            gt_peak = gt_pos.float().reshape(K, -1).amax(dim=-1)
+            peak_loss = F.l1_loss(pred_peak, gt_peak)
+        else:
+            peak_loss = torch.tensor(0.0, device=device)
+
         total = (
             self.lambda_vis * vis_loss
             + self.lambda_coord * coord_loss
             + self.lambda_kl * kl_loss
             + self.lambda_neg * neg_loss
+            + self.lambda_peak * peak_loss
         )
 
         return {
@@ -221,4 +238,5 @@ class HeatmapVLNLoss(nn.Module):
             "coord_loss": coord_loss.detach(),
             "kl_loss": kl_loss.detach(),
             "neg_loss": neg_loss.detach(),
+            "peak_loss": peak_loss.detach(),
         }

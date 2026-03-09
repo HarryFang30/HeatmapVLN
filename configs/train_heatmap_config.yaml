@@ -84,6 +84,7 @@ model:
     lambda_coord: 1.0
     lambda_kl: 1.0
     lambda_neg: 1.0
+    lambda_peak: 1.0
 
   # 动作头 - 禁用
   action_head:
@@ -174,6 +175,7 @@ loss:
     lambda_coord: 1.0
     lambda_kl: 1.0
     lambda_neg: 1.0
+    lambda_peak: 1.0
     temperature: 1.0
     temperature_schedule:
       enabled: false
