@@ -1447,6 +1447,8 @@ def train_one_epoch(
     metrics_jsonl_path: Optional[Path] = None,
     total_train_steps: int = 1,
     dist_context: Optional[DistributedContext] = None,
+    ckpt_manager: Optional['CheckpointManager'] = None,
+    mid_epoch_save_every: int = 1000,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     dist_context = dist_context or DistributedContext(
@@ -2156,6 +2158,54 @@ def train_one_epoch(
                 if tb_writer is not None:
                     tb_writer.flush()
 
+        if (
+            ckpt_manager is not None
+            and mid_epoch_save_every > 0
+            and num_batches > 0
+            and num_batches % mid_epoch_save_every == 0
+            and dist_context.is_main
+        ):
+            model_module_for_save = _unwrap_model(model)
+            mid_metrics = {
+                'total_loss': total_loss / num_batches,
+                'heatmap_loss': total_heatmap_loss / num_batches,
+                'action_loss': total_action_loss / num_batches,
+                'stop_loss': total_stop_loss / num_batches,
+            }
+            if ema is not None:
+                with ema.apply():
+                    ckpt_manager.save(
+                        model=model_module_for_save,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        stage_idx=stage_idx,
+                        stage_name=stage_name,
+                        metrics=mid_metrics,
+                        cfg=cfg,
+                        is_best=False,
+                        scaler=scaler,
+                        batch=num_batches,
+                    )
+            else:
+                ckpt_manager.save(
+                    model=model_module_for_save,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    stage_idx=stage_idx,
+                    stage_name=stage_name,
+                    metrics=mid_metrics,
+                    cfg=cfg,
+                    is_best=False,
+                    scaler=scaler,
+                    batch=num_batches,
+                )
+            logger.info(
+                f"  Mid-epoch checkpoint saved at batch {num_batches} "
+                f"(loss={mid_metrics['total_loss']:.4f})"
+            )
+
         prev_step_end = time.perf_counter()
     
     # 处理剩余梯度
@@ -2550,8 +2600,9 @@ class CheckpointManager:
         cfg: Dict,
         is_best: bool = False,
         scaler: GradScaler = None,
+        batch: int = None,
     ) -> Path:
-        """保存检查点"""
+        """保存检查点。batch 不为 None 时保存为 mid-epoch checkpoint。"""
         trainable_params = _normalized_trainable_param_names(model)
         normalized_state_dict = _normalized_model_state_dict(model)
         trainable_state_dict = {
@@ -2561,6 +2612,7 @@ class CheckpointManager:
         
         ckpt = {
             'epoch': epoch,
+            'batch': batch,
             'stage_idx': stage_idx,
             'stage_name': stage_name,
             'trainable_state_dict': trainable_state_dict,
@@ -2574,7 +2626,10 @@ class CheckpointManager:
         if scaler is not None:
             ckpt['scaler_state_dict'] = scaler.state_dict()
 
-        ckpt_path = self.out_dir / f"epoch_{epoch:03d}.pth"
+        if batch is not None:
+            ckpt_path = self.out_dir / f"epoch_{epoch:03d}_batch_{batch:05d}.pth"
+        else:
+            ckpt_path = self.out_dir / f"epoch_{epoch:03d}.pth"
         torch.save(ckpt, ckpt_path)
         file_size_mb = ckpt_path.stat().st_size / (1024**2)
         print(f"💾 Saved: {ckpt_path.name} ({file_size_mb:.1f} MB)")
@@ -3380,6 +3435,8 @@ def main():
             metrics_jsonl_path=metrics_jsonl_path,
             total_train_steps=total_steps,
             dist_context=dist_context,
+            ckpt_manager=ckpt_manager,
+            mid_epoch_save_every=cfg['log'].get('mid_epoch_save_every', 1000),
         )
         
         timer.end_epoch()
