@@ -473,6 +473,7 @@ class VLNSlidingWindowDataset(Dataset):
         subsequence_samples_per_clip: int = 3,  # 每个 clip 生成的子序列数量
         chunk_direction: str = "front",  # chunks 模式下读取的视角
         chunk_cache_size: int = 6,  # chunks 模式下缓存的数组个数（worker 内）
+        metadata_cache_size: int = 500,  # 元数据 LRU 缓存大小（clip 数量），防止 worker 内存无限增长
         defer_heatmap_to_gpu: bool = False,  # 兼容 train.py 传入（由 GPUHeatmapComputer 处理）
         load_history_frames: bool = True,
     ):
@@ -500,6 +501,7 @@ class VLNSlidingWindowDataset(Dataset):
         self.subsequence_samples_per_clip = subsequence_samples_per_clip
         self.chunk_direction = chunk_direction
         self.chunk_cache_size = max(1, int(chunk_cache_size))
+        self.metadata_cache_size = max(50, int(metadata_cache_size))
 
         # 数据增强 (仅训练集启用)
         self.enable_augmentation = enable_augmentation and (split == 'train')
@@ -519,18 +521,19 @@ class VLNSlidingWindowDataset(Dataset):
         
         # 预计算样本索引
         self.sample_index = []  # [(clip_idx, current_frame_idx), ...]
-        self._poses_cache = {}  # clip_idx -> poses
-        self._meta_cache = {}   # clip_idx -> meta
+        self._poses_cache: OrderedDict = OrderedDict()
+        self._meta_cache: OrderedDict = OrderedDict()
         
         self._build_sample_index()
         
         # chunks 模式相关缓存（每个 dataloader worker 独立）
+        # 全部使用 OrderedDict + LRU 淘汰，防止在 worker 进程中内存无限增长
         self._clip_dir_to_idx = {str(clip_dir): i for i, clip_dir in enumerate(self.clips)}
-        self._storage_format_cache: Dict[int, str] = {}
-        self._chunk_frame_lookup_cache: Dict[int, Dict[int, Tuple[str, int]]] = {}
-        self._chunk_key_map_cache: Dict[int, Dict[str, str]] = {}
-        self._chunk_array_cache: "OrderedDict[Tuple[int, str, str], np.ndarray]" = OrderedDict()
-        self._intrinsics_cache: Dict[int, Tuple[Tuple[int, int], Optional[np.ndarray]]] = {}
+        self._storage_format_cache: OrderedDict = OrderedDict()
+        self._chunk_frame_lookup_cache: OrderedDict = OrderedDict()
+        self._chunk_key_map_cache: OrderedDict = OrderedDict()
+        self._chunk_array_cache: OrderedDict = OrderedDict()
+        self._intrinsics_cache: OrderedDict = OrderedDict()
         
         self._depth_is_meters = self._detect_depth_format()
         self._is_panoramic = self._detect_panoramic()
@@ -547,6 +550,23 @@ class VLNSlidingWindowDataset(Dataset):
             f"samples_per_clip={self.samples_per_clip}, min_history={min_history}"
         )
     
+    def _lru_put(self, cache: OrderedDict, key, value, max_size: int):
+        """向 LRU 缓存写入条目，超过上限时淘汰最旧条目。"""
+        if key in cache:
+            cache.move_to_end(key)
+            cache[key] = value
+        else:
+            cache[key] = value
+            while len(cache) > max_size:
+                cache.popitem(last=False)
+
+    def _lru_get(self, cache: OrderedDict, key):
+        """从 LRU 缓存读取条目，命中时更新访问顺序。返回 (value, hit)。"""
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key], True
+        return None, False
+
     def _detect_depth_format(self) -> bool:
         """自动检测深度图格式：米制 (True) 或归一化 [0,1] (False)"""
         if not self.load_depth or len(self.clips) == 0:
@@ -578,8 +598,9 @@ class VLNSlidingWindowDataset(Dataset):
             return False
 
     def _load_intrinsics(self, clip_idx: int, clip_dir: Path) -> Tuple[Tuple[int, int], Optional[np.ndarray]]:
-        if clip_idx in self._intrinsics_cache:
-            return self._intrinsics_cache[clip_idx]
+        val, hit = self._lru_get(self._intrinsics_cache, clip_idx)
+        if hit:
+            return val
 
         intrinsics_path = clip_dir / "intrinsics.json"
         K = None
@@ -592,8 +613,9 @@ class VLNSlidingWindowDataset(Dataset):
         else:
             img_size = (640, 480)
 
-        self._intrinsics_cache[clip_idx] = (img_size, K)
-        return self._intrinsics_cache[clip_idx]
+        result = (img_size, K)
+        self._lru_put(self._intrinsics_cache, clip_idx, result, self.metadata_cache_size)
+        return result
     
     def _detect_panoramic(self) -> bool:
         """检测数据集是否包含全景多视角数据 (rgb_front, rgb_right, rgb_back, rgb_left)"""
@@ -745,9 +767,10 @@ class VLNSlidingWindowDataset(Dataset):
         logger.info(f"[Epoch {epoch}] Resampled {len(self.sample_index)} samples from {len(self.clips)} clips")
     
     def _load_meta(self, clip_idx: int) -> Dict:
-        """加载并缓存 clip 元数据"""
-        if clip_idx in self._meta_cache:
-            return self._meta_cache[clip_idx]
+        """加载并缓存 clip 元数据（LRU 淘汰）"""
+        val, hit = self._lru_get(self._meta_cache, clip_idx)
+        if hit:
+            return val
         
         clip_dir = self.clips[clip_idx]
         meta_file = clip_dir / "meta.json"
@@ -758,13 +781,15 @@ class VLNSlidingWindowDataset(Dataset):
         with open(meta_file, 'r') as f:
             meta = json.load(f)
         
-        self._meta_cache[clip_idx] = meta
+        self._lru_put(self._meta_cache, clip_idx, meta, self.metadata_cache_size)
         return meta
     
     def _load_poses(self, clip_idx: int) -> List[np.ndarray]:
-        """加载并缓存位姿数据"""
-        if self.cache_poses and clip_idx in self._poses_cache:
-            return self._poses_cache[clip_idx]
+        """加载并缓存位姿数据（LRU 淘汰）"""
+        if self.cache_poses:
+            val, hit = self._lru_get(self._poses_cache, clip_idx)
+            if hit:
+                return val
         
         clip_dir = self.clips[clip_idx]
         storage_format = self._get_storage_format(clip_idx)
@@ -786,14 +811,15 @@ class VLNSlidingWindowDataset(Dataset):
             poses = [np.array(p, dtype=np.float32) for p in poses_list]
         
         if self.cache_poses:
-            self._poses_cache[clip_idx] = poses
+            self._lru_put(self._poses_cache, clip_idx, poses, self.metadata_cache_size)
         
         return poses
 
     def _get_storage_format(self, clip_idx: int) -> str:
         """自动识别 clip 的存储格式（frames/chunks）。"""
-        if clip_idx in self._storage_format_cache:
-            return self._storage_format_cache[clip_idx]
+        val, hit = self._lru_get(self._storage_format_cache, clip_idx)
+        if hit:
+            return val
         
         clip_dir = self.clips[clip_idx]
         meta = self._load_meta(clip_idx)
@@ -802,7 +828,7 @@ class VLNSlidingWindowDataset(Dataset):
         if storage_format not in {"frames", "chunks"}:
             storage_format = "chunks" if (clip_dir / "chunks").exists() else "frames"
         
-        self._storage_format_cache[clip_idx] = storage_format
+        self._lru_put(self._storage_format_cache, clip_idx, storage_format, self.metadata_cache_size)
         return storage_format
 
     def _get_clip_idx(self, clip_dir: Path) -> int:
@@ -812,8 +838,10 @@ class VLNSlidingWindowDataset(Dataset):
         return self._clip_dir_to_idx[clip_key]
 
     def _ensure_chunk_index(self, clip_idx: int):
-        """建立 frame -> (chunk_path, local_idx) 索引，并推断键名。"""
-        if clip_idx in self._chunk_frame_lookup_cache and clip_idx in self._chunk_key_map_cache:
+        """建立 frame -> (chunk_path, local_idx) 索引，并推断键名（LRU 淘汰）。"""
+        _, hit_lookup = self._lru_get(self._chunk_frame_lookup_cache, clip_idx)
+        _, hit_keymap = self._lru_get(self._chunk_key_map_cache, clip_idx)
+        if hit_lookup and hit_keymap:
             return
         
         clip_dir = self.clips[clip_idx]
@@ -829,6 +857,7 @@ class VLNSlidingWindowDataset(Dataset):
         key_map: Dict[str, str] = {}
         
         for chunk_path in chunk_files:
+            chunk_path_str = str(chunk_path)
             try:
                 with np.load(chunk_path, allow_pickle=True) as chunk_data:
                     if "frame_ids" not in chunk_data:
@@ -836,7 +865,7 @@ class VLNSlidingWindowDataset(Dataset):
                         continue
                     frame_ids = np.array(chunk_data["frame_ids"], dtype=np.int32)
                     for local_idx, frame_id in enumerate(frame_ids.tolist()):
-                        frame_lookup[int(frame_id)] = (str(chunk_path), int(local_idx))
+                        frame_lookup[int(frame_id)] = (chunk_path_str, int(local_idx))
                     
                     if not key_map:
                         files = set(chunk_data.files)
@@ -857,15 +886,15 @@ class VLNSlidingWindowDataset(Dataset):
         if "rgb" not in key_map or "pose" not in key_map:
             raise KeyError(f"Chunk keys missing (need rgb/pose): clip={clip_dir}, key_map={key_map}")
         
-        self._chunk_frame_lookup_cache[clip_idx] = frame_lookup
-        self._chunk_key_map_cache[clip_idx] = key_map
+        self._lru_put(self._chunk_frame_lookup_cache, clip_idx, frame_lookup, self.metadata_cache_size)
+        self._lru_put(self._chunk_key_map_cache, clip_idx, key_map, self.metadata_cache_size)
 
     def _load_chunk_array(self, clip_idx: int, chunk_path: str, array_key: str) -> np.ndarray:
-        """加载并缓存 chunk 内单个数组。"""
+        """加载并缓存 chunk 内单个数组（LRU 淘汰）。"""
         cache_key = (clip_idx, chunk_path, array_key)
-        if cache_key in self._chunk_array_cache:
-            self._chunk_array_cache.move_to_end(cache_key)
-            return self._chunk_array_cache[cache_key]
+        val, hit = self._lru_get(self._chunk_array_cache, cache_key)
+        if hit:
+            return val
         
         with np.load(chunk_path, allow_pickle=True) as chunk_data:
             if array_key not in chunk_data:
@@ -874,12 +903,7 @@ class VLNSlidingWindowDataset(Dataset):
             if not isinstance(arr, np.ndarray):
                 arr = np.array(arr)
         
-        self._chunk_array_cache[cache_key] = arr
-        self._chunk_array_cache.move_to_end(cache_key)
-        
-        while len(self._chunk_array_cache) > self.chunk_cache_size:
-            self._chunk_array_cache.popitem(last=False)
-        
+        self._lru_put(self._chunk_array_cache, cache_key, arr, self.chunk_cache_size)
         return arr
 
     def _get_chunk_frame_array(self, clip_idx: int, frame_idx: int, base_key: str,

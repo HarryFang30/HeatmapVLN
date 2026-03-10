@@ -5,6 +5,7 @@ This moves Qwen processor/tokenizer work into DataLoader workers so the
 training main thread can consume already-tokenized panoramic batches.
 """
 
+import gc
 from typing import Any, Dict, List
 
 import torch
@@ -18,6 +19,7 @@ class PanoramicTokenizedCollator:
     def __init__(self, processor):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
+        self._call_count = 0
 
     @staticmethod
     def _stack_optional(batch: List[Dict[str, Any]], key: str):
@@ -143,8 +145,18 @@ class PanoramicTokenizedCollator:
                 for batch_idx in range(len(batch))
             ]
 
+            del messages_batch
             result["pano_inputs"] = pano_inputs
             result["pano_num_histories"] = pano_num_histories
             result["pano_text_anchor_positions"] = pano_text_anchor_positions
+
+        self._call_count += 1
+        if self._call_count % 20 == 0:
+            gc.collect()
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
         return result

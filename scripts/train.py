@@ -2038,6 +2038,11 @@ def train_one_epoch(
         del action_total_loss, stop_total_loss
         del trajectory_loss, action_loss, progress_loss, stop_loss
         loss_dict = None
+        del video_frames
+        del current_views_batch, history_panoramas_batch
+        del panoramic_inputs_batch, panoramic_num_histories, panoramic_text_anchor_positions
+        del history_frames, current_frame, gt_action, action_valid, is_stop, text
+        del batch
 
         pbar.set_postfix({
             'loss': f"{_iter_loss:.4f}",
