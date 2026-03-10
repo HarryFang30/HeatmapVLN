@@ -35,6 +35,26 @@ import random
 
 logger = logging.getLogger(__name__)
 
+_FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 4)
+
+
+def _evict_from_page_cache(filepath):
+    """Advise the kernel to drop cached pages for this file.
+
+    Uses posix_fadvise(FADV_DONTNEED) which works without root/SYS_ADMIN.
+    This prevents page cache from accumulating in Docker cgroup-limited
+    containers, which would otherwise count towards the memory limit and
+    trigger the OOM killer.
+    """
+    try:
+        fd = os.open(str(filepath), os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, _FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
 # ==================== 数据增强工具 ====================
 
 class ColorJitterAugmentation:
@@ -902,6 +922,7 @@ class VLNSlidingWindowDataset(Dataset):
             arr = chunk_data[array_key]
             if not isinstance(arr, np.ndarray):
                 arr = np.array(arr)
+        _evict_from_page_cache(chunk_path)
         
         self._lru_put(self._chunk_array_cache, cache_key, arr, self.chunk_cache_size)
         return arr
@@ -1184,6 +1205,7 @@ class VLNSlidingWindowDataset(Dataset):
                 raise FileNotFoundError(f"RGB file not found: clip={clip_dir}, frame={frame_idx:06d}")
             
             image = cv2.imread(str(rgb_path))
+            _evict_from_page_cache(rgb_path)
             if image is None:
                 raise ValueError(f"Failed to load image: {rgb_path}")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -1314,6 +1336,7 @@ class VLNSlidingWindowDataset(Dataset):
         
         try:
             depth = np.load(depth_path)
+            _evict_from_page_cache(depth_path)
             return depth
         except Exception as e:
             logger.warning(f"Failed to load depth: {depth_path}: {e}")
