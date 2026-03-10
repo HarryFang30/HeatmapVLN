@@ -1484,6 +1484,39 @@ def train_one_epoch(
 
     _mem_log_proc = psutil.Process()
 
+    def _cgroup_mem_gb():
+        """Read actual container memory usage from cgroup (v1 or v2)."""
+        for path in (
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",  # cgroup v1
+            "/sys/fs/cgroup/memory.current",                # cgroup v2
+        ):
+            try:
+                with open(path, "r") as f:
+                    return int(f.read().strip()) / (1024 ** 3)
+            except Exception:
+                continue
+        return -1.0
+
+    def _cgroup_limit_gb():
+        for path in (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+            "/sys/fs/cgroup/memory.max",                    # cgroup v2
+        ):
+            try:
+                with open(path, "r") as f:
+                    val = f.read().strip()
+                    if val == "max":
+                        return -1.0
+                    v = int(val)
+                    if v > 1 << 60:
+                        return -1.0
+                    return v / (1024 ** 3)
+            except Exception:
+                continue
+        return -1.0
+
+    _cg_limit = _cgroup_limit_gb()
+
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
@@ -1492,13 +1525,13 @@ def train_one_epoch(
             main_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
             children = _mem_log_proc.children(recursive=True)
             child_rss = sum(c.memory_info().rss for c in children) / (1024 * 1024)
-            sys_mem = psutil.virtual_memory()
+            cg_used = _cgroup_mem_gb()
+            cg_info = f"cgroup: {cg_used:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup: {cg_used:.1f}GB(no limit)"
             print(
                 f"[MAIN batch={i}] main_rss={main_rss:.0f}MB "
                 f"children({len(children)})={child_rss:.0f}MB "
                 f"total={main_rss + child_rss:.0f}MB | "
-                f"sys: used={sys_mem.used / (1024**3):.1f}GB "
-                f"avail={sys_mem.available / (1024**3):.1f}GB",
+                f"{cg_info}",
                 file=sys.stderr,
                 flush=True,
             )
