@@ -216,6 +216,7 @@ log:
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
+  mid_epoch_save_every: 500    # 每 N 个 batch 保存一次 mid-epoch checkpoint，0 为禁用
   
   notify:
     enabled: true
