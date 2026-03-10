@@ -1491,7 +1491,7 @@ def train_one_epoch(
     total_train_steps: int = 1,
     dist_context: Optional[DistributedContext] = None,
     ckpt_manager: Optional['CheckpointManager'] = None,
-    mid_epoch_save_every: int = 1000,
+    mid_epoch_save_every: int = 500,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     dist_context = dist_context or DistributedContext(
@@ -3484,7 +3484,7 @@ def main():
             total_train_steps=total_steps,
             dist_context=dist_context,
             ckpt_manager=ckpt_manager,
-            mid_epoch_save_every=cfg['log'].get('mid_epoch_save_every', 1000),
+            mid_epoch_save_every=cfg['log'].get('mid_epoch_save_every', 500),
         )
         
         timer.end_epoch()
