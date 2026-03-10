@@ -267,13 +267,15 @@ def _worker_init_fn(worker_id):
     warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
     warnings.filterwarnings("ignore", message="Asked to sample")
 
-    # CRITICAL: disable gc in fork workers.
-    # gc.collect() traverses ALL Python objects including the parent's
-    # frozen Qwen model (millions of Parameter / Tensor objects).
-    # Writing to each object's PyGC_Head triggers Copy-on-Write page
-    # duplication — ~500 MB per worker × 12 workers = 6+ GB wasted.
-    # Workers are short-lived (one epoch) so cycle leaks are negligible.
-    _gc.disable()
+    # Tune gc to avoid gen-2 full collection in fork workers.
+    # Gen-2 collection traverses ALL Python objects (including the parent's
+    # frozen Qwen 9B model — millions of objects), writing to each PyGC_Head
+    # and triggering Copy-on-Write page duplication (~500 MB per worker).
+    # Gen-0/1 collections only touch young objects created by the worker
+    # itself, so CoW impact is negligible — and they ARE needed to break
+    # reference cycles in HuggingFace BatchFeature / processor internals
+    # (without which pano_inputs tensors leak ~100 MB per batch).
+    _gc.set_threshold(700, 10, 999_999_999)  # gen-2 effectively disabled
 
     try:
         import ctypes
