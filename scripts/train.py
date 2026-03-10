@@ -294,23 +294,66 @@ def _cgroup_mem_limit_gb():
 _CG_LIMIT_GB = _cgroup_mem_limit_gb()
 
 
-def _drop_page_cache_if_needed(threshold: float = 0.85):
-    """Drop page cache when cgroup memory usage exceeds threshold of limit."""
+def _drop_page_cache(force: bool = False, threshold: float = 0.80):
+    """Drop page cache when cgroup memory usage exceeds threshold of limit.
+
+    Args:
+        force: If True, always drop regardless of threshold.
+        threshold: Fraction of cgroup limit above which to drop (default 80%).
+    """
     if _CG_LIMIT_GB <= 0:
         return
     usage = _cgroup_mem_usage_gb()
-    if usage > _CG_LIMIT_GB * threshold:
-        try:
-            with open("/proc/sys/vm/drop_caches", "w") as f:
-                f.write("1\n")
-            after = _cgroup_mem_usage_gb()
-            print(
-                f"[PAGE_CACHE] dropped: {usage:.1f}GB → {after:.1f}GB "
-                f"(limit={_CG_LIMIT_GB:.0f}GB)",
-                file=sys.stderr, flush=True,
-            )
-        except Exception:
-            pass
+    if not force and usage <= _CG_LIMIT_GB * threshold:
+        return
+
+    # Method 1: /proc/sys/vm/drop_caches (needs root / SYS_ADMIN)
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("1\n")
+        after = _cgroup_mem_usage_gb()
+        print(
+            f"[PAGE_CACHE] drop_caches: {usage:.1f}GB → {after:.1f}GB "
+            f"(limit={_CG_LIMIT_GB:.0f}GB)",
+            file=sys.stderr, flush=True,
+        )
+        return
+    except PermissionError:
+        pass
+    except Exception as e:
+        print(f"[PAGE_CACHE] drop_caches failed: {e}", file=sys.stderr, flush=True)
+        return
+
+    # Method 2: cgroup v1 force_empty (works without SYS_ADMIN in some Docker setups)
+    try:
+        with open("/sys/fs/cgroup/memory/memory.force_empty", "w") as f:
+            f.write("0\n")
+        after = _cgroup_mem_usage_gb()
+        print(
+            f"[PAGE_CACHE] force_empty: {usage:.1f}GB → {after:.1f}GB "
+            f"(limit={_CG_LIMIT_GB:.0f}GB)",
+            file=sys.stderr, flush=True,
+        )
+        return
+    except Exception:
+        pass
+
+    # Method 3: POSIX_FADV_DONTNEED via madvise on cached training data
+    # This is a last resort - we advise the kernel that we don't need the data
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        # malloc_trim at least returns heap memory
+        libc.malloc_trim(0)
+        print(
+            f"[PAGE_CACHE] WARNING: cannot drop page cache "
+            f"(no permission for drop_caches or force_empty). "
+            f"cgroup={usage:.1f}/{_CG_LIMIT_GB:.0f}GB. "
+            f"Consider running: chmod 666 /proc/sys/vm/drop_caches",
+            file=sys.stderr, flush=True,
+        )
+    except Exception:
+        pass
 
 
 def _worker_init_fn(worker_id):
@@ -1559,6 +1602,7 @@ def train_one_epoch(
                 file=sys.stderr,
                 flush=True,
             )
+            _drop_page_cache()
 
         if enable_timing:
             loop_start = time.perf_counter()
@@ -2151,7 +2195,7 @@ def train_one_epoch(
                 flush=True,
             )
 
-            _drop_page_cache_if_needed()
+            _drop_page_cache()
 
             if num_batches % 200 == 0:
                 torch.cuda.empty_cache()
@@ -3403,7 +3447,11 @@ def main():
     
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
-    
+
+    _drop_page_cache(force=True)
+    cg_init = _cgroup_mem_usage_gb()
+    logger.info(f"  cgroup memory after initial page cache drop: {cg_init:.1f}/{_CG_LIMIT_GB:.0f}GB")
+
     for epoch in range(start_epoch, total_epochs + 1):
         timer.start_epoch()
             
@@ -3444,7 +3492,7 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         _malloc_trim()
-        _drop_page_cache_if_needed()
+        _drop_page_cache()
 
         # 使用 EMA 参数进行验证（滑动平均参数更稳定，泛化更好）
         with ema.apply():
@@ -3462,7 +3510,7 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         _malloc_trim()
-        _drop_page_cache_if_needed()
+        _drop_page_cache()
         
         # 📊 内存使用监控
         process = psutil.Process()
