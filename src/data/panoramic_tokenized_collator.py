@@ -6,6 +6,9 @@ training main thread can consume already-tokenized panoramic batches.
 """
 
 import ctypes
+import gc
+import os
+import sys
 from typing import Any, Dict, List
 
 import torch
@@ -19,16 +22,18 @@ except OSError:
 
 
 def _malloc_trim():
-    """Return freed glibc heap pages to the OS without triggering gc.
-
-    CRITICAL: Do NOT call gc.collect() in fork-based DataLoader workers.
-    gc.collect() traverses ALL Python objects (including the parent's
-    Qwen 9B model with millions of Parameter objects) and writes to
-    each object's gc header, triggering Copy-on-Write page duplication.
-    This can waste 500 MB+ per worker (× 12 workers = 6+ GB).
-    """
     if _libc is not None:
         _libc.malloc_trim(0)
+
+
+def _rss_mb() -> float:
+    """Current process RSS in MB (from /proc, zero-overhead)."""
+    try:
+        with open("/proc/self/statm", "rb") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except Exception:
+        return 0.0
 
 
 class PanoramicTokenizedCollator:
@@ -37,6 +42,7 @@ class PanoramicTokenizedCollator:
     def __init__(self, processor):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
+        self._call_count = 0
 
     @staticmethod
     def _stack_optional(batch: List[Dict[str, Any]], key: str):
@@ -93,6 +99,13 @@ class PanoramicTokenizedCollator:
         return torch.stack(padded_tensors, dim=0)
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        self._call_count += 1
+        do_log = (self._call_count <= 5) or (self._call_count % 25 == 0)
+        pid = os.getpid()
+
+        if do_log:
+            rss0 = _rss_mb()
+
         result = self._stack_padded_history_frames(batch)
         result["current_frame"] = torch.stack([sample["current_frame"] for sample in batch], dim=0)
         result["heatmap"] = self._stack_padded_first_dim(batch, "heatmap")
@@ -110,6 +123,9 @@ class PanoramicTokenizedCollator:
             result["trajectory"] = torch.stack([sample["trajectory"] for sample in batch], dim=0)
             result["trajectory_valid"] = torch.tensor([sample.get("trajectory_valid", 0.0) for sample in batch])
             result["progress"] = torch.tensor([sample.get("progress", 0.0) for sample in batch])
+
+        if do_log:
+            rss1 = _rss_mb()
 
         if "current_views" in batch[0] and "history_panoramas" in batch[0]:
             messages_batch = []
@@ -139,6 +155,9 @@ class PanoramicTokenizedCollator:
             for sample in batch:
                 sample.clear()
 
+            if do_log:
+                rss2 = _rss_mb()
+
             pano_inputs = self.processor.apply_chat_template(
                 messages_batch,
                 tokenize=True,
@@ -148,6 +167,9 @@ class PanoramicTokenizedCollator:
                 padding=True,
             )
             del messages_batch
+
+            if do_log:
+                rss3 = _rss_mb()
 
             if "video_grid_thw" in pano_inputs and pano_inputs["video_grid_thw"] is not None:
                 vgt = pano_inputs["video_grid_thw"]
@@ -173,6 +195,31 @@ class PanoramicTokenizedCollator:
                 result["current_views"] = current_views
             for sample in batch:
                 sample.clear()
+            if do_log:
+                rss2 = rss3 = _rss_mb()
 
+        gc.collect(1)
         _malloc_trim()
+
+        if do_log:
+            rss4 = _rss_mb()
+            pano_mb = 0.0
+            pi = result.get("pano_inputs")
+            if pi is not None:
+                for k, v in pi.items():
+                    if isinstance(v, torch.Tensor):
+                        pano_mb += v.nelement() * v.element_size() / (1024 * 1024)
+            gc_stats = gc.get_stats()
+            gen0_collected = gc_stats[0]["collected"] if gc_stats else 0
+            gen1_collected = gc_stats[1]["collected"] if len(gc_stats) > 1 else 0
+            print(
+                f"[COLLATOR pid={pid} call={self._call_count}] "
+                f"RSS: start={rss0:.0f} stack={rss1:.0f} PIL→msg={rss2:.0f} "
+                f"tokenize={rss3:.0f} gc+trim={rss4:.0f} MB | "
+                f"pano_inputs={pano_mb:.1f}MB | "
+                f"gc_collected: gen0={gen0_collected} gen1={gen1_collected}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         return result

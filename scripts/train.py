@@ -262,27 +262,33 @@ def _malloc_trim():
 def _worker_init_fn(worker_id):
     """Worker 进程初始化函数 - 抑制警告 + 内存管理"""
     import gc as _gc
+    import os as _os
+    import sys as _sys
     import warnings
     warnings.filterwarnings("ignore")
     warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
     warnings.filterwarnings("ignore", message="Asked to sample")
 
-    # Tune gc to avoid gen-2 full collection in fork workers.
-    # Gen-2 collection traverses ALL Python objects (including the parent's
-    # frozen Qwen 9B model — millions of objects), writing to each PyGC_Head
-    # and triggering Copy-on-Write page duplication (~500 MB per worker).
-    # Gen-0/1 collections only touch young objects created by the worker
-    # itself, so CoW impact is negligible — and they ARE needed to break
-    # reference cycles in HuggingFace BatchFeature / processor internals
-    # (without which pano_inputs tensors leak ~100 MB per batch).
-    _gc.set_threshold(700, 10, 999_999_999)  # gen-2 effectively disabled
+    _gc.set_threshold(700, 10, 999_999_999)
 
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
         libc.mallopt(-3, 32 * 1024)   # M_MMAP_THRESHOLD  → 32 KB
         libc.mallopt(-1, 64 * 1024)   # M_TRIM_THRESHOLD  → 64 KB
-        libc.mallopt(-8, 2)           # M_ARENA_MAX → 2 (reduce cross-arena fragmentation)
+        libc.mallopt(-8, 2)           # M_ARENA_MAX → 2
+    except Exception:
+        pass
+
+    try:
+        with open("/proc/self/statm", "rb") as f:
+            pages = int(f.read().split()[1])
+        rss_mb = pages * _os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        print(
+            f"[WORKER init] worker_id={worker_id} pid={_os.getpid()} "
+            f"rss={rss_mb:.0f}MB gc_threshold={_gc.get_threshold()}",
+            file=_sys.stderr, flush=True,
+        )
     except Exception:
         pass
 
@@ -1476,9 +1482,27 @@ def train_one_epoch(
     
     trainable_params = _get_trainable_params(model_module)
 
+    _mem_log_proc = psutil.Process()
+
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
+
+        if i <= 5 or i % 25 == 0:
+            main_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
+            children = _mem_log_proc.children(recursive=True)
+            child_rss = sum(c.memory_info().rss for c in children) / (1024 * 1024)
+            sys_mem = psutil.virtual_memory()
+            print(
+                f"[MAIN batch={i}] main_rss={main_rss:.0f}MB "
+                f"children({len(children)})={child_rss:.0f}MB "
+                f"total={main_rss + child_rss:.0f}MB | "
+                f"sys: used={sys_mem.used / (1024**3):.1f}GB "
+                f"avail={sys_mem.available / (1024**3):.1f}GB",
+                file=sys.stderr,
+                flush=True,
+            )
+
         if enable_timing:
             loop_start = time.perf_counter()
             timing_stats['data_wait_s'] += max(loop_start - prev_step_end, 0.0)
@@ -2058,6 +2082,19 @@ def train_one_epoch(
         if num_batches % 50 == 0:
             gc.collect()
             _malloc_trim()
+            post_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
+            gc_stats = gc.get_stats()
+            print(
+                f"[MAIN batch={i} post-gc] rss={post_rss:.0f}MB | "
+                f"gc: gen0_collected={gc_stats[0]['collected']} "
+                f"gen1_collected={gc_stats[1]['collected']} "
+                f"gen2_collected={gc_stats[2]['collected']} | "
+                f"gen0_uncollectable={gc_stats[0]['uncollectable']} "
+                f"gen1_uncollectable={gc_stats[1]['uncollectable']} "
+                f"gen2_uncollectable={gc_stats[2]['uncollectable']}",
+                file=sys.stderr,
+                flush=True,
+            )
             if num_batches % 200 == 0:
                 torch.cuda.empty_cache()
                 if tb_writer is not None:
