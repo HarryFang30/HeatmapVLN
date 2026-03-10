@@ -152,6 +152,8 @@ class PanoramicTokenizedCollator:
                 )
                 pano_num_histories.append(len(history_panoramas_list))
 
+            result["current_views"] = torch.stack([sample["current_views"] for sample in batch], dim=0)
+
             for sample in batch:
                 sample.clear()
 
