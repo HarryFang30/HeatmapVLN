@@ -6,7 +6,6 @@ training main thread can consume already-tokenized panoramic batches.
 """
 
 import ctypes
-import gc
 from typing import Any, Dict, List
 
 import torch
@@ -19,9 +18,15 @@ except OSError:
     _libc = None
 
 
-def _force_release():
-    """gc.collect + malloc_trim in one call."""
-    gc.collect()
+def _malloc_trim():
+    """Return freed glibc heap pages to the OS without triggering gc.
+
+    CRITICAL: Do NOT call gc.collect() in fork-based DataLoader workers.
+    gc.collect() traverses ALL Python objects (including the parent's
+    Qwen 9B model with millions of Parameter objects) and writes to
+    each object's gc header, triggering Copy-on-Write page duplication.
+    This can waste 500 MB+ per worker (× 12 workers = 6+ GB).
+    """
     if _libc is not None:
         _libc.malloc_trim(0)
 
@@ -131,10 +136,6 @@ class PanoramicTokenizedCollator:
                 )
                 pano_num_histories.append(len(history_panoramas_list))
 
-            # Free raw sample tensors BEFORE tokenization starts —
-            # all needed data is already in result (stacked) and messages_batch (PIL).
-            # This releases ~250 MB of history_panoramas + current_views per batch,
-            # reducing peak worker memory and heap fragmentation.
             for sample in batch:
                 sample.clear()
 
@@ -173,5 +174,5 @@ class PanoramicTokenizedCollator:
             for sample in batch:
                 sample.clear()
 
-        _force_release()
+        _malloc_trim()
         return result

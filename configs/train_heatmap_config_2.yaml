@@ -9,9 +9,9 @@ data:
   val_split: val
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 12
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 2
   
   dataset_type: sliding_window
   
@@ -162,8 +162,7 @@ optim:
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   # 注意：DDP 下这里是每个进程 / 每张卡的 local batch size。
-  # softmax CE + neg BCE 比旧 QFL 多占显存，batch 10 会 OOM。
-  batch_size: 8
+  batch_size: 10
   grad_accum_steps: 1
 
 # ============================================

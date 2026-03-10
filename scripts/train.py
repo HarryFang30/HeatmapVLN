@@ -261,20 +261,26 @@ def _malloc_trim():
 
 def _worker_init_fn(worker_id):
     """Worker 进程初始化函数 - 抑制警告 + 内存管理"""
+    import gc as _gc
     import warnings
     warnings.filterwarnings("ignore")
     warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
     warnings.filterwarnings("ignore", message="Asked to sample")
-    
-    # 设置 worker 级别的内存管理：降低 glibc 的 mmap 阈值
-    # 使得大块内存分配使用 mmap，释放后可以直接归还 OS
+
+    # CRITICAL: disable gc in fork workers.
+    # gc.collect() traverses ALL Python objects including the parent's
+    # frozen Qwen model (millions of Parameter / Tensor objects).
+    # Writing to each object's PyGC_Head triggers Copy-on-Write page
+    # duplication — ~500 MB per worker × 12 workers = 6+ GB wasted.
+    # Workers are short-lived (one epoch) so cycle leaks are negligible.
+    _gc.disable()
+
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
-        # M_MMAP_THRESHOLD = -3, 设置为 32KB，让更多分配走 mmap
-        libc.mallopt(-3, 32 * 1024)
-        # M_TRIM_THRESHOLD = -1, 设置为 64KB，更积极地归还内存
-        libc.mallopt(-1, 64 * 1024)
+        libc.mallopt(-3, 32 * 1024)   # M_MMAP_THRESHOLD  → 32 KB
+        libc.mallopt(-1, 64 * 1024)   # M_TRIM_THRESHOLD  → 64 KB
+        libc.mallopt(-8, 2)           # M_ARENA_MAX → 2 (reduce cross-arena fragmentation)
     except Exception:
         pass
 
