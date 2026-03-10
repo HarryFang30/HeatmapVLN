@@ -85,9 +85,6 @@ class PanoramicTokenizedCollator:
         result["is_stop"] = torch.tensor([sample.get("is_stop", 0.0) for sample in batch])
         result["text"] = [sample["text"] for sample in batch]
 
-        current_views = self._stack_optional(batch, "current_views")
-        if current_views is not None:
-            result["current_views"] = current_views
         if "gt_visibility" in batch[0]:
             result["gt_visibility"] = self._stack_padded_first_dim(batch, "gt_visibility")
         if "is_flipped" in batch[0]:
@@ -149,6 +146,10 @@ class PanoramicTokenizedCollator:
             result["pano_inputs"] = pano_inputs
             result["pano_num_histories"] = pano_num_histories
             result["pano_text_anchor_positions"] = pano_text_anchor_positions
+        else:
+            current_views = self._stack_optional(batch, "current_views")
+            if current_views is not None:
+                result["current_views"] = current_views
 
         self._call_count += 1
         if self._call_count % 20 == 0:
