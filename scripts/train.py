@@ -1518,14 +1518,6 @@ def train_one_epoch(
         if enable_timing:
             forward_start = time.perf_counter()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            # Build video_frames from history only. Append a duplicate of the
-            # last history frame as placeholder; pipeline.forward() ignores it
-            # when current_observation is provided.
-            video_frames = torch.cat([
-                history_frames,
-                history_frames[:, -1:],
-            ], dim=1)
-            
             if text and len(text) > 0:
                 instruction_text = list(text)
             else:
@@ -1537,6 +1529,11 @@ def train_one_epoch(
             panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
             if panoramic_inputs_batch is not None and not train_action:
                 video_frames = current_frame.unsqueeze(1)
+            else:
+                video_frames = torch.cat([
+                    history_frames,
+                    history_frames[:, -1:],
+                ], dim=1)
             
             output = model(
                 video_frames=video_frames,
@@ -2209,11 +2206,6 @@ def validate(
                 gt_heatmap = batch['heatmap'].to(device)
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                video_frames = torch.cat([
-                    history_frames,
-                    history_frames[:, -1:],
-                ], dim=1)
-                
                 if text and len(text) > 0:
                     instruction_text = list(text)
                 else:
@@ -2225,6 +2217,11 @@ def validate(
                 panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
                 if panoramic_inputs_batch is not None and not train_action:
                     video_frames = current_frame.unsqueeze(1)
+                else:
+                    video_frames = torch.cat([
+                        history_frames,
+                        history_frames[:, -1:],
+                    ], dim=1)
                 
                 output = model(
                     video_frames=video_frames,

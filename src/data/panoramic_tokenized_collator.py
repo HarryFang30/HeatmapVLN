@@ -5,12 +5,25 @@ This moves Qwen processor/tokenizer work into DataLoader workers so the
 training main thread can consume already-tokenized panoramic batches.
 """
 
+import ctypes
 import gc
 from typing import Any, Dict, List
 
 import torch
 
 from src.models.heatmap.input_constructor import construct_input, find_text_anchor_positions
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None
+
+
+def _force_release():
+    """gc.collect + malloc_trim in one call."""
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
 
 class PanoramicTokenizedCollator:
@@ -19,7 +32,6 @@ class PanoramicTokenizedCollator:
     def __init__(self, processor):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
-        self._call_count = 0
 
     @staticmethod
     def _stack_optional(batch: List[Dict[str, Any]], key: str):
@@ -119,6 +131,13 @@ class PanoramicTokenizedCollator:
                 )
                 pano_num_histories.append(len(history_panoramas_list))
 
+            # Free raw sample tensors BEFORE tokenization starts —
+            # all needed data is already in result (stacked) and messages_batch (PIL).
+            # This releases ~250 MB of history_panoramas + current_views per batch,
+            # reducing peak worker memory and heap fragmentation.
+            for sample in batch:
+                sample.clear()
+
             pano_inputs = self.processor.apply_chat_template(
                 messages_batch,
                 tokenize=True,
@@ -127,6 +146,8 @@ class PanoramicTokenizedCollator:
                 return_tensors="pt",
                 padding=True,
             )
+            del messages_batch
+
             if "video_grid_thw" in pano_inputs and pano_inputs["video_grid_thw"] is not None:
                 vgt = pano_inputs["video_grid_thw"]
                 if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
@@ -139,10 +160,9 @@ class PanoramicTokenizedCollator:
                     self.processor.tokenizer,
                     num_history=pano_num_histories[batch_idx],
                 )
-                for batch_idx in range(len(batch))
+                for batch_idx in range(len(pano_num_histories))
             ]
 
-            del messages_batch
             result["pano_inputs"] = pano_inputs
             result["pano_num_histories"] = pano_num_histories
             result["pano_text_anchor_positions"] = pano_text_anchor_positions
@@ -150,14 +170,8 @@ class PanoramicTokenizedCollator:
             current_views = self._stack_optional(batch, "current_views")
             if current_views is not None:
                 result["current_views"] = current_views
+            for sample in batch:
+                sample.clear()
 
-        self._call_count += 1
-        if self._call_count % 20 == 0:
-            gc.collect()
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
-
+        _force_release()
         return result
