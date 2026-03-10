@@ -259,6 +259,60 @@ def _malloc_trim():
         pass
 
 
+def _cgroup_mem_usage_gb():
+    for path in (
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        "/sys/fs/cgroup/memory.current",
+    ):
+        try:
+            with open(path, "r") as f:
+                return int(f.read().strip()) / (1024 ** 3)
+        except Exception:
+            continue
+    return -1.0
+
+
+def _cgroup_mem_limit_gb():
+    for path in (
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.max",
+    ):
+        try:
+            with open(path, "r") as f:
+                val = f.read().strip()
+                if val == "max":
+                    return -1.0
+                v = int(val)
+                if v > 1 << 60:
+                    return -1.0
+                return v / (1024 ** 3)
+        except Exception:
+            continue
+    return -1.0
+
+
+_CG_LIMIT_GB = _cgroup_mem_limit_gb()
+
+
+def _drop_page_cache_if_needed(threshold: float = 0.85):
+    """Drop page cache when cgroup memory usage exceeds threshold of limit."""
+    if _CG_LIMIT_GB <= 0:
+        return
+    usage = _cgroup_mem_usage_gb()
+    if usage > _CG_LIMIT_GB * threshold:
+        try:
+            with open("/proc/sys/vm/drop_caches", "w") as f:
+                f.write("1\n")
+            after = _cgroup_mem_usage_gb()
+            print(
+                f"[PAGE_CACHE] dropped: {usage:.1f}GB → {after:.1f}GB "
+                f"(limit={_CG_LIMIT_GB:.0f}GB)",
+                file=sys.stderr, flush=True,
+            )
+        except Exception:
+            pass
+
+
 def _worker_init_fn(worker_id):
     """Worker 进程初始化函数 - 抑制警告 + 内存管理"""
     import gc as _gc
@@ -1483,39 +1537,7 @@ def train_one_epoch(
     trainable_params = _get_trainable_params(model_module)
 
     _mem_log_proc = psutil.Process()
-
-    def _cgroup_mem_gb():
-        """Read actual container memory usage from cgroup (v1 or v2)."""
-        for path in (
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes",  # cgroup v1
-            "/sys/fs/cgroup/memory.current",                # cgroup v2
-        ):
-            try:
-                with open(path, "r") as f:
-                    return int(f.read().strip()) / (1024 ** 3)
-            except Exception:
-                continue
-        return -1.0
-
-    def _cgroup_limit_gb():
-        for path in (
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-            "/sys/fs/cgroup/memory.max",                    # cgroup v2
-        ):
-            try:
-                with open(path, "r") as f:
-                    val = f.read().strip()
-                    if val == "max":
-                        return -1.0
-                    v = int(val)
-                    if v > 1 << 60:
-                        return -1.0
-                    return v / (1024 ** 3)
-            except Exception:
-                continue
-        return -1.0
-
-    _cg_limit = _cgroup_limit_gb()
+    _cg_limit = _CG_LIMIT_GB
 
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
@@ -1525,7 +1547,7 @@ def train_one_epoch(
             main_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
             children = _mem_log_proc.children(recursive=True)
             child_rss = sum(c.memory_info().rss for c in children) / (1024 * 1024)
-            cg_used = _cgroup_mem_gb()
+            cg_used = _cgroup_mem_usage_gb()
             cg_info = f"cgroup: {cg_used:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup: {cg_used:.1f}GB(no limit)"
             print(
                 f"[MAIN batch={i}] main_rss={main_rss:.0f}MB "
@@ -2117,17 +2139,18 @@ def train_one_epoch(
             _malloc_trim()
             post_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
             gc_stats = gc.get_stats()
+            cg_now = _cgroup_mem_usage_gb()
+            cg_str = f"cgroup={cg_now:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup={cg_now:.1f}GB"
             print(
-                f"[MAIN batch={i} post-gc] rss={post_rss:.0f}MB | "
-                f"gc: gen0_collected={gc_stats[0]['collected']} "
-                f"gen1_collected={gc_stats[1]['collected']} "
-                f"gen2_collected={gc_stats[2]['collected']} | "
-                f"gen0_uncollectable={gc_stats[0]['uncollectable']} "
-                f"gen1_uncollectable={gc_stats[1]['uncollectable']} "
-                f"gen2_uncollectable={gc_stats[2]['uncollectable']}",
+                f"[MAIN batch={i} post-gc] rss={post_rss:.0f}MB | {cg_str} | "
+                f"gc: gen0={gc_stats[0]['collected']} gen1={gc_stats[1]['collected']} "
+                f"gen2={gc_stats[2]['collected']}",
                 file=sys.stderr,
                 flush=True,
             )
+
+            _drop_page_cache_if_needed()
+
             if num_batches % 200 == 0:
                 torch.cuda.empty_cache()
                 if tb_writer is not None:
@@ -3361,11 +3384,11 @@ def main():
         
         timer.end_epoch()
         
-        # 🧹 强制内存清理，防止内存泄漏
         gc.collect()
         torch.cuda.empty_cache()
-        _malloc_trim()  # 归还碎片化内存给 OS
-        
+        _malloc_trim()
+        _drop_page_cache_if_needed()
+
         # 使用 EMA 参数进行验证（滑动平均参数更稳定，泛化更好）
         with ema.apply():
             val_metrics = validate(
@@ -3379,10 +3402,10 @@ def main():
                 dist_context=dist_context,
             )
         
-        # 🧹 验证后再次清理内存
         gc.collect()
         torch.cuda.empty_cache()
-        _malloc_trim()  # 归还碎片化内存给 OS
+        _malloc_trim()
+        _drop_page_cache_if_needed()
         
         # 📊 内存使用监控
         process = psutil.Process()
