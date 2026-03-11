@@ -760,8 +760,14 @@ def visualize_heatmap_predictions(
             gated_heatmaps = output.get('heatmaps_gated') # (B, N_hist, 4, H, W) or None
             batch_gt_vis = batch.get('gt_visibility')     # (B, N_hist, 4) or None
 
+            total_rows = B * 4
+            fig, axes = plt.subplots(total_rows, 4, figsize=(16, 4 * total_rows))
+            if total_rows == 1:
+                axes = axes[np.newaxis, :]
+
             for b in range(B):
                 views = batch['current_views'][b]  # (4, C, H, W)
+                row_offset = b * 4
 
                 # --- GT heatmap: aggregate N_hist via max → (4, Hm, Wm) ---
                 gt_b = gt_heatmaps[b]
@@ -782,9 +788,9 @@ def visualize_heatmap_predictions(
 
                 if gated_4 is None:
                     if pred_heatmaps.dim() == 5:
-                        pred_b = pred_heatmaps[b]  # (N_hist, 4, H, W)
+                        pred_b = pred_heatmaps[b]
                     elif pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
-                        pred_b = pred_heatmaps[b].unsqueeze(0)  # (1, 4, H, W)
+                        pred_b = pred_heatmaps[b].unsqueeze(0)
                     else:
                         pred_b = pred_heatmaps[b].unsqueeze(0).unsqueeze(0).expand(1, 4, -1, -1)
                     N_h, _, Hm, Wm = pred_b.shape
@@ -793,11 +799,11 @@ def visualize_heatmap_predictions(
                     probs = torch.softmax(logits.reshape(N_h, 4, -1), dim=-1).reshape(N_h, 4, Hm, Wm)
                     if pred_vis_raw is not None:
                         if pred_vis_raw.dim() == 3:
-                            vis_gate = torch.sigmoid(pred_vis_raw[b].detach().float())  # (N_hist, 4)
+                            vis_gate = torch.sigmoid(pred_vis_raw[b].detach().float())
                         else:
-                            vis_gate = torch.sigmoid(pred_vis_raw[b].detach().float()).unsqueeze(0)  # (1, 4)
+                            vis_gate = torch.sigmoid(pred_vis_raw[b].detach().float()).unsqueeze(0)
                         probs = probs * vis_gate[:, :, None, None]
-                    gated_4 = probs.max(dim=0).values  # (4, H, W)
+                    gated_4 = probs.max(dim=0).values
 
                 # --- Visibility: aggregate via max across N_hist → (4,) ---
                 if pred_vis_raw is not None:
@@ -818,53 +824,60 @@ def visualize_heatmap_predictions(
 
                 N_hist_count = gt_b.shape[0] if gt_b.dim() == 4 else 1
 
-                fig, axes = plt.subplots(4, 4, figsize=(16, 16))
                 for v in range(4):
+                    r = row_offset + v
                     rgb = views[v].cpu().numpy().transpose(1, 2, 0)
                     rgb = np.clip(rgb, 0, 1)
-                    axes[v, 0].imshow(rgb)
-                    axes[v, 0].set_title(f"{VIEW_LABELS[v]}", fontweight='bold')
-                    axes[v, 0].axis('off')
+                    axes[r, 0].imshow(rgb)
+                    label = f"S{b} {VIEW_LABELS[v]}" if v == 0 else VIEW_LABELS[v]
+                    axes[r, 0].set_title(label, fontweight='bold')
+                    axes[r, 0].axis('off')
 
                     gt_hm = gt_4[v].float().cpu().numpy()
-                    axes[v, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(gt_hm.max(), 0.01))
-                    axes[v, 1].set_title(f"GT (max={gt_hm.max():.2f})")
-                    axes[v, 1].axis('off')
+                    axes[r, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(gt_hm.max(), 0.01))
+                    axes[r, 1].set_title(f"GT (max={gt_hm.max():.2f})")
+                    axes[r, 1].axis('off')
 
                     gated_v = gated_4[v].detach().float().cpu().numpy()
                     gated_vmax = max(gated_v.max(), 1e-8)
-                    axes[v, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
-                    axes[v, 2].set_title(f"Gated (max={gated_v.max():.4f})")
-                    axes[v, 2].axis('off')
+                    axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
+                    axes[r, 2].set_title(f"Gated (max={gated_v.max():.4f})")
+                    axes[r, 2].axis('off')
 
                     pred_v = vis_scores[v]
                     gt_v = gt_vis_4[v]
                     correct = (pred_v > 0.5) == (gt_v > 0.5)
                     bg_color = [0.85, 0.95, 0.85] if correct else [0.95, 0.85, 0.85]
-                    axes[v, 3].set_facecolor(bg_color)
-                    axes[v, 3].text(
+                    axes[r, 3].set_facecolor(bg_color)
+                    axes[r, 3].text(
                         0.5, 0.55,
                         f"Pred vis: {pred_v:.2f}\nGT vis: {gt_v:.0f}",
                         ha='center', va='center', fontsize=14, fontfamily='monospace',
-                        transform=axes[v, 3].transAxes,
+                        transform=axes[r, 3].transAxes,
                     )
                     status = "OK" if correct else "WRONG"
-                    axes[v, 3].text(
+                    axes[r, 3].text(
                         0.5, 0.15, status,
                         ha='center', va='center', fontsize=16, fontweight='bold',
                         color='green' if correct else 'red',
-                        transform=axes[v, 3].transAxes,
+                        transform=axes[r, 3].transAxes,
                     )
-                    axes[v, 3].set_title("Visibility")
-                    axes[v, 3].set_xticks([])
-                    axes[v, 3].set_yticks([])
+                    axes[r, 3].set_title("Visibility")
+                    axes[r, 3].set_xticks([])
+                    axes[r, 3].set_yticks([])
 
-                plt.suptitle(f"Epoch {epoch}, Step {step}, Sample {b} (N_hist={N_hist_count}, max-agg)", fontsize=13)
-                plt.tight_layout(rect=[0, 0, 1, 0.97])
-                save_path = output_dir / f"e{epoch:03d}_s{step:05d}_b{b}.png"
-                plt.savefig(save_path, dpi=100, bbox_inches='tight')
-                plt.close(fig)
+                    if v == 0:
+                        axes[r, 0].set_ylabel(
+                            f"Sample {b}\n(N={N_hist_count})",
+                            fontsize=12, fontweight='bold', rotation=0,
+                            labelpad=60, va='center',
+                        )
 
+            plt.suptitle(f"Epoch {epoch}, Step {step} — {B} samples, max-agg", fontsize=14)
+            plt.tight_layout(rect=[0, 0, 1, 0.98])
+            save_path = output_dir / f"e{epoch:03d}_s{step:05d}.png"
+            plt.savefig(save_path, dpi=100, bbox_inches='tight')
+            plt.close(fig)
             return save_path
 
         else:
