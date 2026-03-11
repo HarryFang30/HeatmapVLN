@@ -839,9 +839,14 @@ def visualize_heatmap_predictions(
                     axes[r, 1].axis('off')
 
                     gated_v = gated_4[v].detach().float().cpu().numpy()
-                    gated_vmax = max(gated_v.max(), 1e-8)
-                    axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
-                    axes[r, 2].set_title(f"Gated (max={gated_v.max():.4f})")
+                    pred_vis_v = vis_scores[v]
+                    if pred_vis_v < 0.5:
+                        axes[r, 2].imshow(np.zeros_like(gated_v), cmap='inferno', vmin=0, vmax=1)
+                        axes[r, 2].set_title(f"Gated OFF (vis={pred_vis_v:.2f})")
+                    else:
+                        gated_vmax = max(gated_v.max(), 1e-8)
+                        axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
+                        axes[r, 2].set_title(f"Gated (max={gated_v.max():.4f})")
                     axes[r, 2].axis('off')
 
                     pred_v = vis_scores[v]
