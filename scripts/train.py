@@ -2158,8 +2158,42 @@ def train_one_epoch(
                         except Exception as e:
                             logger.debug(f"Multi-peak eval error (non-critical): {e}")
                     
-                    
-                    
+                    # Visibility gate 诊断
+                    if 'visibility' in output and output['visibility'] is not None:
+                        pred_vis_logits = output['visibility'].detach()
+                        gt_vis_batch = batch.get('gt_visibility')
+                        if gt_vis_batch is None and gt_heatmap is not None:
+                            gt_vis_batch = (gt_heatmap.amax(dim=(-2, -1)) > 0).float()
+                        if gt_vis_batch is not None:
+                            gt_vis_flat = gt_vis_batch.to(pred_vis_logits.device).reshape(-1)
+                            pred_vis_prob = torch.sigmoid(pred_vis_logits.float()).reshape(-1)
+                            pred_vis_bin = (pred_vis_prob > 0.5).float()
+                            gt_vis_bin = (gt_vis_flat > 0.5).float()
+                            total_n = gt_vis_bin.numel()
+                            if total_n > 0:
+                                tp = ((pred_vis_bin == 1) & (gt_vis_bin == 1)).sum().item()
+                                tn = ((pred_vis_bin == 0) & (gt_vis_bin == 0)).sum().item()
+                                fp = ((pred_vis_bin == 1) & (gt_vis_bin == 0)).sum().item()
+                                fn = ((pred_vis_bin == 0) & (gt_vis_bin == 1)).sum().item()
+                                accuracy = (tp + tn) / total_n
+                                precision = tp / max(tp + fp, 1)
+                                recall = tp / max(tp + fn, 1)
+                                tnr = tn / max(tn + fp, 1)
+                                f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+                                tb_writer.add_scalar('diag/vis_accuracy', accuracy, actual_step)
+                                tb_writer.add_scalar('diag/vis_precision', precision, actual_step)
+                                tb_writer.add_scalar('diag/vis_recall', recall, actual_step)
+                                tb_writer.add_scalar('diag/vis_tnr', tnr, actual_step)
+                                tb_writer.add_scalar('diag/vis_f1', f1, actual_step)
+                                tb_writer.add_scalar('diag/vis_pred_mean', pred_vis_prob.mean().item(), actual_step)
+                                pos_ratio = gt_vis_bin.mean().item()
+                                tb_writer.add_scalar('diag/vis_gt_pos_ratio', pos_ratio, actual_step)
+                                logger.info(
+                                    f"[DIAG-VIS] acc={accuracy:.3f} prec={precision:.3f} "
+                                    f"recall={recall:.3f} TNR={tnr:.3f} F1={f1:.3f} "
+                                    f"(gt_pos={pos_ratio:.2f})"
+                                )
+
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
                         pred_progress = output['progress'].detach()
@@ -2407,6 +2441,7 @@ def validate(
     total_heatmap_mse = 0.0      # 完整推理的 heatmap MSE（采样）
     num_heatmap_mse_batches = 0  # MSE 采样 batch 计数
     num_batches = 0
+    vis_tp = vis_tn = vis_fp = vis_fn = 0
     
     loss_cfg = cfg['loss']
     train_history = stage_cfg.get('train_history', True)
@@ -2527,7 +2562,21 @@ def validate(
                         history_mask=hm_history_mask,
                     )
                     heatmap_loss = loss_dict['total']
-            
+
+            # Visibility gate 累积统计
+            if 'visibility' in output and output['visibility'] is not None:
+                pred_vis_logits = output['visibility'].detach()
+                gt_vis_batch = batch.get('gt_visibility')
+                if gt_vis_batch is None and gt_heatmap is not None:
+                    gt_vis_batch = (gt_heatmap.amax(dim=(-2, -1)) > 0).float()
+                if gt_vis_batch is not None:
+                    pv = (torch.sigmoid(pred_vis_logits.float()).reshape(-1) > 0.5).float()
+                    gv = (gt_vis_batch.to(pred_vis_logits.device).reshape(-1) > 0.5).float()
+                    vis_tp += ((pv == 1) & (gv == 1)).sum().item()
+                    vis_tn += ((pv == 0) & (gv == 0)).sum().item()
+                    vis_fp += ((pv == 1) & (gv == 0)).sum().item()
+                    vis_fn += ((pv == 0) & (gv == 1)).sum().item()
+
             # Action Loss / Trajectory Loss (验证)
             action_loss = torch.tensor(0.0, device=device)
             trajectory_loss = torch.tensor(0.0, device=device)
@@ -2664,6 +2713,10 @@ def validate(
             total_heatmap_mse,
             float(num_batches),
             float(num_heatmap_mse_batches),
+            float(vis_tp),
+            float(vis_tn),
+            float(vis_fp),
+            float(vis_fn),
         ],
         device=device,
         dtype=torch.float64,
@@ -2677,6 +2730,26 @@ def validate(
     avg_act = (totals[2] / reduced_num_batches).item()
     avg_stop = (totals[3] / reduced_num_batches).item()
     avg_hm_mse = (totals[4] / max(reduced_num_heatmap_mse_batches, 1)).item() if reduced_num_heatmap_mse_batches > 0 else 0.0
+
+    r_tp, r_tn, r_fp, r_fn = totals[7].item(), totals[8].item(), totals[9].item(), totals[10].item()
+    vis_total = r_tp + r_tn + r_fp + r_fn
+    val_vis_metrics = {}
+    if vis_total > 0:
+        val_vis_metrics['val_vis_accuracy'] = (r_tp + r_tn) / vis_total
+        val_vis_metrics['val_vis_precision'] = r_tp / max(r_tp + r_fp, 1)
+        val_vis_metrics['val_vis_recall'] = r_tp / max(r_tp + r_fn, 1)
+        val_vis_metrics['val_vis_tnr'] = r_tn / max(r_tn + r_fp, 1)
+        p, r = val_vis_metrics['val_vis_precision'], val_vis_metrics['val_vis_recall']
+        val_vis_metrics['val_vis_f1'] = 2 * p * r / max(p + r, 1e-8)
+        val_vis_metrics['val_vis_gt_pos_ratio'] = (r_tp + r_fn) / vis_total
+        logger.info(
+            f"  📊 Visibility gate: acc={val_vis_metrics['val_vis_accuracy']:.3f} "
+            f"prec={val_vis_metrics['val_vis_precision']:.3f} "
+            f"recall={val_vis_metrics['val_vis_recall']:.3f} "
+            f"TNR={val_vis_metrics['val_vis_tnr']:.3f} "
+            f"F1={val_vis_metrics['val_vis_f1']:.3f} "
+            f"(gt_pos={val_vis_metrics['val_vis_gt_pos_ratio']:.2f})"
+        )
     
     # 注意：TensorBoard 记录移至主循环中使用 global_epoch_counter
     # 避免多阶段训练时 epoch 重复导致数据覆盖
@@ -2684,7 +2757,7 @@ def validate(
     if reduced_num_heatmap_mse_batches > 0:
         logger.info(f"  📊 Heatmap 推理 MSE (采样 {reduced_num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
     
-    return {
+    result = {
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
         'val_heatmap_mse': avg_hm_mse,
@@ -2692,6 +2765,8 @@ def validate(
         'val_stop_loss': avg_stop,
         'val_total_loss': avg_loss,
     }
+    result.update(val_vis_metrics)
+    return result
 
 
 class CheckpointManager:
@@ -3681,6 +3756,11 @@ def main():
             # 单独的指标（方便筛选）
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
             tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
+
+            for vk in ('val_vis_accuracy', 'val_vis_precision', 'val_vis_recall',
+                        'val_vis_tnr', 'val_vis_f1', 'val_vis_gt_pos_ratio'):
+                if vk in val_metrics:
+                    tb_writer.add_scalar(f'epoch/{vk}', val_metrics[vk], global_epoch_counter)
             
             tb_writer.flush()
         
