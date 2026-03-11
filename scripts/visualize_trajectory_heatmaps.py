@@ -37,7 +37,8 @@ logger = logging.getLogger("vis_traj")
 
 VIEW_LABELS = ["F", "R", "B", "L"]
 TILE = 80
-GAP = 3
+GAP = 4
+SEP_COLOR = np.array([1.0, 0.85, 0.0], dtype=np.float32)  # yellow separator
 
 
 # ───────────────────── Model ─────────────────────
@@ -163,6 +164,11 @@ def _resize(img: np.ndarray, size: int) -> np.ndarray:
     return cv2.resize(img.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA)
 
 
+def _fill_sep(strip: np.ndarray, x_start: int, gap: int) -> None:
+    """Fill a gap region with the separator color."""
+    strip[:, x_start: x_start + gap] = SEP_COLOR
+
+
 def _build_rgb_strip(samples_data: List[Dict], tile: int = TILE, gap: int = GAP) -> np.ndarray:
     N = len(samples_data)
     group_w = 4 * tile
@@ -174,6 +180,8 @@ def _build_rgb_strip(samples_data: List[Dict], tile: int = TILE, gap: int = GAP)
         for v in range(4):
             t = _resize(np.clip(views[v], 0, 1), tile)
             strip[:, x0 + v * tile: x0 + (v + 1) * tile] = t
+        if i < N - 1:
+            _fill_sep(strip, x0 + group_w, gap)
     return strip
 
 
@@ -199,6 +207,8 @@ def _build_heatmap_strip(
             hm_norm = np.clip(hm / vmax, 0, 1)
             t = cmap(hm_norm)[:, :, :3].astype(np.float32)
             strip[:, x0 + v * tile: x0 + (v + 1) * tile] = t
+        if i < N - 1:
+            _fill_sep(strip, x0 + group_w, gap)
     return strip
 
 
@@ -322,13 +332,23 @@ def visualize_clip_panoramic(
     gated_strip = _build_heatmap_strip(samples_data, 'gated_agg', tile, gap, global_vmax=None)
 
     strip_w_px = rgb_strip.shape[1]
+    strip_h_px = tile
     group_w = 4 * tile
 
-    fig_w = max(strip_w_px / 80, 12)
-    fig_h = max(fig_w * 0.35, 5)
+    DPI = 120
+    bev_h_ratio = 3
+    fig_w_in = strip_w_px / DPI
+    strip_h_in = strip_h_px / DPI
+    bev_h_in = strip_h_in * bev_h_ratio
+    total_h_in = bev_h_in + strip_h_in * 3
+    fig_w_in = max(fig_w_in, 10)
+    total_h_in = max(total_h_in, 3)
 
-    fig = plt.figure(figsize=(fig_w, fig_h))
-    gs = fig.add_gridspec(4, 1, height_ratios=[1.8, 1, 1, 1], hspace=0.15)
+    fig = plt.figure(figsize=(fig_w_in, total_h_in))
+    gs = fig.add_gridspec(
+        4, 1, height_ratios=[bev_h_ratio, 1, 1, 1],
+        hspace=0.05, left=0.02, right=0.98, top=0.95, bottom=0.02,
+    )
 
     ax_bev = fig.add_subplot(gs[0])
     _plot_bev(ax_bev, clip_dir, sampled_frame_indices, samples_data, all_poses)
@@ -342,20 +362,16 @@ def visualize_clip_panoramic(
     ]
     for gs_slot, strip, ylabel in row_data:
         ax = fig.add_subplot(gs_slot)
-        ax.imshow(strip, aspect='auto', interpolation='nearest')
+        ax.imshow(strip, aspect='equal', interpolation='nearest')
         ax.set_ylabel(ylabel, fontsize=7, rotation=90, labelpad=8)
         ax.set_yticks([])
 
         tick_xs = [i * (group_w + gap) + group_w // 2 for i in range(N)]
-        tick_labels = [f"{i}\nF{samples_data[i]['frame_label']}" for i in range(N)]
+        tick_labels = [str(i) for i in range(N)]
         ax.set_xticks(tick_xs)
-        ax.set_xticklabels(tick_labels, fontsize=4, rotation=0)
+        ax.set_xticklabels(tick_labels, fontsize=5)
 
-        for i in range(1, N):
-            sep_x = i * (group_w + gap) - gap / 2 - 0.5
-            ax.axvline(sep_x, color='white', linewidth=0.8, alpha=0.7)
-
-    fig.savefig(output_path, dpi=120, bbox_inches='tight', pad_inches=0.08)
+    fig.savefig(output_path, dpi=DPI, bbox_inches='tight', pad_inches=0.08)
     plt.close(fig)
     logger.info(f"  Saved: {output_path}")
 
