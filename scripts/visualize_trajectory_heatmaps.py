@@ -212,7 +212,7 @@ def _build_heatmap_strip(
     return strip
 
 
-# ───────────────────── BEV plot ─────────────────────
+# ───────────────────── Per-position top-down strip ─────────────────────
 
 def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[List]]:
     """Load pre-rendered navmesh BEV image and trajectory pixel coordinates."""
@@ -234,80 +234,80 @@ def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[L
     return topdown_img, trajectory_pixels
 
 
-def _plot_bev(
-    ax: plt.Axes,
+def _render_topdown_for_position(
+    base_img: np.ndarray,
+    trajectory_pixels: List,
+    sampled_frame_indices: List[int],
+    highlight_idx: int,
+    out_size: int,
+) -> np.ndarray:
+    """Render a top-down map with the highlighted position prominently marked."""
+    canvas = base_img.copy()
+    num_pts = len(trajectory_pixels)
+
+    for i in range(num_pts - 1):
+        p1 = tuple(trajectory_pixels[i])
+        p2 = tuple(trajectory_pixels[i + 1])
+        cv2.line(canvas, p1, p2, (180, 180, 180), 1, cv2.LINE_AA)
+
+    for i, fidx in enumerate(sampled_frame_indices):
+        if fidx >= num_pts:
+            continue
+        pt = tuple(trajectory_pixels[fidx])
+        if i == highlight_idx:
+            continue
+        cv2.circle(canvas, pt, 4, (100, 100, 255), -1, cv2.LINE_AA)
+
+    fidx_hl = sampled_frame_indices[highlight_idx]
+    if fidx_hl < num_pts:
+        curr = tuple(trajectory_pixels[fidx_hl])
+        cv2.circle(canvas, curr, 12, (255, 0, 0), 3, cv2.LINE_AA)
+        cv2.circle(canvas, curr, 5, (255, 0, 0), -1, cv2.LINE_AA)
+
+        if fidx_hl + 1 < num_pts:
+            nxt = tuple(trajectory_pixels[fidx_hl + 1])
+            dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
+            length = max(1, (dx ** 2 + dy ** 2) ** 0.5)
+            arrow_len = 25
+            tip = (int(curr[0] + dx / length * arrow_len),
+                   int(curr[1] + dy / length * arrow_len))
+            cv2.arrowedLine(canvas, curr, tip, (255, 0, 0), 2, tipLength=0.3)
+
+        label = str(highlight_idx)
+        cv2.putText(canvas, label, (curr[0] + 14, curr[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(canvas, label, (curr[0] + 14, curr[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 50, 50), 2, cv2.LINE_AA)
+
+    canvas = cv2.resize(canvas, (out_size, out_size), interpolation=cv2.INTER_AREA)
+    return canvas.astype(np.float32) / 255.0
+
+
+def _build_topdown_strip(
     clip_dir: Path,
     sampled_frame_indices: List[int],
-    samples_data: List[Dict],
-    all_poses: List[np.ndarray],
-) -> None:
+    tile: int = TILE, gap: int = GAP,
+) -> Optional[np.ndarray]:
     topdown_img, trajectory_pixels = _load_topdown_data(clip_dir)
+    if topdown_img is None or trajectory_pixels is None:
+        return None
 
-    if topdown_img is not None and trajectory_pixels is not None:
-        canvas = topdown_img.copy()
-        N = len(sampled_frame_indices)
-        colors_rgb = [
-            tuple(int(c * 255) for c in plt.cm.tab20(i / max(N - 1, 1))[:3])
-            for i in range(N)
-        ]
+    N = len(sampled_frame_indices)
+    td_size = 4 * tile
+    strip_w = N * td_size + max(N - 1, 0) * gap
+    strip = np.zeros((td_size, strip_w, 3), dtype=np.float32)
 
-        num_pts = len(trajectory_pixels)
-        for i in range(num_pts - 1):
-            p1 = tuple(trajectory_pixels[i])
-            p2 = tuple(trajectory_pixels[i + 1])
-            cv2.line(canvas, p1, p2, (200, 200, 200), 1, cv2.LINE_AA)
+    for i in range(N):
+        td = _render_topdown_for_position(
+            topdown_img, trajectory_pixels, sampled_frame_indices,
+            highlight_idx=i, out_size=td_size,
+        )
+        x0 = i * (td_size + gap)
+        strip[:, x0: x0 + td_size] = td
+        if i < N - 1:
+            _fill_sep(strip, x0 + td_size, gap)
 
-        for i, fidx in enumerate(sampled_frame_indices):
-            if fidx >= num_pts:
-                continue
-            curr = tuple(trajectory_pixels[fidx])
-            bgr = (colors_rgb[i][2], colors_rgb[i][1], colors_rgb[i][0])
-            cv2.circle(canvas, curr, 6, bgr, -1, cv2.LINE_AA)
-            cv2.circle(canvas, curr, 6, (0, 0, 0), 1, cv2.LINE_AA)
-
-            if fidx + 1 < num_pts:
-                nxt = tuple(trajectory_pixels[fidx + 1])
-                dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
-                length = max(1, (dx ** 2 + dy ** 2) ** 0.5)
-                arrow_len = 18
-                tip = (int(curr[0] + dx / length * arrow_len),
-                       int(curr[1] + dy / length * arrow_len))
-                cv2.arrowedLine(canvas, curr, tip, bgr, 2, tipLength=0.35)
-
-            label_pos = (curr[0] + 8, curr[1] - 4)
-            cv2.putText(canvas, str(i), label_pos,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(canvas, str(i), label_pos,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-
-        ax.imshow(canvas)
-        ax.axis('off')
-    else:
-        positions = np.array([p[:3, 3] for p in all_poses])
-        x_all, z_all = positions[:, 0], positions[:, 2]
-        ax.plot(x_all, z_all, '-', color='#bbbbbb', linewidth=1.2, zorder=1)
-
-        N = len(sampled_frame_indices)
-        colors = plt.cm.tab20(np.linspace(0, 1, max(N, 1)))
-        extent = max(x_all.max() - x_all.min(), z_all.max() - z_all.min(), 1e-3)
-        arrow_len = extent * 0.04
-
-        for i, fidx in enumerate(sampled_frame_indices):
-            px, pz = x_all[fidx], z_all[fidx]
-            ax.scatter(px, pz, c=[colors[i]], s=40, marker='o', zorder=5,
-                       edgecolors='k', linewidth=0.5)
-            ax.annotate(str(i), (px, pz), fontsize=5, ha='center', va='bottom',
-                        xytext=(0, 4), textcoords='offset points', fontweight='bold')
-            fwd = -all_poses[fidx][:3, 2]
-            fwd_bev = np.array([fwd[0], fwd[2]])
-            fwd_norm = np.linalg.norm(fwd_bev)
-            if fwd_norm > 1e-6:
-                fwd_bev = fwd_bev / fwd_norm * arrow_len
-                ax.annotate('', xy=(px + fwd_bev[0], pz + fwd_bev[1]), xytext=(px, pz),
-                            arrowprops=dict(arrowstyle='->', color=colors[i], lw=1.2))
-        ax.set_aspect('equal')
-        ax.tick_params(labelsize=6)
-        ax.grid(True, alpha=0.2, linewidth=0.5)
+    return strip
 
 
 # ───────────────────── Main visualization ─────────────────────
@@ -327,49 +327,50 @@ def visualize_clip_panoramic(
     if N == 0:
         return
 
+    td_strip = _build_topdown_strip(clip_dir, sampled_frame_indices, tile, gap)
     rgb_strip = _build_rgb_strip(samples_data, tile, gap)
     gt_strip = _build_heatmap_strip(samples_data, 'gt_agg', tile, gap, global_vmax=1.0)
     gated_strip = _build_heatmap_strip(samples_data, 'gated_agg', tile, gap, global_vmax=None)
 
-    strip_w_px = rgb_strip.shape[1]
-    strip_h_px = tile
     group_w = 4 * tile
+    td_h = 4 * tile  # top-down tile height = group width (square)
+
+    strips: List[Tuple[np.ndarray, str]] = []
+    if td_strip is not None:
+        strips.append((td_strip, "Top-Down"))
+    strips.append((rgb_strip, "RGB (F|R|B|L)"))
+    strips.append((gt_strip, "GT Heatmap"))
+    strips.append((gated_strip, "Gated"))
 
     DPI = 120
-    bev_h_ratio = 3
-    fig_w_in = strip_w_px / DPI
-    strip_h_in = strip_h_px / DPI
-    bev_h_in = strip_h_in * bev_h_ratio
-    total_h_in = bev_h_in + strip_h_in * 3
-    fig_w_in = max(fig_w_in, 10)
-    total_h_in = max(total_h_in, 3)
+    strip_w_px = rgb_strip.shape[1]
+    fig_w_in = max(strip_w_px / DPI, 10)
 
-    fig = plt.figure(figsize=(fig_w_in, total_h_in))
+    total_h_px = sum(s.shape[0] for s, _ in strips)
+    fig_h_in = max(total_h_px / DPI, 3)
+
+    height_ratios = [s.shape[0] for s, _ in strips]
+
+    fig = plt.figure(figsize=(fig_w_in, fig_h_in))
     gs = fig.add_gridspec(
-        4, 1, height_ratios=[bev_h_ratio, 1, 1, 1],
-        hspace=0.05, left=0.02, right=0.98, top=0.95, bottom=0.02,
+        len(strips), 1, height_ratios=height_ratios,
+        hspace=0.03, left=0.02, right=0.98, top=0.97, bottom=0.01,
     )
 
-    ax_bev = fig.add_subplot(gs[0])
-    _plot_bev(ax_bev, clip_dir, sampled_frame_indices, samples_data, all_poses)
-    instr_short = instruction[:120] + "..." if len(instruction) > 120 else instruction
-    ax_bev.set_title(f"BEV: {clip_name}\n{instr_short}", fontsize=7, pad=4)
+    instr_short = instruction[:140] + "..." if len(instruction) > 140 else instruction
+    fig.suptitle(f"{clip_name}  |  {instr_short}", fontsize=7, y=0.995)
 
-    row_data = [
-        (gs[1], rgb_strip, "RGB (F|R|B|L)"),
-        (gs[2], gt_strip, "GT Heatmap"),
-        (gs[3], gated_strip, "Gated"),
-    ]
-    for gs_slot, strip, ylabel in row_data:
-        ax = fig.add_subplot(gs_slot)
+    for row_idx, (strip, ylabel) in enumerate(strips):
+        ax = fig.add_subplot(gs[row_idx])
         ax.imshow(strip, aspect='equal', interpolation='nearest')
-        ax.set_ylabel(ylabel, fontsize=7, rotation=90, labelpad=8)
+        ax.set_ylabel(ylabel, fontsize=6, rotation=90, labelpad=8)
         ax.set_yticks([])
 
-        tick_xs = [i * (group_w + gap) + group_w // 2 for i in range(N)]
+        cw = group_w if strip.shape[0] == tile else td_h
+        tick_xs = [i * (cw + gap) + cw // 2 for i in range(N)]
         tick_labels = [str(i) for i in range(N)]
         ax.set_xticks(tick_xs)
-        ax.set_xticklabels(tick_labels, fontsize=5)
+        ax.set_xticklabels(tick_labels, fontsize=4)
 
     fig.savefig(output_path, dpi=DPI, bbox_inches='tight', pad_inches=0.08)
     plt.close(fig)
