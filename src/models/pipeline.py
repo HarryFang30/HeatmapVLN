@@ -460,6 +460,8 @@ class VLNPipeline(nn.Module):
                     'visibility': qwen_output['visibility'],
                     'heatmaps': qwen_output['heatmaps'],
                 }
+                if 'heatmaps_gated' in qwen_output:
+                    heatmap_output['heatmaps_gated'] = qwen_output['heatmaps_gated']
 
         # ==================== Step 4: Action Generation ====================
         actions = None

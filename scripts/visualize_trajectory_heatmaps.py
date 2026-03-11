@@ -4,7 +4,8 @@
 =================================
 
 沿着一条完整轨迹抽样多个位置，对每个位置聚合所有历史时间步热力图，
-并在当前 4 视角中选择 GT 信号最强的视角进行对比可视化。
+以 4 视角 × 4 列 (RGB | GT | Gated | Visibility 诊断) 的格式可视化。
+与训练时 `visualize_heatmap_predictions` 采用完全相同的格式。
 """
 
 import argparse
@@ -16,13 +17,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import cv2
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -34,7 +34,7 @@ from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("vis_traj")
 
-VIEW_NAMES = ["Front", "Right", "Back", "Left"]
+VIEW_LABELS = ["Front", "Right", "Back", "Left"]
 
 
 def build_model(cfg: Dict, device: str) -> VLNPipeline:
@@ -87,148 +87,71 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
     return VLNPipeline(config)
 
 
-def overlay_heatmap_on_frame(frame: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6) -> np.ndarray:
-    height, width = frame.shape[:2]
-    hm_resized = cv2.resize(heatmap, (width, height), interpolation=cv2.INTER_CUBIC)
-    hm_max = hm_resized.max()
-    hm_norm = hm_resized / hm_max if hm_max > 1e-8 else hm_resized
-    hm_uint8 = (np.clip(hm_norm, 0, 1) * 255).astype(np.uint8)
-    hm_color = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_INFERNO)
-    hm_color = cv2.cvtColor(hm_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mask = np.clip(hm_norm * 3.0, 0.0, 1.0)[..., None]
-    mixed = frame * (1.0 - alpha * mask) + hm_color * (alpha * mask)
-    return np.clip(mixed, 0, 1)
+def infer_sample(
+    model: VLNPipeline, sample: Dict[str, Any], device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Run inference and return raw heatmaps, gated heatmaps, and visibility."""
+    history_frames = sample['history_frames'].unsqueeze(0).to(device)
+    current_frame = sample['current_frame'].unsqueeze(0).to(device)
+    current_views = sample.get('current_views')
+    history_panoramas = sample.get('history_panoramas')
+    if current_views is None or history_panoramas is None:
+        raise ValueError("数据集不包含全景 current_views/history_panoramas。")
 
-
-def to_bgr_image(image: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor((np.clip(image, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-
-
-def aggregate_history_heatmaps(heatmaps: torch.Tensor) -> torch.Tensor:
-    if heatmaps.dim() == 4:
-        return heatmaps.max(dim=0).values
-    if heatmaps.dim() == 3:
-        return heatmaps
-    raise ValueError(f"Unsupported heatmap shape: {tuple(heatmaps.shape)}")
-
-
-def choose_view(gt_heatmaps: np.ndarray, pred_heatmaps: np.ndarray) -> Tuple[int, float]:
-    gt_strength = gt_heatmaps.reshape(gt_heatmaps.shape[0], -1).max(axis=1)
-    pred_strength = pred_heatmaps.reshape(pred_heatmaps.shape[0], -1).max(axis=1)
-    if gt_strength.max() <= 1e-6:
-        view_idx = int(pred_strength.argmax())
-    else:
-        view_idx = int(gt_strength.argmax())
-
-    gt_view = gt_heatmaps[view_idx]
-    pred_view = pred_heatmaps[view_idx]
-    if gt_view.max() > 0.01 and pred_view.max() > 0.01:
-        gt_peak = np.unravel_index(gt_view.argmax(), gt_view.shape)
-        pred_peak = np.unravel_index(pred_view.argmax(), pred_view.shape)
-        peak_dist = float(np.sqrt((gt_peak[0] - pred_peak[0]) ** 2 + (gt_peak[1] - pred_peak[1]) ** 2))
-    elif gt_view.max() <= 0.01 and pred_view.max() <= 0.01:
-        peak_dist = 0.0
-    else:
-        peak_dist = float('inf')
-
-    return view_idx, peak_dist
-
-
-def wrap_text(text: str, max_chars: int) -> List[str]:
-    if len(text) <= max_chars:
-        return [text]
-    chunks = []
-    current = []
-    current_len = 0
-    for token in text.split():
-        extra = 1 if current else 0
-        if current_len + len(token) + extra > max_chars:
-            chunks.append(" ".join(current))
-            current = [token]
-            current_len = len(token)
-        else:
-            current.append(token)
-            current_len += len(token) + extra
-    if current:
-        chunks.append(" ".join(current))
-    return chunks[:3]
-
-
-def make_trajectory_grid(
-    clip_name: str,
-    instruction: str,
-    position_labels: Sequence[str],
-    frames_np: Sequence[np.ndarray],
-    gt_heatmaps: Sequence[np.ndarray],
-    pred_heatmaps: Sequence[np.ndarray],
-    chosen_views: Sequence[int],
-    peak_dists: Sequence[float],
-    output_path: str,
-) -> None:
-    if not frames_np:
-        return
-
-    rows = 3
-    cols = len(frames_np)
-    tile_h, tile_w = frames_np[0].shape[:2]
-    top_margin = 90
-    left_margin = 16
-    bottom_margin = 20
-    canvas = np.full(
-        (top_margin + rows * tile_h + bottom_margin, left_margin * 2 + cols * tile_w, 3),
-        20,
-        dtype=np.uint8,
+    current_views = current_views.unsqueeze(0).to(device)
+    history_panoramas = history_panoramas.unsqueeze(0).to(device)
+    video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
+    autocast_ctx = (
+        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        if device.type == 'cuda'
+        else nullcontext()
     )
 
-    cv2.putText(canvas, clip_name[:100], (left_margin, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    y = 52
-    for line in wrap_text(instruction, max_chars=max(48, cols * 18)):
-        cv2.putText(canvas, line, (left_margin, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1)
-        y += 20
+    with torch.no_grad(), autocast_ctx:
+        outputs = model(
+            video_frames=video_frames,
+            instruction_text=[sample['text']],
+            current_observation=current_frame,
+            current_views=current_views,
+            history_panoramas=history_panoramas,
+            return_heatmaps=True,
+            return_actions=False,
+        )
 
-    row_titles = ["View", "GT Overlay", "Pred Overlay"]
-    for row_idx, row_title in enumerate(row_titles):
-        y_pos = top_margin + row_idx * tile_h + 22
-        cv2.putText(canvas, row_title, (4, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+    result: Dict[str, torch.Tensor] = {}
+    hm = outputs.get('heatmaps')
+    if hm is None:
+        raise RuntimeError("模型未返回 heatmaps。")
+    result['heatmaps'] = hm[0].float().cpu()           # (N_hist, 4, H, W)
+    vis = outputs.get('visibility')
+    if vis is not None:
+        result['visibility'] = vis[0].float().cpu()     # (N_hist, 4)
+    gated = outputs.get('heatmaps_gated')
+    if gated is not None:
+        result['heatmaps_gated'] = gated[0].float().cpu()  # (N_hist, 4, H, W)
+    return result
 
-    for col_idx in range(cols):
-        frame = frames_np[col_idx]
-        gt_hm = gt_heatmaps[col_idx]
-        pred_hm = pred_heatmaps[col_idx]
-        view_idx = chosen_views[col_idx]
-        peak_dist = peak_dists[col_idx]
-        x_start = left_margin + col_idx * tile_w
 
-        view_img = to_bgr_image(frame)
-        gt_img = to_bgr_image(overlay_heatmap_on_frame(frame, gt_hm))
-        pred_img = to_bgr_image(overlay_heatmap_on_frame(frame, pred_hm))
+def aggregate_max(t: torch.Tensor) -> torch.Tensor:
+    """Max-aggregate over the N_hist (dim=0) dimension: (N_hist, 4, ...) → (4, ...)."""
+    if t.dim() >= 3:
+        return t.max(dim=0).values
+    return t
 
-        labels = [
-            f"{position_labels[col_idx]} | {VIEW_NAMES[view_idx]}",
-            f"GT max={gt_hm.max():.3f}",
-            f"Pred max={pred_hm.max():.3f}",
-        ]
-        if peak_dist == float('inf'):
-            labels[-1] += " | dist=N/A"
-        else:
-            labels[-1] += f" | dist={peak_dist:.1f}px"
 
-        for row_idx, img in enumerate((view_img, gt_img, pred_img)):
-            y_start = top_margin + row_idx * tile_h
-            canvas[y_start:y_start + tile_h, x_start:x_start + tile_w] = img
-            cv2.putText(
-                canvas,
-                labels[row_idx],
-                (x_start + 4, y_start + 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-    cv2.imwrite(output_path, canvas)
-    logger.info(f"  Saved: {output_path}")
+def compute_gated_fallback(
+    heatmaps: torch.Tensor, visibility: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Manually compute per-view softmax + vis gate (same logic as _gated_softmax_heatmaps)."""
+    sig = heatmaps.float().clamp(1e-6, 1 - 1e-6)
+    logits = torch.logit(sig)
+    N_h = logits.shape[0]
+    probs = torch.softmax(logits.reshape(N_h, 4, -1), dim=-1)
+    probs = probs.reshape_as(heatmaps)
+    if visibility is not None:
+        vis_gate = torch.sigmoid(visibility.float())  # (N_h, 4)
+        probs = probs * vis_gate[:, :, None, None]
+    return probs
 
 
 def collect_clip_samples(
@@ -241,7 +164,10 @@ def collect_clip_samples(
     for dataset_idx, (clip_idx, frame_idx) in enumerate(dataset.sample_index):
         by_clip[int(clip_idx)].append((int(frame_idx), int(dataset_idx)))
 
-    clip_items = [(clip_idx, sorted(items, key=lambda x: x[0])) for clip_idx, items in by_clip.items() if items]
+    clip_items = [
+        (clip_idx, sorted(items, key=lambda x: x[0]))
+        for clip_idx, items in by_clip.items() if items
+    ]
     rng = random.Random(seed)
     rng.shuffle(clip_items)
 
@@ -256,49 +182,103 @@ def collect_clip_samples(
     return selected
 
 
-def infer_sample(model: VLNPipeline, sample: Dict[str, Any], device: torch.device) -> np.ndarray:
-    history_frames = sample['history_frames'].unsqueeze(0).to(device)
-    current_frame = sample['current_frame'].unsqueeze(0).to(device)
-    current_views = sample.get('current_views')
-    history_panoramas = sample.get('history_panoramas')
-    if current_views is None or history_panoramas is None:
-        raise ValueError("当前数据集不包含全景 current_views/history_panoramas，无法运行 v2 热力图可视化。")
+def visualize_clip_diagnostic(
+    clip_name: str,
+    instruction: str,
+    samples_data: List[Dict[str, Any]],
+    output_path: str,
+) -> None:
+    """
+    Generate a diagnostic figure matching the training visualization format.
+    Each sample occupies 4 rows (one per view direction).
+    4 columns: RGB | GT heatmap | Gated heatmap | Visibility diagnostic.
+    """
+    num_samples = len(samples_data)
+    if num_samples == 0:
+        return
 
-    current_views = current_views.unsqueeze(0).to(device)
-    history_panoramas = history_panoramas.unsqueeze(0).to(device)
-    video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
-    autocast_context = (
-        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
-        if device.type == 'cuda'
-        else nullcontext()
-    )
+    total_rows = num_samples * 4
+    fig, axes = plt.subplots(total_rows, 4, figsize=(16, 4 * total_rows))
+    if total_rows == 1:
+        axes = axes[np.newaxis, :]
 
-    with torch.no_grad(), autocast_context:
-        outputs = model(
-            video_frames=video_frames,
-            instruction_text=[sample['text']],
-            current_observation=current_frame,
-            current_views=current_views,
-            history_panoramas=history_panoramas,
-            return_heatmaps=True,
-            return_actions=False,
-        )
+    for s_idx, sd in enumerate(samples_data):
+        views_np = sd['current_views']   # (4, H, W, 3)
+        gt_4 = sd['gt_agg']             # (4, Hm, Wm)
+        gated_4 = sd['gated_agg']       # (4, Hm, Wm)
+        vis_scores = sd['vis_scores']    # (4,) float, sigmoid aggregated
+        gt_vis_4 = sd['gt_vis']          # (4,) float
+        n_hist = sd['n_hist']
+        frame_label = sd['frame_label']
+        row_offset = s_idx * 4
 
-    heatmaps = outputs.get('heatmaps_gated', outputs.get('heatmaps'))
-    if heatmaps is None:
-        raise RuntimeError("模型未返回 heatmaps。")
-    return heatmaps[0].float().cpu()
+        for v in range(4):
+            r = row_offset + v
+            rgb = np.clip(views_np[v], 0, 1)
+            axes[r, 0].imshow(rgb)
+            label = f"F{frame_label} {VIEW_LABELS[v]}" if v == 0 else VIEW_LABELS[v]
+            axes[r, 0].set_title(label, fontweight='bold')
+            axes[r, 0].axis('off')
+
+            gt_hm = gt_4[v]
+            axes[r, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(float(gt_hm.max()), 0.01))
+            axes[r, 1].set_title(f"GT (max={float(gt_hm.max()):.2f})")
+            axes[r, 1].axis('off')
+
+            gated_v = gated_4[v]
+            gated_vmax = max(float(gated_v.max()), 1e-8)
+            axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
+            axes[r, 2].set_title(f"Gated (max={float(gated_v.max()):.4f})")
+            axes[r, 2].axis('off')
+
+            pred_v = vis_scores[v]
+            gt_v = gt_vis_4[v]
+            correct = (pred_v > 0.5) == (gt_v > 0.5)
+            bg_color = [0.85, 0.95, 0.85] if correct else [0.95, 0.85, 0.85]
+            axes[r, 3].set_facecolor(bg_color)
+            axes[r, 3].text(
+                0.5, 0.55,
+                f"Pred vis: {pred_v:.2f}\nGT vis: {gt_v:.0f}",
+                ha='center', va='center', fontsize=14, fontfamily='monospace',
+                transform=axes[r, 3].transAxes,
+            )
+            status = "OK" if correct else "WRONG"
+            axes[r, 3].text(
+                0.5, 0.15, status,
+                ha='center', va='center', fontsize=16, fontweight='bold',
+                color='green' if correct else 'red',
+                transform=axes[r, 3].transAxes,
+            )
+            axes[r, 3].set_title("Visibility")
+            axes[r, 3].set_xticks([])
+            axes[r, 3].set_yticks([])
+
+            if v == 0:
+                axes[r, 0].set_ylabel(
+                    f"Pos {s_idx}\nF{frame_label}\n(N={n_hist})",
+                    fontsize=10, fontweight='bold', rotation=0,
+                    labelpad=60, va='center',
+                )
+
+    title_instr = instruction[:120] + "..." if len(instruction) > 120 else instruction
+    plt.suptitle(f"{clip_name} — {num_samples} positions\n{title_instr}", fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(output_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="轨迹热力图可视化 (HeatmapVLN v2)")
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--num-clips', type=int, default=3, help='可视化 clip 数')
-    parser.add_argument('--frames-per-clip', type=int, default=12, help='每个 clip 抽样的位置数')
+    parser.add_argument('--frames-per-clip', type=int, default=6, help='每个 clip 抽样的位置数')
     parser.add_argument('--output-dir', type=str, default='./vis_trajectory')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--split', type=str, default=None, help='默认使用配置里的 val_split')
+    parser.add_argument('--attn-impl', type=str, default=None,
+                        help='覆盖 attention implementation (sdpa/flash_attention_2)')
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -345,15 +325,30 @@ def main() -> int:
         logger.error("没有找到可用样本。")
         return 1
 
+    if args.attn_impl:
+        cfg['model']['llm']['attn_implementation'] = args.attn_impl
+        logger.info(f"  Overriding attn_implementation → {args.attn_impl}")
+
     logger.info("Building model...")
     model = build_model(cfg, device=str(device))
+    model = model.to(device)
+    model._ensure_heatmap_vln()
     state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', {}))
     if state_dict:
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        logger.info(f"  Loaded: {len(state_dict)} params, missing={len(missing)}, unexpected={len(unexpected)}")
+        current_state = model.state_dict()
+        norm = lambda n: n.replace("module.", "", 1).replace(".module.", ".")
+        norm_to_actual = {norm(k): k for k in current_state.keys()}
+        remapped = {
+            norm_to_actual[norm(k)]: v
+            for k, v in state_dict.items() if norm(k) in norm_to_actual
+        }
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        logger.info(
+            f"  Loaded: {len(remapped)}/{len(state_dict)} params, "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
     else:
         logger.warning("  No trainable weights in checkpoint!")
-    model = model.to(device)
     model.eval()
 
     logger.info(f"Visualizing {len(selected_clips)} clips...")
@@ -362,75 +357,78 @@ def main() -> int:
         clip_name = f"{clip_dir.parent.name}/{clip_dir.name}"
         logger.info(f"[Clip {clip_order + 1}/{len(selected_clips)}] {clip_name} ({len(items)} samples)")
 
-        frames_np: List[np.ndarray] = []
-        gt_heatmaps: List[np.ndarray] = []
-        pred_heatmaps: List[np.ndarray] = []
-        chosen_views: List[int] = []
-        peak_dists: List[float] = []
-        position_labels: List[str] = []
+        samples_data: List[Dict[str, Any]] = []
         instruction = ""
 
         for frame_idx, dataset_idx in items:
             sample = dataset[dataset_idx]
             instruction = sample['text']
 
-            pred_all = infer_sample(model, sample, device=device)
-            gt_all = sample['heatmap'].float().cpu()
+            result = infer_sample(model, sample, device=device)
+            pred_raw = result['heatmaps']           # (N_hist, 4, H, W) raw sigmoid
+            pred_vis = result.get('visibility')     # (N_hist, 4) logits or None
+            pred_gated = result.get('heatmaps_gated')  # (N_hist, 4, H, W) or None
 
-            pred_agg = aggregate_history_heatmaps(pred_all)
-            gt_agg = aggregate_history_heatmaps(gt_all)
+            gt_all = sample['heatmap'].float().cpu()  # (N_hist, 4, H, W)
+            gt_vis_raw = sample.get('gt_visibility')  # (N_hist, 4) or None
 
-            if pred_agg.shape[-2:] != gt_agg.shape[-2:]:
-                pred_agg = F.interpolate(
-                    pred_agg.unsqueeze(0),
-                    size=gt_agg.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False,
-                ).squeeze(0)
+            n_hist = gt_all.shape[0] if gt_all.dim() == 4 else 1
 
-            pred_np = np.clip(pred_agg.numpy(), 0, 1)
-            gt_np = np.clip(gt_agg.numpy(), 0, 1)
-            current_views_np = sample['current_views'].cpu().numpy().transpose(0, 2, 3, 1)
+            # --- GT: max-aggregate across N_hist → (4, H, W) ---
+            gt_agg = aggregate_max(gt_all).numpy()
 
-            view_idx, peak_dist = choose_view(gt_np, pred_np)
-            frames_np.append(np.clip(current_views_np[view_idx], 0, 1))
-            gt_heatmaps.append(gt_np[view_idx])
-            pred_heatmaps.append(pred_np[view_idx])
-            chosen_views.append(view_idx)
-            peak_dists.append(peak_dist)
-            position_labels.append(f"F{frame_idx}")
+            # --- Gated pred: max-aggregate across N_hist → (4, H, W) ---
+            if pred_gated is not None:
+                gated_agg = aggregate_max(pred_gated).numpy()
+            else:
+                gated_t = compute_gated_fallback(pred_raw, pred_vis)
+                gated_agg = aggregate_max(gated_t).numpy()
 
+            # --- Visibility scores: sigmoid → max-aggregate across N_hist → (4,) ---
+            if pred_vis is not None:
+                vis_sig = torch.sigmoid(pred_vis)  # (N_hist, 4)
+                vis_scores = vis_sig.max(dim=0).values.numpy()  # (4,)
+            else:
+                vis_scores = np.ones(4)
+
+            # --- GT visibility: max-aggregate → (4,) ---
+            if gt_vis_raw is not None:
+                if gt_vis_raw.dim() == 2:
+                    gt_vis_4 = gt_vis_raw.float().max(dim=0).values.numpy()
+                else:
+                    gt_vis_4 = gt_vis_raw.float().numpy()
+            else:
+                gt_vis_4 = (gt_agg.max(axis=(-2, -1)) > 0).astype(float)
+
+            views_np = sample['current_views'].cpu().numpy().transpose(0, 2, 3, 1)  # (4, H, W, 3)
+
+            gated_has_signal = "gated" if pred_gated is not None else "fallback"
             logger.info(
-                "  frame=%4d view=%s peak_dist=%s gt_max=%.3f pred_max=%.3f",
-                frame_idx,
-                VIEW_NAMES[view_idx],
-                "N/A" if peak_dist == float('inf') else f"{peak_dist:.1f}px",
-                float(gt_np[view_idx].max()),
-                float(pred_np[view_idx].max()),
+                "  frame=%4d N_hist=%d src=%s  gt_max=[%.2f, %.2f, %.2f, %.2f]  "
+                "gated_max=[%.4f, %.4f, %.4f, %.4f]  vis=[%.2f, %.2f, %.2f, %.2f]",
+                frame_idx, n_hist, gated_has_signal,
+                *[float(gt_agg[v].max()) for v in range(4)],
+                *[float(gated_agg[v].max()) for v in range(4)],
+                *[float(vis_scores[v]) for v in range(4)],
             )
+
+            samples_data.append({
+                'current_views': views_np,
+                'gt_agg': gt_agg,
+                'gated_agg': gated_agg,
+                'vis_scores': vis_scores,
+                'gt_vis': gt_vis_4,
+                'n_hist': n_hist,
+                'frame_label': frame_idx,
+            })
 
         out_path = output_dir / f"clip_{clip_order:02d}_{clip_dir.name}.png"
-        make_trajectory_grid(
+        visualize_clip_diagnostic(
             clip_name=clip_name,
             instruction=instruction,
-            position_labels=position_labels,
-            frames_np=frames_np,
-            gt_heatmaps=gt_heatmaps,
-            pred_heatmaps=pred_heatmaps,
-            chosen_views=chosen_views,
-            peak_dists=peak_dists,
+            samples_data=samples_data,
             output_path=str(out_path),
         )
-
-        finite = [dist for dist in peak_dists if dist != float('inf')]
-        if finite:
-            logger.info(
-                "  Summary: mean_dist=%.1fpx, median=%.1fpx, <5px=%d/%d",
-                float(np.mean(finite)),
-                float(np.median(finite)),
-                sum(1 for dist in finite if dist < 5),
-                len(finite),
-            )
         torch.cuda.empty_cache()
 
     logger.info(f"All done! Output: {output_dir}")
