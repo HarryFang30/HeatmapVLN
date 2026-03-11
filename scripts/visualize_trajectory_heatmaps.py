@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-轨迹热力图可视化（HeatmapVLN v2）
-=================================
+轨迹热力图可视化（HeatmapVLN v2 — 全景横向布局 + BEV）
+=======================================================
 
-沿着一条完整轨迹抽样多个位置，对每个位置聚合所有历史时间步热力图，
-以 4 视角 × 4 列 (RGB | GT | Gated | Visibility 诊断) 的格式可视化。
-与训练时 `visualize_heatmap_predictions` 采用完全相同的格式。
+每个位置的 4 视角 (Front|Right|Back|Left) 在同一行并排，
+所有位置水平排列，顶部显示 BEV 俯视轨迹图。
 """
 
 import argparse
@@ -17,9 +16,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import cv2
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -34,16 +35,18 @@ from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("vis_traj")
 
-VIEW_LABELS = ["Front", "Right", "Back", "Left"]
+VIEW_LABELS = ["F", "R", "B", "L"]
+TILE = 80
+GAP = 3
 
+
+# ───────────────────── Model ─────────────────────
 
 def build_model(cfg: Dict, device: str) -> VLNPipeline:
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
-    action_head_type = action_cfg.get('type', 'transformer')
-
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
@@ -78,7 +81,7 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
-        action_head_type=action_head_type,
+        action_head_type=action_cfg.get('type', 'transformer'),
         enable_action_head=False,
         enable_stop_head=False,
         enable_progress_head=False,
@@ -87,10 +90,11 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
     return VLNPipeline(config)
 
 
+# ───────────────────── Inference ─────────────────────
+
 def infer_sample(
     model: VLNPipeline, sample: Dict[str, Any], device: torch.device,
 ) -> Dict[str, torch.Tensor]:
-    """Run inference and return raw heatmaps, gated heatmaps, and visibility."""
     history_frames = sample['history_frames'].unsqueeze(0).to(device)
     current_frame = sample['current_frame'].unsqueeze(0).to(device)
     current_views = sample.get('current_views')
@@ -103,8 +107,7 @@ def infer_sample(
     video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
     autocast_ctx = (
         torch.autocast(device_type='cuda', dtype=torch.bfloat16)
-        if device.type == 'cuda'
-        else nullcontext()
+        if device.type == 'cuda' else nullcontext()
     )
 
     with torch.no_grad(), autocast_ctx:
@@ -122,18 +125,17 @@ def infer_sample(
     hm = outputs.get('heatmaps')
     if hm is None:
         raise RuntimeError("模型未返回 heatmaps。")
-    result['heatmaps'] = hm[0].float().cpu()           # (N_hist, 4, H, W)
+    result['heatmaps'] = hm[0].float().cpu()
     vis = outputs.get('visibility')
     if vis is not None:
-        result['visibility'] = vis[0].float().cpu()     # (N_hist, 4)
+        result['visibility'] = vis[0].float().cpu()
     gated = outputs.get('heatmaps_gated')
     if gated is not None:
-        result['heatmaps_gated'] = gated[0].float().cpu()  # (N_hist, 4, H, W)
+        result['heatmaps_gated'] = gated[0].float().cpu()
     return result
 
 
 def aggregate_max(t: torch.Tensor) -> torch.Tensor:
-    """Max-aggregate over the N_hist (dim=0) dimension: (N_hist, 4, ...) → (4, ...)."""
     if t.dim() >= 3:
         return t.max(dim=0).values
     return t
@@ -142,17 +144,223 @@ def aggregate_max(t: torch.Tensor) -> torch.Tensor:
 def compute_gated_fallback(
     heatmaps: torch.Tensor, visibility: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Manually compute per-view softmax + vis gate (same logic as _gated_softmax_heatmaps)."""
     sig = heatmaps.float().clamp(1e-6, 1 - 1e-6)
     logits = torch.logit(sig)
     N_h = logits.shape[0]
     probs = torch.softmax(logits.reshape(N_h, 4, -1), dim=-1)
     probs = probs.reshape_as(heatmaps)
     if visibility is not None:
-        vis_gate = torch.sigmoid(visibility.float())  # (N_h, 4)
+        vis_gate = torch.sigmoid(visibility.float())
         probs = probs * vis_gate[:, :, None, None]
     return probs
 
+
+# ───────────────────── Strip builders ─────────────────────
+
+def _resize(img: np.ndarray, size: int) -> np.ndarray:
+    if img.shape[0] == size and img.shape[1] == size:
+        return img
+    return cv2.resize(img.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA)
+
+
+def _build_rgb_strip(samples_data: List[Dict], tile: int = TILE, gap: int = GAP) -> np.ndarray:
+    N = len(samples_data)
+    group_w = 4 * tile
+    strip_w = N * group_w + max(N - 1, 0) * gap
+    strip = np.zeros((tile, strip_w, 3), dtype=np.float32)
+    for i, sd in enumerate(samples_data):
+        views = sd['current_views']
+        x0 = i * (group_w + gap)
+        for v in range(4):
+            t = _resize(np.clip(views[v], 0, 1), tile)
+            strip[:, x0 + v * tile: x0 + (v + 1) * tile] = t
+    return strip
+
+
+def _build_heatmap_strip(
+    samples_data: List[Dict], key: str,
+    tile: int = TILE, gap: int = GAP,
+    global_vmax: Optional[float] = None,
+) -> np.ndarray:
+    cmap = plt.cm.inferno
+    N = len(samples_data)
+    group_w = 4 * tile
+    strip_w = N * group_w + max(N - 1, 0) * gap
+    strip = np.zeros((tile, strip_w, 3), dtype=np.float32)
+    for i, sd in enumerate(samples_data):
+        hm_4 = sd[key]  # (4, Hm, Wm)
+        if global_vmax is not None:
+            vmax = global_vmax
+        else:
+            vmax = max(float(hm_4.max()), 1e-8)
+        x0 = i * (group_w + gap)
+        for v in range(4):
+            hm = _resize(hm_4[v], tile)
+            hm_norm = np.clip(hm / vmax, 0, 1)
+            t = cmap(hm_norm)[:, :, :3].astype(np.float32)
+            strip[:, x0 + v * tile: x0 + (v + 1) * tile] = t
+    return strip
+
+
+# ───────────────────── BEV plot ─────────────────────
+
+def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[List]]:
+    """Load pre-rendered navmesh BEV image and trajectory pixel coordinates."""
+    topdown_path = clip_dir / "topdown_trajectory.jpg"
+    transform_path = clip_dir / "topdown_transform.json"
+
+    topdown_img = cv2.imread(str(topdown_path))
+    if topdown_img is None:
+        return None, None
+    topdown_img = cv2.cvtColor(topdown_img, cv2.COLOR_BGR2RGB)
+
+    if transform_path.exists():
+        import json
+        with open(transform_path, 'r') as f:
+            transform = json.load(f)
+        trajectory_pixels = transform["trajectory_pixels"]
+    else:
+        trajectory_pixels = None
+    return topdown_img, trajectory_pixels
+
+
+def _plot_bev(
+    ax: plt.Axes,
+    clip_dir: Path,
+    sampled_frame_indices: List[int],
+    samples_data: List[Dict],
+    all_poses: List[np.ndarray],
+) -> None:
+    topdown_img, trajectory_pixels = _load_topdown_data(clip_dir)
+
+    if topdown_img is not None and trajectory_pixels is not None:
+        canvas = topdown_img.copy()
+        N = len(sampled_frame_indices)
+        colors_rgb = [
+            tuple(int(c * 255) for c in plt.cm.tab20(i / max(N - 1, 1))[:3])
+            for i in range(N)
+        ]
+
+        num_pts = len(trajectory_pixels)
+        for i in range(num_pts - 1):
+            p1 = tuple(trajectory_pixels[i])
+            p2 = tuple(trajectory_pixels[i + 1])
+            cv2.line(canvas, p1, p2, (200, 200, 200), 1, cv2.LINE_AA)
+
+        for i, fidx in enumerate(sampled_frame_indices):
+            if fidx >= num_pts:
+                continue
+            curr = tuple(trajectory_pixels[fidx])
+            bgr = (colors_rgb[i][2], colors_rgb[i][1], colors_rgb[i][0])
+            cv2.circle(canvas, curr, 6, bgr, -1, cv2.LINE_AA)
+            cv2.circle(canvas, curr, 6, (0, 0, 0), 1, cv2.LINE_AA)
+
+            if fidx + 1 < num_pts:
+                nxt = tuple(trajectory_pixels[fidx + 1])
+                dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
+                length = max(1, (dx ** 2 + dy ** 2) ** 0.5)
+                arrow_len = 18
+                tip = (int(curr[0] + dx / length * arrow_len),
+                       int(curr[1] + dy / length * arrow_len))
+                cv2.arrowedLine(canvas, curr, tip, bgr, 2, tipLength=0.35)
+
+            label_pos = (curr[0] + 8, curr[1] - 4)
+            cv2.putText(canvas, str(i), label_pos,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, str(i), label_pos,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+        ax.imshow(canvas)
+        ax.axis('off')
+    else:
+        positions = np.array([p[:3, 3] for p in all_poses])
+        x_all, z_all = positions[:, 0], positions[:, 2]
+        ax.plot(x_all, z_all, '-', color='#bbbbbb', linewidth=1.2, zorder=1)
+
+        N = len(sampled_frame_indices)
+        colors = plt.cm.tab20(np.linspace(0, 1, max(N, 1)))
+        extent = max(x_all.max() - x_all.min(), z_all.max() - z_all.min(), 1e-3)
+        arrow_len = extent * 0.04
+
+        for i, fidx in enumerate(sampled_frame_indices):
+            px, pz = x_all[fidx], z_all[fidx]
+            ax.scatter(px, pz, c=[colors[i]], s=40, marker='o', zorder=5,
+                       edgecolors='k', linewidth=0.5)
+            ax.annotate(str(i), (px, pz), fontsize=5, ha='center', va='bottom',
+                        xytext=(0, 4), textcoords='offset points', fontweight='bold')
+            fwd = -all_poses[fidx][:3, 2]
+            fwd_bev = np.array([fwd[0], fwd[2]])
+            fwd_norm = np.linalg.norm(fwd_bev)
+            if fwd_norm > 1e-6:
+                fwd_bev = fwd_bev / fwd_norm * arrow_len
+                ax.annotate('', xy=(px + fwd_bev[0], pz + fwd_bev[1]), xytext=(px, pz),
+                            arrowprops=dict(arrowstyle='->', color=colors[i], lw=1.2))
+        ax.set_aspect('equal')
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.2, linewidth=0.5)
+
+
+# ───────────────────── Main visualization ─────────────────────
+
+def visualize_clip_panoramic(
+    clip_name: str,
+    instruction: str,
+    samples_data: List[Dict[str, Any]],
+    all_poses: List[np.ndarray],
+    sampled_frame_indices: List[int],
+    clip_dir: Path,
+    output_path: str,
+    tile: int = TILE,
+    gap: int = GAP,
+) -> None:
+    N = len(samples_data)
+    if N == 0:
+        return
+
+    rgb_strip = _build_rgb_strip(samples_data, tile, gap)
+    gt_strip = _build_heatmap_strip(samples_data, 'gt_agg', tile, gap, global_vmax=1.0)
+    gated_strip = _build_heatmap_strip(samples_data, 'gated_agg', tile, gap, global_vmax=None)
+
+    strip_w_px = rgb_strip.shape[1]
+    group_w = 4 * tile
+
+    fig_w = max(strip_w_px / 80, 12)
+    fig_h = max(fig_w * 0.35, 5)
+
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(4, 1, height_ratios=[1.8, 1, 1, 1], hspace=0.15)
+
+    ax_bev = fig.add_subplot(gs[0])
+    _plot_bev(ax_bev, clip_dir, sampled_frame_indices, samples_data, all_poses)
+    instr_short = instruction[:120] + "..." if len(instruction) > 120 else instruction
+    ax_bev.set_title(f"BEV: {clip_name}\n{instr_short}", fontsize=7, pad=4)
+
+    row_data = [
+        (gs[1], rgb_strip, "RGB (F|R|B|L)"),
+        (gs[2], gt_strip, "GT Heatmap"),
+        (gs[3], gated_strip, "Gated"),
+    ]
+    for gs_slot, strip, ylabel in row_data:
+        ax = fig.add_subplot(gs_slot)
+        ax.imshow(strip, aspect='auto', interpolation='nearest')
+        ax.set_ylabel(ylabel, fontsize=7, rotation=90, labelpad=8)
+        ax.set_yticks([])
+
+        tick_xs = [i * (group_w + gap) + group_w // 2 for i in range(N)]
+        tick_labels = [f"{i}\nF{samples_data[i]['frame_label']}" for i in range(N)]
+        ax.set_xticks(tick_xs)
+        ax.set_xticklabels(tick_labels, fontsize=4, rotation=0)
+
+        for i in range(1, N):
+            sep_x = i * (group_w + gap) - gap / 2 - 0.5
+            ax.axvline(sep_x, color='white', linewidth=0.8, alpha=0.7)
+
+    fig.savefig(output_path, dpi=120, bbox_inches='tight', pad_inches=0.08)
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path}")
+
+
+# ───────────────────── Data collection ─────────────────────
 
 def collect_clip_samples(
     dataset: VLNSlidingWindowDataset,
@@ -182,106 +390,19 @@ def collect_clip_samples(
     return selected
 
 
-def visualize_clip_diagnostic(
-    clip_name: str,
-    instruction: str,
-    samples_data: List[Dict[str, Any]],
-    output_path: str,
-) -> None:
-    """
-    Generate a diagnostic figure matching the training visualization format.
-    Each sample occupies 4 rows (one per view direction).
-    4 columns: RGB | GT heatmap | Gated heatmap | Visibility diagnostic.
-    """
-    num_samples = len(samples_data)
-    if num_samples == 0:
-        return
-
-    total_rows = num_samples * 4
-    fig, axes = plt.subplots(total_rows, 4, figsize=(16, 4 * total_rows))
-    if total_rows == 1:
-        axes = axes[np.newaxis, :]
-
-    for s_idx, sd in enumerate(samples_data):
-        views_np = sd['current_views']   # (4, H, W, 3)
-        gt_4 = sd['gt_agg']             # (4, Hm, Wm)
-        gated_4 = sd['gated_agg']       # (4, Hm, Wm)
-        vis_scores = sd['vis_scores']    # (4,) float, sigmoid aggregated
-        gt_vis_4 = sd['gt_vis']          # (4,) float
-        n_hist = sd['n_hist']
-        frame_label = sd['frame_label']
-        row_offset = s_idx * 4
-
-        gated_shared_vmax = max(float(gated_4.max()), 1e-8)
-
-        for v in range(4):
-            r = row_offset + v
-            rgb = np.clip(views_np[v], 0, 1)
-            axes[r, 0].imshow(rgb)
-            label = f"F{frame_label} {VIEW_LABELS[v]}" if v == 0 else VIEW_LABELS[v]
-            axes[r, 0].set_title(label, fontweight='bold')
-            axes[r, 0].axis('off')
-
-            gt_hm = gt_4[v]
-            axes[r, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(float(gt_hm.max()), 0.01))
-            axes[r, 1].set_title(f"GT (max={float(gt_hm.max()):.2f})")
-            axes[r, 1].axis('off')
-
-            gated_v = gated_4[v]
-            n_pixels = gated_v.shape[0] * gated_v.shape[1]
-            peak_ratio = float(gated_v.max()) / (1.0 / n_pixels) if n_pixels > 0 else 0
-            axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_shared_vmax)
-            axes[r, 2].set_title(f"Gated (vis={vis_scores[v]:.2f}, {peak_ratio:.1f}×uni)")
-            axes[r, 2].axis('off')
-
-            pred_v = vis_scores[v]
-            gt_v = gt_vis_4[v]
-            correct = (pred_v > 0.5) == (gt_v > 0.5)
-            bg_color = [0.85, 0.95, 0.85] if correct else [0.95, 0.85, 0.85]
-            axes[r, 3].set_facecolor(bg_color)
-            axes[r, 3].text(
-                0.5, 0.55,
-                f"Pred vis: {pred_v:.2f}\nGT vis: {gt_v:.0f}",
-                ha='center', va='center', fontsize=14, fontfamily='monospace',
-                transform=axes[r, 3].transAxes,
-            )
-            status = "OK" if correct else "WRONG"
-            axes[r, 3].text(
-                0.5, 0.15, status,
-                ha='center', va='center', fontsize=16, fontweight='bold',
-                color='green' if correct else 'red',
-                transform=axes[r, 3].transAxes,
-            )
-            axes[r, 3].set_title("Visibility")
-            axes[r, 3].set_xticks([])
-            axes[r, 3].set_yticks([])
-
-            if v == 0:
-                axes[r, 0].set_ylabel(
-                    f"Pos {s_idx}\nF{frame_label}\n(N={n_hist})",
-                    fontsize=10, fontweight='bold', rotation=0,
-                    labelpad=60, va='center',
-                )
-
-    title_instr = instruction[:120] + "..." if len(instruction) > 120 else instruction
-    plt.suptitle(f"{clip_name} — {num_samples} positions\n{title_instr}", fontsize=12)
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
-    fig.savefig(output_path, dpi=100, bbox_inches='tight')
-    plt.close(fig)
-    logger.info(f"  Saved: {output_path}")
-
+# ───────────────────── Main ─────────────────────
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="轨迹热力图可视化 (HeatmapVLN v2)")
+    parser = argparse.ArgumentParser(description="轨迹热力图可视化 (HeatmapVLN v2 — 全景横向 + BEV)")
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--num-clips', type=int, default=3, help='可视化 clip 数')
-    parser.add_argument('--frames-per-clip', type=int, default=6, help='每个 clip 抽样的位置数')
+    parser.add_argument('--num-clips', type=int, default=3)
+    parser.add_argument('--frames-per-clip', type=int, default=32)
     parser.add_argument('--output-dir', type=str, default='./vis_trajectory')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--split', type=str, default=None, help='默认使用配置里的 val_split')
-    parser.add_argument('--attn-impl', type=str, default=None,
-                        help='覆盖 attention implementation (sdpa/flash_attention_2)')
+    parser.add_argument('--split', type=str, default=None)
+    parser.add_argument('--attn-impl', type=str, default=None)
+    parser.add_argument('--tile-size', type=int, default=TILE)
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -315,7 +436,7 @@ def main() -> int:
     )
 
     if not getattr(dataset, '_is_panoramic', False):
-        logger.error("当前数据集不是全景 4 视角格式，无法运行 v2 轨迹热力图可视化。")
+        logger.error("数据集不是全景 4 视角格式。")
         return 1
 
     selected_clips = collect_clip_samples(
@@ -360,56 +481,48 @@ def main() -> int:
         clip_name = f"{clip_dir.parent.name}/{clip_dir.name}"
         logger.info(f"[Clip {clip_order + 1}/{len(selected_clips)}] {clip_name} ({len(items)} samples)")
 
+        all_poses = dataset._load_poses(clip_idx)
         samples_data: List[Dict[str, Any]] = []
+        sampled_frame_indices: List[int] = []
         instruction = ""
 
         for frame_idx, dataset_idx in items:
             sample = dataset[dataset_idx]
             instruction = sample['text']
+            sampled_frame_indices.append(frame_idx)
 
             result = infer_sample(model, sample, device=device)
-            pred_raw = result['heatmaps']           # (N_hist, 4, H, W) raw sigmoid
-            pred_vis = result.get('visibility')     # (N_hist, 4) logits or None
-            pred_gated = result.get('heatmaps_gated')  # (N_hist, 4, H, W) or None
+            pred_raw = result['heatmaps']
+            pred_vis = result.get('visibility')
+            pred_gated = result.get('heatmaps_gated')
 
-            gt_all = sample['heatmap'].float().cpu()  # (N_hist, 4, H, W)
-            gt_vis_raw = sample.get('gt_visibility')  # (N_hist, 4) or None
+            gt_all = sample['heatmap'].float().cpu()
+            gt_vis_raw = sample.get('gt_visibility')
 
             n_hist = gt_all.shape[0] if gt_all.dim() == 4 else 1
-
-            # --- GT: max-aggregate across N_hist → (4, H, W) ---
             gt_agg = aggregate_max(gt_all).numpy()
 
-            # --- Gated pred: max-aggregate across N_hist → (4, H, W) ---
             if pred_gated is not None:
                 gated_agg = aggregate_max(pred_gated).numpy()
             else:
-                gated_t = compute_gated_fallback(pred_raw, pred_vis)
-                gated_agg = aggregate_max(gated_t).numpy()
+                gated_agg = aggregate_max(compute_gated_fallback(pred_raw, pred_vis)).numpy()
 
-            # --- Visibility scores: sigmoid → max-aggregate across N_hist → (4,) ---
             if pred_vis is not None:
-                vis_sig = torch.sigmoid(pred_vis)  # (N_hist, 4)
-                vis_scores = vis_sig.max(dim=0).values.numpy()  # (4,)
+                vis_scores = torch.sigmoid(pred_vis).max(dim=0).values.numpy()
             else:
                 vis_scores = np.ones(4)
 
-            # --- GT visibility: max-aggregate → (4,) ---
             if gt_vis_raw is not None:
-                if gt_vis_raw.dim() == 2:
-                    gt_vis_4 = gt_vis_raw.float().max(dim=0).values.numpy()
-                else:
-                    gt_vis_4 = gt_vis_raw.float().numpy()
+                gt_vis_4 = gt_vis_raw.float().max(dim=0).values.numpy() if gt_vis_raw.dim() == 2 else gt_vis_raw.float().numpy()
             else:
                 gt_vis_4 = (gt_agg.max(axis=(-2, -1)) > 0).astype(float)
 
-            views_np = sample['current_views'].cpu().numpy().transpose(0, 2, 3, 1)  # (4, H, W, 3)
+            views_np = sample['current_views'].cpu().numpy().transpose(0, 2, 3, 1)
 
-            gated_has_signal = "gated" if pred_gated is not None else "fallback"
             logger.info(
-                "  frame=%4d N_hist=%d src=%s  gt_max=[%.2f, %.2f, %.2f, %.2f]  "
-                "gated_max=[%.4f, %.4f, %.4f, %.4f]  vis=[%.2f, %.2f, %.2f, %.2f]",
-                frame_idx, n_hist, gated_has_signal,
+                "  frame=%4d N=%d  gt_max=[%.2f,%.2f,%.2f,%.2f]  "
+                "gated_max=[%.4f,%.4f,%.4f,%.4f]  vis=[%.2f,%.2f,%.2f,%.2f]",
+                frame_idx, n_hist,
                 *[float(gt_agg[v].max()) for v in range(4)],
                 *[float(gated_agg[v].max()) for v in range(4)],
                 *[float(vis_scores[v]) for v in range(4)],
@@ -426,11 +539,15 @@ def main() -> int:
             })
 
         out_path = output_dir / f"clip_{clip_order:02d}_{clip_dir.name}.png"
-        visualize_clip_diagnostic(
+        visualize_clip_panoramic(
             clip_name=clip_name,
             instruction=instruction,
             samples_data=samples_data,
+            all_poses=all_poses,
+            sampled_frame_indices=sampled_frame_indices,
+            clip_dir=clip_dir,
             output_path=str(out_path),
+            tile=args.tile_size,
         )
         torch.cuda.empty_cache()
 
