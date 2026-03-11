@@ -756,116 +756,123 @@ def visualize_heatmap_predictions(
         B = min(num_samples, batch['current_frame'].shape[0])
 
         if has_panoramic:
-            pred_vis_raw = output.get('visibility')
-            gated_heatmaps = output.get('heatmaps_gated')
+            pred_vis_raw = output.get('visibility')       # (B, N_hist, 4) or None
+            gated_heatmaps = output.get('heatmaps_gated') # (B, N_hist, 4, H, W) or None
+            batch_gt_vis = batch.get('gt_visibility')     # (B, N_hist, 4) or None
 
             for b in range(B):
                 views = batch['current_views'][b]  # (4, C, H, W)
 
-                if pred_heatmaps.dim() == 5:
-                    pred_4 = pred_heatmaps[b, 0]  # (4, Hm, Wm)
-                elif pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
-                    pred_4 = pred_heatmaps[b]
-                else:
-                    pred_4 = pred_heatmaps[b].unsqueeze(0).expand(4, -1, -1)
-
-                gt_b = gt_heatmaps[b]
-                if gt_b.dim() == 3 and gt_b.shape[0] == 4:
-                    gt_4 = gt_b
+                # --- determine N_hist for this sample ---
+                gt_b = gt_heatmaps[b]  # (N_hist, 4, Hm, Wm) or (4, Hm, Wm) or (Hm, Wm)
+                if gt_b.dim() == 3 and gt_b.shape[0] != 4:
+                    N_hist = 1
+                elif gt_b.dim() == 3 and gt_b.shape[0] == 4:
+                    N_hist = 1
                 elif gt_b.dim() == 4:
-                    gt_4 = gt_b[0]
+                    N_hist = gt_b.shape[0]
                 else:
-                    gt_4 = gt_b.unsqueeze(0).expand(4, -1, -1)
+                    N_hist = 1
 
-                # Use gated heatmaps (per-view softmax + vis gate, same as inference)
-                if gated_heatmaps is not None:
-                    if gated_heatmaps.dim() == 5:
-                        gated_4 = gated_heatmaps[b, 0]
-                    elif gated_heatmaps.dim() == 4:
-                        gated_4 = gated_heatmaps[b]
+                for h in range(N_hist):
+                    # --- extract (4, Hm, Wm) slices for this history frame ---
+                    if gt_b.dim() == 4:
+                        gt_4 = gt_b[h]
+                    elif gt_b.dim() == 3 and gt_b.shape[0] == 4:
+                        gt_4 = gt_b
                     else:
-                        gated_4 = None
-                else:
-                    gated_4 = None
+                        gt_4 = gt_b.unsqueeze(0).expand(4, -1, -1)
 
-                if gated_4 is None:
-                    sig = pred_4.detach().float().clamp(1e-6, 1 - 1e-6)
-                    logits_pv = torch.logit(sig)
-                    H, W = logits_pv.shape[-2], logits_pv.shape[-1]
-                    probs_pv = torch.softmax(logits_pv.reshape(4, -1), dim=-1).reshape(4, H, W)
+                    if pred_heatmaps.dim() == 5:
+                        pred_4 = pred_heatmaps[b, h]
+                    elif pred_heatmaps.dim() == 4 and pred_heatmaps.shape[1] == 4:
+                        pred_4 = pred_heatmaps[b]
+                    else:
+                        pred_4 = pred_heatmaps[b].unsqueeze(0).expand(4, -1, -1)
+
+                    # Use gated heatmaps (per-view softmax + vis gate, same as inference)
+                    gated_4 = None
+                    if gated_heatmaps is not None:
+                        if gated_heatmaps.dim() == 5:
+                            gated_4 = gated_heatmaps[b, h]
+                        elif gated_heatmaps.dim() == 4:
+                            gated_4 = gated_heatmaps[b]
+
+                    if gated_4 is None:
+                        sig = pred_4.detach().float().clamp(1e-6, 1 - 1e-6)
+                        logits_pv = torch.logit(sig)
+                        Hm, Wm = logits_pv.shape[-2], logits_pv.shape[-1]
+                        probs_pv = torch.softmax(logits_pv.reshape(4, -1), dim=-1).reshape(4, Hm, Wm)
+                        if pred_vis_raw is not None:
+                            if pred_vis_raw.dim() == 3:
+                                vis_logits = pred_vis_raw[b, h]
+                            else:
+                                vis_logits = pred_vis_raw[b]
+                            vis_gate = torch.sigmoid(vis_logits.detach().float())
+                            gated_4 = probs_pv * vis_gate[:, None, None]
+                        else:
+                            gated_4 = probs_pv
+
+                    # Visibility scores for annotation
                     if pred_vis_raw is not None:
                         if pred_vis_raw.dim() == 3:
-                            vis_logits = pred_vis_raw[b, 0]
+                            vis_scores = torch.sigmoid(pred_vis_raw[b, h].detach().float()).cpu().numpy()
                         else:
-                            vis_logits = pred_vis_raw[b]
-                        vis_gate = torch.sigmoid(vis_logits.detach().float())
-                        gated_4 = probs_pv * vis_gate[:, None, None]
+                            vis_scores = torch.sigmoid(pred_vis_raw[b].detach().float()).cpu().numpy()
                     else:
-                        gated_4 = probs_pv
+                        vis_scores = np.ones(4)
 
-                # Visibility scores for annotation
-                if pred_vis_raw is not None:
-                    if pred_vis_raw.dim() == 3:
-                        vis_scores = torch.sigmoid(pred_vis_raw[b, 0].detach().float()).cpu().numpy()
+                    if batch_gt_vis is not None:
+                        gt_vis_4 = batch_gt_vis[b, h].float().cpu().numpy() if batch_gt_vis.dim() == 3 else batch_gt_vis[b].float().cpu().numpy()
                     else:
-                        vis_scores = torch.sigmoid(pred_vis_raw[b].detach().float()).cpu().numpy()
-                else:
-                    vis_scores = np.ones(4)
+                        gt_vis_4 = (gt_4.float().amax(dim=(-2, -1)).cpu().numpy() > 0).astype(float)
 
-                gt_vis_4 = gt_4.float().amax(dim=(-2, -1)).cpu().numpy()
-                gt_vis_4 = (gt_vis_4 > 0).astype(float)
+                    fig, axes = plt.subplots(4, 4, figsize=(16, 16))
+                    for v in range(4):
+                        rgb = views[v].cpu().numpy().transpose(1, 2, 0)
+                        rgb = np.clip(rgb, 0, 1)
+                        axes[v, 0].imshow(rgb)
+                        axes[v, 0].set_title(f"{VIEW_LABELS[v]}", fontweight='bold')
+                        axes[v, 0].axis('off')
 
-                fig, axes = plt.subplots(4, 4, figsize=(16, 16))
-                for v in range(4):
-                    # Col 0: RGB
-                    rgb = views[v].cpu().numpy().transpose(1, 2, 0)
-                    rgb = np.clip(rgb, 0, 1)
-                    axes[v, 0].imshow(rgb)
-                    axes[v, 0].set_title(f"{VIEW_LABELS[v]}", fontweight='bold')
-                    axes[v, 0].axis('off')
+                        gt_hm = gt_4[v].float().cpu().numpy()
+                        axes[v, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(gt_hm.max(), 0.01))
+                        axes[v, 1].set_title(f"GT (max={gt_hm.max():.2f})")
+                        axes[v, 1].axis('off')
 
-                    # Col 1: GT heatmap
-                    gt_hm = gt_4[v].float().cpu().numpy()
-                    axes[v, 1].imshow(gt_hm, cmap='inferno', vmin=0, vmax=max(gt_hm.max(), 0.01))
-                    axes[v, 1].set_title(f"GT (max={gt_hm.max():.2f})")
-                    axes[v, 1].axis('off')
+                        gated_v = gated_4[v].detach().float().cpu().numpy()
+                        gated_vmax = max(gated_v.max(), 1e-8)
+                        axes[v, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
+                        axes[v, 2].set_title(f"Gated (max={gated_v.max():.4f})")
+                        axes[v, 2].axis('off')
 
-                    # Col 2: Gated prediction (per-view softmax + vis gate)
-                    gated_v = gated_4[v].detach().float().cpu().numpy()
-                    gated_vmax = max(gated_v.max(), 1e-8)
-                    axes[v, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
-                    pr = gated_v.max() / max(gated_4.detach().float().cpu().numpy().mean(), 1e-10)
-                    axes[v, 2].set_title(f"Gated (max={gated_v.max():.4f})")
-                    axes[v, 2].axis('off')
+                        pred_v = vis_scores[v]
+                        gt_v = gt_vis_4[v]
+                        correct = (pred_v > 0.5) == (gt_v > 0.5)
+                        bg_color = [0.85, 0.95, 0.85] if correct else [0.95, 0.85, 0.85]
+                        axes[v, 3].set_facecolor(bg_color)
+                        axes[v, 3].text(
+                            0.5, 0.55,
+                            f"Pred vis: {pred_v:.2f}\nGT vis: {gt_v:.0f}",
+                            ha='center', va='center', fontsize=14, fontfamily='monospace',
+                            transform=axes[v, 3].transAxes,
+                        )
+                        status = "OK" if correct else "WRONG"
+                        axes[v, 3].text(
+                            0.5, 0.15, status,
+                            ha='center', va='center', fontsize=16, fontweight='bold',
+                            color='green' if correct else 'red',
+                            transform=axes[v, 3].transAxes,
+                        )
+                        axes[v, 3].set_title("Visibility")
+                        axes[v, 3].set_xticks([])
+                        axes[v, 3].set_yticks([])
 
-                    # Col 3: Visibility diagnostic
-                    pred_v = vis_scores[v]
-                    gt_v = gt_vis_4[v]
-                    correct = (pred_v > 0.5) == (gt_v > 0.5)
-                    bg_color = [0.85, 0.95, 0.85] if correct else [0.95, 0.85, 0.85]
-                    axes[v, 3].set_facecolor(bg_color)
-                    axes[v, 3].text(
-                        0.5, 0.55,
-                        f"Pred vis: {pred_v:.2f}\nGT vis: {gt_v:.0f}",
-                        ha='center', va='center', fontsize=14, fontfamily='monospace',
-                        transform=axes[v, 3].transAxes,
-                    )
-                    status = "OK" if correct else "WRONG"
-                    axes[v, 3].text(
-                        0.5, 0.15, status,
-                        ha='center', va='center', fontsize=16, fontweight='bold',
-                        color='green' if correct else 'red',
-                        transform=axes[v, 3].transAxes,
-                    )
-                    axes[v, 3].set_title("Visibility")
-                    axes[v, 3].set_xticks([])
-                    axes[v, 3].set_yticks([])
-
-                plt.suptitle(f"Epoch {epoch}, Step {step}, Sample {b}", fontsize=13)
-                plt.tight_layout(rect=[0, 0, 1, 0.97])
-                save_path = output_dir / f"e{epoch:03d}_s{step:05d}_b{b}.png"
-                plt.savefig(save_path, dpi=100, bbox_inches='tight')
-                plt.close(fig)
+                    plt.suptitle(f"Epoch {epoch}, Step {step}, Sample {b}, Hist {h}/{N_hist}", fontsize=13)
+                    plt.tight_layout(rect=[0, 0, 1, 0.97])
+                    save_path = output_dir / f"e{epoch:03d}_s{step:05d}_b{b}_h{h}.png"
+                    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                    plt.close(fig)
 
             return save_path
 
