@@ -824,6 +824,8 @@ def visualize_heatmap_predictions(
 
                 N_hist_count = gt_b.shape[0] if gt_b.dim() == 4 else 1
 
+                gated_shared_vmax = max(float(gated_4.max()), 1e-8)
+
                 for v in range(4):
                     r = row_offset + v
                     rgb = views[v].cpu().numpy().transpose(1, 2, 0)
@@ -839,14 +841,9 @@ def visualize_heatmap_predictions(
                     axes[r, 1].axis('off')
 
                     gated_v = gated_4[v].detach().float().cpu().numpy()
-                    pred_vis_v = vis_scores[v]
-                    if pred_vis_v < 0.5:
-                        axes[r, 2].imshow(np.zeros_like(gated_v), cmap='inferno', vmin=0, vmax=1)
-                        axes[r, 2].set_title(f"Gated OFF (vis={pred_vis_v:.2f})")
-                    else:
-                        gated_vmax = max(gated_v.max(), 1e-8)
-                        axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_vmax)
-                        axes[r, 2].set_title(f"Gated (max={gated_v.max():.4f})")
+                    axes[r, 2].imshow(gated_v, cmap='inferno', vmin=0, vmax=gated_shared_vmax)
+                    peak_ratio = float(gated_v.max()) / (1.0 / gated_v.size) if gated_v.size > 0 else 0
+                    axes[r, 2].set_title(f"Gated (vis={vis_scores[v]:.2f}, {peak_ratio:.1f}×uni)")
                     axes[r, 2].axis('off')
 
                     pred_v = vis_scores[v]
