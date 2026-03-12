@@ -427,6 +427,8 @@ def collect_clip_samples(
 def main() -> int:
     parser = argparse.ArgumentParser(description="轨迹热力图可视化 (HeatmapVLN v2 — 全景横向 + BEV)")
     parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--data-root', type=str, default=None,
+                        help='Override data root (default: use checkpoint config)')
     parser.add_argument('--num-clips', type=int, default=3)
     parser.add_argument('--frames-per-clip', type=int, default=32)
     parser.add_argument('--output-dir', type=str, default='./vis_trajectory')
@@ -446,12 +448,13 @@ def main() -> int:
     cfg = ckpt['config']
     logger.info(f"  Epoch: {ckpt.get('epoch', '?')}")
 
+    data_root = args.data_root or cfg['data']['root']
     split = args.split or cfg['data'].get('val_split', 'val')
     sw_cfg = cfg['data']['sliding_window']
 
     logger.info("Loading dataset...")
     dataset = VLNSlidingWindowDataset(
-        root=cfg['data']['root'],
+        root=data_root,
         split=split,
         min_history=sw_cfg['min_history'],
         num_history_sample=sw_cfg['num_history_sample'],

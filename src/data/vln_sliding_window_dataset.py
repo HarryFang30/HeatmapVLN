@@ -700,11 +700,14 @@ class VLNSlidingWindowDataset(Dataset):
             if not val_scenes and len(train_scenes) > 1:
                 val_scenes.append(train_scenes.pop())
             
-            if self.split in ('val', 'test'):
+            if self.split == 'all':
+                logger.info(f"Using all {len(scene_dirs)} scenes (split=all, no auto-split)")
+            elif self.split in ('val', 'test'):
                 scene_dirs = val_scenes
+                logger.info(f"Auto-split: {len(train_scenes)} train scenes, {len(val_scenes)} val scenes (split={self.split})")
             else:
                 scene_dirs = train_scenes
-            logger.info(f"Auto-split: {len(train_scenes)} train scenes, {len(val_scenes)} val scenes (split={self.split})")
+                logger.info(f"Auto-split: {len(train_scenes)} train scenes, {len(val_scenes)} val scenes (split={self.split})")
         
         clips = []
         for scene_dir in scene_dirs:
