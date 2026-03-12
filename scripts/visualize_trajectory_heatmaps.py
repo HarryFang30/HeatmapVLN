@@ -237,35 +237,45 @@ def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[L
 def _render_topdown_for_position(
     base_img: np.ndarray,
     trajectory_pixels: List,
-    sampled_frame_indices: List[int],
-    highlight_idx: int,
+    current_frame_idx: int,
+    history_frame_indices: List[int],
+    position_label: int,
     out_size: int,
 ) -> np.ndarray:
-    """Render a top-down map with the highlighted position prominently marked."""
+    """Render a top-down map highlighting current position and its history frames."""
     canvas = base_img.copy()
     num_pts = len(trajectory_pixels)
 
     for i in range(num_pts - 1):
         p1 = tuple(trajectory_pixels[i])
         p2 = tuple(trajectory_pixels[i + 1])
-        cv2.line(canvas, p1, p2, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.line(canvas, p1, p2, (200, 200, 200), 1, cv2.LINE_AA)
 
-    for i, fidx in enumerate(sampled_frame_indices):
-        if fidx >= num_pts:
-            continue
-        pt = tuple(trajectory_pixels[fidx])
-        if i == highlight_idx:
-            continue
-        cv2.circle(canvas, pt, 4, (100, 100, 255), -1, cv2.LINE_AA)
+    HIST_COLORS = [
+        (50, 200, 50), (0, 180, 180), (200, 180, 0), (180, 100, 255),
+        (0, 130, 255), (255, 130, 0), (130, 255, 0), (200, 0, 200),
+    ]
 
-    fidx_hl = sampled_frame_indices[highlight_idx]
-    if fidx_hl < num_pts:
-        curr = tuple(trajectory_pixels[fidx_hl])
+    for h_idx, h_frame in enumerate(history_frame_indices):
+        if h_frame >= num_pts:
+            continue
+        pt = tuple(trajectory_pixels[h_frame])
+        color = HIST_COLORS[h_idx % len(HIST_COLORS)]
+        cv2.circle(canvas, pt, 7, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, pt, 7, (0, 0, 0), 1, cv2.LINE_AA)
+        lbl = f"h{h_idx}"
+        cv2.putText(canvas, lbl, (pt[0] + 9, pt[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(canvas, lbl, (pt[0] + 9, pt[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+
+    if current_frame_idx < num_pts:
+        curr = tuple(trajectory_pixels[current_frame_idx])
         cv2.circle(canvas, curr, 12, (255, 0, 0), 3, cv2.LINE_AA)
         cv2.circle(canvas, curr, 5, (255, 0, 0), -1, cv2.LINE_AA)
 
-        if fidx_hl + 1 < num_pts:
-            nxt = tuple(trajectory_pixels[fidx_hl + 1])
+        if current_frame_idx + 1 < num_pts:
+            nxt = tuple(trajectory_pixels[current_frame_idx + 1])
             dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
             length = max(1, (dx ** 2 + dy ** 2) ** 0.5)
             arrow_len = 25
@@ -273,7 +283,7 @@ def _render_topdown_for_position(
                    int(curr[1] + dy / length * arrow_len))
             cv2.arrowedLine(canvas, curr, tip, (255, 0, 0), 2, tipLength=0.3)
 
-        label = str(highlight_idx)
+        label = str(position_label)
         cv2.putText(canvas, label, (curr[0] + 14, curr[1] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(canvas, label, (curr[0] + 14, curr[1] - 8),
@@ -286,6 +296,7 @@ def _render_topdown_for_position(
 def _build_topdown_strip(
     clip_dir: Path,
     sampled_frame_indices: List[int],
+    samples_data: List[Dict[str, Any]],
     tile: int = TILE, gap: int = GAP,
 ) -> Optional[np.ndarray]:
     topdown_img, trajectory_pixels = _load_topdown_data(clip_dir)
@@ -298,9 +309,13 @@ def _build_topdown_strip(
     strip = np.zeros((td_size, strip_w, 3), dtype=np.float32)
 
     for i in range(N):
+        hist_indices = samples_data[i].get('history_indices', [])
         td = _render_topdown_for_position(
-            topdown_img, trajectory_pixels, sampled_frame_indices,
-            highlight_idx=i, out_size=td_size,
+            topdown_img, trajectory_pixels,
+            current_frame_idx=sampled_frame_indices[i],
+            history_frame_indices=hist_indices,
+            position_label=i,
+            out_size=td_size,
         )
         x0 = i * (td_size + gap)
         strip[:, x0: x0 + td_size] = td
@@ -327,7 +342,7 @@ def visualize_clip_panoramic(
     if N == 0:
         return
 
-    td_strip = _build_topdown_strip(clip_dir, sampled_frame_indices, tile, gap)
+    td_strip = _build_topdown_strip(clip_dir, sampled_frame_indices, samples_data, tile, gap)
     rgb_strip = _build_rgb_strip(samples_data, tile, gap)
     gt_strip = _build_heatmap_strip(samples_data, 'gt_agg', tile, gap, global_vmax=1.0)
     gated_strip = _build_heatmap_strip(samples_data, 'gated_agg', tile, gap, global_vmax=None)
@@ -503,10 +518,21 @@ def main() -> int:
         sampled_frame_indices: List[int] = []
         instruction = ""
 
+        num_hist = getattr(dataset, 'num_history_sample', 8)
+
         for frame_idx, dataset_idx in items:
             sample = dataset[dataset_idx]
             instruction = sample['text']
             sampled_frame_indices.append(frame_idx)
+
+            current_t = frame_idx
+            available = current_t
+            if available <= 0:
+                hist_indices = []
+            elif num_hist == -1 or available <= num_hist:
+                hist_indices = list(range(0, current_t))
+            else:
+                hist_indices = np.linspace(0, current_t - 1, num_hist, dtype=int).tolist()
 
             result = infer_sample(model, sample, device=device)
             pred_raw = result['heatmaps']
@@ -537,9 +563,9 @@ def main() -> int:
             views_np = sample['current_views'].cpu().numpy().transpose(0, 2, 3, 1)
 
             logger.info(
-                "  frame=%4d N=%d  gt_max=[%.2f,%.2f,%.2f,%.2f]  "
+                "  frame=%4d N=%d  hist=%s  gt_max=[%.2f,%.2f,%.2f,%.2f]  "
                 "gated_max=[%.4f,%.4f,%.4f,%.4f]  vis=[%.2f,%.2f,%.2f,%.2f]",
-                frame_idx, n_hist,
+                frame_idx, n_hist, hist_indices,
                 *[float(gt_agg[v].max()) for v in range(4)],
                 *[float(gated_agg[v].max()) for v in range(4)],
                 *[float(vis_scores[v]) for v in range(4)],
@@ -553,6 +579,7 @@ def main() -> int:
                 'gt_vis': gt_vis_4,
                 'n_hist': n_hist,
                 'frame_label': frame_idx,
+                'history_indices': hist_indices,
             })
 
         out_path = output_dir / f"clip_{clip_order:02d}_{clip_dir.name}.png"
