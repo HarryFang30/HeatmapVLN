@@ -378,14 +378,17 @@ def _worker_init_fn(worker_id):
         pass
 
     try:
-        with open("/proc/self/statm", "rb") as f:
-            pages = int(f.read().split()[1])
-        rss_mb = pages * _os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-        print(
-            f"[WORKER init] worker_id={worker_id} pid={_os.getpid()} "
-            f"rss={rss_mb:.0f}MB gc_threshold={_gc.get_threshold()}",
-            file=_sys.stderr, flush=True,
-        )
+        if _os.environ.get("HEATMAPVLN_LOG_MEMORY", "0") != "1":
+            pass
+        else:
+            with open("/proc/self/statm", "rb") as f:
+                pages = int(f.read().split()[1])
+            rss_mb = pages * _os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+            print(
+                f"[WORKER init] worker_id={worker_id} pid={_os.getpid()} "
+                f"rss={rss_mb:.0f}MB gc_threshold={_gc.get_threshold()}",
+                file=_sys.stderr, flush=True,
+            )
     except Exception:
         pass
 
@@ -1663,7 +1666,7 @@ def train_one_epoch(
         if max_batches is not None and i >= max_batches:
             break
 
-        if i <= 5 or i % 25 == 0:
+        if (i <= 5 or i % 25 == 0) and cfg['log'].get('show_gpu_memory', False):
             main_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
             children = _mem_log_proc.children(recursive=True)
             child_rss = sum(c.memory_info().rss for c in children) / (1024 * 1024)
@@ -1677,6 +1680,7 @@ def train_one_epoch(
                 file=sys.stderr,
                 flush=True,
             )
+        if i <= 5 or i % 25 == 0:
             _drop_page_cache()
 
         if enable_timing:
@@ -1903,14 +1907,15 @@ def train_one_epoch(
             
             # 日志
             log_interval = cfg['log'].get('log_interval', 10)
+            show_gpu_memory = cfg['log'].get('show_gpu_memory', False)
             if global_step % log_interval == 0 or global_step <= 3:
-                mem_alloc = torch.cuda.memory_allocated() / 1024**3
                 all_lrs = scheduler.get_last_lr()
                 lr_strs = []
                 for gi, lr_val in enumerate(all_lrs):
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     lr_strs.append(f"{gname}={lr_val:.2e}")
                 lr_display = ", ".join(lr_strs)
+                gpu_mem_str = f" | GPU: {torch.cuda.memory_allocated() / 1024**3:.1f}GB" if show_gpu_memory else ""
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
@@ -1919,8 +1924,8 @@ def train_one_epoch(
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
                     f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
                     f"Temp: {current_heatmap_temperature:.3f} | "
-                    f"LR: [{lr_display}] | "
-                    f"GPU: {mem_alloc:.1f}GB"
+                    f"LR: [{lr_display}]"
+                    + gpu_mem_str
                     + (
                         (
                             f" | T[s] data={_mean_timing(timing_stats, profiled_steps, 'data_wait_s'):.3f} "
@@ -1936,34 +1941,44 @@ def train_one_epoch(
                         ) if enable_timing else ""
                     )
                 )
-                if metrics_jsonl_path is not None:
-                    _append_jsonl(
-                        metrics_jsonl_path,
-                        {
-                            "record_type": "train_step",
-                            "stage": stage_name,
-                            "epoch": epoch,
-                            "batch": i + 1,
-                            "global_step": global_step,
-                            "loss": loss.item() * grad_accum_steps,
-                            "heatmap_loss": heatmap_loss.item(),
-                            "trajectory_loss": trajectory_loss.item(),
-                            "progress_loss": progress_loss.item(),
-                            "heatmap_temperature": current_heatmap_temperature,
-                            "gpu_memory_gb": mem_alloc,
-                            "lrs": {
-                                optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
-                                for gi, lr_val in enumerate(all_lrs)
-                            },
-                        },
+                if isinstance(loss_dict, dict):
+                    logger.info(
+                        f"  [HM] peak={loss_dict.get('peak_loss', 0):.4f} "
+                        f"uniform_ce={loss_dict.get('uniform_ce_loss', 0):.4f} "
+                        f"vis={loss_dict.get('vis_loss', 0):.4f} "
+                        f"coord={loss_dict.get('coord_loss', 0):.4f}"
                     )
+                if metrics_jsonl_path is not None:
+                    step_record = {
+                        "record_type": "train_step",
+                        "stage": stage_name,
+                        "epoch": epoch,
+                        "batch": i + 1,
+                        "global_step": global_step,
+                        "loss": loss.item() * grad_accum_steps,
+                        "heatmap_loss": heatmap_loss.item(),
+                        "trajectory_loss": trajectory_loss.item(),
+                        "progress_loss": progress_loss.item(),
+                        "heatmap_temperature": current_heatmap_temperature,
+                        "lrs": {
+                            optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
+                            for gi, lr_val in enumerate(all_lrs)
+                        },
+                    }
+                    if isinstance(loss_dict, dict):
+                        for k in ('peak_loss', 'uniform_ce_loss', 'vis_loss', 'coord_loss'):
+                            if k in loss_dict:
+                                step_record[f'hm_{k}'] = loss_dict[k].item()
+                    if show_gpu_memory:
+                        step_record["gpu_memory_gb"] = torch.cuda.memory_allocated() / 1024**3
+                    _append_jsonl(metrics_jsonl_path, step_record)
                 
             if tb_writer is not None:
                 actual_step = global_step_offset + global_step
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 if isinstance(loss_dict, dict):
-                    for k in ('vis_loss', 'coord_loss', 'kl_loss', 'neg_loss', 'peak_loss'):
+                    for k in ('vis_loss', 'coord_loss', 'kl_loss', 'uniform_ce_loss', 'peak_loss'):
                         if k in loss_dict:
                             tb_writer.add_scalar(f'train/hm_{k}', loss_dict[k].item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
@@ -2033,11 +2048,11 @@ def train_one_epoch(
                         # 正常训练的模型应显著高于此值
                         uniform_baseline = 1.0 / (_H * _W)
                         peak_ratio = pred_max / uniform_baseline if uniform_baseline > 0 else 0
-                        logger.info(f"[DIAG-HM] softmax: max={pred_max:.6f} ({peak_ratio:.1f}× uniform), sig_max={sig_max:.4f}")
-                        logger.info(f"[DIAG-HM] gt:      mean={gt_mean:.4f}, max={gt_max:.4f}")
-                        
-                        if peak_ratio < 2.0:
-                            logger.warning(f"[DIAG-HM] ⚠️ softmax 分布接近均匀！peak_ratio={peak_ratio:.1f}×")
+                        if cfg['log'].get('show_gpu_memory', False):
+                            logger.info(f"[DIAG-HM] softmax: max={pred_max:.6f} ({peak_ratio:.1f}× uniform), sig_max={sig_max:.4f}")
+                            logger.info(f"[DIAG-HM] gt:      mean={gt_mean:.4f}, max={gt_max:.4f}")
+                            if peak_ratio < 2.0:
+                                logger.warning(f"[DIAG-HM] ⚠️ softmax 分布接近均匀！peak_ratio={peak_ratio:.1f}×")
                         
                         # ==================== 热力图质量指标 ====================
                         B, C, H, W = pred_hm.shape
@@ -2190,11 +2205,12 @@ def train_one_epoch(
                                 tb_writer.add_scalar('diag/vis_pred_mean', pred_vis_prob.mean().item(), actual_step)
                                 pos_ratio = gt_vis_bin.mean().item()
                                 tb_writer.add_scalar('diag/vis_gt_pos_ratio', pos_ratio, actual_step)
-                                logger.info(
-                                    f"[DIAG-VIS] acc={accuracy:.3f} prec={precision:.3f} "
-                                    f"recall={recall:.3f} TNR={tnr:.3f} F1={f1:.3f} "
-                                    f"(gt_pos={pos_ratio:.2f})"
-                                )
+                                if cfg['log'].get('show_gpu_memory', False):
+                                    logger.info(
+                                        f"[DIAG-VIS] acc={accuracy:.3f} prec={precision:.3f} "
+                                        f"recall={recall:.3f} TNR={tnr:.3f} F1={f1:.3f} "
+                                        f"(gt_pos={pos_ratio:.2f})"
+                                    )
 
                     # Progress prediction 诊断
                     if 'progress' in output and output['progress'] is not None:
@@ -2226,9 +2242,10 @@ def train_one_epoch(
                             fde = displacement[:, -1].mean().item()
                             tb_writer.add_scalar('diag/trajectory_fde', fde, actual_step)
                     
-                    # GPU 显存监控
-                    tb_writer.add_scalar('diag/gpu_memory_gb', torch.cuda.memory_allocated() / 1024**3, actual_step)
-                    tb_writer.add_scalar('diag/gpu_memory_reserved_gb', torch.cuda.memory_reserved() / 1024**3, actual_step)
+                    # GPU 显存监控（仅当 show_gpu_memory 开启时）
+                    if cfg['log'].get('show_gpu_memory', False):
+                        tb_writer.add_scalar('diag/gpu_memory_gb', torch.cuda.memory_allocated() / 1024**3, actual_step)
+                        tb_writer.add_scalar('diag/gpu_memory_reserved_gb', torch.cuda.memory_reserved() / 1024**3, actual_step)
                 
                 # 轨迹分布直方图（每 100 步记录一次，避免日志过大）
                 if global_step % 100 == 0:
@@ -2292,18 +2309,18 @@ def train_one_epoch(
         if num_batches % 50 == 0:
             gc.collect()
             _malloc_trim()
-            post_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
-            gc_stats = gc.get_stats()
-            cg_now = _cgroup_mem_usage_gb()
-            cg_str = f"cgroup={cg_now:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup={cg_now:.1f}GB"
-            print(
-                f"[MAIN batch={i} post-gc] rss={post_rss:.0f}MB | {cg_str} | "
-                f"gc: gen0={gc_stats[0]['collected']} gen1={gc_stats[1]['collected']} "
-                f"gen2={gc_stats[2]['collected']}",
-                file=sys.stderr,
-                flush=True,
-            )
-
+            if cfg['log'].get('show_gpu_memory', False):
+                post_rss = _mem_log_proc.memory_info().rss / (1024 * 1024)
+                gc_stats = gc.get_stats()
+                cg_now = _cgroup_mem_usage_gb()
+                cg_str = f"cgroup={cg_now:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup={cg_now:.1f}GB"
+                print(
+                    f"[MAIN batch={i} post-gc] rss={post_rss:.0f}MB | {cg_str} | "
+                    f"gc: gen0={gc_stats[0]['collected']} gen1={gc_stats[1]['collected']} "
+                    f"gen2={gc_stats[2]['collected']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             _drop_page_cache()
 
             if num_batches % 200 == 0:
@@ -2444,6 +2461,10 @@ def validate(
     num_heatmap_mse_batches = 0  # MSE 采样 batch 计数
     num_batches = 0
     vis_tp = vis_tn = vis_fp = vis_fn = 0
+    total_peak_loss = 0.0
+    total_uniform_ce_loss = 0.0
+    total_vis_loss = 0.0
+    total_coord_loss = 0.0
     
     loss_cfg = cfg['loss']
     train_history = stage_cfg.get('train_history', True)
@@ -2564,6 +2585,10 @@ def validate(
                         history_mask=hm_history_mask,
                     )
                     heatmap_loss = loss_dict['total']
+                    total_peak_loss += loss_dict.get('peak_loss', torch.tensor(0.0)).item()
+                    total_uniform_ce_loss += loss_dict.get('uniform_ce_loss', torch.tensor(0.0)).item()
+                    total_vis_loss += loss_dict.get('vis_loss', torch.tensor(0.0)).item()
+                    total_coord_loss += loss_dict.get('coord_loss', torch.tensor(0.0)).item()
 
             # Visibility gate 累积统计
             if 'visibility' in output and output['visibility'] is not None:
@@ -2719,6 +2744,10 @@ def validate(
             float(vis_tn),
             float(vis_fp),
             float(vis_fn),
+            total_peak_loss,
+            total_uniform_ce_loss,
+            total_vis_loss,
+            total_coord_loss,
         ],
         device=device,
         dtype=torch.float64,
@@ -2732,6 +2761,10 @@ def validate(
     avg_act = (totals[2] / reduced_num_batches).item()
     avg_stop = (totals[3] / reduced_num_batches).item()
     avg_hm_mse = (totals[4] / max(reduced_num_heatmap_mse_batches, 1)).item() if reduced_num_heatmap_mse_batches > 0 else 0.0
+    avg_peak_loss = (totals[11] / reduced_num_batches).item()
+    avg_uniform_ce_loss = (totals[12] / reduced_num_batches).item()
+    avg_vis_loss = (totals[13] / reduced_num_batches).item()
+    avg_coord_loss = (totals[14] / reduced_num_batches).item()
 
     r_tp, r_tn, r_fp, r_fn = totals[7].item(), totals[8].item(), totals[9].item(), totals[10].item()
     vis_total = r_tp + r_tn + r_fp + r_fn
@@ -2756,6 +2789,12 @@ def validate(
     # 注意：TensorBoard 记录移至主循环中使用 global_epoch_counter
     # 避免多阶段训练时 epoch 重复导致数据覆盖
     
+    logger.info(
+        f"  [HM] peak={avg_peak_loss:.4f} "
+        f"uniform_ce={avg_uniform_ce_loss:.4f} "
+        f"vis={avg_vis_loss:.4f} "
+        f"coord={avg_coord_loss:.4f}"
+    )
     if reduced_num_heatmap_mse_batches > 0:
         logger.info(f"  📊 Heatmap 推理 MSE (采样 {reduced_num_heatmap_mse_batches} batches): {avg_hm_mse:.6f}")
     
@@ -2766,6 +2805,10 @@ def validate(
         'val_action_loss': avg_act,
         'val_stop_loss': avg_stop,
         'val_total_loss': avg_loss,
+        'val_hm_peak_loss': avg_peak_loss,
+        'val_hm_uniform_ce_loss': avg_uniform_ce_loss,
+        'val_hm_vis_loss': avg_vis_loss,
+        'val_hm_coord_loss': avg_coord_loss,
     }
     result.update(val_vis_metrics)
     return result
@@ -3194,7 +3237,9 @@ def main():
     logger.info("📂 Loading datasets...")
     dataset_type = cfg['data'].get('dataset_type', 'sliding_window')
     logger.info(f"  Dataset type: {dataset_type}")
-    
+    val_root_cfg = cfg['data'].get('val_root')
+    if val_root_cfg:
+        logger.info(f"  Validation from separate root: {val_root_cfg} (split={cfg['data'].get('val_split', 'val')})")
     if dataset_type == 'trajectory':
         # 使用新的轨迹数据集（支持 24 步预测）
         traj_cfg = cfg['data'].get('trajectory', cfg['data'].get('sliding_window', {}))
@@ -3230,10 +3275,11 @@ def main():
             fgr2r_subinstr_path=traj_cfg.get('fgr2r_subinstr_path', None),
         )
         
+        val_root = cfg['data'].get('val_root') or cfg['data']['root']
         val_split = cfg['data'].get('val_split', 'val')
         val_samples_per_clip = traj_cfg.get('val_samples_per_clip', 2)
         val_dataset = VLNTrajectoryDataset(
-            root=cfg['data']['root'],
+            root=val_root,
             split=val_split,
             min_history=traj_cfg.get('min_history', 5),
             num_history_sample=traj_cfg.get('num_history_sample', 8),
@@ -3275,10 +3321,11 @@ def main():
             load_history_frames=load_history_frames,
         )
         
+        val_root = cfg['data'].get('val_root') or cfg['data']['root']
         val_split = cfg['data'].get('val_split', 'val')
         val_samples_per_clip = sw_cfg.get('val_samples_per_clip', 2)
         val_dataset = VLNSlidingWindowDataset(
-            root=cfg['data']['root'],
+            root=val_root,
             split=val_split,
             min_history=sw_cfg['min_history'],
             num_history_sample=sw_cfg['num_history_sample'],
@@ -3456,6 +3503,7 @@ def main():
         drop_last=False,
     ) if dist_context.enabled else None
     
+    os.environ["HEATMAPVLN_LOG_MEMORY"] = "1" if cfg["log"].get("show_gpu_memory", False) else "0"
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg['optim']['batch_size'],
@@ -3493,7 +3541,8 @@ def main():
             logger.info("   ✅ Dynamic sampling enabled with persistent_workers")
         else:
             logger.info("   ✅ Dynamic sampling enabled (workers rebuilt each epoch to reclaim memory)")
-    logger.info(f"   🧠 Memory config: num_workers={num_workers}, prefetch={prefetch_factor}, persistent={persistent_workers}")
+    if cfg["log"].get("show_gpu_memory", False):
+        logger.info(f"   🧠 Memory config: num_workers={num_workers}, prefetch={prefetch_factor}, persistent={persistent_workers}")
     if dist_context.enabled:
         logger.info(
             f"   🔀 DistributedSampler enabled: world_size={dist_context.world_size}, rank={dist_context.rank}"
@@ -3599,8 +3648,9 @@ def main():
     timer.start()
 
     _drop_page_cache(force=True)
-    cg_init = _cgroup_mem_usage_gb()
-    logger.info(f"  cgroup memory after initial page cache drop: {cg_init:.1f}/{_CG_LIMIT_GB:.0f}GB")
+    if cfg['log'].get('show_gpu_memory', False):
+        cg_init = _cgroup_mem_usage_gb()
+        logger.info(f"  cgroup memory after initial page cache drop: {cg_init:.1f}/{_CG_LIMIT_GB:.0f}GB")
 
     for epoch in range(start_epoch, total_epochs + 1):
         timer.start_epoch()
@@ -3662,12 +3712,12 @@ def main():
         _malloc_trim()
         _drop_page_cache()
         
-        # 📊 内存使用监控
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        gpu_mem = torch.cuda.memory_allocated() / (1024**3)
-        gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
-        logger.info(f"  🧠 Memory: CPU={mem_info.rss / (1024**3):.2f}GB, GPU={gpu_mem:.2f}GB (reserved={gpu_reserved:.2f}GB)")
+        if cfg['log'].get('show_gpu_memory', False):
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            gpu_mem = torch.cuda.memory_allocated() / (1024**3)
+            gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(f"  🧠 Memory: CPU={mem_info.rss / (1024**3):.2f}GB, GPU={gpu_mem:.2f}GB (reserved={gpu_reserved:.2f}GB)")
         
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
@@ -3747,6 +3797,12 @@ def main():
                 'train': train_metrics.get('stop_loss', 0),
                 'val': val_metrics.get('val_stop_loss', 0),
             }, global_epoch_counter)
+            
+            # 热力图分项 loss 对比（epoch 级别）
+            for hm_key in ('peak_loss', 'uniform_ce_loss', 'vis_loss', 'coord_loss'):
+                val_key = f'val_hm_{hm_key}'
+                if val_key in val_metrics:
+                    tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)
             
             # 完整推理 heatmap MSE（真实生成质量）
             if val_metrics.get('val_heatmap_mse', 0) > 0:

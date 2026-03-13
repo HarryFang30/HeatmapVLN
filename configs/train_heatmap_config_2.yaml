@@ -4,9 +4,11 @@ seed: 42
 # 数据配置 - 热力图专用训练（2 卡版）
 # ============================================
 data:
-  root: /root/autodl-tmp/heatmap_train_data
+  root: /workspace/heatmap_train_data
   train_split: train
-  val_split: val
+  # 验证集：使用单独采集的 val_unseen 场景（不从训练数据中分割）
+  val_root: /workspace/val_unseen   # 验证集根目录，不设则用 data.root
+  val_split: all                   # 使用 val_root 时建议 all，表示该目录下全部场景用于验证；若目录内有 val 子目录则可设为 val
   image_size: [256, 256]
   init_hm_size: [64, 64]
   num_workers: 8
@@ -202,17 +204,17 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /root/autodl-tmp/heatmap_training_outputs
+  out_dir: /workspace/heatmap_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 1
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs
+  tensorboard_dir: /workspace/tf-logs
   enable_timing: false
   epoch_boundary_cooldown_s: 8
   log_interval: 10
-  show_gpu_memory: true
+  show_gpu_memory: false   # 关闭显存/内存日志，只保留最简单日志
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
@@ -229,5 +231,5 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 5
+  patience: 30
   val_inference_batches: 6

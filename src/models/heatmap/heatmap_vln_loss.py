@@ -5,27 +5,24 @@ HeatmapVLN Loss
 Loss for navigation-oriented heatmap prediction:
   1. Visibility BCE        — classify whether a history view is visible
   2. Softmax Cross-Entropy — pixel-space classification on visible views
-  3. Negative BCE          — push invisible-view heatmaps toward zero
+  3. Uniform CE            — push invisible-view softmax toward uniform
   4. Coordinate loss       — low-weight auxiliary for peak position refinement
 
-Design rationale — two distinct sub-problems require different losses:
+Unified CE framework — both visible and invisible views are supervised in
+the same softmax probability space used at inference:
 
   "Where is it?"  (visible views, gt_vis > 0)
-      Softmax CE over H×W = 4096 pixel classes.  GT L1-normalized to a
-      probability distribution.  Pixel competition prevents false positives
-      *within* visible views; clean gradients.
+      Softmax CE over H×W pixel classes.  GT L1-normalized to a peaked
+      probability distribution.  Gradient: softmax_i - gt_prob_i.
 
   "It's NOT here." (invisible views, gt_vis = 0)
-      Per-pixel BCE pushing all sigmoid outputs toward 0.  Defense in
-      depth beyond the visibility gate.
-
-Inference uses spatial softmax probabilities (not sigmoid values) so
-training and inference operate in the same semantic space.  The "sigmoid
-collapse" problem (pred_max ≈ 0.01) does not affect softmax probabilities
-because softmax is scale-invariant — the probability distribution is always
-valid regardless of the absolute logit scale.
+      Softmax CE with uniform target 1/(H*W).  Equivalent to
+      KL(uniform || pred_softmax) after subtracting the constant baseline
+      log(H*W).  Gradient: softmax_i - 1/(H*W), pushing all peaks flat.
+      Converged minimum is 0 (perfectly uniform prediction).
 """
 
+import math
 from typing import Dict, Tuple
 
 import torch
@@ -41,7 +38,7 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for soft-argmax coordinate loss (auxiliary).
         lambda_kl: (unused, kept for config compatibility).
-        lambda_neg: weight for invisible-view negative suppression BCE.
+        lambda_neg: weight for invisible-view uniform CE (KL to uniform).
         lambda_peak: weight for softmax cross-entropy on visible-view heatmaps.
         temperature: soft-argmax temperature (only affects coord_loss).
         heatmap_size: expected heatmap resolution (H, W).
@@ -256,11 +253,14 @@ class HeatmapVLNLoss(nn.Module):
         else:
             ce_loss = torch.tensor(0.0, device=device)
 
-        # (3) Negative BCE — push invisible-view h_loc toward zero
-        # BCE(p, 0) = -log(1 - p) = -log1p(-p).
+        # (3) Uniform CE — push invisible-view softmax distribution toward
+        # uniform 1/(H*W).  Equivalent to KL(uniform || pred_softmax) after
+        # subtracting the constant baseline log(H*W).
         if has_neg and self.lambda_neg > 0:
-            pred_neg = pred_heatmaps[neg_mask].float().clamp(max=1 - 1e-6)
-            neg_loss = -torch.log1p(-pred_neg).mean()
+            pred_neg = pred_heatmaps[neg_mask]
+            neg_ce = self.softmax_ce_loss(pred_neg, torch.ones_like(pred_neg))
+            H, W = self.heatmap_size
+            neg_loss = neg_ce - math.log(H * W)
         else:
             neg_loss = torch.tensor(0.0, device=device)
 
@@ -283,6 +283,6 @@ class HeatmapVLNLoss(nn.Module):
             "vis_loss": vis_loss.detach(),
             "coord_loss": coord_loss.detach(),
             "kl_loss": torch.tensor(0.0, device=device),
-            "neg_loss": neg_loss.detach(),
+            "uniform_ce_loss": neg_loss.detach(),
             "peak_loss": ce_loss.detach(),
         }

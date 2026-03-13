@@ -45,14 +45,19 @@ ce_loss = F.cross_entropy(logits.reshape(K,-1), gt_prob.reshape(K,-1))
 - 4096 像素类分类，像素竞争防止正样本内假阳性
 - 分布保证始终有效，不会坍缩
 
-### 3. Negative BCE — "不可见方向必须全黑"
+### 3. Uniform CE — "不可见方向必须均匀"
 
 ```
-neg_loss = -log1p(-pred)  # 等价 BCE(pred, 0)
+logits = logit(pred_sigmoid)
+uniform_target = ones_like / sum  # 均匀分布 1/(H*W)
+uniform_ce_loss = cross_entropy(logits, uniform_target) - log(H*W)
 ```
 
 - 只作用于 gt\_vis = 0 的视图
-- 对 visibility gate 的纵深防御
+- 用均匀分布作为目标，将不可见视图的 softmax 输出铲平
+- 减去 `log(H*W)` 基线使最优值为 0（完美均匀时 loss=0）
+- 与正样本的 softmax CE 在同一语义空间，训推完全对齐
+- TensorBoard 标签: `train/hm_uniform_ce_loss`
 
 ### 4. Coordinate Loss — 辅助定位
 
@@ -67,7 +72,7 @@ coord_loss = euclidean_distance(soft_argmax(pred), soft_argmax(gt))
 ```yaml
 lambda_vis:   1.0   # visibility BCE
 lambda_peak:  1.0   # softmax CE
-lambda_neg:   1.0   # negative BCE
+lambda_neg:   1.0   # uniform CE (invisible views)
 lambda_coord: 0.2   # coordinate loss
 lambda_kl:    0.0   # 未使用
 ```
@@ -91,4 +96,5 @@ output = probs × sigmoid(visibility)   # 门控后的概率图
 | v4 | QFL(β=2) | QFL 统一 | sigmoid | 假阳性梯度不够强 |
 | v5 | Softmax CE | per-pixel BCE | sigmoid | sigmoid 坍缩（CE 尺度不变） |
 | v6 | CE + L1 magnitude | per-pixel BCE | sigmoid | 不够干净，用 L1 补 CE 盲区 |
-| **v7** | **Softmax CE** | **per-pixel BCE** | **softmax** | **训推语义对齐** |
+| v7 | Softmax CE | per-pixel BCE | softmax | 训推语义对齐 |
+| **v8** | **Softmax CE** | **Uniform CE (KL→uniform)** | **softmax** | **统一 CE 框架，训推完全对齐** |

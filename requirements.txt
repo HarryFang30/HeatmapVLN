@@ -14,7 +14,7 @@ torchaudio==2.7.0
 # ============================================
 # Transformers & LLM Support
 # ============================================
-transformers==4.57.6
+transformers==5.3.0
 accelerate==1.5.2
 qwen-vl-utils==0.0.11
 huggingface-hub>=0.34.0

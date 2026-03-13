@@ -1,17 +1,18 @@
 seed: 42
 
 # ============================================
-# 数据配置 - 热力图专用训练
+# 数据配置 - 热力图专用训练（单卡）
 # ============================================
 data:
-  root: /root/autodl-tmp/heatmap_train_data
+  root: /workspace/heatmap_train_data
   train_split: train
-  val_split: val
+  val_root: /workspace/val_unseen
+  val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 12
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 2
   
   dataset_type: sliding_window
   
@@ -201,20 +202,21 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /root/autodl-tmp/heatmap_training_outputs
+  out_dir: /workspace/heatmap_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs
+  tensorboard_dir: /workspace/tf-logs
   enable_timing: false
   epoch_boundary_cooldown_s: 8
   log_interval: 10
-  show_gpu_memory: true
+  show_gpu_memory: false
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
+  mid_epoch_save_every: 500
   
   notify:
     enabled: true
@@ -227,5 +229,5 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 5
-  val_inference_batches: 10
+  patience: 30
+  val_inference_batches: 6
