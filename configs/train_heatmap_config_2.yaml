@@ -155,6 +155,7 @@ optim:
   optimizer: adamw
   learning_rate: 1.0e-4
   heatmap_lr: 1.0e-4
+  vis_head_lr: 1.0e-3
   llm_projector_lr: 2.0e-5
   weight_decay: 1.0e-2
   grad_clip: 1.0

@@ -1354,17 +1354,44 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
     # History Heatmap Head — split ResNet backbone (low lr) from rest (normal lr)
     # HeatmapVLN v2 param groups
     heatmap_lr = optim_cfg.get('heatmap_lr', 2e-4)
+    vis_head_lr = optim_cfg.get('vis_head_lr', heatmap_lr)
     if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
         for name, submodule in [
             ('vit_dpt_fusion', model.heatmap_vln.vit_dpt_fusion),
             ('llm_dpt_fusion', model.heatmap_vln.llm_dpt_fusion),
-            ('coarse',         model.heatmap_vln.coarse),
             ('fine',           model.heatmap_vln.fine),
         ]:
             groups = get_param_groups_with_wd(submodule, heatmap_lr, f'heatmap_{name}', default_wd)
             if groups:
                 param_groups.extend(groups)
                 print(f"  Param group: heatmap_{name} (lr={heatmap_lr}, wd={default_wd})")
+
+        coarse_module = model.heatmap_vln.coarse
+        vis_head_params_decay = []
+        vis_head_params_no_decay = []
+        coarse_rest_decay = []
+        coarse_rest_no_decay = []
+        for n, p in coarse_module.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_vis_head = n.startswith('vis_head.')
+            is_no_decay = 'bias' in n or 'norm' in n.lower() or 'ln' in n.lower()
+            if is_vis_head:
+                (vis_head_params_no_decay if is_no_decay else vis_head_params_decay).append(p)
+            else:
+                (coarse_rest_no_decay if is_no_decay else coarse_rest_decay).append(p)
+        if coarse_rest_decay:
+            param_groups.append({'params': coarse_rest_decay, 'lr': heatmap_lr, 'weight_decay': default_wd, 'name': 'heatmap_coarse_decay'})
+        if coarse_rest_no_decay:
+            param_groups.append({'params': coarse_rest_no_decay, 'lr': heatmap_lr, 'weight_decay': 0.0, 'name': 'heatmap_coarse_no_decay'})
+        if vis_head_params_decay:
+            param_groups.append({'params': vis_head_params_decay, 'lr': vis_head_lr, 'weight_decay': default_wd, 'name': 'heatmap_vis_head_decay'})
+        if vis_head_params_no_decay:
+            param_groups.append({'params': vis_head_params_no_decay, 'lr': vis_head_lr, 'weight_decay': 0.0, 'name': 'heatmap_vis_head_no_decay'})
+        n_vis = len(vis_head_params_decay) + len(vis_head_params_no_decay)
+        n_coarse = len(coarse_rest_decay) + len(coarse_rest_no_decay)
+        print(f"  Param group: heatmap_coarse (lr={heatmap_lr}, {n_coarse} params)")
+        print(f"  Param group: heatmap_vis_head (lr={vis_head_lr}, {n_vis} params)")
     
     
     # Action Head (Legacy)
