@@ -3,26 +3,17 @@ HeatmapVLN Loss
 =================
 
 Loss for navigation-oriented heatmap prediction:
-  1. Visibility BCE        — classify whether a history view is visible
-  2. Softmax Cross-Entropy — pixel-space classification on visible views
-  3. Uniform CE            — push invisible-view softmax toward uniform
-  4. Coordinate loss       — low-weight auxiliary for peak position refinement
+  1. Visibility BCE (weighted) — classify whether a history view is visible
+  2. Softmax Cross-Entropy     — pixel-space classification on visible views
+  3. Coordinate loss           — low-weight auxiliary for peak position refinement
 
-Unified CE framework — both visible and invisible views are supervised in
-the same softmax probability space used at inference:
-
-  "Where is it?"  (visible views, gt_vis > 0)
-      Softmax CE over H×W pixel classes.  GT L1-normalized to a peaked
-      probability distribution.  Gradient: softmax_i - gt_prob_i.
-
-  "It's NOT here." (invisible views, gt_vis = 0)
-      Softmax CE with uniform target 1/(H*W).  Equivalent to
-      KL(uniform || pred_softmax) after subtracting the constant baseline
-      log(H*W).  Gradient: softmax_i - 1/(H*W), pushing all peaks flat.
-      Converged minimum is 0 (perfectly uniform prediction).
+Design principle: the heatmap backbone only answers "WHERE is the target?"
+(trained with peak CE on visible views only).  The "WHETHER the target
+exists" question is handled entirely by vis_head (trained with weighted
+BCE on all views).  No loss is applied to invisible-view heatmaps — the
+vis_gate suppresses them at inference.
 """
 
-import math
 from typing import Dict, Tuple
 
 import torch
@@ -38,10 +29,11 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: weight for visibility BCE.
         lambda_coord: weight for soft-argmax coordinate loss (auxiliary).
         lambda_kl: (unused, kept for config compatibility).
-        lambda_neg: weight for invisible-view uniform CE (KL to uniform).
         lambda_peak: weight for softmax cross-entropy on visible-view heatmaps.
         temperature: soft-argmax temperature (only affects coord_loss).
         heatmap_size: expected heatmap resolution (H, W).
+        vis_pos_weight: pos_weight for visibility BCE to handle class
+                        imbalance (recommended ~7.0 for 87%/13% neg/pos ratio).
     """
 
     def __init__(
@@ -49,19 +41,19 @@ class HeatmapVLNLoss(nn.Module):
         lambda_vis: float = 1.0,
         lambda_coord: float = 0.2,
         lambda_kl: float = 0.0,
-        lambda_neg: float = 1.0,
         lambda_peak: float = 1.0,
         temperature: float = 1.0,
         heatmap_size: Tuple[int, int] = (64, 64),
+        vis_pos_weight: float = 1.0,
         **kwargs,
     ):
         super().__init__()
         self.lambda_vis = lambda_vis
         self.lambda_coord = lambda_coord
-        self.lambda_neg = lambda_neg
         self.lambda_peak = lambda_peak
         self.temperature = temperature
         self.heatmap_size = tuple(int(v) for v in heatmap_size)
+        self.vis_pos_weight = vis_pos_weight
 
         height, width = self.heatmap_size
         coords_y, coords_x = torch.meshgrid(
@@ -225,25 +217,22 @@ class HeatmapVLNLoss(nn.Module):
             valid = None
             valid_4 = None
 
-        # (1) Visibility loss — real (non-padded) views only
+        # (1) Visibility loss — weighted BCE on real (non-padded) views
+        pw = torch.tensor([self.vis_pos_weight], device=device) if self.vis_pos_weight != 1.0 else None
         vis_bce = F.binary_cross_entropy_with_logits(
-            pred_vis, gt_vis.float(), reduction="none",
+            pred_vis, gt_vis.float(), reduction="none", pos_weight=pw,
         )
         if valid_4 is not None:
             vis_loss = (vis_bce * valid_4).sum() / valid_4.float().sum().clamp(min=1)
         else:
             vis_loss = vis_bce.mean()
 
-        # Build pos/neg masks, excluding padding
+        # Build pos mask, excluding padding
         pos_mask = gt_vis.bool()
         if valid is not None:
             real_view = valid.unsqueeze(-1).expand_as(pos_mask)
-            neg_mask = ~pos_mask & real_view
             pos_mask = pos_mask & real_view
-        else:
-            neg_mask = ~pos_mask
         has_pos = pos_mask.any()
-        has_neg = neg_mask.any()
         pred_pos = pred_heatmaps[pos_mask] if has_pos else None
         gt_pos = gt_heatmaps[pos_mask] if has_pos else None
 
@@ -253,18 +242,7 @@ class HeatmapVLNLoss(nn.Module):
         else:
             ce_loss = torch.tensor(0.0, device=device)
 
-        # (3) Uniform CE — push invisible-view softmax distribution toward
-        # uniform 1/(H*W).  Equivalent to KL(uniform || pred_softmax) after
-        # subtracting the constant baseline log(H*W).
-        if has_neg and self.lambda_neg > 0:
-            pred_neg = pred_heatmaps[neg_mask]
-            neg_ce = self.softmax_ce_loss(pred_neg, torch.ones_like(pred_neg))
-            H, W = self.heatmap_size
-            neg_loss = neg_ce - math.log(H * W)
-        else:
-            neg_loss = torch.tensor(0.0, device=device)
-
-        # (4) Coordinate loss — auxiliary peak-position refinement
+        # (3) Coordinate loss — auxiliary peak-position refinement
         if has_pos and self.lambda_coord > 0:
             coord_loss = self.soft_argmax_coord_loss(pred_pos, gt_pos)
         else:
@@ -273,7 +251,6 @@ class HeatmapVLNLoss(nn.Module):
         total = (
             self.lambda_vis * vis_loss
             + self.lambda_peak * ce_loss
-            + self.lambda_neg * neg_loss
             + self.lambda_coord * coord_loss
         )
 
@@ -282,7 +259,5 @@ class HeatmapVLNLoss(nn.Module):
             "monitor_total": total.detach(),
             "vis_loss": vis_loss.detach(),
             "coord_loss": coord_loss.detach(),
-            "kl_loss": torch.tensor(0.0, device=device),
-            "uniform_ce_loss": neg_loss.detach(),
             "peak_loss": ce_loss.detach(),
         }

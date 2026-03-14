@@ -76,7 +76,6 @@ model:
     lambda_vis: 1.0
     lambda_coord: 0.2
     lambda_kl: 0.0
-    lambda_neg: 1.0
     lambda_peak: 1.0
 
   # 动作头配置
@@ -173,9 +172,9 @@ loss:
     lambda_vis: 1.0
     lambda_coord: 0.2
     lambda_kl: 0.0
-    lambda_neg: 1.0
     lambda_peak: 1.0
     temperature: 1.0
+    vis_pos_weight: 7.0
     temperature_schedule:
       enabled: false
       mode: cosine

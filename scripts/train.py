@@ -1161,7 +1161,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
         heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
-        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 1.0),
+        # heatmap_lambda_neg removed (neg_loss deleted)
         
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),
@@ -1607,10 +1607,10 @@ def train_one_epoch(
             'lambda_kl',
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
-        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 1.0),
         lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
         temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
+        vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
     ).to(device)
     hm_loss_fn.set_temperature(
         get_heatmap_temperature(cfg, global_step_offset, total_train_steps)
@@ -1944,7 +1944,6 @@ def train_one_epoch(
                 if isinstance(loss_dict, dict):
                     logger.info(
                         f"  [HM] peak={loss_dict.get('peak_loss', 0):.4f} "
-                        f"uniform_ce={loss_dict.get('uniform_ce_loss', 0):.4f} "
                         f"vis={loss_dict.get('vis_loss', 0):.4f} "
                         f"coord={loss_dict.get('coord_loss', 0):.4f}"
                     )
@@ -1966,7 +1965,7 @@ def train_one_epoch(
                         },
                     }
                     if isinstance(loss_dict, dict):
-                        for k in ('peak_loss', 'uniform_ce_loss', 'vis_loss', 'coord_loss'):
+                        for k in ('peak_loss', 'vis_loss', 'coord_loss'):
                             if k in loss_dict:
                                 step_record[f'hm_{k}'] = loss_dict[k].item()
                     if show_gpu_memory:
@@ -1978,7 +1977,7 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 if isinstance(loss_dict, dict):
-                    for k in ('vis_loss', 'coord_loss', 'kl_loss', 'uniform_ce_loss', 'peak_loss'):
+                    for k in ('vis_loss', 'coord_loss', 'peak_loss'):
                         if k in loss_dict:
                             tb_writer.add_scalar(f'train/hm_{k}', loss_dict[k].item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
@@ -2462,7 +2461,6 @@ def validate(
     num_batches = 0
     vis_tp = vis_tn = vis_fp = vis_fn = 0
     total_peak_loss = 0.0
-    total_uniform_ce_loss = 0.0
     total_vis_loss = 0.0
     total_coord_loss = 0.0
     
@@ -2482,10 +2480,10 @@ def validate(
             'lambda_kl',
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
-        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 1.0),
         lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
         temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
+        vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
     ).to(device)
     
     # 验证推理 batch 数限制：只对前 N 个 batch 做完整推理计算 heatmap MSE
@@ -2586,7 +2584,6 @@ def validate(
                     )
                     heatmap_loss = loss_dict['total']
                     total_peak_loss += loss_dict.get('peak_loss', torch.tensor(0.0)).item()
-                    total_uniform_ce_loss += loss_dict.get('uniform_ce_loss', torch.tensor(0.0)).item()
                     total_vis_loss += loss_dict.get('vis_loss', torch.tensor(0.0)).item()
                     total_coord_loss += loss_dict.get('coord_loss', torch.tensor(0.0)).item()
 
@@ -2745,7 +2742,6 @@ def validate(
             float(vis_fp),
             float(vis_fn),
             total_peak_loss,
-            total_uniform_ce_loss,
             total_vis_loss,
             total_coord_loss,
         ],
@@ -2762,9 +2758,8 @@ def validate(
     avg_stop = (totals[3] / reduced_num_batches).item()
     avg_hm_mse = (totals[4] / max(reduced_num_heatmap_mse_batches, 1)).item() if reduced_num_heatmap_mse_batches > 0 else 0.0
     avg_peak_loss = (totals[11] / reduced_num_batches).item()
-    avg_uniform_ce_loss = (totals[12] / reduced_num_batches).item()
-    avg_vis_loss = (totals[13] / reduced_num_batches).item()
-    avg_coord_loss = (totals[14] / reduced_num_batches).item()
+    avg_vis_loss = (totals[12] / reduced_num_batches).item()
+    avg_coord_loss = (totals[13] / reduced_num_batches).item()
 
     r_tp, r_tn, r_fp, r_fn = totals[7].item(), totals[8].item(), totals[9].item(), totals[10].item()
     vis_total = r_tp + r_tn + r_fp + r_fn
@@ -2791,7 +2786,6 @@ def validate(
     
     logger.info(
         f"  [HM] peak={avg_peak_loss:.4f} "
-        f"uniform_ce={avg_uniform_ce_loss:.4f} "
         f"vis={avg_vis_loss:.4f} "
         f"coord={avg_coord_loss:.4f}"
     )
@@ -2806,7 +2800,6 @@ def validate(
         'val_stop_loss': avg_stop,
         'val_total_loss': avg_loss,
         'val_hm_peak_loss': avg_peak_loss,
-        'val_hm_uniform_ce_loss': avg_uniform_ce_loss,
         'val_hm_vis_loss': avg_vis_loss,
         'val_hm_coord_loss': avg_coord_loss,
     }
@@ -3363,25 +3356,8 @@ def main():
     # 创建训练曲线绘制器
     plotter = TrainingPlotter(out_dir=plots_dir) if dist_context.is_main else None
     
-    # 仅加载模型权重（不恢复训练状态）
-    if args.load_weights:
-        weights_path = Path(args.load_weights)
-        if weights_path.exists():
-            ckpt = torch.load(str(weights_path), map_location='cpu')
-            state_dict = ckpt.get('trainable_state_dict', {})
-            if state_dict:
-                missing, unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
-                logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
-                if missing:
-                    logger.info(f"  Missing keys: {len(missing)}")
-                if unexpected:
-                    logger.info(f"  Unexpected keys: {len(unexpected)}")
-            else:
-                logger.warning(f"⚠ No trainable_state_dict found in {weights_path}")
-            del ckpt
-            torch.cuda.empty_cache()
-        else:
-            logger.error(f"✗ Weights file not found: {weights_path}")
+    # NOTE: --load-weights 已移至 _ensure_heatmap_vln() 之后，
+    # 确保 heatmap_vln 模块已构建，否则其 36 个参数无法被匹配加载。
     
     # 断点续训
     resume_epoch = 0
@@ -3562,6 +3538,28 @@ def main():
     if getattr(raw_model.config, 'enable_heatmap', False):
         logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")
         raw_model._ensure_heatmap_vln()
+    
+    # 加载预训练权重（必须在 _ensure_heatmap_vln 之后，所有模块已构建）
+    if args.load_weights:
+        weights_path = Path(args.load_weights)
+        if weights_path.exists():
+            ckpt = torch.load(str(weights_path), map_location='cpu')
+            state_dict = ckpt.get('trainable_state_dict', {})
+            if state_dict:
+                missing, unexpected, loaded_count = _load_normalized_state_dict(raw_model, state_dict)
+                logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
+                if loaded_count < len(state_dict):
+                    logger.warning(f"  ⚠ Only {loaded_count}/{len(state_dict)} checkpoint params matched!")
+                if missing:
+                    logger.info(f"  Missing keys (in model but not checkpoint): {len(missing)}")
+                if unexpected:
+                    logger.info(f"  Unexpected keys (in checkpoint but not model): {len(unexpected)}")
+            else:
+                logger.warning(f"⚠ No trainable_state_dict found in {weights_path}")
+            del ckpt
+            torch.cuda.empty_cache()
+        else:
+            logger.error(f"✗ Weights file not found: {weights_path}")
     
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
@@ -3799,7 +3797,7 @@ def main():
             }, global_epoch_counter)
             
             # 热力图分项 loss 对比（epoch 级别）
-            for hm_key in ('peak_loss', 'uniform_ce_loss', 'vis_loss', 'coord_loss'):
+            for hm_key in ('peak_loss', 'vis_loss', 'coord_loss'):
                 val_key = f'val_hm_{hm_key}'
                 if val_key in val_metrics:
                     tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)

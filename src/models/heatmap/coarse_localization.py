@@ -11,6 +11,11 @@ The multi-layer LLM features are fused upstream (LLM DPT-Lite) into a
 c_fused-dimensional representation.  The text query (c_llm-dimensional)
 is projected to c_fused via a learned Linear before the dot product.
 
+vis_head input = concat(query[c_llm], coarse_heatmap_flat[H*W])
+  - query provides "what to look for"
+  - full flattened coarse heatmap provides spatial matching pattern
+    (richer than scalar statistics like max/mean/std)
+
 Reference: HeatmapVLN设计文档 Section 5
 """
 
@@ -38,6 +43,7 @@ class CoarseLocalization(nn.Module):
         c_llm: int = 4096,
         c_fused: int = 256,
         visibility_scale: float = 4.0,
+        coarse_spatial_size: int = 64,
     ):
         super().__init__()
         self.visibility_scale = visibility_scale
@@ -49,9 +55,9 @@ class CoarseLocalization(nn.Module):
 
         if c_llm > 0:
             self.vis_head = nn.Sequential(
-                nn.Linear(c_llm + 3, 128),
+                nn.Linear(c_llm + coarse_spatial_size, 256),
                 nn.GELU(),
-                nn.Linear(128, 1),
+                nn.Linear(256, 1),
             )
         else:
             self.vis_head = None
@@ -114,12 +120,9 @@ class CoarseLocalization(nn.Module):
             heatmaps = torch.einsum("bnc,bvhwc->bnvhw", q_norm, v_feat_norm)
 
             if self.vis_head is not None:
-                hm_max = heatmaps.amax(dim=(-2, -1))
-                hm_mean = heatmaps.mean(dim=(-2, -1))
-                hm_std = heatmaps.std(dim=(-2, -1))
-                stats = torch.stack([hm_max, hm_mean, hm_std], dim=-1)
+                hm_flat = heatmaps.flatten(-2)
                 query_expand = history_queries_tensor[:, :, None, :].expand(-1, -1, current_llm_tensor.shape[1], -1)
-                vis_input = torch.cat([query_expand, stats], dim=-1)
+                vis_input = torch.cat([query_expand, hm_flat], dim=-1)
                 visibility = self.vis_head(vis_input.reshape(-1, vis_input.shape[-1])).reshape(
                     history_queries_tensor.shape[0], history_queries_tensor.shape[1], current_llm_tensor.shape[1]
                 )
@@ -137,12 +140,9 @@ class CoarseLocalization(nn.Module):
         heatmaps = torch.einsum("nc,vhwc->nvhw", q_norm, v_feat_norm)
 
         if self.vis_head is not None:
-            hm_max = heatmaps.amax(dim=(-2, -1))
-            hm_mean = heatmaps.mean(dim=(-2, -1))
-            hm_std = heatmaps.std(dim=(-2, -1))
-            stats = torch.stack([hm_max, hm_mean, hm_std], dim=-1)
+            hm_flat = heatmaps.flatten(-2)
             query_expand = history_queries_tensor[:, None, :].expand(-1, current_llm_tensor.shape[0], -1)
-            vis_input = torch.cat([query_expand, stats], dim=-1)
+            vis_input = torch.cat([query_expand, hm_flat], dim=-1)
             visibility = self.vis_head(vis_input.reshape(-1, vis_input.shape[-1])).reshape(
                 history_queries_tensor.shape[0], current_llm_tensor.shape[0]
             )

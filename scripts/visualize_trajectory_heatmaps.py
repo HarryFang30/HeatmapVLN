@@ -74,7 +74,7 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
         heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
-        heatmap_lambda_neg=heatmap_cfg.get('lambda_neg', 1.0),
+        # heatmap_lambda_neg removed (neg_loss deleted)
         heatmap_lambda_peak=heatmap_cfg.get('lambda_peak', 1.0),
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
