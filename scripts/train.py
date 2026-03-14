@@ -138,10 +138,21 @@ def _load_normalized_state_dict(
         for name in current_state.keys()
     }
     remapped_state_dict = {}
+    skipped_shape = []
     for name, value in state_dict.items():
         actual_name = normalized_to_actual.get(_normalize_state_key(name))
         if actual_name is not None:
+            if current_state[actual_name].shape != value.shape:
+                skipped_shape.append(
+                    f"{actual_name}: ckpt {tuple(value.shape)} vs model {tuple(current_state[actual_name].shape)}"
+                )
+                continue
             remapped_state_dict[actual_name] = value
+    if skipped_shape:
+        logger.warning(
+            "Skipped %d params due to shape mismatch:\n  %s",
+            len(skipped_shape), "\n  ".join(skipped_shape),
+        )
     missing, unexpected = model.load_state_dict(remapped_state_dict, strict=False)
     return missing, unexpected, len(remapped_state_dict)
 
