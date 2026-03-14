@@ -3638,7 +3638,9 @@ def main():
         global_epoch_counter = start_epoch - 1  # 确保第一个 epoch 记录为 start_epoch
     
     patience = cfg['validation'].get('patience', 5)
+    eval_every_epochs = max(1, int(cfg.get('validation', {}).get('eval_every_epochs', 1)))
     no_improve_count = 0
+    val_metrics: Dict[str, float] = {}  # 保存最近一次验证结果，供跳过验证的 epoch 复用
     epoch_boundary_cooldown_s = float(cfg.get('log', {}).get('epoch_boundary_cooldown_s', 0.0) or 0.0)
     
     # GPU 热力图计算器（减少 CPU 瓶颈）
@@ -3730,23 +3732,29 @@ def main():
         _malloc_trim()
         _drop_page_cache()
 
-        # 使用 EMA 参数进行验证（滑动平均参数更稳定，泛化更好）
-        with ema.apply():
-            val_metrics = validate(
-                model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
-                vis_dir=vis_val_dir,
-                max_batches=args.max_batches,
-                gpu_heatmap_computer=gpu_heatmap_computer,
-                gpu_has_depth=gpu_has_depth,
-                gpu_depth_normalized=gpu_depth_normalized,
-                heatmap_temperature=train_metrics.get('heatmap_temperature'),
-                dist_context=dist_context,
-            )
-        
-        gc.collect()
-        torch.cuda.empty_cache()
-        _malloc_trim()
-        _drop_page_cache()
+        # 判断本 epoch 是否执行验证（最后一个 epoch 强制验证）
+        do_eval = (epoch % eval_every_epochs == 0) or (epoch == total_epochs)
+
+        if do_eval:
+            # 使用 EMA 参数进行验证（滑动平均参数更稳定，泛化更好）
+            with ema.apply():
+                val_metrics = validate(
+                    model, val_loader, cfg, logger, stage_cfg, tb_writer, epoch,
+                    vis_dir=vis_val_dir,
+                    max_batches=args.max_batches,
+                    gpu_heatmap_computer=gpu_heatmap_computer,
+                    gpu_has_depth=gpu_has_depth,
+                    gpu_depth_normalized=gpu_depth_normalized,
+                    heatmap_temperature=train_metrics.get('heatmap_temperature'),
+                    dist_context=dist_context,
+                )
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+            _malloc_trim()
+            _drop_page_cache()
+        else:
+            logger.info(f"  ⏭️  跳过验证（eval_every_epochs={eval_every_epochs}，将在 epoch {epoch + eval_every_epochs - (epoch % eval_every_epochs)} 验证）")
         
         if cfg['log'].get('show_gpu_memory', False):
             process = psutil.Process()
@@ -3760,23 +3768,26 @@ def main():
             f"(hm: {train_metrics['heatmap_loss']:.4f}, "
             f"traj: {train_metrics['action_loss']:.4f})"
         )
-        val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
-        logger.info(
-            f"  Val Loss: {val_metrics['val_loss']:.4f} "
-            f"(hm: {val_metrics['val_heatmap_loss']:.4f}, "
-            f"traj: {val_metrics['val_action_loss']:.4f}{val_hm_mse_str})"
-        )
         
         eta = timer.get_eta(epoch, total_epochs)
         logger.info(f"  ⏱️  Epoch time: {timer.get_epoch_time()} | ETA: {eta}")
-        
-        is_best = val_metrics['val_loss'] < best_val_loss
-        if is_best:
-            best_val_loss = val_metrics['val_loss']
-            no_improve_count = 0
-            logger.info(f"  ⭐ New best val_loss: {best_val_loss:.4f}")
+
+        if do_eval and val_metrics:
+            val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
+            logger.info(
+                f"  Val Loss: {val_metrics['val_loss']:.4f} "
+                f"(hm: {val_metrics['val_heatmap_loss']:.4f}, "
+                f"traj: {val_metrics['val_action_loss']:.4f}{val_hm_mse_str})"
+            )
+            is_best = val_metrics['val_loss'] < best_val_loss
+            if is_best:
+                best_val_loss = val_metrics['val_loss']
+                no_improve_count = 0
+                logger.info(f"  ⭐ New best val_loss: {best_val_loss:.4f}")
+            else:
+                no_improve_count += 1
         else:
-            no_improve_count += 1
+            is_best = False
         
         global_epoch_counter += 1
         current_lr = scheduler.get_last_lr()[0] if scheduler else 0
@@ -3790,9 +3801,10 @@ def main():
                     "global_epoch": global_epoch_counter,
                     "stage": stage_name,
                     "is_best": is_best,
+                    "val_evaluated": do_eval,
                     "learning_rate": current_lr,
                     "train": train_metrics,
-                    "val": val_metrics,
+                    "val": val_metrics if do_eval else None,
                     "epoch_time": timer.get_epoch_time(),
                     "eta": eta,
                 },
@@ -3803,63 +3815,64 @@ def main():
                 epoch=global_epoch_counter,
                 stage_name=stage_name,
                 train_metrics=train_metrics,
-                val_metrics=val_metrics,
+                val_metrics=val_metrics if do_eval else {},
                 lr=current_lr,
                 is_best=is_best,
             )
         
         # 记录 epoch 级别的 loss 到 TensorBoard
         if tb_writer is not None:
-            # 总损失对比
-            tb_writer.add_scalars('loss/total', {
-                'train': train_metrics['total_loss'],
-                'val': val_metrics['val_loss'],
-            }, global_epoch_counter)
-            
-            # 热力图损失对比
-            tb_writer.add_scalars('loss/heatmap', {
-                'train': train_metrics['heatmap_loss'],
-                'val': val_metrics['val_heatmap_loss'],
-            }, global_epoch_counter)
-            
-            # 轨迹损失对比
-            tb_writer.add_scalars('loss/trajectory', {
-                'train': train_metrics['action_loss'],
-                'val': val_metrics['val_action_loss'],
-            }, global_epoch_counter)
-            
-            # 进度损失对比
-            tb_writer.add_scalars('loss/progress', {
-                'train': train_metrics.get('stop_loss', 0),
-                'val': val_metrics.get('val_stop_loss', 0),
-            }, global_epoch_counter)
-            
-            # 热力图分项 loss 对比（epoch 级别）
-            for hm_key in ('peak_loss', 'vis_loss', 'coord_loss'):
-                val_key = f'val_hm_{hm_key}'
-                if val_key in val_metrics:
-                    tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)
-            
-            # 完整推理 heatmap MSE（真实生成质量）
-            if val_metrics.get('val_heatmap_mse', 0) > 0:
-                tb_writer.add_scalar('loss/heatmap_inference_mse', val_metrics['val_heatmap_mse'], global_epoch_counter)
-            
-            # 学习率
+            # 学习率和训练指标始终记录
             tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)
-            
-            # 单独的指标（方便筛选）
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
-            tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
+            
+            if do_eval and val_metrics:
+                # 总损失对比
+                tb_writer.add_scalars('loss/total', {
+                    'train': train_metrics['total_loss'],
+                    'val': val_metrics['val_loss'],
+                }, global_epoch_counter)
+                
+                # 热力图损失对比
+                tb_writer.add_scalars('loss/heatmap', {
+                    'train': train_metrics['heatmap_loss'],
+                    'val': val_metrics['val_heatmap_loss'],
+                }, global_epoch_counter)
+                
+                # 轨迹损失对比
+                tb_writer.add_scalars('loss/trajectory', {
+                    'train': train_metrics['action_loss'],
+                    'val': val_metrics['val_action_loss'],
+                }, global_epoch_counter)
+                
+                # 进度损失对比
+                tb_writer.add_scalars('loss/progress', {
+                    'train': train_metrics.get('stop_loss', 0),
+                    'val': val_metrics.get('val_stop_loss', 0),
+                }, global_epoch_counter)
+                
+                # 热力图分项 loss 对比（epoch 级别）
+                for hm_key in ('peak_loss', 'vis_loss', 'coord_loss'):
+                    val_key = f'val_hm_{hm_key}'
+                    if val_key in val_metrics:
+                        tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)
+                
+                # 完整推理 heatmap MSE（真实生成质量）
+                if val_metrics.get('val_heatmap_mse', 0) > 0:
+                    tb_writer.add_scalar('loss/heatmap_inference_mse', val_metrics['val_heatmap_mse'], global_epoch_counter)
+                
+                # 单独的指标（方便筛选）
+                tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
 
-            for vk in ('val_vis_accuracy', 'val_vis_precision', 'val_vis_recall',
-                        'val_vis_tnr', 'val_vis_f1', 'val_vis_gt_pos_ratio'):
-                if vk in val_metrics:
-                    tb_writer.add_scalar(f'epoch/{vk}', val_metrics[vk], global_epoch_counter)
+                for vk in ('val_vis_accuracy', 'val_vis_precision', 'val_vis_recall',
+                            'val_vis_tnr', 'val_vis_f1', 'val_vis_gt_pos_ratio'):
+                    if vk in val_metrics:
+                        tb_writer.add_scalar(f'epoch/{vk}', val_metrics[vk], global_epoch_counter)
             
             tb_writer.flush()
         
-        # 发送飞书通知
-        if notifier:
+        # 发送飞书通知（只在验证 epoch 发送，避免无意义的重复通知）
+        if notifier and do_eval:
             try:
                 notifier.send_epoch_report(
                     epoch=epoch,
