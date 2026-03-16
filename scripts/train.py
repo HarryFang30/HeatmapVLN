@@ -590,8 +590,6 @@ class TrainingPlotter:
             'val_loss': [],
             'train_heatmap_loss': [],
             'val_heatmap_loss': [],
-            'train_action_loss': [],
-            'val_action_loss': [],
             'lr': [],
             'is_best': [],
         }
@@ -620,8 +618,6 @@ class TrainingPlotter:
         self.history['val_loss'].append(val_metrics.get('val_loss', 0))
         self.history['train_heatmap_loss'].append(train_metrics.get('heatmap_loss', 0))
         self.history['val_heatmap_loss'].append(val_metrics.get('val_heatmap_loss', 0))
-        self.history['train_action_loss'].append(train_metrics.get('action_loss', 0))
-        self.history['val_action_loss'].append(val_metrics.get('val_action_loss', 0))
         self.history['lr'].append(lr or 0)
         self.history['is_best'].append(is_best)
         
@@ -671,16 +667,9 @@ class TrainingPlotter:
         ax2.legend(loc='upper right')
         ax2.grid(True, alpha=0.3)
         
-        # Action Loss
+        # (Placeholder — reserved for future metrics)
         ax3 = axes[1, 0]
-        ax3.plot(epochs, self.history['train_action_loss'], 'b-', label='Train Action', linewidth=1.5)
-        ax3.plot(epochs, self.history['val_action_loss'], 'r-', label='Val Action', linewidth=1.5)
-        draw_stage_lines(ax3)
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Loss')
-        ax3.set_title('Action Loss')
-        ax3.legend(loc='upper right')
-        ax3.grid(True, alpha=0.3)
+        ax3.set_visible(False)
         
         # Learning Rate
         ax4 = axes[1, 1]
@@ -1964,8 +1953,7 @@ def train_one_epoch(
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}, traj: {trajectory_loss.item():.4f}, prog: {progress_loss.item():.4f}) | "
-                    f"Temp: {current_heatmap_temperature:.3f} | "
+                    f"(hm: {heatmap_loss.item():.4f}) | "
                     f"LR: [{lr_display}]"
                     + gpu_mem_str
                     + (
@@ -2000,9 +1988,6 @@ def train_one_epoch(
                         "global_step": global_step,
                         "loss": loss.item() * grad_accum_steps,
                         "heatmap_loss": heatmap_loss.item(),
-                        "trajectory_loss": trajectory_loss.item(),
-                        "progress_loss": progress_loss.item(),
-                        "heatmap_temperature": current_heatmap_temperature,
                         "lrs": {
                             optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
                             for gi, lr_val in enumerate(all_lrs)
@@ -2024,9 +2009,6 @@ def train_one_epoch(
                     for k in ('vis_loss', 'coord_loss', 'peak_loss', 'neg_loss'):
                         if k in loss_dict:
                             tb_writer.add_scalar(f'train/hm_{k}', loss_dict[k].item(), actual_step)
-                tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
-                tb_writer.add_scalar('train/progress_loss', progress_loss.item(), actual_step)
-                tb_writer.add_scalar('train/heatmap_temperature', current_heatmap_temperature, actual_step)
                 if enable_timing:
                     tb_writer.add_scalar('timing/data_wait_s', _mean_timing(timing_stats, profiled_steps, 'data_wait_s'), actual_step)
                     tb_writer.add_scalar('timing/gt_s', _mean_timing(timing_stats, profiled_steps, 'gt_s'), actual_step)
@@ -2048,14 +2030,6 @@ def train_one_epoch(
                 for gi, lr_val in enumerate(scheduler.get_last_lr()):
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     tb_writer.add_scalar(f'lr/{gname}', lr_val, actual_step)
-                
-                # 🔧 修复：优先使用 trajectory_valid（trajectory 数据集），否则使用 action_valid
-                # 监控有效样本比例
-                if 'trajectory_valid' in batch:
-                    valid_ratio = batch['trajectory_valid'].float().mean().item()
-                else:
-                    valid_ratio = action_valid.float().mean().item()
-                tb_writer.add_scalar('train/action_valid_ratio', valid_ratio, actual_step)
                 
                 # 诊断信息记录（固定间隔）
                 diag_interval = cfg['log'].get('diag_interval', 100)
@@ -2255,49 +2229,13 @@ def train_one_epoch(
                                         f"(gt_pos={pos_ratio:.2f})"
                                     )
 
-                    # Progress prediction 诊断
-                    if 'progress' in output and output['progress'] is not None:
-                        pred_progress = output['progress'].detach()
-                        gt_progress = batch.get('progress')
-                        if gt_progress is not None:
-                            gt_progress = gt_progress.to(pred_progress.device)
-                            progress_mae = (pred_progress - gt_progress).abs().mean().item()
-                            tb_writer.add_scalar('diag/progress_mae', progress_mae, actual_step)
-                            tb_writer.add_scalar('diag/progress_pred_mean', pred_progress.mean().item(), actual_step)
-                            tb_writer.add_scalar('diag/progress_gt_mean', gt_progress.mean().item(), actual_step)
-                            # 边界检测准确率 (progress < 0.1 或 > 0.9)
-                            boundary_mask = (gt_progress < 0.1) | (gt_progress > 0.9)
-                            if boundary_mask.sum() > 0:
-                                boundary_error = (pred_progress[boundary_mask] - gt_progress[boundary_mask]).abs().mean().item()
-                                tb_writer.add_scalar('diag/progress_boundary_error', boundary_error, actual_step)
-                    
-                    # 轨迹预测诊断
-                    if 'trajectory' in output and output['trajectory'] is not None:
-                        pred_traj = output['trajectory'].detach()
-                        gt_traj = batch.get('trajectory')
-                        if gt_traj is not None:
-                            gt_traj = gt_traj.to(pred_traj.device)
-                            # ADE (Average Displacement Error)
-                            displacement = torch.sqrt(((pred_traj[..., :2] - gt_traj[..., :2]) ** 2).sum(dim=-1))
-                            ade = displacement.mean().item()
-                            tb_writer.add_scalar('diag/trajectory_ade', ade, actual_step)
-                            # FDE (Final Displacement Error)
-                            fde = displacement[:, -1].mean().item()
-                            tb_writer.add_scalar('diag/trajectory_fde', fde, actual_step)
-                    
                     # GPU 显存监控（仅当 show_gpu_memory 开启时）
                     if cfg['log'].get('show_gpu_memory', False):
                         tb_writer.add_scalar('diag/gpu_memory_gb', torch.cuda.memory_allocated() / 1024**3, actual_step)
                         tb_writer.add_scalar('diag/gpu_memory_reserved_gb', torch.cuda.memory_reserved() / 1024**3, actual_step)
                 
-                # 轨迹分布直方图（每 100 步记录一次，避免日志过大）
-                if global_step % 100 == 0:
-                    if 'trajectory' in output and output['trajectory'] is not None:
-                        tb_writer.add_histogram('train/pred_trajectory_dx', output['trajectory'][..., 0].flatten().cpu(), actual_step)
-                        tb_writer.add_histogram('train/pred_trajectory_dy', output['trajectory'][..., 1].flatten().cpu(), actual_step)
-                    if 'trajectory' in batch and batch['trajectory'] is not None:
-                        tb_writer.add_histogram('train/gt_trajectory_dx', batch['trajectory'][..., 0].flatten().cpu(), actual_step)
-                        tb_writer.add_histogram('train/gt_trajectory_dy', batch['trajectory'][..., 1].flatten().cpu(), actual_step)
+
+
         
         # 定期可视化热力图预测并记录到 TensorBoard
         vis_interval = cfg['log'].get('vis_every_steps', 500)
@@ -2382,8 +2320,6 @@ def train_one_epoch(
             mid_metrics = {
                 'total_loss': total_loss / num_batches,
                 'heatmap_loss': total_heatmap_loss / num_batches,
-                'action_loss': total_action_loss / num_batches,
-                'stop_loss': total_stop_loss / num_batches,
             }
             if ema is not None:
                 with ema.apply():
@@ -2464,10 +2400,7 @@ def train_one_epoch(
     return {
         'total_loss': (totals[0] / reduced_num_batches).item(),
         'heatmap_loss': (totals[1] / reduced_num_batches).item(),
-        'action_loss': (totals[2] / reduced_num_batches).item(),
-        'stop_loss': (totals[3] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
-        'heatmap_temperature': hm_loss_fn.temperature,
     }
 
 
@@ -2841,8 +2774,6 @@ def validate(
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
         'val_heatmap_mse': avg_hm_mse,
-        'val_action_loss': avg_act,
-        'val_stop_loss': avg_stop,
         'val_total_loss': avg_loss,
         'val_hm_peak_loss': avg_peak_loss,
         'val_hm_vis_loss': avg_vis_loss,
@@ -3778,8 +3709,7 @@ def main():
         
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f}, "
-            f"traj: {train_metrics['action_loss']:.4f})"
+            f"(hm: {train_metrics['heatmap_loss']:.4f})"
         )
         
         eta = timer.get_eta(epoch, total_epochs)
@@ -3789,8 +3719,7 @@ def main():
             val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
             logger.info(
                 f"  Val Loss: {val_metrics['val_loss']:.4f} "
-                f"(hm: {val_metrics['val_heatmap_loss']:.4f}, "
-                f"traj: {val_metrics['val_action_loss']:.4f}{val_hm_mse_str})"
+                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_hm_mse_str})"
             )
             is_best = val_metrics['val_loss'] < best_val_loss
             if is_best:
@@ -3850,18 +3779,6 @@ def main():
                 tb_writer.add_scalars('loss/heatmap', {
                     'train': train_metrics['heatmap_loss'],
                     'val': val_metrics['val_heatmap_loss'],
-                }, global_epoch_counter)
-                
-                # 轨迹损失对比
-                tb_writer.add_scalars('loss/trajectory', {
-                    'train': train_metrics['action_loss'],
-                    'val': val_metrics['val_action_loss'],
-                }, global_epoch_counter)
-                
-                # 进度损失对比
-                tb_writer.add_scalars('loss/progress', {
-                    'train': train_metrics.get('stop_loss', 0),
-                    'val': val_metrics.get('val_stop_loss', 0),
                 }, global_epoch_counter)
                 
                 # 热力图分项 loss 对比（epoch 级别）
