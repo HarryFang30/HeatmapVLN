@@ -204,9 +204,12 @@ def _build_heatmap_strip(
         x0 = i * (group_w + gap)
         for v in range(4):
             hm = _resize(hm_4[v], tile)
-            hm_norm = np.clip(hm / vmax, 0, 1)
-            t = cmap(hm_norm)[:, :, :3].astype(np.float32)
-            strip[:, x0 + v * tile: x0 + (v + 1) * tile] = t
+            if float(hm.max()) < 1e-8:
+                strip[:, x0 + v * tile: x0 + (v + 1) * tile] = 0.0
+            else:
+                hm_norm = np.clip(hm / vmax, 0, 1)
+                t = cmap(hm_norm)[:, :, :3].astype(np.float32)
+                strip[:, x0 + v * tile: x0 + (v + 1) * tile] = t
         if i < N - 1:
             _fill_sep(strip, x0 + group_w, gap)
     return strip
@@ -437,6 +440,10 @@ def main() -> int:
     parser.add_argument('--split', type=str, default=None)
     parser.add_argument('--attn-impl', type=str, default=None)
     parser.add_argument('--tile-size', type=int, default=TILE)
+    parser.add_argument('--vis-threshold', type=float, default=None,
+                        help='Hard visibility threshold: views with pred_vis < threshold are zeroed out')
+    parser.add_argument('--peak-ratio', type=float, default=None,
+                        help='Filter diffuse heatmaps: zero out views where max/mean < this ratio')
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -497,10 +504,17 @@ def main() -> int:
         current_state = model.state_dict()
         norm = lambda n: n.replace("module.", "", 1).replace(".module.", ".")
         norm_to_actual = {norm(k): k for k in current_state.keys()}
-        remapped = {
-            norm_to_actual[norm(k)]: v
-            for k, v in state_dict.items() if norm(k) in norm_to_actual
-        }
+        remapped = {}
+        skipped = []
+        for k, v in state_dict.items():
+            actual = norm_to_actual.get(norm(k))
+            if actual is not None:
+                if current_state[actual].shape != v.shape:
+                    skipped.append(f"{actual}: ckpt {tuple(v.shape)} vs model {tuple(current_state[actual].shape)}")
+                    continue
+                remapped[actual] = v
+        if skipped:
+            logger.warning("Skipped %d params (shape mismatch):\n  %s", len(skipped), "\n  ".join(skipped))
         missing, unexpected = model.load_state_dict(remapped, strict=False)
         logger.info(
             f"  Loaded: {len(remapped)}/{len(state_dict)} params, "
@@ -557,6 +571,18 @@ def main() -> int:
                 vis_scores = torch.sigmoid(pred_vis).max(dim=0).values.numpy()
             else:
                 vis_scores = np.ones(4)
+
+            if args.vis_threshold is not None:
+                for v in range(4):
+                    if vis_scores[v] < args.vis_threshold:
+                        gated_agg[v] = 0.0
+
+            if args.peak_ratio is not None:
+                for v in range(4):
+                    vmean = float(gated_agg[v].mean())
+                    vmax = float(gated_agg[v].max())
+                    if vmean < 1e-10 or vmax / vmean < args.peak_ratio:
+                        gated_agg[v] = 0.0
 
             if gt_vis_raw is not None:
                 gt_vis_4 = gt_vis_raw.float().max(dim=0).values.numpy() if gt_vis_raw.dim() == 2 else gt_vis_raw.float().numpy()
