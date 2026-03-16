@@ -2,220 +2,219 @@
 
 <div align="center">
 
-![Python](https://img.shields.io/badge/Python-3.12-blue.svg)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)
+![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.7-ee4c2c.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
-![CUDA](https://img.shields.io/badge/CUDA-12.0+-76b900.svg)
+![CUDA](https://img.shields.io/badge/CUDA-12.8-76b900.svg)
 
-**基于 Qwen3-VL 的视觉语言导航热力图与轨迹预测系统**
+**Heatmap and Trajectory Prediction for Vision-Language Navigation based on Qwen3.5-9B**
 
-[快速开始](#快速开始) •
-[模型架构](#模型架构) •
-[训练指南](#训练) •
-[配置说明](#配置说明) •
-[常见问题](#常见问题)
+[Quick Start](#quick-start) •
+[Architecture](#model-architecture) •
+[Training](#training) •
+[Configuration](#configuration) •
+[FAQ](#faq)
 
 </div>
 
 ---
 
-## 📖 概述
+## Overview
 
-HeatmapVLN 是一个用于视觉语言导航（VLN）任务的深度学习框架。通过历史视频帧、当前观测和自然语言指令，生成空间热力图和连续动作预测，为导航提供关键位置信息。
+HeatmapVLN is a deep learning framework for Vision-Language Navigation (VLN) tasks. Given 360° panoramic observations (front/right/back/left), a history frame sequence, and a natural language instruction, the model predicts projection heatmaps of each history camera position onto the current view, along with continuous trajectory prediction and task progress estimation.
+
+The core architecture uses a **Coarse-to-Fine** two-stage heatmap generation pipeline: a frozen Qwen3.5-9B backbone extracts multi-layer features, which are fused via DPT-Lite modules to first produce an 8x8 coarse localization, then refined into a 64x64 fine-grained heatmap. Only ~2M parameters need to be trained.
 
 <p align="center">
   <img src="assets/architecture.png" width="800" alt="Architecture">
 </p>
 
-### ✨ 核心特性
+### Key Features
 
-| 特性 | 描述 |
-|:-----|:-----|
-| 🔥 **历史热力图** | 基于 Diffusion 生成历史相机位置在当前视角的热力图投影 |
-| 🔮 **未来热力图** | 基于 Diffusion 预测未来位置在当前视角的投影（可选） |
-| 👁️ **多视图支持** | 360° 全景图：4个方向同时预测，支持 circular_padding |
-| 🎯 **轨迹预测** | 24 步连续轨迹预测 (x, y, θ)，Transformer + Diffusion |
-| 📊 **进度估计** | 任务完成进度回归 (0-1)，3层 MLP |
-| 🛑 **停止预测** | 基于 Focal Loss 的二分类（已弃用，用 Progress 替代） |
-| 👁️ **可见性预测** | 预测目标位置是否在当前视角可见，控制假阳性 |
-| 🧠 **Qwen3-VL 骨干** | 视觉语言预训练模型，支持可选 LoRA 微调 |
-| 📡 **Multi-Layer Features** | 从 LLM 多层提取特征并融合 (CVPR 2025 最佳实践) |
-| ⚡ **Sequence Packing** | 高效批量训练，消除 padding 浪费 |
-| 🎛️ **模块化设计** | 可独立启用/禁用各预测头 |
-| 🔄 **360° 全景支持** | circular_padding 处理左右边界连续性 |
-
----
-
-## 📋 目录
-
-- [快速开始](#快速开始)
-  - [环境要求](#环境要求)
-  - [安装](#安装)
-  - [模型准备](#模型准备)
-- [使用指南](#使用指南)
-  - [训练](#训练)
-  - [推理](#推理)
-  - [评估](#评估)
-- [模型架构](#模型架构)
-  - [整体架构](#整体架构)
-  - [热力图生成模块](#热力图生成模块)
-  - [轨迹预测模块](#轨迹预测模块)
-- [数据集](#数据集)
-  - [数据格式](#数据格式)
-  - [采样策略](#采样策略)
-- [配置说明](#配置说明)
-- [常见问题](#常见问题)
-- [致谢](#致谢)
-- [许可证](#许可证)
+| Feature | Description |
+|:--------|:------------|
+| **Coarse-to-Fine Heatmap** | 8x8 coarse localization -> 64x64 fine heatmap via cosine similarity + ConvTranspose refinement |
+| **Multi-Layer Feature Fusion** | DPT-Lite fusion of multi-layer ViT features (16x16) and LLM features (8x8) |
+| **360° Panoramic Support** | Simultaneous heatmap and visibility prediction across 4 directions (front/right/back/left) |
+| **Visibility Prediction** | MLP visibility head determines whether a history frame is visible in the current view, gating the heatmap output |
+| **Trajectory Prediction** | 24-step continuous trajectory prediction (x, y, theta) via Transformer Decoder + DDPM |
+| **Progress Estimation** | Task completion progress regression (0-1) via 3-layer MLP |
+| **Qwen3.5-9B Backbone** | Frozen VLM backbone with hook-based intermediate ViT/LLM feature extraction |
+| **LoRA Fine-Tuning (Optional)** | LoRA adapters on the last N layers of Qwen3.5 for enhanced spatial reasoning |
+| **FGR2R Sub-Instructions** | Dynamic sub-instruction matching for random subsequence sampling |
+| **Trajectory Augmentation** | Random rotation/scaling of trajectories during training for better generalization |
+| **Modular Design** | Heatmap/trajectory/progress heads can be independently enabled or disabled |
 
 ---
 
-## 🚀 快速开始
+## Table of Contents
 
-### 环境要求
+- [Quick Start](#quick-start)
+  - [Requirements](#requirements)
+  - [Installation](#installation)
+  - [Model Preparation](#model-preparation)
+- [Usage Guide](#usage-guide)
+  - [Training](#training)
+  - [Inference](#inference)
+  - [Evaluation](#evaluation)
+- [Model Architecture](#model-architecture)
+  - [Overall Architecture](#overall-architecture)
+  - [Heatmap Generation Module](#heatmap-generation-module)
+  - [Trajectory Prediction Module](#trajectory-prediction-module)
+- [Dataset](#dataset)
+  - [Data Format](#data-format)
+  - [Sampling Strategies](#sampling-strategies)
+- [Configuration](#configuration)
+- [FAQ](#faq)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
 
-- Python 3.12+
-- PyTorch 2.1+
-- CUDA 12.0+
-- 40GB+ GPU 显存（推荐 A100/H100）
+---
 
-### 安装
+## Quick Start
 
-**方式一：Docker 部署（推荐）**
+### Requirements
+
+- Python 3.11+
+- PyTorch 2.7+
+- CUDA 12.8+
+- 40GB+ GPU memory (A100/H100 recommended)
+
+### Installation
+
+**Option 1: Docker Deployment (Recommended)**
 
 ```bash
 ./docker/docker-run.sh
 ```
 
-详细说明请参阅 [Docker 使用指南](docker/DOCKER.md)
+See the [Docker Guide](docker/DOCKER.md) for details.
 
-**方式二：本地安装**
+**Option 2: Local Installation**
 
 ```bash
-# 创建 conda 环境
-conda create -n heatmapvln python=3.12 -y
+# Create conda environment
+conda create -n heatmapvln python=3.11 -y
 conda activate heatmapvln
 
-# 安装依赖
+# Install PyTorch (CUDA 12.8)
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+
+# Install dependencies
 pip install -r requirements.txt
 
-# 可选：安装 FlashAttention 2（推荐）
+# Optional: Install FlashAttention 2 (recommended)
 pip install flash-attn --no-build-isolation
 ```
 
-### 模型准备
+### Model Preparation
 
-下载 Qwen3-VL 模型权重：
+Download Qwen3.5 model weights:
 
 ```bash
-# 从 HuggingFace 下载
-huggingface-cli download Qwen/Qwen3-VL-8B --local-dir models/qwen_3_vl
+# From HuggingFace
+huggingface-cli download Qwen/Qwen3.5-VL-9B --local-dir models/qwen_3.5
 
-# 或从 ModelScope 下载
-modelscope download Qwen/Qwen3-VL-8B --local_dir models/qwen_3_vl
+# Or from ModelScope
+modelscope download Qwen/Qwen3.5-VL-9B --local_dir models/qwen_3.5
 ```
 
-### 快速验证
+### Quick Validation
 
 ```bash
-# 验证安装
+# Verify installation
 python scripts/train.py --config configs/train_config.yaml --dry-run
 
-# 快速训练测试
+# Quick training test
 python scripts/train.py --config configs/train_config.yaml --epochs 2 --max-batches 5
 ```
 
 ---
 
-## 📚 使用指南
+## Usage Guide
 
-### 训练
+### Training
 
 ```bash
-# 基础训练
+# Full training (heatmap + trajectory + progress)
 python scripts/train.py --config configs/train_config.yaml
 
-# 断点续训
+# Heatmap-only training (lightweight)
+python scripts/train.py --config configs/train_heatmap_config.yaml
+
+# Resume from checkpoint
 python scripts/train.py --config configs/train_config.yaml --auto-resume
 ```
 
-**常用参数：**
+**Common Arguments:**
 
-| 参数 | 说明 | 示例 |
-|:-----|:-----|:-----|
-| `--config` | 配置文件路径 | `configs/train_config.yaml` |
-| `--resume` | 从指定检查点恢复 | `--resume ckpts/e005.pth` |
-| `--auto-resume` | 自动从最新检查点恢复 | |
-| `--dry-run` | 仅构建模型，不训练 | |
-| `--epochs` | 训练轮数 | `--epochs 10` |
+| Argument | Description | Example |
+|:---------|:------------|:--------|
+| `--config` | Config file path | `configs/train_config.yaml` |
+| `--resume` | Resume from a specific checkpoint | `--resume ckpts/e005.pth` |
+| `--auto-resume` | Auto-resume from the latest checkpoint | |
+| `--dry-run` | Build model only, skip training | |
+| `--epochs` | Number of training epochs | `--epochs 10` |
 
-**后台训练：**
+**Background Training:**
 
 ```bash
-# 使用 tmux（推荐）
+# Using tmux (recommended)
 tmux new -s train
 python scripts/train.py --config configs/train_config.yaml
-# Ctrl+B D 退出，tmux attach -t train 重新进入
+# Ctrl+B D to detach, tmux attach -t train to reattach
 
-# 使用 nohup
+# Using nohup
 nohup python -u scripts/train.py --config configs/train_config.yaml > train.log 2>&1 &
 ```
 
-**TensorBoard 监控：**
+**TensorBoard Monitoring:**
 
 ```bash
-tensorboard --logdir=/root/tf-logs/latest --port=6006
+tensorboard --logdir /root/tf-logs --port=6006
 ```
 
 <details>
-<summary>📊 TensorBoard 关键指标</summary>
+<summary>Key TensorBoard Metrics</summary>
 
-| 分类 | 指标 | 说明 |
-|:-----|:-----|:-----|
-| **训练损失** | `train/loss` | 总损失 |
-| | `train/history_heatmap_loss` | 历史热力图损失 |
-| | `train/trajectory_loss` | 轨迹损失 (Transformer Diffusion) |
-| | `train/progress_loss` | 进度损失 |
-| **Multi-Layer Fusion** | `diag/fusion_weight_layer{i}` | 各层融合权重 |
-| **热力图损失** | `diag/heatmap_diffusion_loss` | Min-SNR 加权 epsilon MSE 损失 |
-| | `diag/heatmap_eps_mse_high_snr` | 低噪声区 (SNR>5) epsilon MSE |
-| | `diag/heatmap_eps_mse_mid_snr` | 中噪声区 (0.5≤SNR≤5) epsilon MSE |
-| | `diag/heatmap_eps_mse_low_snr` | 高噪声区 (SNR<0.5) epsilon MSE |
-| **热力图诊断** | `diag/pred_heatmap_max` | 预测最大值（<0.1 可能坍缩） |
-| | `diag/pred_heatmap_mean` | 预测均值 |
-| | `diag/pred_heatmap_std` | 预测标准差 |
-| | `diag/pred_heatmap_nonzero_ratio` | 非零像素比例 |
-| | `diag/noise_std` | 真实噪声标准差 |
-| | `diag/noise_pred_std` | 预测噪声标准差（应与 noise_std 接近） |
-| **轨迹诊断** | `diag/trajectory_ade` | 平均位移误差 |
-| | `diag/trajectory_fde` | 终点位移误差 |
-| **进度诊断** | `diag/progress_mae` | 进度 MAE |
-| | `diag/progress_pred_mean` | 预测进度均值 |
-| | `diag/progress_gt_mean` | 真实进度均值 |
-| | `diag/progress_boundary_error` | 进度边界误差 (0/1附件) |
-| **资源监控** | `diag/gpu_memory_gb` | GPU 显存使用量 |
-| | `diag/gpu_memory_reserved_gb` | GPU 预留显存 |
+| Category | Metric | Description |
+|:---------|:-------|:------------|
+| **Heatmap Loss** | `train/heatmap_loss` | Total heatmap loss |
+| | `train/vis_loss` | Visibility BCE loss |
+| | `train/peak_loss` | Softmax CE localization loss |
+| | `train/coord_loss` | Coordinate auxiliary loss |
+| | `train/neg_loss` | Invisible-view suppression loss |
+| **Trajectory Loss** | `train/trajectory_loss` | Trajectory diffusion loss |
+| **Progress Loss** | `train/progress_loss` | Progress regression loss |
+| **Heatmap Diagnostics** | `diag/pred_heatmap_max` | Predicted heatmap max value |
+| | `diag/pred_heatmap_mean` | Predicted heatmap mean value |
+| **Trajectory Diagnostics** | `diag/trajectory_ade` | Average Displacement Error |
+| | `diag/trajectory_fde` | Final Displacement Error |
+| **Progress Diagnostics** | `diag/progress_mae` | Progress MAE |
+| | `diag/progress_pred_mean` | Predicted progress mean |
+| | `diag/progress_gt_mean` | Ground truth progress mean |
+| **Resource Monitoring** | `diag/gpu_memory_gb` | GPU memory usage |
 
 </details>
 
-### 推理
+### Inference
 
 ```bash
-# 对数据集 clip 推理
+# Inference on a dataset clip
 python scripts/inference.py \
   --clip /path/to/clip \
   --config configs/train_config.yaml \
   --checkpoint /path/to/best.pth \
   --output-dir ./outputs
 
-# 对视频文件推理
+# Inference on a video file
 python scripts/inference.py \
   --video /path/to/video.mp4 \
-  --instruction "沿走廊前进并在门口右转" \
+  --instruction "Walk along the corridor and turn right at the door" \
   --checkpoint /path/to/best.pth
 ```
 
-### 评估
+### Evaluation
 
 ```bash
 python scripts/evaluate.py \
@@ -225,241 +224,236 @@ python scripts/evaluate.py \
   --save-vis
 ```
 
-**评估指标：**
+**Evaluation Metrics:**
 
-| 类别 | 指标 | 说明 |
-|:-----|:-----|:-----|
-| **热力图** | Peak Error | 峰值位置误差（像素） |
-| | IoU@0.1/0.3/0.5 | 多阈值交并比 |
-| **轨迹** | ADE | 平均位移误差 |
-| | FDE | 终点位移误差 |
-| **进度** | MAE | 平均绝对误差 |
-| **停止预测** | Accuracy/F1 | 分类准确率与 F1 分数 |
+| Category | Metric | Description |
+|:---------|:-------|:------------|
+| **Heatmap** | Peak Error | Peak position error (pixels) |
+| | IoU@0.1/0.3/0.5 | Multi-threshold Intersection over Union |
+| **Trajectory** | ADE | Average Displacement Error |
+| | FDE | Final Displacement Error |
+| **Progress** | MAE | Mean Absolute Error |
+
+### Visualization
+
+```bash
+# Heatmap visualization (4-view panoramic)
+python scripts/visualize_heatmap.py --checkpoint /path/to/best.pth --num-samples 10
+
+# Trajectory + BEV visualization
+python scripts/visualize_trajectory_heatmaps.py --checkpoint /path/to/best.pth
+```
 
 ---
 
-## 🏗️ 模型架构
+## Model Architecture
 
-### 整体架构
+### Overall Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              VLN Pipeline (Qwen3-VL)                               │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│  输入                                                                                │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐                     │
-│  │ History [K帧]  │  │ Current Frame  │  │  Instruction   │                     │
-│  │  (多视图可选)   │  │   (224×224)    │  │    (文本)       │                     │
-│  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘                     │
-│          └───────────────────┬┴───────────────────┘                                │
-│                              │                                                     │
-│                              ▼                                                     │
-│                    ┌──────────────────┐                                           │
-│                    │    Qwen3-VL      │  ← 冻结 (可选 LoRA 微调)                   │
-│                    │   (Vision+LLM)   │     支持 Multi-Layer Features              │
-│                    └────────┬─────────┘                                           │
-│                             │                                                      │
-│              hidden_states [B, seq, 4096]                                          │
-│                             │                                                      │
-│         ┌────────────────────┼────────────────────┐                                │
-│         ▼                    ▼                    ▼                                │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                          │
-│  │ Multi-Layer │    │    LLM      │    │    LLM      │                          │
-│  │   Fusion    │    │  Projector  │    │  Projector  │                          │
-│  │ (可选)       │    │ 4096→1024   │    │ (Vision)    │                          │
-│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                          │
-│         │                   │                   │                                  │
-│         └───────────────────┼───────────────────┘                                  │
-│                             │                                                      │
-│                     llm_tokens [B, seq, 1024]                                      │
-│                             │                                                      │
-│         ┌────────────────────┼────────────────────┐                                │
-│         ▼                    ▼                    ▼                                │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                          │
-│  │   Heatmap   │    │ Trajectory  │    │  Progress   │                          │
-│  │    Head     │    │    Head     │    │    Head     │                          │
-│  │  (Diffusion)│    │ (Transformer│    │    (MLP)    │                          │
-│  │  +Visible   │    │   +Diffusion)│    │             │                          │
-│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                          │
-│         │                 │                 │                                   │
-│         ▼                 ▼                 ▼                                   │
-│    Heatmap          Trajectory          Progress                                  │
-│    [64×64]         [24, 3] (x,y,θ)      [0, 1]                                   │
-│    + Visibility                                                                    │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------------------+
+|                      VLN Pipeline (Qwen3.5-9B)                               |
++------------------------------------------------------------------------------+
+|                                                                              |
+|  Inputs                                                                      |
+|  +----------------+  +----------------+  +----------------+                  |
+|  | History Frames |  | Current Frame  |  |  Instruction   |                  |
+|  | (N panoramas)  |  | (4 dirs, 256^2)|  |    (text)      |                  |
+|  +-------+--------+  +-------+--------+  +-------+--------+                 |
+|          +-------------------+-------------------+                           |
+|                              v                                               |
+|                    +------------------+                                       |
+|                    |   Qwen3.5-9B     |  <- Frozen (optional LoRA)            |
+|                    | (Vision + LLM)   |                                       |
+|                    +--------+---------+                                       |
+|                             |                                                |
+|            +----------------+----------------+                               |
+|            |                |                |                                |
+|     ViT features      LLM features      Text hidden                         |
+|     (16x16, multi-L)  (8x8, multi-L)    states                              |
+|            |                |                |                                |
+|     +------+------+  +-----+------+         |                                |
+|     | DPT-Lite    |  | DPT-Lite   |         |                                |
+|     | Fusion(ViT) |  | Fusion(LLM)|         |                                |
+|     +------+------+  +-----+------+         |                                |
+|            |               |                 |                                |
+|            |         +-----+------+          |                                |
+|            |         |  Coarse    |<---------+                                |
+|            |         |  8x8 + vis |  query_proj(text) x fused_llm            |
+|            |         +-----+------+                                          |
+|            |               |                                                 |
+|      +-----+---------------+---+                                             |
+|      |    Fine Localization    |  ViT features + coarse heatmap + text       |
+|      |    16x16 -> 64x64      |  ConvTranspose decoder                      |
+|      +------------+-----------+                                              |
+|                   |                                                          |
+|            +------+------+                                                   |
+|            |  Heatmaps   |  (N_hist, 4, 64, 64)                             |
+|            | + Visibility |  (N_hist, 4)                                     |
+|            +-------------+                                                   |
+|                                                                              |
+|  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -                |
+|  LLM Projector: 4096 -> 1024                                                |
+|            |                                                                 |
+|   +--------+---------+                                                       |
+|   v                  v                                                       |
+|  +--------------+ +--------------+                                           |
+|  | Trajectory   | |  Progress    |                                           |
+|  | (Transformer | |    (MLP)     |                                           |
+|  |  + DDPM)     | |              |                                           |
+|  +------+-------+ +------+-------+                                           |
+|         v                v                                                   |
+|     [24, 3]           [0, 1]                                                 |
+|    (x, y, theta)     progress                                                |
+|                                                                              |
++------------------------------------------------------------------------------+
 ```
 
-**训练模式：**
-- **标准模式**: 逐样本处理
-- **Sequence Packing**: 多样本打包成单一长序列 (FlashAttention Varlen)
+**Training Strategies:**
 
-**预测头输出：**
-| 预测头 | 输出维度 | 方法 |
-|:-------|:---------|:-----|
-| History Heatmap | [B, 64, 64] | Conditional UNet2D + DDPM |
-| Future Heatmap | [B, 64, 64] | Conditional UNet2D + DDPM |
-| Visibility | [B, 1] | 3层MLP (可选) |
+| Stage | Trainable Modules | Frozen Modules | Description |
+|:------|:------------------|:---------------|:------------|
+| `coarse_to_fine_64` | HeatmapVLN, TransformerActionHead, ProgressHead, LLM Projector | All of Qwen3.5 | ~2M trainable parameters |
+| `heatmap_only_64` | HeatmapVLN, LLM Projector | Everything else | Heatmap-only training (lighter) |
+
+**Prediction Head Outputs:**
+
+| Head | Output Shape | Method |
+|:-----|:-------------|:-------|
+| Heatmap | (N_hist, 4, 64, 64) | Coarse-to-Fine (cosine sim -> ConvTranspose) |
+| Visibility | (N_hist, 4) | MLP (query + coarse heatmap -> binary) |
 | Trajectory | [B, 24, 3] | Transformer Decoder + DDPM |
-| Progress | [B, 1] | 3层MLP |
+| Progress | [B, 1] | 3-layer MLP regression |
 
-### 热力图生成模块
+### Heatmap Generation Module
 
-基于条件扩散模型（Diffusion）生成 64×64 空间热力图，标记历史相机位置在当前观测中的投影分布。支持多种热力图：
-- **历史热力图** (History Heatmap)：历史相机位置在当前视角的投影
-- **未来热力图** (Future Heatmap)：预测的未来位置在当前视角的投影（可选）
-- **多视图热力图** (Multi-view)：4个方向的全景视图热力图
-
-采用**双路径条件注入**架构，解决将整个 LLM token 序列压缩为单向量的信息瓶颈：
-
-**架构：**
+Uses a **Coarse-to-Fine** two-stage architecture leveraging multi-layer intermediate features from the frozen Qwen3.5-9B backbone:
 
 ```
-LLM Tokens (B, ~900, 1024)
-    │
-    ├──→ AttentionPooling ──→ global_cond (B, 1024) ──→ FiLM (所有 ResBlock)
-    │                                                      ↓
-    ├──→ LinearProj ──→ seq_cond (B, ~900, 1024) ──→ Cross-Attention
-    │                                                      ↓
-Current Frame(s) → CNN Encoder (ResNet-18/轻量CNN) ──→ img_cond ──→ Fusion
-    │                                                                 ↓
-    │                                                     ConditionalUnet2D
-    │                                                                 ↓
-    │                                                    DDPM + CFG → Heatmap
-    │                                                                 ↓
-    └──→ [可选] Visibility Head → 3层MLP → Visibility Score (是否可见)
+Qwen3.5-9B (frozen)
+    |
+    +-- ViT blocks [6, 12, 18, 24] -> 16x16 features (c_vit=1152)
+    +-- LLM full_attention layers [7, 15, 23] -> 8x8 features (c_llm=4096)
+    +-- Text hidden states -> query vector (c_llm=4096)
+    |
+    +-- DPT-Lite Fusion (ViT) -> 16x16, c_fused=256
+    +-- DPT-Lite Fusion (LLM) -> 8x8, c_fused=256
+    |
+    v Coarse Localization (8x8)
+    query_proj(text) x fused_llm -> cosine similarity -> 8x8 coarse heatmap
+    concat(query, coarse_flat) -> MLP -> visibility logits
+    |
+    v Fine Localization (64x64)
+    FiLM modulation: query -> c_fused, element-wise multiply with ViT features
+    Spatial attention: coarse heatmap 8x8 -> 16x16 as attention prior
+    ConvTranspose decoder: 16x16 -> 32x32 -> 64x64
+    |
+    v Output
+    heatmaps: (N_hist, 4, 64, 64) -- sigmoid activation
+    visibility: (N_hist, 4) -- logits, sigmoid-gated at inference
 ```
 
-**关键技术：**
+**Loss Design (v10):**
 
-| 技术 | 说明 |
-|:-----|:-----|
-| **双路径条件注入** | FiLM (全局向量) + 序列 Cross-Attention (保留完整 LLM token 序列) |
-| **序列 Cross-Attention** | UNet 各空间位置 attend 到完整 LLM 序列，避免信息瓶颈 |
-| **Image Encoder** | CNN (ResNet-18 或轻量 CNN) 编码当前图像，提供像素级空间特征 |
-| **空间特征注入** | CNN 多尺度特征注入 UNet skip connections，解决全局池化导致的空间信息丢失 |
-| **Multi-View 支持** | 360° 全景图：4个方向同时预测，支持 circular_padding 处理边界连续性 |
-| **Multi-Layer Features** | 从 LLM 多层提取特征并融合 (CVPR 2025 最佳实践) |
-| **Classifier-Free Guidance** | 训练时随机丢弃条件，推理时增强引导 (scale=2.0-4.0) |
-| **Focal Loss** | 70% 标准 MSE + 30% 峰值加权，关注关键区域 |
-| **x0 重构损失** | 直接监督输出质量，补充 epsilon loss |
-| **Dice Loss** | treats sparse signal correctly，无背景梯度浪费 |
-| **稀疏性正则化** | L1 正则化，鼓励大部分像素为 0 |
-| **峰值距离损失** | 可微分 Soft-Argmax + NMS，多峰感知优化峰值位置准确度 |
-| **负样本零目标损失** | SNR 门控：只对高质量样本（低时间步）施加零约束 |
-| **可见性预测头** | 3层MLP预测目标是否可见，消除假阳性 |
-| **空间 Softmax 锐化** | 推理后处理，温度 0.1 集中能量到峰值区域 |
-| **LoRA 微调 (可选)** | 对 Qwen3-VL 最后 N 层加 LoRA，增强空间推理能力 |
-| **轨迹增强** | 训练时随机旋转/缩放轨迹，提升泛化能力 |
-| **FGR2R 子指令** | 支持动态子指令，适应子序列采样 |
-| **Sequence Packing** | 批量训练优化，多样本打包成长序列 |
+| Loss | Scope | Description |
+|:-----|:------|:------------|
+| **Visibility BCE** | All samples | `pos_weight=7.0` to correct class imbalance (neg/pos ~ 7:1) |
+| **Softmax CE** | Visible views (~13%) | 4096-pixel classification; inter-pixel competition prevents false positives |
+| **Neg BCE** | Invisible views (~87%) | Per-pixel push-to-zero; provides dense gradient signal |
+| **Coord Loss** | Visible views | Soft-argmax coordinate error; low-weight auxiliary |
 
-### 轨迹预测模块
+At inference, the output is gated as `softmax(logit(sigmoid_heatmap)) * sigmoid(visibility)`, ensuring train-inference semantic alignment.
 
-基于 Transformer Decoder + Diffusion 的 24 步轨迹预测。
+### Trajectory Prediction Module
 
-| 组件 | 输出 | 说明 |
-|:-----|:-----|:-----|
-| `TransformerActionHead` | (x, y, θ) × 24 | Transformer Decoder + DDPM (推荐) |
-| `DiffusionActionHead` | (x, y, θ) × 24 | UNet1D + DDPM (legacy) |
-| `ProgressPredictionHead` | [0, 1] | 3 层 MLP 回归 |
-| `StopHead` | binary | 基于 Focal Loss 的二分类，判断是否到达目标 |
+| Component | Output | Description |
+|:----------|:-------|:------------|
+| `TransformerActionHead` | (x, y, theta) x 24 | Transformer Decoder + DDPM (recommended) |
+| `DiffusionActionHead` | (x, y, theta) x 24 | UNet1D + DDPM (legacy) |
+| `ProgressPredictionHead` | [0, 1] | 3-layer MLP, replaces binary Stop Head |
+| `StopPredictionHead` | binary | Focal Loss based (deprecated) |
 
 ---
 
-## 📂 数据集
+## Dataset
 
-### 数据格式
+### Data Format
 
-支持两种存储格式，通过 `meta.json` 中的 `storage_format` 字段自动识别：
+Two storage formats are supported, automatically detected via the `storage_format` field in `meta.json`:
 
-**格式一：Frames（逐帧文件）**
-
-```
-<data_root>/
-├── train/
-│   └── <scene_id>/
-│       └── clip_000000/
-│           ├── meta.json             # 元信息（见下方字段说明）
-│           ├── poses.json            # T 个 4×4 位姿矩阵
-│           ├── intrinsics.json       # 相机内参（可选）
-│           ├── rgb/                  # RGB 图像序列
-│           │   ├── 000000.jpg        # 单视角：直接存放
-│           │   ├── front/            # 全景模式：按方向分子目录
-│           │   │   └── 000000.jpg
-│           │   ├── right/
-│           │   ├── back/
-│           │   └── left/
-│           ├── depth/                # 深度图序列（可选，用于遮挡检测）
-│           │   └── 000000.npy
-│           ├── actions.npy           # 连续动作 [T, 2] (dx, dy)
-│           └── discrete_actions.npy  # 离散动作 [T]
-└── val_unseen/
-    └── ...
-```
-
-**格式二：Chunks（分块 NPZ，推荐）**
+**Format 1: Frames (per-frame files)**
 
 ```
 <data_root>/
-├── train/
-│   └── <scene_id>/
-│       └── clip_000000/
-│           ├── meta.json             # 元信息（storage_format="chunks"）
-│           ├── intrinsics.json       # 相机内参（可选）
-│           ├── chunks/               # 分块 NPZ 文件
-│           │   ├── chunk_000000.npz  # 每块包含：frame_ids, rgb[/方向], depth[/方向], pose
-│           │   └── chunk_000001.npz
-│           ├── actions.npy           # 连续动作 [T, 2] (dx, dy)
-│           └── discrete_actions.npy  # 离散动作 [T]
-└── val_unseen/
-    └── ...
++-- train/
+|   +-- <scene_id>/
+|       +-- clip_000000/
+|           +-- meta.json             # Metadata
+|           +-- poses.json            # T x 4x4 pose matrices
+|           +-- intrinsics.json       # Camera intrinsics (optional)
+|           +-- rgb/                  # RGB image sequence
+|           |   +-- front/            # Panoramic: subdirectories per direction
+|           |   |   +-- 000000.jpg
+|           |   +-- right/
+|           |   +-- back/
+|           |   +-- left/
+|           +-- depth/                # Depth maps (optional, for occlusion)
+|           |   +-- 000000.npy
+|           +-- actions.npy           # Continuous actions [T, 2] (dx, dy)
+|           +-- discrete_actions.npy  # Discrete actions [T]
++-- val_unseen/
+    +-- ...
 ```
 
-**meta.json 字段说明：**
+**Format 2: Chunks (chunked NPZ, recommended)**
 
-| 字段 | 类型 | 说明 |
-|:-----|:-----|:-----|
-| `num_frames` | int | 总帧数 T |
-| `instruction` | str | 导航指令文本 |
-| `trajectory_id` | int | 轨迹 ID（用于 FGR2R 子指令匹配） |
-| `storage_format` | str | `"frames"` 或 `"chunks"` |
-
-**intrinsics.json 字段说明（可选）：**
-
-```json
-{
-  "width": 640,
-  "height": 480,
-  "K": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
-}
+```
+<data_root>/
++-- train/
+|   +-- <scene_id>/
+|       +-- clip_000000/
+|           +-- meta.json
+|           +-- intrinsics.json
+|           +-- chunks/
+|           |   +-- chunk_000000.npz
+|           |   +-- chunk_000001.npz
+|           +-- actions.npy
+|           +-- discrete_actions.npy
++-- val_unseen/
+    +-- ...
 ```
 
-> **提示：** 若数据根目录下不存在 `train/` 子目录，系统会自动按场景名哈希值划分 90% 训练集 / 10% 验证集。
+**meta.json Fields:**
 
-### 采样策略
+| Field | Type | Description |
+|:------|:-----|:------------|
+| `num_frames` | int | Total number of frames T |
+| `instruction` | str | Navigation instruction text |
+| `trajectory_id` | int | Trajectory ID (for FGR2R sub-instruction matching) |
+| `storage_format` | str | `"frames"` or `"chunks"` |
 
-| 模式 | 数据多样性 | 说明 |
-|:-----|:----------:|:-----|
-| 滑动窗口 | ⭐ | 固定步长遍历 |
-| Clip-level | ⭐⭐ | 每 clip 随机采样 |
-| **随机子序列** | ⭐⭐⭐ | 动态子序列 + 子指令（推荐） |
+### Sampling Strategies
+
+| Strategy | Data Diversity | Description |
+|:---------|:--------------:|:------------|
+| Sliding Window | Low | Fixed-stride traversal |
+| Clip-level | Medium | Random sampling per clip |
+| **Random Subsequence** | High | Dynamic subsequence + sub-instructions (recommended) |
 
 <details>
-<summary>📖 随机子序列采样详解</summary>
+<summary>Random Subsequence Sampling Details</summary>
 
-每 epoch 从同一 clip 生成不同的子序列，大幅增加数据多样性：
+Each epoch generates different subsequences from the same clip, greatly increasing data diversity:
 
 ```
-原始 Clip: [帧0, 帧1, ..., 帧99]
+Original Clip: [Frame 0, Frame 1, ..., Frame 99]
 
-子序列1: [10, 50]  → progress: 0% → 100%
-子序列2: [30, 80]  → progress: 0% → 100%
-子序列3: [5, 70]   → progress: 0% → 100%
+Subsequence 1: [10, 50]  -> progress: 0% -> 100%
+Subsequence 2: [30, 80]  -> progress: 0% -> 100%
+Subsequence 3: [5, 70]   -> progress: 0% -> 100%
 ```
 
-**配置：**
+**Configuration:**
 
 ```yaml
 data:
@@ -468,127 +462,189 @@ data:
     min_subsequence_length: 30
     subsequence_samples_per_clip: 5
     samples_per_clip: 30
-    use_subinstruction: true     # 启用 FGR2R 子指令
-    enable_trajectory_augmentation: true  # 轨迹增强（旋转/缩放）
+    use_subinstruction: true
+    enable_trajectory_augmentation: true
 ```
 
-**数据量计算：**
+**Data volume calculation:**
 
 ```
-每 epoch = clips × subseq × samples = 1000 × 5 × 30 = 150,000 样本
+Per epoch = clips x subseq x samples = 1000 x 5 x 30 = 150,000 samples
 ```
 
 </details>
 
 ---
 
-## ⚙️ 配置说明
+## Configuration
 
-主配置文件：`configs/train_config.yaml`（通用配置）或 `configs/train_heatmap_config.yaml`（热力图专用配置）
+Main config files: `configs/train_config.yaml` (full training) or `configs/train_heatmap_config.yaml` (heatmap-only training)
 
 <details>
-<summary>📋 完整配置示例</summary>
+<summary>Full Configuration Example</summary>
 
 ```yaml
-# 模型配置
+# Model configuration
 model:
-  llm:
-    model_path: ./models/qwen_3_vl
-    attn_implementation: flash_attention_2
-    enable_packing: true          # Sequence Packing 高效训练
-    max_seq_length: 8192
+  type: vln_pipeline
 
-    # LoRA 微调（可选，默认关闭）
+  # Qwen3.5 configuration
+  llm:
+    model_path: ./models/qwen_3.5
+    hidden_dim: 4096
+    token_dim: 1024
+    torch_dtype: bfloat16
+    attn_implementation: sdpa       # or flash_attention_2
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+
+    # LoRA fine-tuning (optional, disabled by default)
     use_lora: false
     lora_rank: 16
     lora_alpha: 32
-    lora_num_layers: 4            # 最后 4 层
+    lora_num_layers: 4
 
-  # 热力图头配置
-  heatmap_head:
-    enable_history: true           # 生成历史位置热力图
-    enable_future: false          # 生成未来位置热力图
-    cond_dim: 1024
-    block_out_channels: [128, 256, 512, 512]
-    attention_levels: [1, 2, 3]
-    num_inference_steps: 50
-    cfg_drop_prob: 0.15
-    cfg_scale: 2.0
+  # HeatmapVLN v2 Coarse-to-Fine configuration
+  heatmap:
+    enable: true
+    c_vit: 1152                     # ViT hidden dimension (Qwen3.5)
+    c_llm: 4096                     # LLM hidden dimension
+    c_fused: 256                    # DPT-Lite fusion output dim
+    vit_layer_indices: [6, 12, 18, 24]    # ViT blocks to hook
+    llm_layer_indices: [7, 15, 23]        # LLM full_attention layers
+    heatmap_size: [64, 64]
+    # Loss weights
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_peak: 1.0
 
-    # 双路径条件注入
-    use_image_encoder: true             # CNN 编码当前图像
-    use_spatial_injection: true         # CNN 多尺度特征注入 skip connections
-    use_sequence_conditioning: true     # 序列级 Cross-Attention
-    seq_cross_attn_heads: 8
-    seq_cross_attn_head_dim: 64
-
-    # 可见性预测头
-    use_visibility_head: true
-    visibility_loss_weight: 1.0
-    visibility_threshold: 0.7
-
-    # 推理后处理
-    sharpen_temperature: 0.1            # 空间 Softmax 锐化
-
-    # 损失函数权重
-    x0_loss_weight: 1.0                  # x0 重构损失
-    sparsity_loss_weight: 0.5           # L1 稀疏性正则化
-    peak_distance_loss_weight: 2.0      # 可微分峰值距离损失
-    negative_sample_weight: 0.3         # 负样本权重
-
-  # 动作头配置
+  # Transformer action head configuration
   action_head:
     enable: true
-    type: transformer                   # transformer (推荐) 或 legacy
+    type: transformer
+    transformer:
+      vlm_token_dim: 1024
+      n_emb: 384
+      predict_size: 24              # 24-step prediction
+      n_layer: 16
+      n_head: 6
+      n_cond_layers: 4
+      action_dim: 3                 # (x, y, theta)
+      num_train_timesteps: 20
+      causal_attn: true
 
-    # 停止预测头
-    stop_head:
-      enable: true
-
-  # 进度预测头
+  # Progress prediction head
   progress_head:
     enable: true
+    hidden_dim: 512
+    dropout: 0.3
 
-# 优化器配置
+  # Stop prediction head (deprecated)
+  stop_head:
+    enable: false
+
+# Training strategy
+training:
+  stages:
+    - name: coarse_to_fine_64
+      epochs: 10
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
+      train_action: true
+      trainable_modules:
+        - heatmap_vln
+        - transformer_action_head
+        - progress_head
+        - llm_projector
+      frozen_modules:
+        - qwen3_5
+
+# Optimizer configuration
 optim:
-  batch_size: 16
-  grad_accum_steps: 2             # 有效 batch = 32
-  heatmap_lr: 1.0e-4
-  llm_projector_lr: 5.0e-5        # 投影层使用更低 LR
-  lora_lr: 1.0e-5                 # LoRA 使用极低 LR
+  optimizer: adamw
+  learning_rate: 2.0e-4
+  heatmap_lr: 2.0e-4
+  transformer_action_lr: 1.0e-4
+  progress_lr: 1.0e-4
+  llm_projector_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.1
+  batch_size: 4
+  grad_accum_steps: 2               # effective batch = 8
+
+# Loss weights
+loss:
+  heatmap_loss_type: heatmap_vln
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_peak: 1.0
+    lambda_neg: 1.0
+    vis_pos_weight: 7.0
+  heatmap_weight: 1.0
+  trajectory_weight: 1.0
+  progress_weight: 1.0
 ```
 
 </details>
 
 ---
 
-## ❓ 常见问题
+## Training Outputs
+
+Each training run creates an independent `run_<timestamp>/` directory under `log.out_dir`, with a `latest` symlink pointing to the most recent run.
+
+```
+run_YYYYMMDD_HHMMSS/
++-- manifest/           # Config, args, git state, environment info, summary
++-- logs/
+|   +-- train.log       # Training log
+|   +-- metrics.jsonl   # Structured metrics stream
++-- checkpoints/
+|   +-- epoch_001.pth
+|   +-- best.pth
+|   +-- latest.pth
++-- visualizations/     # Train/val heatmap visualizations
++-- plots/              # Training curve plots
++-- tensorboard/        # TensorBoard entry point
+```
+
+See [Training Outputs Documentation](docs/training_outputs.md) for details.
+
+---
+
+## FAQ
 
 <details>
-<summary><b>显存不足 (CUDA OOM)</b></summary>
+<summary><b>Out of Memory (CUDA OOM)</b></summary>
 
-减小 batch size 并增加梯度累积：
+Reduce batch size and increase gradient accumulation:
 
 ```yaml
 optim:
   batch_size: 2
-  grad_accum_steps: 16  # 有效 batch = 32
+  grad_accum_steps: 16  # effective batch = 32
 ```
 
 </details>
 
 <details>
-<summary><b>热力图全黑</b></summary>
+<summary><b>Heatmap is all black</b></summary>
 
-检查 TensorBoard 中 `diag/pred_heatmap_max`：
-- 如果 < 0.1，说明热力图坍缩
-- 确保 `use_image_encoder: true` 和 `use_sequence_conditioning: true` 已启用
-- 检查 `cfg_scale` 是否过高（推荐 2.0-4.0）
+Check `diag/pred_heatmap_max` in TensorBoard:
+- If < 0.1, the heatmap has collapsed
+- Verify the visibility head is working correctly: `vis_pos_weight` should be set to 7.0 to correct class imbalance
+- Ensure neg_loss weight is not too high, which can suppress the positive sample gradient signal
 
 </details>
 
 <details>
-<summary><b>如何恢复训练？</b></summary>
+<summary><b>How to resume training?</b></summary>
 
 ```bash
 python scripts/train.py --config configs/train_config.yaml --auto-resume
@@ -597,49 +653,28 @@ python scripts/train.py --config configs/train_config.yaml --auto-resume
 </details>
 
 <details>
-<summary><b>如何启用/禁用特定预测头？</b></summary>
+<summary><b>How to enable/disable specific prediction heads?</b></summary>
 
 ```yaml
-# 热力图头
 model:
-  heatmap_head:
-    enable_history: true    # 历史热力图
-    enable_future: false    # 未来热力图
+  heatmap:
+    enable: true           # Heatmap
 
-# 动作头
-model:
   action_head:
-    enable: true
-    type: transformer      # transformer (推荐) 或 legacy
+    enable: true           # Trajectory prediction
+    type: transformer      # transformer (recommended) or legacy
 
-# 停止预测头 (legacy，已弃用)
-model:
-  stop_head:
-    enable: true
-
-# 进度预测头
-model:
   progress_head:
-    enable: true
+    enable: true           # Progress prediction
+
+  stop_head:
+    enable: false          # Stop prediction (deprecated, use progress instead)
 ```
 
 </details>
 
 <details>
-<summary><b>Diffusion 训练/推理步数如何配置？</b></summary>
-
-推荐配置（4:1 比例）：
-```yaml
-model:
-  heatmap_head:
-    num_train_timesteps: 200    # 训练步数
-    num_inference_steps: 50     # 推理步数 (训练步数的 1/4)
-```
-
-</details>
-
-<details>
-<summary><b>如何配置 LoRA 微调？</b></summary>
+<summary><b>How to configure LoRA fine-tuning?</b></summary>
 
 ```yaml
 model:
@@ -647,82 +682,95 @@ model:
     use_lora: true
     lora_rank: 16
     lora_alpha: 32
-    lora_num_layers: 4      # 最后 4 层
+    lora_num_layers: 4      # Last 4 layers
 
 optim:
-  lora_lr: 1.0e-5          # LoRA 使用极低学习率
+  lora_lr: 1.0e-5          # Use very low learning rate for LoRA
 ```
 
 </details>
 
 ---
 
-## 📁 项目结构
+## Project Structure
 
 ```
 HeatmapVLN/
-├── configs/
-│   ├── train_config.yaml           # 通用训练配置
-│   └── train_heatmap_config.yaml  # 热力图训练配置
-├── scripts/
-│   ├── train.py                    # 训练脚本
-│   ├── evaluate.py                 # 评估脚本
-│   ├── inference.py                # 推理脚本
-│   ├── eval_heatmap.py             # 热力图专用评估脚本
-│   ├── visualize_heatmap.py       # 热力图可视化脚本
-│   └── visualize_trajectory_heatmaps.py  # 轨迹热力图可视化
-├── src/
-│   ├── data/                       # 数据加载
-│   │   ├── vln_sliding_window_dataset.py  # 滑动窗口 + 轨迹数据集
-│   │   ├── tokenized_dataset.py    # Qwen3-VL tokenization 数据集
-│   │   └── packing_collator.py     # Sequence Packing collator
-│   ├── models/                     # 模型定义
-│   │   ├── pipeline.py             # VLNPipeline 主模块
-│   │   ├── qwen3_vl/               # Qwen3-VL 集成 (含 LoRA 支持)
-│   │   ├── heatmap/                # 热力图模块
-│   │   │   ├── diffusion_heatmap_head.py  # Diffusion 热力图头
-│   │   │   └── diffusion/
-│   │   │       ├── config.py       # 配置 (含序列 Cross-Attention)
-│   │   │       ├── unet2d.py       # UNet2D (双路径条件注入)
-│   │   │       ├── image_encoder.py # 条件编码器 (ResNet-18)
-│   │   │       └── positional_embedding.py
-│   │   └── action/                 # 动作模块
-│   │       ├── transformer_action_head.py  # Transformer DDPM (推荐)
-│   │       ├── diffusion_action_head.py    # UNet1D DDPM (legacy)
-│   │       ├── progress_head.py     # 进度预测头
-│   │       ├── stop_head.py         # 停止预测头
-│   │       └── utils.py
-│   └── utils/                      # 工具函数
-│       ├── gpu_heatmap.py           # GPU 热力图计算
-│       ├── loss.py                  # 损失函数 (Focal, SNR-gated)
-│       ├── notifier.py              # 飞书通知
-│       ├── visualization.py         # 可视化工具
-│       └── frame_vis_utils.py       # 帧可视化工具
-├── docker/                         # Docker 配置
-├── assets/                        # 资源文件
-│   └── architecture.png            # 架构图
-├── requirements.txt
-└── README.md
++-- configs/
+|   +-- train_config.yaml              # Full training config (heatmap+trajectory+progress)
+|   +-- train_heatmap_config.yaml      # Heatmap-only training config
+|   +-- train_heatmap_config_2.yaml    # Heatmap config variant
++-- scripts/
+|   +-- train.py                       # Training script
+|   +-- inference.py                   # Inference script
+|   +-- evaluate.py                    # Evaluation script
+|   +-- eval_heatmap.py                # Heatmap-specific evaluation
+|   +-- visualize_heatmap.py           # Heatmap visualization (4-view panoramic)
+|   +-- visualize_trajectory_heatmaps.py  # Trajectory + BEV visualization
+|   +-- compute_action_stats.py        # Dataset action statistics
++-- src/
+|   +-- data/                          # Data loading
+|   |   +-- vln_sliding_window_dataset.py  # Sliding window + trajectory dataset
+|   |   +-- tokenized_dataset.py       # Qwen3.5 tokenization
+|   |   +-- packing_collator.py        # Sequence packing collator
+|   |   +-- panoramic_tokenized_collator.py  # Panoramic multi-view collator
+|   +-- models/                        # Model definitions
+|   |   +-- pipeline.py                # VLNPipeline main module
+|   |   +-- qwen3_5/                   # Qwen3.5 integration (with LoRA support)
+|   |   |   +-- integration.py         # Model loading & forward pass
+|   |   |   +-- sequence_packing.py    # Sequence packing utilities
+|   |   +-- heatmap/                   # Heatmap module (Coarse-to-Fine)
+|   |   |   +-- heatmap_vln.py         # HeatmapVLN complete model
+|   |   |   +-- heatmap_vln_loss.py    # Multi-component loss functions
+|   |   |   +-- feature_extractor.py   # Hook-based feature extractor
+|   |   |   +-- coarse_localization.py # Coarse localization (8x8 + visibility)
+|   |   |   +-- fine_localization.py   # Fine localization (64x64)
+|   |   |   +-- dpt_lite_fusion.py     # Multi-layer feature fusion
+|   |   |   +-- input_constructor.py   # Input construction & text positioning
+|   |   +-- action/                    # Action module
+|   |       +-- transformer_action_head.py  # Transformer + DDPM (recommended)
+|   |       +-- diffusion_action_head.py    # UNet1D + DDPM (legacy)
+|   |       +-- progress_head.py       # Progress prediction head
+|   |       +-- stop_head.py           # Stop prediction head (deprecated)
+|   |       +-- action_config.py       # Action head configuration
+|   |       +-- diffusion/             # 1D Diffusion submodule
+|   |           +-- conditional_unet1d.py
+|   |           +-- conv1d_components.py
+|   |           +-- positional_embedding.py
+|   +-- utils/                         # Utilities
+|       +-- gpu_heatmap.py             # GPU heatmap computation
+|       +-- loss.py                    # Navigation loss functions
+|       +-- logger.py                  # Logging configuration
+|       +-- notifier.py                # Feishu notification
+|       +-- visualization.py           # Visualization utilities
+|       +-- frame_vis_utils.py         # Frame visualization utilities
+|       +-- html_template.py           # HTML report template
+|       +-- path_utils.py              # Path utilities
+|       +-- plotting_config.py         # Matplotlib configuration
++-- data/
+|   +-- fgr2r/                         # FGR2R sub-instruction data
+|       +-- subinstr_mapping.json.gz
++-- docker/                            # Docker deployment config
++-- docs/                              # Supplementary documentation
+|   +-- loss.md                        # Loss design details
+|   +-- heatmap_loss_strategy.md       # Heatmap loss strategy analysis
+|   +-- training_outputs.md            # Training output directory documentation
++-- assets/
+|   +-- architecture.png
++-- requirements.txt
++-- README.md
 ```
 
 ---
 
-## 🙏 致谢
+## Acknowledgements
 
-- [Qwen3-VL](https://github.com/QwenLM/Qwen-VL) - 视觉语言骨干模型
-- [InternNav](https://github.com/OpenRobotLab/InternNav) - Transformer Action Head 参考实现
-- [Diffusion Policy](https://github.com/real-stanford/diffusion_policy) - 扩散策略参考
-
----
-
-## 📄 许可证
-
-本项目采用 [MIT License](LICENSE) 开源许可证。
+- [Qwen3.5-VL](https://github.com/QwenLM/Qwen-VL) - Vision-language backbone model
+- [InternNav](https://github.com/OpenRobotLab/InternNav) - Transformer Action Head reference implementation
+- [Diffusion Policy](https://github.com/real-stanford/diffusion_policy) - Diffusion policy reference
 
 ---
 
-<div align="center">
+## License
 
-**如果这个项目对你有帮助，请给一个 ⭐ Star！**
-
-</div>
+This project is licensed under the [MIT License](LICENSE).
