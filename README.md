@@ -78,7 +78,7 @@ The core architecture uses a **Coarse-to-Fine** two-stage heatmap generation pip
 - Python 3.11+
 - PyTorch 2.7+
 - CUDA 12.8+
-- 40GB+ GPU memory (A100/H100 recommended)
+- 20GB+ GPU memory 
 
 ### Installation
 
@@ -113,10 +113,10 @@ Download Qwen3.5 model weights:
 
 ```bash
 # From HuggingFace
-huggingface-cli download Qwen/Qwen3.5-VL-9B --local-dir models/qwen_3.5
+huggingface-cli download Qwen/Qwen3.5-9B --local-dir models/qwen_3.5
 
 # Or from ModelScope
-modelscope download Qwen/Qwen3.5-VL-9B --local_dir models/qwen_3.5
+modelscope download Qwen/Qwen3.5-9B --local_dir models/qwen_3.5
 ```
 
 ### Quick Validation
