@@ -14,7 +14,8 @@
 
 - 热力图 backbone 只回答 **WHERE**（目标在哪），用 peak CE 在可见视图上训练
 - vis_head 只回答 **WHETHER**（目标存在吗），用加权 BCE 在所有视图上训练
-- 不可见视图的热力图不施加任何 loss，假阳性抑制完全由 vis_gate 负责
+- vis_head 的 hm_flat 输入做 `.detach()`，防止 vis_loss 梯度干扰 backbone
+- 可选 bootstrap neg_loss（per-pixel BCE）在前几个 epoch 为 backbone 提供密集梯度
 
 ## 训练与推理的语义对齐
 
@@ -29,7 +30,7 @@
 所以 sigmoid 值可能很小（如 0.01），但 softmax 概率分布始终有效。诊断指标看 softmax
 peak ratio（相对均匀分布的倍数），而非 sigmoid max。
 
-## 三项 Loss
+## Loss 组成
 
 ### 1. Visibility BCE（加权）
 
@@ -63,13 +64,26 @@ coord_loss = euclidean_distance(soft_argmax(pred), soft_argmax(gt))
 
 低权重辅助项。
 
+### 4. Bootstrap Neg Loss — 早期密集梯度（可选）
+
+```
+neg_loss = BCEWithLogits(logit(pred_neg), zeros)
+```
+
+- 只作用于 gt_vis = 0 的不可见视图，对每个像素施加 BCE 推向 0
+- 提供密集梯度信号（每个像素都有梯度），帮助随机初始化的 backbone 在早期打破对称性
+- 通过 `bootstrap_epochs` 控制：仅在前 N 个 epoch 激活，之后自动关闭
+- 关闭后完全等价于 v9（backbone 只受 peak CE 驱动）
+
 ## 权重配置
 
 ```yaml
-lambda_vis:      1.0   # visibility BCE
-lambda_peak:     1.0   # softmax CE
-lambda_coord:    0.2   # coordinate loss
-vis_pos_weight:  7.0   # visibility BCE pos_weight
+lambda_vis:        1.0   # visibility BCE
+lambda_peak:       1.0   # softmax CE
+lambda_coord:      0.2   # coordinate loss
+lambda_neg:        1.0   # bootstrap neg_loss（仅前几个 epoch 生效）
+bootstrap_epochs:  4     # neg_loss 生效的 epoch 数（0=禁用）
+vis_pos_weight:    7.0   # visibility BCE pos_weight
 ```
 
 ## 推理输出
@@ -93,17 +107,25 @@ output = probs × sigmoid(visibility)   # 门控后的概率图
 | v6 | CE + L1 magnitude | per-pixel BCE | sigmoid | 不够干净，用 L1 补 CE 盲区 |
 | v7 | Softmax CE | per-pixel BCE | softmax | 训推语义对齐 |
 | v8 | Softmax CE | Uniform CE (KL→uniform) | softmax | 梯度竞争导致坍缩 |
-| **v9** | **Softmax CE** | **无（vis_gate 负责）** | **softmax** | **分工明确：WHERE vs WHETHER** |
+| v9 | Softmax CE | 无（vis_gate 负责） | softmax | 从头训练坍缩 |
+| **v10** | **Softmax CE** | **bootstrap neg_loss + vis_gate** | **softmax** | **解决从头训练坍缩** |
 
-### v8 → v9 变更说明
+### v9 → v10 变更说明
 
-v8 尝试用 Uniform CE 在 softmax 空间铲平不可见视图的输出，但与 peak CE 在
-共享 backbone 参数上产生梯度竞争（87% 推向均匀 vs 13% 推向尖峰），导致模型
-坍缩为全部输出均匀分布。
+v9 从头训练时 backbone 坍缩（hm_peak_loss 停在 ln(4096)），根因分析：
 
-v9 的核心洞察：不应该让热力图同时编码 "目标在哪" 和 "目标存在吗" 两个任务。
-热力图只负责定位（peak CE），可见性判断交给专门的 vis_head（加权 BCE）。
-同时改进了 vis_head：
+1. **梯度密度不足**：peak CE 只在 13% 的可见视图上提供极稀疏梯度（1/4096 像素），
+   随机初始化的 backbone 无法从中学到有效表征
+2. **vis_head 梯度干扰**：vis_head 的 hm_flat 输入未 detach，vis_loss 梯度
+   回传到 backbone 的 query_proj，与 peak CE 的稀疏信号竞争
+
+v10 的两个修复：
+- **hm_flat.detach()**：切断 vis_loss → backbone 梯度通路，消除干扰
+- **bootstrap neg_loss**：在前 N 个 epoch 对不可见视图施加 per-pixel BCE，
+  为 backbone 提供密集梯度（每像素 ~0.5）帮助打破对称性；N 个 epoch 后自动关闭，
+  backbone 只受 peak CE 驱动（等价于 v9 稳态行为）
+
+vis_head 改进（v9 引入，v10 保留）：
 - 输入从 3 个标量统计量（max/mean/std）扩展为完整 8x8 coarse heatmap（64 维）
 - 隐藏层从 128 扩大到 256
 - BCE 加入 pos_weight=7.0 修正类别不平衡

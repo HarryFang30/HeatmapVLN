@@ -6,12 +6,17 @@ Loss for navigation-oriented heatmap prediction:
   1. Visibility BCE (weighted) — classify whether a history view is visible
   2. Softmax Cross-Entropy     — pixel-space classification on visible views
   3. Coordinate loss           — low-weight auxiliary for peak position refinement
+  4. Bootstrap neg_loss        — per-pixel BCE on invisible views (optional,
+     for early-epoch backbone warm-up only; disabled by default)
 
 Design principle: the heatmap backbone only answers "WHERE is the target?"
 (trained with peak CE on visible views only).  The "WHETHER the target
 exists" question is handled entirely by vis_head (trained with weighted
-BCE on all views).  No loss is applied to invisible-view heatmaps — the
-vis_gate suppresses them at inference.
+BCE on all views, gradient detached from backbone).
+
+The optional neg_loss provides dense gradient to the backbone during
+early training (bootstrap phase) to help multi-layer randomly initialized
+weights converge.  It should be disabled after the backbone stabilises.
 """
 
 from typing import Dict, Tuple
@@ -42,6 +47,7 @@ class HeatmapVLNLoss(nn.Module):
         lambda_coord: float = 0.2,
         lambda_kl: float = 0.0,
         lambda_peak: float = 1.0,
+        lambda_neg: float = 0.0,
         temperature: float = 1.0,
         heatmap_size: Tuple[int, int] = (64, 64),
         vis_pos_weight: float = 1.0,
@@ -51,6 +57,7 @@ class HeatmapVLNLoss(nn.Module):
         self.lambda_vis = lambda_vis
         self.lambda_coord = lambda_coord
         self.lambda_peak = lambda_peak
+        self.lambda_neg = lambda_neg
         self.temperature = temperature
         self.heatmap_size = tuple(int(v) for v in heatmap_size)
         self.vis_pos_weight = vis_pos_weight
@@ -185,6 +192,8 @@ class HeatmapVLNLoss(nn.Module):
         gt_vis: torch.Tensor,
         gt_heatmaps: torch.Tensor,
         history_mask: torch.Tensor = None,
+        current_epoch: int = 0,
+        bootstrap_epochs: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -194,6 +203,9 @@ class HeatmapVLNLoss(nn.Module):
             gt_heatmaps:   ``(N_hist, 4, H, W)`` or ``(B, N_hist, 4, H, W)``.
             history_mask:  ``(N_hist,)`` or ``(B, N_hist)``.  Optional mask to
                            exclude padded history positions from all losses.
+            current_epoch: current training epoch (1-based).
+            bootstrap_epochs: number of early epochs to apply neg_loss.
+                              Set to 0 to disable neg_loss entirely.
         """
         device = pred_vis.device
         pred_vis, pred_heatmaps, gt_vis, gt_heatmaps = self._flatten_inputs(
@@ -248,10 +260,32 @@ class HeatmapVLNLoss(nn.Module):
         else:
             coord_loss = torch.tensor(0.0, device=device)
 
+        # (4) Bootstrap neg_loss — per-pixel BCE on invisible views
+        #     Only active during early epochs (current_epoch <= bootstrap_epochs)
+        use_neg = (
+            self.lambda_neg > 0
+            and bootstrap_epochs > 0
+            and current_epoch <= bootstrap_epochs
+        )
+        neg_mask = (~gt_vis.bool())
+        if valid is not None:
+            real_view = valid.unsqueeze(-1).expand_as(neg_mask)
+            neg_mask = neg_mask & real_view
+
+        if use_neg and neg_mask.any():
+            pred_neg = pred_heatmaps[neg_mask]
+            neg_loss = F.binary_cross_entropy_with_logits(
+                torch.logit(pred_neg.clamp(1e-6, 1 - 1e-6)),
+                torch.zeros_like(pred_neg),
+            )
+        else:
+            neg_loss = torch.tensor(0.0, device=device)
+
         total = (
             self.lambda_vis * vis_loss
             + self.lambda_peak * ce_loss
             + self.lambda_coord * coord_loss
+            + (self.lambda_neg * neg_loss if use_neg else 0.0)
         )
 
         return {
@@ -260,4 +294,5 @@ class HeatmapVLNLoss(nn.Module):
             "vis_loss": vis_loss.detach(),
             "coord_loss": coord_loss.detach(),
             "peak_loss": ce_loss.detach(),
+            "neg_loss": neg_loss.detach(),
         }

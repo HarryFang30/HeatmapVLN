@@ -1646,10 +1646,12 @@ def train_one_epoch(
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
         lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
+        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.0),
         temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
         vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
     ).to(device)
+    bootstrap_epochs = cfg.get('loss', {}).get('heatmap_vln', {}).get('bootstrap_epochs', 0)
     hm_loss_fn.set_temperature(
         get_heatmap_temperature(cfg, global_step_offset, total_train_steps)
     )
@@ -1822,6 +1824,8 @@ def train_one_epoch(
                         gt_vis=gt_vis,
                         gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
                         history_mask=hm_history_mask,
+                        current_epoch=epoch,
+                        bootstrap_epochs=bootstrap_epochs,
                     )
                     heatmap_loss = loss_dict['total']
             
@@ -1980,10 +1984,12 @@ def train_one_epoch(
                     )
                 )
                 if isinstance(loss_dict, dict):
+                    neg_str = f" neg={loss_dict.get('neg_loss', 0):.4f}" if loss_dict.get('neg_loss', 0) > 0 else ""
                     logger.info(
                         f"  [HM] peak={loss_dict.get('peak_loss', 0):.4f} "
                         f"vis={loss_dict.get('vis_loss', 0):.4f} "
                         f"coord={loss_dict.get('coord_loss', 0):.4f}"
+                        f"{neg_str}"
                     )
                 if metrics_jsonl_path is not None:
                     step_record = {
@@ -2003,7 +2009,7 @@ def train_one_epoch(
                         },
                     }
                     if isinstance(loss_dict, dict):
-                        for k in ('peak_loss', 'vis_loss', 'coord_loss'):
+                        for k in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):
                             if k in loss_dict:
                                 step_record[f'hm_{k}'] = loss_dict[k].item()
                     if show_gpu_memory:
@@ -2015,7 +2021,7 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 if isinstance(loss_dict, dict):
-                    for k in ('vis_loss', 'coord_loss', 'peak_loss'):
+                    for k in ('vis_loss', 'coord_loss', 'peak_loss', 'neg_loss'):
                         if k in loss_dict:
                             tb_writer.add_scalar(f'train/hm_{k}', loss_dict[k].item(), actual_step)
                 tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
@@ -2519,6 +2525,7 @@ def validate(
             cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
         ),
         lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
+        lambda_neg=0.0,
         temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
         vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
@@ -3705,6 +3712,12 @@ def main():
         
         logger.info("=" * 80)
         logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
+        _bootstrap_ep = cfg.get('loss', {}).get('heatmap_vln', {}).get('bootstrap_epochs', 0)
+        if _bootstrap_ep > 0:
+            if epoch <= _bootstrap_ep:
+                logger.info(f"  [Bootstrap] neg_loss ACTIVE (epoch {epoch}/{_bootstrap_ep})")
+            elif epoch == _bootstrap_ep + 1:
+                logger.info(f"  [Bootstrap] neg_loss DISABLED from this epoch onward")
         logger.info("=" * 80)
         
         epoch_offset = (epoch - 1) * steps_per_epoch
@@ -3852,7 +3865,7 @@ def main():
                 }, global_epoch_counter)
                 
                 # 热力图分项 loss 对比（epoch 级别）
-                for hm_key in ('peak_loss', 'vis_loss', 'coord_loss'):
+                for hm_key in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):
                     val_key = f'val_hm_{hm_key}'
                     if val_key in val_metrics:
                         tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)

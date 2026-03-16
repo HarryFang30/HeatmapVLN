@@ -120,7 +120,7 @@ class CoarseLocalization(nn.Module):
             heatmaps = torch.einsum("bnc,bvhwc->bnvhw", q_norm, v_feat_norm)
 
             if self.vis_head is not None:
-                hm_flat = heatmaps.flatten(-2)
+                hm_flat = heatmaps.flatten(-2).detach()
                 query_expand = history_queries_tensor[:, :, None, :].expand(-1, -1, current_llm_tensor.shape[1], -1)
                 vis_input = torch.cat([query_expand, hm_flat], dim=-1)
                 visibility = self.vis_head(vis_input.reshape(-1, vis_input.shape[-1])).reshape(
@@ -140,7 +140,7 @@ class CoarseLocalization(nn.Module):
         heatmaps = torch.einsum("nc,vhwc->nvhw", q_norm, v_feat_norm)
 
         if self.vis_head is not None:
-            hm_flat = heatmaps.flatten(-2)
+            hm_flat = heatmaps.flatten(-2).detach()
             query_expand = history_queries_tensor[:, None, :].expand(-1, current_llm_tensor.shape[0], -1)
             vis_input = torch.cat([query_expand, hm_flat], dim=-1)
             visibility = self.vis_head(vis_input.reshape(-1, vis_input.shape[-1])).reshape(
