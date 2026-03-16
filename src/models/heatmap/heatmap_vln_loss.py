@@ -258,11 +258,8 @@ class HeatmapVLNLoss(nn.Module):
                 neg_mask = neg_mask & real_view
 
             if neg_mask.any():
-                pred_neg = pred_heatmaps[neg_mask]
-                neg_loss = F.binary_cross_entropy_with_logits(
-                    torch.logit(pred_neg.clamp(1e-6, 1 - 1e-6)),
-                    torch.zeros_like(pred_neg),
-                )
+                pred_neg = pred_heatmaps[neg_mask].float().clamp(max=1 - 1e-6)
+                neg_loss = -torch.log1p(-pred_neg).mean()
             else:
                 neg_loss = torch.tensor(0.0, device=device)
         else:
