@@ -177,7 +177,6 @@ loss:
     lambda_kl: 0.0
     lambda_peak: 1.0
     lambda_neg: 1.0
-    bootstrap_epochs: 4
     temperature: 1.0
     vis_pos_weight: 7.0
     temperature_schedule:

@@ -1640,7 +1640,6 @@ def train_one_epoch(
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
         vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
     ).to(device)
-    bootstrap_epochs = cfg.get('loss', {}).get('heatmap_vln', {}).get('bootstrap_epochs', 0)
     hm_loss_fn.set_temperature(
         get_heatmap_temperature(cfg, global_step_offset, total_train_steps)
     )
@@ -1813,8 +1812,6 @@ def train_one_epoch(
                         gt_vis=gt_vis,
                         gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
                         history_mask=hm_history_mask,
-                        current_epoch=epoch,
-                        bootstrap_epochs=bootstrap_epochs,
                     )
                     heatmap_loss = loss_dict['total']
             
@@ -3643,12 +3640,6 @@ def main():
         
         logger.info("=" * 80)
         logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
-        _bootstrap_ep = cfg.get('loss', {}).get('heatmap_vln', {}).get('bootstrap_epochs', 0)
-        if _bootstrap_ep > 0:
-            if epoch <= _bootstrap_ep:
-                logger.info(f"  [Bootstrap] neg_loss ACTIVE (epoch {epoch}/{_bootstrap_ep})")
-            elif epoch == _bootstrap_ep + 1:
-                logger.info(f"  [Bootstrap] neg_loss DISABLED from this epoch onward")
         logger.info("=" * 80)
         
         epoch_offset = (epoch - 1) * steps_per_epoch
