@@ -244,6 +244,72 @@ python scripts/visualize_heatmap.py --checkpoint /path/to/best.pth --num-samples
 python scripts/visualize_trajectory_heatmaps.py --checkpoint /path/to/best.pth
 ```
 
+### Trajectory Heatmap Visualization (`visualize_trajectory_heatmaps.py`)
+
+This script produces a comprehensive panoramic visualization that shows how the model's heatmap predictions evolve as the agent moves along a trajectory. For each clip, it generates a single wide image where positions are laid out horizontally and the four panoramic views (Front/Right/Back/Left) are tiled side by side.
+
+**How it works:**
+
+1. **Data loading** -- Loads a validation split from `VLNSlidingWindowDataset` (panoramic 4-view format required). Randomly selects `--num-clips` clips and uniformly samples `--frames-per-clip` positions along each clip's trajectory.
+
+2. **Model inference** -- For each sampled position, the script runs HeatmapVLN inference with the current 4-view panorama, sampled history panoramas, and the navigation instruction. It produces per-history-frame heatmaps `(N_hist, 4, 64, 64)` and visibility logits `(N_hist, 4)`.
+
+3. **Aggregation** -- Per-position heatmaps from all history frames are aggregated via element-wise max across the history dimension, yielding a single `(4, 64, 64)` summary per position. The gated output is computed as `softmax(logit(sigmoid_heatmap)) * sigmoid(visibility)`, matching the inference pipeline.
+
+4. **Rendering** -- The output image is composed of horizontal strips stacked vertically:
+
+   | Strip | Content |
+   |:------|:--------|
+   | **Top-Down** (optional) | Bird's-eye view of the navigation map, with the current position highlighted in red, history positions as colored dots, and a direction arrow. Only rendered if `topdown_trajectory.jpg` and `topdown_transform.json` exist in the clip directory. |
+   | **RGB** | The 4-view current observation `(F\|R\|B\|L)` tiled as `4 x tile` pixels per position. |
+   | **GT Heatmap** | Ground truth heatmap (max-aggregated across history), rendered with the `inferno` colormap, globally normalized to `[0, 1]`. |
+   | **Gated** | Model prediction after visibility gating, rendered with per-position normalization so local structure is visible. |
+
+   Positions are separated by yellow vertical bars. The clip name and instruction text appear as the figure title.
+
+**Arguments:**
+
+| Argument | Default | Description |
+|:---------|:--------|:------------|
+| `--checkpoint` | (required) | Path to a training checkpoint `.pth` file. The config and model weights are loaded from it. |
+| `--data-root` | from checkpoint | Override the data root directory. |
+| `--split` | from checkpoint | Override the validation split name (e.g. `val_unseen`). |
+| `--num-clips` | 3 | Number of clips to visualize. |
+| `--frames-per-clip` | 32 | Number of positions to sample per clip (uniformly spaced). |
+| `--output-dir` | `./vis_trajectory` | Directory to save output images. |
+| `--device` | `cuda:0` | Compute device. |
+| `--seed` | 42 | Random seed for clip selection. |
+| `--tile-size` | 80 | Pixel size of each view tile in the output image. |
+| `--attn-impl` | from checkpoint | Override attention implementation (e.g. `sdpa`, `flash_attention_2`). |
+| `--vis-threshold` | None | Hard visibility threshold: views with `sigmoid(vis) < threshold` are zeroed out in the gated output. |
+| `--peak-ratio` | None | Diffuse-filter ratio: views where `max / mean < ratio` are zeroed out, removing overly spread predictions. |
+
+**Example usage:**
+
+```bash
+# Basic: visualize 3 clips, 32 positions each
+python scripts/visualize_trajectory_heatmaps.py \
+  --checkpoint /path/to/best.pth
+
+# Custom: more clips, filter low-confidence predictions
+python scripts/visualize_trajectory_heatmaps.py \
+  --checkpoint /path/to/best.pth \
+  --num-clips 5 \
+  --frames-per-clip 48 \
+  --vis-threshold 0.5 \
+  --peak-ratio 3.0 \
+  --tile-size 120 \
+  --output-dir ./vis_trajectory_filtered
+
+# Use a different data split
+python scripts/visualize_trajectory_heatmaps.py \
+  --checkpoint /path/to/best.pth \
+  --data-root /data/vln_dataset \
+  --split val_seen
+```
+
+**Output:** One `.png` image per clip, saved to `--output-dir`. Each image is a wide horizontal layout showing the agent's trajectory progression from left to right, making it easy to visually verify whether predicted heatmaps track the ground truth along the navigation path.
+
 ---
 
 ## Model Architecture
