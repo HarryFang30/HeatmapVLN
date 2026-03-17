@@ -1,17 +1,16 @@
 seed: 42
 
 # ============================================
-# 数据配置 - 热力图专用训练（2 卡版）
+# 数据配置 - 热力图专用训练（4 卡版）
 # ============================================
 data:
   root: /workspace/heatmap_train_data
   train_split: train
-  # 验证集：使用单独采集的 val_unseen 场景（不从训练数据中分割）
-  val_root: /workspace/val_unseen   # 验证集根目录，不设则用 data.root
-  val_split: all                   # 使用 val_root 时建议 all，表示该目录下全部场景用于验证；若目录内有 val 子目录则可设为 val
+  val_root: /workspace/val_unseen
+  val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 16
+  num_workers: 8
   pin_memory: true
   prefetch_factor: 4
   
@@ -54,7 +53,6 @@ model:
   type: vln_pipeline
   device: cuda
 
-  # Qwen3.5 配置
   llm:
     model_path: ./models/qwen_3.5
     hidden_dim: 4096
@@ -70,7 +68,6 @@ model:
     max_seq_length: 8192
     spatial_merge_size: 2
 
-  # HeatmapVLN v2 Coarse-to-Fine 配置
   heatmap:
     enable: true
     c_vit: 1152
@@ -81,13 +78,11 @@ model:
     heatmap_size: [64, 64]
     image_size: 256
 
-    # 损失权重
     lambda_vis: 1.0
     lambda_coord: 0.2
     lambda_kl: 0.0
     lambda_peak: 1.0
 
-  # 动作头 - 禁用
   action_head:
     enable: false
     type: transformer
@@ -113,14 +108,12 @@ model:
       p_drop_attn: 0.2
       causal_attn: true
 
-  # Progress 预测头 - 禁用
   progress_head:
     enable: false
     hidden_dim: 512
     dropout: 0.3
     concat_state_txt: true
 
-  # Stop 预测头 - 禁用
   stop_head:
     enable: false
     hidden_dim: 512
@@ -132,7 +125,7 @@ model:
 # ============================================
 training:
   stages:
-    - name: heatmap_only_64_2gpu
+    - name: heatmap_only_64_4gpu
       epochs: 8
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
@@ -163,8 +156,8 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.05
   min_lr: 1.0e-6
-  # 注意：DDP 下这里是每个进程 / 每张卡的 local batch size。
-  batch_size: 35
+  # 4 卡 DDP：每卡 local batch size，全局 batch = 18 × 4 = 72
+  batch_size: 18
   grad_accum_steps: 1
 
 # ============================================
@@ -195,7 +188,7 @@ loss:
 # GPU配置
 # ============================================
 gpu:
-  devices: [0, 1]
+  devices: [0, 1, 2, 3]
   backend: nccl
   multi_gpu:
     enabled: true
@@ -215,11 +208,11 @@ log:
   enable_timing: false
   epoch_boundary_cooldown_s: 8
   log_interval: 10
-  show_gpu_memory: false   # 关闭显存/内存日志，只保留最简单日志
+  show_gpu_memory: false
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
-  mid_epoch_save_every: 500    # 每 N 个 batch 保存一次 mid-epoch checkpoint，0 为禁用
+  mid_epoch_save_every: 200
   
   notify:
     enabled: true
