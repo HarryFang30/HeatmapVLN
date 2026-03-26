@@ -37,11 +37,13 @@ data:
     random_subsequence: true
     min_subsequence_length: 30
     subsequence_samples_per_clip: 5
-    predict_horizon: 24
+    predict_horizon: 32
     action_scale: 4.0
     enable_trajectory_augmentation: true
     use_subinstruction: true
     fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
+    load_traj_images: true
+    traj_image_size: [224, 224]
 
 # ============================================
 # 模型配置
@@ -108,7 +110,7 @@ model:
 
     # DualVLN System 1 — NextDiT + Flow Matching + DepthAnythingV2
     nextdit:
-      enabled: false
+      enabled: true
       vlm_hidden_dim: 4096
       latent_emb_size: 768
       n_query: 4
@@ -121,9 +123,12 @@ model:
       num_inference_steps: 10
       guidance_scale: 1.0
       num_sample_trajs: 32
-      dav2_ckpt_path: ""
-      pretrained_system1_path: ""   # e.g. "models/dualvln_system1_pretrained.safetensors"
+      dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
+      pretrained_system1_path: "models/dualvln_system1_pretrained.safetensors"
       enable_gradient_checkpointing: true
+      # 分阶段 warmup: 前 N 步只训练 cond_projector + latent_queries (适配层),
+      # 之后解冻全部 System 1 模块联合训练
+      warmup_steps: 1000
 
   # Progress 预测头配置
   progress_head:
@@ -152,12 +157,14 @@ training:
       train_action: true
       trainable_modules:
         - heatmap_vln          # DPTLiteFusion + FineLocalization (~2M params)
-        - transformer_action_head
+        - nextdit_action_head  # DualVLN System 1 (DiT + MemoryEncoder + QFormer 等)
+        - latent_queries       # System 2 → System 1 桥接 (4 个可学习 token)
         - progress_head
         - llm_projector
       frozen_modules:
         - qwen3_5              # 冻结 VLM 全部参数
         - action_head
+        - transformer_action_head
         - stop_head
 
 # ============================================
@@ -169,6 +176,9 @@ optim:
   heatmap_lr: 2.0e-4
   action_lr: 1.0e-4
   transformer_action_lr: 1.0e-4
+  nextdit_action_lr: 1.0e-4          # DiT/MemoryEncoder/QFormer 等核心模块
+  nextdit_cond_projector_lr: 3.0e-4  # cond_projector 适配层 (更高 lr 加速收敛)
+  latent_queries_lr: 5.0e-4          # latent_queries (更高 lr 加速收敛)
   progress_lr: 1.0e-4
   llm_projector_lr: 1.0e-4
   weight_decay: 1.0e-2

@@ -1316,7 +1316,10 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
     if 'nextdit_action_head' in trainable:
         if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
             freeze_module(model.nextdit_action_head, freeze=False)
-            logger.info("  ✓ Unfrozen: nextdit_action_head")
+            # DINOv2 backbone must stay frozen (pretrained feature extractor)
+            if hasattr(model.nextdit_action_head, 'rgb_model'):
+                model.nextdit_action_head.rgb_model.requires_grad_(False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head (rgb_model kept frozen)")
     
     # Latent Queries (DualVLN System 2 → System 1 bridge)
     if 'latent_queries' in trainable:
@@ -1358,6 +1361,58 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
                 logger.info(f"  ✓ Unfrozen: qwen3_5 LoRA ({lora_count} parameter tensors)")
             else:
                 logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
+
+
+def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: Dict, logger) -> int:
+    """
+    Apply warmup freeze: only cond_projector + latent_queries are trainable,
+    the rest of nextdit_action_head is frozen.
+
+    Must be called AFTER build_optimizer (so all params are already registered).
+    Returns warmup_steps (0 if warmup is disabled).
+    """
+    nextdit_cfg = cfg.get('model', {}).get('action_head', {}).get('nextdit', {})
+    warmup_steps = nextdit_cfg.get('warmup_steps', 0)
+    if warmup_steps <= 0:
+        return 0
+    nah = getattr(model, 'nextdit_action_head', None)
+    if nah is None:
+        return 0
+
+    # Freeze everything in nextdit
+    freeze_module(nah, freeze=True)
+    # Unfreeze only cond_projector
+    freeze_module(nah.cond_projector, freeze=False)
+
+    cp_params = sum(p.numel() for p in nah.cond_projector.parameters() if p.requires_grad)
+    lq_params = model.latent_queries.numel() if (
+        hasattr(model, 'latent_queries') and model.latent_queries is not None
+        and model.latent_queries.requires_grad
+    ) else 0
+
+    logger.info(
+        "🔥 NextDiT warmup active: first %d steps only train cond_projector (%s params) "
+        "+ latent_queries (%s params), rest of System 1 frozen",
+        warmup_steps, f"{cp_params:,}", f"{lq_params:,}",
+    )
+    return warmup_steps
+
+
+def end_nextdit_warmup(model: VLNPipeline, logger):
+    """Unfreeze all of nextdit_action_head after warmup completes."""
+    nah = getattr(model, 'nextdit_action_head', None)
+    if nah is None:
+        return
+    freeze_module(nah, freeze=False)
+    # DINOv2 backbone must stay frozen
+    if hasattr(nah, 'rgb_model'):
+        nah.rgb_model.requires_grad_(False)
+
+    trainable = sum(p.numel() for p in nah.parameters() if p.requires_grad)
+    logger.info(
+        "🔓 NextDiT warmup complete: unfrozen all System 1 modules (%s trainable params)",
+        f"{trainable:,}",
+    )
 
 
 def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
@@ -1457,13 +1512,32 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             param_groups.extend(groups)
             print(f"  Param group: transformer_action_head (lr={transformer_action_lr}, wd={default_wd})")
     
-    # NextDiT Action Head (DualVLN System 1)
+    # NextDiT Action Head (DualVLN System 1) — split cond_projector for higher warmup lr
     nextdit_lr = optim_cfg.get('nextdit_action_lr', action_lr)
+    nextdit_cond_lr = optim_cfg.get('nextdit_cond_projector_lr', nextdit_lr * 3)
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
-        groups = get_param_groups_with_wd(model.nextdit_action_head, nextdit_lr, 'nextdit_action_head', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: nextdit_action_head (lr={nextdit_lr}, wd={default_wd})")
+        nah = model.nextdit_action_head
+        # cond_projector: separate group with higher lr
+        cp_groups = get_param_groups_with_wd(nah.cond_projector, nextdit_cond_lr, 'nextdit_cond_projector', default_wd)
+        if cp_groups:
+            param_groups.extend(cp_groups)
+            print(f"  Param group: nextdit_cond_projector (lr={nextdit_cond_lr}, wd={default_wd})")
+        # rest of nextdit (excluding cond_projector and frozen rgb_model)
+        rest_decay, rest_no_decay = [], []
+        cond_proj_ids = {id(p) for p in nah.cond_projector.parameters()}
+        for n, p in nah.named_parameters():
+            if not p.requires_grad or id(p) in cond_proj_ids:
+                continue
+            if 'bias' in n or 'norm' in n.lower() or 'ln' in n.lower():
+                rest_no_decay.append(p)
+            else:
+                rest_decay.append(p)
+        if rest_decay:
+            param_groups.append({'params': rest_decay, 'lr': nextdit_lr, 'weight_decay': default_wd, 'name': 'nextdit_rest_decay'})
+        if rest_no_decay:
+            param_groups.append({'params': rest_no_decay, 'lr': nextdit_lr, 'weight_decay': 0.0, 'name': 'nextdit_rest_no_decay'})
+        if rest_decay or rest_no_decay:
+            print(f"  Param group: nextdit_rest (lr={nextdit_lr}, wd={default_wd})")
     
     # Latent Queries
     if hasattr(model, 'latent_queries') and model.latent_queries is not None:
@@ -1674,6 +1748,7 @@ def train_one_epoch(
     dist_context: Optional[DistributedContext] = None,
     ckpt_manager: Optional['CheckpointManager'] = None,
     mid_epoch_save_every: int = 500,
+    nextdit_warmup_steps: int = 0,
 ) -> Dict[str, float]:
     """训练一个 epoch"""
     dist_context = dist_context or DistributedContext(
@@ -2021,9 +2096,16 @@ def train_one_epoch(
             if enable_timing:
                 timing_stats['optimizer_s'] += time.perf_counter() - opt_start
             global_step += 1
+
+            # NextDiT warmup → full training transition
+            abs_step = global_step_offset + global_step
+            if nextdit_warmup_steps > 0 and abs_step == nextdit_warmup_steps:
+                end_nextdit_warmup(model_module, logger)
+                trainable_params = _get_trainable_params(model_module)
+
             current_heatmap_temperature = get_heatmap_temperature(
                 cfg,
-                global_step_offset + global_step,
+                abs_step,
                 total_train_steps,
             )
             hm_loss_fn.set_temperature(current_heatmap_temperature)
@@ -2467,10 +2549,17 @@ def train_one_epoch(
         if ema is not None:
             ema.update()
         global_step += 1
+
+        # NextDiT warmup → full training transition
+        abs_step2 = global_step_offset + global_step
+        if nextdit_warmup_steps > 0 and abs_step2 == nextdit_warmup_steps:
+            end_nextdit_warmup(model_module, logger)
+            trainable_params = _get_trainable_params(model_module)
+
         hm_loss_fn.set_temperature(
             get_heatmap_temperature(
                 cfg,
-                global_step_offset + global_step,
+                abs_step2,
                 total_train_steps,
             )
         )
@@ -3662,6 +3751,10 @@ def main():
     
     # 构建优化器和调度器
     optimizer = build_optimizer(raw_model, cfg, stage_cfg)
+
+    # NextDiT warmup: freeze non-adapter parts AFTER optimizer registration
+    nextdit_warmup_steps = apply_nextdit_warmup_freeze(raw_model, cfg, logger)
+
     grad_accum_steps = cfg['optim'].get('grad_accum_steps', 1)
     total_batches = len(train_loader) * total_epochs
     total_steps = total_batches // grad_accum_steps
@@ -3775,6 +3868,7 @@ def main():
             dist_context=dist_context,
             ckpt_manager=ckpt_manager,
             mid_epoch_save_every=cfg['log'].get('mid_epoch_save_every', 500),
+            nextdit_warmup_steps=nextdit_warmup_steps,
         )
         
         timer.end_epoch()
