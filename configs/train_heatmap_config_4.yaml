@@ -67,6 +67,11 @@ model:
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_layer_indices: [6, 7, 14, 15, 22, 23]
+    lora_dropout: 0.05
 
   heatmap:
     enable: true
@@ -142,6 +147,7 @@ training:
       trainable_modules:
         - heatmap_vln
         - llm_projector
+        - lora
       frozen_modules:
         - qwen3_5
         - transformer_action_head
@@ -158,6 +164,7 @@ optim:
   heatmap_lr: 1.0e-4
   vis_head_lr: 1.0e-3
   llm_projector_lr: 2.0e-5
+  lora_lr: 1.0e-5
   weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16

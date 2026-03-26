@@ -85,6 +85,7 @@ class Qwen3_5Config:
     lora_rank: int = 16           # LoRA rank
     lora_alpha: int = 32          # LoRA alpha
     lora_num_layers: int = 4      # Number of last LLM layers to apply LoRA
+    lora_layer_indices: Optional[List[int]] = None  # Exact layer indices (overrides lora_num_layers)
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
     enable_internal_profiling: bool = False
@@ -447,11 +448,13 @@ class Qwen3_5Integration(nn.Module):
         else:
             logger.info(f"Detected {num_layers} LLM layers")
         
-        # Apply LoRA to the last N layers
-        lora_layers = list(range(
-            num_layers - self.config.lora_num_layers,
-            num_layers
-        ))
+        if self.config.lora_layer_indices is not None:
+            lora_layers = list(self.config.lora_layer_indices)
+        else:
+            lora_layers = list(range(
+                num_layers - self.config.lora_num_layers,
+                num_layers
+            ))
         
         # 使用配置中的 target_modules，默认 ["q_proj", "v_proj"]
         target_modules = self.config.lora_target_modules or ["q_proj", "v_proj"]

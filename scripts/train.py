@@ -1181,6 +1181,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_layer_indices=llm_cfg.get('lora_layer_indices', None),
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
         

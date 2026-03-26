@@ -70,6 +70,7 @@ class VLNPipelineConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_num_layers: int = 4
+    lora_layer_indices: Optional[List[int]] = None
     lora_dropout: float = 0.05
     lora_target_modules: Optional[List[str]] = None
 
@@ -178,6 +179,7 @@ class VLNPipeline(nn.Module):
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
             lora_num_layers=config.lora_num_layers,
+            lora_layer_indices=config.lora_layer_indices,
             lora_dropout=config.lora_dropout,
             lora_target_modules=config.lora_target_modules,
         )
