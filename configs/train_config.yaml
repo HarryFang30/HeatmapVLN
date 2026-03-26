@@ -4,7 +4,7 @@ seed: 42
 # 数据配置
 # ============================================
 data:
-  root: /root/autodl-tmp/dataset_with_actions
+  root: /workspace/r2r_panoramic_data    # 全景R2R数据 (collect_r2r_panoramic.py 采集)
   train_split: train
   val_split: val_unseen
   image_size: [256, 256]
