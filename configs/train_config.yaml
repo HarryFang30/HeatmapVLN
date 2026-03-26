@@ -122,6 +122,7 @@ model:
       guidance_scale: 1.0
       num_sample_trajs: 32
       dav2_ckpt_path: ""
+      pretrained_system1_path: ""   # e.g. "models/dualvln_system1_pretrained.safetensors"
       enable_gradient_checkpointing: true
 
   # Progress 预测头配置

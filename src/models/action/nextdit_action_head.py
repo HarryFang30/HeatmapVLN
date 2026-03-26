@@ -22,7 +22,8 @@ Inference: Euler ODE solver with Classifier-Free Guidance.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, List
+from pathlib import Path
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
+from safetensors import safe_open
 
 from .nextdit import NextDiTCrossAttn, NextDiTCrossAttnConfig
 from .nextdit import SinusoidalPositionalEncoding, MemoryEncoder, QFormer
@@ -140,6 +142,83 @@ class NextDiTActionHead(nn.Module):
             config.dit_layers, config.dit_dim, config.predict_steps,
             f"{total_params:,}", f"{trainable_params:,}",
         )
+
+    def load_pretrained_system1(
+        self,
+        ckpt_path: str,
+        latent_queries: Optional[nn.Parameter] = None,
+    ) -> Tuple[List[str], List[str], int]:
+        """
+        Load pretrained System 1 weights from extracted DualVLN checkpoint.
+
+        The checkpoint keys use the naming convention of NextDiTActionHead's
+        own sub-modules (e.g. ``traj_dit.*``, ``memory_encoder.*``), plus an
+        optional ``latent_queries`` tensor that lives in the pipeline.
+
+        Tensors whose shapes do not match (e.g. ``cond_projector.0.weight``
+        when vlm_hidden_dim differs) are automatically skipped with a warning.
+
+        Args:
+            ckpt_path: path to ``.safetensors`` file.
+            latent_queries: if provided, try to load ``latent_queries`` from
+                the checkpoint into this parameter (lives in pipeline, not here).
+
+        Returns:
+            (missing_keys, skipped_keys, loaded_count)
+        """
+        ckpt_path = str(ckpt_path)
+        logger.info("Loading System 1 pretrained weights from %s", ckpt_path)
+
+        if ckpt_path.endswith(".safetensors"):
+            f = safe_open(ckpt_path, framework="pt", device="cpu")
+            ckpt_sd = {k: f.get_tensor(k) for k in f.keys()}
+        else:
+            ckpt_sd = torch.load(ckpt_path, map_location="cpu")
+
+        current_sd = self.state_dict()
+        loaded_sd: Dict[str, torch.Tensor] = {}
+        skipped: List[str] = []
+
+        for ckpt_key, ckpt_val in ckpt_sd.items():
+            if ckpt_key == "latent_queries":
+                if latent_queries is not None:
+                    if latent_queries.shape == ckpt_val.shape:
+                        latent_queries.data.copy_(ckpt_val)
+                        logger.info("  Loaded latent_queries %s", tuple(ckpt_val.shape))
+                    else:
+                        skipped.append(
+                            f"latent_queries: ckpt {tuple(ckpt_val.shape)} "
+                            f"vs model {tuple(latent_queries.shape)}"
+                        )
+                continue
+
+            if ckpt_key in current_sd:
+                if current_sd[ckpt_key].shape == ckpt_val.shape:
+                    loaded_sd[ckpt_key] = ckpt_val
+                else:
+                    skipped.append(
+                        f"{ckpt_key}: ckpt {tuple(ckpt_val.shape)} "
+                        f"vs model {tuple(current_sd[ckpt_key].shape)}"
+                    )
+
+        if skipped:
+            logger.warning(
+                "Skipped %d tensors due to shape mismatch:\n  %s",
+                len(skipped), "\n  ".join(skipped),
+            )
+
+        missing, unexpected = self.load_state_dict(loaded_sd, strict=False)
+        real_missing = [k for k in missing if not k.startswith("_")]
+        loaded_count = len(loaded_sd)
+
+        logger.info(
+            "System 1 weight loading complete: loaded=%d, skipped=%d, missing=%d",
+            loaded_count, len(skipped), len(real_missing),
+        )
+        if real_missing:
+            logger.info("  Missing keys (random init): %s", real_missing)
+
+        return real_missing, skipped, loaded_count
 
     @staticmethod
     def _build_dav2_backbone(ckpt_path: str) -> nn.Module:

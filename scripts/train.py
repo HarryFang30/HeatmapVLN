@@ -1242,6 +1242,19 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
     
     model = VLNPipeline(config)
     
+    # Load System 1 pretrained weights (if provided)
+    s1_ckpt = nextdit_cfg.get('pretrained_system1_path', '')
+    if s1_ckpt and model.nextdit_action_head is not None:
+        from pathlib import Path
+        s1_path = Path(s1_ckpt)
+        if s1_path.exists():
+            model.nextdit_action_head.load_pretrained_system1(
+                str(s1_path),
+                latent_queries=model.latent_queries,
+            )
+        else:
+            print(f"⚠ System 1 pretrained weights not found: {s1_path}")
+
     packing_enabled = llm_cfg.get('enable_packing', False)
     if verbose:
         print(f"✅ VLN Pipeline 已构建")
@@ -1257,6 +1270,8 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
             f"llm_layers={heatmap_cfg.get('llm_layer_indices', [7, 15, 23])}"
         )
         print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
+        if s1_ckpt:
+            print(f"   System1 pretrained → {s1_ckpt}")
         print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
         print(f"   StopHead (legacy) → enabled={stop_cfg.get('enable', False)}")
     
