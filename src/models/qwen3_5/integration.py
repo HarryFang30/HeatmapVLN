@@ -757,6 +757,7 @@ class Qwen3_5Integration(nn.Module):
         instruction: Optional[Union[str, List[str]]] = None,
         return_hidden_states: bool = True,
         heatmap_vln: Optional[nn.Module] = None,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
         """Batch forward for panoramic input using one batched Qwen pass."""
         if heatmap_vln is None:
@@ -806,6 +807,7 @@ class Qwen3_5Integration(nn.Module):
             num_histories,
             image_positions_batch=image_positions_batch,
             text_anchors_batch=text_anchors_batch,
+            history_rel_poses=history_rel_poses,
         )
         if self.config.enable_runtime_timing:
             t3 = time.perf_counter()
@@ -827,6 +829,7 @@ class Qwen3_5Integration(nn.Module):
         text_anchor_positions_batch: Optional[List[Dict[int, int]]] = None,
         return_hidden_states: bool = True,
         heatmap_vln: Optional[nn.Module] = None,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
         """Forward already-tokenized panoramic batch through one Qwen pass."""
         if heatmap_vln is None:
@@ -873,6 +876,7 @@ class Qwen3_5Integration(nn.Module):
             num_histories,
             image_positions_batch=image_positions_batch,
             text_anchors_batch=text_anchor_positions_batch,
+            history_rel_poses=history_rel_poses,
         )
         if self.config.enable_runtime_timing:
             t3 = time.perf_counter()
@@ -986,6 +990,7 @@ class Qwen3_5Integration(nn.Module):
         panoramic_num_histories: Optional[List[int]] = None,
         panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
         heatmap_vln: Optional[nn.Module] = None,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Forward pass through Qwen3.5 with batch processing."""
         # Ensure model is loaded
@@ -1004,6 +1009,7 @@ class Qwen3_5Integration(nn.Module):
                     text_anchor_positions_batch=panoramic_text_anchor_positions,
                     return_hidden_states=return_hidden_states,
                     heatmap_vln=heatmap_vln,
+                    history_rel_poses=history_rel_poses,
                 )
             )
         elif current_views is not None and history_panoramas is not None:
@@ -1014,6 +1020,7 @@ class Qwen3_5Integration(nn.Module):
                     instruction=instruction,
                     return_hidden_states=return_hidden_states,
                     heatmap_vln=heatmap_vln,
+                    history_rel_poses=history_rel_poses,
                 )
             )
         else:

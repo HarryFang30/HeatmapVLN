@@ -32,6 +32,7 @@ import torch.nn as nn
 from .input_constructor import construct_input, find_text_anchor_positions
 from .feature_extractor import FeatureExtractor
 from .coarse_localization import CoarseLocalization
+from .trajectory_attention import TrajectoryGuidedAttention
 from .dpt_lite_fusion import DPTLiteFusion
 from .fine_localization import FineLocalization
 
@@ -62,6 +63,7 @@ class HeatmapVLN(nn.Module):
         vit_layer_indices: Optional[List[int]] = None,
         llm_layer_indices: Optional[List[int]] = None,
         enable_runtime_timing: bool = False,
+        trajectory_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
 
@@ -80,6 +82,9 @@ class HeatmapVLN(nn.Module):
         self.enable_runtime_timing = enable_runtime_timing
         self._logged_llm_feature_stats = False
 
+        traj_cfg = trajectory_config or {}
+        self.enable_trajectory = traj_cfg.get("enable", False)
+
         # Freeze Qwen3.5
         for param in self.qwen.parameters():
             param.requires_grad = False
@@ -97,8 +102,20 @@ class HeatmapVLN(nn.Module):
         n_llm_layers = len(llm_layer_indices)
         self.llm_dpt_fusion = DPTLiteFusion(c_llm, c_fused, n_llm_layers)
 
-        # Coarse localisation (query_proj + vis_head)
-        self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
+        # Coarse localisation
+        if self.enable_trajectory:
+            self.coarse = TrajectoryGuidedAttention(
+                c_llm=c_llm,
+                c_fused=c_fused,
+                num_freqs=traj_cfg.get("num_freqs", 16),
+                d_attn=traj_cfg.get("d_attn", c_fused),
+                num_heads=traj_cfg.get("num_heads", 4),
+                num_layers=traj_cfg.get("num_layers", 1),
+                max_spatial_range=traj_cfg.get("max_spatial_range", 10.0),
+            )
+            logger.info("HeatmapVLN: using TrajectoryGuidedAttention (replacing CoarseLocalization)")
+        else:
+            self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
 
         # Fine localisation head
         self.fine = FineLocalization(c_fused, c_llm)
@@ -108,9 +125,10 @@ class HeatmapVLN(nn.Module):
         )
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
-            "vit_layers=%s, llm_layers=%s, trainable=%s",
+            "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, trainable=%s",
             c_vit, c_llm, c_fused,
             vit_layer_indices, llm_layer_indices,
+            self.enable_trajectory,
             f"{trainable:,}",
         )
 
@@ -228,6 +246,7 @@ class HeatmapVLN(nn.Module):
         self,
         inputs: Dict[str, torch.Tensor],
         num_history: int,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Decode heatmaps from the most recent hooked Qwen forward."""
         device = next(self.fine.parameters()).device
@@ -256,6 +275,7 @@ class HeatmapVLN(nn.Module):
             history_queries=history_queries,
             num_history=num_history,
             device=device,
+            history_rel_poses=history_rel_poses,
         )
 
     def decode_from_inputs_batch(
@@ -264,6 +284,7 @@ class HeatmapVLN(nn.Module):
         num_histories: List[int],
         image_positions_batch: Optional[List[Dict[int, Tuple[int, int]]]] = None,
         text_anchors_batch: Optional[List[Dict[int, int]]] = None,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Decode batched panoramic inputs from one shared Qwen forward."""
         device = next(self.fine.parameters()).device
@@ -294,6 +315,7 @@ class HeatmapVLN(nn.Module):
                 history_queries_batch=history_queries_batch,
                 num_histories=num_histories,
                 device=device,
+                history_rel_poses=history_rel_poses,
             )
 
         extracted = self.feat_extractor.extract_batch(
@@ -305,6 +327,7 @@ class HeatmapVLN(nn.Module):
             extracted=extracted,
             num_histories=num_histories,
             device=device,
+            history_rel_poses=history_rel_poses,
         )
 
     def _decode_features(
@@ -314,6 +337,7 @@ class HeatmapVLN(nn.Module):
         history_queries: List[torch.Tensor],
         num_history: int,
         device: torch.device,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Run coarse-to-fine decoding from pre-extracted features."""
         if num_history == 0:
@@ -329,7 +353,13 @@ class HeatmapVLN(nn.Module):
         )
         history_queries_tensor = torch.stack(history_queries, dim=0)
 
-        coarse_results = self.coarse(fused_llm, history_queries_tensor)
+        if self.enable_trajectory:
+            coarse_results = self.coarse(
+                fused_llm, history_queries_tensor,
+                history_rel_poses=history_rel_poses,
+            )
+        else:
+            coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
         all_heatmaps = self.fine(
             vit_fused=fused_vit,
@@ -346,6 +376,7 @@ class HeatmapVLN(nn.Module):
         extracted: List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]],
         num_histories: List[int],
         device: torch.device,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size = len(extracted)
         if batch_size == 0:
@@ -413,7 +444,13 @@ class HeatmapVLN(nn.Module):
             output_layout="hwc",
         )
 
-        coarse_results = self.coarse(fused_llm, history_queries_tensor)
+        if self.enable_trajectory:
+            coarse_results = self.coarse(
+                fused_llm, history_queries_tensor,
+                history_rel_poses=history_rel_poses,
+            )
+        else:
+            coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
         all_heatmaps = self.fine(
             vit_fused=fused_vit,
@@ -437,6 +474,7 @@ class HeatmapVLN(nn.Module):
         history_queries_batch: List[List[torch.Tensor]],
         num_histories: List[int],
         device: torch.device,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         timings: Dict[str, float] = {}
         batch_size = len(history_queries_batch)
@@ -507,7 +545,13 @@ class HeatmapVLN(nn.Module):
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             t_coarse0 = time.perf_counter()
-        coarse_results = self.coarse(fused_llm, history_queries_tensor)
+        if self.enable_trajectory:
+            coarse_results = self.coarse(
+                fused_llm, history_queries_tensor,
+                history_rel_poses=history_rel_poses,
+            )
+        else:
+            coarse_results = self.coarse(fused_llm, history_queries_tensor)
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             timings["decode_coarse_s"] = time.perf_counter() - t_coarse0

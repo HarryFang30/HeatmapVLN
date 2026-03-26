@@ -1569,6 +1569,10 @@ class VLNSlidingWindowDataset(Dataset):
             if history_panoramas is not None:
                 result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
             
+            result["history_rel_poses"] = torch.from_numpy(
+                compute_history_rel_poses(history_poses, current_pose)
+            ).float()                                              # [K, 4]
+
             if self.defer_heatmap_to_gpu:
                 result["history_poses"] = torch.from_numpy(
                     np.stack(history_poses, axis=0)).float()       # [K, 4, 4]
@@ -1625,6 +1629,7 @@ class VLNSlidingWindowDataset(Dataset):
                 "is_stop": 0.0,
                 "text": "",
             }
+        result["history_rel_poses"] = torch.zeros(K_heatmap, 4)
         if self.defer_heatmap_to_gpu:
             result["history_poses"] = torch.zeros(K_heatmap, 4, 4)
             result["current_pose"] = torch.zeros(4, 4)
@@ -1681,6 +1686,41 @@ def create_sliding_window_dataloader(
         pin_memory=pin_memory,
         drop_last=drop_last,
     )
+
+
+def compute_history_rel_poses(
+    history_poses: List[np.ndarray],
+    current_pose: np.ndarray,
+    camera_deg: float = 0,
+) -> np.ndarray:
+    """
+    计算每个历史位置相对于当前位置的位姿 (dx, dy, cos_yaw, sin_yaw)。
+
+    坐标系: 当前机器人坐标系 (x=前, y=左)，通过 get_trajectory_relative_to_frame
+    内部的 T_camera2robot 转换实现。
+
+    Args:
+        history_poses: 历史帧的 4x4 camera-to-world 矩阵列表
+        current_pose:  当前帧的 4x4 camera-to-world 矩阵
+        camera_deg:    相机俯仰角度
+
+    Returns:
+        rel_poses: [K, 4] — (dx, dy, cos_yaw, sin_yaw)
+    """
+    if len(history_poses) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    all_poses = np.stack(
+        [np.array(current_pose, dtype=np.float32)]
+        + [np.array(p, dtype=np.float32) for p in history_poses],
+        axis=0,
+    )
+    rel_xyyaw = get_trajectory_relative_to_frame(all_poses, camera_deg=camera_deg)
+    hist_rel = rel_xyyaw[1:]  # skip current (row 0 == [0, 0, 0])
+    return np.column_stack([
+        hist_rel[:, :2],
+        np.cos(hist_rel[:, 2]),
+        np.sin(hist_rel[:, 2]),
+    ]).astype(np.float32)
 
 
 # ==================== 轨迹处理工具函数（参考 InternNav）====================
@@ -2366,6 +2406,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             if history_panoramas is not None:
                 result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
             
+            result["history_rel_poses"] = torch.from_numpy(
+                compute_history_rel_poses(history_poses, current_pose)
+            ).float()                                              # [K, 4]
+
             if self.defer_heatmap_to_gpu:
                 result["history_poses"] = torch.from_numpy(
                     np.stack(history_poses, axis=0)).float()       # [K, 4, 4]

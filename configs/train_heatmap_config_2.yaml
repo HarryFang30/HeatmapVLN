@@ -11,7 +11,7 @@ data:
   val_split: all                   # 使用 val_root 时建议 all，表示该目录下全部场景用于验证；若目录内有 val 子目录则可设为 val
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 16
+  num_workers: 8
   pin_memory: true
   prefetch_factor: 4
   
@@ -133,7 +133,7 @@ model:
 training:
   stages:
     - name: heatmap_only_64_2gpu
-      epochs: 8
+      epochs: 10
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: true
@@ -219,7 +219,7 @@ log:
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
-  mid_epoch_save_every: 500    # 每 N 个 batch 保存一次 mid-epoch checkpoint，0 为禁用
+  mid_epoch_save_every: 200    # 每 N 个 batch 保存一次 mid-epoch checkpoint，0 为禁用
   
   notify:
     enabled: true
@@ -230,7 +230,7 @@ log:
 # 验证配置
 # ============================================
 validation:
-  eval_every_epochs: 1
+  eval_every_epochs: 2
   save_best_metric: val_total_loss
   patience: 30
   val_inference_batches: 6

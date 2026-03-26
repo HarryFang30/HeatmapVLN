@@ -83,6 +83,14 @@ model:
     lambda_kl: 0.0
     lambda_peak: 1.0
 
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 1
+      max_spatial_range: 10.0
+
   action_head:
     enable: false
     type: transformer

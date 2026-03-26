@@ -10,6 +10,7 @@
 from .heatmap_vln import HeatmapVLN
 from .heatmap_vln_loss import HeatmapVLNLoss
 from .coarse_localization import CoarseLocalization
+from .trajectory_attention import TrajectoryGuidedAttention
 from .dpt_lite_fusion import DPTLiteFusion
 from .fine_localization import FineLocalization
 from .feature_extractor import FeatureExtractor
@@ -21,6 +22,7 @@ __all__ = [
     "HeatmapVLN",
     "HeatmapVLNLoss",
     "CoarseLocalization",
+    "TrajectoryGuidedAttention",
     "DPTLiteFusion",
     "FineLocalization",
     "FeatureExtractor",

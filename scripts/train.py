@@ -1104,6 +1104,18 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         result['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
         result['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
     
+    # 历史帧相对位姿（用于 trajectory-guided attention）
+    if 'history_rel_poses' in batch[0]:
+        max_K_rel = max(s['history_rel_poses'].shape[0] for s in batch)
+        rel_poses_padded = []
+        for s in batch:
+            rp = s['history_rel_poses']
+            if rp.shape[0] < max_K_rel:
+                pad = torch.zeros(max_K_rel - rp.shape[0], rp.shape[1], dtype=rp.dtype)
+                rp = torch.cat([rp, pad], dim=0)
+            rel_poses_padded.append(rp)
+        result['history_rel_poses'] = torch.stack(rel_poses_padded, dim=0)
+    
     return result
 
 
@@ -1161,7 +1173,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
         heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
-        # heatmap_lambda_neg removed (neg_loss deleted)
+        heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
         
         # LoRA configuration
         use_lora=llm_cfg.get('use_lora', False),
@@ -1767,6 +1779,9 @@ def train_one_epoch(
             panoramic_inputs_batch = batch.get('pano_inputs')
             panoramic_num_histories = batch.get('pano_num_histories')
             panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
+            history_rel_poses = batch.get('history_rel_poses')
+            if history_rel_poses is not None:
+                history_rel_poses = history_rel_poses.to(device, non_blocking=True)
             if panoramic_inputs_batch is not None and not train_action:
                 video_frames = current_frame.unsqueeze(1)
             else:
@@ -1784,6 +1799,7 @@ def train_one_epoch(
                 panoramic_inputs=panoramic_inputs_batch,
                 panoramic_num_histories=panoramic_num_histories,
                 panoramic_text_anchor_positions=panoramic_text_anchor_positions,
+                history_rel_poses=history_rel_poses,
                 return_heatmaps=True,
                 return_actions=train_action,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
@@ -2514,6 +2530,9 @@ def validate(
                 panoramic_inputs_batch = batch.get('pano_inputs')
                 panoramic_num_histories = batch.get('pano_num_histories')
                 panoramic_text_anchor_positions = batch.get('pano_text_anchor_positions')
+                history_rel_poses = batch.get('history_rel_poses')
+                if history_rel_poses is not None:
+                    history_rel_poses = history_rel_poses.to(device, non_blocking=True)
                 if panoramic_inputs_batch is not None and not train_action:
                     video_frames = current_frame.unsqueeze(1)
                 else:
@@ -2531,6 +2550,7 @@ def validate(
                     panoramic_inputs=panoramic_inputs_batch,
                     panoramic_num_histories=panoramic_num_histories,
                     panoramic_text_anchor_positions=panoramic_text_anchor_positions,
+                    history_rel_poses=history_rel_poses,
                     return_heatmaps=True,
                     return_actions=train_action,
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,

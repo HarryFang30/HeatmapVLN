@@ -79,6 +79,7 @@ class VLNPipelineConfig:
     heatmap_vit_layer_indices: Optional[List[int]] = None   # e.g. [6, 12, 18, 24]
     heatmap_llm_layer_indices: Optional[List[int]] = None  # e.g. [7, 15, 23] (full_attention)
     heatmap_size: Tuple[int, int] = (64, 64)
+    heatmap_trajectory_config: Optional[Dict[str, Any]] = None
 
     # HeatmapVLNLoss weights
     heatmap_lambda_vis: float = 1.0
@@ -271,6 +272,8 @@ class VLNPipeline(nn.Module):
         vit_indices = cfg.heatmap_vit_layer_indices or [6, 12, 18, 24]
         llm_indices = cfg.heatmap_llm_layer_indices or [7, 15, 23]
 
+        trajectory_config = getattr(cfg, 'heatmap_trajectory_config', None)
+
         self.heatmap_vln = HeatmapVLN(
             qwen_model=self.qwen3_5.model,
             processor=self.qwen3_5.processor,
@@ -280,6 +283,7 @@ class VLNPipeline(nn.Module):
             vit_layer_indices=vit_indices,
             llm_layer_indices=llm_indices,
             enable_runtime_timing=cfg.enable_runtime_timing,
+            trajectory_config=trajectory_config,
         )
 
         # Move all trainable parts to correct device/dtype
@@ -387,6 +391,7 @@ class VLNPipeline(nn.Module):
         panoramic_inputs: Optional[Dict[str, torch.Tensor]] = None,
         panoramic_num_histories: Optional[List[int]] = None,
         panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
+        history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
         Forward pass.
@@ -430,6 +435,7 @@ class VLNPipeline(nn.Module):
                 panoramic_num_histories=panoramic_num_histories,
                 panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                 heatmap_vln=self.heatmap_vln if use_panoramic_chain else None,
+                history_rel_poses=history_rel_poses,
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
