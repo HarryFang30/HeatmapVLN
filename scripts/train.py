@@ -1135,9 +1135,10 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
     # 确定动作头类型
     action_head_type = action_cfg.get('type', 'transformer')
     
-    # 获取 Legacy 和 Transformer 配置
+    # 获取 Legacy、Transformer 和 NextDiT 配置
     legacy_action_cfg = action_cfg.get('legacy', {})
     transformer_action_cfg = action_cfg.get('transformer', {})
+    nextdit_cfg = action_cfg.get('nextdit', {})
     
     config = VLNPipelineConfig(
         # Qwen3.5
@@ -1208,6 +1209,23 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
         transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
         
+        # NextDiT Action (DualVLN System 1)
+        nextdit_enabled=nextdit_cfg.get('enabled', False),
+        nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 4096),
+        nextdit_latent_emb_size=nextdit_cfg.get('latent_emb_size', 768),
+        nextdit_n_query=nextdit_cfg.get('n_query', 4),
+        nextdit_dit_dim=nextdit_cfg.get('dit_dim', 384),
+        nextdit_dit_layers=nextdit_cfg.get('dit_layers', 12),
+        nextdit_dit_heads=nextdit_cfg.get('dit_heads', 6),
+        nextdit_dit_kv_heads=nextdit_cfg.get('dit_kv_heads', 6),
+        nextdit_predict_steps=nextdit_cfg.get('predict_steps', 32),
+        nextdit_action_dim=nextdit_cfg.get('action_dim', 3),
+        nextdit_num_inference_steps=nextdit_cfg.get('num_inference_steps', 10),
+        nextdit_guidance_scale=nextdit_cfg.get('guidance_scale', 1.0),
+        nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
+        nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
+        nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
+        
         # Stop (Legacy)
         enable_stop_head=stop_cfg.get('enable', False),
         stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
@@ -1277,6 +1295,18 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
         if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
             freeze_module(model.transformer_action_head, freeze=False)
             logger.info("  ✓ Unfrozen: transformer_action_head")
+    
+    # NextDiT Action Head (DualVLN System 1)
+    if 'nextdit_action_head' in trainable:
+        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+            freeze_module(model.nextdit_action_head, freeze=False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head")
+    
+    # Latent Queries (DualVLN System 2 → System 1 bridge)
+    if 'latent_queries' in trainable:
+        if hasattr(model, 'latent_queries') and model.latent_queries is not None:
+            model.latent_queries.requires_grad_(True)
+            logger.info("  ✓ Unfrozen: latent_queries")
     
     # Stop head (Legacy)
     if 'stop_head' in trainable:
@@ -1410,6 +1440,25 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         if groups:
             param_groups.extend(groups)
             print(f"  Param group: transformer_action_head (lr={transformer_action_lr}, wd={default_wd})")
+    
+    # NextDiT Action Head (DualVLN System 1)
+    nextdit_lr = optim_cfg.get('nextdit_action_lr', action_lr)
+    if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+        groups = get_param_groups_with_wd(model.nextdit_action_head, nextdit_lr, 'nextdit_action_head', default_wd)
+        if groups:
+            param_groups.extend(groups)
+            print(f"  Param group: nextdit_action_head (lr={nextdit_lr}, wd={default_wd})")
+    
+    # Latent Queries
+    if hasattr(model, 'latent_queries') and model.latent_queries is not None:
+        latent_q_lr = optim_cfg.get('latent_queries_lr', action_lr)
+        param_groups.append({
+            'params': [model.latent_queries],
+            'lr': latent_q_lr,
+            'weight_decay': 0.0,
+            'name': 'latent_queries',
+        })
+        print(f"  Param group: latent_queries (lr={latent_q_lr}, wd=0)")
     
     # Stop Head (Legacy)
     stop_lr = optim_cfg.get('stop_lr', action_lr)
@@ -1836,12 +1885,26 @@ def train_one_epoch(
             trajectory_loss = torch.tensor(0.0, device=device)
             
             if train_action:
+                # NextDiT Action Head (DualVLN System 1) — highest priority
+                if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
+                    if 'trajectory' in batch and 'traj_hidden_states' in output:
+                        gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
+                        trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
+                        traj_images = batch.get('traj_images')
+                        if traj_images is not None:
+                            traj_images = traj_images.to(device, non_blocking=True)
+                        traj_result = model_module.nextdit_action_head.compute_loss(
+                            output['traj_hidden_states'],
+                            gt_trajectory,
+                            traj_images=traj_images,
+                            trajectory_valid=trajectory_valid,
+                        )
+                        trajectory_loss = traj_result['loss']
                 # Transformer Action Head (new) - 使用 trajectory
-                if hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
+                elif hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
                     if 'trajectory' in batch:
                         gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
                         trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
-                        # 传入完整 llm_tokens 序列
                         traj_result = model_module.transformer_action_head.compute_loss(
                             output['llm_tokens'],
                             gt_trajectory,
@@ -2601,12 +2664,26 @@ def validate(
             trajectory_loss = torch.tensor(0.0, device=device)
             
             if train_action:
+                # NextDiT Action Head (DualVLN System 1) — highest priority
+                if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
+                    if 'trajectory' in batch and 'traj_hidden_states' in output:
+                        gt_trajectory = batch['trajectory'].to(device)
+                        trajectory_valid = batch['trajectory_valid'].to(device)
+                        traj_images = batch.get('traj_images')
+                        if traj_images is not None:
+                            traj_images = traj_images.to(device)
+                        traj_result = model_module.nextdit_action_head.compute_loss(
+                            output['traj_hidden_states'],
+                            gt_trajectory,
+                            traj_images=traj_images,
+                            trajectory_valid=trajectory_valid,
+                        )
+                        trajectory_loss = traj_result['loss']
                 # Transformer Action Head (new) - 使用 trajectory
-                if hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
+                elif hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
                     if 'trajectory' in batch:
                         gt_trajectory = batch['trajectory'].to(device)
                         trajectory_valid = batch['trajectory_valid'].to(device)
-                        # 传入完整 llm_tokens 序列
                         traj_result = model_module.transformer_action_head.compute_loss(
                             output['llm_tokens'],
                             gt_trajectory,
@@ -3256,6 +3333,8 @@ def main():
             predict_horizon=traj_cfg.get('predict_horizon', 24),
             action_scale=traj_cfg.get('action_scale', 4.0),
             enable_trajectory_augmentation=traj_cfg.get('enable_trajectory_augmentation', True),
+            load_traj_images=traj_cfg.get('load_traj_images', False),
+            traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
             # FGR2R 子指令配置
             use_subinstruction=traj_cfg.get('use_subinstruction', False),
             fgr2r_subinstr_path=traj_cfg.get('fgr2r_subinstr_path', None),
@@ -3280,6 +3359,8 @@ def main():
             predict_horizon=traj_cfg.get('predict_horizon', 24),
             action_scale=traj_cfg.get('action_scale', 4.0),
             enable_trajectory_augmentation=False,  # 验证集不增强
+            load_traj_images=traj_cfg.get('load_traj_images', False),
+            traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
             use_subinstruction=False,  # 验证集使用完整指令
         )
     else:

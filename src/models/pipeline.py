@@ -30,6 +30,8 @@ from .action import (
     StopPredictionHead,
     TransformerActionHead,
     ProgressPredictionHead,
+    NextDiTActionHead,
+    NextDiTActionConfig,
 )
 from .heatmap import HeatmapVLN, HeatmapVLNLoss
 
@@ -109,6 +111,23 @@ class VLNPipelineConfig:
     transformer_p_drop_emb: float = 0.1
     transformer_p_drop_attn: float = 0.1
     transformer_causal_attn: bool = True
+
+    # NextDiT action head (DualVLN System 1)
+    nextdit_enabled: bool = False
+    nextdit_vlm_hidden_dim: int = 4096
+    nextdit_latent_emb_size: int = 768
+    nextdit_n_query: int = 4
+    nextdit_dit_dim: int = 384
+    nextdit_dit_layers: int = 12
+    nextdit_dit_heads: int = 6
+    nextdit_dit_kv_heads: int = 6
+    nextdit_predict_steps: int = 32
+    nextdit_action_dim: int = 3
+    nextdit_num_inference_steps: int = 10
+    nextdit_guidance_scale: float = 1.0
+    nextdit_num_sample_trajs: int = 32
+    nextdit_dav2_ckpt_path: str = ""
+    nextdit_enable_gradient_checkpointing: bool = True
 
     # Stop/Progress prediction
     enable_stop_head: bool = False
@@ -190,8 +209,39 @@ class VLNPipeline(nn.Module):
         # ==================== Action Head ====================
         self.action_head = None
         self.transformer_action_head = None
+        self.nextdit_action_head = None
+        self.latent_queries = None
 
-        if config.enable_action_head:
+        if config.nextdit_enabled:
+            nextdit_cfg = NextDiTActionConfig(
+                vlm_hidden_dim=config.nextdit_vlm_hidden_dim,
+                latent_emb_size=config.nextdit_latent_emb_size,
+                n_query=config.nextdit_n_query,
+                dit_dim=config.nextdit_dit_dim,
+                dit_layers=config.nextdit_dit_layers,
+                dit_heads=config.nextdit_dit_heads,
+                dit_kv_heads=config.nextdit_dit_kv_heads,
+                predict_steps=config.nextdit_predict_steps,
+                action_dim=config.nextdit_action_dim,
+                num_inference_steps=config.nextdit_num_inference_steps,
+                guidance_scale=config.nextdit_guidance_scale,
+                num_sample_trajs=config.nextdit_num_sample_trajs,
+                dav2_ckpt_path=config.nextdit_dav2_ckpt_path,
+                enable_gradient_checkpointing=config.nextdit_enable_gradient_checkpointing,
+            )
+            self.nextdit_action_head = NextDiTActionHead(nextdit_cfg).to(
+                device=self.device, dtype=config.dtype,
+            )
+            self.latent_queries = nn.Parameter(
+                torch.randn(1, config.nextdit_n_query, config.nextdit_vlm_hidden_dim) * 0.02
+            )
+            logger.info(
+                "NextDiTActionHead: dit_layers=%d, predict_steps=%d, n_query=%d",
+                config.nextdit_dit_layers,
+                config.nextdit_predict_steps,
+                config.nextdit_n_query,
+            )
+        elif config.enable_action_head:
             if config.action_head_type == "transformer":
                 self.transformer_action_head = TransformerActionHead(
                     vlm_token_dim=config.llm_token_dim,
@@ -423,6 +473,11 @@ class VLNPipeline(nn.Module):
         if should_run_qwen:
             # ==================== Step 1: Qwen3.5 Processing ====================
             qwen_start = time.perf_counter() if self.config.enable_runtime_timing else 0.0
+            lq = None
+            if self.latent_queries is not None:
+                lq = self.latent_queries.expand(batch_size, -1, -1).to(
+                    device=self.device, dtype=self.config.dtype,
+                )
             qwen_output = self.qwen3_5(
                 history_frames=history_frames,
                 current_frame=current_observation,
@@ -436,6 +491,7 @@ class VLNPipeline(nn.Module):
                 panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                 heatmap_vln=self.heatmap_vln if use_panoramic_chain else None,
                 history_rel_poses=history_rel_poses,
+                latent_queries=lq,
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
@@ -471,13 +527,20 @@ class VLNPipeline(nn.Module):
         # ==================== Step 4: Action Generation ====================
         actions = None
         trajectory = None
+        traj_hidden_states = qwen_output.get('traj_hidden_states') if qwen_output is not None else None
         action_cond = llm_tokens.mean(dim=1) if llm_tokens is not None else None
 
-        if return_actions and llm_tokens is not None:
-            if self.transformer_action_head is not None:
+        if return_actions:
+            if self.nextdit_action_head is not None and traj_hidden_states is not None:
+                if not self.training:
+                    traj_images = kwargs.get('traj_images') if 'kwargs' in dir() else None
+                    trajectory = self.nextdit_action_head.get_trajectory(
+                        traj_hidden_states, traj_images=traj_images,
+                    )
+            elif self.transformer_action_head is not None and llm_tokens is not None:
                 if not self.training:
                     trajectory = self.transformer_action_head.get_trajectory(llm_tokens)
-            elif self.action_head is not None:
+            elif self.action_head is not None and action_cond is not None:
                 if not self.training:
                     actions = self.action_head(action_cond)
 
@@ -516,7 +579,14 @@ class VLNPipeline(nn.Module):
         if action_cond is not None:
             output['action_cond'] = action_cond
 
-        if self.transformer_action_head is not None:
+        if traj_hidden_states is not None:
+            output['traj_hidden_states'] = traj_hidden_states
+
+        if self.nextdit_action_head is not None:
+            output['has_nextdit_action_head'] = True
+            if not self.training and trajectory is not None:
+                output['trajectory'] = trajectory
+        elif self.transformer_action_head is not None:
             output['has_transformer_action_head'] = True
             if not self.training and trajectory is not None:
                 output['trajectory'] = trajectory

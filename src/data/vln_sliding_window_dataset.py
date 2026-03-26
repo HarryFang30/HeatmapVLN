@@ -2041,6 +2041,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         predict_horizon: int = 24,
         action_scale: float = 4.0,
         enable_trajectory_augmentation: bool = True,
+        load_traj_images: bool = False,
+        traj_image_size: Tuple[int, int] = (224, 224),
         # FGR2R 子指令配置
         fgr2r_subinstr_path: Optional[str] = None,
         use_subinstruction: bool = False,
@@ -2066,6 +2068,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.predict_horizon = predict_horizon
         self.action_scale = action_scale
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
+        self.load_traj_images = load_traj_images
+        self.traj_image_size = traj_image_size
         
         # 加载 FGR2R 子指令映射表
         self.use_subinstruction = use_subinstruction
@@ -2076,9 +2080,44 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         logger.info(
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
             f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}, "
-            f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}"
+            f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}, "
+            f"load_traj_images={self.load_traj_images}"
         )
     
+    def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int) -> np.ndarray:
+        """Load a single frame as (H, W, 3) uint8 for DualVLN visual memory.
+
+        Uses ``traj_image_size`` (default 224x224) and no colour augmentation
+        so that the DINOv2 backbone gets clean inputs.
+        """
+        clip_idx = self._get_clip_idx(clip_dir)
+        storage_format = self._get_storage_format(clip_idx)
+
+        if storage_format == "chunks":
+            raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction="front")
+            image = self._decode_chunk_rgb(raw, clip_dir, frame_idx)
+        else:
+            dir_name = "front"
+            rgb_candidates = [
+                clip_dir / "rgb" / f"{frame_idx:06d}.jpg",
+                clip_dir / "rgb" / f"{frame_idx:06d}.png",
+                clip_dir / "rgb" / dir_name / f"{frame_idx:06d}.jpg",
+                clip_dir / "rgb" / dir_name / f"{frame_idx:06d}.png",
+            ]
+            rgb_path = next((p for p in rgb_candidates if p.exists()), None)
+            if rgb_path is None:
+                raise FileNotFoundError(f"RGB file not found: clip={clip_dir}, frame={frame_idx:06d}")
+            image = cv2.imread(str(rgb_path))
+            _evict_from_page_cache(rgb_path)
+            if image is None:
+                raise ValueError(f"Failed to load image: {rgb_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        tw, th = self.traj_image_size
+        if image.shape[:2] != (th, tw):
+            image = cv2.resize(image, (tw, th))
+        return image
+
     def _load_fgr2r_mapping(self, fgr2r_path: Optional[str] = None):
         """加载 FGR2R 子指令映射表（支持 .json 和 .json.gz 格式）"""
         import gzip
@@ -2399,6 +2438,20 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 "is_stop": is_stop,                      # float
                 "text": text,                            # str
             }
+
+            # 12. traj_images for DualVLN visual memory [pixel_goal, current]
+            if self.load_traj_images:
+                goal_frame_idx = min(subseq_end - 1, T - 1)
+                try:
+                    goal_img = self._load_traj_image_raw(clip_dir, goal_frame_idx)
+                    curr_img = self._load_traj_image_raw(clip_dir, current_t)
+                except Exception:
+                    th, tw = self.traj_image_size[1], self.traj_image_size[0]
+                    goal_img = np.zeros((th, tw, 3), dtype=np.uint8)
+                    curr_img = np.zeros((th, tw, 3), dtype=np.uint8)
+                traj_imgs = np.stack([goal_img, curr_img], axis=0).astype(np.float32) / 255.0
+                result["traj_images"] = torch.from_numpy(traj_imgs)  # [2, H, W, 3]
+
             if gt_visibility is not None:
                 result["gt_visibility"] = gt_visibility  # [N, 4]
             if current_views is not None:

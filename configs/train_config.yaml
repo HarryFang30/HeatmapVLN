@@ -106,6 +106,24 @@ model:
       p_drop_attn: 0.2
       causal_attn: true
 
+    # DualVLN System 1 — NextDiT + Flow Matching + DepthAnythingV2
+    nextdit:
+      enabled: false
+      vlm_hidden_dim: 4096
+      latent_emb_size: 768
+      n_query: 4
+      dit_dim: 384
+      dit_layers: 12
+      dit_heads: 6
+      dit_kv_heads: 6
+      predict_steps: 32
+      action_dim: 3
+      num_inference_steps: 10
+      guidance_scale: 1.0
+      num_sample_trajs: 32
+      dav2_ckpt_path: ""
+      enable_gradient_checkpointing: true
+
   # Progress 预测头配置
   progress_head:
     enable: true

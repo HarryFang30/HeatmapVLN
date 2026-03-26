@@ -125,6 +125,8 @@ class PanoramicTokenizedCollator:
             result["progress"] = torch.tensor([sample.get("progress", 0.0) for sample in batch])
         if "history_rel_poses" in batch[0]:
             result["history_rel_poses"] = self._stack_padded_first_dim(batch, "history_rel_poses")
+        if "traj_images" in batch[0]:
+            result["traj_images"] = torch.stack([sample["traj_images"] for sample in batch], dim=0)
 
         if do_log:
             rss1 = _rss_mb()

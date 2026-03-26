@@ -662,7 +662,8 @@ class Qwen3_5Integration(nn.Module):
         inputs: Dict[str, torch.Tensor],
         return_hidden_states: bool,
         skip_lm_head: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        latent_queries: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[torch.Tensor]]:
         """Run Qwen on already prepared multimodal inputs.
 
         Args:
@@ -670,44 +671,116 @@ class Qwen3_5Integration(nn.Module):
                 Qwen3_5Model) instead of ``model()`` (ForConditionalGeneration)
                 to avoid the 1-billion-parameter LM head matmul.  Use this
                 when only hooked features are needed (heatmap-only training).
+            latent_queries: (B, n_query, hidden_dim) learnable trajectory
+                query tokens to inject into the VLM sequence.  When provided,
+                dummy pad tokens are appended to ``input_ids`` and a forward
+                pre-hook replaces their embeddings with *latent_queries*
+                before the language model processes the sequence.  The
+                corresponding output hidden states are returned as
+                ``traj_hidden_states``.
         """
-        input_ids = inputs["input_ids"]
-        image_mask = input_ids == self.image_token_id
+        orig_input_ids = inputs["input_ids"]
+        image_mask = orig_input_ids == self.image_token_id
         num_image_tokens = int(image_mask.sum().item())
+
+        n_query = 0
+        hook_handle = None
+        need_hidden = return_hidden_states or (latent_queries is not None)
+
+        if latent_queries is not None:
+            B, n_query, D = latent_queries.shape
+            device = orig_input_ids.device
+
+            pad_id = getattr(self.model.config, 'pad_token_id', None)
+            if pad_id is None:
+                pad_id = getattr(self.model.config.text_config, 'pad_token_id', 0) or 0
+            dummy_ids = torch.full(
+                (B, n_query), pad_id,
+                device=device, dtype=orig_input_ids.dtype,
+            )
+            inputs["input_ids"] = torch.cat([orig_input_ids, dummy_ids], dim=1)
+
+            if "attention_mask" in inputs and inputs["attention_mask"] is not None:
+                mask_ext = torch.ones(
+                    B, n_query, device=device,
+                    dtype=inputs["attention_mask"].dtype,
+                )
+                inputs["attention_mask"] = torch.cat(
+                    [inputs["attention_mask"], mask_ext], dim=1,
+                )
+
+            if "mm_token_type_ids" in inputs and inputs["mm_token_type_ids"] is not None:
+                mm_ext = torch.zeros(
+                    B, n_query, device=device,
+                    dtype=inputs["mm_token_type_ids"].dtype,
+                )
+                inputs["mm_token_type_ids"] = torch.cat(
+                    [inputs["mm_token_type_ids"], mm_ext], dim=1,
+                )
+
+            lq = latent_queries
+            nq = n_query
+
+            def _replace_embeds_hook(module, args, kwargs):
+                embeds = kwargs.get('inputs_embeds')
+                if embeds is not None:
+                    embeds = embeds.clone()
+                    embeds[:, -nq:, :] = lq.to(dtype=embeds.dtype, device=embeds.device)
+                    kwargs = dict(kwargs)
+                    kwargs['inputs_embeds'] = embeds
+                return args, kwargs
+
+            hook_handle = self.model.model.language_model.register_forward_pre_hook(
+                _replace_embeds_hook, with_kwargs=True,
+            )
 
         fwd_kwargs = dict(
             **inputs,
-            output_hidden_states=return_hidden_states,
+            output_hidden_states=need_hidden,
             return_dict=True,
             use_cache=False,
         )
         if self._internal_profiler is not None:
             self._internal_profiler.reset()
 
-        if skip_lm_head:
-            outputs = self.model.model(**fwd_kwargs)
-        else:
-            outputs = self.model(**fwd_kwargs)
+        try:
+            if skip_lm_head:
+                outputs = self.model.model(**fwd_kwargs)
+            else:
+                outputs = self.model(**fwd_kwargs)
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+
         if self._internal_profiler is not None:
             self._last_internal_timings = self._internal_profiler.snapshot()
         else:
             self._last_internal_timings = {}
 
-        if return_hidden_states:
+        traj_hidden_states = None
+        hidden_states = None
+
+        if need_hidden:
             layer_idx = self.config.hidden_layer_for_features
             if layer_idx == -1:
                 layer_idx = len(outputs.hidden_states) - 1
             hidden_states = outputs.hidden_states[layer_idx]
-        else:
-            hidden_states = None
+
+            if n_query > 0:
+                last_hs = outputs.hidden_states[-1]
+                traj_hidden_states = last_hs[:, -n_query:, :].contiguous()
+                hidden_states = hidden_states[:, :-n_query, :].contiguous()
+
+            if not return_hidden_states:
+                hidden_states = None
 
         vision_hidden_states = None
         if hidden_states is not None:
             vision_hidden_states = self._extract_vision_hidden_states(
-                hidden_states, input_ids,
+                hidden_states, orig_input_ids,
             )
 
-        return hidden_states, vision_hidden_states, num_image_tokens
+        return hidden_states, vision_hidden_states, num_image_tokens, traj_hidden_states
 
     def _forward_single_panorama(
         self,
@@ -738,12 +811,12 @@ class Qwen3_5Integration(nn.Module):
             raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for single-chain decoding.")
 
         if return_hidden_states:
-            hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                 inputs, return_hidden_states,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
 
@@ -791,12 +864,12 @@ class Qwen3_5Integration(nn.Module):
         )
 
         if return_hidden_states:
-            hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                 inputs, return_hidden_states,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
@@ -820,7 +893,7 @@ class Qwen3_5Integration(nn.Module):
             }
             heatmap_output["timings"].update(decode_timings)
             heatmap_output["timings"].update(internal_timings)
-        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs
 
     def _forward_batch_panorama_tokenized(
         self,
@@ -830,7 +903,8 @@ class Qwen3_5Integration(nn.Module):
         return_hidden_states: bool = True,
         heatmap_vln: Optional[nn.Module] = None,
         history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
+        latent_queries: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]], Optional[torch.Tensor]]:
         """Forward already-tokenized panoramic batch through one Qwen pass."""
         if heatmap_vln is None:
             raise RuntimeError("Tokenized panoramic forward requires a HeatmapVLN instance.")
@@ -860,13 +934,13 @@ class Qwen3_5Integration(nn.Module):
         )
 
         if return_hidden_states:
-            hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
-                inputs, return_hidden_states,
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+                inputs, return_hidden_states, latent_queries=latent_queries,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
-                    inputs, False, skip_lm_head=True,
+                hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+                    inputs, False, skip_lm_head=True, latent_queries=latent_queries,
                 )
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         internal_timings = self._consume_internal_timings() if self.config.enable_runtime_timing else {}
@@ -889,7 +963,7 @@ class Qwen3_5Integration(nn.Module):
             }
             heatmap_output["timings"].update(decode_timings)
             heatmap_output["timings"].update(internal_timings)
-        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs
     
     def _forward_batch(
         self,
@@ -972,7 +1046,7 @@ class Qwen3_5Integration(nn.Module):
                 )
                 inputs["video_grid_thw"][:, 0] = 1
 
-        hidden_states, vision_hidden_states, num_image_tokens = self._forward_model_inputs(
+        hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
             inputs, return_hidden_states,
         )
         return hidden_states, vision_hidden_states, num_image_tokens, None
@@ -991,6 +1065,7 @@ class Qwen3_5Integration(nn.Module):
         panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
         heatmap_vln: Optional[nn.Module] = None,
         history_rel_poses: Optional[torch.Tensor] = None,
+        latent_queries: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Forward pass through Qwen3.5 with batch processing."""
         # Ensure model is loaded
@@ -998,11 +1073,12 @@ class Qwen3_5Integration(nn.Module):
             self._load_model()
         
         batch_size = current_views.shape[0] if current_views is not None else history_frames.shape[0]
+        traj_hidden_states = None
 
         if panoramic_inputs is not None:
             if panoramic_num_histories is None:
                 raise ValueError("panoramic_num_histories is required with panoramic_inputs")
-            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hidden_states = (
                 self._forward_batch_panorama_tokenized(
                     panoramic_inputs=panoramic_inputs,
                     num_histories=panoramic_num_histories,
@@ -1010,10 +1086,11 @@ class Qwen3_5Integration(nn.Module):
                     return_hidden_states=return_hidden_states,
                     heatmap_vln=heatmap_vln,
                     history_rel_poses=history_rel_poses,
+                    latent_queries=latent_queries,
                 )
             )
         elif current_views is not None and history_panoramas is not None:
-            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs = (
                 self._forward_batch_panorama(
                     current_views=current_views,
                     history_panoramas=history_panoramas,
@@ -1023,6 +1100,7 @@ class Qwen3_5Integration(nn.Module):
                     history_rel_poses=history_rel_poses,
                 )
             )
+            traj_hidden_states = traj_hs
         else:
             hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
                 self._forward_batch(
@@ -1051,6 +1129,8 @@ class Qwen3_5Integration(nn.Module):
             "generated_text": generated_text,
             "num_image_tokens": num_image_tokens,
         }
+        if traj_hidden_states is not None:
+            result["traj_hidden_states"] = traj_hidden_states
         if heatmap_output is not None:
             result.update(heatmap_output)
         else:

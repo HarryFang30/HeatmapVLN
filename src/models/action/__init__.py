@@ -29,6 +29,7 @@ from .utils import normalize_actions, unnormalize_actions, ActionStats
 from .stop_head import StopPredictionHead, DiscreteActionHead
 from .transformer_action_head import TransformerActionHead, create_transformer_action_head
 from .progress_head import ProgressPredictionHead, create_progress_head
+from .nextdit_action_head import NextDiTActionHead, NextDiTActionConfig
 
 __all__ = [
     # Legacy diffusion action head
@@ -40,6 +41,9 @@ __all__ = [
     # New transformer action head (InternNav style)
     'TransformerActionHead',
     'create_transformer_action_head',
+    # NextDiT action head (DualVLN System 1)
+    'NextDiTActionHead',
+    'NextDiTActionConfig',
     # Stop prediction
     'StopPredictionHead',
     'DiscreteActionHead',
