@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shlex
 import socket
 import subprocess
@@ -136,6 +137,10 @@ def launch_occupy_script(
     if extra_args.strip():
         cmd.extend(shlex.split(extra_args))
     try:
+        # 占卡脚本按 nvidia-smi 的物理 GPU 编号传 --gpu；若继承父进程的
+        # CUDA_VISIBLE_DEVICES，PyTorch 可见卡会重编号，导致与物理号不一致。
+        child_env = os.environ.copy()
+        child_env.pop("CUDA_VISIBLE_DEVICES", None)
         # 新会话，避免监控进程信号误伤子进程；输出丢弃以免管道阻塞
         p = subprocess.Popen(
             cmd,
@@ -143,6 +148,7 @@ def launch_occupy_script(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=child_env,
         )
         logger.info("已启动占卡: pid=%s cmd=%s", p.pid, " ".join(shlex.quote(c) for c in cmd))
         return p
