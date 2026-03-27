@@ -5,10 +5,10 @@
 
 用法示例:
   python scripts/monitor_gpu_idle.py
-  python scripts/monitor_gpu_idle.py --config configs/train_config.yaml --util-max 5 --mem-max-mib 1024
+  python scripts/monitor_gpu_idle.py --util-max 5 --mem-max-mib 2048
   python scripts/monitor_gpu_idle.py --gpus 0,1 --duration-sec 60 --interval-sec 5
 
-未指定 --gpus 时，默认监控配置文件里 gpu.devices；若仍无，则监控本机所有可见 GPU。
+未指定 --gpus 时，默认监控本机 nvidia-smi 可见的全部 GPU；仅 Webhook 从配置文件读取。
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# 默认「显存占用上限」阈值：已用显存 ≤ 此值（MiB）且利用率低时视为可告警的空闲（约 10 GiB）
+DEFAULT_MEM_MAX_MIB = 10 * 1024
 
 try:
     import yaml
@@ -50,14 +53,6 @@ def get_webhook_url(cfg: dict) -> str:
     if not url:
         raise ValueError("配置中 log.notify.webhook_url 为空，无法发送飞书消息")
     return url
-
-
-def get_default_gpu_indices(cfg: dict) -> Optional[List[int]]:
-    gpu = cfg.get("gpu") or {}
-    devices = gpu.get("devices")
-    if isinstance(devices, list) and devices:
-        return [int(x) for x in devices]
-    return None
 
 
 def query_nvidia_smi() -> List[Tuple[int, float, float, float]]:
@@ -126,13 +121,13 @@ def main() -> None:
         "--config",
         type=Path,
         default=default_cfg,
-        help="YAML 配置路径（读取 log.notify.webhook_url 与 gpu.devices）",
+        help="YAML 配置路径（仅读取 log.notify.webhook_url）",
     )
     parser.add_argument(
         "--gpus",
         type=str,
         default="",
-        help="要监控的 GPU 编号，逗号分隔，如 0,1；留空则使用配置文件 gpu.devices 或全部卡",
+        help="要监控的 GPU 编号，逗号分隔，如 0,1；留空则监控本机全部可见 GPU",
     )
     parser.add_argument(
         "--util-max",
@@ -143,8 +138,8 @@ def main() -> None:
     parser.add_argument(
         "--mem-max-mib",
         type=float,
-        default=512.0,
-        help="显存已占用低于该值（MiB）视为空闲，默认 512",
+        default=float(DEFAULT_MEM_MAX_MIB),
+        help=f"显存已占用低于该值（MiB）视为空闲，默认 {DEFAULT_MEM_MAX_MIB}（约 10 GiB）",
     )
     parser.add_argument(
         "--duration-sec",
@@ -171,9 +166,7 @@ def main() -> None:
     if args.gpus.strip():
         watch = [int(x.strip()) for x in args.gpus.split(",") if x.strip()]
     else:
-        watch = get_default_gpu_indices(cfg)
-        if watch is None:
-            watch = []  # 表示全部
+        watch = []  # 空列表表示监控全部可见 GPU
 
     util_max = args.util_max
     mem_max = args.mem_max_mib
