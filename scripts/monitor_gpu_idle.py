@@ -7,8 +7,13 @@
   python scripts/monitor_gpu_idle.py
   python scripts/monitor_gpu_idle.py --util-max 5 --mem-max-mib 2048
   python scripts/monitor_gpu_idle.py --gpus 0,1 --duration-sec 60 --interval-sec 5
+  python scripts/monitor_gpu_idle.py --no-auto-occupy
+  python scripts/monitor_gpu_idle.py --occupy-script /workspace/train.py --occupy-args "--mem max --util 35"
 
 未指定 --gpus 时，默认监控本机 nvidia-smi 可见的全部 GPU；仅 Webhook 从配置文件读取。
+
+飞书发送成功后，可选自动执行占卡脚本（默认 /workspace/train.py，即 --gpu 逗号列表），
+已在占用的 GPU 不会重复拉起进程。
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shlex
 import socket
 import subprocess
 import sys
@@ -23,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 # 默认「显存占用上限」阈值：已用显存 ≤ 此值（MiB）且利用率低时视为可告警的空闲（约 10 GiB）
 DEFAULT_MEM_MAX_MIB = 10 * 1024
@@ -92,6 +98,59 @@ def query_nvidia_smi() -> List[Tuple[int, float, float, float]]:
     return rows
 
 
+def reap_occupy_processes(
+    running: List[Tuple[subprocess.Popen, FrozenSet[int]]],
+) -> None:
+    """移除已结束的占卡子进程。"""
+    alive: List[Tuple[subprocess.Popen, FrozenSet[int]]] = []
+    for p, gpus in running:
+        if p.poll() is None:
+            alive.append((p, gpus))
+        else:
+            logger.info(
+                "占卡进程已结束 pid=%s gpus=%s code=%s",
+                p.pid,
+                sorted(gpus),
+                p.returncode,
+            )
+    running[:] = alive
+
+
+def gpus_covered_by_running(
+    running: List[Tuple[subprocess.Popen, FrozenSet[int]]],
+) -> Set[int]:
+    out: Set[int] = set()
+    for _, gpus in running:
+        out |= set(gpus)
+    return out
+
+
+def launch_occupy_script(
+    script: Path,
+    gpu_ids: List[int],
+    extra_args: str,
+) -> Optional[subprocess.Popen]:
+    """后台启动占卡脚本，返回 Popen；失败返回 None。"""
+    gpu_csv = ",".join(str(i) for i in gpu_ids)
+    cmd: List[str] = [sys.executable, str(script), "--gpu", gpu_csv]
+    if extra_args.strip():
+        cmd.extend(shlex.split(extra_args))
+    try:
+        # 新会话，避免监控进程信号误伤子进程；输出丢弃以免管道阻塞
+        p = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info("已启动占卡: pid=%s cmd=%s", p.pid, " ".join(shlex.quote(c) for c in cmd))
+        return p
+    except OSError as e:
+        logger.error("启动占卡脚本失败: %s", e)
+        return None
+
+
 def send_feishu_text(webhook_url: str, text: str) -> bool:
     body = {"msg_type": "text", "content": {"text": text}}
     data = json.dumps(body).encode("utf-8")
@@ -153,6 +212,24 @@ def main() -> None:
         default=5.0,
         help="采样间隔（秒），默认 5",
     )
+    parser.add_argument(
+        "--auto-occupy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="飞书发送成功后是否启动占卡脚本（默认开启，可用 --no-auto-occupy 关闭）",
+    )
+    parser.add_argument(
+        "--occupy-script",
+        type=Path,
+        default=Path("/workspace/train.py"),
+        help="占卡脚本路径（需支持 --gpu 0,1 这类参数），默认 /workspace/train.py",
+    )
+    parser.add_argument(
+        "--occupy-args",
+        type=str,
+        default="",
+        help='传给占卡脚本的额外参数（shell 分词），例如: --mem max --util 40',
+    )
     args = parser.parse_args()
 
     cfg_path = args.config.resolve()
@@ -175,6 +252,11 @@ def main() -> None:
 
     # gpu_index -> (idle_since_monotonic or None, already_notified_this_streak)
     state: Dict[int, Tuple[Optional[float], bool]] = {}
+    occupy_children: List[Tuple[subprocess.Popen, FrozenSet[int]]] = []
+
+    occupy_script = args.occupy_script.resolve()
+    auto_occupy = args.auto_occupy
+    occupy_extra = args.occupy_args
 
     hostname = socket.gethostname()
     logger.info(
@@ -191,7 +273,15 @@ def main() -> None:
     else:
         logger.info("监控本机全部可见 GPU")
 
+    if auto_occupy:
+        if occupy_script.is_file():
+            logger.info("占卡脚本: %s（飞书成功后将启动空闲 GPU）", occupy_script)
+        else:
+            logger.warning("占卡脚本不存在，将跳过自动占卡: %s", occupy_script)
+
     while True:
+        reap_occupy_processes(occupy_children)
+
         stats = {r[0]: r for r in query_nvidia_smi()}
         if watch:
             indices = watch
@@ -241,6 +331,20 @@ def main() -> None:
             text_plain = "\n".join(lines)
             if send_feishu_text(webhook_url, text_plain):
                 logger.info("已发送飞书通知: %s", [i for i, _, _ in to_notify])
+                if auto_occupy and occupy_script.is_file():
+                    reap_occupy_processes(occupy_children)
+                    want = {i for i, _, _ in to_notify}
+                    busy = gpus_covered_by_running(occupy_children)
+                    to_launch = sorted(want - busy)
+                    if to_launch:
+                        p = launch_occupy_script(occupy_script, to_launch, occupy_extra)
+                        if p is not None:
+                            occupy_children.append((p, frozenset(to_launch)))
+                    elif want <= busy:
+                        logger.info(
+                            "空闲 GPU 已在占卡进程中，跳过拉起: %s",
+                            sorted(want),
+                        )
             else:
                 # 发送失败则允许下次重试
                 for idx, _, _ in to_notify:
