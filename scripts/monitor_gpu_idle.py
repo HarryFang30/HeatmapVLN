@@ -5,12 +5,16 @@
 
 用法示例:
   python scripts/monitor_gpu_idle.py
-  python scripts/monitor_gpu_idle.py --util-max 5 --mem-max-mib 2048
+  python scripts/monitor_gpu_idle.py --util-max 5 --mem-max-ratio 0.05
   python scripts/monitor_gpu_idle.py --gpus 0,1 --duration-sec 60 --interval-sec 5
+  python scripts/monitor_gpu_idle.py --ignore-compute-procs   # 仅看 util+显存比例（易误判训练中停顿）
   python scripts/monitor_gpu_idle.py --no-auto-occupy
   python scripts/monitor_gpu_idle.py --occupy-script /workspace/train.py --occupy-args "--mem max --util 35"
 
 未指定 --gpus 时，默认监控本机 nvidia-smi 可见的全部 GPU；仅 Webhook 从配置文件读取。
+
+空闲判定（默认）: 利用率低 + 已用显存占总额比例低 + 无「计算进程」占用足够显存。
+计算进程来自 nvidia-smi compute-apps：训练在读盘/同步时 GPU-Util 常很低，但进程仍占显存，可避免误判。
 
 飞书发送成功后，可选自动执行占卡脚本（默认 /workspace/train.py，即 --gpu 逗号列表），
 已在占用的 GPU 不会重复拉起进程。
@@ -32,8 +36,10 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-# 默认「显存占用上限」阈值：已用显存 ≤ 此值（MiB）且利用率低时视为可告警的空闲（约 10 GiB）
-DEFAULT_MEM_MAX_MIB = 10 * 1024
+# 默认：已用显存 / 总显存 ≤ 该比例视为「显存侧」空闲（如 0.10 = 10%）
+DEFAULT_MEM_MAX_RATIO = 0.10
+# 某 GPU 上所有 compute-app 的 used_gpu_memory 之和超过该值（MiB）则认为有任务在占用（训练中 util 低仍占显存）
+DEFAULT_COMPUTE_PROC_MIN_MIB = 128.0
 
 try:
     import yaml
@@ -62,13 +68,15 @@ def get_webhook_url(cfg: dict) -> str:
     return url
 
 
-def query_nvidia_smi() -> List[Tuple[int, float, float, float]]:
+def query_nvidia_smi() -> Tuple[List[Tuple[int, float, float, float]], Dict[int, str]]:
     """
-    返回 [(index, util_percent, mem_used_mib, mem_total_mib), ...]
+    返回:
+      rows: [(index, util_percent, mem_used_mib, mem_total_mib), ...]
+      index_to_uuid: 用于关联 compute-apps
     """
     cmd = [
         "nvidia-smi",
-        "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+        "--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -81,22 +89,72 @@ def query_nvidia_smi() -> List[Tuple[int, float, float, float]]:
         sys.exit(2)
 
     rows: List[Tuple[int, float, float, float]] = []
+    index_to_uuid: Dict[int, str] = {}
     for line in out.strip().splitlines():
         line = line.strip()
         if not line:
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
         try:
             idx = int(parts[0])
-            util = float(parts[1])
-            mem_used = float(parts[2])
-            mem_total = float(parts[3])
+            uuid = parts[1]
+            util = float(parts[2])
+            mem_used = float(parts[3])
+            mem_total = float(parts[4])
         except ValueError:
             continue
         rows.append((idx, util, mem_used, mem_total))
-    return rows
+        index_to_uuid[idx] = uuid
+    return rows, index_to_uuid
+
+
+def query_compute_app_mem_mib_by_uuid() -> Dict[str, float]:
+    """按 GPU UUID 汇总计算进程占用的显存（MiB）。无进程或查询失败返回空 dict。"""
+    cmd = [
+        "nvidia-smi",
+        "--query-compute-apps=gpu_uuid,used_gpu_memory",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if r.returncode != 0:
+            return {}
+        out = r.stdout or ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+    sums: Dict[str, float] = {}
+    for line in out.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        uuid, mem_s = parts[0], parts[1]
+        try:
+            mem = float(mem_s)
+        except ValueError:
+            continue
+        sums[uuid] = sums.get(uuid, 0.0) + mem
+    return sums
+
+
+def compute_proc_mem_mib_by_index(index_to_uuid: Dict[int, str]) -> Dict[int, float]:
+    by_uuid = query_compute_app_mem_mib_by_uuid()
+    by_index: Dict[int, float] = {}
+    for idx, uuid in index_to_uuid.items():
+        v = by_uuid.get(uuid, 0.0)
+        if v > 0:
+            by_index[idx] = v
+    return by_index
 
 
 def reap_occupy_processes(
@@ -201,10 +259,21 @@ def main() -> None:
         help="利用率低于该值（%%）视为空闲，默认 10",
     )
     parser.add_argument(
-        "--mem-max-mib",
+        "--mem-max-ratio",
         type=float,
-        default=float(DEFAULT_MEM_MAX_MIB),
-        help=f"显存已占用低于该值（MiB）视为空闲，默认 {DEFAULT_MEM_MAX_MIB}（约 10 GiB）",
+        default=DEFAULT_MEM_MAX_RATIO,
+        help="已用显存/总显存 ≤ 该值视为显存侧空闲，默认 0.10（即 10%%）",
+    )
+    parser.add_argument(
+        "--ignore-compute-procs",
+        action="store_true",
+        help="不检查 nvidia-smi 计算进程（仅 util+显存比例；训练中 util 低时更易误判）",
+    )
+    parser.add_argument(
+        "--compute-proc-min-mib",
+        type=float,
+        default=DEFAULT_COMPUTE_PROC_MIN_MIB,
+        help="某 GPU 上 compute-app 显存合计超过该值（MiB）则视为有任务占用，默认 128",
     )
     parser.add_argument(
         "--duration-sec",
@@ -252,7 +321,12 @@ def main() -> None:
         watch = []  # 空列表表示监控全部可见 GPU
 
     util_max = args.util_max
-    mem_max = args.mem_max_mib
+    mem_max_ratio = args.mem_max_ratio
+    if not (0 < mem_max_ratio <= 1.0):
+        logger.error("--mem-max-ratio 应在 (0,1] 内，例如 0.1 表示 10%%")
+        sys.exit(1)
+    check_compute_procs = not args.ignore_compute_procs
+    compute_proc_min_mib = args.compute_proc_min_mib
     need_sec = args.duration_sec
     interval = max(1.0, args.interval_sec)
 
@@ -266,12 +340,13 @@ def main() -> None:
 
     hostname = socket.gethostname()
     logger.info(
-        "开始监控 | 主机=%s | util<=%.1f%% mem_used<=%.0fMiB 持续>=%.0fs | 间隔=%.1fs | 配置=%s",
+        "开始监控 | 主机=%s | util<=%.1f%% mem_used/total<=%.1f%% 持续>=%.0fs | 间隔=%.1fs | 计算进程=%s | 配置=%s",
         hostname,
         util_max,
-        mem_max,
+        mem_max_ratio * 100.0,
         need_sec,
         interval,
+        "开启(合计>%gMiB 视为占用)" % compute_proc_min_mib if check_compute_procs else "关闭",
         cfg_path,
     )
     if watch:
@@ -288,11 +363,16 @@ def main() -> None:
     while True:
         reap_occupy_processes(occupy_children)
 
-        stats = {r[0]: r for r in query_nvidia_smi()}
+        gpu_rows, index_to_uuid = query_nvidia_smi()
+        stats = {r[0]: r for r in gpu_rows}
         if watch:
             indices = watch
         else:
             indices = sorted(stats.keys())
+
+        proc_mem_by_idx: Dict[int, float] = {}
+        if check_compute_procs:
+            proc_mem_by_idx = compute_proc_mem_mib_by_index(index_to_uuid)
 
         now = time.monotonic()
         to_notify: List[Tuple[int, float, float]] = []
@@ -302,7 +382,14 @@ def main() -> None:
                 logger.warning("未找到 GPU %s 的 nvidia-smi 数据，跳过", idx)
                 continue
             _, util, mem_used, mem_total = stats[idx]
-            is_idle = util <= util_max and mem_used <= mem_max
+            mem_ratio = (mem_used / mem_total) if mem_total > 0 else 1.0
+            mem_ok = mem_ratio <= mem_max_ratio
+            util_ok = util <= util_max
+            proc_ok = True
+            if check_compute_procs:
+                proc_sum = proc_mem_by_idx.get(idx, 0.0)
+                proc_ok = proc_sum <= compute_proc_min_mib
+            is_idle = util_ok and mem_ok and proc_ok
 
             prev = state.get(idx, (None, False))
             idle_since, notified = prev
@@ -321,16 +408,24 @@ def main() -> None:
                 state[idx] = (idle_since, True)
 
         if to_notify:
+            cond_proc = (
+                f"且无计算进程显存合计>{compute_proc_min_mib:.0f}MiB"
+                if check_compute_procs
+                else "（未启用计算进程检测）"
+            )
             lines = [
                 f"【GPU 空闲告警】主机 {hostname}",
-                f"条件: 利用率≤{util_max:.1f}% 且 显存占用≤{mem_max:.0f}MiB，已连续超过 {need_sec:.0f} 秒。",
+                f"条件: 利用率≤{util_max:.1f}% 且 已用显存/总显存≤{mem_max_ratio * 100:.1f}% {cond_proc}，已连续超过 {need_sec:.0f} 秒。",
                 f"空闲 GPU 编号: {', '.join(str(i) for i, _, _ in sorted(to_notify))}",
                 "",
             ]
             for idx, util, mem_used in sorted(to_notify):
                 total = stats[idx][3]
+                pct = (100.0 * mem_used / total) if total > 0 else 0.0
+                pm = proc_mem_by_idx.get(idx, 0.0) if check_compute_procs else 0.0
+                extra = f", compute-app 显存合计 {pm:.0f} MiB" if check_compute_procs else ""
                 lines.append(
-                    f"GPU {idx}: 利用率 {util:.1f}%, 显存 {mem_used:.0f}/{total:.0f} MiB"
+                    f"GPU {idx}: 利用率 {util:.1f}%, 显存 {mem_used:.0f}/{total:.0f} MiB ({pct:.1f}%){extra}"
                 )
             lines.append("")
             lines.append(f"配置: {cfg_path}")
