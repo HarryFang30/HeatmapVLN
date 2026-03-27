@@ -13,8 +13,9 @@
 
 未指定 --gpus 时，默认监控本机 nvidia-smi 可见的全部 GPU；仅 Webhook 从配置文件读取。
 
-空闲判定（默认）: 利用率低 + 已用显存占总额比例低 + 无「计算进程」占用足够显存。
-计算进程来自 nvidia-smi compute-apps：训练在读盘/同步时 GPU-Util 常很低，但进程仍占显存，可避免误判。
+空闲判定（默认）: 利用率低 + 已用显存占总额比例低 + 无「训练类计算进程」占用足够显存。
+compute-apps 仅统计进程名匹配白名单正则的条目（默认 python/torchrun/deepspeed 等），
+系统或其它常驻进程占显存不计入，避免挡掉「狙击别人训练脚本」的判定。
 
 飞书发送成功后，可选自动执行占卡脚本（默认 /workspace/train.py，即 --gpu 逗号列表），
 已在占用的 GPU 不会重复拉起进程。
@@ -26,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -38,8 +40,13 @@ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 # 默认：已用显存 / 总显存 ≤ 该比例视为「显存侧」空闲（如 0.10 = 10%）
 DEFAULT_MEM_MAX_RATIO = 0.10
-# 某 GPU 上所有 compute-app 的 used_gpu_memory 之和超过该值（MiB）则认为有任务在占用（训练中 util 低仍占显存）
+# 某 GPU 上「匹配训练类进程名」的 compute-app 显存合计超过该值（MiB）则认为有训练在占用
 DEFAULT_COMPUTE_PROC_MIN_MIB = 128.0
+# 仅将进程名匹配该正则的 compute-app 计入（nvidia-smi 的 process_name，不含路径）
+DEFAULT_COMPUTE_PROC_NAME_REGEX = (
+    r"(?i)(python|torchrun|deepspeed|accelerate|mpiexec|mpirun|horovod|pt_elastic|"
+    r"pt_main_thread|ray::)"
+)
 
 try:
     import yaml
@@ -110,11 +117,16 @@ def query_nvidia_smi() -> Tuple[List[Tuple[int, float, float, float]], Dict[int,
     return rows, index_to_uuid
 
 
-def query_compute_app_mem_mib_by_uuid() -> Dict[str, float]:
-    """按 GPU UUID 汇总计算进程占用的显存（MiB）。无进程或查询失败返回空 dict。"""
+def query_compute_app_mem_mib_by_uuid_filtered(
+    name_pattern: Optional[re.Pattern[str]],
+) -> Dict[str, float]:
+    """
+    按 GPU UUID 汇总 used_gpu_memory（MiB）。
+    name_pattern 为 None 时计入所有 compute-app；否则仅计入 process_name 能匹配 pattern 的条目。
+    """
     cmd = [
         "nvidia-smi",
-        "--query-compute-apps=gpu_uuid,used_gpu_memory",
+        "--query-compute-apps=gpu_uuid,process_name,used_gpu_memory",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -136,9 +148,11 @@ def query_compute_app_mem_mib_by_uuid() -> Dict[str, float]:
         if not line:
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
-        uuid, mem_s = parts[0], parts[1]
+        uuid, proc_name, mem_s = parts[0], parts[1], parts[2]
+        if name_pattern is not None and not name_pattern.search(proc_name):
+            continue
         try:
             mem = float(mem_s)
         except ValueError:
@@ -147,8 +161,11 @@ def query_compute_app_mem_mib_by_uuid() -> Dict[str, float]:
     return sums
 
 
-def compute_proc_mem_mib_by_index(index_to_uuid: Dict[int, str]) -> Dict[int, float]:
-    by_uuid = query_compute_app_mem_mib_by_uuid()
+def compute_proc_mem_mib_by_index(
+    index_to_uuid: Dict[int, str],
+    name_pattern: Optional[re.Pattern[str]],
+) -> Dict[int, float]:
+    by_uuid = query_compute_app_mem_mib_by_uuid_filtered(name_pattern)
     by_index: Dict[int, float] = {}
     for idx, uuid in index_to_uuid.items():
         v = by_uuid.get(uuid, 0.0)
@@ -270,10 +287,21 @@ def main() -> None:
         help="不检查 nvidia-smi 计算进程（仅 util+显存比例；训练中 util 低时更易误判）",
     )
     parser.add_argument(
+        "--count-all-compute-procs",
+        action="store_true",
+        help="compute-apps 不按进程名过滤（系统/驱动占显存也会计入，易与「只盯训练」冲突）",
+    )
+    parser.add_argument(
+        "--compute-proc-name-regex",
+        type=str,
+        default=DEFAULT_COMPUTE_PROC_NAME_REGEX,
+        help="仅统计进程名(process_name)匹配该正则的显存；默认匹配 python/torchrun/deepspeed 等",
+    )
+    parser.add_argument(
         "--compute-proc-min-mib",
         type=float,
         default=DEFAULT_COMPUTE_PROC_MIN_MIB,
-        help="某 GPU 上 compute-app 显存合计超过该值（MiB）则视为有任务占用，默认 128",
+        help="匹配上述正则的 compute-app 显存合计超过该值（MiB）则视为有训练占用，默认 128",
     )
     parser.add_argument(
         "--duration-sec",
@@ -327,6 +355,16 @@ def main() -> None:
         sys.exit(1)
     check_compute_procs = not args.ignore_compute_procs
     compute_proc_min_mib = args.compute_proc_min_mib
+    proc_name_pattern: Optional[re.Pattern[str]] = None
+    if check_compute_procs:
+        if args.count_all_compute_procs:
+            proc_name_pattern = None
+        else:
+            try:
+                proc_name_pattern = re.compile(args.compute_proc_name_regex)
+            except re.error as e:
+                logger.error("无效正则 --compute-proc-name-regex: %s", e)
+                sys.exit(1)
     need_sec = args.duration_sec
     interval = max(1.0, args.interval_sec)
 
@@ -346,9 +384,20 @@ def main() -> None:
         mem_max_ratio * 100.0,
         need_sec,
         interval,
-        "开启(合计>%gMiB 视为占用)" % compute_proc_min_mib if check_compute_procs else "关闭",
+        (
+            "开启(训练类进程显存合计>%gMiB)"
+            % compute_proc_min_mib
+            if check_compute_procs and proc_name_pattern is not None
+            else (
+                "开启(全部进程显存合计>%gMiB)" % compute_proc_min_mib
+                if check_compute_procs
+                else "关闭"
+            )
+        ),
         cfg_path,
     )
+    if check_compute_procs and proc_name_pattern is not None:
+        logger.info("compute-app 进程名正则: %s", args.compute_proc_name_regex)
     if watch:
         logger.info("监控 GPU 索引: %s", watch)
     else:
@@ -372,7 +421,7 @@ def main() -> None:
 
         proc_mem_by_idx: Dict[int, float] = {}
         if check_compute_procs:
-            proc_mem_by_idx = compute_proc_mem_mib_by_index(index_to_uuid)
+            proc_mem_by_idx = compute_proc_mem_mib_by_index(index_to_uuid, proc_name_pattern)
 
         now = time.monotonic()
         to_notify: List[Tuple[int, float, float]] = []
@@ -408,11 +457,14 @@ def main() -> None:
                 state[idx] = (idle_since, True)
 
         if to_notify:
-            cond_proc = (
-                f"且无计算进程显存合计>{compute_proc_min_mib:.0f}MiB"
-                if check_compute_procs
-                else "（未启用计算进程检测）"
-            )
+            if not check_compute_procs:
+                cond_proc = "（未启用计算进程检测）"
+            elif proc_name_pattern is None:
+                cond_proc = f"且全部 compute-app 显存合计≤{compute_proc_min_mib:.0f}MiB"
+            else:
+                cond_proc = (
+                    f"且训练相关进程显存合计≤{compute_proc_min_mib:.0f}MiB（系统/其它进程名不计）"
+                )
             lines = [
                 f"【GPU 空闲告警】主机 {hostname}",
                 f"条件: 利用率≤{util_max:.1f}% 且 已用显存/总显存≤{mem_max_ratio * 100:.1f}% {cond_proc}，已连续超过 {need_sec:.0f} 秒。",
@@ -423,7 +475,12 @@ def main() -> None:
                 total = stats[idx][3]
                 pct = (100.0 * mem_used / total) if total > 0 else 0.0
                 pm = proc_mem_by_idx.get(idx, 0.0) if check_compute_procs else 0.0
-                extra = f", compute-app 显存合计 {pm:.0f} MiB" if check_compute_procs else ""
+                if check_compute_procs and proc_name_pattern is not None:
+                    extra = f", 训练类进程显存合计 {pm:.0f} MiB"
+                elif check_compute_procs:
+                    extra = f", 全部 compute-app 显存合计 {pm:.0f} MiB"
+                else:
+                    extra = ""
                 lines.append(
                     f"GPU {idx}: 利用率 {util:.1f}%, 显存 {mem_used:.0f}/{total:.0f} MiB ({pct:.1f}%){extra}"
                 )
