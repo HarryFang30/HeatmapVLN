@@ -237,6 +237,20 @@ def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[L
     return topdown_img, trajectory_pixels
 
 
+def _heading_from_pose(pose: np.ndarray) -> Tuple[float, float]:
+    """Extract the agent's forward direction on the XZ ground plane from a
+    camera-to-world 4x4 pose matrix.  Camera forward is -Z in camera space,
+    so world forward = R @ [0, 0, -1]^T.
+
+    Returns (fwd_x, fwd_z) normalised direction in world coordinates.
+    """
+    R = pose[:3, :3]
+    fwd = R @ np.array([0.0, 0.0, -1.0])
+    fx, fz = float(fwd[0]), float(fwd[2])
+    length = max(np.hypot(fx, fz), 1e-8)
+    return fx / length, fz / length
+
+
 def _render_topdown_for_position(
     base_img: np.ndarray,
     trajectory_pixels: List,
@@ -244,6 +258,7 @@ def _render_topdown_for_position(
     history_frame_indices: List[int],
     position_label: int,
     out_size: int,
+    current_pose: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Render a top-down map highlighting current position and its history frames."""
     canvas = base_img.copy()
@@ -277,7 +292,13 @@ def _render_topdown_for_position(
         cv2.circle(canvas, curr, 12, (255, 0, 0), 3, cv2.LINE_AA)
         cv2.circle(canvas, curr, 5, (255, 0, 0), -1, cv2.LINE_AA)
 
-        if current_frame_idx + 1 < num_pts:
+        if current_pose is not None:
+            fwd_x, fwd_z = _heading_from_pose(current_pose)
+            arrow_len = 30
+            tip = (int(curr[0] + fwd_x * arrow_len),
+                   int(curr[1] + fwd_z * arrow_len))
+            cv2.arrowedLine(canvas, curr, tip, (255, 0, 0), 2, tipLength=0.3)
+        elif current_frame_idx + 1 < num_pts:
             nxt = tuple(trajectory_pixels[current_frame_idx + 1])
             dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
             length = max(1, (dx ** 2 + dy ** 2) ** 0.5)
@@ -300,6 +321,7 @@ def _build_topdown_strip(
     clip_dir: Path,
     sampled_frame_indices: List[int],
     samples_data: List[Dict[str, Any]],
+    all_poses: Optional[List[np.ndarray]] = None,
     tile: int = TILE, gap: int = GAP,
 ) -> Optional[np.ndarray]:
     topdown_img, trajectory_pixels = _load_topdown_data(clip_dir)
@@ -312,13 +334,16 @@ def _build_topdown_strip(
     strip = np.zeros((td_size, strip_w, 3), dtype=np.float32)
 
     for i in range(N):
+        fi = sampled_frame_indices[i]
         hist_indices = samples_data[i].get('history_indices', [])
+        cur_pose = all_poses[fi] if (all_poses is not None and fi < len(all_poses)) else None
         td = _render_topdown_for_position(
             topdown_img, trajectory_pixels,
-            current_frame_idx=sampled_frame_indices[i],
+            current_frame_idx=fi,
             history_frame_indices=hist_indices,
             position_label=i,
             out_size=td_size,
+            current_pose=cur_pose,
         )
         x0 = i * (td_size + gap)
         strip[:, x0: x0 + td_size] = td
@@ -330,68 +355,43 @@ def _build_topdown_strip(
 
 # ───────────────── Local-frame trajectory BEV ─────────────────
 
-def _compute_local_trajectories(
+def _compute_local_history(
     all_poses: List[np.ndarray],
     current_t: int,
     history_indices: List[int],
-    subseq_start: int = 0,
-    subseq_end: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """Use the same coordinate transform as the dataloader to compute
-    history and future trajectories in the current frame's local coordinate
-    system.
+    history trajectory in the current frame's local coordinate system.
 
     Returns:
         history_xy:  (N_hist, 2) — history positions in local frame
-        future_xy:   (N_fut, 2)  — future positions (current → end) in local frame
-        current_xy:  (2,)        — always (0, 0) since current is the origin
     """
-    if subseq_end is None:
-        subseq_end = len(all_poses)
+    if len(history_indices) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
 
-    # --- history ---
-    if len(history_indices) > 0:
-        hist_poses = np.stack(
-            [all_poses[current_t]] + [all_poses[i] for i in history_indices],
-            axis=0,
-        )
-        hist_rel = get_trajectory_relative_to_frame(hist_poses, camera_deg=0)
-        history_xy = hist_rel[1:, :2]  # skip ref frame (current)
-    else:
-        history_xy = np.zeros((0, 2), dtype=np.float32)
-
-    # --- future (current → subseq_end) ---
-    end = min(subseq_end, len(all_poses))
-    if end > current_t:
-        fut_poses = np.stack(
-            [all_poses[i] for i in range(current_t, end)], axis=0
-        )
-        fut_rel = get_trajectory_relative_to_frame(fut_poses, camera_deg=0)
-        future_xy = fut_rel[:, :2]  # includes origin at [0]
-    else:
-        future_xy = np.zeros((1, 2), dtype=np.float32)
-
-    current_xy = np.zeros(2, dtype=np.float32)
-    return history_xy, future_xy, current_xy
+    hist_poses = np.stack(
+        [all_poses[current_t]] + [all_poses[i] for i in history_indices],
+        axis=0,
+    )
+    hist_rel = get_trajectory_relative_to_frame(hist_poses, camera_deg=0)
+    return hist_rel[1:, :2]
 
 
 def _render_local_traj_bev(
     history_xy: np.ndarray,
-    future_xy: np.ndarray,
     out_size: int,
     position_label: int,
     margin_m: float = 0.5,
 ) -> np.ndarray:
-    """Render a small BEV image of the local-frame trajectory.
+    """Render a small BEV image of the history trajectory in current
+    frame's local coordinate system.
 
     Convention (matching get_trajectory_relative_to_frame):
       x → right, y → forward.  We draw y upward on the image.
     """
     canvas = np.ones((out_size, out_size, 3), dtype=np.uint8) * 245
 
-    all_pts = np.concatenate(
-        [history_xy, future_xy, np.zeros((1, 2))], axis=0
-    )
+    all_pts = np.concatenate([history_xy, np.zeros((1, 2))], axis=0)
     if len(all_pts) < 2:
         return canvas.astype(np.float32) / 255.0
 
@@ -404,27 +404,17 @@ def _render_local_traj_bev(
         py = int((1.0 - (xy[1] - ymin) / span) * (out_size - 20) + 10)
         return (px, py)
 
-    # grid lines through origin
     ox, oy = to_px(np.zeros(2))
     cv2.line(canvas, (ox, 0), (ox, out_size), (210, 210, 210), 1)
     cv2.line(canvas, (0, oy), (out_size, oy), (210, 210, 210), 1)
 
-    # history trail (blue)
+    # history trail
     if len(history_xy) > 1:
         for i in range(len(history_xy) - 1):
             cv2.line(canvas, to_px(history_xy[i]), to_px(history_xy[i + 1]),
                      (200, 130, 50), 2, cv2.LINE_AA)
-    for i, pt in enumerate(history_xy):
+    for idx, pt in enumerate(history_xy):
         cv2.circle(canvas, to_px(pt), 4, (200, 130, 50), -1, cv2.LINE_AA)
-
-    # future trail (green)
-    if len(future_xy) > 1:
-        for i in range(len(future_xy) - 1):
-            cv2.line(canvas, to_px(future_xy[i]), to_px(future_xy[i + 1]),
-                     (50, 180, 50), 2, cv2.LINE_AA)
-    for i, pt in enumerate(future_xy):
-        color = (50, 180, 50) if i > 0 else (0, 0, 255)
-        cv2.circle(canvas, to_px(pt), 4 if i > 0 else 7, color, -1, cv2.LINE_AA)
 
     # current position (red, at origin)
     cv2.circle(canvas, to_px(np.zeros(2)), 7, (0, 0, 255), -1, cv2.LINE_AA)
@@ -436,18 +426,8 @@ def _render_local_traj_bev(
     cv2.arrowedLine(canvas, to_px(np.zeros(2)), tip_px,
                     (0, 0, 255), 2, cv2.LINE_AA, tipLength=0.35)
 
-    # label
     cv2.putText(canvas, str(position_label), (6, 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
-
-    # legend
-    lx, ly = out_size - 60, out_size - 18
-    cv2.circle(canvas, (lx, ly), 4, (200, 130, 50), -1)
-    cv2.putText(canvas, "hist", (lx + 7, ly + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (100, 100, 100), 1)
-    cv2.circle(canvas, (lx, ly - 14), 4, (50, 180, 50), -1)
-    cv2.putText(canvas, "fut", (lx + 7, ly - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (100, 100, 100), 1)
 
     return canvas.astype(np.float32) / 255.0
 
@@ -463,15 +443,12 @@ def _build_local_traj_strip(
     strip_w = N * cell_size + max(N - 1, 0) * gap
     strip = np.zeros((cell_size, strip_w, 3), dtype=np.float32)
 
-    T = len(all_poses)
     for i in range(N):
         current_t = sampled_frame_indices[i]
         hist_indices = samples_data[i].get('history_indices', [])
-        history_xy, future_xy, _ = _compute_local_trajectories(
-            all_poses, current_t, hist_indices, subseq_start=0, subseq_end=T,
-        )
+        history_xy = _compute_local_history(all_poses, current_t, hist_indices)
         cell = _render_local_traj_bev(
-            history_xy, future_xy, out_size=cell_size, position_label=i,
+            history_xy, out_size=cell_size, position_label=i,
         )
         x0 = i * (cell_size + gap)
         strip[:, x0: x0 + cell_size] = cell
@@ -498,7 +475,7 @@ def visualize_clip_panoramic(
     if N == 0:
         return
 
-    td_strip = _build_topdown_strip(clip_dir, sampled_frame_indices, samples_data, tile, gap)
+    td_strip = _build_topdown_strip(clip_dir, sampled_frame_indices, samples_data, all_poses, tile, gap)
     local_traj_strip = _build_local_traj_strip(
         all_poses, sampled_frame_indices, samples_data, tile, gap,
     )
