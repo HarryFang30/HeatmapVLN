@@ -361,10 +361,14 @@ def _compute_local_history(
     history_indices: List[int],
 ) -> np.ndarray:
     """Use the same coordinate transform as the dataloader to compute
-    history trajectory in the current frame's local coordinate system.
+    history trajectory in the current frame's local coordinate system,
+    then convert to intuitive BEV coordinates (x=right, y=forward).
+
+    get_trajectory_relative_to_frame returns (backward, left) convention;
+    we negate and swap to (right, forward) for visualization.
 
     Returns:
-        history_xy:  (N_hist, 2) — history positions in local frame
+        history_xy:  (N_hist, 2) — BEV coords (right, forward)
     """
     if len(history_indices) == 0:
         return np.zeros((0, 2), dtype=np.float32)
@@ -374,7 +378,8 @@ def _compute_local_history(
         axis=0,
     )
     hist_rel = get_trajectory_relative_to_frame(hist_poses, camera_deg=0)
-    return hist_rel[1:, :2]
+    raw = hist_rel[1:, :2]  # (backward, left)
+    return np.column_stack([-raw[:, 1], -raw[:, 0]])  # (right, forward)
 
 
 def _render_local_traj_bev(
@@ -386,8 +391,8 @@ def _render_local_traj_bev(
     """Render a small BEV image of the history trajectory in current
     frame's local coordinate system.
 
-    Convention (matching get_trajectory_relative_to_frame):
-      x → right, y → forward.  We draw y upward on the image.
+    Input convention (after _compute_local_history conversion):
+      x = right, y = forward.  We draw y upward on the image.
     """
     canvas = np.ones((out_size, out_size, 3), dtype=np.uint8) * 245
 
