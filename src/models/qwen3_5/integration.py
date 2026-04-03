@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*")
 warnings.filterwarnings("ignore", message=".*video_metadata.*")
 
+import os
 import time
 import torch
 import torch.nn as nn
@@ -52,10 +53,13 @@ except ImportError:
 
 @dataclass
 class Qwen3_5Config:
-    """Configuration for Qwen3.5 integration."""
+    """Configuration for Qwen3.5 / Qwen2.5-VL integration."""
     
     # Model path
     model_path: str = "./models/qwen_3.5"
+    
+    # Backbone type: "auto" detects from config.json, or explicitly "qwen3_5" / "qwen2_5_vl"
+    backbone_type: str = "auto"
     
     # Device and dtype
     device: str = "cuda"
@@ -181,11 +185,13 @@ class Qwen3_5Integration(nn.Module):
         self.processor = None
         self._model_loaded = False
         
-        # Special token IDs (Qwen3.5 tokenizer)
-        self.video_token_id = 248057  # <|video_pad|>
-        self.image_token_id = 248056  # <|image_pad|>
-        self.vision_start_id = 248053  # <|vision_start|>
-        self.vision_end_id = 248054  # <|vision_end|>
+        self._resolved_backbone_type: Optional[str] = None
+        
+        # Token IDs are set during model loading based on backbone type
+        self.video_token_id = None
+        self.image_token_id = None
+        self.vision_start_id = None
+        self.vision_end_id = None
         
         # Sequence packing state
         self._packing_enabled = config.enable_packing
@@ -193,89 +199,115 @@ class Qwen3_5Integration(nn.Module):
         self._internal_profiler: Optional[_ModuleTimingProfiler] = None
         self._last_internal_timings: Dict[str, float] = {}
         
-        logger.info(f"Qwen3_5Integration initialized (model will be loaded on first forward)")
+        logger.info("VLM Integration initialized (model will be loaded on first forward)")
     
+    def _detect_backbone_type(self) -> str:
+        """Detect backbone type from config.json in the model directory."""
+        if self.config.backbone_type != "auto":
+            return self.config.backbone_type
+        import json as _json
+        cfg_path = os.path.join(self.config.model_path, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                cfg = _json.load(f)
+            model_type = cfg.get("model_type", "")
+            if model_type in ("qwen2_5_vl", "qwen2_vl"):
+                return "qwen2_5_vl"
+        return "qwen3_5"
+
     def _load_model(self):
-        """Load the Qwen3.5 model and processor."""
+        """Load the VLM backbone (Qwen3.5 or Qwen2.5-VL) and processor."""
         if self._model_loaded:
             return
-        
+
+        backbone = self._detect_backbone_type()
+        self._resolved_backbone_type = backbone
+        logger.info("Detected backbone type: %s", backbone)
+
         try:
-            from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
-            
-            logger.info(f"Loading Qwen3.5 from {self.config.model_path}")
+            from transformers import AutoProcessor
 
-            requested_attn_impl = self.config.attn_implementation
-            tried_impls = [requested_attn_impl]
-            model_load_error = None
-            self.model = None
-
-            for attn_impl in tried_impls + (["sdpa"] if requested_attn_impl != "sdpa" else []):
-                if attn_impl in tried_impls[:-1]:
-                    continue
-                try:
-                    logger.info("Trying Qwen attention implementation: %s", attn_impl)
-                    self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
-                        self.config.model_path,
-                        torch_dtype=self.config.get_torch_dtype(),
-                        attn_implementation=attn_impl,
-                        device_map=self.device,
-                        trust_remote_code=True,
-                    )
-                    if attn_impl != requested_attn_impl:
-                        logger.warning(
-                            "Qwen attention fallback: requested `%s`, using `%s`",
-                            requested_attn_impl,
-                            attn_impl,
-                        )
-                    self.config.attn_implementation = attn_impl
-                    break
-                except Exception as exc:
-                    model_load_error = exc
-                    logger.warning(
-                        "Failed to load Qwen with attention implementation `%s`: %s",
-                        attn_impl,
-                        exc,
-                    )
-
-            if self.model is None:
-                raise model_load_error if model_load_error is not None else RuntimeError("Failed to load Qwen3.5 model")
+            if backbone == "qwen2_5_vl":
+                self._load_qwen25vl()
+            else:
+                self._load_qwen35()
 
             self.model.eval()
-            
-            # Freeze all parameters (never train the backbone)
             for param in self.model.parameters():
                 param.requires_grad = False
-            
-            # Apply LoRA if configured (after freezing base model)
+
             if self.config.use_lora:
                 self._apply_lora()
-            
-            # Load processor
+
             self.processor = AutoProcessor.from_pretrained(
                 self.config.model_path,
                 trust_remote_code=True,
             )
-            
             self._model_loaded = True
-            
-            # 设置 padding_side 为 left，用于批量处理
-            self.processor.tokenizer.padding_side = 'left'
-            
-            logger.info(f"Qwen3.5 loaded successfully on {self.device}")
-            logger.info("Qwen attention implementation in use: %s", self.config.attn_implementation)
-            
-            # Log model info
+            self.processor.tokenizer.padding_side = "left"
+
+            logger.info(
+                "%s loaded on %s (attn=%s)",
+                backbone, self.device, self.config.attn_implementation,
+            )
             total_params = sum(p.numel() for p in self.model.parameters())
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            logger.info(f"Model parameters: {total_params:,} (all frozen, trainable: {trainable_params})")
-            logger.info(f"Batch processing enabled (padding_side='left')")
+            logger.info("Parameters: %s (frozen, trainable: %d)", f"{total_params:,}", trainable_params)
             self._setup_internal_profiler()
             self._maybe_enable_compile()
-            
+
         except Exception as e:
-            logger.error(f"Failed to load Qwen3.5: {e}")
+            logger.error("Failed to load VLM backbone (%s): %s", backbone, e)
             raise
+
+    def _load_qwen35(self):
+        """Load a Qwen3.5 backbone."""
+        from transformers import Qwen3_5ForConditionalGeneration
+
+        logger.info("Loading Qwen3.5 from %s", self.config.model_path)
+        self.model = self._load_with_attn_fallback(
+            Qwen3_5ForConditionalGeneration, self.config.model_path,
+        )
+        cfg = self.model.config
+        self.image_token_id = getattr(cfg, "image_token_id", 248056)
+        self.video_token_id = getattr(cfg, "video_token_id", 248057)
+        self.vision_start_id = getattr(cfg, "vision_start_token_id", 248053)
+        self.vision_end_id = getattr(cfg, "vision_end_token_id", 248054)
+
+    def _load_qwen25vl(self):
+        """Load a Qwen2.5-VL backbone."""
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        logger.info("Loading Qwen2.5-VL from %s", self.config.model_path)
+        self.model = self._load_with_attn_fallback(
+            Qwen2_5_VLForConditionalGeneration, self.config.model_path,
+        )
+        cfg = self.model.config
+        self.image_token_id = getattr(cfg, "image_token_id", 151655)
+        self.video_token_id = getattr(cfg, "video_token_id", 151656)
+        self.vision_start_id = getattr(cfg, "vision_start_token_id", 151652)
+        self.vision_end_id = getattr(cfg, "vision_end_token_id", 151653)
+
+    def _load_with_attn_fallback(self, model_cls, model_path: str):
+        """Try loading with the requested attention impl, fall back to sdpa."""
+        requested = self.config.attn_implementation
+        for attn_impl in [requested] + (["sdpa"] if requested != "sdpa" else []):
+            try:
+                logger.info("Trying attention implementation: %s", attn_impl)
+                model = model_cls.from_pretrained(
+                    model_path,
+                    torch_dtype=self.config.get_torch_dtype(),
+                    attn_implementation=attn_impl,
+                    device_map=self.device,
+                    trust_remote_code=True,
+                )
+                if attn_impl != requested:
+                    logger.warning("Attention fallback: requested `%s`, using `%s`", requested, attn_impl)
+                self.config.attn_implementation = attn_impl
+                return model
+            except Exception as exc:
+                logger.warning("Failed with attention `%s`: %s", attn_impl, exc)
+        raise RuntimeError(f"Failed to load model from {model_path}")
 
     @staticmethod
     def _get_nested_module(root: Any, path: str) -> Optional[nn.Module]:

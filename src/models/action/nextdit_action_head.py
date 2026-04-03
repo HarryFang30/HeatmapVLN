@@ -53,6 +53,7 @@ class NextDiTActionConfig:
     dit_layers: int = 12
     dit_heads: int = 6
     dit_kv_heads: int = 6
+    dit_ffn_dim_multiplier: Optional[float] = None
     predict_steps: int = 32
     action_dim: int = 3
     num_inference_steps: int = 10
@@ -110,6 +111,7 @@ class NextDiTActionHead(nn.Module):
             n_layers=config.dit_layers,
             n_heads=config.dit_heads,
             n_kv_heads=config.dit_kv_heads,
+            ffn_dim_multiplier=config.dit_ffn_dim_multiplier,
             latent_embedding_size=config.latent_emb_size,
             learn_sigma=False,
             _gradient_checkpointing=config.enable_gradient_checkpointing,

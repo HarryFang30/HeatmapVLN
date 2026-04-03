@@ -1,0 +1,256 @@
+seed: 42
+
+# ============================================
+# 数据配置
+# ============================================
+data:
+  root: /workspace/r2r_panoramic_data
+  train_split: train
+  val_split: val_unseen
+  image_size: [256, 256]
+  init_hm_size: [64, 64]
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  
+  dataset_type: trajectory
+  
+  sliding_window:
+    min_history: 5
+    num_history_sample: 32
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: true
+    samples_per_clip: 30
+    val_samples_per_clip: 10
+  
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: true
+    samples_per_clip: 30
+    val_samples_per_clip: 10
+    random_subsequence: true
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    predict_horizon: 32
+    action_scale: 4.0
+    enable_trajectory_augmentation: true
+    use_subinstruction: true
+    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
+    load_traj_images: true
+    traj_image_size: [224, 224]
+
+# ============================================
+# 模型配置 — InternNav backbone (Qwen2.5-VL)
+# ============================================
+model:
+  type: vln_pipeline
+  device: cuda
+
+  llm:
+    model_path: ./models/internnav_backbone
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584          # Qwen2.5-VL hidden_size (vs Qwen3.5: 4096)
+    token_dim: 896            # Projected token dim (3584 -> 896)
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+    max_video_frames: -1
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+
+  # HeatmapVLN v2 Coarse-to-Fine
+  heatmap:
+    enable: true
+    c_vit: 1280               # Qwen2.5-VL ViT hidden_size (vs Qwen3.5: 1152)
+    c_llm: 3584               # Qwen2.5-VL LLM hidden_size (vs Qwen3.5: 4096)
+    c_fused: 256
+    # InternNav ViT: 32 layers, fullatt_block_indexes = [7, 15, 23, 31]
+    vit_layer_indices: [7, 15, 23, 31]
+    # InternNav LLM: 28 layers, pick evenly spaced full-attention layers
+    llm_layer_indices: [6, 13, 20]
+    heatmap_size: [64, 64]
+    image_size: 256
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_kl: 0.0
+    lambda_peak: 1.0
+
+  action_head:
+    enable: true
+    type: transformer
+    
+    legacy:
+      cond_dim: 896
+      action_dim: 2
+      pred_horizon: 1
+      num_diffusion_iters: 10
+      encoding_size: 256
+      down_dims: [128, 256]
+      action_stats_min: [-0.1646, -0.0281]
+      action_stats_max: [0.1850, 0.3087]
+    
+    transformer:
+      vlm_token_dim: 896
+      n_emb: 384
+      predict_size: 24
+      n_layer: 16
+      n_head: 6
+      n_cond_layers: 4
+      action_dim: 3
+      num_train_timesteps: 20
+      p_drop_emb: 0.2
+      p_drop_attn: 0.2
+      causal_attn: true
+
+    # NextDiT System 1 — loaded from InternNav pre-trained weights
+    nextdit:
+      enabled: true
+      vlm_hidden_dim: 3584      # Match Qwen2.5-VL hidden_size
+      latent_emb_size: 768
+      n_query: 4
+      dit_dim: 384
+      dit_layers: 12
+      dit_heads: 6
+      dit_kv_heads: 6
+      dit_ffn_dim_multiplier: 0.6666666666666666   # 2/3 to match InternNav FFN size (1024 vs default 1536)
+      predict_steps: 32
+      action_dim: 3
+      num_inference_steps: 10
+      guidance_scale: 1.0
+      num_sample_trajs: 32
+      dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
+      enable_gradient_checkpointing: true
+      # InternNav System 1 pre-trained weights (from convert_internnav_backbone.py)
+      internnav_system1_path: "models/internnav_system1.safetensors"
+      warmup_steps: 500
+
+  progress_head:
+    enable: true
+    hidden_dim: 512
+    dropout: 0.3
+    concat_state_txt: true
+
+  stop_head:
+    enable: false
+
+# ============================================
+# 训练策略 — Plan A: 冻结 System 1 核心，微调桥接层
+# ============================================
+training:
+  stages:
+    - name: internnav_bridge_adaptation
+      epochs: 10
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
+      train_action: true
+      trainable_modules:
+        - heatmap_vln           # DPTLiteFusion + FineLocalization (needs retrain for new ViT/LLM dims)
+        - latent_queries        # Bridge: System 2 -> System 1 (4 learnable tokens)
+        - cond_projector        # Bridge: latent_queries -> NextDiT condition space
+        - progress_head
+        - llm_projector
+      frozen_modules:
+        - qwen3_5               # Freeze VLM backbone (InternNav Qwen2.5-VL)
+        - traj_dit              # Freeze NextDiT core (pre-trained)
+        - rgb_model             # Freeze DINOv2/DepthAnything (pre-trained)
+        - memory_encoder        # Freeze visual memory encoder (pre-trained)
+        - rgb_resampler         # Freeze QFormer resampler (pre-trained)
+        - action_encoder        # Freeze action codec (pre-trained)
+        - action_decoder
+        - action_head
+        - transformer_action_head
+        - stop_head
+
+# ============================================
+# 优化器配置
+# ============================================
+optim:
+  optimizer: adamw
+  learning_rate: 2.0e-4
+  heatmap_lr: 2.0e-4
+  action_lr: 1.0e-4
+  transformer_action_lr: 1.0e-4
+  nextdit_action_lr: 1.0e-4
+  nextdit_cond_projector_lr: 3.0e-4
+  latent_queries_lr: 5.0e-4
+  progress_lr: 1.0e-4
+  llm_projector_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.1
+  warmup_steps: 500
+  min_lr: 1.0e-6
+  batch_size: 4
+  grad_accum_steps: 2
+
+# ============================================
+# 损失函数
+# ============================================
+loss:
+  heatmap_loss_type: heatmap_vln
+  
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_kl: 0.0
+    lambda_peak: 1.0
+    temperature: 1.0
+    vis_pos_weight: 7.0
+    temperature_schedule:
+      enabled: false
+      mode: cosine
+      start: 1.0
+      end: 1.0
+  
+  heatmap_weight: 1.0
+  trajectory_weight: 1.0
+  progress_weight: 1.0
+
+# ============================================
+# GPU配置
+# ============================================
+gpu:
+  devices: [0]
+  backend: nccl
+  multi_gpu:
+    enabled: false
+    find_unused_parameters: false
+
+# ============================================
+# 日志与保存
+# ============================================
+log:
+  out_dir: /root/autodl-tmp/vln_training_outputs
+  save_every_epochs: 1
+  vis_every_steps: 100
+  val_vis_batches: 2
+  max_ckpts: 3
+  use_tensorboard: true
+  tensorboard_dir: /root/tf-logs
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  
+  notify:
+    enabled: true
+    platform: feishu
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+
+# ============================================
+# 验证配置
+# ============================================
+validation:
+  eval_every_epochs: 1
+  save_best_metric: val_total_loss
+  patience: 5

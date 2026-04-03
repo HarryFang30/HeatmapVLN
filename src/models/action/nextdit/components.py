@@ -86,6 +86,7 @@ class QFormer(nn.Module):
 
         decoder_layer = nn.TransformerDecoderLayer(d_model=hidden_size, nhead=num_heads, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.visual_proj = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, visual_feats, visual_attn_mask=None):
         """
@@ -99,4 +100,5 @@ class QFormer(nn.Module):
         query_tokens = self.query_tokens.unsqueeze(0).expand(B, -1, -1)
         query_tokens = query_tokens + self.query_pos.unsqueeze(0)
         out = self.decoder(query_tokens, visual_feats, memory_key_padding_mask=visual_attn_mask)
+        out = self.visual_proj(out)
         return out

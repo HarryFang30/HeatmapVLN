@@ -11,6 +11,29 @@ import sys
 import os
 from pathlib import Path
 
+
+def _apply_early_gpu_arg_for_monitor() -> None:
+    """
+    monitor_gpu_idle 占卡时会执行: python train.py --gpu 0,1 ...
+    必须在 import torch 之前设置 CUDA_VISIBLE_DEVICES，否则会与物理卡号不一致。
+    从 sys.argv 中移除 --gpu，避免下方 argparse 报 unknown argument。
+    """
+    if "--gpu" not in sys.argv:
+        return
+    try:
+        i = sys.argv.index("--gpu")
+    except ValueError:
+        return
+    if i + 1 >= len(sys.argv):
+        return
+    val = sys.argv[i + 1].strip()
+    if val:
+        os.environ["CUDA_VISIBLE_DEVICES"] = val
+    del sys.argv[i : i + 2]
+
+
+_apply_early_gpu_arg_for_monitor()
+
 # 启用 expandable_segments 减少显存碎片
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -1141,8 +1164,9 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
     nextdit_cfg = action_cfg.get('nextdit', {})
     
     config = VLNPipelineConfig(
-        # Qwen3.5
+        # VLM backbone
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
+        llm_backbone_type=llm_cfg.get('backbone_type', 'auto'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
@@ -1154,10 +1178,13 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         llm_compile_mode=llm_cfg.get('compile_mode', 'reduce-overhead'),
         llm_compile_backend=llm_cfg.get('compile_backend', 'inductor'),
         
-        # Sequence Packing (disabled for Qwen3.5)
+        # Sequence Packing
         enable_packing=llm_cfg.get('enable_packing', False),
         max_seq_length=llm_cfg.get('max_seq_length', 4096),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
+        
+        # InternNav System 1 pre-trained weights
+        internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
         
         # Device
         device=model_cfg.get('device', 'cuda'),
@@ -1219,6 +1246,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
         nextdit_dit_layers=nextdit_cfg.get('dit_layers', 12),
         nextdit_dit_heads=nextdit_cfg.get('dit_heads', 6),
         nextdit_dit_kv_heads=nextdit_cfg.get('dit_kv_heads', 6),
+        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get('dit_ffn_dim_multiplier', None),
         nextdit_predict_steps=nextdit_cfg.get('predict_steps', 32),
         nextdit_action_dim=nextdit_cfg.get('action_dim', 3),
         nextdit_num_inference_steps=nextdit_cfg.get('num_inference_steps', 10),
@@ -1242,9 +1270,11 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
     
     model = VLNPipeline(config)
     
-    # Load System 1 pretrained weights (if provided)
+    # Load System 1 pretrained weights (if provided via legacy path, and NOT
+    # already loaded via internnav_system1_path in pipeline init)
+    internnav_s1 = nextdit_cfg.get('internnav_system1_path', '')
     s1_ckpt = nextdit_cfg.get('pretrained_system1_path', '')
-    if s1_ckpt and model.nextdit_action_head is not None:
+    if s1_ckpt and not internnav_s1 and model.nextdit_action_head is not None:
         from pathlib import Path
         s1_path = Path(s1_ckpt)
         if s1_path.exists():
@@ -1253,13 +1283,14 @@ def build_model(cfg: Dict, verbose: bool = True) -> nn.Module:
                 latent_queries=model.latent_queries,
             )
         else:
-            print(f"⚠ System 1 pretrained weights not found: {s1_path}")
+            print(f"System 1 pretrained weights not found: {s1_path}")
 
     packing_enabled = llm_cfg.get('enable_packing', False)
+    backbone_type = llm_cfg.get('backbone_type', 'auto')
     if verbose:
-        print(f"✅ VLN Pipeline 已构建")
-        print(f"   Qwen3.5 → {llm_cfg.get('model_path', './models/qwen_3.5')}")
-        print(f"   SequencePacking → enabled={packing_enabled} (Qwen3.5 不支持启用)")
+        print(f"VLN Pipeline built")
+        print(f"   Backbone -> {llm_cfg.get('model_path', './models/qwen_3.5')} (type={backbone_type})")
+        print(f"   SequencePacking -> enabled={packing_enabled}")
         print(
             "   HeatmapVLN → "
             f"enabled={heatmap_cfg.get('enable', True)}, "
@@ -1326,6 +1357,12 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
         if hasattr(model, 'latent_queries') and model.latent_queries is not None:
             model.latent_queries.requires_grad_(True)
             logger.info("  ✓ Unfrozen: latent_queries")
+    
+    # cond_projector (System 1 bridge layer: vlm_hidden -> latent_emb)
+    if 'cond_projector' in trainable:
+        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+            freeze_module(model.nextdit_action_head.cond_projector, freeze=False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head.cond_projector")
     
     # Stop head (Legacy)
     if 'stop_head' in trainable:

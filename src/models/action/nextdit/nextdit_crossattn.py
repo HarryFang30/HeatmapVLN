@@ -73,7 +73,9 @@ class NextDiTCrossAttn(PreTrainedModel):
         )
 
         if self._gradient_checkpointing:
-            self.model.enable_gradient_checkpointing()
+            for m in self.model.modules():
+                if hasattr(m, "gradient_checkpointing"):
+                    m.gradient_checkpointing = True
 
         self.freqs_cis = get_2d_rotary_pos_embed_lumina(
             config.dim // config.n_heads,

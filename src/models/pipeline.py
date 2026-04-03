@@ -43,8 +43,9 @@ VIEW_NAMES = ("front", "right", "back", "left")
 class VLNPipelineConfig:
     """Configuration for VLN pipeline."""
 
-    # Qwen3.5 configuration
+    # VLM backbone configuration (Qwen3.5 or Qwen2.5-VL)
     llm_model_path: str = "./models/qwen_3.5"
+    llm_backbone_type: str = "auto"  # "auto", "qwen3_5", "qwen2_5_vl"
     llm_hidden_dim: int = 4096
     llm_token_dim: int = 1024
     llm_torch_dtype: str = "bfloat16"
@@ -60,6 +61,9 @@ class VLNPipelineConfig:
     enable_packing: bool = False
     max_seq_length: int = 4096
     spatial_merge_size: int = 2
+
+    # InternNav System 1 weights (pre-trained NextDiT + latent_queries)
+    internnav_system1_path: str = ""
 
     # Device configuration
     device: str = "cuda"
@@ -122,6 +126,7 @@ class VLNPipelineConfig:
     nextdit_dit_layers: int = 12
     nextdit_dit_heads: int = 6
     nextdit_dit_kv_heads: int = 6
+    nextdit_dit_ffn_dim_multiplier: Optional[float] = None
     nextdit_predict_steps: int = 32
     nextdit_action_dim: int = 3
     nextdit_num_inference_steps: int = 10
@@ -160,9 +165,10 @@ class VLNPipeline(nn.Module):
         logger.info("Initializing VLN Pipeline with Qwen3.5 (v2 Coarse-to-Fine)")
         logger.info("=" * 60)
 
-        # ==================== Qwen3.5 Integration ====================
+        # ==================== VLM Backbone ====================
         qwen_config = Qwen3_5Config(
             model_path=config.llm_model_path,
+            backbone_type=config.llm_backbone_type,
             device=config.device,
             torch_dtype=config.llm_torch_dtype,
             attn_implementation=config.llm_attn_implementation,
@@ -184,7 +190,7 @@ class VLNPipeline(nn.Module):
             lora_target_modules=config.lora_target_modules,
         )
         self.qwen3_5 = Qwen3_5Integration(qwen_config)
-        logger.info("Qwen3.5 integration initialized")
+        logger.info("VLM backbone integration initialized (type=%s)", config.llm_backbone_type)
 
         # ==================== LLM Projector ====================
         self.llm_projector = nn.Sequential(
@@ -223,6 +229,7 @@ class VLNPipeline(nn.Module):
                 dit_layers=config.nextdit_dit_layers,
                 dit_heads=config.nextdit_dit_heads,
                 dit_kv_heads=config.nextdit_dit_kv_heads,
+                dit_ffn_dim_multiplier=config.nextdit_dit_ffn_dim_multiplier,
                 predict_steps=config.nextdit_predict_steps,
                 action_dim=config.nextdit_action_dim,
                 num_inference_steps=config.nextdit_num_inference_steps,
@@ -243,6 +250,8 @@ class VLNPipeline(nn.Module):
                 config.nextdit_predict_steps,
                 config.nextdit_n_query,
             )
+            if config.internnav_system1_path:
+                self._load_internnav_system1(config.internnav_system1_path)
         elif config.enable_action_head:
             if config.action_head_type == "transformer":
                 self.transformer_action_head = TransformerActionHead(
@@ -311,6 +320,91 @@ class VLNPipeline(nn.Module):
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")
         logger.info("=" * 60)
+
+    def _load_internnav_system1(self, ckpt_path: str):
+        """Load InternNav System 1 weights into NextDiTActionHead + latent_queries.
+
+        This loads pre-trained weights for the entire NextDiT pipeline from an
+        InternNav checkpoint (produced by convert_internnav_backbone.py).
+        After loading, System 1 modules are frozen and only latent_queries +
+        cond_projector remain trainable (Plan A adaptation strategy).
+        """
+        from safetensors import safe_open
+
+        logger.info("Loading InternNav System 1 from %s", ckpt_path)
+        with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+            ckpt_keys = list(f.keys())
+            ckpt_sd = {k: f.get_tensor(k) for k in ckpt_keys}
+
+        if "latent_queries" in ckpt_sd:
+            lq = ckpt_sd.pop("latent_queries")
+            if self.latent_queries.shape == lq.shape:
+                self.latent_queries.data.copy_(lq)
+                logger.info("  Loaded latent_queries %s", tuple(lq.shape))
+            else:
+                logger.warning(
+                    "  latent_queries shape mismatch: ckpt %s vs model %s, skipped",
+                    tuple(lq.shape), tuple(self.latent_queries.shape),
+                )
+
+        head_sd = self.nextdit_action_head.state_dict()
+        loaded, skipped = [], []
+        for key, val in ckpt_sd.items():
+            if key in head_sd:
+                if head_sd[key].shape == val.shape:
+                    head_sd[key] = val
+                    loaded.append(key)
+                else:
+                    skipped.append(f"{key}: ckpt {tuple(val.shape)} vs model {tuple(head_sd[key].shape)}")
+            else:
+                skipped.append(f"{key}: not in model")
+
+        missing = [k for k in head_sd if k not in ckpt_sd and k != "latent_queries"]
+        self.nextdit_action_head.load_state_dict(head_sd, strict=False)
+
+        logger.info("  Loaded %d/%d System 1 params", len(loaded), len(ckpt_sd))
+        if skipped:
+            logger.warning("  Skipped: %s", skipped[:10])
+        if missing:
+            logger.info("  Missing in ckpt (will use random init): %d keys", len(missing))
+
+        self._freeze_system1_core()
+
+    def _freeze_system1_core(self):
+        """Freeze System 1 core modules, keep bridge layers trainable.
+
+        Frozen: traj_dit, rgb_model, memory_encoder, rgb_resampler,
+                action_encoder, action_decoder, pos_encoding
+        Trainable: latent_queries, cond_projector
+        """
+        head = self.nextdit_action_head
+        frozen_modules = [
+            head.traj_dit,
+            head.rgb_model,
+            head.memory_encoder,
+            head.rgb_resampler,
+            head.action_encoder,
+            head.action_decoder,
+            head.pos_encoding,
+        ]
+        frozen_count = 0
+        for mod in frozen_modules:
+            for p in mod.parameters():
+                p.requires_grad = False
+                frozen_count += 1
+
+        trainable_count = 0
+        for p in head.cond_projector.parameters():
+            p.requires_grad = True
+            trainable_count += 1
+        self.latent_queries.requires_grad = True
+        trainable_count += 1
+
+        logger.info(
+            "System 1 freeze: %d params frozen, %d bridge params trainable "
+            "(latent_queries + cond_projector)",
+            frozen_count, trainable_count,
+        )
 
     def _ensure_heatmap_vln(self):
         """Lazily construct HeatmapVLN after Qwen3.5 model is loaded."""
