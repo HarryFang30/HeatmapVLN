@@ -5,15 +5,16 @@ Trajectory-Guided Attention Module
 Replaces CoarseLocalization with a self-attention mechanism that allows
 three types of tokens to interact:
 
-  1. **history_query** (N, 4096) — visual identity of historical locations
+  1. **history_query** (N, c_llm) — visual identity of historical locations
   2. **trajectory PE** (N, pe_dim) — sinusoidal positional encoding of
      relative egocentric poses (dx, dy, cos_yaw, sin_yaw)
-  3. **spatial features** (V*H*W, 256) — DPT-fused LLM features for
+  3. **spatial features** (V*H*W, c_fused) — DPT-fused LLM features for
      current 4-view panorama (flattened to 256 tokens)
 
 Outputs:
-  - coarse_heatmap (N, 4, 8, 8) — per-history-location heatmap logits
-  - visibility     (N, 4)       — per-view visibility logits
+  - coarse_heatmap (N, 4, 8, 8)       — per-history-location heatmap logits
+  - visibility     (N, 4)             — per-view visibility logits
+  - spatial_out    (N, V*H*W, d_attn) — enriched spatial features for Fine
 """
 
 import math
@@ -159,10 +160,12 @@ class TrajectoryGuidedAttention(nn.Module):
         if isinstance(history_queries, list):
             if len(history_queries) == 0:
                 device = current_llm_tensor.device
+                V = current_llm_tensor.shape[-4]
                 H, W = current_llm_tensor.shape[-3], current_llm_tensor.shape[-2]
                 return {
                     "visibility": torch.empty(0, 4, device=device),
                     "coarse_heatmap": torch.empty(0, 4, H, W, device=device),
+                    "spatial_out": torch.empty(0, V * H * W, self.d_attn, device=device),
                 }
             history_queries_tensor = torch.stack(history_queries, dim=0)
         else:
@@ -201,6 +204,7 @@ class TrajectoryGuidedAttention(nn.Module):
 
         results_vis = []
         results_hm = []
+        results_spatial = []
 
         for i in range(N):
             tokens = torch.cat([
@@ -214,8 +218,8 @@ class TrajectoryGuidedAttention(nn.Module):
 
             out = self.self_attn(tokens).squeeze(0)  # (258, d_attn)
 
-            spatial_out = out[2:]  # (256, d_attn)
-            hm_logits = self.heatmap_head(spatial_out).squeeze(-1)  # (256,)
+            sp_out = out[2:]  # (256, d_attn)
+            hm_logits = self.heatmap_head(sp_out).squeeze(-1)  # (256,)
             hm = hm_logits.reshape(V, H, W)  # (4, 8, 8)
 
             hist_out = out[0]  # (d_attn,)
@@ -223,10 +227,12 @@ class TrajectoryGuidedAttention(nn.Module):
 
             results_hm.append(hm)
             results_vis.append(vis)
+            results_spatial.append(sp_out)
 
         return {
-            "coarse_heatmap": torch.stack(results_hm, dim=0),  # (N, 4, H, W)
-            "visibility": torch.stack(results_vis, dim=0),      # (N, 4)
+            "coarse_heatmap": torch.stack(results_hm, dim=0),       # (N, 4, H, W)
+            "visibility": torch.stack(results_vis, dim=0),           # (N, 4)
+            "spatial_out": torch.stack(results_spatial, dim=0),      # (N, V*H*W, d_attn)
         }
 
     def _forward_batch(
@@ -249,8 +255,6 @@ class TrajectoryGuidedAttention(nn.Module):
         else:
             traj_proj = torch.zeros(B, N, self.d_attn, device=device)
 
-        # Process all (B*N) history samples in parallel
-        # Expand spatial_flat: (B, 256, C) -> (B, N, 256, C) -> (B*N, 256, C)
         spatial_expanded = spatial_flat.unsqueeze(1).expand(-1, N, -1, -1).reshape(B * N, V * H * W, C)
 
         hist_tokens = hist_proj.reshape(B * N, 1, self.d_attn)
@@ -261,8 +265,8 @@ class TrajectoryGuidedAttention(nn.Module):
 
         out = self.self_attn(tokens)  # (B*N, 258, d_attn)
 
-        spatial_out = out[:, 2:]  # (B*N, 256, d_attn)
-        hm_logits = self.heatmap_head(spatial_out).squeeze(-1)  # (B*N, 256)
+        sp_out = out[:, 2:]  # (B*N, 256, d_attn)
+        hm_logits = self.heatmap_head(sp_out).squeeze(-1)  # (B*N, 256)
         heatmaps = hm_logits.reshape(B, N, V, H, W)  # (B, N, 4, 8, 8)
 
         hist_out = out[:, 0]  # (B*N, d_attn)
@@ -272,4 +276,5 @@ class TrajectoryGuidedAttention(nn.Module):
         return {
             "coarse_heatmap": heatmaps,
             "visibility": visibility,
+            "spatial_out": sp_out.reshape(B, N, V * H * W, self.d_attn),  # (B, N, 256, d_attn)
         }

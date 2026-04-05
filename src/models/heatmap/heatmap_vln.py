@@ -117,8 +117,8 @@ class HeatmapVLN(nn.Module):
         else:
             self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
 
-        # Fine localisation head
-        self.fine = FineLocalization(c_fused, c_llm)
+        # Fine localisation head (no longer needs c_llm — uses spatial_out from coarse)
+        self.fine = FineLocalization(c_fused)
 
         trainable = sum(
             p.numel() for p in self.parameters() if p.requires_grad
@@ -364,7 +364,7 @@ class HeatmapVLN(nn.Module):
         all_heatmaps = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
-            query_vector=history_queries_tensor,
+            spatial_out=coarse_results["spatial_out"],
         )
         result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
         if not self.training:
@@ -455,7 +455,7 @@ class HeatmapVLN(nn.Module):
         all_heatmaps = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
-            query_vector=history_queries_tensor,
+            spatial_out=coarse_results["spatial_out"],
         )
 
         history_mask_f = history_mask.to(all_visibility.dtype)
@@ -563,7 +563,7 @@ class HeatmapVLN(nn.Module):
         all_heatmaps = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
-            query_vector=history_queries_tensor,
+            spatial_out=coarse_results["spatial_out"],
         )
         if self.enable_runtime_timing:
             self._sync_for_timing(device)

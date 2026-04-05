@@ -81,6 +81,15 @@ model:
     lambda_kl: 0.0
     lambda_peak: 1.0
 
+    # Trajectory-Guided Attention (替代 CoarseLocalization 的 cosine similarity)
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 2
+      max_spatial_range: 10.0
+
   action_head:
     enable: true
     type: transformer

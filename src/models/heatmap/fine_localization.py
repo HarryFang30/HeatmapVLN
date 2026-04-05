@@ -2,19 +2,22 @@
 Fine Localization Module
 ==========================
 
-Produces 64x64 fine-grained heatmaps from:
-  - DPT-fused ViT features (16x16, C_fused)
-  - Coarse heatmap (8x8, spatial attention prior)
-  - LLM text-token query vector (C_llm, FiLM modulation)
+Produces 64x64 fine-grained heatmaps by fusing:
+  - DPT-fused ViT features (16x16, C_fused) — high-resolution texture
+  - Coarse spatial_out from TrajectoryGuidedAttention (V*H*W, d_attn) —
+    per-position representations enriched with hist/traj context
+  - Coarse heatmap (8x8) — scalar spatial attention prior
+
+spatial_out replaces the old FiLM modulation: each spatial token already
+carries position-specific "what to look for" information from the
+self-attention, giving the decoder per-position conditioning instead of
+a single global channel-weight vector.
 
 Pipeline:
-  1. Upsample coarse heatmap 8x8 -> 16x16 as spatial attention
-  2. FiLM modulation: project query_vector to C_fused, element-wise multiply
-  3. Spatial attention weighting
-  4. Concatenate attention channel
-  5. ConvTranspose decoder: 16x16 -> 32x32 -> 64x64
-
-Trainable parameters: ~1.5M (c_fused=256, c_llm=4096).
+  1. Upsample spatial_out from 8x8 → 16x16 (bilinear)
+  2. Upsample coarse heatmap 8x8 → 16x16 as scalar attention
+  3. Concat [ViT_fused(C), spatial_out_up(C), coarse_attn(1)] → 2C+1 channels
+  4. ConvTranspose decoder: 16x16 → 32x32 → 64x64
 
 Reference: HeatmapVLN设计文档 Section 6.2
 """
@@ -26,135 +29,109 @@ import torch.nn.functional as F
 
 class FineLocalization(nn.Module):
     """
-    Coarse-guided fine heatmap regression.
+    Spatial-out guided fine heatmap regression.
 
     Args:
-        c_fused: channel dim of DPT-fused ViT features.
-        c_llm:   hidden dim of LLM query vector.
+        c_fused: channel dim of DPT-fused ViT features (= d_attn of coarse).
     """
 
-    def __init__(self, c_fused: int = 256, c_llm: int = 4096):
+    def __init__(self, c_fused: int = 256):
         super().__init__()
-        self.query_proj = nn.Linear(c_llm, c_fused)
+        self.c_fused = c_fused
 
         self.refine = nn.Sequential(
-            nn.ConvTranspose2d(c_fused + 1, 128, kernel_size=4, stride=2, padding=1),  # -> 32x32
+            nn.ConvTranspose2d(c_fused * 2 + 1, 128, kernel_size=4, stride=2, padding=1),  # -> 32x32
             nn.GELU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),            # -> 64x64
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),                # -> 64x64
             nn.GELU(),
-            nn.Conv2d(64, 1, kernel_size=3, padding=1),                                 # -> 64x64, 1ch
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),                                     # -> 64x64, 1ch
         )
 
     def forward(
         self,
         vit_fused: torch.Tensor,
         coarse_heatmap: torch.Tensor,
-        query_vector: torch.Tensor,
+        spatial_out: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-            vit_fused:      ``(1, C_fused, 16, 16)`` — DPT-fused ViT features.
-            coarse_heatmap: ``(H_c, W_c)``           — coarse heatmap (e.g. 8x8).
-            query_vector:   ``(C_llm,)``              — text-token hidden state.
-
-        Returns:
-            ``(64, 64)`` heatmap in [0, 1].
+            vit_fused:      ``(4, C, 16, 16)`` or ``(B, 4, C, 16, 16)``
+            coarse_heatmap: ``(N, 4, H_c, W_c)`` or ``(B, N, 4, H_c, W_c)``
+            spatial_out:    ``(N, V*H_c*W_c, d_attn)`` or ``(B, N, V*H_c*W_c, d_attn)``
         """
-        if coarse_heatmap.dim() >= 4:
-            return self.forward_batched(vit_fused, coarse_heatmap, query_vector)
-
-        # Spatial attention from coarse heatmap
-        attn = F.interpolate(
-            coarse_heatmap[None, None],  # (1, 1, H_c, W_c)
-            size=vit_fused.shape[2:],    # match ViT spatial dims
-            mode="bilinear",
-            align_corners=False,
-        )
-        attn = torch.sigmoid(attn)  # (1, 1, H, W)
-
-        # FiLM modulation
-        q = self.query_proj(query_vector)  # (C_fused,)
-        modulated = vit_fused * q[None, :, None, None]  # (1, C_fused, H, W)
-
-        # Spatial gating
-        modulated = modulated * attn  # (1, C_fused, H, W)
-
-        # Concatenate coarse attention as extra channel
-        x = torch.cat([modulated, attn], dim=1)  # (1, C_fused+1, H, W)
-
-        # Decode to 64x64
-        out = self.refine(x)          # (1, 1, 64, 64)
-        out = torch.sigmoid(out)
-
-        return out.squeeze(0).squeeze(0)  # (64, 64)
-
-    def forward_batched(
-        self,
-        vit_fused: torch.Tensor,
-        coarse_heatmap: torch.Tensor,
-        query_vector: torch.Tensor,
-    ) -> torch.Tensor:
-        """Batched fine localization."""
         if coarse_heatmap.dim() == 5:
-            batch_size, num_hist, num_views = coarse_heatmap.shape[:3]
-            if num_hist == 0:
-                return coarse_heatmap.new_empty((batch_size, 0, num_views, 64, 64))
+            return self._forward_5d(vit_fused, coarse_heatmap, spatial_out)
+        return self._forward_4d(vit_fused, coarse_heatmap, spatial_out)
 
-            spatial_size = vit_fused.shape[-2:]
-            attn = F.interpolate(
-                coarse_heatmap.reshape(
-                    batch_size * num_hist * num_views,
-                    1,
-                    coarse_heatmap.shape[-2],
-                    coarse_heatmap.shape[-1],
-                ),
-                size=spatial_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-            attn = torch.sigmoid(attn)
-
-            q = self.query_proj(query_vector)[:, :, None, :].expand(-1, -1, num_views, -1)
-            q = q.reshape(batch_size * num_hist * num_views, -1, 1, 1)
-
-            vit_expanded = vit_fused[:, None, :, :, :, :].expand(-1, num_hist, -1, -1, -1, -1)
-            vit_expanded = vit_expanded.reshape(
-                batch_size * num_hist * num_views,
-                vit_fused.shape[2],
-                *spatial_size,
-            )
-
-            modulated = vit_expanded * q
-            modulated = modulated * attn
-            x = torch.cat([modulated, attn], dim=1)
-
-            out = self.refine(x)
-            out = torch.sigmoid(out)
-            return out.squeeze(1).reshape(batch_size, num_hist, num_views, out.shape[-2], out.shape[-1])
-
+    def _forward_4d(
+        self,
+        vit_fused: torch.Tensor,      # (V, C, 16, 16)
+        coarse_heatmap: torch.Tensor,  # (N, V, H_c, W_c)
+        spatial_out: torch.Tensor,     # (N, V*H_c*W_c, d_attn)
+    ) -> torch.Tensor:
         num_hist, num_views = coarse_heatmap.shape[:2]
+        H_c, W_c = coarse_heatmap.shape[2], coarse_heatmap.shape[3]
         if num_hist == 0:
             return coarse_heatmap.new_empty((0, num_views, 64, 64))
 
-        spatial_size = vit_fused.shape[2:]
+        spatial_size = vit_fused.shape[2:]  # (16, 16)
+
         attn = F.interpolate(
-            coarse_heatmap.reshape(num_hist * num_views, 1, coarse_heatmap.shape[-2], coarse_heatmap.shape[-1]),
+            coarse_heatmap.reshape(num_hist * num_views, 1, H_c, W_c),
             size=spatial_size,
             mode="bilinear",
             align_corners=False,
         )
-        attn = torch.sigmoid(attn)
+        attn = torch.sigmoid(attn)  # (N*V, 1, 16, 16)
 
-        q = self.query_proj(query_vector)[:, None, :].expand(-1, num_views, -1)
-        q = q.reshape(num_hist * num_views, -1, 1, 1)
+        so = spatial_out.reshape(num_hist, num_views, H_c, W_c, -1)
+        so = so.permute(0, 1, 4, 2, 3).reshape(num_hist * num_views, -1, H_c, W_c)
+        so_up = F.interpolate(so, size=spatial_size, mode="bilinear", align_corners=False)
+        # (N*V, d_attn, 16, 16)
 
         vit_expanded = vit_fused.unsqueeze(0).expand(num_hist, -1, -1, -1, -1)
         vit_expanded = vit_expanded.reshape(num_hist * num_views, vit_fused.shape[1], *spatial_size)
+        # (N*V, C, 16, 16)
 
-        modulated = vit_expanded * q
-        modulated = modulated * attn
-        x = torch.cat([modulated, attn], dim=1)
+        x = torch.cat([vit_expanded, so_up, attn], dim=1)  # (N*V, 2C+1, 16, 16)
 
         out = self.refine(x)
         out = torch.sigmoid(out)
         return out.squeeze(1).reshape(num_hist, num_views, out.shape[-2], out.shape[-1])
+
+    def _forward_5d(
+        self,
+        vit_fused: torch.Tensor,      # (B, V, C, 16, 16)
+        coarse_heatmap: torch.Tensor,  # (B, N, V, H_c, W_c)
+        spatial_out: torch.Tensor,     # (B, N, V*H_c*W_c, d_attn)
+    ) -> torch.Tensor:
+        batch_size, num_hist, num_views = coarse_heatmap.shape[:3]
+        H_c, W_c = coarse_heatmap.shape[3], coarse_heatmap.shape[4]
+        if num_hist == 0:
+            return coarse_heatmap.new_empty((batch_size, 0, num_views, 64, 64))
+
+        spatial_size = vit_fused.shape[-2:]  # (16, 16)
+        BNV = batch_size * num_hist * num_views
+
+        attn = F.interpolate(
+            coarse_heatmap.reshape(BNV, 1, H_c, W_c),
+            size=spatial_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        attn = torch.sigmoid(attn)  # (B*N*V, 1, 16, 16)
+
+        so = spatial_out.reshape(batch_size, num_hist, num_views, H_c, W_c, -1)
+        so = so.permute(0, 1, 2, 5, 3, 4).reshape(BNV, -1, H_c, W_c)
+        so_up = F.interpolate(so, size=spatial_size, mode="bilinear", align_corners=False)
+        # (B*N*V, d_attn, 16, 16)
+
+        vit_expanded = vit_fused[:, None, :, :, :, :].expand(-1, num_hist, -1, -1, -1, -1)
+        vit_expanded = vit_expanded.reshape(BNV, vit_fused.shape[2], *spatial_size)
+        # (B*N*V, C, 16, 16)
+
+        x = torch.cat([vit_expanded, so_up, attn], dim=1)  # (B*N*V, 2C+1, 16, 16)
+
+        out = self.refine(x)
+        out = torch.sigmoid(out)
+        return out.squeeze(1).reshape(batch_size, num_hist, num_views, out.shape[-2], out.shape[-1])
