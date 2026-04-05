@@ -64,6 +64,11 @@ model:
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_layer_indices: [5, 6, 12, 13, 19, 20]
+    lora_dropout: 0.05
 
   # HeatmapVLN v2 Coarse-to-Fine
   heatmap:
@@ -139,6 +144,7 @@ training:
       train_action: false
       trainable_modules:
         - heatmap_vln
+        - lora
       frozen_modules:
         - qwen3_5
         - transformer_action_head
@@ -154,6 +160,7 @@ optim:
   learning_rate: 1.0e-4
   heatmap_lr: 1.0e-4
   vis_head_lr: 1.0e-3
+  lora_lr: 5.0e-6
   weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16

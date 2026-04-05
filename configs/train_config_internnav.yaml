@@ -63,6 +63,12 @@ model:
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
+    # LoRA: 适配 hook 层的 cross-image attention (前向→全景)
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_layer_indices: [5, 6, 12, 13, 19, 20]
+    lora_dropout: 0.05
 
   # HeatmapVLN v2 Coarse-to-Fine
   heatmap:
@@ -165,6 +171,7 @@ training:
         - cond_projector        # Bridge: latent_queries -> NextDiT condition space
         - progress_head
         - llm_projector
+        - lora                  # 适配 LLM hook 层的 cross-image attention (前向→全景)
       frozen_modules:
         - qwen3_5               # Freeze VLM backbone (InternNav Qwen2.5-VL)
         - traj_dit              # Freeze NextDiT core (pre-trained)
@@ -191,6 +198,7 @@ optim:
   latent_queries_lr: 5.0e-4
   progress_lr: 1.0e-4
   llm_projector_lr: 1.0e-4
+  lora_lr: 5.0e-6
   weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16
