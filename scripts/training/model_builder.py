@@ -1,0 +1,286 @@
+"""
+Model construction and freeze/unfreeze strategies.
+"""
+
+import logging
+from pathlib import Path
+from typing import Any, Dict
+
+import torch
+import torch.nn as nn
+
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
+
+logger = logging.getLogger(__name__)
+
+
+def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
+    """Build the VLN Pipeline from a config dict."""
+    model_cfg = cfg['model']
+    llm_cfg = model_cfg.get('llm', {})
+    heatmap_cfg = model_cfg.get('heatmap', {})
+    action_cfg = model_cfg.get('action_head', {})
+    stop_cfg = model_cfg.get('stop_head', {})
+    progress_cfg = model_cfg.get('progress_head', {})
+
+    action_head_type = action_cfg.get('type', 'transformer')
+
+    legacy_action_cfg = action_cfg.get('legacy', {})
+    transformer_action_cfg = action_cfg.get('transformer', {})
+    nextdit_cfg = action_cfg.get('nextdit', {})
+
+    config = VLNPipelineConfig(
+        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
+        llm_backbone_type=llm_cfg.get('backbone_type', 'auto'),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
+        llm_token_dim=llm_cfg.get('token_dim', 1024),
+        llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
+        max_video_frames=llm_cfg.get('max_video_frames', 16),
+        llm_enable_internal_profiling=llm_cfg.get('enable_internal_profiling', False),
+        enable_runtime_timing=cfg.get('log', {}).get('enable_timing', False),
+        llm_enable_compile=llm_cfg.get('enable_compile', False),
+        llm_compile_mode=llm_cfg.get('compile_mode', 'reduce-overhead'),
+        llm_compile_backend=llm_cfg.get('compile_backend', 'inductor'),
+
+        enable_packing=llm_cfg.get('enable_packing', False),
+        max_seq_length=llm_cfg.get('max_seq_length', 4096),
+        spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
+
+        internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
+
+        device=model_cfg.get('device', 'cuda'),
+
+        enable_heatmap=heatmap_cfg.get('enable', True),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
+        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [7, 15, 23]),
+        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
+        image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
+        heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
+        heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
+        heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
+        heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
+
+        use_lora=llm_cfg.get('use_lora', False),
+        lora_rank=llm_cfg.get('lora_rank', 16),
+        lora_alpha=llm_cfg.get('lora_alpha', 32),
+        lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_layer_indices=llm_cfg.get('lora_layer_indices', None),
+        lora_dropout=llm_cfg.get('lora_dropout', 0.05),
+        lora_target_modules=llm_cfg.get('lora_target_modules', None),
+
+        action_head_type=action_head_type,
+        enable_action_head=action_cfg.get('enable', True),
+
+        action_dim=legacy_action_cfg.get('action_dim', 2),
+        action_pred_horizon=legacy_action_cfg.get('pred_horizon', 1),
+        action_encoding_size=legacy_action_cfg.get('encoding_size', 256),
+        action_down_dims=legacy_action_cfg.get('down_dims', None),
+        action_num_diffusion_iters=legacy_action_cfg.get('num_diffusion_iters', 10),
+        action_stats_min=legacy_action_cfg.get('action_stats_min', [-0.17, -0.03]),
+        action_stats_max=legacy_action_cfg.get('action_stats_max', [0.19, 0.31]),
+
+        transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
+        transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
+        transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
+        transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
+        transformer_n_head=transformer_action_cfg.get('n_head', 6),
+        transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
+        transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
+        transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
+        transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
+        transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
+
+        nextdit_enabled=nextdit_cfg.get('enabled', False),
+        nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 4096),
+        nextdit_latent_emb_size=nextdit_cfg.get('latent_emb_size', 768),
+        nextdit_n_query=nextdit_cfg.get('n_query', 4),
+        nextdit_dit_dim=nextdit_cfg.get('dit_dim', 384),
+        nextdit_dit_layers=nextdit_cfg.get('dit_layers', 12),
+        nextdit_dit_heads=nextdit_cfg.get('dit_heads', 6),
+        nextdit_dit_kv_heads=nextdit_cfg.get('dit_kv_heads', 6),
+        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get('dit_ffn_dim_multiplier', None),
+        nextdit_predict_steps=nextdit_cfg.get('predict_steps', 32),
+        nextdit_action_dim=nextdit_cfg.get('action_dim', 3),
+        nextdit_num_inference_steps=nextdit_cfg.get('num_inference_steps', 10),
+        nextdit_guidance_scale=nextdit_cfg.get('guidance_scale', 1.0),
+        nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
+        nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
+        nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
+
+        enable_stop_head=stop_cfg.get('enable', False),
+        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
+        stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
+        stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
+
+        enable_progress_head=progress_cfg.get('enable', True),
+        progress_hidden_dim=progress_cfg.get('hidden_dim', 512),
+
+        verbose=True,
+    )
+
+    model = VLNPipeline(config)
+
+    internnav_s1 = nextdit_cfg.get('internnav_system1_path', '')
+    s1_ckpt = nextdit_cfg.get('pretrained_system1_path', '')
+    if s1_ckpt and not internnav_s1 and model.nextdit_action_head is not None:
+        s1_path = Path(s1_ckpt)
+        if s1_path.exists():
+            model.nextdit_action_head.load_pretrained_system1(
+                str(s1_path),
+                latent_queries=model.latent_queries,
+            )
+        else:
+            print(f"System 1 pretrained weights not found: {s1_path}")
+
+    packing_enabled = llm_cfg.get('enable_packing', False)
+    backbone_type = llm_cfg.get('backbone_type', 'auto')
+    if verbose:
+        print(f"VLN Pipeline built")
+        print(f"   Backbone -> {llm_cfg.get('model_path', './models/qwen_3.5')} (type={backbone_type})")
+        print(f"   SequencePacking -> enabled={packing_enabled}")
+        print(
+            "   HeatmapVLN → "
+            f"enabled={heatmap_cfg.get('enable', True)}, "
+            f"c_vit={heatmap_cfg.get('c_vit', 1152)}, "
+            f"c_llm={heatmap_cfg.get('c_llm', 4096)}, "
+            f"c_fused={heatmap_cfg.get('c_fused', 256)}, "
+            f"vit_layers={heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24])}, "
+            f"llm_layers={heatmap_cfg.get('llm_layer_indices', [7, 15, 23])}"
+        )
+        print(f"   ActionHead → type={action_head_type}, enabled={action_cfg.get('enable', True)}")
+        if s1_ckpt:
+            print(f"   System1 pretrained → {s1_ckpt}")
+        print(f"   ProgressHead → enabled={progress_cfg.get('enable', True)}")
+        print(f"   StopHead (legacy) → enabled={stop_cfg.get('enable', False)}")
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Freeze / unfreeze utilities
+# ---------------------------------------------------------------------------
+
+def freeze_module(module: nn.Module, freeze: bool = True):
+    for param in module.parameters():
+        param.requires_grad = not freeze
+
+
+def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
+    """Set trainable modules according to stage config."""
+    freeze_module(model, freeze=True)
+
+    trainable = stage_cfg.get('trainable_modules', [])
+
+    if 'heatmap_vln' in trainable:
+        if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
+            freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.coarse, freeze=False)
+            freeze_module(model.heatmap_vln.fine, freeze=False)
+            logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
+
+    if 'action_head' in trainable:
+        if hasattr(model, 'action_head') and model.action_head is not None:
+            freeze_module(model.action_head, freeze=False)
+            logger.info("  ✓ Unfrozen: action_head (legacy)")
+
+    if 'transformer_action_head' in trainable:
+        if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
+            freeze_module(model.transformer_action_head, freeze=False)
+            logger.info("  ✓ Unfrozen: transformer_action_head")
+
+    if 'nextdit_action_head' in trainable:
+        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+            freeze_module(model.nextdit_action_head, freeze=False)
+            if hasattr(model.nextdit_action_head, 'rgb_model'):
+                model.nextdit_action_head.rgb_model.requires_grad_(False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head (rgb_model kept frozen)")
+
+    if 'latent_queries' in trainable:
+        if hasattr(model, 'latent_queries') and model.latent_queries is not None:
+            model.latent_queries.requires_grad_(True)
+            logger.info("  ✓ Unfrozen: latent_queries")
+
+    if 'cond_projector' in trainable:
+        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+            freeze_module(model.nextdit_action_head.cond_projector, freeze=False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head.cond_projector")
+
+    if 'stop_head' in trainable:
+        if hasattr(model, 'stop_head') and model.stop_head is not None:
+            freeze_module(model.stop_head, freeze=False)
+            logger.info("  ✓ Unfrozen: stop_head")
+
+    if 'progress_head' in trainable:
+        if hasattr(model, 'progress_head') and model.progress_head is not None:
+            freeze_module(model.progress_head, freeze=False)
+            logger.info("  ✓ Unfrozen: progress_head")
+
+    if 'llm_projector' in trainable:
+        if hasattr(model, 'llm_projector'):
+            freeze_module(model.llm_projector, freeze=False)
+            logger.info("  ✓ Unfrozen: llm_projector")
+
+    if hasattr(model, 'qwen3_5') and model.qwen3_5 is not None:
+        freeze_module(model.qwen3_5, freeze=True)
+        if 'lora' in trainable or 'qwen3_5_lora' in trainable:
+            lora_count = 0
+            for name, param in model.qwen3_5.named_parameters():
+                if 'lora_' in name:
+                    param.requires_grad = True
+                    lora_count += 1
+            if lora_count > 0:
+                logger.info(f"  ✓ Unfrozen: qwen3_5 LoRA ({lora_count} parameter tensors)")
+            else:
+                logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
+
+
+def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: Dict, logger) -> int:
+    """Apply warmup freeze: only cond_projector + latent_queries trainable.
+
+    Must be called AFTER build_optimizer so all params are registered.
+    Returns warmup_steps (0 if disabled).
+    """
+    nextdit_cfg = cfg.get('model', {}).get('action_head', {}).get('nextdit', {})
+    warmup_steps = nextdit_cfg.get('warmup_steps', 0)
+    if warmup_steps <= 0:
+        return 0
+    nah = getattr(model, 'nextdit_action_head', None)
+    if nah is None:
+        return 0
+
+    freeze_module(nah, freeze=True)
+    freeze_module(nah.cond_projector, freeze=False)
+
+    cp_params = sum(p.numel() for p in nah.cond_projector.parameters() if p.requires_grad)
+    lq_params = model.latent_queries.numel() if (
+        hasattr(model, 'latent_queries') and model.latent_queries is not None
+        and model.latent_queries.requires_grad
+    ) else 0
+
+    logger.info(
+        "🔥 NextDiT warmup active: first %d steps only train cond_projector (%s params) "
+        "+ latent_queries (%s params), rest of System 1 frozen",
+        warmup_steps, f"{cp_params:,}", f"{lq_params:,}",
+    )
+    return warmup_steps
+
+
+def end_nextdit_warmup(model: VLNPipeline, logger):
+    """Unfreeze all of nextdit_action_head after warmup completes."""
+    nah = getattr(model, 'nextdit_action_head', None)
+    if nah is None:
+        return
+    freeze_module(nah, freeze=False)
+    if hasattr(nah, 'rgb_model'):
+        nah.rgb_model.requires_grad_(False)
+
+    trainable = sum(p.numel() for p in nah.parameters() if p.requires_grad)
+    logger.info(
+        "🔓 NextDiT warmup complete: unfrozen all System 1 modules (%s trainable params)",
+        f"{trainable:,}",
+    )
