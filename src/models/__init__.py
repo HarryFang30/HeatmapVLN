@@ -2,21 +2,19 @@
 VLN Models Module
 =================
 
-This module provides a VLN pipeline that uses Qwen3.5 for video understanding.
-
-Architecture (v2 — Coarse-to-Fine):
+Architecture (v2 — Coarse-to-Fine + InternNav System 1):
     Current panorama (4 views) + N history panoramas (N*4 views) + text
         |
-    Qwen3.5 (Vision Encoder + LLM, frozen)
+    Qwen2.5-VL (Vision Encoder + LLM, frozen + LoRA)
         |
-    ViT features (16x16) + LLM features (8x8) + text hidden states
-        |
-    Coarse Localisation (zero params) -> visibility + 8x8 heatmap
-        |
-    Fine Localisation (~2M params) -> 64x64 heatmap
+    ├── HeatmapVLN (Coarse-to-Fine)
+    │       → visibility + 64x64 heatmap
+    │
+    └── NextDiT System 1 (InternNav action head)
+            → trajectory (B, T, 3)
 """
 
-# === Qwen3.5 Integration ===
+# === VLM Integration ===
 from .qwen3_5 import (
     Qwen3_5Integration,
     Qwen3_5Config,
@@ -39,11 +37,10 @@ from .heatmap import (
     FeatureExtractor,
 )
 
-# === Action Components ===
+# === Action Components (NextDiT System 1) ===
 from .action import (
-    DiffusionActionHead,
-    DiffusionActionConfig,
-    StopPredictionHead,
+    NextDiTActionHead,
+    NextDiTActionConfig,
 )
 
 # === Other Components ===
@@ -54,28 +51,18 @@ except ImportError:
 
 
 __all__ = [
-    # Qwen3.5 Integration
     'Qwen3_5Integration',
     'Qwen3_5Config',
-
-    # VLN Pipeline
     'VLNPipeline',
     'VLNPipelineConfig',
     'create_vln_pipeline',
-
-    # Heatmap Components (v2)
     'HeatmapVLN',
     'HeatmapVLNLoss',
     'CoarseLocalization',
     'DPTLiteFusion',
     'FineLocalization',
     'FeatureExtractor',
-
-    # Action Components
-    'DiffusionActionHead',
-    'DiffusionActionConfig',
-    'StopPredictionHead',
-
-    # Other
+    'NextDiTActionHead',
+    'NextDiTActionConfig',
     'MLP',
 ]

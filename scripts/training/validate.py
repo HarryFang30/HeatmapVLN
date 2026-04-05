@@ -55,7 +55,6 @@ def validate(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
-    total_stop_loss = 0.0
     total_heatmap_mse = 0.0
     num_heatmap_mse_batches = 0
     num_batches = 0
@@ -200,7 +199,6 @@ def validate(
                     vis_fp += ((pv == 1) & (gv == 0)).sum().item()
                     vis_fn += ((pv == 0) & (gv == 1)).sum().item()
 
-            action_loss = torch.tensor(0.0, device=device)
             trajectory_loss = torch.tensor(0.0, device=device)
 
             if train_action:
@@ -218,59 +216,15 @@ def validate(
                             trajectory_valid=trajectory_valid,
                         )
                         trajectory_loss = traj_result['loss']
-                elif hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
-                    if 'trajectory' in batch:
-                        gt_trajectory = batch['trajectory'].to(device)
-                        trajectory_valid = batch['trajectory_valid'].to(device)
-                        traj_result = model_module.transformer_action_head.compute_loss(
-                            output['llm_tokens'],
-                            gt_trajectory,
-                            trajectory_valid,
-                        )
-                        trajectory_loss = traj_result['loss']
-                elif hasattr(model_module, 'action_head') and model_module.action_head is not None and 'action_cond' in output:
-                    action_result = model_module.action_head.compute_loss(
-                        output['action_cond'],
-                        gt_action.unsqueeze(1),
-                        action_valid
-                    )
-                    action_loss = action_result['loss']
-
-            stop_loss = torch.tensor(0.0, device=device)
-            progress_loss = torch.tensor(0.0, device=device)
-
-            if train_action:
-                if hasattr(model_module, 'progress_head') and model_module.progress_head is not None:
-                    if 'progress' in batch:
-                        gt_progress = batch['progress'].to(device)
-                        progress_valid = batch.get('trajectory_valid', action_valid).to(device)
-                        progress_result = model_module.progress_head(
-                            output['llm_tokens'],
-                            gt_progress=gt_progress,
-                            action_valid=progress_valid,
-                            return_loss=True,
-                        )
-                        progress_loss = progress_result['loss']
-                elif hasattr(model_module, 'stop_head') and model_module.stop_head is not None and 'stop_logits' in output:
-                    stop_loss = model_module.stop_head.compute_loss(
-                        output['stop_logits'],
-                        is_stop,
-                        action_valid
-                    )
 
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
-            progress_weight = loss_cfg.get('progress_weight', 0.5)
 
-            action_total_loss = trajectory_loss if trajectory_loss.item() > 0 else action_loss
-            stop_total_loss = progress_loss if progress_loss.item() > 0 else stop_loss
-
-            loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
+            loss = heatmap_weight * heatmap_loss + trajectory_weight * trajectory_loss
 
             total_loss += loss.item()
             total_heatmap_loss += heatmap_loss.item()
-            total_action_loss += action_total_loss.item()
-            total_stop_loss += stop_total_loss.item()
+            total_action_loss += trajectory_loss.item()
             num_batches += 1
 
             # Reuse current output for inference MSE + visualization
@@ -337,7 +291,6 @@ def validate(
             total_loss,
             total_heatmap_loss,
             total_action_loss,
-            total_stop_loss,
             total_heatmap_mse,
             float(num_batches),
             float(num_heatmap_mse_batches),
@@ -354,18 +307,17 @@ def validate(
     )
     _dist_all_reduce_in_place(totals)
 
-    reduced_num_batches = max(int(totals[5].item()), 1)
-    reduced_num_heatmap_mse_batches = int(totals[6].item())
+    reduced_num_batches = max(int(totals[4].item()), 1)
+    reduced_num_heatmap_mse_batches = int(totals[5].item())
     avg_loss = (totals[0] / reduced_num_batches).item()
     avg_hm = (totals[1] / reduced_num_batches).item()
     avg_act = (totals[2] / reduced_num_batches).item()
-    avg_stop = (totals[3] / reduced_num_batches).item()
-    avg_hm_mse = (totals[4] / max(reduced_num_heatmap_mse_batches, 1)).item() if reduced_num_heatmap_mse_batches > 0 else 0.0
-    avg_peak_loss = (totals[11] / reduced_num_batches).item()
-    avg_vis_loss = (totals[12] / reduced_num_batches).item()
-    avg_coord_loss = (totals[13] / reduced_num_batches).item()
+    avg_hm_mse = (totals[3] / max(reduced_num_heatmap_mse_batches, 1)).item() if reduced_num_heatmap_mse_batches > 0 else 0.0
+    avg_peak_loss = (totals[10] / reduced_num_batches).item()
+    avg_vis_loss = (totals[11] / reduced_num_batches).item()
+    avg_coord_loss = (totals[12] / reduced_num_batches).item()
 
-    r_tp, r_tn, r_fp, r_fn = totals[7].item(), totals[8].item(), totals[9].item(), totals[10].item()
+    r_tp, r_tn, r_fp, r_fn = totals[6].item(), totals[7].item(), totals[8].item(), totals[9].item()
     vis_total = r_tp + r_tn + r_fp + r_fn
     val_vis_metrics = {}
     if vis_total > 0:

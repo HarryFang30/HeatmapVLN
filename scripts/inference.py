@@ -160,15 +160,11 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
-    stop_cfg = model_cfg.get('stop_head', {})
-    progress_cfg = model_cfg.get('progress_head', {})
-    action_head_type = action_cfg.get('type', 'transformer')
-    legacy_action_cfg = action_cfg.get('legacy', {})
-    transformer_action_cfg = action_cfg.get('transformer', {})
+    nextdit_cfg = action_cfg.get('nextdit', {})
     
     config = VLNPipelineConfig(
-        # Qwen3.5
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
+        llm_backbone_type=llm_cfg.get('backbone_type', 'auto'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
@@ -181,11 +177,9 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         enable_packing=llm_cfg.get('enable_packing', False),
         max_seq_length=llm_cfg.get('max_seq_length', 4096),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
-        
-        # Device
+        internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
         device=device,
         
-        # HeatmapVLN v2
         enable_heatmap=heatmap_cfg.get('enable', True),
         heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
         heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
@@ -197,45 +191,34 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
         heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
-        # heatmap_lambda_neg removed (neg_loss deleted)
         heatmap_lambda_peak=heatmap_cfg.get('lambda_peak', 1.0),
+        heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
         
-        # LoRA
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_layer_indices=llm_cfg.get('lora_layer_indices', None),
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
         
-        # Action Head
-        action_head_type=action_head_type,
         enable_action_head=action_cfg.get('enable', True),
-        action_dim=legacy_action_cfg.get('action_dim', 2),
-        action_pred_horizon=legacy_action_cfg.get('pred_horizon', 1),
-        action_encoding_size=legacy_action_cfg.get('encoding_size', 256),
-        action_down_dims=legacy_action_cfg.get('down_dims', None),
-        action_num_diffusion_iters=legacy_action_cfg.get('num_diffusion_iters', 10),
-        action_stats_min=legacy_action_cfg.get('action_stats_min', [-0.17, -0.03]),
-        action_stats_max=legacy_action_cfg.get('action_stats_max', [0.19, 0.31]),
-        transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
-        transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
-        transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
-        transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
-        transformer_n_head=transformer_action_cfg.get('n_head', 6),
-        transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
-        transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
-        transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
-        transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
-        transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
-        
-        # Progress Head
-        enable_stop_head=stop_cfg.get('enable', False),
-        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
-        stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
-        stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
-        enable_progress_head=progress_cfg.get('enable', True),
-        progress_hidden_dim=progress_cfg.get('hidden_dim', 512),
+        nextdit_enabled=nextdit_cfg.get('enabled', False),
+        nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 4096),
+        nextdit_latent_emb_size=nextdit_cfg.get('latent_emb_size', 768),
+        nextdit_n_query=nextdit_cfg.get('n_query', 4),
+        nextdit_dit_dim=nextdit_cfg.get('dit_dim', 384),
+        nextdit_dit_layers=nextdit_cfg.get('dit_layers', 12),
+        nextdit_dit_heads=nextdit_cfg.get('dit_heads', 6),
+        nextdit_dit_kv_heads=nextdit_cfg.get('dit_kv_heads', 6),
+        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get('dit_ffn_dim_multiplier', None),
+        nextdit_predict_steps=nextdit_cfg.get('predict_steps', 32),
+        nextdit_action_dim=nextdit_cfg.get('action_dim', 3),
+        nextdit_num_inference_steps=nextdit_cfg.get('num_inference_steps', 10),
+        nextdit_guidance_scale=nextdit_cfg.get('guidance_scale', 1.0),
+        nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
+        nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
+        nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
         
         verbose=True,
     )
@@ -400,21 +383,6 @@ def run_inference(
         if trajectory is not None:
             results['trajectory'] = trajectory[0].cpu().numpy()
             logger.info(f"Generated trajectory: shape={results['trajectory'].shape}")
-        elif hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
-            action_cond = outputs.get('action_cond')
-            if action_cond is not None:
-                if action_cond.dim() == 2:
-                    action_cond = action_cond.unsqueeze(1)
-                trajectory = model.transformer_action_head.get_trajectory(action_cond)
-                results['trajectory'] = trajectory[0].cpu().numpy()
-                logger.info(f"Generated trajectory: shape={results['trajectory'].shape}")
-    
-    # Progress
-    if output_progress and 'progress' in outputs:
-        progress = outputs['progress'][0].item()
-        results['progress'] = progress
-        logger.info(f"Predicted progress: {progress:.2%}")
-    
     if 'processing_metadata' in outputs:
         results['metadata'] = outputs['processing_metadata']
     

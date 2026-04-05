@@ -53,7 +53,7 @@ class NextDiTActionConfig:
     dit_layers: int = 12
     dit_heads: int = 6
     dit_kv_heads: int = 6
-    dit_ffn_dim_multiplier: Optional[float] = None
+    dit_ffn_dim_multiplier: Optional[float] = 2 / 3
     predict_steps: int = 32
     action_dim: int = 3
     num_inference_steps: int = 10
@@ -74,7 +74,7 @@ class NextDiTActionHead(nn.Module):
     """
     DualVLN System 1 action head using NextDiT + Flow Matching + Visual Memory.
 
-    Replaces the TransformerActionHead in HeatmapVLN pipeline.
+    InternNav-compatible action head for HeatmapVLN pipeline.
     """
 
     def __init__(self, config: NextDiTActionConfig):
@@ -236,9 +236,17 @@ class NextDiTActionHead(nn.Module):
         }
         dav2_model = DepthAnythingV2(**model_configs["vits"])
         if ckpt_path:
-            state_dict = torch.load(ckpt_path, map_location="cpu")
-            dav2_model.load_state_dict(state_dict)
-            logger.info("Loaded DepthAnythingV2 weights from %s", ckpt_path)
+            ckpt_file = Path(ckpt_path)
+            if ckpt_file.is_file():
+                state_dict = torch.load(str(ckpt_file), map_location="cpu")
+                dav2_model.load_state_dict(state_dict)
+                logger.info("Loaded DepthAnythingV2 weights from %s", ckpt_file)
+            else:
+                logger.warning(
+                    "DepthAnythingV2 checkpoint not found at %s; continuing without external DAV2 weights "
+                    "and expecting System 1 checkpoint loading to overwrite them if available",
+                    ckpt_path,
+                )
         else:
             logger.warning("No DepthAnythingV2 checkpoint provided, using random init")
 
@@ -476,7 +484,7 @@ class NextDiTActionHead(nn.Module):
         traj_images: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        High-level inference interface matching TransformerActionHead API.
+        High-level trajectory inference interface.
 
         Returns:
             trajectory: (B * num_sample_trajs, predict_steps, action_dim)

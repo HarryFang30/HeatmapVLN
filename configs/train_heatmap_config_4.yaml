@@ -95,40 +95,6 @@ model:
 
   action_head:
     enable: false
-    type: transformer
-    legacy:
-      cond_dim: 896
-      action_dim: 2
-      pred_horizon: 1
-      num_diffusion_iters: 10
-      encoding_size: 256
-      down_dims: [128, 256]
-      action_stats_min: [-0.1646, -0.0281]
-      action_stats_max: [0.1850, 0.3087]
-    transformer:
-      vlm_token_dim: 896
-      n_emb: 384
-      predict_size: 24
-      n_layer: 16
-      n_head: 6
-      n_cond_layers: 4
-      action_dim: 3
-      num_train_timesteps: 20
-      p_drop_emb: 0.2
-      p_drop_attn: 0.2
-      causal_attn: true
-
-  progress_head:
-    enable: false
-    hidden_dim: 512
-    dropout: 0.3
-    concat_state_txt: true
-
-  stop_head:
-    enable: false
-    hidden_dim: 512
-    focal_gamma: 3.0
-    focal_alpha: 0.9
 
 # ============================================
 # 训练策略 - 只训练热力图
@@ -146,10 +112,6 @@ training:
         - lora
       frozen_modules:
         - qwen3_5
-        - transformer_action_head
-        - action_head
-        - progress_head
-        - stop_head
 
 # ============================================
 # 优化器配置
@@ -192,7 +154,6 @@ loss:
   
   heatmap_weight: 1.0
   trajectory_weight: 0.0
-  progress_weight: 0.0
 
 # ============================================
 # GPU配置

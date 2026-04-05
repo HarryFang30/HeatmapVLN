@@ -1,19 +1,18 @@
 """
-VLN Pipeline with Qwen3.5 — v2 (Coarse-to-Fine)
-===================================================
+VLN Pipeline — v2 (Coarse-to-Fine) + InternNav System 1
+=========================================================
 
 Architecture:
     Current panorama (4 views) + N history panoramas + text
         |
-    Qwen3.5 (Vision Encoder + LLM, frozen)
+    Qwen2.5-VL / Qwen3.5 (Vision Encoder + LLM, frozen + LoRA)
         |
-    HeatmapVLN (Coarse-to-Fine, ~2M trainable)
-        |
-    Output:
-        - visibility (N_hist, 4)
-        - heatmaps   (N_hist, 4, 64, 64)
-        - trajectory  (optional, from TransformerActionHead)
-        - progress    (optional, from ProgressPredictionHead)
+    ├── HeatmapVLN (Coarse-to-Fine, ~2M trainable)
+    │       → visibility (N_hist, 4)
+    │       → heatmaps   (N_hist, 4, 64, 64)
+    │
+    └── NextDiT System 1 (InternNav action head)
+            → trajectory (B, T, 3)
 """
 
 import time
@@ -25,11 +24,6 @@ from dataclasses import dataclass
 
 from .qwen3_5 import Qwen3_5Integration, Qwen3_5Config
 from .action import (
-    DiffusionActionHead,
-    DiffusionActionConfig,
-    StopPredictionHead,
-    TransformerActionHead,
-    ProgressPredictionHead,
     NextDiTActionHead,
     NextDiTActionConfig,
 )
@@ -43,11 +37,11 @@ VIEW_NAMES = ("front", "right", "back", "left")
 class VLNPipelineConfig:
     """Configuration for VLN pipeline."""
 
-    # VLM backbone configuration (Qwen3.5 or Qwen2.5-VL)
-    llm_model_path: str = "./models/qwen_3.5"
-    llm_backbone_type: str = "auto"  # "auto", "qwen3_5", "qwen2_5_vl"
-    llm_hidden_dim: int = 4096
-    llm_token_dim: int = 1024
+    # VLM backbone configuration (shared default: InternNav Qwen2.5-VL)
+    llm_model_path: str = "./models/internnav_backbone"
+    llm_backbone_type: str = "qwen2_5_vl"  # "auto", "qwen3_5", "qwen2_5_vl"
+    llm_hidden_dim: int = 3584
+    llm_token_dim: int = 896
     llm_torch_dtype: str = "bfloat16"
     llm_attn_implementation: str = "sdpa"
     max_video_frames: int = 16
@@ -94,30 +88,8 @@ class VLNPipelineConfig:
     heatmap_lambda_kl: float = 1.0
     heatmap_lambda_peak: float = 1.0
 
-    # ==================== Action Head ====================
-    action_head_type: str = "transformer"
+    # ==================== Action Head (NextDiT System 1) ====================
     enable_action_head: bool = True
-    action_dim: int = 2
-    action_pred_horizon: int = 1
-    action_encoding_size: int = 256
-    action_down_dims: List[int] = None
-    action_num_diffusion_iters: int = 10
-    action_stats_min: List[float] = None
-    action_stats_max: List[float] = None
-
-    # Transformer action head
-    transformer_action_dim: int = 3
-    transformer_predict_size: int = 24
-    transformer_n_emb: int = 384
-    transformer_n_layer: int = 16
-    transformer_n_head: int = 6
-    transformer_n_cond_layers: int = 4
-    transformer_num_train_timesteps: int = 20
-    transformer_p_drop_emb: float = 0.1
-    transformer_p_drop_attn: float = 0.1
-    transformer_causal_attn: bool = True
-
-    # NextDiT action head (DualVLN System 1)
     nextdit_enabled: bool = False
     nextdit_vlm_hidden_dim: int = 4096
     nextdit_latent_emb_size: int = 768
@@ -126,7 +98,7 @@ class VLNPipelineConfig:
     nextdit_dit_layers: int = 12
     nextdit_dit_heads: int = 6
     nextdit_dit_kv_heads: int = 6
-    nextdit_dit_ffn_dim_multiplier: Optional[float] = None
+    nextdit_dit_ffn_dim_multiplier: Optional[float] = 2 / 3
     nextdit_predict_steps: int = 32
     nextdit_action_dim: int = 3
     nextdit_num_inference_steps: int = 10
@@ -134,14 +106,6 @@ class VLNPipelineConfig:
     nextdit_num_sample_trajs: int = 32
     nextdit_dav2_ckpt_path: str = ""
     nextdit_enable_gradient_checkpointing: bool = True
-
-    # Stop/Progress prediction
-    enable_stop_head: bool = False
-    stop_hidden_dim: int = 512
-    stop_focal_gamma: float = 2.0
-    stop_focal_alpha: float = 0.75
-    enable_progress_head: bool = True
-    progress_hidden_dim: int = 512
 
     # Performance settings
     enable_gradient_checkpointing: bool = False
@@ -162,7 +126,10 @@ class VLNPipeline(nn.Module):
         self.device = torch.device(config.device)
 
         logger.info("=" * 60)
-        logger.info("Initializing VLN Pipeline with Qwen3.5 (v2 Coarse-to-Fine)")
+        logger.info(
+            "Initializing VLN Pipeline (backbone=%s, HeatmapVLN v2 Coarse-to-Fine)",
+            config.llm_backbone_type,
+        )
         logger.info("=" * 60)
 
         # ==================== VLM Backbone ====================
@@ -214,9 +181,7 @@ class VLNPipeline(nn.Module):
         self.heatmap_vln: Optional[HeatmapVLN] = None
         self._heatmap_enabled = config.enable_heatmap
 
-        # ==================== Action Head ====================
-        self.action_head = None
-        self.transformer_action_head = None
+        # ==================== Action Head (NextDiT System 1) ====================
         self.nextdit_action_head = None
         self.latent_queries = None
 
@@ -252,70 +217,6 @@ class VLNPipeline(nn.Module):
             )
             if config.internnav_system1_path:
                 self._load_internnav_system1(config.internnav_system1_path)
-        elif config.enable_action_head:
-            if config.action_head_type == "transformer":
-                self.transformer_action_head = TransformerActionHead(
-                    vlm_token_dim=config.llm_token_dim,
-                    n_emb=config.transformer_n_emb,
-                    predict_size=config.transformer_predict_size,
-                    n_layer=config.transformer_n_layer,
-                    n_head=config.transformer_n_head,
-                    n_cond_layers=config.transformer_n_cond_layers,
-                    p_drop_emb=config.transformer_p_drop_emb,
-                    p_drop_attn=config.transformer_p_drop_attn,
-                    action_dim=config.transformer_action_dim,
-                    num_train_timesteps=config.transformer_num_train_timesteps,
-                    causal_attn=config.transformer_causal_attn,
-                ).to(device=self.device, dtype=config.dtype)
-                logger.info(
-                    "TransformerActionHead: predict_size=%d, n_layer=%d, action_dim=%d",
-                    config.transformer_predict_size,
-                    config.transformer_n_layer,
-                    config.transformer_action_dim,
-                )
-            else:
-                action_config_kwargs = {
-                    'action_dim': config.action_dim,
-                    'pred_horizon': config.action_pred_horizon,
-                    'cond_dim': config.llm_token_dim,
-                    'encoding_size': config.action_encoding_size,
-                    'num_diffusion_iters': config.action_num_diffusion_iters,
-                    'action_stats_min': config.action_stats_min or [-0.17, -0.03],
-                    'action_stats_max': config.action_stats_max or [0.19, 0.31],
-                    'device': str(self.device),
-                }
-                if config.action_down_dims is not None:
-                    action_config_kwargs['down_dims'] = config.action_down_dims
-                action_config = DiffusionActionConfig(**action_config_kwargs)
-                self.action_head = DiffusionActionHead(action_config).to(
-                    device=self.device, dtype=config.dtype,
-                )
-                logger.info("DiffusionActionHead (legacy) initialized")
-
-        # ==================== Stop Head (Legacy) ====================
-        if config.enable_stop_head:
-            self.stop_head = StopPredictionHead(
-                input_dim=config.llm_token_dim,
-                hidden_dim=config.stop_hidden_dim,
-                dropout=0.1,
-                focal_gamma=config.stop_focal_gamma,
-                focal_alpha=config.stop_focal_alpha,
-            ).to(device=self.device, dtype=config.dtype)
-            logger.info("Stop Head initialized")
-        else:
-            self.stop_head = None
-
-        # ==================== Progress Head ====================
-        if config.enable_progress_head:
-            self.progress_head = ProgressPredictionHead(
-                input_dim=config.llm_token_dim,
-                hidden_dim=config.progress_hidden_dim,
-                dropout=0.1,
-                concat_state_txt=True,
-            ).to(device=self.device, dtype=config.dtype)
-            logger.info("Progress Head initialized")
-        else:
-            self.progress_head = None
 
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")
@@ -529,7 +430,6 @@ class VLNPipeline(nn.Module):
         return_actions: bool = True,
         gt_actions: Optional[torch.Tensor] = None,
         action_valid: Optional[torch.Tensor] = None,
-        gt_stop: Optional[torch.Tensor] = None,
         gt_history_heatmap: Optional[torch.Tensor] = None,
         gt_future_heatmap: Optional[torch.Tensor] = None,
         current_views: Optional[Dict[str, Any]] = None,
@@ -539,13 +439,7 @@ class VLNPipeline(nn.Module):
         panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
         history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """
-        Forward pass.
-
-        For the v2 Coarse-to-Fine heatmap path, provide ``current_views``
-        and ``history_panoramas`` directly.  The legacy ``video_frames``
-        path still works for action / progress heads.
-        """
+        """Forward pass."""
         batch_size, num_frames = video_frames.shape[:2]
 
         if current_observation is None:
@@ -621,37 +515,15 @@ class VLNPipeline(nn.Module):
                     heatmap_output['heatmaps_gated'] = qwen_output['heatmaps_gated']
 
         # ==================== Step 4: Action Generation ====================
-        actions = None
         trajectory = None
         traj_hidden_states = qwen_output.get('traj_hidden_states') if qwen_output is not None else None
-        action_cond = llm_tokens.mean(dim=1) if llm_tokens is not None else None
 
         if return_actions:
             if self.nextdit_action_head is not None and traj_hidden_states is not None:
                 if not self.training:
-                    traj_images = kwargs.get('traj_images') if 'kwargs' in dir() else None
                     trajectory = self.nextdit_action_head.get_trajectory(
-                        traj_hidden_states, traj_images=traj_images,
+                        traj_hidden_states,
                     )
-            elif self.transformer_action_head is not None and llm_tokens is not None:
-                if not self.training:
-                    trajectory = self.transformer_action_head.get_trajectory(llm_tokens)
-            elif self.action_head is not None and action_cond is not None:
-                if not self.training:
-                    actions = self.action_head(action_cond)
-
-        # ==================== Step 5: Stop/Progress ====================
-        progress = None
-        stop_logits = None
-        stop_prob = None
-
-        if self.progress_head is not None and llm_tokens is not None:
-            progress = self.progress_head.get_progress(llm_tokens)
-
-        if self.stop_head is not None and llm_tokens is not None:
-            stop_cond = llm_tokens.mean(dim=1)
-            stop_logits = self.stop_head.classifier(stop_cond).squeeze(-1)
-            stop_prob = torch.sigmoid(stop_logits)
 
         # ==================== Build Output ====================
         output: Dict[str, Any] = {
@@ -672,9 +544,6 @@ class VLNPipeline(nn.Module):
             if 'heatmaps_gated' in heatmap_output:
                 output['heatmaps_gated'] = heatmap_output['heatmaps_gated']
 
-        if action_cond is not None:
-            output['action_cond'] = action_cond
-
         if traj_hidden_states is not None:
             output['traj_hidden_states'] = traj_hidden_states
 
@@ -682,20 +551,6 @@ class VLNPipeline(nn.Module):
             output['has_nextdit_action_head'] = True
             if not self.training and trajectory is not None:
                 output['trajectory'] = trajectory
-        elif self.transformer_action_head is not None:
-            output['has_transformer_action_head'] = True
-            if not self.training and trajectory is not None:
-                output['trajectory'] = trajectory
-        elif self.action_head is not None:
-            output['has_action_head'] = True
-            if not self.training and actions is not None:
-                output['actions'] = actions
-
-        if progress is not None:
-            output['progress'] = progress
-        if stop_logits is not None:
-            output['stop_logits'] = stop_logits
-            output['stop_prob'] = stop_prob
 
         if return_intermediate and raw_hidden_states is not None and qwen_output is not None:
             output['intermediate_features'] = {
@@ -711,20 +566,8 @@ class VLNPipeline(nn.Module):
         return_intermediate: bool = False,
         return_heatmaps: bool = True,
         return_actions: bool = True,
-        gt_actions: Optional[torch.Tensor] = None,
-        action_valid: Optional[torch.Tensor] = None,
-        gt_stop: Optional[torch.Tensor] = None,
-        gt_history_heatmap: Optional[torch.Tensor] = None,
-        gt_future_heatmap: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """
-        Forward pass with packed batch.
-
-        Note: HeatmapVLN v2 uses its own multi-image input construction
-        (construct_input), so the packed path primarily serves action/progress
-        heads. Heatmap generation should use forward() with current_views /
-        history_panoramas.
-        """
+        """Forward pass with packed batch."""
         batch_size = packed_batch["num_samples"]
         seq_lens = packed_batch["seq_lens"]
         current_observation = packed_batch["current_frame"].to(self.device)
@@ -755,32 +598,6 @@ class VLNPipeline(nn.Module):
         # history_panoramas should be done via forward() instead.
         # This path does not generate heatmaps.
 
-        # ==================== Step 4: Action Generation ====================
-        actions = None
-        trajectory = None
-        action_cond = llm_tokens.mean(dim=1)
-
-        if return_actions:
-            if self.transformer_action_head is not None:
-                if not self.training:
-                    trajectory = self.transformer_action_head.get_trajectory(llm_tokens)
-            elif self.action_head is not None:
-                if not self.training:
-                    actions = self.action_head(action_cond)
-
-        # ==================== Step 5: Stop/Progress ====================
-        progress = None
-        stop_logits = None
-        stop_prob = None
-
-        if self.progress_head is not None:
-            progress = self.progress_head.get_progress(llm_tokens)
-
-        if self.stop_head is not None:
-            stop_cond = llm_tokens.mean(dim=1)
-            stop_logits = self.stop_head.classifier(stop_cond).squeeze(-1)
-            stop_prob = torch.sigmoid(stop_logits)
-
         # ==================== Build Output ====================
         output: Dict[str, Any] = {
             'llm_tokens': llm_tokens,
@@ -793,23 +610,6 @@ class VLNPipeline(nn.Module):
             },
         }
 
-        output['action_cond'] = action_cond
-
-        if self.transformer_action_head is not None:
-            output['has_transformer_action_head'] = True
-            if not self.training and trajectory is not None:
-                output['trajectory'] = trajectory
-        elif self.action_head is not None:
-            output['has_action_head'] = True
-            if not self.training and actions is not None:
-                output['actions'] = actions
-
-        if progress is not None:
-            output['progress'] = progress
-        if stop_logits is not None:
-            output['stop_logits'] = stop_logits
-            output['stop_prob'] = stop_prob
-
         if return_intermediate:
             output['intermediate_features'] = {
                 'raw_hidden_states': raw_hidden_states,
@@ -820,7 +620,7 @@ class VLNPipeline(nn.Module):
 
 
 def create_vln_pipeline(
-    llm_model_path: str = "./models/qwen_3.5",
+    llm_model_path: str = "./models/internnav_backbone",
     heatmap_size: Tuple[int, int] = (64, 64),
     device: str = "cuda",
     verbose: bool = True,

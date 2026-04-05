@@ -88,23 +88,8 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         print(f"  Param group: heatmap_coarse (lr={heatmap_lr}, {n_coarse} params)")
         print(f"  Param group: heatmap_vis_head (lr={vis_head_lr}, {n_vis} params)")
 
-    # Action Head (Legacy)
-    action_lr = optim_cfg.get('action_lr', 1e-4)
-    if hasattr(model, 'action_head') and model.action_head is not None:
-        groups = get_param_groups_with_wd(model.action_head, action_lr, 'action_head', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: action_head (lr={action_lr}, wd={default_wd})")
-
-    # Transformer Action Head
-    transformer_action_lr = optim_cfg.get('transformer_action_lr', action_lr)
-    if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
-        groups = get_param_groups_with_wd(model.transformer_action_head, transformer_action_lr, 'transformer_action_head', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: transformer_action_head (lr={transformer_action_lr}, wd={default_wd})")
-
     # NextDiT Action Head — split cond_projector for higher warmup lr
+    action_lr = optim_cfg.get('action_lr', 1e-4)
     nextdit_lr = optim_cfg.get('nextdit_action_lr', action_lr)
     nextdit_cond_lr = optim_cfg.get('nextdit_cond_projector_lr', nextdit_lr * 3)
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
@@ -139,22 +124,6 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             'name': 'latent_queries',
         })
         print(f"  Param group: latent_queries (lr={latent_q_lr}, wd=0)")
-
-    # Stop Head (Legacy)
-    stop_lr = optim_cfg.get('stop_lr', action_lr)
-    if hasattr(model, 'stop_head') and model.stop_head is not None:
-        groups = get_param_groups_with_wd(model.stop_head, stop_lr, 'stop_head', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: stop_head (lr={stop_lr}, wd={default_wd})")
-
-    # Progress Head
-    progress_lr = optim_cfg.get('progress_lr', action_lr)
-    if hasattr(model, 'progress_head') and model.progress_head is not None:
-        groups = get_param_groups_with_wd(model.progress_head, progress_lr, 'progress_head', default_wd)
-        if groups:
-            param_groups.extend(groups)
-            print(f"  Param group: progress_head (lr={progress_lr}, wd={default_wd})")
 
     # LLM Projector
     proj_lr = optim_cfg.get('llm_projector_lr', 3e-5)

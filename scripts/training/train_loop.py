@@ -91,7 +91,6 @@ def train_one_epoch(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
-    total_stop_loss = 0.0
     num_batches = 0
 
     optim_cfg = cfg['optim']
@@ -287,8 +286,8 @@ def train_one_epoch(
                     )
                     heatmap_loss = loss_dict['total']
 
-            action_loss = torch.tensor(0.0, device=device)
             trajectory_loss = torch.tensor(0.0, device=device)
+            action_loss = torch.tensor(0.0, device=device)
 
             if train_action:
                 if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
@@ -305,56 +304,11 @@ def train_one_epoch(
                             trajectory_valid=trajectory_valid,
                         )
                         trajectory_loss = traj_result['loss']
-                elif hasattr(model_module, 'transformer_action_head') and model_module.transformer_action_head is not None:
-                    if 'trajectory' in batch:
-                        gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
-                        trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
-                        traj_result = model_module.transformer_action_head.compute_loss(
-                            output['llm_tokens'],
-                            gt_trajectory,
-                            trajectory_valid,
-                        )
-                        trajectory_loss = traj_result['loss']
-                elif hasattr(model_module, 'action_head') and model_module.action_head is not None and 'action_cond' in output:
-                    action_result = model_module.action_head.compute_loss(
-                        output['action_cond'],
-                        gt_action.unsqueeze(1),
-                        action_valid
-                    )
-                    action_loss = action_result['loss']
-
-            stop_loss = torch.tensor(0.0, device=device)
-            progress_loss = torch.tensor(0.0, device=device)
-
-            if train_action:
-                if hasattr(model_module, 'progress_head') and model_module.progress_head is not None:
-                    if 'progress' in batch:
-                        gt_progress = batch['progress'].to(device, non_blocking=True)
-                        progress_valid = batch.get('trajectory_valid', action_valid).to(device)
-                        progress_result = model_module.progress_head(
-                            output['llm_tokens'],
-                            gt_progress=gt_progress,
-                            action_valid=progress_valid,
-                            return_loss=True,
-                        )
-                        progress_loss = progress_result['loss']
-                elif hasattr(model_module, 'stop_head') and model_module.stop_head is not None and 'stop_logits' in output:
-                    stop_loss = model_module.stop_head.compute_loss(
-                        output['stop_logits'],
-                        is_stop,
-                        action_valid
-                    )
 
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
-            action_weight = loss_cfg.get('action_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
-            stop_weight = loss_cfg.get('stop_weight', 0.5)
-            progress_weight = loss_cfg.get('progress_weight', 0.5)
 
-            action_total_loss = trajectory_loss if trajectory_loss.item() > 0 else action_loss
-            stop_total_loss = progress_loss if progress_loss.item() > 0 else stop_loss
-
-            loss = heatmap_weight * heatmap_loss + trajectory_weight * action_total_loss + progress_weight * stop_total_loss
+            loss = heatmap_weight * heatmap_loss + trajectory_weight * trajectory_loss
             loss = loss / grad_accum_steps
         if enable_timing:
             timing_stats['forward_s'] += time.perf_counter() - forward_start
@@ -536,18 +490,15 @@ def train_one_epoch(
 
         _iter_loss = loss.item() * grad_accum_steps
         _iter_hm = heatmap_loss.item()
-        _iter_traj = action_total_loss.item()
-        _iter_stop = stop_total_loss.item()
+        _iter_traj = trajectory_loss.item()
 
         total_loss += _iter_loss
         total_heatmap_loss += _iter_hm
         total_action_loss += _iter_traj
-        total_stop_loss += _iter_stop
         num_batches += 1
 
         del output, loss, heatmap_loss, gt_heatmap
-        del action_total_loss, stop_total_loss
-        del trajectory_loss, action_loss, progress_loss, stop_loss
+        del trajectory_loss, action_loss
         loss_dict = None
         del video_frames
         del current_views_batch, history_panoramas_batch
@@ -668,7 +619,6 @@ def train_one_epoch(
             total_loss,
             total_heatmap_loss,
             total_action_loss,
-            total_stop_loss,
             float(num_batches),
         ],
         device=device,
@@ -676,10 +626,11 @@ def train_one_epoch(
     )
     _dist_all_reduce_in_place(totals)
 
-    reduced_num_batches = max(int(totals[4].item()), 1)
+    reduced_num_batches = max(int(totals[3].item()), 1)
     return {
         'total_loss': (totals[0] / reduced_num_batches).item(),
         'heatmap_loss': (totals[1] / reduced_num_batches).item(),
+        'trajectory_loss': (totals[2] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
     }
 

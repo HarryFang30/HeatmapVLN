@@ -80,35 +80,9 @@ model:
     lambda_kl: 0.0
     lambda_peak: 1.0
 
-  # 动作头配置
+  # NextDiT System 1 — 与 InternNav 完全一致
   action_head:
     enable: true
-    type: transformer
-    
-    legacy:
-      cond_dim: 1024
-      action_dim: 2
-      pred_horizon: 1
-      num_diffusion_iters: 10
-      encoding_size: 256
-      down_dims: [128, 256]
-      action_stats_min: [-0.1646, -0.0281]
-      action_stats_max: [0.1850, 0.3087]
-    
-    transformer:
-      vlm_token_dim: 1024
-      n_emb: 384
-      predict_size: 24
-      n_layer: 16
-      n_head: 6
-      n_cond_layers: 4
-      action_dim: 3
-      num_train_timesteps: 20
-      p_drop_emb: 0.2
-      p_drop_attn: 0.2
-      causal_attn: true
-
-    # DualVLN System 1 — NextDiT + Flow Matching + DepthAnythingV2
     nextdit:
       enabled: true
       vlm_hidden_dim: 4096
@@ -118,6 +92,7 @@ model:
       dit_layers: 12
       dit_heads: 6
       dit_kv_heads: 6
+      dit_ffn_dim_multiplier: 0.6666666666666666
       predict_steps: 32
       action_dim: 3
       num_inference_steps: 10
@@ -126,23 +101,7 @@ model:
       dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
       pretrained_system1_path: "models/dualvln_system1_pretrained.safetensors"
       enable_gradient_checkpointing: true
-      # 分阶段 warmup: 前 N 步只训练 cond_projector + latent_queries (适配层),
-      # 之后解冻全部 System 1 模块联合训练
       warmup_steps: 1000
-
-  # Progress 预测头配置
-  progress_head:
-    enable: true
-    hidden_dim: 512
-    dropout: 0.3
-    concat_state_txt: true
-
-  # Stop 预测头配置（已弃用）
-  stop_head:
-    enable: false
-    hidden_dim: 512
-    focal_gamma: 3.0
-    focal_alpha: 0.9
 
 # ============================================
 # 训练策略
@@ -156,16 +115,19 @@ training:
       train_heatmap: true
       train_action: true
       trainable_modules:
-        - heatmap_vln          # DPTLiteFusion + FineLocalization (~2M params)
-        - nextdit_action_head  # DualVLN System 1 (DiT + MemoryEncoder + QFormer 等)
-        - latent_queries       # System 2 → System 1 桥接 (4 个可学习 token)
-        - progress_head
+        - heatmap_vln
+        - nextdit_action_head
+        - latent_queries
+        - cond_projector
         - llm_projector
       frozen_modules:
-        - qwen3_5              # 冻结 VLM 全部参数
-        - action_head
-        - transformer_action_head
-        - stop_head
+        - qwen3_5
+        - traj_dit
+        - rgb_model
+        - memory_encoder
+        - rgb_resampler
+        - action_encoder
+        - action_decoder
 
 # ============================================
 # 优化器配置
@@ -174,12 +136,8 @@ optim:
   optimizer: adamw
   learning_rate: 2.0e-4
   heatmap_lr: 2.0e-4
-  action_lr: 1.0e-4
-  transformer_action_lr: 1.0e-4
-  nextdit_action_lr: 1.0e-4          # DiT/MemoryEncoder/QFormer 等核心模块
-  nextdit_cond_projector_lr: 3.0e-4  # cond_projector 适配层 (更高 lr 加速收敛)
-  latent_queries_lr: 5.0e-4          # latent_queries (更高 lr 加速收敛)
-  progress_lr: 1.0e-4
+  nextdit_cond_projector_lr: 3.0e-4
+  latent_queries_lr: 5.0e-4
   llm_projector_lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip: 1.0
@@ -210,10 +168,8 @@ loss:
       start: 1.0
       end: 1.0
   
-  # 各头损失权重
   heatmap_weight: 1.0
   trajectory_weight: 1.0
-  progress_weight: 1.0
 
 # ============================================
 # GPU配置

@@ -7,7 +7,7 @@ VLN Pipeline 评估脚本
 
 支持评估：
 - 历史热力图头 (History Heatmap)
-- 轨迹预测头 (Trajectory - TransformerActionHead)
+- 轨迹预测头 (Trajectory - NextDiTActionHead)
 - 进度预测头 (Progress)
 """
 
@@ -82,31 +82,22 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
-    stop_cfg = model_cfg.get('stop_head', {})
-    progress_cfg = model_cfg.get('progress_head', {})
-    
-    action_head_type = action_cfg.get('type', 'transformer')
-    legacy_action_cfg = action_cfg.get('legacy', {})
-    transformer_action_cfg = action_cfg.get('transformer', {})
+    nextdit_cfg = action_cfg.get('nextdit', {})
     
     config = VLNPipelineConfig(
-        # Qwen3.5
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
+        llm_backbone_type=llm_cfg.get('backbone_type', 'auto'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
         llm_token_dim=llm_cfg.get('token_dim', 1024),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
-        llm_attn_implementation=llm_cfg.get('attn_implementation', 'flash_attention_2'),
+        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', -1),
-        
-        # Sequence Packing
         enable_packing=llm_cfg.get('enable_packing', False),
         max_seq_length=llm_cfg.get('max_seq_length', 8192),
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
-        
-        # Device
+        internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
         device=device,
         
-        # HeatmapVLN v2
         enable_heatmap=heatmap_cfg.get('enable', True),
         heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
         heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
@@ -115,43 +106,33 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [7, 15, 23]),
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', data_cfg['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', data_cfg['image_size'][0]),
+        heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
         
-        # LoRA
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
+        lora_layer_indices=llm_cfg.get('lora_layer_indices', None),
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
         
-        # Action Head
-        action_head_type=action_head_type,
         enable_action_head=action_cfg.get('enable', True),
-        action_dim=legacy_action_cfg.get('action_dim', 2),
-        action_pred_horizon=legacy_action_cfg.get('pred_horizon', 1),
-        action_encoding_size=legacy_action_cfg.get('encoding_size', 256),
-        action_down_dims=legacy_action_cfg.get('down_dims', None),
-        action_num_diffusion_iters=legacy_action_cfg.get('num_diffusion_iters', 10),
-        action_stats_min=legacy_action_cfg.get('action_stats_min', [-0.17, -0.03]),
-        action_stats_max=legacy_action_cfg.get('action_stats_max', [0.19, 0.31]),
-        transformer_action_dim=transformer_action_cfg.get('action_dim', 3),
-        transformer_predict_size=transformer_action_cfg.get('predict_size', 24),
-        transformer_n_emb=transformer_action_cfg.get('n_emb', 384),
-        transformer_n_layer=transformer_action_cfg.get('n_layer', 16),
-        transformer_n_head=transformer_action_cfg.get('n_head', 6),
-        transformer_n_cond_layers=transformer_action_cfg.get('n_cond_layers', 4),
-        transformer_num_train_timesteps=transformer_action_cfg.get('num_train_timesteps', 20),
-        transformer_p_drop_emb=transformer_action_cfg.get('p_drop_emb', 0.1),
-        transformer_p_drop_attn=transformer_action_cfg.get('p_drop_attn', 0.1),
-        transformer_causal_attn=transformer_action_cfg.get('causal_attn', True),
-        
-        # Stop / Progress
-        enable_stop_head=stop_cfg.get('enable', False),
-        stop_hidden_dim=stop_cfg.get('hidden_dim', 512),
-        stop_focal_gamma=stop_cfg.get('focal_gamma', 3.0),
-        stop_focal_alpha=stop_cfg.get('focal_alpha', 0.9),
-        enable_progress_head=progress_cfg.get('enable', False),
-        progress_hidden_dim=progress_cfg.get('hidden_dim', 512),
+        nextdit_enabled=nextdit_cfg.get('enabled', False),
+        nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 4096),
+        nextdit_latent_emb_size=nextdit_cfg.get('latent_emb_size', 768),
+        nextdit_n_query=nextdit_cfg.get('n_query', 4),
+        nextdit_dit_dim=nextdit_cfg.get('dit_dim', 384),
+        nextdit_dit_layers=nextdit_cfg.get('dit_layers', 12),
+        nextdit_dit_heads=nextdit_cfg.get('dit_heads', 6),
+        nextdit_dit_kv_heads=nextdit_cfg.get('dit_kv_heads', 6),
+        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get('dit_ffn_dim_multiplier', None),
+        nextdit_predict_steps=nextdit_cfg.get('predict_steps', 32),
+        nextdit_action_dim=nextdit_cfg.get('action_dim', 3),
+        nextdit_num_inference_steps=nextdit_cfg.get('num_inference_steps', 10),
+        nextdit_guidance_scale=nextdit_cfg.get('guidance_scale', 1.0),
+        nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
+        nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
+        nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
         
         verbose=False,
     )
@@ -394,40 +375,19 @@ def evaluate(
                         counts['hm'] += 1
 
         # Evaluate trajectory
-        if eval_trajectory and 'trajectory' in batch:
-            gt_traj = batch['trajectory'].cpu().numpy()
-            traj_valid = batch['trajectory_valid'].cpu().numpy()
-            
-            # Get predicted trajectory
-            if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
-                action_cond = outputs.get('action_cond')
-                if action_cond is not None:
-                    if action_cond.dim() == 2:
-                        action_cond = action_cond.unsqueeze(1)
-                    pred_traj = model.transformer_action_head.get_trajectory(action_cond)
-                    pred_traj = pred_traj.cpu().numpy()
-                    
-                    for b in range(B):
-                        metrics = compute_trajectory_metrics(pred_traj[b], gt_traj[b], traj_valid[b])
-                        if metrics['valid']:
-                            totals['traj_ade'] += metrics['ade']
-                            totals['traj_fde'] += metrics['fde']
-                            counts['traj'] += 1
-        
-        # Evaluate progress
-        if eval_progress and 'progress' in batch:
-            gt_progress = batch['progress'].cpu().numpy()
-            
-            if hasattr(model, 'progress_head') and model.progress_head is not None:
-                pred_progress = outputs.get('progress')
-                if pred_progress is not None:
-                    pred_progress = pred_progress.cpu().numpy()
-                    
-                    metrics = compute_progress_metrics(pred_progress, gt_progress)
-                    totals['progress_mae'] += metrics['progress_mae'] * B
-                    totals['progress_accuracy'] += metrics['progress_accuracy'] * B
-                    totals['progress_boundary_acc'] += metrics['progress_boundary_acc'] * B
-                    counts['progress'] += B
+        if eval_trajectory and 'trajectory' in outputs:
+            pred_traj = outputs['trajectory']
+            if pred_traj is not None and 'trajectory' in batch:
+                gt_traj = batch['trajectory'].cpu().numpy()
+                traj_valid = batch['trajectory_valid'].cpu().numpy()
+                pred_traj = pred_traj.cpu().numpy()
+                
+                for b in range(B):
+                    metrics = compute_trajectory_metrics(pred_traj[b], gt_traj[b], traj_valid[b])
+                    if metrics['valid']:
+                        totals['traj_ade'] += metrics['ade']
+                        totals['traj_fde'] += metrics['fde']
+                        counts['traj'] += 1
         
         # Visualization
         if save_dir is not None and idx < num_vis:
@@ -452,10 +412,7 @@ def evaluate(
         results['traj_fde'] = totals['traj_fde'] / counts['traj']
         results['num_traj_samples'] = counts['traj']
     
-    if counts['progress'] > 0:
-        results['progress_mae'] = totals['progress_mae'] / counts['progress']
-        results['progress_accuracy'] = totals['progress_accuracy'] / counts['progress']
-        results['progress_boundary_acc'] = totals['progress_boundary_acc'] / counts['progress']
+    # progress head removed — no progress metrics
         results['num_progress_samples'] = counts['progress']
     
     return results
@@ -511,16 +468,11 @@ def visualize_sample(
         axes[1, 0].scatter([0], [0], c='green', s=100, marker='*', label='Start')
         axes[1, 0].scatter([gt_cum[-1, 0]], [gt_cum[-1, 1]], c='red', s=100, marker='X', label='End')
         
-        # Plot predicted trajectory
-        if hasattr(model, 'transformer_action_head') and model.transformer_action_head is not None:
-            action_cond = outputs.get('action_cond')
-            if action_cond is not None:
-                if action_cond.dim() == 2:
-                    action_cond = action_cond.unsqueeze(1)
-                pred_traj = model.transformer_action_head.get_trajectory(action_cond)
-                pred_traj = pred_traj[0].cpu().numpy()
-                pred_cum = np.cumsum(pred_traj[:, :2], axis=0)
-                axes[1, 0].plot(pred_cum[:, 0], pred_cum[:, 1], 'r--s', label='Pred', markersize=3)
+        pred_traj = outputs.get('trajectory')
+        if pred_traj is not None:
+            pred_traj = pred_traj[0].cpu().numpy()
+            pred_cum = np.cumsum(pred_traj[:, :2], axis=0)
+            axes[1, 0].plot(pred_cum[:, 0], pred_cum[:, 1], 'r--s', label='Pred', markersize=3)
         
         axes[1, 0].set_title("Trajectory (cumulative)")
         axes[1, 0].legend()
@@ -529,21 +481,7 @@ def visualize_sample(
     else:
         axes[1, 0].axis('off')
     
-    # Progress
-    if 'progress' in batch:
-        gt_progress = batch['progress'][0].item()
-        pred_progress = outputs.get('progress')
-        if pred_progress is not None:
-            pred_progress = pred_progress[0].item()
-            axes[1, 1].bar(['GT', 'Pred'], [gt_progress, pred_progress], color=['blue', 'orange'])
-            axes[1, 1].set_ylim(0, 1)
-            axes[1, 1].set_title(f"Progress (GT={gt_progress:.2f}, Pred={pred_progress:.2f})")
-        else:
-            axes[1, 1].bar(['GT'], [gt_progress], color=['blue'])
-            axes[1, 1].set_ylim(0, 1)
-            axes[1, 1].set_title(f"Progress (GT={gt_progress:.2f})")
-    else:
-        axes[1, 1].axis('off')
+    axes[1, 1].axis('off')
     
     # Info text
     info_text = f"Sample {idx}\n"

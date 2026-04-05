@@ -335,7 +335,7 @@ class CombinedNavigationLoss(nn.Module):
         Args:
             pred_heatmap: 预测热力图
             gt_heatmap: GT 热力图
-            action_loss: 动作损失（来自 DiffusionActionHead）
+            action_loss: 动作损失（来自 NextDiTActionHead）
             pred_validity: 有效性预测
             gt_validity: GT 有效性
         """

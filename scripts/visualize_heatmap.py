@@ -54,7 +54,7 @@ def build_model(cfg: Dict) -> VLNPipeline:
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
 
-    action_head_type = action_cfg.get('type', 'transformer')
+
 
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
@@ -81,10 +81,7 @@ def build_model(cfg: Dict) -> VLNPipeline:
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
-        action_head_type=action_head_type,
         enable_action_head=False,
-        enable_stop_head=False,
-        enable_progress_head=False,
         verbose=False,
     )
     return VLNPipeline(config)
