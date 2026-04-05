@@ -440,7 +440,7 @@ def main():
     
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
     if packing_enabled:
-        raise ValueError("Qwen3.5 v2 热力图评估不支持 sequence packing，请关闭 enable_packing。")
+        raise ValueError("当前共享环境热力图评估不支持 sequence packing，请关闭 enable_packing。")
     from scripts.train import collate_fn as train_collate_fn
     collate_fn = train_collate_fn
     actual_dataset = dataset

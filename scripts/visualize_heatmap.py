@@ -57,9 +57,9 @@ def build_model(cfg: Dict) -> VLNPipeline:
 
 
     config = VLNPipelineConfig(
-        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
-        llm_token_dim=llm_cfg.get('token_dim', 1024),
+        llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
+        llm_token_dim=llm_cfg.get('token_dim', 896),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
@@ -68,11 +68,11 @@ def build_model(cfg: Dict) -> VLNPipeline:
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
         device=model_cfg.get('device', 'cuda'),
         enable_heatmap=heatmap_cfg.get('enable', True),
-        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
-        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1280),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 3584),
         heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
-        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
-        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [7, 15, 23]),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [7, 15, 23, 31]),
+        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [6, 13, 20]),
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
         use_lora=llm_cfg.get('use_lora', False),

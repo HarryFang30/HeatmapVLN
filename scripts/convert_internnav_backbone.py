@@ -10,8 +10,8 @@ Usage:
         --system1-dst models/internnav_system1.safetensors
 
 The script performs key remapping so that the backbone weights match
-the Qwen2_5_VLForConditionalGeneration naming convention in
-transformers >= 5.x:
+the Qwen2_5_VLForConditionalGeneration naming convention used by the
+shared transformers 4.51.0 baseline:
 
     InternNav key             ->  Qwen2.5-VL key
     ─────────────────────────────────────────────

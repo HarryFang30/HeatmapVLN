@@ -30,6 +30,7 @@ from PIL import Image
 import numpy as np
 
 from ..heatmap.input_constructor import find_text_anchor_positions
+from ..runtime_compat import detect_backbone_type, ensure_transformers_runtime_compat
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -56,7 +57,7 @@ class Qwen3_5Config:
     """Configuration for Qwen3.5 / Qwen2.5-VL integration."""
     
     # Model path
-    model_path: str = "./models/qwen_3.5"
+    model_path: str = "./models/internnav_backbone"
     
     # Backbone type: "auto" detects from config.json, or explicitly "qwen3_5" / "qwen2_5_vl"
     backbone_type: str = "auto"
@@ -186,6 +187,7 @@ class Qwen3_5Integration(nn.Module):
         self._model_loaded = False
         
         self._resolved_backbone_type: Optional[str] = None
+        self._runtime_compat_state = None
         
         # Token IDs are set during model loading based on backbone type
         self.video_token_id = None
@@ -203,24 +205,20 @@ class Qwen3_5Integration(nn.Module):
     
     def _detect_backbone_type(self) -> str:
         """Detect backbone type from config.json in the model directory."""
-        if self.config.backbone_type != "auto":
-            return self.config.backbone_type
-        import json as _json
-        cfg_path = os.path.join(self.config.model_path, "config.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path) as f:
-                cfg = _json.load(f)
-            model_type = cfg.get("model_type", "")
-            if model_type in ("qwen2_5_vl", "qwen2_vl"):
-                return "qwen2_5_vl"
-        return "qwen3_5"
+        return detect_backbone_type(self.config.model_path, self.config.backbone_type)
 
     def _load_model(self):
         """Load the VLM backbone (Qwen3.5 or Qwen2.5-VL) and processor."""
         if self._model_loaded:
             return
 
-        backbone = self._detect_backbone_type()
+        self._runtime_compat_state = ensure_transformers_runtime_compat(
+            model_path=self.config.model_path,
+            requested_backbone_type=self.config.backbone_type,
+            requested_attn_implementation=self.config.attn_implementation,
+            logger=logger,
+        )
+        backbone = self._runtime_compat_state.resolved_backbone_type
         self._resolved_backbone_type = backbone
         logger.info("Detected backbone type: %s", backbone)
 
@@ -291,7 +289,21 @@ class Qwen3_5Integration(nn.Module):
     def _load_with_attn_fallback(self, model_cls, model_path: str):
         """Try loading with the requested attention impl, fall back to sdpa."""
         requested = self.config.attn_implementation
-        for attn_impl in [requested] + (["sdpa"] if requested != "sdpa" else []):
+        candidates: List[str] = []
+        if requested == "flash_attention_2":
+            flash_available = bool(
+                self._runtime_compat_state and self._runtime_compat_state.flash_attn_available
+            )
+            if flash_available:
+                candidates.append(requested)
+            else:
+                logger.warning("Skipping flash_attention_2 because flash_attn is unavailable in this environment")
+        else:
+            candidates.append(requested)
+        if "sdpa" not in candidates:
+            candidates.append("sdpa")
+
+        for attn_impl in candidates:
             try:
                 logger.info("Trying attention implementation: %s", attn_impl)
                 model = model_cls.from_pretrained(

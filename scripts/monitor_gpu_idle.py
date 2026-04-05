@@ -32,6 +32,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -60,6 +61,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("monitor_gpu_idle")
+OccupyChild = Tuple[subprocess.Popen, FrozenSet[int], Path]
 
 
 def load_config(path: Path) -> dict:
@@ -175,28 +177,34 @@ def compute_proc_mem_mib_by_index(
 
 
 def reap_occupy_processes(
-    running: List[Tuple[subprocess.Popen, FrozenSet[int]]],
-) -> None:
-    """移除已结束的占卡子进程。"""
-    alive: List[Tuple[subprocess.Popen, FrozenSet[int]]] = []
-    for p, gpus in running:
+    running: List[OccupyChild],
+) -> Set[int]:
+    """移除已结束的占卡子进程，并返回异常退出的 GPU。"""
+    alive: List[OccupyChild] = []
+    failed_gpus: Set[int] = set()
+    for p, gpus, log_path in running:
         if p.poll() is None:
-            alive.append((p, gpus))
+            alive.append((p, gpus, log_path))
         else:
-            logger.info(
-                "占卡进程已结束 pid=%s gpus=%s code=%s",
+            log_fn = logger.info if p.returncode == 0 else logger.warning
+            log_fn(
+                "占卡进程已结束 pid=%s gpus=%s code=%s log=%s",
                 p.pid,
                 sorted(gpus),
                 p.returncode,
+                log_path,
             )
+            if p.returncode != 0:
+                failed_gpus.update(gpus)
     running[:] = alive
+    return failed_gpus
 
 
 def gpus_covered_by_running(
-    running: List[Tuple[subprocess.Popen, FrozenSet[int]]],
+    running: List[OccupyChild],
 ) -> Set[int]:
     out: Set[int] = set()
-    for _, gpus in running:
+    for _, gpus, _ in running:
         out |= set(gpus)
     return out
 
@@ -205,28 +213,42 @@ def launch_occupy_script(
     script: Path,
     gpu_ids: List[int],
     extra_args: str,
-) -> Optional[subprocess.Popen]:
-    """后台启动占卡脚本，返回 Popen；失败返回 None。"""
+    log_dir: Path,
+) -> Optional[Tuple[subprocess.Popen, Path]]:
+    """后台启动占卡脚本，返回 (Popen, 日志路径)；失败返回 None。"""
     gpu_csv = ",".join(str(i) for i in gpu_ids)
     cmd: List[str] = [sys.executable, str(script), "--gpu", gpu_csv]
     if extra_args.strip():
         cmd.extend(shlex.split(extra_args))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"occupy_gpu_{'_'.join(str(i) for i in gpu_ids)}_{stamp}.log"
     try:
         # 占卡脚本按 nvidia-smi 的物理 GPU 编号传 --gpu；若继承父进程的
         # CUDA_VISIBLE_DEVICES，PyTorch 可见卡会重编号，导致与物理号不一致。
         child_env = os.environ.copy()
         child_env.pop("CUDA_VISIBLE_DEVICES", None)
-        # 新会话，避免监控进程信号误伤子进程；输出丢弃以免管道阻塞
-        p = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=child_env,
+        log_path.write_text(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] cmd={' '.join(shlex.quote(c) for c in cmd)}\n",
+            encoding="utf-8",
         )
-        logger.info("已启动占卡: pid=%s cmd=%s", p.pid, " ".join(shlex.quote(c) for c in cmd))
-        return p
+        # 新会话，避免监控进程信号误伤子进程；输出写入日志，便于排查占卡失败
+        with open(log_path, "a", encoding="utf-8") as log_fp:
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=child_env,
+            )
+        logger.info(
+            "已启动占卡: pid=%s cmd=%s log=%s",
+            p.pid,
+            " ".join(shlex.quote(c) for c in cmd),
+            log_path,
+        )
+        return p, log_path
     except OSError as e:
         logger.error("启动占卡脚本失败: %s", e)
         return None
@@ -333,6 +355,12 @@ def main() -> None:
         default="",
         help='传给占卡脚本的额外参数（shell 分词），例如: --mem max --util 40',
     )
+    parser.add_argument(
+        "--occupy-log-dir",
+        type=Path,
+        default=Path(tempfile.gettempdir()) / "monitor_gpu_idle",
+        help="占卡脚本日志目录，默认 /tmp/monitor_gpu_idle",
+    )
     args = parser.parse_args()
 
     cfg_path = args.config.resolve()
@@ -370,11 +398,13 @@ def main() -> None:
 
     # gpu_index -> (idle_since_monotonic or None, already_notified_this_streak)
     state: Dict[int, Tuple[Optional[float], bool]] = {}
-    occupy_children: List[Tuple[subprocess.Popen, FrozenSet[int]]] = []
+    occupy_children: List[OccupyChild] = []
 
     occupy_script = args.occupy_script.resolve()
     auto_occupy = args.auto_occupy
     occupy_extra = args.occupy_args
+    occupy_log_dir = args.occupy_log_dir.resolve()
+    occupy_retry_delay_sec = max(interval * 2.0, 15.0)
 
     hostname = socket.gethostname()
     logger.info(
@@ -406,11 +436,12 @@ def main() -> None:
     if auto_occupy:
         if occupy_script.is_file():
             logger.info("占卡脚本: %s（飞书成功后将启动空闲 GPU）", occupy_script)
+            logger.info("占卡日志目录: %s", occupy_log_dir)
         else:
             logger.warning("占卡脚本不存在，将跳过自动占卡: %s", occupy_script)
 
     while True:
-        reap_occupy_processes(occupy_children)
+        failed_gpus = reap_occupy_processes(occupy_children)
 
         gpu_rows, index_to_uuid = query_nvidia_smi()
         stats = {r[0]: r for r in gpu_rows}
@@ -424,6 +455,14 @@ def main() -> None:
             proc_mem_by_idx = compute_proc_mem_mib_by_index(index_to_uuid, proc_name_pattern)
 
         now = time.monotonic()
+        if failed_gpus:
+            for idx in sorted(failed_gpus):
+                state[idx] = (now - need_sec + occupy_retry_delay_sec, False)
+            logger.warning(
+                "以下 GPU 的占卡进程异常退出，将在约 %.0f 秒后重试: %s",
+                occupy_retry_delay_sec,
+                sorted(failed_gpus),
+            )
         to_notify: List[Tuple[int, float, float]] = []
 
         for idx in indices:
@@ -490,15 +529,32 @@ def main() -> None:
             if send_feishu_text(webhook_url, text_plain):
                 logger.info("已发送飞书通知: %s", [i for i, _, _ in to_notify])
                 if auto_occupy and occupy_script.is_file():
-                    reap_occupy_processes(occupy_children)
+                    failed_gpus = reap_occupy_processes(occupy_children)
+                    if failed_gpus:
+                        for idx in sorted(failed_gpus):
+                            state[idx] = (now - need_sec + occupy_retry_delay_sec, False)
+                        logger.warning(
+                            "以下 GPU 的占卡进程异常退出，将在约 %.0f 秒后重试: %s",
+                            occupy_retry_delay_sec,
+                            sorted(failed_gpus),
+                        )
                     want = {i for i, _, _ in to_notify}
                     busy = gpus_covered_by_running(occupy_children)
                     to_launch = sorted(want - busy)
                     if to_launch:
-                        p = launch_occupy_script(occupy_script, to_launch, occupy_extra)
-                        if p is not None:
-                            occupy_children.append((p, frozenset(to_launch)))
-                    elif want <= busy:
+                        for gpu_id in to_launch:
+                            launched = launch_occupy_script(
+                                occupy_script,
+                                [gpu_id],
+                                occupy_extra,
+                                occupy_log_dir,
+                            )
+                            if launched is not None:
+                                p, log_path = launched
+                                occupy_children.append((p, frozenset([gpu_id]), log_path))
+                            else:
+                                state[gpu_id] = (now - need_sec + occupy_retry_delay_sec, False)
+                    if want <= busy:
                         logger.info(
                             "空闲 GPU 已在占卡进程中，跳过拉起: %s",
                             sorted(want),

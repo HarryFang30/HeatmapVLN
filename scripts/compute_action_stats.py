@@ -91,7 +91,7 @@ def compute_dataset_action_stats(config_path: str, margin: float = 0.1):
     
     if needs_update:
         print("⚠️  警告: 当前配置的范围不足以覆盖实际数据！")
-        print("   建议更新 configs/train_config.yaml 中的 action_stats")
+        print("   建议更新当前所用配置文件中的 action_stats（共享环境默认是 configs/train_config_internnav.yaml）")
     else:
         # 检查是否过大
         range_ratio_0 = (current_max[0] - current_min[0]) / (max_vals[0] - min_vals[0])
@@ -143,7 +143,7 @@ if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(description="计算数据集动作统计值")
-    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
+    parser.add_argument('--config', type=str, default='configs/train_config_internnav.yaml',
                         help='配置文件路径')
     parser.add_argument('--margin', type=float, default=0.1,
                         help='安全余量（默认 0.1 = 10%）')

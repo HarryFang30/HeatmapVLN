@@ -1,6 +1,7 @@
 # HeatmapVLN Project Requirements
+# Default shared environment target: Habitat/InternNav coexistence
 # Compatible with conda environment: models
-# Python 3.11+
+# Python 3.11
 
 # ============================================
 # Core Deep Learning Frameworks
@@ -13,8 +14,9 @@ torchaudio==2.7.0
 
 # ============================================
 # Transformers & LLM Support
+# Default baseline follows models/internnav_backbone/config.json
 # ============================================
-transformers==5.3.0
+transformers==4.51.0
 accelerate==1.5.2
 qwen-vl-utils==0.0.11
 huggingface-hub>=0.34.0
@@ -34,7 +36,7 @@ einops>=0.8.0
 # ============================================
 # Data Processing & Utilities
 # ============================================
-numpy>=2.0.0,<3.0.0
+numpy==1.26.4
 PyYAML>=6.0
 tqdm>=4.67.0
 pydantic>=2.0.0
@@ -81,17 +83,19 @@ scipy>=1.14.0
 scikit-learn>=1.6.0
 
 # ============================================
-# Flash Attention (Optional - for speed)
+# Flash Attention (Optional - dedicated env only)
 # ============================================
 # flash-attn>=2.5.0
-# Note: Install separately with:
+# Note: the shared Habitat/InternNav environment should prefer SDPA.
+# Install flash-attn only in a dedicated environment where GLIBC is compatible.
 # pip install flash-attn --no-build-isolation
 
 # ============================================
 # Environment Info
 # ============================================
 # Tested with:
-# - Python 3.11.14
+# - Python 3.11.x
 # - CUDA 12.8
 # - Ubuntu/Linux
-# - 4x Quadro RTX 8000 GPUs (192GB total)
+# - transformers 4.51.0
+# - numpy 1.26.4

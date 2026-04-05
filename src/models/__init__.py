@@ -14,6 +14,17 @@ Architecture (v2 — Coarse-to-Fine + InternNav System 1):
             → trajectory (B, T, 3)
 """
 
+import importlib
+import logging
+
+from .runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
+
+install_numpy_legacy_aliases()
+try:
+    importlib.import_module("flash_attn")
+except Exception:
+    install_flash_attn_stub(logging.getLogger(__name__))
+
 # === VLM Integration ===
 from .qwen3_5 import (
     Qwen3_5Integration,

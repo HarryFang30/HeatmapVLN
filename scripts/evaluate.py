@@ -3,7 +3,7 @@
 VLN Pipeline 评估脚本
 ======================
 
-使用 Qwen3.5 评估视觉语言导航模型。
+使用共享 Habitat/InternNav 环境评估视觉语言导航模型。
 
 支持评估：
 - 历史热力图头 (History Heatmap)
@@ -85,10 +85,10 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     nextdit_cfg = action_cfg.get('nextdit', {})
     
     config = VLNPipelineConfig(
-        llm_model_path=llm_cfg.get('model_path', './models/qwen_3.5'),
-        llm_backbone_type=llm_cfg.get('backbone_type', 'auto'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 4096),
-        llm_token_dim=llm_cfg.get('token_dim', 1024),
+        llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
+        llm_backbone_type=llm_cfg.get('backbone_type', 'qwen2_5_vl'),
+        llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
+        llm_token_dim=llm_cfg.get('token_dim', 896),
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', -1),
@@ -99,11 +99,11 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         device=device,
         
         enable_heatmap=heatmap_cfg.get('enable', True),
-        heatmap_c_vit=heatmap_cfg.get('c_vit', 1152),
-        heatmap_c_llm=heatmap_cfg.get('c_llm', 4096),
+        heatmap_c_vit=heatmap_cfg.get('c_vit', 1280),
+        heatmap_c_llm=heatmap_cfg.get('c_llm', 3584),
         heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
-        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [6, 12, 18, 24]),
-        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [7, 15, 23]),
+        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [7, 15, 23, 31]),
+        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [6, 13, 20]),
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', data_cfg['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', data_cfg['image_size'][0]),
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
@@ -118,14 +118,14 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         
         enable_action_head=action_cfg.get('enable', True),
         nextdit_enabled=nextdit_cfg.get('enabled', False),
-        nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 4096),
+        nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 3584),
         nextdit_latent_emb_size=nextdit_cfg.get('latent_emb_size', 768),
         nextdit_n_query=nextdit_cfg.get('n_query', 4),
         nextdit_dit_dim=nextdit_cfg.get('dit_dim', 384),
         nextdit_dit_layers=nextdit_cfg.get('dit_layers', 12),
         nextdit_dit_heads=nextdit_cfg.get('dit_heads', 6),
         nextdit_dit_kv_heads=nextdit_cfg.get('dit_kv_heads', 6),
-        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get('dit_ffn_dim_multiplier', None),
+        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get('dit_ffn_dim_multiplier', 2 / 3),
         nextdit_predict_steps=nextdit_cfg.get('predict_steps', 32),
         nextdit_action_dim=nextdit_cfg.get('action_dim', 3),
         nextdit_num_inference_steps=nextdit_cfg.get('num_inference_steps', 10),
@@ -498,7 +498,7 @@ def visualize_sample(
 
 def main():
     parser = argparse.ArgumentParser(description='VLN Pipeline Evaluation')
-    parser.add_argument('--config', type=str, default='configs/train_config.yaml')
+    parser.add_argument('--config', type=str, default='configs/train_config_internnav.yaml')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--split', type=str, default='val')
     parser.add_argument('--save-vis', action='store_true', help='Save visualizations')
@@ -544,7 +544,7 @@ def main():
     # Build dataloader
     packing_enabled = args.use_packing or cfg['model']['llm'].get('enable_packing', False)
     if packing_enabled:
-        raise ValueError("Qwen3.5 v2 评估路径不支持 sequence packing，请关闭 enable_packing。")
+        raise ValueError("当前共享环境评估路径不支持 sequence packing，请关闭 enable_packing。")
     dataloader = build_dataloader(cfg, split=args.split)
     logger.info(f"Dataset: {len(dataloader.dataset)} samples")
 

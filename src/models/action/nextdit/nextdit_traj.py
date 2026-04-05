@@ -238,7 +238,7 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         num_attention_heads: Optional[int] = 32,  # 32
         num_kv_heads: Optional[int] = None,
         multiple_of: Optional[int] = 256,
-        ffn_dim_multiplier: Optional[float] = None,
+        ffn_dim_multiplier: Optional[float] = 2 / 3,
         norm_eps: Optional[float] = 1e-5,
         learn_sigma: Optional[bool] = True,
         qk_norm: Optional[bool] = True,

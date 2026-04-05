@@ -3,8 +3,8 @@
 VLN 训练脚本
 ==============
 
-使用 Qwen3.5 进行视觉语言导航训练。
-单阶段训练：History 热力图头 + Action Head + Stop Head
+使用共享 Habitat/InternNav 环境进行视觉语言导航训练。
+单阶段训练：History 热力图头 + Action Head + Progress Head
 """
 
 import sys
@@ -71,6 +71,7 @@ warnings.filterwarnings("ignore", message="Asked to sample")
 
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
+from src.models.runtime_compat import ensure_transformers_runtime_compat
 from src.utils.logger import setup_logger
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 from src.utils.notifier import FeishuNotifier, create_notifier
@@ -121,8 +122,8 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="VLN 训练脚本（单阶段）")
-    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
+    parser = argparse.ArgumentParser(description="VLN 训练脚本（共享 Habitat/InternNav 环境）")
+    parser.add_argument('--config', type=str, default='configs/train_config_internnav.yaml',
                         help='配置文件路径')
     parser.add_argument('--resume', type=str, default=None, 
                         help='从检查点恢复（路径或 "latest"）')
@@ -253,7 +254,7 @@ def main():
     default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
     
     logger.info("=" * 60)
-    logger.info("VLN 训练 (Qwen3.5)")
+    logger.info("VLN 训练 (shared Habitat/InternNav env)")
     logger.info("=" * 60)
     
     # 构建数据集
@@ -458,7 +459,7 @@ def main():
     
     if packing_enabled:
         raise ValueError(
-            "Qwen3.5 路径已移除 Sequence Packing 兼容代码，请在配置中设置 "
+            "当前共享环境训练路径已移除 Sequence Packing 兼容代码，请在配置中设置 "
             "model.llm.enable_packing=false。"
         )
     actual_collate_fn = collate_fn
@@ -470,7 +471,14 @@ def main():
     if use_panoramic_tokenized_collator:
         from transformers import AutoProcessor
 
-        llm_model_path = cfg['model'].get('llm', {}).get('model_path', './models/qwen_3.5')
+        llm_cfg = cfg['model'].get('llm', {})
+        llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
+        ensure_transformers_runtime_compat(
+            model_path=llm_model_path,
+            requested_backbone_type=llm_cfg.get('backbone_type', 'qwen2_5_vl'),
+            requested_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
+            logger=logger,
+        )
         logger.info("🔄 Loading Qwen processor for panoramic worker-side tokenization...")
         pano_processor = AutoProcessor.from_pretrained(llm_model_path, trust_remote_code=True)
         actual_collate_fn = PanoramicTokenizedCollator(pano_processor)
@@ -539,11 +547,11 @@ def main():
             f"   🔀 DistributedSampler enabled: world_size={dist_context.world_size}, rank={dist_context.rank}"
         )
     
-    # ⚠️ 强制加载 Qwen3.5（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
+    # ⚠️ 强制加载 VLM backbone（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
     raw_model = model
     if hasattr(raw_model, 'qwen3_5') and hasattr(raw_model.qwen3_5, '_load_model'):
         if raw_model.qwen3_5.model is None:
-            logger.info("🔄 Pre-loading Qwen3.5 (ensure LoRA params available for optimizer)...")
+            logger.info("🔄 Pre-loading VLM backbone (ensure LoRA params available for optimizer)...")
             raw_model.qwen3_5._load_model()
         logger.info(
             "   🧠 Qwen attention implementation: %s",

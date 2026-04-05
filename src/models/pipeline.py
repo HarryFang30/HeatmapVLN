@@ -74,8 +74,8 @@ class VLNPipelineConfig:
 
     # ==================== HeatmapVLN v2 (Coarse-to-Fine) ====================
     enable_heatmap: bool = True
-    heatmap_c_vit: int = 1152
-    heatmap_c_llm: int = 4096
+    heatmap_c_vit: int = 1280
+    heatmap_c_llm: int = 3584
     heatmap_c_fused: int = 256
     heatmap_vit_layer_indices: Optional[List[int]] = None   # e.g. [6, 12, 18, 24]
     heatmap_llm_layer_indices: Optional[List[int]] = None  # e.g. [7, 15, 23] (full_attention)
@@ -91,7 +91,7 @@ class VLNPipelineConfig:
     # ==================== Action Head (NextDiT System 1) ====================
     enable_action_head: bool = True
     nextdit_enabled: bool = False
-    nextdit_vlm_hidden_dim: int = 4096
+    nextdit_vlm_hidden_dim: int = 3584
     nextdit_latent_emb_size: int = 768
     nextdit_n_query: int = 4
     nextdit_dit_dim: int = 384
@@ -316,8 +316,10 @@ class VLNPipeline(nn.Module):
             self.qwen3_5._load_model()
 
         cfg = self.config
-        vit_indices = cfg.heatmap_vit_layer_indices or [6, 12, 18, 24]
-        llm_indices = cfg.heatmap_llm_layer_indices or [7, 15, 23]
+        default_vit_indices = [7, 15, 23, 31] if cfg.llm_backbone_type == "qwen2_5_vl" else [6, 12, 18, 24]
+        default_llm_indices = [6, 13, 20] if cfg.llm_backbone_type == "qwen2_5_vl" else [7, 15, 23]
+        vit_indices = cfg.heatmap_vit_layer_indices or default_vit_indices
+        llm_indices = cfg.heatmap_llm_layer_indices or default_llm_indices
 
         trajectory_config = getattr(cfg, 'heatmap_trajectory_config', None)
 

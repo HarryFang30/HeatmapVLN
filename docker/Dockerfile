@@ -52,8 +52,8 @@ RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86
 # 初始化 conda
 RUN /root/miniconda3/bin/conda init bash
 
-# 创建 conda 环境 (Python 3.12)
-RUN /root/miniconda3/bin/conda create -n models python=3.12 -y
+# 创建 conda 环境 (shared Habitat/InternNav baseline)
+RUN /root/miniconda3/bin/conda create -n models python=3.11 -y
 
 # 设置工作目录
 WORKDIR /root/HeatmapVLN
@@ -69,7 +69,7 @@ RUN /bin/bash -c "source /root/miniconda3/etc/profile.d/conda.sh && \
     pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128 && \
     pip install -r requirements.txt"
 
-# 可选：安装 FlashAttention 2（需要时间编译，可以注释掉以加快构建）
+# 可选：安装 FlashAttention 2（仅限独立环境；共存环境默认使用 SDPA）
 # RUN /bin/bash -c "source /root/miniconda3/etc/profile.d/conda.sh && \
 #     conda activate models && \
 #     pip install flash-attn --no-build-isolation"
