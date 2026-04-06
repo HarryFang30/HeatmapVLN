@@ -18,16 +18,15 @@ Architecture:
 import time
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, Any, List
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Any, List
 import logging
 from dataclasses import dataclass
 
 from .qwen3_5 import Qwen3_5Integration, Qwen3_5Config
-from .action import (
-    NextDiTActionHead,
-    NextDiTActionConfig,
-)
 from .heatmap import HeatmapVLN, HeatmapVLNLoss
+
+if TYPE_CHECKING:
+    from .action import NextDiTActionConfig
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -186,6 +185,8 @@ class VLNPipeline(nn.Module):
         self.latent_queries = None
 
         if config.nextdit_enabled:
+            from .action import NextDiTActionHead, NextDiTActionConfig
+
             nextdit_cfg = NextDiTActionConfig(
                 vlm_hidden_dim=config.nextdit_vlm_hidden_dim,
                 latent_emb_size=config.nextdit_latent_emb_size,

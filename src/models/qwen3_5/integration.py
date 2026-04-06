@@ -803,7 +803,19 @@ class Qwen3_5Integration(nn.Module):
 
         try:
             if skip_lm_head:
-                outputs = self.model.model(**fwd_kwargs)
+                inner_model = getattr(self.model, "model", None)
+                if inner_model is None:
+                    outputs = self.model(**fwd_kwargs)
+                else:
+                    try:
+                        outputs = inner_model(**fwd_kwargs)
+                    except TypeError as exc:
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        # PEFT-wrapped Qwen exposes the multimodal forward on
+                        # `.model`, but the plain HF model keeps it on the
+                        # outer module. Fall back automatically for the latter.
+                        outputs = self.model(**fwd_kwargs)
             else:
                 outputs = self.model(**fwd_kwargs)
         finally:

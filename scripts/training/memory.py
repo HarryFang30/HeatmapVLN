@@ -1,11 +1,24 @@
 """
 Memory management utilities for training workers and the main process.
+
+Includes ``ShmBypassDataset`` / ``ShmBypassCollate`` — transparent wrappers
+that convert tensors ↔ numpy arrays so DataLoader workers transfer data
+through the regular pickle pipe instead of ``shm_open()`` (which requires
+``/dev/shm``).  When ``/dev/shm`` is too small (Docker default 64 MB),
+these wrappers are the only way to use ``num_workers > 0``.
 """
+
+from __future__ import annotations
 
 import sys
 import os
 import gc
 import warnings
+from typing import Any, Callable, Dict, List, Sequence, Union
+
+import numpy as np
+import torch
+import torch.utils.data
 
 
 def _malloc_trim():
@@ -120,6 +133,9 @@ def _worker_init_fn(worker_id):
     warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
     warnings.filterwarnings("ignore", message="Asked to sample")
 
+    import torch.multiprocessing as _mp
+    _mp.set_sharing_strategy('file_system')
+
     _gc.set_threshold(700, 10, 999_999_999)
 
     try:
@@ -145,3 +161,69 @@ def _worker_init_fn(worker_id):
             )
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# /dev/shm bypass: tensor ↔ numpy conversion for DataLoader IPC
+# ---------------------------------------------------------------------------
+
+def _to_numpy(obj: Any) -> Any:
+    """Recursively convert torch.Tensor → numpy.ndarray (zero-copy when
+    contiguous + CPU + numpy-compatible dtype)."""
+    if isinstance(obj, torch.Tensor):
+        t = obj.detach().cpu()
+        if t.dtype == torch.bfloat16:
+            t = t.float()
+        return t.numpy()
+    if isinstance(obj, dict):
+        return {k: _to_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_numpy(v) for v in obj)
+    return obj
+
+
+def _to_tensor(obj: Any) -> Any:
+    """Recursively convert numpy.ndarray → torch.Tensor (zero-copy)."""
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)
+    if isinstance(obj, dict):
+        return {k: _to_tensor(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_tensor(v) for v in obj)
+    return obj
+
+
+class ShmBypassDataset(torch.utils.data.Dataset):
+    """Wraps any map-style dataset so ``__getitem__`` returns numpy arrays
+    instead of torch tensors.  This makes the DataLoader pickle the arrays
+    through the normal pipe rather than ``shm_open()``, completely
+    avoiding ``/dev/shm``."""
+
+    def __init__(self, dataset: torch.utils.data.Dataset) -> None:
+        object.__setattr__(self, '_dataset', dataset)
+
+    # -- core Dataset API --------------------------------------------------
+    def __len__(self) -> int:
+        return len(self._dataset)  # type: ignore[arg-type]
+
+    def __getitem__(self, idx: int) -> Any:
+        return _to_numpy(self._dataset[idx])
+
+    # -- transparent attribute delegation ----------------------------------
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._dataset, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._dataset, name, value)
+
+
+class ShmBypassCollate:
+    """Wraps a collate function to convert numpy arrays back to tensors
+    before the real collation."""
+
+    def __init__(self, collate_fn: Callable) -> None:
+        self._inner = collate_fn
+
+    def __call__(self, batch: List[Any]) -> Any:
+        batch = [_to_tensor(sample) for sample in batch]
+        return self._inner(batch)

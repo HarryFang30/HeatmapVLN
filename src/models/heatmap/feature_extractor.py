@@ -20,6 +20,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,8 @@ class FeatureExtractor:
         self._captured_batch_vit: Dict[int, List[Dict[int, torch.Tensor]]] = {}
         self._captured_batch_llm: Dict[int, List[Dict[int, torch.Tensor]]] = {}
         self._captured_batch_queries: Optional[List[List[torch.Tensor]]] = None
+        self._llm_resize_logged = False
+        self._vit_resize_logged = False
 
         visual = self._get_visual_module(model)
         num_blocks = len(visual.blocks)
@@ -253,8 +256,9 @@ class FeatureExtractor:
                 if hidden is None:
                     continue
                 tokens = hidden[0, start:end, :]  # (n_tokens, C_llm)
-                h, w = self._resolve_llm_spatial_shape(tokens.shape[0], layer_idx, view_idx, "current")
-                current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
+                current_llm[view_idx][layer_idx] = self._reshape_llm_tokens(
+                    tokens, layer_idx, view_idx, "current"
+                )
 
         # --- current 4 views: ViT features (16x16, multi-layer) ---
         current_vit: Dict[int, Dict[int, torch.Tensor]] = {}
@@ -268,8 +272,7 @@ class FeatureExtractor:
                     vit_out, view_idx, image_grid_thw,
                 )
                 if vit_tokens is not None:
-                    h = w = int(vit_tokens.shape[0] ** 0.5)
-                    current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
+                    current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx)
 
         # --- history query vectors (from deepest hooked LLM layer) ---
         history_queries: List[torch.Tensor] = []
@@ -288,10 +291,9 @@ class FeatureExtractor:
                     continue
                 start, end = image_token_positions[img_idx]
                 tokens = hidden_deepest[0, start:end, :]
-                h, w = self._resolve_llm_spatial_shape(
-                    tokens.shape[0], deepest_layer, img_idx, f"history[{hist_idx}]"
+                views[v] = self._reshape_llm_tokens(
+                    tokens, deepest_layer, img_idx, f"history[{hist_idx}]"
                 )
-                views[v] = tokens.reshape(h, w, -1)
             history_llm_views.append(views)
 
         return current_vit, current_llm, history_queries, history_llm_views
@@ -341,10 +343,9 @@ class FeatureExtractor:
                     if hidden is None:
                         continue
                     tokens = hidden[batch_idx, start:end, :]
-                    h, w = self._resolve_llm_spatial_shape(
-                        tokens.shape[0], layer_idx, view_idx, f"batch[{batch_idx}]-current"
+                    current_llm[view_idx][layer_idx] = self._reshape_llm_tokens(
+                        tokens, layer_idx, view_idx, f"batch[{batch_idx}]-current"
                     )
-                    current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
 
             current_vit: Dict[int, Dict[int, torch.Tensor]] = {}
             image_offset = sample_image_offsets[batch_idx]
@@ -357,8 +358,9 @@ class FeatureExtractor:
                         continue
                     vit_tokens = self._get_vit_for_image(vit_out, global_img_idx, image_grid_thw)
                     if vit_tokens is not None:
-                        h = w = int(vit_tokens.shape[0] ** 0.5)
-                        current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
+                        current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(
+                            vit_tokens, layer_idx, view_idx
+                        )
 
             history_queries: List[torch.Tensor] = []
             for hist_idx in range(n_hist):
@@ -387,10 +389,9 @@ class FeatureExtractor:
                 if layer_samples is None:
                     continue
                 for view_idx, tokens in layer_samples[batch_idx].items():
-                    h, w = self._resolve_llm_spatial_shape(
-                        tokens.shape[0], layer_idx, view_idx, f"batch[{batch_idx}]-current"
+                    current_llm[view_idx][layer_idx] = self._reshape_llm_tokens(
+                        tokens, layer_idx, view_idx, f"batch[{batch_idx}]-current"
                     )
-                    current_llm[view_idx][layer_idx] = tokens.reshape(h, w, -1)
 
             current_vit: Dict[int, Dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
             for layer_idx in self.vit_layer_indices:
@@ -398,8 +399,9 @@ class FeatureExtractor:
                 if layer_samples is None:
                     continue
                 for view_idx, vit_tokens in layer_samples[batch_idx].items():
-                    h = w = int(vit_tokens.shape[0] ** 0.5)
-                    current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
+                    current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(
+                        vit_tokens, layer_idx, view_idx
+                    )
 
             extracted.append((current_vit, current_llm, self._captured_batch_queries[batch_idx]))
 
@@ -426,10 +428,9 @@ class FeatureExtractor:
                 view_tensors = []
                 for view_idx in range(4):
                     tokens = layer_samples[batch_idx][view_idx]
-                    h, w = self._resolve_llm_spatial_shape(
-                        tokens.shape[0], layer_idx, view_idx, f"batch[{batch_idx}]-current"
-                    )
-                    view_tensors.append(tokens.reshape(h, w, -1))
+                    view_tensors.append(self._reshape_llm_tokens(
+                        tokens, layer_idx, view_idx, f"batch[{batch_idx}]-current"
+                    ))
                 batch_views.append(torch.stack(view_tensors, dim=0))
             llm_tensors[layer_idx] = torch.stack(batch_views, dim=0)
 
@@ -442,8 +443,7 @@ class FeatureExtractor:
                 view_tensors = []
                 for view_idx in range(4):
                     vit_tokens = layer_samples[batch_idx][view_idx]
-                    h = w = int(vit_tokens.shape[0] ** 0.5)
-                    view_tensors.append(vit_tokens.reshape(h, w, -1))
+                    view_tensors.append(self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx))
                 batch_views.append(torch.stack(view_tensors, dim=0))
             vit_tensors[layer_idx] = torch.stack(batch_views, dim=0)
 
@@ -480,13 +480,77 @@ class FeatureExtractor:
                 f"LLM layer {layer_idx} image {image_idx} ({tag}) produced {num_tokens} tokens, "
                 "which is not a square grid and cannot be reshaped into 8x8-style spatial features."
             )
-        if num_tokens != TOKENS_PER_IMAGE_LLM:
-            raise RuntimeError(
-                f"LLM layer {layer_idx} image {image_idx} ({tag}) produced {num_tokens} tokens "
-                f"(expected {TOKENS_PER_IMAGE_LLM} for an 8x8 grid). "
-                "Check spatial_merge_size, image layout, or hook placement."
-            )
         return side, side
+
+    def _reshape_llm_tokens(
+        self,
+        tokens: torch.Tensor,
+        layer_idx: int,
+        image_idx: int,
+        tag: str,
+    ) -> torch.Tensor:
+        """Reshape square LLM image tokens and resize to the expected 8x8 grid."""
+        side, _ = self._resolve_llm_spatial_shape(tokens.shape[0], layer_idx, image_idx, tag)
+        feat = tokens.reshape(side, side, -1)
+        if side == LLM_SPATIAL:
+            return feat
+
+        if not self._llm_resize_logged:
+            logger.warning(
+                "LLM spatial grid is %dx%d instead of %dx%d; resizing hooked image features to the expected shape",
+                side,
+                side,
+                LLM_SPATIAL,
+                LLM_SPATIAL,
+            )
+            self._llm_resize_logged = True
+
+        feat = feat.permute(2, 0, 1).unsqueeze(0)
+        feat = F.interpolate(
+            feat,
+            size=(LLM_SPATIAL, LLM_SPATIAL),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return feat.squeeze(0).permute(1, 2, 0)
+
+    def _reshape_vit_tokens(
+        self,
+        tokens: torch.Tensor,
+        layer_idx: int,
+        image_idx: int,
+    ) -> torch.Tensor:
+        """Reshape square ViT tokens and resize to the expected 16x16 grid."""
+        num_tokens = tokens.shape[0]
+        side = int(num_tokens ** 0.5)
+        if side * side != num_tokens:
+            raise RuntimeError(
+                f"ViT layer {layer_idx} image {image_idx} produced {num_tokens} tokens, "
+                "which is not a square grid and cannot be reshaped into 16x16-style spatial features."
+            )
+
+        feat = tokens.reshape(side, side, -1)
+        if side == VIT_SPATIAL:
+            return feat
+
+        if not self._vit_resize_logged:
+            logger.warning(
+                "ViT spatial grid is %dx%d instead of %dx%d; resizing hooked image features to the expected shape",
+                side,
+                side,
+                VIT_SPATIAL,
+                VIT_SPATIAL,
+            )
+            self._vit_resize_logged = True
+
+        feat = feat.permute(2, 0, 1).unsqueeze(0)
+        feat = F.interpolate(
+            feat,
+            size=(VIT_SPATIAL, VIT_SPATIAL),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return feat.squeeze(0).permute(1, 2, 0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -518,17 +582,17 @@ class FeatureExtractor:
     @staticmethod
     def _get_visual_module(model):
         """Resolve the Qwen3_5VisionModel regardless of wrapping."""
-        m = model
-        if hasattr(m, "base_model"):
-            m = m.base_model
-        if hasattr(m, "model"):
-            inner = m.model
-            if hasattr(inner, "visual"):
-                return inner.visual
-            if hasattr(inner, "model") and hasattr(inner.model, "visual"):
-                return inner.model.visual
-        if hasattr(m, "visual"):
-            return m.visual
+        candidates = [model]
+        if hasattr(model, "base_model"):
+            candidates.append(model.base_model)
+        if hasattr(model, "model"):
+            candidates.append(model.model)
+
+        for node in candidates:
+            if hasattr(node, "visual"):
+                return node.visual
+            if hasattr(node, "model") and hasattr(node.model, "visual"):
+                return node.model.visual
         raise RuntimeError("Cannot locate vision model in model hierarchy")
 
     @staticmethod

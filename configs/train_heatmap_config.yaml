@@ -10,7 +10,7 @@ data:
   val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8
+  num_workers: 4
   pin_memory: true
   prefetch_factor: 2
   
@@ -129,8 +129,8 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.05
   min_lr: 1.0e-6
-  batch_size: 10
-  grad_accum_steps: 1
+  batch_size: 1
+  grad_accum_steps: 10
 
 # ============================================
 # 损失函数

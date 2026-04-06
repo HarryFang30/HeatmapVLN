@@ -40,6 +40,8 @@ from .memory import (
     _CG_LIMIT_GB,
     _drop_page_cache,
     _worker_init_fn,
+    ShmBypassDataset,
+    ShmBypassCollate,
 )
 
 from .ema import EMAModel, _EMAContext

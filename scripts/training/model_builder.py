@@ -9,6 +9,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
+from src.models.lora_utils import resolve_lora_layer_indices
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
+    resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
 
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
@@ -61,7 +63,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
-        lora_layer_indices=llm_cfg.get('lora_layer_indices', None),
+        lora_layer_indices=resolved_lora_layers,
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
 

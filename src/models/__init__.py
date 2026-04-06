@@ -51,10 +51,16 @@ from .heatmap import (
 )
 
 # === Action Components (NextDiT System 1) ===
-from .action import (
-    NextDiTActionHead,
-    NextDiTActionConfig,
-)
+try:
+    from .action import (
+        NextDiTActionHead,
+        NextDiTActionConfig,
+    )
+except Exception:
+    # Heatmap-only training should still import cleanly even if the local
+    # action/torchvision stack is unavailable.
+    NextDiTActionHead = None
+    NextDiTActionConfig = None
 
 # === Other Components ===
 try:

@@ -29,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
+from src.models.lora_utils import resolve_lora_layer_indices
 from src.data.vln_sliding_window_dataset import VLNTrajectoryDataset
 
 logging.basicConfig(
@@ -83,6 +84,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
+    resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
@@ -112,7 +114,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
         lora_num_layers=llm_cfg.get('lora_num_layers', 4),
-        lora_layer_indices=llm_cfg.get('lora_layer_indices', None),
+        lora_layer_indices=resolved_lora_layers,
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
         

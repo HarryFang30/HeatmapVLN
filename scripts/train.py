@@ -45,6 +45,13 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 import torch
+import torch.multiprocessing as _mp
+
+# /dev/shm 只有 64 MB（Docker 默认值），PyTorch 默认的 file_descriptor 策略
+# 底层调用 shm_open() 在 /dev/shm 创建临时文件，num_workers>0 时必然溢出。
+# 切换到 file_system 策略，让 PyTorch 在 /tmp（2.6 TB）上用普通文件做 IPC。
+_mp.set_sharing_strategy('file_system')
+
 import gc
 import time
 import logging
@@ -104,6 +111,8 @@ from scripts.training import (
     validate,
     CheckpointManager,
     load_checkpoint_for_resume,
+    ShmBypassDataset,
+    ShmBypassCollate,
     _write_json,
     _write_yaml,
     _append_jsonl,
@@ -475,8 +484,13 @@ def main():
             "model.llm.enable_packing=false。"
         )
     actual_collate_fn = collate_fn
+    use_worker_tokenized_collator = stage_cfg.get(
+        'use_worker_tokenized_collator',
+        cfg['data'].get('use_worker_tokenized_collator', stage_cfg.get('train_action', True)),
+    )
     use_panoramic_tokenized_collator = (
-        cfg['model'].get('heatmap', {}).get('enable', True)
+        use_worker_tokenized_collator
+        and cfg['model'].get('heatmap', {}).get('enable', True)
         and getattr(train_dataset, '_is_panoramic', False)
         and getattr(val_dataset, '_is_panoramic', False)
     )
@@ -495,9 +509,22 @@ def main():
         pano_processor = AutoProcessor.from_pretrained(llm_model_path, trust_remote_code=True)
         actual_collate_fn = PanoramicTokenizedCollator(pano_processor)
         logger.info("   ✅ Panoramic tokenized collator enabled")
+    elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
+        logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")
     
     mp_context = 'fork' if num_workers > 0 else None
     
+    # -- /dev/shm bypass: wrap datasets + collate when workers are used ----
+    # PyTorch DataLoader workers transfer tensors via shm_open() which
+    # lives in /dev/shm (only 64 MB in this container).  By converting
+    # tensors → numpy in the worker and back → tensors before collation,
+    # data travels through the regular pickle pipe and never touches shm.
+    if num_workers > 0:
+        train_dataset = ShmBypassDataset(train_dataset)
+        val_dataset = ShmBypassDataset(val_dataset)
+        actual_collate_fn = ShmBypassCollate(actual_collate_fn)
+        logger.info("   🔀 ShmBypass enabled: tensor↔numpy IPC (bypassing 64 MB /dev/shm)")
+
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
     
     persistent_workers = False
