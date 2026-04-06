@@ -10,7 +10,7 @@ Heatmap 推理可视化 (v2 — 全景 4 视角)
     4 行（front / right / back / left）× 4 列（视角图 | GT 热力图 | Pred 热力图 | Overlay）
 
 用法:
-    python scripts/visualize_heatmap.py \
+    python scripts/run.py visualize heatmap \
         --checkpoint /root/autodl-tmp/heatmap_training_outputs/run_.../ckpts/best.pth \
         --num-samples 10 \
         --output-dir ./vis_heatmap_4view
@@ -33,7 +33,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import cv2
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 持续监控指定 GPU：当某张卡的利用率与显存占用同时低于阈值，且该状态连续超过设定时长时，
-通过 configs/train_config.yaml 中的飞书 Webhook 发送提醒（注明卡号）。
+通过 configs/train_config_internnav.yaml 中的飞书 Webhook 发送提醒（注明卡号）。
 
 用法示例:
-  python scripts/monitor_gpu_idle.py
-  python scripts/monitor_gpu_idle.py --util-max 5 --mem-max-ratio 0.05
-  python scripts/monitor_gpu_idle.py --gpus 0,1 --duration-sec 60 --interval-sec 5
-  python scripts/monitor_gpu_idle.py --ignore-compute-procs   # 仅看 util+显存比例（易误判训练中停顿）
-  python scripts/monitor_gpu_idle.py --no-auto-occupy
-  python scripts/monitor_gpu_idle.py --occupy-script /workspace/train.py --occupy-args "--mem max --util 35"
+  python scripts/ops/monitor_gpu_idle.py
+  python scripts/ops/monitor_gpu_idle.py --util-max 5 --mem-max-ratio 0.05
+  python scripts/ops/monitor_gpu_idle.py --gpus 0,1 --duration-sec 60 --interval-sec 5
+  python scripts/ops/monitor_gpu_idle.py --ignore-compute-procs   # 仅看 util+显存比例（易误判训练中停顿）
+  python scripts/ops/monitor_gpu_idle.py --no-auto-occupy
+  python scripts/ops/monitor_gpu_idle.py --occupy-script /workspace/HeatmapVLN/scripts/train.py --occupy-args "--mem max --util 35"
 
 未指定 --gpus 时，默认监控本机 nvidia-smi 可见的全部 GPU；仅 Webhook 从配置文件读取。
 
@@ -17,7 +17,7 @@
 compute-apps 仅统计进程名匹配白名单正则的条目（默认 python/torchrun/deepspeed 等），
 系统或其它常驻进程占显存不计入，避免挡掉「狙击别人训练脚本」的判定。
 
-飞书发送成功后，可选自动执行占卡脚本（默认 /workspace/train.py，即 --gpu 逗号列表），
+飞书发送成功后，可选自动执行占卡脚本（默认 /workspace/HeatmapVLN/scripts/train.py，即 --gpu 逗号列表），
 已在占用的 GPU 不会重复拉起进程。
 """
 
@@ -275,8 +275,8 @@ def send_feishu_text(webhook_url: str, text: str) -> bool:
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parent.parent
-    default_cfg = repo_root / "configs" / "train_config.yaml"
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    default_cfg = repo_root / "configs" / "train_config_internnav.yaml"
 
     parser = argparse.ArgumentParser(description="GPU 空闲监控 + 飞书通知")
     parser.add_argument(
@@ -346,8 +346,8 @@ def main() -> None:
     parser.add_argument(
         "--occupy-script",
         type=Path,
-        default=Path("/workspace/train.py"),
-        help="占卡脚本路径（需支持 --gpu 0,1 这类参数），默认 /workspace/train.py",
+        default=repo_root / "scripts" / "train.py",
+        help="占卡脚本路径（需支持 --gpu 0,1 这类参数），默认 <repo>/scripts/train.py",
     )
     parser.add_argument(
         "--occupy-args",

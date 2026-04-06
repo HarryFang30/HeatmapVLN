@@ -1,18 +1,19 @@
 """
 Feature Extractor for HeatmapVLN
-==================================
+================================
 
-Registers forward hooks on Qwen3.5-9B to capture:
-  1. ViT intermediate-layer features (16x16 per image, pre-merge)
-  2. LLM multi-layer hidden states (8x8 per image, post-merge)
-  3. Text token hidden states (query vectors for each history position)
+Registers forward hooks on the Qwen2.5-VL / Qwen3.5 backbone to capture:
 
-Qwen3.5 uses alternating linear_attention and full_attention layers
-(full_attention_interval=4).  We hook only **full_attention** layers
-(e.g. 7, 15, 23) because they have global cross-token interaction,
-producing spatially richer 8x8 visual features.
+1. ViT intermediate-layer features (16x16 per image, pre-merge)
+2. LLM multi-layer hidden states (8x8 per image, post-merge)
+3. Text-anchor hidden states used as history queries
 
-Reference: HeatmapVLN设计文档 Section 4
+Important:
+
+- History queries come from the deepest *hooked* LLM layer
+  (i.e. ``max(llm_layer_indices)``), not necessarily the model's final layer.
+- Current default InternNav config uses Qwen2.5-VL with LLM hook layers
+  ``[6, 13, 20]`` and ViT hook layers ``[7, 15, 23, 31]``.
 """
 
 import logging
@@ -31,7 +32,7 @@ LLM_SPATIAL = 8
 
 class FeatureExtractor:
     """
-    Hook-based feature extractor for a frozen Qwen3.5-9B.
+    Hook-based feature extractor for a frozen Qwen backbone base model.
 
     After the model forward pass, call ``extract()`` to retrieve
     grouped features for downstream coarse / fine localisation heads.
@@ -222,8 +223,8 @@ class FeatureExtractor:
         Returns:
             current_vit:  ``{view_idx: {layer: (16,16,C_vit)}}``
             current_llm:  ``{view_idx: {layer: (8,8,C_llm)}}``
-            history_queries: list of ``(C_llm,)`` tensors (from deepest layer)
-            history_llm_views: list of ``{view_idx: (8,8,C_llm)}`` (deepest)
+            history_queries: list of ``(C_llm,)`` tensors (from deepest hooked layer)
+            history_llm_views: list of ``{view_idx: (8,8,C_llm)}`` (same hooked layer)
         """
         self._validate_llm_layers_captured()
 
@@ -270,14 +271,14 @@ class FeatureExtractor:
                     h = w = int(vit_tokens.shape[0] ** 0.5)
                     current_vit[view_idx][layer_idx] = vit_tokens.reshape(h, w, -1)
 
-        # --- history query vectors (from deepest LLM layer) ---
+        # --- history query vectors (from deepest hooked LLM layer) ---
         history_queries: List[torch.Tensor] = []
         for hist_idx in range(n_hist):
             pos = text_anchor_positions[hist_idx]
             q = hidden_deepest[0, pos, :]  # (C_llm,)
             history_queries.append(q)
 
-        # --- history LLM visual features (deepest layer, for ablation) ---
+        # --- history LLM visual features (same hooked layer, for ablation) ---
         history_llm_views: List[Dict[int, torch.Tensor]] = []
         for hist_idx in range(n_hist):
             views: Dict[int, torch.Tensor] = {}

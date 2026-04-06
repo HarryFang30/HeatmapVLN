@@ -62,7 +62,7 @@ docker-compose run --rm heatmapvln
 
 # 后台运行训练
 docker-compose run -d --name heatmapvln-train heatmapvln \
-  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/train.py --config configs/train_config.yaml"
+  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py train --config configs/train_config.yaml"
 
 # 启动 TensorBoard
 docker-compose up tensorboard
@@ -116,7 +116,7 @@ docker run --gpus all -it --rm \
   -v $(pwd)/tf-logs:/root/tf-logs \
   --shm-size 8g \
   heatmapvln:latest \
-  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/train.py --config configs/train_config.yaml"
+  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py train --config configs/train_config.yaml"
 ```
 
 **后台训练**：
@@ -128,7 +128,7 @@ docker run --gpus all -d --name heatmapvln-train \
   -v $(pwd)/tf-logs:/root/tf-logs \
   --shm-size 8g \
   heatmapvln:latest \
-  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/train.py --config configs/train_config.yaml"
+  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py train --config configs/train_config.yaml"
 
 # 查看日志
 docker logs -f heatmapvln-train
@@ -159,7 +159,7 @@ docker run --gpus all -it --rm \
   -v $(pwd)/vln_training_outputs:/root/HeatmapVLN/vln_training_outputs \
   -v $(pwd)/outputs_inference:/root/HeatmapVLN/outputs_inference \
   heatmapvln:latest \
-  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/inference.py --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 --config configs/train_config.yaml --checkpoint vln_training_outputs/best_model.pth --output-dir ./outputs_inference"
+  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py inference --clip dataset_with_actions/val_unseen/<scene_id>/clip_000000 --config configs/train_config.yaml --checkpoint vln_training_outputs/best_model.pth --output-dir ./outputs_inference"
 ```
 
 ### 4. 模型评估
@@ -170,7 +170,7 @@ docker run --gpus all -it --rm \
   -v $(pwd)/dataset_with_actions:/root/HeatmapVLN/dataset_with_actions \
   -v $(pwd)/vln_training_outputs:/root/HeatmapVLN/vln_training_outputs \
   heatmapvln:latest \
-  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/evaluate.py --config configs/train_config.yaml --checkpoint vln_training_outputs/best_model.pth --split val_unseen"
+  bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py evaluate --config configs/train_config.yaml --checkpoint vln_training_outputs/best_model.pth --split val_unseen"
 ```
 
 ### 5. 进入容器调试

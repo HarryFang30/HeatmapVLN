@@ -740,7 +740,10 @@ class Qwen3_5Integration(nn.Module):
 
             pad_id = getattr(self.model.config, 'pad_token_id', None)
             if pad_id is None:
-                pad_id = getattr(self.model.config.text_config, 'pad_token_id', 0) or 0
+                text_cfg = getattr(self.model.config, 'text_config', None)
+                if text_cfg is None and hasattr(self.model.config, 'get_text_config'):
+                    text_cfg = self.model.config.get_text_config()
+                pad_id = getattr(text_cfg, 'pad_token_id', 0) or 0
             dummy_ids = torch.full(
                 (B, n_query), pad_id,
                 device=device, dtype=orig_input_ids.dtype,
@@ -777,7 +780,15 @@ class Qwen3_5Integration(nn.Module):
                     kwargs['inputs_embeds'] = embeds
                 return args, kwargs
 
-            hook_handle = self.model.model.language_model.register_forward_pre_hook(
+            language_model_root = (
+                self._get_nested_module(self.model, "model.language_model")
+                or self._get_nested_module(self.model, "language_model")
+                or self._get_nested_module(self.model, "model")
+            )
+            if language_model_root is None:
+                raise RuntimeError("Could not locate the language model module for latent query injection")
+
+            hook_handle = language_model_root.register_forward_pre_hook(
                 _replace_embeds_hook, with_kwargs=True,
             )
 

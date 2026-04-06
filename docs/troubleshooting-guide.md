@@ -509,7 +509,7 @@ sleep 2
 export DISPLAY=:99
 export __GLX_VENDOR_LIBRARY_NAME=nvidia  # 强制 NVIDIA GPU 渲染
 
-python -u scripts/eval/eval_r2r_val_unseen.py \
+python -u scripts/run.py evaluate r2r \
     --model_path /workspace/InternNav_Model \
     --gpu_id 0 \
     --output_path ./logs/eval_r2r_val_unseen \

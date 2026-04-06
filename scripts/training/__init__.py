@@ -1,8 +1,8 @@
 """
 training — modular training utilities for HeatmapVLN.
 
-Re-exports every public symbol so ``from training import X`` works from
-the scripts/ directory.
+Re-exports every public symbol so ``from scripts.training import X`` works
+from the repository entrypoints.
 """
 
 from .utils import (

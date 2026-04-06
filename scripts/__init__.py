@@ -1,11 +1,13 @@
 """
-Scripts package for VLN Project
-Contains training, inference, and evaluation scripts
-"""
+Scripts package for HeatmapVLN.
 
-# Core scripts are meant to be run directly, not imported as a package
-# Use: python scripts/train_multistage.py --config configs/training_config.yaml
-# Use: python scripts/inference.py --video path/to/video.mp4
-# Use: python scripts/evaluate.py --model path/to/model
+User-facing entrypoints:
+    python scripts/run.py ...
+Compatibility entrypoints:
+    python scripts/train.py ...
+    python scripts/evaluate.py ...
+    python scripts/visualize.py ...
+    python scripts/inference.py ...
+"""
 
 __all__ = []

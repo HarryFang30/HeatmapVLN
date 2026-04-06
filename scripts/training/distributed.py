@@ -181,7 +181,7 @@ def init_distributed_context(cfg: Dict) -> DistributedContext:
         requested = len(configured_devices)
         raise RuntimeError(
             "Detected gpu.multi_gpu.enabled=true but no torchrun distributed environment. "
-            f"Please launch with torchrun --nproc_per_node={requested} scripts/train.py ..."
+            f"Please launch with torchrun --nproc_per_node={requested} scripts/run.py train ..."
         )
 
     if configured_devices and world_size != len(configured_devices):

@@ -76,8 +76,8 @@ from src.utils.logger import setup_logger
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 from src.utils.notifier import FeishuNotifier, create_notifier
 
-# --- All training utilities from the modular training/ package ---
-from training import (
+# --- All training utilities from the modular scripts.training package ---
+from scripts.training import (
     load_config,
     set_seed,
     DistributedContext,
@@ -141,6 +141,12 @@ def main():
                         help='每个 epoch 最多处理的 batch 数')
     parser.add_argument('--distributed', action='store_true',
                         help='启用 DDP（需配合 torchrun；也可在配置 gpu.multi_gpu.enabled 中开启）')
+    parser.add_argument('--num-workers', type=int, default=None,
+                        help='覆盖 data.num_workers，适合在小 /dev/shm 环境下做 smoke test')
+    parser.add_argument('--prefetch-factor', type=int, default=None,
+                        help='覆盖 data.prefetch_factor')
+    parser.add_argument('--pin-memory', action=argparse.BooleanOptionalAction, default=None,
+                        help='覆盖 data.pin_memory')
     
     args = parser.parse_args()
     
@@ -148,6 +154,12 @@ def main():
     cfg = load_config(args.config)
     if args.distributed:
         cfg.setdefault('gpu', {}).setdefault('multi_gpu', {})['enabled'] = True
+    if args.num_workers is not None:
+        cfg.setdefault('data', {})['num_workers'] = args.num_workers
+    if args.prefetch_factor is not None:
+        cfg.setdefault('data', {})['prefetch_factor'] = args.prefetch_factor
+    if args.pin_memory is not None:
+        cfg.setdefault('data', {})['pin_memory'] = args.pin_memory
 
     dist_context = init_distributed_context(cfg)
     cfg.setdefault('model', {})['device'] = str(dist_context.device)

@@ -82,7 +82,7 @@ case $choice in
             -v "$PROJECT_ROOT/tf-logs":/root/tf-logs \
             --shm-size 8g \
             heatmapvln:latest \
-            bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/train.py --config configs/train_config.yaml $RESUME_FLAG"
+            bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py train --config configs/train_config.yaml $RESUME_FLAG"
         echo -e "${GREEN}训练任务已启动！${NC}"
         echo -e "查看日志: ${YELLOW}docker logs -f heatmapvln-train${NC}"
         ;;
@@ -106,7 +106,7 @@ case $choice in
             -v "$PROJECT_ROOT/vln_training_outputs":/root/HeatmapVLN/vln_training_outputs \
             -v "$PROJECT_ROOT/outputs_inference":/root/HeatmapVLN/outputs_inference \
             heatmapvln:latest \
-            bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/inference.py --clip $clip_path --config configs/train_config.yaml --checkpoint $ckpt_path --output-dir ./outputs_inference"
+            bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py inference --clip $clip_path --config configs/train_config.yaml --checkpoint $ckpt_path --output-dir ./outputs_inference"
         ;;
     6)
         echo -e "${GREEN}运行评估...${NC}"
@@ -117,7 +117,7 @@ case $choice in
             -v "$PROJECT_ROOT/dataset_with_actions":/root/HeatmapVLN/dataset_with_actions \
             -v "$PROJECT_ROOT/vln_training_outputs":/root/HeatmapVLN/vln_training_outputs \
             heatmapvln:latest \
-            bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/evaluate.py --config configs/train_config.yaml --checkpoint $ckpt_path --split $split"
+            bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && python scripts/run.py evaluate --config configs/train_config.yaml --checkpoint $ckpt_path --split $split"
         ;;
     7)
         echo -e "${GREEN}查看训练日志...${NC}"

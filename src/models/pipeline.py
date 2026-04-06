@@ -432,6 +432,7 @@ class VLNPipeline(nn.Module):
         return_actions: bool = True,
         gt_actions: Optional[torch.Tensor] = None,
         action_valid: Optional[torch.Tensor] = None,
+        gt_stop: Optional[torch.Tensor] = None,
         gt_history_heatmap: Optional[torch.Tensor] = None,
         gt_future_heatmap: Optional[torch.Tensor] = None,
         current_views: Optional[Dict[str, Any]] = None,
@@ -442,6 +443,7 @@ class VLNPipeline(nn.Module):
         history_rel_poses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Forward pass."""
+        del gt_stop  # Reserved for optional stop-head training compatibility.
         batch_size, num_frames = video_frames.shape[:2]
 
         if current_observation is None:

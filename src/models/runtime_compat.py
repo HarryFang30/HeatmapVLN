@@ -74,23 +74,43 @@ def install_flash_attn_stub(logger: Optional[logging.Logger] = None) -> None:
     def _stubbed_flash_attn(*_args, **_kwargs):
         raise RuntimeError("flash_attn stub is active; use attn_implementation='sdpa' in the shared environment")
 
-    _make_stub_module(
+    class _FlashAttnKernelStub:
+        def fwd(self, *_args, **_kwargs):
+            return _stubbed_flash_attn(*_args, **_kwargs)
+
+        def varlen_fwd(self, *_args, **_kwargs):
+            return _stubbed_flash_attn(*_args, **_kwargs)
+
+        def bwd(self, *_args, **_kwargs):
+            return _stubbed_flash_attn(*_args, **_kwargs)
+
+        def varlen_bwd(self, *_args, **_kwargs):
+            return _stubbed_flash_attn(*_args, **_kwargs)
+
+    flash_kernel_stub = _FlashAttnKernelStub()
+
+    flash_attn_module = _make_stub_module(
         "flash_attn",
         {
-            "__version__": "2.8.3",
+            # xformers only accepts flash-attn 2.7.1-2.7.4 during import-time
+            # probing. Keep the stub inside that window so optional imports don't
+            # fail before we force SDPA at runtime.
+            "__version__": "2.7.4",
             "flash_attn_func": _stubbed_flash_attn,
             "flash_attn_varlen_func": _stubbed_flash_attn,
         },
     )
     _make_stub_module("flash_attn_2_cuda")
-    _make_stub_module(
+    flash_attn_interface = _make_stub_module(
         "flash_attn.flash_attn_interface",
         {
             "flash_attn_func": _stubbed_flash_attn,
             "flash_attn_varlen_func": _stubbed_flash_attn,
+            "flash_attn_gpu": flash_kernel_stub,
+            "flash_attn_cuda": flash_kernel_stub,
         },
     )
-    _make_stub_module(
+    flash_attn_bert_padding = _make_stub_module(
         "flash_attn.bert_padding",
         {
             "index_first_axis": _stubbed_flash_attn,
@@ -98,13 +118,19 @@ def install_flash_attn_stub(logger: Optional[logging.Logger] = None) -> None:
             "unpad_input": _stubbed_flash_attn,
         },
     )
-    _make_stub_module("flash_attn.layers")
-    _make_stub_module(
+    flash_attn_layers = _make_stub_module("flash_attn.layers")
+    flash_attn_rotary = _make_stub_module(
         "flash_attn.layers.rotary",
         {
             "apply_rotary_emb": _stubbed_flash_attn,
         },
     )
+    # Some third-party libraries (notably xformers/diffusers integration paths)
+    # access these stubbed modules as attributes on their parent package.
+    flash_attn_module.flash_attn_interface = flash_attn_interface
+    flash_attn_module.bert_padding = flash_attn_bert_padding
+    flash_attn_module.layers = flash_attn_layers
+    flash_attn_layers.rotary = flash_attn_rotary
     log.info("Installed flash_attn stub; the shared environment should run with SDPA instead of FlashAttention")
 
 
@@ -158,6 +184,8 @@ def ensure_transformers_runtime_compat(
         try:
             importlib.import_module("flash_attn")
             flash_attn_available = True
+        except ModuleNotFoundError:
+            log.info("flash_attn is not installed in the shared environment; SDPA path remains enabled")
         except Exception as exc:
             flash_attn_stubbed = True
             install_flash_attn_stub(log)

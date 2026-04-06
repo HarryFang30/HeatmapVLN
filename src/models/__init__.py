@@ -22,6 +22,8 @@ from .runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliase
 install_numpy_legacy_aliases()
 try:
     importlib.import_module("flash_attn")
+except ModuleNotFoundError:
+    pass
 except Exception:
     install_flash_attn_stub(logging.getLogger(__name__))
 

@@ -3,12 +3,13 @@
 VLN Pipeline 推理脚本
 ======================
 
-使用共享 Habitat/InternNav 环境进行视觉语言导航推理。
+推荐通过统一入口调用：
 
-支持：
-- 历史热力图生成 (History Heatmap)
-- 轨迹预测 (Trajectory - 24 步)
-- 进度预测 (Progress)
+    python scripts/run.py inference ...
+
+也兼容直接调用：
+
+    python scripts/inference.py ...
 """
 
 import os
@@ -354,8 +355,8 @@ def run_inference(
         current_observation = frames[:, -1]
     if output_heatmap:
         raise ValueError(
-            "当前 `scripts/inference.py` 只接受单路视频/clip 帧，无法为 HeatmapVLN v2 "
-            "构造 `current_views` 和 `history_panoramas`。请改用 `scripts/visualize_heatmap.py` "
+            "当前 `scripts/run.py inference` 只接受单路视频/clip 帧，无法为 HeatmapVLN v2 "
+            "构造 `current_views` 和 `history_panoramas`。请改用 `scripts/run.py visualize heatmap` "
             "或基于数据集批次进行热力图推理。"
         )
     

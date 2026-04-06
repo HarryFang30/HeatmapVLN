@@ -1,24 +1,24 @@
 """
 Convert InternNav (InternVLA-N1) model into two parts:
   1. A standard Qwen2.5-VL backbone checkpoint  (models/internnav_backbone/)
-  2. A separate System 1 checkpoint               (models/internnav_system1.safetensors)
+  2. A separate System 1 checkpoint             (models/internnav_system1.safetensors)
 
 Usage:
-    python scripts/convert_internnav_backbone.py \
+    python scripts/tools/convert_internnav_backbone.py \
         --src /workspace/InternNav_Model \
         --backbone-dst models/internnav_backbone \
         --system1-dst models/internnav_system1.safetensors
 
-The script performs key remapping so that the backbone weights match
-the Qwen2_5_VLForConditionalGeneration naming convention used by the
-shared transformers 4.51.0 baseline:
+The script strips the InternNav-specific System 1 branch and preserves the
+native Qwen2.5-VL backbone parameter names expected by the shared
+transformers 4.51.0 baseline:
 
     InternNav key             ->  Qwen2.5-VL key
     ─────────────────────────────────────────────
-    visual.*                  ->  model.visual.*
-    model.embed_tokens.*      ->  model.language_model.embed_tokens.*
-    model.layers.*            ->  model.language_model.layers.*
-    model.norm.*              ->  model.language_model.norm.*
+    visual.*                  ->  visual.*
+    model.embed_tokens.*      ->  model.embed_tokens.*
+    model.layers.*            ->  model.layers.*
+    model.norm.*              ->  model.norm.*
     lm_head.*                 ->  lm_head.*  (unchanged)
 
 System 1 weights (model.latent_queries, model.cond_projector.*,
@@ -71,15 +71,9 @@ def _is_system1_key(key: str) -> bool:
 
 def _remap_backbone_key(key: str) -> str:
     """Remap InternNav backbone key -> Qwen2.5-VL key."""
-    if key.startswith("visual."):
-        return "model." + key
-
-    if key.startswith("model.embed_tokens"):
-        return key.replace("model.embed_tokens", "model.language_model.embed_tokens", 1)
-    if key.startswith("model.layers."):
-        return key.replace("model.layers.", "model.language_model.layers.", 1)
-    if key.startswith("model.norm"):
-        return key.replace("model.norm", "model.language_model.norm", 1)
+    # InternNav already stores the backbone using the native naming scheme
+    # expected by Qwen2.5-VL in transformers 4.51.0. Keep those keys intact
+    # and only separate the System 1 branch below.
     return key
 
 

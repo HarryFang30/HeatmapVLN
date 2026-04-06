@@ -1,9 +1,9 @@
 # Heatmap Module — HeatmapVLN v2
 #
-# Coarse-to-Fine spatial projection system:
-#   - CoarseLocalization: zero-param dot-product matching (visibility + 8x8 heatmap)
-#   - DPTLiteFusion: multi-layer ViT feature fusion (16x16)
-#   - FineLocalization: FiLM modulation + CNN upsample (64x64)
+# Current default coarse-to-fine system:
+#   - TrajectoryGuidedAttention: history query + rel pose + spatial token fusion
+#   - DPTLiteFusion: multi-layer ViT / LLM feature fusion
+#   - FineLocalization: spatial_out-guided decoder (no FiLM, no fine-stage query_proj)
 #   - HeatmapVLN: complete model assembly
 #   - HeatmapVLNLoss: four-component task-priority loss
 

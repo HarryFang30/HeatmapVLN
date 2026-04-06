@@ -1,25 +1,32 @@
 """
-HeatmapVLN — Complete Model Assembly
-=======================================
+HeatmapVLN — Current heatmap branch assembly
+============================================
 
-Frozen:    Qwen3.5-9B  (~9B parameters)
-Trainable: DPTLiteFusion (ViT) + DPTLiteFusion (LLM)
-           + CoarseLocalization (query_proj + vis_head)
-           + FineLocalization
+Current default implementation:
 
-Data flow:
-    Multi-image + text input  →  Qwen3.5 forward (frozen)
-    →  ViT intermediate features (16x16, multi-layer)
-       + LLM intermediate features (8x8, multi-layer from full_attention)
-       + text hidden states (deepest layer)
-    →  DPT-Lite fusion for ViT features   →  (16x16, C_fused)
-    →  DPT-Lite fusion for LLM features   →  (8x8,  C_fused)
-    →  Coarse localisation (query_proj + cosine sim):
-         query_proj(text) × fused_llm  →  visibility + 8x8 coarse heatmap
-    →  Fine localisation (trainable):
-         fused_vit + coarse heatmap + text query  →  64x64 fine heatmap
+- Backbone: Qwen2.5-VL / Qwen3.5 integration
+- Backbone weights: frozen
+- LoRA: optional, enabled by default in InternNav config
+- Trainable heatmap modules:
+  - DPTLiteFusion (ViT)
+  - DPTLiteFusion (LLM)
+  - TrajectoryGuidedAttention or CoarseLocalization
+  - FineLocalization
 
-Reference: HeatmapVLN设计文档 Section 7
+Actual default data flow:
+
+    Multi-image + text input
+    → Qwen forward (base frozen, optional LoRA)
+    → ViT intermediate features (16x16, multi-layer)
+      + LLM intermediate features (8x8, multi-layer)
+      + text-anchor hidden states (deepest hooked LLM layer)
+    → ViT DPT-Lite fusion → (16x16, C_fused)
+    → LLM DPT-Lite fusion → (8x8, C_fused)
+    → Coarse stage
+      - default: TrajectoryGuidedAttention(history_query + rel_pose + spatial tokens)
+      - fallback: CoarseLocalization
+    → Fine localisation
+      - current default: [vit_fused, spatial_out_up, coarse_attn] → 64x64 heatmap
 """
 
 import logging
@@ -44,7 +51,7 @@ class HeatmapVLN(nn.Module):
     HeatmapVLN complete model.
 
     Args:
-        qwen_model:         Qwen3.5-9B model instance (will be frozen).
+        qwen_model:         Qwen model instance (base weights will be frozen).
         processor:          Qwen3.5 processor / tokenizer.
         c_vit:              ViT hidden dimension (1152 for Qwen3.5).
         c_llm:              LLM hidden dimension (4096 for Qwen3.5).
@@ -85,7 +92,8 @@ class HeatmapVLN(nn.Module):
         traj_cfg = trajectory_config or {}
         self.enable_trajectory = traj_cfg.get("enable", False)
 
-        # Freeze Qwen3.5
+        # Freeze backbone base weights. Optional LoRA, if present on the passed
+        # model, remains trainable unless the outer training policy freezes it.
         for param in self.qwen.parameters():
             param.requires_grad = False
 

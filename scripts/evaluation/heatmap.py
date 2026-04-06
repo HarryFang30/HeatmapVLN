@@ -9,7 +9,7 @@
 支持 defer_heatmap_to_gpu 模式（在 GPU 上计算 GT 热力图）。
 
 用法:
-    python scripts/eval_heatmap.py \
+    python scripts/run.py evaluate heatmap \
         --config configs/train_heatmap_config.yaml \
         --checkpoint /path/to/best.pth \
         --max-samples 100 \
@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import build_model

@@ -47,14 +47,20 @@ HeatmapVLN/
 
 | 脚本 | 用途 |
 | --- | --- |
-| `scripts/train.py` | 训练主入口 |
-| `scripts/evaluate.py` | 通用评估 |
-| `scripts/eval_heatmap.py` | 热力图专项评估 |
-| `scripts/inference.py` | 单视频/单 clip 轨迹推理 |
-| `scripts/visualize_heatmap.py` | 4 视角热力图对比可视化 |
-| `scripts/visualize_trajectory_heatmaps.py` | 全景轨迹热力图时序可视化 |
-| `scripts/convert_internnav_backbone.py` | 拆分 InternNav backbone / System 1 权重 |
-| `scripts/monitor_gpu_idle.py` | GPU 空闲监控与飞书提醒 |
+| `scripts/run.py` | 推荐统一入口：`train / evaluate / visualize / inference` |
+| `scripts/train.py` | 训练兼容入口 |
+| `scripts/evaluate.py` | 评估兼容入口 |
+| `scripts/visualize.py` | 可视化兼容入口 |
+| `scripts/inference.py` | 推理兼容入口 |
+| `scripts/tools/convert_internnav_backbone.py` | 拆分 InternNav backbone / System 1 权重 |
+| `scripts/ops/monitor_gpu_idle.py` | GPU 空闲监控与飞书提醒 |
+
+推荐优先使用统一风格：
+
+- `python scripts/run.py train ...`
+- `python scripts/run.py evaluate ...`
+- `python scripts/run.py visualize ...`
+- `python scripts/run.py inference ...`
 
 ## 环境要求
 
@@ -93,7 +99,7 @@ pip install -r requirements.txt
 如果你只有原始 InternNav 模型目录，可执行：
 
 ```bash
-python scripts/convert_internnav_backbone.py \
+python scripts/tools/convert_internnav_backbone.py \
   --src /workspace/InternNav_Model \
   --backbone-dst models/internnav_backbone \
   --system1-dst models/internnav_system1.safetensors
@@ -198,13 +204,13 @@ data:
 建议先做一次 dry-run：
 
 ```bash
-python scripts/train.py --config configs/train_config_internnav.yaml --dry-run
+python scripts/run.py train --config configs/train_config_internnav.yaml --dry-run
 ```
 
 再做一个极小规模训练冒烟：
 
 ```bash
-python scripts/train.py \
+python scripts/run.py train \
   --config configs/train_config_internnav.yaml \
   --epochs 1 \
   --max-batches 2
@@ -215,31 +221,31 @@ python scripts/train.py \
 ### 默认 InternNav 训练
 
 ```bash
-python scripts/train.py --config configs/train_config_internnav.yaml
+python scripts/run.py train --config configs/train_config_internnav.yaml
 ```
 
 ### 热力图专用训练
 
 ```bash
-python scripts/train.py --config configs/train_heatmap_config.yaml
+python scripts/run.py train --config configs/train_heatmap_config.yaml
 ```
 
 ### Qwen3.5 兼容训练
 
 ```bash
-python scripts/train.py --config configs/train_config.yaml
+python scripts/run.py train --config configs/train_config.yaml
 ```
 
 ### 自动续训
 
 ```bash
-python scripts/train.py --config configs/train_config_internnav.yaml --auto-resume
+python scripts/run.py train --config configs/train_config_internnav.yaml --auto-resume
 ```
 
 ### 只加载权重，不恢复优化器状态
 
 ```bash
-python scripts/train.py \
+python scripts/run.py train \
   --config configs/train_config_internnav.yaml \
   --load-weights /path/to/checkpoint.pth
 ```
@@ -247,7 +253,7 @@ python scripts/train.py \
 ### 多卡训练
 
 ```bash
-torchrun --nproc_per_node=2 scripts/train.py \
+torchrun --nproc_per_node=2 scripts/run.py train \
   --config configs/train_config_internnav.yaml \
   --distributed
 ```
@@ -275,7 +281,7 @@ torchrun --nproc_per_node=2 scripts/train.py \
 ### 通用评估
 
 ```bash
-python scripts/evaluate.py \
+python scripts/run.py evaluate \
   --config configs/train_config_internnav.yaml \
   --checkpoint /path/to/best.pth \
   --split val_unseen \
@@ -285,7 +291,7 @@ python scripts/evaluate.py \
 ### 热力图专项评估
 
 ```bash
-python scripts/eval_heatmap.py \
+python scripts/run.py evaluate heatmap \
   --config configs/train_heatmap_config.yaml \
   --checkpoint /path/to/best.pth \
   --max-samples 200
@@ -293,7 +299,9 @@ python scripts/eval_heatmap.py \
 
 说明：
 
-- `scripts/evaluate.py` 当前主要评估 heatmap 和 trajectory。
+- `scripts/run.py evaluate` 不带子命令时执行通用评估。
+- `scripts/run.py evaluate heatmap` 执行热力图专项评估。
+- `scripts/run.py evaluate r2r` 执行 `val_unseen` 的 Habitat / R2R 评估。
 - 命令行里仍保留 `--eval-progress`，但当前脚本主体并不会实际产出 progress 指标，不应再把它视为成熟默认能力。
 
 ## 推理与可视化
@@ -301,7 +309,7 @@ python scripts/eval_heatmap.py \
 ### 1. 单视频 / 单 clip 轨迹推理
 
 ```bash
-python scripts/inference.py \
+python scripts/run.py inference \
   --config configs/train_config_internnav.yaml \
   --checkpoint /path/to/best.pth \
   --video /path/to/video.mp4 \
@@ -312,7 +320,7 @@ python scripts/inference.py \
 或：
 
 ```bash
-python scripts/inference.py \
+python scripts/run.py inference \
   --config configs/train_config_internnav.yaml \
   --checkpoint /path/to/best.pth \
   --clip /path/to/clip_dir \
@@ -321,13 +329,13 @@ python scripts/inference.py \
 
 重要限制：
 
-- 当前 `scripts/inference.py` 只接受单路视频/clip 帧。
+- 当前 `scripts/run.py inference` 只接受单路视频/clip 帧。
 - 即使传入 `--output-heatmap`，脚本也无法为 HeatmapVLN v2 构造全景 `current_views/history_panoramas`，因此不能作为热力图推理入口。
 
 ### 2. 4 视角热力图可视化
 
 ```bash
-python scripts/visualize_heatmap.py \
+python scripts/run.py visualize heatmap \
   --checkpoint /path/to/best.pth \
   --num-samples 10 \
   --output-dir ./vis_heatmap_4view
@@ -343,7 +351,7 @@ python scripts/visualize_heatmap.py \
 ### 3. 轨迹热力图时序可视化
 
 ```bash
-python scripts/visualize_trajectory_heatmaps.py \
+python scripts/run.py visualize trajectory \
   --checkpoint /path/to/best.pth \
   --num-clips 3 \
   --frames-per-clip 32 \
@@ -408,18 +416,14 @@ tensorboard --logdir /root/tf-logs --port=6006
 
 ### 2. `monitor_gpu_idle.py` 的默认占卡脚本路径
 
-该脚本默认使用：
+当前脚本默认占卡入口已经改成仓库内训练主入口：
 
-- `/workspace/train.py`
+- `/workspace/HeatmapVLN/scripts/train.py`
 
-而当前仓库训练入口实际在：
-
-- `scripts/train.py`
-
-如果你要在本仓库内直接使用它，建议显式指定：
+如果你要手动指定，也可以显式传入：
 
 ```bash
-python scripts/monitor_gpu_idle.py \
+python scripts/ops/monitor_gpu_idle.py \
   --occupy-script /workspace/HeatmapVLN/scripts/train.py
 ```
 
@@ -427,10 +431,14 @@ python scripts/monitor_gpu_idle.py \
 
 当前仓库中：
 
+- 应以 `assets/achitecture.svg` 作为当前架构图
 - `assets/architecture.png` 不存在
 - 根目录 `LICENSE` 不存在
 
-因此本文档不再引用这些资源。
+因此如果你要核对当前热力图主链路，请优先查看：
+
+- `assets/achitecture.svg`
+- `docs/HeatmapVLN完整设计.md`
 
 ## 相关补充
 
