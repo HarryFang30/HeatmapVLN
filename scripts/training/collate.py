@@ -7,6 +7,22 @@ from typing import Any, Dict, List
 import torch
 
 
+def _pad_and_stack(batch: List[Dict], key: str) -> torch.Tensor:
+    """Stack tensors that may differ in the first (history) dimension,
+    padding shorter ones with zeros to match the longest."""
+    tensors = [s[key] for s in batch]
+    if all(t.shape == tensors[0].shape for t in tensors):
+        return torch.stack(tensors, dim=0)
+    max_n = max(t.shape[0] for t in tensors)
+    padded = []
+    for t in tensors:
+        if t.shape[0] < max_n:
+            pad_shape = (max_n - t.shape[0],) + t.shape[1:]
+            t = torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype)], dim=0)
+        padded.append(t)
+    return torch.stack(padded, dim=0)
+
+
 def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     max_K = max(s['history_frames'].shape[0] for s in batch)
 
@@ -32,7 +48,9 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     history_frames = torch.stack(history_frames_padded, dim=0)
     history_mask = torch.stack(history_mask, dim=0)
     current_frame = torch.stack([s['current_frame'] for s in batch], dim=0)
-    heatmap = torch.stack([s['heatmap'] for s in batch], dim=0)
+
+    heatmap = _pad_and_stack(batch, 'heatmap')
+
     action = torch.stack([s['action'] for s in batch], dim=0)
     action_valid = torch.tensor([s['action_valid'] for s in batch])
     discrete_action = torch.tensor([s.get('discrete_action', 1) for s in batch])
@@ -54,9 +72,9 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     if 'current_views' in batch[0]:
         result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
     if 'history_panoramas' in batch[0]:
-        result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
+        result['history_panoramas'] = _pad_and_stack(batch, 'history_panoramas')
     if 'gt_visibility' in batch[0]:
-        result['gt_visibility'] = torch.stack([s['gt_visibility'] for s in batch], dim=0)
+        result['gt_visibility'] = _pad_and_stack(batch, 'gt_visibility')
 
     if 'is_flipped' in batch[0]:
         result['is_flipped'] = torch.tensor([s.get('is_flipped', False) for s in batch], dtype=torch.bool)

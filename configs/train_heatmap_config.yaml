@@ -25,7 +25,7 @@ data:
     sample_stride: 2
     defer_heatmap_to_gpu: false
     clip_level_sampling: true
-    samples_per_clip: 45
+    samples_per_clip: 15
     val_samples_per_clip: 5
   
   trajectory:
@@ -129,8 +129,8 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.05
   min_lr: 1.0e-6
-  batch_size: 1
-  grad_accum_steps: 10
+  batch_size: 4
+  grad_accum_steps: 2
 
 # ============================================
 # 损失函数
