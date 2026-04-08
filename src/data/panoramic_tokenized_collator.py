@@ -3,6 +3,13 @@ Panoramic tokenized collator for HeatmapVLN.
 
 This moves Qwen processor/tokenizer work into DataLoader workers so the
 training main thread can consume already-tokenized panoramic batches.
+
+When ``n_traj_query > 0`` the collator also:
+  1. Passes ``pixel_goal`` (if present in samples) to ``construct_input``
+     so that the assistant response with ground-truth waypoint coordinates
+     is included in the tokenized conversation.
+  2. Appends ``n_traj_query`` TRAJ_TOKEN_INDEX placeholder tokens after
+     the tokenized sequence, aligned with InternNav's collator flow.
 """
 
 import ctypes
@@ -14,6 +21,7 @@ from typing import Any, Dict, List
 import torch
 
 from src.models.heatmap.input_constructor import construct_input, find_text_anchor_positions
+from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -37,11 +45,19 @@ def _rss_mb() -> float:
 
 
 class PanoramicTokenizedCollator:
-    """Collate panoramic samples and pre-tokenize them for Qwen."""
+    """Collate panoramic samples and pre-tokenize them for Qwen.
 
-    def __init__(self, processor):
+    Args:
+        processor: Qwen processor with tokenizer.
+        n_traj_query: number of ``<traj>`` placeholder tokens to append
+            (aligned with ``nextdit.n_query``).  Set to 0 to disable the
+            traj-token mechanism entirely (Stage 1 heatmap-only training).
+    """
+
+    def __init__(self, processor, n_traj_query: int = 0):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
+        self.n_traj_query = n_traj_query
         self._call_count = 0
 
     @staticmethod
@@ -127,6 +143,8 @@ class PanoramicTokenizedCollator:
             result["history_rel_poses"] = self._stack_padded_first_dim(batch, "history_rel_poses")
         if "traj_images" in batch[0]:
             result["traj_images"] = torch.stack([sample["traj_images"] for sample in batch], dim=0)
+        if "pixel_goal" in batch[0]:
+            result["pixel_goal"] = [sample.get("pixel_goal") for sample in batch]
 
         if do_log:
             rss1 = _rss_mb()
@@ -147,11 +165,13 @@ class PanoramicTokenizedCollator:
                     }
                     for hist_idx in range(sample["history_panoramas"].shape[0])
                 ]
+                pg = sample.get("pixel_goal")
                 messages_batch.append(
                     construct_input(
                         current_views=current_views_dict,
                         history_panoramas=history_panoramas_list,
                         instruction=sample.get("text"),
+                        pixel_goal=pg,
                     )
                 )
                 pano_num_histories.append(len(history_panoramas_list))
@@ -164,10 +184,11 @@ class PanoramicTokenizedCollator:
             if do_log:
                 rss2 = _rss_mb()
 
+            has_assistant = any(len(m) > 1 for m in messages_batch)
             pano_inputs = self.processor.apply_chat_template(
                 messages_batch,
                 tokenize=True,
-                add_generation_prompt=False,
+                add_generation_prompt=not has_assistant,
                 return_dict=True,
                 return_tensors="pt",
                 padding=True,
@@ -182,6 +203,25 @@ class PanoramicTokenizedCollator:
                 if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
                     pano_inputs["video_grid_thw"] = torch.repeat_interleave(vgt, vgt[:, 0], dim=0)
                     pano_inputs["video_grid_thw"][:, 0] = 1
+
+            # Append TRAJ_TOKEN_INDEX placeholders (InternNav-aligned)
+            nq = self.n_traj_query
+            if nq > 0:
+                B, L = pano_inputs["input_ids"].shape
+                traj_tokens = torch.full(
+                    (B, nq), TRAJ_TOKEN_INDEX,
+                    dtype=pano_inputs["input_ids"].dtype,
+                )
+                pano_inputs["input_ids"] = torch.cat(
+                    [pano_inputs["input_ids"], traj_tokens], dim=1,
+                )
+                if "attention_mask" in pano_inputs and pano_inputs["attention_mask"] is not None:
+                    traj_mask = torch.ones(
+                        B, nq, dtype=pano_inputs["attention_mask"].dtype,
+                    )
+                    pano_inputs["attention_mask"] = torch.cat(
+                        [pano_inputs["attention_mask"], traj_mask], dim=1,
+                    )
 
             pano_text_anchor_positions = [
                 find_text_anchor_positions(

@@ -25,6 +25,7 @@ def construct_input(
     current_views: Dict[str, Union[Image.Image, torch.Tensor]],
     history_panoramas: List[Dict[str, Union[Image.Image, torch.Tensor]]],
     instruction: Optional[str] = None,
+    pixel_goal: Optional[List[int]] = None,
 ) -> List[Dict]:
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
@@ -34,6 +35,11 @@ def construct_input(
             values are PIL Images or tensors (C,H,W) in [0,1].
         history_panoramas: list of dicts with same structure, ordered by time.
         instruction: optional navigation instruction for task grounding.
+        pixel_goal: optional [x, y] pixel coordinates of the next waypoint
+            in the front view.  When provided, the user prompt asks for
+            waypoint coordinates and an assistant response with the
+            ground-truth coordinates is appended (teacher forcing for
+            InternNav-style pixel-goal anchoring).
 
     Returns:
         messages: list of message dicts compatible with the Qwen2.5-VL processor.
@@ -66,12 +72,26 @@ def construct_input(
             img = _ensure_pil(hist[view_name])
             content.append({"type": "image", "image": img})
 
-    content.append({
-        "type": "text",
-        "text": "判断每个历史位置在当前视图中的投影位置。",
-    })
+    if pixel_goal is not None:
+        content.append({
+            "type": "text",
+            "text": "判断每个历史位置在当前视图中的投影位置，"
+                    "并输出下一个导航目标在前视图中的像素坐标。",
+        })
+    else:
+        content.append({
+            "type": "text",
+            "text": "判断每个历史位置在当前视图中的投影位置。",
+        })
 
     messages = [{"role": "user", "content": content}]
+
+    if pixel_goal is not None:
+        messages.append({
+            "role": "assistant",
+            "content": f"{pixel_goal[0]} {pixel_goal[1]}",
+        })
+
     return messages
 
 

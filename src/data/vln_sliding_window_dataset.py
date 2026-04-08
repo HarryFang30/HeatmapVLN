@@ -2118,6 +2118,42 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             image = cv2.resize(image, (tw, th))
         return image
 
+    @staticmethod
+    def _compute_pixel_goal(
+        current_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        img_size: int = 256,
+    ) -> Optional[List[int]]:
+        """Project the goal position onto the current front-view image.
+
+        Uses pinhole projection with HFOV=90° (Habitat convention:
+        X right, Y up, -Z forward).
+
+        Returns:
+            [u, v] integer pixel coordinates, or ``None`` if the goal
+            is behind the camera or too close.
+        """
+        T_inv = np.linalg.inv(np.asarray(current_pose, dtype=np.float64))
+        goal_world = np.array([
+            goal_pose[0, 3], goal_pose[1, 3], goal_pose[2, 3], 1.0,
+        ], dtype=np.float64)
+        p_cam = T_inv @ goal_world
+
+        x, y, z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
+        if z >= -0.1:
+            return None
+
+        z_depth = -z
+        f = img_size / 2.0
+        c = img_size / 2.0
+
+        u = f * x / z_depth + c
+        v = f * (-y) / z_depth + c
+
+        u = max(0, min(img_size - 1, int(round(u))))
+        v = max(0, min(img_size - 1, int(round(v))))
+        return [u, v]
+
     def _load_fgr2r_mapping(self, fgr2r_path: Optional[str] = None):
         """加载 FGR2R 子指令映射表（支持 .json 和 .json.gz 格式）"""
         import gzip
@@ -2451,6 +2487,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     curr_img = np.zeros((th, tw, 3), dtype=np.uint8)
                 traj_imgs = np.stack([goal_img, curr_img], axis=0).astype(np.float32) / 255.0
                 result["traj_images"] = torch.from_numpy(traj_imgs)  # [2, H, W, 3]
+
+                # Pixel-goal: project goal position onto current front view
+                # (InternNav-style spatial anchor for latent queries)
+                goal_pose = poses[goal_frame_idx]
+                pg = self._compute_pixel_goal(
+                    current_pose, goal_pose, img_size=img_size,
+                )
+                if pg is not None:
+                    result["pixel_goal"] = pg
 
             if gt_visibility is not None:
                 result["gt_visibility"] = gt_visibility  # [N, 4]

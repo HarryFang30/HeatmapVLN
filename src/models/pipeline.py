@@ -562,6 +562,53 @@ class VLNPipeline(nn.Module):
 
         return output
 
+    @torch.no_grad()
+    def generate_trajectory(
+        self,
+        panoramic_inputs: Dict[str, torch.Tensor],
+        panoramic_num_histories: List[int],
+        traj_images: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Two-step inference aligned with InternNav.
+
+        Step 1: auto-regressive pixel-goal text generation.
+        Step 2: ``generate_latents`` — forward with generated text + TRAJ
+                tokens to extract ``traj_hidden_states``.
+        Step 3: NextDiT trajectory generation from conditions.
+
+        Returns the predicted trajectory tensor, or ``None`` on failure.
+        """
+        if self.nextdit_action_head is None or self.latent_queries is None:
+            return None
+
+        inputs = {k: v.to(self.device, non_blocking=True)
+                  for k, v in panoramic_inputs.items()}
+
+        with torch.no_grad():
+            output_ids = self.qwen2_5_vl.model.generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=False,
+                use_cache=True,
+                return_dict_in_generate=True,
+            ).sequences
+
+        lq = self.latent_queries.expand(1, -1, -1).to(
+            device=self.device, dtype=self.config.dtype,
+        )
+        traj_hidden_states = self.qwen2_5_vl.generate_latents(
+            output_ids=output_ids,
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            latent_queries=lq,
+        )
+
+        trajectory = self.nextdit_action_head.get_trajectory(
+            traj_hidden_states,
+            traj_images=traj_images,
+        )
+        return trajectory
+
     def forward_packed(
         self,
         packed_batch: Dict[str, Any],

@@ -507,8 +507,13 @@ def main():
         )
         logger.info("🔄 Loading Qwen processor for panoramic worker-side tokenization...")
         pano_processor = AutoProcessor.from_pretrained(llm_model_path, trust_remote_code=True)
-        actual_collate_fn = PanoramicTokenizedCollator(pano_processor)
-        logger.info("   ✅ Panoramic tokenized collator enabled")
+        n_traj_query = cfg.get('model', {}).get('action_head', {}).get('nextdit', {}).get('n_query', 0)
+        if not cfg.get('model', {}).get('action_head', {}).get('nextdit', {}).get('enabled', False):
+            n_traj_query = 0
+        if not stage_cfg.get('train_action', False):
+            n_traj_query = 0
+        actual_collate_fn = PanoramicTokenizedCollator(pano_processor, n_traj_query=n_traj_query)
+        logger.info("   ✅ Panoramic tokenized collator enabled (n_traj_query=%d)", n_traj_query)
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")
     

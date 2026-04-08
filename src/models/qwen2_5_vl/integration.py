@@ -30,6 +30,12 @@ from ..runtime_compat import ensure_transformers_runtime_compat
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
 
+# Aligned with InternNav: special token ID for trajectory query placeholders.
+# These positions in input_ids are replaced by learnable latent_queries before
+# the LLM forward pass.  The token ID matches InternNav's vocabulary entry so
+# that the same backbone weights are compatible.
+TRAJ_TOKEN_INDEX = 151667
+
 # Import sequence packing utilities
 try:
     from .sequence_packing import (
@@ -671,71 +677,82 @@ class Qwen2_5VLIntegration(nn.Module):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[torch.Tensor]]:
         """Run Qwen on already prepared multimodal inputs.
 
+        Aligned with InternNav's traj-token mechanism:
+        - Training: ``input_ids`` already contains ``TRAJ_TOKEN_INDEX``
+          placeholders appended by the collator (after pixel-goal text).
+        - Inference: if no ``TRAJ_TOKEN_INDEX`` found, they are appended here.
+        - In both cases a forward pre-hook replaces the TRAJ embeddings
+          with ``latent_queries`` so they attend to the full context
+          (including pixel-goal coordinates).
+
         Args:
-            skip_lm_head: If True, call ``model.model()`` (the base
-                base vision-language model) instead of ``model()`` (ForConditionalGeneration)
-                to avoid the 1-billion-parameter LM head matmul.  Use this
-                when only hooked features are needed (heatmap-only training).
+            skip_lm_head: bypass the LM head matmul (heatmap-only training).
             latent_queries: (B, n_query, hidden_dim) learnable trajectory
-                query tokens to inject into the VLM sequence.  When provided,
-                dummy pad tokens are appended to ``input_ids`` and a forward
-                pre-hook replaces their embeddings with *latent_queries*
-                before the language model processes the sequence.  The
-                corresponding output hidden states are returned as
-                ``traj_hidden_states``.
+                condition vectors injected at TRAJ_TOKEN_INDEX positions.
         """
-        orig_input_ids = inputs["input_ids"]
-        image_mask = orig_input_ids == self.image_token_id
-        num_image_tokens = int(image_mask.sum().item())
+        raw_input_ids = inputs["input_ids"]
+        num_image_tokens = int((raw_input_ids == self.image_token_id).sum().item())
 
         n_query = 0
         hook_handle = None
         need_hidden = return_hidden_states or (latent_queries is not None)
 
+        # input_ids to use for vision-feature extraction (without TRAJ tokens)
+        vision_input_ids = raw_input_ids
+
         if latent_queries is not None:
             B, n_query, D = latent_queries.shape
-            device = orig_input_ids.device
+            device = raw_input_ids.device
 
-            pad_id = getattr(self.model.config, 'pad_token_id', None)
-            if pad_id is None:
-                text_cfg = getattr(self.model.config, 'text_config', None)
-                if text_cfg is None and hasattr(self.model.config, 'get_text_config'):
-                    text_cfg = self.model.config.get_text_config()
-                pad_id = getattr(text_cfg, 'pad_token_id', 0) or 0
-            dummy_ids = torch.full(
-                (B, n_query), pad_id,
-                device=device, dtype=orig_input_ids.dtype,
-            )
-            inputs["input_ids"] = torch.cat([orig_input_ids, dummy_ids], dim=1)
+            has_traj_tokens = (raw_input_ids == TRAJ_TOKEN_INDEX).any().item()
 
-            if "attention_mask" in inputs and inputs["attention_mask"] is not None:
-                mask_ext = torch.ones(
-                    B, n_query, device=device,
-                    dtype=inputs["attention_mask"].dtype,
+            if has_traj_tokens:
+                # Training path: TRAJ tokens placed by collator after
+                # pixel-goal assistant text.  Strip them from the copy used
+                # for vision-feature extraction so lengths stay aligned.
+                vision_input_ids = raw_input_ids[:, :-n_query]
+            else:
+                # Inference / fallback: append TRAJ placeholder tokens.
+                traj_ids = torch.full(
+                    (B, n_query), TRAJ_TOKEN_INDEX,
+                    device=device, dtype=raw_input_ids.dtype,
                 )
-                inputs["attention_mask"] = torch.cat(
-                    [inputs["attention_mask"], mask_ext], dim=1,
-                )
+                inputs["input_ids"] = torch.cat([raw_input_ids, traj_ids], dim=1)
 
-            if "mm_token_type_ids" in inputs and inputs["mm_token_type_ids"] is not None:
-                mm_ext = torch.zeros(
-                    B, n_query, device=device,
-                    dtype=inputs["mm_token_type_ids"].dtype,
-                )
-                inputs["mm_token_type_ids"] = torch.cat(
-                    [inputs["mm_token_type_ids"], mm_ext], dim=1,
-                )
+                if "attention_mask" in inputs and inputs["attention_mask"] is not None:
+                    mask_ext = torch.ones(
+                        B, n_query, device=device,
+                        dtype=inputs["attention_mask"].dtype,
+                    )
+                    inputs["attention_mask"] = torch.cat(
+                        [inputs["attention_mask"], mask_ext], dim=1,
+                    )
 
+                if "mm_token_type_ids" in inputs and inputs["mm_token_type_ids"] is not None:
+                    mm_ext = torch.zeros(
+                        B, n_query, device=device,
+                        dtype=inputs["mm_token_type_ids"].dtype,
+                    )
+                    inputs["mm_token_type_ids"] = torch.cat(
+                        [inputs["mm_token_type_ids"], mm_ext], dim=1,
+                    )
+
+            # Pre-hook: replace TRAJ_TOKEN_INDEX embeddings with latent_queries
+            # (InternNav-style mask-based replacement)
             lq = latent_queries
-            nq = n_query
+            _traj_token_id = TRAJ_TOKEN_INDEX
+            _input_ids_ref = inputs["input_ids"]
 
-            def _replace_embeds_hook(module, args, kwargs):
+            def _replace_traj_embeds_hook(module, args, kwargs):
                 embeds = kwargs.get('inputs_embeds')
                 if embeds is not None:
-                    embeds = embeds.clone()
-                    embeds[:, -nq:, :] = lq.to(dtype=embeds.dtype, device=embeds.device)
-                    kwargs = dict(kwargs)
-                    kwargs['inputs_embeds'] = embeds
+                    traj_mask = _input_ids_ref == _traj_token_id
+                    if traj_mask.any():
+                        embeds = embeds.clone()
+                        flat_lq = lq.to(dtype=embeds.dtype, device=embeds.device)
+                        embeds[traj_mask] = flat_lq.reshape(-1, flat_lq.shape[-1])
+                        kwargs = dict(kwargs)
+                        kwargs['inputs_embeds'] = embeds
                 return args, kwargs
 
             language_model_root = (
@@ -747,7 +764,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 raise RuntimeError("Could not locate the language model module for latent query injection")
 
             hook_handle = language_model_root.register_forward_pre_hook(
-                _replace_embeds_hook, with_kwargs=True,
+                _replace_traj_embeds_hook, with_kwargs=True,
             )
 
         fwd_kwargs = dict(
@@ -770,9 +787,6 @@ class Qwen2_5VLIntegration(nn.Module):
                     except TypeError as exc:
                         if "unexpected keyword argument" not in str(exc):
                             raise
-                        # PEFT-wrapped Qwen exposes the multimodal forward on
-                        # `.model`, but the plain HF model keeps it on the
-                        # outer module. Fall back automatically for the latter.
                         outputs = self.model(**fwd_kwargs)
             else:
                 outputs = self.model(**fwd_kwargs)
@@ -805,7 +819,7 @@ class Qwen2_5VLIntegration(nn.Module):
         vision_hidden_states = None
         if hidden_states is not None:
             vision_hidden_states = self._extract_vision_hidden_states(
-                hidden_states, orig_input_ids,
+                hidden_states, vision_input_ids,
             )
 
         return hidden_states, vision_hidden_states, num_image_tokens, traj_hidden_states
@@ -1200,7 +1214,79 @@ class Qwen2_5VLIntegration(nn.Module):
         )[0]
         
         return generated_text
-    
+
+    def generate_latents(
+        self,
+        output_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        latent_queries: torch.Tensor,
+    ) -> torch.Tensor:
+        """Two-step inference aligned with InternNav ``generate_latents``.
+
+        After the model has auto-regressively generated pixel-goal text,
+        this method takes the **full** output sequence (prompt + generated
+        tokens), appends ``TRAJ_TOKEN_INDEX`` placeholders, replaces them
+        with ``latent_queries``, and runs a single forward pass.  The
+        hidden states at the TRAJ positions are the trajectory conditions.
+
+        Args:
+            output_ids: (1, L) full token sequence including generated text.
+            pixel_values: preprocessed image/video tensors from the processor.
+            image_grid_thw: grid layout tensor for vision tokens.
+            latent_queries: (1, n_query, hidden_dim) learnable queries.
+
+        Returns:
+            traj_hidden_states: (1, n_query, hidden_dim)
+        """
+        if not self._model_loaded:
+            self._load_model()
+
+        n_query = latent_queries.shape[1]
+        device = output_ids.device
+
+        traj_suffix = torch.full(
+            (1, n_query), TRAJ_TOKEN_INDEX,
+            device=device, dtype=output_ids.dtype,
+        )
+        extended_ids = torch.cat([output_ids, traj_suffix], dim=1)
+
+        with torch.no_grad():
+            text_embeds = self.model.model.embed_tokens(extended_ids)
+
+        image_mask = extended_ids == self.image_token_id
+        if pixel_values is not None and image_mask.any():
+            pixel_values = pixel_values.to(
+                device=self.device,
+                dtype=next(self.model.parameters()).dtype,
+            )
+            image_embeds = self.model.visual(
+                pixel_values, grid_thw=image_grid_thw,
+            )
+            text_embeds[image_mask] = image_embeds.to(
+                device=text_embeds.device,
+            )[:image_mask.sum(), :]
+
+        lq = latent_queries.to(dtype=text_embeds.dtype, device=text_embeds.device)
+        text_embeds[:, -n_query:, :] = lq
+
+        rope_fn = getattr(self.model, 'get_rope_index', None)
+        position_ids = None
+        if rope_fn is not None:
+            position_ids, _ = rope_fn(extended_ids, image_grid_thw)
+            position_ids = position_ids.to(device)
+
+        with torch.no_grad():
+            outputs = self.model.model(
+                inputs_embeds=text_embeds,
+                position_ids=position_ids,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        traj_hidden_states = outputs.hidden_states[-1][:, -n_query:, :]
+        return traj_hidden_states.contiguous()
+
     def _extract_hidden_from_generation(
         self,
         hidden_states_tuple: Tuple,
