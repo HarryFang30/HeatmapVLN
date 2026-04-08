@@ -25,7 +25,7 @@ data:
     sample_stride: 2
     defer_heatmap_to_gpu: false
     clip_level_sampling: true
-    samples_per_clip: 45
+    samples_per_clip: 15
     val_samples_per_clip: 5
   
   trajectory:
