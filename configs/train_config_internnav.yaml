@@ -1,21 +1,21 @@
 seed: 42
 
 # ============================================
-# 阶段 2: System 1 适配（VLM + LoRA 完全冻结）
+# 阶段 2: System 1 桥接适配（VLM + LoRA 完全冻结）
 # ============================================
 #
-# 核心原则（对齐 InternNav 论文）:
-#   InternNav Stage 1: 全参数微调 Qwen → 学 pixel-goal 生成
-#   InternNav Stage 2: 冻结 Qwen → 只训 latent_queries + DiT
+# 对齐 InternNav 论文:
+#   InternNav Stage 2: 冻结整个 Qwen → 只训 latent_queries + System 1
+#   HeatmapVLN Stage 2: 冻结 Qwen + LoRA → 只训桥接层
 #
-#   HeatmapVLN Stage 1: LoRA + 热力图头 → 学空间理解
-#   HeatmapVLN Stage 2: 冻结 LoRA → 只训 System 1 组件
-#
-#   关键: 训练 System 1 时 VLM 表示必须是固定靶标，
-#   否则 latent_queries 追逐一个不断变化的表示空间，无法收敛。
+# 与 InternNav 的关键区别:
+#   - InternNav 从头训 System 1; 我们已有预训练的 System 1 权重
+#   - System 1 的视觉记忆路径 (traj_images) 保持前视图输入，与 InternNav 一致
+#   - 因此 traj_dit / memory_encoder / rgb_resampler 等不需要适配
+#   - 只需训练 latent_queries + cond_projector 适配 LoRA 引入的表示偏移
 #
 # 前置条件:
-#   阶段 1 (train_heatmap_config.yaml) 已完成。
+#   阶段 1 (train_heatmap_config.yaml) 已完成，LoRA 空间理解已固化。
 #
 # 启动方式:
 #   python scripts/train.py \
@@ -69,6 +69,7 @@ data:
     enable_trajectory_augmentation: true
     use_subinstruction: true
     fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
+    # System 1 视觉记忆: 仅前视图，与 InternNav 一致
     load_traj_images: true
     traj_image_size: [224, 224]
 
@@ -97,7 +98,7 @@ model:
     lora_layer_indices: [5, 6, 12, 13, 19, 20]
     lora_dropout: 0.05
 
-  # HeatmapVLN v2 Coarse-to-Fine
+  # HeatmapVLN v2 (可选: 在固定 VLM 上继续精炼)
   heatmap:
     enable: true
     c_vit: 1280
@@ -120,7 +121,7 @@ model:
       num_layers: 2
       max_spatial_range: 10.0
 
-  # NextDiT System 1 — 与 InternNav 完全一致
+  # NextDiT System 1 — 预训练权重，与 InternNav 完全一致
   action_head:
     enable: true
     nextdit:
@@ -141,72 +142,56 @@ model:
       dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
       enable_gradient_checkpointing: true
       internnav_system1_path: "models/internnav_system1.safetensors"
-      # 前 500 步只训 cond_projector + latent_queries
-      # 之后解冻 memory_encoder / rgb_resampler
-      warmup_steps: 500
+      warmup_steps: 0
 
 # ============================================
-# 训练策略 — 对齐 InternNav: 冻结 VLM，只训 System 1
+# 训练策略 — 只训桥接层
 # ============================================
 #
-# 对齐 InternNav 论文的核心设计:
+# 分析:
+#   VLM 变化: Qwen 基座相同，LoRA 引入了空间理解增强
+#   → traj_hidden_states 分布偏移（LoRA 修改了 LLM 层的 attention）
+#   → cond_projector 需重新学习 3584→768 投影
+#   → latent_queries 需重新学习条件提取
 #
-#   InternNav Stage 2:
-#     冻结: 整个 Qwen2.5-VL
-#     训练: latent_queries + cond_projector + DiT + 视觉记忆
-#
-#   HeatmapVLN Stage 2 (本配置):
-#     冻结: Qwen2.5-VL 基座 + LoRA (空间理解已固化)
-#     训练: latent_queries + cond_projector + 视觉记忆
-#     冻结: traj_dit (已从 InternNav 预训练，保持轨迹生成能力)
-#     可选: heatmap_vln 继续训练 (在固定 VLM 特征上精炼，不影响 System 1)
-#
-#   为什么冻结 LoRA:
-#     1. LoRA 是"空间理解增强器"，在 Stage 1 已训练完成
-#     2. 如果 Stage 2 继续训练 LoRA，VLM 表示会不断变化
-#     3. latent_queries 追逐一个移动靶标，无法稳定收敛
-#     4. InternNav 论文已证明: 训练 System 1 时 VLM 必须冻结
-#
-#   为什么冻结 traj_dit:
-#     traj_dit 来自 InternNav 预训练，已有良好的轨迹生成能力。
-#     只需训练桥接层 (cond_projector + latent_queries) 适配新的 VLM 表示。
-#     如果 trajectory loss 不收敛，可以尝试解冻 traj_dit。
+#   System 1 不变: traj_images = 前视图（与 InternNav 一致）
+#   → memory_encoder / rgb_resampler / traj_dit 无需适配
+#   → 整个 System 1 核心保持冻结
 #
 training:
   stages:
-    - name: stage2_system1_adaptation
+    - name: stage2_bridge_only
       epochs: 10
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: true
       train_action: true
       trainable_modules:
-        - latent_queries     # 核心: 学习从固定 VLM 表示中提取导航条件
-        - cond_projector     # 核心: 3584→768 条件投影适配
-        - memory_encoder     # 视觉记忆自注意力 (适配全景)
-        - rgb_resampler      # QFormer 视觉记忆重采样 (适配全景)
-        - llm_projector      # LLM hidden → token dim 桥接
-        - heatmap_vln        # 可选: 在固定 VLM 特征上继续精炼热力图
+        - latent_queries     # 适配 LoRA 修改后的 LLM 表示
+        - cond_projector     # 重新学习 3584→768 投影
+        - heatmap_vln        # 可选: 在固定 VLM 上精炼热力图
       frozen_modules:
         - vlm_backbone       # Qwen2.5-VL 基座权重
-        - lora               # 空间理解已固化，不再更新
-        - traj_dit           # InternNav 预训练的核心扩散模型
-        - rgb_model           # DINOv2/DepthAnythingV2 预训练视觉编码器
-        - action_encoder     # 动作空间编码 (动作空间未变)
-        - action_decoder     # 动作空间解码 (动作空间未变)
+        - lora               # 空间理解已固化
+        - traj_dit           # 预训练轨迹生成 (输入格式不变)
+        - memory_encoder     # 前视图输入不变，无需适配
+        - rgb_resampler      # 前视图输入不变，无需适配
+        - rgb_model           # DINOv2 预训练
+        - action_encoder     # 动作空间不变
+        - action_decoder     # 动作空间不变
         - pos_encoding       # 正弦位置编码
+        - llm_projector      # 非轨迹关键路径
 
 # ============================================
 # 优化器配置
 # ============================================
 #
-# 学习率设计原则:
-#   - LoRA: 不参与 (冻结)
-#   - 桥接层 (latent_queries, cond_projector): 高 lr，主要训练对象
-#   - 视觉记忆 (memory_encoder, rgb_resampler): 中等 lr
-#   - HeatmapVLN: 低 lr，只做精炼 (VLM 特征已固定)
+# 参考 InternNav Stage 2: lr=1e-4, weight_decay=0
 #
-# 参考 InternNav Stage 2: lr=1e-4，轨迹相关组件统一学习率
+# 只有两组核心参数:
+#   - latent_queries: 4 × 3584 = 14336 参数
+#   - cond_projector: ~5.5M 参数 (3584→768→768)
+# 总可训练参数极少，收敛应很快
 #
 optim:
   optimizer: adamw
@@ -215,9 +200,6 @@ optim:
   vis_head_lr: 2.0e-4
   nextdit_cond_projector_lr: 1.0e-4
   latent_queries_lr: 1.0e-4
-  memory_encoder_lr: 1.0e-4
-  rgb_resampler_lr: 1.0e-4
-  llm_projector_lr: 5.0e-5
   weight_decay: 0.0
   grad_clip: 1.0
   amp: bf16
@@ -231,11 +213,9 @@ optim:
 # 损失函数
 # ============================================
 #
-# 轨迹为主导，热力图为辅助监控:
-#   - trajectory_weight = 1.0: System 1 是主要训练目标
-#   - heatmap_weight = 0.3: 热力图只是在固定 VLM 上精炼，
-#     权重降低避免占用过多计算图；
-#     热力图梯度不会流入 LoRA (已冻结)，不影响 System 1
+# trajectory_weight = 1.0: 桥接适配的主目标
+# heatmap_weight = 0.3: 可选监控，梯度不影响桥接层
+#   (LoRA 冻结 → 热力图梯度止于 heatmap_vln 模块，不碰 System 1)
 #
 loss:
   heatmap_loss_type: heatmap_vln
