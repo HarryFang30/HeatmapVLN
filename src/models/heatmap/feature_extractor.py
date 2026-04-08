@@ -2,7 +2,7 @@
 Feature Extractor for HeatmapVLN
 ================================
 
-Registers forward hooks on the Qwen2.5-VL / Qwen3.5 backbone to capture:
+Registers forward hooks on the Qwen2.5-VL backbone to capture:
 
 1. ViT intermediate-layer features (16x16 per image, pre-merge)
 2. LLM multi-layer hidden states (8x8 per image, post-merge)
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# Qwen3.5-9B constants
+# Qwen2.5-VL token-layout constants
 TOKENS_PER_IMAGE_VIT = 256   # 16x16 pre-merge
 TOKENS_PER_IMAGE_LLM = 64    # 8x8 post-merge (after 2x2 spatial merge)
 VIT_SPATIAL = 16
@@ -39,11 +39,11 @@ class FeatureExtractor:
     grouped features for downstream coarse / fine localisation heads.
 
     Args:
-        model:             Qwen3.5 model instance.
+        model:             VLM backbone model instance.
         vit_layer_indices: ViT block indices to hook (e.g. [6, 12, 18, 24]).
         llm_layer_indices: LLM layer indices to hook.  Should be
                            **full_attention** layers (e.g. [7, 15, 23]).
-        spatial_merge_size: Qwen3.5 spatial merge factor (default 2).
+        spatial_merge_size: backbone spatial merge factor (default 2).
     """
 
     def __init__(
@@ -581,7 +581,7 @@ class FeatureExtractor:
 
     @staticmethod
     def _get_visual_module(model):
-        """Resolve the Qwen3_5VisionModel regardless of wrapping."""
+        """Resolve the vision module regardless of wrapping."""
         candidates = [model]
         if hasattr(model, "base_model"):
             candidates.append(model.base_model)
@@ -599,7 +599,7 @@ class FeatureExtractor:
     def _get_llm_layers(model):
         """Resolve the list of LLM transformer layers.
 
-        Walks through common Qwen3.5 wrapping patterns, checking each
+        Walks through common Qwen2.5-VL wrapping patterns, checking each
         candidate node for a ``language_model.layers`` or ``layers``
         attribute.
         """

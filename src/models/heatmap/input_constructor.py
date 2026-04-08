@@ -2,7 +2,7 @@
 Input Constructor for HeatmapVLN
 ==================================
 
-Constructs text-guided multi-image input for Qwen3.5-9B.
+Constructs text-guided multi-image input for Qwen2.5-VL.
 Each panoramic position provides 4 views (front/right/back/left at 256x256).
 Text annotations encode scene context, group structure, and spatial orientation.
 
@@ -27,7 +27,7 @@ def construct_input(
     instruction: Optional[str] = None,
 ) -> List[Dict]:
     """
-    Construct text-annotated multi-image messages for Qwen3.5.
+    Construct text-annotated multi-image messages for Qwen2.5-VL.
 
     Args:
         current_views: dict with keys 'front', 'right', 'back', 'left',
@@ -36,7 +36,7 @@ def construct_input(
         instruction: optional navigation instruction for task grounding.
 
     Returns:
-        messages: list of message dicts compatible with Qwen3.5 processor.
+        messages: list of message dicts compatible with the Qwen2.5-VL processor.
     """
     content = []
 

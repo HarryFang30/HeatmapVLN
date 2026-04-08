@@ -4,7 +4,7 @@ Data loading and preprocessing utilities for VLN datasets
 
 Active components:
 - vln_sliding_window_dataset: Core training dataset (滑动窗口)
-- packing_collator: Sequence Packing Collator (基于 Qwen3.5 官方实现)
+- packing_collator: Sequence Packing Collator（保留的旧实现，默认不用）
 """
 
 # Training dataset classes

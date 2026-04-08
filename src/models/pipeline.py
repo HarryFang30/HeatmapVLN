@@ -5,7 +5,7 @@ VLN Pipeline — v2 (Coarse-to-Fine) + InternNav System 1
 Architecture:
     Current panorama (4 views) + N history panoramas + text
         |
-    Qwen2.5-VL / Qwen3.5 (Vision Encoder + LLM, frozen + LoRA)
+    Qwen2.5-VL backbone (frozen + LoRA)
         |
     ├── HeatmapVLN (Coarse-to-Fine, ~2M trainable)
     │       → visibility (N_hist, 4)
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple, Any, List
 import logging
 from dataclasses import dataclass
 
-from .qwen3_5 import Qwen3_5Integration, Qwen3_5Config
+from .qwen2_5_vl import Qwen2_5VLIntegration, Qwen2_5VLConfig
 from .heatmap import HeatmapVLN, HeatmapVLNLoss
 
 if TYPE_CHECKING:
@@ -36,9 +36,9 @@ VIEW_NAMES = ("front", "right", "back", "left")
 class VLNPipelineConfig:
     """Configuration for VLN pipeline."""
 
-    # VLM backbone configuration (shared default: InternNav Qwen2.5-VL)
+    # Backbone configuration
     llm_model_path: str = "./models/internnav_backbone"
-    llm_backbone_type: str = "qwen2_5_vl"  # "auto", "qwen3_5", "qwen2_5_vl"
+    llm_backbone_type: str = "qwen2_5_vl"
     llm_hidden_dim: int = 3584
     llm_token_dim: int = 896
     llm_torch_dtype: str = "bfloat16"
@@ -50,7 +50,7 @@ class VLNPipelineConfig:
     llm_compile_mode: str = "reduce-overhead"
     llm_compile_backend: str = "inductor"
 
-    # Sequence Packing configuration (disabled for Qwen3.5)
+    # Sequence packing configuration (currently disabled on the shared stack)
     enable_packing: bool = False
     max_seq_length: int = 4096
     spatial_merge_size: int = 2
@@ -62,7 +62,7 @@ class VLNPipelineConfig:
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
-    # LoRA configuration for Qwen3.5 fine-tuning
+    # LoRA configuration for the VLM backbone fine-tuning
     use_lora: bool = False
     lora_rank: int = 16
     lora_alpha: int = 32
@@ -116,7 +116,7 @@ class VLNPipelineConfig:
 
 class VLNPipeline(nn.Module):
     """
-    VLN Pipeline with Qwen3.5 and HeatmapVLN v2 (Coarse-to-Fine).
+    VLN Pipeline with Qwen2.5-VL and HeatmapVLN v2 (Coarse-to-Fine).
     """
 
     def __init__(self, config: VLNPipelineConfig):
@@ -125,16 +125,12 @@ class VLNPipeline(nn.Module):
         self.device = torch.device(config.device)
 
         logger.info("=" * 60)
-        logger.info(
-            "Initializing VLN Pipeline (backbone=%s, HeatmapVLN v2 Coarse-to-Fine)",
-            config.llm_backbone_type,
-        )
+        logger.info("Initializing VLN Pipeline (Qwen2.5-VL, HeatmapVLN v2 Coarse-to-Fine)")
         logger.info("=" * 60)
 
-        # ==================== VLM Backbone ====================
-        qwen_config = Qwen3_5Config(
+        # ==================== Backbone ====================
+        qwen_config = Qwen2_5VLConfig(
             model_path=config.llm_model_path,
-            backbone_type=config.llm_backbone_type,
             device=config.device,
             torch_dtype=config.llm_torch_dtype,
             attn_implementation=config.llm_attn_implementation,
@@ -155,8 +151,9 @@ class VLNPipeline(nn.Module):
             lora_dropout=config.lora_dropout,
             lora_target_modules=config.lora_target_modules,
         )
-        self.qwen3_5 = Qwen3_5Integration(qwen_config)
-        logger.info("VLM backbone integration initialized (type=%s)", config.llm_backbone_type)
+        self.qwen2_5_vl = Qwen2_5VLIntegration(qwen_config)
+        self.vlm_backbone = self.qwen2_5_vl
+        logger.info("Qwen2.5-VL integration initialized")
 
         # ==================== LLM Projector ====================
         self.llm_projector = nn.Sequential(
@@ -175,7 +172,7 @@ class VLNPipeline(nn.Module):
         )
 
         # ==================== HeatmapVLN v2 ====================
-        # HeatmapVLN is constructed lazily after Qwen3.5 model is loaded,
+        # HeatmapVLN is constructed lazily after the VLM backbone is loaded,
         # because it needs the actual model instance for hook registration.
         self.heatmap_vln: Optional[HeatmapVLN] = None
         self._heatmap_enabled = config.enable_heatmap
@@ -309,24 +306,24 @@ class VLNPipeline(nn.Module):
         )
 
     def _ensure_heatmap_vln(self):
-        """Lazily construct HeatmapVLN after Qwen3.5 model is loaded."""
+        """Lazily construct HeatmapVLN after the VLM backbone is loaded."""
         if self.heatmap_vln is not None or not self._heatmap_enabled:
             return
 
-        if not self.qwen3_5._model_loaded:
-            self.qwen3_5._load_model()
+        if not self.qwen2_5_vl._model_loaded:
+            self.qwen2_5_vl._load_model()
 
         cfg = self.config
-        default_vit_indices = [7, 15, 23, 31] if cfg.llm_backbone_type == "qwen2_5_vl" else [6, 12, 18, 24]
-        default_llm_indices = [6, 13, 20] if cfg.llm_backbone_type == "qwen2_5_vl" else [7, 15, 23]
+        default_vit_indices = [7, 15, 23, 31]
+        default_llm_indices = [6, 13, 20]
         vit_indices = cfg.heatmap_vit_layer_indices or default_vit_indices
         llm_indices = cfg.heatmap_llm_layer_indices or default_llm_indices
 
         trajectory_config = getattr(cfg, 'heatmap_trajectory_config', None)
 
         self.heatmap_vln = HeatmapVLN(
-            qwen_model=self.qwen3_5.model,
-            processor=self.qwen3_5.processor,
+            qwen_model=self.qwen2_5_vl.model,
+            processor=self.qwen2_5_vl.processor,
             c_vit=cfg.heatmap_c_vit,
             c_llm=cfg.heatmap_c_llm,
             c_fused=cfg.heatmap_c_fused,
@@ -466,14 +463,14 @@ class VLNPipeline(nn.Module):
         qwen_timings = None
         should_run_qwen = need_sequence_features or use_panoramic_chain
         if should_run_qwen:
-            # ==================== Step 1: Qwen3.5 Processing ====================
+            # ==================== Step 1: VLM backbone processing ====================
             qwen_start = time.perf_counter() if self.config.enable_runtime_timing else 0.0
             lq = None
             if self.latent_queries is not None:
                 lq = self.latent_queries.expand(batch_size, -1, -1).to(
                     device=self.device, dtype=self.config.dtype,
                 )
-            qwen_output = self.qwen3_5(
+            qwen_output = self.qwen2_5_vl(
                 history_frames=history_frames,
                 current_frame=current_observation,
                 instruction=instruction_text,
@@ -498,7 +495,7 @@ class VLNPipeline(nn.Module):
                 if raw_hidden_states is None:
                     raw_hidden_states = qwen_output.get('hidden_states')
                 if raw_hidden_states is None:
-                    raise RuntimeError("Failed to extract hidden states from Qwen3.5")
+                    raise RuntimeError("Failed to extract hidden states from VLM backbone")
 
                 if isinstance(raw_hidden_states, list):
                     raw_hidden_states = raw_hidden_states[-1]
@@ -577,8 +574,8 @@ class VLNPipeline(nn.Module):
         seq_lens = packed_batch["seq_lens"]
         current_observation = packed_batch["current_frame"].to(self.device)
 
-        # ==================== Step 1: Qwen3.5 Processing (Packed) ====================
-        qwen_output = self.qwen3_5.forward_packed(
+        # ==================== Step 1: VLM backbone processing (Packed) ====================
+        qwen_output = self.qwen2_5_vl.forward_packed(
             packed_batch=packed_batch,
             return_hidden_states=True,
         )

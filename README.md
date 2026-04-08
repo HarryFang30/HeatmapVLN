@@ -6,10 +6,9 @@
 - 基于 `HeatmapVLN v2` 的历史位置热力图预测
 - 基于 `InternNav System 1 / NextDiTActionHead` 的 32 步轨迹预测
 
-当前仓库里同时保留了两条配置路径：
+当前推荐使用的主配置：
 
-- 推荐默认：`configs/train_config_internnav.yaml`
-- 兼容保留：`configs/train_config.yaml`（Qwen3.5 路线，非当前默认共享环境）
+- `configs/train_config_internnav.yaml`
 
 旧版 `README.md` 中关于 Transformer/DDPM 轨迹头、进度头、静态架构图、根目录许可证等内容，已经不再代表当前仓库的默认状态；本文档只描述代码里目前真实存在且可直接核对的流程。
 
@@ -109,15 +108,6 @@ python scripts/tools/convert_internnav_backbone.py \
 
 - 当前仓库中的 `models/internnav_backbone/model.safetensors.index.json` 指向 `model-00001-of-00004.safetensors` 等分片；如果这些分片实际不存在，说明 backbone 还没有准备完整。
 - `convert_internnav_backbone.py` 只会生成 backbone 和 System 1；`Depth Anything v2` 权重仍需你自行放到配置指定位置。
-
-### 2. Qwen3.5 路线（兼容保留）
-
-`configs/train_config.yaml` 仍保留 Qwen3.5 路线，额外需要：
-
-- `models/qwen_3.5`
-- `models/dualvln_system1_pretrained.safetensors`
-
-该路线不是当前 README 推荐默认路径，但代码仍可用。
 
 ## 数据集格式
 
@@ -230,7 +220,7 @@ python scripts/run.py train --config configs/train_config_internnav.yaml
 python scripts/run.py train --config configs/train_heatmap_config.yaml
 ```
 
-### Qwen3.5 兼容训练
+### 联合训练
 
 ```bash
 python scripts/run.py train --config configs/train_config.yaml

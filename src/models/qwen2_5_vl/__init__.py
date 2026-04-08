@@ -1,16 +1,13 @@
 """
-Qwen3.5 Integration for VLN Pipeline
-=====================================
-
-This module provides Qwen3.5 model integration for the VLN pipeline.
+Qwen2.5-VL integration for the VLN Pipeline.
 
 Key Components:
-- Qwen3_5Integration: Main integration class for video processing
-- Qwen3_5Config: Configuration dataclass
-- Sequence Packing: (disabled for Qwen3.5 due to hybrid attention)
+- `Qwen2_5VLIntegration`: main integration wrapper
+- `Qwen2_5VLConfig`: configuration dataclass
+- Sequence packing utilities: kept as legacy helpers
 """
 
-from .integration import Qwen3_5Integration, Qwen3_5Config
+from .integration import Qwen2_5VLIntegration, Qwen2_5VLConfig
 
 # Sequence packing utilities (kept for reference, disabled by default)
 try:
@@ -27,8 +24,8 @@ except ImportError:
     PACKING_AVAILABLE = False
 
 __all__ = [
-    "Qwen3_5Integration",
-    "Qwen3_5Config",
+    "Qwen2_5VLIntegration",
+    "Qwen2_5VLConfig",
     "PACKING_AVAILABLE",
 ]
 

@@ -46,7 +46,7 @@ RESNET_STD = [0.229, 0.224, 0.225]
 @dataclass
 class NextDiTActionConfig:
     """Configuration for NextDiTActionHead."""
-    vlm_hidden_dim: int = 4096
+    vlm_hidden_dim: int = 3584
     latent_emb_size: int = LATENT_EMB_SIZE
     n_query: int = 4
     dit_dim: int = 384
@@ -82,7 +82,7 @@ class NextDiTActionHead(nn.Module):
         self.config = config
 
         # ==================== Condition Projector ====================
-        # Adapts Qwen3.5 hidden_dim (4096) -> latent_emb_size (768)
+        # Adapts backbone hidden_dim -> latent_emb_size (768)
         self.cond_projector = nn.Sequential(
             nn.Linear(config.vlm_hidden_dim, config.latent_emb_size),
             nn.GELU(approximate="tanh"),
@@ -299,7 +299,7 @@ class NextDiTActionHead(nn.Module):
         Fuse System 2 latent queries with visual memory.
 
         Args:
-            traj_hidden_states: (B, n_query, vlm_hidden_dim) from Qwen3.5
+            traj_hidden_states: (B, n_query, vlm_hidden_dim) from Qwen2.5-VL backbone
             traj_images: (B, 2, H, W, 3) optional visual memory images
 
         Returns:

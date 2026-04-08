@@ -2,7 +2,7 @@
 Packing Collator for VLN Training
 ==================================
 
-Note: Packing is disabled for Qwen3.5 due to hybrid attention.
+Note: Packing is disabled on the current Qwen2.5-VL training stack.
 This module is kept for reference but should use standard batching
 (TokenizedVLNDataset + FlattenedCollatorForVLN) instead.
 """
@@ -16,7 +16,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Qwen3.5 Special Token IDs
+# Qwen2.5-VL special token IDs
 IMAGE_TOKEN_ID = 248056  # <|image_pad|>
 VIDEO_TOKEN_ID = 248057  # <|video_pad|>
 
@@ -159,7 +159,7 @@ class PackingCollatorForVLN:
     ):
         """
         Args:
-            processor: Qwen3.5 processor (AutoProcessor)
+            processor: Qwen2.5-VL processor (AutoProcessor)
             spatial_merge_size: vision spatial merge size
             max_seq_length: max packed sequence length
         """

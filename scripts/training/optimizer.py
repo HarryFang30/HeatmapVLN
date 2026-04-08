@@ -133,19 +133,20 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             param_groups.extend(groups)
             print(f"  Param group: llm_projector (lr={proj_lr}, wd={projector_wd})")
 
-    # LoRA parameters
+    # VLM backbone LoRA parameters
     lora_lr = optim_cfg.get('lora_lr', 1e-5)
-    if hasattr(model, 'qwen3_5') and model.qwen3_5 is not None:
-        lora_params = [p for n, p in model.qwen3_5.named_parameters()
+    vlm_backbone = getattr(model, 'vlm_backbone', getattr(model, 'qwen2_5_vl', None))
+    if vlm_backbone is not None:
+        lora_params = [p for n, p in vlm_backbone.named_parameters()
                        if p.requires_grad and 'lora_' in n]
         if lora_params:
             param_groups.append({
                 'params': lora_params,
                 'lr': lora_lr,
                 'weight_decay': 0.0,
-                'name': 'qwen3_5_lora'
+                'name': 'vlm_lora'
             })
-            print(f"  Param group: qwen3_5_lora (lr={lora_lr}, wd=0.0, params={len(lora_params)})")
+            print(f"  Param group: vlm_lora (lr={lora_lr}, wd=0.0, params={len(lora_params)})")
 
     if not param_groups:
         raise ValueError("No trainable parameters found!")

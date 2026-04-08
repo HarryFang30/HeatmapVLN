@@ -588,13 +588,14 @@ def main():
     
     # ⚠️ 强制加载 VLM backbone（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
     raw_model = model
-    if hasattr(raw_model, 'qwen3_5') and hasattr(raw_model.qwen3_5, '_load_model'):
-        if raw_model.qwen3_5.model is None:
+    vlm_backbone = getattr(raw_model, 'vlm_backbone', getattr(raw_model, 'qwen2_5_vl', None))
+    if vlm_backbone is not None and hasattr(vlm_backbone, '_load_model'):
+        if vlm_backbone.model is None:
             logger.info("🔄 Pre-loading VLM backbone (ensure LoRA params available for optimizer)...")
-            raw_model.qwen3_5._load_model()
+            vlm_backbone._load_model()
         logger.info(
             "   🧠 Qwen attention implementation: %s",
-            getattr(raw_model.qwen3_5.config, 'attn_implementation', 'unknown'),
+            getattr(vlm_backbone.config, 'attn_implementation', 'unknown'),
         )
     if getattr(raw_model.config, 'enable_heatmap', False):
         logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")

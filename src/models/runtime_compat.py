@@ -40,13 +40,21 @@ def load_model_config(model_path: str) -> Dict[str, Any]:
 
 def detect_backbone_type(model_path: str, requested_backbone_type: str = "auto") -> str:
     if requested_backbone_type != "auto":
-        return requested_backbone_type
+        if requested_backbone_type not in {"qwen2_5_vl", "qwen2_vl"}:
+            raise RuntimeError(
+                f"Unsupported backbone_type={requested_backbone_type}. "
+                "This codebase now only supports Qwen2.5-VL."
+            )
+        return "qwen2_5_vl"
 
     cfg = load_model_config(model_path)
     model_type = cfg.get("model_type", "")
     if model_type in {"qwen2_5_vl", "qwen2_vl"}:
         return "qwen2_5_vl"
-    return "qwen3_5"
+    raise RuntimeError(
+        f"Unsupported model_type={model_type!r} for model_path={model_path}. "
+        "This codebase now only supports Qwen2.5-VL / InternNav backbone."
+    )
 
 
 def _make_stub_module(name: str, attrs: Optional[Dict[str, Any]] = None) -> types.ModuleType:
@@ -160,13 +168,6 @@ def ensure_transformers_runtime_compat(
 
     installed_transformers_version = transformers.__version__
     expected_transformers_version = model_cfg.get("transformers_version")
-
-    if resolved_backbone_type == "qwen3_5" and Version(installed_transformers_version) < Version("5.0.0"):
-        raise RuntimeError(
-            "The current shared environment is pinned to transformers 4.51.0 for Habitat/InternNav compatibility, "
-            "so Qwen3.5 cannot be loaded here. Use `configs/train_config_internnav.yaml` / "
-            "`models/internnav_backbone`, or switch to a dedicated Qwen3.5 environment."
-        )
 
     if expected_transformers_version and Version(installed_transformers_version) != Version(expected_transformers_version):
         raise RuntimeError(

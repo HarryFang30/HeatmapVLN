@@ -4,7 +4,7 @@ HeatmapVLN — Current heatmap branch assembly
 
 Current default implementation:
 
-- Backbone: Qwen2.5-VL / Qwen3.5 integration
+- Backbone: Qwen2.5-VL integration
 - Backbone weights: frozen
 - LoRA: optional, enabled by default in InternNav config
 - Trainable heatmap modules:
@@ -52,9 +52,9 @@ class HeatmapVLN(nn.Module):
 
     Args:
         qwen_model:         Qwen model instance (base weights will be frozen).
-        processor:          Qwen3.5 processor / tokenizer.
-        c_vit:              ViT hidden dimension (1152 for Qwen3.5).
-        c_llm:              LLM hidden dimension (4096 for Qwen3.5).
+        processor:          Qwen2.5-VL processor / tokenizer.
+        c_vit:              ViT hidden dimension (1280 for InternNav Qwen2.5-VL).
+        c_llm:              LLM hidden dimension (3584 for InternNav Qwen2.5-VL).
         c_fused:            Fused feature dimension for DPT / fine head.
         vit_layer_indices:  ViT block indices to hook.
         llm_layer_indices:  LLM layer indices to hook (full_attention layers).
@@ -64,8 +64,8 @@ class HeatmapVLN(nn.Module):
         self,
         qwen_model,
         processor,
-        c_vit: int = 1152,
-        c_llm: int = 4096,
+        c_vit: int = 1280,
+        c_llm: int = 3584,
         c_fused: int = 256,
         vit_layer_indices: Optional[List[int]] = None,
         llm_layer_indices: Optional[List[int]] = None,
@@ -75,9 +75,9 @@ class HeatmapVLN(nn.Module):
         super().__init__()
 
         if vit_layer_indices is None:
-            vit_layer_indices = [6, 12, 18, 24]
+            vit_layer_indices = [7, 15, 23, 31]
         if llm_layer_indices is None:
-            llm_layer_indices = [7, 15, 23]
+            llm_layer_indices = [6, 13, 20]
 
         self.qwen = qwen_model
         self.processor = processor
@@ -844,7 +844,7 @@ class HeatmapVLN(nn.Module):
             device=device,
         )
 
-        # === Step 2: Qwen3.5 forward (frozen, no grad) ===
+        # === Step 2: Qwen2.5-VL forward (frozen, no grad) ===
         self.feat_extractor.clear()
 
         with torch.no_grad():

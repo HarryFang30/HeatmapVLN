@@ -18,7 +18,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Qwen3.5 Special Token IDs
+# Qwen2.5-VL special token IDs
 IMAGE_TOKEN_ID = 248056
 VIDEO_TOKEN_ID = 248057
 VISION_START_ID = 248053
@@ -128,7 +128,7 @@ class TokenizedVLNDataset(Dataset):
         """
         Args:
             base_dataset: base dataset (VLNTrajectoryDataset or VLNSlidingWindowDataset)
-            processor: Qwen3.5 processor
+            processor: Qwen2.5-VL processor
             spatial_merge_size: vision spatial merge size
         """
         self.base_dataset = base_dataset

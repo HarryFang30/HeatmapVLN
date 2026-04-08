@@ -1,5 +1,5 @@
 # HeatmapVLN Dockerfile
-# 基于 Qwen3-VL 视觉语言模型的视觉语言导航系统
+# 基于 Qwen2.5-VL 视觉语言模型的视觉语言导航系统
 
 # 使用 NVIDIA CUDA 基础镜像
 FROM nvidia/cuda:12.8.0-cudnn9-devel-ubuntu22.04
@@ -78,7 +78,7 @@ RUN /bin/bash -c "source /root/miniconda3/etc/profile.d/conda.sh && \
 COPY . .
 
 # 创建必要的目录
-RUN mkdir -p models/qwen_3_vl \
+RUN mkdir -p models/internnav_backbone \
     vln_training_outputs \
     /root/tf-logs \
     outputs_inference

@@ -170,16 +170,17 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             freeze_module(model.llm_projector, freeze=False)
             logger.info("  ✓ Unfrozen: llm_projector")
 
-    if hasattr(model, 'qwen3_5') and model.qwen3_5 is not None:
-        freeze_module(model.qwen3_5, freeze=True)
-        if 'lora' in trainable or 'qwen3_5_lora' in trainable:
+    vlm_backbone = getattr(model, 'vlm_backbone', getattr(model, 'qwen2_5_vl', None))
+    if vlm_backbone is not None:
+        freeze_module(vlm_backbone, freeze=True)
+        if 'lora' in trainable or 'vlm_lora' in trainable:
             lora_count = 0
-            for name, param in model.qwen3_5.named_parameters():
+            for name, param in vlm_backbone.named_parameters():
                 if 'lora_' in name:
                     param.requires_grad = True
                     lora_count += 1
             if lora_count > 0:
-                logger.info(f"  ✓ Unfrozen: qwen3_5 LoRA ({lora_count} parameter tensors)")
+                logger.info(f"  ✓ Unfrozen: VLM LoRA ({lora_count} parameter tensors)")
             else:
                 logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
 

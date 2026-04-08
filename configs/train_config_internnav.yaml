@@ -134,7 +134,7 @@ training:
         - llm_projector
         - lora
       frozen_modules:
-        - qwen3_5
+        - vlm_backbone
         - traj_dit
         - rgb_model
         - memory_encoder

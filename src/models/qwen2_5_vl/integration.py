@@ -1,17 +1,12 @@
 """
-Qwen3.5 Integration Module
-===========================
-
-This module provides the Qwen3.5 integration for the VLN pipeline.
-It handles video processing and hidden state extraction for downstream heads.
+Qwen2.5-VL integration module.
 
 Features:
-- Load Qwen3.5 model with flash attention support
+- Load the Qwen2.5-VL backbone
 - Process video frames + current observation + instruction text
-- Extract hidden states for heatmap/action/stop heads
+- Extract hidden states for downstream heads
 
-Note: Sequence packing is disabled for Qwen3.5 due to the hybrid
-linear+full attention architecture (GatedDeltaNet does not support varlen).
+Sequence packing is currently disabled on the shared stack.
 """
 
 import warnings
@@ -30,7 +25,7 @@ from PIL import Image
 import numpy as np
 
 from ..heatmap.input_constructor import find_text_anchor_positions
-from ..runtime_compat import detect_backbone_type, ensure_transformers_runtime_compat
+from ..runtime_compat import ensure_transformers_runtime_compat
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -53,14 +48,11 @@ except ImportError:
 
 
 @dataclass
-class Qwen3_5Config:
-    """Configuration for Qwen3.5 / Qwen2.5-VL integration."""
+class Qwen2_5VLConfig:
+    """Configuration for the Qwen2.5-VL integration wrapper."""
     
     # Model path
     model_path: str = "./models/internnav_backbone"
-    
-    # Backbone type: "auto" detects from config.json, or explicitly "qwen3_5" / "qwen2_5_vl"
-    backbone_type: str = "auto"
     
     # Device and dtype
     device: str = "cuda"
@@ -80,7 +72,7 @@ class Qwen3_5Config:
     # Video processing
     max_video_frames: int = 16  # Maximum frames to process
     
-    # Sequence Packing settings (based on official Qwen3-VL fine-tuning)
+    # Sequence Packing settings (legacy; disabled on the shared stack)
     enable_packing: bool = False  # Whether to use sequence packing
     max_seq_length: int = 4096    # Maximum packed sequence length
     spatial_merge_size: int = 2   # Vision spatial merge size for position IDs
@@ -163,20 +155,10 @@ class _ModuleTimingProfiler:
         self._registered.clear()
 
 
-class Qwen3_5Integration(nn.Module):
-    """
-    Qwen3.5 Integration for VLN Pipeline.
+class Qwen2_5VLIntegration(nn.Module):
+    """Qwen2.5-VL integration wrapper for VLN Pipeline."""
     
-    This class wraps the Qwen3.5 model to:
-    1. Process video frames and text instructions
-    2. Extract hidden states for downstream heads
-    3. Provide a clean interface for the pipeline
-    
-    Args:
-        config: Qwen3_5Config with model settings
-    """
-    
-    def __init__(self, config: Qwen3_5Config):
+    def __init__(self, config: Qwen2_5VLConfig):
         super().__init__()
         self.config = config
         self.device = torch.device(config.device)
@@ -186,7 +168,6 @@ class Qwen3_5Integration(nn.Module):
         self.processor = None
         self._model_loaded = False
         
-        self._resolved_backbone_type: Optional[str] = None
         self._runtime_compat_state = None
         
         # Token IDs are set during model loading based on backbone type
@@ -203,32 +184,23 @@ class Qwen3_5Integration(nn.Module):
         
         logger.info("VLM Integration initialized (model will be loaded on first forward)")
     
-    def _detect_backbone_type(self) -> str:
-        """Detect backbone type from config.json in the model directory."""
-        return detect_backbone_type(self.config.model_path, self.config.backbone_type)
-
     def _load_model(self):
-        """Load the VLM backbone (Qwen3.5 or Qwen2.5-VL) and processor."""
+        """Load the Qwen2.5-VL backbone and processor."""
         if self._model_loaded:
             return
 
         self._runtime_compat_state = ensure_transformers_runtime_compat(
             model_path=self.config.model_path,
-            requested_backbone_type=self.config.backbone_type,
+            requested_backbone_type="qwen2_5_vl",
             requested_attn_implementation=self.config.attn_implementation,
             logger=logger,
         )
-        backbone = self._runtime_compat_state.resolved_backbone_type
-        self._resolved_backbone_type = backbone
-        logger.info("Detected backbone type: %s", backbone)
+        logger.info("Detected backbone type: qwen2_5_vl")
 
         try:
             from transformers import AutoProcessor
 
-            if backbone == "qwen2_5_vl":
-                self._load_qwen25vl()
-            else:
-                self._load_qwen35()
+            self._load_qwen25vl()
 
             self.model.eval()
             for param in self.model.parameters():
@@ -246,7 +218,7 @@ class Qwen3_5Integration(nn.Module):
 
             logger.info(
                 "%s loaded on %s (attn=%s)",
-                backbone, self.device, self.config.attn_implementation,
+                "qwen2_5_vl", self.device, self.config.attn_implementation,
             )
             total_params = sum(p.numel() for p in self.model.parameters())
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -255,22 +227,8 @@ class Qwen3_5Integration(nn.Module):
             self._maybe_enable_compile()
 
         except Exception as e:
-            logger.error("Failed to load VLM backbone (%s): %s", backbone, e)
+            logger.error("Failed to load Qwen2.5-VL backbone: %s", e)
             raise
-
-    def _load_qwen35(self):
-        """Load a Qwen3.5 backbone."""
-        from transformers import Qwen3_5ForConditionalGeneration
-
-        logger.info("Loading Qwen3.5 from %s", self.config.model_path)
-        self.model = self._load_with_attn_fallback(
-            Qwen3_5ForConditionalGeneration, self.config.model_path,
-        )
-        cfg = self.model.config
-        self.image_token_id = getattr(cfg, "image_token_id", 248056)
-        self.video_token_id = getattr(cfg, "video_token_id", 248057)
-        self.vision_start_id = getattr(cfg, "vision_start_token_id", 248053)
-        self.vision_end_id = getattr(cfg, "vision_end_token_id", 248054)
 
     def _load_qwen25vl(self):
         """Load a Qwen2.5-VL backbone."""
@@ -452,7 +410,7 @@ class Qwen3_5Integration(nn.Module):
         if not self._compile_backend_available():
             return
         logger.info(
-            "Skip torch.compile for Qwen3.5 on this stack: "
+            "Skip torch.compile for Qwen2.5-VL on this stack: "
             "visual submodules are unstable with dynamic shapes and "
             "the language model depends on FLA Triton kernels that are not "
             "reliably compatible with Inductor here"
@@ -464,7 +422,7 @@ class Qwen3_5Integration(nn.Module):
 
     def _apply_lora(self):
         """
-        Apply LoRA adapters to the last N layers of Qwen3.5's language model.
+        Apply LoRA adapters to the last N layers of Qwen2.5-VL's language model.
         
         Uses PEFT library to add low-rank adapters to q_proj and v_proj
         in the specified layers. LoRA parameters are trainable while
@@ -487,7 +445,7 @@ class Qwen3_5Integration(nn.Module):
             num_layers = len(self.model.language_model.model.layers)
         
         if num_layers is None:
-            num_layers = 32  # Qwen3.5 7B default
+            num_layers = 28  # InternNav Qwen2.5-VL default
             logger.warning(f"Could not detect layer count, using default: {num_layers}")
         else:
             logger.info(f"Detected {num_layers} LLM layers")
@@ -528,17 +486,17 @@ class Qwen3_5Integration(nn.Module):
         )
     
     def enable_sequence_packing(self) -> bool:
-        """Sequence packing is disabled for Qwen3.5 (hybrid attention)."""
+        """Sequence packing is disabled on the current Qwen2.5-VL stack."""
         logger.warning(
-            "Sequence packing is not supported for Qwen3.5 due to hybrid "
-            "linear+full attention architecture. Use standard batching instead."
+            "Sequence packing is not supported on the current Qwen2.5-VL "
+            "training stack. Use standard batching instead."
         )
         return False
     
     def forward_packed(self, packed_batch: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        """Disabled for Qwen3.5 — use forward() with standard batching."""
+        """Disabled for Qwen2.5-VL on the current training stack."""
         raise NotImplementedError(
-            "Sequence packing is not supported for Qwen3.5. "
+            "Sequence packing is not supported for Qwen2.5-VL. "
             "Set enable_packing=false in config and use standard forward()."
         )
     
@@ -715,7 +673,7 @@ class Qwen3_5Integration(nn.Module):
 
         Args:
             skip_lm_head: If True, call ``model.model()`` (the base
-                Qwen3_5Model) instead of ``model()`` (ForConditionalGeneration)
+                base vision-language model) instead of ``model()`` (ForConditionalGeneration)
                 to avoid the 1-billion-parameter LM head matmul.  Use this
                 when only hooked features are needed (heatmap-only training).
             latent_queries: (B, n_query, hidden_dim) learnable trajectory
@@ -1044,7 +1002,7 @@ class Qwen3_5Integration(nn.Module):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
         """
         Batch forward by processing each sample individually and stacking.
-        Qwen3.5's internal position ID computation does not handle
+        Qwen2.5-VL's internal position ID computation does not handle
         padded batches correctly, so we loop over samples.
         """
         batch_size = history_frames.shape[0]
@@ -1137,7 +1095,7 @@ class Qwen3_5Integration(nn.Module):
         history_rel_poses: Optional[torch.Tensor] = None,
         latent_queries: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """Forward pass through Qwen3.5 with batch processing."""
+        """Forward pass through Qwen2.5-VL with batch processing."""
         # Ensure model is loaded
         if not self._model_loaded:
             self._load_model()
@@ -1320,8 +1278,8 @@ class Qwen3_5Integration(nn.Module):
         """Get the hidden dimension of the model."""
         if self._model_loaded and self.model is not None:
             return self.model.config.hidden_size
-        # Default for Qwen3.5 7B
-        return 4096
+        # Default for InternNav Qwen2.5-VL
+        return 3584
     
     def freeze(self):
         """Freeze all model parameters."""

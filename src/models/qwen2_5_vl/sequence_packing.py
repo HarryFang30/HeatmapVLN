@@ -1,10 +1,7 @@
 """
-Sequence Packing Module (legacy, disabled for Qwen3.5)
-======================================================
+Sequence packing module (legacy, disabled on the current Qwen2.5-VL stack).
 
-Note: Sequence packing is disabled for Qwen3.5 due to its hybrid
-linear+full attention architecture. This module is kept for reference
-and backward compatibility but should NOT be used with Qwen3.5.
+This module is kept for reference but is not part of the active training path.
 """
 
 import torch
@@ -16,7 +13,7 @@ import itertools
 
 logger = logging.getLogger(__name__)
 
-# Qwen3.5 Special Token IDs
+# Qwen2.5-VL special token IDs
 IMAGE_TOKEN_ID = 248056  # <|image_pad|>
 VIDEO_TOKEN_ID = 248057  # <|video_pad|>
 VISION_START_ID = 248053  # <|vision_start|>
@@ -68,7 +65,7 @@ class FlattenedDataCollatorForVLN:
     VLN 任务专用的 Flattened Data Collator
     
     将多个样本拼接成一个长序列，使用 cumulative sequence lengths 作为 attention mask。
-    这是 Qwen3-VL 官方 FlattenedDataCollatorForSupervisedDataset 的 VLN 适配版本。
+    这是 Qwen2.5-VL 官方风格的 FlattenedDataCollator 的 VLN 适配版本。
     
     与官方的区别：
     1. 不需要 labels（VLN 不是 SFT 任务）
@@ -275,9 +272,9 @@ def get_rope_index_3(
     attention_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    计算 Qwen3-VL 的 3D RoPE position IDs
+    计算 Qwen2.5-VL 的 3D RoPE position IDs
     
-    复制自官方实现：/root/Qwen3-VL/qwen-vl-finetune/qwenvl/data/rope2d.py
+    参考官方实现整理。
     """
     if video_grid_thw is not None:
         video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
@@ -394,11 +391,10 @@ def get_rope_index_3(
 
 def replace_attention_with_varlen(model: nn.Module = None) -> None:
     """
-    Disabled for Qwen3.5 — hybrid attention (GatedDeltaNet + full attention)
-    does not support varlen packing.
+    Disabled for the current Qwen2.5-VL training stack.
     """
     logger.warning(
-        "replace_attention_with_varlen is not supported for Qwen3.5. "
+        "replace_attention_with_varlen is not supported for Qwen2.5-VL. "
         "Use standard batching instead of sequence packing."
     )
 
@@ -419,9 +415,9 @@ class PackedSequenceProcessor:
     ):
         """
         Args:
-            processor: Qwen3.5 processor
+            processor: Qwen2.5-VL processor
             max_seq_length: max packed sequence length
-            enable_packing: whether to enable packing (disabled for Qwen3.5)
+            enable_packing: whether to enable packing (currently disabled)
             spatial_merge_size: vision spatial merge size for position IDs
         """
         self.processor = processor

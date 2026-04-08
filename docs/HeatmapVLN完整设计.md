@@ -87,7 +87,7 @@
    - 记录 `pano_num_histories`
    - 记录 `pano_text_anchor_positions`
 3. `VLNPipeline.forward()` 直接消费 tokenized 的 `pano_inputs`
-4. `Qwen3_5Integration` 做一次共享的多模态前向
+4. `Qwen2_5VLIntegration` 做一次共享的多模态前向
 5. `HeatmapVLN.decode_from_inputs_batch()` 立刻消费 hook 到的中间特征
 
 这意味着当前真实实现是：
@@ -266,7 +266,7 @@ Prompt 由 `src/models/heatmap/input_constructor.py` 组织为：
 
 | 旧描述 | 当前真实实现 |
 | --- | --- |
-| `Qwen3.5-9B` 默认主干 | 当前默认是 `Qwen2.5-VL / InternNav backbone` |
+| 旧版默认主干描述 | 当前默认是 `Qwen2.5-VL / InternNav backbone` |
 | 主干“完全冻结” | 当前默认是“基础权重冻结 + LoRA 可训练” |
 | `history_query` 来自最终层 hidden state | 当前来自**最深 hook 层**，默认第 `20` 层 |
 | coarse 用 `CoarseLocalization` | 当前默认用 `TrajectoryGuidedAttention` |
@@ -282,7 +282,7 @@ Prompt 由 `src/models/heatmap/input_constructor.py` 组织为：
 | 功能 | 文件 |
 | --- | --- |
 | 整体组装 | `src/models/pipeline.py` |
-| Qwen 集成 | `src/models/qwen3_5/integration.py` |
+| Qwen 集成 | `src/models/qwen2_5_vl/integration.py` |
 | Prompt 构造 | `src/models/heatmap/input_constructor.py` |
 | Hook 特征提取 | `src/models/heatmap/feature_extractor.py` |
 | ViT / LLM DPT 融合 | `src/models/heatmap/dpt_lite_fusion.py` |

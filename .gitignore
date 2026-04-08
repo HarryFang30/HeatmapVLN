@@ -2,8 +2,7 @@
 /models/*/
 !/models/*.md
 /outputs/
-/models/qwen_3.5
-/models/qwen_3.5/*/
+/models/internnav_backbone/
 /HeatmapVLN完整设计.md
 
 # Python cache

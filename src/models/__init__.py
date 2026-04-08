@@ -27,10 +27,10 @@ except ModuleNotFoundError:
 except Exception:
     install_flash_attn_stub(logging.getLogger(__name__))
 
-# === VLM Integration ===
-from .qwen3_5 import (
-    Qwen3_5Integration,
-    Qwen3_5Config,
+# === Qwen2.5-VL Integration ===
+from .qwen2_5_vl import (
+    Qwen2_5VLIntegration,
+    Qwen2_5VLConfig,
 )
 
 # === VLN Pipeline ===
@@ -70,8 +70,8 @@ except ImportError:
 
 
 __all__ = [
-    'Qwen3_5Integration',
-    'Qwen3_5Config',
+    'Qwen2_5VLIntegration',
+    'Qwen2_5VLConfig',
     'VLNPipeline',
     'VLNPipelineConfig',
     'create_vln_pipeline',

@@ -91,7 +91,7 @@ docker run --gpus all -it --rm \
 
 | 主机目录 | 容器目录 | 用途 |
 |---------|---------|------|
-| `./models` | `/root/HeatmapVLN/models` | 模型权重（Qwen3-VL） |
+| `./models` | `/root/HeatmapVLN/models` | 模型权重（Qwen2.5-VL / InternNav） |
 | `./dataset_with_actions` | `/root/HeatmapVLN/dataset_with_actions` | 训练/验证数据集 |
 | `./vln_training_outputs` | `/root/HeatmapVLN/vln_training_outputs` | 训练输出和检查点 |
 | `./tf-logs` | `/root/tf-logs` | TensorBoard 日志 |
@@ -100,7 +100,7 @@ docker run --gpus all -it --rm \
 **注意**：首次运行前，请确保这些目录存在：
 
 ```bash
-mkdir -p models/qwen_3_vl dataset_with_actions vln_training_outputs tf-logs outputs_inference
+mkdir -p models/internnav_backbone dataset_with_actions vln_training_outputs tf-logs outputs_inference
 ```
 
 ## 🎯 常用操作

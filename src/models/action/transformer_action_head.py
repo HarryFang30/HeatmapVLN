@@ -59,7 +59,7 @@ class TransformerActionHead(nn.Module):
     - Weight decay 参数分组 (get_optim_groups)
     
     Args:
-        vlm_token_dim: VLM (Qwen3.5) 输出的 token 维度
+        vlm_token_dim: VLM 输出的 token 维度
         n_emb: 内部嵌入维度 (对应 InternNav 的 n_emb)
         predict_size: 预测的轨迹步数 (horizon)
         n_layer: Transformer Decoder 层数
