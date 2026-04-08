@@ -375,13 +375,14 @@ def train_one_epoch(
                     lr_strs.append(f"{gname}={lr_val:.2e}")
                 lr_display = ", ".join(lr_strs)
                 gpu_mem_str = f" | GPU: {torch.cuda.memory_allocated() / 1024**3:.1f}GB" if show_gpu_memory else ""
+                traj_str = f", traj: {trajectory_loss.item():.4f}" if trajectory_loss.item() > 0 else ""
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}) | "
+                    f"(hm: {heatmap_loss.item():.4f}{traj_str}) | "
                     f"LR: [{lr_display}]"
                     + gpu_mem_str
                     + (
@@ -416,6 +417,7 @@ def train_one_epoch(
                         "global_step": global_step,
                         "loss": loss.item() * grad_accum_steps,
                         "heatmap_loss": heatmap_loss.item(),
+                        "trajectory_loss": trajectory_loss.item(),
                         "lrs": {
                             optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
                             for gi, lr_val in enumerate(all_lrs)
@@ -433,6 +435,8 @@ def train_one_epoch(
                 actual_step = global_step_offset + global_step
                 tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
+                if trajectory_loss.item() > 0:
+                    tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
                 if isinstance(loss_dict, dict):
                     for k in ('vis_loss', 'coord_loss', 'peak_loss', 'neg_loss'):
                         if k in loss_dict:

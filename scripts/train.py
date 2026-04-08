@@ -786,9 +786,10 @@ def main():
             gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
             logger.info(f"  🧠 Memory: CPU={mem_info.rss / (1024**3):.2f}GB, GPU={gpu_mem:.2f}GB (reserved={gpu_reserved:.2f}GB)")
         
+        train_traj_str = f", traj: {train_metrics['trajectory_loss']:.4f}" if train_metrics.get('trajectory_loss', 0) > 0 else ""
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f})"
+            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str})"
         )
         
         eta = timer.get_eta(epoch, total_epochs)
@@ -796,9 +797,10 @@ def main():
 
         if do_eval and val_metrics:
             val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
+            val_traj_str = f", traj: {val_metrics['val_trajectory_loss']:.4f}" if val_metrics.get('val_trajectory_loss', 0) > 0 else ""
             logger.info(
                 f"  Val Loss: {val_metrics['val_loss']:.4f} "
-                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_hm_mse_str})"
+                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_traj_str}{val_hm_mse_str})"
             )
             is_best = val_metrics['val_loss'] < best_val_loss
             if is_best:
@@ -855,6 +857,14 @@ def main():
                     'train': train_metrics['heatmap_loss'],
                     'val': val_metrics['val_heatmap_loss'],
                 }, global_epoch_counter)
+                
+                train_traj = train_metrics.get('trajectory_loss', 0)
+                val_traj = val_metrics.get('val_trajectory_loss', 0)
+                if train_traj > 0 or val_traj > 0:
+                    tb_writer.add_scalars('loss/trajectory', {
+                        'train': train_traj,
+                        'val': val_traj,
+                    }, global_epoch_counter)
                 
                 for hm_key in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):
                     val_key = f'val_hm_{hm_key}'
