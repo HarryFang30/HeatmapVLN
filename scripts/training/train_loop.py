@@ -355,7 +355,7 @@ def train_one_epoch(
 
             abs_step = global_step_offset + global_step
             if nextdit_warmup_steps > 0 and abs_step == nextdit_warmup_steps:
-                end_nextdit_warmup(model_module, logger)
+                end_nextdit_warmup(model_module, logger, stage_cfg=stage_cfg)
                 trainable_params = _get_trainable_params(model_module)
 
             current_heatmap_temperature = get_heatmap_temperature(
@@ -603,7 +603,7 @@ def train_one_epoch(
 
         abs_step2 = global_step_offset + global_step
         if nextdit_warmup_steps > 0 and abs_step2 == nextdit_warmup_steps:
-            end_nextdit_warmup(model_module, logger)
+            end_nextdit_warmup(model_module, logger, stage_cfg=stage_cfg)
             trainable_params = _get_trainable_params(model_module)
 
         hm_loss_fn.set_temperature(

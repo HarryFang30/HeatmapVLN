@@ -160,20 +160,22 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             model.latent_queries.requires_grad_(True)
             logger.info("  ✓ Unfrozen: latent_queries")
 
-    if 'cond_projector' in trainable:
-        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
-            freeze_module(model.nextdit_action_head.cond_projector, freeze=False)
-            logger.info("  ✓ Unfrozen: nextdit_action_head.cond_projector")
-
-    if 'memory_encoder' in trainable:
-        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
-            freeze_module(model.nextdit_action_head.memory_encoder, freeze=False)
-            logger.info("  ✓ Unfrozen: nextdit_action_head.memory_encoder")
-
-    if 'rgb_resampler' in trainable:
-        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
-            freeze_module(model.nextdit_action_head.rgb_resampler, freeze=False)
-            logger.info("  ✓ Unfrozen: nextdit_action_head.rgb_resampler")
+    # Fine-grained nextdit sub-module unfreezing
+    _nah_submodule_map = {
+        'cond_projector': 'cond_projector',
+        'traj_dit': 'traj_dit',
+        'memory_encoder': 'memory_encoder',
+        'rgb_resampler': 'rgb_resampler',
+        'action_encoder': 'action_encoder',
+        'action_decoder': 'action_decoder',
+    }
+    if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+        for cfg_name, attr_name in _nah_submodule_map.items():
+            if cfg_name in trainable:
+                submod = getattr(model.nextdit_action_head, attr_name, None)
+                if submod is not None:
+                    freeze_module(submod, freeze=False)
+                    logger.info("  ✓ Unfrozen: nextdit_action_head.%s", attr_name)
 
     if 'llm_projector' in trainable:
         if hasattr(model, 'llm_projector'):
@@ -198,8 +200,10 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
 def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: Dict, logger) -> int:
     """Apply warmup freeze: only cond_projector + latent_queries trainable.
 
-    Must be called AFTER build_optimizer so all params are registered.
-    Returns warmup_steps (0 if disabled).
+    During warmup the bridge layers adapt to the LoRA-modified VLM
+    representations before the downstream trajectory generator is
+    unfrozen.  Must be called AFTER build_optimizer so all params are
+    registered.  Returns warmup_steps (0 if disabled).
     """
     nextdit_cfg = cfg.get('model', {}).get('action_head', {}).get('nextdit', {})
     warmup_steps = nextdit_cfg.get('warmup_steps', 0)
@@ -226,17 +230,43 @@ def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: Dict, logger) -> int:
     return warmup_steps
 
 
-def end_nextdit_warmup(model: VLNPipeline, logger):
-    """Unfreeze all of nextdit_action_head after warmup completes."""
+def end_nextdit_warmup(model: VLNPipeline, logger, stage_cfg: Dict = None):
+    """Unfreeze System 1 modules according to trainable_modules after warmup.
+
+    Unlike the old behaviour that blindly unfroze everything, this now
+    respects *stage_cfg['trainable_modules']* so that modules listed in
+    *frozen_modules* (e.g. memory_encoder, rgb_resampler) stay frozen.
+    Falls back to unfreezing the whole head when no stage_cfg is given.
+    """
     nah = getattr(model, 'nextdit_action_head', None)
     if nah is None:
         return
-    freeze_module(nah, freeze=False)
-    if hasattr(nah, 'rgb_model'):
-        nah.rgb_model.requires_grad_(False)
 
-    trainable = sum(p.numel() for p in nah.parameters() if p.requires_grad)
+    trainable = stage_cfg.get('trainable_modules', []) if stage_cfg else []
+
+    if 'nextdit_action_head' in trainable or not trainable:
+        # Legacy / full unfreeze
+        freeze_module(nah, freeze=False)
+        if hasattr(nah, 'rgb_model'):
+            nah.rgb_model.requires_grad_(False)
+    else:
+        # Selective unfreeze: only named sub-modules
+        _submod_map = {
+            'cond_projector': 'cond_projector',
+            'traj_dit': 'traj_dit',
+            'memory_encoder': 'memory_encoder',
+            'rgb_resampler': 'rgb_resampler',
+            'action_encoder': 'action_encoder',
+            'action_decoder': 'action_decoder',
+        }
+        for cfg_name, attr_name in _submod_map.items():
+            if cfg_name in trainable:
+                submod = getattr(nah, attr_name, None)
+                if submod is not None:
+                    freeze_module(submod, freeze=False)
+
+    total = sum(p.numel() for p in nah.parameters() if p.requires_grad)
     logger.info(
-        "🔓 NextDiT warmup complete: unfrozen all System 1 modules (%s trainable params)",
-        f"{trainable:,}",
+        "🔓 NextDiT warmup complete: unfrozen System 1 modules (%s trainable params)",
+        f"{total:,}",
     )
