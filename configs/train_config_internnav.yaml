@@ -1,30 +1,55 @@
 seed: 42
 
 # ============================================
+# 阶段 2: 桥接适配 + System 1 部分解冻
+# ============================================
+#
+# 前置条件:
+#   阶段 1 (train_heatmap_config.yaml) 已完成，LoRA + HeatmapVLN 权重已收敛。
+#
+# 启动方式:
+#   python scripts/train.py \
+#     --config configs/train_config_internnav.yaml \
+#     --load-weights /path/to/stage1/checkpoints/best.pth
+#
+# 训练策略:
+#   - LoRA lr 降至阶段 1 的 40%（已在全景适配上收敛，不应再大幅变动）
+#   - latent_queries + cond_projector 解冻，在新的 LLM 表示空间中重新对齐 System 1 条件
+#   - memory_encoder + rgb_resampler 解冻，适配全景视觉记忆输入
+#   - traj_dit / rgb_model / action_encoder / action_decoder 保持冻结（核心轨迹生成能力不可破坏）
+#   - heatmap 继续训练（辅助空间理解）
+#   - System 1 前 500 步只训桥接层（warmup），之后才解冻 memory_encoder + rgb_resampler
+#
+# ============================================
+
+# ============================================
 # 数据配置
 # ============================================
 data:
   root: /workspace/r2r_panoramic_data
   train_split: train
-  val_split: val_unseen
+  val_root: /workspace/val_unseen
+  val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8
+  num_workers: 4
   pin_memory: true
-  prefetch_factor: 4
-  
+  prefetch_factor: 2
+
   dataset_type: trajectory
-  
+
   sliding_window:
     min_history: 5
-    num_history_sample: 32
+    num_history_sample: 8
     load_depth: true
+    load_history_frames: false
     cache_poses: true
     sample_stride: 2
+    defer_heatmap_to_gpu: false
     clip_level_sampling: true
-    samples_per_clip: 30
-    val_samples_per_clip: 10
-  
+    samples_per_clip: 15
+    val_samples_per_clip: 5
+
   trajectory:
     min_history: 5
     num_history_sample: 8
@@ -32,8 +57,8 @@ data:
     cache_poses: true
     sample_stride: 2
     clip_level_sampling: true
-    samples_per_clip: 30
-    val_samples_per_clip: 10
+    samples_per_clip: 20
+    val_samples_per_clip: 8
     random_subsequence: true
     min_subsequence_length: 30
     subsequence_samples_per_clip: 5
@@ -63,7 +88,7 @@ model:
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
-    # LoRA: 适配 hook 层的 cross-image attention (前向→全景)
+    # LoRA: 阶段 1 已收敛的层，阶段 2 继续以低 lr 微调
     use_lora: true
     lora_rank: 16
     lora_alpha: 32
@@ -114,45 +139,66 @@ model:
       dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
       enable_gradient_checkpointing: true
       internnav_system1_path: "models/internnav_system1.safetensors"
+      # 前 500 步只训桥接层 (latent_queries + cond_projector)
+      # 之后解冻 memory_encoder / rgb_resampler
       warmup_steps: 500
 
 # ============================================
-# 训练策略 — Plan A: 冻结 System 1 核心，微调桥接层
+# 训练策略 — 阶段 2: 桥接适配 + System 1 视觉记忆解冻
 # ============================================
+#
+# 核心思路:
+#   1. VLM backbone 冻结，LoRA 以极低 lr 继续 (不破坏阶段 1 的全景理解)
+#   2. latent_queries + cond_projector 是核心桥接层，较高 lr
+#   3. memory_encoder + rgb_resampler 需要适配全景视觉输入
+#   4. traj_dit 核心扩散模型 + DINOv2 + 动作编解码器 保持冻结
+#   5. heatmap 分支继续训练，与轨迹分支联合优化
+#
 training:
   stages:
-    - name: internnav_bridge_adaptation
-      epochs: 10
+    - name: stage2_bridge_adaptation
+      epochs: 8
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: true
       train_action: true
       trainable_modules:
-        - heatmap_vln
-        - latent_queries
-        - cond_projector
-        - llm_projector
-        - lora
+        - heatmap_vln        # DPT 融合 + coarse + fine 全部
+        - latent_queries     # System 2→1 条件提取
+        - cond_projector     # 3584→768 条件投影
+        - memory_encoder     # 视觉记忆自注意力 (适配全景)
+        - rgb_resampler      # QFormer 视觉记忆重采样 (适配全景)
+        - llm_projector      # LLM hidden → token dim 桥接
+        - lora               # 以极低 lr 继续微调
       frozen_modules:
-        - vlm_backbone
-        - traj_dit
-        - rgb_model
-        - memory_encoder
-        - rgb_resampler
-        - action_encoder
-        - action_decoder
+        - vlm_backbone       # Qwen2.5-VL 基座权重
+        - traj_dit           # NextDiT 核心扩散模型
+        - rgb_model           # DINOv2/DepthAnythingV2 预训练视觉编码器
+        - action_encoder     # 动作空间编码 (动作空间未变)
+        - action_decoder     # 动作空间解码 (动作空间未变)
+        - pos_encoding       # 正弦位置编码
 
 # ============================================
 # 优化器配置
 # ============================================
+#
+# 学习率设计原则:
+#   - LoRA: 极低 (2e-6)，阶段 1 已收敛，只做微量适应
+#   - 桥接层 (latent_queries, cond_projector): 中高 (3e-4, 2e-4)
+#   - 视觉记忆 (memory_encoder, rgb_resampler): 中等 (1e-4)
+#   - HeatmapVLN: 中等 (1e-4)，阶段 1 已有良好初始化
+#
 optim:
   optimizer: adamw
-  learning_rate: 2.0e-4
-  heatmap_lr: 2.0e-4
-  nextdit_cond_projector_lr: 3.0e-4
-  latent_queries_lr: 5.0e-4
+  learning_rate: 1.0e-4
+  heatmap_lr: 1.0e-4
+  vis_head_lr: 5.0e-4
+  nextdit_cond_projector_lr: 2.0e-4
+  latent_queries_lr: 3.0e-4
+  memory_encoder_lr: 1.0e-4
+  rgb_resampler_lr: 1.0e-4
   llm_projector_lr: 1.0e-4
-  lora_lr: 5.0e-6
+  lora_lr: 2.0e-6
   weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16
@@ -166,9 +212,17 @@ optim:
 # ============================================
 # 损失函数
 # ============================================
+#
+# 阶段 2 联合训练:
+#   total = heatmap_weight × L_heatmap + trajectory_weight × L_trajectory
+#
+# trajectory_weight = 1.0 保证轨迹精度为主导
+# heatmap_weight = 0.5 降低热力图在总损失中的占比，
+#   避免热力图梯度过度影响 LoRA / 桥接层
+#
 loss:
   heatmap_loss_type: heatmap_vln
-  
+
   heatmap_vln:
     lambda_vis: 1.0
     lambda_coord: 0.2
@@ -182,8 +236,8 @@ loss:
       mode: cosine
       start: 1.0
       end: 1.0
-  
-  heatmap_weight: 1.0
+
+  heatmap_weight: 0.5
   trajectory_weight: 1.0
 
 # ============================================
@@ -204,15 +258,18 @@ log:
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 2
-  max_ckpts: 3
+  max_ckpts: 5
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs
+  enable_timing: false
+  epoch_boundary_cooldown_s: 8
   log_interval: 10
   show_gpu_memory: true
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
-  
+  mid_epoch_save_every: 500
+
   notify:
     enabled: true
     platform: feishu
@@ -224,4 +281,5 @@ log:
 validation:
   eval_every_epochs: 1
   save_best_metric: val_total_loss
-  patience: 5
+  patience: 10
+  val_inference_batches: 6

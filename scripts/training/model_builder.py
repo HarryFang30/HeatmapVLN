@@ -165,6 +165,16 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
             freeze_module(model.nextdit_action_head.cond_projector, freeze=False)
             logger.info("  ✓ Unfrozen: nextdit_action_head.cond_projector")
 
+    if 'memory_encoder' in trainable:
+        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+            freeze_module(model.nextdit_action_head.memory_encoder, freeze=False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head.memory_encoder")
+
+    if 'rgb_resampler' in trainable:
+        if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
+            freeze_module(model.nextdit_action_head.rgb_resampler, freeze=False)
+            logger.info("  ✓ Unfrozen: nextdit_action_head.rgb_resampler")
+
     if 'llm_projector' in trainable:
         if hasattr(model, 'llm_projector'):
             freeze_module(model.llm_projector, freeze=False)

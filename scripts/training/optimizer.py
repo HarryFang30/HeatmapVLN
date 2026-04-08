@@ -88,20 +88,37 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         print(f"  Param group: heatmap_coarse (lr={heatmap_lr}, {n_coarse} params)")
         print(f"  Param group: heatmap_vis_head (lr={vis_head_lr}, {n_vis} params)")
 
-    # NextDiT Action Head — split cond_projector for higher warmup lr
+    # NextDiT Action Head — split submodules for per-component learning rates
     action_lr = optim_cfg.get('action_lr', 1e-4)
     nextdit_lr = optim_cfg.get('nextdit_action_lr', action_lr)
     nextdit_cond_lr = optim_cfg.get('nextdit_cond_projector_lr', nextdit_lr * 3)
+    memory_encoder_lr = optim_cfg.get('memory_encoder_lr', nextdit_lr)
+    rgb_resampler_lr = optim_cfg.get('rgb_resampler_lr', nextdit_lr)
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
         nah = model.nextdit_action_head
+        dedicated_param_ids = set()
+
         cp_groups = get_param_groups_with_wd(nah.cond_projector, nextdit_cond_lr, 'nextdit_cond_projector', default_wd)
         if cp_groups:
             param_groups.extend(cp_groups)
             print(f"  Param group: nextdit_cond_projector (lr={nextdit_cond_lr}, wd={default_wd})")
+        dedicated_param_ids.update(id(p) for p in nah.cond_projector.parameters())
+
+        me_groups = get_param_groups_with_wd(nah.memory_encoder, memory_encoder_lr, 'nextdit_memory_encoder', default_wd)
+        if me_groups:
+            param_groups.extend(me_groups)
+            print(f"  Param group: nextdit_memory_encoder (lr={memory_encoder_lr}, wd={default_wd})")
+        dedicated_param_ids.update(id(p) for p in nah.memory_encoder.parameters())
+
+        rr_groups = get_param_groups_with_wd(nah.rgb_resampler, rgb_resampler_lr, 'nextdit_rgb_resampler', default_wd)
+        if rr_groups:
+            param_groups.extend(rr_groups)
+            print(f"  Param group: nextdit_rgb_resampler (lr={rgb_resampler_lr}, wd={default_wd})")
+        dedicated_param_ids.update(id(p) for p in nah.rgb_resampler.parameters())
+
         rest_decay, rest_no_decay = [], []
-        cond_proj_ids = {id(p) for p in nah.cond_projector.parameters()}
         for n, p in nah.named_parameters():
-            if not p.requires_grad or id(p) in cond_proj_ids:
+            if not p.requires_grad or id(p) in dedicated_param_ids:
                 continue
             if 'bias' in n or 'norm' in n.lower() or 'ln' in n.lower():
                 rest_no_decay.append(p)
