@@ -348,11 +348,14 @@ def validate(
     result = {
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
+        'val_trajectory_loss': avg_act,
         'val_heatmap_mse': avg_hm_mse,
         'val_total_loss': avg_loss,
         'val_hm_peak_loss': avg_peak_loss,
         'val_hm_vis_loss': avg_vis_loss,
         'val_hm_coord_loss': avg_coord_loss,
     }
+    if avg_act > 0:
+        logger.info(f"  📊 Trajectory loss: {avg_act:.6f}")
     result.update(val_vis_metrics)
     return result
