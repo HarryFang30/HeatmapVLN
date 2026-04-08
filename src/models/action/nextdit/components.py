@@ -100,5 +100,4 @@ class QFormer(nn.Module):
         query_tokens = self.query_tokens.unsqueeze(0).expand(B, -1, -1)
         query_tokens = query_tokens + self.query_pos.unsqueeze(0)
         out = self.decoder(query_tokens, visual_feats, memory_key_padding_mask=visual_attn_mask)
-        out = self.visual_proj(out)
         return out
