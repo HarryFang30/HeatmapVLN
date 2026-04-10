@@ -2084,20 +2084,31 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"load_traj_images={self.load_traj_images}"
         )
     
-    def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int) -> np.ndarray:
+    def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int,
+                             direction: str = "front") -> np.ndarray:
         """Load a single frame as (H, W, 3) uint8 for DualVLN visual memory.
 
         Uses ``traj_image_size`` (default 224x224) and no colour augmentation
         so that the DINOv2 backbone gets clean inputs.
+
+        Args:
+            direction: which view to load.  Use ``"front_down"`` for the
+                lookdown observation when available.
         """
         clip_idx = self._get_clip_idx(clip_dir)
         storage_format = self._get_storage_format(clip_idx)
 
         if storage_format == "chunks":
-            raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction="front")
+            try:
+                raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction=direction)
+            except KeyError:
+                if direction != "front":
+                    raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction="front")
+                else:
+                    raise
             image = self._decode_chunk_rgb(raw, clip_dir, frame_idx)
         else:
-            dir_name = "front"
+            dir_name = direction
             rgb_candidates = [
                 clip_dir / "rgb" / f"{frame_idx:06d}.jpg",
                 clip_dir / "rgb" / f"{frame_idx:06d}.png",
@@ -2123,15 +2134,29 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         current_pose: np.ndarray,
         goal_pose: np.ndarray,
         img_size: int = 256,
+        depth_map: Optional[np.ndarray] = None,
+        depth_tolerance: float = 0.5,
     ) -> Optional[List[int]]:
         """Project the goal position onto the current front-view image.
 
         Uses pinhole projection with HFOV=90° (Habitat convention:
         X right, Y up, -Z forward).
 
+        Aligned with InternNav paper: when ``depth_map`` is provided,
+        the projected point is checked against the depth buffer.  If the
+        depth at the projected pixel is significantly closer than the
+        goal distance, the goal is considered occluded and ``None`` is
+        returned.
+
+        Args:
+            depth_map: (H, W) depth in metres.  Values <= 0 are treated
+                as invalid / infinite depth (no occlusion).
+            depth_tolerance: margin in metres — the goal is accepted if
+                ``depth_at_pixel >= goal_distance - tolerance``.
+
         Returns:
             [u, v] integer pixel coordinates, or ``None`` if the goal
-            is behind the camera or too close.
+            is behind the camera, outside the image, or occluded.
         """
         T_inv = np.linalg.inv(np.asarray(current_pose, dtype=np.float64))
         goal_world = np.array([
@@ -2147,11 +2172,28 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         f = img_size / 2.0
         c = img_size / 2.0
 
-        u = f * x / z_depth + c
-        v = f * (-y) / z_depth + c
+        u_f = f * x / z_depth + c
+        v_f = f * (-y) / z_depth + c
 
-        u = max(0, min(img_size - 1, int(round(u))))
-        v = max(0, min(img_size - 1, int(round(v))))
+        if u_f < 0 or u_f >= img_size or v_f < 0 or v_f >= img_size:
+            return None
+
+        u = max(0, min(img_size - 1, int(round(u_f))))
+        v = max(0, min(img_size - 1, int(round(v_f))))
+
+        if depth_map is not None:
+            dm = depth_map
+            if dm.ndim == 3 and dm.shape[-1] == 1:
+                dm = dm[:, :, 0]
+            dh, dw = dm.shape[:2]
+            du = int(round(u_f * dw / img_size))
+            dv = int(round(v_f * dh / img_size))
+            du = max(0, min(dw - 1, du))
+            dv = max(0, min(dh - 1, dv))
+            pixel_depth = float(dm[dv, du])
+            if pixel_depth > 0 and pixel_depth < z_depth - depth_tolerance:
+                return None
+
         return [u, v]
 
     def _load_fgr2r_mapping(self, fgr2r_path: Optional[str] = None):
@@ -2478,9 +2520,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # 12. traj_images for DualVLN visual memory [pixel_goal, current]
             if self.load_traj_images:
                 goal_frame_idx = min(subseq_end - 1, T - 1)
+                traj_view = "front_down"
                 try:
-                    goal_img = self._load_traj_image_raw(clip_dir, goal_frame_idx)
-                    curr_img = self._load_traj_image_raw(clip_dir, current_t)
+                    goal_img = self._load_traj_image_raw(clip_dir, goal_frame_idx, direction=traj_view)
+                    curr_img = self._load_traj_image_raw(clip_dir, current_t, direction=traj_view)
                 except Exception:
                     th, tw = self.traj_image_size[1], self.traj_image_size[0]
                     goal_img = np.zeros((th, tw, 3), dtype=np.uint8)
@@ -2488,12 +2531,20 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 traj_imgs = np.stack([goal_img, curr_img], axis=0).astype(np.float32) / 255.0
                 result["traj_images"] = torch.from_numpy(traj_imgs)  # [2, H, W, 3]
 
-                # Pixel-goal: project goal position onto current front view
-                # (InternNav-style spatial anchor for latent queries)
-                goal_pose = poses[goal_frame_idx]
-                pg = self._compute_pixel_goal(
-                    current_pose, goal_pose, img_size=img_size,
-                )
+                # Pixel-goal: project the *farthest visible* future
+                # waypoint onto the current front view, aligned with
+                # InternNav's depth-based occlusion filtering.
+                front_depth = self._load_depth(clip_dir, current_t, direction="front")
+                _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
+                pg = None
+                for fi in range(goal_frame_idx, current_t, -1):
+                    pg = self._compute_pixel_goal(
+                        current_pose, poses[fi],
+                        img_size=_img_w,
+                        depth_map=front_depth,
+                    )
+                    if pg is not None:
+                        break
                 if pg is not None:
                     result["pixel_goal"] = pg
 
