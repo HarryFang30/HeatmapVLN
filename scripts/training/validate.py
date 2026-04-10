@@ -156,7 +156,7 @@ def validate(
                     panoramic_num_histories=panoramic_num_histories,
                     panoramic_text_anchor_positions=panoramic_text_anchor_positions,
                     history_rel_poses=history_rel_poses,
-                    return_heatmaps=True,
+                    return_heatmaps=train_history or train_future,
                     return_actions=train_action,
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
                     action_valid=action_valid if train_action else None,

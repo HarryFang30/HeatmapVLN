@@ -954,33 +954,48 @@ class Qwen2_5VLIntegration(nn.Module):
         history_rel_poses: Optional[torch.Tensor] = None,
         latent_queries: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]], Optional[torch.Tensor]]:
-        """Forward already-tokenized panoramic batch through one Qwen pass."""
-        if heatmap_vln is None:
-            raise RuntimeError("Tokenized panoramic forward requires a HeatmapVLN instance.")
+        """Forward already-tokenized batch through one Qwen pass.
 
+        When ``heatmap_vln`` is None the heatmap hook/decode pipeline is
+        skipped entirely — only the VLM forward (with optional TRAJ latent
+        query injection) is executed.  This is the Stage 2 InternNav path
+        where VLM input is front-view + lookdown (no panoramic history anchors).
+        """
         t0 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         inputs = {k: v.to(self.device, non_blocking=True) for k, v in panoramic_inputs.items()}
-        heatmap_vln._normalize_multimodal_inputs(inputs)
-        image_positions_batch = [
-            heatmap_vln._find_image_positions_from_ids(inputs["input_ids"][b])
-            for b in range(inputs["input_ids"].shape[0])
-        ]
-        if text_anchor_positions_batch is None:
-            text_anchor_positions_batch = [
-                find_text_anchor_positions(
-                    inputs["input_ids"][b:b + 1],
-                    heatmap_vln.processor.tokenizer,
-                    num_history=num_histories[b],
-                )
+
+        if heatmap_vln is not None:
+            heatmap_vln._normalize_multimodal_inputs(inputs)
+            image_positions_batch = [
+                heatmap_vln._find_image_positions_from_ids(inputs["input_ids"][b])
                 for b in range(inputs["input_ids"].shape[0])
             ]
-        t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
-        heatmap_vln.feat_extractor.clear()
-        heatmap_vln.feat_extractor.prepare_batch_capture(
-            image_token_positions_batch=image_positions_batch,
-            text_anchor_positions_batch=text_anchor_positions_batch,
-            image_grid_thw=inputs.get("image_grid_thw"),
-        )
+            if text_anchor_positions_batch is None:
+                text_anchor_positions_batch = [
+                    find_text_anchor_positions(
+                        inputs["input_ids"][b:b + 1],
+                        heatmap_vln.processor.tokenizer,
+                        num_history=num_histories[b],
+                    )
+                    for b in range(inputs["input_ids"].shape[0])
+                ]
+            t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
+            heatmap_vln.feat_extractor.clear()
+            heatmap_vln.feat_extractor.prepare_batch_capture(
+                image_token_positions_batch=image_positions_batch,
+                text_anchor_positions_batch=text_anchor_positions_batch,
+                image_grid_thw=inputs.get("image_grid_thw"),
+            )
+        else:
+            # Lightweight normalisation (same as HeatmapVLN._normalize_multimodal_inputs)
+            if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+                vgt = inputs["video_grid_thw"]
+                if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
+                    inputs["video_grid_thw"] = torch.repeat_interleave(
+                        vgt, vgt[:, 0], dim=0,
+                    )
+                    inputs["video_grid_thw"][:, 0] = 1
+            t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
 
         if return_hidden_states:
             hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
@@ -994,24 +1009,27 @@ class Qwen2_5VLIntegration(nn.Module):
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         internal_timings = self._consume_internal_timings() if self.config.enable_runtime_timing else {}
 
-        heatmap_output = heatmap_vln.decode_from_inputs_batch(
-            inputs,
-            num_histories,
-            image_positions_batch=image_positions_batch,
-            text_anchors_batch=text_anchor_positions_batch,
-            history_rel_poses=history_rel_poses,
-        )
+        heatmap_output = None
+        if heatmap_vln is not None:
+            heatmap_output = heatmap_vln.decode_from_inputs_batch(
+                inputs,
+                num_histories,
+                image_positions_batch=image_positions_batch,
+                text_anchors_batch=text_anchor_positions_batch,
+                history_rel_poses=history_rel_poses,
+            )
         if self.config.enable_runtime_timing:
             t3 = time.perf_counter()
-            decode_timings = dict(heatmap_output.get("timings", {}) or {})
-            heatmap_output["timings"] = {
-                "prepare_inputs_s": t1 - t0,
-                "qwen_forward_s": t2 - t1,
-                "heatmap_decode_s": t3 - t2,
-                "panorama_total_s": t3 - t0,
-            }
-            heatmap_output["timings"].update(decode_timings)
-            heatmap_output["timings"].update(internal_timings)
+            if heatmap_output is not None:
+                decode_timings = dict(heatmap_output.get("timings", {}) or {})
+                heatmap_output["timings"] = {
+                    "prepare_inputs_s": t1 - t0,
+                    "qwen_forward_s": t2 - t1,
+                    "heatmap_decode_s": t3 - t2,
+                    "panorama_total_s": t3 - t0,
+                }
+                heatmap_output["timings"].update(decode_timings)
+                heatmap_output["timings"].update(internal_timings)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs
     
     def _forward_batch(

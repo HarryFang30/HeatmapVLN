@@ -453,7 +453,16 @@ class VLNPipeline(nn.Module):
         use_panoramic_chain = panoramic_inputs is not None or (
             current_views is not None and history_panoramas is not None
         )
-        if use_panoramic_chain:
+        # Only construct and pass heatmap_vln when panoramic history anchors
+        # are present.  In Stage 2 InternNav mode (pano_num_histories all
+        # zeros / no panoramic views), the VLM forward runs without hooks.
+        need_heatmap = (
+            use_panoramic_chain
+            and return_heatmaps
+            and panoramic_num_histories is not None
+            and any(n > 0 for n in panoramic_num_histories)
+        )
+        if need_heatmap:
             self._ensure_heatmap_vln()
 
         need_sequence_features = return_intermediate or return_actions
@@ -483,7 +492,7 @@ class VLNPipeline(nn.Module):
                 panoramic_inputs=panoramic_inputs,
                 panoramic_num_histories=panoramic_num_histories,
                 panoramic_text_anchor_positions=panoramic_text_anchor_positions,
-                heatmap_vln=self.heatmap_vln if use_panoramic_chain else None,
+                heatmap_vln=self.heatmap_vln if need_heatmap else None,
                 history_rel_poses=history_rel_poses,
                 latent_queries=lq,
             )
@@ -508,7 +517,7 @@ class VLNPipeline(nn.Module):
                 # ==================== Step 2: Project Hidden States ====================
                 llm_tokens = self.llm_projector(raw_hidden_states)
 
-            if return_heatmaps and use_panoramic_chain:
+            if return_heatmaps and need_heatmap:
                 if 'visibility' not in qwen_output or 'heatmaps' not in qwen_output:
                     raise RuntimeError("Panoramic Qwen path did not return HeatmapVLN outputs")
                 heatmap_output = {

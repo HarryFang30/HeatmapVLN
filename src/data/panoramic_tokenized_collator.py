@@ -20,7 +20,11 @@ from typing import Any, Dict, List
 
 import torch
 
-from src.models.heatmap.input_constructor import construct_input, find_text_anchor_positions
+from src.models.heatmap.input_constructor import (
+    construct_input,
+    construct_input_stage2,
+    find_text_anchor_positions,
+)
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
 try:
@@ -149,34 +153,54 @@ class PanoramicTokenizedCollator:
         if do_log:
             rss1 = _rss_mb()
 
-        if "current_views" in batch[0] and "history_panoramas" in batch[0]:
+        use_panoramic = "current_views" in batch[0] and "history_panoramas" in batch[0]
+        use_internnav = "lookdown_frame" in batch[0] and not use_panoramic
+
+        if use_panoramic or use_internnav:
             messages_batch = []
             pano_num_histories = []
 
-            for sample in batch:
-                current_views_dict = {
-                    name: sample["current_views"][idx]
-                    for idx, name in enumerate(("front", "right", "back", "left"))
-                }
-                history_panoramas_list = [
-                    {
-                        name: sample["history_panoramas"][hist_idx, view_idx]
-                        for view_idx, name in enumerate(("front", "right", "back", "left"))
-                    }
-                    for hist_idx in range(sample["history_panoramas"].shape[0])
-                ]
-                pg = sample.get("pixel_goal")
-                messages_batch.append(
-                    construct_input(
-                        current_views=current_views_dict,
-                        history_panoramas=history_panoramas_list,
-                        instruction=sample.get("text"),
-                        pixel_goal=pg,
+            if use_internnav:
+                # Stage 2 InternNav-aligned: front-view history + lookdown
+                for sample in batch:
+                    hf = sample["history_frames"]
+                    history_list = [hf[k] for k in range(hf.shape[0])]
+                    pg = sample.get("pixel_goal")
+                    messages_batch.append(
+                        construct_input_stage2(
+                            history_frames=history_list,
+                            current_frame=sample["current_frame"],
+                            lookdown_frame=sample["lookdown_frame"],
+                            instruction=sample.get("text"),
+                            pixel_goal=pg,
+                        )
                     )
-                )
-                pano_num_histories.append(len(history_panoramas_list))
+                    pano_num_histories.append(0)
+            else:
+                for sample in batch:
+                    current_views_dict = {
+                        name: sample["current_views"][idx]
+                        for idx, name in enumerate(("front", "right", "back", "left"))
+                    }
+                    history_panoramas_list = [
+                        {
+                            name: sample["history_panoramas"][hist_idx, view_idx]
+                            for view_idx, name in enumerate(("front", "right", "back", "left"))
+                        }
+                        for hist_idx in range(sample["history_panoramas"].shape[0])
+                    ]
+                    pg = sample.get("pixel_goal")
+                    messages_batch.append(
+                        construct_input(
+                            current_views=current_views_dict,
+                            history_panoramas=history_panoramas_list,
+                            instruction=sample.get("text"),
+                            pixel_goal=pg,
+                        )
+                    )
+                    pano_num_histories.append(len(history_panoramas_list))
 
-            result["current_views"] = torch.stack([sample["current_views"] for sample in batch], dim=0)
+                result["current_views"] = torch.stack([sample["current_views"] for sample in batch], dim=0)
 
             for sample in batch:
                 sample.clear()
@@ -223,14 +247,16 @@ class PanoramicTokenizedCollator:
                         [pano_inputs["attention_mask"], traj_mask], dim=1,
                     )
 
-            pano_text_anchor_positions = [
-                find_text_anchor_positions(
-                    pano_inputs["input_ids"][batch_idx:batch_idx + 1],
-                    self.processor.tokenizer,
-                    num_history=pano_num_histories[batch_idx],
-                )
-                for batch_idx in range(len(pano_num_histories))
-            ]
+            pano_text_anchor_positions = None
+            if not use_internnav:
+                pano_text_anchor_positions = [
+                    find_text_anchor_positions(
+                        pano_inputs["input_ids"][batch_idx:batch_idx + 1],
+                        self.processor.tokenizer,
+                        num_history=pano_num_histories[batch_idx],
+                    )
+                    for batch_idx in range(len(pano_num_histories))
+                ]
 
             result["pano_inputs"] = pano_inputs
             result["pano_num_histories"] = pano_num_histories

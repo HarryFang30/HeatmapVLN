@@ -317,6 +317,7 @@ def main():
             traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
             use_subinstruction=traj_cfg.get('use_subinstruction', False),
             fgr2r_subinstr_path=traj_cfg.get('fgr2r_subinstr_path', None),
+            panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
         )
         
         val_root = cfg['data'].get('val_root') or cfg['data']['root']
@@ -341,6 +342,7 @@ def main():
             load_traj_images=traj_cfg.get('load_traj_images', False),
             traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
             use_subinstruction=False,
+            panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
         )
     else:
         sw_cfg = cfg['data']['sliding_window']

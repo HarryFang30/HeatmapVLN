@@ -162,6 +162,58 @@ def find_text_anchor_positions(
     return anchors
 
 
+def construct_input_stage2(
+    history_frames: List[Union[Image.Image, torch.Tensor]],
+    current_frame: Union[Image.Image, torch.Tensor],
+    lookdown_frame: Union[Image.Image, torch.Tensor],
+    instruction: Optional[str] = None,
+    pixel_goal: Optional[List[int]] = None,
+) -> List[Dict]:
+    """Construct InternNav-aligned Stage 2 input (front-view + lookdown).
+
+    Conversation format mirrors the InternNav paper::
+
+        User:   [video: K past + current front frames] + instruction
+        Assistant: ↓
+        User:   [lookdown image]
+        Assistant: (x, y)   ← pixel-goal coordinates (teacher forcing)
+
+    Args:
+        history_frames: K front-view history images.
+        current_frame:  Current front-view observation.
+        lookdown_frame: Current lookdown (pitch=30°) observation.
+        instruction:    Navigation instruction text.
+        pixel_goal:     [x, y] pixel coordinates of next waypoint.
+
+    Returns:
+        messages: list of message dicts for the Qwen2.5-VL processor.
+    """
+    all_frames = [_ensure_pil(f) for f in history_frames]
+    all_frames.append(_ensure_pil(current_frame))
+
+    user_content: list = []
+    if instruction:
+        user_content.append({"type": "text", "text": instruction})
+    user_content.append({"type": "video", "video": all_frames})
+
+    messages = [{"role": "user", "content": user_content}]
+
+    messages.append({"role": "assistant", "content": "↓"})
+
+    messages.append({
+        "role": "user",
+        "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
+    })
+
+    if pixel_goal is not None:
+        messages.append({
+            "role": "assistant",
+            "content": f"{pixel_goal[0]} {pixel_goal[1]}",
+        })
+
+    return messages
+
+
 def _build_history_anchor_text(hist_idx: int) -> str:
     return f"历史位置{hist_idx + 1}的全景观测（朝向{ORIENTATION_STR}）："
 

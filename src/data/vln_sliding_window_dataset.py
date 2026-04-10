@@ -2046,6 +2046,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # FGR2R 子指令配置
         fgr2r_subinstr_path: Optional[str] = None,
         use_subinstruction: bool = False,
+        # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
+        panoramic_vlm_input: bool = True,
     ):
         super().__init__(
             root=root,
@@ -2070,6 +2072,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
         self.load_traj_images = load_traj_images
         self.traj_image_size = traj_image_size
+        self.panoramic_vlm_input = panoramic_vlm_input
         
         # 加载 FGR2R 子指令映射表
         self.use_subinstruction = use_subinstruction
@@ -2081,7 +2084,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
             f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}, "
             f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}, "
-            f"load_traj_images={self.load_traj_images}"
+            f"load_traj_images={self.load_traj_images}, "
+            f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
     
     def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int,
@@ -2415,13 +2419,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # 3. 加载历史帧
             history_frames = self._load_frames(clip_dir, history_indices)
             
-            # 4. 加载当前帧（全景时取 front 视角，不再拼接 2x2）
-            if self._is_panoramic:
+            # 4. 加载当前帧
+            #    panoramic_vlm_input=True:  全景 4 视图 → VLM (Stage 1)
+            #    panoramic_vlm_input=False: 前视图 + lookdown → VLM (Stage 2, InternNav)
+            if self._is_panoramic and self.panoramic_vlm_input:
                 current_frame = self._load_frame(clip_dir, current_t, direction="front")
                 current_views = self._load_all_views(clip_dir, current_t)
                 history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
             else:
-                current_frame = self._load_frame(clip_dir, current_t)
+                current_frame = self._load_frame(clip_dir, current_t, direction="front")
                 current_views = None
                 history_panoramas = None
             
@@ -2448,7 +2454,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             hm_w, hm_h = self.hm_size
             
             gt_visibility = None
-            if self._is_panoramic:
+            if self._is_panoramic and self.panoramic_vlm_input:
                 heatmap_tensor, gt_visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
@@ -2556,7 +2562,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 result["current_views"] = current_views  # [4, 3, H, W]
             if history_panoramas is not None:
                 result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
-            
+
+            # Stage 2 InternNav: front-view + lookdown for VLM
+            if self._is_panoramic and not self.panoramic_vlm_input:
+                try:
+                    ld = self._load_frame(clip_dir, current_t, direction="front_down")
+                except Exception:
+                    ld = current_frame
+                result["lookdown_frame"] = ld  # [3, H, W]
+
             result["history_rel_poses"] = torch.from_numpy(
                 compute_history_rel_poses(history_poses, current_pose)
             ).float()                                              # [K, 4]
