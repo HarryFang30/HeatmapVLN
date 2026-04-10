@@ -58,8 +58,10 @@ data:
     val_samples_per_clip: 5
 
   trajectory:
+    # 论文: 9 past + 1 current = 10 frames (单视图)
+    # 全景化: 9 × 4 views + 1 × 4 views = 40 images → 需较小 batch_size
     min_history: 5
-    num_history_sample: 8
+    num_history_sample: 9
     load_depth: true
     cache_poses: true
     sample_stride: 2
@@ -219,11 +221,13 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  # 论文: batch_size=128, 15000 steps
+  # 论文: batch_size=128 (11 images/sample), 15000 steps
+  # 全景化: 40 images/sample (~4x heavier), batch_size 须减小
+  # 有效 batch = 4 × 32 = 128
   # 10000 clips × 20 samples = 200K samples/epoch
   # 200K / 128 = 1562 steps/epoch × 10 epochs ≈ 15620 steps ≈ 15000
-  batch_size: 16
-  grad_accum_steps: 8
+  batch_size: 4
+  grad_accum_steps: 32
 
 # ============================================
 # 损失函数
