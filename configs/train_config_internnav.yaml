@@ -92,6 +92,7 @@ model:
     torch_dtype: bfloat16
     attn_implementation: sdpa
     max_video_frames: -1
+    gradient_checkpointing: true
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
@@ -212,14 +213,17 @@ optim:
   latent_queries_lr: 1.0e-4
   # traj_dit: 较低学习率 (有预训练初始化)
   nextdit_action_lr: 5.0e-5
-  weight_decay: 0.0
+  weight_decay: 0.01
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  batch_size: 4
-  grad_accum_steps: 2
+  # 论文: batch_size=128, 15000 steps
+  # 10000 clips × 20 samples = 200K samples/epoch
+  # 200K / 128 = 1562 steps/epoch × 10 epochs ≈ 15620 steps ≈ 15000
+  batch_size: 16
+  grad_accum_steps: 8
 
 # ============================================
 # 损失函数

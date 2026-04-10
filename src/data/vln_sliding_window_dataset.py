@@ -2547,6 +2547,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                         break
                 if pg is not None:
                     result["pixel_goal"] = pg
+                else:
+                    result["trajectory_valid"] = 0.0
 
             if gt_visibility is not None:
                 result["gt_visibility"] = gt_visibility  # [N, 4]

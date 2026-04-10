@@ -32,6 +32,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
         llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
         llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
         max_video_frames=llm_cfg.get('max_video_frames', 16),
+        llm_gradient_checkpointing=llm_cfg.get('gradient_checkpointing', False),
         llm_enable_internal_profiling=llm_cfg.get('enable_internal_profiling', False),
         enable_runtime_timing=cfg.get('log', {}).get('enable_timing', False),
         llm_enable_compile=llm_cfg.get('enable_compile', False),

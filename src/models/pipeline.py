@@ -44,6 +44,7 @@ class VLNPipelineConfig:
     llm_torch_dtype: str = "bfloat16"
     llm_attn_implementation: str = "sdpa"
     max_video_frames: int = 16
+    llm_gradient_checkpointing: bool = False
     llm_enable_internal_profiling: bool = False
     enable_runtime_timing: bool = False
     llm_enable_compile: bool = False
@@ -135,6 +136,7 @@ class VLNPipeline(nn.Module):
             torch_dtype=config.llm_torch_dtype,
             attn_implementation=config.llm_attn_implementation,
             max_video_frames=config.max_video_frames,
+            gradient_checkpointing=config.llm_gradient_checkpointing,
             enable_internal_profiling=config.llm_enable_internal_profiling,
             enable_runtime_timing=config.enable_runtime_timing,
             enable_compile=config.llm_enable_compile,

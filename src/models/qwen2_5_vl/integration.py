@@ -91,6 +91,7 @@ class Qwen2_5VLConfig:
     lora_layer_indices: Optional[List[int]] = None  # Exact layer indices (overrides lora_num_layers)
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
+    gradient_checkpointing: bool = False
     enable_internal_profiling: bool = False
     enable_runtime_timing: bool = False
     enable_compile: bool = False
@@ -219,6 +220,12 @@ class Qwen2_5VLIntegration(nn.Module):
                 self.config.model_path,
                 trust_remote_code=True,
             )
+            if self.config.gradient_checkpointing:
+                base = getattr(self.model, "base_model", self.model)
+                if hasattr(base, "gradient_checkpointing_enable"):
+                    base.gradient_checkpointing_enable()
+                    logger.info("VLM gradient checkpointing enabled (saves ~60%% activation memory)")
+
             self._model_loaded = True
             self.processor.tokenizer.padding_side = "left"
 
