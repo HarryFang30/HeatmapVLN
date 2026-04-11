@@ -79,6 +79,7 @@ model:
     torch_dtype: bfloat16
     attn_implementation: sdpa
     max_video_frames: -1
+    gradient_checkpointing: true
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
@@ -150,8 +151,9 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.05
   min_lr: 1.0e-6
-  # 显存增加后需降低 batch_size（backbone 激活需保留）
-  batch_size: 2
+  # heatmap_trains_backbone=true 保留计算图, gradient_checkpointing 补偿
+  # 48GB VRAM, 有效 batch = 4 × 4 = 16
+  batch_size: 4
   grad_accum_steps: 4
 
 # ============================================
