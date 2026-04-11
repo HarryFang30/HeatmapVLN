@@ -110,9 +110,9 @@ training:
       train_action: false
       trainable_modules:
         - heatmap_vln
-        - lora
       frozen_modules:
         - vlm_backbone
+        - lora
 
 # ============================================
 # 优化器配置

@@ -71,6 +71,7 @@ class HeatmapVLN(nn.Module):
         llm_layer_indices: Optional[List[int]] = None,
         enable_runtime_timing: bool = False,
         trajectory_config: Optional[Dict[str, Any]] = None,
+        heatmap_trains_backbone: bool = False,
     ):
         super().__init__()
 
@@ -87,6 +88,7 @@ class HeatmapVLN(nn.Module):
         self.vit_layer_indices = vit_layer_indices
         self.llm_layer_indices = llm_layer_indices
         self.enable_runtime_timing = enable_runtime_timing
+        self.heatmap_trains_backbone = heatmap_trains_backbone
         self._logged_llm_feature_stats = False
 
         traj_cfg = trajectory_config or {}
@@ -97,9 +99,12 @@ class HeatmapVLN(nn.Module):
         for param in self.qwen.parameters():
             param.requires_grad = False
 
-        # Feature extractor (hooks, no parameters)
+        # Feature extractor (hooks, no parameters).
+        # When heatmap_trains_backbone=True, hooks retain the computation graph
+        # so that heatmap loss gradients flow back through the backbone (LoRA).
         self.feat_extractor = FeatureExtractor(
             self.qwen, vit_layer_indices, llm_layer_indices,
+            detach_features=not heatmap_trains_backbone,
         )
 
         # DPT-Lite fusion for ViT 16x16 multi-layer features
@@ -133,10 +138,12 @@ class HeatmapVLN(nn.Module):
         )
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
-            "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, trainable=%s",
+            "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, "
+            "heatmap_trains_backbone=%s, trainable=%s",
             c_vit, c_llm, c_fused,
             vit_layer_indices, llm_layer_indices,
             self.enable_trajectory,
+            self.heatmap_trains_backbone,
             f"{trainable:,}",
         )
 

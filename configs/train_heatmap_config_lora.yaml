@@ -1,8 +1,16 @@
 seed: 42
 
 # ============================================
-# 数据配置 - 热力图专用训练（单卡）
+# 数据配置 - 热力图训练 + LoRA 对比实验（单卡）
 # ============================================
+#
+# 与 train_heatmap_config.yaml 的唯一区别:
+#   heatmap_trains_backbone: true
+#
+# 效果: 热力图 loss 梯度可穿透 backbone 到达 LoRA 参数
+# 代价: 显存增加 ~4-8 GB（backbone 中间激活需保留）
+# 目的: 对比 LoRA 是否能通过热力图辅助任务提升空间理解能力
+#
 data:
   root: /workspace/heatmap_train_data
   train_split: train
@@ -81,6 +89,9 @@ model:
     heatmap_size: [64, 64]
     image_size: 256
 
+    # ★ 核心开关: 热力图 loss 梯度穿透 backbone 到 LoRA
+    heatmap_trains_backbone: true
+
     lambda_vis: 1.0
     lambda_coord: 0.2
     lambda_kl: 0.0
@@ -98,11 +109,11 @@ model:
     enable: false
 
 # ============================================
-# 训练策略 - 只训练热力图
+# 训练策略 - 热力图 + LoRA 联合训练
 # ============================================
 training:
   stages:
-    - name: heatmap_only_64
+    - name: heatmap_lora_64
       epochs: 8
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
@@ -110,9 +121,9 @@ training:
       train_action: false
       trainable_modules:
         - heatmap_vln
+        - lora
       frozen_modules:
         - vlm_backbone
-        - lora
 
 # ============================================
 # 优化器配置
@@ -129,8 +140,9 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.05
   min_lr: 1.0e-6
-  batch_size: 4
-  grad_accum_steps: 2
+  # 显存增加后需降低 batch_size（backbone 激活需保留）
+  batch_size: 2
+  grad_accum_steps: 4
 
 # ============================================
 # 损失函数
@@ -169,13 +181,13 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /workspace/heatmap_training_outputs
+  out_dir: /workspace/heatmap_lora_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /workspace/tf-logs
+  tensorboard_dir: /workspace/tf-logs-lora
   enable_timing: false
   epoch_boundary_cooldown_s: 8
   log_interval: 10

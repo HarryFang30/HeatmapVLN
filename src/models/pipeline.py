@@ -82,6 +82,13 @@ class VLNPipelineConfig:
     heatmap_size: Tuple[int, int] = (64, 64)
     heatmap_trajectory_config: Optional[Dict[str, Any]] = None
 
+    # Allow heatmap loss gradients to flow back through the VLM backbone (LoRA).
+    # When False (default), hooked features are detached and the backbone runs
+    # in inference_mode during heatmap-only training — zero VRAM overhead from
+    # backbone activations.  When True, the computation graph is preserved so
+    # that LoRA parameters receive gradients from the heatmap loss (+4-8 GB).
+    heatmap_trains_backbone: bool = False
+
     # HeatmapVLNLoss weights
     heatmap_lambda_vis: float = 1.0
     heatmap_lambda_coord: float = 1.0
@@ -152,6 +159,7 @@ class VLNPipeline(nn.Module):
             lora_layer_indices=config.lora_layer_indices,
             lora_dropout=config.lora_dropout,
             lora_target_modules=config.lora_target_modules,
+            heatmap_trains_backbone=config.heatmap_trains_backbone,
         )
         self.qwen2_5_vl = Qwen2_5VLIntegration(qwen_config)
         self.vlm_backbone = self.qwen2_5_vl
@@ -333,6 +341,7 @@ class VLNPipeline(nn.Module):
             llm_layer_indices=llm_indices,
             enable_runtime_timing=cfg.enable_runtime_timing,
             trajectory_config=trajectory_config,
+            heatmap_trains_backbone=cfg.heatmap_trains_backbone,
         )
 
         # Move all trainable parts to correct device/dtype

@@ -91,6 +91,7 @@ class Qwen2_5VLConfig:
     lora_layer_indices: Optional[List[int]] = None  # Exact layer indices (overrides lora_num_layers)
     lora_dropout: float = 0.05    # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
+    heatmap_trains_backbone: bool = False  # Allow heatmap loss to backprop through backbone
     gradient_checkpointing: bool = False
     enable_internal_profiling: bool = False
     enable_runtime_timing: bool = False
@@ -842,8 +843,11 @@ class Qwen2_5VLIntegration(nn.Module):
         """Forward a single panoramic sample through one Qwen pass.
 
         When ``return_hidden_states`` is False (heatmap-only training), the
-        Qwen forward is wrapped in ``torch.no_grad()`` to avoid storing
+        Qwen forward is wrapped in ``torch.inference_mode()`` to avoid storing
         intermediate activations for the frozen backbone, saving ~4-8 GB VRAM.
+
+        When ``heatmap_trains_backbone`` is True, the inference_mode wrapper is
+        skipped so that heatmap loss gradients can flow back through the backbone.
         """
         current_views_dict = self._views_tensor_to_dict(current_views)
         history_panoramas_list = self._history_tensor_to_list(history_panoramas)
@@ -859,7 +863,8 @@ class Qwen2_5VLIntegration(nn.Module):
         else:
             raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for single-chain decoding.")
 
-        if return_hidden_states:
+        need_grad = return_hidden_states or self.config.heatmap_trains_backbone
+        if need_grad:
             hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                 inputs, return_hidden_states,
             )
@@ -912,7 +917,8 @@ class Qwen2_5VLIntegration(nn.Module):
             image_grid_thw=inputs.get("image_grid_thw"),
         )
 
-        if return_hidden_states:
+        need_grad = return_hidden_states or self.config.heatmap_trains_backbone
+        if need_grad:
             hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                 inputs, return_hidden_states,
             )
@@ -997,7 +1003,10 @@ class Qwen2_5VLIntegration(nn.Module):
                     inputs["video_grid_thw"][:, 0] = 1
             t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
 
-        if return_hidden_states:
+        need_grad = return_hidden_states or (
+            heatmap_vln is not None and self.config.heatmap_trains_backbone
+        )
+        if need_grad:
             hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
                 inputs, return_hidden_states, latent_queries=latent_queries,
             )

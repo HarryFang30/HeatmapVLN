@@ -67,6 +67,7 @@ def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
         lora_layer_indices=resolved_lora_layers,
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
+        heatmap_trains_backbone=heatmap_cfg.get('heatmap_trains_backbone', False),
 
         enable_action_head=action_cfg.get('enable', True),
 

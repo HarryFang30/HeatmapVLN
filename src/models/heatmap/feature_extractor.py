@@ -52,6 +52,7 @@ class FeatureExtractor:
         vit_layer_indices: List[int],
         llm_layer_indices: Optional[List[int]] = None,
         spatial_merge_size: int = 2,
+        detach_features: bool = True,
     ):
         if llm_layer_indices is None:
             llm_layer_indices = [7, 15, 23]
@@ -61,6 +62,7 @@ class FeatureExtractor:
         self.vit_layer_indices = list(vit_layer_indices)
         self.llm_layer_indices = sorted(llm_layer_indices)
         self.spatial_merge_size = spatial_merge_size
+        self.detach_features = detach_features
         self._handles: list = []
         self._batch_capture_plan = None
         self._captured_batch_vit: Dict[int, List[Dict[int, torch.Tensor]]] = {}
@@ -95,13 +97,16 @@ class FeatureExtractor:
                 )
 
         logger.info(
-            "FeatureExtractor: ViT hooks %s, LLM hooks %s",
-            self.vit_layer_indices, self.llm_layer_indices,
+            "FeatureExtractor: ViT hooks %s, LLM hooks %s, detach=%s",
+            self.vit_layer_indices, self.llm_layer_indices, self.detach_features,
         )
 
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
+
+    def _maybe_detach(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach() if self.detach_features else tensor
 
     def _make_vit_hook(self, idx: int):
         def hook(_module, _input, output):
@@ -109,13 +114,13 @@ class FeatureExtractor:
                 captured = []
                 for view_ranges in self._batch_capture_plan["vit_ranges_batch"]:
                     sample_views = {
-                        view_idx: output[start:end].detach()
+                        view_idx: self._maybe_detach(output[start:end])
                         for view_idx, (start, end) in view_ranges.items()
                     }
                     captured.append(sample_views)
                 self._captured_batch_vit[idx] = captured
             else:
-                self.vit_features[idx] = output.detach()
+                self.vit_features[idx] = self._maybe_detach(output)
         return hook
 
     def _make_llm_hook(self, layer_idx: int):
@@ -125,7 +130,7 @@ class FeatureExtractor:
                 captured = []
                 for batch_idx, image_positions in enumerate(self._batch_capture_plan["image_token_positions_batch"]):
                     sample_views = {
-                        view_idx: hidden[batch_idx, start:end, :].detach()
+                        view_idx: self._maybe_detach(hidden[batch_idx, start:end, :])
                         for view_idx, (start, end) in image_positions.items()
                         if view_idx < 4
                     }
@@ -136,12 +141,12 @@ class FeatureExtractor:
                     self._captured_batch_queries = []
                     for batch_idx, anchors in enumerate(self._batch_capture_plan["text_anchor_positions_batch"]):
                         sample_queries = [
-                            hidden[batch_idx, anchors[hist_idx], :].detach()
+                            self._maybe_detach(hidden[batch_idx, anchors[hist_idx], :])
                             for hist_idx in range(len(anchors))
                         ]
                         self._captured_batch_queries.append(sample_queries)
             else:
-                self.llm_hidden_states[layer_idx] = hidden.detach()
+                self.llm_hidden_states[layer_idx] = self._maybe_detach(hidden)
         return hook
 
     def clear(self):
