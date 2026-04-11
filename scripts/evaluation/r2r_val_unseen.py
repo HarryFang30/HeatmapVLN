@@ -1,6 +1,22 @@
 """
-Standalone evaluation script for InternVLA-N1 on VLN-CE R2R val_unseen.
-Strictly follows the dual_system evaluation logic from HabitatVLNEvaluator._run_eval_dual_system().
+Habitat closed-loop evaluation for VLNPipeline on VLN-CE R2R val_unseen.
+
+Uses the VLNPipeline (Qwen2.5-VL + HeatmapVLN + NextDiT System 1) to
+navigate in the Habitat simulator and collect standard VLN-CE metrics
+(SR, SPL, OS, NE).
+
+Inference flow per high-level step:
+    1. Capture 4 panoramic views (front/right/back/left) via sim state
+    2. Prepare Qwen2.5-VL input from panoramic views + instruction
+    3. Auto-regressive text generation → pixel-goal coordinates or STOP
+    4. If coordinates found:
+       a. Capture lookdown view (2 × LOOKDOWN, then restore)
+       b. generate_latents → traj_hidden_states
+       c. NextDiT get_trajectory → continuous trajectory (dx, dy, dyaw)
+       d. Convert trajectory to discrete Habitat actions
+       e. Execute up to MAX_LOCAL_STEPS actions
+    5. If STOP or no coordinates → end episode
+
 Adapted for habitat-lab 0.1.7 (YACS config).
 """
 
@@ -11,9 +27,11 @@ faulthandler.enable()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+# ═══════════════════════════════════════════════════════════════════════
+# Section 1: Runtime patches (must be before any heavy imports)
+# ═══════════════════════════════════════════════════════════════════════
+
 # Block flash_attn import (GLIBC_2.32 not available on this system)
-# Provide a complete stub so transformers can import without error,
-# but we will use SDPA attention so these functions are never called at runtime.
 import types as _types, importlib as _importlib
 
 def _noop(*a, **kw):
@@ -61,12 +79,12 @@ if not hasattr(np, 'bool'):
     np.bool = np.bool_
 
 # Initialize NVIDIA GL context BEFORE numba/LLVM is loaded.
-# numba's LLVM runtime conflicts with NVIDIA's GLX shader compiler if
-# numba is imported first, causing fatal X11 BadWindow errors.
-# Requires: __GLX_VENDOR_LIBRARY_NAME=nvidia in the environment.
 import habitat_sim as _hsim
 _dummy_cfg = _hsim.SimulatorConfiguration()
-_dummy_cfg.gpu_device_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]) if os.environ.get("CUDA_VISIBLE_DEVICES") else 0
+_dummy_cfg.gpu_device_id = (
+    int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    if os.environ.get("CUDA_VISIBLE_DEVICES") else 0
+)
 _dummy_agent = _hsim.agent.AgentConfiguration()
 _dummy_agent.sensor_specifications = [_hsim.CameraSensorSpec()]
 _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
@@ -84,70 +102,37 @@ class _PatchedDiscrete(_OrigDiscrete):
         super().__init__(n, *args, **kwargs)
 gym.spaces.Discrete = _PatchedDiscrete
 
+# ═══════════════════════════════════════════════════════════════════════
+# Section 2: Imports
+# ═══════════════════════════════════════════════════════════════════════
+
 import argparse
 import copy
-import importlib
-import importlib.util
-import itertools
 import json
-import random
 import re
-from collections import OrderedDict
+import yaml
 from enum import IntEnum
+from pathlib import Path
+from typing import Dict, List, Optional
 
-import cv2
+import quaternion
 import torch
 import tqdm
-from depth_camera_filtering import filter_depth
 from PIL import Image
-from transformers import AutoProcessor
 
 import habitat
 from habitat.config.default import get_config as get_habitat_default_config
 from habitat.config.default import Config as CN
 
-# Directly load modules via file path to avoid triggering __init__.py which imports
-# HabitatVLNEvaluator (incompatible with habitat-lab 0.1.7)
-_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
+from src.models.lora_utils import resolve_lora_layer_indices
+from src.models.heatmap.input_constructor import construct_input
 
-def _load_module_from_file(name, filepath):
-    spec = importlib.util.spec_from_file_location(name, filepath)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-_load_module_from_file("vln_measures",
-    os.path.join(_base_dir, 'internnav', 'habitat_extensions', 'vln', 'measures.py'))
-_utils_mod = _load_module_from_file("vln_utils_ext",
-    os.path.join(_base_dir, 'internnav', 'habitat_extensions', 'vln', 'utils.py'))
-preprocess_depth_image_v2 = _utils_mod.preprocess_depth_image_v2
-
-# Patch build_depthanythingv2 to skip loading separate checkpoint
-# (weights will be loaded from safetensors via from_pretrained)
-import internnav.model.basemodel.internvla_n1.internvla_n1_arch as _arch_mod
-def _patched_build_dav2(config):
-    from internnav.model.encoder.depth_anything.depth_anything_v2.dpt import DepthAnythingV2
-    model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
-    DAv2_model = DepthAnythingV2(**model_configs['vits'])
-    return DAv2_model.pretrained
-_arch_mod.build_depthanythingv2 = _patched_build_dav2
-
-from internnav.model.basemodel.internvla_n1.internvla_n1 import (
-    InternVLAN1ForCausalLM, InternVLAN1ModelConfig,
-)
-from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
-
-from transformers import AutoConfig, AutoModelForCausalLM
-AutoConfig.register("internvla_n1", InternVLAN1ModelConfig)
-AutoModelForCausalLM.register(InternVLAN1ModelConfig, InternVLAN1ForCausalLM)
-
-DEFAULT_IMAGE_TOKEN = "<image>"
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 
 
-class action_code(IntEnum):
+class ActionCode(IntEnum):
     STOP = 0
     FORWARD = 1
     LEFT = 2
@@ -155,6 +140,10 @@ class action_code(IntEnum):
     LOOKUP = 4
     LOOKDOWN = 5
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# Section 3: Habitat config
+# ═══════════════════════════════════════════════════════════════════════
 
 def build_habitat_config(args):
     cfg = get_habitat_default_config()
@@ -194,8 +183,12 @@ def build_habitat_config(args):
     cfg.TASK.TYPE = "VLN-v0"
     cfg.TASK.SUCCESS_DISTANCE = 3.0
     cfg.TASK.SENSORS = ["INSTRUCTION_SENSOR", "GPS_SENSOR", "COMPASS_SENSOR"]
-    cfg.TASK.POSSIBLE_ACTIONS = ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP", "LOOK_DOWN"]
-    cfg.TASK.MEASUREMENTS = ["DISTANCE_TO_GOAL", "SUCCESS", "SPL", "ORACLE_SUCCESS", "ORACLE_NAVIGATION_ERROR"]
+    cfg.TASK.POSSIBLE_ACTIONS = [
+        "STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP", "LOOK_DOWN",
+    ]
+    cfg.TASK.MEASUREMENTS = [
+        "DISTANCE_TO_GOAL", "SUCCESS", "SPL", "ORACLE_SUCCESS", "ORACLE_NAVIGATION_ERROR",
+    ]
 
     cfg.TASK.DISTANCE_TO_GOAL.TYPE = "DistanceToGoal"
     cfg.TASK.DISTANCE_TO_GOAL.DISTANCE_TO = "POINT"
@@ -219,87 +212,321 @@ def build_habitat_config(args):
     return cfg
 
 
-def parse_actions(output, actions2idx):
-    action_patterns = '|'.join(re.escape(action) for action in actions2idx)
-    regex = re.compile(action_patterns)
-    matches = regex.findall(output)
-    actions = [actions2idx[match] for match in matches]
-    actions = itertools.chain.from_iterable(actions)
-    return list(actions)
+# ═══════════════════════════════════════════════════════════════════════
+# Section 4: Panoramic view capture
+# ═══════════════════════════════════════════════════════════════════════
 
+def _yaw_quaternion(angle_rad: float):
+    """Create a quaternion for rotation around Y-axis (up in Habitat)."""
+    half = angle_rad / 2.0
+    return np.quaternion(np.cos(half), 0.0, np.sin(half), 0.0)
+
+
+def capture_panoramic_views(
+    env, image_size: tuple = (256, 256),
+) -> Dict[str, Image.Image]:
+    """Capture 4 directional views by manipulating agent state directly.
+
+    This avoids env.step() calls so the episode step counter and metrics
+    are not affected.  Only the agent's rotation is temporarily changed;
+    position remains the same.
+    """
+    sim = env._sim
+    agent = sim.get_agent(0)
+    orig_state = agent.get_state()
+
+    view_names = ["front", "right", "back", "left"]
+    yaw_offsets = [0.0, -np.pi / 2, -np.pi, -3 * np.pi / 2]
+
+    views: Dict[str, Image.Image] = {}
+    for name, yaw in zip(view_names, yaw_offsets):
+        state = agent.get_state()
+        if yaw != 0.0:
+            state.rotation = orig_state.rotation * _yaw_quaternion(yaw)
+            agent.set_state(state, reset_sensors=True)
+
+        obs = sim.get_sensor_observations()
+        rgb = obs.get("rgba_camera", obs.get("color_sensor", obs.get("rgb")))
+        if isinstance(rgb, np.ndarray):
+            if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                rgb = rgb[:, :, :3]
+            views[name] = Image.fromarray(rgb).convert("RGB").resize(image_size)
+        else:
+            views[name] = Image.fromarray(
+                np.zeros((*image_size[::-1], 3), dtype=np.uint8)
+            )
+
+    agent.set_state(orig_state, reset_sensors=True)
+    return views
+
+
+def capture_lookdown_view(env, image_size: tuple = (224, 224)) -> Image.Image:
+    """Look down 30° (2 × LOOKDOWN), capture RGB, then restore orientation.
+
+    Unlike panoramic capture, this uses env.step() because the model was
+    trained with exactly this procedure and the tilt sensor state must be
+    consistent.
+    """
+    env.step(ActionCode.LOOKDOWN)
+    obs = env.step(ActionCode.LOOKDOWN)
+
+    rgb = obs["rgb"]
+    lookdown_img = Image.fromarray(rgb).convert("RGB").resize(image_size)
+
+    env.step(ActionCode.LOOKUP)
+    env.step(ActionCode.LOOKUP)
+    return lookdown_img
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Section 5: Trajectory → discrete actions conversion
+# ═══════════════════════════════════════════════════════════════════════
+
+def traj_to_actions(
+    dp_actions: torch.Tensor,
+    num_sample_trajs: int = 32,
+    action_scale: float = 4.0,
+) -> List[int]:
+    """Convert NextDiT continuous trajectory to discrete Habitat actions.
+
+    The trajectory represents relative poses (dx, dy, dyaw) scaled by
+    ``action_scale`` during training.  We accumulate these increments and
+    emit discrete FORWARD / LEFT / RIGHT actions when the accumulated
+    change exceeds the corresponding Habitat action magnitude.
+
+    Args:
+        dp_actions: (B * num_sample_trajs, T, 3) trajectory predictions.
+        num_sample_trajs: number of parallel trajectory samples per batch.
+        action_scale: scaling factor used during training.
+
+    Returns:
+        List of discrete action codes (ActionCode values).
+    """
+    trajs = dp_actions[:num_sample_trajs].float()
+    mean_traj = trajs.mean(dim=0).cpu().numpy() / action_scale  # (T, 3)
+
+    forward_step = 0.25   # Habitat FORWARD_STEP_SIZE
+    turn_step = np.deg2rad(15)  # Habitat TURN_ANGLE
+
+    actions: List[int] = []
+    accum_dx = 0.0
+    accum_dyaw = 0.0
+
+    for step in mean_traj:
+        dx, _dy, dyaw = step
+        accum_dx += dx
+        accum_dyaw += dyaw
+
+        if abs(accum_dyaw) >= turn_step * 0.5:
+            if accum_dyaw > 0:
+                actions.append(ActionCode.LEFT)
+                accum_dyaw -= turn_step
+            else:
+                actions.append(ActionCode.RIGHT)
+                accum_dyaw += turn_step
+        elif accum_dx >= forward_step * 0.5:
+            actions.append(ActionCode.FORWARD)
+            accum_dx -= forward_step
+
+    return actions if actions else [ActionCode.STOP]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Section 6: VLM input preparation
+# ═══════════════════════════════════════════════════════════════════════
+
+def _normalize_multimodal_inputs(inputs: Dict[str, torch.Tensor]):
+    """Replicate HeatmapVLN._normalize_multimodal_inputs."""
+    if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+        vgt = inputs["video_grid_thw"]
+        if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
+            inputs["video_grid_thw"] = torch.repeat_interleave(
+                vgt, vgt[:, 0], dim=0,
+            )
+            inputs["video_grid_thw"][:, 0] = 1
+
+
+def prepare_vlm_inputs(
+    processor,
+    current_views: Dict[str, Image.Image],
+    history_panoramas: List[Dict[str, Image.Image]],
+    instruction: str,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Build tokenised Qwen2.5-VL inputs from panoramic observations.
+
+    Uses ``construct_input`` with a dummy ``pixel_goal`` to include the
+    waypoint-coordinate prompt, then strips the teacher-forcing assistant
+    response so the model generates the coordinates autoregressively.
+    """
+    messages = construct_input(
+        current_views=current_views,
+        history_panoramas=history_panoramas,
+        instruction=instruction,
+        pixel_goal=[0, 0],
+    )
+    messages = [m for m in messages if m["role"] != "assistant"]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    _normalize_multimodal_inputs(inputs)
+    return inputs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Section 7: Model building
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_config(config_path: str) -> dict:
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def build_vln_pipeline(cfg: dict, device: str = "cuda:0") -> VLNPipeline:
+    """Build VLNPipeline from YAML config (mirrors scripts/evaluation/general.py)."""
+    model_cfg = cfg["model"]
+    data_cfg = cfg["data"]
+    llm_cfg = model_cfg.get("llm", {})
+    heatmap_cfg = model_cfg.get("heatmap", {})
+    action_cfg = model_cfg.get("action_head", {})
+    nextdit_cfg = action_cfg.get("nextdit", {})
+
+    import logging
+    _logger = logging.getLogger("evaluate")
+    resolved_lora_layers = resolve_lora_layer_indices(
+        llm_cfg, heatmap_cfg, logger=_logger,
+    )
+
+    config = VLNPipelineConfig(
+        llm_model_path=llm_cfg.get("model_path", "./models/internnav_backbone"),
+        llm_backbone_type=llm_cfg.get("backbone_type", "qwen2_5_vl"),
+        llm_hidden_dim=llm_cfg.get("hidden_dim", 3584),
+        llm_token_dim=llm_cfg.get("token_dim", 896),
+        llm_torch_dtype=llm_cfg.get("torch_dtype", "bfloat16"),
+        llm_attn_implementation=llm_cfg.get("attn_implementation", "sdpa"),
+        max_video_frames=llm_cfg.get("max_video_frames", -1),
+        enable_packing=llm_cfg.get("enable_packing", False),
+        max_seq_length=llm_cfg.get("max_seq_length", 8192),
+        spatial_merge_size=llm_cfg.get("spatial_merge_size", 2),
+        internnav_system1_path=nextdit_cfg.get("internnav_system1_path", ""),
+        device=device,
+        enable_heatmap=heatmap_cfg.get("enable", True),
+        heatmap_c_vit=heatmap_cfg.get("c_vit", 1280),
+        heatmap_c_llm=heatmap_cfg.get("c_llm", 3584),
+        heatmap_c_fused=heatmap_cfg.get("c_fused", 256),
+        heatmap_vit_layer_indices=heatmap_cfg.get("vit_layer_indices", [7, 15, 23, 31]),
+        heatmap_llm_layer_indices=heatmap_cfg.get("llm_layer_indices", [6, 13, 20]),
+        heatmap_size=tuple(heatmap_cfg.get("heatmap_size", data_cfg["init_hm_size"])),
+        image_size=heatmap_cfg.get("image_size", data_cfg["image_size"][0]),
+        heatmap_trajectory_config=heatmap_cfg.get("trajectory", None),
+        use_lora=llm_cfg.get("use_lora", False),
+        lora_rank=llm_cfg.get("lora_rank", 16),
+        lora_alpha=llm_cfg.get("lora_alpha", 32),
+        lora_num_layers=llm_cfg.get("lora_num_layers", 4),
+        lora_layer_indices=resolved_lora_layers,
+        lora_dropout=llm_cfg.get("lora_dropout", 0.05),
+        lora_target_modules=llm_cfg.get("lora_target_modules", None),
+        enable_action_head=action_cfg.get("enable", True),
+        nextdit_enabled=nextdit_cfg.get("enabled", False),
+        nextdit_vlm_hidden_dim=nextdit_cfg.get("vlm_hidden_dim", 3584),
+        nextdit_latent_emb_size=nextdit_cfg.get("latent_emb_size", 768),
+        nextdit_n_query=nextdit_cfg.get("n_query", 4),
+        nextdit_dit_dim=nextdit_cfg.get("dit_dim", 384),
+        nextdit_dit_layers=nextdit_cfg.get("dit_layers", 12),
+        nextdit_dit_heads=nextdit_cfg.get("dit_heads", 6),
+        nextdit_dit_kv_heads=nextdit_cfg.get("dit_kv_heads", 6),
+        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get("dit_ffn_dim_multiplier", 2 / 3),
+        nextdit_predict_steps=nextdit_cfg.get("predict_steps", 32),
+        nextdit_action_dim=nextdit_cfg.get("action_dim", 3),
+        nextdit_num_inference_steps=nextdit_cfg.get("num_inference_steps", 10),
+        nextdit_guidance_scale=nextdit_cfg.get("guidance_scale", 1.0),
+        nextdit_num_sample_trajs=nextdit_cfg.get("num_sample_trajs", 32),
+        nextdit_dav2_ckpt_path=nextdit_cfg.get("dav2_ckpt_path", ""),
+        nextdit_enable_gradient_checkpointing=nextdit_cfg.get(
+            "enable_gradient_checkpointing", True,
+        ),
+        verbose=False,
+    )
+    return VLNPipeline(config)
+
+
+def load_model(args, device: torch.device):
+    """Build VLNPipeline, load checkpoint, and initialise HeatmapVLN."""
+    cfg = load_config(args.config)
+    model = build_vln_pipeline(cfg, device=str(device))
+
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state_dict = ckpt.get(
+        "model_state_dict", ckpt.get("trainable_state_dict", ckpt)
+    )
+    if list(state_dict.keys())[0].startswith("module."):
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(
+        f"Checkpoint loaded: {args.checkpoint}  "
+        f"(missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+
+    model = model.to(device)
+    model.eval()
+    model._ensure_heatmap_vln()
+    return model, cfg
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Section 8: Main evaluation loop
+# ═══════════════════════════════════════════════════════════════════════
 
 def run_eval(args):
     device = torch.device(f"cuda:{args.gpu_id}")
 
-    hab_cfg = build_habitat_config(args)
+    print(f"Loading model from config={args.config}, checkpoint={args.checkpoint}")
+    model, train_cfg = load_model(args, device)
+    processor = model.qwen2_5_vl.processor
 
-    print(f"Loading model from {args.model_path} ...")
-    processor = AutoProcessor.from_pretrained(args.model_path)
-    processor.tokenizer.padding_side = 'left'
-
-    model = InternVLAN1ForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-        device_map={"": device},
+    action_scale = (
+        train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
     )
-    model.eval()
-    print("Model loaded successfully.")
+    num_sample_trajs = (
+        train_cfg.get("model", {})
+        .get("action_head", {})
+        .get("nextdit", {})
+        .get("num_sample_trajs", 32)
+    )
+    has_nextdit = model.nextdit_action_head is not None and model.latent_queries is not None
+    print(f"NextDiT action head available: {has_nextdit}")
+    print(f"  action_scale={action_scale}, num_sample_trajs={num_sample_trajs}")
 
+    hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
     env = habitat.Env(config=hab_cfg)
-    all_episodes = list(env.episodes)
-    num_episodes = len(all_episodes)
+    num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
-    min_depth = hab_cfg.SIMULATOR.DEPTH_SENSOR.MIN_DEPTH
-    max_depth = hab_cfg.SIMULATOR.DEPTH_SENSOR.MAX_DEPTH
-
-    resize_w = args.resize_w
-    resize_h = args.resize_h
+    image_size = tuple(train_cfg["data"]["image_size"])  # (256, 256)
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
 
-    prompt_template = (
-        "You are an autonomous navigation assistant. Your task is to <instruction>. "
-        "Where should you go next to stay on track? Please output the next waypoint's "
-        "coordinates in the image. Please output STOP when you have successfully completed the task."
-    )
-    conversation = [{"from": "human", "value": prompt_template}, {"from": "gpt", "value": ""}]
-
-    conjunctions = [
-        'you can see ',
-        'in front of you is ',
-        'there is ',
-        'you can spot ',
-        'you are toward the ',
-        'ahead of you is ',
-        'in your sight is ',
-    ]
-
-    actions2idx = OrderedDict(
-        {
-            'STOP': [0],
-            "↑": [1],
-            "←": [2],
-            "→": [3],
-            "↓": [5],
-        }
-    )
-
+    # ── Resume support ──
     sucs, spls, oss, nes = [], [], [], []
-    done_set = set()
+    done_set: set = set()
     output_path = args.output_path
     os.makedirs(output_path, exist_ok=True)
-    progress_file = os.path.join(output_path, 'progress.json')
+    progress_file = os.path.join(output_path, "progress.json")
     if os.path.exists(progress_file):
-        with open(progress_file, 'r') as f:
+        with open(progress_file, "r") as f:
             for line in f:
                 res = json.loads(line)
-                sucs.append(res['success'])
-                spls.append(res['spl'])
-                oss.append(res['os'])
-                nes.append(res['ne'])
+                sucs.append(res["success"])
+                spls.append(res["spl"])
+                oss.append(res["os"])
+                nes.append(res["ne"])
                 if "scene_id" in res:
                     done_set.add((res["scene_id"], res["episode_id"]))
 
@@ -307,13 +534,14 @@ def run_eval(args):
     print(f"Episodes already done: {len(done_set)}, remaining: {remaining}")
 
     process_bar = tqdm.tqdm(total=remaining, desc="Evaluating")
-    seen_episodes = set()
+    seen_episodes: set = set()
     eval_count = 0
 
+    # ── Episode loop (iterator-driven, see ReadBeforeEvaluatingHabitat.md §16) ──
     while True:
         observations = env.reset()
         episode = env.current_episode
-        scene_id = episode.scene_id.split('/')[-2]
+        scene_id = episode.scene_id.split("/")[-2]
         episode_id = int(episode.episode_id)
         ep_key = (scene_id, episode_id)
 
@@ -324,242 +552,186 @@ def run_eval(args):
         if ep_key in done_set:
             continue
 
-        episode_instruction = episode.instruction.instruction_text
+        instruction = episode.instruction.instruction_text
         eval_count += 1
-        print(f"\n[{eval_count}/{remaining}] Episode {scene_id}_{episode_id:04d}: {episode_instruction[:80]}...")
+        print(
+            f"\n[{eval_count}/{remaining}] Episode {scene_id}_{episode_id:04d}: "
+            f"{instruction[:80]}..."
+        )
 
-        rgb_list = []
-        action_seq = []
-        input_images = []
-        output_ids = None
-        llm_outputs = ""
-        action = None
-        messages = []
-        local_actions = []
-
-        done = False
-        pixel_goal = None
+        # ── Per-episode state ──
+        history_panoramas: List[Dict[str, Image.Image]] = []
+        pix_goal_image: Optional[torch.Tensor] = None
+        _last_traj_hs: Optional[torch.Tensor] = None
+        local_actions: List[int] = []
+        forward_action_count = 0
         step_id = 0
+        done = False
 
         while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
-            print(f'  [loop] step_id={step_id}, action={action}, pixel_goal={pixel_goal}, action_seq={action_seq}', flush=True)
-            rgb = observations["rgb"]
-            depth = observations["depth"]
-            depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
-            depth = depth * (max_depth - min_depth) + min_depth
-            depth = depth * 1000
 
-            image = Image.fromarray(rgb).convert('RGB')
+            # ── If there are queued local actions, execute them ──
+            if local_actions:
+                action = local_actions.pop(0)
+                forward_action_count += 1
 
-            if action == action_code.LOOKDOWN:
-                look_down_image = image
-                look_down_depth, _ = preprocess_depth_image_v2(
-                    Image.fromarray(depth.astype(np.uint16), mode='I;16'),
-                    do_depth_scale=True, depth_scale=1000,
-                    target_height=224, target_width=224,
-                )
-                look_down_depth = torch.as_tensor(np.ascontiguousarray(look_down_depth)).float()
-                look_down_depth[look_down_depth > 5.0] = 5.0
-            else:
-                image = image.resize((resize_w, resize_h))
-                rgb_list.append(image)
-
-                down_observations = env.step(action_code.LOOKDOWN)
-                down_observations = env.step(action_code.LOOKDOWN)
-
-                look_down_image = Image.fromarray(down_observations["rgb"]).convert('RGB')
-                depth = down_observations["depth"]
-                depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
-                depth = depth * (max_depth - min_depth) + min_depth
-                depth = depth * 1000
-                look_down_depth, _ = preprocess_depth_image_v2(
-                    Image.fromarray(depth.astype(np.uint16), mode='I;16'),
-                    do_depth_scale=True, depth_scale=1000,
-                    target_height=224, target_width=224,
-                )
-                look_down_depth = torch.as_tensor(np.ascontiguousarray(look_down_depth)).float()
-                look_down_depth[look_down_depth > 5.0] = 5.0
-
-                env.step(action_code.LOOKUP)
-                env.step(action_code.LOOKUP)
-
-            if len(action_seq) == 0 and pixel_goal is None:
-                if action == action_code.LOOKDOWN:
-                    sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
-                    input_images += [look_down_image]
-                    messages.append(
-                        {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}
-                    )
-                    input_img_id = -1
-                else:
-                    sources = copy.deepcopy(conversation)
-                    sources[0]["value"] = sources[0]["value"].replace(
-                        '<instruction>.', episode.instruction.instruction_text[:-1]
-                    )
-                    cur_images = rgb_list[-1:]
-                    if step_id == 0:
-                        history_id = []
-                    else:
-                        history_id = np.unique(
-                            np.linspace(0, step_id - 1, num_history, dtype=np.int32)
-                        ).tolist()
-                        placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
-                        sources[0]["value"] += f' These are your historical observations: {placeholder}.'
-
-                    history_id = sorted(history_id)
-                    input_images = [rgb_list[i] for i in history_id] + cur_images
-                    input_img_id = 0
-
-                prompt = random.choice(conjunctions) + DEFAULT_IMAGE_TOKEN
-                sources[0]["value"] += f" {prompt}."
-                prompt_instruction = copy.deepcopy(sources[0]["value"])
-                parts = split_and_clean(prompt_instruction)
-
-                content = []
-                for i in range(len(parts)):
-                    if parts[i] == "<image>":
-                        content.append({"type": "image", "image": input_images[input_img_id]})
-                        input_img_id += 1
-                    else:
-                        content.append({"type": "text", "text": parts[i]})
-
-                messages.append({'role': 'user', 'content': content})
-
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                print(f'  [debug] processing inputs, num_images={len(input_images)}', flush=True)
-                inputs = processor(text=[text], images=input_images, return_tensors="pt").to(device)
-                print(f'  [debug] input_ids shape={inputs.input_ids.shape}, calling model.generate ...', flush=True)
-
-                with torch.no_grad():
-                    output_ids = model.generate(
-                        **inputs,
-                        max_new_tokens=128,
-                        do_sample=False,
-                        use_cache=True,
-                        past_key_values=None,
-                        return_dict_in_generate=True,
-                    ).sequences
-                print(f'  [debug] model.generate done', flush=True)
-
-                llm_outputs = processor.tokenizer.decode(
-                    output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
-                )
-                print(f'  step_id: {step_id}, output: {llm_outputs}')
-
-                if bool(re.search(r'\d', llm_outputs)):
-                    forward_action = 0
-                    coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
-                    pixel_goal = [int(coord[1]), int(coord[0])]
-
-                    env.step(action_code.LOOKUP)
-                    env.step(action_code.LOOKUP)
-
+                if forward_action_count > MAX_STEPS:
+                    pix_goal_image = None
                     local_actions = []
-                    pixel_values = inputs.pixel_values
-                    image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-
-                    print(f'  [debug] calling generate_latents ...', flush=True)
-                    with torch.no_grad():
-                        traj_latents = model.generate_latents(output_ids, pixel_values, image_grid_thw)
-                    print(f'  [debug] generate_latents done', flush=True)
-
-                    image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
-                    pix_goal_image = copy.copy(image_dp)
-                    images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(device)
-                    depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
-                    pix_goal_depth = copy.copy(depth_dp)
-                    depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(device)
-
-                    print(f'  [debug] calling generate_traj ...', flush=True)
-                    with torch.no_grad():
-                        dp_actions = model.generate_traj(traj_latents, images_dp, depths_dp)
-                    print(f'  [debug] generate_traj done, dp_actions={dp_actions}', flush=True)
-
-                    action_list = traj_to_actions(dp_actions)
-                    if len(action_list) < MAX_STEPS:
-                        action_list += [0] * (MAX_STEPS - len(action_list))
-
-                    local_actions = action_list
-                    if len(local_actions) >= MAX_LOCAL_STEPS:
-                        local_actions = local_actions[:MAX_LOCAL_STEPS]
-
-                    action = local_actions[0]
-                    if action == action_code.STOP:
-                        pixel_goal = None
-                        output_ids = None
-                        action = action_code.LEFT
-                        observations = env.step(action)
-                        step_id += 1
-                        done = env.episode_over
-                        messages = []
-                        continue
-                    print(f'  predicted goal {pixel_goal}')
-
-                else:
-                    action_seq = parse_actions(llm_outputs, actions2idx)
-                    print(f'  actions {action_seq}')
-
-            if len(action_seq) != 0:
-                action = action_seq[0]
-                action_seq.pop(0)
-            elif pixel_goal is not None:
-                if len(local_actions) == 0:
-                    local_actions = []
-                    image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
-                    images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(device)
-                    depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
-                    depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(device)
-
-                    with torch.no_grad():
-                        dp_actions = model.generate_traj(traj_latents, images_dp, depths_dp)
-
-                    action_list = traj_to_actions(dp_actions)
-                    if len(action_list) < MAX_STEPS:
-                        action_list += [0] * (MAX_STEPS - len(action_list))
-
-                    local_actions = action_list
-                    if len(local_actions) >= MAX_LOCAL_STEPS:
-                        local_actions = local_actions[:MAX_LOCAL_STEPS]
-                    action = local_actions.pop(0)
-                else:
-                    action = local_actions.pop(0)
-
-                forward_action += 1
-                if forward_action > MAX_STEPS:
-                    pixel_goal = None
-                    output_ids = None
-                    messages = []
+                    forward_action_count = 0
                     step_id += 1
-                    forward_action = 0
-                    local_actions = []
                     continue
-                if action == action_code.STOP:
-                    pixel_goal = None
-                    output_ids = None
-                    messages = []
-                    step_id += 1
-                    forward_action = 0
-                    local_actions = []
-                    continue
-            else:
-                action = 0
 
-            if action == action_code.LOOKDOWN:
-                env.step(action)
-                observations = env.step(action)
-                done = env.episode_over
-            else:
+                if action == ActionCode.STOP:
+                    pix_goal_image = None
+                    local_actions = []
+                    forward_action_count = 0
+                    step_id += 1
+                    continue
+
                 observations = env.step(action)
                 done = env.episode_over
                 step_id += 1
-                messages = []
+                continue
 
+            # ── If pixel_goal is active but local_actions exhausted → re-predict ──
+            if pix_goal_image is not None:
+                lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
+                lookdown_t = (
+                    torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
+                )
+                traj_images = (
+                    torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
+                )
+
+                with torch.no_grad():
+                    trajectory = model.nextdit_action_head.get_trajectory(
+                        _last_traj_hs, traj_images=traj_images,
+                    )
+                local_actions = traj_to_actions(
+                    trajectory, num_sample_trajs=num_sample_trajs,
+                    action_scale=action_scale,
+                )
+                if len(local_actions) >= MAX_LOCAL_STEPS:
+                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+                continue
+
+            # ── High-level step: VLM inference ──
+            print(
+                f"  [step_id={step_id}] Capturing panoramic views + VLM inference ...",
+                flush=True,
+            )
+
+            current_views = capture_panoramic_views(env, image_size=image_size)
+            inputs = prepare_vlm_inputs(
+                processor, current_views, history_panoramas, instruction, device,
+            )
+
+            print(
+                f"  [debug] input_ids shape={inputs['input_ids'].shape}, "
+                f"calling model.generate ...",
+                flush=True,
+            )
+            with torch.no_grad():
+                output_ids = model.qwen2_5_vl.model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    use_cache=True,
+                    return_dict_in_generate=True,
+                ).sequences
+
+            llm_output = processor.tokenizer.decode(
+                output_ids[0][inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True,
+            )
+            print(f"  step_id: {step_id}, VLM output: {llm_output}")
+
+            # ── Parse output: coordinates or STOP ──
+            if has_nextdit and bool(re.search(r"\d", llm_output)):
+                coord = [int(c) for c in re.findall(r"\d+", llm_output)]
+                if len(coord) >= 2:
+                    pixel_goal = [int(coord[1]), int(coord[0])]
+                    print(f"  predicted pixel_goal {pixel_goal}")
+                else:
+                    observations = env.step(ActionCode.LEFT)
+                    step_id += 1
+                    done = env.episode_over
+                    history_panoramas.append(current_views)
+                    continue
+
+                lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
+                lookdown_t = (
+                    torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
+                )
+                pix_goal_image = lookdown_t.clone()
+                traj_images = (
+                    torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
+                )
+
+                print("  [debug] calling generate_latents ...", flush=True)
+                lq = model.latent_queries.expand(1, -1, -1).to(
+                    device=device, dtype=model.config.dtype,
+                )
+                with torch.no_grad():
+                    _last_traj_hs = model.qwen2_5_vl.generate_latents(
+                        output_ids=output_ids,
+                        pixel_values=inputs.get("pixel_values"),
+                        image_grid_thw=inputs.get("image_grid_thw"),
+                        latent_queries=lq,
+                    )
+
+                print("  [debug] calling get_trajectory ...", flush=True)
+                with torch.no_grad():
+                    trajectory = model.nextdit_action_head.get_trajectory(
+                        _last_traj_hs, traj_images=traj_images,
+                    )
+                print(
+                    f"  [debug] trajectory shape={trajectory.shape}",
+                    flush=True,
+                )
+
+                local_actions = traj_to_actions(
+                    trajectory, num_sample_trajs=num_sample_trajs,
+                    action_scale=action_scale,
+                )
+                if len(local_actions) >= MAX_LOCAL_STEPS:
+                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+                forward_action_count = 0
+
+                first_action = local_actions.pop(0) if local_actions else ActionCode.STOP
+                if first_action == ActionCode.STOP:
+                    pix_goal_image = None
+                    local_actions = []
+                    observations = env.step(ActionCode.LEFT)
+                    step_id += 1
+                    done = env.episode_over
+                else:
+                    observations = env.step(first_action)
+                    step_id += 1
+                    forward_action_count += 1
+                    done = env.episode_over
+            else:
+                observations = env.step(ActionCode.STOP)
+                done = True
+
+            # ── Update history ──
+            history_panoramas.append(current_views)
+            if len(history_panoramas) > num_history:
+                indices = np.unique(
+                    np.linspace(
+                        0, len(history_panoramas) - 1, num_history, dtype=np.int32,
+                    )
+                ).tolist()
+                history_panoramas = [history_panoramas[i] for i in indices]
+
+        # ── Collect metrics ──
         metrics = env.get_metrics()
-        sucs.append(metrics['success'])
-        spls.append(metrics['spl'])
-        oss.append(metrics['oracle_success'])
-        nes.append(metrics['distance_to_goal'])
+        sucs.append(metrics["success"])
+        spls.append(metrics["spl"])
+        oss.append(metrics["oracle_success"])
+        nes.append(metrics["distance_to_goal"])
 
         print(
             f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
@@ -571,12 +743,12 @@ def run_eval(args):
             "episode_id": episode_id,
             "success": metrics["success"],
             "spl": metrics["spl"],
-            "os": metrics['oracle_success'],
+            "os": metrics["oracle_success"],
             "ne": metrics["distance_to_goal"],
             "steps": step_id,
-            "episode_instruction": episode_instruction,
+            "episode_instruction": instruction,
         }
-        with open(progress_file, 'a') as f:
+        with open(progress_file, "a") as f:
             f.write(json.dumps(result) + "\n")
 
         done_set.add(ep_key)
@@ -587,12 +759,12 @@ def run_eval(args):
 
     env.close()
 
+    # ── Aggregate results ──
     if len(sucs) > 0:
         sucs_t = torch.tensor(sucs)
         spls_t = torch.tensor(spls)
         oss_t = torch.tensor(oss)
         nes_t = torch.tensor(nes)
-
         torch.nan_to_num(spls_t, nan=0.0, posinf=0.0, neginf=0.0, out=spls_t)
         nes_finite = nes_t[torch.isfinite(nes_t)]
 
@@ -615,25 +787,31 @@ def run_eval(args):
     print(f"  Total episodes:          {final_result['total_episodes']}")
     print("=" * 60)
 
-    with open(os.path.join(output_path, 'result.json'), 'w') as f:
+    with open(os.path.join(output_path, "result.json"), "w") as f:
         json.dump(final_result, f, indent=2)
     print(f"Results saved to {os.path.join(output_path, 'result.json')}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Section 9: CLI
+# ═══════════════════════════════════════════════════════════════════════
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate InternVLA-N1 on VLN-CE R2R val_unseen")
-    parser.add_argument("--model_path", type=str, default="/workspace/InternNav_Model")
+    parser = argparse.ArgumentParser(
+        description="Evaluate VLNPipeline on VLN-CE R2R val_unseen (Habitat closed-loop)"
+    )
+    parser.add_argument("--config", type=str, required=True,
+                        help="YAML config used for training (e.g. configs/train_config_internnav.yaml)")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Model checkpoint path (.pth)")
     parser.add_argument("--scenes_dir", type=str, default="data/scene_data/mp3d_ce")
     parser.add_argument("--data_path", type=str,
                         default="data/vln_ce/raw_data/r2r/{split}/{split}.json.gz")
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
     parser.add_argument("--gpu_id", type=int, default=0)
-    parser.add_argument("--resize_w", type=int, default=384)
-    parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
     args = parser.parse_args()
-
     run_eval(args)
 
 

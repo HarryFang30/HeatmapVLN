@@ -5,7 +5,7 @@ Unified evaluation entrypoint.
 Usage examples:
     python scripts/evaluate.py --config configs/train_config_internnav.yaml --checkpoint /path/to/ckpt --split val_unseen
     python scripts/evaluate.py heatmap --config configs/train_heatmap_config.yaml --checkpoint /path/to/ckpt
-    python scripts/evaluate.py r2r --model_path /workspace/InternNav_Model --gpu_id 0 --output_path ./logs/eval_r2r_val_unseen
+    python scripts/evaluate.py r2r --config configs/train_config_internnav.yaml --checkpoint /path/to/best.pth --gpu_id 0
 """
 
 from __future__ import annotations
