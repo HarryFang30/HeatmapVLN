@@ -71,7 +71,7 @@ data:
     # Token 数量: (num_history+1) × 4 views × ~81 tokens ≈ 2600
     # 较前视频方案增加约 3x 视觉 token，需减少 num_history 或 batch_size
     min_history: 5
-    num_history_sample: 5
+    num_history_sample: 8
     panoramic_vlm_input: true
     load_depth: true
     cache_poses: true
