@@ -127,6 +127,7 @@ from habitat.config.default import Config as CN
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.models.heatmap.input_constructor import construct_input
+from src.data.vln_sliding_window_dataset import compute_history_rel_poses
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -213,7 +214,28 @@ def build_habitat_config(args):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 4: Panoramic view capture
+# Section 4: Agent pose tracking
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_agent_cam2world(env) -> np.ndarray:
+    """Extract a 4x4 camera-to-world matrix from the Habitat agent state.
+
+    Habitat convention: Y-up, agent faces -Z.
+    The returned matrix matches the format used by the training data
+    (``compute_history_rel_poses`` / ``get_trajectory_relative_to_frame``).
+    """
+    sim = env._sim
+    agent = sim.get_agent(0)
+    state = agent.get_state()
+    rot_mat = quaternion.as_rotation_matrix(state.rotation)  # 3×3
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = rot_mat
+    T[:3, 3] = state.position
+    return T
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Section 5: Panoramic view capture
 # ═══════════════════════════════════════════════════════════════════════
 
 def _yaw_quaternion(angle_rad: float):
@@ -279,7 +301,7 @@ def capture_lookdown_view(env, image_size: tuple = (224, 224)) -> Image.Image:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 5: Trajectory → discrete actions conversion
+# Section 6: Trajectory → discrete actions conversion
 # ═══════════════════════════════════════════════════════════════════════
 
 def traj_to_actions(
@@ -332,7 +354,7 @@ def traj_to_actions(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 6: VLM input preparation
+# Section 7: VLM input preparation
 # ═══════════════════════════════════════════════════════════════════════
 
 def _normalize_multimodal_inputs(inputs: Dict[str, torch.Tensor]):
@@ -380,7 +402,7 @@ def prepare_vlm_inputs(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 7: Model building
+# Section 8: Model building
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_config(config_path: str) -> dict:
@@ -480,7 +502,7 @@ def load_model(args, device: torch.device):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 8: Main evaluation loop
+# Section 9: Main evaluation loop
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_eval(args):
@@ -561,6 +583,7 @@ def run_eval(args):
 
         # ── Per-episode state ──
         history_panoramas: List[Dict[str, Image.Image]] = []
+        history_poses: List[np.ndarray] = []  # 4×4 cam2world at each panoramic capture
         pix_goal_image: Optional[torch.Tensor] = None
         _last_traj_hs: Optional[torch.Tensor] = None
         local_actions: List[int] = []
@@ -624,9 +647,74 @@ def run_eval(args):
             )
 
             current_views = capture_panoramic_views(env, image_size=image_size)
+            current_pose = get_agent_cam2world(env)
+
+            # Compute relative poses for TrajectoryGuidedAttention
+            if history_poses:
+                rel_poses_np = compute_history_rel_poses(history_poses, current_pose)
+                history_rel_poses = (
+                    torch.from_numpy(rel_poses_np).float().unsqueeze(0).to(device)
+                )  # (1, N, 4)
+            else:
+                history_rel_poses = None
+
             inputs = prepare_vlm_inputs(
                 processor, current_views, history_panoramas, instruction, device,
             )
+
+            # ── Optional heatmap forward: feed history_rel_poses to the
+            #    TrajectoryGuidedAttention coarse localisation head.
+            #    This runs one non-generative VLM pass with heatmap hooks so
+            #    that the model's spatial understanding is exercised. ──
+            if history_rel_poses is not None and model.heatmap_vln is not None:
+                try:
+                    hm_inputs, n_hist_list = model.heatmap_vln.prepare_qwen_inputs_batch(
+                        current_views=current_views,
+                        history_panoramas=[history_panoramas],
+                        instruction=[instruction],
+                        device=device,
+                    )
+                    model.heatmap_vln.feat_extractor.clear()
+                    from src.models.heatmap.input_constructor import find_text_anchor_positions
+                    img_pos_batch = [
+                        model.heatmap_vln._find_image_positions_from_ids(
+                            hm_inputs["input_ids"][b]
+                        )
+                        for b in range(hm_inputs["input_ids"].shape[0])
+                    ]
+                    txt_anc_batch = [
+                        find_text_anchor_positions(
+                            hm_inputs["input_ids"][b:b + 1],
+                            model.heatmap_vln.processor.tokenizer,
+                            num_history=n_hist_list[b],
+                        )
+                        for b in range(hm_inputs["input_ids"].shape[0])
+                    ]
+                    model.heatmap_vln.feat_extractor.prepare_batch_capture(
+                        image_token_positions_batch=img_pos_batch,
+                        text_anchor_positions_batch=txt_anc_batch,
+                        image_grid_thw=hm_inputs.get("image_grid_thw"),
+                    )
+                    with torch.inference_mode():
+                        model.qwen2_5_vl.model(
+                            **hm_inputs,
+                            output_hidden_states=False,
+                            return_dict=True,
+                        )
+                    heatmap_output = model.heatmap_vln.decode_from_inputs_batch(
+                        hm_inputs, n_hist_list,
+                        image_positions_batch=img_pos_batch,
+                        text_anchors_batch=txt_anc_batch,
+                        history_rel_poses=history_rel_poses,
+                    )
+                    print(
+                        f"  [heatmap] visibility shape="
+                        f"{heatmap_output['visibility'].shape}, "
+                        f"heatmaps shape={heatmap_output['heatmaps'].shape}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"  [heatmap] skipped: {e}", flush=True)
 
             print(
                 f"  [debug] input_ids shape={inputs['input_ids'].shape}, "
@@ -716,8 +804,9 @@ def run_eval(args):
                 observations = env.step(ActionCode.STOP)
                 done = True
 
-            # ── Update history ──
+            # ── Update history (panoramic views + agent poses) ──
             history_panoramas.append(current_views)
+            history_poses.append(current_pose)
             if len(history_panoramas) > num_history:
                 indices = np.unique(
                     np.linspace(
@@ -725,6 +814,7 @@ def run_eval(args):
                     )
                 ).tolist()
                 history_panoramas = [history_panoramas[i] for i in indices]
+                history_poses = [history_poses[i] for i in indices]
 
         # ── Collect metrics ──
         metrics = env.get_metrics()
@@ -793,7 +883,7 @@ def run_eval(args):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 9: CLI
+# Section 10: CLI
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
