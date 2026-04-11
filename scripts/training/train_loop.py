@@ -3,6 +3,7 @@ Core training loop: ``train_one_epoch``.
 """
 
 import gc
+import re
 import sys
 import time
 import logging
@@ -345,6 +346,11 @@ def train_one_epoch(
                 if trainable_params:
                     torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
                 optimizer.step()
+            _next_step = global_step + 1
+            if tb_writer is not None and _next_step % diag_interval == 0:
+                _cached_lora_grads = _collect_lora_grad_norms(model_module)
+            else:
+                _cached_lora_grads = None
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             if ema is not None:
@@ -468,6 +474,10 @@ def train_one_epoch(
                     _log_heatmap_diagnostics(
                         output, gt_heatmap, batch, tb_writer, actual_step,
                         cfg, logger,
+                    )
+                    _log_lora_diagnostics(
+                        model_module, tb_writer, actual_step, cfg, logger,
+                        cached_grad_norms=_cached_lora_grads,
                     )
 
         vis_interval = cfg['log'].get('vis_every_steps', 500)
@@ -637,6 +647,152 @@ def train_one_epoch(
         'trajectory_loss': (totals[2] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
     }
+
+
+# ---------------------------------------------------------------------------
+# Internal: LoRA diagnostics logged to TensorBoard
+# ---------------------------------------------------------------------------
+
+_LORA_PARAM_RE = re.compile(r'layers\.(\d+)\..*?(\w+_proj)\.lora_([AB])\.')
+
+
+def _collect_lora_grad_norms(model_module) -> Optional[Dict]:
+    """Snapshot LoRA gradient norms before optimizer.zero_grad() destroys them.
+
+    Returns ``{(layer_idx, module, 'A'|'B'): float}`` or *None* when no
+    LoRA parameters carry gradients.
+    """
+    qwen_model = getattr(
+        getattr(model_module, 'qwen2_5_vl', None), 'model', None,
+    )
+    if qwen_model is None:
+        return None
+
+    grad_norms: Dict[Tuple[int, str, str], float] = {}
+    for name, param in qwen_model.named_parameters():
+        m = _LORA_PARAM_RE.search(name)
+        if m and param.grad is not None:
+            key = (int(m.group(1)), m.group(2), m.group(3))
+            grad_norms[key] = param.grad.float().norm().item()
+
+    return grad_norms or None
+
+
+def _log_lora_diagnostics(
+    model_module,
+    tb_writer: SummaryWriter,
+    actual_step: int,
+    cfg: Dict,
+    logger,
+    cached_grad_norms: Optional[Dict] = None,
+):
+    """Log LoRA weight norms, gradient norms, and delta_W to TensorBoard.
+
+    Metrics written
+    ---------------
+    lora/B_norm_layer{L}        per-layer ||B||_F  (movement from init)
+    lora/deltaW_layer{L}        per-layer (alpha/r)||BA||_F  (effective weight change)
+    lora/grad_norm_layer{L}     per-layer gradient Frobenius norm (from cache)
+    lora/grad_decay_L20_vs_L5   ratio of layer-20 / layer-5 gradient norms
+    lora/total_B_norm           aggregate across all layers
+    lora/total_deltaW_norm      aggregate across all layers
+    lora/total_grad_norm        aggregate across all layers
+    lora_detail/...             per-(layer, module) breakdown
+    """
+    qwen_model = getattr(
+        getattr(model_module, 'qwen2_5_vl', None), 'model', None,
+    )
+    if qwen_model is None:
+        return
+
+    lora_params: Dict[Tuple[int, str, str], torch.nn.Parameter] = {}
+    for name, param in qwen_model.named_parameters():
+        m = _LORA_PARAM_RE.search(name)
+        if m:
+            lora_params[(int(m.group(1)), m.group(2), m.group(3))] = param
+
+    if not lora_params:
+        return
+
+    lora_rank = cfg['model'].get('llm', {}).get('lora_rank', 16)
+    lora_alpha = cfg['model'].get('llm', {}).get('lora_alpha', 32)
+    scaling = lora_alpha / lora_rank
+
+    layers = sorted({k[0] for k in lora_params})
+    modules = sorted({k[1] for k in lora_params})
+
+    total_B_sq = 0.0
+    total_dW_sq = 0.0
+    total_grad_sq = 0.0
+
+    for layer_idx in layers:
+        layer_B_sq = 0.0
+        layer_grad_sq = 0.0
+        layer_dW_sq = 0.0
+
+        for module in modules:
+            A = lora_params.get((layer_idx, module, 'A'))
+            B = lora_params.get((layer_idx, module, 'B'))
+            if A is None or B is None:
+                continue
+
+            B_norm = B.data.float().norm().item()
+            layer_B_sq += B_norm ** 2
+
+            with torch.no_grad():
+                dW_norm = (B.data.float() @ A.data.float()).norm().item() * scaling
+            layer_dW_sq += dW_norm ** 2
+
+            tb_writer.add_scalar(
+                f'lora_detail/B_norm_L{layer_idx}_{module}', B_norm, actual_step,
+            )
+            tb_writer.add_scalar(
+                f'lora_detail/deltaW_L{layer_idx}_{module}', dW_norm, actual_step,
+            )
+
+            if cached_grad_norms:
+                for ab in ('A', 'B'):
+                    gn = cached_grad_norms.get((layer_idx, module, ab), 0.0)
+                    if gn > 0:
+                        tb_writer.add_scalar(
+                            f'lora_detail/grad_{ab}_L{layer_idx}_{module}',
+                            gn, actual_step,
+                        )
+                        if ab == 'B':
+                            layer_grad_sq += gn ** 2
+
+        layer_B = layer_B_sq ** 0.5
+        layer_grad = layer_grad_sq ** 0.5
+        layer_dW = layer_dW_sq ** 0.5
+
+        tb_writer.add_scalar(f'lora/B_norm_layer{layer_idx}', layer_B, actual_step)
+        tb_writer.add_scalar(f'lora/deltaW_layer{layer_idx}', layer_dW, actual_step)
+        tb_writer.add_scalar(f'lora/grad_norm_layer{layer_idx}', layer_grad, actual_step)
+
+        total_B_sq += layer_B_sq
+        total_dW_sq += layer_dW_sq
+        total_grad_sq += layer_grad_sq
+
+    tb_writer.add_scalar('lora/total_B_norm', total_B_sq ** 0.5, actual_step)
+    tb_writer.add_scalar('lora/total_deltaW_norm', total_dW_sq ** 0.5, actual_step)
+    tb_writer.add_scalar('lora/total_grad_norm', total_grad_sq ** 0.5, actual_step)
+
+    # Layer 20 vs Layer 5 gradient decay ratio
+    if cached_grad_norms:
+        g20_sq = sum(cached_grad_norms.get((20, m, 'B'), 0.0) ** 2 for m in modules)
+        g5_sq = sum(cached_grad_norms.get((5, m, 'B'), 0.0) ** 2 for m in modules)
+        g20, g5 = g20_sq ** 0.5, g5_sq ** 0.5
+        tb_writer.add_scalar('lora/grad_L20', g20, actual_step)
+        tb_writer.add_scalar('lora/grad_L5', g5, actual_step)
+        if g5 > 1e-12:
+            tb_writer.add_scalar('lora/grad_decay_L20_vs_L5', g20 / g5, actual_step)
+
+    total_dW = total_dW_sq ** 0.5
+    if total_dW < 1e-7 and actual_step > 100:
+        logger.warning(
+            f"[LoRA-DIAG] ⚠️ ||delta_W||_F = {total_dW:.2e} < 1e-7, "
+            f"LoRA signal may be too weak!"
+        )
 
 
 # ---------------------------------------------------------------------------
