@@ -11,9 +11,14 @@ seed: 42
 #     → cond_projector 需重新学习投影
 #     → traj_cond 分布变化 → traj_dit 需适配新条件 + R2R 轨迹分布
 #
-#   不变链:
+#   不变链 (System 1 输入不变):
 #     traj_images(前视图) → DINOv2(冻结) → memory_encoder → rgb_resampler
 #     → 输入完全不变，无需训练 (~26M 参数省下)
+#
+#   VLM 输入:
+#     panoramic_vlm_input=true → 4 张全景图 (与 Stage 1 heatmap 一致)
+#     pixel_goal 坐标 = 前视图像素坐标 (prompt 明确指定 "前视图中的像素坐标")
+#     → 消除 Stage 1/2 输入格式错配, LoRA 在同一格式下训练和使用
 #
 # 训练策略 (warmup → 选择性微调):
 #   Warmup (前 500 步): 只训 cond_projector + latent_queries
@@ -58,11 +63,16 @@ data:
     val_samples_per_clip: 5
 
   trajectory:
-    # 论文: 9 past + 1 current = 10 frames (单视图) + 1 lookdown = 11 images
-    # panoramic_vlm_input=false → 仅前视图+lookdown, 与 InternNav 对齐
+    # 全景图统一输入:
+    #   panoramic_vlm_input=true → VLM 看到 4 张全景图 (与 Stage 1 一致)
+    #   pixel_goal 坐标仍在前视图坐标系 (prompt: "前视图中的像素坐标")
+    #   traj_images (System 1 DINOv2 输入) 不受影响，仍为前视图
+    #
+    # Token 数量: (num_history+1) × 4 views × ~81 tokens ≈ 2600
+    # 较前视频方案增加约 3x 视觉 token，需减少 num_history 或 batch_size
     min_history: 5
-    num_history_sample: 9
-    panoramic_vlm_input: false
+    num_history_sample: 5
+    panoramic_vlm_input: true
     load_depth: true
     cache_poses: true
     sample_stride: 2
