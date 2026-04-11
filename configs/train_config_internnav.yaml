@@ -183,8 +183,8 @@ training:
       epochs: 10
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
-      # Stage 2 VLM 输入为前视图+lookdown (无全景历史锚点),
-      # heatmap hooks 不激活 → train_heatmap 关闭
+      # Stage 2 VLM 输入为全景图 (与 Stage 1 一致),
+      # 仅训动作, heatmap loss 不参与 → train_heatmap 关闭
       train_heatmap: false
       train_history: false
       train_action: true
@@ -233,13 +233,11 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  # 论文: batch_size=128 (11 images/sample), 15000 steps
-  # 前视图+lookdown: 11 images/sample (与 InternNav 对齐)
-  # 有效 batch = 16 × 8 = 128
-  # 10000 clips × 20 samples = 200K samples/epoch
-  # 200K / 128 = 1562 steps/epoch × 10 epochs ≈ 15620 steps ≈ 15000
-  batch_size: 16
-  grad_accum_steps: 8
+  # 全景输入: (8+1) × 4 views = 36 images/sample (原前视方案 11 images)
+  # 显存约 3.3x, 需降低 batch_size
+  # 有效 batch = 4 × 16 = 64
+  batch_size: 4
+  grad_accum_steps: 16
 
 # ============================================
 # 损失函数
