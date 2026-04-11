@@ -4,12 +4,22 @@ seed: 42
 # 数据配置 - 热力图训练 + LoRA 对比实验（单卡）
 # ============================================
 #
-# 与 train_heatmap_config.yaml 的唯一区别:
-#   heatmap_trains_backbone: true
+# 与 train_heatmap_config.yaml 的区别:
+#   1. heatmap_trains_backbone: true  — 梯度穿透 backbone
+#   2. lora_lr: 1e-4 (原 5e-6)        — 补偿间接辅助信号的衰减
+#
+# 用法: 从收敛的 heatmap-only checkpoint 继续训练
+#   python scripts/train.py --config configs/train_heatmap_config_lora.yaml \
+#     --load-weights /path/to/heatmap_converged/best.pth
 #
 # 效果: 热力图 loss 梯度可穿透 backbone 到达 LoRA 参数
 # 代价: 显存增加 ~4-8 GB（backbone 中间激活需保留）
 # 目的: 对比 LoRA 是否能通过热力图辅助任务提升空间理解能力
+#
+# 关键监控 (TensorBoard):
+#   lora/total_deltaW_norm  — 训完后应 > 1e-3 才有意义
+#   lora/grad_decay_L20_vs_L5 — 验证深浅层梯度衰减比
+#   diag/vis_accuracy — 最容易看到改善的指标
 #
 data:
   root: /workspace/heatmap_train_data
@@ -133,7 +143,7 @@ optim:
   learning_rate: 1.0e-4
   heatmap_lr: 1.0e-4
   vis_head_lr: 1.0e-3
-  lora_lr: 5.0e-6
+  lora_lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip: 1.0
   amp: bf16
