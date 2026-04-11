@@ -234,10 +234,10 @@ optim:
   warmup_ratio: 0.003
   min_lr: 1.0e-5
   # 全景输入: (8+1) × 4 views = 36 images/sample (原前视方案 11 images)
-  # 显存约 3.3x, 需降低 batch_size
-  # 有效 batch = 4 × 16 = 64
-  batch_size: 4
-  grad_accum_steps: 16
+  # 48GB VRAM, gradient_checkpointing=true
+  # 有效 batch = 8 × 8 = 64
+  batch_size: 8
+  grad_accum_steps: 8
 
 # ============================================
 # 损失函数
