@@ -391,11 +391,14 @@ def main():
             load_history_frames=load_history_frames,
         )
     
-    if hasattr(val_dataset, 'set_epoch'):
+    if val_dataset is not None and hasattr(val_dataset, 'set_epoch'):
         val_dataset.set_epoch(0)
     
     logger.info(f"  Train: {len(train_dataset)} samples")
-    logger.info(f"  Val: {len(val_dataset)} samples")
+    if val_dataset is not None:
+        logger.info(f"  Val: {len(val_dataset)} samples")
+    else:
+        logger.info("  Val: disabled (no val_root)")
     
     # 构建模型
     logger.info("🏗️  Building model...")
@@ -472,7 +475,8 @@ def main():
     # 更新热力图分辨率
     hm_size = tuple(stage_cfg['hm_size'])
     train_dataset.hm_size = hm_size
-    val_dataset.hm_size = hm_size
+    if val_dataset is not None:
+        val_dataset.hm_size = hm_size
     if hasattr(model, 'update_heatmap_size'):
         model.update_heatmap_size(hm_size)
     
@@ -498,7 +502,7 @@ def main():
         use_worker_tokenized_collator
         and cfg['model'].get('heatmap', {}).get('enable', True)
         and getattr(train_dataset, '_is_panoramic', False)
-        and getattr(val_dataset, '_is_panoramic', False)
+        and (val_dataset is None or getattr(val_dataset, '_is_panoramic', False))
     )
     if use_panoramic_tokenized_collator:
         from transformers import AutoProcessor
@@ -532,7 +536,8 @@ def main():
     # data travels through the regular pickle pipe and never touches shm.
     if num_workers > 0:
         train_dataset = ShmBypassDataset(train_dataset)
-        val_dataset = ShmBypassDataset(val_dataset)
+        if val_dataset is not None:
+            val_dataset = ShmBypassDataset(val_dataset)
         actual_collate_fn = ShmBypassCollate(actual_collate_fn)
         logger.info("   🔀 ShmBypass enabled: tensor↔numpy IPC (bypassing 64 MB /dev/shm)")
 
@@ -552,7 +557,7 @@ def main():
         rank=dist_context.rank,
         shuffle=False,
         drop_last=False,
-    ) if dist_context.enabled else None
+    ) if (dist_context.enabled and val_dataset is not None) else None
     
     os.environ["HEATMAPVLN_LOG_MEMORY"] = "1" if cfg["log"].get("show_gpu_memory", False) else "0"
     train_loader = DataLoader(
@@ -571,19 +576,23 @@ def main():
         in_order=False if num_workers > 0 else True,
     )
     
-    val_num_workers = min(num_workers, 4)
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg['optim']['batch_size'],
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=val_num_workers,
-        pin_memory=cfg['data']['pin_memory'],
-        collate_fn=actual_collate_fn,
-        prefetch_factor=prefetch_factor if val_num_workers > 0 else None,
-        persistent_workers=False,
-    )
-    logger.info(f"   📊 验证 DataLoader: num_workers={val_num_workers}, prefetch={prefetch_factor}")
+    if val_dataset is not None:
+        val_num_workers = min(num_workers, 4)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg['optim']['batch_size'],
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=val_num_workers,
+            pin_memory=cfg['data']['pin_memory'],
+            collate_fn=actual_collate_fn,
+            prefetch_factor=prefetch_factor if val_num_workers > 0 else None,
+            persistent_workers=False,
+        )
+        logger.info(f"   📊 验证 DataLoader: num_workers={val_num_workers}, prefetch={prefetch_factor}")
+    else:
+        val_loader = None
+        logger.info("   📊 验证 DataLoader: disabled")
     
     if uses_dynamic_sampling:
         if persistent_workers:
@@ -763,7 +772,7 @@ def main():
         _malloc_trim()
         _drop_page_cache()
 
-        do_eval = (epoch % eval_every_epochs == 0) or (epoch == total_epochs)
+        do_eval = val_loader is not None and ((epoch % eval_every_epochs == 0) or (epoch == total_epochs))
 
         if do_eval:
             with ema.apply():
