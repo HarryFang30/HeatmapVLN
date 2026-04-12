@@ -91,11 +91,11 @@ def query_nvidia_smi() -> Tuple[List[Tuple[int, float, float, float]], Dict[int,
     try:
         out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE, timeout=30)
     except FileNotFoundError:
-        logger.error("未找到 nvidia-smi，请确认已安装 NVIDIA 驱动")
-        sys.exit(2)
-    except subprocess.CalledProcessError as e:
-        logger.error("nvidia-smi 执行失败: %s", e.stderr or e)
-        sys.exit(2)
+        logger.warning("未找到 nvidia-smi，请确认已安装 NVIDIA 驱动")
+        return [], {}
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning("nvidia-smi 执行异常，本轮跳过: %s", e)
+        return [], {}
 
     rows: List[Tuple[int, float, float, float]] = []
     index_to_uuid: Dict[int, str] = {}
@@ -183,18 +183,24 @@ def reap_occupy_processes(
     alive: List[OccupyChild] = []
     failed_gpus: Set[int] = set()
     for p, gpus, log_path in running:
-        if p.poll() is None:
+        try:
+            rc = p.poll()
+        except Exception:
+            logger.warning("检查占卡进程状态失败 pid=%s gpus=%s，保留", p.pid, sorted(gpus))
+            alive.append((p, gpus, log_path))
+            continue
+        if rc is None:
             alive.append((p, gpus, log_path))
         else:
-            log_fn = logger.info if p.returncode == 0 else logger.warning
+            log_fn = logger.info if rc == 0 else logger.warning
             log_fn(
                 "占卡进程已结束 pid=%s gpus=%s code=%s log=%s",
                 p.pid,
                 sorted(gpus),
-                p.returncode,
+                rc,
                 log_path,
             )
-            if p.returncode != 0:
+            if rc != 0:
                 failed_gpus.update(gpus)
     running[:] = alive
     return failed_gpus
@@ -249,7 +255,7 @@ def launch_occupy_script(
             log_path,
         )
         return p, log_path
-    except OSError as e:
+    except Exception as e:
         logger.error("启动占卡脚本失败: %s", e)
         return None
 
@@ -269,7 +275,7 @@ def send_feishu_text(webhook_url: str, text: str) -> bool:
                 return True
             logger.warning("飞书返回异常: %s", result)
             return False
-    except urllib.error.URLError as e:
+    except Exception as e:
         logger.warning("发送飞书失败: %s", e)
         return False
 
@@ -444,6 +450,10 @@ def main() -> None:
         failed_gpus = reap_occupy_processes(occupy_children)
 
         gpu_rows, index_to_uuid = query_nvidia_smi()
+        if not gpu_rows:
+            logger.debug("nvidia-smi 未返回数据，本轮跳过")
+            time.sleep(interval)
+            continue
         stats = {r[0]: r for r in gpu_rows}
         if watch:
             indices = watch
@@ -570,4 +580,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _restart_delay = 10
+    while True:
+        try:
+            main()
+            break
+        except KeyboardInterrupt:
+            logger.info("收到中断，退出监控")
+            break
+        except SystemExit:
+            raise
+        except Exception:
+            logger.exception(
+                "监控进程异常崩溃，%d 秒后自动重启...", _restart_delay
+            )
+            time.sleep(_restart_delay)
