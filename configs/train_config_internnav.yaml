@@ -224,9 +224,9 @@ optim:
   min_lr: 1.0e-5
   # 全景输入: (8+1) × 4 views = 36 images/sample (原前视方案 11 images)
   # 48GB VRAM, gradient_checkpointing=true
-  # 有效 batch = 8 × 8 = 64
+  # InternNav 论文单卡 batch=2, 这里 batch=8 已够大, 无需累积
   batch_size: 8
-  grad_accum_steps: 8
+  grad_accum_steps: 1
 
 # ============================================
 # 损失函数
@@ -272,7 +272,7 @@ log:
   max_ckpts: 5
   use_tensorboard: true
   tensorboard_dir: /root/tf-logs
-  enable_timing: false
+  enable_timing: true
   epoch_boundary_cooldown_s: 8
   log_interval: 10
   show_gpu_memory: true
