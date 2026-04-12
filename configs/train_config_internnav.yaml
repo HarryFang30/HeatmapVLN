@@ -50,18 +50,6 @@ data:
 
   dataset_type: trajectory
 
-  sliding_window:
-    min_history: 5
-    num_history_sample: 8
-    load_depth: true
-    load_history_frames: false
-    cache_poses: true
-    sample_stride: 2
-    defer_heatmap_to_gpu: false
-    clip_level_sampling: true
-    samples_per_clip: 15
-    val_samples_per_clip: 5
-
   trajectory:
     # 全景图统一输入:
     #   panoramic_vlm_input=true → VLM 看到 4 张全景图 (与 Stage 1 一致)
