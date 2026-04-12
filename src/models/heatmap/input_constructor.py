@@ -89,7 +89,7 @@ def construct_input(
     if pixel_goal is not None:
         messages.append({
             "role": "assistant",
-            "content": f"{pixel_goal[0]} {pixel_goal[1]}",
+            "content": [{"type": "text", "text": f"{pixel_goal[0]} {pixel_goal[1]}"}],
         })
 
     return messages
@@ -198,7 +198,10 @@ def construct_input_stage2(
 
     messages = [{"role": "user", "content": user_content}]
 
-    messages.append({"role": "assistant", "content": "↓"})
+    messages.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": "↓"}],
+    })
 
     messages.append({
         "role": "user",
@@ -208,7 +211,7 @@ def construct_input_stage2(
     if pixel_goal is not None:
         messages.append({
             "role": "assistant",
-            "content": f"{pixel_goal[0]} {pixel_goal[1]}",
+            "content": [{"type": "text", "text": f"{pixel_goal[0]} {pixel_goal[1]}"}],
         })
 
     return messages
