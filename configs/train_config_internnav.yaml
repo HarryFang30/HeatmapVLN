@@ -271,7 +271,7 @@ log:
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs
+  tensorboard_dir: /root/tf-logs-stage2
   enable_timing: true
   epoch_boundary_cooldown_s: 8
   log_interval: 10
