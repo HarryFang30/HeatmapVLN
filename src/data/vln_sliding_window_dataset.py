@@ -32,6 +32,7 @@ from torch.utils.data import Dataset, DataLoader
 import cv2
 import logging
 import random
+from PIL import Image, ImageEnhance, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,35 @@ class GaussianNoiseAugmentation:
         noise = np.random.normal(0, self.std, image.shape).astype(np.float32)
         noisy = image.astype(np.float32) + noise
         return np.clip(noisy, 0, 255).astype(np.uint8)
+
+
+class InternNavStyleAugmentation:
+    """InternNav 风格的图像增强 (posterize / sharpness / autocontrast).
+
+    与 InternNav ``train_dual_system.sh`` 中的
+    ``torchvision.transforms.v2`` 管线对齐，使用 PIL 实现。
+    """
+
+    def __init__(self, p: float = 0.5):
+        self.p = p
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        if random.random() > self.p:
+            return image
+
+        pil_img = Image.fromarray(image)
+
+        if random.random() > 0.5:
+            pil_img = ImageOps.posterize(pil_img, bits=4)
+
+        if random.random() > 0.5:
+            enhancer = ImageEnhance.Sharpness(pil_img)
+            pil_img = enhancer.enhance(1.5)
+
+        if random.random() > 0.5:
+            pil_img = ImageOps.autocontrast(pil_img)
+
+        return np.asarray(pil_img)
 
 
 # ==================== 热力图计算工具函数 (Pinhole 投影) ====================
@@ -530,7 +560,11 @@ class VLNSlidingWindowDataset(Dataset):
                 brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1, p=0.5
             )
             self.gaussian_noise = GaussianNoiseAugmentation(std=8.0, p=0.3)
-            logger.info("Data augmentation enabled: ColorJitter + GaussianNoise")
+            self.internnav_aug = InternNavStyleAugmentation(p=0.5)
+            logger.info(
+                "Data augmentation enabled: ColorJitter + GaussianNoise "
+                "+ InternNavStyle (posterize/sharpness/autocontrast)"
+            )
         
         # 枚举所有 clips
         self.clips = self._enumerate_clips()
@@ -1220,6 +1254,7 @@ class VLNSlidingWindowDataset(Dataset):
         if apply_augmentation and self.enable_augmentation:
             image = self.color_jitter(image)
             image = self.gaussian_noise(image)
+            image = self.internnav_aug(image)
 
         image_tensor = torch.from_numpy(image).float() / 255.0
         image_tensor = image_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
