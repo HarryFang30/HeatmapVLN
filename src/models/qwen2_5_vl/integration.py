@@ -1006,9 +1006,11 @@ class Qwen2_5VLIntegration(nn.Module):
         need_grad = return_hidden_states or (
             heatmap_vln is not None and self.config.heatmap_trains_backbone
         )
+        skip_lm = heatmap_vln is None
         if need_grad:
             hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
-                inputs, return_hidden_states, latent_queries=latent_queries,
+                inputs, return_hidden_states,
+                skip_lm_head=skip_lm, latent_queries=latent_queries,
             )
         else:
             with torch.inference_mode():
