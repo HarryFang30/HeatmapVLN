@@ -168,7 +168,7 @@ model:
 training:
   stages:
     - name: stage2_selective_finetune
-      epochs: 10
+      epochs: 2
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       # Stage 2 VLM 输入为全景图 (与 Stage 1 一致),
