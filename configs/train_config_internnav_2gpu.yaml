@@ -1,0 +1,237 @@
+seed: 42
+
+# ============================================
+# 阶段 2: System 1 选择性适配 — 双卡版本
+# ============================================
+#
+# 与 train_config_internnav.yaml 的区别:
+#   1. gpu.devices: [0, 1]
+#   2. gpu.multi_gpu.enabled: true
+#   3. batch_size: 4 (每卡 4, 总有效 batch = 4×2 = 8, 与单卡一致)
+#   4. num_workers: 4 (每卡)
+#
+# 启动方式 (必须用 torchrun):
+#   torchrun --nproc_per_node=2 scripts/train.py \
+#     --config configs/train_config_internnav_2gpu.yaml \
+#     --load-weights /path/to/stage1/checkpoints/best.pth
+#
+# ============================================
+
+# ============================================
+# 数据配置
+# ============================================
+data:
+  root: /workspace/r2r_panoramic_data
+  train_split: train
+  image_size: [256, 256]
+  init_hm_size: [64, 64]
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+  dataset_type: trajectory
+
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    panoramic_vlm_input: true
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: true
+    samples_per_clip: 5
+    val_samples_per_clip: 8
+    random_subsequence: true
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    predict_horizon: 32
+    action_scale: 4.0
+    enable_trajectory_augmentation: true
+    use_subinstruction: true
+    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
+    load_traj_images: true
+    traj_image_size: [224, 224]
+
+# ============================================
+# 模型配置 — InternNav backbone (Qwen2.5-VL)
+# ============================================
+model:
+  type: vln_pipeline
+  device: cuda
+
+  llm:
+    model_path: ./models/internnav_backbone
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+    max_video_frames: -1
+    gradient_checkpointing: true
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_layer_indices: [5, 6, 12, 13, 19, 20]
+    lora_dropout: 0.05
+
+  heatmap:
+    enable: true
+    c_vit: 1280
+    c_llm: 3584
+    c_fused: 256
+    vit_layer_indices: [7, 15, 23, 31]
+    llm_layer_indices: [6, 13, 20]
+    heatmap_size: [64, 64]
+    image_size: 256
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_kl: 0.0
+    lambda_peak: 1.0
+
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 2
+      max_spatial_range: 10.0
+
+  action_head:
+    enable: true
+    nextdit:
+      enabled: true
+      vlm_hidden_dim: 3584
+      latent_emb_size: 768
+      n_query: 4
+      dit_dim: 384
+      dit_layers: 12
+      dit_heads: 6
+      dit_kv_heads: 6
+      dit_ffn_dim_multiplier: 0.6666666666666666
+      predict_steps: 32
+      action_dim: 3
+      num_inference_steps: 10
+      guidance_scale: 1.0
+      num_sample_trajs: 32
+      dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
+      enable_gradient_checkpointing: true
+      internnav_system1_path: "models/internnav_system1.safetensors"
+      warmup_steps: 500
+
+# ============================================
+# 训练策略
+# ============================================
+training:
+  stages:
+    - name: stage2_selective_finetune
+      epochs: 1
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: false
+      train_history: false
+      train_action: true
+      trainable_modules:
+        - latent_queries
+        - cond_projector
+        - traj_dit
+        - action_encoder
+        - action_decoder
+      frozen_modules:
+        - vlm_backbone
+        - lora
+        - memory_encoder
+        - rgb_resampler
+        - rgb_model
+        - pos_encoding
+        - llm_projector
+
+# ============================================
+# 优化器配置
+# ============================================
+optim:
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  heatmap_lr: 5.0e-5
+  vis_head_lr: 2.0e-4
+  nextdit_cond_projector_lr: 1.0e-4
+  latent_queries_lr: 1.0e-4
+  nextdit_action_lr: 5.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.003
+  min_lr: 1.0e-5
+  # 双卡: 每卡 batch=4, 总有效 batch = 4×2 = 8
+  batch_size: 4
+  grad_accum_steps: 1
+
+# ============================================
+# 损失函数
+# ============================================
+loss:
+  heatmap_loss_type: heatmap_vln
+
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_kl: 0.0
+    lambda_peak: 1.0
+    lambda_neg: 1.0
+    temperature: 1.0
+    vis_pos_weight: 7.0
+    temperature_schedule:
+      enabled: false
+      mode: cosine
+      start: 1.0
+      end: 1.0
+
+  heatmap_weight: 0.2
+  trajectory_weight: 1.0
+
+# ============================================
+# GPU配置 — 双卡
+# ============================================
+gpu:
+  devices: [0, 1]
+  backend: nccl
+  multi_gpu:
+    enabled: true
+    find_unused_parameters: true
+
+# ============================================
+# 日志与保存
+# ============================================
+log:
+  out_dir: /root/autodl-tmp/vln_training_outputs
+  save_every_epochs: 1
+  vis_every_steps: 100
+  val_vis_batches: 2
+  max_ckpts: 5
+  use_tensorboard: true
+  tensorboard_dir: /root/tf-logs-stage2
+  enable_timing: true
+  epoch_boundary_cooldown_s: 8
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  mid_epoch_save_every: 500
+
+  notify:
+    enabled: true
+    platform: feishu
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+
+# ============================================
+# 验证配置
+# ============================================
+validation:
+  eval_every_epochs: 0
+  save_best_metric: val_total_loss
+  patience: 999
+  val_inference_batches: 0
