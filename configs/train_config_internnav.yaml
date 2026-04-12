@@ -40,7 +40,8 @@ seed: 42
 data:
   root: /workspace/r2r_panoramic_data
   train_split: train
-  # val_root: /workspace/val_unseen  # 暂不验证，后续手动评估
+  # val_unseen 数据为 Stage 1 热力图格式，不适用于 Stage 2 轨迹验证
+  # val_root: /workspace/val_unseen
   # val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]

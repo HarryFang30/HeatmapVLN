@@ -320,30 +320,34 @@ def main():
             panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
         )
         
-        val_root = cfg['data'].get('val_root') or cfg['data']['root']
-        val_split = cfg['data'].get('val_split', 'val')
-        val_samples_per_clip = traj_cfg.get('val_samples_per_clip', 2)
-        val_dataset = VLNTrajectoryDataset(
-            root=val_root,
-            split=val_split,
-            min_history=traj_cfg.get('min_history', 5),
-            num_history_sample=traj_cfg.get('num_history_sample', 8),
-            image_size=tuple(cfg['data']['image_size']),
-            hm_size=tuple(cfg['data']['init_hm_size']),
-            load_depth=traj_cfg.get('load_depth', True),
-            cache_poses=traj_cfg.get('cache_poses', True),
-            sample_stride=sample_stride,
-            clip_level_sampling=clip_level_sampling,
-            samples_per_clip=val_samples_per_clip,
-            random_subsequence=False,
-            predict_horizon=traj_cfg.get('predict_horizon', 24),
-            action_scale=traj_cfg.get('action_scale', 4.0),
-            enable_trajectory_augmentation=False,
-            load_traj_images=traj_cfg.get('load_traj_images', False),
-            traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
-            use_subinstruction=False,
-            panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
-        )
+        val_root = cfg['data'].get('val_root')
+        if val_root:
+            val_split = cfg['data'].get('val_split', 'val')
+            val_samples_per_clip = traj_cfg.get('val_samples_per_clip', 2)
+            val_dataset = VLNTrajectoryDataset(
+                root=val_root,
+                split=val_split,
+                min_history=traj_cfg.get('min_history', 5),
+                num_history_sample=traj_cfg.get('num_history_sample', 8),
+                image_size=tuple(cfg['data']['image_size']),
+                hm_size=tuple(cfg['data']['init_hm_size']),
+                load_depth=traj_cfg.get('load_depth', True),
+                cache_poses=traj_cfg.get('cache_poses', True),
+                sample_stride=sample_stride,
+                clip_level_sampling=clip_level_sampling,
+                samples_per_clip=val_samples_per_clip,
+                random_subsequence=False,
+                predict_horizon=traj_cfg.get('predict_horizon', 24),
+                action_scale=traj_cfg.get('action_scale', 4.0),
+                enable_trajectory_augmentation=False,
+                load_traj_images=traj_cfg.get('load_traj_images', False),
+                traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
+                use_subinstruction=False,
+                panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
+            )
+        else:
+            val_dataset = None
+            logger.info("  No val_root configured, skipping validation dataset")
     else:
         sw_cfg = cfg['data']['sliding_window']
         sample_stride = sw_cfg.get('sample_stride', 1)
