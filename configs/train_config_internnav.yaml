@@ -40,8 +40,8 @@ seed: 42
 data:
   root: /workspace/r2r_panoramic_data
   train_split: train
-  val_root: /workspace/val_unseen
-  val_split: all
+  # val_root: /workspace/val_unseen  # 暂不验证，后续手动评估
+  # val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]
   num_workers: 4
@@ -289,7 +289,7 @@ log:
 # 验证配置
 # ============================================
 validation:
-  eval_every_epochs: 1
+  eval_every_epochs: 0
   save_best_metric: val_total_loss
-  patience: 10
-  val_inference_batches: 6
+  patience: 999
+  val_inference_batches: 0
