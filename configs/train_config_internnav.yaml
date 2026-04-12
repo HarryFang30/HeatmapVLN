@@ -177,21 +177,21 @@ training:
       train_history: false
       train_action: true
       trainable_modules:
-        # 条件适配 (输入变了)
+        # 条件适配 (全景输入 → traj_cond 分布变了)
         - latent_queries     # 4×3584 = 14K params
         - cond_projector     # 3584→768→768 = ~3.3M params
         # 轨迹生成微调 (条件变了 + R2R 数据分布不同)
         - traj_dit           # 12层 DiT = ~21M params
+        # 动作空间编解码 (参数极少，解冻无害，与 InternNav 对齐)
+        - action_encoder     # Linear(3→384), ~1.2K params
+        - action_decoder     # Linear(384→3), ~1.2K params
       frozen_modules:
         - vlm_backbone       # Qwen2.5-VL 基座权重
         - lora               # 空间理解已固化
-        # 视觉记忆 (输入不变，无需训练，省 ~26M 参数)
+        # 视觉记忆 (traj_images 输入不变 → 输出不变)
         - memory_encoder     # DINOv2 特征不变
         - rgb_resampler      # DINOv2 特征不变
         - rgb_model           # DINOv2 始终冻结
-        # 动作空间 (不变)
-        - action_encoder     # Linear(3→384)
-        - action_decoder     # Linear(384→3)
         - pos_encoding       # 固定正弦编码
         - llm_projector      # 非轨迹路径
 
