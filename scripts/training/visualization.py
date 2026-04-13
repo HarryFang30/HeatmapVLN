@@ -5,13 +5,9 @@ Heatmap prediction visualization utilities.
 import logging
 from pathlib import Path
 
-import matplotlib
 import numpy as np
 import torch
 import torch.nn as nn
-
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +45,11 @@ def visualize_heatmap_predictions(
             GT heatmap to replace batch['heatmap'] (which is a zero placeholder).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     VIEW_LABELS = ["Front", "Right", "Back", "Left"]
 
     try:

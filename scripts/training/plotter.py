@@ -5,11 +5,6 @@ Training curve plotter — generates loss/lr PNG charts and JSON history.
 import json
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
 
 class TrainingPlotter:
     """Training curve plotter."""
@@ -61,6 +56,10 @@ class TrainingPlotter:
     def save_plot(self):
         if len(self.history['epoch']) == 0:
             return
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
         epochs = self.history['epoch']
 
