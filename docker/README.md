@@ -1,57 +1,118 @@
-# Docker 部署文件
+# Docker Deployment
 
-本目录包含 HeatmapVLN 项目的 Docker 部署相关文件。
+Docker setup for the HeatmapVLN training and inference environment.
 
-## 📁 文件说明
+## Files
 
-- **Dockerfile** - Docker 镜像构建文件
-- **.dockerignore** - 构建时忽略的文件
-- **docker-compose.yml** - Docker Compose 配置文件
-- **docker-run.sh** - 快速启动脚本（推荐使用）
-- **DOCKER.md** - 详细部署文档
+| File | Description |
+|:-----|:------------|
+| `Dockerfile` | Image build definition (CUDA 12.8 + Conda + PyTorch 2.7) |
+| `docker-compose.yml` | Compose config with GPU reservation and volume mounts |
+| `docker-run.sh` | Interactive launcher script with menu |
+| `.dockerignore` | Build context exclusion rules |
 
-## 🚀 快速开始
+## Quick Start
 
-### 使用快速启动脚本（最简单）
+### Option 1: Launcher Script (recommended)
 
 ```bash
-# 从项目根目录或 docker 目录运行
 ./docker/docker-run.sh
-
-# 或进入 docker 目录
-cd docker
-./docker-run.sh
 ```
 
-脚本会自动处理路径问题，无论你从哪里运行都能正常工作。
+The script provides a menu for building, training, evaluation, inference, and TensorBoard.
 
-### 使用 docker-compose
+### Option 2: Docker Compose
 
 ```bash
-# 从 docker 目录运行
 cd docker
 
-# 构建镜像
-docker-compose build
+# Build
+docker compose build
 
-# 启动容器
-docker-compose run --rm heatmapvln
+# Interactive shell
+docker compose run --rm heatmapvln
+
+# TensorBoard (port 6007)
+docker compose up tensorboard
 ```
 
-### 使用原生 Docker 命令
+### Option 3: Docker CLI
 
 ```bash
-# 从项目根目录
+# Build from project root
 docker build -f docker/Dockerfile -t heatmapvln:latest .
 
-# 运行容器
+# Interactive shell with GPU and volume mounts
 docker run --gpus all -it --rm \
-  -v $(pwd)/models:/root/HeatmapVLN/models \
-  -v $(pwd)/dataset_with_actions:/root/HeatmapVLN/dataset_with_actions \
-  -p 6006:6006 \
-  heatmapvln:latest
+    -v $(pwd)/models:/workspace/HeatmapVLN/models \
+    -v /path/to/data:/workspace/r2r_panoramic_data \
+    --shm-size 8g -p 6006:6006 \
+    heatmapvln:latest
 ```
 
-## 📖 完整文档
+## Volume Mounts
 
-详细使用说明、常见问题和最佳实践，请查看 [DOCKER.md](DOCKER.md)
+| Host | Container | Purpose |
+|:-----|:----------|:--------|
+| `./models` | `/workspace/HeatmapVLN/models` | Pretrained weights (InternNav backbone, System 1, DAv2) |
+| Data directory | `/workspace/r2r_panoramic_data` | R2R panoramic training data |
+| Output directory | `/workspace/vln_training_outputs` | Checkpoints, logs, visualizations |
+| TensorBoard logs | `/workspace/tf-logs` | TensorBoard event files |
+
+Paths are configurable via environment variables `DATA_ROOT`, `OUT_DIR`, and `TB_DIR`.
+
+## Common Operations
+
+### Training
+
+```bash
+# Foreground
+docker run --gpus all -it --rm \
+    -v $(pwd)/models:/workspace/HeatmapVLN/models \
+    -v /path/to/data:/workspace/r2r_panoramic_data \
+    -v /path/to/output:/workspace/vln_training_outputs \
+    -v /path/to/tb:/workspace/tf-logs \
+    --shm-size 8g \
+    heatmapvln:latest \
+    bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && \
+    python scripts/run.py train --config configs/train_config_internnav.yaml"
+
+# Background
+docker run --gpus all -d --name heatmapvln-train \
+    ... \
+    bash -c "... && python scripts/run.py train --config configs/train_config_internnav.yaml --auto-resume"
+
+docker logs -f heatmapvln-train
+```
+
+### Multi-GPU
+
+```bash
+docker run --gpus all ...    # all GPUs
+docker run --gpus '"device=0,1"' ...    # specific GPUs
+
+# Inside container
+torchrun --nproc_per_node=2 scripts/run.py train \
+    --config configs/train_config_internnav.yaml --distributed
+```
+
+### TensorBoard
+
+```bash
+docker run -d --name heatmapvln-tb \
+    -v /path/to/tb:/workspace/tf-logs \
+    -p 6006:6006 \
+    heatmapvln:latest \
+    bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate models && \
+    tensorboard --logdir=/workspace/tf-logs --host=0.0.0.0 --port=6006"
+```
+
+## Troubleshooting
+
+| Problem | Solution |
+|:--------|:---------|
+| `CUDA not available` | Ensure `--gpus all` is passed and `nvidia-smi` works inside the container |
+| `CUDA out of memory` | Reduce `optim.batch_size` in config or limit GPU count |
+| DataLoader worker killed | Increase `--shm-size` (default 8g, try 16g) |
+| `FileNotFoundError` | Verify volume mounts match config paths; use absolute host paths |
+| Slow image build | Use `DOCKER_BUILDKIT=1` and `--cache-from heatmapvln:latest` |

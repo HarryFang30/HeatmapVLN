@@ -3,42 +3,33 @@
 .gitignore
 .gitattributes
 
-# Python
+# Python artifacts
 __pycache__
 *.py[cod]
 *$py.class
 *.so
-.Python
 *.egg-info
 dist
 build
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# 模型文件（应通过 volume 挂载）
+# Model weights (mount via volume)
 models/
 *.pth
 *.pt
 *.safetensors
 *.bin
 
-# 数据集（应通过 volume 挂载）
-dataset_with_actions/
-data/
+# Data (mount via volume)
+data/fgr2r/*.gz
 
-# 训练输出（应通过 volume 挂载）
-vln_training_outputs/
-outputs_inference/
+# Training outputs (mount via volume)
 checkpoints/
 
-# 日志
+# Logs
 *.log
-train.log
 nohup.out
-/root/tf-logs
 
-# 临时文件
+# Temporary files
 *.tmp
 *.bak
 *.swp
@@ -48,11 +39,13 @@ nohup.out
 .vscode
 .idea
 *.code-workspace
+.ipynb_checkpoints
 
-# macOS
+# OS
 .DS_Store
 
-# 其他
+# Archives
 *.zip
 *.tar.gz
 *.rar
+*.pdf
