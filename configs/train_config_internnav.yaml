@@ -169,7 +169,7 @@ model:
 training:
   stages:
     - name: stage2_selective_finetune
-      epochs: 1
+      epochs: 2
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       # Stage 2 VLM 输入为全景图 (与 Stage 1 一致),
@@ -285,7 +285,7 @@ log:
   notify:
     enabled: true
     platform: feishu
-    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+    webhook_url: "${FEISHU_WEBHOOK_URL}"
 
 # ============================================
 # 验证配置

@@ -163,13 +163,9 @@ def train_one_epoch(
             child_rss = sum(c.memory_info().rss for c in children) / (1024 * 1024)
             cg_used = _cgroup_mem_usage_gb()
             cg_info = f"cgroup: {cg_used:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup: {cg_used:.1f}GB(no limit)"
-            print(
-                f"[MAIN batch={i}] main_rss={main_rss:.0f}MB "
-                f"children({len(children)})={child_rss:.0f}MB "
-                f"total={main_rss + child_rss:.0f}MB | "
-                f"{cg_info}",
-                file=sys.stderr,
-                flush=True,
+            logger.debug(
+                "[MAIN batch=%d] main_rss=%.0fMB children(%d)=%.0fMB total=%.0fMB | %s",
+                i, main_rss, len(children), child_rss, main_rss + child_rss, cg_info,
             )
         if i <= 5 or i % 25 == 0:
             _drop_page_cache()
@@ -522,12 +518,10 @@ def train_one_epoch(
                 gc_stats = gc.get_stats()
                 cg_now = _cgroup_mem_usage_gb()
                 cg_str = f"cgroup={cg_now:.1f}/{_cg_limit:.0f}GB" if _cg_limit > 0 else f"cgroup={cg_now:.1f}GB"
-                print(
-                    f"[MAIN batch={i} post-gc] rss={post_rss:.0f}MB | {cg_str} | "
-                    f"gc: gen0={gc_stats[0]['collected']} gen1={gc_stats[1]['collected']} "
-                    f"gen2={gc_stats[2]['collected']}",
-                    file=sys.stderr,
-                    flush=True,
+                logger.debug(
+                    "[MAIN batch=%d post-gc] rss=%.0fMB | %s | gc: gen0=%d gen1=%d gen2=%d",
+                    i, post_rss, cg_str,
+                    gc_stats[0]['collected'], gc_stats[1]['collected'], gc_stats[2]['collected'],
                 )
             _drop_page_cache()
 

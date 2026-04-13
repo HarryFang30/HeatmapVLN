@@ -225,7 +225,7 @@ log:
   notify:
     enabled: true
     platform: feishu
-    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/60a6d820-9069-4963-8116-46bd68e668aa"
+    webhook_url: "${FEISHU_WEBHOOK_URL}"
 
 # ============================================
 # 验证配置

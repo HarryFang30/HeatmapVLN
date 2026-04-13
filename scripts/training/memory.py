@@ -10,6 +10,7 @@ these wrappers are the only way to use ``num_workers > 0``.
 
 from __future__ import annotations
 
+import logging
 import sys
 import os
 import gc
@@ -19,6 +20,8 @@ from typing import Any, Callable, Dict, List, Sequence, Union
 import numpy as np
 import torch
 import torch.utils.data
+
+logger = logging.getLogger(__name__)
 
 
 def _malloc_trim():
@@ -83,26 +86,24 @@ def _drop_page_cache(force: bool = False, threshold: float = 0.80):
         with open("/proc/sys/vm/drop_caches", "w") as f:
             f.write("1\n")
         after = _cgroup_mem_usage_gb()
-        print(
-            f"[PAGE_CACHE] drop_caches: {usage:.1f}GB → {after:.1f}GB "
-            f"(limit={_CG_LIMIT_GB:.0f}GB)",
-            file=sys.stderr, flush=True,
+        logger.debug(
+            "[PAGE_CACHE] drop_caches: %.1fGB -> %.1fGB (limit=%.0fGB)",
+            usage, after, _CG_LIMIT_GB,
         )
         return
     except PermissionError:
         pass
     except Exception as e:
-        print(f"[PAGE_CACHE] drop_caches failed: {e}", file=sys.stderr, flush=True)
+        logger.debug("[PAGE_CACHE] drop_caches failed: %s", e)
         return
 
     try:
         with open("/sys/fs/cgroup/memory/memory.force_empty", "w") as f:
             f.write("0\n")
         after = _cgroup_mem_usage_gb()
-        print(
-            f"[PAGE_CACHE] force_empty: {usage:.1f}GB → {after:.1f}GB "
-            f"(limit={_CG_LIMIT_GB:.0f}GB)",
-            file=sys.stderr, flush=True,
+        logger.debug(
+            "[PAGE_CACHE] force_empty: %.1fGB -> %.1fGB (limit=%.0fGB)",
+            usage, after, _CG_LIMIT_GB,
         )
         return
     except Exception:
@@ -112,12 +113,10 @@ def _drop_page_cache(force: bool = False, threshold: float = 0.80):
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
-        print(
-            f"[PAGE_CACHE] WARNING: cannot drop page cache "
-            f"(no permission for drop_caches or force_empty). "
-            f"cgroup={usage:.1f}/{_CG_LIMIT_GB:.0f}GB. "
-            f"Consider running: chmod 666 /proc/sys/vm/drop_caches",
-            file=sys.stderr, flush=True,
+        logger.warning(
+            "[PAGE_CACHE] cannot drop page cache (no permission). "
+            "cgroup=%.1f/%.0fGB. Consider: chmod 666 /proc/sys/vm/drop_caches",
+            usage, _CG_LIMIT_GB,
         )
     except Exception:
         pass
@@ -151,13 +150,14 @@ def _worker_init_fn(worker_id):
         if _os.environ.get("HEATMAPVLN_LOG_MEMORY", "0") != "1":
             pass
         else:
+            import logging as _logging
+            _wlog = _logging.getLogger("heatmapvln.worker")
             with open("/proc/self/statm", "rb") as f:
                 pages = int(f.read().split()[1])
             rss_mb = pages * _os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-            print(
-                f"[WORKER init] worker_id={worker_id} pid={_os.getpid()} "
-                f"rss={rss_mb:.0f}MB gc_threshold={_gc.get_threshold()}",
-                file=_sys.stderr, flush=True,
+            _wlog.debug(
+                "[WORKER init] worker_id=%d pid=%d rss=%.0fMB gc_threshold=%s",
+                worker_id, _os.getpid(), rss_mb, _gc.get_threshold(),
             )
     except Exception:
         pass
