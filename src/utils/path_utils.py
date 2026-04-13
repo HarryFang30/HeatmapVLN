@@ -2,8 +2,11 @@
 Path utilities for robust file handling across different environments.
 """
 
+import logging
 from pathlib import Path
 from typing import Union
+
+logger = logging.getLogger(__name__)
 
 
 def get_project_root() -> Path:
@@ -77,7 +80,7 @@ def resolve_model_path(path: Union[str, Path], model_type: str = "model") -> Pat
 
         for alt_path in alternatives:
             if alt_path and alt_path.exists():
-                print(f"Warning: Using alternative path for {model_type}: {alt_path}")
+                logger.warning("Using alternative path for %s: %s", model_type, alt_path)
                 return alt_path.resolve()
 
         raise FileNotFoundError(

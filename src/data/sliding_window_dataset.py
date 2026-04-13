@@ -41,7 +41,7 @@ def _evict_from_page_cache(filepath):
         finally:
             os.close(fd)
     except Exception:
-        pass
+        logger.debug("posix_fadvise skipped for %s", filepath, exc_info=True)
 
 
 # ==================== 主数据集类 ====================

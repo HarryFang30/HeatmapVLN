@@ -9,13 +9,12 @@ Features:
 Sequence packing is currently disabled on the shared stack.
 """
 
+import logging
 import warnings
 
-warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
-warnings.filterwarnings("ignore", message=".*fps.*frames per second.*")
-warnings.filterwarnings("ignore", message=".*video_metadata.*")
-
-import logging
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch_dtype.*is deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*fps.*frames per second.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*video_metadata.*")
 import time
 from dataclasses import dataclass
 from typing import Any, Union

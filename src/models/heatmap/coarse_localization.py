@@ -76,15 +76,11 @@ class CoarseLocalization(nn.Module):
             list of dicts with ``visibility`` (4,) and ``coarse_heatmap`` (4, H, W).
         """
         batch = self.forward_batched(current_llm, history_queries)
-        # Batched decode paths expect the raw tensor dict so they can index
-        # visibility / heatmaps directly. Single-sample paths keep the legacy
-        # list-of-dicts interface.
         if not isinstance(current_llm, dict) or not isinstance(history_queries, list):
             return batch
-        if isinstance(current_llm, dict):
-            sample_feat = next(iter(current_llm.values()), None)
-            if torch.is_tensor(sample_feat) and sample_feat.dim() >= 4:
-                return batch
+        sample_feat = next(iter(current_llm.values()), None)
+        if torch.is_tensor(sample_feat) and sample_feat.dim() >= 4:
+            return batch
         return [
             {
                 "visibility": batch["visibility"][hist_idx],

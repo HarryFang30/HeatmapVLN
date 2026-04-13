@@ -6,7 +6,10 @@ Provides functions to create browsable HTML pages with thumbnails and metrics.
 """
 
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def create_html_index(
@@ -274,5 +277,5 @@ def create_html_index(
     with open(metrics_path, 'w', encoding='utf-8') as f:
         json.dump(metrics_summary, f, indent=2)
 
-    print(f"📄 Created HTML index: {index_path}")
-    print(f"📊 Saved summary metrics: {metrics_path}")
+    logger.info("Created HTML index: %s", index_path)
+    logger.info("Saved summary metrics: %s", metrics_path)

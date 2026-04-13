@@ -14,9 +14,12 @@ When ``n_traj_query > 0`` the collator also:
 
 import ctypes
 import gc
+import logging
 import os
 import sys
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import torch
 
@@ -284,14 +287,13 @@ class PanoramicTokenizedCollator:
             gc_stats = gc.get_stats()
             gen0_collected = gc_stats[0]["collected"] if gc_stats else 0
             gen1_collected = gc_stats[1]["collected"] if len(gc_stats) > 1 else 0
-            print(
-                f"[COLLATOR pid={pid} call={self._call_count}] "
-                f"RSS: start={rss0:.0f} stack={rss1:.0f} PIL→msg={rss2:.0f} "
-                f"tokenize={rss3:.0f} gc+trim={rss4:.0f} MB | "
-                f"pano_inputs={pano_mb:.1f}MB | "
-                f"gc_collected: gen0={gen0_collected} gen1={gen1_collected}",
-                file=sys.stderr,
-                flush=True,
+            logger.debug(
+                "[COLLATOR pid=%s call=%d] RSS: start=%.0f stack=%.0f PIL→msg=%.0f "
+                "tokenize=%.0f gc+trim=%.0f MB | pano_inputs=%.1fMB | "
+                "gc_collected: gen0=%d gen1=%d",
+                pid, self._call_count, rss0, rss1, rss2,
+                rss3, rss4, pano_mb,
+                gen0_collected, gen1_collected,
             )
 
         return result

@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+SOFTMAX_TEMPERATURE = 10.0
+
 
 class NavigationHeatmapLoss(nn.Module):
     """
@@ -197,7 +199,7 @@ class HighFreqHeatmapLoss(nn.Module):
         # 3. KL Divergence
         flat_pred = pred_norm.view(B, -1)
         flat_target = target_norm.view(B, -1)
-        log_prob_pred = F.log_softmax(flat_pred * 10, dim=1)  # Temperature
+        log_prob_pred = F.log_softmax(flat_pred * SOFTMAX_TEMPERATURE, dim=1)
         target_sum = flat_target.sum(dim=1, keepdim=True) + 1e-6
         prob_target = flat_target / target_sum
         kl_loss = F.kl_div(log_prob_pred, prob_target, reduction='batchmean')
@@ -501,8 +503,8 @@ class NeRFRippleHeatmapLoss(nn.Module):
         pred_flat = pred.view(B, -1)
         target_flat = target.view(B, -1)
 
-        pred_weights = F.softmax(pred_flat * 10, dim=-1).view(B, 1, H, W)  # Temperature scaling
-        target_weights = F.softmax(target_flat * 10, dim=-1).view(B, 1, H, W)
+        pred_weights = F.softmax(pred_flat * SOFTMAX_TEMPERATURE, dim=-1).view(B, 1, H, W)
+        target_weights = F.softmax(target_flat * SOFTMAX_TEMPERATURE, dim=-1).view(B, 1, H, W)
 
         pred_y = (pred_weights * y_coords).sum(dim=(2, 3))  # [B, 1]
         pred_x = (pred_weights * x_coords).sum(dim=(2, 3))

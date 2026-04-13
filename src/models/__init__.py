@@ -19,13 +19,15 @@ import logging
 
 from .runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
 
+_logger = logging.getLogger(__name__)
+
 install_numpy_legacy_aliases()
 try:
     importlib.import_module("flash_attn")
 except ModuleNotFoundError:
     pass
-except Exception:
-    install_flash_attn_stub(logging.getLogger(__name__))
+except ImportError:
+    install_flash_attn_stub(_logger)
 
 # === Qwen2.5-VL Integration ===
 # === Heatmap Components (v2 Coarse-to-Fine) ===
@@ -55,9 +57,8 @@ try:
         NextDiTActionConfig,
         NextDiTActionHead,
     )
-except Exception:
-    # Heatmap-only training should still import cleanly even if the local
-    # action/torchvision stack is unavailable.
+except ImportError:
+    _logger.debug("Action module unavailable (heatmap-only mode)", exc_info=True)
     NextDiTActionHead = None
     NextDiTActionConfig = None
 
