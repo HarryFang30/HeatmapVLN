@@ -2,9 +2,8 @@
 Path utilities for robust file handling across different environments.
 """
 
-import os
 from pathlib import Path
-from typing import Union, Optional
+from typing import Union
 
 
 def get_project_root() -> Path:

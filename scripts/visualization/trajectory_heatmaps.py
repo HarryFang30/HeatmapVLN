@@ -11,26 +11,25 @@ import argparse
 import logging
 import random
 import sys
-from contextlib import nullcontext
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import cv2
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.data.factory import build_sliding_window_dataset
+from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
@@ -45,11 +44,11 @@ SEP_COLOR = np.array([1.0, 0.85, 0.0], dtype=np.float32)  # yellow separator
 
 # ───────────────────── Model ─────────────────────
 
-def build_model(cfg: Dict, device: str) -> VLNPipeline:
+def build_model(cfg: dict, device: str) -> VLNPipeline:
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
-    action_cfg = model_cfg.get('action_head', {})
+    model_cfg.get('action_head', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
@@ -95,8 +94,8 @@ def build_model(cfg: Dict, device: str) -> VLNPipeline:
 # ───────────────────── Inference ─────────────────────
 
 def infer_sample(
-    model: VLNPipeline, sample: Dict[str, Any], device: torch.device,
-) -> Dict[str, torch.Tensor]:
+    model: VLNPipeline, sample: dict[str, Any], device: torch.device,
+) -> dict[str, torch.Tensor]:
     history_frames = sample['history_frames'].unsqueeze(0).to(device)
     current_frame = sample['current_frame'].unsqueeze(0).to(device)
     current_views = sample.get('current_views')
@@ -123,7 +122,7 @@ def infer_sample(
             return_actions=False,
         )
 
-    result: Dict[str, torch.Tensor] = {}
+    result: dict[str, torch.Tensor] = {}
     hm = outputs.get('heatmaps')
     if hm is None:
         raise RuntimeError("模型未返回 heatmaps。")
@@ -144,7 +143,7 @@ def aggregate_max(t: torch.Tensor) -> torch.Tensor:
 
 
 def compute_gated_fallback(
-    heatmaps: torch.Tensor, visibility: Optional[torch.Tensor],
+    heatmaps: torch.Tensor, visibility: torch.Tensor | None,
 ) -> torch.Tensor:
     sig = heatmaps.float().clamp(1e-6, 1 - 1e-6)
     logits = torch.logit(sig)
@@ -170,7 +169,7 @@ def _fill_sep(strip: np.ndarray, x_start: int, gap: int) -> None:
     strip[:, x_start: x_start + gap] = SEP_COLOR
 
 
-def _build_rgb_strip(samples_data: List[Dict], tile: int = TILE, gap: int = GAP) -> np.ndarray:
+def _build_rgb_strip(samples_data: list[dict], tile: int = TILE, gap: int = GAP) -> np.ndarray:
     N = len(samples_data)
     group_w = 4 * tile
     strip_w = N * group_w + max(N - 1, 0) * gap
@@ -187,9 +186,9 @@ def _build_rgb_strip(samples_data: List[Dict], tile: int = TILE, gap: int = GAP)
 
 
 def _build_heatmap_strip(
-    samples_data: List[Dict], key: str,
+    samples_data: list[dict], key: str,
     tile: int = TILE, gap: int = GAP,
-    global_vmax: Optional[float] = None,
+    global_vmax: float | None = None,
 ) -> np.ndarray:
     cmap = plt.cm.inferno
     N = len(samples_data)
@@ -218,7 +217,7 @@ def _build_heatmap_strip(
 
 # ───────────────────── Per-position top-down strip ─────────────────────
 
-def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[List]]:
+def _load_topdown_data(clip_dir: Path) -> tuple[np.ndarray | None, list | None]:
     """Load pre-rendered navmesh BEV image and trajectory pixel coordinates."""
     topdown_path = clip_dir / "topdown_trajectory.jpg"
     transform_path = clip_dir / "topdown_transform.json"
@@ -230,7 +229,7 @@ def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[L
 
     if transform_path.exists():
         import json
-        with open(transform_path, 'r') as f:
+        with open(transform_path) as f:
             transform = json.load(f)
         trajectory_pixels = transform["trajectory_pixels"]
     else:
@@ -238,7 +237,7 @@ def _load_topdown_data(clip_dir: Path) -> Tuple[Optional[np.ndarray], Optional[L
     return topdown_img, trajectory_pixels
 
 
-def _heading_from_pose(pose: np.ndarray) -> Tuple[float, float]:
+def _heading_from_pose(pose: np.ndarray) -> tuple[float, float]:
     """Extract the agent's forward direction on the XZ ground plane from a
     camera-to-world 4x4 pose matrix.  Camera forward is -Z in camera space,
     so world forward = R @ [0, 0, -1]^T.
@@ -254,12 +253,12 @@ def _heading_from_pose(pose: np.ndarray) -> Tuple[float, float]:
 
 def _render_topdown_for_position(
     base_img: np.ndarray,
-    trajectory_pixels: List,
+    trajectory_pixels: list,
     current_frame_idx: int,
-    history_frame_indices: List[int],
+    history_frame_indices: list[int],
     position_label: int,
     out_size: int,
-    current_pose: Optional[np.ndarray] = None,
+    current_pose: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render a top-down map highlighting current position and its history frames."""
     canvas = base_img.copy()
@@ -320,11 +319,11 @@ def _render_topdown_for_position(
 
 def _build_topdown_strip(
     clip_dir: Path,
-    sampled_frame_indices: List[int],
-    samples_data: List[Dict[str, Any]],
-    all_poses: Optional[List[np.ndarray]] = None,
+    sampled_frame_indices: list[int],
+    samples_data: list[dict[str, Any]],
+    all_poses: list[np.ndarray] | None = None,
     tile: int = TILE, gap: int = GAP,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     topdown_img, trajectory_pixels = _load_topdown_data(clip_dir)
     if topdown_img is None or trajectory_pixels is None:
         return None
@@ -357,9 +356,9 @@ def _build_topdown_strip(
 # ───────────────── Local-frame trajectory BEV ─────────────────
 
 def _compute_local_history(
-    all_poses: List[np.ndarray],
+    all_poses: list[np.ndarray],
     current_t: int,
-    history_indices: List[int],
+    history_indices: list[int],
 ) -> np.ndarray:
     """Use the same coordinate transform as the dataloader to compute
     history trajectory in the current frame's local coordinate system,
@@ -419,7 +418,7 @@ def _render_local_traj_bev(
         for i in range(len(history_xy) - 1):
             cv2.line(canvas, to_px(history_xy[i]), to_px(history_xy[i + 1]),
                      (200, 130, 50), 2, cv2.LINE_AA)
-    for idx, pt in enumerate(history_xy):
+    for _idx, pt in enumerate(history_xy):
         cv2.circle(canvas, to_px(pt), 4, (200, 130, 50), -1, cv2.LINE_AA)
 
     # current position (red, at origin)
@@ -439,9 +438,9 @@ def _render_local_traj_bev(
 
 
 def _build_local_traj_strip(
-    all_poses: List[np.ndarray],
-    sampled_frame_indices: List[int],
-    samples_data: List[Dict[str, Any]],
+    all_poses: list[np.ndarray],
+    sampled_frame_indices: list[int],
+    samples_data: list[dict[str, Any]],
     tile: int = TILE, gap: int = GAP,
 ) -> np.ndarray:
     N = len(sampled_frame_indices)
@@ -469,9 +468,9 @@ def _build_local_traj_strip(
 def visualize_clip_panoramic(
     clip_name: str,
     instruction: str,
-    samples_data: List[Dict[str, Any]],
-    all_poses: List[np.ndarray],
-    sampled_frame_indices: List[int],
+    samples_data: list[dict[str, Any]],
+    all_poses: list[np.ndarray],
+    sampled_frame_indices: list[int],
     clip_dir: Path,
     output_path: str,
     tile: int = TILE,
@@ -492,7 +491,7 @@ def visualize_clip_panoramic(
     group_w = 4 * tile
     td_h = 4 * tile  # top-down tile height = group width (square)
 
-    strips: List[Tuple[np.ndarray, str]] = []
+    strips: list[tuple[np.ndarray, str]] = []
     if td_strip is not None:
         strips.append((td_strip, "Top-Down"))
     strips.append((local_traj_strip, "Local Traj"))
@@ -542,8 +541,8 @@ def collect_clip_samples(
     num_clips: int,
     frames_per_clip: int,
     seed: int,
-) -> List[Tuple[int, List[Tuple[int, int]]]]:
-    by_clip: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+) -> list[tuple[int, list[tuple[int, int]]]]:
+    by_clip: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for dataset_idx, (clip_idx, frame_idx) in enumerate(dataset.sample_index):
         by_clip[int(clip_idx)].append((int(frame_idx), int(dataset_idx)))
 
@@ -634,8 +633,9 @@ def main() -> int:
     state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', {}))
     if state_dict:
         current_state = model.state_dict()
-        norm = lambda n: n.replace("module.", "", 1).replace(".module.", ".")
-        norm_to_actual = {norm(k): k for k in current_state.keys()}
+        def norm(n):
+            return n.replace("module.", "", 1).replace(".module.", ".")
+        norm_to_actual = {norm(k): k for k in current_state}
         remapped = {}
         skipped = []
         for k, v in state_dict.items():
@@ -663,8 +663,8 @@ def main() -> int:
         logger.info(f"[Clip {clip_order + 1}/{len(selected_clips)}] {clip_name} ({len(items)} samples)")
 
         all_poses = dataset._load_poses(clip_idx)
-        samples_data: List[Dict[str, Any]] = []
-        sampled_frame_indices: List[int] = []
+        samples_data: list[dict[str, Any]] = []
+        sampled_frame_indices: list[int] = []
         instruction = ""
 
         num_hist = getattr(dataset, 'num_history_sample', 8)

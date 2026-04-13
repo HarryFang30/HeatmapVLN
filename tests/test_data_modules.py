@@ -87,7 +87,7 @@ class TestHeatmapGeometry:
         K = np.array([[320, 0, 320], [0, 320, 240], [0, 0, 1]], dtype=np.float32)
         result = project_point_pinhole(np.array([0, 0, -5.0]), K, 640, 480)
         assert result is not None
-        u, v, z = result
+        _u, _v, z = result
         assert z == pytest.approx(5.0)
 
 

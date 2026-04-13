@@ -11,14 +11,16 @@ It uses a U-Net architecture with FiLM conditioning to predict noise given:
 - Optional local conditioning
 """
 
-from typing import Union, List, Optional
+import itertools
 import logging
+from typing import Union
+
+import einops
 import torch
 import torch.nn as nn
-import einops
 from einops.layers.torch import Rearrange
 
-from .conv1d_components import Downsample1d, Upsample1d, Conv1dBlock
+from .conv1d_components import Conv1dBlock
 from .positional_embedding import SinusoidalPosEmb
 
 logger = logging.getLogger(__name__)
@@ -27,10 +29,10 @@ logger = logging.getLogger(__name__)
 class ConditionalResidualBlock1D(nn.Module):
     """
     Conditional residual block with FiLM modulation.
-    
+
     Uses Feature-wise Linear Modulation (FiLM) to condition the block
     on external information (timestep + global features).
-    
+
     Args:
         in_channels: Number of input channels
         out_channels: Number of output channels
@@ -40,11 +42,11 @@ class ConditionalResidualBlock1D(nn.Module):
         cond_predict_scale: If True, predict both scale and bias for FiLM
         dropout: Dropout rate for regularization
     """
-    
+
     def __init__(
-        self, 
-        in_channels: int, 
-        out_channels: int, 
+        self,
+        in_channels: int,
+        out_channels: int,
         cond_dim: int,
         kernel_size: int = 3,
         n_groups: int = 8,
@@ -102,18 +104,18 @@ class ConditionalResidualBlock1D(nn.Module):
 class ConditionalUnet1D(nn.Module):
     """
     Conditional U-Net 1D for noise prediction in diffusion models.
-    
+
     Architecture:
     - Encoder path: Series of conditional residual blocks with optional downsampling
     - Middle: Two conditional residual blocks
     - Decoder path: Series of conditional residual blocks with skip connections
     - Final conv: Project back to input dimension
-    
+
     Conditioning:
     - Diffusion timestep: Encoded via sinusoidal embedding
     - Global condition: Concatenated with timestep embedding
     - Local condition: Added to features at specific layers
-    
+
     Args:
         input_dim: Dimension of input (action dimension)
         local_cond_dim: Optional dimension for local conditioning
@@ -125,21 +127,23 @@ class ConditionalUnet1D(nn.Module):
         cond_predict_scale: If True, use scale+bias FiLM, else just bias
         dropout: Dropout rate for regularization (applied in Conv1dBlocks)
     """
-    
+
     def __init__(
-        self, 
+        self,
         input_dim: int,
-        local_cond_dim: Optional[int] = None,
-        global_cond_dim: Optional[int] = None,
+        local_cond_dim: int | None = None,
+        global_cond_dim: int | None = None,
         diffusion_step_embed_dim: int = 256,
-        down_dims: List[int] = [256, 512, 1024],
+        down_dims: list[int] | None = None,
         kernel_size: int = 3,
         n_groups: int = 8,
         cond_predict_scale: bool = False,
         dropout: float = 0.1,
     ):
+        if down_dims is None:
+            down_dims = [256, 512, 1024]
         super().__init__()
-        all_dims = [input_dim] + list(down_dims)
+        all_dims = [input_dim, *list(down_dims)]
         start_dim = down_dims[0]
 
         dsed = diffusion_step_embed_dim
@@ -153,7 +157,7 @@ class ConditionalUnet1D(nn.Module):
         if global_cond_dim is not None:
             cond_dim += global_cond_dim
 
-        in_out = list(zip(all_dims[:-1], all_dims[1:]))
+        in_out = list(itertools.pairwise(all_dims))
 
         local_cond_encoder = None
         if local_cond_dim is not None:
@@ -162,12 +166,12 @@ class ConditionalUnet1D(nn.Module):
             local_cond_encoder = nn.ModuleList([
                 # down encoder
                 ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
+                    dim_in, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale, dropout=dropout),
                 # up encoder
                 ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
+                    dim_in, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale, dropout=dropout)
             ])
@@ -188,14 +192,14 @@ class ConditionalUnet1D(nn.Module):
 
         down_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (len(in_out) - 1)
+            ind >= (len(in_out) - 1)
             down_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
+                    dim_in, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale, dropout=dropout),
                 ConditionalResidualBlock1D(
-                    dim_out, dim_out, cond_dim=cond_dim, 
+                    dim_out, dim_out, cond_dim=cond_dim,
                     kernel_size=kernel_size, n_groups=n_groups,
                     cond_predict_scale=cond_predict_scale, dropout=dropout),
                 # Note: DifNav uses Identity instead of actual downsampling
@@ -204,7 +208,7 @@ class ConditionalUnet1D(nn.Module):
 
         up_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            is_last = ind >= (len(in_out) - 1)
+            ind >= (len(in_out) - 1)
             up_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
                     dim_out * 2, dim_in, cond_dim=cond_dim,
@@ -217,7 +221,7 @@ class ConditionalUnet1D(nn.Module):
                 # Note: DifNav uses Identity instead of actual upsampling
                 nn.Identity()
             ]))
-        
+
         final_conv = nn.Sequential(
             Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
             nn.Conv1d(start_dim, input_dim, 1),
@@ -230,27 +234,27 @@ class ConditionalUnet1D(nn.Module):
         self.final_conv = final_conv
 
         logger.info(
-            "ConditionalUnet1D initialized with %e parameters", 
+            "ConditionalUnet1D initialized with %e parameters",
             sum(p.numel() for p in self.parameters())
         )
 
     def forward(
-        self, 
-        sample: torch.Tensor, 
-        timestep: Union[torch.Tensor, float, int], 
-        local_cond: Optional[torch.Tensor] = None, 
-        global_cond: Optional[torch.Tensor] = None, 
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        local_cond: torch.Tensor | None = None,
+        global_cond: torch.Tensor | None = None,
         **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for noise prediction.
-        
+
         Args:
             sample: (B, pred_horizon, action_dim) noisy action sample
             timestep: (B,) or scalar diffusion timestep
             local_cond: Optional (B, pred_horizon, local_cond_dim) local conditioning
             global_cond: Optional (B, global_cond_dim) global conditioning
-            
+
         Returns:
             (B, pred_horizon, action_dim) predicted noise
         """
@@ -275,7 +279,7 @@ class ConditionalUnet1D(nn.Module):
             global_feature = torch.cat([
                 global_feature, global_cond
             ], axis=-1)
-        
+
         # 3. Encode local features (if any)
         h_local = list()
         if local_cond is not None:
@@ -285,7 +289,7 @@ class ConditionalUnet1D(nn.Module):
             h_local.append(x)
             x = resnet2(local_cond, global_feature)
             h_local.append(x)
-        
+
         # 4. Encoder path
         x = sample
         h = []

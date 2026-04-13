@@ -23,7 +23,6 @@ Inference: Euler ODE solver with Classifier-Free Guidance.
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import torch
@@ -33,8 +32,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from safetensors import safe_open
 
-from .nextdit import NextDiTCrossAttn, NextDiTCrossAttnConfig
-from .nextdit import SinusoidalPositionalEncoding, MemoryEncoder, QFormer
+from .nextdit import MemoryEncoder, NextDiTCrossAttn, NextDiTCrossAttnConfig, QFormer, SinusoidalPositionalEncoding
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +51,7 @@ class NextDiTActionConfig:
     dit_layers: int = 12
     dit_heads: int = 6
     dit_kv_heads: int = 6
-    dit_ffn_dim_multiplier: Optional[float] = 2 / 3
+    dit_ffn_dim_multiplier: float | None = 2 / 3
     predict_steps: int = 32
     action_dim: int = 3
     num_inference_steps: int = 10
@@ -148,8 +146,8 @@ class NextDiTActionHead(nn.Module):
     def load_pretrained_system1(
         self,
         ckpt_path: str,
-        latent_queries: Optional[nn.Parameter] = None,
-    ) -> Tuple[List[str], List[str], int]:
+        latent_queries: nn.Parameter | None = None,
+    ) -> tuple[list[str], list[str], int]:
         """
         Load pretrained System 1 weights from extracted DualVLN checkpoint.
 
@@ -173,13 +171,13 @@ class NextDiTActionHead(nn.Module):
 
         if ckpt_path.endswith(".safetensors"):
             f = safe_open(ckpt_path, framework="pt", device="cpu")
-            ckpt_sd = {k: f.get_tensor(k) for k in f.keys()}
+            ckpt_sd = {k: f.get_tensor(k) for k in f}
         else:
             ckpt_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         current_sd = self.state_dict()
-        loaded_sd: Dict[str, torch.Tensor] = {}
-        skipped: List[str] = []
+        loaded_sd: dict[str, torch.Tensor] = {}
+        skipped: list[str] = []
 
         for ckpt_key, ckpt_val in ckpt_sd.items():
             if ckpt_key == "latent_queries":
@@ -209,7 +207,7 @@ class NextDiTActionHead(nn.Module):
                 len(skipped), "\n  ".join(skipped),
             )
 
-        missing, unexpected = self.load_state_dict(loaded_sd, strict=False)
+        missing, _unexpected = self.load_state_dict(loaded_sd, strict=False)
         real_missing = [k for k in missing if not k.startswith("_")]
         loaded_count = len(loaded_sd)
 
@@ -293,7 +291,7 @@ class NextDiTActionHead(nn.Module):
     def _fuse_conditions(
         self,
         traj_hidden_states: torch.Tensor,
-        traj_images: Optional[torch.Tensor] = None,
+        traj_images: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Fuse System 2 latent queries with visual memory.
@@ -332,9 +330,9 @@ class NextDiTActionHead(nn.Module):
         self,
         traj_hidden_states: torch.Tensor,
         gt_trajectory: torch.Tensor,
-        traj_images: Optional[torch.Tensor] = None,
-        trajectory_valid: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        traj_images: torch.Tensor | None = None,
+        trajectory_valid: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Compute flow matching training loss.
 
@@ -402,7 +400,7 @@ class NextDiTActionHead(nn.Module):
     def generate_traj(
         self,
         traj_hidden_states: torch.Tensor,
-        traj_images: Optional[torch.Tensor] = None,
+        traj_images: torch.Tensor | None = None,
         predict_step_nums: int = 32,
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
@@ -481,7 +479,7 @@ class NextDiTActionHead(nn.Module):
     def get_trajectory(
         self,
         traj_hidden_states: torch.Tensor,
-        traj_images: Optional[torch.Tensor] = None,
+        traj_images: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         High-level trajectory inference interface.

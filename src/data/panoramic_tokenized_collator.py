@@ -16,7 +16,7 @@ import ctypes
 import gc
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 
@@ -65,13 +65,13 @@ class PanoramicTokenizedCollator:
         self._call_count = 0
 
     @staticmethod
-    def _stack_optional(batch: List[Dict[str, Any]], key: str):
+    def _stack_optional(batch: list[dict[str, Any]], key: str):
         if key in batch[0]:
             return torch.stack([sample[key] for sample in batch], dim=0)
         return None
 
     @staticmethod
-    def _stack_padded_history_frames(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def _stack_padded_history_frames(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         max_k = max(sample["history_frames"].shape[0] for sample in batch)
         history_frames_padded = []
         history_mask = []
@@ -96,7 +96,7 @@ class PanoramicTokenizedCollator:
 
     @staticmethod
     def _stack_padded_first_dim(
-        batch: List[Dict[str, Any]],
+        batch: list[dict[str, Any]],
         key: str,
         pad_value: float = 0.0,
     ) -> torch.Tensor:
@@ -118,7 +118,7 @@ class PanoramicTokenizedCollator:
 
         return torch.stack(padded_tensors, dim=0)
 
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         self._call_count += 1
         do_log = (self._call_count <= 5) or (self._call_count % 25 == 0)
         pid = os.getpid()
@@ -231,7 +231,7 @@ class PanoramicTokenizedCollator:
             # Append TRAJ_TOKEN_INDEX placeholders (InternNav-aligned)
             nq = self.n_traj_query
             if nq > 0:
-                B, L = pano_inputs["input_ids"].shape
+                B, _L = pano_inputs["input_ids"].shape
                 traj_tokens = torch.full(
                     (B, nq), TRAJ_TOKEN_INDEX,
                     dtype=pano_inputs["input_ids"].dtype,
@@ -278,7 +278,7 @@ class PanoramicTokenizedCollator:
             pano_mb = 0.0
             pi = result.get("pano_inputs")
             if pi is not None:
-                for k, v in pi.items():
+                for _k, v in pi.items():
                     if isinstance(v, torch.Tensor):
                         pano_mb += v.nelement() * v.element_size() / (1024 * 1024)
             gc_stats = gc.get_stats()

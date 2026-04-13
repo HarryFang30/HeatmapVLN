@@ -5,16 +5,13 @@ Visualization utilities for VLN heatmap evaluation.
 Provides grid generation and thumbnail creation for frame-by-frame comparisons.
 """
 
-import numpy as np
-import cv2
-import torch
 from pathlib import Path
-from typing import Dict, Tuple, Optional
-from .frame_vis_utils import (
-    create_frame_by_frame_overlay,
-    create_single_heatmap_overlay,
-    create_difference_map
-)
+
+import cv2
+import numpy as np
+import torch
+
+from .frame_vis_utils import create_difference_map, create_frame_by_frame_overlay, create_single_heatmap_overlay
 
 
 def annotate_frame(
@@ -78,7 +75,7 @@ def create_comparison_grid(
     max_frames: int = 16,
     alpha: float = 0.5,
     threshold: float = 0.05
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """
     Generate comparison grids based on overlay mode.
 
@@ -292,10 +289,10 @@ def _create_full_separate_grid(
 
 def create_thumbnail(
     rgb_frame: np.ndarray,
-    gt_hm_hist: Optional[np.ndarray],
-    gt_hm_fut: Optional[np.ndarray],
+    gt_hm_hist: np.ndarray | None,
+    gt_hm_fut: np.ndarray | None,
     save_path: Path,
-    size: Tuple[int, int] = (256, 256),
+    size: tuple[int, int] = (256, 256),
     alpha: float = 0.5,
     threshold: float = 0.05
 ) -> None:

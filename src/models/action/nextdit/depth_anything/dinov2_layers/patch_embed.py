@@ -8,10 +8,11 @@
 #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/patch_embed.py
 
-from typing import Callable, Optional, Tuple, Union
+from collections.abc import Callable
+from typing import Union
 
-from torch import Tensor
 import torch.nn as nn
+from torch import Tensor
 
 
 def make_2tuple(x):
@@ -37,11 +38,11 @@ class PatchEmbed(nn.Module):
 
     def __init__(
         self,
-        img_size: Union[int, Tuple[int, int]] = 224,
-        patch_size: Union[int, Tuple[int, int]] = 16,
+        img_size: Union[int, tuple[int, int]] = 224,
+        patch_size: Union[int, tuple[int, int]] = 16,
         in_chans: int = 3,
         embed_dim: int = 768,
-        norm_layer: Optional[Callable] = None,
+        norm_layer: Callable | None = None,
         flatten_embedding: bool = True,
     ) -> None:
         super().__init__()

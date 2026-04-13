@@ -10,19 +10,20 @@ Sequence packing is currently disabled on the shared stack.
 """
 
 import warnings
+
 warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*")
 warnings.filterwarnings("ignore", message=".*video_metadata.*")
 
-import os
+import logging
 import time
+from dataclasses import dataclass
+from typing import Any, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
-import logging
-from typing import Dict, Any, Optional, List, Tuple, Union
-from dataclasses import dataclass, field
 from PIL import Image
-import numpy as np
 
 from ..heatmap.input_constructor import find_text_anchor_positions
 from ..runtime_compat import ensure_transformers_runtime_compat
@@ -39,13 +40,13 @@ TRAJ_TOKEN_INDEX = 151667
 # Import sequence packing utilities
 try:
     from .sequence_packing import (
-        FlattenedDataCollatorForVLN,
-        split_packed_hidden_states,
-        split_packed_vision_hidden_states,
-        replace_attention_with_varlen,
-        get_rope_index_3,
         IMAGE_TOKEN_ID,
         VIDEO_TOKEN_ID,
+        FlattenedDataCollatorForVLN,
+        get_rope_index_3,
+        replace_attention_with_varlen,
+        split_packed_hidden_states,
+        split_packed_vision_hidden_states,
     )
     PACKING_AVAILABLE = True
 except ImportError:
@@ -56,41 +57,41 @@ except ImportError:
 @dataclass
 class Qwen2_5VLConfig:
     """Configuration for the Qwen2.5-VL integration wrapper."""
-    
+
     # Model path
     model_path: str = "./models/internnav_backbone"
-    
+
     # Device and dtype
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
-    
+
     # Attention implementation (sdpa, flash_attention_2, or eager)
     # Blackwell GPU (RTX 5090) 需使用 sdpa，flash_attention_2 不支持 sm_120
     attn_implementation: str = "sdpa"
-    
+
     # Generation settings (for inference mode)
     max_new_tokens: int = 128
     temperature: float = 0.7
-    
+
     # Hidden state extraction
     hidden_layer_for_features: int = -1  # -1 = last layer (deprecated when multi_layer_features=True)
-    
+
     # Video processing
     max_video_frames: int = 16  # Maximum frames to process
-    
+
     # Sequence Packing settings (legacy; disabled on the shared stack)
     enable_packing: bool = False  # Whether to use sequence packing
     max_seq_length: int = 4096    # Maximum packed sequence length
     spatial_merge_size: int = 2   # Vision spatial merge size for position IDs
-    
+
     # LoRA configuration
     use_lora: bool = False        # Enable LoRA adapters
     lora_rank: int = 16           # LoRA rank
     lora_alpha: int = 32          # LoRA alpha
     lora_num_layers: int = 4      # Number of last LLM layers to apply LoRA
-    lora_layer_indices: Optional[List[int]] = None  # Exact layer indices (overrides lora_num_layers)
+    lora_layer_indices: list[int] | None = None  # Exact layer indices (overrides lora_num_layers)
     lora_dropout: float = 0.05    # LoRA dropout
-    lora_target_modules: Optional[List[str]] = None  # Target modules (default: ["q_proj", "v_proj"])
+    lora_target_modules: list[str] | None = None  # Target modules (default: ["q_proj", "v_proj"])
     heatmap_trains_backbone: bool = False  # Allow heatmap loss to backprop through backbone
     gradient_checkpointing: bool = False
     enable_internal_profiling: bool = False
@@ -98,7 +99,7 @@ class Qwen2_5VLConfig:
     enable_compile: bool = False
     compile_mode: str = "reduce-overhead"
     compile_backend: str = "inductor"
-    
+
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
         dtype_map = {
@@ -114,16 +115,16 @@ class _ModuleTimingProfiler:
 
     def __init__(self, device: torch.device):
         self.device = device
-        self._handles: List[Any] = []
-        self._starts: Dict[int, float] = {}
-        self._totals: Dict[str, float] = {}
-        self._registered: set[Tuple[int, str]] = set()
+        self._handles: list[Any] = []
+        self._starts: dict[int, float] = {}
+        self._totals: dict[str, float] = {}
+        self._registered: set[tuple[int, str]] = set()
 
     def _sync(self) -> None:
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
-    def register(self, module: Optional[nn.Module], key: str) -> None:
+    def register(self, module: nn.Module | None, key: str) -> None:
         if module is None or not isinstance(module, nn.Module):
             return
         reg_key = (id(module), key)
@@ -131,11 +132,11 @@ class _ModuleTimingProfiler:
             return
         self._registered.add(reg_key)
 
-        def _pre_hook(mod: nn.Module, _inputs: Tuple[Any, ...]) -> None:
+        def _pre_hook(mod: nn.Module, _inputs: tuple[Any, ...]) -> None:
             self._sync()
             self._starts[id(mod)] = time.perf_counter()
 
-        def _post_hook(mod: nn.Module, _inputs: Tuple[Any, ...], _output: Any) -> None:
+        def _post_hook(mod: nn.Module, _inputs: tuple[Any, ...], _output: Any) -> None:
             start = self._starts.pop(id(mod), None)
             self._sync()
             if start is None:
@@ -149,7 +150,7 @@ class _ModuleTimingProfiler:
         self._starts.clear()
         self._totals = {}
 
-    def snapshot(self) -> Dict[str, float]:
+    def snapshot(self) -> dict[str, float]:
         totals = dict(self._totals)
         self.reset()
         return totals
@@ -165,33 +166,33 @@ class _ModuleTimingProfiler:
 
 class Qwen2_5VLIntegration(nn.Module):
     """Qwen2.5-VL integration wrapper for VLN Pipeline."""
-    
+
     def __init__(self, config: Qwen2_5VLConfig):
         super().__init__()
         self.config = config
         self.device = torch.device(config.device)
-        
+
         # Model and processor (lazy loading)
         self.model = None
         self.processor = None
         self._model_loaded = False
-        
+
         self._runtime_compat_state = None
-        
+
         # Token IDs are set during model loading based on backbone type
         self.video_token_id = None
         self.image_token_id = None
         self.vision_start_id = None
         self.vision_end_id = None
-        
+
         # Sequence packing state
         self._packing_enabled = config.enable_packing
         self._varlen_attention_replaced = False
-        self._internal_profiler: Optional[_ModuleTimingProfiler] = None
-        self._last_internal_timings: Dict[str, float] = {}
-        
+        self._internal_profiler: _ModuleTimingProfiler | None = None
+        self._last_internal_timings: dict[str, float] = {}
+
         logger.info("VLM Integration initialized (model will be loaded on first forward)")
-    
+
     def _load_model(self):
         """Load the Qwen2.5-VL backbone and processor."""
         if self._model_loaded:
@@ -261,7 +262,7 @@ class Qwen2_5VLIntegration(nn.Module):
     def _load_with_attn_fallback(self, model_cls, model_path: str):
         """Try loading with the requested attention impl, fall back to sdpa."""
         requested = self.config.attn_implementation
-        candidates: List[str] = []
+        candidates: list[str] = []
         if requested == "flash_attention_2":
             flash_available = bool(
                 self._runtime_compat_state and self._runtime_compat_state.flash_attn_available
@@ -294,7 +295,7 @@ class Qwen2_5VLIntegration(nn.Module):
         raise RuntimeError(f"Failed to load model from {model_path}")
 
     @staticmethod
-    def _get_nested_module(root: Any, path: str) -> Optional[nn.Module]:
+    def _get_nested_module(root: Any, path: str) -> nn.Module | None:
         module = root
         for part in path.split("."):
             module = getattr(module, part, None)
@@ -311,7 +312,7 @@ class Qwen2_5VLIntegration(nn.Module):
         base_model = getattr(self.model, "model", self.model)
         profiler = _ModuleTimingProfiler(self.device)
 
-        def register_first(root: Any, key: str, candidates: List[str]) -> Optional[nn.Module]:
+        def register_first(root: Any, key: str, candidates: list[str]) -> nn.Module | None:
             for path in candidates:
                 module = self._get_nested_module(root, path)
                 if module is not None:
@@ -371,7 +372,7 @@ class Qwen2_5VLIntegration(nn.Module):
         else:
             logger.warning("Qwen internal profiling requested, but no matching modules were found")
 
-    def _consume_internal_timings(self) -> Dict[str, float]:
+    def _consume_internal_timings(self) -> dict[str, float]:
         timings = dict(self._last_internal_timings)
         self._last_internal_timings = {}
         return timings
@@ -402,7 +403,7 @@ class Qwen2_5VLIntegration(nn.Module):
         if self.config.compile_backend != "inductor":
             return True
         try:
-            from triton.compiler.compiler import triton_key  # noqa: F401
+            from triton.compiler.compiler import triton_key
             return True
         except Exception as exc:
             logger.warning(
@@ -429,7 +430,7 @@ class Qwen2_5VLIntegration(nn.Module):
             "the language model depends on FLA Triton kernels that are not "
             "reliably compatible with Inductor here"
         )
-    
+
     # ------------------------------------------------------------------
     # LoRA
     # ------------------------------------------------------------------
@@ -437,17 +438,17 @@ class Qwen2_5VLIntegration(nn.Module):
     def _apply_lora(self):
         """
         Apply LoRA adapters to the last N layers of Qwen2.5-VL's language model.
-        
+
         Uses PEFT library to add low-rank adapters to q_proj and v_proj
         in the specified layers. LoRA parameters are trainable while
         the base model remains frozen.
         """
         try:
             from peft import LoraConfig, get_peft_model
-        except ImportError:
+        except ImportError as err:
             logger.error("peft not installed. Install with: pip install peft")
-            raise ImportError("peft is required for LoRA. Install with: pip install peft")
-        
+            raise ImportError("peft is required for LoRA. Install with: pip install peft") from err
+
         num_layers = None
         if hasattr(self.model, 'model'):
             m = self.model.model
@@ -457,13 +458,13 @@ class Qwen2_5VLIntegration(nn.Module):
                 num_layers = len(m.layers)
         if num_layers is None and hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
             num_layers = len(self.model.language_model.model.layers)
-        
+
         if num_layers is None:
             num_layers = 28  # InternNav Qwen2.5-VL default
             logger.warning(f"Could not detect layer count, using default: {num_layers}")
         else:
             logger.info(f"Detected {num_layers} LLM layers")
-        
+
         if self.config.lora_layer_indices is not None:
             lora_layers = list(self.config.lora_layer_indices)
         else:
@@ -471,10 +472,10 @@ class Qwen2_5VLIntegration(nn.Module):
                 num_layers - self.config.lora_num_layers,
                 num_layers
             ))
-        
+
         # 使用配置中的 target_modules，默认 ["q_proj", "v_proj"]
         target_modules = self.config.lora_target_modules or ["q_proj", "v_proj"]
-        
+
         lora_config = LoraConfig(
             r=self.config.lora_rank,
             lora_alpha=self.config.lora_alpha,
@@ -484,9 +485,9 @@ class Qwen2_5VLIntegration(nn.Module):
             bias="none",
             task_type="CAUSAL_LM",
         )
-        
+
         self.model = get_peft_model(self.model, lora_config)
-        
+
         # Log LoRA info
         lora_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -498,7 +499,7 @@ class Qwen2_5VLIntegration(nn.Module):
             f"LoRA trainable: {lora_params:,} / {total_params:,} "
             f"({100 * lora_params / total_params:.4f}%)"
         )
-    
+
     def enable_sequence_packing(self) -> bool:
         """Sequence packing is disabled on the current Qwen2.5-VL stack."""
         logger.warning(
@@ -506,84 +507,84 @@ class Qwen2_5VLIntegration(nn.Module):
             "training stack. Use standard batching instead."
         )
         return False
-    
-    def forward_packed(self, packed_batch: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+
+    def forward_packed(self, packed_batch: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Disabled for Qwen2.5-VL on the current training stack."""
         raise NotImplementedError(
             "Sequence packing is not supported for Qwen2.5-VL. "
             "Set enable_packing=false in config and use standard forward()."
         )
-    
+
     def get_data_collator(self) -> "FlattenedDataCollatorForVLN":
         """
         获取用于 Sequence Packing 的 Data Collator
-        
+
         Returns:
             FlattenedDataCollatorForVLN instance
         """
         if not self._model_loaded:
             self._load_model()
-        
+
         if not PACKING_AVAILABLE:
             raise ImportError("Sequence packing module not available")
-        
+
         return FlattenedDataCollatorForVLN(tokenizer=self.processor.tokenizer)
-    
-    def _tensor_to_pil_images(self, tensor: torch.Tensor) -> List[Image.Image]:
+
+    def _tensor_to_pil_images(self, tensor: torch.Tensor) -> list[Image.Image]:
         """
         Convert tensor frames to PIL Images.
-        
+
         Args:
             tensor: (N, C, H, W) tensor with values in [0, 1]
-            
+
         Returns:
             List of PIL Images
         """
         images = []
         tensor = tensor.cpu()
-        
+
         for i in range(tensor.shape[0]):
             frame = tensor[i]  # (C, H, W)
             # Convert to numpy (H, W, C) and scale to [0, 255]
             frame_np = frame.permute(1, 2, 0).numpy()
             frame_np = (frame_np * 255).clip(0, 255).astype(np.uint8)
             images.append(Image.fromarray(frame_np))
-        
+
         return images
-    
+
     def _prepare_messages_single(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
-        instruction: Optional[str] = None,
-    ) -> Tuple[List[Dict], List[Image.Image], Image.Image]:
+        instruction: str | None = None,
+    ) -> tuple[list[dict], list[Image.Image], Image.Image]:
         """
         Prepare messages for a single sample.
-        
+
         Args:
             history_frames: (K, C, H, W) history video frames for ONE sample
             current_frame: (C, H, W) current observation for ONE sample
             instruction: Navigation instruction text
-            
+
         Returns:
             Tuple of (messages, history_pil, current_pil)
         """
         # Convert history frames to PIL images
         history_pil = self._tensor_to_pil_images(history_frames)
-        
+
         # Limit number of frames (max_video_frames == -1 means no limit)
         if self.config.max_video_frames > 0 and len(history_pil) > self.config.max_video_frames:
             # Uniform sampling
             indices = np.linspace(0, len(history_pil) - 1, self.config.max_video_frames, dtype=int)
             history_pil = [history_pil[i] for i in indices]
-        
+
         # Convert current frame to PIL
         current_pil = self._tensor_to_pil_images(current_frame.unsqueeze(0))[0]
-        
+
         # Build instruction text
         if instruction is None or instruction == "":
             instruction = "Analyze the spatial relationships in this navigation sequence."
-        
+
         prompt_text = (
             "You are a navigation assistant. "
             "The video shows the historical trajectory from a forward-facing camera. "
@@ -591,7 +592,7 @@ class Qwen2_5VLIntegration(nn.Module):
             f"Instruction: {instruction}. "
             "Understand the spatial layout and identify where you came from."
         )
-        
+
         # Build message content
         # 使用 nframes 明确指定帧数，避免 fps 采样警告
         content = [
@@ -599,31 +600,31 @@ class Qwen2_5VLIntegration(nn.Module):
             {"type": "image", "image": current_pil},
             {"type": "text", "text": prompt_text},
         ]
-        
+
         messages = [{"role": "user", "content": content}]
-        
+
         return messages, history_pil, current_pil
-    
+
     def _prepare_conversations_batch(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
-        instruction: Optional[Union[str, List[str]]] = None,
-    ) -> List[List[Dict]]:
+        instruction: Union[str, list[str]] | None = None,
+    ) -> list[list[dict]]:
         """
         Prepare conversations for batch processing.
-        
+
         Args:
             history_frames: (B, K, C, H, W) history video frames
             current_frame: (B, C, H, W) current observation
             instruction: Navigation instruction (str for all, or List[str] per sample)
-            
+
         Returns:
             List of conversations, each conversation is a list of messages
         """
         batch_size = history_frames.shape[0]
         conversations = []
-        
+
         for b in range(batch_size):
             # Get instruction for this sample
             if instruction is None:
@@ -632,7 +633,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 sample_instruction = instruction[b] if b < len(instruction) else instruction[0]
             else:
                 sample_instruction = instruction
-            
+
             # Prepare single sample messages
             messages, _, _ = self._prepare_messages_single(
                 history_frames[b],  # (K, C, H, W)
@@ -640,16 +641,16 @@ class Qwen2_5VLIntegration(nn.Module):
                 sample_instruction,
             )
             conversations.append(messages)
-        
+
         return conversations
 
     @staticmethod
-    def _views_tensor_to_dict(views: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _views_tensor_to_dict(views: torch.Tensor) -> dict[str, torch.Tensor]:
         if views.dim() != 4 or views.shape[0] != 4:
             raise ValueError(f"Expected views tensor [4, C, H, W], got {tuple(views.shape)}")
         return {name: views[idx] for idx, name in enumerate(VIEW_NAMES)}
 
-    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> List[Dict[str, torch.Tensor]]:
+    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
             raise ValueError(
                 f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
@@ -660,7 +661,7 @@ class Qwen2_5VLIntegration(nn.Module):
         ]
 
     @staticmethod
-    def _pad_and_stack(tensors: List[torch.Tensor], pad_dim: int = 1) -> torch.Tensor:
+    def _pad_and_stack(tensors: list[torch.Tensor], pad_dim: int = 1) -> torch.Tensor:
         """Pad a variable-length dimension and stack into a batch tensor."""
         max_len = max(t.shape[pad_dim] for t in tensors)
         padded = []
@@ -678,11 +679,11 @@ class Qwen2_5VLIntegration(nn.Module):
 
     def _forward_model_inputs(
         self,
-        inputs: Dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
         return_hidden_states: bool,
         skip_lm_head: bool = False,
-        latent_queries: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[torch.Tensor]]:
+        latent_queries: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, torch.Tensor | None]:
         """Run Qwen on already prepared multimodal inputs.
 
         Aligned with InternNav's traj-token mechanism:
@@ -709,7 +710,7 @@ class Qwen2_5VLIntegration(nn.Module):
         vision_input_ids = raw_input_ids
 
         if latent_queries is not None:
-            B, n_query, D = latent_queries.shape
+            B, n_query, _D = latent_queries.shape
             device = raw_input_ids.device
 
             has_traj_tokens = (raw_input_ids == TRAJ_TOKEN_INDEX).any().item()
@@ -836,10 +837,10 @@ class Qwen2_5VLIntegration(nn.Module):
         self,
         current_views: torch.Tensor,
         history_panoramas: torch.Tensor,
-        instruction: Optional[str] = None,
+        instruction: str | None = None,
         return_hidden_states: bool = True,
-        heatmap_vln: Optional[nn.Module] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
+        heatmap_vln: nn.Module | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None]:
         """Forward a single panoramic sample through one Qwen pass.
 
         When ``return_hidden_states`` is False (heatmap-only training), the
@@ -870,7 +871,7 @@ class Qwen2_5VLIntegration(nn.Module):
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, _traj_hs = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
 
@@ -881,11 +882,11 @@ class Qwen2_5VLIntegration(nn.Module):
         self,
         current_views: torch.Tensor,
         history_panoramas: torch.Tensor,
-        instruction: Optional[Union[str, List[str]]] = None,
+        instruction: Union[str, list[str]] | None = None,
         return_hidden_states: bool = True,
-        heatmap_vln: Optional[nn.Module] = None,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]]]:
+        heatmap_vln: nn.Module | None = None,
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None]:
         """Batch forward for panoramic input using one batched Qwen pass."""
         if heatmap_vln is None:
             raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for batched decoding.")
@@ -952,14 +953,14 @@ class Qwen2_5VLIntegration(nn.Module):
 
     def _forward_batch_panorama_tokenized(
         self,
-        panoramic_inputs: Dict[str, torch.Tensor],
-        num_histories: List[int],
-        text_anchor_positions_batch: Optional[List[Dict[int, int]]] = None,
+        panoramic_inputs: dict[str, torch.Tensor],
+        num_histories: list[int],
+        text_anchor_positions_batch: list[dict[int, int]] | None = None,
         return_hidden_states: bool = True,
-        heatmap_vln: Optional[nn.Module] = None,
-        history_rel_poses: Optional[torch.Tensor] = None,
-        latent_queries: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[Dict[str, torch.Tensor]], Optional[torch.Tensor]]:
+        heatmap_vln: nn.Module | None = None,
+        history_rel_poses: torch.Tensor | None = None,
+        latent_queries: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None, torch.Tensor | None]:
         """Forward already-tokenized batch through one Qwen pass.
 
         When ``heatmap_vln`` is None the heatmap hook/decode pipeline is
@@ -1042,14 +1043,14 @@ class Qwen2_5VLIntegration(nn.Module):
                 heatmap_output["timings"].update(decode_timings)
                 heatmap_output["timings"].update(internal_timings)
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs
-    
+
     def _forward_batch(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
-        instruction: Optional[Union[str, List[str]]] = None,
+        instruction: Union[str, list[str]] | None = None,
         return_hidden_states: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
         """
         Batch forward by processing each sample individually and stacking.
         Qwen2.5-VL's internal position ID computation does not handle
@@ -1080,30 +1081,30 @@ class Qwen2_5VLIntegration(nn.Module):
             vision_hidden_states = None
 
         return hidden_states, vision_hidden_states, max_image_tokens, None
-    
+
     def _forward_single(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
-        instruction: Optional[str] = None,
+        instruction: str | None = None,
         return_hidden_states: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
         """
         Forward pass for a single sample.
-        
+
         Args:
             history_frames: (K, C, H, W) history video frames
             current_frame: (C, H, W) current observation
             instruction: Navigation instruction text
             return_hidden_states: Whether to return hidden states
-            
+
         Returns:
             Tuple of (hidden_states, vision_hidden_states, num_image_tokens)
         """
         messages, _, _ = self._prepare_messages_single(
             history_frames, current_frame, instruction
         )
-        
+
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -1112,7 +1113,7 @@ class Qwen2_5VLIntegration(nn.Module):
             return_tensors="pt",
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
+
         # Expand video_grid_thw temporal dimension to match mm_token_type_ids groups
         # [[t, h, w]] → t copies of [[1, h, w]] since the processor splits
         # multi-temporal video tokens into separate groups in mm_token_type_ids
@@ -1124,33 +1125,33 @@ class Qwen2_5VLIntegration(nn.Module):
                 )
                 inputs["video_grid_thw"][:, 0] = 1
 
-        hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+        hidden_states, vision_hidden_states, num_image_tokens, _traj_hs = self._forward_model_inputs(
             inputs, return_hidden_states,
         )
         return hidden_states, vision_hidden_states, num_image_tokens, None
-    
+
     def forward(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
-        instruction: Optional[Union[str, List[str]]] = None,
+        instruction: Union[str, list[str]] | None = None,
         return_hidden_states: bool = True,
         generate_text: bool = False,
-        current_views: Optional[torch.Tensor] = None,
-        history_panoramas: Optional[torch.Tensor] = None,
-        panoramic_inputs: Optional[Dict[str, torch.Tensor]] = None,
-        panoramic_num_histories: Optional[List[int]] = None,
-        panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
-        heatmap_vln: Optional[nn.Module] = None,
-        history_rel_poses: Optional[torch.Tensor] = None,
-        latent_queries: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Any]:
+        current_views: torch.Tensor | None = None,
+        history_panoramas: torch.Tensor | None = None,
+        panoramic_inputs: dict[str, torch.Tensor] | None = None,
+        panoramic_num_histories: list[int] | None = None,
+        panoramic_text_anchor_positions: list[dict[int, int]] | None = None,
+        heatmap_vln: nn.Module | None = None,
+        history_rel_poses: torch.Tensor | None = None,
+        latent_queries: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
         """Forward pass through Qwen2.5-VL with batch processing."""
         # Ensure model is loaded
         if not self._model_loaded:
             self._load_model()
-        
-        batch_size = current_views.shape[0] if current_views is not None else history_frames.shape[0]
+
+        current_views.shape[0] if current_views is not None else history_frames.shape[0]
         traj_hidden_states = None
 
         if panoramic_inputs is not None:
@@ -1185,7 +1186,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     history_frames, current_frame, instruction, return_hidden_states,
                 )
             )
-        
+
         # Generate text only for first sample (if requested)
         generated_text = None
         if generate_text:
@@ -1196,11 +1197,11 @@ class Qwen2_5VLIntegration(nn.Module):
                 sample_instruction = instruction[0] if len(instruction) > 0 else None
             else:
                 sample_instruction = instruction
-                
+
             generated_text = self._generate_text_single(
                 history_frames[0], current_frame[0], sample_instruction
             )
-        
+
         result = {
             "hidden_states": hidden_states,
             "vision_hidden_states": vision_hidden_states,
@@ -1216,18 +1217,18 @@ class Qwen2_5VLIntegration(nn.Module):
             if timings:
                 result["timings"] = timings
         return result
-    
+
     def _generate_text_single(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
-        instruction: Optional[str] = None,
+        instruction: str | None = None,
     ) -> str:
         """Generate text for a single sample."""
         messages, _, _ = self._prepare_messages_single(
             history_frames, current_frame, instruction
         )
-        
+
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -1236,19 +1237,19 @@ class Qwen2_5VLIntegration(nn.Module):
             return_tensors="pt",
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
+
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.config.max_new_tokens,
                 temperature=self.config.temperature,
             )
-        
+
         generated_ids = outputs[:, inputs["input_ids"].shape[1]:]
         generated_text = self.processor.batch_decode(
             generated_ids, skip_special_tokens=True
         )[0]
-        
+
         return generated_text
 
     def generate_latents(
@@ -1325,30 +1326,30 @@ class Qwen2_5VLIntegration(nn.Module):
 
     def _extract_hidden_from_generation(
         self,
-        hidden_states_tuple: Tuple,
+        hidden_states_tuple: tuple,
     ) -> torch.Tensor:
         """
         Extract hidden states from generation output.
-        
+
         Generation output has structure:
         hidden_states_tuple[step][layer] = (batch, seq, hidden)
-        
+
         We concatenate all steps and take the last layer.
         """
         all_hidden = []
         layer_idx = self.config.hidden_layer_for_features
-        
+
         for step_hidden in hidden_states_tuple:
             if isinstance(step_hidden, tuple) and len(step_hidden) > 0:
                 if layer_idx == -1:
                     layer_idx = len(step_hidden) - 1
                 if layer_idx < len(step_hidden):
                     all_hidden.append(step_hidden[layer_idx])
-        
+
         if all_hidden:
             return torch.cat(all_hidden, dim=1)
         return None
-    
+
     def _extract_vision_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -1356,59 +1357,59 @@ class Qwen2_5VLIntegration(nn.Module):
     ) -> torch.Tensor:
         """
         Extract hidden states corresponding to vision tokens.
-        
+
         Args:
             hidden_states: (B, seq_len, hidden_dim)
             input_ids: (B, seq_len)
-            
+
         Returns:
             (B, num_vision_tokens, hidden_dim)
         """
         batch_size = hidden_states.shape[0]
         hidden_dim = hidden_states.shape[-1]
-        
+
         # Find vision token positions (video_pad and image_pad tokens)
         video_mask = input_ids == self.video_token_id
         image_mask = input_ids == self.image_token_id
         vision_mask = video_mask | image_mask
-        
+
         # Get number of vision tokens per sample
         num_vision_tokens = vision_mask.sum(dim=1)
         max_vision_tokens = num_vision_tokens.max().item()
-        
+
         if max_vision_tokens == 0:
             # No vision tokens found, return pooled hidden states
             logger.warning("No vision tokens found, returning mean-pooled hidden states")
             return hidden_states.mean(dim=1, keepdim=True)
-        
+
         # Extract vision hidden states
         vision_hidden = torch.zeros(
             batch_size, max_vision_tokens, hidden_dim,
             device=hidden_states.device, dtype=hidden_states.dtype
         )
-        
+
         for b in range(batch_size):
             mask = vision_mask[b]
             vision_indices = mask.nonzero(as_tuple=True)[0]
             n_tokens = len(vision_indices)
             if n_tokens > 0:
                 vision_hidden[b, :n_tokens] = hidden_states[b, vision_indices]
-        
+
         return vision_hidden
-    
+
     def get_hidden_dim(self) -> int:
         """Get the hidden dimension of the model."""
         if self._model_loaded and self.model is not None:
             return self.model.config.hidden_size
         # Default for InternNav Qwen2.5-VL
         return 3584
-    
+
     def freeze(self):
         """Freeze all model parameters."""
         if self.model is not None:
             for param in self.model.parameters():
                 param.requires_grad = False
-    
+
     def unfreeze(self):
         """Unfreeze all model parameters."""
         if self.model is not None:

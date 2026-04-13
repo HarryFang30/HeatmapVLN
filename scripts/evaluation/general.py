@@ -11,16 +11,16 @@ VLN Pipeline 评估脚本
 - 进度预测头 (Progress)
 """
 
-import sys
 import argparse
 import logging
-import yaml
+import sys
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any
 
-import torch
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -28,11 +28,11 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.pipeline import VLNPipeline, VLNPipelineConfig
-from src.models.lora_utils import resolve_lora_layer_indices
-from src.data.vln_sliding_window_dataset import VLNTrajectoryDataset
-from src.data.factory import build_trajectory_dataset
 from scripts.training.utils import load_config
+
+from src.data.factory import build_trajectory_dataset
+from src.models.lora_utils import resolve_lora_layer_indices
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +48,7 @@ def flatten_heatmap_slices(heatmaps: torch.Tensor) -> torch.Tensor:
     return heatmaps.reshape(-1, heatmaps.shape[-2], heatmaps.shape[-1])
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
+def collate_fn(batch: list[dict]) -> dict[str, Any]:
     """Collate function for VLNTrajectoryDataset (non-packing mode)."""
     result = {
         'history_frames': torch.stack([s['history_frames'] for s in batch], dim=0),
@@ -59,7 +59,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         'is_stop': torch.tensor([s.get('is_stop', 0.0) for s in batch]),
         'text': [s['text'] for s in batch],
     }
-    
+
     # Trajectory data
     if 'trajectory' in batch[0]:
         result['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
@@ -69,11 +69,11 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
     if 'history_panoramas' in batch[0]:
         result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
-    
+
     return result
 
 
-def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
+def build_model(cfg: dict, device: str = 'cuda:0') -> VLNPipeline:
     """Build VLN pipeline for evaluation (与 train.py 保持一致)."""
     model_cfg = cfg['model']
     data_cfg = cfg['data']
@@ -82,7 +82,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
-    
+
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
         llm_backbone_type=llm_cfg.get('backbone_type', 'qwen2_5_vl'),
@@ -96,7 +96,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
         internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
         device=device,
-        
+
         enable_heatmap=heatmap_cfg.get('enable', True),
         heatmap_c_vit=heatmap_cfg.get('c_vit', 1280),
         heatmap_c_llm=heatmap_cfg.get('c_llm', 3584),
@@ -106,7 +106,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_size=tuple(heatmap_cfg.get('heatmap_size', data_cfg['init_hm_size'])),
         image_size=heatmap_cfg.get('image_size', data_cfg['image_size'][0]),
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
-        
+
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
@@ -114,7 +114,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         lora_layer_indices=resolved_lora_layers,
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
-        
+
         enable_action_head=action_cfg.get('enable', True),
         nextdit_enabled=nextdit_cfg.get('enabled', False),
         nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 3584),
@@ -132,10 +132,10 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
         nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
         nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
-        
+
         verbose=False,
     )
-    
+
     return VLNPipeline(config)
 
 
@@ -143,8 +143,8 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.
     """Load checkpoint with partial loading support."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
-    
-    if list(state_dict.keys())[0].startswith('module.'):
+
+    if next(iter(state_dict.keys())).startswith('module.'):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -160,7 +160,7 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.
 
 
 def build_dataloader(
-    cfg: Dict,
+    cfg: dict,
     split: str = 'val',
 ) -> DataLoader:
     """Build dataloader using VLNTrajectoryDataset."""
@@ -180,14 +180,14 @@ def build_dataloader(
     )
 
 
-def compute_spatial_metrics(pred_hm: np.ndarray, gt_hm: np.ndarray) -> Dict[str, float]:
+def compute_spatial_metrics(pred_hm: np.ndarray, gt_hm: np.ndarray) -> dict[str, float]:
     """Compute spatial accuracy metrics for heatmaps."""
     # Normalize
     if pred_hm.max() > 0:
         pred_hm = pred_hm / pred_hm.max()
     if gt_hm.max() > 0:
         gt_hm = gt_hm / gt_hm.max()
-    
+
     # Peak location error
     pred_peak = np.unravel_index(np.argmax(pred_hm), pred_hm.shape)
     gt_peak = np.unravel_index(np.argmax(gt_hm), gt_hm.shape)
@@ -217,35 +217,35 @@ def compute_spatial_metrics(pred_hm: np.ndarray, gt_hm: np.ndarray) -> Dict[str,
     }
 
 
-def compute_trajectory_metrics(pred_traj: np.ndarray, gt_traj: np.ndarray, valid: float = 1.0) -> Dict[str, float]:
+def compute_trajectory_metrics(pred_traj: np.ndarray, gt_traj: np.ndarray, valid: float = 1.0) -> dict[str, float]:
     """Compute trajectory prediction metrics.
-    
+
     Args:
         pred_traj: Predicted trajectory [T, 3] (dx, dy, dyaw)
         gt_traj: Ground truth trajectory [T, 3]
         valid: Validity flag
-        
+
     Returns:
         Dictionary with ADE, FDE metrics
     """
     if valid < 0.5:
         return {'ade': 0.0, 'fde': 0.0, 'valid': False}
-    
+
     # Only use position (dx, dy), ignore yaw
     pred_pos = pred_traj[:, :2]  # [T, 2]
     gt_pos = gt_traj[:, :2]  # [T, 2]
-    
+
     # Compute cumulative positions
     pred_cum = np.cumsum(pred_pos, axis=0)
     gt_cum = np.cumsum(gt_pos, axis=0)
-    
+
     # Average Displacement Error (ADE)
     displacements = np.sqrt(np.sum((pred_cum - gt_cum) ** 2, axis=1))
     ade = displacements.mean()
-    
+
     # Final Displacement Error (FDE)
     fde = displacements[-1]
-    
+
     return {
         'ade': float(ade),
         'fde': float(fde),
@@ -253,21 +253,21 @@ def compute_trajectory_metrics(pred_traj: np.ndarray, gt_traj: np.ndarray, valid
     }
 
 
-def compute_progress_metrics(pred_progress: np.ndarray, gt_progress: np.ndarray) -> Dict[str, float]:
+def compute_progress_metrics(pred_progress: np.ndarray, gt_progress: np.ndarray) -> dict[str, float]:
     """Compute progress prediction metrics."""
     mae = np.abs(pred_progress - gt_progress).mean()
-    
+
     # Accuracy at threshold
     thresh = 0.1
     accuracy = (np.abs(pred_progress - gt_progress) < thresh).mean()
-    
+
     # Boundary accuracy (progress near 0 or 1)
     boundary_mask = (gt_progress < 0.1) | (gt_progress > 0.9)
     if boundary_mask.sum() > 0:
         boundary_acc = (np.abs(pred_progress[boundary_mask] - gt_progress[boundary_mask]) < thresh).mean()
     else:
         boundary_acc = 0.0
-    
+
     return {
         'progress_mae': float(mae),
         'progress_accuracy': float(accuracy),
@@ -279,15 +279,15 @@ def compute_progress_metrics(pred_progress: np.ndarray, gt_progress: np.ndarray)
 def evaluate(
     model: VLNPipeline,
     dataloader: DataLoader,
-    cfg: Dict,
+    cfg: dict,
     device: torch.device,
-    save_dir: Path = None,
+    save_dir: Path | None = None,
     num_vis: int = 20,
     eval_heatmap: bool = True,
     eval_trajectory: bool = True,
     eval_progress: bool = True,
     args=None
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Run evaluation."""
     model.eval()
 
@@ -312,7 +312,7 @@ def evaluate(
         gt_heatmap = batch['heatmap'].to(device)
         current_frame = batch['current_frame']
         B = current_frame.shape[0]
-        
+
         history_frames = batch['history_frames']
         video_frames = torch.cat([
             history_frames,
@@ -338,7 +338,7 @@ def evaluate(
                 return_heatmaps=eval_heatmap,
                 return_actions=eval_trajectory,
             )
-        
+
         # Evaluate heatmap
         if eval_heatmap and 'heatmaps' in outputs:
             pred_hm = flatten_heatmap_slices(outputs['heatmaps'].detach().cpu()).numpy()
@@ -366,14 +366,14 @@ def evaluate(
                 gt_traj = batch['trajectory'].cpu().numpy()
                 traj_valid = batch['trajectory_valid'].cpu().numpy()
                 pred_traj = pred_traj.cpu().numpy()
-                
+
                 for b in range(B):
                     metrics = compute_trajectory_metrics(pred_traj[b], gt_traj[b], traj_valid[b])
                     if metrics['valid']:
                         totals['traj_ade'] += metrics['ade']
                         totals['traj_fde'] += metrics['fde']
                         counts['traj'] += 1
-        
+
         # Visualization
         if save_dir is not None and idx < num_vis:
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -384,29 +384,29 @@ def evaluate(
 
     # Average metrics
     results = {}
-    
+
     if counts['hm'] > 0:
         results['hm_peak_error'] = totals['hm_peak_error'] / counts['hm']
         results['hm_iou'] = totals['hm_iou'] / counts['hm']
         results['hm_cosine_sim'] = totals['hm_cosine_sim'] / counts['hm']
         results['hm_mae'] = totals['hm_mae'] / counts['hm']
         results['num_hm_samples'] = counts['hm']
-    
+
     if counts['traj'] > 0:
         results['traj_ade'] = totals['traj_ade'] / counts['traj']
         results['traj_fde'] = totals['traj_fde'] / counts['traj']
         results['num_traj_samples'] = counts['traj']
-    
+
     # progress head removed — no progress metrics
         results['num_progress_samples'] = counts['progress']
-    
+
     return results
 
 
 def visualize_sample(
     idx: int,
-    batch: Dict,
-    outputs: Dict,
+    batch: dict,
+    outputs: dict,
     save_dir: Path,
     eval_heatmap: bool,
     eval_trajectory: bool,
@@ -421,7 +421,7 @@ def visualize_sample(
     elif gt_heatmap.ndim == 3:
         gt_heatmap = gt_heatmap[0]
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    _fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     # Row 1: Frame and Heatmaps
     axes[0, 0].imshow(current_frame)
@@ -432,7 +432,7 @@ def visualize_sample(
     axes[0, 1].set_title(f"GT Heatmap (max={gt_heatmap.max():.2f})")
     axes[0, 1].axis('off')
     plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
-    
+
     if eval_heatmap and 'heatmaps' in outputs:
         pred_hm = outputs['heatmaps'][0, 0, 0].cpu().numpy()
         pred_hm = np.clip(pred_hm, 0, 1)
@@ -442,32 +442,32 @@ def visualize_sample(
         plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
     else:
         axes[0, 2].axis('off')
-    
+
     # Row 2: Trajectory and Progress
     if eval_trajectory and 'trajectory' in batch:
         gt_traj = batch['trajectory'][0].cpu().numpy()
-        
+
         # Plot GT trajectory
         gt_cum = np.cumsum(gt_traj[:, :2], axis=0)
         axes[1, 0].plot(gt_cum[:, 0], gt_cum[:, 1], 'b-o', label='GT', markersize=3)
         axes[1, 0].scatter([0], [0], c='green', s=100, marker='*', label='Start')
         axes[1, 0].scatter([gt_cum[-1, 0]], [gt_cum[-1, 1]], c='red', s=100, marker='X', label='End')
-        
+
         pred_traj = outputs.get('trajectory')
         if pred_traj is not None:
             pred_traj = pred_traj[0].cpu().numpy()
             pred_cum = np.cumsum(pred_traj[:, :2], axis=0)
             axes[1, 0].plot(pred_cum[:, 0], pred_cum[:, 1], 'r--s', label='Pred', markersize=3)
-        
+
         axes[1, 0].set_title("Trajectory (cumulative)")
         axes[1, 0].legend()
         axes[1, 0].set_aspect('equal')
         axes[1, 0].grid(True, alpha=0.3)
     else:
         axes[1, 0].axis('off')
-    
+
     axes[1, 1].axis('off')
-    
+
     # Info text
     info_text = f"Sample {idx}\n"
     if 'text' in batch and batch['text'][0]:
@@ -515,7 +515,7 @@ def main():
     if not torch.cuda.is_available():
         logger.warning("CUDA not available, using CPU")
         args.device = 'cpu'
-    
+
     device = torch.device(args.device)
     logger.info(f"Using device: {device}")
 
@@ -558,19 +558,19 @@ def main():
     logger.info("=" * 60)
     logger.info("Evaluation Results")
     logger.info("=" * 60)
-    
+
     if args.eval_heatmap and 'num_hm_samples' in metrics:
         logger.info(f"Heatmap ({metrics['num_hm_samples']} samples):")
         logger.info(f"  Peak Error: {metrics['hm_peak_error']:.2f} pixels")
         logger.info(f"  IoU:        {metrics['hm_iou']:.4f}")
         logger.info(f"  Cosine Sim: {metrics['hm_cosine_sim']:.4f}")
         logger.info(f"  MAE:        {metrics['hm_mae']:.4f}")
-    
+
     if args.eval_trajectory and 'num_traj_samples' in metrics:
         logger.info(f"Trajectory ({metrics['num_traj_samples']} samples):")
         logger.info(f"  ADE:        {metrics['traj_ade']:.4f}")
         logger.info(f"  FDE:        {metrics['traj_fde']:.4f}")
-    
+
     if args.eval_progress and 'num_progress_samples' in metrics:
         logger.info(f"Progress ({metrics['num_progress_samples']} samples):")
         logger.info(f"  MAE:        {metrics['progress_mae']:.4f}")

@@ -20,9 +20,10 @@ Inference flow per high-level step:
 Adapted for habitat-lab 0.1.7 (YACS config).
 """
 
-import sys
-import os
 import faulthandler
+import os
+import sys
+
 faulthandler.enable()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -32,7 +33,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 # ═══════════════════════════════════════════════════════════════════════
 
 # Block flash_attn import (GLIBC_2.32 not available on this system)
-import types as _types, importlib as _importlib
+import importlib as _importlib
+import types as _types
+
 
 def _noop(*a, **kw):
     raise RuntimeError("flash_attn stub called – should use SDPA attention instead")
@@ -71,6 +74,7 @@ _fa.layers = _fa_rotary
 _fa_rotary.rotary = _fa_rotary_mod
 
 import numpy as np
+
 if not hasattr(np, 'float'):
     np.float = np.float64
 if not hasattr(np, 'int'):
@@ -80,6 +84,7 @@ if not hasattr(np, 'bool'):
 
 # Initialize NVIDIA GL context BEFORE numba/LLVM is loaded.
 import habitat_sim as _hsim
+
 _dummy_cfg = _hsim.SimulatorConfiguration()
 _dummy_cfg.gpu_device_id = (
     int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
@@ -94,6 +99,7 @@ print("GL context pre-initialized (NVIDIA GPU)", flush=True)
 
 # Patch gym.spaces.Discrete to allow n=0 (habitat-lab 0.1.7 compatibility)
 import gym.spaces
+
 _OrigDiscrete = gym.spaces.Discrete
 class _PatchedDiscrete(_OrigDiscrete):
     def __init__(self, n, *args, **kwargs):
@@ -107,27 +113,23 @@ gym.spaces.Discrete = _PatchedDiscrete
 # ═══════════════════════════════════════════════════════════════════════
 
 import argparse
-import copy
 import json
 import re
-import yaml
 from enum import IntEnum
-from pathlib import Path
-from typing import Dict, List, Optional
 
+import habitat
 import quaternion
 import torch
 import tqdm
+import yaml
+from habitat.config.default import Config as CN
+from habitat.config.default import get_config as get_habitat_default_config
 from PIL import Image
 
-import habitat
-from habitat.config.default import get_config as get_habitat_default_config
-from habitat.config.default import Config as CN
-
-from src.models.pipeline import VLNPipeline, VLNPipelineConfig
-from src.models.lora_utils import resolve_lora_layer_indices
-from src.models.heatmap.input_constructor import construct_input
 from src.data.vln_sliding_window_dataset import compute_history_rel_poses
+from src.models.heatmap.input_constructor import construct_input
+from src.models.lora_utils import resolve_lora_layer_indices
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -246,7 +248,7 @@ def _yaw_quaternion(angle_rad: float):
 
 def capture_panoramic_views(
     env, image_size: tuple = (256, 256),
-) -> Dict[str, Image.Image]:
+) -> dict[str, Image.Image]:
     """Capture 4 directional views by manipulating agent state directly.
 
     This avoids env.step() calls so the episode step counter and metrics
@@ -260,7 +262,7 @@ def capture_panoramic_views(
     view_names = ["front", "right", "back", "left"]
     yaw_offsets = [0.0, -np.pi / 2, -np.pi, -3 * np.pi / 2]
 
-    views: Dict[str, Image.Image] = {}
+    views: dict[str, Image.Image] = {}
     for name, yaw in zip(view_names, yaw_offsets):
         state = agent.get_state()
         if yaw != 0.0:
@@ -308,7 +310,7 @@ def traj_to_actions(
     dp_actions: torch.Tensor,
     num_sample_trajs: int = 32,
     action_scale: float = 4.0,
-) -> List[int]:
+) -> list[int]:
     """Convert NextDiT continuous trajectory to discrete Habitat actions.
 
     The trajectory represents relative poses (dx, dy, dyaw) scaled by
@@ -330,7 +332,7 @@ def traj_to_actions(
     forward_step = 0.25   # Habitat FORWARD_STEP_SIZE
     turn_step = np.deg2rad(15)  # Habitat TURN_ANGLE
 
-    actions: List[int] = []
+    actions: list[int] = []
     accum_dx = 0.0
     accum_dyaw = 0.0
 
@@ -357,7 +359,7 @@ def traj_to_actions(
 # Section 7: VLM input preparation
 # ═══════════════════════════════════════════════════════════════════════
 
-def _normalize_multimodal_inputs(inputs: Dict[str, torch.Tensor]):
+def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]):
     """Replicate HeatmapVLN._normalize_multimodal_inputs."""
     if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
         vgt = inputs["video_grid_thw"]
@@ -370,11 +372,11 @@ def _normalize_multimodal_inputs(inputs: Dict[str, torch.Tensor]):
 
 def prepare_vlm_inputs(
     processor,
-    current_views: Dict[str, Image.Image],
-    history_panoramas: List[Dict[str, Image.Image]],
+    current_views: dict[str, Image.Image],
+    history_panoramas: list[dict[str, Image.Image]],
     instruction: str,
     device: torch.device,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Build tokenised Qwen2.5-VL inputs from panoramic observations.
 
     Uses ``construct_input`` with a dummy ``pixel_goal`` to include the
@@ -406,7 +408,7 @@ def prepare_vlm_inputs(
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_config(config_path: str) -> dict:
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         return yaml.safe_load(f)
 
 
@@ -487,7 +489,7 @@ def load_model(args, device: torch.device):
     state_dict = ckpt.get(
         "model_state_dict", ckpt.get("trainable_state_dict", ckpt)
     )
-    if list(state_dict.keys())[0].startswith("module."):
+    if next(iter(state_dict.keys())).startswith("module."):
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(
@@ -542,7 +544,7 @@ def run_eval(args):
     os.makedirs(output_path, exist_ok=True)
     progress_file = os.path.join(output_path, "progress.json")
     if os.path.exists(progress_file):
-        with open(progress_file, "r") as f:
+        with open(progress_file) as f:
             for line in f:
                 res = json.loads(line)
                 sucs.append(res["success"])
@@ -561,7 +563,7 @@ def run_eval(args):
 
     # ── Episode loop (iterator-driven, see ReadBeforeEvaluatingHabitat.md §16) ──
     while True:
-        observations = env.reset()
+        env.reset()
         episode = env.current_episode
         scene_id = episode.scene_id.split("/")[-2]
         episode_id = int(episode.episode_id)
@@ -582,11 +584,11 @@ def run_eval(args):
         )
 
         # ── Per-episode state ──
-        history_panoramas: List[Dict[str, Image.Image]] = []
-        history_poses: List[np.ndarray] = []  # 4×4 cam2world at each panoramic capture
-        pix_goal_image: Optional[torch.Tensor] = None
-        _last_traj_hs: Optional[torch.Tensor] = None
-        local_actions: List[int] = []
+        history_panoramas: list[dict[str, Image.Image]] = []
+        history_poses: list[np.ndarray] = []  # 4×4 cam2world at each panoramic capture
+        pix_goal_image: torch.Tensor | None = None
+        _last_traj_hs: torch.Tensor | None = None
+        local_actions: list[int] = []
         forward_action_count = 0
         step_id = 0
         done = False
@@ -613,7 +615,7 @@ def run_eval(args):
                     step_id += 1
                     continue
 
-                observations = env.step(action)
+                env.step(action)
                 done = env.episode_over
                 step_id += 1
                 continue
@@ -743,7 +745,7 @@ def run_eval(args):
                     pixel_goal = [int(coord[1]), int(coord[0])]
                     print(f"  predicted pixel_goal {pixel_goal}")
                 else:
-                    observations = env.step(ActionCode.LEFT)
+                    env.step(ActionCode.LEFT)
                     step_id += 1
                     done = env.episode_over
                     history_panoramas.append(current_views)
@@ -792,16 +794,16 @@ def run_eval(args):
                 if first_action == ActionCode.STOP:
                     pix_goal_image = None
                     local_actions = []
-                    observations = env.step(ActionCode.LEFT)
+                    env.step(ActionCode.LEFT)
                     step_id += 1
                     done = env.episode_over
                 else:
-                    observations = env.step(first_action)
+                    env.step(first_action)
                     step_id += 1
                     forward_action_count += 1
                     done = env.episode_over
             else:
-                observations = env.step(ActionCode.STOP)
+                env.step(ActionCode.STOP)
                 done = True
 
             # ── Update history (panoramic views + agent poses) ──

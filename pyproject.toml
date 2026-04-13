@@ -34,18 +34,31 @@ select = [
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
+    "E402",   # module-import-not-at-top (scripts use sys.path before imports)
     "B008",   # do not perform function call in argument defaults
     "B905",   # zip() without strict=
+    "SIM102", # collapsible-if (often less readable when collapsed)
     "SIM108", # use ternary operator
+    "SIM115", # open-file-with-context-handler (false positives in yaml.safe_load)
     "UP007",  # use X | Y for union types (keep Optional for readability)
+    "F821",   # undefined-name (false positives on lazy imports and string annotations)
+    "RUF001", # ambiguous unicode in strings (Chinese text is intentional)
+    "RUF002", # ambiguous unicode in docstrings
+    "RUF003", # ambiguous unicode in comments
+    "RUF012", # mutable-class-default (dataclass-style defaults are intentional)
+    "RUF059", # unused-unpacked-variable (destructuring for readability)
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = ["src"]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"]  # unused imports are re-exports
+"__init__.py" = ["F401"]
 "scripts/training/__init__.py" = ["F401"]
+"src/data/vln_sliding_window_dataset.py" = ["F401"]
+"src/models/qwen2_5_vl/integration.py" = ["F401"]
+"src/models/action/nextdit/depth_anything/**" = ["F401"]
+"src/models/action/diffusion/**" = ["B015"]
 
 # ============================================
 # Mypy — gradual type checking

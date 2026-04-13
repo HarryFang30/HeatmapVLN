@@ -7,34 +7,34 @@ Key Components:
 - Sequence packing utilities: kept as legacy helpers
 """
 
-from .integration import Qwen2_5VLIntegration, Qwen2_5VLConfig
+from .integration import Qwen2_5VLConfig, Qwen2_5VLIntegration
 
 # Sequence packing utilities (kept for reference, disabled by default)
 try:
     from .sequence_packing import (
         FlattenedDataCollatorForVLN,
+        PackedSequenceProcessor,
+        get_rope_index_3,
+        replace_attention_with_varlen,
         split_packed_hidden_states,
         split_packed_vision_hidden_states,
-        replace_attention_with_varlen,
-        get_rope_index_3,
-        PackedSequenceProcessor,
     )
     PACKING_AVAILABLE = True
 except ImportError:
     PACKING_AVAILABLE = False
 
 __all__ = [
-    "Qwen2_5VLIntegration",
-    "Qwen2_5VLConfig",
     "PACKING_AVAILABLE",
+    "Qwen2_5VLConfig",
+    "Qwen2_5VLIntegration",
 ]
 
 if PACKING_AVAILABLE:
     __all__.extend([
         "FlattenedDataCollatorForVLN",
+        "PackedSequenceProcessor",
+        "get_rope_index_3",
+        "replace_attention_with_varlen",
         "split_packed_hidden_states",
         "split_packed_vision_hidden_states",
-        "replace_attention_with_varlen",
-        "get_rope_index_3",
-        "PackedSequenceProcessor",
     ])

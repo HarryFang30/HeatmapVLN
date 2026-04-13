@@ -11,11 +11,9 @@ these wrappers are the only way to use ``num_workers > 0``.
 from __future__ import annotations
 
 import logging
-import sys
-import os
-import gc
 import warnings
-from typing import Any, Callable, Dict, List, Sequence, Union
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import torch
@@ -40,7 +38,7 @@ def _cgroup_mem_usage_gb():
         "/sys/fs/cgroup/memory.current",
     ):
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 return int(f.read().strip()) / (1024 ** 3)
         except Exception:
             continue
@@ -53,7 +51,7 @@ def _cgroup_mem_limit_gb():
         "/sys/fs/cgroup/memory.max",
     ):
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 val = f.read().strip()
                 if val == "max":
                     return -1.0
@@ -126,8 +124,6 @@ def _worker_init_fn(worker_id):
     """Worker process init: suppress warnings + memory management."""
     import gc as _gc
     import os as _os
-    import sys as _sys
-    import warnings
     warnings.filterwarnings("ignore")
     warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
     warnings.filterwarnings("ignore", message="Asked to sample")
@@ -224,6 +220,6 @@ class ShmBypassCollate:
     def __init__(self, collate_fn: Callable) -> None:
         self._inner = collate_fn
 
-    def __call__(self, batch: List[Any]) -> Any:
+    def __call__(self, batch: list[Any]) -> Any:
         batch = [_to_tensor(sample) for sample in batch]
         return self._inner(batch)

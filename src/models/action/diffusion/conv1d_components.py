@@ -11,12 +11,11 @@ Components:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Downsample1d(nn.Module):
     """1D downsampling using strided convolution."""
-    
+
     def __init__(self, dim: int):
         super().__init__()
         self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
@@ -27,7 +26,7 @@ class Downsample1d(nn.Module):
 
 class Upsample1d(nn.Module):
     """1D upsampling using transposed convolution."""
-    
+
     def __init__(self, dim: int):
         super().__init__()
         self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
@@ -39,9 +38,9 @@ class Upsample1d(nn.Module):
 class Conv1dBlock(nn.Module):
     """
     Conv1d --> GroupNorm --> Mish --> Dropout
-    
+
     Standard convolution block with normalization, activation, and optional dropout.
-    
+
     Args:
         inp_channels: Number of input channels
         out_channels: Number of output channels
@@ -51,10 +50,10 @@ class Conv1dBlock(nn.Module):
     """
 
     def __init__(
-        self, 
-        inp_channels: int, 
-        out_channels: int, 
-        kernel_size: int, 
+        self,
+        inp_channels: int,
+        out_channels: int,
+        kernel_size: int,
         n_groups: int = 8,
         dropout: float = 0.0,
     ):

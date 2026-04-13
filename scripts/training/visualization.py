@@ -4,20 +4,19 @@ Heatmap prediction visualization utilities.
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional
 
+import matplotlib
 import numpy as np
 import torch
 import torch.nn as nn
 
-import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
 
-def _should_use_gpu_gt(batch: Dict, gpu_heatmap_computer) -> bool:
+def _should_use_gpu_gt(batch: dict, gpu_heatmap_computer) -> bool:
     if gpu_heatmap_computer is None or 'history_poses' not in batch:
         return False
     return 'current_views' not in batch
@@ -35,13 +34,13 @@ def _select_primary_heatmap_slice(heatmaps: torch.Tensor) -> torch.Tensor:
 
 def visualize_heatmap_predictions(
     model: nn.Module,
-    batch: Dict,
-    output: Dict,
+    batch: dict,
+    output: dict,
     epoch: int,
     step: int,
     output_dir: Path,
     num_samples: int = 2,
-    gt_heatmap_override: Optional[torch.Tensor] = None,
+    gt_heatmap_override: torch.Tensor | None = None,
 ):
     """Visualize heatmap predictions.
 

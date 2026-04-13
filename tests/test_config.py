@@ -4,6 +4,7 @@ import glob
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from src.config_schema import TrainConfig, validate_config
 
@@ -24,7 +25,7 @@ class TestLoadConfig:
         cfg_path.write_text(yaml.dump({"data": {"root": "/x"}}))
 
         from scripts.training.utils import load_config
-        with pytest.raises(Exception):
+        with pytest.raises((ValidationError, KeyError)):
             load_config(str(cfg_path), validate=True)
 
 
@@ -55,7 +56,7 @@ class TestPydanticValidation:
     def test_rejects_wrong_type(self, minimal_cfg):
         """Wrong value type (str instead of int) raises ValidationError."""
         minimal_cfg["optim"]["batch_size"] = "eight"
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             validate_config(minimal_cfg)
 
     def test_rejects_negative_batch_size(self, minimal_cfg):
@@ -72,11 +73,11 @@ class TestPydanticValidation:
 
     def test_missing_required_field(self):
         """Missing required top-level 'data' key raises ValidationError."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             validate_config({"training": {"stages": [{"name": "s", "epochs": 1}]}, "log": {"out_dir": "/tmp"}})
 
     def test_extra_keys_in_strict_section(self, minimal_cfg):
         """Misspelled key in strict section (data) raises ValidationError."""
         minimal_cfg["data"]["roott"] = "/typo"
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             validate_config(minimal_cfg)

@@ -16,31 +16,28 @@ Heatmap 推理可视化 (v2 — 全景 4 视角)
         --output-dir ./vis_heatmap_4view
 """
 
-import os
-import sys
 import argparse
 import logging
+import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any
 
-import yaml
+import matplotlib
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib
+
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import cv2
+import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from src.models.pipeline import VLNPipeline, VLNPipelineConfig
-from src.models.lora_utils import resolve_lora_layer_indices
-from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
 from src.data.factory import build_sliding_window_dataset
+from src.models.lora_utils import resolve_lora_layer_indices
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
@@ -50,11 +47,11 @@ VIEW_NAMES = ["Front", "Right", "Back", "Left"]
 
 
 # ==================== 与 train.py 一致的 build_model ====================
-def build_model(cfg: Dict) -> VLNPipeline:
+def build_model(cfg: dict) -> VLNPipeline:
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
-    action_cfg = model_cfg.get('action_head', {})
+    model_cfg.get('action_head', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
 
 
@@ -92,7 +89,7 @@ def build_model(cfg: Dict) -> VLNPipeline:
 
 
 # ==================== collate_fn ====================
-def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
+def collate_fn(batch: list[dict]) -> dict[str, Any]:
     max_K = max(s['history_frames'].shape[0] for s in batch)
 
     history_frames_padded = []
@@ -101,7 +98,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     for s in batch:
         frames = s['history_frames']
         K = frames.shape[0]
-        if K < max_K:
+        if max_K > K:
             pad_size = max_K - K
             pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
             frames_padded = torch.cat([frames, pad_frames], dim=0)
@@ -155,10 +152,10 @@ def visualize_panoramic_sample(
     current_views: np.ndarray,
     pred_heatmaps: np.ndarray,
     gt_heatmaps: np.ndarray,
-    visibility: Optional[np.ndarray],
+    visibility: np.ndarray | None,
     instruction: str,
     output_path: str,
-    metrics: Dict = None,
+    metrics: dict | None = None,
 ):
     """
     全景 4 视角可视化。
@@ -470,7 +467,7 @@ def main():
         logger.info(f"  < 10px: {sum(1 for d in finite_dists if d < 10)}/{len(finite_dists)}")
 
     if all_ious:
-        logger.info(f"IoU:")
+        logger.info("IoU:")
         logger.info(f"  Mean:   {np.mean(all_ious):.3f}")
         logger.info(f"  Median: {np.median(all_ious):.3f}")
 

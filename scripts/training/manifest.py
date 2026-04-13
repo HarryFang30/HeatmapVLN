@@ -2,21 +2,21 @@
 Run metadata capture, file I/O helpers, and git state utilities.
 """
 
+import argparse
 import json
 import os
-import sys
-import shutil
-import subprocess
 import platform
+import shutil
 import socket
-import argparse
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-import yaml
 import numpy as np
 import torch
+import yaml
 
 
 def _make_json_safe(value: Any) -> Any:
@@ -36,19 +36,19 @@ def _make_json_safe(value: Any) -> Any:
     return value
 
 
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(_make_json_safe(payload), f, indent=2, ensure_ascii=False)
 
 
-def _write_yaml(path: Path, payload: Dict[str, Any]) -> None:
+def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
 
 
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {"timestamp": datetime.now().isoformat(), **_make_json_safe(payload)}
     with open(path, "a", encoding="utf-8") as f:
@@ -73,7 +73,7 @@ def _clear_directory(path: Path) -> None:
             shutil.rmtree(child)
 
 
-def _run_git_command(project_dir: Path, args: List[str]) -> str:
+def _run_git_command(project_dir: Path, args: list[str]) -> str:
     try:
         result = subprocess.run(
             ["git", *args],
@@ -87,7 +87,7 @@ def _run_git_command(project_dir: Path, args: List[str]) -> str:
         return ""
 
 
-def _capture_git_state(project_dir: Path) -> Dict[str, Any]:
+def _capture_git_state(project_dir: Path) -> dict[str, Any]:
     commit = _run_git_command(project_dir, ["rev-parse", "HEAD"])
     short_commit = _run_git_command(project_dir, ["rev-parse", "--short", "HEAD"])
     branch = _run_git_command(project_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -104,9 +104,9 @@ def _capture_git_state(project_dir: Path) -> Dict[str, Any]:
 def _capture_env_state(
     args: argparse.Namespace,
     run_dir: Path,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     is_resuming: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "run_dir": str(run_dir),
         "is_resuming": is_resuming,
@@ -126,7 +126,7 @@ def _capture_env_state(
     }
 
 
-def _find_resume_checkpoint(run_dir: Path) -> Optional[Path]:
+def _find_resume_checkpoint(run_dir: Path) -> Path | None:
     candidates = [
         run_dir / "checkpoints" / "latest.pth",
         run_dir / "ckpts" / "latest.pth",

@@ -12,7 +12,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 from packaging.version import Version
@@ -30,7 +30,7 @@ def install_numpy_legacy_aliases() -> None:
         np.bool = np.bool_  # type: ignore[attr-defined]
 
 
-def load_model_config(model_path: str) -> Dict[str, Any]:
+def load_model_config(model_path: str) -> dict[str, Any]:
     cfg_path = Path(model_path) / "config.json"
     if not cfg_path.exists():
         return {}
@@ -57,7 +57,7 @@ def detect_backbone_type(model_path: str, requested_backbone_type: str = "auto")
     )
 
 
-def _make_stub_module(name: str, attrs: Optional[Dict[str, Any]] = None) -> types.ModuleType:
+def _make_stub_module(name: str, attrs: dict[str, Any] | None = None) -> types.ModuleType:
     module = types.ModuleType(name)
     module.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
     module.__heatmapvln_stub__ = True
@@ -73,7 +73,7 @@ def _is_flash_attn_stubbed() -> bool:
     return bool(module is not None and getattr(module, "__heatmapvln_stub__", False))
 
 
-def install_flash_attn_stub(logger: Optional[logging.Logger] = None) -> None:
+def install_flash_attn_stub(logger: logging.Logger | None = None) -> None:
     """Install a minimal flash_attn stub so transformers can import Qwen2.5-VL."""
     log = logger or LOGGER
     if _is_flash_attn_stubbed():
@@ -146,7 +146,7 @@ def install_flash_attn_stub(logger: Optional[logging.Logger] = None) -> None:
 class RuntimeCompatState:
     resolved_backbone_type: str
     installed_transformers_version: str
-    expected_transformers_version: Optional[str]
+    expected_transformers_version: str | None
     flash_attn_available: bool
     flash_attn_stubbed: bool
 
@@ -155,7 +155,7 @@ def ensure_transformers_runtime_compat(
     model_path: str,
     requested_backbone_type: str = "auto",
     requested_attn_implementation: str = "sdpa",
-    logger: Optional[logging.Logger] = None,
+    logger: logging.Logger | None = None,
 ) -> RuntimeCompatState:
     """Validate the active transformers stack and patch incompatible flash_attn imports."""
     log = logger or LOGGER

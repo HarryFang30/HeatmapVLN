@@ -3,13 +3,12 @@ Shared utility functions used across multiple training modules.
 """
 
 import logging
-import math
-import yaml
+
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
+import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
-from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
-def _dist_backend() -> Optional[str]:
+def _dist_backend() -> str | None:
     return dist.get_backend() if _dist_is_initialized() else None
 
 
@@ -40,7 +39,7 @@ def _normalize_state_key(name: str) -> str:
     return name.replace(".module.", ".")
 
 
-def _normalized_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+def _normalized_model_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {
         _normalize_state_key(name): value
         for name, value in model.state_dict().items()
@@ -57,12 +56,12 @@ def _normalized_trainable_param_names(model: nn.Module) -> set[str]:
 
 def _load_normalized_state_dict(
     model: nn.Module,
-    state_dict: Dict[str, torch.Tensor],
-) -> Tuple[List[str], List[str], int]:
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str], int]:
     current_state = model.state_dict()
     normalized_to_actual = {
         _normalize_state_key(name): name
-        for name in current_state.keys()
+        for name in current_state
     }
     remapped_state_dict = {}
     skipped_shape = []
@@ -88,7 +87,7 @@ def _load_normalized_state_dict(
 # Trainable-param helpers
 # ---------------------------------------------------------------------------
 
-def _get_trainable_params(model: nn.Module) -> List[torch.nn.Parameter]:
+def _get_trainable_params(model: nn.Module) -> list[torch.nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
 
@@ -96,13 +95,13 @@ def _get_trainable_params(model: nn.Module) -> List[torch.nn.Parameter]:
 # Timing / formatting helpers
 # ---------------------------------------------------------------------------
 
-def _mean_timing(stats: Dict[str, float], count: int, key: str) -> float:
+def _mean_timing(stats: dict[str, float], count: int, key: str) -> float:
     if count <= 0:
         return 0.0
     return stats.get(key, 0.0) / count
 
 
-def _format_qwen_internal_timing(stats: Dict[str, float], count: int) -> str:
+def _format_qwen_internal_timing(stats: dict[str, float], count: int) -> str:
     if count <= 0:
         return ""
 
@@ -150,7 +149,7 @@ def _format_qwen_internal_timing(stats: Dict[str, float], count: int) -> str:
     return " | ".join(sections)
 
 
-def _format_decode_internal_timing(stats: Dict[str, float], count: int) -> str:
+def _format_decode_internal_timing(stats: dict[str, float], count: int) -> str:
     if count <= 0:
         return ""
 
@@ -174,14 +173,14 @@ def _format_decode_internal_timing(stats: Dict[str, float], count: int) -> str:
 # Config / seed
 # ---------------------------------------------------------------------------
 
-def load_config(config_path: str, validate: bool = True) -> Dict:
+def load_config(config_path: str, validate: bool = True) -> dict:
     """Load a YAML config file, optionally validating against the schema.
 
     When *validate* is True (default), typos and type errors in the
     config are caught immediately at startup instead of causing cryptic
     ``KeyError`` deep in the training loop.
     """
-    with open(config_path, 'r') as f:
+    with open(config_path) as f:
         cfg = yaml.safe_load(f)
     if validate:
         from src.config_schema import validate_config
@@ -192,7 +191,7 @@ def load_config(config_path: str, validate: bool = True) -> Dict:
 def safe_torch_load(
     path: str,
     map_location: str = "cpu",
-) -> Dict:
+) -> dict:
     """Load a checkpoint with consistent safety settings.
 
     Uses ``weights_only=False`` because our checkpoints contain optimizer
@@ -203,10 +202,10 @@ def safe_torch_load(
 
 
 def build_heatmap_loss_fn(
-    cfg: Dict,
+    cfg: dict,
     device: torch.device,
-    temperature: Optional[float] = None,
-    lambda_neg_override: Optional[float] = None,
+    temperature: float | None = None,
+    lambda_neg_override: float | None = None,
 ) -> "HeatmapVLNLoss":
     """Centralized factory for HeatmapVLNLoss — avoids duplication across train/validate."""
     from src.models.heatmap import HeatmapVLNLoss
@@ -228,6 +227,7 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     import random
+
     import numpy as np
     random.seed(seed)
     np.random.seed(seed)

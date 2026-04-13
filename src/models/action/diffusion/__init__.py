@@ -9,16 +9,16 @@ Components:
 - SinusoidalPosEmb: Sinusoidal positional embeddings for diffusion timesteps
 """
 
-from .conditional_unet1d import ConditionalUnet1D, ConditionalResidualBlock1D
+from .conditional_unet1d import ConditionalResidualBlock1D, ConditionalUnet1D
 from .conv1d_components import Conv1dBlock, Downsample1d, Upsample1d
 from .positional_embedding import SinusoidalPosEmb
 
 __all__ = [
-    'ConditionalUnet1D',
     'ConditionalResidualBlock1D',
+    'ConditionalUnet1D',
     'Conv1dBlock',
     'Downsample1d',
-    'Upsample1d',
     'SinusoidalPosEmb',
+    'Upsample1d',
 ]
 

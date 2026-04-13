@@ -15,18 +15,19 @@ Architecture:
             → trajectory (B, T, 3)
 """
 
+import logging
 import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
 import torch
 import torch.nn as nn
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Any, List
-import logging
-from dataclasses import dataclass
 
-from .qwen2_5_vl import Qwen2_5VLIntegration, Qwen2_5VLConfig
-from .heatmap import HeatmapVLN, HeatmapVLNLoss
+from .heatmap import HeatmapVLN
+from .qwen2_5_vl import Qwen2_5VLConfig, Qwen2_5VLIntegration
 
 if TYPE_CHECKING:
-    from .action import NextDiTActionConfig
+    pass
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -68,19 +69,19 @@ class VLNPipelineConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_num_layers: int = 4
-    lora_layer_indices: Optional[List[int]] = None
+    lora_layer_indices: list[int] | None = None
     lora_dropout: float = 0.05
-    lora_target_modules: Optional[List[str]] = None
+    lora_target_modules: list[str] | None = None
 
     # ==================== HeatmapVLN v2 (Coarse-to-Fine) ====================
     enable_heatmap: bool = True
     heatmap_c_vit: int = 1280
     heatmap_c_llm: int = 3584
     heatmap_c_fused: int = 256
-    heatmap_vit_layer_indices: Optional[List[int]] = None   # e.g. [6, 12, 18, 24]
-    heatmap_llm_layer_indices: Optional[List[int]] = None  # e.g. [7, 15, 23] (full_attention)
-    heatmap_size: Tuple[int, int] = (64, 64)
-    heatmap_trajectory_config: Optional[Dict[str, Any]] = None
+    heatmap_vit_layer_indices: list[int] | None = None   # e.g. [6, 12, 18, 24]
+    heatmap_llm_layer_indices: list[int] | None = None  # e.g. [7, 15, 23] (full_attention)
+    heatmap_size: tuple[int, int] = (64, 64)
+    heatmap_trajectory_config: dict[str, Any] | None = None
 
     # Allow heatmap loss gradients to flow back through the VLM backbone (LoRA).
     # When False (default), hooked features are detached and the backbone runs
@@ -105,7 +106,7 @@ class VLNPipelineConfig:
     nextdit_dit_layers: int = 12
     nextdit_dit_heads: int = 6
     nextdit_dit_kv_heads: int = 6
-    nextdit_dit_ffn_dim_multiplier: Optional[float] = 2 / 3
+    nextdit_dit_ffn_dim_multiplier: float | None = 2 / 3
     nextdit_predict_steps: int = 32
     nextdit_action_dim: int = 3
     nextdit_num_inference_steps: int = 10
@@ -184,7 +185,7 @@ class VLNPipeline(nn.Module):
         # ==================== HeatmapVLN v2 ====================
         # HeatmapVLN is constructed lazily after the VLM backbone is loaded,
         # because it needs the actual model instance for hook registration.
-        self.heatmap_vln: Optional[HeatmapVLN] = None
+        self.heatmap_vln: HeatmapVLN | None = None
         self._heatmap_enabled = config.enable_heatmap
 
         # ==================== Action Head (NextDiT System 1) ====================
@@ -192,7 +193,7 @@ class VLNPipeline(nn.Module):
         self.latent_queries = None
 
         if config.nextdit_enabled:
-            from .action import NextDiTActionHead, NextDiTActionConfig
+            from .action import NextDiTActionConfig, NextDiTActionHead
 
             nextdit_cfg = NextDiTActionConfig(
                 vlm_hidden_dim=config.nextdit_vlm_hidden_dim,
@@ -359,12 +360,12 @@ class VLNPipeline(nn.Module):
         )
 
     @staticmethod
-    def _views_tensor_to_dict(views: torch.Tensor) -> Dict[str, Any]:
+    def _views_tensor_to_dict(views: torch.Tensor) -> dict[str, Any]:
         if views.dim() != 4 or views.shape[0] != 4:
             raise ValueError(f"Expected views tensor [4, C, H, W], got {tuple(views.shape)}")
         return {name: views[idx] for idx, name in enumerate(VIEW_NAMES)}
 
-    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> List[Dict[str, Any]]:
+    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> list[dict[str, Any]]:
         if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
             raise ValueError(
                 f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
@@ -378,8 +379,8 @@ class VLNPipeline(nn.Module):
         self,
         current_views: Any,
         history_panoramas: Any,
-        instruction_text: Optional[Any] = None,
-    ) -> Dict[str, torch.Tensor]:
+        instruction_text: Any | None = None,
+    ) -> dict[str, torch.Tensor]:
         if self.heatmap_vln is None:
             raise RuntimeError("HeatmapVLN has not been constructed")
 
@@ -434,23 +435,23 @@ class VLNPipeline(nn.Module):
     def forward(
         self,
         video_frames: torch.Tensor,
-        instruction_text: Optional[str] = None,
-        current_observation: Optional[torch.Tensor] = None,
+        instruction_text: str | None = None,
+        current_observation: torch.Tensor | None = None,
         return_intermediate: bool = False,
         return_heatmaps: bool = True,
         return_actions: bool = True,
-        gt_actions: Optional[torch.Tensor] = None,
-        action_valid: Optional[torch.Tensor] = None,
-        gt_stop: Optional[torch.Tensor] = None,
-        gt_history_heatmap: Optional[torch.Tensor] = None,
-        gt_future_heatmap: Optional[torch.Tensor] = None,
-        current_views: Optional[Dict[str, Any]] = None,
-        history_panoramas: Optional[List[Dict[str, Any]]] = None,
-        panoramic_inputs: Optional[Dict[str, torch.Tensor]] = None,
-        panoramic_num_histories: Optional[List[int]] = None,
-        panoramic_text_anchor_positions: Optional[List[Dict[int, int]]] = None,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Any]:
+        gt_actions: torch.Tensor | None = None,
+        action_valid: torch.Tensor | None = None,
+        gt_stop: torch.Tensor | None = None,
+        gt_history_heatmap: torch.Tensor | None = None,
+        gt_future_heatmap: torch.Tensor | None = None,
+        current_views: dict[str, Any] | None = None,
+        history_panoramas: list[dict[str, Any]] | None = None,
+        panoramic_inputs: dict[str, torch.Tensor] | None = None,
+        panoramic_num_histories: list[int] | None = None,
+        panoramic_text_anchor_positions: list[dict[int, int]] | None = None,
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
         """Forward pass."""
         del gt_stop  # Reserved for optional stop-head training compatibility.
         batch_size, num_frames = video_frames.shape[:2]
@@ -540,15 +541,14 @@ class VLNPipeline(nn.Module):
         trajectory = None
         traj_hidden_states = qwen_output.get('traj_hidden_states') if qwen_output is not None else None
 
-        if return_actions:
-            if self.nextdit_action_head is not None and traj_hidden_states is not None:
-                if not self.training:
-                    trajectory = self.nextdit_action_head.get_trajectory(
-                        traj_hidden_states,
-                    )
+        if return_actions and self.nextdit_action_head is not None and traj_hidden_states is not None:
+            if not self.training:
+                trajectory = self.nextdit_action_head.get_trajectory(
+                    traj_hidden_states,
+                )
 
         # ==================== Build Output ====================
-        output: Dict[str, Any] = {
+        output: dict[str, Any] = {
             'processing_metadata': {
                 'num_input_frames': num_frames,
                 'batch_size': batch_size,
@@ -585,10 +585,10 @@ class VLNPipeline(nn.Module):
     @torch.no_grad()
     def generate_trajectory(
         self,
-        panoramic_inputs: Dict[str, torch.Tensor],
-        panoramic_num_histories: List[int],
-        traj_images: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        panoramic_inputs: dict[str, torch.Tensor],
+        panoramic_num_histories: list[int],
+        traj_images: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """Two-step inference aligned with InternNav.
 
         Step 1: auto-regressive pixel-goal text generation.
@@ -631,15 +631,15 @@ class VLNPipeline(nn.Module):
 
     def forward_packed(
         self,
-        packed_batch: Dict[str, Any],
+        packed_batch: dict[str, Any],
         return_intermediate: bool = False,
         return_heatmaps: bool = True,
         return_actions: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Forward pass with packed batch."""
         batch_size = packed_batch["num_samples"]
         seq_lens = packed_batch["seq_lens"]
-        current_observation = packed_batch["current_frame"].to(self.device)
+        packed_batch["current_frame"].to(self.device)
 
         # ==================== Step 1: VLM backbone processing (Packed) ====================
         qwen_output = self.qwen2_5_vl.forward_packed(
@@ -668,7 +668,7 @@ class VLNPipeline(nn.Module):
         # This path does not generate heatmaps.
 
         # ==================== Build Output ====================
-        output: Dict[str, Any] = {
+        output: dict[str, Any] = {
             'llm_tokens': llm_tokens,
             'processing_metadata': {
                 'num_samples': batch_size,
@@ -690,7 +690,7 @@ class VLNPipeline(nn.Module):
 
 def create_vln_pipeline(
     llm_model_path: str = "./models/internnav_backbone",
-    heatmap_size: Tuple[int, int] = (64, 64),
+    heatmap_size: tuple[int, int] = (64, 64),
     device: str = "cuda",
     verbose: bool = True,
     **kwargs,

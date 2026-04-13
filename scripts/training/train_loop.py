@@ -3,17 +3,14 @@ Core training loop: ``train_one_epoch``.
 """
 
 import gc
-import re
-import sys
-import time
 import logging
+import re
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import psutil
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
@@ -23,30 +20,30 @@ from tqdm import tqdm
 from src.models.pipeline import VLNPipeline
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
-from .utils import (
-    _unwrap_model,
-    _get_trainable_params,
-    _mean_timing,
-    _format_qwen_internal_timing,
-    _format_decode_internal_timing,
-    build_heatmap_loss_fn,
-)
 from .distributed import (
     DistributedContext,
+    _dist_all_reduce_in_place,
     _get_supported_trainable_sync_modules,
     synchronize_trainable_module_gradients,
-    _dist_all_reduce_in_place,
 )
-from .memory import _malloc_trim, _drop_page_cache, _cgroup_mem_usage_gb, _CG_LIMIT_GB
 from .ema import EMAModel
-from .optimizer import get_heatmap_temperature
-from .model_builder import end_nextdit_warmup
-from .visualization import (
-    visualize_heatmap_predictions,
-    _should_use_gpu_gt,
-    _select_primary_heatmap_slice,
-)
 from .manifest import _append_jsonl
+from .memory import _CG_LIMIT_GB, _cgroup_mem_usage_gb, _drop_page_cache, _malloc_trim
+from .model_builder import end_nextdit_warmup
+from .optimizer import get_heatmap_temperature
+from .utils import (
+    _format_decode_internal_timing,
+    _format_qwen_internal_timing,
+    _get_trainable_params,
+    _mean_timing,
+    _unwrap_model,
+    build_heatmap_loss_fn,
+)
+from .visualization import (
+    _select_primary_heatmap_slice,
+    _should_use_gpu_gt,
+    visualize_heatmap_predictions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,27 +54,27 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     scheduler,
     scaler: GradScaler,
-    cfg: Dict,
+    cfg: dict,
     epoch: int,
     logger,
-    tb_writer: Optional[SummaryWriter] = None,
+    tb_writer: SummaryWriter | None = None,
     global_step_offset: int = 0,
     stage_idx: int = 0,
     stage_name: str = "",
-    stage_cfg: Optional[Dict] = None,
-    max_batches: Optional[int] = None,
-    vis_dir: Optional[Path] = None,
-    gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
+    stage_cfg: dict | None = None,
+    max_batches: int | None = None,
+    vis_dir: Path | None = None,
+    gpu_heatmap_computer: GPUHeatmapComputer | None = None,
     gpu_has_depth: bool = False,
     gpu_depth_normalized: bool = True,
-    ema: Optional[EMAModel] = None,
-    metrics_jsonl_path: Optional[Path] = None,
+    ema: EMAModel | None = None,
+    metrics_jsonl_path: Path | None = None,
     total_train_steps: int = 1,
-    dist_context: Optional[DistributedContext] = None,
+    dist_context: DistributedContext | None = None,
     ckpt_manager=None,
     mid_epoch_save_every: int = 500,
     nextdit_warmup_steps: int = 0,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Train one epoch."""
     dist_context = dist_context or DistributedContext(
         enabled=False,
@@ -176,7 +173,7 @@ def train_one_epoch(
 
         history_frames = batch['history_frames']
         current_frame = batch['current_frame']
-        B, K, C, H, W = history_frames.shape
+        _B, _K, _C, _H, _W = history_frames.shape
 
         gt_action = batch['action'].to(device, non_blocking=True)
         action_valid = batch['action_valid'].to(device, non_blocking=True)
@@ -253,23 +250,22 @@ def train_one_epoch(
             heatmap_loss = torch.tensor(0.0, device=device)
             loss_dict = None
 
-            if train_history and 'visibility' in output and 'heatmaps' in output:
-                if gt_heatmap is not None:
-                    if 'gt_visibility' in batch:
-                        gt_vis = batch['gt_visibility'].to(device, non_blocking=True)
-                    else:
-                        gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
-                    hm_history_mask = batch.get('history_mask')
-                    if hm_history_mask is not None:
-                        hm_history_mask = hm_history_mask.to(device, non_blocking=True)
-                    loss_dict = hm_loss_fn(
-                        output['visibility'],
-                        output['heatmaps'],
-                        gt_vis=gt_vis,
-                        gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
-                        history_mask=hm_history_mask,
-                    )
-                    heatmap_loss = loss_dict['total']
+            if train_history and 'visibility' in output and 'heatmaps' in output and gt_heatmap is not None:
+                if 'gt_visibility' in batch:
+                    gt_vis = batch['gt_visibility'].to(device, non_blocking=True)
+                else:
+                    gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
+                hm_history_mask = batch.get('history_mask')
+                if hm_history_mask is not None:
+                    hm_history_mask = hm_history_mask.to(device, non_blocking=True)
+                loss_dict = hm_loss_fn(
+                    output['visibility'],
+                    output['heatmaps'],
+                    gt_vis=gt_vis,
+                    gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
+                    history_mask=hm_history_mask,
+                )
+                heatmap_loss = loss_dict['total']
 
             trajectory_loss = torch.tensor(0.0, device=device)
             action_loss = torch.tensor(0.0, device=device)
@@ -638,7 +634,7 @@ def train_one_epoch(
 _LORA_PARAM_RE = re.compile(r'layers\.(\d+)\..*?(\w+_proj)\.lora_([AB])\.')
 
 
-def _collect_lora_grad_norms(model_module) -> Optional[Dict]:
+def _collect_lora_grad_norms(model_module) -> dict | None:
     """Snapshot LoRA gradient norms before optimizer.zero_grad() destroys them.
 
     Returns ``{(layer_idx, module, 'A'|'B'): float}`` or *None* when no
@@ -650,7 +646,7 @@ def _collect_lora_grad_norms(model_module) -> Optional[Dict]:
     if qwen_model is None:
         return None
 
-    grad_norms: Dict[Tuple[int, str, str], float] = {}
+    grad_norms: dict[tuple[int, str, str], float] = {}
     for name, param in qwen_model.named_parameters():
         m = _LORA_PARAM_RE.search(name)
         if m and param.grad is not None:
@@ -664,9 +660,9 @@ def _log_lora_diagnostics(
     model_module,
     tb_writer: SummaryWriter,
     actual_step: int,
-    cfg: Dict,
+    cfg: dict,
     logger,
-    cached_grad_norms: Optional[Dict] = None,
+    cached_grad_norms: dict | None = None,
 ):
     """Log LoRA weight norms, gradient norms, and delta_W to TensorBoard.
 
@@ -687,7 +683,7 @@ def _log_lora_diagnostics(
     if qwen_model is None:
         return
 
-    lora_params: Dict[Tuple[int, str, str], torch.nn.Parameter] = {}
+    lora_params: dict[tuple[int, str, str], torch.nn.Parameter] = {}
     for name, param in qwen_model.named_parameters():
         m = _LORA_PARAM_RE.search(name)
         if m:
@@ -782,12 +778,12 @@ def _log_lora_diagnostics(
 # ---------------------------------------------------------------------------
 
 def _log_heatmap_diagnostics(
-    output: Dict,
+    output: dict,
     gt_heatmap: torch.Tensor,
-    batch: Dict,
+    batch: dict,
     tb_writer: SummaryWriter,
     actual_step: int,
-    cfg: Dict,
+    cfg: dict,
     logger,
 ):
     """Log per-step heatmap quality diagnostics to TensorBoard."""

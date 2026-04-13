@@ -4,9 +4,9 @@ Training curve plotter — generates loss/lr PNG charts and JSON history.
 
 import json
 from pathlib import Path
-from typing import Dict, Tuple
 
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 class TrainingPlotter:
     """Training curve plotter."""
 
-    def __init__(self, out_dir: Path, figsize: Tuple[int, int] = (14, 10)):
+    def __init__(self, out_dir: Path, figsize: tuple[int, int] = (14, 10)):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.figsize = figsize
@@ -37,9 +37,9 @@ class TrainingPlotter:
         self,
         epoch: int,
         stage_name: str,
-        train_metrics: Dict[str, float],
-        val_metrics: Dict[str, float],
-        lr: float = None,
+        train_metrics: dict[str, float],
+        val_metrics: dict[str, float],
+        lr: float | None = None,
         is_best: bool = False,
     ):
         if stage_name != self.current_stage:
@@ -136,7 +136,7 @@ class TrainingPlotter:
         with open(json_path, 'w') as f:
             json.dump(self.history, f, indent=2)
 
-    def get_summary(self) -> Dict:
+    def get_summary(self) -> dict:
         if not self.history['epoch']:
             return {}
 

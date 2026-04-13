@@ -4,17 +4,15 @@ Optimizer, learning-rate scheduler, and temperature schedule construction.
 
 import logging
 import math
-from typing import Dict
 
 import torch
-import torch.nn as nn
 
 from src.models.pipeline import VLNPipeline
 
 logger = logging.getLogger(__name__)
 
 
-def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
+def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.optim.Optimizer:
     """Build a per-module optimizer with layered learning rates and weight decay."""
     optim_cfg = cfg['optim']
     param_groups = []
@@ -175,7 +173,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
     return optimizer
 
 
-def build_scheduler(optimizer, cfg: Dict, total_steps: int):
+def build_scheduler(optimizer, cfg: dict, total_steps: int):
     """Build warmup + cosine annealing LR scheduler."""
     optim_cfg = cfg['optim']
     warmup_steps = int(total_steps * optim_cfg['warmup_ratio'])
@@ -203,7 +201,7 @@ def build_scheduler(optimizer, cfg: Dict, total_steps: int):
     return scheduler
 
 
-def get_heatmap_temperature(cfg: Dict, step: int, total_steps: int) -> float:
+def get_heatmap_temperature(cfg: dict, step: int, total_steps: int) -> float:
     """Return current soft-argmax temperature based on optimization step."""
     heatmap_loss_cfg = cfg.get('loss', {}).get('heatmap_vln', {})
     base_temperature = float(heatmap_loss_cfg.get('temperature', 1.0))

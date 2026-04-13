@@ -4,11 +4,9 @@ Validation loop.
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional
 
 import cv2
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -17,11 +15,11 @@ from tqdm import tqdm
 from src.models.pipeline import VLNPipeline
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
-from .utils import _unwrap_model, build_heatmap_loss_fn
 from .distributed import DistributedContext, _dist_all_reduce_in_place
+from .utils import _unwrap_model, build_heatmap_loss_fn
 from .visualization import (
-    visualize_heatmap_predictions,
     _should_use_gpu_gt,
+    visualize_heatmap_predictions,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,19 +29,19 @@ logger = logging.getLogger(__name__)
 def validate(
     model: VLNPipeline,
     val_loader: DataLoader,
-    cfg: Dict,
+    cfg: dict,
     logger,
-    stage_cfg: Dict,
-    tb_writer: Optional[SummaryWriter] = None,
+    stage_cfg: dict,
+    tb_writer: SummaryWriter | None = None,
     epoch: int = 0,
-    vis_dir: Optional[Path] = None,
-    max_batches: Optional[int] = None,
-    gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
+    vis_dir: Path | None = None,
+    max_batches: int | None = None,
+    gpu_heatmap_computer: GPUHeatmapComputer | None = None,
     gpu_has_depth: bool = False,
     gpu_depth_normalized: bool = True,
-    heatmap_temperature: Optional[float] = None,
-    dist_context: Optional[DistributedContext] = None,
-) -> Dict[str, float]:
+    heatmap_temperature: float | None = None,
+    dist_context: DistributedContext | None = None,
+) -> dict[str, float]:
     """Validation with optional visualization."""
     dist_context = dist_context or DistributedContext(
         enabled=False,
@@ -67,7 +65,7 @@ def validate(
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
-    loss_type = stage_cfg.get('heatmap_loss_type', 'simplified')
+    stage_cfg.get('heatmap_loss_type', 'simplified')
 
     device = dist_context.device
 
@@ -94,7 +92,7 @@ def validate(
                 break
             history_frames = batch['history_frames']
             current_frame = batch['current_frame']
-            B, K, C, H, W = history_frames.shape
+            _B, _K, _C, _H, _W = history_frames.shape
 
             gt_action = batch['action'].to(device)
             action_valid = batch['action_valid'].to(device)
@@ -156,26 +154,25 @@ def validate(
                 )
 
             heatmap_loss = torch.tensor(0.0, device=device)
-            if train_history and 'visibility' in output and 'heatmaps' in output:
-                if gt_heatmap is not None:
-                    if 'gt_visibility' in batch:
-                        gt_vis = batch['gt_visibility'].to(device)
-                    else:
-                        gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
-                    hm_history_mask = batch.get('history_mask')
-                    if hm_history_mask is not None:
-                        hm_history_mask = hm_history_mask.to(device)
-                    loss_dict = hm_loss_fn(
-                        output['visibility'],
-                        output['heatmaps'],
-                        gt_vis=gt_vis,
-                        gt_heatmaps=gt_heatmap.to(device),
-                        history_mask=hm_history_mask,
-                    )
-                    heatmap_loss = loss_dict['total']
-                    total_peak_loss += loss_dict.get('peak_loss', torch.tensor(0.0)).item()
-                    total_vis_loss += loss_dict.get('vis_loss', torch.tensor(0.0)).item()
-                    total_coord_loss += loss_dict.get('coord_loss', torch.tensor(0.0)).item()
+            if train_history and 'visibility' in output and 'heatmaps' in output and gt_heatmap is not None:
+                if 'gt_visibility' in batch:
+                    gt_vis = batch['gt_visibility'].to(device)
+                else:
+                    gt_vis = gt_heatmap.amax(dim=(-2, -1)).clamp(0, 1).to(device)
+                hm_history_mask = batch.get('history_mask')
+                if hm_history_mask is not None:
+                    hm_history_mask = hm_history_mask.to(device)
+                loss_dict = hm_loss_fn(
+                    output['visibility'],
+                    output['heatmaps'],
+                    gt_vis=gt_vis,
+                    gt_heatmaps=gt_heatmap.to(device),
+                    history_mask=hm_history_mask,
+                )
+                heatmap_loss = loss_dict['total']
+                total_peak_loss += loss_dict.get('peak_loss', torch.tensor(0.0)).item()
+                total_vis_loss += loss_dict.get('vis_loss', torch.tensor(0.0)).item()
+                total_coord_loss += loss_dict.get('coord_loss', torch.tensor(0.0)).item()
 
             if 'visibility' in output and output['visibility'] is not None:
                 pred_vis_logits = output['visibility'].detach()

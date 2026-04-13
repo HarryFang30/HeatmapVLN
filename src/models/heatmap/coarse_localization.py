@@ -19,7 +19,7 @@ vis_head input = concat(query[c_llm], coarse_heatmap_flat[H*W])
 Reference: HeatmapVLN设计文档 Section 5
 """
 
-from typing import Dict, List, Union
+from typing import Union
 
 import torch
 import torch.nn as nn
@@ -64,9 +64,9 @@ class CoarseLocalization(nn.Module):
 
     def forward(
         self,
-        current_llm: Dict[int, torch.Tensor],
-        history_queries: List[torch.Tensor],
-    ) -> Union[List[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+        current_llm: dict[int, torch.Tensor],
+        history_queries: list[torch.Tensor],
+    ) -> Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
         """
         Args:
             current_llm:     ``{view_idx: (H, W, C_fused)}`` — fused multi-layer features.
@@ -93,7 +93,7 @@ class CoarseLocalization(nn.Module):
             for hist_idx in range(batch["visibility"].shape[0])
         ]
 
-    def forward_batched(self, current_llm, history_queries) -> Dict[str, torch.Tensor]:
+    def forward_batched(self, current_llm, history_queries) -> dict[str, torch.Tensor]:
         """Batched coarse localization."""
         if isinstance(current_llm, dict):
             current_llm_tensor = torch.stack([current_llm[view_idx] for view_idx in range(4)], dim=0)

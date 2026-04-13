@@ -2,12 +2,12 @@
 DataLoader collate function for sliding-window / trajectory datasets.
 """
 
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 
 
-def _pad_and_stack(batch: List[Dict], key: str) -> torch.Tensor:
+def _pad_and_stack(batch: list[dict], key: str) -> torch.Tensor:
     """Stack tensors that may differ in the first (history) dimension,
     padding shorter ones with zeros to match the longest."""
     tensors = [s[key] for s in batch]
@@ -17,13 +17,13 @@ def _pad_and_stack(batch: List[Dict], key: str) -> torch.Tensor:
     padded = []
     for t in tensors:
         if t.shape[0] < max_n:
-            pad_shape = (max_n - t.shape[0],) + t.shape[1:]
+            pad_shape = (max_n - t.shape[0], *t.shape[1:])
             t = torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype)], dim=0)
         padded.append(t)
     return torch.stack(padded, dim=0)
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
+def collate_fn(batch: list[dict]) -> dict[str, Any]:
     max_K = max(s['history_frames'].shape[0] for s in batch)
 
     history_frames_padded = []
@@ -33,7 +33,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         frames = s['history_frames']
         K = frames.shape[0]
 
-        if K < max_K:
+        if max_K > K:
             pad_size = max_K - K
             pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
             frames_padded = torch.cat([frames, pad_frames], dim=0)

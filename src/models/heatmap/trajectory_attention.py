@@ -18,11 +18,10 @@ Outputs:
 """
 
 import math
-from typing import Dict, List, Optional, Union
+from typing import Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def sinusoidal_pe(
@@ -130,10 +129,10 @@ class TrajectoryGuidedAttention(nn.Module):
 
     def forward(
         self,
-        current_llm: Union[Dict[int, torch.Tensor], torch.Tensor],
-        history_queries: Union[List[torch.Tensor], torch.Tensor],
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        current_llm: Union[dict[int, torch.Tensor], torch.Tensor],
+        history_queries: Union[list[torch.Tensor], torch.Tensor],
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Args:
             current_llm:
@@ -186,8 +185,8 @@ class TrajectoryGuidedAttention(nn.Module):
         self,
         spatial: torch.Tensor,       # (4, H, W, C)
         hist_q: torch.Tensor,        # (N, C_llm)
-        rel_poses: Optional[torch.Tensor],  # (N, 4) or None
-    ) -> Dict[str, torch.Tensor]:
+        rel_poses: torch.Tensor | None,  # (N, 4) or None
+    ) -> dict[str, torch.Tensor]:
         N = hist_q.shape[0]
         V, H, W, C = spatial.shape
         device = spatial.device
@@ -239,8 +238,8 @@ class TrajectoryGuidedAttention(nn.Module):
         self,
         spatial: torch.Tensor,       # (B, 4, H, W, C)
         hist_q: torch.Tensor,        # (B, N, C_llm)
-        rel_poses: Optional[torch.Tensor],  # (B, N, 4) or None
-    ) -> Dict[str, torch.Tensor]:
+        rel_poses: torch.Tensor | None,  # (B, N, 4) or None
+    ) -> dict[str, torch.Tensor]:
         B, V, H, W, C = spatial.shape
         N = hist_q.shape[1]
         device = spatial.device

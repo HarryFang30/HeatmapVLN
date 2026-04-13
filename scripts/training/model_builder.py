@@ -4,9 +4,7 @@ Model construction and freeze/unfreeze strategies.
 
 import logging
 from pathlib import Path
-from typing import Any, Dict
 
-import torch
 import torch.nn as nn
 
 from src.models.lora_utils import resolve_lora_layer_indices
@@ -15,7 +13,7 @@ from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 logger = logging.getLogger(__name__)
 
 
-def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
+def build_model(cfg: dict, verbose: bool = True) -> VLNPipeline:
     """Build the VLN Pipeline from a config dict."""
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
@@ -136,19 +134,18 @@ def freeze_module(module: nn.Module, freeze: bool = True):
         param.requires_grad = not freeze
 
 
-def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
+def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     """Set trainable modules according to stage config."""
     freeze_module(model, freeze=True)
 
     trainable = stage_cfg.get('trainable_modules', [])
 
-    if 'heatmap_vln' in trainable:
-        if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
-            freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
-            freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
-            freeze_module(model.heatmap_vln.coarse, freeze=False)
-            freeze_module(model.heatmap_vln.fine, freeze=False)
-            logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
+    if 'heatmap_vln' in trainable and hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
+        freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
+        freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
+        freeze_module(model.heatmap_vln.coarse, freeze=False)
+        freeze_module(model.heatmap_vln.fine, freeze=False)
+        logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
 
     if 'nextdit_action_head' in trainable:
         if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
@@ -157,10 +154,9 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
                 model.nextdit_action_head.rgb_model.requires_grad_(False)
             logger.info("  ✓ Unfrozen: nextdit_action_head (rgb_model kept frozen)")
 
-    if 'latent_queries' in trainable:
-        if hasattr(model, 'latent_queries') and model.latent_queries is not None:
-            model.latent_queries.requires_grad_(True)
-            logger.info("  ✓ Unfrozen: latent_queries")
+    if 'latent_queries' in trainable and hasattr(model, 'latent_queries') and model.latent_queries is not None:
+        model.latent_queries.requires_grad_(True)
+        logger.info("  ✓ Unfrozen: latent_queries")
 
     # Fine-grained nextdit sub-module unfreezing
     _nah_submodule_map = {
@@ -179,10 +175,9 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
                     freeze_module(submod, freeze=False)
                     logger.info("  ✓ Unfrozen: nextdit_action_head.%s", attr_name)
 
-    if 'llm_projector' in trainable:
-        if hasattr(model, 'llm_projector'):
-            freeze_module(model.llm_projector, freeze=False)
-            logger.info("  ✓ Unfrozen: llm_projector")
+    if 'llm_projector' in trainable and hasattr(model, 'llm_projector'):
+        freeze_module(model.llm_projector, freeze=False)
+        logger.info("  ✓ Unfrozen: llm_projector")
 
     vlm_backbone = getattr(model, 'vlm_backbone', getattr(model, 'qwen2_5_vl', None))
     if vlm_backbone is not None:
@@ -199,7 +194,7 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: Dict, logger):
                 logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
 
 
-def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: Dict, logger) -> int:
+def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: dict, logger) -> int:
     """Apply warmup freeze: only cond_projector + latent_queries trainable.
 
     During warmup the bridge layers adapt to the LoRA-modified VLM
@@ -232,7 +227,7 @@ def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: Dict, logger) -> int:
     return warmup_steps
 
 
-def end_nextdit_warmup(model: VLNPipeline, logger, stage_cfg: Dict = None):
+def end_nextdit_warmup(model: VLNPipeline, logger, stage_cfg: dict | None = None):
     """Unfreeze System 1 modules according to trainable_modules after warmup.
 
     Unlike the old behaviour that blindly unfroze everything, this now

@@ -13,9 +13,9 @@ Usage:
     trajectory = action_head.get_trajectory(traj_hidden_states)  # (B, T, 3)
 """
 
-from .nextdit_action_head import NextDiTActionHead, NextDiTActionConfig
+from .nextdit_action_head import NextDiTActionConfig, NextDiTActionHead
 
 __all__ = [
-    'NextDiTActionHead',
     'NextDiTActionConfig',
+    'NextDiTActionHead',
 ]

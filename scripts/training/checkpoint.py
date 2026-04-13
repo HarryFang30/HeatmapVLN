@@ -4,16 +4,15 @@ Checkpoint management: save, load, cleanup, and resume.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler
 
 from .utils import (
+    _load_normalized_state_dict,
     _normalized_model_state_dict,
     _normalized_trainable_param_names,
-    _load_normalized_state_dict,
     safe_torch_load,
 )
 
@@ -39,11 +38,11 @@ class CheckpointManager:
         epoch: int,
         stage_idx: int,
         stage_name: str,
-        metrics: Dict,
-        cfg: Dict,
+        metrics: dict,
+        cfg: dict,
         is_best: bool = False,
         scaler: GradScaler = None,
-        batch: int = None,
+        batch: int | None = None,
     ) -> Path:
         """Save checkpoint. ``batch`` being not None produces a mid-epoch save."""
         trainable_params = _normalized_trainable_param_names(model)
@@ -101,19 +100,19 @@ class CheckpointManager:
             old_ckpt.unlink()
             logger.info("🗑️  Removed old checkpoint: %s", old_ckpt.name)
 
-    def load(self, ckpt_path: str) -> Dict:
+    def load(self, ckpt_path: str) -> dict:
         ckpt = safe_torch_load(ckpt_path)
         self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
         return ckpt
 
-    def get_latest(self) -> Optional[Path]:
+    def get_latest(self) -> Path | None:
         latest = self.out_dir / "latest.pth"
         if latest.exists():
             return latest
         legacy_latest = self.out_dir.parent / "ckpts" / "latest.pth"
         return legacy_latest if legacy_latest.exists() else None
 
-    def get_best(self) -> Optional[Path]:
+    def get_best(self) -> Path | None:
         best = self.out_dir / "best.pth"
         if best.exists():
             return best
@@ -128,7 +127,7 @@ def load_checkpoint_for_resume(
     scheduler=None,
     scaler: GradScaler = None,
     logger=None,
-) -> Dict:
+) -> dict:
     """Load checkpoint for resume training."""
     if logger:
         logger.info(f"📂 Loading checkpoint: {ckpt_path}")
@@ -137,7 +136,7 @@ def load_checkpoint_for_resume(
 
     state_dict = ckpt.get('trainable_state_dict', {})
     if state_dict:
-        missing, unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
+        _missing, _unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
         if logger:
             logger.info(f"  ✓ Loaded {loaded_count} trainable parameters")
 

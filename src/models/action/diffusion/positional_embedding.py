@@ -5,6 +5,7 @@ Migrated from DifNav/diffusion_policy for action generation.
 """
 
 import math
+
 import torch
 import torch.nn as nn
 
@@ -12,14 +13,14 @@ import torch.nn as nn
 class SinusoidalPosEmb(nn.Module):
     """
     Sinusoidal positional embedding for diffusion timesteps.
-    
+
     Converts scalar timestep values to high-dimensional embeddings
     using sinusoidal functions, similar to transformer positional encodings.
-    
+
     Args:
         dim: Output embedding dimension
     """
-    
+
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -28,7 +29,7 @@ class SinusoidalPosEmb(nn.Module):
         """
         Args:
             x: (B,) tensor of timestep values
-            
+
         Returns:
             (B, dim) tensor of positional embeddings (same dtype as input)
         """

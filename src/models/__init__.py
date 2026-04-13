@@ -28,9 +28,14 @@ except Exception:
     install_flash_attn_stub(logging.getLogger(__name__))
 
 # === Qwen2.5-VL Integration ===
-from .qwen2_5_vl import (
-    Qwen2_5VLIntegration,
-    Qwen2_5VLConfig,
+# === Heatmap Components (v2 Coarse-to-Fine) ===
+from .heatmap import (
+    CoarseLocalization,
+    DPTLiteFusion,
+    FeatureExtractor,
+    FineLocalization,
+    HeatmapVLN,
+    HeatmapVLNLoss,
 )
 
 # === VLN Pipeline ===
@@ -39,22 +44,16 @@ from .pipeline import (
     VLNPipelineConfig,
     create_vln_pipeline,
 )
-
-# === Heatmap Components (v2 Coarse-to-Fine) ===
-from .heatmap import (
-    HeatmapVLN,
-    HeatmapVLNLoss,
-    CoarseLocalization,
-    DPTLiteFusion,
-    FineLocalization,
-    FeatureExtractor,
+from .qwen2_5_vl import (
+    Qwen2_5VLConfig,
+    Qwen2_5VLIntegration,
 )
 
 # === Action Components (NextDiT System 1) ===
 try:
     from .action import (
-        NextDiTActionHead,
         NextDiTActionConfig,
+        NextDiTActionHead,
     )
 except Exception:
     # Heatmap-only training should still import cleanly even if the local
@@ -63,17 +62,17 @@ except Exception:
     NextDiTActionConfig = None
 
 __all__ = [
-    'Qwen2_5VLIntegration',
+    'CoarseLocalization',
+    'DPTLiteFusion',
+    'FeatureExtractor',
+    'FineLocalization',
+    'HeatmapVLN',
+    'HeatmapVLNLoss',
+    'NextDiTActionConfig',
+    'NextDiTActionHead',
     'Qwen2_5VLConfig',
+    'Qwen2_5VLIntegration',
     'VLNPipeline',
     'VLNPipelineConfig',
     'create_vln_pipeline',
-    'HeatmapVLN',
-    'HeatmapVLNLoss',
-    'CoarseLocalization',
-    'DPTLiteFusion',
-    'FineLocalization',
-    'FeatureExtractor',
-    'NextDiTActionHead',
-    'NextDiTActionConfig',
 ]

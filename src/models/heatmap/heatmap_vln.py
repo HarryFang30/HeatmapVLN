@@ -31,17 +31,17 @@ Actual default data flow:
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 
-from .input_constructor import construct_input, find_text_anchor_positions
-from .feature_extractor import FeatureExtractor
 from .coarse_localization import CoarseLocalization
-from .trajectory_attention import TrajectoryGuidedAttention
 from .dpt_lite_fusion import DPTLiteFusion
+from .feature_extractor import FeatureExtractor
 from .fine_localization import FineLocalization
+from .input_constructor import construct_input, find_text_anchor_positions
+from .trajectory_attention import TrajectoryGuidedAttention
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +67,10 @@ class HeatmapVLN(nn.Module):
         c_vit: int = 1280,
         c_llm: int = 3584,
         c_fused: int = 256,
-        vit_layer_indices: Optional[List[int]] = None,
-        llm_layer_indices: Optional[List[int]] = None,
+        vit_layer_indices: list[int] | None = None,
+        llm_layer_indices: list[int] | None = None,
         enable_runtime_timing: bool = False,
-        trajectory_config: Optional[Dict[str, Any]] = None,
+        trajectory_config: dict[str, Any] | None = None,
         heatmap_trains_backbone: bool = False,
     ):
         super().__init__()
@@ -158,11 +158,11 @@ class HeatmapVLN(nn.Module):
 
     def prepare_qwen_inputs(
         self,
-        current_views: Dict[str, object],
-        history_panoramas: List[Dict[str, object]],
-        instruction: Optional[str] = None,
-        device: Optional[torch.device] = None,
-    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        current_views: dict[str, object],
+        history_panoramas: list[dict[str, object]],
+        instruction: str | None = None,
+        device: torch.device | None = None,
+    ) -> tuple[dict[str, torch.Tensor], int]:
         """Build processor inputs for the panoramic single-chain forward."""
         if device is None:
             device = next(self.fine.parameters()).device
@@ -185,11 +185,11 @@ class HeatmapVLN(nn.Module):
 
     def prepare_qwen_inputs_batch(
         self,
-        current_views: Union[torch.Tensor, List[Dict[str, object]]],
-        history_panoramas: Union[torch.Tensor, List[List[Dict[str, object]]]],
-        instruction: Optional[Union[str, List[Optional[str]]]] = None,
-        device: Optional[torch.device] = None,
-    ) -> Tuple[Dict[str, torch.Tensor], List[int]]:
+        current_views: Union[torch.Tensor, list[dict[str, object]]],
+        history_panoramas: Union[torch.Tensor, list[list[dict[str, object]]]],
+        instruction: Union[str, list[str | None]] | None = None,
+        device: torch.device | None = None,
+    ) -> tuple[dict[str, torch.Tensor], list[int]]:
         """Build one batched processor input for panoramic batch forward."""
         if device is None:
             device = next(self.fine.parameters()).device
@@ -247,7 +247,7 @@ class HeatmapVLN(nn.Module):
         return inputs, [len(panos) for panos in history_panoramas_list]
 
     @staticmethod
-    def _normalize_multimodal_inputs(inputs: Dict[str, torch.Tensor]) -> None:
+    def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]) -> None:
         """Normalize processor outputs to match Qwen's multimodal expectations."""
         if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
             vgt = inputs["video_grid_thw"]
@@ -259,10 +259,10 @@ class HeatmapVLN(nn.Module):
 
     def decode_from_inputs(
         self,
-        inputs: Dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
         num_history: int,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Decode heatmaps from the most recent hooked Qwen forward."""
         device = next(self.fine.parameters()).device
 
@@ -295,12 +295,12 @@ class HeatmapVLN(nn.Module):
 
     def decode_from_inputs_batch(
         self,
-        inputs: Dict[str, torch.Tensor],
-        num_histories: List[int],
-        image_positions_batch: Optional[List[Dict[int, Tuple[int, int]]]] = None,
-        text_anchors_batch: Optional[List[Dict[int, int]]] = None,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        inputs: dict[str, torch.Tensor],
+        num_histories: list[int],
+        image_positions_batch: list[dict[int, tuple[int, int]]] | None = None,
+        text_anchors_batch: list[dict[int, int]] | None = None,
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Decode batched panoramic inputs from one shared Qwen forward."""
         device = next(self.fine.parameters()).device
         input_ids = inputs["input_ids"]
@@ -347,13 +347,13 @@ class HeatmapVLN(nn.Module):
 
     def _decode_features(
         self,
-        current_vit: Dict[int, Dict[int, torch.Tensor]],
-        current_llm: Dict[int, Dict[int, torch.Tensor]],
-        history_queries: List[torch.Tensor],
+        current_vit: dict[int, dict[int, torch.Tensor]],
+        current_llm: dict[int, dict[int, torch.Tensor]],
+        history_queries: list[torch.Tensor],
         num_history: int,
         device: torch.device,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Run coarse-to-fine decoding from pre-extracted features."""
         if num_history == 0:
             return {
@@ -388,11 +388,11 @@ class HeatmapVLN(nn.Module):
 
     def _decode_features_batch(
         self,
-        extracted: List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]],
-        num_histories: List[int],
+        extracted: list[tuple[dict[int, dict[int, torch.Tensor]], dict[int, dict[int, torch.Tensor]], list[torch.Tensor]]],
+        num_histories: list[int],
         device: torch.device,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         batch_size = len(extracted)
         if batch_size == 0:
             return {
@@ -484,14 +484,14 @@ class HeatmapVLN(nn.Module):
 
     def _decode_feature_tensors_batch(
         self,
-        vit_layer_tensors: Dict[int, torch.Tensor],
-        llm_layer_tensors: Dict[int, torch.Tensor],
-        history_queries_batch: List[List[torch.Tensor]],
-        num_histories: List[int],
+        vit_layer_tensors: dict[int, torch.Tensor],
+        llm_layer_tensors: dict[int, torch.Tensor],
+        history_queries_batch: list[list[torch.Tensor]],
+        num_histories: list[int],
         device: torch.device,
-        history_rel_poses: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        timings: Dict[str, float] = {}
+        history_rel_poses: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        timings: dict[str, float] = {}
         batch_size = len(history_queries_batch)
         if batch_size == 0:
             return {
@@ -617,7 +617,7 @@ class HeatmapVLN(nn.Module):
         Returns tensor with same shape as *heatmaps*.
         """
         # (..., H, W) → logits → spatial softmax probability
-        H, W = heatmaps.shape[-2], heatmaps.shape[-1]
+        _H, _W = heatmaps.shape[-2], heatmaps.shape[-1]
         logits = torch.logit(heatmaps.float().clamp(1e-6, 1 - 1e-6))
         probs = torch.softmax(logits.reshape(*logits.shape[:-2], -1), dim=-1)
         probs = probs.reshape_as(heatmaps).to(heatmaps.dtype)
@@ -629,9 +629,9 @@ class HeatmapVLN(nn.Module):
 
     @staticmethod
     def _find_first_feature(
-        feature_map: Dict[int, Dict[int, torch.Tensor]],
-        layer_indices: List[int],
-    ) -> Optional[torch.Tensor]:
+        feature_map: dict[int, dict[int, torch.Tensor]],
+        layer_indices: list[int],
+    ) -> torch.Tensor | None:
         for view_idx in range(4):
             for layer_idx in layer_indices:
                 feat = feature_map.get(view_idx, {}).get(layer_idx)
@@ -641,9 +641,9 @@ class HeatmapVLN(nn.Module):
 
     def _find_first_feature_multi_batch(
         self,
-        feature_maps: List[Dict[int, Dict[int, torch.Tensor]]],
-        layer_indices: List[int],
-    ) -> Optional[torch.Tensor]:
+        feature_maps: list[dict[int, dict[int, torch.Tensor]]],
+        layer_indices: list[int],
+    ) -> torch.Tensor | None:
         for feature_map in feature_maps:
             feat = self._find_first_feature(feature_map, layer_indices)
             if feat is not None:
@@ -652,8 +652,8 @@ class HeatmapVLN(nn.Module):
 
     def _fuse_view_features_batched(
         self,
-        feature_map: Dict[int, Dict[int, torch.Tensor]],
-        layer_indices: List[int],
+        feature_map: dict[int, dict[int, torch.Tensor]],
+        layer_indices: list[int],
         fusion_module: nn.Module,
         device: torch.device,
         output_layout: str,
@@ -680,8 +680,8 @@ class HeatmapVLN(nn.Module):
 
     def _fuse_view_features_multi_batch(
         self,
-        feature_maps: List[Dict[int, Dict[int, torch.Tensor]]],
-        layer_indices: List[int],
+        feature_maps: list[dict[int, dict[int, torch.Tensor]]],
+        layer_indices: list[int],
         fusion_module: nn.Module,
         device: torch.device,
         output_layout: str,
@@ -711,8 +711,8 @@ class HeatmapVLN(nn.Module):
 
     def _fuse_layer_tensor_batch(
         self,
-        layer_tensors: Dict[int, torch.Tensor],
-        layer_indices: List[int],
+        layer_tensors: dict[int, torch.Tensor],
+        layer_indices: list[int],
         fusion_module: nn.Module,
         output_layout: str,
     ) -> torch.Tensor:
@@ -749,7 +749,7 @@ class HeatmapVLN(nn.Module):
 
     def _validate_and_log_current_llm(
         self,
-        current_llm: Dict[int, Dict[int, torch.Tensor]],
+        current_llm: dict[int, dict[int, torch.Tensor]],
     ) -> None:
         stats_lines = []
         for layer_idx in self.llm_layer_indices:
@@ -792,7 +792,7 @@ class HeatmapVLN(nn.Module):
 
     def _validate_and_log_current_llm_layer_tensors(
         self,
-        llm_layer_tensors: Dict[int, torch.Tensor],
+        llm_layer_tensors: dict[int, torch.Tensor],
     ) -> None:
         stats_lines = []
         for layer_idx in self.llm_layer_indices:
@@ -826,10 +826,10 @@ class HeatmapVLN(nn.Module):
 
     def forward(
         self,
-        current_views: Dict[str, object],
-        history_panoramas: List[Dict[str, object]],
-        instruction: Optional[str] = None,
-    ) -> Dict[str, torch.Tensor]:
+        current_views: dict[str, object],
+        history_panoramas: list[dict[str, object]],
+        instruction: str | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         End-to-end forward pass.
 
@@ -864,8 +864,8 @@ class HeatmapVLN(nn.Module):
     # ------------------------------------------------------------------
 
     def _find_image_positions(
-        self, inputs: Dict[str, torch.Tensor],
-    ) -> Dict[int, Tuple[int, int]]:
+        self, inputs: dict[str, torch.Tensor],
+    ) -> dict[int, tuple[int, int]]:
         """
         Find start/end positions of each image's vision tokens in the LLM
         input sequence.
@@ -887,8 +887,8 @@ class HeatmapVLN(nn.Module):
         return self._find_image_positions_from_ids(inputs["input_ids"].squeeze().tolist())
 
     def _find_image_positions_from_ids(
-        self, input_ids: Union[torch.Tensor, List[int]],
-    ) -> Dict[int, Tuple[int, int]]:
+        self, input_ids: Union[torch.Tensor, list[int]],
+    ) -> dict[int, tuple[int, int]]:
         if not hasattr(self, '_image_pad_id'):
             tokenizer = self.processor.tokenizer
             pad_token = "<|image_pad|>"
@@ -904,7 +904,7 @@ class HeatmapVLN(nn.Module):
         if torch.is_tensor(input_ids):
             input_ids = input_ids.squeeze().tolist()
 
-        positions: Dict[int, Tuple[int, int]] = {}
+        positions: dict[int, tuple[int, int]] = {}
         img_idx = 0
         i = 0
         n = len(input_ids)
@@ -920,12 +920,12 @@ class HeatmapVLN(nn.Module):
         return positions
 
     @staticmethod
-    def _views_tensor_to_dict(views: torch.Tensor) -> Dict[str, Any]:
+    def _views_tensor_to_dict(views: torch.Tensor) -> dict[str, Any]:
         if views.dim() != 4 or views.shape[0] != 4:
             raise ValueError(f"Expected views tensor [4, C, H, W], got {tuple(views.shape)}")
         return {name: views[idx] for idx, name in enumerate(("front", "right", "back", "left"))}
 
-    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> List[Dict[str, Any]]:
+    def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> list[dict[str, Any]]:
         if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
             raise ValueError(
                 f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"

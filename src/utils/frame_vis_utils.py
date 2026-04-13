@@ -6,10 +6,10 @@ Provides interpolation and overlay functions for generating frame-by-frame
 comparisons of GT vs predicted heatmaps.
 """
 
-import numpy as np
+
 import cv2
+import numpy as np
 import torch
-from typing import Tuple, Optional
 from scipy.interpolate import interp1d
 
 
@@ -45,7 +45,7 @@ def interpolate_keyframe_predictions(
         interpolated[:] = pred_np[0]
         return torch.from_numpy(interpolated).to(pred_keyframes.device)
 
-    if K == total_frames:
+    if total_frames == K:
         # Already have all frames
         return pred_keyframes
 
@@ -81,7 +81,7 @@ def interpolate_keyframe_predictions(
     return torch.from_numpy(interpolated).to(pred_keyframes.device)
 
 
-def resize_heatmap(heatmap: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+def resize_heatmap(heatmap: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
     """
     Resize heatmap to target image size.
 
@@ -162,8 +162,8 @@ def create_single_heatmap_overlay(
 
 def create_frame_by_frame_overlay(
     rgb_frame: np.ndarray,
-    heatmap_history: Optional[np.ndarray],
-    heatmap_future: Optional[np.ndarray],
+    heatmap_history: np.ndarray | None,
+    heatmap_future: np.ndarray | None,
     alpha: float = 0.5,
     threshold: float = 0.05,
     colormap_history: int = cv2.COLORMAP_WINTER,  # Cyan

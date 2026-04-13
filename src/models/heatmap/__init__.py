@@ -7,26 +7,26 @@
 #   - HeatmapVLN: complete model assembly
 #   - HeatmapVLNLoss: four-component task-priority loss
 
+from .coarse_localization import CoarseLocalization
+from .dpt_lite_fusion import DPTLiteFusion
+from .feature_extractor import FeatureExtractor
+from .fine_localization import FineLocalization
 from .heatmap_vln import HeatmapVLN
 from .heatmap_vln_loss import HeatmapVLNLoss
-from .coarse_localization import CoarseLocalization
-from .trajectory_attention import TrajectoryGuidedAttention
-from .dpt_lite_fusion import DPTLiteFusion
-from .fine_localization import FineLocalization
-from .feature_extractor import FeatureExtractor
 from .input_constructor import construct_input, find_text_anchor_positions
+from .trajectory_attention import TrajectoryGuidedAttention
 
 __version__ = "5.0.0"
 
 __all__ = [
+    "CoarseLocalization",
+    "DPTLiteFusion",
+    "FeatureExtractor",
+    "FineLocalization",
     "HeatmapVLN",
     "HeatmapVLNLoss",
-    "CoarseLocalization",
     "TrajectoryGuidedAttention",
-    "DPTLiteFusion",
-    "FineLocalization",
-    "FeatureExtractor",
+    "__version__",
     "construct_input",
     "find_text_anchor_positions",
-    "__version__",
 ]

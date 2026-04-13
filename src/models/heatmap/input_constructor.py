@@ -9,24 +9,24 @@ Text annotations encode scene context, group structure, and spatial orientation.
 Reference: HeatmapVLN设计文档 Section 3
 """
 
-from typing import Dict, List, Optional, Tuple, Union
-from PIL import Image
-import torch
-import numpy as np
+from typing import Union
 
+import numpy as np
+import torch
+from PIL import Image
 
 VIEW_NAMES = ["front", "right", "back", "left"]
 VIEW_ANGLES = ["0°正前方", "90°右侧", "180°正后方", "270°左侧"]
 ORIENTATION_STR = "、".join(VIEW_ANGLES)
-_ANCHOR_TOKEN_CACHE: Dict[Tuple[int, int], List[List[int]]] = {}
+_ANCHOR_TOKEN_CACHE: dict[tuple[int, int], list[list[int]]] = {}
 
 
 def construct_input(
-    current_views: Dict[str, Union[Image.Image, torch.Tensor]],
-    history_panoramas: List[Dict[str, Union[Image.Image, torch.Tensor]]],
-    instruction: Optional[str] = None,
-    pixel_goal: Optional[List[int]] = None,
-) -> List[Dict]:
+    current_views: dict[str, Union[Image.Image, torch.Tensor]],
+    history_panoramas: list[dict[str, Union[Image.Image, torch.Tensor]]],
+    instruction: str | None = None,
+    pixel_goal: list[int] | None = None,
+) -> list[dict]:
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
 
@@ -116,7 +116,7 @@ def find_text_anchor_positions(
     input_ids: torch.Tensor,
     tokenizer,
     num_history: int,
-) -> Dict[int, int]:
+) -> dict[int, int]:
     """
     Locate the end token of each exact history-anchor annotation.
 
@@ -128,7 +128,7 @@ def find_text_anchor_positions(
     """
     ids = input_ids.squeeze().tolist()
 
-    anchors: Dict[int, int] = {}
+    anchors: dict[int, int] = {}
     i = 0
     cache_key = (id(tokenizer), num_history)
     anchor_token_ids = _ANCHOR_TOKEN_CACHE.get(cache_key)
@@ -163,12 +163,12 @@ def find_text_anchor_positions(
 
 
 def construct_input_stage2(
-    history_frames: List[Union[Image.Image, torch.Tensor]],
+    history_frames: list[Union[Image.Image, torch.Tensor]],
     current_frame: Union[Image.Image, torch.Tensor],
     lookdown_frame: Union[Image.Image, torch.Tensor],
-    instruction: Optional[str] = None,
-    pixel_goal: Optional[List[int]] = None,
-) -> List[Dict]:
+    instruction: str | None = None,
+    pixel_goal: list[int] | None = None,
+) -> list[dict]:
     """Construct InternNav-aligned Stage 2 input (front-view + lookdown).
 
     Conversation format mirrors the InternNav paper::

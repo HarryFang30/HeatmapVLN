@@ -7,8 +7,8 @@ VLN 训练脚本
 单阶段训练：History 热力图头 + Action Head + Progress Head
 """
 
-import sys
 import os
+import sys
 from pathlib import Path
 
 
@@ -52,13 +52,14 @@ import torch.multiprocessing as _mp
 # 切换到 file_system 策略，让 PyTorch 在 /tmp（2.6 TB）上用普通文件做 IPC。
 _mp.set_sharing_strategy('file_system')
 
-import gc
-import time
-import logging
 import argparse
+import gc
+import logging
+import time
 import warnings
-import psutil
 from datetime import datetime
+
+import psutil
 
 # ============================================
 # CUDA 性能优化
@@ -67,9 +68,9 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
 import torch.distributed as dist
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
@@ -77,53 +78,52 @@ warnings.filterwarnings("ignore", message="Asked to sample")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.checkpoint")
 
-from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
-from src.data.factory import build_dataset
-from src.models.runtime_compat import ensure_transformers_runtime_compat
-from src.utils.logger import setup_logger
-from src.utils.gpu_heatmap import GPUHeatmapComputer
-from src.utils.notifier import FeishuNotifier, create_notifier
-
 # --- All training utilities from the modular scripts.training package ---
 from scripts.training import (
-    load_config,
-    set_seed,
-    safe_torch_load,
-    DistributedContext,
-    init_distributed_context,
-    cleanup_distributed,
-    initialize_trainable_module_sync,
-    _dist_barrier,
-    _malloc_trim,
-    _drop_page_cache,
-    _cgroup_mem_usage_gb,
     _CG_LIMIT_GB,
-    _worker_init_fn,
-    _load_normalized_state_dict,
-    EMAModel,
-    TrainingTimer,
-    TrainingPlotter,
-    collate_fn,
-    build_model,
-    set_trainable_modules,
-    apply_nextdit_warmup_freeze,
-    build_optimizer,
-    build_scheduler,
-    train_one_epoch,
-    validate,
     CheckpointManager,
-    load_checkpoint_for_resume,
-    ShmBypassDataset,
+    EMAModel,
     ShmBypassCollate,
+    ShmBypassDataset,
+    TrainingPlotter,
+    TrainingTimer,
+    _append_jsonl,
+    _capture_env_state,
+    _capture_git_state,
+    _cgroup_mem_usage_gb,
+    _clear_directory,
+    _dist_barrier,
+    _drop_page_cache,
+    _find_resume_checkpoint,
+    _load_normalized_state_dict,
+    _malloc_trim,
+    _safe_symlink,
+    _worker_init_fn,
     _write_json,
     _write_yaml,
-    _append_jsonl,
-    _safe_symlink,
-    _clear_directory,
-    _capture_git_state,
-    _capture_env_state,
-    _find_resume_checkpoint,
+    apply_nextdit_warmup_freeze,
+    build_model,
+    build_optimizer,
+    build_scheduler,
+    cleanup_distributed,
+    collate_fn,
+    init_distributed_context,
+    initialize_trainable_module_sync,
+    load_checkpoint_for_resume,
+    load_config,
+    safe_torch_load,
+    set_seed,
+    set_trainable_modules,
+    train_one_epoch,
+    validate,
 )
+
+from src.data.factory import build_dataset
+from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
+from src.models.runtime_compat import ensure_transformers_runtime_compat
+from src.utils.gpu_heatmap import GPUHeatmapComputer
+from src.utils.logger import setup_logger
+from src.utils.notifier import create_notifier
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ def main():
     parser = argparse.ArgumentParser(description="VLN 训练脚本（共享 Habitat/InternNav 环境）")
     parser.add_argument('--config', type=str, default='configs/train_config_internnav.yaml',
                         help='配置文件路径')
-    parser.add_argument('--resume', type=str, default=None, 
+    parser.add_argument('--resume', type=str, default=None,
                         help='从检查点恢复（路径或 "latest"）')
     parser.add_argument('--load-weights', type=str, default=None,
                         help='仅加载模型权重（不恢复 optimizer/scheduler/epoch），用于加载预训练权重后从头训练')
@@ -158,9 +158,9 @@ def main():
                         help='覆盖 data.prefetch_factor')
     parser.add_argument('--pin-memory', action=argparse.BooleanOptionalAction, default=None,
                         help='覆盖 data.pin_memory')
-    
+
     args = parser.parse_args()
-    
+
     # 加载配置
     cfg = load_config(args.config)
     if args.distributed:
@@ -175,7 +175,7 @@ def main():
     dist_context = init_distributed_context(cfg)
     cfg.setdefault('model', {})['device'] = str(dist_context.device)
     set_seed(cfg['seed'])
-    
+
     # ==================== 输出目录结构（每次训练独立文件夹）====================
     base_out_dir = Path(cfg['log']['out_dir'])
     if dist_context.is_main:
@@ -272,14 +272,14 @@ def main():
         logger.info(f"   autodl入口: tensorboard --logdir {live_tb_dir}")
     if not dist_context.is_main:
         metrics_jsonl_path = None
-    
+
     loss_cfg = cfg['loss']
-    default_loss_type = loss_cfg.get('heatmap_loss_type', 'simplified')
-    
+    loss_cfg.get('heatmap_loss_type', 'simplified')
+
     logger.info("=" * 60)
     logger.info("VLN 训练 (shared Habitat/InternNav env)")
     logger.info("=" * 60)
-    
+
     # 构建数据集
     logger.info("📂 Loading datasets...")
     dataset_type = cfg['data'].get('dataset_type', 'sliding_window')
@@ -310,36 +310,36 @@ def main():
             cfg, split=cfg['data'].get('val_split', 'val'), root=val_root,
             samples_per_clip=val_samples,
         )
-    
+
     if val_dataset is not None and hasattr(val_dataset, 'set_epoch'):
         val_dataset.set_epoch(0)
-    
+
     logger.info(f"  Train: {len(train_dataset)} samples")
     if val_dataset is not None:
         logger.info(f"  Val: {len(val_dataset)} samples")
     else:
         logger.info("  Val: disabled (no val_root)")
-    
+
     # 构建模型
     logger.info("🏗️  Building model...")
     model = build_model(cfg, verbose=dist_context.is_main)
-    
+
     # 创建检查点管理器
     ckpt_manager = CheckpointManager(
         out_dir=str(ckpt_dir),
         max_ckpts=cfg['log'].get('max_ckpts', 3)
     )
-    
+
     # 创建通知器
     notifier = create_notifier(cfg) if dist_context.is_main else None
-    
+
     # 创建训练曲线绘制器
     plotter = TrainingPlotter(out_dir=plots_dir) if dist_context.is_main else None
-    
+
     # 断点续训
     resume_epoch = 0
     resume_path = None
-    
+
     if args.resume:
         if args.resume == 'latest':
             resume_path = _find_resume_checkpoint(run_dir) or ckpt_manager.get_latest()
@@ -347,40 +347,40 @@ def main():
             resume_path = Path(args.resume)
     elif args.auto_resume:
         resume_path = _find_resume_checkpoint(run_dir) or ckpt_manager.get_latest()
-    
+
     if resume_path and Path(resume_path).exists():
         resume_info = load_checkpoint_for_resume(
             str(resume_path), model, optimizer=None, scheduler=None, logger=logger
         )
         resume_epoch = resume_info['epoch']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
-    
+
     if args.dry_run:
         logger.info("=" * 60)
         logger.info("🧪 Dry run 模式：模型和数据构建成功")
         logger.info("=" * 60)
         return
-    
+
     # 获取训练配置（单阶段）
     all_stages = cfg['training']['stages']
     if not all_stages:
         logger.error("❌ 配置文件中没有定义训练阶段")
         return
-    
+
     stage_cfg = all_stages[0]
     stage_name = stage_cfg['name']
-    
+
     if args.epochs is not None:
         stage_cfg = stage_cfg.copy()
         stage_cfg['epochs'] = args.epochs
-    
+
     total_epochs = stage_cfg['epochs']
-    
+
     logger.info("=" * 60)
     logger.info(f"📋 训练配置: {stage_name}")
     logger.info(f"   Epochs: {total_epochs}, Heatmap Size: {stage_cfg['hm_size']}")
     logger.info("=" * 60)
-    
+
     if notifier:
         try:
             notifier.send_training_start(
@@ -391,7 +391,7 @@ def main():
             logger.info("📢 飞书通知已发送: 训练开始")
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
-        
+
     # 更新热力图分辨率
     hm_size = tuple(stage_cfg['hm_size'])
     train_dataset.hm_size = hm_size
@@ -399,15 +399,15 @@ def main():
         val_dataset.hm_size = hm_size
     if hasattr(model, 'update_heatmap_size'):
         model.update_heatmap_size(hm_size)
-    
+
     logger.info(f"  Heatmap size: {hm_size}")
-    
+
     # 构建数据加载器
     num_workers = cfg['data']['num_workers']
     prefetch_factor = cfg['data'].get('prefetch_factor', 2)
-    
+
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
-    
+
     if packing_enabled:
         raise ValueError(
             "当前共享环境训练路径已移除 Sequence Packing 兼容代码，请在配置中设置 "
@@ -446,9 +446,9 @@ def main():
         logger.info("   ✅ Panoramic tokenized collator enabled (n_traj_query=%d)", n_traj_query)
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")
-    
+
     mp_context = 'fork' if num_workers > 0 else None
-    
+
     # -- /dev/shm bypass: wrap datasets + collate when workers are used ----
     # PyTorch DataLoader workers transfer tensors via shm_open() which
     # lives in /dev/shm (only 64 MB in this container).  By converting
@@ -462,7 +462,7 @@ def main():
         logger.info("   🔀 ShmBypass enabled: tensor↔numpy IPC (bypassing 64 MB /dev/shm)")
 
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
-    
+
     persistent_workers = False
     train_sampler = DistributedSampler(
         train_dataset,
@@ -478,7 +478,7 @@ def main():
         shuffle=False,
         drop_last=False,
     ) if (dist_context.enabled and val_dataset is not None) else None
-    
+
     os.environ["HEATMAPVLN_LOG_MEMORY"] = "1" if cfg["log"].get("show_gpu_memory", False) else "0"
     train_loader = DataLoader(
         train_dataset,
@@ -493,9 +493,9 @@ def main():
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
-        in_order=False if num_workers > 0 else True,
+        in_order=not num_workers > 0,
     )
-    
+
     if val_dataset is not None:
         val_num_workers = min(num_workers, 4)
         val_loader = DataLoader(
@@ -513,7 +513,7 @@ def main():
     else:
         val_loader = None
         logger.info("   📊 验证 DataLoader: disabled")
-    
+
     if uses_dynamic_sampling:
         if persistent_workers:
             logger.info("   ✅ Dynamic sampling enabled with persistent_workers")
@@ -525,7 +525,7 @@ def main():
         logger.info(
             f"   🔀 DistributedSampler enabled: world_size={dist_context.world_size}, rank={dist_context.rank}"
         )
-    
+
     # ⚠️ 强制加载 VLM backbone（含 LoRA），确保所有参数在 set_trainable + build_optimizer 之前就位
     raw_model = model
     vlm_backbone = getattr(raw_model, 'vlm_backbone', getattr(raw_model, 'qwen2_5_vl', None))
@@ -540,7 +540,7 @@ def main():
     if getattr(raw_model.config, 'enable_heatmap', False):
         logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")
         raw_model._ensure_heatmap_vln()
-    
+
     if args.load_weights:
         weights_path = Path(args.load_weights)
         if weights_path.exists():
@@ -561,16 +561,16 @@ def main():
             torch.cuda.empty_cache()
         else:
             logger.error(f"✗ Weights file not found: {weights_path}")
-    
+
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
     set_trainable_modules(raw_model, stage_cfg, logger)
-    
+
     total_params = sum(p.numel() for p in raw_model.parameters())
     trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     logger.info(f"  Total params: {total_params:,}")
     logger.info(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-    
+
     # 构建优化器和调度器
     optimizer = build_optimizer(raw_model, cfg, stage_cfg)
 
@@ -582,41 +582,41 @@ def main():
     scheduler = build_scheduler(optimizer, cfg, total_steps)
     amp_type = cfg['optim'].get('amp', 'bf16')
     scaler = GradScaler() if amp_type == 'fp16' else None
-    
+
     if resume_path and Path(resume_path).exists():
         load_checkpoint_for_resume(
-            str(resume_path), raw_model, 
-            optimizer=optimizer, 
-            scheduler=scheduler, 
+            str(resume_path), raw_model,
+            optimizer=optimizer,
+            scheduler=scheduler,
             scaler=scaler,
             logger=logger
         )
-    
+
     best_val_loss = ckpt_manager.best_val_loss
     steps_per_epoch = len(train_loader) // grad_accum_steps
-    
+
     if resume_epoch > 0:
         start_epoch = resume_epoch + 1
         global_epoch_counter = resume_epoch
     else:
         start_epoch = args.start_epoch
         global_epoch_counter = start_epoch - 1
-    
+
     patience = cfg['validation'].get('patience', 5)
     eval_every_epochs = max(1, int(cfg.get('validation', {}).get('eval_every_epochs', 1)))
     no_improve_count = 0
     val_metrics: dict = {}
     epoch_boundary_cooldown_s = float(cfg.get('log', {}).get('epoch_boundary_cooldown_s', 0.0) or 0.0)
-    
+
     # GPU 热力图计算器
     data_cfg = cfg['data']
     sliding_cfg = data_cfg.get('sliding_window', {})
     defer_heatmap_to_gpu = sliding_cfg.get('defer_heatmap_to_gpu', False)
-    
+
     if defer_heatmap_to_gpu:
         hm_size = tuple(data_cfg.get('init_hm_size', [64, 64]))
         img_size = (640, 480)
-        
+
         gpu_heatmap_computer = GPUHeatmapComputer(
             hm_size=hm_size,
             img_size=img_size,
@@ -630,7 +630,7 @@ def main():
         gpu_heatmap_computer = None
         gpu_depth_normalized = True
         gpu_has_depth = False
-    
+
     if dist_context.enabled:
         initialize_trainable_module_sync(
             raw_model,
@@ -644,7 +644,7 @@ def main():
     ema_warmup = cfg.get('optim', {}).get('ema_warmup_steps', 2000)
     ema = EMAModel(raw_model, decay=ema_decay, warmup_steps=ema_warmup)
     logger.info(f"📐 EMA enabled: decay={ema_decay}, warmup_steps={ema_warmup}")
-    
+
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
 
@@ -655,17 +655,17 @@ def main():
 
     for epoch in range(start_epoch, total_epochs + 1):
         timer.start_epoch()
-            
+
         if uses_dynamic_sampling:
             train_dataset.set_epoch(epoch)
             logger.info(f"   🔄 Resampled {len(train_dataset)} samples for epoch {epoch} (persistent workers)")
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        
+
         logger.info("=" * 80)
         logger.info(f"[{stage_name}] Epoch {epoch}/{total_epochs}")
         logger.info("=" * 80)
-        
+
         epoch_offset = (epoch - 1) * steps_per_epoch
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
@@ -684,9 +684,9 @@ def main():
             mid_epoch_save_every=cfg['log'].get('mid_epoch_save_every', 500),
             nextdit_warmup_steps=nextdit_warmup_steps,
         )
-        
+
         timer.end_epoch()
-        
+
         gc.collect()
         torch.cuda.empty_cache()
         _malloc_trim()
@@ -706,27 +706,27 @@ def main():
                     heatmap_temperature=train_metrics.get('heatmap_temperature'),
                     dist_context=dist_context,
                 )
-            
+
             gc.collect()
             torch.cuda.empty_cache()
             _malloc_trim()
             _drop_page_cache()
         else:
             logger.info(f"  ⏭️  跳过验证（eval_every_epochs={eval_every_epochs}，将在 epoch {epoch + eval_every_epochs - (epoch % eval_every_epochs)} 验证）")
-        
+
         if cfg['log'].get('show_gpu_memory', False):
             process = psutil.Process()
             mem_info = process.memory_info()
             gpu_mem = torch.cuda.memory_allocated() / (1024**3)
             gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
             logger.info(f"  🧠 Memory: CPU={mem_info.rss / (1024**3):.2f}GB, GPU={gpu_mem:.2f}GB (reserved={gpu_reserved:.2f}GB)")
-        
+
         train_traj_str = f", traj: {train_metrics['trajectory_loss']:.4f}" if train_metrics.get('trajectory_loss', 0) > 0 else ""
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
             f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str})"
         )
-        
+
         eta = timer.get_eta(epoch, total_epochs)
         logger.info(f"  ⏱️  Epoch time: {timer.get_epoch_time()} | ETA: {eta}")
 
@@ -746,7 +746,7 @@ def main():
                 no_improve_count += 1
         else:
             is_best = False
-        
+
         global_epoch_counter += 1
         current_lr = scheduler.get_last_lr()[0] if scheduler else 0
 
@@ -767,7 +767,7 @@ def main():
                     "eta": eta,
                 },
             )
-        
+
         if plotter is not None:
             plotter.update(
                 epoch=global_epoch_counter,
@@ -777,22 +777,22 @@ def main():
                 lr=current_lr,
                 is_best=is_best,
             )
-        
+
         if tb_writer is not None:
             tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
-            
+
             if do_eval and val_metrics:
                 tb_writer.add_scalars('loss/total', {
                     'train': train_metrics['total_loss'],
                     'val': val_metrics['val_loss'],
                 }, global_epoch_counter)
-                
+
                 tb_writer.add_scalars('loss/heatmap', {
                     'train': train_metrics['heatmap_loss'],
                     'val': val_metrics['val_heatmap_loss'],
                 }, global_epoch_counter)
-                
+
                 train_traj = train_metrics.get('trajectory_loss', 0)
                 val_traj = val_metrics.get('val_trajectory_loss', 0)
                 if train_traj > 0 or val_traj > 0:
@@ -800,24 +800,24 @@ def main():
                         'train': train_traj,
                         'val': val_traj,
                     }, global_epoch_counter)
-                
+
                 for hm_key in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):
                     val_key = f'val_hm_{hm_key}'
                     if val_key in val_metrics:
                         tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)
-                
+
                 if val_metrics.get('val_heatmap_mse', 0) > 0:
                     tb_writer.add_scalar('loss/heatmap_inference_mse', val_metrics['val_heatmap_mse'], global_epoch_counter)
-                
+
                 tb_writer.add_scalar('epoch/val_loss', val_metrics['val_loss'], global_epoch_counter)
 
                 for vk in ('val_vis_accuracy', 'val_vis_precision', 'val_vis_recall',
                             'val_vis_tnr', 'val_vis_f1', 'val_vis_gt_pos_ratio'):
                     if vk in val_metrics:
                         tb_writer.add_scalar(f'epoch/{vk}', val_metrics[vk], global_epoch_counter)
-            
+
             tb_writer.flush()
-        
+
         if notifier and do_eval:
             try:
                 notifier.send_epoch_report(
@@ -835,7 +835,7 @@ def main():
                 )
             except Exception as e:
                 logger.warning(f"飞书通知发送失败: {e}")
-        
+
         if epoch % cfg['log']['save_every_epochs'] == 0 or is_best:
             if dist_context.is_main:
                 with ema.apply():
@@ -852,9 +852,9 @@ def main():
                         scaler=scaler,
                     )
             _dist_barrier()
-        
+
         if no_improve_count >= patience:
-            logger.info(f"  🛑 Early stopping")
+            logger.info("  🛑 Early stopping")
             break
 
         if epoch < total_epochs and epoch_boundary_cooldown_s > 0:
@@ -869,16 +869,16 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
             _malloc_trim()
-    
+
     logger.info(f"  📊 训练完成，耗时: {timer.get_total_elapsed()}")
-    
+
     logger.info("=" * 60)
     logger.info("✅ 训练完成！")
     logger.info("=" * 60)
-    
+
     summary = plotter.get_summary() if plotter is not None else {}
     if summary:
-        logger.info(f"📊 训练摘要:")
+        logger.info("📊 训练摘要:")
         logger.info(f"   总 Epochs: {summary.get('total_epochs', 'N/A')}")
         logger.info(f"   最佳 Epoch: {summary.get('best_epoch', 'N/A')}")
         if summary.get('best_val_loss'):
@@ -901,7 +901,7 @@ def main():
                 "best_val_loss": best_val_loss,
             },
         )
-    
+
     if notifier:
         try:
             notifier.send_training_complete(
@@ -912,7 +912,7 @@ def main():
             logger.info("📢 飞书通知已发送: 训练完成")
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
-    
+
     if tb_writer is not None:
         tb_writer.close()
     cleanup_distributed()

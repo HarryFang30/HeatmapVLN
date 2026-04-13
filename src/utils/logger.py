@@ -6,18 +6,17 @@ Based on BridgeVLA logging patterns
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
 
-def setup_logger(name: str, level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
+def setup_logger(name: str, level: str = "INFO", log_file: str | None = None) -> logging.Logger:
     """
     Setup a logger with consistent formatting.
-    
+
     Args:
         name: Logger name
         level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_file: Optional log file path
-    
+
     Returns:
         Configured logger
     """

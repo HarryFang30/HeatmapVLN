@@ -1,9 +1,8 @@
 """Tests for the collate_fn — shape and dtype verification."""
 
 import torch
-from tests.conftest import _make_dummy_sample
-
 from scripts.training.collate import collate_fn
+from tests.conftest import _make_dummy_sample
 
 
 class TestCollateBasic:

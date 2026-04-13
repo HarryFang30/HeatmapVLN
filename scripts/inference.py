@@ -12,26 +12,25 @@ VLN Pipeline 推理脚本
     python scripts/inference.py ...
 """
 
-import os
-import sys
 import argparse
 import logging
+import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Any, Optional
-import yaml
+from typing import Any
 
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
 import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import yaml
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.models.lora_utils import resolve_lora_layer_indices
+from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,18 +102,18 @@ def load_clip_frames(clip_dir: str, max_frames: int = 32, target_size: tuple = (
     """
     clip_path = Path(clip_dir)
     rgb_dir = clip_path / "rgb"
-    
+
     if not rgb_dir.exists():
         raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
-    
+
     png_files = sorted(rgb_dir.glob("*.png"))
     if len(png_files) == 0:
         raise ValueError(f"No PNG files found in: {rgb_dir}")
-    
+
     logger.info(f"Found {len(png_files)} frames in clip")
-    
+
     frames = []
-    for i, png_path in enumerate(png_files[:max_frames]):
+    for _i, png_path in enumerate(png_files[:max_frames]):
         frame = cv2.imread(str(png_path))
         if frame is None:
             logger.warning(f"Failed to load frame: {png_path}")
@@ -124,30 +123,30 @@ def load_clip_frames(clip_dir: str, max_frames: int = 32, target_size: tuple = (
         frame = torch.from_numpy(frame).float() / 255.0
         frame = frame.permute(2, 0, 1)
         frames.append(frame)
-    
+
     if len(frames) == 0:
         raise ValueError(f"Could not load any frames from: {rgb_dir}")
-    
+
     while len(frames) < max_frames:
         frames.append(frames[-1].clone())
-    
+
     return torch.stack(frames[:max_frames])
 
 
-def load_instruction_from_clip(clip_dir: str) -> Optional[str]:
+def load_instruction_from_clip(clip_dir: str) -> str | None:
     """Load instruction from clip's meta.json."""
     meta_path = Path(clip_dir) / "meta.json"
     if not meta_path.exists():
         return None
-    
+
     import json
     with open(meta_path) as f:
         meta = json.load(f)
-    
+
     return meta.get("instruction", None)
 
 
-def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
+def build_model(cfg: dict, device: str = 'cuda:0') -> VLNPipeline:
     """Build VLN pipeline for inference.
 
     Args:
@@ -164,7 +163,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
-    
+
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
         llm_backbone_type=llm_cfg.get('backbone_type', 'qwen2_5_vl'),
@@ -182,7 +181,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
         internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
         device=device,
-        
+
         enable_heatmap=heatmap_cfg.get('enable', True),
         heatmap_c_vit=heatmap_cfg.get('c_vit', 1280),
         heatmap_c_llm=heatmap_cfg.get('c_llm', 3584),
@@ -196,7 +195,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
         heatmap_lambda_peak=heatmap_cfg.get('lambda_peak', 1.0),
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
-        
+
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
         lora_alpha=llm_cfg.get('lora_alpha', 32),
@@ -204,7 +203,7 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         lora_layer_indices=resolved_lora_layers,
         lora_dropout=llm_cfg.get('lora_dropout', 0.05),
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
-        
+
         enable_action_head=action_cfg.get('enable', True),
         nextdit_enabled=nextdit_cfg.get('enabled', False),
         nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 3584),
@@ -222,10 +221,10 @@ def build_model(cfg: Dict, device: str = 'cuda:0') -> VLNPipeline:
         nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
         nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
         nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
-        
+
         verbose=True,
     )
-    
+
     return VLNPipeline(config)
 
 
@@ -246,20 +245,20 @@ def visualize_trajectory(trajectory: np.ndarray, output_path: str, title: str = 
     """Visualize and save trajectory prediction."""
     # Cumulative sum to get positions
     positions = np.cumsum(trajectory[:, :2], axis=0)
-    
+
     plt.figure(figsize=(10, 8))
-    
+
     # Plot trajectory
     plt.plot(positions[:, 0], positions[:, 1], 'b-o', markersize=4, linewidth=2, label='Trajectory')
-    
+
     # Mark start and end
     plt.scatter([0], [0], c='green', s=200, marker='*', zorder=5, label='Start')
     plt.scatter([positions[-1, 0]], [positions[-1, 1]], c='red', s=200, marker='X', zorder=5, label='End')
-    
+
     # Add step numbers
     for i, (x, y) in enumerate(positions[::4]):  # Every 4th point
         plt.annotate(str(i*4), (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
-    
+
     plt.xlabel('X displacement')
     plt.ylabel('Y displacement')
     plt.title(title)
@@ -274,20 +273,20 @@ def visualize_trajectory(trajectory: np.ndarray, output_path: str, title: str = 
 
 def visualize_combined(
     current_frame: np.ndarray,
-    heatmap: Optional[np.ndarray],
-    trajectory: Optional[np.ndarray],
-    progress: Optional[float],
+    heatmap: np.ndarray | None,
+    trajectory: np.ndarray | None,
+    progress: float | None,
     output_path: str,
     instruction: str = "",
 ):
     """Create combined visualization."""
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    
+    _fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
     # Current frame
     axes[0, 0].imshow(current_frame)
     axes[0, 0].set_title("Current Observation")
     axes[0, 0].axis('off')
-    
+
     # Heatmap
     if heatmap is not None:
         im = axes[0, 1].imshow(heatmap, cmap='inferno', vmin=0, vmax=1)
@@ -297,7 +296,7 @@ def visualize_combined(
     else:
         axes[0, 1].text(0.5, 0.5, "No heatmap", ha='center', va='center', fontsize=14)
         axes[0, 1].axis('off')
-    
+
     # Trajectory
     if trajectory is not None:
         positions = np.cumsum(trajectory[:, :2], axis=0)
@@ -311,18 +310,18 @@ def visualize_combined(
     else:
         axes[1, 0].text(0.5, 0.5, "No trajectory", ha='center', va='center', fontsize=14)
         axes[1, 0].axis('off')
-    
+
     # Info panel
     info_text = f"Instruction: {instruction[:100]}..." if len(instruction) > 100 else f"Instruction: {instruction}"
     if progress is not None:
         info_text += f"\n\nProgress: {progress:.2%}"
-    
+
     axes[1, 1].text(0.1, 0.7, info_text, fontsize=12, verticalalignment='top',
                     transform=axes[1, 1].transAxes, wrap=True,
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     axes[1, 1].axis('off')
     axes[1, 1].set_title("Inference Info")
-    
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -334,11 +333,11 @@ def run_inference(
     model: VLNPipeline,
     frames: torch.Tensor,
     instruction: str,
-    current_observation: Optional[torch.Tensor] = None,
+    current_observation: torch.Tensor | None = None,
     output_heatmap: bool = True,
     output_trajectory: bool = True,
     output_progress: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run inference.
 
     Args:
@@ -361,9 +360,9 @@ def run_inference(
             "构造 `current_views` 和 `history_panoramas`。请改用 `scripts/run.py visualize heatmap` "
             "或基于数据集批次进行热力图推理。"
         )
-    
+
     device = next(model.parameters()).device
-    
+
     autocast_context = (
         torch.autocast(device_type='cuda', dtype=torch.bfloat16)
         if device.type == 'cuda'
@@ -379,7 +378,7 @@ def run_inference(
         )
 
     results = {}
-    
+
     # Trajectory
     if output_trajectory:
         trajectory = outputs.get('trajectory')
@@ -388,7 +387,7 @@ def run_inference(
             logger.info(f"Generated trajectory: shape={results['trajectory'].shape}")
     if 'processing_metadata' in outputs:
         results['metadata'] = outputs['processing_metadata']
-    
+
     return results
 
 
@@ -409,7 +408,7 @@ def main():
     if args.video is None and args.clip is None:
         logger.error("Either --video or --clip must be specified")
         return
-    
+
     if not Path(args.config).exists():
         logger.error(f"Config file not found: {args.config}")
         return
@@ -435,7 +434,7 @@ def main():
         logger.info(f"Loading checkpoint from: {args.checkpoint}")
         ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
-        if list(state_dict.keys())[0].startswith('module.'):
+        if next(iter(state_dict.keys())).startswith('module.'):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         if missing_keys:
@@ -455,7 +454,7 @@ def main():
     traj_cfg = data_cfg.get('trajectory', {})
     max_frames = traj_cfg.get('num_history_sample', sw_cfg.get('num_history_sample', 32)) + 1
     target_size = tuple(data_cfg['image_size'])
-    
+
     if args.video:
         frames = load_video_frames(args.video, max_frames=max_frames, target_size=target_size)
         name = Path(args.video).stem
@@ -464,24 +463,24 @@ def main():
         frames = load_clip_frames(args.clip, max_frames=max_frames, target_size=target_size)
         name = Path(args.clip).name
         instruction = args.instruction or load_instruction_from_clip(args.clip)
-    
+
     if instruction is None:
         instruction = "Navigate to the destination"
         logger.info(f"No instruction provided, using default: '{instruction}'")
     else:
         logger.info(f"Instruction: '{instruction}'")
-    
+
     # Get current frame for visualization
     current_frame_np = frames[-1].permute(1, 2, 0).numpy()
     current_frame_np = np.clip(current_frame_np, 0, 1)
-    
+
     frames = frames.unsqueeze(0)  # [1, T, 3, H, W]
 
     # Run inference
     logger.info("=" * 60)
     logger.info("Running inference...")
     logger.info("=" * 60)
-    
+
     results = run_inference(
         model, frames, instruction,
         output_heatmap=args.output_heatmap,
@@ -501,7 +500,7 @@ def main():
     if 'trajectory' in results:
         visualize_trajectory(results['trajectory'], str(out_dir / f"{name}_trajectory.png"), "Predicted Trajectory")
         np.save(out_dir / f"{name}_trajectory.npy", results['trajectory'])
-        
+
         # Also save as readable format
         with open(out_dir / f"{name}_trajectory.txt", 'w') as f:
             f.write(f"# Predicted trajectory ({len(results['trajectory'])} steps)\n")

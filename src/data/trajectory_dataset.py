@@ -8,20 +8,20 @@ Extends VLNSlidingWindowDataset with 24-step trajectory prediction,
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Union
 
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .sliding_window_dataset import VLNSlidingWindowDataset, _evict_from_page_cache
 from .heatmap_geometry import compute_history_heatmap
+from .sliding_window_dataset import VLNSlidingWindowDataset, _evict_from_page_cache
 from .trajectory_utils import (
+    apply_trajectory_augmentation,
     compute_history_rel_poses,
     get_trajectory_relative_to_frame,
     interpolate_and_resample_trajectory,
-    apply_trajectory_augmentation,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,19 +30,19 @@ logger = logging.getLogger(__name__)
 class VLNTrajectoryDataset(VLNSlidingWindowDataset):
     """
     轨迹数据集：支持多步轨迹预测
-    
+
     基于 VLNSlidingWindowDataset，增加以下功能：
     1. 24 步轨迹预测（参考 InternNav）
     2. 3D 动作表示 (dx, dy, delta_yaw) + 4x 放大
     3. 轨迹增强
     4. Progress 预测
-    
+
     Args:
         predict_horizon: 预测步数（默认 24）
         action_scale: 动作放大倍数（默认 4.0）
         enable_trajectory_augmentation: 是否启用轨迹增强
         其他参数继承自 VLNSlidingWindowDataset
-    
+
     Returns:
         {
             "history_frames": [K, 3, H, W],    # K 帧历史
@@ -54,15 +54,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             "text": str,                        # 指令
         }
     """
-    
+
     def __init__(
         self,
         root: str,
         split: str,
         min_history: int = 5,
         num_history_sample: int = 8,
-        image_size: Tuple[int, int] = (224, 224),
-        hm_size: Tuple[int, int] = (64, 64),
+        image_size: tuple[int, int] = (224, 224),
+        hm_size: tuple[int, int] = (64, 64),
         load_depth: bool = True,
         cache_poses: bool = True,
         sample_stride: int = 1,
@@ -78,9 +78,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         action_scale: float = 4.0,
         enable_trajectory_augmentation: bool = True,
         load_traj_images: bool = False,
-        traj_image_size: Tuple[int, int] = (224, 224),
+        traj_image_size: tuple[int, int] = (224, 224),
         # FGR2R 子指令配置
-        fgr2r_subinstr_path: Optional[str] = None,
+        fgr2r_subinstr_path: str | None = None,
         use_subinstruction: bool = False,
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
@@ -102,20 +102,20 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             min_subsequence_length=min_subsequence_length,
             subsequence_samples_per_clip=subsequence_samples_per_clip,
         )
-        
+
         self.predict_horizon = predict_horizon
         self.action_scale = action_scale
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
         self.load_traj_images = load_traj_images
         self.traj_image_size = traj_image_size
         self.panoramic_vlm_input = panoramic_vlm_input
-        
+
         # 加载 FGR2R 子指令映射表
         self.use_subinstruction = use_subinstruction
         self._fgr2r_mapping = {}
         if use_subinstruction:
             self._load_fgr2r_mapping(fgr2r_subinstr_path)
-        
+
         logger.info(
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
             f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}, "
@@ -123,7 +123,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"load_traj_images={self.load_traj_images}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
-    
+
     def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int,
                              direction: str = "front") -> np.ndarray:
         """Load a single frame as (H, W, 3) uint8 for DualVLN visual memory.
@@ -174,9 +174,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         current_pose: np.ndarray,
         goal_pose: np.ndarray,
         img_size: int = 256,
-        depth_map: Optional[np.ndarray] = None,
+        depth_map: np.ndarray | None = None,
         depth_tolerance: float = 0.5,
-    ) -> Optional[List[int]]:
+    ) -> list[int] | None:
         """Project the goal position onto the current front-view image.
 
         Uses pinhole projection with HFOV=90° (Habitat convention:
@@ -218,16 +218,16 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         if u_f < 0 or u_f >= img_size or v_f < 0 or v_f >= img_size:
             return None
 
-        u = max(0, min(img_size - 1, int(round(u_f))))
-        v = max(0, min(img_size - 1, int(round(v_f))))
+        u = max(0, min(img_size - 1, round(u_f)))
+        v = max(0, min(img_size - 1, round(v_f)))
 
         if depth_map is not None:
             dm = depth_map
             if dm.ndim == 3 and dm.shape[-1] == 1:
                 dm = dm[:, :, 0]
             dh, dw = dm.shape[:2]
-            du = int(round(u_f * dw / img_size))
-            dv = int(round(v_f * dh / img_size))
+            du = round(u_f * dw / img_size)
+            dv = round(v_f * dh / img_size)
             du = max(0, min(dw - 1, du))
             dv = max(0, min(dh - 1, dv))
             pixel_depth = float(dm[dv, du])
@@ -236,10 +236,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         return [u, v]
 
-    def _load_fgr2r_mapping(self, fgr2r_path: Optional[str] = None):
+    def _load_fgr2r_mapping(self, fgr2r_path: str | None = None):
         """加载 FGR2R 子指令映射表（支持 .json 和 .json.gz 格式）"""
         import gzip
-        
+
         if fgr2r_path is None:
             # 默认路径：项目目录下的 data/fgr2r/subinstr_mapping.json.gz
             fgr2r_path = Path(__file__).parent.parent.parent / "data/fgr2r/subinstr_mapping.json.gz"
@@ -248,19 +248,19 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # 如果是相对路径，相对于项目根目录
             if not fgr2r_path.is_absolute():
                 fgr2r_path = Path(__file__).parent.parent.parent / fgr2r_path
-        
+
         # 检查是否存在 .gz 版本
         if not fgr2r_path.exists() and not str(fgr2r_path).endswith('.gz'):
             gz_path = Path(str(fgr2r_path) + '.gz')
             if gz_path.exists():
                 fgr2r_path = gz_path
-        
+
         try:
             if str(fgr2r_path).endswith('.gz'):
                 with gzip.open(fgr2r_path, 'rt', encoding='utf-8') as f:
                     mapping = json.load(f)
             else:
-                with open(fgr2r_path, 'r') as f:
+                with open(fgr2r_path) as f:
                     mapping = json.load(f)
             # 转换 key 为 int（JSON 键是字符串）
             self._fgr2r_mapping = {int(k): v for k, v in mapping.items()}
@@ -273,20 +273,20 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             logger.warning(f"Failed to load FGR2R mapping: {e}")
             self._fgr2r_mapping = {}
             self.use_subinstruction = False
-    
+
     def _get_subinstruction(
-        self, 
-        trajectory_id: int, 
+        self,
+        trajectory_id: int,
         num_frames: int,
-        current_t: int, 
-        subseq_start: int, 
+        current_t: int,
+        subseq_start: int,
         subseq_end: int,
         original_instruction: str,
         instr_idx: int = 0,  # 使用第几条原始指令
     ) -> str:
         """
         根据帧范围获取对应的子指令
-        
+
         Args:
             trajectory_id: 轨迹 ID（对应 FGR2R 的 path_id）
             num_frames: 总帧数
@@ -295,39 +295,39 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             subseq_end: 子序列结束帧
             original_instruction: 原始完整指令（备用）
             instr_idx: 使用第几条原始指令（默认第 0 条）
-        
+
         Returns:
             对应的子指令文本
         """
         if not self.use_subinstruction or trajectory_id not in self._fgr2r_mapping:
             return original_instruction
-        
+
         fgr2r_item = self._fgr2r_mapping[trajectory_id]
         num_viewpoints = fgr2r_item['num_viewpoints']
         instructions = fgr2r_item['instructions']
-        
+
         if num_viewpoints < 2 or not instructions:
             return original_instruction
-        
+
         # 计算帧到 viewpoint 的映射
         # viewpoint 之间均匀分布帧
         frames_per_segment = num_frames / (num_viewpoints - 1)
-        
+
         # 将帧范围转换为 viewpoint 范围（1-based）
         # subseq_start 对应的 viewpoint（向下取整 + 1）
         vp_start = int(subseq_start / frames_per_segment) + 1
         # subseq_end 对应的 viewpoint（向上取整 + 1）
         vp_end = min(int((subseq_end - 1) / frames_per_segment) + 2, num_viewpoints + 1)
-        
+
         # 选择指令（如果请求的索引超出范围，使用第 0 条）
         if instr_idx >= len(instructions):
             instr_idx = 0
         instr_data = instructions[instr_idx]
         sub_instructions = instr_data['sub_instructions']
-        
+
         if not sub_instructions:
             return instr_data['original']
-        
+
         # 收集与帧范围有重叠的子指令
         matching_subs = []
         for sub in sub_instructions:
@@ -335,30 +335,30 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # 检查是否有重叠
             if sub_vp_start < vp_end and sub_vp_end > vp_start:
                 matching_subs.append(sub['text'])
-        
+
         if matching_subs:
             # 将匹配的子指令连接起来
             return ' '.join(matching_subs)
         else:
             # 没有匹配的子指令，返回第一个子指令
             return sub_instructions[0]['text'] if sub_instructions else original_instruction
-    
+
     def _compute_trajectory(
-        self, 
-        poses: List[np.ndarray], 
-        current_t: int, 
+        self,
+        poses: list[np.ndarray],
+        current_t: int,
         subseq_end: int,
         subseq_start: int = 0,
-    ) -> Tuple[np.ndarray, float, float]:
+    ) -> tuple[np.ndarray, float, float]:
         """
         从位姿计算轨迹
-        
+
         Args:
             poses: 所有帧的位姿列表
             current_t: 当前帧索引
             subseq_end: 子序列结束帧（不含）
             subseq_start: 子序列起始帧（用于计算 progress）
-        
+
         Returns:
             trajectory: (predict_horizon, 3) 轨迹
             trajectory_valid: 轨迹是否有效
@@ -370,32 +370,32 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         subseq_length = subseq_end - subseq_start
         relative_pos = current_t - subseq_start
         progress = float(relative_pos + 1) / max(subseq_length, 1)
-        
+
         # 获取从当前帧到子序列结束的位姿
         # ⚠️ 重要：必须使用 subseq_end 而不是整个 clip 结束
         # 否则 progress 和轨迹会不一致（progress=1 但轨迹非零）
         future_poses = poses[current_t:subseq_end]
-        
+
         if len(future_poses) < 2:
             # 最后一帧或没有足够的未来帧 - 返回零轨迹（静止/STOP）
             # 注意：对于 STOP 帧，零轨迹是有意义的（表示静止不动）
             # 因此标记为有效 (trajectory_valid=1.0)，让模型学习 "停止时输出零轨迹"
             return np.zeros((self.predict_horizon, 3), dtype=np.float32), 1.0, progress
-        
+
         # 转换为 numpy 数组
         future_poses_np = np.array(future_poses, dtype=np.float32)
-        
+
         # 计算相对于当前帧的轨迹
         try:
             relative_xyyaw = get_trajectory_relative_to_frame(future_poses_np, camera_deg=0)
-            
+
             # 插值和重采样到 predict_horizon 步
             _, resampled_poses = interpolate_and_resample_trajectory(
                 relative_xyyaw,
                 predict_step_num=self.predict_horizon,
                 action_scale=self.action_scale,
             )
-            
+
             # 确保形状正确
             if len(resampled_poses) < self.predict_horizon:
                 # 填充
@@ -406,36 +406,36 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 ], axis=0)
             else:
                 resampled_poses = resampled_poses[:self.predict_horizon]
-            
+
             trajectory_valid = 1.0
-            
+
         except Exception as e:
             logger.warning(f"Failed to compute trajectory: {e}")
             resampled_poses = np.zeros((self.predict_horizon, 3), dtype=np.float32)
             trajectory_valid = 0.0
-        
+
         return resampled_poses.astype(np.float32), trajectory_valid, progress
-    
-    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str, float]]:
+
+    def __getitem__(self, idx: int) -> dict[str, Union[torch.Tensor, str, float]]:
         """
         加载一个训练样本（带轨迹）
         """
         clip_idx, current_t = self.sample_index[idx]
         clip_dir = self.clips[clip_idx]
-        
+
         try:
             # 1. 加载元数据
             meta = self._load_meta(clip_idx)
             T = meta["num_frames"]
             original_text = meta.get("instruction", "")
             trajectory_id = int(meta.get("trajectory_id", 0))
-            
+
             # 获取子序列范围（如果启用了随机子序列采样）
             if self.random_subsequence and idx in self._sample_subsequence_range:
                 subseq_start, subseq_end = self._sample_subsequence_range[idx]
             else:
                 subseq_start, subseq_end = 0, T
-            
+
             # 1.5 获取子指令（如果启用了 FGR2R 子指令）
             if self.use_subinstruction:
                 text = self._get_subinstruction(
@@ -448,13 +448,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 )
             else:
                 text = original_text
-            
+
             # 2. 采样历史帧索引（使用子序列范围）
             history_indices = self._sample_history_indices(subseq_start, current_t, self.num_history_sample)
-            
+
             # 3. 加载历史帧
             history_frames = self._load_frames(clip_dir, history_indices)
-            
+
             # 4. 加载当前帧
             #    panoramic_vlm_input=True:  全景 4 视图 → VLM (Stage 1)
             #    panoramic_vlm_input=False: 前视图 + lookdown → VLM (Stage 2, InternNav)
@@ -466,15 +466,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 current_frame = self._load_frame(clip_dir, current_t, direction="front")
                 current_views = None
                 history_panoramas = None
-            
+
             # 5. 加载位姿
             poses = self._load_poses(clip_idx)
             history_poses = [poses[i] for i in history_indices]
             current_pose = poses[current_t]
-            
+
             # 6. 加载当前帧深度（用于遮挡检测）
             current_depth = self._load_depth(clip_dir, current_t)
-            
+
             # 7. 计算热力图
             intrinsics_path = clip_dir / "intrinsics.json"
             K = None
@@ -486,9 +486,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     K = np.array(intrinsics["K"], dtype=np.float32)
             else:
                 img_size = (640, 480)
-            
+
             hm_w, hm_h = self.hm_size
-            
+
             gt_visibility = None
             if self._is_panoramic and self.panoramic_vlm_input:
                 heatmap_tensor, gt_visibility = self._compute_per_history_multiview_heatmaps(
@@ -513,29 +513,29 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     depth_normalize=not self._depth_is_meters,
                 )
                 heatmap_tensor = torch.from_numpy(heatmap).float()
-            
+
             # 8. 计算轨迹（使用子序列范围计算 progress）
             trajectory, trajectory_valid, progress = self._compute_trajectory(
                 poses, current_t, subseq_end, subseq_start
             )
-            
+
             # 9. 应用轨迹增强
             if self.enable_trajectory_augmentation and trajectory_valid > 0:
                 trajectory = apply_trajectory_augmentation(trajectory, p=0.5)
-            
+
             trajectory_tensor = torch.from_numpy(trajectory).float()
-            
+
             # 10. 保留旧的 action 接口用于兼容
             actions = self._load_actions(clip_dir)
             if actions is not None and current_t < len(actions):
                 action = actions[current_t]
             else:
                 action = np.zeros(2, dtype=np.float32)
-            
+
             action_valid = trajectory_valid
-            
+
             action_tensor = torch.from_numpy(action.astype(np.float32))
-            
+
             # 11. 离散动作
             discrete_actions = self._load_discrete_actions(clip_dir)
             if discrete_actions is not None and current_t < len(discrete_actions):
@@ -544,7 +544,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             else:
                 discrete_action = 1
                 is_stop = 0.0
-            
+
             result = {
                 "history_frames": history_frames,        # [K, 3, H, W]
                 "current_frame": current_frame,          # [3, H, W] (front view)
@@ -626,16 +626,16 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     result["current_depth"] = torch.zeros(1, 1)
                 if K is not None:
                     result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
-            
+
             return result
-            
+
         except Exception as e:
             logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
             import traceback
             logger.error(traceback.format_exc())
             return self._get_dummy_sample_trajectory()
-    
-    def _get_dummy_sample_trajectory(self) -> Dict[str, Union[torch.Tensor, str, float, int]]:
+
+    def _get_dummy_sample_trajectory(self) -> dict[str, Union[torch.Tensor, str, float, int]]:
         """生成虚拟样本（用于错误处理）"""
         base_sample = self._get_dummy_sample()
         base_sample["trajectory"] = torch.zeros(self.predict_horizon, 3)
@@ -649,8 +649,8 @@ def create_trajectory_dataloader(
     split: str,
     min_history: int = 5,
     num_history_sample: int = 8,
-    image_size: Tuple[int, int] = (224, 224),
-    hm_size: Tuple[int, int] = (64, 64),
+    image_size: tuple[int, int] = (224, 224),
+    hm_size: tuple[int, int] = (64, 64),
     predict_horizon: int = 24,
     action_scale: float = 4.0,
     batch_size: int = 8,
@@ -672,7 +672,7 @@ def create_trajectory_dataloader(
         predict_horizon=predict_horizon,
         action_scale=action_scale,
     )
-    
+
     return DataLoader(
         dataset,
         batch_size=batch_size,

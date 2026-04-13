@@ -7,7 +7,6 @@ Reference: InternNav/internnav/dataset/internvla_n1_lerobot_dataset.py
 
 import logging
 import random
-from typing import List, Tuple
 
 import numpy as np
 
@@ -15,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def compute_history_rel_poses(
-    history_poses: List[np.ndarray],
+    history_poses: list[np.ndarray],
     current_pose: np.ndarray,
     camera_deg: float = 0,
 ) -> np.ndarray:
@@ -195,7 +194,7 @@ def interpolate_and_resample_trajectory(
     absolute_trajectories: np.ndarray,
     predict_step_num: int = 24,
     action_scale: float = 4.0,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Filter, smooth, resample trajectory and convert to delta actions.
 
     Returns:
@@ -229,7 +228,7 @@ def interpolate_and_resample_trajectory(
 def apply_trajectory_augmentation(
     trajectory: np.ndarray,
     rotation_range: float = 0.3,
-    scale_range: Tuple[float, float] = (0.8, 1.2),
+    scale_range: tuple[float, float] = (0.8, 1.2),
     p: float = 0.5,
 ) -> np.ndarray:
     """Random rotation and scaling augmentation on (dx, dy, delta_yaw) trajectories."""

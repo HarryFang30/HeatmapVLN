@@ -5,15 +5,14 @@ HTML index generation for VLN heatmap evaluation results.
 Provides functions to create browsable HTML pages with thumbnails and metrics.
 """
 
-from pathlib import Path
-from typing import List, Dict
 import json
+from pathlib import Path
 
 
 def create_html_index(
-    samples_info: List[Dict],
+    samples_info: list[dict],
     output_dir: Path,
-    metrics_summary: Dict[str, float]
+    metrics_summary: dict[str, float]
 ) -> None:
     """
     Generate HTML index page for evaluation results.

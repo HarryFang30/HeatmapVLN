@@ -1,13 +1,13 @@
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 def resolve_lora_layer_indices(
-    llm_cfg: Dict[str, Any],
-    heatmap_cfg: Optional[Dict[str, Any]] = None,
-    logger: Optional[logging.Logger] = None,
+    llm_cfg: dict[str, Any],
+    heatmap_cfg: dict[str, Any] | None = None,
+    logger: logging.Logger | None = None,
     log_prefix: str = "",
-) -> Optional[List[int]]:
+) -> list[int] | None:
     """Resolve LoRA target layers with explicit config taking priority."""
     explicit_layers = llm_cfg.get("lora_layer_indices")
     if explicit_layers is not None:

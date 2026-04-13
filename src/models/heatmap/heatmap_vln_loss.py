@@ -14,7 +14,6 @@ Design principle:
   - vis_head answers "WHETHER" (weighted BCE), gradient detached from backbone.
 """
 
-from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -44,7 +43,7 @@ class HeatmapVLNLoss(nn.Module):
         lambda_peak: float = 1.0,
         lambda_neg: float = 0.0,
         temperature: float = 1.0,
-        heatmap_size: Tuple[int, int] = (64, 64),
+        heatmap_size: tuple[int, int] = (64, 64),
         vis_pos_weight: float = 1.0,
         **kwargs,
     ):
@@ -87,7 +86,7 @@ class HeatmapVLNLoss(nn.Module):
         pred_heatmaps: torch.Tensor,
         gt_vis: torch.Tensor,
         gt_heatmaps: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         self._validate_heatmap_shape(pred_heatmaps)
         self._validate_heatmap_shape(gt_heatmaps)
 
@@ -187,7 +186,7 @@ class HeatmapVLNLoss(nn.Module):
         gt_vis: torch.Tensor,
         gt_heatmaps: torch.Tensor,
         history_mask: torch.Tensor = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """
         Args:
             pred_vis:      ``(N_hist, 4)`` or ``(B, N_hist, 4)``.

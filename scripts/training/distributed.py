@@ -2,15 +2,15 @@
 Distributed training context and communication helpers.
 """
 
-import os
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 
-from .utils import _dist_is_initialized, _dist_backend
+from .utils import _dist_backend, _dist_is_initialized
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class DistributedContext:
         rank: int = 0,
         local_rank: int = 0,
         world_size: int = 1,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ):
         self.enabled = enabled
         self.rank = rank
@@ -77,8 +77,8 @@ def _dist_all_reduce_in_place(tensor: torch.Tensor) -> torch.Tensor:
 
 def _get_supported_trainable_sync_modules(
     model,
-    stage_cfg: Dict[str, Any],
-) -> List[Tuple[str, nn.Module]]:
+    stage_cfg: dict[str, Any],
+) -> list[tuple[str, nn.Module]]:
     trainable = set(stage_cfg.get("trainable_modules", []))
     supported_trainable = {"heatmap_vln", "llm_projector"}
     unsupported = sorted(trainable - supported_trainable)
@@ -89,7 +89,7 @@ def _get_supported_trainable_sync_modules(
             "Please keep other heads/backbone frozen in distributed mode."
         )
 
-    sync_modules: List[Tuple[str, nn.Module]] = []
+    sync_modules: list[tuple[str, nn.Module]] = []
 
     if "llm_projector" in trainable and getattr(model, "llm_projector", None) is not None:
         if any(param.requires_grad for param in model.llm_projector.parameters()):
@@ -113,10 +113,10 @@ def _get_supported_trainable_sync_modules(
 
 def initialize_trainable_module_sync(
     model,
-    stage_cfg: Dict[str, Any],
+    stage_cfg: dict[str, Any],
     dist_context: "DistributedContext",
     logger: logging.Logger,
-) -> List[Tuple[str, nn.Module]]:
+) -> list[tuple[str, nn.Module]]:
     sync_modules = _get_supported_trainable_sync_modules(model, stage_cfg)
     for module_name, module in sync_modules:
         logger.info("🔄 Broadcasting trainable module: %s", module_name)
@@ -132,7 +132,7 @@ def initialize_trainable_module_sync(
 
 
 def synchronize_trainable_module_gradients(
-    sync_modules: List[Tuple[str, nn.Module]],
+    sync_modules: list[tuple[str, nn.Module]],
     dist_context: "DistributedContext",
 ) -> None:
     if not dist_context.enabled or dist_context.world_size <= 1:
@@ -148,7 +148,7 @@ def synchronize_trainable_module_gradients(
 # Init / cleanup
 # ---------------------------------------------------------------------------
 
-def init_distributed_context(cfg: Dict) -> DistributedContext:
+def init_distributed_context(cfg: dict) -> DistributedContext:
     """Initialize optional DDP runtime from config + torchrun env."""
     gpu_cfg = cfg.get("gpu", {})
     multi_gpu_cfg = gpu_cfg.get("multi_gpu", {})

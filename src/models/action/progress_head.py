@@ -31,7 +31,8 @@ Architecture:
 """
 
 import logging
-from typing import Optional, Dict, Union
+from typing import Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,27 +43,27 @@ logger = logging.getLogger(__name__)
 class ProgressPredictionHead(nn.Module):
     """
     Progress Prediction Head (InternNav DistanceNetwork style with concat_state_txt).
-    
+
     预测任务完成进度 (0-1)，替代二分类的 Stop 预测。
-    
+
     对齐 InternNav 的关键设计：
     1. 使用 state + text_embed 拼接 (input_dim * 2)
     2. 3 层 MLP + ReLU + Sigmoid
     3. 简单 MSE loss
     4. Kaiming 初始化（对齐 InternNav _init_pm_layers）
-    
+
     在我们的架构中（需要传入完整 LLM 序列以保证两个表示不同）：
     - state = LLM 的 last token（包含最新上下文信息，类似 GRU 隐藏状态）
     - text_embed = LLM 的 mean pooling（全局聚合信息，类似文本嵌入）
-    
+
     注意：必须传入 (B, seq_len, D) 且 seq_len > 1 才能使 concat_state_txt 有效。
     如果 seq_len == 1，两个表示会相同，失去拼接的意义。
-    
+
     Args:
         input_dim: Input dimension from LLM features (single feature)
         concat_state_txt: 是否使用 state + text 拼接模式 (default: True, 对齐 InternNav)
     """
-    
+
     def __init__(
         self,
         input_dim: int = 1024,
@@ -72,14 +73,14 @@ class ProgressPredictionHead(nn.Module):
         concat_state_txt: bool = True,  # 对齐 InternNav
     ):
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.concat_state_txt = concat_state_txt
-        
+
         # 对齐 InternNav: 如果 concat_state_txt，input_dim 翻倍
         # state (last token) + text_embed (mean pooling) 拼接
         mlp_input_dim = input_dim * 2 if concat_state_txt else input_dim
-        
+
         # 对齐 InternNav 的 DistanceNetwork 结构
         # 简单 3 层 MLP: input -> input/4 -> input/16 -> 1
         # 注意：这里的 input 是拼接后的维度
@@ -91,21 +92,21 @@ class ProgressPredictionHead(nn.Module):
             nn.Linear(mlp_input_dim // 16, 1),
             nn.Sigmoid(),  # 输出 0-1
         )
-        
+
         # 对齐 InternNav _init_pm_layers: Kaiming 初始化
         self._init_weights()
-        
+
         logger.info(
             f"ProgressPredictionHead initialized (InternNav style): "
             f"input_dim={input_dim}, concat_state_txt={concat_state_txt}, "
             f"mlp_input_dim={mlp_input_dim}, "
             f"structure={mlp_input_dim}->{mlp_input_dim//4}->{mlp_input_dim//16}->1"
         )
-    
+
     def _init_weights(self):
         """
         Initialize weights (对齐 InternNav _init_pm_layers)
-        
+
         InternNav 使用 Kaiming 初始化:
         - 2D params (weights): kaiming_normal_ with relu
         - 1D params (biases): constant 0
@@ -115,22 +116,22 @@ class ProgressPredictionHead(nn.Module):
                 nn.init.kaiming_normal_(param, nonlinearity='relu')
             elif param.ndim == 1:  # Typically biases are 1D
                 nn.init.constant_(param, 0)
-    
+
     def _pool_features(self, llm_features: torch.Tensor) -> torch.Tensor:
         """
         Pool LLM features to fixed-size representation.
-        
+
         对齐 InternNav 的 concat_state_txt 模式：
         - state = last token (最新上下文，类似 InternNav GRU hidden state)
         - text_embed = mean pooling (全局信息，类似 InternNav fused text embed)
-        
+
         注意：InternNav 中 state 和 text_embed 来自不同的模块
         (GRU vs 跨模态融合器)，天然是不同的表示。
         在我们的架构中使用 last_token 和 mean_pool 来产生不同的表示。
-        
+
         Args:
             llm_features: (B, seq_len, D) or (B, D) LLM output features
-            
+
         Returns:
             (B, D) or (B, 2*D) pooled features
         """
@@ -143,7 +144,7 @@ class ProgressPredictionHead(nn.Module):
                 )
                 return torch.cat([llm_features, llm_features], dim=-1)
             return llm_features
-        
+
         # (B, seq_len, D)
         if self.concat_state_txt:
             # 对齐 InternNav: state + text_embed 拼接
@@ -155,25 +156,25 @@ class ProgressPredictionHead(nn.Module):
         else:
             # 简单 mean pooling
             pooled = llm_features.mean(dim=1)  # (B, D)
-        
+
         return pooled
-    
+
     def forward(
         self,
         llm_features: torch.Tensor,
-        gt_progress: Optional[torch.Tensor] = None,
-        action_valid: Optional[torch.Tensor] = None,
+        gt_progress: torch.Tensor | None = None,
+        action_valid: torch.Tensor | None = None,
         return_loss: bool = False,
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Union[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Forward pass for progress prediction.
-        
+
         Args:
             llm_features: (B, seq_len, D) or (B, D) LLM output features
             gt_progress: Optional (B,) ground truth progress values (0-1)
             action_valid: Optional (B,) mask for valid actions
             return_loss: If True and gt_progress provided, return loss dict
-            
+
         Returns:
             If return_loss and gt_progress provided:
                 Dict with 'progress', 'loss'
@@ -182,60 +183,60 @@ class ProgressPredictionHead(nn.Module):
         """
         # Pool features (对齐 InternNav concat_state_txt)
         pooled = self._pool_features(llm_features)
-        
+
         # Predict progress: (B, 2*D) -> (B, 1) -> (B,)
         progress = self.progress_mlp(pooled).squeeze(-1)
-        
+
         if gt_progress is not None and return_loss:
             loss = self._compute_loss(progress, gt_progress, action_valid)
             return {
                 'progress': progress,
                 'loss': loss,
             }
-        
+
         return progress
-    
+
     def compute_loss(
         self,
         progress: torch.Tensor,
         gt_progress: torch.Tensor,
-        action_valid: Optional[torch.Tensor] = None,
+        action_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         供外部调用的 loss 计算方法。
-        
+
         Args:
             progress: (B,) predicted progress values
             gt_progress: (B,) ground truth progress values
             action_valid: Optional (B,) mask for valid actions
-            
+
         Returns:
             Scalar loss
         """
         return self._compute_loss(progress, gt_progress, action_valid)
-    
+
     def _compute_loss(
         self,
         progress: torch.Tensor,
         targets: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute progress loss (InternNav style).
-        
+
         使用简单 MSE loss，对齐 InternNav 实现。
-        
+
         Args:
             progress: (B,) predicted progress
             targets: (B,) ground truth progress
             mask: Optional (B,) mask for valid samples
-            
+
         Returns:
             Scalar loss
         """
         device = progress.device
         targets = targets.float().to(device)
-        
+
         # 简单 MSE loss，对齐 InternNav
         if mask is not None:
             mask = mask.float().to(device)
@@ -246,37 +247,37 @@ class ProgressPredictionHead(nn.Module):
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
         else:
             loss = F.mse_loss(progress, targets)
-        
+
         return loss
-    
+
     def predict_stop(
-        self, 
-        llm_features: torch.Tensor, 
+        self,
+        llm_features: torch.Tensor,
         threshold: float = 0.9,
     ) -> torch.Tensor:
         """
         Predict stop action from progress.
-        
+
         当 progress > threshold 时，预测为 STOP。
-        
+
         Args:
             llm_features: (B, seq_len, D) or (B, D) LLM features
             threshold: Progress threshold for STOP prediction
-            
+
         Returns:
             (B,) binary predictions (1=STOP, 0=continue)
         """
         with torch.no_grad():
             progress = self.forward(llm_features)
             return (progress > threshold).long()
-    
+
     def get_progress(self, llm_features: torch.Tensor) -> torch.Tensor:
         """
         Get progress value for inference.
-        
+
         Args:
             llm_features: (B, seq_len, D) or (B, D) LLM features
-            
+
         Returns:
             (B,) progress values (0-1)
         """
@@ -292,14 +293,14 @@ def create_progress_head(
     device: str = "cuda",
 ) -> ProgressPredictionHead:
     """Factory function to create ProgressPredictionHead"""
-    
+
     model = ProgressPredictionHead(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         dropout=dropout,
         concat_state_txt=concat_state_txt,
     )
-    
+
     model = model.to(device)
-    
+
     return model

@@ -14,9 +14,9 @@ Trainable parameters: ~530K (with c_vit=1152, c_fused=256, n_layers=4).
 Reference: HeatmapVLN设计文档 Section 6.1
 """
 
+
 import torch
 import torch.nn as nn
-from typing import List
 
 
 class DPTLiteFusion(nn.Module):
@@ -38,7 +38,7 @@ class DPTLiteFusion(nn.Module):
             nn.Conv2d(c_fused, c_fused, kernel_size=3, padding=1),
         )
 
-    def forward(self, multi_layer_feats: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, multi_layer_feats: list[torch.Tensor]) -> torch.Tensor:
         """
         Args:
             multi_layer_feats: list of ``(B, C_vit, H, W)`` tensors.

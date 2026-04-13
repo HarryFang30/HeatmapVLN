@@ -23,7 +23,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     def forward(self, timesteps):
         timesteps = timesteps.float()
-        B, T = timesteps.shape
+        _B, _T = timesteps.shape
         device = timesteps.device
 
         half_dim = self.embedding_dim // 2
@@ -58,7 +58,7 @@ class MemoryEncoder(nn.Module):
         Returns:
             encoded_memory: (B, N, C)
         """
-        B, N, C = memory.shape
+        B, N, _C = memory.shape
         pos = self.memory_pos[:N, :].unsqueeze(0).expand(B, -1, -1)
         memory = memory + pos
         encoded_memory = self.encoder(memory, src_key_padding_mask=memory_mask)

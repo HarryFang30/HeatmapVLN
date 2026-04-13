@@ -30,12 +30,10 @@ are stripped of the 'model.' prefix and saved separately.
 import argparse
 import json
 import logging
-import os
 import shutil
 from collections import OrderedDict
 from pathlib import Path
 
-import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -146,7 +144,7 @@ def convert(
 
         logger.info("Processing shard: %s", shard_file)
         with safe_open(str(shard_file), framework="pt", device="cpu") as f:
-            for key in f.keys():
+            for key in f:
                 tensor = f.get_tensor(key)
                 if _is_system1_key(key):
                     new_key = _remap_system1_key(key)

@@ -11,8 +11,8 @@ users know how to fix the issue (for example by installing Noto Sans CJK).
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
 
 from matplotlib import font_manager, rcParams
 
@@ -46,11 +46,11 @@ DEFAULT_FONT_SEARCH_DIRS: Sequence[Path] = (
 )
 
 _configured: bool = False
-_selected_font: Optional[str] = None
+_selected_font: str | None = None
 
 
-def _discover_font_files(font_dirs: Iterable[Path]) -> List[Path]:
-    font_files: List[Path] = []
+def _discover_font_files(font_dirs: Iterable[Path]) -> list[Path]:
+    font_files: list[Path] = []
     for font_dir in font_dirs:
         try:
             if not font_dir.exists():
@@ -62,7 +62,7 @@ def _discover_font_files(font_dirs: Iterable[Path]) -> List[Path]:
     return font_files
 
 
-def _register_additional_fonts(extra_font_dirs: Optional[Iterable[Path]] = None) -> int:
+def _register_additional_fonts(extra_font_dirs: Iterable[Path] | None = None) -> int:
     font_dirs = list(DEFAULT_FONT_SEARCH_DIRS)
     if extra_font_dirs:
         for extra_dir in extra_font_dirs:
@@ -91,7 +91,7 @@ def _register_additional_fonts(extra_font_dirs: Optional[Iterable[Path]] = None)
     return registered
 
 
-def configure_matplotlib_fonts(extra_font_dirs: Optional[Iterable[Path]] = None) -> Optional[str]:
+def configure_matplotlib_fonts(extra_font_dirs: Iterable[Path] | None = None) -> str | None:
     """Ensure Matplotlib can render CJK glyphs and return the chosen font.
 
     The first available font from :data:`PREFERRED_CJK_FONTS` is used for the
@@ -130,6 +130,6 @@ def configure_matplotlib_fonts(extra_font_dirs: Optional[Iterable[Path]] = None)
 
 
 __all__ = [
-    "configure_matplotlib_fonts",
     "PREFERRED_CJK_FONTS",
+    "configure_matplotlib_fonts",
 ]

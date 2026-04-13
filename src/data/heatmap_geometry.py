@@ -6,7 +6,6 @@ both CPU-side dataset heatmap generation and GPU heatmap verification.
 """
 
 import math
-from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -16,7 +15,7 @@ def project_point_pinhole(
     K: np.ndarray,
     width: int,
     height: int
-) -> Optional[Tuple[float, float, float]]:
+) -> tuple[float, float, float] | None:
     """Project a camera-space 3D point to pixel coordinates.
 
     Habitat convention: X right, Y up, -Z forward.
@@ -67,7 +66,7 @@ def compute_adaptive_sigma_pinhole(
 
 def draw_gaussian_point(
     heatmap: np.ndarray,
-    center: Tuple[float, float],
+    center: tuple[float, float],
     sigma: float,
     peak_value: float = 1.0,
     use_max: bool = True,
@@ -100,12 +99,12 @@ def draw_gaussian_point(
 
 
 def compute_history_heatmap(
-    history_poses: List[np.ndarray],
+    history_poses: list[np.ndarray],
     current_pose: np.ndarray,
-    current_depth: Optional[np.ndarray],
-    hm_size: Tuple[int, int] = (64, 64),
-    img_size: Tuple[int, int] = (640, 480),
-    K: Optional[np.ndarray] = None,
+    current_depth: np.ndarray | None,
+    hm_size: tuple[int, int] = (64, 64),
+    img_size: tuple[int, int] = (640, 480),
+    K: np.ndarray | None = None,
     depth_normalize: bool = True,
     depth_min: float = 0.0,
     depth_max: float = 10.0,
@@ -115,7 +114,7 @@ def compute_history_heatmap(
     use_distance_decay: bool = True,
     distance_decay_ref: float = 5.0,
     min_peak_value: float = 0.7,
-) -> Tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int]:
     """Render history-camera positions as a Gaussian heatmap on the current frame.
 
     Returns:

@@ -7,12 +7,12 @@ This module is kept for reference but should use standard batching
 (TokenizedVLNDataset + FlattenedCollatorForVLN) instead.
 """
 
-import torch
-import torch.nn as nn
-from typing import Dict, List, Any, Optional, Tuple
-from PIL import Image
-import numpy as np
 import logging
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +27,18 @@ def get_rope_index_3(
     image_grid_thw: torch.LongTensor = None,
     video_grid_thw: torch.LongTensor = None,
     attention_mask: torch.Tensor = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """计算 3D RoPE position IDs"""
     image_token_id = IMAGE_TOKEN_ID
     video_token_id = VIDEO_TOKEN_ID
     vision_start_token_id = 248053  # <|vision_start|>
-    
+
     if video_grid_thw is not None:
         video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
         video_grid_thw[:, 0] = 1
 
     mrope_position_deltas = []
-    
+
     if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
         total_input_ids = input_ids
         if attention_mask is None:
@@ -52,7 +52,7 @@ def get_rope_index_3(
         )
         image_index, video_index = 0, 0
         attention_mask = attention_mask.to(total_input_ids.device)
-        
+
         for i, input_ids_row in enumerate(total_input_ids):
             input_ids_row = input_ids_row[attention_mask[i] == 1]
             image_nums, video_nums = 0, 0
@@ -64,7 +64,7 @@ def get_rope_index_3(
             llm_pos_ids_list = []
             st = 0
             remain_images, remain_videos = image_nums, video_nums
-            
+
             for _ in range(image_nums + video_nums):
                 if image_token_id in input_tokens and remain_images > 0:
                     ed_image = input_tokens.index(image_token_id, st)
@@ -74,7 +74,7 @@ def get_rope_index_3(
                     ed_video = input_tokens.index(video_token_id, st)
                 else:
                     ed_video = len(input_tokens) + 1
-                    
+
                 if ed_image < ed_video:
                     t, h, w = (
                         image_grid_thw[image_index][0],
@@ -93,7 +93,7 @@ def get_rope_index_3(
                     video_index += 1
                     remain_videos -= 1
                     ed = ed_video
-                    
+
                 llm_grid_t, llm_grid_h, llm_grid_w = (
                     t.item(),
                     h.item() // spatial_merge_size,
@@ -118,7 +118,7 @@ def get_rope_index_3(
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
             position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
             mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
-            
+
         mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
     else:
@@ -146,11 +146,11 @@ def get_rope_index_3(
 class PackingCollatorForVLN:
     """
     VLN 任务的 Packing Collator
-    
+
     在 collate 阶段完成 tokenization 和 packing，
     输出可以直接被 forward_packed 使用的数据格式。
     """
-    
+
     def __init__(
         self,
         processor,
@@ -167,44 +167,44 @@ class PackingCollatorForVLN:
         self.tokenizer = processor.tokenizer
         self.spatial_merge_size = spatial_merge_size
         self.max_seq_length = max_seq_length
-        
+
         # 设置 left padding
         self.tokenizer.padding_side = 'left'
-    
-    def _tensor_to_pil_images(self, tensor: torch.Tensor) -> List[Image.Image]:
+
+    def _tensor_to_pil_images(self, tensor: torch.Tensor) -> list[Image.Image]:
         """
         Convert tensor to list of PIL images
-        
+
         Args:
             tensor: (K, C, H, W) or (C, H, W)
         """
         if tensor.dim() == 3:
             tensor = tensor.unsqueeze(0)
-        
+
         images = []
         for i in range(tensor.shape[0]):
             frame = tensor[i].cpu().permute(1, 2, 0).numpy()
             frame = (frame * 255).clip(0, 255).astype(np.uint8)
             images.append(Image.fromarray(frame))
         return images
-    
+
     def _process_single_sample(
         self,
         history_frames: torch.Tensor,
         current_frame: torch.Tensor,
         instruction: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         处理单个样本，返回 tokenized 结果
         """
         # 转换为 PIL 图像
         history_pil = self._tensor_to_pil_images(history_frames)
         current_pil = self._tensor_to_pil_images(current_frame)[0]
-        
+
         # 构建 prompt
         if not instruction:
             instruction = "Navigate according to the visual observations."
-        
+
         prompt_text = (
             "You are a navigation assistant. "
             "The video shows the historical trajectory from a forward-facing camera. "
@@ -212,7 +212,7 @@ class PackingCollatorForVLN:
             f"Instruction: {instruction}. "
             "Understand the spatial layout and identify where you came from."
         )
-        
+
         # 构建 messages
         # 使用 nframes 明确指定帧数，避免 fps 采样警告
         content = [
@@ -221,7 +221,7 @@ class PackingCollatorForVLN:
             {"type": "text", "text": prompt_text},
         ]
         messages = [{"role": "user", "content": content}]
-        
+
         # 调用 processor
         result = self.processor.apply_chat_template(
             messages,
@@ -230,13 +230,13 @@ class PackingCollatorForVLN:
             return_dict=True,
             return_tensors="pt",
         )
-        
+
         return result
-    
-    def __call__(self, batch: List[Dict]) -> Dict[str, Any]:
+
+    def __call__(self, batch: list[dict]) -> dict[str, Any]:
         """
         Collate batch，执行 tokenization 和 packing
-        
+
         Args:
             batch: List of samples, each containing:
                 - history_frames: (K, C, H, W)
@@ -245,12 +245,12 @@ class PackingCollatorForVLN:
                 - action: (2,) or (predict_horizon, 3)
                 - text: str
                 - ...
-        
+
         Returns:
             Dict containing packed data for forward_packed
         """
         batch_size = len(batch)
-        
+
         # ========== 1. Tokenize 每个样本 ==========
         tokenized_samples = []
         for sample in batch:
@@ -260,17 +260,17 @@ class PackingCollatorForVLN:
                 sample['text'],
             )
             tokenized_samples.append(result)
-        
+
         # ========== 2. 计算 position_ids 并记录 seq_lens ==========
         processed_samples = []
         for result in tokenized_samples:
             input_ids = result["input_ids"]  # (1, seq_len)
             seq_len = input_ids.shape[1]
-            
+
             # 获取 grid 信息
             image_grid_thw = result.get("image_grid_thw")
             video_grid_thw = result.get("video_grid_thw")
-            
+
             # 计算 position_ids
             position_ids, _ = get_rope_index_3(
                 spatial_merge_size=self.spatial_merge_size,
@@ -278,7 +278,7 @@ class PackingCollatorForVLN:
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
             )
-            
+
             processed_samples.append({
                 "input_ids": input_ids,
                 "position_ids": position_ids,  # (3, 1, seq_len)
@@ -288,28 +288,28 @@ class PackingCollatorForVLN:
                 "pixel_values_videos": result.get("pixel_values_videos"),
                 "video_grid_thw": video_grid_thw,
             })
-        
+
         # ========== 3. Pack 成单个序列 ==========
         seq_lens = [s["seq_len"] for s in processed_samples]
         total_seq_len = sum(seq_lens)
-        
+
         # 检查是否超过最大长度
         if total_seq_len > self.max_seq_length:
             logger.warning(
                 f"Total sequence length {total_seq_len} exceeds max {self.max_seq_length}. "
                 f"Consider reducing batch_size."
             )
-        
+
         # 拼接 input_ids: (1, total_seq_len)
         input_ids = torch.cat([s["input_ids"] for s in processed_samples], dim=1)
-        
+
         # 拼接 position_ids: (3, 1, total_seq_len)
         position_ids = torch.cat([s["position_ids"] for s in processed_samples], dim=2)
-        
+
         # 计算 cumsum_seq_lens: [0, len1, len1+len2, ...]
-        cumsum_seq_lens = torch.tensor([0] + seq_lens, dtype=torch.int32)
+        cumsum_seq_lens = torch.tensor([0, *seq_lens], dtype=torch.int32)
         cumsum_seq_lens = torch.cumsum(cumsum_seq_lens, dim=0, dtype=torch.int32)
-        
+
         # ========== 4. 拼接视觉数据 ==========
         # 图像
         images = [s["pixel_values"] for s in processed_samples if s["pixel_values"] is not None]
@@ -322,7 +322,7 @@ class PackingCollatorForVLN:
         else:
             pixel_values = None
             image_grid_thw = None
-        
+
         # 视频
         videos = [s["pixel_values_videos"] for s in processed_samples if s["pixel_values_videos"] is not None]
         if videos:
@@ -334,17 +334,17 @@ class PackingCollatorForVLN:
         else:
             pixel_values_videos = None
             video_grid_thw = None
-        
+
         # ========== 5. 处理 VLN 特定数据（非 packed，保持 batch 维度）==========
         # 这些数据用于 downstream heads，不需要 pack
         max_K = max(s['history_frames'].shape[0] for s in batch)
         history_frames_padded = []
         history_mask = []
-        
+
         for s in batch:
             frames = s['history_frames']
             K = frames.shape[0]
-            if K < max_K:
+            if max_K > K:
                 pad_size = max_K - K
                 pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
                 frames_padded = torch.cat([frames, pad_frames], dim=0)
@@ -354,7 +354,7 @@ class PackingCollatorForVLN:
                 mask = torch.ones(K, dtype=torch.bool)
             history_frames_padded.append(frames_padded)
             history_mask.append(mask)
-        
+
         # ========== 6. 构建输出 ==========
         packed_batch = {
             # Packed LLM inputs
@@ -363,13 +363,13 @@ class PackingCollatorForVLN:
             "position_ids": position_ids,              # (3, 1, total_seq_len)
             "seq_lens": seq_lens,                      # List[int]
             "num_samples": batch_size,
-            
+
             # Packed vision data
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "pixel_values_videos": pixel_values_videos,
             "video_grid_thw": video_grid_thw,
-            
+
             # VLN specific data (batched, not packed)
             "history_frames": torch.stack(history_frames_padded, dim=0),  # (B, K, C, H, W)
             "history_mask": torch.stack(history_mask, dim=0),             # (B, K)
@@ -381,18 +381,18 @@ class PackingCollatorForVLN:
             "is_stop": torch.tensor([s.get('is_stop', 0.0) for s in batch]),
             "text": [s['text'] for s in batch],
         }
-        
+
         if 'current_views' in batch[0]:
             packed_batch['current_views'] = torch.stack(
                 [s['current_views'] for s in batch], dim=0)  # [B, 4, C, H, W]
         if 'history_panoramas' in batch[0]:
             packed_batch['history_panoramas'] = torch.stack(
                 [s['history_panoramas'] for s in batch], dim=0)  # [B, N, 4, C, H, W]
-        
+
         # 轨迹数据集的额外字段
         if 'trajectory' in batch[0]:
             packed_batch['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
             packed_batch['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
             packed_batch['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
-        
+
         return packed_batch

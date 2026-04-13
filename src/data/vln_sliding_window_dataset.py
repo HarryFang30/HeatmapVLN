@@ -7,37 +7,36 @@ statements continue to work without modification.
 """
 
 # Dataset classes
-from .sliding_window_dataset import (  # noqa: F401
-    VLNSlidingWindowDataset,
-    create_sliding_window_dataloader,
-    _evict_from_page_cache,
-)
-from .trajectory_dataset import (  # noqa: F401
-    VLNTrajectoryDataset,
-    create_trajectory_dataloader,
-)
-
 # Augmentation
-from .augmentation import (  # noqa: F401
+from .augmentation import (
     ColorJitterAugmentation,
     GaussianNoiseAugmentation,
     InternNavStyleAugmentation,
 )
 
 # Heatmap geometry
-from .heatmap_geometry import (  # noqa: F401
-    project_point_pinhole,
+from .heatmap_geometry import (
     compute_adaptive_sigma_pinhole,
-    draw_gaussian_point,
     compute_history_heatmap,
+    draw_gaussian_point,
+    project_point_pinhole,
+)
+from .sliding_window_dataset import (
+    VLNSlidingWindowDataset,
+    _evict_from_page_cache,
+    create_sliding_window_dataloader,
+)
+from .trajectory_dataset import (
+    VLNTrajectoryDataset,
+    create_trajectory_dataloader,
 )
 
 # Trajectory utilities
-from .trajectory_utils import (  # noqa: F401
+from .trajectory_utils import (
+    apply_trajectory_augmentation,
     compute_history_rel_poses,
     get_trajectory_relative_to_frame,
+    interpolate_and_resample_trajectory,
     smooth_and_resample_trajectory,
     xy_to_delta_xyt,
-    interpolate_and_resample_trajectory,
-    apply_trajectory_augmentation,
 )

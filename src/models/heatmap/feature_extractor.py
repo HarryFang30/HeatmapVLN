@@ -17,7 +17,6 @@ Important:
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,25 +48,25 @@ class FeatureExtractor:
     def __init__(
         self,
         model,
-        vit_layer_indices: List[int],
-        llm_layer_indices: Optional[List[int]] = None,
+        vit_layer_indices: list[int],
+        llm_layer_indices: list[int] | None = None,
         spatial_merge_size: int = 2,
         detach_features: bool = True,
     ):
         if llm_layer_indices is None:
             llm_layer_indices = [7, 15, 23]
 
-        self.vit_features: Dict[int, torch.Tensor] = {}
-        self.llm_hidden_states: Dict[int, Optional[torch.Tensor]] = {}
+        self.vit_features: dict[int, torch.Tensor] = {}
+        self.llm_hidden_states: dict[int, torch.Tensor | None] = {}
         self.vit_layer_indices = list(vit_layer_indices)
         self.llm_layer_indices = sorted(llm_layer_indices)
         self.spatial_merge_size = spatial_merge_size
         self.detach_features = detach_features
         self._handles: list = []
         self._batch_capture_plan = None
-        self._captured_batch_vit: Dict[int, List[Dict[int, torch.Tensor]]] = {}
-        self._captured_batch_llm: Dict[int, List[Dict[int, torch.Tensor]]] = {}
-        self._captured_batch_queries: Optional[List[List[torch.Tensor]]] = None
+        self._captured_batch_vit: dict[int, list[dict[int, torch.Tensor]]] = {}
+        self._captured_batch_llm: dict[int, list[dict[int, torch.Tensor]]] = {}
+        self._captured_batch_queries: list[list[torch.Tensor]] | None = None
         self._llm_resize_logged = False
         self._vit_resize_logged = False
 
@@ -160,13 +159,13 @@ class FeatureExtractor:
 
     def prepare_batch_capture(
         self,
-        image_token_positions_batch: List[Dict[int, Tuple[int, int]]],
-        text_anchor_positions_batch: List[Dict[int, int]],
-        image_grid_thw: Optional[torch.Tensor] = None,
+        image_token_positions_batch: list[dict[int, tuple[int, int]]],
+        text_anchor_positions_batch: list[dict[int, int]],
+        image_grid_thw: torch.Tensor | None = None,
     ) -> None:
         """Prepare compact token capture plan for batched panoramic forward."""
         sample_image_counts = [len(pos) for pos in image_token_positions_batch]
-        sample_offsets: List[int] = []
+        sample_offsets: list[int] = []
         running = 0
         for count in sample_image_counts:
             sample_offsets.append(running)
@@ -183,7 +182,7 @@ class FeatureExtractor:
         for size in per_image_sizes:
             prefix.append(prefix[-1] + int(size))
 
-        vit_ranges_batch: List[Dict[int, Tuple[int, int]]] = []
+        vit_ranges_batch: list[dict[int, tuple[int, int]]] = []
         for image_offset in sample_offsets:
             sample_views = {}
             for view_idx in range(4):
@@ -214,9 +213,9 @@ class FeatureExtractor:
 
     def extract(
         self,
-        image_token_positions: Dict[int, Tuple[int, int]],
-        text_anchor_positions: Dict[int, int],
-        image_grid_thw: Optional[torch.Tensor] = None,
+        image_token_positions: dict[int, tuple[int, int]],
+        text_anchor_positions: dict[int, int],
+        image_grid_thw: torch.Tensor | None = None,
     ):
         """
         Group captured features by image / history position.
@@ -247,7 +246,7 @@ class FeatureExtractor:
         n_hist = len(text_anchor_positions)
 
         # --- current 4 views: multi-layer LLM features (8x8) ---
-        current_llm: Dict[int, Dict[int, torch.Tensor]] = {}
+        current_llm: dict[int, dict[int, torch.Tensor]] = {}
         for view_idx in range(4):
             current_llm[view_idx] = {}
             if view_idx not in image_token_positions:
@@ -266,7 +265,7 @@ class FeatureExtractor:
                 )
 
         # --- current 4 views: ViT features (16x16, multi-layer) ---
-        current_vit: Dict[int, Dict[int, torch.Tensor]] = {}
+        current_vit: dict[int, dict[int, torch.Tensor]] = {}
         for view_idx in range(4):
             current_vit[view_idx] = {}
             for layer_idx in self.vit_layer_indices:
@@ -280,16 +279,16 @@ class FeatureExtractor:
                     current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx)
 
         # --- history query vectors (from deepest hooked LLM layer) ---
-        history_queries: List[torch.Tensor] = []
+        history_queries: list[torch.Tensor] = []
         for hist_idx in range(n_hist):
             pos = text_anchor_positions[hist_idx]
             q = hidden_deepest[0, pos, :]  # (C_llm,)
             history_queries.append(q)
 
         # --- history LLM visual features (same hooked layer, for ablation) ---
-        history_llm_views: List[Dict[int, torch.Tensor]] = []
+        history_llm_views: list[dict[int, torch.Tensor]] = []
         for hist_idx in range(n_hist):
-            views: Dict[int, torch.Tensor] = {}
+            views: dict[int, torch.Tensor] = {}
             for v in range(4):
                 img_idx = 4 + hist_idx * 4 + v
                 if img_idx not in image_token_positions:
@@ -305,10 +304,10 @@ class FeatureExtractor:
 
     def extract_batch(
         self,
-        image_token_positions_batch: List[Dict[int, Tuple[int, int]]],
-        text_anchor_positions_batch: List[Dict[int, int]],
-        image_grid_thw: Optional[torch.Tensor] = None,
-    ) -> List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]]:
+        image_token_positions_batch: list[dict[int, tuple[int, int]]],
+        text_anchor_positions_batch: list[dict[int, int]],
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> list[tuple[dict[int, dict[int, torch.Tensor]], dict[int, dict[int, torch.Tensor]], list[torch.Tensor]]]:
         """Batched variant of ``extract()`` for panoramic single-chain inputs."""
         if self._batch_capture_plan is not None:
             return self._extract_batch_compact()
@@ -324,7 +323,7 @@ class FeatureExtractor:
             )
 
         sample_image_counts = [len(pos) for pos in image_token_positions_batch]
-        sample_image_offsets: List[int] = []
+        sample_image_offsets: list[int] = []
         running = 0
         for count in sample_image_counts:
             sample_image_offsets.append(running)
@@ -334,7 +333,7 @@ class FeatureExtractor:
         for batch_idx, image_token_positions in enumerate(image_token_positions_batch):
             n_hist = len(text_anchor_positions_batch[batch_idx])
 
-            current_llm: Dict[int, Dict[int, torch.Tensor]] = {}
+            current_llm: dict[int, dict[int, torch.Tensor]] = {}
             for view_idx in range(4):
                 current_llm[view_idx] = {}
                 if view_idx not in image_token_positions:
@@ -352,7 +351,7 @@ class FeatureExtractor:
                         tokens, layer_idx, view_idx, f"batch[{batch_idx}]-current"
                     )
 
-            current_vit: Dict[int, Dict[int, torch.Tensor]] = {}
+            current_vit: dict[int, dict[int, torch.Tensor]] = {}
             image_offset = sample_image_offsets[batch_idx]
             for view_idx in range(4):
                 current_vit[view_idx] = {}
@@ -367,7 +366,7 @@ class FeatureExtractor:
                             vit_tokens, layer_idx, view_idx
                         )
 
-            history_queries: List[torch.Tensor] = []
+            history_queries: list[torch.Tensor] = []
             for hist_idx in range(n_hist):
                 pos = text_anchor_positions_batch[batch_idx][hist_idx]
                 q = hidden_deepest[batch_idx, pos, :]
@@ -379,7 +378,7 @@ class FeatureExtractor:
 
     def _extract_batch_compact(
         self,
-    ) -> List[Tuple[Dict[int, Dict[int, torch.Tensor]], Dict[int, Dict[int, torch.Tensor]], List[torch.Tensor]]]:
+    ) -> list[tuple[dict[int, dict[int, torch.Tensor]], dict[int, dict[int, torch.Tensor]], list[torch.Tensor]]]:
         self._validate_llm_layers_captured()
 
         if self._captured_batch_queries is None:
@@ -388,7 +387,7 @@ class FeatureExtractor:
         batch_size = len(self._captured_batch_queries)
         extracted = []
         for batch_idx in range(batch_size):
-            current_llm: Dict[int, Dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
+            current_llm: dict[int, dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
             for layer_idx in self.llm_layer_indices:
                 layer_samples = self._captured_batch_llm.get(layer_idx)
                 if layer_samples is None:
@@ -398,7 +397,7 @@ class FeatureExtractor:
                         tokens, layer_idx, view_idx, f"batch[{batch_idx}]-current"
                     )
 
-            current_vit: Dict[int, Dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
+            current_vit: dict[int, dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
             for layer_idx in self.vit_layer_indices:
                 layer_samples = self._captured_batch_vit.get(layer_idx)
                 if layer_samples is None:
@@ -414,15 +413,15 @@ class FeatureExtractor:
 
     def extract_batch_compact_tensors(
         self,
-    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor], List[List[torch.Tensor]]]:
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], list[list[torch.Tensor]]]:
         self._validate_llm_layers_captured()
 
         if self._captured_batch_queries is None:
             raise RuntimeError("Deepest-layer history queries were not captured in compact batch mode.")
 
         batch_size = len(self._captured_batch_queries)
-        llm_tensors: Dict[int, torch.Tensor] = {}
-        vit_tensors: Dict[int, torch.Tensor] = {}
+        llm_tensors: dict[int, torch.Tensor] = {}
+        vit_tensors: dict[int, torch.Tensor] = {}
 
         for layer_idx in self.llm_layer_indices:
             layer_samples = self._captured_batch_llm.get(layer_idx)
@@ -478,7 +477,7 @@ class FeatureExtractor:
         layer_idx: int,
         image_idx: int,
         tag: str,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         side = int(num_tokens ** 0.5)
         if side * side != num_tokens:
             raise RuntimeError(
@@ -565,8 +564,8 @@ class FeatureExtractor:
         self,
         vit_layer_output: torch.Tensor,
         img_idx: int,
-        image_grid_thw: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """Extract the pre-merge ViT tokens for a single image."""
         if image_grid_thw is not None:
             per_image_sizes = (

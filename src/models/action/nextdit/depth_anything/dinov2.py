@@ -9,17 +9,17 @@
 
 import logging
 import math
+from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Callable, Sequence, Tuple, Union
+from typing import Union
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from .dinov2_layers import MemEffAttention, Mlp
+from .dinov2_layers import MemEffAttention, Mlp, PatchEmbed, SwiGLUFFNFused
 from .dinov2_layers import NestedTensorBlock as Block
-from .dinov2_layers import PatchEmbed, SwiGLUFFNFused
 
 logger = logging.getLogger("dinov2")
 
@@ -211,7 +211,7 @@ class DinoVisionTransformer(nn.Module):
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
 
     def prepare_tokens_with_masks(self, x, masks=None):
-        B, nc, w, h = x.shape
+        _B, _nc, w, h = x.shape
         x = self.patch_embed(x)
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
@@ -302,7 +302,7 @@ class DinoVisionTransformer(nn.Module):
         reshape: bool = False,
         return_class_token: bool = False,
         norm=True,
-    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+    ) -> tuple[Union[torch.Tensor, tuple[torch.Tensor]]]:
         if self.chunked_blocks:
             outputs = self._get_intermediate_layers_chunked(x, n)
         else:

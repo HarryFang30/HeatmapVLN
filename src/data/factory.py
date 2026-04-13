@@ -5,19 +5,19 @@ Eliminates the 15-25 line parameter lists duplicated across train.py,
 evaluation scripts, and visualization scripts.
 """
 
-import logging
-from typing import Any, Dict, Union
+from __future__ import annotations
 
-from torch.utils.data import Dataset
+import logging
+from typing import Any, Union
 
 logger = logging.getLogger(__name__)
 
 
 def build_sliding_window_dataset(
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     split: str = "train",
     **overrides: Any,
-) -> "VLNSlidingWindowDataset":
+) -> VLNSlidingWindowDataset:
     """Build a VLNSlidingWindowDataset from a full config dict.
 
     All constructor parameters are extracted from ``cfg['data']`` and
@@ -50,10 +50,10 @@ def build_sliding_window_dataset(
 
 
 def build_trajectory_dataset(
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     split: str = "train",
     **overrides: Any,
-) -> "VLNTrajectoryDataset":
+) -> VLNTrajectoryDataset:
     """Build a VLNTrajectoryDataset from a full config dict.
 
     Parameters are extracted from ``cfg['data']``, falling back through
@@ -93,10 +93,10 @@ def build_trajectory_dataset(
 
 
 def build_dataset(
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     split: str = "train",
     **overrides: Any,
-) -> Union["VLNSlidingWindowDataset", "VLNTrajectoryDataset"]:
+) -> Union[VLNSlidingWindowDataset, VLNTrajectoryDataset]:
     """Build the appropriate dataset based on ``cfg['data']['dataset_type']``.
 
     Dispatches to :func:`build_sliding_window_dataset` or

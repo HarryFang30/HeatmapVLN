@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Union
 
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -65,30 +65,30 @@ class TrajectoryConfig(_Lenient):
     action_scale: float = 4.0
     enable_trajectory_augmentation: bool = True
     load_traj_images: bool = False
-    traj_image_size: List[int] = [224, 224]
+    traj_image_size: list[int] = [224, 224]
     use_subinstruction: bool = False
-    fgr2r_subinstr_path: Optional[str] = None
+    fgr2r_subinstr_path: str | None = None
     panoramic_vlm_input: bool = True
 
 
 class DataConfig(_Strict):
     root: str
     train_split: str = "train"
-    val_root: Optional[str] = None
+    val_root: str | None = None
     val_split: str = "val"
-    image_size: List[int]
-    init_hm_size: List[int]
+    image_size: list[int]
+    init_hm_size: list[int]
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
     dataset_type: str = "sliding_window"
-    sliding_window: Optional[SlidingWindowConfig] = None
-    trajectory: Optional[TrajectoryConfig] = None
-    use_worker_tokenized_collator: Optional[bool] = None
+    sliding_window: SlidingWindowConfig | None = None
+    trajectory: TrajectoryConfig | None = None
+    use_worker_tokenized_collator: bool | None = None
 
     @field_validator("image_size", "init_hm_size")
     @classmethod
-    def _check_size_pair(cls, v: List[int]) -> List[int]:
+    def _check_size_pair(cls, v: list[int]) -> list[int]:
         if len(v) != 2:
             raise ValueError(f"Expected [W, H], got {v}")
         return v
@@ -120,9 +120,9 @@ class LLMConfig(_Lenient):
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_num_layers: int = 4
-    lora_layer_indices: Optional[List[int]] = None
+    lora_layer_indices: list[int] | None = None
     lora_dropout: float = 0.05
-    lora_target_modules: Optional[List[str]] = None
+    lora_target_modules: list[str] | None = None
 
 
 class HeatmapTrajectoryConfig(_Lenient):
@@ -139,16 +139,16 @@ class HeatmapModelConfig(_Lenient):
     c_vit: int = 1280
     c_llm: int = 3584
     c_fused: int = 256
-    vit_layer_indices: List[int] = [7, 15, 23, 31]
-    llm_layer_indices: List[int] = [6, 13, 20]
-    heatmap_size: List[int] = [64, 64]
+    vit_layer_indices: list[int] = [7, 15, 23, 31]
+    llm_layer_indices: list[int] = [6, 13, 20]
+    heatmap_size: list[int] = [64, 64]
     image_size: int = 256
     lambda_vis: float = 1.0
     lambda_coord: float = 0.2
     lambda_kl: float = 0.0
     lambda_peak: float = 1.0
     heatmap_trains_backbone: bool = False
-    trajectory: Optional[HeatmapTrajectoryConfig] = None
+    trajectory: HeatmapTrajectoryConfig | None = None
 
 
 class NextDiTConfig(_Lenient):
@@ -169,21 +169,21 @@ class NextDiTConfig(_Lenient):
     dav2_ckpt_path: str = ""
     enable_gradient_checkpointing: bool = True
     internnav_system1_path: str = ""
-    pretrained_system1_path: Optional[str] = None
+    pretrained_system1_path: str | None = None
     warmup_steps: int = 0
 
 
 class ActionHeadConfig(_Lenient):
     enable: bool = True
-    nextdit: Optional[NextDiTConfig] = None
+    nextdit: NextDiTConfig | None = None
 
 
 class ModelConfig(_Lenient):
     type: str = "vln_pipeline"
     device: str = "cuda"
-    llm: Optional[LLMConfig] = None
-    heatmap: Optional[HeatmapModelConfig] = None
-    action_head: Optional[ActionHeadConfig] = None
+    llm: LLMConfig | None = None
+    heatmap: HeatmapModelConfig | None = None
+    action_head: ActionHeadConfig | None = None
 
 
 # --- Optim -------------------------------------------------------------------
@@ -225,12 +225,12 @@ class HeatmapVLNLossConfig(_Lenient):
     lambda_neg: float = 0.0
     temperature: float = 1.0
     vis_pos_weight: float = 1.0
-    temperature_schedule: Optional[TemperatureScheduleConfig] = None
+    temperature_schedule: TemperatureScheduleConfig | None = None
 
 
 class LossConfig(_Lenient):
     heatmap_loss_type: str = "heatmap_vln"
-    heatmap_vln: Optional[HeatmapVLNLossConfig] = None
+    heatmap_vln: HeatmapVLNLossConfig | None = None
     heatmap_weight: float = 1.0
     trajectory_weight: float = 0.0
 
@@ -240,14 +240,14 @@ class LossConfig(_Lenient):
 class TrainingStageConfig(_Lenient):
     name: str
     epochs: int
-    hm_size: List[int] = [64, 64]
+    hm_size: list[int] = [64, 64]
     heatmap_loss_type: str = "heatmap_vln"
-    train_heatmap: Optional[bool] = None
-    train_history: Optional[bool] = None
-    train_future: Optional[bool] = None
+    train_heatmap: bool | None = None
+    train_history: bool | None = None
+    train_future: bool | None = None
     train_action: bool = True
-    trainable_modules: List[str] = []
-    frozen_modules: List[str] = []
+    trainable_modules: list[str] = []
+    frozen_modules: list[str] = []
 
     @field_validator("epochs")
     @classmethod
@@ -258,7 +258,7 @@ class TrainingStageConfig(_Lenient):
 
 
 class TrainingConfig(_Strict):
-    stages: List[TrainingStageConfig]
+    stages: list[TrainingStageConfig]
 
 
 # --- GPU ---------------------------------------------------------------------
@@ -269,9 +269,9 @@ class MultiGPUConfig(_Lenient):
 
 
 class GPUConfig(_Lenient):
-    devices: List[int] = [0]
+    devices: list[int] = [0]
     backend: str = "nccl"
-    multi_gpu: Optional[MultiGPUConfig] = None
+    multi_gpu: MultiGPUConfig | None = None
 
 
 # --- Log / Notify ------------------------------------------------------------
@@ -289,7 +289,7 @@ class LogConfig(_Lenient):
     val_vis_batches: int = 2
     max_ckpts: int = 3
     use_tensorboard: bool = False
-    tensorboard_dir: Optional[str] = None
+    tensorboard_dir: str | None = None
     enable_timing: bool = False
     log_interval: int = 10
     show_gpu_memory: bool = False
@@ -297,8 +297,8 @@ class LogConfig(_Lenient):
     log_level: str = "INFO"
     diag_interval: int = 100
     mid_epoch_save_every: int = 500
-    epoch_boundary_cooldown_s: Optional[float] = None
-    notify: Optional[NotifyConfig] = None
+    epoch_boundary_cooldown_s: float | None = None
+    notify: NotifyConfig | None = None
 
 
 # --- Validation --------------------------------------------------------------
@@ -332,7 +332,7 @@ class TrainConfig(_Lenient):
 
 # --- Public API --------------------------------------------------------------
 
-def validate_config(cfg: Dict[str, Any]) -> TrainConfig:
+def validate_config(cfg: dict[str, Any]) -> TrainConfig:
     """Validate a raw config dict against the schema.
 
     Raises ``pydantic.ValidationError`` with a clear message listing all
@@ -341,13 +341,13 @@ def validate_config(cfg: Dict[str, Any]) -> TrainConfig:
     return TrainConfig.model_validate(cfg)
 
 
-def load_and_validate_config(config_path: Union[str, Path]) -> Dict[str, Any]:
+def load_and_validate_config(config_path: Union[str, Path]) -> dict[str, Any]:
     """Load a YAML config file and validate it.
 
     Returns the original dict (not the Pydantic model) so downstream
     code that expects ``Dict`` keeps working unchanged.
     """
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         cfg = yaml.safe_load(f)
     validate_config(cfg)
     return cfg
