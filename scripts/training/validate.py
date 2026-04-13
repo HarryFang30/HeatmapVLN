@@ -69,7 +69,6 @@ def validate(
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
-    stage_cfg.get('heatmap_loss_type', 'simplified')
 
     device = dist_context.device
 
@@ -275,7 +274,7 @@ def validate(
 
                             logger.info(f"[VAL-VIS] Epoch {epoch}, Batch {num_batches} visualization saved")
                 except Exception as e:
-                    logger.warning(f"Validation inference/visualization failed: {e}")
+                    logger.warning("Validation inference/visualization failed: %s", e, exc_info=True)
 
             del output, gt_heatmap
 

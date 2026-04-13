@@ -48,7 +48,6 @@ def build_model(cfg: dict, device: str) -> VLNPipeline:
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
-    model_cfg.get('action_head', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),

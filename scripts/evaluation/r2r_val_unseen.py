@@ -489,7 +489,7 @@ def load_model(args, device: torch.device):
     state_dict = ckpt.get(
         "model_state_dict", ckpt.get("trainable_state_dict", ckpt)
     )
-    if next(iter(state_dict.keys())).startswith("module."):
+    if state_dict and next(iter(state_dict.keys())).startswith("module."):
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(
@@ -716,7 +716,8 @@ def run_eval(args):
                         flush=True,
                     )
                 except Exception as e:
-                    print(f"  [heatmap] skipped: {e}", flush=True)
+                    import traceback
+                    print(f"  [heatmap] skipped: {e}\n{traceback.format_exc()}", flush=True)
 
             print(
                 f"  [debug] input_ids shape={inputs['input_ids'].shape}, "

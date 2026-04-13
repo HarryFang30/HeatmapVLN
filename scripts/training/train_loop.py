@@ -56,7 +56,7 @@ def train_one_epoch(
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler,
-    scaler: GradScaler,
+    scaler: GradScaler | None,
     cfg: dict,
     epoch: int,
     logger,

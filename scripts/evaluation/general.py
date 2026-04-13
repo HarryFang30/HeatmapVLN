@@ -144,7 +144,7 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
 
-    if next(iter(state_dict.keys())).startswith('module.'):
+    if state_dict and next(iter(state_dict.keys())).startswith('module.'):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -396,9 +396,6 @@ def evaluate(
         results['traj_ade'] = totals['traj_ade'] / counts['traj']
         results['traj_fde'] = totals['traj_fde'] / counts['traj']
         results['num_traj_samples'] = counts['traj']
-
-    # progress head removed — no progress metrics
-        results['num_progress_samples'] = counts['progress']
 
     return results
 

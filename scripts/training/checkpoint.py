@@ -2,6 +2,8 @@
 Checkpoint management: save, load, cleanup, and resume.
 """
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 
@@ -41,7 +43,7 @@ class CheckpointManager:
         metrics: dict,
         cfg: dict,
         is_best: bool = False,
-        scaler: GradScaler = None,
+        scaler: GradScaler | None = None,
         batch: int | None = None,
     ) -> Path:
         """Save checkpoint. ``batch`` being not None produces a mid-epoch save."""
@@ -123,9 +125,9 @@ class CheckpointManager:
 def load_checkpoint_for_resume(
     ckpt_path: str,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer = None,
+    optimizer: torch.optim.Optimizer | None = None,
     scheduler=None,
-    scaler: GradScaler = None,
+    scaler: GradScaler | None = None,
     logger=None,
 ) -> dict:
     """Load checkpoint for resume training."""

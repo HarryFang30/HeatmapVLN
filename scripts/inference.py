@@ -413,7 +413,8 @@ def main():
         logger.error(f"Config file not found: {args.config}")
         return
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
 
     # Default: output trajectory + progress
     if not args.output_heatmap and not args.output_trajectory and not args.output_progress:
@@ -434,7 +435,7 @@ def main():
         logger.info(f"Loading checkpoint from: {args.checkpoint}")
         ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
-        if next(iter(state_dict.keys())).startswith('module.'):
+        if state_dict and next(iter(state_dict.keys())).startswith('module.'):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         if missing_keys:

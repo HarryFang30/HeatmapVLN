@@ -453,9 +453,10 @@ def main():
 
     # GPU heatmap computer
     hm_size = tuple(cfg['data'].get('init_hm_size', [64, 64]))
+    img_size = tuple(cfg['data'].get('image_size', [640, 480]))
     gpu_heatmap_computer = GPUHeatmapComputer(
         hm_size=hm_size,
-        img_size=(640, 480),
+        img_size=(img_size[0], img_size[0]),
         device=str(device),
     )
 

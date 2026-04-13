@@ -16,7 +16,6 @@ import ctypes
 import gc
 import logging
 import os
-import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)

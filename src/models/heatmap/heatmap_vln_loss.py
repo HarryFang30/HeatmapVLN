@@ -15,7 +15,6 @@ Design principle:
 """
 
 
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -187,7 +186,7 @@ class HeatmapVLNLoss(nn.Module):
         pred_heatmaps: torch.Tensor,
         gt_vis: torch.Tensor,
         gt_heatmaps: torch.Tensor,
-        history_mask: Optional[torch.Tensor] = None,
+        history_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
