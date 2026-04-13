@@ -15,8 +15,6 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any
-
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -29,6 +27,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.training.model_builder import build_model
+from scripts.training.checkpoint import load_checkpoint_for_resume
+from scripts.training.collate import collate_fn
 from scripts.training.utils import load_config
 
 from src.data.factory import build_trajectory_dataset
@@ -46,51 +46,6 @@ def flatten_heatmap_slices(heatmaps: torch.Tensor) -> torch.Tensor:
     if heatmaps.dim() <= 3:
         return heatmaps
     return heatmaps.reshape(-1, heatmaps.shape[-2], heatmaps.shape[-1])
-
-
-def collate_fn(batch: list[dict]) -> dict[str, Any]:
-    """Collate function for VLNTrajectoryDataset (non-packing mode)."""
-    result = {
-        'history_frames': torch.stack([s['history_frames'] for s in batch], dim=0),
-        'current_frame': torch.stack([s['current_frame'] for s in batch], dim=0),
-        'heatmap': torch.stack([s['heatmap'] for s in batch], dim=0),
-        'action': torch.stack([s['action'] for s in batch], dim=0),
-        'action_valid': torch.tensor([s['action_valid'] for s in batch]),
-        'is_stop': torch.tensor([s.get('is_stop', 0.0) for s in batch]),
-        'text': [s['text'] for s in batch],
-    }
-
-    # Trajectory data
-    if 'trajectory' in batch[0]:
-        result['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
-        result['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
-        result['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
-    if 'current_views' in batch[0]:
-        result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
-    if 'history_panoramas' in batch[0]:
-        result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
-
-    return result
-
-
-def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, device: torch.device):
-    """Load checkpoint with partial loading support."""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
-
-    if state_dict and next(iter(state_dict.keys())).startswith('module.'):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-
-    logger.info(f"Loaded checkpoint: {checkpoint_path}")
-    logger.info(f"  Epoch: {ckpt.get('epoch', 'N/A')}  Stage: {ckpt.get('stage_name', 'N/A')}")
-    if missing_keys:
-        logger.info(f"  Missing keys (using pretrained): {len(missing_keys)}")
-    if unexpected_keys:
-        logger.warning(f"  Unexpected keys: {len(unexpected_keys)}")
-
-    return model
 
 
 def build_dataloader(
@@ -453,7 +408,7 @@ def main():
     # Build model
     logger.info("Building model...")
     model = build_model(cfg, device=args.device, verbose=False)
-    model = load_checkpoint(args.checkpoint, model, device)
+    load_checkpoint_for_resume(args.checkpoint, model, logger=logger)
     model = model.to(device)
     model.eval()
 

@@ -37,7 +37,8 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train import build_model
+from scripts.training.checkpoint import load_checkpoint_for_resume
+from scripts.training.model_builder import build_model
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -48,28 +49,6 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("eval_heatmap")
-
-
-def load_checkpoint(ckpt_path: str, model: torch.nn.Module, device: torch.device):
-    """加载 checkpoint（支持 trainable_state_dict 格式）"""
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', ckpt))
-
-    if isinstance(state_dict, dict) and len(state_dict) > 0:
-        first_key = next(iter(state_dict.keys()))
-        if first_key.startswith('module.'):
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-    epoch = ckpt.get('epoch', 'N/A')
-    stage = ckpt.get('stage_name', 'N/A')
-    best_val = ckpt.get('best_val_loss', 'N/A')
-
-    logger.info(f"Checkpoint loaded: epoch={epoch}, stage={stage}, best_val_loss={best_val}")
-    logger.info(f"  Loaded {len(state_dict)} params, missing={len(missing)}, unexpected={len(unexpected)}")
-
-    return model
 
 
 def should_use_gpu_gt(batch: dict[str, Any]) -> bool:
@@ -416,7 +395,7 @@ def main():
     # Build model
     logger.info("Building model...")
     model = build_model(cfg)
-    model = load_checkpoint(args.checkpoint, model, device)
+    load_checkpoint_for_resume(args.checkpoint, model, logger=logger)
     model = model.to(device)
     model.eval()
 
@@ -434,7 +413,7 @@ def main():
     packing_enabled = cfg['model']['llm'].get('enable_packing', False)
     if packing_enabled:
         raise ValueError("当前共享环境热力图评估不支持 sequence packing，请关闭 enable_packing。")
-    from scripts.train import collate_fn as train_collate_fn
+    from scripts.training.collate import collate_fn as train_collate_fn
     collate_fn = train_collate_fn
     actual_dataset = dataset
 

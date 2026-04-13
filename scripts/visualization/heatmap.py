@@ -20,8 +20,6 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any
-
 import matplotlib
 import numpy as np
 import torch
@@ -35,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from scripts.training.collate import collate_fn
 from scripts.training.model_builder import build_model
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -43,64 +42,6 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', date
 logger = logging.getLogger("visualize")
 
 VIEW_NAMES = ["Front", "Right", "Back", "Left"]
-
-
-# ==================== collate_fn ====================
-def collate_fn(batch: list[dict]) -> dict[str, Any]:
-    max_K = max(s['history_frames'].shape[0] for s in batch)
-
-    history_frames_padded = []
-    history_mask = []
-
-    for s in batch:
-        frames = s['history_frames']
-        K = frames.shape[0]
-        if max_K > K:
-            pad_size = max_K - K
-            pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
-            frames_padded = torch.cat([frames, pad_frames], dim=0)
-            mask = torch.cat([torch.ones(K), torch.zeros(pad_size)])
-        else:
-            frames_padded = frames
-            mask = torch.ones(K)
-        history_frames_padded.append(frames_padded)
-        history_mask.append(mask)
-
-    history_frames = torch.stack(history_frames_padded, dim=0)
-    history_mask = torch.stack(history_mask, dim=0)
-    current_frame = torch.stack([s['current_frame'] for s in batch], dim=0)
-    heatmap = torch.stack([s['heatmap'] for s in batch], dim=0)
-    action = torch.stack([s['action'] for s in batch], dim=0)
-    action_valid = torch.tensor([s['action_valid'] for s in batch])
-    is_stop = torch.tensor([s.get('is_stop', 0.0) for s in batch])
-    text = [s['text'] for s in batch]
-
-    result = {
-        'history_frames': history_frames,
-        'history_mask': history_mask,
-        'current_frame': current_frame,
-        'heatmap': heatmap,
-        'action': action,
-        'action_valid': action_valid,
-        'is_stop': is_stop,
-        'text': text,
-    }
-
-    if 'history_poses' in batch[0]:
-        result['history_poses'] = torch.stack([s['history_poses'] for s in batch], dim=0)
-        result['current_pose'] = torch.stack([s['current_pose'] for s in batch], dim=0)
-        result['has_depth'] = batch[0].get('has_depth', False)
-        if result['has_depth']:
-            result['current_depth'] = torch.stack([s['current_depth'] for s in batch], dim=0)
-        result['has_intrinsics'] = batch[0].get('has_intrinsics', False)
-        if result['has_intrinsics']:
-            result['intrinsics'] = torch.stack([s['intrinsics'] for s in batch], dim=0)
-    if 'current_views' in batch[0]:
-        result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
-    if 'history_panoramas' in batch[0]:
-        result['history_panoramas'] = torch.stack([s['history_panoramas'] for s in batch], dim=0)
-
-    return result
 
 
 # ==================== 4-View Panoramic Visualization ====================

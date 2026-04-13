@@ -95,4 +95,12 @@ def collate_fn(batch: list[dict]) -> dict[str, Any]:
             rel_poses_padded.append(rp)
         result['history_rel_poses'] = torch.stack(rel_poses_padded, dim=0)
 
+    if 'history_poses' in batch[0]:
+        result['history_poses'] = _pad_and_stack(batch, 'history_poses')
+        result['current_pose'] = torch.stack([s['current_pose'] for s in batch], dim=0)
+        if 'current_depth' in batch[0]:
+            result['current_depth'] = torch.stack([s['current_depth'] for s in batch], dim=0)
+        if 'intrinsics' in batch[0]:
+            result['intrinsics'] = torch.stack([s['intrinsics'] for s in batch], dim=0)
+
     return result
