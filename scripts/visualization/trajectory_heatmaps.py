@@ -30,6 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
+from src.data.factory import build_sliding_window_dataset
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 
@@ -599,21 +600,13 @@ def main() -> int:
     sw_cfg = cfg['data']['sliding_window']
 
     logger.info("Loading dataset...")
-    dataset = VLNSlidingWindowDataset(
+    dataset = build_sliding_window_dataset(
+        cfg, split=split,
         root=data_root,
-        split=split,
-        min_history=sw_cfg['min_history'],
-        num_history_sample=sw_cfg['num_history_sample'],
-        image_size=tuple(cfg['data']['image_size']),
-        hm_size=tuple(cfg['data']['init_hm_size']),
-        load_depth=sw_cfg.get('load_depth', True),
-        cache_poses=sw_cfg.get('cache_poses', True),
-        sample_stride=sw_cfg.get('sample_stride', 2),
         clip_level_sampling=False,
         samples_per_clip=sw_cfg.get('val_samples_per_clip', 2),
         enable_augmentation=False,
         defer_heatmap_to_gpu=False,
-        load_history_frames=sw_cfg.get('load_history_frames', True),
     )
 
     if not getattr(dataset, '_is_panoramic', False):

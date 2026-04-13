@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.data.vln_sliding_window_dataset import VLNTrajectoryDataset
+from src.data.factory import build_trajectory_dataset
 from scripts.training.utils import load_config
 
 logging.basicConfig(
@@ -163,33 +164,19 @@ def build_dataloader(
     split: str = 'val',
 ) -> DataLoader:
     """Build dataloader using VLNTrajectoryDataset."""
-    sw_cfg = cfg['data']['sliding_window']
-    traj_cfg = cfg['data'].get('trajectory', {})
-    
-    # Use trajectory dataset
-    base_dataset = VLNTrajectoryDataset(
-        root=cfg['data']['root'],
-        split=split,
-        min_history=sw_cfg['min_history'],
-        num_history_sample=traj_cfg.get('num_history_sample', sw_cfg['num_history_sample']),
-        image_size=tuple(cfg['data']['image_size']),
-        hm_size=tuple(cfg['data']['init_hm_size']),
-        sample_stride=sw_cfg.get('sample_stride', 5),
-        clip_level_sampling=False,  # Disable for evaluation
-        enable_augmentation=False,  # No augmentation for evaluation
+    dataset = build_trajectory_dataset(
+        cfg, split=split,
+        clip_level_sampling=False,
+        enable_augmentation=False,
     )
-    
-    dataset = base_dataset
-    actual_collate_fn = collate_fn
-    num_workers = 4
-    
+
     return DataLoader(
         dataset,
         batch_size=cfg['optim'].get('batch_size', 4),
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=4,
         pin_memory=True,
-        collate_fn=actual_collate_fn,
+        collate_fn=collate_fn,
     )
 
 

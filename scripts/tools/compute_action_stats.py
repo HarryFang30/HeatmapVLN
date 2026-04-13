@@ -16,6 +16,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
+from src.data.factory import build_sliding_window_dataset
 
 def compute_dataset_action_stats(config_path: str, margin: float = 0.1):
     """
@@ -42,17 +43,7 @@ def compute_dataset_action_stats(config_path: str, margin: float = 0.1):
     
     # 创建训练集
     print("正在加载训练集...")
-    train_dataset = VLNSlidingWindowDataset(
-        root=data_cfg['root'],
-        split='train',
-        min_history=sw_cfg['min_history'],
-        num_history_sample=sw_cfg['num_history_sample'],
-        image_size=tuple(data_cfg['image_size']),
-        hm_size=tuple(data_cfg['init_hm_size']),
-        load_depth=sw_cfg.get('load_depth', True),
-        cache_poses=sw_cfg.get('cache_poses', True),
-        sample_stride=sw_cfg.get('sample_stride', 1),
-    )
+    train_dataset = build_sliding_window_dataset(cfg, split='train')
     
     print(f"训练样本数: {len(train_dataset)}")
     print()

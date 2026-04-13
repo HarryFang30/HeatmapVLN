@@ -1,25 +1,37 @@
 """
-Data loading and preprocessing utilities for VLN datasets
-==========================================================
+Data loading and preprocessing utilities for VLN datasets.
 
-Active components:
-- vln_sliding_window_dataset: Core training dataset (滑动窗口)
-- packing_collator: Sequence Packing Collator（保留的旧实现，默认不用）
+Modules:
+- augmentation: Image augmentation transforms
+- heatmap_geometry: Pinhole projection and Gaussian heatmap rendering
+- trajectory_utils: Trajectory coordinate transforms and resampling
+- sliding_window_dataset: Core sliding-window dataset
+- trajectory_dataset: Multi-step trajectory prediction dataset
+- factory: Centralized dataset construction from config
 """
 
-# Training dataset classes
-from .vln_sliding_window_dataset import (
+from .sliding_window_dataset import (
     VLNSlidingWindowDataset,
-    create_sliding_window_dataloader
+    create_sliding_window_dataloader,
 )
-
-# Sequence Packing
+from .trajectory_dataset import (
+    VLNTrajectoryDataset,
+    create_trajectory_dataloader,
+)
+from .factory import (
+    build_dataset,
+    build_sliding_window_dataset,
+    build_trajectory_dataset,
+)
 from .packing_collator import PackingCollatorForVLN
 
 __all__ = [
-    # Training Datasets
     'VLNSlidingWindowDataset',
+    'VLNTrajectoryDataset',
     'create_sliding_window_dataloader',
-    # Sequence Packing
+    'create_trajectory_dataloader',
+    'build_dataset',
+    'build_sliding_window_dataset',
+    'build_trajectory_dataset',
     'PackingCollatorForVLN',
 ]

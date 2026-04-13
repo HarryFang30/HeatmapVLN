@@ -40,6 +40,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset
+from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
@@ -256,17 +257,9 @@ def main():
     sw_cfg = cfg['data']['sliding_window']
     defer_heatmap_to_gpu = sw_cfg.get('defer_heatmap_to_gpu', False)
 
-    val_dataset = VLNSlidingWindowDataset(
-        root=cfg['data']['root'],
+    val_dataset = build_sliding_window_dataset(
+        cfg,
         split=cfg['data'].get('val_split', 'val'),
-        min_history=sw_cfg['min_history'],
-        num_history_sample=sw_cfg['num_history_sample'],
-        image_size=tuple(cfg['data']['image_size']),
-        hm_size=tuple(cfg['data']['init_hm_size']),
-        load_depth=sw_cfg.get('load_depth', True),
-        cache_poses=sw_cfg.get('cache_poses', True),
-        sample_stride=sw_cfg.get('sample_stride', 2),
-        clip_level_sampling=sw_cfg.get('clip_level_sampling', True),
         samples_per_clip=sw_cfg.get('val_samples_per_clip', 2),
         defer_heatmap_to_gpu=defer_heatmap_to_gpu,
     )

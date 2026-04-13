@@ -79,6 +79,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.chec
 
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
+from src.data.factory import build_dataset
 from src.models.runtime_compat import ensure_transformers_runtime_compat
 from src.utils.logger import setup_logger
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -289,108 +290,32 @@ def main():
         logger.info(f"  Validation from separate root: {val_root_cfg} (split={cfg['data'].get('val_split', 'val')})")
     if dataset_type == 'trajectory':
         traj_cfg = cfg['data'].get('trajectory', cfg['data'].get('sliding_window', {}))
-        sample_stride = traj_cfg.get('sample_stride', 1)
-        clip_level_sampling = traj_cfg.get('clip_level_sampling', True)
-        samples_per_clip = traj_cfg.get('samples_per_clip', 8)
-        
-        random_subsequence = traj_cfg.get('random_subsequence', False)
-        min_subsequence_length = traj_cfg.get('min_subsequence_length', 30)
-        subsequence_samples_per_clip = traj_cfg.get('subsequence_samples_per_clip', 3)
-        
-        train_dataset = VLNTrajectoryDataset(
-            root=cfg['data']['root'],
-            split='train',
-            min_history=traj_cfg.get('min_history', 5),
-            num_history_sample=traj_cfg.get('num_history_sample', 8),
-            image_size=tuple(cfg['data']['image_size']),
-            hm_size=tuple(cfg['data']['init_hm_size']),
-            load_depth=traj_cfg.get('load_depth', True),
-            cache_poses=traj_cfg.get('cache_poses', True),
-            sample_stride=sample_stride,
-            clip_level_sampling=clip_level_sampling,
-            samples_per_clip=samples_per_clip,
-            random_subsequence=random_subsequence,
-            min_subsequence_length=min_subsequence_length,
-            subsequence_samples_per_clip=subsequence_samples_per_clip,
-            predict_horizon=traj_cfg.get('predict_horizon', 24),
-            action_scale=traj_cfg.get('action_scale', 4.0),
-            enable_trajectory_augmentation=traj_cfg.get('enable_trajectory_augmentation', True),
-            load_traj_images=traj_cfg.get('load_traj_images', False),
-            traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
-            use_subinstruction=traj_cfg.get('use_subinstruction', False),
-            fgr2r_subinstr_path=traj_cfg.get('fgr2r_subinstr_path', None),
-            panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
-        )
-        
+
+        train_dataset = build_dataset(cfg, split='train')
+
         val_root = cfg['data'].get('val_root')
         if val_root:
             val_split = cfg['data'].get('val_split', 'val')
-            val_samples_per_clip = traj_cfg.get('val_samples_per_clip', 2)
-            val_dataset = VLNTrajectoryDataset(
-                root=val_root,
-                split=val_split,
-                min_history=traj_cfg.get('min_history', 5),
-                num_history_sample=traj_cfg.get('num_history_sample', 8),
-                image_size=tuple(cfg['data']['image_size']),
-                hm_size=tuple(cfg['data']['init_hm_size']),
-                load_depth=traj_cfg.get('load_depth', True),
-                cache_poses=traj_cfg.get('cache_poses', True),
-                sample_stride=sample_stride,
-                clip_level_sampling=clip_level_sampling,
-                samples_per_clip=val_samples_per_clip,
+            val_dataset = build_dataset(
+                cfg, split=val_split, root=val_root,
+                samples_per_clip=traj_cfg.get('val_samples_per_clip', 2),
                 random_subsequence=False,
-                predict_horizon=traj_cfg.get('predict_horizon', 24),
-                action_scale=traj_cfg.get('action_scale', 4.0),
                 enable_trajectory_augmentation=False,
-                load_traj_images=traj_cfg.get('load_traj_images', False),
-                traj_image_size=tuple(traj_cfg.get('traj_image_size', [224, 224])),
                 use_subinstruction=False,
-                panoramic_vlm_input=traj_cfg.get('panoramic_vlm_input', True),
             )
         else:
             val_dataset = None
             logger.info("  No val_root configured, skipping validation dataset")
     else:
         sw_cfg = cfg['data']['sliding_window']
-        sample_stride = sw_cfg.get('sample_stride', 1)
-        clip_level_sampling = sw_cfg.get('clip_level_sampling', True)
-        samples_per_clip = sw_cfg.get('samples_per_clip', 2)
-        defer_heatmap_to_gpu = sw_cfg.get('defer_heatmap_to_gpu', False)
-        load_history_frames = sw_cfg.get('load_history_frames', True)
-        
-        train_dataset = VLNSlidingWindowDataset(
-            root=cfg['data']['root'],
-            split='train',
-            min_history=sw_cfg['min_history'],
-            num_history_sample=sw_cfg['num_history_sample'],
-            image_size=tuple(cfg['data']['image_size']),
-            hm_size=tuple(cfg['data']['init_hm_size']),
-            load_depth=sw_cfg.get('load_depth', True),
-            cache_poses=sw_cfg.get('cache_poses', True),
-            sample_stride=sample_stride,
-            clip_level_sampling=clip_level_sampling,
-            samples_per_clip=samples_per_clip,
-            defer_heatmap_to_gpu=defer_heatmap_to_gpu,
-            load_history_frames=load_history_frames,
-        )
-        
+
+        train_dataset = build_dataset(cfg, split='train')
+
         val_root = cfg['data'].get('val_root') or cfg['data']['root']
         val_split = cfg['data'].get('val_split', 'val')
-        val_samples_per_clip = sw_cfg.get('val_samples_per_clip', 2)
-        val_dataset = VLNSlidingWindowDataset(
-            root=val_root,
-            split=val_split,
-            min_history=sw_cfg['min_history'],
-            num_history_sample=sw_cfg['num_history_sample'],
-            image_size=tuple(cfg['data']['image_size']),
-            hm_size=tuple(cfg['data']['init_hm_size']),
-            load_depth=sw_cfg.get('load_depth', True),
-            cache_poses=sw_cfg.get('cache_poses', True),
-            sample_stride=sample_stride,
-            clip_level_sampling=clip_level_sampling,
-            samples_per_clip=val_samples_per_clip,
-            defer_heatmap_to_gpu=defer_heatmap_to_gpu,
-            load_history_frames=load_history_frames,
+        val_dataset = build_dataset(
+            cfg, split=val_split, root=val_root,
+            samples_per_clip=sw_cfg.get('val_samples_per_clip', 2),
         )
     
     if val_dataset is not None and hasattr(val_dataset, 'set_epoch'):
