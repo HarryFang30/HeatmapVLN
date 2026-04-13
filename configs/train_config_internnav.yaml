@@ -224,8 +224,9 @@ optim:
   min_lr: 1.0e-5
   # 全景输入: (8+1) × 4 views = 36 images/sample (原前视方案 11 images)
   # 48GB VRAM, gradient_checkpointing=true
-  # InternNav 论文单卡 batch=2, 这里 batch=8 已够大, 无需累积
-  batch_size: 8
+  # InternNav 论文单卡 batch=2
+  # batch=6 留出显存余量应对偶发的长序列 batch (ViT attention O(n²) 峰值)
+  batch_size: 6
   grad_accum_steps: 1
 
 # ============================================
