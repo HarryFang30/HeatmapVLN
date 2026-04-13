@@ -1,121 +1,141 @@
 # HeatmapVLN
 
-面向 Vision-Language Navigation（VLN）的训练与分析仓库，当前默认工作流聚焦：
+**Coarse-to-Fine Heatmap Generation for Vision-Language Navigation**
 
-- 基于 `Qwen2.5-VL / InternNav backbone` 的视觉语言特征提取
-- 基于 `HeatmapVLN v2` 的历史位置热力图预测
-- 基于 `InternNav System 1 / NextDiTActionHead` 的 32 步轨迹预测
+HeatmapVLN is a training and evaluation framework for Vision-Language Navigation (VLN) that combines spatial heatmap prediction with trajectory generation. It leverages a frozen Qwen2.5-VL backbone (fine-tuned via LoRA) to jointly predict where the agent has been (history heatmaps) and where it should go next (future trajectories).
 
-当前推荐使用的主配置：
+<p align="center">
+  <img src="assets/system2_achitecture.svg" alt="HeatmapVLN System 2 Architecture" width="90%">
+</p>
 
-- `configs/train_config_internnav.yaml`
+## Architecture
 
-旧版 `README.md` 中关于 Transformer/DDPM 轨迹头、进度头、静态架构图、根目录许可证等内容，已经不再代表当前仓库的默认状态；本文档只描述代码里目前真实存在且可直接核对的流程。
+The pipeline consists of three core components:
 
-## 当前默认方案
-
-| 组件 | 当前默认 |
-| --- | --- |
-| 主配置 | `configs/train_config_internnav.yaml` |
-| VLM 骨干 | `models/internnav_backbone` |
-| backbone 类型 | `qwen2_5_vl` |
-| Heatmap 头 | `HeatmapVLN v2` |
-| 轨迹头 | `NextDiTActionHead` |
-| 默认轨迹长度 | 32 steps |
-| 默认训练数据根目录 | `/workspace/r2r_panoramic_data` |
-| 默认输出目录 | `/root/autodl-tmp/vln_training_outputs` |
-| TensorBoard 目录 | `/root/tf-logs` |
-
-## 仓库结构
-
-```text
-HeatmapVLN/
-├── configs/                     # 训练配置
-├── scripts/                     # 训练、评估、推理、可视化、模型转换脚本
-├── src/
-│   ├── data/                    # 数据集与 collator
-│   ├── models/                  # VLNPipeline、Heatmap、NextDiT 等
-│   └── utils/                   # 日志、通知、可视化等工具
-├── docs/                        # 补充文档
-├── docker/                      # Docker 相关脚本与说明
-├── data/fgr2r/                  # FGR2R 原始说明与许可证
-└── models/                      # 本地模型目录
+```
+Panoramic input (4 views × N history + current) + Text instruction
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  Qwen2.5-VL  (frozen weights + selective    │
+│               LoRA on layers 5,6,12,13,     │
+│               19,20)                        │
+│                                             │
+│  Outputs:                                   │
+│   • ViT intermediate features (multi-layer) │
+│   • LLM intermediate features (multi-layer) │
+│   • Text-anchor hidden states               │
+│   • Trajectory hidden states (n_query=4)    │
+└──────────┬──────────────────────┬───────────┘
+           │                      │
+    ┌──────▼──────┐       ┌──────▼──────────┐
+    │ HeatmapVLN  │       │ NextDiT         │
+    │ (System 2)  │       │ (System 1)      │
+    │             │       │                 │
+    │ Coarse:     │       │ DINOv2 encoder  │
+    │  Trajectory │       │ + DiT denoiser  │
+    │  Guided     │       │ + Flow Matching │
+    │  Attention  │       │                 │
+    │ Fine:       │       │                 │
+    │  DPT-Lite   │       │                 │
+    │  Fusion     │       │                 │
+    └──────┬──────┘       └──────┬──────────┘
+           │                      │
+           ▼                      ▼
+    Visibility (N,4)        Trajectory (B,T,3)
+    Heatmap (N,4,64,64)     [dx, dy, dheading]
 ```
 
-主要入口脚本：
+| Component | Description | Trainable Params |
+|-----------|-------------|-----------------|
+| **Qwen2.5-VL** | Vision-language backbone (InternNav) | LoRA only (~2M) |
+| **HeatmapVLN v2** | Coarse-to-fine history heatmap prediction with DPT-Lite fusion | ~2M |
+| **NextDiT System 1** | Diffusion-based trajectory prediction (32 steps) from InternNav | ~24M (selective) |
 
-| 脚本 | 用途 |
-| --- | --- |
-| `scripts/run.py` | 推荐统一入口：`train / evaluate / visualize / inference` |
-| `scripts/train.py` | 训练兼容入口 |
-| `scripts/evaluate.py` | 评估兼容入口 |
-| `scripts/visualize.py` | 可视化兼容入口 |
-| `scripts/inference.py` | 推理兼容入口 |
-| `scripts/tools/convert_internnav_backbone.py` | 拆分 InternNav backbone / System 1 权重 |
-| `scripts/ops/monitor_gpu_idle.py` | GPU 空闲监控与飞书提醒 |
+## Repository Structure
 
-推荐优先使用统一风格：
+```
+HeatmapVLN/
+├── configs/                          # Training YAML configurations
+│   ├── train_config_internnav.yaml   # Default: Stage 2 selective fine-tuning
+│   ├── train_heatmap_config.yaml     # Stage 1: heatmap-only training
+│   └── ...
+├── scripts/
+│   ├── run.py                        # Unified CLI entrypoint
+│   ├── train.py                      # Training script
+│   ├── evaluate.py                   # Evaluation (general / heatmap / R2R)
+│   ├── visualize.py                  # Visualization (heatmap / trajectory)
+│   ├── inference.py                  # Single-clip inference
+│   ├── training/                     # Training loop, optimizer, checkpointing, etc.
+│   ├── evaluation/                   # Evaluation subroutines
+│   ├── visualization/                # Visualization subroutines
+│   ├── tools/                        # Weight conversion, action statistics
+│   └── ops/                          # GPU monitoring, Feishu notifications
+├── src/
+│   ├── data/                         # Dataset, collators, tokenization
+│   ├── models/
+│   │   ├── pipeline.py               # VLNPipeline (top-level assembly)
+│   │   ├── qwen2_5_vl/              # Qwen2.5-VL integration & LoRA
+│   │   ├── heatmap/                  # HeatmapVLN v2 (coarse-to-fine)
+│   │   └── action/                   # NextDiT action head, diffusion modules
+│   └── utils/                        # Logging, notifications, visualization
+├── models/                           # Local model weights directory
+├── docs/                             # Design documents, loss strategy, troubleshooting
+├── docker/                           # Dockerfile, docker-compose, launch script
+└── data/fgr2r/                       # FGR2R sub-instruction data & license
+```
 
-- `python scripts/run.py train ...`
-- `python scripts/run.py evaluate ...`
-- `python scripts/run.py visualize ...`
-- `python scripts/run.py inference ...`
+## Requirements
 
-## 环境要求
+- Python 3.11
+- PyTorch 2.7.0 with CUDA 12.8
+- transformers 4.51.0
+- 1+ NVIDIA GPU with >= 48 GB VRAM (A6000, A100, etc.)
 
-- Python `3.11`
-- PyTorch `2.7.0`
-- CUDA `12.8`
-- `transformers==4.51.0`
-- 默认注意力实现：`sdpa`
-
-安装示例：
+## Installation
 
 ```bash
 conda create -n heatmapvln python=3.11 -y
 conda activate heatmapvln
 
-pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+# Install PyTorch with CUDA 12.8
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Install remaining dependencies
 pip install -r requirements.txt
 ```
 
-说明：
+> **Note:** The default attention implementation is `sdpa`. Flash Attention is optional and only recommended in dedicated environments with compatible GLIBC. Sequence packing is currently disabled (`model.llm.enable_packing: false`).
 
-- 当前共享环境基线是 `transformers==4.51.0` + `numpy==1.26.4`。
-- 现有默认配置优先使用 `sdpa`，不要把旧文档中的 FlashAttention 视为默认前提。
-- 当前训练/评估路径不支持 `sequence packing`，请保持 `model.llm.enable_packing=false`。
+## Weight Preparation
 
-## 权重准备
+The default configuration requires three sets of pretrained weights:
 
-### 1. InternNav 路线（推荐）
+| Weight | Path | Source |
+|--------|------|--------|
+| InternNav Backbone | `models/internnav_backbone/` | Qwen2.5-VL fine-tuned by InternNav |
+| System 1 Weights | `models/internnav_system1.safetensors` | NextDiT trajectory head |
+| Depth Anything V2 | `models/depth_anything_v2_metric_hypersim_vits.pth` | DINOv2-vits depth encoder |
 
-默认配置依赖以下文件：
-
-- `models/internnav_backbone/`
-- `models/internnav_system1.safetensors`
-- `models/depth_anything_v2_metric_hypersim_vits.pth`
-
-如果你只有原始 InternNav 模型目录，可执行：
+If you have the original InternNav model directory, split it into backbone and System 1 weights:
 
 ```bash
 python scripts/tools/convert_internnav_backbone.py \
-  --src /workspace/InternNav_Model \
-  --backbone-dst models/internnav_backbone \
-  --system1-dst models/internnav_system1.safetensors
+    --src /path/to/InternNav_Model \
+    --backbone-dst models/internnav_backbone \
+    --system1-dst models/internnav_system1.safetensors
 ```
 
-注意：
+The Depth Anything V2 checkpoint must be obtained separately and placed at the configured path.
 
-- 当前仓库中的 `models/internnav_backbone/model.safetensors.index.json` 指向 `model-00001-of-00004.safetensors` 等分片；如果这些分片实际不存在，说明 backbone 还没有准备完整。
-- `convert_internnav_backbone.py` 只会生成 backbone 和 System 1；`Depth Anything v2` 权重仍需你自行放到配置指定位置。
+## Dataset Format
 
-## 数据集格式
+The dataset loader (`src/data/vln_sliding_window_dataset.py`) supports two storage layouts:
 
-`src/data/vln_sliding_window_dataset.py` 当前支持两类组织方式：
+### Split-based Layout (recommended)
 
-### 1. 标准 split 目录
-
-```text
+```
 <data_root>/
 ├── train/
 │   └── <scene_id>/
@@ -125,319 +145,243 @@ python scripts/tools/convert_internnav_backbone.py \
         └── clip_000000/
 ```
 
-### 2. 无 split 目录
+### Flat Layout (auto-split by scene hash)
 
-```text
+```
 <data_root>/
 └── <scene_id>/
     └── clip_000000/
 ```
 
-如果没有 `train/val_*` 层，dataset 会自动按 scene 做哈希切分。
+### Clip Structure
 
-### 单个 clip 的常见内容
+Each clip directory contains navigation data in either **frame** or **chunk** format:
 
-帧文件模式：
+<details>
+<summary><b>Frame format</b></summary>
 
-```text
+```
 clip_xxxxxx/
 ├── meta.json
 ├── poses.json
-├── intrinsics.json             # 可选
+├── intrinsics.json             # optional
 ├── rgb/
-│   ├── front/                  # 全景数据时使用
+│   ├── front/                  # panoramic 4-view
 │   ├── right/
 │   ├── back/
 │   └── left/
-├── depth/                      # 可选
-├── actions.npy
-└── discrete_actions.npy
+├── depth/                      # optional
+├── actions.npy                 # (N,) agent-local displacements
+└── discrete_actions.npy        # 0=STOP, 1=FWD, 2=LEFT, 3=RIGHT
 ```
 
-块文件模式：
+</details>
 
-```text
+<details>
+<summary><b>Chunk format</b></summary>
+
+```
 clip_xxxxxx/
 ├── meta.json
-├── intrinsics.json             # 可选
+├── intrinsics.json             # optional
 ├── chunks/
-│   └── chunk_*.npz
+│   └── chunk_*.npz             # batched frames
 ├── actions.npy
 └── discrete_actions.npy
 ```
 
-补充说明：
+</details>
 
-- `meta.json.storage_format` 可显式标记 `frames` 或 `chunks`；如果未写，dataset 会按是否存在 `chunks/` 自动判断。
-- 全景热力图链路要求 4 视角数据，dataset 会检测 `front/right/back/left` 或 chunk 内的 `rgb_front/rgb_right/rgb_back/rgb_left`。
-- `actions.npy[i]` 表示从 `frame[i]` 到 `frame[i+1]` 的 agent-local 位移。
-- `discrete_actions.npy` 约定为 `0=STOP, 1=MOVE_FORWARD, 2=TURN_LEFT, 3=TURN_RIGHT`。
+To enable FGR2R sub-instructions, set `data.trajectory.use_subinstruction: true` in the config and provide `data/fgr2r/subinstr_mapping.json.gz`.
 
-### FGR2R 子指令
+## Usage
 
-如果配置中开启：
-
-```yaml
-data:
-  trajectory:
-    use_subinstruction: true
-```
-
-则还需要准备：
-
-- `data/fgr2r/subinstr_mapping.json.gz`
-
-当前仓库只包含 `data/fgr2r/README.md` 和对应许可证说明，不包含这个映射文件本体。
-
-## 快速验证
-
-建议先做一次 dry-run：
+All commands are accessible through the unified entrypoint `scripts/run.py`:
 
 ```bash
+python scripts/run.py <command> [options]
+```
+
+### Quick Validation
+
+```bash
+# Dry run: build model and data pipeline without training
 python scripts/run.py train --config configs/train_config_internnav.yaml --dry-run
-```
 
-再做一个极小规模训练冒烟：
-
-```bash
+# Smoke test: run 2 batches for 1 epoch
 python scripts/run.py train \
-  --config configs/train_config_internnav.yaml \
-  --epochs 1 \
-  --max-batches 2
+    --config configs/train_config_internnav.yaml \
+    --epochs 1 --max-batches 2
 ```
 
-## 训练
+### Training
 
-### 默认 InternNav 训练
-
-```bash
-python scripts/run.py train --config configs/train_config_internnav.yaml
-```
-
-### 热力图专用训练
+**Stage 1 — Heatmap pretraining** (train spatial understanding via LoRA + HeatmapVLN):
 
 ```bash
 python scripts/run.py train --config configs/train_heatmap_config.yaml
 ```
 
-### 联合训练
-
-```bash
-python scripts/run.py train --config configs/train_config.yaml
-```
-
-### 自动续训
-
-```bash
-python scripts/run.py train --config configs/train_config_internnav.yaml --auto-resume
-```
-
-### 只加载权重，不恢复优化器状态
+**Stage 2 — Selective fine-tuning** (adapt System 1 trajectory head to the LoRA-modified backbone):
 
 ```bash
 python scripts/run.py train \
-  --config configs/train_config_internnav.yaml \
-  --load-weights /path/to/checkpoint.pth
+    --config configs/train_config_internnav.yaml \
+    --load-weights /path/to/stage1/checkpoints/best.pth
 ```
 
-### 多卡训练
+**Resume from checkpoint:**
+
+```bash
+python scripts/run.py train \
+    --config configs/train_config_internnav.yaml \
+    --auto-resume
+```
+
+**Multi-GPU training (DDP):**
 
 ```bash
 torchrun --nproc_per_node=2 scripts/run.py train \
-  --config configs/train_config_internnav.yaml \
-  --distributed
+    --config configs/train_config_internnav.yaml \
+    --distributed
 ```
 
-使用多卡时请同时确认：
-
-- `gpu.multi_gpu.enabled=true`
-- `WORLD_SIZE` 与 `torchrun` 启动参数一致
-
-### 当前默认训练策略
-
-`configs/train_config_internnav.yaml` 采用的是“桥接层适配”思路：
-
-- 训练 `heatmap_vln`
-- 训练 `latent_queries`
-- 训练 `cond_projector`
-- 训练 `llm_projector`
-- 训练 `lora`
-- 冻结 NextDiT System 1 核心模块
-
-这和旧 README 中“Transformer Decoder + DDPM 全量主路径”已经不是一回事。
-
-## 评估
-
-### 通用评估
+### Evaluation
 
 ```bash
+# General evaluation
 python scripts/run.py evaluate \
-  --config configs/train_config_internnav.yaml \
-  --checkpoint /path/to/best.pth \
-  --split val_unseen \
-  --save-vis
-```
+    --config configs/train_config_internnav.yaml \
+    --checkpoint /path/to/best.pth \
+    --split val_unseen --save-vis
 
-### 热力图专项评估
-
-```bash
+# Heatmap-specific evaluation
 python scripts/run.py evaluate heatmap \
-  --config configs/train_heatmap_config.yaml \
-  --checkpoint /path/to/best.pth \
-  --max-samples 200
+    --config configs/train_heatmap_config.yaml \
+    --checkpoint /path/to/best.pth \
+    --max-samples 200
+
+# R2R val_unseen evaluation
+python scripts/run.py evaluate r2r \
+    --config configs/train_config_internnav.yaml \
+    --checkpoint /path/to/best.pth
 ```
 
-说明：
-
-- `scripts/run.py evaluate` 不带子命令时执行通用评估。
-- `scripts/run.py evaluate heatmap` 执行热力图专项评估。
-- `scripts/run.py evaluate r2r` 执行 `val_unseen` 的 Habitat / R2R 评估。
-- 命令行里仍保留 `--eval-progress`，但当前脚本主体并不会实际产出 progress 指标，不应再把它视为成熟默认能力。
-
-## 推理与可视化
-
-### 1. 单视频 / 单 clip 轨迹推理
+### Inference
 
 ```bash
+# Single video
 python scripts/run.py inference \
-  --config configs/train_config_internnav.yaml \
-  --checkpoint /path/to/best.pth \
-  --video /path/to/video.mp4 \
-  --instruction "Go forward and turn right at the door" \
-  --output-dir ./outputs_inference
-```
+    --config configs/train_config_internnav.yaml \
+    --checkpoint /path/to/best.pth \
+    --video /path/to/video.mp4 \
+    --instruction "Go forward and turn right at the door" \
+    --output-dir ./outputs
 
-或：
-
-```bash
+# Single clip directory
 python scripts/run.py inference \
-  --config configs/train_config_internnav.yaml \
-  --checkpoint /path/to/best.pth \
-  --clip /path/to/clip_dir \
-  --output-dir ./outputs_inference
+    --config configs/train_config_internnav.yaml \
+    --checkpoint /path/to/best.pth \
+    --clip /path/to/clip_dir \
+    --output-dir ./outputs
 ```
 
-重要限制：
-
-- 当前 `scripts/run.py inference` 只接受单路视频/clip 帧。
-- 即使传入 `--output-heatmap`，脚本也无法为 HeatmapVLN v2 构造全景 `current_views/history_panoramas`，因此不能作为热力图推理入口。
-
-### 2. 4 视角热力图可视化
+### Visualization
 
 ```bash
+# 4-view heatmap visualization
 python scripts/run.py visualize heatmap \
-  --checkpoint /path/to/best.pth \
-  --num-samples 10 \
-  --output-dir ./vis_heatmap_4view
-```
+    --checkpoint /path/to/best.pth \
+    --num-samples 10 \
+    --output-dir ./vis_heatmap
 
-这个脚本会复用训练时的数据加载逻辑，更适合检查：
-
-- GT 热力图
-- 预测热力图
-- 可见性输出
-- 4 视角 overlay 效果
-
-### 3. 轨迹热力图时序可视化
-
-```bash
+# Temporal trajectory heatmap visualization
 python scripts/run.py visualize trajectory \
-  --checkpoint /path/to/best.pth \
-  --num-clips 3 \
-  --frames-per-clip 32 \
-  --output-dir ./vis_trajectory
+    --checkpoint /path/to/best.pth \
+    --num-clips 3 --frames-per-clip 32 \
+    --output-dir ./vis_trajectory
 ```
 
-补充说明：
+## Training Strategy
 
-- 该脚本要求数据集包含全景 4 视角。
-- 如果 clip 目录中存在 `topdown_trajectory.jpg` 和 `topdown_transform.json`，会额外渲染 BEV 俯视图。
+The default two-stage training strategy (see `configs/`):
 
-## 训练产物
+| Stage | Config | Trainable | Frozen |
+|-------|--------|-----------|--------|
+| **1. Heatmap** | `train_heatmap_config.yaml` | LoRA, HeatmapVLN, vis_head, llm_projector | VLM base, NextDiT |
+| **2. Trajectory** | `train_config_internnav.yaml` | cond_projector, latent_queries, traj_dit, action_enc/dec | VLM base, LoRA, DINOv2, memory_encoder, rgb_resampler |
 
-每次训练都会在 `log.out_dir` 下创建独立 run 目录，并维护 `latest` 软链接：
+Stage 2 uses a layered learning rate schedule:
+- Bridge layers (`cond_projector`, `latent_queries`): `1e-4`
+- Trajectory DiT: `5e-5` (conservative, pretrained initialization)
 
-```text
+## Training Outputs
+
+Each run creates an isolated directory under `log.out_dir` with a `latest` symlink:
+
+```
 run_YYYYMMDD_HHMMSS/
-├── manifest/
-├── logs/
-├── checkpoints/
-├── visualizations/
-├── plots/
-└── tensorboard/
+├── manifest/          # config snapshot, git state, environment info
+├── logs/              # train.log, metrics.jsonl
+├── checkpoints/       # epoch_XXX.pth, best.pth, latest.pth
+├── visualizations/    # train/ and val/ heatmap renders
+├── plots/             # training curves
+└── tensorboard/       # TensorBoard event files
 ```
 
-常用查看方式：
+Monitor training:
 
 ```bash
-tensorboard --logdir /root/tf-logs --port=6006
+tensorboard --logdir /root/tf-logs --port 6006
 ```
-
-详细说明见：
-
-- `docs/training_outputs.md`
-- `docs/loss.md`
-- `docs/heatmap_loss_strategy.md`
-- `docs/troubleshooting-guide.md`
-- `docs/HeatmapVLN完整设计.md`
 
 ## Docker
 
-仓库提供了 `docker/` 目录和启动菜单脚本：
+A Docker setup is available in `docker/`:
 
 ```bash
+# Build
+docker build -f docker/Dockerfile -t heatmapvln:latest .
+
+# Interactive session
+docker run --gpus all -it --rm \
+    -v /path/to/data:/workspace/r2r_panoramic_data \
+    -v /path/to/models:/workspace/HeatmapVLN/models \
+    --shm-size 8g -p 6006:6006 \
+    heatmapvln:latest
+
+# Or use the interactive launcher
 ./docker/docker-run.sh
 ```
 
-但要注意：
+## GPU Monitoring
 
-- `docker/` 目录中的部分脚本和说明仍沿用 `dataset_with_actions`、`vln_training_outputs` 等旧宿主目录命名。
-- 实际使用时，必须保证容器内路径和配置文件中的 `data.root`、`log.out_dir`、`log.tensorboard_dir` 对齐。
-- 如果你以 `configs/train_config_internnav.yaml` 为主，请优先围绕 `/workspace/r2r_panoramic_data` 来组织容器挂载。
-
-## 常见注意事项
-
-### 1. 飞书通知配置
-
-多个 YAML 配置里都启用了 `log.notify.enabled: true` 并带有 webhook 示例值。正式使用前请：
-
-- 替换为你自己的 webhook
-- 或直接关闭通知
-
-### 2. `monitor_gpu_idle.py` 的默认占卡脚本路径
-
-当前脚本默认占卡入口已经改成仓库内训练主入口：
-
-- `/workspace/HeatmapVLN/scripts/train.py`
-
-如果你要手动指定，也可以显式传入：
+The repository includes a GPU idle monitoring script with Feishu (Lark) webhook notifications:
 
 ```bash
 python scripts/ops/monitor_gpu_idle.py \
-  --occupy-script /workspace/HeatmapVLN/scripts/train.py
+    --gpus 0,1 \
+    --duration-sec 60 \
+    --interval-sec 5
 ```
 
-### 3. 旧 README 里提到的资源并不都还存在
+When idle GPUs are detected, it can optionally auto-launch training to occupy them.
 
-当前仓库中：
+## Documentation
 
-- 应以 `assets/achitecture.svg` 作为当前架构图
-- `assets/architecture.png` 不存在
-- 根目录 `LICENSE` 不存在
+Additional design and operational documentation is available in `docs/`:
 
-因此如果你要核对当前热力图主链路，请优先查看：
+| Document | Description |
+|----------|-------------|
+| `docs/loss.md` | Loss function design and component breakdown |
+| `docs/heatmap_loss_strategy.md` | Heatmap loss scheduling and temperature strategy |
+| `docs/training_outputs.md` | Training output directory structure |
+| `docs/troubleshooting-guide.md` | Common issues and solutions |
+| `docs/ReadBeforeEvaluatingHabitat.md` | Notes on Habitat-based R2R evaluation |
 
-- `assets/achitecture.svg`
-- `docs/HeatmapVLN完整设计.md`
+## License
 
-## 相关补充
-
-- `data/fgr2r/README.md`：FGR2R 原始数据说明
-- `data/fgr2r/LICENSE`：FGR2R 数据许可证
-
-如果后续你准备继续整理文档，优先建议同步检查：
-
-- `docker/DOCKER.md`
-- `docker/README.md`
-
-这两份文档仍保留了一些旧目录命名和旧命令示例。
+This project builds upon the following works:
+- [InternNav](https://github.com/) — Qwen2.5-VL backbone and System 1 trajectory head
+- [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) — DINOv2-based depth encoder
+- [FGR2R](https://github.com/) — Fine-grained R2R sub-instruction annotations (see `data/fgr2r/LICENSE`)
