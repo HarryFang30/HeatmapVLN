@@ -63,8 +63,8 @@ def train_one_epoch(
     global_step_offset: int = 0,
     stage_idx: int = 0,
     stage_name: str = "",
-    stage_cfg: Dict = None,
-    max_batches: int = None,
+    stage_cfg: Optional[Dict] = None,
+    max_batches: Optional[int] = None,
     vis_dir: Optional[Path] = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
     gpu_has_depth: bool = False,
@@ -500,7 +500,7 @@ def train_one_epoch(
                         vis_img = vis_img.transpose(2, 0, 1)
                         tb_writer.add_image('train/heatmap_viz', vis_img, global_step_offset + global_step)
                 except Exception:
-                    pass
+                    logger.debug("Failed to write visualization to TensorBoard", exc_info=True)
 
         _iter_loss = loss.item() * grad_accum_steps
         _iter_hm = heatmap_loss.item()

@@ -352,8 +352,8 @@ def main() -> None:
     parser.add_argument(
         "--occupy-script",
         type=Path,
-        default=Path("/workspace/train.py"),
-        help="占卡脚本路径（需支持 --gpu 0,1 这类参数），默认 /workspace/train.py",
+        default=repo_root / "scripts" / "train.py",
+        help="占卡脚本路径（需支持 --gpu 0,1 这类参数），默认 scripts/train.py",
     )
     parser.add_argument(
         "--occupy-args",

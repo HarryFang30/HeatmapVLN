@@ -101,7 +101,7 @@ class CheckpointManager:
             print(f"🗑️  Removed old checkpoint: {old_ckpt.name}")
 
     def load(self, ckpt_path: str) -> Dict:
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
         return ckpt
 
@@ -132,7 +132,7 @@ def load_checkpoint_for_resume(
     if logger:
         logger.info(f"📂 Loading checkpoint: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location='cpu')
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
     state_dict = ckpt.get('trainable_state_dict', {})
     if state_dict:

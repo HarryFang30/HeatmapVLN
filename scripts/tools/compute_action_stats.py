@@ -123,7 +123,7 @@ def compute_dataset_action_stats(config_path: str, margin: float = 0.1):
                 valid_count += 1
                 if sample['is_stop'] > 0.5:
                     stop_count += 1
-        except:
+        except Exception:
             continue
     
     if valid_count > 0:

@@ -62,13 +62,6 @@ except Exception:
     NextDiTActionHead = None
     NextDiTActionConfig = None
 
-# === Other Components ===
-try:
-    from .mlp import MLP
-except ImportError:
-    MLP = None
-
-
 __all__ = [
     'Qwen2_5VLIntegration',
     'Qwen2_5VLConfig',
@@ -83,5 +76,4 @@ __all__ = [
     'FeatureExtractor',
     'NextDiTActionHead',
     'NextDiTActionConfig',
-    'MLP',
 ]

@@ -72,9 +72,10 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
 warnings.filterwarnings("ignore", message="Asked to sample")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.checkpoint")
 
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
@@ -624,7 +625,7 @@ def main():
     if args.load_weights:
         weights_path = Path(args.load_weights)
         if weights_path.exists():
-            ckpt = torch.load(str(weights_path), map_location='cpu')
+            ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
             state_dict = ckpt.get('trainable_state_dict', {})
             if state_dict:
                 missing, unexpected, loaded_count = _load_normalized_state_dict(raw_model, state_dict)
@@ -986,8 +987,8 @@ def main():
         try:
             notifier.send_training_complete(
                 total_time=timer.get_total_elapsed() if timer else "N/A",
-                best_val_loss=best_val_loss if 'best_val_loss' in dir() else 0.0,
-                final_stage=stage_name if 'stage_name' in dir() else "完成",
+                best_val_loss=best_val_loss,
+                final_stage=stage_name,
             )
             logger.info("📢 飞书通知已发送: 训练完成")
         except Exception as e:

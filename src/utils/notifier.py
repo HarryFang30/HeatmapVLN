@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class FeishuNotifier:
     """飞书机器人通知器"""
     
-    def __init__(self, webhook_url: str = None, enabled: bool = True):
+    def __init__(self, webhook_url: Optional[str] = None, enabled: bool = True):
         """
         初始化飞书通知器
         
@@ -74,7 +74,7 @@ class FeishuNotifier:
         eta: str,
         epoch_time: str,
         is_best: bool = False,
-        best_val_loss: float = None,
+        best_val_loss: Optional[float] = None,
     ) -> bool:
         """发送 epoch 训练报告"""
         now = datetime.now().strftime('%H:%M:%S')
@@ -166,7 +166,7 @@ class FeishuNotifier:
         config_name: str,
         stages: list,
         total_epochs: int,
-        extra_info: Dict = None,
+        extra_info: Optional[Dict] = None,
     ) -> bool:
         """发送训练开始通知"""
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

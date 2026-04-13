@@ -1,17 +1,16 @@
 """
-VLN Project - Vision-Language Navigation with First-Person Inter-Frame Heatmap Generation
+HeatmapVLN — Vision-Language Navigation with Coarse-to-Fine Heatmap Generation
 
-This project implements a sophisticated VLN pipeline that generates first-person-view heatmaps
-showing spatial relationships between video frames, demonstrating the model's understanding
-of inter-frame spatial connections.
-
-Architecture:
-1. VGGT (3D encoder) processes all N_m frames for geometry extraction
-2. Space-aware sampling selects N_k informative keyframes using geometry
-3. Dual-path processing: 3D features from VGGT + 2D features from DINOv3
-4. MLP fusion creates mixed spatial-semantic features
-5. LLM processes features + instructions for spatial reasoning
-6. Heatmap generation with cross-frame spatial projection
+Architecture (v2 — Qwen2.5-VL + HeatmapVLN + NextDiT System 1):
+    Current panorama (4 views) + N history panoramas + text instruction
+        |
+    Qwen2.5-VL (Vision Encoder + LLM, frozen + LoRA)
+        |
+    ├── HeatmapVLN (Coarse-to-Fine localization)
+    │       → visibility prediction + 64×64 heatmap
+    │
+    └── NextDiT System 1 (InternNav action head)
+            → trajectory (B, T, 3)
 """
 
 __version__ = "0.1.0"

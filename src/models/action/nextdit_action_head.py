@@ -175,7 +175,7 @@ class NextDiTActionHead(nn.Module):
             f = safe_open(ckpt_path, framework="pt", device="cpu")
             ckpt_sd = {k: f.get_tensor(k) for k in f.keys()}
         else:
-            ckpt_sd = torch.load(ckpt_path, map_location="cpu")
+            ckpt_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         current_sd = self.state_dict()
         loaded_sd: Dict[str, torch.Tensor] = {}
@@ -238,7 +238,7 @@ class NextDiTActionHead(nn.Module):
         if ckpt_path:
             ckpt_file = Path(ckpt_path)
             if ckpt_file.is_file():
-                state_dict = torch.load(str(ckpt_file), map_location="cpu")
+                state_dict = torch.load(str(ckpt_file), map_location="cpu", weights_only=False)
                 dav2_model.load_state_dict(state_dict)
                 logger.info("Loaded DepthAnythingV2 weights from %s", ckpt_file)
             else:
