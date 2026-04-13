@@ -3,25 +3,16 @@ training — modular training utilities for HeatmapVLN.
 
 Re-exports every public symbol so ``from scripts.training import X`` works
 from the repository entrypoints.
+
+Uses ``__getattr__`` for lazy loading so that importing the package does
+not pull in heavy dependencies (tqdm, transformers, etc.) unless the
+caller actually accesses a symbol that needs them.
 """
 
-from .checkpoint import (
-    CheckpointManager,
-    load_checkpoint_for_resume,
-)
+import importlib
+
+# Lightweight modules — always imported eagerly (no heavy deps)
 from .collate import collate_fn
-from .distributed import (
-    DistributedContext,
-    _dist_all_reduce_in_place,
-    _dist_barrier,
-    _dist_broadcast_in_place,
-    _get_supported_trainable_sync_modules,
-    cleanup_distributed,
-    init_distributed_context,
-    initialize_trainable_module_sync,
-    synchronize_trainable_module_gradients,
-)
-from .ema import EMAModel, _EMAContext
 from .manifest import (
     _append_jsonl,
     _capture_env_state,
@@ -44,21 +35,6 @@ from .memory import (
     _malloc_trim,
     _worker_init_fn,
 )
-from .model_builder import (
-    apply_nextdit_warmup_freeze,
-    build_model,
-    end_nextdit_warmup,
-    freeze_module,
-    set_trainable_modules,
-)
-from .optimizer import (
-    build_optimizer,
-    build_scheduler,
-    get_heatmap_temperature,
-)
-from .plotter import TrainingPlotter
-from .timer import TrainingTimer
-from .train_loop import train_one_epoch
 from .utils import (
     _dist_backend,
     _dist_is_initialized,
@@ -76,9 +52,53 @@ from .utils import (
     safe_torch_load,
     set_seed,
 )
-from .validate import validate
-from .visualization import (
-    _select_primary_heatmap_slice,
-    _should_use_gpu_gt,
-    visualize_heatmap_predictions,
-)
+
+# Heavy modules — loaded lazily via __getattr__ to avoid importing
+# tqdm, transformers, psutil, cv2, matplotlib at package import time.
+_LAZY_MODULES = {
+    # checkpoint.py
+    "CheckpointManager": "checkpoint",
+    "load_checkpoint_for_resume": "checkpoint",
+    # distributed.py
+    "DistributedContext": "distributed",
+    "_dist_all_reduce_in_place": "distributed",
+    "_dist_barrier": "distributed",
+    "_dist_broadcast_in_place": "distributed",
+    "_get_supported_trainable_sync_modules": "distributed",
+    "cleanup_distributed": "distributed",
+    "init_distributed_context": "distributed",
+    "initialize_trainable_module_sync": "distributed",
+    "synchronize_trainable_module_gradients": "distributed",
+    # ema.py
+    "EMAModel": "ema",
+    "_EMAContext": "ema",
+    # model_builder.py
+    "apply_nextdit_warmup_freeze": "model_builder",
+    "build_model": "model_builder",
+    "end_nextdit_warmup": "model_builder",
+    "freeze_module": "model_builder",
+    "set_trainable_modules": "model_builder",
+    # optimizer.py
+    "build_optimizer": "optimizer",
+    "build_scheduler": "optimizer",
+    "get_heatmap_temperature": "optimizer",
+    # plotter.py
+    "TrainingPlotter": "plotter",
+    # timer.py
+    "TrainingTimer": "timer",
+    # train_loop.py
+    "train_one_epoch": "train_loop",
+    # validate.py
+    "validate": "validate",
+    # visualization.py
+    "_select_primary_heatmap_slice": "visualization",
+    "_should_use_gpu_gt": "visualization",
+    "visualize_heatmap_predictions": "visualization",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_MODULES:
+        module = importlib.import_module(f".{_LAZY_MODULES[name]}", __name__)
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
