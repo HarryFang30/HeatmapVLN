@@ -192,7 +192,6 @@ class ConditionalUnet1D(nn.Module):
 
         down_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
-            ind >= (len(in_out) - 1)
             down_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
                     dim_in, dim_out, cond_dim=cond_dim,
@@ -208,7 +207,6 @@ class ConditionalUnet1D(nn.Module):
 
         up_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            ind >= (len(in_out) - 1)
             up_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
                     dim_out * 2, dim_in, cond_dim=cond_dim,

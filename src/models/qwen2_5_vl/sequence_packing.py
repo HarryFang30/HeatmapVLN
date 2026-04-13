@@ -4,6 +4,7 @@ Sequence packing module (legacy, disabled on the current Qwen2.5-VL stack).
 This module is kept for reference but is not part of the active training path.
 """
 
+import itertools
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass

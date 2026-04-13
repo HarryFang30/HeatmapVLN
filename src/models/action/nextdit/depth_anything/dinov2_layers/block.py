@@ -99,7 +99,7 @@ class Block(nn.Module):
             )
         elif self.training and self.sample_drop_ratio > 0.0:
             x = x + self.drop_path1(attn_residual_func(x))
-            x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
+            x = x + self.drop_path2(ffn_residual_func(x))
         else:
             x = x + attn_residual_func(x)
             x = x + ffn_residual_func(x)
@@ -225,7 +225,7 @@ class NestedTensorBlock(Block):
                 x_list,
                 residual_func=ffn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
-                scaling_vector=self.ls2.gamma if isinstance(self.ls1, LayerScale) else None,
+                scaling_vector=self.ls2.gamma if isinstance(self.ls2, LayerScale) else None,
             )
             return x_list
         else:

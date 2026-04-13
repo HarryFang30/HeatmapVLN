@@ -341,8 +341,12 @@ class CombinedNavigationLoss(nn.Module):
             pred_validity: 有效性预测
             gt_validity: GT 有效性
         """
-        # 热力图损失
-        if pred_validity is not None and gt_validity is not None:
+        # 热力图损失 — 仅当 heatmap_loss 支持 validity 参数时才传入
+        import inspect
+        _sig = inspect.signature(self.heatmap_loss.forward)
+        _supports_validity = len(_sig.parameters) > 3
+
+        if _supports_validity and pred_validity is not None and gt_validity is not None:
             hm_loss, hm_dict = self.heatmap_loss(
                 pred_heatmap, gt_heatmap, pred_validity, gt_validity
             )
@@ -414,13 +418,7 @@ class NeRFRippleHeatmapLoss(nn.Module):
         self.lambda_peak = lambda_peak
         self.fft_weight_decay = fft_weight_decay
 
-        # Laplacian kernel for ripple detection
-        laplacian_kernel = torch.tensor([
-            [0, 1, 0],
-            [1, -4, 1],
-            [0, 1, 0]
-        ], dtype=torch.float32).view(1, 1, 3, 3)
-        self.register_buffer('laplacian_kernel', laplacian_kernel)
+
 
         # Sobel for gradient
         sobel_x = torch.tensor([

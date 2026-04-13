@@ -270,7 +270,6 @@ class TransformerActionHead(nn.Module):
             noise_pred: (B, T, action_dim) 预测的噪声
         """
         device = sample.device
-        sample.shape[0]
 
         # 1. 处理时间步（对齐 InternNav）
         timesteps = timestep

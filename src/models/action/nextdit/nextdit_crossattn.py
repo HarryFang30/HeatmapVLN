@@ -1,6 +1,6 @@
 
 import torch
-from diffusers.models.embeddings import get_2d_rotary_pos_embed_lumina
+
 from transformers import PretrainedConfig, PreTrainedModel
 
 from .nextdit_traj import LuminaNextDiT2DModel
@@ -75,12 +75,6 @@ class NextDiTCrossAttn(PreTrainedModel):
             for m in self.model.modules():
                 if hasattr(m, "gradient_checkpointing"):
                     m.gradient_checkpointing = True
-
-        self.freqs_cis = get_2d_rotary_pos_embed_lumina(
-            config.dim // config.n_heads,
-            384,
-            384,
-        )
 
     def forward(self, x, timestep, z_latents, **kwargs):
         model_pred = self.model(

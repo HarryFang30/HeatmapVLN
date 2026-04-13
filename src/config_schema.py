@@ -8,20 +8,17 @@ Usage::
 
     from src.config_schema import validate_config, load_and_validate_config
 
-    cfg = validate_config(raw_dict)          # dict -> validated dict
-    cfg = load_and_validate_config("x.yaml") # path -> validated dict
+    cfg = validate_config(raw_dict)          # dict -> TrainConfig
+    cfg = load_and_validate_config("x.yaml") # path -> validated dict (original)
 """
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any, Union
 
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator
-
-logger = logging.getLogger(__name__)
 
 
 class _Strict(BaseModel):
@@ -347,7 +344,11 @@ def load_and_validate_config(config_path: Union[str, Path]) -> dict[str, Any]:
     Returns the original dict (not the Pydantic model) so downstream
     code that expects ``Dict`` keeps working unchanged.
     """
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(
+            f"Expected a YAML mapping at top level, got {type(cfg).__name__}"
+        )
     validate_config(cfg)
     return cfg

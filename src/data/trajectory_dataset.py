@@ -173,7 +173,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
     def _compute_pixel_goal(
         current_pose: np.ndarray,
         goal_pose: np.ndarray,
-        img_size: int = 256,
+        img_size: int | tuple[int, int] = 256,
         depth_map: np.ndarray | None = None,
         depth_tolerance: float = 0.5,
     ) -> list[int] | None:
@@ -189,6 +189,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         returned.
 
         Args:
+            img_size: scalar (square) or (width, height) tuple.
             depth_map: (H, W) depth in metres.  Values <= 0 are treated
                 as invalid / infinite depth (no occlusion).
             depth_tolerance: margin in metres — the goal is accepted if
@@ -198,6 +199,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             [u, v] integer pixel coordinates, or ``None`` if the goal
             is behind the camera, outside the image, or occluded.
         """
+        if isinstance(img_size, (tuple, list)):
+            img_w, img_h = int(img_size[0]), int(img_size[1])
+        else:
+            img_w = img_h = int(img_size)
+
         T_inv = np.linalg.inv(np.asarray(current_pose, dtype=np.float64))
         goal_world = np.array([
             goal_pose[0, 3], goal_pose[1, 3], goal_pose[2, 3], 1.0,
@@ -209,17 +215,19 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             return None
 
         z_depth = -z
-        f = img_size / 2.0
-        c = img_size / 2.0
+        fx = img_w / 2.0
+        fy = img_h / 2.0
+        cx = img_w / 2.0
+        cy = img_h / 2.0
 
-        u_f = f * x / z_depth + c
-        v_f = f * (-y) / z_depth + c
+        u_f = fx * x / z_depth + cx
+        v_f = fy * (-y) / z_depth + cy
 
-        if u_f < 0 or u_f >= img_size or v_f < 0 or v_f >= img_size:
+        if u_f < 0 or u_f >= img_w or v_f < 0 or v_f >= img_h:
             return None
 
-        u = max(0, min(img_size - 1, round(u_f)))
-        v = max(0, min(img_size - 1, round(v_f)))
+        u = max(0, min(img_w - 1, round(u_f)))
+        v = max(0, min(img_h - 1, round(v_f)))
 
         if depth_map is not None:
             dm = depth_map
@@ -476,16 +484,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             current_depth = self._load_depth(clip_dir, current_t)
 
             # 7. 计算热力图
-            intrinsics_path = clip_dir / "intrinsics.json"
-            K = None
-            if intrinsics_path.exists():
-                with open(intrinsics_path) as f:
-                    intrinsics = json.load(f)
-                img_size = (intrinsics["width"], intrinsics["height"])
-                if "K" in intrinsics:
-                    K = np.array(intrinsics["K"], dtype=np.float32)
-            else:
-                img_size = (640, 480)
+            img_size, K = self._load_intrinsics(clip_idx, clip_dir)
 
             hm_w, hm_h = self.hm_size
 
@@ -566,7 +565,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 try:
                     goal_img = self._load_traj_image_raw(clip_dir, goal_frame_idx, direction=traj_view)
                     curr_img = self._load_traj_image_raw(clip_dir, current_t, direction=traj_view)
-                except Exception:
+                except (FileNotFoundError, ValueError, KeyError, OSError):
                     th, tw = self.traj_image_size[1], self.traj_image_size[0]
                     goal_img = np.zeros((th, tw, 3), dtype=np.uint8)
                     curr_img = np.zeros((th, tw, 3), dtype=np.uint8)

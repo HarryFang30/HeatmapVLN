@@ -1142,10 +1142,10 @@ class VLNSlidingWindowDataset(Dataset):
 
             # 8. 加载连续动作
             actions = self._load_actions(clip_dir)
+            discrete_actions = self._load_discrete_actions(clip_dir)
             if actions is not None and current_t < len(actions):
                 action = actions[current_t]
                 if current_t == T - 1:
-                    discrete_actions = self._load_discrete_actions(clip_dir)
                     is_last_frame_stop = (discrete_actions is not None and
                                           current_t < len(discrete_actions) and
                                           int(discrete_actions[current_t]) == 0)
@@ -1159,7 +1159,6 @@ class VLNSlidingWindowDataset(Dataset):
             action_tensor = torch.from_numpy(action.astype(np.float32))
 
             # 9. 加载离散动作（用于 Stop Prediction）
-            discrete_actions = self._load_discrete_actions(clip_dir)
             if discrete_actions is not None and current_t < len(discrete_actions):
                 discrete_action = int(discrete_actions[current_t])
                 is_stop = 1.0 if discrete_action == 0 else 0.0

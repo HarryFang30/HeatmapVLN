@@ -1049,7 +1049,7 @@ class Qwen2_5VLIntegration(nn.Module):
         current_frame: torch.Tensor,
         instruction: Union[str, list[str]] | None = None,
         return_hidden_states: bool = True,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, None]:
         """
         Batch forward by processing each sample individually and stacking.
         Qwen2.5-VL's internal position ID computation does not handle
@@ -1087,7 +1087,7 @@ class Qwen2_5VLIntegration(nn.Module):
         current_frame: torch.Tensor,
         instruction: str | None = None,
         return_hidden_states: bool = True,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, None]:
         """
         Forward pass for a single sample.
 
@@ -1150,7 +1150,6 @@ class Qwen2_5VLIntegration(nn.Module):
         if not self._model_loaded:
             self._load_model()
 
-        current_views.shape[0] if current_views is not None else history_frames.shape[0]
         traj_hidden_states = None
 
         if panoramic_inputs is not None:

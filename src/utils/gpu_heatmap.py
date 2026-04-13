@@ -117,9 +117,6 @@ class GPUHeatmapComputer:
             img_w = int(cx * 2)
             img_h = int(cy * 2)
 
-        # Extract fx for sigma computation
-        K_mat[:, 0, 0]  # [B]
-
         # Compute inverse of current poses: T_current_inv [B, 4, 4]
         T_current_inv = torch.linalg.inv(current_poses)  # [B, 4, 4]
 

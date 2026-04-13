@@ -218,13 +218,14 @@ def create_html_index(
     for sample in samples_info:
         # Generate grid links based on overlay_mode
         grid_links = []
-        if 'dual' in sample['grid_paths']:
+        grid_paths = sample.get('grid_paths', {})
+        if 'dual' in grid_paths:
             grid_links.append(f'<a href="{sample["grid_paths"]["dual"]}" target="_blank">View Grid (Dual)</a>')
-        if 'history' in sample['grid_paths']:
+        if 'history' in grid_paths:
             grid_links.append(f'<a href="{sample["grid_paths"]["history"]}" target="_blank" class="secondary">History Grid</a>')
-        if 'future' in sample['grid_paths']:
+        if 'future' in grid_paths:
             grid_links.append(f'<a href="{sample["grid_paths"]["future"]}" target="_blank" class="secondary">Future Grid</a>')
-        if 'full' in sample['grid_paths']:
+        if 'full' in grid_paths:
             grid_links.append(f'<a href="{sample["grid_paths"]["full"]}" target="_blank">Full Grid (7-col)</a>')
 
         links_html = '\n                '.join(grid_links)

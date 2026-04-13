@@ -56,14 +56,13 @@ def interpolate_keyframe_predictions(
 
             # Create interpolation function
             if method == 'cubic' and K >= 4:
-                f = interp1d(keyframe_indices, pixel_values, kind='cubic',
-                           bounds_error=False, fill_value='extrapolate')
-            elif method == 'linear':
-                f = interp1d(keyframe_indices, pixel_values, kind='linear',
-                           bounds_error=False, fill_value='extrapolate')
-            else:  # nearest
-                f = interp1d(keyframe_indices, pixel_values, kind='nearest',
-                           bounds_error=False, fill_value='extrapolate')
+                kind = 'cubic'
+            elif method in ('cubic', 'linear'):
+                kind = 'linear'
+            else:
+                kind = 'nearest'
+            f = interp1d(keyframe_indices, pixel_values, kind=kind,
+                         bounds_error=False, fill_value='extrapolate')
 
             # Interpolate to all frames
             target_indices = np.arange(total_frames)

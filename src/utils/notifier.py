@@ -39,7 +39,6 @@ class FeishuNotifier:
             return False
 
         try:
-            import urllib.error
             import urllib.request
 
             data = json.dumps(content).encode('utf-8')
@@ -66,8 +65,8 @@ class FeishuNotifier:
         epoch: int,
         total_epochs: int,
         stage_name: str,
-        stage_idx: int,
-        total_stages: int,
+        stage_idx: int,  # reserved for future use
+        total_stages: int,  # reserved for future use
         train_metrics: dict[str, float],
         val_metrics: dict[str, float],
         eta: str,
@@ -93,7 +92,7 @@ class FeishuNotifier:
         val_prog = val_metrics.get('val_stop_loss', 0)
 
         # 进度条
-        progress_pct = epoch / total_epochs * 100
+        progress_pct = (epoch / total_epochs * 100) if total_epochs > 0 else 0
         progress_bar = "█" * int(progress_pct / 10) + "░" * (10 - int(progress_pct / 10))
 
         # 构建消息内容
@@ -258,7 +257,7 @@ class FeishuNotifier:
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         location = stage or 'Unknown'
-        if epoch:
+        if epoch is not None:
             location += f" (Epoch {epoch})"
 
         content = {

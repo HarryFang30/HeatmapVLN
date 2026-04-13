@@ -18,16 +18,13 @@ Architecture:
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from .heatmap import HeatmapVLN
 from .qwen2_5_vl import Qwen2_5VLConfig, Qwen2_5VLIntegration
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -639,7 +636,7 @@ class VLNPipeline(nn.Module):
         """Forward pass with packed batch."""
         batch_size = packed_batch["num_samples"]
         seq_lens = packed_batch["seq_lens"]
-        packed_batch["current_frame"].to(self.device)
+        packed_batch["current_frame"] = packed_batch["current_frame"].to(self.device)
 
         # ==================== Step 1: VLM backbone processing (Packed) ====================
         qwen_output = self.qwen2_5_vl.forward_packed(

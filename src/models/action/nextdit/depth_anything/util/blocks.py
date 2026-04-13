@@ -74,9 +74,6 @@ class ResidualConvUnit(nn.Module):
         if self.bn:
             out = self.bn2(out)
 
-        if self.groups > 1:
-            out = self.conv_merge(out)
-
         return self.skip_add.add(out, x)
 
 

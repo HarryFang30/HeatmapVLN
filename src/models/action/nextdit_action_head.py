@@ -170,8 +170,8 @@ class NextDiTActionHead(nn.Module):
         logger.info("Loading System 1 pretrained weights from %s", ckpt_path)
 
         if ckpt_path.endswith(".safetensors"):
-            f = safe_open(ckpt_path, framework="pt", device="cpu")
-            ckpt_sd = {k: f.get_tensor(k) for k in f}
+            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+                ckpt_sd = {k: f.get_tensor(k) for k in f}
         else:
             ckpt_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 

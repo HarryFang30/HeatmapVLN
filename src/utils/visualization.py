@@ -123,7 +123,10 @@ def create_comparison_grid(
             gt_val_hist_np, gt_val_fut_np,
             grid_path, alpha, threshold
         )
-        paths['dual'] = str(grid_path.relative_to(save_dir.parent.parent))
+        try:
+            paths['dual'] = str(grid_path.relative_to(save_dir.parent.parent))
+        except ValueError:
+            paths['dual'] = str(grid_path)
 
     elif overlay_mode == 'separate':
         # Generate two separate grids
@@ -141,8 +144,12 @@ def create_comparison_grid(
             alpha, threshold, cv2.COLORMAP_HOT
         )
 
-        paths['history'] = str(hist_path.relative_to(save_dir.parent.parent))
-        paths['future'] = str(fut_path.relative_to(save_dir.parent.parent))
+        try:
+            paths['history'] = str(hist_path.relative_to(save_dir.parent.parent))
+            paths['future'] = str(fut_path.relative_to(save_dir.parent.parent))
+        except ValueError:
+            paths['history'] = str(hist_path)
+            paths['future'] = str(fut_path)
 
     elif overlay_mode == 'full-separate':
         # Generate 7-column grid (RGB | Hist GT | Hist Pred | Hist Diff | Fut GT | Fut Pred | Fut Diff)
@@ -153,7 +160,10 @@ def create_comparison_grid(
             gt_val_hist_np, gt_val_fut_np,
             grid_path, alpha, threshold
         )
-        paths['full'] = str(grid_path.relative_to(save_dir.parent.parent))
+        try:
+            paths['full'] = str(grid_path.relative_to(save_dir.parent.parent))
+        except ValueError:
+            paths['full'] = str(grid_path)
 
     return paths
 
