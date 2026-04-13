@@ -174,9 +174,19 @@ def _format_decode_internal_timing(stats: Dict[str, float], count: int) -> str:
 # Config / seed
 # ---------------------------------------------------------------------------
 
-def load_config(config_path: str) -> Dict:
+def load_config(config_path: str, validate: bool = True) -> Dict:
+    """Load a YAML config file, optionally validating against the schema.
+
+    When *validate* is True (default), typos and type errors in the
+    config are caught immediately at startup instead of causing cryptic
+    ``KeyError`` deep in the training loop.
+    """
     with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    if validate:
+        from src.config_schema import validate_config
+        validate_config(cfg)
+    return cfg
 
 
 def safe_torch_load(
