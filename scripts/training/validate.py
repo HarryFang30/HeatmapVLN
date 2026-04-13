@@ -2,15 +2,19 @@
 Validation loop.
 """
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import cv2
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from torch.utils.tensorboard import SummaryWriter
 
 from src.models.pipeline import VLNPipeline
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -262,6 +266,7 @@ def validate(
 
                         if vis_path is not None:
                             if tb_writer is not None:
+                                import cv2
                                 vis_img = cv2.imread(str(vis_path))
                                 if vis_img is not None:
                                     vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)

@@ -20,6 +20,7 @@ include = ["src*", "scripts*"]
 target-version = "py311"
 line-length = 120
 src = ["src", "scripts"]
+extend-exclude = [".github"]
 
 [tool.ruff.lint]
 select = [

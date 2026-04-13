@@ -2,19 +2,22 @@
 Core training loop: ``train_one_epoch``.
 """
 
+from __future__ import annotations
+
 import gc
 import logging
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import cv2
-import psutil
 import torch
+
+if TYPE_CHECKING:
+    from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.models.pipeline import VLNPipeline
@@ -147,6 +150,7 @@ def train_one_epoch(
 
     trainable_params = _get_trainable_params(model_module)
 
+    import psutil
     _mem_log_proc = psutil.Process()
     _cg_limit = _CG_LIMIT_GB
 
@@ -474,6 +478,7 @@ def train_one_epoch(
             )
             if vis_path:
                 try:
+                    import cv2
                     vis_img = cv2.imread(str(vis_path))
                     if vis_img is not None:
                         vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
