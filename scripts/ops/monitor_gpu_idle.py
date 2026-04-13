@@ -37,7 +37,6 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 # 默认：已用显存 / 总显存 ≤ 该比例视为「显存侧」空闲（如 0.10 = 10%）
 DEFAULT_MEM_MAX_RATIO = 0.10
@@ -61,7 +60,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("monitor_gpu_idle")
-OccupyChild = Tuple[subprocess.Popen, FrozenSet[int], Path]
+OccupyChild = tuple[subprocess.Popen, frozenset[int], Path]
 
 
 def load_config(path: Path) -> dict:
@@ -72,12 +71,18 @@ def load_config(path: Path) -> dict:
 def get_webhook_url(cfg: dict) -> str:
     notify = (cfg.get("log") or {}).get("notify") or {}
     url = (notify.get("webhook_url") or "").strip()
+    if url.startswith("${") and url.endswith("}"):
+        env_var = url[2:-1]
+        url = os.environ.get(env_var, "")
     if not url:
-        raise ValueError("配置中 log.notify.webhook_url 为空，无法发送飞书消息")
+        raise ValueError(
+            "飞书 Webhook URL 为空。请设置环境变量 FEISHU_WEBHOOK_URL，"
+            "或在配置 log.notify.webhook_url 中填入完整 URL"
+        )
     return url
 
 
-def query_nvidia_smi() -> Tuple[List[Tuple[int, float, float, float]], Dict[int, str]]:
+def query_nvidia_smi() -> tuple[list[tuple[int, float, float, float]], dict[int, str]]:
     """
     返回:
       rows: [(index, util_percent, mem_used_mib, mem_total_mib), ...]
@@ -97,8 +102,8 @@ def query_nvidia_smi() -> Tuple[List[Tuple[int, float, float, float]], Dict[int,
         logger.warning("nvidia-smi 执行异常，本轮跳过: %s", e)
         return [], {}
 
-    rows: List[Tuple[int, float, float, float]] = []
-    index_to_uuid: Dict[int, str] = {}
+    rows: list[tuple[int, float, float, float]] = []
+    index_to_uuid: dict[int, str] = {}
     for line in out.strip().splitlines():
         line = line.strip()
         if not line:
@@ -120,8 +125,8 @@ def query_nvidia_smi() -> Tuple[List[Tuple[int, float, float, float]], Dict[int,
 
 
 def query_compute_app_mem_mib_by_uuid_filtered(
-    name_pattern: Optional[re.Pattern[str]],
-) -> Dict[str, float]:
+    name_pattern: re.Pattern[str] | None,
+) -> dict[str, float]:
     """
     按 GPU UUID 汇总 used_gpu_memory（MiB）。
     name_pattern 为 None 时计入所有 compute-app；否则仅计入 process_name 能匹配 pattern 的条目。
@@ -144,7 +149,7 @@ def query_compute_app_mem_mib_by_uuid_filtered(
         out = r.stdout or ""
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return {}
-    sums: Dict[str, float] = {}
+    sums: dict[str, float] = {}
     for line in out.strip().splitlines():
         line = line.strip()
         if not line:
@@ -164,11 +169,11 @@ def query_compute_app_mem_mib_by_uuid_filtered(
 
 
 def compute_proc_mem_mib_by_index(
-    index_to_uuid: Dict[int, str],
-    name_pattern: Optional[re.Pattern[str]],
-) -> Dict[int, float]:
+    index_to_uuid: dict[int, str],
+    name_pattern: re.Pattern[str] | None,
+) -> dict[int, float]:
     by_uuid = query_compute_app_mem_mib_by_uuid_filtered(name_pattern)
-    by_index: Dict[int, float] = {}
+    by_index: dict[int, float] = {}
     for idx, uuid in index_to_uuid.items():
         v = by_uuid.get(uuid, 0.0)
         if v > 0:
@@ -177,11 +182,11 @@ def compute_proc_mem_mib_by_index(
 
 
 def reap_occupy_processes(
-    running: List[OccupyChild],
-) -> Set[int]:
+    running: list[OccupyChild],
+) -> set[int]:
     """移除已结束的占卡子进程，并返回异常退出的 GPU。"""
-    alive: List[OccupyChild] = []
-    failed_gpus: Set[int] = set()
+    alive: list[OccupyChild] = []
+    failed_gpus: set[int] = set()
     for p, gpus, log_path in running:
         try:
             rc = p.poll()
@@ -207,9 +212,9 @@ def reap_occupy_processes(
 
 
 def gpus_covered_by_running(
-    running: List[OccupyChild],
-) -> Set[int]:
-    out: Set[int] = set()
+    running: list[OccupyChild],
+) -> set[int]:
+    out: set[int] = set()
     for _, gpus, _ in running:
         out |= set(gpus)
     return out
@@ -217,13 +222,13 @@ def gpus_covered_by_running(
 
 def launch_occupy_script(
     script: Path,
-    gpu_ids: List[int],
+    gpu_ids: list[int],
     extra_args: str,
     log_dir: Path,
-) -> Optional[Tuple[subprocess.Popen, Path]]:
+) -> tuple[subprocess.Popen, Path] | None:
     """后台启动占卡脚本，返回 (Popen, 日志路径)；失败返回 None。"""
     gpu_csv = ",".join(str(i) for i in gpu_ids)
-    cmd: List[str] = [sys.executable, str(script), "--gpu", gpu_csv]
+    cmd: list[str] = [sys.executable, str(script), "--gpu", gpu_csv]
     if extra_args.strip():
         cmd.extend(shlex.split(extra_args))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -389,7 +394,7 @@ def main() -> None:
         sys.exit(1)
     check_compute_procs = not args.ignore_compute_procs
     compute_proc_min_mib = args.compute_proc_min_mib
-    proc_name_pattern: Optional[re.Pattern[str]] = None
+    proc_name_pattern: re.Pattern[str] | None = None
     if check_compute_procs:
         if args.count_all_compute_procs:
             proc_name_pattern = None
@@ -403,8 +408,8 @@ def main() -> None:
     interval = max(1.0, args.interval_sec)
 
     # gpu_index -> (idle_since_monotonic or None, already_notified_this_streak)
-    state: Dict[int, Tuple[Optional[float], bool]] = {}
-    occupy_children: List[OccupyChild] = []
+    state: dict[int, tuple[float | None, bool]] = {}
+    occupy_children: list[OccupyChild] = []
 
     occupy_script = args.occupy_script.resolve()
     auto_occupy = args.auto_occupy
@@ -421,11 +426,10 @@ def main() -> None:
         need_sec,
         interval,
         (
-            "开启(训练类进程显存合计>%gMiB)"
-            % compute_proc_min_mib
+            f"开启(训练类进程显存合计>{compute_proc_min_mib:g}MiB)"
             if check_compute_procs and proc_name_pattern is not None
             else (
-                "开启(全部进程显存合计>%gMiB)" % compute_proc_min_mib
+                f"开启(全部进程显存合计>{compute_proc_min_mib:g}MiB)"
                 if check_compute_procs
                 else "关闭"
             )
@@ -460,7 +464,7 @@ def main() -> None:
         else:
             indices = sorted(stats.keys())
 
-        proc_mem_by_idx: Dict[int, float] = {}
+        proc_mem_by_idx: dict[int, float] = {}
         if check_compute_procs:
             proc_mem_by_idx = compute_proc_mem_mib_by_index(index_to_uuid, proc_name_pattern)
 
@@ -473,7 +477,7 @@ def main() -> None:
                 occupy_retry_delay_sec,
                 sorted(failed_gpus),
             )
-        to_notify: List[Tuple[int, float, float]] = []
+        to_notify: list[tuple[int, float, float]] = []
 
         for idx in indices:
             if idx not in stats:
