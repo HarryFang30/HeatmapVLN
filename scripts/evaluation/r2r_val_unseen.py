@@ -121,15 +121,15 @@ import habitat
 import quaternion
 import torch
 import tqdm
-import yaml
 from habitat.config.default import Config as CN
 from habitat.config.default import get_config as get_habitat_default_config
 from PIL import Image
 
+from scripts.training.model_builder import build_model
+from scripts.training.utils import load_config
 from src.data.vln_sliding_window_dataset import compute_history_rel_poses
 from src.models.heatmap.input_constructor import construct_input
-from src.models.lora_utils import resolve_lora_layer_indices
-from src.models.pipeline import VLNPipeline, VLNPipelineConfig
+from src.models.pipeline import VLNPipeline
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -407,83 +407,10 @@ def prepare_vlm_inputs(
 # Section 8: Model building
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def build_vln_pipeline(cfg: dict, device: str = "cuda:0") -> VLNPipeline:
-    """Build VLNPipeline from YAML config (mirrors scripts/evaluation/general.py)."""
-    model_cfg = cfg["model"]
-    data_cfg = cfg["data"]
-    llm_cfg = model_cfg.get("llm", {})
-    heatmap_cfg = model_cfg.get("heatmap", {})
-    action_cfg = model_cfg.get("action_head", {})
-    nextdit_cfg = action_cfg.get("nextdit", {})
-
-    import logging
-    _logger = logging.getLogger("evaluate")
-    resolved_lora_layers = resolve_lora_layer_indices(
-        llm_cfg, heatmap_cfg, logger=_logger,
-    )
-
-    config = VLNPipelineConfig(
-        llm_model_path=llm_cfg.get("model_path", "./models/internnav_backbone"),
-        llm_backbone_type=llm_cfg.get("backbone_type", "qwen2_5_vl"),
-        llm_hidden_dim=llm_cfg.get("hidden_dim", 3584),
-        llm_token_dim=llm_cfg.get("token_dim", 896),
-        llm_torch_dtype=llm_cfg.get("torch_dtype", "bfloat16"),
-        llm_attn_implementation=llm_cfg.get("attn_implementation", "sdpa"),
-        max_video_frames=llm_cfg.get("max_video_frames", -1),
-        enable_packing=llm_cfg.get("enable_packing", False),
-        max_seq_length=llm_cfg.get("max_seq_length", 8192),
-        spatial_merge_size=llm_cfg.get("spatial_merge_size", 2),
-        internnav_system1_path=nextdit_cfg.get("internnav_system1_path", ""),
-        device=device,
-        enable_heatmap=heatmap_cfg.get("enable", True),
-        heatmap_c_vit=heatmap_cfg.get("c_vit", 1280),
-        heatmap_c_llm=heatmap_cfg.get("c_llm", 3584),
-        heatmap_c_fused=heatmap_cfg.get("c_fused", 256),
-        heatmap_vit_layer_indices=heatmap_cfg.get("vit_layer_indices", [7, 15, 23, 31]),
-        heatmap_llm_layer_indices=heatmap_cfg.get("llm_layer_indices", [6, 13, 20]),
-        heatmap_size=tuple(heatmap_cfg.get("heatmap_size", data_cfg["init_hm_size"])),
-        image_size=heatmap_cfg.get("image_size", data_cfg["image_size"][0]),
-        heatmap_trajectory_config=heatmap_cfg.get("trajectory", None),
-        use_lora=llm_cfg.get("use_lora", False),
-        lora_rank=llm_cfg.get("lora_rank", 16),
-        lora_alpha=llm_cfg.get("lora_alpha", 32),
-        lora_num_layers=llm_cfg.get("lora_num_layers", 4),
-        lora_layer_indices=resolved_lora_layers,
-        lora_dropout=llm_cfg.get("lora_dropout", 0.05),
-        lora_target_modules=llm_cfg.get("lora_target_modules", None),
-        enable_action_head=action_cfg.get("enable", True),
-        nextdit_enabled=nextdit_cfg.get("enabled", False),
-        nextdit_vlm_hidden_dim=nextdit_cfg.get("vlm_hidden_dim", 3584),
-        nextdit_latent_emb_size=nextdit_cfg.get("latent_emb_size", 768),
-        nextdit_n_query=nextdit_cfg.get("n_query", 4),
-        nextdit_dit_dim=nextdit_cfg.get("dit_dim", 384),
-        nextdit_dit_layers=nextdit_cfg.get("dit_layers", 12),
-        nextdit_dit_heads=nextdit_cfg.get("dit_heads", 6),
-        nextdit_dit_kv_heads=nextdit_cfg.get("dit_kv_heads", 6),
-        nextdit_dit_ffn_dim_multiplier=nextdit_cfg.get("dit_ffn_dim_multiplier", 2 / 3),
-        nextdit_predict_steps=nextdit_cfg.get("predict_steps", 32),
-        nextdit_action_dim=nextdit_cfg.get("action_dim", 3),
-        nextdit_num_inference_steps=nextdit_cfg.get("num_inference_steps", 10),
-        nextdit_guidance_scale=nextdit_cfg.get("guidance_scale", 1.0),
-        nextdit_num_sample_trajs=nextdit_cfg.get("num_sample_trajs", 32),
-        nextdit_dav2_ckpt_path=nextdit_cfg.get("dav2_ckpt_path", ""),
-        nextdit_enable_gradient_checkpointing=nextdit_cfg.get(
-            "enable_gradient_checkpointing", True,
-        ),
-        verbose=False,
-    )
-    return VLNPipeline(config)
-
-
 def load_model(args, device: torch.device):
     """Build VLNPipeline, load checkpoint, and initialise HeatmapVLN."""
     cfg = load_config(args.config)
-    model = build_vln_pipeline(cfg, device=str(device))
+    model = build_model(cfg, device=str(device), verbose=False)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state_dict = ckpt.get(

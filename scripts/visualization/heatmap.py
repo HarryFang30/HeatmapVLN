@@ -35,56 +35,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from scripts.training.model_builder import build_model
 from src.data.factory import build_sliding_window_dataset
-from src.models.lora_utils import resolve_lora_layer_indices
-from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("visualize")
 
 VIEW_NAMES = ["Front", "Right", "Back", "Left"]
-
-
-# ==================== 与 train.py 一致的 build_model ====================
-def build_model(cfg: dict) -> VLNPipeline:
-    model_cfg = cfg['model']
-    llm_cfg = model_cfg.get('llm', {})
-    heatmap_cfg = model_cfg.get('heatmap', {})
-    resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
-
-
-
-    config = VLNPipelineConfig(
-        llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
-        llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
-        llm_token_dim=llm_cfg.get('token_dim', 896),
-        llm_torch_dtype=llm_cfg.get('torch_dtype', 'bfloat16'),
-        llm_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
-        max_video_frames=llm_cfg.get('max_video_frames', 16),
-        enable_packing=False,
-        max_seq_length=llm_cfg.get('max_seq_length', 4096),
-        spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
-        device=model_cfg.get('device', 'cuda'),
-        enable_heatmap=heatmap_cfg.get('enable', True),
-        heatmap_c_vit=heatmap_cfg.get('c_vit', 1280),
-        heatmap_c_llm=heatmap_cfg.get('c_llm', 3584),
-        heatmap_c_fused=heatmap_cfg.get('c_fused', 256),
-        heatmap_vit_layer_indices=heatmap_cfg.get('vit_layer_indices', [7, 15, 23, 31]),
-        heatmap_llm_layer_indices=heatmap_cfg.get('llm_layer_indices', [6, 13, 20]),
-        heatmap_size=tuple(heatmap_cfg.get('heatmap_size', cfg['data']['init_hm_size'])),
-        image_size=heatmap_cfg.get('image_size', cfg['data']['image_size'][0]),
-        use_lora=llm_cfg.get('use_lora', False),
-        lora_rank=llm_cfg.get('lora_rank', 16),
-        lora_alpha=llm_cfg.get('lora_alpha', 32),
-        lora_num_layers=llm_cfg.get('lora_num_layers', 4),
-        lora_layer_indices=resolved_lora_layers,
-        lora_dropout=llm_cfg.get('lora_dropout', 0.05),
-        lora_target_modules=llm_cfg.get('lora_target_modules', None),
-        enable_action_head=False,
-        verbose=False,
-    )
-    return VLNPipeline(config)
 
 
 # ==================== collate_fn ====================
@@ -283,7 +241,7 @@ def main():
 
     # ==================== 构建模型 ====================
     logger.info("Building model...")
-    model = build_model(cfg)
+    model = build_model(cfg, verbose=False, enable_action_head=False)
 
     state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', {}))
     if state_dict:
