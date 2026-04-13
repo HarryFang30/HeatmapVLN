@@ -78,7 +78,6 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.checkpoint")
 
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
-from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset, VLNTrajectoryDataset
 from src.data.factory import build_dataset
 from src.models.runtime_compat import ensure_transformers_runtime_compat
 from src.utils.logger import setup_logger
@@ -288,17 +287,15 @@ def main():
     val_root_cfg = cfg['data'].get('val_root')
     if val_root_cfg:
         logger.info(f"  Validation from separate root: {val_root_cfg} (split={cfg['data'].get('val_split', 'val')})")
+    train_dataset = build_dataset(cfg, split='train')
+
     if dataset_type == 'trajectory':
-        traj_cfg = cfg['data'].get('trajectory', cfg['data'].get('sliding_window', {}))
-
-        train_dataset = build_dataset(cfg, split='train')
-
         val_root = cfg['data'].get('val_root')
         if val_root:
-            val_split = cfg['data'].get('val_split', 'val')
+            val_samples = cfg['data'].get('trajectory', cfg['data'].get('sliding_window', {})).get('val_samples_per_clip', 2)
             val_dataset = build_dataset(
-                cfg, split=val_split, root=val_root,
-                samples_per_clip=traj_cfg.get('val_samples_per_clip', 2),
+                cfg, split=cfg['data'].get('val_split', 'val'), root=val_root,
+                samples_per_clip=val_samples,
                 random_subsequence=False,
                 enable_trajectory_augmentation=False,
                 use_subinstruction=False,
@@ -307,15 +304,11 @@ def main():
             val_dataset = None
             logger.info("  No val_root configured, skipping validation dataset")
     else:
-        sw_cfg = cfg['data']['sliding_window']
-
-        train_dataset = build_dataset(cfg, split='train')
-
         val_root = cfg['data'].get('val_root') or cfg['data']['root']
-        val_split = cfg['data'].get('val_split', 'val')
+        val_samples = cfg['data']['sliding_window'].get('val_samples_per_clip', 2)
         val_dataset = build_dataset(
-            cfg, split=val_split, root=val_root,
-            samples_per_clip=sw_cfg.get('val_samples_per_clip', 2),
+            cfg, split=cfg['data'].get('val_split', 'val'), root=val_root,
+            samples_per_clip=val_samples,
         )
     
     if val_dataset is not None and hasattr(val_dataset, 'set_epoch'):
