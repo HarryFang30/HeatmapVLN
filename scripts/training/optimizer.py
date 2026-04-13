@@ -2,6 +2,7 @@
 Optimizer, learning-rate scheduler, and temperature schedule construction.
 """
 
+import logging
 import math
 from typing import Dict
 
@@ -9,6 +10,8 @@ import torch
 import torch.nn as nn
 
 from src.models.pipeline import VLNPipeline
+
+logger = logging.getLogger(__name__)
 
 
 def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.optim.Optimizer:
@@ -59,7 +62,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             groups = get_param_groups_with_wd(submodule, heatmap_lr, f'heatmap_{name}', default_wd)
             if groups:
                 param_groups.extend(groups)
-                print(f"  Param group: heatmap_{name} (lr={heatmap_lr}, wd={default_wd})")
+                logger.info("  Param group: heatmap_%s (lr=%s, wd=%s)", name, heatmap_lr, default_wd)
 
         coarse_module = model.heatmap_vln.coarse
         vis_head_params_decay = []
@@ -85,8 +88,8 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             param_groups.append({'params': vis_head_params_no_decay, 'lr': vis_head_lr, 'weight_decay': 0.0, 'name': 'heatmap_vis_head_no_decay'})
         n_vis = len(vis_head_params_decay) + len(vis_head_params_no_decay)
         n_coarse = len(coarse_rest_decay) + len(coarse_rest_no_decay)
-        print(f"  Param group: heatmap_coarse (lr={heatmap_lr}, {n_coarse} params)")
-        print(f"  Param group: heatmap_vis_head (lr={vis_head_lr}, {n_vis} params)")
+        logger.info("  Param group: heatmap_coarse (lr=%s, %d params)", heatmap_lr, n_coarse)
+        logger.info("  Param group: heatmap_vis_head (lr=%s, %d params)", vis_head_lr, n_vis)
 
     # NextDiT Action Head — split submodules for per-component learning rates
     action_lr = optim_cfg.get('action_lr', 1e-4)
@@ -101,19 +104,19 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         cp_groups = get_param_groups_with_wd(nah.cond_projector, nextdit_cond_lr, 'nextdit_cond_projector', default_wd)
         if cp_groups:
             param_groups.extend(cp_groups)
-            print(f"  Param group: nextdit_cond_projector (lr={nextdit_cond_lr}, wd={default_wd})")
+            logger.info("  Param group: nextdit_cond_projector (lr=%s, wd=%s)", nextdit_cond_lr, default_wd)
         dedicated_param_ids.update(id(p) for p in nah.cond_projector.parameters())
 
         me_groups = get_param_groups_with_wd(nah.memory_encoder, memory_encoder_lr, 'nextdit_memory_encoder', default_wd)
         if me_groups:
             param_groups.extend(me_groups)
-            print(f"  Param group: nextdit_memory_encoder (lr={memory_encoder_lr}, wd={default_wd})")
+            logger.info("  Param group: nextdit_memory_encoder (lr=%s, wd=%s)", memory_encoder_lr, default_wd)
         dedicated_param_ids.update(id(p) for p in nah.memory_encoder.parameters())
 
         rr_groups = get_param_groups_with_wd(nah.rgb_resampler, rgb_resampler_lr, 'nextdit_rgb_resampler', default_wd)
         if rr_groups:
             param_groups.extend(rr_groups)
-            print(f"  Param group: nextdit_rgb_resampler (lr={rgb_resampler_lr}, wd={default_wd})")
+            logger.info("  Param group: nextdit_rgb_resampler (lr=%s, wd=%s)", rgb_resampler_lr, default_wd)
         dedicated_param_ids.update(id(p) for p in nah.rgb_resampler.parameters())
 
         rest_decay, rest_no_decay = [], []
@@ -129,7 +132,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         if rest_no_decay:
             param_groups.append({'params': rest_no_decay, 'lr': nextdit_lr, 'weight_decay': 0.0, 'name': 'nextdit_rest_no_decay'})
         if rest_decay or rest_no_decay:
-            print(f"  Param group: nextdit_rest (lr={nextdit_lr}, wd={default_wd})")
+            logger.info("  Param group: nextdit_rest (lr=%s, wd=%s)", nextdit_lr, default_wd)
 
     # Latent Queries
     if hasattr(model, 'latent_queries') and model.latent_queries is not None:
@@ -140,7 +143,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
             'weight_decay': 0.0,
             'name': 'latent_queries',
         })
-        print(f"  Param group: latent_queries (lr={latent_q_lr}, wd=0)")
+        logger.info("  Param group: latent_queries (lr=%s, wd=0)", latent_q_lr)
 
     # LLM Projector
     proj_lr = optim_cfg.get('llm_projector_lr', 3e-5)
@@ -148,7 +151,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
         groups = get_param_groups_with_wd(model.llm_projector, proj_lr, 'llm_projector', projector_wd)
         if groups:
             param_groups.extend(groups)
-            print(f"  Param group: llm_projector (lr={proj_lr}, wd={projector_wd})")
+            logger.info("  Param group: llm_projector (lr=%s, wd=%s)", proj_lr, projector_wd)
 
     # VLM backbone LoRA parameters
     lora_lr = optim_cfg.get('lora_lr', 1e-5)
@@ -163,7 +166,7 @@ def build_optimizer(model: VLNPipeline, cfg: Dict, stage_cfg: Dict) -> torch.opt
                 'weight_decay': 0.0,
                 'name': 'vlm_lora'
             })
-            print(f"  Param group: vlm_lora (lr={lora_lr}, wd=0.0, params={len(lora_params)})")
+            logger.info("  Param group: vlm_lora (lr=%s, wd=0.0, params=%d)", lora_lr, len(lora_params))
 
     if not param_groups:
         raise ValueError("No trainable parameters found!")

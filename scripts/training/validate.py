@@ -17,7 +17,7 @@ from tqdm import tqdm
 from src.models.pipeline import VLNPipeline
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
-from .utils import _unwrap_model
+from .utils import _unwrap_model, build_heatmap_loss_fn
 from .distributed import DistributedContext, _dist_all_reduce_in_place
 from .visualization import (
     visualize_heatmap_predictions,
@@ -37,7 +37,7 @@ def validate(
     tb_writer: Optional[SummaryWriter] = None,
     epoch: int = 0,
     vis_dir: Optional[Path] = None,
-    max_batches: int = None,
+    max_batches: Optional[int] = None,
     gpu_heatmap_computer: Optional[GPUHeatmapComputer] = None,
     gpu_has_depth: bool = False,
     gpu_depth_normalized: bool = True,
@@ -71,20 +71,11 @@ def validate(
 
     device = dist_context.device
 
-    from src.models.heatmap import HeatmapVLNLoss
-    hm_loss_fn = HeatmapVLNLoss(
-        lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 1.0),
-        lambda_kl=cfg.get('loss', {}).get('heatmap_vln', {}).get(
-            'lambda_kl',
-            cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
-        ),
-        lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
-        lambda_neg=0.0,
-        temperature=heatmap_temperature if heatmap_temperature is not None else cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
-        heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
-        vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
-    ).to(device)
+    hm_loss_fn = build_heatmap_loss_fn(
+        cfg, device,
+        temperature=heatmap_temperature,
+        lambda_neg_override=0.0,
+    )
 
     val_inference_batches = cfg.get('validation', {}).get('val_inference_batches', 10)
 

@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.data.vln_sliding_window_dataset import VLNTrajectoryDataset
+from scripts.training.utils import load_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,11 +39,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("evaluate")
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
 
 
 def flatten_heatmap_slices(heatmaps: torch.Tensor) -> torch.Tensor:

@@ -88,6 +88,7 @@ from src.utils.notifier import FeishuNotifier, create_notifier
 from scripts.training import (
     load_config,
     set_seed,
+    safe_torch_load,
     DistributedContext,
     init_distributed_context,
     cleanup_distributed,
@@ -625,7 +626,7 @@ def main():
     if args.load_weights:
         weights_path = Path(args.load_weights)
         if weights_path.exists():
-            ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+            ckpt = safe_torch_load(str(weights_path))
             state_dict = ckpt.get('trainable_state_dict', {})
             if state_dict:
                 missing, unexpected, loaded_count = _load_normalized_state_dict(raw_model, state_dict)

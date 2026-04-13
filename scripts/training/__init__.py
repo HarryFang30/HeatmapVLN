@@ -19,6 +19,8 @@ from .utils import (
     _format_decode_internal_timing,
     load_config,
     set_seed,
+    build_heatmap_loss_fn,
+    safe_torch_load,
 )
 
 from .distributed import (

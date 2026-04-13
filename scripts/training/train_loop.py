@@ -29,6 +29,7 @@ from .utils import (
     _mean_timing,
     _format_qwen_internal_timing,
     _format_decode_internal_timing,
+    build_heatmap_loss_fn,
 )
 from .distributed import (
     DistributedContext,
@@ -104,20 +105,7 @@ def train_one_epoch(
 
     device = dist_context.device
 
-    from src.models.heatmap import HeatmapVLNLoss
-    hm_loss_fn = HeatmapVLNLoss(
-        lambda_vis=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_vis', 1.0),
-        lambda_coord=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_coord', 1.0),
-        lambda_kl=cfg.get('loss', {}).get('heatmap_vln', {}).get(
-            'lambda_kl',
-            cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_pos', 1.0),
-        ),
-        lambda_peak=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_peak', 1.0),
-        lambda_neg=cfg.get('loss', {}).get('heatmap_vln', {}).get('lambda_neg', 0.0),
-        temperature=cfg.get('loss', {}).get('heatmap_vln', {}).get('temperature', 1.0),
-        heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
-        vis_pos_weight=cfg.get('loss', {}).get('heatmap_vln', {}).get('vis_pos_weight', 1.0),
-    ).to(device)
+    hm_loss_fn = build_heatmap_loss_fn(cfg, device)
     hm_loss_fn.set_temperature(
         get_heatmap_temperature(cfg, global_step_offset, total_train_steps)
     )

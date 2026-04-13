@@ -179,6 +179,41 @@ def load_config(config_path: str) -> Dict:
         return yaml.safe_load(f)
 
 
+def safe_torch_load(
+    path: str,
+    map_location: str = "cpu",
+) -> Dict:
+    """Load a checkpoint with consistent safety settings.
+
+    Uses ``weights_only=False`` because our checkpoints contain optimizer
+    state dicts and other non-tensor objects.  Only load checkpoints you
+    trust (i.e. produced by this project).
+    """
+    return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def build_heatmap_loss_fn(
+    cfg: Dict,
+    device: torch.device,
+    temperature: Optional[float] = None,
+    lambda_neg_override: Optional[float] = None,
+) -> "HeatmapVLNLoss":
+    """Centralized factory for HeatmapVLNLoss — avoids duplication across train/validate."""
+    from src.models.heatmap import HeatmapVLNLoss
+
+    hm_cfg = cfg.get('loss', {}).get('heatmap_vln', {})
+    return HeatmapVLNLoss(
+        lambda_vis=hm_cfg.get('lambda_vis', 1.0),
+        lambda_coord=hm_cfg.get('lambda_coord', 1.0),
+        lambda_kl=hm_cfg.get('lambda_kl', hm_cfg.get('lambda_pos', 1.0)),
+        lambda_peak=hm_cfg.get('lambda_peak', 1.0),
+        lambda_neg=lambda_neg_override if lambda_neg_override is not None else hm_cfg.get('lambda_neg', 0.0),
+        temperature=temperature if temperature is not None else hm_cfg.get('temperature', 1.0),
+        heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
+        vis_pos_weight=hm_cfg.get('vis_pos_weight', 1.0),
+    ).to(device)
+
+
 def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)

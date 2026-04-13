@@ -103,26 +103,26 @@ def build_model(cfg: Dict, verbose: bool = True) -> VLNPipeline:
                 latent_queries=model.latent_queries,
             )
         else:
-            print(f"System 1 pretrained weights not found: {s1_path}")
+            logger.warning("System 1 pretrained weights not found: %s", s1_path)
 
     packing_enabled = llm_cfg.get('enable_packing', False)
     backbone_type = llm_cfg.get('backbone_type', 'qwen2_5_vl')
     if verbose:
-        print(f"VLN Pipeline built")
-        print(f"   Backbone -> {llm_cfg.get('model_path', './models/internnav_backbone')} (type={backbone_type})")
-        print(f"   SequencePacking -> enabled={packing_enabled}")
-        print(
-            "   HeatmapVLN → "
-            f"enabled={heatmap_cfg.get('enable', True)}, "
-            f"c_vit={heatmap_cfg.get('c_vit', 1280)}, "
-            f"c_llm={heatmap_cfg.get('c_llm', 3584)}, "
-            f"c_fused={heatmap_cfg.get('c_fused', 256)}, "
-            f"vit_layers={heatmap_cfg.get('vit_layer_indices', [7, 15, 23, 31])}, "
-            f"llm_layers={heatmap_cfg.get('llm_layer_indices', [6, 13, 20])}"
+        logger.info("VLN Pipeline built")
+        logger.info("   Backbone -> %s (type=%s)", llm_cfg.get('model_path', './models/internnav_backbone'), backbone_type)
+        logger.info("   SequencePacking -> enabled=%s", packing_enabled)
+        logger.info(
+            "   HeatmapVLN → enabled=%s, c_vit=%s, c_llm=%s, c_fused=%s, vit_layers=%s, llm_layers=%s",
+            heatmap_cfg.get('enable', True),
+            heatmap_cfg.get('c_vit', 1280),
+            heatmap_cfg.get('c_llm', 3584),
+            heatmap_cfg.get('c_fused', 256),
+            heatmap_cfg.get('vit_layer_indices', [7, 15, 23, 31]),
+            heatmap_cfg.get('llm_layer_indices', [6, 13, 20]),
         )
-        print(f"   NextDiT ActionHead → enabled={nextdit_cfg.get('enabled', False)}")
+        logger.info("   NextDiT ActionHead → enabled=%s", nextdit_cfg.get('enabled', False))
         if s1_ckpt:
-            print(f"   System1 pretrained → {s1_ckpt}")
+            logger.info("   System1 pretrained → %s", s1_ckpt)
 
     return model
 

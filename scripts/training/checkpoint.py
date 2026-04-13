@@ -14,6 +14,7 @@ from .utils import (
     _normalized_model_state_dict,
     _normalized_trainable_param_names,
     _load_normalized_state_dict,
+    safe_torch_load,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ class CheckpointManager:
             ckpt_path = self.out_dir / f"epoch_{epoch:03d}.pth"
         torch.save(ckpt, ckpt_path)
         file_size_mb = ckpt_path.stat().st_size / (1024**2)
-        print(f"💾 Saved: {ckpt_path.name} ({file_size_mb:.1f} MB)")
+        logger.info("💾 Saved: %s (%.1f MB)", ckpt_path.name, file_size_mb)
 
         val_loss = metrics.get('val_loss', float('inf'))
         self.ckpt_history.append((ckpt_path, val_loss, epoch))
@@ -84,7 +85,7 @@ class CheckpointManager:
             best_path = self.out_dir / "best.pth"
             torch.save(ckpt, best_path)
             self.best_ckpt_path = best_path
-            print(f"⭐ Best model: val_loss={val_loss:.4f}")
+            logger.info("⭐ Best model: val_loss=%.4f", val_loss)
 
         latest_path = self.out_dir / "latest.pth"
         torch.save(ckpt, latest_path)
@@ -98,10 +99,10 @@ class CheckpointManager:
         while len(ckpts) > self.max_ckpts:
             old_ckpt = ckpts.pop(0)
             old_ckpt.unlink()
-            print(f"🗑️  Removed old checkpoint: {old_ckpt.name}")
+            logger.info("🗑️  Removed old checkpoint: %s", old_ckpt.name)
 
     def load(self, ckpt_path: str) -> Dict:
-        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        ckpt = safe_torch_load(ckpt_path)
         self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
         return ckpt
 
@@ -132,7 +133,7 @@ def load_checkpoint_for_resume(
     if logger:
         logger.info(f"📂 Loading checkpoint: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    ckpt = safe_torch_load(ckpt_path)
 
     state_dict = ckpt.get('trainable_state_dict', {})
     if state_dict:
