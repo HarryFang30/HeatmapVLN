@@ -68,7 +68,7 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -274,7 +274,6 @@ def main():
         metrics_jsonl_path = None
 
     loss_cfg = cfg['loss']
-    loss_cfg.get('heatmap_loss_type', 'simplified')
 
     logger.info("=" * 60)
     logger.info("VLN 训练 (shared Habitat/InternNav env)")
@@ -581,7 +580,7 @@ def main():
     total_steps = total_batches // grad_accum_steps
     scheduler = build_scheduler(optimizer, cfg, total_steps)
     amp_type = cfg['optim'].get('amp', 'bf16')
-    scaler = GradScaler() if amp_type == 'fp16' else None
+    scaler = GradScaler('cuda') if amp_type == 'fp16' else None
 
     if resume_path and Path(resume_path).exists():
         load_checkpoint_for_resume(

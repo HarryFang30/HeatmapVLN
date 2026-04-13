@@ -13,14 +13,29 @@ from src.models.pipeline import VLNPipeline, VLNPipelineConfig
 logger = logging.getLogger(__name__)
 
 
-def build_model(cfg: dict, verbose: bool = True) -> VLNPipeline:
-    """Build the VLN Pipeline from a config dict."""
+def build_model(
+    cfg: dict,
+    verbose: bool = True,
+    device: str | None = None,
+    enable_action_head: bool | None = None,
+) -> VLNPipeline:
+    """Build the VLN Pipeline from a config dict.
+
+    Args:
+        cfg: Full training/eval config dictionary.
+        verbose: Whether to log model construction details.
+        device: Override ``cfg['model']['device']`` (useful for eval scripts).
+        enable_action_head: Override ``cfg['model']['action_head']['enable']``.
+    """
     model_cfg = cfg['model']
     llm_cfg = model_cfg.get('llm', {})
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
+
+    effective_device = device if device is not None else model_cfg.get('device', 'cuda')
+    effective_action_head = enable_action_head if enable_action_head is not None else action_cfg.get('enable', True)
 
     config = VLNPipelineConfig(
         llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
@@ -43,7 +58,7 @@ def build_model(cfg: dict, verbose: bool = True) -> VLNPipeline:
 
         internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
 
-        device=model_cfg.get('device', 'cuda'),
+        device=effective_device,
 
         enable_heatmap=heatmap_cfg.get('enable', True),
         heatmap_c_vit=heatmap_cfg.get('c_vit', 1280),
@@ -56,6 +71,7 @@ def build_model(cfg: dict, verbose: bool = True) -> VLNPipeline:
         heatmap_lambda_vis=heatmap_cfg.get('lambda_vis', 1.0),
         heatmap_lambda_coord=heatmap_cfg.get('lambda_coord', 1.0),
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
+        heatmap_lambda_peak=heatmap_cfg.get('lambda_peak', 1.0),
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
 
         use_lora=llm_cfg.get('use_lora', False),
@@ -67,7 +83,7 @@ def build_model(cfg: dict, verbose: bool = True) -> VLNPipeline:
         lora_target_modules=llm_cfg.get('lora_target_modules', None),
         heatmap_trains_backbone=heatmap_cfg.get('heatmap_trains_backbone', False),
 
-        enable_action_head=action_cfg.get('enable', True),
+        enable_action_head=effective_action_head,
 
         nextdit_enabled=nextdit_cfg.get('enabled', False),
         nextdit_vlm_hidden_dim=nextdit_cfg.get('vlm_hidden_dim', 3584),
@@ -86,7 +102,7 @@ def build_model(cfg: dict, verbose: bool = True) -> VLNPipeline:
         nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
         nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
 
-        verbose=True,
+        verbose=verbose,
     )
 
     model = VLNPipeline(config)

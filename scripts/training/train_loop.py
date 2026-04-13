@@ -16,7 +16,7 @@ import torch
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -272,7 +272,6 @@ def train_one_epoch(
                 heatmap_loss = loss_dict['total']
 
             trajectory_loss = torch.tensor(0.0, device=device)
-            action_loss = torch.tensor(0.0, device=device)
 
             if train_action:
                 if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
@@ -497,7 +496,7 @@ def train_one_epoch(
         num_batches += 1
 
         del output, loss, heatmap_loss, gt_heatmap
-        del trajectory_loss, action_loss
+        del trajectory_loss
         loss_dict = None
         del video_frames
         del current_views_batch, history_panoramas_batch
