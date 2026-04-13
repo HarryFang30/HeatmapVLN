@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from scripts.training.model_builder import build_model
+
 from src.data.factory import build_sliding_window_dataset
 from src.data.trajectory_utils import get_trajectory_relative_to_frame
 from src.data.vln_sliding_window_dataset import VLNSlidingWindowDataset

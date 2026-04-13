@@ -273,7 +273,7 @@ def main():
     if not dist_context.is_main:
         metrics_jsonl_path = None
 
-    loss_cfg = cfg['loss']
+    cfg['loss']
 
     logger.info("=" * 60)
     logger.info("VLN 训练 (shared Habitat/InternNav env)")

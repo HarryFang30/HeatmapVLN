@@ -15,6 +15,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -26,9 +27,9 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.training.model_builder import build_model
 from scripts.training.checkpoint import load_checkpoint_for_resume
 from scripts.training.collate import collate_fn
+from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
 
 from src.data.factory import build_trajectory_dataset

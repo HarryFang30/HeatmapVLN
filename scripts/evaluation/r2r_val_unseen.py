@@ -124,12 +124,11 @@ import tqdm
 from habitat.config.default import Config as CN
 from habitat.config.default import get_config as get_habitat_default_config
 from PIL import Image
-
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
+
 from src.data.vln_sliding_window_dataset import compute_history_rel_poses
 from src.models.heatmap.input_constructor import construct_input
-from src.models.pipeline import VLNPipeline
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4

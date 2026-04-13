@@ -1,6 +1,5 @@
 
 import torch
-
 from transformers import PretrainedConfig, PreTrainedModel
 
 from .nextdit_traj import LuminaNextDiT2DModel
