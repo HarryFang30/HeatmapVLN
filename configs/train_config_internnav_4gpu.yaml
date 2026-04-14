@@ -11,8 +11,8 @@ seed: 42
 #   4. num_workers: 4 (每卡)
 #
 # 启动方式 (必须用 torchrun):
-#   torchrun --nproc_per_node=2 scripts/train.py \
-#     --config configs/train_config_internnav_2gpu.yaml \
+#   torchrun --nproc_per_node=4 scripts/train.py \
+#     --config configs/train_config_internnav_4gpu.yaml \
 #     --load-weights /path/to/stage1/checkpoints/best.pth
 #
 # ============================================
@@ -127,7 +127,7 @@ model:
 training:
   stages:
     - name: stage2_selective_finetune
-      epochs: 1
+      epochs: 2
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: false
@@ -166,7 +166,7 @@ optim:
   warmup_ratio: 0.003
   min_lr: 1.0e-5
   # 双卡: 每卡 batch=4, 总有效 batch = 4×2 = 8
-  batch_size: 4
+  batch_size: 6
   grad_accum_steps: 1
 
 # ============================================
@@ -196,7 +196,7 @@ loss:
 # GPU配置 — 双卡
 # ============================================
 gpu:
-  devices: [0, 1]
+  devices: [0, 1, 2, 3]
   backend: nccl
   multi_gpu:
     enabled: true

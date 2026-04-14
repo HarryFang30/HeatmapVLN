@@ -336,7 +336,7 @@ This project builds upon the following works:
 If you find this work useful, please consider citing:
 
 ```bibtex
-@software{heatmapvln2025,
+@software{heatmapvln2026,
   author       = {Jialei Fang},
   title        = {HeatmapVLN: Coarse-to-Fine Spatial Heatmap Generation for Vision-Language Navigation},
   year         = {2026},
