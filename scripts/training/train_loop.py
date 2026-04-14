@@ -346,6 +346,10 @@ def train_one_epoch(
             if nextdit_warmup_steps > 0 and abs_step == nextdit_warmup_steps:
                 end_nextdit_warmup(model_module, logger, stage_cfg=stage_cfg)
                 trainable_params = _get_trainable_params(model_module)
+                if dist_context.enabled:
+                    synced_trainable_modules = _get_supported_trainable_sync_modules(
+                        model_module, stage_cfg
+                    )
 
             current_heatmap_temperature = get_heatmap_temperature(
                 cfg,
@@ -583,11 +587,13 @@ def train_one_epoch(
     if remaining > 0:
         if scaler is not None:
             scaler.unscale_(optimizer)
+            synchronize_trainable_module_gradients(synced_trainable_modules, dist_context)
             if trainable_params:
                 torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
             scaler.step(optimizer)
             scaler.update()
         else:
+            synchronize_trainable_module_gradients(synced_trainable_modules, dist_context)
             if trainable_params:
                 torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
             optimizer.step()
@@ -601,6 +607,10 @@ def train_one_epoch(
         if nextdit_warmup_steps > 0 and abs_step2 == nextdit_warmup_steps:
             end_nextdit_warmup(model_module, logger, stage_cfg=stage_cfg)
             trainable_params = _get_trainable_params(model_module)
+            if dist_context.enabled:
+                synced_trainable_modules = _get_supported_trainable_sync_modules(
+                    model_module, stage_cfg
+                )
 
         hm_loss_fn.set_temperature(
             get_heatmap_temperature(

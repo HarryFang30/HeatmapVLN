@@ -10,6 +10,18 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+# Submodules of NextDiTActionHead that can be listed in trainable_modules (see model_builder).
+_NEXTDIT_SUBMODULE_KEYS = (
+    "cond_projector",
+    "traj_dit",
+    "memory_encoder",
+    "rgb_resampler",
+    "action_encoder",
+    "action_decoder",
+)
+
+SyncModuleOrParam = nn.Module | nn.Parameter
+
 from .utils import _dist_backend, _dist_is_initialized
 
 logger = logging.getLogger(__name__)
@@ -78,18 +90,25 @@ def _dist_all_reduce_in_place(tensor: torch.Tensor) -> torch.Tensor:
 def _get_supported_trainable_sync_modules(
     model,
     stage_cfg: dict[str, Any],
-) -> list[tuple[str, nn.Module]]:
+) -> list[tuple[str, SyncModuleOrParam]]:
     trainable = set(stage_cfg.get("trainable_modules", []))
-    supported_trainable = {"heatmap_vln", "llm_projector"}
+    supported_trainable = {
+        "heatmap_vln",
+        "llm_projector",
+        "nextdit_action_head",
+        "latent_queries",
+        *_NEXTDIT_SUBMODULE_KEYS,
+    }
     unsupported = sorted(trainable - supported_trainable)
     if unsupported:
         raise RuntimeError(
             "Current multi-GPU trainable-module sync only supports trainable_modules "
             f"{sorted(supported_trainable)}. Unsupported entries: {unsupported}. "
-            "Please keep other heads/backbone frozen in distributed mode."
+            "Please keep other heads/backbone frozen in distributed mode, or extend "
+            "scripts/training/distributed.py for new trainable groups."
         )
 
-    sync_modules: list[tuple[str, nn.Module]] = []
+    sync_modules: list[tuple[str, SyncModuleOrParam]] = []
 
     if "llm_projector" in trainable and getattr(model, "llm_projector", None) is not None:
         if any(param.requires_grad for param in model.llm_projector.parameters()):
@@ -103,6 +122,23 @@ def _get_supported_trainable_sync_modules(
             if module is not None and any(param.requires_grad for param in module.parameters()):
                 sync_modules.append((f"heatmap_vln.{attr_name}", module))
 
+    nah = getattr(model, "nextdit_action_head", None)
+    if "nextdit_action_head" in trainable and nah is not None:
+        if any(p.requires_grad for p in nah.parameters()):
+            sync_modules.append(("nextdit_action_head", nah))
+    elif nah is not None:
+        for key in _NEXTDIT_SUBMODULE_KEYS:
+            if key not in trainable:
+                continue
+            sub = getattr(nah, key, None)
+            if sub is not None and any(p.requires_grad for p in sub.parameters()):
+                sync_modules.append((f"nextdit_action_head.{key}", sub))
+
+    if "latent_queries" in trainable:
+        lq = getattr(model, "latent_queries", None)
+        if isinstance(lq, nn.Parameter) and lq.requires_grad:
+            sync_modules.append(("latent_queries", lq))
+
     if not sync_modules:
         raise RuntimeError(
             "Distributed mode is enabled, but no supported trainable submodules were found for synchronization."
@@ -111,18 +147,32 @@ def _get_supported_trainable_sync_modules(
     return sync_modules
 
 
+def _broadcast_trainable_tensor(tensor: torch.Tensor, src: int = 0) -> None:
+    if tensor.requires_grad:
+        _dist_broadcast_in_place(tensor.data, src=src)
+
+
+def _all_reduce_trainable_grad(param: torch.Tensor, world_size: int) -> None:
+    if param.requires_grad and param.grad is not None:
+        _dist_all_reduce_in_place(param.grad)
+        param.grad.div_(world_size)
+
+
 def initialize_trainable_module_sync(
     model,
     stage_cfg: dict[str, Any],
     dist_context: "DistributedContext",
     logger: logging.Logger,
-) -> list[tuple[str, nn.Module]]:
+) -> list[tuple[str, SyncModuleOrParam]]:
     sync_modules = _get_supported_trainable_sync_modules(model, stage_cfg)
-    for module_name, module in sync_modules:
+    for module_name, module_or_param in sync_modules:
         logger.info("🔄 Broadcasting trainable module: %s", module_name)
-        for _, param in module.named_parameters():
-            if param.requires_grad:
-                _dist_broadcast_in_place(param.data, src=0)
+        if isinstance(module_or_param, nn.Parameter):
+            _broadcast_trainable_tensor(module_or_param, src=0)
+        else:
+            for _, param in module_or_param.named_parameters():
+                if param.requires_grad:
+                    _dist_broadcast_in_place(param.data, src=0)
     _dist_barrier()
     logger.info(
         "🔗 Distributed trainable-module sync enabled for: %s",
@@ -132,16 +182,18 @@ def initialize_trainable_module_sync(
 
 
 def synchronize_trainable_module_gradients(
-    sync_modules: list[tuple[str, nn.Module]],
+    sync_modules: list[tuple[str, SyncModuleOrParam]],
     dist_context: "DistributedContext",
 ) -> None:
     if not dist_context.enabled or dist_context.world_size <= 1:
         return
-    for _, module in sync_modules:
-        for param in module.parameters():
-            if param.requires_grad and param.grad is not None:
-                _dist_all_reduce_in_place(param.grad)
-                param.grad.div_(dist_context.world_size)
+    ws = dist_context.world_size
+    for _, module_or_param in sync_modules:
+        if isinstance(module_or_param, nn.Parameter):
+            _all_reduce_trainable_grad(module_or_param, ws)
+        else:
+            for param in module_or_param.parameters():
+                _all_reduce_trainable_grad(param, ws)
 
 
 # ---------------------------------------------------------------------------
