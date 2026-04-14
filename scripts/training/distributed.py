@@ -62,6 +62,11 @@ def _dist_broadcast_in_place(tensor: torch.Tensor, src: int = 0) -> torch.Tensor
     if not _dist_is_initialized():
         return tensor
     backend = _dist_backend()
+    if backend == "nccl" and not tensor.is_cuda:
+        cuda_tensor = tensor.detach().to(device=torch.cuda.current_device())
+        dist.broadcast(cuda_tensor, src=src)
+        tensor.copy_(cuda_tensor.to(device=tensor.device, dtype=tensor.dtype))
+        return tensor
     if tensor.is_cuda and backend != "nccl":
         cpu_tensor = tensor.detach().cpu()
         dist.broadcast(cpu_tensor, src=src)
@@ -74,7 +79,11 @@ def _dist_broadcast_in_place(tensor: torch.Tensor, src: int = 0) -> torch.Tensor
 def _dist_all_reduce_in_place(tensor: torch.Tensor) -> torch.Tensor:
     if _dist_is_initialized():
         backend = _dist_backend()
-        if tensor.is_cuda and backend != "nccl":
+        if backend == "nccl" and not tensor.is_cuda:
+            cuda_tensor = tensor.detach().to(device=torch.cuda.current_device())
+            dist.all_reduce(cuda_tensor, op=dist.ReduceOp.SUM)
+            tensor.copy_(cuda_tensor.to(device=tensor.device, dtype=tensor.dtype))
+        elif tensor.is_cuda and backend != "nccl":
             cpu_tensor = tensor.detach().cpu()
             dist.all_reduce(cpu_tensor, op=dist.ReduceOp.SUM)
             tensor.copy_(cpu_tensor.to(device=tensor.device, dtype=tensor.dtype))
