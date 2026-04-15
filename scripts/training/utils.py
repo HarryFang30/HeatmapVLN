@@ -2,8 +2,8 @@
 Shared utility functions used across multiple training modules.
 """
 
-from contextlib import nullcontext
 import logging
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist

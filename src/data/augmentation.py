@@ -56,7 +56,7 @@ class ColorJitterAugmentation:
             image = np.asarray(pil_image, dtype=np.float32)
 
         if self.hue > 0:
-            shift = int(round(random.uniform(-self.hue, self.hue) * 255))
+            shift = round(random.uniform(-self.hue, self.hue) * 255)
             pil_image = Image.fromarray(image.clip(0, 255).astype(np.uint8)).convert("HSV")
             hsv = np.asarray(pil_image, dtype=np.uint8).copy()
             hsv[:, :, 0] = ((hsv[:, :, 0].astype(np.int16) + shift) % 256).astype(np.uint8)

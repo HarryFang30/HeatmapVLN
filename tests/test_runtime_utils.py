@@ -5,7 +5,12 @@ import types
 
 import torch
 
-from scripts.training.utils import make_autocast_context, make_grad_scaler, resolve_amp_dtype
+from scripts.training.utils import (
+    make_autocast_context,
+    make_grad_scaler,
+    resolve_amp_dtype,
+)
+
 from src.models import pipeline as pipeline_module
 
 
