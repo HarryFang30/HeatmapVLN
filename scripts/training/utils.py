@@ -2,6 +2,7 @@
 Shared utility functions used across multiple training modules.
 """
 
+from contextlib import nullcontext
 import logging
 
 import torch
@@ -173,18 +174,63 @@ def _format_decode_internal_timing(stats: dict[str, float], count: int) -> str:
 # Config / seed
 # ---------------------------------------------------------------------------
 
+def resolve_amp_dtype(amp_type: str | None) -> torch.dtype | None:
+    """Map config AMP strings to torch dtypes."""
+    normalized = "bf16" if amp_type is None else str(amp_type).lower()
+    amp_dtypes = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "none": None,
+        "off": None,
+        "false": None,
+        "disabled": None,
+    }
+    if normalized not in amp_dtypes:
+        raise ValueError(f"Unsupported AMP mode: {amp_type!r}")
+    return amp_dtypes[normalized]
+
+
+def make_autocast_context(
+    device: torch.device | str,
+    amp_type: str | None = "bf16",
+):
+    """Return a no-op or autocast context based on runtime device + AMP mode."""
+    resolved_device = torch.device(device)
+    dtype = resolve_amp_dtype(amp_type)
+    if resolved_device.type != "cuda" or dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=resolved_device.type, dtype=dtype)
+
+
+def make_grad_scaler(
+    device: torch.device | str,
+    amp_type: str | None = "bf16",
+):
+    """Build a CUDA GradScaler only when fp16 AMP is actually active."""
+    resolved_device = torch.device(device)
+    if resolved_device.type != "cuda" or resolve_amp_dtype(amp_type) != torch.float16:
+        return None
+    from torch.amp import GradScaler
+
+    return GradScaler(resolved_device.type)
+
+
 def load_config(config_path: str, validate: bool = True) -> dict:
     """Load a YAML config file, optionally validating against the schema.
 
     When *validate* is True (default), typos and type errors in the
     config are caught immediately at startup instead of causing cryptic
-    ``KeyError`` deep in the training loop.
+    ``KeyError`` deep in the training loop, and schema defaults are
+    materialized into the returned dict.
     """
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     if validate:
-        from src.config_schema import validate_config
-        validate_config(cfg)
+        from src.config_schema import normalize_config
+
+        return normalize_config(cfg)
     return cfg
 
 

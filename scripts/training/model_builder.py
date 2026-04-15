@@ -134,7 +134,10 @@ def build_model(
             heatmap_cfg.get('vit_layer_indices', [7, 15, 23, 31]),
             heatmap_cfg.get('llm_layer_indices', [6, 13, 20]),
         )
-        logger.info("   NextDiT ActionHead → enabled=%s", nextdit_cfg.get('enabled', False))
+        logger.info(
+            "   NextDiT ActionHead → enabled=%s",
+            effective_action_head and nextdit_cfg.get('enabled', False),
+        )
         if s1_ckpt:
             logger.info("   System1 pretrained → %s", s1_ckpt)
 

@@ -7,7 +7,6 @@ geometric relationships (safe for spatial tasks).
 
 import random
 
-import cv2
 import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
 
@@ -52,16 +51,16 @@ class ColorJitterAugmentation:
 
         if self.saturation > 0:
             factor = 1.0 + random.uniform(-self.saturation, self.saturation)
-            hsv = cv2.cvtColor(image.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-            hsv[:, :, 1] = hsv[:, :, 1] * factor
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
-            image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+            pil_image = Image.fromarray(image.clip(0, 255).astype(np.uint8))
+            pil_image = ImageEnhance.Color(pil_image).enhance(max(factor, 0.0))
+            image = np.asarray(pil_image, dtype=np.float32)
 
         if self.hue > 0:
-            shift = random.uniform(-self.hue, self.hue) * 180
-            hsv = cv2.cvtColor(image.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-            hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
-            image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+            shift = int(round(random.uniform(-self.hue, self.hue) * 255))
+            pil_image = Image.fromarray(image.clip(0, 255).astype(np.uint8)).convert("HSV")
+            hsv = np.asarray(pil_image, dtype=np.uint8).copy()
+            hsv[:, :, 0] = ((hsv[:, :, 0].astype(np.int16) + shift) % 256).astype(np.uint8)
+            image = np.asarray(Image.fromarray(hsv, mode="HSV").convert("RGB"), dtype=np.float32)
 
         return np.clip(image, 0, 255).astype(np.uint8)
 

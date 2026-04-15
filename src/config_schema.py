@@ -23,12 +23,12 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 class _Strict(BaseModel):
     """Base with extra='forbid' to catch misspelled keys."""
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
 class _Lenient(BaseModel):
     """Base with extra='allow' for sections where users add ad-hoc keys."""
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
 
 
 # --- Data -------------------------------------------------------------------
@@ -338,11 +338,24 @@ def validate_config(cfg: dict[str, Any]) -> TrainConfig:
     return TrainConfig.model_validate(cfg)
 
 
+def normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate a config dict and materialize schema defaults.
+
+    Returns a plain ``dict`` so the rest of the codebase can continue to
+    use dictionary access while still benefiting from Pydantic defaults.
+    ``None`` sections are excluded to preserve the previous ``dict.get``
+    behavior for optional nested configs.
+    """
+    validated = validate_config(cfg)
+    return validated.model_dump(mode="python", exclude_none=True)
+
+
 def load_and_validate_config(config_path: Union[str, Path]) -> dict[str, Any]:
     """Load a YAML config file and validate it.
 
-    Returns the original dict (not the Pydantic model) so downstream
-    code that expects ``Dict`` keeps working unchanged.
+    Returns a normalized ``dict`` with schema defaults materialized so
+    downstream code that expects ``dict`` keeps working unchanged while
+    observing the same defaults as the Pydantic model.
     """
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -350,5 +363,4 @@ def load_and_validate_config(config_path: Union[str, Path]) -> dict[str, Any]:
         raise ValueError(
             f"Expected a YAML mapping at top level, got {type(cfg).__name__}"
         )
-    validate_config(cfg)
-    return cfg
+    return normalize_config(cfg)

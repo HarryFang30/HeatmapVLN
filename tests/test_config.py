@@ -28,6 +28,22 @@ class TestLoadConfig:
         with pytest.raises((ValidationError, KeyError)):
             load_config(str(cfg_path), validate=True)
 
+    def test_load_config_materializes_schema_defaults(self, tmp_path):
+        """Validated load_config should return defaults materialized into the dict."""
+        cfg_path = tmp_path / "defaults.yaml"
+        cfg_path.write_text(yaml.dump({
+            "seed": 7,
+            "data": {"root": "/x", "image_size": [64, 64], "init_hm_size": [32, 32]},
+            "training": {"stages": [{"name": "s", "epochs": 1}]},
+            "log": {"out_dir": "/tmp"},
+        }))
+
+        from scripts.training.utils import load_config
+        cfg = load_config(str(cfg_path), validate=True)
+        assert cfg["loss"]["trajectory_weight"] == 0.0
+        assert cfg["optim"]["amp"] == "bf16"
+        assert cfg["model"]["device"] == "cuda"
+
 
 class TestPydanticValidation:
     def test_validate_minimal_config(self, minimal_cfg):

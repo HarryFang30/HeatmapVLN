@@ -20,7 +20,7 @@ from src.models.pipeline import VLNPipeline
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
 from .distributed import DistributedContext, _dist_all_reduce_in_place
-from .utils import _unwrap_model, build_heatmap_loss_fn
+from .utils import _unwrap_model, build_heatmap_loss_fn, make_autocast_context
 from .visualization import (
     _should_use_gpu_gt,
     visualize_heatmap_predictions,
@@ -117,7 +117,7 @@ def validate(
             else:
                 gt_heatmap = batch['heatmap'].to(device)
 
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
                 if text and len(text) > 0:
                     instruction_text = list(text)
                 else:
@@ -209,7 +209,7 @@ def validate(
                         trajectory_loss = traj_result['loss']
 
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
-            trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
+            trajectory_weight = loss_cfg.get('trajectory_weight', 0.0)
 
             loss = heatmap_weight * heatmap_loss + trajectory_weight * trajectory_loss
 

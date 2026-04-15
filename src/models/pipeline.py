@@ -189,7 +189,7 @@ class VLNPipeline(nn.Module):
         self.nextdit_action_head = None
         self.latent_queries = None
 
-        if config.nextdit_enabled:
+        if config.enable_action_head and config.nextdit_enabled:
             from .action import NextDiTActionConfig, NextDiTActionHead
 
             nextdit_cfg = NextDiTActionConfig(
@@ -223,6 +223,8 @@ class VLNPipeline(nn.Module):
             )
             if config.internnav_system1_path:
                 self._load_internnav_system1(config.internnav_system1_path)
+        elif config.nextdit_enabled:
+            logger.info("NextDiT action head disabled by config.enable_action_head=False")
 
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")

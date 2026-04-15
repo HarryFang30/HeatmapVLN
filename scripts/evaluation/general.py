@@ -30,7 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from scripts.training.checkpoint import load_checkpoint_for_resume
 from scripts.training.collate import collate_fn
 from scripts.training.model_builder import build_model
-from scripts.training.utils import load_config
+from scripts.training.utils import load_config, make_autocast_context
 
 from src.data.factory import build_trajectory_dataset
 from src.models.pipeline import VLNPipeline
@@ -218,7 +218,7 @@ def evaluate(
             history_panoramas = history_panoramas.to(device)
 
         # Forward pass
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
             outputs = model(
                 video_frames=video_frames,
                 instruction_text=instruction,

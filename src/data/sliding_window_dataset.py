@@ -12,10 +12,17 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Union
 
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    import cv2
+except ImportError as exc:  # pragma: no cover - exercised in lightweight test envs
+    cv2 = None
+    _CV2_IMPORT_ERROR = exc
+else:
+    _CV2_IMPORT_ERROR = None
 
 from .augmentation import ColorJitterAugmentation, GaussianNoiseAugmentation, InternNavStyleAugmentation
 from .heatmap_geometry import compute_history_heatmap
@@ -24,6 +31,11 @@ from .trajectory_utils import compute_history_rel_poses
 logger = logging.getLogger(__name__)
 
 _FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 4)
+
+
+def _require_cv2() -> None:
+    if cv2 is None:
+        raise ImportError("opencv-python is required for dataset image decoding") from _CV2_IMPORT_ERROR
 
 
 def _evict_from_page_cache(filepath):
@@ -772,6 +784,7 @@ class VLNSlidingWindowDataset(Dataset):
         - [N,] object 数组（JPEG 字节以 int 对象存储，pickle 导致）
         - bytes / bytearray（原始 JPEG）
         """
+        _require_cv2()
         if isinstance(raw, np.ndarray):
             if raw.ndim == 3 and raw.shape[2] >= 3:
                 return cv2.cvtColor(raw[:, :, :3], cv2.COLOR_BGR2RGB)
@@ -810,6 +823,7 @@ class VLNSlidingWindowDataset(Dataset):
             raw = self._get_chunk_frame_array(clip_idx, frame_idx, "rgb", direction=direction)
             image = self._decode_chunk_rgb(raw, clip_dir, frame_idx)
         else:
+            _require_cv2()
             dir_name = direction or self.chunk_direction
             rgb_candidates = [
                 clip_dir / "rgb" / f"{frame_idx:06d}.jpg",

@@ -10,10 +10,17 @@ import logging
 from pathlib import Path
 from typing import Union
 
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+
+try:
+    import cv2
+except ImportError as exc:  # pragma: no cover - exercised in lightweight test envs
+    cv2 = None
+    _CV2_IMPORT_ERROR = exc
+else:
+    _CV2_IMPORT_ERROR = None
 
 from .heatmap_geometry import compute_history_heatmap
 from .sliding_window_dataset import VLNSlidingWindowDataset, _evict_from_page_cache
@@ -25,6 +32,11 @@ from .trajectory_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _require_cv2() -> None:
+    if cv2 is None:
+        raise ImportError("opencv-python is required for trajectory image decoding") from _CV2_IMPORT_ERROR
 
 
 class VLNTrajectoryDataset(VLNSlidingWindowDataset):
@@ -148,6 +160,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     raise
             image = self._decode_chunk_rgb(raw, clip_dir, frame_idx)
         else:
+            _require_cv2()
             dir_name = direction
             rgb_candidates = [
                 clip_dir / "rgb" / f"{frame_idx:06d}.jpg",
@@ -680,4 +693,3 @@ def create_trajectory_dataloader(
         pin_memory=pin_memory,
         drop_last=drop_last,
     )
-

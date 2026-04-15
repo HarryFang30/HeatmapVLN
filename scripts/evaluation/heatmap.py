@@ -26,7 +26,6 @@ from typing import Any
 import matplotlib
 import numpy as np
 import torch
-import yaml
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -39,6 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.training.checkpoint import load_checkpoint_for_resume
 from scripts.training.model_builder import build_model
+from scripts.training.utils import load_config, make_autocast_context
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -270,7 +270,7 @@ def evaluate_heatmap(
             history_panoramas = history_panoramas.to(device)
 
         # 模型推理（完整扩散）
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
             output = model(
                 video_frames=video_frames,
                 instruction_text=instruction,
@@ -379,8 +379,7 @@ def main():
     args = parser.parse_args()
 
     # Load config
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(args.config)
 
     device = torch.device(args.device)
 

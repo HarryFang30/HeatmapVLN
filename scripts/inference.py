@@ -15,7 +15,6 @@ VLN Pipeline 推理脚本
 import argparse
 import logging
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -23,13 +22,13 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import yaml
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.training.model_builder import build_model
+from scripts.training.utils import load_config, make_autocast_context
 
 from src.models.pipeline import VLNPipeline
 
@@ -256,6 +255,7 @@ def run_inference(
     output_heatmap: bool = True,
     output_trajectory: bool = True,
     output_progress: bool = True,
+    amp_type: str = "bf16",
 ) -> dict[str, Any]:
     """Run inference.
 
@@ -282,12 +282,7 @@ def run_inference(
 
     device = next(model.parameters()).device
 
-    autocast_context = (
-        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
-        if device.type == 'cuda'
-        else nullcontext()
-    )
-    with autocast_context:
+    with make_autocast_context(device, amp_type):
         outputs = model(
             video_frames=frames.to(device),
             instruction_text=instruction,
@@ -332,8 +327,7 @@ def main():
         logger.error(f"Config file not found: {args.config}")
         return
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(args.config)
 
     # Default: output trajectory + progress
     if not args.output_heatmap and not args.output_trajectory and not args.output_progress:
@@ -406,6 +400,7 @@ def main():
         output_heatmap=args.output_heatmap,
         output_trajectory=args.output_trajectory,
         output_progress=args.output_progress,
+        amp_type=cfg.get('optim', {}).get('amp', 'bf16'),
     )
 
     # Save results

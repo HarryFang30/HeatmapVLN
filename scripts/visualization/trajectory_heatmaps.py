@@ -12,7 +12,6 @@ import logging
 import random
 import sys
 from collections import defaultdict
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from scripts.training.model_builder import build_model
+from scripts.training.utils import make_autocast_context
 
 from src.data.factory import build_sliding_window_dataset
 from src.data.trajectory_utils import get_trajectory_relative_to_frame
@@ -47,7 +47,10 @@ SEP_COLOR = np.array([1.0, 0.85, 0.0], dtype=np.float32)  # yellow separator
 # ───────────────────── Inference ─────────────────────
 
 def infer_sample(
-    model: VLNPipeline, sample: dict[str, Any], device: torch.device,
+    model: VLNPipeline,
+    sample: dict[str, Any],
+    device: torch.device,
+    amp_type: str = "bf16",
 ) -> dict[str, torch.Tensor]:
     history_frames = sample['history_frames'].unsqueeze(0).to(device)
     current_frame = sample['current_frame'].unsqueeze(0).to(device)
@@ -59,12 +62,7 @@ def infer_sample(
     current_views = current_views.unsqueeze(0).to(device)
     history_panoramas = history_panoramas.unsqueeze(0).to(device)
     video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
-    autocast_ctx = (
-        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
-        if device.type == 'cuda' else nullcontext()
-    )
-
-    with torch.no_grad(), autocast_ctx:
+    with torch.no_grad(), make_autocast_context(device, amp_type):
         outputs = model(
             video_frames=video_frames,
             instruction_text=[sample['text']],
@@ -636,7 +634,12 @@ def main() -> int:
             else:
                 hist_indices = np.linspace(0, current_t - 1, num_hist, dtype=int).tolist()
 
-            result = infer_sample(model, sample, device=device)
+            result = infer_sample(
+                model,
+                sample,
+                device=device,
+                amp_type=cfg.get('optim', {}).get('amp', 'bf16'),
+            )
             pred_raw = result['heatmaps']
             pred_vis = result.get('visibility')
             pred_gated = result.get('heatmaps_gated')

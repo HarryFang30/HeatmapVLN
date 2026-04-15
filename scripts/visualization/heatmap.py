@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from scripts.training.collate import collate_fn
 from scripts.training.model_builder import build_model
+from scripts.training.utils import make_autocast_context
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -245,7 +246,7 @@ def main():
         video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
         instruction_text = list(text) if text else None
 
-        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.no_grad(), make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
             vis_output = model(
                 video_frames=video_frames,
                 instruction_text=instruction_text,

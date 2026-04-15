@@ -68,7 +68,6 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
 import torch.distributed as dist
-from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -111,6 +110,7 @@ from scripts.training import (
     initialize_trainable_module_sync,
     load_checkpoint_for_resume,
     load_config,
+    make_grad_scaler,
     safe_torch_load,
     set_seed,
     set_trainable_modules,
@@ -580,7 +580,7 @@ def main():
     total_steps = total_batches // grad_accum_steps
     scheduler = build_scheduler(optimizer, cfg, total_steps)
     amp_type = cfg['optim'].get('amp', 'bf16')
-    scaler = GradScaler('cuda') if amp_type == 'fp16' else None
+    scaler = make_grad_scaler(dist_context.device, amp_type)
 
     if resume_path and Path(resume_path).exists():
         load_checkpoint_for_resume(

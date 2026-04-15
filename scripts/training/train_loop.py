@@ -41,6 +41,7 @@ from .utils import (
     _mean_timing,
     _unwrap_model,
     build_heatmap_loss_fn,
+    make_autocast_context,
 )
 from .visualization import (
     _select_primary_heatmap_slice,
@@ -211,7 +212,7 @@ def train_one_epoch(
 
         if enable_timing:
             forward_start = time.perf_counter()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with make_autocast_context(device, optim_cfg.get('amp', 'bf16')):
             if text and len(text) > 0:
                 instruction_text = list(text)
             else:
@@ -290,7 +291,7 @@ def train_one_epoch(
                         trajectory_loss = traj_result['loss']
 
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
-            trajectory_weight = loss_cfg.get('trajectory_weight', 1.0)
+            trajectory_weight = loss_cfg.get('trajectory_weight', 0.0)
 
             loss = heatmap_weight * heatmap_loss + trajectory_weight * trajectory_loss
             loss = loss / grad_accum_steps
