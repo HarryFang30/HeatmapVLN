@@ -127,7 +127,7 @@ model:
 training:
   stages:
     - name: stage2_selective_finetune
-      epochs: 2
+      epochs: 1
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: false
@@ -196,7 +196,7 @@ loss:
 # GPU配置 — 双卡
 # ============================================
 gpu:
-  devices: [0, 1, 2, 3]
+  devices: [0, 1, 2]
   backend: nccl
   multi_gpu:
     enabled: true

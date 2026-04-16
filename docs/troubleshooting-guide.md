@@ -183,12 +183,28 @@ def _noop(*a, **kw):
 def _make_stub(name, attrs=None):
     m = _types.ModuleType(name)
     m.__spec__ = _importlib.machinery.ModuleSpec(name, None)
-    m.__version__ = '2.8.3'
+    m.__version__ = '2.7.4'
+    m.__heatmapvln_stub__ = True
     if attrs:
         for k, v in attrs.items():
             setattr(m, k, v)
     sys.modules[name] = m
     return m
+
+class _FlashAttnKernelStub:
+    def fwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+    def varlen_fwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+    def bwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+    def varlen_bwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+_flash_kernel_stub = _FlashAttnKernelStub()
 
 _fa = _make_stub('flash_attn', {
     'flash_attn_func': _noop,
@@ -198,6 +214,8 @@ _make_stub('flash_attn_2_cuda')
 _make_stub('flash_attn.flash_attn_interface', {
     'flash_attn_func': _noop,
     'flash_attn_varlen_func': _noop,
+    'flash_attn_gpu': _flash_kernel_stub,
+    'flash_attn_cuda': _flash_kernel_stub,
 })
 _make_stub('flash_attn.bert_padding', {
     'index_first_axis': _noop,
@@ -214,6 +232,7 @@ _make_stub('flash_attn.layers.rotary', {
 
 - stub 模块必须有正确的 `__spec__` 属性，否则 `importlib.util.find_spec()` 会报 `ValueError`
 - 必须提供 transformers 源码中 `from flash_attn import ...` 实际引用的所有函数名
+- 如果环境里会经过 `xformers` / `diffusers` 的导入链，还必须补齐 `flash_attn.flash_attn_interface.flash_attn_gpu` 和 `flash_attn_cuda`
 - 模型加载时使用 `attn_implementation="sdpa"` 避免实际调用 flash attention
 
 ---
@@ -469,6 +488,45 @@ def _load_module_from_file(name, filepath):
 _load_module_from_file("vln_measures",
     os.path.join(base_dir, 'internnav', 'habitat_extensions', 'vln', 'measures.py'))
 ```
+
+如果当前评测脚本只需要 `OracleSuccess` / `OracleNavigationError` 两个 measure，更稳的做法是直接在脚本内本地注册，避免把旧 evaluator 一起导入：
+
+```python
+from habitat.core.embodied_task import EmbodiedTask, Measure
+from habitat.core.registry import registry
+from habitat.tasks.nav.nav import DistanceToGoal
+
+if registry.get_measure("OracleNavigationError") is None:
+    @registry.register_measure
+    class OracleNavigationError(Measure):
+        cls_uuid = "oracle_navigation_error"
+
+        def _get_uuid(self, *args, **kwargs):
+            return self.cls_uuid
+
+        def reset_metric(self, *args, task: EmbodiedTask, **kwargs):
+            task.measurements.check_measure_dependencies(self.uuid, [DistanceToGoal.cls_uuid])
+            self._metric = float("inf")
+            self.update_metric(task=task)
+
+        def update_metric(self, *args, task: EmbodiedTask, **kwargs):
+            distance_to_target = task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
+            self._metric = min(self._metric, distance_to_target)
+
+if registry.get_measure("OracleSuccess") is None:
+    @registry.register_measure
+    class OracleSuccess(Measure):
+        cls_uuid = "oracle_success"
+
+        def _get_uuid(self, *args, **kwargs):
+            return self.cls_uuid
+```
+
+### 要点
+
+- 只在配置里写 `cfg.TASK.ORACLE_SUCCESS.TYPE = "OracleSuccess"` 还不够，**对应类必须先注册到 Habitat registry**
+- `internnav.habitat_extensions.vln.__init__` 会连带导入不兼容的旧 evaluator，因此不能直接 `import internnav.habitat_extensions.vln`
+- 对于本项目的 Habitat 0.1.7 评测脚本，局部注册所需 measure 是最稳的路径
 
 ---
 

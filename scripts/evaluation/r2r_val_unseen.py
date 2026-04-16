@@ -43,12 +43,28 @@ def _noop(*a, **kw):
 def _make_stub(name, attrs=None):
     m = _types.ModuleType(name)
     m.__spec__ = _importlib.machinery.ModuleSpec(name, None)
-    m.__version__ = '2.8.3'
+    m.__version__ = '2.7.4'
+    m.__heatmapvln_stub__ = True
     if attrs:
         for k, v in attrs.items():
             setattr(m, k, v)
     sys.modules[name] = m
     return m
+
+class _FlashAttnKernelStub:
+    def fwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+    def varlen_fwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+    def bwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+    def varlen_bwd(self, *_args, **_kwargs):
+        return _noop(*_args, **_kwargs)
+
+_flash_kernel_stub = _FlashAttnKernelStub()
 
 _fa = _make_stub('flash_attn', {
     'flash_attn_func': _noop,
@@ -58,6 +74,8 @@ _make_stub('flash_attn_2_cuda')
 _fa_iface = _make_stub('flash_attn.flash_attn_interface', {
     'flash_attn_func': _noop,
     'flash_attn_varlen_func': _noop,
+    'flash_attn_gpu': _flash_kernel_stub,
+    'flash_attn_cuda': _flash_kernel_stub,
 })
 _fa_bert = _make_stub('flash_attn.bert_padding', {
     'index_first_axis': _noop,
@@ -116,13 +134,17 @@ import argparse
 import json
 import re
 from enum import IntEnum
+from pathlib import Path
 
 import habitat
 import quaternion
 import torch
 import tqdm
+from habitat.core.embodied_task import EmbodiedTask, Measure
+from habitat.core.registry import registry
 from habitat.config.default import Config as CN
 from habitat.config.default import get_config as get_habitat_default_config
+from habitat.tasks.nav.nav import DistanceToGoal
 from PIL import Image
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
@@ -132,6 +154,8 @@ from src.models.heatmap.input_constructor import construct_input
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
+DEFAULT_SCENES_DIR = "data/scene_data/mp3d_ce"
+DEFAULT_DATA_PATH = "data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"
 
 
 class ActionCode(IntEnum):
@@ -141,6 +165,109 @@ class ActionCode(IntEnum):
     RIGHT = 3
     LOOKUP = 4
     LOOKDOWN = 5
+
+
+def ensure_vln_measures_registered() -> None:
+    """Register custom VLN measures required by Habitat-Lab 0.1.7 evaluation."""
+
+    if registry.get_measure("OracleNavigationError") is None:
+        @registry.register_measure
+        class OracleNavigationError(Measure):
+            cls_uuid: str = "oracle_navigation_error"
+
+            def _get_uuid(self, *args, **kwargs) -> str:
+                return self.cls_uuid
+
+            def reset_metric(self, *args, task: EmbodiedTask, **kwargs) -> None:
+                task.measurements.check_measure_dependencies(self.uuid, [DistanceToGoal.cls_uuid])
+                self._metric = float("inf")
+                self.update_metric(task=task)
+
+            def update_metric(self, *args, task: EmbodiedTask, **kwargs) -> None:
+                distance_to_target = task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
+                self._metric = min(self._metric, distance_to_target)
+
+    if registry.get_measure("OracleSuccess") is None:
+        @registry.register_measure
+        class OracleSuccess(Measure):
+            cls_uuid: str = "oracle_success"
+
+            def __init__(self, *args, config=None, **kwargs):
+                self._config = config
+                super().__init__()
+
+            def _get_uuid(self, *args, **kwargs) -> str:
+                return self.cls_uuid
+
+            def reset_metric(self, *args, task: EmbodiedTask, **kwargs) -> None:
+                task.measurements.check_measure_dependencies(self.uuid, [DistanceToGoal.cls_uuid])
+                self._metric = 0.0
+                self.update_metric(task=task)
+
+            def update_metric(self, *args, task: EmbodiedTask, **kwargs) -> None:
+                distance_to_target = task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
+                self._metric = float(self._metric or distance_to_target < 3.0)
+
+
+def _expand_path_template(path_str: str, split: str) -> str:
+    expanded = os.path.expandvars(os.path.expanduser(path_str))
+    try:
+        return expanded.format(split=split)
+    except (KeyError, IndexError, ValueError):
+        return expanded
+
+
+def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
+    """Resolve dataset/scenes paths for the shared Habitat evaluation environment."""
+
+    requested_data_path = _expand_path_template(args.data_path, split)
+    data_path = Path(requested_data_path)
+    if data_path.exists():
+        args.data_path = str(data_path.resolve())
+    elif args.data_path == DEFAULT_DATA_PATH:
+        data_candidates = [
+            Path(f"/workspace/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"),
+            Path(f"/workspace/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz"),
+            Path(f"/workspace/R2R_VLNCE_v1-3/{split}/{split}.json.gz"),
+        ]
+        resolved = next((p for p in data_candidates if p.exists()), None)
+        if resolved is None:
+            attempted = "\n  - ".join([requested_data_path, *map(str, data_candidates)])
+            raise FileNotFoundError(
+                "Could not find the VLN-CE dataset file. Tried:\n"
+                f"  - {attempted}"
+            )
+        args.data_path = str(resolved.resolve())
+    else:
+        raise FileNotFoundError(
+            f"Configured --data_path does not exist: {requested_data_path}"
+        )
+
+    requested_scenes_dir = _expand_path_template(args.scenes_dir, split)
+    scenes_dir = Path(requested_scenes_dir)
+    if scenes_dir.exists():
+        args.scenes_dir = str(scenes_dir.resolve())
+    elif args.scenes_dir == DEFAULT_SCENES_DIR:
+        scenes_candidates = [
+            Path("/dataset/mp3d"),
+            Path("/dataset"),
+            Path("/workspace/InternNav/data/scene_data/mp3d_ce"),
+        ]
+        resolved = next((p for p in scenes_candidates if p.exists()), None)
+        if resolved is None:
+            attempted = "\n  - ".join([requested_scenes_dir, *map(str, scenes_candidates)])
+            raise FileNotFoundError(
+                "Could not find the MP3D scene directory. Tried:\n"
+                f"  - {attempted}"
+            )
+        args.scenes_dir = str(resolved.resolve())
+    else:
+        raise FileNotFoundError(
+            f"Configured --scenes_dir does not exist: {requested_scenes_dir}"
+        )
+
+    print(f"Using scenes_dir: {args.scenes_dir}")
+    print(f"Using data_path:  {args.data_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -435,6 +562,7 @@ def load_model(args, device: torch.device):
 
 def run_eval(args):
     device = torch.device(f"cuda:{args.gpu_id}")
+    ensure_vln_measures_registered()
 
     print(f"Loading model from config={args.config}, checkpoint={args.checkpoint}")
     model, train_cfg = load_model(args, device)
@@ -823,14 +951,15 @@ def main():
                         help="YAML config used for training (e.g. configs/train_config_internnav.yaml)")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Model checkpoint path (.pth)")
-    parser.add_argument("--scenes_dir", type=str, default="data/scene_data/mp3d_ce")
+    parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
     parser.add_argument("--data_path", type=str,
-                        default="data/vln_ce/raw_data/r2r/{split}/{split}.json.gz")
+                        default=DEFAULT_DATA_PATH)
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
     args = parser.parse_args()
+    _resolve_eval_paths(args)
     run_eval(args)
 
 
