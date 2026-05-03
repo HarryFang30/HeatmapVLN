@@ -96,12 +96,23 @@ def test_panoramic_sft_collator_builds_assistant_labels():
     assert row1_targets == tokenizer.encode("STOP", add_special_tokens=False)
 
 
-def test_panoramic_sft_collator_labels_turn_and_forward_fallbacks():
+def test_panoramic_sft_collator_labels_turns_and_skips_forward_by_default():
     collator = PanoramicTokenizedCollator(_FakeProcessor(), sft_mode=True)
     out = collator([
         _sample(discrete_action=2),
         _sample(discrete_action=3),
-        _sample(discrete_action=1),
+        _sample(discrete_action=5),
     ])
-    assert out["sft_target_text"] == ["←", "→", "↑"]
+    assert out["sft_target_text"] == ["←", "→", "↓"]
+    assert torch.any(out["pano_inputs"]["labels"] != IGNORE_INDEX)
+
+
+def test_panoramic_sft_collator_can_label_forward_when_enabled():
+    collator = PanoramicTokenizedCollator(
+        _FakeProcessor(),
+        sft_mode=True,
+        sft_include_forward=True,
+    )
+    out = collator([_sample(discrete_action=1)])
+    assert out["sft_target_text"] == ["↑"]
     assert torch.any(out["pano_inputs"]["labels"] != IGNORE_INDEX)

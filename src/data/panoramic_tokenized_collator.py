@@ -69,7 +69,7 @@ class PanoramicTokenizedCollator:
         *,
         sft_mode: bool = False,
         sft_include_turns: bool = True,
-        sft_include_forward: bool = True,
+        sft_include_forward: bool = False,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -155,9 +155,50 @@ class PanoramicTokenizedCollator:
             return "←"
         if self.sft_include_turns and discrete_action == 3:
             return "→"
+        if self.sft_include_turns and discrete_action == 5:
+            return "↓"
         if self.sft_include_forward and discrete_action == 1:
             return "↑"
         return None
+
+    def _assistant_sequence_for_labeling(
+        self,
+        target_text: str,
+    ) -> tuple[list[int], list[int]]:
+        """Return the assistant message ids and matching label ids.
+
+        InternNav masks the chat-role prefix of assistant turns but keeps the
+        assistant content and the chat end token in the CE target.  Matching the
+        full assistant turn preserves that behavior when the tokenizer exposes
+        ``apply_chat_template``; simple test tokenizers fall back to content-only
+        labels.
+        """
+        tokenizer = self.processor.tokenizer
+        apply_template = getattr(tokenizer, "apply_chat_template", None)
+        if callable(apply_template):
+            try:
+                assistant_ids = apply_template(
+                    [{"role": "assistant", "content": target_text}],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                )
+                if torch.is_tensor(assistant_ids):
+                    assistant_ids = assistant_ids.tolist()
+                if assistant_ids and isinstance(assistant_ids[0], list):
+                    assistant_ids = assistant_ids[0]
+                assistant_ids = [int(x) for x in assistant_ids]
+                if assistant_ids:
+                    label_ids = assistant_ids.copy()
+                    # InternNav's preprocessing masks the first three tokens:
+                    # <|im_start|>, assistant, newline.
+                    for i in range(min(3, len(label_ids))):
+                        label_ids[i] = IGNORE_INDEX
+                    return assistant_ids, label_ids
+            except Exception:
+                pass
+
+        target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+        return target_ids, target_ids
 
     def _build_sft_labels(
         self,
@@ -171,26 +212,37 @@ class PanoramicTokenizedCollator:
         for batch_idx, target_text in enumerate(target_texts):
             if not target_text:
                 continue
-            target_ids = tokenizer.encode(target_text, add_special_tokens=False)
-            if not target_ids:
+            match_ids, label_ids = self._assistant_sequence_for_labeling(target_text)
+            if not match_ids:
                 continue
 
             row = input_ids[batch_idx].tolist()
-            start = self._find_last_subsequence(row, target_ids)
+            start = self._find_last_subsequence(row, match_ids)
             if start < 0:
                 # Some tokenizers attach whitespace around short assistant
                 # responses.  Try a tiny set of stable variants before giving up.
                 for variant in (f" {target_text}", f"\n{target_text}"):
-                    variant_ids = tokenizer.encode(variant, add_special_tokens=False)
+                    variant_ids, variant_label_ids = self._assistant_sequence_for_labeling(variant)
                     start = self._find_last_subsequence(row, variant_ids)
                     if start >= 0:
-                        target_ids = variant_ids
+                        match_ids = variant_ids
+                        label_ids = variant_label_ids
                         break
             if start < 0:
-                continue
+                target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+                start = self._find_last_subsequence(row, target_ids)
+                if start < 0:
+                    continue
+                match_ids = target_ids
+                label_ids = target_ids
 
-            end = start + len(target_ids)
-            labels[batch_idx, start:end] = input_ids[batch_idx, start:end]
+            end = start + len(match_ids)
+            if len(label_ids) != len(match_ids):
+                continue
+            label_tensor = torch.tensor(label_ids, dtype=labels.dtype, device=labels.device)
+            keep = label_tensor != IGNORE_INDEX
+            if keep.any():
+                labels[batch_idx, start:end][keep] = input_ids[batch_idx, start:end][keep]
 
         if attention_mask is not None:
             labels = labels.masked_fill(attention_mask == 0, IGNORE_INDEX)

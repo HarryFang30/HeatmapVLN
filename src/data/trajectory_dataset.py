@@ -92,6 +92,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         load_traj_images: bool = False,
         traj_image_size: tuple[int, int] = (224, 224),
         compute_pixel_goal: bool = False,
+        require_sft_target: bool = False,
+        sft_include_turns: bool = True,
+        sft_include_forward: bool = False,
         include_stop_samples_random_subsequence: bool = False,
         # FGR2R 子指令配置
         fgr2r_subinstr_path: str | None = None,
@@ -124,6 +127,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
         self.load_traj_images = load_traj_images
         self.compute_pixel_goal = compute_pixel_goal or load_traj_images
+        self.require_sft_target = require_sft_target
+        self.sft_include_turns = sft_include_turns
+        self.sft_include_forward = sft_include_forward
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
@@ -140,8 +146,37 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}, "
             f"load_traj_images={self.load_traj_images}, "
             f"compute_pixel_goal={self.compute_pixel_goal}, "
+            f"require_sft_target={self.require_sft_target}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
+
+    def set_epoch(self, epoch: int):
+        super().set_epoch(epoch)
+
+    def _result_has_system2_sft_target(self, result: dict[str, Union[torch.Tensor, str, float]]) -> bool:
+        if result.get("is_stop", 0.0) > 0.5 or int(result.get("discrete_action", 1)) == 0:
+            return True
+        if result.get("pixel_goal") is not None:
+            return True
+
+        discrete_action = int(result.get("discrete_action", 1))
+        if self.sft_include_turns and discrete_action in (2, 3, 5):
+            return True
+        if self.sft_include_forward and discrete_action == 1:
+            return True
+        return False
+
+    def _retry_system2_sft_sample(self, idx: int):
+        depth = getattr(self, "_system2_sft_retry_depth", 0)
+        if depth >= 32 or len(self.sample_index) <= 1:
+            return None
+
+        next_idx = (idx + depth + 1) % len(self.sample_index)
+        self._system2_sft_retry_depth = depth + 1
+        try:
+            return self.__getitem__(next_idx)
+        finally:
+            self._system2_sft_retry_depth = depth
 
     def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int,
                              direction: str = "front") -> np.ndarray:
@@ -717,6 +752,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 if K is not None:
                     result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
 
+            if self.require_sft_target and not self._result_has_system2_sft_target(result):
+                retry_sample = self._retry_system2_sft_sample(idx)
+                if retry_sample is not None:
+                    return retry_sample
+
             return result
 
         except Exception as e:
@@ -731,6 +771,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         base_sample["trajectory"] = torch.zeros(self.predict_horizon, 3)
         base_sample["trajectory_valid"] = 0.0
         base_sample["progress"] = 0.0
+        if getattr(self, "require_sft_target", False):
+            base_sample["discrete_action"] = 0
+            base_sample["is_stop"] = 1.0
         return base_sample
 
 

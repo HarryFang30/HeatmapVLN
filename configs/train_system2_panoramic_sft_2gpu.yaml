@@ -8,7 +8,8 @@ seed: 42
 #   让 Qwen/LoRA 在全景输入下学会直接输出:
 #     - 前视图 pixel-goal: "x y"
 #     - 已完成: "STOP"
-#     - 目标不在前视图: "←" / "→" / "↑"
+#     - InternNav 风格离散转向: "←" / "→" / "↓"
+#   与 InternNav 对齐: 不把无 pixel-goal 的 forward 样本标成 "↑" 训练。
 #
 # 启动方式:
 #   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
@@ -49,6 +50,9 @@ data:
     use_subinstruction: true
     fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
     compute_pixel_goal: true
+    require_sft_target: true
+    sft_include_turns: true
+    sft_include_forward: false
     load_traj_images: false
     traj_image_size: [224, 224]
 
@@ -92,7 +96,7 @@ training:
       train_future: false
       train_action: false
       sft_include_turns: true
-      sft_include_forward: true
+      sft_include_forward: false
       strict_trainable_modules: true
       trainable_modules:
         - lora

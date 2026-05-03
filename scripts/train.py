@@ -512,7 +512,7 @@ def main():
             n_traj_query=n_traj_query,
             sft_mode=train_lm,
             sft_include_turns=stage_cfg.get('sft_include_turns', True),
-            sft_include_forward=stage_cfg.get('sft_include_forward', True),
+            sft_include_forward=stage_cfg.get('sft_include_forward', False),
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled (n_traj_query=%d, sft_mode=%s)",
