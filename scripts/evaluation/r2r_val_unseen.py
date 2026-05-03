@@ -23,6 +23,7 @@ Adapted for habitat-lab 0.1.7 (YACS config).
 import faulthandler
 import os
 import sys
+from pathlib import Path
 
 faulthandler.enable()
 
@@ -31,6 +32,27 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 # ═══════════════════════════════════════════════════════════════════════
 # Section 1: Runtime patches (must be before any heavy imports)
 # ═══════════════════════════════════════════════════════════════════════
+
+# Keep Transformers on the PyTorch path only.  Importing TensorFlow after a
+# Habitat-Sim GL context has been created can segfault in this environment.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+# The installed habitat_sim is GLX-based, not EGL/headless.  On this node,
+# forcing NVIDIA GLX through Xvfb crashes with X11 BadWindow; Mesa llvmpipe is
+# slower but stable enough for correctness evaluation.  Operators can opt back
+# into NVIDIA GLX if their display stack supports it.
+if (
+    os.environ.get("__GLX_VENDOR_LIBRARY_NAME") == "nvidia"
+    and os.environ.get("HEATMAPVLN_ALLOW_NVIDIA_GLX", "0") != "1"
+):
+    os.environ.pop("__GLX_VENDOR_LIBRARY_NAME", None)
+    print(
+        "WARNING: disabled __GLX_VENDOR_LIBRARY_NAME=nvidia for Habitat GLX "
+        "stability. Set HEATMAPVLN_ALLOW_NVIDIA_GLX=1 to keep it.",
+        flush=True,
+    )
 
 # Block flash_attn import (GLIBC_2.32 not available on this system)
 import importlib as _importlib
@@ -100,22 +122,63 @@ if not hasattr(np, 'int'):
 if not hasattr(np, 'bool'):
     np.bool = np.bool_
 
-# Initialize NVIDIA GL context BEFORE numba/LLVM is loaded.
-import habitat_sim as _hsim
+def _find_preinit_scene() -> str | None:
+    candidates = [
+        os.environ.get("HEATMAPVLN_PREINIT_SCENE"),
+        "/dataset/mp3d/mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+        "/workspace/InternNav/data/scene_data/mp3d_ce/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
 
-_dummy_cfg = _hsim.SimulatorConfiguration()
-# For GLX builds, pre-initialisation must use the *local visible* GPU index.
-# When users launch with e.g. CUDA_VISIBLE_DEVICES=4 and --gpu_id 0, Habitat's
-# actual simulator later runs on local GPU 0 (the remapped visible device).
-# Parsing CUDA_VISIBLE_DEVICES here would incorrectly request physical GPU 4
-# from GLX, which fails on multi-GPU systems.
-_dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
-_dummy_agent = _hsim.agent.AgentConfiguration()
-_dummy_agent.sensor_specifications = [_hsim.CameraSensorSpec()]
-_dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
-_dummy_sim.close()
-del _dummy_sim, _dummy_cfg, _dummy_agent
-print("GL context pre-initialized (NVIDIA GPU)", flush=True)
+    for root in (Path("/dataset/mp3d/mp3d"), Path("/dataset/mp3d")):
+        if not root.exists():
+            continue
+        try:
+            scene = next(root.glob("*/*.glb"))
+            return str(scene)
+        except StopIteration:
+            continue
+    return None
+
+
+# Create a real-scene GL context before importing habitat-lab, which imports
+# numba/LLVM.  A no-scene dummy simulator is not safe on this node.
+if os.environ.get("HEATMAPVLN_PREINIT_GL", "1") != "0" and os.environ.get("DISPLAY"):
+    _preinit_scene = _find_preinit_scene()
+    if _preinit_scene:
+        import habitat_sim as _hsim
+
+        _dummy_cfg = _hsim.SimulatorConfiguration()
+        _dummy_cfg.scene_id = _preinit_scene
+        _dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
+        _dummy_agent = _hsim.agent.AgentConfiguration()
+        _dummy_sensor = _hsim.CameraSensorSpec()
+        _dummy_sensor.uuid = "rgb"
+        _dummy_sensor.sensor_type = _hsim.SensorType.COLOR
+        _dummy_sensor.resolution = [64, 64]
+        _dummy_agent.sensor_specifications = [_dummy_sensor]
+        _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
+        _dummy_sim.get_sensor_observations()
+        _dummy_sim.close()
+        del _dummy_sim, _dummy_cfg, _dummy_agent, _dummy_sensor
+        print(f"GL context pre-initialized with scene: {_preinit_scene}", flush=True)
+    else:
+        print("WARNING: could not find an MP3D scene for GL pre-initialization", flush=True)
+
+if os.environ.get("HEATMAPVLN_PREINIT_EMPTY_GL", "0") == "1":
+    import habitat_sim as _hsim
+
+    _dummy_cfg = _hsim.SimulatorConfiguration()
+    # For GLX builds, pre-initialisation must use the local visible GPU index.
+    _dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
+    _dummy_agent = _hsim.agent.AgentConfiguration()
+    _dummy_agent.sensor_specifications = [_hsim.CameraSensorSpec()]
+    _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
+    _dummy_sim.close()
+    del _dummy_sim, _dummy_cfg, _dummy_agent
+    print("GL context pre-initialized (NVIDIA GPU)", flush=True)
 
 # Patch gym.spaces.Discrete to allow n=0 (habitat-lab 0.1.7 compatibility)
 import gym.spaces
@@ -140,7 +203,6 @@ import random
 import re
 from collections import OrderedDict
 from enum import IntEnum
-from pathlib import Path
 
 import habitat
 import quaternion
@@ -153,7 +215,7 @@ from habitat.config.default import get_config as get_habitat_default_config
 from habitat.tasks.nav.nav import DistanceToGoal
 from PIL import Image
 from scripts.training.model_builder import build_model
-from scripts.training.utils import load_config
+from scripts.training.utils import _normalize_state_key, load_config
 
 from src.data.vln_sliding_window_dataset import compute_history_rel_poses
 from src.models.heatmap.input_constructor import construct_input
@@ -322,6 +384,152 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
     print(f"Using data_path:  {args.data_path}")
 
 
+def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
+    """Read a checkpoint and return the tensor state dict it contains."""
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"Unsupported checkpoint format: {checkpoint_path}")
+
+    for key in ("model_state_dict", "trainable_state_dict", "state_dict"):
+        state_dict = ckpt.get(key)
+        if isinstance(state_dict, dict):
+            return state_dict
+
+    if all(torch.is_tensor(value) for value in ckpt.values()):
+        return ckpt
+
+    raise KeyError(
+        f"Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: "
+        f"{checkpoint_path}"
+    )
+
+
+def _state_has_prefix(state_dict: dict[str, torch.Tensor] | None, prefix: str) -> bool:
+    if not state_dict:
+        return False
+    return any(_normalize_state_key(key).startswith(prefix) for key in state_dict)
+
+
+def _looks_action_only(state_dict: dict[str, torch.Tensor]) -> bool:
+    if not state_dict:
+        return False
+    prefixes = {_normalize_state_key(key).split(".", 1)[0] for key in state_dict}
+    return prefixes.issubset({"latent_queries", "nextdit_action_head"})
+
+
+def _load_compatible_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    checkpoint_path: str,
+    label: str,
+) -> int:
+    """Load matching tensors while handling DDP and legacy backbone prefixes."""
+    current_state = model.state_dict()
+    normalized_to_actual = {
+        _normalize_state_key(name): name
+        for name in current_state
+    }
+
+    remapped: dict[str, torch.Tensor] = {}
+    skipped_shape: list[str] = []
+    skipped_missing: list[str] = []
+    for name, value in state_dict.items():
+        normalized_name = _normalize_state_key(name)
+        actual_name = normalized_to_actual.get(normalized_name)
+        if actual_name is None:
+            skipped_missing.append(name)
+            continue
+        if current_state[actual_name].shape != value.shape:
+            skipped_shape.append(
+                f"{actual_name}: ckpt {tuple(value.shape)} vs "
+                f"model {tuple(current_state[actual_name].shape)}"
+            )
+            continue
+        remapped[actual_name] = value
+
+    missing, unexpected = model.load_state_dict(remapped, strict=False)
+    print(
+        f"{label} loaded: {checkpoint_path} "
+        f"(loaded={len(remapped)}/{len(state_dict)}, "
+        f"missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+    if skipped_missing:
+        sample = ", ".join(skipped_missing[:5])
+        print(f"  skipped unmatched keys: {len(skipped_missing)}; examples: {sample}")
+    if skipped_shape:
+        print(
+            "  skipped shape-mismatched keys: "
+            f"{len(skipped_shape)}; examples: {'; '.join(skipped_shape[:3])}"
+        )
+    return len(remapped)
+
+
+def _prepare_progress_file(args, output_path: str) -> str:
+    if args.resume and args.overwrite_output:
+        raise ValueError("--resume and --overwrite_output cannot be used together")
+
+    os.makedirs(output_path, exist_ok=True)
+    progress_file = os.path.join(output_path, "progress.json")
+    result_file = os.path.join(output_path, "result.json")
+
+    if args.overwrite_output:
+        for path in (progress_file, result_file):
+            if os.path.exists(path):
+                os.remove(path)
+        return progress_file
+
+    if os.path.exists(progress_file) and not args.resume:
+        raise FileExistsError(
+            f"Found existing progress file: {progress_file}. "
+            "Pass --resume to continue it, --overwrite_output to start fresh, "
+            "or choose a new --output_path."
+        )
+
+    return progress_file
+
+
+def _load_progress(progress_file: str) -> tuple[list[float], list[float], list[float], list[float], set]:
+    sucs, spls, oss, nes = [], [], [], []
+    done_set: set = set()
+    if not os.path.exists(progress_file):
+        return sucs, spls, oss, nes, done_set
+
+    results_by_episode: OrderedDict[tuple[str, int], dict] = OrderedDict()
+    loose_results: list[dict] = []
+    with open(progress_file) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            res = json.loads(line)
+            scene_id = res.get("scene_id")
+            episode_id = res.get("episode_id")
+            if scene_id is None or episode_id is None:
+                loose_results.append(res)
+                continue
+            key = (scene_id, int(episode_id))
+            results_by_episode[key] = res
+
+    for key, res in results_by_episode.items():
+        done_set.add(key)
+        sucs.append(res["success"])
+        spls.append(res["spl"])
+        oss.append(res["os"])
+        nes.append(res["ne"])
+    for res in loose_results:
+        sucs.append(res["success"])
+        spls.append(res["spl"])
+        oss.append(res["os"])
+        nes.append(res["ne"])
+
+    return sucs, spls, oss, nes, done_set
+
+
+def _eval_limit(args, remaining: int) -> int:
+    if args.max_episodes is None:
+        return remaining
+    return min(remaining, max(args.max_episodes, 0))
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 3: Habitat config
 # ═══════════════════════════════════════════════════════════════════════
@@ -344,7 +552,7 @@ def build_habitat_config(args):
     cfg.SIMULATOR.FORWARD_STEP_SIZE = 0.25
     cfg.SIMULATOR.TURN_ANGLE = 15
     cfg.SIMULATOR.TILT_ANGLE = 15
-    cfg.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.gpu_id
+    cfg.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.sim_gpu_id
     cfg.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING = True
 
     cfg.SIMULATOR.AGENT_0.SENSORS = ["RGB_SENSOR", "DEPTH_SENSOR"]
@@ -611,25 +819,63 @@ def prepare_vlm_inputs(
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_model(args, device: torch.device):
-    """Build VLNPipeline, load checkpoint, and initialise the Qwen backbone."""
+    """Build VLNPipeline, initialise lazy modules, then load checkpoints."""
     cfg = load_config(args.config)
     model = build_model(cfg, device=str(device), verbose=False)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state_dict = ckpt.get(
-        "model_state_dict", ckpt.get("trainable_state_dict", ckpt)
-    )
-    if state_dict and next(iter(state_dict.keys())).startswith("module."):
-        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(
-        f"Checkpoint loaded: {args.checkpoint}  "
-        f"(missing={len(missing)}, unexpected={len(unexpected)})"
+    model = model.to(device)
+
+    base_state_dict = None
+    if args.base_checkpoint:
+        base_state_dict = _extract_checkpoint_state_dict(args.base_checkpoint)
+    checkpoint_state_dict = (
+        _extract_checkpoint_state_dict(args.checkpoint)
+        if args.checkpoint else None
     )
 
-    model = model.to(device)
-    model.eval()
+    if checkpoint_state_dict and _looks_action_only(checkpoint_state_dict) and not args.base_checkpoint:
+        print(
+            "WARNING: the main checkpoint contains only action-head weights. "
+            "If this Stage 2 run depends on a Stage 1 LoRA/heatmap checkpoint, "
+            "pass it with --base_checkpoint before evaluating."
+        )
+    if not args.base_checkpoint and checkpoint_state_dict is None:
+        print(
+            "WARNING: no checkpoint was supplied; evaluating the model initialized "
+            "from config/pretrained weights only."
+        )
+
+    # Qwen/LoRA is lazy.  It must exist before loading Stage 1 LoRA weights;
+    # otherwise qwen*.model.* keys are silently treated as unexpected.
     model.qwen2_5_vl._load_model()
+
+    if (
+        _state_has_prefix(base_state_dict, "heatmap_vln.")
+        or _state_has_prefix(checkpoint_state_dict, "heatmap_vln.")
+    ):
+        model._ensure_heatmap_vln()
+
+    if base_state_dict:
+        _load_compatible_state_dict(
+            model,
+            base_state_dict,
+            args.base_checkpoint,
+            label="Base checkpoint",
+        )
+    if checkpoint_state_dict:
+        _load_compatible_state_dict(
+            model,
+            checkpoint_state_dict,
+            args.checkpoint,
+            label="Main checkpoint",
+        )
+
+    del checkpoint_state_dict
+    del base_state_dict
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    model.eval()
     return model, cfg
 
 
@@ -654,30 +900,25 @@ def _run_eval_panoramic_vlm(
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
 
-    sucs, spls, oss, nes = [], [], [], []
-    done_set: set = set()
     output_path = args.output_path
-    os.makedirs(output_path, exist_ok=True)
-    progress_file = os.path.join(output_path, "progress.json")
-    if os.path.exists(progress_file):
-        with open(progress_file) as f:
-            for line in f:
-                res = json.loads(line)
-                sucs.append(res["success"])
-                spls.append(res["spl"])
-                oss.append(res["os"])
-                nes.append(res["ne"])
-                if "scene_id" in res:
-                    done_set.add((res["scene_id"], res["episode_id"]))
+    progress_file = _prepare_progress_file(args, output_path)
+    sucs, spls, oss, nes, done_set = _load_progress(progress_file)
 
     remaining = num_episodes - len(done_set)
-    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}")
+    eval_limit = _eval_limit(args, remaining)
+    print(
+        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
+        f"this run: {eval_limit}"
+    )
 
-    process_bar = tqdm.tqdm(total=remaining, desc="Evaluating")
+    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating")
     seen_episodes: set = set()
     eval_count = 0
 
     while True:
+        if eval_count >= eval_limit:
+            break
+
         observations = env.reset()
         episode = env.current_episode
         scene_id = episode.scene_id.split("/")[-2]
@@ -694,7 +935,7 @@ def _run_eval_panoramic_vlm(
         instruction = episode.instruction.instruction_text
         eval_count += 1
         print(
-            f"\n[{eval_count}/{remaining}] Episode {scene_id}_{episode_id:04d}: "
+            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
             f"{instruction[:80]}..."
         )
 
@@ -710,7 +951,7 @@ def _run_eval_panoramic_vlm(
         step_id = 0
         done = False
 
-        while (not done) and (step_id <= max_steps_per_episode):
+        while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
 
             if local_actions:
@@ -997,7 +1238,9 @@ def run_eval(args):
     device = torch.device(f"cuda:{args.gpu_id}")
     ensure_vln_measures_registered()
 
-    print(f"Loading model from config={args.config}, checkpoint={args.checkpoint}")
+    print(f"Loading model from config={args.config}, checkpoint={args.checkpoint or '<none>'}")
+    if args.base_checkpoint:
+        print(f"Loading base checkpoint first: {args.base_checkpoint}")
     model, train_cfg = load_model(args, device)
     processor = model.qwen2_5_vl.processor
     processor.tokenizer.padding_side = "left"
@@ -1040,32 +1283,27 @@ def run_eval(args):
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
 
-    # ── Resume support ──
-    sucs, spls, oss, nes = [], [], [], []
-    done_set: set = set()
+    # ── Resume / output management ──
     output_path = args.output_path
-    os.makedirs(output_path, exist_ok=True)
-    progress_file = os.path.join(output_path, "progress.json")
-    if os.path.exists(progress_file):
-        with open(progress_file) as f:
-            for line in f:
-                res = json.loads(line)
-                sucs.append(res["success"])
-                spls.append(res["spl"])
-                oss.append(res["os"])
-                nes.append(res["ne"])
-                if "scene_id" in res:
-                    done_set.add((res["scene_id"], res["episode_id"]))
+    progress_file = _prepare_progress_file(args, output_path)
+    sucs, spls, oss, nes, done_set = _load_progress(progress_file)
 
     remaining = num_episodes - len(done_set)
-    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}")
+    eval_limit = _eval_limit(args, remaining)
+    print(
+        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
+        f"this run: {eval_limit}"
+    )
 
-    process_bar = tqdm.tqdm(total=remaining, desc="Evaluating")
+    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating")
     seen_episodes: set = set()
     eval_count = 0
 
     # ── Episode loop (iterator-driven, see ReadBeforeEvaluatingHabitat.md §16) ──
     while True:
+        if eval_count >= eval_limit:
+            break
+
         observations = env.reset()
         episode = env.current_episode
         scene_id = episode.scene_id.split("/")[-2]
@@ -1082,7 +1320,7 @@ def run_eval(args):
         instruction = episode.instruction.instruction_text
         eval_count += 1
         print(
-            f"\n[{eval_count}/{remaining}] Episode {scene_id}_{episode_id:04d}: "
+            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
             f"{instruction[:80]}..."
         )
 
@@ -1100,7 +1338,7 @@ def run_eval(args):
         step_id = 0
         done = False
 
-        while (not done) and (step_id <= max_steps_per_episode):
+        while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
             print(
                 f"  [step_id={step_id}] Capturing observations + VLM inference ...",
@@ -1397,19 +1635,31 @@ def main():
     )
     parser.add_argument("--config", type=str, required=True,
                         help="YAML config used for training (e.g. configs/train_config_internnav.yaml)")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Model checkpoint path (.pth)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Optional main/Stage 2 checkpoint path (.pth)")
+    parser.add_argument("--base_checkpoint", type=str, default=None,
+                        help="Optional Stage 1/base checkpoint loaded before --checkpoint")
     parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
     parser.add_argument("--data_path", type=str,
                         default=DEFAULT_DATA_PATH)
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
-    parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument("--gpu_id", type=int, default=0,
+                        help="Torch CUDA device id for model inference")
+    parser.add_argument("--sim_gpu_id", type=int, default=0,
+                        help="Habitat-Sim GL device id; keep 0 for GLX/Xvfb builds")
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
+    parser.add_argument("--max_episodes", type=int, default=None,
+                        help="Evaluate at most this many new episodes")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from output_path/progress.json")
+    parser.add_argument("--overwrite_output", action="store_true",
+                        help="Delete output_path/progress.json and result.json before evaluating")
     args = parser.parse_args()
     _resolve_eval_paths(args)
+    _prepare_progress_file(args, args.output_path)
     run_eval(args)
 
 

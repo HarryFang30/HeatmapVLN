@@ -268,7 +268,11 @@ class PackingCollatorForVLN:
         # 轨迹数据集的额外字段
         if 'trajectory' in batch[0]:
             packed_batch['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
-            packed_batch['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
+            trajectory_valid = [s.get('trajectory_valid', 0.0) for s in batch]
+            if torch.is_tensor(trajectory_valid[0]):
+                packed_batch['trajectory_valid'] = torch.stack(trajectory_valid, dim=0)
+            else:
+                packed_batch['trajectory_valid'] = torch.tensor(trajectory_valid)
             packed_batch['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
 
         return packed_batch

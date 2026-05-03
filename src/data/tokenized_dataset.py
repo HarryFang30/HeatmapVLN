@@ -379,7 +379,11 @@ class FlattenedCollatorForVLN:
         trajectories = [inst.get('trajectory') for inst in instances]
         if all(t is not None for t in trajectories):
             batch['trajectory'] = torch.stack(trajectories, dim=0)
-            batch['trajectory_valid'] = torch.tensor([inst.get('trajectory_valid', 0.0) for inst in instances])
+            trajectory_valid = [inst.get('trajectory_valid', 0.0) for inst in instances]
+            if torch.is_tensor(trajectory_valid[0]):
+                batch['trajectory_valid'] = torch.stack(trajectory_valid, dim=0)
+            else:
+                batch['trajectory_valid'] = torch.tensor(trajectory_valid)
             batch['progress'] = torch.tensor([inst.get('progress', 0.0) for inst in instances])
 
         # GPU 热力图计算数据（如果有）

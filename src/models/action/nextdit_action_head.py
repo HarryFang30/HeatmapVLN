@@ -7,7 +7,8 @@ Ported from InternNav's InternVLA-N1 (nextdit_async mode).
 Architecture (async):
     traj_hidden_states (B, n_query, vlm_hidden_dim)
         -> cond_projector -> (B, n_query, latent_emb_size)
-    traj_images [pixel_goal, current] (B, 2, H, W, 3)
+    traj_images [anchor, current] (B, 2, H, W, 3)
+        or training sequence frames (B, N, H, W, 3)
         -> DINOv2 (frozen) -> (B, 2, 256, 384)
         -> flatten -> (B, 512, 384)
         -> MemoryEncoder (self-attn) -> (B, 512, 384)
@@ -257,10 +258,10 @@ class NextDiTActionHead(nn.Module):
 
     def _encode_visual_memory(self, traj_images: torch.Tensor) -> torch.Tensor:
         """
-        Process [pixel_goal, current] images through visual memory pipeline.
+        Process [anchor, current] images through visual memory pipeline.
 
         Args:
-            traj_images: (B, 2, H, W, 3) — [pixel_goal_image, current_image], float [0,1]
+            traj_images: (B, 2, H, W, 3) — [anchor_image, current_image], float [0,1]
 
         Returns:
             memory_tokens: (B, qformer_num_query, latent_emb_size)
@@ -285,6 +286,51 @@ class NextDiTActionHead(nn.Module):
 
         memory_tokens = self.rgb_resampler(memory_feat)  # (B, qformer_num_query, 768)
         return memory_tokens
+
+    @staticmethod
+    def _expand_sequence_training_inputs(
+        traj_hidden_states: torch.Tensor,
+        gt_trajectory: torch.Tensor,
+        traj_images: torch.Tensor | None,
+        trajectory_valid: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Flatten InternNav-style multi-current training samples.
+
+        Training may provide ``traj_images`` as ``(B, N, H, W, 3)`` and
+        trajectories as ``(B, N, T, 3)``.  The first image is the fixed anchor;
+        each of the N images becomes the current image for one trajectory loss.
+        Evaluation still passes explicit pairs as ``(B, 2, H, W, 3)``.
+        """
+        if (
+            traj_images is None
+            or traj_images.ndim != 5
+            or gt_trajectory.ndim != 4
+        ):
+            return traj_hidden_states, gt_trajectory, traj_images, trajectory_valid
+
+        batch_size, num_frames = traj_images.shape[:2]
+        anchor_images = traj_images[:, 0:1].repeat(
+            1, num_frames, 1, 1, 1
+        ).flatten(0, 1)
+        current_images = traj_images.flatten(0, 1)
+        traj_image_pairs = torch.stack([anchor_images, current_images], dim=1)
+
+        traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(
+            1, num_frames, 1, 1
+        ).flatten(0, 1)
+        gt_trajectory = gt_trajectory.flatten(0, 1)
+        if trajectory_valid is not None:
+            trajectory_valid = trajectory_valid.flatten(0, 1)
+
+        expected = batch_size * num_frames
+        if traj_hidden_states.shape[0] != expected or gt_trajectory.shape[0] != expected:
+            raise RuntimeError(
+                "Failed to flatten sequence training inputs: "
+                f"expected {expected}, got hidden={traj_hidden_states.shape[0]}, "
+                f"trajectory={gt_trajectory.shape[0]}"
+            )
+
+        return traj_hidden_states, gt_trajectory, traj_image_pairs, trajectory_valid
 
     # ==================== Condition Fusion ====================
 
@@ -339,12 +385,18 @@ class NextDiTActionHead(nn.Module):
         Args:
             traj_hidden_states: (B, n_query, vlm_hidden_dim)
             gt_trajectory: (B, predict_steps, action_dim) — relative poses
-            traj_images: (B, 2, H, W, 3) — [pixel_goal, current]
-            trajectory_valid: (B,) — mask for valid samples
+            traj_images: (B, 2, H, W, 3) — [anchor, current], or
+                (B, N, H, W, 3) InternNav-style current-frame sequence.
+            trajectory_valid: (B,) or (B, N) — mask for valid samples
 
         Returns:
             Dict with 'loss' key
         """
+        traj_hidden_states, gt_trajectory, traj_images, trajectory_valid = (
+            self._expand_sequence_training_inputs(
+                traj_hidden_states, gt_trajectory, traj_images, trajectory_valid,
+            )
+        )
         latents = self._fuse_conditions(traj_hidden_states, traj_images)
 
         bsz = gt_trajectory.shape[0]
@@ -411,7 +463,7 @@ class NextDiTActionHead(nn.Module):
 
         Args:
             traj_hidden_states: (B, n_query, vlm_hidden_dim)
-            traj_images: (B, 2, H, W, 3) — [pixel_goal, current]
+            traj_images: (B, 2, H, W, 3) — [anchor, current]
             predict_step_nums: number of trajectory steps to predict
             guidance_scale: classifier-free guidance scale
             num_inference_steps: number of denoising steps

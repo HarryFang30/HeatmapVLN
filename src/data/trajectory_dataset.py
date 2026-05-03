@@ -120,6 +120,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
         self.load_traj_images = load_traj_images
         self.traj_image_size = traj_image_size
+        self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
 
         # 加载 FGR2R 子指令映射表
@@ -181,6 +182,22 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         if image.shape[:2] != (th, tw):
             image = cv2.resize(image, (tw, th))
         return image
+
+    def _load_poses_for_direction(self, clip_idx: int, direction: str) -> list[np.ndarray]:
+        """Load per-frame camera poses for a specific panoramic direction."""
+        try:
+            meta = self._load_meta(clip_idx)
+            num_frames = int(meta["num_frames"])
+            poses = [
+                np.array(
+                    self._get_chunk_frame_array(clip_idx, frame_idx, "pose", direction=direction),
+                    dtype=np.float32,
+                )
+                for frame_idx in range(num_frames)
+            ]
+            return poses
+        except Exception:
+            return self._load_poses(clip_idx)
 
     @staticmethod
     def _compute_pixel_goal(
@@ -370,6 +387,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         current_t: int,
         subseq_end: int,
         subseq_start: int = 0,
+        camera_deg: float = 0,
     ) -> tuple[np.ndarray, float, float]:
         """
         从位姿计算轨迹
@@ -408,7 +426,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         # 计算相对于当前帧的轨迹
         try:
-            relative_xyyaw = get_trajectory_relative_to_frame(future_poses_np, camera_deg=0)
+            relative_xyyaw = get_trajectory_relative_to_frame(future_poses_np, camera_deg=camera_deg)
 
             # 插值和重采样到 predict_horizon 步
             _, resampled_poses = interpolate_and_resample_trajectory(
@@ -490,6 +508,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
             # 5. 加载位姿
             poses = self._load_poses(clip_idx)
+            action_poses = poses
+            action_camera_deg = 0.0
+            if self.load_traj_images:
+                action_poses = self._load_poses_for_direction(clip_idx, "front_down")
+                action_camera_deg = float(meta.get("lookdown_pitch_deg", 30.0))
             history_poses = [poses[i] for i in history_indices]
             current_pose = poses[current_t]
 
@@ -528,7 +551,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
             # 8. 计算轨迹（使用子序列范围计算 progress）
             trajectory, trajectory_valid, progress = self._compute_trajectory(
-                poses, current_t, subseq_end, subseq_start
+                action_poses, current_t, subseq_end, subseq_start,
+                camera_deg=action_camera_deg,
             )
 
             # 9. 应用轨迹增强
@@ -571,19 +595,61 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 "text": text,                            # str
             }
 
-            # 12. traj_images for DualVLN visual memory [pixel_goal, current]
+            # 12. traj_images for DualVLN visual memory.
+            # InternNav stores a sequence of lookdown frames from the System 2
+            # trigger point onward; the action head repeats the first frame as
+            # the fixed anchor and pairs it with each current frame.  The pixel
+            # goal itself is carried by the generated text / latent queries,
+            # not by replacing the anchor with a privileged future goal view.
             if self.load_traj_images:
-                goal_frame_idx = min(subseq_end - 1, T - 1)
                 traj_view = "front_down"
+                goal_frame_idx = min(subseq_end - 1, T - 1)
+                goal_len = max(goal_frame_idx - current_t, 1)
+                interval = 2
+                frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
+                if len(frame_offsets) == 0:
+                    frame_offsets = np.array([0], dtype=np.int32)
+                if len(frame_offsets) > self.traj_sequence_max_len:
+                    interval = int(np.ceil(goal_len / self.traj_sequence_max_len))
+                    frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)[:self.traj_sequence_max_len]
+
+                traj_imgs_list: list[np.ndarray] = []
+                traj_poses_list: list[np.ndarray] = []
+                traj_valid_list: list[float] = []
                 try:
-                    goal_img = self._load_traj_image_raw(clip_dir, goal_frame_idx, direction=traj_view)
-                    curr_img = self._load_traj_image_raw(clip_dir, current_t, direction=traj_view)
+                    for offset in frame_offsets:
+                        frame_idx = min(current_t + int(offset), goal_frame_idx)
+                        curr_img = self._load_traj_image_raw(clip_dir, frame_idx, direction=traj_view)
+                        traj_i, valid_i, _progress_i = self._compute_trajectory(
+                            action_poses, frame_idx, subseq_end, current_t,
+                            camera_deg=action_camera_deg,
+                        )
+                        if self.enable_trajectory_augmentation and valid_i > 0:
+                            traj_i = apply_trajectory_augmentation(traj_i, p=0.5)
+                        traj_imgs_list.append(curr_img)
+                        traj_poses_list.append(traj_i)
+                        traj_valid_list.append(valid_i)
                 except (FileNotFoundError, ValueError, KeyError, OSError):
+                    traj_imgs_list = []
+
+                if not traj_imgs_list:
                     th, tw = self.traj_image_size[1], self.traj_image_size[0]
-                    goal_img = np.zeros((th, tw, 3), dtype=np.uint8)
-                    curr_img = np.zeros((th, tw, 3), dtype=np.uint8)
-                traj_imgs = np.stack([goal_img, curr_img], axis=0).astype(np.float32) / 255.0
-                result["traj_images"] = torch.from_numpy(traj_imgs)  # [2, H, W, 3]
+                    traj_imgs_list = [np.zeros((th, tw, 3), dtype=np.uint8)]
+                    traj_poses_list = [trajectory]
+                    traj_valid_list = [trajectory_valid]
+
+                pad_len = self.traj_sequence_max_len - len(traj_imgs_list)
+                if pad_len > 0:
+                    traj_imgs_list.extend([traj_imgs_list[-1].copy() for _ in range(pad_len)])
+                    traj_poses_list.extend([traj_poses_list[-1].copy() for _ in range(pad_len)])
+                    traj_valid_list.extend([0.0 for _ in range(pad_len)])
+
+                traj_imgs = np.stack(traj_imgs_list[:self.traj_sequence_max_len], axis=0).astype(np.float32) / 255.0
+                traj_poses = np.stack(traj_poses_list[:self.traj_sequence_max_len], axis=0).astype(np.float32)
+                traj_valids = np.asarray(traj_valid_list[:self.traj_sequence_max_len], dtype=np.float32)
+                result["traj_images"] = torch.from_numpy(traj_imgs)  # [N, H, W, 3]
+                result["trajectory"] = torch.from_numpy(traj_poses)  # [N, predict_horizon, 3]
+                result["trajectory_valid"] = torch.from_numpy(traj_valids)  # [N]
 
                 # Pixel-goal: project the *farthest visible* future
                 # waypoint onto the current front view, aligned with
@@ -602,7 +668,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 if pg is not None:
                     result["pixel_goal"] = pg
                 else:
-                    result["trajectory_valid"] = 0.0
+                    tv = result.get("trajectory_valid", 0.0)
+                    result["trajectory_valid"] = (
+                        torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
+                    )
 
             if gt_visibility is not None:
                 result["gt_visibility"] = gt_visibility  # [N, 4]

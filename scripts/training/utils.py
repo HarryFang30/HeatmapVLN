@@ -37,7 +37,20 @@ def _dist_backend() -> str | None:
 def _normalize_state_key(name: str) -> str:
     if name.startswith("module."):
         name = name[len("module."):]
-    return name.replace(".module.", ".")
+    name = name.replace(".module.", ".")
+
+    # Older HeatmapVLN checkpoints were saved before the backbone wrapper was
+    # renamed from qwen3_5 to qwen2_5_vl.  Normalise the prefix so Stage 1 LoRA
+    # weights remain loadable when used as init weights for newer runs.
+    prefix_aliases = {
+        "qwen3_5.": "qwen2_5_vl.",
+        "qwen3_5_vl.": "qwen2_5_vl.",
+    }
+    for old_prefix, new_prefix in prefix_aliases.items():
+        if name.startswith(old_prefix):
+            return new_prefix + name[len(old_prefix):]
+
+    return name
 
 
 def _normalized_model_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:

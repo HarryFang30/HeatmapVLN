@@ -81,7 +81,11 @@ def collate_fn(batch: list[dict]) -> dict[str, Any]:
 
     if 'trajectory' in batch[0]:
         result['trajectory'] = torch.stack([s['trajectory'] for s in batch], dim=0)
-        result['trajectory_valid'] = torch.tensor([s.get('trajectory_valid', 0.0) for s in batch])
+        trajectory_valid = [s.get('trajectory_valid', 0.0) for s in batch]
+        if torch.is_tensor(trajectory_valid[0]):
+            result['trajectory_valid'] = torch.stack(trajectory_valid, dim=0)
+        else:
+            result['trajectory_valid'] = torch.tensor(trajectory_valid)
         result['progress'] = torch.tensor([s.get('progress', 0.0) for s in batch])
 
     if 'history_rel_poses' in batch[0]:
