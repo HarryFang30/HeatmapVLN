@@ -128,9 +128,16 @@ from src.utils.notifier import create_notifier
 logger = logging.getLogger(__name__)
 
 
-def _log_notification_result(logger: logging.Logger, sent: bool, event_name: str) -> None:
+def _log_notification_result(
+    logger: logging.Logger,
+    sent: bool,
+    event_name: str,
+    error: str | None = None,
+) -> None:
     if sent:
         logger.info("📢 飞书通知已发送: %s", event_name)
+    elif error:
+        logger.warning("飞书通知未发送: %s (%s)", event_name, error)
     else:
         logger.warning("飞书通知未发送: %s", event_name)
 
@@ -436,7 +443,9 @@ def main():
                 stages=[stage_cfg],
                 total_epochs=total_epochs,
             )
-            _log_notification_result(logger, sent, "训练开始")
+            _log_notification_result(
+                logger, sent, "训练开始", getattr(notifier, "last_error", None)
+            )
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
 
@@ -914,7 +923,9 @@ def main():
                     is_best=is_best,
                     best_val_loss=best_val_loss,
                 )
-                _log_notification_result(logger, sent, f"Epoch {epoch}")
+                _log_notification_result(
+                    logger, sent, f"Epoch {epoch}", getattr(notifier, "last_error", None)
+                )
             except Exception as e:
                 logger.warning(f"飞书通知发送失败: {e}")
 
@@ -991,7 +1002,9 @@ def main():
                 best_val_loss=best_val_loss,
                 final_stage=stage_name,
             )
-            _log_notification_result(logger, sent, "训练完成")
+            _log_notification_result(
+                logger, sent, "训练完成", getattr(notifier, "last_error", None)
+            )
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
 

@@ -27,6 +27,7 @@ class FeishuNotifier:
         """
         self.webhook_url = webhook_url or os.environ.get('FEISHU_WEBHOOK_URL', '')
         self.enabled = enabled and bool(self.webhook_url)
+        self.last_error: str | None = None
 
         if self.enabled:
             logger.info(f"📢 FeishuNotifier enabled (webhook: ...{self.webhook_url[-20:]})")
@@ -35,7 +36,9 @@ class FeishuNotifier:
 
     def _send_message(self, content: dict) -> bool:
         """发送消息到飞书"""
+        self.last_error = None
         if not self.enabled:
+            self.last_error = "notifier disabled or empty webhook_url"
             return False
 
         try:
@@ -53,11 +56,11 @@ class FeishuNotifier:
                 if result.get('code') == 0 or result.get('StatusCode') == 0:
                     return True
                 else:
-                    logger.warning(f"Feishu API error: {result}")
+                    self.last_error = f"Feishu API error: {result}"
                     return False
 
         except Exception as e:
-            logger.warning(f"Failed to send Feishu notification: {e}")
+            self.last_error = str(e)
             return False
 
     def send_epoch_report(
