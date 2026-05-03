@@ -13,6 +13,33 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _drop_duplicate_trajectory_points(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Remove non-finite and consecutive duplicate 2D points.
+
+    ``scipy.interpolate.CubicSpline`` requires the distance coordinate to be
+    strictly increasing. Stationary frames can otherwise create zero-length
+    segments and make the whole trajectory target invalid.
+    """
+    points = np.asarray(points, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    points = points.reshape(-1, points.shape[-1])[:, :2]
+    finite_mask = np.isfinite(points).all(axis=1)
+    points = points[finite_mask]
+    if len(points) <= 1:
+        return points.astype(np.float32, copy=False)
+
+    eps_sq = float(eps * eps)
+    keep = np.zeros(len(points), dtype=bool)
+    keep[0] = True
+    last = points[0]
+    for idx in range(1, len(points)):
+        if float(np.sum((points[idx] - last) ** 2)) > eps_sq:
+            keep[idx] = True
+            last = points[idx]
+    return points[keep].astype(np.float32, copy=False)
+
+
 def compute_history_rel_poses(
     history_poses: list[np.ndarray],
     current_pose: np.ndarray,
@@ -112,6 +139,7 @@ def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 25, 
         return np.array([points[int(i)] for i in indices])
 
     total_distance = sample_length * interval
+    points = _drop_duplicate_trajectory_points(points)
 
     if len(points) == 0:
         return np.zeros((sample_length, 2))
@@ -123,6 +151,8 @@ def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 25, 
     segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
     cumulative_distances = np.cumsum(segment_lengths)
     cumulative_distances = np.insert(cumulative_distances, 0, 0)
+    if cumulative_distances[-1] <= 1e-6:
+        return np.tile(points[0], (sample_length, 1))
 
     if len(points) > 3:
         cs_x = CubicSpline(cumulative_distances, points[:, 0])
@@ -137,9 +167,19 @@ def smooth_and_resample_trajectory(points: np.ndarray, sample_length: int = 25, 
         smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
         smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
         smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
+        smoothed_points = _drop_duplicate_trajectory_points(smoothed_points)
+        smooth_diff = np.diff(smoothed_points, axis=0)
+        smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
+        smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
+        smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
     else:
         smoothed_points = points
         smooth_cumulative_distances = cumulative_distances
+
+    if len(smoothed_points) == 0:
+        return np.zeros((sample_length, 2))
+    if len(smoothed_points) == 1 or smooth_cumulative_distances[-1] <= 1e-6:
+        return np.tile(smoothed_points[0], (sample_length, 1))
 
     target_distances = np.linspace(0, total_distance, sample_length)
     resampled = np.zeros((sample_length, 2))
