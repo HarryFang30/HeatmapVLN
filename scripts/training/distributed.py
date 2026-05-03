@@ -103,6 +103,8 @@ def _get_supported_trainable_sync_modules(
     trainable = set(stage_cfg.get("trainable_modules", []))
     supported_trainable = {
         "heatmap_vln",
+        "lora",
+        "vlm_lora",
         "llm_projector",
         "nextdit_action_head",
         "latent_queries",
@@ -122,6 +124,22 @@ def _get_supported_trainable_sync_modules(
     if "llm_projector" in trainable and getattr(model, "llm_projector", None) is not None:
         if any(param.requires_grad for param in model.llm_projector.parameters()):
             sync_modules.append(("llm_projector", model.llm_projector))
+
+    if "lora" in trainable or "vlm_lora" in trainable:
+        vlm_backbone = getattr(model, "vlm_backbone", getattr(model, "qwen2_5_vl", None))
+        if vlm_backbone is None:
+            raise RuntimeError("LoRA is trainable but no VLM backbone was found for distributed sync.")
+        lora_params = [
+            param for name, param in vlm_backbone.named_parameters()
+            if param.requires_grad and "lora_" in name
+        ]
+        if not lora_params:
+            raise RuntimeError(
+                "LoRA is listed in trainable_modules, but no trainable lora_ parameters "
+                "were found for distributed sync. Make sure the VLM backbone is loaded "
+                "before initialize_trainable_module_sync()."
+            )
+        sync_modules.append(("vlm_lora", nn.ParameterList(lora_params)))
 
     if "heatmap_vln" in trainable:
         if model.heatmap_vln is None:

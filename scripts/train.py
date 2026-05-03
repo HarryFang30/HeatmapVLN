@@ -115,8 +115,8 @@ from scripts.training import (
     set_seed,
     set_trainable_modules,
     train_one_epoch,
-    validate,
 )
+from scripts.training.validate import validate
 
 from src.data.factory import build_dataset
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
