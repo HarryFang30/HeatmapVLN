@@ -226,6 +226,12 @@ class Qwen2_5VLIntegration(nn.Module):
                 if hasattr(base, "gradient_checkpointing_enable"):
                     base.gradient_checkpointing_enable()
                     logger.info("VLM gradient checkpointing enabled (saves ~60%% activation memory)")
+                # Frozen-backbone LoRA training needs the input embeddings to
+                # require gradients; otherwise checkpointed layers can detach
+                # the graph and return an LM loss without grad_fn.
+                if self.config.use_lora and hasattr(self.model, "enable_input_require_grads"):
+                    self.model.enable_input_require_grads()
+                    logger.info("VLM input gradients enabled for LoRA + gradient checkpointing")
 
             self._model_loaded = True
             self.processor.tokenizer.padding_side = "left"
