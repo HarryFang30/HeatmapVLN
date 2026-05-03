@@ -1,28 +1,27 @@
 seed: 42
 
 # ============================================
-# 阶段 2: System 1 选择性适配（VLM + LoRA 完全冻结）
+# 阶段 2: Bridge-only 适配（System2 + InternNav System1 完全冻结）
 # ============================================
 #
-# 核心原则: 只解冻输入真正变化了的组件
+# 核心原则: 只训练 System2 hidden states → System1 条件输入之间的桥接层
 #
 #   变化链:
 #     LoRA 修改 VLM → traj_hidden_states 分布偏移
 #     → cond_projector 需重新学习投影
-#     → traj_cond 分布变化 → traj_dit 需适配新条件 + R2R 轨迹分布
 #
 #   不变链 (System 1 输入不变):
-#     traj_images(前视图) → DINOv2(冻结) → memory_encoder → rgb_resampler
-#     → 输入完全不变，无需训练 (~26M 参数省下)
+#     traj_images(InternNav 单视角动作图) → DINOv2(冻结)
+#     → memory_encoder → rgb_resampler → traj_dit/action decoder
+#     → 最大程度复用 InternNav System1 checkpoint
 #
 #   VLM 输入:
 #     panoramic_vlm_input=true → 4 张全景图 (与 Stage 1 heatmap 一致)
 #     pixel_goal 坐标 = 前视图像素坐标 (prompt 明确指定 "前视图中的像素坐标")
 #     → 消除 Stage 1/2 输入格式错配, LoRA 在同一格式下训练和使用
 #
-# 训练策略 (warmup → 选择性微调):
-#   Warmup (前 500 步): 只训 cond_projector + latent_queries
-#   Warmup 后: 加入 traj_dit 微调
+# 训练策略:
+#   只训 cond_projector + latent_queries，不解冻 traj_dit/action_encoder/action_decoder。
 #
 # 前置条件:
 #   阶段 1 (train_heatmap_config.yaml) 已完成，LoRA 空间理解已固化。
@@ -147,28 +146,21 @@ model:
       dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
       enable_gradient_checkpointing: true
       internnav_system1_path: "models/internnav_system1.safetensors"
-      # Warmup: 前 500 步只训桥接层 → 之后解冻 traj_dit
-      warmup_steps: 500
+      warmup_steps: 0
 
 # ============================================
-# 训练策略 — 选择性解冻
+# 训练策略 — bridge-only
 # ============================================
 #
 # 数据流变化分析:
 #   左支 (条件): traj_hidden_states → cond_projector → traj_cond
 #     ↑ LoRA 改变了分布 → 必须训练
 #
-#   右支 (视觉记忆): traj_images → DINOv2 → memory_encoder → rgb_resampler
-#     ↑ 前视图输入完全不变 → 无需训练 (省 ~26M 参数)
-#
-#   下游: traj_dit(cross-attn to [memory_tokens, traj_cond])
-#     ↑ 4/36 条件 token 变了 + R2R 轨迹分布不同 → 应该微调
-#
-#   末端: action_encoder/decoder — 动作空间 (dx,dy,dheading) 不变 → 无需训练
+#   System1 core: InternNav checkpoint 保持冻结，避免破坏动作先验
 #
 training:
   stages:
-    - name: stage2_selective_finetune
+    - name: stage2_bridge_only
       epochs: 2
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
@@ -177,19 +169,21 @@ training:
       train_heatmap: false
       train_history: false
       train_action: true
+      bridge_only: true
+      strict_trainable_modules: true
+      requires_base_checkpoint: true
       trainable_modules:
         # 条件适配 (全景输入 → traj_cond 分布变了)
         - latent_queries     # 4×3584 = 14K params
         - cond_projector     # 3584→768→768 = ~3.3M params
-        # 轨迹生成微调 (条件变了 + R2R 数据分布不同)
-        - traj_dit           # 12层 DiT = ~21M params
-        # 动作空间编解码 (参数极少，解冻无害，与 InternNav 对齐)
-        - action_encoder     # Linear(3→384), ~1.2K params
-        - action_decoder     # Linear(384→3), ~1.2K params
       frozen_modules:
         - vlm_backbone       # Qwen2.5-VL 基座权重
         - lora               # 空间理解已固化
-        # 视觉记忆 (traj_images 输入不变 → 输出不变)
+        - heatmap_vln         # Stage 1 辅助任务已完成
+        # InternNav System1 core 全部冻结
+        - traj_dit
+        - action_encoder
+        - action_decoder
         - memory_encoder     # DINOv2 特征不变
         - rgb_resampler      # DINOv2 特征不变
         - rgb_model           # DINOv2 始终冻结
@@ -202,9 +196,8 @@ training:
 #
 # 分层学习率:
 #   桥接层:  1e-4 (最大适配幅度)
-#   traj_dit: 5e-5 (预训练初始化，保守微调)
 #
-# 总可训练参数: ~24M (vs 全部解冻 ~51M，减少 53%)
+# 总可训练参数: 约 3.3M + latent queries
 #
 optim:
   optimizer: adamw
@@ -214,7 +207,7 @@ optim:
   # 桥接层: 最高学习率
   nextdit_cond_projector_lr: 1.0e-4
   latent_queries_lr: 1.0e-4
-  # traj_dit: 较低学习率 (有预训练初始化)
+  # System1 core 冻结，此项仅作为兼容字段保留
   nextdit_action_lr: 5.0e-5
   weight_decay: 0.01
   grad_clip: 1.0

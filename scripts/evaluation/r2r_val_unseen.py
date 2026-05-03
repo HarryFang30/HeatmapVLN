@@ -404,6 +404,16 @@ def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tens
     )
 
 
+def _extract_checkpoint_config(checkpoint_path: str | None) -> dict:
+    if not checkpoint_path:
+        return {}
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        return {}
+    cfg = ckpt.get("config", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
 def _state_has_prefix(state_dict: dict[str, torch.Tensor] | None, prefix: str) -> bool:
     if not state_dict:
         return False
@@ -415,6 +425,58 @@ def _looks_action_only(state_dict: dict[str, torch.Tensor]) -> bool:
         return False
     prefixes = {_normalize_state_key(key).split(".", 1)[0] for key in state_dict}
     return prefixes.issubset({"latent_queries", "nextdit_action_head"})
+
+
+def _checkpoint_has_base_weights(state_dict: dict[str, torch.Tensor] | None) -> bool:
+    return (
+        _state_has_prefix(state_dict, "qwen2_5_vl.")
+        or _state_has_prefix(state_dict, "qwen3_5.")
+        or _state_has_prefix(state_dict, "qwen3_5_vl.")
+        or _state_has_prefix(state_dict, "heatmap_vln.")
+    )
+
+
+def _requires_base_checkpoint(cfg: dict, checkpoint_cfg: dict | None = None) -> bool:
+    for source in (checkpoint_cfg, cfg):
+        if not isinstance(source, dict):
+            continue
+        stages = source.get("training", {}).get("stages", [])
+        if not stages:
+            continue
+        stage_cfg = stages[0]
+        if stage_cfg.get("requires_base_checkpoint") or stage_cfg.get("bridge_only"):
+            return True
+    return False
+
+
+def _preflight_checkpoint_args(args) -> None:
+    cfg = load_config(args.config)
+    checkpoint_cfg = _extract_checkpoint_config(args.checkpoint)
+
+    if not args.base_checkpoint and checkpoint_cfg:
+        recorded_base = checkpoint_cfg.get("runtime", {}).get("base_checkpoint")
+        if recorded_base and Path(recorded_base).exists():
+            args.base_checkpoint = str(Path(recorded_base).resolve())
+            print(f"Auto-loading base checkpoint from Stage 2 metadata: {args.base_checkpoint}")
+        elif recorded_base:
+            print(f"WARNING: Stage 2 metadata records missing base checkpoint: {recorded_base}")
+
+    if not _requires_base_checkpoint(cfg, checkpoint_cfg):
+        return
+
+    if args.base_checkpoint:
+        return
+
+    checkpoint_state_dict = (
+        _extract_checkpoint_state_dict(args.checkpoint)
+        if args.checkpoint else None
+    )
+    if not _checkpoint_has_base_weights(checkpoint_state_dict):
+        raise ValueError(
+            "This bridge-only config/checkpoint requires the Stage 1 heatmap/System2 "
+            "base checkpoint. Pass it with --base_checkpoint, or evaluate a checkpoint "
+            "whose metadata records runtime.base_checkpoint."
+        )
 
 
 def _load_compatible_state_dict(
@@ -825,6 +887,15 @@ def load_model(args, device: torch.device):
 
     model = model.to(device)
 
+    checkpoint_cfg = _extract_checkpoint_config(args.checkpoint)
+    if not args.base_checkpoint and checkpoint_cfg:
+        recorded_base = checkpoint_cfg.get("runtime", {}).get("base_checkpoint")
+        if recorded_base and Path(recorded_base).exists():
+            args.base_checkpoint = str(Path(recorded_base).resolve())
+            print(f"Auto-loading base checkpoint from Stage 2 metadata: {args.base_checkpoint}")
+        elif recorded_base:
+            print(f"WARNING: Stage 2 metadata records missing base checkpoint: {recorded_base}")
+
     base_state_dict = None
     if args.base_checkpoint:
         base_state_dict = _extract_checkpoint_state_dict(args.base_checkpoint)
@@ -833,11 +904,20 @@ def load_model(args, device: torch.device):
         if args.checkpoint else None
     )
 
+    if (
+        _requires_base_checkpoint(cfg, checkpoint_cfg)
+        and not args.base_checkpoint
+        and not _checkpoint_has_base_weights(checkpoint_state_dict)
+    ):
+        raise ValueError(
+            "This bridge-only config/checkpoint requires the Stage 1 heatmap/System2 "
+            "base checkpoint. Pass it with --base_checkpoint, or evaluate a checkpoint "
+            "whose metadata records runtime.base_checkpoint."
+        )
     if checkpoint_state_dict and _looks_action_only(checkpoint_state_dict) and not args.base_checkpoint:
         print(
-            "WARNING: the main checkpoint contains only action-head weights. "
-            "If this Stage 2 run depends on a Stage 1 LoRA/heatmap checkpoint, "
-            "pass it with --base_checkpoint before evaluating."
+            "WARNING: the main checkpoint contains only action-head weights and no "
+            "base checkpoint was loaded."
         )
     if not args.base_checkpoint and checkpoint_state_dict is None:
         print(
@@ -1658,6 +1738,7 @@ def main():
     parser.add_argument("--overwrite_output", action="store_true",
                         help="Delete output_path/progress.json and result.json before evaluating")
     args = parser.parse_args()
+    _preflight_checkpoint_args(args)
     _resolve_eval_paths(args)
     _prepare_progress_file(args, args.output_path)
     run_eval(args)

@@ -153,6 +153,84 @@ def freeze_module(module: nn.Module, freeze: bool = True):
         param.requires_grad = not freeze
 
 
+_NEXTDIT_SUBMODULES = {
+    'cond_projector': 'cond_projector',
+    'traj_dit': 'traj_dit',
+    'memory_encoder': 'memory_encoder',
+    'rgb_resampler': 'rgb_resampler',
+    'action_encoder': 'action_encoder',
+    'action_decoder': 'action_decoder',
+}
+
+_BRIDGE_ONLY_MODULES = {'latent_queries', 'cond_projector'}
+
+
+def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name == 'latent_queries':
+            group = 'latent_queries'
+        elif name.startswith('nextdit_action_head.'):
+            parts = name.split('.')
+            group = '.'.join(parts[:2]) if len(parts) > 1 else 'nextdit_action_head'
+        elif name.startswith('heatmap_vln.'):
+            parts = name.split('.')
+            group = '.'.join(parts[:2]) if len(parts) > 1 else 'heatmap_vln'
+        elif 'lora_' in name:
+            group = 'vlm_lora'
+        else:
+            group = name.split('.', 1)[0]
+        summary[group] = summary.get(group, 0) + param.numel()
+    return summary
+
+
+def _is_allowed_trainable_name(name: str, trainable_modules: set[str]) -> bool:
+    if 'latent_queries' in trainable_modules and name == 'latent_queries':
+        return True
+    if 'nextdit_action_head' in trainable_modules and name.startswith('nextdit_action_head.'):
+        return True
+    for cfg_name, attr_name in _NEXTDIT_SUBMODULES.items():
+        if cfg_name in trainable_modules and name.startswith(f'nextdit_action_head.{attr_name}.'):
+            return True
+    if 'heatmap_vln' in trainable_modules and name.startswith('heatmap_vln.'):
+        return True
+    if 'llm_projector' in trainable_modules and name.startswith('llm_projector.'):
+        return True
+    if ('lora' in trainable_modules or 'vlm_lora' in trainable_modules) and 'lora_' in name:
+        return True
+    return False
+
+
+def _assert_trainable_scope(model: VLNPipeline, stage_cfg: dict, logger) -> None:
+    trainable = set(stage_cfg.get('trainable_modules', []))
+
+    if stage_cfg.get('bridge_only', False):
+        extra = sorted(trainable - _BRIDGE_ONLY_MODULES)
+        missing = sorted(_BRIDGE_ONLY_MODULES - trainable)
+        if extra or missing:
+            raise ValueError(
+                "bridge_only stages must train exactly latent_queries + cond_projector; "
+                f"extra={extra}, missing={missing}"
+            )
+
+    if not stage_cfg.get('strict_trainable_modules', False):
+        return
+
+    violations = [
+        name for name, param in model.named_parameters()
+        if param.requires_grad and not _is_allowed_trainable_name(name, trainable)
+    ]
+    if violations:
+        examples = ', '.join(violations[:8])
+        raise RuntimeError(
+            "Trainable parameter scope does not match trainable_modules. "
+            f"Found {len(violations)} unexpected trainable tensors; examples: {examples}"
+        )
+    logger.info("  ✓ Strict trainable scope check passed")
+
+
 def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     """Set trainable modules according to stage config."""
     freeze_module(model, freeze=True)
@@ -177,17 +255,9 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
         model.latent_queries.requires_grad_(True)
         logger.info("  ✓ Unfrozen: latent_queries")
 
-    # Fine-grained nextdit sub-module unfreezing
-    _nah_submodule_map = {
-        'cond_projector': 'cond_projector',
-        'traj_dit': 'traj_dit',
-        'memory_encoder': 'memory_encoder',
-        'rgb_resampler': 'rgb_resampler',
-        'action_encoder': 'action_encoder',
-        'action_decoder': 'action_decoder',
-    }
+    # Fine-grained NextDiT sub-module unfreezing.
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
-        for cfg_name, attr_name in _nah_submodule_map.items():
+        for cfg_name, attr_name in _NEXTDIT_SUBMODULES.items():
             if cfg_name in trainable:
                 submod = getattr(model.nextdit_action_head, attr_name, None)
                 if submod is not None:
@@ -211,6 +281,15 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
                 logger.info(f"  ✓ Unfrozen: VLM LoRA ({lora_count} parameter tensors)")
             else:
                 logger.warning("  ⚠️ LoRA in trainable_modules but no LoRA params found (model loaded?)")
+
+    summary = _trainable_summary(model)
+    if summary:
+        logger.info("  Trainable parameter groups:")
+        for group, count in sorted(summary.items()):
+            logger.info("    - %s: %s params", group, f"{count:,}")
+    else:
+        logger.warning("  ⚠️ No trainable parameters after applying stage config")
+    _assert_trainable_scope(model, stage_cfg, logger)
 
 
 def apply_nextdit_warmup_freeze(model: VLNPipeline, cfg: dict, logger) -> int:

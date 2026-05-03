@@ -128,6 +128,27 @@ from src.utils.notifier import create_notifier
 logger = logging.getLogger(__name__)
 
 
+def _infer_base_checkpoint_from_resume(resume_path: Path, logger) -> str | None:
+    """Recover the Stage 1/base checkpoint path recorded in a bridge checkpoint."""
+    try:
+        ckpt = safe_torch_load(str(resume_path))
+    except Exception as exc:
+        logger.warning("Could not inspect resume checkpoint for base weights: %s", exc)
+        return None
+
+    cfg = ckpt.get('config', {}) if isinstance(ckpt, dict) else {}
+    base_path = cfg.get('runtime', {}).get('base_checkpoint') if isinstance(cfg, dict) else None
+    del ckpt
+    if not base_path:
+        return None
+
+    resolved = Path(base_path)
+    if not resolved.exists():
+        logger.warning("Resume checkpoint records missing base weights: %s", resolved)
+        return None
+    return str(resolved)
+
+
 # ============================================
 # 主函数
 # ============================================
@@ -347,18 +368,18 @@ def main():
     elif args.auto_resume:
         resume_path = _find_resume_checkpoint(run_dir) or ckpt_manager.get_latest()
 
+    if resume_path and Path(resume_path).exists() and not args.load_weights:
+        inferred_base = _infer_base_checkpoint_from_resume(Path(resume_path), logger)
+        if inferred_base:
+            args.load_weights = inferred_base
+            logger.info("🔗 Inferred base checkpoint from resume metadata: %s", inferred_base)
+
     if resume_path and Path(resume_path).exists():
         resume_info = load_checkpoint_for_resume(
             str(resume_path), model, optimizer=None, scheduler=None, logger=logger
         )
         resume_epoch = resume_info['epoch']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
-
-    if args.dry_run:
-        logger.info("=" * 60)
-        logger.info("🧪 Dry run 模式：模型和数据构建成功")
-        logger.info("=" * 60)
-        return
 
     # 获取训练配置（单阶段）
     all_stages = cfg['training']['stages']
@@ -375,10 +396,31 @@ def main():
 
     total_epochs = stage_cfg['epochs']
 
+    requires_base_checkpoint = bool(
+        stage_cfg.get('requires_base_checkpoint', False)
+        or stage_cfg.get('bridge_only', False)
+    )
+    if requires_base_checkpoint and not args.load_weights:
+        raise ValueError(
+            "Bridge-only training requires the Stage 1 heatmap/System2 checkpoint. "
+            "Pass it with --load-weights so the frozen panoramic LoRA/heatmap base "
+            "is loaded before the bridge checkpoint."
+        )
+    if requires_base_checkpoint and not Path(args.load_weights).exists():
+        raise FileNotFoundError(
+            f"Bridge-only base checkpoint does not exist: {args.load_weights}"
+        )
+
     logger.info("=" * 60)
     logger.info(f"📋 训练配置: {stage_name}")
     logger.info(f"   Epochs: {total_epochs}, Heatmap Size: {stage_cfg['hm_size']}")
     logger.info("=" * 60)
+
+    if args.dry_run:
+        logger.info("=" * 60)
+        logger.info("🧪 Dry run 模式：模型和数据构建成功")
+        logger.info("=" * 60)
+        return
 
     if notifier:
         try:
@@ -543,8 +585,10 @@ def main():
     if args.load_weights:
         weights_path = Path(args.load_weights)
         if weights_path.exists():
+            cfg.setdefault('runtime', {})['base_checkpoint'] = str(weights_path.resolve())
             ckpt = safe_torch_load(str(weights_path))
             state_dict = ckpt.get('trainable_state_dict', {})
+            loaded_count = 0
             if state_dict:
                 missing, unexpected, loaded_count = _load_normalized_state_dict(raw_model, state_dict)
                 logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
@@ -556,6 +600,11 @@ def main():
                     logger.info(f"  Unexpected keys (in checkpoint but not model): {len(unexpected)}")
             else:
                 logger.warning(f"⚠ No trainable_state_dict found in {weights_path}")
+            if requires_base_checkpoint and loaded_count == 0:
+                raise RuntimeError(
+                    "Bridge-only training did not load any parameters from the Stage 1 "
+                    f"base checkpoint: {weights_path}"
+                )
             del ckpt
             torch.cuda.empty_cache()
         else:

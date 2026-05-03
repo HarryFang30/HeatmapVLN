@@ -133,7 +133,11 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
             logger.info("  Param group: nextdit_rest (lr=%s, wd=%s)", nextdit_lr, default_wd)
 
     # Latent Queries
-    if hasattr(model, 'latent_queries') and model.latent_queries is not None:
+    if (
+        hasattr(model, 'latent_queries')
+        and model.latent_queries is not None
+        and model.latent_queries.requires_grad
+    ):
         latent_q_lr = optim_cfg.get('latent_queries_lr', action_lr)
         param_groups.append({
             'params': [model.latent_queries],

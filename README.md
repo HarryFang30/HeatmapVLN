@@ -176,13 +176,13 @@ FGR2R sub-instruction support requires `data.trajectory.use_subinstruction: true
 
 The default pipeline follows a two-stage curriculum:
 
-| | Stage 1: Spatial Grounding | Stage 2: Trajectory Adaptation |
+| | Stage 1: Spatial Grounding | Stage 2: Bridge Adaptation |
 |:---|:---|:---|
 | **Config** | `train_heatmap_config.yaml` | `train_config_internnav.yaml` |
-| **Objective** | Train LoRA + HeatmapVLN for spatial understanding | Adapt NextDiT to LoRA-modified VLM features |
-| **Trainable** | LoRA, HeatmapVLN, vis_head, llm_projector | cond_projector, latent_queries, traj_dit, action_enc/dec |
-| **Frozen** | VLM base weights, NextDiT | VLM base weights, LoRA, DINOv2, memory_encoder |
-| **Learning Rate** | 5e-5 (LoRA), 2e-4 (vis_head) | 1e-4 (bridge), 5e-5 (DiT) |
+| **Objective** | Train LoRA + HeatmapVLN for panoramic spatial understanding | Connect frozen panoramic System2 features to frozen InternNav System1 |
+| **Trainable** | LoRA, HeatmapVLN, vis_head, llm_projector | `latent_queries`, `cond_projector` |
+| **Frozen** | VLM base weights, NextDiT | VLM/LoRA/HeatmapVLN, DINOv2, memory_encoder, DiT, action enc/dec |
+| **Learning Rate** | 5e-5 (LoRA), 2e-4 (vis_head) | 1e-4 (bridge) |
 
 ### Commands
 
@@ -196,21 +196,30 @@ python scripts/run.py train \
     --load-weights /path/to/stage1/best.pth
 
 # Resume training
-python scripts/run.py train --config configs/train_config_internnav.yaml --auto-resume
+python scripts/run.py train \
+    --config configs/train_config_internnav.yaml \
+    --load-weights /path/to/stage1/best.pth \
+    --auto-resume
 
 # Multi-GPU (DDP)
 torchrun --nproc_per_node=2 scripts/run.py train \
-    --config configs/train_config_internnav.yaml --distributed
+    --config configs/train_config_internnav.yaml \
+    --load-weights /path/to/stage1/best.pth \
+    --distributed
 ```
 
 ### Quick Validation
 
 ```bash
 # Dry run (build model + data, no training)
-python scripts/run.py train --config configs/train_config_internnav.yaml --dry-run
+python scripts/run.py train \
+    --config configs/train_config_internnav.yaml \
+    --load-weights /path/to/stage1/best.pth \
+    --dry-run
 
 # Smoke test (2 batches, 1 epoch)
 python scripts/run.py train --config configs/train_config_internnav.yaml \
+    --load-weights /path/to/stage1/best.pth \
     --epochs 1 --max-batches 2
 ```
 
@@ -226,7 +235,9 @@ python scripts/run.py evaluate heatmap \
     --checkpoint /path/to/best.pth --max-samples 200
 
 # R2R val_unseen (Habitat)
-python scripts/run.py evaluate r2r --checkpoint /path/to/best.pth
+python scripts/run.py evaluate r2r \
+    --base_checkpoint /path/to/stage1/best.pth \
+    --checkpoint /path/to/stage2_bridge/best.pth
 ```
 
 ## Inference & Visualization
