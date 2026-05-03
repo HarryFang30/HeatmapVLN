@@ -63,6 +63,8 @@ class TrajectoryConfig(_Lenient):
     enable_trajectory_augmentation: bool = True
     load_traj_images: bool = False
     traj_image_size: list[int] = [224, 224]
+    compute_pixel_goal: bool = False
+    include_stop_samples_random_subsequence: bool = False
     use_subinstruction: bool = False
     fgr2r_subinstr_path: str | None = None
     panoramic_vlm_input: bool = True

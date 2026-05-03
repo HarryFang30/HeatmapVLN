@@ -57,6 +57,7 @@ def validate(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
+    total_lm_loss = 0.0
     total_heatmap_mse = 0.0
     num_heatmap_mse_batches = 0
     num_batches = 0
@@ -69,6 +70,7 @@ def validate(
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
+    train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
 
     device = dist_context.device
 
@@ -150,6 +152,7 @@ def validate(
                     history_rel_poses=history_rel_poses,
                     return_heatmaps=train_history or train_future,
                     return_actions=train_action,
+                    return_lm_loss=train_lm,
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
                     action_valid=action_valid if train_action else None,
                     gt_stop=is_stop if train_action else None,
@@ -208,14 +211,28 @@ def validate(
                         )
                         trajectory_loss = traj_result['loss']
 
+            lm_loss = torch.tensor(0.0, device=device)
+            if train_lm:
+                if 'lm_loss' not in output or output['lm_loss'] is None:
+                    raise RuntimeError(
+                        "train_lm=True but validation model output has no lm_loss."
+                    )
+                lm_loss = output['lm_loss']
+
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 0.0)
+            lm_weight = loss_cfg.get('lm_weight', stage_cfg.get('lm_weight', 1.0))
 
-            loss = heatmap_weight * heatmap_loss + trajectory_weight * trajectory_loss
+            loss = (
+                heatmap_weight * heatmap_loss
+                + trajectory_weight * trajectory_loss
+                + lm_weight * lm_loss
+            )
 
             total_loss += loss.item()
             total_heatmap_loss += heatmap_loss.item()
             total_action_loss += trajectory_loss.item()
+            total_lm_loss += lm_loss.item()
             num_batches += 1
 
             # Reuse current output for inference MSE + visualization
@@ -293,6 +310,7 @@ def validate(
             total_peak_loss,
             total_vis_loss,
             total_coord_loss,
+            total_lm_loss,
         ],
         device=device,
         dtype=torch.float64,
@@ -308,6 +326,7 @@ def validate(
     avg_peak_loss = (totals[10] / reduced_num_batches).item()
     avg_vis_loss = (totals[11] / reduced_num_batches).item()
     avg_coord_loss = (totals[12] / reduced_num_batches).item()
+    avg_lm_loss = (totals[13] / reduced_num_batches).item()
 
     r_tp, r_tn, r_fp, r_fn = totals[6].item(), totals[7].item(), totals[8].item(), totals[9].item()
     vis_total = r_tp + r_tn + r_fp + r_fn
@@ -341,6 +360,7 @@ def validate(
         'val_loss': avg_loss,
         'val_heatmap_loss': avg_hm,
         'val_trajectory_loss': avg_act,
+        'val_lm_loss': avg_lm_loss,
         'val_heatmap_mse': avg_hm_mse,
         'val_total_loss': avg_loss,
         'val_hm_peak_loss': avg_peak_loss,
@@ -349,5 +369,7 @@ def validate(
     }
     if avg_act > 0:
         logger.info(f"  📊 Trajectory loss: {avg_act:.6f}")
+    if train_lm:
+        logger.info(f"  📊 LM loss: {avg_lm_loss:.6f}")
     result.update(val_vis_metrics)
     return result

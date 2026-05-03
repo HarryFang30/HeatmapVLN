@@ -5,8 +5,8 @@ Unified evaluation entrypoint.
 Usage examples:
     python scripts/evaluate.py --config configs/train_config_internnav.yaml --checkpoint /path/to/ckpt --split val_unseen
     python scripts/evaluate.py heatmap --config configs/train_heatmap_config.yaml --checkpoint /path/to/ckpt
-    python scripts/evaluate.py r2r --config configs/train_config_internnav.yaml --base_checkpoint /path/to/stage1.pth --checkpoint /path/to/stage2.pth --gpu_id 0 --sim_gpu_id 0
-    python scripts/evaluate.py r2r --config configs/train_config_internnav.yaml --base_checkpoint /path/to/stage1.pth --gpu_id 0 --sim_gpu_id 0
+    python scripts/evaluate.py r2r --config configs/train_config_internnav.yaml --base_checkpoint /path/to/stage1_s2_sft.pth --checkpoint /path/to/stage2_bridge.pth --gpu_id 0 --sim_gpu_id 0
+    python scripts/evaluate.py r2r --config configs/train_config_internnav.yaml --base_checkpoint /path/to/stage1_s2_sft.pth --gpu_id 0 --sim_gpu_id 0
 """
 
 from __future__ import annotations

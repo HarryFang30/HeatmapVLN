@@ -29,6 +29,8 @@ from src.models.heatmap.input_constructor import (
 )
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
+IGNORE_INDEX = -100
+
 try:
     _libc = ctypes.CDLL("libc.so.6")
 except OSError:
@@ -60,10 +62,21 @@ class PanoramicTokenizedCollator:
             traj-token mechanism entirely (Stage 1 heatmap-only training).
     """
 
-    def __init__(self, processor, n_traj_query: int = 0):
+    def __init__(
+        self,
+        processor,
+        n_traj_query: int = 0,
+        *,
+        sft_mode: bool = False,
+        sft_include_turns: bool = True,
+        sft_include_forward: bool = True,
+    ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
         self.n_traj_query = n_traj_query
+        self.sft_mode = sft_mode
+        self.sft_include_turns = sft_include_turns
+        self.sft_include_forward = sft_include_forward
         self._call_count = 0
 
     @staticmethod
@@ -120,6 +133,69 @@ class PanoramicTokenizedCollator:
 
         return torch.stack(padded_tensors, dim=0)
 
+    @staticmethod
+    def _find_last_subsequence(seq: list[int], pattern: list[int]) -> int:
+        if not pattern or len(pattern) > len(seq):
+            return -1
+        for start in range(len(seq) - len(pattern), -1, -1):
+            if seq[start:start + len(pattern)] == pattern:
+                return start
+        return -1
+
+    def _assistant_text_for_sft(self, sample: dict[str, Any]) -> str | None:
+        if sample.get("is_stop", 0.0) > 0.5 or int(sample.get("discrete_action", 1)) == 0:
+            return "STOP"
+
+        pg = sample.get("pixel_goal")
+        if pg is not None:
+            return f"{int(pg[0])} {int(pg[1])}"
+
+        discrete_action = int(sample.get("discrete_action", 1))
+        if self.sft_include_turns and discrete_action == 2:
+            return "←"
+        if self.sft_include_turns and discrete_action == 3:
+            return "→"
+        if self.sft_include_forward and discrete_action == 1:
+            return "↑"
+        return None
+
+    def _build_sft_labels(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        target_texts: list[str | None],
+    ) -> torch.Tensor:
+        labels = torch.full_like(input_ids, IGNORE_INDEX)
+        tokenizer = self.processor.tokenizer
+
+        for batch_idx, target_text in enumerate(target_texts):
+            if not target_text:
+                continue
+            target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+            if not target_ids:
+                continue
+
+            row = input_ids[batch_idx].tolist()
+            start = self._find_last_subsequence(row, target_ids)
+            if start < 0:
+                # Some tokenizers attach whitespace around short assistant
+                # responses.  Try a tiny set of stable variants before giving up.
+                for variant in (f" {target_text}", f"\n{target_text}"):
+                    variant_ids = tokenizer.encode(variant, add_special_tokens=False)
+                    start = self._find_last_subsequence(row, variant_ids)
+                    if start >= 0:
+                        target_ids = variant_ids
+                        break
+            if start < 0:
+                continue
+
+            end = start + len(target_ids)
+            labels[batch_idx, start:end] = input_ids[batch_idx, start:end]
+
+        if attention_mask is not None:
+            labels = labels.masked_fill(attention_mask == 0, IGNORE_INDEX)
+        return labels
+
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         self._call_count += 1
         do_log = (self._call_count <= 5) or (self._call_count % 25 == 0)
@@ -164,6 +240,7 @@ class PanoramicTokenizedCollator:
 
         if use_panoramic or use_internnav:
             messages_batch = []
+            sft_target_texts: list[str | None] = []
             pano_num_histories = []
 
             if use_internnav:
@@ -172,6 +249,7 @@ class PanoramicTokenizedCollator:
                     hf = sample["history_frames"]
                     history_list = [hf[k] for k in range(hf.shape[0])]
                     pg = sample.get("pixel_goal")
+                    assistant_text = self._assistant_text_for_sft(sample) if self.sft_mode else None
                     messages_batch.append(
                         construct_input_stage2(
                             history_frames=history_list,
@@ -179,8 +257,10 @@ class PanoramicTokenizedCollator:
                             lookdown_frame=sample["lookdown_frame"],
                             instruction=sample.get("text"),
                             pixel_goal=pg,
+                            assistant_text=assistant_text,
                         )
                     )
+                    sft_target_texts.append(assistant_text)
                     pano_num_histories.append(0)
             else:
                 for sample in batch:
@@ -196,14 +276,17 @@ class PanoramicTokenizedCollator:
                         for hist_idx in range(sample["history_panoramas"].shape[0])
                     ]
                     pg = sample.get("pixel_goal")
+                    assistant_text = self._assistant_text_for_sft(sample) if self.sft_mode else None
                     messages_batch.append(
                         construct_input(
                             current_views=current_views_dict,
                             history_panoramas=history_panoramas_list,
                             instruction=sample.get("text"),
                             pixel_goal=pg,
+                            assistant_text=assistant_text,
                         )
                     )
+                    sft_target_texts.append(assistant_text)
                     pano_num_histories.append(len(history_panoramas_list))
 
                 result["current_views"] = torch.stack([sample["current_views"] for sample in batch], dim=0)
@@ -252,6 +335,25 @@ class PanoramicTokenizedCollator:
                     pano_inputs["attention_mask"] = torch.cat(
                         [pano_inputs["attention_mask"], traj_mask], dim=1,
                     )
+
+            if self.sft_mode:
+                labels = self._build_sft_labels(
+                    pano_inputs["input_ids"],
+                    pano_inputs.get("attention_mask"),
+                    sft_target_texts,
+                )
+                if nq > 0:
+                    # Labels were built after appending the TRAJ placeholders,
+                    # so this is normally redundant.  Keep it explicit because
+                    # TRAJ tokens are latent-query carriers, never LM targets.
+                    labels[:, -nq:] = IGNORE_INDEX
+                if not torch.any(labels != IGNORE_INDEX):
+                    raise RuntimeError(
+                        "Panoramic SFT batch has no assistant labels. "
+                        "Check pixel_goal/STOP synthesis and tokenizer alignment."
+                    )
+                pano_inputs["labels"] = labels
+                result["sft_target_text"] = sft_target_texts
 
             pano_text_anchor_positions = None
             if not use_internnav:

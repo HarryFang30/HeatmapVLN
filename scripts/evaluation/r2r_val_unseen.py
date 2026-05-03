@@ -473,7 +473,7 @@ def _preflight_checkpoint_args(args) -> None:
     )
     if not _checkpoint_has_base_weights(checkpoint_state_dict):
         raise ValueError(
-            "This bridge-only config/checkpoint requires the Stage 1 heatmap/System2 "
+            "This bridge-only config/checkpoint requires the Stage1-S2 panoramic System2 "
             "base checkpoint. Pass it with --base_checkpoint, or evaluate a checkpoint "
             "whose metadata records runtime.base_checkpoint."
         )
@@ -910,7 +910,7 @@ def load_model(args, device: torch.device):
         and not _checkpoint_has_base_weights(checkpoint_state_dict)
     ):
         raise ValueError(
-            "This bridge-only config/checkpoint requires the Stage 1 heatmap/System2 "
+            "This bridge-only config/checkpoint requires the Stage1-S2 panoramic System2 "
             "base checkpoint. Pass it with --base_checkpoint, or evaluate a checkpoint "
             "whose metadata records runtime.base_checkpoint."
         )

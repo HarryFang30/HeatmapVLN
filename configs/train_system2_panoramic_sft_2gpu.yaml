@@ -1,0 +1,155 @@
+seed: 42
+
+# ============================================
+# Stage1-S2: panoramic System2 SFT
+# ============================================
+#
+# 目标:
+#   让 Qwen/LoRA 在全景输入下学会直接输出:
+#     - 前视图 pixel-goal: "x y"
+#     - 已完成: "STOP"
+#     - 目标不在前视图: "←" / "→" / "↑"
+#
+# 启动方式:
+#   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
+#     --config configs/train_system2_panoramic_sft_2gpu.yaml
+#
+# 产物:
+#   checkpoint 只保存 LoRA trainable_state_dict。
+#   后续 Stage2 bridge-only 用 --load-weights 加载这个 checkpoint。
+
+data:
+  root: /workspace/r2r_panoramic_data
+  train_split: train
+  image_size: [256, 256]
+  init_hm_size: [64, 64]
+  num_workers: 2
+  pin_memory: true
+  prefetch_factor: 2
+  dataset_type: trajectory
+  use_worker_tokenized_collator: true
+
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    panoramic_vlm_input: true
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: true
+    samples_per_clip: 5
+    val_samples_per_clip: 4
+    random_subsequence: true
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    include_stop_samples_random_subsequence: true
+    predict_horizon: 32
+    action_scale: 4.0
+    enable_trajectory_augmentation: false
+    use_subinstruction: true
+    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
+    compute_pixel_goal: true
+    load_traj_images: false
+    traj_image_size: [224, 224]
+
+model:
+  type: vln_pipeline
+  device: cuda
+
+  llm:
+    model_path: ./models/internnav_backbone
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+    max_video_frames: -1
+    gradient_checkpointing: true
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_layer_indices: [5, 6, 12, 13, 19, 20]
+    lora_dropout: 0.05
+
+  heatmap:
+    enable: false
+
+  action_head:
+    enable: false
+
+training:
+  stages:
+    - name: stage1_s2_panoramic_sft
+      epochs: 2
+      hm_size: [64, 64]
+      train_lm: true
+      train_system2_sft: true
+      train_heatmap: false
+      train_history: false
+      train_future: false
+      train_action: false
+      sft_include_turns: true
+      sft_include_forward: true
+      strict_trainable_modules: true
+      trainable_modules:
+        - lora
+      frozen_modules:
+        - heatmap_vln
+        - nextdit_action_head
+        - latent_queries
+        - llm_projector
+
+optim:
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  lora_lr: 5.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr: 1.0e-6
+  # 双卡: 每卡 batch=1, grad_accum=8, 总有效 batch=16
+  batch_size: 1
+  grad_accum_steps: 8
+
+loss:
+  heatmap_loss_type: heatmap_vln
+  heatmap_weight: 0.0
+  trajectory_weight: 0.0
+  lm_weight: 1.0
+
+gpu:
+  devices: [0, 1]
+  backend: nccl
+  multi_gpu:
+    enabled: true
+    find_unused_parameters: true
+
+log:
+  out_dir: /root/autodl-tmp/vln_system2_sft_outputs
+  save_every_epochs: 1
+  vis_every_steps: 1000
+  val_vis_batches: 0
+  max_ckpts: 5
+  use_tensorboard: true
+  tensorboard_dir: /root/tf-logs-system2-sft
+  enable_timing: true
+  epoch_boundary_cooldown_s: 8
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  mid_epoch_save_every: 5000
+  notify:
+    enabled: false
+
+validation:
+  eval_every_epochs: 1
+  save_best_metric: val_total_loss
+  patience: 5
+  val_inference_batches: 0

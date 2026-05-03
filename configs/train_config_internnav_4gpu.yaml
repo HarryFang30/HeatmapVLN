@@ -13,10 +13,10 @@ seed: 42
 # 启动方式 (必须用 torchrun):
 #   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
 #     --config configs/train_config_internnav_4gpu.yaml \
-#     --load-weights /path/to/stage1/checkpoints/best.pth
+#     --load-weights /path/to/stage1_s2_panoramic_sft/checkpoints/best.pth
 #
 # 目标:
-#   System2/Qwen/LoRA/heatmap 已在 Stage 1 训练好并冻结。
+#   System2/Qwen/LoRA 已通过 Stage1-S2 panoramic SFT 训练好并冻结。
 #   System1 最大程度复用 InternNav checkpoint，动作侧只使用单视角 traj_images。
 #   本阶段只训练全景 System2 hidden states → System1 条件输入之间的桥接层。
 #
@@ -132,7 +132,7 @@ model:
 training:
   stages:
     - name: stage2_bridge_only
-      epochs: 1
+      epochs: 3
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: false

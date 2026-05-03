@@ -84,6 +84,10 @@ def build_trajectory_dataset(
         enable_trajectory_augmentation=traj_cfg.get("enable_trajectory_augmentation", True),
         load_traj_images=traj_cfg.get("load_traj_images", False),
         traj_image_size=tuple(traj_cfg.get("traj_image_size", [224, 224])),
+        compute_pixel_goal=traj_cfg.get("compute_pixel_goal", False),
+        include_stop_samples_random_subsequence=traj_cfg.get(
+            "include_stop_samples_random_subsequence", False,
+        ),
         use_subinstruction=traj_cfg.get("use_subinstruction", False),
         fgr2r_subinstr_path=traj_cfg.get("fgr2r_subinstr_path", None),
         panoramic_vlm_input=traj_cfg.get("panoramic_vlm_input", True),

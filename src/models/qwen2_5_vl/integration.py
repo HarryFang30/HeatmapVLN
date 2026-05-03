@@ -682,7 +682,8 @@ class Qwen2_5VLIntegration(nn.Module):
         return_hidden_states: bool,
         skip_lm_head: bool = False,
         latent_queries: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, torch.Tensor | None]:
+        return_lm_loss: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, torch.Tensor | None, torch.Tensor | None]:
         """Run Qwen on already prepared multimodal inputs.
 
         Aligned with InternNav's traj-token mechanism:
@@ -699,6 +700,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 condition vectors injected at TRAJ_TOKEN_INDEX positions.
         """
         raw_input_ids = inputs["input_ids"]
+        lm_labels = inputs.get("labels") if return_lm_loss else None
         num_image_tokens = int((raw_input_ids == self.image_token_id).sum().item())
 
         n_query = 0
@@ -776,11 +778,16 @@ class Qwen2_5VLIntegration(nn.Module):
             )
 
         fwd_kwargs = dict(
-            **inputs,
+            **{k: v for k, v in inputs.items() if k != "labels"},
             output_hidden_states=need_hidden,
             return_dict=True,
             use_cache=False,
         )
+        if return_lm_loss:
+            if lm_labels is None:
+                raise ValueError("return_lm_loss=True requires `labels` in panoramic_inputs")
+            fwd_kwargs["labels"] = lm_labels
+            skip_lm_head = False
         if self._internal_profiler is not None:
             self._internal_profiler.reset()
 
@@ -809,6 +816,7 @@ class Qwen2_5VLIntegration(nn.Module):
 
         traj_hidden_states = None
         hidden_states = None
+        lm_loss = getattr(outputs, "loss", None) if return_lm_loss else None
 
         if need_hidden:
             layer_idx = self.config.hidden_layer_for_features
@@ -830,7 +838,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 hidden_states, vision_input_ids,
             )
 
-        return hidden_states, vision_hidden_states, num_image_tokens, traj_hidden_states
+        return hidden_states, vision_hidden_states, num_image_tokens, traj_hidden_states, lm_loss
 
     def _forward_single_panorama(
         self,
@@ -865,12 +873,12 @@ class Qwen2_5VLIntegration(nn.Module):
 
         need_grad = return_hidden_states or self.config.heatmap_trains_backbone
         if need_grad:
-            hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs, _lm_loss = self._forward_model_inputs(
                 inputs, return_hidden_states,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens, _traj_hs = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, _traj_hs, _lm_loss = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
 
@@ -919,12 +927,12 @@ class Qwen2_5VLIntegration(nn.Module):
 
         need_grad = return_hidden_states or self.config.heatmap_trains_backbone
         if need_grad:
-            hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs, _lm_loss = self._forward_model_inputs(
                 inputs, return_hidden_states,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, traj_hs, _lm_loss = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True,
                 )
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
@@ -959,7 +967,8 @@ class Qwen2_5VLIntegration(nn.Module):
         heatmap_vln: nn.Module | None = None,
         history_rel_poses: torch.Tensor | None = None,
         latent_queries: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None, torch.Tensor | None]:
+        return_lm_loss: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None, torch.Tensor | None, torch.Tensor | None]:
         """Forward already-tokenized batch through one Qwen pass.
 
         When ``heatmap_vln`` is None the heatmap hook/decode pipeline is
@@ -1003,18 +1012,19 @@ class Qwen2_5VLIntegration(nn.Module):
                     inputs["video_grid_thw"][:, 0] = 1
             t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
 
-        need_grad = return_hidden_states or (
+        need_grad = return_lm_loss or return_hidden_states or (
             heatmap_vln is not None and self.config.heatmap_trains_backbone
         )
-        skip_lm = heatmap_vln is None
+        skip_lm = (heatmap_vln is None) and not return_lm_loss
         if need_grad:
-            hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_loss = self._forward_model_inputs(
                 inputs, return_hidden_states,
                 skip_lm_head=skip_lm, latent_queries=latent_queries,
+                return_lm_loss=return_lm_loss,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens, traj_hs = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_loss = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True, latent_queries=latent_queries,
                 )
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
@@ -1041,7 +1051,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 }
                 heatmap_output["timings"].update(decode_timings)
                 heatmap_output["timings"].update(internal_timings)
-        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs, lm_loss
 
     def _forward_batch(
         self,
@@ -1124,7 +1134,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 )
                 inputs["video_grid_thw"][:, 0] = 1
 
-        hidden_states, vision_hidden_states, num_image_tokens, _traj_hs = self._forward_model_inputs(
+        hidden_states, vision_hidden_states, num_image_tokens, _traj_hs, _lm_loss = self._forward_model_inputs(
             inputs, return_hidden_states,
         )
         return hidden_states, vision_hidden_states, num_image_tokens, None
@@ -1144,6 +1154,7 @@ class Qwen2_5VLIntegration(nn.Module):
         heatmap_vln: nn.Module | None = None,
         history_rel_poses: torch.Tensor | None = None,
         latent_queries: torch.Tensor | None = None,
+        return_lm_loss: bool = False,
     ) -> dict[str, Any]:
         """Forward pass through Qwen2.5-VL with batch processing."""
         # Ensure model is loaded
@@ -1151,11 +1162,12 @@ class Qwen2_5VLIntegration(nn.Module):
             self._load_model()
 
         traj_hidden_states = None
+        lm_loss = None
 
         if panoramic_inputs is not None:
             if panoramic_num_histories is None:
                 raise ValueError("panoramic_num_histories is required with panoramic_inputs")
-            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hidden_states = (
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hidden_states, lm_loss = (
                 self._forward_batch_panorama_tokenized(
                     panoramic_inputs=panoramic_inputs,
                     num_histories=panoramic_num_histories,
@@ -1164,6 +1176,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     heatmap_vln=heatmap_vln,
                     history_rel_poses=history_rel_poses,
                     latent_queries=latent_queries,
+                    return_lm_loss=return_lm_loss,
                 )
             )
         elif current_views is not None and history_panoramas is not None:
@@ -1208,6 +1221,8 @@ class Qwen2_5VLIntegration(nn.Module):
         }
         if traj_hidden_states is not None:
             result["traj_hidden_states"] = traj_hidden_states
+        if lm_loss is not None:
+            result["lm_loss"] = lm_loss
         if heatmap_output is not None:
             result.update(heatmap_output)
         else:

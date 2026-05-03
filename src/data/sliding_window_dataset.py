@@ -113,6 +113,7 @@ class VLNSlidingWindowDataset(Dataset):
         random_subsequence: bool = False,  # 是否启用随机子序列采样
         min_subsequence_length: int = 30,  # 最小子序列长度
         subsequence_samples_per_clip: int = 3,  # 每个 clip 生成的子序列数量
+        include_stop_samples_random_subsequence: bool = False,
         chunk_direction: str = "front",  # chunks 模式下读取的视角
         chunk_cache_size: int = 6,  # chunks 模式下缓存的数组个数（worker 内）
         metadata_cache_size: int = 500,  # 元数据 LRU 缓存大小（clip 数量），防止 worker 内存无限增长
@@ -141,6 +142,7 @@ class VLNSlidingWindowDataset(Dataset):
         self.random_subsequence = random_subsequence and (split == 'train')  # 仅训练集启用
         self.min_subsequence_length = min_subsequence_length
         self.subsequence_samples_per_clip = subsequence_samples_per_clip
+        self.include_stop_samples_random_subsequence = include_stop_samples_random_subsequence
         self.chunk_direction = chunk_direction
         self.chunk_cache_size = max(1, int(chunk_cache_size))
         self.metadata_cache_size = max(50, int(metadata_cache_size))
@@ -608,6 +610,7 @@ class VLNSlidingWindowDataset(Dataset):
             # ========== 随机子序列采样（新增） ==========
             total_subsequences = 0
             total_samples = 0
+            stop_samples = 0
 
             for clip_idx in self._clip_valid_frames:
                 valid_frames = self._clip_valid_frames[clip_idx]
@@ -665,6 +668,15 @@ class VLNSlidingWindowDataset(Dataset):
 
                     total_subsequences += 1
 
+                if self.include_stop_samples_random_subsequence:
+                    last_frame = valid_frames[-1]
+                    if last_frame >= self.min_history:
+                        sample_idx = len(self.sample_index)
+                        self.sample_index.append((clip_idx, last_frame))
+                        self._sample_subsequence_range[sample_idx] = (clip_start, clip_end)
+                        stop_samples += 1
+                        total_samples += 1
+
             # 打乱样本顺序（需要同时打乱 sample_index 和 _sample_subsequence_range）
             indices = list(range(len(self.sample_index)))
             self._rng.shuffle(indices)
@@ -677,7 +689,7 @@ class VLNSlidingWindowDataset(Dataset):
             logger.info(
                 f"Built random subsequence sample index: {len(self.sample_index)} samples "
                 f"from {total_subsequences} subsequences, {len(self._clip_valid_frames)} clips, "
-                f"min_subseq_len={self.min_subsequence_length}, epoch={self._epoch}"
+                f"min_subseq_len={self.min_subsequence_length}, stop_samples={stop_samples}, epoch={self._epoch}"
             )
 
         elif self.clip_level_sampling:

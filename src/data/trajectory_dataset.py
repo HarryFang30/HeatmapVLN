@@ -91,12 +91,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         enable_trajectory_augmentation: bool = True,
         load_traj_images: bool = False,
         traj_image_size: tuple[int, int] = (224, 224),
+        compute_pixel_goal: bool = False,
+        include_stop_samples_random_subsequence: bool = False,
         # FGR2R 子指令配置
         fgr2r_subinstr_path: str | None = None,
         use_subinstruction: bool = False,
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
     ):
+        self.include_stop_samples_random_subsequence = include_stop_samples_random_subsequence
         super().__init__(
             root=root,
             split=split,
@@ -113,12 +116,14 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             random_subsequence=random_subsequence,
             min_subsequence_length=min_subsequence_length,
             subsequence_samples_per_clip=subsequence_samples_per_clip,
+            include_stop_samples_random_subsequence=include_stop_samples_random_subsequence,
         )
 
         self.predict_horizon = predict_horizon
         self.action_scale = action_scale
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
         self.load_traj_images = load_traj_images
+        self.compute_pixel_goal = compute_pixel_goal or load_traj_images
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
@@ -134,6 +139,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}, "
             f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}, "
             f"load_traj_images={self.load_traj_images}, "
+            f"compute_pixel_goal={self.compute_pixel_goal}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
 
@@ -595,6 +601,32 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 "text": text,                            # str
             }
 
+            # Pixel-goal SFT / bridge target: project the farthest visible
+            # future waypoint onto the current front view, aligned with
+            # InternNav's depth-based occlusion filtering.  This is computed
+            # independently of traj_images so System2 SFT can train without
+            # loading the System1 visual-memory frames.
+            goal_frame_idx = min(subseq_end - 1, T - 1)
+            if self.compute_pixel_goal and goal_frame_idx > current_t:
+                front_depth = self._load_depth(clip_dir, current_t, direction="front")
+                _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
+                pg = None
+                for fi in range(goal_frame_idx, current_t, -1):
+                    pg = self._compute_pixel_goal(
+                        current_pose, poses[fi],
+                        img_size=_img_w,
+                        depth_map=front_depth,
+                    )
+                    if pg is not None:
+                        break
+                if pg is not None:
+                    result["pixel_goal"] = pg
+                elif self.load_traj_images:
+                    tv = result.get("trajectory_valid", 0.0)
+                    result["trajectory_valid"] = (
+                        torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
+                    )
+
             # 12. traj_images for DualVLN visual memory.
             # InternNav stores a sequence of lookdown frames from the System 2
             # trigger point onward; the action head repeats the first frame as
@@ -603,7 +635,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             # not by replacing the anchor with a privileged future goal view.
             if self.load_traj_images:
                 traj_view = "front_down"
-                goal_frame_idx = min(subseq_end - 1, T - 1)
                 goal_len = max(goal_frame_idx - current_t, 1)
                 interval = 2
                 frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
@@ -650,28 +681,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 result["traj_images"] = torch.from_numpy(traj_imgs)  # [N, H, W, 3]
                 result["trajectory"] = torch.from_numpy(traj_poses)  # [N, predict_horizon, 3]
                 result["trajectory_valid"] = torch.from_numpy(traj_valids)  # [N]
-
-                # Pixel-goal: project the *farthest visible* future
-                # waypoint onto the current front view, aligned with
-                # InternNav's depth-based occlusion filtering.
-                front_depth = self._load_depth(clip_dir, current_t, direction="front")
-                _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
-                pg = None
-                for fi in range(goal_frame_idx, current_t, -1):
-                    pg = self._compute_pixel_goal(
-                        current_pose, poses[fi],
-                        img_size=_img_w,
-                        depth_map=front_depth,
-                    )
-                    if pg is not None:
-                        break
-                if pg is not None:
-                    result["pixel_goal"] = pg
-                else:
-                    tv = result.get("trajectory_valid", 0.0)
-                    result["trajectory_valid"] = (
-                        torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
-                    )
 
             if gt_visibility is not None:
                 result["gt_visibility"] = gt_visibility  # [N, 4]

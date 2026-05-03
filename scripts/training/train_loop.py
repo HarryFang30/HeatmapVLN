@@ -94,6 +94,7 @@ def train_one_epoch(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_action_loss = 0.0
+    total_lm_loss = 0.0
     num_batches = 0
 
     optim_cfg = cfg['optim']
@@ -103,6 +104,7 @@ def train_one_epoch(
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
+    train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
 
     device = dist_context.device
 
@@ -245,6 +247,7 @@ def train_one_epoch(
                 history_rel_poses=history_rel_poses,
                 return_heatmaps=train_history or train_future,
                 return_actions=train_action,
+                return_lm_loss=train_lm,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
                 action_valid=action_valid if train_action else None,
                 gt_stop=is_stop if train_action else None,
@@ -290,10 +293,24 @@ def train_one_epoch(
                         )
                         trajectory_loss = traj_result['loss']
 
+            lm_loss = torch.tensor(0.0, device=device)
+            if train_lm:
+                if 'lm_loss' not in output or output['lm_loss'] is None:
+                    raise RuntimeError(
+                        "train_lm=True but model output has no lm_loss. "
+                        "Check PanoramicTokenizedCollator labels and Qwen forward wiring."
+                    )
+                lm_loss = output['lm_loss']
+
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 0.0)
+            lm_weight = loss_cfg.get('lm_weight', stage_cfg.get('lm_weight', 1.0))
 
-            loss = heatmap_weight * heatmap_loss + trajectory_weight * trajectory_loss
+            loss = (
+                heatmap_weight * heatmap_loss
+                + trajectory_weight * trajectory_loss
+                + lm_weight * lm_loss
+            )
             loss = loss / grad_accum_steps
         if enable_timing:
             timing_stats['forward_s'] += time.perf_counter() - forward_start
@@ -370,13 +387,14 @@ def train_one_epoch(
                 lr_display = ", ".join(lr_strs)
                 gpu_mem_str = f" | GPU: {torch.cuda.memory_allocated() / 1024**3:.1f}GB" if show_gpu_memory else ""
                 traj_str = f", traj: {trajectory_loss.item():.4f}" if trajectory_loss.item() > 0 else ""
+                lm_str = f", lm: {lm_loss.item():.4f}" if train_lm else ""
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}{traj_str}) | "
+                    f"(hm: {heatmap_loss.item():.4f}{traj_str}{lm_str}) | "
                     f"LR: [{lr_display}]"
                     + gpu_mem_str
                     + (
@@ -412,6 +430,7 @@ def train_one_epoch(
                         "loss": loss.item() * grad_accum_steps,
                         "heatmap_loss": heatmap_loss.item(),
                         "trajectory_loss": trajectory_loss.item(),
+                        "lm_loss": lm_loss.item(),
                         "lrs": {
                             optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
                             for gi, lr_val in enumerate(all_lrs)
@@ -431,6 +450,8 @@ def train_one_epoch(
                 tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
                 if trajectory_loss.item() > 0:
                     tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
+                if train_lm:
+                    tb_writer.add_scalar('train/lm_loss', lm_loss.item(), actual_step)
                 if isinstance(loss_dict, dict):
                     for k in ('vis_loss', 'coord_loss', 'peak_loss', 'neg_loss'):
                         if k in loss_dict:
@@ -494,14 +515,16 @@ def train_one_epoch(
         _iter_loss = loss.item() * grad_accum_steps
         _iter_hm = heatmap_loss.item()
         _iter_traj = trajectory_loss.item()
+        _iter_lm = lm_loss.item()
 
         total_loss += _iter_loss
         total_heatmap_loss += _iter_hm
         total_action_loss += _iter_traj
+        total_lm_loss += _iter_lm
         num_batches += 1
 
         del output, loss, heatmap_loss, gt_heatmap
-        del trajectory_loss
+        del trajectory_loss, lm_loss
         loss_dict = None
         del video_frames
         del current_views_batch, history_panoramas_batch
@@ -513,6 +536,7 @@ def train_one_epoch(
             'loss': f"{_iter_loss:.4f}",
             'hm': f"{total_heatmap_loss / num_batches:.4f}",
             'traj': f"{_iter_traj:.4f}",
+            'lm': f"{_iter_lm:.4f}",
         })
 
         if num_batches % 50 == 0:
@@ -546,6 +570,7 @@ def train_one_epoch(
             mid_metrics = {
                 'total_loss': total_loss / num_batches,
                 'heatmap_loss': total_heatmap_loss / num_batches,
+                'lm_loss': total_lm_loss / num_batches,
             }
             if ema is not None:
                 with ema.apply():
@@ -626,6 +651,7 @@ def train_one_epoch(
             total_loss,
             total_heatmap_loss,
             total_action_loss,
+            total_lm_loss,
             float(num_batches),
         ],
         device=device,
@@ -633,11 +659,12 @@ def train_one_epoch(
     )
     _dist_all_reduce_in_place(totals)
 
-    reduced_num_batches = max(int(totals[3].item()), 1)
+    reduced_num_batches = max(int(totals[4].item()), 1)
     return {
         'total_loss': (totals[0] / reduced_num_batches).item(),
         'heatmap_loss': (totals[1] / reduced_num_batches).item(),
         'trajectory_loss': (totals[2] / reduced_num_batches).item(),
+        'lm_loss': (totals[3] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
     }
 

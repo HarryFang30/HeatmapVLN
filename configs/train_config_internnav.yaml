@@ -16,20 +16,20 @@ seed: 42
 #     → 最大程度复用 InternNav System1 checkpoint
 #
 #   VLM 输入:
-#     panoramic_vlm_input=true → 4 张全景图 (与 Stage 1 heatmap 一致)
+#     panoramic_vlm_input=true → 4 张全景图 (与 Stage1-S2 SFT 一致)
 #     pixel_goal 坐标 = 前视图像素坐标 (prompt 明确指定 "前视图中的像素坐标")
-#     → 消除 Stage 1/2 输入格式错配, LoRA 在同一格式下训练和使用
+#     → 消除 Stage1-S2/Stage2 输入格式错配, LoRA 在同一格式下训练和使用
 #
 # 训练策略:
 #   只训 cond_projector + latent_queries，不解冻 traj_dit/action_encoder/action_decoder。
 #
 # 前置条件:
-#   阶段 1 (train_heatmap_config.yaml) 已完成，LoRA 空间理解已固化。
+#   Stage1-S2 (train_system2_panoramic_sft_2gpu.yaml) 已完成，LoRA 输出坐标/STOP/转向能力已固化。
 #
 # 启动方式:
 #   python scripts/train.py \
 #     --config configs/train_config_internnav.yaml \
-#     --load-weights /path/to/stage1/checkpoints/best.pth
+#     --load-weights /path/to/stage1_s2_panoramic_sft/checkpoints/best.pth
 #
 # ============================================
 

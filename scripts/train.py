@@ -402,8 +402,8 @@ def main():
     )
     if requires_base_checkpoint and not args.load_weights:
         raise ValueError(
-            "Bridge-only training requires the Stage 1 heatmap/System2 checkpoint. "
-            "Pass it with --load-weights so the frozen panoramic LoRA/heatmap base "
+            "Bridge-only training requires the Stage1-S2 panoramic System2 SFT checkpoint. "
+            "Pass it with --load-weights so the frozen panoramic LoRA/System2 base "
             "is loaded before the bridge checkpoint."
         )
     if requires_base_checkpoint and not Path(args.load_weights).exists():
@@ -457,11 +457,18 @@ def main():
     actual_collate_fn = collate_fn
     use_worker_tokenized_collator = stage_cfg.get(
         'use_worker_tokenized_collator',
-        cfg['data'].get('use_worker_tokenized_collator', stage_cfg.get('train_action', True)),
+        cfg['data'].get(
+            'use_worker_tokenized_collator',
+            stage_cfg.get('train_action', True)
+            or stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)),
+        ),
     )
     use_panoramic_tokenized_collator = (
         use_worker_tokenized_collator
-        and cfg['model'].get('heatmap', {}).get('enable', True)
+        and (
+            cfg['model'].get('heatmap', {}).get('enable', True)
+            or stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False))
+        )
         and getattr(train_dataset, '_is_panoramic', False)
         and (val_dataset is None or getattr(val_dataset, '_is_panoramic', False))
     )
@@ -483,8 +490,18 @@ def main():
             n_traj_query = 0
         if not stage_cfg.get('train_action', False):
             n_traj_query = 0
-        actual_collate_fn = PanoramicTokenizedCollator(pano_processor, n_traj_query=n_traj_query)
-        logger.info("   ✅ Panoramic tokenized collator enabled (n_traj_query=%d)", n_traj_query)
+        train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+        actual_collate_fn = PanoramicTokenizedCollator(
+            pano_processor,
+            n_traj_query=n_traj_query,
+            sft_mode=train_lm,
+            sft_include_turns=stage_cfg.get('sft_include_turns', True),
+            sft_include_forward=stage_cfg.get('sft_include_forward', True),
+        )
+        logger.info(
+            "   ✅ Panoramic tokenized collator enabled (n_traj_query=%d, sft_mode=%s)",
+            n_traj_query, train_lm,
+        )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")
 
@@ -602,7 +619,7 @@ def main():
                 logger.warning(f"⚠ No trainable_state_dict found in {weights_path}")
             if requires_base_checkpoint and loaded_count == 0:
                 raise RuntimeError(
-                    "Bridge-only training did not load any parameters from the Stage 1 "
+                    "Bridge-only training did not load any parameters from the Stage1-S2 "
                     f"base checkpoint: {weights_path}"
                 )
             del ckpt
@@ -770,9 +787,10 @@ def main():
             logger.info(f"  🧠 Memory: CPU={mem_info.rss / (1024**3):.2f}GB, GPU={gpu_mem:.2f}GB (reserved={gpu_reserved:.2f}GB)")
 
         train_traj_str = f", traj: {train_metrics['trajectory_loss']:.4f}" if train_metrics.get('trajectory_loss', 0) > 0 else ""
+        train_lm_str = f", lm: {train_metrics['lm_loss']:.4f}" if train_metrics.get('lm_loss', 0) > 0 else ""
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str})"
+            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str}{train_lm_str})"
         )
 
         eta = timer.get_eta(epoch, total_epochs)
@@ -781,9 +799,10 @@ def main():
         if do_eval and val_metrics:
             val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
             val_traj_str = f", traj: {val_metrics['val_trajectory_loss']:.4f}" if val_metrics.get('val_trajectory_loss', 0) > 0 else ""
+            val_lm_str = f", lm: {val_metrics['val_lm_loss']:.4f}" if val_metrics.get('val_lm_loss', 0) > 0 else ""
             logger.info(
                 f"  Val Loss: {val_metrics['val_loss']:.4f} "
-                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_traj_str}{val_hm_mse_str})"
+                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_traj_str}{val_lm_str}{val_hm_mse_str})"
             )
             is_best = val_metrics['val_loss'] < best_val_loss
             if is_best:
@@ -847,6 +866,13 @@ def main():
                     tb_writer.add_scalars('loss/trajectory', {
                         'train': train_traj,
                         'val': val_traj,
+                    }, global_epoch_counter)
+                train_lm = train_metrics.get('lm_loss', 0)
+                val_lm = val_metrics.get('val_lm_loss', 0)
+                if train_lm > 0 or val_lm > 0:
+                    tb_writer.add_scalars('loss/lm', {
+                        'train': train_lm,
+                        'val': val_lm,
                     }, global_epoch_counter)
 
                 for hm_key in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):

@@ -450,6 +450,7 @@ class VLNPipeline(nn.Module):
         panoramic_num_histories: list[int] | None = None,
         panoramic_text_anchor_positions: list[dict[int, int]] | None = None,
         history_rel_poses: torch.Tensor | None = None,
+        return_lm_loss: bool = False,
     ) -> dict[str, Any]:
         """Forward pass."""
         del gt_stop  # Reserved for optional stop-head training compatibility.
@@ -481,7 +482,7 @@ class VLNPipeline(nn.Module):
         llm_tokens = None
         heatmap_output = None
         qwen_timings = None
-        should_run_qwen = need_sequence_features or use_panoramic_chain
+        should_run_qwen = need_sequence_features or use_panoramic_chain or return_lm_loss
         if should_run_qwen:
             # ==================== Step 1: VLM backbone processing ====================
             qwen_start = time.perf_counter() if self.config.enable_runtime_timing else 0.0
@@ -504,6 +505,7 @@ class VLNPipeline(nn.Module):
                 heatmap_vln=self.heatmap_vln if need_heatmap else None,
                 history_rel_poses=history_rel_poses,
                 latent_queries=lq,
+                return_lm_loss=return_lm_loss,
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
@@ -567,6 +569,8 @@ class VLNPipeline(nn.Module):
 
         if traj_hidden_states is not None:
             output['traj_hidden_states'] = traj_hidden_states
+        if qwen_output is not None and qwen_output.get('lm_loss') is not None:
+            output['lm_loss'] = qwen_output['lm_loss']
 
         if self.nextdit_action_head is not None:
             output['has_nextdit_action_head'] = True
