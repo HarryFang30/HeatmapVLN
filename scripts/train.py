@@ -128,6 +128,13 @@ from src.utils.notifier import create_notifier
 logger = logging.getLogger(__name__)
 
 
+def _log_notification_result(logger: logging.Logger, sent: bool, event_name: str) -> None:
+    if sent:
+        logger.info("📢 飞书通知已发送: %s", event_name)
+    else:
+        logger.warning("飞书通知未发送: %s", event_name)
+
+
 def _infer_base_checkpoint_from_resume(resume_path: Path, logger) -> str | None:
     """Recover the Stage 1/base checkpoint path recorded in a bridge checkpoint."""
     try:
@@ -424,12 +431,12 @@ def main():
 
     if notifier:
         try:
-            notifier.send_training_start(
+            sent = notifier.send_training_start(
                 config_name=Path(args.config).stem,
                 stages=[stage_cfg],
                 total_epochs=total_epochs,
             )
-            logger.info("📢 飞书通知已发送: 训练开始")
+            _log_notification_result(logger, sent, "训练开始")
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
 
@@ -894,7 +901,7 @@ def main():
 
         if notifier and do_eval:
             try:
-                notifier.send_epoch_report(
+                sent = notifier.send_epoch_report(
                     epoch=epoch,
                     total_epochs=total_epochs,
                     stage_name=stage_name,
@@ -907,6 +914,7 @@ def main():
                     is_best=is_best,
                     best_val_loss=best_val_loss,
                 )
+                _log_notification_result(logger, sent, f"Epoch {epoch}")
             except Exception as e:
                 logger.warning(f"飞书通知发送失败: {e}")
 
@@ -978,12 +986,12 @@ def main():
 
     if notifier:
         try:
-            notifier.send_training_complete(
+            sent = notifier.send_training_complete(
                 total_time=timer.get_total_elapsed() if timer else "N/A",
                 best_val_loss=best_val_loss,
                 final_stage=stage_name,
             )
-            logger.info("📢 飞书通知已发送: 训练完成")
+            _log_notification_result(logger, sent, "训练完成")
         except Exception as e:
             logger.warning(f"飞书通知发送失败: {e}")
 
