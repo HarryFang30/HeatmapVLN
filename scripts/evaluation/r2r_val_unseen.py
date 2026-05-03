@@ -104,10 +104,12 @@ if not hasattr(np, 'bool'):
 import habitat_sim as _hsim
 
 _dummy_cfg = _hsim.SimulatorConfiguration()
-_dummy_cfg.gpu_device_id = (
-    int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
-    if os.environ.get("CUDA_VISIBLE_DEVICES") else 0
-)
+# For GLX builds, pre-initialisation must use the *local visible* GPU index.
+# When users launch with e.g. CUDA_VISIBLE_DEVICES=4 and --gpu_id 0, Habitat's
+# actual simulator later runs on local GPU 0 (the remapped visible device).
+# Parsing CUDA_VISIBLE_DEVICES here would incorrectly request physical GPU 4
+# from GLX, which fails on multi-GPU systems.
+_dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
 _dummy_agent = _hsim.agent.AgentConfiguration()
 _dummy_agent.sensor_specifications = [_hsim.CameraSensorSpec()]
 _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
@@ -131,8 +133,12 @@ gym.spaces.Discrete = _PatchedDiscrete
 # ═══════════════════════════════════════════════════════════════════════
 
 import argparse
+import copy
+import itertools
 import json
+import random
 import re
+from collections import OrderedDict
 from enum import IntEnum
 from pathlib import Path
 
@@ -156,6 +162,30 @@ MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 DEFAULT_SCENES_DIR = "data/scene_data/mp3d_ce"
 DEFAULT_DATA_PATH = "data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"
+DEFAULT_IMAGE_TOKEN = "<image>"
+LEGACY_PROMPT_TEMPLATE = (
+    "You are an autonomous navigation assistant. Your task is to <instruction>. "
+    "Where should you go next to stay on track? Please output the next waypoint's "
+    "coordinates in the image. Please output STOP when you have successfully completed the task."
+)
+LEGACY_CONJUNCTIONS = [
+    "you can see ",
+    "in front of you is ",
+    "there is ",
+    "you can spot ",
+    "you are toward the ",
+    "ahead of you is ",
+    "in your sight is ",
+]
+LEGACY_ACTIONS2IDX = OrderedDict(
+    {
+        "STOP": [0],
+        "↑": [1],
+        "←": [2],
+        "→": [3],
+        "↓": [5],
+    }
+)
 
 
 class ActionCode(IntEnum):
@@ -165,6 +195,28 @@ class ActionCode(IntEnum):
     RIGHT = 3
     LOOKUP = 4
     LOOKDOWN = 5
+
+
+def split_and_clean(text: str) -> list[str]:
+    """Split by <image> while preserving the token and removing blank text chunks."""
+    parts = re.split(r"(<image>)", text)
+    results: list[str] = []
+    for part in parts:
+        if part == DEFAULT_IMAGE_TOKEN:
+            results.append(part)
+        else:
+            clean = part.replace("\n", "").strip()
+            if clean:
+                results.append(clean)
+    return results
+
+
+def parse_actions(output: str, actions2idx: OrderedDict) -> list[int]:
+    action_patterns = "|".join(re.escape(action) for action in actions2idx)
+    regex = re.compile(action_patterns)
+    matches = regex.findall(output)
+    actions = [actions2idx[match] for match in matches]
+    return list(itertools.chain.from_iterable(actions))
 
 
 def ensure_vln_measures_registered() -> None:
@@ -437,47 +489,72 @@ def traj_to_actions(
     num_sample_trajs: int = 32,
     action_scale: float = 4.0,
 ) -> list[int]:
-    """Convert NextDiT continuous trajectory to discrete Habitat actions.
+    """Convert InternNav trajectory predictions to discrete Habitat actions.
 
-    The trajectory represents relative poses (dx, dy, dyaw) scaled by
-    ``action_scale`` during training.  We accumulate these increments and
-    emit discrete FORWARD / LEFT / RIGHT actions when the accumulated
-    change exceeds the corresponding Habitat action magnitude.
-
-    Args:
-        dp_actions: (B * num_sample_trajs, T, 3) trajectory predictions.
-        num_sample_trajs: number of parallel trajectory samples per batch.
-        action_scale: scaling factor used during training.
-
-    Returns:
-        List of discrete action codes (ActionCode values).
+    This mirrors the verified logic from
+    ``internnav.model.utils.vln_utils.traj_to_actions`` instead of the
+    simplified threshold-based decoder.
     """
-    trajs = dp_actions[:num_sample_trajs].float()
-    mean_traj = trajs.mean(dim=0).cpu().numpy() / action_scale  # (T, 3)
 
-    forward_step = 0.25   # Habitat FORWARD_STEP_SIZE
-    turn_step = np.deg2rad(15)  # Habitat TURN_ANGLE
+    def reconstruct_xy_from_delta(delta_xyt: np.ndarray) -> np.ndarray:
+        start_xy = np.zeros((len(delta_xyt), 2))
+        delta_xy = delta_xyt[:, :, :2]
+        cumsum_xy = np.cumsum(delta_xy, axis=1)
 
-    actions: list[int] = []
-    accum_dx = 0.0
-    accum_dyaw = 0.0
+        B = delta_xyt.shape[0]
+        T = delta_xyt.shape[1]
+        xy = np.zeros((B, T + 1, 2))
+        xy[:, 0] = start_xy
+        xy[:, 1:] = start_xy[:, None, :] + cumsum_xy
+        return xy
 
-    for step in mean_traj:
-        dx, _dy, dyaw = step
-        accum_dx += dx
-        accum_dyaw += dyaw
+    def trajectory_to_discrete_actions_close_to_goal(
+        trajectory: np.ndarray,
+        step_size: float = 0.25,
+        turn_angle_deg: float = 15,
+        lookahead: int = 4,
+    ) -> list[int]:
+        actions: list[int] = []
+        yaw = 0.0
+        pos = trajectory[0]
+        turn_angle_rad = np.deg2rad(turn_angle_deg)
+        goal = trajectory[-1]
 
-        if abs(accum_dyaw) >= turn_step * 0.5:
-            if accum_dyaw > 0:
-                actions.append(ActionCode.LEFT)
-                accum_dyaw -= turn_step
-            else:
-                actions.append(ActionCode.RIGHT)
-                accum_dyaw += turn_step
-        elif accum_dx >= forward_step * 0.5:
+        def normalize_angle(angle: float) -> float:
+            return (angle + np.pi) % (2 * np.pi) - np.pi
+
+        while np.linalg.norm(pos - goal) > 0.2:
+            dists = np.linalg.norm(trajectory - pos, axis=1)
+            nearest_idx = np.argmin(dists)
+            target_idx = min(nearest_idx + lookahead, len(trajectory) - 1)
+            target = trajectory[target_idx]
+            target_dir = target - pos
+            if np.linalg.norm(target_dir) < 1e-6:
+                break
+
+            target_yaw = np.arctan2(target_dir[1], target_dir[0])
+            delta_yaw = normalize_angle(target_yaw - yaw)
+            n_turns = int(round(delta_yaw / turn_angle_rad))
+            if n_turns > 0:
+                actions += [ActionCode.LEFT] * n_turns
+            elif n_turns < 0:
+                actions += [ActionCode.RIGHT] * (-n_turns)
+            yaw = normalize_angle(yaw + n_turns * turn_angle_rad)
+
+            next_pos = pos + step_size * np.array([np.cos(yaw), np.sin(yaw)])
+            if np.linalg.norm(next_pos - goal) > np.linalg.norm(pos - goal):
+                break
+
             actions.append(ActionCode.FORWARD)
-            accum_dx -= forward_step
+            pos = next_pos
 
+        return actions
+
+    trajs = dp_actions[:num_sample_trajs].float().cpu().numpy()
+    trajs[:, :, :2] /= action_scale
+    all_trajectory = reconstruct_xy_from_delta(trajs)
+    trajectory = np.mean(all_trajectory, axis=0)
+    actions = trajectory_to_discrete_actions_close_to_goal(trajectory)
     return actions if actions else [ActionCode.STOP]
 
 
@@ -534,7 +611,7 @@ def prepare_vlm_inputs(
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_model(args, device: torch.device):
-    """Build VLNPipeline, load checkpoint, and initialise HeatmapVLN."""
+    """Build VLNPipeline, load checkpoint, and initialise the Qwen backbone."""
     cfg = load_config(args.config)
     model = build_model(cfg, device=str(device), verbose=False)
 
@@ -552,8 +629,364 @@ def load_model(args, device: torch.device):
 
     model = model.to(device)
     model.eval()
-    model._ensure_heatmap_vln()
+    model.qwen2_5_vl._load_model()
     return model, cfg
+
+
+def _run_eval_panoramic_vlm(
+    args,
+    model,
+    train_cfg: dict,
+    processor,
+    device: torch.device,
+    action_scale: float,
+    num_sample_trajs: int,
+    has_nextdit: bool,
+) -> None:
+    """Closed-loop Habitat evaluation for checkpoints trained with panoramic VLM input."""
+    hab_cfg = build_habitat_config(args)
+    print("Creating Habitat environment ...")
+    env = habitat.Env(config=hab_cfg)
+    num_episodes = len(list(env.episodes))
+    print(f"Total episodes: {num_episodes}")
+
+    image_size = tuple(train_cfg["data"]["image_size"])
+    num_history = args.num_history
+    max_steps_per_episode = args.max_steps_per_episode
+
+    sucs, spls, oss, nes = [], [], [], []
+    done_set: set = set()
+    output_path = args.output_path
+    os.makedirs(output_path, exist_ok=True)
+    progress_file = os.path.join(output_path, "progress.json")
+    if os.path.exists(progress_file):
+        with open(progress_file) as f:
+            for line in f:
+                res = json.loads(line)
+                sucs.append(res["success"])
+                spls.append(res["spl"])
+                oss.append(res["os"])
+                nes.append(res["ne"])
+                if "scene_id" in res:
+                    done_set.add((res["scene_id"], res["episode_id"]))
+
+    remaining = num_episodes - len(done_set)
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}")
+
+    process_bar = tqdm.tqdm(total=remaining, desc="Evaluating")
+    seen_episodes: set = set()
+    eval_count = 0
+
+    while True:
+        observations = env.reset()
+        episode = env.current_episode
+        scene_id = episode.scene_id.split("/")[-2]
+        episode_id = int(episode.episode_id)
+        ep_key = (scene_id, episode_id)
+
+        if ep_key in seen_episodes:
+            break
+        seen_episodes.add(ep_key)
+
+        if ep_key in done_set:
+            continue
+
+        instruction = episode.instruction.instruction_text
+        eval_count += 1
+        print(
+            f"\n[{eval_count}/{remaining}] Episode {scene_id}_{episode_id:04d}: "
+            f"{instruction[:80]}..."
+        )
+
+        history_panoramas: list[dict[str, Image.Image]] = []
+        action_seq: list[int] = []
+        local_actions: list[int] = []
+        pix_goal_image: torch.Tensor | None = None
+        _last_traj_hs: torch.Tensor | None = None
+        base_messages: list[dict] | None = None
+        awaiting_lookdown = False
+        last_llm_output = ""
+        forward_action_count = 0
+        step_id = 0
+        done = False
+
+        while (not done) and (step_id <= max_steps_per_episode):
+            sys.stdout.flush()
+
+            if local_actions:
+                action = local_actions.pop(0)
+                forward_action_count += 1
+
+                if forward_action_count > MAX_STEPS:
+                    pix_goal_image = None
+                    local_actions = []
+                    forward_action_count = 0
+                    step_id += 1
+                    continue
+
+                if action == ActionCode.STOP:
+                    pix_goal_image = None
+                    local_actions = []
+                    forward_action_count = 0
+                    step_id += 1
+                    continue
+
+                observations = env.step(action)
+                done = env.episode_over
+                step_id += 1
+                continue
+
+            if pix_goal_image is not None and _last_traj_hs is not None:
+                # Training pins traj_images to direction="front_down" (see
+                # src/data/trajectory_dataset.py:577). Feeding s1 the level
+                # forward RGB is a domain mismatch; capture a fresh lookdown
+                # (LOOKDOWN×2 → RGB → LOOKUP×2 restores pitch).
+                current_lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
+                current_traj_t = (
+                    torch.from_numpy(np.array(current_lookdown_img)).to(torch.bfloat16) / 255.0
+                )
+                traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
+
+                print("  [debug] re-calling get_trajectory ...", flush=True)
+                with torch.no_grad():
+                    trajectory = model.nextdit_action_head.get_trajectory(
+                        _last_traj_hs,
+                        traj_images=traj_images,
+                    )
+
+                local_actions = traj_to_actions(
+                    trajectory,
+                    num_sample_trajs=num_sample_trajs,
+                    action_scale=action_scale,
+                )
+                if len(local_actions) < MAX_STEPS:
+                    local_actions = list(local_actions) + [ActionCode.STOP] * (
+                        MAX_STEPS - len(local_actions)
+                    )
+                if len(local_actions) >= MAX_LOCAL_STEPS:
+                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+                continue
+
+            print(
+                f"  [step_id={step_id}] Capturing panoramic views + VLM inference ...",
+                flush=True,
+            )
+
+            if awaiting_lookdown and base_messages is not None:
+                lookdown_img = capture_lookdown_view(env, image_size=(640, 480))
+                messages = copy.deepcopy(base_messages)
+                messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": last_llm_output}],
+                })
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "image", "image": lookdown_img}],
+                })
+                awaiting_lookdown = False
+            else:
+                current_views = capture_panoramic_views(env, image_size=image_size)
+                messages = construct_input(
+                    current_views=current_views,
+                    history_panoramas=history_panoramas,
+                    instruction=instruction,
+                    pixel_goal=[0, 0],
+                )
+                messages = [m for m in messages if m["role"] != "assistant"]
+                base_messages = copy.deepcopy(messages)
+                history_panoramas.append(current_views)
+                if len(history_panoramas) > num_history:
+                    indices = np.unique(
+                        np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)
+                    ).tolist()
+                    history_panoramas = [history_panoramas[i] for i in indices]
+
+            inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            _normalize_multimodal_inputs(inputs)
+
+            print(
+                f"  [debug] input_ids shape={inputs['input_ids'].shape}, calling model.generate ...",
+                flush=True,
+            )
+            with torch.no_grad():
+                output_ids = model.qwen2_5_vl.model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    use_cache=True,
+                    return_dict_in_generate=True,
+                ).sequences
+
+            llm_output = processor.tokenizer.decode(
+                output_ids[0][inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True,
+            )
+            last_llm_output = llm_output
+            print(f"  step_id: {step_id}, VLM output: {llm_output}")
+
+            if has_nextdit and bool(re.search(r"\d", llm_output)):
+                coord = [int(c) for c in re.findall(r"\d+", llm_output)]
+                if len(coord) >= 2:
+                    pixel_goal = [int(coord[1]), int(coord[0])]
+                    print(f"  predicted pixel_goal {pixel_goal}")
+                else:
+                    env.step(ActionCode.STOP)
+                    done = True
+                    continue
+
+                # Capture lookdown view (matches training direction="front_down"
+                # in src/data/trajectory_dataset.py:577). Both slots of
+                # traj_images are the same frame at goal-freeze time.
+                current_lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
+                current_traj_t = (
+                    torch.from_numpy(np.array(current_lookdown_img)).to(torch.bfloat16) / 255.0
+                )
+                pix_goal_image = current_traj_t.clone()
+                traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
+
+                print("  [debug] calling generate_latents ...", flush=True)
+                lq = model.latent_queries.expand(1, -1, -1).to(
+                    device=device, dtype=model.config.dtype,
+                )
+                with torch.no_grad():
+                    _last_traj_hs = model.qwen2_5_vl.generate_latents(
+                        output_ids=output_ids,
+                        pixel_values=inputs.get("pixel_values"),
+                        image_grid_thw=inputs.get("image_grid_thw"),
+                        latent_queries=lq,
+                    )
+
+                print("  [debug] calling get_trajectory ...", flush=True)
+                with torch.no_grad():
+                    trajectory = model.nextdit_action_head.get_trajectory(
+                        _last_traj_hs,
+                        traj_images=traj_images,
+                    )
+
+                local_actions = traj_to_actions(
+                    trajectory,
+                    num_sample_trajs=num_sample_trajs,
+                    action_scale=action_scale,
+                )
+                if len(local_actions) < MAX_STEPS:
+                    local_actions = list(local_actions) + [ActionCode.STOP] * (
+                        MAX_STEPS - len(local_actions)
+                    )
+                if len(local_actions) >= MAX_LOCAL_STEPS:
+                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+                forward_action_count = 0
+
+                if local_actions:
+                    first_action = local_actions.pop(0)
+                    if first_action == ActionCode.STOP:
+                        # Mirror InternNav: if s1 predicts STOP on the very
+                        # first action after s2, force a LEFT turn so the next
+                        # s2 call sees a different panorama and can replan
+                        # (otherwise s2→s1→STOP loops with identical views).
+                        pix_goal_image = None
+                        _last_traj_hs = None
+                        local_actions = []
+                        base_messages = None
+                        awaiting_lookdown = False
+                        forward_action_count = 0
+                        observations = env.step(ActionCode.LEFT)
+                        done = env.episode_over
+                        step_id += 1
+                        continue
+
+                    observations = env.step(first_action)
+                    done = env.episode_over
+                    step_id += 1
+                    forward_action_count += 1
+                    continue
+
+                env.step(ActionCode.STOP)
+                done = True
+                continue
+
+            action_seq = parse_actions(llm_output, LEGACY_ACTIONS2IDX)
+            if action_seq:
+                action = action_seq.pop(0)
+                if action == ActionCode.LOOKDOWN:
+                    awaiting_lookdown = True
+                    continue
+                else:
+                    observations = env.step(action)
+                    done = env.episode_over
+                    step_id += 1
+            else:
+                env.step(ActionCode.STOP)
+                done = True
+
+        metrics = env.get_metrics()
+        sucs.append(metrics["success"])
+        spls.append(metrics["spl"])
+        oss.append(metrics["oracle_success"])
+        nes.append(metrics["distance_to_goal"])
+
+        print(
+            f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
+            f"os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']:.4f}"
+        )
+
+        result = {
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "success": metrics["success"],
+            "spl": metrics["spl"],
+            "os": metrics["oracle_success"],
+            "ne": metrics["distance_to_goal"],
+            "steps": step_id,
+            "episode_instruction": instruction,
+        }
+        with open(progress_file, "a") as f:
+            f.write(json.dumps(result) + "\n")
+
+        done_set.add(ep_key)
+        process_bar.update(1)
+
+        if eval_count % 50 == 0:
+            torch.cuda.empty_cache()
+
+    env.close()
+
+    if len(sucs) > 0:
+        sucs_t = torch.tensor(sucs)
+        spls_t = torch.tensor(spls)
+        oss_t = torch.tensor(oss)
+        nes_t = torch.tensor(nes)
+        torch.nan_to_num(spls_t, nan=0.0, posinf=0.0, neginf=0.0, out=spls_t)
+        nes_finite = nes_t[torch.isfinite(nes_t)]
+
+        final_result = {
+            "SR": float(sucs_t.mean().item()),
+            "SPL": float(spls_t.mean().item()),
+            "OS": float(oss_t.mean().item()),
+            "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
+            "total_episodes": len(sucs),
+        }
+    else:
+        final_result = {"SR": 0, "SPL": 0, "OS": 0, "NE": 0, "total_episodes": 0}
+
+    print("\n" + "=" * 60)
+    print("Final Results:")
+    print(f"  NE  (Navigation Error):  {final_result['NE']:.4f}")
+    print(f"  OS  (Oracle Success):    {final_result['OS']:.4f}")
+    print(f"  SR  (Success Rate):      {final_result['SR']:.4f}")
+    print(f"  SPL (Success w/ Path):   {final_result['SPL']:.4f}")
+    print(f"  Total episodes:          {final_result['total_episodes']}")
+    print("=" * 60)
+
+    with open(os.path.join(output_path, "result.json"), "w") as f:
+        json.dump(final_result, f, indent=2)
+    print(f"Results saved to {os.path.join(output_path, 'result.json')}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -567,6 +1000,7 @@ def run_eval(args):
     print(f"Loading model from config={args.config}, checkpoint={args.checkpoint}")
     model, train_cfg = load_model(args, device)
     processor = model.qwen2_5_vl.processor
+    processor.tokenizer.padding_side = "left"
 
     action_scale = (
         train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
@@ -581,13 +1015,28 @@ def run_eval(args):
     print(f"NextDiT action head available: {has_nextdit}")
     print(f"  action_scale={action_scale}, num_sample_trajs={num_sample_trajs}")
 
+    panoramic_vlm_input = bool(
+        train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
+    )
+    print(f"Panoramic VLM input: {panoramic_vlm_input}")
+    if panoramic_vlm_input:
+        return _run_eval_panoramic_vlm(
+            args=args,
+            model=model,
+            train_cfg=train_cfg,
+            processor=processor,
+            device=device,
+            action_scale=action_scale,
+            num_sample_trajs=num_sample_trajs,
+            has_nextdit=has_nextdit,
+        )
+
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
     env = habitat.Env(config=hab_cfg)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
-    image_size = tuple(train_cfg["data"]["image_size"])  # (256, 256)
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
 
@@ -617,7 +1066,7 @@ def run_eval(args):
 
     # ── Episode loop (iterator-driven, see ReadBeforeEvaluatingHabitat.md §16) ──
     while True:
-        env.reset()
+        observations = env.reset()
         episode = env.current_episode
         scene_id = episode.scene_id.split("/")[-2]
         episode_id = int(episode.episode_id)
@@ -637,9 +1086,13 @@ def run_eval(args):
             f"{instruction[:80]}..."
         )
 
-        # ── Per-episode state ──
-        history_panoramas: list[dict[str, Image.Image]] = []
-        history_poses: list[np.ndarray] = []  # 4×4 cam2world at each panoramic capture
+        # ── Per-episode state (InternNav dual-system logic) ──
+        rgb_history: list[Image.Image] = []
+        action_seq: list[int] = []
+        input_images: list[Image.Image] = []
+        llm_output = ""
+        action: int | None = None
+        messages: list[dict] = []
         pix_goal_image: torch.Tensor | None = None
         _last_traj_hs: torch.Tensor | None = None
         local_actions: list[int] = []
@@ -649,229 +1102,224 @@ def run_eval(args):
 
         while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
+            print(
+                f"  [step_id={step_id}] Capturing observations + VLM inference ...",
+                flush=True,
+            )
 
-            # ── If there are queued local actions, execute them ──
-            if local_actions:
-                action = local_actions.pop(0)
+            rgb = observations["rgb"]
+            image = Image.fromarray(rgb).convert("RGB")
+
+            if action == ActionCode.LOOKDOWN:
+                lookdown_img = image.resize((224, 224))
+            else:
+                rgb_history.append(image.resize((args.resize_w, args.resize_h)))
+
+                down_observations = env.step(ActionCode.LOOKDOWN)
+                down_observations = env.step(ActionCode.LOOKDOWN)
+                lookdown_img = Image.fromarray(down_observations["rgb"]).convert("RGB").resize((224, 224))
+                env.step(ActionCode.LOOKUP)
+                env.step(ActionCode.LOOKUP)
+
+            if len(action_seq) == 0 and pix_goal_image is None:
+                if action == ActionCode.LOOKDOWN:
+                    sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                    input_images += [lookdown_img]
+                    messages.append(
+                        {"role": "assistant", "content": [{"type": "text", "text": llm_output}]}
+                    )
+                    input_img_id = -1
+                else:
+                    sources = [
+                        {"from": "human", "value": LEGACY_PROMPT_TEMPLATE},
+                        {"from": "gpt", "value": ""},
+                    ]
+                    prompt_instruction = instruction[:-1] if instruction.endswith((".", "!", "?")) else instruction
+                    sources[0]["value"] = sources[0]["value"].replace("<instruction>.", prompt_instruction)
+
+                    cur_images = rgb_history[-1:]
+                    if step_id == 0:
+                        history_id = []
+                    else:
+                        history_id = np.unique(
+                            np.linspace(0, step_id - 1, num_history, dtype=np.int32)
+                        ).tolist()
+                        placeholder = (DEFAULT_IMAGE_TOKEN + "\n") * len(history_id)
+                        sources[0]["value"] += (
+                            f" These are your historical observations: {placeholder}."
+                        )
+
+                    history_id = sorted(history_id)
+                    input_images = [rgb_history[i] for i in history_id] + cur_images
+                    input_img_id = 0
+
+                prompt = random.choice(LEGACY_CONJUNCTIONS) + DEFAULT_IMAGE_TOKEN
+                sources[0]["value"] += f" {prompt}."
+                prompt_instruction = copy.deepcopy(sources[0]["value"])
+                parts = split_and_clean(prompt_instruction)
+
+                content = []
+                for part in parts:
+                    if part == DEFAULT_IMAGE_TOKEN:
+                        content.append({"type": "image", "image": input_images[input_img_id]})
+                        input_img_id += 1
+                    else:
+                        content.append({"type": "text", "text": part})
+
+                messages.append({"role": "user", "content": content})
+
+                text = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                inputs = processor(
+                    text=[text],
+                    images=input_images,
+                    return_tensors="pt",
+                ).to(device)
+
+                print(
+                    f"  [debug] input_ids shape={inputs.input_ids.shape}, calling model.generate ...",
+                    flush=True,
+                )
+                with torch.no_grad():
+                    output_ids = model.qwen2_5_vl.model.generate(
+                        **inputs,
+                        max_new_tokens=128,
+                        do_sample=False,
+                        use_cache=True,
+                        return_dict_in_generate=True,
+                    ).sequences
+
+                llm_output = processor.tokenizer.decode(
+                    output_ids[0][inputs.input_ids.shape[1]:],
+                    skip_special_tokens=True,
+                )
+                print(f"  step_id: {step_id}, VLM output: {llm_output}")
+
+                if bool(re.search(r"\d", llm_output)):
+                    coord = [int(c) for c in re.findall(r"\d+", llm_output)]
+                    if len(coord) >= 2:
+                        pixel_goal = [int(coord[1]), int(coord[0])]
+                        print(f"  predicted pixel_goal {pixel_goal}")
+                    else:
+                        action = ActionCode.LEFT
+                        observations = env.step(action)
+                        step_id += 1
+                        done = env.episode_over
+                        messages = []
+                        continue
+
+                    if not has_nextdit:
+                        action = ActionCode.STOP
+                        observations = env.step(action)
+                        done = True
+                        messages = []
+                        continue
+
+                    lookdown_t = (
+                        torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
+                    )
+                    pix_goal_image = lookdown_t.clone()
+                    traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
+
+                    print("  [debug] calling generate_latents ...", flush=True)
+                    lq = model.latent_queries.expand(1, -1, -1).to(
+                        device=device, dtype=model.config.dtype,
+                    )
+                    with torch.no_grad():
+                        _last_traj_hs = model.qwen2_5_vl.generate_latents(
+                            output_ids=output_ids,
+                            pixel_values=inputs.get("pixel_values"),
+                            image_grid_thw=inputs.get("image_grid_thw"),
+                            latent_queries=lq,
+                        )
+
+                    print("  [debug] calling get_trajectory ...", flush=True)
+                    with torch.no_grad():
+                        trajectory = model.nextdit_action_head.get_trajectory(
+                            _last_traj_hs,
+                            traj_images=traj_images,
+                        )
+
+                    local_actions = traj_to_actions(
+                        trajectory,
+                        num_sample_trajs=num_sample_trajs,
+                        action_scale=action_scale,
+                    )
+                    if len(local_actions) >= MAX_LOCAL_STEPS:
+                        local_actions = local_actions[:MAX_LOCAL_STEPS]
+
+                    forward_action_count = 0
+                    action = local_actions[0] if local_actions else ActionCode.STOP
+                    if action == ActionCode.STOP:
+                        pix_goal_image = None
+                        local_actions = []
+                        action = ActionCode.LEFT
+                        observations = env.step(action)
+                        step_id += 1
+                        done = env.episode_over
+                        messages = []
+                        continue
+                else:
+                    action_seq = parse_actions(llm_output, LEGACY_ACTIONS2IDX)
+                    print(f"  actions {action_seq}")
+
+            if len(action_seq) != 0:
+                action = action_seq.pop(0)
+            elif pix_goal_image is not None:
+                if len(local_actions) == 0:
+                    lookdown_t = (
+                        torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
+                    )
+                    traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
+
+                    with torch.no_grad():
+                        trajectory = model.nextdit_action_head.get_trajectory(
+                            _last_traj_hs,
+                            traj_images=traj_images,
+                        )
+
+                    local_actions = traj_to_actions(
+                        trajectory,
+                        num_sample_trajs=num_sample_trajs,
+                        action_scale=action_scale,
+                    )
+                    if len(local_actions) >= MAX_LOCAL_STEPS:
+                        local_actions = local_actions[:MAX_LOCAL_STEPS]
+                    action = local_actions.pop(0) if local_actions else ActionCode.STOP
+                else:
+                    action = local_actions.pop(0)
+
                 forward_action_count += 1
-
                 if forward_action_count > MAX_STEPS:
                     pix_goal_image = None
-                    local_actions = []
-                    forward_action_count = 0
+                    messages = []
                     step_id += 1
+                    forward_action_count = 0
+                    local_actions = []
                     continue
 
                 if action == ActionCode.STOP:
                     pix_goal_image = None
-                    local_actions = []
-                    forward_action_count = 0
+                    messages = []
                     step_id += 1
+                    forward_action_count = 0
+                    local_actions = []
                     continue
+            else:
+                action = ActionCode.STOP
 
+            if action == ActionCode.LOOKDOWN:
                 env.step(action)
+                observations = env.step(action)
+                done = env.episode_over
+            else:
+                observations = env.step(action)
                 done = env.episode_over
                 step_id += 1
-                continue
-
-            # ── If pixel_goal is active but local_actions exhausted → re-predict ──
-            if pix_goal_image is not None:
-                lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
-                lookdown_t = (
-                    torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
-                )
-                traj_images = (
-                    torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
-                )
-
-                with torch.no_grad():
-                    trajectory = model.nextdit_action_head.get_trajectory(
-                        _last_traj_hs, traj_images=traj_images,
-                    )
-                local_actions = traj_to_actions(
-                    trajectory, num_sample_trajs=num_sample_trajs,
-                    action_scale=action_scale,
-                )
-                if len(local_actions) >= MAX_LOCAL_STEPS:
-                    local_actions = local_actions[:MAX_LOCAL_STEPS]
-                continue
-
-            # ── High-level step: VLM inference ──
-            print(
-                f"  [step_id={step_id}] Capturing panoramic views + VLM inference ...",
-                flush=True,
-            )
-
-            current_views = capture_panoramic_views(env, image_size=image_size)
-            current_pose = get_agent_cam2world(env)
-
-            # Compute relative poses for TrajectoryGuidedAttention
-            if history_poses:
-                rel_poses_np = compute_history_rel_poses(history_poses, current_pose)
-                history_rel_poses = (
-                    torch.from_numpy(rel_poses_np).float().unsqueeze(0).to(device)
-                )  # (1, N, 4)
-            else:
-                history_rel_poses = None
-
-            inputs = prepare_vlm_inputs(
-                processor, current_views, history_panoramas, instruction, device,
-            )
-
-            # ── Optional heatmap forward: feed history_rel_poses to the
-            #    TrajectoryGuidedAttention coarse localisation head.
-            #    This runs one non-generative VLM pass with heatmap hooks so
-            #    that the model's spatial understanding is exercised. ──
-            if history_rel_poses is not None and model.heatmap_vln is not None:
-                try:
-                    hm_inputs, n_hist_list = model.heatmap_vln.prepare_qwen_inputs_batch(
-                        current_views=current_views,
-                        history_panoramas=[history_panoramas],
-                        instruction=[instruction],
-                        device=device,
-                    )
-                    model.heatmap_vln.feat_extractor.clear()
-                    from src.models.heatmap.input_constructor import find_text_anchor_positions
-                    img_pos_batch = [
-                        model.heatmap_vln._find_image_positions_from_ids(
-                            hm_inputs["input_ids"][b]
-                        )
-                        for b in range(hm_inputs["input_ids"].shape[0])
-                    ]
-                    txt_anc_batch = [
-                        find_text_anchor_positions(
-                            hm_inputs["input_ids"][b:b + 1],
-                            model.heatmap_vln.processor.tokenizer,
-                            num_history=n_hist_list[b],
-                        )
-                        for b in range(hm_inputs["input_ids"].shape[0])
-                    ]
-                    model.heatmap_vln.feat_extractor.prepare_batch_capture(
-                        image_token_positions_batch=img_pos_batch,
-                        text_anchor_positions_batch=txt_anc_batch,
-                        image_grid_thw=hm_inputs.get("image_grid_thw"),
-                    )
-                    with torch.inference_mode():
-                        model.qwen2_5_vl.model(
-                            **hm_inputs,
-                            output_hidden_states=False,
-                            return_dict=True,
-                        )
-                    heatmap_output = model.heatmap_vln.decode_from_inputs_batch(
-                        hm_inputs, n_hist_list,
-                        image_positions_batch=img_pos_batch,
-                        text_anchors_batch=txt_anc_batch,
-                        history_rel_poses=history_rel_poses,
-                    )
-                    print(
-                        f"  [heatmap] visibility shape="
-                        f"{heatmap_output['visibility'].shape}, "
-                        f"heatmaps shape={heatmap_output['heatmaps'].shape}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    import traceback
-                    print(f"  [heatmap] skipped: {e}\n{traceback.format_exc()}", flush=True)
-
-            print(
-                f"  [debug] input_ids shape={inputs['input_ids'].shape}, "
-                f"calling model.generate ...",
-                flush=True,
-            )
-            with torch.no_grad():
-                output_ids = model.qwen2_5_vl.model.generate(
-                    **inputs,
-                    max_new_tokens=128,
-                    do_sample=False,
-                    use_cache=True,
-                    return_dict_in_generate=True,
-                ).sequences
-
-            llm_output = processor.tokenizer.decode(
-                output_ids[0][inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True,
-            )
-            print(f"  step_id: {step_id}, VLM output: {llm_output}")
-
-            # ── Parse output: coordinates or STOP ──
-            if has_nextdit and bool(re.search(r"\d", llm_output)):
-                coord = [int(c) for c in re.findall(r"\d+", llm_output)]
-                if len(coord) >= 2:
-                    pixel_goal = [int(coord[1]), int(coord[0])]
-                    print(f"  predicted pixel_goal {pixel_goal}")
-                else:
-                    env.step(ActionCode.LEFT)
-                    step_id += 1
-                    done = env.episode_over
-                    history_panoramas.append(current_views)
-                    continue
-
-                lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
-                lookdown_t = (
-                    torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
-                )
-                pix_goal_image = lookdown_t.clone()
-                traj_images = (
-                    torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
-                )
-
-                print("  [debug] calling generate_latents ...", flush=True)
-                lq = model.latent_queries.expand(1, -1, -1).to(
-                    device=device, dtype=model.config.dtype,
-                )
-                with torch.no_grad():
-                    _last_traj_hs = model.qwen2_5_vl.generate_latents(
-                        output_ids=output_ids,
-                        pixel_values=inputs.get("pixel_values"),
-                        image_grid_thw=inputs.get("image_grid_thw"),
-                        latent_queries=lq,
-                    )
-
-                print("  [debug] calling get_trajectory ...", flush=True)
-                with torch.no_grad():
-                    trajectory = model.nextdit_action_head.get_trajectory(
-                        _last_traj_hs, traj_images=traj_images,
-                    )
-                print(
-                    f"  [debug] trajectory shape={trajectory.shape}",
-                    flush=True,
-                )
-
-                local_actions = traj_to_actions(
-                    trajectory, num_sample_trajs=num_sample_trajs,
-                    action_scale=action_scale,
-                )
-                if len(local_actions) >= MAX_LOCAL_STEPS:
-                    local_actions = local_actions[:MAX_LOCAL_STEPS]
-                forward_action_count = 0
-
-                first_action = local_actions.pop(0) if local_actions else ActionCode.STOP
-                if first_action == ActionCode.STOP:
-                    pix_goal_image = None
-                    local_actions = []
-                    env.step(ActionCode.LEFT)
-                    step_id += 1
-                    done = env.episode_over
-                else:
-                    env.step(first_action)
-                    step_id += 1
-                    forward_action_count += 1
-                    done = env.episode_over
-            else:
-                env.step(ActionCode.STOP)
-                done = True
-
-            # ── Update history (panoramic views + agent poses) ──
-            history_panoramas.append(current_views)
-            history_poses.append(current_pose)
-            if len(history_panoramas) > num_history:
-                indices = np.unique(
-                    np.linspace(
-                        0, len(history_panoramas) - 1, num_history, dtype=np.int32,
-                    )
-                ).tolist()
-                history_panoramas = [history_panoramas[i] for i in indices]
-                history_poses = [history_poses[i] for i in indices]
+                messages = []
 
         # ── Collect metrics ──
         metrics = env.get_metrics()
@@ -956,6 +1404,8 @@ def main():
                         default=DEFAULT_DATA_PATH)
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
     parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument("--resize_w", type=int, default=384)
+    parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
     args = parser.parse_args()

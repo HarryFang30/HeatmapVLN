@@ -1286,8 +1286,9 @@ class Qwen2_5VLIntegration(nn.Module):
         )
         extended_ids = torch.cat([output_ids, traj_suffix], dim=1)
 
+        embedding_layer = self.model.get_input_embeddings()
         with torch.no_grad():
-            text_embeds = self.model.model.embed_tokens(extended_ids)
+            text_embeds = embedding_layer(extended_ids)
 
         image_mask = extended_ids == self.image_token_id
         if pixel_values is not None and image_mask.any():
@@ -1312,11 +1313,12 @@ class Qwen2_5VLIntegration(nn.Module):
             position_ids = position_ids.to(device)
 
         with torch.no_grad():
-            outputs = self.model.model(
+            outputs = self.model(
                 inputs_embeds=text_embeds,
                 position_ids=position_ids,
                 output_hidden_states=True,
                 return_dict=True,
+                use_cache=False,
             )
 
         traj_hidden_states = outputs.hidden_states[-1][:, -n_query:, :]
@@ -1413,4 +1415,3 @@ class Qwen2_5VLIntegration(nn.Module):
         if self.model is not None:
             for param in self.model.parameters():
                 param.requires_grad = True
-

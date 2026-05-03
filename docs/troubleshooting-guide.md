@@ -556,6 +556,40 @@ _arch_mod.build_depthanythingv2 = _patched_build_dav2
 
 ---
 
+## 16. 评测 prompt / 状态机 与 checkpoint 不匹配（会“跑得飞快但几乎没导航”）
+
+### 问题描述
+
+如果评测脚本把高层 VLM 推理路径改成了新的全景 prompt / 直接 STOP 逻辑，而 checkpoint 实际仍依赖 InternNav 原始的 dual-system 评测状态机，就会出现这种现象：
+
+- `model.generate()` 很快返回，但输出经常是 `____`、空串、或未被当前脚本识别的箭头 token
+- episode 常在 `step_id=0` 直接结束
+- 评测速度异常快（几分钟跑几百个 episode）
+- `NE` 基本接近初始距离，`SR/SPL/OS` 接近 0
+
+根因通常不是 Habitat 环境没创建，而是：
+
+1. **VLM prompt 分布变了**：例如把 InternNav 的英文 `<image>` 对话模板换成新的中文全景 prompt
+2. **非坐标输出处理变了**：旧版会把 `↑/←/→/↓/STOP` 继续解析成动作；错误实现会把“非数字输出”直接当作 STOP
+
+### 解决方案
+
+- 对这类 InternNav-compatible checkpoint，评测时应优先沿用旧版 `eval_r2r_val_unseen.py` 的高层推理逻辑：
+  - 英文 prompt template
+  - `<image>` 插槽拼接
+  - 历史前视图采样
+  - `↑/←/→/↓/STOP` 动作解析
+  - lookdown 多轮对话分支
+- 可以继续使用当前仓库里的 `generate_latents` / `NextDiTActionHead.get_trajectory`，但**不要**随意替换掉高层 VLM 的 prompt 和状态机
+
+### 要点
+
+- “评测很快”本身就是一个强烈信号：通常说明 agent 几乎没有执行导航动作
+- 如果日志里大量出现 `step_id: 0, VLM output: ____`，优先检查 prompt 构造和输出解析，而不是先怀疑场景路径
+- 对冻结 VLM、只微调 System 1 / latent query / cond projector 的 checkpoint，更要保持与原始 backbone 一致的推理 prompt
+
+---
+
 ## 完整启动命令参考
 
 ```bash

@@ -366,7 +366,7 @@ class NextDiTActionHead(nn.Module):
         # Encode noisy trajectory
         action_features = self.action_encoder(noisy_trajectory)  # (B, T, dit_dim)
         pos_ids = torch.arange(gt_trajectory.shape[1], device=device).reshape(1, -1).repeat(bsz, 1)
-        pos_embed = self.pos_encoding(pos_ids)
+        pos_embed = self.pos_encoding(pos_ids).to(dtype=action_features.dtype)
         action_features = action_features + pos_embed
 
         # NextDiT forward
@@ -452,7 +452,7 @@ class NextDiTActionHead(nn.Module):
                 .reshape(1, -1)
                 .repeat(batch_size * num_sample_trajs, 1)
             )
-            pos_embed = self.pos_encoding(pos_ids)
+            pos_embed = self.pos_encoding(pos_ids).to(dtype=latent_features.dtype)
             latent_features = latent_features + pos_embed
 
             # Double for CFG

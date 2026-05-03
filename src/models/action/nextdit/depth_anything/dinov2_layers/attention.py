@@ -24,6 +24,10 @@ except ImportError:
     XFORMERS_AVAILABLE = False
 
 
+_MEM_EFF_ATTENTION_RUNTIME_DISABLED = False
+_MEM_EFF_ATTENTION_RUNTIME_FALLBACK_WARNED = False
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -62,7 +66,9 @@ class Attention(nn.Module):
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        if not XFORMERS_AVAILABLE:
+        global _MEM_EFF_ATTENTION_RUNTIME_DISABLED, _MEM_EFF_ATTENTION_RUNTIME_FALLBACK_WARNED
+
+        if not XFORMERS_AVAILABLE or (_MEM_EFF_ATTENTION_RUNTIME_DISABLED and attn_bias is None):
             assert attn_bias is None, "xFormers is required for nested tensors usage"
             return super().forward(x)
 
@@ -71,10 +77,22 @@ class MemEffAttention(Attention):
 
         q, k, v = unbind(qkv, 2)
 
-        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        try:
+            x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        except Exception as exc:
+            if attn_bias is not None:
+                raise
+            _MEM_EFF_ATTENTION_RUNTIME_DISABLED = True
+            if not _MEM_EFF_ATTENTION_RUNTIME_FALLBACK_WARNED:
+                logger.warning(
+                    "Falling back to standard attention because xFormers failed at runtime: %s. "
+                    "Subsequent calls will stay on the fallback path.",
+                    exc,
+                )
+                _MEM_EFF_ATTENTION_RUNTIME_FALLBACK_WARNED = True
+            return super().forward(x)
         x = x.reshape([B, N, C])
 
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
