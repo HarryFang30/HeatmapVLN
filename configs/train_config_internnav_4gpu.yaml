@@ -1,17 +1,17 @@
 seed: 42
 
 # ============================================
-# 阶段 2: Bridge-only 适配 — 多卡版本
+# 阶段 2: Bridge-only 适配 — 双卡版本
 # ============================================
 #
 # 与 train_config_internnav.yaml 的区别:
-#   1. gpu.devices: [0, 1, 2]
+#   1. gpu.devices: [0, 1]
 #   2. gpu.multi_gpu.enabled: true
-#   3. batch_size: 6 (每卡 6)
+#   3. batch_size: 4 (每卡 4, 总有效 batch=8)
 #   4. num_workers: 4 (每卡)
 #
 # 启动方式 (必须用 torchrun):
-#   torchrun --nproc_per_node=4 scripts/train.py \
+#   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
 #     --config configs/train_config_internnav_4gpu.yaml \
 #     --load-weights /path/to/stage1/checkpoints/best.pth
 #
@@ -174,8 +174,8 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  # 多卡: 每卡 batch=6
-  batch_size: 6
+  # 双卡: 每卡 batch=4，总有效 batch=8
+  batch_size: 4
   grad_accum_steps: 1
 
 # ============================================
@@ -202,10 +202,10 @@ loss:
   trajectory_weight: 1.0
 
 # ============================================
-# GPU配置 — 多卡
+# GPU配置 — 双卡
 # ============================================
 gpu:
-  devices: [0, 1, 2]
+  devices: [0, 1]
   backend: nccl
   multi_gpu:
     enabled: true
