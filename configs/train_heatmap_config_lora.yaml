@@ -1,7 +1,7 @@
 seed: 42
 
 # ============================================
-# 数据配置 - 热力图训练 + LoRA 对比实验（单卡）
+# 数据配置 - 热力图训练 + LoRA 对比实验（双卡）
 # ============================================
 #
 # 与 train_heatmap_config.yaml 的区别:
@@ -9,7 +9,8 @@ seed: 42
 #   2. lora_lr: 1e-4 (原 5e-6)        — 补偿间接辅助信号的衰减
 #
 # 用法: 从收敛的 heatmap-only checkpoint 继续训练
-#   python scripts/train.py --config configs/train_heatmap_config_lora.yaml \
+#   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
+#     --config configs/train_heatmap_config_lora.yaml \
 #     --load-weights /path/to/heatmap_converged/best.pth
 #
 # 效果: 热力图 loss 梯度可穿透 backbone 到达 LoRA 参数
@@ -152,8 +153,8 @@ optim:
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   # heatmap_trains_backbone=true 保留计算图, gradient_checkpointing 补偿
-  # 48GB VRAM, 有效 batch = 4 × 4 = 16
-  batch_size: 4
+  # 双卡: 每卡 batch=2, grad_accum=4, 总有效 batch=16
+  batch_size: 2
   grad_accum_steps: 4
 
 # ============================================
@@ -183,11 +184,11 @@ loss:
 # GPU配置
 # ============================================
 gpu:
-  devices: [0]
+  devices: [0, 1]
   backend: nccl
   multi_gpu:
-    enabled: false
-    find_unused_parameters: false
+    enabled: true
+    find_unused_parameters: true
 
 # ============================================
 # 日志与保存
