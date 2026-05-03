@@ -466,11 +466,17 @@ class VLNPipeline(nn.Module):
         # Only construct and pass heatmap_vln when panoramic history anchors
         # are present.  In Stage 2 InternNav mode (pano_num_histories all
         # zeros / no panoramic views), the VLM forward runs without hooks.
+        has_standard_panoramic_views = (
+            current_views is not None and history_panoramas is not None
+        )
+        has_tokenized_panoramic_history = (
+            panoramic_num_histories is not None
+            and any(n > 0 for n in panoramic_num_histories)
+        )
         need_heatmap = (
             use_panoramic_chain
             and return_heatmaps
-            and panoramic_num_histories is not None
-            and any(n > 0 for n in panoramic_num_histories)
+            and (has_standard_panoramic_views or has_tokenized_panoramic_history)
         )
         if need_heatmap:
             self._ensure_heatmap_vln()
