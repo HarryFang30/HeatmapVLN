@@ -449,6 +449,14 @@ def _requires_base_checkpoint(cfg: dict, checkpoint_cfg: dict | None = None) -> 
     return False
 
 
+def _system2_sft_protocol(cfg: dict) -> str:
+    return (
+        cfg.get("data", {})
+        .get("trajectory", {})
+        .get("system2_sft_protocol", "direct")
+    ).lower()
+
+
 def _preflight_checkpoint_args(args) -> None:
     cfg = load_config(args.config)
     checkpoint_cfg = _extract_checkpoint_config(args.checkpoint)
@@ -849,6 +857,7 @@ def prepare_vlm_inputs(
     history_panoramas: list[dict[str, Image.Image]],
     instruction: str,
     device: torch.device,
+    internnav_protocol: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build tokenised Qwen2.5-VL inputs from panoramic observations.
 
@@ -861,6 +870,7 @@ def prepare_vlm_inputs(
         history_panoramas=history_panoramas,
         instruction=instruction,
         pixel_goal=[0, 0],
+        internnav_protocol=internnav_protocol,
     )
     messages = [m for m in messages if m["role"] != "assistant"]
 
@@ -979,6 +989,8 @@ def _run_eval_panoramic_vlm(
     image_size = tuple(train_cfg["data"]["image_size"])
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
+    internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
+    print(f"System2 SFT protocol: {'internnav' if internnav_protocol else 'direct'}")
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
@@ -1112,6 +1124,7 @@ def _run_eval_panoramic_vlm(
                     history_panoramas=history_panoramas,
                     instruction=instruction,
                     pixel_goal=[0, 0],
+                    internnav_protocol=internnav_protocol,
                 )
                 messages = [m for m in messages if m["role"] != "assistant"]
                 base_messages = copy.deepcopy(messages)

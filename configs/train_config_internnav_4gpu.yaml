@@ -5,9 +5,9 @@ seed: 42
 # ============================================
 #
 # 与 train_config_internnav.yaml 的区别:
-#   1. gpu.devices: [0, 1]
+#   1. gpu.devices: [0, 1, 2, 3, 4, 5, 6, 7]
 #   2. gpu.multi_gpu.enabled: true
-#   3. batch_size: 4 (每卡 4, 总有效 batch=8)
+#   3. batch_size: 1 (每卡 1, 总有效 batch=8)
 #   4. num_workers: 4 (每卡)
 #
 # 启动方式 (必须用 torchrun):
@@ -19,6 +19,7 @@ seed: 42
 #   System2/Qwen/LoRA 已通过 Stage1-S2 panoramic SFT 训练好并冻结。
 #   System1 最大程度复用 InternNav checkpoint，动作侧只使用单视角 traj_images。
 #   本阶段只训练全景 System2 hidden states → System1 条件输入之间的桥接层。
+#   System2 文本/latent 协议保持 InternNav: ↓ → lookdown image → x y → 4 queries。
 #
 # ============================================
 
@@ -54,6 +55,10 @@ data:
     enable_trajectory_augmentation: true
     use_subinstruction: true
     fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
+    compute_pixel_goal: true
+    load_lookdown_for_system2: true
+    system2_sft_protocol: internnav
+    pixel_goal_direction: front_down
     load_traj_images: true
     traj_image_size: [224, 224]
 
@@ -77,9 +82,10 @@ model:
     max_seq_length: 8192
     spatial_merge_size: 2
     use_lora: true
-    lora_rank: 16
-    lora_alpha: 32
-    lora_layer_indices: [5, 6, 12, 13, 19, 20]
+    lora_rank: 32
+    lora_alpha: 64
+    lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
     lora_dropout: 0.05
 
   heatmap:
@@ -174,8 +180,8 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  # 双卡: 每卡 batch=4，总有效 batch=8
-  batch_size: 4
+  # A800 80GB × 8: 每卡 batch=1，总有效 batch=8
+  batch_size: 1
   grad_accum_steps: 1
 
 # ============================================
@@ -202,10 +208,10 @@ loss:
   trajectory_weight: 1.0
 
 # ============================================
-# GPU配置 — 双卡
+# GPU配置 — A800 80GB × 8
 # ============================================
 gpu:
-  devices: [0, 1]
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
   backend: nccl
   multi_gpu:
     enabled: true

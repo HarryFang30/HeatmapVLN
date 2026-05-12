@@ -85,6 +85,11 @@ def build_trajectory_dataset(
         load_traj_images=traj_cfg.get("load_traj_images", False),
         traj_image_size=tuple(traj_cfg.get("traj_image_size", [224, 224])),
         compute_pixel_goal=traj_cfg.get("compute_pixel_goal", False),
+        load_lookdown_for_system2=traj_cfg.get(
+            "load_lookdown_for_system2",
+            traj_cfg.get("load_lookdown_for_sft", False),
+        ),
+        pixel_goal_direction=traj_cfg.get("pixel_goal_direction", "front"),
         require_sft_target=traj_cfg.get("require_sft_target", False),
         sft_include_turns=traj_cfg.get("sft_include_turns", True),
         sft_include_forward=traj_cfg.get("sft_include_forward", False),

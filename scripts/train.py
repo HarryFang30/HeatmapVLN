@@ -507,16 +507,24 @@ def main():
         if not stage_cfg.get('train_action', False):
             n_traj_query = 0
         train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+        traj_cfg = cfg.get('data', {}).get('trajectory', cfg.get('data', {}).get('sliding_window', {}))
+        sft_protocol = stage_cfg.get(
+            'system2_sft_protocol',
+            traj_cfg.get('system2_sft_protocol', 'direct'),
+        )
+        sft_protocol = str(sft_protocol).lower()
         actual_collate_fn = PanoramicTokenizedCollator(
             pano_processor,
             n_traj_query=n_traj_query,
             sft_mode=train_lm,
             sft_include_turns=stage_cfg.get('sft_include_turns', True),
             sft_include_forward=stage_cfg.get('sft_include_forward', False),
+            sft_protocol=sft_protocol,
         )
         logger.info(
-            "   ✅ Panoramic tokenized collator enabled (n_traj_query=%d, sft_mode=%s)",
-            n_traj_query, train_lm,
+            "   ✅ Panoramic tokenized collator enabled "
+            "(n_traj_query=%d, sft_mode=%s, protocol=%s)",
+            n_traj_query, train_lm, sft_protocol,
         )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")

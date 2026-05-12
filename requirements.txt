@@ -26,7 +26,7 @@ diffusers==0.36.0
 # ============================================
 # Vision & Video Processing
 # ============================================
-opencv-python>=4.12.0
+opencv-python-headless==4.11.0.86
 Pillow>=11.0.0
 decord==0.6.0
 av>=15.0.0

@@ -264,9 +264,23 @@ def init_distributed_context(cfg: dict) -> DistributedContext:
         )
 
     if configured_devices and world_size != len(configured_devices):
-        raise RuntimeError(
-            f"WORLD_SIZE={world_size} does not match configured gpu.devices={configured_devices}."
-        )
+        visible_count = torch.cuda.device_count()
+        if visible_count == world_size:
+            configured_devices = list(range(world_size))
+            logger.warning(
+                "WORLD_SIZE=%s does not match configured gpu.devices=%s; "
+                "using visible CUDA device indices %s. This is expected when "
+                "CUDA_VISIBLE_DEVICES is set by the launch script.",
+                world_size,
+                gpu_cfg.get("devices", [0]),
+                configured_devices,
+            )
+        else:
+            raise RuntimeError(
+                f"WORLD_SIZE={world_size} does not match configured "
+                f"gpu.devices={configured_devices}, and CUDA visible device "
+                f"count is {visible_count}."
+            )
 
     if local_rank >= len(configured_devices):
         raise RuntimeError(

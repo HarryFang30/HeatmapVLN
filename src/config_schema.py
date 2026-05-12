@@ -64,6 +64,9 @@ class TrajectoryConfig(_Lenient):
     load_traj_images: bool = False
     traj_image_size: list[int] = [224, 224]
     compute_pixel_goal: bool = False
+    load_lookdown_for_system2: bool = False
+    system2_sft_protocol: str = "direct"
+    pixel_goal_direction: str = "front"
     include_stop_samples_random_subsequence: bool = False
     use_subinstruction: bool = False
     fgr2r_subinstr_path: str | None = None

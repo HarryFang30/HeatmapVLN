@@ -92,6 +92,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         load_traj_images: bool = False,
         traj_image_size: tuple[int, int] = (224, 224),
         compute_pixel_goal: bool = False,
+        load_lookdown_for_system2: bool = False,
+        pixel_goal_direction: str = "front",
         require_sft_target: bool = False,
         sft_include_turns: bool = True,
         sft_include_forward: bool = False,
@@ -127,6 +129,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.enable_trajectory_augmentation = enable_trajectory_augmentation and (split == 'train')
         self.load_traj_images = load_traj_images
         self.compute_pixel_goal = compute_pixel_goal or load_traj_images
+        self.load_lookdown_for_system2 = load_lookdown_for_system2
+        self.pixel_goal_direction = pixel_goal_direction
         self.require_sft_target = require_sft_target
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
@@ -146,6 +150,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}, "
             f"load_traj_images={self.load_traj_images}, "
             f"compute_pixel_goal={self.compute_pixel_goal}, "
+            f"load_lookdown_for_system2={self.load_lookdown_for_system2}, "
+            f"pixel_goal_direction={self.pixel_goal_direction}, "
             f"require_sft_target={self.require_sft_target}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
@@ -637,20 +643,23 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             }
 
             # Pixel-goal SFT / bridge target: project the farthest visible
-            # future waypoint onto the current front view, aligned with
-            # InternNav's depth-based occlusion filtering.  This is computed
-            # independently of traj_images so System2 SFT can train without
-            # loading the System1 visual-memory frames.
+            # future waypoint onto the configured System2 target camera.
+            # Direct panoramic SFT uses the front view; strict InternNav mode
+            # uses the front_down/lookdown view, matching goal.{pitch_2}.
             goal_frame_idx = min(subseq_end - 1, T - 1)
             if self.compute_pixel_goal and goal_frame_idx > current_t:
-                front_depth = self._load_depth(clip_dir, current_t, direction="front")
+                pg_direction = self.pixel_goal_direction or "front"
+                pg_poses = poses
+                if pg_direction != "front":
+                    pg_poses = self._load_poses_for_direction(clip_idx, pg_direction)
+                pg_depth = self._load_depth(clip_dir, current_t, direction=pg_direction)
                 _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
                 pg = None
                 for fi in range(goal_frame_idx, current_t, -1):
                     pg = self._compute_pixel_goal(
-                        current_pose, poses[fi],
+                        pg_poses[current_t], pg_poses[fi],
                         img_size=_img_w,
-                        depth_map=front_depth,
+                        depth_map=pg_depth,
                     )
                     if pg is not None:
                         break
@@ -724,8 +733,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             if history_panoramas is not None:
                 result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
 
-            # Stage 2 InternNav: front-view + lookdown for VLM
-            if self._is_panoramic and not self.panoramic_vlm_input:
+            # InternNav-style System2 protocol needs a lookdown observation
+            # after the first assistant emits ↓.  For panoramic VLM input this
+            # keeps the first turn panoramic while matching InternNav's second
+            # user turn.
+            if self._is_panoramic and (
+                not self.panoramic_vlm_input or self.load_lookdown_for_system2
+            ):
                 try:
                     ld = self._load_frame(clip_dir, current_t, direction="front_down")
                 except Exception:

@@ -27,6 +27,8 @@ def construct_input(
     instruction: str | None = None,
     pixel_goal: list[int] | None = None,
     assistant_text: str | None = None,
+    lookdown_frame: Union[Image.Image, torch.Tensor, np.ndarray] | None = None,
+    internnav_protocol: bool = False,
 ) -> list[dict]:
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
@@ -41,6 +43,12 @@ def construct_input(
         assistant_text: optional explicit assistant response.  When omitted
             and ``pixel_goal`` is provided, the response defaults to
             ``"{x} {y}"``.
+        lookdown_frame: optional current lookdown observation.  Required for
+            teacher-forced pixel-goal samples when ``internnav_protocol`` is
+            enabled.
+        internnav_protocol: when true, pixel-goal samples use the InternNav
+            two-turn protocol: assistant ``↓``, user lookdown image,
+            assistant coordinates.
 
     Returns:
         messages: list of message dicts compatible with the Qwen2.5-VL processor.
@@ -78,12 +86,23 @@ def construct_input(
         nav_target_text = f"{pixel_goal[0]} {pixel_goal[1]}"
 
     if nav_target_text is not None or pixel_goal is not None:
+        if internnav_protocol:
+            prompt_text = (
+                "判断每个历史位置在当前视图中的投影位置。"
+                "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
+                "请输出 ← 或 → 调整朝向；如果需要在前视图中定位下一个导航目标，"
+                "请先输出 ↓，收到下视图后再输出下视图中的像素坐标。"
+            )
+        else:
+            prompt_text = (
+                "判断每个历史位置在当前视图中的投影位置，"
+                "并输出下一个导航目标在前视图中的像素坐标。"
+                "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
+                "请输出 ← 或 → 调整朝向。"
+            )
         content.append({
             "type": "text",
-            "text": "判断每个历史位置在当前视图中的投影位置，"
-                    "并输出下一个导航目标在前视图中的像素坐标。"
-                    "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
-                    "请输出 ← 或 → 调整朝向。",
+            "text": prompt_text,
         })
     else:
         content.append({
@@ -94,6 +113,17 @@ def construct_input(
     messages = [{"role": "user", "content": content}]
 
     if nav_target_text is not None:
+        if internnav_protocol and pixel_goal is not None:
+            if lookdown_frame is None:
+                return messages
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "↓"}],
+            })
+            messages.append({
+                "role": "user",
+                "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
+            })
         messages.append({
             "role": "assistant",
             "content": [{"type": "text", "text": nav_target_text}],
@@ -179,12 +209,15 @@ def construct_input_stage2(
 ) -> list[dict]:
     """Construct InternNav-aligned Stage 2 input (front-view + lookdown).
 
-    Conversation format mirrors the InternNav paper::
+    Pixel-goal samples mirror the InternNav paper::
 
         User:   [video: K past + current front frames] + instruction
         Assistant: ↓
         User:   [lookdown image]
         Assistant: (x, y)   ← pixel-goal coordinates (teacher forcing)
+
+    STOP / turn samples use a single assistant response without the lookdown
+    turn, matching InternNav's non-pixel-goal branches.
 
     Args:
         history_frames: K front-view history images.
@@ -208,19 +241,20 @@ def construct_input_stage2(
 
     messages = [{"role": "user", "content": user_content}]
 
-    messages.append({
-        "role": "assistant",
-        "content": [{"type": "text", "text": "↓"}],
-    })
-
-    messages.append({
-        "role": "user",
-        "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
-    })
-
     nav_target_text = assistant_text
     if nav_target_text is None and pixel_goal is not None:
         nav_target_text = f"{pixel_goal[0]} {pixel_goal[1]}"
+
+    if pixel_goal is not None:
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "↓"}],
+        })
+
+        messages.append({
+            "role": "user",
+            "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
+        })
 
     if nav_target_text is not None:
         messages.append({

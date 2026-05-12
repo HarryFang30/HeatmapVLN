@@ -5,9 +5,9 @@ This moves Qwen processor/tokenizer work into DataLoader workers so the
 training main thread can consume already-tokenized panoramic batches.
 
 When ``n_traj_query > 0`` the collator also:
-  1. Passes ``pixel_goal`` (if present in samples) to ``construct_input``
-     so that the assistant response with ground-truth waypoint coordinates
-     is included in the tokenized conversation.
+  1. Passes ``pixel_goal`` (if present in samples) to ``construct_input``.
+     In direct mode this includes the coordinate answer; in InternNav mode
+     this includes ``↓``, the lookdown user image, and the coordinate answer.
   2. Appends ``n_traj_query`` TRAJ_TOKEN_INDEX placeholder tokens after
      the tokenized sequence, aligned with InternNav's collator flow.
 """
@@ -70,6 +70,7 @@ class PanoramicTokenizedCollator:
         sft_mode: bool = False,
         sft_include_turns: bool = True,
         sft_include_forward: bool = False,
+        sft_protocol: str = "direct",
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -77,6 +78,9 @@ class PanoramicTokenizedCollator:
         self.sft_mode = sft_mode
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
+        self.sft_protocol = str(sft_protocol).lower()
+        if self.sft_protocol not in {"direct", "internnav"}:
+            raise ValueError(f"Unsupported System2 SFT protocol: {sft_protocol}")
         self._call_count = 0
 
     @staticmethod
@@ -142,107 +146,95 @@ class PanoramicTokenizedCollator:
                 return start
         return -1
 
-    def _assistant_text_for_sft(self, sample: dict[str, Any]) -> str | None:
+    def _assistant_texts_for_sft(self, sample: dict[str, Any]) -> list[str]:
         if sample.get("is_stop", 0.0) > 0.5 or int(sample.get("discrete_action", 1)) == 0:
-            return "STOP"
+            return ["STOP"]
 
         pg = sample.get("pixel_goal")
         if pg is not None:
-            return f"{int(pg[0])} {int(pg[1])}"
+            coord_text = f"{int(pg[0])} {int(pg[1])}"
+            if self.sft_protocol == "internnav":
+                return ["↓", coord_text]
+            return [coord_text]
 
         discrete_action = int(sample.get("discrete_action", 1))
         if self.sft_include_turns and discrete_action == 2:
-            return "←"
+            return ["←"]
         if self.sft_include_turns and discrete_action == 3:
-            return "→"
+            return ["→"]
         if self.sft_include_turns and discrete_action == 5:
-            return "↓"
+            return ["↓"]
         if self.sft_include_forward and discrete_action == 1:
-            return "↑"
-        return None
+            return ["↑"]
+        return []
 
     def _assistant_sequence_for_labeling(
         self,
         target_text: str,
-    ) -> tuple[list[int], list[int]]:
-        """Return the assistant message ids and matching label ids.
+    ) -> list[int]:
+        """Return token ids for the assistant answer content.
 
-        InternNav masks the chat-role prefix of assistant turns but keeps the
-        assistant content and the chat end token in the CE target.  Matching the
-        full assistant turn preserves that behavior when the tokenizer exposes
-        ``apply_chat_template``; simple test tokenizers fall back to content-only
-        labels.
+        Do not build this from an assistant-only chat template.  Qwen's
+        ``apply_chat_template`` injects a default system message for a lone
+        assistant turn, so that sequence is not present inside the full
+        user+assistant prompt.  Matching the content in the already-tokenized
+        row and then adding the following chat end token is more robust.
         """
         tokenizer = self.processor.tokenizer
-        apply_template = getattr(tokenizer, "apply_chat_template", None)
-        if callable(apply_template):
-            try:
-                assistant_ids = apply_template(
-                    [{"role": "assistant", "content": target_text}],
-                    tokenize=True,
-                    add_generation_prompt=False,
-                )
-                if torch.is_tensor(assistant_ids):
-                    assistant_ids = assistant_ids.tolist()
-                if assistant_ids and isinstance(assistant_ids[0], list):
-                    assistant_ids = assistant_ids[0]
-                assistant_ids = [int(x) for x in assistant_ids]
-                if assistant_ids:
-                    label_ids = assistant_ids.copy()
-                    # InternNav's preprocessing masks the first three tokens:
-                    # <|im_start|>, assistant, newline.
-                    for i in range(min(3, len(label_ids))):
-                        label_ids[i] = IGNORE_INDEX
-                    return assistant_ids, label_ids
-            except Exception:
-                pass
+        return tokenizer.encode(target_text, add_special_tokens=False)
 
-        target_ids = tokenizer.encode(target_text, add_special_tokens=False)
-        return target_ids, target_ids
+    def _maybe_label_chat_end(
+        self,
+        labels_row: torch.Tensor,
+        input_row: torch.Tensor,
+        end: int,
+    ) -> None:
+        """Include the assistant chat end token in the CE target when present."""
+        if end >= input_row.numel():
+            return
+
+        eos_token_id = getattr(self.processor.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None and int(input_row[end].item()) == int(eos_token_id):
+            labels_row[end] = input_row[end]
 
     def _build_sft_labels(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        target_texts: list[str | None],
+        target_texts: list[list[str]],
     ) -> torch.Tensor:
         labels = torch.full_like(input_ids, IGNORE_INDEX)
         tokenizer = self.processor.tokenizer
 
-        for batch_idx, target_text in enumerate(target_texts):
-            if not target_text:
+        for batch_idx, sample_target_texts in enumerate(target_texts):
+            if not sample_target_texts:
                 continue
-            match_ids, label_ids = self._assistant_sequence_for_labeling(target_text)
-            if not match_ids:
-                continue
-
             row = input_ids[batch_idx].tolist()
-            start = self._find_last_subsequence(row, match_ids)
-            if start < 0:
-                # Some tokenizers attach whitespace around short assistant
-                # responses.  Try a tiny set of stable variants before giving up.
-                for variant in (f" {target_text}", f"\n{target_text}"):
-                    variant_ids, variant_label_ids = self._assistant_sequence_for_labeling(variant)
-                    start = self._find_last_subsequence(row, variant_ids)
-                    if start >= 0:
-                        match_ids = variant_ids
-                        label_ids = variant_label_ids
-                        break
-            if start < 0:
-                target_ids = tokenizer.encode(target_text, add_special_tokens=False)
-                start = self._find_last_subsequence(row, target_ids)
-                if start < 0:
+            for target_text in sample_target_texts:
+                match_ids = self._assistant_sequence_for_labeling(target_text)
+                if not match_ids:
                     continue
-                match_ids = target_ids
-                label_ids = target_ids
 
-            end = start + len(match_ids)
-            if len(label_ids) != len(match_ids):
-                continue
-            label_tensor = torch.tensor(label_ids, dtype=labels.dtype, device=labels.device)
-            keep = label_tensor != IGNORE_INDEX
-            if keep.any():
-                labels[batch_idx, start:end][keep] = input_ids[batch_idx, start:end][keep]
+                start = self._find_last_subsequence(row, match_ids)
+                if start < 0:
+                    # Some tokenizers attach whitespace around short assistant
+                    # responses.  Try a tiny set of stable variants before giving up.
+                    for variant in (f" {target_text}", f"\n{target_text}"):
+                        variant_ids = self._assistant_sequence_for_labeling(variant)
+                        start = self._find_last_subsequence(row, variant_ids)
+                        if start >= 0:
+                            match_ids = variant_ids
+                            break
+                if start < 0:
+                    target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+                    start = self._find_last_subsequence(row, target_ids)
+                    if start < 0:
+                        continue
+                    match_ids = target_ids
+
+                end = start + len(match_ids)
+                labels[batch_idx, start:end] = input_ids[batch_idx, start:end]
+                self._maybe_label_chat_end(labels[batch_idx], input_ids[batch_idx], end)
 
         if attention_mask is not None:
             labels = labels.masked_fill(attention_mask == 0, IGNORE_INDEX)
@@ -292,7 +284,7 @@ class PanoramicTokenizedCollator:
 
         if use_panoramic or use_internnav:
             messages_batch = []
-            sft_target_texts: list[str | None] = []
+            sft_target_texts: list[list[str]] = []
             pano_num_histories = []
 
             if use_internnav:
@@ -301,7 +293,8 @@ class PanoramicTokenizedCollator:
                     hf = sample["history_frames"]
                     history_list = [hf[k] for k in range(hf.shape[0])]
                     pg = sample.get("pixel_goal")
-                    assistant_text = self._assistant_text_for_sft(sample) if self.sft_mode else None
+                    assistant_texts = self._assistant_texts_for_sft(sample) if self.sft_mode else []
+                    assistant_text = assistant_texts[-1] if assistant_texts else None
                     messages_batch.append(
                         construct_input_stage2(
                             history_frames=history_list,
@@ -312,7 +305,7 @@ class PanoramicTokenizedCollator:
                             assistant_text=assistant_text,
                         )
                     )
-                    sft_target_texts.append(assistant_text)
+                    sft_target_texts.append(assistant_texts)
                     pano_num_histories.append(0)
             else:
                 for sample in batch:
@@ -328,7 +321,14 @@ class PanoramicTokenizedCollator:
                         for hist_idx in range(sample["history_panoramas"].shape[0])
                     ]
                     pg = sample.get("pixel_goal")
-                    assistant_text = self._assistant_text_for_sft(sample) if self.sft_mode else None
+                    assistant_texts = self._assistant_texts_for_sft(sample) if self.sft_mode else []
+                    assistant_text = assistant_texts[-1] if assistant_texts else None
+                    lookdown_frame = sample.get("lookdown_frame")
+                    if self.sft_protocol == "internnav" and pg is not None and lookdown_frame is None:
+                        raise RuntimeError(
+                            "InternNav-protocol panoramic sample with pixel_goal "
+                            "is missing lookdown_frame."
+                        )
                     messages_batch.append(
                         construct_input(
                             current_views=current_views_dict,
@@ -336,9 +336,14 @@ class PanoramicTokenizedCollator:
                             instruction=sample.get("text"),
                             pixel_goal=pg,
                             assistant_text=assistant_text,
+                            lookdown_frame=lookdown_frame,
+                            internnav_protocol=self.sft_protocol == "internnav",
                         )
                     )
-                    sft_target_texts.append(assistant_text)
+                    if not self.sft_mode and self.sft_protocol == "internnav" and pg is not None:
+                        sft_target_texts.append(["↓", f"{int(pg[0])} {int(pg[1])}"])
+                    else:
+                        sft_target_texts.append(assistant_texts)
                     pano_num_histories.append(len(history_panoramas_list))
 
                 result["current_views"] = torch.stack([sample["current_views"] for sample in batch], dim=0)
