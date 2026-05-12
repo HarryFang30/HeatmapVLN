@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint",
-        default="/root/autodl-tmp/vln_system2_sft_outputs/latest/checkpoints/latest.pth",
+        default=None,
         help="Stage1-S2 checkpoint to evaluate.",
     )
     parser.add_argument(
@@ -186,8 +186,19 @@ def configure_logging() -> None:
     )
 
 
-def default_checkpoint(path: str) -> Path:
-    ckpt = Path(path)
+def resolve_checkpoint_path(path: str | None, cfg: dict[str, Any]) -> Path:
+    if path:
+        ckpt = Path(path)
+    else:
+        out_dir = (
+            cfg.get("log", {}).get("out_dir")
+            or cfg.get("logging", {}).get("out_dir")
+        )
+        if not out_dir:
+            raise FileNotFoundError(
+                "Checkpoint not provided and config.log.out_dir is missing."
+            )
+        ckpt = Path(out_dir) / "latest" / "checkpoints" / "latest.pth"
     if ckpt.exists():
         return ckpt
     best = ckpt.with_name("best.pth")
@@ -699,7 +710,7 @@ def main() -> None:
     configure_logging()
     args = parse_args()
     cfg = prepare_config(args)
-    checkpoint = default_checkpoint(args.checkpoint)
+    checkpoint = resolve_checkpoint_path(args.checkpoint, cfg)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
