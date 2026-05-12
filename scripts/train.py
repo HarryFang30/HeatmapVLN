@@ -314,6 +314,24 @@ def main():
     logger.info("VLN 训练 (shared Habitat/InternNav env)")
     logger.info("=" * 60)
 
+    # 获取训练配置（单阶段）
+    all_stages = cfg['training']['stages']
+    if not all_stages:
+        logger.error("❌ 配置文件中没有定义训练阶段")
+        return
+
+    stage_cfg = all_stages[0]
+    stage_name = stage_cfg['name']
+
+    if args.epochs is not None:
+        stage_cfg = stage_cfg.copy()
+        stage_cfg['epochs'] = args.epochs
+
+    total_epochs = stage_cfg['epochs']
+    stage_uses_heatmap_targets = bool(
+        stage_cfg.get('train_history', True) or stage_cfg.get('train_future', False)
+    )
+
     # 构建数据集
     logger.info("📂 Loading datasets...")
     dataset_type = cfg['data'].get('dataset_type', 'sliding_window')
@@ -321,7 +339,11 @@ def main():
     val_root_cfg = cfg['data'].get('val_root')
     if val_root_cfg:
         logger.info(f"  Validation from separate root: {val_root_cfg} (split={cfg['data'].get('val_split', 'val')})")
-    train_dataset = build_dataset(cfg, split='train')
+    dataset_overrides = {}
+    if dataset_type == 'trajectory' and not stage_uses_heatmap_targets:
+        dataset_overrides['load_history_heatmap'] = False
+        logger.info("  Trajectory dataset override: load_history_heatmap=False (stage has no heatmap supervision)")
+    train_dataset = build_dataset(cfg, split='train', **dataset_overrides)
 
     if dataset_type == 'trajectory':
         val_root = cfg['data'].get('val_root')
@@ -333,6 +355,7 @@ def main():
                 random_subsequence=False,
                 enable_trajectory_augmentation=False,
                 use_subinstruction=False,
+                **dataset_overrides,
             )
         else:
             val_dataset = None
@@ -394,21 +417,6 @@ def main():
         )
         resume_epoch = resume_info['epoch']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
-
-    # 获取训练配置（单阶段）
-    all_stages = cfg['training']['stages']
-    if not all_stages:
-        logger.error("❌ 配置文件中没有定义训练阶段")
-        return
-
-    stage_cfg = all_stages[0]
-    stage_name = stage_cfg['name']
-
-    if args.epochs is not None:
-        stage_cfg = stage_cfg.copy()
-        stage_cfg['epochs'] = args.epochs
-
-    total_epochs = stage_cfg['epochs']
 
     requires_base_checkpoint = bool(
         stage_cfg.get('requires_base_checkpoint', False)
@@ -489,8 +497,6 @@ def main():
         and (val_dataset is None or getattr(val_dataset, '_is_panoramic', False))
     )
     if use_panoramic_tokenized_collator:
-        from transformers import AutoProcessor
-
         llm_cfg = cfg['model'].get('llm', {})
         llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
         ensure_transformers_runtime_compat(
@@ -499,6 +505,8 @@ def main():
             requested_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
             logger=logger,
         )
+        from transformers import AutoProcessor
+
         logger.info("🔄 Loading Qwen processor for panoramic worker-side tokenization...")
         pano_processor = AutoProcessor.from_pretrained(llm_model_path, trust_remote_code=True)
         n_traj_query = cfg.get('model', {}).get('action_head', {}).get('nextdit', {}).get('n_query', 0)

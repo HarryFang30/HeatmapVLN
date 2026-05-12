@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import importlib
 import importlib.machinery
+import importlib.metadata
 import json
 import logging
 import sys
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,8 @@ import numpy as np
 from packaging.version import Version
 
 LOGGER = logging.getLogger(__name__)
+
+_HF_HUB_RELAXED_VERSION = "0.36.0"
 
 
 def install_numpy_legacy_aliases() -> None:
@@ -66,6 +70,49 @@ def _make_stub_module(name: str, attrs: dict[str, Any] | None = None) -> types.M
             setattr(module, key, value)
     sys.modules[name] = module
     return module
+
+
+@contextmanager
+def _relax_huggingface_hub_version_check(logger: logging.Logger | None = None):
+    """
+    Transformers 4.51.0 hard-checks huggingface-hub<1.0 on import, but the
+    shared environment currently ships a 1.x build that is API-compatible for
+    our usage. Relax that import-time check only while importing transformers.
+    """
+    log = logger or LOGGER
+    version_fn = importlib.metadata.version
+
+    try:
+        hub_version = version_fn("huggingface-hub")
+    except importlib.metadata.PackageNotFoundError:
+        hub_version = None
+
+    if hub_version is None or Version(hub_version) < Version("1.0"):
+        yield
+        return
+
+    warned = False
+
+    def _patched_version(dist_name: str) -> str:
+        nonlocal warned
+        normalized = dist_name.replace("_", "-").lower()
+        if normalized == "huggingface-hub":
+            if not warned:
+                log.warning(
+                    "Relaxing import-time huggingface-hub version check: "
+                    "installed=%s, reported=%s for transformers compatibility",
+                    hub_version,
+                    _HF_HUB_RELAXED_VERSION,
+                )
+                warned = True
+            return _HF_HUB_RELAXED_VERSION
+        return version_fn(dist_name)
+
+    importlib.metadata.version = _patched_version
+    try:
+        yield
+    finally:
+        importlib.metadata.version = version_fn
 
 
 def _is_flash_attn_stubbed() -> bool:
@@ -164,7 +211,8 @@ def ensure_transformers_runtime_compat(
     resolved_backbone_type = detect_backbone_type(model_path, requested_backbone_type)
     model_cfg = load_model_config(model_path)
 
-    import transformers
+    with _relax_huggingface_hub_version_check(log):
+        import transformers
 
     installed_transformers_version = transformers.__version__
     expected_transformers_version = model_cfg.get("transformers_version")

@@ -56,6 +56,7 @@ data:
     require_sft_target: true
     sft_include_turns: true
     sft_include_forward: false
+    sft_num_future_steps: 4
     load_traj_images: false
     traj_image_size: [224, 224]
 

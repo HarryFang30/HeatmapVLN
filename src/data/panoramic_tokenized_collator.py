@@ -30,6 +30,13 @@ from src.models.heatmap.input_constructor import (
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
 IGNORE_INDEX = -100
+_SYSTEM2_ACTION_TEXT = {
+    0: "STOP",
+    1: "↑",
+    2: "←",
+    3: "→",
+    5: "↓",
+}
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -156,6 +163,15 @@ class PanoramicTokenizedCollator:
             if self.sft_protocol == "internnav":
                 return ["↓", coord_text]
             return [coord_text]
+
+        turn_action_text = sample.get("turn_action_text")
+        if self.sft_include_turns and isinstance(turn_action_text, str) and turn_action_text:
+            return [turn_action_text]
+        turn_actions = sample.get("turn_actions")
+        if self.sft_include_turns and isinstance(turn_actions, list) and turn_actions:
+            return [
+                "".join(_SYSTEM2_ACTION_TEXT.get(int(action_code), "") for action_code in turn_actions)
+            ]
 
         discrete_action = int(sample.get("discrete_action", 1))
         if self.sft_include_turns and discrete_action == 2:

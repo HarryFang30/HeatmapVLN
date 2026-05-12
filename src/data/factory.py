@@ -90,9 +90,11 @@ def build_trajectory_dataset(
             traj_cfg.get("load_lookdown_for_sft", False),
         ),
         pixel_goal_direction=traj_cfg.get("pixel_goal_direction", "front"),
+        load_history_heatmap=traj_cfg.get("load_history_heatmap", True),
         require_sft_target=traj_cfg.get("require_sft_target", False),
         sft_include_turns=traj_cfg.get("sft_include_turns", True),
         sft_include_forward=traj_cfg.get("sft_include_forward", False),
+        sft_num_future_steps=traj_cfg.get("sft_num_future_steps", 4),
         include_stop_samples_random_subsequence=traj_cfg.get(
             "include_stop_samples_random_subsequence", False,
         ),

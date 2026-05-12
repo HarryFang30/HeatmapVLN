@@ -105,6 +105,7 @@ def train_one_epoch(
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
     train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+    need_heatmap_targets = train_history or train_future
 
     device = dist_context.device
 
@@ -187,30 +188,32 @@ def train_one_epoch(
         is_stop = batch['is_stop'].to(device, non_blocking=True)
         text = batch['text']
 
-        if enable_timing:
-            gt_start = time.perf_counter()
-        if _should_use_gpu_gt(batch, gpu_heatmap_computer):
-            history_poses = batch['history_poses'].to(device, non_blocking=True)
-            current_poses = batch['current_pose'].to(device, non_blocking=True)
-            current_depths = batch['current_depth'].to(device, non_blocking=True) if gpu_has_depth and 'current_depth' in batch else None
-            intrinsics = batch['intrinsics'].to(device, non_blocking=True) if 'intrinsics' in batch else None
-            gt_heatmap = gpu_heatmap_computer.compute_batch(
-                history_poses=history_poses,
-                current_poses=current_poses,
-                current_depths=current_depths,
-                intrinsics=intrinsics,
-                depth_normalized=gpu_depth_normalized,
-            )
-            if 'is_flipped' in batch:
-                flip_mask = batch['is_flipped']
-                if flip_mask.any():
-                    for b_idx in range(gt_heatmap.shape[0]):
-                        if flip_mask[b_idx]:
-                            gt_heatmap[b_idx] = gt_heatmap[b_idx].flip(dims=[-1])
-        else:
-            gt_heatmap = batch['heatmap'].to(device, non_blocking=True)
-        if enable_timing:
-            timing_stats['gt_s'] += time.perf_counter() - gt_start
+        gt_heatmap = None
+        if need_heatmap_targets:
+            if enable_timing:
+                gt_start = time.perf_counter()
+            if _should_use_gpu_gt(batch, gpu_heatmap_computer):
+                history_poses = batch['history_poses'].to(device, non_blocking=True)
+                current_poses = batch['current_pose'].to(device, non_blocking=True)
+                current_depths = batch['current_depth'].to(device, non_blocking=True) if gpu_has_depth and 'current_depth' in batch else None
+                intrinsics = batch['intrinsics'].to(device, non_blocking=True) if 'intrinsics' in batch else None
+                gt_heatmap = gpu_heatmap_computer.compute_batch(
+                    history_poses=history_poses,
+                    current_poses=current_poses,
+                    current_depths=current_depths,
+                    intrinsics=intrinsics,
+                    depth_normalized=gpu_depth_normalized,
+                )
+                if 'is_flipped' in batch:
+                    flip_mask = batch['is_flipped']
+                    if flip_mask.any():
+                        for b_idx in range(gt_heatmap.shape[0]):
+                            if flip_mask[b_idx]:
+                                gt_heatmap[b_idx] = gt_heatmap[b_idx].flip(dims=[-1])
+            else:
+                gt_heatmap = batch['heatmap'].to(device, non_blocking=True)
+            if enable_timing:
+                timing_stats['gt_s'] += time.perf_counter() - gt_start
 
         if enable_timing:
             forward_start = time.perf_counter()
@@ -490,7 +493,13 @@ def train_one_epoch(
                     )
 
         vis_interval = cfg['log'].get('vis_every_steps', 500)
-        if tb_writer is not None and global_step % vis_interval == 0 and global_step > 0:
+        if (
+            tb_writer is not None
+            and train_history
+            and 'heatmaps' in output
+            and global_step % vis_interval == 0
+            and global_step > 0
+        ):
             vis_path = visualize_heatmap_predictions(
                 model=model_module,
                 batch=batch,

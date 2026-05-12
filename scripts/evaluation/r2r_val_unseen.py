@@ -1168,7 +1168,8 @@ def _run_eval_panoramic_vlm(
             if has_nextdit and bool(re.search(r"\d", llm_output)):
                 coord = [int(c) for c in re.findall(r"\d+", llm_output)]
                 if len(coord) >= 2:
-                    pixel_goal = [int(coord[1]), int(coord[0])]
+                    # Stage1-S2 trains coordinates as "x y"; keep evaluation aligned.
+                    pixel_goal = [int(coord[0]), int(coord[1])]
                     print(f"  predicted pixel_goal {pixel_goal}")
                 else:
                     env.step(ActionCode.STOP)
@@ -1532,7 +1533,8 @@ def run_eval(args):
                 if bool(re.search(r"\d", llm_output)):
                     coord = [int(c) for c in re.findall(r"\d+", llm_output)]
                     if len(coord) >= 2:
-                        pixel_goal = [int(coord[1]), int(coord[0])]
+                        # Stage1-S2 trains coordinates as "x y"; keep evaluation aligned.
+                        pixel_goal = [int(coord[0]), int(coord[1])]
                         print(f"  predicted pixel_goal {pixel_goal}")
                     else:
                         action = ActionCode.LEFT

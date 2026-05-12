@@ -33,6 +33,14 @@ from .trajectory_utils import (
 
 logger = logging.getLogger(__name__)
 
+_SYSTEM2_ACTION_TEXT = {
+    0: "STOP",
+    1: "↑",
+    2: "←",
+    3: "→",
+    5: "↓",
+}
+
 
 def _require_cv2() -> None:
     if cv2 is None:
@@ -94,9 +102,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         compute_pixel_goal: bool = False,
         load_lookdown_for_system2: bool = False,
         pixel_goal_direction: str = "front",
+        load_history_heatmap: bool = True,
         require_sft_target: bool = False,
         sft_include_turns: bool = True,
         sft_include_forward: bool = False,
+        sft_num_future_steps: int = 4,
         include_stop_samples_random_subsequence: bool = False,
         # FGR2R 子指令配置
         fgr2r_subinstr_path: str | None = None,
@@ -131,9 +141,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.compute_pixel_goal = compute_pixel_goal or load_traj_images
         self.load_lookdown_for_system2 = load_lookdown_for_system2
         self.pixel_goal_direction = pixel_goal_direction
+        self.load_history_heatmap = load_history_heatmap
         self.require_sft_target = require_sft_target
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
+        self.sft_num_future_steps = max(int(sft_num_future_steps), 1)
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
@@ -152,7 +164,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"compute_pixel_goal={self.compute_pixel_goal}, "
             f"load_lookdown_for_system2={self.load_lookdown_for_system2}, "
             f"pixel_goal_direction={self.pixel_goal_direction}, "
+            f"load_history_heatmap={self.load_history_heatmap}, "
             f"require_sft_target={self.require_sft_target}, "
+            f"sft_num_future_steps={self.sft_num_future_steps}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
 
@@ -165,24 +179,61 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         if result.get("pixel_goal") is not None:
             return True
 
-        discrete_action = int(result.get("discrete_action", 1))
-        if self.sft_include_turns and discrete_action in (2, 3, 5):
+        if self.sft_include_turns and result.get("turn_actions"):
             return True
+        discrete_action = int(result.get("discrete_action", 1))
         if self.sft_include_forward and discrete_action == 1:
             return True
         return False
 
-    def _retry_system2_sft_sample(self, idx: int):
-        depth = getattr(self, "_system2_sft_retry_depth", 0)
-        if depth >= 32 or len(self.sample_index) <= 1:
-            return None
+    def _candidate_retry_indices(self, idx: int, max_attempts: int = 64) -> list[int]:
+        total = len(self.sample_index)
+        if total <= 1:
+            return [idx]
 
-        next_idx = (idx + depth + 1) % len(self.sample_index)
-        self._system2_sft_retry_depth = depth + 1
-        try:
-            return self.__getitem__(next_idx)
-        finally:
-            self._system2_sft_retry_depth = depth
+        target_count = min(max(total, 1), max(max_attempts, 1))
+        candidates = [idx]
+        seen = {idx}
+        seed = ((self._epoch + 1) * 1_000_003 + idx) % (2**32 - 1)
+        rng = np.random.RandomState(seed)
+
+        while len(candidates) < target_count and len(seen) < total:
+            candidate = int(rng.randint(0, total))
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+
+        return candidates
+
+    def _collect_turn_actions(
+        self,
+        discrete_actions: np.ndarray | None,
+        current_t: int,
+    ) -> list[int]:
+        """Match InternNav turn-label construction: collect turns until next forward."""
+        if discrete_actions is None or current_t >= len(discrete_actions):
+            return []
+
+        current_action = int(discrete_actions[current_t])
+        if current_action in (0, 1):
+            return []
+
+        end_t = min(len(discrete_actions), current_t + self.sft_num_future_steps)
+        turn_actions: list[int] = []
+        for t in range(current_t, end_t):
+            action_code = int(discrete_actions[t])
+            if action_code == 1:
+                break
+            if action_code not in _SYSTEM2_ACTION_TEXT:
+                logger.debug(
+                    "Skip unsupported System2 turn action %s at t=%s",
+                    action_code,
+                    t,
+                )
+                break
+            turn_actions.append(action_code)
+        return turn_actions
 
     def _load_traj_image_raw(self, clip_dir: Path, frame_idx: int,
                              direction: str = "front") -> np.ndarray:
@@ -502,76 +553,74 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         return resampled_poses.astype(np.float32), trajectory_valid, progress
 
-    def __getitem__(self, idx: int) -> dict[str, Union[torch.Tensor, str, float]]:
-        """
-        加载一个训练样本（带轨迹）
-        """
+    def _build_sample(self, idx: int) -> dict[str, Union[torch.Tensor, str, float]]:
+        """构建单个轨迹样本。异常向上传递，由调用方决定是否重试。"""
         clip_idx, current_t = self.sample_index[idx]
         clip_dir = self.clips[clip_idx]
+        # 1. 加载元数据
+        meta = self._load_meta(clip_idx)
+        T = meta["num_frames"]
+        original_text = meta.get("instruction", "")
+        trajectory_id = int(meta.get("trajectory_id", 0))
 
-        try:
-            # 1. 加载元数据
-            meta = self._load_meta(clip_idx)
-            T = meta["num_frames"]
-            original_text = meta.get("instruction", "")
-            trajectory_id = int(meta.get("trajectory_id", 0))
+        # 获取子序列范围（如果启用了随机子序列采样）
+        if self.random_subsequence and idx in self._sample_subsequence_range:
+            subseq_start, subseq_end = self._sample_subsequence_range[idx]
+        else:
+            subseq_start, subseq_end = 0, T
 
-            # 获取子序列范围（如果启用了随机子序列采样）
-            if self.random_subsequence and idx in self._sample_subsequence_range:
-                subseq_start, subseq_end = self._sample_subsequence_range[idx]
-            else:
-                subseq_start, subseq_end = 0, T
+        # 1.5 获取子指令（如果启用了 FGR2R 子指令）
+        if self.use_subinstruction:
+            text = self._get_subinstruction(
+                trajectory_id=trajectory_id,
+                num_frames=T,
+                current_t=current_t,
+                subseq_start=subseq_start,
+                subseq_end=subseq_end,
+                original_instruction=original_text,
+            )
+        else:
+            text = original_text
 
-            # 1.5 获取子指令（如果启用了 FGR2R 子指令）
-            if self.use_subinstruction:
-                text = self._get_subinstruction(
-                    trajectory_id=trajectory_id,
-                    num_frames=T,
-                    current_t=current_t,
-                    subseq_start=subseq_start,
-                    subseq_end=subseq_end,
-                    original_instruction=original_text,
-                )
-            else:
-                text = original_text
+        # 2. 采样历史帧索引（使用子序列范围）
+        history_indices = self._sample_history_indices(subseq_start, current_t, self.num_history_sample)
 
-            # 2. 采样历史帧索引（使用子序列范围）
-            history_indices = self._sample_history_indices(subseq_start, current_t, self.num_history_sample)
+        # 3. 加载历史帧
+        history_frames = self._load_frames(clip_dir, history_indices)
 
-            # 3. 加载历史帧
-            history_frames = self._load_frames(clip_dir, history_indices)
+        # 4. 加载当前帧
+        #    panoramic_vlm_input=True:  全景 4 视图 → VLM (Stage 1)
+        #    panoramic_vlm_input=False: 前视图 + lookdown → VLM (Stage 2, InternNav)
+        if self._is_panoramic and self.panoramic_vlm_input:
+            current_frame = self._load_frame(clip_dir, current_t, direction="front")
+            current_views = self._load_all_views(clip_dir, current_t)
+            history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
+        else:
+            current_frame = self._load_frame(clip_dir, current_t, direction="front")
+            current_views = None
+            history_panoramas = None
 
-            # 4. 加载当前帧
-            #    panoramic_vlm_input=True:  全景 4 视图 → VLM (Stage 1)
-            #    panoramic_vlm_input=False: 前视图 + lookdown → VLM (Stage 2, InternNav)
-            if self._is_panoramic and self.panoramic_vlm_input:
-                current_frame = self._load_frame(clip_dir, current_t, direction="front")
-                current_views = self._load_all_views(clip_dir, current_t)
-                history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
-            else:
-                current_frame = self._load_frame(clip_dir, current_t, direction="front")
-                current_views = None
-                history_panoramas = None
+        # 5. 加载位姿
+        poses = self._load_poses(clip_idx)
+        action_poses = poses
+        action_camera_deg = 0.0
+        if self.load_traj_images:
+            action_poses = self._load_poses_for_direction(clip_idx, "front_down")
+            action_camera_deg = float(meta.get("lookdown_pitch_deg", 30.0))
+        history_poses = [poses[i] for i in history_indices]
+        current_pose = poses[current_t]
 
-            # 5. 加载位姿
-            poses = self._load_poses(clip_idx)
-            action_poses = poses
-            action_camera_deg = 0.0
-            if self.load_traj_images:
-                action_poses = self._load_poses_for_direction(clip_idx, "front_down")
-                action_camera_deg = float(meta.get("lookdown_pitch_deg", 30.0))
-            history_poses = [poses[i] for i in history_indices]
-            current_pose = poses[current_t]
-
-            # 6. 加载当前帧深度（用于遮挡检测）
+        # 6. 仅在需要热力图监督时才加载正视角深度
+        current_depth = None
+        if self.load_history_heatmap and not self._is_panoramic:
             current_depth = self._load_depth(clip_dir, current_t)
 
-            # 7. 计算热力图
-            img_size, K = self._load_intrinsics(clip_idx, clip_dir)
+        # 7. 计算热力图 / 生成占位张量
+        img_size, K = self._load_intrinsics(clip_idx, clip_dir)
+        hm_w, hm_h = self.hm_size
 
-            hm_w, hm_h = self.hm_size
-
-            gt_visibility = None
+        gt_visibility = None
+        if self.load_history_heatmap:
             if self._is_panoramic and self.panoramic_vlm_input:
                 heatmap_tensor, gt_visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
@@ -595,189 +644,234 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     depth_normalize=not self._depth_is_meters,
                 )
                 heatmap_tensor = torch.from_numpy(heatmap).float()
+        elif self._is_panoramic and self.panoramic_vlm_input:
+            heatmap_tensor = torch.zeros(len(history_indices), 4, hm_h, hm_w)
+        else:
+            heatmap_tensor = torch.zeros(hm_h, hm_w)
 
-            # 8. 计算轨迹（使用子序列范围计算 progress）
-            trajectory, trajectory_valid, progress = self._compute_trajectory(
-                action_poses, current_t, subseq_end, subseq_start,
-                camera_deg=action_camera_deg,
+        # 8. 计算轨迹（使用子序列范围计算 progress）
+        trajectory, trajectory_valid, progress = self._compute_trajectory(
+            action_poses, current_t, subseq_end, subseq_start,
+            camera_deg=action_camera_deg,
+        )
+
+        # 9. 应用轨迹增强
+        if self.enable_trajectory_augmentation and trajectory_valid > 0:
+            trajectory = apply_trajectory_augmentation(trajectory, p=0.5)
+
+        trajectory_tensor = torch.from_numpy(trajectory).float()
+
+        # 10. 保留旧的 action 接口用于兼容
+        actions = self._load_actions(clip_dir)
+        if actions is not None and current_t < len(actions):
+            action = actions[current_t]
+        else:
+            action = np.zeros(2, dtype=np.float32)
+
+        action_valid = trajectory_valid
+        action_tensor = torch.from_numpy(action.astype(np.float32))
+
+        # 11. 离散动作
+        discrete_actions = self._load_discrete_actions(clip_dir)
+        if discrete_actions is not None and current_t < len(discrete_actions):
+            discrete_action = int(discrete_actions[current_t])
+            is_stop = 1.0 if discrete_action == 0 else 0.0
+        else:
+            discrete_action = 1
+            is_stop = 0.0
+        turn_actions = self._collect_turn_actions(discrete_actions, current_t)
+
+        result = {
+            "history_frames": history_frames,        # [K, 3, H, W]
+            "current_frame": current_frame,          # [3, H, W] (front view)
+            "heatmap": heatmap_tensor,               # [Hm, Wm] or [N, 4, Hm, Wm] (panoramic)
+            "trajectory": trajectory_tensor,         # [predict_horizon, 3]
+            "trajectory_valid": trajectory_valid,    # float
+            "progress": progress,                    # float (0-1)
+            "action": action_tensor,                 # [2]
+            "action_valid": action_valid,            # float
+            "discrete_action": discrete_action,      # int
+            "is_stop": is_stop,                      # float
+            "text": text,                            # str
+        }
+        if turn_actions:
+            result["turn_actions"] = turn_actions
+            result["turn_action_text"] = "".join(
+                _SYSTEM2_ACTION_TEXT[action_code] for action_code in turn_actions
             )
 
-            # 9. 应用轨迹增强
-            if self.enable_trajectory_augmentation and trajectory_valid > 0:
-                trajectory = apply_trajectory_augmentation(trajectory, p=0.5)
-
-            trajectory_tensor = torch.from_numpy(trajectory).float()
-
-            # 10. 保留旧的 action 接口用于兼容
-            actions = self._load_actions(clip_dir)
-            if actions is not None and current_t < len(actions):
-                action = actions[current_t]
-            else:
-                action = np.zeros(2, dtype=np.float32)
-
-            action_valid = trajectory_valid
-
-            action_tensor = torch.from_numpy(action.astype(np.float32))
-
-            # 11. 离散动作
-            discrete_actions = self._load_discrete_actions(clip_dir)
-            if discrete_actions is not None and current_t < len(discrete_actions):
-                discrete_action = int(discrete_actions[current_t])
-                is_stop = 1.0 if discrete_action == 0 else 0.0
-            else:
-                discrete_action = 1
-                is_stop = 0.0
-
-            result = {
-                "history_frames": history_frames,        # [K, 3, H, W]
-                "current_frame": current_frame,          # [3, H, W] (front view)
-                "heatmap": heatmap_tensor,               # [Hm, Wm] or [N, 4, Hm, Wm] (panoramic)
-                "trajectory": trajectory_tensor,         # [predict_horizon, 3]
-                "trajectory_valid": trajectory_valid,    # float
-                "progress": progress,                    # float (0-1)
-                "action": action_tensor,                 # [2]
-                "action_valid": action_valid,            # float
-                "discrete_action": discrete_action,      # int
-                "is_stop": is_stop,                      # float
-                "text": text,                            # str
-            }
-
-            # Pixel-goal SFT / bridge target: project the farthest visible
-            # future waypoint onto the configured System2 target camera.
-            # Direct panoramic SFT uses the front view; strict InternNav mode
-            # uses the front_down/lookdown view, matching goal.{pitch_2}.
-            goal_frame_idx = min(subseq_end - 1, T - 1)
-            if self.compute_pixel_goal and goal_frame_idx > current_t:
-                pg_direction = self.pixel_goal_direction or "front"
-                pg_poses = poses
-                if pg_direction != "front":
-                    pg_poses = self._load_poses_for_direction(clip_idx, pg_direction)
-                pg_depth = self._load_depth(clip_dir, current_t, direction=pg_direction)
-                _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
-                pg = None
-                for fi in range(goal_frame_idx, current_t, -1):
-                    pg = self._compute_pixel_goal(
-                        pg_poses[current_t], pg_poses[fi],
-                        img_size=_img_w,
-                        depth_map=pg_depth,
-                    )
-                    if pg is not None:
-                        break
+        # Pixel-goal SFT / bridge target: project the farthest visible
+        # future waypoint onto the configured System2 target camera.
+        # Direct panoramic SFT uses the front view; strict InternNav mode
+        # uses the front_down/lookdown view, matching goal.{pitch_2}.
+        goal_frame_idx = min(subseq_end - 1, T - 1)
+        if self.compute_pixel_goal and goal_frame_idx > current_t:
+            pg_direction = self.pixel_goal_direction or "front"
+            pg_poses = poses
+            if pg_direction != "front":
+                pg_poses = self._load_poses_for_direction(clip_idx, pg_direction)
+            pg_depth = self._load_depth(clip_dir, current_t, direction=pg_direction)
+            _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
+            pg = None
+            for fi in range(goal_frame_idx, current_t, -1):
+                pg = self._compute_pixel_goal(
+                    pg_poses[current_t], pg_poses[fi],
+                    img_size=_img_w,
+                    depth_map=pg_depth,
+                )
                 if pg is not None:
-                    result["pixel_goal"] = pg
-                elif self.load_traj_images:
-                    tv = result.get("trajectory_valid", 0.0)
-                    result["trajectory_valid"] = (
-                        torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
+                    break
+            if pg is not None:
+                result["pixel_goal"] = pg
+            elif self.load_traj_images:
+                tv = result.get("trajectory_valid", 0.0)
+                result["trajectory_valid"] = (
+                    torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
+                )
+
+        # 12. traj_images for DualVLN visual memory.
+        # InternNav stores a sequence of lookdown frames from the System 2
+        # trigger point onward; the action head repeats the first frame as
+        # the fixed anchor and pairs it with each current frame.  The pixel
+        # goal itself is carried by the generated text / latent queries,
+        # not by replacing the anchor with a privileged future goal view.
+        if self.load_traj_images:
+            traj_view = "front_down"
+            goal_len = max(goal_frame_idx - current_t, 1)
+            interval = 2
+            frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
+            if len(frame_offsets) == 0:
+                frame_offsets = np.array([0], dtype=np.int32)
+            if len(frame_offsets) > self.traj_sequence_max_len:
+                interval = int(np.ceil(goal_len / self.traj_sequence_max_len))
+                frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)[:self.traj_sequence_max_len]
+
+            traj_imgs_list: list[np.ndarray] = []
+            traj_poses_list: list[np.ndarray] = []
+            traj_valid_list: list[float] = []
+            try:
+                for offset in frame_offsets:
+                    frame_idx = min(current_t + int(offset), goal_frame_idx)
+                    curr_img = self._load_traj_image_raw(clip_dir, frame_idx, direction=traj_view)
+                    traj_i, valid_i, _progress_i = self._compute_trajectory(
+                        action_poses, frame_idx, subseq_end, current_t,
+                        camera_deg=action_camera_deg,
                     )
+                    if self.enable_trajectory_augmentation and valid_i > 0:
+                        traj_i = apply_trajectory_augmentation(traj_i, p=0.5)
+                    traj_imgs_list.append(curr_img)
+                    traj_poses_list.append(traj_i)
+                    traj_valid_list.append(valid_i)
+            except (FileNotFoundError, ValueError, KeyError, OSError):
+                traj_imgs_list = []
 
-            # 12. traj_images for DualVLN visual memory.
-            # InternNav stores a sequence of lookdown frames from the System 2
-            # trigger point onward; the action head repeats the first frame as
-            # the fixed anchor and pairs it with each current frame.  The pixel
-            # goal itself is carried by the generated text / latent queries,
-            # not by replacing the anchor with a privileged future goal view.
-            if self.load_traj_images:
-                traj_view = "front_down"
-                goal_len = max(goal_frame_idx - current_t, 1)
-                interval = 2
-                frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
-                if len(frame_offsets) == 0:
-                    frame_offsets = np.array([0], dtype=np.int32)
-                if len(frame_offsets) > self.traj_sequence_max_len:
-                    interval = int(np.ceil(goal_len / self.traj_sequence_max_len))
-                    frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)[:self.traj_sequence_max_len]
+            if not traj_imgs_list:
+                th, tw = self.traj_image_size[1], self.traj_image_size[0]
+                traj_imgs_list = [np.zeros((th, tw, 3), dtype=np.uint8)]
+                traj_poses_list = [trajectory]
+                traj_valid_list = [trajectory_valid]
 
-                traj_imgs_list: list[np.ndarray] = []
-                traj_poses_list: list[np.ndarray] = []
-                traj_valid_list: list[float] = []
-                try:
-                    for offset in frame_offsets:
-                        frame_idx = min(current_t + int(offset), goal_frame_idx)
-                        curr_img = self._load_traj_image_raw(clip_dir, frame_idx, direction=traj_view)
-                        traj_i, valid_i, _progress_i = self._compute_trajectory(
-                            action_poses, frame_idx, subseq_end, current_t,
-                            camera_deg=action_camera_deg,
-                        )
-                        if self.enable_trajectory_augmentation and valid_i > 0:
-                            traj_i = apply_trajectory_augmentation(traj_i, p=0.5)
-                        traj_imgs_list.append(curr_img)
-                        traj_poses_list.append(traj_i)
-                        traj_valid_list.append(valid_i)
-                except (FileNotFoundError, ValueError, KeyError, OSError):
-                    traj_imgs_list = []
+            pad_len = self.traj_sequence_max_len - len(traj_imgs_list)
+            if pad_len > 0:
+                traj_imgs_list.extend([traj_imgs_list[-1].copy() for _ in range(pad_len)])
+                traj_poses_list.extend([traj_poses_list[-1].copy() for _ in range(pad_len)])
+                traj_valid_list.extend([0.0 for _ in range(pad_len)])
 
-                if not traj_imgs_list:
-                    th, tw = self.traj_image_size[1], self.traj_image_size[0]
-                    traj_imgs_list = [np.zeros((th, tw, 3), dtype=np.uint8)]
-                    traj_poses_list = [trajectory]
-                    traj_valid_list = [trajectory_valid]
+            traj_imgs = np.stack(traj_imgs_list[:self.traj_sequence_max_len], axis=0).astype(np.float32) / 255.0
+            traj_poses = np.stack(traj_poses_list[:self.traj_sequence_max_len], axis=0).astype(np.float32)
+            traj_valids = np.asarray(traj_valid_list[:self.traj_sequence_max_len], dtype=np.float32)
+            result["traj_images"] = torch.from_numpy(traj_imgs)  # [N, H, W, 3]
+            result["trajectory"] = torch.from_numpy(traj_poses)  # [N, predict_horizon, 3]
+            result["trajectory_valid"] = torch.from_numpy(traj_valids)  # [N]
 
-                pad_len = self.traj_sequence_max_len - len(traj_imgs_list)
-                if pad_len > 0:
-                    traj_imgs_list.extend([traj_imgs_list[-1].copy() for _ in range(pad_len)])
-                    traj_poses_list.extend([traj_poses_list[-1].copy() for _ in range(pad_len)])
-                    traj_valid_list.extend([0.0 for _ in range(pad_len)])
+        if gt_visibility is not None:
+            result["gt_visibility"] = gt_visibility  # [N, 4]
+        if current_views is not None:
+            result["current_views"] = current_views  # [4, 3, H, W]
+        if history_panoramas is not None:
+            result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
 
-                traj_imgs = np.stack(traj_imgs_list[:self.traj_sequence_max_len], axis=0).astype(np.float32) / 255.0
-                traj_poses = np.stack(traj_poses_list[:self.traj_sequence_max_len], axis=0).astype(np.float32)
-                traj_valids = np.asarray(traj_valid_list[:self.traj_sequence_max_len], dtype=np.float32)
-                result["traj_images"] = torch.from_numpy(traj_imgs)  # [N, H, W, 3]
-                result["trajectory"] = torch.from_numpy(traj_poses)  # [N, predict_horizon, 3]
-                result["trajectory_valid"] = torch.from_numpy(traj_valids)  # [N]
+        # InternNav-style System2 protocol needs a lookdown observation
+        # after the first assistant emits ↓.  For panoramic VLM input this
+        # keeps the first turn panoramic while matching InternNav's second
+        # user turn.
+        if self._is_panoramic and (
+            not self.panoramic_vlm_input or self.load_lookdown_for_system2
+        ):
+            try:
+                ld = self._load_frame(clip_dir, current_t, direction="front_down")
+            except Exception:
+                ld = current_frame
+            result["lookdown_frame"] = ld  # [3, H, W]
 
-            if gt_visibility is not None:
-                result["gt_visibility"] = gt_visibility  # [N, 4]
-            if current_views is not None:
-                result["current_views"] = current_views  # [4, 3, H, W]
-            if history_panoramas is not None:
-                result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
+        result["history_rel_poses"] = torch.from_numpy(
+            compute_history_rel_poses(history_poses, current_pose)
+        ).float()                                              # [K, 4]
 
-            # InternNav-style System2 protocol needs a lookdown observation
-            # after the first assistant emits ↓.  For panoramic VLM input this
-            # keeps the first turn panoramic while matching InternNav's second
-            # user turn.
-            if self._is_panoramic and (
-                not self.panoramic_vlm_input or self.load_lookdown_for_system2
-            ):
-                try:
-                    ld = self._load_frame(clip_dir, current_t, direction="front_down")
-                except Exception:
-                    ld = current_frame
-                result["lookdown_frame"] = ld  # [3, H, W]
+        if self.defer_heatmap_to_gpu:
+            result["history_poses"] = torch.from_numpy(
+                np.stack(history_poses, axis=0)).float()       # [K, 4, 4]
+            result["current_pose"] = torch.from_numpy(
+                current_pose).float()                          # [4, 4]
+            if current_depth is not None:
+                d = current_depth
+                if d.ndim == 3 and d.shape[-1] == 1:
+                    d = d[:, :, 0]
+                result["current_depth"] = torch.from_numpy(
+                    d.astype(np.float32))                      # [Hd, Wd]
+            else:
+                result["current_depth"] = torch.zeros(1, 1)
+            if K is not None:
+                result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
 
-            result["history_rel_poses"] = torch.from_numpy(
-                compute_history_rel_poses(history_poses, current_pose)
-            ).float()                                              # [K, 4]
+        return result
 
-            if self.defer_heatmap_to_gpu:
-                result["history_poses"] = torch.from_numpy(
-                    np.stack(history_poses, axis=0)).float()       # [K, 4, 4]
-                result["current_pose"] = torch.from_numpy(
-                    current_pose).float()                          # [4, 4]
-                if current_depth is not None:
-                    d = current_depth
-                    if d.ndim == 3 and d.shape[-1] == 1:
-                        d = d[:, :, 0]
-                    result["current_depth"] = torch.from_numpy(
-                        d.astype(np.float32))                      # [Hd, Wd]
-                else:
-                    result["current_depth"] = torch.zeros(1, 1)
-                if K is not None:
-                    result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
+    def __getitem__(self, idx: int) -> dict[str, Union[torch.Tensor, str, float]]:
+        """
+        加载一个训练样本（带轨迹）
+        """
+        if not self.require_sft_target:
+            return self._build_sample(idx)
 
-            if self.require_sft_target and not self._result_has_system2_sft_target(result):
-                retry_sample = self._retry_system2_sft_sample(idx)
-                if retry_sample is not None:
-                    return retry_sample
+        errors: list[str] = []
+        missing_target_indices: list[int] = []
+        last_exception: Exception | None = None
 
-            return result
+        for candidate_idx in self._candidate_retry_indices(idx):
+            try:
+                result = self._build_sample(candidate_idx)
+            except Exception as exc:
+                last_exception = exc
+                clip_idx, current_t = self.sample_index[candidate_idx]
+                errors.append(
+                    f"idx={candidate_idx} clip={clip_idx} t={current_t} err={exc!r}"
+                )
+                continue
 
-        except Exception as e:
-            logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return self._get_dummy_sample_trajectory()
+            if self._result_has_system2_sft_target(result):
+                return result
+            missing_target_indices.append(candidate_idx)
+
+        details = []
+        if missing_target_indices:
+            details.append(
+                f"no_target={missing_target_indices[:8]}"
+                + ("..." if len(missing_target_indices) > 8 else "")
+            )
+        if errors:
+            details.append(
+                f"errors={errors[:4]}"
+                + ("..." if len(errors) > 4 else "")
+            )
+        detail_str = "; ".join(details) if details else "no candidates available"
+
+        failure = RuntimeError(
+            "Failed to produce a valid System2 SFT sample after bounded retries. "
+            f"requested_idx={idx}; {detail_str}"
+        )
+        if last_exception is not None:
+            raise failure from last_exception
+        raise failure
 
     def _get_dummy_sample_trajectory(self) -> dict[str, Union[torch.Tensor, str, float, int]]:
         """生成虚拟样本（用于错误处理）"""
@@ -785,9 +879,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         base_sample["trajectory"] = torch.zeros(self.predict_horizon, 3)
         base_sample["trajectory_valid"] = 0.0
         base_sample["progress"] = 0.0
-        if getattr(self, "require_sft_target", False):
-            base_sample["discrete_action"] = 0
-            base_sample["is_stop"] = 1.0
         return base_sample
 
 

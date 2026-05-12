@@ -67,10 +67,38 @@ class TrajectoryConfig(_Lenient):
     load_lookdown_for_system2: bool = False
     system2_sft_protocol: str = "direct"
     pixel_goal_direction: str = "front"
+    load_history_heatmap: bool = True
+    require_sft_target: bool = False
+    sft_include_turns: bool = True
+    sft_include_forward: bool = False
+    sft_num_future_steps: int = 4
     include_stop_samples_random_subsequence: bool = False
     use_subinstruction: bool = False
     fgr2r_subinstr_path: str | None = None
     panoramic_vlm_input: bool = True
+
+    @field_validator("system2_sft_protocol")
+    @classmethod
+    def _check_system2_sft_protocol(cls, v: str) -> str:
+        allowed = {"direct", "internnav"}
+        if v not in allowed:
+            raise ValueError(f"system2_sft_protocol must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("pixel_goal_direction")
+    @classmethod
+    def _check_pixel_goal_direction(cls, v: str) -> str:
+        allowed = {"front", "right", "back", "left", "front_down"}
+        if v not in allowed:
+            raise ValueError(f"pixel_goal_direction must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("sft_num_future_steps")
+    @classmethod
+    def _check_sft_num_future_steps(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"sft_num_future_steps must be >= 1, got {v}")
+        return v
 
 
 class DataConfig(_Strict):
@@ -235,6 +263,7 @@ class LossConfig(_Lenient):
     heatmap_vln: HeatmapVLNLossConfig | None = None
     heatmap_weight: float = 1.0
     trajectory_weight: float = 0.0
+    lm_weight: float = 1.0
 
 
 # --- Training ----------------------------------------------------------------
@@ -247,7 +276,16 @@ class TrainingStageConfig(_Lenient):
     train_heatmap: bool | None = None
     train_history: bool | None = None
     train_future: bool | None = None
+    train_lm: bool | None = None
+    train_system2_sft: bool | None = None
     train_action: bool = True
+    strict_trainable_modules: bool = False
+    bridge_only: bool = False
+    requires_base_checkpoint: bool = False
+    sft_include_turns: bool | None = None
+    sft_include_forward: bool | None = None
+    system2_sft_protocol: str | None = None
+    lm_weight: float | None = None
     trainable_modules: list[str] = []
     frozen_modules: list[str] = []
 
@@ -256,6 +294,16 @@ class TrainingStageConfig(_Lenient):
     def _positive_epochs(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"epochs must be >= 1, got {v}")
+        return v
+
+    @field_validator("system2_sft_protocol")
+    @classmethod
+    def _check_stage_system2_protocol(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {"direct", "internnav"}
+        if v not in allowed:
+            raise ValueError(f"system2_sft_protocol must be one of {allowed}, got '{v}'")
         return v
 
 

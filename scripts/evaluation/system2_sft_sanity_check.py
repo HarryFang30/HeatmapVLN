@@ -18,6 +18,7 @@ import random
 import re
 import sys
 from collections import Counter
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -42,11 +43,21 @@ from src.models.heatmap.input_constructor import VIEW_NAMES, _ensure_pil, constr
 
 LOGGER = logging.getLogger("system2_sft_sanity")
 TURN_TEXT = {
+    0: "STOP",
     1: "↑",
     2: "←",
     3: "→",
     5: "↓",
 }
+ACTION_TEXT_TO_IDS = OrderedDict(
+    {
+        "STOP": [0],
+        "↑": [1],
+        "←": [2],
+        "→": [3],
+        "↓": [5],
+    }
+)
 TARGET_PROMPT = (
     "判断每个历史位置在当前视图中的投影位置，"
     "并输出下一个导航目标在前视图中的像素坐标。"
@@ -67,6 +78,7 @@ class ParsedText:
     text: str
     coord: list[int] | None = None
     coord_valid: bool | None = None
+    action_seq: list[int] | None = None
     format_valid: bool = False
 
 
@@ -268,6 +280,13 @@ def target_texts_for_sample(
             return ["↓", coord_text]
         return [coord_text]
 
+    turn_action_text = sample.get("turn_action_text")
+    if include_turns and isinstance(turn_action_text, str) and turn_action_text:
+        return [turn_action_text]
+    turn_actions = sample.get("turn_actions")
+    if include_turns and isinstance(turn_actions, list) and turn_actions:
+        return ["".join(TURN_TEXT.get(int(action_code), "") for action_code in turn_actions)]
+
     if include_turns and discrete_action in (2, 3, 5):
         return [TURN_TEXT[discrete_action]]
     if include_forward and discrete_action == 1:
@@ -281,6 +300,23 @@ def parse_target(text: str | None, image_size: tuple[int, int]) -> ParsedText:
     return parse_generated_text(text, image_size=image_size, target_mode=True)
 
 
+def _parse_action_sequence(raw: str) -> tuple[list[int], bool]:
+    compact = re.sub(r"[\s\t\r\n。.!！,，;；:：]+", "", raw or "")
+    if not compact:
+        return [], False
+    pattern = re.compile("|".join(re.escape(token) for token in ACTION_TEXT_TO_IDS))
+    matches = pattern.findall(compact)
+    if not matches:
+        return [], False
+    reconstructed = "".join(matches)
+    if reconstructed != compact:
+        return [], False
+    action_seq = []
+    for token in matches:
+        action_seq.extend(ACTION_TEXT_TO_IDS[token])
+    return action_seq, True
+
+
 def parse_generated_text(
     text: str,
     image_size: tuple[int, int],
@@ -290,6 +326,7 @@ def parse_generated_text(
     upper = raw.upper()
     canonical = raw.strip(" \t\r\n。.!！,，;；:：")
 
+    action_seq, action_seq_valid = _parse_action_sequence(raw)
     contains_stop = "STOP" in upper
     direction_hits = {
         "left": (
@@ -319,28 +356,40 @@ def parse_generated_text(
     has_numbers = bool(numbers)
 
     if canonical.upper() == "STOP":
-        return ParsedText(kind="stop", text=raw, format_valid=True)
+        return ParsedText(kind="stop", text=raw, action_seq=[0], format_valid=True)
+
+    if action_seq:
+        if len(action_seq) == 1 and action_seq[0] in (1, 2, 3, 5):
+            kind = {
+                1: "forward",
+                2: "left",
+                3: "right",
+                5: "down",
+            }[action_seq[0]]
+            return ParsedText(
+                kind=kind,
+                text=raw,
+                action_seq=action_seq,
+                format_valid=action_seq_valid,
+            )
+        return ParsedText(
+            kind="action_seq",
+            text=raw,
+            action_seq=action_seq,
+            format_valid=action_seq_valid,
+        )
+
     if contains_stop:
-        return ParsedText(kind="mixed", text=raw, format_valid=False)
+        return ParsedText(kind="mixed", text=raw, action_seq=action_seq or None, format_valid=False)
 
     if len(direction_kinds) == 1 and not has_numbers:
         kind = direction_kinds[0]
         arrow = {"left": "←", "right": "→", "down": "↓", "forward": "↑"}[kind]
-        english = {"left": "left", "right": "right", "down": "down", "forward": "forward"}[kind]
-        chinese = {
-            "left": ("向左", "往左", "左转", "转左"),
-            "right": ("向右", "往右", "右转", "转右"),
-            "down": ("向下", "往下", "低头", "下看"),
-            "forward": ("向前", "往前", "前进"),
-        }[kind]
-        strict = (
-            canonical == arrow
-            or canonical.lower() == english
-            or canonical in chinese
-        )
-        return ParsedText(kind=kind, text=raw, format_valid=strict)
+        strict = canonical == arrow
+        action_map = {"left": [2], "right": [3], "down": [5], "forward": [1]}
+        return ParsedText(kind=kind, text=raw, action_seq=action_map[kind], format_valid=strict)
     if direction_kinds:
-        return ParsedText(kind="mixed", text=raw, format_valid=False)
+        return ParsedText(kind="mixed", text=raw, action_seq=None, format_valid=False)
 
     if len(numbers) >= 2:
         x = int(round(float(numbers[0])))
@@ -353,10 +402,11 @@ def parse_generated_text(
             text=raw,
             coord=[x, y],
             coord_valid=coord_valid,
+            action_seq=None,
             format_valid=strict,
         )
 
-    return ParsedText(kind="invalid", text=raw, format_valid=False)
+    return ParsedText(kind="invalid", text=raw, action_seq=None, format_valid=False)
 
 
 def current_views_from_sample(sample: dict[str, Any]) -> dict[str, Any]:
@@ -542,6 +592,8 @@ def update_metrics(
     target: ParsedText,
     pred: ParsedText,
     coord_tolerance: float,
+    *,
+    include_turn_metrics: bool = True,
 ) -> dict[str, Any]:
     metrics["total"] += 1
     metrics[f"target_{target.kind}"] += 1
@@ -580,9 +632,9 @@ def update_metrics(
         if pred.kind == "stop":
             metrics["stop_hit"] += 1
 
-    if target.kind in {"left", "right", "down", "forward"}:
+    if include_turn_metrics and target.kind in {"left", "right", "down", "forward", "action_seq"}:
         metrics["turn_targets"] += 1
-        if pred.kind == target.kind:
+        if pred.action_seq is not None and target.action_seq is not None and pred.action_seq == target.action_seq:
             metrics["turn_hit"] += 1
 
     return {
@@ -592,6 +644,8 @@ def update_metrics(
         "coord_linf": coord_linf,
         "coord_l1": coord_l1,
         "coord_hit": coord_hit,
+        "pred_action_seq": pred.action_seq,
+        "target_action_seq": target.action_seq,
     }
 
 
@@ -613,6 +667,21 @@ def print_summary(metrics: Counter, output_path: Path) -> None:
     print(f"coord_hit@tol:      {pct('coord_hit', coord_targets)}  ({int(metrics['coord_hit'])}/{int(metrics['coord_targets'])})")
     print(f"stop_hit:           {pct('stop_hit', stop_targets)}  ({int(metrics['stop_hit'])}/{int(metrics['stop_targets'])})")
     print(f"turn_hit:           {pct('turn_hit', turn_targets)}  ({int(metrics['turn_hit'])}/{int(metrics['turn_targets'])})")
+    if metrics["first_down_targets"] > 0:
+        print(
+            f"first_down_hit:     {pct('first_down_hit', int(metrics['first_down_targets']))}  "
+            f"({int(metrics['first_down_hit'])}/{int(metrics['first_down_targets'])})"
+        )
+    if metrics["second_coord_attempted"] > 0:
+        print(
+            f"second_coord_hit:   {pct('second_coord_hit', int(metrics['second_coord_attempted']))}  "
+            f"({int(metrics['second_coord_hit'])}/{int(metrics['second_coord_attempted'])})"
+        )
+    if metrics["first_down_targets"] > 0:
+        print(
+            f"second_coord_overall:{pct('second_coord_hit', int(metrics['first_down_targets']))}  "
+            f"({int(metrics['second_coord_hit'])}/{int(metrics['first_down_targets'])})"
+        )
     if metrics["coord_pred_on_coord_target"] > 0:
         print(f"coord_mean_L1:      {float(metrics['coord_l1_sum']) / coord_pred_count:.2f}")
         print(f"coord_mean_Linf:    {float(metrics['coord_linf_sum']) / coord_pred_count:.2f}")
@@ -674,7 +743,18 @@ def main() -> None:
                 pred_text = generate_one(model, sample, device, args, protocol)
                 target = parse_target(first_target_text, image_size)
                 pred = parse_generated_text(pred_text, image_size)
-                extra = update_metrics(metrics, target, pred, args.coord_tolerance)
+                is_internnav_pixel_goal = protocol == "internnav" and len(target_texts) > 1
+                if is_internnav_pixel_goal:
+                    metrics["first_down_targets"] += 1
+                    if pred.action_seq == [5] and pred.format_valid:
+                        metrics["first_down_hit"] += 1
+                extra = update_metrics(
+                    metrics,
+                    target,
+                    pred,
+                    args.coord_tolerance,
+                    include_turn_metrics=not is_internnav_pixel_goal,
+                )
 
                 record = {
                     "ordinal": ordinal,
@@ -702,7 +782,7 @@ def main() -> None:
                     )
                     printed += 1
 
-                if protocol == "internnav" and len(target_texts) > 1:
+                if is_internnav_pixel_goal:
                     if pred.kind != "down":
                         metrics["second_turn_skipped_bad_first"] += 1
                         f.write(json.dumps({
@@ -730,12 +810,16 @@ def main() -> None:
                     second_target_text = target_texts[1]
                     second_target = parse_target(second_target_text, image_size)
                     second_pred = parse_generated_text(second_pred_text, image_size)
+                    metrics["second_coord_attempted"] += 1
                     second_extra = update_metrics(
                         metrics,
                         second_target,
                         second_pred,
                         args.coord_tolerance,
+                        include_turn_metrics=False,
                     )
+                    if second_extra["coord_hit"]:
+                        metrics["second_coord_hit"] += 1
                     f.write(json.dumps({
                         "ordinal": ordinal,
                         "dataset_index": idx,

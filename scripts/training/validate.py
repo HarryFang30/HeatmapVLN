@@ -71,6 +71,7 @@ def validate(
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
     train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+    need_heatmap_targets = train_history or train_future
 
     device = dist_context.device
 
@@ -104,20 +105,22 @@ def validate(
             is_stop = batch['is_stop'].to(device)
             text = batch['text']
 
-            if _should_use_gpu_gt(batch, gpu_heatmap_computer):
-                history_poses = batch['history_poses'].to(device)
-                current_poses = batch['current_pose'].to(device)
-                current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
-                intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
-                gt_heatmap = gpu_heatmap_computer.compute_batch(
-                    history_poses=history_poses,
-                    current_poses=current_poses,
-                    current_depths=current_depths,
-                    intrinsics=intrinsics,
-                    depth_normalized=gpu_depth_normalized,
-                )
-            else:
-                gt_heatmap = batch['heatmap'].to(device)
+            gt_heatmap = None
+            if need_heatmap_targets:
+                if _should_use_gpu_gt(batch, gpu_heatmap_computer):
+                    history_poses = batch['history_poses'].to(device)
+                    current_poses = batch['current_pose'].to(device)
+                    current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
+                    intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
+                    gt_heatmap = gpu_heatmap_computer.compute_batch(
+                        history_poses=history_poses,
+                        current_poses=current_poses,
+                        current_depths=current_depths,
+                        intrinsics=intrinsics,
+                        depth_normalized=gpu_depth_normalized,
+                    )
+                else:
+                    gt_heatmap = batch['heatmap'].to(device)
 
             with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
                 if text and len(text) > 0:
@@ -240,7 +243,7 @@ def validate(
             if num_batches <= val_inference_batches:
                 try:
                     vis_output = output
-                    if train_history and 'heatmaps' in vis_output:
+                    if train_history and gt_heatmap is not None and 'heatmaps' in vis_output:
                         infer_pred_hm = vis_output.get('heatmaps_gated', vis_output['heatmaps']).to(device)
                         gt_hm_eval = gt_heatmap.to(device)
                         if infer_pred_hm.shape[-2:] != gt_hm_eval.shape[-2:]:
@@ -268,7 +271,13 @@ def validate(
                         total_heatmap_mse += batch_mse.item()
                         num_heatmap_mse_batches += 1
 
-                    if dist_context.is_main and num_batches <= num_vis_batches and vis_dir is not None:
+                    if (
+                        dist_context.is_main
+                        and train_history
+                        and 'heatmaps' in vis_output
+                        and num_batches <= num_vis_batches
+                        and vis_dir is not None
+                    ):
                         vis_path = visualize_heatmap_predictions(
                             model=model_module,
                             batch=batch,
