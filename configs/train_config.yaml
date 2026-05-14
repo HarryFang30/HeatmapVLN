@@ -4,7 +4,7 @@ paths:
   dataset_root: /workspace/r2r_panoramic_data
   log_out_dir: /root/autodl-tmp/vln_training_outputs
   tensorboard_dir: /root/tf-logs
-  llm_model_path: ./models/internnav_backbone
+  llm_model_path: /workspace/InternNav_Model
 
 # ============================================
 # 数据配置
@@ -103,8 +103,8 @@ model:
       num_inference_steps: 10
       guidance_scale: 1.0
       num_sample_trajs: 32
-      dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
-      internnav_system1_path: "models/internnav_system1.safetensors"
+      dav2_ckpt_path: ""
+      internnav_model_path: "/workspace/InternNav_Model"
       enable_gradient_checkpointing: true
       warmup_steps: 1000
 

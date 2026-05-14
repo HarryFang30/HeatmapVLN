@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from src.models.lora_utils import resolve_lora_layer_indices
 from src.models.pipeline import VLNPipeline, VLNPipelineConfig
+from src.models.runtime_compat import ensure_transformers_runtime_compat
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,20 @@ def build_model(
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
+    llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
+
+    ensure_transformers_runtime_compat(
+        model_path=llm_model_path,
+        requested_backbone_type=llm_cfg.get('backbone_type', 'qwen2_5_vl'),
+        requested_attn_implementation=llm_cfg.get('attn_implementation', 'sdpa'),
+        logger=logger,
+    )
 
     effective_device = device if device is not None else model_cfg.get('device', 'cuda')
     effective_action_head = enable_action_head if enable_action_head is not None else action_cfg.get('enable', True)
 
     config = VLNPipelineConfig(
-        llm_model_path=llm_cfg.get('model_path', './models/internnav_backbone'),
+        llm_model_path=llm_model_path,
         llm_backbone_type=llm_cfg.get('backbone_type', 'qwen2_5_vl'),
         llm_hidden_dim=llm_cfg.get('hidden_dim', 3584),
         llm_token_dim=llm_cfg.get('token_dim', 896),
@@ -57,6 +66,7 @@ def build_model(
         spatial_merge_size=llm_cfg.get('spatial_merge_size', 2),
 
         internnav_system1_path=nextdit_cfg.get('internnav_system1_path', ''),
+        internnav_model_path=nextdit_cfg.get('internnav_model_path', ''),
 
         device=effective_device,
 
@@ -107,7 +117,7 @@ def build_model(
 
     model = VLNPipeline(config)
 
-    internnav_s1 = nextdit_cfg.get('internnav_system1_path', '')
+    internnav_s1 = nextdit_cfg.get('internnav_system1_path', '') or nextdit_cfg.get('internnav_model_path', '')
     s1_ckpt = nextdit_cfg.get('pretrained_system1_path', '')
     if s1_ckpt and not internnav_s1 and model.nextdit_action_head is not None:
         s1_path = Path(s1_ckpt)

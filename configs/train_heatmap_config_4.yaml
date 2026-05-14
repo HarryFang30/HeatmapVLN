@@ -5,7 +5,7 @@ paths:
   val_root: /workspace/val_unseen
   log_out_dir: /workspace/heatmap_training_outputs
   tensorboard_dir: /workspace/tf-logs
-  llm_model_path: ./models/internnav_backbone
+  llm_model_path: /workspace/InternNav_Model
 
 # ============================================
 # 数据配置 - 热力图专用训练（4 卡版）

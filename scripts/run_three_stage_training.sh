@@ -8,10 +8,10 @@ cd "$ROOT_DIR"
 # Configurable runtime settings
 # -----------------------------
 
-INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$ROOT_DIR/models/internnav_backbone}"
+INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-/workspace/InternNav_Model}"
 export INTERNNAV_BACKBONE
 # Cluster usage:
-#   export INTERNNAV_BACKBONE=/path/to/hf/internnav_backbone
+#   export INTERNNAV_BACKBONE=/path/to/full/InternNav_Model
 
 GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -36,8 +36,9 @@ STAGE2_DATA_ROOT="${STAGE2_DATA_ROOT:-$PANORAMIC_DATA_ROOT}"
 
 # Checkpoints and pretrained assets.
 STAGE1_HM_INIT_CKPT="${STAGE1_HM_INIT_CKPT:-${HEATMAP_BASE_CKPT:-/workspace/heatmap_training_outputs/run_20260407_004635/checkpoints/best.pth}}"
-STAGE2_SYSTEM1_CKPT="${STAGE2_SYSTEM1_CKPT:-$ROOT_DIR/models/internnav_system1.safetensors}"
-STAGE2_DAV2_CKPT="${STAGE2_DAV2_CKPT:-$ROOT_DIR/models/depth_anything_v2_metric_hypersim_vits.pth}"
+STAGE2_INTERNNAV_MODEL="${STAGE2_INTERNNAV_MODEL:-$INTERNNAV_BACKBONE}"
+STAGE2_SYSTEM1_CKPT="${STAGE2_SYSTEM1_CKPT:-}"
+STAGE2_DAV2_CKPT="${STAGE2_DAV2_CKPT:-}"
 STAGE2_REQUIRE_DAV2_CKPT="${STAGE2_REQUIRE_DAV2_CKPT:-0}"
 
 # Output and TensorBoard directories.  Old variable names are still honored.
@@ -295,9 +296,14 @@ if prefix == "STAGE2":
         .setdefault("action_head", {})
         .setdefault("nextdit", {})
     )
+    internnav_model = os.environ.get("STAGE2_INTERNNAV_MODEL")
+    if internnav_model:
+        nextdit["internnav_model_path"] = internnav_model
+        nextdit["internnav_system1_path"] = ""
     system1 = os.environ.get("STAGE2_SYSTEM1_CKPT")
     if system1:
         nextdit["internnav_system1_path"] = system1
+        nextdit["internnav_model_path"] = ""
     dav2 = os.environ.get("STAGE2_EFFECTIVE_DAV2_CKPT")
     if dav2 is not None:
         nextdit["dav2_ckpt_path"] = dav2
@@ -393,15 +399,21 @@ preflight() {
   require_dir "$STAGE1_S2_DATA_ROOT"
   require_dir "$STAGE2_DATA_ROOT"
   require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
-  require_file "$STAGE2_SYSTEM1_CKPT"
 
-  STAGE2_EFFECTIVE_DAV2_CKPT="$STAGE2_DAV2_CKPT"
-  if [[ -f "$STAGE2_DAV2_CKPT" ]]; then
+  if [[ -n "$STAGE2_SYSTEM1_CKPT" ]]; then
+    require_file "$STAGE2_SYSTEM1_CKPT"
+  else
+    require_hf_model_dir "$STAGE2_INTERNNAV_MODEL"
+  fi
+
+  STAGE2_EFFECTIVE_DAV2_CKPT=""
+  if [[ -n "$STAGE2_DAV2_CKPT" && -f "$STAGE2_DAV2_CKPT" ]]; then
+    STAGE2_EFFECTIVE_DAV2_CKPT="$STAGE2_DAV2_CKPT"
     export STAGE2_EFFECTIVE_DAV2_CKPT
   elif is_truthy "$STAGE2_REQUIRE_DAV2_CKPT"; then
     require_file "$STAGE2_DAV2_CKPT"
   else
-    log "DepthAnythingV2 checkpoint not found; Stage2 config will use dav2_ckpt_path='' and rely on System1 weights: $STAGE2_DAV2_CKPT"
+    log "DepthAnythingV2 checkpoint not configured; Stage2 will rely on InternNav full-model System1 weights"
     STAGE2_EFFECTIVE_DAV2_CKPT=""
     export STAGE2_EFFECTIVE_DAV2_CKPT
   fi
@@ -446,7 +458,7 @@ export STAGE1_S2_FEISHU_NOTIFY
 export STAGE2_DATA_ROOT STAGE2_OUT_DIR STAGE2_TB_DIR
 export STAGE2_EPOCHS STAGE2_BATCH_SIZE STAGE2_GRAD_ACCUM_STEPS
 export STAGE2_NUM_WORKERS STAGE2_PREFETCH_FACTOR STAGE2_PIN_MEMORY
-export STAGE2_FEISHU_NOTIFY STAGE2_SYSTEM1_CKPT
+export STAGE2_FEISHU_NOTIFY STAGE2_INTERNNAV_MODEL STAGE2_SYSTEM1_CKPT
 
 make_stage_config STAGE1_HM "$STAGE1_HM_CONFIG" "$STAGE1_HM_TMP_CONFIG"
 make_stage_config STAGE1_S2 "$STAGE1_S2_CONFIG" "$STAGE1_S2_TMP_CONFIG"

@@ -4,7 +4,7 @@ paths:
   dataset_root: /workspace/r2r_panoramic_data
   log_out_dir: /root/autodl-tmp/vln_training_outputs
   tensorboard_dir: /root/tf-logs-stage2
-  llm_model_path: ./models/internnav_backbone
+  llm_model_path: /workspace/InternNav_Model
 
 # ============================================
 # 阶段 2: Bridge-only 适配 — 双卡版本
@@ -131,9 +131,9 @@ model:
       num_inference_steps: 10
       guidance_scale: 1.0
       num_sample_trajs: 32
-      dav2_ckpt_path: "models/depth_anything_v2_metric_hypersim_vits.pth"
+      dav2_ckpt_path: ""
       enable_gradient_checkpointing: true
-      internnav_system1_path: "models/internnav_system1.safetensors"
+      internnav_model_path: "/workspace/InternNav_Model"
       warmup_steps: 0
 
 # ============================================

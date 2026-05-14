@@ -212,6 +212,7 @@ class NextDiTConfig(_Lenient):
     dav2_ckpt_path: str = ""
     enable_gradient_checkpointing: bool = True
     internnav_system1_path: str = ""
+    internnav_model_path: str = ""
     pretrained_system1_path: str | None = None
     warmup_steps: int = 0
 

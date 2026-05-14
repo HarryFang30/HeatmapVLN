@@ -4,9 +4,9 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$ROOT_DIR/models/internnav_backbone}"
+INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-/workspace/InternNav_Model}"
 export INTERNNAV_BACKBONE
-# 与 paths.llm_model_path / 环境变量覆盖逻辑一致
+# 与 paths.llm_model_path / 环境变量覆盖逻辑一致，默认指向完整 InternNav HF 权重目录
 
 BASE_CONFIG="${BASE_CONFIG:-configs/train_system2_panoramic_sft_2gpu.yaml}"
 

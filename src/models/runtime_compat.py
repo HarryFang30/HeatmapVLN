@@ -53,7 +53,7 @@ def detect_backbone_type(model_path: str, requested_backbone_type: str = "auto")
 
     cfg = load_model_config(model_path)
     model_type = cfg.get("model_type", "")
-    if model_type in {"qwen2_5_vl", "qwen2_vl"}:
+    if model_type in {"qwen2_5_vl", "qwen2_vl", "internvla_n1"}:
         return "qwen2_5_vl"
     raise RuntimeError(
         f"Unsupported model_type={model_type!r} for model_path={model_path}. "

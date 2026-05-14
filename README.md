@@ -112,15 +112,14 @@ pip install -r requirements.txt
 
 ### Model Weights
 
-Three sets of pretrained weights are required:
+By default the training configs load the unified InternNav checkpoint directly:
 
 | Weight | Default Path | Description |
 |:-------|:-------------|:------------|
-| InternNav Backbone | `models/internnav_backbone/` | Qwen2.5-VL checkpoint (7B, safetensors shards) |
-| System 1 | `models/internnav_system1.safetensors` | NextDiT trajectory head + latent queries |
-| Depth Anything V2 | `models/depth_anything_v2_metric_hypersim_vits.pth` | DINOv2-vits depth encoder |
+| InternNav Full Model | `/workspace/InternNav_Model` | Qwen2.5-VL backbone + NextDiT System 1 + `rgb_model` DINOv2/DepthAnything encoder |
 
-To extract backbone and System 1 from a unified InternNav checkpoint:
+The old split layout is still supported for compatibility. To extract backbone
+and System 1 from a unified InternNav checkpoint:
 
 ```bash
 python scripts/tools/convert_internnav_backbone.py \

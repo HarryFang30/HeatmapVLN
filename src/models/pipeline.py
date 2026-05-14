@@ -15,9 +15,11 @@ Architecture:
             → trajectory (B, T, 3)
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -28,6 +30,25 @@ from .qwen2_5_vl import Qwen2_5VLConfig, Qwen2_5VLIntegration
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
+
+INTERNNAV_SYSTEM1_PREFIXES = (
+    "model.latent_queries",
+    "model.cond_projector.",
+    "model.traj_dit.",
+    "model.memory_encoder.",
+    "model.rgb_model.",
+    "model.rgb_resampler.",
+    "model.action_encoder.",
+    "model.action_decoder.",
+)
+
+
+def _is_internnav_system1_key(key: str) -> bool:
+    return any(key.startswith(prefix) or key == prefix.rstrip(".") for prefix in INTERNNAV_SYSTEM1_PREFIXES)
+
+
+def _remap_internnav_system1_key(key: str) -> str:
+    return key[len("model."):] if key.startswith("model.") else key
 
 
 @dataclass
@@ -56,6 +77,7 @@ class VLNPipelineConfig:
 
     # InternNav System 1 weights (pre-trained NextDiT + latent_queries)
     internnav_system1_path: str = ""
+    internnav_model_path: str = ""
 
     # Device configuration
     device: str = "cuda"
@@ -223,6 +245,8 @@ class VLNPipeline(nn.Module):
             )
             if config.internnav_system1_path:
                 self._load_internnav_system1(config.internnav_system1_path)
+            elif config.internnav_model_path:
+                self._load_internnav_system1_from_model_dir(config.internnav_model_path)
         elif config.nextdit_enabled:
             logger.info("NextDiT action head disabled by config.enable_action_head=False")
 
@@ -245,6 +269,67 @@ class VLNPipeline(nn.Module):
             ckpt_keys = list(f.keys())
             ckpt_sd = {k: f.get_tensor(k) for k in ckpt_keys}
 
+        self._load_system1_state_dict(ckpt_sd, source=ckpt_path)
+
+    def _load_internnav_system1_from_model_dir(self, model_dir: str):
+        """Load System 1 directly from a full InternNav HF checkpoint directory."""
+        from safetensors import safe_open
+
+        model_path = Path(model_dir)
+        index_path = model_path / "model.safetensors.index.json"
+        if not index_path.is_file():
+            single_path = model_path / "model.safetensors"
+            if not single_path.is_file():
+                raise FileNotFoundError(
+                    f"InternNav model weights not found in {model_path}: expected "
+                    "model.safetensors.index.json or model.safetensors"
+                )
+            logger.info("Loading InternNav System 1 from full model shard %s", single_path)
+            with safe_open(str(single_path), framework="pt", device="cpu") as f:
+                ckpt_sd = {
+                    _remap_internnav_system1_key(k): f.get_tensor(k)
+                    for k in f.keys()
+                    if _is_internnav_system1_key(k)
+                }
+            self._load_system1_state_dict(ckpt_sd, source=str(single_path))
+            return
+
+        with index_path.open("r", encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+
+        target_keys = {k: shard for k, shard in weight_map.items() if _is_internnav_system1_key(k)}
+        if not target_keys:
+            raise RuntimeError(f"No InternNav System 1 tensors found in {index_path}")
+
+        keys_by_shard: dict[str, list[str]] = {}
+        for key, shard in target_keys.items():
+            keys_by_shard.setdefault(shard, []).append(key)
+
+        ckpt_sd = {}
+        logger.info(
+            "Loading InternNav System 1 from full model %s (%d tensors across %d shards)",
+            model_path, len(target_keys), len(keys_by_shard),
+        )
+        for shard_name, keys in sorted(keys_by_shard.items()):
+            shard_path = model_path / shard_name
+            if not shard_path.is_file():
+                cache_path = model_path / ".cache" / "huggingface" / "download" / shard_name
+                if cache_path.is_file():
+                    shard_path = cache_path
+                else:
+                    raise FileNotFoundError(f"Missing InternNav model shard: {shard_path}")
+
+            with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+                available = set(f.keys())
+                for key in keys:
+                    if key not in available:
+                        raise KeyError(f"Tensor {key} listed in {index_path} is missing from {shard_path}")
+                    ckpt_sd[_remap_internnav_system1_key(key)] = f.get_tensor(key)
+
+        self._load_system1_state_dict(ckpt_sd, source=str(model_path))
+
+    def _load_system1_state_dict(self, ckpt_sd: dict[str, torch.Tensor], source: str):
+        """Apply remapped System 1 weights to the action head and latent queries."""
         if "latent_queries" in ckpt_sd:
             lq = ckpt_sd.pop("latent_queries")
             if self.latent_queries.shape == lq.shape:
@@ -271,7 +356,7 @@ class VLNPipeline(nn.Module):
         missing = [k for k in head_sd if k not in ckpt_sd and k != "latent_queries"]
         self.nextdit_action_head.load_state_dict(head_sd, strict=False)
 
-        logger.info("  Loaded %d/%d System 1 params", len(loaded), len(ckpt_sd))
+        logger.info("  Loaded %d/%d System 1 params from %s", len(loaded), len(ckpt_sd), source)
         if skipped:
             logger.warning("  Skipped: %s", skipped[:10])
         if missing:

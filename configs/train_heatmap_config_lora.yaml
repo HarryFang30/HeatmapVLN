@@ -5,7 +5,7 @@ paths:
   val_root: /workspace/val_unseen
   log_out_dir: /workspace/heatmap_lora_training_outputs
   tensorboard_dir: /workspace/tf-logs-lora
-  llm_model_path: ./models/internnav_backbone
+  llm_model_path: /workspace/InternNav_Model
 
 # ============================================
 # 数据配置 - 热力图训练 + LoRA 对比实验（双卡）

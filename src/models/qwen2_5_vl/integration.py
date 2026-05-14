@@ -9,6 +9,7 @@ Features:
 Sequence packing is currently disabled on the shared stack.
 """
 
+import json
 import logging
 import warnings
 
@@ -17,6 +18,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*fps.*frames p
 warnings.filterwarnings("ignore", category=UserWarning, message=".*video_metadata.*")
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Union
 
 import numpy as np
@@ -252,11 +254,12 @@ class Qwen2_5VLIntegration(nn.Module):
 
     def _load_qwen25vl(self):
         """Load a Qwen2.5-VL backbone."""
-        from transformers import Qwen2_5_VLForConditionalGeneration
+        from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
         logger.info("Loading Qwen2.5-VL from %s", self.config.model_path)
+        model_config = self._build_qwen25vl_config_for_path(Qwen2_5_VLConfig)
         self.model = self._load_with_attn_fallback(
-            Qwen2_5_VLForConditionalGeneration, self.config.model_path,
+            Qwen2_5_VLForConditionalGeneration, self.config.model_path, model_config,
         )
         cfg = self.model.config
         self.image_token_id = getattr(cfg, "image_token_id", 151655)
@@ -264,7 +267,32 @@ class Qwen2_5VLIntegration(nn.Module):
         self.vision_start_id = getattr(cfg, "vision_start_token_id", 151652)
         self.vision_end_id = getattr(cfg, "vision_end_token_id", 151653)
 
-    def _load_with_attn_fallback(self, model_cls, model_path: str):
+    def _build_qwen25vl_config_for_path(self, config_cls):
+        """Reuse full InternNav checkpoints by loading their backbone with Qwen2.5-VL config."""
+        cfg_path = Path(self.config.model_path) / "config.json"
+        if not cfg_path.is_file():
+            return None
+
+        with cfg_path.open("r", encoding="utf-8") as f:
+            raw_cfg = json.load(f)
+
+        if raw_cfg.get("model_type") != "internvla_n1":
+            return None
+
+        qwen_cfg = dict(raw_cfg)
+        qwen_cfg["architectures"] = ["Qwen2_5_VLForConditionalGeneration"]
+        qwen_cfg["model_type"] = "qwen2_5_vl"
+        qwen_cfg["auto_map"] = {
+            "AutoConfig": "transformers.Qwen2_5_VLConfig",
+            "AutoModelForCausalLM": "transformers.Qwen2_5_VLForConditionalGeneration",
+        }
+        for key in ("n_query", "system1", "model_cfg"):
+            qwen_cfg.pop(key, None)
+
+        logger.info("Detected InternNav full checkpoint; loading backbone with Qwen2.5-VL config")
+        return config_cls.from_dict(qwen_cfg)
+
+    def _load_with_attn_fallback(self, model_cls, model_path: str, model_config=None):
         """Try loading with the requested attention impl, fall back to sdpa."""
         requested = self.config.attn_implementation
         candidates: list[str] = []
@@ -284,13 +312,15 @@ class Qwen2_5VLIntegration(nn.Module):
         for attn_impl in candidates:
             try:
                 logger.info("Trying attention implementation: %s", attn_impl)
-                model = model_cls.from_pretrained(
-                    model_path,
+                load_kwargs = dict(
                     torch_dtype=self.config.get_torch_dtype(),
                     attn_implementation=attn_impl,
                     device_map=self.device,
                     trust_remote_code=True,
                 )
+                if model_config is not None:
+                    load_kwargs["config"] = model_config
+                model = model_cls.from_pretrained(model_path, **load_kwargs)
                 if attn_impl != requested:
                     logger.warning("Attention fallback: requested `%s`, using `%s`", requested, attn_impl)
                 self.config.attn_implementation = attn_impl
