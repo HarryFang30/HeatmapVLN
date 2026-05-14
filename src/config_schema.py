@@ -370,6 +370,7 @@ class LogConfig(_Lenient):
 # --- Validation --------------------------------------------------------------
 
 class ValidationConfig(_Lenient):
+    enabled: bool = True
     eval_every_epochs: int = 1
     save_best_metric: str = "val_total_loss"
     patience: int = 5

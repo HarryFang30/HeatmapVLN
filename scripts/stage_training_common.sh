@@ -220,6 +220,10 @@ notify = log_cfg.setdefault("notify", {})
 notify["enabled"] = env_bool("FEISHU_NOTIFY")
 notify["webhook_url"] = os.environ.get("FEISHU_WEBHOOK_URL", "")
 
+validation_cfg = cfg.setdefault("validation", {})
+if f"{prefix}_VALIDATION_ENABLED" in os.environ:
+    validation_cfg["enabled"] = env_bool("VALIDATION_ENABLED", "true")
+
 stages = cfg.setdefault("training", {}).setdefault("stages", [])
 if not stages:
     raise RuntimeError("training.stages is empty in the base config")

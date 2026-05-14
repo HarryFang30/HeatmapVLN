@@ -111,6 +111,11 @@ class TestPydanticValidation:
         assert "paths" not in out
         assert out["data"]["root"] == "/p"
 
+    def test_validation_disabled_schema(self, minimal_cfg):
+        minimal_cfg.setdefault("validation", {})["enabled"] = False
+        r = validate_config(minimal_cfg)
+        assert r.validation.enabled is False
+
     def test_validate_minimal_config(self, minimal_cfg):
         """Minimal config fixture passes validation."""
         result = validate_config(minimal_cfg)

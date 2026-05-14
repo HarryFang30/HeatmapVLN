@@ -368,6 +368,10 @@ def main():
             samples_per_clip=val_samples,
         )
 
+    if not cfg.get('validation', {}).get('enabled', True):
+        val_dataset = None
+        logger.info("  Validation disabled (validation.enabled=false)")
+
     if val_dataset is not None and hasattr(val_dataset, 'set_epoch'):
         val_dataset.set_epoch(0)
 
@@ -375,7 +379,10 @@ def main():
     if val_dataset is not None:
         logger.info(f"  Val: {len(val_dataset)} samples")
     else:
-        logger.info("  Val: disabled (no val_root)")
+        if not cfg.get('validation', {}).get('enabled', True):
+            logger.info("  Val: disabled (validation.enabled=false)")
+        else:
+            logger.info("  Val: disabled (no val_root for trajectory, or no val_loader)")
 
     # 构建模型
     logger.info("🏗️  Building model...")
@@ -809,7 +816,16 @@ def main():
             _malloc_trim()
             _drop_page_cache()
         else:
-            logger.info(f"  ⏭️  跳过验证（eval_every_epochs={eval_every_epochs}，将在 epoch {epoch + eval_every_epochs - (epoch % eval_every_epochs)} 验证）")
+            if val_loader is None:
+                if not cfg.get('validation', {}).get('enabled', True):
+                    logger.info("  ⏭️  跳过验证（validation.enabled=false）")
+                else:
+                    logger.info("  ⏭️  跳过验证（未配置验证集）")
+            else:
+                logger.info(
+                    f"  ⏭️  跳过验证（eval_every_epochs={eval_every_epochs}，将在 epoch "
+                    f"{epoch + eval_every_epochs - (epoch % eval_every_epochs)} 验证）"
+                )
 
         if cfg['log'].get('show_gpu_memory', False):
             process = psutil.Process()
