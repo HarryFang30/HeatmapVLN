@@ -6,7 +6,7 @@ paths:
   log_out_dir: /root/autodl-tmp/vln_training_outputs
   tensorboard_dir: /root/tf-logs-stage2
   # VLM（HF 目录）。export INTERNNAV_BACKBONE 或 HEATMAPVLN_LLM_MODEL_PATH 可覆盖此项（无需改 yaml）
-  llm_model_path: /workspace/InternNav_Model
+  internnav_model_path: $INTERNNAV_MODEL_PATH
 
 # ============================================
 # 阶段 2: Bridge-only 适配（System2 + InternNav System1 完全冻结）
@@ -154,7 +154,6 @@ model:
       num_sample_trajs: 32
       dav2_ckpt_path: ""
       enable_gradient_checkpointing: true
-      internnav_model_path: "/workspace/InternNav_Model"
       warmup_steps: 0
 
 # ============================================

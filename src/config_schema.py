@@ -16,11 +16,13 @@ Usage::
     cfg = load_and_validate_config("x.yaml")  # path -> validated dict
 
 Optional top-level ``paths:`` (``dataset_root``, ``val_root``, ``log_out_dir``,
-``tensorboard_dir``, ``llm_model_path``) is merged into ``data`` / ``log`` /
-``model.llm`` after expanding ``$VAR`` in all strings.  If the environment
-sets ``INTERNNAV_BACKBONE`` or ``HEATMAPVLN_LLM_MODEL_PATH``, that value
-overrides ``model.llm.model_path`` last.  Use :func:`prepare_config_for_use`
-when loading YAML without schema validation.
+``tensorboard_dir``, ``llm_model_path``, ``internnav_model_path``) is merged
+into ``data`` / ``log`` / ``model`` after expanding ``$VAR`` in all strings.
+If the environment sets ``INTERNNAV_MODEL_PATH`` or
+``HEATMAPVLN_INTERNNAV_MODEL_PATH``, that value overrides both the backbone and
+Stage2 System1 source.  Legacy ``INTERNNAV_BACKBONE`` /
+``HEATMAPVLN_LLM_MODEL_PATH`` still override only ``model.llm.model_path``.
+Use :func:`prepare_config_for_use` when loading YAML without schema validation.
 """
 
 from __future__ import annotations
@@ -403,6 +405,7 @@ _PATHS_ALLOWED = frozenset(
         "log_out_dir",
         "tensorboard_dir",
         "llm_model_path",
+        "internnav_model_path",
     }
 )
 
@@ -427,8 +430,12 @@ def _merge_paths_block(cfg: dict[str, Any]) -> None:
     * ``val_root`` → ``data.val_root`` (if key is present; value may be null)
     * ``log_out_dir`` → ``log.out_dir`` (non-empty string only)
     * ``tensorboard_dir`` → ``log.tensorboard_dir`` (if key is present)
+    * ``internnav_model_path`` → ``model.llm.model_path`` and
+      ``model.action_head.nextdit.internnav_model_path`` (non-empty string only;
+      use this for unified InternNav HF checkpoints)
     * ``llm_model_path`` → ``model.llm.model_path`` (non-empty string only;
-      e.g. ``$INTERNNAV_BACKBONE`` expanded from the environment)
+      e.g. ``$INTERNNAV_BACKBONE`` expanded from the environment; kept for
+      split-backbone compatibility)
 
     Values in ``paths`` should be host-specific; use ``$VAR`` / ``${VAR}`` and
     set environment variables on the machine or scheduler.
@@ -470,6 +477,10 @@ def _merge_paths_block(cfg: dict[str, Any]) -> None:
             raise ValueError("log must be a mapping when paths.tensorboard_dir is set")
         log["tensorboard_dir"] = raw_paths["tensorboard_dir"]
 
+    internnav_mp = raw_paths.get("internnav_model_path")
+    if isinstance(internnav_mp, str) and internnav_mp.strip():
+        _set_unified_internnav_model_path(cfg, internnav_mp)
+
     llm_mp = raw_paths.get("llm_model_path")
     if isinstance(llm_mp, str) and llm_mp.strip():
         model = cfg.setdefault("model", {})
@@ -486,8 +497,37 @@ def prepare_config_for_use(cfg: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(cfg)
     out = _expand_env_strings(out)
     _merge_paths_block(out)
-    _apply_llm_model_path_env_override(out)
+    _apply_model_path_env_overrides(out)
     return out
+
+
+def _set_unified_internnav_model_path(cfg: dict[str, Any], path: str) -> None:
+    """Set the unified InternNav model path for both backbone and System1."""
+    model = cfg.setdefault("model", {})
+    if not isinstance(model, dict):
+        raise ValueError("model must be a mapping when InternNav model path is set")
+
+    llm = model.setdefault("llm", {})
+    if not isinstance(llm, dict):
+        raise ValueError("model.llm must be a mapping when InternNav model path is set")
+    llm["model_path"] = str(path).strip()
+
+    action_head = model.setdefault("action_head", {})
+    if not isinstance(action_head, dict):
+        raise ValueError("model.action_head must be a mapping when InternNav model path is set")
+    nextdit = action_head.setdefault("nextdit", {})
+    if not isinstance(nextdit, dict):
+        raise ValueError("model.action_head.nextdit must be a mapping when InternNav model path is set")
+    nextdit["internnav_model_path"] = str(path).strip()
+
+
+def _apply_model_path_env_overrides(cfg: dict[str, Any]) -> None:
+    raw_unified = os.environ.get("INTERNNAV_MODEL_PATH") or os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH")
+    if raw_unified and str(raw_unified).strip():
+        _set_unified_internnav_model_path(cfg, str(raw_unified).strip())
+        return
+
+    _apply_llm_model_path_env_override(cfg)
 
 
 def _apply_llm_model_path_env_override(cfg: dict[str, Any]) -> None:

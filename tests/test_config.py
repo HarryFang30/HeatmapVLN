@@ -56,7 +56,7 @@ class TestPydanticValidation:
             "dataset_root": "/from_paths_root",
             "log_out_dir": "/from_paths_log",
             "tensorboard_dir": "/from_paths_tb",
-            "llm_model_path": "/vlm/from_paths",
+            "internnav_model_path": "/vlm/from_paths",
         }
         result = validate_config(minimal_cfg)
         assert result.data.root == "/from_paths_root"
@@ -64,6 +64,19 @@ class TestPydanticValidation:
         assert result.log.tensorboard_dir == "/from_paths_tb"
         assert result.model.llm is not None
         assert result.model.llm.model_path == "/vlm/from_paths"
+        assert result.model.action_head is not None
+        assert result.model.action_head.nextdit is not None
+        assert result.model.action_head.nextdit.internnav_model_path == "/vlm/from_paths"
+
+    def test_internnav_model_env_overrides_unified_path(self, minimal_cfg, monkeypatch):
+        monkeypatch.setenv("INTERNNAV_MODEL_PATH", "/env/internnav")
+        minimal_cfg["paths"] = {"internnav_model_path": "/yaml/internnav"}
+        result = validate_config(minimal_cfg)
+        assert result.model.llm is not None
+        assert result.model.llm.model_path == "/env/internnav"
+        assert result.model.action_head is not None
+        assert result.model.action_head.nextdit is not None
+        assert result.model.action_head.nextdit.internnav_model_path == "/env/internnav"
 
     def test_internnav_backbone_env_overrides_paths_llm(self, minimal_cfg, monkeypatch):
         monkeypatch.setenv("INTERNNAV_BACKBONE", "/env/vlm")

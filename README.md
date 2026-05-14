@@ -116,7 +116,11 @@ By default the training configs load the unified InternNav checkpoint directly:
 
 | Weight | Default Path | Description |
 |:-------|:-------------|:------------|
-| InternNav Full Model | `/workspace/InternNav_Model` | Qwen2.5-VL backbone + NextDiT System 1 + `rgb_model` DINOv2/DepthAnything encoder |
+| InternNav Full Model | `$INTERNNAV_MODEL_PATH` | Qwen2.5-VL backbone + NextDiT System 1 + `rgb_model` DINOv2/DepthAnything encoder |
+
+Set `paths.internnav_model_path` in YAML, or export `INTERNNAV_MODEL_PATH=/path/to/InternNav_Model`,
+to choose the unified checkpoint directory without editing code. The bundled launch scripts default this
+environment variable to `/workspace/InternNav_Model` if it is not already set.
 
 The old split layout is still supported for compatibility. To extract backbone
 and System 1 from a unified InternNav checkpoint:
