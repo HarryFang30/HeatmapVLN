@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stage_training_common.sh"
+
+STAGE1_S2_CONFIG="${STAGE1_S2_CONFIG:-configs/train_system2_panoramic_sft_2gpu.yaml}"
+PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-${DATA_ROOT:-/workspace/r2r_panoramic_data}}"
+STAGE1_S2_DATA_ROOT="${STAGE1_S2_DATA_ROOT:-$PANORAMIC_DATA_ROOT}"
+STAGE1_HM_OUT_DIR="${STAGE1_HM_OUT_DIR:-${HEATMAP_LORA_OUT_DIR:-/workspace/heatmap_lora_training_outputs}}"
+STAGE1_HM_CHECKPOINT_PREFERENCE="${STAGE1_HM_CHECKPOINT_PREFERENCE:-best}"
+STAGE1_S2_LOAD_WEIGHTS="${STAGE1_S2_LOAD_WEIGHTS:-${STAGE1_INIT_CKPT:-}}"
+STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-${SYSTEM2_SFT_OUT_DIR:-/root/autodl-tmp/vln_system2_sft_outputs}}"
+STAGE1_S2_TB_DIR="${STAGE1_S2_TB_DIR:-/root/tf-logs-system2-sft}"
+STAGE1_S2_EPOCHS="${STAGE1_S2_EPOCHS:-}"
+STAGE1_S2_BATCH_SIZE="${STAGE1_S2_BATCH_SIZE:-1}"
+STAGE1_S2_GRAD_ACCUM_STEPS="${STAGE1_S2_GRAD_ACCUM_STEPS:-2}"
+STAGE1_S2_NUM_WORKERS="${STAGE1_S2_NUM_WORKERS:-2}"
+STAGE1_S2_PREFETCH_FACTOR="${STAGE1_S2_PREFETCH_FACTOR:-2}"
+STAGE1_S2_PIN_MEMORY="${STAGE1_S2_PIN_MEMORY:-true}"
+STAGE1_S2_MAX_BATCHES="${STAGE1_S2_MAX_BATCHES:-}"
+STAGE1_S2_CHECKPOINT_PREFERENCE="${STAGE1_S2_CHECKPOINT_PREFERENCE:-latest}"
+STAGE1_S2_FEISHU_NOTIFY="${STAGE1_S2_FEISHU_NOTIFY:-$FEISHU_NOTIFY}"
+MASTER_PORT_STAGE1_S2="${MASTER_PORT_STAGE1_S2:-29617}"
+
+if [[ -z "$STAGE1_S2_LOAD_WEIGHTS" ]]; then
+  STAGE1_S2_LOAD_WEIGHTS="$(choose_checkpoint "${STAGE1_HM_OUT_DIR}/latest/checkpoints" "$STAGE1_HM_CHECKPOINT_PREFERENCE")"
+fi
+
+preflight_gpu
+preflight_notify "$STAGE1_S2_FEISHU_NOTIFY"
+require_file "$STAGE1_S2_CONFIG"
+require_file "$STAGE1_S2_LOAD_WEIGHTS"
+require_hf_model_dir "$INTERNNAV_BACKBONE"
+require_dir "$STAGE1_S2_DATA_ROOT"
+require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
+mkdir -p "$STAGE1_S2_OUT_DIR" "$STAGE1_S2_TB_DIR"
+
+STAGE1_S2_TMP_CONFIG="$(mktemp "/tmp/stage1_s2.XXXXXX")"
+TMP_CONFIGS+=("$STAGE1_S2_TMP_CONFIG")
+
+export GPU_DEVICES
+export STAGE1_S2_DATA_ROOT STAGE1_S2_OUT_DIR STAGE1_S2_TB_DIR
+export STAGE1_S2_EPOCHS STAGE1_S2_BATCH_SIZE STAGE1_S2_GRAD_ACCUM_STEPS
+export STAGE1_S2_NUM_WORKERS STAGE1_S2_PREFETCH_FACTOR STAGE1_S2_PIN_MEMORY
+export STAGE1_S2_FEISHU_NOTIFY
+
+make_stage_config STAGE1_S2 "$STAGE1_S2_CONFIG" "$STAGE1_S2_TMP_CONFIG"
+
+log "Stage: Stage1-S2 panoramic System2 SFT"
+log "Repo root: $ROOT_DIR"
+log "Training GPUs: $GPU_DEVICES (nproc_per_node=$NPROC_PER_NODE)"
+log "InternNav backbone: $INTERNNAV_BACKBONE"
+log "Config: $STAGE1_S2_TMP_CONFIG"
+log "Load weights: $STAGE1_S2_LOAD_WEIGHTS"
+log "Output dir: $STAGE1_S2_OUT_DIR"
+
+if is_truthy "$STAGE_DRY_RUN"; then
+  log "STAGE_DRY_RUN=$STAGE_DRY_RUN; preflight and config generation completed, skipping training"
+  exit 0
+fi
+
+run_training_stage "Stage1-S2 panoramic System2 SFT" "$MASTER_PORT_STAGE1_S2" \
+  "$STAGE1_S2_TMP_CONFIG" "$STAGE1_S2_LOAD_WEIGHTS" "$STAGE1_S2_MAX_BATCHES"
+
+FINAL_CKPT="$(choose_checkpoint "${STAGE1_S2_OUT_DIR}/latest/checkpoints" "$STAGE1_S2_CHECKPOINT_PREFERENCE")"
+log "Stage1-S2 checkpoint: $FINAL_CKPT"
