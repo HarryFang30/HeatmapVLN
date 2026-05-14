@@ -29,10 +29,11 @@ STAGE2_CONFIG="${STAGE2_CONFIG:-configs/train_config_internnav_4gpu.yaml}"
 # with the existing single-stage cluster scripts.
 PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-${DATA_ROOT:-/workspace/r2r_panoramic_data}}"
 HEATMAP_DATA_ROOT="${HEATMAP_DATA_ROOT:-/workspace/heatmap_train_data}"
-HEATMAP_VAL_ROOT="${HEATMAP_VAL_ROOT:-/workspace/val_unseen}"
+# 未设置时用默认；显式空字符串表示无单独 val 根目录（与 run_stage1_hm_8gpu.sh 一致）
+HEATMAP_VAL_ROOT="${HEATMAP_VAL_ROOT-/workspace/val_unseen}"
 
 STAGE1_HM_DATA_ROOT="${STAGE1_HM_DATA_ROOT:-$HEATMAP_DATA_ROOT}"
-STAGE1_HM_VAL_ROOT="${STAGE1_HM_VAL_ROOT:-$HEATMAP_VAL_ROOT}"
+STAGE1_HM_VAL_ROOT="${STAGE1_HM_VAL_ROOT-$HEATMAP_VAL_ROOT}"
 STAGE1_S2_DATA_ROOT="${STAGE1_S2_DATA_ROOT:-$PANORAMIC_DATA_ROOT}"
 STAGE2_DATA_ROOT="${STAGE2_DATA_ROOT:-$PANORAMIC_DATA_ROOT}"
 
@@ -397,7 +398,11 @@ preflight() {
   require_file "$STAGE1_HM_INIT_CKPT"
   require_hf_model_dir "$INTERNNAV_BACKBONE"
   require_dir "$STAGE1_HM_DATA_ROOT"
-  require_dir "$STAGE1_HM_VAL_ROOT"
+  if [[ -n "${STAGE1_HM_VAL_ROOT:-}" ]]; then
+    require_dir "$STAGE1_HM_VAL_ROOT"
+  else
+    log "STAGE1_HM_VAL_ROOT empty: skipping separate val root preflight"
+  fi
   require_dir "$STAGE1_S2_DATA_ROOT"
   require_dir "$STAGE2_DATA_ROOT"
   require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"

@@ -5,9 +5,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stage_training_common.sh"
 
 STAGE1_HM_CONFIG="${STAGE1_HM_CONFIG:-configs/train_heatmap_config_lora.yaml}"
 HEATMAP_DATA_ROOT="${HEATMAP_DATA_ROOT:-/workspace/heatmap_train_data}"
-HEATMAP_VAL_ROOT="${HEATMAP_VAL_ROOT:-/workspace/val_unseen}"
+# 未设置时用默认；显式设为空字符串表示「无单独 val 根目录」（训练里 val 会回退到 train 的 root）
+HEATMAP_VAL_ROOT="${HEATMAP_VAL_ROOT-/workspace/val_unseen}"
 STAGE1_HM_DATA_ROOT="${STAGE1_HM_DATA_ROOT:-$HEATMAP_DATA_ROOT}"
-STAGE1_HM_VAL_ROOT="${STAGE1_HM_VAL_ROOT:-$HEATMAP_VAL_ROOT}"
+STAGE1_HM_VAL_ROOT="${STAGE1_HM_VAL_ROOT-$HEATMAP_VAL_ROOT}"
 STAGE1_HM_INIT_CKPT="${STAGE1_HM_INIT_CKPT:-${HEATMAP_BASE_CKPT:-/workspace/heatmap_training_outputs/run_20260407_004635/checkpoints/best.pth}}"
 STAGE1_HM_OUT_DIR="${STAGE1_HM_OUT_DIR:-${HEATMAP_LORA_OUT_DIR:-/workspace/heatmap_lora_training_outputs}}"
 STAGE1_HM_TB_DIR="${STAGE1_HM_TB_DIR:-/workspace/tf-logs-lora}"
@@ -28,7 +29,11 @@ require_file "$STAGE1_HM_CONFIG"
 require_file "$STAGE1_HM_INIT_CKPT"
 require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE1_HM_DATA_ROOT"
-require_dir "$STAGE1_HM_VAL_ROOT"
+if [[ -n "${STAGE1_HM_VAL_ROOT:-}" ]]; then
+  require_dir "$STAGE1_HM_VAL_ROOT"
+else
+  log "STAGE1_HM_VAL_ROOT empty: no separate val root preflight; val_root cleared in generated config"
+fi
 mkdir -p "$STAGE1_HM_OUT_DIR" "$STAGE1_HM_TB_DIR"
 
 STAGE1_HM_TMP_CONFIG="$(mktemp "/tmp/stage1_hm.XXXXXX")"
