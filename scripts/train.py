@@ -657,7 +657,7 @@ def main():
             del ckpt
             torch.cuda.empty_cache()
         else:
-            logger.error(f"✗ Weights file not found: {weights_path}")
+            raise FileNotFoundError(f"Weights file not found: {weights_path}")
 
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
