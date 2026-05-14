@@ -4,6 +4,7 @@ paths:
   dataset_root: /workspace/r2r_panoramic_data
   log_out_dir: /root/autodl-tmp/vln_training_outputs
   tensorboard_dir: /root/tf-logs
+  llm_model_path: ./models/internnav_backbone
 
 # ============================================
 # 数据配置
@@ -58,7 +59,6 @@ model:
 
   # VLM backbone 配置
   llm:
-    model_path: ./models/internnav_backbone
     backbone_type: qwen2_5_vl
     hidden_dim: 3584
     token_dim: 896

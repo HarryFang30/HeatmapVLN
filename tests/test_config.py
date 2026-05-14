@@ -56,11 +56,26 @@ class TestPydanticValidation:
             "dataset_root": "/from_paths_root",
             "log_out_dir": "/from_paths_log",
             "tensorboard_dir": "/from_paths_tb",
+            "llm_model_path": "/vlm/from_paths",
         }
         result = validate_config(minimal_cfg)
         assert result.data.root == "/from_paths_root"
         assert result.log.out_dir == "/from_paths_log"
         assert result.log.tensorboard_dir == "/from_paths_tb"
+        assert result.model.llm is not None
+        assert result.model.llm.model_path == "/vlm/from_paths"
+
+    def test_internnav_backbone_env_overrides_paths_llm(self, minimal_cfg, monkeypatch):
+        monkeypatch.setenv("INTERNNAV_BACKBONE", "/env/vlm")
+        minimal_cfg["paths"] = {
+            "dataset_root": "/from_paths_root",
+            "log_out_dir": "/from_paths_log",
+            "tensorboard_dir": "/from_paths_tb",
+            "llm_model_path": "/yaml/vlm",
+        }
+        result = validate_config(minimal_cfg)
+        assert result.model.llm is not None
+        assert result.model.llm.model_path == "/env/vlm"
 
     def test_expand_vars_in_paths(self, minimal_cfg, monkeypatch):
         monkeypatch.setenv("HVLN_TEST_DATA", "/expanded/data")
@@ -77,6 +92,7 @@ class TestPydanticValidation:
             "dataset_root": "/p",
             "log_out_dir": "/l",
             "tensorboard_dir": "/t",
+            "llm_model_path": "/vlm",
         }
         out = prepare_config_for_use(minimal_cfg)
         assert "paths" not in out

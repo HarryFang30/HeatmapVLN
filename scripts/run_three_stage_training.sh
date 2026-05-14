@@ -4,6 +4,10 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$ROOT_DIR/models/internnav_backbone}"
+export INTERNNAV_BACKBONE
+# 集群上可预先 export INTERNNAV_BACKBONE=/你的/HF权重目录（覆盖 yaml 中 paths.llm_model_path）
+
 GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-120}"

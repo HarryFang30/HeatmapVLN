@@ -4,6 +4,10 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$ROOT_DIR/models/internnav_backbone}"
+export INTERNNAV_BACKBONE
+# 与配置中 paths.llm_model_path 一致；指向 HuggingFace 格式的 Qwen2.5-VL / InternNav 权重根目录
+
 BASE_CONFIG="${BASE_CONFIG:-configs/train_heatmap_config_lora.yaml}"
 STAGE1_INIT_CKPT="${STAGE1_INIT_CKPT:-$ROOT_DIR/run_20260414_012624_latest.pth}"
 
@@ -87,7 +91,7 @@ require_file "$BASE_CONFIG"
 require_file "$STAGE1_INIT_CKPT"
 require_dir "$DATA_ROOT"
 require_dir "$VAL_ROOT"
-require_dir "$ROOT_DIR/models/internnav_backbone"
+require_dir "$INTERNNAV_BACKBONE"
 
 TMP_CONFIG="$(mktemp "/tmp/${RUN_NAME}.XXXXXX.yaml")"
 trap 'rm -f "$TMP_CONFIG"' EXIT

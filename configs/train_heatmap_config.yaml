@@ -5,6 +5,7 @@ paths:
   val_root: /workspace/val_unseen
   log_out_dir: /workspace/heatmap_training_outputs
   tensorboard_dir: /workspace/tf-logs
+  llm_model_path: ./models/internnav_backbone
 
 # ============================================
 # 数据配置 - 热力图专用训练（单卡）
@@ -58,7 +59,6 @@ model:
   device: cuda
 
   llm:
-    model_path: ./models/internnav_backbone
     backbone_type: qwen2_5_vl
     hidden_dim: 3584
     token_dim: 896

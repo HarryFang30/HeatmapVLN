@@ -4,6 +4,7 @@ paths:
   dataset_root: /workspace/r2r_panoramic_data
   log_out_dir: /root/autodl-tmp/vln_system2_sft_outputs
   tensorboard_dir: /root/tf-logs-system2-sft
+  llm_model_path: ./models/internnav_backbone
 
 # ============================================
 # Stage1-S2: panoramic System2 SFT
@@ -69,7 +70,6 @@ model:
   device: cuda
 
   llm:
-    model_path: ./models/internnav_backbone
     backbone_type: qwen2_5_vl
     hidden_dim: 3584
     token_dim: 896

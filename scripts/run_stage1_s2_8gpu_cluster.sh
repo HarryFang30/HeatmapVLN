@@ -4,6 +4,10 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$ROOT_DIR/models/internnav_backbone}"
+export INTERNNAV_BACKBONE
+# 与 paths.llm_model_path / 环境变量覆盖逻辑一致
+
 BASE_CONFIG="${BASE_CONFIG:-configs/train_system2_panoramic_sft_2gpu.yaml}"
 
 DATA_ROOT="${DATA_ROOT:?DATA_ROOT is required}"
@@ -89,7 +93,7 @@ mkdir -p "$OUT_DIR" "$TB_DIR" "$LOG_DIR"
 require_file "$BASE_CONFIG"
 require_file "$STAGE1_INIT_CKPT"
 require_dir "$DATA_ROOT"
-require_dir "$ROOT_DIR/models/internnav_backbone"
+require_dir "$INTERNNAV_BACKBONE"
 require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
 
 TMP_CONFIG="$(mktemp "/tmp/${RUN_NAME}.XXXXXX.yaml")"

@@ -16,9 +16,11 @@ Usage::
     cfg = load_and_validate_config("x.yaml")  # path -> validated dict
 
 Optional top-level ``paths:`` (``dataset_root``, ``val_root``, ``log_out_dir``,
-``tensorboard_dir``) is merged into ``data`` / ``log`` after expanding
-``$VAR`` in all strings; use :func:`prepare_config_for_use` when loading YAML
-without schema validation.
+``tensorboard_dir``, ``llm_model_path``) is merged into ``data`` / ``log`` /
+``model.llm`` after expanding ``$VAR`` in all strings.  If the environment
+sets ``INTERNNAV_BACKBONE`` or ``HEATMAPVLN_LLM_MODEL_PATH``, that value
+overrides ``model.llm.model_path`` last.  Use :func:`prepare_config_for_use`
+when loading YAML without schema validation.
 """
 
 from __future__ import annotations
@@ -394,7 +396,13 @@ class TrainConfig(_Lenient):
 # --- Public API --------------------------------------------------------------
 
 _PATHS_ALLOWED = frozenset(
-    {"dataset_root", "val_root", "log_out_dir", "tensorboard_dir"}
+    {
+        "dataset_root",
+        "val_root",
+        "log_out_dir",
+        "tensorboard_dir",
+        "llm_model_path",
+    }
 )
 
 
@@ -410,7 +418,7 @@ def _expand_env_strings(obj: Any) -> Any:
 
 
 def _merge_paths_block(cfg: dict[str, Any]) -> None:
-    """Pop optional top-level ``paths`` and merge into ``data`` / ``log``.
+    """Pop optional top-level ``paths`` and merge into ``data`` / ``log`` / ``model``.
 
     Supported keys:
 
@@ -418,6 +426,8 @@ def _merge_paths_block(cfg: dict[str, Any]) -> None:
     * ``val_root`` → ``data.val_root`` (if key is present; value may be null)
     * ``log_out_dir`` → ``log.out_dir`` (non-empty string only)
     * ``tensorboard_dir`` → ``log.tensorboard_dir`` (if key is present)
+    * ``llm_model_path`` → ``model.llm.model_path`` (non-empty string only;
+      e.g. ``$INTERNNAV_BACKBONE`` expanded from the environment)
 
     Values in ``paths`` should be host-specific; use ``$VAR`` / ``${VAR}`` and
     set environment variables on the machine or scheduler.
@@ -459,13 +469,42 @@ def _merge_paths_block(cfg: dict[str, Any]) -> None:
             raise ValueError("log must be a mapping when paths.tensorboard_dir is set")
         log["tensorboard_dir"] = raw_paths["tensorboard_dir"]
 
+    llm_mp = raw_paths.get("llm_model_path")
+    if isinstance(llm_mp, str) and llm_mp.strip():
+        model = cfg.setdefault("model", {})
+        if not isinstance(model, dict):
+            raise ValueError("model must be a mapping when paths.llm_model_path is set")
+        llm = model.setdefault("llm", {})
+        if not isinstance(llm, dict):
+            raise ValueError("model.llm must be a mapping when paths.llm_model_path is set")
+        llm["model_path"] = llm_mp
+
 
 def prepare_config_for_use(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Deep-copy, expand env vars in strings, merge ``paths`` into data/log."""
+    """Deep-copy, expand env vars in strings, merge ``paths`` into data/log/model."""
     out = copy.deepcopy(cfg)
     out = _expand_env_strings(out)
     _merge_paths_block(out)
+    _apply_llm_model_path_env_override(out)
     return out
+
+
+def _apply_llm_model_path_env_override(cfg: dict[str, Any]) -> None:
+    """If set, ``INTERNNAV_BACKBONE`` or ``HEATMAPVLN_LLM_MODEL_PATH`` overrides ``model.llm.model_path``.
+
+    Applied after ``paths`` merge so a single export can point all stages at the
+    host VLM directory without editing YAML per machine.
+    """
+    raw = os.environ.get("INTERNNAV_BACKBONE") or os.environ.get("HEATMAPVLN_LLM_MODEL_PATH")
+    if not raw or not str(raw).strip():
+        return
+    model = cfg.setdefault("model", {})
+    if not isinstance(model, dict):
+        raise ValueError("model must be a mapping when VLM env override is set")
+    llm = model.setdefault("llm", {})
+    if not isinstance(llm, dict):
+        raise ValueError("model.llm must be a mapping when VLM env override is set")
+    llm["model_path"] = str(raw).strip()
 
 
 def validate_config(cfg: dict[str, Any]) -> TrainConfig:

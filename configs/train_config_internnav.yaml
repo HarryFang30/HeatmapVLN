@@ -1,10 +1,12 @@
 seed: 42
 
-# 主机路径集中配置（加载时 expandvars 后合并到 data / log；也可用 data.root 等传统字段）
+# 主机路径集中配置（expandvars 后合并到 data / log / model.llm；亦可用环境变量覆盖，见下）
 paths:
   dataset_root: /workspace/r2r_panoramic_data
   log_out_dir: /root/autodl-tmp/vln_training_outputs
   tensorboard_dir: /root/tf-logs-stage2
+  # VLM（HF 目录）。export INTERNNAV_BACKBONE 或 HEATMAPVLN_LLM_MODEL_PATH 可覆盖此项（无需改 yaml）
+  llm_model_path: ./models/internnav_backbone
 
 # ============================================
 # 阶段 2: Bridge-only 适配（System2 + InternNav System1 完全冻结）
@@ -93,7 +95,6 @@ model:
   device: cuda
 
   llm:
-    model_path: ./models/internnav_backbone
     backbone_type: qwen2_5_vl
     hidden_dim: 3584
     token_dim: 896
