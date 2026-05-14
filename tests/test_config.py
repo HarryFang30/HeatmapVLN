@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from src.config_schema import TrainConfig, validate_config
+from src.config_schema import TrainConfig, prepare_config_for_use, validate_config
 
 
 class TestLoadConfig:
@@ -46,6 +46,42 @@ class TestLoadConfig:
 
 
 class TestPydanticValidation:
+    def test_paths_unknown_key_raises(self, minimal_cfg):
+        minimal_cfg["paths"] = {"dataset_root": "/tmp/x", "typo_key": "y"}
+        with pytest.raises(ValueError, match="Unknown paths keys"):
+            validate_config(minimal_cfg)
+
+    def test_paths_merge_overrides_data_and_log(self, minimal_cfg):
+        minimal_cfg["paths"] = {
+            "dataset_root": "/from_paths_root",
+            "log_out_dir": "/from_paths_log",
+            "tensorboard_dir": "/from_paths_tb",
+        }
+        result = validate_config(minimal_cfg)
+        assert result.data.root == "/from_paths_root"
+        assert result.log.out_dir == "/from_paths_log"
+        assert result.log.tensorboard_dir == "/from_paths_tb"
+
+    def test_expand_vars_in_paths(self, minimal_cfg, monkeypatch):
+        monkeypatch.setenv("HVLN_TEST_DATA", "/expanded/data")
+        minimal_cfg["paths"] = {
+            "dataset_root": "$HVLN_TEST_DATA",
+            "log_out_dir": "/tmp/log",
+            "tensorboard_dir": "/tmp/tb",
+        }
+        result = validate_config(minimal_cfg)
+        assert result.data.root == "/expanded/data"
+
+    def test_prepare_config_pops_paths(self, minimal_cfg):
+        minimal_cfg["paths"] = {
+            "dataset_root": "/p",
+            "log_out_dir": "/l",
+            "tensorboard_dir": "/t",
+        }
+        out = prepare_config_for_use(minimal_cfg)
+        assert "paths" not in out
+        assert out["data"]["root"] == "/p"
+
     def test_validate_minimal_config(self, minimal_cfg):
         """Minimal config fixture passes validation."""
         result = validate_config(minimal_cfg)

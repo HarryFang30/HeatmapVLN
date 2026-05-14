@@ -102,10 +102,14 @@ import sys
 
 import yaml
 
+from src.config_schema import prepare_config_for_use
+
 base_config, output_config = sys.argv[1], sys.argv[2]
 
 with open(base_config, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
+
+cfg = prepare_config_for_use(cfg)
 
 cfg.setdefault("data", {})
 cfg["data"]["root"] = os.environ["DATA_ROOT"]

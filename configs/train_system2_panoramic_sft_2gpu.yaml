@@ -1,5 +1,10 @@
 seed: 42
 
+paths:
+  dataset_root: /workspace/r2r_panoramic_data
+  log_out_dir: /root/autodl-tmp/vln_system2_sft_outputs
+  tensorboard_dir: /root/tf-logs-system2-sft
+
 # ============================================
 # Stage1-S2: panoramic System2 SFT
 # ============================================
@@ -20,7 +25,6 @@ seed: 42
 #   后续 Stage2 bridge-only 用 --load-weights 加载这个 checkpoint。
 
 data:
-  root: /workspace/r2r_panoramic_data
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
@@ -139,13 +143,11 @@ gpu:
     find_unused_parameters: true
 
 log:
-  out_dir: /root/autodl-tmp/vln_system2_sft_outputs
   save_every_epochs: 1
   vis_every_steps: 1000
   val_vis_batches: 0
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs-system2-sft
   enable_timing: true
   epoch_boundary_cooldown_s: 8
   log_interval: 10

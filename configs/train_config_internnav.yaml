@@ -1,5 +1,11 @@
 seed: 42
 
+# 主机路径集中配置（加载时 expandvars 后合并到 data / log；也可用 data.root 等传统字段）
+paths:
+  dataset_root: /workspace/r2r_panoramic_data
+  log_out_dir: /root/autodl-tmp/vln_training_outputs
+  tensorboard_dir: /root/tf-logs-stage2
+
 # ============================================
 # 阶段 2: Bridge-only 适配（System2 + InternNav System1 完全冻结）
 # ============================================
@@ -37,11 +43,8 @@ seed: 42
 # 数据配置
 # ============================================
 data:
-  root: /workspace/r2r_panoramic_data
   train_split: train
-  # val_unseen 数据为 Stage 1 热力图格式，不适用于 Stage 2 轨迹验证
-  # val_root: /workspace/val_unseen
-  # val_split: all
+  # val_unseen 为 Stage1 热力图格式，一般不用于 Stage2 轨迹验证；若需要可在 paths 中加 val_root
   image_size: [256, 256]
   init_hm_size: [64, 64]
   num_workers: 4
@@ -262,13 +265,11 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /root/autodl-tmp/vln_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs-stage2
   enable_timing: true
   epoch_boundary_cooldown_s: 8
   log_interval: 10

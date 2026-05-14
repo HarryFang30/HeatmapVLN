@@ -244,7 +244,9 @@ def load_config(config_path: str, validate: bool = True) -> dict:
         from src.config_schema import normalize_config
 
         return normalize_config(cfg)
-    return cfg
+    from src.config_schema import prepare_config_for_use
+
+    return prepare_config_for_use(cfg)
 
 
 def safe_torch_load(

@@ -1,5 +1,11 @@
 seed: 42
 
+paths:
+  dataset_root: /workspace/heatmap_train_data
+  val_root: /workspace/val_unseen
+  log_out_dir: /workspace/heatmap_lora_training_outputs
+  tensorboard_dir: /workspace/tf-logs-lora
+
 # ============================================
 # 数据配置 - 热力图训练 + LoRA 对比实验（双卡）
 # ============================================
@@ -23,9 +29,7 @@ seed: 42
 #   diag/vis_accuracy — 最容易看到改善的指标
 #
 data:
-  root: /workspace/heatmap_train_data
   train_split: train
-  val_root: /workspace/val_unseen
   val_split: all
   image_size: [256, 256]
   init_hm_size: [64, 64]
@@ -195,13 +199,11 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /workspace/heatmap_lora_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /workspace/tf-logs-lora
   enable_timing: false
   epoch_boundary_cooldown_s: 8
   log_interval: 10

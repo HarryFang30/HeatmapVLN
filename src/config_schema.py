@@ -6,14 +6,25 @@ before they cause cryptic failures deep in the training loop.
 
 Usage::
 
-    from src.config_schema import validate_config, load_and_validate_config
+    from src.config_schema import (
+        validate_config,
+        load_and_validate_config,
+        prepare_config_for_use,
+    )
 
     cfg = validate_config(raw_dict)          # dict -> TrainConfig
-    cfg = load_and_validate_config("x.yaml") # path -> validated dict (original)
+    cfg = load_and_validate_config("x.yaml")  # path -> validated dict
+
+Optional top-level ``paths:`` (``dataset_root``, ``val_root``, ``log_out_dir``,
+``tensorboard_dir``) is merged into ``data`` / ``log`` after expanding
+``$VAR`` in all strings; use :func:`prepare_config_for_use` when loading YAML
+without schema validation.
 """
 
 from __future__ import annotations
 
+import copy
+import os
 from pathlib import Path
 from typing import Any, Union
 
@@ -382,13 +393,89 @@ class TrainConfig(_Lenient):
 
 # --- Public API --------------------------------------------------------------
 
+_PATHS_ALLOWED = frozenset(
+    {"dataset_root", "val_root", "log_out_dir", "tensorboard_dir"}
+)
+
+
+def _expand_env_strings(obj: Any) -> Any:
+    """Apply ``expanduser`` / ``expandvars`` to every string in nested dict/list."""
+    if isinstance(obj, str):
+        return os.path.expandvars(os.path.expanduser(obj))
+    if isinstance(obj, dict):
+        return {k: _expand_env_strings(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_strings(v) for v in obj]
+    return obj
+
+
+def _merge_paths_block(cfg: dict[str, Any]) -> None:
+    """Pop optional top-level ``paths`` and merge into ``data`` / ``log``.
+
+    Supported keys:
+
+    * ``dataset_root`` → ``data.root`` (non-empty string only)
+    * ``val_root`` → ``data.val_root`` (if key is present; value may be null)
+    * ``log_out_dir`` → ``log.out_dir`` (non-empty string only)
+    * ``tensorboard_dir`` → ``log.tensorboard_dir`` (if key is present)
+
+    Values in ``paths`` should be host-specific; use ``$VAR`` / ``${VAR}`` and
+    set environment variables on the machine or scheduler.
+    """
+    raw_paths = cfg.pop("paths", None)
+    if raw_paths is None:
+        return
+    if not isinstance(raw_paths, dict):
+        raise ValueError(f"paths must be a mapping, got {type(raw_paths).__name__}")
+    extra = set(raw_paths) - _PATHS_ALLOWED
+    if extra:
+        raise ValueError(
+            f"Unknown paths keys: {sorted(extra)}. Allowed: {sorted(_PATHS_ALLOWED)}"
+        )
+
+    dr = raw_paths.get("dataset_root")
+    if isinstance(dr, str) and dr.strip():
+        data = cfg.setdefault("data", {})
+        if not isinstance(data, dict):
+            raise ValueError("data must be a mapping when paths.dataset_root is set")
+        data["root"] = dr
+
+    if "val_root" in raw_paths:
+        data = cfg.setdefault("data", {})
+        if not isinstance(data, dict):
+            raise ValueError("data must be a mapping when paths.val_root is set")
+        data["val_root"] = raw_paths["val_root"]
+
+    lod = raw_paths.get("log_out_dir")
+    if isinstance(lod, str) and lod.strip():
+        log = cfg.setdefault("log", {})
+        if not isinstance(log, dict):
+            raise ValueError("log must be a mapping when paths.log_out_dir is set")
+        log["out_dir"] = lod
+
+    if "tensorboard_dir" in raw_paths:
+        log = cfg.setdefault("log", {})
+        if not isinstance(log, dict):
+            raise ValueError("log must be a mapping when paths.tensorboard_dir is set")
+        log["tensorboard_dir"] = raw_paths["tensorboard_dir"]
+
+
+def prepare_config_for_use(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy, expand env vars in strings, merge ``paths`` into data/log."""
+    out = copy.deepcopy(cfg)
+    out = _expand_env_strings(out)
+    _merge_paths_block(out)
+    return out
+
+
 def validate_config(cfg: dict[str, Any]) -> TrainConfig:
     """Validate a raw config dict against the schema.
 
     Raises ``pydantic.ValidationError`` with a clear message listing all
     violations if the config is invalid.
     """
-    return TrainConfig.model_validate(cfg)
+    prepared = prepare_config_for_use(cfg)
+    return TrainConfig.model_validate(prepared)
 
 
 def normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:

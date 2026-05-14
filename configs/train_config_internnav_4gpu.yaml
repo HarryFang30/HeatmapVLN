@@ -1,5 +1,10 @@
 seed: 42
 
+paths:
+  dataset_root: /workspace/r2r_panoramic_data
+  log_out_dir: /root/autodl-tmp/vln_training_outputs
+  tensorboard_dir: /root/tf-logs-stage2
+
 # ============================================
 # 阶段 2: Bridge-only 适配 — 双卡版本
 # ============================================
@@ -27,7 +32,6 @@ seed: 42
 # 数据配置
 # ============================================
 data:
-  root: /workspace/r2r_panoramic_data
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
@@ -221,13 +225,11 @@ gpu:
 # 日志与保存
 # ============================================
 log:
-  out_dir: /root/autodl-tmp/vln_training_outputs
   save_every_epochs: 1
   vis_every_steps: 100
   val_vis_batches: 2
   max_ckpts: 5
   use_tensorboard: true
-  tensorboard_dir: /root/tf-logs-stage2
   enable_timing: true
   epoch_boundary_cooldown_s: 8
   log_interval: 10
