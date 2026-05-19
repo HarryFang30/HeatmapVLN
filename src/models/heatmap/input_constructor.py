@@ -6,9 +6,13 @@ Constructs text-guided multi-image input for Qwen2.5-VL.
 Each panoramic position provides 4 views (front/right/back/left at 256x256).
 Text annotations encode scene context, group structure, and spatial orientation.
 
-Reference: HeatmapVLN设计文档 Section 3
+Prompt wording follows ``NavPixelGoalDataset`` in InternNav
+(``internnav/dataset/internvla_n1_lerobot_dataset.py``).
 """
 
+from __future__ import annotations
+
+import random
 from typing import Union
 
 import numpy as np
@@ -16,8 +20,46 @@ import torch
 from PIL import Image
 
 VIEW_NAMES = ["front", "right", "back", "left"]
-VIEW_ANGLES = ["0°正前方", "90°右侧", "180°正后方", "270°左侧"]
-ORIENTATION_STR = "、".join(VIEW_ANGLES)
+
+# InternNav ``NavPixelGoalDataset.conjunctions``
+INTERNAV_CONJUNCTIONS = [
+    "you can see ",
+    "in front of you is ",
+    "there is ",
+    "you can spot ",
+    "you are toward the ",
+    "ahead of you is ",
+    "in your sight is ",
+]
+
+# Appendix A.1 / NavPixelGoalDataset user prompt (without <history> / <image> placeholders).
+INTERNAV_BASE_PROMPT = (
+    "You are an autonomous navigation assistant. Your task is to {instruction}. "
+    "Where should you go next to stay on track? Please output the next waypoint's "
+    "coordinates in the image. Please output STOP when you have successfully completed the task."
+)
+
+# VL-LN bench variant in ``vlln_lerobot_dataset.py`` (look-down + turn hints).
+INTERNAV_LOOKDOWN_TASK_SUFFIX = (
+    " When you want to output a waypoint you need to TILT DOWN (↓) by 30 degrees "
+    "then output the next waypoint's coordinates in the look-down image. "
+    "In case the next waypoint is out of view, utilize the turn actions: "
+    "TURN LEFT (←) or TURN RIGHT (→) by 30 degrees."
+)
+
+INTERNAV_TURN_TASK_SUFFIX = (
+    " In case the next waypoint is out of view, utilize the turn actions: "
+    "TURN LEFT (←) or TURN RIGHT (→) by 30 degrees."
+)
+
+DIRECT_WAYPOINT_TASK_SUFFIX = (
+    " Output the next waypoint coordinates in the front view of the current observation."
+)
+
+HISTORY_PROJECTION_TASK = (
+    "Project each historical location into the current panoramic views."
+)
+
 _ANCHOR_TOKEN_CACHE: dict[tuple[int, int], list[list[int]]] = {}
 
 
@@ -33,53 +75,31 @@ def construct_input(
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
 
-    Args:
-        current_views: dict with keys 'front', 'right', 'back', 'left',
-            values are PIL Images or tensors (C,H,W) in [0,1].
-        history_panoramas: list of dicts with same structure, ordered by time.
-        instruction: optional navigation instruction for task grounding.
-        pixel_goal: optional [x, y] pixel coordinates of the next waypoint
-            in the front view.
-        assistant_text: optional explicit assistant response.  When omitted
-            and ``pixel_goal`` is provided, the response defaults to
-            ``"{x} {y}"``.
-        lookdown_frame: optional current lookdown observation.  Required for
-            teacher-forced pixel-goal samples when ``internnav_protocol`` is
-            enabled.
-        internnav_protocol: when true, pixel-goal samples use the InternNav
-            two-turn protocol: assistant ``↓``, user lookdown image,
-            assistant coordinates.
-
-    Returns:
-        messages: list of message dicts compatible with the Qwen2.5-VL processor.
+    Panoramic layout is HeatmapVLN-specific; user-facing task text matches InternNav System2 SFT.
     """
-    content = []
+    content: list[dict] = []
+    instruction_text = instruction or ""
+    has_history = len(history_panoramas) > 0
+
+    prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
+    if has_history:
+        prompt_text += " These are your historical observations:"
+    content.append({"type": "text", "text": prompt_text})
+
+    for hist_idx, hist in enumerate(history_panoramas):
+        content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
+        for view_name in VIEW_NAMES:
+            content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
 
     content.append({
         "type": "text",
-        "text": "以下是一个室内导航场景。",
-    })
-    if instruction:
-        content.append({
-            "type": "text",
-            "text": f"导航指令：{instruction}",
-        })
-    content.append({
-        "type": "text",
-        "text": f"当前位置的全景观测（朝向{ORIENTATION_STR}）：",
+        "text": (
+            f"Current panoramic observation "
+            f"(views: {', '.join(VIEW_NAMES)}):"
+        ),
     })
     for view_name in VIEW_NAMES:
-        img = _ensure_pil(current_views[view_name])
-        content.append({"type": "image", "image": img})
-
-    for i, hist in enumerate(history_panoramas):
-        content.append({
-            "type": "text",
-            "text": _build_history_anchor_text(i),
-        })
-        for view_name in VIEW_NAMES:
-            img = _ensure_pil(hist[view_name])
-            content.append({"type": "image", "image": img})
+        content.append({"type": "image", "image": _ensure_pil(current_views[view_name])})
 
     nav_target_text = assistant_text
     if nav_target_text is None and pixel_goal is not None:
@@ -87,28 +107,14 @@ def construct_input(
 
     if nav_target_text is not None or pixel_goal is not None:
         if internnav_protocol:
-            prompt_text = (
-                "判断每个历史位置在当前视图中的投影位置。"
-                "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
-                "请输出 ← 或 → 调整朝向；如果需要在前视图中定位下一个导航目标，"
-                "请先输出 ↓，收到下视图后再输出下视图中的像素坐标。"
-            )
+            content.append({"type": "text", "text": INTERNAV_LOOKDOWN_TASK_SUFFIX})
         else:
-            prompt_text = (
-                "判断每个历史位置在当前视图中的投影位置，"
-                "并输出下一个导航目标在前视图中的像素坐标。"
-                "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
-                "请输出 ← 或 → 调整朝向。"
-            )
-        content.append({
-            "type": "text",
-            "text": prompt_text,
-        })
+            content.append({
+                "type": "text",
+                "text": DIRECT_WAYPOINT_TASK_SUFFIX + INTERNAV_TURN_TASK_SUFFIX,
+            })
     else:
-        content.append({
-            "type": "text",
-            "text": "判断每个历史位置在当前视图中的投影位置。",
-        })
+        content.append({"type": "text", "text": HISTORY_PROJECTION_TASK})
 
     messages = [{"role": "user", "content": content}]
 
@@ -122,7 +128,10 @@ def construct_input(
             })
             messages.append({
                 "role": "user",
-                "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
+                "content": [
+                    {"type": "text", "text": random.choice(INTERNAV_CONJUNCTIONS)},
+                    {"type": "image", "image": _ensure_pil(lookdown_frame)},
+                ],
             })
         messages.append({
             "role": "assistant",
@@ -159,9 +168,6 @@ def find_text_anchor_positions(
 
     After LLM attention, these token positions aggregate visual information
     from the following 4 images, serving as compact query vectors.
-
-    Returns:
-        dict mapping history_index -> token position in the sequence.
     """
     ids = input_ids.squeeze().tolist()
 
@@ -207,38 +213,19 @@ def construct_input_stage2(
     pixel_goal: list[int] | None = None,
     assistant_text: str | None = None,
 ) -> list[dict]:
-    """Construct InternNav-aligned Stage 2 input (front-view + lookdown).
-
-    Pixel-goal samples mirror the InternNav paper::
-
-        User:   [video: K past + current front frames] + instruction
-        Assistant: ↓
-        User:   [lookdown image]
-        Assistant: (x, y)   ← pixel-goal coordinates (teacher forcing)
-
-    STOP / turn samples use a single assistant response without the lookdown
-    turn, matching InternNav's non-pixel-goal branches.
-
-    Args:
-        history_frames: K front-view history images.
-        current_frame:  Current front-view observation.
-        lookdown_frame: Current lookdown (pitch=30°) observation.
-        instruction:    Navigation instruction text.
-        pixel_goal:     [x, y] pixel coordinates of next waypoint.
-        assistant_text: optional explicit assistant response.  Defaults to
-            ``"{x} {y}"`` when ``pixel_goal`` is provided.
-
-    Returns:
-        messages: list of message dicts for the Qwen2.5-VL processor.
-    """
+    """Construct InternNav-aligned Stage 2 input (front-view + lookdown)."""
     all_frames = [_ensure_pil(f) for f in history_frames]
     all_frames.append(_ensure_pil(current_frame))
 
-    user_content: list = []
-    if instruction:
-        user_content.append({"type": "text", "text": instruction})
-    user_content.append({"type": "video", "video": all_frames})
+    instruction_text = instruction or ""
+    prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
+    if len(history_frames) > 0:
+        prompt_text += " These are your historical observations in the following video."
 
+    user_content: list[dict] = [
+        {"type": "text", "text": prompt_text},
+        {"type": "video", "video": all_frames},
+    ]
     messages = [{"role": "user", "content": user_content}]
 
     nav_target_text = assistant_text
@@ -250,10 +237,12 @@ def construct_input_stage2(
             "role": "assistant",
             "content": [{"type": "text", "text": "↓"}],
         })
-
         messages.append({
             "role": "user",
-            "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
+            "content": [
+                {"type": "text", "text": random.choice(INTERNAV_CONJUNCTIONS)},
+                {"type": "image", "image": _ensure_pil(lookdown_frame)},
+            ],
         })
 
     if nav_target_text is not None:
@@ -266,7 +255,10 @@ def construct_input_stage2(
 
 
 def _build_history_anchor_text(hist_idx: int) -> str:
-    return f"历史位置{hist_idx + 1}的全景观测（朝向{ORIENTATION_STR}）："
+    return (
+        f"Historical observation {hist_idx + 1} "
+        f"(panoramic views: {', '.join(VIEW_NAMES)}):"
+    )
 
 
 def _sublist_match(seq: list, start: int, pattern: list) -> bool:

@@ -38,7 +38,15 @@ from scripts.training.checkpoint import load_checkpoint_for_resume
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
 from src.data.factory import build_dataset
-from src.models.heatmap.input_constructor import VIEW_NAMES, _ensure_pil, construct_input
+from src.models.heatmap.input_constructor import (
+    DIRECT_WAYPOINT_TASK_SUFFIX,
+    INTERNAV_CONJUNCTIONS,
+    INTERNAV_LOOKDOWN_TASK_SUFFIX,
+    INTERNAV_TURN_TASK_SUFFIX,
+    VIEW_NAMES,
+    _ensure_pil,
+    construct_input,
+)
 
 
 LOGGER = logging.getLogger("system2_sft_sanity")
@@ -58,18 +66,8 @@ ACTION_TEXT_TO_IDS = OrderedDict(
         "↓": [5],
     }
 )
-TARGET_PROMPT = (
-    "判断每个历史位置在当前视图中的投影位置，"
-    "并输出下一个导航目标在前视图中的像素坐标。"
-    "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
-    "请输出 ← 或 → 调整朝向。"
-)
-INTERNNAV_TARGET_PROMPT = (
-    "判断每个历史位置在当前视图中的投影位置。"
-    "如果已经完成导航，请输出 STOP；如果目标不在前视图中，"
-    "请输出 ← 或 → 调整朝向；如果需要在前视图中定位下一个导航目标，"
-    "请先输出 ↓，收到下视图后再输出下视图中的像素坐标。"
-)
+TARGET_PROMPT = DIRECT_WAYPOINT_TASK_SUFFIX + INTERNAV_TURN_TASK_SUFFIX
+INTERNNAV_TARGET_PROMPT = INTERNAV_LOOKDOWN_TASK_SUFFIX
 
 
 @dataclass
@@ -496,7 +494,10 @@ def make_second_turn_messages(
     })
     messages.append({
         "role": "user",
-        "content": [{"type": "image", "image": _ensure_pil(lookdown_frame)}],
+        "content": [
+            {"type": "text", "text": random.choice(INTERNNAV_CONJUNCTIONS)},
+            {"type": "image", "image": _ensure_pil(lookdown_frame)},
+        ],
     })
     return messages
 

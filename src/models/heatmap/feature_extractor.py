@@ -224,7 +224,7 @@ class FeatureExtractor:
             image_token_positions: ``{img_idx: (start, end)}`` — each image's
                 vision-token span in the LLM sequence.
             text_anchor_positions: ``{hist_idx: token_position}`` — last token
-                of each "历史位置X..." annotation.
+                of each "Historical observation N ..." annotation.
             image_grid_thw: ``(num_images, 3)`` from Qwen processor.
 
         Returns:
