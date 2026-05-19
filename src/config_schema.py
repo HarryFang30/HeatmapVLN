@@ -87,6 +87,9 @@ class TrajectoryConfig(_Lenient):
     sft_include_turns: bool = True
     sft_include_forward: bool = False
     sft_num_future_steps: int = 4
+    system2_sample_step: int = 4
+    system2_min_pixel_goal_len: int = 3
+    system2_stop_oversample: int = 5
     include_stop_samples_random_subsequence: bool = False
     use_subinstruction: bool = False
     fgr2r_subinstr_path: str | None = None
@@ -113,6 +116,13 @@ class TrajectoryConfig(_Lenient):
     def _check_sft_num_future_steps(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"sft_num_future_steps must be >= 1, got {v}")
+        return v
+
+    @field_validator("system2_sample_step", "system2_min_pixel_goal_len", "system2_stop_oversample")
+    @classmethod
+    def _check_positive_system2_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"System2 InternNav alignment parameter must be >= 1, got {v}")
         return v
 
 

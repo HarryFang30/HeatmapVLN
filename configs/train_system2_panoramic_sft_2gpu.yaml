@@ -42,13 +42,13 @@ data:
     load_depth: true
     cache_poses: true
     sample_stride: 2
-    clip_level_sampling: true
+    clip_level_sampling: false
     samples_per_clip: 5
     val_samples_per_clip: 4
-    random_subsequence: true
+    random_subsequence: false
     min_subsequence_length: 30
     subsequence_samples_per_clip: 5
-    include_stop_samples_random_subsequence: true
+    include_stop_samples_random_subsequence: false
     predict_horizon: 32
     action_scale: 4.0
     enable_trajectory_augmentation: false
@@ -62,6 +62,9 @@ data:
     sft_include_turns: true
     sft_include_forward: false
     sft_num_future_steps: 4
+    system2_sample_step: 4
+    system2_min_pixel_goal_len: 3
+    system2_stop_oversample: 5
     load_traj_images: false
     traj_image_size: [224, 224]
 

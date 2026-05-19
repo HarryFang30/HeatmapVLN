@@ -107,6 +107,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         sft_include_turns: bool = True,
         sft_include_forward: bool = False,
         sft_num_future_steps: int = 4,
+        system2_sample_step: int = 4,
+        system2_min_pixel_goal_len: int = 3,
+        system2_stop_oversample: int = 5,
         include_stop_samples_random_subsequence: bool = False,
         # FGR2R 子指令配置
         fgr2r_subinstr_path: str | None = None,
@@ -146,6 +149,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
         self.sft_num_future_steps = max(int(sft_num_future_steps), 1)
+        self.system2_sample_step = max(int(system2_sample_step), 1)
+        self.system2_min_pixel_goal_len = max(int(system2_min_pixel_goal_len), 1)
+        self.system2_stop_oversample = max(int(system2_stop_oversample), 1)
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
@@ -167,21 +173,213 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"load_history_heatmap={self.load_history_heatmap}, "
             f"require_sft_target={self.require_sft_target}, "
             f"sft_num_future_steps={self.sft_num_future_steps}, "
+            f"system2_sample_step={self.system2_sample_step}, "
+            f"system2_min_pixel_goal_len={self.system2_min_pixel_goal_len}, "
+            f"system2_stop_oversample={self.system2_stop_oversample}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}"
         )
 
     def set_epoch(self, epoch: int):
+        if self.require_sft_target:
+            self._epoch = epoch
+            self._rng = np.random.RandomState(42 + epoch)
+            self._build_sample_index()
+            logger.info(
+                f"[Epoch {epoch}] Resampled {len(self.sample_index)} InternNav-style System2 SFT samples"
+            )
+            return
         super().set_epoch(epoch)
+
+    def _build_sample_index(self):
+        if self.require_sft_target:
+            self._build_internnav_sample_index()
+            return
+        super()._build_sample_index()
+
+    @staticmethod
+    def _align_internnav_discrete_actions(discrete_actions: np.ndarray) -> np.ndarray:
+        """Match NavPixelGoalDataset: ``actions = item['actions'][1:] + [0]``."""
+        if len(discrete_actions) <= 1:
+            return discrete_actions
+        return np.concatenate([discrete_actions[1:], np.array([0], dtype=discrete_actions.dtype)])
+
+    def _system2_discrete_actions(self, discrete_actions: np.ndarray | None) -> np.ndarray | None:
+        if discrete_actions is None:
+            return None
+        if self.require_sft_target:
+            return self._align_internnav_discrete_actions(discrete_actions)
+        return discrete_actions
+
+    def _resolve_farthest_pixel_goal(
+        self,
+        clip_idx: int,
+        clip_dir: Path,
+        current_t: int,
+        num_frames: int,
+        img_size: int | tuple[int, int],
+    ) -> tuple[int, list[int]] | None:
+        """Match InternNav farthest visible pixel goal on ``goal.{pitch_2}`` poses.
+
+        Returns ``(relative_goal_frame_id, [u, v])`` like parquet ``pixel_goals``,
+        or ``None`` when no waypoint projects into the current lookdown view.
+        """
+        if not self.compute_pixel_goal or current_t >= num_frames - 1:
+            return None
+
+        pg_direction = self.pixel_goal_direction or "front"
+        pg_poses = self._load_poses(clip_idx)
+        if pg_direction != "front":
+            pg_poses = self._load_poses_for_direction(clip_idx, pg_direction)
+        pg_depth = self._load_depth(clip_dir, current_t, direction=pg_direction)
+
+        if isinstance(img_size, (tuple, list)):
+            proj_size: int | tuple[int, int] = (int(img_size[0]), int(img_size[1]))
+        else:
+            proj_size = int(img_size)
+
+        # InternNav precomputes relative_goal_frame_id on the full episode, not a random subsequence.
+        for fi in range(num_frames - 1, current_t, -1):
+            pg = self._compute_pixel_goal(
+                pg_poses[current_t],
+                pg_poses[fi],
+                img_size=proj_size,
+                depth_map=pg_depth,
+            )
+            if pg is None:
+                continue
+            goal_len = fi - current_t
+            if goal_len < self.system2_min_pixel_goal_len:
+                return None
+            return goal_len, pg
+        return None
+
+    def _internnav_sft_frame_kind(
+        self,
+        clip_idx: int,
+        clip_dir: Path,
+        frame_id: int,
+        num_frames: int,
+        discrete_actions: np.ndarray,
+    ) -> str | None:
+        """Return ``pixel`` / ``turn`` / ``stop`` / ``None`` (skip), mirroring NavPixelGoalDataset."""
+        if num_frames < 4:
+            return None
+        if frame_id == num_frames - 1:
+            return "stop"
+
+        action_flag = int(discrete_actions[frame_id])
+        pg_result = self._resolve_farthest_pixel_goal(
+            clip_idx, clip_dir, frame_id, num_frames, self.image_size,
+        )
+        if pg_result is None:
+            if action_flag == 1:
+                return None
+            return "turn"
+        return "pixel"
+
+    def _build_internnav_sample_index(self):
+        """Build sample index like ``NavPixelGoalDataset`` in internvla_n1_lerobot_dataset.py."""
+        self.sample_index = []
+        self._sample_subsequence_range = {}
+        sample_step = self.system2_sample_step
+        stop_repeat = self.system2_stop_oversample
+        pixel_samples = 0
+        turn_samples = 0
+        stop_samples = 0
+        skipped = 0
+
+        for clip_idx, clip_dir in enumerate(self.clips):
+            try:
+                meta = self._load_meta(clip_idx)
+                num_frames = int(meta["num_frames"])
+                if num_frames < 4:
+                    skipped += 1
+                    continue
+
+                raw_actions = self._load_discrete_actions(clip_dir)
+                if raw_actions is None or len(raw_actions) != num_frames:
+                    skipped += 1
+                    continue
+                actions = self._align_internnav_discrete_actions(raw_actions)
+                actions_len = len(actions)
+
+                num_rounds = actions_len // sample_step
+                for n in range(num_rounds + 1):
+                    start_frame_id = n * sample_step
+                    if (
+                        start_frame_id == actions_len
+                        or start_frame_id == actions_len - 1
+                        or start_frame_id < self.min_history
+                    ):
+                        continue
+
+                    kind = self._internnav_sft_frame_kind(
+                        clip_idx, clip_dir, start_frame_id, num_frames, actions,
+                    )
+                    if kind is None:
+                        continue
+                    sample_idx = len(self.sample_index)
+                    self.sample_index.append((clip_idx, start_frame_id))
+                    self._sample_subsequence_range[sample_idx] = (0, num_frames)
+                    if kind == "pixel":
+                        pixel_samples += 1
+                    elif kind == "turn":
+                        turn_samples += 1
+
+                last_frame = num_frames - 1
+                if last_frame >= self.min_history:
+                    for _ in range(stop_repeat):
+                        sample_idx = len(self.sample_index)
+                        self.sample_index.append((clip_idx, last_frame))
+                        self._sample_subsequence_range[sample_idx] = (0, num_frames)
+                        stop_samples += 1
+            except Exception as exc:
+                logger.warning("Failed to build InternNav SFT index for %s: %s", clip_dir, exc)
+                skipped += 1
+
+        if self.sample_index:
+            indices = list(range(len(self.sample_index)))
+            self._rng.shuffle(indices)
+            self.sample_index = [self.sample_index[i] for i in indices]
+            new_range = {
+                new_idx: self._sample_subsequence_range[old_idx]
+                for new_idx, old_idx in enumerate(indices)
+            }
+            self._sample_subsequence_range = new_range
+
+        logger.info(
+            "Built InternNav-style System2 SFT index: %s samples "
+            "(pixel=%s, turn=%s, stop=%s, skipped_clips=%s, sample_step=%s, min_goal_len=%s)",
+            len(self.sample_index),
+            pixel_samples,
+            turn_samples,
+            stop_samples,
+            skipped,
+            sample_step,
+            self.system2_min_pixel_goal_len,
+        )
 
     def _result_has_system2_sft_target(self, result: dict[str, Union[torch.Tensor, str, float]]) -> bool:
         if result.get("is_stop", 0.0) > 0.5 or int(result.get("discrete_action", 1)) == 0:
             return True
-        if result.get("pixel_goal") is not None:
+
+        pg = result.get("pixel_goal")
+        if pg is not None:
+            goal_len = result.get("pixel_goal_relative_len")
+            if goal_len is not None and goal_len < self.system2_min_pixel_goal_len:
+                return False
             return True
+
+        # NavPixelGoalDataset: skip forward-only frames when pixel_goal[0] == -1.
+        if int(result.get("discrete_action", 1)) == 1:
+            return bool(self.sft_include_forward)
 
         if self.sft_include_turns and result.get("turn_actions"):
             return True
+
         discrete_action = int(result.get("discrete_action", 1))
+        if self.sft_include_turns and discrete_action in (2, 3, 5):
+            return True
         if self.sft_include_forward and discrete_action == 1:
             return True
         return False
@@ -362,8 +560,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             if dm.ndim == 3 and dm.shape[-1] == 1:
                 dm = dm[:, :, 0]
             dh, dw = dm.shape[:2]
-            du = round(u_f * dw / img_size)
-            dv = round(v_f * dh / img_size)
+            du = round(u_f * dw / img_w)
+            dv = round(v_f * dh / img_h)
             du = max(0, min(dw - 1, du))
             dv = max(0, min(dh - 1, dv))
             pixel_depth = float(dm[dv, du])
@@ -671,15 +869,16 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         action_valid = trajectory_valid
         action_tensor = torch.from_numpy(action.astype(np.float32))
 
-        # 11. 离散动作
-        discrete_actions = self._load_discrete_actions(clip_dir)
-        if discrete_actions is not None and current_t < len(discrete_actions):
-            discrete_action = int(discrete_actions[current_t])
+        # 11. 离散动作（InternNav SFT 使用 actions[1:]+[0] 对齐）
+        raw_discrete_actions = self._load_discrete_actions(clip_dir)
+        system2_actions = self._system2_discrete_actions(raw_discrete_actions)
+        if system2_actions is not None and current_t < len(system2_actions):
+            discrete_action = int(system2_actions[current_t])
             is_stop = 1.0 if discrete_action == 0 else 0.0
         else:
             discrete_action = 1
             is_stop = 0.0
-        turn_actions = self._collect_turn_actions(discrete_actions, current_t)
+        turn_actions = self._collect_turn_actions(system2_actions, current_t)
 
         result = {
             "history_frames": history_frames,        # [K, 3, H, W]
@@ -700,34 +899,28 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 _SYSTEM2_ACTION_TEXT[action_code] for action_code in turn_actions
             )
 
-        # Pixel-goal SFT / bridge target: project the farthest visible
-        # future waypoint onto the configured System2 target camera.
-        # Direct panoramic SFT uses the front view; strict InternNav mode
-        # uses the front_down/lookdown view, matching goal.{pitch_2}.
-        goal_frame_idx = min(subseq_end - 1, T - 1)
-        if self.compute_pixel_goal and goal_frame_idx > current_t:
-            pg_direction = self.pixel_goal_direction or "front"
-            pg_poses = poses
-            if pg_direction != "front":
-                pg_poses = self._load_poses_for_direction(clip_idx, pg_direction)
-            pg_depth = self._load_depth(clip_dir, current_t, direction=pg_direction)
-            _img_w = img_size[0] if isinstance(img_size, tuple) else img_size
-            pg = None
-            for fi in range(goal_frame_idx, current_t, -1):
-                pg = self._compute_pixel_goal(
-                    pg_poses[current_t], pg_poses[fi],
-                    img_size=_img_w,
-                    depth_map=pg_depth,
-                )
-                if pg is not None:
-                    break
-            if pg is not None:
-                result["pixel_goal"] = pg
-            elif self.load_traj_images:
-                tv = result.get("trajectory_valid", 0.0)
-                result["trajectory_valid"] = (
-                    torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
-                )
+        # Pixel-goal SFT / bridge target: farthest visible waypoint in lookdown view.
+        # Mirrors InternNav parquet ``[relative_goal_frame_id, goal.{pitch_2}deg]``.
+        pg_result = self._resolve_farthest_pixel_goal(
+            clip_idx=clip_idx,
+            clip_dir=clip_dir,
+            current_t=current_t,
+            num_frames=T,
+            img_size=img_size,
+        )
+        if pg_result is not None:
+            goal_len, pg = pg_result
+            result["pixel_goal"] = pg
+            result["pixel_goal_relative_len"] = goal_len
+        elif self.load_traj_images:
+            tv = result.get("trajectory_valid", 0.0)
+            result["trajectory_valid"] = (
+                torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
+            )
+
+        goal_frame_idx = current_t + int(result.get("pixel_goal_relative_len", 0))
+        if result.get("pixel_goal") is None:
+            goal_frame_idx = min(subseq_end - 1, T - 1)
 
         # 12. traj_images for DualVLN visual memory.
         # InternNav stores a sequence of lookdown frames from the System 2

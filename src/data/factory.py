@@ -95,6 +95,9 @@ def build_trajectory_dataset(
         sft_include_turns=traj_cfg.get("sft_include_turns", True),
         sft_include_forward=traj_cfg.get("sft_include_forward", False),
         sft_num_future_steps=traj_cfg.get("sft_num_future_steps", 4),
+        system2_sample_step=traj_cfg.get("system2_sample_step", 4),
+        system2_min_pixel_goal_len=traj_cfg.get("system2_min_pixel_goal_len", 3),
+        system2_stop_oversample=traj_cfg.get("system2_stop_oversample", 5),
         include_stop_samples_random_subsequence=traj_cfg.get(
             "include_stop_samples_random_subsequence", False,
         ),
