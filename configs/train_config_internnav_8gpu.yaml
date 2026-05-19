@@ -7,42 +7,29 @@ paths:
   internnav_model_path: $INTERNNAV_MODEL_PATH
 
 # ============================================
-# 阶段 2: Bridge-only 适配 — 双卡版本
+# Stage2: Bridge-only — 8×A800 80GB
 # ============================================
 #
-# 与 train_config_internnav.yaml 的区别:
-#   1. gpu.devices: [0, 1, 2, 3, 4, 5, 6, 7]
-#   2. gpu.multi_gpu.enabled: true
-#   3. batch_size: 1 (每卡 1, 总有效 batch=8)
-#   4. num_workers: 4 (每卡)
+# Loads Stage1-S2 LoRA checkpoint (--load-weights); trains only:
+#   latent_queries + nextdit_action_head.cond_projector
 #
-# 启动方式 (2 卡示例):
-#   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
-#     --config configs/train_config_internnav_4gpu.yaml \
-#     --load-weights /path/to/stage1_s2_panoramic_sft/checkpoints/best.pth
+# Heavier than Stage1-S2 (frozen VLM+LoRA forward + NextDiT + traj_images),
+# so per-GPU batch is more conservative than S2 SFT yaml.
 #
-# 8×A800 请用 configs/train_config_internnav_8gpu.yaml 或 scripts/run_stage2_8gpu.sh
+# Effective global batch ≈ batch_size × 8 × grad_accum_steps (default 2×8×1=16).
+# If OOM: batch_size=1. If VRAM headroom: try batch_size=3.
 #
-# 目标:
-#   System2/Qwen/LoRA 已通过 Stage1-S2 panoramic SFT 训练好并冻结。
-#   System1 最大程度复用 InternNav checkpoint，动作侧只使用单视角 traj_images。
-#   本阶段只训练全景 System2 hidden states → System1 条件输入之间的桥接层。
-#   System2 文本/latent 协议保持 InternNav: ↓ → lookdown image → x y → 4 queries。
-#
-# ============================================
+# Base checkpoint MUST be Stage1-S2 output (not Stage1-HM / not old NextDiT-only ckpt).
 
-# ============================================
-# 数据配置
-# ============================================
 data:
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 4
+  num_workers: 6
   pin_memory: true
-  prefetch_factor: 2
-
+  prefetch_factor: 4
   dataset_type: trajectory
+  use_worker_tokenized_collator: true
 
   trajectory:
     min_history: 5
@@ -69,9 +56,6 @@ data:
     load_traj_images: true
     traj_image_size: [224, 224]
 
-# ============================================
-# 模型配置 — InternNav backbone (Qwen2.5-VL)
-# ============================================
 model:
   type: vln_pipeline
   device: cuda
@@ -137,9 +121,6 @@ model:
       enable_gradient_checkpointing: true
       warmup_steps: 0
 
-# ============================================
-# 训练策略 — bridge-only
-# ============================================
 training:
   stages:
     - name: stage2_bridge_only
@@ -168,67 +149,37 @@ training:
         - pos_encoding
         - llm_projector
 
-# ============================================
-# 优化器配置
-# ============================================
 optim:
   optimizer: adamw
   learning_rate: 1.0e-4
-  heatmap_lr: 5.0e-5
-  vis_head_lr: 2.0e-4
   nextdit_cond_projector_lr: 1.0e-4
   latent_queries_lr: 1.0e-4
-  nextdit_action_lr: 5.0e-5
   weight_decay: 0.01
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  # A800 80GB × 8: 每卡 batch=1，总有效 batch=8
-  batch_size: 1
+  batch_size: 2
   grad_accum_steps: 1
 
-# ============================================
-# 损失函数
-# ============================================
 loss:
   heatmap_loss_type: heatmap_vln
-
-  heatmap_vln:
-    lambda_vis: 1.0
-    lambda_coord: 0.2
-    lambda_kl: 0.0
-    lambda_peak: 1.0
-    lambda_neg: 1.0
-    temperature: 1.0
-    vis_pos_weight: 7.0
-    temperature_schedule:
-      enabled: false
-      mode: cosine
-      start: 1.0
-      end: 1.0
-
-  heatmap_weight: 0.2
+  heatmap_weight: 0.0
   trajectory_weight: 1.0
 
-# ============================================
-# GPU配置 — A800 80GB × 8
-# ============================================
 gpu:
   devices: [0, 1, 2, 3, 4, 5, 6, 7]
   backend: nccl
   multi_gpu:
     enabled: true
+    # Frozen NextDiT submodules may not receive grads each step.
     find_unused_parameters: true
 
-# ============================================
-# 日志与保存
-# ============================================
 log:
   save_every_epochs: 1
-  vis_every_steps: 100
-  val_vis_batches: 2
+  vis_every_steps: 200
+  val_vis_batches: 0
   max_ckpts: 5
   use_tensorboard: true
   enable_timing: true
@@ -238,17 +189,12 @@ log:
   tqdm_ncols: 120
   log_level: INFO
   diag_interval: 100
-  mid_epoch_save_every: 500
-
+  mid_epoch_save_every: 2000
   notify:
-    enabled: true
-    platform: feishu
-    webhook_url: "${FEISHU_WEBHOOK_URL}"
+    enabled: false
 
-# ============================================
-# 验证配置
-# ============================================
 validation:
+  enabled: false
   eval_every_epochs: 0
   save_best_metric: val_total_loss
   patience: 999

@@ -7,33 +7,28 @@ paths:
   internnav_model_path: $INTERNNAV_MODEL_PATH
 
 # ============================================
-# Stage1-S2: panoramic System2 SFT
+# Stage1-S2: panoramic System2 SFT — 8×A800 80GB
 # ============================================
 #
-# 目标:
-#   让 Qwen/LoRA 在全景输入下复刻 InternNav System2 协议:
-#     - pixel-goal: 先输出 "↓"，收到 lookdown 图后输出 front_down 像素 "x y"
-#     - 已完成: "STOP"
-#     - InternNav 风格离散转向: "←" / "→" / "↓"
-#   与 InternNav 对齐: 不把无 pixel-goal 的 forward 样本标成 "↑" 训练。
+# Tuned for higher GPU/CPU utilization vs train_system2_panoramic_sft_2gpu.yaml:
+#   - Larger per-GPU batch (LoRA-only SFT leaves lots of headroom at batch=1)
+#   - More DataLoader workers + prefetch (tokenized collator is CPU-heavy)
+#   - grad_accum=1 so each optimizer step does more work on GPU
+#   - Validation off during training (re-enable for final quality checks)
 #
-# 启动方式 (2 卡):
-#   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
-#     --config configs/train_system2_panoramic_sft_2gpu.yaml
+# Effective global batch ≈ batch_size × n_gpu × grad_accum_steps
+#   default: 4 × 8 × 1 = 32  (was 1 × 8 × 2 = 16 on the 2gpu yaml)
 #
-# 8×A800 请用 configs/train_system2_panoramic_sft_8gpu.yaml 或 scripts/run_stage1_s2_8gpu.sh
-#
-# 产物:
-#   checkpoint 只保存 LoRA trainable_state_dict。
-#   后续 Stage2 bridge-only 用 --load-weights 加载这个 checkpoint。
+# If OOM: lower batch_size to 3 or 2, or set gradient_checkpointing: true (already on).
+# If GPU still <90%: try batch_size=6, num_workers=8, or --max-batches smoke first.
 
 data:
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 2
+  num_workers: 6
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4
   dataset_type: trajectory
   use_worker_tokenized_collator: true
 
@@ -123,16 +118,16 @@ training:
 optim:
   optimizer: adamw
   learning_rate: 1.0e-4
-  lora_lr: 5.0e-5
+  # Slight scale-up for global batch 32 vs 16 (optional; reduce if loss unstable).
+  lora_lr: 7.0e-5
   weight_decay: 0.01
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.03
   min_lr: 1.0e-6
-  # A800 80GB × 8: 每卡 batch=1, grad_accum=2, 总有效 batch=16
-  batch_size: 1
-  grad_accum_steps: 2
+  batch_size: 4
+  grad_accum_steps: 1
 
 loss:
   heatmap_loss_type: heatmap_vln
@@ -145,7 +140,8 @@ gpu:
   backend: nccl
   multi_gpu:
     enabled: true
-    find_unused_parameters: true
+    # LoRA-only LM SFT: all trainable params participate each step.
+    find_unused_parameters: false
 
 log:
   save_every_epochs: 1
@@ -165,6 +161,7 @@ log:
     enabled: false
 
 validation:
+  enabled: false
   eval_every_epochs: 1
   save_best_metric: val_total_loss
   patience: 5
