@@ -117,6 +117,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
     ):
+        # ``VLNSlidingWindowDataset.__init__`` calls ``self._build_sample_index()``
+        # before its chunk caches / panoramic detection fields are fully
+        # initialized.  Since this class overrides that method for System2 SFT,
+        # keep the parent bootstrap on the plain sliding-window path and rebuild
+        # the InternNav index after ``super().__init__`` completes.
+        actual_require_sft_target = require_sft_target
+        self.require_sft_target = False
         self.include_stop_samples_random_subsequence = include_stop_samples_random_subsequence
         super().__init__(
             root=root,
@@ -145,7 +152,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.load_lookdown_for_system2 = load_lookdown_for_system2
         self.pixel_goal_direction = pixel_goal_direction
         self.load_history_heatmap = load_history_heatmap
-        self.require_sft_target = require_sft_target
+        self.require_sft_target = actual_require_sft_target
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
         self.sft_num_future_steps = max(int(sft_num_future_steps), 1)
@@ -161,6 +168,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self._fgr2r_mapping = {}
         if use_subinstruction:
             self._load_fgr2r_mapping(fgr2r_subinstr_path)
+
+        if self.require_sft_target:
+            self._build_sample_index()
 
         logger.info(
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
