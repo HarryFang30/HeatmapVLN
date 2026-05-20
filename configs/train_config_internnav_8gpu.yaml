@@ -14,10 +14,11 @@ paths:
 #   latent_queries + nextdit_action_head.cond_projector
 #
 # Heavier than Stage1-S2 (frozen VLM+LoRA forward + NextDiT + traj_images),
-# so per-GPU batch is more conservative than S2 SFT yaml.
+# but tuned for 8×A800 80GB throughput rather than conservative smoke runs.
 #
-# Effective global batch ≈ batch_size × 8 × grad_accum_steps (default 2×8×1=16).
-# If OOM: batch_size=1. If VRAM headroom: try batch_size=3.
+# Effective global batch ≈ batch_size × 8 × grad_accum_steps (default 6×8×1=48).
+# If OOM on long samples: batch_size=4 or temporarily enable checkpointing.
+# If memory remains below ~70GB/card and GPU util is low: try batch_size=8.
 #
 # Base checkpoint MUST be Stage1-S2 output (not Stage1-HM / not old NextDiT-only ckpt).
 
@@ -25,9 +26,9 @@ data:
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 6
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 2
   dataset_type: trajectory
   use_worker_tokenized_collator: true
 
@@ -67,7 +68,7 @@ model:
     torch_dtype: bfloat16
     attn_implementation: sdpa
     max_video_frames: -1
-    gradient_checkpointing: true
+    gradient_checkpointing: false
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
@@ -118,7 +119,7 @@ model:
       guidance_scale: 1.0
       num_sample_trajs: 32
       dav2_ckpt_path: ""
-      enable_gradient_checkpointing: true
+      enable_gradient_checkpointing: false
       warmup_steps: 0
 
 training:
@@ -160,7 +161,7 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.003
   min_lr: 1.0e-5
-  batch_size: 2
+  batch_size: 6
   grad_accum_steps: 1
 
 loss:

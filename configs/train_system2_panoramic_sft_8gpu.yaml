@@ -10,25 +10,26 @@ paths:
 # Stage1-S2: panoramic System2 SFT — 8×A800 80GB
 # ============================================
 #
-# Tuned for higher GPU/CPU utilization vs train_system2_panoramic_sft_2gpu.yaml:
-#   - Larger per-GPU batch (LoRA-only SFT leaves lots of headroom at batch=1)
-#   - More DataLoader workers + prefetch (tokenized collator is CPU-heavy)
-#   - grad_accum=1 so each optimizer step does more work on GPU
-#   - Validation off during training (re-enable for final quality checks)
+# Throughput-oriented defaults for 8×A800 80GB:
+#   - Per-GPU batch=12 to use the available memory instead of running latency-bound.
+#   - Gradient checkpointing disabled because memory is not the bottleneck on A800.
+#   - Worker-side tokenization stays enabled; num_workers=8 keeps the CPU queue warm.
+#   - Validation off during training (re-enable for final quality checks).
 #
 # Effective global batch ≈ batch_size × n_gpu × grad_accum_steps
-#   default: 4 × 8 × 1 = 32  (was 1 × 8 × 2 = 16 on the 2gpu yaml)
+#   default: 12 × 8 × 1 = 96
 #
-# If OOM: lower batch_size to 3 or 2, or set gradient_checkpointing: true (already on).
-# If GPU still <90%: try batch_size=6, num_workers=8, or --max-batches smoke first.
+# If OOM on unusually long prompts: lower batch_size to 8/6 or temporarily set
+# gradient_checkpointing=true.  If GPU util is still low and memory remains
+# below ~70GB/card, try batch_size=16 before increasing grad_accum_steps.
 
 data:
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 6
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 2
   dataset_type: trajectory
   use_worker_tokenized_collator: true
 
@@ -76,7 +77,7 @@ model:
     torch_dtype: bfloat16
     attn_implementation: sdpa
     max_video_frames: -1
-    gradient_checkpointing: true
+    gradient_checkpointing: false
     enable_packing: false
     max_seq_length: 8192
     spatial_merge_size: 2
@@ -118,15 +119,15 @@ training:
 optim:
   optimizer: adamw
   learning_rate: 1.0e-4
-  # Slight scale-up for global batch 32 vs 16 (optional; reduce if loss unstable).
-  lora_lr: 7.0e-5
+  # Global batch 96: keep LR moderate for LoRA stability.
+  lora_lr: 1.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.03
   min_lr: 1.0e-6
-  batch_size: 4
+  batch_size: 12
   grad_accum_steps: 1
 
 loss:
