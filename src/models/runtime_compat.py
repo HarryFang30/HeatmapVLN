@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.metadata
 import json
 import logging
+import os
 import sys
 import types
 from contextlib import contextmanager
