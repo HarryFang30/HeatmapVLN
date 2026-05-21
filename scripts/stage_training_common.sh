@@ -274,6 +274,7 @@ log_config_summary() {
   local config_path="$2"
 
   python - "$label" "$config_path" "$NPROC_PER_NODE" <<'PY' | while IFS= read -r line; do
+import os
 import sys
 
 import yaml
