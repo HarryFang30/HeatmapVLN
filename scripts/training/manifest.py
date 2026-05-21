@@ -73,7 +73,7 @@ def _clear_directory(path: Path) -> None:
             shutil.rmtree(child)
 
 
-def _run_git_command(project_dir: Path, args: list[str]) -> str:
+def _run_git_command(project_dir: Path, args: list[str], timeout_s: float = 5.0) -> str:
     try:
         result = subprocess.run(
             ["git", *args],
@@ -81,6 +81,7 @@ def _run_git_command(project_dir: Path, args: list[str]) -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=timeout_s,
         )
         return result.stdout.strip()
     except Exception:
@@ -91,7 +92,7 @@ def _capture_git_state(project_dir: Path) -> dict[str, Any]:
     commit = _run_git_command(project_dir, ["rev-parse", "HEAD"])
     short_commit = _run_git_command(project_dir, ["rev-parse", "--short", "HEAD"])
     branch = _run_git_command(project_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
-    status_short = _run_git_command(project_dir, ["status", "--short"])
+    status_short = _run_git_command(project_dir, ["status", "--short", "--untracked-files=no"])
     return {
         "commit": commit or None,
         "short_commit": short_commit or None,

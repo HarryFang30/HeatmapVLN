@@ -271,6 +271,7 @@ def main():
                 f"   DDP: enabled=True, world_size={dist_context.world_size}, local_rank={dist_context.local_rank}, device={dist_context.device}"
             )
 
+        logger.info("🧾 Writing run manifest...")
         _write_yaml(manifest_dir / "config.yaml", cfg)
         _write_json(manifest_dir / "args.json", vars(args))
         _write_json(manifest_dir / "git.json", _capture_git_state(project_root))
@@ -289,24 +290,31 @@ def main():
                 "world_size": dist_context.world_size,
             },
         )
+        logger.info("   ✓ Run manifest written")
 
     # ==================== TensorBoard ====================
     tb_writer = None
     if dist_context.is_main and cfg['log'].get('use_tensorboard', False):
         tb_base_cfg = cfg['log'].get('tensorboard_dir')
-        live_tb_dir = Path(tb_base_cfg) if tb_base_cfg else tb_run_dir
+        tb_parent_dir = Path(tb_base_cfg) if tb_base_cfg else None
+        live_tb_dir = (tb_parent_dir / run_dir.name) if tb_parent_dir else tb_run_dir
         if not is_resuming:
-            _clear_directory(live_tb_dir)
+            if live_tb_dir.exists():
+                _clear_directory(live_tb_dir)
+            else:
+                live_tb_dir.mkdir(parents=True, exist_ok=True)
         else:
             live_tb_dir.mkdir(parents=True, exist_ok=True)
 
-        _safe_symlink(tb_run_dir, live_tb_dir)
+        if tb_parent_dir:
+            _safe_symlink(tb_run_dir, live_tb_dir)
         tb_writer = SummaryWriter(log_dir=str(live_tb_dir))
         logger.info(f"📊 TensorBoard: {tb_run_dir}")
         logger.info(f"   实时监控目录: {live_tb_dir}")
-        logger.info(f"   autodl入口: tensorboard --logdir {live_tb_dir}")
+        logger.info(f"   autodl入口: tensorboard --logdir {tb_parent_dir or live_tb_dir}")
     if not dist_context.is_main:
         metrics_jsonl_path = None
+    _dist_barrier()
 
     cfg['loss']
 
