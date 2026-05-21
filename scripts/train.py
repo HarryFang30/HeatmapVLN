@@ -502,11 +502,20 @@ def main():
             or stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)),
         ),
     )
+    stage_train_action = bool(stage_cfg.get('train_action', True))
+    stage_train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+    nextdit_enabled = bool(
+        cfg.get('model', {})
+        .get('action_head', {})
+        .get('nextdit', {})
+        .get('enabled', False)
+    )
     use_panoramic_tokenized_collator = (
         use_worker_tokenized_collator
         and (
             cfg['model'].get('heatmap', {}).get('enable', True)
-            or stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False))
+            or stage_train_lm
+            or (stage_train_action and nextdit_enabled)
         )
         and getattr(train_dataset, '_is_panoramic', False)
         and (val_dataset is None or getattr(val_dataset, '_is_panoramic', False))

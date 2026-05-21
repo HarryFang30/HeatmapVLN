@@ -118,11 +118,18 @@ class TrajectoryConfig(_Lenient):
             raise ValueError(f"sft_num_future_steps must be >= 1, got {v}")
         return v
 
-    @field_validator("system2_sample_step", "system2_min_pixel_goal_len", "system2_stop_oversample")
+    @field_validator("system2_sample_step", "system2_min_pixel_goal_len")
     @classmethod
     def _check_positive_system2_int(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"System2 InternNav alignment parameter must be >= 1, got {v}")
+        return v
+
+    @field_validator("system2_stop_oversample")
+    @classmethod
+    def _check_nonnegative_system2_stop_oversample(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"system2_stop_oversample must be >= 0, got {v}")
         return v
 
 

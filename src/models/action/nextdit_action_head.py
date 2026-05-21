@@ -440,7 +440,7 @@ class NextDiTActionHead(nn.Module):
                 per_sample_loss = loss.mean(dim=(1, 2))
                 loss_val = (per_sample_loss * mask).sum() / mask.sum()
             else:
-                loss_val = loss.mean()
+                loss_val = loss.sum() * 0.0
         else:
             loss_val = loss.mean()
 

@@ -566,7 +566,15 @@ class VLNPipeline(nn.Module):
         if need_heatmap:
             self._ensure_heatmap_vln()
 
-        need_sequence_features = return_intermediate or return_actions
+        # NextDiT action training only consumes TRAJ latent-query states.
+        # Full projected image-token features are needed for intermediate
+        # inspection / legacy feature consumers, not for bridge-only Stage2.
+        need_projected_sequence_features = return_intermediate
+        need_traj_query_features = (
+            return_actions
+            and self.nextdit_action_head is not None
+            and self.latent_queries is not None
+        )
 
         qwen_output = None
         raw_hidden_states = None
@@ -593,12 +601,17 @@ class VLNPipeline(nn.Module):
                 qwen_input_stats["pano_history_avg"] = (
                     float(sum(panoramic_num_histories)) / max(len(panoramic_num_histories), 1)
                 )
-        should_run_qwen = need_sequence_features or use_panoramic_chain or return_lm_loss
+        should_run_qwen = (
+            need_projected_sequence_features
+            or need_traj_query_features
+            or use_panoramic_chain
+            or return_lm_loss
+        )
         if should_run_qwen:
             # ==================== Step 1: VLM backbone processing ====================
             qwen_start = time.perf_counter() if self.config.enable_runtime_timing else 0.0
             lq = None
-            if self.latent_queries is not None:
+            if need_traj_query_features:
                 lq = self.latent_queries.expand(batch_size, -1, -1).to(
                     device=self.device, dtype=self.config.dtype,
                 )
@@ -606,7 +619,7 @@ class VLNPipeline(nn.Module):
                 history_frames=history_frames,
                 current_frame=current_observation,
                 instruction=instruction_text,
-                return_hidden_states=need_sequence_features,
+                return_hidden_states=need_projected_sequence_features,
                 generate_text=False,
                 current_views=current_views,
                 history_panoramas=history_panoramas,
@@ -625,7 +638,7 @@ class VLNPipeline(nn.Module):
                 qwen_timings.setdefault('qwen_forward_s', qwen_total_s)
                 qwen_timings.setdefault('pipeline_qwen_total_s', qwen_total_s)
 
-            if need_sequence_features:
+            if need_projected_sequence_features:
                 raw_hidden_states = qwen_output.get('vision_hidden_states')
                 if raw_hidden_states is None:
                     raw_hidden_states = qwen_output.get('hidden_states')

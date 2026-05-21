@@ -42,18 +42,27 @@ data:
     clip_level_sampling: true
     samples_per_clip: 5
     val_samples_per_clip: 8
-    random_subsequence: true
+    # Keep System2 pixel-goal, visual-memory frames, and trajectory labels on
+    # the same full clip. Random subsequences can truncate the trajectory while
+    # the pixel-goal still points to the full-episode waypoint.
+    random_subsequence: false
     min_subsequence_length: 30
     subsequence_samples_per_clip: 5
     predict_horizon: 32
     action_scale: 4.0
-    enable_trajectory_augmentation: true
+    # Bridge-only training must keep trajectory labels aligned with fixed
+    # visual/text conditions; random trajectory-only augmentation breaks that.
+    enable_trajectory_augmentation: false
     use_subinstruction: true
     fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
     compute_pixel_goal: true
     load_lookdown_for_system2: true
     system2_sft_protocol: internnav
     pixel_goal_direction: front_down
+    require_sft_target: true
+    system2_sample_step: 4
+    system2_min_pixel_goal_len: 3
+    system2_stop_oversample: 0
     load_traj_images: true
     traj_image_size: [224, 224]
 

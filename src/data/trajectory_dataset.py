@@ -158,7 +158,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.sft_num_future_steps = max(int(sft_num_future_steps), 1)
         self.system2_sample_step = max(int(system2_sample_step), 1)
         self.system2_min_pixel_goal_len = max(int(system2_min_pixel_goal_len), 1)
-        self.system2_stop_oversample = max(int(system2_stop_oversample), 1)
+        self.system2_stop_oversample = max(int(system2_stop_oversample), 0)
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
@@ -328,6 +328,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     )
                     if kind is None:
                         continue
+                    if self.load_traj_images and kind != "pixel":
+                        continue
                     sample_idx = len(self.sample_index)
                     self.sample_index.append((clip_idx, start_frame_id))
                     self._sample_subsequence_range[sample_idx] = (0, num_frames)
@@ -337,7 +339,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                         turn_samples += 1
 
                 last_frame = num_frames - 1
-                if last_frame >= self.min_history:
+                if not self.load_traj_images and last_frame >= self.min_history:
                     for _ in range(stop_repeat):
                         sample_idx = len(self.sample_index)
                         self.sample_index.append((clip_idx, last_frame))
@@ -939,40 +941,46 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # goal itself is carried by the generated text / latent queries,
         # not by replacing the anchor with a privileged future goal view.
         if self.load_traj_images:
-            traj_view = "front_down"
-            goal_len = max(goal_frame_idx - current_t, 1)
-            interval = 2
-            frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
-            if len(frame_offsets) == 0:
-                frame_offsets = np.array([0], dtype=np.int32)
-            if len(frame_offsets) > self.traj_sequence_max_len:
-                interval = int(np.ceil(goal_len / self.traj_sequence_max_len))
-                frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)[:self.traj_sequence_max_len]
-
-            traj_imgs_list: list[np.ndarray] = []
-            traj_poses_list: list[np.ndarray] = []
-            traj_valid_list: list[float] = []
-            try:
-                for offset in frame_offsets:
-                    frame_idx = min(current_t + int(offset), goal_frame_idx)
-                    curr_img = self._load_traj_image_raw(clip_dir, frame_idx, direction=traj_view)
-                    traj_i, valid_i, _progress_i = self._compute_trajectory(
-                        action_poses, frame_idx, subseq_end, current_t,
-                        camera_deg=action_camera_deg,
-                    )
-                    if self.enable_trajectory_augmentation and valid_i > 0:
-                        traj_i = apply_trajectory_augmentation(traj_i, p=0.5)
-                    traj_imgs_list.append(curr_img)
-                    traj_poses_list.append(traj_i)
-                    traj_valid_list.append(valid_i)
-            except (FileNotFoundError, ValueError, KeyError, OSError):
-                traj_imgs_list = []
-
-            if not traj_imgs_list:
+            if result.get("pixel_goal") is None:
                 th, tw = self.traj_image_size[1], self.traj_image_size[0]
                 traj_imgs_list = [np.zeros((th, tw, 3), dtype=np.uint8)]
-                traj_poses_list = [trajectory]
-                traj_valid_list = [trajectory_valid]
+                traj_poses_list = [np.zeros((self.predict_horizon, 3), dtype=np.float32)]
+                traj_valid_list = [0.0]
+            else:
+                traj_view = "front_down"
+                goal_len = max(goal_frame_idx - current_t, 1)
+                interval = 2
+                frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
+                if len(frame_offsets) == 0:
+                    frame_offsets = np.array([0], dtype=np.int32)
+                if len(frame_offsets) > self.traj_sequence_max_len:
+                    interval = int(np.ceil(goal_len / self.traj_sequence_max_len))
+                    frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)[:self.traj_sequence_max_len]
+
+                traj_imgs_list = []
+                traj_poses_list = []
+                traj_valid_list = []
+                try:
+                    for offset in frame_offsets:
+                        frame_idx = min(current_t + int(offset), goal_frame_idx)
+                        curr_img = self._load_traj_image_raw(clip_dir, frame_idx, direction=traj_view)
+                        traj_i, valid_i, _progress_i = self._compute_trajectory(
+                            action_poses, frame_idx, subseq_end, current_t,
+                            camera_deg=action_camera_deg,
+                        )
+                        if self.enable_trajectory_augmentation and valid_i > 0:
+                            traj_i = apply_trajectory_augmentation(traj_i, p=0.5)
+                        traj_imgs_list.append(curr_img)
+                        traj_poses_list.append(traj_i)
+                        traj_valid_list.append(valid_i)
+                except (FileNotFoundError, ValueError, KeyError, OSError):
+                    traj_imgs_list = []
+
+                if not traj_imgs_list:
+                    th, tw = self.traj_image_size[1], self.traj_image_size[0]
+                    traj_imgs_list = [np.zeros((th, tw, 3), dtype=np.uint8)]
+                    traj_poses_list = [np.zeros((self.predict_horizon, 3), dtype=np.float32)]
+                    traj_valid_list = [0.0]
 
             pad_len = self.traj_sequence_max_len - len(traj_imgs_list)
             if pad_len > 0:

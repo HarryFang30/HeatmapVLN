@@ -204,6 +204,8 @@ if env("PIN_MEMORY") is not None:
 trajectory = data.setdefault("trajectory", {})
 set_int(trajectory, "num_history_sample", env("NUM_HISTORY_SAMPLE"))
 set_bool(trajectory, "panoramic_vlm_input", env("PANORAMIC_VLM_INPUT"))
+set_bool(trajectory, "random_subsequence", env("RANDOM_SUBSEQUENCE"))
+set_bool(trajectory, "enable_trajectory_augmentation", env("ENABLE_TRAJECTORY_AUGMENTATION"))
 
 llm = cfg.setdefault("model", {}).setdefault("llm", {})
 attn_impl = env("LLM_ATTN_IMPLEMENTATION")
@@ -329,6 +331,13 @@ print(
         trajectory.get("num_history_sample"),
         trajectory.get("panoramic_vlm_input"),
         trajectory.get("load_lookdown_for_system2"),
+    )
+)
+print(
+    "  trajectory.random_subsequence=%s, enable_trajectory_augmentation=%s"
+    % (
+        trajectory.get("random_subsequence"),
+        trajectory.get("enable_trajectory_augmentation"),
     )
 )
 print(

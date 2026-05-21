@@ -200,19 +200,26 @@ def validate(
 
             if train_action:
                 if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
-                    if 'trajectory' in batch and 'traj_hidden_states' in output:
-                        gt_trajectory = batch['trajectory'].to(device)
-                        trajectory_valid = batch['trajectory_valid'].to(device)
-                        traj_images = batch.get('traj_images')
-                        if traj_images is not None:
-                            traj_images = traj_images.to(device)
-                        traj_result = model_module.nextdit_action_head.compute_loss(
-                            output['traj_hidden_states'],
-                            gt_trajectory,
-                            traj_images=traj_images,
-                            trajectory_valid=trajectory_valid,
+                    if 'trajectory' not in batch:
+                        raise RuntimeError(
+                            "train_action=True but validation batch has no trajectory target."
                         )
-                        trajectory_loss = traj_result['loss']
+                    if 'traj_hidden_states' not in output:
+                        raise RuntimeError(
+                            "train_action=True but validation output has no traj_hidden_states."
+                        )
+                    gt_trajectory = batch['trajectory'].to(device)
+                    trajectory_valid = batch['trajectory_valid'].to(device)
+                    traj_images = batch.get('traj_images')
+                    if traj_images is not None:
+                        traj_images = traj_images.to(device)
+                    traj_result = model_module.nextdit_action_head.compute_loss(
+                        output['traj_hidden_states'],
+                        gt_trajectory,
+                        traj_images=traj_images,
+                        trajectory_valid=trajectory_valid,
+                    )
+                    trajectory_loss = traj_result['loss']
 
             lm_loss = torch.tensor(0.0, device=device)
             if train_lm:

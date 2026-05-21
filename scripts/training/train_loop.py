@@ -52,6 +52,41 @@ from .visualization import (
 logger = logging.getLogger(__name__)
 
 
+def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, logger) -> None:
+    """Keep frozen Stage2 components in eval mode while bridge params train.
+
+    ``model.train()`` recursively switches every child module to training mode.
+    In bridge-only Stage2 most of those children are frozen conditions
+    (Qwen/LoRA, visual memory, NextDiT).  Leaving them in train mode can enable
+    dropout/stochastic-depth noise even though their weights are frozen.
+    """
+    if not stage_cfg.get("bridge_only", False):
+        return
+
+    vlm_backbone = getattr(model_module, "vlm_backbone", getattr(model_module, "qwen2_5_vl", None))
+    if vlm_backbone is not None:
+        # Keep the VLM itself in train mode so Transformers gradient
+        # checkpointing remains active, but disable frozen dropout noise.
+        for submodule in vlm_backbone.modules():
+            if isinstance(submodule, torch.nn.Dropout):
+                submodule.eval()
+
+    if getattr(model_module, "heatmap_vln", None) is not None:
+        model_module.heatmap_vln.eval()
+
+    if getattr(model_module, "llm_projector", None) is not None:
+        model_module.llm_projector.eval()
+
+    nah = getattr(model_module, "nextdit_action_head", None)
+    if nah is not None:
+        nah.eval()
+        if "cond_projector" in set(stage_cfg.get("trainable_modules", [])):
+            # No dropout here, but keep the trainable bridge explicitly marked.
+            nah.cond_projector.train()
+
+    logger.info("  Bridge-only mode: frozen System1 eval; frozen VLM dropout disabled")
+
+
 def train_one_epoch(
     model: VLNPipeline,
     train_loader: DataLoader,
@@ -86,6 +121,7 @@ def train_one_epoch(
     )
     model_module = _unwrap_model(model)
     model.train()
+    _apply_bridge_only_train_mode(model_module, stage_cfg or {}, logger)
     synced_trainable_modules = (
         _get_supported_trainable_sync_modules(model_module, stage_cfg)
         if dist_context.enabled
@@ -282,19 +318,29 @@ def train_one_epoch(
 
             if train_action:
                 if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
-                    if 'trajectory' in batch and 'traj_hidden_states' in output:
-                        gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
-                        trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
-                        traj_images = batch.get('traj_images')
-                        if traj_images is not None:
-                            traj_images = traj_images.to(device, non_blocking=True)
-                        traj_result = model_module.nextdit_action_head.compute_loss(
-                            output['traj_hidden_states'],
-                            gt_trajectory,
-                            traj_images=traj_images,
-                            trajectory_valid=trajectory_valid,
+                    if 'trajectory' not in batch:
+                        raise RuntimeError(
+                            "train_action=True but batch has no trajectory target. "
+                            "Check the trajectory dataset/collator configuration."
                         )
-                        trajectory_loss = traj_result['loss']
+                    if 'traj_hidden_states' not in output:
+                        raise RuntimeError(
+                            "train_action=True but model output has no traj_hidden_states. "
+                            "Check that the panoramic tokenized collator is enabled and "
+                            "that TRAJ latent queries are being passed to Qwen."
+                        )
+                    gt_trajectory = batch['trajectory'].to(device, non_blocking=True)
+                    trajectory_valid = batch['trajectory_valid'].to(device, non_blocking=True)
+                    traj_images = batch.get('traj_images')
+                    if traj_images is not None:
+                        traj_images = traj_images.to(device, non_blocking=True)
+                    traj_result = model_module.nextdit_action_head.compute_loss(
+                        output['traj_hidden_states'],
+                        gt_trajectory,
+                        traj_images=traj_images,
+                        trajectory_valid=trajectory_valid,
+                    )
+                    trajectory_loss = traj_result['loss']
 
             lm_loss = torch.tensor(0.0, device=device)
             if train_lm:

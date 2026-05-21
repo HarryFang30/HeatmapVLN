@@ -1048,8 +1048,11 @@ class Qwen2_5VLIntegration(nn.Module):
                     inputs["video_grid_thw"][:, 0] = 1
             t1 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
 
-        need_grad = return_lm_loss or return_hidden_states or (
-            heatmap_vln is not None and self.config.heatmap_trains_backbone
+        need_grad = (
+            return_lm_loss
+            or return_hidden_states
+            or latent_queries is not None
+            or (heatmap_vln is not None and self.config.heatmap_trains_backbone)
         )
         skip_lm = (heatmap_vln is None) and not return_lm_loss
         if need_grad:
