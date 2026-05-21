@@ -388,9 +388,25 @@ def train_one_epoch(
                     gname = optimizer.param_groups[gi].get('name', f'g{gi}')
                     lr_strs.append(f"{gname}={lr_val:.2e}")
                 lr_display = ", ".join(lr_strs)
-                gpu_mem_str = f" | GPU: {torch.cuda.memory_allocated() / 1024**3:.1f}GB" if show_gpu_memory else ""
+                gpu_mem_str = ""
+                if show_gpu_memory:
+                    gpu_mem_str = (
+                        f" | GPU: alloc={torch.cuda.memory_allocated() / 1024**3:.1f}GB"
+                        f" reserved={torch.cuda.memory_reserved() / 1024**3:.1f}GB"
+                        f" max={torch.cuda.max_memory_allocated() / 1024**3:.1f}GB"
+                    )
                 traj_str = f", traj: {trajectory_loss.item():.4f}" if trajectory_loss.item() > 0 else ""
                 lm_str = f", lm: {lm_loss.item():.4f}" if train_lm else ""
+                metadata = output.get('processing_metadata', {}) if isinstance(output, dict) else {}
+                input_stats_str = ""
+                if metadata.get('pano_seq_len') is not None:
+                    input_stats_str = (
+                        f" | In: L={metadata.get('pano_seq_len')} "
+                        f"img_groups={metadata.get('pano_image_groups', 0)} "
+                        f"vid_groups={metadata.get('pano_video_groups', 0)} "
+                        f"img_tok={metadata.get('num_image_tokens', 0)} "
+                        f"hist_max={metadata.get('pano_history_max', 0)}"
+                    )
                 logger.info(
                     f"[{stage_name}] "
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
@@ -400,6 +416,7 @@ def train_one_epoch(
                     f"(hm: {heatmap_loss.item():.4f}{traj_str}{lm_str}) | "
                     f"LR: [{lr_display}]"
                     + gpu_mem_str
+                    + input_stats_str
                     + (
                         (
                             f" | T[s] data={_mean_timing(timing_stats, profiled_steps, 'data_wait_s'):.3f} "

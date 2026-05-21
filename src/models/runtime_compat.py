@@ -24,6 +24,10 @@ LOGGER = logging.getLogger(__name__)
 _HF_HUB_RELAXED_VERSION = "0.36.0"
 
 
+def _env_truthy(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def install_numpy_legacy_aliases() -> None:
     """Restore NumPy 1.x aliases expected by older third-party code."""
     if "float" not in np.__dict__:
@@ -227,15 +231,38 @@ def ensure_transformers_runtime_compat(
 
     flash_attn_available = False
     flash_attn_stubbed = False
+    require_flash_attn = (
+        requested_attn_implementation == "flash_attention_2"
+        and _env_truthy("HEATMAPVLN_REQUIRE_FLASH_ATTN")
+    )
     if _is_flash_attn_stubbed():
         flash_attn_stubbed = True
+        if require_flash_attn:
+            raise RuntimeError(
+                "HEATMAPVLN_REQUIRE_FLASH_ATTN=1 but flash_attn is stubbed. "
+                "Install a working flash-attn build for this CUDA/PyTorch stack, "
+                "or set STAGE1_S2_REQUIRE_FLASH_ATTN=0 to allow slow SDPA fallback."
+            )
     else:
         try:
             importlib.import_module("flash_attn")
             flash_attn_available = True
         except ModuleNotFoundError:
+            if require_flash_attn:
+                raise RuntimeError(
+                    "Stage1-S2 requested flash_attention_2 but flash_attn is not installed. "
+                    "On 8xA800 panoramic SFT this usually causes SDPA to run extremely slowly. "
+                    "Install flash-attn in the qwen25 environment, or set "
+                    "STAGE1_S2_REQUIRE_FLASH_ATTN=0 to allow slow SDPA fallback."
+                )
             log.info("flash_attn is not installed in the shared environment; SDPA path remains enabled")
         except Exception as exc:
+            if require_flash_attn:
+                raise RuntimeError(
+                    "Stage1-S2 requested flash_attention_2 but flash_attn failed to import. "
+                    "Install a working flash-attn build for this CUDA/PyTorch stack, "
+                    "or set STAGE1_S2_REQUIRE_FLASH_ATTN=0 to allow slow SDPA fallback."
+                ) from exc
             flash_attn_stubbed = True
             install_flash_attn_stub(log)
             if requested_attn_implementation == "flash_attention_2":

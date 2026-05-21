@@ -179,6 +179,11 @@ def set_int(section: dict, key: str, value: str | None) -> None:
         section[key] = int(value)
 
 
+def set_bool(section: dict, key: str, value: str | None) -> None:
+    if value is not None and str(value).strip() != "":
+        section[key] = str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 with open(base_config, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
@@ -195,6 +200,16 @@ set_int(data, "num_workers", env("NUM_WORKERS"))
 set_int(data, "prefetch_factor", env("PREFETCH_FACTOR"))
 if env("PIN_MEMORY") is not None:
     data["pin_memory"] = env_bool("PIN_MEMORY")
+
+trajectory = data.setdefault("trajectory", {})
+set_int(trajectory, "num_history_sample", env("NUM_HISTORY_SAMPLE"))
+set_bool(trajectory, "panoramic_vlm_input", env("PANORAMIC_VLM_INPUT"))
+
+llm = cfg.setdefault("model", {}).setdefault("llm", {})
+attn_impl = env("LLM_ATTN_IMPLEMENTATION")
+if attn_impl:
+    llm["attn_implementation"] = attn_impl
+set_bool(llm, "gradient_checkpointing", env("LLM_GRADIENT_CHECKPOINTING"))
 
 optim = cfg.setdefault("optim", {})
 set_int(optim, "batch_size", env("BATCH_SIZE"))
@@ -269,6 +284,7 @@ with open(config_path, "r", encoding="utf-8") as f:
 
 optim = cfg.get("optim", {}) or {}
 data = cfg.get("data", {}) or {}
+trajectory = data.get("trajectory", {}) or {}
 model = cfg.get("model", {}) or {}
 llm = (model.get("llm", {}) or {})
 stages = ((cfg.get("training", {}) or {}).get("stages", []) or [{}])
@@ -284,11 +300,12 @@ print(
     % (batch_size, grad_accum, world_size, global_batch)
 )
 print(
-    "  epochs=%s, llm.gradient_checkpointing=%s, attn=%s"
+    "  epochs=%s, llm.gradient_checkpointing=%s, attn=%s, require_flash_attn=%s"
     % (
         stage.get("epochs"),
         llm.get("gradient_checkpointing"),
         llm.get("attn_implementation"),
+        os.environ.get("HEATMAPVLN_REQUIRE_FLASH_ATTN", ""),
     )
 )
 print(
@@ -297,6 +314,14 @@ print(
         data.get("num_workers"),
         data.get("prefetch_factor"),
         data.get("pin_memory"),
+    )
+)
+print(
+    "  trajectory.num_history_sample=%s, panoramic_vlm_input=%s, load_lookdown_for_system2=%s"
+    % (
+        trajectory.get("num_history_sample"),
+        trajectory.get("panoramic_vlm_input"),
+        trajectory.get("load_lookdown_for_system2"),
     )
 )
 PY

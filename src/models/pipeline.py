@@ -573,6 +573,26 @@ class VLNPipeline(nn.Module):
         llm_tokens = None
         heatmap_output = None
         qwen_timings = None
+        qwen_input_stats: dict[str, Any] = {}
+        if panoramic_inputs is not None:
+            input_ids = panoramic_inputs.get("input_ids")
+            if input_ids is not None:
+                qwen_input_stats["pano_batch_size"] = int(input_ids.shape[0])
+                qwen_input_stats["pano_seq_len"] = int(input_ids.shape[1])
+            image_grid = panoramic_inputs.get("image_grid_thw")
+            if image_grid is not None:
+                qwen_input_stats["pano_image_groups"] = int(image_grid.shape[0])
+            video_grid = panoramic_inputs.get("video_grid_thw")
+            if video_grid is not None:
+                qwen_input_stats["pano_video_groups"] = int(video_grid.shape[0])
+            pixel_values = panoramic_inputs.get("pixel_values")
+            if pixel_values is not None:
+                qwen_input_stats["pano_pixel_values"] = int(pixel_values.shape[0])
+            if panoramic_num_histories is not None:
+                qwen_input_stats["pano_history_max"] = int(max(panoramic_num_histories))
+                qwen_input_stats["pano_history_avg"] = (
+                    float(sum(panoramic_num_histories)) / max(len(panoramic_num_histories), 1)
+                )
         should_run_qwen = need_sequence_features or use_panoramic_chain or return_lm_loss
         if should_run_qwen:
             # ==================== Step 1: VLM backbone processing ====================
@@ -601,7 +621,9 @@ class VLNPipeline(nn.Module):
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
                 qwen_timings = dict(qwen_output.get('timings', {}) or {})
-                qwen_timings.setdefault('pipeline_qwen_total_s', qwen_end - qwen_start)
+                qwen_total_s = qwen_end - qwen_start
+                qwen_timings.setdefault('qwen_forward_s', qwen_total_s)
+                qwen_timings.setdefault('pipeline_qwen_total_s', qwen_total_s)
 
             if need_sequence_features:
                 raw_hidden_states = qwen_output.get('vision_hidden_states')
@@ -646,6 +668,11 @@ class VLNPipeline(nn.Module):
                 'batch_size': batch_size,
                 'llm_token_shape': None if llm_tokens is None else llm_tokens.shape,
                 'timings': qwen_timings,
+                'num_image_tokens': (
+                    qwen_output.get('num_image_tokens')
+                    if isinstance(qwen_output, dict) else None
+                ),
+                **qwen_input_stats,
             },
         }
 

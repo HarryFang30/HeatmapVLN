@@ -13,8 +13,10 @@ paths:
 # Throughput-oriented defaults for 8×A800 80GB:
 #   - Per-GPU batch=8 keeps a large global batch while leaving headroom for
 #     Qwen2.5-VL visual attention peaks on panoramic inputs.
-#   - Gradient checkpointing stays enabled; batch=12 without checkpointing
-#     OOMed at the first visual-attention batch on 80GB A800.
+#   - FlashAttention2 is required on A800.  SDPA on the panoramic multi-image
+#     prompt is memory-heavy and can be an order of magnitude slower.
+#   - Gradient checkpointing stays enabled initially; after FlashAttention2 is
+#     confirmed, try disabling it if memory has enough headroom.
 #   - Worker-side tokenization stays enabled; num_workers=8 keeps the CPU queue warm.
 #   - Validation off during training (re-enable for final quality checks).
 #
@@ -76,7 +78,7 @@ model:
     hidden_dim: 3584
     token_dim: 896
     torch_dtype: bfloat16
-    attn_implementation: sdpa
+    attn_implementation: flash_attention_2
     max_video_frames: -1
     gradient_checkpointing: true
     enable_packing: false
