@@ -211,6 +211,9 @@ if attn_impl:
     llm["attn_implementation"] = attn_impl
 set_bool(llm, "gradient_checkpointing", env("LLM_GRADIENT_CHECKPOINTING"))
 
+heatmap = cfg.setdefault("model", {}).setdefault("heatmap", {})
+set_bool(heatmap, "enable", env("HEATMAP_ENABLE"))
+
 optim = cfg.setdefault("optim", {})
 set_int(optim, "batch_size", env("BATCH_SIZE"))
 set_int(optim, "grad_accum_steps", env("GRAD_ACCUM_STEPS"))
@@ -288,6 +291,9 @@ data = cfg.get("data", {}) or {}
 trajectory = data.get("trajectory", {}) or {}
 model = cfg.get("model", {}) or {}
 llm = (model.get("llm", {}) or {})
+heatmap = (model.get("heatmap", {}) or {})
+action_head = (model.get("action_head", {}) or {})
+nextdit = (action_head.get("nextdit", {}) or {})
 stages = ((cfg.get("training", {}) or {}).get("stages", []) or [{}])
 stage = stages[0] if stages else {}
 
@@ -323,6 +329,14 @@ print(
         trajectory.get("num_history_sample"),
         trajectory.get("panoramic_vlm_input"),
         trajectory.get("load_lookdown_for_system2"),
+    )
+)
+print(
+    "  heatmap.enable=%s, action_head.enable=%s, nextdit.enabled=%s"
+    % (
+        heatmap.get("enable"),
+        action_head.get("enable"),
+        nextdit.get("enabled"),
     )
 )
 PY
