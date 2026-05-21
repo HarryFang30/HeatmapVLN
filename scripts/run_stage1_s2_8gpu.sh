@@ -45,6 +45,7 @@ export STAGE1_S2_NUM_WORKERS STAGE1_S2_PREFETCH_FACTOR STAGE1_S2_PIN_MEMORY
 export STAGE1_S2_FEISHU_NOTIFY
 
 make_stage_config STAGE1_S2 "$STAGE1_S2_CONFIG" "$STAGE1_S2_TMP_CONFIG"
+log_config_summary "Stage1-S2" "$STAGE1_S2_TMP_CONFIG"
 
 log "Stage: Stage1-S2 panoramic System2 SFT"
 log "Repo root: $ROOT_DIR"

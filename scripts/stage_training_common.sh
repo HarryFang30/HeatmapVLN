@@ -254,6 +254,56 @@ with open(output_config, "w", encoding="utf-8") as f:
 PY
 }
 
+log_config_summary() {
+  local label="$1"
+  local config_path="$2"
+
+  python - "$label" "$config_path" "$NPROC_PER_NODE" <<'PY' | while IFS= read -r line; do
+import sys
+
+import yaml
+
+label, config_path, world_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(config_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+optim = cfg.get("optim", {}) or {}
+data = cfg.get("data", {}) or {}
+model = cfg.get("model", {}) or {}
+llm = (model.get("llm", {}) or {})
+stages = ((cfg.get("training", {}) or {}).get("stages", []) or [{}])
+stage = stages[0] if stages else {}
+
+batch_size = int(optim.get("batch_size", 0) or 0)
+grad_accum = int(optim.get("grad_accum_steps", 1) or 1)
+global_batch = batch_size * world_size * grad_accum
+
+print(f"{label} effective config:")
+print(
+    "  batch_size=%s, grad_accum_steps=%s, world_size=%s, effective_global_batch=%s"
+    % (batch_size, grad_accum, world_size, global_batch)
+)
+print(
+    "  epochs=%s, llm.gradient_checkpointing=%s, attn=%s"
+    % (
+        stage.get("epochs"),
+        llm.get("gradient_checkpointing"),
+        llm.get("attn_implementation"),
+    )
+)
+print(
+    "  num_workers=%s, prefetch_factor=%s, pin_memory=%s"
+    % (
+        data.get("num_workers"),
+        data.get("prefetch_factor"),
+        data.get("pin_memory"),
+    )
+)
+PY
+    log "$line"
+  done
+}
+
 run_training_stage() {
   local name="$1"
   local master_port="$2"
