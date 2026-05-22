@@ -661,7 +661,30 @@ def _load_progress(progress_file: str) -> tuple[list[float], list[float], list[f
     return sucs, spls, oss, nes, done_set
 
 
-def _eval_limit(args, remaining: int) -> int:
+def _load_episode_list(path: str) -> tuple[list[tuple[str, int]], set[tuple[str, int]]]:
+    """Load fixed (scene_id, episode_id) pairs for apples-to-apples comparison."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    episodes = data.get("episodes", data)
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError(f"episode_list must contain a non-empty 'episodes' array: {path}")
+    keys: list[tuple[str, int]] = []
+    for item in episodes:
+        keys.append((str(item["scene_id"]), int(item["episode_id"])))
+    return keys, set(keys)
+
+
+def _episode_list_from_args(args) -> tuple[list[tuple[str, int]] | None, set[tuple[str, int]] | None]:
+    path = getattr(args, "episode_list", None)
+    if not path:
+        return None, None
+    return _load_episode_list(path)
+
+
+def _eval_limit(args, remaining: int, target_list: list[tuple[str, int]] | None = None,
+                done_set: set | None = None) -> int:
+    if target_list is not None:
+        done = done_set or set()
+        return sum(1 for key in target_list if key not in done)
     if args.max_episodes is None:
         return remaining
     return min(remaining, max(args.max_episodes, 0))
@@ -1234,8 +1257,11 @@ def _run_eval_panoramic_vlm(
     progress_file = _prepare_progress_file(args, output_path)
     sucs, spls, oss, nes, done_set = _load_progress(progress_file)
 
+    target_list, target_set = _episode_list_from_args(args)
+    if target_list is not None:
+        print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
-    eval_limit = _eval_limit(args, remaining)
+    eval_limit = _eval_limit(args, remaining, target_list, done_set)
     print(
         f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
         f"this run: {eval_limit}"
@@ -1258,6 +1284,9 @@ def _run_eval_panoramic_vlm(
         if ep_key in seen_episodes:
             break
         seen_episodes.add(ep_key)
+
+        if target_set is not None and ep_key not in target_set:
+            continue
 
         if ep_key in done_set:
             continue
@@ -1610,8 +1639,11 @@ def run_eval(args):
     progress_file = _prepare_progress_file(args, output_path)
     sucs, spls, oss, nes, done_set = _load_progress(progress_file)
 
+    target_list, target_set = _episode_list_from_args(args)
+    if target_list is not None:
+        print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
-    eval_limit = _eval_limit(args, remaining)
+    eval_limit = _eval_limit(args, remaining, target_list, done_set)
     print(
         f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
         f"this run: {eval_limit}"
@@ -1635,6 +1667,9 @@ def run_eval(args):
         if ep_key in seen_episodes:
             break
         seen_episodes.add(ep_key)
+
+        if target_set is not None and ep_key not in target_set:
+            continue
 
         if ep_key in done_set:
             continue
@@ -1967,6 +2002,8 @@ def main():
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
     parser.add_argument("--max_episodes", type=int, default=None,
                         help="Evaluate at most this many new episodes")
+    parser.add_argument("--episode_list", type=str, default=None,
+                        help="JSON file with fixed episodes [{scene_id, episode_id}, ...]")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from output_path/progress.json")
     parser.add_argument("--overwrite_output", action="store_true",
