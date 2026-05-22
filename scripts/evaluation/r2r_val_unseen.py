@@ -259,6 +259,65 @@ class ActionCode(IntEnum):
     LOOKDOWN = 5
 
 
+def _normalize_instruction(instruction: str) -> str:
+    """Match InternNav eval: drop trailing sentence punctuation in prompts."""
+    if instruction.endswith((".", "!", "?")):
+        return instruction[:-1]
+    return instruction
+
+
+def _finalize_local_actions(action_list: list[int]) -> list[int]:
+    """Pad to MAX_STEPS then cap to MAX_LOCAL_STEPS (InternNav dual_system)."""
+    if len(action_list) < MAX_STEPS:
+        action_list = list(action_list) + [ActionCode.STOP] * (MAX_STEPS - len(action_list))
+    if len(action_list) >= MAX_LOCAL_STEPS:
+        action_list = action_list[:MAX_LOCAL_STEPS]
+    return action_list
+
+
+_RGB_SENSOR_KEYS = (
+    "rgb",
+    "RGB_SENSOR",
+    "color_sensor",
+    "rgba_camera",
+    "rgb_camera",
+    "color",
+)
+_panoramic_sensor_warned = False
+
+
+def _extract_rgb_array(observations: dict) -> np.ndarray | None:
+    """Resolve RGB from Habitat task or sim sensor observations."""
+    for key in _RGB_SENSOR_KEYS:
+        value = observations.get(key)
+        if isinstance(value, np.ndarray) and value.ndim >= 2:
+            return value
+
+    for key, value in observations.items():
+        if not isinstance(value, np.ndarray) or value.ndim < 2:
+            continue
+        key_lower = str(key).lower()
+        if "depth" in key_lower:
+            continue
+        if value.ndim == 3 and value.shape[-1] in (3, 4):
+            return value
+        if value.ndim == 2:
+            return value
+    return None
+
+
+def _rgb_array_to_pil(rgb: np.ndarray, image_size: tuple | None = None) -> Image.Image:
+    arr = np.asarray(rgb)
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        arr = arr[:, :, :3]
+    elif arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    img = Image.fromarray(arr.astype(np.uint8)).convert("RGB")
+    if image_size is not None:
+        img = img.resize(image_size)
+    return img
+
+
 def split_and_clean(text: str) -> list[str]:
     """Split by <image> while preserving the token and removing blank text chunks."""
     parts = re.split(r"(<image>)", text)
@@ -726,12 +785,19 @@ def capture_panoramic_views(
             agent.set_state(state, reset_sensors=True)
 
         obs = sim.get_sensor_observations()
-        rgb = obs.get("rgba_camera", obs.get("color_sensor", obs.get("rgb")))
-        if isinstance(rgb, np.ndarray):
-            if rgb.ndim == 3 and rgb.shape[-1] == 4:
-                rgb = rgb[:, :, :3]
-            views[name] = Image.fromarray(rgb).convert("RGB").resize(image_size)
+        rgb = _extract_rgb_array(obs)
+        if rgb is not None:
+            views[name] = _rgb_array_to_pil(rgb, image_size)
         else:
+            global _panoramic_sensor_warned
+            if not _panoramic_sensor_warned:
+                available = sorted(obs.keys())
+                print(
+                    "WARNING: could not find RGB in sim sensor observations; "
+                    f"using black placeholders. Available keys: {available}",
+                    flush=True,
+                )
+                _panoramic_sensor_warned = True
             views[name] = Image.fromarray(
                 np.zeros((*image_size[::-1], 3), dtype=np.uint8)
             )
@@ -750,8 +816,10 @@ def capture_lookdown_view(env, image_size: tuple = (224, 224)) -> Image.Image:
     env.step(ActionCode.LOOKDOWN)
     obs = env.step(ActionCode.LOOKDOWN)
 
-    rgb = obs["rgb"]
-    lookdown_img = Image.fromarray(rgb).convert("RGB").resize(image_size)
+    rgb = _extract_rgb_array(obs)
+    if rgb is None:
+        rgb = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
+    lookdown_img = _rgb_array_to_pil(rgb, image_size)
 
     env.step(ActionCode.LOOKUP)
     env.step(ActionCode.LOOKUP)
@@ -1024,7 +1092,7 @@ def _run_eval_panoramic_vlm(
         if ep_key in done_set:
             continue
 
-        instruction = episode.instruction.instruction_text
+        instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(
             f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
@@ -1043,7 +1111,7 @@ def _run_eval_panoramic_vlm(
         step_id = 0
         done = False
 
-        while (not done) and (step_id < max_steps_per_episode):
+        while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
 
             if local_actions:
@@ -1087,17 +1155,13 @@ def _run_eval_panoramic_vlm(
                         traj_images=traj_images,
                     )
 
-                local_actions = traj_to_actions(
-                    trajectory,
-                    num_sample_trajs=num_sample_trajs,
-                    action_scale=action_scale,
-                )
-                if len(local_actions) < MAX_STEPS:
-                    local_actions = list(local_actions) + [ActionCode.STOP] * (
-                        MAX_STEPS - len(local_actions)
+                local_actions = _finalize_local_actions(
+                    traj_to_actions(
+                        trajectory,
+                        num_sample_trajs=num_sample_trajs,
+                        action_scale=action_scale,
                     )
-                if len(local_actions) >= MAX_LOCAL_STEPS:
-                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+                )
                 continue
 
             print(
@@ -1205,17 +1269,13 @@ def _run_eval_panoramic_vlm(
                         traj_images=traj_images,
                     )
 
-                local_actions = traj_to_actions(
-                    trajectory,
-                    num_sample_trajs=num_sample_trajs,
-                    action_scale=action_scale,
-                )
-                if len(local_actions) < MAX_STEPS:
-                    local_actions = list(local_actions) + [ActionCode.STOP] * (
-                        MAX_STEPS - len(local_actions)
+                local_actions = _finalize_local_actions(
+                    traj_to_actions(
+                        trajectory,
+                        num_sample_trajs=num_sample_trajs,
+                        action_scale=action_scale,
                     )
-                if len(local_actions) >= MAX_LOCAL_STEPS:
-                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+                )
                 forward_action_count = 0
 
                 if local_actions:
@@ -1411,7 +1471,7 @@ def run_eval(args):
         if ep_key in done_set:
             continue
 
-        instruction = episode.instruction.instruction_text
+        instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(
             f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
@@ -1432,15 +1492,17 @@ def run_eval(args):
         step_id = 0
         done = False
 
-        while (not done) and (step_id < max_steps_per_episode):
+        while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
             print(
                 f"  [step_id={step_id}] Capturing observations + VLM inference ...",
                 flush=True,
             )
 
-            rgb = observations["rgb"]
-            image = Image.fromarray(rgb).convert("RGB")
+            rgb_arr = _extract_rgb_array(observations)
+            if rgb_arr is None:
+                rgb_arr = np.zeros((480, 640, 3), dtype=np.uint8)
+            image = _rgb_array_to_pil(rgb_arr)
 
             if action == ActionCode.LOOKDOWN:
                 lookdown_img = image.resize((224, 224))
@@ -1449,7 +1511,10 @@ def run_eval(args):
 
                 down_observations = env.step(ActionCode.LOOKDOWN)
                 down_observations = env.step(ActionCode.LOOKDOWN)
-                lookdown_img = Image.fromarray(down_observations["rgb"]).convert("RGB").resize((224, 224))
+                down_rgb = _extract_rgb_array(down_observations)
+                if down_rgb is None:
+                    down_rgb = np.zeros((224, 224, 3), dtype=np.uint8)
+                lookdown_img = _rgb_array_to_pil(down_rgb, (224, 224))
                 env.step(ActionCode.LOOKUP)
                 env.step(ActionCode.LOOKUP)
 
@@ -1466,8 +1531,7 @@ def run_eval(args):
                         {"from": "human", "value": LEGACY_PROMPT_TEMPLATE},
                         {"from": "gpt", "value": ""},
                     ]
-                    prompt_instruction = instruction[:-1] if instruction.endswith((".", "!", "?")) else instruction
-                    sources[0]["value"] = sources[0]["value"].replace("<instruction>.", prompt_instruction)
+                    sources[0]["value"] = sources[0]["value"].replace("<instruction>.", instruction)
 
                     cur_images = rgb_history[-1:]
                     if step_id == 0:
@@ -1576,13 +1640,13 @@ def run_eval(args):
                             traj_images=traj_images,
                         )
 
-                    local_actions = traj_to_actions(
-                        trajectory,
-                        num_sample_trajs=num_sample_trajs,
-                        action_scale=action_scale,
+                    local_actions = _finalize_local_actions(
+                        traj_to_actions(
+                            trajectory,
+                            num_sample_trajs=num_sample_trajs,
+                            action_scale=action_scale,
+                        )
                     )
-                    if len(local_actions) >= MAX_LOCAL_STEPS:
-                        local_actions = local_actions[:MAX_LOCAL_STEPS]
 
                     forward_action_count = 0
                     action = local_actions[0] if local_actions else ActionCode.STOP
@@ -1614,13 +1678,13 @@ def run_eval(args):
                             traj_images=traj_images,
                         )
 
-                    local_actions = traj_to_actions(
-                        trajectory,
-                        num_sample_trajs=num_sample_trajs,
-                        action_scale=action_scale,
+                    local_actions = _finalize_local_actions(
+                        traj_to_actions(
+                            trajectory,
+                            num_sample_trajs=num_sample_trajs,
+                            action_scale=action_scale,
+                        )
                     )
-                    if len(local_actions) >= MAX_LOCAL_STEPS:
-                        local_actions = local_actions[:MAX_LOCAL_STEPS]
                     action = local_actions.pop(0) if local_actions else ActionCode.STOP
                 else:
                     action = local_actions.pop(0)
@@ -1755,7 +1819,6 @@ def main():
     args = parser.parse_args()
     _preflight_checkpoint_args(args)
     _resolve_eval_paths(args)
-    _prepare_progress_file(args, args.output_path)
     run_eval(args)
 
 
