@@ -139,3 +139,54 @@ env.reset()
 ```
 
 每次 `reset()` 必定从 iterator 取下一个 episode，外部设置的 `current_episode` 会被覆盖。
+
+---
+
+## 17. SR=0 冒烟：评测闭环与训练不一致（已修复）
+
+### 现象
+
+- `progress.json` 中 **SR=0**，但部分 episode **OS=1**（曾靠近目标）
+- 每个 episode **steps=501**（打满 `max_steps_per_episode`）
+- 日志中大量 `pixel_goal` 坐标 **>255**（例如 `[503, 342]`），且单 episode **VLM 调用 200+ 次**
+
+### 根因（`scripts/evaluation/r2r_val_unseen.py`）
+
+1. **Lookdown 分辨率**：InternNav 二轮对话使用 Habitat 原生 **640×480**，训练为 **`data.image_size`（256×256）**，坐标尺度错乱。
+2. **STOP 未送入仿真**：`local_actions` 队列遇到 `STOP` 时只 `continue`，未 `env.step(STOP)`，VLN-CE Success 无法触发（解释 OS>0、SR=0）。
+3. **VLM 文本 STOP 未统一处理**：需在解析坐标前识别 `STOP` 并结束 episode。
+4. **`forward_action_count > MAX_STEPS` 时 `step_id` 空转**：无仿真步却消耗步数预算。
+
+### 修复要点
+
+- VLM lookdown 与 `construct_input` 对齐 **`vlm_image_size`**（来自 config）；System1 **`traj_image_size`**（默认 224）
+- `_parse_pixel_goal`：按 `[u, v]` 解析并 **clamp** 到图像边界
+- `_apply_habitat_action`：队列内 **STOP 必须 `env.step`**
+- 去掉上述 **phantom `step_id++`**
+
+### GL 渲染（可选）
+
+默认在部分节点为 **Mesa llvmpipe**（日志 `Renderer: llvmpipe`），与训练渲染可能有差异。若 Xvfb + NVIDIA 稳定，可尝试：
+
+```bash
+export HEATMAPVLN_ALLOW_NVIDIA_GLX=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+```
+
+若出现 X11 BadWindow，保持 `HEATMAPVLN_PREINIT_GL=0` 与 `HEATMAPVLN_PREINIT_EMPTY_GL=1`（见评测脚本头部注释）。
+
+### 推荐 smoke 命令
+
+```bash
+export DISPLAY=:200
+HEATMAPVLN_PREINIT_GL=0 HEATMAPVLN_PREINIT_EMPTY_GL=1 \
+INTERNNAV_MODEL_PATH=/path/to/InternNav_Model \
+CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py r2r \
+  --config configs/train_config_internnav_8gpu.yaml \
+  --base_checkpoint checkpoints/stage1-s2_latest.pth \
+  --checkpoint checkpoints/stage2_latest.pth \
+  --max_episodes 2 --overwrite_output \
+  --output_path logs/eval_r2r_fix_smoke
+```
+
+检查 `run.log` 中 `vlm_image_size=(256, 256)`，且 `pixel_goal` 不应再出现远超 255 的坐标。

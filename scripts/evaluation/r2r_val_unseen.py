@@ -832,6 +832,66 @@ def capture_lookdown_view(env, image_size: tuple = (224, 224)) -> Image.Image:
     return lookdown_img
 
 
+def _eval_image_sizes(train_cfg: dict) -> tuple[tuple[int, int], tuple[int, int]]:
+    """VLM/lookdown size and System1 traj image size from training config."""
+    vlm_size = tuple(train_cfg["data"]["image_size"])
+    traj_size = tuple(train_cfg["data"]["trajectory"].get("traj_image_size", [224, 224]))
+    return vlm_size, traj_size
+
+
+_pixel_goal_clamp_warned = False
+
+
+def _parse_pixel_goal(
+    llm_output: str,
+    image_size: tuple[int, int],
+) -> list[int] | None:
+    """Parse ``u v`` pixel goal in training order; clamp to image bounds."""
+    global _pixel_goal_clamp_warned
+    if not re.search(r"\d", llm_output):
+        return None
+    coord = [int(c) for c in re.findall(r"\d+", llm_output)]
+    if len(coord) < 2:
+        return None
+    w, h = int(image_size[0]), int(image_size[1])
+    u, v = int(coord[0]), int(coord[1])
+    if u > w - 1 or v > h - 1 or u < 0 or v < 0:
+        raw_u, raw_v = u, v
+        u = max(0, min(w - 1, u))
+        v = max(0, min(h - 1, v))
+        if not _pixel_goal_clamp_warned:
+            print(
+                f"WARNING: clamped pixel_goal from [{raw_u}, {raw_v}] to [{u}, {v}] "
+                f"for image_size={image_size}",
+                flush=True,
+            )
+            _pixel_goal_clamp_warned = True
+    return [u, v]
+
+
+def _vlm_requests_stop(llm_output: str) -> bool:
+    if re.search(r"\bSTOP\b", llm_output, flags=re.I):
+        return True
+    return ActionCode.STOP in parse_actions(llm_output, LEGACY_ACTIONS2IDX)
+
+
+def _apply_habitat_action(env, action: int):
+    """Execute one Habitat action; LOOKDOWN is issued twice like InternNav."""
+    if action == ActionCode.LOOKDOWN:
+        env.step(action)
+        observations = env.step(action)
+    else:
+        observations = env.step(action)
+    return observations, env.episode_over
+
+
+def _lookdown_to_traj_tensor(
+    lookdown_img: Image.Image,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 6: Trajectory → discrete actions conversion
 # ═══════════════════════════════════════════════════════════════════════
@@ -1060,11 +1120,13 @@ def _run_eval_panoramic_vlm(
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
-    image_size = tuple(train_cfg["data"]["image_size"])
+    vlm_image_size, traj_image_size = _eval_image_sizes(train_cfg)
+    image_size = vlm_image_size
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
     print(f"System2 SFT protocol: {'internnav' if internnav_protocol else 'direct'}")
+    print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
@@ -1126,20 +1188,23 @@ def _run_eval_panoramic_vlm(
 
                 if forward_action_count > MAX_STEPS:
                     pix_goal_image = None
+                    _last_traj_hs = None
                     local_actions = []
                     forward_action_count = 0
-                    step_id += 1
+                    base_messages = None
+                    awaiting_lookdown = False
                     continue
 
                 if action == ActionCode.STOP:
                     pix_goal_image = None
+                    _last_traj_hs = None
                     local_actions = []
                     forward_action_count = 0
+                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
                     step_id += 1
                     continue
 
-                observations = env.step(action)
-                done = env.episode_over
+                observations, done = _apply_habitat_action(env, action)
                 step_id += 1
                 continue
 
@@ -1148,10 +1213,8 @@ def _run_eval_panoramic_vlm(
                 # src/data/trajectory_dataset.py:577). Feeding s1 the level
                 # forward RGB is a domain mismatch; capture a fresh lookdown
                 # (LOOKDOWN×2 → RGB → LOOKUP×2 restores pitch).
-                current_lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
-                current_traj_t = (
-                    torch.from_numpy(np.array(current_lookdown_img)).to(torch.bfloat16) / 255.0
-                )
+                current_lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+                current_traj_t = _lookdown_to_traj_tensor(current_lookdown_img, device)
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
 
                 print("  [debug] re-calling get_trajectory ...", flush=True)
@@ -1176,7 +1239,7 @@ def _run_eval_panoramic_vlm(
             )
 
             if awaiting_lookdown and base_messages is not None:
-                lookdown_img = capture_lookdown_view(env, image_size=(640, 480))
+                lookdown_img = capture_lookdown_view(env, image_size=vlm_image_size)
                 messages = copy.deepcopy(base_messages)
                 messages.append({
                     "role": "assistant",
@@ -1238,24 +1301,20 @@ def _run_eval_panoramic_vlm(
             last_llm_output = llm_output
             print(f"  step_id: {step_id}, VLM output: {llm_output}")
 
-            if has_nextdit and bool(re.search(r"\d", llm_output)):
-                coord = [int(c) for c in re.findall(r"\d+", llm_output)]
-                if len(coord) >= 2:
-                    # Stage1-S2 trains coordinates as "x y"; keep evaluation aligned.
-                    pixel_goal = [int(coord[0]), int(coord[1])]
-                    print(f"  predicted pixel_goal {pixel_goal}")
-                else:
-                    env.step(ActionCode.STOP)
-                    done = True
-                    continue
+            if _vlm_requests_stop(llm_output):
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
+                continue
+
+            pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
+            if has_nextdit and pixel_goal is not None:
+                print(f"  predicted pixel_goal {pixel_goal}")
 
                 # Capture lookdown view (matches training direction="front_down"
                 # in src/data/trajectory_dataset.py:577). Both slots of
                 # traj_images are the same frame at goal-freeze time.
-                current_lookdown_img = capture_lookdown_view(env, image_size=(224, 224))
-                current_traj_t = (
-                    torch.from_numpy(np.array(current_lookdown_img)).to(torch.bfloat16) / 255.0
-                )
+                current_lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+                current_traj_t = _lookdown_to_traj_tensor(current_lookdown_img, device)
                 pix_goal_image = current_traj_t.clone()
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
 
@@ -1300,19 +1359,17 @@ def _run_eval_panoramic_vlm(
                         base_messages = None
                         awaiting_lookdown = False
                         forward_action_count = 0
-                        observations = env.step(ActionCode.LEFT)
-                        done = env.episode_over
+                        observations, done = _apply_habitat_action(env, ActionCode.LEFT)
                         step_id += 1
                         continue
 
-                    observations = env.step(first_action)
-                    done = env.episode_over
+                    observations, done = _apply_habitat_action(env, first_action)
                     step_id += 1
                     forward_action_count += 1
                     continue
 
-                env.step(ActionCode.STOP)
-                done = True
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
                 continue
 
             action_seq = parse_actions(llm_output, LEGACY_ACTIONS2IDX)
@@ -1321,13 +1378,11 @@ def _run_eval_panoramic_vlm(
                 if action == ActionCode.LOOKDOWN:
                     awaiting_lookdown = True
                     continue
-                else:
-                    observations = env.step(action)
-                    done = env.episode_over
-                    step_id += 1
+                observations, done = _apply_habitat_action(env, action)
+                step_id += 1
             else:
-                env.step(ActionCode.STOP)
-                done = True
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
 
         metrics = env.get_metrics()
         sucs.append(metrics["success"])
@@ -1445,6 +1500,8 @@ def run_eval(args):
 
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
+    vlm_image_size, traj_image_size = _eval_image_sizes(train_cfg)
+    print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
 
     # ── Resume / output management ──
     output_path = args.output_path
@@ -1514,7 +1571,7 @@ def run_eval(args):
             image = _rgb_array_to_pil(rgb_arr)
 
             if action == ActionCode.LOOKDOWN:
-                lookdown_img = image.resize((224, 224))
+                lookdown_img = image.resize(vlm_image_size)
             else:
                 rgb_history.append(image.resize((args.resize_w, args.resize_h)))
 
@@ -1522,8 +1579,8 @@ def run_eval(args):
                 down_observations = env.step(ActionCode.LOOKDOWN)
                 down_rgb = _extract_rgb_array(down_observations)
                 if down_rgb is None:
-                    down_rgb = np.zeros((224, 224, 3), dtype=np.uint8)
-                lookdown_img = _rgb_array_to_pil(down_rgb, (224, 224))
+                    down_rgb = np.zeros((vlm_image_size[1], vlm_image_size[0], 3), dtype=np.uint8)
+                lookdown_img = _rgb_array_to_pil(down_rgb, vlm_image_size)
                 env.step(ActionCode.LOOKUP)
                 env.step(ActionCode.LOOKUP)
 
@@ -1603,30 +1660,23 @@ def run_eval(args):
                 )
                 print(f"  step_id: {step_id}, VLM output: {llm_output}")
 
-                if bool(re.search(r"\d", llm_output)):
-                    coord = [int(c) for c in re.findall(r"\d+", llm_output)]
-                    if len(coord) >= 2:
-                        # Stage1-S2 trains coordinates as "x y"; keep evaluation aligned.
-                        pixel_goal = [int(coord[0]), int(coord[1])]
-                        print(f"  predicted pixel_goal {pixel_goal}")
-                    else:
-                        action = ActionCode.LEFT
-                        observations = env.step(action)
-                        step_id += 1
-                        done = env.episode_over
-                        messages = []
-                        continue
+                if _vlm_requests_stop(llm_output):
+                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                    step_id += 1
+                    messages = []
+                    continue
+
+                pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
+                if pixel_goal is not None:
+                    print(f"  predicted pixel_goal {pixel_goal}")
 
                     if not has_nextdit:
-                        action = ActionCode.STOP
-                        observations = env.step(action)
-                        done = True
+                        observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                        step_id += 1
                         messages = []
                         continue
 
-                    lookdown_t = (
-                        torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
-                    )
+                    lookdown_t = _lookdown_to_traj_tensor(lookdown_img, device)
                     pix_goal_image = lookdown_t.clone()
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
 
@@ -1661,11 +1711,11 @@ def run_eval(args):
                     action = local_actions[0] if local_actions else ActionCode.STOP
                     if action == ActionCode.STOP:
                         pix_goal_image = None
+                        _last_traj_hs = None
                         local_actions = []
                         action = ActionCode.LEFT
-                        observations = env.step(action)
+                        observations, done = _apply_habitat_action(env, action)
                         step_id += 1
-                        done = env.episode_over
                         messages = []
                         continue
                 else:
@@ -1676,9 +1726,7 @@ def run_eval(args):
                 action = action_seq.pop(0)
             elif pix_goal_image is not None:
                 if len(local_actions) == 0:
-                    lookdown_t = (
-                        torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
-                    )
+                    lookdown_t = _lookdown_to_traj_tensor(lookdown_img, device)
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
 
                     with torch.no_grad():
@@ -1701,31 +1749,27 @@ def run_eval(args):
                 forward_action_count += 1
                 if forward_action_count > MAX_STEPS:
                     pix_goal_image = None
+                    _last_traj_hs = None
                     messages = []
-                    step_id += 1
                     forward_action_count = 0
                     local_actions = []
                     continue
 
                 if action == ActionCode.STOP:
                     pix_goal_image = None
+                    _last_traj_hs = None
                     messages = []
-                    step_id += 1
                     forward_action_count = 0
                     local_actions = []
+                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                    step_id += 1
                     continue
             else:
                 action = ActionCode.STOP
 
-            if action == ActionCode.LOOKDOWN:
-                env.step(action)
-                observations = env.step(action)
-                done = env.episode_over
-            else:
-                observations = env.step(action)
-                done = env.episode_over
-                step_id += 1
-                messages = []
+            observations, done = _apply_habitat_action(env, action)
+            step_id += 1
+            messages = []
 
         # ── Collect metrics ──
         metrics = env.get_metrics()
