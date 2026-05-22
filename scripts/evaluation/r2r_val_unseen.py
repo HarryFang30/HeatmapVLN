@@ -277,6 +277,10 @@ def _finalize_local_actions(action_list: list[int]) -> list[int]:
     return action_list
 
 
+def _actions_for_log(actions: list[int]) -> list[int]:
+    return [int(action) for action in actions]
+
+
 _RGB_SENSOR_KEYS = (
     "rgb",
     "RGB_SENSOR",
@@ -968,6 +972,68 @@ def _lookdown_to_traj_tensor(
     return torch.from_numpy(np.array(lookdown_img)).to(torch.bfloat16) / 255.0
 
 
+def _metric_distance_to_goal(env) -> float | None:
+    try:
+        metrics = env.get_metrics()
+    except Exception:
+        return None
+    value = metrics.get("distance_to_goal")
+    if value is None:
+        value = metrics.get("distance_to_target")
+    if value is None:
+        return None
+    try:
+        distance = float(value)
+    except (TypeError, ValueError):
+        return None
+    return distance if np.isfinite(distance) else None
+
+
+def _maybe_stop_at_success(env, args, step_id: int):
+    stop_distance = float(getattr(args, "auto_stop_distance", 0.0) or 0.0)
+    if stop_distance <= 0.0:
+        return None
+
+    distance = _metric_distance_to_goal(env)
+    if distance is None or distance > stop_distance:
+        return None
+
+    print(
+        f"  [debug] auto STOP: distance_to_goal={distance:.3f} <= {stop_distance:.3f}",
+        flush=True,
+    )
+    observations, done = _apply_habitat_action(env, ActionCode.STOP)
+    return observations, done, step_id + 1
+
+
+def _trajectory_debug_summary(
+    trajectory: torch.Tensor,
+    num_sample_trajs: int,
+    action_scale: float,
+) -> str:
+    if trajectory is None or trajectory.numel() == 0:
+        return "trajectory=empty"
+
+    trajs = trajectory[:num_sample_trajs].float().detach().cpu().numpy().copy()
+    if trajs.ndim != 3 or trajs.shape[-1] < 2:
+        return f"trajectory_shape={tuple(trajectory.shape)}"
+
+    trajs[:, :, :2] /= float(action_scale)
+    cumsum_xy = np.cumsum(trajs[:, :, :2], axis=1)
+    xy = np.concatenate(
+        [np.zeros((trajs.shape[0], 1, 2), dtype=cumsum_xy.dtype), cumsum_xy],
+        axis=1,
+    )
+    mean_xy = xy.mean(axis=0)
+    goal_xy = mean_xy[-1]
+    direct = float(np.linalg.norm(goal_xy))
+    path_len = float(np.linalg.norm(np.diff(mean_xy, axis=0), axis=1).sum())
+    return (
+        f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), "
+        f"direct={direct:.2f}, path_len={path_len:.2f}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 6: Trajectory → discrete actions conversion
 # ═══════════════════════════════════════════════════════════════════════
@@ -1358,12 +1424,19 @@ def _run_eval_panoramic_vlm(
         awaiting_lookdown = False
         last_llm_output = ""
         forward_action_count = 0
+        system2_calls = 0
+        trajectory_calls = 0
         step_id = 0
         done = False
 
         while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
             turn_lookdown_img: Image.Image | None = None
+
+            stop_result = _maybe_stop_at_success(env, args, step_id)
+            if stop_result is not None:
+                observations, done, step_id = stop_result
+                continue
 
             if local_actions:
                 current_views = capture_panoramic_views(env, image_size=image_size)
@@ -1385,6 +1458,7 @@ def _run_eval_panoramic_vlm(
                     # (often padding after a short local trajectory).  InternNav
                     # treats it as "local waypoint finished, ask System2 again",
                     # not as the final VLN episode STOP.
+                    print("  [debug] local trajectory STOP -> replan", flush=True)
                     pix_goal_image = None
                     _last_traj_hs = None
                     local_actions = []
@@ -1407,6 +1481,7 @@ def _run_eval_panoramic_vlm(
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
 
                 print("  [debug] re-calling get_trajectory ...", flush=True)
+                trajectory_calls += 1
                 with torch.no_grad():
                     trajectory = model.nextdit_action_head.get_trajectory(
                         _last_traj_hs,
@@ -1419,6 +1494,12 @@ def _run_eval_panoramic_vlm(
                         num_sample_trajs=num_sample_trajs,
                         action_scale=action_scale,
                     )
+                )
+                print(
+                    "  [debug] trajectory "
+                    f"{_trajectory_debug_summary(trajectory, num_sample_trajs, action_scale)}, "
+                    f"actions={_actions_for_log(local_actions)}",
+                    flush=True,
                 )
                 continue
 
@@ -1473,6 +1554,16 @@ def _run_eval_panoramic_vlm(
                 f"  [debug] input_ids shape={inputs['input_ids'].shape}, calling model.generate ...",
                 flush=True,
             )
+            system2_calls += 1
+            max_system2_calls = int(getattr(args, "max_system2_calls_per_episode", 0) or 0)
+            if max_system2_calls > 0 and system2_calls > max_system2_calls:
+                print(
+                    f"  [debug] max System2 calls reached ({system2_calls - 1}); stopping episode",
+                    flush=True,
+                )
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
+                continue
             with torch.no_grad():
                 output_ids = model.qwen2_5_vl.model.generate(
                     **inputs,
@@ -1533,6 +1624,7 @@ def _run_eval_panoramic_vlm(
                     )
 
                 print("  [debug] calling get_trajectory ...", flush=True)
+                trajectory_calls += 1
                 with torch.no_grad():
                     trajectory = model.nextdit_action_head.get_trajectory(
                         _last_traj_hs,
@@ -1546,6 +1638,12 @@ def _run_eval_panoramic_vlm(
                         action_scale=action_scale,
                     )
                 )
+                print(
+                    "  [debug] trajectory "
+                    f"{_trajectory_debug_summary(trajectory, num_sample_trajs, action_scale)}, "
+                    f"actions={_actions_for_log(local_actions)}",
+                    flush=True,
+                )
                 forward_action_count = 0
 
                 if local_actions:
@@ -1555,6 +1653,7 @@ def _run_eval_panoramic_vlm(
                         # first action after s2, force a LEFT turn so the next
                         # s2 call sees a different panorama and can replan
                         # (otherwise s2→s1→STOP loops with identical views).
+                        print("  [debug] first local action STOP -> LEFT anti-deadlock", flush=True)
                         pix_goal_image = None
                         _last_traj_hs = None
                         local_actions = []
@@ -1594,7 +1693,8 @@ def _run_eval_panoramic_vlm(
 
         print(
             f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
-            f"os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']:.4f}"
+            f"os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']:.4f}, "
+            f"vlm_calls: {system2_calls}, trajectory_calls: {trajectory_calls}"
         )
 
         result = {
@@ -1606,6 +1706,8 @@ def _run_eval_panoramic_vlm(
             "ne": metrics["distance_to_goal"],
             "steps": step_id,
             "episode_instruction": instruction,
+            "vlm_calls": system2_calls,
+            "trajectory_calls": trajectory_calls,
         }
         with open(progress_file, "a") as f:
             f.write(json.dumps(result) + "\n")
@@ -1768,6 +1870,11 @@ def run_eval(args):
 
         while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
+            stop_result = _maybe_stop_at_success(env, args, step_id)
+            if stop_result is not None:
+                observations, done, step_id = stop_result
+                continue
+
             print(
                 f"  [step_id={step_id}] Capturing observations + VLM inference ...",
                 flush=True,
@@ -2093,6 +2200,18 @@ def main():
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
+    parser.add_argument(
+        "--auto_stop_distance",
+        type=float,
+        default=3.0,
+        help="Execute Habitat STOP once distance_to_goal is within this threshold; set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--max_system2_calls_per_episode",
+        type=int,
+        default=0,
+        help="Optional debug safety cap for VLM calls per episode; 0 disables the cap.",
+    )
     parser.add_argument("--max_episodes", type=int, default=None,
                         help="Evaluate at most this many new episodes")
     parser.add_argument("--episode_list", type=str, default=None,
