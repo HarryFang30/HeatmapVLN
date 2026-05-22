@@ -928,8 +928,9 @@ def _condition_output_ids_for_pixel_goal(
         desired = [int(pixel_goal[0]), int(pixel_goal[1])]
     elif coord_order == "internnav_yx":
         # InternNav System1 was trained from text like "301 225" while the
-        # eval-side pixel goal state is [u=225, v=301].  The panoramic SFT
-        # model emits [u v], so rewrite only the hidden-state conditioning text.
+        # eval-side pixel goal state is [u=225, v=301].  Keep this mode for
+        # raw InternNav compatibility checks; HeatmapVLN Stage2 bridge
+        # checkpoints are trained on the generated [u v] text.
         desired = [int(pixel_goal[1]), int(pixel_goal[0])]
     else:
         raise ValueError(f"Unsupported coord_order: {coord_order}")
@@ -1134,7 +1135,12 @@ def _system1_coord_order(args, *, panoramic_internnav_protocol: bool) -> str:
     requested = getattr(args, "system1_coord_order", "auto")
     if requested != "auto":
         return requested
-    return "internnav_yx" if panoramic_internnav_protocol else "generated"
+    # Stage2 bridge-only training tokenizes HeatmapVLN pixel_goal as [u v]
+    # before appending TRAJ latent-query tokens.  Auto must therefore match
+    # the generated text, even when System2 uses the InternNav two-turn
+    # protocol.  Use --system1_coord_order internnav_yx only for raw
+    # InternNav hidden-state compatibility experiments.
+    return "generated"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2427,8 +2433,9 @@ def main():
         choices=("auto", "generated", "internnav_yx"),
         default="auto",
         help=(
-            "Coordinate text used for System1 latent conditioning. auto rewrites "
-            "panoramic InternNav-protocol [u v] outputs to InternNav [v u]."
+            "Coordinate text used for System1 latent conditioning. auto keeps "
+            "HeatmapVLN Stage2's generated [u v] order; use internnav_yx only "
+            "for raw InternNav compatibility checks."
         ),
     )
     parser.add_argument("--max_episodes", type=int, default=None,
