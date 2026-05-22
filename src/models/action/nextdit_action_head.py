@@ -247,7 +247,11 @@ class NextDiTActionHead(nn.Module):
                     ckpt_path,
                 )
         else:
-            logger.warning("No DepthAnythingV2 checkpoint provided, using random init")
+            logger.info(
+                "DepthAnythingV2 encoder created without dav2_ckpt_path; "
+                "weights should be loaded from InternNav_Model safetensors (rgb_model.*) "
+                "via pipeline internnav_model_path before evaluation."
+            )
 
         rgb_model = dav2_model.pretrained
         rgb_model.requires_grad_(False)

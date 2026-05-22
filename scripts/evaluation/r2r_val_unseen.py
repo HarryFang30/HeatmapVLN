@@ -1059,40 +1059,64 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
 
     from safetensors import safe_open
 
-    ref_key = "model.traj_dit.model.layers.0.attn1.to_q.weight"
-    model_key = "model.layers.0.attn1.to_q.weight"
-    shard_paths: list[Path] = []
+    checks = (
+        (
+            "model.traj_dit.model.layers.0.attn1.to_q.weight",
+            lambda: head.traj_dit.state_dict()["model.layers.0.attn1.to_q.weight"],
+        ),
+        (
+            "model.rgb_model.patch_embed.proj.weight",
+            lambda: head.rgb_model.patch_embed.proj.weight,
+        ),
+    )
+
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.is_file():
         import json as _json
 
         weight_map = _json.loads(index_path.read_text()).get("weight_map", {})
-        if ref_key not in weight_map:
-            raise RuntimeError(f"{ref_key} missing from {index_path}")
-        shard_paths = [model_dir / weight_map[ref_key]]
     else:
         single = model_dir / "model.safetensors"
-        if single.is_file():
-            shard_paths = [single]
-        else:
+        if not single.is_file():
             raise FileNotFoundError(
                 f"No InternNav safetensors found under {internnav_path}"
             )
+        weight_map = {k: single.name for k in safe_open(str(single)).keys()}
 
-    with safe_open(str(shard_paths[0]), framework="pt", device="cpu") as handle:
+    shards: dict[str, object] = {}
+
+    def _tensor_from_internnav(ref_key: str) -> torch.Tensor:
+        shard_name = weight_map.get(ref_key)
+        if shard_name is None:
+            raise RuntimeError(f"{ref_key} missing from {index_path or model_dir}")
+        shard_path = model_dir / shard_name
+        if shard_name not in shards:
+            shards[shard_name] = safe_open(str(shard_path), framework="pt", device="cpu")
+        handle = shards[shard_name]
         if ref_key not in handle.keys():
-            raise RuntimeError(f"{ref_key} missing from {shard_paths[0]}")
-        reference = handle.get_tensor(ref_key).float()
+            raise RuntimeError(f"{ref_key} missing from {shard_path}")
+        return handle.get_tensor(ref_key).float()
 
-    current = head.traj_dit.state_dict()[model_key].detach().float().cpu()
-    if current.shape != reference.shape or not torch.allclose(current, reference, atol=1e-4, rtol=1e-3):
+    rgb_key_count = sum(1 for key in weight_map if key.startswith("model.rgb_model."))
+    if rgb_key_count == 0:
         raise RuntimeError(
-            "InternNav System1 weights were not loaded into NextDiT "
-            f"(mismatch on {model_key}). Check INTERNNAV_MODEL_PATH and eval startup logs."
+            f"No model.rgb_model.* tensors in InternNav weights at {internnav_path}"
         )
+
+    for ref_key, current_fn in checks:
+        reference = _tensor_from_internnav(ref_key)
+        current = current_fn().detach().float().cpu()
+        if current.shape != reference.shape or not torch.allclose(
+            current, reference, atol=1e-4, rtol=1e-3
+        ):
+            raise RuntimeError(
+                "InternNav System1 weights were not loaded into NextDiT "
+                f"(mismatch on {ref_key}). Check INTERNNAV_MODEL_PATH."
+            )
+
     print(
-        f"Verified InternNav System1 weights loaded from {internnav_path} "
-        f"({model_key} matches safetensors)",
+        f"Verified InternNav System1 from {internnav_path}: "
+        f"traj_dit + DepthAnythingV2 rgb_model ({rgb_key_count} rgb tensors in checkpoint)",
         flush=True,
     )
 

@@ -356,7 +356,20 @@ class VLNPipeline(nn.Module):
         missing = [k for k in head_sd if k not in ckpt_sd and k != "latent_queries"]
         self.nextdit_action_head.load_state_dict(head_sd, strict=False)
 
+        rgb_loaded = sum(1 for key in loaded if key.startswith("rgb_model."))
+        traj_loaded = sum(1 for key in loaded if key.startswith("traj_dit."))
         logger.info("  Loaded %d/%d System 1 params from %s", len(loaded), len(ckpt_sd), source)
+        logger.info(
+            "  DepthAnythingV2 encoder (rgb_model): %d tensors, traj_dit: %d tensors",
+            rgb_loaded,
+            traj_loaded,
+        )
+        if rgb_loaded == 0:
+            logger.warning(
+                "  rgb_model (DepthAnythingV2) received 0 tensors from %s — "
+                "set paths.internnav_model_path / INTERNNAV_MODEL_PATH or nextdit.dav2_ckpt_path",
+                source,
+            )
         if skipped:
             logger.warning("  Skipped: %s", skipped[:10])
         if missing:
