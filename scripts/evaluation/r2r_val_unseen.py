@@ -399,6 +399,9 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         args.data_path = str(data_path.resolve())
     elif args.data_path == DEFAULT_DATA_PATH:
         data_candidates = [
+            Path(f"/home/intern/zhr/fjl/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"),
+            Path.home() / f"zhr/fjl/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz",
+            Path.home() / f"InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz",
             Path(f"/workspace/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"),
             Path(f"/workspace/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz"),
             Path(f"/workspace/R2R_VLNCE_v1-3/{split}/{split}.json.gz"),
@@ -422,6 +425,9 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         args.scenes_dir = str(scenes_dir.resolve())
     elif args.scenes_dir == DEFAULT_SCENES_DIR:
         scenes_candidates = [
+            Path("/home/intern/zhr/fjl/InternNav/data/scene_data/mp3d_ce"),
+            Path.home() / "zhr/fjl/InternNav/data/scene_data/mp3d_ce",
+            Path.home() / "InternNav/data/scene_data/mp3d_ce",
             Path("/dataset/mp3d"),
             Path("/dataset"),
             Path("/workspace/InternNav/data/scene_data/mp3d_ce"),
@@ -1178,7 +1184,10 @@ def _run_eval_panoramic_vlm(
                 })
                 messages.append({
                     "role": "user",
-                    "content": [{"type": "image", "image": lookdown_img}],
+                    "content": [
+                        {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
+                        {"type": "image", "image": lookdown_img},
+                    ],
                 })
                 awaiting_lookdown = False
             else:
