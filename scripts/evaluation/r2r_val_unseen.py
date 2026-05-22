@@ -864,6 +864,21 @@ def _eval_image_sizes(train_cfg: dict) -> tuple[tuple[int, int], tuple[int, int]
     return vlm_size, traj_size
 
 
+def _sample_history_panoramas(
+    history_panoramas: list[dict[str, Image.Image]],
+    num_history: int,
+) -> list[dict[str, Image.Image]]:
+    """Sample prompt history without mutating the full executed trajectory."""
+    if num_history <= 0:
+        return []
+    if len(history_panoramas) <= num_history:
+        return list(history_panoramas)
+    indices = np.unique(
+        np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)
+    ).tolist()
+    return [history_panoramas[i] for i in indices]
+
+
 _pixel_goal_clamp_warned = False
 
 
@@ -892,6 +907,42 @@ def _parse_pixel_goal(
             )
             _pixel_goal_clamp_warned = True
     return [u, v]
+
+
+def _condition_output_ids_for_pixel_goal(
+    output_ids: torch.Tensor,
+    prompt_len: int,
+    tokenizer,
+    pixel_goal: list[int],
+    llm_output: str,
+) -> torch.Tensor:
+    """Use the clamped pixel goal in the latent-conditioning text if needed."""
+    coord = [int(c) for c in re.findall(r"\d+", llm_output)]
+    if len(coord) >= 2 and [coord[0], coord[1]] == pixel_goal:
+        return output_ids
+
+    coord_text = f"{int(pixel_goal[0])} {int(pixel_goal[1])}"
+    replacement = tokenizer.encode(coord_text, add_special_tokens=False)
+    if not replacement:
+        return output_ids
+
+    replacement_ids = torch.tensor(
+        [replacement],
+        device=output_ids.device,
+        dtype=output_ids.dtype,
+    )
+
+    generated_suffix = output_ids[:, prompt_len:]
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if (
+        eos_token_id is not None
+        and generated_suffix.numel() > 0
+        and int(generated_suffix[0, -1].item()) == int(eos_token_id)
+    ):
+        eos = torch.tensor([[eos_token_id]], device=output_ids.device, dtype=output_ids.dtype)
+        replacement_ids = torch.cat([replacement_ids, eos], dim=1)
+
+    return torch.cat([output_ids[:, :prompt_len], replacement_ids], dim=1)
 
 
 def _vlm_requests_stop(llm_output: str) -> bool:
@@ -1298,7 +1349,7 @@ def _run_eval_panoramic_vlm(
             f"{instruction[:80]}..."
         )
 
-        history_panoramas: list[dict[str, Image.Image]] = []
+        executed_history_panoramas: list[dict[str, Image.Image]] = []
         action_seq: list[int] = []
         local_actions: list[int] = []
         pix_goal_image: torch.Tensor | None = None
@@ -1312,8 +1363,11 @@ def _run_eval_panoramic_vlm(
 
         while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
+            turn_lookdown_img: Image.Image | None = None
 
             if local_actions:
+                current_views = capture_panoramic_views(env, image_size=image_size)
+                executed_history_panoramas.append(current_views)
                 action = local_actions.pop(0)
                 forward_action_count += 1
 
@@ -1370,7 +1424,7 @@ def _run_eval_panoramic_vlm(
             )
 
             if awaiting_lookdown and base_messages is not None:
-                lookdown_img = capture_lookdown_view(env, image_size=vlm_image_size)
+                turn_lookdown_img = capture_lookdown_view(env, image_size=vlm_image_size)
                 messages = copy.deepcopy(base_messages)
                 messages.append({
                     "role": "assistant",
@@ -1380,27 +1434,26 @@ def _run_eval_panoramic_vlm(
                     "role": "user",
                     "content": [
                         {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
-                        {"type": "image", "image": lookdown_img},
+                        {"type": "image", "image": turn_lookdown_img},
                     ],
                 })
                 awaiting_lookdown = False
             else:
                 current_views = capture_panoramic_views(env, image_size=image_size)
+                prompt_history = _sample_history_panoramas(
+                    executed_history_panoramas,
+                    num_history,
+                )
                 messages = construct_input(
                     current_views=current_views,
-                    history_panoramas=history_panoramas,
+                    history_panoramas=prompt_history,
                     instruction=instruction,
                     pixel_goal=[0, 0],
                     internnav_protocol=internnav_protocol,
                 )
                 messages = [m for m in messages if m["role"] != "assistant"]
                 base_messages = copy.deepcopy(messages)
-                history_panoramas.append(current_views)
-                if len(history_panoramas) > num_history:
-                    indices = np.unique(
-                        np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)
-                    ).tolist()
-                    history_panoramas = [history_panoramas[i] for i in indices]
+                executed_history_panoramas.append(current_views)
 
             inputs = processor.apply_chat_template(
                 messages,
@@ -1444,7 +1497,14 @@ def _run_eval_panoramic_vlm(
                 # Capture lookdown view (matches training direction="front_down"
                 # in src/data/trajectory_dataset.py:577). Both slots of
                 # traj_images are the same frame at goal-freeze time.
-                current_lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+                if turn_lookdown_img is None:
+                    current_lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+                else:
+                    current_lookdown_img = (
+                        turn_lookdown_img
+                        if turn_lookdown_img.size == traj_image_size
+                        else turn_lookdown_img.resize(traj_image_size)
+                    )
                 current_traj_t = _lookdown_to_traj_tensor(current_lookdown_img, device)
                 pix_goal_image = current_traj_t.clone()
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
@@ -1453,9 +1513,16 @@ def _run_eval_panoramic_vlm(
                 lq = model.latent_queries.expand(1, -1, -1).to(
                     device=device, dtype=model.config.dtype,
                 )
+                condition_output_ids = _condition_output_ids_for_pixel_goal(
+                    output_ids=output_ids,
+                    prompt_len=inputs["input_ids"].shape[1],
+                    tokenizer=processor.tokenizer,
+                    pixel_goal=pixel_goal,
+                    llm_output=llm_output,
+                )
                 with torch.no_grad():
                     _last_traj_hs = model.qwen2_5_vl.generate_latents(
-                        output_ids=output_ids,
+                        output_ids=condition_output_ids,
                         pixel_values=inputs.get("pixel_values"),
                         image_grid_thw=inputs.get("image_grid_thw"),
                         latent_queries=lq,
@@ -1797,6 +1864,11 @@ def run_eval(args):
                 )
                 print(f"  step_id: {step_id}, VLM output: {llm_output}")
 
+                if action == ActionCode.LOOKDOWN:
+                    env.step(ActionCode.LOOKUP)
+                    observations = env.step(ActionCode.LOOKUP)
+                    done = env.episode_over
+
                 if _vlm_requests_stop(llm_output):
                     observations, done = _apply_habitat_action(env, ActionCode.STOP)
                     step_id += 1
@@ -1813,7 +1885,12 @@ def run_eval(args):
                         messages = []
                         continue
 
-                    lookdown_t = _lookdown_to_traj_tensor(lookdown_img, device)
+                    lookdown_traj_img = (
+                        lookdown_img
+                        if lookdown_img.size == traj_image_size
+                        else lookdown_img.resize(traj_image_size)
+                    )
+                    lookdown_t = _lookdown_to_traj_tensor(lookdown_traj_img, device)
                     pix_goal_image = lookdown_t.clone()
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
 
@@ -1821,9 +1898,16 @@ def run_eval(args):
                     lq = model.latent_queries.expand(1, -1, -1).to(
                         device=device, dtype=model.config.dtype,
                     )
+                    condition_output_ids = _condition_output_ids_for_pixel_goal(
+                        output_ids=output_ids,
+                        prompt_len=inputs.input_ids.shape[1],
+                        tokenizer=processor.tokenizer,
+                        pixel_goal=pixel_goal,
+                        llm_output=llm_output,
+                    )
                     with torch.no_grad():
                         _last_traj_hs = model.qwen2_5_vl.generate_latents(
-                            output_ids=output_ids,
+                            output_ids=condition_output_ids,
                             pixel_values=inputs.get("pixel_values"),
                             image_grid_thw=inputs.get("image_grid_thw"),
                             latent_queries=lq,
@@ -1863,7 +1947,12 @@ def run_eval(args):
                 action = action_seq.pop(0)
             elif pix_goal_image is not None:
                 if len(local_actions) == 0:
-                    lookdown_t = _lookdown_to_traj_tensor(lookdown_img, device)
+                    lookdown_traj_img = (
+                        lookdown_img
+                        if lookdown_img.size == traj_image_size
+                        else lookdown_img.resize(traj_image_size)
+                    )
+                    lookdown_t = _lookdown_to_traj_tensor(lookdown_traj_img, device)
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
 
                     with torch.no_grad():
