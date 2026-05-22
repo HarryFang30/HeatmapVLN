@@ -378,9 +378,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         pg = result.get("pixel_goal")
         if pg is not None:
             goal_len = result.get("pixel_goal_relative_len")
-            if goal_len is not None and goal_len < self.system2_min_pixel_goal_len:
-                return False
-            return True
+            return goal_len is None or goal_len >= self.system2_min_pixel_goal_len
 
         # NavPixelGoalDataset: skip forward-only frames when pixel_goal[0] == -1.
         if int(result.get("discrete_action", 1)) == 1:
@@ -392,9 +390,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         discrete_action = int(result.get("discrete_action", 1))
         if self.sft_include_turns and discrete_action in (2, 3, 5):
             return True
-        if self.sft_include_forward and discrete_action == 1:
-            return True
-        return False
+        return self.sft_include_forward and discrete_action == 1
 
     def _candidate_retry_indices(self, idx: int, max_attempts: int = 64) -> list[int]:
         total = len(self.sample_index)

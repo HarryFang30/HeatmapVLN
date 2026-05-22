@@ -288,7 +288,7 @@ class VLNPipeline(nn.Module):
             with safe_open(str(single_path), framework="pt", device="cpu") as f:
                 ckpt_sd = {
                     _remap_internnav_system1_key(k): f.get_tensor(k)
-                    for k in f.keys()
+                    for k in f
                     if _is_internnav_system1_key(k)
                 }
             self._load_system1_state_dict(ckpt_sd, source=str(single_path))

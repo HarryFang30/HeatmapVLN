@@ -248,14 +248,14 @@ def ensure_transformers_runtime_compat(
         try:
             importlib.import_module("flash_attn")
             flash_attn_available = True
-        except ModuleNotFoundError:
+        except ModuleNotFoundError as exc:
             if require_flash_attn:
                 raise RuntimeError(
                     "Stage1-S2 requested flash_attention_2 but flash_attn is not installed. "
                     "On 8xA800 panoramic SFT this usually causes SDPA to run extremely slowly. "
                     "Install flash-attn in the qwen25 environment, or set "
                     "STAGE1_S2_REQUIRE_FLASH_ATTN=0 to allow slow SDPA fallback."
-                )
+                ) from exc
             log.info("flash_attn is not installed in the shared environment; SDPA path remains enabled")
         except Exception as exc:
             if require_flash_attn:

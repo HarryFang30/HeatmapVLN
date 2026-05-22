@@ -208,9 +208,7 @@ def _is_allowed_trainable_name(name: str, trainable_modules: set[str]) -> bool:
         return True
     if 'llm_projector' in trainable_modules and name.startswith('llm_projector.'):
         return True
-    if ('lora' in trainable_modules or 'vlm_lora' in trainable_modules) and 'lora_' in name:
-        return True
-    return False
+    return ('lora' in trainable_modules or 'vlm_lora' in trainable_modules) and 'lora_' in name
 
 
 def _assert_trainable_scope(model: VLNPipeline, stage_cfg: dict, logger) -> None:

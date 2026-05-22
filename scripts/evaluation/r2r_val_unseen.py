@@ -208,16 +208,15 @@ import habitat
 import quaternion
 import torch
 import tqdm
-from habitat.core.embodied_task import EmbodiedTask, Measure
-from habitat.core.registry import registry
 from habitat.config.default import Config as CN
 from habitat.config.default import get_config as get_habitat_default_config
+from habitat.core.embodied_task import EmbodiedTask, Measure
+from habitat.core.registry import registry
 from habitat.tasks.nav.nav import DistanceToGoal
 from PIL import Image
 from scripts.training.model_builder import build_model
 from scripts.training.utils import _normalize_state_key, load_config
 
-from src.data.vln_sliding_window_dataset import compute_history_rel_poses
 from src.models.heatmap.input_constructor import construct_input
 
 MAX_STEPS = 8
@@ -946,7 +945,7 @@ def traj_to_actions(
 
             target_yaw = np.arctan2(target_dir[1], target_dir[0])
             delta_yaw = normalize_angle(target_yaw - yaw)
-            n_turns = int(round(delta_yaw / turn_angle_rad))
+            n_turns = round(delta_yaw / turn_angle_rad)
             if n_turns > 0:
                 actions += [ActionCode.LEFT] * n_turns
             elif n_turns < 0:

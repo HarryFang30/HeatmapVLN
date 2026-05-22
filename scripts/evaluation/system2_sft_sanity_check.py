@@ -17,8 +17,7 @@ import os
 import random
 import re
 import sys
-from collections import Counter
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -33,21 +32,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
-
 from scripts.training.checkpoint import load_checkpoint_for_resume
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
+
 from src.data.factory import build_dataset
 from src.models.heatmap.input_constructor import (
     DIRECT_WAYPOINT_TASK_SUFFIX,
-    INTERNAV_CONJUNCTIONS,
     INTERNAV_LOOKDOWN_TASK_SUFFIX,
     INTERNAV_TURN_TASK_SUFFIX,
     VIEW_NAMES,
     _ensure_pil,
     construct_input,
 )
-
 
 LOGGER = logging.getLogger("system2_sft_sanity")
 TURN_TEXT = {
@@ -401,8 +398,8 @@ def parse_generated_text(
         return ParsedText(kind="mixed", text=raw, action_seq=None, format_valid=False)
 
     if len(numbers) >= 2:
-        x = int(round(float(numbers[0])))
-        y = int(round(float(numbers[1])))
+        x = round(float(numbers[0]))
+        y = round(float(numbers[1]))
         width, height = image_size
         coord_valid = 0 <= x < width and 0 <= y < height
         strict = len(numbers) == 2

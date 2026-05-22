@@ -98,8 +98,14 @@ def test_panoramic_sft_collator_builds_assistant_labels():
     tokenizer = collator.processor.tokenizer
     row0_targets = labels[0][labels[0] != IGNORE_INDEX].tolist()
     row1_targets = labels[1][labels[1] != IGNORE_INDEX].tolist()
-    assert row0_targets == tokenizer.encode("12 34", add_special_tokens=False) + [tokenizer.eos_token_id]
-    assert row1_targets == tokenizer.encode("STOP", add_special_tokens=False) + [tokenizer.eos_token_id]
+    assert row0_targets == [
+        *tokenizer.encode("12 34", add_special_tokens=False),
+        tokenizer.eos_token_id,
+    ]
+    assert row1_targets == [
+        *tokenizer.encode("STOP", add_special_tokens=False),
+        tokenizer.eos_token_id,
+    ]
 
 
 def test_panoramic_sft_collator_labels_turns_and_skips_forward_by_default():
@@ -138,8 +144,10 @@ def test_panoramic_sft_collator_internnav_protocol_labels_down_then_coord():
     targets = out["pano_inputs"]["labels"][0]
     targets = targets[targets != IGNORE_INDEX].tolist()
     assert targets == (
-        tokenizer.encode("↓", add_special_tokens=False)
-        + [tokenizer.eos_token_id]
-        + tokenizer.encode("12 34", add_special_tokens=False)
-        + [tokenizer.eos_token_id]
+        [
+            *tokenizer.encode("↓", add_special_tokens=False),
+            tokenizer.eos_token_id,
+            *tokenizer.encode("12 34", add_special_tokens=False),
+            tokenizer.eos_token_id,
+        ]
     )
