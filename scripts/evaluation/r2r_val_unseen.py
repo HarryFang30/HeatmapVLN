@@ -122,6 +122,9 @@ if not hasattr(np, 'int'):
 if not hasattr(np, 'bool'):
     np.bool = np.bool_
 
+# Import torch before habitat_sim (habitat_sim pulls torch during its __init__).
+import torch as _torch_preload  # noqa: F401
+
 def _find_preinit_scene() -> str | None:
     candidates = [
         os.environ.get("HEATMAPVLN_PREINIT_SCENE"),
@@ -1057,7 +1060,7 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
     from safetensors import safe_open
 
     ref_key = "model.traj_dit.model.layers.0.attn1.to_q.weight"
-    model_key = "traj_dit.model.layers.0.attn1.to_q.weight"
+    model_key = "model.layers.0.attn1.to_q.weight"
     shard_paths: list[Path] = []
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.is_file():
