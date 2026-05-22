@@ -919,13 +919,28 @@ def _condition_output_ids_for_pixel_goal(
     tokenizer,
     pixel_goal: list[int],
     llm_output: str,
+    coord_order: str = "generated",
 ) -> torch.Tensor:
-    """Use the clamped pixel goal in the latent-conditioning text if needed."""
+    """Use the System1-compatible coordinate text in latent conditioning."""
     coord = [int(c) for c in re.findall(r"\d+", llm_output)]
-    if len(coord) >= 2 and [coord[0], coord[1]] == pixel_goal:
+    if coord_order == "generated":
+        desired = [int(pixel_goal[0]), int(pixel_goal[1])]
+    elif coord_order == "internnav_yx":
+        # InternNav System1 was trained from text like "301 225" while the
+        # eval-side pixel goal state is [u=225, v=301].  The panoramic SFT
+        # model emits [u v], so rewrite only the hidden-state conditioning text.
+        desired = [int(pixel_goal[1]), int(pixel_goal[0])]
+    else:
+        raise ValueError(f"Unsupported coord_order: {coord_order}")
+
+    if len(coord) >= 2 and [coord[0], coord[1]] == desired:
         return output_ids
 
-    coord_text = f"{int(pixel_goal[0])} {int(pixel_goal[1])}"
+    coord_text = f"{desired[0]} {desired[1]}"
+    print(
+        f"  [debug] System1 coordinate text ({coord_order}): {coord_text}",
+        flush=True,
+    )
     replacement = tokenizer.encode(coord_text, add_special_tokens=False)
     if not replacement:
         return output_ids
@@ -1032,6 +1047,13 @@ def _trajectory_debug_summary(
         f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), "
         f"direct={direct:.2f}, path_len={path_len:.2f}"
     )
+
+
+def _system1_coord_order(args, *, panoramic_internnav_protocol: bool) -> str:
+    requested = getattr(args, "system1_coord_order", "auto")
+    if requested != "auto":
+        return requested
+    return "internnav_yx" if panoramic_internnav_protocol else "generated"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1367,8 +1389,13 @@ def _run_eval_panoramic_vlm(
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
+    system1_coord_order = _system1_coord_order(
+        args,
+        panoramic_internnav_protocol=internnav_protocol,
+    )
     print(f"System2 SFT protocol: {'internnav' if internnav_protocol else 'direct'}")
     print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
+    print(f"System1 coordinate text order: {system1_coord_order}")
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
@@ -1614,6 +1641,7 @@ def _run_eval_panoramic_vlm(
                     tokenizer=processor.tokenizer,
                     pixel_goal=pixel_goal,
                     llm_output=llm_output,
+                    coord_order=system1_coord_order,
                 )
                 with torch.no_grad():
                     _last_traj_hs = model.qwen2_5_vl.generate_latents(
@@ -1708,6 +1736,7 @@ def _run_eval_panoramic_vlm(
             "episode_instruction": instruction,
             "vlm_calls": system2_calls,
             "trajectory_calls": trajectory_calls,
+            "system1_coord_order": system1_coord_order,
         }
         with open(progress_file, "a") as f:
             f.write(json.dumps(result) + "\n")
@@ -2015,6 +2044,7 @@ def run_eval(args):
                         tokenizer=processor.tokenizer,
                         pixel_goal=pixel_goal,
                         llm_output=llm_output,
+                        coord_order="generated",
                     )
                     with torch.no_grad():
                         _last_traj_hs = model.qwen2_5_vl.generate_latents(
@@ -2211,6 +2241,15 @@ def main():
         type=int,
         default=0,
         help="Optional debug safety cap for VLM calls per episode; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--system1_coord_order",
+        choices=("auto", "generated", "internnav_yx"),
+        default="auto",
+        help=(
+            "Coordinate text used for System1 latent conditioning. auto rewrites "
+            "panoramic InternNav-protocol [u v] outputs to InternNav [v u]."
+        ),
     )
     parser.add_argument("--max_episodes", type=int, default=None,
                         help="Evaluate at most this many new episodes")
