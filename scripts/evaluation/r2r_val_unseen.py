@@ -1381,12 +1381,16 @@ def _run_eval_panoramic_vlm(
                     continue
 
                 if action == ActionCode.STOP:
+                    # This STOP comes from the local System1 action queue
+                    # (often padding after a short local trajectory).  InternNav
+                    # treats it as "local waypoint finished, ask System2 again",
+                    # not as the final VLN episode STOP.
                     pix_goal_image = None
                     _last_traj_hs = None
                     local_actions = []
                     forward_action_count = 0
-                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
-                    step_id += 1
+                    base_messages = None
+                    awaiting_lookdown = False
                     continue
 
                 observations, done = _apply_habitat_action(env, action)
@@ -1982,13 +1986,13 @@ def run_eval(args):
                     continue
 
                 if action == ActionCode.STOP:
+                    # Local System1 STOP means replan from System2.  Only an
+                    # explicit high-level VLM STOP should finish the episode.
                     pix_goal_image = None
                     _last_traj_hs = None
                     messages = []
                     forward_action_count = 0
                     local_actions = []
-                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
-                    step_id += 1
                     continue
             else:
                 action = ActionCode.STOP
