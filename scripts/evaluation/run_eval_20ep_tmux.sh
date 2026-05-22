@@ -2,9 +2,9 @@
 # 20 fixed val_unseen episodes in tmux (HeatmapVLN Stage2 + eval patches).
 set -euo pipefail
 
-SESSION="${1:-eval_20ep_v4}"
+SESSION="${1:-eval_20ep_v5}"
 ROOT="/workspace/HeatmapVLN"
-OUT="${2:-${ROOT}/logs/compare_rerun_20ep_v4/heatmapvln}"
+OUT="${2:-${ROOT}/logs/compare_rerun_20ep_v5/heatmapvln}"
 DEBUG_SAVE_IMAGES="${DEBUG_SAVE_INPUT_IMAGES:-8}"
 EP="${ROOT}/logs/compare_rerun_20ep/episode_list.json"
 
