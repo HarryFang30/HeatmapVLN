@@ -1023,12 +1023,88 @@ def prepare_vlm_inputs(
 # Section 8: Model building
 # ═══════════════════════════════════════════════════════════════════════
 
+def _resolve_internnav_model_path(cfg: dict) -> str:
+    raw = (
+        os.environ.get("INTERNNAV_MODEL_PATH")
+        or os.environ.get("INTERNNAV_BACKBONE")
+        or cfg.get("model", {})
+        .get("action_head", {})
+        .get("nextdit", {})
+        .get("internnav_model_path", "")
+        or cfg.get("model", {}).get("llm", {}).get("model_path", "")
+    )
+    return os.path.expandvars(os.path.expanduser(str(raw or "").strip()))
+
+
+def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str) -> None:
+    """Fail fast when NextDiT System1 was not loaded from InternNav safetensors."""
+    head = getattr(model, "nextdit_action_head", None)
+    if head is None:
+        return
+
+    unresolved = internnav_path.startswith("$") or not internnav_path
+    if unresolved:
+        raise RuntimeError(
+            "INTERNNAV_MODEL_PATH is not set (config still has an unresolved placeholder). "
+            "Stage2 eval requires InternNav System1 weights for traj_dit/rgb_model; "
+            "export INTERNNAV_MODEL_PATH=/path/to/InternNav_Model before running."
+        )
+
+    model_dir = Path(internnav_path)
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"INTERNNAV_MODEL_PATH does not exist: {internnav_path}")
+
+    from safetensors import safe_open
+
+    ref_key = "model.traj_dit.model.layers.0.attn1.to_q.weight"
+    model_key = "traj_dit.model.layers.0.attn1.to_q.weight"
+    shard_paths: list[Path] = []
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        import json as _json
+
+        weight_map = _json.loads(index_path.read_text()).get("weight_map", {})
+        if ref_key not in weight_map:
+            raise RuntimeError(f"{ref_key} missing from {index_path}")
+        shard_paths = [model_dir / weight_map[ref_key]]
+    else:
+        single = model_dir / "model.safetensors"
+        if single.is_file():
+            shard_paths = [single]
+        else:
+            raise FileNotFoundError(
+                f"No InternNav safetensors found under {internnav_path}"
+            )
+
+    with safe_open(str(shard_paths[0]), framework="pt", device="cpu") as handle:
+        if ref_key not in handle.keys():
+            raise RuntimeError(f"{ref_key} missing from {shard_paths[0]}")
+        reference = handle.get_tensor(ref_key).float()
+
+    current = head.traj_dit.state_dict()[model_key].detach().float().cpu()
+    if current.shape != reference.shape or not torch.allclose(current, reference, atol=1e-4, rtol=1e-3):
+        raise RuntimeError(
+            "InternNav System1 weights were not loaded into NextDiT "
+            f"(mismatch on {model_key}). Check INTERNNAV_MODEL_PATH and eval startup logs."
+        )
+    print(
+        f"Verified InternNav System1 weights loaded from {internnav_path} "
+        f"({model_key} matches safetensors)",
+        flush=True,
+    )
+
+
 def load_model(args, device: torch.device):
     """Build VLNPipeline, initialise lazy modules, then load checkpoints."""
     cfg = load_config(args.config)
+    internnav_path = _resolve_internnav_model_path(cfg)
+    if internnav_path:
+        print(f"InternNav model path: {internnav_path}", flush=True)
+
     model = build_model(cfg, device=str(device), verbose=False)
 
     model = model.to(device)
+    _verify_internnav_system1_loaded(model, internnav_path)
 
     checkpoint_cfg = _extract_checkpoint_config(args.checkpoint)
     if not args.base_checkpoint and checkpoint_cfg:
