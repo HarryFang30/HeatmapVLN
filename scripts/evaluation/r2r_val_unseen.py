@@ -200,6 +200,7 @@ gym.spaces.Discrete = _PatchedDiscrete
 
 import argparse
 import copy
+import hashlib
 import itertools
 import json
 import random
@@ -1004,6 +1005,86 @@ def _metric_distance_to_goal(env) -> float | None:
     return distance if np.isfinite(distance) else None
 
 
+def _debug_input_trace_enabled(args) -> bool:
+    return bool(getattr(args, "debug_input_trace", True))
+
+
+def _image_trace_summary(image: Image.Image) -> str:
+    arr = np.asarray(image)
+    if arr.size == 0:
+        return "empty"
+    digest = hashlib.sha1(arr.tobytes()).hexdigest()[:10]
+    height, width = arr.shape[:2]
+    return (
+        f"{width}x{height}:{digest}:"
+        f"mean={float(arr.mean()):.1f}:std={float(arr.std()):.1f}"
+    )
+
+
+def _views_trace_summary(views: dict[str, Image.Image]) -> str:
+    parts = []
+    for name in ("front", "right", "back", "left"):
+        image = views.get(name)
+        if image is not None:
+            parts.append(f"{name}={_image_trace_summary(image)}")
+    return " ".join(parts)
+
+
+def _agent_pose_summary(env) -> str:
+    try:
+        state = env._sim.get_agent(0).get_state()
+        pos = np.asarray(state.position, dtype=np.float64)
+        rot = quaternion.as_float_array(state.rotation)
+    except Exception as exc:
+        return f"pose=unavailable:{type(exc).__name__}"
+    return (
+        f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
+        f"rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f},{rot[3]:.4f})"
+    )
+
+
+def _env_trace_summary(env) -> str:
+    distance = _metric_distance_to_goal(env)
+    dist_text = "dist=NA" if distance is None else f"dist={distance:.3f}"
+    return f"{_agent_pose_summary(env)} {dist_text}"
+
+
+def _tensor_trace_summary(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "none"
+    t = tensor.detach()
+    if t.numel() == 0:
+        return f"shape={tuple(t.shape)} empty"
+    tf = t.float()
+    return (
+        f"shape={tuple(t.shape)} "
+        f"mean={float(tf.mean().item()):.4f} "
+        f"std={float(tf.std(unbiased=False).item()):.4f}"
+    )
+
+
+def _maybe_save_debug_images(
+    args,
+    scene_id: str,
+    episode_id: int,
+    call_idx: int,
+    phase: str,
+    images: dict[str, Image.Image],
+) -> None:
+    limit = int(getattr(args, "debug_save_input_images", 0) or 0)
+    if limit <= 0 or call_idx > limit:
+        return
+
+    debug_dir = (
+        Path(args.output_path)
+        / "debug_inputs"
+        / f"{scene_id}_{episode_id:04d}"
+    )
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    for name, image in images.items():
+        image.save(debug_dir / f"{call_idx:04d}_{phase}_{name}.jpg")
+
+
 def _maybe_stop_at_success(env, args, step_id: int):
     stop_distance = float(getattr(args, "auto_stop_distance", 0.0) or 0.0)
     if stop_distance <= 0.0:
@@ -1494,7 +1575,14 @@ def _run_eval_panoramic_vlm(
                     awaiting_lookdown = False
                     continue
 
+                before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                 observations, done = _apply_habitat_action(env, action)
+                if before is not None:
+                    print(
+                        f"  [debug] executed local action={int(action)} "
+                        f"{before} -> {_env_trace_summary(env)}",
+                        flush=True,
+                    )
                 step_id += 1
                 continue
 
@@ -1504,6 +1592,13 @@ def _run_eval_panoramic_vlm(
                 # forward RGB is a domain mismatch; capture a fresh lookdown
                 # (LOOKDOWN×2 → RGB → LOOKUP×2 restores pitch).
                 current_lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+                if _debug_input_trace_enabled(args):
+                    print(
+                        "  [debug] System1 refresh lookdown: "
+                        f"{_env_trace_summary(env)} "
+                        f"lookdown={_image_trace_summary(current_lookdown_img)}",
+                        flush=True,
+                    )
                 current_traj_t = _lookdown_to_traj_tensor(current_lookdown_img, device)
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
 
@@ -1537,6 +1632,21 @@ def _run_eval_panoramic_vlm(
 
             if awaiting_lookdown and base_messages is not None:
                 turn_lookdown_img = capture_lookdown_view(env, image_size=vlm_image_size)
+                if _debug_input_trace_enabled(args):
+                    print(
+                        "  [debug] System2 lookdown input: "
+                        f"{_env_trace_summary(env)} "
+                        f"lookdown={_image_trace_summary(turn_lookdown_img)}",
+                        flush=True,
+                    )
+                _maybe_save_debug_images(
+                    args,
+                    scene_id,
+                    episode_id,
+                    system2_calls + 1,
+                    "lookdown",
+                    {"lookdown": turn_lookdown_img},
+                )
                 messages = copy.deepcopy(base_messages)
                 messages.append({
                     "role": "assistant",
@@ -1555,6 +1665,22 @@ def _run_eval_panoramic_vlm(
                 prompt_history = _sample_history_panoramas(
                     executed_history_panoramas,
                     num_history,
+                )
+                if _debug_input_trace_enabled(args):
+                    print(
+                        "  [debug] System2 panoramic input: "
+                        f"{_env_trace_summary(env)} "
+                        f"history={len(prompt_history)} "
+                        f"{_views_trace_summary(current_views)}",
+                        flush=True,
+                    )
+                _maybe_save_debug_images(
+                    args,
+                    scene_id,
+                    episode_id,
+                    system2_calls + 1,
+                    "pano",
+                    current_views,
                 )
                 messages = construct_input(
                     current_views=current_views,
@@ -1581,6 +1707,12 @@ def _run_eval_panoramic_vlm(
                 f"  [debug] input_ids shape={inputs['input_ids'].shape}, calling model.generate ...",
                 flush=True,
             )
+            if _debug_input_trace_enabled(args):
+                print(
+                    "  [debug] processor pixel_values "
+                    f"{_tensor_trace_summary(inputs.get('pixel_values'))}",
+                    flush=True,
+                )
             system2_calls += 1
             max_system2_calls = int(getattr(args, "max_system2_calls_per_episode", 0) or 0)
             if max_system2_calls > 0 and system2_calls > max_system2_calls:
@@ -1626,6 +1758,13 @@ def _run_eval_panoramic_vlm(
                         turn_lookdown_img
                         if turn_lookdown_img.size == traj_image_size
                         else turn_lookdown_img.resize(traj_image_size)
+                    )
+                if _debug_input_trace_enabled(args):
+                    print(
+                        "  [debug] System1 goal-freeze lookdown: "
+                        f"{_env_trace_summary(env)} "
+                        f"lookdown={_image_trace_summary(current_lookdown_img)}",
+                        flush=True,
                     )
                 current_traj_t = _lookdown_to_traj_tensor(current_lookdown_img, device)
                 pix_goal_image = current_traj_t.clone()
@@ -1688,11 +1827,34 @@ def _run_eval_panoramic_vlm(
                         base_messages = None
                         awaiting_lookdown = False
                         forward_action_count = 0
+                        before = (
+                            _env_trace_summary(env)
+                            if _debug_input_trace_enabled(args)
+                            else None
+                        )
                         observations, done = _apply_habitat_action(env, ActionCode.LEFT)
+                        if before is not None:
+                            print(
+                                "  [debug] executed anti-deadlock action="
+                                f"{int(ActionCode.LEFT)} {before} -> "
+                                f"{_env_trace_summary(env)}",
+                                flush=True,
+                            )
                         step_id += 1
                         continue
 
+                    before = (
+                        _env_trace_summary(env)
+                        if _debug_input_trace_enabled(args)
+                        else None
+                    )
                     observations, done = _apply_habitat_action(env, first_action)
+                    if before is not None:
+                        print(
+                            f"  [debug] executed first local action={int(first_action)} "
+                            f"{before} -> {_env_trace_summary(env)}",
+                            flush=True,
+                        )
                     step_id += 1
                     forward_action_count += 1
                     continue
@@ -2241,6 +2403,24 @@ def main():
         type=int,
         default=0,
         help="Optional debug safety cap for VLM calls per episode; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--debug_input_trace",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Print compact pose, distance, image hash, and processor tensor stats "
+            "for System2/System1 inputs."
+        ),
+    )
+    parser.add_argument(
+        "--debug_save_input_images",
+        type=int,
+        default=0,
+        help=(
+            "Save raw System2 input images for the first N VLM calls in "
+            "output_path/debug_inputs; 0 disables image dumps."
+        ),
     )
     parser.add_argument(
         "--system1_coord_order",
