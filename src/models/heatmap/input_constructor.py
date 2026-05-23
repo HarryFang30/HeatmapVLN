@@ -224,7 +224,7 @@ def construct_input_stage2(
 
     user_content: list[dict] = [
         {"type": "text", "text": prompt_text},
-        {"type": "video", "video": all_frames},
+        {"type": "video", "video": all_frames, "nframes": len(all_frames)},
     ]
     messages = [{"role": "user", "content": user_content}]
 
