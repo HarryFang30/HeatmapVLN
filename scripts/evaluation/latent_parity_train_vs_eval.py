@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Latent parity: eval ``generate_latents`` (path A) vs training collator forward (path B).
+Latent parity: eval (A), training collator forward (B), and isolated generate_latents (C).
 
-On the same gold pixel_goal samples, compare traj_hidden_states and downstream
-get_trajectory outputs to separate:
-  - generate_latents / eval wiring bug (A short, B normal)
-  - Stage2 bridge not learned (A and B both short)
+Path C (highest priority): same ``pano_inputs`` as B, strip trailing TRAJ tokens,
+call ``generate_latents`` on identical input_ids / pixel_values / image_grid_thw,
+compare to B's ``traj_hidden_states``.
+
+Decision:
+  - C vs B cosine > 0.99 → generate_latents OK; A/B gap is prompt / token sequence.
+  - C vs B cosine << 1   → generate_latents ≠ train forward; fix eval latent extraction.
+  - C ≈ B but B short   → fix eval wiring, but Stage2 bridge still weak vs GT.
 """
 
 from __future__ import annotations
@@ -47,8 +51,10 @@ from scripts.evaluation.r2r_val_unseen import (
 from scripts.training.utils import load_config
 from src.data.factory import build_trajectory_dataset
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
+from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
 LOGGER = logging.getLogger("latent_parity")
+COSINE_MATCH = 0.99
 
 PATH_LEN_RE = re.compile(r"path_len=([0-9.]+)")
 
@@ -100,6 +106,23 @@ def _build_train_batch(
     pano_inputs = batch["pano_inputs"]
     _normalize_multimodal_inputs(pano_inputs)
     return pano_inputs, batch["pano_num_histories"]
+
+
+def _strip_trailing_traj_tokens(
+    input_ids: torch.Tensor,
+    n_traj_query: int,
+) -> torch.Tensor:
+    """Return collator input_ids without the trailing TRAJ placeholders (path C)."""
+    if n_traj_query <= 0:
+        return input_ids
+    tail = input_ids[:, -n_traj_query:]
+    if not bool((tail == TRAJ_TOKEN_INDEX).all().item()):
+        got = tail[0].tolist()
+        raise RuntimeError(
+            f"Expected last {n_traj_query} tokens to be TRAJ_TOKEN_INDEX={TRAJ_TOKEN_INDEX}, "
+            f"got {got}"
+        )
+    return input_ids[:, :-n_traj_query].contiguous()
 
 
 def _latent_metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
@@ -245,6 +268,16 @@ def parity_forward_one(
     if traj_hs_b is None:
         raise RuntimeError("Training path did not return traj_hidden_states")
 
+    # ── Path C: B's pano_inputs minus TRAJ suffix → generate_latents ─────
+    output_ids_c = _strip_trailing_traj_tokens(pano_inputs["input_ids"], n_traj_query)
+    with torch.no_grad():
+        traj_hs_c = model.qwen2_5_vl.generate_latents(
+            output_ids=output_ids_c,
+            pixel_values=pano_inputs.get("pixel_values"),
+            image_grid_thw=pano_inputs.get("image_grid_thw"),
+            latent_queries=lq,
+        )
+
     traj_images = _build_eval_traj_images(sample, device, traj_image_size)
     traj_a = _run_get_trajectory(
         model, traj_hs_a, traj_images,
@@ -252,6 +285,10 @@ def parity_forward_one(
     )
     traj_b = _run_get_trajectory(
         model, traj_hs_b, traj_images,
+        num_sample_trajs=num_sample_trajs, action_scale=action_scale,
+    )
+    traj_c = _run_get_trajectory(
+        model, traj_hs_c, traj_images,
         num_sample_trajs=num_sample_trajs, action_scale=action_scale,
     )
 
@@ -262,18 +299,23 @@ def parity_forward_one(
         gt_summary = _trajectory_debug_summary(gt_t, 1, action_scale)
         gt_path_len = _parse_path_len(gt_summary)
 
-    latent_metrics = _latent_metrics(traj_hs_a, traj_hs_b)
+    latent_ab = _latent_metrics(traj_hs_a, traj_hs_b)
+    latent_cb = _latent_metrics(traj_hs_c, traj_hs_b)
     return {
         "pixel_goal": pixel_goal,
         "coord_text": coord_text,
-        "latent": latent_metrics,
-        "latent_cosine_per_query": _per_query_cosine(traj_hs_a, traj_hs_b),
+        "latent_ab": latent_ab,
+        "latent_cb": latent_cb,
+        "latent_ab_cosine_per_query": _per_query_cosine(traj_hs_a, traj_hs_b),
+        "latent_cb_cosine_per_query": _per_query_cosine(traj_hs_c, traj_hs_b),
         "path_a": traj_a,
         "path_b": traj_b,
+        "path_c": traj_c,
         "gt_trajectory_summary": gt_summary,
         "gt_path_len": gt_path_len,
         "seq_len_eval": int(condition_output_ids.shape[1]),
         "seq_len_train": int(pano_inputs["input_ids"].shape[1]),
+        "seq_len_c_input": int(output_ids_c.shape[1]),
         "pano_num_histories": int(pano_num_histories[0]),
     }
 
@@ -374,17 +416,23 @@ def main() -> int:
         print("No samples processed.", flush=True)
         return 1
 
-    cosines = [r["latent"]["cosine_mean"] for r in records if not np.isnan(r["latent"]["cosine_mean"])]
+    cos_ab = [r["latent_ab"]["cosine_mean"] for r in records if not np.isnan(r["latent_ab"]["cosine_mean"])]
+    cos_cb = [r["latent_cb"]["cosine_mean"] for r in records if not np.isnan(r["latent_cb"]["cosine_mean"])]
     path_a = [r["path_a"]["path_len"] for r in records if r["path_a"]["path_len"] is not None]
     path_b = [r["path_b"]["path_len"] for r in records if r["path_b"]["path_len"] is not None]
+    path_c = [r["path_c"]["path_len"] for r in records if r["path_c"]["path_len"] is not None]
     gt_lens = [r["gt_path_len"] for r in records if r["gt_path_len"] is not None]
 
     a_short = sum(1 for p in path_a if p < SHORT)
     b_short = sum(1 for p in path_b if p < SHORT)
-    a_ok_b_ok = sum(
+    c_short = sum(1 for p in path_c if p < SHORT)
+    cb_match = sum(1 for c in cos_cb if c >= COSINE_MATCH)
+    cb_mismatch = sum(1 for c in cos_cb if c < COSINE_MATCH)
+    c_match_b_short = sum(
         1 for r in records
-        if r["path_a"]["path_len"] is not None and r["path_b"]["path_len"] is not None
-        and r["path_a"]["path_len"] >= SHORT and r["path_b"]["path_len"] >= SHORT
+        if r["latent_cb"]["cosine_mean"] >= COSINE_MATCH
+        and r["path_b"]["path_len"] is not None
+        and r["path_b"]["path_len"] < SHORT
     )
     a_short_b_ok = sum(
         1 for r in records
@@ -393,54 +441,68 @@ def main() -> int:
     )
     both_short = sum(
         1 for r in records
-        if r["path_a"]["path_len"] is not None and r["path_b"]["path_len"] is not None
-        and r["path_a"]["path_len"] < SHORT and r["path_b"]["path_len"] < SHORT
+        if r["path_b"]["path_len"] is not None and r["path_c"]["path_len"] is not None
+        and r["path_b"]["path_len"] < SHORT and r["path_c"]["path_len"] < SHORT
     )
-    cos_lt_95 = sum(1 for c in cosines if c < 0.95)
 
-    print("\n===== Latent Parity (eval generate_latents vs train forward) =====", flush=True)
+    print("\n===== Latent Parity A / B / C =====", flush=True)
     print(f"samples:              {n} (skipped: {skipped})", flush=True)
-    if cosines:
-        print(f"cosine_mean:          avg={np.mean(cosines):.4f} min={np.min(cosines):.4f} max={np.max(cosines):.4f}", flush=True)
-        print(f"cosine < 0.95:        {cos_lt_95}/{n} ({_pct(cos_lt_95, n)})", flush=True)
+    if cos_cb:
+        print(
+            f"C vs B cosine:        avg={np.mean(cos_cb):.4f} "
+            f"min={np.min(cos_cb):.4f} max={np.max(cos_cb):.4f}",
+            flush=True,
+        )
+        print(f"C vs B >= {COSINE_MATCH}:     {cb_match}/{n} ({_pct(cb_match, n)})", flush=True)
+    if cos_ab:
+        print(
+            f"A vs B cosine:        avg={np.mean(cos_ab):.4f} "
+            f"(prompt+eval path; not isolated)",
+            flush=True,
+        )
     if path_a:
         print(f"path_len A (eval):    mean={np.mean(path_a):.3f} median={np.median(path_a):.3f}", flush=True)
     if path_b:
         print(f"path_len B (train):   mean={np.mean(path_b):.3f} median={np.median(path_b):.3f}", flush=True)
+    if path_c:
+        print(f"path_len C (gen_lat): mean={np.mean(path_c):.3f} median={np.median(path_c):.3f}", flush=True)
     if gt_lens:
         print(f"path_len GT label:    mean={np.mean(gt_lens):.3f} median={np.median(gt_lens):.3f}", flush=True)
-    print(f"path_len < {SHORT}m — A: {_pct(a_short, n)}  B: {_pct(b_short, n)}", flush=True)
+    print(f"path_len < {SHORT}m — A: {_pct(a_short, n)}  B: {_pct(b_short, n)}  C: {_pct(c_short, n)}", flush=True)
     print(f"A short & B ok:       {a_short_b_ok}/{n} ({_pct(a_short_b_ok, n)})", flush=True)
-    print(f"both short:           {both_short}/{n} ({_pct(both_short, n)})", flush=True)
-    print(f"both ok (>= {SHORT}m):  {a_ok_b_ok}/{n} ({_pct(a_ok_b_ok, n)})", flush=True)
+    print(f"B & C both short:     {both_short}/{n} ({_pct(both_short, n)})", flush=True)
+    print(f"C≈B but B short:      {c_match_b_short}/{n} ({_pct(c_match_b_short, n)})", flush=True)
     print(f"jsonl:                {out_path}", flush=True)
 
-    if a_short_b_ok >= max(3, n * 0.1):
+    median_cb = float(np.median(cos_cb)) if cos_cb else 0.0
+    median_gt = float(np.median(gt_lens)) if gt_lens else 0.0
+    median_b = float(np.median(path_b)) if path_b else 0.0
+
+    if cos_cb and median_cb >= COSINE_MATCH and cb_match >= n * 0.9:
         print(
-            "\nVERDICT: Eval generate_latents latents differ from train forward and "
-            "yield shorter trajectories → prioritize fixing eval/inference latent path.",
+            f"\nVERDICT [C≈B]: generate_latents matches train forward (median cosine={median_cb:.4f}). "
+            "Fix eval prompt / token sequence (path A), not generate_latents internals.",
             flush=True,
         )
-    elif both_short >= n * 0.5 and (not gt_lens or np.median(gt_lens) >= SHORT):
+        if median_b < SHORT and median_gt >= SHORT:
+            print(
+                "  Bridge still weak: train latents (B) do not yield GT-scale trajectories.",
+                flush=True,
+            )
+    elif cos_cb and median_cb < 0.95:
         print(
-            "\nVERDICT: Train and eval paths both short while GT paths are longer → "
-            "Stage2 bridge / training target / checkpoint may not be learning.",
+            f"\nVERDICT [C≠B]: generate_latents diverges from train forward (median cosine={median_cb:.4f}). "
+            "Replace eval latent extraction with _forward_model_inputs(..., latent_queries=...) "
+            "on collator pano_inputs; do not use hand-rolled inputs_embeds/rope path.",
             flush=True,
         )
-    elif both_short >= n * 0.5 and gt_lens and np.median(gt_lens) < SHORT:
+    elif c_match_b_short >= n * 0.5:
         print(
-            "\nVERDICT: GT trajectories are also short on this audit set → "
-            "check labels / action_scale before blaming bridge.",
-            flush=True,
-        )
-    elif cosines and np.median(cosines) >= 0.99 and abs(np.median(path_a) - np.median(path_b)) < 0.1:
-        print(
-            "\nVERDICT: Latents and trajectories align between paths → "
-            "suspect closed-loop System2 (prompt/history/off-policy), not latent extraction.",
+            "\nVERDICT [C≈B, B short]: latent extraction OK; Stage2 bridge / training is the bottleneck.",
             flush=True,
         )
     else:
-        print("\nVERDICT: Mixed — inspect jsonl per-sample latent_cosine_per_query.", flush=True)
+        print("\nVERDICT: Mixed — inspect jsonl latent_cb_cosine_per_query.", flush=True)
     return 0
 
 
