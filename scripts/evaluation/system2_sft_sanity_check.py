@@ -39,6 +39,7 @@ from scripts.training.utils import load_config
 from src.data.factory import build_dataset
 from src.models.heatmap.input_constructor import (
     DIRECT_WAYPOINT_TASK_SUFFIX,
+    INTERNAV_CONJUNCTIONS,
     INTERNAV_LOOKDOWN_TASK_SUFFIX,
     INTERNAV_TURN_TASK_SUFFIX,
     VIEW_NAMES,
@@ -489,10 +490,11 @@ def make_second_turn_messages(
         "role": "assistant",
         "content": [{"type": "text", "text": first_turn_text}],
     })
+    from src.models.heatmap.input_constructor import INTERNAV_CONJUNCTIONS as conjunctions
     messages.append({
         "role": "user",
         "content": [
-            {"type": "text", "text": random.choice(INTERNNAV_CONJUNCTIONS)},
+            {"type": "text", "text": random.choice(conjunctions)},
             {"type": "image", "image": _ensure_pil(lookdown_frame)},
         ],
     })
