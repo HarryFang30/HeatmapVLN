@@ -63,7 +63,7 @@ export STAGE2_FEISHU_NOTIFY STAGE2_INTERNNAV_MODEL STAGE2_SYSTEM1_CKPT
 make_stage_config STAGE2 "$STAGE2_CONFIG" "$STAGE2_TMP_CONFIG"
 log_config_summary "Stage2" "$STAGE2_TMP_CONFIG"
 
-log "Stage: Stage2 bridge-only"
+log "Stage: Stage2 action training"
 log "Repo root: $ROOT_DIR"
 log "Training GPUs: $GPU_DEVICES (nproc_per_node=$NPROC_PER_NODE)"
 log "InternNav backbone: $INTERNNAV_BACKBONE"
@@ -76,7 +76,7 @@ if is_truthy "$STAGE_DRY_RUN"; then
   exit 0
 fi
 
-run_training_stage "Stage2 bridge-only" "$MASTER_PORT_STAGE2" \
+run_training_stage "Stage2 action training" "$MASTER_PORT_STAGE2" \
   "$STAGE2_TMP_CONFIG" "$STAGE2_LOAD_WEIGHTS" "$STAGE2_MAX_BATCHES"
 
 FINAL_CKPT="$(choose_checkpoint "${STAGE2_OUT_DIR}/latest/checkpoints" "$STAGE2_CHECKPOINT_PREFERENCE")"

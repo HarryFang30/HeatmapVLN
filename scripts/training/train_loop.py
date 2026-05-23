@@ -53,38 +53,70 @@ logger = logging.getLogger(__name__)
 
 
 def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, logger) -> None:
-    """Keep frozen Stage2 components in eval mode while bridge params train.
+    """Keep frozen Stage2 components in eval mode while selected bridge params train.
 
     ``model.train()`` recursively switches every child module to training mode.
-    In bridge-only Stage2 most of those children are frozen conditions
-    (Qwen/LoRA, visual memory, NextDiT).  Leaving them in train mode can enable
-    dropout/stochastic-depth noise even though their weights are frozen.
+    Stage2 variants often train only a subset of the action condition stack
+    while Qwen/LoRA and most of System1 stay frozen.  Leaving frozen modules in
+    train mode can enable dropout/stochastic-depth noise even though their
+    weights are frozen.
     """
-    if not stage_cfg.get("bridge_only", False):
+    trainable = set(stage_cfg.get("trainable_modules", []))
+    selective_action_modules = {
+        "latent_queries",
+        "cond_projector",
+        "memory_encoder",
+        "rgb_resampler",
+        "traj_dit",
+        "action_encoder",
+        "action_decoder",
+    }
+    is_selective_stage2 = (
+        stage_cfg.get("bridge_only", False)
+        or (
+            stage_cfg.get("train_action", False)
+            and bool(trainable & selective_action_modules)
+            and "nextdit_action_head" not in trainable
+        )
+    )
+    if not is_selective_stage2:
         return
 
     vlm_backbone = getattr(model_module, "vlm_backbone", getattr(model_module, "qwen2_5_vl", None))
-    if vlm_backbone is not None:
+    if vlm_backbone is not None and not ({"lora", "vlm_lora"} & trainable):
         # Keep the VLM itself in train mode so Transformers gradient
         # checkpointing remains active, but disable frozen dropout noise.
         for submodule in vlm_backbone.modules():
             if isinstance(submodule, torch.nn.Dropout):
                 submodule.eval()
 
-    if getattr(model_module, "heatmap_vln", None) is not None:
+    if "heatmap_vln" not in trainable and getattr(model_module, "heatmap_vln", None) is not None:
         model_module.heatmap_vln.eval()
 
-    if getattr(model_module, "llm_projector", None) is not None:
+    if "llm_projector" not in trainable and getattr(model_module, "llm_projector", None) is not None:
         model_module.llm_projector.eval()
 
     nah = getattr(model_module, "nextdit_action_head", None)
     if nah is not None:
         nah.eval()
-        if "cond_projector" in set(stage_cfg.get("trainable_modules", [])):
-            # No dropout here, but keep the trainable bridge explicitly marked.
-            nah.cond_projector.train()
+        submodules = {
+            "cond_projector": "cond_projector",
+            "memory_encoder": "memory_encoder",
+            "rgb_resampler": "rgb_resampler",
+            "traj_dit": "traj_dit",
+            "action_encoder": "action_encoder",
+            "action_decoder": "action_decoder",
+        }
+        for cfg_name, attr_name in submodules.items():
+            if cfg_name in trainable:
+                submodule = getattr(nah, attr_name, None)
+                if submodule is not None:
+                    submodule.train()
 
-    logger.info("  Bridge-only mode: frozen System1 eval; frozen VLM dropout disabled")
+    logger.info(
+        "  Selective Stage2 mode: frozen modules eval; trainable action modules=%s",
+        sorted(trainable & selective_action_modules),
+    )
 
 
 def train_one_epoch(
