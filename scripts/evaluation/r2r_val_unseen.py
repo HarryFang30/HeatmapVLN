@@ -1794,6 +1794,8 @@ def _run_eval_panoramic_vlm(
                         pixel_values=inputs.get("pixel_values"),
                         image_grid_thw=inputs.get("image_grid_thw"),
                         latent_queries=lq,
+                        attention_mask=inputs.get("attention_mask"),
+                        mm_token_type_ids=inputs.get("mm_token_type_ids"),
                     )
 
                 print("  [debug] calling get_trajectory ...", flush=True)
@@ -2220,6 +2222,8 @@ def run_eval(args):
                             pixel_values=inputs.get("pixel_values"),
                             image_grid_thw=inputs.get("image_grid_thw"),
                             latent_queries=lq,
+                            attention_mask=inputs.get("attention_mask"),
+                            mm_token_type_ids=inputs.get("mm_token_type_ids"),
                         )
 
                     print("  [debug] calling get_trajectory ...", flush=True)

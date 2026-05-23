@@ -1304,79 +1304,107 @@ class Qwen2_5VLIntegration(nn.Module):
 
         return generated_text
 
+    @staticmethod
+    def _normalize_multimodal_forward_inputs(inputs: dict[str, torch.Tensor]) -> None:
+        if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+            vgt = inputs["video_grid_thw"]
+            if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
+                inputs["video_grid_thw"] = torch.repeat_interleave(
+                    vgt, vgt[:, 0], dim=0,
+                )
+                inputs["video_grid_thw"][:, 0] = 1
+
+    def extract_traj_hidden_states(
+        self,
+        output_ids: torch.Tensor,
+        latent_queries: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Extract trajectory conditions via the training-aligned forward path.
+
+        Appends ``TRAJ_TOKEN_INDEX`` placeholders when absent, then runs
+        ``_forward_model_inputs`` with ``latent_queries`` injection (same as
+        ``PanoramicTokenizedCollator`` + Stage2 training).
+        """
+        if not self._model_loaded:
+            self._load_model()
+
+        n_query = latent_queries.shape[1]
+        batch_size = output_ids.shape[0]
+        device = self.device
+        ids = output_ids.to(device)
+
+        has_traj_tokens = (ids == TRAJ_TOKEN_INDEX).any().item()
+        if not has_traj_tokens:
+            traj_suffix = torch.full(
+                (batch_size, n_query),
+                TRAJ_TOKEN_INDEX,
+                device=device,
+                dtype=ids.dtype,
+            )
+            ids = torch.cat([ids, traj_suffix], dim=1)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+                ext = torch.ones(
+                    batch_size, n_query,
+                    device=device,
+                    dtype=attention_mask.dtype,
+                )
+                attention_mask = torch.cat([attention_mask, ext], dim=1)
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = mm_token_type_ids.to(device)
+                mm_ext = torch.zeros(
+                    batch_size, n_query,
+                    device=device,
+                    dtype=mm_token_type_ids.dtype,
+                )
+                mm_token_type_ids = torch.cat([mm_token_type_ids, mm_ext], dim=1)
+
+        inputs: dict[str, torch.Tensor] = {"input_ids": ids}
+        if attention_mask is not None:
+            inputs["attention_mask"] = attention_mask
+        if mm_token_type_ids is not None:
+            inputs["mm_token_type_ids"] = mm_token_type_ids
+        if pixel_values is not None:
+            inputs["pixel_values"] = pixel_values.to(device)
+        if image_grid_thw is not None:
+            inputs["image_grid_thw"] = image_grid_thw.to(device)
+
+        self._normalize_multimodal_forward_inputs(inputs)
+
+        lq = latent_queries.to(device=device, dtype=self.config.get_torch_dtype())
+        with torch.no_grad():
+            _hidden, _vision, _n_img, traj_hidden_states, _lm_loss = self._forward_model_inputs(
+                inputs,
+                return_hidden_states=False,
+                latent_queries=lq,
+            )
+
+        if traj_hidden_states is None:
+            raise RuntimeError("extract_traj_hidden_states: forward returned no traj_hidden_states")
+        return traj_hidden_states.contiguous()
+
     def generate_latents(
         self,
         output_ids: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
         latent_queries: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Two-step inference aligned with InternNav ``generate_latents``.
-
-        After the model has auto-regressively generated pixel-goal text,
-        this method takes the **full** output sequence (prompt + generated
-        tokens), appends ``TRAJ_TOKEN_INDEX`` placeholders, replaces them
-        with ``latent_queries``, and runs a single forward pass.  The
-        hidden states at the TRAJ positions are the trajectory conditions.
-
-        Args:
-            output_ids: (1, L) full token sequence including generated text.
-            pixel_values: preprocessed image/video tensors from the processor.
-            image_grid_thw: grid layout tensor for vision tokens.
-            latent_queries: (1, n_query, hidden_dim) learnable queries.
-
-        Returns:
-            traj_hidden_states: (1, n_query, hidden_dim)
-        """
-        if not self._model_loaded:
-            self._load_model()
-
-        n_query = latent_queries.shape[1]
-        device = output_ids.device
-
-        traj_suffix = torch.full(
-            (1, n_query), TRAJ_TOKEN_INDEX,
-            device=device, dtype=output_ids.dtype,
+        """Extract traj_hidden_states (delegates to training-aligned forward)."""
+        return self.extract_traj_hidden_states(
+            output_ids=output_ids,
+            latent_queries=latent_queries,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+            mm_token_type_ids=mm_token_type_ids,
         )
-        extended_ids = torch.cat([output_ids, traj_suffix], dim=1)
-
-        embedding_layer = self.model.get_input_embeddings()
-        with torch.no_grad():
-            text_embeds = embedding_layer(extended_ids)
-
-        image_mask = extended_ids == self.image_token_id
-        if pixel_values is not None and image_mask.any():
-            pixel_values = pixel_values.to(
-                device=self.device,
-                dtype=next(self.model.parameters()).dtype,
-            )
-            image_embeds = self.model.visual(
-                pixel_values, grid_thw=image_grid_thw,
-            )
-            text_embeds[image_mask] = image_embeds.to(
-                device=text_embeds.device,
-            )[:image_mask.sum(), :]
-
-        lq = latent_queries.to(dtype=text_embeds.dtype, device=text_embeds.device)
-        text_embeds[:, -n_query:, :] = lq
-
-        rope_fn = getattr(self.model, 'get_rope_index', None)
-        position_ids = None
-        if rope_fn is not None:
-            position_ids, _ = rope_fn(extended_ids, image_grid_thw)
-            position_ids = position_ids.to(device)
-
-        with torch.no_grad():
-            outputs = self.model(
-                inputs_embeds=text_embeds,
-                position_ids=position_ids,
-                output_hidden_states=True,
-                return_dict=True,
-                use_cache=False,
-            )
-
-        traj_hidden_states = outputs.hidden_states[-1][:, -n_query:, :]
-        return traj_hidden_states.contiguous()
 
     def _extract_hidden_from_generation(
         self,
