@@ -15,9 +15,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
-import habitat  # noqa: E402
-
-from scripts.evaluation.r2r_val_unseen import (  # noqa: E402
+import habitat
+from scripts.evaluation.r2r_val_unseen import (
     build_habitat_config,
     ensure_vln_measures_registered,
 )

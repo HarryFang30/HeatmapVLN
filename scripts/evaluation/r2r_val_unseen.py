@@ -125,6 +125,7 @@ if not hasattr(np, 'bool'):
 # Import torch before habitat_sim (habitat_sim pulls torch during its __init__).
 import torch as _torch_preload  # noqa: F401
 
+
 def _find_preinit_scene() -> str | None:
     candidates = [
         os.environ.get("HEATMAPVLN_PREINIT_SCENE"),
@@ -1330,7 +1331,7 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
             raise FileNotFoundError(
                 f"No InternNav safetensors found under {internnav_path}"
             )
-        weight_map = {k: single.name for k in safe_open(str(single)).keys()}
+        weight_map = {k: single.name for k in safe_open(str(single)).keys()}  # noqa: SIM118
 
     shards: dict[str, object] = {}
 
@@ -1342,7 +1343,7 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
         if shard_name not in shards:
             shards[shard_name] = safe_open(str(shard_path), framework="pt", device="cpu")
         handle = shards[shard_name]
-        if ref_key not in handle.keys():
+        if ref_key not in handle.keys():  # noqa: SIM118
             raise RuntimeError(f"{ref_key} missing from {shard_path}")
         return handle.get_tensor(ref_key).float()
 

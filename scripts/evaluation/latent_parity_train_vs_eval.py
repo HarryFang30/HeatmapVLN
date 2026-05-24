@@ -34,7 +34,6 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from scripts.evaluation.oracle_pixel_goal_bridge_test import (
     build_eval_aligned_messages,
     load_eval_model,
@@ -49,6 +48,7 @@ from scripts.evaluation.r2r_val_unseen import (
     traj_to_actions,
 )
 from scripts.training.utils import load_config
+
 from src.data.factory import build_trajectory_dataset
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
@@ -217,10 +217,13 @@ def parity_forward_one(
     )
     prompt_len = int(prefill["input_ids"].shape[1])
 
-    messages_with_gold = list(messages) + [{
-        "role": "assistant",
-        "content": [{"type": "text", "text": coord_text}],
-    }]
+    messages_with_gold = [
+        *messages,
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": coord_text}],
+        },
+    ]
     full = processor.apply_chat_template(
         messages_with_gold,
         tokenize=True,
@@ -427,7 +430,6 @@ def main() -> int:
     b_short = sum(1 for p in path_b if p < SHORT)
     c_short = sum(1 for p in path_c if p < SHORT)
     cb_match = sum(1 for c in cos_cb if c >= COSINE_MATCH)
-    cb_mismatch = sum(1 for c in cos_cb if c < COSINE_MATCH)
     c_match_b_short = sum(
         1 for r in records
         if r["latent_cb"]["cosine_mean"] >= COSINE_MATCH

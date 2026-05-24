@@ -31,7 +31,6 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
-
 from scripts.evaluation.latent_parity_train_vs_eval import _build_train_batch
 from scripts.evaluation.r2r_val_unseen import (
     _extract_checkpoint_state_dict,
@@ -44,6 +43,7 @@ from scripts.evaluation.r2r_val_unseen import (
 )
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
+
 from src.data.factory import build_trajectory_dataset
 
 LOGGER = logging.getLogger("bridge_ab")
@@ -306,7 +306,6 @@ def load_bridge_model(
     if model.nextdit_action_head is None or model.latent_queries is None:
         raise RuntimeError("nextdit_action_head / latent_queries disabled")
 
-    bridge_before = _snapshot_bridge_params(model)
     base_sd = _extract_checkpoint_state_dict(str(base_ckpt))
     _load_compatible_state_dict(model, base_sd, str(base_ckpt), label=f"[{label}] Base")
     bridge_after_base = _snapshot_bridge_params(model)

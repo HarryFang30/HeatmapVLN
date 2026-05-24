@@ -29,7 +29,6 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import torch
 from PIL import Image
-
 from scripts.evaluation.r2r_val_unseen import (
     _condition_output_ids_for_pixel_goal,
     _extract_checkpoint_state_dict,
@@ -46,6 +45,7 @@ from scripts.evaluation.r2r_val_unseen import (
 from scripts.evaluation.system2_sft_sanity_check import make_generation_messages
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
+
 from src.data.factory import build_trajectory_dataset
 from src.models.heatmap.input_constructor import INTERNAV_CONJUNCTIONS
 
@@ -145,10 +145,13 @@ def oracle_forward_one(
     )
     prompt_len = int(prefill["input_ids"].shape[1])
 
-    messages_with_gold = list(messages) + [{
-        "role": "assistant",
-        "content": [{"type": "text", "text": coord_text}],
-    }]
+    messages_with_gold = [
+        *messages,
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": coord_text}],
+        },
+    ]
     full = processor.apply_chat_template(
         messages_with_gold,
         tokenize=True,

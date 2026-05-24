@@ -39,7 +39,6 @@ from scripts.training.utils import load_config
 from src.data.factory import build_dataset
 from src.models.heatmap.input_constructor import (
     DIRECT_WAYPOINT_TASK_SUFFIX,
-    INTERNAV_CONJUNCTIONS,
     INTERNAV_LOOKDOWN_TASK_SUFFIX,
     INTERNAV_TURN_TASK_SUFFIX,
     VIEW_NAMES,
