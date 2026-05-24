@@ -106,6 +106,7 @@ def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: t
     if args.internnav_model_path:
         os.environ["INTERNNAV_MODEL_PATH"] = args.internnav_model_path
         cfg.setdefault("paths", {})["internnav_model_path"] = args.internnav_model_path
+        cfg.setdefault("model", {}).setdefault("llm", {})["model_path"] = args.internnav_model_path
         cfg.setdefault("model", {}).setdefault("action_head", {}).setdefault("nextdit", {})[
             "internnav_model_path"
         ] = args.internnav_model_path
