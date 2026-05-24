@@ -816,6 +816,16 @@ def parse_args() -> argparse.Namespace:
             "stop_turn: only STOP/turn/no-pixel states for System2 policy labels."
         ),
     )
+    p.add_argument(
+        "--index-mode",
+        choices=["generic", "internnav_sft"],
+        default="generic",
+        help=(
+            "generic builds the regular clip-level dataset index quickly and filters samples "
+            "on the fly. internnav_sft exactly rebuilds the old InternNav SFT pixel index, "
+            "but scans all clips at startup and can look stuck on large datasets."
+        ),
+    )
     p.add_argument("--allow-no-pixel-goal", dest="require_pixel_goal", action="store_false")
     p.set_defaults(require_pixel_goal=True)
     p.add_argument("--all-samples", action="store_true", help="Ignore config require_sft_target and iterate the generic dataset index")
@@ -867,6 +877,7 @@ def main() -> None:
     if args.sample_mode in {"all", "stop_turn"}:
         args.require_pixel_goal = False
         args.include_stop = True
+        args.index_mode = "generic"
     if args.num_shards < 1:
         raise ValueError("--num-shards must be >= 1")
     if not (0 <= args.shard_index < args.num_shards):
@@ -888,7 +899,7 @@ def main() -> None:
     traj_cfg["load_lookdown_for_system2"] = True
     traj_cfg["load_traj_images"] = True
     traj_cfg["enable_trajectory_augmentation"] = False
-    if args.sample_mode in {"all", "stop_turn"}:
+    if args.sample_mode in {"all", "stop_turn"} or args.index_mode == "generic":
         traj_cfg["require_sft_target"] = False
     elif args.sample_mode == "pixel":
         traj_cfg["require_sft_target"] = True
@@ -896,11 +907,19 @@ def main() -> None:
     action_scale = float(traj_cfg.get("action_scale", 4.0))
     print(
         f"[dataset] root={args.root} split={args.split} sample_mode={args.sample_mode} "
+        f"index_mode={args.index_mode} "
         f"require_sft_target={traj_cfg.get('require_sft_target')} "
         f"require_pixel_goal={args.require_pixel_goal} include_stop={args.include_stop} "
         f"shard={args.shard_index}/{args.num_shards}",
         flush=True,
     )
+    if traj_cfg.get("require_sft_target"):
+        print(
+            "[dataset] building InternNav SFT index; this scans all clips and may take several minutes...",
+            flush=True,
+        )
+    else:
+        print("[dataset] building generic clip-level index...", flush=True)
     dataset = build_trajectory_dataset(
         cfg,
         split=args.split,
@@ -932,9 +951,11 @@ def main() -> None:
     written = 0
     skipped = 0
     errors = 0
+    scanned = 0
     kind_counts: dict[str, int] = {}
     with out_path.open("a", encoding="utf-8", buffering=1) as f:
         for idx in range(len(dataset)):
+            scanned += 1
             if args.num_shards > 1 and idx % args.num_shards != args.shard_index:
                 continue
             if idx in done:
@@ -979,9 +1000,9 @@ def main() -> None:
                 f.write(json.dumps(err_rec, ensure_ascii=False, separators=(",", ":")) + "\n")
                 written += 1
 
-            if args.progress_interval > 0 and (attempted + errors) % args.progress_interval == 0:
+            if args.progress_interval > 0 and scanned % args.progress_interval == 0:
                 print(
-                    f"[progress] attempted={attempted} written={written} skipped={skipped} "
+                    f"[progress] scanned={scanned} attempted={attempted} written={written} skipped={skipped} "
                     f"errors={errors} last_idx={idx}",
                     flush=True,
                 )
@@ -989,7 +1010,7 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
     print(
-        f"[done] output={out_path} attempted={attempted} written={written} skipped={skipped} "
+        f"[done] output={out_path} scanned={scanned} attempted={attempted} written={written} skipped={skipped} "
         f"errors={errors} kind_counts={kind_counts}",
         flush=True,
     )

@@ -178,13 +178,9 @@ def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
     traj_cfg = cfg.setdefault("data", {}).setdefault("trajectory", {})
     traj_cfg["panoramic_vlm_input"] = True
     traj_cfg["load_lookdown_for_system2"] = True
-    # Keep this true so the InternNav-style SFT sample_index matches the
-    # teacher sidecar collected in pixel mode.  When false, the dataset also
-    # inserts turn/stop samples and the saved dataset_index no longer refers
-    # to the same state.
-    traj_cfg["load_traj_images"] = True
+    traj_cfg["load_traj_images"] = args.index_mode == "internnav_sft"
     traj_cfg["enable_trajectory_augmentation"] = False
-    traj_cfg["require_sft_target"] = True
+    traj_cfg["require_sft_target"] = args.index_mode == "internnav_sft"
     return cfg
 
 
@@ -192,6 +188,44 @@ def _copy_sample_for_collator(sample: dict[str, Any], coord_uv: list[int]) -> di
     copied = {k: v for k, v in sample.items()}
     copied["pixel_goal"] = [int(coord_uv[0]), int(coord_uv[1])]
     return copied
+
+
+def _sample_from_record(dataset: Any, rec: dict[str, Any]) -> dict[str, Any]:
+    """Load the exact `(clip_idx, current_t)` state recorded in the sidecar.
+
+    The collector can run on the fast generic dataset index while older
+    sidecars may use the InternNav SFT index.  Using the recorded clip/frame
+    pair avoids coupling adapter training to whichever index mode was used.
+    """
+    idx = int(rec["dataset_index"])
+    clip_idx = rec.get("clip_idx")
+    current_t = rec.get("current_t")
+    if clip_idx is None or current_t is None:
+        return dataset[idx]
+
+    target = (int(clip_idx), int(current_t))
+    if 0 <= idx < len(dataset.sample_index) and tuple(dataset.sample_index[idx]) == target:
+        return dataset[idx]
+
+    # Temporarily append the requested state.  VLNTrajectoryDataset builds
+    # samples from `self.sample_index[idx]`, so this avoids an expensive exact
+    # global index rebuild while still using the normal loader path.
+    temp_idx = len(dataset.sample_index)
+    dataset.sample_index.append(target)
+    old_range = getattr(dataset, "_sample_subsequence_range", None)
+    try:
+        if old_range is not None:
+            try:
+                meta = dataset._load_meta(target[0])
+                num_frames = int(meta.get("num_frames", target[1] + 1))
+            except Exception:
+                num_frames = target[1] + 1
+            old_range[temp_idx] = (0, num_frames)
+        return dataset[temp_idx]
+    finally:
+        dataset.sample_index.pop()
+        if old_range is not None:
+            old_range.pop(temp_idx, None)
 
 
 def _move_pano_inputs_to_device(pano_inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -308,6 +342,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher-jsonl", required=True)
     p.add_argument("--base-checkpoint", default="checkpoints/stage1-s2_latest.pth")
     p.add_argument("--internnav-model-path", default=os.environ.get("INTERNNAV_MODEL_PATH", ""))
+    p.add_argument(
+        "--index-mode",
+        choices=["generic", "internnav_sft"],
+        default="generic",
+        help="Use generic for sidecars collected with the fast default index; internnav_sft exactly rebuilds the old SFT index.",
+    )
     p.add_argument("--output-dir", default="outputs/pano_latent_adapter")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=42)
@@ -354,7 +394,7 @@ def main() -> int:
         load_history_heatmap=False,
         panoramic_vlm_input=True,
         load_lookdown_for_system2=True,
-        load_traj_images=True,
+        load_traj_images=args.index_mode == "internnav_sft",
     )
     LOGGER.info("Dataset samples=%d", len(dataset))
 
@@ -406,7 +446,7 @@ def main() -> int:
                 if idx < 0 or idx >= len(dataset):
                     LOGGER.warning("Skip out-of-range dataset_index=%s", idx)
                     continue
-                sample = dataset[idx]
+                sample = _sample_from_record(dataset, rec)
                 coord_uv = rec["teacher"]["coord_uv"]
                 batch_samples.append(_copy_sample_for_collator(sample, coord_uv))
                 usable_records.append(rec)
