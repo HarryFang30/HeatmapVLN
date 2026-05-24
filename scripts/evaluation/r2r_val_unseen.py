@@ -1148,77 +1148,175 @@ def _system1_coord_order(args, *, panoramic_internnav_protocol: bool) -> str:
 # Section 6: Trajectory → discrete actions conversion
 # ═══════════════════════════════════════════════════════════════════════
 
+TRAJECTORY_SELECTION_CHOICES = (
+    "mean",
+    "endpoint_medoid",
+    "path_medoid",
+    "median_endpoint_nearest",
+    "forward_or_medoid",
+    "longest_forward",
+)
+
+
+def reconstruct_xy_from_delta(delta_xyt: np.ndarray) -> np.ndarray:
+    start_xy = np.zeros((len(delta_xyt), 2))
+    delta_xy = delta_xyt[:, :, :2]
+    cumsum_xy = np.cumsum(delta_xy, axis=1)
+
+    batch_size = delta_xyt.shape[0]
+    steps = delta_xyt.shape[1]
+    xy = np.zeros((batch_size, steps + 1, 2))
+    xy[:, 0] = start_xy
+    xy[:, 1:] = start_xy[:, None, :] + cumsum_xy
+    return xy
+
+
+def trajectory_xy_path_len(trajectory: np.ndarray) -> float:
+    if trajectory.ndim != 2 or trajectory.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(trajectory[:, :2], axis=0), axis=1).sum())
+
+
+def _trajectory_to_discrete_actions_close_to_goal(
+    trajectory: np.ndarray,
+    step_size: float = 0.25,
+    turn_angle_deg: float = 15,
+    lookahead: int = 4,
+) -> list[int]:
+    actions: list[int] = []
+    yaw = 0.0
+    pos = trajectory[0]
+    turn_angle_rad = np.deg2rad(turn_angle_deg)
+    goal = trajectory[-1]
+
+    def normalize_angle(angle: float) -> float:
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    while np.linalg.norm(pos - goal) > 0.2:
+        dists = np.linalg.norm(trajectory - pos, axis=1)
+        nearest_idx = np.argmin(dists)
+        target_idx = min(nearest_idx + lookahead, len(trajectory) - 1)
+        target = trajectory[target_idx]
+        target_dir = target - pos
+        if np.linalg.norm(target_dir) < 1e-6:
+            break
+
+        target_yaw = np.arctan2(target_dir[1], target_dir[0])
+        delta_yaw = normalize_angle(target_yaw - yaw)
+        n_turns = round(delta_yaw / turn_angle_rad)
+        if n_turns > 0:
+            actions += [ActionCode.LEFT] * n_turns
+        elif n_turns < 0:
+            actions += [ActionCode.RIGHT] * (-n_turns)
+        yaw = normalize_angle(yaw + n_turns * turn_angle_rad)
+
+        next_pos = pos + step_size * np.array([np.cos(yaw), np.sin(yaw)])
+        if np.linalg.norm(next_pos - goal) > np.linalg.norm(pos - goal):
+            break
+
+        actions.append(ActionCode.FORWARD)
+        pos = next_pos
+
+    return actions
+
+
+def _endpoint_medoid_index(all_trajectory: np.ndarray) -> int:
+    endpoints = all_trajectory[:, -1, :2]
+    dists = np.linalg.norm(endpoints[:, None, :] - endpoints[None, :, :], axis=-1)
+    return int(np.argmin(dists.sum(axis=1)))
+
+
+def _path_medoid_index(all_trajectory: np.ndarray) -> int:
+    flat = all_trajectory[:, :, :2].reshape(all_trajectory.shape[0], -1)
+    dists = np.linalg.norm(flat[:, None, :] - flat[None, :, :], axis=-1)
+    return int(np.argmin(dists.sum(axis=1)))
+
+
+def _median_endpoint_nearest_index(all_trajectory: np.ndarray) -> int:
+    endpoints = all_trajectory[:, -1, :2]
+    median_endpoint = np.median(endpoints, axis=0)
+    return int(np.argmin(np.linalg.norm(endpoints - median_endpoint[None, :], axis=-1)))
+
+
+def _forward_candidate_stats(all_trajectory: np.ndarray) -> list[tuple[int, int, float, list[int]]]:
+    candidates: list[tuple[int, int, float, list[int]]] = []
+    for idx, trajectory in enumerate(all_trajectory):
+        actions = _trajectory_to_discrete_actions_close_to_goal(trajectory)
+        forward_count = sum(1 for action in actions if action == ActionCode.FORWARD)
+        if forward_count <= 0:
+            continue
+        candidates.append((idx, forward_count, trajectory_xy_path_len(trajectory), actions))
+    return candidates
+
+
+def select_trajectory_xy(
+    all_trajectory: np.ndarray,
+    selection: str = "mean",
+) -> tuple[np.ndarray, int | None]:
+    """Select one XY trajectory from parallel diffusion samples.
+
+    Returns ``(trajectory, selected_index)``.  ``selected_index`` is ``None``
+    for the mean trajectory because it is not an original diffusion sample.
+    """
+    if all_trajectory.ndim != 3 or all_trajectory.shape[0] == 0:
+        raise ValueError(f"Expected all_trajectory shape (B,T,2), got {all_trajectory.shape}")
+
+    if selection == "mean":
+        return np.mean(all_trajectory, axis=0), None
+    if selection == "endpoint_medoid":
+        idx = _endpoint_medoid_index(all_trajectory)
+        return all_trajectory[idx], idx
+    if selection == "path_medoid":
+        idx = _path_medoid_index(all_trajectory)
+        return all_trajectory[idx], idx
+    if selection == "median_endpoint_nearest":
+        idx = _median_endpoint_nearest_index(all_trajectory)
+        return all_trajectory[idx], idx
+
+    forward_candidates = _forward_candidate_stats(all_trajectory)
+    if selection == "forward_or_medoid":
+        if forward_candidates:
+            medoid_idx = _endpoint_medoid_index(all_trajectory)
+            medoid_endpoint = all_trajectory[medoid_idx, -1, :2]
+            median_path_len = float(
+                np.median([trajectory_xy_path_len(traj) for traj in all_trajectory])
+            )
+
+            def score(item: tuple[int, int, float, list[int]]) -> tuple[float, int, float]:
+                idx, forward_count, path_len, _actions = item
+                endpoint_dist = float(np.linalg.norm(all_trajectory[idx, -1, :2] - medoid_endpoint))
+                return (endpoint_dist, -forward_count, abs(path_len - median_path_len))
+
+            idx = min(forward_candidates, key=score)[0]
+            return all_trajectory[idx], idx
+        idx = _endpoint_medoid_index(all_trajectory)
+        return all_trajectory[idx], idx
+
+    if selection == "longest_forward":
+        if forward_candidates:
+            idx = max(forward_candidates, key=lambda item: (item[2], item[1]))[0]
+            return all_trajectory[idx], idx
+        idx = _endpoint_medoid_index(all_trajectory)
+        return all_trajectory[idx], idx
+
+    raise ValueError(
+        f"Unsupported trajectory selection: {selection}; "
+        f"expected one of {TRAJECTORY_SELECTION_CHOICES}"
+    )
+
+
 def traj_to_actions(
     dp_actions: torch.Tensor,
     num_sample_trajs: int = 32,
     action_scale: float = 4.0,
+    trajectory_selection: str = "mean",
 ) -> list[int]:
-    """Convert InternNav trajectory predictions to discrete Habitat actions.
-
-    This mirrors the verified logic from
-    ``internnav.model.utils.vln_utils.traj_to_actions`` instead of the
-    simplified threshold-based decoder.
-    """
-
-    def reconstruct_xy_from_delta(delta_xyt: np.ndarray) -> np.ndarray:
-        start_xy = np.zeros((len(delta_xyt), 2))
-        delta_xy = delta_xyt[:, :, :2]
-        cumsum_xy = np.cumsum(delta_xy, axis=1)
-
-        B = delta_xyt.shape[0]
-        T = delta_xyt.shape[1]
-        xy = np.zeros((B, T + 1, 2))
-        xy[:, 0] = start_xy
-        xy[:, 1:] = start_xy[:, None, :] + cumsum_xy
-        return xy
-
-    def trajectory_to_discrete_actions_close_to_goal(
-        trajectory: np.ndarray,
-        step_size: float = 0.25,
-        turn_angle_deg: float = 15,
-        lookahead: int = 4,
-    ) -> list[int]:
-        actions: list[int] = []
-        yaw = 0.0
-        pos = trajectory[0]
-        turn_angle_rad = np.deg2rad(turn_angle_deg)
-        goal = trajectory[-1]
-
-        def normalize_angle(angle: float) -> float:
-            return (angle + np.pi) % (2 * np.pi) - np.pi
-
-        while np.linalg.norm(pos - goal) > 0.2:
-            dists = np.linalg.norm(trajectory - pos, axis=1)
-            nearest_idx = np.argmin(dists)
-            target_idx = min(nearest_idx + lookahead, len(trajectory) - 1)
-            target = trajectory[target_idx]
-            target_dir = target - pos
-            if np.linalg.norm(target_dir) < 1e-6:
-                break
-
-            target_yaw = np.arctan2(target_dir[1], target_dir[0])
-            delta_yaw = normalize_angle(target_yaw - yaw)
-            n_turns = round(delta_yaw / turn_angle_rad)
-            if n_turns > 0:
-                actions += [ActionCode.LEFT] * n_turns
-            elif n_turns < 0:
-                actions += [ActionCode.RIGHT] * (-n_turns)
-            yaw = normalize_angle(yaw + n_turns * turn_angle_rad)
-
-            next_pos = pos + step_size * np.array([np.cos(yaw), np.sin(yaw)])
-            if np.linalg.norm(next_pos - goal) > np.linalg.norm(pos - goal):
-                break
-
-            actions.append(ActionCode.FORWARD)
-            pos = next_pos
-
-        return actions
-
-    trajs = dp_actions[:num_sample_trajs].float().cpu().numpy()
+    """Convert InternNav trajectory predictions to discrete Habitat actions."""
+    trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy()
     trajs[:, :, :2] /= action_scale
     all_trajectory = reconstruct_xy_from_delta(trajs)
-    trajectory = np.mean(all_trajectory, axis=0)
-    actions = trajectory_to_discrete_actions_close_to_goal(trajectory)
+    trajectory, _selected_idx = select_trajectory_xy(all_trajectory, trajectory_selection)
+    actions = _trajectory_to_discrete_actions_close_to_goal(trajectory)
     return actions if actions else [ActionCode.STOP]
 
 
@@ -1622,6 +1720,7 @@ def _run_eval_panoramic_vlm(
                         trajectory,
                         num_sample_trajs=num_sample_trajs,
                         action_scale=action_scale,
+                        trajectory_selection=args.trajectory_selection,
                     )
                 )
                 print(
@@ -1812,6 +1911,7 @@ def _run_eval_panoramic_vlm(
                         trajectory,
                         num_sample_trajs=num_sample_trajs,
                         action_scale=action_scale,
+                        trajectory_selection=args.trajectory_selection,
                     )
                 )
                 print(
@@ -1979,6 +2079,7 @@ def run_eval(args):
     has_nextdit = model.nextdit_action_head is not None and model.latent_queries is not None
     print(f"NextDiT action head available: {has_nextdit}")
     print(f"  action_scale={action_scale}, num_sample_trajs={num_sample_trajs}")
+    print(f"  trajectory_selection={args.trajectory_selection}")
 
     panoramic_vlm_input = bool(
         train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
@@ -2239,6 +2340,7 @@ def run_eval(args):
                             trajectory,
                             num_sample_trajs=num_sample_trajs,
                             action_scale=action_scale,
+                            trajectory_selection=args.trajectory_selection,
                         )
                     )
 
@@ -2280,6 +2382,7 @@ def run_eval(args):
                             trajectory,
                             num_sample_trajs=num_sample_trajs,
                             action_scale=action_scale,
+                            trajectory_selection=args.trajectory_selection,
                         )
                     )
                     action = local_actions.pop(0) if local_actions else ActionCode.STOP
@@ -2414,6 +2517,16 @@ def main():
         type=int,
         default=0,
         help="Optional debug safety cap for VLM calls per episode; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--trajectory_selection",
+        choices=TRAJECTORY_SELECTION_CHOICES,
+        default="mean",
+        help=(
+            "How to select one local trajectory from parallel diffusion samples "
+            "before decoding Habitat actions. mean preserves the original "
+            "InternNav-compatible behavior."
+        ),
     )
     parser.add_argument(
         "--debug_input_trace",

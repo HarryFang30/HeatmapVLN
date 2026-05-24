@@ -33,13 +33,17 @@ import numpy as np
 import torch
 from scripts.evaluation.latent_parity_train_vs_eval import _build_train_batch
 from scripts.evaluation.r2r_val_unseen import (
+    TRAJECTORY_SELECTION_CHOICES,
     _extract_checkpoint_state_dict,
     _finalize_local_actions,
     _load_compatible_state_dict,
     _resolve_internnav_model_path,
     _trajectory_debug_summary,
     _verify_internnav_system1_loaded,
+    reconstruct_xy_from_delta,
+    select_trajectory_xy,
     traj_to_actions,
+    trajectory_xy_path_len,
 )
 from scripts.training.model_builder import build_model
 from scripts.training.utils import load_config
@@ -134,14 +138,15 @@ def _continuous_trajectory_stats(
     """Stats over num_sample_trajs parallel flow-matching samples."""
     n = min(int(num_sample_trajs), int(trajectory.shape[0]))
     trajs = trajectory[:n].float().detach().cpu().numpy()
-    per_sample_path_lens = [_path_len_from_delta_np(trajs[i], action_scale) for i in range(n)]
+    trajs[:, :, :2] /= float(action_scale)
+    all_trajectory = reconstruct_xy_from_delta(trajs)
+    per_sample_path_lens = [trajectory_xy_path_len(all_trajectory[i]) for i in range(n)]
 
     endpoints = []
     delta_norms = []
     for i in range(n):
-        deltas = trajs[i, :, :2] / float(action_scale)
-        cumsum = np.cumsum(deltas, axis=0)
-        endpoints.append(cumsum[-1] if len(cumsum) else np.zeros(2))
+        deltas = np.diff(all_trajectory[i, :, :2], axis=0)
+        endpoints.append(all_trajectory[i, -1, :2] if len(all_trajectory[i]) else np.zeros(2))
         delta_norms.append(float(np.linalg.norm(deltas)))
 
     endpoints_arr = np.stack(endpoints, axis=0) if endpoints else np.zeros((0, 2))
@@ -155,17 +160,34 @@ def _continuous_trajectory_stats(
         _set_rng(10_000 + i)
         acts = _finalize_local_actions(
             traj_to_actions(
-                torch.from_numpy(trajs[i : i + 1].copy()).float(),
+                trajectory[i : i + 1],
                 num_sample_trajs=1,
                 action_scale=action_scale,
+                trajectory_selection="mean",
             )
         )
         per_sample_forward.append(sum(1 for a in acts if a == 1))
 
-    _set_rng(20_000)
-    batch_actions = _finalize_local_actions(
-        traj_to_actions(trajectory[:n], num_sample_trajs=n, action_scale=action_scale)
-    )
+    selection_results: dict[str, Any] = {}
+    for selection in TRAJECTORY_SELECTION_CHOICES:
+        _set_rng(20_000)
+        selected_xy, selected_idx = select_trajectory_xy(all_trajectory, selection)
+        actions = _finalize_local_actions(
+            traj_to_actions(
+                trajectory[:n],
+                num_sample_trajs=n,
+                action_scale=action_scale,
+                trajectory_selection=selection,
+            )
+        )
+        selection_results[selection] = {
+            "selected_index": selected_idx,
+            "path_len": trajectory_xy_path_len(selected_xy),
+            "actions_first4": actions[:4],
+            "forward_count": sum(1 for a in actions if a == 1),
+            "zero_pad": actions[:4] == [0, 0, 0, 0],
+        }
+    mean_result = selection_results["mean"]
 
     return {
         "trajectory_summary_mean": mean_summary,
@@ -178,9 +200,10 @@ def _continuous_trajectory_stats(
         "delta_xy_norm_std": float(np.std(delta_norms)) if delta_norms else None,
         "per_sample_forward_in_decode": per_sample_forward,
         "forward_any_per_sample_pct": 100.0 * sum(1 for f in per_sample_forward if f > 0) / max(n, 1),
-        "actions_from_mean_traj_first4": batch_actions[:4],
-        "forward_from_mean_traj": sum(1 for a in batch_actions if a == 1),
-        "zero_pad_mean_traj": batch_actions[:4] == [0, 0, 0, 0],
+        "selection_results": selection_results,
+        "actions_from_mean_traj_first4": mean_result["actions_first4"],
+        "forward_from_mean_traj": mean_result["forward_count"],
+        "zero_pad_mean_traj": mean_result["zero_pad"],
     }
 
 
@@ -430,7 +453,8 @@ def main() -> int:
             )
         except Exception as exc:
             LOGGER.exception("stage2 idx=%s: %s", idx, exc)
-    rec["stage2_bridge_delta"] = stage2_delta
+    for rec in records:
+        rec["stage2_bridge_delta"] = stage2_delta
 
     with out_path.open("w", encoding="utf-8") as f:
         for rec in records:
@@ -476,6 +500,22 @@ def main() -> int:
             print(f"  per_sample path_len std(avg): {np.mean(ic_ps_std):.3f}", flush=True)
             print(f"  endpoint_std_xy (avg):       {np.mean(ic_ep):.3f}", flush=True)
             print(f"  forward_from_mean_traj>0:  {sum(1 for f in ic_fwd if f > 0)}/{n}", flush=True)
+            for selection in TRAJECTORY_SELECTION_CHOICES:
+                sel = [
+                    r[label]["initial_current"]["selection_results"][selection]
+                    for r in records
+                    if label in r and selection in r[label]["initial_current"].get("selection_results", {})
+                ]
+                if not sel:
+                    continue
+                sel_fwd = [item["forward_count"] for item in sel]
+                sel_path = [item["path_len"] for item in sel]
+                print(
+                    f"  selection[{selection}]: "
+                    f"forward>0={sum(1 for f in sel_fwd if f > 0)}/{len(sel)} "
+                    f"path_len_mean={np.mean(sel_path):.3f}",
+                    flush=True,
+                )
         if fl:
             print(f"  train_full_loss:             mean={np.mean(fl):.4f} median={np.median(fl):.4f}", flush=True)
 
