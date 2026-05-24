@@ -122,6 +122,36 @@ def _patch_internnav_depthanything() -> None:
     arch_mod.build_depthanythingv2 = _patched_build_dav2
 
 
+def _patch_internnav_gradient_checkpointing() -> None:
+    """Support newer diffusers gradient-checkpointing kwargs in InternNav."""
+    from internnav.model.basemodel.internvla_n1.nextdit_traj import LuminaNextDiT2DModel
+
+    original = getattr(LuminaNextDiT2DModel, "_set_gradient_checkpointing", None)
+    if original is None or getattr(original, "__heatmapvln_gc_compat__", False):
+        return
+
+    def _compat_set_gradient_checkpointing(
+        self,
+        module=None,
+        value: bool = False,
+        *,
+        enable: bool | None = None,
+        gradient_checkpointing_func=None,
+    ):
+        del gradient_checkpointing_func
+        if enable is not None:
+            value = enable
+        if module is None:
+            for submodule in self.modules():
+                if hasattr(submodule, "gradient_checkpointing"):
+                    submodule.gradient_checkpointing = value
+            return None
+        return original(self, module, value)
+
+    _compat_set_gradient_checkpointing.__heatmapvln_gc_compat__ = True  # type: ignore[attr-defined]
+    LuminaNextDiT2DModel._set_gradient_checkpointing = _compat_set_gradient_checkpointing
+
+
 def _torch_dtype(name: str) -> torch.dtype:
     name = name.lower()
     if name in {"bf16", "bfloat16"}:
@@ -584,6 +614,7 @@ def _load_teacher(args: argparse.Namespace, device: torch.device):
         _install_flash_attn_stub()
     _patch_numpy_aliases()
     _patch_internnav_depthanything()
+    _patch_internnav_gradient_checkpointing()
 
     from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
     from internnav.model.basemodel.internvla_n1.internvla_n1 import (
