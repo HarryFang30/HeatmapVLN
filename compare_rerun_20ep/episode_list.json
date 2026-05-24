@@ -1,0 +1,108 @@
+{
+  "split": "val_unseen",
+  "scenes_dir": "/dataset/mp3d",
+  "data_path": "/workspace/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz",
+  "count": 20,
+  "episodes": [
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 1,
+      "instruction": "Exit the bedroom and turn left. Walk straight passing the gray couch and stop near the rug. "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 2,
+      "instruction": "Walk out of the bedroom through the open door into the hallway. Turn the corner and walk into the dining area. Pass the "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 3,
+      "instruction": "Go out of the room you're in.  Turn left.  Go poast the dining room and into the living room.  Wait right by the coffee "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 13,
+      "instruction": "Walk passed the dining table and continue towards the kitchen. Walk through the kitchen passed the counters and stove an"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 14,
+      "instruction": "Move to the far left corner of the table\r\nProceed to the doorway to your right\r\nwalk into the kitchen with the stove on "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 15,
+      "instruction": "Walk straight past the table and turn right to go between the kitchen counters and walk straight past the refrigerator i"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 25,
+      "instruction": "Walk through the small room with a lounge chair and dresser. Turn the corner and walk passed the sink. Walk into the kit"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 26,
+      "instruction": "Turn around 180 degrees.  Go down the hallway to the right.  Walk through the kitchen, past the island and stop as soon "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 27,
+      "instruction": "Walk past closet doors. Walk through kitchen. Wait at dining room table. "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 37,
+      "instruction": "Turn right and walk straight until you are standing in a bedroom door, then stop. "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 38,
+      "instruction": "Go straight past the bed and into the hallway. Enter the bedroom straight ahead and wait there. "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 39,
+      "instruction": "Walk past the bed and move straight until you have pasts through 3 doorways. "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 40,
+      "instruction": "Walk into the kitchen area. Walk by the sink and oven. Walk straight into the hallway. turn right into the little room. "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 41,
+      "instruction": "Walk through the kitchen between the sink and the stove. and down the hall.  Turn right before the bathroom.  Go into th"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 42,
+      "instruction": "Walk towards the kitchen area. Keep walking along the kitchen area towards the doorway. Turn right and exit the kitchen "
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 52,
+      "instruction": "Take a right at the large clock and travel straight through the kitchen, when you see the thermostat on the wall you are"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 53,
+      "instruction": "Exit the living room and turn right into the kitchen. Turn left at the end of the counter and wait in the room across th"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 54,
+      "instruction": "Turn around and go out of the room towards the clock.  Turn right and go down the hall past the kitchen counter.  At the"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 55,
+      "instruction": "Walk between the two counters in the kitchen and into another small room off the kitchen. Exit that room and make a slig"
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 56,
+      "instruction": "Walk through the kitchen and walk out the door into the hallway. Turn right and then left and enter the door closest to "
+    }
+  ]
+}
