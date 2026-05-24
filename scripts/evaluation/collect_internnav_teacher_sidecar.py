@@ -600,6 +600,52 @@ def _generate_text(
     return output.strip(), output_ids, inputs, prompt_len
 
 
+def _condition_on_dataset_coord(
+    processor: Any,
+    first_messages: list[dict[str, Any]],
+    first_images: list[Image.Image],
+    sample: dict[str, Any],
+    args: argparse.Namespace,
+    rng: random.Random,
+    device: torch.device,
+) -> tuple[str, torch.Tensor, Any, int, list[int], list[int]]:
+    """Build InternNav two-turn context with dataset gold pixel_goal as answer."""
+    pixel_goal = sample.get("pixel_goal")
+    if pixel_goal is None:
+        raise RuntimeError("--coord-source dataset requires sample['pixel_goal']")
+    coord_uv = [int(pixel_goal[0]), int(pixel_goal[1])]
+    goal_yx = [coord_uv[1], coord_uv[0]]
+    coord_text = f"{coord_uv[0]} {coord_uv[1]}"
+
+    messages, images = _build_second_turn(
+        first_messages,
+        first_images,
+        "↓",
+        sample,
+        args,
+        rng,
+    )
+    prefill_text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    prefill_inputs = processor(text=[prefill_text], images=images, return_tensors="pt").to(device)
+    prompt_len = int(prefill_inputs.input_ids.shape[1])
+
+    messages_with_coord = [
+        *messages,
+        {"role": "assistant", "content": [{"type": "text", "text": coord_text}]},
+    ]
+    full_text = processor.apply_chat_template(
+        messages_with_coord,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    inputs = processor(text=[full_text], images=images, return_tensors="pt").to(device)
+    return coord_text, inputs.input_ids, inputs, prompt_len, coord_uv, goal_yx
+
+
 def _run_system1(
     model: Any,
     traj_to_actions_fn: Callable[[torch.Tensor], list[int]],
@@ -785,22 +831,50 @@ def _collect_one(
 ) -> dict[str, Any]:
     _set_sample_seed(args.seed + int(idx) * 1009 + args.shard_index)
     first_messages, first_images = _build_first_turn(sample, args, rng)
-    first_output, first_output_ids, first_inputs, first_prompt_len = _generate_text(
-        model, processor, first_messages, first_images, device, args,
-    )
-    first_coord_uv, first_goal_yx = _parse_coord(first_output)
-    first_actions = _parse_text_actions(first_output)
+    first_output: str | None = None
+    second_output = None
+    first_coord_uv = None
+    first_goal_yx = None
+    first_actions: list[int] = []
 
-    final_output = first_output
+    if args.coord_source == "teacher":
+        first_output, first_output_ids, first_inputs, first_prompt_len = _generate_text(
+            model, processor, first_messages, first_images, device, args,
+        )
+        first_coord_uv, first_goal_yx = _parse_coord(first_output)
+        first_actions = _parse_text_actions(first_output)
+    else:
+        first_output_ids = None
+        first_inputs = None
+        first_prompt_len = 0
+
+    final_output = first_output or ""
     final_output_ids = first_output_ids
     final_inputs = first_inputs
     prompt_len = first_prompt_len
-    second_output = None
     coord_uv = first_coord_uv
     goal_yx = first_goal_yx
     mode = "coord" if coord_uv is not None else "text_actions"
 
-    if coord_uv is None and args.two_turn_lookdown and 5 in first_actions:
+    if args.coord_source == "dataset" and sample.get("pixel_goal") is not None:
+        (
+            final_output,
+            final_output_ids,
+            final_inputs,
+            prompt_len,
+            coord_uv,
+            goal_yx,
+        ) = _condition_on_dataset_coord(
+            processor,
+            first_messages,
+            first_images,
+            sample,
+            args,
+            rng,
+            device,
+        )
+        mode = "dataset_coord"
+    elif coord_uv is None and args.two_turn_lookdown and 5 in first_actions:
         second_messages, second_images = _build_second_turn(
             first_messages, first_images, first_output, sample, args, rng,
         )
@@ -819,6 +893,7 @@ def _collect_one(
 
     teacher: dict[str, Any] = {
         "mode": mode,
+        "coord_source": args.coord_source,
         "first_output": first_output,
         "first_actions": _pad_actions(first_actions),
         "prompt_len": prompt_len,
@@ -826,6 +901,8 @@ def _collect_one(
     if second_output is not None:
         teacher["second_output"] = second_output
     if coord_uv is not None:
+        if final_output_ids is None or final_inputs is None:
+            raise RuntimeError(f"Missing conditioned inputs for mode={mode}")
         teacher["coord_uv"] = coord_uv
         teacher["internnav_pixel_goal_yx"] = goal_yx
         try:
@@ -891,6 +968,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--coord-source",
+        choices=["dataset", "teacher"],
+        default="dataset",
+        help=(
+            "dataset forces the gold dataset pixel_goal into the InternNav two-turn context "
+            "and gives every pixel sample a teacher latent. teacher preserves the old audit "
+            "path and only saves System1 tensors when InternNav itself emits coordinates."
+        ),
+    )
     p.add_argument("--include-stop", action="store_true", help="Keep dataset stop samples")
     p.add_argument(
         "--sample-mode",
