@@ -50,15 +50,15 @@ LOGGER = logging.getLogger("pano_latent_adapter")
 
 
 class PanoToInternNavLatentAdapter(nn.Module):
-    """Residual per-query adapter from student pano hidden states to teacher latents."""
+    """Per-query adapter from student pano hidden states to teacher latents."""
 
     def __init__(
         self,
         dim: int = 3584,
         hidden_dim: int = 1024,
-        dropout: float = 0.05,
-        residual: bool = True,
-        zero_init: bool = True,
+        dropout: float = 0.0,
+        residual: bool = False,
+        zero_init: bool = False,
     ) -> None:
         super().__init__()
         self.residual = residual
@@ -294,20 +294,27 @@ def _latent_loss(
     *,
     cosine_weight: float,
     mse_weight: float,
+    norm_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     pred_f = pred.float()
     target_f = target.float()
     cos = F.cosine_similarity(pred_f.flatten(1), target_f.flatten(1), dim=1)
     cos_loss = (1.0 - cos).mean()
     mse_loss = F.mse_loss(pred_f, target_f)
-    loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    pred_norm = pred_f.norm(dim=-1)
+    target_norm = target_f.norm(dim=-1)
+    norm_ratio = pred_norm / target_norm.clamp_min(1.0e-6)
+    norm_loss = ((norm_ratio - 1.0) ** 2).mean()
+    loss = cosine_weight * cos_loss + mse_weight * mse_loss + norm_weight * norm_loss
     return loss, {
         "loss": float(loss.detach().item()),
         "cosine": float(cos.mean().detach().item()),
         "cos_loss": float(cos_loss.detach().item()),
         "mse_loss": float(mse_loss.detach().item()),
-        "pred_norm": float(pred_f.norm(dim=-1).mean().detach().item()),
-        "target_norm": float(target_f.norm(dim=-1).mean().detach().item()),
+        "norm_loss": float(norm_loss.detach().item()),
+        "pred_norm": float(pred_norm.mean().detach().item()),
+        "target_norm": float(target_norm.mean().detach().item()),
+        "norm_ratio": float(norm_ratio.mean().detach().item()),
     }
 
 
@@ -358,14 +365,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1.0e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--adapter-hidden-dim", type=int, default=1024)
-    p.add_argument("--adapter-dropout", type=float, default=0.05)
+    p.add_argument("--adapter-hidden-dim", type=int, default=2048)
+    p.add_argument("--adapter-dropout", type=float, default=0.0)
+    p.add_argument(
+        "--residual",
+        dest="residual",
+        action="store_true",
+        help="Use student_latent + adapter_delta. Off by default because pano and InternNav latents can have different scales.",
+    )
     p.add_argument("--no-residual", dest="residual", action="store_false")
-    p.set_defaults(residual=True)
+    p.set_defaults(residual=False)
+    p.add_argument(
+        "--zero-init",
+        dest="zero_init",
+        action="store_true",
+        help="Zero-initialize the final projection layer. Useful mainly with --residual.",
+    )
     p.add_argument("--no-zero-init", dest="zero_init", action="store_false")
-    p.set_defaults(zero_init=True)
+    p.set_defaults(zero_init=False)
     p.add_argument("--cosine-weight", type=float, default=1.0)
     p.add_argument("--mse-weight", type=float, default=0.05)
+    p.add_argument(
+        "--norm-weight",
+        type=float,
+        default=0.0,
+        help="Optional penalty on pred/teacher latent norm ratio. Try 0.1 for small overfit smoke tests.",
+    )
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--save-every-epochs", type=int, default=1)
     p.add_argument("--resume-adapter", default="")
@@ -469,6 +494,7 @@ def main() -> int:
                 teacher_latents,
                 cosine_weight=args.cosine_weight,
                 mse_weight=args.mse_weight,
+                norm_weight=args.norm_weight,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -485,12 +511,13 @@ def main() -> int:
             if args.log_interval > 0 and global_step % args.log_interval == 0:
                 avg = {k: v / max(count, 1) for k, v in running.items()}
                 LOGGER.info(
-                    "epoch=%d step=%d loss=%.5f cosine=%.5f mse=%.6f pred_norm=%.3f target_norm=%.3f",
+                    "epoch=%d step=%d loss=%.5f cosine=%.5f mse=%.6f norm_ratio=%.3f pred_norm=%.3f target_norm=%.3f",
                     epoch + 1,
                     global_step,
                     avg.get("loss", 0.0),
                     avg.get("cosine", 0.0),
                     avg.get("mse_loss", 0.0),
+                    avg.get("norm_ratio", 0.0),
                     avg.get("pred_norm", 0.0),
                     avg.get("target_norm", 0.0),
                 )
