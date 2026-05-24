@@ -50,35 +50,72 @@ LOGGER = logging.getLogger("pano_latent_adapter")
 
 
 class PanoToInternNavLatentAdapter(nn.Module):
-    """Per-query adapter from student pano hidden states to teacher latents."""
+    """Per-query adapter from student pano hidden states to teacher latents.
+
+    Defaults are tuned for "cross-interface projection": pure projector
+    (``residual=False``), no leading LayerNorm (``pre_norm=False``) so the
+    student latent scale is preserved into the MLP, plus a per-dim output
+    affine that lets the adapter rescale to the teacher latent norm without
+    asking the MLP to memorise both direction and magnitude in its weights.
+
+    The ``norm`` LayerNorm submodule is always instantiated for state-dict
+    compatibility with older checkpoints; it is only applied when
+    ``pre_norm=True``.
+    """
 
     def __init__(
         self,
         dim: int = 3584,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 2048,
         dropout: float = 0.0,
         residual: bool = False,
         zero_init: bool = False,
+        pre_norm: bool = False,
+        n_layers: int = 1,
+        output_affine: bool = True,
     ) -> None:
         super().__init__()
         self.residual = residual
+        self.pre_norm = pre_norm
+        self.n_layers = max(int(n_layers), 1)
+
         self.norm = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-        )
+
+        layers: list[nn.Module] = []
+        in_dim = dim
+        for _ in range(self.n_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, dim))
+        self.mlp = nn.Sequential(*layers)
+
         self.gate = nn.Parameter(torch.tensor(1.0))
+
+        if output_affine:
+            self.out_scale = nn.Parameter(torch.ones(dim))
+            self.out_bias = nn.Parameter(torch.zeros(dim))
+        else:
+            self.register_parameter("out_scale", None)
+            self.register_parameter("out_bias", None)
+
         if zero_init:
             nn.init.zeros_(self.mlp[-1].weight)
             nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        delta = self.mlp(self.norm(x.float())).to(dtype=x.dtype)
+        h = x.float()
+        if self.pre_norm:
+            h = self.norm(h)
+        h = self.mlp(h).to(dtype=x.dtype)
+        if self.out_scale is not None:
+            h = h * self.out_scale.to(dtype=h.dtype)
+        if self.out_bias is not None:
+            h = h + self.out_bias.to(dtype=h.dtype)
         if self.residual:
-            return x + self.gate.to(dtype=x.dtype) * delta
-        return delta
+            return x + self.gate.to(dtype=x.dtype) * h
+        return h
 
 
 def _set_seed(seed: int) -> None:
@@ -295,6 +332,7 @@ def _latent_loss(
     cosine_weight: float,
     mse_weight: float,
     norm_weight: float,
+    norm_loss_type: str = "log_ratio",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     pred_f = pred.float()
     target_f = target.float()
@@ -302,9 +340,16 @@ def _latent_loss(
     cos_loss = (1.0 - cos).mean()
     mse_loss = F.mse_loss(pred_f, target_f)
     pred_norm = pred_f.norm(dim=-1)
-    target_norm = target_f.norm(dim=-1)
-    norm_ratio = pred_norm / target_norm.clamp_min(1.0e-6)
-    norm_loss = ((norm_ratio - 1.0) ** 2).mean()
+    target_norm = target_f.norm(dim=-1).clamp_min(1.0e-6)
+    norm_ratio = pred_norm / target_norm
+    if norm_loss_type == "log_ratio":
+        # Symmetric in pred_norm/target_norm vs target_norm/pred_norm and finite at 1.
+        norm_loss = (torch.log(norm_ratio.clamp_min(1.0e-6))) ** 2
+        norm_loss = norm_loss.mean()
+    elif norm_loss_type == "ratio":
+        norm_loss = ((norm_ratio - 1.0) ** 2).mean()
+    else:
+        raise ValueError(f"Unknown norm_loss_type: {norm_loss_type!r}")
     loss = cosine_weight * cos_loss + mse_weight * mse_loss + norm_weight * norm_loss
     return loss, {
         "loss": float(loss.detach().item()),
@@ -316,6 +361,116 @@ def _latent_loss(
         "target_norm": float(target_norm.mean().detach().item()),
         "norm_ratio": float(norm_ratio.mean().detach().item()),
     }
+
+
+def _split_train_val(
+    records: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deterministic split based on a stable record ordering and the seed."""
+    if not records:
+        return [], []
+    if args.val_records > 0:
+        val_size = min(int(args.val_records), len(records) - 1)
+    else:
+        val_size = int(round(max(args.val_ratio, 0.0) * len(records)))
+        val_size = max(val_size, 0)
+        val_size = min(val_size, len(records) - 1) if len(records) > 1 else 0
+    if val_size <= 0:
+        return list(records), []
+
+    ordered = sorted(records, key=lambda r: int(r["dataset_index"]))
+    rng = random.Random(args.seed)
+    indices = list(range(len(ordered)))
+    rng.shuffle(indices)
+    val_pos = set(indices[:val_size])
+    train_records = [ordered[i] for i in range(len(ordered)) if i not in val_pos]
+    val_records = [ordered[i] for i in indices[:val_size]]
+    return train_records, val_records
+
+
+def _build_batch(
+    batch_records: list[dict[str, Any]],
+    *,
+    dataset: Any,
+    model: Any,
+    processor: Any,
+    device: torch.device,
+    n_traj_query: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    batch_samples: list[dict[str, Any]] = []
+    usable_records: list[dict[str, Any]] = []
+    for rec in batch_records:
+        idx = int(rec["dataset_index"])
+        if idx < 0 or idx >= len(dataset):
+            LOGGER.warning("Skip out-of-range dataset_index=%s", idx)
+            continue
+        sample = _sample_from_record(dataset, rec)
+        coord_uv = rec["teacher"]["coord_uv"]
+        batch_samples.append(_copy_sample_for_collator(sample, coord_uv))
+        usable_records.append(rec)
+    if not usable_records:
+        empty = torch.empty(0)
+        return empty, empty, []
+
+    student_latents = _extract_student_latents(
+        model,
+        processor,
+        batch_samples,
+        device,
+        n_traj_query,
+    )
+    teacher_latents = _load_teacher_latents(usable_records, device).to(dtype=student_latents.dtype)
+    return student_latents, teacher_latents, usable_records
+
+
+@torch.no_grad()
+def _evaluate_adapter(
+    adapter: nn.Module,
+    val_records: list[dict[str, Any]],
+    *,
+    dataset: Any,
+    model: Any,
+    processor: Any,
+    device: torch.device,
+    n_traj_query: int,
+    batch_size: int,
+    cosine_weight: float,
+    mse_weight: float,
+    norm_weight: float,
+    norm_loss_type: str,
+) -> dict[str, float]:
+    adapter.eval()
+    running: dict[str, float] = {}
+    count = 0
+    try:
+        for start in range(0, len(val_records), batch_size):
+            batch_records = val_records[start:start + batch_size]
+            student_latents, teacher_latents, usable = _build_batch(
+                batch_records,
+                dataset=dataset,
+                model=model,
+                processor=processor,
+                device=device,
+                n_traj_query=n_traj_query,
+            )
+            if not usable:
+                continue
+            pred = adapter(student_latents)
+            _, metrics = _latent_loss(
+                pred,
+                teacher_latents,
+                cosine_weight=cosine_weight,
+                mse_weight=mse_weight,
+                norm_weight=norm_weight,
+                norm_loss_type=norm_loss_type,
+            )
+            count += 1
+            for key, value in metrics.items():
+                running[key] = running.get(key, 0.0) + value
+    finally:
+        adapter.train()
+    return {k: v / max(count, 1) for k, v in running.items()}
 
 
 def _save_checkpoint(
@@ -368,10 +523,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adapter-hidden-dim", type=int, default=2048)
     p.add_argument("--adapter-dropout", type=float, default=0.0)
     p.add_argument(
+        "--adapter-n-layers",
+        type=int,
+        default=1,
+        help="Number of hidden GELU layers in the projector MLP (1 means Linear-GELU-Linear).",
+    )
+    p.add_argument(
         "--residual",
         dest="residual",
         action="store_true",
-        help="Use student_latent + adapter_delta. Off by default because pano and InternNav latents can have different scales.",
+        help="Use student_latent + adapter_delta. Off by default because pano and InternNav latents have different scales.",
     )
     p.add_argument("--no-residual", dest="residual", action="store_false")
     p.set_defaults(residual=False)
@@ -383,13 +544,57 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--no-zero-init", dest="zero_init", action="store_false")
     p.set_defaults(zero_init=False)
+    p.add_argument(
+        "--pre-norm",
+        dest="pre_norm",
+        action="store_true",
+        help="Apply a LayerNorm to the student latent before the MLP (strips per-token scale).",
+    )
+    p.add_argument(
+        "--no-pre-norm",
+        dest="pre_norm",
+        action="store_false",
+        help="Default: feed raw student latents into the MLP so per-token scale is preserved.",
+    )
+    p.set_defaults(pre_norm=False)
+    p.add_argument(
+        "--output-affine",
+        dest="output_affine",
+        action="store_true",
+        help="Add a per-dim learnable scale/bias on the adapter output (helps match teacher norm).",
+    )
+    p.add_argument(
+        "--no-output-affine",
+        dest="output_affine",
+        action="store_false",
+        help="Disable the per-dim output affine.",
+    )
+    p.set_defaults(output_affine=True)
     p.add_argument("--cosine-weight", type=float, default=1.0)
-    p.add_argument("--mse-weight", type=float, default=0.05)
+    p.add_argument("--mse-weight", type=float, default=0.1)
     p.add_argument(
         "--norm-weight",
         type=float,
-        default=0.0,
-        help="Optional penalty on pred/teacher latent norm ratio. Try 0.1 for small overfit smoke tests.",
+        default=0.1,
+        help="Penalty on pred/teacher latent norm ratio. Set to 0 to disable.",
+    )
+    p.add_argument(
+        "--norm-loss-type",
+        choices=["log_ratio", "ratio"],
+        default="log_ratio",
+        help="log_ratio is symmetric around 1.0 and well-behaved when pred_norm is too large.",
+    )
+    p.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of records held out as a deterministic validation split (after --max-samples).",
+    )
+    p.add_argument(
+        "--val-records",
+        type=int,
+        default=0,
+        help="Override --val-ratio with an absolute count. 0 disables the override.",
     )
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--save-every-epochs", type=int, default=1)
@@ -437,7 +642,19 @@ def main() -> int:
         dropout=args.adapter_dropout,
         residual=args.residual,
         zero_init=args.zero_init,
+        pre_norm=args.pre_norm,
+        n_layers=args.adapter_n_layers,
+        output_affine=args.output_affine,
     ).to(device)
+    LOGGER.info(
+        "Adapter: residual=%s pre_norm=%s output_affine=%s n_layers=%d hidden_dim=%d dim=%d",
+        args.residual,
+        args.pre_norm,
+        args.output_affine,
+        args.adapter_n_layers,
+        args.adapter_hidden_dim,
+        hidden_dim,
+    )
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     start_epoch = 0
@@ -456,37 +673,37 @@ def main() -> int:
     with (out_dir / "train_args.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
+    train_records, val_records = _split_train_val(records, args)
+    LOGGER.info("Split records: train=%d val=%d", len(train_records), len(val_records))
+    with (out_dir / "split.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "train_indices": [int(rec["dataset_index"]) for rec in train_records],
+                "val_indices": [int(rec["dataset_index"]) for rec in val_records],
+            },
+            f,
+            indent=2,
+        )
+
     rng = random.Random(args.seed)
     for epoch in range(start_epoch, args.epochs):
-        rng.shuffle(records)
+        rng.shuffle(train_records)
         running: dict[str, float] = {}
         count = 0
         adapter.train()
 
-        for start in range(0, len(records), args.batch_size):
-            batch_records = records[start:start + args.batch_size]
-            batch_samples: list[dict[str, Any]] = []
-            usable_records: list[dict[str, Any]] = []
-            for rec in batch_records:
-                idx = int(rec["dataset_index"])
-                if idx < 0 or idx >= len(dataset):
-                    LOGGER.warning("Skip out-of-range dataset_index=%s", idx)
-                    continue
-                sample = _sample_from_record(dataset, rec)
-                coord_uv = rec["teacher"]["coord_uv"]
-                batch_samples.append(_copy_sample_for_collator(sample, coord_uv))
-                usable_records.append(rec)
-            if not usable_records:
-                continue
-
-            student_latents = _extract_student_latents(
-                model,
-                processor,
-                batch_samples,
-                device,
-                n_traj_query,
+        for start in range(0, len(train_records), args.batch_size):
+            batch_records = train_records[start:start + args.batch_size]
+            student_latents, teacher_latents, usable = _build_batch(
+                batch_records,
+                dataset=dataset,
+                model=model,
+                processor=processor,
+                device=device,
+                n_traj_query=n_traj_query,
             )
-            teacher_latents = _load_teacher_latents(usable_records, device).to(dtype=student_latents.dtype)
+            if not usable:
+                continue
 
             pred = adapter(student_latents)
             loss, metrics = _latent_loss(
@@ -495,6 +712,7 @@ def main() -> int:
                 cosine_weight=args.cosine_weight,
                 mse_weight=args.mse_weight,
                 norm_weight=args.norm_weight,
+                norm_loss_type=args.norm_loss_type,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -523,7 +741,30 @@ def main() -> int:
                 )
 
         epoch_metrics = {k: v / max(count, 1) for k, v in running.items()}
-        LOGGER.info("epoch=%d done metrics=%s", epoch + 1, epoch_metrics)
+        LOGGER.info("epoch=%d train metrics=%s", epoch + 1, epoch_metrics)
+
+        val_metrics: dict[str, float] | None = None
+        if val_records:
+            val_metrics = _evaluate_adapter(
+                adapter,
+                val_records,
+                dataset=dataset,
+                model=model,
+                processor=processor,
+                device=device,
+                n_traj_query=n_traj_query,
+                batch_size=args.batch_size,
+                cosine_weight=args.cosine_weight,
+                mse_weight=args.mse_weight,
+                norm_weight=args.norm_weight,
+                norm_loss_type=args.norm_loss_type,
+            )
+            LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
+
+        combined_metrics = dict(epoch_metrics)
+        if val_metrics is not None:
+            for key, value in val_metrics.items():
+                combined_metrics[f"val_{key}"] = value
         _save_checkpoint(
             out_dir / "latest.pth",
             adapter,
@@ -531,7 +772,7 @@ def main() -> int:
             args,
             epoch=epoch + 1,
             step=global_step,
-            metrics=epoch_metrics,
+            metrics=combined_metrics,
         )
         if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
             _save_checkpoint(
@@ -541,7 +782,7 @@ def main() -> int:
                 args,
                 epoch=epoch + 1,
                 step=global_step,
-                metrics=epoch_metrics,
+                metrics=combined_metrics,
             )
 
     LOGGER.info("Saved adapter to %s", out_dir / "latest.pth")
