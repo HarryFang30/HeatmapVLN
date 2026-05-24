@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.machinery
+import importlib.util
 import itertools
 import json
 import os
@@ -100,12 +101,39 @@ def _install_flash_attn_stub() -> None:
 
 
 def _patch_numpy_aliases() -> None:
-    if not hasattr(np, "float"):
+    if "float" not in np.__dict__:
         np.float = np.float64  # type: ignore[attr-defined]
-    if not hasattr(np, "int"):
+    if "int" not in np.__dict__:
         np.int = np.int64  # type: ignore[attr-defined]
-    if not hasattr(np, "bool"):
+    if "bool" not in np.__dict__:
         np.bool = np.bool_  # type: ignore[attr-defined]
+
+
+def _load_internnav_depthanything_class(arch_mod: Any):
+    """Load DepthAnythingV2 without executing internnav.model.encoder.__init__."""
+    model_dir = Path(arch_mod.__file__).resolve().parents[2]
+    depth_pkg_dir = model_dir / "encoder" / "depth_anything" / "depth_anything_v2"
+    dpt_path = depth_pkg_dir / "dpt.py"
+    if not dpt_path.is_file():
+        raise FileNotFoundError(f"DepthAnythingV2 dpt.py not found: {dpt_path}")
+
+    package_name = "_heatmapvln_internnav_depth_anything_v2"
+    if package_name not in sys.modules:
+        pkg = types.ModuleType(package_name)
+        pkg.__path__ = [str(depth_pkg_dir)]  # type: ignore[attr-defined]
+        pkg.__spec__ = importlib.machinery.ModuleSpec(package_name, None, is_package=True)
+        sys.modules[package_name] = pkg
+
+    module_name = f"{package_name}.dpt"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, dpt_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load DepthAnythingV2 module from {dpt_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    return module.DepthAnythingV2
 
 
 def _patch_internnav_depthanything() -> None:
@@ -113,8 +141,7 @@ def _patch_internnav_depthanything() -> None:
     import internnav.model.basemodel.internvla_n1.internvla_n1_arch as arch_mod
 
     def _patched_build_dav2(_config):
-        from internnav.model.encoder.depth_anything.depth_anything_v2.dpt import DepthAnythingV2
-
+        DepthAnythingV2 = _load_internnav_depthanything_class(arch_mod)
         model_configs = {"vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]}}
         dav2_model = DepthAnythingV2(**model_configs["vits"])
         return dav2_model.pretrained
