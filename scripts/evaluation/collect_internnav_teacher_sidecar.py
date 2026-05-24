@@ -149,6 +149,33 @@ def _patch_internnav_depthanything() -> None:
     arch_mod.build_depthanythingv2 = _patched_build_dav2
 
 
+def _patch_internnav_nextdit_config() -> None:
+    """Build InternNav NextDiT with the FFN width used by the released weights."""
+    import internnav.model.basemodel.internvla_n1.internvla_n1_arch as arch_mod
+
+    if getattr(arch_mod.build_traj_dit, "__heatmapvln_nextdit_compat__", False):
+        return
+
+    def _patched_build_traj_dit(_config):
+        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+        from internnav.model.basemodel.internvla_n1.nextdit_crossattn_traj import (
+            NextDiTCrossAttn,
+            NextDiTCrossAttnConfig,
+        )
+
+        dit = NextDiTCrossAttn(
+            NextDiTCrossAttnConfig(
+                latent_embedding_size=arch_mod.LatentEmbSize,
+                ffn_dim_multiplier=2 / 3,
+            )
+        )
+        noise_scheduler = FlowMatchEulerDiscreteScheduler()
+        return dit, noise_scheduler
+
+    _patched_build_traj_dit.__heatmapvln_nextdit_compat__ = True  # type: ignore[attr-defined]
+    arch_mod.build_traj_dit = _patched_build_traj_dit
+
+
 def _patch_internnav_gradient_checkpointing() -> None:
     """Support newer diffusers gradient-checkpointing kwargs in InternNav."""
     from internnav.model.basemodel.internvla_n1.nextdit_traj import LuminaNextDiT2DModel
@@ -640,6 +667,7 @@ def _load_teacher(args: argparse.Namespace, device: torch.device):
     if args.flash_attn_stub:
         _install_flash_attn_stub()
     _patch_numpy_aliases()
+    _patch_internnav_nextdit_config()
     _patch_internnav_depthanything()
     _patch_internnav_gradient_checkpointing()
 
