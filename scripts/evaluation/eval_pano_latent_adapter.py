@@ -9,15 +9,26 @@ For each teacher sidecar record this script:
   3. Loads the saved InternNav teacher ``traj_latents`` + ``dp_actions``.
   4. Runs the frozen InternNav System1 (``model.generate_traj``) on the
      adapter-projected latents to get *adapter dp_actions*.
-  5. Compares adapter vs teacher in two spaces:
-        - latent space: cosine / mse / norm_ratio
-        - trajectory space: per-step L2, path length, endpoint distance,
-          mean-trajectory cosine, discrete-action overlap.
+  5. Compares three pairs on the discrete first action:
+        - adapter vs teacher (legacy ``first_action_match``)
+        - adapter vs dataset GT (``adapter_vs_gt_first_match``)
+        - teacher vs dataset GT (``teacher_vs_gt_first_match``)
+     plus the existing latent/trajectory metrics (cosine / mse / norm_ratio /
+     step L2 / endpoint distance / path length / action overlap).
+  6. Buckets every record into one of:
+        ``both_correct`` / ``adapter_only_wrong`` /
+        ``adapter_rescued_teacher`` / ``both_wrong`` / ``unknown``
+     so we can tell apart "adapter has real headroom" from "teacher is the
+     ceiling on this state".
+  7. Auto-dumps top worst-N records per metric (traj_cosine, latent_cosine,
+     endpoint_distance, |norm_ratio - 1|) with teacher diagnostic fields
+     (path_len_std, endpoint_std_xy, forward_candidate_pct, turn_actions,
+     sample_kind) attached, so failure clustering can be inspected without
+     re-running ad-hoc scripts.
 
-This answers the real question Stage2 cares about: does the adapter project
-panoramic latents back onto the manifold that the frozen System1 actually
-understands, or does the adapter merely fit the training-set teacher latents
-in isolation?
+This answers the real question Stage2 cares about: is the adapter approaching
+the InternNav-on-panoramic-data ceiling (teacher-bound), or is it still
+leaving accuracy on the table (adapter-bound)?
 """
 
 from __future__ import annotations
@@ -175,7 +186,8 @@ def _trajectory_metrics(
     *,
     traj_to_actions_fn: Any,
     action_scale: float,
-) -> dict[str, float]:
+    gt_first_action: int | None = None,
+) -> dict[str, Any]:
     adapter_mean = _mean_trajectory(adapter_dp)
     teacher_mean = _mean_trajectory(teacher_dp)
 
@@ -195,11 +207,14 @@ def _trajectory_metrics(
     adapter_actions = traj_to_actions_fn(adapter_dp.float().cpu().clone())
     teacher_actions = traj_to_actions_fn(teacher_dp.float().cpu().clone())
     overlap = _action_overlap(adapter_actions, teacher_actions)
-    first_action_match = int(bool(
-        adapter_actions and teacher_actions and adapter_actions[0] == teacher_actions[0]
-    ))
 
-    return {
+    adapter_first = adapter_actions[0] if adapter_actions else None
+    teacher_first = teacher_actions[0] if teacher_actions else None
+    adapter_vs_teacher_first = int(
+        adapter_first is not None and teacher_first is not None and adapter_first == teacher_first
+    )
+
+    out: dict[str, Any] = {
         "traj_step_l2": float(step_l2),
         "traj_cosine": float(cosine),
         "adapter_path_len_m": float(adapter_path_len),
@@ -207,10 +222,23 @@ def _trajectory_metrics(
         "path_len_diff_m": float(abs(adapter_path_len - teacher_path_len)),
         "endpoint_distance_m": float(endpoint_distance),
         "action_overlap_at_min_len": overlap,
-        "first_action_match": first_action_match,
+        # Legacy field name kept for backwards-compat: adapter vs teacher first action.
+        "first_action_match": adapter_vs_teacher_first,
+        "adapter_vs_teacher_first_match": adapter_vs_teacher_first,
+        "adapter_first_action": adapter_first if adapter_first is not None else -1,
+        "teacher_first_action": teacher_first if teacher_first is not None else -1,
         "adapter_actions": adapter_actions,
         "teacher_actions": teacher_actions,
     }
+
+    if gt_first_action is not None and gt_first_action >= 0:
+        gt_int = int(gt_first_action)
+        out["gt_first_action"] = gt_int
+        if adapter_first is not None:
+            out["adapter_vs_gt_first_match"] = int(adapter_first == gt_int)
+        if teacher_first is not None:
+            out["teacher_vs_gt_first_match"] = int(teacher_first == gt_int)
+    return out
 
 
 def _action_overlap(a: list[int], b: list[int]) -> float:
@@ -256,6 +284,172 @@ def _aggregate(records: list[dict[str, Any]], keys: list[str]) -> dict[str, floa
     return out
 
 
+def _maybe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_teacher_diagnostic(rec: dict[str, Any]) -> dict[str, Any]:
+    """Pull stable fields from the teacher sidecar that help diagnose worst samples."""
+    teacher = rec.get("teacher", {}) or {}
+    sys1 = teacher.get("system1", {}) or {}
+    summary = sys1.get("sample_traj_summary", {}) or {}
+    dlabel = rec.get("dataset_label", {}) or {}
+    clip_dir = rec.get("clip_dir") or ""
+    return {
+        "clip_dir_basename": Path(clip_dir).name if clip_dir else None,
+        "scene_id": rec.get("scene_id"),
+        "episode_id": rec.get("episode_id"),
+        "sample_kind": dlabel.get("sample_kind"),
+        "is_stop": _maybe_float(dlabel.get("is_stop")),
+        "turn_actions": list(dlabel.get("turn_actions") or []),
+        "pixel_goal_relative_len": _maybe_int(dlabel.get("pixel_goal_relative_len")),
+        "teacher_mean_path_len_m": _maybe_float(sys1.get("mean_path_len_m")),
+        "teacher_path_len_mean_m": _maybe_float(summary.get("path_len_mean_m")),
+        "teacher_path_len_std_m": _maybe_float(summary.get("path_len_std_m")),
+        "teacher_endpoint_std_xy_m": _maybe_float(summary.get("endpoint_std_xy_m")),
+        "teacher_forward_candidate_pct": _maybe_float(summary.get("forward_candidate_pct")),
+        "teacher_num_sample_trajs": _maybe_int(sys1.get("num_sample_trajs")),
+        "teacher_actions8": list(teacher.get("actions8") or []),
+    }
+
+
+def _classify_record(report: dict[str, Any]) -> str:
+    """Bucket each record by (teacher_vs_gt, adapter_vs_gt) for the summary table."""
+    tg = report.get("teacher_vs_gt_first_match")
+    ag = report.get("adapter_vs_gt_first_match")
+    if tg is None or ag is None:
+        return "unknown"
+    if tg == 1 and ag == 1:
+        return "both_correct"
+    if tg == 1 and ag == 0:
+        # Adapter failed where teacher succeeded — adapter has real headroom here.
+        return "adapter_only_wrong"
+    if tg == 0 and ag == 1:
+        # Adapter beat teacher — usually rare under pure distillation.
+        return "adapter_rescued_teacher"
+    return "both_wrong"
+
+
+def _gt_compare_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate adapter-vs-GT, teacher-vs-GT, and category counts."""
+    with_gt = [r for r in records if "gt_first_action" in r]
+    if not with_gt:
+        return {"gt_records": 0}
+
+    adapter_gt = [int(r.get("adapter_vs_gt_first_match", 0)) for r in with_gt if "adapter_vs_gt_first_match" in r]
+    teacher_gt = [int(r.get("teacher_vs_gt_first_match", 0)) for r in with_gt if "teacher_vs_gt_first_match" in r]
+    adapter_teacher = [int(r.get("adapter_vs_teacher_first_match", 0)) for r in with_gt]
+
+    cats = {
+        "both_correct": 0,
+        "adapter_only_wrong": 0,
+        "adapter_rescued_teacher": 0,
+        "both_wrong": 0,
+        "unknown": 0,
+    }
+    for r in with_gt:
+        cats[_classify_record(r)] += 1
+
+    total = float(len(with_gt))
+    return {
+        "gt_records": len(with_gt),
+        "mean_adapter_vs_gt_first_match": float(np.mean(adapter_gt)) if adapter_gt else None,
+        "mean_teacher_vs_gt_first_match": float(np.mean(teacher_gt)) if teacher_gt else None,
+        "mean_adapter_vs_teacher_first_match": float(np.mean(adapter_teacher)) if adapter_teacher else None,
+        "gain_adapter_minus_teacher_vs_gt": (
+            float(np.mean(adapter_gt) - np.mean(teacher_gt))
+            if adapter_gt and teacher_gt
+            else None
+        ),
+        "category_counts": cats,
+        "category_fractions": {k: v / total for k, v in cats.items()},
+    }
+
+
+def _dump_worst_n(
+    records: list[dict[str, Any]],
+    key: str,
+    n: int,
+    *,
+    higher_is_better: bool,
+    output_path: Path,
+    abs_distance_from: float | None = None,
+) -> list[dict[str, Any]]:
+    """Sort records on ``key`` (or ``|key - abs_distance_from|``) and dump worst-N as JSONL."""
+    if not records:
+        return []
+
+    if abs_distance_from is not None:
+        def keyfn(r: dict[str, Any]) -> float:
+            v = r.get(key)
+            return float(abs(float(v) - abs_distance_from)) if isinstance(v, (int, float)) else -1.0
+        worst = sorted(records, key=keyfn, reverse=True)[:n]
+    else:
+        present = [r for r in records if isinstance(r.get(key), (int, float))]
+        worst = sorted(present, key=lambda r: float(r[key]), reverse=not higher_is_better)[:n]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for r in worst:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return worst
+
+
+def _print_worst_table(label: str, worst: list[dict[str, Any]], sort_key: str) -> None:
+    LOGGER.info("=== %s (n=%d) ===", label, len(worst))
+    for r in worst:
+        gt = r.get("gt_first_action")
+        tf = r.get("teacher_first_action")
+        af = r.get("adapter_first_action")
+        cat = _classify_record(r)
+        LOGGER.info(
+            "  idx=%5d clip=%s t=%s | %s=%.3f | GT=%s teacher=%s adapter=%s [%s] | "
+            "lat_cos=%.3f norm=%.3f traj_cos=%.3f endpt=%.3fm | "
+            "teacher_std: path=%s endpt=%s fwd%%=%s | sample_kind=%s turns=%s",
+            r.get("dataset_index", -1),
+            r.get("clip_dir_basename") or r.get("clip_idx"),
+            r.get("current_t"),
+            sort_key,
+            float(r.get(sort_key, 0.0)) if isinstance(r.get(sort_key), (int, float)) else -1.0,
+            gt if gt is not None else "?",
+            tf if tf is not None else "?",
+            af if af is not None else "?",
+            cat,
+            float(r.get("latent_cosine", 0.0)),
+            float(r.get("latent_norm_ratio", 0.0)),
+            float(r.get("traj_cosine", 0.0)),
+            float(r.get("endpoint_distance_m", 0.0)),
+            _fmt(r.get("teacher_path_len_std_m"), ".3f"),
+            _fmt(r.get("teacher_endpoint_std_xy_m"), ".3f"),
+            _fmt(r.get("teacher_forward_candidate_pct"), ".1f"),
+            r.get("sample_kind") or "?",
+            r.get("turn_actions") or [],
+        )
+
+
+def _fmt(value: Any, spec: str) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return format(float(value), spec)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="End-to-end sanity check for pano-to-InternNav adapter")
     p.add_argument("--config", default="configs/train_config_internnav_8gpu_stage2_wider.yaml")
@@ -294,6 +488,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--action-scale", type=float, default=0.0, help="0 = read from config; otherwise override")
     p.add_argument("--output", default="", help="Optional JSONL output path (default: <adapter-dir>/e2e_sanity.jsonl)")
     p.add_argument("--max-prints", type=int, default=10)
+    p.add_argument(
+        "--worst-n",
+        type=int,
+        default=10,
+        help="After the main loop, dump worst-N records per metric to JSONL and log a table.",
+    )
     return p.parse_args()
 
 
@@ -400,13 +600,20 @@ def main() -> int:
             adapter_dp_cpu = adapter_dp_actions.detach().cpu()
             teacher_dp_cpu = teacher_dp_saved.detach().cpu().float()
 
+            dlabel = rec.get("dataset_label", {}) or {}
+            gt_first = dlabel.get("discrete_action")
+            gt_first = int(gt_first) if isinstance(gt_first, (int, float)) and int(gt_first) >= 0 else None
+
             latent_metrics = _latent_metrics_for_one(adapter_latents, teacher_latents)
             traj_metrics = _trajectory_metrics(
                 adapter_dp_cpu,
                 teacher_dp_cpu,
                 traj_to_actions_fn=traj_to_actions_fn,
                 action_scale=action_scale,
+                gt_first_action=gt_first,
             )
+
+            diagnostic = _extract_teacher_diagnostic(rec)
 
             report = {
                 "dataset_index": idx,
@@ -414,14 +621,17 @@ def main() -> int:
                 "current_t": rec.get("current_t"),
                 **latent_metrics,
                 **traj_metrics,
+                **diagnostic,
             }
+            report["category"] = _classify_record(report)
             fout.write(json.dumps(report, ensure_ascii=False) + "\n")
             summary_records.append(report)
 
             if i < args.max_prints:
                 LOGGER.info(
                     "[%d/%d] idx=%d cos=%.3f norm_ratio=%.3f traj_cos=%.3f step_l2=%.4f "
-                    "endpoint_d=%.3fm path_len adapter=%.3f teacher=%.3f overlap=%.2f first_match=%d",
+                    "endpoint_d=%.3fm path_len A=%.3f T=%.3f overlap=%.2f "
+                    "first[A=%s T=%s GT=%s] a_v_t=%d a_v_gt=%s t_v_gt=%s cat=%s",
                     i + 1,
                     len(records),
                     idx,
@@ -433,7 +643,13 @@ def main() -> int:
                     traj_metrics["adapter_path_len_m"],
                     traj_metrics["teacher_path_len_m"],
                     traj_metrics["action_overlap_at_min_len"],
-                    traj_metrics["first_action_match"],
+                    traj_metrics["adapter_first_action"],
+                    traj_metrics["teacher_first_action"],
+                    traj_metrics.get("gt_first_action", "?"),
+                    traj_metrics["adapter_vs_teacher_first_match"],
+                    traj_metrics.get("adapter_vs_gt_first_match", "?"),
+                    traj_metrics.get("teacher_vs_gt_first_match", "?"),
+                    report["category"],
                 )
 
     summary = _aggregate(
@@ -448,14 +664,42 @@ def main() -> int:
             "path_len_diff_m",
             "action_overlap_at_min_len",
             "first_action_match",
+            "adapter_vs_teacher_first_match",
+            "adapter_vs_gt_first_match",
+            "teacher_vs_gt_first_match",
         ],
     )
     summary["num_records"] = len(summary_records)
+    summary["gt_compare"] = _gt_compare_summary(summary_records)
+
     summary_path = output_path.with_suffix(".summary.json")
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     LOGGER.info("Summary: %s", json.dumps(summary, ensure_ascii=False))
     LOGGER.info("Wrote summary to %s", summary_path)
+
+    # ---- Worst-N diagnostic dump ---------------------------------------------
+    worst_dir = output_path.parent
+    n = max(args.worst_n, 1)
+    worst_specs = [
+        ("traj_cosine", True, None, f"worst{n}_by_traj_cosine.jsonl", "WORST by traj_cosine"),
+        ("latent_cosine", True, None, f"worst{n}_by_latent_cosine.jsonl", "WORST by latent_cosine"),
+        ("endpoint_distance_m", False, None, f"worst{n}_by_endpoint_distance.jsonl", "WORST by endpoint_distance"),
+        ("latent_norm_ratio", True, 1.0, f"worst{n}_by_norm_ratio.jsonl", "WORST by |norm_ratio - 1.0|"),
+    ]
+    LOGGER.info("================= WORST-%d DIAGNOSTIC =================", n)
+    for key, higher_is_better, abs_from, fname, label in worst_specs:
+        worst = _dump_worst_n(
+            summary_records,
+            key,
+            n,
+            higher_is_better=higher_is_better,
+            output_path=worst_dir / fname,
+            abs_distance_from=abs_from,
+        )
+        if worst:
+            _print_worst_table(label, worst, sort_key=key)
+            LOGGER.info("  -> wrote %s", worst_dir / fname)
     return 0
 
 
