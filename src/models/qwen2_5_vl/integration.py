@@ -1337,6 +1337,34 @@ class Qwen2_5VLIntegration(nn.Module):
         device = self.device
         ids = output_ids.to(device)
 
+        # ``output_ids`` from ``model.generate(...)`` includes both the prompt
+        # and the autoregressively generated text tokens, while ``attention_mask``
+        # and ``mm_token_type_ids`` provided by the caller usually correspond to
+        # the *prompt only* (the original ``apply_chat_template`` output).  Pad
+        # them up to the pre-suffix length of ``ids`` so the eventual
+        # ``get_rope_index`` call sees matching shapes; generated tokens are
+        # real text tokens (mask=1, mm_token_type=0).
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+            gap = ids.shape[1] - attention_mask.shape[1]
+            if gap > 0:
+                fill = torch.ones(
+                    batch_size, gap,
+                    device=device,
+                    dtype=attention_mask.dtype,
+                )
+                attention_mask = torch.cat([attention_mask, fill], dim=1)
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids.to(device)
+            gap_mm = ids.shape[1] - mm_token_type_ids.shape[1]
+            if gap_mm > 0:
+                fill_mm = torch.zeros(
+                    batch_size, gap_mm,
+                    device=device,
+                    dtype=mm_token_type_ids.dtype,
+                )
+                mm_token_type_ids = torch.cat([mm_token_type_ids, fill_mm], dim=1)
+
         has_traj_tokens = (ids == TRAJ_TOKEN_INDEX).any().item()
         if not has_traj_tokens:
             traj_suffix = torch.full(
@@ -1347,7 +1375,6 @@ class Qwen2_5VLIntegration(nn.Module):
             )
             ids = torch.cat([ids, traj_suffix], dim=1)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
                 ext = torch.ones(
                     batch_size, n_query,
                     device=device,
@@ -1355,7 +1382,6 @@ class Qwen2_5VLIntegration(nn.Module):
                 )
                 attention_mask = torch.cat([attention_mask, ext], dim=1)
             if mm_token_type_ids is not None:
-                mm_token_type_ids = mm_token_type_ids.to(device)
                 mm_ext = torch.zeros(
                     batch_size, n_query,
                     device=device,
