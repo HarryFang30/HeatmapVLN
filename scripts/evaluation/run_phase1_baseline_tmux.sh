@@ -73,16 +73,25 @@ echo '=== Phase1 1A done: \$(date -Is) ==='
 "
 
 # 1B: distillation route (pano VLM + adapter + frozen NextDiT), 100 episodes, CUDA:3
+# Set ADAPTER_OVERWRITE=1 to restart from scratch; default resumes progress.json.
 tmux new-session -d -s "${SESSION_ADAPTER}" -c "${ROOT}" bash -lc "
 set -e
 exec > >(tee -a '${OUT}/adapter_100ep/run.log') 2>&1
-echo '=== Phase1 1B adapter 100ep start: \$(date -Is) ==='
+echo '=== Phase1 1B adapter 100ep start (GPU3, max_steps=300): \$(date -Is) ==='
+export DISPLAY=\${DISPLAY:-:200}
 export CUDA_VISIBLE_DEVICES=3
 export HABITAT_GL_GPU_ID=0
 export USE_TF=0 TRANSFORMERS_NO_TF=1
-export HEATMAPVLN_PREINIT_GL=0 HEATMAPVLN_PREINIT_EMPTY_GL=1
+export HEATMAPVLN_PREINIT_GL=0
+export HEATMAPVLN_PREINIT_EMPTY_GL=1
 export HEATMAPVLN_REQUIRE_FLASH_ATTN=0
 export INTERNNAV_MODEL_PATH='${INTERNNAV_MODEL_PATH}'
+OVERWRITE_FLAG=''
+if [[ \"\${ADAPTER_OVERWRITE:-0}\" == 1 ]]; then
+  OVERWRITE_FLAG='--overwrite_output'
+else
+  OVERWRITE_FLAG='--resume'
+fi
 python -u scripts/evaluate.py r2r \\
   --config configs/train_config_internnav_8gpu_stage2_wider.yaml \\
   --base_checkpoint checkpoints/stage1-s2_latest.pth \\
@@ -91,11 +100,12 @@ python -u scripts/evaluate.py r2r \\
   --scenes_dir '${SCENES}' \\
   --data_path '${DATA}' \\
   --episode_list '${EP100}' \\
+  --max_steps_per_episode 300 \\
   --auto_stop_distance 3.0 \\
   --max_system2_calls_per_episode 160 \\
   --no-debug_input_trace \\
   --debug_save_input_images 0 \\
-  --overwrite_output \\
+  \$OVERWRITE_FLAG \\
   --output_path '${OUT}/adapter_100ep'
 echo '=== Phase1 1B done: \$(date -Is) ==='
 "
@@ -103,7 +113,7 @@ echo '=== Phase1 1B done: \$(date -Is) ==='
 echo ""
 echo "Phase 1 tmux sessions:"
 echo "  1A InternNav 20ep (GPU0): tmux attach -t ${SESSION_INTERN}"
-echo "  1B Adapter 100ep (GPU3): tmux attach -t ${SESSION_ADAPTER}"
+echo "  1B Adapter 100ep (GPU3, max_steps=300): tmux attach -t ${SESSION_ADAPTER}"
 echo "Logs:"
 echo "  ${OUT}/internnav_20ep/run.log"
 echo "  ${OUT}/adapter_100ep/run.log"
