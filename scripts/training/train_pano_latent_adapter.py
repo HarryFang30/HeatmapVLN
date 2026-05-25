@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -33,8 +34,10 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grad_norm_
 
 from scripts.training.model_builder import build_model
@@ -124,6 +127,46 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _distributed_available() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _rank0() -> bool:
+    return not _distributed_available() or dist.get_rank() == 0
+
+
+def _init_distributed(args: argparse.Namespace) -> tuple[torch.device, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        backend = args.ddp_backend
+        if backend == "auto":
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cpu")
+        dist.init_process_group(backend=backend, init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", local_rank))
+        return device, rank, local_rank, world_size
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    return device, rank, local_rank, world_size
+
+
+def _cleanup_distributed() -> None:
+    if _distributed_available():
+        dist.destroy_process_group()
+
+
+def _unwrap_adapter(adapter: nn.Module) -> nn.Module:
+    return adapter.module if isinstance(adapter, DistributedDataParallel) else adapter
 
 
 def _extract_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
@@ -389,6 +432,51 @@ def _split_train_val(
     return train_records, val_records
 
 
+def _epoch_rank_records(
+    records: list[dict[str, Any]],
+    *,
+    seed: int,
+    epoch: int,
+    rank: int,
+    world_size: int,
+) -> list[dict[str, Any]]:
+    """Return the same number of batches per rank for DDP.
+
+    DDP requires every rank to execute the same number of backward calls.  We
+    deterministically shuffle once per epoch, pad to a multiple of world_size,
+    then strided-shard the list.
+    """
+    if world_size <= 1:
+        shuffled = list(records)
+        random.Random(seed + epoch).shuffle(shuffled)
+        return shuffled
+    if not records:
+        return []
+
+    shuffled = list(records)
+    random.Random(seed + epoch).shuffle(shuffled)
+    total_size = int(math.ceil(len(shuffled) / float(world_size)) * world_size)
+    if total_size > len(shuffled):
+        shuffled.extend(shuffled[: total_size - len(shuffled)])
+    return shuffled[rank:total_size:world_size]
+
+
+def _reduce_metrics(
+    sums: dict[str, float],
+    count: int,
+    device: torch.device,
+) -> dict[str, float]:
+    keys = sorted(sums)
+    if not keys:
+        return {}
+    values = [sums[key] for key in keys] + [float(count)]
+    tensor = torch.tensor(values, device=device, dtype=torch.float64)
+    if _distributed_available():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    total_count = max(float(tensor[-1].item()), 1.0)
+    return {key: float(tensor[i].item() / total_count) for i, key in enumerate(keys)}
+
+
 def _build_batch(
     batch_records: list[dict[str, Any]],
     *,
@@ -484,9 +572,10 @@ def _save_checkpoint(
     metrics: dict[str, float],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    adapter_to_save = _unwrap_adapter(adapter)
     torch.save(
         {
-            "adapter_state_dict": adapter.state_dict(),
+            "adapter_state_dict": adapter_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
             "step": step,
@@ -513,6 +602,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--output-dir", default="outputs/pano_latent_adapter")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--ddp-backend",
+        choices=["auto", "nccl", "gloo"],
+        default="auto",
+        help="Distributed backend when launched with torchrun. auto uses nccl on CUDA.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=2)
@@ -605,188 +700,241 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    _set_seed(args.seed)
+    device, rank, local_rank, world_size = _init_distributed(args)
+    if not _rank0():
+        logging.getLogger().setLevel(logging.WARNING)
+    _set_seed(args.seed + rank)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    cfg = _prepare_config(args)
-    teacher_jsonl = Path(args.teacher_jsonl).expanduser()
-    records = _load_teacher_records(teacher_jsonl)
-    if args.max_samples > 0:
-        records = records[: args.max_samples]
-    if not records:
-        raise RuntimeError(f"No usable teacher records found in {teacher_jsonl}")
+    try:
+        cfg = _prepare_config(args)
+        teacher_jsonl = Path(args.teacher_jsonl).expanduser()
+        records = _load_teacher_records(teacher_jsonl)
+        if args.max_samples > 0:
+            records = records[: args.max_samples]
+        if not records:
+            raise RuntimeError(f"No usable teacher records found in {teacher_jsonl}")
 
-    LOGGER.info("Loaded %d teacher records from %s", len(records), teacher_jsonl)
-    dataset = build_trajectory_dataset(
-        cfg,
-        split=args.split,
-        enable_augmentation=False,
-        enable_trajectory_augmentation=False,
-        load_history_heatmap=False,
-        panoramic_vlm_input=True,
-        load_lookdown_for_system2=True,
-        load_traj_images=args.index_mode == "internnav_sft",
-    )
-    LOGGER.info("Dataset samples=%d", len(dataset))
-
-    model = _load_student_model(cfg, args, device)
-    processor = model.qwen2_5_vl.processor
-    if processor is None:
-        raise RuntimeError("Missing Qwen processor")
-    n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
-    hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
-
-    adapter = PanoToInternNavLatentAdapter(
-        dim=hidden_dim,
-        hidden_dim=args.adapter_hidden_dim,
-        dropout=args.adapter_dropout,
-        residual=args.residual,
-        zero_init=args.zero_init,
-        pre_norm=args.pre_norm,
-        n_layers=args.adapter_n_layers,
-        output_affine=args.output_affine,
-    ).to(device)
-    LOGGER.info(
-        "Adapter: residual=%s pre_norm=%s output_affine=%s n_layers=%d hidden_dim=%d dim=%d",
-        args.residual,
-        args.pre_norm,
-        args.output_affine,
-        args.adapter_n_layers,
-        args.adapter_hidden_dim,
-        hidden_dim,
-    )
-    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    start_epoch = 0
-    global_step = 0
-    if args.resume_adapter:
-        ckpt = torch.load(args.resume_adapter, map_location=device, weights_only=False)
-        adapter.load_state_dict(ckpt["adapter_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0))
-        global_step = int(ckpt.get("step", 0))
-        LOGGER.info("Resumed adapter from %s at epoch=%d step=%d", args.resume_adapter, start_epoch, global_step)
-
-    out_dir = Path(args.output_dir).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with (out_dir / "train_args.json").open("w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2, ensure_ascii=False)
-
-    train_records, val_records = _split_train_val(records, args)
-    LOGGER.info("Split records: train=%d val=%d", len(train_records), len(val_records))
-    with (out_dir / "split.json").open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "train_indices": [int(rec["dataset_index"]) for rec in train_records],
-                "val_indices": [int(rec["dataset_index"]) for rec in val_records],
-            },
-            f,
-            indent=2,
+        if _rank0():
+            LOGGER.info(
+                "Loaded %d teacher records from %s (world_size=%d)",
+                len(records),
+                teacher_jsonl,
+                world_size,
+            )
+        dataset = build_trajectory_dataset(
+            cfg,
+            split=args.split,
+            enable_augmentation=False,
+            enable_trajectory_augmentation=False,
+            load_history_heatmap=False,
+            panoramic_vlm_input=True,
+            load_lookdown_for_system2=True,
+            load_traj_images=args.index_mode == "internnav_sft",
         )
+        if _rank0():
+            LOGGER.info("Dataset samples=%d", len(dataset))
 
-    rng = random.Random(args.seed)
-    for epoch in range(start_epoch, args.epochs):
-        rng.shuffle(train_records)
-        running: dict[str, float] = {}
-        count = 0
-        adapter.train()
+        model = _load_student_model(cfg, args, device)
+        processor = model.qwen2_5_vl.processor
+        if processor is None:
+            raise RuntimeError("Missing Qwen processor")
+        n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
+        hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
 
-        for start in range(0, len(train_records), args.batch_size):
-            batch_records = train_records[start:start + args.batch_size]
-            student_latents, teacher_latents, usable = _build_batch(
-                batch_records,
-                dataset=dataset,
-                model=model,
-                processor=processor,
-                device=device,
-                n_traj_query=n_traj_query,
+        adapter = PanoToInternNavLatentAdapter(
+            dim=hidden_dim,
+            hidden_dim=args.adapter_hidden_dim,
+            dropout=args.adapter_dropout,
+            residual=args.residual,
+            zero_init=args.zero_init,
+            pre_norm=args.pre_norm,
+            n_layers=args.adapter_n_layers,
+            output_affine=args.output_affine,
+        ).to(device)
+
+        start_epoch = 0
+        global_step = 0
+        resume_ckpt: dict[str, Any] | None = None
+        if args.resume_adapter:
+            resume_ckpt = torch.load(args.resume_adapter, map_location=device, weights_only=False)
+            adapter.load_state_dict(resume_ckpt["adapter_state_dict"])
+            start_epoch = int(resume_ckpt.get("epoch", 0))
+            global_step = int(resume_ckpt.get("step", 0))
+
+        train_adapter: nn.Module = adapter
+        if world_size > 1:
+            if device.type == "cuda":
+                train_adapter = DistributedDataParallel(
+                    adapter,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=True,
+                )
+            else:
+                train_adapter = DistributedDataParallel(adapter, find_unused_parameters=True)
+
+        if _rank0():
+            LOGGER.info(
+                "Adapter: residual=%s pre_norm=%s output_affine=%s n_layers=%d hidden_dim=%d dim=%d "
+                "ddp=%s rank=%d local_rank=%d",
+                args.residual,
+                args.pre_norm,
+                args.output_affine,
+                args.adapter_n_layers,
+                args.adapter_hidden_dim,
+                hidden_dim,
+                world_size > 1,
+                rank,
+                local_rank,
             )
-            if not usable:
-                continue
-
-            pred = adapter(student_latents)
-            loss, metrics = _latent_loss(
-                pred,
-                teacher_latents,
-                cosine_weight=args.cosine_weight,
-                mse_weight=args.mse_weight,
-                norm_weight=args.norm_weight,
-                norm_loss_type=args.norm_loss_type,
-            )
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip > 0:
-                clip_grad_norm_(adapter.parameters(), args.grad_clip)
-            optimizer.step()
-
-            global_step += 1
-            count += 1
-            for key, value in metrics.items():
-                running[key] = running.get(key, 0.0) + value
-
-            if args.log_interval > 0 and global_step % args.log_interval == 0:
-                avg = {k: v / max(count, 1) for k, v in running.items()}
+        optimizer = torch.optim.AdamW(train_adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        if resume_ckpt is not None and "optimizer_state_dict" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            if _rank0():
                 LOGGER.info(
-                    "epoch=%d step=%d loss=%.5f cosine=%.5f mse=%.6f norm_ratio=%.3f pred_norm=%.3f target_norm=%.3f",
-                    epoch + 1,
+                    "Resumed adapter from %s at epoch=%d step=%d",
+                    args.resume_adapter,
+                    start_epoch,
                     global_step,
-                    avg.get("loss", 0.0),
-                    avg.get("cosine", 0.0),
-                    avg.get("mse_loss", 0.0),
-                    avg.get("norm_ratio", 0.0),
-                    avg.get("pred_norm", 0.0),
-                    avg.get("target_norm", 0.0),
                 )
 
-        epoch_metrics = {k: v / max(count, 1) for k, v in running.items()}
-        LOGGER.info("epoch=%d train metrics=%s", epoch + 1, epoch_metrics)
+        out_dir = Path(args.output_dir).expanduser()
+        if _rank0():
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with (out_dir / "train_args.json").open("w", encoding="utf-8") as f:
+                json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
-        val_metrics: dict[str, float] | None = None
-        if val_records:
-            val_metrics = _evaluate_adapter(
-                adapter,
-                val_records,
-                dataset=dataset,
-                model=model,
-                processor=processor,
-                device=device,
-                n_traj_query=n_traj_query,
-                batch_size=args.batch_size,
-                cosine_weight=args.cosine_weight,
-                mse_weight=args.mse_weight,
-                norm_weight=args.norm_weight,
-                norm_loss_type=args.norm_loss_type,
+        train_records, val_records = _split_train_val(records, args)
+        if _rank0():
+            LOGGER.info("Split records: train=%d val=%d", len(train_records), len(val_records))
+            with (out_dir / "split.json").open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "train_indices": [int(rec["dataset_index"]) for rec in train_records],
+                        "val_indices": [int(rec["dataset_index"]) for rec in val_records],
+                    },
+                    f,
+                    indent=2,
+                )
+        if _distributed_available():
+            dist.barrier()
+
+        for epoch in range(start_epoch, args.epochs):
+            epoch_records = _epoch_rank_records(
+                train_records,
+                seed=args.seed,
+                epoch=epoch,
+                rank=rank,
+                world_size=world_size,
             )
-            LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
+            running: dict[str, float] = {}
+            count = 0
+            train_adapter.train()
 
-        combined_metrics = dict(epoch_metrics)
-        if val_metrics is not None:
-            for key, value in val_metrics.items():
-                combined_metrics[f"val_{key}"] = value
-        _save_checkpoint(
-            out_dir / "latest.pth",
-            adapter,
-            optimizer,
-            args,
-            epoch=epoch + 1,
-            step=global_step,
-            metrics=combined_metrics,
-        )
-        if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
-            _save_checkpoint(
-                out_dir / f"epoch_{epoch + 1:03d}.pth",
-                adapter,
-                optimizer,
-                args,
-                epoch=epoch + 1,
-                step=global_step,
-                metrics=combined_metrics,
-            )
+            for start in range(0, len(epoch_records), args.batch_size):
+                batch_records = epoch_records[start:start + args.batch_size]
+                student_latents, teacher_latents, usable = _build_batch(
+                    batch_records,
+                    dataset=dataset,
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    n_traj_query=n_traj_query,
+                )
+                if not usable:
+                    continue
 
-    LOGGER.info("Saved adapter to %s", out_dir / "latest.pth")
-    return 0
+                pred = train_adapter(student_latents)
+                loss, metrics = _latent_loss(
+                    pred,
+                    teacher_latents,
+                    cosine_weight=args.cosine_weight,
+                    mse_weight=args.mse_weight,
+                    norm_weight=args.norm_weight,
+                    norm_loss_type=args.norm_loss_type,
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if args.grad_clip > 0:
+                    clip_grad_norm_(train_adapter.parameters(), args.grad_clip)
+                optimizer.step()
+
+                global_step += world_size
+                count += 1
+                for key, value in metrics.items():
+                    running[key] = running.get(key, 0.0) + value
+
+                if _rank0() and args.log_interval > 0 and count % args.log_interval == 0:
+                    avg = {k: v / max(count, 1) for k, v in running.items()}
+                    LOGGER.info(
+                        "epoch=%d local_step=%d global_step=%d loss=%.5f cosine=%.5f mse=%.6f "
+                        "norm_ratio=%.3f pred_norm=%.3f target_norm=%.3f",
+                        epoch + 1,
+                        count,
+                        global_step,
+                        avg.get("loss", 0.0),
+                        avg.get("cosine", 0.0),
+                        avg.get("mse_loss", 0.0),
+                        avg.get("norm_ratio", 0.0),
+                        avg.get("pred_norm", 0.0),
+                        avg.get("target_norm", 0.0),
+                    )
+
+            epoch_metrics = _reduce_metrics(running, count, device)
+            if _rank0():
+                LOGGER.info("epoch=%d train metrics=%s", epoch + 1, epoch_metrics)
+
+            val_metrics: dict[str, float] | None = None
+            if _rank0() and val_records:
+                val_metrics = _evaluate_adapter(
+                    _unwrap_adapter(train_adapter),
+                    val_records,
+                    dataset=dataset,
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    n_traj_query=n_traj_query,
+                    batch_size=args.batch_size,
+                    cosine_weight=args.cosine_weight,
+                    mse_weight=args.mse_weight,
+                    norm_weight=args.norm_weight,
+                    norm_loss_type=args.norm_loss_type,
+                )
+                LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
+
+            if _rank0():
+                combined_metrics = dict(epoch_metrics)
+                if val_metrics is not None:
+                    for key, value in val_metrics.items():
+                        combined_metrics[f"val_{key}"] = value
+                _save_checkpoint(
+                    out_dir / "latest.pth",
+                    train_adapter,
+                    optimizer,
+                    args,
+                    epoch=epoch + 1,
+                    step=global_step,
+                    metrics=combined_metrics,
+                )
+                if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
+                    _save_checkpoint(
+                        out_dir / f"epoch_{epoch + 1:03d}.pth",
+                        train_adapter,
+                        optimizer,
+                        args,
+                        epoch=epoch + 1,
+                        step=global_step,
+                        metrics=combined_metrics,
+                    )
+            if _distributed_available():
+                dist.barrier()
+
+        if _rank0():
+            LOGGER.info("Saved adapter to %s", out_dir / "latest.pth")
+        return 0
+    finally:
+        _cleanup_distributed()
 
 
 if __name__ == "__main__":
