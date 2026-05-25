@@ -1953,6 +1953,17 @@ def _run_eval_panoramic_vlm(
                         attention_mask=inputs.get("attention_mask"),
                         mm_token_type_ids=inputs.get("mm_token_type_ids"),
                     )
+                    if _debug_input_trace_enabled(args):
+                        _per_q = [
+                            float(_last_traj_hs[0, i].float().norm().item())
+                            for i in range(_last_traj_hs.shape[1])
+                        ]
+                        print(
+                            "  [debug] traj_hs total_norm="
+                            f"{float(_last_traj_hs.float().norm().item()):.3f} "
+                            f"per_query={_per_q}",
+                            flush=True,
+                        )
                     if pano_latent_adapter is not None:
                         _last_traj_hs = _maybe_apply_pano_latent_adapter(
                             _last_traj_hs, pano_latent_adapter,
@@ -2404,6 +2415,17 @@ def run_eval(args):
                             attention_mask=inputs.get("attention_mask"),
                             mm_token_type_ids=inputs.get("mm_token_type_ids"),
                         )
+                        if _debug_input_trace_enabled(args):
+                            _per_q = [
+                                float(_last_traj_hs[0, i].float().norm().item())
+                                for i in range(_last_traj_hs.shape[1])
+                            ]
+                            print(
+                                "  [debug] traj_hs total_norm="
+                                f"{float(_last_traj_hs.float().norm().item()):.3f} "
+                                f"per_query={_per_q}",
+                                flush=True,
+                            )
                         if pano_latent_adapter is not None:
                             _last_traj_hs = _maybe_apply_pano_latent_adapter(
                                 _last_traj_hs, pano_latent_adapter,
