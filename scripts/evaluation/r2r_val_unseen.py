@@ -12,9 +12,11 @@ Inference flow per high-level step:
     4. If coordinates found:
        a. Capture lookdown view (2 × LOOKDOWN, then restore)
        b. generate_latents → traj_hidden_states
-       c. NextDiT get_trajectory → continuous trajectory (dx, dy, dyaw)
-       d. Convert trajectory to discrete Habitat actions
-       e. Execute up to MAX_LOCAL_STEPS actions
+       c. (optional) pano-to-InternNav latent adapter projects traj_hidden_states
+          into the InternNav-compatible latent manifold expected by frozen NextDiT
+       d. NextDiT get_trajectory → continuous trajectory (dx, dy, dyaw)
+       e. Convert trajectory to discrete Habitat actions
+       f. Execute up to MAX_LOCAL_STEPS actions
     5. If STOP or no coordinates → end episode
 
 Adapted for habitat-lab 0.1.7 (YACS config).
@@ -223,6 +225,54 @@ from scripts.training.model_builder import build_model
 from scripts.training.utils import _normalize_state_key, load_config
 
 from src.models.heatmap.input_constructor import construct_input
+
+
+def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
+    """Lazy loader for the pano→InternNav latent adapter.
+
+    Imports are kept inside the function so vanilla Habitat eval runs without
+    the adapter never need to touch the training-side modules.
+
+    Returns the adapter in ``eval()`` mode on ``device``. Reuses the inference
+    helper from ``eval_pano_latent_adapter.py`` so checkpoint introspection
+    (n_layers / pre_norm / output_affine) stays in one place.
+    """
+    from scripts.evaluation.eval_pano_latent_adapter import (
+        _load_adapter_from_checkpoint,
+    )
+
+    fallback = argparse.Namespace(
+        adapter_hidden_dim=2048,
+        adapter_dropout=0.0,
+        residual=False,
+        pre_norm=False,
+    )
+    adapter, _saved_args = _load_adapter_from_checkpoint(
+        Path(checkpoint_path).expanduser(),
+        dim=hidden_dim,
+        fallback_args=fallback,
+        device=device,
+    )
+    return adapter
+
+
+def _maybe_apply_pano_latent_adapter(
+    traj_hs: torch.Tensor,
+    adapter,
+) -> torch.Tensor:
+    """Project ``traj_hs`` through the optional adapter, preserving dtype.
+
+    The adapter is trained in fp32 but Stage-2 inference often runs in
+    bfloat16/fp16; we cast in and back to keep NextDiT inputs identical to
+    the un-adapted path when the adapter is absent.
+    """
+    if adapter is None:
+        return traj_hs
+    orig_dtype = traj_hs.dtype
+    adapter_param = next(adapter.parameters(), None)
+    adapter_dtype = adapter_param.dtype if adapter_param is not None else orig_dtype
+    out = adapter(traj_hs.to(dtype=adapter_dtype))
+    return out.to(dtype=orig_dtype)
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -1562,8 +1612,14 @@ def _run_eval_panoramic_vlm(
     action_scale: float,
     num_sample_trajs: int,
     has_nextdit: bool,
+    pano_latent_adapter=None,
 ) -> None:
     """Closed-loop Habitat evaluation for checkpoints trained with panoramic VLM input."""
+    if pano_latent_adapter is not None:
+        print(
+            "[panoramic-eval] pano-to-InternNav latent adapter is ACTIVE; "
+            "generate_latents output will be projected before NextDiT."
+        )
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
     env = habitat.Env(config=hab_cfg)
@@ -1897,6 +1953,10 @@ def _run_eval_panoramic_vlm(
                         attention_mask=inputs.get("attention_mask"),
                         mm_token_type_ids=inputs.get("mm_token_type_ids"),
                     )
+                    if pano_latent_adapter is not None:
+                        _last_traj_hs = _maybe_apply_pano_latent_adapter(
+                            _last_traj_hs, pano_latent_adapter,
+                        )
 
                 print("  [debug] calling get_trajectory ...", flush=True)
                 trajectory_calls += 1
@@ -2085,6 +2145,22 @@ def run_eval(args):
         train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
     )
     print(f"Panoramic VLM input: {panoramic_vlm_input}")
+
+    pano_latent_adapter = None
+    if getattr(args, "pano_latent_adapter_checkpoint", None):
+        hidden_dim = int(
+            train_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584)
+        )
+        print(
+            f"Loading pano-latent adapter from {args.pano_latent_adapter_checkpoint} "
+            f"(hidden_dim={hidden_dim})"
+        )
+        pano_latent_adapter = _load_pano_latent_adapter(
+            args.pano_latent_adapter_checkpoint,
+            hidden_dim=hidden_dim,
+            device=device,
+        )
+
     if panoramic_vlm_input:
         return _run_eval_panoramic_vlm(
             args=args,
@@ -2095,6 +2171,7 @@ def run_eval(args):
             action_scale=action_scale,
             num_sample_trajs=num_sample_trajs,
             has_nextdit=has_nextdit,
+            pano_latent_adapter=pano_latent_adapter,
         )
 
     hab_cfg = build_habitat_config(args)
@@ -2327,6 +2404,10 @@ def run_eval(args):
                             attention_mask=inputs.get("attention_mask"),
                             mm_token_type_ids=inputs.get("mm_token_type_ids"),
                         )
+                        if pano_latent_adapter is not None:
+                            _last_traj_hs = _maybe_apply_pano_latent_adapter(
+                                _last_traj_hs, pano_latent_adapter,
+                            )
 
                     print("  [debug] calling get_trajectory ...", flush=True)
                     with torch.no_grad():
@@ -2494,6 +2575,17 @@ def main():
                         help="Optional main/Stage 2 checkpoint path (.pth)")
     parser.add_argument("--base_checkpoint", type=str, default=None,
                         help="Optional Stage 1/base checkpoint loaded before --checkpoint")
+    parser.add_argument(
+        "--pano_latent_adapter_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Optional PanoToInternNavLatentAdapter checkpoint (.pth with "
+            "adapter_state_dict). When set, the panoramic generate_latents output "
+            "is projected through the adapter before being fed to the frozen "
+            "NextDiT System1 (distillation interface)."
+        ),
+    )
     parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
     parser.add_argument("--data_path", type=str,
                         default=DEFAULT_DATA_PATH)
