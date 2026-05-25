@@ -740,7 +740,10 @@ def _eval_limit(args, remaining: int, target_list: list[tuple[str, int]] | None 
                 done_set: set | None = None) -> int:
     if target_list is not None:
         done = done_set or set()
-        return sum(1 for key in target_list if key not in done)
+        pending = sum(1 for key in target_list if key not in done)
+        if args.max_episodes is None:
+            return pending
+        return min(pending, max(args.max_episodes, 0))
     if args.max_episodes is None:
         return remaining
     return min(remaining, max(args.max_episodes, 0))
