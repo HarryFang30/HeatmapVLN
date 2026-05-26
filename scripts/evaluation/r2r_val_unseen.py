@@ -58,6 +58,7 @@ if (
 
 # Block flash_attn import (GLIBC_2.32 not available on this system)
 import importlib as _importlib
+import importlib.machinery as _importlib_machinery  # noqa: F401  # needed for _importlib.machinery
 import types as _types
 
 
@@ -273,6 +274,135 @@ def _maybe_apply_pano_latent_adapter(
     adapter_dtype = adapter_param.dtype if adapter_param is not None else orig_dtype
     out = adapter(traj_hs.to(dtype=adapter_dtype))
     return out.to(dtype=orig_dtype)
+
+
+def _load_force_teacher_internnav(args, device: torch.device):
+    """Load the InternNav teacher VLM in-process for ``--force_teacher_coord``.
+
+    Reuses ``scripts.evaluation.collect_internnav_teacher_sidecar._load_teacher``
+    by synthesising a SimpleNamespace with only the fields it consumes. Lazy
+    import keeps default eval runs free of InternNav-side dependencies.
+
+    NOTE: H7 sanity check helper. Loads ~7 GB extra GPU memory; if VRAM is
+    tight, point ``--force_teacher_coord_gpu_id`` at a separate device.
+    """
+    import types as _types
+
+    teacher_device = device
+    teacher_gpu_id = int(getattr(args, "force_teacher_coord_gpu_id", -1))
+    if teacher_gpu_id >= 0:
+        teacher_device = torch.device(f"cuda:{teacher_gpu_id}")
+
+    from scripts.evaluation.collect_internnav_teacher_sidecar import _load_teacher
+
+    sub = _types.SimpleNamespace(
+        internnav_repo=str(args.force_teacher_internnav_repo),
+        model_path=str(args.force_teacher_internnav_model_path),
+        flash_attn_stub=bool(getattr(args, "force_teacher_flash_attn_stub", True)),
+        torch_dtype=str(getattr(args, "force_teacher_torch_dtype", "bf16")),
+        attn_implementation=str(getattr(args, "force_teacher_attn_impl", "sdpa")),
+        require_nextdit=False,
+    )
+    model, processor, _traj_to_actions = _load_teacher(sub, teacher_device)
+    return model, processor, teacher_device
+
+
+def _predict_force_teacher_coord(
+    teacher_model,
+    teacher_processor,
+    teacher_device: torch.device,
+    current_front_pil,
+    lookdown_pil,
+    instruction: str,
+    *,
+    vlm_image_size: tuple[int, int],
+    history_front_pils: list | None = None,
+    max_new_tokens: int = 64,
+) -> list[int] | None:
+    """Run the InternNav teacher's two-turn protocol to get a teacher coord.
+
+    Returns ``[u, v]`` or ``None`` if either turn fails to produce a parseable
+    coordinate. Used by ``--force_teacher_coord`` to substitute the student's
+    student-generated pixel goal with the teacher's (training-distribution) one.
+    """
+    from scripts.evaluation.collect_internnav_teacher_sidecar import (
+        DEFAULT_IMAGE_TOKEN,
+        INTERNNAV_CONJUNCTIONS,
+        PROMPT_TEMPLATE,
+        _content_from_text_with_images,
+        _parse_coord,
+        _strip_instruction_final_period,
+    )
+
+    if current_front_pil.size != vlm_image_size:
+        current_front_pil = current_front_pil.resize(vlm_image_size)
+    if lookdown_pil.size != vlm_image_size:
+        lookdown_pil = lookdown_pil.resize(vlm_image_size)
+    history_front_pils = history_front_pils or []
+    history_front_pils = [
+        (img if img.size == vlm_image_size else img.resize(vlm_image_size))
+        for img in history_front_pils
+    ]
+
+    cleaned_instruction = _strip_instruction_final_period(instruction or "")
+    prompt_text = PROMPT_TEMPLATE.replace("<instruction>.", cleaned_instruction)
+    if history_front_pils:
+        prompt_text += (
+            f" These are your historical observations: "
+            f"{(DEFAULT_IMAGE_TOKEN + chr(10)) * len(history_front_pils)}."
+        )
+    prompt_text += f" {INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
+
+    first_images = history_front_pils + [current_front_pil]
+    first_messages = [{
+        "role": "user",
+        "content": _content_from_text_with_images(prompt_text, first_images),
+    }]
+
+    def _run_once(messages, images):
+        text = teacher_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = teacher_processor(
+            text=[text], images=images, return_tensors="pt"
+        ).to(teacher_device)
+        with torch.inference_mode():
+            out_ids = teacher_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=None,
+                return_dict_in_generate=True,
+            ).sequences
+        prompt_len = int(inputs.input_ids.shape[1])
+        return teacher_processor.tokenizer.decode(
+            out_ids[0][prompt_len:], skip_special_tokens=True
+        ).strip()
+
+    turn1 = _run_once(first_messages, first_images)
+    coord_uv, _ = _parse_coord(turn1)
+    if coord_uv is not None:
+        return coord_uv
+
+    if "↓" not in turn1:
+        return None
+
+    second_text = f"{INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
+    second_messages = list(first_messages)
+    second_messages.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": turn1}],
+    })
+    second_messages.append({
+        "role": "user",
+        "content": _content_from_text_with_images(second_text, [lookdown_pil]),
+    })
+    second_images = first_images + [lookdown_pil]
+
+    turn2 = _run_once(second_messages, second_images)
+    coord_uv, _ = _parse_coord(turn2)
+    return coord_uv
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -1616,12 +1746,20 @@ def _run_eval_panoramic_vlm(
     num_sample_trajs: int,
     has_nextdit: bool,
     pano_latent_adapter=None,
+    force_teacher_model=None,
+    force_teacher_processor=None,
+    force_teacher_device: torch.device | None = None,
 ) -> None:
     """Closed-loop Habitat evaluation for checkpoints trained with panoramic VLM input."""
     if pano_latent_adapter is not None:
         print(
             "[panoramic-eval] pano-to-InternNav latent adapter is ACTIVE; "
             "generate_latents output will be projected before NextDiT."
+        )
+    if force_teacher_model is not None:
+        print(
+            "[panoramic-eval] --force_teacher_coord is ACTIVE; student VLM coord "
+            "will be REPLACED with InternNav teacher's coord at each System2 call."
         )
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
@@ -1935,6 +2073,39 @@ def _run_eval_panoramic_vlm(
                 pix_goal_image = current_traj_t.clone()
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
 
+                if force_teacher_model is not None:
+                    student_pixel_goal = list(pixel_goal)
+                    try:
+                        front_pil_for_teacher = current_views["front"]
+                    except Exception:
+                        front_pil_for_teacher = None
+                    teacher_pixel_goal = None
+                    if front_pil_for_teacher is not None:
+                        teacher_pixel_goal = _predict_force_teacher_coord(
+                            force_teacher_model,
+                            force_teacher_processor,
+                            force_teacher_device or device,
+                            current_front_pil=front_pil_for_teacher,
+                            lookdown_pil=current_lookdown_img,
+                            instruction=instruction,
+                            vlm_image_size=vlm_image_size,
+                            history_front_pils=None,
+                        )
+                    if teacher_pixel_goal is not None:
+                        print(
+                            "  [force-teacher] coord override: "
+                            f"student={student_pixel_goal} -> "
+                            f"teacher={teacher_pixel_goal}",
+                            flush=True,
+                        )
+                        pixel_goal = teacher_pixel_goal
+                    else:
+                        print(
+                            "  [force-teacher] teacher failed to produce coord; "
+                            f"falling back to student={student_pixel_goal}",
+                            flush=True,
+                        )
+
                 print("  [debug] calling generate_latents ...", flush=True)
                 lq = model.latent_queries.expand(1, -1, -1).to(
                     device=device, dtype=model.config.dtype,
@@ -2175,6 +2346,26 @@ def run_eval(args):
             device=device,
         )
 
+    force_teacher_model = None
+    force_teacher_processor = None
+    force_teacher_device = None
+    if bool(getattr(args, "force_teacher_coord", False)):
+        if not getattr(args, "force_teacher_internnav_model_path", ""):
+            raise RuntimeError(
+                "--force_teacher_coord requires --force_teacher_internnav_model_path"
+            )
+        if not getattr(args, "force_teacher_internnav_repo", ""):
+            raise RuntimeError(
+                "--force_teacher_coord requires --force_teacher_internnav_repo"
+            )
+        print(
+            f"Loading InternNav teacher VLM for --force_teacher_coord from "
+            f"{args.force_teacher_internnav_model_path}"
+        )
+        force_teacher_model, force_teacher_processor, force_teacher_device = (
+            _load_force_teacher_internnav(args, device)
+        )
+
     if panoramic_vlm_input:
         return _run_eval_panoramic_vlm(
             args=args,
@@ -2186,6 +2377,9 @@ def run_eval(args):
             num_sample_trajs=num_sample_trajs,
             has_nextdit=has_nextdit,
             pano_latent_adapter=pano_latent_adapter,
+            force_teacher_model=force_teacher_model,
+            force_teacher_processor=force_teacher_processor,
+            force_teacher_device=force_teacher_device,
         )
 
     hab_cfg = build_habitat_config(args)
@@ -2610,6 +2804,63 @@ def main():
             "is projected through the adapter before being fed to the frozen "
             "NextDiT System1 (distillation interface)."
         ),
+    )
+    parser.add_argument(
+        "--force_teacher_coord",
+        action="store_true",
+        default=False,
+        help=(
+            "H7 sanity check: at each System2 call, run the InternNav teacher VLM "
+            "alongside the student to predict the pixel goal, and override the "
+            "student's coord with the teacher's before conditioning the student "
+            "latent. Used to test whether closing the coord-distribution gap is "
+            "enough to close the closed-loop SR gap."
+        ),
+    )
+    parser.add_argument(
+        "--force_teacher_internnav_model_path",
+        type=str,
+        default=os.environ.get("INTERNNAV_MODEL_PATH", ""),
+        help="Path to InternNav teacher VLM (required when --force_teacher_coord).",
+    )
+    parser.add_argument(
+        "--force_teacher_internnav_repo",
+        type=str,
+        default=os.environ.get("INTERNNAV_REPO", ""),
+        help="Path to InternNav source repo (required when --force_teacher_coord).",
+    )
+    parser.add_argument(
+        "--force_teacher_torch_dtype",
+        type=str,
+        default="bf16",
+        help="Teacher dtype: bf16 | fp16 | fp32.",
+    )
+    parser.add_argument(
+        "--force_teacher_attn_impl",
+        type=str,
+        default="sdpa",
+        help="Teacher attn impl: sdpa | flash_attention_2 | eager.",
+    )
+    parser.add_argument(
+        "--force_teacher_flash_attn_stub",
+        action="store_true",
+        default=True,
+        help=(
+            "Install a flash_attn stub when teacher uses SDPA (mirrors "
+            "collect_internnav_teacher_sidecar default). Disable with "
+            "--no_force_teacher_flash_attn_stub if you actually have flash_attn."
+        ),
+    )
+    parser.add_argument(
+        "--no_force_teacher_flash_attn_stub",
+        dest="force_teacher_flash_attn_stub",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--force_teacher_coord_gpu_id",
+        type=int,
+        default=-1,
+        help="Optional separate GPU id for the teacher VLM; -1 = use --gpu_id.",
     )
     parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
     parser.add_argument("--data_path", type=str,

@@ -20,9 +20,11 @@ TEMPORARY DIAGNOSTIC SCRIPT; delete after the question is settled.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -53,6 +55,17 @@ from src.data.factory import build_trajectory_dataset
 from src.models.heatmap.input_constructor import VIEW_NAMES, construct_input
 
 LOGGER = logging.getLogger("verify_h7")
+
+LEGACY_CONJUNCTIONS = [
+    "you can see ",
+    "in front of you is ",
+    "there is ",
+    "you can spot ",
+    "you are toward the ",
+    "ahead of you is ",
+    "in your sight is ",
+]
+LOOKDOWN_TURN_TOKEN = "\u2193"
 
 
 def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]) -> None:
@@ -87,6 +100,38 @@ def _parse_pixel_goal(llm_output: str, image_size: tuple[int, int]) -> list[int]
     return [u, v]
 
 
+def _run_vlm_once(
+    model,
+    processor,
+    messages: list[dict[str, Any]],
+    *,
+    device: torch.device,
+    max_new_tokens: int = 128,
+) -> str:
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    _normalize_multimodal_inputs(inputs)
+    with torch.no_grad():
+        outputs = model.qwen2_5_vl.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            return_dict_in_generate=True,
+        )
+    output_ids = outputs.sequences
+    return processor.tokenizer.decode(
+        output_ids[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    )
+
+
 def _generate_student_coord(
     model,
     processor,
@@ -96,8 +141,16 @@ def _generate_student_coord(
     device: torch.device,
     internnav_protocol: bool = True,
     max_new_tokens: int = 128,
-) -> tuple[list[int] | None, str]:
-    """Run student VLM in closed-loop style to generate a pixel goal."""
+) -> tuple[list[int] | None, dict[str, Any]]:
+    """Run student VLM in closed-loop style (InternNav two-turn protocol).
+
+    Turn 1: panorama -> expect either coord directly, or LOOKDOWN_TURN_TOKEN.
+    Turn 2 (only if turn 1 returned LOOKDOWN_TURN_TOKEN): re-issue with lookdown
+    frame appended -> expect coord.
+
+    Returns ``(coord, info)`` where ``info`` contains both turns' raw text and
+    which turn produced the final coord.
+    """
     current_views_tensor = sample.get("current_views")
     history_panoramas_tensor = sample.get("history_panoramas")
     if current_views_tensor is None or history_panoramas_tensor is None:
@@ -119,41 +172,56 @@ def _generate_student_coord(
 
     instruction = str(sample.get("text", ""))
 
-    messages = construct_input(
+    base_messages = construct_input(
         current_views=current_views,
         history_panoramas=history_panoramas,
         instruction=instruction,
         pixel_goal=[0, 0],
         internnav_protocol=internnav_protocol,
     )
-    messages = [m for m in messages if m["role"] != "assistant"]
+    base_messages = [m for m in base_messages if m["role"] != "assistant"]
 
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    _normalize_multimodal_inputs(inputs)
-
-    with torch.no_grad():
-        outputs = model.qwen2_5_vl.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            return_dict_in_generate=True,
-        )
-    output_ids = outputs.sequences
-    llm_output = processor.tokenizer.decode(
-        output_ids[0][inputs["input_ids"].shape[1] :],
-        skip_special_tokens=True,
+    turn1_text = _run_vlm_once(
+        model, processor, base_messages, device=device, max_new_tokens=max_new_tokens,
     )
 
-    coord = _parse_pixel_goal(llm_output, image_size)
-    return coord, llm_output
+    info: dict[str, Any] = {"turn1_text": turn1_text, "turn2_text": None, "used_turn": 1}
+
+    coord = _parse_pixel_goal(turn1_text, image_size)
+    if coord is not None:
+        return coord, info
+
+    if LOOKDOWN_TURN_TOKEN not in turn1_text:
+        return None, info
+
+    lookdown_tensor = sample.get("lookdown_frame")
+    if lookdown_tensor is None:
+        info["error"] = "no lookdown_frame in sample; cannot do turn 2"
+        return None, info
+
+    lookdown_pil = _tensor_chw_to_pil(lookdown_tensor, resize=image_size)
+
+    messages_turn2 = copy.deepcopy(base_messages)
+    messages_turn2.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": turn1_text}],
+    })
+    messages_turn2.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
+            {"type": "image", "image": lookdown_pil},
+        ],
+    })
+
+    turn2_text = _run_vlm_once(
+        model, processor, messages_turn2, device=device, max_new_tokens=max_new_tokens,
+    )
+    info["turn2_text"] = turn2_text
+    info["used_turn"] = 2
+
+    coord = _parse_pixel_goal(turn2_text, image_size)
+    return coord, info
 
 
 def parse_args() -> argparse.Namespace:
@@ -234,7 +302,7 @@ def main() -> int:
             teacher_coord = list(rec["teacher"]["coord_uv"])
 
             try:
-                student_coord, raw_text = _generate_student_coord(
+                student_coord, gen_info = _generate_student_coord(
                     student_model, processor, sample,
                     image_size=image_size, device=device,
                     internnav_protocol=args.internnav_protocol,
@@ -244,10 +312,13 @@ def main() -> int:
                 coord_failures += 1
                 continue
 
+            turn1_text = gen_info.get("turn1_text", "") or ""
+            turn2_text = gen_info.get("turn2_text") or ""
+
             if student_coord is None:
                 LOGGER.info(
-                    "[%d] student VLM did not return a coord (text=%r)",
-                    i, raw_text[:80],
+                    "[%d] student VLM did not return a coord (turn1=%r turn2=%r)",
+                    i, turn1_text[:60], turn2_text[:60],
                 )
                 coord_failures += 1
                 continue
@@ -281,7 +352,9 @@ def main() -> int:
                 "current_t": rec.get("current_t"),
                 "teacher_coord_uv": teacher_coord,
                 "student_coord_uv": student_coord,
-                "student_raw_text": raw_text,
+                "student_turn1_text": turn1_text,
+                "student_turn2_text": turn2_text,
+                "used_turn": gen_info.get("used_turn"),
                 "coord_diff_pixels": coord_diff,
                 "latent_A_norm": float(latent_A.float().norm().item()),
                 "latent_B_norm": float(latent_B.float().norm().item()),
@@ -291,8 +364,9 @@ def main() -> int:
             fout.flush()
 
             LOGGER.info(
-                "[%d/%d] idx=%s teach=%s stud=%s diff=%.1fpx cos(A,B)=%.4f",
+                "[%d/%d] idx=%s turn=%d teach=%s stud=%s diff=%.1fpx cos(A,B)=%.4f",
                 i + 1, len(records), entry["dataset_index"],
+                int(gen_info.get("used_turn", 0)),
                 teacher_coord, student_coord, coord_diff, cos,
             )
 
