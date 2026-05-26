@@ -2057,6 +2057,145 @@ def _run_eval_panoramic_vlm(
                 continue
 
             pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
+
+            # === Force-teacher full-drive (--force_teacher_coord) ============
+            #
+            # Replace student's whole System2 decision with InternNav teacher's
+            # at every call. Teacher's two-turn protocol can yield three modes:
+            #   coord  -> use teacher coord, fall through to student System1
+            #             (with teacher coord overriding student coord at
+            #              _condition_output_ids_for_pixel_goal time)
+            #   action -> push teacher's action sequence onto local_actions,
+            #             skip System1 entirely, drain via the outer loop
+            #   none   -> fall back to student behavior (rare degenerate case)
+            # This isolates VLM as the sole controlled variable when measuring
+            # the SR ceiling for the adapter+NextDiT stack.
+            if force_teacher_model is not None:
+                from scripts.evaluation.collect_internnav_teacher_sidecar import (
+                    _parse_text_actions,
+                )
+
+                if turn_lookdown_img is not None:
+                    ld_for_teacher = (
+                        turn_lookdown_img
+                        if turn_lookdown_img.size == vlm_image_size
+                        else turn_lookdown_img.resize(vlm_image_size)
+                    )
+                else:
+                    ld_for_teacher = capture_lookdown_view(
+                        env, image_size=vlm_image_size,
+                    )
+                    turn_lookdown_img = ld_for_teacher
+
+                try:
+                    front_for_teacher = current_views["front"]
+                except (KeyError, TypeError):
+                    front_for_teacher = None
+
+                teacher_coord: list[int] | None = None
+                teacher_info: dict = {}
+                teacher_actions: list[int] = []
+                if front_for_teacher is not None:
+                    history_front_pils: list = []
+                    if len(executed_history_panoramas) > 1:
+                        hist_pano = executed_history_panoramas[
+                            -1 - num_history : -1
+                        ]
+                        history_front_pils = [
+                            h["front"] for h in hist_pano if "front" in h
+                        ]
+                    teacher_coord, teacher_info = _predict_force_teacher_coord(
+                        force_teacher_model,
+                        force_teacher_processor,
+                        force_teacher_device or device,
+                        current_front_pil=front_for_teacher,
+                        lookdown_pil=ld_for_teacher,
+                        instruction=instruction,
+                        vlm_image_size=vlm_image_size,
+                        history_front_pils=history_front_pils,
+                    )
+                    teacher_actions = _parse_text_actions(
+                        teacher_info.get("turn1_text") or ""
+                    )
+
+                student_pg_repr = (
+                    list(pixel_goal) if pixel_goal is not None else None
+                )
+
+                if teacher_coord is not None:
+                    if pixel_goal is not None and has_nextdit:
+                        print(
+                            "  [force-teacher] coord override (turn "
+                            f"{teacher_info.get('used_turn')}, hist="
+                            f"{teacher_info.get('n_history')}): "
+                            f"student={student_pg_repr} -> "
+                            f"teacher={teacher_coord}",
+                            flush=True,
+                        )
+                        pixel_goal = teacher_coord
+                    else:
+                        print(
+                            "  [force-teacher] teacher coord="
+                            f"{teacher_coord} but student gave actions "
+                            f"(llm_output={llm_output[:40]!r}); "
+                            "cannot reuse student latent for teacher coord; "
+                            "falling back to student",
+                            flush=True,
+                        )
+                elif teacher_actions:
+                    action_name_map = {
+                        0: "STOP", 1: "FORWARD", 2: "LEFT",
+                        3: "RIGHT", 5: "LOOKDOWN",
+                    }
+                    pretty_actions = [
+                        action_name_map.get(int(a), str(a))
+                        for a in teacher_actions
+                    ]
+                    print(
+                        "  [force-teacher] action override (hist="
+                        f"{teacher_info.get('n_history')}): "
+                        f"student pixel_goal={student_pg_repr} "
+                        f"-> teacher actions={pretty_actions}",
+                        flush=True,
+                    )
+
+                    first_action = teacher_actions[0]
+                    if first_action == ActionCode.LOOKDOWN:
+                        awaiting_lookdown = True
+                        last_llm_output = "\u2193"
+                        continue
+                    if first_action == ActionCode.STOP:
+                        observations, done = _apply_habitat_action(
+                            env, ActionCode.STOP,
+                        )
+                        step_id += 1
+                        continue
+
+                    local_actions = _finalize_local_actions(teacher_actions)
+                    pix_goal_image = None
+                    _last_traj_hs = None
+                    forward_action_count = 0
+                    first_action = local_actions.pop(0)
+                    if first_action == ActionCode.STOP:
+                        observations, done = _apply_habitat_action(
+                            env, ActionCode.STOP,
+                        )
+                        step_id += 1
+                        continue
+                    observations, done = _apply_habitat_action(
+                        env, first_action,
+                    )
+                    step_id += 1
+                    forward_action_count += 1
+                    continue
+                else:
+                    print(
+                        "  [force-teacher] teacher unparseable (turn1="
+                        f"{(teacher_info.get('turn1_text') or '')!r}); "
+                        "falling back to student",
+                        flush=True,
+                    )
+
             if has_nextdit and pixel_goal is not None:
                 print(f"  predicted pixel_goal {pixel_goal}")
 
@@ -2081,51 +2220,6 @@ def _run_eval_panoramic_vlm(
                 current_traj_t = _lookdown_to_traj_tensor(current_lookdown_img, device)
                 pix_goal_image = current_traj_t.clone()
                 traj_images = torch.stack([pix_goal_image, current_traj_t]).unsqueeze(0).to(device)
-
-                if force_teacher_model is not None:
-                    student_pixel_goal = list(pixel_goal)
-                    try:
-                        front_pil_for_teacher = current_views["front"]
-                    except Exception:
-                        front_pil_for_teacher = None
-                    teacher_pixel_goal = None
-                    teacher_info: dict = {}
-                    if front_pil_for_teacher is not None:
-                        history_front_pils: list = []
-                        if len(executed_history_panoramas) > 1:
-                            hist_pano = executed_history_panoramas[-1 - num_history : -1]
-                            history_front_pils = [
-                                h["front"] for h in hist_pano if "front" in h
-                            ]
-                        teacher_pixel_goal, teacher_info = _predict_force_teacher_coord(
-                            force_teacher_model,
-                            force_teacher_processor,
-                            force_teacher_device or device,
-                            current_front_pil=front_pil_for_teacher,
-                            lookdown_pil=current_lookdown_img,
-                            instruction=instruction,
-                            vlm_image_size=vlm_image_size,
-                            history_front_pils=history_front_pils,
-                        )
-                    if teacher_pixel_goal is not None:
-                        print(
-                            "  [force-teacher] coord override (turn "
-                            f"{teacher_info.get('used_turn')}, hist="
-                            f"{teacher_info.get('n_history')}): "
-                            f"student={student_pixel_goal} -> "
-                            f"teacher={teacher_pixel_goal}",
-                            flush=True,
-                        )
-                        pixel_goal = teacher_pixel_goal
-                    else:
-                        print(
-                            "  [force-teacher] teacher failed to produce coord "
-                            f"(hist={teacher_info.get('n_history', 0)}, "
-                            f"turn1={teacher_info.get('turn1_text', '')!r}, "
-                            f"turn2={teacher_info.get('turn2_text', '')!r}); "
-                            f"falling back to student={student_pixel_goal}",
-                            flush=True,
-                        )
 
                 print("  [debug] calling generate_latents ...", flush=True)
                 lq = model.latent_queries.expand(1, -1, -1).to(
