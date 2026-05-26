@@ -2117,6 +2117,21 @@ def _run_eval_panoramic_vlm(
                     teacher_actions = _parse_text_actions(
                         teacher_info.get("turn1_text") or ""
                     )
+                    # If teacher's turn-1 contained "↓" (lookdown trigger) we
+                    # already executed turn-2 internally inside
+                    # _predict_force_teacher_coord. In that case the LOOKDOWN
+                    # tokens in turn-1 were a *protocol signal* ("show me the
+                    # lookdown frame"), NOT an action sequence. If turn-2 still
+                    # didn't yield a coord, treat that as "teacher refused" and
+                    # let us fall back to student -- otherwise we re-trigger
+                    # awaiting_lookdown on every iteration and burn cycles in
+                    # an infinite "LOOKDOWN -> ↓↓ -> LOOKDOWN" loop with no
+                    # step_id progress.
+                    if teacher_info.get("turn2_text") is not None:
+                        teacher_actions = [
+                            a for a in teacher_actions
+                            if a != int(ActionCode.LOOKDOWN)
+                        ]
 
                 student_pg_repr = (
                     list(pixel_goal) if pixel_goal is not None else None
