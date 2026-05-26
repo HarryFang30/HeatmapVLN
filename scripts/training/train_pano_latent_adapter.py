@@ -450,6 +450,44 @@ def _load_teacher_latents(
     return stacked
 
 
+def _filter_records_with_pano_goals(
+    records: list[dict[str, Any]],
+    *,
+    dataset: Any,
+) -> list[dict[str, Any]]:
+    """Keep records whose exact frame has a structured pano pixel goal.
+
+    DDP needs every rank to execute the same number of backward calls.  Filtering
+    once before sharding avoids rank-local batch skips when a teacher sidecar
+    record has no student pano pixel target under the current C3 rule.
+    """
+    filtered: list[dict[str, Any]] = []
+    skipped = 0
+    failed = 0
+    for rec in records:
+        try:
+            sample = _sample_from_record(dataset, rec)
+        except Exception as exc:
+            failed += 1
+            LOGGER.warning(
+                "Skip teacher record dataset_index=%s: failed to load exact sample (%r)",
+                rec.get("dataset_index"),
+                exc,
+            )
+            continue
+        if _has_trainable_pano_goal(sample):
+            filtered.append(rec)
+        else:
+            skipped += 1
+    LOGGER.info(
+        "Filtered teacher records for pano pixel goals: kept=%d skipped_no_pano_goal=%d failed=%d",
+        len(filtered),
+        skipped,
+        failed,
+    )
+    return filtered
+
+
 def _latent_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -710,13 +748,15 @@ def _build_batch(
     usable_records: list[dict[str, Any]] = []
     for rec in batch_records:
         idx = int(rec["dataset_index"])
-        if idx < 0 or idx >= len(dataset):
-            LOGGER.warning("Skip out-of-range dataset_index=%s", idx)
+        if (idx < 0 or idx >= len(dataset)) and (
+            rec.get("clip_idx") is None or rec.get("current_t") is None
+        ):
+            LOGGER.warning("Skip out-of-range dataset_index=%s without clip/frame fallback", idx)
             continue
         sample = _sample_from_record(dataset, rec)
         if not _has_trainable_pano_goal(sample):
-            LOGGER.debug(
-                "Skip dataset_index=%s without trainable pano pixel goal (kind=%s view=%s)",
+            LOGGER.warning(
+                "Skip dataset_index=%s without trainable pano pixel goal after prefilter (kind=%s view=%s)",
                 idx,
                 sample.get("pano_sample_kind"),
                 sample.get("pano_view_id"),
@@ -907,42 +947,42 @@ def parse_args() -> argparse.Namespace:
         "--residual",
         dest="residual",
         action="store_true",
-        help="Use student_latent + adapter_delta. Off by default because pano and InternNav latents have different scales.",
+        help=argparse.SUPPRESS,
     )
-    p.add_argument("--no-residual", dest="residual", action="store_false")
+    p.add_argument("--no-residual", dest="residual", action="store_false", help=argparse.SUPPRESS)
     p.set_defaults(residual=False)
     p.add_argument(
         "--zero-init",
         dest="zero_init",
         action="store_true",
-        help="Zero-initialize the final projection layer. Useful mainly with --residual.",
+        help=argparse.SUPPRESS,
     )
-    p.add_argument("--no-zero-init", dest="zero_init", action="store_false")
+    p.add_argument("--no-zero-init", dest="zero_init", action="store_false", help=argparse.SUPPRESS)
     p.set_defaults(zero_init=False)
     p.add_argument(
         "--pre-norm",
         dest="pre_norm",
         action="store_true",
-        help="Apply a LayerNorm to the student latent before the MLP (strips per-token scale).",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--no-pre-norm",
         dest="pre_norm",
         action="store_false",
-        help="Default: feed raw student latents into the MLP so per-token scale is preserved.",
+        help=argparse.SUPPRESS,
     )
     p.set_defaults(pre_norm=False)
     p.add_argument(
         "--output-affine",
         dest="output_affine",
         action="store_true",
-        help="Add a per-dim learnable scale/bias on the adapter output (helps match teacher norm).",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--no-output-affine",
         dest="output_affine",
         action="store_false",
-        help="Disable the per-dim output affine.",
+        help=argparse.SUPPRESS,
     )
     p.set_defaults(output_affine=True)
     p.add_argument("--cosine-weight", type=float, default=0.1)
@@ -1018,6 +1058,14 @@ def main() -> int:
         )
         if _rank0():
             LOGGER.info("Dataset samples=%d", len(dataset))
+
+        records = _filter_records_with_pano_goals(records, dataset=dataset)
+        if not records:
+            raise RuntimeError(
+                "No teacher records remain after filtering for structured pano pixel goals"
+            )
+        if _rank0():
+            LOGGER.info("Usable pano pixel teacher records=%d", len(records))
 
         model = _load_student_model(cfg, args, device)
         processor = model.qwen2_5_vl.processor

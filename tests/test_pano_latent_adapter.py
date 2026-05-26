@@ -3,6 +3,10 @@ import math
 import torch
 
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
+from scripts.training.train_pano_latent_adapter import (
+    _filter_records_with_pano_goals,
+    _sample_from_record,
+)
 
 
 def test_geometry_scalars_use_view_yaw_and_pixel_offset():
@@ -71,3 +75,51 @@ def test_geometry_aware_adapter_outputs_nextdit_condition_shape_and_grad():
     assert out.shape == (2, 4, 6)
     out.square().mean().backward()
     assert adapter.output_queries.grad is not None
+
+
+class _FakeDataset:
+    def __init__(self):
+        self.sample_index = [(0, 5)]
+        self._sample_subsequence_range = {0: (0, 20)}
+        self.samples = {
+            (0, 5): {
+                "pano_sample_kind": "pixel",
+                "pano_view_id": "front",
+                "pano_pixel_goal": [128, 128],
+            },
+            (1, 7): {
+                "pano_sample_kind": "turn",
+                "pano_view_id": "view_turn",
+            },
+        }
+
+    def __len__(self):
+        return len(self.sample_index)
+
+    def _load_meta(self, clip_idx):
+        return {"num_frames": 20 + int(clip_idx)}
+
+    def _build_sample(self, idx):
+        return self.samples[tuple(self.sample_index[idx])]
+
+
+def test_sample_from_record_uses_clip_frame_when_dataset_index_is_stale():
+    dataset = _FakeDataset()
+    rec = {"dataset_index": 999, "clip_idx": 0, "current_t": 5}
+
+    sample = _sample_from_record(dataset, rec)
+
+    assert sample["pano_view_id"] == "front"
+    assert dataset.sample_index == [(0, 5)]
+
+
+def test_filter_records_with_pano_goals_is_global_before_ddp_sharding():
+    dataset = _FakeDataset()
+    records = [
+        {"dataset_index": 0, "clip_idx": 0, "current_t": 5},
+        {"dataset_index": 1, "clip_idx": 1, "current_t": 7},
+    ]
+
+    filtered = _filter_records_with_pano_goals(records, dataset=dataset)
+
+    assert filtered == [records[0]]
