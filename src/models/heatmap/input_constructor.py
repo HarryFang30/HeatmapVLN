@@ -56,11 +56,36 @@ DIRECT_WAYPOINT_TASK_SUFFIX = (
     " Output the next waypoint coordinates in the front view of the current observation."
 )
 
+STRUCTURED_PANO_OUTPUT_SUFFIX = (
+    " Output the next waypoint using exactly two lines when applicable: "
+    "`view: <front|right|back|left>` and `pixel: <u> <v>`. "
+    "Output `view: stop` when you have completed the task. "
+    "Output `view: turn` when the waypoint is not visible in any panoramic view."
+)
+
 HISTORY_PROJECTION_TASK = (
     "Project each historical location into the current panoramic views."
 )
 
 _ANCHOR_TOKEN_CACHE: dict[tuple[int, int], list[list[int]]] = {}
+
+
+def format_structured_pano_assistant_text(
+    pano_view_id: str | None,
+    pano_pixel_goal: list[int] | None,
+    *,
+    sample_kind: str | None = None,
+    is_stop: bool = False,
+) -> str | None:
+    """Build Stage1-S2 structured assistant target text."""
+    if is_stop or sample_kind == "stop" or pano_view_id == "view_stop":
+        return "view: stop"
+    if pano_pixel_goal is not None and pano_view_id in VIEW_NAMES:
+        u, v = int(pano_pixel_goal[0]), int(pano_pixel_goal[1])
+        return f"view: {pano_view_id}\npixel: {u} {v}"
+    if sample_kind == "turn" or pano_view_id == "view_turn":
+        return "view: turn"
+    return None
 
 
 def construct_input(
@@ -71,6 +96,7 @@ def construct_input(
     assistant_text: str | None = None,
     lookdown_frame: Union[Image.Image, torch.Tensor, np.ndarray] | None = None,
     internnav_protocol: bool = False,
+    structured_pano_output: bool = False,
 ) -> list[dict]:
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
@@ -106,7 +132,9 @@ def construct_input(
         nav_target_text = f"{pixel_goal[0]} {pixel_goal[1]}"
 
     if nav_target_text is not None or pixel_goal is not None:
-        if internnav_protocol:
+        if structured_pano_output:
+            content.append({"type": "text", "text": STRUCTURED_PANO_OUTPUT_SUFFIX})
+        elif internnav_protocol:
             content.append({"type": "text", "text": INTERNAV_LOOKDOWN_TASK_SUFFIX})
         else:
             content.append({
@@ -119,7 +147,11 @@ def construct_input(
     messages = [{"role": "user", "content": content}]
 
     if nav_target_text is not None:
-        if internnav_protocol and pixel_goal is not None:
+        if (
+            internnav_protocol
+            and pixel_goal is not None
+            and not structured_pano_output
+        ):
             if lookdown_frame is None:
                 return messages
             messages.append({

@@ -26,6 +26,7 @@ from src.models.heatmap.input_constructor import (
     construct_input,
     construct_input_stage2,
     find_text_anchor_positions,
+    format_structured_pano_assistant_text,
 )
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
@@ -78,6 +79,7 @@ class PanoramicTokenizedCollator:
         sft_include_turns: bool = True,
         sft_include_forward: bool = False,
         sft_protocol: str = "direct",
+        structured_pano_output: bool = True,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -88,6 +90,7 @@ class PanoramicTokenizedCollator:
         self.sft_protocol = str(sft_protocol).lower()
         if self.sft_protocol not in {"direct", "internnav"}:
             raise ValueError(f"Unsupported System2 SFT protocol: {sft_protocol}")
+        self.structured_pano_output = bool(structured_pano_output)
         self._call_count = 0
 
     @staticmethod
@@ -153,7 +156,23 @@ class PanoramicTokenizedCollator:
                 return start
         return -1
 
+    def _structured_pano_assistant_text(self, sample: dict[str, Any]) -> str | None:
+        if not self.structured_pano_output:
+            return None
+        if sample.get("pano_view_id") is None and sample.get("pano_sample_kind") is None:
+            return None
+        return format_structured_pano_assistant_text(
+            sample.get("pano_view_id"),
+            sample.get("pano_pixel_goal"),
+            sample_kind=sample.get("pano_sample_kind"),
+            is_stop=sample.get("is_stop", 0.0) > 0.5,
+        )
+
     def _assistant_texts_for_sft(self, sample: dict[str, Any]) -> list[str]:
+        structured = self._structured_pano_assistant_text(sample)
+        if structured is not None:
+            return [structured]
+
         if sample.get("is_stop", 0.0) > 0.5 or int(sample.get("discrete_action", 1)) == 0:
             return ["STOP"]
 
@@ -291,6 +310,10 @@ class PanoramicTokenizedCollator:
             result["traj_images"] = torch.stack([sample["traj_images"] for sample in batch], dim=0)
         if "pixel_goal" in batch[0]:
             result["pixel_goal"] = [sample.get("pixel_goal") for sample in batch]
+        if "pano_view_id" in batch[0]:
+            result["pano_view_id"] = [sample.get("pano_view_id") for sample in batch]
+        if "pano_pixel_goal" in batch[0]:
+            result["pano_pixel_goal"] = [sample.get("pano_pixel_goal") for sample in batch]
 
         if do_log:
             rss1 = _rss_mb()
@@ -336,11 +359,23 @@ class PanoramicTokenizedCollator:
                         }
                         for hist_idx in range(sample["history_panoramas"].shape[0])
                     ]
-                    pg = sample.get("pixel_goal")
+                    pg = sample.get("pano_pixel_goal") or sample.get("pixel_goal")
                     assistant_texts = self._assistant_texts_for_sft(sample) if self.sft_mode else []
                     assistant_text = assistant_texts[-1] if assistant_texts else None
                     lookdown_frame = sample.get("lookdown_frame")
-                    if self.sft_protocol == "internnav" and pg is not None and lookdown_frame is None:
+                    use_structured = (
+                        self.structured_pano_output
+                        and (
+                            sample.get("pano_view_id") is not None
+                            or sample.get("pano_sample_kind") is not None
+                        )
+                    )
+                    if (
+                        self.sft_protocol == "internnav"
+                        and pg is not None
+                        and lookdown_frame is None
+                        and not use_structured
+                    ):
                         raise RuntimeError(
                             "InternNav-protocol panoramic sample with pixel_goal "
                             "is missing lookdown_frame."
@@ -354,9 +389,10 @@ class PanoramicTokenizedCollator:
                             assistant_text=assistant_text,
                             lookdown_frame=lookdown_frame,
                             internnav_protocol=self.sft_protocol == "internnav",
+                            structured_pano_output=use_structured,
                         )
                     )
-                    if not self.sft_mode and self.sft_protocol == "internnav" and pg is not None:
+                    if not self.sft_mode and self.sft_protocol == "internnav" and pg is not None and not use_structured:
                         sft_target_texts.append(["↓", f"{int(pg[0])} {int(pg[1])}"])
                     else:
                         sft_target_texts.append(assistant_texts)

@@ -61,7 +61,7 @@ class _FakeProcessor:
         }
 
 
-def _sample(pixel_goal=None, discrete_action=1, is_stop=0.0):
+def _sample(pixel_goal=None, discrete_action=1, is_stop=0.0, pano_view_id=None, pano_pixel_goal=None, pano_sample_kind=None):
     sample = {
         "history_frames": torch.zeros(1, 3, 2, 2),
         "current_frame": torch.zeros(3, 2, 2),
@@ -77,6 +77,12 @@ def _sample(pixel_goal=None, discrete_action=1, is_stop=0.0):
     }
     if pixel_goal is not None:
         sample["pixel_goal"] = pixel_goal
+    if pano_view_id is not None:
+        sample["pano_view_id"] = pano_view_id
+    if pano_pixel_goal is not None:
+        sample["pano_pixel_goal"] = pano_pixel_goal
+    if pano_sample_kind is not None:
+        sample["pano_sample_kind"] = pano_sample_kind
     return sample
 
 
@@ -151,3 +157,32 @@ def test_panoramic_sft_collator_internnav_protocol_labels_down_then_coord():
             tokenizer.eos_token_id,
         ]
     )
+
+
+def test_panoramic_sft_collator_structured_pano_pixel_goal():
+    collator = PanoramicTokenizedCollator(_FakeProcessor(), sft_mode=True)
+    sample = _sample(
+        pixel_goal=[128, 192],
+        pano_view_id="front",
+        pano_pixel_goal=[128, 192],
+        pano_sample_kind="pixel",
+    )
+    out = collator([sample])
+    assert out["sft_target_text"] == [["view: front\npixel: 128 192"]]
+
+    tokenizer = collator.processor.tokenizer
+    targets = out["pano_inputs"]["labels"][0]
+    targets = targets[targets != IGNORE_INDEX].tolist()
+    assert targets == [
+        *tokenizer.encode("view: front\npixel: 128 192", add_special_tokens=False),
+        tokenizer.eos_token_id,
+    ]
+
+
+def test_panoramic_sft_collator_structured_pano_stop_and_turn():
+    collator = PanoramicTokenizedCollator(_FakeProcessor(), sft_mode=True)
+    out = collator([
+        _sample(discrete_action=0, is_stop=1.0, pano_view_id="view_stop", pano_sample_kind="stop"),
+        _sample(discrete_action=2, pano_view_id="view_turn", pano_sample_kind="turn"),
+    ])
+    assert out["sft_target_text"] == [["view: stop"], ["view: turn"]]
