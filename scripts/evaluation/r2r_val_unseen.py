@@ -318,12 +318,13 @@ def _predict_force_teacher_coord(
     vlm_image_size: tuple[int, int],
     history_front_pils: list | None = None,
     max_new_tokens: int = 64,
-) -> list[int] | None:
+) -> tuple[list[int] | None, dict]:
     """Run the InternNav teacher's two-turn protocol to get a teacher coord.
 
-    Returns ``[u, v]`` or ``None`` if either turn fails to produce a parseable
-    coordinate. Used by ``--force_teacher_coord`` to substitute the student's
-    student-generated pixel goal with the teacher's (training-distribution) one.
+    Returns ``(coord, info)`` where ``coord`` is ``[u, v]`` or ``None`` if
+    either turn failed to produce a parseable coordinate. ``info`` carries
+    both turns' raw text and which turn produced the final coord, so callers
+    can log failure reasons for diagnostics.
     """
     from scripts.evaluation.collect_internnav_teacher_sidecar import (
         DEFAULT_IMAGE_TOKEN,
@@ -381,12 +382,18 @@ def _predict_force_teacher_coord(
         ).strip()
 
     turn1 = _run_once(first_messages, first_images)
+    info: dict = {
+        "turn1_text": turn1,
+        "turn2_text": None,
+        "used_turn": 1,
+        "n_history": len(history_front_pils),
+    }
     coord_uv, _ = _parse_coord(turn1)
     if coord_uv is not None:
-        return coord_uv
+        return coord_uv, info
 
     if "↓" not in turn1:
-        return None
+        return None, info
 
     second_text = f"{INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
     second_messages = list(first_messages)
@@ -401,8 +408,10 @@ def _predict_force_teacher_coord(
     second_images = first_images + [lookdown_pil]
 
     turn2 = _run_once(second_messages, second_images)
+    info["turn2_text"] = turn2
+    info["used_turn"] = 2
     coord_uv, _ = _parse_coord(turn2)
-    return coord_uv
+    return coord_uv, info
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -2080,8 +2089,15 @@ def _run_eval_panoramic_vlm(
                     except Exception:
                         front_pil_for_teacher = None
                     teacher_pixel_goal = None
+                    teacher_info: dict = {}
                     if front_pil_for_teacher is not None:
-                        teacher_pixel_goal = _predict_force_teacher_coord(
+                        history_front_pils: list = []
+                        if len(executed_history_panoramas) > 1:
+                            hist_pano = executed_history_panoramas[-1 - num_history : -1]
+                            history_front_pils = [
+                                h["front"] for h in hist_pano if "front" in h
+                            ]
+                        teacher_pixel_goal, teacher_info = _predict_force_teacher_coord(
                             force_teacher_model,
                             force_teacher_processor,
                             force_teacher_device or device,
@@ -2089,11 +2105,13 @@ def _run_eval_panoramic_vlm(
                             lookdown_pil=current_lookdown_img,
                             instruction=instruction,
                             vlm_image_size=vlm_image_size,
-                            history_front_pils=None,
+                            history_front_pils=history_front_pils,
                         )
                     if teacher_pixel_goal is not None:
                         print(
-                            "  [force-teacher] coord override: "
+                            "  [force-teacher] coord override (turn "
+                            f"{teacher_info.get('used_turn')}, hist="
+                            f"{teacher_info.get('n_history')}): "
                             f"student={student_pixel_goal} -> "
                             f"teacher={teacher_pixel_goal}",
                             flush=True,
@@ -2101,7 +2119,10 @@ def _run_eval_panoramic_vlm(
                         pixel_goal = teacher_pixel_goal
                     else:
                         print(
-                            "  [force-teacher] teacher failed to produce coord; "
+                            "  [force-teacher] teacher failed to produce coord "
+                            f"(hist={teacher_info.get('n_history', 0)}, "
+                            f"turn1={teacher_info.get('turn1_text', '')!r}, "
+                            f"turn2={teacher_info.get('turn2_text', '')!r}); "
                             f"falling back to student={student_pixel_goal}",
                             flush=True,
                         )
