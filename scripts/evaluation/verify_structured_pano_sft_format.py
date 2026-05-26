@@ -93,41 +93,56 @@ def _base_sample(**overrides):
 
 
 def _print_case(title: str, sample: dict, collator: PanoramicTokenizedCollator) -> dict:
+    meta = {
+        "pano_view_id": sample.get("pano_view_id"),
+        "pano_pixel_goal": sample.get("pano_pixel_goal"),
+        "pano_sample_kind": sample.get("pano_sample_kind"),
+        "pixel_goal": sample.get("pixel_goal"),
+        "text": sample.get("text"),
+        "lookdown_frame": sample.get("lookdown_frame"),
+    }
+    views = {
+        n: sample["current_views"][i]
+        for i, n in enumerate(("front", "right", "back", "left"))
+    }
+    hist = [{
+        n: sample["history_panoramas"][0, i]
+        for i, n in enumerate(("front", "right", "back", "left"))
+    }]
+    pg = meta["pano_pixel_goal"] or meta["pixel_goal"]
+    use_structured = (
+        meta["pano_view_id"] is not None or meta["pano_sample_kind"] is not None
+    )
+
     out = collator([sample])
     target = out["sft_target_text"][0]
     labels = out["pano_inputs"]["labels"][0]
     n_labeled = int((labels != -100).sum().item())
 
     print(f"\n=== {title} ===")
-    print(f"  pano_view_id      : {sample.get('pano_view_id')}")
-    print(f"  pano_pixel_goal   : {sample.get('pano_pixel_goal')}")
-    print(f"  pano_sample_kind  : {sample.get('pano_sample_kind')}")
-    print(f"  legacy pixel_goal : {sample.get('pixel_goal')}")
+    print(f"  pano_view_id      : {meta['pano_view_id']}")
+    print(f"  pano_pixel_goal   : {meta['pano_pixel_goal']}")
+    print(f"  pano_sample_kind  : {meta['pano_sample_kind']}")
+    print(f"  legacy pixel_goal : {meta['pixel_goal']}")
     print(f"  sft_target_text   : {target!r}")
     print(f"  labeled tokens    : {n_labeled}")
 
-    # Also show prompt tail + assistant from construct_input directly.
-    views = {n: sample["current_views"][i] for i, n in enumerate(("front", "right", "back", "left"))}
-    hist = [{
-        n: sample["history_panoramas"][0, i]
-        for i, n in enumerate(("front", "right", "back", "left"))
-    }]
-    pg = sample.get("pano_pixel_goal") or sample.get("pixel_goal")
-    use_structured = sample.get("pano_view_id") is not None or sample.get("pano_sample_kind") is not None
     assistant = target[-1] if target else None
     messages = construct_input(
         current_views=views,
         history_panoramas=hist,
-        instruction=sample.get("text"),
+        instruction=meta["text"],
         pixel_goal=pg,
         assistant_text=assistant,
-        lookdown_frame=sample.get("lookdown_frame"),
+        lookdown_frame=meta["lookdown_frame"],
         internnav_protocol=collator.sft_protocol == "internnav",
         structured_pano_output=use_structured,
     )
     user_tail = ""
     for item in messages[0]["content"]:
-        if item["type"] == "text" and "view:" in item["text"] or "Output the next waypoint" in item["text"]:
+        if item["type"] == "text" and (
+            "view:" in item["text"] or "Output the next waypoint" in item["text"]
+        ):
             user_tail = item["text"]
     assistant_msg = messages[-1]["content"][0]["text"] if len(messages) > 1 else None
     print(f"  user suffix used  : {'STRUCTURED' if use_structured else 'LEGACY'}")
