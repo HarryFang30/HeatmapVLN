@@ -999,7 +999,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             goal_len, pg = pg_result
             result["pixel_goal"] = pg
             result["pixel_goal_relative_len"] = goal_len
-        elif self.load_traj_images:
+        elif self.load_traj_images and not self.compute_pano_view_pixel_goal:
             tv = result.get("trajectory_valid", 0.0)
             result["trajectory_valid"] = (
                 torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
@@ -1028,8 +1028,19 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 result["pano_view_id"] = VIEW_TURN
                 result["pano_sample_kind"] = "turn"
 
-        goal_frame_idx = current_t + int(result.get("pixel_goal_relative_len", 0))
-        if result.get("pixel_goal") is None:
+        goal_rel_len = result.get(
+            "pixel_goal_relative_len",
+            result.get("pano_pixel_goal_relative_len", 0),
+        )
+        goal_frame_idx = current_t + int(goal_rel_len or 0)
+        has_system1_goal = (
+            result.get("pixel_goal") is not None
+            or (
+                str(result.get("pano_sample_kind") or "").lower() == "pixel"
+                and result.get("pano_pixel_goal") is not None
+            )
+        )
+        if not has_system1_goal:
             goal_frame_idx = min(subseq_end - 1, T - 1)
 
         # 12. traj_images for DualVLN visual memory.
@@ -1039,7 +1050,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # goal itself is carried by the generated text / latent queries,
         # not by replacing the anchor with a privileged future goal view.
         if self.load_traj_images:
-            if result.get("pixel_goal") is None:
+            if not has_system1_goal:
                 th, tw = self.traj_image_size[1], self.traj_image_size[0]
                 traj_imgs_list = [np.zeros((th, tw, 3), dtype=np.uint8)]
                 traj_poses_list = [np.zeros((self.predict_horizon, 3), dtype=np.float32)]

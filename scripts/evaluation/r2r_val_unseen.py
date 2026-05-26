@@ -260,6 +260,10 @@ def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: tor
 def _maybe_apply_pano_latent_adapter(
     traj_hs: torch.Tensor,
     adapter,
+    *,
+    view_id: str | None = None,
+    pixel_goal: list[int] | None = None,
+    image_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Project ``traj_hs`` through the optional adapter, preserving dtype.
 
@@ -272,8 +276,65 @@ def _maybe_apply_pano_latent_adapter(
     orig_dtype = traj_hs.dtype
     adapter_param = next(adapter.parameters(), None)
     adapter_dtype = adapter_param.dtype if adapter_param is not None else orig_dtype
+    if hasattr(adapter, "geometry_token"):
+        from src.models.adapters import view_ids_to_indices
+
+        if pixel_goal is None:
+            raise RuntimeError("Geometry-aware pano adapter requires pixel_goal")
+        goal_view = (view_id or "front").lower()
+        if goal_view not in {"front", "right", "back", "left"}:
+            goal_view = "front"
+        if image_size is None:
+            image_size = (384, 384)
+        width, height = int(image_size[0]), int(image_size[1])
+        view_indices = view_ids_to_indices([goal_view], device=traj_hs.device)
+        pixel_xy = torch.tensor(
+            [[int(pixel_goal[0]), int(pixel_goal[1])]],
+            device=traj_hs.device,
+            dtype=adapter_dtype,
+        )
+        image_hw = torch.tensor(
+            [[height, width]],
+            device=traj_hs.device,
+            dtype=adapter_dtype,
+        )
+        out = adapter(
+            traj_hs.to(dtype=adapter_dtype),
+            view_indices,
+            pixel_xy,
+            image_hw,
+        )
+        return out.to(dtype=orig_dtype)
+
     out = adapter(traj_hs.to(dtype=adapter_dtype))
     return out.to(dtype=orig_dtype)
+
+
+def _parse_pano_view_id(llm_output: str) -> str | None:
+    match = re.search(r"\bview\s*:\s*(front|right|back|left|stop|turn)\b", llm_output, flags=re.I)
+    if match is None:
+        return None
+    view = match.group(1).lower()
+    if view in {"stop", "turn"}:
+        return None
+    return view
+
+
+def _trajectory_from_condition(
+    action_head,
+    traj_condition: torch.Tensor,
+    *,
+    traj_images: torch.Tensor | None,
+) -> torch.Tensor:
+    if traj_condition.shape[-1] == int(action_head.config.latent_emb_size):
+        return action_head.get_trajectory_from_projected(
+            traj_condition,
+            traj_images=traj_images,
+        )
+    return action_head.get_trajectory(
+        traj_condition,
+        traj_images=traj_images,
+    )
 
 
 def _load_force_teacher_internnav(args, device: torch.device):
@@ -1916,7 +1977,8 @@ def _run_eval_panoramic_vlm(
                 print("  [debug] re-calling get_trajectory ...", flush=True)
                 trajectory_calls += 1
                 with torch.no_grad():
-                    trajectory = model.nextdit_action_head.get_trajectory(
+                    trajectory = _trajectory_from_condition(
+                        model.nextdit_action_head,
                         _last_traj_hs,
                         traj_images=traj_images,
                     )
@@ -2057,6 +2119,7 @@ def _run_eval_panoramic_vlm(
                 continue
 
             pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
+            pano_goal_view = _parse_pano_view_id(llm_output) or "front"
 
             # === Force-teacher full-drive (--force_teacher_coord) ============
             #
@@ -2148,6 +2211,7 @@ def _run_eval_panoramic_vlm(
                             flush=True,
                         )
                         pixel_goal = teacher_coord
+                        pano_goal_view = "front"
                     else:
                         print(
                             "  [force-teacher] teacher coord="
@@ -2270,13 +2334,18 @@ def _run_eval_panoramic_vlm(
                         )
                     if pano_latent_adapter is not None:
                         _last_traj_hs = _maybe_apply_pano_latent_adapter(
-                            _last_traj_hs, pano_latent_adapter,
+                            _last_traj_hs,
+                            pano_latent_adapter,
+                            view_id=pano_goal_view,
+                            pixel_goal=pixel_goal,
+                            image_size=vlm_image_size,
                         )
 
                 print("  [debug] calling get_trajectory ...", flush=True)
                 trajectory_calls += 1
                 with torch.no_grad():
-                    trajectory = model.nextdit_action_head.get_trajectory(
+                    trajectory = _trajectory_from_condition(
+                        model.nextdit_action_head,
                         _last_traj_hs,
                         traj_images=traj_images,
                     )
@@ -2753,14 +2822,19 @@ def run_eval(args):
                                 f"per_query={_per_q}",
                                 flush=True,
                             )
-                        if pano_latent_adapter is not None:
-                            _last_traj_hs = _maybe_apply_pano_latent_adapter(
-                                _last_traj_hs, pano_latent_adapter,
-                            )
+                    if pano_latent_adapter is not None:
+                        _last_traj_hs = _maybe_apply_pano_latent_adapter(
+                            _last_traj_hs,
+                            pano_latent_adapter,
+                            view_id=_parse_pano_view_id(llm_output) or "front",
+                            pixel_goal=pixel_goal,
+                            image_size=vlm_image_size,
+                        )
 
                     print("  [debug] calling get_trajectory ...", flush=True)
                     with torch.no_grad():
-                        trajectory = model.nextdit_action_head.get_trajectory(
+                        trajectory = _trajectory_from_condition(
+                            model.nextdit_action_head,
                             _last_traj_hs,
                             traj_images=traj_images,
                         )
@@ -2802,7 +2876,8 @@ def run_eval(args):
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
 
                     with torch.no_grad():
-                        trajectory = model.nextdit_action_head.get_trajectory(
+                        trajectory = _trajectory_from_condition(
+                            model.nextdit_action_head,
                             _last_traj_hs,
                             traj_images=traj_images,
                         )

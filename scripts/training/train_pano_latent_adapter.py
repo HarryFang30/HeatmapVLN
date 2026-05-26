@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Train a small panoramic-to-InternNav latent adapter.
+Train a geometry-aware panoramic-to-InternNav latent adapter.
 
 This is intentionally narrower than Stage2 bridge training:
   student: panoramic Qwen TRAJ hidden states from HeatmapVLN / Stage1-S2
-  target:  InternNav teacher traj_latents saved by collect_internnav_teacher_sidecar.py
-  train:   a small adapter only
+  target:  InternNav teacher traj_latents projected through cond_projector to 768
+  train:   adapter only; Pano-System2 and InternNav System1 stay frozen
 
 Frozen VLM + frozen InternNav System1 let this test answer one question:
-can a lightweight interface adapter map panoramic latent queries back onto the
-InternNav latent manifold that System1 already understands?
+can a teacher-guided translator map panoramic latent queries plus structured
+goal geometry into the NextDiT condition space that System1 actually consumes?
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import math
 import os
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +49,22 @@ from scripts.training.utils import (
 )
 from src.data.factory import build_trajectory_dataset
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
+from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
 
 LOGGER = logging.getLogger("pano_latent_adapter")
+
+
+@dataclass
+class AdapterTrainBatch:
+    student_latents: torch.Tensor
+    teacher_latents: torch.Tensor
+    view_indices: torch.Tensor
+    goal_pixels: torch.Tensor
+    image_hw: torch.Tensor
+    trajectory: torch.Tensor | None
+    trajectory_valid: torch.Tensor | None
+    traj_images: torch.Tensor | None
+    records: list[dict[str, Any]]
 
 
 class PanoToInternNavLatentAdapter(nn.Module):
@@ -257,9 +272,13 @@ def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
     if "paths" in cfg:
         cfg["paths"]["dataset_root"] = args.root
     traj_cfg = cfg.setdefault("data", {}).setdefault("trajectory", {})
+    use_traj_images = bool(getattr(args, "use_traj_images", args.index_mode == "internnav_sft"))
     traj_cfg["panoramic_vlm_input"] = True
-    traj_cfg["load_lookdown_for_system2"] = True
-    traj_cfg["load_traj_images"] = args.index_mode == "internnav_sft"
+    traj_cfg["compute_pixel_goal"] = use_traj_images
+    traj_cfg["compute_pano_view_pixel_goal"] = True
+    traj_cfg["pano_max_side_dist_m"] = float(getattr(args, "pano_max_side_dist_m", 6.0))
+    traj_cfg["load_lookdown_for_system2"] = False
+    traj_cfg["load_traj_images"] = use_traj_images
     traj_cfg["enable_trajectory_augmentation"] = False
     traj_cfg["require_sft_target"] = args.index_mode == "internnav_sft"
     return cfg
@@ -286,6 +305,8 @@ def _sample_from_record(dataset: Any, rec: dict[str, Any]) -> dict[str, Any]:
 
     target = (int(clip_idx), int(current_t))
     if 0 <= idx < len(dataset.sample_index) and tuple(dataset.sample_index[idx]) == target:
+        if hasattr(dataset, "_build_sample"):
+            return dataset._build_sample(idx)
         return dataset[idx]
 
     # Temporarily append the requested state.  VLNTrajectoryDataset builds
@@ -302,6 +323,8 @@ def _sample_from_record(dataset: Any, rec: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 num_frames = target[1] + 1
             old_range[temp_idx] = (0, num_frames)
+        if hasattr(dataset, "_build_sample"):
+            return dataset._build_sample(temp_idx)
         return dataset[temp_idx]
     finally:
         dataset.sample_index.pop()
@@ -323,12 +346,16 @@ def _extract_student_latents(
     samples: list[dict[str, Any]],
     device: torch.device,
     n_traj_query: int,
-) -> torch.Tensor:
+    *,
+    sft_protocol: str = "direct",
+    return_batch: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
     collator = PanoramicTokenizedCollator(
         processor,
         n_traj_query=n_traj_query,
         sft_mode=True,
-        sft_protocol="internnav",
+        sft_protocol=sft_protocol,
+        structured_pano_output=True,
     )
     batch = collator(samples)
     pano_inputs = _move_pano_inputs_to_device(batch["pano_inputs"], device)
@@ -349,23 +376,78 @@ def _extract_student_latents(
     traj_hs = out.get("traj_hidden_states")
     if traj_hs is None:
         raise RuntimeError("Student Qwen forward returned no traj_hidden_states")
-    return traj_hs.detach()
+    traj_hs = traj_hs.detach()
+    if return_batch:
+        return traj_hs, batch
+    return traj_hs
 
 
-def _load_teacher_latents(records: list[dict[str, Any]], device: torch.device) -> torch.Tensor:
+@torch.no_grad()
+def _project_teacher_latents_to_dim(
+    latents: torch.Tensor,
+    *,
+    model: Any,
+    target_dim: int,
+) -> torch.Tensor:
+    if latents.shape[-1] == target_dim:
+        return latents
+    head = getattr(model, "nextdit_action_head", None)
+    if head is None:
+        raise RuntimeError("Cannot project teacher latents: model has no nextdit_action_head")
+    if target_dim != int(head.config.latent_emb_size):
+        raise RuntimeError(
+            f"Unsupported teacher target_dim={target_dim}; expected {head.config.latent_emb_size}"
+        )
+    expected_in = int(head.config.vlm_hidden_dim)
+    if latents.shape[-1] != expected_in:
+        raise RuntimeError(
+            f"Cannot project teacher latents from dim {latents.shape[-1]} to {target_dim}; "
+            f"expected source dim {expected_in}"
+        )
+    projector_dtype = next(head.cond_projector.parameters()).dtype
+    projected = head.cond_projector(latents.to(dtype=projector_dtype))
+    return projected.detach()
+
+
+def _load_teacher_latents(
+    records: list[dict[str, Any]],
+    device: torch.device,
+    *,
+    model: Any | None = None,
+    target_dim: int = 768,
+) -> torch.Tensor:
     latents = []
     for rec in records:
         path = rec.get("_tensor_path")
         if not path:
             raise RuntimeError(f"Missing tensor sidecar for dataset_index={rec.get('dataset_index')}")
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if "traj_latents" not in payload:
-            raise RuntimeError(f"{path} has no traj_latents")
-        latent = payload["traj_latents"].detach()
+        latent = None
+        if target_dim == 768:
+            for key in ("traj_latents_768", "traj_cond_768", "traj_cond"):
+                if key in payload:
+                    latent = payload[key].detach()
+                    break
+        if latent is None:
+            if "traj_latents" not in payload:
+                raise RuntimeError(f"{path} has no traj_latents")
+            latent = payload["traj_latents"].detach()
         if latent.dim() == 3 and latent.shape[0] == 1:
             latent = latent.squeeze(0)
         latents.append(latent)
-    return torch.stack(latents, dim=0).to(device)
+    stacked = torch.stack(latents, dim=0).to(device)
+    if stacked.shape[-1] != target_dim:
+        if model is None:
+            raise RuntimeError(
+                f"Teacher latents are dim {stacked.shape[-1]}, need {target_dim}; "
+                "pass model to project through cond_projector"
+            )
+        stacked = _project_teacher_latents_to_dim(
+            stacked,
+            model=model,
+            target_dim=target_dim,
+        )
+    return stacked
 
 
 def _latent_loss(
@@ -403,6 +485,144 @@ def _latent_loss(
         "pred_norm": float(pred_norm.mean().detach().item()),
         "target_norm": float(target_norm.mean().detach().item()),
         "norm_ratio": float(norm_ratio.mean().detach().item()),
+    }
+
+
+def _has_trainable_pano_goal(sample: dict[str, Any]) -> bool:
+    kind = str(sample.get("pano_sample_kind") or "").lower()
+    if kind and kind != "pixel":
+        return False
+    if sample.get("pano_pixel_goal") is None:
+        return False
+    view_id = str(sample.get("pano_view_id") or "").lower()
+    return view_id in {"front", "right", "back", "left"}
+
+
+def _goal_tensors_from_samples(
+    samples: list[dict[str, Any]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    view_ids = [str(sample["pano_view_id"]).lower() for sample in samples]
+    view_indices = view_ids_to_indices(view_ids, device=device)
+    pixels = torch.tensor(
+        [[int(sample["pano_pixel_goal"][0]), int(sample["pano_pixel_goal"][1])] for sample in samples],
+        device=device,
+        dtype=torch.float32,
+    )
+    image_hw_values: list[list[int]] = []
+    for sample in samples:
+        image_tensor = sample.get("current_views")
+        if image_tensor is None:
+            image_tensor = sample.get("current_frame")
+        if image_tensor is None or not torch.is_tensor(image_tensor):
+            raise RuntimeError("Cannot infer image size for pano geometry token")
+        height = int(image_tensor.shape[-2])
+        width = int(image_tensor.shape[-1])
+        image_hw_values.append([height, width])
+    image_hw = torch.tensor(image_hw_values, device=device, dtype=torch.float32)
+    return view_indices, pixels, image_hw
+
+
+def _collated_tensor(
+    batch: dict[str, Any],
+    key: str,
+    device: torch.device,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    value = batch.get(key)
+    if value is None or not torch.is_tensor(value):
+        return None
+    if dtype is None:
+        return value.to(device)
+    return value.to(device=device, dtype=dtype)
+
+
+def _policy_and_gt_losses(
+    *,
+    model: Any,
+    pred_cond: torch.Tensor,
+    teacher_cond: torch.Tensor,
+    batch: AdapterTrainBatch,
+    policy_weight: float,
+    gt_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if policy_weight <= 0 and gt_weight <= 0:
+        zero = pred_cond.sum() * 0.0
+        return zero, {"policy_loss": 0.0, "gt_loss": 0.0}
+    if batch.trajectory is None:
+        zero = pred_cond.sum() * 0.0
+        return zero, {"policy_loss": 0.0, "gt_loss": 0.0}
+
+    head = getattr(model, "nextdit_action_head", None)
+    if head is None:
+        raise RuntimeError("Policy/GT loss requires model.nextdit_action_head")
+
+    dit_dtype = next(head.action_encoder.parameters()).dtype
+    gt = batch.trajectory.to(device=pred_cond.device, dtype=dit_dtype)
+    images = batch.traj_images.to(device=pred_cond.device) if batch.traj_images is not None else None
+    valid = (
+        batch.trajectory_valid.to(device=pred_cond.device)
+        if batch.trajectory_valid is not None
+        else None
+    )
+
+    pred_exp, gt_exp, images_exp, valid_exp = head._expand_sequence_training_inputs(
+        pred_cond.to(dtype=dit_dtype),
+        gt,
+        images,
+        valid,
+    )
+    teacher_exp, _gt_t, _images_t, _valid_t = head._expand_sequence_training_inputs(
+        teacher_cond.to(device=pred_cond.device, dtype=dit_dtype),
+        gt,
+        images,
+        valid,
+    )
+    noisy, timesteps, target_velocity = head.sample_flow_matching_inputs(gt_exp)
+
+    policy_loss = pred_cond.sum() * 0.0
+    if policy_weight > 0:
+        with torch.no_grad():
+            teacher_velocity = head.predict_velocity_from_projected(
+                teacher_exp,
+                noisy,
+                timesteps,
+                traj_images=images_exp,
+            )
+        student_velocity = head.predict_velocity_from_projected(
+            pred_exp,
+            noisy,
+            timesteps,
+            traj_images=images_exp,
+        )
+        policy_loss = head.masked_velocity_mse(
+            student_velocity,
+            teacher_velocity.detach(),
+            trajectory_valid=valid_exp,
+        )
+    else:
+        student_velocity = None
+
+    gt_loss = pred_cond.sum() * 0.0
+    if gt_weight > 0:
+        if student_velocity is None:
+            student_velocity = head.predict_velocity_from_projected(
+                pred_exp,
+                noisy,
+                timesteps,
+                traj_images=images_exp,
+            )
+        gt_loss = head.masked_velocity_mse(
+            student_velocity,
+            target_velocity,
+            trajectory_valid=valid_exp,
+        )
+
+    total = policy_weight * policy_loss + gt_weight * gt_loss
+    return total, {
+        "policy_loss": float(policy_loss.detach().item()),
+        "gt_loss": float(gt_loss.detach().item()),
     }
 
 
@@ -485,7 +705,7 @@ def _build_batch(
     processor: Any,
     device: torch.device,
     n_traj_query: int,
-) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+) -> AdapterTrainBatch | None:
     batch_samples: list[dict[str, Any]] = []
     usable_records: list[dict[str, Any]] = []
     for rec in batch_records:
@@ -494,22 +714,51 @@ def _build_batch(
             LOGGER.warning("Skip out-of-range dataset_index=%s", idx)
             continue
         sample = _sample_from_record(dataset, rec)
-        coord_uv = rec["teacher"]["coord_uv"]
-        batch_samples.append(_copy_sample_for_collator(sample, coord_uv))
+        if not _has_trainable_pano_goal(sample):
+            LOGGER.debug(
+                "Skip dataset_index=%s without trainable pano pixel goal (kind=%s view=%s)",
+                idx,
+                sample.get("pano_sample_kind"),
+                sample.get("pano_view_id"),
+            )
+            continue
+        batch_samples.append(sample)
         usable_records.append(rec)
     if not usable_records:
-        empty = torch.empty(0)
-        return empty, empty, []
+        return None
 
-    student_latents = _extract_student_latents(
+    view_indices, goal_pixels, image_hw = _goal_tensors_from_samples(batch_samples, device)
+
+    student_latents, collated = _extract_student_latents(
         model,
         processor,
         batch_samples,
         device,
         n_traj_query,
+        sft_protocol="direct",
+        return_batch=True,
     )
-    teacher_latents = _load_teacher_latents(usable_records, device).to(dtype=student_latents.dtype)
-    return student_latents, teacher_latents, usable_records
+    target_dim = int(model.nextdit_action_head.config.latent_emb_size)
+    teacher_latents = _load_teacher_latents(
+        usable_records,
+        device,
+        model=model,
+        target_dim=target_dim,
+    )
+    trajectory = _collated_tensor(collated, "trajectory", device)
+    trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
+    traj_images = _collated_tensor(collated, "traj_images", device)
+    return AdapterTrainBatch(
+        student_latents=student_latents,
+        teacher_latents=teacher_latents,
+        view_indices=view_indices,
+        goal_pixels=goal_pixels,
+        image_hw=image_hw,
+        trajectory=trajectory,
+        trajectory_valid=trajectory_valid,
+        traj_images=traj_images,
+        records=usable_records,
+    )
 
 
 @torch.no_grad()
@@ -527,6 +776,8 @@ def _evaluate_adapter(
     mse_weight: float,
     norm_weight: float,
     norm_loss_type: str,
+    policy_weight: float,
+    gt_weight: float,
 ) -> dict[str, float]:
     adapter.eval()
     running: dict[str, float] = {}
@@ -534,7 +785,7 @@ def _evaluate_adapter(
     try:
         for start in range(0, len(val_records), batch_size):
             batch_records = val_records[start:start + batch_size]
-            student_latents, teacher_latents, usable = _build_batch(
+            batch = _build_batch(
                 batch_records,
                 dataset=dataset,
                 model=model,
@@ -542,17 +793,32 @@ def _evaluate_adapter(
                 device=device,
                 n_traj_query=n_traj_query,
             )
-            if not usable:
+            if batch is None:
                 continue
-            pred = adapter(student_latents)
-            _, metrics = _latent_loss(
+            pred = adapter(
+                batch.student_latents,
+                batch.view_indices,
+                batch.goal_pixels,
+                batch.image_hw,
+            )
+            latent_loss, metrics = _latent_loss(
                 pred,
-                teacher_latents,
+                batch.teacher_latents.to(device=pred.device, dtype=pred.dtype),
                 cosine_weight=cosine_weight,
                 mse_weight=mse_weight,
                 norm_weight=norm_weight,
                 norm_loss_type=norm_loss_type,
             )
+            policy_loss, policy_metrics = _policy_and_gt_losses(
+                model=model,
+                pred_cond=pred,
+                teacher_cond=batch.teacher_latents,
+                batch=batch,
+                policy_weight=policy_weight,
+                gt_weight=gt_weight,
+            )
+            metrics.update(policy_metrics)
+            metrics["loss"] = float((latent_loss + policy_loss).detach().item())
             count += 1
             for key, value in metrics.items():
                 running[key] = running.get(key, 0.0) + value
@@ -616,13 +882,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--adapter-hidden-dim", type=int, default=2048)
+    p.add_argument("--adapter-dim", type=int, default=768)
+    p.add_argument("--adapter-output-dim", type=int, default=768)
+    p.add_argument("--adapter-num-heads", type=int, default=8)
+    p.add_argument("--adapter-geometry-embed-dim", type=int, default=64)
+    p.add_argument("--adapter-horizontal-fov-deg", type=float, default=90.0)
     p.add_argument("--adapter-dropout", type=float, default=0.0)
     p.add_argument(
         "--adapter-n-layers",
         type=int,
         default=1,
-        help="Number of hidden GELU layers in the projector MLP (1 means Linear-GELU-Linear).",
+        help="Number of decoder-style Transformer adapter layers.",
     )
+    p.add_argument("--pano-max-side-dist-m", type=float, default=6.0)
+    p.add_argument(
+        "--use-traj-images",
+        dest="use_traj_images",
+        action="store_true",
+        help="Load System1 front_down visual-memory frames for policy/GT losses.",
+    )
+    p.add_argument("--no-use-traj-images", dest="use_traj_images", action="store_false")
+    p.set_defaults(use_traj_images=True)
     p.add_argument(
         "--residual",
         dest="residual",
@@ -665,12 +945,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable the per-dim output affine.",
     )
     p.set_defaults(output_affine=True)
-    p.add_argument("--cosine-weight", type=float, default=1.0)
-    p.add_argument("--mse-weight", type=float, default=0.1)
+    p.add_argument("--cosine-weight", type=float, default=0.1)
+    p.add_argument("--mse-weight", type=float, default=1.0)
+    p.add_argument("--policy-weight", type=float, default=1.0)
+    p.add_argument("--gt-weight", type=float, default=1.0)
     p.add_argument(
         "--norm-weight",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Penalty on pred/teacher latent norm ratio. Set to 0 to disable.",
     )
     p.add_argument(
@@ -728,8 +1010,11 @@ def main() -> int:
             enable_trajectory_augmentation=False,
             load_history_heatmap=False,
             panoramic_vlm_input=True,
-            load_lookdown_for_system2=True,
-            load_traj_images=args.index_mode == "internnav_sft",
+            compute_pixel_goal=bool(args.use_traj_images),
+            compute_pano_view_pixel_goal=True,
+            pano_max_side_dist_m=float(args.pano_max_side_dist_m),
+            load_lookdown_for_system2=False,
+            load_traj_images=bool(args.use_traj_images),
         )
         if _rank0():
             LOGGER.info("Dataset samples=%d", len(dataset))
@@ -741,15 +1026,24 @@ def main() -> int:
         n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
         hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
 
-        adapter = PanoToInternNavLatentAdapter(
-            dim=hidden_dim,
-            hidden_dim=args.adapter_hidden_dim,
-            dropout=args.adapter_dropout,
-            residual=args.residual,
-            zero_init=args.zero_init,
-            pre_norm=args.pre_norm,
-            n_layers=args.adapter_n_layers,
-            output_affine=args.output_affine,
+        target_dim = int(model.nextdit_action_head.config.latent_emb_size)
+        if int(args.adapter_output_dim) != target_dim:
+            raise RuntimeError(
+                f"Adapter output dim must match NextDiT latent dim {target_dim}; "
+                f"got {args.adapter_output_dim}"
+            )
+
+        adapter = GeometryAwarePanoToNextDiTAdapter(
+            student_dim=hidden_dim,
+            adapter_dim=int(args.adapter_dim),
+            output_dim=target_dim,
+            num_query=n_traj_query,
+            num_layers=int(args.adapter_n_layers),
+            num_heads=int(args.adapter_num_heads),
+            ffn_dim=int(args.adapter_hidden_dim),
+            dropout=float(args.adapter_dropout),
+            geometry_embed_dim=int(args.adapter_geometry_embed_dim),
+            horizontal_fov_deg=float(args.adapter_horizontal_fov_deg),
         ).to(device)
 
         start_epoch = 0
@@ -775,14 +1069,20 @@ def main() -> int:
 
         if _rank0():
             LOGGER.info(
-                "Adapter: residual=%s pre_norm=%s output_affine=%s n_layers=%d hidden_dim=%d dim=%d "
+                "Adapter: geometry-aware decoder layers=%d student_dim=%d adapter_dim=%d output_dim=%d "
+                "heads=%d ffn_dim=%d use_traj_images=%s loss_weights(mse=%.3g cos=%.3g policy=%.3g gt=%.3g) "
                 "ddp=%s rank=%d local_rank=%d",
-                args.residual,
-                args.pre_norm,
-                args.output_affine,
                 args.adapter_n_layers,
-                args.adapter_hidden_dim,
                 hidden_dim,
+                args.adapter_dim,
+                target_dim,
+                args.adapter_num_heads,
+                args.adapter_hidden_dim,
+                args.use_traj_images,
+                args.mse_weight,
+                args.cosine_weight,
+                args.policy_weight,
+                args.gt_weight,
                 world_size > 1,
                 rank,
                 local_rank,
@@ -833,7 +1133,7 @@ def main() -> int:
 
             for start in range(0, len(epoch_records), args.batch_size):
                 batch_records = epoch_records[start:start + args.batch_size]
-                student_latents, teacher_latents, usable = _build_batch(
+                batch = _build_batch(
                     batch_records,
                     dataset=dataset,
                     model=model,
@@ -841,18 +1141,34 @@ def main() -> int:
                     device=device,
                     n_traj_query=n_traj_query,
                 )
-                if not usable:
+                if batch is None:
                     continue
 
-                pred = train_adapter(student_latents)
-                loss, metrics = _latent_loss(
+                pred = train_adapter(
+                    batch.student_latents,
+                    batch.view_indices,
+                    batch.goal_pixels,
+                    batch.image_hw,
+                )
+                latent_loss, metrics = _latent_loss(
                     pred,
-                    teacher_latents,
+                    batch.teacher_latents.to(device=pred.device, dtype=pred.dtype),
                     cosine_weight=args.cosine_weight,
                     mse_weight=args.mse_weight,
                     norm_weight=args.norm_weight,
                     norm_loss_type=args.norm_loss_type,
                 )
+                policy_loss, policy_metrics = _policy_and_gt_losses(
+                    model=model,
+                    pred_cond=pred,
+                    teacher_cond=batch.teacher_latents,
+                    batch=batch,
+                    policy_weight=args.policy_weight,
+                    gt_weight=args.gt_weight,
+                )
+                loss = latent_loss + policy_loss
+                metrics.update(policy_metrics)
+                metrics["loss"] = float(loss.detach().item())
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -869,13 +1185,15 @@ def main() -> int:
                     avg = {k: v / max(count, 1) for k, v in running.items()}
                     LOGGER.info(
                         "epoch=%d local_step=%d global_step=%d loss=%.5f cosine=%.5f mse=%.6f "
-                        "norm_ratio=%.3f pred_norm=%.3f target_norm=%.3f",
+                        "policy=%.6f gt=%.6f norm_ratio=%.3f pred_norm=%.3f target_norm=%.3f",
                         epoch + 1,
                         count,
                         global_step,
                         avg.get("loss", 0.0),
                         avg.get("cosine", 0.0),
                         avg.get("mse_loss", 0.0),
+                        avg.get("policy_loss", 0.0),
+                        avg.get("gt_loss", 0.0),
                         avg.get("norm_ratio", 0.0),
                         avg.get("pred_norm", 0.0),
                         avg.get("target_norm", 0.0),
@@ -900,6 +1218,8 @@ def main() -> int:
                     mse_weight=args.mse_weight,
                     norm_weight=args.norm_weight,
                     norm_loss_type=args.norm_loss_type,
+                    policy_weight=args.policy_weight,
+                    gt_weight=args.gt_weight,
                 )
                 LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
 

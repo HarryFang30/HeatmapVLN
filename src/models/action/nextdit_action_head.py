@@ -363,6 +363,30 @@ class NextDiTActionHead(nn.Module):
 
         return latents
 
+    def _fuse_projected_conditions(
+        self,
+        traj_cond: torch.Tensor,
+        traj_images: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fuse already-projected 768-dim trajectory condition tokens.
+
+        This is the direct adapter path: callers have already mapped System-2
+        latents into ``config.latent_emb_size`` and intentionally skip
+        ``cond_projector``.
+        """
+        if traj_cond.ndim != 3:
+            raise ValueError(f"traj_cond must be [B,Q,D], got {tuple(traj_cond.shape)}")
+        if traj_cond.shape[-1] != self.config.latent_emb_size:
+            raise ValueError(
+                f"Expected projected dim {self.config.latent_emb_size}, "
+                f"got {traj_cond.shape[-1]}"
+            )
+
+        if traj_images is not None:
+            memory_tokens = self._encode_visual_memory(traj_images)
+            return torch.cat([memory_tokens.to(dtype=traj_cond.dtype), traj_cond], dim=1)
+        return traj_cond
+
     # ==================== Flow Matching Training ====================
 
     def _get_sigmas(self, timesteps: torch.Tensor, device, n_dim: int = 3, dtype=torch.float32):
@@ -375,6 +399,95 @@ class NextDiTActionHead(nn.Module):
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
         return sigma
+
+    def sample_flow_matching_inputs(
+        self,
+        gt_trajectory: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample the shared noisy trajectory, timestep, and velocity target."""
+        bsz = gt_trajectory.shape[0]
+        device = gt_trajectory.device
+        dtype = gt_trajectory.dtype
+        noise = torch.randn_like(gt_trajectory)
+        u = torch.rand(size=(bsz,), device="cpu")
+        indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
+        timesteps = self.noise_scheduler.timesteps[indices].to(device=device)
+        sigmas = self._get_sigmas(timesteps, device, n_dim=gt_trajectory.ndim, dtype=dtype)
+        noisy_trajectory = (1 - sigmas) * gt_trajectory + sigmas * noise
+        target_velocity = noise - gt_trajectory
+        return noisy_trajectory, timesteps, target_velocity
+
+    def predict_velocity_from_projected(
+        self,
+        traj_cond: torch.Tensor,
+        noisy_trajectory: torch.Tensor,
+        timesteps: torch.Tensor,
+        traj_images: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict flow velocity from pre-projected NextDiT condition tokens."""
+        latents = self._fuse_projected_conditions(traj_cond, traj_images)
+        bsz = noisy_trajectory.shape[0]
+        action_features = self.action_encoder(noisy_trajectory)
+        pos_ids = (
+            torch.arange(noisy_trajectory.shape[1], device=noisy_trajectory.device)
+            .reshape(1, -1)
+            .repeat(bsz, 1)
+        )
+        pos_embed = self.pos_encoding(pos_ids).to(dtype=action_features.dtype)
+        action_features = action_features + pos_embed
+        velocity = self.traj_dit(
+            x=action_features,
+            timestep=timesteps,
+            z_latents=latents,
+        )
+        return self.action_decoder(velocity)
+
+    @staticmethod
+    def masked_velocity_mse(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        trajectory_valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+        if trajectory_valid is None:
+            return loss.mean()
+        mask = trajectory_valid.float()
+        if mask.sum() <= 0:
+            return loss.sum() * 0.0
+        per_sample_loss = loss.mean(dim=(1, 2))
+        return (per_sample_loss * mask).sum() / mask.sum()
+
+    def compute_loss_from_projected(
+        self,
+        traj_cond: torch.Tensor,
+        gt_trajectory: torch.Tensor,
+        traj_images: torch.Tensor | None = None,
+        trajectory_valid: torch.Tensor | None = None,
+        noisy_trajectory: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+        target_velocity: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute flow-matching loss from already-projected conditions."""
+        traj_cond, gt_trajectory, traj_images, trajectory_valid = (
+            self._expand_sequence_training_inputs(
+                traj_cond, gt_trajectory, traj_images, trajectory_valid,
+            )
+        )
+        if noisy_trajectory is None or timesteps is None or target_velocity is None:
+            noisy_trajectory, timesteps, target_velocity = self.sample_flow_matching_inputs(gt_trajectory)
+        velocity = self.predict_velocity_from_projected(
+            traj_cond,
+            noisy_trajectory,
+            timesteps,
+            traj_images=traj_images,
+        )
+        return {
+            "loss": self.masked_velocity_mse(
+                velocity,
+                target_velocity,
+                trajectory_valid=trajectory_valid,
+            )
+        }
 
     def compute_loss(
         self,
@@ -452,35 +565,18 @@ class NextDiTActionHead(nn.Module):
 
     # ==================== Flow Matching Inference ====================
 
-    @torch.no_grad()
-    def generate_traj(
+    def _generate_traj_from_condition_latents(
         self,
-        traj_hidden_states: torch.Tensor,
-        traj_images: torch.Tensor | None = None,
-        predict_step_nums: int = 32,
-        guidance_scale: float = 1.0,
-        num_inference_steps: int = 10,
-        num_sample_trajs: int = 32,
+        latents_cond: torch.Tensor,
+        *,
+        predict_step_nums: int,
+        guidance_scale: float,
+        num_inference_steps: int,
+        num_sample_trajs: int,
     ) -> torch.Tensor:
-        """
-        Generate trajectory via iterative flow matching denoising with CFG.
-
-        Args:
-            traj_hidden_states: (B, n_query, vlm_hidden_dim)
-            traj_images: (B, 2, H, W, 3) — [anchor, current]
-            predict_step_nums: number of trajectory steps to predict
-            guidance_scale: classifier-free guidance scale
-            num_inference_steps: number of denoising steps
-            num_sample_trajs: number of parallel trajectory samples
-
-        Returns:
-            latents: (B * num_sample_trajs, predict_step_nums, action_dim)
-        """
-        latents_cond = self._fuse_conditions(traj_hidden_states, traj_images)
-
-        device = traj_hidden_states.device
-        dtype = traj_hidden_states.dtype
-        batch_size = traj_hidden_states.shape[0]
+        device = latents_cond.device
+        dtype = latents_cond.dtype
+        batch_size = latents_cond.shape[0]
 
         # Classifier-Free Guidance: [unconditional, conditional]
         hidden_states_null = torch.zeros_like(latents_cond)
@@ -532,6 +628,59 @@ class NextDiTActionHead(nn.Module):
         return traj_latents
 
     @torch.no_grad()
+    def generate_traj(
+        self,
+        traj_hidden_states: torch.Tensor,
+        traj_images: torch.Tensor | None = None,
+        predict_step_nums: int = 32,
+        guidance_scale: float = 1.0,
+        num_inference_steps: int = 10,
+        num_sample_trajs: int = 32,
+    ) -> torch.Tensor:
+        """
+        Generate trajectory via iterative flow matching denoising with CFG.
+
+        Args:
+            traj_hidden_states: (B, n_query, vlm_hidden_dim)
+            traj_images: (B, 2, H, W, 3) — [anchor, current]
+            predict_step_nums: number of trajectory steps to predict
+            guidance_scale: classifier-free guidance scale
+            num_inference_steps: number of denoising steps
+            num_sample_trajs: number of parallel trajectory samples
+
+        Returns:
+            latents: (B * num_sample_trajs, predict_step_nums, action_dim)
+        """
+        latents_cond = self._fuse_conditions(traj_hidden_states, traj_images)
+        return self._generate_traj_from_condition_latents(
+            latents_cond,
+            predict_step_nums=predict_step_nums,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            num_sample_trajs=num_sample_trajs,
+        )
+
+    @torch.no_grad()
+    def generate_traj_from_projected(
+        self,
+        traj_cond: torch.Tensor,
+        traj_images: torch.Tensor | None = None,
+        predict_step_nums: int = 32,
+        guidance_scale: float = 1.0,
+        num_inference_steps: int = 10,
+        num_sample_trajs: int = 32,
+    ) -> torch.Tensor:
+        """Generate trajectories from pre-projected NextDiT condition tokens."""
+        latents_cond = self._fuse_projected_conditions(traj_cond, traj_images)
+        return self._generate_traj_from_condition_latents(
+            latents_cond,
+            predict_step_nums=predict_step_nums,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            num_sample_trajs=num_sample_trajs,
+        )
+
+    @torch.no_grad()
     def get_trajectory(
         self,
         traj_hidden_states: torch.Tensor,
@@ -546,6 +695,23 @@ class NextDiTActionHead(nn.Module):
         self.eval()
         return self.generate_traj(
             traj_hidden_states=traj_hidden_states,
+            traj_images=traj_images,
+            predict_step_nums=self.config.predict_steps,
+            guidance_scale=self.config.guidance_scale,
+            num_inference_steps=self.config.num_inference_steps,
+            num_sample_trajs=self.config.num_sample_trajs,
+        )
+
+    @torch.no_grad()
+    def get_trajectory_from_projected(
+        self,
+        traj_cond: torch.Tensor,
+        traj_images: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """High-level inference interface for direct 768-dim conditions."""
+        self.eval()
+        return self.generate_traj_from_projected(
+            traj_cond=traj_cond,
             traj_images=traj_images,
             predict_step_nums=self.config.predict_steps,
             guidance_scale=self.config.guidance_scale,

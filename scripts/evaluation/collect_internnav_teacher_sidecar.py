@@ -527,6 +527,7 @@ def _save_tensor_sidecar(
     dataset_index: int,
     mode: str,
     traj_latents: torch.Tensor | None,
+    traj_latents_768: torch.Tensor | None,
     dp_actions: torch.Tensor | None,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -540,6 +541,9 @@ def _save_tensor_sidecar(
     if traj_latents is not None and args.save_traj_latents:
         payload["traj_latents"] = _cast_tensor_for_save(traj_latents, args.tensor_save_dtype)
         saved["traj_latents_shape"] = list(traj_latents.shape)
+    if traj_latents_768 is not None and args.save_traj_latents_768:
+        payload["traj_latents_768"] = _cast_tensor_for_save(traj_latents_768, args.tensor_save_dtype)
+        saved["traj_latents_768_shape"] = list(traj_latents_768.shape)
     if dp_actions is not None and args.save_dp_actions:
         payload["dp_actions"] = _cast_tensor_for_save(dp_actions, args.tensor_save_dtype)
         saved["dp_actions_shape"] = list(dp_actions.shape)
@@ -547,6 +551,20 @@ def _save_tensor_sidecar(
         torch.save(payload, path)
         saved["path"] = str(path)
     return saved
+
+
+def _find_cond_projector(model: Any) -> torch.nn.Module | None:
+    for attr in ("cond_projector", "traj_cond_projector"):
+        module = getattr(model, attr, None)
+        if isinstance(module, torch.nn.Module):
+            return module
+    nested = getattr(model, "model", None)
+    if nested is not None and nested is not model:
+        for attr in ("cond_projector", "traj_cond_projector"):
+            module = getattr(nested, attr, None)
+            if isinstance(module, torch.nn.Module):
+                return module
+    return None
 
 
 def _round_nested(value: Any, digits: int = 5) -> Any:
@@ -665,6 +683,12 @@ def _run_system1(
 
     with torch.inference_mode():
         traj_latents = model.generate_latents(output_ids, pixel_values, image_grid_thw)
+        traj_latents_768 = None
+        if args.save_traj_latents_768:
+            cond_projector = _find_cond_projector(model)
+            if cond_projector is not None:
+                projector_dtype = next(cond_projector.parameters()).dtype
+                traj_latents_768 = cond_projector(traj_latents.to(dtype=projector_dtype))
         dp_actions = model.generate_traj(
             traj_latents,
             traj_images,
@@ -693,6 +717,7 @@ def _run_system1(
             dataset_index=dataset_index,
             mode=mode,
             traj_latents=traj_latents,
+            traj_latents_768=traj_latents_768,
             dp_actions=dp_actions,
             args=args,
         )
@@ -1036,6 +1061,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--save-traj-latents", dest="save_traj_latents", action="store_true", default=True)
     p.add_argument("--no-save-traj-latents", dest="save_traj_latents", action="store_false")
+    p.add_argument("--save-traj-latents-768", dest="save_traj_latents_768", action="store_true", default=True)
+    p.add_argument("--no-save-traj-latents-768", dest="save_traj_latents_768", action="store_false")
     p.add_argument("--save-dp-actions", dest="save_dp_actions", action="store_true", default=True)
     p.add_argument("--no-save-dp-actions", dest="save_dp_actions", action="store_false")
     p.add_argument("--round-digits", type=int, default=5)
@@ -1115,7 +1142,9 @@ def main() -> None:
     if args.tensor_output_dir:
         print(
             f"[tensor] output_dir={Path(args.tensor_output_dir).expanduser()} "
-            f"save_traj_latents={args.save_traj_latents} save_dp_actions={args.save_dp_actions} "
+            f"save_traj_latents={args.save_traj_latents} "
+            f"save_traj_latents_768={args.save_traj_latents_768} "
+            f"save_dp_actions={args.save_dp_actions} "
             f"dtype={args.tensor_save_dtype}",
             flush=True,
         )

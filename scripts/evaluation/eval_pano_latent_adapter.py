@@ -62,12 +62,16 @@ from scripts.training.train_pano_latent_adapter import (
     PanoToInternNavLatentAdapter,
     _copy_sample_for_collator,
     _extract_student_latents,
+    _goal_tensors_from_samples,
+    _has_trainable_pano_goal,
+    _load_teacher_latents,
     _load_student_model,
     _load_teacher_records,
     _prepare_config,
     _sample_from_record,
 )
 from src.data.factory import build_trajectory_dataset
+from src.models.adapters import GeometryAwarePanoToNextDiTAdapter
 
 LOGGER = logging.getLogger("eval_pano_latent_adapter")
 
@@ -93,12 +97,49 @@ def _load_adapter_from_checkpoint(
     dim: int,
     fallback_args: argparse.Namespace,
     device: torch.device,
-) -> tuple[PanoToInternNavLatentAdapter, dict[str, Any]]:
+):
     ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
     state_dict = ckpt.get("adapter_state_dict")
     if state_dict is None:
         raise KeyError(f"{path} has no adapter_state_dict")
     saved_args = ckpt.get("args", {}) or {}
+
+    if "student_proj.weight" in state_dict:
+        student_dim = int(state_dict["student_proj.weight"].shape[1])
+        adapter_dim = int(state_dict["student_proj.weight"].shape[0])
+        output_dim = int(state_dict["output_proj.weight"].shape[0])
+        num_query = int(state_dict["output_queries"].shape[0])
+        ffn_dim = int(state_dict["layers.0.linear1.weight"].shape[0])
+        geometry_embed_dim = int(state_dict["view_embedding.weight"].shape[1])
+        layer_ids = {
+            int(name.split(".")[1])
+            for name in state_dict
+            if name.startswith("layers.") and name.split(".")[1].isdigit()
+        }
+        adapter = GeometryAwarePanoToNextDiTAdapter(
+            student_dim=student_dim,
+            adapter_dim=adapter_dim,
+            output_dim=output_dim,
+            num_query=num_query,
+            num_layers=max(len(layer_ids), 1),
+            num_heads=int(saved_args.get("adapter_num_heads", 8)),
+            ffn_dim=ffn_dim,
+            dropout=float(saved_args.get("adapter_dropout", 0.0)),
+            geometry_embed_dim=geometry_embed_dim,
+            horizontal_fov_deg=float(saved_args.get("adapter_horizontal_fov_deg", 90.0)),
+        )
+        adapter.load_state_dict(state_dict)
+        adapter.eval()
+        adapter.to(device)
+        LOGGER.info(
+            "Loaded geometry-aware adapter from %s student_dim=%d adapter_dim=%d output_dim=%d layers=%d",
+            path,
+            student_dim,
+            adapter_dim,
+            output_dim,
+            max(len(layer_ids), 1),
+        )
+        return adapter, saved_args
 
     def _get(key: str, default: Any) -> Any:
         if key in saved_args:
@@ -527,6 +568,8 @@ def main() -> int:
         enable_trajectory_augmentation=False,
         load_history_heatmap=False,
         panoramic_vlm_input=True,
+        compute_pano_view_pixel_goal=True,
+        pano_max_side_dist_m=float(getattr(args, "pano_max_side_dist_m", 6.0)),
         load_lookdown_for_system2=True,
         load_traj_images=args.index_mode == "internnav_sft",
     )
@@ -542,6 +585,7 @@ def main() -> int:
         fallback_args=args,
         device=device,
     )
+    geometry_adapter = hasattr(adapter, "geometry_token")
 
     teacher_model, _teacher_processor, traj_to_actions_fn = _load_teacher(args, device)
 
@@ -557,7 +601,17 @@ def main() -> int:
             idx = int(rec["dataset_index"])
             sample = _sample_from_record(dataset, rec)
             coord_uv = rec["teacher"]["coord_uv"]
-            sample_for_collator = _copy_sample_for_collator(sample, coord_uv)
+            if geometry_adapter:
+                if not _has_trainable_pano_goal(sample):
+                    LOGGER.warning("Record idx=%s has no structured pano pixel goal; skipping", idx)
+                    continue
+                sample_for_collator = {k: v for k, v in sample.items()}
+                geometry_tensors = _goal_tensors_from_samples([sample_for_collator], device)
+                sft_protocol = "direct"
+            else:
+                sample_for_collator = _copy_sample_for_collator(sample, coord_uv)
+                geometry_tensors = None
+                sft_protocol = "internnav"
 
             with torch.no_grad():
                 student_latents = _extract_student_latents(
@@ -566,11 +620,26 @@ def main() -> int:
                     [sample_for_collator],
                     device,
                     n_traj_query,
+                    sft_protocol=sft_protocol,
                 )
-                adapter_latents = adapter(student_latents)
+                if geometry_adapter:
+                    view_indices, goal_pixels, image_hw = geometry_tensors
+                    adapter_latents = adapter(
+                        student_latents,
+                        view_indices,
+                        goal_pixels,
+                        image_hw,
+                    )
+                else:
+                    adapter_latents = adapter(student_latents)
 
             payload = torch.load(rec["_tensor_path"], map_location="cpu", weights_only=False)
-            teacher_latents = payload["traj_latents"].to(device=device, dtype=adapter_latents.dtype)
+            teacher_latents = _load_teacher_latents(
+                [rec],
+                device,
+                model=student_model,
+                target_dim=int(adapter_latents.shape[-1]),
+            ).to(device=device, dtype=adapter_latents.dtype)
             teacher_dp_saved = payload.get("dp_actions")
             if teacher_dp_saved is None:
                 LOGGER.warning("Record idx=%s has no saved dp_actions; skipping", idx)
@@ -587,15 +656,25 @@ def main() -> int:
             if adapter_latents_for_dit.dim() == 2:
                 adapter_latents_for_dit = adapter_latents_for_dit.unsqueeze(0)
             with torch.inference_mode():
-                adapter_dp_actions = teacher_model.generate_traj(
-                    adapter_latents_for_dit,
-                    traj_images,
-                    None,
-                    predict_step_nums=args.predict_steps,
-                    guidance_scale=args.guidance_scale,
-                    num_inference_steps=args.num_inference_steps,
-                    num_sample_trajs=args.num_sample_trajs,
-                )
+                if adapter_latents_for_dit.shape[-1] == int(student_model.nextdit_action_head.config.latent_emb_size):
+                    adapter_dp_actions = student_model.nextdit_action_head.generate_traj_from_projected(
+                        adapter_latents_for_dit,
+                        traj_images=traj_images,
+                        predict_step_nums=args.predict_steps,
+                        guidance_scale=args.guidance_scale,
+                        num_inference_steps=args.num_inference_steps,
+                        num_sample_trajs=args.num_sample_trajs,
+                    )
+                else:
+                    adapter_dp_actions = teacher_model.generate_traj(
+                        adapter_latents_for_dit,
+                        traj_images,
+                        None,
+                        predict_step_nums=args.predict_steps,
+                        guidance_scale=args.guidance_scale,
+                        num_inference_steps=args.num_inference_steps,
+                        num_sample_trajs=args.num_sample_trajs,
+                    )
 
             adapter_dp_cpu = adapter_dp_actions.detach().cpu()
             teacher_dp_cpu = teacher_dp_saved.detach().cpu().float()
