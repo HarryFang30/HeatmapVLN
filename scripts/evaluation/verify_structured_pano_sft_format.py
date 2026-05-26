@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from collections import Counter
@@ -208,28 +209,77 @@ def run_synthetic(protocol: str) -> None:
         print(f"  {rec['title']:14s} turns={rec['num_turns']} target={rec['sft_target_text']!r} OK={ok}")
 
 
-def run_dataset(config_path: str, num_samples: int, seed: int) -> None:
+def _resolve_model_path(cfg: dict) -> str:
+    raw = (
+        os.environ.get("INTERNNAV_MODEL_PATH")
+        or os.environ.get("INTERNNAV_BACKBONE")
+        or cfg.get("paths", {}).get("internnav_model_path", "")
+        or cfg.get("model", {})
+        .get("action_head", {})
+        .get("nextdit", {})
+        .get("internnav_model_path", "")
+        or cfg.get("model", {}).get("llm", {}).get("model_path", "")
+    )
+    return os.path.expandvars(os.path.expanduser(str(raw or "").strip()))
+
+
+def _apply_data_root_override(cfg: dict, data_root: str | None) -> None:
+    if not data_root:
+        return
+    cfg.setdefault("data", {})["root"] = os.path.expanduser(data_root)
+    cfg.setdefault("paths", {})["dataset_root"] = os.path.expanduser(data_root)
+
+
+def run_dataset(
+    config_path: str,
+    num_samples: int,
+    seed: int,
+    *,
+    data_root: str | None,
+    use_real_processor: bool,
+    processor_path: str | None,
+) -> None:
     from scripts.training.utils import load_config
     from src.data.factory import build_dataset
-    from transformers import AutoProcessor
 
     cfg = load_config(config_path)
+    _apply_data_root_override(cfg, data_root)
     data_cfg = cfg["data"]
     traj_cfg = data_cfg.get("trajectory", data_cfg.get("sliding_window", {}))
-    stage_cfg = cfg.get("training", {}).get("stage2", cfg.get("stage2", {}))
+    stages = cfg.get("training", {}).get("stages", [])
+    stage_cfg = stages[0] if stages else cfg.get("training", {}).get("stage2", cfg.get("stage2", {}))
 
     print("=== config check ===")
+    print(f"  data.root                 : {data_cfg.get('root')}")
     print(f"  panoramic_vlm_input       : {traj_cfg.get('panoramic_vlm_input')}")
     print(f"  compute_pixel_goal        : {traj_cfg.get('compute_pixel_goal')}")
     print(f"  compute_pano_view_pixel_goal: {traj_cfg.get('compute_pano_view_pixel_goal', 'auto')}")
     print(f"  system2_sft_protocol      : {traj_cfg.get('system2_sft_protocol')}")
-    print(f"  train_system2_sft        : {stage_cfg.get('train_system2_sft')}")
+    print(f"  stage.train_lm            : {stage_cfg.get('train_lm')}")
+    print(f"  stage.train_system2_sft   : {stage_cfg.get('train_system2_sft')}")
 
-    llm_path = cfg["model"]["llm"]["model_path"]
-    processor = AutoProcessor.from_pretrained(llm_path, trust_remote_code=True)
     protocol = str(
         stage_cfg.get("system2_sft_protocol", traj_cfg.get("system2_sft_protocol", "direct"))
     ).lower()
+
+    if use_real_processor:
+        from transformers import AutoProcessor
+
+        llm_path = processor_path or _resolve_model_path(cfg)
+        if not llm_path or llm_path.startswith("$"):
+            raise RuntimeError(
+                "Cannot load real Qwen processor: set INTERNNAV_MODEL_PATH or pass "
+                "--processor-path /path/to/InternNav_Model. "
+                "For format-only checks, omit --use-real-processor (default)."
+            )
+        if not Path(llm_path).is_dir():
+            raise FileNotFoundError(f"Processor path does not exist: {llm_path}")
+        print(f"  processor.path            : {llm_path}")
+        processor = AutoProcessor.from_pretrained(llm_path, trust_remote_code=True)
+    else:
+        print("  processor                 : lightweight fake (format check only)")
+        processor = _PrintProcessor()
+
     collator = PanoramicTokenizedCollator(
         processor,
         n_traj_query=0,
@@ -253,19 +303,24 @@ def run_dataset(config_path: str, num_samples: int, seed: int) -> None:
 
     for rank, idx in enumerate(indices):
         sample = dataset[idx]
+        meta = {
+            "text": sample.get("text"),
+            "pano_sample_kind": sample.get("pano_sample_kind", "?"),
+            "pano_view_id": sample.get("pano_view_id", "?"),
+            "pano_pixel_goal": sample.get("pano_pixel_goal"),
+            "pixel_goal": sample.get("pixel_goal"),
+        }
         batch = collator([sample])
         target = batch["sft_target_text"][0]
-        kind = sample.get("pano_sample_kind", "?")
-        view = sample.get("pano_view_id", "?")
-        kind_counter[kind] += 1
-        view_counter[str(view)] += 1
+        kind_counter[str(meta["pano_sample_kind"])] += 1
+        view_counter[str(meta["pano_view_id"])] += 1
 
         print(f"\n--- dataset sample #{rank} (idx={idx}) ---")
-        print(f"  instruction       : {str(sample.get('text', ''))[:80]}")
-        print(f"  pano_sample_kind  : {kind}")
-        print(f"  pano_view_id      : {view}")
-        print(f"  pano_pixel_goal   : {sample.get('pano_pixel_goal')}")
-        print(f"  legacy pixel_goal : {sample.get('pixel_goal')}")
+        print(f"  instruction       : {str(meta['text'] or '')[:80]}")
+        print(f"  pano_sample_kind  : {meta['pano_sample_kind']}")
+        print(f"  pano_view_id      : {meta['pano_view_id']}")
+        print(f"  pano_pixel_goal   : {meta['pano_pixel_goal']}")
+        print(f"  legacy pixel_goal : {meta['pixel_goal']}")
         print(f"  sft_target_text   : {target!r}")
 
     summary = {
@@ -284,12 +339,34 @@ def main() -> None:
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--protocol", default="internnav", choices=["direct", "internnav"])
+    p.add_argument(
+        "--data-root",
+        default=os.environ.get("DATASET_ROOT", "/home/intern/zhr/fjl/r2r_paronamic_data"),
+        help="Override cfg paths.dataset_root / data.root",
+    )
+    p.add_argument(
+        "--use-real-processor",
+        action="store_true",
+        help="Load real Qwen AutoProcessor (needs INTERNNAV_MODEL_PATH). Default uses fake processor.",
+    )
+    p.add_argument(
+        "--processor-path",
+        default="",
+        help="Optional explicit HF model dir when --use-real-processor is set",
+    )
     args = p.parse_args()
 
     if args.mode == "synthetic":
         run_synthetic(args.protocol)
     else:
-        run_dataset(args.config, args.num_samples, args.seed)
+        run_dataset(
+            args.config,
+            args.num_samples,
+            args.seed,
+            data_root=args.data_root,
+            use_real_processor=args.use_real_processor,
+            processor_path=args.processor_path or None,
+        )
 
 
 if __name__ == "__main__":
