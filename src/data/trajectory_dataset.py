@@ -23,6 +23,7 @@ else:
     _CV2_IMPORT_ERROR = None
 
 from .heatmap_geometry import compute_history_heatmap
+from .pano_view_pixel_goal import load_clip_labels
 from .sliding_window_dataset import VLNSlidingWindowDataset, _evict_from_page_cache
 from .trajectory_utils import (
     apply_trajectory_augmentation,
@@ -925,6 +926,17 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             result["trajectory_valid"] = (
                 torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
             )
+
+        pano_labels = load_clip_labels(clip_dir)
+        if pano_labels is not None:
+            frame_label = pano_labels.get(str(current_t))
+            if frame_label is not None:
+                result["pano_view_id"] = frame_label.get("pano_view_id")
+                result["pano_pixel_goal"] = frame_label.get("pano_pixel_goal")
+                result["pano_sample_kind"] = frame_label.get("sample_kind")
+                rel_len = frame_label.get("pixel_goal_relative_len")
+                if rel_len is not None:
+                    result["pano_pixel_goal_relative_len"] = int(rel_len)
 
         goal_frame_idx = current_t + int(result.get("pixel_goal_relative_len", 0))
         if result.get("pixel_goal") is None:
