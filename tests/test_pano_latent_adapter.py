@@ -4,7 +4,9 @@ import torch
 
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
 from scripts.training.train_pano_latent_adapter import (
+    AdapterTrainBatch,
     _filter_records_with_pano_goals,
+    _policy_and_gt_losses,
     _sample_from_record,
 )
 
@@ -123,3 +125,81 @@ def test_filter_records_with_pano_goals_is_global_before_ddp_sharding():
     filtered = _filter_records_with_pano_goals(records, dataset=dataset)
 
     assert filtered == [records[0]]
+
+
+class _FakeSystem1Head(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.action_encoder = torch.nn.Linear(3, 4)
+
+    @staticmethod
+    def _expand_sequence_training_inputs(traj_cond, gt_trajectory, traj_images, trajectory_valid):
+        if traj_images is None or traj_images.ndim != 5 or gt_trajectory.ndim != 4:
+            return traj_cond, gt_trajectory, traj_images, trajectory_valid
+        batch_size, num_frames = traj_images.shape[:2]
+        anchor_images = traj_images[:, 0:1].repeat(1, num_frames, 1, 1, 1).flatten(0, 1)
+        current_images = traj_images.flatten(0, 1)
+        traj_image_pairs = torch.stack([anchor_images, current_images], dim=1)
+        traj_cond = traj_cond.unsqueeze(1).repeat(1, num_frames, 1, 1).flatten(0, 1)
+        gt_trajectory = gt_trajectory.flatten(0, 1)
+        if trajectory_valid is not None:
+            trajectory_valid = trajectory_valid.flatten(0, 1)
+        return traj_cond, gt_trajectory, traj_image_pairs, trajectory_valid
+
+    @staticmethod
+    def sample_flow_matching_inputs(gt_trajectory):
+        noisy = torch.zeros_like(gt_trajectory)
+        timesteps = torch.zeros(gt_trajectory.shape[0], dtype=torch.long, device=gt_trajectory.device)
+        target = torch.ones_like(gt_trajectory)
+        return noisy, timesteps, target
+
+    @staticmethod
+    def predict_velocity_from_projected(traj_cond, noisy_trajectory, timesteps, traj_images=None):
+        del timesteps, traj_images
+        scale = traj_cond.mean(dim=(1, 2)).view(-1, 1, 1)
+        return noisy_trajectory + scale
+
+    @staticmethod
+    def masked_velocity_mse(pred, target, trajectory_valid=None):
+        loss = (pred - target).square().mean(dim=(1, 2))
+        if trajectory_valid is None:
+            return loss.mean()
+        mask = trajectory_valid.float()
+        return (loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+class _FakeModel:
+    def __init__(self):
+        self.nextdit_action_head = _FakeSystem1Head()
+
+
+def test_policy_and_gt_losses_keep_gradient_to_adapter_condition():
+    pred_cond = torch.randn(2, 4, 6, requires_grad=True)
+    teacher_cond = torch.randn(2, 4, 6)
+    batch = AdapterTrainBatch(
+        student_latents=torch.empty(0),
+        teacher_latents=teacher_cond,
+        view_indices=torch.empty(0, dtype=torch.long),
+        goal_pixels=torch.empty(0),
+        image_hw=torch.empty(0),
+        trajectory=torch.zeros(2, 3, 4, 3),
+        trajectory_valid=torch.ones(2, 3),
+        traj_images=torch.zeros(2, 3, 2, 2, 3),
+        records=[],
+    )
+
+    loss, metrics = _policy_and_gt_losses(
+        model=_FakeModel(),
+        pred_cond=pred_cond,
+        teacher_cond=teacher_cond,
+        batch=batch,
+        policy_weight=1.0,
+        gt_weight=1.0,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert metrics["policy_loss"] > 0.0
+    assert metrics["gt_loss"] > 0.0
+    assert pred_cond.grad is not None
+    assert torch.any(pred_cond.grad != 0)
