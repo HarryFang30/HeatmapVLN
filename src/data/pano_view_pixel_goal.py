@@ -56,13 +56,33 @@ def load_intrinsics(clip_dir: Path) -> dict[str, float]:
     path = clip_dir / "intrinsics.json"
     with open(path) as f:
         data = json.load(f)
+
+    if "K" in data:
+        K = np.asarray(data["K"], dtype=np.float64).reshape(3, 3)
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+    else:
+        fx = float(data["fx"])
+        fy = float(data["fy"])
+        cx = float(data["cx"])
+        cy = float(data["cy"])
+
+    width = data.get("width", data.get("image_width"))
+    height = data.get("height", data.get("image_height"))
+    if width is None:
+        width = cx * 2.0
+    if height is None:
+        height = cy * 2.0
+
     return {
-        "width": float(data["width"]),
-        "height": float(data["height"]),
-        "fx": float(data["fx"]),
-        "fy": float(data["fy"]),
-        "cx": float(data["cx"]),
-        "cy": float(data["cy"]),
+        "width": float(width),
+        "height": float(height),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
     }
 
 

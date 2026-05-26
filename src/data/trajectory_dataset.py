@@ -434,6 +434,23 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         )
 
     def _result_has_system2_sft_target(self, result: dict[str, Union[torch.Tensor, str, float]]) -> bool:
+        pano_kind = str(result.get("pano_sample_kind") or "").lower()
+        pano_view_id = str(result.get("pano_view_id") or "")
+
+        if pano_kind == "pixel" or result.get("pano_pixel_goal") is not None:
+            if result.get("pano_pixel_goal") is None:
+                return False
+            goal_len = result.get("pano_pixel_goal_relative_len")
+            if goal_len is None:
+                return True
+            return float(goal_len) >= self.system2_min_pixel_goal_len
+
+        if pano_kind == "stop" or pano_view_id == VIEW_STOP:
+            return True
+
+        if pano_kind == "turn" or pano_view_id == VIEW_TURN:
+            return bool(self.sft_include_turns)
+
         if result.get("is_stop", 0.0) > 0.5 or int(result.get("discrete_action", 1)) == 0:
             return True
 

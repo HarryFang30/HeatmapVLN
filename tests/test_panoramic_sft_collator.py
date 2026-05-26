@@ -179,6 +179,18 @@ def test_panoramic_sft_collator_structured_pano_pixel_goal():
     ]
 
 
+def test_panoramic_sft_collator_structured_side_goal_without_legacy_pixel_goal():
+    collator = PanoramicTokenizedCollator(_FakeProcessor(), sft_mode=True)
+    sample = _sample(
+        pixel_goal=None,
+        pano_view_id="right",
+        pano_pixel_goal=[211, 128],
+        pano_sample_kind="pixel",
+    )
+    out = collator([sample])
+    assert out["sft_target_text"] == [["view: right\npixel: 211 128"]]
+
+
 def test_panoramic_sft_collator_structured_pano_stop_and_turn():
     collator = PanoramicTokenizedCollator(_FakeProcessor(), sft_mode=True)
     out = collator([

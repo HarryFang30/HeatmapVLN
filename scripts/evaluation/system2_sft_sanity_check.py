@@ -41,9 +41,11 @@ from src.models.heatmap.input_constructor import (
     DIRECT_WAYPOINT_TASK_SUFFIX,
     INTERNAV_LOOKDOWN_TASK_SUFFIX,
     INTERNAV_TURN_TASK_SUFFIX,
+    STRUCTURED_PANO_OUTPUT_SUFFIX,
     VIEW_NAMES,
     _ensure_pil,
     construct_input,
+    format_structured_pano_assistant_text,
 )
 
 LOGGER = logging.getLogger("system2_sft_sanity")
@@ -73,6 +75,7 @@ class ParsedText:
     text: str
     coord: list[int] | None = None
     coord_valid: bool | None = None
+    view: str | None = None
     action_seq: list[int] | None = None
     format_valid: bool = False
 
@@ -275,6 +278,15 @@ def target_texts_for_sample(
     include_forward: bool,
     protocol: str,
 ) -> list[str]:
+    structured = format_structured_pano_assistant_text(
+        sample.get("pano_view_id"),
+        sample.get("pano_pixel_goal"),
+        sample_kind=sample.get("pano_sample_kind"),
+        is_stop=float(sample.get("is_stop", 0.0)) > 0.5,
+    )
+    if structured is not None:
+        return [structured]
+
     discrete_action = int(sample.get("discrete_action", 1))
     if float(sample.get("is_stop", 0.0)) > 0.5 or discrete_action == 0:
         return ["STOP"]
@@ -331,6 +343,34 @@ def parse_generated_text(
     raw = (text or "").strip()
     upper = raw.upper()
     canonical = raw.strip(" \t\r\n。.!！,，;；:：")
+
+    view_match = re.search(r"\bview\s*:\s*(front|right|back|left|stop|turn)\b", raw, flags=re.I)
+    pixel_match = re.search(
+        r"\bpixel\s*:\s*([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)",
+        raw,
+        flags=re.I,
+    )
+    if view_match:
+        view = view_match.group(1).lower()
+        if view == "stop":
+            return ParsedText(kind="stop", text=raw, view=view, action_seq=[0], format_valid=True)
+        if view == "turn":
+            return ParsedText(kind="turn", text=raw, view=view, action_seq=None, format_valid=True)
+        if view in VIEW_NAMES and pixel_match:
+            x = round(float(pixel_match.group(1)))
+            y = round(float(pixel_match.group(2)))
+            width, height = image_size
+            coord_valid = 0 <= x < width and 0 <= y < height
+            return ParsedText(
+                kind="coord",
+                text=raw,
+                coord=[x, y],
+                coord_valid=coord_valid,
+                view=view,
+                action_seq=None,
+                format_valid=True,
+            )
+        return ParsedText(kind="invalid", text=raw, view=view, action_seq=None, format_valid=False)
 
     action_seq, action_seq_valid = _parse_action_sequence(raw)
     contains_stop = "STOP" in upper
@@ -441,6 +481,10 @@ def make_generation_messages(
     current_views = current_views_from_sample(sample)
     history_panoramas = history_panoramas_from_sample(sample)
     internnav_protocol = protocol == "internnav"
+    structured_pano_output = (
+        sample.get("pano_view_id") is not None
+        or sample.get("pano_sample_kind") is not None
+    )
 
     if prompt_mode == "current_inference":
         return construct_input(
@@ -450,6 +494,7 @@ def make_generation_messages(
             pixel_goal=None,
             assistant_text=None,
             internnav_protocol=internnav_protocol,
+            structured_pano_output=structured_pano_output,
         )
 
     # Passing a dummy pixel_goal makes construct_input include the target
@@ -461,10 +506,14 @@ def make_generation_messages(
         pixel_goal=[0, 0],
         assistant_text=None,
         internnav_protocol=internnav_protocol,
+        structured_pano_output=structured_pano_output,
     )
     messages = [m for m in messages if m.get("role") != "assistant"]
     user_content = messages[0]["content"]
-    target_prompt = INTERNNAV_TARGET_PROMPT if internnav_protocol else TARGET_PROMPT
+    if structured_pano_output:
+        target_prompt = STRUCTURED_PANO_OUTPUT_SUFFIX
+    else:
+        target_prompt = INTERNNAV_TARGET_PROMPT if internnav_protocol else TARGET_PROMPT
     for item in reversed(user_content):
         if item.get("type") == "text":
             item["text"] = target_prompt
@@ -636,11 +685,20 @@ def update_metrics(
             metrics["coord_linf_sum"] += coord_linf
             if coord_hit:
                 metrics["coord_hit"] += 1
+            if target.view is not None:
+                metrics["view_coord_targets"] += 1
+                if pred.view == target.view:
+                    metrics["view_hit"] += 1
 
     if target.kind == "stop":
         metrics["stop_targets"] += 1
         if pred.kind == "stop":
             metrics["stop_hit"] += 1
+
+    if target.kind == "turn":
+        metrics["turn_targets"] += 1
+        if pred.kind == "turn":
+            metrics["turn_hit"] += 1
 
     if include_turn_metrics and target.kind in {"left", "right", "down", "forward", "action_seq"}:
         metrics["turn_targets"] += 1
@@ -695,6 +753,11 @@ def print_summary(metrics: Counter, output_path: Path) -> None:
     if metrics["coord_pred_on_coord_target"] > 0:
         print(f"coord_mean_L1:      {float(metrics['coord_l1_sum']) / coord_pred_count:.2f}")
         print(f"coord_mean_Linf:    {float(metrics['coord_linf_sum']) / coord_pred_count:.2f}")
+    if metrics["view_coord_targets"] > 0:
+        print(
+            f"view_hit:           {pct('view_hit', int(metrics['view_coord_targets']))}  "
+            f"({int(metrics['view_hit'])}/{int(metrics['view_coord_targets'])})"
+        )
     if metrics["second_turn_skipped_bad_first"] > 0:
         print(f"second_skipped:     {int(metrics['second_turn_skipped_bad_first'])}")
 

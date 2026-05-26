@@ -79,6 +79,8 @@ class TrajectoryConfig(_Lenient):
     load_traj_images: bool = False
     traj_image_size: list[int] = [224, 224]
     compute_pixel_goal: bool = False
+    compute_pano_view_pixel_goal: bool | None = None
+    pano_max_side_dist_m: float = 6.0
     load_lookdown_for_system2: bool = False
     system2_sft_protocol: str = "direct"
     pixel_goal_direction: str = "front"
