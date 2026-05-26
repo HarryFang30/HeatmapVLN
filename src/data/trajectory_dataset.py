@@ -23,7 +23,13 @@ else:
     _CV2_IMPORT_ERROR = None
 
 from .heatmap_geometry import compute_history_heatmap
-from .pano_view_pixel_goal import load_clip_labels
+from .pano_view_pixel_goal import (
+    PANO_HORIZONTAL_VIEWS,
+    VIEW_STOP,
+    VIEW_TURN,
+    load_intrinsics,
+    resolve_farthest_pano_pixel_goal,
+)
 from .sliding_window_dataset import VLNSlidingWindowDataset, _evict_from_page_cache
 from .trajectory_utils import (
     apply_trajectory_augmentation,
@@ -117,6 +123,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         use_subinstruction: bool = False,
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
+        compute_pano_view_pixel_goal: bool | None = None,
+        pano_max_side_dist_m: float = 6.0,
     ):
         # ``VLNSlidingWindowDataset.__init__`` calls ``self._build_sample_index()``
         # before its chunk caches / panoramic detection fields are fully
@@ -163,6 +171,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
+        if compute_pano_view_pixel_goal is None:
+            compute_pano_view_pixel_goal = panoramic_vlm_input and self.compute_pixel_goal
+        self.compute_pano_view_pixel_goal = bool(compute_pano_view_pixel_goal)
+        self.pano_max_side_dist_m = float(pano_max_side_dist_m)
 
         # 加载 FGR2R 子指令映射表
         self.use_subinstruction = use_subinstruction
@@ -187,7 +199,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"system2_sample_step={self.system2_sample_step}, "
             f"system2_min_pixel_goal_len={self.system2_min_pixel_goal_len}, "
             f"system2_stop_oversample={self.system2_stop_oversample}, "
-            f"panoramic_vlm_input={self.panoramic_vlm_input}"
+            f"panoramic_vlm_input={self.panoramic_vlm_input}, "
+            f"compute_pano_view_pixel_goal={self.compute_pano_view_pixel_goal}, "
+            f"pano_max_side_dist_m={self.pano_max_side_dist_m}"
         )
 
     def set_epoch(self, epoch: int):
@@ -264,6 +278,48 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             return goal_len, pg
         return None
 
+    def _resolve_farthest_pano_pixel_goal(
+        self,
+        clip_idx: int,
+        clip_dir: Path,
+        current_t: int,
+        num_frames: int,
+        img_size: int | tuple[int, int],
+    ) -> tuple[int, str, list[int], list[int] | None] | None:
+        """Online C3 pano label: ``(goal_len, view_id, [u,v], legacy_front_uv)``."""
+        if not self.compute_pano_view_pixel_goal or current_t >= num_frames - 1:
+            return None
+
+        if isinstance(img_size, (tuple, list)):
+            proj_size: int | tuple[int, int] = (int(img_size[0]), int(img_size[1]))
+        else:
+            proj_size = int(img_size)
+
+        poses_by_view = {
+            direction: self._load_poses_for_direction(clip_idx, direction)
+            for direction in PANO_HORIZONTAL_VIEWS
+        }
+        depth_front = self._load_depth(clip_dir, current_t, direction="front")
+        try:
+            intrinsics = load_intrinsics(clip_dir)
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            intrinsics = None
+
+        pano_goal = resolve_farthest_pano_pixel_goal(
+            current_t=current_t,
+            num_frames=num_frames,
+            poses_by_view=poses_by_view,
+            depth_front=depth_front,
+            img_size=proj_size,
+            intrinsics=intrinsics,
+            min_goal_len=self.system2_min_pixel_goal_len,
+            max_side_dist_m=self.pano_max_side_dist_m,
+        )
+        if pano_goal is None:
+            return None
+        goal_len, canonical, legacy_uv = pano_goal
+        return goal_len, canonical.view_id, [canonical.u, canonical.v], legacy_uv
+
     def _internnav_sft_frame_kind(
         self,
         clip_idx: int,
@@ -279,9 +335,14 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             return "stop"
 
         action_flag = int(discrete_actions[frame_id])
-        pg_result = self._resolve_farthest_pixel_goal(
-            clip_idx, clip_dir, frame_id, num_frames, self.image_size,
-        )
+        if self.compute_pano_view_pixel_goal:
+            pg_result = self._resolve_farthest_pano_pixel_goal(
+                clip_idx, clip_dir, frame_id, num_frames, self.image_size,
+            )
+        else:
+            pg_result = self._resolve_farthest_pixel_goal(
+                clip_idx, clip_dir, frame_id, num_frames, self.image_size,
+            )
         if pg_result is None:
             if action_flag == 1:
                 return None
@@ -927,16 +988,28 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 torch.zeros_like(tv) if torch.is_tensor(tv) else 0.0
             )
 
-        pano_labels = load_clip_labels(clip_dir)
-        if pano_labels is not None:
-            frame_label = pano_labels.get(str(current_t))
-            if frame_label is not None:
-                result["pano_view_id"] = frame_label.get("pano_view_id")
-                result["pano_pixel_goal"] = frame_label.get("pano_pixel_goal")
-                result["pano_sample_kind"] = frame_label.get("sample_kind")
-                rel_len = frame_label.get("pixel_goal_relative_len")
-                if rel_len is not None:
-                    result["pano_pixel_goal_relative_len"] = int(rel_len)
+        if self.compute_pano_view_pixel_goal:
+            pano_result = self._resolve_farthest_pano_pixel_goal(
+                clip_idx=clip_idx,
+                clip_dir=clip_dir,
+                current_t=current_t,
+                num_frames=T,
+                img_size=img_size,
+            )
+            if pano_result is not None:
+                goal_len, view_id, pano_pg, legacy_uv = pano_result
+                result["pano_view_id"] = view_id
+                result["pano_pixel_goal"] = pano_pg
+                result["pano_pixel_goal_relative_len"] = goal_len
+                result["pano_sample_kind"] = "pixel"
+                if legacy_uv is not None:
+                    result["legacy_front_pixel_goal"] = legacy_uv
+            elif float(result.get("is_stop", 0.0)) > 0.5:
+                result["pano_view_id"] = VIEW_STOP
+                result["pano_sample_kind"] = "stop"
+            elif turn_actions or int(result.get("discrete_action", 1)) in (2, 3, 5):
+                result["pano_view_id"] = VIEW_TURN
+                result["pano_sample_kind"] = "turn"
 
         goal_frame_idx = current_t + int(result.get("pixel_goal_relative_len", 0))
         if result.get("pixel_goal") is None:

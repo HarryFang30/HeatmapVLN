@@ -104,6 +104,8 @@ def build_trajectory_dataset(
         use_subinstruction=traj_cfg.get("use_subinstruction", False),
         fgr2r_subinstr_path=traj_cfg.get("fgr2r_subinstr_path", None),
         panoramic_vlm_input=traj_cfg.get("panoramic_vlm_input", True),
+        compute_pano_view_pixel_goal=traj_cfg.get("compute_pano_view_pixel_goal"),
+        pano_max_side_dist_m=traj_cfg.get("pano_max_side_dist_m", 6.0),
     )
     kwargs.update(overrides)
     return VLNTrajectoryDataset(**kwargs)
