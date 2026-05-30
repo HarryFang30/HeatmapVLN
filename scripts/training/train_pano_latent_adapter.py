@@ -48,6 +48,11 @@ from scripts.training.utils import (
     safe_torch_load,
 )
 from src.data.factory import build_trajectory_dataset
+from src.data.pano_teacher_alignment import (
+    compute_aligned_teacher_latents_768_batch,
+    has_structured_pano_pixel_goal,
+    make_teacher_turn_args,
+)
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
 
@@ -245,7 +250,12 @@ def _resolve_tensor_path(jsonl_path: Path, path_value: str | None) -> Path | Non
     return path
 
 
-def _load_teacher_records(jsonl_path: Path, *, require_tensor: bool = True) -> list[dict[str, Any]]:
+def _load_teacher_records(
+    jsonl_path: Path,
+    *,
+    require_tensor: bool = True,
+    require_coord_uv: bool = True,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -254,16 +264,44 @@ def _load_teacher_records(jsonl_path: Path, *, require_tensor: bool = True) -> l
             rec = json.loads(line)
             if rec.get("status") != "ok":
                 continue
+            if rec.get("dataset_index") is None:
+                continue
             teacher = rec.get("teacher", {})
             tensor_info = teacher.get("system1", {}).get("tensor_sidecar", {})
             tensor_path = _resolve_tensor_path(jsonl_path, tensor_info.get("path"))
             if require_tensor and (tensor_path is None or not tensor_path.is_file()):
                 continue
-            if teacher.get("coord_uv") is None:
+            if require_coord_uv and teacher.get("coord_uv") is None:
                 continue
             rec["_tensor_path"] = str(tensor_path) if tensor_path is not None else None
             records.append(rec)
     return records
+
+
+def _load_alignment_teacher(args: argparse.Namespace, device: torch.device):
+    import types
+
+    from scripts.evaluation.collect_internnav_teacher_sidecar import _load_teacher
+
+    model_path = str(args.internnav_model_path or "").strip()
+    if not model_path:
+        raise RuntimeError(
+            "--teacher-target-mode aligned requires --internnav-model-path "
+            "(or INTERNAV_MODEL_PATH)"
+        )
+    sub = types.SimpleNamespace(
+        internnav_repo=str(args.internnav_repo),
+        model_path=model_path,
+        flash_attn_stub=bool(args.teacher_flash_attn_stub),
+        torch_dtype=str(args.teacher_torch_dtype),
+        attn_implementation=str(args.teacher_attn_implementation),
+        require_nextdit=False,
+    )
+    model, processor, _traj_to_actions = _load_teacher(sub, device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    return model, processor
 
 
 def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -527,13 +565,7 @@ def _latent_loss(
 
 
 def _has_trainable_pano_goal(sample: dict[str, Any]) -> bool:
-    kind = str(sample.get("pano_sample_kind") or "").lower()
-    if kind and kind != "pixel":
-        return False
-    if sample.get("pano_pixel_goal") is None:
-        return False
-    view_id = str(sample.get("pano_view_id") or "").lower()
-    return view_id in {"front", "right", "back", "left"}
+    return has_structured_pano_pixel_goal(sample)
 
 
 def _goal_tensors_from_samples(
@@ -743,6 +775,10 @@ def _build_batch(
     processor: Any,
     device: torch.device,
     n_traj_query: int,
+    teacher_target_mode: str = "sidecar",
+    teacher_model: Any | None = None,
+    teacher_processor: Any | None = None,
+    teacher_turn_args: Any | None = None,
 ) -> AdapterTrainBatch | None:
     batch_samples: list[dict[str, Any]] = []
     usable_records: list[dict[str, Any]] = []
@@ -779,12 +815,23 @@ def _build_batch(
         return_batch=True,
     )
     target_dim = int(model.nextdit_action_head.config.latent_emb_size)
-    teacher_latents = _load_teacher_latents(
-        usable_records,
-        device,
-        model=model,
-        target_dim=target_dim,
-    )
+    if teacher_target_mode == "aligned":
+        if teacher_model is None or teacher_processor is None:
+            raise RuntimeError("aligned teacher target mode requires teacher_model/processor")
+        teacher_latents = compute_aligned_teacher_latents_768_batch(
+            teacher_model,
+            teacher_processor,
+            batch_samples,
+            device,
+            turn_args=teacher_turn_args or make_teacher_turn_args(),
+        )
+    else:
+        teacher_latents = _load_teacher_latents(
+            usable_records,
+            device,
+            model=model,
+            target_dim=target_dim,
+        )
     trajectory = _collated_tensor(collated, "trajectory", device)
     trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
     traj_images = _collated_tensor(collated, "traj_images", device)
@@ -818,6 +865,10 @@ def _evaluate_adapter(
     norm_loss_type: str,
     policy_weight: float,
     gt_weight: float,
+    teacher_target_mode: str = "sidecar",
+    teacher_model: Any | None = None,
+    teacher_processor: Any | None = None,
+    teacher_turn_args: Any | None = None,
 ) -> dict[str, float]:
     adapter.eval()
     running: dict[str, float] = {}
@@ -832,6 +883,10 @@ def _evaluate_adapter(
                 processor=processor,
                 device=device,
                 n_traj_query=n_traj_query,
+                teacher_target_mode=teacher_target_mode,
+                teacher_model=teacher_model,
+                teacher_processor=teacher_processor,
+                teacher_turn_args=teacher_turn_args,
             )
             if batch is None:
                 continue
@@ -900,6 +955,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher-jsonl", required=True)
     p.add_argument("--base-checkpoint", default="checkpoints/stage1-s2_latest.pth")
     p.add_argument("--internnav-model-path", default=os.environ.get("INTERNNAV_MODEL_PATH", ""))
+    p.add_argument("--internnav-repo", default=os.environ.get("INTERNNAV_REPO", "~/InternNav"))
+    p.add_argument(
+        "--teacher-target-mode",
+        choices=["aligned", "sidecar"],
+        default="aligned",
+        help=(
+            "aligned: on-the-fly InternNav teacher 768 latents from dataset pano goals "
+            "(recommended; no traj_latents_768 sidecar required). "
+            "sidecar: load pre-collected traj_latents_768 tensors from --teacher-jsonl."
+        ),
+    )
+    p.add_argument("--teacher-device", default="", help="Device for aligned teacher (default: same as --device)")
+    p.add_argument("--teacher-torch-dtype", default="bfloat16")
+    p.add_argument("--teacher-attn-implementation", default="sdpa")
+    p.add_argument("--teacher-flash-attn-stub", dest="teacher_flash_attn_stub", action="store_true", default=True)
+    p.add_argument("--no-teacher-flash-attn-stub", dest="teacher_flash_attn_stub", action="store_false")
     p.add_argument(
         "--index-mode",
         choices=["generic", "internnav_sft"],
@@ -1030,7 +1101,12 @@ def main() -> int:
     try:
         cfg = _prepare_config(args)
         teacher_jsonl = Path(args.teacher_jsonl).expanduser()
-        records = _load_teacher_records(teacher_jsonl)
+        use_sidecar_tensors = args.teacher_target_mode == "sidecar"
+        records = _load_teacher_records(
+            teacher_jsonl,
+            require_tensor=use_sidecar_tensors,
+            require_coord_uv=use_sidecar_tensors,
+        )
         if args.max_samples > 0:
             records = records[: args.max_samples]
         if not records:
@@ -1038,10 +1114,11 @@ def main() -> int:
 
         if _rank0():
             LOGGER.info(
-                "Loaded %d teacher records from %s (world_size=%d)",
+                "Loaded %d teacher records from %s (world_size=%d teacher_target_mode=%s)",
                 len(records),
                 teacher_jsonl,
                 world_size,
+                args.teacher_target_mode,
             )
         dataset = build_trajectory_dataset(
             cfg,
@@ -1071,6 +1148,18 @@ def main() -> int:
         processor = model.qwen2_5_vl.processor
         if processor is None:
             raise RuntimeError("Missing Qwen processor")
+
+        teacher_model = None
+        teacher_processor = None
+        teacher_turn_args = make_teacher_turn_args(seed=args.seed)
+        if args.teacher_target_mode == "aligned":
+            teacher_device = device
+            if str(args.teacher_device).strip():
+                teacher_device = torch.device(str(args.teacher_device).strip())
+            teacher_model, teacher_processor = _load_alignment_teacher(args, teacher_device)
+            if _rank0():
+                LOGGER.info("Loaded aligned InternNav teacher on %s", teacher_device)
+
         n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
         hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
 
@@ -1188,6 +1277,10 @@ def main() -> int:
                     processor=processor,
                     device=device,
                     n_traj_query=n_traj_query,
+                    teacher_target_mode=args.teacher_target_mode,
+                    teacher_model=teacher_model,
+                    teacher_processor=teacher_processor,
+                    teacher_turn_args=teacher_turn_args,
                 )
                 if batch is None:
                     continue
@@ -1268,6 +1361,10 @@ def main() -> int:
                     norm_loss_type=args.norm_loss_type,
                     policy_weight=args.policy_weight,
                     gt_weight=args.gt_weight,
+                    teacher_target_mode=args.teacher_target_mode,
+                    teacher_model=teacher_model,
+                    teacher_processor=teacher_processor,
+                    teacher_turn_args=teacher_turn_args,
                 )
                 LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
 

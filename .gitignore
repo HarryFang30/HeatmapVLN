@@ -44,6 +44,9 @@ wheels/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Repo-local git/ssh (per-developer, not committed)
+.git-local/
+
 # Environment variables
 .env
 .venv

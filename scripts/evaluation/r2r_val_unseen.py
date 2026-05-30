@@ -225,7 +225,12 @@ from PIL import Image
 from scripts.training.model_builder import build_model
 from scripts.training.utils import _normalize_state_key, load_config
 
-from src.models.heatmap.input_constructor import construct_input
+from src.models.heatmap.input_constructor import (
+    construct_input,
+    parse_structured_pano_output,
+    structured_condition_text,
+    vlm_output_requests_stop,
+)
 
 
 def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
@@ -311,13 +316,34 @@ def _maybe_apply_pano_latent_adapter(
 
 
 def _parse_pano_view_id(llm_output: str) -> str | None:
-    match = re.search(r"\bview\s*:\s*(front|right|back|left|stop|turn)\b", llm_output, flags=re.I)
-    if match is None:
+    parsed = parse_structured_pano_output(llm_output, image_size=None)
+    if parsed.kind == "pixel" and parsed.view_id is not None:
+        return parsed.view_id
+    if parsed.kind in {"legacy_coord", "stop", "turn", "invalid"}:
+        return parsed.view_id
+    return None
+
+
+_pixel_goal_clamp_warned = False
+
+
+def _parse_pixel_goal(
+    llm_output: str,
+    image_size: tuple[int, int],
+) -> list[int] | None:
+    """Parse structured ``view/pixel`` or legacy ``u v`` pixel goals."""
+    global _pixel_goal_clamp_warned
+    parsed = parse_structured_pano_output(llm_output, image_size=image_size)
+    if parsed.kind in {"pixel", "legacy_coord"} and parsed.pixel_goal is not None:
+        return list(parsed.pixel_goal)
+    if not re.search(r"\d", llm_output or ""):
         return None
-    view = match.group(1).lower()
-    if view in {"stop", "turn"}:
-        return None
-    return view
+    return None
+
+
+def _vlm_requests_turn(llm_output: str) -> bool:
+    parsed = parse_structured_pano_output(llm_output, image_size=None)
+    return parsed.kind == "turn"
 
 
 def _trajectory_from_condition(
@@ -1138,36 +1164,6 @@ def _sample_history_panoramas(
     return [history_panoramas[i] for i in indices]
 
 
-_pixel_goal_clamp_warned = False
-
-
-def _parse_pixel_goal(
-    llm_output: str,
-    image_size: tuple[int, int],
-) -> list[int] | None:
-    """Parse ``u v`` pixel goal in training order; clamp to image bounds."""
-    global _pixel_goal_clamp_warned
-    if not re.search(r"\d", llm_output):
-        return None
-    coord = [int(c) for c in re.findall(r"\d+", llm_output)]
-    if len(coord) < 2:
-        return None
-    w, h = int(image_size[0]), int(image_size[1])
-    u, v = int(coord[0]), int(coord[1])
-    if u > w - 1 or v > h - 1 or u < 0 or v < 0:
-        raw_u, raw_v = u, v
-        u = max(0, min(w - 1, u))
-        v = max(0, min(h - 1, v))
-        if not _pixel_goal_clamp_warned:
-            print(
-                f"WARNING: clamped pixel_goal from [{raw_u}, {raw_v}] to [{u}, {v}] "
-                f"for image_size={image_size}",
-                flush=True,
-            )
-            _pixel_goal_clamp_warned = True
-    return [u, v]
-
-
 def _condition_output_ids_for_pixel_goal(
     output_ids: torch.Tensor,
     prompt_len: int,
@@ -1175,29 +1171,42 @@ def _condition_output_ids_for_pixel_goal(
     pixel_goal: list[int],
     llm_output: str,
     coord_order: str = "generated",
+    view_id: str | None = None,
+    structured_output: bool = False,
 ) -> torch.Tensor:
-    """Use the System1-compatible coordinate text in latent conditioning."""
-    coord = [int(c) for c in re.findall(r"\d+", llm_output)]
-    if coord_order == "generated":
-        desired = [int(pixel_goal[0]), int(pixel_goal[1])]
-    elif coord_order == "internnav_yx":
-        # InternNav System1 was trained from text like "301 225" while the
-        # eval-side pixel goal state is [u=225, v=301].  Keep this mode for
-        # raw InternNav compatibility checks; HeatmapVLN Stage2 bridge
-        # checkpoints are trained on the generated [u v] text.
-        desired = [int(pixel_goal[1]), int(pixel_goal[0])]
+    """Use System1-compatible coordinate text in latent conditioning."""
+    parsed = parse_structured_pano_output(llm_output, image_size=None)
+    use_structured = structured_output or parsed.kind == "pixel"
+    if use_structured:
+        resolved_view = (view_id or parsed.view_id or "front").lower()
+        desired_text = structured_condition_text(resolved_view, pixel_goal)
+        generated_text = (llm_output or "").strip()
+        if generated_text == desired_text:
+            return output_ids
+        print(
+            f"  [debug] System1 structured coordinate text: {desired_text!r}",
+            flush=True,
+        )
+        replacement = tokenizer.encode(desired_text, add_special_tokens=False)
     else:
-        raise ValueError(f"Unsupported coord_order: {coord_order}")
+        coord = [int(c) for c in re.findall(r"\d+", llm_output or "")]
+        if coord_order == "generated":
+            desired = [int(pixel_goal[0]), int(pixel_goal[1])]
+        elif coord_order == "internnav_yx":
+            desired = [int(pixel_goal[1]), int(pixel_goal[0])]
+        else:
+            raise ValueError(f"Unsupported coord_order: {coord_order}")
 
-    if len(coord) >= 2 and [coord[0], coord[1]] == desired:
-        return output_ids
+        if len(coord) >= 2 and [coord[0], coord[1]] == desired:
+            return output_ids
 
-    coord_text = f"{desired[0]} {desired[1]}"
-    print(
-        f"  [debug] System1 coordinate text ({coord_order}): {coord_text}",
-        flush=True,
-    )
-    replacement = tokenizer.encode(coord_text, add_special_tokens=False)
+        coord_text = f"{desired[0]} {desired[1]}"
+        print(
+            f"  [debug] System1 coordinate text ({coord_order}): {coord_text}",
+            flush=True,
+        )
+        replacement = tokenizer.encode(coord_text, add_special_tokens=False)
+
     if not replacement:
         return output_ids
 
@@ -1221,7 +1230,7 @@ def _condition_output_ids_for_pixel_goal(
 
 
 def _vlm_requests_stop(llm_output: str) -> bool:
-    if re.search(r"\bSTOP\b", llm_output, flags=re.I):
+    if vlm_output_requests_stop(llm_output):
         return True
     return ActionCode.STOP in parse_actions(llm_output, LEGACY_ACTIONS2IDX)
 
@@ -1842,11 +1851,13 @@ def _run_eval_panoramic_vlm(
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
+    structured_pano_output = not internnav_protocol
     system1_coord_order = _system1_coord_order(
         args,
         panoramic_internnav_protocol=internnav_protocol,
     )
     print(f"System2 SFT protocol: {'internnav' if internnav_protocol else 'direct'}")
+    print(f"structured_pano_output={structured_pano_output}")
     print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
     print(f"System1 coordinate text order: {system1_coord_order}")
 
@@ -2062,6 +2073,7 @@ def _run_eval_panoramic_vlm(
                     instruction=instruction,
                     pixel_goal=[0, 0],
                     internnav_protocol=internnav_protocol,
+                    structured_pano_output=structured_pano_output,
                 )
                 messages = [m for m in messages if m["role"] != "assistant"]
                 base_messages = copy.deepcopy(messages)
@@ -2115,6 +2127,11 @@ def _run_eval_panoramic_vlm(
 
             if _vlm_requests_stop(llm_output):
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
+                continue
+
+            if _vlm_requests_turn(llm_output):
+                observations, done = _apply_habitat_action(env, ActionCode.LEFT)
                 step_id += 1
                 continue
 
@@ -2311,6 +2328,8 @@ def _run_eval_panoramic_vlm(
                     pixel_goal=pixel_goal,
                     llm_output=llm_output,
                     coord_order=system1_coord_order,
+                    view_id=pano_goal_view,
+                    structured_output=structured_pano_output,
                 )
                 with torch.no_grad():
                     _last_traj_hs = model.qwen2_5_vl.generate_latents(

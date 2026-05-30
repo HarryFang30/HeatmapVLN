@@ -13,6 +13,8 @@ Prompt wording follows ``NavPixelGoalDataset`` in InternNav
 from __future__ import annotations
 
 import random
+import re
+from dataclasses import dataclass
 from typing import Union
 
 import numpy as np
@@ -86,6 +88,83 @@ def format_structured_pano_assistant_text(
     if sample_kind == "turn" or pano_view_id == "view_turn":
         return "view: turn"
     return None
+
+
+@dataclass(frozen=True)
+class StructuredPanoParseResult:
+    kind: str
+    view_id: str | None = None
+    pixel_goal: list[int] | None = None
+
+
+def parse_structured_pano_output(
+    text: str,
+    image_size: tuple[int, int] | None = None,
+) -> StructuredPanoParseResult:
+    """Parse Stage1-S2 structured output or fall back to legacy ``u v`` coords."""
+    if not text or not str(text).strip():
+        return StructuredPanoParseResult(kind="invalid")
+
+    view_match = re.search(
+        r"\bview\s*:\s*(front|right|back|left|stop|turn)\b",
+        text,
+        flags=re.I,
+    )
+    if view_match is not None:
+        view = view_match.group(1).lower()
+        if view == "stop":
+            return StructuredPanoParseResult(kind="stop")
+        if view == "turn":
+            return StructuredPanoParseResult(kind="turn")
+        pixel_match = re.search(r"\bpixel\s*:\s*(\d+)\s+(\d+)\b", text, flags=re.I)
+        if pixel_match is not None:
+            u, v = int(pixel_match.group(1)), int(pixel_match.group(2))
+            if image_size is not None:
+                w, h = int(image_size[0]), int(image_size[1])
+                u = max(0, min(w - 1, u))
+                v = max(0, min(h - 1, v))
+            return StructuredPanoParseResult(
+                kind="pixel",
+                view_id=view,
+                pixel_goal=[u, v],
+            )
+        return StructuredPanoParseResult(kind="invalid", view_id=view)
+
+    if re.search(r"\bSTOP\b", text, flags=re.I):
+        return StructuredPanoParseResult(kind="stop")
+
+    if re.search(r"\d", text):
+        nums = [int(c) for c in re.findall(r"\d+", text)]
+        if len(nums) >= 2:
+            u, v = nums[0], nums[1]
+            if image_size is not None:
+                w, h = int(image_size[0]), int(image_size[1])
+                u = max(0, min(w - 1, u))
+                v = max(0, min(h - 1, v))
+            return StructuredPanoParseResult(
+                kind="legacy_coord",
+                view_id="front",
+                pixel_goal=[u, v],
+            )
+    return StructuredPanoParseResult(kind="invalid")
+
+
+def vlm_output_requests_stop(text: str) -> bool:
+    parsed = parse_structured_pano_output(text, image_size=None)
+    if parsed.kind == "stop":
+        return True
+    return bool(re.search(r"\bSTOP\b", text or "", flags=re.I))
+
+
+def structured_condition_text(
+    view_id: str,
+    pixel_goal: list[int],
+) -> str:
+    """Canonical structured assistant text for System1 latent conditioning."""
+    text = format_structured_pano_assistant_text(view_id, pixel_goal)
+    if text is None:
+        raise ValueError(f"Cannot build structured condition for view={view_id} pixel={pixel_goal}")
+    return text
 
 
 def construct_input(

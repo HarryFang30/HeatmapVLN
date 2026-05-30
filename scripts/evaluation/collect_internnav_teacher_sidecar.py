@@ -38,6 +38,11 @@ from PIL import Image
 
 from scripts.training.utils import load_config
 from src.data.factory import build_trajectory_dataset
+from src.data.pano_teacher_alignment import (
+    condition_on_pano_coord,
+    has_structured_pano_pixel_goal,
+    sidecar_alignment_metadata,
+)
 
 DEFAULT_IMAGE_TOKEN = "<image>"
 MAX_STEPS = 8
@@ -815,6 +820,9 @@ def _sample_metadata(dataset: Any, idx: int) -> dict[str, Any]:
 
 
 def _sample_kind(sample: dict[str, Any]) -> str:
+    pano_kind = sample.get("pano_sample_kind")
+    if pano_kind:
+        return str(pano_kind)
     if float(sample.get("is_stop", 0.0)) > 0.5 or int(sample.get("discrete_action", 1)) == 0:
         return "stop"
     if sample.get("pixel_goal") is not None:
@@ -825,6 +833,16 @@ def _sample_kind(sample: dict[str, Any]) -> str:
 
 
 def _sample_passes_mode(sample: dict[str, Any], args: argparse.Namespace) -> bool:
+    if args.coord_source == "pano":
+        if args.sample_mode == "pixel":
+            return has_structured_pano_pixel_goal(sample)
+        if args.sample_mode == "stop_turn":
+            kind = _sample_kind(sample)
+            return kind in {"stop", "turn"}
+        if args.sample_mode == "all":
+            return args.include_stop or _sample_kind(sample) != "stop"
+        raise ValueError(f"Unknown sample mode: {args.sample_mode}")
+
     kind = _sample_kind(sample)
     if args.sample_mode == "pixel":
         if args.require_pixel_goal and sample.get("pixel_goal") is None:
@@ -881,7 +899,26 @@ def _collect_one(
     goal_yx = first_goal_yx
     mode = "coord" if coord_uv is not None else "text_actions"
 
-    if args.coord_source == "dataset" and sample.get("pixel_goal") is not None:
+    if args.coord_source == "pano" and has_structured_pano_pixel_goal(sample):
+        (
+            final_output,
+            final_output_ids,
+            final_inputs,
+            prompt_len,
+            coord_uv,
+            goal_yx,
+            pano_view_id,
+        ) = condition_on_pano_coord(
+            processor,
+            first_messages,
+            first_images,
+            sample,
+            device,
+        )
+        mode = "pano_structured_coord"
+        teacher["pano_view_id"] = pano_view_id
+        teacher["structured_assistant_text"] = final_output
+    elif args.coord_source == "dataset" and sample.get("pixel_goal") is not None:
         (
             final_output,
             final_output_ids,
@@ -967,6 +1004,11 @@ def _collect_one(
             "is_stop": float(sample.get("is_stop", 0.0)),
             "turn_actions": _jsonable(sample.get("turn_actions", [])),
             "trajectory_valid": _jsonable(trajectory_valid),
+            **(
+                sidecar_alignment_metadata(sample)
+                if args.coord_source == "pano"
+                else {}
+            ),
         },
     }
     if args.include_text:
@@ -995,12 +1037,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--coord-source",
-        choices=["dataset", "teacher"],
-        default="dataset",
+        choices=["pano", "dataset", "teacher"],
+        default="pano",
         help=(
-            "dataset forces the gold dataset pixel_goal into the InternNav two-turn context "
-            "and gives every pixel sample a teacher latent. teacher preserves the old audit "
-            "path and only saves System1 tensors when InternNav itself emits coordinates."
+            "pano (recommended): single-turn structured conditioning from dataset "
+            "pano_view_id + pano_pixel_goal, aligned with Stage1-S2 student targets. "
+            "dataset: legacy two-turn front_down path with dataset pixel_goal. "
+            "teacher: preserve InternNav native outputs for audit only."
         ),
     )
     p.add_argument("--include-stop", action="store_true", help="Keep dataset stop samples")
@@ -1039,6 +1082,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--traj-image-size", type=int, default=224)
     p.add_argument("--conjunction-mode", choices=["fixed", "random"], default="fixed")
     p.add_argument("--fixed-conjunction", default="you can see ")
+    p.add_argument("--pano-max-side-dist-m", type=float, default=6.0)
     p.add_argument("--two-turn-lookdown", dest="two_turn_lookdown", action="store_true", default=True)
     p.add_argument("--no-two-turn-lookdown", dest="two_turn_lookdown", action="store_false")
     p.add_argument("--max-new-tokens", type=int, default=128)
@@ -1107,7 +1151,7 @@ def main() -> None:
     action_scale = float(traj_cfg.get("action_scale", 4.0))
     print(
         f"[dataset] root={args.root} split={args.split} sample_mode={args.sample_mode} "
-        f"index_mode={args.index_mode} "
+        f"index_mode={args.index_mode} coord_source={args.coord_source} "
         f"require_sft_target={traj_cfg.get('require_sft_target')} "
         f"require_pixel_goal={args.require_pixel_goal} include_stop={args.include_stop} "
         f"shard={args.shard_index}/{args.num_shards}",
@@ -1126,8 +1170,11 @@ def main() -> None:
         enable_augmentation=False,
         enable_trajectory_augmentation=False,
         load_history_heatmap=False,
-        panoramic_vlm_input=False,
-        load_lookdown_for_system2=True,
+        panoramic_vlm_input=args.coord_source == "pano",
+        compute_pixel_goal=args.coord_source == "pano",
+        compute_pano_view_pixel_goal=args.coord_source == "pano",
+        pano_max_side_dist_m=float(getattr(args, "pano_max_side_dist_m", 6.0)),
+        load_lookdown_for_system2=args.coord_source != "pano",
         load_traj_images=True,
     )
     print(f"[dataset] samples={len(dataset)}", flush=True)
