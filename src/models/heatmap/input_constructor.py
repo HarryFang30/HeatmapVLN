@@ -85,6 +85,11 @@ def format_structured_pano_assistant_text(
     if pano_pixel_goal is not None and pano_view_id in VIEW_NAMES:
         u, v = int(pano_pixel_goal[0]), int(pano_pixel_goal[1])
         return f"view: {pano_view_id}\npixel: {u} {v}"
+    if sample_kind in {"turn_left", "turn_right"}:
+        return f"view: {sample_kind}"
+    if pano_view_id in {"view_turn_left", "view_turn_right"}:
+        direction = pano_view_id.replace("view_turn_", "")
+        return f"view: turn_{direction}"
     if sample_kind == "turn" or pano_view_id == "view_turn":
         return "view: turn"
     return None
@@ -92,9 +97,13 @@ def format_structured_pano_assistant_text(
 
 @dataclass(frozen=True)
 class StructuredPanoParseResult:
-    kind: str
+    kind: str  # "pixel", "turn_left", "turn_right", "turn", "stop", "legacy_coord", "invalid"
     view_id: str | None = None
     pixel_goal: list[int] | None = None
+    turn_direction: str | None = None  # "left" or "right" when kind is turn_left/turn_right
+
+
+_CLAMP_WARNED = False
 
 
 def parse_structured_pano_output(
@@ -105,8 +114,9 @@ def parse_structured_pano_output(
     if not text or not str(text).strip():
         return StructuredPanoParseResult(kind="invalid")
 
+    # Recognise turn_left / turn_right as well as the legacy ambiguous "turn".
     view_match = re.search(
-        r"\bview\s*:\s*(front|right|back|left|stop|turn)\b",
+        r"\bview\s*:\s*(front|right|back|left|stop|turn_left|turn_right|turn)\b",
         text,
         flags=re.I,
     )
@@ -114,15 +124,16 @@ def parse_structured_pano_output(
         view = view_match.group(1).lower()
         if view == "stop":
             return StructuredPanoParseResult(kind="stop")
+        if view == "turn_left":
+            return StructuredPanoParseResult(kind="turn", turn_direction="left")
+        if view == "turn_right":
+            return StructuredPanoParseResult(kind="turn", turn_direction="right")
         if view == "turn":
             return StructuredPanoParseResult(kind="turn")
         pixel_match = re.search(r"\bpixel\s*:\s*(\d+)\s+(\d+)\b", text, flags=re.I)
         if pixel_match is not None:
             u, v = int(pixel_match.group(1)), int(pixel_match.group(2))
-            if image_size is not None:
-                w, h = int(image_size[0]), int(image_size[1])
-                u = max(0, min(w - 1, u))
-                v = max(0, min(h - 1, v))
+            u, v = _clamp_coord(u, v, image_size)
             return StructuredPanoParseResult(
                 kind="pixel",
                 view_id=view,
@@ -137,10 +148,7 @@ def parse_structured_pano_output(
         nums = [int(c) for c in re.findall(r"\d+", text)]
         if len(nums) >= 2:
             u, v = nums[0], nums[1]
-            if image_size is not None:
-                w, h = int(image_size[0]), int(image_size[1])
-                u = max(0, min(w - 1, u))
-                v = max(0, min(h - 1, v))
+            u, v = _clamp_coord(u, v, image_size)
             return StructuredPanoParseResult(
                 kind="legacy_coord",
                 view_id="front",
@@ -149,11 +157,46 @@ def parse_structured_pano_output(
     return StructuredPanoParseResult(kind="invalid")
 
 
+def _clamp_coord(
+    u: int, v: int, image_size: tuple[int, int] | None
+) -> tuple[int, int]:
+    """Clamp (u, v) to image bounds, warning once if clamping occurred."""
+    global _CLAMP_WARNED
+    if image_size is None:
+        return u, v
+    w, h = int(image_size[0]), int(image_size[1])
+    cu, cv = u, v
+    u = max(0, min(w - 1, u))
+    v = max(0, min(h - 1, v))
+    if (cu != u or cv != v) and not _CLAMP_WARNED:
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.warning(
+            "Clamped pixel_goal from [%d, %d] to [%d, %d] for image_size=%s",
+            cu, cv, u, v, (w, h),
+        )
+        _CLAMP_WARNED = True
+    return u, v
+
+
 def vlm_output_requests_stop(text: str) -> bool:
     parsed = parse_structured_pano_output(text, image_size=None)
     if parsed.kind == "stop":
         return True
     return bool(re.search(r"\bSTOP\b", text or "", flags=re.I))
+
+
+def vlm_output_requests_turn(text: str) -> str | None:
+    """Return turn direction ("left" / "right") if the output is a turn request.
+
+    Returns ``None`` when the output is not a turn.
+    When the structured output uses the ambiguous ``view: turn`` (no direction),
+    returns ``None`` so the caller can fall back to ground-truth inference.
+    """
+    parsed = parse_structured_pano_output(text, image_size=None)
+    if parsed.kind == "turn":
+        return parsed.turn_direction  # may be None for ambiguous "view: turn"
+    return None
 
 
 def structured_condition_text(

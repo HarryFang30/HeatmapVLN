@@ -151,6 +151,8 @@ def compute_aligned_teacher_latents_768_batch(
     rng = random.Random(int(getattr(turn_args, "seed", 42)))
     latents: list[torch.Tensor] = []
     for sample in samples:
+        if not has_structured_pano_pixel_goal(sample):
+            continue
         first_messages, first_images = _build_first_turn(sample, turn_args, rng)
         (
             _assistant_text,

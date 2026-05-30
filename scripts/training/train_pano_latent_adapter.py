@@ -190,7 +190,7 @@ def _unwrap_adapter(adapter: nn.Module) -> nn.Module:
 
 
 def _extract_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
-    ckpt = safe_torch_load(str(path), map_location="cpu")
+    ckpt = safe_torch_load(str(path), map_location="cpu", weights_only=True)
     if not isinstance(ckpt, dict):
         raise TypeError(f"Unsupported checkpoint format: {path}")
     for key in ("model_state_dict", "trainable_state_dict", "state_dict"):

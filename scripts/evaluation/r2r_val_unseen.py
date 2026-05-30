@@ -230,6 +230,7 @@ from src.models.heatmap.input_constructor import (
     parse_structured_pano_output,
     structured_condition_text,
     vlm_output_requests_stop,
+    vlm_output_requests_turn,
 )
 
 
@@ -324,15 +325,15 @@ def _parse_pano_view_id(llm_output: str) -> str | None:
     return None
 
 
-_pixel_goal_clamp_warned = False
-
-
 def _parse_pixel_goal(
     llm_output: str,
     image_size: tuple[int, int],
 ) -> list[int] | None:
-    """Parse structured ``view/pixel`` or legacy ``u v`` pixel goals."""
-    global _pixel_goal_clamp_warned
+    """Parse structured ``view/pixel`` or legacy ``u v`` pixel goals.
+
+    Clamping of out-of-bounds pixel coordinates is handled (with a
+    one-shot warning) inside ``parse_structured_pano_output``.
+    """
     parsed = parse_structured_pano_output(llm_output, image_size=image_size)
     if parsed.kind in {"pixel", "legacy_coord"} and parsed.pixel_goal is not None:
         return list(parsed.pixel_goal)
@@ -341,9 +342,9 @@ def _parse_pixel_goal(
     return None
 
 
-def _vlm_requests_turn(llm_output: str) -> bool:
-    parsed = parse_structured_pano_output(llm_output, image_size=None)
-    return parsed.kind == "turn"
+def _vlm_requests_turn(llm_output: str) -> str | None:
+    """Return "left" / "right" for directional turn, or None if not a turn."""
+    return vlm_output_requests_turn(llm_output)
 
 
 def _trajectory_from_condition(
@@ -2130,8 +2131,10 @@ def _run_eval_panoramic_vlm(
                 step_id += 1
                 continue
 
-            if _vlm_requests_turn(llm_output):
-                observations, done = _apply_habitat_action(env, ActionCode.LEFT)
+            turn_dir = _vlm_requests_turn(llm_output)
+            if turn_dir is not None:
+                action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
+                observations, done = _apply_habitat_action(env, action)
                 step_id += 1
                 continue
 
