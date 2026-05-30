@@ -709,7 +709,7 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
 
 def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
     """Read a checkpoint and return the tensor state dict it contains."""
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(ckpt, dict):
         raise TypeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
@@ -730,7 +730,7 @@ def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tens
 def _extract_checkpoint_config(checkpoint_path: str | None) -> dict:
     if not checkpoint_path:
         return {}
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(ckpt, dict):
         return {}
     cfg = ckpt.get("config", {})

@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn as nn
 from scripts.training.distributed import _get_supported_trainable_sync_modules
@@ -43,12 +44,8 @@ def test_lora_sync_requires_loaded_trainable_lora_params():
     for param in model.vlm_backbone.parameters():
         param.requires_grad_(False)
 
-    try:
+    with pytest.raises(RuntimeError, match="no trainable lora_"):
         _get_supported_trainable_sync_modules(
             model,
             {"trainable_modules": ["lora"]},
         )
-    except RuntimeError as exc:
-        assert "no trainable lora_" in str(exc)
-    else:
-        raise AssertionError("Expected missing LoRA params to raise RuntimeError")

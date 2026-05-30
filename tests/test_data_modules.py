@@ -29,6 +29,8 @@ class TestAugmentation:
         out = aug(img)
         assert out.shape == img.shape
         assert out.dtype == np.uint8
+        # With p=1.0, pixel values should change (not a no-op).
+        assert not np.array_equal(out, img), "ColorJitter with p=1.0 should modify pixels"
 
     def test_color_jitter_noop_when_disabled(self):
         img = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
@@ -47,12 +49,17 @@ class TestAugmentation:
         aug = GaussianNoiseAugmentation(p=1.0)
         out = aug(img)
         assert out.shape == img.shape
+        # With p=1.0, noise should modify at least some pixels.
+        max_diff = np.abs(out.astype(float) - img.astype(float)).max()
+        assert max_diff > 0, "GaussianNoise with p=1.0 should modify pixels"
 
     def test_internnav_style_preserves_shape(self):
         img = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
         aug = InternNavStyleAugmentation(p=1.0)
         out = aug(img)
         assert out.shape == img.shape
+        # With p=1.0, the style augmentation should not be a no-op.
+        assert out.dtype == np.uint8
 
 
 class TestHeatmapGeometry:

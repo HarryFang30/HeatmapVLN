@@ -8,6 +8,7 @@ Each sample: history frames + current frame -> heatmap + action.
 import json
 import logging
 import os
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Union
@@ -185,6 +186,12 @@ class VLNSlidingWindowDataset(Dataset):
 
         self._depth_is_meters = self._detect_depth_format()
         self._is_panoramic = self._detect_panoramic()
+
+        # Thread-safe failure tracking for __getitem__ error handling
+        self._sample_failure_count: int = 0
+        self._sample_total_count: int = 0
+        self._sample_failure_lock = threading.Lock()
+        self._max_sample_failure_rate: float = 0.005  # 0.5% threshold
 
         if self.random_subsequence:
             sampling_mode = "random-subsequence"
@@ -377,7 +384,7 @@ class VLNSlidingWindowDataset(Dataset):
                     has_corrupted = False
                     for cf in chunk_files:
                         try:
-                            with np.load(cf, allow_pickle=True) as _:
+                            with np.load(cf, allow_pickle=False) as _:
                                 pass
                         except Exception:
                             logger.warning(f"Corrupted chunk, excluding clip: {cf}")
@@ -409,6 +416,20 @@ class VLNSlidingWindowDataset(Dataset):
         Args:
             epoch: 当前 epoch 编号
         """
+        # Log and reset sample failure tracking from previous epoch
+        with self._sample_failure_lock:
+            failures = self._sample_failure_count
+            total = self._sample_total_count
+            if total > 0:
+                rate = failures / total
+                if rate > 0:
+                    logger.warning(
+                        f"[Epoch {epoch-1}] Sample failure summary: "
+                        f"{failures}/{total} ({rate*100:.2f}%) samples replaced with dummies"
+                    )
+            self._sample_failure_count = 0
+            self._sample_total_count = 0
+
         if not self.clip_level_sampling:
             return
 
@@ -510,7 +531,7 @@ class VLNSlidingWindowDataset(Dataset):
         for chunk_path in chunk_files:
             chunk_path_str = str(chunk_path)
             try:
-                with np.load(chunk_path, allow_pickle=True) as chunk_data:
+                with np.load(chunk_path, allow_pickle=False) as chunk_data:
                     if "frame_ids" not in chunk_data:
                         logger.warning(f"frame_ids missing in chunk, skipping: {chunk_path}")
                         continue
@@ -547,7 +568,7 @@ class VLNSlidingWindowDataset(Dataset):
         if hit:
             return val
 
-        with np.load(chunk_path, allow_pickle=True) as chunk_data:
+        with np.load(chunk_path, allow_pickle=False) as chunk_data:
             if array_key not in chunk_data:
                 raise KeyError(f"Key {array_key} not found in chunk: {chunk_path}")
             arr = chunk_data[array_key]
@@ -1100,6 +1121,9 @@ class VLNSlidingWindowDataset(Dataset):
             }
         """
         clip_idx, current_t = self.sample_index[idx]
+
+        with self._sample_failure_lock:
+            self._sample_total_count += 1
         clip_dir = self.clips[clip_idx]
 
         try:
@@ -1231,10 +1255,23 @@ class VLNSlidingWindowDataset(Dataset):
 
             return result
 
-        except Exception as e:
-            logger.error(f"Error loading sample {idx} (clip {clip_idx}, t={current_t}): {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        except (FileNotFoundError, ValueError, KeyError, OSError,
+                IndexError, TypeError, json.JSONDecodeError) as e:
+            with self._sample_failure_lock:
+                self._sample_failure_count += 1
+                failure_count = self._sample_failure_count
+                total_count = self._sample_total_count
+            failure_rate = failure_count / max(total_count, 1)
+            logger.warning(
+                f"Error loading sample {idx} (clip {clip_idx}, t={current_t}) "
+                f"[failures: {failure_count}, rate: {failure_rate:.4f}]: {e}"
+            )
+            if failure_rate > self._max_sample_failure_rate and total_count > 100:
+                raise RuntimeError(
+                    f"Sample failure rate ({failure_rate:.4f}) exceeds threshold "
+                    f"({self._max_sample_failure_rate}). Aborting training to prevent "
+                    f"silent data corruption from dummy samples."
+                ) from e
             return self._get_dummy_sample()
 
     def _get_dummy_sample(self) -> dict[str, Union[torch.Tensor, str, float, int]]:

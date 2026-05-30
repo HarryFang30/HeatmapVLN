@@ -174,7 +174,7 @@ class NextDiTActionHead(nn.Module):
             with safe_open(ckpt_path, framework="pt", device="cpu") as f:
                 ckpt_sd = {k: f.get_tensor(k) for k in f}
         else:
-            ckpt_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            ckpt_sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
         current_sd = self.state_dict()
         loaded_sd: dict[str, torch.Tensor] = {}
@@ -237,7 +237,7 @@ class NextDiTActionHead(nn.Module):
         if ckpt_path:
             ckpt_file = Path(ckpt_path)
             if ckpt_file.is_file():
-                state_dict = torch.load(str(ckpt_file), map_location="cpu", weights_only=False)
+                state_dict = torch.load(str(ckpt_file), map_location="cpu", weights_only=True)
                 dav2_model.load_state_dict(state_dict)
                 logger.info("Loaded DepthAnythingV2 weights from %s", ckpt_file)
             else:
@@ -391,8 +391,8 @@ class NextDiTActionHead(nn.Module):
 
     def _get_sigmas(self, timesteps: torch.Tensor, device, n_dim: int = 3, dtype=torch.float32):
         """Look up sigma values from the scheduler for given timesteps."""
-        sigmas = self.noise_scheduler.sigmas.to(device=device, dtype=dtype)
-        schedule_timesteps = self.noise_scheduler.timesteps.to(device=device)
+        sigmas = self.noise_self.noise_scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = self.noise_self.noise_scheduler.timesteps.to(device=device)
         timesteps = timesteps.to(device)
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
         sigma = sigmas[step_indices].flatten()
@@ -410,8 +410,8 @@ class NextDiTActionHead(nn.Module):
         dtype = gt_trajectory.dtype
         noise = torch.randn_like(gt_trajectory)
         u = torch.rand(size=(bsz,), device="cpu")
-        indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
-        timesteps = self.noise_scheduler.timesteps[indices].to(device=device)
+        indices = (u * self.noise_self.noise_scheduler.config.num_train_timesteps).long()
+        timesteps = self.noise_self.noise_scheduler.timesteps[indices].to(device=device)
         sigmas = self._get_sigmas(timesteps, device, n_dim=gt_trajectory.ndim, dtype=dtype)
         noisy_trajectory = (1 - sigmas) * gt_trajectory + sigmas * noise
         target_velocity = noise - gt_trajectory
@@ -523,10 +523,12 @@ class NextDiTActionHead(nn.Module):
         # Sample noise
         noise = torch.randn_like(gt_trajectory)
 
-        # Sample timesteps: u ~ U(0, 1)
-        u = torch.rand(size=(bsz,), device="cpu")
-        indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
-        timesteps = self.noise_scheduler.timesteps[indices].to(device=device)
+        # Sample timesteps: u ~ U(0, 1).
+        # IMPORTANT: use the same device as gt_trajectory so that torch.manual_seed
+        # controls the GPU RNG state, making timestep sampling deterministic.
+        u = torch.rand(size=(bsz,), device=device)
+        indices = (u * self.noise_self.noise_scheduler.config.num_train_timesteps).long().to(device=device)
+        timesteps = self.noise_self.noise_scheduler.timesteps.to(device=device)[indices]
         sigmas = self._get_sigmas(timesteps, device, n_dim=gt_trajectory.ndim, dtype=dtype)
 
         # Flow matching interpolation: X_u = (1 - sigma) * X_0 + sigma * epsilon
@@ -591,13 +593,13 @@ class NextDiTActionHead(nn.Module):
             dtype=dtype,
         )
 
-        # Set up scheduler
-        scheduler = FlowMatchEulerDiscreteScheduler()
+        # Reuse the existing noise scheduler to avoid repeated allocations.
+        # Reset timesteps for inference (training config is preserved after this call).
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
+        self.noise_self.noise_scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
         # Iterative denoising
-        for t in scheduler.timesteps:
+        for t in self.noise_scheduler.timesteps:
             latent_features = self.action_encoder(traj_latents)
             pos_ids = (
                 torch.arange(latent_features.shape[1], device=device)
@@ -610,7 +612,7 @@ class NextDiTActionHead(nn.Module):
             # Double for CFG
             latent_model_input = latent_features.repeat(2, 1, 1)
             if hasattr(scheduler, "scale_model_input"):
-                latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+                latent_model_input = self.noise_scheduler.scale_model_input(latent_model_input, t)
 
             noise_pred = self.traj_dit(
                 x=latent_model_input,
@@ -623,7 +625,7 @@ class NextDiTActionHead(nn.Module):
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-            traj_latents = scheduler.step(noise_pred, t, traj_latents).prev_sample
+            traj_latents = self.noise_scheduler.step(noise_pred, t, traj_latents).prev_sample
 
         return traj_latents
 

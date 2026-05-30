@@ -98,7 +98,7 @@ def _load_adapter_from_checkpoint(
     fallback_args: argparse.Namespace,
     device: torch.device,
 ):
-    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     state_dict = ckpt.get("adapter_state_dict")
     if state_dict is None:
         raise KeyError(f"{path} has no adapter_state_dict")
@@ -633,7 +633,7 @@ def main() -> int:
                 else:
                     adapter_latents = adapter(student_latents)
 
-            payload = torch.load(rec["_tensor_path"], map_location="cpu", weights_only=False)
+            payload = torch.load(rec["_tensor_path"], map_location="cpu", weights_only=True)
             teacher_latents = _load_teacher_latents(
                 [rec],
                 device,

@@ -22,13 +22,28 @@ import torch.utils.data
 logger = logging.getLogger(__name__)
 
 
+_LIBC: "ctypes.CDLL" = None  # type: ignore[name-defined]
+
+
+def _get_libc():
+    """Lazily load and cache libc handle to avoid repeated dlopen() calls."""
+    global _LIBC
+    if _LIBC is None:
+        try:
+            import ctypes
+            _LIBC = ctypes.CDLL("libc.so.6")
+        except (OSError, AttributeError):
+            _LIBC = False  # type: ignore[assignment]
+    return _LIBC if _LIBC is not False else None
+
+
 def _malloc_trim():
     """Force glibc to return freed memory to the OS."""
     try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6")
-        libc.malloc_trim(0)
-    except Exception:
+        libc = _get_libc()
+        if libc is not None:
+            libc.malloc_trim(0)
+    except (OSError, AttributeError):
         pass
 
 
@@ -40,7 +55,7 @@ def _cgroup_mem_usage_gb():
         try:
             with open(path) as f:
                 return int(f.read().strip()) / (1024 ** 3)
-        except Exception:
+        except (OSError, ValueError, FileNotFoundError):
             continue
     return -1.0
 
@@ -59,7 +74,7 @@ def _cgroup_mem_limit_gb():
                 if v > 1 << 60:
                     return -1.0
                 return v / (1024 ** 3)
-        except Exception:
+        except (OSError, ValueError, FileNotFoundError):
             continue
     return -1.0
 
@@ -91,7 +106,7 @@ def _drop_page_cache(force: bool = False, threshold: float = 0.80):
         return
     except PermissionError:
         pass
-    except Exception as e:
+    except (OSError, FileNotFoundError) as e:
         logger.debug("[PAGE_CACHE] drop_caches failed: %s", e)
         return
 
@@ -104,20 +119,17 @@ def _drop_page_cache(force: bool = False, threshold: float = 0.80):
             usage, after, _CG_LIMIT_GB,
         )
         return
-    except Exception:
+    except (OSError, PermissionError):
         pass
 
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6")
-        libc.malloc_trim(0)
+    lbc = _get_libc()
+    if lbc is not None:
+        lbc.malloc_trim(0)
         logger.warning(
             "[PAGE_CACHE] cannot drop page cache (no permission). "
             "cgroup=%.1f/%.0fGB. Consider: chmod 666 /proc/sys/vm/drop_caches",
             usage, _CG_LIMIT_GB,
         )
-    except Exception:
-        pass
 
 
 def _worker_init_fn(worker_id):
@@ -133,14 +145,14 @@ def _worker_init_fn(worker_id):
 
     _gc.set_threshold(700, 10, 999_999_999)
 
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6")
-        libc.mallopt(-3, 32 * 1024)   # M_MMAP_THRESHOLD  → 32 KB
-        libc.mallopt(-1, 64 * 1024)   # M_TRIM_THRESHOLD  → 64 KB
-        libc.mallopt(-8, 2)           # M_ARENA_MAX → 2
-    except Exception:
-        pass
+    lbc = _get_libc()
+    if lbc is not None:
+        try:
+            lbc.mallopt(-3, 32 * 1024)   # M_MMAP_THRESHOLD  → 32 KB
+            lbc.mallopt(-1, 64 * 1024)   # M_TRIM_THRESHOLD  → 64 KB
+            lbc.mallopt(-8, 2)           # M_ARENA_MAX → 2
+        except (OSError, AttributeError):
+            pass
 
     try:
         if _os.environ.get("HEATMAPVLN_LOG_MEMORY", "0") != "1":
@@ -155,7 +167,7 @@ def _worker_init_fn(worker_id):
                 "[WORKER init] worker_id=%d pid=%d rss=%.0fMB gc_threshold=%s",
                 worker_id, _os.getpid(), rss_mb, _gc.get_threshold(),
             )
-    except Exception:
+    except (OSError, ValueError, FileNotFoundError):
         pass
 
 

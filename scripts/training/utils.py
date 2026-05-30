@@ -249,17 +249,36 @@ def load_config(config_path: str, validate: bool = True) -> dict:
     return prepare_config_for_use(cfg)
 
 
-def safe_torch_load(
+def load_checkpoint(
     path: str,
     map_location: str = "cpu",
+    weights_only: bool = False,
+    trust_checkpoint: bool = False,
 ) -> dict:
-    """Load a checkpoint with consistent safety settings.
+    """Load a training checkpoint.
 
-    Uses ``weights_only=False`` because our checkpoints contain optimizer
-    state dicts and other non-tensor objects.  Only load checkpoints you
-    trust (i.e. produced by this project).
+    For **weight-only** checkpoints (no optimizer state), pass
+    ``weights_only=True`` to enable PyTorch's safe unpickling.
+
+    For **full training** checkpoints that contain optimizer state dicts,
+    scheduler state, or other non-tensor objects, ``weights_only=False`` is
+    required.  This enables pickle deserialization — only use with checkpoints
+    you trust (produced by this project).  Pass ``trust_checkpoint=True`` to
+    confirm the checkpoint path has been validated.
     """
-    return torch.load(path, map_location=map_location, weights_only=False)
+    if not weights_only and not trust_checkpoint:
+        import warnings
+        warnings.warn(
+            f"Loading checkpoint with pickle deserialization (weights_only=False). "
+            f"Ensure the checkpoint is trusted: {path}",
+            category=UserWarning,
+            stacklevel=2,
+        )
+    return torch.load(path, map_location=map_location, weights_only=weights_only)
+
+
+# Deprecated alias — use load_checkpoint instead.
+safe_torch_load = load_checkpoint
 
 
 def build_heatmap_loss_fn(

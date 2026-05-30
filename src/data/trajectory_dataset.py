@@ -40,13 +40,7 @@ from .trajectory_utils import (
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM2_ACTION_TEXT = {
-    0: "STOP",
-    1: "↑",
-    2: "←",
-    3: "→",
-    5: "↓",
-}
+from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
 
 
 def _require_cv2() -> None:
@@ -831,8 +825,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
             trajectory_valid = 1.0
 
-        except Exception as e:
-            logger.warning(f"Failed to compute trajectory: {e}")
+        except (ValueError, np.linalg.LinAlgError, IndexError) as e:
+            logger.warning(f"Failed to compute trajectory: {e}", exc_info=True)
             resampled_poses = np.zeros((self.predict_horizon, 3), dtype=np.float32)
             trajectory_valid = 0.0
 

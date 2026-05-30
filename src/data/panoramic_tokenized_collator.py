@@ -31,23 +31,26 @@ from src.models.heatmap.input_constructor import (
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
 IGNORE_INDEX = -100
-_SYSTEM2_ACTION_TEXT = {
-    0: "STOP",
-    1: "↑",
-    2: "←",
-    3: "→",
-    5: "↓",
-}
+from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
 
-try:
-    _libc = ctypes.CDLL("libc.so.6")
-except OSError:
-    _libc = None
+_libc: ctypes.CDLL | None = None
+
+
+def _get_libc() -> ctypes.CDLL | None:
+    """Lazily load libc and cache the handle to avoid repeated dlopen() calls."""
+    global _libc
+    if _libc is None:
+        try:
+            _libc = ctypes.CDLL("libc.so.6")
+        except OSError:
+            pass
+    return _libc
 
 
 def _malloc_trim():
-    if _libc is not None:
-        _libc.malloc_trim(0)
+    libc = _get_libc()
+    if libc is not None:
+        libc.malloc_trim(0)
 
 
 def _rss_mb() -> float:
@@ -487,10 +490,10 @@ class PanoramicTokenizedCollator:
             if do_log:
                 rss2 = rss3 = _rss_mb()
 
-        gc.collect(1)
-        _malloc_trim()
-
         if do_log:
+            gc.collect(1)
+            _malloc_trim()
+
             rss4 = _rss_mb()
             pano_mb = 0.0
             pi = result.get("pano_inputs")

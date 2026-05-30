@@ -46,5 +46,5 @@ class TestCollateBasic:
         result = collate_fn(batch)
 
         assert result["history_frames"].dtype == torch.float32
-        assert result["action_valid"].dtype in (torch.float32, torch.float64)
+        assert result["action_valid"].dtype == torch.float32
         assert result["history_mask"].dtype == torch.float32

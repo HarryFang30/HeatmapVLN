@@ -100,16 +100,16 @@ def validate(
             current_frame = batch['current_frame']
             _B, _K, _C, _H, _W = history_frames.shape
 
-            gt_action = batch['action'].to(device)
-            action_valid = batch['action_valid'].to(device)
-            is_stop = batch['is_stop'].to(device)
+            gt_action = batch['action'].to(device, non_blocking=True)
+            action_valid = batch['action_valid'].to(device, non_blocking=True)
+            is_stop = batch['is_stop'].to(device, non_blocking=True)
             text = batch['text']
 
             gt_heatmap = None
             if need_heatmap_targets:
                 if _should_use_gpu_gt(batch, gpu_heatmap_computer):
-                    history_poses = batch['history_poses'].to(device)
-                    current_poses = batch['current_pose'].to(device)
+                    history_poses = batch['history_poses'].to(device, non_blocking=True)
+                    current_poses = batch['current_pose'].to(device, non_blocking=True)
                     current_depths = batch['current_depth'].to(device) if gpu_has_depth and 'current_depth' in batch else None
                     intrinsics = batch['intrinsics'].to(device) if 'intrinsics' in batch else None
                     gt_heatmap = gpu_heatmap_computer.compute_batch(
@@ -120,7 +120,7 @@ def validate(
                         depth_normalized=gpu_depth_normalized,
                     )
                 else:
-                    gt_heatmap = batch['heatmap'].to(device)
+                    gt_heatmap = batch['heatmap'].to(device, non_blocking=True)
 
             with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
                 if text and len(text) > 0:

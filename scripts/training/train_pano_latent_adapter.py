@@ -421,7 +421,7 @@ def _load_teacher_latents(
         path = rec.get("_tensor_path")
         if not path:
             raise RuntimeError(f"Missing tensor sidecar for dataset_index={rec.get('dataset_index')}")
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = safe_torch_load(path, map_location="cpu", trust_checkpoint=True)
         latent = None
         if target_dim == 768:
             for key in ("traj_latents_768", "traj_cond_768", "traj_cond"):
@@ -1098,7 +1098,7 @@ def main() -> int:
         global_step = 0
         resume_ckpt: dict[str, Any] | None = None
         if args.resume_adapter:
-            resume_ckpt = torch.load(args.resume_adapter, map_location=device, weights_only=False)
+            resume_ckpt = safe_torch_load(args.resume_adapter, map_location=str(device), trust_checkpoint=True)
             adapter.load_state_dict(resume_ckpt["adapter_state_dict"])
             start_epoch = int(resume_ckpt.get("epoch", 0))
             global_step = int(resume_ckpt.get("step", 0))

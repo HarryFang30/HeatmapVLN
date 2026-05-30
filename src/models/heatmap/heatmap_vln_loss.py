@@ -131,15 +131,17 @@ class HeatmapVLNLoss(nn.Module):
         num_samples = pred.shape[0]
 
         pred_logits = (pred * self.temperature).reshape(num_samples, -1)
-        target_logits = (target * self.temperature).reshape(num_samples, -1)
 
+        # Differentiable soft-argmax for predictions.
         pred_weights = F.softmax(pred_logits, dim=-1).reshape_as(pred)
-        target_weights = F.softmax(target_logits, dim=-1).reshape_as(target)
-
         pred_cx = (pred_weights * self.coords_x).sum(dim=(-2, -1))
         pred_cy = (pred_weights * self.coords_y).sum(dim=(-2, -1))
-        target_cx = (target_weights * self.coords_x).sum(dim=(-2, -1))
-        target_cy = (target_weights * self.coords_y).sum(dim=(-2, -1))
+
+        # Hard argmax for target (no gradient needed, saves one materialization).
+        target_flat = target.reshape(num_samples, -1)
+        target_peak = target_flat.argmax(dim=-1)
+        target_cx = self.coords_x.reshape(-1)[target_peak]
+        target_cy = self.coords_y.reshape(-1)[target_peak]
 
         coord_dist = torch.sqrt(
             (pred_cx - target_cx).square()
@@ -211,6 +213,13 @@ class HeatmapVLNLoss(nn.Module):
         if history_mask is not None:
             valid = history_mask.reshape(-1).bool()
             if valid.shape[0] != pred_vis.shape[0]:
+                import logging
+                _logger = logging.getLogger(__name__)
+                _logger.warning(
+                    "history_mask shape mismatch: mask has %d entries but "
+                    "flattened pred_vis has %d rows — mask discarded.",
+                    valid.shape[0], pred_vis.shape[0],
+                )
                 valid = None
                 valid_4 = None
             else:

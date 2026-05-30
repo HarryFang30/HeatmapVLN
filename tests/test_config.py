@@ -136,7 +136,7 @@ class TestPydanticValidation:
     def test_rejects_invalid_dataset_type(self, minimal_cfg):
         """Invalid dataset_type raises ValidationError."""
         minimal_cfg["data"]["dataset_type"] = "invalid_type"
-        with pytest.raises(Exception, match="dataset_type"):
+        with pytest.raises(ValidationError, match="dataset_type"):
             validate_config(minimal_cfg)
 
     def test_rejects_wrong_type(self, minimal_cfg):
@@ -148,13 +148,13 @@ class TestPydanticValidation:
     def test_rejects_negative_batch_size(self, minimal_cfg):
         """Negative batch_size raises ValidationError."""
         minimal_cfg["optim"]["batch_size"] = -1
-        with pytest.raises(Exception, match="batch_size"):
+        with pytest.raises(ValidationError, match="batch_size"):
             validate_config(minimal_cfg)
 
     def test_rejects_bad_image_size(self, minimal_cfg):
         """image_size with wrong length raises ValidationError."""
         minimal_cfg["data"]["image_size"] = [256]
-        with pytest.raises(Exception, match="Expected"):
+        with pytest.raises(ValidationError, match="Expected"):
             validate_config(minimal_cfg)
 
     def test_missing_required_field(self):

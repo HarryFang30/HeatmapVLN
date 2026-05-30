@@ -264,7 +264,7 @@ def _eval_branch(
     seed_loss_ic = sample_index * 10_000 + (0 if branch == "base_only" else 1) * 1000 + 100
     _set_rng(seed_loss_ic)
     gt_loss = gt_ic_t.unsqueeze(0).to(device=device, dtype=dtype)
-    with torch.cuda.amp.autocast(dtype=dtype, enabled=(device.type == "cuda")):
+    with torch.amp.autocast("cuda", dtype=dtype, enabled=(device.type == "cuda")):
         loss_ic = model.nextdit_action_head.compute_loss(
             traj_hs, gt_loss, traj_images=traj_images_ic, trajectory_valid=None,
         )

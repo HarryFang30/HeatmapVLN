@@ -775,16 +775,19 @@ class HeatmapVLN(nn.Module):
                 )
 
             stacked = torch.stack(layer_feats, dim=0)
-            abs_mean = float(stacked.abs().mean().item())
+            # abs_max is always needed for the safety check.
             abs_max = float(stacked.abs().max().item())
-            std = float(stacked.std().item())
             if abs_max <= 1e-8:
                 raise RuntimeError(
                     f"LLM layer {layer_idx} 8x8 features are effectively all-zero after hooking (abs_max={abs_max:.3e})."
                 )
-            stats_lines.append(
-                f"L{layer_idx + 1}: shape={tuple(stacked.shape[1:])}, abs_mean={abs_mean:.3e}, abs_max={abs_max:.3e}, std={std:.3e}"
-            )
+            # Only compute abs_mean and std when logging — these incur CUDA syncs.
+            if not self._logged_llm_feature_stats:
+                abs_mean = float(stacked.abs().mean().item())
+                std = float(stacked.std().item())
+                stats_lines.append(
+                    f"L{layer_idx + 1}: shape={tuple(stacked.shape[1:])}, abs_mean={abs_mean:.3e}, abs_max={abs_max:.3e}, std={std:.3e}"
+                )
 
         if not self._logged_llm_feature_stats and stats_lines:
             logger.info("Captured LLM 8x8 multi-layer features:\n  %s", "\n  ".join(stats_lines))
@@ -805,16 +808,19 @@ class HeatmapVLN(nn.Module):
                 )
             if not torch.isfinite(feats).all():
                 raise RuntimeError(f"LLM layer {layer_idx} batched features contain non-finite values.")
-            abs_mean = float(feats.abs().mean().item())
+            # abs_max is always needed for the safety check.
             abs_max = float(feats.abs().max().item())
-            std = float(feats.std().item())
             if abs_max <= 1e-8:
                 raise RuntimeError(
                     f"LLM layer {layer_idx} batched 8x8 features are effectively all-zero after hooking (abs_max={abs_max:.3e})."
                 )
-            stats_lines.append(
-                f"L{layer_idx + 1}: shape={tuple(feats.shape[1:])}, abs_mean={abs_mean:.3e}, abs_max={abs_max:.3e}, std={std:.3e}"
-            )
+            # Only compute abs_mean and std when logging — these incur CUDA syncs.
+            if not self._logged_llm_feature_stats:
+                abs_mean = float(feats.abs().mean().item())
+                std = float(feats.std().item())
+                stats_lines.append(
+                    f"L{layer_idx + 1}: shape={tuple(feats.shape[1:])}, abs_mean={abs_mean:.3e}, abs_max={abs_max:.3e}, std={std:.3e}"
+                )
 
         if not self._logged_llm_feature_stats and stats_lines:
             logger.info("Captured LLM 8x8 multi-layer features:\n  %s", "\n  ".join(stats_lines))

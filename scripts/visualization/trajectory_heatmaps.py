@@ -28,7 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from scripts.training.model_builder import build_model
-from scripts.training.utils import make_autocast_context
+from scripts.training.utils import make_autocast_context, load_checkpoint
 
 from src.data.factory import build_sliding_window_dataset
 from src.data.trajectory_utils import get_trajectory_relative_to_frame
@@ -541,7 +541,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint, map_location='cpu', trust_checkpoint=True)
     cfg = ckpt['config']
     logger.info(f"  Epoch: {ckpt.get('epoch', '?')}")
 

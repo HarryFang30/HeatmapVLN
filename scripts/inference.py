@@ -346,7 +346,7 @@ def main():
     # Load checkpoint (optional)
     if args.checkpoint and Path(args.checkpoint).exists():
         logger.info(f"Loading checkpoint from: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
         state_dict = ckpt.get('model_state_dict', ckpt.get('trainable_state_dict', ckpt))
         if state_dict and next(iter(state_dict.keys())).startswith('module.'):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}

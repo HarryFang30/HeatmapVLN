@@ -30,7 +30,7 @@ from src.data.pano_view_pixel_goal import (  # noqa: E402
 def _load_rgb(clip_dir: Path, frame_id: int, direction: str) -> np.ndarray:
     chunks_dir = clip_dir / "chunks"
     for chunk_path in sorted(chunks_dir.glob("chunk_*.npz")):
-        with np.load(chunk_path, allow_pickle=True) as z:
+        with np.load(chunk_path, allow_pickle=False) as z:
             key = f"rgb_{direction}"
             if key not in z.files:
                 raise KeyError(key)

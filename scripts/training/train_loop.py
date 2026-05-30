@@ -301,10 +301,15 @@ def train_one_epoch(
             if panoramic_inputs_batch is not None and not train_action:
                 video_frames = current_frame.unsqueeze(1)
             else:
-                video_frames = torch.cat([
-                    history_frames,
-                    history_frames[:, -1:],
-                ], dim=1)
+                # Pre-allocate to avoid implicit copy from torch.cat on
+                # potentially non-contiguous tensors.
+                B, K, C, H, W = history_frames.shape
+                video_frames = torch.empty(
+                    B, K + 1, C, H, W,
+                    dtype=history_frames.dtype, device=history_frames.device,
+                )
+                video_frames[:, :K] = history_frames
+                video_frames[:, -1] = history_frames[:, -1]
 
             output = model(
                 video_frames=video_frames,
@@ -792,14 +797,20 @@ def _collect_lora_grad_norms(model_module) -> dict | None:
     if qwen_model is None:
         return None
 
-    grad_norms: dict[tuple[int, str, str], float] = {}
+    keys: list[tuple[int, str, str]] = []
+    gpu_norms: list[torch.Tensor] = []
     for name, param in qwen_model.named_parameters():
         m = _LORA_PARAM_RE.search(name)
         if m and param.grad is not None:
-            key = (int(m.group(1)), m.group(2), m.group(3))
-            grad_norms[key] = param.grad.float().norm().item()
+            keys.append((int(m.group(1)), m.group(2), m.group(3)))
+            gpu_norms.append(param.grad.float().norm())  # stays on GPU
 
-    return grad_norms or None
+    if not keys:
+        return None
+
+    # Single GPU→CPU sync instead of O(n_lora_params) sequential syncs.
+    norms_cpu = torch.stack(gpu_norms).cpu().tolist()
+    return {key: float(norm) for key, norm in zip(keys, norms_cpu)}
 
 
 def _log_lora_diagnostics(

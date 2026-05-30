@@ -577,7 +577,7 @@ def main():
 
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
 
-    persistent_workers = False
+    persistent_workers = num_workers > 0
     train_sampler = DistributedSampler(
         train_dataset,
         num_replicas=dist_context.world_size,

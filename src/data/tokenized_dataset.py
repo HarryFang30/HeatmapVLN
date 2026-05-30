@@ -10,6 +10,7 @@ import warnings
 # 抑制 Qwen-VL 的 fps 警告（我们使用 nframes 而不是 fps 采样）
 warnings.filterwarnings("ignore", message=".*fps.*frames per second.*video metadata.*")
 
+import ctypes
 import logging
 from typing import Any
 
@@ -19,6 +20,19 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+_LIBC: "ctypes.CDLL | None" = None  # type: ignore[name-defined]
+
+
+def _lazy_libc() -> "ctypes.CDLL | None":  # type: ignore[name-defined]
+    """Lazily load and cache libc handle to avoid repeated dlopen() calls."""
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        except (OSError, AttributeError):
+            _LIBC = False  # type: ignore[assignment]
+    return _LIBC if _LIBC is not False else None
 
 # Qwen2.5-VL special token IDs
 IMAGE_TOKEN_ID = 248056
@@ -276,9 +290,8 @@ class TokenizedVLNDataset(Dataset):
             import gc
             gc.collect()
             try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
+                _lazy_libc().malloc_trim(0)
+            except (OSError, AttributeError):
                 pass
 
         return output

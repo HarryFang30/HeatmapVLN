@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from scripts.training.collate import collate_fn
 from scripts.training.model_builder import build_model
-from scripts.training.utils import make_autocast_context
+from scripts.training.utils import make_autocast_context, load_checkpoint
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -144,7 +144,7 @@ def main():
 
     # ==================== 加载 checkpoint ====================
     logger.info(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint, map_location='cpu', trust_checkpoint=True)
     cfg = ckpt['config']
     epoch = ckpt.get('epoch', '?')
     best_val = ckpt.get('best_val_loss', '?')
