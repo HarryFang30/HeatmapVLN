@@ -422,8 +422,6 @@ class PanoramicTokenizedCollator:
                 return_dict=True,
                 return_tensors="pt",
                 padding=True,
-                truncation=True,
-                max_length=self.max_seq_length,
             )
             del messages_batch
 
