@@ -7,21 +7,24 @@ paths:
   internnav_model_path: $INTERNNAV_MODEL_PATH
 
 # ============================================
-# Stage1-S2: panoramic System2 SFT
+# Stage1-S2: panoramic System2 SFT — 2-GPU
 # ============================================
 #
 # 目标:
 #   让 Qwen/LoRA 在全景输入下输出结构化 System2 pixel goal:
 #     - pixel-goal: "view: front/right/back/left" + "pixel: x y"
 #     - 已完成: "view: stop"
-#     - 无全景可见 waypoint: "view: turn"
-#   与 InternNav 对齐: 不把无 pixel-goal 的 forward 样本标成 "↑" 训练。
+#   sft_include_turns=false, sft_include_forward=false:
+#   全景 360° 覆盖下 goal 总在一个方向上可见，不训练无信息量的 turn。
 #
 # 启动方式 (2 卡):
 #   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
 #     --config configs/train_system2_panoramic_sft_2gpu.yaml
 #
-# 8×A800 请用 configs/train_system2_panoramic_sft_8gpu.yaml 或 scripts/run_stage1_s2_8gpu.sh
+# 8×A800 请用 configs/train_system2_panoramic_sft_8gpu.yaml
+#
+# Effective global batch ≈ batch_size × n_gpu × grad_accum_steps
+#   default: 2 × 2 × 4 = 16
 #
 # 产物:
 #   checkpoint 只保存 LoRA trainable_state_dict。
@@ -90,7 +93,7 @@ model:
     use_lora: true
     lora_rank: 32
     lora_alpha: 64
-    lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    lora_layer_indices: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
     lora_dropout: 0.05
 
@@ -125,16 +128,17 @@ training:
 optim:
   optimizer: adamw
   learning_rate: 1.0e-4
-  lora_lr: 5.0e-5
+  # Global batch 16: standard LoRA SFT LR, sqrt-scaling baseline for 8-gpu.
+  lora_lr: 1.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.03
   min_lr: 1.0e-6
-  # A800 80GB × 8: 每卡 batch=1, grad_accum=2, 总有效 batch=16
-  batch_size: 1
-  grad_accum_steps: 2
+  # 2-GPU: 每卡 batch=2, grad_accum=4, 总有效 batch=16
+  batch_size: 2
+  grad_accum_steps: 4
 
 loss:
   heatmap_loss_type: heatmap_vln
@@ -143,11 +147,12 @@ loss:
   lm_weight: 1.0
 
 gpu:
-  devices: [0, 1, 2, 3, 4, 5, 6, 7]
+  devices: [0, 1]
   backend: nccl
   multi_gpu:
     enabled: true
-    find_unused_parameters: true
+    # LoRA-only LM SFT: all trainable params participate each step.
+    find_unused_parameters: false
 
 log:
   save_every_epochs: 1
@@ -167,6 +172,7 @@ log:
     enabled: false
 
 validation:
+  enabled: false
   eval_every_epochs: 1
   save_best_metric: val_total_loss
   patience: 5
