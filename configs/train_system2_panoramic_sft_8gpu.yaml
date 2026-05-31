@@ -11,13 +11,12 @@ paths:
 # ============================================
 #
 # Memory-conscious defaults for 8×MXC500 64GB:
-#   - batch=3 back-calculated from OOM: GPU 0 at batch=4 peaked
-#     70.72 GB → per-sample ≈ 17.68 GB → batch=3 ≈ 57 GB (89% util).
-#   - No truncation — full panoramic sequences preserved.
+#   - batch=2 × 8GPUs × accum=2 → effective=32.
+#   - No truncation, no data loss, exact same training as A800.
 #   - num_history_sample=8 gives 36 images/sample (8×4+4).
 #   - Gradient checkpointing + FA2 stay on.
 #
-# Effective global batch ≈ 3 × 8 × 1 = 24
+# Effective global batch ≈ 2 × 8 × 2 = 32
 
 data:
   train_split: train
@@ -117,19 +116,17 @@ training:
 optim:
   optimizer: adamw
   learning_rate: 1.0e-4
-  # Effective batch 24 (3×8×1): sqrt(24/64) × 2e-4 ≈ 1.2e-4
-  lora_lr: 1.2e-4
+  # Effective batch 32 (2×8×2): sqrt(32/64) × 2e-4 ≈ 1.4e-4
+  lora_lr: 1.5e-4
   weight_decay: 0.01
   grad_clip: 1.0
   amp: bf16
   scheduler: cosine
   warmup_ratio: 0.03
   min_lr: 1.0e-6
-  # MXC500 64GB: batch=3, peak ~57GB from OOM back-calculation.
-  # GPU 0 worst-case at batch=4 peaked 70.72GB → per-sample=17.68GB.
-  # batch=3: 14+(17.68-14/4)×3 ≈ 57GB → 89% utilisation.
-  batch_size: 3
-  grad_accum_steps: 1
+  # MXC500 64GB: batch=2×8GPU×accum=2 → effective=32.
+  batch_size: 2
+  grad_accum_steps: 2
 
 loss:
   heatmap_loss_type: heatmap_vln
