@@ -105,7 +105,7 @@ def load_poses_from_chunks(clip_dir: Path, direction: str) -> list[np.ndarray]:
     frame_poses: dict[int, np.ndarray] = {}
     key = f"pose_{direction}"
     for chunk_path in chunk_files:
-        with np.load(chunk_path, allow_pickle=False) as z:
+        with np.load(chunk_path, allow_pickle=True) as z:
             if key not in z.files:
                 raise KeyError(f"{key} missing in {chunk_path}")
             frame_ids = np.asarray(z["frame_ids"], dtype=np.int32)
@@ -122,7 +122,7 @@ def load_poses_from_chunks(clip_dir: Path, direction: str) -> list[np.ndarray]:
 def load_depth_from_chunks(clip_dir: Path, frame_id: int, direction: str) -> np.ndarray | None:
     chunks_dir = clip_dir / "chunks"
     for chunk_path in sorted(chunks_dir.glob("chunk_*.npz")):
-        with np.load(chunk_path, allow_pickle=False) as z:
+        with np.load(chunk_path, allow_pickle=True) as z:
             key = f"depth_{direction}"
             if key not in z.files:
                 return None

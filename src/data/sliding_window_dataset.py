@@ -236,7 +236,7 @@ class VLNSlidingWindowDataset(Dataset):
                 chunk_dir = clip_dir / "chunks"
                 if chunk_dir.exists():
                     chunk_file = sorted(chunk_dir.glob("chunk_*.npz"))[0]
-                    with np.load(str(chunk_file), allow_pickle=False) as data:
+                    with np.load(str(chunk_file), allow_pickle=True) as data:
                         for k in data.files:
                             if k.startswith("depth"):
                                 d = data[k][0]
@@ -281,7 +281,7 @@ class VLNSlidingWindowDataset(Dataset):
             chunk_dir = clip_dir / "chunks"
             if chunk_dir.exists():
                 chunk_file = sorted(chunk_dir.glob("chunk_*.npz"))[0]
-                with np.load(str(chunk_file), allow_pickle=False) as data:
+                with np.load(str(chunk_file), allow_pickle=True) as data:
                     keys = set(data.files)
                     required = {"rgb_front", "rgb_right", "rgb_back", "rgb_left"}
                     is_pano = required.issubset(keys)
@@ -384,7 +384,7 @@ class VLNSlidingWindowDataset(Dataset):
                     has_corrupted = False
                     for cf in chunk_files:
                         try:
-                            with np.load(cf, allow_pickle=False) as _:
+                            with np.load(cf, allow_pickle=True) as _:
                                 pass
                         except Exception:
                             logger.warning(f"Corrupted chunk, excluding clip: {cf}")
@@ -531,7 +531,7 @@ class VLNSlidingWindowDataset(Dataset):
         for chunk_path in chunk_files:
             chunk_path_str = str(chunk_path)
             try:
-                with np.load(chunk_path, allow_pickle=False) as chunk_data:
+                with np.load(chunk_path, allow_pickle=True) as chunk_data:
                     if "frame_ids" not in chunk_data:
                         logger.warning(f"frame_ids missing in chunk, skipping: {chunk_path}")
                         continue
@@ -568,7 +568,7 @@ class VLNSlidingWindowDataset(Dataset):
         if hit:
             return val
 
-        with np.load(chunk_path, allow_pickle=False) as chunk_data:
+        with np.load(chunk_path, allow_pickle=True) as chunk_data:
             if array_key not in chunk_data:
                 raise KeyError(f"Key {array_key} not found in chunk: {chunk_path}")
             arr = chunk_data[array_key]
