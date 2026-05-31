@@ -1069,6 +1069,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 elif da == 3:
                     result["pano_view_id"] = VIEW_TURN_RIGHT
                     result["pano_sample_kind"] = "turn_right"
+                elif da == 5:
+                    # InternNav discrete_action 5 = "look down".  In panoramic
+                    # 360° input there is no dedicated down view; flag it as a
+                    # non-trainable legacy turn so sft_include_turns can still
+                    # optionally include it.  Closed-loop eval will return None
+                    # from vlm_output_requests_turn, triggering a heuristic
+                    # fallback rather than a directed action.
+                    result["pano_view_id"] = VIEW_TURN
+                    result["pano_sample_kind"] = "turn"
                 else:
                     result["pano_view_id"] = VIEW_TURN
                     result["pano_sample_kind"] = "turn"

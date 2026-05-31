@@ -82,9 +82,8 @@ export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-}"
 
 # Output
 export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter}"
-export STAGE2_ADAPTER_TB_DIR="${STAGE2_ADAPTER_TB_DIR:-/mnt/afs/tensorlog/heatmapvln_stage2_adapter_8gpu}"
 
-mkdir -p "$REPO_ROOT/logs" "${STAGE2_ADAPTER_OUT_DIR}" "${STAGE2_ADAPTER_TB_DIR}"
+mkdir -p "$REPO_ROOT/logs" "${STAGE2_ADAPTER_OUT_DIR}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage2_adapter_8gpu_mxc500.log}"
 
 # ---------------------------------------------------------------------------

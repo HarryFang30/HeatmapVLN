@@ -10,6 +10,18 @@ This is intentionally narrower than Stage2 bridge training:
 Frozen VLM + frozen InternNav System1 let this test answer one question:
 can a teacher-guided translator map panoramic latent queries plus structured
 goal geometry into the NextDiT condition space that System1 actually consumes?
+
+..  warning::
+    The aligned teacher latent targets use a **synthetic single-turn structured
+    pano protocol** (``view: front\\npixel: u v``).  InternNav's native training
+    protocol is a **two-turn lookdown + raw coordinate** conditioning path.
+    Even for front-view samples the teacher latent is not strictly in the
+    InternNav native System1 distribution.
+
+    The primary supervision signal for ALL views is the **GT trajectory loss**
+    through the frozen System1 NextDiT, which is native.  Teacher latent
+    distillation (cosine + MSE + policy) is a supplementary signal gated to
+    front-view samples only, accepting a small distribution gap.
 """
 
 from __future__ import annotations
@@ -632,37 +644,76 @@ def _filter_records_with_pano_goals(
     records: list[dict[str, Any]],
     *,
     dataset: Any,
+    validate_sidecar_metadata: bool = False,
 ) -> list[dict[str, Any]]:
     """Keep records whose exact frame has a structured pano pixel goal.
 
     DDP needs every rank to execute the same number of backward calls.  Filtering
     once before sharding avoids rank-local batch skips when a teacher sidecar
     record has no student pano pixel target under the current C3 rule.
+
+    When ``validate_sidecar_metadata`` is True, also verifies that the sidecar
+    record's pano metadata matches the dataset sample's computed labels.  This
+    catches stale or misaligned sidecars before training starts.
     """
     filtered: list[dict[str, Any]] = []
     skipped = 0
     failed = 0
+    mismatched = 0
     for rec in records:
+        idx = rec.get("dataset_index")
         try:
             sample = _sample_from_record(dataset, rec)
         except Exception as exc:
             failed += 1
             LOGGER.warning(
                 "Skip teacher record dataset_index=%s: failed to load exact sample (%r)",
-                rec.get("dataset_index"),
+                idx,
                 exc,
             )
             continue
-        if _has_trainable_pano_goal(sample):
-            filtered.append(rec)
-        else:
+        if not _has_trainable_pano_goal(sample):
             skipped += 1
+            continue
+        # Validate sidecar metadata against the current dataset labels.
+        # This runs globally before DDP sharding so a mismatch is surfaced
+        # synchronously on every rank.
+        if validate_sidecar_metadata:
+            sv = rec.get("_sidecar_pano_view_id")
+            sp = rec.get("_sidecar_pano_pixel_goal")
+            if sv is not None and str(sv).lower() != str(sample.get("pano_view_id") or "").lower():
+                mismatched += 1
+                LOGGER.warning(
+                    "Skip sidecar record dataset_index=%s: pano_view_id mismatch "
+                    "sidecar=%r dataset=%r",
+                    idx, sv, sample.get("pano_view_id"),
+                )
+                continue
+            if sp is not None:
+                dp = sample.get("pano_pixel_goal")
+                if dp is None or int(sp[0]) != int(dp[0]) or int(sp[1]) != int(dp[1]):
+                    mismatched += 1
+                    LOGGER.warning(
+                        "Skip sidecar record dataset_index=%s: pano_pixel_goal mismatch "
+                        "sidecar=%s dataset=%s",
+                        idx, sp, dp,
+                    )
+                    continue
+        filtered.append(rec)
     LOGGER.info(
-        "Filtered teacher records for pano pixel goals: kept=%d skipped_no_pano_goal=%d failed=%d",
+        "Filtered teacher records for pano pixel goals: "
+        "kept=%d skipped_no_pano_goal=%d failed=%d mismatched=%d",
         len(filtered),
         skipped,
         failed,
+        mismatched,
     )
+    if mismatched:
+        LOGGER.warning(
+            "%d sidecar records had pano metadata mismatches and were dropped. "
+            "Re-collect sidecars if this count is unexpected.",
+            mismatched,
+        )
     return filtered
 
 
@@ -818,17 +869,27 @@ def _policy_and_gt_losses(
     )
     noisy, timesteps, target_velocity = head.sample_flow_matching_inputs(gt_exp)
 
-    # Build front-view mask in the expanded (per-timestep) space.  Non-front
-    # teacher latents are out-of-distribution so policy distillation is gated.
+    # Build front-view mask for policy loss gating.  When traj_images has the
+    # multi-current shape (B, N, H, W, 3), _expand_sequence_training_inputs
+    # flattens B → B×N; the mask must be expanded to match.
     fm = batch.front_mask
     front_mask_exp: torch.Tensor | None = None
     if fm is not None and policy_weight > 0:
-        num_frames = gt.shape[1]  # T dimension from [B, T, ...]
-        front_mask_exp = fm.to(device=pred_cond.device, dtype=torch.float32)
-        front_mask_exp = front_mask_exp.unsqueeze(1).expand(-1, num_frames).reshape(-1)
-        # Combine with per-timestep valid mask when both are present.
-        if valid_exp is not None:
-            front_mask_exp = front_mask_exp * valid_exp.float()
+        expanded = (
+            images is not None
+            and images.ndim == 5
+            and gt.ndim == 4
+        )
+        if expanded:
+            num_frames = images.shape[1]  # N from [B, N, H, W, 3]
+            front_mask_exp = fm.to(device=pred_cond.device, dtype=torch.float32)
+            front_mask_exp = front_mask_exp.unsqueeze(1).expand(-1, num_frames).reshape(-1)
+            if valid_exp is not None:
+                front_mask_exp = front_mask_exp * valid_exp.float()
+        else:
+            front_mask_exp = fm.to(device=pred_cond.device, dtype=torch.float32)
+            if valid_exp is not None:
+                front_mask_exp = front_mask_exp * valid_exp.float()
 
     policy_loss = pred_cond.sum() * 0.0
     if policy_weight > 0:
@@ -985,23 +1046,6 @@ def _build_batch(
                 f"dataset_index={idx} kind={sample.get('pano_sample_kind')} "
                 f"view={sample.get('pano_view_id')}"
             )
-        # Sidecar alignment: verify the pre-computed pano metadata in the
-        # sidecar record matches what the dataset computes on-the-fly.
-        if teacher_target_mode == "sidecar":
-            sv = rec.get("_sidecar_pano_view_id")
-            sp = rec.get("_sidecar_pano_pixel_goal")
-            if sv is not None and str(sv).lower() != str(sample.get("pano_view_id") or "").lower():
-                raise RuntimeError(
-                    f"Sidecar pano_view_id mismatch at dataset_index={idx}: "
-                    f"sidecar={sv!r} dataset={sample.get('pano_view_id')!r}"
-                )
-            if sp is not None:
-                dp = sample.get("pano_pixel_goal")
-                if dp is None or int(sp[0]) != int(dp[0]) or int(sp[1]) != int(dp[1]):
-                    raise RuntimeError(
-                        f"Sidecar pano_pixel_goal mismatch at dataset_index={idx}: "
-                        f"sidecar={sp} dataset={dp}"
-                    )
         batch_samples.append(sample)
         usable_records.append(rec)
     if not usable_records:
@@ -1439,7 +1483,11 @@ def main() -> int:
                     world_size,
                     args.teacher_target_mode,
                 )
-            records = _filter_records_with_pano_goals(records, dataset=dataset)
+            records = _filter_records_with_pano_goals(
+                records,
+                dataset=dataset,
+                validate_sidecar_metadata=use_sidecar_tensors,
+            )
         elif args.teacher_target_mode == "aligned":
             if _rank0():
                 LOGGER.info(

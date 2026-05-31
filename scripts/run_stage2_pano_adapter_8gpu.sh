@@ -24,7 +24,9 @@ STAGE1_S2_CHECKPOINT_PREFERENCE="${STAGE1_S2_CHECKPOINT_PREFERENCE:-latest}"
 STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-${BASE_CHECKPOINT:-}}"
 STAGE2_ADAPTER_INTERNNAV_MODEL="${STAGE2_ADAPTER_INTERNNAV_MODEL:-$INTERNNAV_MODEL_PATH}"
 STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/root/autodl-tmp/vln_pano_adapter_outputs}"
-STAGE2_ADAPTER_TB_DIR="${STAGE2_ADAPTER_TB_DIR:-/root/tf-logs-pano-adapter}"
+# Adapter training iterates records directly (no DataLoader).  num_workers /
+# prefetch_factor from the config YAML do not affect this script's path,
+# and TensorBoard logging is not yet wired — only console logging is active.
 # Teacher JSONL (optional for aligned mode — auto-generated from dataset if empty)
 STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-}"
 
@@ -77,7 +79,7 @@ if [[ -n "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
   require_file "$STAGE2_ADAPTER_TEACHER_JSONL"
 fi
 
-mkdir -p "$STAGE2_ADAPTER_OUT_DIR" "$STAGE2_ADAPTER_TB_DIR"
+mkdir -p "$STAGE2_ADAPTER_OUT_DIR"
 
 export GPU_DEVICES
 export HEATMAPVLN_REQUIRE_FLASH_ATTN="$STAGE2_ADAPTER_REQUIRE_FLASH_ATTN"
