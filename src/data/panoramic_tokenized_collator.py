@@ -278,18 +278,39 @@ class PanoramicTokenizedCollator:
                         match_ids = target_ids
                 if start < 0:
                     # Fallback: for multi-line structured output (e.g.
-                    # "view: front\\npixel: 128 64"), try matching each
-                    # line independently.  The chat template may tokenize
-                    # newlines differently than standalone encoding.
-                    for line in target_text.split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        line_ids = tokenizer.encode(line, add_special_tokens=False)
-                        start = self._find_last_subsequence(row, line_ids)
-                        if start >= 0:
-                            match_ids = line_ids
-                            break
+                    # "view: front\\npixel: 128 64"), match each non-empty
+                    # line independently and label the full span.  The chat
+                    # template may tokenize newlines differently than standalone
+                    # encoding, so the full two-line sequence can fail even
+                    # though each line is individually tokenisable.
+                    lines = [
+                        ln.strip()
+                        for ln in target_text.split("\n")
+                        if ln.strip()
+                    ]
+                    if len(lines) >= 2:
+                        line_starts: list[int] = []
+                        line_ids_list: list[list[int]] = []
+                        all_matched = True
+                        for line in lines:
+                            line_ids = tokenizer.encode(line, add_special_tokens=False)
+                            ls = self._find_last_subsequence(row, line_ids)
+                            if ls < 0:
+                                all_matched = False
+                                break
+                            line_starts.append(ls)
+                            line_ids_list.append(line_ids)
+                        if all_matched:
+                            # Label from the start of the first matched line
+                            # through the end of the last matched line.
+                            start = line_starts[0]
+                            last_ids = line_ids_list[-1]
+                            match_ids = row[start:line_starts[-1] + len(last_ids)]
+                            # Validate the spanning slice is non-empty.
+                            if len(match_ids) == 0:
+                                start = -1
+                        else:
+                            start = -1
                 if start < 0:
                     # Last resort: try with add_special_tokens=True in case
                     # the chat template injects BOS/EOS-like tokens around

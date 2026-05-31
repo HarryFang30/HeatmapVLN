@@ -165,10 +165,14 @@ def project_world_point(
         fx = fy = img_w / 2.0
         cx = cy = img_w / 2.0
     else:
-        fx = float(intrinsics["fx"])
-        fy = float(intrinsics["fy"])
-        cx = float(intrinsics["cx"])
-        cy = float(intrinsics["cy"])
+        orig_w = float(intrinsics.get("width", img_w))
+        orig_h = float(intrinsics.get("height", img_h))
+        scale_x = img_w / max(orig_w, 1.0)
+        scale_y = img_h / max(orig_h, 1.0)
+        fx = float(intrinsics["fx"]) * scale_x
+        fy = float(intrinsics["fy"]) * scale_y
+        cx = float(intrinsics["cx"]) * scale_x
+        cy = float(intrinsics["cy"]) * scale_y
 
     t_inv = np.linalg.inv(np.asarray(cam_pose_c2w, dtype=np.float64))
     p_world = np.array([*world_xyz, 1.0], dtype=np.float64)

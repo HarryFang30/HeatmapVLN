@@ -616,7 +616,14 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             if self.cache_poses:
                 self._lru_put(self._directional_poses_cache, cache_key, poses, self.metadata_cache_size)
             return poses
-        except Exception:
+        except Exception as exc:
+            if direction != "front":
+                raise RuntimeError(
+                    f"Missing pose data for direction={direction!r} in clip={clip_idx}. "
+                    f"Side-view pixel goals require directional poses; "
+                    f"falling back to front poses would corrupt projections. "
+                    f"Original error: {exc}"
+                ) from exc
             return self._load_poses(clip_idx)
 
     @staticmethod
