@@ -427,6 +427,17 @@ class PanoramicTokenizedCollator:
             )
             del messages_batch
 
+            # Diagnostic: report seq_len so user can see truncation impact.
+            # seq_len == max_seq_length → truncation was triggered.
+            seq_len = int(pano_inputs["input_ids"].shape[1])
+            max_sl = self.max_seq_length
+            if self._call_count <= 10 or self._call_count % 100 == 0:
+                logger.info(
+                    "[COLLATOR call=%d] seq_len=%d max_seq_len=%d %s",
+                    self._call_count, seq_len, max_sl,
+                    "(TRUNCATED)" if seq_len >= max_sl else "",
+                )
+
             if do_log:
                 rss3 = _rss_mb()
 
