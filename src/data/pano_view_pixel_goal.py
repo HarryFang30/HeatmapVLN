@@ -52,7 +52,15 @@ class PanoPixelGoalLabel:
         }
 
 
+_intrinsics_cache: dict[str, dict[str, float]] = {}
+
+
 def load_intrinsics(clip_dir: Path) -> dict[str, float]:
+    cache_key = str(clip_dir)
+    cached = _intrinsics_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     path = clip_dir / "intrinsics.json"
     with open(path) as f:
         data = json.load(f)
@@ -76,7 +84,7 @@ def load_intrinsics(clip_dir: Path) -> dict[str, float]:
     if height is None:
         height = cy * 2.0
 
-    return {
+    result = {
         "width": float(width),
         "height": float(height),
         "fx": fx,
@@ -84,6 +92,8 @@ def load_intrinsics(clip_dir: Path) -> dict[str, float]:
         "cx": cx,
         "cy": cy,
     }
+    _intrinsics_cache[cache_key] = result
+    return result
 
 
 def load_poses_from_chunks(clip_dir: Path, direction: str) -> list[np.ndarray]:

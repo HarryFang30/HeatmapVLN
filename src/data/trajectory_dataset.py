@@ -7,12 +7,14 @@ Extends VLNSlidingWindowDataset with 24-step trajectory prediction,
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Union
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 try:
     import cv2
@@ -156,6 +158,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.pixel_goal_direction = pixel_goal_direction
         self.load_history_heatmap = load_history_heatmap
         self.require_sft_target = actual_require_sft_target
+        from collections import OrderedDict
+        self._directional_poses_cache: OrderedDict = OrderedDict()
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
         self.sft_num_future_steps = max(int(sft_num_future_steps), 1)
@@ -354,7 +358,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         stop_samples = 0
         skipped = 0
 
-        for clip_idx, clip_dir in enumerate(self.clips):
+        logger.info(
+            "Building InternNav SFT sample index across %d clips (sample_step=%d, min_goal_len=%d)...",
+            len(self.clips), sample_step, self.system2_min_pixel_goal_len,
+        )
+        for clip_idx, clip_dir in enumerate(
+            tqdm(self.clips, desc="Building SFT index", unit="clip", mininterval=5.0)
+        ):
             try:
                 meta = self._load_meta(clip_idx)
                 num_frames = int(meta["num_frames"])
@@ -563,7 +573,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         return image
 
     def _load_poses_for_direction(self, clip_idx: int, direction: str) -> list[np.ndarray]:
-        """Load per-frame camera poses for a specific panoramic direction."""
+        """Load per-frame camera poses for a specific panoramic direction (LRU cached)."""
+        cache_key = (clip_idx, direction)
+        if self.cache_poses:
+            val, hit = self._lru_get(self._directional_poses_cache, cache_key)
+            if hit:
+                return val
+
         try:
             meta = self._load_meta(clip_idx)
             num_frames = int(meta["num_frames"])
@@ -574,6 +590,9 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 )
                 for frame_idx in range(num_frames)
             ]
+
+            if self.cache_poses:
+                self._lru_put(self._directional_poses_cache, cache_key, poses, self.metadata_cache_size)
             return poses
         except Exception:
             return self._load_poses(clip_idx)
