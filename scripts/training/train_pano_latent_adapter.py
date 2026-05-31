@@ -305,7 +305,7 @@ def _load_alignment_teacher(args: argparse.Namespace, device: torch.device):
 
 
 def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
-    cfg = load_config(args.config)
+    cfg = load_config(args.student_config)
     cfg["data"]["root"] = args.root
     if "paths" in cfg:
         cfg["paths"]["dataset_root"] = args.root
@@ -486,6 +486,44 @@ def _load_teacher_latents(
             target_dim=target_dim,
         )
     return stacked
+
+
+def _build_records_from_dataset(
+    dataset: Any,
+    *,
+    max_samples: int = 0,
+) -> list[dict[str, Any]]:
+    """Auto-generate minimal teacher records from dataset for aligned mode.
+
+    Scans every sample in the dataset and emits one record per sample that
+    passes ``_has_trainable_pano_goal``.  No teacher forward is run here —
+    teacher latents come from ``compute_aligned_teacher_latents_768_batch``
+    during training.
+    """
+    records: list[dict[str, Any]] = []
+    total = len(dataset)
+    for idx in range(total):
+        try:
+            sample = dataset[idx]
+        except Exception:
+            continue
+        if not _has_trainable_pano_goal(sample):
+            continue
+        clip_idx, current_t = (
+            tuple(dataset.sample_index[idx])
+            if idx < len(dataset.sample_index)
+            else (None, None)
+        )
+        records.append({
+            "status": "ok",
+            "dataset_index": idx,
+            "clip_idx": clip_idx,
+            "current_t": current_t,
+            "_tensor_path": None,
+        })
+        if max_samples > 0 and len(records) >= max_samples:
+            break
+    return records
 
 
 def _filter_records_with_pano_goals(
@@ -947,19 +985,102 @@ def _save_checkpoint(
     )
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train pano-to-InternNav latent adapter")
-    p.add_argument("--config", default="configs/train_config_internnav_8gpu_stage2_wider.yaml")
+def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
+    """Load adapter-training defaults from a YAML config ``adapter:`` section."""
+    if not config_path:
+        return {}
+    path = Path(config_path).expanduser()
+    if not path.is_file():
+        LOGGER.warning("Adapter config not found: %s; using CLI defaults.", path)
+        return {}
+    import yaml
+
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    adapter_cfg: dict[str, Any] = cfg.get("adapter", {}) or {}
+    if not adapter_cfg:
+        LOGGER.warning("No 'adapter:' section in %s; using CLI defaults.", path)
+        return {}
+
+    defaults: dict[str, Any] = {}
+
+    # Architecture
+    defaults["adapter_dim"] = int(adapter_cfg.get("dim", 768))
+    defaults["adapter_hidden_dim"] = int(adapter_cfg.get("hidden_dim", 2048))
+    defaults["adapter_output_dim"] = int(adapter_cfg.get("output_dim", 768))
+    defaults["adapter_n_layers"] = int(adapter_cfg.get("num_layers", 1))
+    defaults["adapter_num_heads"] = int(adapter_cfg.get("num_heads", 8))
+    defaults["adapter_geometry_embed_dim"] = int(adapter_cfg.get("geometry_embed_dim", 64))
+    defaults["adapter_horizontal_fov_deg"] = float(adapter_cfg.get("horizontal_fov_deg", 90.0))
+    defaults["adapter_dropout"] = float(adapter_cfg.get("dropout", 0.0))
+
+    # Training
+    training = adapter_cfg.get("training", {}) or {}
+    defaults["epochs"] = int(training.get("epochs", 5))
+    defaults["batch_size"] = int(training.get("batch_size", 2))
+    defaults["lr"] = float(training.get("lr", 1.0e-4))
+    defaults["weight_decay"] = float(training.get("weight_decay", 0.01))
+    defaults["grad_clip"] = float(training.get("grad_clip", 1.0))
+    defaults["max_samples"] = int(training.get("max_samples", 0))
+    defaults["use_traj_images"] = bool(training.get("use_traj_images", True))
+    defaults["index_mode"] = str(training.get("index_mode", "generic"))
+    defaults["val_ratio"] = float(training.get("val_ratio", 0.1))
+
+    # Loss
+    loss = adapter_cfg.get("loss", {}) or {}
+    defaults["cosine_weight"] = float(loss.get("cosine_weight", 0.1))
+    defaults["mse_weight"] = float(loss.get("mse_weight", 1.0))
+    defaults["policy_weight"] = float(loss.get("policy_weight", 1.0))
+    defaults["gt_weight"] = float(loss.get("gt_weight", 1.0))
+    defaults["norm_weight"] = float(loss.get("norm_weight", 0.0))
+    defaults["norm_loss_type"] = str(loss.get("norm_loss_type", "log_ratio"))
+
+    # Teacher
+    teacher = adapter_cfg.get("teacher", {}) or {}
+    defaults["teacher_target_mode"] = str(teacher.get("target_mode", "aligned"))
+    defaults["teacher_torch_dtype"] = str(teacher.get("torch_dtype", "bfloat16"))
+    defaults["teacher_attn_implementation"] = str(teacher.get("attn_implementation", "sdpa"))
+    defaults["teacher_flash_attn_stub"] = bool(teacher.get("flash_attn_stub", True))
+
+    return defaults
+
+
+def _parse_args_with_config() -> argparse.Namespace:
+    """Two-pass parse: load YAML defaults, then let CLI override."""
+    # First pass: discover which config files were requested.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--student-config", default="")
+    pre.add_argument("--config", default="")  # legacy alias for --student-config
+    pre.add_argument("--adapter-config", default="")
+    pre_args, _ = pre.parse_known_args()
+
+    student_config = pre_args.student_config or pre_args.config or "configs/train_pano_adapter_stage2_8gpu.yaml"
+    adapter_config = pre_args.adapter_config or student_config
+    adapter_defaults = _load_adapter_config_defaults(adapter_config)
+
+    p = argparse.ArgumentParser(
+        description="Train pano-to-InternNav latent adapter (Stage2)",
+        parents=[pre],
+    )
+    # Override the pre-parser arguments with full versions
+    p.add_argument("--student-config", default=student_config,
+                   help="Student model config for build_model (default: %(default)s)")
+    p.add_argument("--config", default=student_config, dest="student_config_legacy",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--adapter-config", default=adapter_config,
+                   help="Config for adapter/training defaults (default: same as --student-config)")
+
     p.add_argument("--root", default=os.environ.get("PANORAMIC_DATA_ROOT", "/workspace/r2r_panoramic_data"))
     p.add_argument("--split", default="train")
-    p.add_argument("--teacher-jsonl", required=True)
+    p.add_argument("--teacher-jsonl", default="",
+                   help="Teacher sidecar JSONL. When empty and teacher-target-mode=aligned, auto-generate records from dataset.")
     p.add_argument("--base-checkpoint", default="checkpoints/stage1-s2_latest.pth")
     p.add_argument("--internnav-model-path", default=os.environ.get("INTERNNAV_MODEL_PATH", ""))
     p.add_argument("--internnav-repo", default=os.environ.get("INTERNNAV_REPO", "~/InternNav"))
     p.add_argument(
         "--teacher-target-mode",
         choices=["aligned", "sidecar"],
-        default="aligned",
+        default=adapter_defaults.get("teacher_target_mode", "aligned"),
         help=(
             "aligned: on-the-fly InternNav teacher 768 latents from dataset pano goals "
             "(recommended; no traj_latents_768 sidecar required). "
@@ -967,14 +1088,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--teacher-device", default="", help="Device for aligned teacher (default: same as --device)")
-    p.add_argument("--teacher-torch-dtype", default="bfloat16")
-    p.add_argument("--teacher-attn-implementation", default="sdpa")
-    p.add_argument("--teacher-flash-attn-stub", dest="teacher_flash_attn_stub", action="store_true", default=True)
+    p.add_argument("--teacher-torch-dtype", default=adapter_defaults.get("teacher_torch_dtype", "bfloat16"))
+    p.add_argument("--teacher-attn-implementation", default=adapter_defaults.get("teacher_attn_implementation", "sdpa"))
+    p.add_argument("--teacher-flash-attn-stub", dest="teacher_flash_attn_stub", action="store_true",
+                   default=adapter_defaults.get("teacher_flash_attn_stub", True))
     p.add_argument("--no-teacher-flash-attn-stub", dest="teacher_flash_attn_stub", action="store_false")
     p.add_argument(
         "--index-mode",
         choices=["generic", "internnav_sft"],
-        default="generic",
+        default=adapter_defaults.get("index_mode", "generic"),
         help="Use generic for sidecars collected with the fast default index; internnav_sft exactly rebuilds the old SFT index.",
     )
     p.add_argument("--output-dir", default="outputs/pano_latent_adapter")
@@ -986,23 +1108,23 @@ def parse_args() -> argparse.Namespace:
         help="Distributed backend when launched with torchrun. auto uses nccl on CUDA.",
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--max-samples", type=int, default=0)
-    p.add_argument("--lr", type=float, default=1.0e-4)
-    p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--adapter-hidden-dim", type=int, default=2048)
-    p.add_argument("--adapter-dim", type=int, default=768)
-    p.add_argument("--adapter-output-dim", type=int, default=768)
-    p.add_argument("--adapter-num-heads", type=int, default=8)
-    p.add_argument("--adapter-geometry-embed-dim", type=int, default=64)
-    p.add_argument("--adapter-horizontal-fov-deg", type=float, default=90.0)
-    p.add_argument("--adapter-dropout", type=float, default=0.0)
+    p.add_argument("--epochs", type=int, default=adapter_defaults.get("epochs", 5))
+    p.add_argument("--batch-size", type=int, default=adapter_defaults.get("batch_size", 2))
+    p.add_argument("--max-samples", type=int, default=adapter_defaults.get("max_samples", 0))
+    p.add_argument("--lr", type=float, default=adapter_defaults.get("lr", 1.0e-4))
+    p.add_argument("--weight-decay", type=float, default=adapter_defaults.get("weight_decay", 0.01))
+    p.add_argument("--grad-clip", type=float, default=adapter_defaults.get("grad_clip", 1.0))
+    p.add_argument("--adapter-hidden-dim", type=int, default=adapter_defaults.get("adapter_hidden_dim", 2048))
+    p.add_argument("--adapter-dim", type=int, default=adapter_defaults.get("adapter_dim", 768))
+    p.add_argument("--adapter-output-dim", type=int, default=adapter_defaults.get("adapter_output_dim", 768))
+    p.add_argument("--adapter-num-heads", type=int, default=adapter_defaults.get("adapter_num_heads", 8))
+    p.add_argument("--adapter-geometry-embed-dim", type=int, default=adapter_defaults.get("adapter_geometry_embed_dim", 64))
+    p.add_argument("--adapter-horizontal-fov-deg", type=float, default=adapter_defaults.get("adapter_horizontal_fov_deg", 90.0))
+    p.add_argument("--adapter-dropout", type=float, default=adapter_defaults.get("adapter_dropout", 0.0))
     p.add_argument(
         "--adapter-n-layers",
         type=int,
-        default=1,
+        default=adapter_defaults.get("adapter_n_layers", 1),
         help="Number of decoder-style Transformer adapter layers.",
     )
     p.add_argument("--pano-max-side-dist-m", type=float, default=6.0)
@@ -1010,10 +1132,10 @@ def parse_args() -> argparse.Namespace:
         "--use-traj-images",
         dest="use_traj_images",
         action="store_true",
+        default=adapter_defaults.get("use_traj_images", True),
         help="Load System1 front_down visual-memory frames for policy/GT losses.",
     )
     p.add_argument("--no-use-traj-images", dest="use_traj_images", action="store_false")
-    p.set_defaults(use_traj_images=True)
     p.add_argument(
         "--residual",
         dest="residual",
@@ -1056,26 +1178,26 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     p.set_defaults(output_affine=True)
-    p.add_argument("--cosine-weight", type=float, default=0.1)
-    p.add_argument("--mse-weight", type=float, default=1.0)
-    p.add_argument("--policy-weight", type=float, default=1.0)
-    p.add_argument("--gt-weight", type=float, default=1.0)
+    p.add_argument("--cosine-weight", type=float, default=adapter_defaults.get("cosine_weight", 0.1))
+    p.add_argument("--mse-weight", type=float, default=adapter_defaults.get("mse_weight", 1.0))
+    p.add_argument("--policy-weight", type=float, default=adapter_defaults.get("policy_weight", 1.0))
+    p.add_argument("--gt-weight", type=float, default=adapter_defaults.get("gt_weight", 1.0))
     p.add_argument(
         "--norm-weight",
         type=float,
-        default=0.0,
+        default=adapter_defaults.get("norm_weight", 0.0),
         help="Penalty on pred/teacher latent norm ratio. Set to 0 to disable.",
     )
     p.add_argument(
         "--norm-loss-type",
         choices=["log_ratio", "ratio"],
-        default="log_ratio",
+        default=adapter_defaults.get("norm_loss_type", "log_ratio"),
         help="log_ratio is symmetric around 1.0 and well-behaved when pred_norm is too large.",
     )
     p.add_argument(
         "--val-ratio",
         type=float,
-        default=0.1,
+        default=adapter_defaults.get("val_ratio", 0.1),
         help="Fraction of records held out as a deterministic validation split (after --max-samples).",
     )
     p.add_argument(
@@ -1091,7 +1213,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    args = _parse_args_with_config()
+    # Normalise: --config is a legacy alias for --student-config
+    if not args.student_config and args.student_config_legacy:
+        args.student_config = args.student_config_legacy
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     device, rank, local_rank, world_size = _init_distributed(args)
     if not _rank0():
@@ -1100,26 +1225,10 @@ def main() -> int:
 
     try:
         cfg = _prepare_config(args)
-        teacher_jsonl = Path(args.teacher_jsonl).expanduser()
-        use_sidecar_tensors = args.teacher_target_mode == "sidecar"
-        records = _load_teacher_records(
-            teacher_jsonl,
-            require_tensor=use_sidecar_tensors,
-            require_coord_uv=use_sidecar_tensors,
-        )
-        if args.max_samples > 0:
-            records = records[: args.max_samples]
-        if not records:
-            raise RuntimeError(f"No usable teacher records found in {teacher_jsonl}")
+        teacher_jsonl_str = str(args.teacher_jsonl).strip()
 
-        if _rank0():
-            LOGGER.info(
-                "Loaded %d teacher records from %s (world_size=%d teacher_target_mode=%s)",
-                len(records),
-                teacher_jsonl,
-                world_size,
-                args.teacher_target_mode,
-            )
+        # Build dataset first — needed both for record filtering AND for
+        # auto-generating records when no teacher JSONL is provided.
         dataset = build_trajectory_dataset(
             cfg,
             split=args.split,
@@ -1136,7 +1245,44 @@ def main() -> int:
         if _rank0():
             LOGGER.info("Dataset samples=%d", len(dataset))
 
-        records = _filter_records_with_pano_goals(records, dataset=dataset)
+        if teacher_jsonl_str:
+            teacher_jsonl = Path(teacher_jsonl_str).expanduser()
+            use_sidecar_tensors = args.teacher_target_mode == "sidecar"
+            records = _load_teacher_records(
+                teacher_jsonl,
+                require_tensor=use_sidecar_tensors,
+                require_coord_uv=use_sidecar_tensors,
+            )
+            if args.max_samples > 0:
+                records = records[: args.max_samples]
+            if not records:
+                raise RuntimeError(f"No usable teacher records found in {teacher_jsonl}")
+            if _rank0():
+                LOGGER.info(
+                    "Loaded %d teacher records from %s (world_size=%d teacher_target_mode=%s)",
+                    len(records),
+                    teacher_jsonl,
+                    world_size,
+                    args.teacher_target_mode,
+                )
+            records = _filter_records_with_pano_goals(records, dataset=dataset)
+        elif args.teacher_target_mode == "aligned":
+            if _rank0():
+                LOGGER.info(
+                    "No --teacher-jsonl provided; auto-generating records from dataset "
+                    "(aligned mode — teacher runs on-the-fly during training)"
+                )
+            records = _build_records_from_dataset(
+                dataset,
+                max_samples=args.max_samples,
+            )
+            if _rank0():
+                LOGGER.info("Auto-generated %d records from dataset", len(records))
+        else:
+            raise RuntimeError(
+                "--teacher-jsonl is required for teacher-target-mode=sidecar"
+            )
+
         if not records:
             raise RuntimeError(
                 "No teacher records remain after filtering for structured pano pixel goals"
