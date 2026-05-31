@@ -14,8 +14,8 @@ paths:
 #   - Per-GPU batch=2 + grad_accum=4 keeps effective batch=64 while
 #     fitting inside 64GB.  Panoramic 36-image prompts with LoRA+gc
 #     consume ~25-35GB per sample batch — batch=2 leaves headroom.
-#   - num_history_sample=4 reduces visual tokens (4×4+4=20 images vs
-#     8×4+4=36), roughly halving sequence length and attention memory.
+#   - num_history_sample=8 gives 36 images/sample (8×4+4). With FA2
+#     + gradient checkpointing, this is manageable at batch=2.
 #   - Gradient checkpointing stays on to keep activation memory in check.
 #   - FlashAttention2 is expected; SDPA on panoramic input is 3-5× heavier.
 #   - Validation off during training (re-enable for final quality checks).
@@ -37,8 +37,7 @@ data:
 
   trajectory:
     min_history: 5
-    # 64GB cards: 4 history positions keep visual tokens manageable.
-    num_history_sample: 4
+    num_history_sample: 8
     panoramic_vlm_input: true
     load_depth: true
     cache_poses: true
