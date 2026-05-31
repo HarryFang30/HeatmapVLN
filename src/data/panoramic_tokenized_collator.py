@@ -248,11 +248,14 @@ class PanoramicTokenizedCollator:
     ) -> torch.Tensor:
         labels = torch.full_like(input_ids, IGNORE_INDEX)
         tokenizer = self.processor.tokenizer
+        per_sample_labeled = [False] * len(target_texts)
+        per_sample_has_target = [bool(texts) for texts in target_texts]
 
         for batch_idx, sample_target_texts in enumerate(target_texts):
             if not sample_target_texts:
                 continue
             row = input_ids[batch_idx].tolist()
+            sample_labeled = False
             for target_text in sample_target_texts:
                 match_ids = self._assistant_sequence_for_labeling(target_text)
                 if not match_ids:
@@ -271,16 +274,72 @@ class PanoramicTokenizedCollator:
                 if start < 0:
                     target_ids = tokenizer.encode(target_text, add_special_tokens=False)
                     start = self._find_last_subsequence(row, target_ids)
-                    if start < 0:
-                        continue
-                    match_ids = target_ids
+                    if start >= 0:
+                        match_ids = target_ids
+                if start < 0:
+                    # Fallback: for multi-line structured output (e.g.
+                    # "view: front\\npixel: 128 64"), try matching each
+                    # line independently.  The chat template may tokenize
+                    # newlines differently than standalone encoding.
+                    for line in target_text.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        line_ids = tokenizer.encode(line, add_special_tokens=False)
+                        start = self._find_last_subsequence(row, line_ids)
+                        if start >= 0:
+                            match_ids = line_ids
+                            break
+                if start < 0:
+                    # Last resort: try with add_special_tokens=True in case
+                    # the chat template injects BOS/EOS-like tokens around
+                    # the assistant content.
+                    try:
+                        target_ids_special = tokenizer.encode(
+                            target_text, add_special_tokens=True,
+                        )
+                        start = self._find_last_subsequence(row, target_ids_special)
+                        if start >= 0:
+                            match_ids = target_ids_special
+                    except Exception:
+                        pass
+                if start < 0:
+                    continue
 
                 end = start + len(match_ids)
                 labels[batch_idx, start:end] = input_ids[batch_idx, start:end]
                 self._maybe_label_chat_end(labels[batch_idx], input_ids[batch_idx], end)
+                sample_labeled = True
+
+            per_sample_labeled[batch_idx] = sample_labeled
 
         if attention_mask is not None:
             labels = labels.masked_fill(attention_mask == 0, IGNORE_INDEX)
+
+        # Per-sample diagnostics: only warn about samples that *should* have
+        # labels (non-empty target_texts) but none were found in the tokenized
+        # sequence.  A batch-level RuntimeError is still raised downstream when
+        # every sample fails; this warning catches the partial-failure case.
+        unlabeled_with_targets = [
+            i for i in range(len(target_texts))
+            if per_sample_has_target[i] and not per_sample_labeled[i]
+        ]
+        if unlabeled_with_targets:
+            detail_parts: list[str] = []
+            for i in unlabeled_with_targets[:3]:
+                texts = target_texts[i] if i < len(target_texts) else []
+                detail_parts.append(f"idx={i} target={texts}")
+            if len(unlabeled_with_targets) > 3:
+                detail_parts.append(f"...and {len(unlabeled_with_targets) - 3} more")
+            logger.warning(
+                "[COLLATOR call=%d] %d/%d samples have NO labels assigned "
+                "(target present but not found in tokenized sequence): %s",
+                self._call_count,
+                len(unlabeled_with_targets),
+                len(target_texts),
+                "; ".join(detail_parts),
+            )
+
         return labels
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -425,15 +484,15 @@ class PanoramicTokenizedCollator:
             )
             del messages_batch
 
-            # Diagnostic: report seq_len so user can see truncation impact.
-            # seq_len == max_seq_length → truncation was triggered.
+            # Diagnostic only: multimodal truncation is intentionally disabled.
+            # Report over-limit batches so history sizing can be corrected.
             seq_len = int(pano_inputs["input_ids"].shape[1])
             max_sl = self.max_seq_length
             if self._call_count <= 10 or self._call_count % 100 == 0:
                 logger.info(
                     "[COLLATOR call=%d] seq_len=%d max_seq_len=%d %s",
                     self._call_count, seq_len, max_sl,
-                    "(TRUNCATED)" if seq_len >= max_sl else "",
+                    "(OVER_LIMIT; NOT TRUNCATED)" if seq_len > max_sl else "",
                 )
 
             if do_log:
@@ -476,9 +535,15 @@ class PanoramicTokenizedCollator:
                     # TRAJ tokens are latent-query carriers, never LM targets.
                     labels[:, -nq:] = IGNORE_INDEX
                 if not torch.any(labels != IGNORE_INDEX):
+                    target_summary = [
+                        f"sample[{i}]: {texts}"
+                        for i, texts in enumerate(sft_target_texts)
+                        if texts
+                    ][:5]
                     raise RuntimeError(
                         "Panoramic SFT batch has no assistant labels. "
-                        "Check pixel_goal/STOP synthesis and tokenizer alignment."
+                        "Check pixel_goal/STOP synthesis and tokenizer alignment. "
+                        f"Batch target texts: {target_summary}"
                     )
                 pano_inputs["labels"] = labels
                 result["sft_target_text"] = sft_target_texts
