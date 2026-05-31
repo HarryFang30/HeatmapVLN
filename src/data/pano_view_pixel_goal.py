@@ -19,7 +19,9 @@ import numpy as np
 
 PANO_HORIZONTAL_VIEWS: tuple[str, ...] = ("front", "right", "back", "left")
 VIEW_STOP = "view_stop"
-VIEW_TURN = "view_turn"
+VIEW_TURN = "view_turn"  # legacy ambiguous turn — kept for backward compat
+VIEW_TURN_LEFT = "view_turn_left"
+VIEW_TURN_RIGHT = "view_turn_right"
 LABEL_VERSION = 1
 
 

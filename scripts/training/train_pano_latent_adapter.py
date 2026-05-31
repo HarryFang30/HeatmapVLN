@@ -80,6 +80,10 @@ class AdapterTrainBatch:
     trajectory_valid: torch.Tensor | None
     traj_images: torch.Tensor | None
     records: list[dict[str, Any]]
+    front_mask: torch.Tensor | None = None
+    """Bool [B]; True when sample is a front-view pixel goal whose teacher
+    latent is in-distribution.  Non-front views only receive GT trajectory
+    supervision because the teacher never saw the corresponding image."""
 
 
 class PanoToInternNavLatentAdapter(nn.Module):
@@ -357,6 +361,19 @@ def _load_teacher_records(
             if require_coord_uv and teacher.get("coord_uv") is None:
                 continue
             rec["_tensor_path"] = str(tensor_path) if tensor_path is not None else None
+            # Extract pano alignment metadata for sidecar validation.
+            ds_label = rec.get("dataset_label", {}) or {}
+            rec["_sidecar_pano_view_id"] = (
+                teacher.get("pano_view_id")
+                or ds_label.get("pano_view_id")
+                or None
+            )
+            pixel_goal = ds_label.get("pano_pixel_goal")
+            rec["_sidecar_pano_pixel_goal"] = (
+                [int(pixel_goal[0]), int(pixel_goal[1])]
+                if pixel_goal and len(pixel_goal) >= 2
+                else None
+            )
             records.append(rec)
     return records
 
@@ -657,33 +674,60 @@ def _latent_loss(
     mse_weight: float,
     norm_weight: float,
     norm_loss_type: str = "log_ratio",
+    front_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    """Latent-space distillation loss, gated to front-view samples only.
+
+    Non-front samples have out-of-distribution teacher latents (the teacher
+    never saw the corresponding image).  ``front_mask`` zeros their contribution
+    so they only receive GT trajectory supervision.
+    """
     pred_f = pred.float()
     target_f = target.float()
     cos = F.cosine_similarity(pred_f.flatten(1), target_f.flatten(1), dim=1)
-    cos_loss = (1.0 - cos).mean()
-    mse_loss = F.mse_loss(pred_f, target_f)
+    cos_loss_per_sample = 1.0 - cos  # [B]
+    mse_loss_per_sample = F.mse_loss(pred_f, target_f, reduction="none").flatten(1).mean(dim=1)  # [B]
     pred_norm = pred_f.norm(dim=-1)
     target_norm = target_f.norm(dim=-1).clamp_min(1.0e-6)
     norm_ratio = pred_norm / target_norm
     if norm_loss_type == "log_ratio":
-        # Symmetric in pred_norm/target_norm vs target_norm/pred_norm and finite at 1.
-        norm_loss = (torch.log(norm_ratio.clamp_min(1.0e-6))) ** 2
-        norm_loss = norm_loss.mean()
+        norm_loss_per_sample = (torch.log(norm_ratio.clamp_min(1.0e-6))) ** 2
+        norm_loss_per_sample = norm_loss_per_sample.mean(dim=-1)  # [B]
     elif norm_loss_type == "ratio":
-        norm_loss = ((norm_ratio - 1.0) ** 2).mean()
+        norm_loss_per_sample = ((norm_ratio - 1.0) ** 2).mean(dim=-1)
     else:
         raise ValueError(f"Unknown norm_loss_type: {norm_loss_type!r}")
+
+    if front_mask is not None:
+        mask = front_mask.to(device=pred_f.device, dtype=torch.float32)
+        denom = mask.sum().clamp_min(1.0)
+        cos_loss = (cos_loss_per_sample * mask).sum() / denom
+        mse_loss = (mse_loss_per_sample * mask).sum() / denom
+        norm_loss = (norm_loss_per_sample * mask).sum() / denom
+        # Diagnostics: aggregate over front-masked subset
+        cos_mean = (cos * mask).sum() / denom
+        pn_mean = (pred_norm.mean(dim=-1) * mask).sum() / denom
+        tn_mean = (target_norm.mean(dim=-1) * mask).sum() / denom
+        nr_mean = (norm_ratio.mean(dim=-1) * mask).sum() / denom
+    else:
+        cos_loss = cos_loss_per_sample.mean()
+        mse_loss = mse_loss_per_sample.mean()
+        norm_loss = norm_loss_per_sample.mean()
+        cos_mean = cos.mean()
+        pn_mean = pred_norm.mean()
+        tn_mean = target_norm.mean()
+        nr_mean = norm_ratio.mean()
+
     loss = cosine_weight * cos_loss + mse_weight * mse_loss + norm_weight * norm_loss
     return loss, {
         "loss": float(loss.detach().item()),
-        "cosine": float(cos.mean().detach().item()),
+        "cosine": float(cos_mean.detach().item()),
         "cos_loss": float(cos_loss.detach().item()),
         "mse_loss": float(mse_loss.detach().item()),
         "norm_loss": float(norm_loss.detach().item()),
-        "pred_norm": float(pred_norm.mean().detach().item()),
-        "target_norm": float(target_norm.mean().detach().item()),
-        "norm_ratio": float(norm_ratio.mean().detach().item()),
+        "pred_norm": float(pn_mean.detach().item()),
+        "target_norm": float(tn_mean.detach().item()),
+        "norm_ratio": float(nr_mean.detach().item()),
     }
 
 
@@ -774,6 +818,18 @@ def _policy_and_gt_losses(
     )
     noisy, timesteps, target_velocity = head.sample_flow_matching_inputs(gt_exp)
 
+    # Build front-view mask in the expanded (per-timestep) space.  Non-front
+    # teacher latents are out-of-distribution so policy distillation is gated.
+    fm = batch.front_mask
+    front_mask_exp: torch.Tensor | None = None
+    if fm is not None and policy_weight > 0:
+        num_frames = gt.shape[1]  # T dimension from [B, T, ...]
+        front_mask_exp = fm.to(device=pred_cond.device, dtype=torch.float32)
+        front_mask_exp = front_mask_exp.unsqueeze(1).expand(-1, num_frames).reshape(-1)
+        # Combine with per-timestep valid mask when both are present.
+        if valid_exp is not None:
+            front_mask_exp = front_mask_exp * valid_exp.float()
+
     policy_loss = pred_cond.sum() * 0.0
     if policy_weight > 0:
         with torch.no_grad():
@@ -789,11 +845,20 @@ def _policy_and_gt_losses(
             timesteps,
             traj_images=images_exp,
         )
-        policy_loss = head.masked_velocity_mse(
-            student_velocity,
-            teacher_velocity.detach(),
-            trajectory_valid=valid_exp,
-        )
+        if front_mask_exp is not None and front_mask_exp.sum() > 0:
+            policy_loss = head.masked_velocity_mse(
+                student_velocity,
+                teacher_velocity.detach(),
+                trajectory_valid=front_mask_exp,
+            )
+        elif front_mask_exp is not None:
+            policy_loss = pred_cond.sum() * 0.0
+        else:
+            policy_loss = head.masked_velocity_mse(
+                student_velocity,
+                teacher_velocity.detach(),
+                trajectory_valid=valid_exp,
+            )
     else:
         student_velocity = None
 
@@ -920,6 +985,23 @@ def _build_batch(
                 f"dataset_index={idx} kind={sample.get('pano_sample_kind')} "
                 f"view={sample.get('pano_view_id')}"
             )
+        # Sidecar alignment: verify the pre-computed pano metadata in the
+        # sidecar record matches what the dataset computes on-the-fly.
+        if teacher_target_mode == "sidecar":
+            sv = rec.get("_sidecar_pano_view_id")
+            sp = rec.get("_sidecar_pano_pixel_goal")
+            if sv is not None and str(sv).lower() != str(sample.get("pano_view_id") or "").lower():
+                raise RuntimeError(
+                    f"Sidecar pano_view_id mismatch at dataset_index={idx}: "
+                    f"sidecar={sv!r} dataset={sample.get('pano_view_id')!r}"
+                )
+            if sp is not None:
+                dp = sample.get("pano_pixel_goal")
+                if dp is None or int(sp[0]) != int(dp[0]) or int(sp[1]) != int(dp[1]):
+                    raise RuntimeError(
+                        f"Sidecar pano_pixel_goal mismatch at dataset_index={idx}: "
+                        f"sidecar={sp} dataset={dp}"
+                    )
         batch_samples.append(sample)
         usable_records.append(rec)
     if not usable_records:
@@ -961,6 +1043,11 @@ def _build_batch(
     trajectory = _collated_tensor(collated, "trajectory", device)
     trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
     traj_images = _collated_tensor(collated, "traj_images", device)
+    # Front-view gate: aligned teacher only saw front images during its
+    # native training.  Non-front pixel goals produce out-of-distribution
+    # teacher latents — those samples receive GT trajectory supervision
+    # only (no latent / policy teacher distillation).
+    front_mask = (view_indices == 0)
     return AdapterTrainBatch(
         student_latents=student_latents,
         teacher_latents=teacher_latents,
@@ -971,6 +1058,7 @@ def _build_batch(
         trajectory_valid=trajectory_valid,
         traj_images=traj_images,
         records=usable_records,
+        front_mask=front_mask,
     )
 
 
@@ -1027,6 +1115,7 @@ def _evaluate_adapter(
                 mse_weight=mse_weight,
                 norm_weight=norm_weight,
                 norm_loss_type=norm_loss_type,
+                front_mask=batch.front_mask,
             )
             policy_loss, policy_metrics = _policy_and_gt_losses(
                 model=model,
@@ -1526,6 +1615,7 @@ def main() -> int:
                     mse_weight=args.mse_weight,
                     norm_weight=args.norm_weight,
                     norm_loss_type=args.norm_loss_type,
+                    front_mask=batch.front_mask,
                 )
                 policy_loss, policy_metrics = _policy_and_gt_losses(
                     model=model,

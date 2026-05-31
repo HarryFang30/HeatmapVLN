@@ -60,6 +60,12 @@ data:
     pano_max_side_dist_m: 6.0
     load_lookdown_for_system2: false
     system2_sft_protocol: direct
+    # pixel_goal_direction is "front" (horizontal front view), NOT "front_down"
+    # (30° lookdown).  The panoramic VLM sees 4 horizontal views (front/right/
+    # back/left); InternNav's native System1 was trained on a single front_down
+    # camera.  These are different coordinate systems — the adapter's job is to
+    # learn the mapping between them.  The NextDiT GT trajectory loss provides
+    # the System1-native supervision signal.
     pixel_goal_direction: front
     require_sft_target: false
     sft_include_turns: false

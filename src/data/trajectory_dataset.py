@@ -29,6 +29,8 @@ from .pano_view_pixel_goal import (
     PANO_HORIZONTAL_VIEWS,
     VIEW_STOP,
     VIEW_TURN,
+    VIEW_TURN_LEFT,
+    VIEW_TURN_RIGHT,
     load_intrinsics,
     resolve_farthest_pano_pixel_goal,
 )
@@ -474,7 +476,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         if pano_kind == "stop" or pano_view_id == VIEW_STOP:
             return True
 
-        if pano_kind == "turn" or pano_view_id == VIEW_TURN:
+        if pano_kind in ("turn", "turn_left", "turn_right") or pano_view_id in (VIEW_TURN, VIEW_TURN_LEFT, VIEW_TURN_RIGHT):
             return bool(self.sft_include_turns)
 
         if result.get("is_stop", 0.0) > 0.5 or int(result.get("discrete_action", 1)) == 0:
@@ -1060,8 +1062,16 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 result["pano_view_id"] = VIEW_STOP
                 result["pano_sample_kind"] = "stop"
             elif turn_actions or int(result.get("discrete_action", 1)) in (2, 3, 5):
-                result["pano_view_id"] = VIEW_TURN
-                result["pano_sample_kind"] = "turn"
+                da = int(result.get("discrete_action", 1))
+                if da == 2:
+                    result["pano_view_id"] = VIEW_TURN_LEFT
+                    result["pano_sample_kind"] = "turn_left"
+                elif da == 3:
+                    result["pano_view_id"] = VIEW_TURN_RIGHT
+                    result["pano_sample_kind"] = "turn_right"
+                else:
+                    result["pano_view_id"] = VIEW_TURN
+                    result["pano_sample_kind"] = "turn"
 
         goal_rel_len = result.get(
             "pixel_goal_relative_len",
