@@ -182,6 +182,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         if self.require_sft_target:
             self._build_sample_index()
+            # Index building fills LRU caches by touching every clip's poses,
+            # chunk arrays, and intrinsics.  Clear them now so fork()-ed
+            # DataLoader workers don't each inherit a full copy — that would
+            # multiply process memory by num_workers × n_gpus (up to ~64×).
+            self._directional_poses_cache.clear()
+            self._poses_cache.clear()
+            self._chunk_array_cache.clear()
+            import src.data.pano_view_pixel_goal as _pvpg
+            _pvpg._intrinsics_cache.clear()
 
         logger.info(
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
@@ -206,10 +215,21 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         if self.require_sft_target:
             self._epoch = epoch
             self._rng = np.random.RandomState(42 + epoch)
-            self._build_sample_index()
-            logger.info(
-                f"[Epoch {epoch}] Resampled {len(self.sample_index)} InternNav-style System2 SFT samples"
-            )
+            # InternNav SFT index is deterministic — same frames every epoch.
+            # Only reshuffle instead of rebuilding all projection computations.
+            if self.sample_index:
+                indices = list(range(len(self.sample_index)))
+                self._rng.shuffle(indices)
+                self.sample_index = [self.sample_index[i] for i in indices]
+                new_range = {
+                    new_idx: self._sample_subsequence_range[old_idx]
+                    for new_idx, old_idx in enumerate(indices)
+                }
+                self._sample_subsequence_range = new_range
+                logger.info(
+                    "[Epoch %d] Reshuffled %d InternNav-style System2 SFT samples "
+                    "(skip rebuild)", epoch, len(self.sample_index),
+                )
             return
         super().set_epoch(epoch)
 
