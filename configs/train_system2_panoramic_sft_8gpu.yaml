@@ -7,24 +7,23 @@ paths:
   internnav_model_path: $INTERNNAV_MODEL_PATH
 
 # ============================================
-# Stage1-S2: panoramic System2 SFT — 8×A800 80GB
+# Stage1-S2: panoramic System2 SFT — 8×MXC500 64GB
 # ============================================
 #
-# Throughput-oriented defaults for 8×A800 80GB:
-#   - Per-GPU batch=8 keeps a large global batch while leaving headroom for
-#     Qwen2.5-VL visual attention peaks on panoramic inputs.
-#   - FlashAttention2 is required on A800.  SDPA on the panoramic multi-image
-#     prompt is memory-heavy and can be an order of magnitude slower.
-#   - Gradient checkpointing stays enabled initially; after FlashAttention2 is
-#     confirmed, try disabling it if memory has enough headroom.
-#   - Worker-side tokenization stays enabled; num_workers=8 keeps the CPU queue warm.
+# Memory-conscious defaults for 8×MXC500 64GB:
+#   - Per-GPU batch=2 + grad_accum=4 keeps effective batch=64 while
+#     fitting inside 64GB.  Panoramic 36-image prompts with LoRA+gc
+#     consume ~25-35GB per sample batch — batch=2 leaves headroom.
+#   - num_history_sample=4 reduces visual tokens (4×4+4=20 images vs
+#     8×4+4=36), roughly halving sequence length and attention memory.
+#   - Gradient checkpointing stays on to keep activation memory in check.
+#   - FlashAttention2 is expected; SDPA on panoramic input is 3-5× heavier.
 #   - Validation off during training (re-enable for final quality checks).
 #
 # Effective global batch ≈ batch_size × n_gpu × grad_accum_steps
-#   default: 8 × 8 × 1 = 64
+#   default: 2 × 8 × 4 = 64
 #
-# If OOM on unusually long prompts: lower batch_size to 6.  If stable and
-# memory remains below ~65GB/card after the first 100 steps, try batch_size=10.
+# If stable and memory stays below ~50GB/card, try batch_size=4, grad_accum=2.
 
 data:
   train_split: train
@@ -38,7 +37,8 @@ data:
 
   trajectory:
     min_history: 5
-    num_history_sample: 8
+    # 64GB cards: 4 history positions keep visual tokens manageable.
+    num_history_sample: 4
     panoramic_vlm_input: true
     load_depth: true
     cache_poses: true
@@ -124,7 +124,7 @@ training:
 optim:
   optimizer: adamw
   learning_rate: 1.0e-4
-  # Global batch 64: sqrt-scaled from 2-gpu baseline (1e-4 × √4 = 2e-4).
+  # Effective batch 64 unchanged (2×8×4): LR stays at 2e-4.
   lora_lr: 2.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
@@ -132,8 +132,9 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.03
   min_lr: 1.0e-6
-  batch_size: 8
-  grad_accum_steps: 1
+  # MXC500 64GB: batch=2 × 8GPUs × grad_accum=4 → effective batch=64
+  batch_size: 2
+  grad_accum_steps: 4
 
 loss:
   heatmap_loss_type: heatmap_vln
