@@ -384,6 +384,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     )
                     if kind is None:
                         continue
+                    if kind == "turn" and not self.sft_include_turns:
+                        continue
                     if self.load_traj_images and kind != "pixel":
                         continue
                     sample_idx = len(self.sample_index)

@@ -62,7 +62,7 @@ data:
     system2_sft_protocol: direct
     pixel_goal_direction: front
     require_sft_target: true
-    sft_include_turns: true
+    sft_include_turns: false
     sft_include_forward: false
     sft_num_future_steps: 4
     system2_sample_step: 4
@@ -110,7 +110,7 @@ training:
       train_history: false
       train_future: false
       train_action: false
-      sft_include_turns: true
+      sft_include_turns: false
       sft_include_forward: false
       strict_trainable_modules: true
       trainable_modules:
