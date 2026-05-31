@@ -50,9 +50,8 @@ STAGE2_ADAPTER_MSE_WEIGHT="${STAGE2_ADAPTER_MSE_WEIGHT:-}"
 STAGE2_ADAPTER_POLICY_WEIGHT="${STAGE2_ADAPTER_POLICY_WEIGHT:-}"
 STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-}"
 
-# Data settings — controlled by the adapter config YAML
-# (data.num_workers, data.prefetch_factor, data.trajectory fields).
-# Override via STAGE2_ADAPTER_CONFIG, not env vars.
+# Dataset behavior is controlled by data.trajectory in the adapter config YAML.
+# This direct record loop intentionally has no DataLoader worker settings.
 STAGE2_ADAPTER_USE_TRAJ_IMAGES="${STAGE2_ADAPTER_USE_TRAJ_IMAGES:-true}"
 
 # Misc

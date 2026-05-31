@@ -1,11 +1,13 @@
 import math
 
+import pytest
 import torch
 
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
 from scripts.training.train_pano_latent_adapter import (
     AdapterTrainBatch,
     _filter_records_with_pano_goals,
+    _load_teacher_latents,
     _policy_and_gt_losses,
     _sample_from_record,
 )
@@ -125,6 +127,88 @@ def test_filter_records_with_pano_goals_is_global_before_ddp_sharding():
     filtered = _filter_records_with_pano_goals(records, dataset=dataset)
 
     assert filtered == [records[0]]
+
+
+def test_filter_records_drops_sidecar_without_pano_metadata():
+    dataset = _FakeDataset()
+    records = [
+        {
+            "dataset_index": 0,
+            "clip_idx": 0,
+            "current_t": 5,
+            "_tensor_path": "unused.pt",
+            "_sidecar_pano_view_id": None,
+            "_sidecar_pano_pixel_goal": None,
+        },
+    ]
+
+    filtered = _filter_records_with_pano_goals(
+        records,
+        dataset=dataset,
+        validate_sidecar_metadata=True,
+    )
+
+    assert filtered == []
+
+
+def test_filter_records_drops_tensor_sidecar_with_wrong_dataset_index(tmp_path):
+    tensor_path = tmp_path / "teacher.pt"
+    torch.save({"dataset_index": 999, "traj_latents_768": torch.ones(1, 4, 6)}, tensor_path)
+    dataset = _FakeDataset()
+    records = [
+        {
+            "dataset_index": 0,
+            "clip_idx": 0,
+            "current_t": 5,
+            "_tensor_path": str(tensor_path),
+            "_sidecar_pano_view_id": "front",
+            "_sidecar_pano_pixel_goal": [128, 128],
+        },
+    ]
+
+    filtered = _filter_records_with_pano_goals(
+        records,
+        dataset=dataset,
+        validate_sidecar_metadata=True,
+    )
+
+    assert filtered == []
+
+
+def test_load_teacher_latents_rejects_tensor_sidecar_with_wrong_dataset_index(tmp_path):
+    tensor_path = tmp_path / "teacher.pt"
+    torch.save({"dataset_index": 999, "traj_latents_768": torch.ones(1, 4, 6)}, tensor_path)
+
+    with pytest.raises(RuntimeError, match="dataset_index mismatch"):
+        _load_teacher_latents(
+            [{"dataset_index": 0, "_tensor_path": str(tensor_path)}],
+            torch.device("cpu"),
+            target_dim=6,
+        )
+
+
+def test_filter_records_accepts_strictly_aligned_sidecar(tmp_path):
+    tensor_path = tmp_path / "teacher.pt"
+    torch.save({"dataset_index": 0, "traj_latents_768": torch.ones(1, 4, 6)}, tensor_path)
+    dataset = _FakeDataset()
+    records = [
+        {
+            "dataset_index": 0,
+            "clip_idx": 0,
+            "current_t": 5,
+            "_tensor_path": str(tensor_path),
+            "_sidecar_pano_view_id": "front",
+            "_sidecar_pano_pixel_goal": [128, 128],
+        },
+    ]
+
+    filtered = _filter_records_with_pano_goals(
+        records,
+        dataset=dataset,
+        validate_sidecar_metadata=True,
+    )
+
+    assert filtered == records
 
 
 class _FakeSystem1Head(torch.nn.Module):

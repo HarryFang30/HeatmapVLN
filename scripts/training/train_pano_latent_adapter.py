@@ -349,6 +349,28 @@ def _resolve_tensor_path(jsonl_path: Path, path_value: str | None) -> Path | Non
     return path
 
 
+def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any]:
+    """Load one tensor sidecar and require it to belong to the JSONL record."""
+    path = rec.get("_tensor_path")
+    expected_idx = rec.get("dataset_index")
+    if not path:
+        raise RuntimeError(f"Missing tensor sidecar for dataset_index={expected_idx}")
+    payload = safe_torch_load(path, map_location="cpu", trust_checkpoint=True)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Tensor sidecar {path} is not a dict payload")
+    payload_idx = payload.get("dataset_index")
+    if payload_idx is None:
+        raise RuntimeError(
+            f"Tensor sidecar {path} has no dataset_index; re-collect the sidecar"
+        )
+    if int(payload_idx) != int(expected_idx):
+        raise RuntimeError(
+            f"Tensor sidecar dataset_index mismatch: path={path} "
+            f"payload={payload_idx} record={expected_idx}"
+        )
+    return payload
+
+
 def _load_teacher_records(
     jsonl_path: Path,
     *,
@@ -571,9 +593,7 @@ def _load_teacher_latents(
     latents = []
     for rec in records:
         path = rec.get("_tensor_path")
-        if not path:
-            raise RuntimeError(f"Missing tensor sidecar for dataset_index={rec.get('dataset_index')}")
-        payload = safe_torch_load(path, map_location="cpu", trust_checkpoint=True)
+        payload = _load_validated_tensor_sidecar_payload(rec)
         latent = None
         if target_dim == 768:
             for key in ("traj_latents_768", "traj_cond_768", "traj_cond"):
@@ -660,6 +680,8 @@ def _filter_records_with_pano_goals(
     skipped = 0
     failed = 0
     mismatched = 0
+    missing_metadata = 0
+    invalid_tensor = 0
     for rec in records:
         idx = rec.get("dataset_index")
         try:
@@ -681,7 +703,15 @@ def _filter_records_with_pano_goals(
         if validate_sidecar_metadata:
             sv = rec.get("_sidecar_pano_view_id")
             sp = rec.get("_sidecar_pano_pixel_goal")
-            if sv is not None and str(sv).lower() != str(sample.get("pano_view_id") or "").lower():
+            if sv is None or sp is None:
+                missing_metadata += 1
+                LOGGER.warning(
+                    "Skip sidecar record dataset_index=%s: missing pano metadata "
+                    "view_id=%r pixel_goal=%r",
+                    idx, sv, sp,
+                )
+                continue
+            if str(sv).lower() != str(sample.get("pano_view_id") or "").lower():
                 mismatched += 1
                 LOGGER.warning(
                     "Skip sidecar record dataset_index=%s: pano_view_id mismatch "
@@ -689,30 +719,41 @@ def _filter_records_with_pano_goals(
                     idx, sv, sample.get("pano_view_id"),
                 )
                 continue
-            if sp is not None:
-                dp = sample.get("pano_pixel_goal")
-                if dp is None or int(sp[0]) != int(dp[0]) or int(sp[1]) != int(dp[1]):
-                    mismatched += 1
-                    LOGGER.warning(
-                        "Skip sidecar record dataset_index=%s: pano_pixel_goal mismatch "
-                        "sidecar=%s dataset=%s",
-                        idx, sp, dp,
-                    )
-                    continue
+            dp = sample.get("pano_pixel_goal")
+            if dp is None or int(sp[0]) != int(dp[0]) or int(sp[1]) != int(dp[1]):
+                mismatched += 1
+                LOGGER.warning(
+                    "Skip sidecar record dataset_index=%s: pano_pixel_goal mismatch "
+                    "sidecar=%s dataset=%s",
+                    idx, sp, dp,
+                )
+                continue
+            try:
+                _load_validated_tensor_sidecar_payload(rec)
+            except Exception as exc:
+                invalid_tensor += 1
+                LOGGER.warning(
+                    "Skip sidecar record dataset_index=%s: invalid tensor sidecar (%r)",
+                    idx, exc,
+                )
+                continue
         filtered.append(rec)
     LOGGER.info(
         "Filtered teacher records for pano pixel goals: "
-        "kept=%d skipped_no_pano_goal=%d failed=%d mismatched=%d",
+        "kept=%d skipped_no_pano_goal=%d failed=%d mismatched=%d "
+        "missing_metadata=%d invalid_tensor=%d",
         len(filtered),
         skipped,
         failed,
         mismatched,
+        missing_metadata,
+        invalid_tensor,
     )
-    if mismatched:
+    if mismatched or missing_metadata or invalid_tensor:
         LOGGER.warning(
-            "%d sidecar records had pano metadata mismatches and were dropped. "
+            "%d sidecar records failed strict alignment validation and were dropped. "
             "Re-collect sidecars if this count is unexpected.",
-            mismatched,
+            mismatched + missing_metadata + invalid_tensor,
         )
     return filtered
 
