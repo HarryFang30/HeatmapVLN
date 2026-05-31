@@ -391,8 +391,8 @@ class NextDiTActionHead(nn.Module):
 
     def _get_sigmas(self, timesteps: torch.Tensor, device, n_dim: int = 3, dtype=torch.float32):
         """Look up sigma values from the scheduler for given timesteps."""
-        sigmas = self.noise_self.noise_scheduler.sigmas.to(device=device, dtype=dtype)
-        schedule_timesteps = self.noise_self.noise_scheduler.timesteps.to(device=device)
+        sigmas = self.noise_scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = self.noise_scheduler.timesteps.to(device=device)
         timesteps = timesteps.to(device)
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
         sigma = sigmas[step_indices].flatten()
@@ -410,8 +410,8 @@ class NextDiTActionHead(nn.Module):
         dtype = gt_trajectory.dtype
         noise = torch.randn_like(gt_trajectory)
         u = torch.rand(size=(bsz,), device="cpu")
-        indices = (u * self.noise_self.noise_scheduler.config.num_train_timesteps).long()
-        timesteps = self.noise_self.noise_scheduler.timesteps[indices].to(device=device)
+        indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
+        timesteps = self.noise_scheduler.timesteps[indices].to(device=device)
         sigmas = self._get_sigmas(timesteps, device, n_dim=gt_trajectory.ndim, dtype=dtype)
         noisy_trajectory = (1 - sigmas) * gt_trajectory + sigmas * noise
         target_velocity = noise - gt_trajectory
@@ -527,8 +527,8 @@ class NextDiTActionHead(nn.Module):
         # IMPORTANT: use the same device as gt_trajectory so that torch.manual_seed
         # controls the GPU RNG state, making timestep sampling deterministic.
         u = torch.rand(size=(bsz,), device=device)
-        indices = (u * self.noise_self.noise_scheduler.config.num_train_timesteps).long().to(device=device)
-        timesteps = self.noise_self.noise_scheduler.timesteps.to(device=device)[indices]
+        indices = (u * self.noise_scheduler.config.num_train_timesteps).long().to(device=device)
+        timesteps = self.noise_scheduler.timesteps.to(device=device)[indices]
         sigmas = self._get_sigmas(timesteps, device, n_dim=gt_trajectory.ndim, dtype=dtype)
 
         # Flow matching interpolation: X_u = (1 - sigma) * X_0 + sigma * epsilon
@@ -596,7 +596,7 @@ class NextDiTActionHead(nn.Module):
         # Reuse the existing noise scheduler to avoid repeated allocations.
         # Reset timesteps for inference (training config is preserved after this call).
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        self.noise_self.noise_scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
+        self.noise_scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
         # Iterative denoising
         for t in self.noise_scheduler.timesteps:
@@ -611,7 +611,7 @@ class NextDiTActionHead(nn.Module):
 
             # Double for CFG
             latent_model_input = latent_features.repeat(2, 1, 1)
-            if hasattr(scheduler, "scale_model_input"):
+            if hasattr(self.noise_scheduler, "scale_model_input"):
                 latent_model_input = self.noise_scheduler.scale_model_input(latent_model_input, t)
 
             noise_pred = self.traj_dit(

@@ -152,7 +152,9 @@ def compute_aligned_teacher_latents_768_batch(
     latents: list[torch.Tensor] = []
     for sample in samples:
         if not has_structured_pano_pixel_goal(sample):
-            continue
+            raise RuntimeError(
+                "Aligned teacher batch contains a sample without a structured pano pixel goal"
+            )
         first_messages, first_images = _build_first_turn(sample, turn_args, rng)
         (
             _assistant_text,

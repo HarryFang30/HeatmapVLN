@@ -210,6 +210,7 @@ class VLNPipeline(nn.Module):
         # ==================== Action Head (NextDiT System 1) ====================
         self.nextdit_action_head = None
         self.latent_queries = None
+        self._internnav_system1_load_audit: dict[str, Any] | None = None
 
         if config.enable_action_head and config.nextdit_enabled:
             from .action import NextDiTActionConfig, NextDiTActionHead
@@ -330,10 +331,12 @@ class VLNPipeline(nn.Module):
 
     def _load_system1_state_dict(self, ckpt_sd: dict[str, torch.Tensor], source: str):
         """Apply remapped System 1 weights to the action head and latent queries."""
+        latent_queries_loaded = False
         if "latent_queries" in ckpt_sd:
             lq = ckpt_sd.pop("latent_queries")
             if self.latent_queries.shape == lq.shape:
                 self.latent_queries.data.copy_(lq)
+                latent_queries_loaded = True
                 logger.info("  Loaded latent_queries %s", tuple(lq.shape))
             else:
                 logger.warning(
@@ -355,6 +358,13 @@ class VLNPipeline(nn.Module):
 
         missing = [k for k in head_sd if k not in ckpt_sd and k != "latent_queries"]
         self.nextdit_action_head.load_state_dict(head_sd, strict=False)
+        self._internnav_system1_load_audit = {
+            "source": source,
+            "latent_queries_loaded": latent_queries_loaded,
+            "loaded_keys": tuple(loaded),
+            "skipped": tuple(skipped),
+            "missing_keys": tuple(missing),
+        }
 
         rgb_loaded = sum(1 for key in loaded if key.startswith("rgb_model."))
         traj_loaded = sum(1 for key in loaded if key.startswith("traj_dit."))

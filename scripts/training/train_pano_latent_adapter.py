@@ -44,6 +44,7 @@ from torch.nn.utils import clip_grad_norm_
 from scripts.training.model_builder import build_model
 from scripts.training.utils import (
     _load_normalized_state_dict,
+    _normalize_state_key,
     load_config,
     safe_torch_load,
 )
@@ -57,6 +58,15 @@ from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
 
 LOGGER = logging.getLogger("pano_latent_adapter")
+REQUIRED_SYSTEM1_PREFIXES = (
+    "cond_projector.",
+    "traj_dit.",
+    "memory_encoder.",
+    "rgb_model.",
+    "rgb_resampler.",
+    "action_encoder.",
+    "action_decoder.",
+)
 
 
 @dataclass
@@ -202,6 +212,67 @@ def _extract_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
     raise KeyError(f"No model_state_dict/trainable_state_dict/state_dict in {path}")
 
 
+def _assert_internnav_system1_loaded(model: Any) -> None:
+    """Require the frozen local System1 port to come entirely from InternNav."""
+    head = getattr(model, "nextdit_action_head", None)
+    audit = getattr(model, "_internnav_system1_load_audit", None)
+    if head is None:
+        raise RuntimeError("Model has no NextDiT action head")
+    if not audit:
+        raise RuntimeError(
+            "InternNav System1 weights were not loaded. Set --internnav-model-path "
+            "to the released InternNav model directory."
+        )
+
+    loaded_keys = set(audit["loaded_keys"])
+    required_keys = {
+        key
+        for key in head.state_dict()
+        if key.startswith(REQUIRED_SYSTEM1_PREFIXES)
+    }
+    missing_keys = sorted(required_keys - loaded_keys)
+    if not audit["latent_queries_loaded"] or missing_keys:
+        missing_preview = ", ".join(missing_keys[:10])
+        raise RuntimeError(
+            "InternNav System1 load is incomplete; refusing to freeze random weights. "
+            f"source={audit['source']} latent_queries_loaded={audit['latent_queries_loaded']} "
+            f"missing_required={len(missing_keys)}"
+            + (f" first_missing=[{missing_preview}]" if missing_preview else "")
+        )
+    LOGGER.info(
+        "Verified complete frozen InternNav System1 load from %s: %d required tensors + latent_queries",
+        audit["source"],
+        len(required_keys),
+    )
+
+
+def _compatible_lora_checkpoint_keys(
+    model: nn.Module,
+    state: dict[str, torch.Tensor],
+) -> list[str]:
+    current_state = {
+        _normalize_state_key(name): value
+        for name, value in model.state_dict().items()
+    }
+    return [
+        name
+        for name, value in state.items()
+        if "lora_" in _normalize_state_key(name)
+        and _normalize_state_key(name) in current_state
+        and current_state[_normalize_state_key(name)].shape == value.shape
+    ]
+
+
+def _lora_checkpoint_state(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        name: value
+        for name, value in state.items()
+        if "lora_" in _normalize_state_key(name)
+    }
+
+
 def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: torch.device):
     if args.internnav_model_path:
         os.environ["INTERNNAV_MODEL_PATH"] = args.internnav_model_path
@@ -220,16 +291,28 @@ def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: t
         raise RuntimeError("Qwen processor is None after _load_model()")
     if model.latent_queries is None:
         raise RuntimeError("Model has no latent_queries; enable NextDiT action head in config")
+    _assert_internnav_system1_loaded(model)
 
-    if args.base_checkpoint:
-        state = _extract_checkpoint_state_dict(args.base_checkpoint)
-        missing, unexpected, loaded = _load_normalized_state_dict(model, state)
-        LOGGER.info(
-            "Loaded base/student checkpoint %s: loaded=%d missing=%d unexpected=%d",
-            args.base_checkpoint,
-            loaded,
-            len(missing),
-            len(unexpected),
+    if not args.base_checkpoint:
+        raise RuntimeError("--base-checkpoint is required for the frozen Stage1-S2 student")
+    state = _extract_checkpoint_state_dict(args.base_checkpoint)
+    compatible_lora_keys = _compatible_lora_checkpoint_keys(model, state)
+    lora_state = _lora_checkpoint_state(state)
+    missing, unexpected, loaded = _load_normalized_state_dict(model, lora_state)
+    LOGGER.info(
+        "Loaded Stage1-S2 LoRA checkpoint %s: checkpoint_tensors=%d lora_tensors=%d "
+        "loaded=%d missing=%d unexpected=%d compatible_lora=%d",
+        args.base_checkpoint,
+        len(state),
+        len(lora_state),
+        loaded,
+        len(missing),
+        len(unexpected),
+        len(compatible_lora_keys),
+    )
+    if loaded == 0:
+        raise RuntimeError(
+            f"Stage1-S2 checkpoint {args.base_checkpoint} loaded zero compatible LoRA tensors"
         )
 
     model.eval()
@@ -295,7 +378,7 @@ def _load_alignment_teacher(args: argparse.Namespace, device: torch.device):
         flash_attn_stub=bool(args.teacher_flash_attn_stub),
         torch_dtype=str(args.teacher_torch_dtype),
         attn_implementation=str(args.teacher_attn_implementation),
-        require_nextdit=False,
+        require_nextdit=True,
     )
     model, processor, _traj_to_actions = _load_teacher(sub, device)
     model.eval()
@@ -395,7 +478,9 @@ def _extract_student_latents(
         sft_protocol=sft_protocol,
         structured_pano_output=True,
     )
-    batch = collator(samples)
+    # The collator clears each sample dict after packing to release large image
+    # references. Keep the originals intact for the aligned teacher pass.
+    batch = collator([{key: value for key, value in sample.items()} for sample in samples])
     pano_inputs = _move_pano_inputs_to_device(batch["pano_inputs"], device)
     histories = batch["history_frames"].to(device)
     current = batch["current_frame"].to(device)
@@ -817,7 +902,7 @@ def _build_batch(
     teacher_model: Any | None = None,
     teacher_processor: Any | None = None,
     teacher_turn_args: Any | None = None,
-) -> AdapterTrainBatch | None:
+) -> AdapterTrainBatch:
     batch_samples: list[dict[str, Any]] = []
     usable_records: list[dict[str, Any]] = []
     for rec in batch_records:
@@ -825,21 +910,20 @@ def _build_batch(
         if (idx < 0 or idx >= len(dataset)) and (
             rec.get("clip_idx") is None or rec.get("current_t") is None
         ):
-            LOGGER.warning("Skip out-of-range dataset_index=%s without clip/frame fallback", idx)
-            continue
+            raise RuntimeError(
+                f"Out-of-range dataset_index={idx} without clip/frame fallback after prefilter"
+            )
         sample = _sample_from_record(dataset, rec)
         if not _has_trainable_pano_goal(sample):
-            LOGGER.warning(
-                "Skip dataset_index=%s without trainable pano pixel goal after prefilter (kind=%s view=%s)",
-                idx,
-                sample.get("pano_sample_kind"),
-                sample.get("pano_view_id"),
+            raise RuntimeError(
+                "Lost trainable pano pixel goal after prefilter: "
+                f"dataset_index={idx} kind={sample.get('pano_sample_kind')} "
+                f"view={sample.get('pano_view_id')}"
             )
-            continue
         batch_samples.append(sample)
         usable_records.append(rec)
     if not usable_records:
-        return None
+        raise RuntimeError("Cannot build an empty adapter batch")
 
     view_indices, goal_pixels, image_hw = _goal_tensors_from_samples(batch_samples, device)
 
@@ -856,13 +940,17 @@ def _build_batch(
     if teacher_target_mode == "aligned":
         if teacher_model is None or teacher_processor is None:
             raise RuntimeError("aligned teacher target mode requires teacher_model/processor")
+        try:
+            teacher_device = next(teacher_model.parameters()).device
+        except StopIteration:
+            teacher_device = device
         teacher_latents = compute_aligned_teacher_latents_768_batch(
             teacher_model,
             teacher_processor,
             batch_samples,
-            device,
+            teacher_device,
             turn_args=teacher_turn_args or make_teacher_turn_args(),
-        )
+        ).to(device)
     else:
         teacher_latents = _load_teacher_latents(
             usable_records,
@@ -926,8 +1014,6 @@ def _evaluate_adapter(
                 teacher_processor=teacher_processor,
                 teacher_turn_args=teacher_turn_args,
             )
-            if batch is None:
-                continue
             pred = adapter(
                 batch.student_latents,
                 batch.view_indices,
@@ -1060,9 +1146,8 @@ def _parse_args_with_config() -> argparse.Namespace:
 
     p = argparse.ArgumentParser(
         description="Train pano-to-InternNav latent adapter (Stage2)",
-        parents=[pre],
     )
-    # Override the pre-parser arguments with full versions
+    # Register full versions after the lightweight config-discovery parse.
     p.add_argument("--student-config", default=student_config,
                    help="Student model config for build_model (default: %(default)s)")
     p.add_argument("--config", default=student_config, dest="student_config_legacy",
@@ -1428,9 +1513,6 @@ def main() -> int:
                     teacher_processor=teacher_processor,
                     teacher_turn_args=teacher_turn_args,
                 )
-                if batch is None:
-                    continue
-
                 pred = train_adapter(
                     batch.student_latents,
                     batch.view_indices,

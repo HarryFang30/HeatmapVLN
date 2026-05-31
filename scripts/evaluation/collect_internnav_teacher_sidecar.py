@@ -777,7 +777,7 @@ def _load_teacher(args: argparse.Namespace, device: torch.device):
 
     system1_type = str(model.get_system1_type()) if hasattr(model, "get_system1_type") else ""
     print(f"[teacher] loaded system1_type={system1_type}", flush=True)
-    if args.require_nextdit and "nextdit" not in system1_type:
+    if args.require_nextdit and "nextdit" not in system1_type.lower():
         raise RuntimeError(
             f"Expected an InternNav NextDiT teacher, got system1_type={system1_type!r}. "
             "Pass --no-require-nextdit if this is intentional."
@@ -879,6 +879,7 @@ def _collect_one(
     first_coord_uv = None
     first_goal_yx = None
     first_actions: list[int] = []
+    pano_teacher_metadata: dict[str, Any] = {}
 
     if args.coord_source == "teacher":
         first_output, first_output_ids, first_inputs, first_prompt_len = _generate_text(
@@ -916,8 +917,8 @@ def _collect_one(
             device,
         )
         mode = "pano_structured_coord"
-        teacher["pano_view_id"] = pano_view_id
-        teacher["structured_assistant_text"] = final_output
+        pano_teacher_metadata["pano_view_id"] = pano_view_id
+        pano_teacher_metadata["structured_assistant_text"] = final_output
     elif args.coord_source == "dataset" and sample.get("pixel_goal") is not None:
         (
             final_output,
@@ -959,6 +960,7 @@ def _collect_one(
         "first_output": first_output,
         "first_actions": _pad_actions(first_actions),
         "prompt_len": prompt_len,
+        **pano_teacher_metadata,
     }
     if second_output is not None:
         teacher["second_output"] = second_output

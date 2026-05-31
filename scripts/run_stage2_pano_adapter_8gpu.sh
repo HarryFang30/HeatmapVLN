@@ -140,7 +140,7 @@ build_adapter_args() {
     args+=(--no-use-traj-images)
   fi
 
-  # Teacher JSONL (required)
+  # Teacher JSONL (optional in aligned mode)
   if [[ -n "${STAGE2_ADAPTER_TEACHER_JSONL:-}" ]]; then
     args+=(--teacher-jsonl "$STAGE2_ADAPTER_TEACHER_JSONL")
   fi

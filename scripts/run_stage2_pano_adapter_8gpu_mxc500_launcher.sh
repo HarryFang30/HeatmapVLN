@@ -17,7 +17,6 @@
 #   - Teacher: InternNav System1（frozen, aligned 模式在线运行）
 #   - Adapter: GeometryAwarePanoToNextDiTAdapter（~3M params，唯一可训练部分）
 #   - 不需要预先收集 teacher sidecar（aligned 模式）
-#   - 需要 teacher JSONL（即使 aligned 模式也需要记录 dataset_index 映射）
 
 set -Eeuo pipefail
 

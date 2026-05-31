@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end sanity check for a trained pano-to-InternNav latent adapter.
+Oracle bridge sanity check for a trained pano-to-InternNav latent adapter.
 
 For each teacher sidecar record this script:
 
@@ -26,9 +26,10 @@ For each teacher sidecar record this script:
      sample_kind) attached, so failure clustering can be inspected without
      re-running ad-hoc scripts.
 
-This answers the real question Stage2 cares about: is the adapter approaching
-the InternNav-on-panoramic-data ceiling (teacher-bound), or is it still
-leaving accuracy on the table (adapter-bound)?
+For geometry-aware adapters this script uses dataset GT pano view/pixel labels
+and teacher-forced structured student text. It measures the bridge ceiling, not
+closed-loop behavior under student-generated coordinates. Use r2r_val_unseen.py
+for end-to-end evaluation.
 """
 
 from __future__ import annotations
@@ -492,7 +493,7 @@ def _fmt(value: Any, spec: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="End-to-end sanity check for pano-to-InternNav adapter")
+    p = argparse.ArgumentParser(description="Oracle bridge sanity check for pano-to-InternNav adapter")
     p.add_argument("--config", default="configs/train_config_internnav_8gpu_stage2_wider.yaml")
     p.add_argument("--root", required=True, help="Panoramic dataset root")
     p.add_argument("--split", default="train")
@@ -560,6 +561,11 @@ def main() -> int:
     if not records:
         raise RuntimeError("No usable teacher records after filtering")
     LOGGER.info("Evaluating on %d records", len(records))
+    LOGGER.warning(
+        "This is an oracle bridge sanity check: geometry-aware adapters receive "
+        "dataset GT view/pixel labels and teacher-forced structured student text. "
+        "Run r2r_val_unseen.py for closed-loop metrics."
+    )
 
     dataset = build_trajectory_dataset(
         cfg,
