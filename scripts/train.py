@@ -545,6 +545,7 @@ def main():
             traj_cfg.get('system2_sft_protocol', 'direct'),
         )
         sft_protocol = str(sft_protocol).lower()
+        max_seq_len = int(llm_cfg.get('max_seq_length', 8192))
         actual_collate_fn = PanoramicTokenizedCollator(
             pano_processor,
             n_traj_query=n_traj_query,
@@ -552,11 +553,12 @@ def main():
             sft_include_turns=stage_cfg.get('sft_include_turns', True),
             sft_include_forward=stage_cfg.get('sft_include_forward', False),
             sft_protocol=sft_protocol,
+            max_seq_length=max_seq_len,
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled "
-            "(n_traj_query=%d, sft_mode=%s, protocol=%s)",
-            n_traj_query, train_lm, sft_protocol,
+            "(n_traj_query=%d, sft_mode=%s, protocol=%s, max_seq_len=%d)",
+            n_traj_query, train_lm, sft_protocol, max_seq_len,
         )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")

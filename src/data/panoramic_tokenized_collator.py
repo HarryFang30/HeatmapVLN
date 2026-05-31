@@ -83,13 +83,18 @@ class PanoramicTokenizedCollator:
         sft_include_forward: bool = False,
         sft_protocol: str = "direct",
         structured_pano_output: bool = True,
+        max_seq_length: int = 8192,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
+        # Truncate from left so oldest history tokens are dropped first,
+        # preserving the current observation and assistant response.
+        self.processor.tokenizer.truncation_side = "left"
         self.n_traj_query = n_traj_query
         self.sft_mode = sft_mode
         self.sft_include_turns = sft_include_turns
         self.sft_include_forward = sft_include_forward
+        self.max_seq_length = max_seq_length
         self.sft_protocol = str(sft_protocol).lower()
         if self.sft_protocol not in {"direct", "internnav"}:
             raise ValueError(f"Unsupported System2 SFT protocol: {sft_protocol}")
@@ -417,6 +422,8 @@ class PanoramicTokenizedCollator:
                 return_dict=True,
                 return_tensors="pt",
                 padding=True,
+                truncation=True,
+                max_length=self.max_seq_length,
             )
             del messages_batch
 

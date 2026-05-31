@@ -11,19 +11,18 @@ paths:
 # ============================================
 #
 # Memory-conscious defaults for 8×MXC500 64GB:
-#   - The logits tensor at the end of Qwen's forward is the VRAM
-#     bottleneck: B×8192×152064.  At batch=4, bf16+fp32 logits
-#     consume ~30 GB alone — OOM on 64 GB cards.
-#   - batch=2 + grad_accum=2 halves the logits peak while keeping
-#     effective batch at 32.
+#   - max_seq_length=8192 now ENFORCED by collator (was declared but
+#     never applied — the root cause of all OOMs).  Normal panorama
+#     samples (~4000-5000 tokens) are unaffected; only abnormally
+#     long sequences (>8192) are truncated from the left (oldest
+#     history dropped first, current observation preserved).
+#   - batch=4 × 8GPUs → effective batch=32.
 #   - num_history_sample=8 gives 36 images/sample (8×4+4).
 #   - Gradient checkpointing + FA2 stay on.
 #   - Validation off during training (re-enable for final quality checks).
 #
 # Effective global batch ≈ batch_size × n_gpu × grad_accum_steps
-#   default: 2 × 8 × 2 = 32
-#
-# If VRAM remains below 50 GB, try batch=3, accum=2.
+#   default: 4 × 8 × 1 = 32
 
 data:
   train_split: train
@@ -131,13 +130,12 @@ optim:
   scheduler: cosine
   warmup_ratio: 0.03
   min_lr: 1.0e-6
-  # MXC500 64GB: batch=2 × 8GPUs × accum=2 → effective batch=32.
-  # OOM root cause: logits.float() at end of Qwen forward allocates
-  # B×seq×vocab×4B (fp32). At seq=8192, batch=4 this is 20 GB alone.
-  # batch=2 halves logits peak (10 GB fp32 + 5 GB bf16 = 15 GB).
-  # If VRAM <50 GB stable, try batch=3, accum=2.
-  batch_size: 2
-  grad_accum_steps: 2
+  # MXC500 64GB: batch=4 × 8GPUs → effective batch=32.
+  # With truncation at seq=6144, logits.fp32 = 4×6144×152064×4B ≈ 15 GB.
+  # Peak VRAM ≈ model(14) + activations(15) + logits(22) ≈ 51 GB.
+  # If OOM still, reduce max_seq_length to 4096.
+  batch_size: 4
+  grad_accum_steps: 1
 
 loss:
   heatmap_loss_type: heatmap_vln

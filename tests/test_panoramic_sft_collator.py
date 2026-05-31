@@ -28,8 +28,10 @@ class _FakeProcessor:
         return_dict=True,
         return_tensors="pt",
         padding=True,
+        truncation=False,
+        max_length=None,
     ):
-        del tokenize, return_dict, return_tensors, padding
+        del tokenize, return_dict, return_tensors, padding, truncation, max_length
         rows = []
         for messages in messages_batch:
             row = []
