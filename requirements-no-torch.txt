@@ -38,6 +38,7 @@ tqdm>=4.67.0
 datasets>=4.0.0
 requests>=2.32.0
 psutil>=6.0.0
+pydantic==2.13.4
 
 # ============================================
 # Training & Logging
