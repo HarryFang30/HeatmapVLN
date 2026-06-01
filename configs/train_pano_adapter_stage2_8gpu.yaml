@@ -135,7 +135,7 @@ adapter:
 
   # Training
   training:
-    epochs: 5
+    epochs: 3
     batch_size: 2
     lr: 1.0e-4
     weight_decay: 0.01
@@ -164,7 +164,7 @@ adapter:
 training:
   stages:
     - name: stage2_pano_adapter
-      epochs: 5
+      epochs: 3
       hm_size: [64, 64]
       train_lm: false
       train_system2_sft: false
