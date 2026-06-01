@@ -636,7 +636,13 @@ def _build_records_from_dataset(
     """
     records: list[dict[str, Any]] = []
     total = len(dataset)
-    for idx in range(total):
+    if _rank0():
+        from tqdm import tqdm as _tqdm
+
+        it = _tqdm(range(total), desc="Building records from dataset", unit="samples")
+    else:
+        it = range(total)
+    for idx in it:
         try:
             sample = dataset[idx]
         except Exception:
