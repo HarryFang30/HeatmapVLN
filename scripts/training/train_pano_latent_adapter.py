@@ -1797,8 +1797,15 @@ def main() -> int:
             if _rank0():
                 LOGGER.info("epoch=%d train metrics=%s", epoch + 1, epoch_metrics)
 
+            is_last_epoch = epoch == args.epochs - 1
+            if _distributed_available() and is_last_epoch:
+                # Validation can exceed NCCL's watchdog timeout. Tear down the
+                # process group before the final rank-0-only validation pass.
+                dist.barrier()
+                _cleanup_distributed()
+
             val_metrics: dict[str, float] | None = None
-            if _rank0() and val_records and epoch == args.epochs - 1:
+            if rank == 0 and val_records and is_last_epoch:
                 val_metrics = _evaluate_adapter(
                     _unwrap_adapter(train_adapter),
                     val_records,
@@ -1821,7 +1828,7 @@ def main() -> int:
                 )
                 LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
 
-            if _rank0():
+            if rank == 0:
                 combined_metrics = dict(epoch_metrics)
                 if val_metrics is not None:
                     for key, value in val_metrics.items():
@@ -1848,7 +1855,7 @@ def main() -> int:
             if _distributed_available():
                 dist.barrier()
 
-        if _rank0():
+        if rank == 0:
             LOGGER.info("Saved adapter to %s", out_dir / "latest.pth")
         return 0
     finally:

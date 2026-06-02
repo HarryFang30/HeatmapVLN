@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 from src.data.pano_teacher_alignment import (
     append_structured_pano_suffix,
@@ -37,3 +38,80 @@ def test_aligned_teacher_batch_rejects_invalid_sample():
             device=torch.device("cpu"),
             turn_args=SimpleNamespace(seed=42),
         )
+
+
+def test_aligned_teacher_batch_keeps_full_context_and_runs_teacher_sequentially(monkeypatch):
+    from scripts.evaluation import collect_internnav_teacher_sidecar as sidecar
+
+    def build_first_turn(sample, _turn_args, _rng):
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": f"Navigate sample {sample['sample_id']}."}],
+            }
+        ]
+        return messages, [object()]
+
+    monkeypatch.setattr(sidecar, "_build_first_turn", build_first_turn)
+
+    class Inputs:
+        def __init__(self, sample_id):
+            self.input_ids = torch.tensor([[101, sample_id, 202]])
+            self.pixel_values = torch.zeros(1)
+            self.image_grid_thw = torch.tensor([[1, 1, 1]])
+
+        def to(self, _device):
+            return self
+
+    class Processor:
+        def apply_chat_template(self, messages, **_kwargs):
+            return " ".join(
+                item["text"]
+                for message in messages
+                for item in message["content"]
+                if item["type"] == "text"
+            )
+
+        def __call__(self, *, text, images, **_kwargs):
+            assert len(text) == 1
+            assert len(images) == 1
+            assert "Navigate sample" in text[0]
+            sample_id = 1 if "sample 1." in text[0] else 2
+            return Inputs(sample_id)
+
+    class Teacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cond_projector = nn.Linear(1, 1, bias=False)
+            nn.init.ones_(self.cond_projector.weight)
+            self.calls = []
+
+        def generate_latents(self, input_ids, _pixel_values, _image_grid_thw):
+            self.calls.append(input_ids.clone())
+            return input_ids[:, -1:].float().unsqueeze(-1)
+
+    teacher = Teacher()
+    samples = [
+        {
+            "sample_id": 1,
+            "pano_sample_kind": "pixel",
+            "pano_view_id": "front",
+            "pano_pixel_goal": [10, 20],
+        },
+        {
+            "sample_id": 2,
+            "pano_sample_kind": "pixel",
+            "pano_view_id": "right",
+            "pano_pixel_goal": [30, 40],
+        },
+    ]
+    latents = compute_aligned_teacher_latents_768_batch(
+        teacher_model=teacher,
+        processor=Processor(),
+        samples=samples,
+        device=torch.device("cpu"),
+        turn_args=SimpleNamespace(seed=42),
+    )
+
+    assert latents.shape == (2, 1, 1)
+    assert [call.tolist() for call in teacher.calls] == [[[101, 1, 202]], [[101, 2, 202]]]
