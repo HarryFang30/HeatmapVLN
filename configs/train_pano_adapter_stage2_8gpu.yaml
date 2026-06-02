@@ -127,7 +127,7 @@ adapter:
   dim: 768
   hidden_dim: 2048
   output_dim: 768
-  num_layers: 1
+  num_layers: 2
   num_heads: 8
   geometry_embed_dim: 64
   horizontal_fov_deg: 90.0
@@ -136,8 +136,8 @@ adapter:
   # Training
   training:
     epochs: 3
-    batch_size: 2
-    lr: 1.0e-4
+    batch_size: 3
+    lr: 1.5e-4
     weight_decay: 0.01
     grad_clip: 1.0
     max_samples: 0
