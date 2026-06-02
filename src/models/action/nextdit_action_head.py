@@ -272,7 +272,8 @@ class NextDiTActionHead(nn.Module):
         """
         B = traj_images.shape[0]
         images_dp = traj_images.permute(0, 1, 4, 2, 3)  # (B, 2, 3, H, W)
-        images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
+        model_dtype = next(self.rgb_model.parameters()).dtype
+        images_dp_norm = ((images_dp.to(dtype=model_dtype) - self._resnet_mean) / self._resnet_std)
 
         with torch.no_grad():
             images_dp_feat = (

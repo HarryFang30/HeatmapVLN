@@ -199,7 +199,7 @@ gpu:
   backend: nccl
   multi_gpu:
     enabled: true
-    find_unused_parameters: true
+    find_unused_parameters: false
 
 log:
   save_every_epochs: 1

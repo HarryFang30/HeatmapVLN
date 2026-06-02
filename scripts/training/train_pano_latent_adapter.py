@@ -1654,10 +1654,10 @@ def main() -> int:
                     adapter,
                     device_ids=[local_rank],
                     output_device=local_rank,
-                    find_unused_parameters=True,
+                    find_unused_parameters=False,
                 )
             else:
-                train_adapter = DistributedDataParallel(adapter, find_unused_parameters=True)
+                train_adapter = DistributedDataParallel(adapter, find_unused_parameters=False)
 
         if _rank0():
             LOGGER.info(
