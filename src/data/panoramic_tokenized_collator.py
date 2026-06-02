@@ -505,15 +505,13 @@ class PanoramicTokenizedCollator:
             )
             del messages_batch
 
-            # Diagnostic only: multimodal truncation is intentionally disabled.
-            # Report over-limit batches so history sizing can be corrected.
+            # Only warn when sequence exceeds max length (truncation is disabled).
             seq_len = int(pano_inputs["input_ids"].shape[1])
             max_sl = self.max_seq_length
-            if self._call_count <= 10 or self._call_count % 100 == 0:
-                logger.info(
-                    "[COLLATOR call=%d] seq_len=%d max_seq_len=%d %s",
+            if seq_len > max_sl:
+                logger.warning(
+                    "[COLLATOR call=%d] seq_len=%d > max_seq_len=%d (OVER_LIMIT; NOT TRUNCATED)",
                     self._call_count, seq_len, max_sl,
-                    "(OVER_LIMIT; NOT TRUNCATED)" if seq_len > max_sl else "",
                 )
 
             if do_log:

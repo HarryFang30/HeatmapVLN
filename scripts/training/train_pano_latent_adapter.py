@@ -52,6 +52,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grad_norm_
+from tqdm import tqdm
 
 from scripts.training.model_builder import build_model
 from scripts.training.utils import (
@@ -1723,6 +1724,14 @@ def main() -> int:
             count = 0
             train_adapter.train()
 
+            num_batches = (len(epoch_records) + args.batch_size - 1) // args.batch_size
+            pbar = tqdm(
+                total=num_batches,
+                desc=f"Epoch {epoch + 1}/{args.epochs}",
+                unit="step",
+                disable=not _rank0(),
+                ncols=140,
+            )
             for start in range(0, len(epoch_records), args.batch_size):
                 batch_records = epoch_records[start:start + args.batch_size]
                 batch = _build_batch(
@@ -1775,8 +1784,18 @@ def main() -> int:
                 for key, value in metrics.items():
                     running[key] = running.get(key, 0.0) + value
 
+                # Update tqdm postfix with running averages.
+                avg = {k: v / max(count, 1) for k, v in running.items()}
+                pbar.set_postfix(
+                    loss=f"{avg.get('loss', 0):.4f}",
+                    cos=f"{avg.get('cosine', 0):.4f}",
+                    mse=f"{avg.get('mse_loss', 0):.5f}",
+                    policy=f"{avg.get('policy_loss', 0):.5f}",
+                    gt=f"{avg.get('gt_loss', 0):.5f}",
+                )
+                pbar.update(1)
+
                 if _rank0() and args.log_interval > 0 and count % args.log_interval == 0:
-                    avg = {k: v / max(count, 1) for k, v in running.items()}
                     LOGGER.info(
                         "epoch=%d local_step=%d global_step=%d loss=%.5f cosine=%.5f mse=%.6f "
                         "policy=%.6f gt=%.6f norm_ratio=%.3f pred_norm=%.3f target_norm=%.3f",
@@ -1792,6 +1811,7 @@ def main() -> int:
                         avg.get("pred_norm", 0.0),
                         avg.get("target_norm", 0.0),
                     )
+            pbar.close()
 
             epoch_metrics = _reduce_metrics(running, count, device)
             if _rank0():
