@@ -1055,7 +1055,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 clip_dir=clip_dir,
                 current_t=current_t,
                 num_frames=T,
-                img_size=img_size,
+                img_size=self.image_size,
             )
             if pano_result is not None:
                 goal_len, view_id, pano_pg, legacy_uv = pano_result

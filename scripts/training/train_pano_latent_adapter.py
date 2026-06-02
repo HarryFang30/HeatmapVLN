@@ -629,31 +629,71 @@ def _build_records_from_dataset(
 ) -> list[dict[str, Any]]:
     """Auto-generate minimal teacher records from dataset for aligned mode.
 
-    Scans every sample in the dataset and emits one record per sample that
-    passes ``_has_trainable_pano_goal``.  No teacher forward is run here —
-    teacher latents come from ``compute_aligned_teacher_latents_768_batch``
-    during training.
+    Uses a fast path that only loads poses + depth + metadata (no RGB images).
+    Each sample's pano pixel goal is re-computed via the same C3 occlusion rule
+    used during dataset building, so there is no drift.  Typically finishes in
+    single-digit minutes even for 100k+ samples.
     """
     records: list[dict[str, Any]] = []
     total = len(dataset)
     if _rank0():
         from tqdm import tqdm as _tqdm
 
-        it = _tqdm(range(total), desc="Building records from dataset", unit="samples")
+        it = _tqdm(range(total), desc="Building records from dataset (fast)", unit="samples")
     else:
         it = range(total)
+
+    # Cache metadata lookups that are shared across samples within the same clip.
+    _clip_meta: dict[int, dict[str, Any]] = {}
+    _clip_dir: dict[int, Any] = {}
+    _clip_img_size: dict[int, tuple[int, int]] = {}
+
     for idx in it:
-        try:
-            sample = dataset[idx]
-        except Exception:
-            continue
-        if not _has_trainable_pano_goal(sample):
-            continue
         clip_idx, current_t = (
             tuple(dataset.sample_index[idx])
             if idx < len(dataset.sample_index)
             else (None, None)
         )
+        if clip_idx is None:
+            continue
+
+        # Lazy-load per-clip metadata.
+        if clip_idx not in _clip_meta:
+            try:
+                _clip_meta[clip_idx] = dataset._load_meta(clip_idx)
+                _clip_dir[clip_idx] = dataset.clips[clip_idx]
+                _clip_img_size[clip_idx] = dataset._load_intrinsics(clip_idx, dataset.clips[clip_idx])[0]
+            except Exception:
+                _clip_meta[clip_idx] = None  # type: ignore[assignment]
+                continue
+        meta = _clip_meta.get(clip_idx)
+        if meta is None:
+            continue
+        clip_dir = _clip_dir[clip_idx]
+        img_size = _clip_img_size[clip_idx]
+        num_frames = int(meta.get("num_frames", 0))
+        if current_t >= num_frames - 1:
+            continue  # last frame → no pixel goal possible
+
+        # Fast pano label computation — no images loaded.
+        try:
+            pano_result = dataset._resolve_farthest_pano_pixel_goal(
+                clip_idx=clip_idx,
+                clip_dir=clip_dir,
+                current_t=current_t,
+                num_frames=num_frames,
+                img_size=img_size,
+            )
+        except Exception:
+            continue
+
+        if pano_result is None:
+            continue
+        # pano_result = (goal_len, view_id, [u, v], legacy_front_uv)
+        _goal_len, view_id, pano_pg, _legacy = pano_result
+        if pano_pg is None:
+            continue
+
         records.append({
             "status": "ok",
             "dataset_index": idx,
