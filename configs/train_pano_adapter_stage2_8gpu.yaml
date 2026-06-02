@@ -13,7 +13,7 @@ seed: 42
 # Train:   Adapter only (~3M params)
 #
 # Effective global batch = batch_size × GPUs × 1 (no accum in adapter training)
-# For MXC500 64GB: batch_size=2 → effective=16 across 8 GPUs.
+# For MXC500 64GB: batch_size=6 → effective=48 across 8 GPUs.
 
 paths:
   dataset_root: /workspace/r2r_panoramic_data
@@ -136,7 +136,7 @@ adapter:
   # Training
   training:
     epochs: 3
-    batch_size: 3
+    batch_size: 6
     lr: 1.5e-4
     weight_decay: 0.01
     grad_clip: 1.0
