@@ -99,6 +99,7 @@ fi
 # 路径默认值（请按你机器上实际位置修改）
 # ---------------------------------------------------------------------------
 export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
+export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/lixiaoou/intern/fjl/InternNav}"
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
 

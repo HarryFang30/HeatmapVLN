@@ -23,6 +23,7 @@ STAGE1_S2_CHECKPOINT_PREFERENCE="${STAGE1_S2_CHECKPOINT_PREFERENCE:-latest}"
 # Paths
 STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-${BASE_CHECKPOINT:-}}"
 STAGE2_ADAPTER_INTERNNAV_MODEL="${STAGE2_ADAPTER_INTERNNAV_MODEL:-$INTERNNAV_MODEL_PATH}"
+STAGE2_ADAPTER_INTERNNAV_REPO="${STAGE2_ADAPTER_INTERNNAV_REPO:-${INTERNNAV_REPO:-~/InternNav}}"
 STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/root/autodl-tmp/vln_pano_adapter_outputs}"
 # Adapter training iterates records directly (no DataLoader).  num_workers /
 # prefetch_factor from the config YAML do not affect this script's path,
@@ -93,6 +94,7 @@ build_adapter_args() {
     --root "$STAGE2_ADAPTER_DATA_ROOT"
     --base-checkpoint "$STAGE2_ADAPTER_LOAD_WEIGHTS"
     --internnav-model-path "$STAGE2_ADAPTER_INTERNNAV_MODEL"
+    --internnav-repo "$STAGE2_ADAPTER_INTERNNAV_REPO"
     --output-dir "$STAGE2_ADAPTER_OUT_DIR"
     --seed "$STAGE2_ADAPTER_SEED"
     --log-interval "$STAGE2_ADAPTER_LOG_INTERVAL"
