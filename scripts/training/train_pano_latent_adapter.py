@@ -1798,7 +1798,7 @@ def main() -> int:
                 LOGGER.info("epoch=%d train metrics=%s", epoch + 1, epoch_metrics)
 
             val_metrics: dict[str, float] | None = None
-            if _rank0() and val_records:
+            if _rank0() and val_records and epoch == args.epochs - 1:
                 val_metrics = _evaluate_adapter(
                     _unwrap_adapter(train_adapter),
                     val_records,
