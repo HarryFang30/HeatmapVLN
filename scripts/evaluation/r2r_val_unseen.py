@@ -1078,6 +1078,31 @@ def _yaw_quaternion(angle_rad: float):
     return np.quaternion(np.cos(half), 0.0, np.sin(half), 0.0)
 
 
+def _quat_to_heading_deg(rot_xyzw: np.ndarray) -> float:
+    """Convert Habitat quaternion [x,y,z,w] to compass heading in degrees.
+
+    Habitat convention: Y-up, agent faces -Z in its local frame.
+    Heading is the angle of the agent's forward vector (-Z) projected
+    onto the XZ ground plane, measured from +Z (north) clockwise:
+    heading = arctan2(forward_x, forward_z).
+    """
+    q = np.quaternion(float(rot_xyzw[3]), float(rot_xyzw[0]),
+                      float(rot_xyzw[1]), float(rot_xyzw[2]))
+    rot_mat = quaternion.as_rotation_matrix(q)
+    forward = rot_mat @ np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    heading_rad = np.arctan2(float(forward[0]), float(forward[2]))
+    return float(np.degrees(heading_rad) % 360)
+
+
+_ACTION_NAMES: dict[int, str] = {
+    0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT", 4: "LOOKUP", 5: "LOOKDOWN",
+}
+
+
+def _action_name(action: int) -> str:
+    return _ACTION_NAMES.get(int(action), str(action))
+
+
 def capture_panoramic_views(
     env, image_size: tuple = (256, 256),
 ) -> dict[str, Image.Image]:
@@ -1348,6 +1373,128 @@ def _maybe_save_debug_images(
     debug_dir.mkdir(parents=True, exist_ok=True)
     for name, image in images.items():
         image.save(debug_dir / f"{call_idx:04d}_{phase}_{name}.jpg")
+
+
+# ── Trajectory Step Recorder (for offline HTML visualisation) ──────────
+
+class TrajectoryStepRecorder:
+    """Save per-step agent state, VLM outputs, and panorama images to disk.
+
+    Produces a ``trajectory_steps.json`` alongside per-step JPEG images in a
+    subdirectory named ``<scene_id>_<episode_id:04d>``.  The companion script
+    ``scripts/visualization/generate_trajectory_html.py`` reads this output
+    and renders a self-contained HTML inspection page.
+    """
+
+    def __init__(self, output_dir: Path, scene_id: str, episode_id: int) -> None:
+        self._out = Path(output_dir) / f"{scene_id}_{int(episode_id):04d}"
+        self._out.mkdir(parents=True, exist_ok=True)
+        self._meta: dict[str, Any] = {}
+        self._steps: list[dict[str, Any]] = []
+        self._prev_dist: float | None = None
+
+    def set_metadata(
+        self,
+        *,
+        instruction: str,
+        start_pos: list[float],
+        start_rot: list[float],
+        goal_pos: list[float],
+        gt_path: list[list[float]],
+    ) -> None:
+        self._meta = {
+            "scene_id": "",
+            "episode_id": -1,
+            "instruction": instruction,
+            "start_position": list(start_pos),
+            "start_heading_deg": _quat_to_heading_deg(np.array(start_rot)),
+            "goal_position": list(goal_pos),
+            "gt_reference_path": [[float(v) for v in p] for p in gt_path],
+        }
+
+    def record_step(self, data: dict[str, Any]) -> None:
+        step: dict[str, Any] = {
+            "step_id": int(data.get("step_id", len(self._steps))),
+            "phase": str(data.get("phase", "unknown")),
+            "position": [float(v) for v in data["position"]],
+            "heading_deg": float(data.get("heading_deg", 0.0)),
+            "rotation": [float(v) for v in data.get("rotation", [0, 0, 0, 1])],
+            "distance_to_goal": float(data["distance_to_goal"])
+            if data.get("distance_to_goal") is not None
+            else None,
+        }
+
+        cur_dist = step["distance_to_goal"]
+        delta: float | None = None
+        if self._prev_dist is not None and cur_dist is not None:
+            delta = cur_dist - self._prev_dist  # positive = moving away
+        self._prev_dist = cur_dist
+        step["delta_dist"] = delta
+
+        # Text / prediction fields (only for VLM steps).
+        for key in ("vlm_output", "pano_goal_view"):
+            val = data.get(key)
+            step[key] = str(val) if val is not None else None
+        pg = data.get("pixel_goal")
+        step["pixel_goal"] = [int(pg[0]), int(pg[1])] if pg and len(pg) >= 2 else None
+        for num_key in ("traj_hs_total_norm",):
+            val = data.get(num_key)
+            step[num_key] = float(val) if val is not None else None
+        per_q = data.get("traj_hs_per_query")
+        step["traj_hs_per_query"] = (
+            [float(v) for v in per_q] if per_q is not None else None
+        )
+
+        # Action fields.
+        step["executed_action"] = (
+            int(data["executed_action"])
+            if data.get("executed_action") is not None
+            else None
+        )
+        step["executed_action_name"] = (
+            _action_name(data["executed_action"])
+            if data.get("executed_action") is not None
+            else None
+        )
+
+        # Save panorama images as JPEG files.
+        panorama: dict[str, str] = {}
+        current_views = data.get("current_views")
+        if isinstance(current_views, dict):
+            for view_name in ("front", "right", "back", "left"):
+                img = current_views.get(view_name)
+                if isinstance(img, Image.Image):
+                    fname = f"step_{len(self._steps):04d}_{view_name}.jpg"
+                    # Downsize for storage efficiency.
+                    thumb = img.copy()
+                    thumb.thumbnail((256, 256))
+                    thumb.save(self._out / fname, "JPEG", quality=65)
+                    panorama[view_name] = fname
+        step["panorama"] = panorama
+
+        self._steps.append(step)
+
+    def finalize(
+        self,
+        *,
+        scene_id: str,
+        episode_id: int,
+        success: float,
+        spl: float,
+        total_steps: int,
+        vlm_calls: int = 0,
+        traj_calls: int = 0,
+    ) -> None:
+        self._meta["scene_id"] = str(scene_id)
+        self._meta["episode_id"] = int(episode_id)
+        self._meta["success"] = bool(success)
+        self._meta["spl"] = float(spl)
+        self._meta["total_steps"] = int(total_steps)
+        self._meta["vlm_calls"] = int(vlm_calls)
+        self._meta["trajectory_calls"] = int(traj_calls)
+        payload: dict[str, Any] = {"metadata": self._meta, "steps": self._steps}
+        with (self._out / "trajectory_steps.json").open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def _maybe_stop_at_success(env, args, step_id: int):
@@ -1923,6 +2070,25 @@ def _run_eval_panoramic_vlm(
         step_id = 0
         done = False
 
+        step_recorder: TrajectoryStepRecorder | None = None
+        if args.save_trajectory_steps:
+            step_recorder = TrajectoryStepRecorder(
+                Path(output_path), scene_id, episode_id,
+            )
+            init_state = env._sim.get_agent(0).get_state()
+            init_pos = np.array(init_state.position, dtype=float)
+            init_rot = quaternion.as_float_array(init_state.rotation)
+            goal_pos = np.array(episode.goals[0].position, dtype=float)
+            gt_ref = getattr(episode, "reference_path", None)
+            gt_path = [list(p) for p in gt_ref] if gt_ref is not None else [list(goal_pos)]
+            step_recorder.set_metadata(
+                instruction=instruction,
+                start_pos=init_pos.tolist(),
+                start_rot=init_rot.tolist(),
+                goal_pos=goal_pos.tolist(),
+                gt_path=gt_path,
+            )
+
         while (not done) and (step_id <= max_steps_per_episode):
             sys.stdout.flush()
             turn_lookdown_img: Image.Image | None = None
@@ -1962,6 +2128,24 @@ def _run_eval_panoramic_vlm(
                     continue
 
                 before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
+                if step_recorder is not None:
+                    state = env._sim.get_agent(0).get_state()
+                    pos = np.array(state.position, dtype=float)
+                    rot = quaternion.as_float_array(state.rotation)
+                    views_for_record = (
+                        executed_history_panoramas[-1]
+                        if executed_history_panoramas else None
+                    )
+                    step_recorder.record_step({
+                        "step_id": step_id,
+                        "phase": "local_action",
+                        "position": pos,
+                        "heading_deg": _quat_to_heading_deg(rot),
+                        "rotation": rot,
+                        "distance_to_goal": _metric_distance_to_goal(env),
+                        "executed_action": int(action),
+                        "current_views": views_for_record,
+                    })
                 observations, done = _apply_habitat_action(env, action)
                 if before is not None:
                     print(
@@ -2136,12 +2320,51 @@ def _run_eval_panoramic_vlm(
             turn_dir = _vlm_requests_turn(llm_output)
             if turn_dir is not None:
                 action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
+                if step_recorder is not None:
+                    state = env._sim.get_agent(0).get_state()
+                    pos = np.array(state.position, dtype=float)
+                    rot = quaternion.as_float_array(state.rotation)
+                    views = (
+                        executed_history_panoramas[-1]
+                        if executed_history_panoramas else None
+                    )
+                    step_recorder.record_step({
+                        "step_id": step_id,
+                        "phase": "turn",
+                        "position": pos,
+                        "heading_deg": _quat_to_heading_deg(rot),
+                        "rotation": rot,
+                        "distance_to_goal": _metric_distance_to_goal(env),
+                        "vlm_output": llm_output,
+                        "executed_action": int(action),
+                        "current_views": views,
+                    })
                 observations, done = _apply_habitat_action(env, action)
                 step_id += 1
                 continue
 
             pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
             pano_goal_view = _parse_pano_view_id(llm_output) or "front"
+
+            if step_recorder is not None:
+                state = env._sim.get_agent(0).get_state()
+                pos = np.array(state.position, dtype=float)
+                rot = quaternion.as_float_array(state.rotation)
+                views_for_record = None
+                if executed_history_panoramas:
+                    views_for_record = executed_history_panoramas[-1]
+                step_recorder.record_step({
+                    "step_id": step_id,
+                    "phase": "vlm",
+                    "position": pos,
+                    "heading_deg": _quat_to_heading_deg(rot),
+                    "rotation": rot,
+                    "distance_to_goal": _metric_distance_to_goal(env),
+                    "vlm_output": llm_output,
+                    "pixel_goal": pixel_goal,
+                    "pano_goal_view": pano_goal_view,
+                    "current_views": views_for_record,
+                })
 
             # === Force-teacher full-drive (--force_teacher_coord) ============
             #
@@ -2356,6 +2579,18 @@ def _run_eval_panoramic_vlm(
                             f"per_query={_per_q}",
                             flush=True,
                         )
+                    if step_recorder is not None and _last_traj_hs is not None:
+                        try:
+                            ths = _last_traj_hs.detach()
+                            step_recorder._steps[-1]["traj_hs_total_norm"] = (
+                                float(ths.float().norm().item())
+                            )
+                            step_recorder._steps[-1]["traj_hs_per_query"] = [
+                                float(ths[0, i].float().norm().item())
+                                for i in range(ths.shape[1])
+                            ]
+                        except Exception:
+                            pass
                     if pano_latent_adapter is not None:
                         _last_traj_hs = _maybe_apply_pano_latent_adapter(
                             _last_traj_hs,
@@ -2466,6 +2701,17 @@ def _run_eval_panoramic_vlm(
         spls.append(metrics["spl"])
         oss.append(metrics["oracle_success"])
         nes.append(metrics["distance_to_goal"])
+
+        if step_recorder is not None:
+            step_recorder.finalize(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                success=metrics["success"],
+                spl=metrics["spl"],
+                total_steps=step_id,
+                vlm_calls=system2_calls,
+                traj_calls=trajectory_calls,
+            )
 
         print(
             f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
@@ -3170,6 +3416,14 @@ def main():
                         help="Resume from output_path/progress.json")
     parser.add_argument("--overwrite_output", action="store_true",
                         help="Delete output_path/progress.json and result.json before evaluating")
+    parser.add_argument(
+        "--save_trajectory_steps", action="store_true", default=False,
+        help=(
+            "Record per-step agent state, VLM outputs, panorama images into "
+            "output_path/<scene>_<ep>/trajectory_steps.json for offline HTML "
+            "visualization via scripts/visualization/generate_trajectory_html.py."
+        ),
+    )
     args = parser.parse_args()
     _preflight_checkpoint_args(args)
     _resolve_eval_paths(args)
