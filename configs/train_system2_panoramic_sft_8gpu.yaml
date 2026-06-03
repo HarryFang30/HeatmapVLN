@@ -52,7 +52,7 @@ data:
     pano_max_side_dist_m: 6.0
     load_lookdown_for_system2: false
     system2_sft_protocol: direct
-    structured_pano_output: false
+    structured_pano_output: true
     pixel_goal_direction: front
     require_sft_target: true
     sft_include_turns: false

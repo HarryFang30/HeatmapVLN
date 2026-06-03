@@ -1853,7 +1853,7 @@ def _run_eval_panoramic_vlm(
     max_steps_per_episode = args.max_steps_per_episode
     internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
     structured_pano_output = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("structured_pano_output", False)
+        train_cfg.get("data", {}).get("trajectory", {}).get("structured_pano_output", True)
     )
     system1_coord_order = _system1_coord_order(
         args,

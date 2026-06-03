@@ -197,6 +197,12 @@ def vlm_output_requests_turn(text: str) -> str | None:
     parsed = parse_structured_pano_output(text, image_size=None)
     if parsed.kind == "turn":
         return parsed.turn_direction  # may be None for ambiguous "view: turn"
+    # Legacy fallback: VLM outputs unicode arrows when sft_include_turns=False.
+    stripped = (text or "").strip()
+    if stripped and all(c in "←" for c in stripped):
+        return "left"
+    if stripped and all(c in "→" for c in stripped):
+        return "right"
     return None
 
 
