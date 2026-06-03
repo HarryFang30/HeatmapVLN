@@ -45,15 +45,8 @@ STAGE2_ADAPTER_TEACHER_DTYPE="${STAGE2_ADAPTER_TEACHER_DTYPE:-bfloat16}"
 STAGE2_ADAPTER_TEACHER_ATTN="${STAGE2_ADAPTER_TEACHER_ATTN:-sdpa}"
 STAGE2_ADAPTER_REQUIRE_FLASH_ATTN="${STAGE2_ADAPTER_REQUIRE_FLASH_ATTN:-1}"
 
-# Loss weights
-STAGE2_ADAPTER_COSINE_WEIGHT="${STAGE2_ADAPTER_COSINE_WEIGHT:-}"
-STAGE2_ADAPTER_MSE_WEIGHT="${STAGE2_ADAPTER_MSE_WEIGHT:-}"
-STAGE2_ADAPTER_POLICY_WEIGHT="${STAGE2_ADAPTER_POLICY_WEIGHT:-}"
-STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-}"
-
 # Dataset behavior is controlled by data.trajectory in the adapter config YAML.
 # This direct record loop intentionally has no DataLoader worker settings.
-STAGE2_ADAPTER_USE_TRAJ_IMAGES="${STAGE2_ADAPTER_USE_TRAJ_IMAGES:-true}"
 
 # Misc
 STAGE2_ADAPTER_SEED="${STAGE2_ADAPTER_SEED:-42}"
@@ -119,27 +112,8 @@ build_adapter_args() {
   if [[ -n "${STAGE2_ADAPTER_GRAD_CLIP:-}" ]]; then
     args+=(--grad-clip "$STAGE2_ADAPTER_GRAD_CLIP")
   fi
-  if [[ -n "${STAGE2_ADAPTER_COSINE_WEIGHT:-}" ]]; then
-    args+=(--cosine-weight "$STAGE2_ADAPTER_COSINE_WEIGHT")
-  fi
-  if [[ -n "${STAGE2_ADAPTER_MSE_WEIGHT:-}" ]]; then
-    args+=(--mse-weight "$STAGE2_ADAPTER_MSE_WEIGHT")
-  fi
-  if [[ -n "${STAGE2_ADAPTER_POLICY_WEIGHT:-}" ]]; then
-    args+=(--policy-weight "$STAGE2_ADAPTER_POLICY_WEIGHT")
-  fi
-  if [[ -n "${STAGE2_ADAPTER_GT_WEIGHT:-}" ]]; then
-    args+=(--gt-weight "$STAGE2_ADAPTER_GT_WEIGHT")
-  fi
   if [[ -n "${STAGE2_ADAPTER_MAX_SAMPLES:-}" && "${STAGE2_ADAPTER_MAX_SAMPLES}" -gt 0 ]]; then
     args+=(--max-samples "$STAGE2_ADAPTER_MAX_SAMPLES")
-  fi
-
-  # use_traj_images
-  if is_truthy "${STAGE2_ADAPTER_USE_TRAJ_IMAGES:-true}"; then
-    args+=(--use-traj-images)
-  else
-    args+=(--no-use-traj-images)
   fi
 
   # Teacher JSONL (optional in aligned mode)

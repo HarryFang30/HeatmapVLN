@@ -141,6 +141,5 @@ export STAGE2_ADAPTER_REQUIRE_FLASH_ATTN="${STAGE2_ADAPTER_REQUIRE_FLASH_ATTN:-1
 
 # Data — controlled by adapter config YAML. Override via
 # STAGE2_ADAPTER_CONFIG=my_config.yaml, not env vars.
-export STAGE2_ADAPTER_USE_TRAJ_IMAGES="${STAGE2_ADAPTER_USE_TRAJ_IMAGES:-true}"
 
 bash scripts/run_stage2_pano_adapter_8gpu.sh 2>&1 | tee "$LOG_FILE"
