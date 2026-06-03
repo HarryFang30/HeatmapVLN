@@ -2448,6 +2448,15 @@ def _run_eval_panoramic_vlm(
                     continue
                 observations, done = _apply_habitat_action(env, action)
                 step_id += 1
+            elif not (llm_output or "").strip():
+                # VLM generated blank/empty output — fall back to a turn
+                # instead of immediately stopping the episode.
+                print(
+                    "  [warn] VLM output empty; falling back to LEFT turn",
+                    flush=True,
+                )
+                observations, done = _apply_habitat_action(env, ActionCode.LEFT)
+                step_id += 1
             else:
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 step_id += 1
