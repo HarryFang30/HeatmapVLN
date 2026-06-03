@@ -109,8 +109,26 @@ def _load_adapter_from_checkpoint(
     saved_args = ckpt.get("args", {}) or {}
     adapter_type = ckpt.get("adapter_type", "")
 
-    if adapter_type == "pano_latent_space":
-        # PanoLatentSpaceAdapter (simple MLP, 3584→2048→3584)
+    # Primary detection: explicit adapter_type field (c9f2e79+).
+    # Fallback: state-dict heuristics for checkpoints saved before the field existed.
+    _is_pano_latent_space = (
+        adapter_type == "pano_latent_space"
+        or (
+            not adapter_type
+            and "mlp.0.weight" in state_dict
+            and "mlp.3.weight" in state_dict
+            and "student_proj.weight" not in state_dict
+            and "output_queries" not in state_dict
+        )
+    )
+
+    if _is_pano_latent_space:
+        if not adapter_type:
+            LOGGER.warning(
+                "Checkpoint %s lacks adapter_type; detected PanoLatentSpaceAdapter "
+                "from state-dict keys. Re-save to avoid heuristic detection.",
+                path,
+            )
         dim = int(state_dict["mlp.0.weight"].shape[1])
         hidden_dim = int(state_dict["mlp.0.weight"].shape[0])
         adapter = PanoLatentSpaceAdapter(
