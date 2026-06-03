@@ -2,12 +2,14 @@
 
 from .pano_latent_adapter import (
     GeometryAwarePanoToNextDiTAdapter,
+    PanoLatentSpaceAdapter,
     VIEW_ID_TO_INDEX,
     view_ids_to_indices,
 )
 
 __all__ = [
     "GeometryAwarePanoToNextDiTAdapter",
+    "PanoLatentSpaceAdapter",
     "VIEW_ID_TO_INDEX",
     "view_ids_to_indices",
 ]

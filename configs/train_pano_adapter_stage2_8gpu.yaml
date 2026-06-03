@@ -123,37 +123,27 @@ model:
 # Adapter-specific settings (loaded by train_pano_latent_adapter.py)
 # ------------------------------------------------------------------
 adapter:
-  # Architecture (geometry_aware decoder transformer)
-  architecture: geometry_aware
-  dim: 768
+  # Architecture: PanoLatentSpaceAdapter — simple 2-layer residual MLP
+  #   traj_hs (3584) → Linear→GELU→Dropout→Linear + residual → (3584)
+  #   → cond_projector (frozen) → 768 → NextDiT
+  architecture: mlp_latent_space
   hidden_dim: 2048
-  output_dim: 768
-  num_layers: 2
-  num_heads: 8
-  geometry_embed_dim: 64
-  horizontal_fov_deg: 90.0
   dropout: 0.0
 
   # Training
   training:
-    epochs: 3
-    batch_size: 6
-    lr: 1.5e-4
+    epochs: 5
+    batch_size: 8
+    lr: 3.0e-4
     weight_decay: 0.01
     grad_clip: 1.0
     max_samples: 0
-    use_traj_images: true
     index_mode: generic
     val_ratio: 0.1
 
-  # Loss weights
+  # Loss: pure MSE between adapter output and teacher raw traj_latents (3584-dim).
   loss:
-    cosine_weight: 0.1
     mse_weight: 1.0
-    policy_weight: 1.0
-    gt_weight: 1.0
-    norm_weight: 0.0
-    norm_loss_type: log_ratio
 
   # Teacher
   teacher:

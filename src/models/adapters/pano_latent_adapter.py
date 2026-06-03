@@ -42,6 +42,56 @@ def view_ids_to_indices(
     return torch.tensor(indices, dtype=torch.long, device=device)
 
 
+class PanoLatentSpaceAdapter(nn.Module):
+    """Simple MLP that maps student VLM traj_hidden_states into teacher latent space.
+
+    The adapter sits **before** ``cond_projector``::
+
+        traj_hs (B, Q, 3584) → MLP → adapted_hs (B, Q, 3584)
+            → cond_projector (frozen) → 768 → NextDiT
+
+    This preserves InternNav's pre-trained cond_projector knowledge and only
+    learns the student→teacher latent-space translation (pure style transfer).
+    No geometry, no cross-attention — just a 2-layer MLP with residual.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim: int = 3584,
+        hidden_dim: int = 2048,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.hidden_dim = int(hidden_dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim, self.dim),
+        )
+        # Small init so the adapter starts close to identity.
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, student_latents: torch.Tensor) -> torch.Tensor:
+        """Return adapted latents with the same shape as the input."""
+        if student_latents.ndim != 3:
+            raise ValueError(
+                f"student_latents must be [B,Q,D], got {tuple(student_latents.shape)}"
+            )
+        if student_latents.shape[-1] != self.dim:
+            raise ValueError(
+                f"Expected dim={self.dim}, got {student_latents.shape[-1]}"
+            )
+        adapter_dtype = next(self.mlp[0].parameters()).dtype
+        residual = student_latents.to(dtype=adapter_dtype)
+        out = self.mlp(residual) + residual  # residual connection
+        return out
+
+
 class GeometryAwarePanoToNextDiTAdapter(nn.Module):
     """Decoder-style translator from pano student latents to NextDiT latents.
 

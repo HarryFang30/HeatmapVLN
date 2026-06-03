@@ -138,6 +138,51 @@ def make_teacher_turn_args(seed: int = 42) -> Any:
 
 
 @torch.no_grad()
+def compute_aligned_teacher_latents_3584_batch(
+    teacher_model: Any,
+    processor: Any,
+    samples: list[dict[str, Any]],
+    device: torch.device,
+    *,
+    turn_args: Any,
+) -> torch.Tensor:
+    """Extract aligned teacher **raw** latents (3584-dim, before cond_projector).
+
+    Same as ``compute_aligned_teacher_latents_768_batch`` but returns the
+    VLM hidden-state latents instead of cond_projector projections.
+    Used as training targets for ``PanoLatentSpaceAdapter``.
+    """
+    from scripts.evaluation.collect_internnav_teacher_sidecar import (
+        _build_first_turn,
+        _normalize_image_grid_thw,
+    )
+
+    rng = random.Random(int(getattr(turn_args, "seed", 42)))
+    if not samples:
+        raise RuntimeError("Empty teacher batch")
+
+    latents: list[torch.Tensor] = []
+    for sample in samples:
+        if not has_structured_pano_pixel_goal(sample):
+            raise RuntimeError(
+                "Aligned teacher batch contains a sample without a structured pano pixel goal"
+            )
+        first_messages, first_images = _build_first_turn(sample, turn_args, rng)
+        _, output_ids, inputs, _, _, _, _ = condition_on_pano_coord(
+            processor, first_messages, first_images, sample, device,
+        )
+        pixel_values = inputs.pixel_values
+        image_grid_thw = _normalize_image_grid_thw(inputs)
+        traj_latents = teacher_model.generate_latents(
+            output_ids, pixel_values, image_grid_thw,
+        )
+        if traj_latents.dim() == 3 and traj_latents.shape[0] == 1:
+            traj_latents = traj_latents.squeeze(0)
+        latents.append(traj_latents)
+    return torch.stack(latents, dim=0).to(device)
+
+
+@torch.no_grad()
 def compute_aligned_teacher_latents_768_batch(
     teacher_model: Any,
     processor: Any,

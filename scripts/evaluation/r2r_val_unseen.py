@@ -271,19 +271,23 @@ def _maybe_apply_pano_latent_adapter(
     view_id: str | None = None,
     pixel_goal: list[int] | None = None,
     image_size: tuple[int, int] | None = None,
+    cond_projector: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """Project ``traj_hs`` through the optional adapter, preserving dtype.
 
-    The adapter is trained in fp32 but Stage-2 inference often runs in
-    bfloat16/fp16; we cast in and back to keep NextDiT inputs identical to
-    the un-adapted path when the adapter is absent.
+    - ``GeometryAwarePanoToNextDiTAdapter``: geometry-aware → 768, bypasses
+      cond_projector (legacy).
+    - ``PanoLatentSpaceAdapter``: simple MLP → 3584, then routed through
+      ``cond_projector`` to 768.
     """
     if adapter is None:
         return traj_hs
     orig_dtype = traj_hs.dtype
     adapter_param = next(adapter.parameters(), None)
     adapter_dtype = adapter_param.dtype if adapter_param is not None else orig_dtype
+
     if hasattr(adapter, "geometry_token"):
+        # Legacy geometry-aware adapter — bypasses cond_projector.
         from src.models.adapters import view_ids_to_indices
 
         if pixel_goal is None:
@@ -297,21 +301,22 @@ def _maybe_apply_pano_latent_adapter(
         view_indices = view_ids_to_indices([goal_view], device=traj_hs.device)
         pixel_xy = torch.tensor(
             [[int(pixel_goal[0]), int(pixel_goal[1])]],
-            device=traj_hs.device,
-            dtype=adapter_dtype,
+            device=traj_hs.device, dtype=adapter_dtype,
         )
         image_hw = torch.tensor(
             [[height, width]],
-            device=traj_hs.device,
-            dtype=adapter_dtype,
+            device=traj_hs.device, dtype=adapter_dtype,
         )
-        out = adapter(
-            traj_hs.to(dtype=adapter_dtype),
-            view_indices,
-            pixel_xy,
-            image_hw,
-        )
+        out = adapter(traj_hs.to(dtype=adapter_dtype), view_indices, pixel_xy, image_hw)
         return out.to(dtype=orig_dtype)
+
+    if hasattr(adapter, "mlp"):
+        # PanoLatentSpaceAdapter: MLP → 3584 → cond_projector → 768.
+        adapted = adapter(traj_hs.to(dtype=adapter_dtype))  # (B, Q, 3584)
+        if cond_projector is not None:
+            proj_dtype = next(cond_projector.parameters()).dtype
+            adapted = cond_projector(adapted.to(dtype=proj_dtype))
+        return adapted.to(dtype=orig_dtype)
 
     out = adapter(traj_hs.to(dtype=adapter_dtype))
     return out.to(dtype=orig_dtype)
@@ -2596,9 +2601,9 @@ def _run_eval_panoramic_vlm(
                         _last_traj_hs = _maybe_apply_pano_latent_adapter(
                             _last_traj_hs,
                             pano_latent_adapter,
-                            view_id=pano_goal_view,
-                            pixel_goal=pixel_goal,
-                            image_size=vlm_image_size,
+                            cond_projector=model.nextdit_action_head.cond_projector
+                            if model.nextdit_action_head is not None
+                            else None,
                         )
 
                 print("  [debug] calling get_trajectory ...", flush=True)

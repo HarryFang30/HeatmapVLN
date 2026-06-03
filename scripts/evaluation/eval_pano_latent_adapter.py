@@ -72,7 +72,10 @@ from scripts.training.train_pano_latent_adapter import (
     _sample_from_record,
 )
 from src.data.factory import build_trajectory_dataset
-from src.models.adapters import GeometryAwarePanoToNextDiTAdapter
+from src.models.adapters import (
+    GeometryAwarePanoToNextDiTAdapter,
+    PanoLatentSpaceAdapter,
+)
 
 LOGGER = logging.getLogger("eval_pano_latent_adapter")
 
@@ -104,6 +107,24 @@ def _load_adapter_from_checkpoint(
     if state_dict is None:
         raise KeyError(f"{path} has no adapter_state_dict")
     saved_args = ckpt.get("args", {}) or {}
+
+    if "mlp.0.weight" in state_dict:
+        # PanoLatentSpaceAdapter (simple MLP, 3584→2048→3584)
+        dim = int(state_dict["mlp.0.weight"].shape[1])
+        hidden_dim = int(state_dict["mlp.0.weight"].shape[0])
+        adapter = PanoLatentSpaceAdapter(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            dropout=float(saved_args.get("adapter_dropout", 0.0)),
+        )
+        adapter.load_state_dict(state_dict)
+        adapter.eval()
+        adapter.to(device)
+        LOGGER.info(
+            "Loaded PanoLatentSpaceAdapter from %s dim=%d hidden_dim=%d",
+            path, dim, hidden_dim,
+        )
+        return adapter, saved_args
 
     if "student_proj.weight" in state_dict:
         student_dim = int(state_dict["student_proj.weight"].shape[1])
