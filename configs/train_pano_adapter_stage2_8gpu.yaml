@@ -127,7 +127,7 @@ adapter:
   #   traj_hs (3584) → Linear→GELU→Dropout→Linear + residual → (3584)
   #   → cond_projector (frozen) → 768 → NextDiT
   architecture: mlp_latent_space
-  hidden_dim: 2048
+  hidden_dim: 512
   dropout: 0.0
 
   # Training
