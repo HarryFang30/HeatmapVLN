@@ -92,6 +92,9 @@ class AdapterTrainBatch:
     student_latents: torch.Tensor
     teacher_latents: torch.Tensor
     records: list[dict[str, Any]]
+    trajectory: torch.Tensor | None = None
+    trajectory_valid: torch.Tensor | None = None
+    traj_images: torch.Tensor | None = None
 
 
 class PanoToInternNavLatentAdapter(nn.Module):
@@ -441,11 +444,12 @@ def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
         cfg["paths"]["dataset_root"] = args.root
     traj_cfg = cfg.setdefault("data", {}).setdefault("trajectory", {})
     traj_cfg["panoramic_vlm_input"] = True
-    traj_cfg["compute_pixel_goal"] = False
+    traj_cfg["compute_pixel_goal"] = True
     traj_cfg["compute_pano_view_pixel_goal"] = True
     traj_cfg["pano_max_side_dist_m"] = float(getattr(args, "pano_max_side_dist_m", 6.0))
     traj_cfg["load_lookdown_for_system2"] = False
-    traj_cfg["load_traj_images"] = False
+    traj_cfg["load_traj_images"] = True
+    traj_cfg["traj_image_size"] = [224, 224]
     traj_cfg["enable_trajectory_augmentation"] = False
     traj_cfg["require_sft_target"] = False
     return cfg
@@ -1133,9 +1137,9 @@ def _build_batch(
     if not usable_records:
         raise RuntimeError("Cannot build an empty adapter batch")
 
-    student_latents = _extract_student_latents(
+    student_latents, collated = _extract_student_latents(
         model, processor, batch_samples, device, n_traj_query,
-        sft_protocol="direct", return_batch=False,
+        sft_protocol="direct", return_batch=True,
     )
 
     if teacher_target_mode != "aligned":
@@ -1156,10 +1160,17 @@ def _build_batch(
         turn_args=teacher_turn_args or make_teacher_turn_args(),
     ).to(device)
 
+    trajectory = _collated_tensor(collated, "trajectory", device)
+    trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
+    traj_images = _collated_tensor(collated, "traj_images", device)
+
     return AdapterTrainBatch(
         student_latents=student_latents,
         teacher_latents=teacher_latents,
         records=usable_records,
+        trajectory=trajectory,
+        trajectory_valid=trajectory_valid,
+        traj_images=traj_images,
     )
 
 
@@ -1392,11 +1403,11 @@ def main() -> int:
             enable_trajectory_augmentation=False,
             load_history_heatmap=False,
             panoramic_vlm_input=True,
-            compute_pixel_goal=False,
+            compute_pixel_goal=True,
             compute_pano_view_pixel_goal=True,
             pano_max_side_dist_m=float(args.pano_max_side_dist_m),
             load_lookdown_for_system2=False,
-            load_traj_images=False,
+            load_traj_images=True,
         )
         if _rank0():
             LOGGER.info("Dataset samples=%d", len(dataset))
@@ -1578,10 +1589,27 @@ def main() -> int:
                     pred.float(),
                     batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
                 )
-                loss = mse
+                gt_loss = torch.tensor(0.0, device=pred.device)
+                if batch.trajectory is not None and model.nextdit_action_head is not None:
+                    head = model.nextdit_action_head
+                    proj_dtype = next(head.cond_projector.parameters()).dtype
+                    projected = head.cond_projector(pred.to(dtype=proj_dtype))  # (B,Q,3584)→(B,Q,768)
+                    gt = batch.trajectory.to(device=pred.device, dtype=proj_dtype)
+                    images = batch.traj_images.to(device=pred.device) if batch.traj_images is not None else None
+                    valid = batch.trajectory_valid.to(device=pred.device) if batch.trajectory_valid is not None else None
+                    pred_exp, gt_exp, images_exp, valid_exp = head._expand_sequence_training_inputs(
+                        projected, gt, images, valid,
+                    )
+                    noisy, timesteps, target_vel = head.sample_flow_matching_inputs(gt_exp)
+                    pred_vel = head.predict_velocity_from_projected(
+                        pred_exp, noisy, timesteps, traj_images=images_exp,
+                    )
+                    gt_loss = head.masked_velocity_mse(pred_vel, target_vel, valid_exp)
+                loss = mse + 0.1 * gt_loss
                 metrics = {
                     "loss": float(loss.detach().item()),
                     "mse": float(mse.detach().item()),
+                    "gt": float(gt_loss.detach().item()),
                 }
 
                 optimizer.zero_grad(set_to_none=True)
@@ -1600,14 +1628,15 @@ def main() -> int:
                 pbar.set_postfix(
                     loss=f"{avg.get('loss', 0):.5f}",
                     mse=f"{avg.get('mse', 0):.6f}",
+                    gt=f"{avg.get('gt', 0):.5f}",
                 )
                 pbar.update(1)
 
                 if _rank0() and args.log_interval > 0 and count % args.log_interval == 0:
                     LOGGER.info(
-                        "epoch=%d local_step=%d global_step=%d loss=%.6f mse=%.8f",
+                        "epoch=%d local_step=%d global_step=%d loss=%.6f mse=%.8f gt=%.6f",
                         epoch + 1, count, global_step,
-                        avg.get("loss", 0.0), avg.get("mse", 0.0),
+                        avg.get("loss", 0.0), avg.get("mse", 0.0), avg.get("gt", 0.0),
                     )
             pbar.close()
 
