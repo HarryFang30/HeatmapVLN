@@ -1138,24 +1138,23 @@ def _build_batch(
         sft_protocol="direct", return_batch=False,
     )
 
-    if teacher_target_mode == "aligned":
-        if teacher_model is None or teacher_processor is None:
-            raise RuntimeError("aligned teacher target mode requires teacher_model/processor")
-        try:
-            teacher_device = next(teacher_model.parameters()).device
-        except StopIteration:
-            teacher_device = device
-        # Raw 3584-dim latents (before cond_projector) — adapter target.
-        teacher_latents = compute_aligned_teacher_latents_3584_batch(
-            teacher_model, teacher_processor, batch_samples,
-            teacher_device,
-            turn_args=teacher_turn_args or make_teacher_turn_args(),
-        ).to(device)
-    else:
-        teacher_latents = _load_teacher_latents(
-            usable_records, device, model=model,
-            target_dim=int(model.nextdit_action_head.config.latent_emb_size),
+    if teacher_target_mode != "aligned":
+        raise RuntimeError(
+            "PanoLatentSpaceAdapter requires teacher-target-mode=aligned "
+            "(sidecar mode stores 768-dim latents but adapter targets 3584-dim)."
         )
+    if teacher_model is None or teacher_processor is None:
+        raise RuntimeError("aligned teacher target mode requires teacher_model/processor")
+    try:
+        teacher_device = next(teacher_model.parameters()).device
+    except StopIteration:
+        teacher_device = device
+    # Raw 3584-dim latents (before cond_projector) — adapter target.
+    teacher_latents = compute_aligned_teacher_latents_3584_batch(
+        teacher_model, teacher_processor, batch_samples,
+        teacher_device,
+        turn_args=teacher_turn_args or make_teacher_turn_args(),
+    ).to(device)
 
     return AdapterTrainBatch(
         student_latents=student_latents,
@@ -1469,13 +1468,6 @@ def main() -> int:
 
         n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
         hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
-
-        target_dim = int(model.nextdit_action_head.config.latent_emb_size)
-        if int(args.adapter_output_dim) != target_dim:
-            raise RuntimeError(
-                f"Adapter output dim must match NextDiT latent dim {target_dim}; "
-                f"got {args.adapter_output_dim}"
-            )
 
         adapter = PanoLatentSpaceAdapter(
             dim=hidden_dim,
