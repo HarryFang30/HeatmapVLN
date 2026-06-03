@@ -2031,11 +2031,15 @@ def _run_eval_panoramic_vlm(
         f"this run: {eval_limit}"
     )
 
-    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating")
+    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
     eval_count = 0
 
     while True:
+        process_bar.set_postfix(
+            SR=f"{float(np.mean(sucs)):.3f}" if sucs else "?",
+            SPL=f"{float(np.mean(spls)):.3f}" if spls else "?",
+        )
         if eval_count >= eval_limit:
             break
 
@@ -2892,12 +2896,16 @@ def run_eval(args):
         f"this run: {eval_limit}"
     )
 
-    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating")
+    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
     eval_count = 0
 
     # ── Episode loop (iterator-driven, see ReadBeforeEvaluatingHabitat.md §16) ──
     while True:
+        process_bar.set_postfix(
+            SR=f"{float(np.mean(sucs)):.3f}" if sucs else "?",
+            SPL=f"{float(np.mean(spls)):.3f}" if spls else "?",
+        )
         if eval_count >= eval_limit:
             break
 
