@@ -1193,6 +1193,8 @@ def _evaluate_adapter(
     adapter.eval()
     running: dict[str, float] = {}
     count = 0
+    num_batches = (len(val_records) + batch_size - 1) // batch_size
+    pbar = tqdm(total=num_batches, desc="Validating", unit="step", ncols=100, disable=not _rank0())
     try:
         for start in range(0, len(val_records), batch_size):
             batch_records = val_records[start:start + batch_size]
@@ -1216,7 +1218,11 @@ def _evaluate_adapter(
             count += 1
             running["loss"] = running.get("loss", 0.0) + mse
             running["mse"] = running.get("mse", 0.0) + mse
+            avg_mse = running["mse"] / count
+            pbar.set_postfix(mse=f"{avg_mse:.6f}")
+            pbar.update(1)
     finally:
+        pbar.close()
         adapter.train()
     return {k: v / max(count, 1) for k, v in running.items()}
 
