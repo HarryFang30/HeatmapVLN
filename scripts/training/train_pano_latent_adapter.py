@@ -1215,11 +1215,25 @@ def _evaluate_adapter(
                 pred.float(),
                 batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
             ).item())
+            gt_val = 0.0
+            if batch.trajectory is not None and model.nextdit_action_head is not None:
+                head = model.nextdit_action_head
+                proj_dtype = next(head.cond_projector.parameters()).dtype
+                projected = head.cond_projector(pred.to(dtype=proj_dtype))
+                gt_t = batch.trajectory.to(device=pred.device, dtype=proj_dtype)
+                images_t = batch.traj_images.to(device=pred.device) if batch.traj_images is not None else None
+                valid_t = batch.trajectory_valid.to(device=pred.device) if batch.trajectory_valid is not None else None
+                pe, ge, ie, ve = head._expand_sequence_training_inputs(projected, gt_t, images_t, valid_t)
+                noisy, ts, tv = head.sample_flow_matching_inputs(ge)
+                pv = head.predict_velocity_from_projected(pe, noisy, ts, traj_images=ie)
+                gt_val = float(head.masked_velocity_mse(pv, tv, ve).item())
+            val_loss = mse + 0.1 * gt_val
             count += 1
-            running["loss"] = running.get("loss", 0.0) + mse
+            running["loss"] = running.get("loss", 0.0) + val_loss
             running["mse"] = running.get("mse", 0.0) + mse
+            running["gt"] = running.get("gt", 0.0) + gt_val
             avg_mse = running["mse"] / count
-            pbar.set_postfix(mse=f"{avg_mse:.6f}")
+            pbar.set_postfix(mse=f"{avg_mse:.6f}", gt=f"{running['gt']/count:.5f}")
             pbar.update(1)
     finally:
         pbar.close()
@@ -1241,6 +1255,7 @@ def _save_checkpoint(
     adapter_to_save = _unwrap_adapter(adapter)
     torch.save(
         {
+            "adapter_type": "pano_latent_space",
             "adapter_state_dict": adapter_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,

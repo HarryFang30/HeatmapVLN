@@ -107,8 +107,9 @@ def _load_adapter_from_checkpoint(
     if state_dict is None:
         raise KeyError(f"{path} has no adapter_state_dict")
     saved_args = ckpt.get("args", {}) or {}
+    adapter_type = ckpt.get("adapter_type", "")
 
-    if "mlp.0.weight" in state_dict and "mlp.3.weight" in state_dict:
+    if adapter_type == "pano_latent_space":
         # PanoLatentSpaceAdapter (simple MLP, 3584→2048→3584)
         dim = int(state_dict["mlp.0.weight"].shape[1])
         hidden_dim = int(state_dict["mlp.0.weight"].shape[0])
