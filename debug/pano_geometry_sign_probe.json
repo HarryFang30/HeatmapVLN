@@ -1,0 +1,38 @@
+{
+  "eval_capture_vs_adapter": [
+    {
+      "view": "front",
+      "eval_raw_yaw_offset_deg": 0.0,
+      "eval_heading_right_positive_deg": 0.0,
+      "adapter_center_deg": 0.0,
+      "heading_error_deg": 0.0,
+      "matches_adapter_center": true
+    },
+    {
+      "view": "right",
+      "eval_raw_yaw_offset_deg": -90.0,
+      "eval_heading_right_positive_deg": 90.0,
+      "adapter_center_deg": 90.0,
+      "heading_error_deg": 0.0,
+      "matches_adapter_center": true
+    },
+    {
+      "view": "back",
+      "eval_raw_yaw_offset_deg": -180.0,
+      "eval_heading_right_positive_deg": -180.0,
+      "adapter_center_deg": -180.0,
+      "heading_error_deg": 0.0,
+      "matches_adapter_center": true
+    },
+    {
+      "view": "left",
+      "eval_raw_yaw_offset_deg": -270.0,
+      "eval_heading_right_positive_deg": -90.0,
+      "adapter_center_deg": -90.0,
+      "heading_error_deg": 0.0,
+      "matches_adapter_center": true
+    }
+  ],
+  "dataset_pose_vs_adapter": null,
+  "adapter_sign_sensitivity": null
+}

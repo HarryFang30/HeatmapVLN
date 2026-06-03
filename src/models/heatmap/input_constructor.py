@@ -59,11 +59,9 @@ DIRECT_WAYPOINT_TASK_SUFFIX = (
 )
 
 STRUCTURED_PANO_OUTPUT_SUFFIX = (
-    " Output the next waypoint using exactly two lines when applicable: "
+    " Output the next waypoint using exactly two lines: "
     "`view: <front|right|back|left>` and `pixel: <u> <v>`. "
-    "Output `view: stop` when you have completed the task. "
-    "Output `view: turn_left` or `view: turn_right` when the waypoint is "
-    "not visible in any panoramic view and you need to turn."
+    "Output `view: stop` when you have successfully completed the task."
 )
 
 HISTORY_PROJECTION_TASK = (
