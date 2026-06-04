@@ -14,9 +14,9 @@
 #
 # 训练说明：
 #   - Student: Stage1-S2 全景 SFT checkpoint（frozen）
-#   - Teacher: InternNav System1（frozen, aligned 模式在线运行）
-#   - Adapter: GeometryAwarePanoToNextDiTAdapter（~3M params，唯一可训练部分）
-#   - 不需要预先收集 teacher sidecar（aligned 模式）
+#   - Frozen executor: InternNav cond_projector + NextDiT
+#   - Adapter: PanoLatentSpaceAdapter（hidden_dim=256 时约 1.84M params）
+#   - 默认 pure GT loss，不加载 teacher；MSE 诊断需显式开启
 
 set -Eeuo pipefail
 
@@ -106,8 +106,8 @@ export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/
 # Stage1-S2 checkpoint (student weights)
 export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2}"
 
-# Teacher JSONL (optional for aligned mode — auto-generated from dataset if not set)
-# Only needed for sidecar mode or pre-filtered record subsets.
+# Optional record JSONL. Aligned mode auto-generates records from dataset when unset.
+# Pure-GT training does not use teacher sidecar tensors.
 export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-}"
 
 # Output
@@ -131,8 +131,9 @@ export STAGE2_ADAPTER_EPOCHS="${STAGE2_ADAPTER_EPOCHS:-}"
 export STAGE2_ADAPTER_LR="${STAGE2_ADAPTER_LR:-}"
 export STAGE2_ADAPTER_MAX_SAMPLES="${STAGE2_ADAPTER_MAX_SAMPLES:-0}"
 
-# Teacher: aligned mode (on-the-fly, recommended for MXC500)
+# Teacher diagnostics: aligned records by default; teacher MSE is opt-in.
 export STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-aligned}"
+export STAGE2_ADAPTER_COMPUTE_TEACHER_MSE="${STAGE2_ADAPTER_COMPUTE_TEACHER_MSE:-0}"
 export STAGE2_ADAPTER_TEACHER_DTYPE="${STAGE2_ADAPTER_TEACHER_DTYPE:-bfloat16}"
 export STAGE2_ADAPTER_TEACHER_ATTN="${STAGE2_ADAPTER_TEACHER_ATTN:-sdpa}"
 

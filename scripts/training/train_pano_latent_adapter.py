@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-Train a geometry-aware panoramic-to-InternNav latent adapter.
+Train a panoramic latent-space adapter for InternNav System1.
 
 This is intentionally narrower than Stage2 bridge training:
   student: panoramic Qwen TRAJ hidden states from HeatmapVLN / Stage1-S2
-  target:  InternNav teacher traj_latents projected through cond_projector to 768
+  output:  adapted 3584-dim latents before InternNav's frozen cond_projector
+  loss:    GT trajectory loss through frozen cond_projector + NextDiT
   train:   adapter only; Pano-System2 and InternNav System1 stay frozen
 
 Frozen VLM + frozen InternNav System1 let this test answer one question:
-can a teacher-guided translator map panoramic latent queries plus structured
-goal geometry into the NextDiT condition space that System1 actually consumes?
+can a small residual MLP translate the student VLM latent "dialect" into the
+InternNav latent "dialect" that frozen cond_projector + NextDiT can execute?
 
 ..  warning::
-    The aligned teacher latent targets use a **synthetic single-turn structured
-    pano protocol** (``view: front\\npixel: u v``).  InternNav's native training
-    protocol is a **two-turn lookdown + raw coordinate** conditioning path.
-    Even for front-view samples the teacher latent is not strictly in the
-    InternNav native System1 distribution.
-
-    The primary supervision signal for ALL views is the **GT trajectory loss**
-    through the frozen System1 NextDiT, which is native.  Teacher latent
-    distillation (cosine + MSE + policy) is a supplementary signal gated to
-    front-view samples only, accepting a small distribution gap.
+    Teacher latents are optional diagnostics only.  When
+    ``--compute-teacher-mse`` is enabled, aligned teacher latents use a
+    synthetic single-turn structured pano protocol (``view: front\\npixel: u v``)
+    rather than InternNav's native two-turn lookdown + raw-coordinate path.
+    The diagnostic MSE is logged but never participates in the training loss.
 """
 
 from __future__ import annotations
@@ -64,13 +60,11 @@ from scripts.training.utils import (
 from src.data.factory import build_trajectory_dataset
 from src.data.pano_teacher_alignment import (
     compute_aligned_teacher_latents_3584_batch,
-    compute_aligned_teacher_latents_768_batch,
     has_structured_pano_pixel_goal,
     make_teacher_turn_args,
 )
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.models.adapters import (
-    GeometryAwarePanoToNextDiTAdapter,
     PanoLatentSpaceAdapter,
     view_ids_to_indices,
 )
@@ -813,11 +807,10 @@ def _latent_loss(
     norm_loss_type: str = "log_ratio",
     front_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Latent-space distillation loss, gated to front-view samples only.
+    """Legacy latent-space diagnostic loss, gated to front-view samples only.
 
-    Non-front samples have out-of-distribution teacher latents (the teacher
-    never saw the corresponding image).  ``front_mask`` zeros their contribution
-    so they only receive GT trajectory supervision.
+    The current PanoLatentSpaceAdapter training path does not call this helper;
+    it is retained for older experiments that compare against teacher latents.
     """
     pred_f = pred.float()
     target_f = target.float()
@@ -1335,7 +1328,11 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument("--root", default=os.environ.get("PANORAMIC_DATA_ROOT", "/workspace/r2r_panoramic_data"))
     p.add_argument("--split", default="train")
     p.add_argument("--teacher-jsonl", default="",
-                   help="Teacher sidecar JSONL. When empty and teacher-target-mode=aligned, auto-generate records from dataset.")
+                   help=(
+                       "Optional record/teacher sidecar JSONL. In aligned mode it can supply "
+                       "a prefiltered record subset; when empty, records are auto-generated "
+                       "from the dataset."
+                   ))
     p.add_argument("--base-checkpoint", default="checkpoints/stage1-s2_latest.pth")
     p.add_argument("--internnav-model-path", default=os.environ.get("INTERNNAV_MODEL_PATH", ""))
     p.add_argument("--internnav-repo", default=os.environ.get("INTERNNAV_REPO", "~/InternNav"))
@@ -1344,9 +1341,10 @@ def _parse_args_with_config() -> argparse.Namespace:
         choices=["aligned", "sidecar"],
         default=adapter_defaults.get("teacher_target_mode", "aligned"),
         help=(
-            "aligned: on-the-fly InternNav teacher 768 latents from dataset pano goals "
-            "(recommended; no traj_latents_768 sidecar required). "
-            "sidecar: load pre-collected traj_latents_768 tensors from --teacher-jsonl."
+            "aligned: build records from dataset pano goals; teacher latents are only "
+            "computed when --compute-teacher-mse is set. "
+            "sidecar: legacy pre-collected 768-dim tensors; unsupported for the "
+            "pure-GT PanoLatentSpaceAdapter path."
         ),
     )
     p.add_argument(
@@ -1463,7 +1461,7 @@ def main() -> int:
             if _rank0():
                 LOGGER.info(
                     "No --teacher-jsonl provided; auto-generating records from dataset "
-                    "(aligned mode — teacher runs on-the-fly during training)"
+                    "(aligned mode records; teacher loads only with --compute-teacher-mse)"
                 )
             records = _build_records_from_dataset(
                 dataset,

@@ -1,19 +1,19 @@
 seed: 42
 
 # ============================================
-# Stage2: Pano Adapter Teacher-Student Training — 8×GPU
+# Stage2: Pano Adapter Pure-GT Training — 8×GPU
 # ============================================
 #
-# Trains a GeometryAwarePanoToNextDiTAdapter that translates frozen
-# Pano-System2 (Qwen2.5-VL) traj_hidden_states into InternNav System1
-# NextDiT condition space (768-dim), using InternNav as teacher.
+# Trains a PanoLatentSpaceAdapter that translates frozen Pano-System2
+# (Qwen2.5-VL) traj_hidden_states into InternNav's 3584-dim latent space.
+# Supervision is pure GT trajectory loss through frozen cond_projector + NextDiT.
 #
 # Student: Stage1-S2 checkpoint (frozen, LoRA Qwen VLM)
-# Teacher: InternNav System1 (frozen, cond_projector + NextDiT)
-# Train:   Adapter only (~3M params)
+# Frozen executor: InternNav cond_projector + NextDiT
+# Train:   Adapter only (1.84M params with hidden_dim=256)
 #
 # Effective global batch = batch_size × GPUs × 1 (no accum in adapter training)
-# For MXC500 64GB: batch_size=6 → effective=48 across 8 GPUs.
+# For MXC500 64GB: batch_size=8 → effective=64 across 8 GPUs.
 
 paths:
   dataset_root: /workspace/r2r_panoramic_data
@@ -132,9 +132,9 @@ adapter:
 
   # Training
   training:
-    epochs: 3
+    epochs: 5
     batch_size: 8
-    lr: 5.0e-4
+    lr: 3.0e-4
     weight_decay: 0.01
     grad_clip: 1.0
     max_samples: 0
