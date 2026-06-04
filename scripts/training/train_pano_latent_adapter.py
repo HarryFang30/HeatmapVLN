@@ -90,7 +90,7 @@ REQUIRED_SYSTEM1_PREFIXES = (
 @dataclass
 class AdapterTrainBatch:
     student_latents: torch.Tensor
-    teacher_latents: torch.Tensor
+    teacher_latents: torch.Tensor | None
     records: list[dict[str, Any]]
     trajectory: torch.Tensor | None = None
     trajectory_valid: torch.Tensor | None = None
@@ -1142,36 +1142,33 @@ def _build_batch(
         sft_protocol="direct", return_batch=True,
     )
 
-    if teacher_target_mode != "aligned":
-        raise RuntimeError(
-            "PanoLatentSpaceAdapter requires teacher-target-mode=aligned "
-            "(sidecar mode stores 768-dim latents but adapter targets 3584-dim)."
-        )
-    if teacher_model is None or teacher_processor is None:
-        raise RuntimeError("aligned teacher target mode requires teacher_model/processor")
-    try:
-        teacher_device = next(teacher_model.parameters()).device
-    except StopIteration:
-        teacher_device = device
-    # Raw 3584-dim latents (before cond_projector) — adapter target.
-    teacher_latents = compute_aligned_teacher_latents_3584_batch(
-        teacher_model, teacher_processor, batch_samples,
-        teacher_device,
-        turn_args=teacher_turn_args or make_teacher_turn_args(),
-    ).to(device)
+    # Teacher latents are only needed for MSE loss (legacy).  Pure GT-loss
+    # training skips teacher inference entirely.
+    teacher_latents: torch.Tensor | None = None
+    if teacher_model is not None and teacher_processor is not None:
+        try:
+            teacher_device = next(teacher_model.parameters()).device
+        except StopIteration:
+            teacher_device = device
+        teacher_latents = compute_aligned_teacher_latents_3584_batch(
+            teacher_model, teacher_processor, batch_samples,
+            teacher_device,
+            turn_args=teacher_turn_args or make_teacher_turn_args(),
+        ).to(device)
 
     trajectory = _collated_tensor(collated, "trajectory", device)
     trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
     traj_images = _collated_tensor(collated, "traj_images", device)
 
-    return AdapterTrainBatch(
+    batch = AdapterTrainBatch(
         student_latents=student_latents,
-        teacher_latents=teacher_latents,
+        teacher_latents=teacher_latents,  # type: ignore[arg-type]
         records=usable_records,
         trajectory=trajectory,
         trajectory_valid=trajectory_valid,
         traj_images=traj_images,
     )
+    return batch
 
 
 @torch.no_grad()
@@ -1227,7 +1224,7 @@ def _evaluate_adapter(
                 noisy, ts, tv = head.sample_flow_matching_inputs(ge)
                 pv = head.predict_velocity_from_projected(pe, noisy, ts, traj_images=ie)
                 gt_val = float(head.masked_velocity_mse(pv, tv, ve).item())
-            val_loss = gt_val + 0.1 * mse
+            val_loss = gt_val
             count += 1
             running["loss"] = running.get("loss", 0.0) + val_loss
             running["mse"] = running.get("mse", 0.0) + mse
@@ -1606,10 +1603,12 @@ def main() -> int:
                     teacher_turn_args=teacher_turn_args,
                 )
                 pred = train_adapter(batch.student_latents)
-                mse = F.mse_loss(
-                    pred.float(),
-                    batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
-                )
+                mse = torch.tensor(0.0, device=pred.device)
+                if batch.teacher_latents is not None:
+                    mse = F.mse_loss(
+                        pred.float(),
+                        batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
+                    )
                 gt_loss = torch.tensor(0.0, device=pred.device)
                 if batch.trajectory is not None and model.nextdit_action_head is not None:
                     head = model.nextdit_action_head
@@ -1626,7 +1625,7 @@ def main() -> int:
                         pred_exp, noisy, timesteps, traj_images=images_exp,
                     )
                     gt_loss = head.masked_velocity_mse(pred_vel, target_vel, valid_exp)
-                loss = gt_loss + 0.1 * mse
+                loss = gt_loss
                 metrics = {
                     "loss": float(loss.detach().item()),
                     "mse": float(mse.detach().item()),
