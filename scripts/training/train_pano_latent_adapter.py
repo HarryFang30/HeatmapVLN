@@ -1227,7 +1227,7 @@ def _evaluate_adapter(
                 noisy, ts, tv = head.sample_flow_matching_inputs(ge)
                 pv = head.predict_velocity_from_projected(pe, noisy, ts, traj_images=ie)
                 gt_val = float(head.masked_velocity_mse(pv, tv, ve).item())
-            val_loss = mse + 0.1 * gt_val
+            val_loss = gt_val + 0.1 * mse
             count += 1
             running["loss"] = running.get("loss", 0.0) + val_loss
             running["mse"] = running.get("mse", 0.0) + mse
@@ -1626,7 +1626,7 @@ def main() -> int:
                         pred_exp, noisy, timesteps, traj_images=images_exp,
                     )
                     gt_loss = head.masked_velocity_mse(pred_vel, target_vel, valid_exp)
-                loss = mse + 0.1 * gt_loss
+                loss = gt_loss + 0.1 * mse
                 metrics = {
                     "loss": float(loss.detach().item()),
                     "mse": float(mse.detach().item()),
