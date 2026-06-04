@@ -141,9 +141,10 @@ adapter:
     index_mode: generic
     val_ratio: 0.1
 
-  # Loss: pure MSE between adapter output and teacher raw traj_latents (3584-dim).
+  # Loss: pure GT trajectory loss through frozen cond_projector + NextDiT.
+  # MSE against teacher latents is a diagnostic only (--compute-teacher-mse).
   loss:
-    mse_weight: 1.0
+    gt_weight: 1.0
 
   # Teacher
   teacher:

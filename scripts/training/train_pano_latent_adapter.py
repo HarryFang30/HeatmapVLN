@@ -1211,7 +1211,7 @@ def _evaluate_adapter(
             mse = float(F.mse_loss(
                 pred.float(),
                 batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
-            ).item())
+            ).item()) if batch.teacher_latents is not None else 0.0
             gt_val = 0.0
             if batch.trajectory is not None and model.nextdit_action_head is not None:
                 head = model.nextdit_action_head
@@ -1348,6 +1348,10 @@ def _parse_args_with_config() -> argparse.Namespace:
             "(recommended; no traj_latents_768 sidecar required). "
             "sidecar: load pre-collected traj_latents_768 tensors from --teacher-jsonl."
         ),
+    )
+    p.add_argument(
+        "--compute-teacher-mse", action="store_true", default=False,
+        help="Load teacher model and compute MSE against teacher latents for diagnostic logging (adds ~7 GB VRAM).",
     )
     p.add_argument("--teacher-device", default="", help="Device for aligned teacher (default: same as --device)")
     p.add_argument("--teacher-torch-dtype", default=adapter_defaults.get("teacher_torch_dtype", "bfloat16"))
@@ -1487,13 +1491,29 @@ def main() -> int:
         teacher_model = None
         teacher_processor = None
         teacher_turn_args = make_teacher_turn_args(seed=args.seed)
-        if args.teacher_target_mode == "aligned":
-            teacher_device = device
-            if str(args.teacher_device).strip():
-                teacher_device = torch.device(str(args.teacher_device).strip())
-            teacher_model, teacher_processor = _load_alignment_teacher(args, teacher_device)
+        if args.compute_teacher_mse:
+            if args.teacher_target_mode == "aligned":
+                teacher_device = device
+                if str(args.teacher_device).strip():
+                    teacher_device = torch.device(str(args.teacher_device).strip())
+                teacher_model, teacher_processor = _load_alignment_teacher(args, teacher_device)
+                if _rank0():
+                    LOGGER.info("Loaded aligned InternNav teacher on %s (MSE diagnostic)", teacher_device)
+            elif args.teacher_target_mode == "sidecar":
+                raise RuntimeError(
+                    "sidecar mode stores 768-dim latents but PanoLatentSpaceAdapter "
+                    "targets 3584-dim. Use --teacher-target-mode=aligned or omit "
+                    "--compute-teacher-mse."
+                )
+        else:
+            if args.teacher_target_mode == "sidecar":
+                raise RuntimeError(
+                    "PanoLatentSpaceAdapter uses pure GT loss. "
+                    "sidecar mode (768-dim teacher latents) is not supported."
+                )
             if _rank0():
-                LOGGER.info("Loaded aligned InternNav teacher on %s", teacher_device)
+                LOGGER.info("Pure GT loss — teacher model not loaded "
+                            "(use --compute-teacher-mse for diagnostic MSE)")
 
         n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
         hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
