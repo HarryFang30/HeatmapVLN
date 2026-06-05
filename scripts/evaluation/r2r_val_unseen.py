@@ -2276,27 +2276,6 @@ def _run_eval_panoramic_vlm(
                 base_messages = copy.deepcopy(messages)
                 executed_history_panoramas.append(current_views)
 
-            if _debug_input_trace_enabled(args):
-                # Log the last user-message text portion (without images).
-                last_text = ""
-                for item in (messages[-1].get("content", []) if messages else []):
-                    if item.get("type") == "text":
-                        last_text += str(item["text"])
-                print(
-                    f"  [debug] structured_pano={structured_pano_output} "
-                    f"prompt_tail={last_text[-200:]!r}",
-                    flush=True,
-                )
-
-            # Decode the full prompt text (before generation) for debugging.
-            full_text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-            print(
-                f"  [debug] FULL PROMPT TEXT ({len(full_text)} chars):\n{full_text}\n  [debug] END PROMPT",
-                flush=True,
-            )
-
             inputs = processor.apply_chat_template(
                 messages,
                 tokenize=True,
