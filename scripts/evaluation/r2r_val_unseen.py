@@ -2288,6 +2288,15 @@ def _run_eval_panoramic_vlm(
                     flush=True,
                 )
 
+            # Decode the full prompt text (before generation) for debugging.
+            full_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            print(
+                f"  [debug] FULL PROMPT TEXT ({len(full_text)} chars):\n{full_text}\n  [debug] END PROMPT",
+                flush=True,
+            )
+
             inputs = processor.apply_chat_template(
                 messages,
                 tokenize=True,
