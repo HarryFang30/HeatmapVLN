@@ -1503,6 +1503,38 @@ class TrajectoryStepRecorder:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def _record_post_action_step(
+    step_recorder: TrajectoryStepRecorder | None,
+    env,
+    *,
+    step_id: int,
+    phase: str,
+    action: int,
+    image_size: tuple[int, int],
+    vlm_output: str | None = None,
+) -> None:
+    """Record the state after a Habitat action has been executed."""
+    if step_recorder is None:
+        return
+
+    state = env._sim.get_agent(0).get_state()
+    pos = np.array(state.position, dtype=float)
+    rot = quaternion.as_float_array(state.rotation)
+    step_data: dict[str, Any] = {
+        "step_id": int(step_id),
+        "phase": phase,
+        "position": pos,
+        "heading_deg": _quat_to_heading_deg(rot),
+        "rotation": rot,
+        "distance_to_goal": _metric_distance_to_goal(env),
+        "executed_action": int(action),
+        "current_views": capture_panoramic_views(env, image_size=image_size),
+    }
+    if vlm_output is not None:
+        step_data["vlm_output"] = vlm_output
+    step_recorder.record_step(step_data)
+
+
 def _maybe_stop_at_success(env, args, step_id: int):
     stop_distance = float(getattr(args, "auto_stop_distance", 0.0) or 0.0)
     if stop_distance <= 0.0:
@@ -2137,26 +2169,16 @@ def _run_eval_panoramic_vlm(
                     awaiting_lookdown = False
                     continue
 
-                before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
-                if step_recorder is not None:
-                    state = env._sim.get_agent(0).get_state()
-                    pos = np.array(state.position, dtype=float)
-                    rot = quaternion.as_float_array(state.rotation)
-                    views_for_record = (
-                        executed_history_panoramas[-1]
-                        if executed_history_panoramas else None
-                    )
-                    step_recorder.record_step({
-                        "step_id": step_id,
-                        "phase": "local_action",
-                        "position": pos,
-                        "heading_deg": _quat_to_heading_deg(rot),
-                        "rotation": rot,
-                        "distance_to_goal": _metric_distance_to_goal(env),
-                        "executed_action": int(action),
-                        "current_views": views_for_record,
-                    })
+                before = (
+                    _env_trace_summary(env)
+                    if _debug_input_trace_enabled(args)
+                    else None
+                )
                 observations, done = _apply_habitat_action(env, action)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1,
+                    phase="local_action", action=int(action), image_size=image_size,
+                )
                 if before is not None:
                     print(
                         f"  [debug] executed local action={int(action)} "
@@ -2304,6 +2326,10 @@ def _run_eval_panoramic_vlm(
                     flush=True,
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1, phase="stop",
+                    action=int(ActionCode.STOP), image_size=image_size,
+                )
                 step_id += 1
                 continue
             with torch.no_grad():
@@ -2324,32 +2350,23 @@ def _run_eval_panoramic_vlm(
 
             if _vlm_requests_stop(llm_output):
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1, phase="stop",
+                    action=int(ActionCode.STOP), image_size=image_size,
+                    vlm_output=llm_output,
+                )
                 step_id += 1
                 continue
 
             turn_dir = _vlm_requests_turn(llm_output)
             if turn_dir is not None:
                 action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
-                if step_recorder is not None:
-                    state = env._sim.get_agent(0).get_state()
-                    pos = np.array(state.position, dtype=float)
-                    rot = quaternion.as_float_array(state.rotation)
-                    views = (
-                        executed_history_panoramas[-1]
-                        if executed_history_panoramas else None
-                    )
-                    step_recorder.record_step({
-                        "step_id": step_id,
-                        "phase": "turn",
-                        "position": pos,
-                        "heading_deg": _quat_to_heading_deg(rot),
-                        "rotation": rot,
-                        "distance_to_goal": _metric_distance_to_goal(env),
-                        "vlm_output": llm_output,
-                        "executed_action": int(action),
-                        "current_views": views,
-                    })
                 observations, done = _apply_habitat_action(env, action)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1, phase="turn",
+                    action=int(action), image_size=image_size,
+                    vlm_output=llm_output,
+                )
                 step_id += 1
                 continue
 
@@ -2502,6 +2519,11 @@ def _run_eval_panoramic_vlm(
                         observations, done = _apply_habitat_action(
                             env, ActionCode.STOP,
                         )
+                        _record_post_action_step(
+                            step_recorder, env, step_id=step_id + 1,
+                            phase="stop", action=int(ActionCode.STOP),
+                            image_size=image_size, vlm_output=llm_output,
+                        )
                         step_id += 1
                         continue
 
@@ -2514,10 +2536,20 @@ def _run_eval_panoramic_vlm(
                         observations, done = _apply_habitat_action(
                             env, ActionCode.STOP,
                         )
+                        _record_post_action_step(
+                            step_recorder, env, step_id=step_id + 1,
+                            phase="stop", action=int(ActionCode.STOP),
+                            image_size=image_size, vlm_output=llm_output,
+                        )
                         step_id += 1
                         continue
                     observations, done = _apply_habitat_action(
                         env, first_action,
+                    )
+                    _record_post_action_step(
+                        step_recorder, env, step_id=step_id + 1,
+                        phase="local_action", action=int(first_action),
+                        image_size=image_size, vlm_output=llm_output,
                     )
                     step_id += 1
                     forward_action_count += 1
@@ -2655,6 +2687,11 @@ def _run_eval_panoramic_vlm(
                             else None
                         )
                         observations, done = _apply_habitat_action(env, ActionCode.LEFT)
+                        _record_post_action_step(
+                            step_recorder, env, step_id=step_id + 1,
+                            phase="local_action", action=int(ActionCode.LEFT),
+                            image_size=image_size, vlm_output=llm_output,
+                        )
                         if before is not None:
                             print(
                                 "  [debug] executed anti-deadlock action="
@@ -2671,6 +2708,11 @@ def _run_eval_panoramic_vlm(
                         else None
                     )
                     observations, done = _apply_habitat_action(env, first_action)
+                    _record_post_action_step(
+                        step_recorder, env, step_id=step_id + 1,
+                        phase="local_action", action=int(first_action),
+                        image_size=image_size, vlm_output=llm_output,
+                    )
                     if before is not None:
                         print(
                             f"  [debug] executed first local action={int(first_action)} "
@@ -2682,6 +2724,11 @@ def _run_eval_panoramic_vlm(
                     continue
 
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1,
+                    phase="stop", action=int(ActionCode.STOP),
+                    image_size=image_size, vlm_output=llm_output,
+                )
                 step_id += 1
                 continue
 
@@ -2692,6 +2739,11 @@ def _run_eval_panoramic_vlm(
                     awaiting_lookdown = True
                     continue
                 observations, done = _apply_habitat_action(env, action)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1,
+                    phase="vlm_action", action=int(action),
+                    image_size=image_size, vlm_output=llm_output,
+                )
                 step_id += 1
             elif not (llm_output or "").strip():
                 # VLM generated blank/empty output — fall back to a turn
@@ -2701,9 +2753,19 @@ def _run_eval_panoramic_vlm(
                     flush=True,
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.LEFT)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1,
+                    phase="fallback_action", action=int(ActionCode.LEFT),
+                    image_size=image_size, vlm_output=llm_output,
+                )
                 step_id += 1
             else:
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                _record_post_action_step(
+                    step_recorder, env, step_id=step_id + 1,
+                    phase="stop", action=int(ActionCode.STOP),
+                    image_size=image_size, vlm_output=llm_output,
+                )
                 step_id += 1
 
         metrics = env.get_metrics()

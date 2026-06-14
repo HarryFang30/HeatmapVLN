@@ -157,32 +157,37 @@ const steps = DATA.steps || [];
 const meta = DATA.metadata || {};
 const total = steps.length;
 
-function init() {{
-    document.getElementById('slider').max = total - 1;
+function init() {
+    document.getElementById('slider').max = Math.max(total - 1, 0);
     updateSliderColors();
     jumpTo(0);
-}}
+}
 
-function updateSliderColors() {{
-    const colors = steps.map((s, i) => {{
+function updateSliderColors() {
+    const colors = steps.map((s, i) => {
         const dd = s.delta_dist;
         if (dd === null || dd === undefined) return '#6b7280';
         if (dd > 0.05) return '#f87171';
         if (dd < -0.05) return '#4ade80';
         return '#9ca3af';
-    }});
+    });
     const n = colors.length;
+    if (n === 0) {
+        document.getElementById('slider').style.setProperty('--slider-colors', '#6b7280 0%, #6b7280 100%');
+        return;
+    }
+    if (n === 1) colors.push(colors[0]);
     const stops = colors.map((c, i) => c + ' ' + Math.round(i/(n-1)*100) + '%').join(', ');
     document.getElementById('slider').style.setProperty('--slider-colors', stops);
-}}
+}
 
-function _state() {{
+function _state() {
     if (total === 0) return null;
     const i = Math.max(0, Math.min(total - 1, current));
     return steps[i];
-}}
+}
 
-function jumpTo(i) {{
+function jumpTo(i) {
     current = Math.max(0, Math.min(total - 1, i));
     const s = _state();
     if (!s) return;
@@ -191,37 +196,37 @@ function jumpTo(i) {{
     renderBirdseye(s);
     renderPanorama(s);
     renderInfo(s);
-}}
+}
 
-function prevStep() {{ jumpTo(current - 1); }}
-function nextStep() {{ jumpTo(current + 1); }}
+function prevStep() { jumpTo(current - 1); }
+function nextStep() { jumpTo(current + 1); }
 
-function togglePlay() {{
+function togglePlay() {
     playing = !playing;
     document.getElementById('play-btn').textContent = playing ? '⏸ Pause' : '▶ Play';
-    if (playing) {{
-        playTimer = setInterval(() => {{
-            if (current >= total - 1) {{ togglePlay(); return; }}
+    if (playing) {
+        playTimer = setInterval(() => {
+            if (current >= total - 1) { togglePlay(); return; }
             jumpTo(current + 1);
-        }}, parseInt(document.getElementById('speed-sel').value));
-    }} else {{
+        }, parseInt(document.getElementById('speed-sel').value));
+    } else {
         clearInterval(playTimer);
-    }}
-}}
+    }
+}
 
-function updateSpeed() {{
-    if (playing) {{
+function updateSpeed() {
+    if (playing) {
         clearInterval(playTimer);
-        playTimer = setInterval(() => {{
-            if (current >= total - 1) {{ togglePlay(); return; }}
+        playTimer = setInterval(() => {
+            if (current >= total - 1) { togglePlay(); return; }
             jumpTo(current + 1);
-        }}, parseInt(document.getElementById('speed-sel').value));
-    }}
-}}
+        }, parseInt(document.getElementById('speed-sel').value));
+    }
+}
 
 // ── Bird's-eye SVG ─────────────────────────────────────────────────
 
-function renderBirdseye(activeStep) {{
+function renderBirdseye(activeStep) {
     const svg = document.getElementById('birdseye');
     const W = svg.clientWidth || 600;
     const H = svg.clientHeight || 500;
@@ -232,46 +237,48 @@ function renderBirdseye(activeStep) {{
     let pts = [];
     const gtPath = meta.gt_reference_path || [];
     gtPath.forEach(p => pts.push([p[0], p[2]]));
-    steps.forEach(s => pts.push([s.position[0], s.position[2]]));
+    steps.filter(s => s.position && s.position.length >= 3).forEach(s => pts.push([s.position[0], s.position[2]]));
     if (meta.goal_position) pts.push([meta.goal_position[0], meta.goal_position[2]]);
     if (meta.start_position) pts.push([meta.start_position[0], meta.start_position[2]]);
 
-    if (pts.length === 0) {{ svg.innerHTML = ''; return; }}
+    if (pts.length === 0) { svg.innerHTML = ''; return; }
 
     let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    pts.forEach(([x, z]) => {{ minX = Math.min(minX, x); maxX = Math.max(maxX, x); minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z); }});
+    pts.forEach(([x, z]) => { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z); });
     const span = Math.max(maxX - minX, maxZ - minZ, 1.0);
     const pad = span * 0.2;
     minX -= pad; maxX += pad; minZ -= pad; maxZ += pad;
     const span2 = Math.max(maxX - minX, maxZ - minZ, 1.0);
 
-    function tx(x) {{ return M + (x - minX) / span2 * w; }}
-    function tz(z) {{ return M + h - (z - minZ) / span2 * h; }}
+    function tx(x) { return M + (x - minX) / span2 * w; }
+    function tz(z) { return M + h - (z - minZ) / span2 * h; }
 
     let html = '';
 
     // GT path
-    if (gtPath.length >= 2) {{
+    if (gtPath.length >= 2) {
         let d = gtPath.map((p, i) => (i===0?'M':'L') + tx(p[0]).toFixed(1)+','+tz(p[2]).toFixed(1)).join(' ');
         html += '<polyline points="' + gtPath.map(p => tx(p[0]).toFixed(1)+','+tz(p[2]).toFixed(1)).join(' ') + '" fill="none" stroke="#4ade80" stroke-width="2" stroke-dasharray="6,4" opacity="0.6"/>';
-    }}
+    }
 
     // Agent path with color segments
-    for (let i = 0; i < steps.length - 1; i++) {{
+    for (let i = 0; i < steps.length - 1; i++) {
         const a = steps[i], b = steps[i+1];
+        if (!a.position || !b.position || a.position.length < 3 || b.position.length < 3) continue;
         const dd = b.delta_dist;
         let color = '#6b7280';
-        if (dd !== null && dd !== undefined) {{
+        if (dd !== null && dd !== undefined) {
             if (dd > 0.05) color = '#f87171';
             else if (dd < -0.05) color = '#4ade80';
-        }}
+        }
         html += '<line x1="'+tx(a.position[0]).toFixed(1)+'" y1="'+tz(a.position[2]).toFixed(1)+'" x2="'+tx(b.position[0]).toFixed(1)+'" y2="'+tz(b.position[2]).toFixed(1)+'" stroke="'+color+'" stroke-width="3" stroke-linecap="round"/>';
-    }}
+    }
 
     // Step circles + heading arrows
     const arrowLen = span2 * 0.025;
-    for (let i = 0; i < steps.length; i++) {{
+    for (let i = 0; i < steps.length; i++) {
         const s = steps[i];
+        if (!s.position || s.position.length < 3) continue;
         const cx = tx(s.position[0]), cy = tz(s.position[2]);
         const hdg = (s.heading_deg || 0) * Math.PI / 180;
         const ax = cx + arrowLen * Math.sin(hdg) / (span2/w);
@@ -280,41 +287,41 @@ function renderBirdseye(activeStep) {{
 
         const dd = s.delta_dist;
         let fill = '#6b7280';
-        if (dd !== null && dd !== undefined) {{
+        if (dd !== null && dd !== undefined) {
             if (dd > 0.05) fill = '#f87171';
             else if (dd < -0.05) fill = '#4ade80';
-        }}
+        }
 
         const r = (i === current) ? 5 : 3;
         html += '<circle cx="'+cx.toFixed(1)+'" cy="'+cy.toFixed(1)+'" r="'+r+'" fill="'+fill+'" stroke="'+(i===current?'#facc15':'none')+'" stroke-width="'+(i===current?2:0)+'"/>';
 
         // Heading arrow (only for non-action steps)
-        if (s.phase === 'vlm' || i === current) {{
+        if (s.phase === 'vlm' || i === current) {
             const headRad = (s.heading_deg || 0) * Math.PI / 180;
             const lx = cx + arrowLen * 2 * Math.sin(headRad);
             const ly = cy - arrowLen * 2 * Math.cos(headRad);
             html += '<line x1="'+cx.toFixed(1)+'" y1="'+cy.toFixed(1)+'" x2="'+lx.toFixed(1)+'" y2="'+ly.toFixed(1)+'" stroke="'+fill+'" stroke-width="1.5" opacity="0.8"/>';
-        }}
+        }
 
         // Step number label (every 5th step to avoid clutter)
-        if (i % 5 === 0 || i === current) {{
+        if (i % 5 === 0 || i === current) {
             html += '<text x="'+(cx+5).toFixed(0)+'" y="'+(cy-5).toFixed(0)+'" fill="#e0e0e0" font-size="9">'+(i+1)+'</text>';
-        }}
-    }}
+        }
+    }
 
     // Goal star
-    if (meta.goal_position) {{
+    if (meta.goal_position) {
         const gx = tx(meta.goal_position[0]), gy = tz(meta.goal_position[2]);
         html += '<polygon points="'+gx.toFixed(1)+','+(gy-8).toFixed(1)+' '+(gx+3).toFixed(1)+','+(gy-2).toFixed(1)+' '+(gx+8).toFixed(1)+','+(gy-2).toFixed(1)+' '+(gx+4).toFixed(1)+','+(gy+2).toFixed(1)+' '+(gx+5).toFixed(1)+','+(gy+7).toFixed(1)+' '+(gx).toFixed(1)+','+(gy+4).toFixed(1)+' '+(gx-5).toFixed(1)+','+(gy+7).toFixed(1)+' '+(gx-4).toFixed(1)+','+(gy+2).toFixed(1)+' '+(gx-8).toFixed(1)+','+(gy-2).toFixed(1)+' '+(gx-3).toFixed(1)+','+(gy-2).toFixed(1)+'" fill="#facc15" stroke="#eab308" stroke-width="1"/>';
         html += '<text x="'+(gx-10).toFixed(0)+'" y="'+(gy+16).toFixed(0)+'" fill="#facc15" font-size="10">GOAL</text>';
-    }}
+    }
 
     // Start marker
-    if (meta.start_position) {{
+    if (meta.start_position) {
         const sx = tx(meta.start_position[0]), sy = tz(meta.start_position[2]);
         html += '<circle cx="'+sx.toFixed(1)+'" cy="'+sy.toFixed(1)+'" r="5" fill="none" stroke="#94a3b8" stroke-width="2"/>';
         html += '<text x="'+(sx-15).toFixed(0)+'" y="'+(sy-8).toFixed(0)+'" fill="#94a3b8" font-size="9">START</text>';
-    }}
+    }
 
     // Legend
     html += '<rect x="'+(W-130)+'" y="8" width="122" height="52" rx="4" fill="#1e293b" opacity="0.9"/>';
@@ -326,94 +333,99 @@ function renderBirdseye(activeStep) {{
     html += '<text x="'+(W-98)+'" y="54" fill="#6b7280" font-size="10">stationary</text>';
 
     svg.innerHTML = html;
-}}
+}
 
 // ── Panorama ─────────────────────────────────────────────────────────
 
-function renderPanorama(s) {{
-    const pano = s._panorama_b64 || {{}};
+function renderPanorama(s) {
+    const pano = s._panorama_b64 || {};
     document.getElementById('img-front').src = pano.front || '';
     document.getElementById('img-right').src = pano.right || '';
     document.getElementById('img-back').src = pano.back || '';
     document.getElementById('img-left').src = pano.left || '';
 
     // Highlight active view
-    ['front','right','back','left'].forEach(v => {{
+    ['front','right','back','left'].forEach(v => {
         const el = document.getElementById('img-'+v);
         const label = el.parentElement.querySelector('.view-label');
-        if (s.pano_goal_view && s.pano_goal_view.toLowerCase() === v) {{
+        if (s.pano_goal_view && s.pano_goal_view.toLowerCase() === v) {
             el.classList.add('active');
             if (label) label.style.color = '#facc15';
-        }} else {{
+        } else {
             el.classList.remove('active');
             if (label) label.style.color = '#aaa';
-        }}
-    }});
-}}
+        }
+    });
+}
 
 // ── Info panel ────────────────────────────────────────────────────────
 
-function renderInfo(s) {{
+function renderInfo(s) {
     const dd = s.delta_dist;
     let ddHtml = '';
-    if (dd !== null && dd !== undefined) {{
+    if (dd !== null && dd !== undefined) {
         if (dd > 0.05) ddHtml = '<span class="color-red">&#9650; +' + dd.toFixed(2) + ' m (away)</span>';
         else if (dd < -0.05) ddHtml = '<span class="color-green">&#9660; ' + dd.toFixed(2) + ' m (toward)</span>';
         else ddHtml = '<span class="color-gray">&#9644; ' + dd.toFixed(2) + ' m</span>';
-    }}
+    }
 
     let phaseLabel = s.phase || 'unknown';
-    if (s.executed_action_name && s.phase !== 'vlm') {{
+    if (s.executed_action_name && s.phase !== 'vlm') {
         phaseLabel = 'action: ' + s.executed_action_name;
-    }}
+    }
 
     const rows = [
         ['Step', (current+1) + ' / ' + total + ' &nbsp;|&nbsp; phase: <b>' + phaseLabel + '</b>'],
-        ['Distance to goal', (s.distance_to_goal !== null ? s.distance_to_goal.toFixed(2) + ' m' : 'n/a') + ' &nbsp;' + ddHtml],
+        ['Distance to goal', (
+            s.distance_to_goal !== null && s.distance_to_goal !== undefined
+                ? s.distance_to_goal.toFixed(2) + ' m' : 'n/a'
+        ) + ' &nbsp;' + ddHtml],
     ];
 
-    if (s.vlm_output) {{
+    if (s.vlm_output) {
         rows.push(['VLM output', '<code style="font-size:12px;white-space:pre-wrap;">' + escHtml(s.vlm_output || '') + '</code>']);
-    }}
-    if (s.pixel_goal) {{
+    }
+    if (s.pixel_goal) {
         rows.push(['Pixel goal', '[' + s.pixel_goal.join(', ') + '] in <b>' + escHtml(s.pano_goal_view || '?') + '</b>']);
-    }}
-    if (s.executed_action_name) {{
+    }
+    if (s.executed_action_name) {
         rows.push(['Executed action', '<b>' + s.executed_action_name + '</b> (' + (s.executed_action||'') + ')']);
-    }}
-    if (s.traj_hs_total_norm !== null && s.traj_hs_total_norm !== undefined) {{
+    }
+    if (s.traj_hs_total_norm !== null && s.traj_hs_total_norm !== undefined) {
         const pq = s.traj_hs_per_query || [];
         rows.push(['traj_hs norm', s.traj_hs_total_norm.toFixed(1) + ' &nbsp; per-query: [' + pq.map(v => v.toFixed(0)).join(', ') + ']']);
-    }}
+    }
     rows.push(['Heading', (s.heading_deg||0).toFixed(1) + '°']);
-    rows.push(['Position', '(' + s.position.map(v => v.toFixed(2)).join(', ') + ')']);
+    if (s.position) {
+        rows.push(['Position', '(' + s.position.map(v => v.toFixed(2)).join(', ') + ')']);
+    }
 
     let html = '';
-    rows.forEach(([k, v]) => {{
+    rows.forEach(([k, v]) => {
         html += '<tr><td>' + k + '</td><td>' + v + '</td></tr>';
-    }});
+    });
     document.getElementById('info-table').innerHTML = html;
 
     // Instruction
     document.getElementById('instruction-bar').textContent = meta.instruction || '';
-}}
+}
 
-function escHtml(s) {{
+function escHtml(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}}
+}
 
 // Keyboard
-document.addEventListener('keydown', e => {{
-    if (e.key === 'ArrowLeft') {{ e.preventDefault(); prevStep(); }}
-    else if (e.key === 'ArrowRight') {{ e.preventDefault(); nextStep(); }}
-    else if (e.key === ' ') {{ e.preventDefault(); togglePlay(); }}
-}});
+document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); prevStep(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); nextStep(); }
+    else if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+});
 
 // Click on SVG to jump to nearest step
-document.getElementById('birdseye').addEventListener('click', function(e) {{
+document.getElementById('birdseye').addEventListener('click', function(e) {
     // Simple: click anywhere advances one step
     // (More precise click-to-step would need coordinate mapping)
-}});
+});
 
 window.addEventListener('load', init);
 window.addEventListener('resize', () => jumpTo(current));
