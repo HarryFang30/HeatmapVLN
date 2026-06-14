@@ -262,6 +262,69 @@ python scripts/run.py visualize trajectory \
     --checkpoint /path/to/best.pth --num-clips 3 --frames-per-clip 32
 ```
 
+### Stage2 Closed-Loop HTML Trajectory Visualization
+
+Use this when you want to inspect a full Habitat R2R rollout with a bird's-eye
+trajectory, the current 4-view panorama, System2 text output, pixel goal,
+executed action, distance change, heading, position, and trajectory hidden-state
+norms.
+
+First run the Stage2 closed-loop evaluator with trajectory-step recording
+enabled. Keep your usual checkpoint/evaluation arguments and add
+`--save_trajectory_steps`:
+
+```bash
+/opt/conda/bin/python scripts/evaluation/r2r_val_unseen.py \
+    <your existing stage2 eval args> \
+    --output_path logs/stage2_vis \
+    --save_trajectory_steps
+```
+
+This writes one directory per episode:
+
+```text
+logs/stage2_vis/<scene_id>_<episode_id>/
+├── trajectory_steps.json
+├── step_0000_front.jpg
+├── step_0000_right.jpg
+├── step_0000_back.jpg
+└── step_0000_left.jpg
+```
+
+Then convert the recorded JSON/images to a self-contained HTML file:
+
+```bash
+# Single episode
+/opt/conda/bin/python scripts/visualization/generate_trajectory_html.py \
+    --input logs/stage2_vis/zsNo4HB9uLZ_0420/trajectory_steps.json \
+    --output logs/stage2_vis/zsNo4HB9uLZ_0420/trajectory.html
+
+# Batch convert every trajectory_steps.json under the output root
+/opt/conda/bin/python scripts/visualization/generate_trajectory_html.py \
+    --input-dir logs/stage2_vis \
+    --output-dir logs/stage2_vis/html
+```
+
+The generated `trajectory.html` embeds the panorama images as base64, so it can
+be copied to a local machine and opened directly in a browser. For example:
+
+```bash
+ssh 6024_fjl \
+    "docker cp fjl-habitat:/workspace/HeatmapVLN/logs/stage2_vis/html /tmp/stage2_vis_html"
+scp -r 6024_fjl:/tmp/stage2_vis_html ./stage2_vis_html
+```
+
+Important notes:
+
+- Regenerate `trajectory_steps.json` with the current recorder before judging
+  action-level behavior. Older JSON files may have action records shifted by one
+  step because the action was recorded before Habitat applied it.
+- `trajectory_steps.json` is the source of truth for the HTML. If panorama
+  images are missing next to the JSON, the HTML will still open but the current
+  view panel will be blank.
+- Use batch mode only on a directory that contains episode subdirectories;
+  output paths mirror the input layout under `--output-dir`.
+
 ### Stage1-S2 Heatmap Impact Check
 
 Stage1-S2 checkpoints fine-tune the Qwen LoRA weights only. They do **not**
