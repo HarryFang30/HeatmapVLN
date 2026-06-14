@@ -61,6 +61,9 @@ def infer_sample(
 
     current_views = current_views.unsqueeze(0).to(device)
     history_panoramas = history_panoramas.unsqueeze(0).to(device)
+    history_rel_poses = sample.get('history_rel_poses')
+    if history_rel_poses is not None:
+        history_rel_poses = history_rel_poses.unsqueeze(0).to(device)
     video_frames = torch.cat([history_frames, history_frames[:, -1:]], dim=1)
     with torch.no_grad(), make_autocast_context(device, amp_type):
         outputs = model(
@@ -69,6 +72,7 @@ def infer_sample(
             current_observation=current_frame,
             current_views=current_views,
             history_panoramas=history_panoramas,
+            history_rel_poses=history_rel_poses,
             return_heatmaps=True,
             return_actions=False,
         )

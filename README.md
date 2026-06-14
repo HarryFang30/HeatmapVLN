@@ -262,6 +262,118 @@ python scripts/run.py visualize trajectory \
     --checkpoint /path/to/best.pth --num-clips 3 --frames-per-clip 32
 ```
 
+### Stage1-S2 Heatmap Impact Check
+
+Stage1-S2 checkpoints fine-tune the Qwen LoRA weights only. They do **not**
+continue training `heatmap_vln`, and the saved config usually has
+`model.heatmap.enable: false`. Do not pass a Stage1-S2 checkpoint directly to
+heatmap visualization and interpret it as a full heatmap model.
+
+To check whether Stage1-S2 changed heatmap generation, build two visualization
+checkpoints:
+
+1. Stage1 baseline: Stage1 LoRA + Stage1 `heatmap_vln`.
+2. Stage1+S2 overlay: Stage1 `heatmap_vln`, with Stage1-S2 Qwen LoRA keys
+   overriding the matching Stage1 LoRA keys.
+
+The following snippet also patches old checkpoint paths to the local model and
+`/workspace/val_unseen` dataset root:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import copy
+import torch
+
+stage1_path = Path('checkpoints/stage1_latest.pth')
+stage1_s2_path = Path('checkpoints/stage1-s2_latest.pth')
+out_dir = Path('debug/topdown_trajectory_checkpoint_inputs')
+out_dir.mkdir(parents=True, exist_ok=True)
+
+stage1 = torch.load(stage1_path, map_location='cpu', weights_only=False)
+stage1_s2 = torch.load(stage1_s2_path, map_location='cpu', weights_only=False)
+
+def patch_config(ckpt):
+    cfg = copy.deepcopy(ckpt['config'])
+    cfg.setdefault('data', {})['root'] = '/workspace/val_unseen'
+    cfg['data']['val_split'] = 'all'
+    cfg.setdefault('model', {}).setdefault('llm', {})['model_path'] = 'models/internnav_backbone'
+    cfg['model']['llm']['attn_implementation'] = 'sdpa'
+    cfg['model']['llm']['gradient_checkpointing'] = False
+    cfg['model'].setdefault('heatmap', {})['enable'] = True
+    cfg['model'].setdefault('action_head', {})['enable'] = False
+    cfg.setdefault('log', {})['enable_timing'] = False
+    return cfg
+
+base = copy.deepcopy(stage1)
+base['config'] = patch_config(stage1)
+base['stage_name'] = 'stage1_heatmap_visualization_config_patched'
+base_out = out_dir / 'stage1_heatmap_visualization_config_patched.pth'
+torch.save(base, base_out)
+
+merged = copy.deepcopy(stage1)
+merged['config'] = patch_config(stage1)
+merged_sd = copy.deepcopy(stage1.get('trainable_state_dict', {}))
+merged_sd.update(stage1_s2.get('trainable_state_dict', {}))
+merged['trainable_state_dict'] = merged_sd
+merged['stage_name'] = 'stage1_heatmap_plus_stage1_s2_lora_visualization'
+merged['source_checkpoints'] = {
+    'stage1_heatmap': str(stage1_path),
+    'stage1_s2_lora_overlay': str(stage1_s2_path),
+    'note': 'stage1 heatmap_vln plus stage1-s2 LoRA overlay',
+}
+merged_out = out_dir / 'stage1_heatmap_plus_stage1_s2_lora_visualization.pth'
+torch.save(merged, merged_out)
+
+print(base_out)
+print(merged_out)
+PY
+```
+
+Then run the top-down trajectory heatmap visualization on both checkpoints with
+the same selection parameters:
+
+```bash
+# Stage1 baseline
+CUDA_VISIBLE_DEVICES=1 python scripts/run.py visualize trajectory \
+    --checkpoint debug/topdown_trajectory_checkpoint_inputs/stage1_heatmap_visualization_config_patched.pth \
+    --data-root /workspace/val_unseen \
+    --split all \
+    --num-clips 2 \
+    --frames-per-clip 12 \
+    --output-dir debug/topdown_trajectory_vis_stage1 \
+    --device cuda:0 \
+    --attn-impl sdpa \
+    --tile-size 72
+
+# Stage1 heatmap + Stage1-S2 Qwen LoRA overlay
+CUDA_VISIBLE_DEVICES=1 python scripts/run.py visualize trajectory \
+    --checkpoint debug/topdown_trajectory_checkpoint_inputs/stage1_heatmap_plus_stage1_s2_lora_visualization.pth \
+    --data-root /workspace/val_unseen \
+    --split all \
+    --num-clips 2 \
+    --frames-per-clip 12 \
+    --output-dir debug/topdown_trajectory_vis_stage1_plus_stage1_s2 \
+    --device cuda:0 \
+    --attn-impl sdpa \
+    --tile-size 72
+```
+
+Important notes:
+
+- `--split all` is intentional for `/workspace/val_unseen`, which has scene
+  directories directly under the root rather than a `val/` subdirectory.
+- Use `--attn-impl sdpa` on machines without `flash_attn` installed.
+- `scripts/visualization/trajectory_heatmaps.py` must pass
+  `history_rel_poses` into the model. Stage1 uses `TrajectoryGuidedAttention`;
+  if this tensor is omitted, the trajectory token is zeroed and predictions can
+  collapse to a fixed view (commonly the Back view), producing misleading
+  visualizations.
+- The current `/workspace/val_unseen` metadata does not include `instruction`,
+  so these visualizations test the visual/trajectory-conditioned heatmap path
+  with empty instruction text. Use a dataset whose `meta.json` includes
+  `instruction` for instruction-conditioned checks.
+
 ## Training Outputs
 
 Each run produces an isolated, reproducible output directory:
