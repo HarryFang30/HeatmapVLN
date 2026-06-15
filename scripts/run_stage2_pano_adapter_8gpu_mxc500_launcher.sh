@@ -144,12 +144,15 @@ export STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-0.2}"
 export STAGE2_TEACHER_SIDECAR_DIR="${STAGE2_TEACHER_SIDECAR_DIR:-/mnt/afs/lixiaoou/intern/fjl/teacher_sidecars/stage2_native_dataset}"
 export STAGE2_TEACHER_TENSOR_DIR="${STAGE2_TEACHER_TENSOR_DIR:-${STAGE2_TEACHER_SIDECAR_DIR}/tensors}"
 export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-${STAGE2_TEACHER_SIDECAR_DIR}/train_native_teacher.jsonl}"
-export STAGE2_TEACHER_COLLECT_CONFIG="${STAGE2_TEACHER_COLLECT_CONFIG:-configs/train_config_internnav_8gpu_stage2_wider.yaml}"
+export STAGE2_TEACHER_COLLECT_CONFIG="${STAGE2_TEACHER_COLLECT_CONFIG:-configs/train_pano_adapter_stage2_8gpu.yaml}"
 export STAGE2_TEACHER_COLLECT_SPLIT="${STAGE2_TEACHER_COLLECT_SPLIT:-train}"
 export STAGE2_TEACHER_COLLECT_GPU="${STAGE2_TEACHER_COLLECT_GPU:-${GPU_DEVICES%%,*}}"
 export STAGE2_TEACHER_COLLECT_GPU_DEVICES="${STAGE2_TEACHER_COLLECT_GPU_DEVICES:-$GPU_DEVICES}"
 export STAGE2_TEACHER_COLLECT_NPROC="${STAGE2_TEACHER_COLLECT_NPROC:-}"
 export STAGE2_TEACHER_COLLECT_NUM_SAMPLES="${STAGE2_TEACHER_COLLECT_NUM_SAMPLES:-0}"
+export STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE="${STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE:-1}"
+export STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING="${STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING:-0}"
+export STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP="${STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP:-0}"
 export STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL="${STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL:-100}"
 export STAGE2_TEACHER_COLLECT_PROGRESS_STYLE="${STAGE2_TEACHER_COLLECT_PROGRESS_STYLE:-tqdm}"
 export STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL="${STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL:-5.0}"
@@ -177,13 +180,16 @@ is_truthy_launcher() {
 }
 
 sidecar_signature() {
-  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
+  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
     "$PANORAMIC_DATA_ROOT" \
     "$STAGE2_TEACHER_COLLECT_SPLIT" \
     "$STAGE2_TEACHER_COLLECT_CONFIG" \
     "$INTERNNAV_MODEL_PATH" \
     "$INTERNNAV_REPO" \
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" \
+    "$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE" \
+    "$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING" \
+    "$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP" \
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
     "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
     "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
@@ -253,6 +259,10 @@ ensure_native_teacher_sidecar() {
     echo "[launcher] STAGE2_TEACHER_FORCE_RECOLLECT=1，清理旧 sidecar/shard JSONL 后重新采集"
     rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
     rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  elif [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && ( ! -f "$marker" || ! -f "$meta" ) ]]; then
+    echo "[launcher] sidecar 缺少 .done/.meta，清理旧 sidecar/shard JSONL 后重新采集"
+    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
+    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
   elif [[ -f "$meta" && "$(cat "$meta")" != "$current_sig" ]]; then
     echo "[launcher] sidecar meta 与当前参数不一致，清理旧 sidecar/shard JSONL 后重新采集"
     rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
@@ -292,6 +302,8 @@ ensure_native_teacher_sidecar() {
   echo "[launcher]   output=$STAGE2_ADAPTER_TEACHER_JSONL"
   echo "[launcher]   tensors=$STAGE2_TEACHER_TENSOR_DIR"
   echo "[launcher]   shard_dir=$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  echo "[launcher]   collect_config=$STAGE2_TEACHER_COLLECT_CONFIG"
+  echo "[launcher]   sample_stride=$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE clip_level_sampling=$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING samples_per_clip=$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP"
   echo "[launcher]   gpus=${collect_gpus[*]:0:$collect_nproc} nproc=$collect_nproc"
 
   local shard_num_samples="$STAGE2_TEACHER_COLLECT_NUM_SAMPLES"
@@ -310,30 +322,43 @@ ensure_native_teacher_sidecar() {
     shard_outputs+=("$shard_output")
     echo "[launcher]   shard $shard_idx/$collect_nproc -> GPU $gpu output=$shard_output log=$shard_log"
 
+    local -a collect_args=(
+      --config "$STAGE2_TEACHER_COLLECT_CONFIG"
+      --root "$PANORAMIC_DATA_ROOT"
+      --split "$STAGE2_TEACHER_COLLECT_SPLIT"
+      --output "$shard_output"
+      --tensor-output-dir "$STAGE2_TEACHER_TENSOR_DIR"
+      --internnav-repo "$INTERNNAV_REPO"
+      --model-path "$INTERNNAV_MODEL_PATH"
+      --device cuda:0
+      --coord-source dataset
+      --sample-mode pixel
+      --num-samples "$shard_num_samples"
+      --num-shards "$collect_nproc"
+      --shard-index "$shard_idx"
+      --sample-stride "$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE"
+      --traj-image-size "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE"
+      --num-sample-trajs "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS"
+      --num-inference-steps "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS"
+      --guidance-scale "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE"
+      --save-traj-latents
+      --save-traj-latents-768
+      --save-dp-actions
+      --progress-interval "$STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL"
+      --progress-style "$STAGE2_TEACHER_COLLECT_PROGRESS_STYLE"
+      --tqdm-mininterval "$STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL"
+    )
+    if is_truthy_launcher "$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING"; then
+      collect_args+=(--clip-level-sampling)
+    else
+      collect_args+=(--no-clip-level-sampling)
+    fi
+    if [[ "$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP" -gt 0 ]]; then
+      collect_args+=(--samples-per-clip "$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP")
+    fi
+
     CUDA_VISIBLE_DEVICES="$gpu" python -u scripts/evaluation/collect_internnav_teacher_sidecar.py \
-      --config "$STAGE2_TEACHER_COLLECT_CONFIG" \
-      --root "$PANORAMIC_DATA_ROOT" \
-      --split "$STAGE2_TEACHER_COLLECT_SPLIT" \
-      --output "$shard_output" \
-      --tensor-output-dir "$STAGE2_TEACHER_TENSOR_DIR" \
-      --internnav-repo "$INTERNNAV_REPO" \
-      --model-path "$INTERNNAV_MODEL_PATH" \
-      --device cuda:0 \
-      --coord-source dataset \
-      --sample-mode pixel \
-      --num-samples "$shard_num_samples" \
-      --num-shards "$collect_nproc" \
-      --shard-index "$shard_idx" \
-      --traj-image-size "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE" \
-      --num-sample-trajs "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
-      --num-inference-steps "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
-      --guidance-scale "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
-      --save-traj-latents \
-      --save-traj-latents-768 \
-      --save-dp-actions \
-      --progress-interval "$STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL" \
-      --progress-style "$STAGE2_TEACHER_COLLECT_PROGRESS_STYLE" \
-      --tqdm-mininterval "$STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL" \
+      "${collect_args[@]}" \
       > "$shard_log" 2>&1 &
     pids+=("$!")
   done

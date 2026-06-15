@@ -1043,6 +1043,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--sample-stride",
+        type=int,
+        default=None,
+        help="Override trajectory.sample_stride before building the dataset.",
+    )
+    p.add_argument(
+        "--samples-per-clip",
+        type=int,
+        default=None,
+        help="Override trajectory.samples_per_clip when clip-level sampling is enabled.",
+    )
+    p.add_argument(
+        "--clip-level-sampling",
+        dest="clip_level_sampling",
+        action="store_true",
+        default=None,
+        help="Override trajectory.clip_level_sampling=true.",
+    )
+    p.add_argument(
+        "--no-clip-level-sampling",
+        dest="clip_level_sampling",
+        action="store_false",
+        help="Override trajectory.clip_level_sampling=false for dense sliding-window collection.",
+    )
+    p.add_argument(
         "--coord-source",
         choices=["pano", "dataset", "teacher"],
         default="pano",
@@ -1157,6 +1182,12 @@ def main() -> None:
     traj_cfg["load_lookdown_for_system2"] = True
     traj_cfg["load_traj_images"] = True
     traj_cfg["enable_trajectory_augmentation"] = False
+    if args.sample_stride is not None:
+        traj_cfg["sample_stride"] = int(args.sample_stride)
+    if args.samples_per_clip is not None:
+        traj_cfg["samples_per_clip"] = int(args.samples_per_clip)
+    if args.clip_level_sampling is not None:
+        traj_cfg["clip_level_sampling"] = bool(args.clip_level_sampling)
     if args.sample_mode in {"all", "stop_turn"} or args.index_mode == "generic":
         traj_cfg["require_sft_target"] = False
     elif args.sample_mode == "pixel":
@@ -1167,6 +1198,9 @@ def main() -> None:
         f"[dataset] root={args.root} split={args.split} sample_mode={args.sample_mode} "
         f"index_mode={args.index_mode} coord_source={args.coord_source} "
         f"require_sft_target={traj_cfg.get('require_sft_target')} "
+        f"sample_stride={traj_cfg.get('sample_stride')} "
+        f"clip_level_sampling={traj_cfg.get('clip_level_sampling')} "
+        f"samples_per_clip={traj_cfg.get('samples_per_clip')} "
         f"require_pixel_goal={args.require_pixel_goal} include_stop={args.include_stop} "
         f"shard={args.shard_index}/{args.num_shards}",
         flush=True,
