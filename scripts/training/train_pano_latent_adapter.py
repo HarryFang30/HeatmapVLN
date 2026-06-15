@@ -538,6 +538,67 @@ def _sample_from_record(dataset: Any, rec: dict[str, Any]) -> dict[str, Any]:
             old_range.pop(temp_idx, None)
 
 
+def _try_fast_pano_goal_from_record(
+    dataset: Any,
+    rec: dict[str, Any],
+) -> tuple[bool, dict[str, Any] | None]:
+    """Check the C3 pano pixel label without materializing image tensors.
+
+    Full sample construction loads history/current/pano/trajectory images.  The
+    pre-filter only needs to know whether this frame has a trainable pano pixel
+    goal, so use the dataset's projection resolver directly when the sidecar
+    contains a stable ``(clip_idx, current_t)`` pair.
+    """
+    clip_idx = rec.get("clip_idx")
+    current_t = rec.get("current_t")
+    if clip_idx is None or current_t is None:
+        return False, None
+    if not hasattr(dataset, "_resolve_farthest_pano_pixel_goal"):
+        return False, None
+    if not hasattr(dataset, "_load_meta") or not hasattr(dataset, "clips"):
+        return False, None
+
+    clip_i = int(clip_idx)
+    frame_i = int(current_t)
+    clips = getattr(dataset, "clips")
+    if clip_i < 0 or clip_i >= len(clips):
+        return False, None
+
+    try:
+        meta = dataset._load_meta(clip_i)
+        num_frames = int(meta["num_frames"])
+        result = dataset._resolve_farthest_pano_pixel_goal(
+            clip_idx=clip_i,
+            clip_dir=Path(clips[clip_i]),
+            current_t=frame_i,
+            num_frames=num_frames,
+            img_size=getattr(dataset, "image_size", (224, 224)),
+        )
+    except Exception as exc:
+        LOGGER.debug(
+            "Fast pano-goal check unavailable for dataset_index=%s clip=%s t=%s: %r",
+            rec.get("dataset_index"),
+            clip_idx,
+            current_t,
+            exc,
+        )
+        return False, None
+
+    if result is None:
+        return True, None
+
+    goal_len, view_id, pano_pg, legacy_uv = result
+    goal: dict[str, Any] = {
+        "pano_view_id": view_id,
+        "pano_pixel_goal": [int(pano_pg[0]), int(pano_pg[1])],
+        "pano_pixel_goal_relative_len": int(goal_len),
+        "pano_sample_kind": "pixel",
+    }
+    if legacy_uv is not None:
+        goal["legacy_front_pixel_goal"] = [int(legacy_uv[0]), int(legacy_uv[1])]
+    return True, goal
+
+
 def _move_pano_inputs_to_device(pano_inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
         key: value.to(device) if torch.is_tensor(value) else value
@@ -764,8 +825,23 @@ def _filter_records_with_pano_goals(
     missing_metadata = 0
     invalid_tensor = 0
     invalid_native = 0
-    for rec in records:
+    fast_checked = 0
+    fallback_loaded = 0
+    total = len(records)
+    for rec_i, rec in enumerate(records, start=1):
         idx = rec.get("dataset_index")
+        if rec_i % 1000 == 0:
+            LOGGER.info(
+                "Filtering teacher records... %d/%d kept=%d skipped=%d failed=%d "
+                "fast=%d fallback=%d",
+                rec_i,
+                total,
+                len(filtered),
+                skipped,
+                failed,
+                fast_checked,
+                fallback_loaded,
+            )
         if require_native_teacher_sidecar:
             if str(rec.get("_sidecar_coord_source") or "").lower() != "dataset":
                 invalid_native += 1
@@ -780,19 +856,34 @@ def _filter_records_with_pano_goals(
             if not tensor_path or not Path(str(tensor_path)).is_file():
                 invalid_native += 1
                 continue
-        try:
-            sample = _sample_from_record(dataset, rec)
-        except Exception as exc:
-            failed += 1
-            LOGGER.warning(
-                "Skip teacher record dataset_index=%s: failed to load exact sample (%r)",
-                idx,
-                exc,
-            )
-            continue
-        if not _has_trainable_pano_goal(sample):
-            skipped += 1
-            continue
+
+        fast_available, fast_goal = _try_fast_pano_goal_from_record(dataset, rec)
+        if fast_available:
+            fast_checked += 1
+            if fast_goal is None:
+                skipped += 1
+                continue
+            sample: dict[str, Any] | None = None
+            pano_view_id = fast_goal["pano_view_id"]
+            pano_pixel_goal = fast_goal["pano_pixel_goal"]
+        else:
+            try:
+                sample = _sample_from_record(dataset, rec)
+            except Exception as exc:
+                failed += 1
+                LOGGER.warning(
+                    "Skip teacher record dataset_index=%s: failed to load exact sample (%r)",
+                    idx,
+                    exc,
+                )
+                continue
+            fallback_loaded += 1
+            if not _has_trainable_pano_goal(sample):
+                skipped += 1
+                continue
+            pano_view_id = sample.get("pano_view_id")
+            pano_pixel_goal = sample.get("pano_pixel_goal")
+
         # Validate sidecar metadata against the current dataset labels.
         # This runs globally before DDP sharding so a mismatch is surfaced
         # synchronously on every rank.
@@ -807,15 +898,15 @@ def _filter_records_with_pano_goals(
                     idx, sv, sp,
                 )
                 continue
-            if str(sv).lower() != str(sample.get("pano_view_id") or "").lower():
+            if str(sv).lower() != str(pano_view_id or "").lower():
                 mismatched += 1
                 LOGGER.warning(
                     "Skip sidecar record dataset_index=%s: pano_view_id mismatch "
                     "sidecar=%r dataset=%r",
-                    idx, sv, sample.get("pano_view_id"),
+                    idx, sv, pano_view_id,
                 )
                 continue
-            dp = sample.get("pano_pixel_goal")
+            dp = pano_pixel_goal
             if dp is None or int(sp[0]) != int(dp[0]) or int(sp[1]) != int(dp[1]):
                 mismatched += 1
                 LOGGER.warning(
@@ -837,7 +928,8 @@ def _filter_records_with_pano_goals(
     LOGGER.info(
         "Filtered teacher records for pano pixel goals: "
         "kept=%d skipped_no_pano_goal=%d failed=%d mismatched=%d "
-        "missing_metadata=%d invalid_tensor=%d invalid_native=%d",
+        "missing_metadata=%d invalid_tensor=%d invalid_native=%d "
+        "fast_checked=%d fallback_loaded=%d",
         len(filtered),
         skipped,
         failed,
@@ -845,6 +937,8 @@ def _filter_records_with_pano_goals(
         missing_metadata,
         invalid_tensor,
         invalid_native,
+        fast_checked,
+        fallback_loaded,
     )
     if mismatched or missing_metadata or invalid_tensor or invalid_native:
         LOGGER.warning(
