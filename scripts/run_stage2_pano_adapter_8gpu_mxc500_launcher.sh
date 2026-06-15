@@ -16,7 +16,7 @@
 #   - Student: Stage1-S2 全景 SFT checkpoint（frozen）
 #   - Frozen executor: InternNav cond_projector + NextDiT
 #   - Adapter: PanoLatentSpaceAdapter（hidden_dim=256 时约 1.84M params）
-#   - 默认先离线生成 native InternNav teacher sidecar，再训练 adapter
+#   - 默认先用本机 GPU_DEVICES 并行离线生成 native InternNav teacher sidecar，再训练 adapter
 #   - 全程只训练 adapter
 
 set -Eeuo pipefail
@@ -147,6 +147,8 @@ export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-${STAGE2_TE
 export STAGE2_TEACHER_COLLECT_CONFIG="${STAGE2_TEACHER_COLLECT_CONFIG:-configs/train_config_internnav_8gpu_stage2_wider.yaml}"
 export STAGE2_TEACHER_COLLECT_SPLIT="${STAGE2_TEACHER_COLLECT_SPLIT:-train}"
 export STAGE2_TEACHER_COLLECT_GPU="${STAGE2_TEACHER_COLLECT_GPU:-${GPU_DEVICES%%,*}}"
+export STAGE2_TEACHER_COLLECT_GPU_DEVICES="${STAGE2_TEACHER_COLLECT_GPU_DEVICES:-$GPU_DEVICES}"
+export STAGE2_TEACHER_COLLECT_NPROC="${STAGE2_TEACHER_COLLECT_NPROC:-}"
 export STAGE2_TEACHER_COLLECT_NUM_SAMPLES="${STAGE2_TEACHER_COLLECT_NUM_SAMPLES:-0}"
 export STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL="${STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL:-100}"
 export STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS="${STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS:-32}"
@@ -156,6 +158,7 @@ export STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE="${STAGE2_TEACHER_COLLECT_TRAJ_IMA
 export STAGE2_TEACHER_COLLECT_ENABLE="${STAGE2_TEACHER_COLLECT_ENABLE:-1}"
 export STAGE2_TEACHER_FORCE_RECOLLECT="${STAGE2_TEACHER_FORCE_RECOLLECT:-0}"
 export STAGE2_TEACHER_COLLECT_LOG_FILE="${STAGE2_TEACHER_COLLECT_LOG_FILE:-$REPO_ROOT/logs/stage2_native_teacher_sidecar_collect.log}"
+export STAGE2_TEACHER_COLLECT_SHARD_DIR="${STAGE2_TEACHER_COLLECT_SHARD_DIR:-${STAGE2_ADAPTER_TEACHER_JSONL}.shards}"
 export STAGE2_TEACHER_WAIT_TIMEOUT_S="${STAGE2_TEACHER_WAIT_TIMEOUT_S:-172800}"
 
 # FlashAttention2：默认强制开启（与 MXC500 环境一致）
@@ -172,16 +175,30 @@ is_truthy_launcher() {
 }
 
 sidecar_signature() {
-  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
+  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
     "$PANORAMIC_DATA_ROOT" \
     "$STAGE2_TEACHER_COLLECT_SPLIT" \
     "$STAGE2_TEACHER_COLLECT_CONFIG" \
     "$INTERNNAV_MODEL_PATH" \
     "$INTERNNAV_REPO" \
+    "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" \
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
     "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
     "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
     "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE"
+}
+
+parse_teacher_collect_gpus() {
+  local raw="${1:-}"
+  local -a split_gpus=()
+  local gpu
+  IFS=',' read -r -a split_gpus <<< "$raw"
+  for gpu in "${split_gpus[@]}"; do
+    gpu="${gpu//[[:space:]]/}"
+    if [[ -n "$gpu" ]]; then
+      printf '%s\n' "$gpu"
+    fi
+  done
 }
 
 ensure_native_teacher_sidecar() {
@@ -191,6 +208,7 @@ ensure_native_teacher_sidecar() {
 
   local marker="${STAGE2_ADAPTER_TEACHER_JSONL}.done"
   local meta="${STAGE2_ADAPTER_TEACHER_JSONL}.meta"
+  local collecting_meta="${STAGE2_ADAPTER_TEACHER_JSONL}.collecting.meta"
   local current_sig
   current_sig="$(sidecar_signature)"
 
@@ -228,39 +246,123 @@ ensure_native_teacher_sidecar() {
   fi
 
   mkdir -p "$STAGE2_TEACHER_SIDECAR_DIR" "$STAGE2_TEACHER_TENSOR_DIR" "$(dirname "$STAGE2_TEACHER_COLLECT_LOG_FILE")"
+
+  if is_truthy_launcher "$STAGE2_TEACHER_FORCE_RECOLLECT"; then
+    echo "[launcher] STAGE2_TEACHER_FORCE_RECOLLECT=1，清理旧 sidecar/shard JSONL 后重新采集"
+    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
+    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  elif [[ -f "$meta" && "$(cat "$meta")" != "$current_sig" ]]; then
+    echo "[launcher] sidecar meta 与当前参数不一致，清理旧 sidecar/shard JSONL 后重新采集"
+    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
+    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  elif [[ -f "$collecting_meta" && "$(cat "$collecting_meta")" != "$current_sig" ]]; then
+    echo "[launcher] 未完成采集的参数与当前参数不一致，清理旧 shard JSONL 后重新采集"
+    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$collecting_meta"
+    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  fi
+
+  local -a collect_gpus=()
+  mapfile -t collect_gpus < <(parse_teacher_collect_gpus "$STAGE2_TEACHER_COLLECT_GPU_DEVICES")
+  if [[ "${#collect_gpus[@]}" -eq 0 ]]; then
+    collect_gpus=("$STAGE2_TEACHER_COLLECT_GPU")
+  fi
+
+  local collect_nproc
+  if [[ -n "$STAGE2_TEACHER_COLLECT_NPROC" ]]; then
+    collect_nproc="$STAGE2_TEACHER_COLLECT_NPROC"
+  else
+    collect_nproc="${#collect_gpus[@]}"
+  fi
+  if [[ "$collect_nproc" -lt 1 ]]; then
+    echo "STAGE2_TEACHER_COLLECT_NPROC must be >= 1, got: $collect_nproc" >&2
+    exit 1
+  fi
+  if [[ "$collect_nproc" -gt "${#collect_gpus[@]}" ]]; then
+    echo "STAGE2_TEACHER_COLLECT_NPROC=$collect_nproc exceeds GPU count in STAGE2_TEACHER_COLLECT_GPU_DEVICES=${STAGE2_TEACHER_COLLECT_GPU_DEVICES}" >&2
+    exit 1
+  fi
+
+  mkdir -p "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  printf '%s' "$current_sig" > "$collecting_meta"
+
   echo "[launcher] 开始/恢复 native InternNav teacher sidecar 采集"
   echo "[launcher]   data_root=$PANORAMIC_DATA_ROOT"
   echo "[launcher]   output=$STAGE2_ADAPTER_TEACHER_JSONL"
   echo "[launcher]   tensors=$STAGE2_TEACHER_TENSOR_DIR"
-  echo "[launcher]   gpu=$STAGE2_TEACHER_COLLECT_GPU"
+  echo "[launcher]   shard_dir=$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  echo "[launcher]   gpus=${collect_gpus[*]:0:$collect_nproc} nproc=$collect_nproc"
 
-  CUDA_VISIBLE_DEVICES="$STAGE2_TEACHER_COLLECT_GPU" python -u scripts/evaluation/collect_internnav_teacher_sidecar.py \
-    --config "$STAGE2_TEACHER_COLLECT_CONFIG" \
-    --root "$PANORAMIC_DATA_ROOT" \
-    --split "$STAGE2_TEACHER_COLLECT_SPLIT" \
-    --output "$STAGE2_ADAPTER_TEACHER_JSONL" \
-    --tensor-output-dir "$STAGE2_TEACHER_TENSOR_DIR" \
-    --internnav-repo "$INTERNNAV_REPO" \
-    --model-path "$INTERNNAV_MODEL_PATH" \
-    --device cuda:0 \
-    --coord-source dataset \
-    --sample-mode pixel \
-    --num-samples "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" \
-    --traj-image-size "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE" \
-    --num-sample-trajs "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
-    --num-inference-steps "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
-    --guidance-scale "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
-    --save-traj-latents \
-    --save-traj-latents-768 \
-    --save-dp-actions \
-    --progress-interval "$STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL" \
-    2>&1 | tee "$STAGE2_TEACHER_COLLECT_LOG_FILE"
+  local shard_num_samples="$STAGE2_TEACHER_COLLECT_NUM_SAMPLES"
+  if [[ "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" -gt 0 && "$collect_nproc" -gt 1 ]]; then
+    shard_num_samples=$(( (STAGE2_TEACHER_COLLECT_NUM_SAMPLES + collect_nproc - 1) / collect_nproc ))
+    echo "[launcher]   num_samples=$STAGE2_TEACHER_COLLECT_NUM_SAMPLES total target; per-shard cap=$shard_num_samples"
+  fi
+
+  local -a pids=()
+  local -a shard_outputs=()
+  local shard_idx gpu shard_output shard_log
+  for shard_idx in $(seq 0 $((collect_nproc - 1))); do
+    gpu="${collect_gpus[$shard_idx]}"
+    shard_output="${STAGE2_TEACHER_COLLECT_SHARD_DIR}/shard_$(printf '%02d' "$shard_idx").jsonl"
+    shard_log="${STAGE2_TEACHER_COLLECT_SHARD_DIR}/shard_$(printf '%02d' "$shard_idx").log"
+    shard_outputs+=("$shard_output")
+    echo "[launcher]   shard $shard_idx/$collect_nproc -> GPU $gpu output=$shard_output log=$shard_log"
+
+    CUDA_VISIBLE_DEVICES="$gpu" python -u scripts/evaluation/collect_internnav_teacher_sidecar.py \
+      --config "$STAGE2_TEACHER_COLLECT_CONFIG" \
+      --root "$PANORAMIC_DATA_ROOT" \
+      --split "$STAGE2_TEACHER_COLLECT_SPLIT" \
+      --output "$shard_output" \
+      --tensor-output-dir "$STAGE2_TEACHER_TENSOR_DIR" \
+      --internnav-repo "$INTERNNAV_REPO" \
+      --model-path "$INTERNNAV_MODEL_PATH" \
+      --device cuda:0 \
+      --coord-source dataset \
+      --sample-mode pixel \
+      --num-samples "$shard_num_samples" \
+      --num-shards "$collect_nproc" \
+      --shard-index "$shard_idx" \
+      --traj-image-size "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE" \
+      --num-sample-trajs "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
+      --num-inference-steps "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
+      --guidance-scale "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
+      --save-traj-latents \
+      --save-traj-latents-768 \
+      --save-dp-actions \
+      --progress-interval "$STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL" \
+      > "$shard_log" 2>&1 &
+    pids+=("$!")
+  done
+
+  local failed=0
+  for shard_idx in "${!pids[@]}"; do
+    if wait "${pids[$shard_idx]}"; then
+      echo "[launcher] shard $shard_idx finished"
+    else
+      echo "[launcher] shard $shard_idx failed; see ${STAGE2_TEACHER_COLLECT_SHARD_DIR}/shard_$(printf '%02d' "$shard_idx").log" >&2
+      failed=1
+    fi
+  done
+  if [[ "$failed" -ne 0 ]]; then
+    echo "Teacher sidecar collection failed. Fix the failed shard logs above, then rerun; completed shards will resume." >&2
+    exit 1
+  fi
+
+  local tmp_output="${STAGE2_ADAPTER_TEACHER_JSONL}.tmp.$$"
+  : > "$tmp_output"
+  for shard_output in "${shard_outputs[@]}"; do
+    if [[ -f "$shard_output" ]]; then
+      cat "$shard_output" >> "$tmp_output"
+    fi
+  done
+  mv "$tmp_output" "$STAGE2_ADAPTER_TEACHER_JSONL"
 
   if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
     echo "Teacher sidecar collection finished but JSONL is missing or empty: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
     exit 1
   fi
   printf '%s' "$current_sig" > "$meta"
+  rm -f "$collecting_meta"
   touch "$marker"
   echo "[launcher] native teacher sidecar 已就绪: $STAGE2_ADAPTER_TEACHER_JSONL"
 }
