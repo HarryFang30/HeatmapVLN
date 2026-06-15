@@ -1055,6 +1055,15 @@ def parse_args() -> argparse.Namespace:
         help="Override trajectory.samples_per_clip when clip-level sampling is enabled.",
     )
     p.add_argument(
+        "--pixel-goal-direction",
+        default=None,
+        help=(
+            "Override trajectory.pixel_goal_direction. For --coord-source dataset, "
+            "defaults to front_down because InternNav conditions System1 from the "
+            "lookdown/front_down image."
+        ),
+    )
+    p.add_argument(
         "--clip-level-sampling",
         dest="clip_level_sampling",
         action="store_true",
@@ -1182,6 +1191,10 @@ def main() -> None:
     traj_cfg["load_lookdown_for_system2"] = True
     traj_cfg["load_traj_images"] = True
     traj_cfg["enable_trajectory_augmentation"] = False
+    if args.pixel_goal_direction is not None:
+        traj_cfg["pixel_goal_direction"] = str(args.pixel_goal_direction)
+    elif args.coord_source == "dataset":
+        traj_cfg["pixel_goal_direction"] = "front_down"
     if args.sample_stride is not None:
         traj_cfg["sample_stride"] = int(args.sample_stride)
     if args.samples_per_clip is not None:
@@ -1201,6 +1214,7 @@ def main() -> None:
         f"sample_stride={traj_cfg.get('sample_stride')} "
         f"clip_level_sampling={traj_cfg.get('clip_level_sampling')} "
         f"samples_per_clip={traj_cfg.get('samples_per_clip')} "
+        f"pixel_goal_direction={traj_cfg.get('pixel_goal_direction')} "
         f"require_pixel_goal={args.require_pixel_goal} include_stop={args.include_stop} "
         f"shard={args.shard_index}/{args.num_shards}",
         flush=True,
@@ -1219,10 +1233,11 @@ def main() -> None:
         enable_trajectory_augmentation=False,
         load_history_heatmap=False,
         panoramic_vlm_input=args.coord_source == "pano",
-        compute_pixel_goal=args.coord_source == "pano",
+        compute_pixel_goal=args.coord_source in {"pano", "dataset"},
         compute_pano_view_pixel_goal=args.coord_source == "pano",
         pano_max_side_dist_m=float(getattr(args, "pano_max_side_dist_m", 6.0)),
         load_lookdown_for_system2=args.coord_source != "pano",
+        pixel_goal_direction=traj_cfg.get("pixel_goal_direction", "front"),
         load_traj_images=True,
     )
     print(f"[dataset] samples={len(dataset)}", flush=True)

@@ -153,6 +153,7 @@ export STAGE2_TEACHER_COLLECT_NUM_SAMPLES="${STAGE2_TEACHER_COLLECT_NUM_SAMPLES:
 export STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE="${STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE:-1}"
 export STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING="${STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING:-0}"
 export STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP="${STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP:-0}"
+export STAGE2_TEACHER_COLLECT_PIXEL_GOAL_DIRECTION="${STAGE2_TEACHER_COLLECT_PIXEL_GOAL_DIRECTION:-front_down}"
 export STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL="${STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL:-100}"
 export STAGE2_TEACHER_COLLECT_PROGRESS_STYLE="${STAGE2_TEACHER_COLLECT_PROGRESS_STYLE:-tqdm}"
 export STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL="${STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL:-5.0}"
@@ -180,7 +181,7 @@ is_truthy_launcher() {
 }
 
 sidecar_signature() {
-  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
+  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|pixel_goal_direction=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
     "$PANORAMIC_DATA_ROOT" \
     "$STAGE2_TEACHER_COLLECT_SPLIT" \
     "$STAGE2_TEACHER_COLLECT_CONFIG" \
@@ -190,6 +191,7 @@ sidecar_signature() {
     "$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE" \
     "$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING" \
     "$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP" \
+    "$STAGE2_TEACHER_COLLECT_PIXEL_GOAL_DIRECTION" \
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
     "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
     "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
@@ -303,7 +305,7 @@ ensure_native_teacher_sidecar() {
   echo "[launcher]   tensors=$STAGE2_TEACHER_TENSOR_DIR"
   echo "[launcher]   shard_dir=$STAGE2_TEACHER_COLLECT_SHARD_DIR"
   echo "[launcher]   collect_config=$STAGE2_TEACHER_COLLECT_CONFIG"
-  echo "[launcher]   sample_stride=$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE clip_level_sampling=$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING samples_per_clip=$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP"
+  echo "[launcher]   sample_stride=$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE clip_level_sampling=$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING samples_per_clip=$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP pixel_goal_direction=$STAGE2_TEACHER_COLLECT_PIXEL_GOAL_DIRECTION"
   echo "[launcher]   gpus=${collect_gpus[*]:0:$collect_nproc} nproc=$collect_nproc"
 
   local shard_num_samples="$STAGE2_TEACHER_COLLECT_NUM_SAMPLES"
@@ -337,6 +339,7 @@ ensure_native_teacher_sidecar() {
       --num-shards "$collect_nproc"
       --shard-index "$shard_idx"
       --sample-stride "$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE"
+      --pixel-goal-direction "$STAGE2_TEACHER_COLLECT_PIXEL_GOAL_DIRECTION"
       --traj-image-size "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE"
       --num-sample-trajs "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS"
       --num-inference-steps "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS"
