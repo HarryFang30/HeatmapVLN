@@ -36,6 +36,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:  # pragma: no cover - tqdm is optional in cluster envs.
+    _tqdm = None
+
 from scripts.training.utils import load_config
 from src.data.factory import build_trajectory_dataset
 from src.data.pano_teacher_alignment import (
@@ -1113,6 +1118,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-save-dp-actions", dest="save_dp_actions", action="store_false")
     p.add_argument("--round-digits", type=int, default=5)
     p.add_argument("--progress-interval", type=int, default=20)
+    p.add_argument(
+        "--progress-style",
+        choices=["tqdm", "log", "none"],
+        default="tqdm",
+        help="tqdm writes a live progress bar; log keeps periodic [progress] lines.",
+    )
+    p.add_argument("--tqdm-mininterval", type=float, default=5.0)
     return p.parse_args()
 
 
@@ -1204,61 +1216,105 @@ def main() -> None:
     errors = 0
     scanned = 0
     kind_counts: dict[str, int] = {}
-    with out_path.open("a", encoding="utf-8", buffering=1) as f:
-        for idx in range(len(dataset)):
-            scanned += 1
-            if args.num_shards > 1 and idx % args.num_shards != args.shard_index:
-                continue
-            if idx in done:
-                skipped += 1
-                continue
-            if args.num_samples > 0 and written >= args.num_samples:
-                break
+    use_tqdm = args.progress_style == "tqdm" and _tqdm is not None
+    if args.progress_style == "tqdm" and _tqdm is None:
+        print("[progress] tqdm is not installed; falling back to log progress", flush=True)
 
-            try:
-                sample = dataset[idx]
-                if not _sample_passes_mode(sample, args):
+    if args.num_shards > 1:
+        index_iter = range(args.shard_index, len(dataset), args.num_shards)
+    else:
+        index_iter = range(len(dataset))
+    shard_total = len(index_iter)
+
+    pbar = None
+    if use_tqdm:
+        pbar = _tqdm(
+            total=shard_total,
+            desc=f"sidecar shard {args.shard_index}/{args.num_shards}",
+            unit="idx",
+            dynamic_ncols=True,
+            mininterval=float(args.tqdm_mininterval),
+            file=sys.stderr,
+            disable=False,
+        )
+
+    def _emit_progress(idx: int) -> None:
+        if args.progress_interval <= 0:
+            return
+        if scanned % args.progress_interval != 0:
+            return
+        progress_state = {
+            "attempted": attempted,
+            "written": written,
+            "skipped": skipped,
+            "errors": errors,
+            "last_idx": int(idx),
+        }
+        if pbar is not None:
+            pbar.set_postfix(progress_state, refresh=True)
+        elif args.progress_style != "none":
+            print(
+                f"[progress] scanned={scanned} attempted={attempted} written={written} "
+                f"skipped={skipped} errors={errors} last_idx={idx}",
+                flush=True,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        with out_path.open("a", encoding="utf-8", buffering=1) as f:
+            for idx in index_iter:
+                scanned += 1
+                if pbar is not None:
+                    pbar.update(1)
+                if idx in done:
                     skipped += 1
+                    _emit_progress(idx)
                     continue
+                if args.num_samples > 0 and written >= args.num_samples:
+                    break
 
-                kind = _sample_kind(sample)
-                kind_counts[kind] = kind_counts.get(kind, 0) + 1
-                rec = _collect_one(
-                    idx,
-                    sample,
-                    dataset,
-                    model,
-                    processor,
-                    traj_to_actions_fn,
-                    device,
-                    dtype,
-                    action_scale,
-                    args,
-                    rng,
-                )
-                attempted += 1
-                written += 1
-                f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-            except Exception as exc:
-                errors += 1
-                if not args.skip_errors:
-                    raise
-                err_rec = {
-                    "status": "error",
-                    **_sample_metadata(dataset, idx),
-                    "error": repr(exc),
-                }
-                f.write(json.dumps(err_rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-                written += 1
+                try:
+                    sample = dataset[idx]
+                    if not _sample_passes_mode(sample, args):
+                        skipped += 1
+                        _emit_progress(idx)
+                        continue
 
-            if args.progress_interval > 0 and scanned % args.progress_interval == 0:
-                print(
-                    f"[progress] scanned={scanned} attempted={attempted} written={written} skipped={skipped} "
-                    f"errors={errors} last_idx={idx}",
-                    flush=True,
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    kind = _sample_kind(sample)
+                    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                    rec = _collect_one(
+                        idx,
+                        sample,
+                        dataset,
+                        model,
+                        processor,
+                        traj_to_actions_fn,
+                        device,
+                        dtype,
+                        action_scale,
+                        args,
+                        rng,
+                    )
+                    attempted += 1
+                    written += 1
+                    f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+                except Exception as exc:
+                    errors += 1
+                    if not args.skip_errors:
+                        raise
+                    err_rec = {
+                        "status": "error",
+                        **_sample_metadata(dataset, idx),
+                        "error": repr(exc),
+                    }
+                    f.write(json.dumps(err_rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    written += 1
+
+                _emit_progress(idx)
+    finally:
+        if pbar is not None:
+            pbar.close()
 
     print(
         f"[done] output={out_path} scanned={scanned} attempted={attempted} written={written} skipped={skipped} "
