@@ -5,19 +5,18 @@ Train a panoramic latent-space adapter for InternNav System1.
 This is intentionally narrower than Stage2 bridge training:
   student: panoramic Qwen TRAJ hidden states from HeatmapVLN / Stage1-S2
   output:  adapted 3584-dim latents before InternNav's frozen cond_projector
-  loss:    GT trajectory loss through frozen cond_projector + NextDiT
+  loss:    native InternNav teacher latent/cond distillation + GT trajectory
+           loss through frozen cond_projector + NextDiT
   train:   adapter only; Pano-System2 and InternNav System1 stay frozen
 
 Frozen VLM + frozen InternNav System1 let this test answer one question:
 can a small residual MLP translate the student VLM latent "dialect" into the
 InternNav latent "dialect" that frozen cond_projector + NextDiT can execute?
 
-..  warning::
-    Teacher latents are optional diagnostics only.  When
-    ``--compute-teacher-mse`` is enabled, aligned teacher latents use a
-    synthetic single-turn structured pano protocol (``view: front\\npixel: u v``)
-    rather than InternNav's native two-turn lookdown + raw-coordinate path.
-    The diagnostic MSE is logged but never participates in the training loss.
+Native teacher sidecars must come from InternNav's front/history + lookdown
+protocol (``collect_internnav_teacher_sidecar.py --coord-source dataset``).
+They are matched to panoramic student samples by ``(clip_idx, current_t)``,
+not by the integer dataset index.
 """
 
 from __future__ import annotations
@@ -85,6 +84,7 @@ REQUIRED_SYSTEM1_PREFIXES = (
 class AdapterTrainBatch:
     student_latents: torch.Tensor
     teacher_latents: torch.Tensor | None
+    teacher_cond: torch.Tensor | None
     records: list[dict[str, Any]]
     trajectory: torch.Tensor | None = None
     trajectory_valid: torch.Tensor | None = None
@@ -369,6 +369,7 @@ def _load_teacher_records(
     *,
     require_tensor: bool = True,
     require_coord_uv: bool = True,
+    require_native_teacher: bool = False,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with jsonl_path.open("r", encoding="utf-8") as f:
@@ -381,6 +382,11 @@ def _load_teacher_records(
             if rec.get("dataset_index") is None:
                 continue
             teacher = rec.get("teacher", {})
+            if require_native_teacher:
+                coord_source = str(teacher.get("coord_source") or "").lower()
+                mode = str(teacher.get("mode") or "").lower()
+                if coord_source != "dataset" or mode != "dataset_coord":
+                    continue
             tensor_info = teacher.get("system1", {}).get("tensor_sidecar", {})
             tensor_path = _resolve_tensor_path(jsonl_path, tensor_info.get("path"))
             if require_tensor and (tensor_path is None or not tensor_path.is_file()):
@@ -388,6 +394,8 @@ def _load_teacher_records(
             if require_coord_uv and teacher.get("coord_uv") is None:
                 continue
             rec["_tensor_path"] = str(tensor_path) if tensor_path is not None else None
+            rec["_sidecar_coord_source"] = teacher.get("coord_source")
+            rec["_sidecar_mode"] = teacher.get("mode")
             # Extract pano alignment metadata for sidecar validation.
             ds_label = rec.get("dataset_label", {}) or {}
             rec["_sidecar_pano_view_id"] = (
@@ -403,6 +411,39 @@ def _load_teacher_records(
             )
             records.append(rec)
     return records
+
+
+def _validate_native_teacher_sidecar_record(rec: dict[str, Any]) -> bool:
+    teacher = rec.get("teacher", {}) or {}
+    if str(teacher.get("coord_source") or "").lower() != "dataset":
+        return False
+    if str(teacher.get("mode") or "").lower() != "dataset_coord":
+        return False
+    tensor_path = rec.get("_tensor_path")
+    if not tensor_path or not Path(str(tensor_path)).is_file():
+        return False
+    try:
+        payload = _load_validated_tensor_sidecar_payload(rec)
+    except Exception as exc:
+        LOGGER.warning(
+            "Skip native teacher record dataset_index=%s: invalid tensor sidecar (%r)",
+            rec.get("dataset_index"),
+            exc,
+        )
+        return False
+    if "traj_latents" not in payload:
+        LOGGER.warning(
+            "Skip native teacher record dataset_index=%s: tensor sidecar has no traj_latents",
+            rec.get("dataset_index"),
+        )
+        return False
+    if not any(key in payload for key in ("traj_latents_768", "traj_cond_768", "traj_cond")):
+        LOGGER.warning(
+            "Native teacher record dataset_index=%s has no saved 768-dim cond; "
+            "will project raw latents through the frozen student cond_projector.",
+            rec.get("dataset_index"),
+        )
+    return True
 
 
 def _load_alignment_teacher(args: argparse.Namespace, device: torch.device):
@@ -704,6 +745,7 @@ def _filter_records_with_pano_goals(
     *,
     dataset: Any,
     validate_sidecar_metadata: bool = False,
+    require_native_teacher_sidecar: bool = False,
 ) -> list[dict[str, Any]]:
     """Keep records whose exact frame has a structured pano pixel goal.
 
@@ -721,8 +763,23 @@ def _filter_records_with_pano_goals(
     mismatched = 0
     missing_metadata = 0
     invalid_tensor = 0
+    invalid_native = 0
     for rec in records:
         idx = rec.get("dataset_index")
+        if require_native_teacher_sidecar:
+            if str(rec.get("_sidecar_coord_source") or "").lower() != "dataset":
+                invalid_native += 1
+                continue
+            if str(rec.get("_sidecar_mode") or "").lower() != "dataset_coord":
+                invalid_native += 1
+                continue
+            if rec.get("clip_idx") is None or rec.get("current_t") is None:
+                invalid_native += 1
+                continue
+            tensor_path = rec.get("_tensor_path")
+            if not tensor_path or not Path(str(tensor_path)).is_file():
+                invalid_native += 1
+                continue
         try:
             sample = _sample_from_record(dataset, rec)
         except Exception as exc:
@@ -780,19 +837,20 @@ def _filter_records_with_pano_goals(
     LOGGER.info(
         "Filtered teacher records for pano pixel goals: "
         "kept=%d skipped_no_pano_goal=%d failed=%d mismatched=%d "
-        "missing_metadata=%d invalid_tensor=%d",
+        "missing_metadata=%d invalid_tensor=%d invalid_native=%d",
         len(filtered),
         skipped,
         failed,
         mismatched,
         missing_metadata,
         invalid_tensor,
+        invalid_native,
     )
-    if mismatched or missing_metadata or invalid_tensor:
+    if mismatched or missing_metadata or invalid_tensor or invalid_native:
         LOGGER.warning(
-            "%d sidecar records failed strict alignment validation and were dropped. "
+            "%d sidecar records failed strict/native validation and were dropped. "
             "Re-collect sidecars if this count is unexpected.",
-            mismatched + missing_metadata + invalid_tensor,
+            mismatched + missing_metadata + invalid_tensor + invalid_native,
         )
     return filtered
 
@@ -859,6 +917,155 @@ def _latent_loss(
         "target_norm": float(tn_mean.detach().item()),
         "norm_ratio": float(nr_mean.detach().item()),
     }
+
+
+def _cosine_and_norm_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    norm_weight: float = 0.1,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    pred_f = pred.float()
+    target_f = target.to(device=pred.device, dtype=torch.float32)
+    cos = F.cosine_similarity(pred_f.flatten(1), target_f.flatten(1), dim=1)
+    cos_loss = (1.0 - cos).mean()
+    pred_norm = pred_f.norm(dim=-1)
+    target_norm = target_f.norm(dim=-1).clamp_min(1.0e-6)
+    norm_ratio = pred_norm / target_norm
+    norm_loss = (torch.log(norm_ratio.clamp_min(1.0e-6)) ** 2).mean()
+    loss = cos_loss + float(norm_weight) * norm_loss
+    return loss, {
+        "cos": float(cos.mean().detach().item()),
+        "cos_loss": float(cos_loss.detach().item()),
+        "norm_loss": float(norm_loss.detach().item()),
+        "pred_norm": float(pred_norm.mean().detach().item()),
+        "target_norm": float(target_norm.mean().detach().item()),
+        "norm_ratio": float(norm_ratio.mean().detach().item()),
+    }
+
+
+def _cond_distill_loss(
+    pred_cond: torch.Tensor,
+    teacher_cond: torch.Tensor,
+    *,
+    cosine_weight: float = 1.0,
+    beta: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    pred_f = pred_cond.float()
+    target_f = teacher_cond.to(device=pred_cond.device, dtype=torch.float32)
+    smooth_l1 = F.smooth_l1_loss(pred_f, target_f, beta=float(beta))
+    cos = F.cosine_similarity(pred_f.flatten(1), target_f.flatten(1), dim=1)
+    cos_loss = (1.0 - cos).mean()
+    mse = F.mse_loss(pred_f, target_f)
+    loss = smooth_l1 + float(cosine_weight) * cos_loss
+    return loss, {
+        "cos": float(cos.mean().detach().item()),
+        "cos_loss": float(cos_loss.detach().item()),
+        "smooth_l1": float(smooth_l1.detach().item()),
+        "mse": float(mse.detach().item()),
+        "pred_norm": float(pred_f.norm(dim=-1).mean().detach().item()),
+        "target_norm": float(target_f.norm(dim=-1).mean().detach().item()),
+    }
+
+
+def _gt_flow_loss_from_projected(
+    *,
+    model: Any,
+    pred_cond: torch.Tensor,
+    batch: AdapterTrainBatch,
+) -> torch.Tensor:
+    if batch.trajectory is None or model.nextdit_action_head is None:
+        return pred_cond.sum() * 0.0
+    head = model.nextdit_action_head
+    dit_dtype = next(head.action_encoder.parameters()).dtype
+    gt = batch.trajectory.to(device=pred_cond.device, dtype=dit_dtype)
+    images = batch.traj_images.to(device=pred_cond.device) if batch.traj_images is not None else None
+    valid = batch.trajectory_valid.to(device=pred_cond.device) if batch.trajectory_valid is not None else None
+    pred_exp, gt_exp, images_exp, valid_exp = head._expand_sequence_training_inputs(
+        pred_cond.to(dtype=dit_dtype),
+        gt,
+        images,
+        valid,
+    )
+    noisy, timesteps, target_vel = head.sample_flow_matching_inputs(gt_exp)
+    pred_vel = head.predict_velocity_from_projected(
+        pred_exp,
+        noisy,
+        timesteps,
+        traj_images=images_exp,
+    )
+    return head.masked_velocity_mse(pred_vel, target_vel, valid_exp)
+
+
+def _compute_adapter_objective(
+    *,
+    model: Any,
+    pred_raw: torch.Tensor,
+    batch: AdapterTrainBatch,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+    head = getattr(model, "nextdit_action_head", None)
+    if head is None:
+        raise RuntimeError("Adapter training requires model.nextdit_action_head")
+    cond_projector = head.cond_projector
+    proj_dtype = next(cond_projector.parameters()).dtype
+    pred_cond = cond_projector(pred_raw.to(dtype=proj_dtype))
+
+    zero = pred_raw.sum() * 0.0
+    raw_loss = zero
+    raw_stats = {
+        "cos": 0.0,
+        "cos_loss": 0.0,
+        "norm_loss": 0.0,
+        "pred_norm": 0.0,
+        "target_norm": 0.0,
+        "norm_ratio": 0.0,
+    }
+    if batch.teacher_latents is not None and float(args.raw_distill_weight) > 0:
+        raw_loss, raw_stats = _cosine_and_norm_loss(
+            pred_raw,
+            batch.teacher_latents,
+            norm_weight=float(args.raw_norm_weight),
+        )
+
+    cond_loss = zero
+    cond_stats = {
+        "cos": 0.0,
+        "cos_loss": 0.0,
+        "smooth_l1": 0.0,
+        "mse": 0.0,
+        "pred_norm": 0.0,
+        "target_norm": 0.0,
+    }
+    if batch.teacher_cond is not None and float(args.cond_distill_weight) > 0:
+        cond_loss, cond_stats = _cond_distill_loss(
+            pred_cond,
+            batch.teacher_cond,
+            cosine_weight=float(args.cond_cosine_weight),
+            beta=float(args.cond_smooth_l1_beta),
+        )
+
+    gt_loss = _gt_flow_loss_from_projected(model=model, pred_cond=pred_cond, batch=batch)
+    loss = (
+        float(args.raw_distill_weight) * raw_loss
+        + float(args.cond_distill_weight) * cond_loss
+        + float(args.gt_weight) * gt_loss
+    )
+    metrics = {
+        "loss": float(loss.detach().item()),
+        "raw": float(raw_loss.detach().item()),
+        "raw_cos": raw_stats["cos"],
+        "raw_cos_loss": raw_stats["cos_loss"],
+        "raw_norm_loss": raw_stats["norm_loss"],
+        "raw_norm_ratio": raw_stats["norm_ratio"],
+        "cond": float(cond_loss.detach().item()),
+        "cond_cos": cond_stats["cos"],
+        "cond_cos_loss": cond_stats["cos_loss"],
+        "cond_smooth_l1": cond_stats["smooth_l1"],
+        "cond_mse": cond_stats["mse"],
+        "gt": float(gt_loss.detach().item()),
+    }
+    return loss, metrics, pred_cond
 
 
 def _has_trainable_pano_goal(sample: dict[str, Any]) -> bool:
@@ -1135,9 +1342,25 @@ def _build_batch(
         sft_protocol="direct", return_batch=True,
     )
 
-    # Teacher latents are only needed for MSE loss (legacy).  Pure GT-loss
-    # training skips teacher inference entirely.
+    # Native sidecar mode loads executable InternNav raw/cond targets from
+    # tensor sidecars. Legacy aligned mode only computes teacher targets when
+    # a teacher model is explicitly requested.
     teacher_latents: torch.Tensor | None = None
+    teacher_cond: torch.Tensor | None = None
+    if teacher_target_mode == "native_sidecar":
+        teacher_latents = _load_teacher_latents(
+            usable_records,
+            device,
+            model=model,
+            target_dim=int(student_latents.shape[-1]),
+        )
+        cond_dim = int(model.nextdit_action_head.config.latent_emb_size)
+        teacher_cond = _load_teacher_latents(
+            usable_records,
+            device,
+            model=model,
+            target_dim=cond_dim,
+        )
     if teacher_model is not None and teacher_processor is not None:
         try:
             teacher_device = next(teacher_model.parameters()).device
@@ -1148,6 +1371,11 @@ def _build_batch(
             teacher_device,
             turn_args=teacher_turn_args or make_teacher_turn_args(),
         ).to(device)
+        if model.nextdit_action_head is not None:
+            cond_projector = model.nextdit_action_head.cond_projector
+            proj_dtype = next(cond_projector.parameters()).dtype
+            with torch.no_grad():
+                teacher_cond = cond_projector(teacher_latents.to(dtype=proj_dtype)).detach()
 
     trajectory = _collated_tensor(collated, "trajectory", device)
     trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
@@ -1156,6 +1384,7 @@ def _build_batch(
     batch = AdapterTrainBatch(
         student_latents=student_latents,
         teacher_latents=teacher_latents,  # type: ignore[arg-type]
+        teacher_cond=teacher_cond,
         records=usable_records,
         trajectory=trajectory,
         trajectory_valid=trajectory_valid,
@@ -1169,6 +1398,7 @@ def _evaluate_adapter(
     adapter: nn.Module,
     val_records: list[dict[str, Any]],
     *,
+    args: argparse.Namespace,
     dataset: Any,
     model: Any,
     processor: Any,
@@ -1201,29 +1431,20 @@ def _evaluate_adapter(
                 teacher_turn_args=teacher_turn_args,
             )
             pred = adapter(batch.student_latents)
-            mse = float(F.mse_loss(
-                pred.float(),
-                batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
-            ).item()) if batch.teacher_latents is not None else 0.0
-            gt_val = 0.0
-            if batch.trajectory is not None and model.nextdit_action_head is not None:
-                head = model.nextdit_action_head
-                proj_dtype = next(head.cond_projector.parameters()).dtype
-                projected = head.cond_projector(pred.to(dtype=proj_dtype))
-                gt_t = batch.trajectory.to(device=pred.device, dtype=proj_dtype)
-                images_t = batch.traj_images.to(device=pred.device) if batch.traj_images is not None else None
-                valid_t = batch.trajectory_valid.to(device=pred.device) if batch.trajectory_valid is not None else None
-                pe, ge, ie, ve = head._expand_sequence_training_inputs(projected, gt_t, images_t, valid_t)
-                noisy, ts, tv = head.sample_flow_matching_inputs(ge)
-                pv = head.predict_velocity_from_projected(pe, noisy, ts, traj_images=ie)
-                gt_val = float(head.masked_velocity_mse(pv, tv, ve).item())
-            val_loss = gt_val
+            _loss, metrics, _pred_cond = _compute_adapter_objective(
+                model=model,
+                pred_raw=pred,
+                batch=batch,
+                args=args,
+            )
             count += 1
-            running["loss"] = running.get("loss", 0.0) + val_loss
-            running["mse"] = running.get("mse", 0.0) + mse
-            running["gt"] = running.get("gt", 0.0) + gt_val
-            avg_mse = running["mse"] / count
-            pbar.set_postfix(mse=f"{avg_mse:.6f}", gt=f"{running['gt']/count:.5f}")
+            for key, value in metrics.items():
+                running[key] = running.get(key, 0.0) + value
+            pbar.set_postfix(
+                loss=f"{running.get('loss', 0.0)/count:.5f}",
+                cond_cos=f"{running.get('cond_cos', 0.0)/count:.3f}",
+                gt=f"{running.get('gt', 0.0)/count:.5f}",
+            )
             pbar.update(1)
     finally:
         pbar.close()
@@ -1298,6 +1519,15 @@ def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
     defaults["teacher_attn_implementation"] = str(teacher.get("attn_implementation", "sdpa"))
     defaults["teacher_flash_attn_stub"] = bool(teacher.get("flash_attn_stub", True))
 
+    # Loss
+    loss_cfg = adapter_cfg.get("loss", {}) or {}
+    defaults["raw_distill_weight"] = float(loss_cfg.get("raw_weight", 0.1))
+    defaults["cond_distill_weight"] = float(loss_cfg.get("cond_weight", 1.0))
+    defaults["gt_weight"] = float(loss_cfg.get("gt_weight", 0.2))
+    defaults["raw_norm_weight"] = float(loss_cfg.get("raw_norm_weight", 0.1))
+    defaults["cond_cosine_weight"] = float(loss_cfg.get("cond_cosine_weight", 1.0))
+    defaults["cond_smooth_l1_beta"] = float(loss_cfg.get("cond_smooth_l1_beta", 1.0))
+
     return defaults
 
 
@@ -1329,22 +1559,23 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument("--split", default="train")
     p.add_argument("--teacher-jsonl", default="",
                    help=(
-                       "Optional record/teacher sidecar JSONL. In aligned mode it can supply "
-                       "a prefiltered record subset; when empty, records are auto-generated "
-                       "from the dataset."
+                       "Teacher sidecar JSONL. Required for native_sidecar mode; collect "
+                       "with collect_internnav_teacher_sidecar.py --coord-source dataset "
+                       "--tensor-output-dir. In legacy aligned mode it may supply a "
+                       "prefiltered record subset."
                    ))
     p.add_argument("--base-checkpoint", default="checkpoints/stage1-s2_latest.pth")
     p.add_argument("--internnav-model-path", default=os.environ.get("INTERNNAV_MODEL_PATH", ""))
     p.add_argument("--internnav-repo", default=os.environ.get("INTERNNAV_REPO", "~/InternNav"))
     p.add_argument(
         "--teacher-target-mode",
-        choices=["aligned", "sidecar"],
+        choices=["aligned", "sidecar", "native_sidecar"],
         default=adapter_defaults.get("teacher_target_mode", "aligned"),
         help=(
-            "aligned: build records from dataset pano goals; teacher latents are only "
-            "computed when --compute-teacher-mse is set. "
-            "sidecar: legacy pre-collected 768-dim tensors; unsupported for the "
-            "pure-GT PanoLatentSpaceAdapter path."
+            "native_sidecar: use InternNav native front/lookdown teacher tensors "
+            "collected with coord_source=dataset and align by (clip_idx,current_t). "
+            "aligned: legacy synthetic pano teacher diagnostic path. "
+            "sidecar: legacy pre-collected sidecars."
         ),
     )
     p.add_argument(
@@ -1380,6 +1611,12 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=adapter_defaults.get("grad_clip", 1.0))
     p.add_argument("--adapter-hidden-dim", type=int, default=adapter_defaults.get("adapter_hidden_dim", 2048))
     p.add_argument("--adapter-dropout", type=float, default=adapter_defaults.get("adapter_dropout", 0.0))
+    p.add_argument("--raw-distill-weight", type=float, default=adapter_defaults.get("raw_distill_weight", 0.1))
+    p.add_argument("--cond-distill-weight", type=float, default=adapter_defaults.get("cond_distill_weight", 1.0))
+    p.add_argument("--gt-weight", type=float, default=adapter_defaults.get("gt_weight", 0.2))
+    p.add_argument("--raw-norm-weight", type=float, default=adapter_defaults.get("raw_norm_weight", 0.1))
+    p.add_argument("--cond-cosine-weight", type=float, default=adapter_defaults.get("cond_cosine_weight", 1.0))
+    p.add_argument("--cond-smooth-l1-beta", type=float, default=adapter_defaults.get("cond_smooth_l1_beta", 1.0))
     p.add_argument("--pano-max-side-dist-m", type=float, default=6.0)
     p.add_argument(
         "--val-ratio",
@@ -1434,11 +1671,12 @@ def main() -> int:
 
         if teacher_jsonl_str:
             teacher_jsonl = Path(teacher_jsonl_str).expanduser()
-            use_sidecar_tensors = args.teacher_target_mode == "sidecar"
+            use_sidecar_tensors = args.teacher_target_mode in {"sidecar", "native_sidecar"}
             records = _load_teacher_records(
                 teacher_jsonl,
                 require_tensor=use_sidecar_tensors,
                 require_coord_uv=use_sidecar_tensors,
+                require_native_teacher=args.teacher_target_mode == "native_sidecar",
             )
             if args.max_samples > 0:
                 records = records[: args.max_samples]
@@ -1455,7 +1693,8 @@ def main() -> int:
             records = _filter_records_with_pano_goals(
                 records,
                 dataset=dataset,
-                validate_sidecar_metadata=use_sidecar_tensors,
+                validate_sidecar_metadata=args.teacher_target_mode == "sidecar",
+                require_native_teacher_sidecar=args.teacher_target_mode == "native_sidecar",
             )
         elif args.teacher_target_mode == "aligned":
             if _rank0():
@@ -1471,7 +1710,7 @@ def main() -> int:
                 LOGGER.info("Auto-generated %d records from dataset", len(records))
         else:
             raise RuntimeError(
-                "--teacher-jsonl is required for teacher-target-mode=sidecar"
+                f"--teacher-jsonl is required for teacher-target-mode={args.teacher_target_mode}"
             )
 
         if not records:
@@ -1497,21 +1736,33 @@ def main() -> int:
                 teacher_model, teacher_processor = _load_alignment_teacher(args, teacher_device)
                 if _rank0():
                     LOGGER.info("Loaded aligned InternNav teacher on %s (MSE diagnostic)", teacher_device)
+            elif args.teacher_target_mode == "native_sidecar":
+                if _rank0():
+                    LOGGER.info(
+                        "Using native teacher tensor sidecars; no teacher model is loaded "
+                        "during adapter training."
+                    )
             elif args.teacher_target_mode == "sidecar":
                 raise RuntimeError(
-                    "sidecar mode stores 768-dim latents but PanoLatentSpaceAdapter "
-                    "targets 3584-dim. Use --teacher-target-mode=aligned or omit "
-                    "--compute-teacher-mse."
+                    "Use --teacher-target-mode=native_sidecar for native InternNav tensor sidecars."
                 )
         else:
             if args.teacher_target_mode == "sidecar":
                 raise RuntimeError(
-                    "PanoLatentSpaceAdapter uses pure GT loss. "
-                    "sidecar mode (768-dim teacher latents) is not supported."
+                    "Use --teacher-target-mode=native_sidecar for native InternNav tensor sidecars."
                 )
-            if _rank0():
-                LOGGER.info("Pure GT loss — teacher model not loaded "
-                            "(use --compute-teacher-mse for diagnostic MSE)")
+            if _rank0() and args.teacher_target_mode == "native_sidecar":
+                LOGGER.info(
+                    "Using native teacher tensor sidecars with weights: raw=%.3f cond=%.3f gt=%.3f",
+                    args.raw_distill_weight,
+                    args.cond_distill_weight,
+                    args.gt_weight,
+                )
+            elif _rank0():
+                LOGGER.info(
+                    "No native teacher sidecar targets active; teacher model not loaded "
+                    "(legacy aligned mode can still use --compute-teacher-mse)."
+                )
 
         n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
         hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
@@ -1621,34 +1872,12 @@ def main() -> int:
                     teacher_turn_args=teacher_turn_args,
                 )
                 pred = train_adapter(batch.student_latents)
-                mse = torch.tensor(0.0, device=pred.device)
-                if batch.teacher_latents is not None:
-                    mse = F.mse_loss(
-                        pred.float(),
-                        batch.teacher_latents.to(device=pred.device, dtype=torch.float32),
-                    )
-                gt_loss = torch.tensor(0.0, device=pred.device)
-                if batch.trajectory is not None and model.nextdit_action_head is not None:
-                    head = model.nextdit_action_head
-                    proj_dtype = next(head.cond_projector.parameters()).dtype
-                    projected = head.cond_projector(pred.to(dtype=proj_dtype))  # (B,Q,3584)→(B,Q,768)
-                    gt = batch.trajectory.to(device=pred.device, dtype=proj_dtype)
-                    images = batch.traj_images.to(device=pred.device) if batch.traj_images is not None else None
-                    valid = batch.trajectory_valid.to(device=pred.device) if batch.trajectory_valid is not None else None
-                    pred_exp, gt_exp, images_exp, valid_exp = head._expand_sequence_training_inputs(
-                        projected, gt, images, valid,
-                    )
-                    noisy, timesteps, target_vel = head.sample_flow_matching_inputs(gt_exp)
-                    pred_vel = head.predict_velocity_from_projected(
-                        pred_exp, noisy, timesteps, traj_images=images_exp,
-                    )
-                    gt_loss = head.masked_velocity_mse(pred_vel, target_vel, valid_exp)
-                loss = gt_loss
-                metrics = {
-                    "loss": float(loss.detach().item()),
-                    "mse": float(mse.detach().item()),
-                    "gt": float(gt_loss.detach().item()),
-                }
+                loss, metrics, _pred_cond = _compute_adapter_objective(
+                    model=model,
+                    pred_raw=pred,
+                    batch=batch,
+                    args=args,
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1665,16 +1894,25 @@ def main() -> int:
                 avg = {k: v / max(count, 1) for k, v in running.items()}
                 pbar.set_postfix(
                     loss=f"{avg.get('loss', 0):.5f}",
-                    mse=f"{avg.get('mse', 0):.6f}",
+                    raw_cos=f"{avg.get('raw_cos', 0):.3f}",
+                    cond_cos=f"{avg.get('cond_cos', 0):.3f}",
                     gt=f"{avg.get('gt', 0):.5f}",
                 )
                 pbar.update(1)
 
                 if _rank0() and args.log_interval > 0 and count % args.log_interval == 0:
                     LOGGER.info(
-                        "epoch=%d local_step=%d global_step=%d loss=%.6f mse=%.8f gt=%.6f",
+                        "epoch=%d local_step=%d global_step=%d loss=%.6f "
+                        "raw=%.6f raw_cos=%.4f cond=%.6f cond_cos=%.4f "
+                        "cond_smooth_l1=%.6f gt=%.6f",
                         epoch + 1, count, global_step,
-                        avg.get("loss", 0.0), avg.get("mse", 0.0), avg.get("gt", 0.0),
+                        avg.get("loss", 0.0),
+                        avg.get("raw", 0.0),
+                        avg.get("raw_cos", 0.0),
+                        avg.get("cond", 0.0),
+                        avg.get("cond_cos", 0.0),
+                        avg.get("cond_smooth_l1", 0.0),
+                        avg.get("gt", 0.0),
                     )
             pbar.close()
 
@@ -1694,6 +1932,7 @@ def main() -> int:
                 val_metrics = _evaluate_adapter(
                     _unwrap_adapter(train_adapter),
                     val_records,
+                    args=args,
                     dataset=dataset,
                     model=model,
                     processor=processor,

@@ -16,7 +16,8 @@
 #   - Student: Stage1-S2 全景 SFT checkpoint（frozen）
 #   - Frozen executor: InternNav cond_projector + NextDiT
 #   - Adapter: PanoLatentSpaceAdapter（hidden_dim=256 时约 1.84M params）
-#   - 默认 pure GT loss，不加载 teacher；MSE 诊断需显式开启
+#   - 默认先离线生成 native InternNav teacher sidecar，再训练 adapter
+#   - 全程只训练 adapter
 
 set -Eeuo pipefail
 
@@ -106,10 +107,6 @@ export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/
 # Stage1-S2 checkpoint (student weights)
 export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2}"
 
-# Optional record JSONL. Aligned mode auto-generates records from dataset when unset.
-# Pure-GT training does not use teacher sidecar tensors.
-export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-}"
-
 # Output
 export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter}"
 
@@ -131,16 +128,158 @@ export STAGE2_ADAPTER_EPOCHS="${STAGE2_ADAPTER_EPOCHS:-}"
 export STAGE2_ADAPTER_LR="${STAGE2_ADAPTER_LR:-}"
 export STAGE2_ADAPTER_MAX_SAMPLES="${STAGE2_ADAPTER_MAX_SAMPLES:-0}"
 
-# Teacher diagnostics: aligned records by default; teacher MSE is opt-in.
-export STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-aligned}"
+# Teacher targets: native InternNav sidecar by default; teacher model is not
+# loaded during adapter training.
+export STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-native_sidecar}"
 export STAGE2_ADAPTER_COMPUTE_TEACHER_MSE="${STAGE2_ADAPTER_COMPUTE_TEACHER_MSE:-0}"
 export STAGE2_ADAPTER_TEACHER_DTYPE="${STAGE2_ADAPTER_TEACHER_DTYPE:-bfloat16}"
 export STAGE2_ADAPTER_TEACHER_ATTN="${STAGE2_ADAPTER_TEACHER_ATTN:-sdpa}"
+export STAGE2_ADAPTER_RAW_WEIGHT="${STAGE2_ADAPTER_RAW_WEIGHT:-0.1}"
+export STAGE2_ADAPTER_COND_WEIGHT="${STAGE2_ADAPTER_COND_WEIGHT:-1.0}"
+export STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-0.2}"
+
+# Native teacher sidecar collection.  This is not a new Habitat dataset; it is
+# a cache of InternNav native front/lookdown teacher latents for the existing
+# trajectory dataset, aligned later by (clip_idx,current_t).
+export STAGE2_TEACHER_SIDECAR_DIR="${STAGE2_TEACHER_SIDECAR_DIR:-/mnt/afs/lixiaoou/intern/fjl/teacher_sidecars/stage2_native_dataset}"
+export STAGE2_TEACHER_TENSOR_DIR="${STAGE2_TEACHER_TENSOR_DIR:-${STAGE2_TEACHER_SIDECAR_DIR}/tensors}"
+export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-${STAGE2_TEACHER_SIDECAR_DIR}/train_native_teacher.jsonl}"
+export STAGE2_TEACHER_COLLECT_CONFIG="${STAGE2_TEACHER_COLLECT_CONFIG:-configs/train_config_internnav_8gpu_stage2_wider.yaml}"
+export STAGE2_TEACHER_COLLECT_SPLIT="${STAGE2_TEACHER_COLLECT_SPLIT:-train}"
+export STAGE2_TEACHER_COLLECT_GPU="${STAGE2_TEACHER_COLLECT_GPU:-${GPU_DEVICES%%,*}}"
+export STAGE2_TEACHER_COLLECT_NUM_SAMPLES="${STAGE2_TEACHER_COLLECT_NUM_SAMPLES:-0}"
+export STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL="${STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL:-100}"
+export STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS="${STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS:-32}"
+export STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS="${STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS:-10}"
+export STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE="${STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE:-1.0}"
+export STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE="${STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE:-224}"
+export STAGE2_TEACHER_COLLECT_ENABLE="${STAGE2_TEACHER_COLLECT_ENABLE:-1}"
+export STAGE2_TEACHER_FORCE_RECOLLECT="${STAGE2_TEACHER_FORCE_RECOLLECT:-0}"
+export STAGE2_TEACHER_COLLECT_LOG_FILE="${STAGE2_TEACHER_COLLECT_LOG_FILE:-$REPO_ROOT/logs/stage2_native_teacher_sidecar_collect.log}"
+export STAGE2_TEACHER_WAIT_TIMEOUT_S="${STAGE2_TEACHER_WAIT_TIMEOUT_S:-172800}"
 
 # FlashAttention2：默认强制开启（与 MXC500 环境一致）
 export STAGE2_ADAPTER_REQUIRE_FLASH_ATTN="${STAGE2_ADAPTER_REQUIRE_FLASH_ATTN:-1}"
 
 # Data — controlled by adapter config YAML. Override via
 # STAGE2_ADAPTER_CONFIG=my_config.yaml, not env vars.
+
+is_truthy_launcher() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sidecar_signature() {
+  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
+    "$PANORAMIC_DATA_ROOT" \
+    "$STAGE2_TEACHER_COLLECT_SPLIT" \
+    "$STAGE2_TEACHER_COLLECT_CONFIG" \
+    "$INTERNNAV_MODEL_PATH" \
+    "$INTERNNAV_REPO" \
+    "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
+    "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
+    "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
+    "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE"
+}
+
+ensure_native_teacher_sidecar() {
+  if [[ "$STAGE2_ADAPTER_TEACHER_MODE" != "native_sidecar" ]]; then
+    return 0
+  fi
+
+  local marker="${STAGE2_ADAPTER_TEACHER_JSONL}.done"
+  local meta="${STAGE2_ADAPTER_TEACHER_JSONL}.meta"
+  local current_sig
+  current_sig="$(sidecar_signature)"
+
+  if ! is_truthy_launcher "$STAGE2_TEACHER_COLLECT_ENABLE"; then
+    if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
+      echo "STAGE2_TEACHER_COLLECT_ENABLE=0 but sidecar JSONL is missing or empty: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
+      exit 1
+    fi
+    echo "[launcher] 跳过 teacher sidecar 采集，使用已有: $STAGE2_ADAPTER_TEACHER_JSONL"
+    return 0
+  fi
+
+  if [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && -f "$marker" && -f "$meta" ]] \
+    && [[ "$(cat "$meta")" == "$current_sig" ]] \
+    && ! is_truthy_launcher "$STAGE2_TEACHER_FORCE_RECOLLECT"; then
+    echo "[launcher] native teacher sidecar 已存在，跳过采集: $STAGE2_ADAPTER_TEACHER_JSONL"
+    return 0
+  fi
+
+  if [[ ! -f "$STAGE2_TEACHER_COLLECT_CONFIG" ]]; then
+    echo "Teacher collect config not found: $STAGE2_TEACHER_COLLECT_CONFIG" >&2
+    exit 1
+  fi
+  if [[ ! -d "$PANORAMIC_DATA_ROOT" ]]; then
+    echo "PANORAMIC_DATA_ROOT not found: $PANORAMIC_DATA_ROOT" >&2
+    exit 1
+  fi
+  if [[ ! -d "$INTERNNAV_MODEL_PATH" ]]; then
+    echo "INTERNNAV_MODEL_PATH not found: $INTERNNAV_MODEL_PATH" >&2
+    exit 1
+  fi
+  if [[ ! -d "$INTERNNAV_REPO" ]]; then
+    echo "INTERNNAV_REPO not found: $INTERNNAV_REPO" >&2
+    exit 1
+  fi
+
+  mkdir -p "$STAGE2_TEACHER_SIDECAR_DIR" "$STAGE2_TEACHER_TENSOR_DIR" "$(dirname "$STAGE2_TEACHER_COLLECT_LOG_FILE")"
+  echo "[launcher] 开始/恢复 native InternNav teacher sidecar 采集"
+  echo "[launcher]   data_root=$PANORAMIC_DATA_ROOT"
+  echo "[launcher]   output=$STAGE2_ADAPTER_TEACHER_JSONL"
+  echo "[launcher]   tensors=$STAGE2_TEACHER_TENSOR_DIR"
+  echo "[launcher]   gpu=$STAGE2_TEACHER_COLLECT_GPU"
+
+  CUDA_VISIBLE_DEVICES="$STAGE2_TEACHER_COLLECT_GPU" python -u scripts/evaluation/collect_internnav_teacher_sidecar.py \
+    --config "$STAGE2_TEACHER_COLLECT_CONFIG" \
+    --root "$PANORAMIC_DATA_ROOT" \
+    --split "$STAGE2_TEACHER_COLLECT_SPLIT" \
+    --output "$STAGE2_ADAPTER_TEACHER_JSONL" \
+    --tensor-output-dir "$STAGE2_TEACHER_TENSOR_DIR" \
+    --internnav-repo "$INTERNNAV_REPO" \
+    --model-path "$INTERNNAV_MODEL_PATH" \
+    --device cuda:0 \
+    --coord-source dataset \
+    --sample-mode pixel \
+    --num-samples "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" \
+    --traj-image-size "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE" \
+    --num-sample-trajs "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
+    --num-inference-steps "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
+    --guidance-scale "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
+    --save-traj-latents \
+    --save-traj-latents-768 \
+    --save-dp-actions \
+    --progress-interval "$STAGE2_TEACHER_COLLECT_PROGRESS_INTERVAL" \
+    2>&1 | tee "$STAGE2_TEACHER_COLLECT_LOG_FILE"
+
+  if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
+    echo "Teacher sidecar collection finished but JSONL is missing or empty: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
+    exit 1
+  fi
+  printf '%s' "$current_sig" > "$meta"
+  touch "$marker"
+  echo "[launcher] native teacher sidecar 已就绪: $STAGE2_ADAPTER_TEACHER_JSONL"
+}
+
+if [[ "$RANK" == "0" ]]; then
+  ensure_native_teacher_sidecar
+else
+  echo "[launcher] RANK=$RANK 等待 rank0 生成 native teacher sidecar: $STAGE2_ADAPTER_TEACHER_JSONL"
+  _wait_iters=$(( (STAGE2_TEACHER_WAIT_TIMEOUT_S + 29) / 30 ))
+  for _ in $(seq 1 "$_wait_iters"); do
+    if [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && -f "${STAGE2_ADAPTER_TEACHER_JSONL}.done" ]]; then
+      break
+    fi
+    sleep 30
+  done
+  if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
+    echo "Timed out waiting for teacher sidecar: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
+    exit 1
+  fi
+fi
 
 bash scripts/run_stage2_pano_adapter_8gpu.sh 2>&1 | tee "$LOG_FILE"

@@ -1,12 +1,13 @@
 seed: 42
 
 # ============================================
-# Stage2: Pano Adapter Pure-GT Training — 8×GPU
+# Stage2: Pano Adapter Native-Teacher Distillation — 8×GPU
 # ============================================
 #
 # Trains a PanoLatentSpaceAdapter that translates frozen Pano-System2
 # (Qwen2.5-VL) traj_hidden_states into InternNav's 3584-dim latent space.
-# Supervision is pure GT trajectory loss through frozen cond_projector + NextDiT.
+# Supervision uses native InternNav teacher latent/cond distillation plus a
+# lightweight GT trajectory loss through frozen cond_projector + NextDiT.
 #
 # Student: Stage1-S2 checkpoint (frozen, LoRA Qwen VLM)
 # Frozen executor: InternNav cond_projector + NextDiT
@@ -141,14 +142,24 @@ adapter:
     index_mode: generic
     val_ratio: 0.1
 
-  # Loss: pure GT trajectory loss through frozen cond_projector + NextDiT.
-  # MSE against teacher latents is a diagnostic only (--compute-teacher-mse).
+  # Loss:
+  #   raw_weight  * raw latent direction/norm distillation
+  # + cond_weight * cond_projector-space SmoothL1 + cosine distillation
+  # + gt_weight   * GT flow-matching loss through frozen NextDiT
   loss:
-    gt_weight: 1.0
+    raw_weight: 0.1
+    cond_weight: 1.0
+    gt_weight: 0.2
+    raw_norm_weight: 0.1
+    cond_cosine_weight: 1.0
+    cond_smooth_l1_beta: 1.0
 
   # Teacher
   teacher:
-    target_mode: aligned
+    # Requires a JSONL collected by:
+    #   collect_internnav_teacher_sidecar.py --coord-source dataset ...
+    # Records are aligned to pano samples by (clip_idx,current_t).
+    target_mode: native_sidecar
     torch_dtype: bfloat16
     attn_implementation: sdpa
     flash_attn_stub: true

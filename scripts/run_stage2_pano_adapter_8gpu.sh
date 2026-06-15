@@ -4,10 +4,10 @@ set -Eeuo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stage_training_common.sh"
 
 # ------------------------------------------------------------------
-# Stage2: Pano Adapter Pure-GT Training
+# Stage2: Pano Adapter Native-Teacher Distillation
 # ------------------------------------------------------------------
 # Trains PanoLatentSpaceAdapter to translate frozen Pano-System2
-# traj_hidden_states into InternNav's 3584-dim latent space.
+# traj_hidden_states into native InternNav's executable 3584-dim latent space.
 #
 # Student: Stage1-S2 checkpoint (frozen LoRA Qwen VLM)
 # Frozen executor: InternNav cond_projector + NextDiT
@@ -28,8 +28,9 @@ STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/root/autodl-tmp/vln_pano_adap
 # Adapter training iterates records directly (no DataLoader).  num_workers /
 # prefetch_factor from the config YAML do not affect this script's path,
 # and TensorBoard logging is not yet wired — only console logging is active.
-# Optional record JSONL. In aligned mode this can provide a prefiltered subset;
-# pure-GT training does not require teacher sidecars.
+# Native teacher JSONL collected with:
+#   collect_internnav_teacher_sidecar.py --coord-source dataset --tensor-output-dir ...
+# Records are aligned by (clip_idx,current_t), not integer dataset_index.
 STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-}"
 
 # Training hyperparams (empty values defer to adapter config YAML)
@@ -40,12 +41,15 @@ STAGE2_ADAPTER_WEIGHT_DECAY="${STAGE2_ADAPTER_WEIGHT_DECAY:-}"
 STAGE2_ADAPTER_GRAD_CLIP="${STAGE2_ADAPTER_GRAD_CLIP:-}"
 STAGE2_ADAPTER_MAX_SAMPLES="${STAGE2_ADAPTER_MAX_SAMPLES:-0}"
 
-# Teacher diagnostics
-STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-aligned}"
+# Teacher targets / loss weights
+STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-native_sidecar}"
 STAGE2_ADAPTER_COMPUTE_TEACHER_MSE="${STAGE2_ADAPTER_COMPUTE_TEACHER_MSE:-0}"
 STAGE2_ADAPTER_TEACHER_DTYPE="${STAGE2_ADAPTER_TEACHER_DTYPE:-bfloat16}"
 STAGE2_ADAPTER_TEACHER_ATTN="${STAGE2_ADAPTER_TEACHER_ATTN:-sdpa}"
 STAGE2_ADAPTER_REQUIRE_FLASH_ATTN="${STAGE2_ADAPTER_REQUIRE_FLASH_ATTN:-1}"
+STAGE2_ADAPTER_RAW_WEIGHT="${STAGE2_ADAPTER_RAW_WEIGHT:-0.1}"
+STAGE2_ADAPTER_COND_WEIGHT="${STAGE2_ADAPTER_COND_WEIGHT:-1.0}"
+STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-0.2}"
 
 # Dataset behavior is controlled by data.trajectory in the adapter config YAML.
 # This direct record loop intentionally has no DataLoader worker settings.
@@ -69,6 +73,12 @@ require_file "$STAGE2_ADAPTER_LOAD_WEIGHTS"
 require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE2_ADAPTER_DATA_ROOT"
 require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
+
+if [[ "$STAGE2_ADAPTER_TEACHER_MODE" == "native_sidecar" && -z "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
+  echo "STAGE2_ADAPTER_TEACHER_MODE=native_sidecar requires STAGE2_ADAPTER_TEACHER_JSONL." >&2
+  echo "Collect it with scripts/evaluation/collect_internnav_teacher_sidecar.py --coord-source dataset --tensor-output-dir ..." >&2
+  exit 1
+fi
 
 if [[ -n "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
   require_file "$STAGE2_ADAPTER_TEACHER_JSONL"
@@ -96,6 +106,9 @@ build_adapter_args() {
     --teacher-target-mode "$STAGE2_ADAPTER_TEACHER_MODE"
     --teacher-torch-dtype "$STAGE2_ADAPTER_TEACHER_DTYPE"
     --teacher-attn-implementation "$STAGE2_ADAPTER_TEACHER_ATTN"
+    --raw-distill-weight "$STAGE2_ADAPTER_RAW_WEIGHT"
+    --cond-distill-weight "$STAGE2_ADAPTER_COND_WEIGHT"
+    --gt-weight "$STAGE2_ADAPTER_GT_WEIGHT"
   )
 
   # Optional overrides (only pass if non-empty)
@@ -118,7 +131,7 @@ build_adapter_args() {
     args+=(--max-samples "$STAGE2_ADAPTER_MAX_SAMPLES")
   fi
 
-  # Teacher JSONL (optional in aligned mode)
+  # Teacher JSONL (required in native_sidecar mode)
   if [[ -n "${STAGE2_ADAPTER_TEACHER_JSONL:-}" ]]; then
     args+=(--teacher-jsonl "$STAGE2_ADAPTER_TEACHER_JSONL")
   fi
@@ -134,7 +147,7 @@ build_adapter_args() {
   printf '%s\n' "${args[@]}"
 }
 
-log "Stage: Stage2 Pano Adapter Pure-GT Training"
+log "Stage: Stage2 Pano Adapter Native-Teacher Distillation"
 log "Repo root: $ROOT_DIR"
 log "Training GPUs: $GPU_DEVICES (nproc_per_node=$NPROC_PER_NODE)"
 log "Student config: $STAGE2_ADAPTER_STUDENT_CONFIG"
@@ -143,8 +156,9 @@ log "Load weights (Stage1-S2): $STAGE2_ADAPTER_LOAD_WEIGHTS"
 log "InternNav model: $STAGE2_ADAPTER_INTERNNAV_MODEL"
 log "Output dir: $STAGE2_ADAPTER_OUT_DIR"
 log "Teacher target mode: $STAGE2_ADAPTER_TEACHER_MODE"
+log "Loss weights: raw=$STAGE2_ADAPTER_RAW_WEIGHT cond=$STAGE2_ADAPTER_COND_WEIGHT gt=$STAGE2_ADAPTER_GT_WEIGHT"
 log "Teacher MSE diagnostic: $STAGE2_ADAPTER_COMPUTE_TEACHER_MSE"
-log "Record JSONL: ${STAGE2_ADAPTER_TEACHER_JSONL:-<none - auto-generate aligned records from dataset>}"
+log "Record JSONL: ${STAGE2_ADAPTER_TEACHER_JSONL:-<none>}"
 
 if is_truthy "$STAGE_DRY_RUN"; then
   log "STAGE_DRY_RUN=$STAGE_DRY_RUN; preflight and config validation completed, skipping training"
