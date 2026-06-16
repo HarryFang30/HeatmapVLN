@@ -1,0 +1,35 @@
+# Adapter-only defaults for a larger Stage2 pano latent adapter.
+#
+# Use this as STAGE2_ADAPTER_CONFIG while keeping
+# STAGE2_ADAPTER_STUDENT_CONFIG=configs/train_pano_adapter_stage2_8gpu.yaml.
+# It changes only adapter/training defaults, not the frozen student/System1
+# architecture.
+
+adapter:
+  architecture: mlp_latent_space
+  hidden_dim: 1024
+  dropout: 0.0
+
+  training:
+    epochs: 5
+    batch_size: 16
+    lr: 3.0e-4
+    weight_decay: 0.01
+    grad_clip: 1.0
+    max_samples: 0
+    index_mode: generic
+    val_ratio: 0.1
+
+  loss:
+    raw_weight: 0.1
+    cond_weight: 1.0
+    gt_weight: 0.2
+    raw_norm_weight: 0.1
+    cond_cosine_weight: 1.0
+    cond_smooth_l1_beta: 1.0
+
+  teacher:
+    target_mode: native_sidecar
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+    flash_attn_stub: true
