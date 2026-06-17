@@ -426,11 +426,17 @@ def main():
             args.load_weights = inferred_base
             logger.info("🔗 Inferred base checkpoint from resume metadata: %s", inferred_base)
 
+    resume_skip_batches: int | None = None
+
     if resume_path and Path(resume_path).exists():
         resume_info = load_checkpoint_for_resume(
             str(resume_path), model, optimizer=None, scheduler=None, logger=logger
         )
         resume_epoch = resume_info['epoch']
+        if resume_info.get('batch') is not None:
+            # Mid-epoch checkpoint: stay on the same epoch and skip batches
+            # that were already processed before the save.
+            resume_skip_batches = resume_info['batch']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
 
     requires_base_checkpoint = bool(
@@ -721,7 +727,23 @@ def main():
     steps_per_epoch = len(train_loader) // grad_accum_steps
 
     if resume_epoch > 0:
-        start_epoch = resume_epoch + 1
+        if resume_skip_batches is not None:
+            # Mid-epoch checkpoint: resume the same epoch starting from
+            # resume_skip_batches.  The saved batch landed *after* the
+            # gradient-accumulation step so the next batch to process is
+            # resume_skip_batches + 1.  We record resume_skip_batches as
+            # the skip count so train_one_epoch can fast-forward the
+            # dataloader iterator.
+            start_epoch = resume_epoch
+            resume_skip_batches = resume_skip_batches  # pass through as-is
+            logger.info(
+                "📂 Mid-epoch resume: epoch=%d skip=%d batches",
+                start_epoch,
+                resume_skip_batches,
+            )
+        else:
+            start_epoch = resume_epoch + 1
+            resume_skip_batches = None
         global_epoch_counter = resume_epoch
     else:
         start_epoch = args.start_epoch
@@ -792,11 +814,18 @@ def main():
         logger.info("=" * 80)
 
         epoch_offset = (epoch - 1) * steps_per_epoch
+        skip_batches = resume_skip_batches if epoch == start_epoch else None
+        if skip_batches is not None:
+            logger.info(
+                "⏭️  Skipping first %d batches (mid-epoch resume)",
+                skip_batches,
+            )
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
             cfg, epoch, logger, tb_writer, epoch_offset,
             stage_idx=0, stage_name=stage_name, stage_cfg=stage_cfg,
             max_batches=args.max_batches,
+            skip_first_n_batches=skip_batches,
             vis_dir=vis_train_dir,
             gpu_heatmap_computer=gpu_heatmap_computer,
             gpu_has_depth=gpu_has_depth,

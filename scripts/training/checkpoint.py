@@ -171,6 +171,7 @@ def load_checkpoint_for_resume(
 
     return {
         'epoch': ckpt.get('epoch', 0),
+        'batch': ckpt.get('batch'),
         'stage_idx': ckpt.get('stage_idx', 0),
         'stage_name': ckpt.get('stage_name', ''),
         'metrics': ckpt.get('metrics', {}),

@@ -151,8 +151,16 @@ def train_one_epoch(
     ckpt_manager=None,
     mid_epoch_save_every: int = 500,
     nextdit_warmup_steps: int = 0,
+    skip_first_n_batches: int | None = None,
 ) -> dict[str, float]:
-    """Train one epoch."""
+    """Train one epoch.
+
+    Parameters
+    ----------
+    skip_first_n_batches:
+        When set (mid-epoch resume), fast-forward the dataloader iterator by
+        this many batches before beginning the actual training loop.
+    """
     dist_context = dist_context or DistributedContext(
         enabled=False,
         device=torch.device(cfg['model'].get('device', 'cuda')),
@@ -233,6 +241,12 @@ def train_one_epoch(
     _cg_limit = _CG_LIMIT_GB
 
     for i, batch in enumerate(pbar):
+        # Fast-forward dataloader on mid-epoch resume — the checkpoint was
+        # saved *after* completing `skip_first_n_batches` batches (counter
+        # incremented post-step), so we skip index 0 through
+        # skip_first_n_batches-1 and resume from index skip_first_n_batches.
+        if skip_first_n_batches is not None and i < skip_first_n_batches:
+            continue
         if max_batches is not None and i >= max_batches:
             break
 
