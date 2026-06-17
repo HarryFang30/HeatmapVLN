@@ -935,7 +935,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         action_camera_deg = 0.0
         if self.load_traj_images:
             action_poses = self._load_poses_for_direction(clip_idx, "front_down")
-            action_camera_deg = float(meta.get("lookdown_pitch_deg", 30.0))
+            # Stored chunk poses are camera-to-world matrices.  The front_down
+            # pose already contains the downward camera pitch, while
+            # get_trajectory_relative_to_frame applies the camera->robot pitch
+            # correction in the opposite convention used by InternNav's
+            # world-to-camera parquet poses.  Use the negative metadata pitch so
+            # straight 0.25m steps stay above the trajectory filter threshold.
+            action_camera_deg = -float(meta.get("lookdown_pitch_deg", 30.0))
         history_poses = [poses[i] for i in history_indices]
         current_pose = poses[current_t]
 
