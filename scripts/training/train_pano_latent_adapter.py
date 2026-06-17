@@ -1387,6 +1387,16 @@ def _reduce_metrics(
 ) -> dict[str, float]:
     keys = sorted(sums)
     if not keys:
+        # In distributed mode every rank must participate in the all_reduce
+        # collective; returning early would deadlock the other ranks.
+        # Callers must ensure every rank processes ≥1 batch (see
+        # _evaluate_adapter for validation and _epoch_rank_records for training).
+        if _distributed_available():
+            raise RuntimeError(
+                "_reduce_metrics called with empty sums in distributed mode — "
+                "this would deadlock other ranks.  Pad your data to a multiple "
+                "of world_size before sharding."
+            )
         return {}
     values = [sums[key] for key in keys] + [float(count)]
     tensor = torch.tensor(values, device=device, dtype=torch.float64)
@@ -1515,7 +1525,17 @@ def _evaluate_adapter(
     adapter.eval()
     shard = val_records
     if world_size > 1:
-        shard = val_records[rank::world_size]
+        # Pad to a multiple of world_size so every rank gets ≥1 batch.
+        # Mirrors _epoch_rank_records (training) so that _reduce_metrics
+        # never receives an empty dict on any rank — which would skip the
+        # all_reduce collective and deadlock the other ranks.
+        total_size = int(math.ceil(len(val_records) / float(world_size)) * world_size)
+        if total_size > len(val_records):
+            padded = list(val_records)
+            padded.extend(padded[: total_size - len(padded)])
+            shard = padded[rank::world_size]
+        else:
+            shard = val_records[rank::world_size]
     running: dict[str, float] = {}
     count = 0
     num_batches = (len(shard) + batch_size - 1) // batch_size
