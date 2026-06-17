@@ -1503,15 +1503,32 @@ def _evaluate_adapter(
     teacher_model: Any | None = None,
     teacher_processor: Any | None = None,
     teacher_turn_args: Any | None = None,
-) -> dict[str, float]:
+    rank: int = 0,
+    world_size: int = 1,
+) -> tuple[dict[str, float], int]:
+    """Evaluate adapter, optionally sharding val_records across ranks.
+
+    When ``world_size > 1`` each rank processes a strided subset of
+    ``val_records``.  Returns ``(raw_sums, count)`` so callers can reduce
+    across ranks with ``_reduce_metrics``.
+    """
     adapter.eval()
+    shard = val_records
+    if world_size > 1:
+        shard = val_records[rank::world_size]
     running: dict[str, float] = {}
     count = 0
-    num_batches = (len(val_records) + batch_size - 1) // batch_size
-    pbar = tqdm(total=num_batches, desc="Validating", unit="step", ncols=100, disable=not _rank0())
+    num_batches = (len(shard) + batch_size - 1) // batch_size
+    pbar = tqdm(
+        total=num_batches,
+        desc=f"Validating (rank {rank})",
+        unit="step",
+        ncols=100,
+        disable=rank != 0,
+    )
     try:
-        for start in range(0, len(val_records), batch_size):
-            batch_records = val_records[start:start + batch_size]
+        for start in range(0, len(shard), batch_size):
+            batch_records = shard[start:start + batch_size]
             batch = _build_batch(
                 batch_records,
                 dataset=dataset,
@@ -1534,16 +1551,17 @@ def _evaluate_adapter(
             count += 1
             for key, value in metrics.items():
                 running[key] = running.get(key, 0.0) + value
-            pbar.set_postfix(
-                loss=f"{running.get('loss', 0.0)/count:.5f}",
-                cond_cos=f"{running.get('cond_cos', 0.0)/count:.3f}",
-                gt=f"{running.get('gt', 0.0)/count:.5f}",
-            )
+            if rank == 0:
+                pbar.set_postfix(
+                    loss=f"{running.get('loss', 0.0)/count:.5f}",
+                    cond_cos=f"{running.get('cond_cos', 0.0)/count:.3f}",
+                    gt=f"{running.get('gt', 0.0)/count:.5f}",
+                )
             pbar.update(1)
     finally:
         pbar.close()
         adapter.train()
-    return {k: v / max(count, 1) for k, v in running.items()}
+    return running, count
 
 
 def _save_checkpoint(
@@ -2015,16 +2033,16 @@ def main() -> int:
                 LOGGER.info("epoch=%d train metrics=%s", epoch + 1, epoch_metrics)
 
             is_last_epoch = epoch == args.epochs - 1
-            if _distributed_available() and is_last_epoch:
-                # Validation can exceed NCCL's watchdog timeout. Tear down the
-                # process group before the final rank-0-only validation pass.
-                dist.barrier()
-                _cleanup_distributed()
 
+            # Distributed validation: each rank processes a strided subset of
+            # val_records, then metrics are all_reduced.  DDP stays alive —
+            # since validation uses @torch.no_grad() there are no pending
+            # gradient syncs, so NCCL watchdogs are not at risk.
             val_metrics: dict[str, float] | None = None
-            if rank == 0 and val_records and is_last_epoch:
-                val_metrics = _evaluate_adapter(
-                    _unwrap_adapter(train_adapter),
+            if val_records and is_last_epoch:
+                raw_adapter = _unwrap_adapter(train_adapter)
+                val_sums, val_count = _evaluate_adapter(
+                    raw_adapter,
                     val_records,
                     args=args,
                     dataset=dataset,
@@ -2037,8 +2055,12 @@ def main() -> int:
                     teacher_model=teacher_model,
                     teacher_processor=teacher_processor,
                     teacher_turn_args=teacher_turn_args,
+                    rank=rank,
+                    world_size=world_size,
                 )
-                LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
+                val_metrics = _reduce_metrics(val_sums, val_count, device)
+                if _rank0():
+                    LOGGER.info("epoch=%d val   metrics=%s", epoch + 1, val_metrics)
 
             if rank == 0:
                 combined_metrics = dict(epoch_metrics)
