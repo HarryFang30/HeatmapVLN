@@ -2895,6 +2895,10 @@ def run_eval(args):
             hidden_dim=hidden_dim,
             device=device,
         )
+    elif getattr(model, "pano_latent_adapter", None) is not None:
+        pano_latent_adapter = model.pano_latent_adapter
+        pano_latent_adapter.eval()
+        print("Using model-attached pano-latent adapter from config/checkpoint")
 
     force_teacher_model = None
     force_teacher_processor = None
@@ -3359,10 +3363,11 @@ def main():
         type=str,
         default=None,
         help=(
-            "Optional PanoToInternNavLatentAdapter checkpoint (.pth with "
-            "adapter_state_dict). When set, the panoramic generate_latents output "
-            "is projected through the adapter before being fed to the frozen "
-            "NextDiT System1 (distillation interface)."
+            "Optional pano latent adapter checkpoint. Accepts Stage2 adapter-only "
+            "checkpoints with adapter_state_dict or Stage3 full checkpoints with "
+            "pano_latent_adapter.* in trainable_state_dict. When set, the "
+            "panoramic generate_latents output is projected through the adapter "
+            "before NextDiT."
         ),
     )
     parser.add_argument(

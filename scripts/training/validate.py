@@ -213,8 +213,11 @@ def validate(
                     traj_images = batch.get('traj_images')
                     if traj_images is not None:
                         traj_images = traj_images.to(device)
+                    traj_hidden_states = model_module.adapt_traj_hidden_states(
+                        output['traj_hidden_states']
+                    )
                     traj_result = model_module.nextdit_action_head.compute_loss(
-                        output['traj_hidden_states'],
+                        traj_hidden_states,
                         gt_trajectory,
                         traj_images=traj_images,
                         trajectory_valid=trajectory_valid,

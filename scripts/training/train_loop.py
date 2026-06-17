@@ -70,6 +70,7 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
         "traj_dit",
         "action_encoder",
         "action_decoder",
+        "pano_latent_adapter",
     }
     is_selective_stage2 = (
         stage_cfg.get("bridge_only", False)
@@ -95,6 +96,11 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
 
     if "llm_projector" not in trainable and getattr(model_module, "llm_projector", None) is not None:
         model_module.llm_projector.eval()
+
+    if "pano_latent_adapter" in trainable and getattr(model_module, "pano_latent_adapter", None) is not None:
+        model_module.pano_latent_adapter.train()
+    elif getattr(model_module, "pano_latent_adapter", None) is not None:
+        model_module.pano_latent_adapter.eval()
 
     nah = getattr(model_module, "nextdit_action_head", None)
     if nah is not None:
@@ -371,8 +377,11 @@ def train_one_epoch(
                     traj_images = batch.get('traj_images')
                     if traj_images is not None:
                         traj_images = traj_images.to(device, non_blocking=True)
+                    traj_hidden_states = model_module.adapt_traj_hidden_states(
+                        output['traj_hidden_states']
+                    )
                     traj_result = model_module.nextdit_action_head.compute_loss(
-                        output['traj_hidden_states'],
+                        traj_hidden_states,
                         gt_trajectory,
                         traj_images=traj_images,
                         trajectory_valid=trajectory_valid,

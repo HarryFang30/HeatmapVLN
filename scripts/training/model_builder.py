@@ -33,6 +33,7 @@ def build_model(
     heatmap_cfg = model_cfg.get('heatmap', {})
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
+    pano_adapter_cfg = nextdit_cfg.get('pano_latent_adapter', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
 
@@ -112,6 +113,12 @@ def build_model(
         nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
         nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
 
+        pano_latent_adapter_enabled=pano_adapter_cfg.get('enabled', False),
+        pano_latent_adapter_hidden_dim=pano_adapter_cfg.get('hidden_dim', 1024),
+        pano_latent_adapter_dropout=pano_adapter_cfg.get('dropout', 0.0),
+        pano_latent_adapter_checkpoint_path=pano_adapter_cfg.get('pretrained_path', ''),
+        pano_latent_adapter_strict_load=pano_adapter_cfg.get('strict_load', True),
+
         verbose=verbose,
     )
 
@@ -148,6 +155,12 @@ def build_model(
             "   NextDiT ActionHead → enabled=%s",
             effective_action_head and nextdit_cfg.get('enabled', False),
         )
+        if pano_adapter_cfg.get('enabled', False):
+            logger.info(
+                "   Pano latent adapter → enabled=True, hidden_dim=%s, pretrained=%s",
+                pano_adapter_cfg.get('hidden_dim', 1024),
+                pano_adapter_cfg.get('pretrained_path', '') or '<none>',
+            )
         if s1_ckpt:
             logger.info("   System1 pretrained → %s", s1_ckpt)
 
@@ -182,6 +195,8 @@ def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
             continue
         if name == 'latent_queries':
             group = 'latent_queries'
+        elif name.startswith('pano_latent_adapter.'):
+            group = 'pano_latent_adapter'
         elif name.startswith('nextdit_action_head.'):
             parts = name.split('.')
             group = '.'.join(parts[:2]) if len(parts) > 1 else 'nextdit_action_head'
@@ -198,6 +213,8 @@ def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
 
 def _is_allowed_trainable_name(name: str, trainable_modules: set[str]) -> bool:
     if 'latent_queries' in trainable_modules and name == 'latent_queries':
+        return True
+    if 'pano_latent_adapter' in trainable_modules and name.startswith('pano_latent_adapter.'):
         return True
     if 'nextdit_action_head' in trainable_modules and name.startswith('nextdit_action_head.'):
         return True
@@ -262,6 +279,14 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     if 'latent_queries' in trainable and hasattr(model, 'latent_queries') and model.latent_queries is not None:
         model.latent_queries.requires_grad_(True)
         logger.info("  ✓ Unfrozen: latent_queries")
+
+    if (
+        'pano_latent_adapter' in trainable
+        and hasattr(model, 'pano_latent_adapter')
+        and model.pano_latent_adapter is not None
+    ):
+        freeze_module(model.pano_latent_adapter, freeze=False)
+        logger.info("  ✓ Unfrozen: pano_latent_adapter")
 
     # Fine-grained NextDiT sub-module unfreezing.
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:

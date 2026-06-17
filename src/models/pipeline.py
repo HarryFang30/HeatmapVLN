@@ -134,6 +134,14 @@ class VLNPipelineConfig:
     nextdit_dav2_ckpt_path: str = ""
     nextdit_enable_gradient_checkpointing: bool = True
 
+    # Optional pano-student -> InternNav-latent adapter.  This sits before the
+    # NextDiT cond_projector and preserves the original System1 visual path.
+    pano_latent_adapter_enabled: bool = False
+    pano_latent_adapter_hidden_dim: int = 1024
+    pano_latent_adapter_dropout: float = 0.0
+    pano_latent_adapter_checkpoint_path: str = ""
+    pano_latent_adapter_strict_load: bool = True
+
     # Performance settings
     enable_gradient_checkpointing: bool = False
     verbose: bool = False
@@ -210,6 +218,7 @@ class VLNPipeline(nn.Module):
         # ==================== Action Head (NextDiT System 1) ====================
         self.nextdit_action_head = None
         self.latent_queries = None
+        self.pano_latent_adapter = None
         self._internnav_system1_load_audit: dict[str, Any] | None = None
 
         if config.enable_action_head and config.nextdit_enabled:
@@ -248,12 +257,98 @@ class VLNPipeline(nn.Module):
                 self._load_internnav_system1(config.internnav_system1_path)
             elif config.internnav_model_path:
                 self._load_internnav_system1_from_model_dir(config.internnav_model_path)
+
+            if config.pano_latent_adapter_enabled:
+                from .adapters import PanoLatentSpaceAdapter
+
+                self.pano_latent_adapter = PanoLatentSpaceAdapter(
+                    dim=config.nextdit_vlm_hidden_dim,
+                    hidden_dim=config.pano_latent_adapter_hidden_dim,
+                    dropout=config.pano_latent_adapter_dropout,
+                ).to(device=self.device, dtype=config.dtype)
+                logger.info(
+                    "PanoLatentSpaceAdapter enabled: dim=%d hidden_dim=%d",
+                    config.nextdit_vlm_hidden_dim,
+                    config.pano_latent_adapter_hidden_dim,
+                )
+                if config.pano_latent_adapter_checkpoint_path:
+                    self._load_pano_latent_adapter(
+                        config.pano_latent_adapter_checkpoint_path,
+                        strict=config.pano_latent_adapter_strict_load,
+                    )
         elif config.nextdit_enabled:
             logger.info("NextDiT action head disabled by config.enable_action_head=False")
 
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")
         logger.info("=" * 60)
+
+    @staticmethod
+    def _torch_load_checkpoint(path: str) -> Any:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+    @staticmethod
+    def _extract_pano_adapter_state_dict(ckpt: Any) -> dict[str, torch.Tensor]:
+        if not isinstance(ckpt, dict):
+            raise TypeError("Pano adapter checkpoint must be a dict")
+
+        state = ckpt.get("adapter_state_dict")
+        if isinstance(state, dict):
+            return state
+
+        for key in ("trainable_state_dict", "model_state_dict", "state_dict"):
+            candidate = ckpt.get(key)
+            if not isinstance(candidate, dict):
+                continue
+            prefixed = {
+                name.removeprefix("module.").removeprefix("pano_latent_adapter."): value
+                for name, value in candidate.items()
+                if name.removeprefix("module.").startswith("pano_latent_adapter.")
+            }
+            if prefixed:
+                return prefixed
+
+        if all(torch.is_tensor(value) for value in ckpt.values()):
+            return {
+                name.removeprefix("module.").removeprefix("pano_latent_adapter."): value
+                for name, value in ckpt.items()
+            }
+
+        raise KeyError(
+            "No adapter_state_dict or pano_latent_adapter.* trainable_state_dict "
+            "found in checkpoint"
+        )
+
+    def _load_pano_latent_adapter(self, ckpt_path: str, *, strict: bool = True) -> None:
+        if self.pano_latent_adapter is None:
+            raise RuntimeError("Cannot load pano adapter before it is constructed")
+        path = Path(ckpt_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"Pano latent adapter checkpoint not found: {path}")
+        ckpt = self._torch_load_checkpoint(str(path))
+        state_dict = self._extract_pano_adapter_state_dict(ckpt)
+        missing, unexpected = self.pano_latent_adapter.load_state_dict(
+            state_dict,
+            strict=strict,
+        )
+        if missing:
+            logger.warning("Pano adapter missing keys when loading %s: %s", path, missing)
+        if unexpected:
+            logger.warning("Pano adapter unexpected keys when loading %s: %s", path, unexpected)
+        logger.info(
+            "Loaded pano latent adapter from %s (%d tensors)",
+            path,
+            len(state_dict),
+        )
+
+    def adapt_traj_hidden_states(self, traj_hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the optional pano latent adapter before System1 cond_projector."""
+        if self.pano_latent_adapter is None:
+            return traj_hidden_states
+        return self.pano_latent_adapter(traj_hidden_states)
 
     def _load_internnav_system1(self, ckpt_path: str):
         """Load InternNav System 1 weights into NextDiTActionHead + latent_queries.
@@ -693,8 +788,9 @@ class VLNPipeline(nn.Module):
 
         if return_actions and self.nextdit_action_head is not None and traj_hidden_states is not None:
             if not self.training:
+                condition_hidden_states = self.adapt_traj_hidden_states(traj_hidden_states)
                 trajectory = self.nextdit_action_head.get_trajectory(
-                    traj_hidden_states,
+                    condition_hidden_states,
                 )
 
         # ==================== Build Output ====================
@@ -779,6 +875,7 @@ class VLNPipeline(nn.Module):
             image_grid_thw=inputs.get("image_grid_thw"),
             latent_queries=lq,
         )
+        traj_hidden_states = self.adapt_traj_hidden_states(traj_hidden_states)
 
         trajectory = self.nextdit_action_head.get_trajectory(
             traj_hidden_states,

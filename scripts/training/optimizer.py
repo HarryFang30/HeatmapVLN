@@ -147,6 +147,26 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
         })
         logger.info("  Param group: latent_queries (lr=%s, wd=0)", latent_q_lr)
 
+    # Pano latent adapter
+    if (
+        hasattr(model, 'pano_latent_adapter')
+        and model.pano_latent_adapter is not None
+    ):
+        pano_adapter_lr = optim_cfg.get('pano_latent_adapter_lr', action_lr)
+        groups = get_param_groups_with_wd(
+            model.pano_latent_adapter,
+            pano_adapter_lr,
+            'pano_latent_adapter',
+            default_wd,
+        )
+        if groups:
+            param_groups.extend(groups)
+            logger.info(
+                "  Param group: pano_latent_adapter (lr=%s, wd=%s)",
+                pano_adapter_lr,
+                default_wd,
+            )
+
     # LLM Projector
     proj_lr = optim_cfg.get('llm_projector_lr', 3e-5)
     if hasattr(model, 'llm_projector'):

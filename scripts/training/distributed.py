@@ -108,6 +108,7 @@ def _get_supported_trainable_sync_modules(
         "llm_projector",
         "nextdit_action_head",
         "latent_queries",
+        "pano_latent_adapter",
         *_NEXTDIT_SUBMODULE_KEYS,
     }
     unsupported = sorted(trainable - supported_trainable)
@@ -165,6 +166,13 @@ def _get_supported_trainable_sync_modules(
         lq = getattr(model, "latent_queries", None)
         if isinstance(lq, nn.Parameter) and lq.requires_grad:
             sync_modules.append(("latent_queries", lq))
+
+    if "pano_latent_adapter" in trainable:
+        adapter = getattr(model, "pano_latent_adapter", None)
+        if adapter is None:
+            raise RuntimeError("pano_latent_adapter is trainable but the model has no adapter module.")
+        if any(param.requires_grad for param in adapter.parameters()):
+            sync_modules.append(("pano_latent_adapter", adapter))
 
     if not sync_modules:
         raise RuntimeError(

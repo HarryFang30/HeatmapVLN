@@ -504,6 +504,7 @@ def main():
     )
     stage_train_action = bool(stage_cfg.get('train_action', True))
     stage_train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+    stage_teacher_force_system2_answer = bool(stage_cfg.get('teacher_force_system2_answer', False))
     nextdit_enabled = bool(
         cfg.get('model', {})
         .get('action_head', {})
@@ -539,6 +540,7 @@ def main():
         if not stage_cfg.get('train_action', False):
             n_traj_query = 0
         train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
+        sft_prompt_mode = train_lm or stage_teacher_force_system2_answer
         traj_cfg = cfg.get('data', {}).get('trajectory', cfg.get('data', {}).get('sliding_window', {}))
         sft_protocol = stage_cfg.get(
             'system2_sft_protocol',
@@ -549,7 +551,7 @@ def main():
         actual_collate_fn = PanoramicTokenizedCollator(
             pano_processor,
             n_traj_query=n_traj_query,
-            sft_mode=train_lm,
+            sft_mode=sft_prompt_mode,
             sft_include_turns=stage_cfg.get('sft_include_turns', True),
             sft_include_forward=stage_cfg.get('sft_include_forward', False),
             sft_protocol=sft_protocol,
@@ -557,8 +559,8 @@ def main():
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled "
-            "(n_traj_query=%d, sft_mode=%s, protocol=%s, max_seq_len=%d)",
-            n_traj_query, train_lm, sft_protocol, max_seq_len,
+            "(n_traj_query=%d, sft_mode=%s, return_lm_loss=%s, protocol=%s, max_seq_len=%d)",
+            n_traj_query, sft_prompt_mode, train_lm, sft_protocol, max_seq_len,
         )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")

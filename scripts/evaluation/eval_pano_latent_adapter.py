@@ -105,7 +105,22 @@ def _load_adapter_from_checkpoint(
     ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     state_dict = ckpt.get("adapter_state_dict")
     if state_dict is None:
-        raise KeyError(f"{path} has no adapter_state_dict")
+        for key in ("trainable_state_dict", "model_state_dict", "state_dict"):
+            candidate = ckpt.get(key)
+            if not isinstance(candidate, dict):
+                continue
+            state_dict = {
+                name.removeprefix("module.").removeprefix("pano_latent_adapter."): value
+                for name, value in candidate.items()
+                if name.removeprefix("module.").startswith("pano_latent_adapter.")
+            }
+            if state_dict:
+                break
+    if not state_dict:
+        raise KeyError(
+            f"{path} has no adapter_state_dict or pano_latent_adapter.* "
+            "trainable_state_dict"
+        )
     saved_args = ckpt.get("args", {}) or {}
     adapter_type = ckpt.get("adapter_type", "")
 
