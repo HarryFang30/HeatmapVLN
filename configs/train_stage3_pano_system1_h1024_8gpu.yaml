@@ -129,7 +129,7 @@ model:
 training:
   stages:
     - name: stage3_pano_system1_action_h1024
-      epochs: 3
+      epochs: 5
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: false

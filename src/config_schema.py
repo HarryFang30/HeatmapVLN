@@ -83,6 +83,7 @@ class TrajectoryConfig(_Lenient):
     pano_max_side_dist_m: float = 6.0
     load_lookdown_for_system2: bool = False
     system2_sft_protocol: str = "direct"
+    structured_pano_output: bool = True
     pixel_goal_direction: str = "front"
     load_history_heatmap: bool = True
     require_sft_target: bool = False

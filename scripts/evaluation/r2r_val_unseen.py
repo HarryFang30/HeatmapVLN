@@ -22,6 +22,8 @@ Inference flow per high-level step:
 Adapted for habitat-lab 0.1.7 (YACS config).
 """
 
+from __future__ import annotations
+
 import faulthandler
 import os
 import sys
@@ -133,6 +135,7 @@ import torch as _torch_preload  # noqa: F401
 def _find_preinit_scene() -> str | None:
     candidates = [
         os.environ.get("HEATMAPVLN_PREINIT_SCENE"),
+        "/root/autodl-tmp/data/scene_datasets/mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
         "/dataset/mp3d/mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
         "/workspace/InternNav/data/scene_data/mp3d_ce/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
     ]
@@ -140,7 +143,11 @@ def _find_preinit_scene() -> str | None:
         if candidate and Path(candidate).exists():
             return candidate
 
-    for root in (Path("/dataset/mp3d/mp3d"), Path("/dataset/mp3d")):
+    for root in (
+        Path("/root/autodl-tmp/data/scene_datasets/mp3d"),
+        Path("/dataset/mp3d/mp3d"),
+        Path("/dataset/mp3d"),
+    ):
         if not root.exists():
             continue
         try:
@@ -149,6 +156,17 @@ def _find_preinit_scene() -> str | None:
         except StopIteration:
             continue
     return None
+
+
+def _make_camera_sensor_spec(_hsim: Any, uuid: str = "rgb", resolution: tuple[int, int] = (64, 64)) -> Any:
+    spec_cls = getattr(_hsim, "CameraSensorSpec", None) or _hsim.SensorSpec
+    sensor = spec_cls()
+    sensor.uuid = uuid
+    sensor.sensor_type = _hsim.SensorType.COLOR
+    if hasattr(_hsim, "SensorSubType"):
+        sensor.sensor_subtype = _hsim.SensorSubType.PINHOLE
+    sensor.resolution = list(resolution)
+    return sensor
 
 
 # Create a real-scene GL context before importing habitat-lab, which imports
@@ -162,10 +180,7 @@ if os.environ.get("HEATMAPVLN_PREINIT_GL", "1") != "0" and os.environ.get("DISPL
         _dummy_cfg.scene_id = _preinit_scene
         _dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
         _dummy_agent = _hsim.agent.AgentConfiguration()
-        _dummy_sensor = _hsim.CameraSensorSpec()
-        _dummy_sensor.uuid = "rgb"
-        _dummy_sensor.sensor_type = _hsim.SensorType.COLOR
-        _dummy_sensor.resolution = [64, 64]
+        _dummy_sensor = _make_camera_sensor_spec(_hsim)
         _dummy_agent.sensor_specifications = [_dummy_sensor]
         _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
         _dummy_sim.get_sensor_observations()
@@ -178,15 +193,23 @@ if os.environ.get("HEATMAPVLN_PREINIT_GL", "1") != "0" and os.environ.get("DISPL
 if os.environ.get("HEATMAPVLN_PREINIT_EMPTY_GL", "0") == "1":
     import habitat_sim as _hsim
 
+    _preinit_scene = _find_preinit_scene()
     _dummy_cfg = _hsim.SimulatorConfiguration()
-    # For GLX builds, pre-initialisation must use the local visible GPU index.
-    _dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
-    _dummy_agent = _hsim.agent.AgentConfiguration()
-    _dummy_agent.sensor_specifications = [_hsim.CameraSensorSpec()]
-    _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
-    _dummy_sim.close()
-    del _dummy_sim, _dummy_cfg, _dummy_agent
-    print("GL context pre-initialized (NVIDIA GPU)", flush=True)
+    if _preinit_scene:
+        _dummy_cfg.scene_id = _preinit_scene
+    else:
+        print("WARNING: skipping empty GL pre-initialization; no real MP3D scene found", flush=True)
+        _dummy_cfg = None
+    if _dummy_cfg is not None:
+        # For GLX builds, pre-initialisation must use the local visible GPU index.
+        _dummy_cfg.gpu_device_id = int(os.environ.get("HABITAT_GL_GPU_ID", "0"))
+        _dummy_agent = _hsim.agent.AgentConfiguration()
+        _dummy_agent.sensor_specifications = [_make_camera_sensor_spec(_hsim)]
+        _dummy_sim = _hsim.Simulator(_hsim.Configuration(_dummy_cfg, [_dummy_agent]))
+        _dummy_sim.get_sensor_observations()
+        _dummy_sim.close()
+        del _dummy_sim, _dummy_cfg, _dummy_agent
+        print(f"GL context pre-initialized with scene: {_preinit_scene}", flush=True)
 
 # Patch gym.spaces.Discrete to allow n=0 (habitat-lab 0.1.7 compatibility)
 import gym.spaces
@@ -206,8 +229,10 @@ gym.spaces.Discrete = _PatchedDiscrete
 import argparse
 import copy
 import hashlib
+import importlib.util
 import itertools
 import json
+import math
 import random
 import re
 from collections import OrderedDict
@@ -223,16 +248,75 @@ from habitat.core.embodied_task import EmbodiedTask, Measure
 from habitat.core.registry import registry
 from habitat.tasks.nav.nav import DistanceToGoal
 from PIL import Image
-from scripts.training.model_builder import build_model
-from scripts.training.utils import _normalize_state_key, load_config
 
-from src.models.heatmap.input_constructor import (
-    construct_input,
-    parse_structured_pano_output,
-    structured_condition_text,
-    vlm_output_requests_stop,
-    vlm_output_requests_turn,
+if not hasattr(argparse, "BooleanOptionalAction"):
+    class _BooleanOptionalAction(argparse.Action):
+        def __init__(
+            self,
+            option_strings,
+            dest,
+            default=None,
+            type=None,
+            choices=None,
+            required=False,
+            help=None,
+            metavar=None,
+        ):
+            expanded = []
+            for option_string in option_strings:
+                expanded.append(option_string)
+                if option_string.startswith("--"):
+                    expanded.append("--no-" + option_string[2:])
+            super().__init__(
+                option_strings=expanded,
+                dest=dest,
+                nargs=0,
+                default=default,
+                type=type,
+                choices=choices,
+                required=required,
+                help=help,
+                metavar=metavar,
+            )
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, not str(option_string).startswith("--no-"))
+
+        def format_usage(self):
+            return " | ".join(self.option_strings)
+
+    argparse.BooleanOptionalAction = _BooleanOptionalAction
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+_INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
+_INPUT_CONSTRUCTOR_SPEC = importlib.util.spec_from_file_location(
+    "_heatmapvln_input_constructor",
+    _INPUT_CONSTRUCTOR_PATH,
 )
+if _INPUT_CONSTRUCTOR_SPEC is None or _INPUT_CONSTRUCTOR_SPEC.loader is None:
+    raise ImportError(f"Could not load input constructor from {_INPUT_CONSTRUCTOR_PATH}")
+_input_constructor = importlib.util.module_from_spec(_INPUT_CONSTRUCTOR_SPEC)
+sys.modules[_INPUT_CONSTRUCTOR_SPEC.name] = _input_constructor
+_INPUT_CONSTRUCTOR_SPEC.loader.exec_module(_input_constructor)
+construct_input = _input_constructor.construct_input
+parse_structured_pano_output = _input_constructor.parse_structured_pano_output
+structured_condition_text = _input_constructor.structured_condition_text
+vlm_output_requests_stop = _input_constructor.vlm_output_requests_stop
+vlm_output_requests_turn = _input_constructor.vlm_output_requests_turn
+
+_TRAINING_UTILS_PATH = _PROJECT_ROOT / "scripts" / "training" / "utils.py"
+_TRAINING_UTILS_SPEC = importlib.util.spec_from_file_location(
+    "_heatmapvln_training_utils",
+    _TRAINING_UTILS_PATH,
+)
+if _TRAINING_UTILS_SPEC is None or _TRAINING_UTILS_SPEC.loader is None:
+    raise ImportError(f"Could not load training utils from {_TRAINING_UTILS_PATH}")
+_training_utils = importlib.util.module_from_spec(_TRAINING_UTILS_SPEC)
+sys.modules[_TRAINING_UTILS_SPEC.name] = _training_utils
+_TRAINING_UTILS_SPEC.loader.exec_module(_training_utils)
+_normalize_state_key = _training_utils._normalize_state_key
+load_config = _training_utils.load_config
 
 
 def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
@@ -334,13 +418,19 @@ def _parse_pano_view_id(llm_output: str) -> str | None:
 def _parse_pixel_goal(
     llm_output: str,
     image_size: tuple[int, int],
+    *,
+    allow_legacy_coord: bool = True,
 ) -> list[int] | None:
     """Parse structured ``view/pixel`` or legacy ``u v`` pixel goals.
 
     Clamping of out-of-bounds pixel coordinates is handled (with a
     one-shot warning) inside ``parse_structured_pano_output``.
     """
-    parsed = parse_structured_pano_output(llm_output, image_size=image_size)
+    parsed = parse_structured_pano_output(
+        llm_output,
+        image_size=image_size,
+        allow_legacy_coord=allow_legacy_coord,
+    )
     if parsed.kind in {"pixel", "legacy_coord"} and parsed.pixel_goal is not None:
         return list(parsed.pixel_goal)
     if not re.search(r"\d", llm_output or ""):
@@ -1443,6 +1533,26 @@ class TrajectoryStepRecorder:
             step[key] = str(val) if val is not None else None
         pg = data.get("pixel_goal")
         step["pixel_goal"] = [int(pg[0]), int(pg[1])] if pg and len(pg) >= 2 else None
+        oracle_system2 = data.get("oracle_system2")
+        if isinstance(oracle_system2, dict):
+            step["oracle_system2"] = {
+                key: oracle_system2.get(key)
+                for key in (
+                    "text",
+                    "view",
+                    "pixel_goal",
+                    "target_position",
+                    "heading_delta_deg",
+                    "bearing_deg",
+                    "offpath_m",
+                    "path_progress_m",
+                    "target_progress_m",
+                    "lookahead_m",
+                )
+                if key in oracle_system2
+            }
+        else:
+            step["oracle_system2"] = None
         for num_key in ("traj_hs_total_norm",):
             val = data.get(num_key)
             step[num_key] = float(val) if val is not None else None
@@ -1919,6 +2029,8 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
 
 def load_model(args, device: torch.device):
     """Build VLNPipeline, initialise lazy modules, then load checkpoints."""
+    from scripts.training.model_builder import build_model
+
     cfg = load_config(args.config)
     internnav_path = _resolve_internnav_model_path(cfg)
     if internnav_path:
@@ -2370,7 +2482,11 @@ def _run_eval_panoramic_vlm(
                 step_id += 1
                 continue
 
-            pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
+            pixel_goal = _parse_pixel_goal(
+                llm_output,
+                vlm_image_size,
+                allow_legacy_coord=not structured_pano_output,
+            )
             pano_goal_view = _parse_pano_view_id(llm_output) or "front"
 
             if step_recorder is not None:
@@ -2829,6 +2945,657 @@ def _run_eval_panoramic_vlm(
             "OS": float(oss_t.mean().item()),
             "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
             "total_episodes": len(sucs),
+            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+        }
+        if bool(getattr(args, "oracle_system2", False)):
+            final_result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
+            final_result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
+            final_result["oracle_system2_max_side_dist_m"] = float(args.oracle_system2_max_side_dist_m)
+    else:
+        final_result = {
+            "SR": 0,
+            "SPL": 0,
+            "OS": 0,
+            "NE": 0,
+            "total_episodes": 0,
+            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+        }
+        if bool(getattr(args, "oracle_system2", False)):
+            final_result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
+            final_result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
+            final_result["oracle_system2_max_side_dist_m"] = float(args.oracle_system2_max_side_dist_m)
+
+    print("\n" + "=" * 60)
+    print("Final Results:")
+    print(f"  NE  (Navigation Error):  {final_result['NE']:.4f}")
+    print(f"  OS  (Oracle Success):    {final_result['OS']:.4f}")
+    print(f"  SR  (Success Rate):      {final_result['SR']:.4f}")
+    print(f"  SPL (Success w/ Path):   {final_result['SPL']:.4f}")
+    print(f"  Total episodes:          {final_result['total_episodes']}")
+    print("=" * 60)
+
+    with open(os.path.join(output_path, "result.json"), "w") as f:
+        json.dump(final_result, f, indent=2)
+    print(f"Results saved to {os.path.join(output_path, 'result.json')}")
+
+
+def _rpc_blob_from_pil(name: str, image: Image.Image, quality: int) -> dict:
+    from vla_rpc.core.image import encode_rgb_to_jpeg
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return {
+        "name": name,
+        "data": encode_rgb_to_jpeg(arr, quality=quality),
+        "mime_type": "image/jpeg",
+        "height": int(arr.shape[0]),
+        "width": int(arr.shape[1]),
+    }
+
+
+_ORACLE_PANO_VIEW_CENTERS_DEG: dict[str, float] = {
+    "front": 0.0,
+    "right": 90.0,
+    "back": 180.0,
+    "left": -90.0,
+}
+
+
+def _normalize_angle_deg(angle: float) -> float:
+    return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def _oracle_view_from_delta(delta_deg: float) -> str:
+    delta = _normalize_angle_deg(delta_deg)
+    if -45.0 <= delta <= 45.0:
+        return "front"
+    if 45.0 < delta <= 135.0:
+        return "right"
+    if -135.0 <= delta < -45.0:
+        return "left"
+    return "back"
+
+
+def _path_xz(points: list[list[float]]) -> list[tuple[float, float]]:
+    return [(float(p[0]), float(p[2])) for p in points if len(p) >= 3]
+
+
+def _path_cumulative(points: list[tuple[float, float]]) -> list[float]:
+    distances = [0.0]
+    for (x0, z0), (x1, z1) in zip(points, points[1:]):
+        distances.append(distances[-1] + float(math.hypot(x1 - x0, z1 - z0)))
+    return distances
+
+
+def _closest_progress_on_path(
+    points: list[tuple[float, float]],
+    cumulative: list[float],
+    pos: np.ndarray,
+) -> tuple[float, float]:
+    px, pz = float(pos[0]), float(pos[2])
+    if len(points) == 1:
+        return float(math.hypot(px - points[0][0], pz - points[0][1])), 0.0
+
+    best_dist = float("inf")
+    best_progress = 0.0
+    for idx, ((x0, z0), (x1, z1)) in enumerate(zip(points, points[1:])):
+        dx, dz = x1 - x0, z1 - z0
+        seg_len_sq = dx * dx + dz * dz
+        if seg_len_sq <= 1e-9:
+            continue
+        t = ((px - x0) * dx + (pz - z0) * dz) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        qx, qz = x0 + t * dx, z0 + t * dz
+        dist = float(math.hypot(px - qx, pz - qz))
+        if dist < best_dist:
+            best_dist = dist
+            best_progress = cumulative[idx] + t * math.sqrt(seg_len_sq)
+    return best_dist, best_progress
+
+
+def _point_at_path_progress(
+    points: list[tuple[float, float]],
+    cumulative: list[float],
+    progress: float,
+) -> tuple[float, float]:
+    if progress <= 0.0:
+        return points[0]
+    if progress >= cumulative[-1]:
+        return points[-1]
+    for idx in range(len(points) - 1):
+        if cumulative[idx] <= progress <= cumulative[idx + 1]:
+            seg_len = max(cumulative[idx + 1] - cumulative[idx], 1e-9)
+            t = (progress - cumulative[idx]) / seg_len
+            x = points[idx][0] + t * (points[idx + 1][0] - points[idx][0])
+            z = points[idx][1] + t * (points[idx + 1][1] - points[idx][1])
+            return x, z
+    return points[-1]
+
+
+def _episode_reference_path(episode) -> list[list[float]]:
+    gt_ref = getattr(episode, "reference_path", None)
+    if gt_ref is not None:
+        path = [[float(v) for v in p] for p in gt_ref]
+        if path:
+            return path
+    goal_pos = getattr(episode.goals[0], "position", None)
+    return [[float(v) for v in goal_pos]] if goal_pos is not None else []
+
+
+def _build_oracle_system2_from_reference_path(
+    env,
+    episode,
+    *,
+    image_size: tuple[int, int],
+    strategy: str,
+    lookahead_m: float,
+    min_ahead_m: float,
+    max_side_dist_m: float,
+) -> dict[str, Any] | None:
+    """Reference-path oracle for panoramic System2.
+
+    This uses the closed-loop agent pose and the episode reference path.  It is
+    intentionally depth-free: it is a direction/pixel oracle for isolating
+    System1+adapter behavior, not a replica of the offline pano labeler.
+    """
+    gt_path = _episode_reference_path(episode)
+    points = _path_xz(gt_path)
+    if not points:
+        return None
+
+    state = env._sim.get_agent(0).get_state()
+    pos = np.asarray(state.position, dtype=np.float64)
+    rot = quaternion.as_float_array(state.rotation)
+    heading_deg = _quat_to_heading_deg(rot)
+
+    cumulative = _path_cumulative(points)
+    offpath_m, progress_m = _closest_progress_on_path(points, cumulative, pos)
+    min_progress_m = min(cumulative[-1], progress_m + float(min_ahead_m))
+
+    if strategy == "lookahead":
+        ahead_m = max(float(lookahead_m), float(min_ahead_m))
+        target_progress_m = min(cumulative[-1], progress_m + ahead_m)
+        target_x, target_z = _point_at_path_progress(points, cumulative, target_progress_m)
+    else:
+        target_progress_m = min_progress_m
+        target_x, target_z = _point_at_path_progress(points, cumulative, target_progress_m)
+        span = max(cumulative[-1] - min_progress_m, 0.0)
+        num_samples = max(1, int(math.ceil(span / 0.25)))
+        for sample_idx in range(num_samples + 1):
+            cand_progress = cumulative[-1] - (span * sample_idx / num_samples)
+            cand_x, cand_z = _point_at_path_progress(points, cumulative, cand_progress)
+            cand_dx = cand_x - float(pos[0])
+            cand_dz = cand_z - float(pos[2])
+            cand_dist = float(math.hypot(cand_dx, cand_dz))
+            if cand_dist <= 1e-6:
+                continue
+            cand_bearing = math.degrees(math.atan2(cand_dx, cand_dz)) % 360.0
+            cand_delta = _normalize_angle_deg(cand_bearing - heading_deg)
+            cand_view = _oracle_view_from_delta(cand_delta)
+            if cand_view == "front" or cand_dist <= float(max_side_dist_m):
+                target_progress_m = cand_progress
+                target_x, target_z = cand_x, cand_z
+                break
+
+    dx = target_x - float(pos[0])
+    dz = target_z - float(pos[2])
+    if math.hypot(dx, dz) <= 1e-6:
+        target_x, target_z = points[-1]
+        dx = target_x - float(pos[0])
+        dz = target_z - float(pos[2])
+    if math.hypot(dx, dz) <= 1e-6:
+        return {"text": "view: stop", "view": "stop", "pixel_goal": None}
+
+    bearing_deg = math.degrees(math.atan2(dx, dz)) % 360.0
+    delta_deg = _normalize_angle_deg(bearing_deg - heading_deg)
+    view_id = _oracle_view_from_delta(delta_deg)
+    local_deg = _normalize_angle_deg(delta_deg - _ORACLE_PANO_VIEW_CENTERS_DEG[view_id])
+
+    width, height = int(image_size[0]), int(image_size[1])
+    u_float = (width / 2.0) + (width / 2.0) * math.tan(math.radians(local_deg))
+    u = max(0, min(width - 1, int(round(u_float))))
+    v = max(0, min(height - 1, height // 2))
+    pixel_goal = [u, v]
+    return {
+        "text": structured_condition_text(view_id, pixel_goal),
+        "view": view_id,
+        "pixel_goal": pixel_goal,
+        "target_position": [float(target_x), float(pos[1]), float(target_z)],
+        "heading_delta_deg": float(delta_deg),
+        "bearing_deg": float(bearing_deg),
+        "offpath_m": float(offpath_m),
+        "path_progress_m": float(progress_m),
+        "target_progress_m": float(target_progress_m),
+        "strategy": str(strategy),
+        "lookahead_m": float(lookahead_m),
+        "max_side_dist_m": float(max_side_dist_m),
+    }
+
+
+def _rpc_plan_panoramic(
+    client,
+    *,
+    instruction: str,
+    current_views: dict[str, Image.Image],
+    history_panoramas: list[dict[str, Image.Image]],
+    lookdown_img: Image.Image,
+    vlm_image_size: tuple[int, int],
+    traj_image_size: tuple[int, int],
+    system1_coord_order: str,
+    trajectory_selection: str,
+    jpeg_quality: int,
+    oracle_system2: dict[str, Any] | None = None,
+) -> dict:
+    blobs = []
+    for view in ("front", "right", "back", "left"):
+        blobs.append(_rpc_blob_from_pil(f"current/{view}", current_views[view], jpeg_quality))
+    for idx, hist in enumerate(history_panoramas):
+        for view in ("front", "right", "back", "left"):
+            blobs.append(_rpc_blob_from_pil(f"history/{idx}/{view}", hist[view], jpeg_quality))
+    blobs.append(_rpc_blob_from_pil("lookdown", lookdown_img, jpeg_quality))
+
+    payload = {
+        "instruction": instruction,
+        "num_history": len(history_panoramas),
+        "vlm_image_size": list(vlm_image_size),
+        "traj_image_size": list(traj_image_size),
+        "system1_coord_order": system1_coord_order,
+        "trajectory_selection": trajectory_selection,
+    }
+    if oracle_system2 is not None:
+        payload["oracle_system2"] = oracle_system2
+    result = client.infer_json("plan_panoramic", payload, blobs)
+    if result is None:
+        raise RuntimeError("RPC model server returned no response")
+    response, _response_blobs = result
+    if not response.get("ok", False):
+        raise RuntimeError(f"RPC model server error: {response}")
+    return response
+
+
+def run_eval_rpc_panoramic(args):
+    """Run Habitat in this process and send model inference to RPC server."""
+    import yaml
+    from vla_rpc.client import VLAClient
+
+    ensure_vln_measures_registered()
+    with open(args.config) as f:
+        train_cfg = yaml.safe_load(f)
+    panoramic_vlm_input = bool(
+        train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
+    )
+    if not panoramic_vlm_input:
+        raise RuntimeError("--rpc_server currently supports panoramic_vlm_input configs only")
+
+    vlm_image_size, traj_image_size = _eval_image_sizes(train_cfg)
+    image_size = vlm_image_size
+    num_history = args.num_history
+    max_steps_per_episode = args.max_steps_per_episode
+    system1_coord_order = _system1_coord_order(args, panoramic_internnav_protocol=False)
+
+    print(f"Using RPC model server: {args.rpc_server}")
+    print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
+    print(f"trajectory_selection={args.trajectory_selection}")
+    if bool(getattr(args, "oracle_system2", False)):
+        print(
+            "[rpc-eval] --oracle_system2 is ACTIVE; System2 text will be "
+            "replaced by a reference-path pano view/pixel oracle before RPC "
+            "System1 inference."
+        )
+
+    client = VLAClient(
+        server_addr=args.rpc_server,
+        timeout_ms=args.rpc_timeout_ms,
+        jpeg_quality=args.rpc_jpeg_quality,
+    )
+    client.connect()
+    if not client.health_check():
+        raise RuntimeError(f"RPC model server is not healthy: {args.rpc_server}")
+    info = client.get_server_info()
+    if info is not None:
+        print(f"RPC server: version={info.version}, model={info.model_version}")
+
+    hab_cfg = build_habitat_config(args)
+    print("Creating Habitat environment ...")
+    env = habitat.Env(config=hab_cfg)
+    num_episodes = len(list(env.episodes))
+    print(f"Total episodes: {num_episodes}")
+
+    output_path = args.output_path
+    progress_file = _prepare_progress_file(args, output_path)
+    sucs, spls, oss, nes, done_set = _load_progress(progress_file)
+    target_list, target_set = _episode_list_from_args(args)
+    if target_list is not None:
+        print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
+    remaining = num_episodes - len(done_set)
+    eval_limit = _eval_limit(args, remaining, target_list, done_set)
+    print(
+        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
+        f"this run: {eval_limit}"
+    )
+
+    process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
+    seen_episodes: set = set()
+    eval_count = 0
+
+    while True:
+        process_bar.set_postfix(
+            SR=f"{float(np.mean(sucs)):.3f}" if sucs else "?",
+            SPL=f"{float(np.mean(spls)):.3f}" if spls else "?",
+        )
+        if eval_count >= eval_limit:
+            break
+
+        observations = env.reset()
+        episode = env.current_episode
+        scene_id = episode.scene_id.split("/")[-2]
+        episode_id = int(episode.episode_id)
+        ep_key = (scene_id, episode_id)
+        if ep_key in seen_episodes:
+            break
+        seen_episodes.add(ep_key)
+        if target_set is not None and ep_key not in target_set:
+            continue
+        if ep_key in done_set:
+            continue
+
+        instruction = _normalize_instruction(episode.instruction.instruction_text)
+        eval_count += 1
+        print(
+            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
+            f"{instruction[:80]}..."
+        )
+
+        executed_history_panoramas: list[dict[str, Image.Image]] = []
+        local_actions: list[int] = []
+        forward_action_count = 0
+        system2_calls = 0
+        trajectory_calls = 0
+        step_id = 0
+        done = False
+
+        step_recorder: TrajectoryStepRecorder | None = None
+        if args.save_trajectory_steps:
+            step_recorder = TrajectoryStepRecorder(
+                Path(output_path), scene_id, episode_id,
+            )
+            init_state = env._sim.get_agent(0).get_state()
+            init_pos = np.array(init_state.position, dtype=float)
+            init_rot = quaternion.as_float_array(init_state.rotation)
+            goal_pos = np.array(episode.goals[0].position, dtype=float)
+            gt_path = _episode_reference_path(episode) or [list(goal_pos)]
+            step_recorder.set_metadata(
+                instruction=instruction,
+                start_pos=init_pos.tolist(),
+                start_rot=init_rot.tolist(),
+                goal_pos=goal_pos.tolist(),
+                gt_path=gt_path,
+            )
+
+        while (not done) and (step_id <= max_steps_per_episode):
+            sys.stdout.flush()
+            stop_result = _maybe_stop_at_success(env, args, step_id)
+            if stop_result is not None:
+                observations, done, new_step_id = stop_result
+                _record_post_action_step(
+                    step_recorder,
+                    env,
+                    step_id=new_step_id,
+                    phase="auto_stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                )
+                step_id = new_step_id
+                continue
+
+            if local_actions:
+                current_views = capture_panoramic_views(env, image_size=image_size)
+                executed_history_panoramas.append(current_views)
+                action = int(local_actions.pop(0))
+                forward_action_count += 1
+                if forward_action_count > MAX_STEPS:
+                    local_actions = []
+                    forward_action_count = 0
+                    continue
+                if action == ActionCode.STOP:
+                    print("  [debug] local trajectory STOP -> replan", flush=True)
+                    local_actions = []
+                    forward_action_count = 0
+                    continue
+                before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
+                observations, done = _apply_habitat_action(env, action)
+                if before is not None:
+                    print(
+                        f"  [debug] executed local action={int(action)} "
+                        f"{before} -> {_env_trace_summary(env)}",
+                        flush=True,
+                    )
+                step_id += 1
+                _record_post_action_step(
+                    step_recorder,
+                    env,
+                    step_id=step_id,
+                    phase="local_action",
+                    action=int(action),
+                    image_size=image_size,
+                )
+                continue
+
+            max_system2_calls = int(getattr(args, "max_system2_calls_per_episode", 0) or 0)
+            if max_system2_calls > 0 and system2_calls >= max_system2_calls:
+                print(
+                    f"  [debug] max System2 calls reached ({system2_calls}); stopping episode",
+                    flush=True,
+                )
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
+                _record_post_action_step(
+                    step_recorder,
+                    env,
+                    step_id=step_id,
+                    phase="max_system2_stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                )
+                continue
+
+            current_views = capture_panoramic_views(env, image_size=image_size)
+            prompt_history = _sample_history_panoramas(executed_history_panoramas, num_history)
+            if _debug_input_trace_enabled(args):
+                print(
+                    "  [debug] RPC System2 input: "
+                    f"{_env_trace_summary(env)} "
+                    f"history={len(prompt_history)} "
+                    f"{_views_trace_summary(current_views)}",
+                    flush=True,
+                )
+            lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+            executed_history_panoramas.append(current_views)
+            system2_calls += 1
+            oracle_system2 = None
+            if bool(getattr(args, "oracle_system2", False)):
+                oracle_system2 = _build_oracle_system2_from_reference_path(
+                    env,
+                    episode,
+                    image_size=vlm_image_size,
+                    strategy=str(getattr(args, "oracle_system2_strategy", "farthest_visible")),
+                    lookahead_m=float(getattr(args, "oracle_system2_lookahead_m", 2.0)),
+                    min_ahead_m=float(getattr(args, "oracle_system2_min_ahead_m", 0.5)),
+                    max_side_dist_m=float(getattr(args, "oracle_system2_max_side_dist_m", 6.0)),
+                )
+                if oracle_system2 is None:
+                    raise RuntimeError(
+                        f"Could not build oracle System2 for {scene_id}_{episode_id:04d}"
+                    )
+                print(
+                    "  [oracle-system2] "
+                    f"{oracle_system2['text'].replace(chr(10), ' | ')} "
+                    f"delta={oracle_system2.get('heading_delta_deg', 0.0):.1f} "
+                    f"offpath={oracle_system2.get('offpath_m', 0.0):.2f}",
+                    flush=True,
+                )
+
+            response = _rpc_plan_panoramic(
+                client,
+                instruction=instruction,
+                current_views=current_views,
+                history_panoramas=prompt_history,
+                lookdown_img=lookdown_img,
+                vlm_image_size=vlm_image_size,
+                traj_image_size=traj_image_size,
+                system1_coord_order=system1_coord_order,
+                trajectory_selection=args.trajectory_selection,
+                jpeg_quality=args.rpc_jpeg_quality,
+                oracle_system2=oracle_system2,
+            )
+            llm_output = response.get("llm_output", "")
+            actions = [int(action) for action in response.get("actions", [])]
+            print(
+                f"  step_id: {step_id}, RPC kind={response.get('kind')}, "
+                f"VLM output: {llm_output}",
+                flush=True,
+            )
+            if response.get("trajectory_summary"):
+                trajectory_calls += 1
+                print(
+                    f"  [debug] trajectory {response['trajectory_summary']}, "
+                    f"actions={actions}",
+                    flush=True,
+                )
+            elif actions:
+                print(f"  [debug] actions={actions}", flush=True)
+
+            if step_recorder is not None:
+                state = env._sim.get_agent(0).get_state()
+                pos = np.array(state.position, dtype=float)
+                rot = quaternion.as_float_array(state.rotation)
+                step_recorder.record_step({
+                    "step_id": step_id,
+                    "phase": "rpc_vlm",
+                    "position": pos,
+                    "heading_deg": _quat_to_heading_deg(rot),
+                    "rotation": rot,
+                    "distance_to_goal": _metric_distance_to_goal(env),
+                    "vlm_output": llm_output,
+                    "pixel_goal": response.get("pixel_goal"),
+                    "pano_goal_view": response.get("pano_goal_view"),
+                    "oracle_system2": response.get("oracle_system2"),
+                    "current_views": current_views,
+                })
+
+            if response.get("terminal", False):
+                action = actions[0] if actions else ActionCode.STOP
+                observations, done = _apply_habitat_action(env, action)
+                step_id += 1
+                _record_post_action_step(
+                    step_recorder,
+                    env,
+                    step_id=step_id,
+                    phase="rpc_terminal",
+                    action=int(action),
+                    image_size=image_size,
+                    vlm_output=llm_output,
+                )
+                continue
+
+            if not actions:
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                step_id += 1
+                _record_post_action_step(
+                    step_recorder,
+                    env,
+                    step_id=step_id,
+                    phase="rpc_empty_actions",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                    vlm_output=llm_output,
+                )
+                continue
+
+            first_action = int(actions.pop(0))
+            local_actions = actions
+            forward_action_count = 0
+            if first_action == ActionCode.STOP:
+                local_actions = []
+                continue
+            before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
+            observations, done = _apply_habitat_action(env, first_action)
+            if before is not None:
+                print(
+                    f"  [debug] executed first RPC action={int(first_action)} "
+                    f"{before} -> {_env_trace_summary(env)}",
+                    flush=True,
+                )
+            step_id += 1
+            forward_action_count += 1
+            _record_post_action_step(
+                step_recorder,
+                env,
+                step_id=step_id,
+                phase="rpc_first_action",
+                action=int(first_action),
+                image_size=image_size,
+                vlm_output=llm_output,
+            )
+
+        metrics = env.get_metrics()
+        sucs.append(metrics["success"])
+        spls.append(metrics["spl"])
+        oss.append(metrics["oracle_success"])
+        nes.append(metrics["distance_to_goal"])
+        if step_recorder is not None:
+            step_recorder.finalize(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                success=metrics["success"],
+                spl=metrics["spl"],
+                total_steps=step_id,
+                vlm_calls=system2_calls,
+                traj_calls=trajectory_calls,
+            )
+        print(
+            f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
+            f"os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']:.4f}, "
+            f"vlm_calls: {system2_calls}, trajectory_calls: {trajectory_calls}"
+        )
+        result = {
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "success": metrics["success"],
+            "spl": metrics["spl"],
+            "os": metrics["oracle_success"],
+            "ne": metrics["distance_to_goal"],
+            "steps": step_id,
+            "episode_instruction": instruction,
+            "vlm_calls": system2_calls,
+            "trajectory_calls": trajectory_calls,
+            "rpc_server": args.rpc_server,
+            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+        }
+        if bool(getattr(args, "oracle_system2", False)):
+            result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
+            result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
+            result["oracle_system2_max_side_dist_m"] = float(args.oracle_system2_max_side_dist_m)
+        with open(progress_file, "a") as f:
+            f.write(json.dumps(result) + "\n")
+        done_set.add(ep_key)
+        process_bar.update(1)
+
+    env.close()
+    client.close()
+
+    if len(sucs) > 0:
+        sucs_t = torch.tensor(sucs)
+        spls_t = torch.tensor(spls)
+        oss_t = torch.tensor(oss)
+        nes_t = torch.tensor(nes)
+        torch.nan_to_num(spls_t, nan=0.0, posinf=0.0, neginf=0.0, out=spls_t)
+        nes_finite = nes_t[torch.isfinite(nes_t)]
+        final_result = {
+            "SR": float(sucs_t.mean().item()),
+            "SPL": float(spls_t.mean().item()),
+            "OS": float(oss_t.mean().item()),
+            "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
+            "total_episodes": len(sucs),
         }
     else:
         final_result = {"SR": 0, "SPL": 0, "OS": 0, "NE": 0, "total_episodes": 0}
@@ -2852,6 +3619,9 @@ def _run_eval_panoramic_vlm(
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_eval(args):
+    if getattr(args, "rpc_server", ""):
+        return run_eval_rpc_panoramic(args)
+
     device = torch.device(f"cuda:{args.gpu_id}")
     ensure_vln_measures_registered()
 
@@ -3130,7 +3900,11 @@ def run_eval(args):
                     messages = []
                     continue
 
-                pixel_goal = _parse_pixel_goal(llm_output, vlm_image_size)
+                pixel_goal = _parse_pixel_goal(
+                    llm_output,
+                    vlm_image_size,
+                    allow_legacy_coord=not structured_pano_output,
+                )
                 if pixel_goal is not None:
                     print(f"  predicted pixel_goal {pixel_goal}")
 
@@ -3435,6 +4209,67 @@ def main():
                         help="Torch CUDA device id for model inference")
     parser.add_argument("--sim_gpu_id", type=int, default=0,
                         help="Habitat-Sim GL device id; keep 0 for GLX/Xvfb builds")
+    parser.add_argument(
+        "--rpc_server",
+        type=str,
+        default="",
+        help=(
+            "Optional model RPC server address (host:port). When set, this "
+            "process runs Habitat only and sends panoramic observations to the "
+            "model server."
+        ),
+    )
+    parser.add_argument(
+        "--rpc_timeout_ms",
+        type=int,
+        default=600000,
+        help="RPC timeout for one model planning call in milliseconds.",
+    )
+    parser.add_argument(
+        "--rpc_jpeg_quality",
+        type=int,
+        default=90,
+        help="JPEG quality for RGB observations sent to the model server.",
+    )
+    parser.add_argument(
+        "--oracle_system2",
+        action="store_true",
+        default=False,
+        help=(
+            "RPC-only ablation: replace generated panoramic System2 text with "
+            "a reference-path oracle 'view: <front|right|back|left>\\n"
+            "pixel: <u> <v>' before System1 latent/action inference."
+        ),
+    )
+    parser.add_argument(
+        "--oracle_system2_strategy",
+        choices=("farthest_visible", "lookahead"),
+        default="farthest_visible",
+        help=(
+            "How to select the reference-path oracle target. farthest_visible "
+            "scans backward from the goal and uses side/back targets only "
+            "within --oracle_system2_max_side_dist_m; lookahead uses a fixed "
+            "--oracle_system2_lookahead_m target."
+        ),
+    )
+    parser.add_argument(
+        "--oracle_system2_lookahead_m",
+        type=float,
+        default=2.0,
+        help="Reference-path lookahead distance in meters for --oracle_system2_strategy lookahead.",
+    )
+    parser.add_argument(
+        "--oracle_system2_min_ahead_m",
+        type=float,
+        default=0.5,
+        help="Minimum forward path progress in meters for --oracle_system2.",
+    )
+    parser.add_argument(
+        "--oracle_system2_max_side_dist_m",
+        type=float,
+        default=6.0,
+        help="Maximum side/back target distance for --oracle_system2_strategy farthest_visible.",
+    )
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
@@ -3506,7 +4341,10 @@ def main():
         ),
     )
     args = parser.parse_args()
-    _preflight_checkpoint_args(args)
+    if args.oracle_system2 and not args.rpc_server:
+        raise RuntimeError("--oracle_system2 currently requires --rpc_server")
+    if not args.rpc_server:
+        _preflight_checkpoint_args(args)
     _resolve_eval_paths(args)
     run_eval(args)
 

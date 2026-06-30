@@ -46,6 +46,40 @@ def test_parse_legacy_coord_fallback():
     assert parsed.pixel_goal == [128, 192]
 
 
+def test_structured_option_echo_is_invalid_not_front():
+    parsed = parse_structured_pano_output(
+        "view: front|right|back|left\npixel: 10 128",
+        image_size=(256, 256),
+    )
+    assert parsed.kind == "invalid"
+    assert parsed.view_id is None
+
+
+def test_malformed_structured_output_does_not_use_legacy_fallback():
+    parsed = parse_structured_pano_output(
+        "view: right|back\npixel: 10 128",
+        image_size=(256, 256),
+    )
+    assert parsed.kind == "invalid"
+
+
+def test_xml_box_output_is_not_legacy_coord():
+    parsed = parse_structured_pano_output(
+        "<ref>front</ref><box>[[190,164,231,211]]</box>",
+        image_size=(256, 256),
+    )
+    assert parsed.kind == "invalid"
+
+
+def test_legacy_coord_can_be_disabled_for_structured_eval():
+    parsed = parse_structured_pano_output(
+        "128 192",
+        image_size=(256, 256),
+        allow_legacy_coord=False,
+    )
+    assert parsed.kind == "invalid"
+
+
 def test_structured_condition_text():
     text = structured_condition_text("right", [211, 128])
     assert text == "view: right\npixel: 211 128"

@@ -46,6 +46,7 @@ from src.models.heatmap.input_constructor import (
     _ensure_pil,
     construct_input,
     format_structured_pano_assistant_text,
+    parse_structured_pano_output,
 )
 
 LOGGER = logging.getLogger("system2_sft_sanity")
@@ -344,21 +345,18 @@ def parse_generated_text(
     upper = raw.upper()
     canonical = raw.strip(" \t\r\n。.!！,，;；:：")
 
-    view_match = re.search(r"\bview\s*:\s*(front|right|back|left|stop|turn)\b", raw, flags=re.I)
-    pixel_match = re.search(
-        r"\bpixel\s*:\s*([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)",
+    structured = parse_structured_pano_output(
         raw,
-        flags=re.I,
+        image_size=image_size,
+        allow_legacy_coord=False,
     )
-    if view_match:
-        view = view_match.group(1).lower()
-        if view == "stop":
-            return ParsedText(kind="stop", text=raw, view=view, action_seq=[0], format_valid=True)
-        if view == "turn":
-            return ParsedText(kind="turn", text=raw, view=view, action_seq=None, format_valid=True)
-        if view in VIEW_NAMES and pixel_match:
-            x = round(float(pixel_match.group(1)))
-            y = round(float(pixel_match.group(2)))
+    has_structured_directive = any(
+        re.match(r"^\s*view\s*:", line, flags=re.I)
+        for line in raw.splitlines()
+    )
+    if structured.kind != "invalid" or has_structured_directive:
+        if structured.kind == "pixel" and structured.pixel_goal is not None:
+            x, y = structured.pixel_goal
             width, height = image_size
             coord_valid = 0 <= x < width and 0 <= y < height
             return ParsedText(
@@ -366,11 +364,32 @@ def parse_generated_text(
                 text=raw,
                 coord=[x, y],
                 coord_valid=coord_valid,
-                view=view,
+                view=structured.view_id,
                 action_seq=None,
                 format_valid=True,
             )
-        return ParsedText(kind="invalid", text=raw, view=view, action_seq=None, format_valid=False)
+        if structured.kind == "stop":
+            return ParsedText(kind="stop", text=raw, view="stop", action_seq=[0], format_valid=True)
+        if structured.kind == "turn":
+            action_seq = None
+            if structured.turn_direction == "left":
+                action_seq = [2]
+            elif structured.turn_direction == "right":
+                action_seq = [3]
+            return ParsedText(
+                kind="turn",
+                text=raw,
+                view=structured.view_id or "turn",
+                action_seq=action_seq,
+                format_valid=True,
+            )
+        return ParsedText(
+            kind="invalid",
+            text=raw,
+            view=structured.view_id,
+            action_seq=None,
+            format_valid=False,
+        )
 
     action_seq, action_seq_valid = _parse_action_sequence(raw)
     contains_stop = "STOP" in upper
@@ -662,8 +681,19 @@ def update_metrics(
     action_valid = format_valid and (pred.kind != "coord" or bool(pred.coord_valid))
     if format_valid:
         metrics["format_valid"] += 1
+    else:
+        metrics["invalid_format"] += 1
     if action_valid:
         metrics["action_valid"] += 1
+
+    if "front|right|back|left" in pred.text:
+        metrics["echo_option_list"] += 1
+    if "<ref>" in pred.text or "<box>" in pred.text or "<" in pred.text:
+        metrics["xml_or_markup_output"] += 1
+    if target.view in VIEW_NAMES:
+        metrics[f"target_view_{target.view}"] += 1
+    if pred.view in VIEW_NAMES:
+        metrics[f"pred_view_{pred.view}"] += 1
 
     category_match = target.kind == pred.kind
     if category_match:
@@ -681,6 +711,8 @@ def update_metrics(
             coord_l1 = dx + dy
             coord_hit = coord_linf <= coord_tolerance and bool(pred.coord_valid)
             metrics["coord_pred_on_coord_target"] += 1
+            metrics["coord_abs_u_sum"] += dx
+            metrics["coord_abs_v_sum"] += dy
             metrics["coord_l1_sum"] += coord_l1
             metrics["coord_linf_sum"] += coord_linf
             if coord_hit:
@@ -689,6 +721,11 @@ def update_metrics(
                 metrics["view_coord_targets"] += 1
                 if pred.view == target.view:
                     metrics["view_hit"] += 1
+                    metrics["same_view_coord_pred"] += 1
+                    metrics["same_view_coord_l1_sum"] += coord_l1
+                    metrics["same_view_coord_linf_sum"] += coord_linf
+                    metrics["same_view_abs_u_sum"] += dx
+                    metrics["same_view_abs_v_sum"] += dy
 
     if target.kind == "stop":
         metrics["stop_targets"] += 1
@@ -730,6 +767,7 @@ def print_summary(metrics: Counter, output_path: Path) -> None:
     print("\n===== Stage1-S2 System2 SFT Sanity Summary =====")
     print(f"records:            {int(metrics['total'])}")
     print(f"format_valid:       {pct('format_valid')}")
+    print(f"invalid_format:     {pct('invalid_format')}")
     print(f"action_valid:       {pct('action_valid')}")
     print(f"category_match:     {pct('category_match')}")
     print(f"coord_hit@tol:      {pct('coord_hit', coord_targets)}  ({int(metrics['coord_hit'])}/{int(metrics['coord_targets'])})")
@@ -753,18 +791,34 @@ def print_summary(metrics: Counter, output_path: Path) -> None:
     if metrics["coord_pred_on_coord_target"] > 0:
         print(f"coord_mean_L1:      {float(metrics['coord_l1_sum']) / coord_pred_count:.2f}")
         print(f"coord_mean_Linf:    {float(metrics['coord_linf_sum']) / coord_pred_count:.2f}")
+        print(f"coord_mean_abs_u:   {float(metrics['coord_abs_u_sum']) / coord_pred_count:.2f}")
+        print(f"coord_mean_abs_v:   {float(metrics['coord_abs_v_sum']) / coord_pred_count:.2f}")
     if metrics["view_coord_targets"] > 0:
         print(
             f"view_hit:           {pct('view_hit', int(metrics['view_coord_targets']))}  "
             f"({int(metrics['view_hit'])}/{int(metrics['view_coord_targets'])})"
         )
+    if metrics["same_view_coord_pred"] > 0:
+        same_view_count = int(metrics["same_view_coord_pred"])
+        print(f"same_view_mean_L1:  {float(metrics['same_view_coord_l1_sum']) / same_view_count:.2f}")
+        print(f"same_view_mean_Linf:{float(metrics['same_view_coord_linf_sum']) / same_view_count:.2f}")
+        print(f"same_view_mean_abs_u:{float(metrics['same_view_abs_u_sum']) / same_view_count:.2f}")
+        print(f"same_view_mean_abs_v:{float(metrics['same_view_abs_v_sum']) / same_view_count:.2f}")
+    if metrics["echo_option_list"] > 0:
+        print(f"echo_option_list:   {int(metrics['echo_option_list'])}")
+    if metrics["xml_or_markup_output"] > 0:
+        print(f"xml_markup_output:  {int(metrics['xml_or_markup_output'])}")
     if metrics["second_turn_skipped_bad_first"] > 0:
         print(f"second_skipped:     {int(metrics['second_turn_skipped_bad_first'])}")
 
     target_counts = {k.removeprefix("target_"): int(v) for k, v in metrics.items() if k.startswith("target_")}
     pred_counts = {k.removeprefix("pred_"): int(v) for k, v in metrics.items() if k.startswith("pred_")}
+    target_view_counts = {k.removeprefix("target_view_"): int(v) for k, v in metrics.items() if k.startswith("target_view_")}
+    pred_view_counts = {k.removeprefix("pred_view_"): int(v) for k, v in metrics.items() if k.startswith("pred_view_")}
     print(f"target_counts:      {json.dumps(target_counts, ensure_ascii=False, sort_keys=True)}")
     print(f"pred_counts:        {json.dumps(pred_counts, ensure_ascii=False, sort_keys=True)}")
+    print(f"target_views:       {json.dumps(target_view_counts, ensure_ascii=False, sort_keys=True)}")
+    print(f"pred_views:         {json.dumps(pred_view_counts, ensure_ascii=False, sort_keys=True)}")
     print(f"jsonl:              {output_path}")
 
 

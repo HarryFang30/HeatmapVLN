@@ -59,9 +59,12 @@ DIRECT_WAYPOINT_TASK_SUFFIX = (
 )
 
 STRUCTURED_PANO_OUTPUT_SUFFIX = (
-    " Output the next waypoint using exactly two lines: "
-    "`view: <front|right|back|left>` and `pixel: <u> <v>`. "
-    "Output `view: stop` when you have successfully completed the task."
+    " Output the next waypoint using exactly two lines. "
+    "The first line must be one of `view: front`, `view: right`, "
+    "`view: back`, or `view: left`. "
+    "The second line must be `pixel: <u> <v>`. "
+    "Do not output an option list or any extra text. "
+    "Output exactly `view: stop` when you have successfully completed the task."
 )
 
 HISTORY_PROJECTION_TASK = (
@@ -108,28 +111,57 @@ _CLAMP_WARNED = False
 def parse_structured_pano_output(
     text: str,
     image_size: tuple[int, int] | None = None,
+    *,
+    allow_legacy_coord: bool = True,
 ) -> StructuredPanoParseResult:
-    """Parse Stage1-S2 structured output or fall back to legacy ``u v`` coords."""
+    """Parse Stage1-S2 structured output or optionally legacy ``u v`` coords.
+
+    Structured panoramic outputs are intentionally strict: a line like
+    ``view: front|right|back|left`` is invalid, not ``front``.  This prevents
+    evaluation from silently accepting prompt-option echoes as usable waypoints.
+    """
     if not text or not str(text).strip():
         return StructuredPanoParseResult(kind="invalid")
 
-    # Recognise turn_left / turn_right as well as the legacy ambiguous "turn".
-    view_match = re.search(
-        r"\bview\s*:\s*(front|right|back|left|stop|turn_left|turn_right|turn)\b",
-        text,
+    stripped = str(text).strip()
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+
+    # Recognise turn_left / turn_right as well as the legacy ambiguous "turn",
+    # but require the whole non-empty line to be exactly the view directive.
+    view_line_re = re.compile(
+        r"^view\s*:\s*(front|right|back|left|stop|turn_left|turn_right|turn)\s*$",
         flags=re.I,
     )
+    pixel_line_re = re.compile(r"^pixel\s*:\s*([-+]?\d+)\s+([-+]?\d+)\s*$", flags=re.I)
+
+    view_match = view_line_re.fullmatch(lines[0]) if lines else None
     if view_match is not None:
         view = view_match.group(1).lower()
         if view == "stop":
-            return StructuredPanoParseResult(kind="stop")
+            return (
+                StructuredPanoParseResult(kind="stop")
+                if len(lines) == 1
+                else StructuredPanoParseResult(kind="invalid", view_id=view)
+            )
         if view == "turn_left":
-            return StructuredPanoParseResult(kind="turn", turn_direction="left")
+            return (
+                StructuredPanoParseResult(kind="turn", turn_direction="left")
+                if len(lines) == 1
+                else StructuredPanoParseResult(kind="invalid", view_id=view)
+            )
         if view == "turn_right":
-            return StructuredPanoParseResult(kind="turn", turn_direction="right")
+            return (
+                StructuredPanoParseResult(kind="turn", turn_direction="right")
+                if len(lines) == 1
+                else StructuredPanoParseResult(kind="invalid", view_id=view)
+            )
         if view == "turn":
-            return StructuredPanoParseResult(kind="turn")
-        pixel_match = re.search(r"\bpixel\s*:\s*(\d+)\s+(\d+)\b", text, flags=re.I)
+            return (
+                StructuredPanoParseResult(kind="turn")
+                if len(lines) == 1
+                else StructuredPanoParseResult(kind="invalid", view_id=view)
+            )
+        pixel_match = pixel_line_re.fullmatch(lines[1]) if len(lines) == 2 else None
         if pixel_match is not None:
             u, v = int(pixel_match.group(1)), int(pixel_match.group(2))
             u, v = _clamp_coord(u, v, image_size)
@@ -140,13 +172,18 @@ def parse_structured_pano_output(
             )
         return StructuredPanoParseResult(kind="invalid", view_id=view)
 
-    if re.search(r"\bSTOP\b", text, flags=re.I):
+    # A malformed structured line should stay invalid instead of falling through
+    # to legacy numeric parsing.
+    if any(re.match(r"^view\s*:", line, flags=re.I) for line in lines):
+        return StructuredPanoParseResult(kind="invalid")
+
+    if re.fullmatch(r"\s*STOP\s*", stripped, flags=re.I):
         return StructuredPanoParseResult(kind="stop")
 
-    if re.search(r"\d", text):
-        nums = [int(c) for c in re.findall(r"\d+", text)]
-        if len(nums) >= 2:
-            u, v = nums[0], nums[1]
+    if allow_legacy_coord:
+        legacy_match = re.fullmatch(r"\s*([-+]?\d+)\s+([-+]?\d+)\s*", stripped)
+        if legacy_match is not None:
+            u, v = int(legacy_match.group(1)), int(legacy_match.group(2))
             u, v = _clamp_coord(u, v, image_size)
             return StructuredPanoParseResult(
                 kind="legacy_coord",

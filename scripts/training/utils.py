@@ -2,6 +2,8 @@
 Shared utility functions used across multiple training modules.
 """
 
+from __future__ import annotations
+
 import logging
 from contextlib import nullcontext
 
