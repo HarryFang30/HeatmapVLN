@@ -2544,7 +2544,11 @@ def _run_eval_panoramic_vlm(
             pixel_goal = _parse_pixel_goal(
                 llm_output,
                 vlm_image_size,
-                allow_legacy_coord=not structured_pano_output,
+                # Structured output is preferred, but closed-loop eval should
+                # still salvage a pure legacy "u v" coordinate.  Malformed
+                # structured lines such as "view: front|right|..." stay invalid
+                # inside parse_structured_pano_output and do not fall through.
+                allow_legacy_coord=True,
             )
             pano_goal_view = _parse_pano_view_id(llm_output) or "front"
 
@@ -3962,7 +3966,10 @@ def run_eval(args):
                 pixel_goal = _parse_pixel_goal(
                     llm_output,
                     vlm_image_size,
-                    allow_legacy_coord=not structured_pano_output,
+                    # Same compatibility policy as the in-process panoramic
+                    # path: accept bare "u v" as front-view fallback, while
+                    # keeping malformed structured view lines invalid.
+                    allow_legacy_coord=True,
                 )
                 if pixel_goal is not None:
                     print(f"  predicted pixel_goal {pixel_goal}")

@@ -46,6 +46,26 @@ def test_parse_legacy_coord_fallback():
     assert parsed.pixel_goal == [128, 192]
 
 
+def test_parse_structured_pano_inline_pixel_goal():
+    parsed = parse_structured_pano_output(
+        "view: right pixel: 211 128",
+        image_size=(256, 256),
+    )
+    assert parsed.kind == "pixel"
+    assert parsed.view_id == "right"
+    assert parsed.pixel_goal == [211, 128]
+
+
+def test_parse_pixel_only_legacy_front_fallback():
+    parsed = parse_structured_pano_output(
+        "pixel: 211 128",
+        image_size=(256, 256),
+    )
+    assert parsed.kind == "legacy_coord"
+    assert parsed.view_id == "front"
+    assert parsed.pixel_goal == [211, 128]
+
+
 def test_structured_option_echo_is_invalid_not_front():
     parsed = parse_structured_pano_output(
         "view: front|right|back|left\npixel: 10 128",

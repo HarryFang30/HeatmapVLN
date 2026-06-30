@@ -75,6 +75,7 @@ class TrajectoryConfig(_Lenient):
     subsequence_samples_per_clip: int = 3
     predict_horizon: int = 24
     action_scale: float = 4.0
+    enable_augmentation: bool = True
     enable_trajectory_augmentation: bool = True
     load_traj_images: bool = False
     traj_image_size: list[int] = [224, 224]

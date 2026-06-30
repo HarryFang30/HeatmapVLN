@@ -133,6 +133,22 @@ def parse_structured_pano_output(
         flags=re.I,
     )
     pixel_line_re = re.compile(r"^pixel\s*:\s*([-+]?\d+)\s+([-+]?\d+)\s*$", flags=re.I)
+    inline_pixel_re = re.compile(
+        r"^view\s*:\s*(front|right|back|left)\s*[,;]?\s+"
+        r"pixel\s*:\s*([-+]?\d+)\s+([-+]?\d+)\s*$",
+        flags=re.I,
+    )
+
+    inline_pixel_match = inline_pixel_re.fullmatch(stripped)
+    if inline_pixel_match is not None:
+        view = inline_pixel_match.group(1).lower()
+        u, v = int(inline_pixel_match.group(2)), int(inline_pixel_match.group(3))
+        u, v = _clamp_coord(u, v, image_size)
+        return StructuredPanoParseResult(
+            kind="pixel",
+            view_id=view,
+            pixel_goal=[u, v],
+        )
 
     view_match = view_line_re.fullmatch(lines[0]) if lines else None
     if view_match is not None:
@@ -181,6 +197,20 @@ def parse_structured_pano_output(
         return StructuredPanoParseResult(kind="stop")
 
     if allow_legacy_coord:
+        pixel_only_match = re.fullmatch(
+            r"\s*pixel\s*:\s*([-+]?\d+)\s+([-+]?\d+)\s*",
+            stripped,
+            flags=re.I,
+        )
+        if pixel_only_match is not None:
+            u, v = int(pixel_only_match.group(1)), int(pixel_only_match.group(2))
+            u, v = _clamp_coord(u, v, image_size)
+            return StructuredPanoParseResult(
+                kind="legacy_coord",
+                view_id="front",
+                pixel_goal=[u, v],
+            )
+
         legacy_match = re.fullmatch(r"\s*([-+]?\d+)\s+([-+]?\d+)\s*", stripped)
         if legacy_match is not None:
             u, v = int(legacy_match.group(1)), int(legacy_match.group(2))

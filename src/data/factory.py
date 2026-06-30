@@ -81,6 +81,7 @@ def build_trajectory_dataset(
         subsequence_samples_per_clip=traj_cfg.get("subsequence_samples_per_clip", 3),
         predict_horizon=traj_cfg.get("predict_horizon", 24),
         action_scale=traj_cfg.get("action_scale", 4.0),
+        enable_augmentation=traj_cfg.get("enable_augmentation", True),
         enable_trajectory_augmentation=traj_cfg.get("enable_trajectory_augmentation", True),
         load_traj_images=traj_cfg.get("load_traj_images", False),
         traj_image_size=tuple(traj_cfg.get("traj_image_size", [224, 224])),

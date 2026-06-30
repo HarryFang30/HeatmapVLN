@@ -25,6 +25,7 @@ class TestFactory:
     def test_build_trajectory_extracts_params(self, minimal_cfg):
         """Factory extracts trajectory-specific params."""
         minimal_cfg["data"]["dataset_type"] = "trajectory"
+        minimal_cfg["data"]["trajectory"]["enable_augmentation"] = False
         with patch("src.data.trajectory_dataset.VLNTrajectoryDataset") as MockDS:
             MockDS.return_value = "mock_traj"
             result = build_trajectory_dataset(minimal_cfg, split="val")
@@ -32,6 +33,7 @@ class TestFactory:
             call_kwargs = MockDS.call_args[1]
             assert call_kwargs["split"] == "val"
             assert call_kwargs["min_history"] == 5
+            assert call_kwargs["enable_augmentation"] is False
 
     def test_build_dataset_dispatches_sliding_window(self, minimal_cfg):
         """build_dataset dispatches to sliding_window when dataset_type matches."""

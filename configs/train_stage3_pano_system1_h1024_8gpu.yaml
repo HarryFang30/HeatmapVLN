@@ -47,6 +47,7 @@ data:
     include_stop_samples_random_subsequence: false
     predict_horizon: 32
     action_scale: 4.0
+    enable_augmentation: false
     enable_trajectory_augmentation: false
     compute_pixel_goal: true
     compute_pano_view_pixel_goal: true

@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -6,9 +7,9 @@ import torch
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
 from scripts.training.train_pano_latent_adapter import (
     AdapterTrainBatch,
+    _compute_adapter_objective,
     _filter_records_with_pano_goals,
     _load_teacher_latents,
-    _policy_and_gt_losses,
     _sample_from_record,
 )
 
@@ -215,6 +216,8 @@ class _FakeSystem1Head(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.action_encoder = torch.nn.Linear(3, 4)
+        self.cond_projector = torch.nn.Linear(6, 6, bias=False)
+        torch.nn.init.eye_(self.cond_projector.weight)
 
     @staticmethod
     def _expand_sequence_training_inputs(traj_cond, gt_trajectory, traj_images, trajectory_valid):
@@ -257,33 +260,38 @@ class _FakeModel:
         self.nextdit_action_head = _FakeSystem1Head()
 
 
-def test_policy_and_gt_losses_keep_gradient_to_adapter_condition():
-    pred_cond = torch.randn(2, 4, 6, requires_grad=True)
+def test_adapter_objective_keeps_gradient_to_adapter_output():
+    pred_raw = torch.randn(2, 4, 6, requires_grad=True)
     teacher_cond = torch.randn(2, 4, 6)
     batch = AdapterTrainBatch(
         student_latents=torch.empty(0),
-        teacher_latents=teacher_cond,
-        view_indices=torch.empty(0, dtype=torch.long),
-        goal_pixels=torch.empty(0),
-        image_hw=torch.empty(0),
+        teacher_latents=None,
+        teacher_cond=teacher_cond,
+        records=[],
         trajectory=torch.zeros(2, 3, 4, 3),
         trajectory_valid=torch.ones(2, 3),
         traj_images=torch.zeros(2, 3, 2, 2, 3),
-        records=[],
+    )
+    args = SimpleNamespace(
+        raw_distill_weight=0.0,
+        raw_norm_weight=0.0,
+        cond_distill_weight=1.0,
+        cond_cosine_weight=1.0,
+        cond_smooth_l1_beta=1.0,
+        gt_weight=1.0,
     )
 
-    loss, metrics = _policy_and_gt_losses(
+    loss, metrics, pred_cond = _compute_adapter_objective(
         model=_FakeModel(),
-        pred_cond=pred_cond,
-        teacher_cond=teacher_cond,
+        pred_raw=pred_raw,
         batch=batch,
-        policy_weight=1.0,
-        gt_weight=1.0,
+        args=args,
     )
     loss.backward()
 
     assert loss.item() > 0.0
-    assert metrics["policy_loss"] > 0.0
-    assert metrics["gt_loss"] > 0.0
-    assert pred_cond.grad is not None
-    assert torch.any(pred_cond.grad != 0)
+    assert metrics["cond"] > 0.0
+    assert metrics["gt"] > 0.0
+    assert pred_cond.requires_grad
+    assert pred_raw.grad is not None
+    assert torch.any(pred_raw.grad != 0)

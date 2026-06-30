@@ -706,7 +706,10 @@ class HeatmapVLNRuntime:
         pixel_goal = _parse_pixel_goal(
             llm_output,
             vlm_image_size,
-            allow_legacy_coord=not structured_pano_output,
+            # Main eval compatibility: salvage pure legacy "u v" coordinates
+            # even under the structured prompt. Malformed structured `view:`
+            # lines remain invalid in parse_structured_pano_output.
+            allow_legacy_coord=True,
         )
         pano_goal_view = _parse_pano_view_id(llm_output) or "front"
         response["pixel_goal"] = pixel_goal
