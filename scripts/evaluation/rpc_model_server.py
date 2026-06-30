@@ -2,8 +2,8 @@
 """HeatmapVLN model-side RPC server.
 
 Run this in the model environment.  It intentionally does not import Habitat;
-the Habitat process sends RGB observations through /root/rpc and receives
-discrete Habitat actions.
+the Habitat process sends RGB observations through the vla_rpc bridge and
+receives discrete Habitat actions.
 """
 
 from __future__ import annotations
@@ -48,6 +48,24 @@ LOGGER = logging.getLogger("heatmapvln-rpc-server")
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 PROTO_VERSION = "heatmapvln-r2r-json-v1"
+LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+LOCAL_INTERNNAV_MODEL_PATH = Path(
+    os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
+)
+
+
+def _default_internnav_model_path() -> str:
+    for raw in (
+        os.environ.get("INTERNNAV_MODEL_PATH"),
+        os.environ.get("INTERNNAV_BACKBONE"),
+        str(LOCAL_INTERNNAV_MODEL_PATH),
+    ):
+        if not raw:
+            continue
+        candidate = Path(os.path.expandvars(os.path.expanduser(str(raw))))
+        if candidate.exists():
+            return str(candidate.resolve())
+    return os.environ.get("INTERNNAV_MODEL_PATH", "")
 
 
 class ActionCode:
@@ -811,7 +829,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--base_checkpoint", default=None)
     parser.add_argument("--pano_latent_adapter_checkpoint", default=None)
-    parser.add_argument("--internnav_model_path", default=os.environ.get("INTERNNAV_MODEL_PATH", ""))
+    parser.add_argument("--internnav_model_path", default=_default_internnav_model_path())
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=50051)

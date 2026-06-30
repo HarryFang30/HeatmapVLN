@@ -132,18 +132,36 @@ if not hasattr(np, 'bool'):
 import torch as _torch_preload  # noqa: F401
 
 
+LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+LOCAL_VLNCE_DATA_ROOT = Path(
+    os.environ.get("HEATMAPVLN_VLNCE_DATA_ROOT", str(LOCAL_FJL_ROOT / "habitat" / "VLN-CE" / "data"))
+)
+LOCAL_MP3D_ROOT = Path(
+    os.environ.get("HEATMAPVLN_MP3D_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d"))
+)
+LOCAL_R2R_DATASETS_ROOT = Path(
+    os.environ.get("HEATMAPVLN_R2R_DATASETS_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "datasets"))
+)
+LOCAL_INTERNNAV_MODEL_PATH = Path(
+    os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
+)
+
+
 def _find_preinit_scene() -> str | None:
     candidates = [
         os.environ.get("HEATMAPVLN_PREINIT_SCENE"),
+        str(LOCAL_MP3D_ROOT / "17DRP5sb8fy" / "17DRP5sb8fy.glb"),
+        str(LOCAL_MP3D_ROOT / "zsNo4HB9uLZ" / "zsNo4HB9uLZ.glb"),
         "/root/autodl-tmp/data/scene_datasets/mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
         "/dataset/mp3d/mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
         "/workspace/InternNav/data/scene_data/mp3d_ce/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():
-            return candidate
+            return str(Path(candidate).resolve())
 
     for root in (
+        LOCAL_MP3D_ROOT,
         Path("/root/autodl-tmp/data/scene_datasets/mp3d"),
         Path("/dataset/mp3d/mp3d"),
         Path("/dataset/mp3d"),
@@ -151,8 +169,8 @@ def _find_preinit_scene() -> str | None:
         if not root.exists():
             continue
         try:
-            scene = next(root.glob("*/*.glb"))
-            return str(scene)
+            scene = next(sorted(root.glob("*/*.glb")))
+            return str(scene.resolve())
         except StopIteration:
             continue
     return None
@@ -312,11 +330,44 @@ _TRAINING_UTILS_SPEC = importlib.util.spec_from_file_location(
 )
 if _TRAINING_UTILS_SPEC is None or _TRAINING_UTILS_SPEC.loader is None:
     raise ImportError(f"Could not load training utils from {_TRAINING_UTILS_PATH}")
-_training_utils = importlib.util.module_from_spec(_TRAINING_UTILS_SPEC)
-sys.modules[_TRAINING_UTILS_SPEC.name] = _training_utils
-_TRAINING_UTILS_SPEC.loader.exec_module(_training_utils)
-_normalize_state_key = _training_utils._normalize_state_key
-load_config = _training_utils.load_config
+try:
+    _training_utils = importlib.util.module_from_spec(_TRAINING_UTILS_SPEC)
+    sys.modules[_TRAINING_UTILS_SPEC.name] = _training_utils
+    _TRAINING_UTILS_SPEC.loader.exec_module(_training_utils)
+    _normalize_state_key = _training_utils._normalize_state_key
+    load_config = _training_utils.load_config
+except ModuleNotFoundError as exc:
+    if exc.name != "torch.distributed":
+        raise
+
+    def _normalize_state_key(name: str) -> str:
+        if name.startswith("module."):
+            name = name[len("module."):]
+        name = name.replace(".module.", ".")
+        prefix_aliases = {
+            "qwen3_5.": "qwen2_5_vl.",
+            "qwen3_5_vl.": "qwen2_5_vl.",
+        }
+        for old_prefix, new_prefix in prefix_aliases.items():
+            if name.startswith(old_prefix):
+                return new_prefix + name[len(old_prefix):]
+        return name
+
+    def load_config(config_path: str, validate: bool = True) -> dict:
+        import yaml
+
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        try:
+            if validate:
+                from src.config_schema import normalize_config
+
+                return normalize_config(cfg)
+            from src.config_schema import prepare_config_for_use
+
+            return prepare_config_for_use(cfg)
+        except Exception:
+            return cfg
 
 
 def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
@@ -780,6 +831,9 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         args.data_path = str(data_path.resolve())
     elif args.data_path == DEFAULT_DATA_PATH:
         data_candidates = [
+            LOCAL_R2R_DATASETS_ROOT / "R2R_VLNCE_v1-3_preprocessed" / split / f"{split}.json.gz",
+            LOCAL_R2R_DATASETS_ROOT / "R2R_VLNCE_v1-3" / split / f"{split}.json.gz",
+            LOCAL_VLNCE_DATA_ROOT / "vln_ce" / "raw_data" / "r2r" / split / f"{split}.json.gz",
             Path(f"/home/intern/zhr/fjl/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"),
             Path.home() / f"zhr/fjl/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz",
             Path.home() / f"InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz",
@@ -806,6 +860,8 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         args.scenes_dir = str(scenes_dir.resolve())
     elif args.scenes_dir == DEFAULT_SCENES_DIR:
         scenes_candidates = [
+            LOCAL_MP3D_ROOT,
+            LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d",
             Path("/home/intern/zhr/fjl/InternNav/data/scene_data/mp3d_ce"),
             Path.home() / "zhr/fjl/InternNav/data/scene_data/mp3d_ce",
             Path.home() / "InternNav/data/scene_data/mp3d_ce",
@@ -1942,7 +1998,10 @@ def _resolve_internnav_model_path(cfg: dict) -> str:
         .get("internnav_model_path", "")
         or cfg.get("model", {}).get("llm", {}).get("model_path", "")
     )
-    return os.path.expandvars(os.path.expanduser(str(raw or "").strip()))
+    resolved = os.path.expandvars(os.path.expanduser(str(raw or "").strip()))
+    if (not resolved or resolved.startswith("$")) and LOCAL_INTERNNAV_MODEL_PATH.exists():
+        resolved = str(LOCAL_INTERNNAV_MODEL_PATH.resolve())
+    return resolved
 
 
 def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str) -> None:
