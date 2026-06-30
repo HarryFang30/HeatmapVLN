@@ -96,8 +96,6 @@ require_file "$BASE_CONFIG"
 require_file "$STAGE1_INIT_CKPT"
 require_dir "$DATA_ROOT"
 require_dir "$INTERNNAV_BACKBONE"
-require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
-
 TMP_CONFIG="$(mktemp "/tmp/${RUN_NAME}.XXXXXX.yaml")"
 trap 'rm -f "$TMP_CONFIG"' EXIT
 

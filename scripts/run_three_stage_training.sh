@@ -406,8 +406,6 @@ preflight() {
   fi
   require_dir "$STAGE1_S2_DATA_ROOT"
   require_dir "$STAGE2_DATA_ROOT"
-  require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
-
   if [[ -n "$STAGE2_SYSTEM1_CKPT" ]]; then
     require_file "$STAGE2_SYSTEM1_CKPT"
   else

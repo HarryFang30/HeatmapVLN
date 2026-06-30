@@ -141,8 +141,6 @@ require_file "$STAGE3_BASE_CKPT"
 require_file "$STAGE3_ADAPTER_CKPT"
 require_dir "$PANORAMIC_DATA_ROOT"
 require_dir "$INTERNNAV_MODEL_PATH"
-require_file "$REPO_ROOT/data/fgr2r/subinstr_mapping.json.gz"
-
 TMP_CONFIG="$(mktemp "/tmp/stage3_pano_system1.XXXXXX.yaml")"
 cleanup() {
   if [[ "${KEEP_TMP_CONFIGS:-0}" != "1" ]]; then

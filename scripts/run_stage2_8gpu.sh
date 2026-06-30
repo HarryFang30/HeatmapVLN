@@ -42,7 +42,6 @@ require_file "$STAGE2_CONFIG"
 require_file "$STAGE2_LOAD_WEIGHTS"
 require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE2_DATA_ROOT"
-require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
 prepare_stage2_assets
 mkdir -p "$STAGE2_OUT_DIR" "$STAGE2_TB_DIR"
 

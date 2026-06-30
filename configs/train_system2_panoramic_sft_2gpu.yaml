@@ -57,8 +57,6 @@ data:
     predict_horizon: 32
     action_scale: 4.0
     enable_trajectory_augmentation: false
-    use_subinstruction: true
-    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
     compute_pixel_goal: false
     compute_pano_view_pixel_goal: true
     pano_max_side_dist_m: 6.0

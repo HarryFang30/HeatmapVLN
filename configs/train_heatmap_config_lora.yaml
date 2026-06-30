@@ -67,9 +67,6 @@ data:
     predict_horizon: 24
     action_scale: 4.0
     enable_trajectory_augmentation: false
-    use_subinstruction: false
-    fgr2r_subinstr_path: null
-
 # ============================================
 # 模型配置 — InternNav backbone (Qwen2.5-VL)
 # ============================================

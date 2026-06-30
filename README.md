@@ -171,8 +171,6 @@ Alternatively, frames may be stored as `chunks/chunk_*.npz` (auto-detected).
 
 </details>
 
-FGR2R sub-instruction support requires `data.trajectory.use_subinstruction: true` and `data/fgr2r/subinstr_mapping.json.gz`.
-
 ## Training
 
 ### Two-Stage Training Strategy
@@ -482,7 +480,6 @@ HeatmapVLN/
 │   │   └── action/                # NextDiT: DiT denoiser, DINOv2, Flow Matching
 │   └── utils/                      # Logging, Feishu notifier, visualization, loss
 ├── models/                         # Pretrained weight directory
-├── data/fgr2r/                     # FGR2R sub-instruction data
 ├── docs/                           # Design documents
 └── docker/                         # Dockerfile, docker-compose, launch script
 ```
@@ -518,7 +515,6 @@ This project builds upon the following works:
 - **[Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL)** &mdash; Vision-language foundation model
 - **[InternNav](https://github.com/)** &mdash; Navigation-tuned Qwen2.5-VL backbone and NextDiT System 1
 - **[Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2)** &mdash; Monocular depth estimation (DINOv2-vits)
-- **[FGR2R](https://github.com/YicongHong/Fine-Grained-R2R)** &mdash; Fine-grained sub-instruction annotations for R2R (see [`data/fgr2r/LICENSE`](data/fgr2r/LICENSE))
 
 ## Citation
 

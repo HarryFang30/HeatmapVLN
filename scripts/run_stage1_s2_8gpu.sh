@@ -38,7 +38,6 @@ require_file "$STAGE1_S2_CONFIG"
 require_file "$STAGE1_S2_LOAD_WEIGHTS"
 require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE1_S2_DATA_ROOT"
-require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
 mkdir -p "$STAGE1_S2_OUT_DIR" "$STAGE1_S2_TB_DIR"
 
 STAGE1_S2_TMP_CONFIG="$(mktemp "/tmp/stage1_s2.XXXXXX")"

@@ -116,6 +116,15 @@ class TestPydanticValidation:
         r = validate_config(minimal_cfg)
         assert r.validation.enabled is False
 
+    def test_rejects_removed_subinstruction_keys(self, minimal_cfg):
+        minimal_cfg["data"]["dataset_type"] = "trajectory"
+        minimal_cfg["data"]["trajectory"] = {
+            "use_subinstruction": True,
+            "fgr2r_subinstr_path": "./data/fgr2r/subinstr_mapping.json.gz",
+        }
+        with pytest.raises(ValidationError, match="FGR2R/subinstruction support has been removed"):
+            validate_config(minimal_cfg)
+
     def test_validate_minimal_config(self, minimal_cfg):
         """Minimal config fixture passes validation."""
         result = validate_config(minimal_cfg)

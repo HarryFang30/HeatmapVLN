@@ -116,9 +116,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         system2_min_pixel_goal_len: int = 3,
         system2_stop_oversample: int = 5,
         include_stop_samples_random_subsequence: bool = False,
-        # FGR2R 子指令配置
-        fgr2r_subinstr_path: str | None = None,
-        use_subinstruction: bool = False,
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
         compute_pano_view_pixel_goal: bool | None = None,
@@ -176,12 +173,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.compute_pano_view_pixel_goal = bool(compute_pano_view_pixel_goal)
         self.pano_max_side_dist_m = float(pano_max_side_dist_m)
 
-        # 加载 FGR2R 子指令映射表
-        self.use_subinstruction = use_subinstruction
-        self._fgr2r_mapping = {}
-        if use_subinstruction:
-            self._load_fgr2r_mapping(fgr2r_subinstr_path)
-
         if self.require_sft_target:
             self._build_sample_index()
             # Index building fills LRU caches by touching every clip's poses,
@@ -197,7 +188,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         logger.info(
             f"VLNTrajectoryDataset initialized: predict_horizon={predict_horizon}, "
             f"action_scale={action_scale}, trajectory_aug={self.enable_trajectory_augmentation}, "
-            f"random_subseq={self.random_subsequence}, use_subinstr={self.use_subinstruction}, "
+            f"random_subseq={self.random_subsequence}, "
             f"load_traj_images={self.load_traj_images}, "
             f"compute_pixel_goal={self.compute_pixel_goal}, "
             f"load_lookdown_for_system2={self.load_lookdown_for_system2}, "
@@ -701,113 +692,6 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         return [u, v]
 
-    def _load_fgr2r_mapping(self, fgr2r_path: str | None = None):
-        """加载 FGR2R 子指令映射表（支持 .json 和 .json.gz 格式）"""
-        import gzip
-
-        if fgr2r_path is None:
-            # 默认路径：项目目录下的 data/fgr2r/subinstr_mapping.json.gz
-            fgr2r_path = Path(__file__).parent.parent.parent / "data/fgr2r/subinstr_mapping.json.gz"
-        else:
-            fgr2r_path = Path(fgr2r_path)
-            # 如果是相对路径，相对于项目根目录
-            if not fgr2r_path.is_absolute():
-                fgr2r_path = Path(__file__).parent.parent.parent / fgr2r_path
-
-        # 检查是否存在 .gz 版本
-        if not fgr2r_path.exists() and not str(fgr2r_path).endswith('.gz'):
-            gz_path = Path(str(fgr2r_path) + '.gz')
-            if gz_path.exists():
-                fgr2r_path = gz_path
-
-        try:
-            if str(fgr2r_path).endswith('.gz'):
-                with gzip.open(fgr2r_path, 'rt', encoding='utf-8') as f:
-                    mapping = json.load(f)
-            else:
-                with open(fgr2r_path) as f:
-                    mapping = json.load(f)
-            # 转换 key 为 int（JSON 键是字符串）
-            self._fgr2r_mapping = {int(k): v for k, v in mapping.items()}
-            logger.info(f"Loaded FGR2R subinstruction mapping: {len(self._fgr2r_mapping)} trajectories from {fgr2r_path}")
-        except FileNotFoundError:
-            logger.warning(f"FGR2R mapping file not found: {fgr2r_path}")
-            self._fgr2r_mapping = {}
-            self.use_subinstruction = False
-        except Exception as e:
-            logger.warning(f"Failed to load FGR2R mapping: {e}")
-            self._fgr2r_mapping = {}
-            self.use_subinstruction = False
-
-    def _get_subinstruction(
-        self,
-        trajectory_id: int,
-        num_frames: int,
-        current_t: int,
-        subseq_start: int,
-        subseq_end: int,
-        original_instruction: str,
-        instr_idx: int = 0,  # 使用第几条原始指令
-    ) -> str:
-        """
-        根据帧范围获取对应的子指令
-
-        Args:
-            trajectory_id: 轨迹 ID（对应 FGR2R 的 path_id）
-            num_frames: 总帧数
-            current_t: 当前帧索引
-            subseq_start: 子序列起始帧
-            subseq_end: 子序列结束帧
-            original_instruction: 原始完整指令（备用）
-            instr_idx: 使用第几条原始指令（默认第 0 条）
-
-        Returns:
-            对应的子指令文本
-        """
-        if not self.use_subinstruction or trajectory_id not in self._fgr2r_mapping:
-            return original_instruction
-
-        fgr2r_item = self._fgr2r_mapping[trajectory_id]
-        num_viewpoints = fgr2r_item['num_viewpoints']
-        instructions = fgr2r_item['instructions']
-
-        if num_viewpoints < 2 or not instructions:
-            return original_instruction
-
-        # 计算帧到 viewpoint 的映射
-        # viewpoint 之间均匀分布帧
-        frames_per_segment = num_frames / (num_viewpoints - 1)
-
-        # 将帧范围转换为 viewpoint 范围（1-based）
-        # subseq_start 对应的 viewpoint（向下取整 + 1）
-        vp_start = int(subseq_start / frames_per_segment) + 1
-        # subseq_end 对应的 viewpoint（向上取整 + 1）
-        vp_end = min(int((subseq_end - 1) / frames_per_segment) + 2, num_viewpoints + 1)
-
-        # 选择指令（如果请求的索引超出范围，使用第 0 条）
-        if instr_idx >= len(instructions):
-            instr_idx = 0
-        instr_data = instructions[instr_idx]
-        sub_instructions = instr_data['sub_instructions']
-
-        if not sub_instructions:
-            return instr_data['original']
-
-        # 收集与帧范围有重叠的子指令
-        matching_subs = []
-        for sub in sub_instructions:
-            sub_vp_start, sub_vp_end = sub['viewpoint_range']
-            # 检查是否有重叠
-            if sub_vp_start < vp_end and sub_vp_end > vp_start:
-                matching_subs.append(sub['text'])
-
-        if matching_subs:
-            # 将匹配的子指令连接起来
-            return ' '.join(matching_subs)
-        else:
-            # 没有匹配的子指令，返回第一个子指令
-            return sub_instructions[0]['text'] if sub_instructions else original_instruction
-
     def _compute_trajectory(
         self,
         poses: list[np.ndarray],
@@ -889,27 +773,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # 1. 加载元数据
         meta = self._load_meta(clip_idx)
         T = meta["num_frames"]
-        original_text = meta.get("instruction", "")
-        trajectory_id = int(meta.get("trajectory_id", 0))
+        text = meta.get("instruction", "")
 
         # 获取子序列范围（如果启用了随机子序列采样）
         if self.random_subsequence and idx in self._sample_subsequence_range:
             subseq_start, subseq_end = self._sample_subsequence_range[idx]
         else:
             subseq_start, subseq_end = 0, T
-
-        # 1.5 获取子指令（如果启用了 FGR2R 子指令）
-        if self.use_subinstruction:
-            text = self._get_subinstruction(
-                trajectory_id=trajectory_id,
-                num_frames=T,
-                current_t=current_t,
-                subseq_start=subseq_start,
-                subseq_end=subseq_end,
-                original_instruction=original_text,
-            )
-        else:
-            text = original_text
 
         # 2. 采样历史帧索引（使用子序列范围）
         history_indices = self._sample_history_indices(subseq_start, current_t, self.num_history_sample)

@@ -72,8 +72,6 @@ require_file "$STAGE2_ADAPTER_STUDENT_CONFIG"
 require_file "$STAGE2_ADAPTER_LOAD_WEIGHTS"
 require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE2_ADAPTER_DATA_ROOT"
-require_file "$ROOT_DIR/data/fgr2r/subinstr_mapping.json.gz"
-
 if [[ "$STAGE2_ADAPTER_TEACHER_MODE" == "native_sidecar" && -z "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
   echo "STAGE2_ADAPTER_TEACHER_MODE=native_sidecar requires STAGE2_ADAPTER_TEACHER_JSONL." >&2
   echo "Collect it with scripts/evaluation/collect_internnav_teacher_sidecar.py --coord-source dataset --tensor-output-dir ..." >&2

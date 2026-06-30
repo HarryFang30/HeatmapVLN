@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 class _Strict(BaseModel):
@@ -94,9 +94,19 @@ class TrajectoryConfig(_Lenient):
     system2_min_pixel_goal_len: int = 3
     system2_stop_oversample: int = 5
     include_stop_samples_random_subsequence: bool = False
-    use_subinstruction: bool = False
-    fgr2r_subinstr_path: str | None = None
     panoramic_vlm_input: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_subinstruction_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            removed = {"use_subinstruction", "fgr2r_subinstr_path"} & set(data)
+            if removed:
+                keys = ", ".join(sorted(removed))
+                raise ValueError(
+                    f"FGR2R/subinstruction support has been removed; delete trajectory config key(s): {keys}"
+                )
+        return data
 
     @field_validator("system2_sft_protocol")
     @classmethod

@@ -53,8 +53,6 @@ data:
     # Bridge-only training must keep trajectory labels aligned with fixed
     # visual/text conditions; random trajectory-only augmentation breaks that.
     enable_trajectory_augmentation: false
-    use_subinstruction: true
-    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
     compute_pixel_goal: true
     load_lookdown_for_system2: true
     system2_sft_protocol: internnav

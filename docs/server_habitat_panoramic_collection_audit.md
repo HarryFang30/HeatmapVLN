@@ -246,7 +246,7 @@ root = Path("/home/intern/zhr/fjl/r2r_paronamic_audit_depth/train")
 
 ## 5. 检查 `meta.json` 是否能被 Stage1-S2 正常使用
 
-Stage1-S2 当前会读取 `meta.json` 里的 instruction 和 `trajectory_id`。如果启用了 `use_subinstruction: true`，`trajectory_id` 最好是可以转成 int 的 R2R trajectory id。
+Stage1-S2 当前会读取 `meta.json` 里的 `instruction` 作为唯一语言监督。`trajectory_id` 可用于数据审计，但不会参与训练文本生成。
 
 运行：
 
@@ -258,28 +258,20 @@ import json
 root = Path("/home/intern/zhr/fjl/r2r_paronamic_data/train")
 clips = sorted(p for p in root.glob("*/*") if (p / "meta.json").exists())
 
-bad_tid = []
 empty_instruction = []
 for clip in clips[:200]:
     meta = json.loads((clip / "meta.json").read_text())
-    tid = meta.get("trajectory_id")
     instr = meta.get("instruction", "")
-    try:
-        int(tid)
-    except Exception:
-        bad_tid.append((str(clip), tid))
     if not instr:
         empty_instruction.append(str(clip))
 
 print("checked:", min(200, len(clips)))
-print("bad_trajectory_id:", len(bad_tid), bad_tid[:5])
 print("empty_instruction:", len(empty_instruction), empty_instruction[:5])
 PY
 ```
 
 判断标准：
 
-- `bad_trajectory_id > 0`：如果训练配置 `use_subinstruction: true`，可能会在训练读取时失败，或者拿不到正确 subinstruction。
 - `empty_instruction > 0`：这些样本不能作为有效 SFT 数据。
 
 ## 6. 检查 action 和轨迹长度
@@ -366,7 +358,6 @@ PY
 | `rgb_front_down` | chunk key 中存在 | lookdown 输入缺失，Stage1-S2 不成立 |
 | `pose_front_down` | chunk key 中存在 | 无法在 lookdown 视角可靠投影 pixel-goal |
 | `depth_front_down` | chunk key 中存在 | 不会崩，但 pixel-goal 遮挡过滤退化，建议重采 |
-| `trajectory_id` | 可转 int | `use_subinstruction: true` 可能失败或 subinstruction 错 |
 | instruction | 非空 | SFT prompt 无效 |
 | 样本数量 | 至少 50k SFT samples，正式建议 150k+ | 只能做 smoke/debug，不适合下结论 |
 

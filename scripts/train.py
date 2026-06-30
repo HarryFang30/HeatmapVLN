@@ -362,7 +362,6 @@ def main():
                 samples_per_clip=val_samples,
                 random_subsequence=False,
                 enable_trajectory_augmentation=False,
-                use_subinstruction=False,
                 **dataset_overrides,
             )
         else:

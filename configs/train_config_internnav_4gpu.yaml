@@ -60,8 +60,6 @@ data:
     predict_horizon: 32
     action_scale: 4.0
     enable_trajectory_augmentation: true
-    use_subinstruction: true
-    fgr2r_subinstr_path: ./data/fgr2r/subinstr_mapping.json.gz
     compute_pixel_goal: true
     load_lookdown_for_system2: true
     system2_sft_protocol: internnav
