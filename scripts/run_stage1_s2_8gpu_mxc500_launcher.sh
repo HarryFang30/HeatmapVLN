@@ -44,24 +44,48 @@ echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} WORLD_SIZE=${WORLD_S
 
 # ---------------------------------------------------------------------------
 # Conda：激活环境固定为 /mnt/afs/lixiaoou/intern/fjl/envs/qwen25
-# 仅需初始化 conda 函数（source conda.sh 或 conda shell hook）
+# 集群镜像未必暴露 conda shell hook；若 qwen25 路径存在，则直接通过
+# PATH 激活，和 Stage2/Stage3 launcher 保持一致。
 # ---------------------------------------------------------------------------
-if [[ -n "${CONDA_INIT_SH:-}" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONDA_INIT_SH"
+QWEN25_ENV="/mnt/afs/lixiaoou/intern/fjl/envs/qwen25"
+
+activate_qwen25_via_path() {
+  if [[ ! -x "${QWEN25_ENV}/bin/python" ]]; then
+    return 1
+  fi
+  export PATH="${QWEN25_ENV}/bin:${PATH}"
+  export CONDA_PREFIX="${QWEN25_ENV}"
+  export CONDA_DEFAULT_ENV="qwen25"
+  hash -r
+  echo "[launcher] 已通过 PATH 激活环境: ${QWEN25_ENV} (python=$(command -v python))"
+  return 0
+}
+
+_CONDA_SH=""
+if [[ -n "${CONDA_INIT_SH:-}" && -f "${CONDA_INIT_SH}" ]]; then
+  _CONDA_SH="${CONDA_INIT_SH}"
+elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
+  _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
 elif [[ -f "/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh" ]]; then
-  # shellcheck source=/dev/null
-  source "/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh"
+  _CONDA_SH="/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+  _CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
+fi
+
+if [[ -n "${_CONDA_SH}" ]]; then
   # shellcheck source=/dev/null
-  source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+  source "${_CONDA_SH}"
+  conda activate "${QWEN25_ENV}"
 elif command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
+  conda activate "${QWEN25_ENV}"
+elif activate_qwen25_via_path; then
+  :
 else
-  echo "未找到 conda：请 export CONDA_INIT_SH=/path/to/miniconda3/etc/profile.d/conda.sh 后重试。" >&2
+  echo "未找到 conda 且 ${QWEN25_ENV}/bin/python 不可用。" >&2
+  echo "请 export CONDA_INIT_SH=/path/to/conda.sh，或确认 qwen25 环境路径正确。" >&2
   exit 1
 fi
-conda activate /mnt/afs/lixiaoou/intern/fjl/envs/qwen25
 
 # ---------------------------------------------------------------------------
 # 路径默认值（请按你机器上实际位置修改）
