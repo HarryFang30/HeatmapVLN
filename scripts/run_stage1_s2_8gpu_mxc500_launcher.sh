@@ -85,7 +85,7 @@ export STAGE1_S2_CONFIG="${STAGE1_S2_CONFIG:-configs/train_system2_panoramic_sft
 export GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export MASTER_PORT_STAGE1_S2="${MASTER_PORT_STAGE1_S2:-$MASTER_PORT}"
-export STAGE1_S2_EPOCHS="${STAGE1_S2_EPOCHS:-4}"
+export STAGE1_S2_EPOCHS="${STAGE1_S2_EPOCHS:-5}"
 # batch_size / grad_accum: defer to config (deleted overrides that
 # were clobbering config values — 12 was the culprit for all OOMs)
 export STAGE1_S2_BATCH_SIZE="${STAGE1_S2_BATCH_SIZE:-}"
