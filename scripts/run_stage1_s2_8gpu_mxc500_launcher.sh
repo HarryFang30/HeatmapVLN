@@ -72,9 +72,10 @@ export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/
 
 export STAGE1_S2_LOAD_WEIGHTS="${STAGE1_S2_LOAD_WEIGHTS:-/mnt/afs/lixiaoou/intern/fjl/model/output/run_20260519_232017/checkpoints/latest.pth}"
 export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2}"
-export STAGE1_S2_TB_DIR="${STAGE1_S2_TB_DIR:-/mnt/afs/tensorlog/heatmapvln_stage1_s2_8gpu}"
+export STAGE1_S2_TB_DIR="${STAGE1_S2_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage1_s2_8gpu}"
+export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/lixiaoou/intern/fjl/tmp}"
 
-mkdir -p "$REPO_ROOT/logs" "${STAGE1_S2_OUT_DIR}" "${STAGE1_S2_TB_DIR}"
+mkdir -p "$REPO_ROOT/logs" "${STAGE1_S2_OUT_DIR}" "${STAGE1_S2_TB_DIR}" "${STAGE_TMP_DIR}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage1_s2_8gpu_mxc500.log}"
 
 # ---------------------------------------------------------------------------

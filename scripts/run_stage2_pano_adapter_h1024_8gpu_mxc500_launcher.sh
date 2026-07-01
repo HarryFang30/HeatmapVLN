@@ -15,10 +15,11 @@ export STAGE2_ADAPTER_CONFIG="${STAGE2_ADAPTER_CONFIG:-configs/adapter_pano_stag
 export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_h1024}"
 export LOG_FILE="${LOG_FILE:-${REPO_ROOT}/logs/stage2_adapter_h1024_8gpu_mxc500.log}"
 
-# This experiment should reuse the dense sidecar produced by the default
-# launcher.  If it is missing, fail fast instead of spending another long
-# collection pass.
-export STAGE2_TEACHER_COLLECT_ENABLE="${STAGE2_TEACHER_COLLECT_ENABLE:-0}"
+# Verify/reuse the dense sidecar produced by the default launcher.  When the
+# dataset has grown, the base launcher will keep old records and incrementally
+# collect the missing ones; set STAGE2_TEACHER_COLLECT_ENABLE=0 only to force
+# fail-fast reuse of an already verified sidecar.
+export STAGE2_TEACHER_COLLECT_ENABLE="${STAGE2_TEACHER_COLLECT_ENABLE:-1}"
 
 # Use a different default port so this can run beside the baseline job on a
 # separate allocation without colliding with its torchrun rendezvous.

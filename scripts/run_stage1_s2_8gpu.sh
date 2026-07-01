@@ -40,7 +40,9 @@ require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE1_S2_DATA_ROOT"
 mkdir -p "$STAGE1_S2_OUT_DIR" "$STAGE1_S2_TB_DIR"
 
-STAGE1_S2_TMP_CONFIG="$(mktemp "/tmp/stage1_s2.XXXXXX")"
+STAGE_TMP_DIR="${STAGE_TMP_DIR:-${TMPDIR:-/tmp}}"
+mkdir -p "$STAGE_TMP_DIR"
+STAGE1_S2_TMP_CONFIG="$(mktemp "${STAGE_TMP_DIR%/}/stage1_s2.XXXXXX")"
 TMP_CONFIGS+=("$STAGE1_S2_TMP_CONFIG")
 
 export GPU_DEVICES

@@ -342,6 +342,64 @@ def _resolve_tensor_path(jsonl_path: Path, path_value: str | None) -> Path | Non
     return path
 
 
+def _normalized_clip_dir_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except Exception:
+        return str(value)
+
+
+def _stable_sample_key(clip_dir: Any, current_t: Any) -> str | None:
+    if clip_dir is None or current_t is None:
+        return None
+    clip_key = _normalized_clip_dir_key(clip_dir)
+    if not clip_key:
+        return None
+    return f"{clip_key}|t={int(current_t)}"
+
+
+def _stable_sample_key_from_mapping(mapping: dict[str, Any]) -> str | None:
+    return (
+        mapping.get("stable_sample_key")
+        or _stable_sample_key(mapping.get("clip_dir"), mapping.get("current_t"))
+    )
+
+
+def _stable_sample_keys_match(payload: dict[str, Any], rec: dict[str, Any]) -> bool:
+    payload_key = _stable_sample_key_from_mapping(payload)
+    record_key = _stable_sample_key_from_mapping(rec)
+    return bool(payload_key and record_key and payload_key == record_key)
+
+
+def _resolve_record_clip_idx(dataset: Any, rec: dict[str, Any]) -> int | None:
+    """Resolve a sidecar record against the current dataset, preferring clip_dir.
+
+    Older sidecars store ``clip_idx`` from the collection-time dataset order.
+    Expanding the dataset can shift those indices, while ``clip_dir`` remains
+    stable.  Prefer the path whenever it is available.
+    """
+    clip_dir = rec.get("clip_dir")
+    clips = getattr(dataset, "clips", None)
+    if clip_dir is not None and clips is not None:
+        target_key = _normalized_clip_dir_key(clip_dir)
+        lookup = getattr(dataset, "_clip_dir_to_idx", None)
+        if isinstance(lookup, dict):
+            for raw_key in (str(clip_dir), str(Path(str(clip_dir)).expanduser()), target_key):
+                if raw_key and raw_key in lookup:
+                    return int(lookup[raw_key])
+        if target_key:
+            for idx, current_clip_dir in enumerate(clips):
+                if _normalized_clip_dir_key(current_clip_dir) == target_key:
+                    return int(idx)
+
+    clip_idx = rec.get("clip_idx")
+    if clip_idx is None:
+        return None
+    return int(clip_idx)
+
+
 def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any]:
     """Load one tensor sidecar and require it to belong to the JSONL record."""
     path = rec.get("_tensor_path")
@@ -356,7 +414,7 @@ def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any
         raise RuntimeError(
             f"Tensor sidecar {path} has no dataset_index; re-collect the sidecar"
         )
-    if int(payload_idx) != int(expected_idx):
+    if int(payload_idx) != int(expected_idx) and not _stable_sample_keys_match(payload, rec):
         raise RuntimeError(
             f"Tensor sidecar dataset_index mismatch: path={path} "
             f"payload={payload_idx} record={expected_idx}"
@@ -497,14 +555,16 @@ def _copy_sample_for_collator(sample: dict[str, Any], coord_uv: list[int]) -> di
 
 
 def _sample_from_record(dataset: Any, rec: dict[str, Any]) -> dict[str, Any]:
-    """Load the exact `(clip_idx, current_t)` state recorded in the sidecar.
+    """Load the exact sidecar state, preferring stable ``clip_dir/current_t``.
 
     The collector can run on the fast generic dataset index while older
     sidecars may use the InternNav SFT index.  Using the recorded clip/frame
-    pair avoids coupling adapter training to whichever index mode was used.
+    pair avoids coupling adapter training to whichever index mode was used;
+    using ``clip_dir`` first also survives dataset expansion that shifts
+    integer clip indices.
     """
     idx = int(rec["dataset_index"])
-    clip_idx = rec.get("clip_idx")
+    clip_idx = _resolve_record_clip_idx(dataset, rec)
     current_t = rec.get("current_t")
     if clip_idx is None or current_t is None:
         return dataset[idx]
@@ -547,9 +607,9 @@ def _try_fast_pano_goal_from_record(
     Full sample construction loads history/current/pano/trajectory images.  The
     pre-filter only needs to know whether this frame has a trainable pano pixel
     goal, so use the dataset's projection resolver directly when the sidecar
-    contains a stable ``(clip_idx, current_t)`` pair.
+    contains a stable clip/frame pair.
     """
-    clip_idx = rec.get("clip_idx")
+    clip_idx = _resolve_record_clip_idx(dataset, rec)
     current_t = rec.get("current_t")
     if clip_idx is None or current_t is None:
         return False, None

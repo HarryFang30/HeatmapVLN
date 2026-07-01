@@ -163,6 +163,8 @@ export STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE="${STAGE2_TEACHER_COLLECT_GUIDANCE_
 export STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE="${STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE:-224}"
 export STAGE2_TEACHER_COLLECT_ENABLE="${STAGE2_TEACHER_COLLECT_ENABLE:-1}"
 export STAGE2_TEACHER_FORCE_RECOLLECT="${STAGE2_TEACHER_FORCE_RECOLLECT:-0}"
+export STAGE2_TEACHER_INCREMENTAL_COLLECT="${STAGE2_TEACHER_INCREMENTAL_COLLECT:-1}"
+export STAGE2_TEACHER_TENSOR_PATH_MODE="${STAGE2_TEACHER_TENSOR_PATH_MODE:-stable_key}"
 export STAGE2_TEACHER_COLLECT_LOG_FILE="${STAGE2_TEACHER_COLLECT_LOG_FILE:-$REPO_ROOT/logs/stage2_native_teacher_sidecar_collect.log}"
 export STAGE2_TEACHER_COLLECT_SHARD_DIR="${STAGE2_TEACHER_COLLECT_SHARD_DIR:-${STAGE2_ADAPTER_TEACHER_JSONL}.shards}"
 export STAGE2_TEACHER_WAIT_TIMEOUT_S="${STAGE2_TEACHER_WAIT_TIMEOUT_S:-172800}"
@@ -180,13 +182,37 @@ is_truthy_launcher() {
   esac
 }
 
+dataset_signature() {
+  python - "$PANORAMIC_DATA_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).expanduser()
+parts = []
+stats_path = root / "collection_stats.json"
+if stats_path.is_file():
+    with stats_path.open("r", encoding="utf-8") as f:
+        stats = json.load(f)
+    for key in ("successful", "failed", "total_frames"):
+        if key in stats:
+            parts.append(f"{key}={stats[key]}")
+try:
+    parts.append(f"meta_count={sum(1 for _ in root.rglob('meta.json'))}")
+except Exception:
+    pass
+print(",".join(parts) if parts else "unknown")
+PY
+}
+
 sidecar_signature() {
-  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|pixel_goal_direction=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s\n' \
+  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|dataset=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|pixel_goal_direction=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s|tensor_path_mode=%s\n' \
     "$PANORAMIC_DATA_ROOT" \
     "$STAGE2_TEACHER_COLLECT_SPLIT" \
     "$STAGE2_TEACHER_COLLECT_CONFIG" \
     "$INTERNNAV_MODEL_PATH" \
     "$INTERNNAV_REPO" \
+    "$(dataset_signature)" \
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" \
     "$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE" \
     "$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING" \
@@ -195,7 +221,8 @@ sidecar_signature() {
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" \
     "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
     "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
-    "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE"
+    "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE" \
+    "$STAGE2_TEACHER_TENSOR_PATH_MODE"
 }
 
 parse_teacher_collect_gpus() {
@@ -209,6 +236,63 @@ parse_teacher_collect_gpus() {
       printf '%s\n' "$gpu"
     fi
   done
+}
+
+prime_incremental_shards_from_master() {
+  local collect_nproc="$1"
+  if ! is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
+    return 0
+  fi
+  if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
+    return 0
+  fi
+  if [[ "$collect_nproc" -lt 1 ]]; then
+    return 0
+  fi
+
+  local existing_shard=""
+  if [[ -d "$STAGE2_TEACHER_COLLECT_SHARD_DIR" ]]; then
+    existing_shard="$(find "$STAGE2_TEACHER_COLLECT_SHARD_DIR" -maxdepth 1 -name 'shard_*.jsonl' -size +0c -print -quit 2>/dev/null || true)"
+  fi
+  if [[ -n "$existing_shard" ]]; then
+    return 0
+  fi
+
+  echo "[launcher] 未找到旧 shard JSONL，从 master sidecar 拆分以便增量复用"
+  mkdir -p "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  python - "$STAGE2_ADAPTER_TEACHER_JSONL" "$STAGE2_TEACHER_COLLECT_SHARD_DIR" "$collect_nproc" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+master = Path(sys.argv[1])
+shard_dir = Path(sys.argv[2])
+nproc = int(sys.argv[3])
+handles = {}
+count = 0
+try:
+    with master.open("r", encoding="utf-8") as src:
+        for line in src:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                idx = rec.get("dataset_index")
+                if idx is None:
+                    continue
+                shard = int(idx) % nproc
+            except Exception:
+                continue
+            if shard not in handles:
+                path = shard_dir / f"shard_{shard:02d}.jsonl"
+                handles[shard] = path.open("a", encoding="utf-8")
+            handles[shard].write(line)
+            count += 1
+finally:
+    for handle in handles.values():
+        handle.close()
+print(f"[launcher] primed {count} records into {len(handles)} shard files", flush=True)
+PY
 }
 
 ensure_native_teacher_sidecar() {
@@ -262,17 +346,32 @@ ensure_native_teacher_sidecar() {
     rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
     rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
   elif [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && ( ! -f "$marker" || ! -f "$meta" ) ]]; then
-    echo "[launcher] sidecar 缺少 .done/.meta，清理旧 sidecar/shard JSONL 后重新采集"
-    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
-    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
+      echo "[launcher] sidecar 缺少 .done/.meta，保留旧记录并增量恢复采集"
+      rm -f "$marker" "$collecting_meta"
+    else
+      echo "[launcher] sidecar 缺少 .done/.meta，清理旧 sidecar/shard JSONL 后重新采集"
+      rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
+      rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    fi
   elif [[ -f "$meta" && "$(cat "$meta")" != "$current_sig" ]]; then
-    echo "[launcher] sidecar meta 与当前参数不一致，清理旧 sidecar/shard JSONL 后重新采集"
-    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
-    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
+      echo "[launcher] sidecar meta 与当前参数/数据集不一致，保留旧记录并增量补齐"
+      rm -f "$marker" "$collecting_meta"
+    else
+      echo "[launcher] sidecar meta 与当前参数不一致，清理旧 sidecar/shard JSONL 后重新采集"
+      rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
+      rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    fi
   elif [[ -f "$collecting_meta" && "$(cat "$collecting_meta")" != "$current_sig" ]]; then
-    echo "[launcher] 未完成采集的参数与当前参数不一致，清理旧 shard JSONL 后重新采集"
-    rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$collecting_meta"
-    rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
+      echo "[launcher] 未完成采集的参数与当前参数不一致，保留旧记录并增量恢复"
+      rm -f "$marker" "$collecting_meta"
+    else
+      echo "[launcher] 未完成采集的参数与当前参数不一致，清理旧 shard JSONL 后重新采集"
+      rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$collecting_meta"
+      rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    fi
   fi
 
   local -a collect_gpus=()
@@ -296,6 +395,7 @@ ensure_native_teacher_sidecar() {
     exit 1
   fi
 
+  prime_incremental_shards_from_master "$collect_nproc"
   mkdir -p "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
   printf '%s' "$current_sig" > "$collecting_meta"
 
@@ -306,6 +406,7 @@ ensure_native_teacher_sidecar() {
   echo "[launcher]   shard_dir=$STAGE2_TEACHER_COLLECT_SHARD_DIR"
   echo "[launcher]   collect_config=$STAGE2_TEACHER_COLLECT_CONFIG"
   echo "[launcher]   sample_stride=$STAGE2_TEACHER_COLLECT_SAMPLE_STRIDE clip_level_sampling=$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING samples_per_clip=$STAGE2_TEACHER_COLLECT_SAMPLES_PER_CLIP pixel_goal_direction=$STAGE2_TEACHER_COLLECT_PIXEL_GOAL_DIRECTION"
+  echo "[launcher]   incremental=$STAGE2_TEACHER_INCREMENTAL_COLLECT tensor_path_mode=$STAGE2_TEACHER_TENSOR_PATH_MODE"
   echo "[launcher]   gpus=${collect_gpus[*]:0:$collect_nproc} nproc=$collect_nproc"
 
   local shard_num_samples="$STAGE2_TEACHER_COLLECT_NUM_SAMPLES"
@@ -330,6 +431,7 @@ ensure_native_teacher_sidecar() {
       --split "$STAGE2_TEACHER_COLLECT_SPLIT"
       --output "$shard_output"
       --tensor-output-dir "$STAGE2_TEACHER_TENSOR_DIR"
+      --tensor-path-mode "$STAGE2_TEACHER_TENSOR_PATH_MODE"
       --internnav-repo "$INTERNNAV_REPO"
       --model-path "$INTERNNAV_MODEL_PATH"
       --device cuda:0
@@ -351,6 +453,9 @@ ensure_native_teacher_sidecar() {
       --progress-style "$STAGE2_TEACHER_COLLECT_PROGRESS_STYLE"
       --tqdm-mininterval "$STAGE2_TEACHER_COLLECT_TQDM_MININTERVAL"
     )
+    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT" && [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
+      collect_args+=(--resume-from-jsonl "$STAGE2_ADAPTER_TEACHER_JSONL")
+    fi
     if is_truthy_launcher "$STAGE2_TEACHER_COLLECT_CLIP_LEVEL_SAMPLING"; then
       collect_args+=(--clip-level-sampling)
     else

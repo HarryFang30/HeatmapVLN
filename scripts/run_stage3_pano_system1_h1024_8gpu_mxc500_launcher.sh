@@ -91,7 +91,8 @@ export STAGE3_CONFIG="${STAGE3_CONFIG:-configs/train_stage3_pano_system1_h1024_8
 export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN/checkpoints/stage1-s2_latest.pth}"
 export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_h1024/latest.pth}"
 export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_h1024}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/tensorlog/heatmapvln_stage3_pano_system1_h1024}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_h1024}"
+export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/lixiaoou/intern/fjl/tmp}"
 
 export GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -106,7 +107,7 @@ export STAGE3_MAX_BATCHES="${STAGE3_MAX_BATCHES:-}"
 export STAGE3_REQUIRE_FLASH_ATTN="${STAGE3_REQUIRE_FLASH_ATTN:-1}"
 export HEATMAPVLN_REQUIRE_FLASH_ATTN="$STAGE3_REQUIRE_FLASH_ATTN"
 
-mkdir -p "$REPO_ROOT/logs" "$STAGE3_OUT_DIR" "$STAGE3_TB_DIR"
+mkdir -p "$REPO_ROOT/logs" "$STAGE3_OUT_DIR" "$STAGE3_TB_DIR" "$STAGE_TMP_DIR"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_h1024_8gpu_mxc500.log}"
 
 require_file() {
@@ -141,7 +142,7 @@ require_file "$STAGE3_BASE_CKPT"
 require_file "$STAGE3_ADAPTER_CKPT"
 require_dir "$PANORAMIC_DATA_ROOT"
 require_dir "$INTERNNAV_MODEL_PATH"
-TMP_CONFIG="$(mktemp "/tmp/stage3_pano_system1.XXXXXX.yaml")"
+TMP_CONFIG="$(mktemp "${STAGE_TMP_DIR%/}/stage3_pano_system1.XXXXXX.yaml")"
 cleanup() {
   if [[ "${KEEP_TMP_CONFIGS:-0}" != "1" ]]; then
     rm -f "$TMP_CONFIG"

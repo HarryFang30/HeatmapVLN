@@ -9,6 +9,7 @@ from scripts.training.train_pano_latent_adapter import (
     AdapterTrainBatch,
     _compute_adapter_objective,
     _filter_records_with_pano_goals,
+    _load_validated_tensor_sidecar_payload,
     _load_teacher_latents,
     _sample_from_record,
 )
@@ -118,6 +119,32 @@ def test_sample_from_record_uses_clip_frame_when_dataset_index_is_stale():
     assert dataset.sample_index == [(0, 5)]
 
 
+def test_sample_from_record_prefers_clip_dir_when_clip_index_shifted(tmp_path):
+    dataset = _FakeDataset()
+    stale_clip = tmp_path / "new_scene" / "clip_000001"
+    target_clip = tmp_path / "old_scene" / "clip_000001"
+    stale_clip.mkdir(parents=True)
+    target_clip.mkdir(parents=True)
+    dataset.clips = [stale_clip, target_clip]
+    dataset._clip_dir_to_idx = {str(stale_clip): 0, str(target_clip): 1}
+    dataset.samples[(1, 5)] = {
+        "pano_sample_kind": "pixel",
+        "pano_view_id": "right",
+        "pano_pixel_goal": [64, 128],
+    }
+    rec = {
+        "dataset_index": 0,
+        "clip_idx": 0,
+        "clip_dir": str(target_clip),
+        "current_t": 5,
+    }
+
+    sample = _sample_from_record(dataset, rec)
+
+    assert sample["pano_view_id"] == "right"
+    assert dataset.sample_index == [(0, 5)]
+
+
 def test_filter_records_with_pano_goals_is_global_before_ddp_sharding():
     dataset = _FakeDataset()
     records = [
@@ -186,6 +213,32 @@ def test_load_teacher_latents_rejects_tensor_sidecar_with_wrong_dataset_index(tm
             torch.device("cpu"),
             target_dim=6,
         )
+
+
+def test_tensor_sidecar_accepts_stable_key_when_dataset_index_shifted(tmp_path):
+    clip = tmp_path / "scene" / "clip_000001"
+    clip.mkdir(parents=True)
+    tensor_path = tmp_path / "teacher.pt"
+    torch.save(
+        {
+            "dataset_index": 999,
+            "clip_dir": str(clip),
+            "current_t": 5,
+            "traj_latents_768": torch.ones(1, 4, 6),
+        },
+        tensor_path,
+    )
+
+    payload = _load_validated_tensor_sidecar_payload(
+        {
+            "dataset_index": 0,
+            "clip_dir": str(clip),
+            "current_t": 5,
+            "_tensor_path": str(tensor_path),
+        }
+    )
+
+    assert int(payload["dataset_index"]) == 999
 
 
 def test_filter_records_accepts_strictly_aligned_sidecar(tmp_path):

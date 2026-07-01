@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import torch
@@ -60,3 +61,61 @@ def test_collect_one_pano_structured_coord_adds_teacher_metadata(monkeypatch):
 
     assert rec["teacher"]["pano_view_id"] == "right"
     assert rec["teacher"]["structured_assistant_text"] == "view: right\npixel: 211 128"
+
+
+def test_incremental_resume_does_not_skip_shifted_dataset_index(tmp_path):
+    old_clip = tmp_path / "old_scene" / "clip_000001"
+    new_clip = tmp_path / "new_scene" / "clip_000001"
+    old_clip.mkdir(parents=True)
+    new_clip.mkdir(parents=True)
+    shard = tmp_path / "shard_00.jsonl"
+    shard.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "dataset_index": 0,
+                "clip_dir": str(old_clip),
+                "current_t": 5,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    done_indices, done_keys = collector._load_done_markers(shard)
+
+    dataset = SimpleNamespace(sample_index=[(0, 5)], clips=[new_clip])
+    stable_key = collector._stable_sample_key_from_dataset(dataset, 0)
+    should_skip = (stable_key and stable_key in done_keys) or (
+        not stable_key and 0 in done_indices
+    )
+
+    assert 0 in done_indices
+    assert stable_key not in done_keys
+    assert not should_skip
+
+
+def test_stable_tensor_path_avoids_dataset_index_collision(tmp_path):
+    old_clip = tmp_path / "old_scene" / "clip_000001"
+    new_clip = tmp_path / "new_scene" / "clip_000001"
+    old_clip.mkdir(parents=True)
+    new_clip.mkdir(parents=True)
+    args = SimpleNamespace(
+        tensor_output_dir=str(tmp_path / "tensors"),
+        tensor_path_mode="stable_key",
+        tensor_shard_size=1000,
+    )
+
+    old_path = collector._tensor_sidecar_path(
+        args,
+        0,
+        {"clip_dir": str(old_clip), "current_t": 5},
+    )
+    new_path = collector._tensor_sidecar_path(
+        args,
+        0,
+        {"clip_dir": str(new_clip), "current_t": 5},
+    )
+
+    assert old_path != new_path
+    assert old_path.parent.name != "shard_00000"

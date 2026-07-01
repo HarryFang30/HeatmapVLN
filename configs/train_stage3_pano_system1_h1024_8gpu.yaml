@@ -18,7 +18,7 @@ seed: 42
 paths:
   dataset_root: /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data
   log_out_dir: /mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_h1024
-  tensorboard_dir: /mnt/afs/tensorlog/heatmapvln_stage3_pano_system1_h1024
+  tensorboard_dir: /mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_h1024
   internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
 
 data:

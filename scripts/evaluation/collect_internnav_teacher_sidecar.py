@@ -11,6 +11,7 @@ that can be used for distillation or offline audits.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.machinery
 import importlib.util
 import itertools
@@ -523,10 +524,54 @@ def _summarize_sample_trajectories(
     }
 
 
-def _tensor_sidecar_path(args: argparse.Namespace, dataset_index: int) -> Path | None:
+def _normalized_clip_dir_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except Exception:
+        return str(value)
+
+
+def _stable_sample_key(clip_dir: Any, current_t: Any) -> str | None:
+    if clip_dir is None or current_t is None:
+        return None
+    clip_key = _normalized_clip_dir_key(clip_dir)
+    if not clip_key:
+        return None
+    return f"{clip_key}|t={int(current_t)}"
+
+
+def _stable_sample_key_from_record(rec: dict[str, Any]) -> str | None:
+    return (
+        rec.get("stable_sample_key")
+        or _stable_sample_key(rec.get("clip_dir"), rec.get("current_t"))
+    )
+
+
+def _stable_sample_key_from_dataset(dataset: Any, idx: int) -> str | None:
+    if not hasattr(dataset, "sample_index") or not hasattr(dataset, "clips"):
+        return None
+    try:
+        clip_idx, current_t = dataset.sample_index[idx]
+        return _stable_sample_key(dataset.clips[clip_idx], current_t)
+    except Exception:
+        return None
+
+
+def _tensor_sidecar_path(
+    args: argparse.Namespace,
+    dataset_index: int,
+    sample_metadata: dict[str, Any] | None = None,
+) -> Path | None:
     if not args.tensor_output_dir:
         return None
     root = Path(args.tensor_output_dir).expanduser()
+    if getattr(args, "tensor_path_mode", "dataset_index") == "stable_key":
+        stable_key = _stable_sample_key_from_record(sample_metadata or {})
+        if stable_key:
+            digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()
+            return root / "by_clip" / digest[:2] / f"{digest}.pt"
     shard = int(dataset_index) // int(args.tensor_shard_size)
     return root / f"shard_{shard:05d}" / f"{int(dataset_index):08d}.pt"
 
@@ -540,6 +585,7 @@ def _save_tensor_sidecar(
     traj_latents_768: torch.Tensor | None,
     dp_actions: torch.Tensor | None,
     args: argparse.Namespace,
+    sample_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
@@ -547,6 +593,13 @@ def _save_tensor_sidecar(
         "mode": mode,
         "tensor_save_dtype": args.tensor_save_dtype,
     }
+    if sample_metadata:
+        for key in ("clip_idx", "current_t", "clip_dir", "scene_id", "episode_id", "trajectory_id"):
+            if key in sample_metadata:
+                payload[key] = sample_metadata[key]
+        stable_key = _stable_sample_key_from_record(sample_metadata)
+        if stable_key:
+            payload["stable_sample_key"] = stable_key
     saved: dict[str, Any] = {}
     if traj_latents is not None and args.save_traj_latents:
         payload["traj_latents"] = _cast_tensor_for_save(traj_latents, args.tensor_save_dtype)
@@ -686,6 +739,7 @@ def _run_system1(
     args: argparse.Namespace,
     dataset_index: int,
     mode: str,
+    sample_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pixel_values = inputs.pixel_values
     image_grid_thw = _normalize_image_grid_thw(inputs)
@@ -720,7 +774,7 @@ def _run_system1(
             dp_actions, traj_to_actions_fn, action_scale,
         ),
     }
-    tensor_path = _tensor_sidecar_path(args, dataset_index)
+    tensor_path = _tensor_sidecar_path(args, dataset_index, sample_metadata)
     if tensor_path is not None:
         saved = _save_tensor_sidecar(
             tensor_path,
@@ -730,6 +784,7 @@ def _run_system1(
             traj_latents_768=traj_latents_768,
             dp_actions=dp_actions,
             args=args,
+            sample_metadata=sample_metadata,
         )
         if saved:
             result["tensor_sidecar"] = saved
@@ -790,10 +845,11 @@ def _load_teacher(args: argparse.Namespace, device: torch.device):
     return model, processor, traj_to_actions
 
 
-def _load_done_indices(output: Path) -> set[int]:
-    done: set[int] = set()
+def _load_done_markers(output: Path) -> tuple[set[int], set[str]]:
+    done_indices: set[int] = set()
+    done_keys: set[str] = set()
     if not output.exists():
-        return done
+        return done_indices, done_keys
     with output.open("r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -802,8 +858,11 @@ def _load_done_indices(output: Path) -> set[int]:
                 continue
             idx = rec.get("dataset_index")
             if idx is not None:
-                done.add(int(idx))
-    return done
+                done_indices.add(int(idx))
+            stable_key = _stable_sample_key_from_record(rec)
+            if stable_key:
+                done_keys.add(stable_key)
+    return done_indices, done_keys
 
 
 def _sample_metadata(dataset: Any, idx: int) -> dict[str, Any]:
@@ -814,6 +873,9 @@ def _sample_metadata(dataset: Any, idx: int) -> dict[str, Any]:
         if hasattr(dataset, "clips"):
             clip_dir = Path(dataset.clips[clip_idx])
             meta["clip_dir"] = str(clip_dir)
+            stable_key = _stable_sample_key(clip_dir, current_t)
+            if stable_key:
+                meta["stable_sample_key"] = stable_key
         try:
             clip_meta = dataset._load_meta(clip_idx)
             for key in ("scene_id", "episode_id", "trajectory_id", "num_frames"):
@@ -878,6 +940,7 @@ def _collect_one(
     rng: random.Random,
 ) -> dict[str, Any]:
     _set_sample_seed(args.seed + int(idx) * 1009 + args.shard_index)
+    sample_meta = _sample_metadata(dataset, idx)
     first_messages, first_images = _build_first_turn(sample, args, rng)
     first_output: str | None = None
     second_output = None
@@ -987,6 +1050,7 @@ def _collect_one(
                 args,
                 dataset_index=idx,
                 mode=mode,
+                sample_metadata=sample_meta,
             )
             for key in ("actions8", "local4", "forward_count8", "first_action"):
                 teacher[key] = teacher["system1"][key]
@@ -1001,7 +1065,7 @@ def _collect_one(
     trajectory_valid = sample.get("trajectory_valid")
     rec = {
         "status": "ok",
-        **_sample_metadata(dataset, idx),
+        **sample_meta,
         "teacher": teacher,
         "dataset_label": {
             "pixel_goal_uv": _jsonable(pixel_goal) if pixel_goal is not None else None,
@@ -1114,6 +1178,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-text", action="store_true")
     p.add_argument("--resume", dest="resume", action="store_true", default=True)
     p.add_argument("--no-resume", dest="resume", action="store_false")
+    p.add_argument(
+        "--resume-from-jsonl",
+        action="append",
+        default=[],
+        help=(
+            "Additional completed JSONL(s) used only for resume markers. "
+            "This lets each shard see global stable sample keys during "
+            "incremental collection."
+        ),
+    )
     p.add_argument("--skip-errors", dest="skip_errors", action="store_true", default=True)
     p.add_argument("--no-skip-errors", dest="skip_errors", action="store_false")
     p.add_argument("--skip-system1-errors", dest="skip_system1_errors", action="store_true", default=True)
@@ -1137,6 +1211,16 @@ def parse_args() -> argparse.Namespace:
         "--tensor-output-dir",
         default=None,
         help="Optional directory for .pt tensor sidecars containing traj_latents and/or dp_actions.",
+    )
+    p.add_argument(
+        "--tensor-path-mode",
+        choices=["dataset_index", "stable_key"],
+        default="dataset_index",
+        help=(
+            "dataset_index preserves legacy shard_XXXXX/NNNNNNNN.pt paths. "
+            "stable_key hashes clip_dir/current_t so incremental collection cannot "
+            "overwrite tensors when dataset indices shift."
+        ),
     )
     p.add_argument("--tensor-shard-size", type=int, default=1000)
     p.add_argument(
@@ -1246,9 +1330,23 @@ def main() -> None:
 
     out_path = Path(args.output).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    done = _load_done_indices(out_path) if args.resume else set()
-    if done:
-        print(f"[resume] loaded {len(done)} completed dataset indices from {out_path}", flush=True)
+    if args.resume:
+        done_indices, done_keys = _load_done_markers(out_path)
+        for resume_jsonl in getattr(args, "resume_from_jsonl", []) or []:
+            resume_path = Path(resume_jsonl).expanduser()
+            if not resume_path.is_file():
+                continue
+            extra_indices, extra_keys = _load_done_markers(resume_path)
+            done_indices.update(extra_indices)
+            done_keys.update(extra_keys)
+    else:
+        done_indices, done_keys = set(), set()
+    if done_indices or done_keys:
+        print(
+            f"[resume] loaded {len(done_indices)} completed dataset indices and "
+            f"{len(done_keys)} stable sample keys from {out_path}",
+            flush=True,
+        )
     if args.tensor_output_dir:
         print(
             f"[tensor] output_dir={Path(args.tensor_output_dir).expanduser()} "
@@ -1316,7 +1414,10 @@ def main() -> None:
                 scanned += 1
                 if pbar is not None:
                     pbar.update(1)
-                if idx in done:
+                stable_key = _stable_sample_key_from_dataset(dataset, idx)
+                if (stable_key and stable_key in done_keys) or (
+                    not stable_key and idx in done_indices
+                ):
                     skipped += 1
                     _emit_progress(idx)
                     continue
