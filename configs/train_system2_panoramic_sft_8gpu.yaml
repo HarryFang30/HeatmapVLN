@@ -94,7 +94,7 @@ model:
 training:
   stages:
     - name: stage1_s2_panoramic_sft
-      epochs: 2
+      epochs: 5
       hm_size: [64, 64]
       train_lm: true
       train_system2_sft: true
