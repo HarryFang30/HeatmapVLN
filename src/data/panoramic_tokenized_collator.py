@@ -83,6 +83,7 @@ class PanoramicTokenizedCollator:
         sft_include_forward: bool = False,
         sft_protocol: str = "direct",
         structured_pano_output: bool = True,
+        build_sft_labels: bool = True,
         max_seq_length: int = 8192,
     ):
         self.processor = processor
@@ -99,6 +100,7 @@ class PanoramicTokenizedCollator:
         if self.sft_protocol not in {"direct", "internnav"}:
             raise ValueError(f"Unsupported System2 SFT protocol: {sft_protocol}")
         self.structured_pano_output = bool(structured_pano_output)
+        self.build_sft_labels = bool(build_sft_labels)
         self._call_count = 0
 
     @staticmethod
@@ -542,7 +544,7 @@ class PanoramicTokenizedCollator:
                         [pano_inputs["attention_mask"], traj_mask], dim=1,
                     )
 
-            if self.sft_mode:
+            if self.sft_mode and self.build_sft_labels:
                 labels = self._build_sft_labels(
                     pano_inputs["input_ids"],
                     pano_inputs.get("attention_mask"),

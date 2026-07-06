@@ -70,6 +70,64 @@ def _normalized_trainable_param_names(model: nn.Module) -> set[str]:
     }
 
 
+def _normalized_lora_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        _normalize_state_key(name): value
+        for name, value in state_dict.items()
+        if "lora_" in _normalize_state_key(name)
+    }
+
+
+def assert_complete_lora_checkpoint_match(
+    model: nn.Module,
+    checkpoint_state_dict: dict[str, torch.Tensor],
+    checkpoint_path: str | None = None,
+) -> int:
+    """Require checkpoint LoRA tensors to exactly match the current model."""
+    model_lora = _normalized_lora_state_dict(model.state_dict())
+    checkpoint_lora = _normalized_lora_state_dict(checkpoint_state_dict)
+    model_keys = set(model_lora)
+    checkpoint_keys = set(checkpoint_lora)
+
+    common_keys = model_keys & checkpoint_keys
+    shape_mismatches = sorted(
+        key
+        for key in common_keys
+        if tuple(model_lora[key].shape) != tuple(checkpoint_lora[key].shape)
+    )
+    matched = sorted(common_keys - set(shape_mismatches))
+    missing = sorted(model_keys - checkpoint_keys)
+    unexpected = sorted(checkpoint_keys - model_keys)
+
+    if missing or unexpected or shape_mismatches:
+        def preview(items: list[str], limit: int = 5) -> str:
+            if not items:
+                return "[]"
+            suffix = "" if len(items) <= limit else f", ... +{len(items) - limit}"
+            return "[" + ", ".join(items[:limit]) + suffix + "]"
+
+        source = f" from {checkpoint_path}" if checkpoint_path else ""
+        raise RuntimeError(
+            "Incomplete LoRA checkpoint load refused"
+            f"{source}: model_lora={len(model_lora)} checkpoint_lora={len(checkpoint_lora)} "
+            f"matched={len(matched)} missing={len(missing)} unexpected={len(unexpected)} "
+            f"shape_mismatches={len(shape_mismatches)} "
+            f"missing_preview={preview(missing)} unexpected_preview={preview(unexpected)} "
+            f"shape_mismatch_preview={preview(shape_mismatches)}"
+        )
+
+    if model_lora and not matched:
+        source = f" from {checkpoint_path}" if checkpoint_path else ""
+        raise RuntimeError(
+            "LoRA checkpoint load refused"
+            f"{source}: current model has {len(model_lora)} LoRA tensors but none matched"
+        )
+
+    return len(matched)
+
+
 def _load_normalized_state_dict(
     model: nn.Module,
     state_dict: dict[str, torch.Tensor],
@@ -105,6 +163,127 @@ def _load_normalized_state_dict(
 
 def _get_trainable_params(model: nn.Module) -> list[torch.nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
+
+
+# ---------------------------------------------------------------------------
+# L2-SP regularization helpers
+# ---------------------------------------------------------------------------
+
+_L2_SP_MODULE_PREFIXES = {
+    "cond_projector": ("nextdit_action_head.cond_projector.",),
+    "memory_encoder": ("nextdit_action_head.memory_encoder.",),
+    "rgb_resampler": ("nextdit_action_head.rgb_resampler.",),
+    "traj_dit": ("nextdit_action_head.traj_dit.",),
+    "action_encoder": ("nextdit_action_head.action_encoder.",),
+    "action_decoder": ("nextdit_action_head.action_decoder.",),
+    "system1_action": (
+        "nextdit_action_head.cond_projector.",
+        "nextdit_action_head.memory_encoder.",
+        "nextdit_action_head.rgb_resampler.",
+        "nextdit_action_head.traj_dit.",
+        "nextdit_action_head.action_encoder.",
+        "nextdit_action_head.action_decoder.",
+    ),
+}
+
+
+def _l2_sp_enabled(cfg: dict) -> bool:
+    l2_cfg = cfg.get("loss", {}).get("l2_sp", {})
+    return bool(l2_cfg.get("enabled", False)) and float(l2_cfg.get("weight", 0.0) or 0.0) > 0.0
+
+
+def _l2_sp_prefixes(cfg: dict) -> tuple[str, ...]:
+    l2_cfg = cfg.get("loss", {}).get("l2_sp", {})
+    modules = l2_cfg.get("modules") or ["system1_action"]
+    prefixes: list[str] = []
+    unknown: list[str] = []
+    for module_name in modules:
+        key = str(module_name)
+        module_prefixes = _L2_SP_MODULE_PREFIXES.get(key)
+        if module_prefixes is None:
+            unknown.append(key)
+            continue
+        prefixes.extend(module_prefixes)
+    if unknown:
+        raise ValueError(
+            "Unsupported loss.l2_sp.modules entries: "
+            f"{unknown}. Supported: {sorted(_L2_SP_MODULE_PREFIXES)}"
+        )
+    return tuple(dict.fromkeys(prefixes))
+
+
+def build_l2_sp_reference(
+    model: nn.Module,
+    cfg: dict,
+    *,
+    logger: logging.Logger | None = None,
+) -> dict[str, torch.Tensor]:
+    """Snapshot trainable System1 parameters for L2-SP regularization.
+
+    Only parameters that are both currently trainable and included in
+    ``loss.l2_sp.modules`` are captured.  In the default Stage3 adapter-only
+    plan this intentionally returns an empty dict, because no System1 parameter
+    should receive gradients.
+    """
+    if not _l2_sp_enabled(cfg):
+        return {}
+
+    prefixes = _l2_sp_prefixes(cfg)
+    reference: dict[str, torch.Tensor] = {}
+    numel = 0
+    for name, param in model.named_parameters():
+        norm_name = _normalize_state_key(name)
+        if not param.requires_grad or not norm_name.startswith(prefixes):
+            continue
+        reference[norm_name] = param.detach().cpu().float().clone()
+        numel += param.numel()
+
+    if logger is not None:
+        if reference:
+            logger.info(
+                "  L2-SP enabled: tracking %d tensors / %s System1 params",
+                len(reference),
+                f"{numel:,}",
+            )
+        else:
+            logger.info(
+                "  L2-SP enabled but no trainable System1 params matched "
+                "loss.l2_sp.modules; regularization is inactive for adapter-only stage3"
+            )
+    return reference
+
+
+def compute_l2_sp_loss(
+    model: nn.Module,
+    reference: dict[str, torch.Tensor] | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return mean squared drift from the L2-SP reference."""
+    if not reference:
+        return torch.zeros((), device=device)
+
+    total = torch.zeros((), device=device, dtype=torch.float32)
+    count = 0
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        norm_name = _normalize_state_key(name)
+        ref = reference.get(norm_name)
+        if ref is None:
+            continue
+        if tuple(ref.shape) != tuple(param.shape):
+            raise RuntimeError(
+                f"L2-SP reference shape mismatch for {norm_name}: "
+                f"ref={tuple(ref.shape)} current={tuple(param.shape)}"
+            )
+        diff = param.float() - ref.to(device=param.device, dtype=torch.float32)
+        total = total + diff.pow(2).sum()
+        count += param.numel()
+
+    if count == 0:
+        return torch.zeros((), device=device)
+    return total / float(count)
 
 
 # ---------------------------------------------------------------------------

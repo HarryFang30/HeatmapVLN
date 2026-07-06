@@ -7,8 +7,8 @@
 # This stage does not collect teacher sidecars.  It starts from:
 #   1. Stage1-S2 panoramic Qwen LoRA checkpoint (--load-weights)
 #   2. Stage2 h1024 pano latent adapter checkpoint
-# then trains the adapter plus InternNav System1 action-side modules with GT
-# trajectory flow-matching loss.
+# then trains only the pano latent adapter with GT trajectory flow-matching
+# loss, keeping InternNav System1 frozen by default.
 
 set -Eeuo pipefail
 
@@ -88,10 +88,10 @@ export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
 
 export STAGE3_CONFIG="${STAGE3_CONFIG:-configs/train_stage3_pano_system1_h1024_8gpu.yaml}"
-export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN/checkpoints/stage1-s2_latest.pth}"
-export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_h1024/latest.pth}"
-export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_h1024}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_h1024}"
+export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
+export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth}"
+export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024}"
 export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/lixiaoou/intern/fjl/tmp}"
 
 export GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -100,10 +100,20 @@ export MASTER_PORT_STAGE3="${MASTER_PORT_STAGE3:-$MASTER_PORT}"
 export STAGE3_EPOCHS="${STAGE3_EPOCHS:-}"
 export STAGE3_BATCH_SIZE="${STAGE3_BATCH_SIZE:-}"
 export STAGE3_GRAD_ACCUM_STEPS="${STAGE3_GRAD_ACCUM_STEPS:-}"
-export STAGE3_NUM_WORKERS="${STAGE3_NUM_WORKERS:-8}"
-export STAGE3_PREFETCH_FACTOR="${STAGE3_PREFETCH_FACTOR:-2}"
+export STAGE3_PANO_ADAPTER_LR="${STAGE3_PANO_ADAPTER_LR:-}"
+export STAGE3_L2_SP_ENABLED="${STAGE3_L2_SP_ENABLED:-}"
+export STAGE3_L2_SP_WEIGHT="${STAGE3_L2_SP_WEIGHT:-}"
+export STAGE3_NUM_WORKERS="${STAGE3_NUM_WORKERS:-16}"
+export STAGE3_PREFETCH_FACTOR="${STAGE3_PREFETCH_FACTOR:-4}"
+export STAGE3_PIN_MEMORY="${STAGE3_PIN_MEMORY:-1}"
+export STAGE3_ENABLE_TIMING="${STAGE3_ENABLE_TIMING:-1}"
+export STAGE3_SHOW_GPU_MEMORY="${STAGE3_SHOW_GPU_MEMORY:-0}"
+export STAGE3_LOG_INTERVAL="${STAGE3_LOG_INTERVAL:-20}"
+export STAGE3_TENSORBOARD_INTERVAL="${STAGE3_TENSORBOARD_INTERVAL:-20}"
+export STAGE3_PAGE_CACHE_DROP_ENABLED="${STAGE3_PAGE_CACHE_DROP_ENABLED:-0}"
 export STAGE3_SYSTEM2_SAMPLE_STEP="${STAGE3_SYSTEM2_SAMPLE_STEP:-1}"
 export STAGE3_MAX_BATCHES="${STAGE3_MAX_BATCHES:-}"
+export STAGE3_DRY_RUN="${STAGE3_DRY_RUN:-${STAGE_DRY_RUN:-0}}"
 export STAGE3_REQUIRE_FLASH_ATTN="${STAGE3_REQUIRE_FLASH_ATTN:-1}"
 export HEATMAPVLN_REQUIRE_FLASH_ATTN="$STAGE3_REQUIRE_FLASH_ATTN"
 
@@ -168,6 +178,23 @@ def set_int(section, key, env_name):
     if value is not None and str(value).strip() != "":
         section[key] = int(value)
 
+def set_float(section, key, env_name):
+    value = os.environ.get(env_name)
+    if value is not None and str(value).strip() != "":
+        section[key] = float(value)
+
+def set_bool(section, key, env_name):
+    value = os.environ.get(env_name)
+    if value is None or str(value).strip() == "":
+        return
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        section[key] = True
+    elif normalized in {"0", "false", "no", "n", "off"}:
+        section[key] = False
+    else:
+        raise RuntimeError(f"{env_name} must be boolean-like, got {value!r}")
+
 paths = cfg.setdefault("paths", {})
 paths["dataset_root"] = os.environ["PANORAMIC_DATA_ROOT"]
 paths["log_out_dir"] = os.environ["STAGE3_OUT_DIR"]
@@ -178,6 +205,7 @@ data = cfg.setdefault("data", {})
 data["root"] = os.environ["PANORAMIC_DATA_ROOT"]
 set_int(data, "num_workers", "STAGE3_NUM_WORKERS")
 set_int(data, "prefetch_factor", "STAGE3_PREFETCH_FACTOR")
+set_bool(data, "pin_memory", "STAGE3_PIN_MEMORY")
 trajectory = data.setdefault("trajectory", {})
 set_int(trajectory, "system2_sample_step", "STAGE3_SYSTEM2_SAMPLE_STEP")
 
@@ -192,6 +220,12 @@ adapter["pretrained_path"] = os.environ["STAGE3_ADAPTER_CKPT"]
 optim = cfg.setdefault("optim", {})
 set_int(optim, "batch_size", "STAGE3_BATCH_SIZE")
 set_int(optim, "grad_accum_steps", "STAGE3_GRAD_ACCUM_STEPS")
+set_float(optim, "pano_latent_adapter_lr", "STAGE3_PANO_ADAPTER_LR")
+
+loss = cfg.setdefault("loss", {})
+l2_sp = loss.setdefault("l2_sp", {})
+set_bool(l2_sp, "enabled", "STAGE3_L2_SP_ENABLED")
+set_float(l2_sp, "weight", "STAGE3_L2_SP_WEIGHT")
 
 stages = cfg.setdefault("training", {}).setdefault("stages", [])
 if not stages:
@@ -199,6 +233,13 @@ if not stages:
 epochs = os.environ.get("STAGE3_EPOCHS")
 if epochs is not None and epochs.strip():
     stages[0]["epochs"] = int(epochs)
+
+log = cfg.setdefault("log", {})
+set_bool(log, "enable_timing", "STAGE3_ENABLE_TIMING")
+set_bool(log, "show_gpu_memory", "STAGE3_SHOW_GPU_MEMORY")
+set_bool(log, "page_cache_drop_enabled", "STAGE3_PAGE_CACHE_DROP_ENABLED")
+set_int(log, "log_interval", "STAGE3_LOG_INTERVAL")
+set_int(log, "tensorboard_interval", "STAGE3_TENSORBOARD_INTERVAL")
 
 visible_device_count = len([x for x in os.environ["GPU_DEVICES"].split(",") if x.strip()])
 gpu = cfg.setdefault("gpu", {})
@@ -222,6 +263,12 @@ train_args=(--config "$TMP_CONFIG" --load-weights "$STAGE3_BASE_CKPT")
 if [[ -n "$STAGE3_MAX_BATCHES" ]]; then
   train_args+=(--max-batches "$STAGE3_MAX_BATCHES")
 fi
+case "${STAGE3_DRY_RUN,,}" in
+  1|true|yes|y|on)
+    train_args+=(--dry-run)
+    echo "[launcher] dry-run enabled"
+    ;;
+esac
 
 CUDA_VISIBLE_DEVICES="$GPU_DEVICES" torchrun \
   --master_port="$MASTER_PORT_STAGE3" \

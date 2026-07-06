@@ -40,6 +40,12 @@ STAGE2_ADAPTER_LR="${STAGE2_ADAPTER_LR:-}"
 STAGE2_ADAPTER_WEIGHT_DECAY="${STAGE2_ADAPTER_WEIGHT_DECAY:-}"
 STAGE2_ADAPTER_GRAD_CLIP="${STAGE2_ADAPTER_GRAD_CLIP:-}"
 STAGE2_ADAPTER_MAX_SAMPLES="${STAGE2_ADAPTER_MAX_SAMPLES:-0}"
+STAGE2_ADAPTER_PREFETCH_BATCHES="${STAGE2_ADAPTER_PREFETCH_BATCHES:-}"
+STAGE2_ADAPTER_PREFETCH_WORKERS="${STAGE2_ADAPTER_PREFETCH_WORKERS:-}"
+STAGE2_ADAPTER_TEACHER_CACHE_MODE="${STAGE2_ADAPTER_TEACHER_CACHE_MODE:-}"
+STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS="${STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS:-}"
+STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE="${STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE:-}"
+STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS="${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-}"
 
 # Teacher targets / loss weights
 STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-native_sidecar}"
@@ -128,6 +134,28 @@ build_adapter_args() {
   if [[ -n "${STAGE2_ADAPTER_MAX_SAMPLES:-}" && "${STAGE2_ADAPTER_MAX_SAMPLES}" -gt 0 ]]; then
     args+=(--max-samples "$STAGE2_ADAPTER_MAX_SAMPLES")
   fi
+  if [[ -n "${STAGE2_ADAPTER_PREFETCH_BATCHES:-}" ]]; then
+    args+=(--prefetch-batches "$STAGE2_ADAPTER_PREFETCH_BATCHES")
+  fi
+  if [[ -n "${STAGE2_ADAPTER_PREFETCH_WORKERS:-}" ]]; then
+    args+=(--prefetch-workers "$STAGE2_ADAPTER_PREFETCH_WORKERS")
+  fi
+  if [[ -n "${STAGE2_ADAPTER_TEACHER_CACHE_MODE:-}" ]]; then
+    args+=(--teacher-cache-mode "$STAGE2_ADAPTER_TEACHER_CACHE_MODE")
+  fi
+  if [[ -n "${STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS:-}" ]]; then
+    args+=(--teacher-cache-max-items "$STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS")
+  fi
+  if [[ -n "${STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE:-}" ]]; then
+    if is_truthy "$STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE"; then
+      args+=(--teacher-preload-cache)
+    else
+      args+=(--no-teacher-preload-cache)
+    fi
+  fi
+  if [[ -n "${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-}" ]]; then
+    args+=(--teacher-preload-workers "$STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS")
+  fi
 
   # Teacher JSONL (required in native_sidecar mode)
   if [[ -n "${STAGE2_ADAPTER_TEACHER_JSONL:-}" ]]; then
@@ -155,6 +183,9 @@ log "InternNav model: $STAGE2_ADAPTER_INTERNNAV_MODEL"
 log "Output dir: $STAGE2_ADAPTER_OUT_DIR"
 log "Teacher target mode: $STAGE2_ADAPTER_TEACHER_MODE"
 log "Loss weights: raw=$STAGE2_ADAPTER_RAW_WEIGHT cond=$STAGE2_ADAPTER_COND_WEIGHT gt=$STAGE2_ADAPTER_GT_WEIGHT"
+log "Prefetch batches: ${STAGE2_ADAPTER_PREFETCH_BATCHES:-<config default>}"
+log "Prefetch workers: ${STAGE2_ADAPTER_PREFETCH_WORKERS:-<config default>}"
+log "Teacher cache: mode=${STAGE2_ADAPTER_TEACHER_CACHE_MODE:-<config default>} preload=${STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE:-<config default>} preload_workers=${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-<config default>}"
 log "Teacher MSE diagnostic: $STAGE2_ADAPTER_COMPUTE_TEACHER_MSE"
 log "Record JSONL: ${STAGE2_ADAPTER_TEACHER_JSONL:-<none>}"
 

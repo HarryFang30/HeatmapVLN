@@ -105,10 +105,11 @@ export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
 
 # Stage1-S2 checkpoint (student weights)
-export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2}"
+export STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
+export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap}"
 
 # Output
-export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter}"
+export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora}"
 
 mkdir -p "$REPO_ROOT/logs" "${STAGE2_ADAPTER_OUT_DIR}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage2_adapter_8gpu_mxc500.log}"
@@ -127,6 +128,12 @@ export STAGE2_ADAPTER_BATCH_SIZE="${STAGE2_ADAPTER_BATCH_SIZE:-}"
 export STAGE2_ADAPTER_EPOCHS="${STAGE2_ADAPTER_EPOCHS:-}"
 export STAGE2_ADAPTER_LR="${STAGE2_ADAPTER_LR:-}"
 export STAGE2_ADAPTER_MAX_SAMPLES="${STAGE2_ADAPTER_MAX_SAMPLES:-0}"
+export STAGE2_ADAPTER_PREFETCH_BATCHES="${STAGE2_ADAPTER_PREFETCH_BATCHES:-}"
+export STAGE2_ADAPTER_PREFETCH_WORKERS="${STAGE2_ADAPTER_PREFETCH_WORKERS:-}"
+export STAGE2_ADAPTER_TEACHER_CACHE_MODE="${STAGE2_ADAPTER_TEACHER_CACHE_MODE:-}"
+export STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS="${STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS:-}"
+export STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE="${STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE:-}"
+export STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS="${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-}"
 
 # Teacher targets: native InternNav sidecar by default; teacher model is not
 # loaded during adapter training.
@@ -303,8 +310,6 @@ ensure_native_teacher_sidecar() {
   local marker="${STAGE2_ADAPTER_TEACHER_JSONL}.done"
   local meta="${STAGE2_ADAPTER_TEACHER_JSONL}.meta"
   local collecting_meta="${STAGE2_ADAPTER_TEACHER_JSONL}.collecting.meta"
-  local current_sig
-  current_sig="$(sidecar_signature)"
 
   if ! is_truthy_launcher "$STAGE2_TEACHER_COLLECT_ENABLE"; then
     if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
@@ -314,6 +319,9 @@ ensure_native_teacher_sidecar() {
     echo "[launcher] 跳过 teacher sidecar 采集，使用已有: $STAGE2_ADAPTER_TEACHER_JSONL"
     return 0
   fi
+
+  local current_sig
+  current_sig="$(sidecar_signature)"
 
   if [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && -f "$marker" && -f "$meta" ]] \
     && [[ "$(cat "$meta")" == "$current_sig" ]] \

@@ -11,7 +11,7 @@ adapter:
   dropout: 0.0
 
   training:
-    epochs: 5
+    epochs: 3
     batch_size: 16
     lr: 3.0e-4
     weight_decay: 0.01
@@ -19,6 +19,12 @@ adapter:
     max_samples: 0
     index_mode: generic
     val_ratio: 0.1
+    prefetch_batches: 8
+    prefetch_workers: 4
+    teacher_cache_mode: unbounded
+    teacher_cache_max_items: 0
+    teacher_preload_cache: true
+    teacher_preload_workers: 8
 
   loss:
     raw_weight: 0.1

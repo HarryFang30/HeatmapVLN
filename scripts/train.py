@@ -101,6 +101,8 @@ from scripts.training import (
     _write_json,
     _write_yaml,
     apply_nextdit_warmup_freeze,
+    assert_complete_lora_checkpoint_match,
+    build_l2_sp_reference,
     build_model,
     build_optimizer,
     build_scheduler,
@@ -426,6 +428,7 @@ def main():
             logger.info("🔗 Inferred base checkpoint from resume metadata: %s", inferred_base)
 
     resume_skip_batches: int | None = None
+    resume_l2_sp_reference = None
 
     if resume_path and Path(resume_path).exists():
         resume_info = load_checkpoint_for_resume(
@@ -437,6 +440,7 @@ def main():
             # that were already processed before the save.
             resume_skip_batches = resume_info['batch']
         ckpt_manager.best_val_loss = resume_info['best_val_loss']
+        resume_l2_sp_reference = resume_info.get('l2_sp_reference_state')
 
     requires_base_checkpoint = bool(
         stage_cfg.get('requires_base_checkpoint', False)
@@ -560,12 +564,14 @@ def main():
             sft_include_turns=stage_cfg.get('sft_include_turns', True),
             sft_include_forward=stage_cfg.get('sft_include_forward', False),
             sft_protocol=sft_protocol,
+            build_sft_labels=train_lm,
             max_seq_length=max_seq_len,
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled "
-            "(n_traj_query=%d, sft_mode=%s, return_lm_loss=%s, protocol=%s, max_seq_len=%d)",
-            n_traj_query, sft_prompt_mode, train_lm, sft_protocol, max_seq_len,
+            "(n_traj_query=%d, sft_mode=%s, build_sft_labels=%s, return_lm_loss=%s, "
+            "protocol=%s, max_seq_len=%d)",
+            n_traj_query, sft_prompt_mode, train_lm, train_lm, sft_protocol, max_seq_len,
         )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")
@@ -672,6 +678,13 @@ def main():
             state_dict = ckpt.get('trainable_state_dict', {})
             loaded_count = 0
             if state_dict:
+                if requires_base_checkpoint:
+                    matched_lora = assert_complete_lora_checkpoint_match(
+                        raw_model,
+                        state_dict,
+                        checkpoint_path=str(weights_path),
+                    )
+                    logger.info(f"  ✓ Verified complete LoRA load: {matched_lora} tensors")
                 missing, unexpected, loaded_count = _load_normalized_state_dict(raw_model, state_dict)
                 logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
                 if loaded_count < len(state_dict):
@@ -700,6 +713,16 @@ def main():
     trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     logger.info(f"  Total params: {total_params:,}")
     logger.info(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    if resume_l2_sp_reference:
+        l2_sp_reference = resume_l2_sp_reference
+        l2_sp_numel = sum(t.numel() for t in l2_sp_reference.values() if torch.is_tensor(t))
+        logger.info(
+            "  L2-SP reference restored from checkpoint: %d tensors / %s params",
+            len(l2_sp_reference),
+            f"{l2_sp_numel:,}",
+        )
+    else:
+        l2_sp_reference = build_l2_sp_reference(raw_model, cfg, logger=logger)
 
     # 构建优化器和调度器
     optimizer = build_optimizer(raw_model, cfg, stage_cfg)
@@ -794,7 +817,12 @@ def main():
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
 
-    _drop_page_cache(force=True)
+    log_cfg = cfg.get('log', {})
+    page_cache_drop_enabled = bool(log_cfg.get('page_cache_drop_enabled', True))
+    page_cache_drop_threshold = float(log_cfg.get('page_cache_drop_threshold', 0.80))
+    initial_page_cache_drop = bool(log_cfg.get('initial_page_cache_drop', page_cache_drop_enabled))
+    if page_cache_drop_enabled and initial_page_cache_drop:
+        _drop_page_cache(force=True, threshold=page_cache_drop_threshold)
     if cfg['log'].get('show_gpu_memory', False):
         cg_init = _cgroup_mem_usage_gb()
         logger.info(f"  cgroup memory after initial page cache drop: {cg_init:.1f}/{_CG_LIMIT_GB:.0f}GB")
@@ -836,6 +864,7 @@ def main():
             ckpt_manager=ckpt_manager,
             mid_epoch_save_every=cfg['log'].get('mid_epoch_save_every', 500),
             nextdit_warmup_steps=nextdit_warmup_steps,
+            l2_sp_reference=l2_sp_reference,
         )
 
         timer.end_epoch()
@@ -843,7 +872,8 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         _malloc_trim()
-        _drop_page_cache()
+        if page_cache_drop_enabled:
+            _drop_page_cache(threshold=page_cache_drop_threshold)
 
         do_eval = val_loader is not None and ((epoch % eval_every_epochs == 0) or (epoch == total_epochs))
 
@@ -863,7 +893,8 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
             _malloc_trim()
-            _drop_page_cache()
+            if page_cache_drop_enabled:
+                _drop_page_cache(threshold=page_cache_drop_threshold)
         else:
             if val_loader is None:
                 if not cfg.get('validation', {}).get('enabled', True):
@@ -885,9 +916,10 @@ def main():
 
         train_traj_str = f", traj: {train_metrics['trajectory_loss']:.4f}" if train_metrics.get('trajectory_loss', 0) > 0 else ""
         train_lm_str = f", lm: {train_metrics['lm_loss']:.4f}" if train_metrics.get('lm_loss', 0) > 0 else ""
+        train_l2_sp_str = f", l2sp: {train_metrics['l2_sp_loss']:.6f}" if train_metrics.get('l2_sp_loss', 0) > 0 else ""
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str}{train_lm_str})"
+            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str}{train_lm_str}{train_l2_sp_str})"
         )
 
         eta = timer.get_eta(epoch, total_epochs)
@@ -945,6 +977,10 @@ def main():
         if tb_writer is not None:
             tb_writer.add_scalar('train/lr', current_lr, global_epoch_counter)
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
+            if train_metrics.get('trajectory_loss', 0) > 0:
+                tb_writer.add_scalar('epoch/train_trajectory_loss', train_metrics['trajectory_loss'], global_epoch_counter)
+            if train_metrics.get('l2_sp_loss', 0) > 0:
+                tb_writer.add_scalar('epoch/train_l2_sp_loss', train_metrics['l2_sp_loss'], global_epoch_counter)
 
             if do_eval and val_metrics:
                 tb_writer.add_scalars('loss/total', {
@@ -1024,6 +1060,11 @@ def main():
                         cfg=cfg,
                         is_best=is_best,
                         scaler=scaler,
+                        extra_state=(
+                            {"l2_sp_reference_state": l2_sp_reference}
+                            if l2_sp_reference
+                            else None
+                        ),
                     )
             _dist_barrier()
 

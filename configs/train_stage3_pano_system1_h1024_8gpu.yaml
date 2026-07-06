@@ -1,6 +1,7 @@
 seed: 42
 
-# Stage3: action fine-tuning for the panoramic System2 -> InternNav System1 path.
+# Stage3: prior-preserving adapter correction for the panoramic System2 ->
+# InternNav System1 path.
 #
 # Initialization:
 #   --load-weights loads the Stage1-S2 panoramic Qwen LoRA checkpoint.
@@ -10,24 +11,26 @@ seed: 42
 # Training:
 #   frozen pano student Qwen + frozen latent_queries
 #     -> trainable pano_latent_adapter
-#     -> trainable InternNav System1 action-side modules
+#     -> frozen InternNav System1 action modules
 #     -> GT trajectory flow-matching loss
 #
 # No teacher sidecar is required for this stage.
 
 paths:
   dataset_root: /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data
-  log_out_dir: /mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_h1024
-  tensorboard_dir: /mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_h1024
+  log_out_dir: /mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024
+  tensorboard_dir: /mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024
   internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
 
 data:
   train_split: train
   image_size: [256, 256]
   init_hm_size: [64, 64]
-  num_workers: 8
+  # Stage3 loads/tokenizes pano inputs plus System1 trajectory images.  The
+  # MXC500 node has enough CPU/RAM, so keep the workers aggressive by default.
+  num_workers: 16
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4
   dataset_type: trajectory
   use_worker_tokenized_collator: true
 
@@ -90,7 +93,7 @@ model:
     use_lora: true
     lora_rank: 32
     lora_alpha: 64
-    lora_layer_indices: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
     lora_dropout: 0.05
 
@@ -121,13 +124,13 @@ model:
         enabled: true
         hidden_dim: 1024
         dropout: 0.0
-        pretrained_path: /mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_h1024/latest.pth
+        pretrained_path: /mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth
         strict_load: true
 
 training:
   stages:
-    - name: stage3_pano_system1_action_h1024
-      epochs: 5
+    - name: stage3
+      epochs: 2
       hm_size: [64, 64]
       heatmap_loss_type: heatmap_vln
       train_heatmap: false
@@ -143,16 +146,16 @@ training:
       requires_base_checkpoint: true
       trainable_modules:
         - pano_latent_adapter
+      frozen_modules:
+        - vlm_backbone
+        - lora
+        - latent_queries
         - cond_projector
         - memory_encoder
         - rgb_resampler
         - traj_dit
         - action_encoder
         - action_decoder
-      frozen_modules:
-        - vlm_backbone
-        - lora
-        - latent_queries
         - heatmap_vln
         - rgb_model
         - pos_encoding
@@ -161,11 +164,13 @@ training:
 optim:
   optimizer: adamw
   learning_rate: 2.0e-5
-  pano_latent_adapter_lr: 1.0e-4
-  nextdit_action_lr: 2.0e-5
-  nextdit_cond_projector_lr: 5.0e-5
-  memory_encoder_lr: 2.0e-5
-  rgb_resampler_lr: 2.0e-5
+  pano_latent_adapter_lr: 5.0e-5
+  # Kept low for future ablations where selected System1 modules are unfrozen.
+  # In the default stage3 adapter-only plan these groups have no parameters.
+  nextdit_action_lr: 5.0e-6
+  nextdit_cond_projector_lr: 1.0e-5
+  memory_encoder_lr: 5.0e-6
+  rgb_resampler_lr: 5.0e-6
   weight_decay: 0.01
   projector_weight_decay: 0.01
   grad_clip: 1.0
@@ -183,6 +188,16 @@ loss:
   heatmap_weight: 0.0
   trajectory_weight: 1.0
   lm_weight: 0.0
+  l2_sp:
+    enabled: true
+    weight: 1.0e-4
+    modules:
+      - cond_projector
+      - memory_encoder
+      - rgb_resampler
+      - traj_dit
+      - action_encoder
+      - action_decoder
 
 gpu:
   devices: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -199,12 +214,17 @@ log:
   use_tensorboard: true
   enable_timing: true
   epoch_boundary_cooldown_s: 8
-  log_interval: 10
-  show_gpu_memory: true
+  log_interval: 20
+  tensorboard_interval: 20
+  show_gpu_memory: false
   tqdm_ncols: 120
   log_level: INFO
-  diag_interval: 100
+  diag_interval: 200
   mid_epoch_save_every: 2000
+  page_cache_drop_enabled: false
+  initial_page_cache_drop: false
+  page_cache_drop_interval: 0
+  page_cache_drop_threshold: 0.95
   notify:
     enabled: false
 

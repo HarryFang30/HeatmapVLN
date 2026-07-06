@@ -41,6 +41,7 @@ from .utils import (
     _mean_timing,
     _unwrap_model,
     build_heatmap_loss_fn,
+    compute_l2_sp_loss,
     make_autocast_context,
 )
 from .visualization import (
@@ -152,6 +153,7 @@ def train_one_epoch(
     mid_epoch_save_every: int = 500,
     nextdit_warmup_steps: int = 0,
     skip_first_n_batches: int | None = None,
+    l2_sp_reference: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     """Train one epoch.
 
@@ -173,15 +175,22 @@ def train_one_epoch(
         if dist_context.enabled
         else []
     )
-    total_loss = 0.0
-    total_heatmap_loss = 0.0
-    total_action_loss = 0.0
-    total_lm_loss = 0.0
+    total_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_heatmap_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_action_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_lm_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_l2_sp_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
     num_batches = 0
 
     optim_cfg = cfg['optim']
     loss_cfg = cfg['loss']
     grad_accum_steps = optim_cfg.get('grad_accum_steps', 1)
+    l2_sp_cfg = loss_cfg.get('l2_sp', {})
+    l2_sp_weight = (
+        float(l2_sp_cfg.get('weight', 0.0) or 0.0)
+        if bool(l2_sp_cfg.get('enabled', False))
+        else 0.0
+    )
 
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
@@ -227,6 +236,12 @@ def train_one_epoch(
     prev_step_end = time.perf_counter() if enable_timing else 0.0
 
     diag_interval = cfg['log'].get('diag_interval', 100)
+    log_interval = max(1, int(cfg['log'].get('log_interval', 10)))
+    tensorboard_interval = max(1, int(cfg['log'].get('tensorboard_interval', log_interval)))
+    progress_interval = int(cfg['log'].get('progress_interval', log_interval))
+    page_cache_drop_enabled = bool(cfg['log'].get('page_cache_drop_enabled', True))
+    page_cache_drop_interval = int(cfg['log'].get('page_cache_drop_interval', 25))
+    page_cache_drop_threshold = float(cfg['log'].get('page_cache_drop_threshold', 0.80))
     aligned_interval = grad_accum_steps * diag_interval
     for head_attr in ['heatmap_vln']:
         head = getattr(model, head_attr, None)
@@ -260,8 +275,12 @@ def train_one_epoch(
                 "[MAIN batch=%d] main_rss=%.0fMB children(%d)=%.0fMB total=%.0fMB | %s",
                 i, main_rss, len(children), child_rss, main_rss + child_rss, cg_info,
             )
-        if i <= 5 or i % 25 == 0:
-            _drop_page_cache()
+        if (
+            page_cache_drop_enabled
+            and page_cache_drop_interval > 0
+            and (i <= 5 or i % page_cache_drop_interval == 0)
+        ):
+            _drop_page_cache(threshold=page_cache_drop_threshold)
 
         if enable_timing:
             loop_start = time.perf_counter()
@@ -411,6 +430,14 @@ def train_one_epoch(
                     )
                 lm_loss = output['lm_loss']
 
+            l2_sp_loss = torch.tensor(0.0, device=device)
+            if l2_sp_weight > 0.0 and l2_sp_reference:
+                l2_sp_loss = compute_l2_sp_loss(
+                    model_module,
+                    l2_sp_reference,
+                    device=device,
+                )
+
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 0.0)
             lm_weight = loss_cfg.get('lm_weight', stage_cfg.get('lm_weight', 1.0))
@@ -419,6 +446,7 @@ def train_one_epoch(
                 heatmap_weight * heatmap_loss
                 + trajectory_weight * trajectory_loss
                 + lm_weight * lm_loss
+                + l2_sp_weight * l2_sp_loss
             )
             loss = loss / grad_accum_steps
         if enable_timing:
@@ -485,9 +513,23 @@ def train_one_epoch(
             )
             hm_loss_fn.set_temperature(current_heatmap_temperature)
 
-            log_interval = cfg['log'].get('log_interval', 10)
             show_gpu_memory = cfg['log'].get('show_gpu_memory', False)
-            if global_step % log_interval == 0 or global_step <= 3:
+            log_this_step = global_step % log_interval == 0 or global_step <= 3
+            tb_this_step = (
+                tb_writer is not None
+                and (global_step % tensorboard_interval == 0 or global_step <= 3)
+            )
+            step_scalars = None
+            if log_this_step or tb_this_step:
+                step_scalars = {
+                    "loss": float((loss.detach() * grad_accum_steps).item()),
+                    "heatmap_loss": float(heatmap_loss.detach().item()),
+                    "trajectory_loss": float(trajectory_loss.detach().item()),
+                    "lm_loss": float(lm_loss.detach().item()),
+                    "l2_sp_loss": float(l2_sp_loss.detach().item()),
+                }
+
+            if log_this_step:
                 all_lrs = scheduler.get_last_lr()
                 lr_strs = []
                 for gi, lr_val in enumerate(all_lrs):
@@ -501,8 +543,16 @@ def train_one_epoch(
                         f" reserved={torch.cuda.memory_reserved() / 1024**3:.1f}GB"
                         f" max={torch.cuda.max_memory_allocated() / 1024**3:.1f}GB"
                     )
-                traj_str = f", traj: {trajectory_loss.item():.4f}" if trajectory_loss.item() > 0 else ""
-                lm_str = f", lm: {lm_loss.item():.4f}" if train_lm else ""
+                traj_str = (
+                    f", traj: {step_scalars['trajectory_loss']:.4f}"
+                    if step_scalars["trajectory_loss"] > 0 else ""
+                )
+                lm_str = f", lm: {step_scalars['lm_loss']:.4f}" if train_lm else ""
+                l2_sp_str = (
+                    f", l2sp: {step_scalars['l2_sp_loss']:.6f}"
+                    if l2_sp_weight > 0.0 and step_scalars["l2_sp_loss"] > 0
+                    else ""
+                )
                 metadata = output.get('processing_metadata', {}) if isinstance(output, dict) else {}
                 input_stats_str = ""
                 if metadata.get('pano_seq_len') is not None:
@@ -518,8 +568,8 @@ def train_one_epoch(
                     f"Epoch {epoch}/{stage_cfg['epochs']} | "
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
-                    f"Loss: {loss.item()*grad_accum_steps:.4f} "
-                    f"(hm: {heatmap_loss.item():.4f}{traj_str}{lm_str}) | "
+                    f"Loss: {step_scalars['loss']:.4f} "
+                    f"(hm: {step_scalars['heatmap_loss']:.4f}{traj_str}{lm_str}{l2_sp_str}) | "
                     f"LR: [{lr_display}]"
                     + gpu_mem_str
                     + input_stats_str
@@ -553,11 +603,12 @@ def train_one_epoch(
                         "epoch": epoch,
                         "batch": i + 1,
                         "global_step": global_step,
-                        "loss": loss.item() * grad_accum_steps,
-                        "heatmap_loss": heatmap_loss.item(),
-                        "trajectory_loss": trajectory_loss.item(),
-                        "lm_loss": lm_loss.item(),
-                        "lrs": {
+                        "loss": step_scalars["loss"],
+                        "heatmap_loss": step_scalars["heatmap_loss"],
+                        "trajectory_loss": step_scalars["trajectory_loss"],
+                            "lm_loss": step_scalars["lm_loss"],
+                            "l2_sp_loss": step_scalars["l2_sp_loss"],
+                            "lrs": {
                             optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
                             for gi, lr_val in enumerate(all_lrs)
                         },
@@ -570,14 +621,16 @@ def train_one_epoch(
                         step_record["gpu_memory_gb"] = torch.cuda.memory_allocated() / 1024**3
                     _append_jsonl(metrics_jsonl_path, step_record)
 
-            if tb_writer is not None:
+            if tb_this_step:
                 actual_step = global_step_offset + global_step
-                tb_writer.add_scalar('train/loss', loss.item()*grad_accum_steps, actual_step)
-                tb_writer.add_scalar('train/heatmap_loss', heatmap_loss.item(), actual_step)
-                if trajectory_loss.item() > 0:
-                    tb_writer.add_scalar('train/trajectory_loss', trajectory_loss.item(), actual_step)
+                tb_writer.add_scalar('train/loss', step_scalars["loss"], actual_step)
+                tb_writer.add_scalar('train/heatmap_loss', step_scalars["heatmap_loss"], actual_step)
+                if step_scalars["trajectory_loss"] > 0:
+                    tb_writer.add_scalar('train/trajectory_loss', step_scalars["trajectory_loss"], actual_step)
                 if train_lm:
-                    tb_writer.add_scalar('train/lm_loss', lm_loss.item(), actual_step)
+                    tb_writer.add_scalar('train/lm_loss', step_scalars["lm_loss"], actual_step)
+                if l2_sp_weight > 0.0 and step_scalars["l2_sp_loss"] > 0:
+                    tb_writer.add_scalar('train/l2_sp_loss', step_scalars["l2_sp_loss"], actual_step)
                 if isinstance(loss_dict, dict):
                     for k in ('vis_loss', 'coord_loss', 'peak_loss', 'neg_loss'):
                         if k in loss_dict:
@@ -644,32 +697,40 @@ def train_one_epoch(
                 except Exception:
                     logger.debug("Failed to write visualization to TensorBoard", exc_info=True)
 
-        _iter_loss = loss.item() * grad_accum_steps
-        _iter_hm = heatmap_loss.item()
-        _iter_traj = trajectory_loss.item()
-        _iter_lm = lm_loss.item()
+        iter_loss_t = (loss.detach() * grad_accum_steps).to(dtype=torch.float64)
+        iter_hm_t = heatmap_loss.detach().to(dtype=torch.float64)
+        iter_traj_t = trajectory_loss.detach().to(dtype=torch.float64)
+        iter_lm_t = lm_loss.detach().to(dtype=torch.float64)
+        iter_l2_sp_t = l2_sp_loss.detach().to(dtype=torch.float64)
 
-        total_loss += _iter_loss
-        total_heatmap_loss += _iter_hm
-        total_action_loss += _iter_traj
-        total_lm_loss += _iter_lm
+        total_loss += iter_loss_t
+        total_heatmap_loss += iter_hm_t
+        total_action_loss += iter_traj_t
+        total_lm_loss += iter_lm_t
+        total_l2_sp_loss += iter_l2_sp_t
         num_batches += 1
 
+        if progress_interval > 0 and (num_batches <= 3 or num_batches % progress_interval == 0):
+            _iter_loss = float(iter_loss_t.item())
+            _iter_hm = float(iter_hm_t.item())
+            _iter_traj = float(iter_traj_t.item())
+            _iter_lm = float(iter_lm_t.item())
+            _avg_hm = float((total_heatmap_loss / max(num_batches, 1)).item())
+            pbar.set_postfix({
+                'loss': f"{_iter_loss:.4f}",
+                'hm': f"{_avg_hm:.4f}",
+                'traj': f"{_iter_traj:.4f}",
+                'lm': f"{_iter_lm:.4f}",
+            })
+
         del output, loss, heatmap_loss, gt_heatmap
-        del trajectory_loss, lm_loss
+        del trajectory_loss, lm_loss, l2_sp_loss
         loss_dict = None
         del video_frames
         del current_views_batch, history_panoramas_batch
         del panoramic_inputs_batch, panoramic_num_histories, panoramic_text_anchor_positions
         del history_frames, current_frame, gt_action, action_valid, is_stop, text
         del batch
-
-        pbar.set_postfix({
-            'loss': f"{_iter_loss:.4f}",
-            'hm': f"{total_heatmap_loss / num_batches:.4f}",
-            'traj': f"{_iter_traj:.4f}",
-            'lm': f"{_iter_lm:.4f}",
-        })
 
         if num_batches % 50 == 0:
             gc.collect()
@@ -684,7 +745,8 @@ def train_one_epoch(
                     i, post_rss, cg_str,
                     gc_stats[0]['collected'], gc_stats[1]['collected'], gc_stats[2]['collected'],
                 )
-            _drop_page_cache()
+            if page_cache_drop_enabled:
+                _drop_page_cache(threshold=page_cache_drop_threshold)
 
             if num_batches % 200 == 0:
                 torch.cuda.empty_cache()
@@ -700,9 +762,10 @@ def train_one_epoch(
         ):
             model_module_for_save = _unwrap_model(model)
             mid_metrics = {
-                'total_loss': total_loss / num_batches,
-                'heatmap_loss': total_heatmap_loss / num_batches,
-                'lm_loss': total_lm_loss / num_batches,
+                'total_loss': float((total_loss / num_batches).item()),
+                'heatmap_loss': float((total_heatmap_loss / num_batches).item()),
+                'lm_loss': float((total_lm_loss / num_batches).item()),
+                'l2_sp_loss': float((total_l2_sp_loss / num_batches).item()),
             }
             if ema is not None:
                 with ema.apply():
@@ -718,6 +781,11 @@ def train_one_epoch(
                         is_best=False,
                         scaler=scaler,
                         batch=num_batches,
+                        extra_state=(
+                            {"l2_sp_reference_state": l2_sp_reference}
+                            if l2_sp_reference
+                            else None
+                        ),
                     )
             else:
                 ckpt_manager.save(
@@ -732,6 +800,11 @@ def train_one_epoch(
                     is_best=False,
                     scaler=scaler,
                     batch=num_batches,
+                    extra_state=(
+                        {"l2_sp_reference_state": l2_sp_reference}
+                        if l2_sp_reference
+                        else None
+                    ),
                 )
             logger.info(
                 f"  Mid-epoch checkpoint saved at batch {num_batches} "
@@ -778,25 +851,25 @@ def train_one_epoch(
             )
         )
 
-    totals = torch.tensor(
+    totals = torch.stack(
         [
             total_loss,
             total_heatmap_loss,
             total_action_loss,
             total_lm_loss,
-            float(num_batches),
-        ],
-        device=device,
-        dtype=torch.float64,
+            total_l2_sp_loss,
+            torch.tensor(float(num_batches), device=device, dtype=torch.float64),
+        ]
     )
     _dist_all_reduce_in_place(totals)
 
-    reduced_num_batches = max(int(totals[4].item()), 1)
+    reduced_num_batches = max(int(totals[5].item()), 1)
     return {
         'total_loss': (totals[0] / reduced_num_batches).item(),
         'heatmap_loss': (totals[1] / reduced_num_batches).item(),
         'trajectory_loss': (totals[2] / reduced_num_batches).item(),
         'lm_loss': (totals[3] / reduced_num_batches).item(),
+        'l2_sp_loss': (totals[4] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
     }
 

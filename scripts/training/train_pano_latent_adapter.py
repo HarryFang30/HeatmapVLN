@@ -26,8 +26,12 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import sys
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,6 +57,7 @@ from scripts.training.model_builder import build_model
 from scripts.training.utils import (
     _load_normalized_state_dict,
     _normalize_state_key,
+    assert_complete_lora_checkpoint_match,
     load_config,
     safe_torch_load,
 )
@@ -89,6 +94,88 @@ class AdapterTrainBatch:
     trajectory: torch.Tensor | None = None
     trajectory_valid: torch.Tensor | None = None
     traj_images: torch.Tensor | None = None
+
+
+@dataclass
+class AdapterCpuBatch:
+    collated: dict[str, Any]
+    teacher_latents: torch.Tensor | None
+    teacher_cond: torch.Tensor | None
+    records: list[dict[str, Any]]
+    samples: list[dict[str, Any]] | None = None
+
+
+class NativeTeacherTargetCache:
+    """Per-process CPU RAM cache for native teacher sidecar tensors."""
+
+    def __init__(self, *, mode: str = "none", max_items: int = 0) -> None:
+        mode = str(mode or "none").lower()
+        if mode not in {"none", "lru", "unbounded"}:
+            raise ValueError(f"Unsupported teacher cache mode: {mode}")
+        self.mode = mode
+        self.max_items = max(0, int(max_items))
+        self._items: OrderedDict[str, tuple[torch.Tensor, torch.Tensor | None]] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "none"
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def _key(self, rec: dict[str, Any]) -> str:
+        path = rec.get("_tensor_path")
+        if not path:
+            raise RuntimeError(f"Missing tensor sidecar for dataset_index={rec.get('dataset_index')}")
+        return str(path)
+
+    def get(self, rec: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.enabled:
+            payload = _load_validated_tensor_sidecar_payload(rec)
+            path = rec.get("_tensor_path")
+            raw = _native_raw_tensor_from_payload(payload, path)
+            cond = _native_cond_tensor_from_payload(payload)
+            return raw, cond
+
+        key = self._key(rec)
+        with self._lock:
+            cached = self._items.get(key)
+            if cached is not None:
+                self.hits += 1
+                if self.mode == "lru":
+                    self._items.move_to_end(key)
+                return cached
+
+        payload = _load_validated_tensor_sidecar_payload(rec)
+        raw = _native_raw_tensor_from_payload(payload, rec.get("_tensor_path"))
+        cond = _native_cond_tensor_from_payload(payload)
+
+        with self._lock:
+            existing = self._items.get(key)
+            if existing is not None:
+                self.hits += 1
+                if self.mode == "lru":
+                    self._items.move_to_end(key)
+                return existing
+            self.misses += 1
+            self._items[key] = (raw, cond)
+            if self.mode == "lru" and self.max_items > 0:
+                while len(self._items) > self.max_items:
+                    self._items.popitem(last=False)
+        return raw, cond
+
+    def stats(self) -> dict[str, int | str]:
+        with self._lock:
+            return {
+                "mode": self.mode,
+                "items": len(self._items),
+                "hits": self.hits,
+                "misses": self.misses,
+            }
 
 
 class PanoToInternNavLatentAdapter(nn.Module):
@@ -307,10 +394,15 @@ def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: t
     state = _extract_checkpoint_state_dict(args.base_checkpoint)
     compatible_lora_keys = _compatible_lora_checkpoint_keys(model, state)
     lora_state = _lora_checkpoint_state(state)
+    matched_lora = assert_complete_lora_checkpoint_match(
+        model,
+        lora_state,
+        checkpoint_path=str(args.base_checkpoint),
+    )
     missing, unexpected, loaded = _load_normalized_state_dict(model, lora_state)
     LOGGER.info(
         "Loaded Stage1-S2 LoRA checkpoint %s: checkpoint_tensors=%d lora_tensors=%d "
-        "loaded=%d missing=%d unexpected=%d compatible_lora=%d",
+        "loaded=%d missing=%d unexpected=%d compatible_lora=%d complete_lora=%d",
         args.base_checkpoint,
         len(state),
         len(lora_state),
@@ -318,6 +410,7 @@ def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: t
         len(missing),
         len(unexpected),
         len(compatible_lora_keys),
+        matched_lora,
     )
     if loaded == 0:
         raise RuntimeError(
@@ -661,36 +754,48 @@ def _try_fast_pano_goal_from_record(
 
 def _move_pano_inputs_to_device(pano_inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
-        key: value.to(device) if torch.is_tensor(value) else value
+        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
         for key, value in pano_inputs.items()
     }
 
 
-@torch.no_grad()
-def _extract_student_latents(
-    model,
-    processor,
-    samples: list[dict[str, Any]],
-    device: torch.device,
+def _make_pano_collator(
+    processor: Any,
     n_traj_query: int,
     *,
     sft_protocol: str = "direct",
-    return_batch: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
-    collator = PanoramicTokenizedCollator(
+) -> PanoramicTokenizedCollator:
+    return PanoramicTokenizedCollator(
         processor,
         n_traj_query=n_traj_query,
         sft_mode=True,
         sft_protocol=sft_protocol,
         structured_pano_output=True,
+        build_sft_labels=False,
     )
+
+
+def _collate_student_batch_cpu(
+    collator: PanoramicTokenizedCollator,
+    samples: list[dict[str, Any]],
+) -> dict[str, Any]:
     # The collator clears each sample dict after packing to release large image
     # references. Keep the originals intact for the aligned teacher pass.
-    batch = collator([{key: value for key, value in sample.items()} for sample in samples])
+    return collator([{key: value for key, value in sample.items()} for sample in samples])
+
+
+@torch.no_grad()
+def _extract_student_latents_from_collated(
+    model,
+    batch: dict[str, Any],
+    device: torch.device,
+    *,
+    batch_size: int,
+) -> torch.Tensor:
     pano_inputs = _move_pano_inputs_to_device(batch["pano_inputs"], device)
-    histories = batch["history_frames"].to(device)
-    current = batch["current_frame"].to(device)
-    lq = model.latent_queries.expand(len(samples), -1, -1).to(
+    histories = batch["history_frames"].to(device, non_blocking=True)
+    current = batch["current_frame"].to(device, non_blocking=True)
+    lq = model.latent_queries.expand(batch_size, -1, -1).to(
         device=device,
         dtype=model.config.dtype,
     )
@@ -705,7 +810,34 @@ def _extract_student_latents(
     traj_hs = out.get("traj_hidden_states")
     if traj_hs is None:
         raise RuntimeError("Student Qwen forward returned no traj_hidden_states")
-    traj_hs = traj_hs.detach()
+    return traj_hs.detach()
+
+
+@torch.no_grad()
+def _extract_student_latents(
+    model,
+    processor,
+    samples: list[dict[str, Any]],
+    device: torch.device,
+    n_traj_query: int,
+    *,
+    sft_protocol: str = "direct",
+    return_batch: bool = False,
+    collator: PanoramicTokenizedCollator | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
+    if collator is None:
+        collator = _make_pano_collator(
+            processor,
+            n_traj_query,
+            sft_protocol=sft_protocol,
+        )
+    batch = _collate_student_batch_cpu(collator, samples)
+    traj_hs = _extract_student_latents_from_collated(
+        model,
+        batch,
+        device,
+        batch_size=len(samples),
+    )
     if return_batch:
         return traj_hs, batch
     return traj_hs
@@ -775,6 +907,61 @@ def _load_teacher_latents(
             target_dim=target_dim,
         )
     return stacked
+
+
+def _squeeze_teacher_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach()
+    if tensor.dim() == 3 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+    return tensor
+
+
+def _native_cond_tensor_from_payload(payload: dict[str, Any]) -> torch.Tensor | None:
+    for key in ("traj_latents_768", "traj_cond_768", "traj_cond"):
+        if key in payload:
+            value = payload[key]
+            if torch.is_tensor(value):
+                return _squeeze_teacher_tensor(value)
+    return None
+
+
+def _native_raw_tensor_from_payload(payload: dict[str, Any], path: Any) -> torch.Tensor:
+    if "traj_latents" not in payload or not torch.is_tensor(payload["traj_latents"]):
+        raise RuntimeError(f"{path} has no traj_latents")
+    return _squeeze_teacher_tensor(payload["traj_latents"])
+
+
+def _load_native_teacher_targets_cpu(
+    records: list[dict[str, Any]],
+    *,
+    need_raw: bool,
+    need_cond: bool,
+    teacher_cache: NativeTeacherTargetCache | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    raw_latents: list[torch.Tensor] = []
+    cond_latents: list[torch.Tensor] = []
+
+    if not need_raw and not need_cond:
+        return None, None
+
+    for rec in records:
+        if teacher_cache is not None:
+            raw_tensor, cond_tensor = teacher_cache.get(rec)
+        else:
+            path = rec.get("_tensor_path")
+            payload = _load_validated_tensor_sidecar_payload(rec)
+            raw_tensor = _native_raw_tensor_from_payload(payload, path)
+            cond_tensor = _native_cond_tensor_from_payload(payload)
+
+        if need_raw:
+            raw_latents.append(raw_tensor)
+
+        if need_cond:
+            cond_latents.append(cond_tensor if cond_tensor is not None else raw_tensor)
+
+    raw = torch.stack(raw_latents, dim=0) if need_raw else None
+    cond = torch.stack(cond_latents, dim=0) if need_cond else None
+    return raw, cond
 
 
 def _build_records_from_dataset(
@@ -1262,8 +1449,8 @@ def _collated_tensor(
     if value is None or not torch.is_tensor(value):
         return None
     if dtype is None:
-        return value.to(device)
-    return value.to(device=device, dtype=dtype)
+        return value.to(device, non_blocking=True)
+    return value.to(device=device, dtype=dtype, non_blocking=True)
 
 
 def _split_train_val(
@@ -1359,7 +1546,279 @@ def _build_batch(
     teacher_model: Any | None = None,
     teacher_processor: Any | None = None,
     teacher_turn_args: Any | None = None,
+    collator: PanoramicTokenizedCollator | None = None,
+    teacher_cache: NativeTeacherTargetCache | None = None,
 ) -> AdapterTrainBatch:
+    if collator is None:
+        collator = _make_pano_collator(
+            processor,
+            n_traj_query,
+            sft_protocol="direct",
+        )
+    cpu_batch = _prepare_batch_cpu(
+        batch_records,
+        dataset=dataset,
+        collator=collator,
+        teacher_target_mode=teacher_target_mode,
+        keep_samples=teacher_model is not None and teacher_processor is not None,
+        need_raw=True,
+        need_cond=True,
+        teacher_cache=teacher_cache,
+    )
+    return _finalize_batch_on_device(
+        cpu_batch,
+        model=model,
+        device=device,
+        teacher_model=teacher_model,
+        teacher_processor=teacher_processor,
+        teacher_turn_args=teacher_turn_args,
+    )
+
+
+def _record_batches(
+    records: list[dict[str, Any]],
+    batch_size: int,
+) -> list[list[dict[str, Any]]]:
+    return [
+        records[start:start + batch_size]
+        for start in range(0, len(records), batch_size)
+    ]
+
+
+def _records_for_rank_remaining_epochs(
+    train_records: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    start_epoch: int,
+) -> list[dict[str, Any]]:
+    by_path: dict[str, dict[str, Any]] = {}
+    for epoch in range(start_epoch, int(args.epochs)):
+        for rec in _epoch_rank_records(
+            train_records,
+            seed=int(args.seed),
+            epoch=epoch,
+            rank=rank,
+            world_size=world_size,
+        ):
+            key = str(rec.get("_tensor_path") or rec.get("dataset_index"))
+            by_path.setdefault(key, rec)
+    return list(by_path.values())
+
+
+def _preload_teacher_cache(
+    records: list[dict[str, Any]],
+    *,
+    teacher_cache: NativeTeacherTargetCache,
+    workers: int,
+    rank: int,
+) -> None:
+    if not teacher_cache.enabled or not records:
+        return
+    worker_count = max(1, int(workers))
+    task_q: queue.Queue[Any] = queue.Queue(maxsize=worker_count * 4)
+    done = object()
+    first_error: list[BaseException] = []
+    stats = {"done": 0}
+    lock = threading.Lock()
+
+    def worker() -> None:
+        while True:
+            item = task_q.get()
+            try:
+                if item is done:
+                    return
+                try:
+                    teacher_cache.get(item)
+                except BaseException as exc:
+                    with lock:
+                        if not first_error:
+                            first_error.append(exc)
+                finally:
+                    with lock:
+                        stats["done"] += 1
+                        done_count = stats["done"]
+                    if rank == 0 and done_count % 10000 == 0:
+                        LOGGER.info(
+                            "Preloading teacher sidecar cache... %d/%d cache=%s",
+                            done_count,
+                            len(records),
+                            teacher_cache.stats(),
+                        )
+            finally:
+                task_q.task_done()
+
+    threads = [
+        threading.Thread(target=worker, name=f"stage2-teacher-cache-preload-{idx}", daemon=True)
+        for idx in range(worker_count)
+    ]
+    for thread in threads:
+        thread.start()
+
+    t0 = time.perf_counter()
+    for rec in records:
+        task_q.put(rec)
+    for _ in threads:
+        task_q.put(done)
+    task_q.join()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    if first_error:
+        raise first_error[0]
+    if rank == 0:
+        elapsed = time.perf_counter() - t0
+        LOGGER.info(
+            "Preloaded teacher sidecar cache: records=%d workers=%d elapsed=%.1fs cache=%s",
+            len(records),
+            worker_count,
+            elapsed,
+            teacher_cache.stats(),
+        )
+
+
+def _iter_prepared_cpu_batches(
+    record_batches: list[list[dict[str, Any]]],
+    *,
+    dataset: Any,
+    dataset_factory: Any | None = None,
+    collator: PanoramicTokenizedCollator,
+    collator_factory: Any | None = None,
+    teacher_target_mode: str,
+    keep_samples: bool,
+    need_raw: bool,
+    need_cond: bool,
+    teacher_cache: NativeTeacherTargetCache | None,
+    prefetch_batches: int,
+    prefetch_workers: int = 1,
+) -> Any:
+    def build(
+        batch_records: list[dict[str, Any]],
+        batch_dataset: Any,
+        batch_collator: PanoramicTokenizedCollator,
+    ) -> AdapterCpuBatch:
+        return _prepare_batch_cpu(
+            batch_records,
+            dataset=batch_dataset,
+            collator=batch_collator,
+            teacher_target_mode=teacher_target_mode,
+            keep_samples=keep_samples,
+            need_raw=need_raw,
+            need_cond=need_cond,
+            teacher_cache=teacher_cache,
+        )
+
+    worker_count = max(1, int(prefetch_workers))
+    if prefetch_batches <= 0:
+        for batch_records in record_batches:
+            yield build(batch_records, dataset, collator)
+        return
+
+    if worker_count <= 1:
+        q: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(prefetch_batches)))
+        done = object()
+
+        def worker() -> None:
+            batch_dataset = dataset_factory() if dataset_factory is not None else dataset
+            try:
+                for batch_records in record_batches:
+                    q.put(build(batch_records, batch_dataset, collator))
+            except BaseException as exc:
+                q.put(exc)
+            finally:
+                q.put(done)
+
+        thread = threading.Thread(target=worker, name="stage2-batch-prefetch", daemon=True)
+        thread.start()
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            thread.join(timeout=1.0)
+        return
+
+    total = len(record_batches)
+    task_q: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(prefetch_batches)) + worker_count)
+    q: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(prefetch_batches)))
+    done = object()
+
+    def producer() -> None:
+        for idx, batch_records in enumerate(record_batches):
+            task_q.put((idx, batch_records))
+        for _ in range(worker_count):
+            task_q.put(done)
+
+    def worker(worker_idx: int) -> None:
+        batch_dataset = dataset_factory() if dataset_factory is not None else dataset
+        batch_collator = collator_factory() if collator_factory is not None else collator
+        try:
+            while True:
+                item = task_q.get()
+                try:
+                    if item is done:
+                        return
+                    idx, batch_records = item
+                    q.put((idx, build(batch_records, batch_dataset, batch_collator), None))
+                except BaseException as exc:
+                    if item is done:
+                        raise
+                    idx = item[0] if isinstance(item, tuple) else -1
+                    q.put((idx, None, exc))
+                finally:
+                    task_q.task_done()
+        except BaseException as exc:
+            q.put((-1, None, exc))
+
+    producer_thread = threading.Thread(target=producer, name="stage2-batch-prefetch-producer", daemon=True)
+    workers = [
+        threading.Thread(target=worker, args=(idx,), name=f"stage2-batch-prefetch-{idx}", daemon=True)
+        for idx in range(worker_count)
+    ]
+    producer_thread.start()
+    for thread in workers:
+        thread.start()
+
+    next_idx = 0
+    buffered: dict[int, AdapterCpuBatch] = {}
+    try:
+        while next_idx < total:
+            ready = buffered.pop(next_idx, None)
+            if ready is not None:
+                yield ready
+                next_idx += 1
+                continue
+
+            idx, batch, exc = q.get()
+            if exc is not None:
+                raise exc
+            if idx == next_idx:
+                yield batch
+                next_idx += 1
+            else:
+                buffered[int(idx)] = batch
+    finally:
+        producer_thread.join(timeout=1.0)
+        for thread in workers:
+            thread.join(timeout=1.0)
+
+
+def _prepare_batch_cpu(
+    batch_records: list[dict[str, Any]],
+    *,
+    dataset: Any,
+    collator: PanoramicTokenizedCollator,
+    teacher_target_mode: str = "aligned",
+    keep_samples: bool = False,
+    need_raw: bool = True,
+    need_cond: bool = True,
+    teacher_cache: NativeTeacherTargetCache | None = None,
+) -> AdapterCpuBatch:
     batch_samples: list[dict[str, Any]] = []
     usable_records: list[dict[str, Any]] = []
     for rec in batch_records:
@@ -1382,37 +1841,74 @@ def _build_batch(
     if not usable_records:
         raise RuntimeError("Cannot build an empty adapter batch")
 
-    student_latents, collated = _extract_student_latents(
-        model, processor, batch_samples, device, n_traj_query,
-        sft_protocol="direct", return_batch=True,
-    )
+    collated = _collate_student_batch_cpu(collator, batch_samples)
 
-    # Native sidecar mode loads executable InternNav raw/cond targets from
-    # tensor sidecars. Legacy aligned mode only computes teacher targets when
-    # a teacher model is explicitly requested.
     teacher_latents: torch.Tensor | None = None
     teacher_cond: torch.Tensor | None = None
     if teacher_target_mode == "native_sidecar":
-        teacher_latents = _load_teacher_latents(
+        teacher_latents, teacher_cond = _load_native_teacher_targets_cpu(
             usable_records,
-            device,
-            model=model,
-            target_dim=int(student_latents.shape[-1]),
+            need_raw=need_raw,
+            need_cond=need_cond,
+            teacher_cache=teacher_cache,
         )
+
+    return AdapterCpuBatch(
+        collated=collated,
+        teacher_latents=teacher_latents,
+        teacher_cond=teacher_cond,
+        records=usable_records,
+        samples=batch_samples if keep_samples else None,
+    )
+
+
+def _finalize_batch_on_device(
+    cpu_batch: AdapterCpuBatch,
+    *,
+    model: Any,
+    device: torch.device,
+    teacher_model: Any | None = None,
+    teacher_processor: Any | None = None,
+    teacher_turn_args: Any | None = None,
+) -> AdapterTrainBatch:
+    student_latents = _extract_student_latents_from_collated(
+        model,
+        cpu_batch.collated,
+        device,
+        batch_size=len(cpu_batch.records),
+    )
+
+    teacher_latents: torch.Tensor | None = None
+    teacher_cond: torch.Tensor | None = None
+
+    if cpu_batch.teacher_latents is not None:
+        teacher_latents = cpu_batch.teacher_latents.to(device, non_blocking=True)
+        if teacher_latents.shape[-1] != int(student_latents.shape[-1]):
+            teacher_latents = _project_teacher_latents_to_dim(
+                teacher_latents,
+                model=model,
+                target_dim=int(student_latents.shape[-1]),
+            )
+
+    if cpu_batch.teacher_cond is not None:
+        teacher_cond = cpu_batch.teacher_cond.to(device, non_blocking=True)
         cond_dim = int(model.nextdit_action_head.config.latent_emb_size)
-        teacher_cond = _load_teacher_latents(
-            usable_records,
-            device,
-            model=model,
-            target_dim=cond_dim,
-        )
+        if teacher_cond.shape[-1] != cond_dim:
+            teacher_cond = _project_teacher_latents_to_dim(
+                teacher_cond,
+                model=model,
+                target_dim=cond_dim,
+            )
+
     if teacher_model is not None and teacher_processor is not None:
+        if cpu_batch.samples is None:
+            raise RuntimeError("Aligned teacher diagnostics require CPU samples")
         try:
             teacher_device = next(teacher_model.parameters()).device
         except StopIteration:
             teacher_device = device
         teacher_latents = compute_aligned_teacher_latents_3584_batch(
-            teacher_model, teacher_processor, batch_samples,
+            teacher_model, teacher_processor, cpu_batch.samples,
             teacher_device,
             turn_args=teacher_turn_args or make_teacher_turn_args(),
         ).to(device)
@@ -1422,15 +1918,15 @@ def _build_batch(
             with torch.no_grad():
                 teacher_cond = cond_projector(teacher_latents.to(dtype=proj_dtype)).detach()
 
-    trajectory = _collated_tensor(collated, "trajectory", device)
-    trajectory_valid = _collated_tensor(collated, "trajectory_valid", device)
-    traj_images = _collated_tensor(collated, "traj_images", device)
+    trajectory = _collated_tensor(cpu_batch.collated, "trajectory", device)
+    trajectory_valid = _collated_tensor(cpu_batch.collated, "trajectory_valid", device)
+    traj_images = _collated_tensor(cpu_batch.collated, "traj_images", device)
 
     batch = AdapterTrainBatch(
         student_latents=student_latents,
         teacher_latents=teacher_latents,  # type: ignore[arg-type]
         teacher_cond=teacher_cond,
-        records=usable_records,
+        records=cpu_batch.records,
         trajectory=trajectory,
         trajectory_valid=trajectory_valid,
         traj_images=traj_images,
@@ -1445,17 +1941,22 @@ def _evaluate_adapter(
     *,
     args: argparse.Namespace,
     dataset: Any,
+    dataset_factory: Any | None = None,
     model: Any,
     processor: Any,
     device: torch.device,
     n_traj_query: int,
     batch_size: int,
+    collator: PanoramicTokenizedCollator,
     teacher_target_mode: str = "aligned",
     teacher_model: Any | None = None,
     teacher_processor: Any | None = None,
     teacher_turn_args: Any | None = None,
     rank: int = 0,
     world_size: int = 1,
+    prefetch_batches: int = 0,
+    prefetch_workers: int = 1,
+    teacher_cache: NativeTeacherTargetCache | None = None,
 ) -> tuple[dict[str, float], int]:
     """Evaluate adapter, optionally sharding val_records across ranks.
 
@@ -1488,16 +1989,31 @@ def _evaluate_adapter(
         disable=rank != 0,
     )
     try:
-        for start in range(0, len(shard), batch_size):
-            batch_records = shard[start:start + batch_size]
-            batch = _build_batch(
-                batch_records,
-                dataset=dataset,
+        need_raw = teacher_target_mode == "native_sidecar" and float(args.raw_distill_weight) > 0
+        need_cond = teacher_target_mode == "native_sidecar" and float(args.cond_distill_weight) > 0
+        keep_samples = teacher_model is not None and teacher_processor is not None
+        for cpu_batch in _iter_prepared_cpu_batches(
+            _record_batches(shard, batch_size),
+            dataset=dataset,
+            dataset_factory=dataset_factory,
+            collator=collator,
+            collator_factory=lambda: _make_pano_collator(
+                processor,
+                n_traj_query,
+                sft_protocol="direct",
+            ),
+            teacher_target_mode=teacher_target_mode,
+            keep_samples=keep_samples,
+            need_raw=need_raw,
+            need_cond=need_cond,
+            teacher_cache=teacher_cache,
+            prefetch_batches=prefetch_batches,
+            prefetch_workers=prefetch_workers,
+        ):
+            batch = _finalize_batch_on_device(
+                cpu_batch,
                 model=model,
-                processor=processor,
                 device=device,
-                n_traj_query=n_traj_query,
-                teacher_target_mode=teacher_target_mode,
                 teacher_model=teacher_model,
                 teacher_processor=teacher_processor,
                 teacher_turn_args=teacher_turn_args,
@@ -1584,6 +2100,12 @@ def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
     defaults["max_samples"] = int(training.get("max_samples", 0))
     defaults["index_mode"] = str(training.get("index_mode", "generic"))
     defaults["val_ratio"] = float(training.get("val_ratio", 0.1))
+    defaults["prefetch_batches"] = int(training.get("prefetch_batches", 2))
+    defaults["prefetch_workers"] = int(training.get("prefetch_workers", 1))
+    defaults["teacher_cache_mode"] = str(training.get("teacher_cache_mode", "none"))
+    defaults["teacher_cache_max_items"] = int(training.get("teacher_cache_max_items", 0))
+    defaults["teacher_preload_cache"] = bool(training.get("teacher_preload_cache", False))
+    defaults["teacher_preload_workers"] = int(training.get("teacher_preload_workers", 4))
 
     # Teacher
     teacher = adapter_cfg.get("teacher", {}) or {}
@@ -1678,6 +2200,42 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--epochs", type=int, default=adapter_defaults.get("epochs", 5))
     p.add_argument("--batch-size", type=int, default=adapter_defaults.get("batch_size", 2))
+    p.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=adapter_defaults.get("prefetch_batches", 2),
+        help="CPU batch prefetch queue depth. 0 disables threaded prefetch.",
+    )
+    p.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=adapter_defaults.get("prefetch_workers", 1),
+        help="Number of CPU workers preparing future batches when prefetch is enabled.",
+    )
+    p.add_argument(
+        "--teacher-cache-mode",
+        choices=["none", "lru", "unbounded"],
+        default=adapter_defaults.get("teacher_cache_mode", "none"),
+        help="CPU RAM cache for native teacher sidecar tensors.",
+    )
+    p.add_argument(
+        "--teacher-cache-max-items",
+        type=int,
+        default=adapter_defaults.get("teacher_cache_max_items", 0),
+        help="Max cached sidecars in lru mode. 0 means no explicit cap.",
+    )
+    p.add_argument(
+        "--teacher-preload-cache",
+        action=argparse.BooleanOptionalAction,
+        default=adapter_defaults.get("teacher_preload_cache", False),
+        help="Preload this rank's remaining-epoch native teacher sidecars into RAM before training.",
+    )
+    p.add_argument(
+        "--teacher-preload-workers",
+        type=int,
+        default=adapter_defaults.get("teacher_preload_workers", 4),
+        help="CPU workers used by --teacher-preload-cache.",
+    )
     p.add_argument("--max-samples", type=int, default=adapter_defaults.get("max_samples", 0))
     p.add_argument("--lr", type=float, default=adapter_defaults.get("lr", 1.0e-4))
     p.add_argument("--weight-decay", type=float, default=adapter_defaults.get("weight_decay", 0.01))
@@ -1741,6 +2299,21 @@ def main() -> int:
         )
         if _rank0():
             LOGGER.info("Dataset samples=%d", len(dataset))
+
+        def make_prefetch_dataset():
+            return build_trajectory_dataset(
+                cfg,
+                split=args.split,
+                enable_augmentation=False,
+                enable_trajectory_augmentation=False,
+                load_history_heatmap=False,
+                panoramic_vlm_input=True,
+                compute_pixel_goal=True,
+                compute_pano_view_pixel_goal=True,
+                pano_max_side_dist_m=float(args.pano_max_side_dist_m),
+                load_lookdown_for_system2=False,
+                load_traj_images=True,
+            )
 
         if teacher_jsonl_str:
             teacher_jsonl = Path(teacher_jsonl_str).expanduser()
@@ -1839,6 +2412,11 @@ def main() -> int:
 
         n_traj_query = int(cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("n_query", 4))
         hidden_dim = int(cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
+        collator = _make_pano_collator(
+            processor,
+            n_traj_query,
+            sft_protocol="direct",
+        )
 
         adapter = PanoLatentSpaceAdapter(
             dim=hidden_dim,
@@ -1878,6 +2456,15 @@ def main() -> int:
                 rank,
                 local_rank,
             )
+            LOGGER.info("CPU batch prefetch depth=%d", max(0, int(args.prefetch_batches)))
+            LOGGER.info("CPU batch prefetch workers=%d", max(1, int(args.prefetch_workers)))
+            LOGGER.info(
+                "Teacher cache config: mode=%s max_items=%d preload=%s preload_workers=%d",
+                args.teacher_cache_mode,
+                int(args.teacher_cache_max_items),
+                bool(args.teacher_preload_cache),
+                int(args.teacher_preload_workers),
+            )
         optimizer = torch.optim.AdamW(train_adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         if resume_ckpt is not None and "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
@@ -1910,6 +2497,37 @@ def main() -> int:
         if _distributed_available():
             dist.barrier()
 
+        teacher_cache = NativeTeacherTargetCache(
+            mode=str(args.teacher_cache_mode),
+            max_items=int(args.teacher_cache_max_items),
+        )
+        if args.teacher_target_mode == "native_sidecar" and teacher_cache.enabled:
+            if _rank0():
+                LOGGER.info("Native teacher RAM cache enabled: %s", teacher_cache.stats())
+            if bool(args.teacher_preload_cache):
+                preload_records = _records_for_rank_remaining_epochs(
+                    train_records,
+                    args=args,
+                    rank=rank,
+                    world_size=world_size,
+                    start_epoch=start_epoch,
+                )
+                if _rank0():
+                    LOGGER.info(
+                        "Preloading native teacher cache for rank-local remaining epochs: "
+                        "records=%d workers=%d",
+                        len(preload_records),
+                        int(args.teacher_preload_workers),
+                    )
+                _preload_teacher_cache(
+                    preload_records,
+                    teacher_cache=teacher_cache,
+                    workers=int(args.teacher_preload_workers),
+                    rank=rank,
+                )
+                if _distributed_available():
+                    dist.barrier()
+
         for epoch in range(start_epoch, args.epochs):
             epoch_records = _epoch_rank_records(
                 train_records,
@@ -1930,20 +2548,44 @@ def main() -> int:
                 disable=not _rank0(),
                 ncols=140,
             )
-            for start in range(0, len(epoch_records), args.batch_size):
-                batch_records = epoch_records[start:start + args.batch_size]
-                batch = _build_batch(
-                    batch_records,
-                    dataset=dataset,
+            need_raw = args.teacher_target_mode == "native_sidecar" and float(args.raw_distill_weight) > 0
+            need_cond = args.teacher_target_mode == "native_sidecar" and float(args.cond_distill_weight) > 0
+            keep_samples = teacher_model is not None and teacher_processor is not None
+            cpu_batch_iter = iter(_iter_prepared_cpu_batches(
+                _record_batches(epoch_records, args.batch_size),
+                dataset=dataset,
+                dataset_factory=make_prefetch_dataset,
+                collator=collator,
+                collator_factory=lambda: _make_pano_collator(
+                    processor,
+                    n_traj_query,
+                    sft_protocol="direct",
+                ),
+                teacher_target_mode=args.teacher_target_mode,
+                keep_samples=keep_samples,
+                need_raw=need_raw,
+                need_cond=need_cond,
+                teacher_cache=teacher_cache,
+                prefetch_batches=max(0, int(args.prefetch_batches)),
+                prefetch_workers=max(1, int(args.prefetch_workers)),
+            ))
+            for _step_idx in range(num_batches):
+                wait_t0 = time.perf_counter()
+                cpu_batch = next(cpu_batch_iter)
+                prefetch_wait_s = time.perf_counter() - wait_t0
+
+                finalize_t0 = time.perf_counter()
+                batch = _finalize_batch_on_device(
+                    cpu_batch,
                     model=model,
-                    processor=processor,
                     device=device,
-                    n_traj_query=n_traj_query,
-                    teacher_target_mode=args.teacher_target_mode,
                     teacher_model=teacher_model,
                     teacher_processor=teacher_processor,
                     teacher_turn_args=teacher_turn_args,
                 )
+                finalize_s = time.perf_counter() - finalize_t0
+
+                train_t0 = time.perf_counter()
                 pred = train_adapter(batch.student_latents)
                 loss, metrics, _pred_cond = _compute_adapter_objective(
                     model=model,
@@ -1957,9 +2599,13 @@ def main() -> int:
                 if args.grad_clip > 0:
                     clip_grad_norm_(train_adapter.parameters(), args.grad_clip)
                 optimizer.step()
+                train_step_s = time.perf_counter() - train_t0
 
                 global_step += world_size
                 count += 1
+                metrics["prefetch_wait_s"] = prefetch_wait_s
+                metrics["finalize_s"] = finalize_s
+                metrics["train_step_s"] = train_step_s
                 for key, value in metrics.items():
                     running[key] = running.get(key, 0.0) + value
 
@@ -1977,7 +2623,7 @@ def main() -> int:
                     LOGGER.info(
                         "epoch=%d local_step=%d global_step=%d loss=%.6f "
                         "raw=%.6f raw_cos=%.4f cond=%.6f cond_cos=%.4f "
-                        "cond_smooth_l1=%.6f gt=%.6f",
+                        "cond_smooth_l1=%.6f gt=%.6f wait=%.3fs finalize=%.3fs train=%.3fs",
                         epoch + 1, count, global_step,
                         avg.get("loss", 0.0),
                         avg.get("raw", 0.0),
@@ -1986,7 +2632,14 @@ def main() -> int:
                         avg.get("cond_cos", 0.0),
                         avg.get("cond_smooth_l1", 0.0),
                         avg.get("gt", 0.0),
+                        avg.get("prefetch_wait_s", 0.0),
+                        avg.get("finalize_s", 0.0),
+                        avg.get("train_step_s", 0.0),
                     )
+            try:
+                next(cpu_batch_iter)
+            except StopIteration:
+                pass
             pbar.close()
 
             epoch_metrics = _reduce_metrics(running, count, device)
@@ -2007,17 +2660,22 @@ def main() -> int:
                     val_records,
                     args=args,
                     dataset=dataset,
+                    dataset_factory=make_prefetch_dataset,
                     model=model,
                     processor=processor,
                     device=device,
                     n_traj_query=n_traj_query,
                     batch_size=args.batch_size,
+                    collator=collator,
                     teacher_target_mode=args.teacher_target_mode,
                     teacher_model=teacher_model,
                     teacher_processor=teacher_processor,
                     teacher_turn_args=teacher_turn_args,
                     rank=rank,
                     world_size=world_size,
+                    prefetch_batches=max(0, int(args.prefetch_batches)),
+                    prefetch_workers=max(1, int(args.prefetch_workers)),
+                    teacher_cache=teacher_cache,
                 )
                 val_metrics = _reduce_metrics(val_sums, val_count, device)
                 if _rank0():

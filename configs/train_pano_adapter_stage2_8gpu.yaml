@@ -91,7 +91,7 @@ model:
     use_lora: true
     lora_rank: 32
     lora_alpha: 64
-    lora_layer_indices: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
     lora_dropout: 0.05
 
@@ -132,7 +132,7 @@ adapter:
 
   # Training
   training:
-    epochs: 5
+    epochs: 3
     batch_size: 16
     lr: 3.0e-4
     weight_decay: 0.01
@@ -140,6 +140,12 @@ adapter:
     max_samples: 0
     index_mode: generic
     val_ratio: 0.1
+    prefetch_batches: 8
+    prefetch_workers: 4
+    teacher_cache_mode: unbounded
+    teacher_cache_max_items: 0
+    teacher_preload_cache: true
+    teacher_preload_workers: 8
 
   # Loss:
   #   raw_weight  * raw latent direction/norm distillation

@@ -45,6 +45,7 @@ class CheckpointManager:
         is_best: bool = False,
         scaler: GradScaler | None = None,
         batch: int | None = None,
+        extra_state: dict | None = None,
     ) -> Path:
         """Save checkpoint. ``batch`` being not None produces a mid-epoch save."""
         trainable_params = _normalized_trainable_param_names(model)
@@ -69,6 +70,8 @@ class CheckpointManager:
 
         if scaler is not None:
             ckpt['scaler_state_dict'] = scaler.state_dict()
+        if extra_state:
+            ckpt.update(extra_state)
 
         if batch is not None:
             ckpt_path = self.out_dir / f"epoch_{epoch:03d}_batch_{batch:05d}.pth"
@@ -176,4 +179,5 @@ def load_checkpoint_for_resume(
         'stage_name': ckpt.get('stage_name', ''),
         'metrics': ckpt.get('metrics', {}),
         'best_val_loss': ckpt.get('best_val_loss', float('inf')),
+        'l2_sp_reference_state': ckpt.get('l2_sp_reference_state'),
     }
