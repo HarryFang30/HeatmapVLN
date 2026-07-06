@@ -130,6 +130,61 @@ from src.utils.notifier import create_notifier
 logger = logging.getLogger(__name__)
 
 
+def _parse_auto_bool(value, *, name: str) -> bool | str:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"", "auto"}:
+        return "auto"
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be boolean-like or 'auto', got {value!r}")
+
+
+def _dev_shm_total_gb() -> float | None:
+    try:
+        stat = os.statvfs("/dev/shm")
+    except OSError:
+        return None
+    return stat.f_frsize * stat.f_blocks / (1024**3)
+
+
+def _should_enable_shm_bypass(cfg: dict, num_workers: int, logger: logging.Logger) -> bool:
+    if num_workers <= 0:
+        return False
+
+    data_cfg = cfg.get("data", {})
+    raw_mode = os.environ.get("HEATMAPVLN_SHM_BYPASS", data_cfg.get("shm_bypass", "auto"))
+    mode = _parse_auto_bool(raw_mode, name="data.shm_bypass/HEATMAPVLN_SHM_BYPASS")
+
+    if isinstance(mode, bool):
+        logger.info("   🔀 ShmBypass %s by config/env", "enabled" if mode else "disabled")
+        return mode
+
+    raw_min_gb = os.environ.get(
+        "HEATMAPVLN_SHM_BYPASS_MIN_GB",
+        data_cfg.get("shm_bypass_min_gb", 8.0),
+    )
+    min_gb = float(raw_min_gb)
+    shm_gb = _dev_shm_total_gb()
+    if shm_gb is None:
+        logger.warning(
+            "   🔀 ShmBypass auto: cannot inspect /dev/shm; enabling conservative IPC bypass"
+        )
+        return True
+
+    enabled = shm_gb < min_gb
+    logger.info(
+        "   🔀 ShmBypass auto: /dev/shm=%.1fGB threshold=%.1fGB -> %s",
+        shm_gb,
+        min_gb,
+        "enabled" if enabled else "disabled",
+    )
+    return enabled
+
+
 def _log_notification_result(
     logger: logging.Logger,
     sent: bool,
@@ -195,6 +250,8 @@ def main():
                         help='覆盖 data.prefetch_factor')
     parser.add_argument('--pin-memory', action=argparse.BooleanOptionalAction, default=None,
                         help='覆盖 data.pin_memory')
+    parser.add_argument('--shm-bypass', type=str, default=None,
+                        help="覆盖 data.shm_bypass: auto/on/off")
 
     args = parser.parse_args()
 
@@ -208,6 +265,8 @@ def main():
         cfg.setdefault('data', {})['prefetch_factor'] = args.prefetch_factor
     if args.pin_memory is not None:
         cfg.setdefault('data', {})['pin_memory'] = args.pin_memory
+    if args.shm_bypass is not None:
+        cfg.setdefault('data', {})['shm_bypass'] = args.shm_bypass
 
     dist_context = init_distributed_context(cfg)
     cfg.setdefault('model', {})['device'] = str(dist_context.device)
@@ -578,17 +637,16 @@ def main():
 
     mp_context = 'fork' if num_workers > 0 else None
 
-    # -- /dev/shm bypass: wrap datasets + collate when workers are used ----
-    # PyTorch DataLoader workers transfer tensors via shm_open() which
-    # lives in /dev/shm (only 64 MB in this container).  By converting
-    # tensors → numpy in the worker and back → tensors before collation,
-    # data travels through the regular pickle pipe and never touches shm.
-    if num_workers > 0:
+    # -- /dev/shm bypass: wrap datasets + collate only when needed ----
+    # On small Docker /dev/shm mounts this avoids DataLoader IPC failures.
+    # On MXC500-style nodes with huge /dev/shm it is slower, so keep it
+    # configurable and auto-disable it when shared memory is sufficient.
+    if _should_enable_shm_bypass(cfg, num_workers, logger):
         train_dataset = ShmBypassDataset(train_dataset)
         if val_dataset is not None:
             val_dataset = ShmBypassDataset(val_dataset)
         actual_collate_fn = ShmBypassCollate(actual_collate_fn)
-        logger.info("   🔀 ShmBypass enabled: tensor↔numpy IPC (bypassing 64 MB /dev/shm)")
+        logger.info("   🔀 ShmBypass active: tensor↔numpy IPC")
 
     uses_dynamic_sampling = hasattr(train_dataset, 'set_epoch')
 

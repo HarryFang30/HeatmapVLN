@@ -31,6 +31,11 @@ data:
   num_workers: 16
   pin_memory: true
   prefetch_factor: 4
+  # auto enables the tensor->numpy DataLoader IPC bypass only on small /dev/shm
+  # mounts.  MXC500 nodes expose large /dev/shm, where bypassing shared memory
+  # is slower and should stay disabled.
+  shm_bypass: auto
+  shm_bypass_min_gb: 8.0
   dataset_type: trajectory
   use_worker_tokenized_collator: true
 

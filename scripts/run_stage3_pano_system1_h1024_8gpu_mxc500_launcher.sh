@@ -106,6 +106,8 @@ export STAGE3_L2_SP_WEIGHT="${STAGE3_L2_SP_WEIGHT:-}"
 export STAGE3_NUM_WORKERS="${STAGE3_NUM_WORKERS:-16}"
 export STAGE3_PREFETCH_FACTOR="${STAGE3_PREFETCH_FACTOR:-4}"
 export STAGE3_PIN_MEMORY="${STAGE3_PIN_MEMORY:-1}"
+export STAGE3_SHM_BYPASS="${STAGE3_SHM_BYPASS:-auto}"
+export STAGE3_SHM_BYPASS_MIN_GB="${STAGE3_SHM_BYPASS_MIN_GB:-8.0}"
 export STAGE3_ENABLE_TIMING="${STAGE3_ENABLE_TIMING:-1}"
 export STAGE3_SHOW_GPU_MEMORY="${STAGE3_SHOW_GPU_MEMORY:-0}"
 export STAGE3_LOG_INTERVAL="${STAGE3_LOG_INTERVAL:-20}"
@@ -206,6 +208,9 @@ data["root"] = os.environ["PANORAMIC_DATA_ROOT"]
 set_int(data, "num_workers", "STAGE3_NUM_WORKERS")
 set_int(data, "prefetch_factor", "STAGE3_PREFETCH_FACTOR")
 set_bool(data, "pin_memory", "STAGE3_PIN_MEMORY")
+if os.environ.get("STAGE3_SHM_BYPASS", "").strip():
+    data["shm_bypass"] = os.environ["STAGE3_SHM_BYPASS"].strip()
+set_float(data, "shm_bypass_min_gb", "STAGE3_SHM_BYPASS_MIN_GB")
 trajectory = data.setdefault("trajectory", {})
 set_int(trajectory, "system2_sample_step", "STAGE3_SYSTEM2_SAMPLE_STEP")
 

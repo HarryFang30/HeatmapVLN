@@ -712,6 +712,25 @@ class Qwen2_5VLIntegration(nn.Module):
             padded.append(t)
         return torch.cat(padded, dim=0)
 
+    def _model_has_trainable_parameters(self) -> bool:
+        if self.model is None:
+            return False
+        return any(param.requires_grad for param in self.model.parameters())
+
+    @staticmethod
+    def _last_hidden_state_from_outputs(outputs) -> torch.Tensor | None:
+        last_hs = getattr(outputs, "last_hidden_state", None)
+        if last_hs is not None:
+            return last_hs
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is not None:
+            return hidden_states[-1]
+        if isinstance(outputs, (tuple, list)) and outputs:
+            first = outputs[0]
+            if torch.is_tensor(first) and first.ndim == 3:
+                return first
+        return None
+
     def _forward_model_inputs(
         self,
         inputs: dict[str, torch.Tensor],
@@ -741,7 +760,7 @@ class Qwen2_5VLIntegration(nn.Module):
 
         n_query = 0
         hook_handle = None
-        need_hidden = return_hidden_states or (latent_queries is not None)
+        need_traj_hidden = latent_queries is not None
 
         # input_ids to use for vision-feature extraction (without TRAJ tokens)
         vision_input_ids = raw_input_ids
@@ -813,9 +832,14 @@ class Qwen2_5VLIntegration(nn.Module):
                 _replace_traj_embeds_hook, with_kwargs=True,
             )
 
+        inner_model = getattr(self.model, "model", None) if skip_lm_head else None
+        use_inner_model_for_skip = skip_lm_head and inner_model is not None
+        need_all_hidden_states = return_hidden_states or (
+            need_traj_hidden and not use_inner_model_for_skip
+        )
         fwd_kwargs = dict(
             **{k: v for k, v in inputs.items() if k != "labels"},
-            output_hidden_states=need_hidden,
+            output_hidden_states=need_all_hidden_states,
             return_dict=True,
             use_cache=False,
         )
@@ -824,23 +848,43 @@ class Qwen2_5VLIntegration(nn.Module):
                 raise ValueError("return_lm_loss=True requires `labels` in panoramic_inputs")
             fwd_kwargs["labels"] = lm_labels
             skip_lm_head = False
+            inner_model = None
+            if need_traj_hidden:
+                fwd_kwargs["output_hidden_states"] = True
         if self._internal_profiler is not None:
             self._internal_profiler.reset()
 
-        try:
+        qwen_needs_grad = (
+            return_lm_loss
+            or self._model_has_trainable_parameters()
+            or (latent_queries is not None and latent_queries.requires_grad)
+        )
+
+        def _run_model_forward():
             if skip_lm_head:
-                inner_model = getattr(self.model, "model", None)
                 if inner_model is None:
-                    outputs = self.model(**fwd_kwargs)
-                else:
-                    try:
-                        outputs = inner_model(**fwd_kwargs)
-                    except TypeError as exc:
-                        if "unexpected keyword argument" not in str(exc):
-                            raise
-                        outputs = self.model(**fwd_kwargs)
+                    return self.model(**fwd_kwargs)
+                try:
+                    return inner_model(**fwd_kwargs)
+                except TypeError as exc:
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    if need_traj_hidden and not fwd_kwargs.get("output_hidden_states", False):
+                        fwd_kwargs["output_hidden_states"] = True
+                    return self.model(**fwd_kwargs)
+            return self.model(**fwd_kwargs)
+
+        try:
+            if qwen_needs_grad:
+                outputs = _run_model_forward()
+            elif need_traj_hidden:
+                # no_grad returns normal tensors that can feed a trainable
+                # adapter. inference_mode tensors cannot be saved for backward.
+                with torch.no_grad():
+                    outputs = _run_model_forward()
             else:
-                outputs = self.model(**fwd_kwargs)
+                with torch.inference_mode():
+                    outputs = _run_model_forward()
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
@@ -854,19 +898,25 @@ class Qwen2_5VLIntegration(nn.Module):
         hidden_states = None
         lm_loss = getattr(outputs, "loss", None) if return_lm_loss else None
 
-        if need_hidden:
+        if return_hidden_states:
             layer_idx = self.config.hidden_layer_for_features
             if layer_idx == -1:
                 layer_idx = len(outputs.hidden_states) - 1
             hidden_states = outputs.hidden_states[layer_idx]
 
-            if n_query > 0:
-                last_hs = outputs.hidden_states[-1]
-                traj_hidden_states = last_hs[:, -n_query:, :].contiguous()
+        if need_traj_hidden:
+            last_hs = self._last_hidden_state_from_outputs(outputs)
+            if last_hs is None:
+                raise RuntimeError(
+                    "Failed to extract last hidden state for TRAJ latent queries. "
+                    "Use an inner/base model output or enable output_hidden_states."
+                )
+            traj_hidden_states = last_hs[:, -n_query:, :].contiguous()
+            if hidden_states is not None:
                 hidden_states = hidden_states[:, :-n_query, :].contiguous()
 
-            if not return_hidden_states:
-                hidden_states = None
+        if not return_hidden_states:
+            hidden_states = None
 
         vision_hidden_states = None
         if hidden_states is not None:

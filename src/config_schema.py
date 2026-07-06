@@ -161,6 +161,8 @@ class DataConfig(_Strict):
     sliding_window: SlidingWindowConfig | None = None
     trajectory: TrajectoryConfig | None = None
     use_worker_tokenized_collator: bool | None = None
+    shm_bypass: Union[bool, str] = "auto"
+    shm_bypass_min_gb: float = 8.0
 
     @field_validator("image_size", "init_hm_size")
     @classmethod
@@ -175,6 +177,24 @@ class DataConfig(_Strict):
         allowed = {"sliding_window", "trajectory"}
         if v not in allowed:
             raise ValueError(f"dataset_type must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("shm_bypass")
+    @classmethod
+    def _check_shm_bypass(cls, v: Union[bool, str]) -> Union[bool, str]:
+        if isinstance(v, bool):
+            return v
+        normalized = str(v).strip().lower()
+        allowed = {"auto", "1", "0", "true", "false", "yes", "no", "on", "off"}
+        if normalized not in allowed:
+            raise ValueError(f"shm_bypass must be boolean-like or 'auto', got {v}")
+        return normalized
+
+    @field_validator("shm_bypass_min_gb")
+    @classmethod
+    def _check_shm_bypass_min_gb(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"shm_bypass_min_gb must be >= 0, got {v}")
         return v
 
 
