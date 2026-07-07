@@ -47,6 +47,12 @@ def _normalize_state_key(name: str) -> str:
     prefix_aliases = {
         "qwen3_5.": "qwen2_5_vl.",
         "qwen3_5_vl.": "qwen2_5_vl.",
+        # VLNPipeline exposes the same Qwen module through both attributes:
+        # ``qwen2_5_vl`` and ``vlm_backbone``.  state_dict() includes both
+        # alias prefixes, but checkpoints normally store only qwen2_5_vl.*.
+        # Normalize the alias before completeness checks so one physical LoRA
+        # adapter is not counted twice.
+        "vlm_backbone.": "qwen2_5_vl.",
     }
     for old_prefix, new_prefix in prefix_aliases.items():
         if name.startswith(old_prefix):
