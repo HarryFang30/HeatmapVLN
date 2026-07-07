@@ -103,6 +103,7 @@ class AdapterCpuBatch:
     teacher_cond: torch.Tensor | None
     records: list[dict[str, Any]]
     samples: list[dict[str, Any]] | None = None
+    skipped_records: int = 0
 
 
 class NativeTeacherTargetCache:
@@ -1868,9 +1869,10 @@ def _prepare_batch_cpu(
     need_raw: bool = True,
     need_cond: bool = True,
     teacher_cache: NativeTeacherTargetCache | None = None,
-) -> AdapterCpuBatch:
+) -> AdapterCpuBatch | None:
     batch_samples: list[dict[str, Any]] = []
     usable_records: list[dict[str, Any]] = []
+    skipped_records = 0
     for rec in batch_records:
         idx = int(rec["dataset_index"])
         if (idx < 0 or idx >= len(dataset)) and (
@@ -1889,6 +1891,7 @@ def _prepare_batch_cpu(
                     sample.get("pano_sample_kind"),
                     sample.get("pano_view_id"),
                 )
+                skipped_records += 1
                 continue
             raise RuntimeError(
                 "Lost trainable pano pixel goal after prefilter: "
@@ -1898,6 +1901,14 @@ def _prepare_batch_cpu(
         batch_samples.append(sample)
         usable_records.append(rec)
     if not usable_records:
+        if teacher_target_mode == "native_sidecar":
+            LOGGER.warning(
+                "Skipping empty native-sidecar adapter batch after lazy pano-goal "
+                "filtering: input_records=%d skipped_records=%d",
+                len(batch_records),
+                skipped_records,
+            )
+            return None
         raise RuntimeError("Cannot build an empty adapter batch")
 
     collated = _collate_student_batch_cpu(collator, batch_samples)
@@ -1918,6 +1929,7 @@ def _prepare_batch_cpu(
         teacher_cond=teacher_cond,
         records=usable_records,
         samples=batch_samples if keep_samples else None,
+        skipped_records=skipped_records,
     )
 
 
@@ -1991,6 +2003,32 @@ def _finalize_batch_on_device(
         traj_images=traj_images,
     )
     return batch
+
+
+def _ddp_safe_zero_train_step(
+    train_adapter: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    n_traj_query: int,
+    hidden_dim: int,
+    device: torch.device,
+) -> None:
+    """Run a synchronized zero-gradient step for an empty lazy-filtered batch."""
+    try:
+        first_param = next(train_adapter.parameters())
+        dtype = first_param.dtype
+    except StopIteration:
+        dtype = torch.float32
+    optimizer.zero_grad(set_to_none=True)
+    dummy = torch.zeros(
+        (1, int(n_traj_query), int(hidden_dim)),
+        device=device,
+        dtype=dtype,
+    )
+    pred = train_adapter(dummy)
+    loss = pred.float().sum() * 0.0
+    loss.backward()
+    optimizer.step()
 
 
 @torch.no_grad()
@@ -2069,6 +2107,10 @@ def _evaluate_adapter(
             prefetch_batches=prefetch_batches,
             prefetch_workers=prefetch_workers,
         ):
+            if cpu_batch is None:
+                if rank == 0:
+                    pbar.update(1)
+                continue
             batch = _finalize_batch_on_device(
                 cpu_batch,
                 model=model,
@@ -2671,32 +2713,63 @@ def main() -> int:
                 cpu_batch = next(cpu_batch_iter)
                 prefetch_wait_s = time.perf_counter() - wait_t0
 
-                finalize_t0 = time.perf_counter()
-                batch = _finalize_batch_on_device(
-                    cpu_batch,
-                    model=model,
-                    device=device,
-                    teacher_model=teacher_model,
-                    teacher_processor=teacher_processor,
-                    teacher_turn_args=teacher_turn_args,
-                )
-                finalize_s = time.perf_counter() - finalize_t0
+                if cpu_batch is None:
+                    finalize_s = 0.0
+                    train_t0 = time.perf_counter()
+                    _ddp_safe_zero_train_step(
+                        train_adapter,
+                        optimizer,
+                        n_traj_query=n_traj_query,
+                        hidden_dim=hidden_dim,
+                        device=device,
+                    )
+                    train_step_s = time.perf_counter() - train_t0
+                    metrics = {
+                        "loss": 0.0,
+                        "raw": 0.0,
+                        "raw_cos": 0.0,
+                        "raw_cos_loss": 0.0,
+                        "raw_norm_loss": 0.0,
+                        "raw_norm_ratio": 0.0,
+                        "cond": 0.0,
+                        "cond_cos": 0.0,
+                        "cond_cos_loss": 0.0,
+                        "cond_smooth_l1": 0.0,
+                        "cond_mse": 0.0,
+                        "gt": 0.0,
+                        "lazy_empty_batches": 1.0,
+                        "lazy_skipped_records": float(args.batch_size),
+                    }
+                else:
+                    finalize_t0 = time.perf_counter()
+                    batch = _finalize_batch_on_device(
+                        cpu_batch,
+                        model=model,
+                        device=device,
+                        teacher_model=teacher_model,
+                        teacher_processor=teacher_processor,
+                        teacher_turn_args=teacher_turn_args,
+                    )
+                    finalize_s = time.perf_counter() - finalize_t0
 
-                train_t0 = time.perf_counter()
-                pred = train_adapter(batch.student_latents)
-                loss, metrics, _pred_cond = _compute_adapter_objective(
-                    model=model,
-                    pred_raw=pred,
-                    batch=batch,
-                    args=args,
-                )
+                    train_t0 = time.perf_counter()
+                    pred = train_adapter(batch.student_latents)
+                    loss, metrics, _pred_cond = _compute_adapter_objective(
+                        model=model,
+                        pred_raw=pred,
+                        batch=batch,
+                        args=args,
+                    )
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if args.grad_clip > 0:
-                    clip_grad_norm_(train_adapter.parameters(), args.grad_clip)
-                optimizer.step()
-                train_step_s = time.perf_counter() - train_t0
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    if args.grad_clip > 0:
+                        clip_grad_norm_(train_adapter.parameters(), args.grad_clip)
+                    optimizer.step()
+                    train_step_s = time.perf_counter() - train_t0
+                    if cpu_batch.skipped_records:
+                        metrics["lazy_skipped_records"] = float(cpu_batch.skipped_records)
+                        metrics["lazy_empty_batches"] = 0.0
 
                 global_step += world_size
                 count += 1
@@ -2720,7 +2793,8 @@ def main() -> int:
                     LOGGER.info(
                         "epoch=%d local_step=%d global_step=%d loss=%.6f "
                         "raw=%.6f raw_cos=%.4f cond=%.6f cond_cos=%.4f "
-                        "cond_smooth_l1=%.6f gt=%.6f wait=%.3fs finalize=%.3fs train=%.3fs",
+                        "cond_smooth_l1=%.6f gt=%.6f lazy_skip=%.1f empty_batches=%.1f "
+                        "wait=%.3fs finalize=%.3fs train=%.3fs",
                         epoch + 1, count, global_step,
                         avg.get("loss", 0.0),
                         avg.get("raw", 0.0),
@@ -2729,6 +2803,8 @@ def main() -> int:
                         avg.get("cond_cos", 0.0),
                         avg.get("cond_smooth_l1", 0.0),
                         avg.get("gt", 0.0),
+                        avg.get("lazy_skipped_records", 0.0),
+                        avg.get("lazy_empty_batches", 0.0),
                         avg.get("prefetch_wait_s", 0.0),
                         avg.get("finalize_s", 0.0),
                         avg.get("train_step_s", 0.0),
