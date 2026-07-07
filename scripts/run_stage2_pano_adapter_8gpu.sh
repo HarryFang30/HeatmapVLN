@@ -46,6 +46,8 @@ STAGE2_ADAPTER_TEACHER_CACHE_MODE="${STAGE2_ADAPTER_TEACHER_CACHE_MODE:-}"
 STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS="${STAGE2_ADAPTER_TEACHER_CACHE_MAX_ITEMS:-}"
 STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE="${STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE:-}"
 STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS="${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-}"
+STAGE2_ADAPTER_CHECK_TEACHER_TENSOR_FILES="${STAGE2_ADAPTER_CHECK_TEACHER_TENSOR_FILES:-}"
+STAGE2_ADAPTER_TRUST_NATIVE_PANO_LABELS="${STAGE2_ADAPTER_TRUST_NATIVE_PANO_LABELS:-}"
 
 # Teacher targets / loss weights
 STAGE2_ADAPTER_TEACHER_MODE="${STAGE2_ADAPTER_TEACHER_MODE:-native_sidecar}"
@@ -156,6 +158,20 @@ build_adapter_args() {
   if [[ -n "${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-}" ]]; then
     args+=(--teacher-preload-workers "$STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS")
   fi
+  if [[ -n "${STAGE2_ADAPTER_CHECK_TEACHER_TENSOR_FILES:-}" ]]; then
+    if is_truthy "$STAGE2_ADAPTER_CHECK_TEACHER_TENSOR_FILES"; then
+      args+=(--check-teacher-tensor-files)
+    else
+      args+=(--no-check-teacher-tensor-files)
+    fi
+  fi
+  if [[ -n "${STAGE2_ADAPTER_TRUST_NATIVE_PANO_LABELS:-}" ]]; then
+    if is_truthy "$STAGE2_ADAPTER_TRUST_NATIVE_PANO_LABELS"; then
+      args+=(--trust-native-sidecar-pano-labels)
+    else
+      args+=(--no-trust-native-sidecar-pano-labels)
+    fi
+  fi
 
   # Teacher JSONL (required in native_sidecar mode)
   if [[ -n "${STAGE2_ADAPTER_TEACHER_JSONL:-}" ]]; then
@@ -186,6 +202,7 @@ log "Loss weights: raw=$STAGE2_ADAPTER_RAW_WEIGHT cond=$STAGE2_ADAPTER_COND_WEIG
 log "Prefetch batches: ${STAGE2_ADAPTER_PREFETCH_BATCHES:-<config default>}"
 log "Prefetch workers: ${STAGE2_ADAPTER_PREFETCH_WORKERS:-<config default>}"
 log "Teacher cache: mode=${STAGE2_ADAPTER_TEACHER_CACHE_MODE:-<config default>} preload=${STAGE2_ADAPTER_TEACHER_PRELOAD_CACHE:-<config default>} preload_workers=${STAGE2_ADAPTER_TEACHER_PRELOAD_WORKERS:-<config default>}"
+log "Teacher startup filter: check_tensor_files=${STAGE2_ADAPTER_CHECK_TEACHER_TENSOR_FILES:-<config default>} trust_native_pano_labels=${STAGE2_ADAPTER_TRUST_NATIVE_PANO_LABELS:-<config default>}"
 log "Teacher MSE diagnostic: $STAGE2_ADAPTER_COMPUTE_TEACHER_MSE"
 log "Record JSONL: ${STAGE2_ADAPTER_TEACHER_JSONL:-<none>}"
 

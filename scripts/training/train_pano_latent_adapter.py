@@ -423,16 +423,25 @@ def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: t
     return model
 
 
-def _resolve_tensor_path(jsonl_path: Path, path_value: str | None) -> Path | None:
+def _resolve_tensor_path(
+    jsonl_path: Path,
+    path_value: str | None,
+    *,
+    check_exists: bool = True,
+) -> Path | None:
     if not path_value:
         return None
     path = Path(path_value).expanduser()
+    if not check_exists:
+        if path.is_absolute():
+            return path
+        return (jsonl_path.parent / path).expanduser()
     if path.is_file():
         return path
     candidate = (jsonl_path.parent / path_value).expanduser()
     if candidate.is_file():
         return candidate
-    return path
+    return None
 
 
 def _normalized_clip_dir_key(value: Any) -> str | None:
@@ -473,24 +482,38 @@ def _resolve_record_clip_idx(dataset: Any, rec: dict[str, Any]) -> int | None:
     Expanding the dataset can shift those indices, while ``clip_dir`` remains
     stable.  Prefer the path whenever it is available.
     """
+    cached_idx = rec.get("_resolved_clip_idx")
+    if cached_idx is not None:
+        return int(cached_idx)
+
     clip_dir = rec.get("clip_dir")
     clips = getattr(dataset, "clips", None)
     if clip_dir is not None and clips is not None:
-        target_key = _normalized_clip_dir_key(clip_dir)
         lookup = getattr(dataset, "_clip_dir_to_idx", None)
         if isinstance(lookup, dict):
-            for raw_key in (str(clip_dir), str(Path(str(clip_dir)).expanduser()), target_key):
+            raw_value = str(clip_dir)
+            for raw_key in (raw_value, str(Path(raw_value).expanduser())):
                 if raw_key and raw_key in lookup:
-                    return int(lookup[raw_key])
+                    idx = int(lookup[raw_key])
+                    rec["_resolved_clip_idx"] = idx
+                    return idx
+        target_key = _normalized_clip_dir_key(clip_dir)
+        if isinstance(lookup, dict) and target_key and target_key in lookup:
+            idx = int(lookup[target_key])
+            rec["_resolved_clip_idx"] = idx
+            return idx
         if target_key:
             for idx, current_clip_dir in enumerate(clips):
                 if _normalized_clip_dir_key(current_clip_dir) == target_key:
+                    rec["_resolved_clip_idx"] = int(idx)
                     return int(idx)
 
     clip_idx = rec.get("clip_idx")
     if clip_idx is None:
         return None
-    return int(clip_idx)
+    idx = int(clip_idx)
+    rec["_resolved_clip_idx"] = idx
+    return idx
 
 
 def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any]:
@@ -521,6 +544,7 @@ def _load_teacher_records(
     require_tensor: bool = True,
     require_coord_uv: bool = True,
     require_native_teacher: bool = False,
+    check_tensor_exists: bool = True,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with jsonl_path.open("r", encoding="utf-8") as f:
@@ -539,8 +563,12 @@ def _load_teacher_records(
                 if coord_source != "dataset" or mode != "dataset_coord":
                     continue
             tensor_info = teacher.get("system1", {}).get("tensor_sidecar", {})
-            tensor_path = _resolve_tensor_path(jsonl_path, tensor_info.get("path"))
-            if require_tensor and (tensor_path is None or not tensor_path.is_file()):
+            tensor_path = _resolve_tensor_path(
+                jsonl_path,
+                tensor_info.get("path"),
+                check_exists=check_tensor_exists,
+            )
+            if require_tensor and tensor_path is None:
                 continue
             if require_coord_uv and teacher.get("coord_uv") is None:
                 continue
@@ -1054,6 +1082,7 @@ def _filter_records_with_pano_goals(
     dataset: Any,
     validate_sidecar_metadata: bool = False,
     require_native_teacher_sidecar: bool = False,
+    trust_sidecar_pano_labels: bool = False,
 ) -> list[dict[str, Any]]:
     """Keep records whose exact frame has a structured pano pixel goal.
 
@@ -1074,18 +1103,23 @@ def _filter_records_with_pano_goals(
     invalid_native = 0
     fast_checked = 0
     fallback_loaded = 0
+    sidecar_label_checked = 0
+    trusted_without_pano_label = 0
     total = len(records)
+    progress_interval = 100000 if trust_sidecar_pano_labels else 1000
     for rec_i, rec in enumerate(records, start=1):
         idx = rec.get("dataset_index")
-        if rec_i % 1000 == 0:
+        if rec_i == 1000 or rec_i % progress_interval == 0:
             LOGGER.info(
                 "Filtering teacher records... %d/%d kept=%d skipped=%d failed=%d "
-                "fast=%d fallback=%d",
+                "sidecar_label=%d trusted_no_label=%d fast=%d fallback=%d",
                 rec_i,
                 total,
                 len(filtered),
                 skipped,
                 failed,
+                sidecar_label_checked,
+                trusted_without_pano_label,
                 fast_checked,
                 fallback_loaded,
             )
@@ -1100,9 +1134,22 @@ def _filter_records_with_pano_goals(
                 invalid_native += 1
                 continue
             tensor_path = rec.get("_tensor_path")
-            if not tensor_path or not Path(str(tensor_path)).is_file():
+            if not tensor_path:
                 invalid_native += 1
                 continue
+
+        if trust_sidecar_pano_labels:
+            pano_pixel_goal = rec.get("_sidecar_pano_pixel_goal")
+            if pano_pixel_goal is None:
+                if require_native_teacher_sidecar and not validate_sidecar_metadata:
+                    trusted_without_pano_label += 1
+                    filtered.append(rec)
+                    continue
+                skipped += 1
+                continue
+            sidecar_label_checked += 1
+            filtered.append(rec)
+            continue
 
         fast_available, fast_goal = _try_fast_pano_goal_from_record(dataset, rec)
         if fast_available:
@@ -1176,6 +1223,7 @@ def _filter_records_with_pano_goals(
         "Filtered teacher records for pano pixel goals: "
         "kept=%d skipped_no_pano_goal=%d failed=%d mismatched=%d "
         "missing_metadata=%d invalid_tensor=%d invalid_native=%d "
+        "sidecar_label_checked=%d trusted_without_pano_label=%d "
         "fast_checked=%d fallback_loaded=%d",
         len(filtered),
         skipped,
@@ -1184,6 +1232,8 @@ def _filter_records_with_pano_goals(
         missing_metadata,
         invalid_tensor,
         invalid_native,
+        sidecar_label_checked,
+        trusted_without_pano_label,
         fast_checked,
         fallback_loaded,
     )
@@ -1831,6 +1881,15 @@ def _prepare_batch_cpu(
             )
         sample = _sample_from_record(dataset, rec)
         if not _has_trainable_pano_goal(sample):
+            if teacher_target_mode == "native_sidecar":
+                LOGGER.debug(
+                    "Skip native teacher record without trainable pano pixel goal "
+                    "during lazy batch build: dataset_index=%s kind=%s view=%s",
+                    idx,
+                    sample.get("pano_sample_kind"),
+                    sample.get("pano_view_id"),
+                )
+                continue
             raise RuntimeError(
                 "Lost trainable pano pixel goal after prefilter: "
                 f"dataset_index={idx} kind={sample.get('pano_sample_kind')} "
@@ -2106,6 +2165,10 @@ def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
     defaults["teacher_cache_max_items"] = int(training.get("teacher_cache_max_items", 0))
     defaults["teacher_preload_cache"] = bool(training.get("teacher_preload_cache", False))
     defaults["teacher_preload_workers"] = int(training.get("teacher_preload_workers", 4))
+    defaults["check_teacher_tensor_files"] = bool(training.get("check_teacher_tensor_files", True))
+    defaults["trust_native_sidecar_pano_labels"] = bool(
+        training.get("trust_native_sidecar_pano_labels", True)
+    )
 
     # Teacher
     teacher = adapter_cfg.get("teacher", {}) or {}
@@ -2236,6 +2299,28 @@ def _parse_args_with_config() -> argparse.Namespace:
         default=adapter_defaults.get("teacher_preload_workers", 4),
         help="CPU workers used by --teacher-preload-cache.",
     )
+    p.add_argument(
+        "--check-teacher-tensor-files",
+        action=argparse.BooleanOptionalAction,
+        default=adapter_defaults.get("check_teacher_tensor_files", True),
+        help=(
+            "Check every teacher tensor path during JSONL load. Disable for large "
+            "trusted native_sidecar JSONL files to avoid hundreds of thousands of "
+            "remote filesystem metadata queries; tensors are still validated when loaded."
+        ),
+    )
+    p.add_argument(
+        "--trust-native-sidecar-pano-labels",
+        action=argparse.BooleanOptionalAction,
+        default=adapter_defaults.get("trust_native_sidecar_pano_labels", True),
+        help=(
+            "For native_sidecar records, trust the pano pixel label stored in the "
+            "collector JSONL during startup filtering instead of recomputing the "
+            "projection for every record. If older native sidecars do not contain "
+            "pano labels, trust the record set and lazily skip the rare invalid "
+            "samples during batch construction."
+        ),
+    )
     p.add_argument("--max-samples", type=int, default=adapter_defaults.get("max_samples", 0))
     p.add_argument("--lr", type=float, default=adapter_defaults.get("lr", 1.0e-4))
     p.add_argument("--weight-decay", type=float, default=adapter_defaults.get("weight_decay", 0.01))
@@ -2323,6 +2408,7 @@ def main() -> int:
                 require_tensor=use_sidecar_tensors,
                 require_coord_uv=use_sidecar_tensors,
                 require_native_teacher=args.teacher_target_mode == "native_sidecar",
+                check_tensor_exists=bool(args.check_teacher_tensor_files),
             )
             if args.max_samples > 0:
                 records = records[: args.max_samples]
@@ -2336,11 +2422,22 @@ def main() -> int:
                     world_size,
                     args.teacher_target_mode,
                 )
+                if args.teacher_target_mode == "native_sidecar":
+                    LOGGER.info(
+                        "Native sidecar startup filter: trust_pano_labels=%s "
+                        "check_tensor_files=%s",
+                        bool(args.trust_native_sidecar_pano_labels),
+                        bool(args.check_teacher_tensor_files),
+                    )
             records = _filter_records_with_pano_goals(
                 records,
                 dataset=dataset,
                 validate_sidecar_metadata=args.teacher_target_mode == "sidecar",
                 require_native_teacher_sidecar=args.teacher_target_mode == "native_sidecar",
+                trust_sidecar_pano_labels=(
+                    args.teacher_target_mode == "native_sidecar"
+                    and bool(args.trust_native_sidecar_pano_labels)
+                ),
             )
         elif args.teacher_target_mode == "aligned":
             if _rank0():

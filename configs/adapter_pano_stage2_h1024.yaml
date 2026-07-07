@@ -25,6 +25,8 @@ adapter:
     teacher_cache_max_items: 0
     teacher_preload_cache: true
     teacher_preload_workers: 8
+    check_teacher_tensor_files: false
+    trust_native_sidecar_pano_labels: true
 
   loss:
     raw_weight: 0.1
