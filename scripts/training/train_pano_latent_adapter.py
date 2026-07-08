@@ -1871,11 +1871,11 @@ def _iter_prepared_cpu_batches(
         thread.start()
 
     next_idx = 0
-    buffered: dict[int, AdapterCpuBatch] = {}
+    buffered: dict[int, AdapterCpuBatch | None] = {}
     try:
         while next_idx < total:
-            ready = buffered.pop(next_idx, None)
-            if ready is not None:
+            if next_idx in buffered:
+                ready = buffered.pop(next_idx)
                 yield ready
                 next_idx += 1
                 continue
