@@ -2377,6 +2377,15 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument("--cond-smooth-l1-beta", type=float, default=adapter_defaults.get("cond_smooth_l1_beta", 1.0))
     p.add_argument("--pano-max-side-dist-m", type=float, default=6.0)
     p.add_argument(
+        "--dataset-max-clips",
+        type=int,
+        default=0,
+        help=(
+            "Limit clip enumeration before dataset indexing. Intended for "
+            "smoke tests with --max-samples; 0 keeps full training data."
+        ),
+    )
+    p.add_argument(
         "--val-ratio",
         type=float,
         default=adapter_defaults.get("val_ratio", 0.1),
@@ -2423,6 +2432,7 @@ def main() -> int:
             pano_max_side_dist_m=float(args.pano_max_side_dist_m),
             load_lookdown_for_system2=False,
             load_traj_images=True,
+            max_clips=max(0, int(args.dataset_max_clips or 0)),
         )
         if _rank0():
             LOGGER.info("Dataset samples=%d", len(dataset))
@@ -2440,6 +2450,7 @@ def main() -> int:
                 pano_max_side_dist_m=float(args.pano_max_side_dist_m),
                 load_lookdown_for_system2=False,
                 load_traj_images=True,
+                max_clips=max(0, int(args.dataset_max_clips or 0)),
             )
 
         if teacher_jsonl_str:

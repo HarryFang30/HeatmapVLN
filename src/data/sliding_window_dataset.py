@@ -120,10 +120,12 @@ class VLNSlidingWindowDataset(Dataset):
         metadata_cache_size: int = 500,  # 元数据 LRU 缓存大小（clip 数量），防止 worker 内存无限增长
         defer_heatmap_to_gpu: bool = False,  # 兼容 train.py 传入（由 GPUHeatmapComputer 处理）
         load_history_frames: bool = True,
+        max_clips: int = 0,
     ):
         self.root = Path(root).expanduser()
         self.defer_heatmap_to_gpu = defer_heatmap_to_gpu
         self.load_history_frames = load_history_frames
+        self.max_clips = max(0, int(max_clips or 0))
         self.split = split
         self.min_history = min_history
         self.num_history_sample = num_history_sample
@@ -354,6 +356,16 @@ class VLNSlidingWindowDataset(Dataset):
 
         if len(clips) == 0:
             raise FileNotFoundError(f"No clips found in {search_dir} (split={self.split})")
+
+        if self.max_clips > 0 and len(clips) > self.max_clips:
+            original_clip_count = len(clips)
+            clips = clips[: self.max_clips]
+            logger.info(
+                "Limiting dataset clips: %d/%d clips (split=%s)",
+                len(clips),
+                original_clip_count,
+                self.split,
+            )
 
         logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips

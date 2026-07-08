@@ -44,6 +44,7 @@ def build_sliding_window_dataset(
         samples_per_clip=sw_cfg.get("samples_per_clip", 2),
         defer_heatmap_to_gpu=sw_cfg.get("defer_heatmap_to_gpu", False),
         load_history_frames=sw_cfg.get("load_history_frames", True),
+        max_clips=sw_cfg.get("max_clips", 0),
     )
     kwargs.update(overrides)
     return VLNSlidingWindowDataset(**kwargs)
@@ -105,6 +106,7 @@ def build_trajectory_dataset(
         panoramic_vlm_input=traj_cfg.get("panoramic_vlm_input", True),
         compute_pano_view_pixel_goal=traj_cfg.get("compute_pano_view_pixel_goal"),
         pano_max_side_dist_m=traj_cfg.get("pano_max_side_dist_m", 6.0),
+        max_clips=traj_cfg.get("max_clips", 0),
     )
     kwargs.update(overrides)
     return VLNTrajectoryDataset(**kwargs)

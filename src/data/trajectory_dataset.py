@@ -120,6 +120,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         panoramic_vlm_input: bool = True,
         compute_pano_view_pixel_goal: bool | None = None,
         pano_max_side_dist_m: float = 6.0,
+        max_clips: int = 0,
     ):
         # ``VLNSlidingWindowDataset.__init__`` calls ``self._build_sample_index()``
         # before its chunk caches / panoramic detection fields are fully
@@ -146,6 +147,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             min_subsequence_length=min_subsequence_length,
             subsequence_samples_per_clip=subsequence_samples_per_clip,
             include_stop_samples_random_subsequence=include_stop_samples_random_subsequence,
+            max_clips=max_clips,
         )
 
         self.predict_horizon = predict_horizon
