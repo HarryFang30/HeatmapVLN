@@ -1598,20 +1598,21 @@ def _reduce_metrics(
     count: int,
     device: torch.device,
 ) -> dict[str, float]:
-    keys = sorted(sums)
+    local_keys = sorted(sums)
+    if _distributed_available():
+        gathered_keys: list[list[str] | None] = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered_keys, local_keys)
+        keys = sorted({key for rank_keys in gathered_keys for key in (rank_keys or [])})
+    else:
+        keys = local_keys
     if not keys:
-        # In distributed mode every rank must participate in the all_reduce
-        # collective; returning early would deadlock the other ranks.
-        # Callers must ensure every rank processes ≥1 batch (see
-        # _evaluate_adapter for validation and _epoch_rank_records for training).
+        # In distributed mode every rank still participates in the collective
+        # key exchange above, so an all-empty reduction can safely return.
         if _distributed_available():
-            raise RuntimeError(
-                "_reduce_metrics called with empty sums in distributed mode — "
-                "this would deadlock other ranks.  Pad your data to a multiple "
-                "of world_size before sharding."
-            )
+            count_tensor = torch.tensor([float(count)], device=device, dtype=torch.float64)
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
         return {}
-    values = [sums[key] for key in keys] + [float(count)]
+    values = [float(sums.get(key, 0.0)) for key in keys] + [float(count)]
     tensor = torch.tensor(values, device=device, dtype=torch.float64)
     if _distributed_available():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
