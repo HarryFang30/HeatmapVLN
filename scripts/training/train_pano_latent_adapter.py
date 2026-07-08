@@ -546,6 +546,7 @@ def _load_teacher_records(
     require_coord_uv: bool = True,
     require_native_teacher: bool = False,
     check_tensor_exists: bool = True,
+    max_records: int = 0,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with jsonl_path.open("r", encoding="utf-8") as f:
@@ -590,6 +591,8 @@ def _load_teacher_records(
                 else None
             )
             records.append(rec)
+            if max_records > 0 and len(records) >= max_records:
+                break
     return records
 
 
@@ -2462,8 +2465,9 @@ def main() -> int:
                 require_coord_uv=use_sidecar_tensors,
                 require_native_teacher=args.teacher_target_mode == "native_sidecar",
                 check_tensor_exists=bool(args.check_teacher_tensor_files),
+                max_records=max(0, int(args.max_samples or 0)),
             )
-            if args.max_samples > 0:
+            if args.max_samples > 0 and len(records) > args.max_samples:
                 records = records[: args.max_samples]
             if not records:
                 raise RuntimeError(f"No usable teacher records found in {teacher_jsonl}")

@@ -378,6 +378,7 @@ class VLNSlidingWindowDataset(Dataset):
         """
         self._clip_valid_frames = {}
         skipped_corrupted = 0
+        skipped_missing_frames = 0
 
         for clip_idx, clip_dir in enumerate(self.clips):
             try:
@@ -394,16 +395,37 @@ class VLNSlidingWindowDataset(Dataset):
                 if chunks_dir.exists():
                     chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
                     has_corrupted = False
+                    frame_ids_seen: set[int] = set()
                     for cf in chunk_files:
                         try:
-                            with np.load(cf, allow_pickle=True) as _:
-                                pass
+                            with np.load(cf, allow_pickle=True) as chunk_data:
+                                if "frame_ids" not in chunk_data:
+                                    logger.warning(f"frame_ids missing in chunk, excluding clip: {cf}")
+                                    has_corrupted = True
+                                    break
+                                frame_ids_seen.update(
+                                    int(frame_id)
+                                    for frame_id in np.array(chunk_data["frame_ids"], dtype=np.int32).tolist()
+                                )
                         except Exception:
                             logger.warning(f"Corrupted chunk, excluding clip: {cf}")
                             has_corrupted = True
                             break
                     if has_corrupted:
                         skipped_corrupted += 1
+                        continue
+                    expected_frames = set(range(T))
+                    missing_frames = expected_frames - frame_ids_seen
+                    if missing_frames:
+                        skipped_missing_frames += 1
+                        preview = sorted(missing_frames)[:5]
+                        logger.warning(
+                            "Chunk frame_ids incomplete, excluding clip %s: "
+                            "missing_count=%d first_missing=%s",
+                            clip_dir,
+                            len(missing_frames),
+                            preview,
+                        )
                         continue
 
                 valid_frames = list(range(self.min_history, T))
@@ -417,6 +439,8 @@ class VLNSlidingWindowDataset(Dataset):
 
         if skipped_corrupted > 0:
             logger.warning(f"Excluded {skipped_corrupted} clips with corrupted chunk files")
+        if skipped_missing_frames > 0:
+            logger.warning(f"Excluded {skipped_missing_frames} clips with incomplete chunk frame_ids")
         logger.info(f"Precomputed valid frames for {len(self._clip_valid_frames)} clips")
 
     def set_epoch(self, epoch: int):
@@ -769,15 +793,18 @@ class VLNSlidingWindowDataset(Dataset):
 
             for clip_idx, clip_dir in enumerate(self.clips):
                 try:
-                    meta = self._load_meta(clip_idx)
-                    T = meta["num_frames"]
+                    valid_frames = self._clip_valid_frames.get(clip_idx)
+                    if not valid_frames:
+                        continue
 
                     # 每个 clip 可生成 T - min_history 个样本
-                    for t in range(self.min_history, T, self.sample_stride):
+                    for t in valid_frames:
+                        if (t - self.min_history) % self.sample_stride != 0:
+                            continue
                         self.sample_index.append((clip_idx, t))
 
                     # 确保最后一帧（STOP）被采样
-                    last_frame = T - 1
+                    last_frame = valid_frames[-1]
                     if last_frame >= self.min_history:
                         if (last_frame - self.min_history) % self.sample_stride != 0:
                             self.sample_index.append((clip_idx, last_frame))
