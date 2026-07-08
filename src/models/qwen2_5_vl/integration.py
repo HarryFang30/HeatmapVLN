@@ -11,6 +11,7 @@ Sequence packing is currently disabled on the shared stack.
 
 import json
 import logging
+import inspect
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch_dtype.*is deprecated.*")
@@ -862,6 +863,16 @@ class Qwen2_5VLIntegration(nn.Module):
             or (latent_queries is not None and latent_queries.requires_grad)
         )
 
+        def _filter_kwargs_for_forward(module: nn.Module, kwargs: dict[str, Any]) -> dict[str, Any]:
+            try:
+                signature = inspect.signature(module.forward)
+            except (TypeError, ValueError):
+                return kwargs
+            parameters = signature.parameters
+            if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+                return kwargs
+            return {key: value for key, value in kwargs.items() if key in parameters}
+
         def _run_model_forward():
             if skip_lm_head:
                 if inner_model is None:
@@ -873,7 +884,10 @@ class Qwen2_5VLIntegration(nn.Module):
                         raise
                     if need_traj_hidden and not fwd_kwargs.get("output_hidden_states", False):
                         fwd_kwargs["output_hidden_states"] = True
-                    return self.model(**fwd_kwargs)
+                    filtered_kwargs = _filter_kwargs_for_forward(inner_model, fwd_kwargs)
+                    if filtered_kwargs.keys() == fwd_kwargs.keys():
+                        raise
+                    return inner_model(**filtered_kwargs)
             return self.model(**fwd_kwargs)
 
         try:
