@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 from dataclasses import dataclass
 from typing import Union
 
@@ -72,6 +73,7 @@ HISTORY_PROJECTION_TASK = (
 )
 
 _ANCHOR_TOKEN_CACHE: dict[tuple[int, int], list[list[int]]] = {}
+_ANCHOR_TOKEN_CACHE_LOCK = threading.Lock()
 
 
 def format_structured_pano_assistant_text(
@@ -402,14 +404,20 @@ def find_text_anchor_positions(
     cache_key = (id(tokenizer), num_history)
     anchor_token_ids = _ANCHOR_TOKEN_CACHE.get(cache_key)
     if anchor_token_ids is None:
-        anchor_token_ids = []
-        for hist_idx in range(num_history):
-            anchor_text = _build_history_anchor_text(hist_idx)
-            anchor_ids = tokenizer.encode(anchor_text, add_special_tokens=False)
-            if not anchor_ids:
-                raise RuntimeError(f"Failed to tokenize anchor text: {anchor_text}")
-            anchor_token_ids.append(anchor_ids)
-        _ANCHOR_TOKEN_CACHE[cache_key] = anchor_token_ids
+        # Hugging Face fast tokenizers are not re-entrant; Stage2 adapter
+        # prefetch builds batches on multiple threads, so populate this cache
+        # under a lock before concurrent callers reuse the token ids.
+        with _ANCHOR_TOKEN_CACHE_LOCK:
+            anchor_token_ids = _ANCHOR_TOKEN_CACHE.get(cache_key)
+            if anchor_token_ids is None:
+                anchor_token_ids = []
+                for hist_idx in range(num_history):
+                    anchor_text = _build_history_anchor_text(hist_idx)
+                    anchor_ids = tokenizer.encode(anchor_text, add_special_tokens=False)
+                    if not anchor_ids:
+                        raise RuntimeError(f"Failed to tokenize anchor text: {anchor_text}")
+                    anchor_token_ids.append(anchor_ids)
+                _ANCHOR_TOKEN_CACHE[cache_key] = anchor_token_ids
 
     for hist_idx in range(num_history):
         anchor_ids = anchor_token_ids[hist_idx]

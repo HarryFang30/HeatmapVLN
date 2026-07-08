@@ -834,9 +834,11 @@ class Qwen2_5VLIntegration(nn.Module):
 
         inner_model = getattr(self.model, "model", None) if skip_lm_head else None
         use_inner_model_for_skip = skip_lm_head and inner_model is not None
-        need_all_hidden_states = return_hidden_states or (
-            need_traj_hidden and not use_inner_model_for_skip
-        )
+        # TRAJ latent queries are read from the final sequence hidden states.
+        # Some Qwen2.5-VL wrappers do not expose ``last_hidden_state`` when the
+        # LM head is bypassed, so request hidden_states whenever TRAJ queries are
+        # present.  This still skips the expensive LM-head logits path.
+        need_all_hidden_states = return_hidden_states or need_traj_hidden
         fwd_kwargs = dict(
             **{k: v for k, v in inputs.items() if k != "labels"},
             output_hidden_states=need_all_hidden_states,
