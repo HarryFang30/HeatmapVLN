@@ -517,6 +517,34 @@ def _resolve_record_clip_idx(dataset: Any, rec: dict[str, Any]) -> int | None:
     return idx
 
 
+def _record_state_is_indexable(dataset: Any, rec: dict[str, Any]) -> bool:
+    clip_idx = _resolve_record_clip_idx(dataset, rec)
+    current_t = rec.get("current_t")
+    if clip_idx is None or current_t is None:
+        return False
+
+    clips = getattr(dataset, "clips", None)
+    if clips is not None and not (0 <= int(clip_idx) < len(clips)):
+        return False
+
+    valid_frames = getattr(dataset, "_clip_valid_frames", None)
+    if isinstance(valid_frames, dict):
+        frames = valid_frames.get(int(clip_idx))
+        if not frames:
+            return False
+        frame_sets = getattr(dataset, "_clip_valid_frame_sets", None)
+        if frame_sets is None:
+            frame_sets = {}
+            setattr(dataset, "_clip_valid_frame_sets", frame_sets)
+        frame_set = frame_sets.get(int(clip_idx))
+        if frame_set is None:
+            frame_set = set(int(frame) for frame in frames)
+            frame_sets[int(clip_idx)] = frame_set
+        return int(current_t) in frame_set
+
+    return True
+
+
 def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any]:
     """Load one tensor sidecar and require it to belong to the JSONL record."""
     path = rec.get("_tensor_path")
@@ -1139,6 +1167,9 @@ def _filter_records_with_pano_goals(
                 continue
             tensor_path = rec.get("_tensor_path")
             if not tensor_path:
+                invalid_native += 1
+                continue
+            if not _record_state_is_indexable(dataset, rec):
                 invalid_native += 1
                 continue
 
