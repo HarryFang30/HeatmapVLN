@@ -16,6 +16,7 @@ import ctypes
 import gc
 import logging
 import os
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ IGNORE_INDEX = -100
 from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
 
 _libc: ctypes.CDLL | None = None
+_TOKENIZER_LOCKS: dict[int, threading.RLock] = {}
+_TOKENIZER_LOCKS_GUARD = threading.Lock()
 
 
 def _get_libc() -> ctypes.CDLL | None:
@@ -51,6 +54,22 @@ def _malloc_trim():
     libc = _get_libc()
     if libc is not None:
         libc.malloc_trim(0)
+
+
+def _get_tokenizer_lock(tokenizer) -> threading.RLock:
+    # Hugging Face fast tokenizers wrap a Rust backend that is not re-entrant.
+    # Stage2 adapter prefetch may build batches on several Python threads in
+    # the same rank, so collators sharing a tokenizer must serialize tokenizer
+    # calls.  Key on the backend object when present so copied wrappers that
+    # still share the same backend also share the same lock.
+    backend = getattr(tokenizer, "_tokenizer", tokenizer)
+    key = id(backend)
+    with _TOKENIZER_LOCKS_GUARD:
+        lock = _TOKENIZER_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _TOKENIZER_LOCKS[key] = lock
+        return lock
 
 
 def _rss_mb() -> float:
@@ -102,6 +121,7 @@ class PanoramicTokenizedCollator:
         self.structured_pano_output = bool(structured_pano_output)
         self.build_sft_labels = bool(build_sft_labels)
         self._call_count = 0
+        self._tokenizer_lock = _get_tokenizer_lock(self.processor.tokenizer)
 
     @staticmethod
     def _stack_optional(batch: list[dict[str, Any]], key: str):
@@ -497,14 +517,15 @@ class PanoramicTokenizedCollator:
                 rss2 = _rss_mb()
 
             has_assistant = any(len(m) > 1 for m in messages_batch)
-            pano_inputs = self.processor.apply_chat_template(
-                messages_batch,
-                tokenize=True,
-                add_generation_prompt=not has_assistant,
-                return_dict=True,
-                return_tensors="pt",
-                padding=True,
-            )
+            with self._tokenizer_lock:
+                pano_inputs = self.processor.apply_chat_template(
+                    messages_batch,
+                    tokenize=True,
+                    add_generation_prompt=not has_assistant,
+                    return_dict=True,
+                    return_tensors="pt",
+                    padding=True,
+                )
             del messages_batch
 
             # Only warn when sequence exceeds max length (truncation is disabled).
@@ -545,11 +566,12 @@ class PanoramicTokenizedCollator:
                     )
 
             if self.sft_mode and self.build_sft_labels:
-                labels = self._build_sft_labels(
-                    pano_inputs["input_ids"],
-                    pano_inputs.get("attention_mask"),
-                    sft_target_texts,
-                )
+                with self._tokenizer_lock:
+                    labels = self._build_sft_labels(
+                        pano_inputs["input_ids"],
+                        pano_inputs.get("attention_mask"),
+                        sft_target_texts,
+                    )
                 if nq > 0:
                     # Labels were built after appending the TRAJ placeholders,
                     # so this is normally redundant.  Keep it explicit because
@@ -571,14 +593,15 @@ class PanoramicTokenizedCollator:
 
             pano_text_anchor_positions = None
             if not use_internnav:
-                pano_text_anchor_positions = [
-                    find_text_anchor_positions(
-                        pano_inputs["input_ids"][batch_idx:batch_idx + 1],
-                        self.processor.tokenizer,
-                        num_history=pano_num_histories[batch_idx],
-                    )
-                    for batch_idx in range(len(pano_num_histories))
-                ]
+                with self._tokenizer_lock:
+                    pano_text_anchor_positions = [
+                        find_text_anchor_positions(
+                            pano_inputs["input_ids"][batch_idx:batch_idx + 1],
+                            self.processor.tokenizer,
+                            num_history=pano_num_histories[batch_idx],
+                        )
+                        for batch_idx in range(len(pano_num_histories))
+                    ]
 
             result["pano_inputs"] = pano_inputs
             result["pano_num_histories"] = pano_num_histories

@@ -22,6 +22,7 @@ not by the integer dataset index.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -824,7 +825,17 @@ def _make_pano_collator(
     n_traj_query: int,
     *,
     sft_protocol: str = "direct",
+    clone_processor: bool = False,
 ) -> PanoramicTokenizedCollator:
+    if clone_processor:
+        try:
+            processor = copy.deepcopy(processor)
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to deepcopy Qwen processor for prefetch worker; "
+                "falling back to shared processor with tokenizer locking: %s",
+                exc,
+            )
     return PanoramicTokenizedCollator(
         processor,
         n_traj_query=n_traj_query,
@@ -1671,6 +1682,103 @@ def _record_batches(
     ]
 
 
+def _run_startup_prefetch_preflight(
+    *,
+    train_records: list[dict[str, Any]],
+    args: argparse.Namespace,
+    dataset: Any,
+    dataset_factory: Any | None,
+    collator: PanoramicTokenizedCollator,
+    processor: Any,
+    n_traj_query: int,
+    teacher_cache: NativeTeacherTargetCache | None,
+    rank: int,
+    world_size: int,
+    start_epoch: int,
+) -> None:
+    preflight_batches = max(0, int(getattr(args, "startup_preflight_batches", 0) or 0))
+    if preflight_batches <= 0:
+        return
+
+    epoch_records = _epoch_rank_records(
+        train_records,
+        seed=args.seed,
+        epoch=start_epoch,
+        rank=rank,
+        world_size=world_size,
+    )
+    record_batches = _record_batches(epoch_records, args.batch_size)[:preflight_batches]
+    if not record_batches:
+        raise RuntimeError(
+            f"Stage2 startup preflight found no rank-local batches on rank={rank}; "
+            f"train_records={len(train_records)} batch_size={args.batch_size}"
+        )
+
+    need_raw = args.teacher_target_mode == "native_sidecar" and float(args.raw_distill_weight) > 0
+    need_cond = args.teacher_target_mode == "native_sidecar" and float(args.cond_distill_weight) > 0
+    if rank == 0:
+        LOGGER.info(
+            "Running Stage2 startup preflight: batches=%d batch_size=%d "
+            "prefetch_batches=%d prefetch_workers=%d",
+            len(record_batches),
+            int(args.batch_size),
+            max(0, int(args.prefetch_batches)),
+            max(1, int(args.prefetch_workers)),
+        )
+
+    nonempty = 0
+    skipped = 0
+    t0 = time.perf_counter()
+    try:
+        for cpu_batch in _iter_prepared_cpu_batches(
+            record_batches,
+            dataset=dataset,
+            dataset_factory=dataset_factory,
+            collator=collator,
+            collator_factory=lambda: _make_pano_collator(
+                processor,
+                n_traj_query,
+                sft_protocol="direct",
+                clone_processor=True,
+            ),
+            teacher_target_mode=args.teacher_target_mode,
+            keep_samples=False,
+            need_raw=need_raw,
+            need_cond=need_cond,
+            teacher_cache=teacher_cache,
+            prefetch_batches=max(0, int(args.prefetch_batches)),
+            prefetch_workers=max(1, int(args.prefetch_workers)),
+        ):
+            if cpu_batch is None:
+                skipped += 1
+                continue
+            nonempty += 1
+            if "pano_inputs" not in cpu_batch.collated:
+                raise RuntimeError("Stage2 startup preflight produced a batch without pano_inputs")
+            if need_raw and cpu_batch.teacher_latents is None:
+                raise RuntimeError("Stage2 startup preflight expected native raw teacher latents")
+            if need_cond and cpu_batch.teacher_cond is None:
+                raise RuntimeError("Stage2 startup preflight expected native cond teacher latents")
+    except Exception as exc:
+        raise RuntimeError(
+            "Stage2 startup preflight failed while preparing CPU/prefetch batches. "
+            "This is a startup safety check; fix this before submitting a full run."
+        ) from exc
+
+    if nonempty == 0:
+        raise RuntimeError(
+            "Stage2 startup preflight prepared only empty batches; "
+            f"attempted={len(record_batches)} skipped={skipped}"
+        )
+    if rank == 0:
+        LOGGER.info(
+            "Stage2 startup preflight passed: nonempty_batches=%d skipped_batches=%d elapsed=%.1fs",
+            nonempty,
+            skipped,
+            time.perf_counter() - t0,
+        )
+
+
 def _records_for_rank_remaining_epochs(
     train_records: list[dict[str, Any]],
     *,
@@ -2133,6 +2241,7 @@ def _evaluate_adapter(
                 processor,
                 n_traj_query,
                 sft_protocol="direct",
+                clone_processor=True,
             ),
             teacher_target_mode=teacher_target_mode,
             keep_samples=keep_samples,
@@ -2238,6 +2347,7 @@ def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
     defaults["val_ratio"] = float(training.get("val_ratio", 0.1))
     defaults["prefetch_batches"] = int(training.get("prefetch_batches", 2))
     defaults["prefetch_workers"] = int(training.get("prefetch_workers", 1))
+    defaults["startup_preflight_batches"] = int(training.get("startup_preflight_batches", 0))
     defaults["teacher_cache_mode"] = str(training.get("teacher_cache_mode", "none"))
     defaults["teacher_cache_max_items"] = int(training.get("teacher_cache_max_items", 0))
     defaults["teacher_preload_cache"] = bool(training.get("teacher_preload_cache", False))
@@ -2351,6 +2461,16 @@ def _parse_args_with_config() -> argparse.Namespace:
         type=int,
         default=adapter_defaults.get("prefetch_workers", 1),
         help="Number of CPU workers preparing future batches when prefetch is enabled.",
+    )
+    p.add_argument(
+        "--startup-preflight-batches",
+        type=int,
+        default=adapter_defaults.get("startup_preflight_batches", 0),
+        help=(
+            "Prepare this many rank-local CPU batches with the real prefetch "
+            "settings before epoch 1. Catches tokenizer/dataset/sidecar "
+            "startup failures before the training loop."
+        ),
     )
     p.add_argument(
         "--teacher-cache-mode",
@@ -2714,6 +2834,22 @@ def main() -> int:
                 if _distributed_available():
                     dist.barrier()
 
+        _run_startup_prefetch_preflight(
+            train_records=train_records,
+            args=args,
+            dataset=dataset,
+            dataset_factory=make_prefetch_dataset,
+            collator=collator,
+            processor=processor,
+            n_traj_query=n_traj_query,
+            teacher_cache=teacher_cache,
+            rank=rank,
+            world_size=world_size,
+            start_epoch=start_epoch,
+        )
+        if _distributed_available():
+            dist.barrier()
+
         for epoch in range(start_epoch, args.epochs):
             epoch_records = _epoch_rank_records(
                 train_records,
@@ -2746,6 +2882,7 @@ def main() -> int:
                     processor,
                     n_traj_query,
                     sft_protocol="direct",
+                    clone_processor=True,
                 ),
                 teacher_target_mode=args.teacher_target_mode,
                 keep_samples=keep_samples,
