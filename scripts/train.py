@@ -101,6 +101,7 @@ from scripts.training import (
     _write_json,
     _write_yaml,
     apply_nextdit_warmup_freeze,
+    assert_complete_internnav_system1_load,
     assert_complete_lora_checkpoint_match,
     build_l2_sp_reference,
     build_model,
@@ -108,11 +109,13 @@ from scripts.training import (
     build_scheduler,
     cleanup_distributed,
     collate_fn,
+    extract_lora_checkpoint_state,
     init_distributed_context,
     initialize_trainable_module_sync,
     load_checkpoint_for_resume,
     load_config,
     make_grad_scaler,
+    run_training_preflight,
     safe_torch_load,
     set_seed,
     set_trainable_modules,
@@ -239,7 +242,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=None,
                         help='覆盖配置中的 epoch 数量')
     parser.add_argument('--dry-run', action='store_true',
-                        help='只构建模型和数据，不实际训练')
+                        help='执行一批完整训练 preflight（含 backward/DDP/optimizer），不保存 checkpoint')
     parser.add_argument('--max-batches', type=int, default=None,
                         help='每个 epoch 最多处理的 batch 数')
     parser.add_argument('--distributed', action='store_true',
@@ -254,6 +257,9 @@ def main():
                         help="覆盖 data.shm_bypass: auto/on/off")
 
     args = parser.parse_args()
+
+    if args.dry_run and (args.resume or args.auto_resume):
+        raise ValueError('--dry-run cannot be combined with --resume/--auto-resume')
 
     # 加载配置
     cfg = load_config(args.config)
@@ -281,7 +287,10 @@ def main():
     run_dir = None
     is_resuming = False
     if dist_context.is_main:
-        if args.auto_resume and latest_link.exists():
+        if args.dry_run:
+            run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_dir = base_out_dir / f'preflight_{run_timestamp}'
+        elif args.auto_resume and latest_link.exists():
             run_dir = latest_link.resolve() if latest_link.is_symlink() else latest_link
             if _find_resume_checkpoint(run_dir) is not None:
                 is_resuming = True
@@ -300,7 +309,8 @@ def main():
         is_resuming = bool(shared[1])
     elif run_dir is None:
         run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        run_dir = base_out_dir / f'run_{run_timestamp}'
+        run_prefix = 'preflight' if args.dry_run else 'run'
+        run_dir = base_out_dir / f'{run_prefix}_{run_timestamp}'
 
     manifest_dir = run_dir / 'manifest'
     logs_dir = run_dir / 'logs'
@@ -314,7 +324,8 @@ def main():
     if dist_context.is_main:
         for d in [manifest_dir, logs_dir, ckpt_dir, vis_train_dir, vis_val_dir, plots_dir]:
             d.mkdir(parents=True, exist_ok=True)
-        _safe_symlink(latest_link, run_dir.name)
+        if not args.dry_run:
+            _safe_symlink(latest_link, run_dir.name)
     _dist_barrier()
 
     logger = setup_logger(
@@ -343,7 +354,7 @@ def main():
         _append_jsonl(
             metrics_jsonl_path,
             {
-                "record_type": "run_start",
+                "record_type": "preflight_start" if args.dry_run else "run_start",
                 "run_name": run_dir.name,
                 "is_resuming": is_resuming,
                 "output_dir": str(run_dir),
@@ -456,6 +467,30 @@ def main():
     logger.info("🏗️  Building model...")
     model = build_model(cfg, verbose=dist_context.is_main)
 
+    nextdit_cfg = cfg.get('model', {}).get('action_head', {}).get('nextdit', {})
+    default_require_complete_system1 = bool(
+        stage_cfg.get('train_action', True)
+        and nextdit_cfg.get('enabled', False)
+        and (
+            nextdit_cfg.get('internnav_system1_path')
+            or nextdit_cfg.get('internnav_model_path')
+        )
+    )
+    require_complete_system1 = stage_cfg.get(
+        'require_complete_internnav_system1',
+        default_require_complete_system1,
+    )
+    if require_complete_system1 is None:
+        require_complete_system1 = default_require_complete_system1
+    system1_required_tensors = 0
+    system1_source = None
+    if require_complete_system1:
+        system1_required_tensors = assert_complete_internnav_system1_load(
+            model,
+            logger=logger,
+        )
+        system1_source = model._internnav_system1_load_audit.get('source')
+
     # 创建检查点管理器
     ckpt_manager = CheckpointManager(
         out_dir=str(ckpt_dir),
@@ -507,7 +542,7 @@ def main():
     )
     if requires_base_checkpoint and not args.load_weights:
         raise ValueError(
-            "Bridge-only training requires the Stage1-S2 panoramic System2 SFT checkpoint. "
+            "This training stage requires the Stage1-S2 panoramic System2 SFT checkpoint. "
             "Pass it with --load-weights so the frozen panoramic LoRA/System2 base "
             "is loaded before the bridge checkpoint."
         )
@@ -521,13 +556,7 @@ def main():
     logger.info(f"   Epochs: {total_epochs}, Heatmap Size: {stage_cfg['hm_size']}")
     logger.info("=" * 60)
 
-    if args.dry_run:
-        logger.info("=" * 60)
-        logger.info("🧪 Dry run 模式：模型和数据构建成功")
-        logger.info("=" * 60)
-        return
-
-    if notifier:
+    if notifier and not args.dry_run:
         try:
             sent = notifier.send_training_start(
                 config_name=Path(args.config).stem,
@@ -728,6 +757,7 @@ def main():
         logger.info("🔄 Constructing HeatmapVLN before optimizer setup...")
         raw_model._ensure_heatmap_vln()
 
+    matched_lora_tensors = 0
     if args.load_weights:
         weights_path = Path(args.load_weights)
         if weights_path.exists():
@@ -737,16 +767,35 @@ def main():
             loaded_count = 0
             if state_dict:
                 if requires_base_checkpoint:
-                    matched_lora = assert_complete_lora_checkpoint_match(
+                    matched_lora_tensors = assert_complete_lora_checkpoint_match(
                         raw_model,
                         state_dict,
                         checkpoint_path=str(weights_path),
                     )
-                    logger.info(f"  ✓ Verified complete LoRA load: {matched_lora} tensors")
-                missing, unexpected, loaded_count = _load_normalized_state_dict(raw_model, state_dict)
+                    logger.info(
+                        "  ✓ Verified complete LoRA checkpoint match: %d tensors",
+                        matched_lora_tensors,
+                    )
+                state_to_load = state_dict
+                if stage_cfg.get('base_checkpoint_lora_only', False):
+                    state_to_load = extract_lora_checkpoint_state(state_dict)
+                    if not state_to_load:
+                        raise RuntimeError(
+                            f'Base checkpoint contains no LoRA tensors: {weights_path}'
+                        )
+                    logger.info(
+                        '  🔒 Base checkpoint LoRA-only guard: loading %d/%d tensors; '
+                        'InternNav System1 and adapter weights cannot be overwritten',
+                        len(state_to_load),
+                        len(state_dict),
+                    )
+                missing, unexpected, loaded_count = _load_normalized_state_dict(
+                    raw_model,
+                    state_to_load,
+                )
                 logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
-                if loaded_count < len(state_dict):
-                    logger.warning(f"  ⚠ Only {loaded_count}/{len(state_dict)} checkpoint params matched!")
+                if loaded_count < len(state_to_load):
+                    logger.warning(f"  ⚠ Only {loaded_count}/{len(state_to_load)} checkpoint params matched!")
                 if missing:
                     logger.info(f"  Missing keys (in model but not checkpoint): {len(missing)}")
                 if unexpected:
@@ -755,7 +804,7 @@ def main():
                 logger.warning(f"⚠ No trainable_state_dict found in {weights_path}")
             if requires_base_checkpoint and loaded_count == 0:
                 raise RuntimeError(
-                    "Bridge-only training did not load any parameters from the Stage1-S2 "
+                    "Training stage did not load any parameters from the Stage1-S2 "
                     f"base checkpoint: {weights_path}"
                 )
             del ckpt
@@ -788,8 +837,19 @@ def main():
     nextdit_warmup_steps = apply_nextdit_warmup_freeze(raw_model, cfg, logger)
 
     grad_accum_steps = cfg['optim'].get('grad_accum_steps', 1)
-    total_batches = len(train_loader) * total_epochs
+    batches_per_epoch = len(train_loader)
+    if batches_per_epoch < 1:
+        raise RuntimeError(
+            'Training DataLoader has zero full batches. Increase the dataset size '
+            'or reduce optim.batch_size/world_size.'
+        )
+    total_batches = batches_per_epoch * total_epochs
     total_steps = total_batches // grad_accum_steps
+    if total_steps < 1:
+        raise RuntimeError(
+            'Training schedule has zero optimizer steps. Reduce '
+            'optim.grad_accum_steps or increase the number of batches.'
+        )
     scheduler = build_scheduler(optimizer, cfg, total_steps)
     amp_type = cfg['optim'].get('amp', 'bf16')
     scaler = make_grad_scaler(dist_context.device, amp_type)
@@ -872,9 +932,6 @@ def main():
     ema = EMAModel(raw_model, decay=ema_decay, warmup_steps=ema_warmup)
     logger.info(f"📐 EMA enabled: decay={ema_decay}, warmup_steps={ema_warmup}")
 
-    timer = TrainingTimer(total_epochs=total_epochs)
-    timer.start()
-
     log_cfg = cfg.get('log', {})
     page_cache_drop_enabled = bool(log_cfg.get('page_cache_drop_enabled', True))
     page_cache_drop_threshold = float(log_cfg.get('page_cache_drop_threshold', 0.80))
@@ -884,6 +941,84 @@ def main():
     if cfg['log'].get('show_gpu_memory', False):
         cg_init = _cgroup_mem_usage_gb()
         logger.info(f"  cgroup memory after initial page cache drop: {cg_init:.1f}/{_CG_LIMIT_GB:.0f}GB")
+
+    if args.dry_run:
+        logger.info("=" * 80)
+        logger.info("🧪 REAL TRAINING PREFLIGHT: no checkpoint will be saved")
+        logger.info("=" * 80)
+        preflight_metrics = run_training_preflight(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            cfg,
+            logger,
+            stage_name=stage_name,
+            stage_cfg=stage_cfg,
+            train_dataset=train_dataset,
+            train_sampler=train_sampler,
+            gpu_heatmap_computer=gpu_heatmap_computer,
+            gpu_has_depth=gpu_has_depth,
+            gpu_depth_normalized=gpu_depth_normalized,
+            ema=ema,
+            total_train_steps=total_steps,
+            dist_context=dist_context,
+            nextdit_warmup_steps=nextdit_warmup_steps,
+            l2_sp_reference=l2_sp_reference,
+        )
+        _dist_barrier()
+        if dist_context.is_main:
+            checkpoint_files = sorted(
+                str(path.relative_to(run_dir))
+                for path in ckpt_dir.rglob('*')
+                if path.is_file()
+            )
+            if checkpoint_files:
+                raise RuntimeError(
+                    'Dry-run preflight unexpectedly wrote checkpoint files: '
+                    f'{checkpoint_files}'
+                )
+            preflight_record = {
+                'record_type': 'preflight_pass',
+                'status': 'passed',
+                'stage': stage_name,
+                'world_size': dist_context.world_size,
+                'batch_size_per_rank': cfg['optim']['batch_size'],
+                'global_batch_size': cfg['optim']['batch_size'] * dist_context.world_size,
+                'num_workers_per_rank': num_workers,
+                'prefetch_factor': prefetch_factor,
+                'system1_source': system1_source,
+                'system1_required_tensors': system1_required_tensors,
+                'matched_lora_tensors': matched_lora_tensors,
+                'base_checkpoint_lora_only': bool(
+                    stage_cfg.get('base_checkpoint_lora_only', False)
+                ),
+                'metrics': preflight_metrics,
+                'peak_gpu_memory_gb_rank0': (
+                    torch.cuda.max_memory_allocated(dist_context.device) / 1024**3
+                    if dist_context.device.type == 'cuda'
+                    else 0.0
+                ),
+                'checkpoint_files': checkpoint_files,
+            }
+            _write_json(manifest_dir / 'preflight.json', preflight_record)
+            _append_jsonl(metrics_jsonl_path, preflight_record)
+            logger.info(
+                '✅ REAL TRAINING PREFLIGHT PASSED: System1=%d tensors, LoRA=%d tensors, '
+                'optimizer_steps=1, checkpoint_files=0',
+                system1_required_tensors,
+                matched_lora_tensors,
+            )
+            logger.info('   Report: %s', manifest_dir / 'preflight.json')
+        _dist_barrier()
+        if tb_writer is not None:
+            tb_writer.close()
+        cleanup_distributed()
+        return
+
+    timer = TrainingTimer(total_epochs=total_epochs)
+    timer.start()
 
     for epoch in range(start_epoch, total_epochs + 1):
         timer.start_epoch()

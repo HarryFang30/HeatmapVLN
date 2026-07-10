@@ -349,6 +349,8 @@ class TrainingStageConfig(_Lenient):
     strict_trainable_modules: bool = False
     bridge_only: bool = False
     requires_base_checkpoint: bool = False
+    require_complete_internnav_system1: bool | None = None
+    base_checkpoint_lora_only: bool = False
     sft_include_turns: bool | None = None
     sft_include_forward: bool | None = None
     system2_sft_protocol: str | None = None

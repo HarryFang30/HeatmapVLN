@@ -149,6 +149,10 @@ training:
       bridge_only: false
       strict_trainable_modules: true
       requires_base_checkpoint: true
+      require_complete_internnav_system1: true
+      # Stage1-S2 may also contain heatmap/bridge tensors. Stage3 must import
+      # only its all-layer Qwen LoRA so InternNav System1 remains untouched.
+      base_checkpoint_lora_only: true
       trainable_modules:
         - pano_latent_adapter
       frozen_modules:

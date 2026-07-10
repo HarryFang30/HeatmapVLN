@@ -13,6 +13,16 @@ from src.models.runtime_compat import ensure_transformers_runtime_compat
 
 logger = logging.getLogger(__name__)
 
+_INTERNNAV_SYSTEM1_REQUIRED_PREFIXES = (
+    'cond_projector.',
+    'traj_dit.',
+    'memory_encoder.',
+    'rgb_model.',
+    'rgb_resampler.',
+    'action_encoder.',
+    'action_decoder.',
+)
+
 
 def build_model(
     cfg: dict,
@@ -165,6 +175,63 @@ def build_model(
             logger.info("   System1 pretrained → %s", s1_ckpt)
 
     return model
+
+
+def assert_complete_internnav_system1_load(
+    model: VLNPipeline,
+    *,
+    logger: logging.Logger | None = None,
+) -> int:
+    """Refuse to use a partially initialized InternNav System1.
+
+    ``VLNPipeline`` records every shape-compatible tensor copied from the
+    released InternNav checkpoint.  Compare that audit against the complete
+    local System1 state before any of those modules are frozen for training.
+    """
+    target_logger = logger or logging.getLogger(__name__)
+    head = getattr(model, 'nextdit_action_head', None)
+    audit = getattr(model, '_internnav_system1_load_audit', None)
+    if head is None:
+        raise RuntimeError('Model has no NextDiT action head')
+    if not isinstance(audit, dict):
+        raise RuntimeError(
+            'InternNav System1 weights were not loaded. Configure '
+            'model.action_head.nextdit.internnav_model_path with the released '
+            'InternNav model directory.'
+        )
+
+    head_keys = set(head.state_dict())
+    missing_modules = [
+        prefix.removesuffix('.')
+        for prefix in _INTERNNAV_SYSTEM1_REQUIRED_PREFIXES
+        if not any(key.startswith(prefix) for key in head_keys)
+    ]
+    required_keys = {
+        key
+        for key in head_keys
+        if key.startswith(_INTERNNAV_SYSTEM1_REQUIRED_PREFIXES)
+    }
+    loaded_keys = set(audit.get('loaded_keys') or ())
+    missing_keys = sorted(required_keys - loaded_keys)
+    latent_queries_loaded = bool(audit.get('latent_queries_loaded', False))
+
+    if missing_modules or not required_keys or not latent_queries_loaded or missing_keys:
+        missing_preview = ', '.join(missing_keys[:10])
+        raise RuntimeError(
+            'InternNav System1 load is incomplete; refusing to freeze random or '
+            'partially initialized weights. '
+            f"source={audit.get('source', '<unknown>')} "
+            f'latent_queries_loaded={latent_queries_loaded} '
+            f'missing_modules={missing_modules} missing_required={len(missing_keys)}'
+            + (f' first_missing=[{missing_preview}]' if missing_preview else '')
+        )
+
+    target_logger.info(
+        'Verified complete frozen InternNav System1 load from %s: %d required tensors + latent_queries',
+        audit.get('source', '<unknown>'),
+        len(required_keys),
+    )
+    return len(required_keys)
 
 
 # ---------------------------------------------------------------------------

@@ -271,7 +271,7 @@ fi
 case "${STAGE3_DRY_RUN,,}" in
   1|true|yes|y|on)
     train_args+=(--dry-run)
-    echo "[launcher] dry-run enabled"
+    echo "[launcher] real dry-run preflight enabled: one full forward/backward/DDP/optimizer batch, no checkpoint"
     ;;
 esac
 

@@ -51,6 +51,7 @@ from .utils import (
     build_l2_sp_reference,
     build_heatmap_loss_fn,
     compute_l2_sp_loss,
+    extract_lora_checkpoint_state,
     load_config,
     make_autocast_context,
     make_grad_scaler,
@@ -80,6 +81,7 @@ _LAZY_MODULES = {
     "_EMAContext": "ema",
     # model_builder.py
     "apply_nextdit_warmup_freeze": "model_builder",
+    "assert_complete_internnav_system1_load": "model_builder",
     "build_model": "model_builder",
     "end_nextdit_warmup": "model_builder",
     "freeze_module": "model_builder",
@@ -88,6 +90,8 @@ _LAZY_MODULES = {
     "build_optimizer": "optimizer",
     "build_scheduler": "optimizer",
     "get_heatmap_temperature": "optimizer",
+    # preflight.py
+    "run_training_preflight": "preflight",
     # plotter.py
     "TrainingPlotter": "plotter",
     # timer.py

@@ -2,10 +2,9 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import scripts.training.train_pano_latent_adapter as train_adapter
 import torch
 import torch.nn as nn
-
-import scripts.training.train_pano_latent_adapter as train_adapter
 from scripts.training.train_pano_latent_adapter import (
     _assert_internnav_system1_loaded,
     _build_batch,
@@ -53,6 +52,14 @@ def test_assert_internnav_system1_loaded_rejects_missing_frozen_tensor():
     )
 
     with pytest.raises(RuntimeError, match="missing_required=1"):
+        _assert_internnav_system1_loaded(model)
+
+
+def test_assert_internnav_system1_loaded_rejects_missing_latent_queries():
+    model = _fake_loaded_model()
+    model._internnav_system1_load_audit['latent_queries_loaded'] = False
+
+    with pytest.raises(RuntimeError, match='latent_queries_loaded=False'):
         _assert_internnav_system1_loaded(model)
 
 

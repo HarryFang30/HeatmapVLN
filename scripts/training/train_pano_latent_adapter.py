@@ -50,18 +50,22 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel
-from torch.nn.utils import clip_grad_norm_
-from tqdm import tqdm
-
-from scripts.training.model_builder import build_model
+from scripts.training.model_builder import (
+    assert_complete_internnav_system1_load,
+    build_model,
+)
 from scripts.training.utils import (
     _load_normalized_state_dict,
     _normalize_state_key,
     assert_complete_lora_checkpoint_match,
+    extract_lora_checkpoint_state,
     load_config,
     safe_torch_load,
 )
+from torch.nn.parallel import DistributedDataParallel
+from torch.nn.utils import clip_grad_norm_
+from tqdm import tqdm
+
 from src.data.factory import build_trajectory_dataset
 from src.data.pano_teacher_alignment import (
     compute_aligned_teacher_latents_3584_batch,
@@ -75,15 +79,6 @@ from src.models.adapters import (
 )
 
 LOGGER = logging.getLogger("pano_latent_adapter")
-REQUIRED_SYSTEM1_PREFIXES = (
-    "cond_projector.",
-    "traj_dit.",
-    "memory_encoder.",
-    "rgb_model.",
-    "rgb_resampler.",
-    "action_encoder.",
-    "action_decoder.",
-)
 
 
 @dataclass
@@ -311,37 +306,8 @@ def _extract_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
 
 
 def _assert_internnav_system1_loaded(model: Any) -> None:
-    """Require the frozen local System1 port to come entirely from InternNav."""
-    head = getattr(model, "nextdit_action_head", None)
-    audit = getattr(model, "_internnav_system1_load_audit", None)
-    if head is None:
-        raise RuntimeError("Model has no NextDiT action head")
-    if not audit:
-        raise RuntimeError(
-            "InternNav System1 weights were not loaded. Set --internnav-model-path "
-            "to the released InternNav model directory."
-        )
-
-    loaded_keys = set(audit["loaded_keys"])
-    required_keys = {
-        key
-        for key in head.state_dict()
-        if key.startswith(REQUIRED_SYSTEM1_PREFIXES)
-    }
-    missing_keys = sorted(required_keys - loaded_keys)
-    if not audit["latent_queries_loaded"] or missing_keys:
-        missing_preview = ", ".join(missing_keys[:10])
-        raise RuntimeError(
-            "InternNav System1 load is incomplete; refusing to freeze random weights. "
-            f"source={audit['source']} latent_queries_loaded={audit['latent_queries_loaded']} "
-            f"missing_required={len(missing_keys)}"
-            + (f" first_missing=[{missing_preview}]" if missing_preview else "")
-        )
-    LOGGER.info(
-        "Verified complete frozen InternNav System1 load from %s: %d required tensors + latent_queries",
-        audit["source"],
-        len(required_keys),
-    )
+    """Backward-compatible Stage2 entrypoint for the shared assertion."""
+    assert_complete_internnav_system1_load(model, logger=LOGGER)
 
 
 def _compatible_lora_checkpoint_keys(
@@ -364,11 +330,7 @@ def _compatible_lora_checkpoint_keys(
 def _lora_checkpoint_state(
     state: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    return {
-        name: value
-        for name, value in state.items()
-        if "lora_" in _normalize_state_key(name)
-    }
+    return extract_lora_checkpoint_state(state)
 
 
 def _load_student_model(cfg: dict[str, Any], args: argparse.Namespace, device: torch.device):
@@ -1631,6 +1593,20 @@ def _reduce_metrics(
     return {key: float(tensor[i].item() / total_count) for i, key in enumerate(keys)}
 
 
+def _validate_prefiltered_record_indices(
+    batch_records: list[dict[str, Any]],
+    dataset: Any,
+) -> None:
+    for rec in batch_records:
+        idx = int(rec['dataset_index'])
+        if (idx < 0 or idx >= len(dataset)) and (
+            rec.get('clip_idx') is None or rec.get('current_t') is None
+        ):
+            raise RuntimeError(
+                f'Out-of-range dataset_index={idx} without clip/frame fallback after prefilter'
+            )
+
+
 def _build_batch(
     batch_records: list[dict[str, Any]],
     *,
@@ -1646,6 +1622,7 @@ def _build_batch(
     collator: PanoramicTokenizedCollator | None = None,
     teacher_cache: NativeTeacherTargetCache | None = None,
 ) -> AdapterTrainBatch:
+    _validate_prefiltered_record_indices(batch_records, dataset)
     if collator is None:
         collator = _make_pano_collator(
             processor,
@@ -2013,17 +1990,12 @@ def _prepare_batch_cpu(
     need_cond: bool = True,
     teacher_cache: NativeTeacherTargetCache | None = None,
 ) -> AdapterCpuBatch | None:
+    _validate_prefiltered_record_indices(batch_records, dataset)
     batch_samples: list[dict[str, Any]] = []
     usable_records: list[dict[str, Any]] = []
     skipped_records = 0
     for rec in batch_records:
         idx = int(rec["dataset_index"])
-        if (idx < 0 or idx >= len(dataset)) and (
-            rec.get("clip_idx") is None or rec.get("current_t") is None
-        ):
-            raise RuntimeError(
-                f"Out-of-range dataset_index={idx} without clip/frame fallback after prefilter"
-            )
         sample = _sample_from_record(dataset, rec)
         if not _has_trainable_pano_goal(sample):
             if teacher_target_mode == "native_sidecar":

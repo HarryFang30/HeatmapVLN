@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+if TYPE_CHECKING:
+    from src.models.heatmap import HeatmapVLNLoss
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,17 @@ def _normalize_state_key(name: str) -> str:
             return new_prefix + name[len(old_prefix):]
 
     return name
+
+
+def extract_lora_checkpoint_state(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Return only LoRA tensors, preserving their original checkpoint keys."""
+    return {
+        name: value
+        for name, value in state_dict.items()
+        if 'lora_' in _normalize_state_key(name)
+    }
 
 
 def _normalized_model_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
