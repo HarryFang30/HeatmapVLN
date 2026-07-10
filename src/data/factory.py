@@ -8,7 +8,11 @@ evaluation scripts, and visualization scripts.
 from __future__ import annotations
 
 import logging
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
+
+if TYPE_CHECKING:
+    from .sliding_window_dataset import VLNSlidingWindowDataset
+    from .trajectory_dataset import VLNTrajectoryDataset
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +89,7 @@ def build_trajectory_dataset(
         enable_augmentation=traj_cfg.get("enable_augmentation", True),
         enable_trajectory_augmentation=traj_cfg.get("enable_trajectory_augmentation", True),
         load_traj_images=traj_cfg.get("load_traj_images", False),
+        load_history_frames=traj_cfg.get("load_history_frames", True),
         traj_image_size=tuple(traj_cfg.get("traj_image_size", [224, 224])),
         compute_pixel_goal=traj_cfg.get("compute_pixel_goal", False),
         load_lookdown_for_system2=traj_cfg.get(

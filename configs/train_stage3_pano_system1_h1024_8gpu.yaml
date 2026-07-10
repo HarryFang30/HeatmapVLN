@@ -43,6 +43,9 @@ data:
     min_history: 5
     num_history_sample: 8
     panoramic_vlm_input: true
+    # Pano history already contains the front view. Avoid loading the same eight
+    # front frames a second time for the unused legacy video_frames argument.
+    load_history_frames: false
     load_depth: true
     cache_poses: true
     sample_stride: 2
@@ -101,6 +104,11 @@ model:
     lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
     lora_dropout: 0.05
+    # Frozen Stage3 Qwen only needs the final TRAJ states. Inference mode plus a
+    # normal clone keeps adapter backprop valid without retaining Qwen autograd
+    # metadata or all 28 layer outputs.
+    frozen_traj_inference_mode: true
+    traj_last_hidden_state_only: true
 
   heatmap:
     enable: false
@@ -153,6 +161,12 @@ training:
       # Stage1-S2 may also contain heatmap/bridge tensors. Stage3 must import
       # only its all-layer Qwen LoRA so InternNav System1 remains untouched.
       base_checkpoint_lora_only: true
+      # LoRA is frozen in Stage3, so merge its 224 tensors into Qwen once after
+      # checkpoint validation and remove the per-projection low-rank matmuls.
+      merge_frozen_lora: true
+      retain_raw_panoramic_views: false
+      compute_pano_text_anchor_positions: false
+      retain_history_rel_poses: false
       trainable_modules:
         - pano_latent_adapter
       frozen_modules:

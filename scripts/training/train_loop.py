@@ -337,7 +337,9 @@ def train_one_epoch(
             history_rel_poses = batch.get('history_rel_poses')
             if history_rel_poses is not None:
                 history_rel_poses = history_rel_poses.to(device, non_blocking=True)
-            if panoramic_inputs_batch is not None and not train_action:
+            if panoramic_inputs_batch is not None:
+                # Worker-tokenized Qwen inputs already contain every panorama.
+                # The pipeline only needs this tensor for batch/shape metadata.
                 video_frames = current_frame.unsqueeze(1)
             else:
                 # Pre-allocate to avoid implicit copy from torch.cat on

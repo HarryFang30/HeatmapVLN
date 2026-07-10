@@ -71,6 +71,8 @@ def build_model(
         llm_enable_compile=llm_cfg.get('enable_compile', False),
         llm_compile_mode=llm_cfg.get('compile_mode', 'reduce-overhead'),
         llm_compile_backend=llm_cfg.get('compile_backend', 'inductor'),
+        llm_frozen_traj_inference_mode=llm_cfg.get('frozen_traj_inference_mode', False),
+        llm_traj_last_hidden_state_only=llm_cfg.get('traj_last_hidden_state_only', False),
 
         enable_packing=llm_cfg.get('enable_packing', False),
         max_seq_length=llm_cfg.get('max_seq_length', 4096),

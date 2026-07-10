@@ -200,3 +200,35 @@ def test_panoramic_sft_collator_structured_pano_stop_and_turn():
         _sample(discrete_action=2, pano_view_id="view_turn", pano_sample_kind="turn"),
     ])
     assert out["sft_target_text"] == [["view: stop"], ["view: turn"]]
+
+
+def test_stage3_lean_collator_drops_only_unused_raw_inputs():
+    sample = _sample(
+        pano_view_id='front',
+        pano_pixel_goal=[12, 34],
+        pano_sample_kind='pixel',
+    )
+    sample['history_rel_poses'] = torch.zeros(1, 4)
+    sample['trajectory'] = torch.zeros(12, 32, 3)
+    sample['trajectory_valid'] = torch.ones(12)
+    sample['traj_images'] = torch.zeros(12, 2, 2, 3)
+    collator = PanoramicTokenizedCollator(
+        _FakeProcessor(),
+        n_traj_query=4,
+        sft_mode=True,
+        build_sft_labels=False,
+        include_heatmap_targets=False,
+        include_history_rel_poses=False,
+        retain_raw_panoramic_views=False,
+        compute_pano_text_anchor_positions=False,
+    )
+
+    out = collator([sample])
+
+    assert 'heatmap' not in out
+    assert 'history_rel_poses' not in out
+    assert 'current_views' not in out
+    assert out['pano_text_anchor_positions'] is None
+    assert out['pano_inputs']['input_ids'].shape[1] >= 4
+    assert out['trajectory'].shape == (1, 12, 32, 3)
+    assert out['traj_images'].shape == (1, 12, 2, 2, 3)

@@ -78,6 +78,7 @@ class TrajectoryConfig(_Lenient):
     enable_augmentation: bool = True
     enable_trajectory_augmentation: bool = True
     load_traj_images: bool = False
+    load_history_frames: bool = True
     traj_image_size: list[int] = [224, 224]
     compute_pixel_goal: bool = False
     compute_pano_view_pixel_goal: bool | None = None
@@ -219,6 +220,8 @@ class LLMConfig(_Lenient):
     lora_layer_indices: list[int] | None = None
     lora_dropout: float = 0.05
     lora_target_modules: list[str] | None = None
+    frozen_traj_inference_mode: bool = False
+    traj_last_hidden_state_only: bool = False
 
 
 class HeatmapTrajectoryConfig(_Lenient):
@@ -351,6 +354,10 @@ class TrainingStageConfig(_Lenient):
     requires_base_checkpoint: bool = False
     require_complete_internnav_system1: bool | None = None
     base_checkpoint_lora_only: bool = False
+    merge_frozen_lora: bool = False
+    retain_raw_panoramic_views: bool = True
+    compute_pano_text_anchor_positions: bool = True
+    retain_history_rel_poses: bool = True
     sft_include_turns: bool | None = None
     sft_include_forward: bool | None = None
     system2_sft_protocol: str | None = None

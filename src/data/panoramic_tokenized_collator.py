@@ -104,6 +104,10 @@ class PanoramicTokenizedCollator:
         structured_pano_output: bool = True,
         build_sft_labels: bool = True,
         max_seq_length: int = 8192,
+        include_heatmap_targets: bool = True,
+        include_history_rel_poses: bool = True,
+        retain_raw_panoramic_views: bool = True,
+        compute_pano_text_anchor_positions: bool = True,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -120,6 +124,10 @@ class PanoramicTokenizedCollator:
             raise ValueError(f"Unsupported System2 SFT protocol: {sft_protocol}")
         self.structured_pano_output = bool(structured_pano_output)
         self.build_sft_labels = bool(build_sft_labels)
+        self.include_heatmap_targets = bool(include_heatmap_targets)
+        self.include_history_rel_poses = bool(include_history_rel_poses)
+        self.retain_raw_panoramic_views = bool(retain_raw_panoramic_views)
+        self.compute_pano_text_anchor_positions = bool(compute_pano_text_anchor_positions)
         self._call_count = 0
         self._tokenizer_lock = _get_tokenizer_lock(self.processor.tokenizer)
 
@@ -395,7 +403,8 @@ class PanoramicTokenizedCollator:
 
         result = self._stack_padded_history_frames(batch)
         result["current_frame"] = torch.stack([sample["current_frame"] for sample in batch], dim=0)
-        result["heatmap"] = self._stack_padded_first_dim(batch, "heatmap")
+        if self.include_heatmap_targets:
+            result["heatmap"] = self._stack_padded_first_dim(batch, "heatmap")
         result["action"] = torch.stack([sample["action"] for sample in batch], dim=0)
         result["action_valid"] = torch.tensor([sample["action_valid"] for sample in batch])
         result["discrete_action"] = torch.tensor([sample.get("discrete_action", 1) for sample in batch])
@@ -414,7 +423,7 @@ class PanoramicTokenizedCollator:
             else:
                 result["trajectory_valid"] = torch.tensor(trajectory_valid)
             result["progress"] = torch.tensor([sample.get("progress", 0.0) for sample in batch])
-        if "history_rel_poses" in batch[0]:
+        if self.include_history_rel_poses and "history_rel_poses" in batch[0]:
             result["history_rel_poses"] = self._stack_padded_first_dim(batch, "history_rel_poses")
         if "traj_images" in batch[0]:
             result["traj_images"] = torch.stack([sample["traj_images"] for sample in batch], dim=0)
@@ -508,7 +517,11 @@ class PanoramicTokenizedCollator:
                         sft_target_texts.append(assistant_texts)
                     pano_num_histories.append(len(history_panoramas_list))
 
-                result["current_views"] = torch.stack([sample["current_views"] for sample in batch], dim=0)
+                if self.retain_raw_panoramic_views:
+                    result["current_views"] = torch.stack(
+                        [sample["current_views"] for sample in batch],
+                        dim=0,
+                    )
 
             for sample in batch:
                 sample.clear()
@@ -592,7 +605,7 @@ class PanoramicTokenizedCollator:
                 result["sft_target_text"] = sft_target_texts
 
             pano_text_anchor_positions = None
-            if not use_internnav:
+            if not use_internnav and self.compute_pano_text_anchor_positions:
                 with self._tokenizer_lock:
                     pano_text_anchor_positions = [
                         find_text_anchor_positions(

@@ -69,6 +69,8 @@ class VLNPipelineConfig:
     llm_enable_compile: bool = False
     llm_compile_mode: str = "reduce-overhead"
     llm_compile_backend: str = "inductor"
+    llm_frozen_traj_inference_mode: bool = False
+    llm_traj_last_hidden_state_only: bool = False
 
     # Sequence packing configuration (currently disabled on the shared stack)
     enable_packing: bool = False
@@ -177,6 +179,8 @@ class VLNPipeline(nn.Module):
             enable_compile=config.llm_enable_compile,
             compile_mode=config.llm_compile_mode,
             compile_backend=config.llm_compile_backend,
+            frozen_traj_inference_mode=config.llm_frozen_traj_inference_mode,
+            traj_last_hidden_state_only=config.llm_traj_last_hidden_state_only,
             enable_packing=config.enable_packing,
             max_seq_length=config.max_seq_length,
             spatial_merge_size=config.spatial_merge_size,

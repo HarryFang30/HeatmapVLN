@@ -654,12 +654,33 @@ def main():
             sft_protocol=sft_protocol,
             build_sft_labels=train_lm,
             max_seq_length=max_seq_len,
+            include_heatmap_targets=stage_uses_heatmap_targets,
+            include_history_rel_poses=stage_cfg.get(
+                'retain_history_rel_poses',
+                stage_uses_heatmap_targets,
+            ),
+            retain_raw_panoramic_views=stage_cfg.get(
+                'retain_raw_panoramic_views',
+                True,
+            ),
+            compute_pano_text_anchor_positions=stage_cfg.get(
+                'compute_pano_text_anchor_positions',
+                True,
+            ),
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled "
             "(n_traj_query=%d, sft_mode=%s, build_sft_labels=%s, return_lm_loss=%s, "
-            "protocol=%s, max_seq_len=%d)",
-            n_traj_query, sft_prompt_mode, train_lm, train_lm, sft_protocol, max_seq_len,
+            "protocol=%s, max_seq_len=%d, heatmap_targets=%s, raw_pano=%s, anchors=%s)",
+            n_traj_query,
+            sft_prompt_mode,
+            train_lm,
+            train_lm,
+            sft_protocol,
+            max_seq_len,
+            stage_uses_heatmap_targets,
+            stage_cfg.get('retain_raw_panoramic_views', True),
+            stage_cfg.get('compute_pano_text_anchor_positions', True),
         )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")
@@ -758,6 +779,7 @@ def main():
         raw_model._ensure_heatmap_vln()
 
     matched_lora_tensors = 0
+    merged_lora_tensors = 0
     if args.load_weights:
         weights_path = Path(args.load_weights)
         if weights_path.exists():
@@ -811,6 +833,25 @@ def main():
             torch.cuda.empty_cache()
         else:
             raise FileNotFoundError(f"Weights file not found: {weights_path}")
+
+    if stage_cfg.get('merge_frozen_lora', False):
+        trainable_names = set(stage_cfg.get('trainable_modules', []))
+        if trainable_names & {'lora', 'vlm_lora'}:
+            raise RuntimeError(
+                'merge_frozen_lora cannot be enabled when LoRA is trainable'
+            )
+        merge_lora = getattr(vlm_backbone, 'merge_lora_for_frozen_forward', None)
+        if not callable(merge_lora):
+            raise RuntimeError(
+                'merge_frozen_lora requested but the VLM backbone does not '
+                'provide merge_lora_for_frozen_forward'
+            )
+        merged_lora_tensors = merge_lora(safe_merge=True)
+        logger.info(
+            '  ✓ Stage3 frozen-Qwen optimization: merged %d LoRA tensors',
+            merged_lora_tensors,
+        )
+        torch.cuda.empty_cache()
 
     # 设置可训练模块
     logger.info("🔧 Setting trainable modules...")
@@ -991,6 +1032,7 @@ def main():
                 'system1_source': system1_source,
                 'system1_required_tensors': system1_required_tensors,
                 'matched_lora_tensors': matched_lora_tensors,
+                'merged_lora_tensors': merged_lora_tensors,
                 'base_checkpoint_lora_only': bool(
                     stage_cfg.get('base_checkpoint_lora_only', False)
                 ),
@@ -1005,10 +1047,12 @@ def main():
             _write_json(manifest_dir / 'preflight.json', preflight_record)
             _append_jsonl(metrics_jsonl_path, preflight_record)
             logger.info(
-                '✅ REAL TRAINING PREFLIGHT PASSED: System1=%d tensors, LoRA=%d tensors, '
+                '✅ REAL TRAINING PREFLIGHT PASSED: System1=%d tensors, '
+                'LoRA matched/merged=%d/%d tensors, '
                 'optimizer_steps=1, checkpoint_files=0',
                 system1_required_tensors,
                 matched_lora_tensors,
+                merged_lora_tensors,
             )
             logger.info('   Report: %s', manifest_dir / 'preflight.json')
         _dist_barrier()

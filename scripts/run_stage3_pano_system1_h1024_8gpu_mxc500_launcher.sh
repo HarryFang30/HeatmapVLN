@@ -114,8 +114,12 @@ export STAGE3_LOG_INTERVAL="${STAGE3_LOG_INTERVAL:-20}"
 export STAGE3_TENSORBOARD_INTERVAL="${STAGE3_TENSORBOARD_INTERVAL:-20}"
 export STAGE3_PAGE_CACHE_DROP_ENABLED="${STAGE3_PAGE_CACHE_DROP_ENABLED:-0}"
 export STAGE3_SYSTEM2_SAMPLE_STEP="${STAGE3_SYSTEM2_SAMPLE_STEP:-1}"
+export STAGE3_MAX_CLIPS="${STAGE3_MAX_CLIPS:-}"
 export STAGE3_MAX_BATCHES="${STAGE3_MAX_BATCHES:-}"
 export STAGE3_DRY_RUN="${STAGE3_DRY_RUN:-${STAGE_DRY_RUN:-0}}"
+export STAGE3_MERGE_FROZEN_LORA="${STAGE3_MERGE_FROZEN_LORA:-1}"
+export STAGE3_FROZEN_TRAJ_INFERENCE_MODE="${STAGE3_FROZEN_TRAJ_INFERENCE_MODE:-1}"
+export STAGE3_TRAJ_LAST_HIDDEN_STATE_ONLY="${STAGE3_TRAJ_LAST_HIDDEN_STATE_ONLY:-1}"
 export STAGE3_REQUIRE_FLASH_ATTN="${STAGE3_REQUIRE_FLASH_ATTN:-1}"
 export HEATMAPVLN_REQUIRE_FLASH_ATTN="$STAGE3_REQUIRE_FLASH_ATTN"
 
@@ -213,10 +217,13 @@ if os.environ.get("STAGE3_SHM_BYPASS", "").strip():
 set_float(data, "shm_bypass_min_gb", "STAGE3_SHM_BYPASS_MIN_GB")
 trajectory = data.setdefault("trajectory", {})
 set_int(trajectory, "system2_sample_step", "STAGE3_SYSTEM2_SAMPLE_STEP")
+set_int(trajectory, "max_clips", "STAGE3_MAX_CLIPS")
 
 model = cfg.setdefault("model", {})
 llm = model.setdefault("llm", {})
 llm["model_path"] = os.environ["INTERNNAV_MODEL_PATH"]
+set_bool(llm, "frozen_traj_inference_mode", "STAGE3_FROZEN_TRAJ_INFERENCE_MODE")
+set_bool(llm, "traj_last_hidden_state_only", "STAGE3_TRAJ_LAST_HIDDEN_STATE_ONLY")
 nextdit = model.setdefault("action_head", {}).setdefault("nextdit", {})
 nextdit["internnav_model_path"] = os.environ["INTERNNAV_MODEL_PATH"]
 adapter = nextdit.setdefault("pano_latent_adapter", {})
@@ -235,6 +242,7 @@ set_float(l2_sp, "weight", "STAGE3_L2_SP_WEIGHT")
 stages = cfg.setdefault("training", {}).setdefault("stages", [])
 if not stages:
     raise RuntimeError("training.stages is empty")
+set_bool(stages[0], "merge_frozen_lora", "STAGE3_MERGE_FROZEN_LORA")
 epochs = os.environ.get("STAGE3_EPOCHS")
 if epochs is not None and epochs.strip():
     stages[0]["epochs"] = int(epochs)

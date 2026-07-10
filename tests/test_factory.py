@@ -35,6 +35,13 @@ class TestFactory:
             assert call_kwargs["min_history"] == 5
             assert call_kwargs["enable_augmentation"] is False
 
+    def test_build_trajectory_can_skip_duplicate_history_frames(self, minimal_cfg):
+        minimal_cfg["data"]["trajectory"]["load_history_frames"] = False
+        with patch("src.data.trajectory_dataset.VLNTrajectoryDataset") as mock_ds:
+            build_trajectory_dataset(minimal_cfg, split="train")
+
+        assert mock_ds.call_args.kwargs["load_history_frames"] is False
+
     def test_build_dataset_dispatches_sliding_window(self, minimal_cfg):
         """build_dataset dispatches to sliding_window when dataset_type matches."""
         minimal_cfg["data"]["dataset_type"] = "sliding_window"

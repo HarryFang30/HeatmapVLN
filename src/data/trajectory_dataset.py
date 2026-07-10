@@ -103,6 +103,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         action_scale: float = 4.0,
         enable_trajectory_augmentation: bool = True,
         load_traj_images: bool = False,
+        load_history_frames: bool = True,
         traj_image_size: tuple[int, int] = (224, 224),
         compute_pixel_goal: bool = False,
         load_lookdown_for_system2: bool = False,
@@ -147,6 +148,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             min_subsequence_length=min_subsequence_length,
             subsequence_samples_per_clip=subsequence_samples_per_clip,
             include_stop_samples_random_subsequence=include_stop_samples_random_subsequence,
+            load_history_frames=load_history_frames,
             max_clips=max_clips,
         )
 
@@ -787,14 +789,18 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         history_indices = self._sample_history_indices(subseq_start, current_t, self.num_history_sample)
 
         # 3. 加载历史帧
-        history_frames = self._load_frames(clip_dir, history_indices)
+        history_frames = (
+            self._load_frames(clip_dir, history_indices)
+            if self.load_history_frames
+            else torch.zeros(1, 3, self.image_size[1], self.image_size[0])
+        )
 
         # 4. 加载当前帧
         #    panoramic_vlm_input=True:  全景 4 视图 → VLM (Stage 1)
         #    panoramic_vlm_input=False: 前视图 + lookdown → VLM (Stage 2, InternNav)
         if self._is_panoramic and self.panoramic_vlm_input:
-            current_frame = self._load_frame(clip_dir, current_t, direction="front")
             current_views = self._load_all_views(clip_dir, current_t)
+            current_frame = current_views[0]
             history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
         else:
             current_frame = self._load_frame(clip_dir, current_t, direction="front")

@@ -9,9 +9,9 @@ Features:
 Sequence packing is currently disabled on the shared stack.
 """
 
+import inspect
 import json
 import logging
-import inspect
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch_dtype.*is deprecated.*")
@@ -101,6 +101,8 @@ class Qwen2_5VLConfig:
     enable_compile: bool = False
     compile_mode: str = "reduce-overhead"
     compile_backend: str = "inductor"
+    frozen_traj_inference_mode: bool = False
+    traj_last_hidden_state_only: bool = False
 
     def get_torch_dtype(self) -> torch.dtype:
         """Convert string dtype to torch dtype."""
@@ -536,6 +538,64 @@ class Qwen2_5VLIntegration(nn.Module):
             f"({100 * lora_params / total_params:.4f}%)"
         )
 
+    def merge_lora_for_frozen_forward(self, *, safe_merge: bool = True) -> int:
+        """Merge a loaded LoRA adapter into a frozen Qwen backbone.
+
+        Stage3 never updates Qwen or LoRA.  Merging removes the extra low-rank
+        matmuls from every attention projection while preserving the exact eval
+        function of the loaded adapter.
+        """
+        if not self._model_loaded or self.model is None:
+            raise RuntimeError("Qwen must be loaded before merging LoRA")
+
+        lora_tensors = [
+            name for name, _param in self.model.named_parameters()
+            if "lora_" in name
+        ]
+        if not lora_tensors:
+            raise RuntimeError(
+                "merge_lora_for_frozen_forward requested but the loaded Qwen "
+                "model has no LoRA tensors"
+            )
+
+        merge_and_unload = getattr(self.model, "merge_and_unload", None)
+        if not callable(merge_and_unload):
+            raise RuntimeError(
+                "Loaded Qwen LoRA model does not support merge_and_unload; "
+                "refusing to silently keep the slower unmerged path"
+            )
+
+        if self._internal_profiler is not None:
+            self._internal_profiler.close()
+            self._internal_profiler = None
+
+        merged_model = merge_and_unload(
+            progressbar=False,
+            safe_merge=safe_merge,
+        )
+        merged_model.requires_grad_(False)
+        merged_model.eval()
+        self.model = merged_model
+        self.config.use_lora = False
+
+        remaining_lora = [
+            name for name, _param in self.model.named_parameters()
+            if "lora_" in name
+        ]
+        if remaining_lora:
+            raise RuntimeError(
+                "LoRA merge reported success but adapter tensors remain: "
+                f"{remaining_lora[:5]}"
+            )
+
+        if self.config.enable_internal_profiling:
+            self._setup_internal_profiler()
+        logger.info(
+            "Merged %d frozen LoRA tensors into Qwen for Stage3 forward",
+            len(lora_tensors),
+        )
+        return len(lora_tensors)
+
     def enable_sequence_packing(self) -> bool:
         """Sequence packing is disabled on the current Qwen2.5-VL stack."""
         logger.warning(
@@ -835,11 +895,18 @@ class Qwen2_5VLIntegration(nn.Module):
 
         inner_model = getattr(self.model, "model", None) if skip_lm_head else None
         use_inner_model_for_skip = skip_lm_head and inner_model is not None
-        # TRAJ latent queries are read from the final sequence hidden states.
-        # Some Qwen2.5-VL wrappers do not expose ``last_hidden_state`` when the
-        # LM head is bypassed, so request hidden_states whenever TRAJ queries are
-        # present.  This still skips the expensive LM-head logits path.
-        need_all_hidden_states = return_hidden_states or need_traj_hidden
+        # TRAJ latent queries only need the final sequence state. The optimized
+        # frozen path calls the inner model, which exposes last_hidden_state;
+        # legacy/wrapper paths retain the all-hidden-states fallback.
+        use_last_hidden_state_only = bool(
+            need_traj_hidden
+            and self.config.traj_last_hidden_state_only
+            and use_inner_model_for_skip
+        )
+        need_all_hidden_states = (
+            return_hidden_states
+            or (need_traj_hidden and not use_last_hidden_state_only)
+        )
         fwd_kwargs = dict(
             **{k: v for k, v in inputs.items() if k != "labels"},
             output_hidden_states=need_all_hidden_states,
@@ -890,17 +957,17 @@ class Qwen2_5VLIntegration(nn.Module):
                     return inner_model(**filtered_kwargs)
             return self.model(**fwd_kwargs)
 
+        outputs_are_inference_tensors = False
         try:
             if qwen_needs_grad:
                 outputs = _run_model_forward()
-            elif need_traj_hidden:
-                # no_grad returns normal tensors that can feed a trainable
-                # adapter. inference_mode tensors cannot be saved for backward.
+            elif need_traj_hidden and not self.config.frozen_traj_inference_mode:
                 with torch.no_grad():
                     outputs = _run_model_forward()
             else:
                 with torch.inference_mode():
                     outputs = _run_model_forward()
+                outputs_are_inference_tensors = True
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
@@ -928,6 +995,10 @@ class Qwen2_5VLIntegration(nn.Module):
                     "Use an inner/base model output or enable output_hidden_states."
                 )
             traj_hidden_states = last_hs[:, -n_query:, :].contiguous()
+            if outputs_are_inference_tensors:
+                # A normal clone can be saved by the trainable adapter's
+                # backward pass; inference tensors cannot.
+                traj_hidden_states = traj_hidden_states.clone()
             if hidden_states is not None:
                 hidden_states = hidden_states[:, :-n_query, :].contiguous()
 
