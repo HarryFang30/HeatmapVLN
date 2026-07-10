@@ -161,9 +161,10 @@ training:
       # Stage1-S2 may also contain heatmap/bridge tensors. Stage3 must import
       # only its all-layer Qwen LoRA so InternNav System1 remains untouched.
       base_checkpoint_lora_only: true
-      # LoRA is frozen in Stage3, so merge its 224 tensors into Qwen once after
-      # checkpoint validation and remove the per-projection low-rank matmuls.
-      merge_frozen_lora: true
+      # Keep the verified PEFT forward path. PEFT safe_merge reports non-finite
+      # merged weights for this checkpoint/runtime, so merging is opt-in until
+      # that incompatibility is isolated independently from Stage3 training.
+      merge_frozen_lora: false
       retain_raw_panoramic_views: false
       compute_pano_text_anchor_positions: false
       retain_history_rel_poses: false

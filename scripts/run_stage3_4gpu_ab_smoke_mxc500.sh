@@ -133,22 +133,24 @@ run_variant() {
   local checkpoint="$STAGE3_OUT_DIR/latest/checkpoints/latest.pth"
   require_file "$checkpoint"
   if [[ "$name" == "optimized" ]]; then
-    if ! grep -q "Stage3 frozen-Qwen optimization: merged 224 LoRA tensors" "$LOG_FILE"; then
-      echo "Optimized run did not confirm the expected 224-tensor LoRA merge" >&2
+    if ! grep -Fq \
+      "Stage3 frozen-Qwen execution: merge_lora=False inference_mode=True last_hidden_state_only=True" \
+      "$LOG_FILE"; then
+      echo "Optimized run did not confirm the expected frozen-Qwen execution flags" >&2
       return 1
     fi
   fi
 
   echo "[$(date '+%F %T')] PASSED $name checkpoint=$checkpoint"
   echo "[stage3-ab] key $name lines:"
-  grep -E "Verified complete frozen InternNav System1|Verified complete LoRA|frozen-Qwen optimization|Trainable params|Batch (1|2|3|20)/|Train Loss" \
+  grep -E "Verified complete frozen InternNav System1|Verified complete LoRA|frozen-Qwen execution|Trainable params|Batch (1|2|3|20)/|Train Loss" \
     "$LOG_FILE" | tail -30 || true
 }
 
 if is_truthy "$RUN_BASELINE"; then
   run_variant baseline 0 0 0 "$BASE_PORT"
 fi
-run_variant optimized 1 1 1 "$((BASE_PORT + 1))"
+run_variant optimized 0 1 1 "$((BASE_PORT + 1))"
 
 echo "[stage3-ab] COMPLETE tag=$STAMP"
 echo "[stage3-ab] logs: $LOG_ROOT/smoke_stage3_4gpu_ab_${STAMP}_*.log"

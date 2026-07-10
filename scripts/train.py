@@ -834,6 +834,16 @@ def main():
         else:
             raise FileNotFoundError(f"Weights file not found: {weights_path}")
 
+    if stage_cfg.get('name') == 'stage3':
+        stage3_llm_cfg = cfg.get('model', {}).get('llm', {})
+        logger.info(
+            'Stage3 frozen-Qwen execution: merge_lora=%s '
+            'inference_mode=%s last_hidden_state_only=%s',
+            bool(stage_cfg.get('merge_frozen_lora', False)),
+            bool(stage3_llm_cfg.get('frozen_traj_inference_mode', False)),
+            bool(stage3_llm_cfg.get('traj_last_hidden_state_only', False)),
+        )
+
     if stage_cfg.get('merge_frozen_lora', False):
         trainable_names = set(stage_cfg.get('trainable_modules', []))
         if trainable_names & {'lora', 'vlm_lora'}:
