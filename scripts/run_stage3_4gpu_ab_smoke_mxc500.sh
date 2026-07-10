@@ -77,7 +77,7 @@ require_file "$STAGE3_ADAPTER_CKPT"
 require_dir "$PANORAMIC_DATA_ROOT"
 require_dir "$INTERNNAV_MODEL_PATH"
 
-echo "[stage3-ab] commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo "[stage3-ab] commit=$(git -c safe.directory="$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "[stage3-ab] gpus=$GPU_DEVICES nproc=$NPROC_PER_NODE batch_per_rank=$STAGE3_BATCH_SIZE"
 echo "[stage3-ab] max_clips=$STAGE3_MAX_CLIPS max_batches=$STAGE3_MAX_BATCHES"
 echo "[stage3-ab] base=$STAGE3_BASE_CKPT"
