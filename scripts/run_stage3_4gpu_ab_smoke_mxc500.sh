@@ -134,7 +134,7 @@ run_variant() {
   require_file "$checkpoint"
   if [[ "$name" == "optimized" ]]; then
     if ! grep -Fq \
-      "Stage3 frozen-Qwen execution: merge_lora=False inference_mode=True last_hidden_state_only=True" \
+      "Stage3 frozen-Qwen execution: merge_lora=False inference_mode=True last_hidden_state_only=False" \
       "$LOG_FILE"; then
       echo "Optimized run did not confirm the expected frozen-Qwen execution flags" >&2
       return 1
@@ -150,7 +150,7 @@ run_variant() {
 if is_truthy "$RUN_BASELINE"; then
   run_variant baseline 0 0 0 "$BASE_PORT"
 fi
-run_variant optimized 0 1 1 "$((BASE_PORT + 1))"
+run_variant optimized 0 1 0 "$((BASE_PORT + 1))"
 
 echo "[stage3-ab] COMPLETE tag=$STAMP"
 echo "[stage3-ab] logs: $LOG_ROOT/smoke_stage3_4gpu_ab_${STAMP}_*.log"

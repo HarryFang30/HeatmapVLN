@@ -957,17 +957,40 @@ class Qwen2_5VLIntegration(nn.Module):
                     return inner_model(**filtered_kwargs)
             return self.model(**fwd_kwargs)
 
-        outputs_are_inference_tensors = False
-        try:
+        use_inference_context = bool(
+            not qwen_needs_grad
+            and not (
+                need_traj_hidden
+                and not self.config.frozen_traj_inference_mode
+            )
+        )
+        outputs_are_inference_tensors = use_inference_context
+
+        def _run_with_runtime_context():
             if qwen_needs_grad:
-                outputs = _run_model_forward()
-            elif need_traj_hidden and not self.config.frozen_traj_inference_mode:
-                with torch.no_grad():
-                    outputs = _run_model_forward()
-            else:
+                return _run_model_forward()
+            if use_inference_context:
                 with torch.inference_mode():
-                    outputs = _run_model_forward()
-                outputs_are_inference_tensors = True
+                    return _run_model_forward()
+            with torch.no_grad():
+                return _run_model_forward()
+
+        try:
+            outputs = _run_with_runtime_context()
+            if (
+                use_last_hidden_state_only
+                and self._last_hidden_state_from_outputs(outputs) is None
+            ):
+                logger.warning(
+                    "Qwen output %s from %s did not expose last_hidden_state; "
+                    "disabling traj_last_hidden_state_only and retrying with "
+                    "output_hidden_states=true",
+                    type(outputs).__name__,
+                    type(inner_model).__name__ if inner_model is not None else "None",
+                )
+                self.config.traj_last_hidden_state_only = False
+                fwd_kwargs["output_hidden_states"] = True
+                outputs = _run_with_runtime_context()
         finally:
             if hook_handle is not None:
                 hook_handle.remove()

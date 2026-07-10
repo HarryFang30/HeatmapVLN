@@ -104,11 +104,12 @@ model:
     lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
     lora_dropout: 0.05
-    # Frozen Stage3 Qwen only needs the final TRAJ states. Inference mode plus a
-    # normal clone keeps adapter backprop valid without retaining Qwen autograd
-    # metadata or all 28 layer outputs.
+    # Inference mode plus a normal clone keeps adapter backprop valid without
+    # retaining Qwen autograd metadata. The current PEFT wrapper does not expose
+    # last_hidden_state when output_hidden_states=false, so retain the compatible
+    # final-entry extraction from the hidden-state tuple.
     frozen_traj_inference_mode: true
-    traj_last_hidden_state_only: true
+    traj_last_hidden_state_only: false
 
   heatmap:
     enable: false
