@@ -246,6 +246,7 @@ gym.spaces.Discrete = _PatchedDiscrete
 
 import argparse
 import copy
+import gzip
 import hashlib
 import importlib.util
 import itertools
@@ -306,6 +307,8 @@ if not hasattr(argparse, "BooleanOptionalAction"):
     argparse.BooleanOptionalAction = _BooleanOptionalAction
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
 _INPUT_CONSTRUCTOR_SPEC = importlib.util.spec_from_file_location(
@@ -822,6 +825,32 @@ def _expand_path_template(path_str: str, split: str) -> str:
         return expanded
 
 
+def _first_dataset_scene_id(data_path: str) -> str | None:
+    """Read one scene id so an invalid Habitat scene root fails before native init."""
+    path = Path(data_path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    episodes = payload.get("episodes", []) if isinstance(payload, dict) else []
+    if not episodes:
+        return None
+    scene_id = episodes[0].get("scene_id")
+    return str(scene_id) if scene_id else None
+
+
+def _scene_asset_path(scenes_dir: Path, scene_id: str | None) -> Path | None:
+    if not scene_id:
+        return None
+    return scenes_dir / scene_id
+
+
+def _scene_root_is_compatible(scenes_dir: Path, scene_id: str | None) -> bool:
+    if not scenes_dir.is_dir():
+        return False
+    scene_asset = _scene_asset_path(scenes_dir, scene_id)
+    return scene_asset is None or scene_asset.is_file()
+
+
 def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
     """Resolve dataset/scenes paths for the shared Habitat evaluation environment."""
 
@@ -854,36 +883,52 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
             f"Configured --data_path does not exist: {requested_data_path}"
         )
 
+    first_scene_id = _first_dataset_scene_id(args.data_path)
+
     requested_scenes_dir = _expand_path_template(args.scenes_dir, split)
     scenes_dir = Path(requested_scenes_dir)
-    if scenes_dir.exists():
+    if _scene_root_is_compatible(scenes_dir, first_scene_id):
         args.scenes_dir = str(scenes_dir.resolve())
     elif args.scenes_dir == DEFAULT_SCENES_DIR:
         scenes_candidates = [
+            LOCAL_VLNCE_DATA_ROOT / "scene_datasets",
             LOCAL_MP3D_ROOT,
             LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d",
+            Path("/home/intern/zhr/fjl/InternNav/data/scene_data"),
             Path("/home/intern/zhr/fjl/InternNav/data/scene_data/mp3d_ce"),
+            Path.home() / "zhr/fjl/InternNav/data/scene_data",
             Path.home() / "zhr/fjl/InternNav/data/scene_data/mp3d_ce",
+            Path.home() / "InternNav/data/scene_data",
             Path.home() / "InternNav/data/scene_data/mp3d_ce",
-            Path("/dataset/mp3d"),
             Path("/dataset"),
+            Path("/dataset/mp3d"),
+            Path("/workspace/InternNav/data/scene_data"),
             Path("/workspace/InternNav/data/scene_data/mp3d_ce"),
         ]
-        resolved = next((p for p in scenes_candidates if p.exists()), None)
+        resolved = next(
+            (p for p in scenes_candidates if _scene_root_is_compatible(p, first_scene_id)),
+            None,
+        )
         if resolved is None:
             attempted = "\n  - ".join([requested_scenes_dir, *map(str, scenes_candidates)])
             raise FileNotFoundError(
-                "Could not find the MP3D scene directory. Tried:\n"
+                "Could not find a scene root compatible with the dataset's "
+                f"first scene_id={first_scene_id!r}. Tried:\n"
                 f"  - {attempted}"
             )
         args.scenes_dir = str(resolved.resolve())
     else:
+        expected_asset = _scene_asset_path(scenes_dir, first_scene_id)
         raise FileNotFoundError(
-            f"Configured --scenes_dir does not exist: {requested_scenes_dir}"
+            "Configured --scenes_dir is incompatible with the dataset: "
+            f"root={requested_scenes_dir!r}, first_scene_id={first_scene_id!r}, "
+            f"expected_asset={str(expected_asset)!r}"
         )
 
     print(f"Using scenes_dir: {args.scenes_dir}")
     print(f"Using data_path:  {args.data_path}")
+    if first_scene_id:
+        print(f"Verified first scene asset: {Path(args.scenes_dir) / first_scene_id}")
 
 
 def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
@@ -3272,6 +3317,12 @@ def _rpc_plan_panoramic(
     response, _response_blobs = result
     if not response.get("ok", False):
         raise RuntimeError(f"RPC model server error: {response}")
+    if response.get("proto_v") != HEATMAPVLN_RPC_PROTOCOL_VERSION:
+        raise RuntimeError(
+            "RPC response protocol mismatch: "
+            f"server={response.get('proto_v')!r} "
+            f"expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
+        )
     return response
 
 
@@ -3316,6 +3367,11 @@ def run_eval_rpc_panoramic(args):
     info = client.get_server_info()
     if info is not None:
         print(f"RPC server: version={info.version}, model={info.model_version}")
+        if info.version != HEATMAPVLN_RPC_PROTOCOL_VERSION:
+            raise RuntimeError(
+                "RPC server protocol mismatch: "
+                f"server={info.version!r} expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
+            )
 
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
@@ -3632,6 +3688,10 @@ def run_eval_rpc_panoramic(args):
             "vlm_calls": system2_calls,
             "trajectory_calls": trajectory_calls,
             "rpc_server": args.rpc_server,
+            "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "auto_stop_distance": float(args.auto_stop_distance),
+            "trajectory_selection": str(args.trajectory_selection),
+            "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
         if bool(getattr(args, "oracle_system2", False)):
@@ -3659,9 +3719,25 @@ def run_eval_rpc_panoramic(args):
             "OS": float(oss_t.mean().item()),
             "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
             "total_episodes": len(sucs),
+            "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "auto_stop_distance": float(args.auto_stop_distance),
+            "trajectory_selection": str(args.trajectory_selection),
+            "system1_coord_order": str(system1_coord_order),
+            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
     else:
-        final_result = {"SR": 0, "SPL": 0, "OS": 0, "NE": 0, "total_episodes": 0}
+        final_result = {
+            "SR": 0,
+            "SPL": 0,
+            "OS": 0,
+            "NE": 0,
+            "total_episodes": 0,
+            "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "auto_stop_distance": float(args.auto_stop_distance),
+            "trajectory_selection": str(args.trajectory_selection),
+            "system1_coord_order": str(system1_coord_order),
+            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+        }
 
     print("\n" + "=" * 60)
     print("Final Results:")

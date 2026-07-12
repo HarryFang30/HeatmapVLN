@@ -31,7 +31,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from scripts.training.utils import _normalize_state_key, load_config
+from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
+from scripts.training.utils import (
+    _normalize_state_key,
+    assert_complete_lora_checkpoint_match,
+    extract_lora_checkpoint_state,
+    load_config,
+)
 from src.models.heatmap.input_constructor import (
     construct_input,
     parse_structured_pano_output,
@@ -47,7 +53,7 @@ LOGGER = logging.getLogger("heatmapvln-rpc-server")
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
-PROTO_VERSION = "heatmapvln-r2r-json-v1"
+PROTO_VERSION = HEATMAPVLN_RPC_PROTOCOL_VERSION
 LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
     os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
@@ -136,6 +142,29 @@ def _requires_base_checkpoint(cfg: dict, checkpoint_cfg: dict | None = None) -> 
         if stage_cfg.get("requires_base_checkpoint") or stage_cfg.get("bridge_only"):
             return True
     return False
+
+
+def _first_stage_config(*configs: dict | None) -> dict:
+    for config in configs:
+        if not isinstance(config, dict):
+            continue
+        stages = config.get("training", {}).get("stages", [])
+        if stages and isinstance(stages[0], dict):
+            return stages[0]
+    return {}
+
+
+def _assert_finite_state_dict(state_dict: dict[str, torch.Tensor], label: str) -> None:
+    non_tensors = [name for name, value in state_dict.items() if not torch.is_tensor(value)]
+    if non_tensors:
+        raise RuntimeError(f"{label} contains non-tensor values: {non_tensors[:5]}")
+    nonfinite = [
+        name
+        for name, value in state_dict.items()
+        if not bool(torch.isfinite(value.float()).all())
+    ]
+    if nonfinite:
+        raise RuntimeError(f"{label} contains non-finite tensors: {nonfinite[:5]}")
 
 
 def _load_compatible_state_dict(
@@ -556,11 +585,15 @@ class HeatmapVLNRuntime:
         return cfg
 
     def _load_model(self, args: argparse.Namespace, device: torch.device):
-        from scripts.training.model_builder import build_model
+        from scripts.training.model_builder import (
+            assert_complete_internnav_system1_load,
+            build_model,
+        )
 
         model = build_model(self.cfg, device=str(device), verbose=True)
         model = model.to(device)
         checkpoint_cfg = _extract_checkpoint_config(args.checkpoint)
+        stage_cfg = _first_stage_config(checkpoint_cfg, self.cfg)
         if not args.base_checkpoint and checkpoint_cfg:
             recorded_base = checkpoint_cfg.get("runtime", {}).get("base_checkpoint")
             if recorded_base and Path(recorded_base).exists():
@@ -585,10 +618,59 @@ class HeatmapVLNRuntime:
         ):
             model._ensure_heatmap_vln()
 
+        if stage_cfg.get("require_complete_internnav_system1", False):
+            required_system1 = assert_complete_internnav_system1_load(model, logger=LOGGER)
+            LOGGER.info(
+                "Verified complete frozen InternNav System1 for RPC evaluation: %d tensors",
+                required_system1,
+            )
+
         if base_state_dict:
-            _load_compatible_state_dict(model, base_state_dict, args.base_checkpoint, label="Base checkpoint")
+            _assert_finite_state_dict(base_state_dict, "Base checkpoint")
+            if _requires_base_checkpoint(self.cfg, checkpoint_cfg):
+                matched_lora = assert_complete_lora_checkpoint_match(
+                    model,
+                    base_state_dict,
+                    checkpoint_path=args.base_checkpoint,
+                )
+                LOGGER.info("Verified complete LoRA checkpoint match: %d tensors", matched_lora)
+            base_state_to_load = base_state_dict
+            if stage_cfg.get("base_checkpoint_lora_only", False):
+                base_state_to_load = extract_lora_checkpoint_state(base_state_dict)
+                if not base_state_to_load:
+                    raise RuntimeError(
+                        f"Base checkpoint contains no LoRA tensors: {args.base_checkpoint}"
+                    )
+                LOGGER.info(
+                    "Base checkpoint LoRA-only guard: loading %d/%d tensors; "
+                    "InternNav System1 and pano adapter cannot be overwritten",
+                    len(base_state_to_load),
+                    len(base_state_dict),
+                )
+            loaded_base = _load_compatible_state_dict(
+                model,
+                base_state_to_load,
+                args.base_checkpoint,
+                label="Base checkpoint",
+            )
+            if loaded_base != len(base_state_to_load):
+                raise RuntimeError(
+                    "Incomplete base checkpoint load refused: "
+                    f"loaded={loaded_base}/{len(base_state_to_load)}"
+                )
         if checkpoint_state_dict:
-            _load_compatible_state_dict(model, checkpoint_state_dict, args.checkpoint, label="Main checkpoint")
+            _assert_finite_state_dict(checkpoint_state_dict, "Main checkpoint")
+            loaded_main = _load_compatible_state_dict(
+                model,
+                checkpoint_state_dict,
+                args.checkpoint,
+                label="Main checkpoint",
+            )
+            if loaded_main != len(checkpoint_state_dict):
+                raise RuntimeError(
+                    "Incomplete main checkpoint load refused: "
+                    f"loaded={loaded_main}/{len(checkpoint_state_dict)}"
+                )
         del checkpoint_state_dict
         del base_state_dict
         if device.type == "cuda":
@@ -601,7 +683,37 @@ class HeatmapVLNRuntime:
             return None
         hidden_dim = int(self.train_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
         LOGGER.info("Loading pano latent adapter from %s", args.pano_latent_adapter_checkpoint)
-        return _load_pano_latent_adapter(args.pano_latent_adapter_checkpoint, hidden_dim, self.device)
+        adapter = _load_pano_latent_adapter(
+            args.pano_latent_adapter_checkpoint,
+            hidden_dim,
+            self.device,
+        )
+        adapter_cfg = (
+            self.train_cfg.get("model", {})
+            .get("action_head", {})
+            .get("nextdit", {})
+            .get("pano_latent_adapter", {})
+        )
+        expected_hidden_dim = int(adapter_cfg.get("hidden_dim", 0) or 0)
+        actual_dim = int(getattr(adapter, "dim", hidden_dim))
+        actual_hidden_dim = int(getattr(adapter, "hidden_dim", expected_hidden_dim))
+        if actual_dim != hidden_dim or (
+            expected_hidden_dim > 0 and actual_hidden_dim != expected_hidden_dim
+        ):
+            raise RuntimeError(
+                "Pano adapter architecture mismatch: "
+                f"dim={actual_dim}/{hidden_dim} "
+                f"hidden_dim={actual_hidden_dim}/{expected_hidden_dim}"
+            )
+        _assert_finite_state_dict(adapter.state_dict(), "Pano latent adapter")
+        LOGGER.info(
+            "Verified pano latent adapter: tensors=%d parameters=%d dim=%d hidden_dim=%d",
+            len(adapter.state_dict()),
+            sum(parameter.numel() for parameter in adapter.parameters()),
+            actual_dim,
+            actual_hidden_dim,
+        )
+        return adapter
 
     def plan_panoramic(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
         blob_map = _blobs_by_name(blobs)
@@ -857,7 +969,9 @@ def main() -> int:
     )
     vla_pb2_grpc.add_VLAServicer_to_server(HeatmapVLNRPCServicer(runtime), server)
     address = f"{args.host}:{args.port}"
-    server.add_insecure_port(address)
+    bound_port = server.add_insecure_port(address)
+    if bound_port == 0:
+        raise RuntimeError(f"Could not bind HeatmapVLN RPC server to {address}")
     server.start()
     LOGGER.info("HeatmapVLN RPC server listening on %s", address)
 
