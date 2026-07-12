@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from src.data.history_length import infer_history_length
+
 
 def _pad_and_stack(batch: list[dict], key: str) -> torch.Tensor:
     """Stack tensors that may differ in the first (history) dimension,
@@ -24,10 +26,14 @@ def _pad_and_stack(batch: list[dict], key: str) -> torch.Tensor:
 
 
 def collate_fn(batch: list[dict]) -> dict[str, Any]:
+    # ``history_frames`` may intentionally be a single dummy frame when
+    # ``load_history_frames=false``.  Build the supervision mask from the real
+    # panoramic/heatmap history axis instead of that compatibility tensor.
+    history_lengths = [infer_history_length(sample) for sample in batch]
+    max_history = max(history_lengths)
     max_K = max(s['history_frames'].shape[0] for s in batch)
 
     history_frames_padded = []
-    history_mask = []
 
     for s in batch:
         frames = s['history_frames']
@@ -37,16 +43,16 @@ def collate_fn(batch: list[dict]) -> dict[str, Any]:
             pad_size = max_K - K
             pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
             frames_padded = torch.cat([frames, pad_frames], dim=0)
-            mask = torch.cat([torch.ones(K), torch.zeros(pad_size)])
         else:
             frames_padded = frames
-            mask = torch.ones(K)
 
         history_frames_padded.append(frames_padded)
-        history_mask.append(mask)
 
     history_frames = torch.stack(history_frames_padded, dim=0)
-    history_mask = torch.stack(history_mask, dim=0)
+    history_mask = (
+        torch.arange(max_history).unsqueeze(0)
+        < torch.tensor(history_lengths).unsqueeze(1)
+    ).to(dtype=torch.float32)
     current_frame = torch.stack([s['current_frame'] for s in batch], dim=0)
 
     heatmap = _pad_and_stack(batch, 'heatmap')
@@ -73,6 +79,9 @@ def collate_fn(batch: list[dict]) -> dict[str, Any]:
         result['current_views'] = torch.stack([s['current_views'] for s in batch], dim=0)
     if 'history_panoramas' in batch[0]:
         result['history_panoramas'] = _pad_and_stack(batch, 'history_panoramas')
+        # The non-tokenized panoramic forward uses these lengths to remove
+        # collate padding before constructing image occurrences and anchors.
+        result['pano_num_histories'] = history_lengths
     if 'gt_visibility' in batch[0]:
         result['gt_visibility'] = _pad_and_stack(batch, 'gt_visibility')
 

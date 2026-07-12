@@ -23,6 +23,25 @@ import torch
 from PIL import Image
 
 VIEW_NAMES = ["front", "right", "back", "left"]
+VIEWS_PER_PANORAMA = len(VIEW_NAMES)
+CURRENT_IMAGE_OCCURRENCE_START = 0
+HISTORY_IMAGE_OCCURRENCE_START = VIEWS_PER_PANORAMA
+
+
+def current_image_occurrence(view_idx: int) -> int:
+    """Return a current-view occurrence in the Stage-1 prompt contract."""
+    if not 0 <= view_idx < VIEWS_PER_PANORAMA:
+        raise ValueError(f"Current view index out of range: {view_idx}")
+    return CURRENT_IMAGE_OCCURRENCE_START + view_idx
+
+
+def history_image_occurrence(hist_idx: int, view_idx: int) -> int:
+    """Return a history-view occurrence in the Stage-1 prompt contract."""
+    if hist_idx < 0:
+        raise ValueError(f"History index must be non-negative: {hist_idx}")
+    if not 0 <= view_idx < VIEWS_PER_PANORAMA:
+        raise ValueError(f"History view index out of range: {view_idx}")
+    return HISTORY_IMAGE_OCCURRENCE_START + hist_idx * VIEWS_PER_PANORAMA + view_idx
 
 # InternNav ``NavPixelGoalDataset.conjunctions``
 INTERNAV_CONJUNCTIONS = [
@@ -293,25 +312,36 @@ def construct_input(
     lookdown_frame: Union[Image.Image, torch.Tensor, np.ndarray] | None = None,
     internnav_protocol: bool = False,
     structured_pano_output: bool = False,
+    history_projection_layout: bool = False,
 ) -> list[dict]:
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
 
-    Panoramic layout is HeatmapVLN-specific; user-facing task text matches InternNav System2 SFT.
+    Panoramic layout is HeatmapVLN-specific; user-facing task text matches
+    InternNav System2 SFT.
+
+    ``history_projection_layout`` is an explicit contract for the Stage-1
+    heatmap feature extractor.  In that layout image occurrences are ordered
+    as ``current[4], history[0][4], ..., history[K-1][4]`` and each history
+    anchor is placed *after* its four images.  A causal LLM anchor can therefore
+    attend to both the current panorama and the historical panorama it
+    represents.  The default keeps the established System2 SFT prompt byte-for-
+    byte compatible with existing checkpoints.
     """
     content: list[dict] = []
     instruction_text = instruction or ""
     has_history = len(history_panoramas) > 0
 
     prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
-    if has_history:
+    if has_history and not history_projection_layout:
         prompt_text += " These are your historical observations:"
     content.append({"type": "text", "text": prompt_text})
 
-    for hist_idx, hist in enumerate(history_panoramas):
-        content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
-        for view_name in VIEW_NAMES:
-            content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
+    if not history_projection_layout:
+        for hist_idx, hist in enumerate(history_panoramas):
+            content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
+            for view_name in VIEW_NAMES:
+                content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
 
     content.append({
         "type": "text",
@@ -322,6 +352,14 @@ def construct_input(
     })
     for view_name in VIEW_NAMES:
         content.append({"type": "image", "image": _ensure_pil(current_views[view_name])})
+
+    if history_projection_layout and has_history:
+        content.append({"type": "text", "text": "These are your historical observations:"})
+    if history_projection_layout:
+        for hist_idx, hist in enumerate(history_panoramas):
+            for view_name in VIEW_NAMES:
+                content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
+            content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
 
     nav_target_text = assistant_text
     if nav_target_text is None and pixel_goal is not None:
@@ -394,8 +432,10 @@ def find_text_anchor_positions(
     """
     Locate the end token of each exact history-anchor annotation.
 
-    After LLM attention, these token positions aggregate visual information
-    from the following 4 images, serving as compact query vectors.
+    In the Stage-1 history-projection layout, these anchors occur after the
+    corresponding four historical images.  Their causal hidden states can
+    therefore aggregate the current panorama and the matching history panorama
+    as compact query vectors.
     """
     ids = input_ids.squeeze().tolist()
 

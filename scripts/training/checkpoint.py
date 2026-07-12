@@ -13,12 +13,102 @@ from torch.amp import GradScaler
 
 from .utils import (
     _load_normalized_state_dict,
+    _normalize_state_key,
     _normalized_model_state_dict,
     _normalized_trainable_param_names,
+    _unwrap_model,
     safe_torch_load,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_and_validate_heatmap_checkpoint_state(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    checkpoint_path: str | None = None,
+) -> int:
+    """Materialize a lazy HeatmapVLN head and validate every saved head tensor.
+
+    ``VLNPipeline`` cannot construct ``heatmap_vln`` until its lazy Qwen
+    backbone exists.  Loading a checkpoint before the first forward therefore
+    used to make all ``heatmap_vln.*`` entries look unexpected; with
+    ``strict=False`` they were silently discarded.  Detect those entries before
+    loading, construct the head through the pipeline's public lazy initializer,
+    and require every saved heatmap tensor to have a shape-compatible target.
+    """
+    heatmap_state = {
+        _normalize_state_key(name): value
+        for name, value in state_dict.items()
+        if _normalize_state_key(name).startswith("heatmap_vln.")
+    }
+    if not heatmap_state:
+        return 0
+
+    raw_model = _unwrap_model(model)
+    if getattr(raw_model, "heatmap_vln", None) is None:
+        ensure_heatmap = getattr(raw_model, "_ensure_heatmap_vln", None)
+        if not callable(ensure_heatmap):
+            raise RuntimeError(
+                "Checkpoint contains HeatmapVLN tensors, but the target model "
+                "does not provide _ensure_heatmap_vln()"
+            )
+        ensure_heatmap()
+
+    if getattr(raw_model, "heatmap_vln", None) is None:
+        source = f" from {checkpoint_path}" if checkpoint_path else ""
+        raise RuntimeError(
+            "Checkpoint contains HeatmapVLN tensors"
+            f"{source}, but the heatmap head is disabled or could not be constructed"
+        )
+
+    model_state = _normalized_model_state_dict(model)
+    missing = sorted(name for name in heatmap_state if name not in model_state)
+    shape_mismatches = sorted(
+        name
+        for name, value in heatmap_state.items()
+        if name in model_state and tuple(model_state[name].shape) != tuple(value.shape)
+    )
+    if missing or shape_mismatches:
+        source = f" from {checkpoint_path}" if checkpoint_path else ""
+        missing_preview = ", ".join(missing[:5])
+        mismatch_preview = ", ".join(
+            f"{name}: ckpt {tuple(heatmap_state[name].shape)} vs model {tuple(model_state[name].shape)}"
+            for name in shape_mismatches[:5]
+        )
+        raise RuntimeError(
+            "Incomplete HeatmapVLN checkpoint load refused"
+            f"{source}: saved={len(heatmap_state)} missing={len(missing)} "
+            f"shape_mismatches={len(shape_mismatches)}"
+            + (f" missing_preview=[{missing_preview}]" if missing_preview else "")
+            + (f" shape_mismatch_preview=[{mismatch_preview}]" if mismatch_preview else "")
+        )
+
+    return len(heatmap_state)
+
+
+def load_checkpoint_model_state(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    checkpoint_path: str | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[list[str], list[str], int]:
+    """Load model weights, including shape-checked lazy HeatmapVLN tensors."""
+    heatmap_count = _materialize_and_validate_heatmap_checkpoint_state(
+        model,
+        state_dict,
+        checkpoint_path=checkpoint_path,
+    )
+    missing, unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
+    if heatmap_count:
+        target_logger = logger or globals()["logger"]
+        target_logger.info(
+            "  ✓ Verified and loaded %d HeatmapVLN checkpoint tensors",
+            heatmap_count,
+        )
+    return missing, unexpected, loaded_count
 
 
 class CheckpointManager:
@@ -139,9 +229,19 @@ def load_checkpoint_for_resume(
 
     ckpt = safe_torch_load(ckpt_path)
 
-    state_dict = ckpt.get('trainable_state_dict', {})
+    state_dict = (
+        ckpt.get('trainable_state_dict')
+        or ckpt.get('model_state_dict')
+        or ckpt.get('state_dict')
+        or {}
+    )
     if state_dict:
-        _missing, _unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
+        _missing, _unexpected, loaded_count = load_checkpoint_model_state(
+            model,
+            state_dict,
+            checkpoint_path=ckpt_path,
+            logger=logger,
+        )
         if logger:
             logger.info(f"  ✓ Loaded {loaded_count} trainable parameters")
 

@@ -21,6 +21,12 @@ import logging
 import torch
 import torch.nn.functional as F
 
+from .input_constructor import (
+    VIEWS_PER_PANORAMA,
+    current_image_occurrence,
+    history_image_occurrence,
+)
+
 logger = logging.getLogger(__name__)
 
 # Qwen2.5-VL token-layout constants
@@ -164,6 +170,20 @@ class FeatureExtractor:
         image_grid_thw: torch.Tensor | None = None,
     ) -> None:
         """Prepare compact token capture plan for batched panoramic forward."""
+        if len(image_token_positions_batch) != len(text_anchor_positions_batch):
+            raise ValueError(
+                "Batch size mismatch between image occurrences and history anchors: "
+                f"{len(image_token_positions_batch)} vs {len(text_anchor_positions_batch)}"
+            )
+        for batch_idx, (image_positions, anchors) in enumerate(
+            zip(image_token_positions_batch, text_anchor_positions_batch)
+        ):
+            self._validate_history_projection_layout(
+                image_positions,
+                anchors,
+                tag=f"batch item {batch_idx}",
+            )
+
         sample_image_counts = [len(pos) for pos in image_token_positions_batch]
         sample_offsets: list[int] = []
         running = 0
@@ -185,8 +205,9 @@ class FeatureExtractor:
         vit_ranges_batch: list[dict[int, tuple[int, int]]] = []
         for image_offset in sample_offsets:
             sample_views = {}
-            for view_idx in range(4):
-                global_img_idx = image_offset + view_idx
+            for view_idx in range(VIEWS_PER_PANORAMA):
+                occurrence_idx = current_image_occurrence(view_idx)
+                global_img_idx = image_offset + occurrence_idx
                 start = prefix[global_img_idx]
                 end = prefix[global_img_idx + 1]
                 sample_views[view_idx] = (start, end)
@@ -244,17 +265,23 @@ class FeatureExtractor:
             )
 
         n_hist = len(text_anchor_positions)
+        self._validate_history_projection_layout(
+            image_token_positions,
+            text_anchor_positions,
+            tag="single sample",
+        )
 
         # --- current 4 views: multi-layer LLM features (8x8) ---
         current_llm: dict[int, dict[int, torch.Tensor]] = {}
-        for view_idx in range(4):
+        for view_idx in range(VIEWS_PER_PANORAMA):
             current_llm[view_idx] = {}
-            if view_idx not in image_token_positions:
+            occurrence_idx = current_image_occurrence(view_idx)
+            if occurrence_idx not in image_token_positions:
                 raise RuntimeError(
                     f"Current panoramic view {view_idx} missing from image_token_positions. "
                     "Prompt/image layout and image token spans are inconsistent."
                 )
-            start, end = image_token_positions[view_idx]
+            start, end = image_token_positions[occurrence_idx]
             for layer_idx in self.llm_layer_indices:
                 hidden = self.llm_hidden_states.get(layer_idx)
                 if hidden is None:
@@ -266,14 +293,15 @@ class FeatureExtractor:
 
         # --- current 4 views: ViT features (16x16, multi-layer) ---
         current_vit: dict[int, dict[int, torch.Tensor]] = {}
-        for view_idx in range(4):
+        for view_idx in range(VIEWS_PER_PANORAMA):
             current_vit[view_idx] = {}
+            occurrence_idx = current_image_occurrence(view_idx)
             for layer_idx in self.vit_layer_indices:
                 vit_out = self.vit_features.get(layer_idx)
                 if vit_out is None:
                     continue
                 vit_tokens = self._get_vit_for_image(
-                    vit_out, view_idx, image_grid_thw,
+                    vit_out, occurrence_idx, image_grid_thw,
                 )
                 if vit_tokens is not None:
                     current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx)
@@ -289,8 +317,8 @@ class FeatureExtractor:
         history_llm_views: list[dict[int, torch.Tensor]] = []
         for hist_idx in range(n_hist):
             views: dict[int, torch.Tensor] = {}
-            for v in range(4):
-                img_idx = 4 + hist_idx * 4 + v
+            for v in range(VIEWS_PER_PANORAMA):
+                img_idx = history_image_occurrence(hist_idx, v)
                 if img_idx not in image_token_positions:
                     continue
                 start, end = image_token_positions[img_idx]
@@ -332,16 +360,22 @@ class FeatureExtractor:
         extracted = []
         for batch_idx, image_token_positions in enumerate(image_token_positions_batch):
             n_hist = len(text_anchor_positions_batch[batch_idx])
+            self._validate_history_projection_layout(
+                image_token_positions,
+                text_anchor_positions_batch[batch_idx],
+                tag=f"batch item {batch_idx}",
+            )
 
             current_llm: dict[int, dict[int, torch.Tensor]] = {}
-            for view_idx in range(4):
+            for view_idx in range(VIEWS_PER_PANORAMA):
                 current_llm[view_idx] = {}
-                if view_idx not in image_token_positions:
+                occurrence_idx = current_image_occurrence(view_idx)
+                if occurrence_idx not in image_token_positions:
                     raise RuntimeError(
                         f"Current panoramic view {view_idx} missing from image_token_positions "
                         f"for batch item {batch_idx}."
                     )
-                start, end = image_token_positions[view_idx]
+                start, end = image_token_positions[occurrence_idx]
                 for layer_idx in self.llm_layer_indices:
                     hidden = self.llm_hidden_states.get(layer_idx)
                     if hidden is None:
@@ -353,9 +387,10 @@ class FeatureExtractor:
 
             current_vit: dict[int, dict[int, torch.Tensor]] = {}
             image_offset = sample_image_offsets[batch_idx]
-            for view_idx in range(4):
+            for view_idx in range(VIEWS_PER_PANORAMA):
                 current_vit[view_idx] = {}
-                global_img_idx = image_offset + view_idx
+                occurrence_idx = current_image_occurrence(view_idx)
+                global_img_idx = image_offset + occurrence_idx
                 for layer_idx in self.vit_layer_indices:
                     vit_out = self.vit_features.get(layer_idx)
                     if vit_out is None:
@@ -470,6 +505,54 @@ class FeatureExtractor:
                 f"{missing_layers}. Requested layers={self.llm_layer_indices}. "
                 "This usually means the hook indices no longer match the Qwen model layout."
             )
+
+    @staticmethod
+    def _validate_history_projection_layout(
+        image_token_positions: dict[int, tuple[int, int]],
+        text_anchor_positions: dict[int, int],
+        *,
+        tag: str,
+    ) -> None:
+        """Enforce the image/anchor occurrence contract used by Stage 1.
+
+        The check intentionally happens before feature capture/decode so a
+        System2-style history-first prompt cannot silently be interpreted as a
+        Stage-1 current-first prompt again.
+        """
+        num_history = len(text_anchor_positions)
+        expected_images = VIEWS_PER_PANORAMA * (num_history + 1)
+        expected_keys = set(range(expected_images))
+        actual_keys = set(image_token_positions)
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)
+            extra = sorted(actual_keys - expected_keys)
+            raise RuntimeError(
+                f"Invalid Stage-1 image occurrence layout for {tag}: "
+                f"expected contiguous occurrences 0..{expected_images - 1}, "
+                f"missing={missing}, extra={extra}."
+            )
+
+        current_end = max(
+            image_token_positions[current_image_occurrence(view_idx)][1]
+            for view_idx in range(VIEWS_PER_PANORAMA)
+        )
+        for hist_idx in range(num_history):
+            if hist_idx not in text_anchor_positions:
+                raise RuntimeError(
+                    f"Missing Stage-1 history anchor {hist_idx} for {tag}; "
+                    "anchor indices must be contiguous from zero."
+                )
+            history_end = max(
+                image_token_positions[history_image_occurrence(hist_idx, view_idx)][1]
+                for view_idx in range(VIEWS_PER_PANORAMA)
+            )
+            anchor_pos = text_anchor_positions[hist_idx]
+            if anchor_pos < max(current_end, history_end):
+                raise RuntimeError(
+                    f"History anchor {hist_idx} occurs at token {anchor_pos} before its "
+                    f"required visual context ends at token {max(current_end, history_end)} "
+                    f"for {tag}. Use construct_input(history_projection_layout=True)."
+                )
 
     @staticmethod
     def _resolve_llm_spatial_shape(

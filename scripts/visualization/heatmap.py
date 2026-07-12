@@ -34,9 +34,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from scripts.training.checkpoint import load_checkpoint_model_state
 from scripts.training.collate import collate_fn
 from scripts.training.model_builder import build_model
-from scripts.training.utils import make_autocast_context, load_checkpoint
+from scripts.training.utils import load_checkpoint, make_autocast_context
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -187,10 +188,26 @@ def main():
     logger.info("Building model...")
     model = build_model(cfg, verbose=False, enable_action_head=False)
 
-    state_dict = ckpt.get('trainable_state_dict', ckpt.get('model_state_dict', {}))
+    state_dict = (
+        ckpt.get('trainable_state_dict')
+        or ckpt.get('model_state_dict')
+        or ckpt.get('state_dict')
+        or {}
+    )
     if state_dict:
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        logger.info(f"  Loaded: {len(state_dict)} params, missing={len(missing)}, unexpected={len(unexpected)}")
+        missing, unexpected, loaded_count = load_checkpoint_model_state(
+            model,
+            state_dict,
+            checkpoint_path=args.checkpoint,
+            logger=logger,
+        )
+        logger.info(
+            "  Loaded: %d/%d params, missing=%d, unexpected=%d",
+            loaded_count,
+            len(state_dict),
+            len(missing),
+            len(unexpected),
+        )
     else:
         logger.warning("  No trainable weights in checkpoint!")
 
@@ -238,6 +255,12 @@ def main():
             current_views = current_views.to(device)
         if history_panoramas is not None:
             history_panoramas = history_panoramas.to(device)
+        history_rel_poses = batch.get('history_rel_poses')
+        if history_rel_poses is not None:
+            history_rel_poses = history_rel_poses.to(device, non_blocking=True)
+        panoramic_num_histories = batch.get('pano_num_histories')
+        if torch.is_tensor(panoramic_num_histories):
+            panoramic_num_histories = [int(value) for value in panoramic_num_histories.tolist()]
 
         # 跳过 GT 全空的样本
         if gt_heatmap.max() < 0.01:
@@ -253,6 +276,8 @@ def main():
                 current_observation=current_frame.to(device),
                 current_views=current_views,
                 history_panoramas=history_panoramas,
+                history_rel_poses=history_rel_poses,
+                panoramic_num_histories=panoramic_num_histories,
                 return_heatmaps=True,
                 return_actions=False,
             )

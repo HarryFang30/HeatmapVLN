@@ -48,3 +48,25 @@ class TestCollateBasic:
         assert result["history_frames"].dtype == torch.float32
         assert result["action_valid"].dtype == torch.float32
         assert result["history_mask"].dtype == torch.float32
+
+    def test_panorama_history_mask_ignores_dummy_history_frames(self):
+        """Panoramic K, not the one-frame compatibility tensor, defines mask."""
+        samples = []
+        for real_k in (5, 8):
+            sample = _make_dummy_sample(H=2, W=2, K=1, hm_h=2, hm_w=2)
+            sample["current_views"] = torch.zeros(4, 3, 2, 2)
+            sample["history_panoramas"] = torch.ones(real_k, 4, 3, 2, 2)
+            sample["heatmap"] = torch.zeros(real_k, 4, 2, 2)
+            sample["gt_visibility"] = torch.zeros(real_k, 4)
+            sample["history_rel_poses"] = torch.zeros(real_k, 4)
+            samples.append(sample)
+
+        result = collate_fn(samples)
+
+        assert result["history_frames"].shape == (2, 1, 3, 2, 2)
+        assert result["history_mask"].shape == (2, 8)
+        assert result["history_mask"][0].tolist() == [1, 1, 1, 1, 1, 0, 0, 0]
+        assert result["history_mask"][1].tolist() == [1, 1, 1, 1, 1, 1, 1, 1]
+        assert result["pano_num_histories"] == [5, 8]
+        assert result["history_panoramas"].shape[:2] == (2, 8)
+        assert torch.count_nonzero(result["history_panoramas"][0, 5:]) == 0

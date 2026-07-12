@@ -207,23 +207,19 @@ class HeatmapVLNLoss(nn.Module):
             gt_heatmaps,
         )
 
-        # Flatten history_mask to (N,) matching pred_vis leading dim.
-        # Guard against shape mismatch (e.g. load_history_frames=false makes
-        # batch history_mask track dummy frames, not actual heatmap histories).
+        # Flatten history_mask to (N,) matching pred_vis leading dim.  A
+        # mismatch is unsafe: discarding the mask would silently turn padded
+        # panoramic slots into invisible negative examples.
         if history_mask is not None:
             valid = history_mask.reshape(-1).bool()
             if valid.shape[0] != pred_vis.shape[0]:
-                import logging
-                _logger = logging.getLogger(__name__)
-                _logger.warning(
-                    "history_mask shape mismatch: mask has %d entries but "
-                    "flattened pred_vis has %d rows — mask discarded.",
-                    valid.shape[0], pred_vis.shape[0],
+                raise ValueError(
+                    "history_mask shape mismatch: mask has "
+                    f"{valid.shape[0]} entries but flattened pred_vis has "
+                    f"{pred_vis.shape[0]} rows. Refusing to treat padded "
+                    "history slots as negative samples."
                 )
-                valid = None
-                valid_4 = None
-            else:
-                valid_4 = valid.unsqueeze(-1).expand_as(pred_vis)
+            valid_4 = valid.unsqueeze(-1).expand_as(pred_vis)
         else:
             valid = None
             valid_4 = None

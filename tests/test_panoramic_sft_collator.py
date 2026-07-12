@@ -19,6 +19,7 @@ class _FakeTokenizer:
 class _FakeProcessor:
     def __init__(self):
         self.tokenizer = _FakeTokenizer()
+        self.messages_batch = None
 
     def apply_chat_template(
         self,
@@ -32,6 +33,7 @@ class _FakeProcessor:
         max_length=None,
     ):
         del tokenize, return_dict, return_tensors, padding, truncation, max_length
+        self.messages_batch = messages_batch
         rows = []
         for messages in messages_batch:
             row = []
@@ -232,3 +234,57 @@ def test_stage3_lean_collator_drops_only_unused_raw_inputs():
     assert out['pano_inputs']['input_ids'].shape[1] >= 4
     assert out['trajectory'].shape == (1, 12, 32, 3)
     assert out['traj_images'].shape == (1, 12, 2, 2, 3)
+
+
+def test_tokenized_collator_masks_real_mixed_panorama_lengths():
+    """A dummy one-frame tensor must not collapse the heatmap history mask."""
+    samples = []
+    for real_k in (3, 5):
+        sample = _sample(
+            pano_view_id="front",
+            pano_pixel_goal=[12, 34],
+            pano_sample_kind="pixel",
+        )
+        sample["history_panoramas"] = torch.zeros(real_k, 4, 3, 2, 2)
+        sample["heatmap"] = torch.zeros(real_k, 4, 2, 2)
+        sample["gt_visibility"] = torch.zeros(real_k, 4)
+        sample["history_rel_poses"] = torch.zeros(real_k, 4)
+        samples.append(sample)
+
+    collator = PanoramicTokenizedCollator(_FakeProcessor(), sft_mode=True)
+    out = collator(samples)
+
+    assert out["history_frames"].shape == (2, 1, 3, 2, 2)
+    assert out["history_mask"].shape == (2, 5)
+    assert out["history_mask"][0].tolist() == [1, 1, 1, 0, 0]
+    assert out["history_mask"][1].tolist() == [1, 1, 1, 1, 1]
+    assert out["pano_num_histories"] == [3, 5]
+    assert out["heatmap"].shape[:2] == (2, 5)
+
+
+def test_heatmap_only_tokenized_collator_uses_current_first_anchor_after_layout():
+    processor = _FakeProcessor()
+    sample = _sample()
+    sample["current_views"] = torch.zeros(4, 3, 2, 2)
+    sample["history_panoramas"] = torch.ones(1, 4, 3, 2, 2)
+    sample["heatmap"] = torch.zeros(1, 4, 2, 2)
+    sample["gt_visibility"] = torch.zeros(1, 4)
+    sample["history_rel_poses"] = torch.zeros(1, 4)
+
+    PanoramicTokenizedCollator(
+        processor,
+        sft_mode=False,
+        include_heatmap_targets=True,
+    )([sample])
+
+    content = processor.messages_batch[0][0]["content"]
+    images = [item["image"] for item in content if item["type"] == "image"]
+    anchor_idx = next(
+        idx
+        for idx, item in enumerate(content)
+        if item.get("text", "").startswith("Historical observation 1 ")
+    )
+
+    assert [image.getpixel((0, 0))[0] for image in images[:4]] == [0, 0, 0, 0]
+    assert [image.getpixel((0, 0))[0] for image in images[4:]] == [255, 255, 255, 255]
+    assert sum(item["type"] == "image" for item in content[:anchor_idx]) == 8

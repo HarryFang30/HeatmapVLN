@@ -33,6 +33,7 @@ from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
 IGNORE_INDEX = -100
 from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
+from .history_length import infer_history_length
 
 _libc: ctypes.CDLL | None = None
 _TOKENIZER_LOCKS: dict[int, threading.RLock] = {}
@@ -139,9 +140,10 @@ class PanoramicTokenizedCollator:
 
     @staticmethod
     def _stack_padded_history_frames(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        history_lengths = [infer_history_length(sample) for sample in batch]
+        max_history = max(history_lengths)
         max_k = max(sample["history_frames"].shape[0] for sample in batch)
         history_frames_padded = []
-        history_mask = []
 
         for sample in batch:
             frames = sample["history_frames"]
@@ -150,15 +152,16 @@ class PanoramicTokenizedCollator:
                 pad_size = max_k - k
                 pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
                 frames = torch.cat([frames, pad_frames], dim=0)
-                mask = torch.cat([torch.ones(k), torch.zeros(pad_size)])
-            else:
-                mask = torch.ones(k)
             history_frames_padded.append(frames)
-            history_mask.append(mask)
+
+        history_mask = (
+            torch.arange(max_history).unsqueeze(0)
+            < torch.tensor(history_lengths).unsqueeze(1)
+        ).to(dtype=torch.float32)
 
         return {
             "history_frames": torch.stack(history_frames_padded, dim=0),
-            "history_mask": torch.stack(history_mask, dim=0),
+            "history_mask": history_mask,
         }
 
     @staticmethod
@@ -509,6 +512,9 @@ class PanoramicTokenizedCollator:
                             lookdown_frame=lookdown_frame,
                             internnav_protocol=self.sft_protocol == "internnav",
                             structured_pano_output=use_structured,
+                            history_projection_layout=(
+                                self.include_heatmap_targets and not self.sft_mode
+                            ),
                         )
                     )
                     if not self.sft_mode and self.sft_protocol == "internnav" and pg is not None and not use_structured:

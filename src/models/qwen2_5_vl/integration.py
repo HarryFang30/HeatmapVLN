@@ -1089,17 +1089,31 @@ class Qwen2_5VLIntegration(nn.Module):
         return_hidden_states: bool = True,
         heatmap_vln: nn.Module | None = None,
         history_rel_poses: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None]:
-        """Batch forward for panoramic input using one batched Qwen pass."""
+        num_histories: list[int] | None = None,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+        dict[str, torch.Tensor] | None,
+        torch.Tensor | None,
+    ]:
+        """Batch forward for panoramic input using one batched Qwen pass.
+
+        ``history_panoramas`` may be padded by the standard DataLoader
+        collator.  ``num_histories`` carries each sample's real K so prompt
+        construction can discard those padded image occurrences before Qwen
+        sees them.
+        """
         if heatmap_vln is None:
             raise RuntimeError("Panoramic forward requires a HeatmapVLN instance for batched decoding.")
 
         t0 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
-        inputs, num_histories = heatmap_vln.prepare_qwen_inputs_batch(
+        inputs, resolved_num_histories = heatmap_vln.prepare_qwen_inputs_batch(
             current_views=current_views,
             history_panoramas=history_panoramas,
             instruction=instruction,
             device=self.device,
+            num_histories=num_histories,
         )
         image_positions_batch = [
             heatmap_vln._find_image_positions_from_ids(inputs["input_ids"][b])
@@ -1109,7 +1123,7 @@ class Qwen2_5VLIntegration(nn.Module):
             find_text_anchor_positions(
                 inputs["input_ids"][b:b + 1],
                 heatmap_vln.processor.tokenizer,
-                num_history=num_histories[b],
+                num_history=resolved_num_histories[b],
             )
             for b in range(inputs["input_ids"].shape[0])
         ]
@@ -1136,7 +1150,7 @@ class Qwen2_5VLIntegration(nn.Module):
 
         heatmap_output = heatmap_vln.decode_from_inputs_batch(
             inputs,
-            num_histories,
+            resolved_num_histories,
             image_positions_batch=image_positions_batch,
             text_anchors_batch=text_anchors_batch,
             history_rel_poses=history_rel_poses,
@@ -1387,6 +1401,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     return_hidden_states=return_hidden_states,
                     heatmap_vln=heatmap_vln,
                     history_rel_poses=history_rel_poses,
+                    num_histories=panoramic_num_histories,
                 )
             )
             traj_hidden_states = traj_hs

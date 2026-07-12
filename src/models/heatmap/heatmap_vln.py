@@ -171,6 +171,7 @@ class HeatmapVLN(nn.Module):
             current_views,
             history_panoramas,
             instruction=instruction,
+            history_projection_layout=True,
         )
         inputs = self.processor.apply_chat_template(
             messages,
@@ -189,8 +190,15 @@ class HeatmapVLN(nn.Module):
         history_panoramas: Union[torch.Tensor, list[list[dict[str, object]]]],
         instruction: Union[str, list[str | None]] | None = None,
         device: torch.device | None = None,
+        num_histories: list[int] | None = None,
     ) -> tuple[dict[str, torch.Tensor], list[int]]:
-        """Build one batched processor input for panoramic batch forward."""
+        """Build one batched processor input for panoramic batch forward.
+
+        ``num_histories`` carries the unpadded history length for each sample.
+        When the collate step padded ``history_panoramas`` to a shared K, only
+        the real prefix is emitted into the multimodal prompt.  Consequently
+        image occurrences, text anchors, and decoder history rows stay aligned.
+        """
         if device is None:
             device = next(self.fine.parameters()).device
 
@@ -204,19 +212,61 @@ class HeatmapVLN(nn.Module):
         else:
             current_views_list = current_views
 
+        batch_size = len(current_views_list)
+        if num_histories is not None:
+            if len(num_histories) != batch_size:
+                raise ValueError(
+                    "num_histories batch size mismatch: "
+                    f"got {len(num_histories)} for {batch_size} samples"
+                )
+            resolved_num_histories = [int(n) for n in num_histories]
+            if any(n < 0 for n in resolved_num_histories):
+                raise ValueError(f"num_histories must be non-negative, got {resolved_num_histories}")
+        else:
+            resolved_num_histories = None
+
         if torch.is_tensor(history_panoramas):
             if history_panoramas.dim() != 6:
                 raise ValueError(
                     f"Expected history_panoramas [B, N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
                 )
+            if history_panoramas.shape[0] != batch_size:
+                raise ValueError(
+                    "history_panoramas batch size mismatch: "
+                    f"got {history_panoramas.shape[0]} for {batch_size} current panoramas"
+                )
+            available = int(history_panoramas.shape[1])
+            if resolved_num_histories is None:
+                resolved_num_histories = [available] * batch_size
+            if any(n > available for n in resolved_num_histories):
+                raise ValueError(
+                    f"num_histories exceeds padded history size {available}: {resolved_num_histories}"
+                )
             history_panoramas_list = [
-                self._history_tensor_to_list(history_panoramas[b])
+                self._history_tensor_to_list(history_panoramas[b, :resolved_num_histories[b]])
                 for b in range(history_panoramas.shape[0])
             ]
         else:
-            history_panoramas_list = history_panoramas
+            if len(history_panoramas) != batch_size:
+                raise ValueError(
+                    "history_panoramas batch size mismatch: "
+                    f"got {len(history_panoramas)} for {batch_size} current panoramas"
+                )
+            available_per_sample = [len(panos) for panos in history_panoramas]
+            if resolved_num_histories is None:
+                resolved_num_histories = available_per_sample
+            for batch_idx, (requested, available) in enumerate(
+                zip(resolved_num_histories, available_per_sample)
+            ):
+                if requested > available:
+                    raise ValueError(
+                        f"num_histories[{batch_idx}]={requested} exceeds available history {available}"
+                    )
+            history_panoramas_list = [
+                list(panos[:resolved_num_histories[b]])
+                for b, panos in enumerate(history_panoramas)
+            ]
 
-        batch_size = len(current_views_list)
         if isinstance(instruction, list):
             instructions = list(instruction)
             if len(instructions) != batch_size:
@@ -231,6 +281,7 @@ class HeatmapVLN(nn.Module):
                 current_views=current_views_list[b],
                 history_panoramas=history_panoramas_list[b],
                 instruction=instructions[b],
+                history_projection_layout=True,
             )
             for b in range(batch_size)
         ]
@@ -244,7 +295,7 @@ class HeatmapVLN(nn.Module):
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
         self._normalize_multimodal_inputs(inputs)
-        return inputs, [len(panos) for panos in history_panoramas_list]
+        return inputs, resolved_num_histories
 
     @staticmethod
     def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]) -> None:

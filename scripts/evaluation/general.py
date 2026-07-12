@@ -216,6 +216,12 @@ def evaluate(
             current_views = current_views.to(device)
         if history_panoramas is not None:
             history_panoramas = history_panoramas.to(device)
+        history_rel_poses = batch.get('history_rel_poses')
+        if history_rel_poses is not None:
+            history_rel_poses = history_rel_poses.to(device, non_blocking=True)
+        panoramic_num_histories = batch.get('pano_num_histories')
+        if torch.is_tensor(panoramic_num_histories):
+            panoramic_num_histories = [int(value) for value in panoramic_num_histories.tolist()]
 
         # Forward pass
         with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
@@ -225,6 +231,8 @@ def evaluate(
                 current_observation=current_frame.to(device),
                 current_views=current_views,
                 history_panoramas=history_panoramas,
+                panoramic_num_histories=panoramic_num_histories,
+                history_rel_poses=history_rel_poses,
                 return_heatmaps=eval_heatmap,
                 return_actions=eval_trajectory,
             )

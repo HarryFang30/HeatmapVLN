@@ -268,6 +268,12 @@ def evaluate_heatmap(
             current_views = current_views.to(device)
         if history_panoramas is not None:
             history_panoramas = history_panoramas.to(device)
+        history_rel_poses = batch.get('history_rel_poses')
+        if history_rel_poses is not None:
+            history_rel_poses = history_rel_poses.to(device, non_blocking=True)
+        panoramic_num_histories = batch.get('pano_num_histories')
+        if torch.is_tensor(panoramic_num_histories):
+            panoramic_num_histories = [int(value) for value in panoramic_num_histories.tolist()]
 
         # 模型推理（完整扩散）
         with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
@@ -277,6 +283,8 @@ def evaluate_heatmap(
                 current_observation=current_frame.to(device),
                 current_views=current_views,
                 history_panoramas=history_panoramas,
+                history_rel_poses=history_rel_poses,
+                panoramic_num_histories=panoramic_num_histories,
                 return_heatmaps=True,
             )
 
