@@ -308,6 +308,7 @@ if not hasattr(argparse, "BooleanOptionalAction"):
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+from scripts.evaluation.navigation_metrics import aggregate_navigation_metrics
 from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
@@ -3039,39 +3040,12 @@ def _run_eval_panoramic_vlm(
 
     env.close()
 
-    if len(sucs) > 0:
-        sucs_t = torch.tensor(sucs)
-        spls_t = torch.tensor(spls)
-        oss_t = torch.tensor(oss)
-        nes_t = torch.tensor(nes)
-        torch.nan_to_num(spls_t, nan=0.0, posinf=0.0, neginf=0.0, out=spls_t)
-        nes_finite = nes_t[torch.isfinite(nes_t)]
-
-        final_result = {
-            "SR": float(sucs_t.mean().item()),
-            "SPL": float(spls_t.mean().item()),
-            "OS": float(oss_t.mean().item()),
-            "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
-            "total_episodes": len(sucs),
-            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
-        }
-        if bool(getattr(args, "oracle_system2", False)):
-            final_result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
-            final_result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
-            final_result["oracle_system2_max_side_dist_m"] = float(args.oracle_system2_max_side_dist_m)
-    else:
-        final_result = {
-            "SR": 0,
-            "SPL": 0,
-            "OS": 0,
-            "NE": 0,
-            "total_episodes": 0,
-            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
-        }
-        if bool(getattr(args, "oracle_system2", False)):
-            final_result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
-            final_result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
-            final_result["oracle_system2_max_side_dist_m"] = float(args.oracle_system2_max_side_dist_m)
+    final_result = aggregate_navigation_metrics(sucs, spls, oss, nes)
+    final_result["oracle_system2"] = bool(getattr(args, "oracle_system2", False))
+    if bool(getattr(args, "oracle_system2", False)):
+        final_result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
+        final_result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
+        final_result["oracle_system2_max_side_dist_m"] = float(args.oracle_system2_max_side_dist_m)
 
     print("\n" + "=" * 60)
     print("Final Results:")
@@ -3706,38 +3680,16 @@ def run_eval_rpc_panoramic(args):
     env.close()
     client.close()
 
-    if len(sucs) > 0:
-        sucs_t = torch.tensor(sucs)
-        spls_t = torch.tensor(spls)
-        oss_t = torch.tensor(oss)
-        nes_t = torch.tensor(nes)
-        torch.nan_to_num(spls_t, nan=0.0, posinf=0.0, neginf=0.0, out=spls_t)
-        nes_finite = nes_t[torch.isfinite(nes_t)]
-        final_result = {
-            "SR": float(sucs_t.mean().item()),
-            "SPL": float(spls_t.mean().item()),
-            "OS": float(oss_t.mean().item()),
-            "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
-            "total_episodes": len(sucs),
+    final_result = aggregate_navigation_metrics(sucs, spls, oss, nes)
+    final_result.update(
+        {
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
-    else:
-        final_result = {
-            "SR": 0,
-            "SPL": 0,
-            "OS": 0,
-            "NE": 0,
-            "total_episodes": 0,
-            "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
-            "auto_stop_distance": float(args.auto_stop_distance),
-            "trajectory_selection": str(args.trajectory_selection),
-            "system1_coord_order": str(system1_coord_order),
-            "oracle_system2": bool(getattr(args, "oracle_system2", False)),
-        }
+    )
 
     print("\n" + "=" * 60)
     print("Final Results:")
@@ -4228,23 +4180,7 @@ def run_eval(args):
     env.close()
 
     # ── Aggregate results ──
-    if len(sucs) > 0:
-        sucs_t = torch.tensor(sucs)
-        spls_t = torch.tensor(spls)
-        oss_t = torch.tensor(oss)
-        nes_t = torch.tensor(nes)
-        torch.nan_to_num(spls_t, nan=0.0, posinf=0.0, neginf=0.0, out=spls_t)
-        nes_finite = nes_t[torch.isfinite(nes_t)]
-
-        final_result = {
-            "SR": float(sucs_t.mean().item()),
-            "SPL": float(spls_t.mean().item()),
-            "OS": float(oss_t.mean().item()),
-            "NE": float(nes_finite.mean().item()) if len(nes_finite) > 0 else 0.0,
-            "total_episodes": len(sucs),
-        }
-    else:
-        final_result = {"SR": 0, "SPL": 0, "OS": 0, "NE": 0, "total_episodes": 0}
+    final_result = aggregate_navigation_metrics(sucs, spls, oss, nes)
 
     print("\n" + "=" * 60)
     print("Final Results:")
