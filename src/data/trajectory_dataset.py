@@ -1032,6 +1032,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             else:
                 traj_view = "front_down"
                 goal_len = max(goal_frame_idx - current_t, 1)
+                trajectory_end = min(goal_frame_idx + 1, subseq_end, T)
                 interval = 2
                 frame_offsets = np.arange(0, goal_len, interval, dtype=np.int32)
                 if len(frame_offsets) == 0:
@@ -1048,7 +1049,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                         frame_idx = min(current_t + int(offset), goal_frame_idx)
                         curr_img = self._load_traj_image_raw(clip_dir, frame_idx, direction=traj_view)
                         traj_i, valid_i, _progress_i = self._compute_trajectory(
-                            action_poses, frame_idx, subseq_end, current_t,
+                            # Match InternNav's pixel-goal supervision: each
+                            # local trajectory ends at the conditioned goal,
+                            # not at the end of the full navigation episode.
+                            action_poses, frame_idx, trajectory_end, current_t,
                             camera_deg=action_camera_deg,
                             camera_forward_axis=action_camera_forward_axis,
                         )
