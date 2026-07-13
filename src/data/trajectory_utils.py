@@ -66,16 +66,31 @@ def compute_history_rel_poses(
     ]).astype(np.float32)
 
 
-def get_trajectory_relative_to_frame(extrinsics: np.ndarray, camera_deg: float = 0) -> np.ndarray:
+def get_trajectory_relative_to_frame(
+    extrinsics: np.ndarray,
+    camera_deg: float = 0,
+    camera_forward_axis: str = "+z",
+) -> np.ndarray:
     """Compute trajectory poses (x, y, yaw) relative to the first frame.
 
     Args:
-        extrinsics: camera-to-world 4x4 matrices, shape (n, 4, 4)
+        extrinsics: Pose matrices in the convention used by InternNav's
+            trajectory transform, shape (n, 4, 4).
         camera_deg: camera pitch in degrees
+        camera_forward_axis: Camera-space forward axis. InternNav's source
+            poses use ``+z``. Habitat RGB sensors face ``-z``; selecting
+            ``-z`` reflects the resulting local frame so that ``x`` remains
+            forward, ``y`` remains left, and positive yaw remains a left turn.
 
     Returns:
         relative_xyyaw: (n, 3)
     """
+    if camera_forward_axis not in {"+z", "-z"}:
+        raise ValueError(
+            "camera_forward_axis must be '+z' or '-z', "
+            f"got {camera_forward_axis!r}"
+        )
+
     T_camera2robot = np.array([
         [[0.0, -1.0, 0.0, 0.0],
          [0.0, 0.0, -1.0, 0.0],
@@ -112,6 +127,13 @@ def get_trajectory_relative_to_frame(extrinsics: np.ndarray, camera_deg: float =
     relative_yaws = np.arctan2(relative_to_ref[:, 1, 0], relative_to_ref[:, 0, 0])
 
     relative_xyyaw = np.concatenate((relative_translations, relative_yaws.reshape(-1, 1)), axis=-1)
+
+    if camera_forward_axis == "-z":
+        # InternNav consumes (forward, left, left-positive yaw). Changing the
+        # camera forward axis from +Z to Habitat's -Z reflects forward and
+        # handedness, so x and yaw change sign while lateral y does not.
+        relative_xyyaw[:, 0] *= -1.0
+        relative_xyyaw[:, 2] *= -1.0
 
     return relative_xyyaw
 

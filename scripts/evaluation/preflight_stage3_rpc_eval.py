@@ -110,6 +110,11 @@ def validate_stage3_config(
         errors.append("data.trajectory.panoramic_vlm_input must be true")
     if trajectory.get("structured_pano_output") is not True:
         errors.append("data.trajectory.structured_pano_output must be true")
+    if trajectory.get("trajectory_target_convention") != "internnav_habitat":
+        errors.append(
+            "data.trajectory.trajectory_target_convention must be "
+            "'internnav_habitat'"
+        )
 
     llm = config.get("model", {}).get("llm", {})
     layers = [int(value) for value in (llm.get("lora_layer_indices") or [])]

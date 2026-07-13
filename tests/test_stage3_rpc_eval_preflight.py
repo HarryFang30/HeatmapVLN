@@ -16,6 +16,7 @@ def _config(*, dim: int = 8, adapter_hidden_dim: int = 4) -> dict:
             "trajectory": {
                 "panoramic_vlm_input": True,
                 "structured_pano_output": True,
+                "trajectory_target_convention": "internnav_habitat",
             }
         },
         "model": {
@@ -127,6 +128,16 @@ def test_stage3_rpc_preflight_rejects_partial_lora_checkpoint(tmp_path):
 
     with pytest.raises(ValueError, match="Base LoRA checkpoint validation failed"):
         validate_base_checkpoint(base_path, summary)
+
+
+def test_stage3_rpc_preflight_rejects_legacy_trajectory_targets():
+    config = _config()
+    config["data"]["trajectory"]["trajectory_target_convention"] = (
+        "legacy_pitched_camera"
+    )
+
+    with pytest.raises(ValueError, match="trajectory_target_convention"):
+        validate_stage3_config(config, expected_adapter_hidden_dim=4)
 
 
 def test_stage3_rpc_preflight_rejects_nonfinite_adapter(tmp_path):

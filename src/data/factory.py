@@ -111,6 +111,9 @@ def build_trajectory_dataset(
         panoramic_vlm_input=traj_cfg.get("panoramic_vlm_input", True),
         compute_pano_view_pixel_goal=traj_cfg.get("compute_pano_view_pixel_goal"),
         pano_max_side_dist_m=traj_cfg.get("pano_max_side_dist_m", 6.0),
+        trajectory_target_convention=traj_cfg.get(
+            "trajectory_target_convention", "legacy_pitched_camera"
+        ),
         max_clips=traj_cfg.get("max_clips", 0),
     )
     kwargs.update(overrides)

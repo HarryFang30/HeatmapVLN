@@ -18,8 +18,8 @@ seed: 42
 
 paths:
   dataset_root: /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data
-  log_out_dir: /mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024
-  tensorboard_dir: /mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024
+  log_out_dir: /mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords
+  tensorboard_dir: /mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords
   internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
 
 data:
@@ -58,6 +58,10 @@ data:
     include_stop_samples_random_subsequence: false
     predict_horizon: 32
     action_scale: 4.0
+    # The collected Habitat camera faces -Z, while InternNav trajectories use
+    # x=forward, y=left, and left-positive yaw. Build targets from the level
+    # front pose so front_down pitch/mount motion cannot pollute agent actions.
+    trajectory_target_convention: internnav_habitat
     enable_augmentation: false
     enable_trajectory_augmentation: false
     compute_pixel_goal: true

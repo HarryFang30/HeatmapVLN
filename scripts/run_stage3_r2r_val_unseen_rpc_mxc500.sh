@@ -16,14 +16,14 @@ export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-${FJL_ROOT}/InternNav-Model
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 export STAGE3_EVAL_CONFIG="${STAGE3_EVAL_CONFIG:-configs/train_stage3_pano_system1_h1024_8gpu.yaml}"
 export STAGE3_EVAL_BASE_CKPT="${STAGE3_EVAL_BASE_CKPT:-${FJL_ROOT}/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
-export STAGE3_EVAL_TRAIN_OUT_DIR="${STAGE3_EVAL_TRAIN_OUT_DIR:-${FJL_ROOT}/model/output_stage3_pano_system1_full_11000_alllora_h1024}"
+export STAGE3_EVAL_TRAIN_OUT_DIR="${STAGE3_EVAL_TRAIN_OUT_DIR:-${FJL_ROOT}/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
 export STAGE3_EVAL_EXPECTED_EPOCH="${STAGE3_EVAL_EXPECTED_EPOCH:-2}"
 printf -v STAGE3_EVAL_CHECKPOINT_NAME 'epoch_%03d.pth' "$STAGE3_EVAL_EXPECTED_EPOCH"
 export STAGE3_EVAL_CHECKPOINT="${STAGE3_EVAL_CHECKPOINT:-${STAGE3_EVAL_TRAIN_OUT_DIR}/latest/checkpoints/${STAGE3_EVAL_CHECKPOINT_NAME}}"
 
 export STAGE3_EVAL_SCENES_DIR="${STAGE3_EVAL_SCENES_DIR:-${FJL_ROOT}/habitat/VLN-CE/data/scene_datasets}"
 export STAGE3_EVAL_DATA_PATH="${STAGE3_EVAL_DATA_PATH:-${FJL_ROOT}/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/val_unseen/val_unseen.json.gz}"
-export STAGE3_EVAL_OUTPUT_PATH="${STAGE3_EVAL_OUTPUT_PATH:-${FJL_ROOT}/model/eval_stage3_r2r_val_unseen_full_11000_alllora_h1024_epoch${STAGE3_EVAL_EXPECTED_EPOCH}_no_privileged_stop}"
+export STAGE3_EVAL_OUTPUT_PATH="${STAGE3_EVAL_OUTPUT_PATH:-${FJL_ROOT}/model/eval_stage3_r2r_val_unseen_full_11000_alllora_h1024_internnavcoords_epoch${STAGE3_EVAL_EXPECTED_EPOCH}_no_privileged_stop}"
 
 export STAGE3_EVAL_MODEL_GPU="${STAGE3_EVAL_MODEL_GPU:-0}"
 export STAGE3_EVAL_DISPLAY="${STAGE3_EVAL_DISPLAY:-localhost:200.0}"
@@ -39,7 +39,9 @@ export STAGE3_EVAL_MAX_STEPS="${STAGE3_EVAL_MAX_STEPS:-500}"
 export STAGE3_EVAL_MAX_SYSTEM2_CALLS="${STAGE3_EVAL_MAX_SYSTEM2_CALLS:-0}"
 export STAGE3_EVAL_NUM_HISTORY="${STAGE3_EVAL_NUM_HISTORY:-8}"
 export STAGE3_EVAL_TRAJECTORY_SELECTION="${STAGE3_EVAL_TRAJECTORY_SELECTION:-mean}"
-export STAGE3_EVAL_TRAJECTORY_X_SIGN="${STAGE3_EVAL_TRAJECTORY_X_SIGN:--1}"
+# Corrected Stage3 checkpoints already emit native InternNav coordinates.
+# Set -1 explicitly only when diagnosing a legacy pre-coordinate-fix checkpoint.
+export STAGE3_EVAL_TRAJECTORY_X_SIGN="${STAGE3_EVAL_TRAJECTORY_X_SIGN:-1}"
 export STAGE3_EVAL_SYSTEM1_COORD_ORDER="${STAGE3_EVAL_SYSTEM1_COORD_ORDER:-generated}"
 export STAGE3_EVAL_AUTO_STOP_DISTANCE="${STAGE3_EVAL_AUTO_STOP_DISTANCE:-0.0}"
 export STAGE3_EVAL_ORACLE_SYSTEM2="${STAGE3_EVAL_ORACLE_SYSTEM2:-0}"

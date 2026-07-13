@@ -121,6 +121,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         panoramic_vlm_input: bool = True,
         compute_pano_view_pixel_goal: bool | None = None,
         pano_max_side_dist_m: float = 6.0,
+        trajectory_target_convention: str = "legacy_pitched_camera",
         max_clips: int = 0,
     ):
         # ``VLNSlidingWindowDataset.__init__`` calls ``self._build_sample_index()``
@@ -176,6 +177,17 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             compute_pano_view_pixel_goal = panoramic_vlm_input and self.compute_pixel_goal
         self.compute_pano_view_pixel_goal = bool(compute_pano_view_pixel_goal)
         self.pano_max_side_dist_m = float(pano_max_side_dist_m)
+        allowed_target_conventions = {
+            "legacy_pitched_camera",
+            "internnav_habitat",
+        }
+        if trajectory_target_convention not in allowed_target_conventions:
+            raise ValueError(
+                "trajectory_target_convention must be one of "
+                f"{sorted(allowed_target_conventions)}, got "
+                f"{trajectory_target_convention!r}"
+            )
+        self.trajectory_target_convention = trajectory_target_convention
 
         if self.require_sft_target:
             self._build_sample_index()
@@ -205,7 +217,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"system2_stop_oversample={self.system2_stop_oversample}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}, "
             f"compute_pano_view_pixel_goal={self.compute_pano_view_pixel_goal}, "
-            f"pano_max_side_dist_m={self.pano_max_side_dist_m}"
+            f"pano_max_side_dist_m={self.pano_max_side_dist_m}, "
+            f"trajectory_target_convention={self.trajectory_target_convention}"
         )
 
     def set_epoch(self, epoch: int):
@@ -703,6 +716,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         subseq_end: int,
         subseq_start: int = 0,
         camera_deg: float = 0,
+        camera_forward_axis: str = "+z",
     ) -> tuple[np.ndarray, float, float]:
         """
         从位姿计算轨迹
@@ -741,7 +755,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         # 计算相对于当前帧的轨迹
         try:
-            relative_xyyaw = get_trajectory_relative_to_frame(future_poses_np, camera_deg=camera_deg)
+            relative_xyyaw = get_trajectory_relative_to_frame(
+                future_poses_np,
+                camera_deg=camera_deg,
+                camera_forward_axis=camera_forward_axis,
+            )
 
             # 插值和重采样到 predict_horizon 步
             _, resampled_poses = interpolate_and_resample_trajectory(
@@ -811,7 +829,17 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         poses = self._load_poses(clip_idx)
         action_poses = poses
         action_camera_deg = 0.0
-        if self.load_traj_images:
+        action_camera_forward_axis = "+z"
+        if self.trajectory_target_convention == "internnav_habitat":
+            # The action target is an agent trajectory, so derive it from the
+            # level front pose. The collected front_down pose rotates the
+            # camera mount offset with pitch and introduces false translation
+            # during in-place turns. Habitat cameras face -Z, unlike the +Z
+            # convention assumed by InternNav's source trajectory utility.
+            action_poses = poses
+            action_camera_deg = 0.0
+            action_camera_forward_axis = "-z"
+        elif self.load_traj_images:
             action_poses = self._load_poses_for_direction(clip_idx, "front_down")
             # Stored chunk poses are camera-to-world matrices.  The front_down
             # pose already contains the downward camera pitch, while
@@ -866,6 +894,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         trajectory, trajectory_valid, progress = self._compute_trajectory(
             action_poses, current_t, subseq_end, subseq_start,
             camera_deg=action_camera_deg,
+            camera_forward_axis=action_camera_forward_axis,
         )
 
         # 9. 应用轨迹增强
@@ -1021,6 +1050,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                         traj_i, valid_i, _progress_i = self._compute_trajectory(
                             action_poses, frame_idx, subseq_end, current_t,
                             camera_deg=action_camera_deg,
+                            camera_forward_axis=action_camera_forward_axis,
                         )
                         if self.enable_trajectory_augmentation and valid_i > 0:
                             traj_i = apply_trajectory_augmentation(traj_i, p=0.5)

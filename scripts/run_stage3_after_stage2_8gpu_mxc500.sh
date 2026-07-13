@@ -30,9 +30,9 @@ export STAGE2_ADAPTER_FINAL_EPOCH="${STAGE2_ADAPTER_FINAL_EPOCH:-3}"
 printf -v STAGE2_FINAL_CHECKPOINT_NAME 'epoch_%03d.pth' "$STAGE2_ADAPTER_FINAL_EPOCH"
 export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-${STAGE2_ADAPTER_OUT_DIR}/${STAGE2_FINAL_CHECKPOINT_NAME}}"
 
-export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024}"
-export LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_full_11000_alllora_h1024_8gpu_mxc500.log}"
+export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
+export LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_8gpu_mxc500.log}"
 
 # Formal Stage3 settings validated by the four-GPU, 100-step smoke run.
 export STAGE3_EPOCHS=2

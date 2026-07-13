@@ -97,6 +97,7 @@ class TrajectoryConfig(_Lenient):
     system2_stop_oversample: int = 5
     include_stop_samples_random_subsequence: bool = False
     panoramic_vlm_input: bool = True
+    trajectory_target_convention: str = "legacy_pitched_camera"
 
     @model_validator(mode="before")
     @classmethod
@@ -124,6 +125,17 @@ class TrajectoryConfig(_Lenient):
         allowed = {"front", "right", "back", "left", "front_down"}
         if v not in allowed:
             raise ValueError(f"pixel_goal_direction must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("trajectory_target_convention")
+    @classmethod
+    def _check_trajectory_target_convention(cls, v: str) -> str:
+        allowed = {"legacy_pitched_camera", "internnav_habitat"}
+        if v not in allowed:
+            raise ValueError(
+                "trajectory_target_convention must be one of "
+                f"{allowed}, got {v!r}"
+            )
         return v
 
     @field_validator("sft_num_future_steps")

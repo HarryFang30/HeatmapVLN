@@ -46,6 +46,14 @@ class TestLoadConfig:
 
 
 class TestPydanticValidation:
+    def test_trajectory_target_convention_rejects_unknown_value(self, minimal_cfg):
+        minimal_cfg["data"]["dataset_type"] = "trajectory"
+        minimal_cfg["data"]["trajectory"] = {
+            "trajectory_target_convention": "mirrored",
+        }
+        with pytest.raises(ValueError, match="trajectory_target_convention"):
+            validate_config(minimal_cfg)
+
     def test_paths_unknown_key_raises(self, minimal_cfg):
         minimal_cfg["paths"] = {"dataset_root": "/tmp/x", "typo_key": "y"}
         with pytest.raises(ValueError, match="Unknown paths keys"):

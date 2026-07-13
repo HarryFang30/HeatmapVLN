@@ -90,8 +90,8 @@ export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/
 export STAGE3_CONFIG="${STAGE3_CONFIG:-configs/train_stage3_pano_system1_h1024_8gpu.yaml}"
 export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
 export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth}"
-export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024}"
+export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
 export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/lixiaoou/intern/fjl/tmp}"
 
 export GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -218,6 +218,11 @@ set_float(data, "shm_bypass_min_gb", "STAGE3_SHM_BYPASS_MIN_GB")
 trajectory = data.setdefault("trajectory", {})
 set_int(trajectory, "system2_sample_step", "STAGE3_SYSTEM2_SAMPLE_STEP")
 set_int(trajectory, "max_clips", "STAGE3_MAX_CLIPS")
+if trajectory.get("trajectory_target_convention") != "internnav_habitat":
+    raise RuntimeError(
+        "Stage3 requires data.trajectory.trajectory_target_convention="
+        "internnav_habitat so GT actions match frozen InternNav System1"
+    )
 
 model = cfg.setdefault("model", {})
 llm = model.setdefault("llm", {})
@@ -270,6 +275,7 @@ echo "[launcher] data=$PANORAMIC_DATA_ROOT"
 echo "[launcher] base=$STAGE3_BASE_CKPT"
 echo "[launcher] adapter=$STAGE3_ADAPTER_CKPT"
 echo "[launcher] out=$STAGE3_OUT_DIR"
+echo "[launcher] trajectory_target_convention=internnav_habitat (x=forward, y=left, yaw=left-positive)"
 echo "[launcher] gpus=$GPU_DEVICES nproc=$NPROC_PER_NODE"
 
 train_args=(--config "$TMP_CONFIG" --load-weights "$STAGE3_BASE_CKPT")
