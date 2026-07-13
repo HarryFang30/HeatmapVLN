@@ -1970,10 +1970,16 @@ def traj_to_actions(
     num_sample_trajs: int = 32,
     action_scale: float = 4.0,
     trajectory_selection: str = "mean",
+    trajectory_x_sign: float = 1.0,
 ) -> list[int]:
     """Convert InternNav trajectory predictions to discrete Habitat actions."""
-    trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy()
+    if trajectory_x_sign not in (-1.0, 1.0):
+        raise ValueError(
+            f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
+        )
+    trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy().copy()
     trajs[:, :, :2] /= action_scale
+    trajs[:, :, 0] *= trajectory_x_sign
     all_trajectory = reconstruct_xy_from_delta(trajs)
     trajectory, _selected_idx = select_trajectory_xy(all_trajectory, trajectory_selection)
     actions = _trajectory_to_discrete_actions_close_to_goal(trajectory)
@@ -2348,7 +2354,7 @@ def _run_eval_panoramic_vlm(
                 gt_path=gt_path,
             )
 
-        while (not done) and (step_id <= max_steps_per_episode):
+        while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
             turn_lookdown_img: Image.Image | None = None
 
@@ -3264,6 +3270,7 @@ def _rpc_plan_panoramic(
     traj_image_size: tuple[int, int],
     system1_coord_order: str,
     trajectory_selection: str,
+    trajectory_x_sign: float,
     jpeg_quality: int,
     oracle_system2: dict[str, Any] | None = None,
 ) -> dict:
@@ -3282,6 +3289,7 @@ def _rpc_plan_panoramic(
         "traj_image_size": list(traj_image_size),
         "system1_coord_order": system1_coord_order,
         "trajectory_selection": trajectory_selection,
+        "trajectory_x_sign": trajectory_x_sign,
     }
     if oracle_system2 is not None:
         payload["oracle_system2"] = oracle_system2
@@ -3323,6 +3331,7 @@ def run_eval_rpc_panoramic(args):
     print(f"Using RPC model server: {args.rpc_server}")
     print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
     print(f"trajectory_selection={args.trajectory_selection}")
+    print(f"trajectory_x_sign={args.trajectory_x_sign:g}")
     if bool(getattr(args, "oracle_system2", False)):
         print(
             "[rpc-eval] --oracle_system2 is ACTIVE; System2 text will be "
@@ -3424,7 +3433,7 @@ def run_eval_rpc_panoramic(args):
                 gt_path=gt_path,
             )
 
-        while (not done) and (step_id <= max_steps_per_episode):
+        while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
             stop_result = _maybe_stop_at_success(env, args, step_id)
             if stop_result is not None:
@@ -3537,6 +3546,7 @@ def run_eval_rpc_panoramic(args):
                 traj_image_size=traj_image_size,
                 system1_coord_order=system1_coord_order,
                 trajectory_selection=args.trajectory_selection,
+                trajectory_x_sign=args.trajectory_x_sign,
                 jpeg_quality=args.rpc_jpeg_quality,
                 oracle_system2=oracle_system2,
             )
@@ -3665,6 +3675,7 @@ def run_eval_rpc_panoramic(args):
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
+            "trajectory_x_sign": float(args.trajectory_x_sign),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
@@ -3686,6 +3697,7 @@ def run_eval_rpc_panoramic(args):
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
+            "trajectory_x_sign": float(args.trajectory_x_sign),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
@@ -3873,7 +3885,7 @@ def run_eval(args):
         step_id = 0
         done = False
 
-        while (not done) and (step_id <= max_steps_per_episode):
+        while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
             stop_result = _maybe_stop_at_success(env, args, step_id)
             if stop_result is not None:
@@ -4372,6 +4384,16 @@ def main():
             "How to select one local trajectory from parallel diffusion samples "
             "before decoding Habitat actions. mean preserves the original "
             "InternNav-compatible behavior."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_x_sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=1.0,
+        help=(
+            "Multiply predicted trajectory x by this sign before InternNav "
+            "discretization. Stage3 pose-derived targets use -x as forward."
         ),
     )
     parser.add_argument(

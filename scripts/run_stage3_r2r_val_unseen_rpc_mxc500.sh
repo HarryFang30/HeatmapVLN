@@ -39,6 +39,7 @@ export STAGE3_EVAL_MAX_STEPS="${STAGE3_EVAL_MAX_STEPS:-500}"
 export STAGE3_EVAL_MAX_SYSTEM2_CALLS="${STAGE3_EVAL_MAX_SYSTEM2_CALLS:-0}"
 export STAGE3_EVAL_NUM_HISTORY="${STAGE3_EVAL_NUM_HISTORY:-8}"
 export STAGE3_EVAL_TRAJECTORY_SELECTION="${STAGE3_EVAL_TRAJECTORY_SELECTION:-mean}"
+export STAGE3_EVAL_TRAJECTORY_X_SIGN="${STAGE3_EVAL_TRAJECTORY_X_SIGN:--1}"
 export STAGE3_EVAL_SYSTEM1_COORD_ORDER="${STAGE3_EVAL_SYSTEM1_COORD_ORDER:-generated}"
 export STAGE3_EVAL_AUTO_STOP_DISTANCE="${STAGE3_EVAL_AUTO_STOP_DISTANCE:-0.0}"
 export STAGE3_EVAL_ORACLE_SYSTEM2="${STAGE3_EVAL_ORACLE_SYSTEM2:-0}"
@@ -129,6 +130,13 @@ if is_true "$STAGE3_EVAL_RESUME" && is_true "$STAGE3_EVAL_OVERWRITE"; then
   echo "STAGE3_EVAL_RESUME and STAGE3_EVAL_OVERWRITE cannot both be enabled" >&2
   exit 1
 fi
+case "$STAGE3_EVAL_TRAJECTORY_X_SIGN" in
+  -1|-1.0|1|1.0) ;;
+  *)
+    echo "STAGE3_EVAL_TRAJECTORY_X_SIGN must be -1 or 1" >&2
+    exit 1
+    ;;
+esac
 
 privileged_requested="$($QWEN25_PYTHON - "$STAGE3_EVAL_AUTO_STOP_DISTANCE" <<'PY'
 import sys
@@ -237,6 +245,7 @@ echo "[stage3-eval] rpc=$RPC_SERVER_ADDR rpc_root=$RPC_ROOT"
 echo "[stage3-eval] model_gpu=$STAGE3_EVAL_MODEL_GPU display=$STAGE3_EVAL_DISPLAY"
 echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
+echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN"
 
 if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
   echo "[$(date '+%F %T')] STAGE3_EVAL_PREFLIGHT_ONLY=1; all static preflights passed"
@@ -341,6 +350,7 @@ manifest = {
     "auto_stop_distance": float(os.environ["STAGE3_EVAL_AUTO_STOP_DISTANCE"]),
     "oracle_system2": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2"].lower() in {"1", "true", "yes", "on"},
     "trajectory_selection": os.environ["STAGE3_EVAL_TRAJECTORY_SELECTION"],
+    "trajectory_x_sign": float(os.environ["STAGE3_EVAL_TRAJECTORY_X_SIGN"]),
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
 }
 Path(sys.argv[1]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -362,6 +372,7 @@ client_args=(
   --auto_stop_distance "$STAGE3_EVAL_AUTO_STOP_DISTANCE"
   --max_system2_calls_per_episode "$STAGE3_EVAL_MAX_SYSTEM2_CALLS"
   --trajectory_selection "$STAGE3_EVAL_TRAJECTORY_SELECTION"
+  --trajectory_x_sign "$STAGE3_EVAL_TRAJECTORY_X_SIGN"
   --system1_coord_order "$STAGE3_EVAL_SYSTEM1_COORD_ORDER"
   --no-debug_input_trace
   --debug_save_input_images 0

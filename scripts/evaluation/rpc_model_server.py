@@ -499,22 +499,34 @@ def traj_to_actions(
     num_sample_trajs: int = 32,
     action_scale: float = 4.0,
     trajectory_selection: str = "mean",
+    trajectory_x_sign: float = 1.0,
 ) -> list[int]:
-    trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy()
+    if trajectory_x_sign not in (-1.0, 1.0):
+        raise ValueError(
+            f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
+        )
+    trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy().copy()
     trajs[:, :, :2] /= action_scale
+    trajs[:, :, 0] *= trajectory_x_sign
     all_trajectory = reconstruct_xy_from_delta(trajs)
     trajectory, _selected_idx = select_trajectory_xy(all_trajectory, trajectory_selection)
     actions = _trajectory_to_discrete_actions_close_to_goal(trajectory)
     return actions if actions else [ActionCode.STOP]
 
 
-def _trajectory_debug_summary(trajectory: torch.Tensor, num_sample_trajs: int, action_scale: float) -> str:
+def _trajectory_debug_summary(
+    trajectory: torch.Tensor,
+    num_sample_trajs: int,
+    action_scale: float,
+    trajectory_x_sign: float = 1.0,
+) -> str:
     if trajectory is None or trajectory.numel() == 0:
         return "trajectory=empty"
     trajs = trajectory[:num_sample_trajs].float().detach().cpu().numpy().copy()
     if trajs.ndim != 3 or trajs.shape[-1] < 2:
         return f"trajectory_shape={tuple(trajectory.shape)}"
     trajs[:, :, :2] /= float(action_scale)
+    trajs[:, :, 0] *= float(trajectory_x_sign)
     cumsum_xy = np.cumsum(trajs[:, :, :2], axis=1)
     xy = np.concatenate([np.zeros((trajs.shape[0], 1, 2), dtype=cumsum_xy.dtype), cumsum_xy], axis=1)
     mean_xy = xy.mean(axis=0)
@@ -741,6 +753,11 @@ class HeatmapVLNRuntime:
         if system1_coord_order == "auto":
             system1_coord_order = "generated"
         trajectory_selection = str(payload.get("trajectory_selection", "mean"))
+        trajectory_x_sign = float(payload.get("trajectory_x_sign", 1.0))
+        if trajectory_x_sign not in (-1.0, 1.0):
+            raise ValueError(
+                f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
+            )
         oracle_system2 = payload.get("oracle_system2")
         if not isinstance(oracle_system2, dict):
             oracle_system2 = None
@@ -876,6 +893,7 @@ class HeatmapVLNRuntime:
                     num_sample_trajs=self.num_sample_trajs,
                     action_scale=self.action_scale,
                     trajectory_selection=trajectory_selection,
+                    trajectory_x_sign=trajectory_x_sign,
                 )
             )
             if local_actions and local_actions[0] == ActionCode.STOP:
@@ -888,7 +906,9 @@ class HeatmapVLNRuntime:
                     trajectory,
                     self.num_sample_trajs,
                     self.action_scale,
+                    trajectory_x_sign,
                 ),
+                "trajectory_x_sign": trajectory_x_sign,
             })
             return response
 
