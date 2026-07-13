@@ -52,3 +52,14 @@ def test_result_has_system2_sft_target_handles_structured_stop_and_turn():
         "is_stop": 0.0,
     })
 
+
+def test_system1_goal_length_prefers_structured_pano_goal():
+    result = {
+        "pano_sample_kind": "pixel",
+        "pano_pixel_goal": [211, 128],
+        "pano_pixel_goal_relative_len": 7,
+        "pixel_goal": [120, 96],
+        "pixel_goal_relative_len": 19,
+    }
+
+    assert VLNTrajectoryDataset._system1_goal_relative_len(result) == 7

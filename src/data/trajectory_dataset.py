@@ -507,6 +507,16 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             return True
         return self.sft_include_forward and discrete_action == 1
 
+    @staticmethod
+    def _system1_goal_relative_len(result: dict) -> int:
+        """Return the frame offset for the goal actually sent to System1."""
+        pano_kind = str(result.get("pano_sample_kind") or "").lower()
+        if pano_kind == "pixel" and result.get("pano_pixel_goal") is not None:
+            return int(result.get("pano_pixel_goal_relative_len") or 0)
+        if result.get("pixel_goal") is not None:
+            return int(result.get("pixel_goal_relative_len") or 0)
+        return 0
+
     def _candidate_retry_indices(self, idx: int, max_attempts: int = 64) -> list[int]:
         total = len(self.sample_index)
         if total <= 1:
@@ -1002,11 +1012,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     result["pano_view_id"] = VIEW_TURN
                     result["pano_sample_kind"] = "turn"
 
-        goal_rel_len = result.get(
-            "pixel_goal_relative_len",
-            result.get("pano_pixel_goal_relative_len", 0),
-        )
-        goal_frame_idx = current_t + int(goal_rel_len or 0)
+        goal_rel_len = self._system1_goal_relative_len(result)
+        goal_frame_idx = current_t + goal_rel_len
         has_system1_goal = (
             result.get("pixel_goal") is not None
             or (
