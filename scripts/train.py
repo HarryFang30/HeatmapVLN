@@ -667,11 +667,13 @@ def main():
                 'compute_pano_text_anchor_positions',
                 True,
             ),
+            heatmap_layout=stage_uses_heatmap_targets,
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled "
             "(n_traj_query=%d, sft_mode=%s, build_sft_labels=%s, return_lm_loss=%s, "
-            "protocol=%s, max_seq_len=%d, heatmap_targets=%s, raw_pano=%s, anchors=%s)",
+            "protocol=%s, max_seq_len=%d, heatmap_targets=%s, raw_pano=%s, anchors=%s, "
+            "heatmap_layout=%s)",
             n_traj_query,
             sft_prompt_mode,
             train_lm,
@@ -681,6 +683,7 @@ def main():
             stage_uses_heatmap_targets,
             stage_cfg.get('retain_raw_panoramic_views', True),
             stage_cfg.get('compute_pano_text_anchor_positions', True),
+            stage_uses_heatmap_targets,
         )
     elif getattr(train_dataset, '_is_panoramic', False) and not stage_cfg.get('train_action', True):
         logger.info("   ✅ Heatmap-only stage: using standard panoramic collate path (skip AutoProcessor worker tokenization)")

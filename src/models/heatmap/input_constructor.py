@@ -293,6 +293,7 @@ def construct_input(
     lookdown_frame: Union[Image.Image, torch.Tensor, np.ndarray] | None = None,
     internnav_protocol: bool = False,
     structured_pano_output: bool = False,
+    heatmap_layout: bool = False,
 ) -> list[dict]:
     """
     Construct text-annotated multi-image messages for Qwen2.5-VL.
@@ -304,24 +305,49 @@ def construct_input(
     has_history = len(history_panoramas) > 0
 
     prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
-    if has_history:
+    if has_history and not heatmap_layout:
         prompt_text += " These are your historical observations:"
     content.append({"type": "text", "text": prompt_text})
 
-    for hist_idx, hist in enumerate(history_panoramas):
-        content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
+    if heatmap_layout:
+        # Heatmap feature extraction treats image occurrences 0..3 as the
+        # current panorama.  Put those images first so the occurrence mapping
+        # is explicit and stable.  History query anchors are deliberately
+        # placed *after* their four images: Qwen is a causal decoder, so an
+        # anchor before the images cannot aggregate their visual tokens.
+        content.append({
+            "type": "text",
+            "text": (
+                f"Current panoramic observation "
+                f"(views: {', '.join(VIEW_NAMES)}):"
+            ),
+        })
         for view_name in VIEW_NAMES:
-            content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
+            content.append({"type": "image", "image": _ensure_pil(current_views[view_name])})
 
-    content.append({
-        "type": "text",
-        "text": (
-            f"Current panoramic observation "
-            f"(views: {', '.join(VIEW_NAMES)}):"
-        ),
-    })
-    for view_name in VIEW_NAMES:
-        content.append({"type": "image", "image": _ensure_pil(current_views[view_name])})
+        for hist_idx, hist in enumerate(history_panoramas):
+            content.append({
+                "type": "text",
+                "text": f"Historical panorama {hist_idx + 1} in {', '.join(VIEW_NAMES)} order:",
+            })
+            for view_name in VIEW_NAMES:
+                content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
+            content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
+    else:
+        for hist_idx, hist in enumerate(history_panoramas):
+            content.append({"type": "text", "text": _build_history_anchor_text(hist_idx)})
+            for view_name in VIEW_NAMES:
+                content.append({"type": "image", "image": _ensure_pil(hist[view_name])})
+
+        content.append({
+            "type": "text",
+            "text": (
+                f"Current panoramic observation "
+                f"(views: {', '.join(VIEW_NAMES)}):"
+            ),
+        })
+        for view_name in VIEW_NAMES:
+            content.append({"type": "image", "image": _ensure_pil(current_views[view_name])})
 
     nav_target_text = assistant_text
     if nav_target_text is None and pixel_goal is not None:
@@ -394,8 +420,9 @@ def find_text_anchor_positions(
     """
     Locate the end token of each exact history-anchor annotation.
 
-    After LLM attention, these token positions aggregate visual information
-    from the following 4 images, serving as compact query vectors.
+    In the heatmap-specific prompt layout, every anchor follows its four
+    historical images.  After causal LLM attention, the anchor can therefore
+    aggregate both the current panorama and its corresponding history images.
     """
     ids = input_ids.squeeze().tolist()
 

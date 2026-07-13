@@ -230,6 +230,21 @@ class VLNSlidingWindowDataset(Dataset):
             return False
         try:
             clip_dir = self.clips[0]
+            meta_path = clip_dir / "meta.json"
+            if meta_path.exists():
+                with meta_path.open("r", encoding="utf-8") as handle:
+                    meta = json.load(handle)
+                depth_unit = str(
+                    meta.get("depth_unit")
+                    or meta.get("data_format", {}).get("depth_unit")
+                    or ""
+                ).strip().lower()
+                if depth_unit in {"meter", "meters", "metre", "metres", "m"}:
+                    logger.info("Depth format: meters (declared by meta.json)")
+                    return True
+                if depth_unit in {"normalized", "normalised", "unit", "0-1", "[0,1]"}:
+                    logger.info("Depth format: normalized [0,1] (declared by meta.json)")
+                    return False
             depth_npy = clip_dir / "depth" / "000000.npy"
             if depth_npy.exists():
                 d = np.load(str(depth_npy))

@@ -36,9 +36,15 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.training.checkpoint import load_checkpoint_for_resume
 from scripts.training.model_builder import build_model
-from scripts.training.utils import load_config, make_autocast_context
+from scripts.training.utils import (
+    _load_normalized_state_dict,
+    _normalize_state_key,
+    assert_complete_lora_checkpoint_match,
+    load_config,
+    make_autocast_context,
+    safe_torch_load,
+)
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -49,6 +55,67 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("eval_heatmap")
+
+
+def materialize_and_load_heatmap_checkpoint(model, checkpoint_path: str) -> dict[str, int]:
+    """Materialize lazy Qwen/head modules, then require a complete checkpoint.
+
+    Loading before these modules exist silently drops their tensors because
+    the shared checkpoint loader is intentionally non-strict.  A heatmap
+    evaluation with base LoRA or a random decoder is invalid, so this entry
+    point fails closed on incomplete LoRA/head state.
+    """
+    checkpoint = safe_torch_load(checkpoint_path)
+    state = checkpoint.get('trainable_state_dict', {})
+    if not state:
+        raise RuntimeError(f"Checkpoint has no trainable_state_dict: {checkpoint_path}")
+
+    model.qwen2_5_vl._load_model()
+    matched_lora = assert_complete_lora_checkpoint_match(
+        model,
+        state,
+        checkpoint_path=checkpoint_path,
+    )
+    model._ensure_heatmap_vln()
+    if model.heatmap_vln is None:
+        raise RuntimeError("Heatmap evaluation requires model.heatmap_vln to be enabled")
+
+    expected_head = {
+        _normalize_state_key(f"heatmap_vln.{name}"): parameter
+        for name, parameter in model.heatmap_vln.named_parameters()
+        if not name.startswith("qwen.")
+    }
+    normalized_checkpoint = {
+        _normalize_state_key(name): value
+        for name, value in state.items()
+    }
+    missing_head = sorted(set(expected_head) - set(normalized_checkpoint))
+    mismatched_head = sorted(
+        name
+        for name in set(expected_head) & set(normalized_checkpoint)
+        if tuple(expected_head[name].shape) != tuple(normalized_checkpoint[name].shape)
+    )
+    if missing_head or mismatched_head:
+        raise RuntimeError(
+            "Incomplete heatmap-head checkpoint load refused: "
+            f"expected={len(expected_head)} missing={len(missing_head)} "
+            f"shape_mismatches={len(mismatched_head)} "
+            f"missing_preview={missing_head[:5]} "
+            f"shape_mismatch_preview={mismatched_head[:5]}"
+        )
+
+    _missing, _unexpected, loaded = _load_normalized_state_dict(model, state)
+    logger.info(
+        "Loaded validated heatmap checkpoint: total=%d LoRA=%d head=%d",
+        loaded,
+        matched_lora,
+        len(expected_head),
+    )
+    return {
+        "loaded_tensors": loaded,
+        "matched_lora_tensors": matched_lora,
+        "matched_heatmap_head_tensors": len(expected_head),
+    }
 
 
 def should_use_gpu_gt(batch: dict[str, Any]) -> bool:
@@ -264,10 +331,13 @@ def evaluate_heatmap(
         instruction = list(text) if text else None
         current_views = batch.get('current_views')
         history_panoramas = batch.get('history_panoramas')
+        history_rel_poses = batch.get('history_rel_poses')
         if current_views is not None:
             current_views = current_views.to(device)
         if history_panoramas is not None:
             history_panoramas = history_panoramas.to(device)
+        if history_rel_poses is not None:
+            history_rel_poses = history_rel_poses.to(device)
 
         # 模型推理（完整扩散）
         with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
@@ -277,6 +347,7 @@ def evaluate_heatmap(
                 current_observation=current_frame.to(device),
                 current_views=current_views,
                 history_panoramas=history_panoramas,
+                history_rel_poses=history_rel_poses,
                 return_heatmaps=True,
             )
 
@@ -394,7 +465,7 @@ def main():
     # Build model
     logger.info("Building model...")
     model = build_model(cfg)
-    load_checkpoint_for_resume(args.checkpoint, model, logger=logger)
+    materialize_and_load_heatmap_checkpoint(model, args.checkpoint)
     model = model.to(device)
     model.eval()
 

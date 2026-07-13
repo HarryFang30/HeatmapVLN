@@ -7,6 +7,24 @@ from typing import Any
 import torch
 
 
+def _heatmap_history_length(sample: dict) -> int:
+    """Return the real number of heatmap histories for one sample.
+
+    ``history_frames`` can intentionally be a one-frame dummy tensor when
+    panoramic heatmap training sets ``load_history_frames=false``.  Building
+    the mask from that tensor silently masks or unmasks the wrong histories.
+    Prefer occurrence-aligned panoramic/pose targets and fall back to frames.
+    """
+    for key in ("history_panoramas", "history_rel_poses", "gt_visibility"):
+        value = sample.get(key)
+        if torch.is_tensor(value) and value.ndim >= 1:
+            return int(value.shape[0])
+    heatmap = sample.get("heatmap")
+    if torch.is_tensor(heatmap) and heatmap.ndim >= 4:
+        return int(heatmap.shape[0])
+    return int(sample["history_frames"].shape[0])
+
+
 def _pad_and_stack(batch: list[dict], key: str) -> torch.Tensor:
     """Stack tensors that may differ in the first (history) dimension,
     padding shorter ones with zeros to match the longest."""
@@ -25,9 +43,10 @@ def _pad_and_stack(batch: list[dict], key: str) -> torch.Tensor:
 
 def collate_fn(batch: list[dict]) -> dict[str, Any]:
     max_K = max(s['history_frames'].shape[0] for s in batch)
+    heatmap_lengths = [_heatmap_history_length(sample) for sample in batch]
+    max_heatmap_K = max(heatmap_lengths)
 
     history_frames_padded = []
-    history_mask = []
 
     for s in batch:
         frames = s['history_frames']
@@ -37,16 +56,19 @@ def collate_fn(batch: list[dict]) -> dict[str, Any]:
             pad_size = max_K - K
             pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
             frames_padded = torch.cat([frames, pad_frames], dim=0)
-            mask = torch.cat([torch.ones(K), torch.zeros(pad_size)])
         else:
             frames_padded = frames
-            mask = torch.ones(K)
 
         history_frames_padded.append(frames_padded)
-        history_mask.append(mask)
 
     history_frames = torch.stack(history_frames_padded, dim=0)
-    history_mask = torch.stack(history_mask, dim=0)
+    history_mask = torch.stack([
+        torch.cat([
+            torch.ones(length),
+            torch.zeros(max_heatmap_K - length),
+        ])
+        for length in heatmap_lengths
+    ], dim=0)
     current_frame = torch.stack([s['current_frame'] for s in batch], dim=0)
 
     heatmap = _pad_and_stack(batch, 'heatmap')

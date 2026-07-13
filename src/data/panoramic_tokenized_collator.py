@@ -108,6 +108,7 @@ class PanoramicTokenizedCollator:
         include_history_rel_poses: bool = True,
         retain_raw_panoramic_views: bool = True,
         compute_pano_text_anchor_positions: bool = True,
+        heatmap_layout: bool = False,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -128,6 +129,7 @@ class PanoramicTokenizedCollator:
         self.include_history_rel_poses = bool(include_history_rel_poses)
         self.retain_raw_panoramic_views = bool(retain_raw_panoramic_views)
         self.compute_pano_text_anchor_positions = bool(compute_pano_text_anchor_positions)
+        self.heatmap_layout = bool(heatmap_layout)
         self._call_count = 0
         self._tokenizer_lock = _get_tokenizer_lock(self.processor.tokenizer)
 
@@ -140,8 +142,21 @@ class PanoramicTokenizedCollator:
     @staticmethod
     def _stack_padded_history_frames(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         max_k = max(sample["history_frames"].shape[0] for sample in batch)
+        heatmap_lengths = []
+        for sample in batch:
+            for key in ("history_panoramas", "history_rel_poses", "gt_visibility"):
+                value = sample.get(key)
+                if torch.is_tensor(value) and value.ndim >= 1:
+                    heatmap_lengths.append(int(value.shape[0]))
+                    break
+            else:
+                heatmap = sample.get("heatmap")
+                if torch.is_tensor(heatmap) and heatmap.ndim >= 4:
+                    heatmap_lengths.append(int(heatmap.shape[0]))
+                else:
+                    heatmap_lengths.append(int(sample["history_frames"].shape[0]))
+        max_heatmap_k = max(heatmap_lengths)
         history_frames_padded = []
-        history_mask = []
 
         for sample in batch:
             frames = sample["history_frames"]
@@ -150,15 +165,17 @@ class PanoramicTokenizedCollator:
                 pad_size = max_k - k
                 pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
                 frames = torch.cat([frames, pad_frames], dim=0)
-                mask = torch.cat([torch.ones(k), torch.zeros(pad_size)])
-            else:
-                mask = torch.ones(k)
             history_frames_padded.append(frames)
-            history_mask.append(mask)
 
         return {
             "history_frames": torch.stack(history_frames_padded, dim=0),
-            "history_mask": torch.stack(history_mask, dim=0),
+            "history_mask": torch.stack([
+                torch.cat([
+                    torch.ones(length),
+                    torch.zeros(max_heatmap_k - length),
+                ])
+                for length in heatmap_lengths
+            ], dim=0),
         }
 
     @staticmethod
@@ -509,6 +526,7 @@ class PanoramicTokenizedCollator:
                             lookdown_frame=lookdown_frame,
                             internnav_protocol=self.sft_protocol == "internnav",
                             structured_pano_output=use_structured,
+                            heatmap_layout=self.heatmap_layout,
                         )
                     )
                     if not self.sft_mode and self.sft_protocol == "internnav" and pg is not None and not use_structured:

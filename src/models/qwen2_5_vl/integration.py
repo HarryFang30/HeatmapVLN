@@ -229,8 +229,29 @@ class Qwen2_5VLIntegration(nn.Module):
             if self.config.gradient_checkpointing:
                 base = getattr(self.model, "base_model", self.model)
                 if hasattr(base, "gradient_checkpointing_enable"):
-                    base.gradient_checkpointing_enable()
-                    logger.info("VLM gradient checkpointing enabled (saves ~60%% activation memory)")
+                    try:
+                        base.gradient_checkpointing_enable(
+                            gradient_checkpointing_kwargs={"use_reentrant": False},
+                        )
+                    except TypeError as exc:
+                        if self.config.heatmap_trains_backbone:
+                            raise RuntimeError(
+                                "Heatmap-to-backbone training requires non-reentrant "
+                                "gradient checkpointing because heatmap features are "
+                                "captured by forward hooks. Upgrade transformers or "
+                                "disable llm.gradient_checkpointing."
+                            ) from exc
+                        base.gradient_checkpointing_enable()
+                        logger.warning(
+                            "VLM gradient checkpointing enabled with the legacy "
+                            "reentrant implementation; hook-based auxiliary losses "
+                            "must remain detached"
+                        )
+                    else:
+                        logger.info(
+                            "VLM non-reentrant gradient checkpointing enabled "
+                            "(hook-based auxiliary gradients preserved)"
+                        )
                 # Frozen-backbone LoRA training needs the input embeddings to
                 # require gradients; otherwise checkpointed layers can detach
                 # the graph and return an LM loss without grad_fn.
@@ -1043,6 +1064,7 @@ class Qwen2_5VLIntegration(nn.Module):
         instruction: str | None = None,
         return_hidden_states: bool = True,
         heatmap_vln: nn.Module | None = None,
+        history_rel_poses: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None]:
         """Forward a single panoramic sample through one Qwen pass.
 
@@ -1078,7 +1100,11 @@ class Qwen2_5VLIntegration(nn.Module):
                     inputs, False, skip_lm_head=True,
                 )
 
-        heatmap_output = heatmap_vln.decode_from_inputs(inputs, num_history)
+        heatmap_output = heatmap_vln.decode_from_inputs(
+            inputs,
+            num_history,
+            history_rel_poses=history_rel_poses,
+        )
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
 
     def _forward_batch_panorama(

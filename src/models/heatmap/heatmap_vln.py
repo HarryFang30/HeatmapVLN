@@ -171,6 +171,7 @@ class HeatmapVLN(nn.Module):
             current_views,
             history_panoramas,
             instruction=instruction,
+            heatmap_layout=True,
         )
         inputs = self.processor.apply_chat_template(
             messages,
@@ -231,6 +232,7 @@ class HeatmapVLN(nn.Module):
                 current_views=current_views_list[b],
                 history_panoramas=history_panoramas_list[b],
                 instruction=instructions[b],
+                heatmap_layout=True,
             )
             for b in range(batch_size)
         ]

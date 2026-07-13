@@ -19,6 +19,7 @@ class _FakeTokenizer:
 class _FakeProcessor:
     def __init__(self):
         self.tokenizer = _FakeTokenizer()
+        self.last_messages_batch = None
 
     def apply_chat_template(
         self,
@@ -32,6 +33,7 @@ class _FakeProcessor:
         max_length=None,
     ):
         del tokenize, return_dict, return_tensors, padding, truncation, max_length
+        self.last_messages_batch = messages_batch
         rows = []
         for messages in messages_batch:
             row = []
@@ -232,3 +234,31 @@ def test_stage3_lean_collator_drops_only_unused_raw_inputs():
     assert out['pano_inputs']['input_ids'].shape[1] >= 4
     assert out['trajectory'].shape == (1, 12, 32, 3)
     assert out['traj_images'].shape == (1, 12, 2, 2, 3)
+
+
+def test_worker_tokenized_heatmap_layout_places_current_before_history_anchor():
+    processor = _FakeProcessor()
+    collator = PanoramicTokenizedCollator(
+        processor,
+        heatmap_layout=True,
+    )
+    sample = _sample()
+    sample["history_panoramas"] = torch.zeros(1, 4, 3, 2, 2)
+    sample["heatmap"] = torch.zeros(1, 4, 2, 2)
+    collator([sample])
+
+    content = processor.last_messages_batch[0][0]["content"]
+    image_indices = [index for index, item in enumerate(content) if item["type"] == "image"]
+    anchor_index = next(
+        index
+        for index, item in enumerate(content)
+        if item["type"] == "text" and item["text"].startswith("Historical observation")
+    )
+    assert len(image_indices) == 8
+    assert anchor_index > image_indices[-1]
+    current_label_index = next(
+        index
+        for index, item in enumerate(content)
+        if item["type"] == "text" and item["text"].startswith("Current panoramic observation")
+    )
+    assert current_label_index < image_indices[0]
