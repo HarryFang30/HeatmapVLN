@@ -34,7 +34,8 @@ export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/outp
 export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
 export LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_8gpu_mxc500.log}"
 
-# Formal Stage3 settings validated by the four-GPU, 100-step smoke run.
+# Batch/runtime settings passed the four-GPU 100-step smoke; the corrected
+# InternNav targets additionally passed a four-GPU real training preflight.
 export STAGE3_EPOCHS=2
 export STAGE3_BATCH_SIZE=8
 export STAGE3_GRAD_ACCUM_STEPS=1
