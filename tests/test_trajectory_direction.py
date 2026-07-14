@@ -3,6 +3,7 @@ import numpy as np
 from src.utils.trajectory_direction import (
     pairwise_representation_stats,
     summarize_direction_response,
+    view_pixel_target_angle_deg,
 )
 
 
@@ -56,3 +57,10 @@ def test_pairwise_representation_stats_reports_view_separation():
     assert len(stats["pairs"]) == 3
     assert 0.0 < stats["cosine_mean"] < 1.0
     assert stats["relative_l2_mean"] > 0.0
+
+
+def test_view_pixel_target_angle_includes_horizontal_pixel_offset():
+    assert view_pixel_target_angle_deg("front", [128, 128], [256, 256]) == 0.0
+    assert view_pixel_target_angle_deg("front", [192, 128], [256, 256]) == -22.5
+    assert view_pixel_target_angle_deg("right", [64, 128], [256, 256]) == -67.5
+    assert view_pixel_target_angle_deg("back", [0, 128], [256, 256]) == -135.0

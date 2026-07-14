@@ -25,6 +25,24 @@ def angular_error_deg(angle: float | np.ndarray, target: float) -> float | np.nd
     return np.abs(normalize_angle_deg(np.asarray(angle) - float(target)))
 
 
+def view_pixel_target_angle_deg(
+    view_id: str,
+    pixel_xy: tuple[float, float] | list[float],
+    image_size: tuple[int, int] | list[int],
+    *,
+    horizontal_fov_deg: float = 90.0,
+) -> float:
+    view = str(view_id).lower()
+    if view not in VIEW_TARGET_ANGLE_DEG:
+        raise ValueError(f"Unsupported view_id={view_id!r}")
+    width = float(image_size[0])
+    if width <= 0.0:
+        raise ValueError(f"image width must be positive, got {image_size}")
+    u = float(pixel_xy[0])
+    pixel_offset_deg = -((u / width) - 0.5) * float(horizontal_fov_deg)
+    return float(normalize_angle_deg(VIEW_TARGET_ANGLE_DEG[view] + pixel_offset_deg))
+
+
 def reconstruct_delta_xy(
     delta_xyt: np.ndarray,
     *,
@@ -51,11 +69,16 @@ def summarize_direction_response(
     view_id: str,
     action_scale: float,
     trajectory_x_sign: float = 1.0,
+    target_angle_deg: float | None = None,
 ) -> dict[str, object]:
     view = str(view_id).lower()
     if view not in VIEW_TARGET_ANGLE_DEG:
         raise ValueError(f"Unsupported view_id={view_id!r}")
-    expected_deg = VIEW_TARGET_ANGLE_DEG[view]
+    expected_deg = (
+        VIEW_TARGET_ANGLE_DEG[view]
+        if target_angle_deg is None
+        else float(normalize_angle_deg(target_angle_deg))
+    )
     paths = reconstruct_delta_xy(
         delta_xyt,
         action_scale=action_scale,

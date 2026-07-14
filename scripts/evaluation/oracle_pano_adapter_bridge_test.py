@@ -64,10 +64,10 @@ from scripts.training.utils import load_config
 from src.data.factory import build_trajectory_dataset
 from src.models.heatmap.input_constructor import construct_input, structured_condition_text
 from src.utils.trajectory_direction import (
-    VIEW_TARGET_ANGLE_DEG,
     angular_error_deg,
     pairwise_representation_stats,
     summarize_direction_response,
+    view_pixel_target_angle_deg,
 )
 
 LOGGER = logging.getLogger("oracle_pano_adapter_bridge")
@@ -125,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         nargs=2,
         metavar=("U", "V"),
         default=None,
-        help="Pixel used for all counterfactual views; defaults to image center.",
+        help="Pixel used for all counterfactual views; defaults to the sample's labeled pixel.",
     )
     p.add_argument(
         "--trajectory-seed",
@@ -295,6 +295,7 @@ def _run_condition_branch(
     num_sample_trajs: int,
     action_scale: float,
     trajectory_selection: str,
+    image_size: tuple[int, int],
     trajectory_seed: int | None = None,
     diagnostic_detail: bool = False,
 ) -> dict[str, Any]:
@@ -333,7 +334,7 @@ def _run_condition_branch(
             adapter,
             view_id=view_id,
             pixel_goal=pixel_goal,
-            image_size=None,
+            image_size=image_size,
             cond_projector=(
                 model.nextdit_action_head.cond_projector
                 if model.nextdit_action_head is not None
@@ -382,11 +383,21 @@ def _run_condition_branch(
             trajectory_np,
             view_id=view_id,
             action_scale=action_scale,
+            target_angle_deg=view_pixel_target_angle_deg(
+                view_id,
+                pixel_goal,
+                image_size,
+            ),
         )
         scaled = trajectory_np.copy()
         scaled[:, :, :2] /= float(action_scale)
         all_xy = reconstruct_xy_from_delta(scaled)
         selections: dict[str, Any] = {}
+        expected_angle_deg = view_pixel_target_angle_deg(
+            view_id,
+            pixel_goal,
+            image_size,
+        )
         for selection in TRAJECTORY_SELECTIONS:
             selected_xy, selected_idx = select_trajectory_xy(all_xy, selection)
             endpoint = selected_xy[-1, :2]
@@ -409,7 +420,7 @@ def _run_condition_branch(
                 "endpoint_xy_m": [float(endpoint[0]), float(endpoint[1])],
                 "endpoint_angle_deg": angle,
                 "endpoint_angle_error_deg": (
-                    float(angular_error_deg(angle, VIEW_TARGET_ANGLE_DEG[view_id]))
+                    float(angular_error_deg(angle, expected_angle_deg))
                     if angle is not None
                     else 180.0
                 ),
@@ -525,6 +536,8 @@ def _ground_truth_direction(
     sample: dict[str, Any],
     *,
     view_id: str,
+    pixel_goal: list[int],
+    image_size: tuple[int, int],
     action_scale: float,
 ) -> dict[str, Any] | None:
     trajectory = sample.get("trajectory")
@@ -534,12 +547,28 @@ def _ground_truth_direction(
         trajectory_np = trajectory.detach().float().cpu().numpy()
     else:
         trajectory_np = np.asarray(trajectory, dtype=np.float32)
+    if trajectory_np.ndim == 3:
+        valid = sample.get("trajectory_valid")
+        if torch.is_tensor(valid):
+            valid_np = valid.detach().float().cpu().numpy().reshape(-1)
+        elif valid is not None:
+            valid_np = np.asarray(valid, dtype=np.float32).reshape(-1)
+        else:
+            valid_np = np.ones(trajectory_np.shape[0], dtype=np.float32)
+        valid_indices = np.flatnonzero(valid_np > 0.5)
+        trajectory_idx = int(valid_indices[0]) if valid_indices.size else 0
+        trajectory_np = trajectory_np[trajectory_idx]
     if trajectory_np.ndim != 2 or trajectory_np.shape[-1] < 2:
         return None
     return summarize_direction_response(
         trajectory_np[None, ...],
         view_id=view_id,
         action_scale=action_scale,
+        target_angle_deg=view_pixel_target_angle_deg(
+            view_id,
+            pixel_goal,
+            image_size,
+        ),
     )
 
 
@@ -578,7 +607,10 @@ def _run_counterfactual_sample(
     pixel = (
         [int(counterfactual_pixel[0]), int(counterfactual_pixel[1])]
         if counterfactual_pixel is not None
-        else [int(image_size[0] // 2), int(image_size[1] // 2)]
+        else [
+            int(sample["pano_pixel_goal"][0]),
+            int(sample["pano_pixel_goal"][1]),
+        ]
     )
 
     raw_representations: dict[str, np.ndarray] = {}
@@ -602,6 +634,7 @@ def _run_counterfactual_sample(
             num_sample_trajs=num_sample_trajs,
             action_scale=action_scale,
             trajectory_selection="mean",
+            image_size=image_size,
             trajectory_seed=shared_seed,
             diagnostic_detail=True,
         )
@@ -633,6 +666,11 @@ def _run_counterfactual_sample(
         "ground_truth_direction": _ground_truth_direction(
             sample,
             view_id=str(sample.get("pano_view_id") or "").lower(),
+            pixel_goal=[
+                int(sample["pano_pixel_goal"][0]),
+                int(sample["pano_pixel_goal"][1]),
+            ],
+            image_size=image_size,
             action_scale=action_scale,
         ),
         "representations": {
@@ -912,6 +950,7 @@ def main() -> int:
                     num_sample_trajs=num_sample_trajs,
                     action_scale=action_scale,
                     trajectory_selection=args.trajectory_selection,
+                    image_size=image_size,
                 )
                 gen_result["ran"] = True
                 gen_result["view"] = gen_view
@@ -934,6 +973,7 @@ def main() -> int:
                 num_sample_trajs=num_sample_trajs,
                 action_scale=action_scale,
                 trajectory_selection=args.trajectory_selection,
+                image_size=image_size,
             )
             oracle_result["ran"] = True
             oracle_result["expected_suffix_text"] = oracle_text
