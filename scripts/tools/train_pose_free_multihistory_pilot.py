@@ -372,9 +372,8 @@ def exact_sample(dataset: ExplicitMultiHistoryDataset, index: int) -> dict[str, 
     current = int(current)
     if current != int(record["current_frame"]):
         raise RuntimeError(f"Explicit runtime current frame changed at index={index}")
-    expected_runtime_id = (
-        f"{record['relative_clip']}:current={current}:history="
-        + ",".join(str(frame) for frame in runtime_frames)
+    expected_runtime_id = f"{record['relative_clip']}:current={current}:history=" + ",".join(
+        str(frame) for frame in runtime_frames
     )
     leaked = [key for key in ("history_rel_poses", "history_poses", "current_pose") if key in sample]
     if leaked:
@@ -402,10 +401,7 @@ def normalized_lora_parameters(model: torch.nn.Module) -> dict[str, torch.nn.Par
 
 
 def lora_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {
-        name: parameter.detach().cpu().clone()
-        for name, parameter in normalized_lora_parameters(model).items()
-    }
+    return {name: parameter.detach().cpu().clone() for name, parameter in normalized_lora_parameters(model).items()}
 
 
 def pose_free_head_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -425,9 +421,7 @@ def load_stage1_s2_lora_strict(model: torch.nn.Module, checkpoint: str) -> dict[
         raise RuntimeError(f"Stage1-S2 checkpoint has no trainable_state_dict: {checkpoint}")
     matched = assert_complete_lora_checkpoint_match(model, state, checkpoint_path=checkpoint)
     if matched != EXPECTED_LORA_TENSORS:
-        raise RuntimeError(
-            f"Task-3.6c requires exactly {EXPECTED_LORA_TENSORS} matched LoRA tensors, got {matched}"
-        )
+        raise RuntimeError(f"Task-3.6c requires exactly {EXPECTED_LORA_TENSORS} matched LoRA tensors, got {matched}")
     _missing, _unexpected, _loaded = _load_normalized_state_dict(model, state)
     current = lora_state_dict(model)
     if len(current) != EXPECTED_LORA_TENSORS:
@@ -459,8 +453,7 @@ def strict_load_named_state(
     missing = sorted(set(expected) - set(state))
     unexpected = sorted(set(state) - set(expected))
     mismatched = sorted(
-        name for name in set(expected) & set(state)
-        if tuple(expected[name].shape) != tuple(state[name].shape)
+        name for name in set(expected) & set(state) if tuple(expected[name].shape) != tuple(state[name].shape)
     )
     if missing or unexpected or mismatched:
         raise RuntimeError(
@@ -643,9 +636,7 @@ def regroup_isolated_pair_outputs(
     num_histories: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if len(outputs) != num_histories:
-        raise RuntimeError(
-            f"Expected {num_histories} independent B=1 outputs, got {len(outputs)}"
-        )
+        raise RuntimeError(f"Expected {num_histories} independent B=1 outputs, got {len(outputs)}")
     visibility_rows = []
     heatmap_rows = []
     for chain_index, output in enumerate(outputs):
@@ -653,13 +644,11 @@ def regroup_isolated_pair_outputs(
         heatmaps = output["heatmaps"]
         if tuple(visibility.shape) != (1, 1, 4):
             raise RuntimeError(
-                f"Isolated chain {chain_index} visibility must be [1,1,4], "
-                f"got {tuple(visibility.shape)}"
+                f"Isolated chain {chain_index} visibility must be [1,1,4], got {tuple(visibility.shape)}"
             )
         if heatmaps.ndim != 5 or tuple(heatmaps.shape[:3]) != (1, 1, 4):
             raise RuntimeError(
-                f"Isolated chain {chain_index} heatmaps must be [1,1,4,H,W], "
-                f"got {tuple(heatmaps.shape)}"
+                f"Isolated chain {chain_index} heatmaps must be [1,1,4,H,W], got {tuple(heatmaps.shape)}"
             )
         visibility_rows.append(visibility[:, 0])
         heatmap_rows.append(heatmaps[:, 0])
@@ -669,6 +658,7 @@ def regroup_isolated_pair_outputs(
 def assert_blank_output_identity(
     visibility: torch.Tensor,
     heatmaps: torch.Tensor,
+    heatmap_logits: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Fail if four identical blank B=1 chains produce different outputs."""
     if visibility.shape[:2] != (1, 4) or heatmaps.shape[:2] != (1, 4):
@@ -677,11 +667,13 @@ def assert_blank_output_identity(
         "visibility": bool(torch.equal(visibility, visibility[:, :1].expand_as(visibility))),
         "heatmaps": bool(torch.equal(heatmaps, heatmaps[:, :1].expand_as(heatmaps))),
     }
+    if heatmap_logits is not None:
+        if heatmap_logits.shape != heatmaps.shape:
+            raise RuntimeError("Blank-output raw/probability heatmap shapes differ")
+        checks["heatmap_logits"] = bool(torch.equal(heatmap_logits, heatmap_logits[:, :1].expand_as(heatmap_logits)))
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
-        raise RuntimeError(
-            "Identical blank B=1 chains produced row-specific outputs: " + ", ".join(failed)
-        )
+        raise RuntimeError("Identical blank B=1 chains produced row-specific outputs: " + ", ".join(failed))
     return {
         "four_blank_chain_outputs_bitwise_identical": True,
         "checked_tensors": sorted(checks),
@@ -695,6 +687,7 @@ def forward_loss(
     device: torch.device,
     *,
     history_rel_poses: torch.Tensor | None = None,
+    return_heatmap_logits: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     if history_rel_poses is not None:
         raise ValueError("Task-3.6c pose-free forward received non-None history_rel_poses")
@@ -707,6 +700,9 @@ def forward_loss(
     for chain_index in range(num_histories):
         # Four physically separate B=1 calls are the attribution contract.
         # No Qwen batch row may encode or perturb history identity.
+        model_kwargs = {}
+        if return_heatmap_logits:
+            model_kwargs["return_heatmap_logits"] = True
         output = model(
             video_frames=chains["video_frames"][chain_index : chain_index + 1].to(device),
             current_observation=chains["current_observation"][chain_index : chain_index + 1].to(device),
@@ -716,15 +712,35 @@ def forward_loss(
             return_heatmaps=True,
             return_actions=False,
             return_lm_loss=False,
+            **model_kwargs,
         )
         outputs.append(output)
     pred_vis, pred_heatmaps = regroup_isolated_pair_outputs(
         outputs,
         num_histories=num_histories,
     )
+    pred_heatmap_logits = None
+    if return_heatmap_logits:
+        logits_rows = []
+        for chain_index, output in enumerate(outputs):
+            logits = output.get("heatmap_logits")
+            if not torch.is_tensor(logits):
+                raise RuntimeError(f"Isolated chain {chain_index} omitted explicitly requested raw heatmap_logits")
+            if logits.ndim != 5 or tuple(logits.shape[:3]) != (1, 1, 4):
+                raise RuntimeError(
+                    f"Isolated chain {chain_index} heatmap_logits must be [1,1,4,H,W], got {tuple(logits.shape)}"
+                )
+            if tuple(logits.shape) != tuple(output["heatmaps"].shape):
+                raise RuntimeError(f"Isolated chain {chain_index} raw/probability heatmap shapes differ")
+            logits_rows.append(logits[:, 0])
+        pred_heatmap_logits = torch.stack(logits_rows, dim=1)
     blank_output_gate = None
     if transformed.get("metadata", {}).get("intervention") == "blank-images":
-        blank_output_gate = assert_blank_output_identity(pred_vis, pred_heatmaps)
+        blank_output_gate = assert_blank_output_identity(
+            pred_vis,
+            pred_heatmaps,
+            pred_heatmap_logits,
+        )
     gt_vis = transformed["gt_visibility"].unsqueeze(0).to(device)
     gt_heatmaps = transformed["gt_heatmaps"].unsqueeze(0).to(device)
     history_mask = torch.ones(gt_vis.shape[:2], dtype=torch.bool, device=device)
@@ -741,6 +757,8 @@ def forward_loss(
         "gt_visibility": transformed["gt_visibility"].detach().float().cpu(),
         "gt_heatmaps": transformed["gt_heatmaps"].detach().float().cpu(),
     }
+    if pred_heatmap_logits is not None:
+        record["heatmap_logits"] = pred_heatmap_logits.detach().float().cpu()
     if blank_output_gate is not None:
         record["blank_input_identity_gate"] = blank_input_gate
         record["blank_output_identity_gate"] = blank_output_gate
@@ -1005,12 +1023,8 @@ def paired_single_swap_output_change(
         width = int(base_hm.shape[-1])
         for output_slot in range(int(base_vis.shape[0])):
             bucket = buckets["targeted" if output_slot == int(target_slot) else "untargeted"]
-            bucket["heatmap_l1"].append(
-                float((swap_hm[output_slot] - base_hm[output_slot]).abs().mean().item())
-            )
-            bucket["visibility_l1"].append(
-                float((swap_vis[output_slot] - base_vis[output_slot]).abs().mean().item())
-            )
+            bucket["heatmap_l1"].append(float((swap_hm[output_slot] - base_hm[output_slot]).abs().mean().item()))
+            bucket["visibility_l1"].append(float((swap_vis[output_slot] - base_vis[output_slot]).abs().mean().item()))
             base_view = int(base_vis[output_slot].argmax().item())
             swap_view = int(swap_vis[output_slot].argmax().item())
             base_x, base_y = _peak_xy(base_hm[output_slot, base_view])
@@ -1029,9 +1043,7 @@ def paired_single_swap_output_change(
         }
     untargeted_l1 = summary["untargeted"]["mean_heatmap_l1"]
     summary["targeted_to_untargeted_heatmap_l1_ratio"] = (
-        summary["targeted"]["mean_heatmap_l1"] / untargeted_l1
-        if untargeted_l1 > 0
-        else None
+        summary["targeted"]["mean_heatmap_l1"] / untargeted_l1 if untargeted_l1 > 0 else None
     )
     summary["contract"] = "replace history i; compare output i against all output j!=i on the same current"
     return summary
@@ -1055,7 +1067,12 @@ def assert_history_permutation_equivariance(
         inverse = [0] * len(permutation)
         for shuffled_slot, original_slot in enumerate(permutation):
             inverse[int(original_slot)] = shuffled_slot
-        for key in ("visibility", "heatmaps"):
+        tensor_keys = ["visibility", "heatmaps"]
+        if "heatmap_logits" in standard or "heatmap_logits" in shuffled:
+            if "heatmap_logits" not in standard or "heatmap_logits" not in shuffled:
+                raise RuntimeError("History permutation raw-logit records are incomplete")
+            tensor_keys.append("heatmap_logits")
+        for key in tensor_keys:
             restored = shuffled[key][:, inverse]
             expected = standard[key]
             if not torch.equal(restored, expected):
@@ -1082,6 +1099,8 @@ def evaluate_intervention(
     dataset: ExplicitMultiHistoryDataset,
     intervention: str,
     device: torch.device,
+    *,
+    return_heatmap_logits: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     model.eval()
     model.heatmap_vln.feat_extractor.detach_features = True
@@ -1104,7 +1123,14 @@ def evaluate_intervention(
                 dtype=torch.bfloat16,
                 enabled=device.type == "cuda",
             ):
-                loss, record = forward_loss(model, criterion, transformed, device, history_rel_poses=None)
+                loss, record = forward_loss(
+                    model,
+                    criterion,
+                    transformed,
+                    device,
+                    history_rel_poses=None,
+                    return_heatmap_logits=return_heatmap_logits,
+                )
             record["sample_id"] = transformed["sample_id"]
             record["target_slot"] = transformed["metadata"].get("target_slot")
             record["history_permutation"] = transformed["metadata"].get("history_permutation")
@@ -1117,9 +1143,7 @@ def evaluate_intervention(
     if intervention == "blank-images":
         if not all(
             record.get("blank_input_identity_gate")
-            and record.get("blank_output_identity_gate", {}).get(
-                "four_blank_chain_outputs_bitwise_identical"
-            )
+            and record.get("blank_output_identity_gate", {}).get("four_blank_chain_outputs_bitwise_identical")
             for record in records
         ):
             raise RuntimeError("Blank input/output identity gates were not recorded for every sample")
@@ -1301,9 +1325,7 @@ def load_pilot_checkpoint_strict(
     head_file_hash = pilot_file_hash
     if eval_head_checkpoint is not None:
         if branch != "heatmap-lora" or eval_lora != "trained":
-            raise RuntimeError(
-                "An alternate eval head is valid only for trained LoRA from the heatmap-lora branch"
-            )
+            raise RuntimeError("An alternate eval head is valid only for trained LoRA from the heatmap-lora branch")
         head_payload, head_file_hash = validate_pilot_checkpoint_payload_strict(
             eval_head_checkpoint,
             branch="head-only",
@@ -1430,7 +1452,9 @@ def run_train(args: argparse.Namespace) -> int:
     )
     groups = [{"name": "pose_free_matcher", "params": head_parameters, "lr": args.head_learning_rate}]
     if trainable_lora:
-        groups.append({"name": "reachable_lora", "params": list(trainable_lora.values()), "lr": args.lora_learning_rate})
+        groups.append(
+            {"name": "reachable_lora", "params": list(trainable_lora.values()), "lr": args.lora_learning_rate}
+        )
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     model.eval()
     # Qwen's gradient-checkpointing blocks are active only in train mode.
@@ -1449,9 +1473,7 @@ def run_train(args: argparse.Namespace) -> int:
         sample = exact_sample(dataset, index)
         runtime_audit = sample["_task36c_audit"]
         history_frames = ",".join(str(value) for value in runtime_audit["runtime_history_frames"])
-        schedule_ids.append(
-            f"{runtime_audit['runtime_sample_id']}:epoch={epoch}:runtime_history={history_frames}"
-        )
+        schedule_ids.append(f"{runtime_audit['runtime_sample_id']}:epoch={epoch}:runtime_history={history_frames}")
         transformed = transform_sample(sample, intervention="standard")
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
@@ -1513,15 +1535,24 @@ def run_train(args: argparse.Namespace) -> int:
     common_eval = [
         sys.executable,
         str(Path(__file__).resolve()),
-        "--phase", "eval",
-        "--branch", args.branch,
-        "--config", str(Path(args.config).resolve()),
-        "--checkpoint", str(Path(args.checkpoint).resolve()),
-        "--selection-manifest", str(Path(args.selection_manifest).resolve()),
-        "--data-root", str(Path(args.data_root).resolve()),
-        "--output-dir", str(Path(args.output_dir).resolve()),
-        "--device", args.device,
-        "--pilot-checkpoint", str(checkpoint_path.resolve()),
+        "--phase",
+        "eval",
+        "--branch",
+        args.branch,
+        "--config",
+        str(Path(args.config).resolve()),
+        "--checkpoint",
+        str(Path(args.checkpoint).resolve()),
+        "--selection-manifest",
+        str(Path(args.selection_manifest).resolve()),
+        "--data-root",
+        str(Path(args.data_root).resolve()),
+        "--output-dir",
+        str(Path(args.output_dir).resolve()),
+        "--device",
+        args.device,
+        "--pilot-checkpoint",
+        str(checkpoint_path.resolve()),
     ]
     if args.model_path:
         common_eval += ["--model-path", str(Path(args.model_path).resolve())]
@@ -1551,8 +1582,7 @@ def run_train(args: argparse.Namespace) -> int:
         "training_sample_schedule_sha256": hash_strings(schedule_ids),
         "train_log": train_log,
         "fresh_process_evaluation_argv": {
-            source: [*common_eval, "--eval-lora", source]
-            for source in ("trained", "off")
+            source: [*common_eval, "--eval-lora", source] for source in ("trained", "off")
         },
         "training_process_runs_evaluation": False,
     }
@@ -1622,9 +1652,7 @@ def run_eval(args: argparse.Namespace) -> int:
     output_name = f"eval_{args.eval_lora}"
     if args.eval_head_checkpoint is not None:
         head_source = pilot_contract["head_source_checkpoint"]
-        output_name += (
-            f"_head_{head_source['branch']}_{head_source['head_state_sha256'][:12]}"
-        )
+        output_name += f"_head_{head_source['branch']}_{head_source['head_state_sha256'][:12]}"
     output_dir = Path(args.output_dir) / args.branch / output_name
     report = {
         "schema": REPORT_SCHEMA,

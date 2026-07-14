@@ -30,7 +30,7 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -38,15 +38,18 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 class _Strict(BaseModel):
     """Base with extra='forbid' to catch misspelled keys."""
+
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
 class _Lenient(BaseModel):
     """Base with extra='allow' for sections where users add ad-hoc keys."""
+
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
 
 # --- Data -------------------------------------------------------------------
+
 
 class SlidingWindowConfig(_Lenient):
     min_history: int = 5
@@ -132,10 +135,7 @@ class TrajectoryConfig(_Lenient):
     def _check_trajectory_target_convention(cls, v: str) -> str:
         allowed = {"legacy_pitched_camera", "internnav_habitat"}
         if v not in allowed:
-            raise ValueError(
-                "trajectory_target_convention must be one of "
-                f"{allowed}, got {v!r}"
-            )
+            raise ValueError(f"trajectory_target_convention must be one of {allowed}, got {v!r}")
         return v
 
     @field_validator("sft_num_future_steps")
@@ -213,6 +213,7 @@ class DataConfig(_Strict):
 
 # --- Model -------------------------------------------------------------------
 
+
 class LLMConfig(_Lenient):
     model_path: str = "./models/internnav_backbone"
     backbone_type: str = "qwen2_5_vl"
@@ -245,10 +246,15 @@ class HeatmapTrajectoryConfig(_Lenient):
     max_spatial_range: float = 10.0
 
 
-class HeatmapPoseFreeConfig(_Lenient):
+class HeatmapPoseFreeConfig(_Strict):
     match_dim: int = 64
     visibility_hidden_dim: int = 16
     logit_temperature: float = 10.0
+    heatmap_size: tuple[int, int] = (64, 64)
+    history_query_source: Literal[
+        "text_anchor",
+        "history_visual_equal_view_mean_v1",
+    ] = "text_anchor"
 
 
 class HeatmapModelConfig(_Lenient):
@@ -274,10 +280,7 @@ class HeatmapModelConfig(_Lenient):
     def _valid_decoder_mode(cls, value: str) -> str:
         normalized = str(value).strip().lower()
         if normalized not in {"legacy", "pose_free_matcher"}:
-            raise ValueError(
-                "decoder_mode must be 'legacy' or 'pose_free_matcher', "
-                f"got {value!r}"
-            )
+            raise ValueError(f"decoder_mode must be 'legacy' or 'pose_free_matcher', got {value!r}")
         return normalized
 
 
@@ -319,6 +322,7 @@ class ModelConfig(_Lenient):
 
 # --- Optim -------------------------------------------------------------------
 
+
 class OptimConfig(_Lenient):
     optimizer: str = "adamw"
     learning_rate: float = 1e-4
@@ -340,6 +344,7 @@ class OptimConfig(_Lenient):
 
 
 # --- Loss --------------------------------------------------------------------
+
 
 class TemperatureScheduleConfig(_Lenient):
     enabled: bool = False
@@ -368,6 +373,7 @@ class LossConfig(_Lenient):
 
 
 # --- Training ----------------------------------------------------------------
+
 
 class TrainingStageConfig(_Lenient):
     name: str
@@ -420,6 +426,7 @@ class TrainingConfig(_Strict):
 
 # --- GPU ---------------------------------------------------------------------
 
+
 class MultiGPUConfig(_Lenient):
     enabled: bool = False
     find_unused_parameters: bool = False
@@ -432,6 +439,7 @@ class GPUConfig(_Lenient):
 
 
 # --- Log / Notify ------------------------------------------------------------
+
 
 class NotifyConfig(_Lenient):
     enabled: bool = False
@@ -460,6 +468,7 @@ class LogConfig(_Lenient):
 
 # --- Validation --------------------------------------------------------------
 
+
 class ValidationConfig(_Lenient):
     enabled: bool = True
     eval_every_epochs: int = 1
@@ -470,6 +479,7 @@ class ValidationConfig(_Lenient):
 
 # --- Top-level ---------------------------------------------------------------
 
+
 class TrainConfig(_Lenient):
     """Top-level training configuration schema.
 
@@ -477,6 +487,7 @@ class TrainConfig(_Lenient):
     ad-hoc root keys don't cause validation failures, while all nested
     sub-configs use strict or lenient validation as appropriate.
     """
+
     seed: int = 42
     data: DataConfig
     model: ModelConfig = ModelConfig()
@@ -539,9 +550,7 @@ def _merge_paths_block(cfg: dict[str, Any]) -> None:
         raise ValueError(f"paths must be a mapping, got {type(raw_paths).__name__}")
     extra = set(raw_paths) - _PATHS_ALLOWED
     if extra:
-        raise ValueError(
-            f"Unknown paths keys: {sorted(extra)}. Allowed: {sorted(_PATHS_ALLOWED)}"
-        )
+        raise ValueError(f"Unknown paths keys: {sorted(extra)}. Allowed: {sorted(_PATHS_ALLOWED)}")
 
     dr = raw_paths.get("dataset_root")
     if isinstance(dr, str) and dr.strip():
@@ -672,7 +681,5 @@ def load_and_validate_config(config_path: Union[str, Path]) -> dict[str, Any]:
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
-        raise ValueError(
-            f"Expected a YAML mapping at top level, got {type(cfg).__name__}"
-        )
+        raise ValueError(f"Expected a YAML mapping at top level, got {type(cfg).__name__}")
     return normalize_config(cfg)

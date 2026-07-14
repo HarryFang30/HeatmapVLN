@@ -15,6 +15,15 @@ from .heatmap_vln import HeatmapVLN
 from .heatmap_vln_loss import HeatmapVLNLoss
 from .input_constructor import construct_input, find_text_anchor_positions
 from .pose_free_matching import PoseFreeHistoryMatcher, pad_history_queries
+from .target_grounded_identity import (
+    PrimaryPanoramaTargets,
+    TargetGroundedIdentityLoss,
+    TargetGroundedPanoramaIdentityLoss,
+    circular_pairwise_distances,
+    extract_primary_panorama_targets,
+    target_grounded_panorama_losses,
+    target_grounded_score_matrix,
+)
 from .trajectory_attention import TrajectoryGuidedAttention
 
 __version__ = "5.0.0"
@@ -27,9 +36,16 @@ __all__ = [
     "HeatmapVLN",
     "HeatmapVLNLoss",
     "PoseFreeHistoryMatcher",
+    "PrimaryPanoramaTargets",
+    "TargetGroundedIdentityLoss",
+    "TargetGroundedPanoramaIdentityLoss",
     "TrajectoryGuidedAttention",
     "__version__",
+    "circular_pairwise_distances",
     "construct_input",
+    "extract_primary_panorama_targets",
     "find_text_anchor_positions",
     "pad_history_queries",
+    "target_grounded_panorama_losses",
+    "target_grounded_score_matrix",
 ]

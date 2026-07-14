@@ -48,7 +48,7 @@ def _is_internnav_system1_key(key: str) -> bool:
 
 
 def _remap_internnav_system1_key(key: str) -> str:
-    return key[len("model."):] if key.startswith("model.") else key
+    return key[len("model.") :] if key.startswith("model.") else key
 
 
 @dataclass
@@ -99,7 +99,7 @@ class VLNPipelineConfig:
     heatmap_c_vit: int = 1280
     heatmap_c_llm: int = 3584
     heatmap_c_fused: int = 256
-    heatmap_vit_layer_indices: list[int] | None = None   # e.g. [6, 12, 18, 24]
+    heatmap_vit_layer_indices: list[int] | None = None  # e.g. [6, 12, 18, 24]
     heatmap_llm_layer_indices: list[int] | None = None  # e.g. [7, 15, 23] (full_attention)
     heatmap_size: tuple[int, int] = (64, 64)
     heatmap_trajectory_config: dict[str, Any] | None = None
@@ -212,7 +212,8 @@ class VLNPipeline(nn.Module):
         ).to(device=self.device, dtype=config.dtype)
         logger.info(
             "LLM projector: %d -> %d",
-            config.llm_hidden_dim, config.llm_token_dim,
+            config.llm_hidden_dim,
+            config.llm_token_dim,
         )
 
         # ==================== HeatmapVLN v2 ====================
@@ -248,7 +249,8 @@ class VLNPipeline(nn.Module):
                 enable_gradient_checkpointing=config.nextdit_enable_gradient_checkpointing,
             )
             self.nextdit_action_head = NextDiTActionHead(nextdit_cfg).to(
-                device=self.device, dtype=config.dtype,
+                device=self.device,
+                dtype=config.dtype,
             )
             self.latent_queries = nn.Parameter(
                 torch.randn(1, config.nextdit_n_query, config.nextdit_vlm_hidden_dim) * 0.02
@@ -319,14 +321,10 @@ class VLNPipeline(nn.Module):
 
         if all(torch.is_tensor(value) for value in ckpt.values()):
             return {
-                name.removeprefix("module.").removeprefix("pano_latent_adapter."): value
-                for name, value in ckpt.items()
+                name.removeprefix("module.").removeprefix("pano_latent_adapter."): value for name, value in ckpt.items()
             }
 
-        raise KeyError(
-            "No adapter_state_dict or pano_latent_adapter.* trainable_state_dict "
-            "found in checkpoint"
-        )
+        raise KeyError("No adapter_state_dict or pano_latent_adapter.* trainable_state_dict found in checkpoint")
 
     def _load_pano_latent_adapter(self, ckpt_path: str, *, strict: bool = True) -> None:
         if self.pano_latent_adapter is None:
@@ -388,11 +386,7 @@ class VLNPipeline(nn.Module):
                 )
             logger.info("Loading InternNav System 1 from full model shard %s", single_path)
             with safe_open(str(single_path), framework="pt", device="cpu") as f:
-                ckpt_sd = {
-                    _remap_internnav_system1_key(k): f.get_tensor(k)
-                    for k in f
-                    if _is_internnav_system1_key(k)
-                }
+                ckpt_sd = {_remap_internnav_system1_key(k): f.get_tensor(k) for k in f if _is_internnav_system1_key(k)}
             self._load_system1_state_dict(ckpt_sd, source=str(single_path))
             return
 
@@ -410,7 +404,9 @@ class VLNPipeline(nn.Module):
         ckpt_sd = {}
         logger.info(
             "Loading InternNav System 1 from full model %s (%d tensors across %d shards)",
-            model_path, len(target_keys), len(keys_by_shard),
+            model_path,
+            len(target_keys),
+            len(keys_by_shard),
         )
         for shard_name, keys in sorted(keys_by_shard.items()):
             shard_path = model_path / shard_name
@@ -442,7 +438,8 @@ class VLNPipeline(nn.Module):
             else:
                 logger.warning(
                     "  latent_queries shape mismatch: ckpt %s vs model %s, skipped",
-                    tuple(lq.shape), tuple(self.latent_queries.shape),
+                    tuple(lq.shape),
+                    tuple(self.latent_queries.shape),
                 )
 
         head_sd = self.nextdit_action_head.state_dict()
@@ -519,9 +516,9 @@ class VLNPipeline(nn.Module):
         trainable_count += 1
 
         logger.info(
-            "System 1 freeze: %d params frozen, %d bridge params trainable "
-            "(latent_queries + cond_projector)",
-            frozen_count, trainable_count,
+            "System 1 freeze: %d params frozen, %d bridge params trainable (latent_queries + cond_projector)",
+            frozen_count,
+            trainable_count,
         )
 
     def _ensure_heatmap_vln(self):
@@ -535,18 +532,14 @@ class VLNPipeline(nn.Module):
         cfg = self.config
         default_vit_indices = [7, 15, 23, 31]
         default_llm_indices = [6, 13, 20]
-        decoder_mode = getattr(cfg, 'heatmap_decoder_mode', 'legacy')
-        vit_indices = (
-            default_vit_indices
-            if cfg.heatmap_vit_layer_indices is None
-            else cfg.heatmap_vit_layer_indices
-        )
+        decoder_mode = getattr(cfg, "heatmap_decoder_mode", "legacy")
+        vit_indices = default_vit_indices if cfg.heatmap_vit_layer_indices is None else cfg.heatmap_vit_layer_indices
         if decoder_mode == "pose_free_matcher":
             vit_indices = []
         llm_indices = cfg.heatmap_llm_layer_indices or default_llm_indices
 
-        trajectory_config = getattr(cfg, 'heatmap_trajectory_config', None)
-        pose_free_config = dict(getattr(cfg, 'heatmap_pose_free_config', None) or {})
+        trajectory_config = getattr(cfg, "heatmap_trajectory_config", None)
+        pose_free_config = dict(getattr(cfg, "heatmap_pose_free_config", None) or {})
         pose_free_config.setdefault("heatmap_size", cfg.heatmap_size)
 
         self.heatmap_vln = HeatmapVLN(
@@ -557,6 +550,7 @@ class VLNPipeline(nn.Module):
             c_fused=cfg.heatmap_c_fused,
             vit_layer_indices=vit_indices,
             llm_layer_indices=llm_indices,
+            spatial_merge_size=getattr(cfg, "spatial_merge_size", 2),
             enable_runtime_timing=cfg.enable_runtime_timing,
             trajectory_config=trajectory_config,
             heatmap_trains_backbone=cfg.heatmap_trains_backbone,
@@ -589,13 +583,8 @@ class VLNPipeline(nn.Module):
 
     def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> list[dict[str, Any]]:
         if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
-            raise ValueError(
-                f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
-            )
-        return [
-            self._views_tensor_to_dict(history_panoramas[idx])
-            for idx in range(history_panoramas.shape[0])
-        ]
+            raise ValueError(f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}")
+        return [self._views_tensor_to_dict(history_panoramas[idx]) for idx in range(history_panoramas.shape[0])]
 
     def _forward_heatmap_batch(
         self,
@@ -616,9 +605,7 @@ class VLNPipeline(nn.Module):
                 )
 
             if current_views.dim() != 5:
-                raise ValueError(
-                    f"Expected current_views [B, 4, C, H, W], got {tuple(current_views.shape)}"
-                )
+                raise ValueError(f"Expected current_views [B, 4, C, H, W], got {tuple(current_views.shape)}")
             if not torch.is_tensor(history_panoramas) or history_panoramas.dim() != 6:
                 raise ValueError("Batched history_panoramas must be a tensor of shape [B, N, 4, C, H, W]")
 
@@ -643,8 +630,10 @@ class VLNPipeline(nn.Module):
             }
             if not self.training:
                 from .heatmap.heatmap_vln import HeatmapVLN
+
                 result["heatmaps_gated"] = HeatmapVLN._gated_softmax_heatmaps(
-                    result["heatmaps"], result["visibility"],
+                    result["heatmaps"],
+                    result["visibility"],
                 )
             return result
 
@@ -675,6 +664,7 @@ class VLNPipeline(nn.Module):
         history_rel_poses: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        return_heatmap_logits: bool = False,
     ) -> dict[str, Any]:
         """Forward pass."""
         del gt_stop  # Reserved for optional stop-head training compatibility.
@@ -690,18 +680,20 @@ class VLNPipeline(nn.Module):
         # Only construct and pass heatmap_vln when panoramic history anchors
         # are present.  In Stage 2 InternNav mode (pano_num_histories all
         # zeros / no panoramic views), the VLM forward runs without hooks.
-        has_standard_panoramic_views = (
-            current_views is not None and history_panoramas is not None
-        )
-        has_tokenized_panoramic_history = (
-            panoramic_num_histories is not None
-            and any(n > 0 for n in panoramic_num_histories)
+        has_standard_panoramic_views = current_views is not None and history_panoramas is not None
+        has_tokenized_panoramic_history = panoramic_num_histories is not None and any(
+            n > 0 for n in panoramic_num_histories
         )
         need_heatmap = (
             use_panoramic_chain
             and return_heatmaps
             and (has_standard_panoramic_views or has_tokenized_panoramic_history)
         )
+        if return_heatmap_logits and not need_heatmap:
+            raise ValueError(
+                "return_heatmap_logits=True requires return_heatmaps=True and "
+                "an active panoramic heatmap path with at least one history"
+            )
         if need_heatmap:
             self._ensure_heatmap_vln()
 
@@ -710,9 +702,7 @@ class VLNPipeline(nn.Module):
         # inspection / legacy feature consumers, not for bridge-only Stage2.
         need_projected_sequence_features = return_intermediate
         need_traj_query_features = (
-            return_actions
-            and self.nextdit_action_head is not None
-            and self.latent_queries is not None
+            return_actions and self.nextdit_action_head is not None and self.latent_queries is not None
         )
 
         qwen_output = None
@@ -737,8 +727,8 @@ class VLNPipeline(nn.Module):
                 qwen_input_stats["pano_pixel_values"] = int(pixel_values.shape[0])
             if panoramic_num_histories is not None:
                 qwen_input_stats["pano_history_max"] = int(max(panoramic_num_histories))
-                qwen_input_stats["pano_history_avg"] = (
-                    float(sum(panoramic_num_histories)) / max(len(panoramic_num_histories), 1)
+                qwen_input_stats["pano_history_avg"] = float(sum(panoramic_num_histories)) / max(
+                    len(panoramic_num_histories), 1
                 )
         should_run_qwen = (
             need_projected_sequence_features
@@ -753,7 +743,8 @@ class VLNPipeline(nn.Module):
             lq = None
             if need_traj_query_features:
                 lq = self.latent_queries.expand(batch_size, -1, -1).to(
-                    device=self.device, dtype=self.config.dtype,
+                    device=self.device,
+                    dtype=self.config.dtype,
                 )
             qwen_output = self.qwen2_5_vl(
                 history_frames=history_frames,
@@ -774,40 +765,48 @@ class VLNPipeline(nn.Module):
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
-                qwen_timings = dict(qwen_output.get('timings', {}) or {})
+                qwen_timings = dict(qwen_output.get("timings", {}) or {})
                 qwen_total_s = qwen_end - qwen_start
-                qwen_timings.setdefault('qwen_forward_s', qwen_total_s)
-                qwen_timings.setdefault('pipeline_qwen_total_s', qwen_total_s)
+                qwen_timings.setdefault("qwen_forward_s", qwen_total_s)
+                qwen_timings.setdefault("pipeline_qwen_total_s", qwen_total_s)
 
             if need_projected_sequence_features:
-                raw_hidden_states = qwen_output.get('vision_hidden_states')
+                raw_hidden_states = qwen_output.get("vision_hidden_states")
                 if raw_hidden_states is None:
-                    raw_hidden_states = qwen_output.get('hidden_states')
+                    raw_hidden_states = qwen_output.get("hidden_states")
                 if raw_hidden_states is None:
                     raise RuntimeError("Failed to extract hidden states from VLM backbone")
 
                 if isinstance(raw_hidden_states, list):
                     raw_hidden_states = raw_hidden_states[-1]
                 raw_hidden_states = raw_hidden_states.to(
-                    device=self.device, dtype=self.config.dtype,
+                    device=self.device,
+                    dtype=self.config.dtype,
                 )
 
                 # ==================== Step 2: Project Hidden States ====================
                 llm_tokens = self.llm_projector(raw_hidden_states)
 
             if return_heatmaps and need_heatmap:
-                if 'visibility' not in qwen_output or 'heatmaps' not in qwen_output:
+                if "visibility" not in qwen_output or "heatmaps" not in qwen_output:
                     raise RuntimeError("Panoramic Qwen path did not return HeatmapVLN outputs")
                 heatmap_output = {
-                    'visibility': qwen_output['visibility'],
-                    'heatmaps': qwen_output['heatmaps'],
+                    "visibility": qwen_output["visibility"],
+                    "heatmaps": qwen_output["heatmaps"],
                 }
-                if 'heatmaps_gated' in qwen_output:
-                    heatmap_output['heatmaps_gated'] = qwen_output['heatmaps_gated']
+                if return_heatmap_logits:
+                    if "heatmap_logits" not in qwen_output:
+                        raise RuntimeError(
+                            "Raw heatmap logits were explicitly requested but "
+                            "the active heatmap decoder did not return them"
+                        )
+                    heatmap_output["heatmap_logits"] = qwen_output["heatmap_logits"]
+                if "heatmaps_gated" in qwen_output:
+                    heatmap_output["heatmaps_gated"] = qwen_output["heatmaps_gated"]
 
         # ==================== Step 4: Action Generation ====================
         trajectory = None
-        traj_hidden_states = qwen_output.get('traj_hidden_states') if qwen_output is not None else None
+        traj_hidden_states = qwen_output.get("traj_hidden_states") if qwen_output is not None else None
 
         if return_actions and self.nextdit_action_head is not None and traj_hidden_states is not None:
             if not self.training:
@@ -818,52 +817,44 @@ class VLNPipeline(nn.Module):
 
         # ==================== Build Output ====================
         output: dict[str, Any] = {
-            'processing_metadata': {
-                'num_input_frames': num_frames,
-                'batch_size': batch_size,
-                'llm_token_shape': None if llm_tokens is None else llm_tokens.shape,
-                'timings': qwen_timings,
-                'num_image_tokens': (
-                    qwen_output.get('num_image_tokens')
-                    if isinstance(qwen_output, dict) else None
-                ),
+            "processing_metadata": {
+                "num_input_frames": num_frames,
+                "batch_size": batch_size,
+                "llm_token_shape": None if llm_tokens is None else llm_tokens.shape,
+                "timings": qwen_timings,
+                "num_image_tokens": (qwen_output.get("num_image_tokens") if isinstance(qwen_output, dict) else None),
                 **qwen_input_stats,
             },
         }
 
         if llm_tokens is not None:
-            output['llm_tokens'] = llm_tokens
+            output["llm_tokens"] = llm_tokens
 
         if heatmap_output is not None:
-            output['visibility'] = heatmap_output['visibility']
-            output['heatmaps'] = heatmap_output['heatmaps']
-            if 'heatmaps_gated' in heatmap_output:
-                output['heatmaps_gated'] = heatmap_output['heatmaps_gated']
+            output["visibility"] = heatmap_output["visibility"]
+            output["heatmaps"] = heatmap_output["heatmaps"]
+            if "heatmap_logits" in heatmap_output:
+                output["heatmap_logits"] = heatmap_output["heatmap_logits"]
+            if "heatmaps_gated" in heatmap_output:
+                output["heatmaps_gated"] = heatmap_output["heatmaps_gated"]
 
         if traj_hidden_states is not None:
-            output['traj_hidden_states'] = traj_hidden_states
-        if qwen_output is not None and qwen_output.get('lm_loss') is not None:
-            output['lm_loss'] = qwen_output['lm_loss']
-        if (
-            qwen_output is not None
-            and qwen_output.get('lm_correct_label_logprobs') is not None
-        ):
-            output['lm_correct_label_logprobs'] = qwen_output[
-                'lm_correct_label_logprobs'
-            ]
-            output['lm_correct_label_alignment'] = qwen_output[
-                'lm_correct_label_alignment'
-            ]
+            output["traj_hidden_states"] = traj_hidden_states
+        if qwen_output is not None and qwen_output.get("lm_loss") is not None:
+            output["lm_loss"] = qwen_output["lm_loss"]
+        if qwen_output is not None and qwen_output.get("lm_correct_label_logprobs") is not None:
+            output["lm_correct_label_logprobs"] = qwen_output["lm_correct_label_logprobs"]
+            output["lm_correct_label_alignment"] = qwen_output["lm_correct_label_alignment"]
 
         if self.nextdit_action_head is not None:
-            output['has_nextdit_action_head'] = True
+            output["has_nextdit_action_head"] = True
             if not self.training and trajectory is not None:
-                output['trajectory'] = trajectory
+                output["trajectory"] = trajectory
 
         if return_intermediate and raw_hidden_states is not None and qwen_output is not None:
-            output['intermediate_features'] = {
-                'raw_hidden_states': raw_hidden_states,
-                'qwen_output': qwen_output,
+            output["intermediate_features"] = {
+                "raw_hidden_states": raw_hidden_states,
+                "qwen_output": qwen_output,
             }
 
         return output
@@ -887,8 +878,7 @@ class VLNPipeline(nn.Module):
         if self.nextdit_action_head is None or self.latent_queries is None:
             return None
 
-        inputs = {k: v.to(self.device, non_blocking=True)
-                  for k, v in panoramic_inputs.items()}
+        inputs = {k: v.to(self.device, non_blocking=True) for k, v in panoramic_inputs.items()}
 
         with torch.no_grad():
             output_ids = self.qwen2_5_vl.model.generate(
@@ -900,7 +890,8 @@ class VLNPipeline(nn.Module):
             ).sequences
 
         lq = self.latent_queries.expand(1, -1, -1).to(
-            device=self.device, dtype=self.config.dtype,
+            device=self.device,
+            dtype=self.config.dtype,
         )
         traj_hidden_states = self.qwen2_5_vl.generate_latents(
             output_ids=output_ids,
@@ -934,14 +925,15 @@ class VLNPipeline(nn.Module):
             return_hidden_states=True,
         )
 
-        raw_hidden_states = qwen_output.get('hidden_states')
+        raw_hidden_states = qwen_output.get("hidden_states")
         if raw_hidden_states is None:
             raise RuntimeError("Failed to extract hidden states (packed mode)")
 
         if isinstance(raw_hidden_states, list):
             raw_hidden_states = raw_hidden_states[-1]
         raw_hidden_states = raw_hidden_states.to(
-            device=self.device, dtype=self.config.dtype,
+            device=self.device,
+            dtype=self.config.dtype,
         )
         if raw_hidden_states.dim() == 2:
             raw_hidden_states = raw_hidden_states.unsqueeze(1)
@@ -956,20 +948,20 @@ class VLNPipeline(nn.Module):
 
         # ==================== Build Output ====================
         output: dict[str, Any] = {
-            'llm_tokens': llm_tokens,
-            'processing_metadata': {
-                'num_samples': batch_size,
-                'seq_lens': seq_lens,
-                'total_seq_len': packed_batch["input_ids"].shape[1],
-                'llm_token_shape': llm_tokens.shape,
-                'mode': 'packed',
+            "llm_tokens": llm_tokens,
+            "processing_metadata": {
+                "num_samples": batch_size,
+                "seq_lens": seq_lens,
+                "total_seq_len": packed_batch["input_ids"].shape[1],
+                "llm_token_shape": llm_tokens.shape,
+                "mode": "packed",
             },
         }
 
         if return_intermediate:
-            output['intermediate_features'] = {
-                'raw_hidden_states': raw_hidden_states,
-                'qwen_output': qwen_output,
+            output["intermediate_features"] = {
+                "raw_hidden_states": raw_hidden_states,
+                "qwen_output": qwen_output,
             }
 
         return output

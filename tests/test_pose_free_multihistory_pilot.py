@@ -179,7 +179,11 @@ def test_transform_interventions_never_create_pose_and_single_swap_is_local():
     blank = transform_sample(sample, intervention="blank-images")
     assert torch.count_nonzero(blank["current_views"]) == 0
     assert set(INTERVENTIONS) == {
-        "standard", "blank-images", "history-shuffle", "current-shuffle", "single-anchor-swap"
+        "standard",
+        "blank-images",
+        "history-shuffle",
+        "current-shuffle",
+        "single-anchor-swap",
     }
 
 
@@ -238,23 +242,34 @@ def test_forward_loss_rejects_pose_and_calls_four_isolated_b1_forwards():
 
         def __call__(self, **kwargs):
             self.seen.append(kwargs)
-            return {
+            output = {
                 "visibility": self.scale.expand(1, 1, 4),
                 "heatmaps": self.scale.sigmoid().expand(1, 1, 4, 8, 8),
             }
+            if kwargs.get("return_heatmap_logits"):
+                output["heatmap_logits"] = self.scale.expand(1, 1, 4, 8, 8)
+            return output
 
     model = FakeModel()
     transformed = transform_sample(_sample(), intervention="standard")
     criterion = HeatmapVLNLoss(heatmap_size=(8, 8), lambda_coord=0.0)
 
-    loss, record = forward_loss(model, criterion, transformed, torch.device("cpu"))
+    loss, record = forward_loss(
+        model,
+        criterion,
+        transformed,
+        torch.device("cpu"),
+        return_heatmap_logits=True,
+    )
 
     assert torch.isfinite(loss)
     assert record["visibility"].shape == (1, 4, 4)
+    assert record["heatmap_logits"].shape == (1, 4, 4, 8, 8)
     assert len(model.seen) == 4
     assert all(item["history_panoramas"].shape == (1, 1, 4, 3, 2, 2) for item in model.seen)
     assert all(item["current_views"].shape == (1, 4, 3, 2, 2) for item in model.seen)
     assert all(item["history_rel_poses"] is None for item in model.seen)
+    assert all(item["return_heatmap_logits"] is True for item in model.seen)
     loss.backward()
     assert model.scale.grad is not None
     assert model.scale.grad.abs() > 0
@@ -271,9 +286,7 @@ def test_forward_loss_rejects_pose_and_calls_four_isolated_b1_forwards():
 def test_blank_output_identity_gate_fails_closed_on_row_specific_results():
     visibility = torch.zeros(1, 4, 4)
     heatmaps = torch.full((1, 4, 4, 8, 8), 0.5)
-    assert assert_blank_output_identity(visibility, heatmaps)[
-        "four_blank_chain_outputs_bitwise_identical"
-    ]
+    assert assert_blank_output_identity(visibility, heatmaps)["four_blank_chain_outputs_bitwise_identical"]
 
     visibility[:, 2] = 1
     with pytest.raises(RuntimeError, match="row-specific"):
@@ -308,12 +321,14 @@ def test_history_permutation_gate_inverse_reorders_outputs_and_fails_on_drift():
         "visibility": torch.arange(16, dtype=torch.float32).reshape(1, 4, 4),
         "heatmaps": torch.arange(4 * 4 * 2 * 2, dtype=torch.float32).reshape(1, 4, 4, 2, 2),
     }
+    standard["heatmap_logits"] = standard["heatmaps"] - 10.0
     permutation = [3, 2, 1, 0]
     shuffled = {
         "sample_id": "sample-a",
         "history_permutation": permutation,
         "visibility": standard["visibility"][:, permutation].clone(),
         "heatmaps": standard["heatmaps"][:, permutation].clone(),
+        "heatmap_logits": standard["heatmap_logits"][:, permutation].clone(),
     }
 
     gate = assert_history_permutation_equivariance([standard], [shuffled])
@@ -364,14 +379,9 @@ def test_single_swap_reports_targeted_metrics_and_untargeted_output_invariance()
     }
     swaps = []
     for target_slot in range(4):
-        swapped = {
-            key: value.clone() if torch.is_tensor(value) else value
-            for key, value in base.items()
-        }
+        swapped = {key: value.clone() if torch.is_tensor(value) else value for key, value in base.items()}
         swapped["target_slot"] = target_slot
-        swapped["heatmaps"][0, target_slot] = torch.roll(
-            swapped["heatmaps"][0, target_slot], shifts=2, dims=-1
-        )
+        swapped["heatmaps"][0, target_slot] = torch.roll(swapped["heatmaps"][0, target_slot], shifts=2, dims=-1)
         swaps.append(swapped)
 
     targeted = compute_metrics(swaps, dynamic_slots="targeted")

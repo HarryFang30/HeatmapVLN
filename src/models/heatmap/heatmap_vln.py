@@ -70,6 +70,7 @@ class HeatmapVLN(nn.Module):
         c_fused: int = 256,
         vit_layer_indices: list[int] | None = None,
         llm_layer_indices: list[int] | None = None,
+        spatial_merge_size: int = 2,
         enable_runtime_timing: bool = False,
         trajectory_config: dict[str, Any] | None = None,
         heatmap_trains_backbone: bool = False,
@@ -94,10 +95,7 @@ class HeatmapVLN(nn.Module):
         self.heatmap_trains_backbone = heatmap_trains_backbone
         self.decoder_mode = str(decoder_mode).strip().lower()
         if self.decoder_mode not in {"legacy", "pose_free_matcher"}:
-            raise ValueError(
-                "decoder_mode must be 'legacy' or 'pose_free_matcher', "
-                f"got {decoder_mode!r}"
-            )
+            raise ValueError(f"decoder_mode must be 'legacy' or 'pose_free_matcher', got {decoder_mode!r}")
         if self.decoder_mode == "pose_free_matcher":
             # The pose-free matcher consumes only deepest-layer LLM patches.
             # Retaining hooked ViT tensors would keep a large, completely
@@ -106,6 +104,18 @@ class HeatmapVLN(nn.Module):
         self._logged_llm_feature_stats = False
 
         traj_cfg = trajectory_config or {}
+        pose_cfg = pose_free_config or {}
+        allowed_pose_free_keys = {
+            "match_dim",
+            "heatmap_size",
+            "visibility_hidden_dim",
+            "logit_temperature",
+            "history_query_source",
+        }
+        unknown_pose_free_keys = set(pose_cfg) - allowed_pose_free_keys
+        if unknown_pose_free_keys:
+            raise ValueError(f"Unknown pose_free configuration keys: {sorted(unknown_pose_free_keys)}")
+        self.history_query_source = str(pose_cfg.get("history_query_source", "text_anchor")).strip().lower()
         self.enable_trajectory = traj_cfg.get("enable", False)
         if self.decoder_mode == "pose_free_matcher" and self.enable_trajectory:
             raise ValueError(
@@ -122,13 +132,16 @@ class HeatmapVLN(nn.Module):
         # When heatmap_trains_backbone=True, hooks retain the computation graph
         # so that heatmap loss gradients flow back through the backbone (LoRA).
         self.feat_extractor = FeatureExtractor(
-            self.qwen, self.vit_layer_indices, llm_layer_indices,
+            self.qwen,
+            self.vit_layer_indices,
+            llm_layer_indices,
+            spatial_merge_size=spatial_merge_size,
             detach_features=not heatmap_trains_backbone,
+            history_query_source=self.history_query_source,
         )
 
         self.pose_free_matcher: PoseFreeHistoryMatcher | None = None
         if self.decoder_mode == "pose_free_matcher":
-            pose_cfg = pose_free_config or {}
             self.vit_dpt_fusion = None
             self.llm_dpt_fusion = None
             self.coarse = None
@@ -141,9 +154,7 @@ class HeatmapVLN(nn.Module):
                 visibility_hidden_dim=pose_cfg.get("visibility_hidden_dim", 16),
                 logit_temperature=pose_cfg.get("logit_temperature", 10.0),
             )
-            logger.info(
-                "HeatmapVLN: using pose-free shared history-query x current-patch matcher"
-            )
+            logger.info("HeatmapVLN: using pose-free shared history-query x current-patch matcher")
         else:
             # DPT-Lite fusion for ViT 16x16 multi-layer features
             n_vit_layers = len(vit_layer_indices)
@@ -171,18 +182,20 @@ class HeatmapVLN(nn.Module):
             # Fine localisation head (no longer needs c_llm — uses spatial_out from coarse)
             self.fine = FineLocalization(c_fused)
 
-        trainable = sum(
-            p.numel() for p in self.parameters() if p.requires_grad
-        )
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
             "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, "
-            "heatmap_trains_backbone=%s, decoder_mode=%s, trainable=%s",
-            c_vit, c_llm, c_fused,
-            self.vit_layer_indices, llm_layer_indices,
+            "heatmap_trains_backbone=%s, decoder_mode=%s, history_query_source=%s, trainable=%s",
+            c_vit,
+            c_llm,
+            c_fused,
+            self.vit_layer_indices,
+            llm_layer_indices,
             self.enable_trajectory,
             self.heatmap_trains_backbone,
             self.decoder_mode,
+            self.history_query_source,
             f"{trainable:,}",
         )
 
@@ -256,21 +269,15 @@ class HeatmapVLN(nn.Module):
         if torch.is_tensor(current_views):
             if current_views.dim() != 5:
                 raise ValueError(f"Expected current_views [B, 4, C, H, W], got {tuple(current_views.shape)}")
-            current_views_list = [
-                self._views_tensor_to_dict(current_views[b])
-                for b in range(current_views.shape[0])
-            ]
+            current_views_list = [self._views_tensor_to_dict(current_views[b]) for b in range(current_views.shape[0])]
         else:
             current_views_list = current_views
 
         if torch.is_tensor(history_panoramas):
             if history_panoramas.dim() != 6:
-                raise ValueError(
-                    f"Expected history_panoramas [B, N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
-                )
+                raise ValueError(f"Expected history_panoramas [B, N, 4, C, H, W], got {tuple(history_panoramas.shape)}")
             history_panoramas_list = [
-                self._history_tensor_to_list(history_panoramas[b])
-                for b in range(history_panoramas.shape[0])
+                self._history_tensor_to_list(history_panoramas[b]) for b in range(history_panoramas.shape[0])
             ]
         else:
             history_panoramas_list = history_panoramas
@@ -279,9 +286,7 @@ class HeatmapVLN(nn.Module):
         if isinstance(instruction, list):
             instructions = list(instruction)
             if len(instructions) != batch_size:
-                raise ValueError(
-                    f"Instruction batch size mismatch: got {len(instructions)} for {batch_size} samples"
-                )
+                raise ValueError(f"Instruction batch size mismatch: got {len(instructions)} for {batch_size} samples")
         else:
             instructions = [instruction] * batch_size
 
@@ -313,7 +318,9 @@ class HeatmapVLN(nn.Module):
             vgt = inputs["video_grid_thw"]
             if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
                 inputs["video_grid_thw"] = torch.repeat_interleave(
-                    vgt, vgt[:, 0], dim=0,
+                    vgt,
+                    vgt[:, 0],
+                    dim=0,
                 )
                 inputs["video_grid_thw"][:, 0] = 1
 
@@ -335,14 +342,14 @@ class HeatmapVLN(nn.Module):
 
         image_grid_thw = inputs.get("image_grid_thw")
         current_vit, current_llm, history_queries, _ = self.feat_extractor.extract(
-            image_positions, text_anchors, image_grid_thw,
+            image_positions,
+            text_anchors,
+            image_grid_thw,
         )
         self._validate_and_log_current_llm(current_llm)
 
         if len(history_queries) != num_history:
-            raise RuntimeError(
-                f"Expected {num_history} history queries, got {len(history_queries)}"
-            )
+            raise RuntimeError(f"Expected {num_history} history queries, got {len(history_queries)}")
 
         return self._decode_features(
             current_vit=current_vit,
@@ -369,13 +376,12 @@ class HeatmapVLN(nn.Module):
 
         if image_positions_batch is None:
             image_positions_batch = [
-                self._find_image_positions_from_ids(input_ids[b])
-                for b in range(input_ids.shape[0])
+                self._find_image_positions_from_ids(input_ids[b]) for b in range(input_ids.shape[0])
             ]
         if text_anchors_batch is None:
             text_anchors_batch = [
                 find_text_anchor_positions(
-                    input_ids[b:b + 1],
+                    input_ids[b : b + 1],
                     self.processor.tokenizer,
                     num_history=num_histories[b],
                 )
@@ -425,8 +431,7 @@ class HeatmapVLN(nn.Module):
                 ).unsqueeze(0)
             except KeyError as exc:
                 raise RuntimeError(
-                    f"Pose-free decoder requires current LLM patches from layer {deepest_layer} "
-                    "for all four views"
+                    f"Pose-free decoder requires current LLM patches from layer {deepest_layer} for all four views"
                 ) from exc
             if history_queries:
                 history_queries_tensor = torch.stack(history_queries, dim=0).unsqueeze(0)
@@ -443,9 +448,7 @@ class HeatmapVLN(nn.Module):
                 history_mask=history_mask,
             )
             return {
-                key: value.squeeze(0)
-                if torch.is_tensor(value) and value.shape[:1] == (1,)
-                else value
+                key: value.squeeze(0) if torch.is_tensor(value) and value.shape[:1] == (1,) else value
                 for key, value in result.items()
             }
         if num_history == 0:
@@ -454,16 +457,25 @@ class HeatmapVLN(nn.Module):
                 "heatmaps": torch.empty(0, 4, 64, 64, device=device),
             }
         fused_vit = self._fuse_view_features_batched(
-            current_vit, self.vit_layer_indices, self.vit_dpt_fusion, device, output_layout="nchw",
+            current_vit,
+            self.vit_layer_indices,
+            self.vit_dpt_fusion,
+            device,
+            output_layout="nchw",
         )
         fused_llm = self._fuse_view_features_batched(
-            current_llm, self.llm_layer_indices, self.llm_dpt_fusion, device, output_layout="hwc",
+            current_llm,
+            self.llm_layer_indices,
+            self.llm_dpt_fusion,
+            device,
+            output_layout="hwc",
         )
         history_queries_tensor = torch.stack(history_queries, dim=0)
 
         if self.enable_trajectory:
             coarse_results = self.coarse(
-                fused_llm, history_queries_tensor,
+                fused_llm,
+                history_queries_tensor,
                 history_rel_poses=history_rel_poses,
             )
         else:
@@ -481,7 +493,9 @@ class HeatmapVLN(nn.Module):
 
     def _decode_features_batch(
         self,
-        extracted: list[tuple[dict[int, dict[int, torch.Tensor]], dict[int, dict[int, torch.Tensor]], list[torch.Tensor]]],
+        extracted: list[
+            tuple[dict[int, dict[int, torch.Tensor]], dict[int, dict[int, torch.Tensor]], list[torch.Tensor]]
+        ],
         num_histories: list[int],
         device: torch.device,
         history_rel_poses: torch.Tensor | None = None,
@@ -591,7 +605,8 @@ class HeatmapVLN(nn.Module):
 
         if self.enable_trajectory:
             coarse_results = self.coarse(
-                fused_llm, history_queries_tensor,
+                fused_llm,
+                history_queries_tensor,
                 history_rel_poses=history_rel_poses,
             )
         else:
@@ -654,9 +669,7 @@ class HeatmapVLN(nn.Module):
             deepest_layer = max(self.llm_layer_indices)
             current_patches = llm_layer_tensors.get(deepest_layer)
             if current_patches is None:
-                raise RuntimeError(
-                    f"Pose-free decoder requires current LLM patches from layer {deepest_layer}"
-                )
+                raise RuntimeError(f"Pose-free decoder requires current LLM patches from layer {deepest_layer}")
             if self.enable_runtime_timing:
                 self._sync_for_timing(device)
                 t_pose_free0 = time.perf_counter()
@@ -726,7 +739,8 @@ class HeatmapVLN(nn.Module):
             t_coarse0 = time.perf_counter()
         if self.enable_trajectory:
             coarse_results = self.coarse(
-                fused_llm, history_queries_tensor,
+                fused_llm,
+                history_queries_tensor,
                 history_rel_poses=history_rel_poses,
             )
         else:
@@ -779,9 +793,7 @@ class HeatmapVLN(nn.Module):
             history_mask=history_mask,
         )
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(
-                result["heatmaps"], result["visibility"]
-            )
+            result["heatmaps_gated"] = self._gated_softmax_heatmaps(result["heatmaps"], result["visibility"])
         return result
 
     @staticmethod
@@ -1053,7 +1065,8 @@ class HeatmapVLN(nn.Module):
     # ------------------------------------------------------------------
 
     def _find_image_positions(
-        self, inputs: dict[str, torch.Tensor],
+        self,
+        inputs: dict[str, torch.Tensor],
     ) -> dict[int, tuple[int, int]]:
         """
         Find start/end positions of each image's vision tokens in the LLM
@@ -1062,7 +1075,7 @@ class HeatmapVLN(nn.Module):
         Uses the tokenizer's ``<|image_pad|>`` token ID dynamically so that
         we are robust to tokenizer changes.
         """
-        if not hasattr(self, '_image_pad_id'):
+        if not hasattr(self, "_image_pad_id"):
             tokenizer = self.processor.tokenizer
             pad_token = "<|image_pad|>"
             self._image_pad_id = tokenizer.convert_tokens_to_ids(pad_token)
@@ -1076,9 +1089,10 @@ class HeatmapVLN(nn.Module):
         return self._find_image_positions_from_ids(inputs["input_ids"].squeeze().tolist())
 
     def _find_image_positions_from_ids(
-        self, input_ids: Union[torch.Tensor, list[int]],
+        self,
+        input_ids: Union[torch.Tensor, list[int]],
     ) -> dict[int, tuple[int, int]]:
-        if not hasattr(self, '_image_pad_id'):
+        if not hasattr(self, "_image_pad_id"):
             tokenizer = self.processor.tokenizer
             pad_token = "<|image_pad|>"
             self._image_pad_id = tokenizer.convert_tokens_to_ids(pad_token)
@@ -1116,10 +1130,5 @@ class HeatmapVLN(nn.Module):
 
     def _history_tensor_to_list(self, history_panoramas: torch.Tensor) -> list[dict[str, Any]]:
         if history_panoramas.dim() != 5 or history_panoramas.shape[1] != 4:
-            raise ValueError(
-                f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}"
-            )
-        return [
-            self._views_tensor_to_dict(history_panoramas[idx])
-            for idx in range(history_panoramas.shape[0])
-        ]
+            raise ValueError(f"Expected history panoramas [N, 4, C, H, W], got {tuple(history_panoramas.shape)}")
+        return [self._views_tensor_to_dict(history_panoramas[idx]) for idx in range(history_panoramas.shape[0])]
