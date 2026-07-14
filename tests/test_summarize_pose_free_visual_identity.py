@@ -101,17 +101,17 @@ def _metric(records: list[dict[str, Any]], *, targeted: bool = False) -> dict[st
     }
 
 
-def _routing() -> dict[str, Any]:
+def _routing(source_samples: int) -> dict[str, Any]:
     return {
         "contract": "replace history i; compare output i against all output j!=i on the same current",
         "targeted": {
-            "comparisons": 160,
+            "comparisons": source_samples * 4,
             "mean_heatmap_l1": 0.2,
             "mean_visibility_l1": 0.3,
             "mean_peak_displacement": 20.0,
         },
         "untargeted": {
-            "comparisons": 480,
+            "comparisons": source_samples * 12,
             "mean_heatmap_l1": 0.0,
             "mean_visibility_l1": 0.0,
             "mean_peak_displacement": 0.0,
@@ -120,7 +120,7 @@ def _routing() -> dict[str, Any]:
     }
 
 
-def _prediction_records(cell: str) -> dict[str, list[dict[str, Any]]]:
+def _prediction_records(cell: str, source_samples: int = 40) -> dict[str, list[dict[str, Any]]]:
     standard_assignments = {
         "identity-trained": [0, 1, 2, 3],
         "heatmap-control-trained": [0, 1, 0, 0],
@@ -128,7 +128,7 @@ def _prediction_records(cell: str) -> dict[str, list[dict[str, Any]]]:
     }[cell]
     changed_assignments = [1, 2, 3, 0] if cell == "identity-trained" else standard_assignments
     output: dict[str, list[dict[str, Any]]] = {intervention: [] for intervention in INTERVENTIONS}
-    for position in range(40):
+    for position in range(source_samples):
         sample_id = f"scene{position:02d}/clip{position:04d}"
         output["standard"].append(_record(sample_id, standard_assignments))
         output["history-shuffle"].append(_record(sample_id, changed_assignments))
@@ -138,33 +138,41 @@ def _prediction_records(cell: str) -> dict[str, list[dict[str, Any]]]:
     return output
 
 
-def _gates() -> dict[str, Any]:
+def _gates(source_samples: int = 40) -> dict[str, Any]:
     history = {
         "passed": True,
         "bitwise_exact": True,
-        "samples": 40,
-        "tensor_comparisons": 80,
+        "samples": source_samples,
+        "tensor_comparisons": source_samples * 2,
         "maximum_abs_difference": 0.0,
     }
-    current = {"passed": True, "paired_source_samples": 40, "sample_order_exact": True}
+    current = {
+        "passed": True,
+        "paired_source_samples": source_samples,
+        "sample_order_exact": True,
+    }
     swap = {
         "passed": True,
         "bitwise_exact": True,
-        "source_samples": 40,
-        "swap_pairs": 160,
-        "untargeted_output_slots": 480,
-        "tensor_comparisons": 960,
+        "source_samples": source_samples,
+        "swap_pairs": source_samples * 4,
+        "untargeted_output_slots": source_samples * 12,
+        "tensor_comparisons": source_samples * 24,
         "maximum_abs_difference": 0.0,
     }
-    blank_input = {"passed": True, "bitwise_exact": True, "samples": 40}
+    blank_input = {"passed": True, "bitwise_exact": True, "samples": source_samples}
     blank_output = {
         "passed": True,
         "bitwise_exact": True,
-        "samples": 40,
+        "samples": source_samples,
         "maximum_abs_difference": 0.0,
     }
     return {
-        "standard": {"passed": True, "source_samples": 40, "unique_sample_ids": True},
+        "standard": {
+            "passed": True,
+            "source_samples": source_samples,
+            "unique_sample_ids": True,
+        },
         "history-shuffle": history,
         "current-shuffle": current,
         "single-anchor-swap": swap,
@@ -173,6 +181,7 @@ def _gates() -> dict[str, Any]:
 
 
 def _evaluations(records: dict[str, list[dict[str, Any]]], gates: dict[str, Any]) -> dict[str, Any]:
+    source_samples = len(records["standard"])
     evaluations: dict[str, Any] = {}
     for intervention in INTERVENTIONS:
         metrics = _metric(records[intervention])
@@ -182,13 +191,15 @@ def _evaluations(records: dict[str, list[dict[str, Any]]], gates: dict[str, Any]
     evaluations["current-shuffle"]["paired_schedule_gate"] = gates["current-shuffle"]
     evaluations["single-anchor-swap"]["targeted_slot_metrics"] = _metric(records["single-anchor-swap"], targeted=True)
     evaluations["single-anchor-swap"]["untargeted_invariance_gate"] = gates["single-anchor-swap"]
-    evaluations["single-anchor-swap"]["paired_output_change_vs_standard"] = _routing()
+    evaluations["single-anchor-swap"]["paired_output_change_vs_standard"] = _routing(source_samples)
     evaluations["blank-images"]["blank_input_identity_gate"] = gates["blank-images"]["input"]
     evaluations["blank-images"]["blank_output_identity_gate"] = gates["blank-images"]["output"]
     return evaluations
 
 
-def _shared_contracts() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _shared_contracts(
+    source_samples: int = 40,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     stage1 = {
         "path": "/pinned/stage1.pth",
         "file_sha256": _sha("stage1-file"),
@@ -205,7 +216,7 @@ def _shared_contracts() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any],
         "train_identity_sha256": _sha("train-ids"),
         "val_identity_sha256": _sha("val-ids"),
         "train_samples": 128,
-        "val_samples": 40,
+        "val_samples": source_samples,
         "scene_disjoint": True,
         "minimum_target_separation_pixels": 12.0,
         "identity_targets_per_sample": 4,
@@ -260,8 +271,8 @@ def _pair_gate(identity_file: str, control_file: str) -> dict[str, Any]:
     }
 
 
-def _reports() -> dict[str, dict[str, Any]]:
-    stage1, manifest, config, runtime = _shared_contracts()
+def _reports(source_samples: int = 40) -> dict[str, dict[str, Any]]:
+    stage1, manifest, config, runtime = _shared_contracts(source_samples)
     warmup_file = _sha("warmup-file")
     warmup_head = _sha("warmup-head")
     warmup_lora = stage1["loaded_lora_sha256"]
@@ -280,8 +291,8 @@ def _reports() -> dict[str, dict[str, Any]]:
     }
     reports: dict[str, dict[str, Any]] = {}
     for index, cell in enumerate(CELL_NAMES):
-        records = _prediction_records(cell)
-        gates = _gates()
+        records = _prediction_records(cell, source_samples)
+        gates = _gates(source_samples)
         mode = {
             "warmup-original": "head-warmup",
             "identity-trained": "lora-identity",
@@ -328,6 +339,11 @@ def _reports() -> dict[str, dict[str, Any]]:
             "protocol": REPORT_PROTOCOL,
             "phase": "eval",
             "cell": cell,
+            "evaluation_scope": {
+                "selection_split": "val",
+                "standard_only": False,
+                "source_samples": source_samples,
+            },
             "evaluation_pid": 200 + index,
             "fresh_process_contract": {
                 "training_pid": 100 + index,
@@ -415,6 +431,28 @@ def test_summary_is_source_paired_and_authorizes_only_when_all_gates_pass():
     assert summary["overall_stage2_stage3_authorized"] is True
 
 
+def test_summary_derives_and_accepts_128_source_validation_contract():
+    summary = summarize(_reports(128), bootstrap_samples=20, seed=19, heatmap_width=WIDTH)
+
+    assert summary["contract_validation"]["source_samples"] == 128
+    assert summary["bootstrap_contract"]["source_samples"] == 128
+    assert summary["cells"]["identity-trained"]["standard"]["score_nearest_identity_accuracy"]["denominator"] == 512.0
+    assert summary["overall_stage2_stage3_authorized"] is True
+
+
+def test_summary_rejects_manifest_or_evaluation_scope_count_disagreement():
+    reports = _reports(128)
+    reports["heatmap-control-trained"]["manifest_contract"]["val_samples"] = 127
+    reports["heatmap-control-trained"]["evaluation_scope"]["source_samples"] = 127
+    with pytest.raises(RuntimeError, match="do not agree on manifest val_samples"):
+        summarize(reports, bootstrap_samples=10, heatmap_width=WIDTH)
+
+    reports = _reports(128)
+    reports["identity-trained"]["evaluation_scope"]["standard_only"] = True
+    with pytest.raises(RuntimeError, match="evaluation scope is not the complete manifest validation split"):
+        summarize(reports, bootstrap_samples=10, heatmap_width=WIDTH)
+
+
 def test_gate_fails_when_score_identity_does_not_beat_control():
     reports = _reports()
     for record in reports["identity-trained"]["prediction_records"]["standard"]:
@@ -429,7 +467,7 @@ def test_gate_fails_when_score_identity_does_not_beat_control():
     assert summary["decision_gate"]["failure_action"] is not None
 
 
-def test_summary_rejects_non_40_source_schedule():
+def test_summary_rejects_record_schedule_shorter_than_manifest_contract():
     reports = _reports()
     for report in reports.values():
         for intervention in INTERVENTIONS:

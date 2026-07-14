@@ -83,7 +83,6 @@ PANORAMA_CONTROL_VIEW_GAIN_MINIMUM = 0.10
 PANORAMA_CONTROL_GLOBAL_MAP_PCK8_MINIMUM = 0.15
 PANORAMA_CONTROL_GLOBAL_MAP_GAIN_MINIMUM = 0.05
 PANORAMA_CONTROL_CONDITIONAL_PCK8_GAIN_MINIMUM = 0.03
-REQUIRED_SOURCE_SAMPLES = 40
 REQUIRED_TARGETS = 4
 MINIMUM_TARGET_SEPARATION = 12.0
 
@@ -200,12 +199,12 @@ def _validate_exact_gate(gate: Any, *, context: str, maximum_required: bool = Tr
     return gate
 
 
-def _validate_swap_routing(evaluation: Any, *, cell: str) -> None:
+def _validate_swap_routing(evaluation: Any, *, cell: str, source_samples: int) -> None:
     _require(isinstance(evaluation, dict), f"Cell {cell} single-anchor-swap evaluation missing")
     paired = evaluation.get("paired_output_change_vs_standard")
     _require(isinstance(paired, dict), f"Cell {cell} paired single-swap metrics missing")
     _require(paired.get("contract") == PAIRED_SWAP_CONTRACT, f"Cell {cell} paired swap contract mismatch")
-    expected = {"targeted": REQUIRED_SOURCE_SAMPLES * 4, "untargeted": REQUIRED_SOURCE_SAMPLES * 12}
+    expected = {"targeted": source_samples * 4, "untargeted": source_samples * 12}
     for route, comparisons in expected.items():
         values = paired.get(route)
         _require(isinstance(values, dict), f"Cell {cell} paired swap {route} route missing")
@@ -277,6 +276,7 @@ def _validate_prediction_records(
     reports: Mapping[str, Mapping[str, Any]],
     *,
     width: int,
+    source_samples: int,
 ) -> tuple[list[str], str]:
     canonical_ids: list[str] | None = None
     canonical_labels: dict[str, tuple[Any, Any]] | None = None
@@ -290,7 +290,10 @@ def _validate_prediction_records(
         standard = records_by_intervention["standard"]
         _require(isinstance(standard, list), f"Cell {cell} standard records are not a list")
         ids = [str(record.get("sample_id")) for record in standard]
-        _require(len(ids) == REQUIRED_SOURCE_SAMPLES, f"Cell {cell} must contain exactly 40 source IDs")
+        _require(
+            len(ids) == source_samples,
+            f"Cell {cell} must contain exactly {source_samples} source IDs",
+        )
         _require(len(ids) == len(set(ids)), f"Cell {cell} standard source IDs are not unique")
         labels: dict[str, tuple[Any, Any]] = {}
         for position, record in enumerate(standard):
@@ -307,7 +310,7 @@ def _validate_prediction_records(
         for intervention in INTERVENTIONS:
             records = records_by_intervention[intervention]
             _require(isinstance(records, list), f"Cell {cell} {intervention} records are not a list")
-            expected_count = REQUIRED_SOURCE_SAMPLES * (4 if intervention == "single-anchor-swap" else 1)
+            expected_count = source_samples * (4 if intervention == "single-anchor-swap" else 1)
             _require(len(records) == expected_count, f"Cell {cell} {intervention} record count mismatch")
             keys = [_record_key(record) for record in records]
             expected_keys = (
@@ -331,7 +334,12 @@ def _validate_prediction_records(
     return canonical_ids, source_hash
 
 
-def _validate_report_gates(report: Mapping[str, Any], *, cell: str) -> None:
+def _validate_report_gates(
+    report: Mapping[str, Any],
+    *,
+    cell: str,
+    source_samples: int,
+) -> None:
     evaluations = report.get("evaluations")
     gates = report.get("intervention_gates")
     _require(isinstance(evaluations, dict), f"Cell {cell} evaluations missing")
@@ -341,14 +349,14 @@ def _validate_report_gates(report: Mapping[str, Any], *, cell: str) -> None:
     for intervention in INTERVENTIONS:
         evaluation = evaluations[intervention]
         _require(isinstance(evaluation, dict), f"Cell {cell} {intervention} evaluation is invalid")
-        expected = REQUIRED_SOURCE_SAMPLES * (4 if intervention == "single-anchor-swap" else 1)
+        expected = source_samples * (4 if intervention == "single-anchor-swap" else 1)
         _require(evaluation.get("samples") == expected, f"Cell {cell} {intervention} sample count mismatch")
 
     standard = gates["standard"]
     _require(
         isinstance(standard, dict)
         and standard.get("passed") is True
-        and standard.get("source_samples") == REQUIRED_SOURCE_SAMPLES
+        and standard.get("source_samples") == source_samples
         and standard.get("unique_sample_ids") is True,
         f"Cell {cell} standard source-ID gate failed",
     )
@@ -361,7 +369,7 @@ def _validate_report_gates(report: Mapping[str, Any], *, cell: str) -> None:
     _require(
         isinstance(current, dict)
         and current.get("passed") is True
-        and current.get("paired_source_samples") == REQUIRED_SOURCE_SAMPLES
+        and current.get("paired_source_samples") == source_samples
         and current.get("sample_order_exact") is True,
         f"Cell {cell} current-shuffle pairing gate failed",
     )
@@ -371,9 +379,9 @@ def _validate_report_gates(report: Mapping[str, Any], *, cell: str) -> None:
     )
     swap = _validate_exact_gate(gates["single-anchor-swap"], context=f"Cell {cell} single-swap locality")
     _require(
-        swap.get("source_samples") == REQUIRED_SOURCE_SAMPLES
-        and swap.get("swap_pairs") == REQUIRED_SOURCE_SAMPLES * 4
-        and swap.get("untargeted_output_slots") == REQUIRED_SOURCE_SAMPLES * 12,
+        swap.get("source_samples") == source_samples
+        and swap.get("swap_pairs") == source_samples * 4
+        and swap.get("untargeted_output_slots") == source_samples * 12,
         f"Cell {cell} single-swap locality counts mismatch",
     )
     _require(
@@ -389,7 +397,11 @@ def _validate_report_gates(report: Mapping[str, Any], *, cell: str) -> None:
         and evaluations["blank-images"].get("blank_output_identity_gate") == blank_output,
         f"Cell {cell} duplicated blank gates differ",
     )
-    _validate_swap_routing(evaluations["single-anchor-swap"], cell=cell)
+    _validate_swap_routing(
+        evaluations["single-anchor-swap"],
+        cell=cell,
+        source_samples=source_samples,
+    )
 
 
 def _validate_selected_cell_contracts(reports: Mapping[str, Mapping[str, Any]]) -> None:
@@ -512,12 +524,46 @@ def _validate_selected_cell_contracts(reports: Mapping[str, Mapping[str, Any]]) 
         )
 
 
+def _validated_source_samples(reports: Mapping[str, Mapping[str, Any]]) -> int:
+    """Bind the full-validation sample count across all three eval reports."""
+
+    canonical: int | None = None
+    for cell in CELL_NAMES:
+        manifest = reports[cell].get("manifest_contract")
+        _require(isinstance(manifest, dict), f"Cell {cell} manifest contract missing")
+        value = manifest.get("val_samples")
+        _require(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0,
+            f"Cell {cell} manifest val_samples must be a positive integer",
+        )
+        scope = reports[cell].get("evaluation_scope")
+        _require(
+            scope
+            == {
+                "selection_split": "val",
+                "standard_only": False,
+                "source_samples": value,
+            },
+            f"Cell {cell} evaluation scope is not the complete manifest validation split",
+        )
+        if canonical is None:
+            canonical = value
+        else:
+            _require(
+                value == canonical,
+                "Three eval reports do not agree on manifest val_samples",
+            )
+    assert canonical is not None
+    return canonical
+
+
 def validate_contracts(
     reports: Mapping[str, Mapping[str, Any]],
     *,
     width: int,
 ) -> dict[str, Any]:
     _require(set(reports) == set(CELL_NAMES), "Exactly the three registered visual-identity cells are required")
+    source_samples = _validated_source_samples(reports)
     for cell in CELL_NAMES:
         report = reports[cell]
         _require(report.get("schema") == REPORT_SCHEMA, f"Cell {cell} report schema mismatch")
@@ -527,7 +573,10 @@ def validate_contracts(
         _require(tuple(report.get("interventions", ())) == INTERVENTIONS, f"Cell {cell} intervention order mismatch")
         manifest = report.get("manifest_contract")
         _require(isinstance(manifest, dict), f"Cell {cell} manifest contract missing")
-        _require(manifest.get("val_samples") == REQUIRED_SOURCE_SAMPLES, f"Cell {cell} validation split is not 40")
+        _require(
+            manifest.get("val_samples") == source_samples,
+            f"Cell {cell} validation sample count differs from the shared contract",
+        )
         _require(manifest.get("scene_disjoint") is True, f"Cell {cell} train/validation scenes are not disjoint")
         _require(manifest.get("identity_targets_per_sample") == REQUIRED_TARGETS, f"Cell {cell} does not use K=4")
         _require(
@@ -558,7 +607,11 @@ def validate_contracts(
             and fresh["training_pid"] != fresh["evaluation_pid"],
             f"Cell {cell} was not evaluated in a fresh process",
         )
-        _validate_report_gates(report, cell=cell)
+        _validate_report_gates(
+            report,
+            cell=cell,
+            source_samples=source_samples,
+        )
 
     for key in ("stage1_s2_contract", "manifest_contract", "pose_free_config_contract", "runtime_contract"):
         _require(_same(reports, key), f"Three cells do not share the same {key}")
@@ -582,7 +635,11 @@ def validate_contracts(
         runtime.get("raw_heatmap_logits_opt_in") == "return_heatmap_logits=True", "Runtime raw-logit contract mismatch"
     )
     _validate_selected_cell_contracts(reports)
-    source_ids, source_hash = _validate_prediction_records(reports, width=width)
+    source_ids, source_hash = _validate_prediction_records(
+        reports,
+        width=width,
+        source_samples=source_samples,
+    )
     return {
         "passed": True,
         "report_schema": REPORT_SCHEMA,
