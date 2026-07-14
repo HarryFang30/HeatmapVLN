@@ -121,11 +121,16 @@ class VLNSlidingWindowDataset(Dataset):
         defer_heatmap_to_gpu: bool = False,  # 兼容 train.py 传入（由 GPUHeatmapComputer 处理）
         load_history_frames: bool = True,
         max_clips: int = 0,
+        max_clip_id: int = 0,
     ):
         self.root = Path(root).expanduser()
         self.defer_heatmap_to_gpu = defer_heatmap_to_gpu
         self.load_history_frames = load_history_frames
         self.max_clips = max(0, int(max_clips or 0))
+        # Collection jobs use monotonically increasing global clip ids.  A
+        # ceiling lets diagnostics reproduce an earlier append-only snapshot
+        # without copying or mutating the dataset on disk.
+        self.max_clip_id = max(0, int(max_clip_id or 0))
         self.split = split
         self.min_history = min_history
         self.num_history_sample = num_history_sample
@@ -367,6 +372,12 @@ class VLNSlidingWindowDataset(Dataset):
                 d for d in scene_dir.iterdir()
                 if d.is_dir() and d.name.startswith('clip_')
             ])
+            if self.max_clip_id > 0:
+                clip_dirs = [
+                    clip_dir
+                    for clip_dir in clip_dirs
+                    if self._numeric_clip_id(clip_dir) <= self.max_clip_id
+                ]
             clips.extend(clip_dirs)
 
         if len(clips) == 0:
@@ -384,6 +395,15 @@ class VLNSlidingWindowDataset(Dataset):
 
         logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips
+
+    @staticmethod
+    def _numeric_clip_id(clip_dir: Path) -> int:
+        """Parse the numeric suffix of a ``clip_XXXXXX`` directory."""
+        suffix = clip_dir.name.removeprefix("clip_")
+        try:
+            return int(suffix)
+        except ValueError as exc:
+            raise ValueError(f"Invalid clip directory name: {clip_dir}") from exc
 
     def _precompute_valid_frames(self):
         """预计算每个 clip 的有效帧索引列表（用于 clip-level 采样）

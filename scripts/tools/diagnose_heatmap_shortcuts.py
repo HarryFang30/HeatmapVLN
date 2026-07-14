@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Train matched head-only heatmap probes and evaluate input shortcuts.
 
-Three independently launched modes share the same seed, data order, frozen
+Four independently launched modes share the same seed, data order, frozen
 Stage1-S2 LoRA, and freshly initialised HeatmapVLN head:
 
 * ``full``: normal current/history images plus relative pose;
 * ``vision-only``: normal images, no pose input;
 * ``pose-only``: constant black images plus relative pose.
+* ``no-input``: constant black images and no relative pose.
 
 The full mode also evaluates history/current shuffles and pose conflicts
 without retraining.  This script is intentionally diagnostic: LoRA is frozen.
@@ -44,7 +45,7 @@ from src.models.heatmap import HeatmapVLNLoss  # noqa: E402
 
 
 LOGGER = logging.getLogger("heatmap_shortcut_diagnostic")
-MODES = ("full", "vision-only", "pose-only")
+MODES = ("full", "vision-only", "pose-only", "no-input")
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-steps", type=int, default=100)
     parser.add_argument("--train-samples", type=int, default=64)
     parser.add_argument("--val-samples", type=int, default=24)
+    parser.add_argument(
+        "--max-clip-id",
+        type=int,
+        default=0,
+        help="Restrict an append-only random-walk collection to clip ids <= this value.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
@@ -66,6 +73,36 @@ def parse_args() -> argparse.Namespace:
         "--head-checkpoint",
         default=None,
         help="Load a previously trained head and run evaluation only.",
+    )
+    parser.add_argument(
+        "--selection-manifest",
+        default=None,
+        help=(
+            "Optional Task-3.5b selection_manifest.json. Explicit selections are "
+            "evaluation-only and are verified against the rebuilt dataset before use."
+        ),
+    )
+    parser.add_argument(
+        "--selection-name",
+        choices=("baseline", "debiased"),
+        default="debiased",
+        help="Selection family to load from --selection-manifest.",
+    )
+    parser.add_argument(
+        "--train-on-explicit-selection",
+        action="store_true",
+        help=(
+            "Explicitly permit head-only probe training on the verified manifest train split. "
+            "Without this opt-in, manifest-backed runs remain evaluation-only."
+        ),
+    )
+    parser.add_argument(
+        "--loss-history-slots",
+        default="",
+        help=(
+            "Comma-separated history slots included in the heatmap loss; empty uses all. "
+            "Metrics still cover every slot for transparent shortcut auditing."
+        ),
     )
     return parser.parse_args()
 
@@ -124,7 +161,12 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
-def build_dataset(cfg: dict[str, Any], split: str) -> VLNSlidingWindowDataset:
+def build_dataset(
+    cfg: dict[str, Any],
+    split: str,
+    *,
+    max_clip_id: int = 0,
+) -> VLNSlidingWindowDataset:
     sw_cfg = cfg["data"]["sliding_window"]
     return VLNSlidingWindowDataset(
         root=cfg["data"]["root"],
@@ -141,6 +183,7 @@ def build_dataset(cfg: dict[str, Any], split: str) -> VLNSlidingWindowDataset:
         clip_level_sampling=True,
         load_history_frames=True,
         max_clips=0,
+        max_clip_id=max_clip_id,
     )
 
 
@@ -176,6 +219,148 @@ def scene_stratified_indices(
     if not selected:
         raise RuntimeError(f"No non-terminal samples selected for split={dataset.split}")
     return selected
+
+
+def sample_identities(
+    dataset: VLNSlidingWindowDataset,
+    indices: list[int],
+) -> list[str]:
+    """Return stable clip/frame identities for an ordered diagnostic subset."""
+    identities = []
+    for sample_idx in indices:
+        clip_idx, frame_idx = dataset.sample_index[sample_idx]
+        clip = dataset.clips[clip_idx]
+        try:
+            clip_label = clip.relative_to(dataset.root).as_posix()
+        except ValueError:
+            clip_label = clip.as_posix()
+        identities.append(f"{clip_label}:frame={frame_idx}")
+    return identities
+
+
+def selection_contract(
+    dataset: VLNSlidingWindowDataset,
+    indices: list[int],
+) -> dict[str, Any]:
+    """Describe and hash the exact ordered subset used by a diagnostic."""
+    identities = sample_identities(dataset, indices)
+    digest = hashlib.sha256("\n".join(identities).encode("utf-8")).hexdigest()
+    scenes = sorted({dataset.clips[dataset.sample_index[index][0]].parent.name for index in indices})
+    return {
+        "sample_count": len(indices),
+        "sample_identity_sha256": digest,
+        "sample_identities": identities,
+        "scenes": scenes,
+    }
+
+
+def parse_history_slots(specification: str, num_history: int) -> tuple[int, ...] | None:
+    if num_history <= 0:
+        raise ValueError(f"num_history must be positive, got {num_history}")
+    values = [value.strip() for value in specification.split(",") if value.strip()]
+    if not values:
+        return None
+    slots = tuple(sorted({int(value) for value in values}))
+    invalid = [slot for slot in slots if slot < 0 or slot >= num_history]
+    if invalid:
+        raise ValueError(
+            f"loss history slots {invalid} are outside [0, {num_history - 1}]"
+        )
+    return slots
+
+
+def history_mask_for_slots(
+    history_count: int,
+    *,
+    device: torch.device,
+    active_slots: tuple[int, ...] | None,
+) -> torch.Tensor:
+    if history_count <= 0:
+        raise ValueError(f"history_count must be positive, got {history_count}")
+    mask = torch.ones(1, history_count, dtype=torch.bool, device=device)
+    if active_slots is None:
+        return mask
+    invalid = [slot for slot in active_slots if slot < 0 or slot >= history_count]
+    if invalid:
+        raise ValueError(
+            f"active history slots {invalid} are outside [0, {history_count - 1}]"
+        )
+    mask.zero_()
+    mask[0, list(active_slots)] = True
+    if not bool(mask.any()):
+        raise ValueError("heatmap loss history mask cannot be empty")
+    return mask
+
+
+def load_explicit_selection(
+    manifest_path: str | Path,
+    selection_name: str,
+    train_dataset: VLNSlidingWindowDataset,
+    val_dataset: VLNSlidingWindowDataset,
+) -> tuple[list[int], list[int], dict[str, Any]]:
+    """Load and strictly verify an ordered Task-3.5b selection.
+
+    Dataset indices alone are not accepted as provenance: every rebuilt
+    clip/frame identity, ordered hash, and scene list must match the manifest.
+    This prevents an append-only collection or config change from silently
+    evaluating a different subset under an old diagnostic label.
+    """
+
+    path = Path(manifest_path).resolve()
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema_version") != "task35b_debiased_selection_v1":
+        raise RuntimeError(
+            "Unsupported heatmap selection schema: "
+            f"{payload.get('schema_version')!r} in {path}"
+        )
+    if selection_name not in payload:
+        raise RuntimeError(f"Selection {selection_name!r} is missing from {path}")
+
+    verified: dict[str, Any] = {}
+    selected_indices: dict[str, list[int]] = {}
+    for split, dataset in (("train", train_dataset), ("val", val_dataset)):
+        manifest = payload[selection_name].get(split)
+        if not isinstance(manifest, dict):
+            raise RuntimeError(
+                f"Selection {selection_name!r} has no {split!r} manifest in {path}"
+            )
+        raw_indices = manifest.get("dataset_indices")
+        if not isinstance(raw_indices, list) or not raw_indices:
+            raise RuntimeError(f"Explicit {split} selection has no dataset indices")
+        indices = [int(value) for value in raw_indices]
+        if len(indices) != len(set(indices)):
+            raise RuntimeError(f"Explicit {split} selection contains duplicate dataset indices")
+        invalid = [index for index in indices if index < 0 or index >= len(dataset)]
+        if invalid:
+            raise RuntimeError(
+                f"Explicit {split} selection contains out-of-range indices: {invalid[:5]}"
+            )
+
+        actual = selection_contract(dataset, indices)
+        expected = {
+            "sample_count": manifest.get("sample_count"),
+            "sample_identity_sha256": manifest.get("sample_identity_sha256"),
+            "sample_identities": manifest.get("sample_ids"),
+            "scenes": manifest.get("scenes"),
+        }
+        mismatches = [key for key, value in expected.items() if actual.get(key) != value]
+        if mismatches:
+            details = ", ".join(
+                f"{key}: expected={expected[key]!r} actual={actual.get(key)!r}"
+                for key in mismatches
+            )
+            raise RuntimeError(f"Explicit {split} selection does not match dataset: {details}")
+        selected_indices[split] = indices
+        verified[split] = actual
+
+    return selected_indices["train"], selected_indices["val"], {
+        "schema_version": payload["schema_version"],
+        "selection_name": selection_name,
+        "manifest_path": str(path),
+        "train": verified["train"],
+        "val": verified["val"],
+    }
 
 
 def load_stage1_s2_lora(model: torch.nn.Module, checkpoint: str) -> dict[str, int]:
@@ -231,12 +416,12 @@ def transform_sample(
     history_frames = sample["history_frames"]
     rel_poses: torch.Tensor | None = sample["history_rel_poses"]
 
-    if train_mode == "pose-only" or perturbation == "blank-images":
+    if train_mode in {"pose-only", "no-input"} or perturbation == "blank-images":
         current_views = torch.zeros_like(current_views)
         current_frame = torch.zeros_like(current_frame)
         histories = torch.zeros_like(histories)
         history_frames = torch.zeros_like(history_frames)
-    if train_mode == "vision-only" or perturbation == "zero-pose":
+    if train_mode in {"vision-only", "no-input"} or perturbation == "zero-pose":
         rel_poses = None
 
     if perturbation == "history-shuffle" and histories.shape[0] > 1:
@@ -273,6 +458,8 @@ def forward_loss(
     criterion: HeatmapVLNLoss,
     transformed: dict[str, Any],
     device: torch.device,
+    *,
+    active_history_slots: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     history = transformed["history_frames"].unsqueeze(0).to(device)
     current = transformed["current_frame"].unsqueeze(0).to(device)
@@ -293,11 +480,10 @@ def forward_loss(
     )
     gt_vis = transformed["gt_visibility"].unsqueeze(0).to(device)
     gt_heatmaps = transformed["gt_heatmaps"].unsqueeze(0).to(device)
-    history_mask = torch.ones(
-        1,
-        gt_heatmaps.shape[1],
-        dtype=torch.bool,
+    history_mask = history_mask_for_slots(
+        int(gt_heatmaps.shape[1]),
         device=device,
+        active_slots=active_history_slots,
     )
     losses = criterion(
         output["visibility"],
@@ -399,6 +585,7 @@ def compute_metrics(records: list[dict[str, torch.Tensor]]) -> dict[str, Any]:
     view_total = 0
     pixel_errors: list[float] = []
     u_errors: list[float] = []
+    joint_pixel_errors: list[float] = []
     for record in records:
         vis_logits = record["visibility"].squeeze(0)
         gt_visibility = record["gt_visibility"]
@@ -410,8 +597,19 @@ def compute_metrics(records: list[dict[str, torch.Tensor]]) -> dict[str, Any]:
                 continue
             view_total += 1
             selected_view = int(vis_logits[history_idx].argmax().item())
-            if bool((positive_views == selected_view).any()):
+            selected_view_is_positive = bool((positive_views == selected_view).any())
+            if selected_view_is_positive:
                 view_correct += 1
+                pred_flat_idx = int(pred_heatmaps[history_idx, selected_view].argmax().item())
+                gt_flat_idx = int(gt_heatmaps[history_idx, selected_view].argmax().item())
+                width = int(gt_heatmaps.shape[-1])
+                pred_y, pred_x = divmod(pred_flat_idx, width)
+                gt_y, gt_x = divmod(gt_flat_idx, width)
+                joint_pixel_errors.append(math.hypot(pred_x - gt_x, pred_y - gt_y))
+            else:
+                # A wrong view must be a failed end-to-end localisation, even
+                # if an oracle-selected positive view happens to have a good peak.
+                joint_pixel_errors.append(float("inf"))
             for view_idx in positive_views.tolist():
                 pred_flat_idx = int(pred_heatmaps[history_idx, view_idx].argmax().item())
                 gt_flat_idx = int(gt_heatmaps[history_idx, view_idx].argmax().item())
@@ -423,6 +621,7 @@ def compute_metrics(records: list[dict[str, torch.Tensor]]) -> dict[str, Any]:
 
     errors = np.asarray(pixel_errors, dtype=np.float64)
     u_values = np.asarray(u_errors, dtype=np.float64)
+    joint_errors = np.asarray(joint_pixel_errors, dtype=np.float64)
     return {
         "visibility_auroc": auroc,
         "visibility_auprc": auprc,
@@ -436,7 +635,52 @@ def compute_metrics(records: list[dict[str, torch.Tensor]]) -> dict[str, Any]:
         "median_u_error": float(np.median(u_values)) if u_values.size else float("nan"),
         "pck4": float((errors <= 4.0).mean()) if errors.size else float("nan"),
         "pck8": float((errors <= 8.0).mean()) if errors.size else float("nan"),
+        "joint_median_pixel_error": (
+            float(np.median(joint_errors)) if joint_errors.size else float("nan")
+        ),
+        "joint_pck4": (
+            float((joint_errors <= 4.0).mean()) if joint_errors.size else float("nan")
+        ),
+        "joint_pck8": (
+            float((joint_errors <= 8.0).mean()) if joint_errors.size else float("nan")
+        ),
     }
+
+
+def compact_prediction_records(
+    records: list[dict[str, torch.Tensor]],
+    identities: list[str],
+) -> list[dict[str, Any]]:
+    """Store only logits and peak coordinates needed for paired analysis."""
+    if len(records) != len(identities):
+        raise ValueError(
+            f"records/identities length mismatch: {len(records)} != {len(identities)}"
+        )
+    compact = []
+    for identity, record in zip(identities, records, strict=True):
+        pred_vis = record["visibility"].squeeze(0)
+        gt_vis = record["gt_visibility"]
+        pred_heatmaps = record["heatmaps"].squeeze(0)
+        gt_heatmaps = record["gt_heatmaps"]
+        width = int(gt_heatmaps.shape[-1])
+
+        def peak_xy(
+            heatmaps: torch.Tensor,
+            width: int = width,
+        ) -> list[list[list[int]]]:
+            flat = heatmaps.reshape(*heatmaps.shape[:2], -1).argmax(dim=-1)
+            return torch.stack((flat % width, flat // width), dim=-1).tolist()
+
+        compact.append(
+            {
+                "sample_id": identity,
+                "visibility_logits": pred_vis.float().tolist(),
+                "gt_visibility": gt_vis.float().tolist(),
+                "pred_xy": peak_xy(pred_heatmaps),
+                "gt_xy": peak_xy(gt_heatmaps),
+            }
+        )
+    return compact
 
 
 @torch.no_grad()
@@ -449,6 +693,8 @@ def evaluate(
     train_mode: str,
     perturbation: str,
     device: torch.device,
+    sample_ids: list[str] | None = None,
+    active_history_slots: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     model.eval()
     model.heatmap_vln.feat_extractor.detach_features = True
@@ -464,28 +710,69 @@ def evaluate(
             partner=partner,
         )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            loss, record = forward_loss(model, criterion, transformed, device)
+            loss, record = forward_loss(
+                model,
+                criterion,
+                transformed,
+                device,
+                active_history_slots=active_history_slots,
+            )
         loss_values.append(float(loss.detach().float().item()))
         records.append(record)
     metrics = compute_metrics(records)
     metrics["loss"] = float(np.mean(loss_values))
     metrics["samples"] = len(indices)
+    if sample_ids is not None:
+        metrics["prediction_records"] = compact_prediction_records(records, sample_ids)
     return metrics
 
 
 def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.train_on_explicit_selection and not args.selection_manifest:
+        raise ValueError("--train-on-explicit-selection requires --selection-manifest")
+    if args.train_on_explicit_selection and args.head_checkpoint:
+        raise ValueError(
+            "--train-on-explicit-selection cannot be combined with --head-checkpoint"
+        )
+    if args.selection_manifest and not args.head_checkpoint and not args.train_on_explicit_selection:
+        raise ValueError(
+            "Manifest-backed training requires the explicit --train-on-explicit-selection opt-in"
+        )
+    active_history_slots = parse_history_slots(
+        args.loss_history_slots,
+        args.num_history,
+    )
     set_seed(args.seed)
     output_dir = Path(args.output_dir) / args.mode
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     cfg = load_config(args)
 
-    train_dataset = build_dataset(cfg, "train")
-    val_dataset = build_dataset(cfg, "val")
-    train_indices = scene_stratified_indices(train_dataset, args.train_samples)
-    val_indices = scene_stratified_indices(val_dataset, args.val_samples)
+    train_dataset = build_dataset(cfg, "train", max_clip_id=args.max_clip_id)
+    val_dataset = build_dataset(cfg, "val", max_clip_id=args.max_clip_id)
+    explicit_selection = None
+    if args.selection_manifest:
+        train_indices, val_indices, explicit_selection = load_explicit_selection(
+            args.selection_manifest,
+            args.selection_name,
+            train_dataset,
+            val_dataset,
+        )
+        train_selection = explicit_selection["train"]
+        val_selection = explicit_selection["val"]
+    else:
+        train_indices = scene_stratified_indices(train_dataset, args.train_samples)
+        val_indices = scene_stratified_indices(val_dataset, args.val_samples)
+        train_selection = selection_contract(train_dataset, train_indices)
+        val_selection = selection_contract(val_dataset, val_indices)
+    overlapping_scenes = sorted(set(train_selection["scenes"]) & set(val_selection["scenes"]))
+    if overlapping_scenes:
+        raise RuntimeError(
+            "Task-3 diagnostic requires scene-disjoint train/val subsets; "
+            f"overlap={overlapping_scenes}"
+        )
 
     model = build_model(cfg, verbose=True, device=args.device, enable_action_head=False)
     model.qwen2_5_vl._load_model()
@@ -544,7 +831,13 @@ def main() -> int:
         assert optimizer is not None
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            loss, _record = forward_loss(model, criterion, transformed, device)
+            loss, _record = forward_loss(
+                model,
+                criterion,
+                transformed,
+                device,
+                active_history_slots=active_history_slots,
+            )
         loss.backward()
         lora_nonzero = sum(
             param.grad is not None and float(param.grad.detach().float().norm().item()) > 0.0
@@ -570,6 +863,8 @@ def main() -> int:
         train_mode=args.mode,
         perturbation="none",
         device=device,
+        sample_ids=val_selection["sample_identities"],
+        active_history_slots=active_history_slots,
     )
     evaluations = {"standard": standard}
     if args.mode == "full":
@@ -589,6 +884,8 @@ def main() -> int:
                 train_mode=args.mode,
                 perturbation=perturbation,
                 device=device,
+                sample_ids=val_selection["sample_identities"],
+                active_history_slots=active_history_slots,
             )
 
     head_path = output_dir / "head_final.pth"
@@ -615,8 +912,26 @@ def main() -> int:
         "loaded_head_checkpoint": args.head_checkpoint,
         "train_samples": len(train_indices),
         "val_samples": len(val_indices),
+        "selection_contract": {
+            "algorithm": (
+                "task35b_verified_explicit_manifest_v1"
+                if explicit_selection
+                else "scene_stratified_non_terminal_round_robin_v1"
+            ),
+            "scene_disjoint": True,
+            "explicit_selection": explicit_selection,
+            "train": train_selection,
+            "val": val_selection,
+        },
         "num_history": args.num_history,
+        "max_clip_id": args.max_clip_id,
         "lambda_coord": 0.0,
+        "loss_history_slots": (
+            list(active_history_slots)
+            if active_history_slots is not None
+            else list(range(args.num_history))
+        ),
+        "trained_on_explicit_selection": bool(args.train_on_explicit_selection),
         "trainable_head_tensors": len(trainable),
         "trainable_head_numel": int(sum(param.numel() for param in trainable)),
         "trainable_qwen_tensors": 0,

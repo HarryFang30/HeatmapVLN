@@ -96,6 +96,8 @@ def build_model(
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
         heatmap_lambda_peak=heatmap_cfg.get('lambda_peak', 1.0),
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
+        heatmap_decoder_mode=heatmap_cfg.get('decoder_mode', 'legacy'),
+        heatmap_pose_free_config=heatmap_cfg.get('pose_free', None),
 
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
@@ -332,11 +334,15 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     trainable = stage_cfg.get('trainable_modules', [])
 
     if 'heatmap_vln' in trainable and hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
-        freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
-        freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
-        freeze_module(model.heatmap_vln.coarse, freeze=False)
-        freeze_module(model.heatmap_vln.fine, freeze=False)
-        logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
+        if model.heatmap_vln.pose_free_matcher is not None:
+            freeze_module(model.heatmap_vln.pose_free_matcher, freeze=False)
+            logger.info("  ✓ Unfrozen: heatmap_vln (pose_free_matcher)")
+        else:
+            freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.coarse, freeze=False)
+            freeze_module(model.heatmap_vln.fine, freeze=False)
+            logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
 
     if 'nextdit_action_head' in trainable:
         if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:

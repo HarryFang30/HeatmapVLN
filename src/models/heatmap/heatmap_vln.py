@@ -41,6 +41,7 @@ from .dpt_lite_fusion import DPTLiteFusion
 from .feature_extractor import FeatureExtractor
 from .fine_localization import FineLocalization
 from .input_constructor import construct_input, find_text_anchor_positions
+from .pose_free_matching import PoseFreeHistoryMatcher, pad_history_queries
 from .trajectory_attention import TrajectoryGuidedAttention
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,8 @@ class HeatmapVLN(nn.Module):
         enable_runtime_timing: bool = False,
         trajectory_config: dict[str, Any] | None = None,
         heatmap_trains_backbone: bool = False,
+        decoder_mode: str = "legacy",
+        pose_free_config: dict[str, Any] | None = None,
     ):
         super().__init__()
 
@@ -89,10 +92,26 @@ class HeatmapVLN(nn.Module):
         self.llm_layer_indices = llm_layer_indices
         self.enable_runtime_timing = enable_runtime_timing
         self.heatmap_trains_backbone = heatmap_trains_backbone
+        self.decoder_mode = str(decoder_mode).strip().lower()
+        if self.decoder_mode not in {"legacy", "pose_free_matcher"}:
+            raise ValueError(
+                "decoder_mode must be 'legacy' or 'pose_free_matcher', "
+                f"got {decoder_mode!r}"
+            )
+        if self.decoder_mode == "pose_free_matcher":
+            # The pose-free matcher consumes only deepest-layer LLM patches.
+            # Retaining hooked ViT tensors would keep a large, completely
+            # unused autograd graph alive when LoRA training is enabled.
+            self.vit_layer_indices = []
         self._logged_llm_feature_stats = False
 
         traj_cfg = trajectory_config or {}
         self.enable_trajectory = traj_cfg.get("enable", False)
+        if self.decoder_mode == "pose_free_matcher" and self.enable_trajectory:
+            raise ValueError(
+                "pose_free_matcher cannot be combined with trajectory.enable=true; "
+                "exact relative pose is forbidden in the diagnostic branch"
+            )
 
         # Freeze backbone base weights. Optional LoRA, if present on the passed
         # model, remains trainable unless the outer training policy freezes it.
@@ -103,35 +122,54 @@ class HeatmapVLN(nn.Module):
         # When heatmap_trains_backbone=True, hooks retain the computation graph
         # so that heatmap loss gradients flow back through the backbone (LoRA).
         self.feat_extractor = FeatureExtractor(
-            self.qwen, vit_layer_indices, llm_layer_indices,
+            self.qwen, self.vit_layer_indices, llm_layer_indices,
             detach_features=not heatmap_trains_backbone,
         )
 
-        # DPT-Lite fusion for ViT 16x16 multi-layer features
-        n_vit_layers = len(vit_layer_indices)
-        self.vit_dpt_fusion = DPTLiteFusion(c_vit, c_fused, n_vit_layers)
-
-        # DPT-Lite fusion for LLM 8x8 multi-layer features
-        n_llm_layers = len(llm_layer_indices)
-        self.llm_dpt_fusion = DPTLiteFusion(c_llm, c_fused, n_llm_layers)
-
-        # Coarse localisation
-        if self.enable_trajectory:
-            self.coarse = TrajectoryGuidedAttention(
-                c_llm=c_llm,
-                c_fused=c_fused,
-                num_freqs=traj_cfg.get("num_freqs", 16),
-                d_attn=traj_cfg.get("d_attn", c_fused),
-                num_heads=traj_cfg.get("num_heads", 4),
-                num_layers=traj_cfg.get("num_layers", 1),
-                max_spatial_range=traj_cfg.get("max_spatial_range", 10.0),
+        self.pose_free_matcher: PoseFreeHistoryMatcher | None = None
+        if self.decoder_mode == "pose_free_matcher":
+            pose_cfg = pose_free_config or {}
+            self.vit_dpt_fusion = None
+            self.llm_dpt_fusion = None
+            self.coarse = None
+            self.fine = None
+            self.pose_free_matcher = PoseFreeHistoryMatcher(
+                current_dim=c_llm,
+                query_dim=c_llm,
+                match_dim=pose_cfg.get("match_dim", 64),
+                heatmap_size=tuple(pose_cfg.get("heatmap_size", (64, 64))),
+                visibility_hidden_dim=pose_cfg.get("visibility_hidden_dim", 16),
+                logit_temperature=pose_cfg.get("logit_temperature", 10.0),
             )
-            logger.info("HeatmapVLN: using TrajectoryGuidedAttention (replacing CoarseLocalization)")
+            logger.info(
+                "HeatmapVLN: using pose-free shared history-query x current-patch matcher"
+            )
         else:
-            self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
+            # DPT-Lite fusion for ViT 16x16 multi-layer features
+            n_vit_layers = len(vit_layer_indices)
+            self.vit_dpt_fusion = DPTLiteFusion(c_vit, c_fused, n_vit_layers)
 
-        # Fine localisation head (no longer needs c_llm — uses spatial_out from coarse)
-        self.fine = FineLocalization(c_fused)
+            # DPT-Lite fusion for LLM 8x8 multi-layer features
+            n_llm_layers = len(llm_layer_indices)
+            self.llm_dpt_fusion = DPTLiteFusion(c_llm, c_fused, n_llm_layers)
+
+            # Coarse localisation
+            if self.enable_trajectory:
+                self.coarse = TrajectoryGuidedAttention(
+                    c_llm=c_llm,
+                    c_fused=c_fused,
+                    num_freqs=traj_cfg.get("num_freqs", 16),
+                    d_attn=traj_cfg.get("d_attn", c_fused),
+                    num_heads=traj_cfg.get("num_heads", 4),
+                    num_layers=traj_cfg.get("num_layers", 1),
+                    max_spatial_range=traj_cfg.get("max_spatial_range", 10.0),
+                )
+                logger.info("HeatmapVLN: using TrajectoryGuidedAttention (replacing CoarseLocalization)")
+            else:
+                self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
+
+            # Fine localisation head (no longer needs c_llm — uses spatial_out from coarse)
+            self.fine = FineLocalization(c_fused)
 
         trainable = sum(
             p.numel() for p in self.parameters() if p.requires_grad
@@ -139,11 +177,12 @@ class HeatmapVLN(nn.Module):
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
             "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, "
-            "heatmap_trains_backbone=%s, trainable=%s",
+            "heatmap_trains_backbone=%s, decoder_mode=%s, trainable=%s",
             c_vit, c_llm, c_fused,
-            vit_layer_indices, llm_layer_indices,
+            self.vit_layer_indices, llm_layer_indices,
             self.enable_trajectory,
             self.heatmap_trains_backbone,
+            self.decoder_mode,
             f"{trainable:,}",
         )
 
@@ -156,6 +195,25 @@ class HeatmapVLN(nn.Module):
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(device)
 
+    def _decoder_device(self) -> torch.device:
+        if self.decoder_mode == "pose_free_matcher":
+            if self.pose_free_matcher is None:
+                raise RuntimeError("pose_free_matcher decoder was not initialized")
+            return next(self.pose_free_matcher.parameters()).device
+        if self.fine is None:
+            raise RuntimeError("legacy fine decoder was not initialized")
+        return next(self.fine.parameters()).device
+
+    def _reject_pose_for_pose_free(
+        self,
+        history_rel_poses: torch.Tensor | None,
+    ) -> None:
+        if self.decoder_mode == "pose_free_matcher" and history_rel_poses is not None:
+            raise ValueError(
+                "pose_free_matcher received non-None history_rel_poses; "
+                "the visual-grounding diagnostic fails closed when exact pose is supplied"
+            )
+
     def prepare_qwen_inputs(
         self,
         current_views: dict[str, object],
@@ -165,7 +223,7 @@ class HeatmapVLN(nn.Module):
     ) -> tuple[dict[str, torch.Tensor], int]:
         """Build processor inputs for the panoramic single-chain forward."""
         if device is None:
-            device = next(self.fine.parameters()).device
+            device = self._decoder_device()
 
         messages = construct_input(
             current_views,
@@ -193,7 +251,7 @@ class HeatmapVLN(nn.Module):
     ) -> tuple[dict[str, torch.Tensor], list[int]]:
         """Build one batched processor input for panoramic batch forward."""
         if device is None:
-            device = next(self.fine.parameters()).device
+            device = self._decoder_device()
 
         if torch.is_tensor(current_views):
             if current_views.dim() != 5:
@@ -266,7 +324,7 @@ class HeatmapVLN(nn.Module):
         history_rel_poses: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Decode heatmaps from the most recent hooked Qwen forward."""
-        device = next(self.fine.parameters()).device
+        device = self._decoder_device()
 
         image_positions = self._find_image_positions(inputs)
         text_anchors = find_text_anchor_positions(
@@ -304,7 +362,7 @@ class HeatmapVLN(nn.Module):
         history_rel_poses: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Decode batched panoramic inputs from one shared Qwen forward."""
-        device = next(self.fine.parameters()).device
+        device = self._decoder_device()
         input_ids = inputs["input_ids"]
         if input_ids.dim() != 2:
             raise ValueError(f"Expected batched input_ids [B, S], got {tuple(input_ids.shape)}")
@@ -357,6 +415,39 @@ class HeatmapVLN(nn.Module):
         history_rel_poses: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run coarse-to-fine decoding from pre-extracted features."""
+        self._reject_pose_for_pose_free(history_rel_poses)
+        if self.decoder_mode == "pose_free_matcher":
+            deepest_layer = max(self.llm_layer_indices)
+            try:
+                current_patches = torch.stack(
+                    [current_llm[view_idx][deepest_layer] for view_idx in range(4)],
+                    dim=0,
+                ).unsqueeze(0)
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Pose-free decoder requires current LLM patches from layer {deepest_layer} "
+                    "for all four views"
+                ) from exc
+            if history_queries:
+                history_queries_tensor = torch.stack(history_queries, dim=0).unsqueeze(0)
+            else:
+                history_queries_tensor = current_patches.new_empty((1, 0, self.c_llm))
+            history_mask = torch.ones(
+                (1, num_history),
+                dtype=torch.bool,
+                device=current_patches.device,
+            )
+            result = self._run_pose_free_matcher(
+                current_patches=current_patches,
+                history_queries=history_queries_tensor,
+                history_mask=history_mask,
+            )
+            return {
+                key: value.squeeze(0)
+                if torch.is_tensor(value) and value.shape[:1] == (1,)
+                else value
+                for key, value in result.items()
+            }
         if num_history == 0:
             return {
                 "visibility": torch.empty(0, 4, device=device),
@@ -395,6 +486,7 @@ class HeatmapVLN(nn.Module):
         device: torch.device,
         history_rel_poses: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        self._reject_pose_for_pose_free(history_rel_poses)
         batch_size = len(extracted)
         if batch_size == 0:
             return {
@@ -408,6 +500,42 @@ class HeatmapVLN(nn.Module):
                 "visibility": torch.empty(batch_size, 0, 4, device=device),
                 "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
             }
+
+        if self.decoder_mode == "pose_free_matcher":
+            deepest_layer = max(self.llm_layer_indices)
+            current_patch_samples = []
+            history_queries_batch = []
+            for batch_idx, (_current_vit, current_llm, history_queries) in enumerate(extracted):
+                self._validate_and_log_current_llm(current_llm)
+                expected_hist = num_histories[batch_idx]
+                if len(history_queries) != expected_hist:
+                    raise RuntimeError(
+                        f"Expected {expected_hist} history queries for batch item {batch_idx}, "
+                        f"got {len(history_queries)}"
+                    )
+                try:
+                    current_patch_samples.append(
+                        torch.stack(
+                            [current_llm[view_idx][deepest_layer] for view_idx in range(4)],
+                            dim=0,
+                        )
+                    )
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Pose-free decoder requires current LLM patches from layer {deepest_layer} "
+                        f"for all four views in batch item {batch_idx}"
+                    ) from exc
+                history_queries_batch.append(history_queries)
+
+            history_queries_tensor, history_mask = pad_history_queries(
+                history_queries_batch,
+                device=device,
+            )
+            return self._run_pose_free_matcher(
+                current_patches=torch.stack(current_patch_samples, dim=0).to(device),
+                history_queries=history_queries_tensor,
+                history_mask=history_mask,
+            )
 
         current_vit_batch = []
         current_llm_batch = []
@@ -493,6 +621,7 @@ class HeatmapVLN(nn.Module):
         device: torch.device,
         history_rel_poses: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        self._reject_pose_for_pose_free(history_rel_poses)
         timings: dict[str, float] = {}
         batch_size = len(history_queries_batch)
         if batch_size == 0:
@@ -509,6 +638,39 @@ class HeatmapVLN(nn.Module):
             }
 
         self._validate_and_log_current_llm_layer_tensors(llm_layer_tensors)
+
+        if self.decoder_mode == "pose_free_matcher":
+            for batch_idx, history_queries in enumerate(history_queries_batch):
+                expected_hist = num_histories[batch_idx]
+                if len(history_queries) != expected_hist:
+                    raise RuntimeError(
+                        f"Expected {expected_hist} history queries for batch item {batch_idx}, "
+                        f"got {len(history_queries)}"
+                    )
+            history_queries_tensor, history_mask = pad_history_queries(
+                history_queries_batch,
+                device=device,
+            )
+            deepest_layer = max(self.llm_layer_indices)
+            current_patches = llm_layer_tensors.get(deepest_layer)
+            if current_patches is None:
+                raise RuntimeError(
+                    f"Pose-free decoder requires current LLM patches from layer {deepest_layer}"
+                )
+            if self.enable_runtime_timing:
+                self._sync_for_timing(device)
+                t_pose_free0 = time.perf_counter()
+            result = self._run_pose_free_matcher(
+                current_patches=current_patches.to(device),
+                history_queries=history_queries_tensor,
+                history_mask=history_mask,
+            )
+            if self.enable_runtime_timing:
+                self._sync_for_timing(device)
+                result["timings"] = {
+                    "decode_pose_free_matcher_s": time.perf_counter() - t_pose_free0,
+                }
+            return result
 
         first_query = next((queries[0] for queries in history_queries_batch if queries), None)
         if first_query is None:
@@ -601,6 +763,25 @@ class HeatmapVLN(nn.Module):
             result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
         if self.enable_runtime_timing:
             result["timings"] = timings
+        return result
+
+    def _run_pose_free_matcher(
+        self,
+        current_patches: torch.Tensor,
+        history_queries: torch.Tensor,
+        history_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if self.pose_free_matcher is None:
+            raise RuntimeError("pose_free_matcher decoder was not initialized")
+        result = self.pose_free_matcher(
+            current_patches=current_patches,
+            history_queries=history_queries,
+            history_mask=history_mask,
+        )
+        if not self.training:
+            result["heatmaps_gated"] = self._gated_softmax_heatmaps(
+                result["heatmaps"], result["visibility"]
+            )
         return result
 
     @staticmethod
@@ -851,7 +1032,7 @@ class HeatmapVLN(nn.Module):
                 ``visibility``:  ``(N_hist, 4)``
                 ``heatmaps``:    ``(N_hist, 4, 64, 64)``
         """
-        device = next(self.fine.parameters()).device
+        device = self._decoder_device()
         inputs, num_history = self.prepare_qwen_inputs(
             current_views=current_views,
             history_panoramas=history_panoramas,

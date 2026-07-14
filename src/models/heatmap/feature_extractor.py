@@ -17,6 +17,8 @@ Important:
 """
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -67,6 +69,7 @@ class FeatureExtractor:
         self._captured_batch_vit: dict[int, list[dict[int, torch.Tensor]]] = {}
         self._captured_batch_llm: dict[int, list[dict[int, torch.Tensor]]] = {}
         self._captured_batch_queries: list[list[torch.Tensor]] | None = None
+        self._capture_suspend_depth = 0
         self._llm_resize_logged = False
         self._vit_resize_logged = False
 
@@ -109,6 +112,8 @@ class FeatureExtractor:
 
     def _make_vit_hook(self, idx: int):
         def hook(_module, _input, output):
+            if self._capture_suspend_depth > 0:
+                return
             if self._batch_capture_plan is not None:
                 captured = []
                 for view_ranges in self._batch_capture_plan["vit_ranges_batch"]:
@@ -124,6 +129,8 @@ class FeatureExtractor:
 
     def _make_llm_hook(self, layer_idx: int):
         def hook(_module, _input, output):
+            if self._capture_suspend_depth > 0:
+                return
             hidden = output[0] if isinstance(output, tuple) else output
             if self._batch_capture_plan is not None:
                 captured = []
@@ -156,6 +163,27 @@ class FeatureExtractor:
         self._captured_batch_vit = {}
         self._captured_batch_llm = {}
         self._captured_batch_queries = None
+
+    @contextmanager
+    def suspend_capture(self) -> Iterator[None]:
+        """Temporarily disable all feature hooks without removing them.
+
+        A shared Qwen backbone may run an unrelated forward (for example, an
+        LM-rehearsal batch) while the heatmap head remains materialized.  The
+        registered hooks must stay installed for the next heatmap batch, but
+        they must not retain tensors from that unrelated computation graph.
+
+        Suspension is depth-counted so nested callers remain suspended until
+        the outermost context exits.  Cached tensors are cleared on every
+        entry and exit, including exceptional exits.
+        """
+        self._capture_suspend_depth += 1
+        self.clear()
+        try:
+            yield
+        finally:
+            self.clear()
+            self._capture_suspend_depth -= 1
 
     def prepare_batch_capture(
         self,

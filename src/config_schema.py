@@ -245,6 +245,12 @@ class HeatmapTrajectoryConfig(_Lenient):
     max_spatial_range: float = 10.0
 
 
+class HeatmapPoseFreeConfig(_Lenient):
+    match_dim: int = 64
+    visibility_hidden_dim: int = 16
+    logit_temperature: float = 10.0
+
+
 class HeatmapModelConfig(_Lenient):
     enable: bool = True
     c_vit: int = 1280
@@ -259,7 +265,20 @@ class HeatmapModelConfig(_Lenient):
     lambda_kl: float = 0.0
     lambda_peak: float = 1.0
     heatmap_trains_backbone: bool = False
+    decoder_mode: str = "legacy"
+    pose_free: HeatmapPoseFreeConfig | None = None
     trajectory: HeatmapTrajectoryConfig | None = None
+
+    @field_validator("decoder_mode")
+    @classmethod
+    def _valid_decoder_mode(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in {"legacy", "pose_free_matcher"}:
+            raise ValueError(
+                "decoder_mode must be 'legacy' or 'pose_free_matcher', "
+                f"got {value!r}"
+            )
+        return normalized
 
 
 class NextDiTConfig(_Lenient):

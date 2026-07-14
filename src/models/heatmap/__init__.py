@@ -14,6 +14,7 @@ from .fine_localization import FineLocalization
 from .heatmap_vln import HeatmapVLN
 from .heatmap_vln_loss import HeatmapVLNLoss
 from .input_constructor import construct_input, find_text_anchor_positions
+from .pose_free_matching import PoseFreeHistoryMatcher, pad_history_queries
 from .trajectory_attention import TrajectoryGuidedAttention
 
 __version__ = "5.0.0"
@@ -25,8 +26,10 @@ __all__ = [
     "FineLocalization",
     "HeatmapVLN",
     "HeatmapVLNLoss",
+    "PoseFreeHistoryMatcher",
     "TrajectoryGuidedAttention",
     "__version__",
     "construct_input",
     "find_text_anchor_positions",
+    "pad_history_queries",
 ]

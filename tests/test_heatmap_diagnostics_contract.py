@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
+import pytest
 import torch
 
 from scripts.evaluation.heatmap import materialize_and_load_heatmap_checkpoint
@@ -12,6 +13,7 @@ from scripts.training.collate import collate_fn
 from scripts.tools.diagnose_heatmap_shortcuts import binary_curves, heatmap_head_state_dict
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.data.sliding_window_dataset import VLNSlidingWindowDataset
+from src.models.heatmap.feature_extractor import FeatureExtractor
 from src.models.heatmap.input_constructor import VIEW_NAMES, construct_input
 from src.models.qwen2_5_vl.integration import Qwen2_5VLIntegration
 
@@ -97,6 +99,20 @@ def test_declared_meter_depth_takes_precedence_over_first_frame_heuristic(tmp_pa
     assert dataset._detect_depth_format() is True
 
 
+def test_append_only_collection_can_be_restricted_by_global_clip_id(tmp_path):
+    for scene in ("scene_a", "scene_b"):
+        for clip_id in (1, 2000, 2001, 6000):
+            (tmp_path / scene / f"clip_{clip_id:06d}").mkdir(parents=True)
+    dataset = object.__new__(VLNSlidingWindowDataset)
+    dataset.root = tmp_path
+    dataset.split = "all"
+    dataset.max_clips = 0
+    dataset.max_clip_id = 2000
+    clips = dataset._enumerate_clips()
+    assert len(clips) == 4
+    assert all(VLNSlidingWindowDataset._numeric_clip_id(clip) <= 2000 for clip in clips)
+
+
 def test_head_checkpoint_excludes_shared_qwen_reference():
     class DummyHeatmap(torch.nn.Module):
         def __init__(self):
@@ -117,6 +133,71 @@ def test_binary_curves_are_order_invariant_for_tied_scores():
     reversed_auroc, reversed_auprc = binary_curves(scores[::-1], labels[::-1])
     assert auroc == reversed_auroc == 0.5
     assert auprc == reversed_auprc == 0.5
+
+
+def _bare_feature_extractor() -> FeatureExtractor:
+    extractor = object.__new__(FeatureExtractor)
+    extractor.vit_features = {}
+    extractor.llm_hidden_states = {}
+    extractor._batch_capture_plan = None
+    extractor._captured_batch_vit = {}
+    extractor._captured_batch_llm = {}
+    extractor._captured_batch_queries = None
+    extractor._capture_suspend_depth = 0
+    extractor.detach_features = False
+    return extractor
+
+
+def test_feature_capture_suspension_is_reentrant_and_preserves_normal_hooks():
+    extractor = _bare_feature_extractor()
+    vit_hook = extractor._make_vit_hook(7)
+    llm_hook = extractor._make_llm_hook(13)
+    vit_output = torch.randn(4, 3)
+    llm_output = torch.randn(1, 4, 3)
+
+    vit_hook(None, None, vit_output)
+    llm_hook(None, None, (llm_output,))
+    assert extractor.vit_features[7] is vit_output
+    assert extractor.llm_hidden_states[13] is llm_output
+
+    with extractor.suspend_capture():
+        assert extractor.vit_features == {}
+        assert extractor.llm_hidden_states == {}
+        vit_hook(None, None, vit_output)
+        llm_hook(None, None, llm_output)
+        assert extractor.vit_features == {}
+        assert extractor.llm_hidden_states == {}
+
+        with extractor.suspend_capture():
+            vit_hook(None, None, vit_output)
+            assert extractor.vit_features == {}
+
+        llm_hook(None, None, llm_output)
+        assert extractor.llm_hidden_states == {}
+
+    assert extractor.vit_features == {}
+    assert extractor.llm_hidden_states == {}
+    vit_hook(None, None, vit_output)
+    llm_hook(None, None, llm_output)
+    assert extractor.vit_features[7] is vit_output
+    assert extractor.llm_hidden_states[13] is llm_output
+
+
+def test_feature_capture_suspension_clears_and_recovers_after_exception():
+    extractor = _bare_feature_extractor()
+    vit_hook = extractor._make_vit_hook(7)
+    vit_output = torch.randn(4, 3)
+
+    with pytest.raises(RuntimeError, match="rehearsal failed"):
+        with extractor.suspend_capture():
+            extractor.vit_features[99] = torch.ones(1)
+            raise RuntimeError("rehearsal failed")
+
+    assert extractor._capture_suspend_depth == 0
+    assert extractor.vit_features == {}
+    assert extractor.llm_hidden_states == {}
+    vit_hook(None, None, vit_output)
+    assert extractor.vit_features[7] is vit_output
 
 
 def test_single_panorama_decode_receives_relative_pose():

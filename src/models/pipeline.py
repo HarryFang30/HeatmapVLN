@@ -103,6 +103,8 @@ class VLNPipelineConfig:
     heatmap_llm_layer_indices: list[int] | None = None  # e.g. [7, 15, 23] (full_attention)
     heatmap_size: tuple[int, int] = (64, 64)
     heatmap_trajectory_config: dict[str, Any] | None = None
+    heatmap_decoder_mode: str = "legacy"
+    heatmap_pose_free_config: dict[str, Any] | None = None
 
     # Allow heatmap loss gradients to flow back through the VLM backbone (LoRA).
     # When False (default), hooked features are detached and the backbone runs
@@ -533,10 +535,19 @@ class VLNPipeline(nn.Module):
         cfg = self.config
         default_vit_indices = [7, 15, 23, 31]
         default_llm_indices = [6, 13, 20]
-        vit_indices = cfg.heatmap_vit_layer_indices or default_vit_indices
+        decoder_mode = getattr(cfg, 'heatmap_decoder_mode', 'legacy')
+        vit_indices = (
+            default_vit_indices
+            if cfg.heatmap_vit_layer_indices is None
+            else cfg.heatmap_vit_layer_indices
+        )
+        if decoder_mode == "pose_free_matcher":
+            vit_indices = []
         llm_indices = cfg.heatmap_llm_layer_indices or default_llm_indices
 
         trajectory_config = getattr(cfg, 'heatmap_trajectory_config', None)
+        pose_free_config = dict(getattr(cfg, 'heatmap_pose_free_config', None) or {})
+        pose_free_config.setdefault("heatmap_size", cfg.heatmap_size)
 
         self.heatmap_vln = HeatmapVLN(
             qwen_model=self.qwen2_5_vl.model,
@@ -549,6 +560,8 @@ class VLNPipeline(nn.Module):
             enable_runtime_timing=cfg.enable_runtime_timing,
             trajectory_config=trajectory_config,
             heatmap_trains_backbone=cfg.heatmap_trains_backbone,
+            decoder_mode=decoder_mode,
+            pose_free_config=pose_free_config,
         )
 
         # Move all trainable parts to correct device/dtype
@@ -557,11 +570,14 @@ class VLNPipeline(nn.Module):
             self.heatmap_vln.llm_dpt_fusion,
             self.heatmap_vln.fine,
             self.heatmap_vln.coarse,
+            self.heatmap_vln.pose_free_matcher,
         ]:
-            module.to(device=self.device, dtype=cfg.dtype)
+            if module is not None:
+                module.to(device=self.device, dtype=cfg.dtype)
 
         logger.info(
-            "HeatmapVLN v2 constructed (Coarse-to-Fine, LLM layers=%s)",
+            "HeatmapVLN v2 constructed (decoder_mode=%s, LLM layers=%s)",
+            decoder_mode,
             llm_indices,
         )
 
@@ -658,6 +674,7 @@ class VLNPipeline(nn.Module):
         panoramic_text_anchor_positions: list[dict[int, int]] | None = None,
         history_rel_poses: torch.Tensor | None = None,
         return_lm_loss: bool = False,
+        return_lm_correct_logprobs: bool = False,
     ) -> dict[str, Any]:
         """Forward pass."""
         del gt_stop  # Reserved for optional stop-head training compatibility.
@@ -728,6 +745,7 @@ class VLNPipeline(nn.Module):
             or need_traj_query_features
             or use_panoramic_chain
             or return_lm_loss
+            or return_lm_correct_logprobs
         )
         if should_run_qwen:
             # ==================== Step 1: VLM backbone processing ====================
@@ -752,6 +770,7 @@ class VLNPipeline(nn.Module):
                 history_rel_poses=history_rel_poses,
                 latent_queries=lq,
                 return_lm_loss=return_lm_loss,
+                return_lm_correct_logprobs=return_lm_correct_logprobs,
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
@@ -825,6 +844,16 @@ class VLNPipeline(nn.Module):
             output['traj_hidden_states'] = traj_hidden_states
         if qwen_output is not None and qwen_output.get('lm_loss') is not None:
             output['lm_loss'] = qwen_output['lm_loss']
+        if (
+            qwen_output is not None
+            and qwen_output.get('lm_correct_label_logprobs') is not None
+        ):
+            output['lm_correct_label_logprobs'] = qwen_output[
+                'lm_correct_label_logprobs'
+            ]
+            output['lm_correct_label_alignment'] = qwen_output[
+                'lm_correct_label_alignment'
+            ]
 
         if self.nextdit_action_head is not None:
             output['has_nextdit_action_head'] = True
