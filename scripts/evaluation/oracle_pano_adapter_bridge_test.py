@@ -34,21 +34,24 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+FJL_ROOT = Path(os.environ.get("FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+RPC_SRC = Path(os.environ.get("RPC_ROOT", str(FJL_ROOT / "rpc"))) / "src"
+if RPC_SRC.is_dir() and str(RPC_SRC) not in sys.path:
+    sys.path.insert(0, str(RPC_SRC))
 
 import numpy as np
 import torch
 
-from scripts.evaluation.r2r_val_unseen import (
+from scripts.evaluation.rpc_model_server import (
+    HeatmapVLNRuntime,
     _condition_output_ids_for_pixel_goal,
     _finalize_local_actions,
-    _load_pano_latent_adapter,
     _maybe_apply_pano_latent_adapter,
     _normalize_multimodal_inputs,
     _parse_pano_view_id,
     _parse_pixel_goal,
     _trajectory_debug_summary,
     _trajectory_from_condition,
-    load_model,
     reconstruct_xy_from_delta,
     select_trajectory_xy,
     traj_to_actions,
@@ -606,18 +609,30 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model_args = argparse.Namespace(
+    requested_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if requested_device.type != "cuda":
+        raise RuntimeError("The full Stage3 counterfactual diagnostic requires a CUDA device")
+    runtime_args = argparse.Namespace(
         config=args.config,
         checkpoint=None,
         base_checkpoint=args.base_checkpoint,
+        pano_latent_adapter_checkpoint=args.adapter_checkpoint,
+        internnav_model_path=(
+            os.environ.get("INTERNNAV_MODEL_PATH")
+            or os.environ.get("INTERNNAV_BACKBONE")
+            or ""
+        ),
+        gpu_id=int(requested_device.index or 0),
     )
-    model, model_cfg = load_model(model_args, device)
+    runtime = HeatmapVLNRuntime(runtime_args)
+    model = runtime.model
+    model_cfg = runtime.train_cfg
+    adapter = runtime.pano_latent_adapter
+    device = runtime.device
     if model.nextdit_action_head is None or model.latent_queries is None:
         raise RuntimeError("Config/model must enable NextDiT action_head and latent_queries")
-
-    hidden_dim = int(model_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
-    adapter = _load_pano_latent_adapter(args.adapter_checkpoint, hidden_dim, device)
+    if adapter is None:
+        raise RuntimeError("The counterfactual diagnostic requires a pano adapter checkpoint")
 
     dataset_cfg = _load_cfg_for_dataset(args)
     dataset = _build_dataset(
