@@ -53,6 +53,8 @@ from .visualization import (
 
 logger = logging.getLogger(__name__)
 
+_TRAJECTORY_VIEW_ORDER = ("front", "right", "back", "left")
+
 
 def _prepare_trajectory_sequence_inputs(
     gt_trajectory: torch.Tensor,
@@ -122,7 +124,7 @@ def _trajectory_view_sample_weights(
         )
 
     configured = cfg.get("weights") or {}
-    allowed = {"front", "right", "back", "left"}
+    allowed = set(_TRAJECTORY_VIEW_ORDER)
     unknown = sorted(set(configured) - allowed)
     if unknown:
         raise ValueError(f"Unknown trajectory view weights: {unknown}")
@@ -271,6 +273,11 @@ def train_one_epoch(
     total_action_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
     total_lm_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
     total_l2_sp_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_trajectory_view_counts = torch.zeros(
+        len(_TRAJECTORY_VIEW_ORDER),
+        device=dist_context.device,
+        dtype=torch.float64,
+    )
     num_batches = 0
 
     optim_cfg = cfg['optim']
@@ -540,6 +547,12 @@ def train_one_epoch(
                         trajectory_view_weights_cfg,
                         device=device,
                     )
+                    for raw_view in batch.get('pano_view_id') or []:
+                        view = str(raw_view).lower()
+                        if view in _TRAJECTORY_VIEW_ORDER:
+                            total_trajectory_view_counts[
+                                _TRAJECTORY_VIEW_ORDER.index(view)
+                            ] += 1
                     if view_weights is not None:
                         if trajectory_valid is None:
                             trajectory_valid = view_weights
@@ -1007,8 +1020,15 @@ def train_one_epoch(
         ]
     )
     _dist_all_reduce_in_place(totals)
+    _dist_all_reduce_in_place(total_trajectory_view_counts)
 
     reduced_num_batches = max(int(totals[5].item()), 1)
+    view_count_metrics = {
+        f'trajectory_view_count_{view}': int(total_trajectory_view_counts[idx].item())
+        for idx, view in enumerate(_TRAJECTORY_VIEW_ORDER)
+    }
+    if dist_context.is_main and total_trajectory_view_counts.sum().item() > 0:
+        logger.info("  Trajectory view samples: %s", view_count_metrics)
     return {
         'total_loss': (totals[0] / reduced_num_batches).item(),
         'heatmap_loss': (totals[1] / reduced_num_batches).item(),
@@ -1016,6 +1036,7 @@ def train_one_epoch(
         'lm_loss': (totals[3] / reduced_num_batches).item(),
         'l2_sp_loss': (totals[4] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
+        **view_count_metrics,
     }
 
 
