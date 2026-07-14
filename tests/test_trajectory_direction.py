@@ -1,6 +1,7 @@
 import numpy as np
 
 from src.utils.trajectory_direction import (
+    align_trajectory_endpoint_heading,
     pairwise_representation_stats,
     summarize_direction_response,
     view_pixel_target_angle_deg,
@@ -64,3 +65,26 @@ def test_view_pixel_target_angle_includes_horizontal_pixel_offset():
     assert view_pixel_target_angle_deg("front", [192, 128], [256, 256]) == -22.5
     assert view_pixel_target_angle_deg("right", [64, 128], [256, 256]) == -67.5
     assert view_pixel_target_angle_deg("back", [0, 128], [256, 256]) == -135.0
+
+
+def test_endpoint_heading_alignment_preserves_path_shape_and_length():
+    path = np.array([[0.0, 0.0], [1.0, 0.25], [2.0, 0.0]], dtype=np.float32)
+    aligned, rotation_deg = align_trajectory_endpoint_heading(
+        path,
+        target_angle_deg=-90.0,
+    )
+
+    assert rotation_deg == -90.0
+    assert np.allclose(aligned[-1], [0.0, -2.0], atol=1.0e-7)
+    assert np.allclose(
+        np.linalg.norm(np.diff(aligned, axis=0), axis=1),
+        np.linalg.norm(np.diff(path, axis=0), axis=1),
+    )
+
+
+def test_endpoint_heading_alignment_leaves_zero_path_unchanged():
+    path = np.zeros((3, 2), dtype=np.float32)
+    aligned, rotation_deg = align_trajectory_endpoint_heading(path, target_angle_deg=180.0)
+
+    assert rotation_deg == 0.0
+    assert np.array_equal(aligned, path)

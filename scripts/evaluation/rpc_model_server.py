@@ -46,6 +46,10 @@ from src.models.heatmap.input_constructor import (
     vlm_output_requests_turn,
 )
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
+from src.utils.trajectory_direction import (
+    align_trajectory_endpoint_heading,
+    view_pixel_target_angle_deg,
+)
 from vla_rpc.core.image import decode_jpeg_to_rgb
 from vla_rpc.proto import vla_pb2, vla_pb2_grpc
 
@@ -500,6 +504,7 @@ def traj_to_actions(
     action_scale: float = 4.0,
     trajectory_selection: str = "mean",
     trajectory_x_sign: float = 1.0,
+    target_heading_deg: float | None = None,
 ) -> list[int]:
     if trajectory_x_sign not in (-1.0, 1.0):
         raise ValueError(
@@ -510,6 +515,11 @@ def traj_to_actions(
     trajs[:, :, 0] *= trajectory_x_sign
     all_trajectory = reconstruct_xy_from_delta(trajs)
     trajectory, _selected_idx = select_trajectory_xy(all_trajectory, trajectory_selection)
+    if target_heading_deg is not None:
+        trajectory, _rotation_deg = align_trajectory_endpoint_heading(
+            trajectory,
+            target_angle_deg=float(target_heading_deg),
+        )
     actions = _trajectory_to_discrete_actions_close_to_goal(trajectory)
     return actions if actions else [ActionCode.STOP]
 
@@ -754,9 +764,17 @@ class HeatmapVLNRuntime:
             system1_coord_order = "generated"
         trajectory_selection = str(payload.get("trajectory_selection", "mean"))
         trajectory_x_sign = float(payload.get("trajectory_x_sign", 1.0))
+        trajectory_heading_alignment = str(
+            payload.get("trajectory_heading_alignment", "none")
+        ).lower()
         if trajectory_x_sign not in (-1.0, 1.0):
             raise ValueError(
                 f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
+            )
+        if trajectory_heading_alignment not in {"none", "pano_pixel"}:
+            raise ValueError(
+                "trajectory_heading_alignment must be none or pano_pixel, got "
+                f"{trajectory_heading_alignment!r}"
             )
         oracle_system2 = payload.get("oracle_system2")
         if not isinstance(oracle_system2, dict):
@@ -845,6 +863,13 @@ class HeatmapVLNRuntime:
         response["pano_goal_view"] = pano_goal_view
 
         if self.has_nextdit and pixel_goal is not None:
+            target_heading_deg = None
+            if trajectory_heading_alignment == "pano_pixel":
+                target_heading_deg = view_pixel_target_angle_deg(
+                    pano_goal_view,
+                    pixel_goal,
+                    vlm_image_size,
+                )
             lookdown_t = _lookdown_to_traj_tensor(lookdown_img, self.device)
             pix_goal_image = lookdown_t.clone()
             traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(self.device)
@@ -894,6 +919,7 @@ class HeatmapVLNRuntime:
                     action_scale=self.action_scale,
                     trajectory_selection=trajectory_selection,
                     trajectory_x_sign=trajectory_x_sign,
+                    target_heading_deg=target_heading_deg,
                 )
             )
             if local_actions and local_actions[0] == ActionCode.STOP:
@@ -909,6 +935,8 @@ class HeatmapVLNRuntime:
                     trajectory_x_sign,
                 ),
                 "trajectory_x_sign": trajectory_x_sign,
+                "trajectory_heading_alignment": trajectory_heading_alignment,
+                "trajectory_target_heading_deg": target_heading_deg,
             })
             return response
 

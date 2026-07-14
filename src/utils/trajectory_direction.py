@@ -43,6 +43,37 @@ def view_pixel_target_angle_deg(
     return float(normalize_angle_deg(VIEW_TARGET_ANGLE_DEG[view] + pixel_offset_deg))
 
 
+def align_trajectory_endpoint_heading(
+    trajectory_xy: np.ndarray,
+    *,
+    target_angle_deg: float,
+    min_endpoint_distance: float = 1.0e-6,
+) -> tuple[np.ndarray, float]:
+    """Rotate a local path so its endpoint bearing matches a pano goal ray."""
+    trajectory = np.asarray(trajectory_xy, dtype=np.float64)
+    if trajectory.ndim != 2 or trajectory.shape[0] < 2 or trajectory.shape[1] < 2:
+        raise ValueError(f"Expected trajectory [T,>=2], got {trajectory.shape}")
+    aligned = trajectory.copy()
+    origin = trajectory[0, :2]
+    endpoint_delta = trajectory[-1, :2] - origin
+    endpoint_distance = float(np.linalg.norm(endpoint_delta))
+    if endpoint_distance <= float(min_endpoint_distance):
+        return aligned, 0.0
+
+    current_angle_deg = float(np.degrees(np.arctan2(endpoint_delta[1], endpoint_delta[0])))
+    rotation_deg = float(normalize_angle_deg(float(target_angle_deg) - current_angle_deg))
+    rotation_rad = np.deg2rad(rotation_deg)
+    rotation = np.array(
+        [
+            [np.cos(rotation_rad), -np.sin(rotation_rad)],
+            [np.sin(rotation_rad), np.cos(rotation_rad)],
+        ],
+        dtype=np.float64,
+    )
+    aligned[:, :2] = (trajectory[:, :2] - origin) @ rotation.T + origin
+    return aligned, rotation_deg
+
+
 def reconstruct_delta_xy(
     delta_xyt: np.ndarray,
     *,

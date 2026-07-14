@@ -42,6 +42,7 @@ export STAGE3_EVAL_TRAJECTORY_SELECTION="${STAGE3_EVAL_TRAJECTORY_SELECTION:-mea
 # Corrected Stage3 checkpoints already emit native InternNav coordinates.
 # Set -1 explicitly only when diagnosing a legacy pre-coordinate-fix checkpoint.
 export STAGE3_EVAL_TRAJECTORY_X_SIGN="${STAGE3_EVAL_TRAJECTORY_X_SIGN:-1}"
+export STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT="${STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT:-none}"
 export STAGE3_EVAL_SYSTEM1_COORD_ORDER="${STAGE3_EVAL_SYSTEM1_COORD_ORDER:-generated}"
 export STAGE3_EVAL_AUTO_STOP_DISTANCE="${STAGE3_EVAL_AUTO_STOP_DISTANCE:-0.0}"
 export STAGE3_EVAL_ORACLE_SYSTEM2="${STAGE3_EVAL_ORACLE_SYSTEM2:-0}"
@@ -140,6 +141,13 @@ case "$STAGE3_EVAL_TRAJECTORY_X_SIGN" in
   -1|-1.0|1|1.0) ;;
   *)
     echo "STAGE3_EVAL_TRAJECTORY_X_SIGN must be -1 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT" in
+  none|pano_pixel) ;;
+  *)
+    echo "STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT must be none or pano_pixel" >&2
     exit 1
     ;;
 esac
@@ -272,7 +280,7 @@ echo "[stage3-eval] model_gpu=$STAGE3_EVAL_MODEL_GPU display=$STAGE3_EVAL_DISPLA
 echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
 echo "[stage3-eval] oracle_strategy=$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY lookahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M min_ahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M max_side_dist_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"
-echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN"
+echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN heading_alignment=$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
 
 if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
   echo "[$(date '+%F %T')] STAGE3_EVAL_PREFLIGHT_ONLY=1; all static preflights passed"
@@ -382,6 +390,7 @@ manifest = {
     "oracle_system2_max_side_dist_m": float(os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"]),
     "trajectory_selection": os.environ["STAGE3_EVAL_TRAJECTORY_SELECTION"],
     "trajectory_x_sign": float(os.environ["STAGE3_EVAL_TRAJECTORY_X_SIGN"]),
+    "trajectory_heading_alignment": os.environ["STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"],
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
 }
 Path(sys.argv[1]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -404,6 +413,7 @@ client_args=(
   --max_system2_calls_per_episode "$STAGE3_EVAL_MAX_SYSTEM2_CALLS"
   --trajectory_selection "$STAGE3_EVAL_TRAJECTORY_SELECTION"
   --trajectory_x_sign "$STAGE3_EVAL_TRAJECTORY_X_SIGN"
+  --trajectory_heading_alignment "$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
   --system1_coord_order "$STAGE3_EVAL_SYSTEM1_COORD_ORDER"
   --no-debug_input_trace
   --debug_save_input_images 0

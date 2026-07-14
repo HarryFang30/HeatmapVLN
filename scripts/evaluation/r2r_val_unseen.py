@@ -1816,6 +1816,7 @@ TRAJECTORY_SELECTION_CHOICES = (
     "forward_or_medoid",
     "longest_forward",
 )
+TRAJECTORY_HEADING_ALIGNMENT_CHOICES = ("none", "pano_pixel")
 
 
 def reconstruct_xy_from_delta(delta_xyt: np.ndarray) -> np.ndarray:
@@ -3271,6 +3272,7 @@ def _rpc_plan_panoramic(
     system1_coord_order: str,
     trajectory_selection: str,
     trajectory_x_sign: float,
+    trajectory_heading_alignment: str,
     jpeg_quality: int,
     oracle_system2: dict[str, Any] | None = None,
 ) -> dict:
@@ -3290,6 +3292,7 @@ def _rpc_plan_panoramic(
         "system1_coord_order": system1_coord_order,
         "trajectory_selection": trajectory_selection,
         "trajectory_x_sign": trajectory_x_sign,
+        "trajectory_heading_alignment": trajectory_heading_alignment,
     }
     if oracle_system2 is not None:
         payload["oracle_system2"] = oracle_system2
@@ -3332,6 +3335,7 @@ def run_eval_rpc_panoramic(args):
     print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
     print(f"trajectory_selection={args.trajectory_selection}")
     print(f"trajectory_x_sign={args.trajectory_x_sign:g}")
+    print(f"trajectory_heading_alignment={args.trajectory_heading_alignment}")
     if bool(getattr(args, "oracle_system2", False)):
         print(
             "[rpc-eval] --oracle_system2 is ACTIVE; System2 text will be "
@@ -3547,6 +3551,7 @@ def run_eval_rpc_panoramic(args):
                 system1_coord_order=system1_coord_order,
                 trajectory_selection=args.trajectory_selection,
                 trajectory_x_sign=args.trajectory_x_sign,
+                trajectory_heading_alignment=args.trajectory_heading_alignment,
                 jpeg_quality=args.rpc_jpeg_quality,
                 oracle_system2=oracle_system2,
             )
@@ -3676,6 +3681,7 @@ def run_eval_rpc_panoramic(args):
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
+            "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
@@ -3698,6 +3704,7 @@ def run_eval_rpc_panoramic(args):
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
+            "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
         }
@@ -4394,6 +4401,16 @@ def main():
         help=(
             "Multiply predicted trajectory x by this sign before InternNav "
             "discretization. Stage3 pose-derived targets use -x as forward."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory_heading_alignment",
+        choices=TRAJECTORY_HEADING_ALIGNMENT_CHOICES,
+        default="none",
+        help=(
+            "RPC-only optional calibration. pano_pixel rotates the selected "
+            "local trajectory so its endpoint bearing matches the panoramic "
+            "view/pixel ray while preserving path length and curvature."
         ),
     )
     parser.add_argument(
