@@ -49,6 +49,8 @@ from scripts.evaluation.r2r_val_unseen import (
     _trajectory_debug_summary,
     _trajectory_from_condition,
     load_model,
+    reconstruct_xy_from_delta,
+    select_trajectory_xy,
     traj_to_actions,
 )
 from scripts.evaluation.system2_sft_sanity_check import (
@@ -58,9 +60,24 @@ from scripts.evaluation.system2_sft_sanity_check import (
 from scripts.training.utils import load_config
 from src.data.factory import build_trajectory_dataset
 from src.models.heatmap.input_constructor import construct_input, structured_condition_text
+from src.utils.trajectory_direction import (
+    VIEW_TARGET_ANGLE_DEG,
+    angular_error_deg,
+    pairwise_representation_stats,
+    summarize_direction_response,
+)
 
 LOGGER = logging.getLogger("oracle_pano_adapter_bridge")
 VALID_PANO_VIEWS = {"front", "right", "back", "left"}
+COUNTERFACTUAL_VIEWS = ("front", "right", "back", "left")
+TRAJECTORY_SELECTIONS = (
+    "mean",
+    "endpoint_medoid",
+    "path_medoid",
+    "median_endpoint_nearest",
+    "forward_or_medoid",
+    "longest_forward",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,14 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--trajectory-selection",
         default="mean",
-        choices=(
-            "mean",
-            "endpoint_medoid",
-            "path_medoid",
-            "median_endpoint_nearest",
-            "forward_or_medoid",
-            "longest_forward",
-        ),
+        choices=TRAJECTORY_SELECTIONS,
     )
     p.add_argument(
         "--output",
@@ -97,6 +107,35 @@ def parse_args() -> argparse.Namespace:
         help="Per-sample JSONL output.",
     )
     p.add_argument("--max-prints", type=int, default=8)
+    p.add_argument(
+        "--counterfactual-all-views",
+        action="store_true",
+        help=(
+            "For each fixed image/prompt sample, replace the assistant suffix "
+            "with front/right/back/left center goals and report latent and "
+            "trajectory direction separation."
+        ),
+    )
+    p.add_argument(
+        "--counterfactual-pixel",
+        type=int,
+        nargs=2,
+        metavar=("U", "V"),
+        default=None,
+        help="Pixel used for all counterfactual views; defaults to image center.",
+    )
+    p.add_argument(
+        "--trajectory-seed",
+        type=int,
+        default=20260714,
+        help="Shared diffusion seed across counterfactual views for each sample.",
+    )
+    p.add_argument(
+        "--dataset-max-clips",
+        type=int,
+        default=0,
+        help="Limit dataset indexing for diagnostics; 0 keeps all clips.",
+    )
     return p.parse_args()
 
 
@@ -116,7 +155,7 @@ def _load_cfg_for_dataset(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
-def _build_dataset(cfg: dict[str, Any], split: str):
+def _build_dataset(cfg: dict[str, Any], split: str, *, max_clips: int = 0):
     return build_trajectory_dataset(
         cfg,
         split=split,
@@ -129,6 +168,7 @@ def _build_dataset(cfg: dict[str, Any], split: str):
         load_lookdown_for_system2=False,
         load_traj_images=True,
         require_sft_target=False,
+        max_clips=max(0, int(max_clips)),
     )
 
 
@@ -252,6 +292,8 @@ def _run_condition_branch(
     num_sample_trajs: int,
     action_scale: float,
     trajectory_selection: str,
+    trajectory_seed: int | None = None,
+    diagnostic_detail: bool = False,
 ) -> dict[str, Any]:
     tokenizer = processor.tokenizer
 
@@ -296,6 +338,10 @@ def _run_condition_branch(
             ),
         )
         conditioned_norm = float(conditioned.float().norm().item())
+        if trajectory_seed is not None:
+            torch.manual_seed(int(trajectory_seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(trajectory_seed))
         trajectory = _trajectory_from_condition(
             model.nextdit_action_head,
             conditioned,
@@ -313,7 +359,7 @@ def _run_condition_branch(
     summary = _trajectory_debug_summary(trajectory, num_sample_trajs, action_scale)
     parsed_summary = _parse_summary(summary)
 
-    return {
+    result: dict[str, Any] = {
         "branch": branch,
         "condition_suffix_text": suffix_text,
         "prompt_unchanged": prompt_unchanged,
@@ -327,6 +373,50 @@ def _run_condition_branch(
         "turn_only_first4": all(int(a) in (2, 3) for a in actions[:4]),
         "no_forward_first4": all(int(a) != 1 for a in actions[:4]),
     }
+    if diagnostic_detail:
+        trajectory_np = trajectory[:num_sample_trajs].float().detach().cpu().numpy()
+        direction = summarize_direction_response(
+            trajectory_np,
+            view_id=view_id,
+            action_scale=action_scale,
+        )
+        scaled = trajectory_np.copy()
+        scaled[:, :, :2] /= float(action_scale)
+        all_xy = reconstruct_xy_from_delta(scaled)
+        selections: dict[str, Any] = {}
+        for selection in TRAJECTORY_SELECTIONS:
+            selected_xy, selected_idx = select_trajectory_xy(all_xy, selection)
+            endpoint = selected_xy[-1, :2]
+            direct = float(np.linalg.norm(endpoint))
+            angle = (
+                float(np.degrees(np.arctan2(endpoint[1], endpoint[0])))
+                if direct > 1.0e-6
+                else None
+            )
+            selected_actions = _finalize_local_actions(
+                traj_to_actions(
+                    trajectory,
+                    num_sample_trajs=num_sample_trajs,
+                    action_scale=action_scale,
+                    trajectory_selection=selection,
+                )
+            )
+            selections[selection] = {
+                "selected_index": int(selected_idx) if selected_idx is not None else None,
+                "endpoint_xy_m": [float(endpoint[0]), float(endpoint[1])],
+                "endpoint_angle_deg": angle,
+                "endpoint_angle_error_deg": (
+                    float(angular_error_deg(angle, VIEW_TARGET_ANGLE_DEG[view_id]))
+                    if angle is not None
+                    else 180.0
+                ),
+                "actions_first4": [int(action) for action in selected_actions[:4]],
+            }
+        result["direction"] = direction
+        result["selections"] = selections
+        result["_traj_hs_repr"] = traj_hs.float().detach().cpu().numpy()
+        result["_conditioned_repr"] = conditioned.float().detach().cpu().numpy()
+    return result
 
 
 def _generated_branch_goal(llm_output: str, image_size: tuple[int, int]) -> tuple[str, list[int]] | None:
@@ -355,6 +445,163 @@ def _choose_indices(dataset, num_samples: int, seed: int) -> list[int]:
     return chosen
 
 
+def _run_counterfactual_sample(
+    *,
+    dataset,
+    sample: dict[str, Any],
+    dataset_index: int,
+    model,
+    processor,
+    adapter,
+    device: torch.device,
+    internnav_protocol: bool,
+    structured_output: bool,
+    image_size: tuple[int, int],
+    counterfactual_pixel: list[int] | None,
+    max_new_tokens: int,
+    num_sample_trajs: int,
+    action_scale: float,
+    trajectory_seed: int,
+) -> dict[str, Any]:
+    inputs = _prepare_prompt_inputs(
+        processor,
+        sample,
+        device,
+        internnav_protocol=internnav_protocol,
+        structured_pano_output=structured_output,
+    )
+    student_text, output_ids, prompt_len = _generate_system2_text(
+        model,
+        processor,
+        inputs,
+        max_new_tokens=max_new_tokens,
+    )
+    traj_images = _traj_images_from_sample(sample, device, model.config.dtype)
+    pixel = (
+        [int(counterfactual_pixel[0]), int(counterfactual_pixel[1])]
+        if counterfactual_pixel is not None
+        else [int(image_size[0] // 2), int(image_size[1] // 2)]
+    )
+
+    raw_representations: dict[str, np.ndarray] = {}
+    conditioned_representations: dict[str, np.ndarray] = {}
+    view_results: dict[str, Any] = {}
+    shared_seed = int(trajectory_seed) + int(dataset_index)
+    for view_id in COUNTERFACTUAL_VIEWS:
+        result = _run_condition_branch(
+            branch=f"counterfactual_{view_id}",
+            model=model,
+            processor=processor,
+            adapter=adapter,
+            inputs=inputs,
+            output_ids=output_ids,
+            prompt_len=prompt_len,
+            llm_output=student_text,
+            pixel_goal=pixel,
+            view_id=view_id,
+            structured_output=True,
+            traj_images=traj_images,
+            num_sample_trajs=num_sample_trajs,
+            action_scale=action_scale,
+            trajectory_selection="mean",
+            trajectory_seed=shared_seed,
+            diagnostic_detail=True,
+        )
+        raw_representations[view_id] = result.pop("_traj_hs_repr")
+        conditioned_representations[view_id] = result.pop("_conditioned_repr")
+        result["expected_suffix_text"] = structured_condition_text(view_id, pixel)
+        result["suffix_matches_expected"] = (
+            result["condition_suffix_text"] == result["expected_suffix_text"]
+        )
+        view_results[view_id] = result
+
+    clip_idx = current_t = None
+    if hasattr(dataset, "sample_index"):
+        clip_idx, current_t = dataset.sample_index[dataset_index]
+    return {
+        "dataset_index": int(dataset_index),
+        "clip_idx": int(clip_idx) if clip_idx is not None else None,
+        "current_t": int(current_t) if current_t is not None else None,
+        "source_view": str(sample.get("pano_view_id") or ""),
+        "source_pixel": (
+            [int(value) for value in sample["pano_pixel_goal"]]
+            if sample.get("pano_pixel_goal") is not None
+            else None
+        ),
+        "counterfactual_pixel": pixel,
+        "student_text": student_text,
+        "prompt_len": prompt_len,
+        "trajectory_seed": shared_seed,
+        "representations": {
+            "raw": pairwise_representation_stats(raw_representations),
+            "conditioned": pairwise_representation_stats(conditioned_representations),
+        },
+        "views": view_results,
+    }
+
+
+def _summarize_counterfactual(
+    records: list[dict[str, Any]],
+    *,
+    output: Path,
+    adapter_checkpoint: str,
+) -> dict[str, Any]:
+    direction_keys = (
+        "candidate_angle_error_mean_deg",
+        "candidate_angle_error_median_deg",
+        "candidate_within_45_rate",
+        "candidate_within_90_rate",
+        "candidate_positive_progress_rate",
+        "candidate_alignment_mean",
+        "candidate_progress_mean_m",
+        "mean_endpoint_angle_error_deg",
+        "mean_endpoint_progress_m",
+    )
+    views: dict[str, Any] = {}
+    for view_id in COUNTERFACTUAL_VIEWS:
+        view_summary: dict[str, Any] = {}
+        for key in direction_keys:
+            values = [float(rec["views"][view_id]["direction"][key]) for rec in records]
+            view_summary[f"{key}_mean"] = float(np.mean(values))
+            view_summary[f"{key}_median"] = float(np.median(values))
+        selection_summary: dict[str, Any] = {}
+        for selection in TRAJECTORY_SELECTIONS:
+            errors = [
+                float(rec["views"][view_id]["selections"][selection]["endpoint_angle_error_deg"])
+                for rec in records
+            ]
+            selection_summary[selection] = {
+                "endpoint_angle_error_deg_mean": float(np.mean(errors)),
+                "endpoint_angle_error_deg_median": float(np.median(errors)),
+                "within_45_rate": float(np.mean(np.asarray(errors) <= 45.0)),
+            }
+        view_summary["selections"] = selection_summary
+        views[view_id] = view_summary
+
+    representation_summary: dict[str, Any] = {}
+    for stage in ("raw", "conditioned"):
+        cosines = [float(rec["representations"][stage]["cosine_mean"]) for rec in records]
+        relative_l2 = [
+            float(rec["representations"][stage]["relative_l2_mean"])
+            for rec in records
+        ]
+        representation_summary[stage] = {
+            "pairwise_cosine_mean": float(np.mean(cosines)),
+            "pairwise_cosine_min": float(np.min(cosines)),
+            "pairwise_relative_l2_mean": float(np.mean(relative_l2)),
+            "pairwise_relative_l2_max": float(np.max(relative_l2)),
+        }
+
+    return {
+        "mode": "counterfactual_all_views",
+        "num_samples": len(records),
+        "adapter_checkpoint": str(adapter_checkpoint),
+        "views": views,
+        "representations": representation_summary,
+        "output": str(output),
+    }
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args()
@@ -373,7 +620,11 @@ def main() -> int:
     adapter = _load_pano_latent_adapter(args.adapter_checkpoint, hidden_dim, device)
 
     dataset_cfg = _load_cfg_for_dataset(args)
-    dataset = _build_dataset(dataset_cfg, args.split)
+    dataset = _build_dataset(
+        dataset_cfg,
+        args.split,
+        max_clips=args.dataset_max_clips,
+    )
     indices = _choose_indices(dataset, args.num_samples, args.seed)
     if not indices:
         raise RuntimeError("No pixel pano samples found for oracle bridge test")
@@ -381,6 +632,14 @@ def main() -> int:
     traj_cfg = dataset_cfg.get("data", {}).get("trajectory", {})
     action_scale = float(traj_cfg.get("action_scale", dataset_cfg.get("data", {}).get("action_scale", 4.0)))
     image_size = tuple(int(v) for v in dataset_cfg.get("data", {}).get("image_size", [256, 256]))
+    if args.counterfactual_pixel is not None:
+        u, v = (int(value) for value in args.counterfactual_pixel)
+        width, height = image_size
+        if not (0 <= u < width and 0 <= v < height):
+            raise ValueError(
+                "--counterfactual-pixel must be inside the configured image: "
+                f"pixel={(u, v)} image_size={image_size}"
+            )
     num_sample_trajs = int(
         model_cfg.get("model", {})
         .get("action_head", {})
@@ -394,6 +653,7 @@ def main() -> int:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     counters: Counter[str] = Counter()
+    counterfactual_records: list[dict[str, Any]] = []
     branch_metrics: dict[str, Counter[str]] = {
         "generated": Counter(),
         "oracle_replace": Counter(),
@@ -409,6 +669,47 @@ def main() -> int:
     with out_path.open("w", encoding="utf-8") as fout:
         for n, idx in enumerate(indices, start=1):
             sample = dataset[idx]
+            if args.counterfactual_all_views:
+                counterfactual = _run_counterfactual_sample(
+                    dataset=dataset,
+                    sample=sample,
+                    dataset_index=idx,
+                    model=model,
+                    processor=processor,
+                    adapter=adapter,
+                    device=device,
+                    internnav_protocol=internnav_protocol,
+                    structured_output=structured_output,
+                    image_size=image_size,
+                    counterfactual_pixel=args.counterfactual_pixel,
+                    max_new_tokens=args.max_new_tokens,
+                    num_sample_trajs=num_sample_trajs,
+                    action_scale=action_scale,
+                    trajectory_seed=args.trajectory_seed,
+                )
+                fout.write(json.dumps(counterfactual, ensure_ascii=False) + "\n")
+                counterfactual_records.append(counterfactual)
+                counters["processed"] += 1
+                if n <= args.max_prints:
+                    LOGGER.info(
+                        "[%d/%d idx=%s] counterfactual mean endpoint errors: %s",
+                        n,
+                        len(indices),
+                        idx,
+                        {
+                            view: round(
+                                float(
+                                    counterfactual["views"][view]["direction"][
+                                        "mean_endpoint_angle_error_deg"
+                                    ]
+                                ),
+                                2,
+                            )
+                            for view in COUNTERFACTUAL_VIEWS
+                        },
+                    )
+                continue
+
             gold_view = str(sample["pano_view_id"]).lower()
             gold_pixel = [int(sample["pano_pixel_goal"][0]), int(sample["pano_pixel_goal"][1])]
             oracle_text = structured_condition_text(gold_view, gold_pixel)
@@ -531,6 +832,21 @@ def main() -> int:
                     oracle_result["suffix_matches_oracle"],
                     oracle_result["prompt_unchanged"],
                 )
+
+    if args.counterfactual_all_views:
+        summary = _summarize_counterfactual(
+            counterfactual_records,
+            output=out_path,
+            adapter_checkpoint=args.adapter_checkpoint,
+        )
+        summary_path = out_path.with_suffix(".summary.json")
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        LOGGER.info("Counterfactual summary: %s", json.dumps(summary, ensure_ascii=False))
+        LOGGER.info("Wrote %s and %s", out_path, summary_path)
+        return 0
 
     summary: dict[str, Any] = {
         "num_samples": int(counters["processed"]),

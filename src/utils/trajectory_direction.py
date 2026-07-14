@@ -1,0 +1,139 @@
+"""Direction-response diagnostics for local trajectory predictions."""
+
+from __future__ import annotations
+
+from itertools import combinations
+from typing import Mapping
+
+import numpy as np
+
+
+VIEW_TARGET_ANGLE_DEG: dict[str, float] = {
+    # Local trajectory angles are counter-clockwise: +Y turns left.
+    "front": 0.0,
+    "left": 90.0,
+    "back": 180.0,
+    "right": -90.0,
+}
+
+
+def normalize_angle_deg(angle: float | np.ndarray) -> float | np.ndarray:
+    return (np.asarray(angle) + 180.0) % 360.0 - 180.0
+
+
+def angular_error_deg(angle: float | np.ndarray, target: float) -> float | np.ndarray:
+    return np.abs(normalize_angle_deg(np.asarray(angle) - float(target)))
+
+
+def reconstruct_delta_xy(
+    delta_xyt: np.ndarray,
+    *,
+    action_scale: float,
+    trajectory_x_sign: float = 1.0,
+) -> np.ndarray:
+    deltas = np.asarray(delta_xyt, dtype=np.float64).copy()
+    if deltas.ndim != 3 or deltas.shape[-1] < 2:
+        raise ValueError(f"Expected [N,T,>=2] trajectory deltas, got {deltas.shape}")
+    if action_scale <= 0.0:
+        raise ValueError(f"action_scale must be positive, got {action_scale}")
+    if trajectory_x_sign not in (-1.0, 1.0):
+        raise ValueError(f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}")
+    deltas[:, :, :2] /= float(action_scale)
+    deltas[:, :, 0] *= float(trajectory_x_sign)
+    cumulative = np.cumsum(deltas[:, :, :2], axis=1)
+    origin = np.zeros((deltas.shape[0], 1, 2), dtype=np.float64)
+    return np.concatenate([origin, cumulative], axis=1)
+
+
+def summarize_direction_response(
+    delta_xyt: np.ndarray,
+    *,
+    view_id: str,
+    action_scale: float,
+    trajectory_x_sign: float = 1.0,
+) -> dict[str, object]:
+    view = str(view_id).lower()
+    if view not in VIEW_TARGET_ANGLE_DEG:
+        raise ValueError(f"Unsupported view_id={view_id!r}")
+    expected_deg = VIEW_TARGET_ANGLE_DEG[view]
+    paths = reconstruct_delta_xy(
+        delta_xyt,
+        action_scale=action_scale,
+        trajectory_x_sign=trajectory_x_sign,
+    )
+    endpoints = paths[:, -1, :2]
+    direct = np.linalg.norm(endpoints, axis=1)
+    angles = np.degrees(np.arctan2(endpoints[:, 1], endpoints[:, 0]))
+    valid = direct > 1.0e-6
+    errors = np.full_like(direct, 180.0)
+    errors[valid] = angular_error_deg(angles[valid], expected_deg)
+
+    target_rad = np.deg2rad(expected_deg)
+    target_unit = np.array([np.cos(target_rad), np.sin(target_rad)], dtype=np.float64)
+    progress = endpoints @ target_unit
+    alignment = np.full_like(direct, -1.0)
+    alignment[valid] = progress[valid] / direct[valid]
+
+    mean_path = paths.mean(axis=0)
+    mean_endpoint = mean_path[-1, :2]
+    mean_direct = float(np.linalg.norm(mean_endpoint))
+    mean_angle = (
+        float(np.degrees(np.arctan2(mean_endpoint[1], mean_endpoint[0])))
+        if mean_direct > 1.0e-6
+        else None
+    )
+    mean_error = (
+        float(angular_error_deg(mean_angle, expected_deg))
+        if mean_angle is not None
+        else 180.0
+    )
+
+    return {
+        "view": view,
+        "expected_angle_deg": float(expected_deg),
+        "num_candidates": int(paths.shape[0]),
+        "candidate_endpoint_angles_deg": [float(v) for v in angles.tolist()],
+        "candidate_endpoint_xy_m": [[float(x), float(y)] for x, y in endpoints.tolist()],
+        "candidate_angle_error_mean_deg": float(errors.mean()),
+        "candidate_angle_error_median_deg": float(np.median(errors)),
+        "candidate_within_45_rate": float(np.mean(errors <= 45.0)),
+        "candidate_within_90_rate": float(np.mean(errors <= 90.0)),
+        "candidate_positive_progress_rate": float(np.mean(progress > 0.0)),
+        "candidate_alignment_mean": float(alignment.mean()),
+        "candidate_progress_mean_m": float(progress.mean()),
+        "candidate_direct_mean_m": float(direct.mean()),
+        "mean_endpoint_xy_m": [float(mean_endpoint[0]), float(mean_endpoint[1])],
+        "mean_endpoint_direct_m": mean_direct,
+        "mean_endpoint_angle_deg": mean_angle,
+        "mean_endpoint_angle_error_deg": mean_error,
+        "mean_endpoint_progress_m": float(mean_endpoint @ target_unit),
+    }
+
+
+def pairwise_representation_stats(
+    representations: Mapping[str, np.ndarray],
+) -> dict[str, object]:
+    pairs: list[dict[str, float | str]] = []
+    for left, right in combinations(sorted(representations), 2):
+        a = np.asarray(representations[left], dtype=np.float64).reshape(-1)
+        b = np.asarray(representations[right], dtype=np.float64).reshape(-1)
+        if a.shape != b.shape:
+            raise ValueError(f"Representation shape mismatch: {left}={a.shape}, {right}={b.shape}")
+        a_norm = float(np.linalg.norm(a))
+        b_norm = float(np.linalg.norm(b))
+        denom = max(a_norm * b_norm, 1.0e-12)
+        cosine = float(np.dot(a, b) / denom)
+        relative_l2 = float(np.linalg.norm(a - b) / max(0.5 * (a_norm + b_norm), 1.0e-12))
+        pairs.append({
+            "left": left,
+            "right": right,
+            "cosine": cosine,
+            "relative_l2": relative_l2,
+        })
+    return {
+        "pairs": pairs,
+        "cosine_mean": float(np.mean([p["cosine"] for p in pairs])) if pairs else 1.0,
+        "relative_l2_mean": (
+            float(np.mean([p["relative_l2"] for p in pairs])) if pairs else 0.0
+        ),
+    }
