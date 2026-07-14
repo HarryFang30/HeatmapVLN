@@ -191,6 +191,7 @@ def _get_trainable_params(model: nn.Module) -> list[torch.nn.Parameter]:
 # ---------------------------------------------------------------------------
 
 _L2_SP_MODULE_PREFIXES = {
+    "pano_latent_adapter": ("pano_latent_adapter.",),
     "cond_projector": ("nextdit_action_head.cond_projector.",),
     "memory_encoder": ("nextdit_action_head.memory_encoder.",),
     "rgb_resampler": ("nextdit_action_head.rgb_resampler.",),
@@ -239,12 +240,12 @@ def build_l2_sp_reference(
     *,
     logger: logging.Logger | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Snapshot trainable System1 parameters for L2-SP regularization.
+    """Snapshot selected trainable parameters for L2-SP regularization.
 
     Only parameters that are both currently trainable and included in
-    ``loss.l2_sp.modules`` are captured.  In the default Stage3 adapter-only
-    plan this intentionally returns an empty dict, because no System1 parameter
-    should receive gradients.
+    ``loss.l2_sp.modules`` are captured.  Stage3 can therefore anchor its
+    trainable pano adapter to the loaded Stage2 checkpoint without unfreezing
+    any InternNav System1 parameter.
     """
     if not _l2_sp_enabled(cfg):
         return {}
@@ -262,14 +263,14 @@ def build_l2_sp_reference(
     if logger is not None:
         if reference:
             logger.info(
-                "  L2-SP enabled: tracking %d tensors / %s System1 params",
+                "  L2-SP enabled: tracking %d tensors / %s params",
                 len(reference),
                 f"{numel:,}",
             )
         else:
             logger.info(
-                "  L2-SP enabled but no trainable System1 params matched "
-                "loss.l2_sp.modules; regularization is inactive for adapter-only stage3"
+                "  L2-SP enabled but no trainable params matched loss.l2_sp.modules; "
+                "regularization is inactive"
             )
     return reference
 
@@ -279,12 +280,24 @@ def compute_l2_sp_loss(
     reference: dict[str, torch.Tensor] | None,
     *,
     device: torch.device,
+    normalization: str = "mean_parameter_mse",
 ) -> torch.Tensor:
-    """Return mean squared drift from the L2-SP reference."""
+    """Return parameter drift from the L2-SP reference.
+
+    ``relative_l2`` returns ``||theta-theta0||^2 / ||theta0||^2``.  This is
+    scale-independent and makes the configured weight meaningful for a large
+    adapter.  ``mean_parameter_mse`` preserves the historical behavior.
+    """
     if not reference:
         return torch.zeros((), device=device)
+    if normalization not in {"mean_parameter_mse", "relative_l2"}:
+        raise ValueError(
+            "loss.l2_sp.normalization must be mean_parameter_mse or relative_l2, "
+            f"got {normalization!r}"
+        )
 
     total = torch.zeros((), device=device, dtype=torch.float32)
+    reference_total = torch.zeros((), device=device, dtype=torch.float32)
     count = 0
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -298,12 +311,17 @@ def compute_l2_sp_loss(
                 f"L2-SP reference shape mismatch for {norm_name}: "
                 f"ref={tuple(ref.shape)} current={tuple(param.shape)}"
             )
-        diff = param.float() - ref.to(device=param.device, dtype=torch.float32)
+        ref_device = ref.to(device=param.device, dtype=torch.float32)
+        diff = param.float() - ref_device
         total = total + diff.pow(2).sum()
+        if normalization == "relative_l2":
+            reference_total = reference_total + ref_device.pow(2).sum()
         count += param.numel()
 
     if count == 0:
         return torch.zeros((), device=device)
+    if normalization == "relative_l2":
+        return total / reference_total.clamp_min(torch.finfo(torch.float32).eps)
     return total / float(count)
 
 

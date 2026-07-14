@@ -884,6 +884,17 @@ def main():
         )
     else:
         l2_sp_reference = build_l2_sp_reference(raw_model, cfg, logger=logger)
+    stage3_l2_cfg = cfg.get('loss', {}).get('l2_sp', {})
+    if (
+        stage_name == 'stage3'
+        and bool(stage3_l2_cfg.get('enabled', False))
+        and float(stage3_l2_cfg.get('weight', 0.0) or 0.0) > 0.0
+        and not l2_sp_reference
+    ):
+        raise RuntimeError(
+            'Stage3 L2-SP is enabled but no trainable parameters matched its '
+            'reference. Include pano_latent_adapter in loss.l2_sp.modules.'
+        )
 
     # 构建优化器和调度器
     optimizer = build_optimizer(raw_model, cfg, stage_cfg)

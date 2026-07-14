@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import re
 import time
 from pathlib import Path
@@ -51,6 +52,96 @@ from .visualization import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_trajectory_sequence_inputs(
+    gt_trajectory: torch.Tensor,
+    trajectory_valid: torch.Tensor | None,
+    traj_images: torch.Tensor | None,
+    *,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Select the System1 supervision layout used by the current stage.
+
+    Closed-loop evaluation predicts one trajectory from the goal-freeze
+    lookdown frame, with that frame in both the anchor and current slots.
+    ``first_only`` reproduces that layout and avoids repeating one initial
+    pano-goal latent against later egocentric trajectory targets.
+    """
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode == "all":
+        return gt_trajectory, trajectory_valid, traj_images
+    if normalized_mode != "first_only":
+        raise ValueError(
+            "training stage trajectory_sequence_mode must be all or first_only, "
+            f"got {mode!r}"
+        )
+
+    if gt_trajectory.ndim == 3:
+        return gt_trajectory, trajectory_valid, traj_images
+    if gt_trajectory.ndim != 4:
+        raise RuntimeError(
+            "first_only trajectory supervision expects [B,N,T,D], got "
+            f"{tuple(gt_trajectory.shape)}"
+        )
+    if traj_images is None or traj_images.ndim != 5:
+        raise RuntimeError(
+            "first_only trajectory supervision requires traj_images [B,N,H,W,C]"
+        )
+    if gt_trajectory.shape[:2] != traj_images.shape[:2]:
+        raise RuntimeError(
+            "trajectory/traj_images sequence shape mismatch: "
+            f"trajectory={tuple(gt_trajectory.shape)} images={tuple(traj_images.shape)}"
+        )
+
+    first_image = traj_images[:, 0]
+    eval_matched_pair = torch.stack([first_image, first_image], dim=1)
+    first_valid = trajectory_valid
+    if trajectory_valid is not None:
+        if trajectory_valid.ndim != 2:
+            raise RuntimeError(
+                "first_only trajectory_valid must be [B,N], got "
+                f"{tuple(trajectory_valid.shape)}"
+            )
+        first_valid = trajectory_valid[:, 0]
+    return gt_trajectory[:, 0], first_valid, eval_matched_pair
+
+
+def _trajectory_view_sample_weights(
+    view_ids,
+    cfg: dict,
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Build finite positive per-sample weights for panoramic goal views."""
+    if not bool(cfg.get("enabled", False)):
+        return None
+    if view_ids is None:
+        raise RuntimeError(
+            "trajectory_view_weights is enabled but the batch has no pano_view_id"
+        )
+
+    configured = cfg.get("weights") or {}
+    allowed = {"front", "right", "back", "left"}
+    unknown = sorted(set(configured) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown trajectory view weights: {unknown}")
+
+    values: list[float] = []
+    for raw_view in view_ids:
+        view = str(raw_view).lower()
+        if view not in allowed:
+            raise RuntimeError(
+                "trajectory_view_weights requires pixel-goal views, got "
+                f"{raw_view!r}"
+            )
+        value = float(configured.get(view, 1.0))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"trajectory view weight for {view!r} must be finite and > 0, got {value}"
+            )
+        values.append(value)
+    return torch.tensor(values, device=device, dtype=torch.float32)
 
 
 def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, logger) -> None:
@@ -191,6 +282,13 @@ def train_one_epoch(
         if bool(l2_sp_cfg.get('enabled', False))
         else 0.0
     )
+    l2_sp_normalization = str(
+        l2_sp_cfg.get('normalization', 'mean_parameter_mse')
+    )
+    trajectory_sequence_mode = str(
+        (stage_cfg or {}).get('trajectory_sequence_mode', 'all')
+    )
+    trajectory_view_weights_cfg = loss_cfg.get('trajectory_view_weights', {})
 
     train_history = stage_cfg.get('train_history', True)
     train_future = stage_cfg.get('train_future', False)
@@ -199,6 +297,23 @@ def train_one_epoch(
     need_heatmap_targets = train_history or train_future
 
     device = dist_context.device
+    l2_sp_device_reference = None
+    if l2_sp_weight > 0.0 and l2_sp_reference:
+        l2_sp_device_reference = {
+            name: value.to(device=device, dtype=torch.float32)
+            for name, value in l2_sp_reference.items()
+        }
+
+    if dist_context.is_main:
+        logger.info(
+            "  Trajectory supervision: sequence_mode=%s view_weights=%s",
+            trajectory_sequence_mode,
+            (
+                trajectory_view_weights_cfg.get('weights', {})
+                if trajectory_view_weights_cfg.get('enabled', False)
+                else "disabled"
+            ),
+        )
 
     hm_loss_fn = build_heatmap_loss_fn(cfg, device)
     hm_loss_fn.set_temperature(
@@ -412,6 +527,33 @@ def train_one_epoch(
                     traj_images = batch.get('traj_images')
                     if traj_images is not None:
                         traj_images = traj_images.to(device, non_blocking=True)
+                    gt_trajectory, trajectory_valid, traj_images = (
+                        _prepare_trajectory_sequence_inputs(
+                            gt_trajectory,
+                            trajectory_valid,
+                            traj_images,
+                            mode=trajectory_sequence_mode,
+                        )
+                    )
+                    view_weights = _trajectory_view_sample_weights(
+                        batch.get('pano_view_id'),
+                        trajectory_view_weights_cfg,
+                        device=device,
+                    )
+                    if view_weights is not None:
+                        if trajectory_valid is None:
+                            trajectory_valid = view_weights
+                        elif trajectory_valid.ndim == 1:
+                            trajectory_valid = trajectory_valid.float() * view_weights
+                        elif trajectory_valid.ndim == 2:
+                            trajectory_valid = (
+                                trajectory_valid.float() * view_weights.unsqueeze(1)
+                            )
+                        else:
+                            raise RuntimeError(
+                                "Unsupported trajectory_valid shape for view weighting: "
+                                f"{tuple(trajectory_valid.shape)}"
+                            )
                     traj_hidden_states = model_module.adapt_traj_hidden_states(
                         output['traj_hidden_states']
                     )
@@ -436,8 +578,9 @@ def train_one_epoch(
             if l2_sp_weight > 0.0 and l2_sp_reference:
                 l2_sp_loss = compute_l2_sp_loss(
                     model_module,
-                    l2_sp_reference,
+                    l2_sp_device_reference,
                     device=device,
+                    normalization=l2_sp_normalization,
                 )
 
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)

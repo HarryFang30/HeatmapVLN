@@ -103,6 +103,12 @@ export STAGE3_GRAD_ACCUM_STEPS="${STAGE3_GRAD_ACCUM_STEPS:-}"
 export STAGE3_PANO_ADAPTER_LR="${STAGE3_PANO_ADAPTER_LR:-}"
 export STAGE3_L2_SP_ENABLED="${STAGE3_L2_SP_ENABLED:-}"
 export STAGE3_L2_SP_WEIGHT="${STAGE3_L2_SP_WEIGHT:-}"
+export STAGE3_L2_SP_NORMALIZATION="${STAGE3_L2_SP_NORMALIZATION:-}"
+export STAGE3_TRAJECTORY_SEQUENCE_MODE="${STAGE3_TRAJECTORY_SEQUENCE_MODE:-}"
+export STAGE3_VIEW_WEIGHT_FRONT="${STAGE3_VIEW_WEIGHT_FRONT:-}"
+export STAGE3_VIEW_WEIGHT_RIGHT="${STAGE3_VIEW_WEIGHT_RIGHT:-}"
+export STAGE3_VIEW_WEIGHT_BACK="${STAGE3_VIEW_WEIGHT_BACK:-}"
+export STAGE3_VIEW_WEIGHT_LEFT="${STAGE3_VIEW_WEIGHT_LEFT:-}"
 export STAGE3_NUM_WORKERS="${STAGE3_NUM_WORKERS:-16}"
 export STAGE3_PREFETCH_FACTOR="${STAGE3_PREFETCH_FACTOR:-4}"
 export STAGE3_PIN_MEMORY="${STAGE3_PIN_MEMORY:-1}"
@@ -201,6 +207,11 @@ def set_bool(section, key, env_name):
     else:
         raise RuntimeError(f"{env_name} must be boolean-like, got {value!r}")
 
+def set_str(section, key, env_name):
+    value = os.environ.get(env_name)
+    if value is not None and str(value).strip() != "":
+        section[key] = str(value).strip()
+
 paths = cfg.setdefault("paths", {})
 paths["dataset_root"] = os.environ["PANORAMIC_DATA_ROOT"]
 paths["log_out_dir"] = os.environ["STAGE3_OUT_DIR"]
@@ -243,14 +254,40 @@ loss = cfg.setdefault("loss", {})
 l2_sp = loss.setdefault("l2_sp", {})
 set_bool(l2_sp, "enabled", "STAGE3_L2_SP_ENABLED")
 set_float(l2_sp, "weight", "STAGE3_L2_SP_WEIGHT")
+set_str(l2_sp, "normalization", "STAGE3_L2_SP_NORMALIZATION")
+view_weights_cfg = loss.setdefault("trajectory_view_weights", {})
+view_weights = view_weights_cfg.setdefault("weights", {})
+set_float(view_weights, "front", "STAGE3_VIEW_WEIGHT_FRONT")
+set_float(view_weights, "right", "STAGE3_VIEW_WEIGHT_RIGHT")
+set_float(view_weights, "back", "STAGE3_VIEW_WEIGHT_BACK")
+set_float(view_weights, "left", "STAGE3_VIEW_WEIGHT_LEFT")
 
 stages = cfg.setdefault("training", {}).setdefault("stages", [])
 if not stages:
     raise RuntimeError("training.stages is empty")
 set_bool(stages[0], "merge_frozen_lora", "STAGE3_MERGE_FROZEN_LORA")
+set_str(stages[0], "trajectory_sequence_mode", "STAGE3_TRAJECTORY_SEQUENCE_MODE")
 epochs = os.environ.get("STAGE3_EPOCHS")
 if epochs is not None and epochs.strip():
     stages[0]["epochs"] = int(epochs)
+
+sequence_mode = str(stages[0].get("trajectory_sequence_mode", "all"))
+if sequence_mode not in {"all", "first_only"}:
+    raise RuntimeError(
+        "Stage3 trajectory_sequence_mode must be all or first_only, got "
+        f"{sequence_mode!r}"
+    )
+if bool(l2_sp.get("enabled", False)) and float(l2_sp.get("weight", 0.0) or 0.0) > 0.0:
+    if "pano_latent_adapter" not in set(l2_sp.get("modules") or []):
+        raise RuntimeError(
+            "Stage3 L2-SP must include pano_latent_adapter; otherwise the "
+            "adapter-only training has no regularized parameter"
+        )
+    if str(l2_sp.get("normalization", "mean_parameter_mse")) not in {
+        "mean_parameter_mse",
+        "relative_l2",
+    }:
+        raise RuntimeError("Unsupported Stage3 L2-SP normalization")
 
 log = cfg.setdefault("log", {})
 set_bool(log, "enable_timing", "STAGE3_ENABLE_TIMING")
@@ -276,6 +313,15 @@ echo "[launcher] base=$STAGE3_BASE_CKPT"
 echo "[launcher] adapter=$STAGE3_ADAPTER_CKPT"
 echo "[launcher] out=$STAGE3_OUT_DIR"
 echo "[launcher] trajectory_target_convention=internnav_habitat (x=forward, y=left, yaw=left-positive)"
+effective_sequence_mode="$(python - "$TMP_CONFIG" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+print(cfg["training"]["stages"][0].get("trajectory_sequence_mode", "all"))
+PY
+)"
+echo "[launcher] trajectory_sequence_mode=$effective_sequence_mode"
 echo "[launcher] gpus=$GPU_DEVICES nproc=$NPROC_PER_NODE"
 
 train_args=(--config "$TMP_CONFIG" --load-weights "$STAGE3_BASE_CKPT")

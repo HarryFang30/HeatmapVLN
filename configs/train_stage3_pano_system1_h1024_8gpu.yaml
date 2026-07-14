@@ -154,6 +154,10 @@ training:
       train_heatmap: false
       train_history: false
       train_action: true
+      # Closed-loop System1 receives one goal-freeze lookdown pair.  Repeating
+      # the same initial pano latent over later frames gives contradictory
+      # egocentric targets, especially for side/back goals.
+      trajectory_sequence_mode: first_only
       train_lm: false
       teacher_force_system2_answer: true
       system2_sft_protocol: direct
@@ -217,16 +221,24 @@ loss:
   heatmap_weight: 0.0
   trajectory_weight: 1.0
   lm_weight: 0.0
+  # Approximate capped sqrt-inverse-frequency weights.  They give rare
+  # side/back goals useful gradient mass without letting a handful of back
+  # samples dominate an epoch.
+  trajectory_view_weights:
+    enabled: true
+    weights:
+      front: 1.0
+      right: 2.0
+      back: 16.0
+      left: 3.0
   l2_sp:
     enabled: true
-    weight: 1.0e-4
+    # Relative squared L2 drift from the loaded Stage2 adapter.  The previous
+    # 1e-4 mean-MSE setting matched no trainable parameter and was inactive.
+    weight: 5.0
+    normalization: relative_l2
     modules:
-      - cond_projector
-      - memory_encoder
-      - rgb_resampler
-      - traj_dit
-      - action_encoder
-      - action_decoder
+      - pano_latent_adapter
 
 gpu:
   devices: [0, 1, 2, 3, 4, 5, 6, 7]
