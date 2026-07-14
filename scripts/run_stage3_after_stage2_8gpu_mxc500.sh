@@ -30,9 +30,9 @@ export STAGE2_ADAPTER_FINAL_EPOCH="${STAGE2_ADAPTER_FINAL_EPOCH:-3}"
 printf -v STAGE2_FINAL_CHECKPOINT_NAME 'epoch_%03d.pth' "$STAGE2_ADAPTER_FINAL_EPOCH"
 export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-${STAGE2_ADAPTER_OUT_DIR}/${STAGE2_FINAL_CHECKPOINT_NAME}}"
 
-export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
-export LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_8gpu_mxc500.log}"
+export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix}"
+export LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix_8gpu_mxc500.log}"
 
 # Batch/runtime settings passed the four-GPU 100-step smoke; the corrected
 # InternNav targets additionally passed a four-GPU real training preflight.
@@ -41,7 +41,13 @@ export STAGE3_BATCH_SIZE=8
 export STAGE3_GRAD_ACCUM_STEPS=1
 export STAGE3_PANO_ADAPTER_LR=5e-5
 export STAGE3_L2_SP_ENABLED=1
-export STAGE3_L2_SP_WEIGHT=1e-4
+export STAGE3_L2_SP_WEIGHT=5.0
+export STAGE3_L2_SP_NORMALIZATION=relative_l2
+export STAGE3_TRAJECTORY_SEQUENCE_MODE=first_only
+export STAGE3_VIEW_WEIGHT_FRONT=1.0
+export STAGE3_VIEW_WEIGHT_RIGHT=2.0
+export STAGE3_VIEW_WEIGHT_BACK=16.0
+export STAGE3_VIEW_WEIGHT_LEFT=3.0
 
 export STAGE3_NUM_WORKERS=16
 export STAGE3_PREFETCH_FACTOR=4

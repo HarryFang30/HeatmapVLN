@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 from scripts.training.train_loop import (
     _prepare_trajectory_sequence_inputs,
     _trajectory_view_sample_weights,
 )
 from scripts.training.utils import build_l2_sp_reference, compute_l2_sp_loss
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _AdapterOnlyModel(torch.nn.Module):
@@ -99,3 +105,36 @@ def test_invalid_l2_sp_normalization_fails_closed() -> None:
             device=torch.device("cpu"),
             normalization="silent_noop",
         )
+
+
+def test_formal_wrapper_cannot_override_prior_fix_with_legacy_values() -> None:
+    config = yaml.safe_load(
+        (_REPO_ROOT / "configs/train_stage3_pano_system1_h1024_8gpu.yaml").read_text()
+    )
+    wrapper = (
+        _REPO_ROOT / "scripts/run_stage3_after_stage2_8gpu_mxc500.sh"
+    ).read_text()
+
+    stage = config["training"]["stages"][0]
+    l2_sp = config["loss"]["l2_sp"]
+    view_weights = config["loss"]["trajectory_view_weights"]["weights"]
+
+    assert stage["trajectory_sequence_mode"] == "first_only"
+    assert l2_sp["weight"] == 5.0
+    assert l2_sp["normalization"] == "relative_l2"
+    assert view_weights == {"front": 1.0, "right": 2.0, "back": 16.0, "left": 3.0}
+
+    expected_exports = {
+        "STAGE3_L2_SP_WEIGHT": "5.0",
+        "STAGE3_L2_SP_NORMALIZATION": "relative_l2",
+        "STAGE3_TRAJECTORY_SEQUENCE_MODE": "first_only",
+        "STAGE3_VIEW_WEIGHT_FRONT": "1.0",
+        "STAGE3_VIEW_WEIGHT_RIGHT": "2.0",
+        "STAGE3_VIEW_WEIGHT_BACK": "16.0",
+        "STAGE3_VIEW_WEIGHT_LEFT": "3.0",
+    }
+    for name, value in expected_exports.items():
+        assert f"export {name}={value}" in wrapper
+
+    assert "STAGE3_L2_SP_WEIGHT=1e-4" not in wrapper
+    assert "internnavcoords_priorfix" in wrapper

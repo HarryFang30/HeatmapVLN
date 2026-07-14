@@ -313,15 +313,35 @@ echo "[launcher] base=$STAGE3_BASE_CKPT"
 echo "[launcher] adapter=$STAGE3_ADAPTER_CKPT"
 echo "[launcher] out=$STAGE3_OUT_DIR"
 echo "[launcher] trajectory_target_convention=internnav_habitat (x=forward, y=left, yaw=left-positive)"
-effective_sequence_mode="$(python - "$TMP_CONFIG" <<'PY'
+python - "$TMP_CONFIG" <<'PY'
 import sys
 import yaml
 with open(sys.argv[1], encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
-print(cfg["training"]["stages"][0].get("trajectory_sequence_mode", "all"))
+stage = cfg["training"]["stages"][0]
+l2_sp = cfg.get("loss", {}).get("l2_sp", {})
+view_weights = cfg.get("loss", {}).get("trajectory_view_weights", {})
+print(
+    "[launcher] trajectory_sequence_mode="
+    f"{stage.get('trajectory_sequence_mode', 'all')}"
+)
+print(
+    "[launcher] l2_sp="
+    f"enabled:{bool(l2_sp.get('enabled', False))} "
+    f"weight:{float(l2_sp.get('weight', 0.0) or 0.0):g} "
+    f"normalization:{l2_sp.get('normalization', 'mean_parameter_mse')} "
+    f"modules:{','.join(l2_sp.get('modules') or [])}"
+)
+weights = view_weights.get("weights") or {}
+print(
+    "[launcher] trajectory_view_weights="
+    f"enabled:{bool(view_weights.get('enabled', False))} "
+    f"front:{float(weights.get('front', 1.0)):g} "
+    f"right:{float(weights.get('right', 1.0)):g} "
+    f"back:{float(weights.get('back', 1.0)):g} "
+    f"left:{float(weights.get('left', 1.0)):g}"
+)
 PY
-)"
-echo "[launcher] trajectory_sequence_mode=$effective_sequence_mode"
 echo "[launcher] gpus=$GPU_DEVICES nproc=$NPROC_PER_NODE"
 
 train_args=(--config "$TMP_CONFIG" --load-weights "$STAGE3_BASE_CKPT")
