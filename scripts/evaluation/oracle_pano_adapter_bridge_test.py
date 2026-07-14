@@ -429,10 +429,83 @@ def _generated_branch_goal(llm_output: str, image_size: tuple[int, int]) -> tupl
     return _parse_pano_view_id(llm_output) or "front", pixel_goal
 
 
-def _choose_indices(dataset, num_samples: int, seed: int) -> list[int]:
+def _peek_pano_goal(dataset, idx: int) -> tuple[str, list[int]] | None:
+    if all(
+        hasattr(dataset, name)
+        for name in (
+            "sample_index",
+            "clips",
+            "_load_meta",
+            "_resolve_farthest_pano_pixel_goal",
+        )
+    ):
+        clip_idx, current_t = dataset.sample_index[idx]
+        clip_dir = dataset.clips[clip_idx]
+        meta = dataset._load_meta(clip_idx)
+        result = dataset._resolve_farthest_pano_pixel_goal(
+            clip_idx=clip_idx,
+            clip_dir=clip_dir,
+            current_t=current_t,
+            num_frames=int(meta["num_frames"]),
+            img_size=dataset.image_size,
+        )
+        if result is None:
+            return None
+        _goal_len, view_id, pixel_goal, _legacy_uv = result
+        return str(view_id).lower(), [int(pixel_goal[0]), int(pixel_goal[1])]
+
+    sample = dataset[idx]
+    view_id = str(sample.get("pano_view_id") or "").lower()
+    pixel_goal = sample.get("pano_pixel_goal")
+    if view_id not in VALID_PANO_VIEWS or pixel_goal is None:
+        return None
+    return view_id, [int(pixel_goal[0]), int(pixel_goal[1])]
+
+
+def _choose_indices(
+    dataset,
+    num_samples: int,
+    seed: int,
+    *,
+    stratify_views: bool = False,
+) -> list[int]:
     rng = random.Random(seed)
     indices = list(range(len(dataset)))
     rng.shuffle(indices)
+    if stratify_views:
+        base, remainder = divmod(num_samples, len(COUNTERFACTUAL_VIEWS))
+        quotas = {
+            view: base + int(position < remainder)
+            for position, view in enumerate(COUNTERFACTUAL_VIEWS)
+        }
+        buckets: dict[str, list[int]] = {view: [] for view in COUNTERFACTUAL_VIEWS}
+        eligible: list[int] = []
+        for idx in indices:
+            goal = _peek_pano_goal(dataset, idx)
+            if goal is None:
+                continue
+            view_id, _pixel_goal = goal
+            if view_id not in buckets:
+                continue
+            eligible.append(idx)
+            if len(buckets[view_id]) < quotas[view_id]:
+                buckets[view_id].append(idx)
+            if all(len(buckets[view]) >= quotas[view] for view in COUNTERFACTUAL_VIEWS):
+                break
+
+        chosen = [idx for view in COUNTERFACTUAL_VIEWS for idx in buckets[view]]
+        if len(chosen) < num_samples:
+            chosen_set = set(chosen)
+            chosen.extend(idx for idx in eligible if idx not in chosen_set)
+            chosen = chosen[:num_samples]
+        LOGGER.info(
+            "Counterfactual source-view selection: requested=%d selected=%d buckets=%s",
+            num_samples,
+            len(chosen),
+            {view: len(buckets[view]) for view in COUNTERFACTUAL_VIEWS},
+        )
+        return chosen
+
     chosen: list[int] = []
     for idx in indices:
         sample = dataset[idx]
@@ -446,6 +519,28 @@ def _choose_indices(dataset, num_samples: int, seed: int) -> list[int]:
         if len(chosen) >= num_samples:
             break
     return chosen
+
+
+def _ground_truth_direction(
+    sample: dict[str, Any],
+    *,
+    view_id: str,
+    action_scale: float,
+) -> dict[str, Any] | None:
+    trajectory = sample.get("trajectory")
+    if trajectory is None:
+        return None
+    if torch.is_tensor(trajectory):
+        trajectory_np = trajectory.detach().float().cpu().numpy()
+    else:
+        trajectory_np = np.asarray(trajectory, dtype=np.float32)
+    if trajectory_np.ndim != 2 or trajectory_np.shape[-1] < 2:
+        return None
+    return summarize_direction_response(
+        trajectory_np[None, ...],
+        view_id=view_id,
+        action_scale=action_scale,
+    )
 
 
 def _run_counterfactual_sample(
@@ -535,6 +630,11 @@ def _run_counterfactual_sample(
         "student_text": student_text,
         "prompt_len": prompt_len,
         "trajectory_seed": shared_seed,
+        "ground_truth_direction": _ground_truth_direction(
+            sample,
+            view_id=str(sample.get("pano_view_id") or "").lower(),
+            action_scale=action_scale,
+        ),
         "representations": {
             "raw": pairwise_representation_stats(raw_representations),
             "conditioned": pairwise_representation_stats(conditioned_representations),
@@ -595,12 +695,39 @@ def _summarize_counterfactual(
             "pairwise_relative_l2_max": float(np.max(relative_l2)),
         }
 
+    source_view_summary: dict[str, Any] = {}
+    for view_id in COUNTERFACTUAL_VIEWS:
+        matching = [rec for rec in records if rec["source_view"] == view_id]
+        if not matching:
+            source_view_summary[view_id] = {"count": 0}
+            continue
+        gt_errors = [
+            float(rec["ground_truth_direction"]["mean_endpoint_angle_error_deg"])
+            for rec in matching
+            if rec.get("ground_truth_direction") is not None
+        ]
+        predicted_errors = [
+            float(rec["views"][view_id]["direction"]["mean_endpoint_angle_error_deg"])
+            for rec in matching
+        ]
+        source_view_summary[view_id] = {
+            "count": len(matching),
+            "gt_endpoint_angle_error_deg_mean": (
+                float(np.mean(gt_errors)) if gt_errors else None
+            ),
+            "predicted_endpoint_angle_error_deg_mean": float(np.mean(predicted_errors)),
+            "predicted_within_45_rate": float(
+                np.mean(np.asarray(predicted_errors) <= 45.0)
+            ),
+        }
+
     return {
         "mode": "counterfactual_all_views",
         "num_samples": len(records),
         "adapter_checkpoint": str(adapter_checkpoint),
         "views": views,
         "representations": representation_summary,
+        "matching_source_views": source_view_summary,
         "output": str(output),
     }
 
@@ -640,7 +767,12 @@ def main() -> int:
         args.split,
         max_clips=args.dataset_max_clips,
     )
-    indices = _choose_indices(dataset, args.num_samples, args.seed)
+    indices = _choose_indices(
+        dataset,
+        args.num_samples,
+        args.seed,
+        stratify_views=args.counterfactual_all_views,
+    )
     if not indices:
         raise RuntimeError("No pixel pano samples found for oracle bridge test")
 
