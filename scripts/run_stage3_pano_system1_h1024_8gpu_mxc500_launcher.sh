@@ -299,7 +299,7 @@ set_int(log, "tensorboard_interval", "STAGE3_TENSORBOARD_INTERVAL")
 visible_device_count = len([x for x in os.environ["GPU_DEVICES"].split(",") if x.strip()])
 gpu = cfg.setdefault("gpu", {})
 gpu["devices"] = list(range(visible_device_count))
-gpu.setdefault("multi_gpu", {})["enabled"] = True
+gpu.setdefault("multi_gpu", {})["enabled"] = visible_device_count > 1
 
 with open(output_config, "w", encoding="utf-8") as f:
     yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
