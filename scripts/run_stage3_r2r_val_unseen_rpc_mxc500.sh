@@ -45,6 +45,10 @@ export STAGE3_EVAL_TRAJECTORY_X_SIGN="${STAGE3_EVAL_TRAJECTORY_X_SIGN:-1}"
 export STAGE3_EVAL_SYSTEM1_COORD_ORDER="${STAGE3_EVAL_SYSTEM1_COORD_ORDER:-generated}"
 export STAGE3_EVAL_AUTO_STOP_DISTANCE="${STAGE3_EVAL_AUTO_STOP_DISTANCE:-0.0}"
 export STAGE3_EVAL_ORACLE_SYSTEM2="${STAGE3_EVAL_ORACLE_SYSTEM2:-0}"
+export STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY="${STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY:-farthest_visible}"
+export STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M="${STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M:-2.0}"
+export STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M="${STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M:-0.5}"
+export STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M="${STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M:-6.0}"
 export STAGE3_EVAL_ALLOW_PRIVILEGED="${STAGE3_EVAL_ALLOW_PRIVILEGED:-0}"
 export STAGE3_EVAL_RESUME="${STAGE3_EVAL_RESUME:-1}"
 export STAGE3_EVAL_OVERWRITE="${STAGE3_EVAL_OVERWRITE:-0}"
@@ -139,6 +143,26 @@ case "$STAGE3_EVAL_TRAJECTORY_X_SIGN" in
     exit 1
     ;;
 esac
+case "$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY" in
+  farthest_visible|lookahead) ;;
+  *)
+    echo "STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY must be farthest_visible or lookahead" >&2
+    exit 1
+    ;;
+esac
+"$QWEN25_PYTHON" - \
+  "$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M" \
+  "$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M" \
+  "$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M" <<'PY'
+import math
+import sys
+
+names = ("lookahead_m", "min_ahead_m", "max_side_dist_m")
+for name, raw in zip(names, sys.argv[1:]):
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise SystemExit(f"Oracle System2 {name} must be finite and > 0, got {raw!r}")
+PY
 
 privileged_requested="$($QWEN25_PYTHON - "$STAGE3_EVAL_AUTO_STOP_DISTANCE" <<'PY'
 import sys
@@ -247,6 +271,7 @@ echo "[stage3-eval] rpc=$RPC_SERVER_ADDR rpc_root=$RPC_ROOT"
 echo "[stage3-eval] model_gpu=$STAGE3_EVAL_MODEL_GPU display=$STAGE3_EVAL_DISPLAY"
 echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
+echo "[stage3-eval] oracle_strategy=$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY lookahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M min_ahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M max_side_dist_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"
 echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN"
 
 if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
@@ -351,6 +376,10 @@ manifest = {
     "rpc_protocol": "heatmapvln-r2r-json-v1",
     "auto_stop_distance": float(os.environ["STAGE3_EVAL_AUTO_STOP_DISTANCE"]),
     "oracle_system2": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2"].lower() in {"1", "true", "yes", "on"},
+    "oracle_system2_strategy": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY"],
+    "oracle_system2_lookahead_m": float(os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M"]),
+    "oracle_system2_min_ahead_m": float(os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M"]),
+    "oracle_system2_max_side_dist_m": float(os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"]),
     "trajectory_selection": os.environ["STAGE3_EVAL_TRAJECTORY_SELECTION"],
     "trajectory_x_sign": float(os.environ["STAGE3_EVAL_TRAJECTORY_X_SIGN"]),
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
@@ -392,7 +421,13 @@ if is_true "$STAGE3_EVAL_OVERWRITE"; then
   client_args+=(--overwrite_output)
 fi
 if is_true "$STAGE3_EVAL_ORACLE_SYSTEM2"; then
-  client_args+=(--oracle_system2)
+  client_args+=(
+    --oracle_system2
+    --oracle_system2_strategy "$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY"
+    --oracle_system2_lookahead_m "$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M"
+    --oracle_system2_min_ahead_m "$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M"
+    --oracle_system2_max_side_dist_m "$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"
+  )
 fi
 if is_true "$STAGE3_EVAL_SAVE_TRAJECTORY_STEPS"; then
   client_args+=(--save_trajectory_steps)
