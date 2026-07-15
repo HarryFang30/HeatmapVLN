@@ -39,6 +39,22 @@ export STAGE3_EVAL_MAX_EPISODES="${STAGE3_EVAL_MAX_EPISODES:-}"
 export STAGE3_EVAL_EPISODE_LIST="${STAGE3_EVAL_EPISODE_LIST:-}"
 export STAGE3_EVAL_MAX_STEPS="${STAGE3_EVAL_MAX_STEPS:-500}"
 export STAGE3_EVAL_MAX_SYSTEM2_CALLS="${STAGE3_EVAL_MAX_SYSTEM2_CALLS:-0}"
+export STAGE3_EVAL_ACTION_CHUNK_SIZE="${STAGE3_EVAL_ACTION_CHUNK_SIZE:-4}"
+export STAGE3_EVAL_STOP_CONFIRMATIONS="${STAGE3_EVAL_STOP_CONFIRMATIONS:-1}"
+export STAGE3_EVAL_STOP_PROBE_TURN="${STAGE3_EVAL_STOP_PROBE_TURN:-left}"
+export STAGE3_EVAL_CLOSED_LOOP_GUARD="${STAGE3_EVAL_CLOSED_LOOP_GUARD:-0}"
+export STAGE3_EVAL_COLLISION_EPSILON_M="${STAGE3_EVAL_COLLISION_EPSILON_M:-0.03}"
+export STAGE3_EVAL_COLLISION_FORWARD_LIMIT="${STAGE3_EVAL_COLLISION_FORWARD_LIMIT:-3}"
+export STAGE3_EVAL_MOTION_WINDOW_STEPS="${STAGE3_EVAL_MOTION_WINDOW_STEPS:-32}"
+export STAGE3_EVAL_MOTION_MIN_PATH_M="${STAGE3_EVAL_MOTION_MIN_PATH_M:-2.0}"
+export STAGE3_EVAL_MOTION_MAX_NET_M="${STAGE3_EVAL_MOTION_MAX_NET_M:-0.75}"
+export STAGE3_EVAL_PLAN_WINDOW_CALLS="${STAGE3_EVAL_PLAN_WINDOW_CALLS:-20}"
+export STAGE3_EVAL_PLAN_VIEW_DOMINANCE="${STAGE3_EVAL_PLAN_VIEW_DOMINANCE:-0.9}"
+export STAGE3_EVAL_PLAN_MIN_PATH_M="${STAGE3_EVAL_PLAN_MIN_PATH_M:-3.0}"
+export STAGE3_EVAL_PLAN_MAX_NET_M="${STAGE3_EVAL_PLAN_MAX_NET_M:-1.5}"
+export STAGE3_EVAL_RECOVERY_TURNS="${STAGE3_EVAL_RECOVERY_TURNS:-3}"
+export STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS="${STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS:-12}"
+export STAGE3_EVAL_RECOVERY_HISTORY_KEEP="${STAGE3_EVAL_RECOVERY_HISTORY_KEEP:-2}"
 export STAGE3_EVAL_NUM_HISTORY="${STAGE3_EVAL_NUM_HISTORY:-8}"
 export STAGE3_EVAL_TRAJECTORY_SELECTION="${STAGE3_EVAL_TRAJECTORY_SELECTION:-mean}"
 # Corrected Stage3 checkpoints already emit native InternNav coordinates.
@@ -180,6 +196,70 @@ for name, raw in zip(names, sys.argv[1:]):
     if not math.isfinite(value) or value <= 0.0:
         raise SystemExit(f"Oracle System2 {name} must be finite and > 0, got {raw!r}")
 PY
+"$QWEN25_PYTHON" - \
+  "$STAGE3_EVAL_ACTION_CHUNK_SIZE" \
+  "$STAGE3_EVAL_STOP_CONFIRMATIONS" \
+  "$STAGE3_EVAL_COLLISION_EPSILON_M" \
+  "$STAGE3_EVAL_COLLISION_FORWARD_LIMIT" \
+  "$STAGE3_EVAL_MOTION_WINDOW_STEPS" \
+  "$STAGE3_EVAL_MOTION_MIN_PATH_M" \
+  "$STAGE3_EVAL_MOTION_MAX_NET_M" \
+  "$STAGE3_EVAL_PLAN_WINDOW_CALLS" \
+  "$STAGE3_EVAL_PLAN_VIEW_DOMINANCE" \
+  "$STAGE3_EVAL_PLAN_MIN_PATH_M" \
+  "$STAGE3_EVAL_PLAN_MAX_NET_M" \
+  "$STAGE3_EVAL_RECOVERY_TURNS" \
+  "$STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS" \
+  "$STAGE3_EVAL_RECOVERY_HISTORY_KEEP" <<'PY'
+import math
+import sys
+
+(
+    action_chunk,
+    stop_confirmations,
+    collision_epsilon,
+    collision_limit,
+    motion_window,
+    motion_min_path,
+    motion_max_net,
+    plan_window,
+    plan_dominance,
+    plan_min_path,
+    plan_max_net,
+    recovery_turns,
+    recovery_cooldown,
+    recovery_history_keep,
+) = sys.argv[1:]
+action_chunk = int(action_chunk)
+if not 1 <= action_chunk <= 4:
+    raise SystemExit(f"STAGE3_EVAL_ACTION_CHUNK_SIZE must be in [1, 4], got {action_chunk}")
+if int(stop_confirmations) < 1:
+    raise SystemExit("STAGE3_EVAL_STOP_CONFIRMATIONS must be >= 1")
+if int(collision_limit) < 1 or int(motion_window) < 2 or int(plan_window) < 2:
+    raise SystemExit("Closed-loop collision/window counts are invalid")
+if int(recovery_turns) < 1 or int(recovery_cooldown) < 0 or int(recovery_history_keep) < 0:
+    raise SystemExit("Closed-loop recovery counts are invalid")
+for name, raw in (
+    ("collision_epsilon", collision_epsilon),
+    ("motion_min_path", motion_min_path),
+    ("motion_max_net", motion_max_net),
+    ("plan_min_path", plan_min_path),
+    ("plan_max_net", plan_max_net),
+):
+    value = float(raw)
+    if not math.isfinite(value) or value < 0.0:
+        raise SystemExit(f"{name} must be finite and >= 0, got {raw!r}")
+dominance = float(plan_dominance)
+if not math.isfinite(dominance) or not 0.5 < dominance <= 1.0:
+    raise SystemExit("STAGE3_EVAL_PLAN_VIEW_DOMINANCE must be in (0.5, 1]")
+PY
+case "$STAGE3_EVAL_STOP_PROBE_TURN" in
+  left|right) ;;
+  *)
+    echo "STAGE3_EVAL_STOP_PROBE_TURN must be left or right" >&2
+    exit 1
+    ;;
+esac
 
 privileged_requested="$($QWEN25_PYTHON - "$STAGE3_EVAL_AUTO_STOP_DISTANCE" <<'PY'
 import sys
@@ -291,6 +371,7 @@ echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
 echo "[stage3-eval] oracle_strategy=$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY lookahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M min_ahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M max_side_dist_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"
 echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN heading_alignment=$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
+echo "[stage3-eval] closed_loop action_chunk=$STAGE3_EVAL_ACTION_CHUNK_SIZE stop_confirmations=$STAGE3_EVAL_STOP_CONFIRMATIONS stop_probe_turn=$STAGE3_EVAL_STOP_PROBE_TURN loop_guard=$STAGE3_EVAL_CLOSED_LOOP_GUARD"
 
 if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
   echo "[$(date '+%F %T')] STAGE3_EVAL_PREFLIGHT_ONLY=1; all static preflights passed"
@@ -421,6 +502,23 @@ manifest = {
     "trajectory_x_sign": float(os.environ["STAGE3_EVAL_TRAJECTORY_X_SIGN"]),
     "trajectory_heading_alignment": os.environ["STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"],
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
+    "rpc_action_chunk_size": int(os.environ["STAGE3_EVAL_ACTION_CHUNK_SIZE"]),
+    "system2_stop_confirmations": int(os.environ["STAGE3_EVAL_STOP_CONFIRMATIONS"]),
+    "system2_stop_probe_turn": os.environ["STAGE3_EVAL_STOP_PROBE_TURN"],
+    "closed_loop_guard": os.environ["STAGE3_EVAL_CLOSED_LOOP_GUARD"].lower()
+    in {"1", "true", "yes", "on"},
+    "closed_loop_collision_epsilon_m": float(os.environ["STAGE3_EVAL_COLLISION_EPSILON_M"]),
+    "closed_loop_collision_forward_limit": int(os.environ["STAGE3_EVAL_COLLISION_FORWARD_LIMIT"]),
+    "closed_loop_motion_window_steps": int(os.environ["STAGE3_EVAL_MOTION_WINDOW_STEPS"]),
+    "closed_loop_motion_min_path_m": float(os.environ["STAGE3_EVAL_MOTION_MIN_PATH_M"]),
+    "closed_loop_motion_max_net_m": float(os.environ["STAGE3_EVAL_MOTION_MAX_NET_M"]),
+    "closed_loop_plan_window_calls": int(os.environ["STAGE3_EVAL_PLAN_WINDOW_CALLS"]),
+    "closed_loop_plan_view_dominance": float(os.environ["STAGE3_EVAL_PLAN_VIEW_DOMINANCE"]),
+    "closed_loop_plan_min_path_m": float(os.environ["STAGE3_EVAL_PLAN_MIN_PATH_M"]),
+    "closed_loop_plan_max_net_m": float(os.environ["STAGE3_EVAL_PLAN_MAX_NET_M"]),
+    "closed_loop_recovery_turns": int(os.environ["STAGE3_EVAL_RECOVERY_TURNS"]),
+    "closed_loop_recovery_cooldown_steps": int(os.environ["STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS"]),
+    "closed_loop_recovery_history_keep": int(os.environ["STAGE3_EVAL_RECOVERY_HISTORY_KEEP"]),
 }
 path = Path(sys.argv[1])
 resume = os.environ["STAGE3_EVAL_RESUME"].lower() in {"1", "true", "yes", "on"}
@@ -466,6 +564,21 @@ client_args=(
   --max_steps_per_episode "$STAGE3_EVAL_MAX_STEPS"
   --auto_stop_distance "$STAGE3_EVAL_AUTO_STOP_DISTANCE"
   --max_system2_calls_per_episode "$STAGE3_EVAL_MAX_SYSTEM2_CALLS"
+  --rpc_action_chunk_size "$STAGE3_EVAL_ACTION_CHUNK_SIZE"
+  --system2_stop_confirmations "$STAGE3_EVAL_STOP_CONFIRMATIONS"
+  --system2_stop_probe_turn "$STAGE3_EVAL_STOP_PROBE_TURN"
+  --closed_loop_collision_epsilon_m "$STAGE3_EVAL_COLLISION_EPSILON_M"
+  --closed_loop_collision_forward_limit "$STAGE3_EVAL_COLLISION_FORWARD_LIMIT"
+  --closed_loop_motion_window_steps "$STAGE3_EVAL_MOTION_WINDOW_STEPS"
+  --closed_loop_motion_min_path_m "$STAGE3_EVAL_MOTION_MIN_PATH_M"
+  --closed_loop_motion_max_net_m "$STAGE3_EVAL_MOTION_MAX_NET_M"
+  --closed_loop_plan_window_calls "$STAGE3_EVAL_PLAN_WINDOW_CALLS"
+  --closed_loop_plan_view_dominance "$STAGE3_EVAL_PLAN_VIEW_DOMINANCE"
+  --closed_loop_plan_min_path_m "$STAGE3_EVAL_PLAN_MIN_PATH_M"
+  --closed_loop_plan_max_net_m "$STAGE3_EVAL_PLAN_MAX_NET_M"
+  --closed_loop_recovery_turns "$STAGE3_EVAL_RECOVERY_TURNS"
+  --closed_loop_recovery_cooldown_steps "$STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS"
+  --closed_loop_recovery_history_keep "$STAGE3_EVAL_RECOVERY_HISTORY_KEEP"
   --trajectory_selection "$STAGE3_EVAL_TRAJECTORY_SELECTION"
   --trajectory_x_sign "$STAGE3_EVAL_TRAJECTORY_X_SIGN"
   --trajectory_heading_alignment "$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
@@ -475,6 +588,11 @@ client_args=(
 )
 if is_true "$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"; then
   client_args+=(--rpc_require_deterministic_sampling)
+fi
+if is_true "$STAGE3_EVAL_CLOSED_LOOP_GUARD"; then
+  client_args+=(--closed_loop_guard)
+else
+  client_args+=(--no-closed_loop_guard)
 fi
 if [[ -n "$STAGE3_EVAL_MAX_EPISODES" ]]; then
   client_args+=(--max_episodes "$STAGE3_EVAL_MAX_EPISODES")

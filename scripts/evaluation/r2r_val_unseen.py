@@ -324,6 +324,12 @@ if not hasattr(argparse, "BooleanOptionalAction"):
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+from scripts.evaluation.closed_loop_guard import (
+    STOP_ACCEPT,
+    STOP_PROBE,
+    ClosedLoopGuard,
+    ClosedLoopGuardConfig,
+)
 from scripts.evaluation.navigation_metrics import aggregate_navigation_metrics
 from scripts.evaluation.rpc_protocol import (
     HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED,
@@ -725,6 +731,50 @@ class ActionCode(IntEnum):
     RIGHT = 3
     LOOKUP = 4
     LOOKDOWN = 5
+
+
+def _closed_loop_guard_config(args) -> ClosedLoopGuardConfig:
+    action_chunk_size = int(args.rpc_action_chunk_size)
+    if action_chunk_size > MAX_LOCAL_STEPS:
+        raise ValueError(
+            f"rpc_action_chunk_size must be <= {MAX_LOCAL_STEPS}, got {action_chunk_size}"
+        )
+    if int(args.closed_loop_recovery_history_keep) < 0:
+        raise ValueError("closed_loop_recovery_history_keep must be >= 0")
+    return ClosedLoopGuardConfig(
+        action_chunk_size=action_chunk_size,
+        stop_confirmations=int(args.system2_stop_confirmations),
+        stop_probe_turn=str(args.system2_stop_probe_turn),
+        loop_guard_enabled=bool(args.closed_loop_guard),
+        collision_epsilon_m=float(args.closed_loop_collision_epsilon_m),
+        collision_forward_limit=int(args.closed_loop_collision_forward_limit),
+        motion_window_steps=int(args.closed_loop_motion_window_steps),
+        motion_min_path_m=float(args.closed_loop_motion_min_path_m),
+        motion_max_net_m=float(args.closed_loop_motion_max_net_m),
+        plan_window_calls=int(args.closed_loop_plan_window_calls),
+        plan_view_dominance=float(args.closed_loop_plan_view_dominance),
+        plan_min_path_m=float(args.closed_loop_plan_min_path_m),
+        plan_max_net_m=float(args.closed_loop_plan_max_net_m),
+        recovery_turns=int(args.closed_loop_recovery_turns),
+        recovery_cooldown_steps=int(args.closed_loop_recovery_cooldown_steps),
+    )
+
+
+def _agent_position(env) -> tuple[float, float, float]:
+    state = env._sim.get_agent(0).get_state()
+    position = np.asarray(state.position, dtype=np.float64)
+    if position.shape != (3,) or not np.isfinite(position).all():
+        raise RuntimeError(f"Invalid agent position from Habitat: {position!r}")
+    return float(position[0]), float(position[1]), float(position[2])
+
+
+def _trim_recovery_history(
+    history: list[dict[str, Image.Image]],
+    keep: int,
+) -> list[dict[str, Image.Image]]:
+    if keep <= 0:
+        return []
+    return history[-keep:]
 
 
 def _normalize_instruction(instruction: str) -> str:
@@ -1167,6 +1217,26 @@ def _load_progress(
         nes.append(res["ne"])
 
     return sucs, spls, oss, nes, done_set
+
+
+def _load_closed_loop_progress_totals(progress_file: str) -> tuple[int, int]:
+    if not os.path.exists(progress_file):
+        return 0, 0
+    rows: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
+    with open(progress_file) as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if "scene_id" not in row or "episode_id" not in row:
+                continue
+            rows[(str(row["scene_id"]), int(row["episode_id"]))] = row
+    stop_probes = sum(int(row.get("closed_loop_stop_probes", 0) or 0) for row in rows.values())
+    recoveries = 0
+    for row in rows.values():
+        value = row.get("closed_loop_recoveries", [])
+        recoveries += len(value) if isinstance(value, list) else int(value or 0)
+    return stop_probes, recoveries
 
 
 def _load_episode_list(path: str) -> tuple[list[tuple[str, int]], set[tuple[str, int]]]:
@@ -3377,6 +3447,14 @@ def run_eval_rpc_panoramic(args):
     print(f"trajectory_selection={args.trajectory_selection}")
     print(f"trajectory_x_sign={args.trajectory_x_sign:g}")
     print(f"trajectory_heading_alignment={args.trajectory_heading_alignment}")
+    guard_config = _closed_loop_guard_config(args)
+    print(
+        "closed_loop_policy="
+        f"action_chunk={guard_config.action_chunk_size} "
+        f"stop_confirmations={guard_config.stop_confirmations} "
+        f"stop_probe_turn={guard_config.stop_probe_turn} "
+        f"loop_guard={guard_config.loop_guard_enabled}"
+    )
     print(
         "rpc_sampling="
         f"{HEATMAPVLN_RPC_SAMPLING_PROTOCOL} "
@@ -3434,6 +3512,7 @@ def run_eval_rpc_panoramic(args):
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
     eval_count = 0
+    total_stop_probes, total_recoveries = _load_closed_loop_progress_totals(progress_file)
 
     while True:
         process_bar.set_postfix(
@@ -3467,6 +3546,15 @@ def run_eval_rpc_panoramic(args):
         trajectory_calls = 0
         step_id = 0
         done = False
+        stop_probes = 0
+        recovery_reasons: list[str] = []
+        closed_loop_guard = ClosedLoopGuard(
+            guard_config,
+            forward_action=int(ActionCode.FORWARD),
+            left_action=int(ActionCode.LEFT),
+            right_action=int(ActionCode.RIGHT),
+        )
+        closed_loop_guard.reset_episode(_agent_position(env))
 
         step_recorder: TrajectoryStepRecorder | None = None
         if args.save_trajectory_steps:
@@ -3518,8 +3606,10 @@ def run_eval_rpc_panoramic(args):
                     local_actions = []
                     forward_action_count = 0
                     continue
+                before_position = _agent_position(env)
                 before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                 observations, done = _apply_habitat_action(env, action)
+                after_position = _agent_position(env)
                 if before is not None:
                     print(
                         f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
@@ -3534,6 +3624,25 @@ def run_eval_rpc_panoramic(args):
                     action=int(action),
                     image_size=image_size,
                 )
+                recovery = closed_loop_guard.observe_action(
+                    action,
+                    before_position,
+                    after_position,
+                )
+                if recovery is not None and not done:
+                    recovery_reasons.append(recovery.reason)
+                    local_actions = list(recovery.actions)
+                    forward_action_count = 0
+                    executed_history_panoramas = _trim_recovery_history(
+                        executed_history_panoramas,
+                        int(args.closed_loop_recovery_history_keep),
+                    )
+                    print(
+                        "  [guard] recovery: "
+                        f"reason={recovery.reason} actions={list(recovery.actions)} "
+                        f"history={len(executed_history_panoramas)}",
+                        flush=True,
+                    )
                 continue
 
             max_system2_calls = int(getattr(args, "max_system2_calls_per_episode", 0) or 0)
@@ -3611,7 +3720,8 @@ def run_eval_rpc_panoramic(args):
                 oracle_system2=oracle_system2,
             )
             llm_output = response.get("llm_output", "")
-            actions = [int(action) for action in response.get("actions", [])]
+            raw_actions = [int(action) for action in response.get("actions", [])]
+            actions = closed_loop_guard.limit_actions(raw_actions)
             print(
                 f"  step_id: {step_id}, RPC kind={response.get('kind')}, VLM output: {llm_output}",
                 flush=True,
@@ -3619,11 +3729,13 @@ def run_eval_rpc_panoramic(args):
             if response.get("trajectory_summary"):
                 trajectory_calls += 1
                 print(
-                    f"  [debug] trajectory {response['trajectory_summary']}, actions={actions}",
+                    f"  [debug] trajectory {response['trajectory_summary']}, actions={raw_actions}",
                     flush=True,
                 )
-            elif actions:
-                print(f"  [debug] actions={actions}", flush=True)
+                if actions != raw_actions:
+                    print(f"  [guard] action chunk: {raw_actions} -> {actions}", flush=True)
+            elif raw_actions:
+                print(f"  [debug] actions={raw_actions}", flush=True)
 
             if step_recorder is not None:
                 state = env._sim.get_agent(0).get_state()
@@ -3646,7 +3758,35 @@ def run_eval_rpc_panoramic(args):
                     }
                 )
 
-            if response.get("terminal", False):
+            terminal = bool(response.get("terminal", False))
+            stop_decision = closed_loop_guard.observe_system2_terminal(terminal)
+            if terminal and stop_decision == STOP_PROBE:
+                action = closed_loop_guard.next_stop_probe_action()
+                before_position = _agent_position(env)
+                observations, done = _apply_habitat_action(env, action)
+                after_position = _agent_position(env)
+                closed_loop_guard.observe_action(action, before_position, after_position)
+                step_id += 1
+                stop_probes += 1
+                print(
+                    "  [guard] unconfirmed System2 STOP; "
+                    f"probe_action={int(action)} vote={stop_probes}",
+                    flush=True,
+                )
+                _record_post_action_step(
+                    step_recorder,
+                    env,
+                    step_id=step_id,
+                    phase="rpc_stop_probe",
+                    action=int(action),
+                    image_size=image_size,
+                    vlm_output=llm_output,
+                )
+                continue
+
+            if terminal:
+                if stop_decision != STOP_ACCEPT:
+                    raise RuntimeError(f"Unexpected STOP guard decision: {stop_decision!r}")
                 action = actions[0] if actions else ActionCode.STOP
                 observations, done = _apply_habitat_action(env, action)
                 step_id += 1
@@ -3658,6 +3798,26 @@ def run_eval_rpc_panoramic(args):
                     action=int(action),
                     image_size=image_size,
                     vlm_output=llm_output,
+                )
+                continue
+
+            plan_recovery = closed_loop_guard.observe_plan(
+                response.get("pano_goal_view"),
+                _agent_position(env),
+            )
+            if plan_recovery is not None:
+                recovery_reasons.append(plan_recovery.reason)
+                local_actions = list(plan_recovery.actions)
+                forward_action_count = 0
+                executed_history_panoramas = _trim_recovery_history(
+                    executed_history_panoramas,
+                    int(args.closed_loop_recovery_history_keep),
+                )
+                print(
+                    "  [guard] recovery before plan execution: "
+                    f"reason={plan_recovery.reason} actions={list(plan_recovery.actions)} "
+                    f"history={len(executed_history_panoramas)}",
+                    flush=True,
                 )
                 continue
 
@@ -3681,8 +3841,10 @@ def run_eval_rpc_panoramic(args):
             if first_action == ActionCode.STOP:
                 local_actions = []
                 continue
+            before_position = _agent_position(env)
             before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
             observations, done = _apply_habitat_action(env, first_action)
+            after_position = _agent_position(env)
             if before is not None:
                 print(
                     f"  [debug] executed first RPC action={int(first_action)} {before} -> {_env_trace_summary(env)}",
@@ -3699,12 +3861,33 @@ def run_eval_rpc_panoramic(args):
                 image_size=image_size,
                 vlm_output=llm_output,
             )
+            recovery = closed_loop_guard.observe_action(
+                first_action,
+                before_position,
+                after_position,
+            )
+            if recovery is not None and not done:
+                recovery_reasons.append(recovery.reason)
+                local_actions = list(recovery.actions)
+                forward_action_count = 0
+                executed_history_panoramas = _trim_recovery_history(
+                    executed_history_panoramas,
+                    int(args.closed_loop_recovery_history_keep),
+                )
+                print(
+                    "  [guard] recovery: "
+                    f"reason={recovery.reason} actions={list(recovery.actions)} "
+                    f"history={len(executed_history_panoramas)}",
+                    flush=True,
+                )
 
         metrics = env.get_metrics()
         sucs.append(metrics["success"])
         spls.append(metrics["spl"])
         oss.append(metrics["oracle_success"])
         nes.append(metrics["distance_to_goal"])
+        total_stop_probes += stop_probes
+        total_recoveries += len(recovery_reasons)
         if step_recorder is not None:
             step_recorder.finalize(
                 scene_id=scene_id,
@@ -3718,7 +3901,8 @@ def run_eval_rpc_panoramic(args):
         print(
             f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
             f"os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']:.4f}, "
-            f"vlm_calls: {system2_calls}, trajectory_calls: {trajectory_calls}"
+            f"vlm_calls: {system2_calls}, trajectory_calls: {trajectory_calls}, "
+            f"stop_probes: {stop_probes}, recoveries: {len(recovery_reasons)}"
         )
         result = {
             "scene_id": scene_id,
@@ -3743,6 +3927,12 @@ def run_eval_rpc_panoramic(args):
             "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+            "rpc_action_chunk_size": guard_config.action_chunk_size,
+            "system2_stop_confirmations": guard_config.stop_confirmations,
+            "system2_stop_probe_turn": guard_config.stop_probe_turn,
+            "closed_loop_guard": guard_config.loop_guard_enabled,
+            "closed_loop_stop_probes": stop_probes,
+            "closed_loop_recoveries": recovery_reasons,
         }
         if bool(getattr(args, "oracle_system2", False)):
             result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
@@ -3770,6 +3960,12 @@ def run_eval_rpc_panoramic(args):
             "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+            "rpc_action_chunk_size": guard_config.action_chunk_size,
+            "system2_stop_confirmations": guard_config.stop_confirmations,
+            "system2_stop_probe_turn": guard_config.stop_probe_turn,
+            "closed_loop_guard": guard_config.loop_guard_enabled,
+            "closed_loop_stop_probes": total_stop_probes,
+            "closed_loop_recoveries": total_recoveries,
         }
     )
 
@@ -4425,6 +4621,57 @@ def main():
         type=int,
         default=0,
         help="Optional debug safety cap for VLM calls per episode; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--rpc_action_chunk_size",
+        type=int,
+        default=MAX_LOCAL_STEPS,
+        help=(
+            "Maximum low-level actions executed from one RPC trajectory before "
+            "System2 replans. Use 2 for tighter endpoint/obstacle feedback; 4 "
+            "reproduces the original InternNav execution cadence."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_confirmations",
+        type=int,
+        default=1,
+        help=(
+            "Consecutive System2 STOP votes required at the same position. "
+            "Unconfirmed votes trigger an in-place probe turn; 1 disables verification."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_probe_turn",
+        choices=("left", "right"),
+        default="left",
+        help="Direction of the first in-place STOP verification turn; later probes alternate.",
+    )
+    parser.add_argument(
+        "--closed_loop_guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable non-privileged collision and local-loop recovery using only "
+            "issued actions, agent self-motion, and predicted waypoint views."
+        ),
+    )
+    parser.add_argument("--closed_loop_collision_epsilon_m", type=float, default=0.03)
+    parser.add_argument("--closed_loop_collision_forward_limit", type=int, default=3)
+    parser.add_argument("--closed_loop_motion_window_steps", type=int, default=32)
+    parser.add_argument("--closed_loop_motion_min_path_m", type=float, default=2.0)
+    parser.add_argument("--closed_loop_motion_max_net_m", type=float, default=0.75)
+    parser.add_argument("--closed_loop_plan_window_calls", type=int, default=20)
+    parser.add_argument("--closed_loop_plan_view_dominance", type=float, default=0.9)
+    parser.add_argument("--closed_loop_plan_min_path_m", type=float, default=3.0)
+    parser.add_argument("--closed_loop_plan_max_net_m", type=float, default=1.5)
+    parser.add_argument("--closed_loop_recovery_turns", type=int, default=3)
+    parser.add_argument("--closed_loop_recovery_cooldown_steps", type=int, default=12)
+    parser.add_argument(
+        "--closed_loop_recovery_history_keep",
+        type=int,
+        default=2,
+        help="Number of most recent panoramas retained after loop recovery.",
     )
     parser.add_argument(
         "--trajectory_selection",
