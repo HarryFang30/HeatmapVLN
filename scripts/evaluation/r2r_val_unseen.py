@@ -32,7 +32,7 @@ from typing import Any
 
 faulthandler.enable()
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # ═══════════════════════════════════════════════════════════════════════
 # Section 1: Runtime patches (must be before any heavy imports)
@@ -68,16 +68,18 @@ import types as _types
 def _noop(*a, **kw):
     raise RuntimeError("flash_attn stub called – should use SDPA attention instead")
 
+
 def _make_stub(name, attrs=None):
     m = _types.ModuleType(name)
     m.__spec__ = _importlib.machinery.ModuleSpec(name, None)
-    m.__version__ = '2.7.4'
+    m.__version__ = "2.7.4"
     m.__heatmapvln_stub__ = True
     if attrs:
         for k, v in attrs.items():
             setattr(m, k, v)
     sys.modules[name] = m
     return m
+
 
 class _FlashAttnKernelStub:
     def fwd(self, *_args, **_kwargs):
@@ -92,28 +94,41 @@ class _FlashAttnKernelStub:
     def varlen_bwd(self, *_args, **_kwargs):
         return _noop(*_args, **_kwargs)
 
+
 _flash_kernel_stub = _FlashAttnKernelStub()
 
-_fa = _make_stub('flash_attn', {
-    'flash_attn_func': _noop,
-    'flash_attn_varlen_func': _noop,
-})
-_make_stub('flash_attn_2_cuda')
-_fa_iface = _make_stub('flash_attn.flash_attn_interface', {
-    'flash_attn_func': _noop,
-    'flash_attn_varlen_func': _noop,
-    'flash_attn_gpu': _flash_kernel_stub,
-    'flash_attn_cuda': _flash_kernel_stub,
-})
-_fa_bert = _make_stub('flash_attn.bert_padding', {
-    'index_first_axis': _noop,
-    'pad_input': _noop,
-    'unpad_input': _noop,
-})
-_fa_rotary = _make_stub('flash_attn.layers', {})
-_fa_rotary_mod = _make_stub('flash_attn.layers.rotary', {
-    'apply_rotary_emb': _noop,
-})
+_fa = _make_stub(
+    "flash_attn",
+    {
+        "flash_attn_func": _noop,
+        "flash_attn_varlen_func": _noop,
+    },
+)
+_make_stub("flash_attn_2_cuda")
+_fa_iface = _make_stub(
+    "flash_attn.flash_attn_interface",
+    {
+        "flash_attn_func": _noop,
+        "flash_attn_varlen_func": _noop,
+        "flash_attn_gpu": _flash_kernel_stub,
+        "flash_attn_cuda": _flash_kernel_stub,
+    },
+)
+_fa_bert = _make_stub(
+    "flash_attn.bert_padding",
+    {
+        "index_first_axis": _noop,
+        "pad_input": _noop,
+        "unpad_input": _noop,
+    },
+)
+_fa_rotary = _make_stub("flash_attn.layers", {})
+_fa_rotary_mod = _make_stub(
+    "flash_attn.layers.rotary",
+    {
+        "apply_rotary_emb": _noop,
+    },
+)
 _fa.flash_attn_interface = _fa_iface
 _fa.bert_padding = _fa_bert
 _fa.layers = _fa_rotary
@@ -121,11 +136,11 @@ _fa_rotary.rotary = _fa_rotary_mod
 
 import numpy as np
 
-if not hasattr(np, 'float'):
+if not hasattr(np, "float"):
     np.float = np.float64
-if not hasattr(np, 'int'):
+if not hasattr(np, "int"):
     np.int = np.int64
-if not hasattr(np, 'bool'):
+if not hasattr(np, "bool"):
     np.bool = np.bool_
 
 # Import torch before habitat_sim (habitat_sim pulls torch during its __init__).
@@ -136,12 +151,8 @@ LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/i
 LOCAL_VLNCE_DATA_ROOT = Path(
     os.environ.get("HEATMAPVLN_VLNCE_DATA_ROOT", str(LOCAL_FJL_ROOT / "habitat" / "VLN-CE" / "data"))
 )
-LOCAL_MP3D_ROOT = Path(
-    os.environ.get("HEATMAPVLN_MP3D_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d"))
-)
-LOCAL_R2R_DATASETS_ROOT = Path(
-    os.environ.get("HEATMAPVLN_R2R_DATASETS_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "datasets"))
-)
+LOCAL_MP3D_ROOT = Path(os.environ.get("HEATMAPVLN_MP3D_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d")))
+LOCAL_R2R_DATASETS_ROOT = Path(os.environ.get("HEATMAPVLN_R2R_DATASETS_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "datasets")))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
     os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
 )
@@ -233,11 +244,15 @@ if os.environ.get("HEATMAPVLN_PREINIT_EMPTY_GL", "0") == "1":
 import gym.spaces
 
 _OrigDiscrete = gym.spaces.Discrete
+
+
 class _PatchedDiscrete(_OrigDiscrete):
     def __init__(self, n, *args, **kwargs):
         if n == 0:
             n = 1
         super().__init__(n, *args, **kwargs)
+
+
 gym.spaces.Discrete = _PatchedDiscrete
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -269,6 +284,7 @@ from habitat.tasks.nav.nav import DistanceToGoal
 from PIL import Image
 
 if not hasattr(argparse, "BooleanOptionalAction"):
+
     class _BooleanOptionalAction(argparse.Action):
         def __init__(
             self,
@@ -309,7 +325,16 @@ if not hasattr(argparse, "BooleanOptionalAction"):
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from scripts.evaluation.navigation_metrics import aggregate_navigation_metrics
-from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
+from scripts.evaluation.rpc_protocol import (
+    HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED,
+    HEATMAPVLN_RPC_PROTOCOL_VERSION,
+    HEATMAPVLN_RPC_SAMPLING_FIELD,
+    HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+    build_rpc_progress_sampling_contract,
+    build_rpc_sampling_metadata,
+    validate_rpc_progress_sampling_contract,
+    validate_rpc_sampling_metadata,
+)
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
 _INPUT_CONSTRUCTOR_SPEC = importlib.util.spec_from_file_location(
@@ -346,7 +371,7 @@ except ModuleNotFoundError as exc:
 
     def _normalize_state_key(name: str) -> str:
         if name.startswith("module."):
-            name = name[len("module."):]
+            name = name[len("module.") :]
         name = name.replace(".module.", ".")
         prefix_aliases = {
             "qwen3_5.": "qwen2_5_vl.",
@@ -354,7 +379,7 @@ except ModuleNotFoundError as exc:
         }
         for old_prefix, new_prefix in prefix_aliases.items():
             if name.startswith(old_prefix):
-                return new_prefix + name[len(old_prefix):]
+                return new_prefix + name[len(old_prefix) :]
         return name
 
     def load_config(config_path: str, validate: bool = True) -> dict:
@@ -374,7 +399,12 @@ except ModuleNotFoundError as exc:
             return cfg
 
 
-def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
+def _load_pano_latent_adapter(
+    checkpoint_path: str,
+    hidden_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
     """Lazy loader for the pano→InternNav latent adapter.
 
     Imports are kept inside the function so vanilla Habitat eval runs without
@@ -399,6 +429,7 @@ def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: tor
         dim=hidden_dim,
         fallback_args=fallback,
         device=device,
+        dtype=dtype,
     )
     return adapter
 
@@ -440,11 +471,13 @@ def _maybe_apply_pano_latent_adapter(
         view_indices = view_ids_to_indices([goal_view], device=traj_hs.device)
         pixel_xy = torch.tensor(
             [[int(pixel_goal[0]), int(pixel_goal[1])]],
-            device=traj_hs.device, dtype=adapter_dtype,
+            device=traj_hs.device,
+            dtype=adapter_dtype,
         )
         image_hw = torch.tensor(
             [[height, width]],
-            device=traj_hs.device, dtype=adapter_dtype,
+            device=traj_hs.device,
+            dtype=adapter_dtype,
         )
         out = adapter(traj_hs.to(dtype=adapter_dtype), view_indices, pixel_xy, image_hw)
         return out.to(dtype=orig_dtype)
@@ -580,32 +613,32 @@ def _predict_force_teacher_coord(
         lookdown_pil = lookdown_pil.resize(vlm_image_size)
     history_front_pils = history_front_pils or []
     history_front_pils = [
-        (img if img.size == vlm_image_size else img.resize(vlm_image_size))
-        for img in history_front_pils
+        (img if img.size == vlm_image_size else img.resize(vlm_image_size)) for img in history_front_pils
     ]
 
     cleaned_instruction = _strip_instruction_final_period(instruction or "")
     prompt_text = PROMPT_TEMPLATE.replace("<instruction>.", cleaned_instruction)
     if history_front_pils:
         prompt_text += (
-            f" These are your historical observations: "
-            f"{(DEFAULT_IMAGE_TOKEN + chr(10)) * len(history_front_pils)}."
+            f" These are your historical observations: {(DEFAULT_IMAGE_TOKEN + chr(10)) * len(history_front_pils)}."
         )
     prompt_text += f" {INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
 
     first_images = history_front_pils + [current_front_pil]
-    first_messages = [{
-        "role": "user",
-        "content": _content_from_text_with_images(prompt_text, first_images),
-    }]
+    first_messages = [
+        {
+            "role": "user",
+            "content": _content_from_text_with_images(prompt_text, first_images),
+        }
+    ]
 
     def _run_once(messages, images):
         text = teacher_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        inputs = teacher_processor(
-            text=[text], images=images, return_tensors="pt"
-        ).to(teacher_device)
+        inputs = teacher_processor(text=[text], images=images, return_tensors="pt").to(teacher_device)
         with torch.inference_mode():
             out_ids = teacher_model.generate(
                 **inputs,
@@ -616,9 +649,7 @@ def _predict_force_teacher_coord(
                 return_dict_in_generate=True,
             ).sequences
         prompt_len = int(inputs.input_ids.shape[1])
-        return teacher_processor.tokenizer.decode(
-            out_ids[0][prompt_len:], skip_special_tokens=True
-        ).strip()
+        return teacher_processor.tokenizer.decode(out_ids[0][prompt_len:], skip_special_tokens=True).strip()
 
     turn1 = _run_once(first_messages, first_images)
     info: dict = {
@@ -636,14 +667,18 @@ def _predict_force_teacher_coord(
 
     second_text = f"{INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
     second_messages = list(first_messages)
-    second_messages.append({
-        "role": "assistant",
-        "content": [{"type": "text", "text": turn1}],
-    })
-    second_messages.append({
-        "role": "user",
-        "content": _content_from_text_with_images(second_text, [lookdown_pil]),
-    })
+    second_messages.append(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": turn1}],
+        }
+    )
+    second_messages.append(
+        {
+            "role": "user",
+            "content": _content_from_text_with_images(second_text, [lookdown_pil]),
+        }
+    )
     second_images = first_images + [lookdown_pil]
 
     turn2 = _run_once(second_messages, second_images)
@@ -651,6 +686,7 @@ def _predict_force_teacher_coord(
     info["used_turn"] = 2
     coord_uv, _ = _parse_coord(turn2)
     return coord_uv, info
+
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -780,6 +816,7 @@ def ensure_vln_measures_registered() -> None:
     """Register custom VLN measures required by Habitat-Lab 0.1.7 evaluation."""
 
     if registry.get_measure("OracleNavigationError") is None:
+
         @registry.register_measure
         class OracleNavigationError(Measure):
             cls_uuid: str = "oracle_navigation_error"
@@ -797,6 +834,7 @@ def ensure_vln_measures_registered() -> None:
                 self._metric = min(self._metric, distance_to_target)
 
     if registry.get_measure("OracleSuccess") is None:
+
         @registry.register_measure
         class OracleSuccess(Measure):
             cls_uuid: str = "oracle_success"
@@ -874,15 +912,10 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         resolved = next((p for p in data_candidates if p.exists()), None)
         if resolved is None:
             attempted = "\n  - ".join([requested_data_path, *map(str, data_candidates)])
-            raise FileNotFoundError(
-                "Could not find the VLN-CE dataset file. Tried:\n"
-                f"  - {attempted}"
-            )
+            raise FileNotFoundError(f"Could not find the VLN-CE dataset file. Tried:\n  - {attempted}")
         args.data_path = str(resolved.resolve())
     else:
-        raise FileNotFoundError(
-            f"Configured --data_path does not exist: {requested_data_path}"
-        )
+        raise FileNotFoundError(f"Configured --data_path does not exist: {requested_data_path}")
 
     first_scene_id = _first_dataset_scene_id(args.data_path)
 
@@ -946,10 +979,7 @@ def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tens
     if all(torch.is_tensor(value) for value in ckpt.values()):
         return ckpt
 
-    raise KeyError(
-        f"Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: "
-        f"{checkpoint_path}"
-    )
+    raise KeyError(f"Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: {checkpoint_path}")
 
 
 def _extract_checkpoint_config(checkpoint_path: str | None) -> dict:
@@ -998,11 +1028,7 @@ def _requires_base_checkpoint(cfg: dict, checkpoint_cfg: dict | None = None) -> 
 
 
 def _system2_sft_protocol(cfg: dict) -> str:
-    return (
-        cfg.get("data", {})
-        .get("trajectory", {})
-        .get("system2_sft_protocol", "direct")
-    ).lower()
+    return (cfg.get("data", {}).get("trajectory", {}).get("system2_sft_protocol", "direct")).lower()
 
 
 def _preflight_checkpoint_args(args) -> None:
@@ -1023,10 +1049,7 @@ def _preflight_checkpoint_args(args) -> None:
     if args.base_checkpoint:
         return
 
-    checkpoint_state_dict = (
-        _extract_checkpoint_state_dict(args.checkpoint)
-        if args.checkpoint else None
-    )
+    checkpoint_state_dict = _extract_checkpoint_state_dict(args.checkpoint) if args.checkpoint else None
     if not _checkpoint_has_base_weights(checkpoint_state_dict):
         raise ValueError(
             "This bridge-only config/checkpoint requires the Stage1-S2 panoramic System2 "
@@ -1043,10 +1066,7 @@ def _load_compatible_state_dict(
 ) -> int:
     """Load matching tensors while handling DDP and legacy backbone prefixes."""
     current_state = model.state_dict()
-    normalized_to_actual = {
-        _normalize_state_key(name): name
-        for name in current_state
-    }
+    normalized_to_actual = {_normalize_state_key(name): name for name in current_state}
 
     remapped: dict[str, torch.Tensor] = {}
     skipped_shape: list[str] = []
@@ -1059,8 +1079,7 @@ def _load_compatible_state_dict(
             continue
         if current_state[actual_name].shape != value.shape:
             skipped_shape.append(
-                f"{actual_name}: ckpt {tuple(value.shape)} vs "
-                f"model {tuple(current_state[actual_name].shape)}"
+                f"{actual_name}: ckpt {tuple(value.shape)} vs model {tuple(current_state[actual_name].shape)}"
             )
             continue
         remapped[actual_name] = value
@@ -1075,10 +1094,7 @@ def _load_compatible_state_dict(
         sample = ", ".join(skipped_missing[:5])
         print(f"  skipped unmatched keys: {len(skipped_missing)}; examples: {sample}")
     if skipped_shape:
-        print(
-            "  skipped shape-mismatched keys: "
-            f"{len(skipped_shape)}; examples: {'; '.join(skipped_shape[:3])}"
-        )
+        print(f"  skipped shape-mismatched keys: {len(skipped_shape)}; examples: {'; '.join(skipped_shape[:3])}")
     return len(remapped)
 
 
@@ -1106,7 +1122,11 @@ def _prepare_progress_file(args, output_path: str) -> str:
     return progress_file
 
 
-def _load_progress(progress_file: str) -> tuple[list[float], list[float], list[float], list[float], set]:
+def _load_progress(
+    progress_file: str,
+    *,
+    expected_rpc_sampling_contract: dict[str, Any] | None = None,
+) -> tuple[list[float], list[float], list[float], list[float], set]:
     sucs, spls, oss, nes = [], [], [], []
     done_set: set = set()
     if not os.path.exists(progress_file):
@@ -1119,8 +1139,15 @@ def _load_progress(progress_file: str) -> tuple[list[float], list[float], list[f
             if not line.strip():
                 continue
             res = json.loads(line)
+            if expected_rpc_sampling_contract is not None:
+                validate_rpc_progress_sampling_contract(
+                    res,
+                    expected=expected_rpc_sampling_contract,
+                )
             scene_id = res.get("scene_id")
             episode_id = res.get("episode_id")
+            if expected_rpc_sampling_contract is not None and (scene_id is None or episode_id is None):
+                raise ValueError("Deterministic RPC progress rows require scene_id and episode_id")
             if scene_id is None or episode_id is None:
                 loose_results.append(res)
                 continue
@@ -1161,8 +1188,9 @@ def _episode_list_from_args(args) -> tuple[list[tuple[str, int]] | None, set[tup
     return _load_episode_list(path)
 
 
-def _eval_limit(args, remaining: int, target_list: list[tuple[str, int]] | None = None,
-                done_set: set | None = None) -> int:
+def _eval_limit(
+    args, remaining: int, target_list: list[tuple[str, int]] | None = None, done_set: set | None = None
+) -> int:
     if target_list is not None:
         done = done_set or set()
         pending = sum(1 for key in target_list if key not in done)
@@ -1177,6 +1205,7 @@ def _eval_limit(args, remaining: int, target_list: list[tuple[str, int]] | None 
 # ═══════════════════════════════════════════════════════════════════════
 # Section 3: Habitat config
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def build_habitat_config(args):
     cfg = get_habitat_default_config()
@@ -1217,10 +1246,19 @@ def build_habitat_config(args):
     cfg.TASK.SUCCESS_DISTANCE = 3.0
     cfg.TASK.SENSORS = ["INSTRUCTION_SENSOR", "GPS_SENSOR", "COMPASS_SENSOR"]
     cfg.TASK.POSSIBLE_ACTIONS = [
-        "STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP", "LOOK_DOWN",
+        "STOP",
+        "MOVE_FORWARD",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "LOOK_UP",
+        "LOOK_DOWN",
     ]
     cfg.TASK.MEASUREMENTS = [
-        "DISTANCE_TO_GOAL", "SUCCESS", "SPL", "ORACLE_SUCCESS", "ORACLE_NAVIGATION_ERROR",
+        "DISTANCE_TO_GOAL",
+        "SUCCESS",
+        "SPL",
+        "ORACLE_SUCCESS",
+        "ORACLE_NAVIGATION_ERROR",
     ]
 
     cfg.TASK.DISTANCE_TO_GOAL.TYPE = "DistanceToGoal"
@@ -1249,6 +1287,7 @@ def build_habitat_config(args):
 # Section 4: Agent pose tracking
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def get_agent_cam2world(env) -> np.ndarray:
     """Extract a 4x4 camera-to-world matrix from the Habitat agent state.
 
@@ -1270,6 +1309,7 @@ def get_agent_cam2world(env) -> np.ndarray:
 # Section 5: Panoramic view capture
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _yaw_quaternion(angle_rad: float):
     """Create a quaternion for rotation around Y-axis (up in Habitat)."""
     half = angle_rad / 2.0
@@ -1284,8 +1324,7 @@ def _quat_to_heading_deg(rot_xyzw: np.ndarray) -> float:
     onto the XZ ground plane, measured from +Z (north) clockwise:
     heading = arctan2(forward_x, forward_z).
     """
-    q = np.quaternion(float(rot_xyzw[3]), float(rot_xyzw[0]),
-                      float(rot_xyzw[1]), float(rot_xyzw[2]))
+    q = np.quaternion(float(rot_xyzw[3]), float(rot_xyzw[0]), float(rot_xyzw[1]), float(rot_xyzw[2]))
     rot_mat = quaternion.as_rotation_matrix(q)
     forward = rot_mat @ np.array([0.0, 0.0, -1.0], dtype=np.float64)
     heading_rad = np.arctan2(float(forward[0]), float(forward[2]))
@@ -1293,7 +1332,12 @@ def _quat_to_heading_deg(rot_xyzw: np.ndarray) -> float:
 
 
 _ACTION_NAMES: dict[int, str] = {
-    0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT", 4: "LOOKUP", 5: "LOOKDOWN",
+    0: "STOP",
+    1: "FORWARD",
+    2: "LEFT",
+    3: "RIGHT",
+    4: "LOOKUP",
+    5: "LOOKDOWN",
 }
 
 
@@ -1302,7 +1346,8 @@ def _action_name(action: int) -> str:
 
 
 def capture_panoramic_views(
-    env, image_size: tuple = (256, 256),
+    env,
+    image_size: tuple = (256, 256),
 ) -> dict[str, Image.Image]:
     """Capture 4 directional views by manipulating agent state directly.
 
@@ -1338,9 +1383,7 @@ def capture_panoramic_views(
                     flush=True,
                 )
                 _panoramic_sensor_warned = True
-            views[name] = Image.fromarray(
-                np.zeros((*image_size[::-1], 3), dtype=np.uint8)
-            )
+            views[name] = Image.fromarray(np.zeros((*image_size[::-1], 3), dtype=np.uint8))
 
     agent.set_state(orig_state, reset_sensors=True)
     return views
@@ -1382,9 +1425,7 @@ def _sample_history_panoramas(
         return []
     if len(history_panoramas) <= num_history:
         return list(history_panoramas)
-    indices = np.unique(
-        np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)
-    ).tolist()
+    indices = np.unique(np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)).tolist()
     return [history_panoramas[i] for i in indices]
 
 
@@ -1503,10 +1544,7 @@ def _image_trace_summary(image: Image.Image) -> str:
         return "empty"
     digest = hashlib.sha1(arr.tobytes()).hexdigest()[:10]
     height, width = arr.shape[:2]
-    return (
-        f"{width}x{height}:{digest}:"
-        f"mean={float(arr.mean()):.1f}:std={float(arr.std()):.1f}"
-    )
+    return f"{width}x{height}:{digest}:mean={float(arr.mean()):.1f}:std={float(arr.std()):.1f}"
 
 
 def _views_trace_summary(views: dict[str, Image.Image]) -> str:
@@ -1525,10 +1563,7 @@ def _agent_pose_summary(env) -> str:
         rot = quaternion.as_float_array(state.rotation)
     except Exception as exc:
         return f"pose=unavailable:{type(exc).__name__}"
-    return (
-        f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
-        f"rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f},{rot[3]:.4f})"
-    )
+    return f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f},{rot[3]:.4f})"
 
 
 def _env_trace_summary(env) -> str:
@@ -1544,11 +1579,7 @@ def _tensor_trace_summary(tensor: torch.Tensor | None) -> str:
     if t.numel() == 0:
         return f"shape={tuple(t.shape)} empty"
     tf = t.float()
-    return (
-        f"shape={tuple(t.shape)} "
-        f"mean={float(tf.mean().item()):.4f} "
-        f"std={float(tf.std(unbiased=False).item()):.4f}"
-    )
+    return f"shape={tuple(t.shape)} mean={float(tf.mean().item()):.4f} std={float(tf.std(unbiased=False).item()):.4f}"
 
 
 def _maybe_save_debug_images(
@@ -1563,17 +1594,14 @@ def _maybe_save_debug_images(
     if limit <= 0 or call_idx > limit:
         return
 
-    debug_dir = (
-        Path(args.output_path)
-        / "debug_inputs"
-        / f"{scene_id}_{episode_id:04d}"
-    )
+    debug_dir = Path(args.output_path) / "debug_inputs" / f"{scene_id}_{episode_id:04d}"
     debug_dir.mkdir(parents=True, exist_ok=True)
     for name, image in images.items():
         image.save(debug_dir / f"{call_idx:04d}_{phase}_{name}.jpg")
 
 
 # ── Trajectory Step Recorder (for offline HTML visualisation) ──────────
+
 
 class TrajectoryStepRecorder:
     """Save per-step agent state, VLM outputs, and panorama images to disk.
@@ -1617,9 +1645,7 @@ class TrajectoryStepRecorder:
             "position": [float(v) for v in data["position"]],
             "heading_deg": float(data.get("heading_deg", 0.0)),
             "rotation": [float(v) for v in data.get("rotation", [0, 0, 0, 1])],
-            "distance_to_goal": float(data["distance_to_goal"])
-            if data.get("distance_to_goal") is not None
-            else None,
+            "distance_to_goal": float(data["distance_to_goal"]) if data.get("distance_to_goal") is not None else None,
         }
 
         cur_dist = step["distance_to_goal"]
@@ -1659,20 +1685,12 @@ class TrajectoryStepRecorder:
             val = data.get(num_key)
             step[num_key] = float(val) if val is not None else None
         per_q = data.get("traj_hs_per_query")
-        step["traj_hs_per_query"] = (
-            [float(v) for v in per_q] if per_q is not None else None
-        )
+        step["traj_hs_per_query"] = [float(v) for v in per_q] if per_q is not None else None
 
         # Action fields.
-        step["executed_action"] = (
-            int(data["executed_action"])
-            if data.get("executed_action") is not None
-            else None
-        )
+        step["executed_action"] = int(data["executed_action"]) if data.get("executed_action") is not None else None
         step["executed_action_name"] = (
-            _action_name(data["executed_action"])
-            if data.get("executed_action") is not None
-            else None
+            _action_name(data["executed_action"]) if data.get("executed_action") is not None else None
         )
 
         # Save panorama images as JPEG files.
@@ -1786,10 +1804,7 @@ def _trajectory_debug_summary(
     goal_xy = mean_xy[-1]
     direct = float(np.linalg.norm(goal_xy))
     path_len = float(np.linalg.norm(np.diff(mean_xy, axis=0), axis=1).sum())
-    return (
-        f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), "
-        f"direct={direct:.2f}, path_len={path_len:.2f}"
-    )
+    return f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), direct={direct:.2f}, path_len={path_len:.2f}"
 
 
 def _system1_coord_order(args, *, panoramic_internnav_protocol: bool) -> str:
@@ -1939,9 +1954,7 @@ def select_trajectory_xy(
         if forward_candidates:
             medoid_idx = _endpoint_medoid_index(all_trajectory)
             medoid_endpoint = all_trajectory[medoid_idx, -1, :2]
-            median_path_len = float(
-                np.median([trajectory_xy_path_len(traj) for traj in all_trajectory])
-            )
+            median_path_len = float(np.median([trajectory_xy_path_len(traj) for traj in all_trajectory]))
 
             def score(item: tuple[int, int, float, list[int]]) -> tuple[float, int, float]:
                 idx, forward_count, path_len, _actions = item
@@ -1960,10 +1973,7 @@ def select_trajectory_xy(
         idx = _endpoint_medoid_index(all_trajectory)
         return all_trajectory[idx], idx
 
-    raise ValueError(
-        f"Unsupported trajectory selection: {selection}; "
-        f"expected one of {TRAJECTORY_SELECTION_CHOICES}"
-    )
+    raise ValueError(f"Unsupported trajectory selection: {selection}; expected one of {TRAJECTORY_SELECTION_CHOICES}")
 
 
 def traj_to_actions(
@@ -1975,9 +1985,7 @@ def traj_to_actions(
 ) -> list[int]:
     """Convert InternNav trajectory predictions to discrete Habitat actions."""
     if trajectory_x_sign not in (-1.0, 1.0):
-        raise ValueError(
-            f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
-        )
+        raise ValueError(f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}")
     trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy().copy()
     trajs[:, :, :2] /= action_scale
     trajs[:, :, 0] *= trajectory_x_sign
@@ -1991,13 +1999,16 @@ def traj_to_actions(
 # Section 7: VLM input preparation
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]):
     """Replicate HeatmapVLN._normalize_multimodal_inputs."""
     if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
         vgt = inputs["video_grid_thw"]
         if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
             inputs["video_grid_thw"] = torch.repeat_interleave(
-                vgt, vgt[:, 0], dim=0,
+                vgt,
+                vgt[:, 0],
+                dim=0,
             )
             inputs["video_grid_thw"][:, 0] = 1
 
@@ -2041,14 +2052,12 @@ def prepare_vlm_inputs(
 # Section 8: Model building
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _resolve_internnav_model_path(cfg: dict) -> str:
     raw = (
         os.environ.get("INTERNNAV_MODEL_PATH")
         or os.environ.get("INTERNNAV_BACKBONE")
-        or cfg.get("model", {})
-        .get("action_head", {})
-        .get("nextdit", {})
-        .get("internnav_model_path", "")
+        or cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("internnav_model_path", "")
         or cfg.get("model", {}).get("llm", {}).get("model_path", "")
     )
     resolved = os.path.expandvars(os.path.expanduser(str(raw or "").strip()))
@@ -2096,9 +2105,7 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
     else:
         single = model_dir / "model.safetensors"
         if not single.is_file():
-            raise FileNotFoundError(
-                f"No InternNav safetensors found under {internnav_path}"
-            )
+            raise FileNotFoundError(f"No InternNav safetensors found under {internnav_path}")
         weight_map = {k: single.name for k in safe_open(str(single)).keys()}  # noqa: SIM118
 
     shards: dict[str, object] = {}
@@ -2117,16 +2124,12 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
 
     rgb_key_count = sum(1 for key in weight_map if key.startswith("model.rgb_model."))
     if rgb_key_count == 0:
-        raise RuntimeError(
-            f"No model.rgb_model.* tensors in InternNav weights at {internnav_path}"
-        )
+        raise RuntimeError(f"No model.rgb_model.* tensors in InternNav weights at {internnav_path}")
 
     for ref_key, current_fn in checks:
         reference = _tensor_from_internnav(ref_key)
         current = current_fn().detach().float().cpu()
-        if current.shape != reference.shape or not torch.allclose(
-            current, reference, atol=1e-4, rtol=1e-3
-        ):
+        if current.shape != reference.shape or not torch.allclose(current, reference, atol=1e-4, rtol=1e-3):
             raise RuntimeError(
                 "InternNav System1 weights were not loaded into NextDiT "
                 f"(mismatch on {ref_key}). Check INTERNNAV_MODEL_PATH."
@@ -2165,10 +2168,7 @@ def load_model(args, device: torch.device):
     base_state_dict = None
     if args.base_checkpoint:
         base_state_dict = _extract_checkpoint_state_dict(args.base_checkpoint)
-    checkpoint_state_dict = (
-        _extract_checkpoint_state_dict(args.checkpoint)
-        if args.checkpoint else None
-    )
+    checkpoint_state_dict = _extract_checkpoint_state_dict(args.checkpoint) if args.checkpoint else None
 
     if (
         _requires_base_checkpoint(cfg, checkpoint_cfg)
@@ -2181,24 +2181,17 @@ def load_model(args, device: torch.device):
             "whose metadata records runtime.base_checkpoint."
         )
     if checkpoint_state_dict and _looks_action_only(checkpoint_state_dict) and not args.base_checkpoint:
-        print(
-            "WARNING: the main checkpoint contains only action-head weights and no "
-            "base checkpoint was loaded."
-        )
+        print("WARNING: the main checkpoint contains only action-head weights and no base checkpoint was loaded.")
     if not args.base_checkpoint and checkpoint_state_dict is None:
         print(
-            "WARNING: no checkpoint was supplied; evaluating the model initialized "
-            "from config/pretrained weights only."
+            "WARNING: no checkpoint was supplied; evaluating the model initialized from config/pretrained weights only."
         )
 
     # Qwen/LoRA is lazy.  It must exist before loading Stage 1 LoRA weights;
     # otherwise qwen*.model.* keys are silently treated as unexpected.
     model.qwen2_5_vl._load_model()
 
-    if (
-        _state_has_prefix(base_state_dict, "heatmap_vln.")
-        or _state_has_prefix(checkpoint_state_dict, "heatmap_vln.")
-    ):
+    if _state_has_prefix(base_state_dict, "heatmap_vln.") or _state_has_prefix(checkpoint_state_dict, "heatmap_vln."):
         model._ensure_heatmap_vln()
 
     if base_state_dict:
@@ -2261,9 +2254,7 @@ def _run_eval_panoramic_vlm(
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
-    structured_pano_output = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("structured_pano_output", True)
-    )
+    structured_pano_output = bool(train_cfg.get("data", {}).get("trajectory", {}).get("structured_pano_output", True))
     system1_coord_order = _system1_coord_order(
         args,
         panoramic_internnav_protocol=internnav_protocol,
@@ -2282,10 +2273,7 @@ def _run_eval_panoramic_vlm(
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
-    print(
-        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
-        f"this run: {eval_limit}"
-    )
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
 
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
@@ -2317,10 +2305,7 @@ def _run_eval_panoramic_vlm(
 
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
-        print(
-            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
-            f"{instruction[:80]}..."
-        )
+        print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
 
         executed_history_panoramas: list[dict[str, Image.Image]] = []
         action_seq: list[int] = []
@@ -2339,7 +2324,9 @@ def _run_eval_panoramic_vlm(
         step_recorder: TrajectoryStepRecorder | None = None
         if args.save_trajectory_steps:
             step_recorder = TrajectoryStepRecorder(
-                Path(output_path), scene_id, episode_id,
+                Path(output_path),
+                scene_id,
+                episode_id,
             )
             init_state = env._sim.get_agent(0).get_state()
             init_pos = np.array(init_state.position, dtype=float)
@@ -2393,20 +2380,19 @@ def _run_eval_panoramic_vlm(
                     awaiting_lookdown = False
                     continue
 
-                before = (
-                    _env_trace_summary(env)
-                    if _debug_input_trace_enabled(args)
-                    else None
-                )
+                before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                 observations, done = _apply_habitat_action(env, action)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="local_action", action=int(action), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="local_action",
+                    action=int(action),
+                    image_size=image_size,
                 )
                 if before is not None:
                     print(
-                        f"  [debug] executed local action={int(action)} "
-                        f"{before} -> {_env_trace_summary(env)}",
+                        f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
                         flush=True,
                     )
                 step_id += 1
@@ -2476,17 +2462,21 @@ def _run_eval_panoramic_vlm(
                     {"lookdown": turn_lookdown_img},
                 )
                 messages = copy.deepcopy(base_messages)
-                messages.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": last_llm_output}],
-                })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
-                        {"type": "image", "image": turn_lookdown_img},
-                    ],
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": last_llm_output}],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
+                            {"type": "image", "image": turn_lookdown_img},
+                        ],
+                    }
+                )
                 awaiting_lookdown = False
             else:
                 current_views = capture_panoramic_views(env, image_size=image_size)
@@ -2538,8 +2528,7 @@ def _run_eval_panoramic_vlm(
             )
             if _debug_input_trace_enabled(args):
                 print(
-                    "  [debug] processor pixel_values "
-                    f"{_tensor_trace_summary(inputs.get('pixel_values'))}",
+                    f"  [debug] processor pixel_values {_tensor_trace_summary(inputs.get('pixel_values'))}",
                     flush=True,
                 )
             system2_calls += 1
@@ -2551,8 +2540,12 @@ def _run_eval_panoramic_vlm(
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1, phase="stop",
-                    action=int(ActionCode.STOP), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
                 )
                 step_id += 1
                 continue
@@ -2566,7 +2559,7 @@ def _run_eval_panoramic_vlm(
                 ).sequences
 
             llm_output = processor.tokenizer.decode(
-                output_ids[0][inputs["input_ids"].shape[1]:],
+                output_ids[0][inputs["input_ids"].shape[1] :],
                 skip_special_tokens=True,
             )
             last_llm_output = llm_output
@@ -2575,8 +2568,12 @@ def _run_eval_panoramic_vlm(
             if _vlm_requests_stop(llm_output):
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1, phase="stop",
-                    action=int(ActionCode.STOP), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
                     vlm_output=llm_output,
                 )
                 step_id += 1
@@ -2587,8 +2584,12 @@ def _run_eval_panoramic_vlm(
                 action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
                 observations, done = _apply_habitat_action(env, action)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1, phase="turn",
-                    action=int(action), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="turn",
+                    action=int(action),
+                    image_size=image_size,
                     vlm_output=llm_output,
                 )
                 step_id += 1
@@ -2612,18 +2613,20 @@ def _run_eval_panoramic_vlm(
                 views_for_record = None
                 if executed_history_panoramas:
                     views_for_record = executed_history_panoramas[-1]
-                step_recorder.record_step({
-                    "step_id": step_id,
-                    "phase": "vlm",
-                    "position": pos,
-                    "heading_deg": _quat_to_heading_deg(rot),
-                    "rotation": rot,
-                    "distance_to_goal": _metric_distance_to_goal(env),
-                    "vlm_output": llm_output,
-                    "pixel_goal": pixel_goal,
-                    "pano_goal_view": pano_goal_view,
-                    "current_views": views_for_record,
-                })
+                step_recorder.record_step(
+                    {
+                        "step_id": step_id,
+                        "phase": "vlm",
+                        "position": pos,
+                        "heading_deg": _quat_to_heading_deg(rot),
+                        "rotation": rot,
+                        "distance_to_goal": _metric_distance_to_goal(env),
+                        "vlm_output": llm_output,
+                        "pixel_goal": pixel_goal,
+                        "pano_goal_view": pano_goal_view,
+                        "current_views": views_for_record,
+                    }
+                )
 
             # === Force-teacher full-drive (--force_teacher_coord) ============
             #
@@ -2650,7 +2653,8 @@ def _run_eval_panoramic_vlm(
                     )
                 else:
                     ld_for_teacher = capture_lookdown_view(
-                        env, image_size=vlm_image_size,
+                        env,
+                        image_size=vlm_image_size,
                     )
                     turn_lookdown_img = ld_for_teacher
 
@@ -2665,12 +2669,8 @@ def _run_eval_panoramic_vlm(
                 if front_for_teacher is not None:
                     history_front_pils: list = []
                     if len(executed_history_panoramas) > 1:
-                        hist_pano = executed_history_panoramas[
-                            -1 - num_history : -1
-                        ]
-                        history_front_pils = [
-                            h["front"] for h in hist_pano if "front" in h
-                        ]
+                        hist_pano = executed_history_panoramas[-1 - num_history : -1]
+                        history_front_pils = [h["front"] for h in hist_pano if "front" in h]
                     teacher_coord, teacher_info = _predict_force_teacher_coord(
                         force_teacher_model,
                         force_teacher_processor,
@@ -2681,9 +2681,7 @@ def _run_eval_panoramic_vlm(
                         vlm_image_size=vlm_image_size,
                         history_front_pils=history_front_pils,
                     )
-                    teacher_actions = _parse_text_actions(
-                        teacher_info.get("turn1_text") or ""
-                    )
+                    teacher_actions = _parse_text_actions(teacher_info.get("turn1_text") or "")
                     # If teacher's turn-1 contained "↓" (lookdown trigger) we
                     # already executed turn-2 internally inside
                     # _predict_force_teacher_coord. In that case the LOOKDOWN
@@ -2695,14 +2693,9 @@ def _run_eval_panoramic_vlm(
                     # an infinite "LOOKDOWN -> ↓↓ -> LOOKDOWN" loop with no
                     # step_id progress.
                     if teacher_info.get("turn2_text") is not None:
-                        teacher_actions = [
-                            a for a in teacher_actions
-                            if a != int(ActionCode.LOOKDOWN)
-                        ]
+                        teacher_actions = [a for a in teacher_actions if a != int(ActionCode.LOOKDOWN)]
 
-                student_pg_repr = (
-                    list(pixel_goal) if pixel_goal is not None else None
-                )
+                student_pg_repr = list(pixel_goal) if pixel_goal is not None else None
 
                 if teacher_coord is not None:
                     if pixel_goal is not None and has_nextdit:
@@ -2727,13 +2720,13 @@ def _run_eval_panoramic_vlm(
                         )
                 elif teacher_actions:
                     action_name_map = {
-                        0: "STOP", 1: "FORWARD", 2: "LEFT",
-                        3: "RIGHT", 5: "LOOKDOWN",
+                        0: "STOP",
+                        1: "FORWARD",
+                        2: "LEFT",
+                        3: "RIGHT",
+                        5: "LOOKDOWN",
                     }
-                    pretty_actions = [
-                        action_name_map.get(int(a), str(a))
-                        for a in teacher_actions
-                    ]
+                    pretty_actions = [action_name_map.get(int(a), str(a)) for a in teacher_actions]
                     print(
                         "  [force-teacher] action override (hist="
                         f"{teacher_info.get('n_history')}): "
@@ -2749,12 +2742,17 @@ def _run_eval_panoramic_vlm(
                         continue
                     if first_action == ActionCode.STOP:
                         observations, done = _apply_habitat_action(
-                            env, ActionCode.STOP,
+                            env,
+                            ActionCode.STOP,
                         )
                         _record_post_action_step(
-                            step_recorder, env, step_id=step_id + 1,
-                            phase="stop", action=int(ActionCode.STOP),
-                            image_size=image_size, vlm_output=llm_output,
+                            step_recorder,
+                            env,
+                            step_id=step_id + 1,
+                            phase="stop",
+                            action=int(ActionCode.STOP),
+                            image_size=image_size,
+                            vlm_output=llm_output,
                         )
                         step_id += 1
                         continue
@@ -2766,22 +2764,32 @@ def _run_eval_panoramic_vlm(
                     first_action = local_actions.pop(0)
                     if first_action == ActionCode.STOP:
                         observations, done = _apply_habitat_action(
-                            env, ActionCode.STOP,
+                            env,
+                            ActionCode.STOP,
                         )
                         _record_post_action_step(
-                            step_recorder, env, step_id=step_id + 1,
-                            phase="stop", action=int(ActionCode.STOP),
-                            image_size=image_size, vlm_output=llm_output,
+                            step_recorder,
+                            env,
+                            step_id=step_id + 1,
+                            phase="stop",
+                            action=int(ActionCode.STOP),
+                            image_size=image_size,
+                            vlm_output=llm_output,
                         )
                         step_id += 1
                         continue
                     observations, done = _apply_habitat_action(
-                        env, first_action,
+                        env,
+                        first_action,
                     )
                     _record_post_action_step(
-                        step_recorder, env, step_id=step_id + 1,
-                        phase="local_action", action=int(first_action),
-                        image_size=image_size, vlm_output=llm_output,
+                        step_recorder,
+                        env,
+                        step_id=step_id + 1,
+                        phase="local_action",
+                        action=int(first_action),
+                        image_size=image_size,
+                        vlm_output=llm_output,
                     )
                     step_id += 1
                     forward_action_count += 1
@@ -2821,7 +2829,8 @@ def _run_eval_panoramic_vlm(
 
                 print("  [debug] calling generate_latents ...", flush=True)
                 lq = model.latent_queries.expand(1, -1, -1).to(
-                    device=device, dtype=model.config.dtype,
+                    device=device,
+                    dtype=model.config.dtype,
                 )
                 condition_output_ids = _condition_output_ids_for_pixel_goal(
                     output_ids=output_ids,
@@ -2844,8 +2853,7 @@ def _run_eval_panoramic_vlm(
                     )
                     if _debug_input_trace_enabled(args):
                         _per_q = [
-                            float(_last_traj_hs[0, i].float().norm().item())
-                            for i in range(_last_traj_hs.shape[1])
+                            float(_last_traj_hs[0, i].float().norm().item()) for i in range(_last_traj_hs.shape[1])
                         ]
                         print(
                             "  [debug] traj_hs total_norm="
@@ -2856,12 +2864,9 @@ def _run_eval_panoramic_vlm(
                     if step_recorder is not None and _last_traj_hs is not None:
                         try:
                             ths = _last_traj_hs.detach()
-                            step_recorder._steps[-1]["traj_hs_total_norm"] = (
-                                float(ths.float().norm().item())
-                            )
+                            step_recorder._steps[-1]["traj_hs_total_norm"] = float(ths.float().norm().item())
                             step_recorder._steps[-1]["traj_hs_per_query"] = [
-                                float(ths[0, i].float().norm().item())
-                                for i in range(ths.shape[1])
+                                float(ths[0, i].float().norm().item()) for i in range(ths.shape[1])
                             ]
                         except Exception:
                             pass
@@ -2913,16 +2918,16 @@ def _run_eval_panoramic_vlm(
                         base_messages = None
                         awaiting_lookdown = False
                         forward_action_count = 0
-                        before = (
-                            _env_trace_summary(env)
-                            if _debug_input_trace_enabled(args)
-                            else None
-                        )
+                        before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                         observations, done = _apply_habitat_action(env, ActionCode.LEFT)
                         _record_post_action_step(
-                            step_recorder, env, step_id=step_id + 1,
-                            phase="local_action", action=int(ActionCode.LEFT),
-                            image_size=image_size, vlm_output=llm_output,
+                            step_recorder,
+                            env,
+                            step_id=step_id + 1,
+                            phase="local_action",
+                            action=int(ActionCode.LEFT),
+                            image_size=image_size,
+                            vlm_output=llm_output,
                         )
                         if before is not None:
                             print(
@@ -2934,16 +2939,16 @@ def _run_eval_panoramic_vlm(
                         step_id += 1
                         continue
 
-                    before = (
-                        _env_trace_summary(env)
-                        if _debug_input_trace_enabled(args)
-                        else None
-                    )
+                    before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                     observations, done = _apply_habitat_action(env, first_action)
                     _record_post_action_step(
-                        step_recorder, env, step_id=step_id + 1,
-                        phase="local_action", action=int(first_action),
-                        image_size=image_size, vlm_output=llm_output,
+                        step_recorder,
+                        env,
+                        step_id=step_id + 1,
+                        phase="local_action",
+                        action=int(first_action),
+                        image_size=image_size,
+                        vlm_output=llm_output,
                     )
                     if before is not None:
                         print(
@@ -2957,9 +2962,13 @@ def _run_eval_panoramic_vlm(
 
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="stop", action=int(ActionCode.STOP),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
                 continue
@@ -2972,9 +2981,13 @@ def _run_eval_panoramic_vlm(
                     continue
                 observations, done = _apply_habitat_action(env, action)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="vlm_action", action=int(action),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="vlm_action",
+                    action=int(action),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
             elif not (llm_output or "").strip():
@@ -2986,17 +2999,25 @@ def _run_eval_panoramic_vlm(
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.LEFT)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="fallback_action", action=int(ActionCode.LEFT),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="fallback_action",
+                    action=int(ActionCode.LEFT),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
             else:
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="stop", action=int(ActionCode.STOP),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
 
@@ -3274,6 +3295,11 @@ def _rpc_plan_panoramic(
     trajectory_x_sign: float,
     trajectory_heading_alignment: str,
     jpeg_quality: int,
+    scene_id: str,
+    episode_id: int,
+    system2_call_index: int,
+    protocol_seed: int,
+    require_deterministic_sampling: bool,
     oracle_system2: dict[str, Any] | None = None,
 ) -> dict:
     blobs = []
@@ -3284,6 +3310,12 @@ def _rpc_plan_panoramic(
             blobs.append(_rpc_blob_from_pil(f"history/{idx}/{view}", hist[view], jpeg_quality))
     blobs.append(_rpc_blob_from_pil("lookdown", lookdown_img, jpeg_quality))
 
+    sampling_metadata = build_rpc_sampling_metadata(
+        protocol_seed=protocol_seed,
+        scene_id=scene_id,
+        episode_id=episode_id,
+        system2_call_index=system2_call_index,
+    )
     payload = {
         "instruction": instruction,
         "num_history": len(history_panoramas),
@@ -3293,6 +3325,8 @@ def _rpc_plan_panoramic(
         "trajectory_selection": trajectory_selection,
         "trajectory_x_sign": trajectory_x_sign,
         "trajectory_heading_alignment": trajectory_heading_alignment,
+        "require_deterministic_sampling": bool(require_deterministic_sampling),
+        HEATMAPVLN_RPC_SAMPLING_FIELD: sampling_metadata,
     }
     if oracle_system2 is not None:
         payload["oracle_system2"] = oracle_system2
@@ -3308,6 +3342,15 @@ def _rpc_plan_panoramic(
             f"server={response.get('proto_v')!r} "
             f"expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
         )
+    response_sampling = validate_rpc_sampling_metadata(
+        response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+        require_deterministic=True,
+    )
+    if response_sampling != sampling_metadata:
+        raise RuntimeError(
+            "RPC server did not echo the exact deterministic sampling record: "
+            f"request={sampling_metadata!r} response={response_sampling!r}"
+        )
     return response
 
 
@@ -3319,9 +3362,7 @@ def run_eval_rpc_panoramic(args):
     ensure_vln_measures_registered()
     with open(args.config) as f:
         train_cfg = yaml.safe_load(f)
-    panoramic_vlm_input = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
-    )
+    panoramic_vlm_input = bool(train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False))
     if not panoramic_vlm_input:
         raise RuntimeError("--rpc_server currently supports panoramic_vlm_input configs only")
 
@@ -3336,6 +3377,12 @@ def run_eval_rpc_panoramic(args):
     print(f"trajectory_selection={args.trajectory_selection}")
     print(f"trajectory_x_sign={args.trajectory_x_sign:g}")
     print(f"trajectory_heading_alignment={args.trajectory_heading_alignment}")
+    print(
+        "rpc_sampling="
+        f"{HEATMAPVLN_RPC_SAMPLING_PROTOCOL} "
+        f"protocol_seed={args.rpc_protocol_seed} "
+        f"required={bool(args.rpc_require_deterministic_sampling)}"
+    )
     if bool(getattr(args, "oracle_system2", False)):
         print(
             "[rpc-eval] --oracle_system2 is ACTIVE; System2 text will be "
@@ -3356,8 +3403,7 @@ def run_eval_rpc_panoramic(args):
         print(f"RPC server: version={info.version}, model={info.model_version}")
         if info.version != HEATMAPVLN_RPC_PROTOCOL_VERSION:
             raise RuntimeError(
-                "RPC server protocol mismatch: "
-                f"server={info.version!r} expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
+                f"RPC server protocol mismatch: server={info.version!r} expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
             )
 
     hab_cfg = build_habitat_config(args)
@@ -3368,16 +3414,22 @@ def run_eval_rpc_panoramic(args):
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
-    sucs, spls, oss, nes, done_set = _load_progress(progress_file)
     target_list, target_set = _episode_list_from_args(args)
+    sucs, spls, oss, nes, done_set = _load_progress(
+        progress_file,
+        expected_rpc_sampling_contract=build_rpc_progress_sampling_contract(
+            protocol_seed=int(args.rpc_protocol_seed),
+            require_deterministic_sampling=bool(args.rpc_require_deterministic_sampling),
+        ),
+    )
+    if target_set is not None and not done_set.issubset(target_set):
+        unexpected = sorted(done_set - target_set)
+        raise ValueError(f"RPC progress contains episodes outside the requested fixed cohort: {unexpected[:10]}")
     if target_list is not None:
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
-    print(
-        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
-        f"this run: {eval_limit}"
-    )
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
 
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
@@ -3406,10 +3458,7 @@ def run_eval_rpc_panoramic(args):
 
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
-        print(
-            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
-            f"{instruction[:80]}..."
-        )
+        print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
 
         executed_history_panoramas: list[dict[str, Image.Image]] = []
         local_actions: list[int] = []
@@ -3422,7 +3471,9 @@ def run_eval_rpc_panoramic(args):
         step_recorder: TrajectoryStepRecorder | None = None
         if args.save_trajectory_steps:
             step_recorder = TrajectoryStepRecorder(
-                Path(output_path), scene_id, episode_id,
+                Path(output_path),
+                scene_id,
+                episode_id,
             )
             init_state = env._sim.get_agent(0).get_state()
             init_pos = np.array(init_state.position, dtype=float)
@@ -3471,8 +3522,7 @@ def run_eval_rpc_panoramic(args):
                 observations, done = _apply_habitat_action(env, action)
                 if before is not None:
                     print(
-                        f"  [debug] executed local action={int(action)} "
-                        f"{before} -> {_env_trace_summary(env)}",
+                        f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
                         flush=True,
                     )
                 step_id += 1
@@ -3529,9 +3579,7 @@ def run_eval_rpc_panoramic(args):
                     max_side_dist_m=float(getattr(args, "oracle_system2_max_side_dist_m", 6.0)),
                 )
                 if oracle_system2 is None:
-                    raise RuntimeError(
-                        f"Could not build oracle System2 for {scene_id}_{episode_id:04d}"
-                    )
+                    raise RuntimeError(f"Could not build oracle System2 for {scene_id}_{episode_id:04d}")
                 print(
                     "  [oracle-system2] "
                     f"{oracle_system2['text'].replace(chr(10), ' | ')} "
@@ -3553,20 +3601,25 @@ def run_eval_rpc_panoramic(args):
                 trajectory_x_sign=args.trajectory_x_sign,
                 trajectory_heading_alignment=args.trajectory_heading_alignment,
                 jpeg_quality=args.rpc_jpeg_quality,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                # Explicitly zero-based and independent of any calls made by
+                # the other experimental arm.
+                system2_call_index=system2_calls - 1,
+                protocol_seed=args.rpc_protocol_seed,
+                require_deterministic_sampling=args.rpc_require_deterministic_sampling,
                 oracle_system2=oracle_system2,
             )
             llm_output = response.get("llm_output", "")
             actions = [int(action) for action in response.get("actions", [])]
             print(
-                f"  step_id: {step_id}, RPC kind={response.get('kind')}, "
-                f"VLM output: {llm_output}",
+                f"  step_id: {step_id}, RPC kind={response.get('kind')}, VLM output: {llm_output}",
                 flush=True,
             )
             if response.get("trajectory_summary"):
                 trajectory_calls += 1
                 print(
-                    f"  [debug] trajectory {response['trajectory_summary']}, "
-                    f"actions={actions}",
+                    f"  [debug] trajectory {response['trajectory_summary']}, actions={actions}",
                     flush=True,
                 )
             elif actions:
@@ -3576,19 +3629,22 @@ def run_eval_rpc_panoramic(args):
                 state = env._sim.get_agent(0).get_state()
                 pos = np.array(state.position, dtype=float)
                 rot = quaternion.as_float_array(state.rotation)
-                step_recorder.record_step({
-                    "step_id": step_id,
-                    "phase": "rpc_vlm",
-                    "position": pos,
-                    "heading_deg": _quat_to_heading_deg(rot),
-                    "rotation": rot,
-                    "distance_to_goal": _metric_distance_to_goal(env),
-                    "vlm_output": llm_output,
-                    "pixel_goal": response.get("pixel_goal"),
-                    "pano_goal_view": response.get("pano_goal_view"),
-                    "oracle_system2": response.get("oracle_system2"),
-                    "current_views": current_views,
-                })
+                step_recorder.record_step(
+                    {
+                        "step_id": step_id,
+                        "phase": "rpc_vlm",
+                        "position": pos,
+                        "heading_deg": _quat_to_heading_deg(rot),
+                        "rotation": rot,
+                        "distance_to_goal": _metric_distance_to_goal(env),
+                        "vlm_output": llm_output,
+                        "pixel_goal": response.get("pixel_goal"),
+                        "pano_goal_view": response.get("pano_goal_view"),
+                        "oracle_system2": response.get("oracle_system2"),
+                        HEATMAPVLN_RPC_SAMPLING_FIELD: response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+                        "current_views": current_views,
+                    }
+                )
 
             if response.get("terminal", False):
                 action = actions[0] if actions else ActionCode.STOP
@@ -3629,8 +3685,7 @@ def run_eval_rpc_panoramic(args):
             observations, done = _apply_habitat_action(env, first_action)
             if before is not None:
                 print(
-                    f"  [debug] executed first RPC action={int(first_action)} "
-                    f"{before} -> {_env_trace_summary(env)}",
+                    f"  [debug] executed first RPC action={int(first_action)} {before} -> {_env_trace_summary(env)}",
                     flush=True,
                 )
             step_id += 1
@@ -3678,6 +3733,10 @@ def run_eval_rpc_panoramic(args):
             "trajectory_calls": trajectory_calls,
             "rpc_server": args.rpc_server,
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+            "rpc_deterministic_sampling_enabled": True,
+            "rpc_protocol_seed": int(args.rpc_protocol_seed),
+            "rpc_require_deterministic_sampling": bool(args.rpc_require_deterministic_sampling),
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
@@ -3701,6 +3760,10 @@ def run_eval_rpc_panoramic(args):
     final_result.update(
         {
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+            "rpc_deterministic_sampling_enabled": True,
+            "rpc_protocol_seed": int(args.rpc_protocol_seed),
+            "rpc_require_deterministic_sampling": bool(args.rpc_require_deterministic_sampling),
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
@@ -3728,6 +3791,7 @@ def run_eval_rpc_panoramic(args):
 # Section 9: Main evaluation loop
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def run_eval(args):
     if getattr(args, "rpc_server", ""):
         return run_eval_rpc_panoramic(args)
@@ -3742,38 +3806,25 @@ def run_eval(args):
     processor = model.qwen2_5_vl.processor
     processor.tokenizer.padding_side = "left"
 
-    action_scale = (
-        train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
-    )
-    num_sample_trajs = (
-        train_cfg.get("model", {})
-        .get("action_head", {})
-        .get("nextdit", {})
-        .get("num_sample_trajs", 32)
-    )
+    action_scale = train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
+    num_sample_trajs = train_cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("num_sample_trajs", 32)
     has_nextdit = model.nextdit_action_head is not None and model.latent_queries is not None
     print(f"NextDiT action head available: {has_nextdit}")
     print(f"  action_scale={action_scale}, num_sample_trajs={num_sample_trajs}")
     print(f"  trajectory_selection={args.trajectory_selection}")
 
-    panoramic_vlm_input = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
-    )
+    panoramic_vlm_input = bool(train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False))
     print(f"Panoramic VLM input: {panoramic_vlm_input}")
 
     pano_latent_adapter = None
     if getattr(args, "pano_latent_adapter_checkpoint", None):
-        hidden_dim = int(
-            train_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584)
-        )
-        print(
-            f"Loading pano-latent adapter from {args.pano_latent_adapter_checkpoint} "
-            f"(hidden_dim={hidden_dim})"
-        )
+        hidden_dim = int(train_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
+        print(f"Loading pano-latent adapter from {args.pano_latent_adapter_checkpoint} (hidden_dim={hidden_dim})")
         pano_latent_adapter = _load_pano_latent_adapter(
             args.pano_latent_adapter_checkpoint,
             hidden_dim=hidden_dim,
             device=device,
+            dtype=model.config.dtype,
         )
     elif getattr(model, "pano_latent_adapter", None) is not None:
         pano_latent_adapter = model.pano_latent_adapter
@@ -3785,20 +3836,11 @@ def run_eval(args):
     force_teacher_device = None
     if bool(getattr(args, "force_teacher_coord", False)):
         if not getattr(args, "force_teacher_internnav_model_path", ""):
-            raise RuntimeError(
-                "--force_teacher_coord requires --force_teacher_internnav_model_path"
-            )
+            raise RuntimeError("--force_teacher_coord requires --force_teacher_internnav_model_path")
         if not getattr(args, "force_teacher_internnav_repo", ""):
-            raise RuntimeError(
-                "--force_teacher_coord requires --force_teacher_internnav_repo"
-            )
-        print(
-            f"Loading InternNav teacher VLM for --force_teacher_coord from "
-            f"{args.force_teacher_internnav_model_path}"
-        )
-        force_teacher_model, force_teacher_processor, force_teacher_device = (
-            _load_force_teacher_internnav(args, device)
-        )
+            raise RuntimeError("--force_teacher_coord requires --force_teacher_internnav_repo")
+        print(f"Loading InternNav teacher VLM for --force_teacher_coord from {args.force_teacher_internnav_model_path}")
+        force_teacher_model, force_teacher_processor, force_teacher_device = _load_force_teacher_internnav(args, device)
 
     if panoramic_vlm_input:
         return _run_eval_panoramic_vlm(
@@ -3837,10 +3879,7 @@ def run_eval(args):
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
-    print(
-        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
-        f"this run: {eval_limit}"
-    )
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
 
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
@@ -3873,10 +3912,7 @@ def run_eval(args):
 
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
-        print(
-            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
-            f"{instruction[:80]}..."
-        )
+        print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
 
         # ── Per-episode state (InternNav dual-system logic) ──
         rgb_history: list[Image.Image] = []
@@ -3927,9 +3963,7 @@ def run_eval(args):
                 if action == ActionCode.LOOKDOWN:
                     sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
                     input_images += [lookdown_img]
-                    messages.append(
-                        {"role": "assistant", "content": [{"type": "text", "text": llm_output}]}
-                    )
+                    messages.append({"role": "assistant", "content": [{"type": "text", "text": llm_output}]})
                     input_img_id = -1
                 else:
                     sources = [
@@ -3942,13 +3976,9 @@ def run_eval(args):
                     if step_id == 0:
                         history_id = []
                     else:
-                        history_id = np.unique(
-                            np.linspace(0, step_id - 1, num_history, dtype=np.int32)
-                        ).tolist()
+                        history_id = np.unique(np.linspace(0, step_id - 1, num_history, dtype=np.int32)).tolist()
                         placeholder = (DEFAULT_IMAGE_TOKEN + "\n") * len(history_id)
-                        sources[0]["value"] += (
-                            f" These are your historical observations: {placeholder}."
-                        )
+                        sources[0]["value"] += f" These are your historical observations: {placeholder}."
 
                     history_id = sorted(history_id)
                     input_images = [rgb_history[i] for i in history_id] + cur_images
@@ -3994,7 +4024,7 @@ def run_eval(args):
                     ).sequences
 
                 llm_output = processor.tokenizer.decode(
-                    output_ids[0][inputs.input_ids.shape[1]:],
+                    output_ids[0][inputs.input_ids.shape[1] :],
                     skip_special_tokens=True,
                 )
                 print(f"  step_id: {step_id}, VLM output: {llm_output}")
@@ -4028,9 +4058,7 @@ def run_eval(args):
                         continue
 
                     lookdown_traj_img = (
-                        lookdown_img
-                        if lookdown_img.size == traj_image_size
-                        else lookdown_img.resize(traj_image_size)
+                        lookdown_img if lookdown_img.size == traj_image_size else lookdown_img.resize(traj_image_size)
                     )
                     lookdown_t = _lookdown_to_traj_tensor(lookdown_traj_img, device)
                     pix_goal_image = lookdown_t.clone()
@@ -4038,7 +4066,8 @@ def run_eval(args):
 
                     print("  [debug] calling generate_latents ...", flush=True)
                     lq = model.latent_queries.expand(1, -1, -1).to(
-                        device=device, dtype=model.config.dtype,
+                        device=device,
+                        dtype=model.config.dtype,
                     )
                     condition_output_ids = _condition_output_ids_for_pixel_goal(
                         output_ids=output_ids,
@@ -4059,8 +4088,7 @@ def run_eval(args):
                         )
                         if _debug_input_trace_enabled(args):
                             _per_q = [
-                                float(_last_traj_hs[0, i].float().norm().item())
-                                for i in range(_last_traj_hs.shape[1])
+                                float(_last_traj_hs[0, i].float().norm().item()) for i in range(_last_traj_hs.shape[1])
                             ]
                             print(
                                 "  [debug] traj_hs total_norm="
@@ -4114,9 +4142,7 @@ def run_eval(args):
             elif pix_goal_image is not None:
                 if len(local_actions) == 0:
                     lookdown_traj_img = (
-                        lookdown_img
-                        if lookdown_img.size == traj_image_size
-                        else lookdown_img.resize(traj_image_size)
+                        lookdown_img if lookdown_img.size == traj_image_size else lookdown_img.resize(traj_image_size)
                     )
                     lookdown_t = _lookdown_to_traj_tensor(lookdown_traj_img, device)
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
@@ -4219,16 +4245,19 @@ def run_eval(args):
 # Section 10: CLI
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate VLNPipeline on VLN-CE R2R val_unseen (Habitat closed-loop)"
+    parser = argparse.ArgumentParser(description="Evaluate VLNPipeline on VLN-CE R2R val_unseen (Habitat closed-loop)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="YAML config used for training (e.g. configs/train_config_internnav.yaml)",
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="YAML config used for training (e.g. configs/train_config_internnav.yaml)")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Optional main/Stage 2 checkpoint path (.pth)")
-    parser.add_argument("--base_checkpoint", type=str, default=None,
-                        help="Optional Stage 1/base checkpoint loaded before --checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Optional main/Stage 2 checkpoint path (.pth)")
+    parser.add_argument(
+        "--base_checkpoint", type=str, default=None, help="Optional Stage 1/base checkpoint loaded before --checkpoint"
+    )
     parser.add_argument(
         "--pano_latent_adapter_checkpoint",
         type=str,
@@ -4299,13 +4328,12 @@ def main():
         help="Optional separate GPU id for the teacher VLM; -1 = use --gpu_id.",
     )
     parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
-    parser.add_argument("--data_path", type=str,
-                        default=DEFAULT_DATA_PATH)
+    parser.add_argument("--data_path", type=str, default=DEFAULT_DATA_PATH)
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
-    parser.add_argument("--gpu_id", type=int, default=0,
-                        help="Torch CUDA device id for model inference")
-    parser.add_argument("--sim_gpu_id", type=int, default=0,
-                        help="Habitat-Sim GL device id; keep 0 for GLX/Xvfb builds")
+    parser.add_argument("--gpu_id", type=int, default=0, help="Torch CUDA device id for model inference")
+    parser.add_argument(
+        "--sim_gpu_id", type=int, default=0, help="Habitat-Sim GL device id; keep 0 for GLX/Xvfb builds"
+    )
     parser.add_argument(
         "--rpc_server",
         type=str,
@@ -4327,6 +4355,21 @@ def main():
         type=int,
         default=90,
         help="JPEG quality for RGB observations sent to the model server.",
+    )
+    parser.add_argument(
+        "--rpc_protocol_seed",
+        type=int,
+        default=HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED,
+        help=(
+            "Fixed cross-arm protocol seed used with scene/episode/System2 "
+            "call index to derive each NextDiT SHA256 seed."
+        ),
+    )
+    parser.add_argument(
+        "--rpc_require_deterministic_sampling",
+        action="store_true",
+        default=False,
+        help=("Ask the server to fail closed unless the deterministic NextDiT sampling record is complete and valid."),
     )
     parser.add_argument(
         "--oracle_system2",
@@ -4417,10 +4460,7 @@ def main():
         "--debug_input_trace",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=(
-            "Print compact pose, distance, image hash, and processor tensor stats "
-            "for System2/System1 inputs."
-        ),
+        help=("Print compact pose, distance, image hash, and processor tensor stats for System2/System1 inputs."),
     )
     parser.add_argument(
         "--debug_save_input_images",
@@ -4441,16 +4481,20 @@ def main():
             "for raw InternNav compatibility checks."
         ),
     )
-    parser.add_argument("--max_episodes", type=int, default=None,
-                        help="Evaluate at most this many new episodes")
-    parser.add_argument("--episode_list", type=str, default=None,
-                        help="JSON file with fixed episodes [{scene_id, episode_id}, ...]")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from output_path/progress.json")
-    parser.add_argument("--overwrite_output", action="store_true",
-                        help="Delete output_path/progress.json and result.json before evaluating")
+    parser.add_argument("--max_episodes", type=int, default=None, help="Evaluate at most this many new episodes")
     parser.add_argument(
-        "--save_trajectory_steps", action="store_true", default=False,
+        "--episode_list", type=str, default=None, help="JSON file with fixed episodes [{scene_id, episode_id}, ...]"
+    )
+    parser.add_argument("--resume", action="store_true", help="Resume from output_path/progress.json")
+    parser.add_argument(
+        "--overwrite_output",
+        action="store_true",
+        help="Delete output_path/progress.json and result.json before evaluating",
+    )
+    parser.add_argument(
+        "--save_trajectory_steps",
+        action="store_true",
+        default=False,
         help=(
             "Record per-step agent state, VLM outputs, panorama images into "
             "output_path/<scene>_<ep>/trajectory_steps.json for offline HTML "

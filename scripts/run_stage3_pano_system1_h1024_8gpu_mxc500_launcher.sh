@@ -110,6 +110,7 @@ export STAGE3_VIEW_WEIGHT_RIGHT="${STAGE3_VIEW_WEIGHT_RIGHT:-}"
 export STAGE3_VIEW_WEIGHT_BACK="${STAGE3_VIEW_WEIGHT_BACK:-}"
 export STAGE3_VIEW_WEIGHT_LEFT="${STAGE3_VIEW_WEIGHT_LEFT:-}"
 export STAGE3_NUM_WORKERS="${STAGE3_NUM_WORKERS:-16}"
+export STAGE3_IN_ORDER="${STAGE3_IN_ORDER:-}"
 export STAGE3_PREFETCH_FACTOR="${STAGE3_PREFETCH_FACTOR:-4}"
 export STAGE3_PIN_MEMORY="${STAGE3_PIN_MEMORY:-1}"
 export STAGE3_SHM_BYPASS="${STAGE3_SHM_BYPASS:-auto}"
@@ -221,6 +222,7 @@ paths["internnav_model_path"] = os.environ["INTERNNAV_MODEL_PATH"]
 data = cfg.setdefault("data", {})
 data["root"] = os.environ["PANORAMIC_DATA_ROOT"]
 set_int(data, "num_workers", "STAGE3_NUM_WORKERS")
+set_bool(data, "in_order", "STAGE3_IN_ORDER")
 set_int(data, "prefetch_factor", "STAGE3_PREFETCH_FACTOR")
 set_bool(data, "pin_memory", "STAGE3_PIN_MEMORY")
 if os.environ.get("STAGE3_SHM_BYPASS", "").strip():
@@ -319,11 +321,17 @@ import yaml
 with open(sys.argv[1], encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 stage = cfg["training"]["stages"][0]
+data = cfg.get("data", {})
 l2_sp = cfg.get("loss", {}).get("l2_sp", {})
 view_weights = cfg.get("loss", {}).get("trajectory_view_weights", {})
 print(
     "[launcher] trajectory_sequence_mode="
     f"{stage.get('trajectory_sequence_mode', 'all')}"
+)
+print(
+    "[launcher] dataloader="
+    f"num_workers:{int(data.get('num_workers', 0))} "
+    f"in_order:{bool(data.get('in_order', False))}"
 )
 print(
     "[launcher] l2_sp="

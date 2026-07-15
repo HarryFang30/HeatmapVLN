@@ -30,14 +30,20 @@ import grpc
 import numpy as np
 import torch
 from PIL import Image
-
-from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
+from scripts.evaluation.rpc_protocol import (
+    HEATMAPVLN_RPC_PROTOCOL_VERSION,
+    HEATMAPVLN_RPC_SAMPLING_FIELD,
+    validate_rpc_sampling_metadata,
+)
 from scripts.training.utils import (
     _normalize_state_key,
     assert_complete_lora_checkpoint_match,
     extract_lora_checkpoint_state,
     load_config,
 )
+from vla_rpc.core.image import decode_jpeg_to_rgb
+from vla_rpc.proto import vla_pb2, vla_pb2_grpc
+
 from src.models.heatmap.input_constructor import (
     construct_input,
     parse_structured_pano_output,
@@ -50,8 +56,6 @@ from src.utils.trajectory_direction import (
     align_trajectory_endpoint_heading,
     view_pixel_target_angle_deg,
 )
-from vla_rpc.core.image import decode_jpeg_to_rgb
-from vla_rpc.proto import vla_pb2, vla_pb2_grpc
 
 LOGGER = logging.getLogger("heatmapvln-rpc-server")
 
@@ -97,10 +101,7 @@ def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tens
             return state_dict
     if all(torch.is_tensor(value) for value in ckpt.values()):
         return ckpt
-    raise KeyError(
-        "Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: "
-        f"{checkpoint_path}"
-    )
+    raise KeyError(f"Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: {checkpoint_path}")
 
 
 def _extract_checkpoint_config(checkpoint_path: str | None) -> dict:
@@ -162,11 +163,7 @@ def _assert_finite_state_dict(state_dict: dict[str, torch.Tensor], label: str) -
     non_tensors = [name for name, value in state_dict.items() if not torch.is_tensor(value)]
     if non_tensors:
         raise RuntimeError(f"{label} contains non-tensor values: {non_tensors[:5]}")
-    nonfinite = [
-        name
-        for name, value in state_dict.items()
-        if not bool(torch.isfinite(value.float()).all())
-    ]
+    nonfinite = [name for name, value in state_dict.items() if not bool(torch.isfinite(value.float()).all())]
     if nonfinite:
         raise RuntimeError(f"{label} contains non-finite tensors: {nonfinite[:5]}")
 
@@ -190,8 +187,7 @@ def _load_compatible_state_dict(
             continue
         if current_state[actual_name].shape != value.shape:
             skipped_shape.append(
-                f"{actual_name}: ckpt {tuple(value.shape)} vs "
-                f"model {tuple(current_state[actual_name].shape)}"
+                f"{actual_name}: ckpt {tuple(value.shape)} vs model {tuple(current_state[actual_name].shape)}"
             )
             continue
         remapped[actual_name] = value
@@ -212,7 +208,12 @@ def _load_compatible_state_dict(
     return len(remapped)
 
 
-def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
+def _load_pano_latent_adapter(
+    checkpoint_path: str,
+    hidden_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
     from scripts.evaluation.eval_pano_latent_adapter import _load_adapter_from_checkpoint
 
     fallback = argparse.Namespace(
@@ -226,6 +227,7 @@ def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: tor
         dim=hidden_dim,
         fallback_args=fallback,
         device=device,
+        dtype=dtype,
     )
     return adapter
 
@@ -354,10 +356,24 @@ def _condition_output_ids_for_pixel_goal(
     return torch.cat([output_ids[:, :prompt_len], replacement_ids], dim=1)
 
 
-def _trajectory_from_condition(action_head, traj_condition: torch.Tensor, *, traj_images: torch.Tensor | None):
+def _trajectory_from_condition(
+    action_head,
+    traj_condition: torch.Tensor,
+    *,
+    traj_images: torch.Tensor | None,
+    generator: torch.Generator | None = None,
+):
     if traj_condition.shape[-1] == int(action_head.config.latent_emb_size):
-        return action_head.get_trajectory_from_projected(traj_condition, traj_images=traj_images)
-    return action_head.get_trajectory(traj_condition, traj_images=traj_images)
+        return action_head.get_trajectory_from_projected(
+            traj_condition,
+            traj_images=traj_images,
+            generator=generator,
+        )
+    return action_head.get_trajectory(
+        traj_condition,
+        traj_images=traj_images,
+        generator=generator,
+    )
 
 
 def _lookdown_to_traj_tensor(lookdown_img: Image.Image, device: torch.device) -> torch.Tensor:
@@ -507,9 +523,7 @@ def traj_to_actions(
     target_heading_deg: float | None = None,
 ) -> list[int]:
     if trajectory_x_sign not in (-1.0, 1.0):
-        raise ValueError(
-            f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
-        )
+        raise ValueError(f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}")
     trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy().copy()
     trajs[:, :, :2] /= action_scale
     trajs[:, :, 0] *= trajectory_x_sign
@@ -571,12 +585,10 @@ class HeatmapVLNRuntime:
         self.processor.tokenizer.padding_side = "left"
         self.action_scale = self.train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
         self.num_sample_trajs = (
-            self.train_cfg.get("model", {})
-            .get("action_head", {})
-            .get("nextdit", {})
-            .get("num_sample_trajs", 32)
+            self.train_cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("num_sample_trajs", 32)
         )
         self.has_nextdit = self.model.nextdit_action_head is not None and self.model.latent_queries is not None
+        self.require_deterministic_sampling = bool(getattr(args, "require_deterministic_sampling", False))
         self.pano_latent_adapter = self._load_adapter(args)
         if self.pano_latent_adapter is None and getattr(self.model, "pano_latent_adapter", None) is not None:
             self.pano_latent_adapter = self.model.pano_latent_adapter
@@ -584,6 +596,10 @@ class HeatmapVLNRuntime:
             LOGGER.info("Using model-attached pano latent adapter")
         LOGGER.info("NextDiT action head available: %s", self.has_nextdit)
         LOGGER.info("action_scale=%s num_sample_trajs=%s", self.action_scale, self.num_sample_trajs)
+        LOGGER.info(
+            "require_deterministic_sampling=%s",
+            self.require_deterministic_sampling,
+        )
 
     def _load_runtime_config(self, args: argparse.Namespace) -> dict:
         cfg = load_config(args.config)
@@ -634,9 +650,8 @@ class HeatmapVLNRuntime:
             LOGGER.warning("Main checkpoint contains only action-head weights and no base checkpoint was loaded")
 
         model.qwen2_5_vl._load_model()
-        if (
-            _state_has_prefix(base_state_dict, "heatmap_vln.")
-            or _state_has_prefix(checkpoint_state_dict, "heatmap_vln.")
+        if _state_has_prefix(base_state_dict, "heatmap_vln.") or _state_has_prefix(
+            checkpoint_state_dict, "heatmap_vln."
         ):
             model._ensure_heatmap_vln()
 
@@ -660,9 +675,7 @@ class HeatmapVLNRuntime:
             if stage_cfg.get("base_checkpoint_lora_only", False):
                 base_state_to_load = extract_lora_checkpoint_state(base_state_dict)
                 if not base_state_to_load:
-                    raise RuntimeError(
-                        f"Base checkpoint contains no LoRA tensors: {args.base_checkpoint}"
-                    )
+                    raise RuntimeError(f"Base checkpoint contains no LoRA tensors: {args.base_checkpoint}")
                 LOGGER.info(
                     "Base checkpoint LoRA-only guard: loading %d/%d tensors; "
                     "InternNav System1 and pano adapter cannot be overwritten",
@@ -677,8 +690,7 @@ class HeatmapVLNRuntime:
             )
             if loaded_base != len(base_state_to_load):
                 raise RuntimeError(
-                    "Incomplete base checkpoint load refused: "
-                    f"loaded={loaded_base}/{len(base_state_to_load)}"
+                    f"Incomplete base checkpoint load refused: loaded={loaded_base}/{len(base_state_to_load)}"
                 )
         if checkpoint_state_dict:
             _assert_finite_state_dict(checkpoint_state_dict, "Main checkpoint")
@@ -690,8 +702,7 @@ class HeatmapVLNRuntime:
             )
             if loaded_main != len(checkpoint_state_dict):
                 raise RuntimeError(
-                    "Incomplete main checkpoint load refused: "
-                    f"loaded={loaded_main}/{len(checkpoint_state_dict)}"
+                    f"Incomplete main checkpoint load refused: loaded={loaded_main}/{len(checkpoint_state_dict)}"
                 )
         del checkpoint_state_dict
         del base_state_dict
@@ -709,19 +720,15 @@ class HeatmapVLNRuntime:
             args.pano_latent_adapter_checkpoint,
             hidden_dim,
             self.device,
+            self.model.config.dtype,
         )
         adapter_cfg = (
-            self.train_cfg.get("model", {})
-            .get("action_head", {})
-            .get("nextdit", {})
-            .get("pano_latent_adapter", {})
+            self.train_cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("pano_latent_adapter", {})
         )
         expected_hidden_dim = int(adapter_cfg.get("hidden_dim", 0) or 0)
         actual_dim = int(getattr(adapter, "dim", hidden_dim))
         actual_hidden_dim = int(getattr(adapter, "hidden_dim", expected_hidden_dim))
-        if actual_dim != hidden_dim or (
-            expected_hidden_dim > 0 and actual_hidden_dim != expected_hidden_dim
-        ):
+        if actual_dim != hidden_dim or (expected_hidden_dim > 0 and actual_hidden_dim != expected_hidden_dim):
             raise RuntimeError(
                 "Pano adapter architecture mismatch: "
                 f"dim={actual_dim}/{hidden_dim} "
@@ -729,15 +736,28 @@ class HeatmapVLNRuntime:
             )
         _assert_finite_state_dict(adapter.state_dict(), "Pano latent adapter")
         LOGGER.info(
-            "Verified pano latent adapter: tensors=%d parameters=%d dim=%d hidden_dim=%d",
+            "Verified pano latent adapter: tensors=%d parameters=%d dim=%d hidden_dim=%d dtype=%s",
             len(adapter.state_dict()),
             sum(parameter.numel() for parameter in adapter.parameters()),
             actual_dim,
             actual_hidden_dim,
+            next(adapter.parameters()).dtype,
         )
         return adapter
 
     def plan_panoramic(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
+        require_deterministic = self.require_deterministic_sampling or bool(
+            payload.get("require_deterministic_sampling", False)
+        )
+        sampling_metadata = validate_rpc_sampling_metadata(
+            payload.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+            require_deterministic=require_deterministic,
+        )
+        trajectory_generator = None
+        if sampling_metadata is not None:
+            trajectory_generator = torch.Generator(device=self.device)
+            trajectory_generator.manual_seed(int(sampling_metadata["per_call_seed"]))
+
         blob_map = _blobs_by_name(blobs)
         vlm_image_size = tuple(payload.get("vlm_image_size") or self.train_cfg["data"]["image_size"])
         traj_image_size = tuple(
@@ -750,10 +770,12 @@ class HeatmapVLNRuntime:
         }
         history_panoramas: list[dict[str, Image.Image]] = []
         for hist_idx in range(int(payload.get("num_history", 0))):
-            history_panoramas.append({
-                view: _pil_from_blob(blob_map[f"history/{hist_idx}/{view}"], vlm_image_size)
-                for view in ("front", "right", "back", "left")
-            })
+            history_panoramas.append(
+                {
+                    view: _pil_from_blob(blob_map[f"history/{hist_idx}/{view}"], vlm_image_size)
+                    for view in ("front", "right", "back", "left")
+                }
+            )
         lookdown_img = _pil_from_blob(blob_map["lookdown"], traj_image_size)
         instruction = str(payload.get("instruction", ""))
         trajectory_cfg = self.train_cfg.get("data", {}).get("trajectory", {})
@@ -764,17 +786,12 @@ class HeatmapVLNRuntime:
             system1_coord_order = "generated"
         trajectory_selection = str(payload.get("trajectory_selection", "mean"))
         trajectory_x_sign = float(payload.get("trajectory_x_sign", 1.0))
-        trajectory_heading_alignment = str(
-            payload.get("trajectory_heading_alignment", "none")
-        ).lower()
+        trajectory_heading_alignment = str(payload.get("trajectory_heading_alignment", "none")).lower()
         if trajectory_x_sign not in (-1.0, 1.0):
-            raise ValueError(
-                f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
-            )
+            raise ValueError(f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}")
         if trajectory_heading_alignment not in {"none", "pano_pixel"}:
             raise ValueError(
-                "trajectory_heading_alignment must be none or pano_pixel, got "
-                f"{trajectory_heading_alignment!r}"
+                f"trajectory_heading_alignment must be none or pano_pixel, got {trajectory_heading_alignment!r}"
             )
         oracle_system2 = payload.get("oracle_system2")
         if not isinstance(oracle_system2, dict):
@@ -840,6 +857,8 @@ class HeatmapVLNRuntime:
             "terminal": False,
             "kind": "unknown",
         }
+        if sampling_metadata is not None:
+            response[HEATMAPVLN_RPC_SAMPLING_FIELD] = sampling_metadata
         if vlm_output_requests_stop(llm_output):
             response.update({"kind": "stop", "terminal": True, "actions": [ActionCode.STOP]})
             return response
@@ -911,6 +930,7 @@ class HeatmapVLNRuntime:
                     self.model.nextdit_action_head,
                     traj_hs,
                     traj_images=traj_images,
+                    generator=trajectory_generator,
                 )
             local_actions = _finalize_local_actions(
                 traj_to_actions(
@@ -925,19 +945,21 @@ class HeatmapVLNRuntime:
             if local_actions and local_actions[0] == ActionCode.STOP:
                 local_actions = [ActionCode.LEFT]
                 response["anti_deadlock"] = True
-            response.update({
-                "kind": "trajectory",
-                "actions": [int(action) for action in local_actions],
-                "trajectory_summary": _trajectory_debug_summary(
-                    trajectory,
-                    self.num_sample_trajs,
-                    self.action_scale,
-                    trajectory_x_sign,
-                ),
-                "trajectory_x_sign": trajectory_x_sign,
-                "trajectory_heading_alignment": trajectory_heading_alignment,
-                "trajectory_target_heading_deg": target_heading_deg,
-            })
+            response.update(
+                {
+                    "kind": "trajectory",
+                    "actions": [int(action) for action in local_actions],
+                    "trajectory_summary": _trajectory_debug_summary(
+                        trajectory,
+                        self.num_sample_trajs,
+                        self.action_scale,
+                        trajectory_x_sign,
+                    ),
+                    "trajectory_x_sign": trajectory_x_sign,
+                    "trajectory_heading_alignment": trajectory_heading_alignment,
+                    "trajectory_target_heading_deg": target_heading_deg,
+                }
+            )
             return response
 
         response.update({"kind": "fallback_stop", "terminal": True, "actions": [ActionCode.STOP]})
@@ -997,6 +1019,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--require_deterministic_sampling",
+        action="store_true",
+        help=(
+            "Reject legacy/partial RPC requests that do not provide a valid "
+            "SHA256-derived deterministic NextDiT sampling key."
+        ),
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 

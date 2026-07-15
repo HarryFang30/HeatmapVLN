@@ -170,6 +170,7 @@ class DataConfig(_Strict):
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
+    in_order: bool = False
     dataset_type: str = "sliding_window"
     sliding_window: SlidingWindowConfig | None = None
     trajectory: TrajectoryConfig | None = None

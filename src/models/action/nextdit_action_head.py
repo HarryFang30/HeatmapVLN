@@ -45,6 +45,7 @@ RESNET_STD = [0.229, 0.224, 0.225]
 @dataclass
 class NextDiTActionConfig:
     """Configuration for NextDiTActionHead."""
+
     vlm_hidden_dim: int = 3584
     latent_emb_size: int = LATENT_EMB_SIZE
     n_query: int = 4
@@ -140,8 +141,11 @@ class NextDiTActionHead(nn.Module):
         logger.info(
             "NextDiTActionHead initialized: dit_layers=%d, dit_dim=%d, predict_steps=%d, "
             "total_params=%s, trainable_params=%s",
-            config.dit_layers, config.dit_dim, config.predict_steps,
-            f"{total_params:,}", f"{trainable_params:,}",
+            config.dit_layers,
+            config.dit_dim,
+            config.predict_steps,
+            f"{total_params:,}",
+            f"{trainable_params:,}",
         )
 
     def load_pretrained_system1(
@@ -188,8 +192,7 @@ class NextDiTActionHead(nn.Module):
                         logger.info("  Loaded latent_queries %s", tuple(ckpt_val.shape))
                     else:
                         skipped.append(
-                            f"latent_queries: ckpt {tuple(ckpt_val.shape)} "
-                            f"vs model {tuple(latent_queries.shape)}"
+                            f"latent_queries: ckpt {tuple(ckpt_val.shape)} vs model {tuple(latent_queries.shape)}"
                         )
                 continue
 
@@ -198,14 +201,14 @@ class NextDiTActionHead(nn.Module):
                     loaded_sd[ckpt_key] = ckpt_val
                 else:
                     skipped.append(
-                        f"{ckpt_key}: ckpt {tuple(ckpt_val.shape)} "
-                        f"vs model {tuple(current_sd[ckpt_key].shape)}"
+                        f"{ckpt_key}: ckpt {tuple(ckpt_val.shape)} vs model {tuple(current_sd[ckpt_key].shape)}"
                     )
 
         if skipped:
             logger.warning(
                 "Skipped %d tensors due to shape mismatch:\n  %s",
-                len(skipped), "\n  ".join(skipped),
+                len(skipped),
+                "\n  ".join(skipped),
             )
 
         missing, _unexpected = self.load_state_dict(loaded_sd, strict=False)
@@ -214,7 +217,9 @@ class NextDiTActionHead(nn.Module):
 
         logger.info(
             "System 1 weight loading complete: loaded=%d, skipped=%d, missing=%d",
-            loaded_count, len(skipped), len(real_missing),
+            loaded_count,
+            len(skipped),
+            len(real_missing),
         )
         if real_missing:
             logger.info("  Missing keys (random init): %s", real_missing)
@@ -273,13 +278,11 @@ class NextDiTActionHead(nn.Module):
         B = traj_images.shape[0]
         images_dp = traj_images.permute(0, 1, 4, 2, 3)  # (B, 2, 3, H, W)
         model_dtype = next(self.rgb_model.parameters()).dtype
-        images_dp_norm = ((images_dp.to(dtype=model_dtype) - self._resnet_mean) / self._resnet_std)
+        images_dp_norm = (images_dp.to(dtype=model_dtype) - self._resnet_mean) / self._resnet_std
 
         with torch.no_grad():
-            images_dp_feat = (
-                self.rgb_model
-                .get_intermediate_layers(images_dp_norm.flatten(0, 1))[0]
-                .unflatten(dim=0, sizes=(B, -1))
+            images_dp_feat = self.rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1))[0].unflatten(
+                dim=0, sizes=(B, -1)
             )
         # images_dp_feat: (B, 2, num_patches, 384)
 
@@ -306,23 +309,15 @@ class NextDiTActionHead(nn.Module):
         each of the N images becomes the current image for one trajectory loss.
         Evaluation still passes explicit pairs as ``(B, 2, H, W, 3)``.
         """
-        if (
-            traj_images is None
-            or traj_images.ndim != 5
-            or gt_trajectory.ndim != 4
-        ):
+        if traj_images is None or traj_images.ndim != 5 or gt_trajectory.ndim != 4:
             return traj_hidden_states, gt_trajectory, traj_images, trajectory_valid
 
         batch_size, num_frames = traj_images.shape[:2]
-        anchor_images = traj_images[:, 0:1].repeat(
-            1, num_frames, 1, 1, 1
-        ).flatten(0, 1)
+        anchor_images = traj_images[:, 0:1].repeat(1, num_frames, 1, 1, 1).flatten(0, 1)
         current_images = traj_images.flatten(0, 1)
         traj_image_pairs = torch.stack([anchor_images, current_images], dim=1)
 
-        traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(
-            1, num_frames, 1, 1
-        ).flatten(0, 1)
+        traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, num_frames, 1, 1).flatten(0, 1)
         gt_trajectory = gt_trajectory.flatten(0, 1)
         if trajectory_valid is not None:
             trajectory_valid = trajectory_valid.flatten(0, 1)
@@ -378,10 +373,7 @@ class NextDiTActionHead(nn.Module):
         if traj_cond.ndim != 3:
             raise ValueError(f"traj_cond must be [B,Q,D], got {tuple(traj_cond.shape)}")
         if traj_cond.shape[-1] != self.config.latent_emb_size:
-            raise ValueError(
-                f"Expected projected dim {self.config.latent_emb_size}, "
-                f"got {traj_cond.shape[-1]}"
-            )
+            raise ValueError(f"Expected projected dim {self.config.latent_emb_size}, got {traj_cond.shape[-1]}")
 
         if traj_images is not None:
             memory_tokens = self._encode_visual_memory(traj_images)
@@ -429,11 +421,7 @@ class NextDiTActionHead(nn.Module):
         latents = self._fuse_projected_conditions(traj_cond, traj_images)
         bsz = noisy_trajectory.shape[0]
         action_features = self.action_encoder(noisy_trajectory)
-        pos_ids = (
-            torch.arange(noisy_trajectory.shape[1], device=noisy_trajectory.device)
-            .reshape(1, -1)
-            .repeat(bsz, 1)
-        )
+        pos_ids = torch.arange(noisy_trajectory.shape[1], device=noisy_trajectory.device).reshape(1, -1).repeat(bsz, 1)
         pos_embed = self.pos_encoding(pos_ids).to(dtype=action_features.dtype)
         action_features = action_features + pos_embed
         velocity = self.traj_dit(
@@ -469,10 +457,11 @@ class NextDiTActionHead(nn.Module):
         target_velocity: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute flow-matching loss from already-projected conditions."""
-        traj_cond, gt_trajectory, traj_images, trajectory_valid = (
-            self._expand_sequence_training_inputs(
-                traj_cond, gt_trajectory, traj_images, trajectory_valid,
-            )
+        traj_cond, gt_trajectory, traj_images, trajectory_valid = self._expand_sequence_training_inputs(
+            traj_cond,
+            gt_trajectory,
+            traj_images,
+            trajectory_valid,
         )
         if noisy_trajectory is None or timesteps is None or target_velocity is None:
             noisy_trajectory, timesteps, target_velocity = self.sample_flow_matching_inputs(gt_trajectory)
@@ -510,10 +499,11 @@ class NextDiTActionHead(nn.Module):
         Returns:
             Dict with 'loss' key
         """
-        traj_hidden_states, gt_trajectory, traj_images, trajectory_valid = (
-            self._expand_sequence_training_inputs(
-                traj_hidden_states, gt_trajectory, traj_images, trajectory_valid,
-            )
+        traj_hidden_states, gt_trajectory, traj_images, trajectory_valid = self._expand_sequence_training_inputs(
+            traj_hidden_states,
+            gt_trajectory,
+            traj_images,
+            trajectory_valid,
         )
         latents = self._fuse_conditions(traj_hidden_states, traj_images)
 
@@ -576,6 +566,7 @@ class NextDiTActionHead(nn.Module):
         guidance_scale: float,
         num_inference_steps: int,
         num_sample_trajs: int,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         device = latents_cond.device
         dtype = latents_cond.dtype
@@ -589,7 +580,7 @@ class NextDiTActionHead(nn.Module):
         # Initialize random noise
         traj_latents = randn_tensor(
             shape=(batch_size * num_sample_trajs, predict_step_nums, self.config.action_dim),
-            generator=None,
+            generator=generator,
             device=device,
             dtype=dtype,
         )
@@ -639,6 +630,7 @@ class NextDiTActionHead(nn.Module):
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """
         Generate trajectory via iterative flow matching denoising with CFG.
@@ -661,6 +653,7 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             num_sample_trajs=num_sample_trajs,
+            generator=generator,
         )
 
     @torch.no_grad()
@@ -672,6 +665,7 @@ class NextDiTActionHead(nn.Module):
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Generate trajectories from pre-projected NextDiT condition tokens."""
         latents_cond = self._fuse_projected_conditions(traj_cond, traj_images)
@@ -681,6 +675,7 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             num_sample_trajs=num_sample_trajs,
+            generator=generator,
         )
 
     @torch.no_grad()
@@ -688,6 +683,8 @@ class NextDiTActionHead(nn.Module):
         self,
         traj_hidden_states: torch.Tensor,
         traj_images: torch.Tensor | None = None,
+        *,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """
         High-level trajectory inference interface.
@@ -703,6 +700,7 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=self.config.guidance_scale,
             num_inference_steps=self.config.num_inference_steps,
             num_sample_trajs=self.config.num_sample_trajs,
+            generator=generator,
         )
 
     @torch.no_grad()
@@ -710,6 +708,8 @@ class NextDiTActionHead(nn.Module):
         self,
         traj_cond: torch.Tensor,
         traj_images: torch.Tensor | None = None,
+        *,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """High-level inference interface for direct 768-dim conditions."""
         self.eval()
@@ -720,4 +720,5 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=self.config.guidance_scale,
             num_inference_steps=self.config.num_inference_steps,
             num_sample_trajs=self.config.num_sample_trajs,
+            generator=generator,
         )

@@ -188,6 +188,37 @@ def _should_enable_shm_bypass(cfg: dict, num_workers: int, logger: logging.Logge
     return enabled
 
 
+def _dataloader_in_order_kwargs(
+    cfg: dict,
+    num_workers: int,
+    *,
+    validation: bool = False,
+) -> dict[str, bool]:
+    """Return an explicit worker-order policy only for multiprocessing loaders.
+
+    Training historically used ``in_order=False`` when workers were enabled,
+    while validation relied on DataLoader's ordered default.  Keep those
+    defaults for compatibility, but allow ``data.in_order`` to make formal
+    training runs causally comparable.  Omitting the keyword for a zero-worker
+    loader also keeps that path compatible with PyTorch versions without the
+    ``in_order`` argument.
+    """
+    if num_workers <= 0:
+        return {}
+
+    data_cfg = cfg.get("data", {})
+    config_key = "in_order"
+    configured = True if validation else data_cfg.get(config_key, False)
+    parsed = _parse_auto_bool(
+        configured,
+        name="validation in_order" if validation else f"data.{config_key}",
+    )
+    if parsed == "auto":
+        name = "validation in_order" if validation else f"data.{config_key}"
+        raise ValueError(f"{name} must be boolean-like, got 'auto'")
+    return {"in_order": parsed}
+
+
 def _log_notification_result(
     logger: logging.Logger,
     sent: bool,
@@ -733,7 +764,7 @@ def main():
         persistent_workers=persistent_workers,
         multiprocessing_context=mp_context,
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
-        in_order=not num_workers > 0,
+        **_dataloader_in_order_kwargs(cfg, num_workers),
     )
 
     if val_dataset is not None:
@@ -748,6 +779,7 @@ def main():
             collate_fn=actual_collate_fn,
             prefetch_factor=prefetch_factor if val_num_workers > 0 else None,
             persistent_workers=False,
+            **_dataloader_in_order_kwargs(cfg, val_num_workers, validation=True),
         )
         logger.info(f"   📊 验证 DataLoader: num_workers={val_num_workers}, prefetch={prefetch_factor}")
     else:

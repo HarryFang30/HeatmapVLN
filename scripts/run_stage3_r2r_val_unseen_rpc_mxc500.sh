@@ -31,6 +31,8 @@ export STAGE3_EVAL_RPC_HOST="${STAGE3_EVAL_RPC_HOST:-127.0.0.1}"
 export STAGE3_EVAL_RPC_PORT="${STAGE3_EVAL_RPC_PORT:-50061}"
 export STAGE3_EVAL_RPC_TIMEOUT_MS="${STAGE3_EVAL_RPC_TIMEOUT_MS:-600000}"
 export STAGE3_EVAL_RPC_JPEG_QUALITY="${STAGE3_EVAL_RPC_JPEG_QUALITY:-90}"
+export STAGE3_EVAL_RPC_PROTOCOL_SEED="${STAGE3_EVAL_RPC_PROTOCOL_SEED:-42}"
+export STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING="${STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING:-0}"
 export STAGE3_EVAL_SERVER_START_TIMEOUT_S="${STAGE3_EVAL_SERVER_START_TIMEOUT_S:-1800}"
 
 export STAGE3_EVAL_MAX_EPISODES="${STAGE3_EVAL_MAX_EPISODES:-}"
@@ -158,6 +160,13 @@ case "$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY" in
     exit 1
     ;;
 esac
+"$QWEN25_PYTHON" - "$STAGE3_EVAL_RPC_PROTOCOL_SEED" <<'PY'
+import sys
+
+seed = int(sys.argv[1])
+if not 0 <= seed <= (1 << 63) - 1:
+    raise SystemExit("STAGE3_EVAL_RPC_PROTOCOL_SEED must be in [0, 2**63 - 1]")
+PY
 "$QWEN25_PYTHON" - \
   "$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M" \
   "$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M" \
@@ -276,6 +285,7 @@ echo "[stage3-eval] stage3=$STAGE3_EVAL_CHECKPOINT"
 echo "[stage3-eval] scenes=$STAGE3_EVAL_SCENES_DIR (${scene_count})"
 echo "[stage3-eval] data=$STAGE3_EVAL_DATA_PATH"
 echo "[stage3-eval] rpc=$RPC_SERVER_ADDR rpc_root=$RPC_ROOT"
+echo "[stage3-eval] rpc_protocol_seed=$STAGE3_EVAL_RPC_PROTOCOL_SEED require_deterministic_sampling=$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"
 echo "[stage3-eval] model_gpu=$STAGE3_EVAL_MODEL_GPU display=$STAGE3_EVAL_DISPLAY"
 echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
@@ -288,6 +298,11 @@ if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
 fi
 
 mkdir -p "$LOG_DIR" "$STAGE3_EVAL_OUTPUT_PATH"
+
+server_deterministic_args=()
+if is_true "$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"; then
+  server_deterministic_args+=(--require_deterministic_sampling)
+fi
 
 env \
   PYTHONPATH="$RPC_PYTHONPATH" \
@@ -306,6 +321,7 @@ env \
     --port "$STAGE3_EVAL_RPC_PORT" \
     --workers 1 \
     --log_level INFO \
+    "${server_deterministic_args[@]}" \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID="$!"
 echo "[$(date '+%F %T')] RPC model server starting pid=$SERVER_PID log=$SERVER_LOG"
@@ -321,6 +337,7 @@ while [[ "$(($(date +%s) - start_time))" -lt "$STAGE3_EVAL_SERVER_START_TIMEOUT_
   fi
   if PYTHONPATH="$RPC_PYTHONPATH" "$VLNCE_PYTHON" - "$RPC_SERVER_ADDR" <<'PY' >/dev/null 2>&1
 import sys
+from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
 from vla_rpc.client import VLAClient
 
 client = VLAClient(server_addr=sys.argv[1], timeout_ms=5000)
@@ -329,7 +346,7 @@ try:
     info = client.get_server_info()
     if not client.health_check() or info is None:
         raise SystemExit(1)
-    if info.version != "heatmapvln-r2r-json-v1":
+    if info.version != HEATMAPVLN_RPC_PROTOCOL_VERSION:
         raise SystemExit(2)
 finally:
     client.close()
@@ -351,7 +368,8 @@ for required_log in \
   "Verified complete frozen InternNav System1 for RPC evaluation: 608 tensors" \
   "Verified complete LoRA checkpoint match: 224 tensors" \
   "Base checkpoint LoRA-only guard: loading 224/224 tensors" \
-  "Verified pano latent adapter: tensors=4 parameters=7344640 dim=3584 hidden_dim=1024"; do
+  "Verified pano latent adapter: tensors=4 parameters=7344640 dim=3584 hidden_dim=1024" \
+  "hidden_dim=1024 dtype=torch.bfloat16"; do
   if ! grep -Fq "$required_log" "$SERVER_LOG"; then
     echo "RPC startup assertion missing from server log: $required_log" >&2
     tail -200 "$SERVER_LOG" >&2 || true
@@ -369,6 +387,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.evaluation.rpc_protocol import (
+    HEATMAPVLN_RPC_PROTOCOL_VERSION,
+    HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+)
+
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "code_commit": subprocess.run(
@@ -381,7 +404,13 @@ manifest = {
     "scenes_dir": os.environ["STAGE3_EVAL_SCENES_DIR"],
     "data_path": os.environ["STAGE3_EVAL_DATA_PATH"],
     "rpc_root": os.environ["RPC_ROOT"],
-    "rpc_protocol": "heatmapvln-r2r-json-v1",
+    "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+    "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+    "rpc_deterministic_sampling_enabled": True,
+    "rpc_protocol_seed": int(os.environ["STAGE3_EVAL_RPC_PROTOCOL_SEED"]),
+    "rpc_require_deterministic_sampling": os.environ[
+        "STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"
+    ].lower() in {"1", "true", "yes", "on"},
     "auto_stop_distance": float(os.environ["STAGE3_EVAL_AUTO_STOP_DISTANCE"]),
     "oracle_system2": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2"].lower() in {"1", "true", "yes", "on"},
     "oracle_system2_strategy": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY"],
@@ -393,7 +422,32 @@ manifest = {
     "trajectory_heading_alignment": os.environ["STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"],
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
 }
-Path(sys.argv[1]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+path = Path(sys.argv[1])
+resume = os.environ["STAGE3_EVAL_RESUME"].lower() in {"1", "true", "yes", "on"}
+overwrite = os.environ["STAGE3_EVAL_OVERWRITE"].lower() in {"1", "true", "yes", "on"}
+if resume and overwrite:
+    raise SystemExit("STAGE3_EVAL_RESUME and STAGE3_EVAL_OVERWRITE cannot both be true")
+progress_exists = (path.parent / "progress.json").exists()
+if path.exists():
+    existing = json.loads(path.read_text())
+    comparable_existing = {key: existing.get(key) for key in manifest if key != "created_at"}
+    comparable_new = {key: value for key, value in manifest.items() if key != "created_at"}
+    if resume:
+        if comparable_existing != comparable_new:
+            raise SystemExit(
+                "Existing eval_manifest.json does not match this resume contract"
+            )
+    elif not overwrite:
+        raise SystemExit(
+            "Existing eval_manifest.json requires STAGE3_EVAL_RESUME=1 or "
+            "STAGE3_EVAL_OVERWRITE=1"
+        )
+    else:
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+elif progress_exists:
+    raise SystemExit("progress.json exists without eval_manifest.json; resume refused")
+else:
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
 
 client_args=(
@@ -401,6 +455,7 @@ client_args=(
   --rpc_server "$RPC_SERVER_ADDR"
   --rpc_timeout_ms "$STAGE3_EVAL_RPC_TIMEOUT_MS"
   --rpc_jpeg_quality "$STAGE3_EVAL_RPC_JPEG_QUALITY"
+  --rpc_protocol_seed "$STAGE3_EVAL_RPC_PROTOCOL_SEED"
   --scenes_dir "$STAGE3_EVAL_SCENES_DIR"
   --data_path "$STAGE3_EVAL_DATA_PATH"
   --output_path "$STAGE3_EVAL_OUTPUT_PATH"
@@ -418,6 +473,9 @@ client_args=(
   --no-debug_input_trace
   --debug_save_input_images 0
 )
+if is_true "$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"; then
+  client_args+=(--rpc_require_deterministic_sampling)
+fi
 if [[ -n "$STAGE3_EVAL_MAX_EPISODES" ]]; then
   client_args+=(--max_episodes "$STAGE3_EVAL_MAX_EPISODES")
 fi

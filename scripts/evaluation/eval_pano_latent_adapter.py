@@ -53,7 +53,6 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from scripts.evaluation.collect_internnav_teacher_sidecar import (
     _build_images_dp,
     _load_teacher,
@@ -65,12 +64,13 @@ from scripts.training.train_pano_latent_adapter import (
     _extract_student_latents,
     _goal_tensors_from_samples,
     _has_trainable_pano_goal,
-    _load_teacher_latents,
     _load_student_model,
+    _load_teacher_latents,
     _load_teacher_records,
     _prepare_config,
     _sample_from_record,
 )
+
 from src.data.factory import build_trajectory_dataset
 from src.models.adapters import (
     GeometryAwarePanoToNextDiTAdapter,
@@ -101,6 +101,7 @@ def _load_adapter_from_checkpoint(
     dim: int,
     fallback_args: argparse.Namespace,
     device: torch.device,
+    dtype: torch.dtype | None = None,
 ):
     ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     state_dict = ckpt.get("adapter_state_dict")
@@ -117,24 +118,18 @@ def _load_adapter_from_checkpoint(
             if state_dict:
                 break
     if not state_dict:
-        raise KeyError(
-            f"{path} has no adapter_state_dict or pano_latent_adapter.* "
-            "trainable_state_dict"
-        )
+        raise KeyError(f"{path} has no adapter_state_dict or pano_latent_adapter.* trainable_state_dict")
     saved_args = ckpt.get("args", {}) or {}
     adapter_type = ckpt.get("adapter_type", "")
 
     # Primary detection: explicit adapter_type field (c9f2e79+).
     # Fallback: state-dict heuristics for checkpoints saved before the field existed.
-    _is_pano_latent_space = (
-        adapter_type == "pano_latent_space"
-        or (
-            not adapter_type
-            and "mlp.0.weight" in state_dict
-            and "mlp.3.weight" in state_dict
-            and "student_proj.weight" not in state_dict
-            and "output_queries" not in state_dict
-        )
+    _is_pano_latent_space = adapter_type == "pano_latent_space" or (
+        not adapter_type
+        and "mlp.0.weight" in state_dict
+        and "mlp.3.weight" in state_dict
+        and "student_proj.weight" not in state_dict
+        and "output_queries" not in state_dict
     )
 
     if _is_pano_latent_space:
@@ -153,10 +148,13 @@ def _load_adapter_from_checkpoint(
         )
         adapter.load_state_dict(state_dict)
         adapter.eval()
-        adapter.to(device)
+        adapter.to(device=device, dtype=dtype)
         LOGGER.info(
-            "Loaded PanoLatentSpaceAdapter from %s dim=%d hidden_dim=%d",
-            path, dim, hidden_dim,
+            "Loaded PanoLatentSpaceAdapter from %s dim=%d hidden_dim=%d dtype=%s",
+            path,
+            dim,
+            hidden_dim,
+            next(adapter.parameters()).dtype,
         )
         return adapter, saved_args
 
@@ -186,14 +184,15 @@ def _load_adapter_from_checkpoint(
         )
         adapter.load_state_dict(state_dict)
         adapter.eval()
-        adapter.to(device)
+        adapter.to(device=device, dtype=dtype)
         LOGGER.info(
-            "Loaded geometry-aware adapter from %s student_dim=%d adapter_dim=%d output_dim=%d layers=%d",
+            "Loaded geometry-aware adapter from %s student_dim=%d adapter_dim=%d output_dim=%d layers=%d dtype=%s",
             path,
             student_dim,
             adapter_dim,
             output_dim,
             max(len(layer_ids), 1),
+            next(adapter.parameters()).dtype,
         )
         return adapter, saved_args
 
@@ -236,15 +235,16 @@ def _load_adapter_from_checkpoint(
     if unexpected:
         LOGGER.warning("Adapter state_dict unexpected keys: %s", unexpected)
     adapter.eval()
-    adapter.to(device)
+    adapter.to(device=device, dtype=dtype)
     LOGGER.info(
-        "Loaded adapter from %s residual=%s pre_norm=%s output_affine=%s n_layers=%d hidden_dim=%d",
+        "Loaded adapter from %s residual=%s pre_norm=%s output_affine=%s n_layers=%d hidden_dim=%d dtype=%s",
         path,
         bool(_get("residual", False)),
         pre_norm,
         has_output_affine,
         n_layers,
         int(_get("adapter_hidden_dim", 2048)),
+        next(adapter.parameters()).dtype,
     )
     return adapter, saved_args
 
@@ -468,9 +468,7 @@ def _gt_compare_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_teacher_vs_gt_first_match": float(np.mean(teacher_gt)) if teacher_gt else None,
         "mean_adapter_vs_teacher_first_match": float(np.mean(adapter_teacher)) if adapter_teacher else None,
         "gain_adapter_minus_teacher_vs_gt": (
-            float(np.mean(adapter_gt) - np.mean(teacher_gt))
-            if adapter_gt and teacher_gt
-            else None
+            float(np.mean(adapter_gt) - np.mean(teacher_gt)) if adapter_gt and teacher_gt else None
         ),
         "category_counts": cats,
         "category_fractions": {k: v / total for k, v in cats.items()},
@@ -491,9 +489,11 @@ def _dump_worst_n(
         return []
 
     if abs_distance_from is not None:
+
         def keyfn(r: dict[str, Any]) -> float:
             v = r.get(key)
             return float(abs(float(v) - abs_distance_from)) if isinstance(v, (int, float)) else -1.0
+
         worst = sorted(records, key=keyfn, reverse=True)[:n]
     else:
         present = [r for r in records if isinstance(r.get(key), (int, float))]
@@ -601,8 +601,10 @@ def main() -> int:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dtype = _torch_dtype(args.torch_dtype)
     cfg = _prepare_config(args)
-    action_scale = float(args.action_scale) if args.action_scale > 0 else float(
-        cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
+    action_scale = (
+        float(args.action_scale)
+        if args.action_scale > 0
+        else float(cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0))
     )
 
     teacher_jsonl = Path(args.teacher_jsonl).expanduser()
@@ -645,13 +647,16 @@ def main() -> int:
         dim=hidden_dim,
         fallback_args=args,
         device=device,
+        dtype=student_model.config.dtype,
     )
     geometry_adapter = hasattr(adapter, "geometry_token")
 
     teacher_model, _teacher_processor, traj_to_actions_fn = _load_teacher(args, device)
 
-    output_path = Path(args.output).expanduser() if args.output else (
-        Path(args.adapter_checkpoint).expanduser().parent / "e2e_sanity.jsonl"
+    output_path = (
+        Path(args.output).expanduser()
+        if args.output
+        else (Path(args.adapter_checkpoint).expanduser().parent / "e2e_sanity.jsonl")
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Writing per-sample report to %s", output_path)
