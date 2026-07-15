@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and summarize the preregistered Task39 Stage2/Stage3 causal comparison.
+"""Validate and summarize the revised Task39 Stage2/Stage3 causal comparison.
 
 The only estimand in this report is ``pano_control - warmup_original``.  A
 failed scientific gate is still a valid report; malformed or incomparable
@@ -19,8 +19,8 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA = "heatmapvln-task39-stage23-causal-summary-v1"
-EXPECTED_EPISODE_COUNT = 1839
+SCHEMA = "heatmapvln-task39-stage23-causal-summary-v2-eval200"
+EXPECTED_EPISODE_COUNT = 200
 EXPECTED_CODE_COMMIT = "2c5c94daa642690feb28d270c9457c36971bb154"
 RPC_PROTOCOL = "heatmapvln-r2r-json-v2"
 RPC_SAMPLING_PROTOCOL = "heatmapvln-nextdit-sha256-v1"
@@ -540,6 +540,18 @@ def _build_gate(effects: dict[str, float], bootstrap: dict[str, Any]) -> dict[st
     }
 
 
+def _build_screening_gate(effects: dict[str, float]) -> dict[str, Any]:
+    """Apply the eval-200 pilot screen without weakening the full gate."""
+
+    passed = effects["SPL"] >= SPL_POINT_THRESHOLD
+    return {
+        "passed": passed,
+        "checks": {"delta_SPL_at_least_0.02": passed},
+        "interpretation": ("advance_to_confirmation" if passed else "do_not_advance_on_current_effect_size"),
+        "locked_thresholds": {"delta_SPL_minimum": SPL_POINT_THRESHOLD},
+    }
+
+
 def summarize(
     warmup_eval_dir: str | Path,
     pano_control_eval_dir: str | Path,
@@ -566,13 +578,21 @@ def summarize(
         warmup["rows"],
         pano["rows"],
     )
-    gate = _build_gate(effects, bootstrap)
+    screening_gate = _build_screening_gate(effects)
+    confirmatory_gate = _build_gate(effects, bootstrap)
+    if confirmatory_gate["passed"]:
+        decision = "confirmatory_pass"
+    elif screening_gate["passed"]:
+        decision = "screening_pass_confirmatory_inconclusive"
+    else:
+        decision = "screening_fail"
     return {
         "schema": SCHEMA,
         "estimand": "pano_control_minus_warmup_original",
         "preregistration": {
             "code_commit": EXPECTED_CODE_COMMIT,
             "expected_episodes": EXPECTED_EPISODE_COUNT,
+            "evaluation_role": "cost-controlled_screening_cohort",
             "protocol": PROTOCOL_CONTRACT,
             "bootstrap": {
                 "method": "paired_scene_cluster_percentile_bootstrap",
@@ -582,7 +602,7 @@ def summarize(
                 "SR_interval": "one_sided_95_percentile_lower",
             },
             "thresholds_locked_before_results": True,
-            "thresholds": gate["locked_thresholds"],
+            "thresholds": confirmatory_gate["locked_thresholds"],
         },
         "contract": {
             "passed": True,
@@ -603,7 +623,12 @@ def summarize(
         },
         "point_effects": effects,
         "paired_scene_cluster_bootstrap": bootstrap,
-        "gate": gate,
+        "decision": decision,
+        "screening_gate": screening_gate,
+        "confirmatory_gate": confirmatory_gate,
+        # Backward-compatible alias. In schema v2 this always means the
+        # unchanged, stricter confirmatory gate rather than the pilot screen.
+        "gate": confirmatory_gate,
     }
 
 
@@ -657,7 +682,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Task39 output already exists; overwrite refused: {output}", file=sys.stderr)
         return 2
     print(f"Wrote Task39 causal summary to {output}")
-    print(f"Task39 gate passed: {report['gate']['passed']}")
+    print(f"Task39 eval-200 decision: {report['decision']}")
+    print(f"Task39 screening gate passed: {report['screening_gate']['passed']}")
+    print(f"Task39 confirmatory gate passed: {report['confirmatory_gate']['passed']}")
     return 0
 
 

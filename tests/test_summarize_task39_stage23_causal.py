@@ -183,8 +183,11 @@ def test_summary_passes_locked_gate_and_reports_all_point_effects(tmp_path):
     report = json.loads(output.read_text(encoding="utf-8"))
 
     assert report["estimand"] == "pano_control_minus_warmup_original"
+    assert report["decision"] == "confirmatory_pass"
+    assert report["screening_gate"]["passed"] is True
+    assert report["confirmatory_gate"]["passed"] is True
     assert report["contract"]["passed"] is True
-    assert report["contract"]["ordered_cohort"]["episodes"] == 1839
+    assert report["contract"]["ordered_cohort"]["episodes"] == 200
     assert report["point_effects"] == pytest.approx(
         {
             "SPL": 0.03,
@@ -231,6 +234,9 @@ def test_summary_emits_a_valid_failed_gate_without_changing_thresholds(tmp_path)
     report = summarize(warmup, pano, cohort)
 
     assert report["point_effects"]["SPL"] == pytest.approx(0.01)
+    assert report["decision"] == "screening_fail"
+    assert report["screening_gate"]["passed"] is False
+    assert report["confirmatory_gate"]["passed"] is False
     assert report["gate"]["passed"] is False
     assert report["gate"]["checks"]["delta_SPL_at_least_0.02"] is False
     assert report["gate"]["locked_thresholds"]["delta_SPL_minimum"] == 0.02
