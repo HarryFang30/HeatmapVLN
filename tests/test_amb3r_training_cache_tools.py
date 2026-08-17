@@ -37,12 +37,12 @@ def _write_plan_clip(clip_dir: Path, frame_count: int = 40) -> None:
     )
 
 
-def test_clip_plan_limit_stops_before_scanning_later_clips(tmp_path: Path) -> None:
+def test_clip_plan_limit_and_empty_placeholder_contract(tmp_path: Path) -> None:
     scene_root = tmp_path / "dataset" / "train" / "scene"
     _write_plan_clip(scene_root / "clip_000001")
-    # This later clip is intentionally malformed. A bounded smoke plan must not
-    # inspect the rest of a large dataset after selecting its requested clips.
-    (scene_root / "clip_000002").mkdir(parents=True)
+    # The production corpus contains one abandoned allocation placeholder with
+    # no metadata or chunk payload. It is not part of the successful dataset.
+    (scene_root / "clip_000002" / "chunks").mkdir(parents=True)
 
     rows = _clip_rows(
         tmp_path / "dataset",
@@ -51,12 +51,28 @@ def test_clip_plan_limit_stops_before_scanning_later_clips(tmp_path: Path) -> No
     )
     assert [row["clip_key"] for row in rows] == ["scene/clip_000001"]
 
+    ignored: list[str] = []
+    rows = _clip_rows(
+        tmp_path / "dataset",
+        ["train"],
+        ignored_empty_clip_placeholders=ignored,
+    )
+    assert [row["clip_key"] for row in rows] == ["scene/clip_000001"]
+    assert ignored == ["scene/clip_000002"]
+
+    # A partially populated clip is real corruption and must remain fail-closed.
+    partial = scene_root / "clip_000003"
+    partial.mkdir(parents=True)
+    (partial / "meta.json").write_text(
+        json.dumps({"num_frames": 40}),
+        encoding="utf-8",
+    )
     try:
         _clip_rows(tmp_path / "dataset", ["train"])
     except FileNotFoundError:
         pass
     else:
-        raise AssertionError("unbounded discovery must still validate every clip")
+        raise AssertionError("partially populated clips must fail validation")
 
 
 def test_mxc_launcher_forces_safe_da3_attention_compatibility() -> None:
