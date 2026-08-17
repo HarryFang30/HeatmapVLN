@@ -1,0 +1,483 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1320" viewBox="0 0 2400 1320">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F7F9FD"/>
+    </linearGradient>
+    <linearGradient id="roomWall" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#DDEBF5"/>
+      <stop offset="0.62" stop-color="#F6EEE4"/>
+      <stop offset="1" stop-color="#CEB8A0"/>
+    </linearGradient>
+    <linearGradient id="heat" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#173C8C"/>
+      <stop offset="0.38" stop-color="#1F9AC0"/>
+      <stop offset="0.68" stop-color="#F2D148"/>
+      <stop offset="1" stop-color="#EF4B4F"/>
+    </linearGradient>
+    <linearGradient id="purpleBand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#EEE8FA"/>
+      <stop offset="1" stop-color="#F7F2FF"/>
+    </linearGradient>
+    <linearGradient id="orangeBand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFF0E6"/>
+      <stop offset="1" stop-color="#FFF8F2"/>
+    </linearGradient>
+    <pattern id="frozenHatch" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="9" height="9" fill="#F5F6F8"/>
+      <line x1="0" y1="0" x2="0" y2="9" stroke="#D7DAE0" stroke-width="3"/>
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#273248" flood-opacity="0.12"/>
+    </filter>
+    <filter id="softGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#6F7785"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#7351B8"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#2584B8"/>
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#E56A54"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#E27A27"/>
+    </marker>
+    <symbol id="room" viewBox="0 0 100 72">
+      <rect x="0" y="0" width="100" height="72" rx="7" fill="url(#roomWall)"/>
+      <polygon points="0,72 28,42 72,42 100,72" fill="#C6A989"/>
+      <polygon points="0,0 28,42 28,72 0,72" fill="#C8DBE7"/>
+      <polygon points="100,0 72,42 72,72 100,72" fill="#EBD9C5"/>
+      <rect x="42" y="14" width="19" height="28" fill="#8099A6" opacity="0.8"/>
+      <rect x="45" y="17" width="13" height="22" fill="#B9D7E5"/>
+      <line x1="50" y1="42" x2="50" y2="72" stroke="#8A715C" stroke-width="1"/>
+      <line x1="28" y1="42" x2="0" y2="56" stroke="#A98D73" stroke-width="1"/>
+      <line x1="72" y1="42" x2="100" y2="56" stroke="#A98D73" stroke-width="1"/>
+      <rect x="7" y="19" width="14" height="18" rx="2" fill="#66809A" opacity="0.55"/>
+      <rect x="78" y="25" width="15" height="12" rx="2" fill="#A88466" opacity="0.7"/>
+    </symbol>
+    <symbol id="heatThumb" viewBox="0 0 72 72">
+      <rect x="0" y="0" width="72" height="72" rx="7" fill="#183B79"/>
+      <g stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="1">
+        <line x1="18" y1="0" x2="18" y2="72"/>
+        <line x1="36" y1="0" x2="36" y2="72"/>
+        <line x1="54" y1="0" x2="54" y2="72"/>
+        <line x1="0" y1="18" x2="72" y2="18"/>
+        <line x1="0" y1="36" x2="72" y2="36"/>
+        <line x1="0" y1="54" x2="72" y2="54"/>
+      </g>
+      <circle cx="48" cy="29" r="22" fill="url(#heat)" opacity="0.34" filter="url(#softGlow)"/>
+      <circle cx="48" cy="29" r="10" fill="#F7D348" opacity="0.85"/>
+      <circle cx="48" cy="29" r="4" fill="#F34C50"/>
+    </symbol>
+    <style>
+      .panel { stroke-width: 2.2; stroke-dasharray: 10 8; }
+      .panel-title { font: 700 30px Inter, "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.6px; }
+      .panel-sub { font: 500 17px Inter, "Helvetica Neue", Arial, sans-serif; }
+      .section { font: 700 21px Inter, "Helvetica Neue", Arial, sans-serif; fill: #2C3240; }
+      .label { font: 600 18px Inter, "Helvetica Neue", Arial, sans-serif; fill: #313744; }
+      .body { font: 500 16px Inter, "Helvetica Neue", Arial, sans-serif; fill: #4E5665; }
+      .small { font: 500 14px Inter, "Helvetica Neue", Arial, sans-serif; fill: #687181; }
+      .tiny { font: 500 12px Inter, "Helvetica Neue", Arial, sans-serif; fill: #737C8B; }
+      .mono { font: 600 16px "SFMono-Regular", Consolas, monospace; fill: #343A47; }
+      .pill { stroke-width: 1.4; }
+      .arrow { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .thin-arrow { fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+      .module { stroke-width: 1.7; }
+    </style>
+  </defs>
+
+  <rect width="2400" height="1320" fill="url(#bg)"/>
+
+  <!-- Main groups -->
+  <rect class="panel" x="28" y="42" width="1110" height="1228" rx="30" fill="#FCFAFF" stroke="#D6C7EE"/>
+  <rect class="panel" x="1162" y="306" width="330" height="690" rx="28" fill="#FFF9F6" stroke="#F1B8A9"/>
+  <rect class="panel" x="1516" y="42" width="856" height="1228" rx="30" fill="#FFFCF8" stroke="#F3C59D"/>
+
+  <!-- SYSTEM 2 HEADER -->
+  <circle cx="69" cy="79" r="20" fill="#7351B8"/>
+  <path d="M59 78 C59 69,67 64,74 68 C84 67,87 78,82 84 C77 91,65 92,60 85" fill="none" stroke="#FFF" stroke-width="2.2"/>
+  <path d="M65 68 C64 73,67 76,72 76 M82 73 C77 74,75 78,77 84 M63 84 C68 82,71 84,72 89" fill="none" stroke="#FFF" stroke-width="1.8"/>
+  <text class="panel-title" x="101" y="83" fill="#63429F">SYSTEM-2 · SLOW PANORAMIC REASONING</text>
+  <text class="panel-sub" x="101" y="108" fill="#8D76B7">autoregressive waypoint decision + optional spatial grounding</text>
+
+  <!-- Input cards -->
+  <g filter="url(#shadow)">
+    <rect x="65" y="137" width="238" height="166" rx="18" fill="#FFFFFF" stroke="#CFD3DB" stroke-width="1.6"/>
+  </g>
+  <text class="section" x="84" y="169">Instruction</text>
+  <text class="body" x="84" y="200">
+    <tspan x="84" dy="0">“Exit the bedroom,</tspan>
+    <tspan x="84" dy="23">walk straight, turn right</tspan>
+    <tspan x="84" dy="23">at the stairwell …”</tspan>
+  </text>
+  <rect x="84" y="267" width="129" height="21" rx="10" fill="#F0ECF8"/>
+  <text class="tiny" x="95" y="282" fill="#7351B8">language tokens</text>
+
+  <text class="section" x="337" y="158">History panoramas</text>
+  <text class="small" x="337" y="181">K ≤ 8 · four RGB views each</text>
+  <g filter="url(#shadow)">
+    <rect x="362" y="194" width="247" height="102" rx="13" fill="#E6E0F0" stroke="#C9BEDD" transform="rotate(-4 485 245)"/>
+    <rect x="348" y="190" width="247" height="102" rx="13" fill="#F0EBF8" stroke="#C9BEDD" transform="rotate(-1.5 472 241)"/>
+    <rect x="335" y="189" width="247" height="102" rx="13" fill="#FFFFFF" stroke="#BDAED7"/>
+  </g>
+  <use href="#room" x="346" y="201" width="52" height="70"/>
+  <use href="#room" x="404" y="201" width="52" height="70"/>
+  <use href="#room" x="462" y="201" width="52" height="70"/>
+  <use href="#room" x="520" y="201" width="52" height="70"/>
+  <text class="tiny" x="360" y="286">F</text><text class="tiny" x="418" y="286">R</text>
+  <text class="tiny" x="476" y="286">B</text><text class="tiny" x="534" y="286">L</text>
+
+  <text class="section" x="645" y="158">Current panorama</text>
+  <text class="small" x="645" y="181">O<tspan baseline-shift="sub">t</tspan> · RGB only · 4 × 256²</text>
+  <g filter="url(#shadow)">
+    <rect x="643" y="190" width="448" height="102" rx="15" fill="#FFFFFF" stroke="#B8C3D4" stroke-width="1.5"/>
+  </g>
+  <use href="#room" x="657" y="202" width="95" height="70"/>
+  <use href="#room" x="765" y="202" width="95" height="70"/>
+  <use href="#room" x="873" y="202" width="95" height="70"/>
+  <use href="#room" x="981" y="202" width="95" height="70"/>
+  <text class="tiny" x="687" y="287">front</text>
+  <text class="tiny" x="799" y="287">right</text>
+  <text class="tiny" x="908" y="287">back</text>
+  <text class="tiny" x="1017" y="287">left</text>
+
+  <!-- input flow -->
+  <path class="arrow" d="M184 304 L184 330 L569 330 L569 356" stroke="#7351B8" marker-end="url(#arrowPurple)"/>
+  <path class="arrow" d="M458 304 L458 330" stroke="#7351B8"/>
+  <path class="arrow" d="M868 304 L868 330 L569 330" stroke="#7351B8"/>
+  <g>
+    <rect x="367" y="315" width="18" height="18" rx="4" fill="#DED3F1"/>
+    <rect x="391" y="315" width="18" height="18" rx="4" fill="#DED3F1"/>
+    <rect x="415" y="315" width="18" height="18" rx="4" fill="#DED3F1"/>
+    <circle cx="449" cy="324" r="3.5" fill="#9B88C2"/>
+    <circle cx="461" cy="324" r="3.5" fill="#9B88C2"/>
+    <circle cx="473" cy="324" r="3.5" fill="#9B88C2"/>
+  </g>
+
+  <!-- Qwen -->
+  <g filter="url(#shadow)">
+    <rect x="86" y="360" width="1002" height="180" rx="23" fill="url(#purpleBand)" stroke="#B9A8D8" stroke-width="2"/>
+  </g>
+  <text x="115" y="397" font-family="Inter,Arial,sans-serif" font-size="27" font-weight="700" fill="#5D3B9B">Qwen2.5-VL</text>
+  <rect x="306" y="374" width="177" height="29" rx="14" fill="#FFFFFF" stroke="#C8B9E1"/>
+  <text class="small" x="328" y="394" fill="#7351B8">shared backbone</text>
+  <rect x="925" y="374" width="135" height="29" rx="14" fill="url(#frozenHatch)" stroke="#BFC4CD"/>
+  <text class="tiny" x="951" y="393">BASE FROZEN</text>
+
+  <rect class="module" x="111" y="418" width="269" height="88" rx="14" fill="#E8F3FC" stroke="#83B9DA"/>
+  <text class="label" x="137" y="447" fill="#247AAB">Vision encoder · 32L</text>
+  <text class="small" x="137" y="472">ViT hidden 1280 · 16 × 16 patches</text>
+  <text class="small" x="137" y="493">4-view image tokens</text>
+
+  <rect class="module" x="404" y="418" width="405" height="88" rx="14" fill="#F4EFFC" stroke="#A892D0"/>
+  <text class="label" x="432" y="447" fill="#63429F">Causal language model · 28L</text>
+  <text class="small" x="432" y="472">hidden 3584 · instruction + history + current</text>
+  <text class="small" x="432" y="493">multimodal autoregressive reasoning</text>
+
+  <rect class="module" x="833" y="418" width="230" height="88" rx="14" fill="#FFF0F0" stroke="#E49A9E"/>
+  <text class="label" x="857" y="447" fill="#B94E59">All-layer LoRA</text>
+  <text class="small" x="857" y="472">q / k / v / o · 28 / 28</text>
+  <text class="small" x="857" y="493">rank 32 · α = 64</text>
+
+  <!-- Structured goal -->
+  <path class="arrow" d="M944 540 L944 564" stroke="#7351B8" marker-end="url(#arrowPurple)"/>
+  <g filter="url(#shadow)">
+    <rect x="793" y="573" width="295" height="137" rx="18" fill="#FFFFFF" stroke="#C4B2E1" stroke-width="1.8"/>
+  </g>
+  <text class="section" x="817" y="603" fill="#63429F">Structured decision</text>
+  <text class="mono" x="820" y="635">view: right</text>
+  <text class="mono" x="820" y="662">pixel: 128 173</text>
+  <line x1="816" y1="676" x2="1063" y2="676" stroke="#E2DCEF"/>
+  <text class="small" x="819" y="698" fill="#A84A53">or “view: stop” → terminate</text>
+
+  <!-- Second causal readout -->
+  <path class="arrow" d="M941 711 L941 736" stroke="#E56A54" marker-end="url(#arrowCoral)"/>
+  <rect class="module" x="787" y="742" width="306" height="184" rx="19" fill="#FFF5F2" stroke="#E9A594"/>
+  <text class="label" x="811" y="772" fill="#C65B47">Second causal readout</text>
+  <text class="small" x="811" y="798">prompt + generated goal +</text>
+  <text class="small" x="811" y="819">4 appended &lt;TRAJ&gt; placeholders</text>
+  <g>
+    <rect x="816" y="842" width="40" height="34" rx="9" fill="#F48B8F" stroke="#CC5C64"/>
+    <rect x="866" y="842" width="40" height="34" rx="9" fill="#F48B8F" stroke="#CC5C64"/>
+    <rect x="916" y="842" width="40" height="34" rx="9" fill="#F48B8F" stroke="#CC5C64"/>
+    <rect x="966" y="842" width="40" height="34" rx="9" fill="#F48B8F" stroke="#CC5C64"/>
+    <text class="tiny" x="1022" y="862">learnable queries</text>
+  </g>
+  <text class="mono" x="811" y="908">H_S2 ∈ R^(B × 4 × 3584)</text>
+  <path class="arrow" d="M1094 858 L1157 858" stroke="#E56A54" marker-end="url(#arrowCoral)"/>
+
+  <!-- Heatmap auxiliary branch -->
+  <rect x="63" y="573" width="690" height="647" rx="24" fill="#F8FCFF" stroke="#8FC6E0" stroke-width="2" stroke-dasharray="8 6"/>
+  <text class="section" x="88" y="609" fill="#237DAA">AUXILIARY SPATIAL GROUNDING · HEATMAP HEAD</text>
+  <rect x="88" y="621" width="506" height="27" rx="13" fill="#E6F4FA"/>
+  <text class="tiny" x="106" y="639" fill="#237DAA">optional pretraining branch · disabled in Stage1-S2 and deployed Stage3</text>
+
+  <path class="thin-arrow" d="M245 540 L245 665" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+  <path class="thin-arrow" d="M606 540 L606 665" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+
+  <rect class="module" x="87" y="668" width="284" height="92" rx="15" fill="#EAF6FC" stroke="#76B6D5"/>
+  <text class="label" x="106" y="696" fill="#247AAB">ViT hooks + DPT-Lite</text>
+  <text class="small" x="106" y="721">L7/15/23/31 · 4 × 16² × 1280</text>
+  <text class="mono" x="106" y="746">→ 4 × 256 × 16 × 16</text>
+
+  <rect class="module" x="391" y="668" width="337" height="92" rx="15" fill="#EEF4FC" stroke="#84AACB"/>
+  <text class="label" x="411" y="696" fill="#386B99">LLM hooks + DPT-Lite</text>
+  <text class="small" x="411" y="721">L6/13/20 · 3 × 4 × 8² × 3584</text>
+  <text class="mono" x="411" y="746">→ 4 × 8 × 8 × 256</text>
+
+  <path class="thin-arrow" d="M229 761 L229 786 L382 786 L382 803" stroke="#2584B8"/>
+  <path class="thin-arrow" d="M559 761 L559 786 L382 786" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+
+  <rect class="module" x="87" y="807" width="641" height="124" rx="17" fill="#F0F8FB" stroke="#64A8C8"/>
+  <text class="label" x="108" y="838" fill="#247AAB">Trajectory-Guided Attention × 2</text>
+  <text class="small" x="108" y="866">[history anchor 3584→256] + [relative pose PE 4→132→256]</text>
+  <text class="small" x="108" y="892">+ 256 current spatial tokens → Transformer encoder · 4 heads · d=256</text>
+  <g>
+    <rect x="102" y="905" width="178" height="21" rx="10" fill="#DDEFF6"/>
+    <text class="tiny" x="118" y="920">history token</text>
+    <rect x="291" y="905" width="153" height="21" rx="10" fill="#E9E1F7"/>
+    <text class="tiny" x="307" y="920">pose token</text>
+    <rect x="455" y="905" width="250" height="21" rx="10" fill="#DCEBF9"/>
+    <text class="tiny" x="474" y="920">256 spatial tokens</text>
+  </g>
+
+  <path class="thin-arrow" d="M236 932 L236 956" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+  <path class="thin-arrow" d="M408 932 L408 956" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+  <path class="thin-arrow" d="M590 932 L590 956" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+
+  <rect x="87" y="960" width="201" height="80" rx="14" fill="#FFFFFF" stroke="#8BBBD0"/>
+  <text class="label" x="105" y="989">Visibility</text>
+  <text class="mono" x="105" y="1017">B × N × 4</text>
+
+  <rect x="306" y="960" width="207" height="80" rx="14" fill="#FFFFFF" stroke="#8BBBD0"/>
+  <text class="label" x="324" y="989">Coarse prior</text>
+  <text class="mono" x="324" y="1017">B × N × 4 × 8²</text>
+
+  <rect x="531" y="960" width="197" height="80" rx="14" fill="#FFFFFF" stroke="#8BBBD0"/>
+  <text class="label" x="549" y="989">Spatial out</text>
+  <text class="mono" x="549" y="1017">B × N × 256 × 256</text>
+
+  <path class="thin-arrow" d="M410 1041 L410 1064" stroke="#2584B8" marker-end="url(#arrowBlue)"/>
+  <path class="thin-arrow" d="M628 1041 L628 1064 L510 1064" stroke="#2584B8"/>
+  <path class="thin-arrow" d="M229 761 L68 761 L68 1090 L88 1090" stroke="#2584B8" stroke-dasharray="5 5"/>
+
+  <rect class="module" x="87" y="1069" width="426" height="101" rx="16" fill="#EAF7FA" stroke="#64A8C8"/>
+  <text class="label" x="106" y="1098" fill="#247AAB">Fine localization</text>
+  <text class="small" x="106" y="1123">concat [ViT 256 + spatial 256 + coarse 1] = 513 ch</text>
+  <text class="small" x="106" y="1148">ConvTranspose 16→32→64 · Conv 64→1 · sigmoid</text>
+
+  <g transform="translate(535,1072)">
+    <use href="#heatThumb" x="0" y="0" width="62" height="62"/>
+    <use href="#heatThumb" x="66" y="0" width="62" height="62"/>
+    <use href="#heatThumb" x="132" y="0" width="62" height="62"/>
+    <text class="tiny" x="3" y="82">front</text>
+    <text class="tiny" x="70" y="82">right</text>
+    <text class="tiny" x="139" y="82">back / left</text>
+  </g>
+  <text class="mono" x="535" y="1187">Heatmaps B × N × 4 × 64²</text>
+
+  <rect x="87" y="1181" width="425" height="26" rx="13" fill="#FFFFFF" stroke="#B4D8E7" stroke-dasharray="5 4"/>
+  <text class="tiny" x="104" y="1198">depth + intrinsics → GT · relative pose PE → attention</text>
+  <text class="tiny" x="535" y="1210" fill="#247AAB">L = BCE_vis + CE_peak + 0.2 L_coord + BCE_neg</text>
+
+  <!-- BRIDGE -->
+  <circle cx="1205" cy="348" r="19" fill="#E56A54"/>
+  <path d="M1194 348 H1216 M1200 341 L1194 348 L1200 355 M1210 341 L1216 348 L1210 355" fill="none" stroke="#FFF" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+  <text class="panel-title" x="1234" y="354" fill="#C45946">LATENT BRIDGE</text>
+  <text class="panel-sub" x="1194" y="382" fill="#B66A5C">System-2 → System-1</text>
+
+  <text class="small" x="1197" y="426">goal-conditioned readout</text>
+  <g>
+    <rect x="1200" y="443" width="45" height="38" rx="10" fill="#F48B8F" stroke="#CC5C64"/>
+    <rect x="1254" y="443" width="45" height="38" rx="10" fill="#F48B8F" stroke="#CC5C64"/>
+    <rect x="1308" y="443" width="45" height="38" rx="10" fill="#F48B8F" stroke="#CC5C64"/>
+    <rect x="1362" y="443" width="45" height="38" rx="10" fill="#F48B8F" stroke="#CC5C64"/>
+  </g>
+  <text class="mono" x="1197" y="509">4 × 3584</text>
+  <path class="arrow" d="M1302 516 L1302 548" stroke="#E56A54" marker-end="url(#arrowCoral)"/>
+
+  <g filter="url(#shadow)">
+    <rect class="module" x="1192" y="555" width="270" height="143" rx="19" fill="#FFF0EB" stroke="#E88974"/>
+  </g>
+  <rect x="1212" y="572" width="120" height="25" rx="12" fill="#E56A54"/>
+  <text x="1236" y="590" font-family="Inter,Arial,sans-serif" font-size="13" font-weight="700" fill="#FFF">TRAINABLE</text>
+  <text class="label" x="1213" y="628" fill="#B94D3B">PanoLatentSpaceAdapter</text>
+  <text class="mono" x="1213" y="655">3584 → 1024 → 3584</text>
+  <text class="small" x="1213" y="681">GELU + residual identity</text>
+  <path d="M1223 664 C1184 664,1184 610,1223 610" fill="none" stroke="#E56A54" stroke-width="2.2" marker-end="url(#arrowCoral)"/>
+
+  <path class="arrow" d="M1302 699 L1302 731" stroke="#E56A54" marker-end="url(#arrowCoral)"/>
+  <rect class="module" x="1192" y="738" width="270" height="112" rx="18" fill="url(#frozenHatch)" stroke="#BFC4CC"/>
+  <rect x="1212" y="754" width="93" height="23" rx="11" fill="#6F7785"/>
+  <text x="1228" y="770" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFF">FROZEN</text>
+  <text class="label" x="1212" y="806">Cond projector</text>
+  <text class="mono" x="1212" y="833">3584 → 768 → 768</text>
+
+  <path class="arrow" d="M1302 851 L1302 880" stroke="#E56A54" marker-end="url(#arrowCoral)"/>
+  <g>
+    <rect x="1200" y="887" width="45" height="38" rx="10" fill="#F4AE72" stroke="#D87A30"/>
+    <rect x="1254" y="887" width="45" height="38" rx="10" fill="#F4AE72" stroke="#D87A30"/>
+    <rect x="1308" y="887" width="45" height="38" rx="10" fill="#F4AE72" stroke="#D87A30"/>
+    <rect x="1362" y="887" width="45" height="38" rx="10" fill="#F4AE72" stroke="#D87A30"/>
+  </g>
+  <text class="mono" x="1198" y="951">C_goal ∈ R^(B × 4 × 768)</text>
+  <path class="arrow" d="M1463 906 L1538 906 L1538 588 L1570 588" stroke="#E56A54" marker-end="url(#arrowCoral)"/>
+  <text class="tiny" x="1189" y="979">No geometry token · no learned “view adjust”</text>
+
+  <!-- SYSTEM 1 HEADER -->
+  <circle cx="1558" cy="79" r="20" fill="#E27A27"/>
+  <path d="M1553 62 L1544 80 H1556 L1551 96 L1573 73 H1560 L1566 62 Z" fill="#FFF"/>
+  <text class="panel-title" x="1590" y="83" fill="#CA661A">SYSTEM-1 · FAST DIFFUSION CONTROL</text>
+  <text class="panel-sub" x="1590" y="108" fill="#B87842">frozen InternNav visual memory + NextDiT trajectory prior</text>
+
+  <!-- Visual memory panel -->
+  <rect x="1548" y="132" width="792" height="352" rx="22" fill="#F7FBF7" stroke="#A8C9AD" stroke-width="1.8"/>
+  <text class="section" x="1572" y="165" fill="#3F7D4A">Independent visual-memory path</text>
+  <rect x="2150" y="146" width="156" height="25" rx="12" fill="url(#frozenHatch)" stroke="#C3C8CE"/>
+  <text class="tiny" x="2181" y="163">INTERNNAV FROZEN</text>
+
+  <text class="small" x="1572" y="194">goal-free front-down pair · 224²</text>
+  <g filter="url(#shadow)">
+    <rect x="1570" y="207" width="115" height="96" rx="12" fill="#FFFFFF" stroke="#B7C8BA"/>
+    <rect x="1708" y="207" width="115" height="96" rx="12" fill="#FFFFFF" stroke="#B7C8BA"/>
+  </g>
+  <use href="#room" x="1578" y="216" width="99" height="70"/>
+  <use href="#room" x="1716" y="216" width="99" height="70"/>
+  <text class="label" x="1692" y="262" fill="#598262">=</text>
+  <text class="tiny" x="1588" y="319">anchor</text>
+  <text class="tiny" x="1729" y="319">current</text>
+  <text class="tiny" x="1570" y="338">same frame in deployed first-only policy</text>
+
+  <path class="thin-arrow" d="M1824 254 L1853 254" stroke="#589265" marker-end="url(#arrowGray)"/>
+  <rect class="module" x="1860" y="204" width="186" height="101" rx="15" fill="#E7F3E9" stroke="#83B28C"/>
+  <text class="label" x="1881" y="233" fill="#3F7D4A">DINOv2 ViT-S/14</text>
+  <text class="small" x="1881" y="258">2 × 256 patches × 384</text>
+  <text class="small" x="1881" y="283">ImageNet norm · frozen</text>
+
+  <path class="thin-arrow" d="M2047 254 L2071 254" stroke="#589265" marker-end="url(#arrowGray)"/>
+  <rect class="module" x="2078" y="193" width="231" height="122" rx="15" fill="#EDF6EE" stroke="#83B28C"/>
+  <text class="label" x="2097" y="222" fill="#3F7D4A">Memory Encoder</text>
+  <text class="small" x="2097" y="248">3-layer Transformer · 6 heads</text>
+  <text class="small" x="2097" y="271">512 patch tokens · 384d</text>
+  <text class="small" x="2097" y="295">concat [original ; encoded]</text>
+
+  <path class="thin-arrow" d="M2193 316 L2193 340" stroke="#589265" marker-end="url(#arrowGray)"/>
+  <rect x="1808" y="346" width="501" height="107" rx="16" fill="#FFFFFF" stroke="#8EB696" stroke-width="1.7"/>
+  <text class="label" x="1831" y="376" fill="#3F7D4A">Q-Former visual resampler</text>
+  <text class="small" x="1831" y="402">32 learnable queries · 3 decoder layers · 12 heads</text>
+  <g>
+    <circle cx="1847" cy="428" r="7" fill="#5C9C68"/>
+    <circle cx="1868" cy="428" r="7" fill="#5C9C68"/>
+    <circle cx="1889" cy="428" r="7" fill="#5C9C68"/>
+    <text class="small" x="1910" y="433">…</text>
+    <circle cx="1944" cy="428" r="7" fill="#5C9C68"/>
+  </g>
+  <text class="mono" x="2026" y="433">M_vis ∈ R^(B × 32 × 768)</text>
+
+  <!-- Fusion -->
+  <path class="arrow" d="M2060 454 L2060 512" stroke="#589265" marker-end="url(#arrowGray)"/>
+  <g filter="url(#shadow)">
+    <rect class="module" x="1572" y="520" width="741" height="128" rx="20" fill="#FFF4E9" stroke="#E4A76F"/>
+  </g>
+  <text class="section" x="1597" y="553" fill="#C56520">Condition fusion</text>
+  <g>
+    <circle cx="1609" cy="583" r="7" fill="#5C9C68"/>
+    <circle cx="1630" cy="583" r="7" fill="#5C9C68"/>
+    <circle cx="1651" cy="583" r="7" fill="#5C9C68"/>
+    <text class="small" x="1671" y="589">… 32 visual</text>
+    <text x="1780" y="590" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="700" fill="#9C765A">⊕</text>
+    <rect x="1817" y="570" width="26" height="26" rx="7" fill="#F4AE72" stroke="#D87A30"/>
+    <rect x="1852" y="570" width="26" height="26" rx="7" fill="#F4AE72" stroke="#D87A30"/>
+    <rect x="1887" y="570" width="26" height="26" rx="7" fill="#F4AE72" stroke="#D87A30"/>
+    <rect x="1922" y="570" width="26" height="26" rx="7" fill="#F4AE72" stroke="#D87A30"/>
+    <text class="small" x="1960" y="590">4 goal</text>
+  </g>
+  <text class="mono" x="1598" y="628">Z_cond ∈ R^(B × 36 × 768)</text>
+  <rect x="2054" y="566" width="227" height="49" rx="13" fill="#FFFFFF" stroke="#E0B183"/>
+  <text class="small" x="2073" y="588">internal caption projection</text>
+  <text class="mono" x="2115" y="608">768 → 384</text>
+
+  <!-- NextDiT -->
+  <path class="arrow" d="M1944 650 L1944 684" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+  <rect x="1548" y="686" width="792" height="408" rx="22" fill="#FFF8F1" stroke="#E7AC76" stroke-width="1.8"/>
+  <text class="section" x="1572" y="721" fill="#C56520">Flow-matching trajectory denoiser</text>
+
+  <path d="M1580 772 C1607 739,1633 805,1661 765 C1687 728,1714 800,1743 758" fill="none" stroke="#7C8491" stroke-width="4" stroke-dasharray="10 8"/>
+  <text class="label" x="1578" y="804">Noised trajectory x<tspan baseline-shift="sub">σ</tspan></text>
+  <text class="mono" x="1578" y="829">B × 32 × 3</text>
+  <text class="small" x="1578" y="852">[Δx, Δy, Δyaw]</text>
+
+  <path class="thin-arrow" d="M1748 788 L1780 788" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+  <rect class="module" x="1787" y="748" width="170" height="91" rx="15" fill="#FFEDDC" stroke="#E2A46B"/>
+  <text class="label" x="1804" y="778" fill="#C56520">Action encoder</text>
+  <text class="mono" x="1804" y="807">3 → 384</text>
+  <text class="small" x="1804" y="828">+ sinusoidal pos</text>
+
+  <path class="thin-arrow" d="M1958 793 L1984 793" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+  <g filter="url(#shadow)">
+    <rect class="module" x="1991" y="733" width="315" height="294" rx="20" fill="#FFFFFF" stroke="#E3A369"/>
+  </g>
+  <text class="label" x="2014" y="764" fill="#C56520">NextDiT block × 12</text>
+  <text class="small" x="2014" y="787">dim 384 · 6 heads · timestep gates</text>
+
+  <rect x="2021" y="813" width="112" height="65" rx="13" fill="#FFF0CC" stroke="#DDBD69"/>
+  <text class="small" x="2038" y="839" fill="#916C15">Self-attn</text>
+  <text class="tiny" x="2037" y="861">action tokens</text>
+
+  <rect x="2161" y="813" width="116" height="65" rx="13" fill="#FFE4D7" stroke="#E09974"/>
+  <text class="small" x="2174" y="839" fill="#B4562D">Cross-attn</text>
+  <text class="tiny" x="2177" y="861">36 conditions</text>
+
+  <path class="thin-arrow" d="M2147 788 L2147 804 L2077 804 L2077 811" stroke="#7D8490" marker-end="url(#arrowGray)"/>
+  <path class="thin-arrow" d="M2147 804 L2219 804 L2219 811" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+  <circle cx="2147" cy="903" r="19" fill="#F3E3D6" stroke="#C8895F"/>
+  <text x="2138" y="911" font-family="Inter,Arial,sans-serif" font-size="25" font-weight="700" fill="#A35D30">+</text>
+  <path class="thin-arrow" d="M2077 879 L2077 903 L2126 903" stroke="#7D8490" marker-end="url(#arrowGray)"/>
+  <path class="thin-arrow" d="M2219 879 L2219 903 L2168 903" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+
+  <rect x="2066" y="937" width="162" height="60" rx="13" fill="#E8F3E7" stroke="#91B48C"/>
+  <text class="label" x="2114" y="963" fill="#4F7B47">FFN</text>
+  <text class="tiny" x="2087" y="984">gated residual</text>
+  <path class="thin-arrow" d="M2147 923 L2147 935" stroke="#7D8490" marker-end="url(#arrowGray)"/>
+
+  <path class="thin-arrow" d="M2147 1029 L2147 1054" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+  <rect class="module" x="1986" y="1055" width="324" height="70" rx="15" fill="#FFEDDC" stroke="#E2A46B"/>
+  <text class="label" x="2010" y="1084" fill="#C56520">Action decoder · 384 → 3</text>
+  <text class="small" x="2010" y="1108">predicted flow velocity · B × 32 × 3</text>
+
+  <!-- Output -->
+  <path class="arrow" d="M2147 1127 L2147 1149" stroke="#E27A27" marker-end="url(#arrowOrange)"/>
+  <g filter="url(#shadow)">
+    <rect x="1567" y="1149" width="745" height="87" rx="19" fill="#FFFFFF" stroke="#E3A369" stroke-width="1.8"/>
+  </g>
+  <path d="M1596 1203 C1643 1198,1653 1168,1690 1177 C1731 1187,1732 1216,1773 1208 C1806 1201,1818 1169,1853 1179 C1887 1188,1903 1208,1937 1195" fill="none" stroke="#E27A27" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="1596" cy="1203" r="6" fill="#E27A27"/>
+  <circle cx="1937" cy="1195" r="8" fill="#FFF" stroke="#E27A27" stroke-width="4"/>
+  <text class="label" x="1970" y="1180" fill="#C56520">32 candidate trajectories</text>
+  <text class="mono" x="1970" y="1206">32 steps × [Δx, Δy, Δyaw]</text>
+  <text class="tiny" x="1970" y="1228">10 Euler updates · CFG=1 · mean XY path → executor</text>
+
+  <!-- Stage / legend strip -->
+  <rect x="45" y="1281" width="2310" height="26" rx="13" fill="#F0F2F6"/>
+  <circle cx="73" cy="1294" r="6" fill="#7351B8"/>
+  <text class="tiny" x="87" y="1299">LoRA-adapted System-2</text>
+  <circle cx="270" cy="1294" r="6" fill="#2584B8"/>
+  <text class="tiny" x="284" y="1299">optional heatmap pretraining branch</text>
+  <circle cx="523" cy="1294" r="6" fill="#E56A54"/>
+  <text class="tiny" x="537" y="1299">trainable panoramic latent adapter</text>
+  <rect x="798" y="1287" width="13" height="13" rx="2" fill="url(#frozenHatch)" stroke="#AEB4BD"/>
+  <text class="tiny" x="820" y="1299">frozen InternNav prior</text>
+  <path d="M1008 1294 H1052" stroke="#6F7785" stroke-width="2.5" stroke-dasharray="6 5"/>
+  <text class="tiny" x="1064" y="1299">auxiliary / supervision-only</text>
+  <text class="tiny" x="1345" y="1299">System-2 STOP bypasses System-1; optional view-aware heading alignment is off by default</text>
+</svg>

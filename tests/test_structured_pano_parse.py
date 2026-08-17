@@ -16,6 +16,16 @@ def test_parse_structured_pano_pixel_goal():
     assert parsed.pixel_goal == [211, 128]
 
 
+def test_parse_structured_pano_repeated_pixel_label():
+    parsed = parse_structured_pano_output(
+        "view: left\npixel: 255 pixel: 240",
+        image_size=(256, 256),
+    )
+    assert parsed.kind == "pixel"
+    assert parsed.view_id == "left"
+    assert parsed.pixel_goal == [255, 240]
+
+
 def test_parse_structured_pano_stop_and_turn():
     assert parse_structured_pano_output("view: stop", image_size=None).kind == "stop"
     assert parse_structured_pano_output("view: turn", image_size=None).kind == "turn"

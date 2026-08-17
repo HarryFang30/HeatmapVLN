@@ -9,9 +9,11 @@ Features:
 Sequence packing is currently disabled on the shared stack.
 """
 
+import hashlib
 import inspect
 import json
 import logging
+import threading
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch_dtype.*is deprecated.*")
@@ -25,6 +27,7 @@ from typing import Any, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 
 from ..heatmap.input_constructor import find_text_anchor_positions
@@ -32,6 +35,9 @@ from ..runtime_compat import ensure_transformers_runtime_compat
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
+STRUCTURED_VIEW_CLASSES = ("stop", "front", "right", "back", "left", "turn")
+DEFAULT_LORA_ADAPTER_NAME = "default"
+STOP_DECISION_ADAPTER_NAME = "stop_decision"
 
 # Aligned with InternNav: special token ID for trajectory query placeholders.
 # These positions in input_ids are replaced by learnable latent_queries before
@@ -194,6 +200,7 @@ class Qwen2_5VLIntegration(nn.Module):
         self._varlen_attention_replaced = False
         self._internal_profiler: _ModuleTimingProfiler | None = None
         self._last_internal_timings: dict[str, float] = {}
+        self._lm_head_bypass_lock = threading.RLock()
 
         logger.info("VLM Integration initialized (model will be loaded on first forward)")
 
@@ -601,6 +608,329 @@ class Qwen2_5VLIntegration(nn.Module):
             f"({100 * lora_params / total_params:.4f}%)"
         )
 
+    @staticmethod
+    def _adapter_parameter_marker(adapter_name: str) -> tuple[str, ...]:
+        return tuple(
+            f".{family}.{adapter_name}."
+            for family in (
+                "lora_A",
+                "lora_B",
+                "lora_embedding_A",
+                "lora_embedding_B",
+            )
+        )
+
+    def available_lora_adapters(self) -> tuple[str, ...]:
+        """Return PEFT adapter names with a strict, deterministic order."""
+        if not self._model_loaded or self.model is None:
+            raise RuntimeError("Qwen must be loaded before inspecting LoRA adapters")
+        configs = getattr(self.model, "peft_config", None)
+        if not isinstance(configs, dict) or not configs:
+            raise RuntimeError("Loaded Qwen model is not a PEFT model with LoRA adapters")
+        return tuple(sorted(str(name) for name in configs))
+
+    def active_lora_adapters(self) -> tuple[str, ...]:
+        """Return the adapters currently summed by every PEFT LoRA layer."""
+        if not self._model_loaded or self.model is None:
+            raise RuntimeError("Qwen must be loaded before inspecting active adapters")
+        base_model = getattr(self.model, "base_model", None)
+        if base_model is None:
+            raise RuntimeError("Loaded Qwen PEFT model has no base_model tuner")
+        active = getattr(base_model, "active_adapters", None)
+        if active is None:
+            active = getattr(base_model, "active_adapter", None)
+        if isinstance(active, str):
+            return (active,)
+        if isinstance(active, (list, tuple)):
+            return tuple(str(name) for name in active)
+        raise RuntimeError(f"Could not inspect active PEFT adapters: {active!r}")
+
+    def activate_lora_adapters(
+        self,
+        adapter_names: list[str] | tuple[str, ...],
+        *,
+        trainable_adapters: list[str] | tuple[str, ...] = (),
+    ) -> None:
+        """Activate an explicit LoRA sum and independently control gradients.
+
+        ``PeftModel.set_adapter`` accepts only one adapter in PEFT 0.19.  The
+        underlying tuner supports a list, which makes the frozen navigation
+        LoRA and a small STOP-only delta additive.  Gradients are then narrowed
+        to the named STOP adapter so the original 224 tensors remain immutable.
+        """
+        names = tuple(dict.fromkeys(str(name) for name in adapter_names))
+        trainable = set(str(name) for name in trainable_adapters)
+        if not names:
+            raise ValueError("At least one LoRA adapter must remain active")
+        available = set(self.available_lora_adapters())
+        unknown = sorted(set(names) - available)
+        unknown_trainable = sorted(trainable - set(names))
+        if unknown or unknown_trainable:
+            raise ValueError(
+                "Invalid LoRA adapter activation: "
+                f"unknown={unknown} trainable_not_active={unknown_trainable} "
+                f"available={sorted(available)}"
+            )
+        base_model = getattr(self.model, "base_model", None)
+        set_adapter = getattr(base_model, "set_adapter", None)
+        if not callable(set_adapter):
+            raise RuntimeError("Loaded PEFT tuner does not support adapter stacking")
+        set_adapter(list(names), inference_mode=False)
+
+        markers_by_adapter = {
+            name: self._adapter_parameter_marker(name) for name in available
+        }
+        seen_trainable: set[str] = set()
+        for parameter_name, parameter in self.model.named_parameters():
+            owner = next(
+                (
+                    name
+                    for name, markers in markers_by_adapter.items()
+                    if any(marker in parameter_name for marker in markers)
+                ),
+                None,
+            )
+            if owner is None:
+                continue
+            should_train = owner in trainable
+            parameter.requires_grad_(should_train)
+            if should_train:
+                seen_trainable.add(owner)
+        if seen_trainable != trainable:
+            raise RuntimeError(
+                "Failed to locate every trainable LoRA adapter: "
+                f"requested={sorted(trainable)} found={sorted(seen_trainable)}"
+            )
+        if self.active_lora_adapters() != names:
+            raise RuntimeError(
+                "PEFT adapter stack did not activate exactly as requested: "
+                f"requested={names} active={self.active_lora_adapters()}"
+            )
+
+    def add_stop_decision_adapter(
+        self,
+        *,
+        adapter_name: str = STOP_DECISION_ADAPTER_NAME,
+        rank: int = 8,
+        alpha: int = 16,
+        layer_indices: list[int] | tuple[int, ...] = tuple(range(20, 28)),
+        target_modules: list[str] | tuple[str, ...] = (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ),
+    ) -> int:
+        """Add a zero-initialized LoRA delta used only for STOP scoring."""
+        if not adapter_name or adapter_name == DEFAULT_LORA_ADAPTER_NAME:
+            raise ValueError(f"Invalid STOP-decision adapter name: {adapter_name!r}")
+        if rank <= 0 or alpha <= 0:
+            raise ValueError("STOP-decision LoRA rank and alpha must be positive")
+        layers = sorted({int(index) for index in layer_indices})
+        modules = tuple(dict.fromkeys(str(name) for name in target_modules))
+        if not layers or not modules:
+            raise ValueError("STOP-decision LoRA requires layers and target modules")
+        available = set(self.available_lora_adapters())
+        if adapter_name in available:
+            raise ValueError(f"LoRA adapter already exists: {adapter_name}")
+        try:
+            from peft import LoraConfig
+        except ImportError as err:
+            raise ImportError("peft is required for STOP-decision LoRA") from err
+        config = LoraConfig(
+            r=int(rank),
+            lora_alpha=int(alpha),
+            target_modules=list(modules),
+            layers_to_transform=layers,
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        add_adapter = getattr(self.model, "add_adapter", None)
+        if not callable(add_adapter):
+            raise RuntimeError("Loaded Qwen PEFT model cannot add another adapter")
+        add_adapter(adapter_name, config)
+        self.activate_lora_adapters(
+            (DEFAULT_LORA_ADAPTER_NAME, adapter_name),
+            trainable_adapters=(adapter_name,),
+        )
+        parameter_count = sum(
+            parameter.numel()
+            for _name, parameter in self.lora_adapter_named_parameters(adapter_name)
+        )
+        if parameter_count <= 0:
+            raise RuntimeError("STOP-decision adapter was added without parameters")
+        logger.info(
+            "STOP-decision LoRA added: name=%s rank=%d alpha=%d layers=%s "
+            "targets=%s params=%d",
+            adapter_name,
+            rank,
+            alpha,
+            layers,
+            list(modules),
+            parameter_count,
+        )
+        return parameter_count
+
+    def lora_adapter_named_parameters(
+        self,
+        adapter_name: str,
+    ) -> list[tuple[str, nn.Parameter]]:
+        markers = self._adapter_parameter_marker(adapter_name)
+        parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if any(marker in name for marker in markers)
+        ]
+        if not parameters:
+            raise RuntimeError(f"No LoRA parameters found for adapter {adapter_name!r}")
+        return parameters
+
+    @staticmethod
+    def _canonical_adapter_parameter_name(name: str, adapter_name: str) -> str:
+        for family in (
+            "lora_A",
+            "lora_B",
+            "lora_embedding_A",
+            "lora_embedding_B",
+        ):
+            marker = f".{family}.{adapter_name}."
+            if marker in name:
+                return name.replace(marker, f".{family}.", 1)
+        raise ValueError(
+            f"Parameter {name!r} does not belong to adapter {adapter_name!r}"
+        )
+
+    def lora_adapter_state_dict(
+        self,
+        adapter_name: str,
+        *,
+        cpu: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        state: dict[str, torch.Tensor] = {}
+        for name, parameter in self.lora_adapter_named_parameters(adapter_name):
+            canonical = self._canonical_adapter_parameter_name(name, adapter_name)
+            value = parameter.detach().clone()
+            if cpu:
+                value = value.cpu()
+            if canonical in state:
+                raise RuntimeError(f"Duplicate canonical LoRA key: {canonical}")
+            state[canonical] = value
+        return dict(sorted(state.items()))
+
+    def load_lora_adapter_state_dict(
+        self,
+        adapter_name: str,
+        state_dict: dict[str, torch.Tensor],
+    ) -> int:
+        expected = {
+            self._canonical_adapter_parameter_name(name, adapter_name): parameter
+            for name, parameter in self.lora_adapter_named_parameters(adapter_name)
+        }
+        if set(state_dict) != set(expected):
+            raise RuntimeError(
+                "STOP-decision adapter checkpoint key mismatch: "
+                f"missing={sorted(set(expected) - set(state_dict))[:5]} "
+                f"unexpected={sorted(set(state_dict) - set(expected))[:5]}"
+            )
+        for name, parameter in expected.items():
+            value = state_dict[name]
+            if not torch.is_tensor(value) or tuple(value.shape) != tuple(parameter.shape):
+                raise RuntimeError(
+                    f"STOP-decision adapter tensor mismatch for {name}: "
+                    f"checkpoint={getattr(value, 'shape', None)} model={tuple(parameter.shape)}"
+                )
+            if not bool(torch.isfinite(value.float()).all()):
+                raise RuntimeError(f"STOP-decision adapter contains non-finite tensor: {name}")
+            parameter.data.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+        return len(expected)
+
+    def lora_adapter_fingerprint(self, adapter_name: str) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"heatmapvln-lora-adapter-fp32-v1\0")
+        for name, value in self.lora_adapter_state_dict(adapter_name).items():
+            tensor = value.float().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(tensor.numpy().tobytes(order="C"))
+        return digest.hexdigest()
+
+    def structured_view_token_contract(self) -> dict[str, Any]:
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("Qwen processor has no tokenizer")
+        patterns = {
+            name: tokenizer.encode(f"view: {name}", add_special_tokens=False)
+            for name in STRUCTURED_VIEW_CLASSES
+        }
+        prefixes = {tuple(pattern[:-1]) for pattern in patterns.values()}
+        class_ids = [int(patterns[name][-1]) for name in STRUCTURED_VIEW_CLASSES]
+        if (
+            any(len(pattern) != 3 for pattern in patterns.values())
+            or len(prefixes) != 1
+            or len(set(class_ids)) != len(class_ids)
+        ):
+            raise RuntimeError(
+                "STOP-decision adapter requires one shared two-token `view:` "
+                f"prefix and six distinct class tokens, got {patterns}"
+            )
+        return {
+            "schema": "heatmapvln-structured-view-token-contract-v1",
+            "classes": list(STRUCTURED_VIEW_CLASSES),
+            "prefix_token_ids": list(next(iter(prefixes))),
+            "class_token_ids": class_ids,
+            "patterns": patterns,
+        }
+
+    def structured_view_class_logits(
+        self,
+        sequence_hidden: torch.Tensor,
+        predictor_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project only the six structured class tokens, never the vocabulary."""
+        if sequence_hidden.ndim != 3:
+            raise ValueError(
+                f"Expected [B,S,H] sequence hidden states, got {tuple(sequence_hidden.shape)}"
+            )
+        positions = predictor_positions.to(
+            device=sequence_hidden.device,
+            dtype=torch.long,
+        )
+        if positions.shape != (sequence_hidden.shape[0],):
+            raise ValueError(
+                f"Predictor positions must have shape ({sequence_hidden.shape[0]},), "
+                f"got {tuple(positions.shape)}"
+            )
+        if bool((positions < 0).any()) or bool((positions >= sequence_hidden.shape[1]).any()):
+            raise ValueError("Structured view predictor position is out of bounds")
+        rows = torch.arange(sequence_hidden.shape[0], device=sequence_hidden.device)
+        predictors = sequence_hidden[rows, positions]
+        _owner_path, _owner, lm_head = self._locate_conditional_generation_lm_head()
+        weight = getattr(lm_head, "weight", None)
+        if not torch.is_tensor(weight) or weight.ndim != 2:
+            raise RuntimeError("Physical Qwen lm_head has no rank-2 weight")
+        contract = self.structured_view_token_contract()
+        token_ids = torch.tensor(
+            contract["class_token_ids"],
+            device=weight.device,
+            dtype=torch.long,
+        )
+        selected_weight = weight.index_select(0, token_ids)
+        bias = getattr(lm_head, "bias", None)
+        selected_bias = (
+            bias.index_select(0, token_ids) if torch.is_tensor(bias) else None
+        )
+        logits = F.linear(
+            predictors.to(dtype=selected_weight.dtype),
+            selected_weight,
+            selected_bias,
+        )
+        if logits.shape != (sequence_hidden.shape[0], len(STRUCTURED_VIEW_CLASSES)):
+            raise RuntimeError(f"Unexpected structured view logits shape: {tuple(logits.shape)}")
+        return logits.float()
+
     def merge_lora_for_frozen_forward(self, *, safe_merge: bool = True) -> int:
         """Merge a loaded LoRA adapter into a frozen Qwen backbone.
 
@@ -863,6 +1193,9 @@ class Qwen2_5VLIntegration(nn.Module):
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        structured_class_token_ids: tuple[int, ...] | None = None,
+        return_last_hidden_state_only: bool = False,
+        extract_vision_hidden_states: bool = True,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -888,6 +1221,24 @@ class Qwen2_5VLIntegration(nn.Module):
         if return_lm_loss and return_lm_correct_logprobs:
             raise ValueError(
                 "return_lm_loss and return_lm_correct_logprobs are mutually exclusive"
+            )
+        if structured_class_token_ids is not None:
+            if not return_lm_correct_logprobs:
+                raise ValueError(
+                    "structured_class_token_ids requires "
+                    "return_lm_correct_logprobs=True"
+                )
+            if (
+                len(structured_class_token_ids) < 2
+                or len(set(structured_class_token_ids))
+                != len(structured_class_token_ids)
+            ):
+                raise ValueError(
+                    "structured_class_token_ids must contain distinct class tokens"
+                )
+        if return_last_hidden_state_only and not return_hidden_states:
+            raise ValueError(
+                "return_last_hidden_state_only requires return_hidden_states=True"
             )
         raw_input_ids = inputs["input_ids"]
         lm_labels = (
@@ -976,7 +1327,38 @@ class Qwen2_5VLIntegration(nn.Module):
             )
 
         inner_model = getattr(self.model, "model", None) if skip_lm_head else None
-        use_inner_model_for_skip = skip_lm_head and inner_model is not None
+        bypass_lm_head_owner = None
+        bypass_lm_head = None
+        if skip_lm_head:
+            try:
+                (
+                    _bypass_owner_path,
+                    bypass_lm_head_owner,
+                    bypass_lm_head,
+                ) = self._locate_conditional_generation_lm_head()
+            except RuntimeError:
+                # Lightweight test doubles and non-Qwen wrappers can expose a
+                # real base model directly. Keep that compatibility fallback.
+                bypass_lm_head_owner = None
+                bypass_lm_head = None
+        use_physical_lm_head_bypass = bool(
+            skip_lm_head
+            and bypass_lm_head_owner is not None
+            and bypass_lm_head is not None
+        )
+        use_inner_model_for_skip = bool(
+            skip_lm_head
+            and (use_physical_lm_head_bypass or inner_model is not None)
+        )
+        use_sequence_last_hidden_state_only = bool(
+            return_hidden_states
+            and return_last_hidden_state_only
+            and use_inner_model_for_skip
+        )
+        if return_last_hidden_state_only and not use_sequence_last_hidden_state_only:
+            raise RuntimeError(
+                "Last-hidden-only sequence features require the skip-LM-head inner model path"
+            )
         # TRAJ latent queries only need the final sequence state. The optimized
         # frozen path calls the inner model, which exposes last_hidden_state;
         # legacy/wrapper paths retain the all-hidden-states fallback.
@@ -986,7 +1368,7 @@ class Qwen2_5VLIntegration(nn.Module):
             and use_inner_model_for_skip
         )
         need_all_hidden_states = (
-            return_hidden_states
+            (return_hidden_states and not use_sequence_last_hidden_state_only)
             or (need_traj_hidden and not use_last_hidden_state_only)
         )
         fwd_kwargs = dict(
@@ -1162,6 +1544,27 @@ class Qwen2_5VLIntegration(nn.Module):
 
         def _run_model_forward():
             if skip_lm_head:
+                if use_physical_lm_head_bypass:
+                    assert bypass_lm_head_owner is not None
+                    assert bypass_lm_head is not None
+                    # PEFT wraps the multimodal conditional-generation model;
+                    # calling ``PeftModel.model`` does not reach the Qwen base
+                    # model and therefore cannot expose last_hidden_state. Run
+                    # the normal PEFT path so all LoRA modules and vision input
+                    # handling remain identical, but replace the one physical
+                    # vocabulary projection with Identity for this forward.
+                    with self._lm_head_bypass_lock:
+                        registered_head = bypass_lm_head_owner._modules.get("lm_head")
+                        if registered_head is not bypass_lm_head:
+                            raise RuntimeError(
+                                "Physical Qwen lm_head changed before frozen-forward bypass"
+                            )
+                        identity = nn.Identity()
+                        bypass_lm_head_owner._modules["lm_head"] = identity
+                        try:
+                            return self.model(**fwd_kwargs)
+                        finally:
+                            bypass_lm_head_owner._modules["lm_head"] = bypass_lm_head
                 if inner_model is None:
                     return self.model(**fwd_kwargs)
                 try:
@@ -1218,8 +1621,29 @@ class Qwen2_5VLIntegration(nn.Module):
                         "fallback for correct-label preservation"
                     ) from exc
                 raise
+            bypassed_sequence_hidden = None
+            if use_physical_lm_head_bypass:
+                bypassed_sequence_hidden = getattr(outputs, "logits", None)
+                expected_hidden_dim = getattr(bypass_lm_head, "in_features", None)
+                bypass_weight = getattr(bypass_lm_head, "weight", None)
+                if expected_hidden_dim is None and torch.is_tensor(bypass_weight):
+                    expected_hidden_dim = int(bypass_weight.shape[-1])
+                if (
+                    not torch.is_tensor(bypassed_sequence_hidden)
+                    or bypassed_sequence_hidden.ndim != 3
+                    or (
+                        expected_hidden_dim is not None
+                        and bypassed_sequence_hidden.shape[-1] != expected_hidden_dim
+                    )
+                ):
+                    raise RuntimeError(
+                        "Physical Qwen lm_head bypass did not return sequence hidden states: "
+                        f"shape={getattr(bypassed_sequence_hidden, 'shape', None)} "
+                        f"expected_hidden_dim={expected_hidden_dim}"
+                    )
             if (
                 use_last_hidden_state_only
+                and bypassed_sequence_hidden is None
                 and self._last_hidden_state_from_outputs(outputs) is None
             ):
                 logger.warning(
@@ -1314,6 +1738,18 @@ class Qwen2_5VLIntegration(nn.Module):
                     f"expected_kept_positions={predictor_union.numel()}"
                 )
             flat_correct_logprobs = []
+            flat_correct_rejection_log_odds = []
+            sample_structured_class_logits = []
+            sample_structured_class_targets = []
+            structured_ids = (
+                torch.tensor(
+                    structured_class_token_ids,
+                    device=logits.device,
+                    dtype=torch.long,
+                )
+                if structured_class_token_ids is not None
+                else None
+            )
             for row, (positions_list, token_ids_list) in enumerate(
                 zip(
                     correct_logprob_alignment["sample_predictor_positions"],
@@ -1331,31 +1767,94 @@ class Qwen2_5VLIntegration(nn.Module):
                 correct_logits = selected_logits.gather(
                     dim=-1, index=token_ids.unsqueeze(-1),
                 ).squeeze(-1)
+                competing_logits = selected_logits.clone()
+                competing_logits.scatter_(
+                    dim=-1,
+                    index=token_ids.unsqueeze(-1),
+                    value=float("-inf"),
+                )
                 flat_correct_logprobs.append(
                     correct_logits - torch.logsumexp(selected_logits, dim=-1)
                 )
+                flat_correct_rejection_log_odds.append(
+                    correct_logits - torch.logsumexp(competing_logits, dim=-1)
+                )
+                if structured_ids is not None:
+                    matches = token_ids.unsqueeze(-1) == structured_ids.unsqueeze(0)
+                    occurrences = torch.nonzero(matches, as_tuple=False)
+                    if occurrences.shape != (1, 2):
+                        raise RuntimeError(
+                            "Each structured SFT row must expose exactly one class "
+                            "token, got "
+                            f"row={row} token_ids={token_ids_list} "
+                            f"class_ids={list(structured_class_token_ids)}"
+                        )
+                    labelled_position = int(occurrences[0, 0].item())
+                    class_target = int(occurrences[0, 1].item())
+                    sample_structured_class_logits.append(
+                        selected_logits[labelled_position]
+                        .index_select(0, structured_ids)
+                        .float()
+                    )
+                    sample_structured_class_targets.append(class_target)
             correct_logprobs = torch.cat(flat_correct_logprobs, dim=0)
+            correct_rejection_log_odds = torch.cat(
+                flat_correct_rejection_log_odds,
+                dim=0,
+            )
             if correct_logprobs.dtype != torch.float32:
                 raise RuntimeError(
                     "Correct-label log probabilities must be accumulated in FP32"
+                )
+            if correct_rejection_log_odds.dtype != torch.float32:
+                raise RuntimeError(
+                    "Correct-label rejection log odds must be accumulated in FP32"
                 )
             correct_logprob_alignment["returned_logits_shape"] = list(logits.shape)
             correct_logprob_alignment["returned_logprob_dtype"] = str(
                 correct_logprobs.dtype
             )
+            correct_logprob_alignment["returned_rejection_log_odds_dtype"] = str(
+                correct_rejection_log_odds.dtype
+            )
             lm_output = {
                 "correct_label_logprobs": correct_logprobs,
+                "correct_label_rejection_log_odds": correct_rejection_log_odds,
                 "alignment": correct_logprob_alignment,
             }
+            if structured_ids is not None:
+                structured_logits = torch.stack(
+                    sample_structured_class_logits,
+                    dim=0,
+                )
+                if structured_logits.dtype != torch.float32:
+                    raise RuntimeError(
+                        "Structured class logits must be accumulated in FP32"
+                    )
+                lm_output["structured_class_logits"] = structured_logits
+                lm_output["structured_class_targets"] = (
+                    sample_structured_class_targets
+                )
 
         if return_hidden_states:
-            layer_idx = self.config.hidden_layer_for_features
-            if layer_idx == -1:
-                layer_idx = len(outputs.hidden_states) - 1
-            hidden_states = outputs.hidden_states[layer_idx]
+            if use_sequence_last_hidden_state_only:
+                hidden_states = bypassed_sequence_hidden
+                if hidden_states is None:
+                    hidden_states = self._last_hidden_state_from_outputs(outputs)
+                if hidden_states is None:
+                    raise RuntimeError(
+                        "Inner Qwen model did not expose last_hidden_state for STOP features"
+                    )
+            else:
+                layer_idx = self.config.hidden_layer_for_features
+                if layer_idx == -1:
+                    layer_idx = len(outputs.hidden_states) - 1
+                hidden_states = outputs.hidden_states[layer_idx]
 
         if need_traj_hidden:
-            last_hs = self._last_hidden_state_from_outputs(outputs)
+            last_hs = bypassed_sequence_hidden
+            if last_hs is None:
+                last_hs = self._last_hidden_state_from_outputs(outputs)
             if last_hs is None:
                 raise RuntimeError(
                     "Failed to extract last hidden state for TRAJ latent queries. "
@@ -1373,7 +1872,7 @@ class Qwen2_5VLIntegration(nn.Module):
             hidden_states = None
 
         vision_hidden_states = None
-        if hidden_states is not None:
+        if hidden_states is not None and extract_vision_hidden_states:
             vision_hidden_states = self._extract_vision_hidden_states(
                 hidden_states, vision_input_ids,
             )
@@ -1388,6 +1887,7 @@ class Qwen2_5VLIntegration(nn.Module):
         return_hidden_states: bool = True,
         heatmap_vln: nn.Module | None = None,
         history_rel_poses: torch.Tensor | None = None,
+        return_heatmap_memory_tokens: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None]:
         """Forward a single panoramic sample through one Qwen pass.
 
@@ -1423,10 +1923,13 @@ class Qwen2_5VLIntegration(nn.Module):
                     inputs, False, skip_lm_head=True,
                 )
 
+        heatmap_decode_kwargs = {"history_rel_poses": history_rel_poses}
+        if return_heatmap_memory_tokens:
+            heatmap_decode_kwargs["return_memory_tokens"] = True
         heatmap_output = heatmap_vln.decode_from_inputs(
             inputs,
             num_history,
-            history_rel_poses=history_rel_poses,
+            **heatmap_decode_kwargs,
         )
         return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output
 
@@ -1438,6 +1941,7 @@ class Qwen2_5VLIntegration(nn.Module):
         return_hidden_states: bool = True,
         heatmap_vln: nn.Module | None = None,
         history_rel_poses: torch.Tensor | None = None,
+        return_heatmap_memory_tokens: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None]:
         """Batch forward for panoramic input using one batched Qwen pass."""
         if heatmap_vln is None:
@@ -1483,12 +1987,17 @@ class Qwen2_5VLIntegration(nn.Module):
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         internal_timings = self._consume_internal_timings() if self.config.enable_runtime_timing else {}
 
+        heatmap_decode_kwargs = {
+            "image_positions_batch": image_positions_batch,
+            "text_anchors_batch": text_anchors_batch,
+            "history_rel_poses": history_rel_poses,
+        }
+        if return_heatmap_memory_tokens:
+            heatmap_decode_kwargs["return_memory_tokens"] = True
         heatmap_output = heatmap_vln.decode_from_inputs_batch(
             inputs,
             num_histories,
-            image_positions_batch=image_positions_batch,
-            text_anchors_batch=text_anchors_batch,
-            history_rel_poses=history_rel_poses,
+            **heatmap_decode_kwargs,
         )
         if self.config.enable_runtime_timing:
             t3 = time.perf_counter()
@@ -1514,6 +2023,8 @@ class Qwen2_5VLIntegration(nn.Module):
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        sequence_last_hidden_state_only: bool = False,
+        return_heatmap_memory_tokens: bool = False,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -1583,6 +2094,8 @@ class Qwen2_5VLIntegration(nn.Module):
                 skip_lm_head=skip_lm, latent_queries=latent_queries,
                 return_lm_loss=return_lm_loss,
                 return_lm_correct_logprobs=return_lm_correct_logprobs,
+                return_last_hidden_state_only=sequence_last_hidden_state_only,
+                extract_vision_hidden_states=not sequence_last_hidden_state_only,
             )
         else:
             with torch.inference_mode():
@@ -1594,12 +2107,17 @@ class Qwen2_5VLIntegration(nn.Module):
 
         heatmap_output = None
         if heatmap_vln is not None:
+            heatmap_decode_kwargs = {
+                "image_positions_batch": image_positions_batch,
+                "text_anchors_batch": text_anchor_positions_batch,
+                "history_rel_poses": history_rel_poses,
+            }
+            if return_heatmap_memory_tokens:
+                heatmap_decode_kwargs["return_memory_tokens"] = True
             heatmap_output = heatmap_vln.decode_from_inputs_batch(
                 inputs,
                 num_histories,
-                image_positions_batch=image_positions_batch,
-                text_anchors_batch=text_anchor_positions_batch,
-                history_rel_poses=history_rel_poses,
+                **heatmap_decode_kwargs,
             )
         if self.config.enable_runtime_timing:
             t3 = time.perf_counter()
@@ -1718,6 +2236,8 @@ class Qwen2_5VLIntegration(nn.Module):
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        sequence_last_hidden_state_only: bool = False,
+        return_heatmap_memory_tokens: bool = False,
     ) -> dict[str, Any]:
         """Forward pass through Qwen2.5-VL with batch processing."""
         # Ensure model is loaded
@@ -1741,6 +2261,8 @@ class Qwen2_5VLIntegration(nn.Module):
                     latent_queries=latent_queries,
                     return_lm_loss=return_lm_loss,
                     return_lm_correct_logprobs=return_lm_correct_logprobs,
+                    sequence_last_hidden_state_only=sequence_last_hidden_state_only,
+                    return_heatmap_memory_tokens=return_heatmap_memory_tokens,
                 )
             )
         elif current_views is not None and history_panoramas is not None:
@@ -1752,6 +2274,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     return_hidden_states=return_hidden_states,
                     heatmap_vln=heatmap_vln,
                     history_rel_poses=history_rel_poses,
+                    return_heatmap_memory_tokens=return_heatmap_memory_tokens,
                 )
             )
             traj_hidden_states = traj_hs

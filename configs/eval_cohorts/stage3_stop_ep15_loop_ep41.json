@@ -1,0 +1,7 @@
+{
+  "description": "Fixed second-pass smoke for false head-added STOP and collision loop recovery.",
+  "episodes": [
+    {"scene_id": "zsNo4HB9uLZ", "episode_id": 15, "baseline": "false_head_added_stop"},
+    {"scene_id": "zsNo4HB9uLZ", "episode_id": 41, "baseline": "collision_loop_500_steps"}
+  ]
+}

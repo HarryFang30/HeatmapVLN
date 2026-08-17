@@ -107,7 +107,13 @@ def assert_complete_lora_checkpoint_match(
     checkpoint_path: str | None = None,
 ) -> int:
     """Require checkpoint LoRA tensors to exactly match the current model."""
-    model_lora = _normalized_lora_state_dict(model.state_dict())
+    # ``state_dict()`` emits one key for every registered module path, even
+    # when multiple paths point at the same physical module.  HeatmapVLN keeps
+    # a reference to the pipeline's Qwen model as ``heatmap_vln.qwen``, so
+    # using state_dict here counts every LoRA tensor twice.  named_parameters
+    # removes shared-parameter aliases by default and therefore represents the
+    # physical LoRA state that a checkpoint actually needs to contain.
+    model_lora = _normalized_lora_state_dict(dict(model.named_parameters()))
     checkpoint_lora = _normalized_lora_state_dict(checkpoint_state_dict)
     model_keys = set(model_lora)
     checkpoint_keys = set(checkpoint_lora)
@@ -520,6 +526,55 @@ def build_heatmap_loss_fn(
         temperature=temperature if temperature is not None else hm_cfg.get('temperature', 1.0),
         heatmap_size=tuple(cfg['model'].get('heatmap', {}).get('heatmap_size', cfg['data']['init_hm_size'])),
         vis_pos_weight=hm_cfg.get('vis_pos_weight', 1.0),
+        lambda_view_macro=hm_cfg.get('lambda_view_macro', 0.0),
+        lambda_direction_macro=hm_cfg.get('lambda_direction_macro', 0.0),
+        lambda_panoramic_view=hm_cfg.get('lambda_panoramic_view', 0.0),
+        panoramic_detach_visibility=hm_cfg.get(
+            'panoramic_detach_visibility',
+            False,
+        ),
+        coord_smooth_l1_beta=hm_cfg.get('coord_smooth_l1_beta', 0.1),
+        allow_probability_fallback=hm_cfg.get(
+            'allow_probability_fallback',
+            True,
+        ),
+    ).to(device)
+
+
+def build_future_heatmap_loss_fn(cfg: dict, device: torch.device):
+    """Build the v1 multi-point Future-tube objective.
+
+    This is intentionally separate from ``build_heatmap_loss_fn``: a temporal
+    tube has no single soft-argmax coordinate or forced single panorama view.
+    """
+
+    from src.models.future_trajectory_objective import (
+        FutureTrajectoryHeatmapObjective,
+    )
+
+    future_cfg = cfg.get('loss', {}).get('future_heatmap', {}) or {}
+    forbidden = {
+        'lambda_coord': 0.0,
+        'lambda_direction_macro': 0.0,
+        'lambda_panoramic_view': 0.0,
+        'allow_probability_fallback': False,
+    }
+    violations = {
+        name: future_cfg[name]
+        for name, required in forbidden.items()
+        if name in future_cfg and future_cfg[name] != required
+    }
+    if violations:
+        raise ValueError(
+            "Future trajectory tube loss cannot enable point/single-view "
+            f"objectives or probability fallback: {violations}"
+        )
+    return FutureTrajectoryHeatmapObjective(
+        lambda_vis=float(future_cfg.get('lambda_vis', 1.0)),
+        lambda_peak=float(future_cfg.get('lambda_peak', 1.0)),
+        lambda_neg=float(future_cfg.get('lambda_neg', 0.25)),
+        lambda_view_macro=float(future_cfg.get('lambda_view_macro', 0.5)),
+        vis_pos_weight=float(future_cfg.get('vis_pos_weight', 1.0)),
     ).to(device)
 
 

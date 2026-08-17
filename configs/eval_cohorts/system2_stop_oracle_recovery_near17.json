@@ -1,0 +1,22 @@
+{
+  "description": "Train episodes with baseline false STOPs within 8.3 m, for bounded shortest-path recovery collection.",
+  "episodes": [
+    {"scene_id": "PuKPg4mmafe", "episode_id": 6966, "baseline_false_stop_distance_m": 4.214},
+    {"scene_id": "Pm6F8kyY3z2", "episode_id": 4385, "baseline_false_stop_distance_m": 4.227},
+    {"scene_id": "gTV8FGcVJC9", "episode_id": 4418, "baseline_false_stop_distance_m": 4.311},
+    {"scene_id": "XcA2TqTSSAj", "episode_id": 10531, "baseline_false_stop_distance_m": 4.428},
+    {"scene_id": "HxpKQynjfin", "episode_id": 7043, "baseline_false_stop_distance_m": 4.915},
+    {"scene_id": "PuKPg4mmafe", "episode_id": 6965, "baseline_false_stop_distance_m": 4.945},
+    {"scene_id": "VLzqgDo317F", "episode_id": 9102, "baseline_false_stop_distance_m": 5.405},
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8848, "baseline_false_stop_distance_m": 5.579},
+    {"scene_id": "qoiz87JEwZ2", "episode_id": 10638, "baseline_false_stop_distance_m": 5.929},
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8846, "baseline_false_stop_distance_m": 6.082},
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8847, "baseline_false_stop_distance_m": 6.232},
+    {"scene_id": "uNb9QFRL6hY", "episode_id": 791, "baseline_false_stop_distance_m": 6.608},
+    {"scene_id": "b8cTxDM8gDG", "episode_id": 4551, "baseline_false_stop_distance_m": 7.023},
+    {"scene_id": "Vvot9Ly1tCj", "episode_id": 4281, "baseline_false_stop_distance_m": 7.463},
+    {"scene_id": "kEZ7cmS4wCh", "episode_id": 9005, "baseline_false_stop_distance_m": 7.995},
+    {"scene_id": "e9zR4mvMWw7", "episode_id": 3811, "baseline_false_stop_distance_m": 8.044},
+    {"scene_id": "gTV8FGcVJC9", "episode_id": 4419, "baseline_false_stop_distance_m": 8.264}
+  ]
+}

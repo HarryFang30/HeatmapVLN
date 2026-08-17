@@ -15,6 +15,29 @@ logger = logging.getLogger(__name__)
 def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.optim.Optimizer:
     """Build a per-module optimizer with layered learning rates and weight decay."""
     optim_cfg = cfg['optim']
+
+    if stage_cfg.get('past_plan_action_stage') is not None:
+        chain = getattr(model, 'past_plan_action', None)
+        past_head = getattr(model, 'heatmap_vln', None)
+        if chain is None or past_head is None:
+            raise RuntimeError(
+                "Past→Plan→Action optimizer requires the enabled chain and Past Head"
+            )
+        from src.models.past_plan_action_training import (
+            build_past_plan_action_optimizer,
+        )
+
+        return build_past_plan_action_optimizer(
+            chain=chain,
+            past_head=past_head,
+            future_lr=float(optim_cfg.get('past_plan_action_future_lr', 1e-4)),
+            bridge_lr=float(optim_cfg.get('past_plan_action_bridge_lr', 2e-5)),
+            shared_map_lr=float(
+                optim_cfg.get('past_plan_action_shared_map_lr', 2e-5)
+            ),
+            weight_decay=float(optim_cfg.get('weight_decay', 1e-2)),
+        )
+
     param_groups = []
 
     default_wd = optim_cfg.get('weight_decay', 1e-2)
@@ -50,7 +73,15 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
 
     # HeatmapVLN v2 param groups
     heatmap_lr = optim_cfg.get('heatmap_lr', 2e-4)
-    vis_head_lr = optim_cfg.get('vis_head_lr', heatmap_lr)
+    def heatmap_group_lr(name: str) -> float:
+        configured = optim_cfg.get(name)
+        return heatmap_lr if configured is None else configured
+
+    vit_lr = heatmap_group_lr('heatmap_vit_lr')
+    fine_lr = heatmap_group_lr('heatmap_fine_lr')
+    llm_lr = heatmap_group_lr('heatmap_llm_lr')
+    coarse_lr = heatmap_group_lr('heatmap_coarse_lr')
+    vis_head_lr = heatmap_group_lr('vis_head_lr')
     if hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
         if model.heatmap_vln.pose_free_matcher is not None:
             groups = get_param_groups_with_wd(
@@ -67,15 +98,25 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
                     default_wd,
                 )
         else:
-            for name, submodule in [
-                ('vit_dpt_fusion', model.heatmap_vln.vit_dpt_fusion),
-                ('llm_dpt_fusion', model.heatmap_vln.llm_dpt_fusion),
-                ('fine',           model.heatmap_vln.fine),
+            for name, submodule, module_lr in [
+                ('vit_dpt_fusion', model.heatmap_vln.vit_dpt_fusion, vit_lr),
+                ('llm_dpt_fusion', model.heatmap_vln.llm_dpt_fusion, llm_lr),
+                ('fine',           model.heatmap_vln.fine, fine_lr),
             ]:
-                groups = get_param_groups_with_wd(submodule, heatmap_lr, f'heatmap_{name}', default_wd)
+                groups = get_param_groups_with_wd(
+                    submodule,
+                    module_lr,
+                    f'heatmap_{name}',
+                    default_wd,
+                )
                 if groups:
                     param_groups.extend(groups)
-                    logger.info("  Param group: heatmap_%s (lr=%s, wd=%s)", name, heatmap_lr, default_wd)
+                    logger.info(
+                        "  Param group: heatmap_%s (lr=%s, wd=%s)",
+                        name,
+                        module_lr,
+                        default_wd,
+                    )
 
             coarse_module = model.heatmap_vln.coarse
             vis_head_params_decay = []
@@ -92,16 +133,16 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
                 else:
                     (coarse_rest_no_decay if is_no_decay else coarse_rest_decay).append(p)
             if coarse_rest_decay:
-                param_groups.append({'params': coarse_rest_decay, 'lr': heatmap_lr, 'weight_decay': default_wd, 'name': 'heatmap_coarse_decay'})
+                param_groups.append({'params': coarse_rest_decay, 'lr': coarse_lr, 'weight_decay': default_wd, 'name': 'heatmap_coarse_decay'})
             if coarse_rest_no_decay:
-                param_groups.append({'params': coarse_rest_no_decay, 'lr': heatmap_lr, 'weight_decay': 0.0, 'name': 'heatmap_coarse_no_decay'})
+                param_groups.append({'params': coarse_rest_no_decay, 'lr': coarse_lr, 'weight_decay': 0.0, 'name': 'heatmap_coarse_no_decay'})
             if vis_head_params_decay:
                 param_groups.append({'params': vis_head_params_decay, 'lr': vis_head_lr, 'weight_decay': default_wd, 'name': 'heatmap_vis_head_decay'})
             if vis_head_params_no_decay:
                 param_groups.append({'params': vis_head_params_no_decay, 'lr': vis_head_lr, 'weight_decay': 0.0, 'name': 'heatmap_vis_head_no_decay'})
             n_vis = len(vis_head_params_decay) + len(vis_head_params_no_decay)
             n_coarse = len(coarse_rest_decay) + len(coarse_rest_no_decay)
-            logger.info("  Param group: heatmap_coarse (lr=%s, %d params)", heatmap_lr, n_coarse)
+            logger.info("  Param group: heatmap_coarse (lr=%s, %d params)", coarse_lr, n_coarse)
             logger.info("  Param group: heatmap_vis_head (lr=%s, %d params)", vis_head_lr, n_vis)
 
     # NextDiT Action Head — split submodules for per-component learning rates
@@ -189,6 +230,23 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
         if groups:
             param_groups.extend(groups)
             logger.info("  Param group: llm_projector (lr=%s, wd=%s)", proj_lr, projector_wd)
+
+    # Independent System2 STOP classifier
+    if getattr(model, 'stop_head', None) is not None:
+        stop_head_lr = optim_cfg.get('stop_head_lr', 1e-4)
+        groups = get_param_groups_with_wd(
+            model.stop_head,
+            stop_head_lr,
+            'stop_head',
+            default_wd,
+        )
+        if groups:
+            param_groups.extend(groups)
+            logger.info(
+                "  Param group: stop_head (lr=%s, wd=%s)",
+                stop_head_lr,
+                default_wd,
+            )
 
     # VLM backbone LoRA parameters
     lora_lr = optim_cfg.get('lora_lr', 1e-5)

@@ -113,6 +113,27 @@ def test_append_only_collection_can_be_restricted_by_global_clip_id(tmp_path):
     assert all(VLNSlidingWindowDataset._numeric_clip_id(clip) <= 2000 for clip in clips)
 
 
+def test_max_clips_is_selected_scene_round_robin(tmp_path):
+    for scene in ("scene_a", "scene_b", "scene_c"):
+        for clip_id in (1, 2, 3):
+            (tmp_path / scene / f"clip_{clip_id:06d}").mkdir(parents=True)
+    dataset = object.__new__(VLNSlidingWindowDataset)
+    dataset.root = tmp_path
+    dataset.split = "all"
+    dataset.max_clips = 4
+    dataset.max_clip_id = 0
+
+    clips = dataset._enumerate_clips()
+
+    assert len(clips) == 4
+    assert [clip.parent.name for clip in clips[:3]] == [
+        "scene_a",
+        "scene_b",
+        "scene_c",
+    ]
+    assert len({clip.parent.name for clip in clips}) == 3
+
+
 def test_head_checkpoint_excludes_shared_qwen_reference():
     class DummyHeatmap(torch.nn.Module):
         def __init__(self):

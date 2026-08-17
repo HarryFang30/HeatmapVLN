@@ -1,7 +1,11 @@
 import pytest
 import torch
 import torch.nn as nn
-from scripts.training.distributed import _get_supported_trainable_sync_modules
+from scripts.training import distributed
+from scripts.training.distributed import (
+    _all_reduce_trainable_grad,
+    _get_supported_trainable_sync_modules,
+)
 
 
 class DummyBackbone(nn.Module):
@@ -49,3 +53,46 @@ def test_lora_sync_requires_loaded_trainable_lora_params():
             model,
             {"trainable_modules": ["lora"]},
         )
+
+
+def test_manual_sync_materializes_missing_gradient_and_still_reduces(monkeypatch):
+    param = nn.Parameter(torch.tensor([2.0, -3.0]))
+    reduced = []
+
+    def fake_all_reduce(tensor):
+        reduced.append(tensor)
+        tensor.add_(torch.tensor([4.0, 6.0]))
+        return tensor
+
+    monkeypatch.setattr(
+        distributed,
+        "_dist_all_reduce_in_place",
+        fake_all_reduce,
+    )
+
+    assert param.grad is None
+    _all_reduce_trainable_grad(param, world_size=2)
+
+    assert reduced == [param.grad]
+    assert torch.equal(param.grad, torch.tensor([2.0, 3.0]))
+
+
+def test_manual_sync_ignores_only_frozen_parameters(monkeypatch):
+    param = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+    called = False
+
+    def fake_all_reduce(tensor):
+        nonlocal called
+        called = True
+        return tensor
+
+    monkeypatch.setattr(
+        distributed,
+        "_dist_all_reduce_in_place",
+        fake_all_reduce,
+    )
+
+    _all_reduce_trainable_grad(param, world_size=2)
+
+    assert param.grad is None
+    assert called is False

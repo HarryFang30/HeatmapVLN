@@ -5,6 +5,7 @@ Extends VLNSlidingWindowDataset with 24-step trajectory prediction,
 3D actions (dx, dy, delta_yaw), trajectory augmentation, and progress.
 """
 
+import copy
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ except ImportError as exc:  # pragma: no cover - exercised in lightweight test e
 else:
     _CV2_IMPORT_ERROR = None
 
+from .future_trajectory_batch import future_target_to_tensors
+from .future_trajectory_heatmap import build_future_target_from_action_and_poses
 from .heatmap_geometry import compute_history_heatmap
 from .pano_view_pixel_goal import (
     PANO_HORIZONTAL_VIEWS,
@@ -116,12 +119,21 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         system2_sample_step: int = 4,
         system2_min_pixel_goal_len: int = 3,
         system2_stop_oversample: int = 5,
+        system2_stop_path_radius_m: float = 0.0,
+        system2_near_stop_hard_negative_oversample: int = 0,
+        system2_near_stop_hard_negative_min_path_m: float = 0.0,
+        system2_near_stop_hard_negative_max_path_m: float = 0.0,
+        system2_near_stop_hard_negative_min_goal_distance_m: float = 0.0,
+        system2_near_stop_hard_negative_max_goal_distance_m: float = 0.0,
         include_stop_samples_random_subsequence: bool = False,
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
         compute_pano_view_pixel_goal: bool | None = None,
         pano_max_side_dist_m: float = 6.0,
         trajectory_target_convention: str = "legacy_pitched_camera",
+        load_future_trajectory_heatmap: bool = False,
+        future_heatmap_size: tuple[int, int] = (64, 64),
+        future_agent_camera_height_m: float = 1.25,
         max_clips: int = 0,
     ):
         # ``VLNSlidingWindowDataset.__init__`` calls ``self._build_sample_index()``
@@ -170,6 +182,71 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         self.system2_sample_step = max(int(system2_sample_step), 1)
         self.system2_min_pixel_goal_len = max(int(system2_min_pixel_goal_len), 1)
         self.system2_stop_oversample = max(int(system2_stop_oversample), 0)
+        self.system2_stop_path_radius_m = float(system2_stop_path_radius_m)
+        self.system2_near_stop_hard_negative_oversample = max(
+            int(system2_near_stop_hard_negative_oversample),
+            0,
+        )
+        self.system2_near_stop_hard_negative_min_path_m = float(
+            system2_near_stop_hard_negative_min_path_m
+        )
+        self.system2_near_stop_hard_negative_max_path_m = float(
+            system2_near_stop_hard_negative_max_path_m
+        )
+        self.system2_near_stop_hard_negative_min_goal_distance_m = float(
+            system2_near_stop_hard_negative_min_goal_distance_m
+        )
+        self.system2_near_stop_hard_negative_max_goal_distance_m = float(
+            system2_near_stop_hard_negative_max_goal_distance_m
+        )
+        if self.system2_stop_path_radius_m < 0:
+            raise ValueError("system2_stop_path_radius_m must be >= 0")
+        hard_negative_enabled = self.system2_near_stop_hard_negative_oversample > 0
+        legacy_hard_negative_range_enabled = (
+            self.system2_near_stop_hard_negative_min_path_m > 0
+            or self.system2_near_stop_hard_negative_max_path_m > 0
+        )
+        goal_distance_range_enabled = (
+            self.system2_near_stop_hard_negative_min_goal_distance_m > 0
+            or self.system2_near_stop_hard_negative_max_goal_distance_m > 0
+        )
+        if legacy_hard_negative_range_enabled and goal_distance_range_enabled:
+            raise ValueError(
+                "Configure either path-distance or goal-distance STOP hard negatives, not both"
+            )
+        hard_negative_range_enabled = (
+            legacy_hard_negative_range_enabled or goal_distance_range_enabled
+        )
+        if hard_negative_enabled != hard_negative_range_enabled:
+            raise ValueError(
+                "system2_near_stop_hard_negative_oversample and "
+                "its distance range must either both be enabled or both be zero"
+            )
+        if hard_negative_enabled:
+            if goal_distance_range_enabled:
+                if not (
+                    self.system2_near_stop_hard_negative_max_goal_distance_m
+                    > self.system2_near_stop_hard_negative_min_goal_distance_m
+                    >= self.system2_stop_path_radius_m
+                ):
+                    raise ValueError(
+                        "System2 STOP goal-distance hard negatives must satisfy "
+                        "max_goal_distance_m > min_goal_distance_m >= stop_path_radius_m"
+                    )
+                self._system2_stop_hard_negative_distance = "goal_euclidean"
+            else:
+                if not (
+                    self.system2_near_stop_hard_negative_max_path_m
+                    > self.system2_near_stop_hard_negative_min_path_m
+                    >= self.system2_stop_path_radius_m
+                ):
+                    raise ValueError(
+                        "System2 STOP path-distance hard negatives must satisfy "
+                        "max_path_m > min_path_m >= stop_path_radius_m"
+                    )
+                self._system2_stop_hard_negative_distance = "remaining_path"
+        else:
+            self._system2_stop_hard_negative_distance = "disabled"
         self.traj_image_size = traj_image_size
         self.traj_sequence_max_len = 12
         self.panoramic_vlm_input = panoramic_vlm_input
@@ -188,6 +265,33 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 f"{trajectory_target_convention!r}"
             )
         self.trajectory_target_convention = trajectory_target_convention
+        self.load_future_trajectory_heatmap = bool(load_future_trajectory_heatmap)
+        self.future_heatmap_size = tuple(int(value) for value in future_heatmap_size)
+        self.future_agent_camera_height_m = float(future_agent_camera_height_m)
+        if self.load_future_trajectory_heatmap:
+            if self.predict_horizon != 32:
+                raise ValueError(
+                    "Future trajectory heatmaps require predict_horizon=32, "
+                    f"got {self.predict_horizon}"
+                )
+            if self.future_heatmap_size != (64, 64):
+                raise ValueError(
+                    "Future trajectory batch schema requires heatmap_size=(64,64), "
+                    f"got {self.future_heatmap_size}"
+                )
+            if self.trajectory_target_convention != "internnav_habitat":
+                raise ValueError(
+                    "Future trajectory heatmaps require the level front-pose "
+                    "trajectory_target_convention='internnav_habitat'"
+                )
+            if not np.isfinite(self.future_agent_camera_height_m):
+                raise ValueError("future_agent_camera_height_m must be finite")
+            if self.enable_trajectory_augmentation:
+                logger.info(
+                    "Disabling trajectory augmentation for Future heatmap "
+                    "supervision so action and image-space labels stay aligned"
+                )
+                self.enable_trajectory_augmentation = False
 
         if self.require_sft_target:
             self._build_sample_index()
@@ -215,10 +319,21 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"system2_sample_step={self.system2_sample_step}, "
             f"system2_min_pixel_goal_len={self.system2_min_pixel_goal_len}, "
             f"system2_stop_oversample={self.system2_stop_oversample}, "
+            f"system2_stop_path_radius_m={self.system2_stop_path_radius_m}, "
+            "system2_near_stop_hard_negative_oversample="
+            f"{self.system2_near_stop_hard_negative_oversample}, "
+            "system2_near_stop_hard_negative_path_m="
+            f"[{self.system2_near_stop_hard_negative_min_path_m}, "
+            f"{self.system2_near_stop_hard_negative_max_path_m}], "
+            "system2_near_stop_hard_negative_goal_distance_m="
+            f"[{self.system2_near_stop_hard_negative_min_goal_distance_m}, "
+            f"{self.system2_near_stop_hard_negative_max_goal_distance_m}], "
             f"panoramic_vlm_input={self.panoramic_vlm_input}, "
             f"compute_pano_view_pixel_goal={self.compute_pano_view_pixel_goal}, "
             f"pano_max_side_dist_m={self.pano_max_side_dist_m}, "
-            f"trajectory_target_convention={self.trajectory_target_convention}"
+            f"trajectory_target_convention={self.trajectory_target_convention}, "
+            "load_future_trajectory_heatmap="
+            f"{self.load_future_trajectory_heatmap}"
         )
 
     def set_epoch(self, epoch: int):
@@ -236,6 +351,12 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     for new_idx, old_idx in enumerate(indices)
                 }
                 self._sample_subsequence_range = new_range
+                old_overrides = getattr(self, "_system2_sft_kind_override", {})
+                self._system2_sft_kind_override = {
+                    new_idx: old_overrides[old_idx]
+                    for new_idx, old_idx in enumerate(indices)
+                    if old_idx in old_overrides
+                }
                 logger.info(
                     "[Epoch %d] Reshuffled %d InternNav-style System2 SFT samples "
                     "(skip rebuild)", epoch, len(self.sample_index),
@@ -355,12 +476,33 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         frame_id: int,
         num_frames: int,
         discrete_actions: np.ndarray,
+        remaining_path_m: float | None = None,
+        endpoint_distance_m: float | None = None,
     ) -> str | None:
         """Return ``pixel`` / ``turn`` / ``stop`` / ``None`` (skip), mirroring NavPixelGoalDataset."""
         if num_frames < 4:
             return None
         if frame_id == num_frames - 1:
             return "stop"
+        if (
+            self.system2_stop_path_radius_m > 0
+            and remaining_path_m is not None
+            and remaining_path_m <= self.system2_stop_path_radius_m
+        ):
+            return "stop"
+        if (
+            self.system2_near_stop_hard_negative_oversample > 0
+            and self._stop_hard_negative_distance(
+                remaining_path_m=remaining_path_m,
+                endpoint_distance_m=endpoint_distance_m,
+            )
+            < self._stop_hard_negative_min_distance()
+        ):
+            # Leave a metric margin between positive and negative classes.
+            # It avoids teaching contradictory behavior around the 3 m R2R
+            # success boundary when recorded-path length is only a proxy for
+            # the simulator's geodesic distance.
+            return None
 
         action_flag = int(discrete_actions[frame_id])
         if self.compute_pano_view_pixel_goal:
@@ -377,15 +519,123 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             return "turn"
         return "pixel"
 
+    def _near_stop_hard_negative_repeat(
+        self,
+        *,
+        kind: str,
+        remaining_path_m: float,
+        endpoint_distance_m: float,
+    ) -> int:
+        """Return extra repeats for valid non-STOP samples near the metric boundary."""
+        if kind != "pixel":
+            return 0
+        distance_m = self._stop_hard_negative_distance(
+            remaining_path_m=remaining_path_m,
+            endpoint_distance_m=endpoint_distance_m,
+        )
+        if not (
+            self._stop_hard_negative_min_distance()
+            <= distance_m
+            <= self._stop_hard_negative_max_distance()
+        ):
+            return 0
+        return self.system2_near_stop_hard_negative_oversample
+
+    def _stop_hard_negative_distance(
+        self,
+        *,
+        remaining_path_m: float | None,
+        endpoint_distance_m: float | None,
+    ) -> float:
+        if self._system2_stop_hard_negative_distance == "goal_euclidean":
+            if endpoint_distance_m is None:
+                raise ValueError("STOP hard-negative goal distance is missing")
+            return float(endpoint_distance_m)
+        if remaining_path_m is None:
+            raise ValueError("STOP hard-negative remaining path distance is missing")
+        return float(remaining_path_m)
+
+    def _stop_hard_negative_min_distance(self) -> float:
+        if self._system2_stop_hard_negative_distance == "goal_euclidean":
+            return self.system2_near_stop_hard_negative_min_goal_distance_m
+        return self.system2_near_stop_hard_negative_min_path_m
+
+    def _stop_hard_negative_max_distance(self) -> float:
+        if self._system2_stop_hard_negative_distance == "goal_euclidean":
+            return self.system2_near_stop_hard_negative_max_goal_distance_m
+        return self.system2_near_stop_hard_negative_max_path_m
+
+    @staticmethod
+    def _remaining_path_distances(
+        poses: list[np.ndarray],
+        num_frames: int,
+    ) -> np.ndarray:
+        """Approximate distance-to-goal using the recorded navigable path."""
+        if len(poses) < num_frames:
+            raise ValueError(f"Expected {num_frames} poses, found {len(poses)}")
+        positions = np.asarray(
+            [np.asarray(pose, dtype=np.float64)[:3, 3] for pose in poses[:num_frames]],
+            dtype=np.float64,
+        )
+        if positions.shape != (num_frames, 3) or not np.isfinite(positions).all():
+            raise ValueError(f"Invalid pose positions with shape {positions.shape}")
+        step_distances = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+        return np.concatenate(
+            [np.cumsum(step_distances[::-1], dtype=np.float64)[::-1], np.zeros(1)],
+        )
+
+    @staticmethod
+    def _endpoint_euclidean_distances(
+        poses: list[np.ndarray],
+        num_frames: int,
+    ) -> np.ndarray:
+        """Straight-line distance to the recorded endpoint for safe negatives."""
+        if len(poses) < num_frames:
+            raise ValueError(f"Expected {num_frames} poses, found {len(poses)}")
+        positions = np.asarray(
+            [np.asarray(pose, dtype=np.float64)[:3, 3] for pose in poses[:num_frames]],
+            dtype=np.float64,
+        )
+        if positions.shape != (num_frames, 3) or not np.isfinite(positions).all():
+            raise ValueError(f"Invalid pose positions with shape {positions.shape}")
+        return np.linalg.norm(positions - positions[-1], axis=1)
+
+    def subset_by_clip_indices(self, clip_indices: set[int]) -> "VLNTrajectoryDataset":
+        """Return a shallow dataset view containing complete, disjoint clips."""
+        selected_old_indices = [
+            idx
+            for idx, (clip_idx, _frame_idx) in enumerate(self.sample_index)
+            if int(clip_idx) in clip_indices
+        ]
+        if not selected_old_indices:
+            raise ValueError("Clip subset produced no System2 samples")
+        subset = copy.copy(self)
+        subset.sample_index = [self.sample_index[idx] for idx in selected_old_indices]
+        subset._sample_subsequence_range = {
+            new_idx: self._sample_subsequence_range[old_idx]
+            for new_idx, old_idx in enumerate(selected_old_indices)
+        }
+        old_overrides = getattr(self, "_system2_sft_kind_override", {})
+        subset._system2_sft_kind_override = {
+            new_idx: old_overrides[old_idx]
+            for new_idx, old_idx in enumerate(selected_old_indices)
+            if old_idx in old_overrides
+        }
+        subset._rng = np.random.RandomState(42 + int(getattr(self, "_epoch", 0)))
+        return subset
+
     def _build_internnav_sample_index(self):
         """Build sample index like ``NavPixelGoalDataset`` in internvla_n1_lerobot_dataset.py."""
         self.sample_index = []
         self._sample_subsequence_range = {}
+        self._system2_sft_kind_override: dict[int, str] = {}
         sample_step = self.system2_sample_step
         stop_repeat = self.system2_stop_oversample
         pixel_samples = 0
         turn_samples = 0
         stop_samples = 0
+        metric_stop_samples = 0
+        near_stop_hard_negative_samples = 0
         skipped = 0
 
         logger.info(
@@ -408,6 +658,10 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     continue
                 actions = self._align_internnav_discrete_actions(raw_actions)
                 actions_len = len(actions)
+                last_frame = num_frames - 1
+                poses = self._load_poses(clip_idx)
+                remaining_path_m = self._remaining_path_distances(poses, num_frames)
+                endpoint_distance_m = self._endpoint_euclidean_distances(poses, num_frames)
 
                 num_rounds = actions_len // sample_step
                 for n in range(num_rounds + 1):
@@ -420,7 +674,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                         continue
 
                     kind = self._internnav_sft_frame_kind(
-                        clip_idx, clip_dir, start_frame_id, num_frames, actions,
+                        clip_idx,
+                        clip_dir,
+                        start_frame_id,
+                        num_frames,
+                        actions,
+                        remaining_path_m=float(remaining_path_m[start_frame_id]),
+                        endpoint_distance_m=float(endpoint_distance_m[start_frame_id]),
                     )
                     if kind is None:
                         continue
@@ -433,15 +693,30 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     self._sample_subsequence_range[sample_idx] = (0, num_frames)
                     if kind == "pixel":
                         pixel_samples += 1
+                        hard_negative_repeat = self._near_stop_hard_negative_repeat(
+                            kind=kind,
+                            remaining_path_m=float(remaining_path_m[start_frame_id]),
+                            endpoint_distance_m=float(endpoint_distance_m[start_frame_id]),
+                        )
+                        for _ in range(hard_negative_repeat):
+                            sample_idx = len(self.sample_index)
+                            self.sample_index.append((clip_idx, start_frame_id))
+                            self._sample_subsequence_range[sample_idx] = (0, num_frames)
+                            pixel_samples += 1
+                            near_stop_hard_negative_samples += 1
                     elif kind == "turn":
                         turn_samples += 1
+                    elif kind == "stop":
+                        stop_samples += 1
+                        metric_stop_samples += 1
+                        self._system2_sft_kind_override[sample_idx] = "stop"
 
-                last_frame = num_frames - 1
                 if not self.load_traj_images and last_frame >= self.min_history:
                     for _ in range(stop_repeat):
                         sample_idx = len(self.sample_index)
                         self.sample_index.append((clip_idx, last_frame))
                         self._sample_subsequence_range[sample_idx] = (0, num_frames)
+                        self._system2_sft_kind_override[sample_idx] = "stop"
                         stop_samples += 1
             except Exception as exc:
                 logger.warning("Failed to build InternNav SFT index for %s: %s", clip_dir, exc)
@@ -456,14 +731,23 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 for new_idx, old_idx in enumerate(indices)
             }
             self._sample_subsequence_range = new_range
+            self._system2_sft_kind_override = {
+                new_idx: self._system2_sft_kind_override[old_idx]
+                for new_idx, old_idx in enumerate(indices)
+                if old_idx in self._system2_sft_kind_override
+            }
 
         logger.info(
             "Built InternNav-style System2 SFT index: %s samples "
-            "(pixel=%s, turn=%s, stop=%s, skipped_clips=%s, sample_step=%s, min_goal_len=%s)",
+            "(pixel=%s, near_stop_hard_negative=%s, turn=%s, stop=%s, "
+            "metric_stop=%s, "
+            "skipped_clips=%s, sample_step=%s, min_goal_len=%s)",
             len(self.sample_index),
             pixel_samples,
+            near_stop_hard_negative_samples,
             turn_samples,
             stop_samples,
+            metric_stop_samples,
             skipped,
             sample_step,
             self.system2_min_pixel_goal_len,
@@ -1012,6 +1296,8 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     result["pano_view_id"] = VIEW_TURN
                     result["pano_sample_kind"] = "turn"
 
+        self._apply_system2_sft_label_override(result, idx)
+
         goal_rel_len = self._system1_goal_relative_len(result)
         goal_frame_idx = current_t + goal_rel_len
         has_system1_goal = (
@@ -1023,6 +1309,67 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         )
         if not has_system1_goal:
             goal_frame_idx = min(subseq_end - 1, T - 1)
+
+        if self.load_future_trajectory_heatmap:
+            if K is None:
+                raise ValueError(
+                    "Future trajectory heatmap supervision requires a calibrated "
+                    f"intrinsics.json with K for clip={clip_dir}"
+                )
+            # Match the first native System1 action target: when System2 found a
+            # pixel goal, supervise the route through that goal frame; otherwise
+            # use the exact random-subsequence/episode end. This is computed
+            # before load_traj_images replaces ``result['trajectory']`` with its
+            # sequence of local action targets.
+            future_end = (
+                min(goal_frame_idx + 1, subseq_end, T)
+                if has_system1_goal
+                else min(subseq_end, T)
+            )
+            if future_end == subseq_end:
+                future_trajectory = trajectory
+                future_trajectory_valid = trajectory_valid
+            else:
+                future_trajectory, future_trajectory_valid, _ = (
+                    self._compute_trajectory(
+                        action_poses,
+                        current_t,
+                        future_end,
+                        current_t,
+                        camera_deg=action_camera_deg,
+                        camera_forward_axis=action_camera_forward_axis,
+                    )
+                )
+            # Future supervision must describe the same native System1
+            # treatment that supplies the action loss. Pixel-goal rows have a
+            # real System1 target. A terminal STOP is a valid four-bin NONE
+            # target. Turn/fallback rows do not invoke System1, so mask them
+            # instead of leaking the remainder of the expert route into Z.
+            is_terminal_stop = float(result.get("is_stop", 0.0)) > 0.5
+            if is_terminal_stop and not has_system1_goal:
+                future_trajectory = np.zeros(
+                    (self.predict_horizon, 3), dtype=np.float32
+                )
+                future_trajectory_valid = 1.0
+            elif not has_system1_goal:
+                future_trajectory_valid = 0.0
+            future_target = build_future_target_from_action_and_poses(
+                future_trajectory,
+                action_scale=self.action_scale,
+                current_camera_c2w=current_pose,
+                raw_future_poses=np.stack(
+                    poses[current_t:max(future_end, current_t + 1)], axis=0
+                ),
+                intrinsics=K,
+                image_size=img_size,
+                heatmap_size=self.future_heatmap_size,
+                trajectory_valid=bool(future_trajectory_valid > 0),
+                # R2R expert pose_front entries are camera-center poses. DAgger
+                # agent-base poses use a separate adapter and must pass True.
+                future_poses_are_agent_base=False,
+                agent_camera_height_m=self.future_agent_camera_height_m,
+            )
+            result.update(future_target_to_tensors(future_target))
 
         # 12. traj_images for DualVLN visual memory.
         # InternNav stores a sequence of lookdown frames from the System 2
@@ -1131,6 +1478,15 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 result["intrinsics"] = torch.from_numpy(K)     # [3, 3]
 
         return result
+
+    def _apply_system2_sft_label_override(self, result: dict, idx: int) -> None:
+        if getattr(self, "_system2_sft_kind_override", {}).get(idx) == "stop":
+            result["pano_view_id"] = VIEW_STOP
+            result["pano_sample_kind"] = "stop"
+            result["pano_pixel_goal"] = None
+            result.pop("pano_pixel_goal_relative_len", None)
+            result.pop("legacy_front_pixel_goal", None)
+            result["system2_sft_label_override"] = "metric_stop"
 
     def __getitem__(self, idx: int) -> dict[str, Union[torch.Tensor, str, float]]:
         """

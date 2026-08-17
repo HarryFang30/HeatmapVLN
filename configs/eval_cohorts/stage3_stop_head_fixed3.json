@@ -1,0 +1,8 @@
+{
+  "description": "Fixed STOP-head smoke: missed STOP, premature STOP/loop, premature STOP.",
+  "episodes": [
+    {"scene_id": "zsNo4HB9uLZ", "episode_id": 2, "baseline": "oracle_success_final_fail"},
+    {"scene_id": "zsNo4HB9uLZ", "episode_id": 15, "baseline": "premature_stop_then_loop_when_vetoed"},
+    {"scene_id": "zsNo4HB9uLZ", "episode_id": 41, "baseline": "premature_stop"}
+  ]
+}

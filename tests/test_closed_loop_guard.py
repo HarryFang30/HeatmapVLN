@@ -6,6 +6,7 @@ from scripts.evaluation.closed_loop_guard import (
     STOP_PROBE,
     ClosedLoopGuard,
     ClosedLoopGuardConfig,
+    should_trust_temporal_terminal,
 )
 
 
@@ -50,6 +51,190 @@ def test_original_single_vote_stop_behavior_is_preserved():
     assert guard.observe_system2_terminal(True) == STOP_ACCEPT
 
 
+def test_trusted_terminal_bypasses_confirmation_and_resets_pending_vote():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_confirmation_max_gap_calls=1,
+    )
+
+    assert guard.observe_system2_terminal(True) == STOP_PROBE
+    assert guard.stop_votes == 1
+    assert (
+        guard.observe_system2_terminal(True, trusted_terminal=True)
+        == STOP_ACCEPT
+    )
+    assert guard.stop_votes == 0
+    assert guard.stop_gap_calls == 0
+
+
+def test_trusted_terminal_rejects_nonterminal_output():
+    guard = _guard(stop_confirmations=2)
+
+    with pytest.raises(ValueError, match="trusted_terminal requires terminal=True"):
+        guard.observe_system2_terminal(False, trusted_terminal=True)
+
+
+def test_temporal_terminal_trust_requires_calibrated_margin():
+    assert should_trust_temporal_terminal(
+        enabled=True,
+        decision="temporal_confirms_original_stop",
+        observed_margin=0.0123,
+        min_margin=0.005,
+    )
+    assert not should_trust_temporal_terminal(
+        enabled=True,
+        decision="temporal_confirms_original_stop",
+        observed_margin=0.0016,
+        min_margin=0.005,
+    )
+    assert not should_trust_temporal_terminal(
+        enabled=False,
+        decision="temporal_confirms_original_stop",
+        observed_margin=0.5,
+        min_margin=0.005,
+    )
+    assert not should_trust_temporal_terminal(
+        enabled=True,
+        decision="hybrid_static_adds_stop",
+        observed_margin=0.5,
+        min_margin=0.005,
+    )
+
+
+def test_temporal_terminal_trust_fails_closed_without_margin():
+    assert not should_trust_temporal_terminal(
+        enabled=True,
+        decision="temporal_confirms_original_stop",
+        observed_margin=None,
+        min_margin=0.005,
+    )
+    with pytest.raises(ValueError, match="min_margin"):
+        should_trust_temporal_terminal(
+            enabled=True,
+            decision="temporal_confirms_original_stop",
+            observed_margin=0.1,
+            min_margin=float("nan"),
+        )
+
+
+def test_stop_confirmation_does_not_mix_terminal_sources():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_confirmation_max_gap_calls=2,
+        stop_confirmation_view_sweep=True,
+    )
+
+    assert guard.observe_system2_terminal(
+        True,
+        terminal_source="temporal_confirms_original_stop",
+    ) == STOP_PROBE
+    assert guard.stop_vote_source == "temporal_confirms_original_stop"
+    assert guard.observe_system2_terminal(False) == STOP_PROBE
+    assert guard.observe_system2_terminal(
+        True,
+        terminal_source="hybrid_static_adds_stop",
+    ) == STOP_PROBE
+    assert guard.stop_votes == 1
+    assert guard.stop_vote_source == "hybrid_static_adds_stop"
+    assert guard.observe_system2_terminal(
+        True,
+        terminal_source="hybrid_static_adds_stop",
+    ) == STOP_ACCEPT
+    assert guard.stop_vote_source is None
+
+
+def test_terminal_source_rejects_nonterminal_observation():
+    guard = _guard(stop_confirmations=2)
+
+    with pytest.raises(ValueError, match="terminal_source requires terminal=True"):
+        guard.observe_system2_terminal(
+            False,
+            terminal_source="hybrid_static_adds_stop",
+        )
+
+
+def test_stop_confirmation_can_bridge_one_nonterminal_replan():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_confirmation_max_gap_calls=1,
+    )
+
+    assert guard.observe_system2_terminal(True) == STOP_PROBE
+    assert guard.observe_system2_terminal(False) == STOP_CONTINUE
+    assert guard.stop_votes == 1
+    assert guard.stop_gap_calls == 1
+    assert guard.observe_system2_terminal(True) == STOP_ACCEPT
+
+
+def test_stop_confirmation_view_sweep_probes_without_executing_gap_plan():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_confirmation_max_gap_calls=1,
+        stop_confirmation_view_sweep=True,
+        stop_probe_turn="left",
+    )
+
+    assert guard.observe_system2_terminal(True) == STOP_PROBE
+    assert guard.next_stop_probe_action() == LEFT
+    assert guard.observe_system2_terminal(False) == STOP_PROBE
+    assert guard.stop_votes == 1
+    assert guard.stop_gap_calls == 1
+    assert guard.next_stop_probe_action() == LEFT
+    assert guard.observe_system2_terminal(True) == STOP_ACCEPT
+
+
+def test_stop_confirmation_view_sweep_resumes_after_gap_budget():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_confirmation_max_gap_calls=1,
+        stop_confirmation_view_sweep=True,
+    )
+
+    assert guard.observe_system2_terminal(True) == STOP_PROBE
+    assert guard.observe_system2_terminal(False) == STOP_PROBE
+    assert guard.observe_system2_terminal(False) == STOP_CONTINUE
+    assert guard.stop_votes == 0
+    assert guard.stop_gap_calls == 0
+
+
+def test_stop_confirmation_resets_after_gap_budget_is_exhausted():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_confirmation_max_gap_calls=1,
+    )
+
+    assert guard.observe_system2_terminal(True) == STOP_PROBE
+    assert guard.observe_system2_terminal(False) == STOP_CONTINUE
+    assert guard.observe_system2_terminal(False) == STOP_CONTINUE
+    assert guard.stop_votes == 0
+    assert guard.stop_gap_calls == 0
+    assert guard.observe_system2_terminal(True) == STOP_PROBE
+
+
+def test_high_confidence_stop_bypasses_low_confidence_confirmation():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_high_confidence_threshold=0.8,
+    )
+
+    assert (
+        guard.observe_system2_terminal(True, stop_probability=0.9)
+        == STOP_ACCEPT
+    )
+
+
+def test_low_confidence_stop_requires_confirmation_and_resets():
+    guard = _guard(
+        stop_confirmations=2,
+        stop_high_confidence_threshold=0.8,
+    )
+
+    assert guard.observe_system2_terminal(True, stop_probability=0.6) == STOP_PROBE
+    assert guard.observe_system2_terminal(False, stop_probability=0.1) == STOP_CONTINUE
+    assert guard.observe_system2_terminal(True, stop_probability=0.6) == STOP_PROBE
+    assert guard.observe_system2_terminal(True, stop_probability=0.7) == STOP_ACCEPT
+
+
 def test_collision_recovery_alternates_turn_direction():
     guard = _guard(
         loop_guard_enabled=True,
@@ -69,6 +254,27 @@ def test_collision_recovery_alternates_turn_direction():
     second = guard.observe_action(FORWARD, (0, 0, 0), (0, 0, 0))
     assert second is not None
     assert second.actions == (RIGHT, RIGHT, RIGHT)
+
+
+def test_collision_recovery_follows_last_turn_and_translates():
+    guard = _guard(
+        loop_guard_enabled=True,
+        collision_forward_limit=1,
+        recovery_turns=2,
+        recovery_forward_steps=2,
+        recovery_follow_last_turn=True,
+        recovery_cooldown_steps=12,
+    )
+
+    assert guard.observe_action(RIGHT, (0, 0, 0), (0, 0, 0)) is None
+    first = guard.observe_action(FORWARD, (0, 0, 0), (0, 0, 0))
+    assert first is not None
+    assert first.actions == (RIGHT, RIGHT, FORWARD, FORWARD)
+
+    # A blocked escape must still retrigger collision recovery during cooldown.
+    second = guard.observe_action(FORWARD, (0, 0, 0), (0, 0, 0))
+    assert second is not None
+    assert second.actions == (RIGHT, RIGHT, FORWARD, FORWARD)
 
 
 def test_motion_loop_detects_return_after_real_travel():
@@ -143,5 +349,21 @@ def test_invalid_guard_configuration_fails_closed():
         ClosedLoopGuardConfig(action_chunk_size=0)
     with pytest.raises(ValueError, match="stop_confirmations"):
         ClosedLoopGuardConfig(stop_confirmations=0)
+    with pytest.raises(ValueError, match="stop_confirmation_max_gap_calls"):
+        ClosedLoopGuardConfig(stop_confirmation_max_gap_calls=-1)
+    with pytest.raises(ValueError, match="stop_confirmation_view_sweep"):
+        ClosedLoopGuardConfig(stop_confirmation_view_sweep=True)
+    with pytest.raises(ValueError, match="stop_high_confidence_threshold"):
+        ClosedLoopGuardConfig(
+            stop_confirmations=2,
+            stop_high_confidence_threshold=1.1,
+        )
+    with pytest.raises(ValueError, match="requires stop_confirmations"):
+        ClosedLoopGuardConfig(
+            stop_confirmations=1,
+            stop_high_confidence_threshold=0.8,
+        )
+    with pytest.raises(ValueError, match="recovery_forward_steps"):
+        ClosedLoopGuardConfig(recovery_forward_steps=-1)
     with pytest.raises(ValueError, match="plan_view_dominance"):
         ClosedLoopGuardConfig(plan_view_dominance=0.5)

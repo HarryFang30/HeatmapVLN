@@ -1,0 +1,200 @@
+seed: 42
+
+paths:
+  dataset_root: /workspace/r2r_panoramic_data
+  log_out_dir: /root/autodl-tmp/vln_system2_stop_head
+  tensorboard_dir: /root/tf-logs-system2-stop-head
+  internnav_model_path: $INTERNNAV_MODEL_PATH
+
+data:
+  train_split: train
+  image_size: [256, 256]
+  init_hm_size: [64, 64]
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  dataset_type: trajectory
+  use_worker_tokenized_collator: true
+
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    panoramic_vlm_input: true
+    load_depth: true
+    load_history_frames: false
+    load_history_heatmap: false
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: false
+    samples_per_clip: 5
+    val_samples_per_clip: 4
+    random_subsequence: false
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    include_stop_samples_random_subsequence: false
+    predict_horizon: 32
+    action_scale: 4.0
+    enable_augmentation: false
+    enable_trajectory_augmentation: false
+    compute_pixel_goal: false
+    compute_pano_view_pixel_goal: true
+    pano_max_side_dist_m: 6.0
+    load_lookdown_for_system2: false
+    system2_sft_protocol: direct
+    structured_pano_output: true
+    pixel_goal_direction: front
+    require_sft_target: true
+    sft_include_turns: true
+    sft_include_forward: false
+    sft_num_future_steps: 4
+    system2_sample_step: 4
+    system2_min_pixel_goal_len: 3
+    # Positive STOP states cover the complete R2R success region. Recorded
+    # expert-path distance is a conservative proxy for Habitat geodesic distance.
+    system2_stop_oversample: 1
+    system2_stop_path_radius_m: 3.0
+    # Only use negatives whose straight-line endpoint distance is >= 4 m.
+    # This leaves a one-metre ambiguity band around the 3 m success boundary.
+    system2_near_stop_hard_negative_oversample: 2
+    system2_near_stop_hard_negative_min_goal_distance_m: 4.0
+    system2_near_stop_hard_negative_max_goal_distance_m: 18.0
+    load_traj_images: false
+    traj_image_size: [224, 224]
+
+model:
+  type: vln_pipeline
+  device: cuda
+
+  llm:
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    max_video_frames: -1
+    gradient_checkpointing: false
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: true
+    lora_rank: 32
+    lora_alpha: 64
+    lora_layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+    lora_dropout: 0.05
+
+  heatmap:
+    enable: false
+
+  action_head:
+    enable: false
+
+  stop_head:
+    enabled: true
+    hidden_dim: 512
+    dropout: 0.1
+    focal_gamma: 2.0
+    focal_alpha: 0.5
+    # Metric-radius positives and hard-negative resampling remove the legacy
+    # class imbalance. Pure BCE is a proper scoring loss for threshold calibration.
+    pos_weight: 1.0
+    bce_mix: 1.0
+    # Legacy fallback plus calibrated asymmetric thresholds. Adding a STOP must
+    # be conservative; vetoing an existing STOP uses a lower recall-oriented bar.
+    inference_threshold: 0.5
+    add_stop_threshold: 0.9
+    veto_stop_threshold: 0.2
+
+training:
+  stages:
+    - name: system2_stop_head
+      epochs: 1
+      hm_size: [64, 64]
+      train_lm: false
+      train_system2_sft: false
+      train_system2_stop_head: true
+      teacher_force_system2_answer: true
+      train_heatmap: false
+      train_history: false
+      train_future: false
+      train_action: false
+      sft_include_turns: true
+      sft_include_forward: false
+      strict_trainable_modules: true
+      requires_base_checkpoint: true
+      base_checkpoint_lora_only: true
+      merge_frozen_lora: false
+      retain_raw_panoramic_views: false
+      compute_pano_text_anchor_positions: false
+      retain_history_rel_poses: false
+      trainable_modules: [stop_head]
+      frozen_modules:
+        - vlm_backbone
+        - lora
+        - heatmap_vln
+        - nextdit_action_head
+        - latent_queries
+        - llm_projector
+
+optim:
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  stop_head_lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr: 1.0e-6
+  batch_size: 4
+  grad_accum_steps: 1
+
+loss:
+  heatmap_loss_type: heatmap_vln
+  heatmap_weight: 0.0
+  trajectory_weight: 0.0
+  lm_weight: 0.0
+  stop_weight: 1.0
+  l2_sp:
+    enabled: false
+    weight: 0.0
+    normalization: relative_l2
+    modules: []
+
+gpu:
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
+  backend: nccl
+  multi_gpu:
+    enabled: true
+    find_unused_parameters: false
+
+log:
+  save_every_epochs: 1
+  vis_every_steps: 1000
+  val_vis_batches: 0
+  max_ckpts: 2
+  use_tensorboard: true
+  enable_timing: true
+  epoch_boundary_cooldown_s: 8
+  log_interval: 10
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  mid_epoch_save_every: 5000
+  notify:
+    enabled: false
+
+validation:
+  enabled: true
+  eval_every_epochs: 1
+  save_best_metric: val_total_loss
+  patience: 2
+  val_inference_batches: 0
+  holdout_clip_fraction: 0.05
+  holdout_seed: 20260716
+  stop_add_max_false_positive_rate: 0.01
+  stop_veto_min_recall: 0.98
+  stop_add_min_threshold: 0.9
+  stop_veto_max_threshold: 0.5
+  stop_threshold_grid_steps: 200

@@ -1,0 +1,10 @@
+{
+  "description": "Single-episode STOP timing diagnostic for the remaining fixed3 failure.",
+  "episodes": [
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 15,
+      "baseline": "oracle_success_without_final_stop"
+    }
+  ]
+}

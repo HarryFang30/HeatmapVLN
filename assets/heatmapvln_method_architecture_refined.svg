@@ -1,0 +1,471 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1080" viewBox="0 0 2400 1080" role="img" aria-labelledby="title desc">
+  <title id="title">HeatmapVLN slow-to-fast navigation architecture</title>
+  <desc id="desc">A code-faithful overview of panoramic System-2 reasoning, the trainable latent bridge, frozen System-1 diffusion control, and the auxiliary heatmap pretraining branch.</desc>
+
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F7F8FC"/>
+    </linearGradient>
+    <linearGradient id="purpleCore" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F6F0FF"/>
+      <stop offset="1" stop-color="#EDE4FA"/>
+    </linearGradient>
+    <linearGradient id="coralCore" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFF6F2"/>
+      <stop offset="0.52" stop-color="#FFE9E2"/>
+      <stop offset="1" stop-color="#FFF2E9"/>
+    </linearGradient>
+    <linearGradient id="orangeCore" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFF9F2"/>
+      <stop offset="1" stop-color="#FFF0DF"/>
+    </linearGradient>
+    <linearGradient id="heatCore" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F5FCFF"/>
+      <stop offset="1" stop-color="#EAF7FB"/>
+    </linearGradient>
+    <linearGradient id="heatSpot" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#173B83"/>
+      <stop offset="0.42" stop-color="#1A94BD"/>
+      <stop offset="0.73" stop-color="#F5D64B"/>
+      <stop offset="1" stop-color="#F05255"/>
+    </linearGradient>
+    <linearGradient id="trajectoryStroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#E76350"/>
+      <stop offset="1" stop-color="#E58A28"/>
+    </linearGradient>
+    <pattern id="frozen" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#F6F7F9"/>
+      <line x1="0" y1="0" x2="0" y2="10" stroke="#D9DDE4" stroke-width="3"/>
+    </pattern>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="3" cy="3" r="1.4" fill="#D8DDE8" opacity="0.42"/>
+    </pattern>
+    <filter id="focusShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="7" stdDeviation="9" flood-color="#2F3850" flood-opacity="0.13"/>
+    </filter>
+    <filter id="tokenGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L9,5 L1,9 Z" fill="#7250B5"/>
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L9,5 L1,9 Z" fill="#E56A55"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L9,5 L1,9 Z" fill="#DF7B26"/>
+    </marker>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1,1 L9,5 L1,9 Z" fill="#727A88"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1,1 L9,5 L1,9 Z" fill="#2586B6"/>
+    </marker>
+
+    <symbol id="frontView" viewBox="0 0 120 78">
+      <rect width="120" height="78" rx="8" fill="#E7F0F4"/>
+      <polygon points="0,78 34,42 86,42 120,78" fill="#CDB395"/>
+      <polygon points="0,0 34,42 34,78 0,78" fill="#C8DCE5"/>
+      <polygon points="120,0 86,42 86,78 120,78" fill="#EBD8C4"/>
+      <rect x="49" y="11" width="25" height="32" rx="2" fill="#849EA9"/>
+      <rect x="53" y="15" width="17" height="24" fill="#BEDBE5"/>
+      <path d="M60 43 V78 M34 42 L0 60 M86 42 L120 60" fill="none" stroke="#9E826A" stroke-width="1.2"/>
+      <rect x="9" y="21" width="17" height="20" rx="2" fill="#7791A7" opacity="0.65"/>
+      <rect x="94" y="28" width="18" height="13" rx="2" fill="#A68367" opacity="0.74"/>
+    </symbol>
+    <symbol id="rightView" viewBox="0 0 120 78">
+      <rect width="120" height="78" rx="8" fill="#E6EFF2"/>
+      <polygon points="0,78 20,45 70,38 120,68 120,78" fill="#C9AD8D"/>
+      <polygon points="0,0 20,45 20,78 0,78" fill="#D7E5EB"/>
+      <polygon points="120,0 70,38 70,78 120,78" fill="#E9D5BF"/>
+      <rect x="77" y="22" width="36" height="17" rx="3" fill="#9A785D"/>
+      <rect x="73" y="40" width="44" height="13" rx="2" fill="#B69070"/>
+      <rect x="33" y="15" width="19" height="29" fill="#82A2AE"/>
+      <rect x="36" y="18" width="13" height="23" fill="#C1DDE7"/>
+      <path d="M20 45 L0 57 M70 38 L120 50" fill="none" stroke="#9E826A" stroke-width="1.2"/>
+    </symbol>
+    <symbol id="backView" viewBox="0 0 120 78">
+      <rect width="120" height="78" rx="8" fill="#EDF1F2"/>
+      <polygon points="0,78 30,40 91,45 120,78" fill="#BFA88F"/>
+      <polygon points="0,0 30,40 30,78 0,78" fill="#E3D9CF"/>
+      <polygon points="120,0 91,45 91,78 120,78" fill="#CDDCE1"/>
+      <rect x="8" y="12" width="29" height="31" rx="2" fill="#8D7668"/>
+      <rect x="12" y="16" width="21" height="25" fill="#6E8792"/>
+      <rect x="72" y="22" width="14" height="23" fill="#9BB2B9"/>
+      <path d="M30 40 L0 59 M91 45 L120 59" fill="none" stroke="#8F7866" stroke-width="1.2"/>
+      <rect x="48" y="27" width="17" height="12" rx="2" fill="#B59677"/>
+    </symbol>
+    <symbol id="leftView" viewBox="0 0 120 78">
+      <rect width="120" height="78" rx="8" fill="#E9F0F2"/>
+      <polygon points="0,78 29,45 88,39 120,78" fill="#C5AA8B"/>
+      <polygon points="0,0 29,45 29,78 0,78" fill="#CADDE5"/>
+      <polygon points="120,0 88,39 88,78 120,78" fill="#E5D4C4"/>
+      <path d="M7 48 H46 M14 41 H51 M22 34 H57 M30 27 H63" stroke="#8E7560" stroke-width="5" stroke-linecap="round"/>
+      <path d="M29 45 L0 61 M88 39 L120 57" fill="none" stroke="#9C826D" stroke-width="1.2"/>
+      <rect x="76" y="13" width="21" height="27" fill="#86A4AF"/>
+      <rect x="80" y="17" width="13" height="21" fill="#C2DDE6"/>
+    </symbol>
+    <symbol id="lookDown" viewBox="0 0 100 74">
+      <rect width="100" height="74" rx="8" fill="#E9EEF0"/>
+      <polygon points="0,74 20,23 80,23 100,74" fill="#CBB091"/>
+      <path d="M50 23 V74 M20 23 L0 48 M80 23 L100 48 M34 23 L25 74 M66 23 L75 74" fill="none" stroke="#9A7E68" stroke-width="1.2"/>
+      <rect x="41" y="9" width="18" height="18" rx="3" fill="#84A3AE"/>
+      <circle cx="50" cy="45" r="6" fill="#E47B2B"/>
+      <path d="M50 34 L44 43 H56 Z" fill="#FFFFFF"/>
+    </symbol>
+    <symbol id="heatMap" viewBox="0 0 60 72">
+      <rect width="60" height="72" rx="8" fill="#173A78"/>
+      <g stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1">
+        <path d="M15 0 V72 M30 0 V72 M45 0 V72 M0 18 H60 M0 36 H60 M0 54 H60"/>
+      </g>
+      <circle cx="38" cy="29" r="22" fill="url(#heatSpot)" opacity="0.45"/>
+      <circle cx="38" cy="29" r="10" fill="#F3D34E" opacity="0.9"/>
+      <circle cx="38" cy="29" r="4" fill="#F05255"/>
+    </symbol>
+
+    <style>
+      .sys-title { font: 700 42px "Avenir Next", Inter, "Helvetica Neue", Arial, sans-serif; letter-spacing: .2px; }
+      .sys-sub { font: 500 24px "Avenir Next", Inter, "Helvetica Neue", Arial, sans-serif; }
+      .eyebrow { font: 700 23px "Avenir Next", Inter, "Helvetica Neue", Arial, sans-serif; letter-spacing: 2.2px; }
+      .module-title { font: 650 29px "Avenir Next", Inter, "Helvetica Neue", Arial, sans-serif; fill: #2F3542; }
+      .body { font: 500 24px "Avenir Next", Inter, "Helvetica Neue", Arial, sans-serif; fill: #535D6D; }
+      .small { font: 500 21px "Avenir Next", Inter, "Helvetica Neue", Arial, sans-serif; fill: #697385; }
+      .mono { font: 600 24px "SFMono-Regular", Menlo, Consolas, monospace; fill: #303744; }
+      .mini-mono { font: 600 20px "SFMono-Regular", Menlo, Consolas, monospace; fill: #3F4857; }
+      .badge { font: 700 18px "Avenir Next", Inter, Arial, sans-serif; letter-spacing: .8px; }
+      .main-flow { fill: none; stroke-width: 4.2; stroke-linecap: round; stroke-linejoin: round; }
+      .inner-flow { fill: none; stroke-width: 2.7; stroke-linecap: round; stroke-linejoin: round; }
+      .aux-flow { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 7 6; }
+      .module { stroke-width: 1.7; }
+    </style>
+  </defs>
+
+  <rect width="2400" height="1080" fill="url(#canvas)"/>
+  <rect width="2400" height="1080" fill="url(#dots)" opacity="0.28"/>
+
+  <!-- Panel label -->
+  <text class="eyebrow" x="49" y="48" fill="#697385">(a) ONLINE SLOW-TO-FAST POLICY</text>
+
+  <!-- System-2 surface -->
+  <rect x="48" y="78" width="880" height="638" rx="29" fill="#FCFAFF" stroke="#D8CFF0" stroke-width="1.8"/>
+  <path d="M77 78 H899 A29 29 0 0 1 928 107" fill="none" stroke="#7551B7" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="86" cy="128" r="24" fill="#7551B7"/>
+  <path d="M73 128 C73 115 84 107 95 114 C106 114 110 127 104 136 C98 146 80 146 74 137" fill="none" stroke="#FFFFFF" stroke-width="2.5"/>
+  <path d="M82 114 C80 122 84 127 91 126 M104 121 C96 123 94 130 98 138 M78 137 C84 134 90 138 90 144" fill="none" stroke="#FFFFFF" stroke-width="2"/>
+  <text class="sys-title" x="124" y="135" fill="#60409A">System-2 · Slow Reasoning</text>
+  <text class="sys-sub" x="124" y="165" fill="#8D76B5">panoramic semantic planning</text>
+
+  <!-- System-2 inputs -->
+  <rect class="module" x="78" y="194" width="210" height="126" rx="17" fill="#FFFFFF" stroke="#CDD2DC"/>
+  <text class="module-title" x="99" y="229">Instruction</text>
+  <text class="body" x="99" y="263">“Exit the room,</text>
+  <text class="body" x="99" y="294">turn right …”</text>
+
+  <rect class="module" x="315" y="194" width="275" height="126" rx="17" fill="#FFFFFF" stroke="#D2C7E6"/>
+  <text class="module-title" x="335" y="229">History · K ≤ 8</text>
+  <g transform="translate(334,247)">
+    <rect x="15" y="8" width="218" height="58" rx="10" fill="#EAE4F5" stroke="#D1C5E6"/>
+    <rect x="7" y="4" width="218" height="58" rx="10" fill="#F2EDF9" stroke="#D1C5E6"/>
+    <rect width="218" height="58" rx="10" fill="#FFFFFF" stroke="#C4B5DE"/>
+    <use href="#frontView" x="7" y="8" width="47" height="37"/>
+    <use href="#rightView" x="59" y="8" width="47" height="37"/>
+    <use href="#backView" x="111" y="8" width="47" height="37"/>
+    <use href="#leftView" x="163" y="8" width="47" height="37"/>
+  </g>
+
+  <rect class="module" x="618" y="194" width="280" height="126" rx="17" fill="#FFFFFF" stroke="#C8D0DC"/>
+  <text class="module-title" x="638" y="229">Current panorama</text>
+  <g transform="translate(636,247)">
+    <use href="#frontView" x="0" y="0" width="57" height="43"/>
+    <use href="#rightView" x="63" y="0" width="57" height="43"/>
+    <use href="#backView" x="126" y="0" width="57" height="43"/>
+    <use href="#leftView" x="189" y="0" width="57" height="43"/>
+    <text class="small" x="13" y="63">F</text>
+    <text class="small" x="77" y="63">R</text>
+    <text class="small" x="140" y="63">B</text>
+    <text class="small" x="203" y="63">L</text>
+  </g>
+
+  <path class="inner-flow" d="M183 321 V340 H273" stroke="#7250B5"/>
+  <path class="inner-flow" d="M452 321 V340 H273" stroke="#7250B5"/>
+  <path class="inner-flow" d="M758 321 V340 H273 V359" stroke="#7250B5" marker-end="url(#arrowPurple)"/>
+
+  <!-- Qwen core -->
+  <g filter="url(#focusShadow)">
+    <rect x="78" y="360" width="390" height="225" rx="23" fill="url(#purpleCore)" stroke="#A992D0" stroke-width="2"/>
+  </g>
+  <text x="104" y="401" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="35" font-weight="700" fill="#5F3E9C">Qwen2.5-VL</text>
+  <rect x="322" y="374" width="121" height="30" rx="15" fill="url(#frozen)" stroke="#C3C7CF"/>
+  <text class="badge" x="344" y="395" fill="#6A7280">FROZEN</text>
+
+  <rect x="103" y="426" width="112" height="104" rx="15" fill="#E7F2FB" stroke="#7CB6D8" stroke-width="1.6"/>
+  <path d="M126 452 H190 M126 468 H190 M126 484 H190" stroke="#4A91BC" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+  <text class="body" x="121" y="516" fill="#2B78A4">Vision · 32L</text>
+
+  <path class="inner-flow" d="M216 478 H241" stroke="#7250B5" marker-end="url(#arrowPurple)"/>
+  <g transform="translate(248,421)">
+    <rect x="20" y="18" width="145" height="87" rx="13" fill="#DFD1F4" stroke="#A88CCF"/>
+    <rect x="12" y="11" width="145" height="87" rx="13" fill="#E9DFFA" stroke="#A88CCF"/>
+    <rect x="4" y="4" width="145" height="87" rx="13" fill="#F5F0FC" stroke="#9678C5"/>
+    <text class="body" x="23" y="42" fill="#60409A">Causal LLM</text>
+    <text class="mono" x="23" y="74">28L · d=3584</text>
+  </g>
+  <rect x="105" y="545" width="220" height="27" rx="13" fill="#7451B7"/>
+  <text x="121" y="565" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="16" font-weight="700" fill="#FFFFFF" letter-spacing=".3">LoRA · q/k/v/o · all 28L</text>
+  <rect x="332" y="545" width="108" height="27" rx="13" fill="#8C68C7"/>
+  <text x="346" y="565" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="16" font-weight="700" fill="#FFFFFF" letter-spacing=".3">r32 · α64</text>
+
+  <!-- Structured goal -->
+  <path class="main-flow" d="M470 471 H494" stroke="#7250B5" marker-end="url(#arrowPurple)"/>
+  <rect class="module" x="500" y="390" width="198" height="160" rx="19" fill="#FFFFFF" stroke="#BDAADC"/>
+  <text class="module-title" x="520" y="427" fill="#60409A">Goal text</text>
+  <rect x="518" y="443" width="162" height="79" rx="12" fill="#F8F5FC"/>
+  <text class="mini-mono" x="530" y="474">view: right</text>
+  <text x="530" y="506" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="19" font-weight="600" fill="#303744">pixel: 128 173</text>
+  <path class="aux-flow" d="M653 390 V350 H675" stroke="#8C75B8" marker-end="url(#arrowPurple)"/>
+  <circle cx="695" cy="350" r="18" fill="#FFFFFF" stroke="#8C75B8" stroke-width="2"/>
+  <rect x="686" y="342" width="18" height="16" rx="3" fill="none" stroke="#7250B5" stroke-width="2"/>
+  <text class="small" x="720" y="357" fill="#7250B5">STOP bypass</text>
+
+  <!-- second causal readout -->
+  <path class="main-flow" d="M699 471 H708" stroke="#7250B5" marker-end="url(#arrowPurple)"/>
+  <rect class="module" x="714" y="360" width="185" height="225" rx="21" fill="#FFF7F4" stroke="#E5A08F"/>
+  <text class="module-title" x="734" y="398" fill="#C25947">2nd causal</text>
+  <text class="module-title" x="734" y="432" fill="#C25947">readout</text>
+  <text class="small" x="734" y="465">goal text + 4 ×</text>
+  <text class="mini-mono" x="734" y="493">&lt;TRAJ&gt;</text>
+  <g transform="translate(735,511)">
+    <rect x="0" y="0" width="31" height="31" rx="8" fill="#EF8588" stroke="#C85861"/>
+    <rect x="39" y="0" width="31" height="31" rx="8" fill="#EF8588" stroke="#C85861"/>
+    <rect x="78" y="0" width="31" height="31" rx="8" fill="#EF8588" stroke="#C85861"/>
+    <rect x="117" y="0" width="31" height="31" rx="8" fill="#EF8588" stroke="#C85861"/>
+  </g>
+  <text class="mini-mono" x="734" y="568">H₂ [4 × 3584]</text>
+  <path class="main-flow" d="M900 474 H936 V368 H951" stroke="#E56A55" marker-end="url(#arrowCoral)"/>
+  <text class="small" x="79" y="681" fill="#8D76B5">First pass: structured waypoint · Second pass: four contextual latent states</text>
+
+  <!-- Latent bridge -->
+  <g filter="url(#focusShadow)">
+    <rect x="952" y="260" width="280" height="456" rx="30" fill="url(#coralCore)" stroke="#E58D78" stroke-width="2.2"/>
+  </g>
+  <rect x="982" y="281" width="220" height="35" rx="17" fill="#E56651"/>
+  <text class="badge" x="1005" y="305" fill="#FFFFFF">LATENT BRIDGE</text>
+  <g transform="translate(980,347)" filter="url(#tokenGlow)">
+    <rect x="0" y="0" width="45" height="34" rx="10" fill="#8B68C4" stroke="#66489E"/>
+    <rect x="58" y="0" width="45" height="34" rx="10" fill="#8B68C4" stroke="#66489E"/>
+    <rect x="116" y="0" width="45" height="34" rx="10" fill="#8B68C4" stroke="#66489E"/>
+    <rect x="174" y="0" width="45" height="34" rx="10" fill="#8B68C4" stroke="#66489E"/>
+  </g>
+  <path class="main-flow" d="M1092 386 V408" stroke="#E56A55" marker-end="url(#arrowCoral)"/>
+
+  <rect class="module" x="978" y="414" width="228" height="94" rx="17" fill="#FFFFFF" stroke="#E58D78"/>
+  <rect x="994" y="428" width="108" height="25" rx="12" fill="#E56651"/>
+  <text x="1005" y="447" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="17" font-weight="700" fill="#FFFFFF" letter-spacing=".5">TRAINABLE</text>
+  <text x="996" y="481" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="26" font-weight="650" fill="#B94D3B">Residual adapter</text>
+  <text class="mini-mono" x="996" y="503">3584 → 1024 → 3584</text>
+  <path d="M997 488 C961 488 961 440 997 440" fill="none" stroke="#E56A55" stroke-width="2.5" marker-end="url(#arrowCoral)"/>
+
+  <path class="inner-flow" d="M1092 510 V528" stroke="#E56A55" marker-end="url(#arrowCoral)"/>
+  <rect class="module" x="978" y="532" width="228" height="90" rx="16" fill="url(#frozen)" stroke="#BFC4CD"/>
+  <rect x="994" y="543" width="88" height="23" rx="11" fill="#727A88"/>
+  <text x="1004" y="560" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="16" font-weight="700" fill="#FFFFFF" letter-spacing=".4">FROZEN</text>
+  <text x="994" y="586" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="25" font-weight="650" fill="#303744">Cond projector</text>
+  <text class="mini-mono" x="994" y="613">3584 → 768 → 768</text>
+  <path class="inner-flow" d="M1092 624 V638" stroke="#E56A55" marker-end="url(#arrowCoral)"/>
+  <g transform="translate(980,646)">
+    <rect x="0" y="0" width="45" height="34" rx="10" fill="#F2A568" stroke="#D87930"/>
+    <rect x="58" y="0" width="45" height="34" rx="10" fill="#F2A568" stroke="#D87930"/>
+    <rect x="116" y="0" width="45" height="34" rx="10" fill="#F2A568" stroke="#D87930"/>
+    <rect x="174" y="0" width="45" height="34" rx="10" fill="#F2A568" stroke="#D87930"/>
+  </g>
+  <text class="small" x="992" y="708" fill="#C25947">C_goal [4 × 768]</text>
+
+  <!-- System-1 surface -->
+  <rect x="1256" y="78" width="1096" height="954" rx="29" fill="#FFFCF8" stroke="#F0C9A5" stroke-width="1.8"/>
+  <path d="M1285 78 H2323 A29 29 0 0 1 2352 107" fill="none" stroke="#E17A25" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="1294" cy="128" r="24" fill="#E17A25"/>
+  <path d="M1288 108 L1277 130 H1291 L1285 149 L1311 122 H1297 L1304 108 Z" fill="#FFFFFF"/>
+  <text class="sys-title" x="1332" y="135" fill="#C66418">System-1 · Fast Control</text>
+  <text class="sys-sub" x="1332" y="165" fill="#B97842">frozen visual memory + diffusion trajectory prior</text>
+
+  <!-- Visual memory lane -->
+  <rect class="module" x="1286" y="190" width="1036" height="170" rx="21" fill="#FFF8F1" stroke="#EED0B4"/>
+  <text class="module-title" x="1312" y="224" fill="#BC6D2B">Independent visual memory</text>
+  <rect x="2154" y="204" width="140" height="27" rx="13" fill="url(#frozen)" stroke="#C1C6CE"/>
+  <text class="badge" x="2174" y="224" fill="#687181">ALL FROZEN</text>
+
+  <g transform="translate(1312,245)">
+    <use href="#lookDown" x="0" y="0" width="90" height="67"/>
+    <text class="module-title" x="99" y="43" fill="#A7754E">=</text>
+    <use href="#lookDown" x="125" y="0" width="90" height="67"/>
+    <text class="small" x="10" y="91">same RGB<tspan baseline-shift="sub">t</tspan> × 2</text>
+  </g>
+
+  <path class="inner-flow" d="M1533 279 H1555" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <rect class="module" x="1561" y="242" width="155" height="81" rx="15" fill="#FFFFFF" stroke="#D6B693"/>
+  <text class="module-title" x="1580" y="275">DINOv2</text>
+  <text class="small" x="1580" y="306">ViT-S/14 · 384d</text>
+
+  <path class="inner-flow" d="M1718 281 H1740" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <rect class="module" x="1746" y="237" width="178" height="91" rx="15" fill="#FFFFFF" stroke="#D6B693"/>
+  <text x="1765" y="267" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="25" font-weight="650" fill="#2F3542">Memory</text>
+  <text x="1765" y="295" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="25" font-weight="650" fill="#2F3542">Encoder</text>
+  <text class="small" x="1765" y="319">3L · 6 heads</text>
+
+  <path class="inner-flow" d="M1926 281 H1948" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <rect class="module" x="1954" y="242" width="170" height="81" rx="15" fill="#FFFFFF" stroke="#D6B693"/>
+  <text class="module-title" x="1973" y="275">Q-Former</text>
+  <text class="small" x="1973" y="306">32 queries · 3L</text>
+
+  <path class="inner-flow" d="M2126 281 H2148" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <g transform="translate(2162,261)">
+    <circle cx="8" cy="8" r="8" fill="#C59063"/>
+    <circle cx="32" cy="8" r="8" fill="#C59063"/>
+    <circle cx="56" cy="8" r="8" fill="#C59063"/>
+    <circle cx="80" cy="8" r="8" fill="#C59063"/>
+    <circle cx="104" cy="8" r="8" fill="#C59063"/>
+    <text class="small" x="0" y="55">32 visual tokens</text>
+  </g>
+
+  <!-- Goal-token route into fusion -->
+  <path class="main-flow" d="M1233 649 H1275 V458 H1393" stroke="#E56A55" marker-end="url(#arrowCoral)"/>
+
+  <!-- Condition fusion -->
+  <g filter="url(#focusShadow)">
+    <rect x="1394" y="399" width="820" height="133" rx="21" fill="#FFFFFF" stroke="#E5A36C" stroke-width="2"/>
+  </g>
+  <text class="module-title" x="1422" y="437" fill="#C66418">Condition fusion</text>
+  <g transform="translate(1425,458)">
+    <circle cx="9" cy="9" r="9" fill="#C59063"/>
+    <circle cx="36" cy="9" r="9" fill="#C59063"/>
+    <circle cx="63" cy="9" r="9" fill="#C59063"/>
+    <circle cx="90" cy="9" r="9" fill="#C59063"/>
+    <text class="body" x="113" y="17">… 32 visual</text>
+    <text x="278" y="19" font-family="Avenir Next,Arial,sans-serif" font-size="31" font-weight="700" fill="#A37958">⊕</text>
+    <rect x="323" y="-3" width="27" height="27" rx="7" fill="#F2A568" stroke="#D87930"/>
+    <rect x="359" y="-3" width="27" height="27" rx="7" fill="#F2A568" stroke="#D87930"/>
+    <rect x="395" y="-3" width="27" height="27" rx="7" fill="#F2A568" stroke="#D87930"/>
+    <rect x="431" y="-3" width="27" height="27" rx="7" fill="#F2A568" stroke="#D87930"/>
+    <text class="body" x="476" y="17">4 goal</text>
+  </g>
+  <text class="mono" x="1425" y="512">36 condition tokens · 768 → 384</text>
+  <rect x="2028" y="430" width="157" height="67" rx="14" fill="#FFF4E8" stroke="#E2B485"/>
+  <text x="2049" y="458" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="22" font-weight="500" fill="#535D6D">caption</text>
+  <text x="2049" y="486" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="20" font-weight="600" fill="#303744">projection</text>
+  <path class="inner-flow" d="M2221 321 V386 H1990 V398" stroke="#C59063" marker-end="url(#arrowGray)"/>
+
+  <!-- NextDiT -->
+  <rect class="module" x="1286" y="566" width="1036" height="329" rx="22" fill="url(#orangeCore)" stroke="#E7AC75" stroke-width="1.9"/>
+  <text class="module-title" x="1314" y="605" fill="#C66418">Flow-matching trajectory denoiser</text>
+  <rect x="2091" y="579" width="199" height="29" rx="14" fill="url(#frozen)" stroke="#C1C6CE"/>
+  <text x="2110" y="600" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="16" font-weight="700" fill="#687181" letter-spacing=".4">FROZEN INTERNNAV PRIOR</text>
+
+  <path d="M1322 682 C1346 648 1369 712 1394 673 C1419 636 1440 706 1465 666" fill="none" stroke="#77808E" stroke-width="4" stroke-dasharray="9 7"/>
+  <text class="body" x="1318" y="724">Noised trajectory</text>
+  <text class="mini-mono" x="1318" y="754">32 × [Δx, Δy, Δyaw]</text>
+
+  <path class="main-flow" d="M1468 684 H1490" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+  <rect class="module" x="1497" y="638" width="151" height="103" rx="16" fill="#FFFFFF" stroke="#DFA365"/>
+  <text class="module-title" x="1516" y="674">Action</text>
+  <text class="module-title" x="1516" y="707">encoder</text>
+  <text class="mini-mono" x="1516" y="733">3 → 384 + PE</text>
+  <path class="main-flow" d="M1650 688 H1674" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+
+  <g filter="url(#focusShadow)">
+    <rect x="1681" y="617" width="421" height="230" rx="20" fill="#FFFFFF" stroke="#DF9A5B" stroke-width="2"/>
+  </g>
+  <text class="module-title" x="1708" y="655" fill="#C66418">NextDiT block × 12</text>
+  <text class="small" x="1708" y="683">d=384 · 6 heads · timestep-gated</text>
+
+  <circle cx="1733" cy="750" r="9" fill="#F3D8BE" stroke="#C98348" stroke-width="2"/>
+  <path class="inner-flow" d="M1704 750 H1723" stroke="#727A88"/>
+  <path class="inner-flow" d="M1742 750 V716 H1760" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <path class="inner-flow" d="M1742 750 V795 H1760" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+
+  <rect x="1767" y="692" width="126" height="57" rx="13" fill="#FFF1D4" stroke="#DDBA67"/>
+  <text class="body" x="1785" y="727">Self-attn</text>
+  <rect x="1767" y="770" width="126" height="57" rx="13" fill="#FFE8DE" stroke="#E09B78"/>
+  <text class="body" x="1778" y="805">Cross-attn</text>
+
+  <path class="inner-flow" d="M1895 720 H1920 V749 H1938" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <path class="inner-flow" d="M1895 799 H1920 V751 H1938" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+  <circle cx="1953" cy="750" r="17" fill="#F7E6D7" stroke="#C98348" stroke-width="2"/>
+  <text x="1944" y="759" font-family="Avenir Next,Arial,sans-serif" font-size="28" font-weight="700" fill="#AA6230">+</text>
+  <path class="inner-flow" d="M1971 750 H1990" stroke="#727A88" marker-end="url(#arrowGray)"/>
+  <rect x="1997" y="713" width="80" height="74" rx="14" fill="#F0F4ED" stroke="#A6B99D"/>
+  <text class="body" x="2013" y="757">FFN</text>
+  <path class="aux-flow" d="M1806 533 V763" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+  <text class="small" x="1821" y="570" fill="#B97842">condition</text>
+
+  <path class="main-flow" d="M2105 735 H2129" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+  <rect class="module" x="2136" y="680" width="157" height="105" rx="16" fill="#FFFFFF" stroke="#DFA365"/>
+  <text class="module-title" x="2155" y="718">Action</text>
+  <text class="module-title" x="2155" y="751">decoder</text>
+  <text class="mini-mono" x="2155" y="778">384 → 3</text>
+
+  <!-- Trajectory output -->
+  <path class="main-flow" d="M2215 787 V917" stroke="#DF7B26" marker-end="url(#arrowOrange)"/>
+  <rect class="module" x="1286" y="916" width="1036" height="88" rx="19" fill="#FFFFFF" stroke="#E2A267"/>
+  <g opacity="0.25" fill="none" stroke="#E4872D" stroke-width="3">
+    <path d="M1315 972 C1360 970 1390 931 1435 950 C1480 969 1518 984 1562 952 C1605 921 1646 968 1690 951"/>
+    <path d="M1315 972 C1361 956 1404 944 1443 963 C1486 984 1528 945 1568 958 C1610 973 1650 936 1690 951"/>
+    <path d="M1315 972 C1365 985 1398 940 1446 948 C1491 956 1534 992 1575 960 C1616 930 1654 966 1690 951"/>
+  </g>
+  <path d="M1315 972 C1362 968 1394 937 1438 954 C1483 972 1523 976 1566 955 C1608 934 1649 963 1690 951" fill="none" stroke="url(#trajectoryStroke)" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="1315" cy="972" r="6" fill="#E56651"/>
+  <circle cx="1690" cy="951" r="8" fill="#FFFFFF" stroke="#E17A25" stroke-width="4"/>
+  <text class="module-title" x="1740" y="958" fill="#C66418">32 candidate trajectories × 32 steps</text>
+  <text class="body" x="1740" y="988">10 Euler updates · predicted velocity field</text>
+
+  <!-- Auxiliary heatmap inset -->
+  <rect x="48" y="754" width="1184" height="278" rx="24" fill="url(#heatCore)" stroke="#7DBBD8" stroke-width="2" stroke-dasharray="9 7"/>
+  <text class="eyebrow" x="76" y="794" fill="#247FAA">(b) AUXILIARY HEATMAP PRETRAINING</text>
+  <rect x="858" y="770" width="339" height="31" rx="15" fill="#DCEFF7"/>
+  <text class="badge" x="881" y="792" fill="#247FAA">AUXILIARY · OFF IN DEPLOYMENT</text>
+
+  <path class="aux-flow" d="M273 586 V751" stroke="#2586B6" marker-end="url(#arrowBlue)"/>
+  <rect class="module" x="76" y="820" width="238" height="128" rx="17" fill="#FFFFFF" stroke="#89BDD5"/>
+  <text class="module-title" x="96" y="853" fill="#247FAA">Feature hooks</text>
+  <rect x="96" y="870" width="198" height="27" rx="12" fill="#E7F3FA"/>
+  <text class="small" x="109" y="891">ViT 7/15/23/31 + DPT</text>
+  <rect x="96" y="906" width="198" height="27" rx="12" fill="#EAF0F8"/>
+  <text class="small" x="109" y="927">LLM 6/13/20 + DPT</text>
+
+  <path class="aux-flow" d="M316 884 H341" stroke="#2586B6" marker-end="url(#arrowBlue)"/>
+  <rect class="module" x="348" y="820" width="272" height="128" rx="17" fill="#FFFFFF" stroke="#6AABC9"/>
+  <text class="module-title" x="369" y="853" fill="#247FAA">Trajectory-Guided</text>
+  <text class="module-title" x="369" y="887" fill="#247FAA">Attention × 2</text>
+  <text x="369" y="921" font-family="Avenir Next,Inter,Arial,sans-serif" font-size="18" font-weight="500" fill="#697385">history · pose PE · spatial tokens</text>
+
+  <path class="aux-flow" d="M622 884 H647" stroke="#2586B6" marker-end="url(#arrowBlue)"/>
+  <rect class="module" x="654" y="820" width="213" height="128" rx="17" fill="#FFFFFF" stroke="#89BDD5"/>
+  <text class="module-title" x="675" y="853" fill="#247FAA">Coarse outputs</text>
+  <text class="small" x="675" y="890">visibility · 4 views</text>
+  <text class="small" x="675" y="921">8² prior · spatial</text>
+
+  <path class="aux-flow" d="M869 884 H892" stroke="#2586B6" marker-end="url(#arrowBlue)"/>
+  <rect class="module" x="899" y="820" width="140" height="128" rx="17" fill="#FFFFFF" stroke="#6AABC9"/>
+  <text class="module-title" x="923" y="869" fill="#247FAA">Fine</text>
+  <text class="module-title" x="914" y="903" fill="#247FAA">decoder</text>
+  <text class="small" x="926" y="932">→ 64²</text>
+
+  <path class="aux-flow" d="M1041 884 H1061" stroke="#2586B6" marker-end="url(#arrowBlue)"/>
+  <g transform="translate(1068,824)">
+    <use href="#heatMap" x="0" y="0" width="34" height="76"/>
+    <use href="#heatMap" x="39" y="0" width="34" height="76"/>
+    <use href="#heatMap" x="78" y="0" width="34" height="76"/>
+    <use href="#heatMap" x="117" y="0" width="34" height="76"/>
+    <text class="small" x="8" y="101">F</text>
+    <text class="small" x="47" y="101">R</text>
+    <text class="small" x="86" y="101">B</text>
+    <text class="small" x="125" y="101">L</text>
+  </g>
+  <text class="small" x="76" y="1001" fill="#247FAA">depth + intrinsics → GT · relative pose PE → attention</text>
+  <text class="mini-mono" x="619" y="1001" fill="#247FAA">L_heat = L_vis + L_peak + 0.2 L_coord + L_neg</text>
+</svg>

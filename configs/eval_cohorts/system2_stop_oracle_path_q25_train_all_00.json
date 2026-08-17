@@ -1,0 +1,403 @@
+{
+  "cohort_index": 0,
+  "dataset": "/mnt/afs/lixiaoou/intern/fjl/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz",
+  "description": "Scene-balanced q25 unused R2R train episodes for closed-loop System2 STOP DAgger collection.",
+  "episodes": [
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 10515,
+      "geodesic_distance": 5.001047611236572,
+      "scene_id": "17DRP5sb8fy"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4151,
+      "geodesic_distance": 6.878818511962891,
+      "scene_id": "1LXtFkjw3qL"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 6754,
+      "geodesic_distance": 7.901128768920898,
+      "scene_id": "1pXnuDYAj8r"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4355,
+      "geodesic_distance": 5.184852600097656,
+      "scene_id": "29hnd4uzFmX"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8703,
+      "geodesic_distance": 7.325215816497803,
+      "scene_id": "2n8kARJN3HM"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2087,
+      "geodesic_distance": 6.793440818786621,
+      "scene_id": "5LpN3gDmAk7"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 5949,
+      "geodesic_distance": 6.308419704437256,
+      "scene_id": "5q7pvUzZiYa"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 3816,
+      "geodesic_distance": 9.835308074951172,
+      "scene_id": "759xd9YjKW5"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 7632,
+      "geodesic_distance": 7.22413444519043,
+      "scene_id": "7y3sRwLe3Va"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2366,
+      "geodesic_distance": 6.42308235168457,
+      "scene_id": "82sE5b5pLXE"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 7354,
+      "geodesic_distance": 6.715105056762695,
+      "scene_id": "8WUmhLawc2A"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 7333,
+      "geodesic_distance": 7.239676475524902,
+      "scene_id": "B6ByNegPMKs"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 321,
+      "geodesic_distance": 5.58254337310791,
+      "scene_id": "D7G3Y4RVNrH"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8963,
+      "geodesic_distance": 6.760441780090332,
+      "scene_id": "D7N2EKCX4Sj"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 6977,
+      "geodesic_distance": 11.180624008178711,
+      "scene_id": "E9uDoFAP3SH"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2260,
+      "geodesic_distance": 6.272044658660889,
+      "scene_id": "EDJbREhghzL"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4117,
+      "geodesic_distance": 4.997364044189453,
+      "scene_id": "GdvgFV5R1Z5"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4863,
+      "geodesic_distance": 4.599235534667969,
+      "scene_id": "HxpKQynjfin"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 9513,
+      "geodesic_distance": 7.835077285766602,
+      "scene_id": "JF19kD82Mey"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4389,
+      "geodesic_distance": 6.1413984298706055,
+      "scene_id": "JeFG25nYj2p"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 9605,
+      "geodesic_distance": 6.893694877624512,
+      "scene_id": "JmbYfDe2QKZ"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 553,
+      "geodesic_distance": 6.79944372177124,
+      "scene_id": "PX4nDJXEHrG"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2814,
+      "geodesic_distance": 5.023900508880615,
+      "scene_id": "Pm6F8kyY3z2"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2561,
+      "geodesic_distance": 10.624482154846191,
+      "scene_id": "PuKPg4mmafe"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 3298,
+      "geodesic_distance": 6.264621734619141,
+      "scene_id": "S9hNv5qa7GM"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 7972,
+      "geodesic_distance": 7.7376580238342285,
+      "scene_id": "SN83YJsR3w2"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 5769,
+      "geodesic_distance": 5.769719123840332,
+      "scene_id": "ULsKaCPVFJR"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 3476,
+      "geodesic_distance": 7.816305160522461,
+      "scene_id": "Uxmj2M2itWa"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 5232,
+      "geodesic_distance": 7.572272300720215,
+      "scene_id": "V2XKFyX4ASd"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8486,
+      "geodesic_distance": 7.89661979675293,
+      "scene_id": "VFuaQ6m2Qom"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 6691,
+      "geodesic_distance": 9.18761920928955,
+      "scene_id": "VLzqgDo317F"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 7902,
+      "geodesic_distance": 5.552312850952148,
+      "scene_id": "VVfe2KiqLaN"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2854,
+      "geodesic_distance": 7.190433979034424,
+      "scene_id": "Vvot9Ly1tCj"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1910,
+      "geodesic_distance": 7.3228302001953125,
+      "scene_id": "VzqfbhrpDEA"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1764,
+      "geodesic_distance": 7.5531158447265625,
+      "scene_id": "XcA2TqTSSAj"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1416,
+      "geodesic_distance": 5.356137752532959,
+      "scene_id": "YmJkqBEsHnH"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4035,
+      "geodesic_distance": 8.179115295410156,
+      "scene_id": "ZMojNkEp431"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 7582,
+      "geodesic_distance": 7.940382957458496,
+      "scene_id": "aayBHfsNo7d"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1390,
+      "geodesic_distance": 8.808589935302734,
+      "scene_id": "ac26ZMwG7aT"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8494,
+      "geodesic_distance": 7.547537803649902,
+      "scene_id": "b8cTxDM8gDG"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 525,
+      "geodesic_distance": 6.849427700042725,
+      "scene_id": "cV4RVeZvu5T"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1506,
+      "geodesic_distance": 9.044053077697754,
+      "scene_id": "dhjEzFoUFzH"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2062,
+      "geodesic_distance": 6.26795768737793,
+      "scene_id": "e9zR4mvMWw7"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 555,
+      "geodesic_distance": 9.010248184204102,
+      "scene_id": "gTV8FGcVJC9"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 5120,
+      "geodesic_distance": 5.923267364501953,
+      "scene_id": "i5noydFURQK"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1203,
+      "geodesic_distance": 6.4786529541015625,
+      "scene_id": "jh4fc5c5qoQ"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 9760,
+      "geodesic_distance": 8.051145553588867,
+      "scene_id": "kEZ7cmS4wCh"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2207,
+      "geodesic_distance": 5.939687252044678,
+      "scene_id": "mJXqzFtmKg4"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8191,
+      "geodesic_distance": 7.693503379821777,
+      "scene_id": "p5wJjkQkbXX"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 2763,
+      "geodesic_distance": 6.373218536376953,
+      "scene_id": "pRbA3pwrgk9"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 9865,
+      "geodesic_distance": 5.862302780151367,
+      "scene_id": "qoiz87JEwZ2"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8651,
+      "geodesic_distance": 10.080482482910156,
+      "scene_id": "r1Q1Z4BcV1o"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 9082,
+      "geodesic_distance": 7.109902858734131,
+      "scene_id": "r47D5H71a5s"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 4506,
+      "geodesic_distance": 5.510920524597168,
+      "scene_id": "rPc6DW4iMge"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 10738,
+      "geodesic_distance": 7.422448635101318,
+      "scene_id": "s8pcmisQ38h"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 1898,
+      "geodesic_distance": 6.5801591873168945,
+      "scene_id": "sKLMLpTHeUy"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 663,
+      "geodesic_distance": 6.8823089599609375,
+      "scene_id": "sT4fr6TAbpF"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 6637,
+      "geodesic_distance": 5.6038994789123535,
+      "scene_id": "uNb9QFRL6hY"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 8102,
+      "geodesic_distance": 8.269286155700684,
+      "scene_id": "ur6pFq6Qu1A"
+    },
+    {
+      "baseline": "train_split_closed_loop_dagger",
+      "episode_id": 10239,
+      "geodesic_distance": 8.199304580688477,
+      "scene_id": "vyrNrziPKCB"
+    }
+  ],
+  "excluded_episode_count": 452,
+  "excluded_label_files": [
+    "/mnt/afs/lixiaoou/intern/fjl/model/diag_stage3_fixed3_unmodified_stop_features_20260717/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_near17_20260717/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_seeded_near17_20260717/seed_118/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_seeded_near17_20260717/seed_119/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_seeded_near17_20260717/seed_121/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_seeded_near17_20260717/seed_122/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_seeded_near17_20260717/seed_42/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/output_system2_stop_oracle_recovery_seeded_near17_20260717_INVALID_unreproduced_qwen_stop/seed_42/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_stop_dagger_collect_train3_fixed_20260716_170658/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_stop_dagger_collect_train_all61_seed46_a_20260716/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_stop_dagger_collect_train_all61_seed46_b_20260716/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_stop_dagger_collect_train_scene16_seed43_20260716/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_stop_dagger_collect_train_scene8_20260716_1727/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_bounded_oracle_recovery_train3_20260717_1954/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_force_continue_train3_20260717_1235/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_oracle_path_train3_20260718_codex/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_oracle_path_train3_chunk4_20260718_codex/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_oracle_recovery_train3_20260717_1900/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_persistent_oracle_recovery_train3_20260717_1922/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/smoke_system2_stop_persistent_oracle_recovery_train3_retry_20260717_1930/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_00/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_01/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_02/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_03/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_04/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_05/system2_stop_rollout_labels.jsonl",
+    "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_missing_gz6/system2_stop_rollout_labels.jsonl"
+  ],
+  "num_cohorts": 1,
+  "seed": 20260718,
+  "selection": "q25",
+  "skipped_scene_ids": [
+    "gZ6f7yhEvPG"
+  ]
+}

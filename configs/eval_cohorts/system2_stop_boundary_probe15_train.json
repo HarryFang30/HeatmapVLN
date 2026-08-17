@@ -1,0 +1,21 @@
+{
+  "dataset": "/mnt/afs/lixiaoou/intern/fjl/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz",
+  "description": "Scene-disjoint train episodes for narrow 3.01-4.0 m System2 STOP boundary sweeps.",
+  "episodes": [
+    {"scene_id": "17DRP5sb8fy", "episode_id": 10515},
+    {"scene_id": "1LXtFkjw3qL", "episode_id": 4151},
+    {"scene_id": "1pXnuDYAj8r", "episode_id": 6754},
+    {"scene_id": "29hnd4uzFmX", "episode_id": 4355},
+    {"scene_id": "2n8kARJN3HM", "episode_id": 8703},
+    {"scene_id": "5LpN3gDmAk7", "episode_id": 2087},
+    {"scene_id": "5q7pvUzZiYa", "episode_id": 5949},
+    {"scene_id": "759xd9YjKW5", "episode_id": 3816},
+    {"scene_id": "7y3sRwLe3Va", "episode_id": 7632},
+    {"scene_id": "82sE5b5pLXE", "episode_id": 2366},
+    {"scene_id": "8WUmhLawc2A", "episode_id": 7354},
+    {"scene_id": "B6ByNegPMKs", "episode_id": 7333},
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8846},
+    {"scene_id": "PuKPg4mmafe", "episode_id": 6966},
+    {"scene_id": "b8cTxDM8gDG", "episode_id": 4551}
+  ]
+}

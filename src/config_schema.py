@@ -57,11 +57,25 @@ class SlidingWindowConfig(_Lenient):
     load_depth: bool = True
     cache_poses: bool = True
     sample_stride: int = 1
+    enable_augmentation: bool = False
     clip_level_sampling: bool = True
     samples_per_clip: int = 2
     val_samples_per_clip: int = 2
     defer_heatmap_to_gpu: bool = False
     load_history_frames: bool = True
+
+
+class FutureTrajectoryDataConfig(_Strict):
+    enabled: bool = False
+    heatmap_size: tuple[Literal[64], Literal[64]] = (64, 64)
+    agent_camera_height_m: float = 1.25
+
+    @field_validator("agent_camera_height_m")
+    @classmethod
+    def _finite_camera_height(cls, value: float) -> float:
+        if not (value == value and abs(value) < float("inf")):
+            raise ValueError("agent_camera_height_m must be finite")
+        return value
 
 
 class TrajectoryConfig(_Lenient):
@@ -101,6 +115,7 @@ class TrajectoryConfig(_Lenient):
     include_stop_samples_random_subsequence: bool = False
     panoramic_vlm_input: bool = True
     trajectory_target_convention: str = "legacy_pitched_camera"
+    future_heatmap: FutureTrajectoryDataConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -273,6 +288,9 @@ class HeatmapModelConfig(_Lenient):
     lambda_peak: float = 1.0
     heatmap_trains_backbone: bool = False
     decoder_mode: str = "legacy"
+    restore_vit_spatial_layout: bool = False
+    coarse_logit_residual: bool = False
+    joint_panorama_inference: bool = False
     pose_free: HeatmapPoseFreeConfig | None = None
     trajectory: HeatmapTrajectoryConfig | None = None
 
@@ -283,6 +301,30 @@ class HeatmapModelConfig(_Lenient):
         if normalized not in {"legacy", "pose_free_matcher"}:
             raise ValueError(f"decoder_mode must be 'legacy' or 'pose_free_matcher', got {value!r}")
         return normalized
+
+
+class PastPlanActionModelConfig(_Strict):
+    """Fixed v1 latent/geometry contract; disabled is the legacy path."""
+
+    enabled: bool = False
+    stage: Literal[
+        "stage0_equivalence",
+        "stage1_map_pretrain",
+        "stage2_joint",
+    ] = "stage0_equivalence"
+    architecture_id: Literal["past-plan-action-single-bridge-v1"] = (
+        "past-plan-action-single-bridge-v1"
+    )
+    plan_dim: Literal[768] = 768
+    memory_dim: Literal[256] = 256
+    bridge_heads: Literal[8] = 8
+    plan_tokens: Literal[4] = 4
+    predict_steps: Literal[32] = 32
+    future_time_bins: Literal[4] = 4
+    future_views: Literal[4] = 4
+    future_heatmap_size: Literal[64] = 64
+    old_heatmap_control_enabled: bool = False
+    pano_latent_adapter_enabled: bool = False
 
 
 class NextDiTConfig(_Lenient):
@@ -306,6 +348,7 @@ class NextDiTConfig(_Lenient):
     internnav_model_path: str = ""
     pretrained_system1_path: str | None = None
     warmup_steps: int = 0
+    past_plan_action: PastPlanActionModelConfig | None = None
 
 
 class ActionHeadConfig(_Lenient):
@@ -327,6 +370,15 @@ class ModelConfig(_Lenient):
 class OptimConfig(_Lenient):
     optimizer: str = "adamw"
     learning_rate: float = 1e-4
+    heatmap_lr: float = 2e-4
+    heatmap_vit_lr: float | None = None
+    heatmap_fine_lr: float | None = None
+    heatmap_llm_lr: float | None = None
+    heatmap_coarse_lr: float | None = None
+    vis_head_lr: float | None = None
+    past_plan_action_future_lr: float = 1e-4
+    past_plan_action_bridge_lr: float = 2e-5
+    past_plan_action_shared_map_lr: float = 2e-5
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     amp: str = "bf16"
@@ -362,18 +414,83 @@ class HeatmapVLNLossConfig(_Lenient):
     lambda_neg: float = 0.0
     temperature: float = 1.0
     vis_pos_weight: float = 1.0
+    lambda_view_macro: float = 0.0
+    lambda_direction_macro: float = 0.0
+    lambda_panoramic_view: float = 0.0
+    panoramic_detach_visibility: bool = False
+    coord_smooth_l1_beta: float = 0.1
+    allow_probability_fallback: bool = True
     temperature_schedule: TemperatureScheduleConfig | None = None
+
+
+class FutureTrajectoryHeatmapLossConfig(_Strict):
+    """Tube-map loss; point-only and forced-single-view terms stay disabled."""
+
+    lambda_vis: float = 1.0
+    lambda_peak: float = 1.0
+    lambda_neg: float = 0.25
+    lambda_view_macro: float = 0.5
+    vis_pos_weight: float = 1.0
+    lambda_coord: Literal[0.0] = 0.0
+    lambda_direction_macro: Literal[0.0] = 0.0
+    lambda_panoramic_view: Literal[0.0] = 0.0
+    allow_probability_fallback: Literal[False] = False
+
+
+class PastPlanActionLossConfig(_Strict):
+    action: float = 1.0
+    history: float = 0.3
+    future: float = 0.3
+    preserve: float = 0.5
+    delta_z: float = 0.01
+
+    @model_validator(mode="after")
+    def _finite_nonnegative(self) -> "PastPlanActionLossConfig":
+        for name in ("action", "history", "future", "preserve", "delta_z"):
+            value = float(getattr(self, name))
+            if not (value >= 0.0 and value < float("inf")):
+                raise ValueError(f"Past→Plan→Action loss weight {name} must be finite and non-negative")
+        if self.preserve <= 0.0:
+            raise ValueError("Stage-2 native preservation weight must be positive")
+        return self
 
 
 class LossConfig(_Lenient):
     heatmap_loss_type: str = "heatmap_vln"
     heatmap_vln: HeatmapVLNLossConfig | None = None
+    future_heatmap: FutureTrajectoryHeatmapLossConfig | None = None
+    past_plan_action: PastPlanActionLossConfig | None = None
     heatmap_weight: float = 1.0
     trajectory_weight: float = 0.0
     lm_weight: float = 1.0
 
 
 # --- Training ----------------------------------------------------------------
+
+
+class HeatmapWarmstartContractConfig(_Strict):
+    """Fail-closed warm-start contract for HeatmapVLN training."""
+
+    policy: Literal["spatial_reset_v1", "full_head_v1"] = "spatial_reset_v1"
+    expected_lora_tensors: int = 224
+    expected_vit_dpt_tensors: int = 12
+    expected_llm_dpt_tensors: int = 10
+    expected_coarse_tensors: int = 37
+    expected_fine_tensors: int = 6
+    require_metadata: bool = True
+
+    @field_validator(
+        "expected_lora_tensors",
+        "expected_vit_dpt_tensors",
+        "expected_llm_dpt_tensors",
+        "expected_coarse_tensors",
+        "expected_fine_tensors",
+    )
+    @classmethod
+    def _positive_expected_tensor_count(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("warm-start tensor counts must be >= 1")
+        return value
 
 
 class TrainingStageConfig(_Lenient):
@@ -387,12 +504,19 @@ class TrainingStageConfig(_Lenient):
     train_lm: bool | None = None
     train_system2_sft: bool | None = None
     train_action: bool = True
+    past_plan_action_stage: Literal[
+        "stage1_map_pretrain",
+        "stage2_joint",
+    ] | None = None
+    trajectory_sequence_mode: Literal["all", "first_only"] = "all"
+    verify_stage0_equivalence: bool = False
     strict_trainable_modules: bool = False
     bridge_only: bool = False
     requires_base_checkpoint: bool = False
     require_complete_internnav_system1: bool | None = None
     base_checkpoint_lora_only: bool = False
     merge_frozen_lora: bool = False
+    heatmap_warmstart_contract: HeatmapWarmstartContractConfig | None = None
     retain_raw_panoramic_views: bool = True
     compute_pano_text_anchor_positions: bool = True
     retain_history_rel_poses: bool = True
@@ -474,6 +598,16 @@ class ValidationConfig(_Lenient):
     enabled: bool = True
     eval_every_epochs: int = 1
     save_best_metric: str = "val_total_loss"
+    save_best_mode: Literal["min", "max"] = "min"
+    evaluate_before_training: bool = False
+    baseline_as_best_threshold: bool = False
+    baseline_overall_metric: str = "val_heatmap_joint_pck8"
+    baseline_overall_tolerance: float = 0.02
+    baseline_back_metric: str = "val_heatmap_back_pck8"
+    baseline_back_tolerance: float = 0.03
+    baseline_direction_metrics: dict[str, str] | None = None
+    baseline_direction_tolerance: float = 0.03
+    save_best_loss_tiebreak_metric: str = "val_loss"
     patience: int = 5
     val_inference_batches: int = 10
 
@@ -498,6 +632,110 @@ class TrainConfig(_Lenient):
     gpu: GPUConfig = GPUConfig()
     log: LogConfig
     validation: ValidationConfig = ValidationConfig()
+
+    @model_validator(mode="after")
+    def _validate_past_plan_action_training(self) -> "TrainConfig":
+        action = self.model.action_head
+        nextdit = action.nextdit if action is not None else None
+        ppa = nextdit.past_plan_action if nextdit is not None else None
+        if ppa is None or not ppa.enabled:
+            return self
+
+        if action is None or not action.enable or nextdit is None or not nextdit.enabled:
+            raise ValueError("enabled Past→Plan→Action requires native NextDiT")
+        if (
+            nextdit.latent_emb_size != 768
+            or nextdit.n_query != 4
+            or nextdit.predict_steps != 32
+        ):
+            raise ValueError(
+                "Past→Plan→Action v1 requires NextDiT latent_emb_size=768, "
+                "n_query=4, predict_steps=32"
+            )
+        heatmap = self.model.heatmap
+        if (
+            heatmap is None
+            or not heatmap.enable
+            or heatmap.c_fused != 256
+            or heatmap.decoder_mode != "legacy"
+            or heatmap.trajectory is None
+            or not heatmap.trajectory.enable
+        ):
+            raise ValueError(
+                "Past→Plan→Action requires the 256-d trajectory-guided legacy Past Head"
+            )
+        if ppa.old_heatmap_control_enabled or ppa.pano_latent_adapter_enabled:
+            raise ValueError(
+                "Past→Plan→Action is mutually exclusive with legacy heatmap control "
+                "and the pano latent adapter"
+            )
+        pano_adapter = getattr(nextdit, "pano_latent_adapter", None)
+        if isinstance(pano_adapter, BaseModel):
+            pano_adapter = pano_adapter.model_dump(mode="python")
+        if isinstance(pano_adapter, dict) and pano_adapter.get("enabled", False):
+            raise ValueError("Past→Plan→Action cannot enable pano_latent_adapter")
+
+        trajectory = self.data.trajectory
+        if self.data.dataset_type != "trajectory" or trajectory is None:
+            raise ValueError("Past→Plan→Action training requires trajectory data")
+        if trajectory.predict_horizon != 32:
+            raise ValueError("Past→Plan→Action future supervision requires predict_horizon=32")
+        if trajectory.enable_trajectory_augmentation:
+            raise ValueError(
+                "Past→Plan→Action future/action labels require "
+                "enable_trajectory_augmentation=false"
+            )
+        if trajectory.future_heatmap is None or not trajectory.future_heatmap.enabled:
+            raise ValueError(
+                "Past→Plan→Action training requires "
+                "data.trajectory.future_heatmap.enabled=true"
+            )
+        if trajectory.trajectory_target_convention != "internnav_habitat":
+            raise ValueError(
+                "Past→Plan→Action future labels require "
+                "trajectory_target_convention='internnav_habitat'"
+            )
+        legacy_control = getattr(nextdit, "heatmap_control", None)
+        if isinstance(legacy_control, BaseModel):
+            legacy_control = legacy_control.model_dump(mode="python")
+        if isinstance(legacy_control, dict) and legacy_control.get("enabled", False):
+            raise ValueError("Past→Plan→Action cannot enable legacy heatmap_control")
+
+        expected_scopes = {
+            "stage1_map_pretrain": {
+                "future_heatmap_head",
+                "heatmap_memory_and_decoder",
+            },
+            "stage2_joint": {
+                "future_heatmap_head",
+                "heatmap_memory_and_decoder",
+                "past_plan_bridge",
+            },
+        }
+        for stage in self.training.stages:
+            if stage.past_plan_action_stage is None:
+                continue
+            expected = expected_scopes[stage.past_plan_action_stage]
+            actual = set(stage.trainable_modules)
+            if actual != expected:
+                raise ValueError(
+                    f"{stage.past_plan_action_stage} trainable_modules must be "
+                    f"exactly {sorted(expected)}, got {sorted(actual)}"
+                )
+            if not stage.strict_trainable_modules:
+                raise ValueError("Past→Plan→Action stages require strict_trainable_modules=true")
+            if not stage.train_future:
+                raise ValueError("Past→Plan→Action stages require train_future=true")
+            if stage.train_history is False:
+                raise ValueError("Past→Plan→Action stages cannot disable History supervision")
+            if stage.past_plan_action_stage == "stage1_map_pretrain" and stage.train_action:
+                raise ValueError("Stage 1 map pretraining must keep the action path disabled")
+            if stage.past_plan_action_stage == "stage2_joint":
+                if not stage.train_action or stage.trajectory_sequence_mode != "first_only":
+                    raise ValueError(
+                        "Stage 2 requires train_action=true and trajectory_sequence_mode=first_only"
+                    )
+        return self
 
 
 # --- Public API --------------------------------------------------------------

@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="178mm" height="46.3mm" viewBox="0 0 3000 780" role="img" aria-labelledby="title desc">
+  <title id="title">Historical spatial grounding for trajectory generation</title>
+  <desc id="desc">Front RGB history is processed by frozen AMB3R-VO and frozen Qwen visual encoders into pose and visual tokens. Pose-visual fusion predicts K by four heatmaps and visibility. A structured tokenizer converts these predictions into heatmap tokens, which are injected through gated cross-attention into NextDiT to generate a trajectory.</desc>
+
+  <defs>
+    <style><![CDATA[
+      text { font-family: Arial, Helvetica, sans-serif; fill: #252A31; }
+      .heading { font-size: 54px; font-weight: 700; }
+      .module  { font-size: 50px; font-weight: 700; }
+      .compact { font-size: 46px; }
+      .label   { font-size: 44px; font-weight: 400; }
+      .mini    { font-size: 38px; font-weight: 700; }
+      .arrow   { fill: none; stroke: #A7AAAE; stroke-width: 4.5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow); }
+      .box     { stroke-width: 3.5; }
+    ]]></style>
+
+    <marker id="arrow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="21" markerHeight="21" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1,1 L11,6 L1,11 Z" fill="#A7AAAE"/>
+    </marker>
+
+    <symbol id="rgb-frame" viewBox="0 0 210 92">
+      <rect x="1.5" y="1.5" width="207" height="89" rx="8" fill="#FFFFFF" stroke="#8AA5B7" stroke-width="3"/>
+      <polygon points="4,4 66,34 66,87 4,87" fill="#DCE9EE"/>
+      <polygon points="206,4 144,34 144,87 206,87" fill="#E8DED2"/>
+      <polygon points="66,34 144,34 198,87 12,87" fill="#CDBEAD"/>
+      <rect x="87" y="10" width="35" height="48" rx="2" fill="#6F8791"/>
+      <rect x="94" y="16" width="22" height="36" fill="#D8EFF3"/>
+      <line x1="66" y1="34" x2="144" y2="34" stroke="#FFFFFF" stroke-width="3"/>
+    </symbol>
+
+    <symbol id="hm-front" viewBox="0 0 64 64">
+      <rect x="1" y="1" width="62" height="62" rx="8" fill="#243D73"/>
+      <circle cx="34" cy="17" r="17" fill="#22A4B4"/>
+      <circle cx="34" cy="17" r="10" fill="#F7D250"/>
+      <circle cx="34" cy="17" r="5" fill="#F16C68"/>
+    </symbol>
+    <symbol id="hm-right" viewBox="0 0 64 64">
+      <rect x="1" y="1" width="62" height="62" rx="8" fill="#243D73"/>
+      <circle cx="52" cy="34" r="13" fill="#2A91AA"/>
+      <circle cx="52" cy="34" r="6" fill="#F2CD58"/>
+    </symbol>
+    <symbol id="hm-back" viewBox="0 0 64 64">
+      <rect x="1" y="1" width="62" height="62" rx="8" fill="#DCE3E8" stroke="#9CA8AF" stroke-width="2"/>
+      <circle cx="32" cy="32" r="4" fill="#B7C2C8"/>
+    </symbol>
+    <symbol id="hm-left" viewBox="0 0 64 64">
+      <rect x="1" y="1" width="62" height="62" rx="8" fill="#243D73"/>
+      <circle cx="17" cy="46" r="15" fill="#269EB1"/>
+      <circle cx="17" cy="46" r="8" fill="#F2D05A"/>
+      <circle cx="17" cy="46" r="4" fill="#F1776E"/>
+    </symbol>
+  </defs>
+
+  <rect width="3000" height="780" fill="#FFFFFF"/>
+
+  <!-- Front RGB history. -->
+  <text x="160" y="62" text-anchor="middle" class="heading" fill="#2A6FA8">Front RGB</text>
+  <text x="160" y="116" text-anchor="middle" class="heading" fill="#2A6FA8">History</text>
+  <use href="#rgb-frame" x="28" y="150" width="210" height="92" opacity="0.72"/>
+  <use href="#rgb-frame" x="44" y="258" width="210" height="92" opacity="0.82"/>
+  <use href="#rgb-frame" x="60" y="366" width="210" height="92" opacity="0.92"/>
+  <use href="#rgb-frame" x="76" y="474" width="210" height="92"/>
+  <text x="160" y="634" text-anchor="middle" class="label" fill="#68737A">K frames</text>
+
+  <!-- Shared input fork. -->
+  <path d="M286 390 H315" fill="none" stroke="#A7AAAE" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="315" cy="390" r="5" fill="#A7AAAE"/>
+  <path d="M315 390 V230 H326" class="arrow"/>
+  <path d="M315 390 V550 H326" class="arrow"/>
+
+  <!-- Frozen providers. -->
+  <rect x="340" y="142" width="290" height="176" rx="20" fill="#DCEFF7" stroke="#69A9C5" class="box"/>
+  <text x="485" y="221" text-anchor="middle" class="module" fill="#27749D">Frozen</text>
+  <text x="485" y="278" text-anchor="middle" class="module compact" fill="#27749D">AMB3R-VO</text>
+
+  <rect x="340" y="462" width="290" height="176" rx="20" fill="#EEEAF7" stroke="#9A86BD" class="box"/>
+  <text x="485" y="541" text-anchor="middle" class="module" fill="#70559F">Frozen</text>
+  <text x="485" y="598" text-anchor="middle" class="module compact" fill="#70559F">Qwen.visual</text>
+
+  <!-- Pose and visual tokens. -->
+  <path d="M630 230 H660" class="arrow"/>
+  <text x="744" y="126" text-anchor="middle" class="label" fill="#27749D">Pose Tokens</text>
+  <g transform="translate(672 180)">
+    <rect x="0" y="0" width="44" height="44" rx="5" fill="#7FA8C7"/>
+    <rect x="56" y="0" width="44" height="44" rx="5" fill="#9BC1D8"/>
+    <rect x="112" y="0" width="44" height="44" rx="5" fill="#C4DEEA"/>
+    <rect x="0" y="58" width="44" height="44" rx="5" fill="#9BC1D8"/>
+    <rect x="56" y="58" width="44" height="44" rx="5" fill="#7FA8C7"/>
+    <rect x="112" y="58" width="44" height="44" rx="5" fill="#C4DEEA"/>
+  </g>
+
+  <path d="M630 550 H660" class="arrow"/>
+  <text x="744" y="444" text-anchor="middle" class="label" fill="#70559F">Visual Tokens</text>
+  <g transform="translate(672 500)">
+    <rect x="0" y="0" width="44" height="44" rx="5" fill="#F1BE58"/>
+    <rect x="56" y="0" width="44" height="44" rx="5" fill="#F7D17A"/>
+    <rect x="112" y="0" width="44" height="44" rx="5" fill="#F9DFA5"/>
+    <rect x="0" y="58" width="44" height="44" rx="5" fill="#F7D17A"/>
+    <rect x="56" y="58" width="44" height="44" rx="5" fill="#F1BE58"/>
+    <rect x="112" y="58" width="44" height="44" rx="5" fill="#F9DFA5"/>
+  </g>
+
+  <!-- Pose-visual fusion. -->
+  <path d="M828 230 C858 230 850 337 875 337" class="arrow"/>
+  <path d="M828 550 C858 550 850 443 875 443" class="arrow"/>
+  <rect x="889" y="278" width="270" height="224" rx="22" fill="#DDF2E8" stroke="#64AB88" class="box"/>
+  <text x="1024" y="340" text-anchor="middle" class="module compact" fill="#377C5B">Pose–Visual</text>
+  <text x="1024" y="397" text-anchor="middle" class="module" fill="#377C5B">Fusion</text>
+  <g transform="translate(939 430)">
+    <rect width="40" height="40" rx="5" fill="#87B3D0"/>
+    <rect x="52" width="40" height="40" rx="5" fill="#F2C45F"/>
+    <rect x="104" width="40" height="40" rx="5" fill="#86C7A4"/>
+    <rect x="156" width="40" height="40" rx="5" fill="#68B78D"/>
+  </g>
+
+  <!-- Heatmap head and predictions. -->
+  <path d="M1159 390 H1192" class="arrow"/>
+  <rect x="1206" y="300" width="220" height="180" rx="20" fill="#FCE4E1" stroke="#E78C85" class="box"/>
+  <text x="1316" y="372" text-anchor="middle" class="module" fill="#B85E58">Heatmap</text>
+  <text x="1316" y="431" text-anchor="middle" class="module" fill="#B85E58">Head</text>
+
+  <path d="M1426 390 H1442" class="arrow"/>
+  <rect x="1456" y="188" width="350" height="404" rx="22" fill="#F7F3EA" stroke="#C9B27A" class="box"/>
+  <text x="1631" y="248" text-anchor="middle" class="module" fill="#8B6A25">K × 4 Heatmaps</text>
+  <g transform="translate(1489 286)">
+    <use href="#hm-front" x="0" y="0" width="64" height="64"/>
+    <use href="#hm-right" x="82" y="0" width="64" height="64"/>
+    <use href="#hm-back" x="164" y="0" width="64" height="64"/>
+    <use href="#hm-left" x="246" y="0" width="64" height="64"/>
+    <text x="32" y="108" text-anchor="middle" class="mini">F</text>
+    <text x="114" y="108" text-anchor="middle" class="mini">R</text>
+    <text x="196" y="108" text-anchor="middle" class="mini">B</text>
+    <text x="278" y="108" text-anchor="middle" class="mini">L</text>
+  </g>
+  <text x="1631" y="456" text-anchor="middle" class="label" fill="#8B6A25">Visibility</text>
+  <g transform="translate(1501 488)">
+    <rect width="54" height="38" rx="19" fill="#69B98C"/>
+    <rect x="76" width="54" height="38" rx="19" fill="#99C9A9"/>
+    <rect x="152" width="54" height="38" rx="19" fill="#D7DDE0"/>
+    <rect x="228" width="54" height="38" rx="19" fill="#7AC096"/>
+  </g>
+
+  <!-- Structured tokenization. -->
+  <path d="M1806 390 H1830" class="arrow"/>
+  <rect x="1844" y="294" width="270" height="192" rx="20" fill="#FFF0D8" stroke="#E3A85C" class="box"/>
+  <text x="1979" y="367" text-anchor="middle" class="module compact" fill="#B77321">Structured</text>
+  <text x="1979" y="426" text-anchor="middle" class="module compact" fill="#B77321">Tokenizer</text>
+
+  <path d="M2114 390 H2140" class="arrow"/>
+  <text x="2227" y="256" text-anchor="middle" class="label" fill="#377C5B">Heatmap Tokens</text>
+  <g transform="translate(2146 323)">
+    <rect x="0" y="0" width="46" height="46" rx="6" fill="#69B98C"/>
+    <rect x="58" y="0" width="46" height="46" rx="6" fill="#8FC8A5"/>
+    <rect x="116" y="0" width="46" height="46" rx="6" fill="#C0DFC8"/>
+    <rect x="0" y="60" width="46" height="46" rx="6" fill="#8FC8A5"/>
+    <rect x="58" y="60" width="46" height="46" rx="6" fill="#69B98C"/>
+    <rect x="116" y="60" width="46" height="46" rx="6" fill="#C0DFC8"/>
+  </g>
+
+  <!-- Navigation injection and output. -->
+  <path d="M2308 390 H2332" class="arrow"/>
+  <rect x="2346" y="300" width="210" height="180" rx="20" fill="#E7F1DC" stroke="#86B05F" class="box"/>
+  <text x="2451" y="372" text-anchor="middle" class="module" fill="#567E30">Gated</text>
+  <text x="2451" y="431" text-anchor="middle" class="module" fill="#567E30">X-Attn</text>
+
+  <path d="M2556 390 H2580" class="arrow"/>
+  <rect x="2594" y="300" width="190" height="180" rx="20" fill="#EEF1F5" stroke="#929BA5" class="box"/>
+  <text x="2689" y="408" text-anchor="middle" class="module">NextDiT</text>
+
+  <path d="M2784 390 H2810" class="arrow"/>
+  <text x="2860" y="278" text-anchor="middle" class="label" fill="#4D555C">Trajectory</text>
+  <path d="M2828 390 C2852 345 2876 354 2892 389 S2932 443 2968 392" fill="none" stroke="#73777B" stroke-width="7" stroke-linecap="round"/>
+</svg>

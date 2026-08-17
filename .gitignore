@@ -73,3 +73,17 @@ nohup.out
 .cursor/*
 !.cursor/rules/
 /xyc/*
+
+# Codex scratch/staging trees (never project source)
+/.codex_stage/
+/.codex_staging/
+/.codex_tmp/
+/.codex_work/
+
+# Reproducible local artifacts
+/tmp/
+/evaluation_artifacts/
+*.aux
+*.synctex.gz
+/docs/method.out
+/docs/method.pdf

@@ -1,0 +1,6 @@
+{
+  "description": "Audited historical false-STOP calls for privileged recovery collection with RPC protocol seed 118.",
+  "episodes": [
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8848, "historical_false_stop_system2_call_index": 36, "historical_false_stop_step": 144, "historical_false_stop_distance_m": 5.578694820404053, "historical_false_stop_rpc_protocol_seed": 118, "historical_false_stop_source_labels": "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_01/system2_stop_rollout_labels.jsonl"}
+  ]
+}

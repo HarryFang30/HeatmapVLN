@@ -40,12 +40,20 @@ class StopPredictionHead(nn.Module):
         hidden_dim: int = 512,
         dropout: float = 0.1,
         focal_gamma: float = 2.0,
-        focal_alpha: float = 0.75,  # STOP is rare, give it higher weight
+        focal_alpha: float = 0.5,
+        pos_weight: float = 1.0,
+        bce_mix: float = 0.5,
     ):
         super().__init__()
 
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
+        self.pos_weight = float(pos_weight)
+        self.bce_mix = float(bce_mix)
+        if self.pos_weight <= 0:
+            raise ValueError(f"pos_weight must be > 0, got {self.pos_weight}")
+        if not 0.0 <= self.bce_mix <= 1.0:
+            raise ValueError(f"bce_mix must be in [0, 1], got {self.bce_mix}")
 
         # MLP classifier
         self.classifier = nn.Sequential(
@@ -66,7 +74,9 @@ class StopPredictionHead(nn.Module):
 
         logger.info(
             f"StopPredictionHead initialized: input_dim={input_dim}, "
-            f"hidden_dim={hidden_dim}, focal_gamma={focal_gamma}, focal_alpha={focal_alpha}"
+            f"hidden_dim={hidden_dim}, focal_gamma={focal_gamma}, "
+            f"focal_alpha={focal_alpha}, pos_weight={self.pos_weight}, "
+            f"bce_mix={self.bce_mix}"
         )
 
     def forward(
@@ -136,16 +146,11 @@ class StopPredictionHead(nn.Module):
         targets: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        🔧 [FIX] 混合 Loss = BCE + Focal Loss
+        """Compute a configurable BCE/focal mixture.
 
-        问题：纯 Focal Loss 在极度不平衡（97% vs 3%）时过度压低 Loss
-        - gamma=3 时，容易样本的 loss 被压低到原来的 1/8
-        - 导致模型梯度不足，无法有效学习
-
-        解决：使用混合 Loss
-        - 基础 BCE Loss (权重0.3)：保持梯度流动
-        - Focal Loss (权重0.7)：聚焦困难样本
+        Metric-aware STOP training uses ``bce_mix=1`` for calibrated
+        probabilities. Legacy imbalanced datasets may still opt into the
+        focal component without changing this head implementation.
 
         Args:
             logits: (B,) raw logits
@@ -158,22 +163,22 @@ class StopPredictionHead(nn.Module):
         device = logits.device
         targets = targets.float().to(device)
 
-        # 🔧 [FIX] 类别权重：STOP 类权重更高
-        # STOP 样本只有 3%，需要 33x 权重才能平衡
-        # 使用较保守的 10x 权重
-        pos_weight = torch.tensor([10.0], device=device)
+        # The metric-aware STOP dataset is deliberately rebalanced. Keep the
+        # positive weight configurable instead of assuming the legacy 3%
+        # terminal-only class frequency.
+        pos_weight = torch.tensor(self.pos_weight, device=device, dtype=torch.float32)
+        logits_fp32 = logits.float()
 
         # 基础 BCE loss（带类别权重）
         bce_loss = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none', pos_weight=pos_weight
+            logits_fp32, targets, reduction='none', pos_weight=pos_weight
         )
 
         # Compute p_t (probability of correct class)
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits_fp32)
         p_t = probs * targets + (1 - probs) * (1 - targets)
 
         # Focal weight: (1 - p_t)^gamma
-        # 🔧 [FIX] 降低 gamma 以保持更多梯度
         gamma = min(self.focal_gamma, 2.0)  # 限制最大 gamma=2
         focal_weight = (1 - p_t) ** gamma
 
@@ -183,9 +188,7 @@ class StopPredictionHead(nn.Module):
         # Focal loss
         focal_loss = alpha_weight * focal_weight * bce_loss
 
-        # 🔧 [FIX] 混合 Loss = 0.3 * BCE + 0.7 * Focal
-        # 保持基础梯度的同时聚焦困难样本
-        mixed_loss = 0.3 * bce_loss + 0.7 * focal_loss
+        mixed_loss = self.bce_mix * bce_loss + (1.0 - self.bce_mix) * focal_loss
 
         # Apply mask if provided
         if mask is not None:
@@ -332,4 +335,3 @@ class DiscreteActionHead(nn.Module):
             loss = loss_per_sample.mean()
 
         return loss
-

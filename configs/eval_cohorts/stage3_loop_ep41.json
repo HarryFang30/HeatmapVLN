@@ -1,0 +1,10 @@
+{
+  "description": "Fixed Stage3 closed-loop recovery diagnostic.",
+  "episodes": [
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 41,
+      "baseline": "max_steps_plan_loop"
+    }
+  ]
+}

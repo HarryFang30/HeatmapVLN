@@ -1,0 +1,175 @@
+# One-card real smoke template for Past→Plan→Action v1.
+# Host paths are supplied through environment variables; this file pins no hash.
+seed: 42
+
+paths:
+  dataset_root: $HEATMAPVLN_PPA_DATA_ROOT
+  val_root: $HEATMAPVLN_PPA_VAL_ROOT
+  log_out_dir: $HEATMAPVLN_PPA_OUTPUT_ROOT
+  internnav_model_path: $INTERNNAV_MODEL_PATH
+
+data:
+  train_split: train
+  val_split: val_unseen
+  image_size: [256, 256]
+  init_hm_size: [64, 64]
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: 2
+  dataset_type: trajectory
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 1
+    clip_level_sampling: true
+    samples_per_clip: 1
+    val_samples_per_clip: 1
+    random_subsequence: false
+    predict_horizon: 32
+    action_scale: 4.0
+    enable_augmentation: false
+    enable_trajectory_augmentation: false
+    load_traj_images: true
+    load_history_frames: true
+    traj_image_size: [224, 224]
+    compute_pixel_goal: true
+    load_lookdown_for_system2: true
+    system2_sft_protocol: internnav
+    pixel_goal_direction: front_down
+    panoramic_vlm_input: true
+    trajectory_target_convention: internnav_habitat
+    future_heatmap:
+      enabled: true
+      heatmap_size: [64, 64]
+      agent_camera_height_m: 1.25
+
+model:
+  type: vln_pipeline
+  device: cuda
+  llm:
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+    max_video_frames: -1
+    gradient_checkpointing: false
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: false
+  heatmap:
+    enable: true
+    c_vit: 1280
+    c_llm: 3584
+    c_fused: 256
+    vit_layer_indices: [7, 15, 23, 31]
+    llm_layer_indices: [6, 13, 20]
+    heatmap_size: [64, 64]
+    image_size: 256
+    decoder_mode: legacy
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 2
+      max_spatial_range: 10.0
+  action_head:
+    enable: true
+    nextdit:
+      enabled: true
+      vlm_hidden_dim: 3584
+      latent_emb_size: 768
+      n_query: 4
+      predict_steps: 32
+      action_dim: 3
+      num_inference_steps: 10
+      guidance_scale: 1.0
+      num_sample_trajs: 32
+      internnav_model_path: $INTERNNAV_MODEL_PATH
+      past_plan_action:
+        enabled: true
+        stage: stage2_joint
+        architecture_id: past-plan-action-single-bridge-v1
+
+training:
+  stages:
+    - name: past_plan_action_stage2_smoke
+      epochs: 1
+      train_history: true
+      train_future: true
+      train_action: true
+      past_plan_action_stage: stage2_joint
+      trajectory_sequence_mode: first_only
+      verify_stage0_equivalence: true
+      strict_trainable_modules: true
+      trainable_modules:
+        - future_heatmap_head
+        - heatmap_memory_and_decoder
+        - past_plan_bridge
+      frozen_modules:
+        - vlm_backbone
+        - latent_queries
+        - cond_projector
+        - nextdit_action_head
+
+optim:
+  optimizer: adamw
+  past_plan_action_future_lr: 1.0e-4
+  past_plan_action_bridge_lr: 2.0e-5
+  past_plan_action_shared_map_lr: 2.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.0
+  min_lr: 1.0e-6
+  batch_size: 1
+  grad_accum_steps: 1
+
+loss:
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_peak: 1.0
+    lambda_neg: 1.0
+    allow_probability_fallback: false
+  future_heatmap:
+    lambda_vis: 1.0
+    lambda_peak: 1.0
+    lambda_neg: 0.25
+    lambda_view_macro: 0.5
+    vis_pos_weight: 1.0
+    lambda_coord: 0.0
+    lambda_direction_macro: 0.0
+    lambda_panoramic_view: 0.0
+    allow_probability_fallback: false
+  past_plan_action:
+    action: 1.0
+    history: 0.3
+    future: 0.3
+    preserve: 0.5
+    delta_z: 0.01
+
+gpu:
+  devices: [0]
+  backend: nccl
+  multi_gpu:
+    enabled: false
+
+log:
+  out_dir: $HEATMAPVLN_PPA_OUTPUT_ROOT
+  use_tensorboard: false
+  log_interval: 1
+  diag_interval: 1
+  mid_epoch_save_every: 0
+  max_ckpts: 1
+
+validation:
+  enabled: false
+  eval_every_epochs: 1
+  patience: 1
+  val_inference_batches: 0

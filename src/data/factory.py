@@ -68,6 +68,9 @@ def build_trajectory_dataset(
 
     data_cfg = cfg["data"]
     traj_cfg = data_cfg.get("trajectory", data_cfg.get("sliding_window", {}))
+    future_cfg = traj_cfg.get("future_heatmap", {})
+    if not isinstance(future_cfg, dict):
+        raise TypeError("data.trajectory.future_heatmap must be a mapping")
 
     kwargs = dict(
         root=data_cfg["root"],
@@ -105,6 +108,22 @@ def build_trajectory_dataset(
         system2_sample_step=traj_cfg.get("system2_sample_step", 4),
         system2_min_pixel_goal_len=traj_cfg.get("system2_min_pixel_goal_len", 3),
         system2_stop_oversample=traj_cfg.get("system2_stop_oversample", 5),
+        system2_stop_path_radius_m=traj_cfg.get("system2_stop_path_radius_m", 0.0),
+        system2_near_stop_hard_negative_oversample=traj_cfg.get(
+            "system2_near_stop_hard_negative_oversample", 0,
+        ),
+        system2_near_stop_hard_negative_min_path_m=traj_cfg.get(
+            "system2_near_stop_hard_negative_min_path_m", 0.0,
+        ),
+        system2_near_stop_hard_negative_max_path_m=traj_cfg.get(
+            "system2_near_stop_hard_negative_max_path_m", 0.0,
+        ),
+        system2_near_stop_hard_negative_min_goal_distance_m=traj_cfg.get(
+            "system2_near_stop_hard_negative_min_goal_distance_m", 0.0,
+        ),
+        system2_near_stop_hard_negative_max_goal_distance_m=traj_cfg.get(
+            "system2_near_stop_hard_negative_max_goal_distance_m", 0.0,
+        ),
         include_stop_samples_random_subsequence=traj_cfg.get(
             "include_stop_samples_random_subsequence", False,
         ),
@@ -113,6 +132,11 @@ def build_trajectory_dataset(
         pano_max_side_dist_m=traj_cfg.get("pano_max_side_dist_m", 6.0),
         trajectory_target_convention=traj_cfg.get(
             "trajectory_target_convention", "legacy_pitched_camera"
+        ),
+        load_future_trajectory_heatmap=future_cfg.get("enabled", False),
+        future_heatmap_size=tuple(future_cfg.get("heatmap_size", [64, 64])),
+        future_agent_camera_height_m=future_cfg.get(
+            "agent_camera_height_m", 1.25
         ),
         max_clips=traj_cfg.get("max_clips", 0),
     )

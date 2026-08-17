@@ -366,7 +366,7 @@ class VLNSlidingWindowDataset(Dataset):
                 scene_dirs = train_scenes
                 logger.info(f"Auto-split: {len(train_scenes)} train scenes, {len(val_scenes)} val scenes (split={self.split})")
 
-        clips = []
+        clips_by_scene: list[list[Path]] = []
         for scene_dir in scene_dirs:
             clip_dirs = sorted([
                 d for d in scene_dir.iterdir()
@@ -378,22 +378,41 @@ class VLNSlidingWindowDataset(Dataset):
                     for clip_dir in clip_dirs
                     if self._numeric_clip_id(clip_dir) <= self.max_clip_id
                 ]
-            clips.extend(clip_dirs)
+            if clip_dirs:
+                clips_by_scene.append(clip_dirs)
+
+        clips = [clip for scene_clips in clips_by_scene for clip in scene_clips]
 
         if len(clips) == 0:
             raise FileNotFoundError(f"No clips found in {search_dir} (split={self.split})")
 
         if self.max_clips > 0 and len(clips) > self.max_clips:
             original_clip_count = len(clips)
-            clips = clips[: self.max_clips]
+            selected: list[Path] = []
+            round_index = 0
+            while len(selected) < self.max_clips:
+                added = False
+                for scene_clips in clips_by_scene:
+                    if round_index < len(scene_clips):
+                        selected.append(scene_clips[round_index])
+                        added = True
+                        if len(selected) == self.max_clips:
+                            break
+                if not added:
+                    break
+                round_index += 1
+            clips = selected
             logger.info(
-                "Limiting dataset clips: %d/%d clips (split=%s)",
+                "Limiting dataset clips scene-round-robin: %d/%d clips "
+                "across %d scenes (split=%s)",
                 len(clips),
                 original_clip_count,
+                len({clip.parent.name for clip in clips}),
                 self.split,
             )
 
-        logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
+        selected_scene_count = len({clip.parent.name for clip in clips})
+        logger.info(f"Found {len(clips)} clips in {selected_scene_count} scenes")
         return clips
 
     @staticmethod

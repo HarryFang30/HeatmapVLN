@@ -567,6 +567,7 @@ class NextDiTActionHead(nn.Module):
         num_inference_steps: int,
         num_sample_trajs: int,
         generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         device = latents_cond.device
         dtype = latents_cond.dtype
@@ -578,12 +579,29 @@ class NextDiTActionHead(nn.Module):
         hidden_states_input = hidden_states_input.repeat_interleave(num_sample_trajs, dim=0)
 
         # Initialize random noise
-        traj_latents = randn_tensor(
-            shape=(batch_size * num_sample_trajs, predict_step_nums, self.config.action_dim),
-            generator=generator,
-            device=device,
-            dtype=dtype,
+        expected_noise_shape = (
+            batch_size * num_sample_trajs,
+            predict_step_nums,
+            self.config.action_dim,
         )
+        if initial_noise is None:
+            traj_latents = randn_tensor(
+                shape=expected_noise_shape,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            if tuple(initial_noise.shape) != expected_noise_shape:
+                raise ValueError(
+                    f"initial_noise must be {expected_noise_shape}, got "
+                    f"{tuple(initial_noise.shape)}"
+                )
+            if not initial_noise.is_floating_point() or not torch.isfinite(
+                initial_noise
+            ).all():
+                raise ValueError("initial_noise must be finite floating point")
+            traj_latents = initial_noise.to(device=device, dtype=dtype).clone()
 
         # Reuse the existing noise scheduler to avoid repeated allocations.
         # Reset timesteps for inference (training config is preserved after this call).
@@ -631,6 +649,7 @@ class NextDiTActionHead(nn.Module):
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
         generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Generate trajectory via iterative flow matching denoising with CFG.
@@ -654,6 +673,7 @@ class NextDiTActionHead(nn.Module):
             num_inference_steps=num_inference_steps,
             num_sample_trajs=num_sample_trajs,
             generator=generator,
+            initial_noise=initial_noise,
         )
 
     @torch.no_grad()
@@ -666,6 +686,7 @@ class NextDiTActionHead(nn.Module):
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
         generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate trajectories from pre-projected NextDiT condition tokens."""
         latents_cond = self._fuse_projected_conditions(traj_cond, traj_images)
@@ -676,6 +697,7 @@ class NextDiTActionHead(nn.Module):
             num_inference_steps=num_inference_steps,
             num_sample_trajs=num_sample_trajs,
             generator=generator,
+            initial_noise=initial_noise,
         )
 
     @torch.no_grad()
@@ -685,6 +707,7 @@ class NextDiTActionHead(nn.Module):
         traj_images: torch.Tensor | None = None,
         *,
         generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         High-level trajectory inference interface.
@@ -701,6 +724,7 @@ class NextDiTActionHead(nn.Module):
             num_inference_steps=self.config.num_inference_steps,
             num_sample_trajs=self.config.num_sample_trajs,
             generator=generator,
+            initial_noise=initial_noise,
         )
 
     @torch.no_grad()
@@ -710,6 +734,7 @@ class NextDiTActionHead(nn.Module):
         traj_images: torch.Tensor | None = None,
         *,
         generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """High-level inference interface for direct 768-dim conditions."""
         self.eval()
@@ -721,4 +746,5 @@ class NextDiTActionHead(nn.Module):
             num_inference_steps=self.config.num_inference_steps,
             num_sample_trajs=self.config.num_sample_trajs,
             generator=generator,
+            initial_noise=initial_noise,
         )

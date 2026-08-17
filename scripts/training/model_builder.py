@@ -44,6 +44,8 @@ def build_model(
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
     pano_adapter_cfg = nextdit_cfg.get('pano_latent_adapter', {})
+    past_plan_action_cfg = nextdit_cfg.get('past_plan_action', {})
+    stop_head_cfg = model_cfg.get('stop_head', {})
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
 
@@ -98,6 +100,18 @@ def build_model(
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
         heatmap_decoder_mode=heatmap_cfg.get('decoder_mode', 'legacy'),
         heatmap_pose_free_config=heatmap_cfg.get('pose_free', None),
+        heatmap_restore_vit_spatial_layout=heatmap_cfg.get(
+            'restore_vit_spatial_layout',
+            False,
+        ),
+        heatmap_coarse_logit_residual=heatmap_cfg.get(
+            'coarse_logit_residual',
+            False,
+        ),
+        heatmap_joint_panorama_inference=heatmap_cfg.get(
+            'joint_panorama_inference',
+            False,
+        ),
 
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
@@ -132,6 +146,19 @@ def build_model(
         pano_latent_adapter_dropout=pano_adapter_cfg.get('dropout', 0.0),
         pano_latent_adapter_checkpoint_path=pano_adapter_cfg.get('pretrained_path', ''),
         pano_latent_adapter_strict_load=pano_adapter_cfg.get('strict_load', True),
+
+        past_plan_action_enabled=past_plan_action_cfg.get('enabled', False),
+        past_plan_action_plan_dim=past_plan_action_cfg.get('plan_dim', 768),
+        past_plan_action_memory_dim=past_plan_action_cfg.get('memory_dim', 256),
+        past_plan_action_bridge_heads=past_plan_action_cfg.get('bridge_heads', 8),
+
+        stop_head_enabled=stop_head_cfg.get('enabled', False),
+        stop_head_hidden_dim=stop_head_cfg.get('hidden_dim', 512),
+        stop_head_dropout=stop_head_cfg.get('dropout', 0.1),
+        stop_head_focal_gamma=stop_head_cfg.get('focal_gamma', 2.0),
+        stop_head_focal_alpha=stop_head_cfg.get('focal_alpha', 0.5),
+        stop_head_pos_weight=stop_head_cfg.get('pos_weight', 1.0),
+        stop_head_bce_mix=stop_head_cfg.get('bce_mix', 0.5),
 
         verbose=verbose,
     )
@@ -259,6 +286,12 @@ _NEXTDIT_SUBMODULES = {
 _BRIDGE_ONLY_MODULES = {'latent_queries', 'cond_projector'}
 
 
+def _matches_exact_or_dotted_prefix(name: str, prefix: str) -> bool:
+    """Match a leaf exactly or descendants of a module prefix only."""
+
+    return name == prefix or (prefix.endswith('.') and name.startswith(prefix))
+
+
 def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
     summary: dict[str, int] = {}
     for name, param in model.named_parameters():
@@ -266,6 +299,9 @@ def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
             continue
         if name == 'latent_queries':
             group = 'latent_queries'
+        elif name.startswith('past_plan_action.'):
+            parts = name.split('.')
+            group = '.'.join(parts[:2])
         elif name.startswith('pano_latent_adapter.'):
             group = 'pano_latent_adapter'
         elif name.startswith('nextdit_action_head.'):
@@ -287,6 +323,31 @@ def _is_allowed_trainable_name(name: str, trainable_modules: set[str]) -> bool:
         return True
     if 'pano_latent_adapter' in trainable_modules and name.startswith('pano_latent_adapter.'):
         return True
+    if 'stop_head' in trainable_modules and name.startswith('stop_head.'):
+        return True
+    if (
+        'future_heatmap_head' in trainable_modules
+        and name.startswith('past_plan_action.future_head.')
+    ):
+        return True
+    if (
+        'past_plan_bridge' in trainable_modules
+        and name.startswith('past_plan_action.bridge.')
+    ):
+        return True
+    if 'heatmap_memory_and_decoder' in trainable_modules:
+        return any(
+            _matches_exact_or_dotted_prefix(name, prefix)
+            for prefix in (
+                'heatmap_vln.coarse.proj_history.',
+                'heatmap_vln.coarse.proj_traj.',
+                'heatmap_vln.coarse.pos_embed',
+                'heatmap_vln.coarse.self_attn.',
+                'heatmap_vln.coarse.heatmap_head.',
+                'heatmap_vln.coarse.vis_head.',
+                'heatmap_vln.fine.',
+            )
+        )
     if 'nextdit_action_head' in trainable_modules and name.startswith('nextdit_action_head.'):
         return True
     for cfg_name, attr_name in _NEXTDIT_SUBMODULES.items():
@@ -333,6 +394,47 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
 
     trainable = stage_cfg.get('trainable_modules', [])
 
+    ppa_stage = stage_cfg.get('past_plan_action_stage')
+    if ppa_stage is not None:
+        chain = getattr(model, 'past_plan_action', None)
+        past_head = getattr(model, 'heatmap_vln', None)
+        action_head = getattr(model, 'nextdit_action_head', None)
+        if chain is None or past_head is None or action_head is None:
+            raise RuntimeError(
+                "Past→Plan→Action stage requires model.past_plan_action, "
+                "heatmap_vln, and nextdit_action_head"
+            )
+        from src.models.past_plan_action_training import (
+            configure_past_plan_action_stage,
+        )
+
+        audit = configure_past_plan_action_stage(
+            stage=ppa_stage,
+            chain=chain,
+            past_head=past_head,
+            native_action_head=action_head,
+            native_cond_projector=action_head.cond_projector,
+            other_frozen_modules=tuple(
+                module
+                for module in (
+                    getattr(model, 'vlm_backbone', None),
+                    getattr(model, 'llm_projector', None),
+                )
+                if module is not None
+            ),
+        )
+        logger.info(
+            "  ✓ Past→Plan→Action %s scope: %d tensors / %s parameters",
+            ppa_stage,
+            audit.trainable_tensors,
+            f"{audit.trainable_parameters:,}",
+        )
+        summary = _trainable_summary(model)
+        for group, count in sorted(summary.items()):
+            logger.info("    - %s: %s params", group, f"{count:,}")
+        _assert_trainable_scope(model, stage_cfg, logger)
+        return
+
     if 'heatmap_vln' in trainable and hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
         if model.heatmap_vln.pose_free_matcher is not None:
             freeze_module(model.heatmap_vln.pose_free_matcher, freeze=False)
@@ -362,6 +464,12 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     ):
         freeze_module(model.pano_latent_adapter, freeze=False)
         logger.info("  ✓ Unfrozen: pano_latent_adapter")
+
+    if 'stop_head' in trainable:
+        if getattr(model, 'stop_head', None) is None:
+            raise RuntimeError("stop_head is trainable but model.stop_head is disabled")
+        freeze_module(model.stop_head, freeze=False)
+        logger.info("  ✓ Unfrozen: System2 STOP head")
 
     # Fine-grained NextDiT sub-module unfreezing.
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:

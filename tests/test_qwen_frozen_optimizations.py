@@ -80,6 +80,45 @@ class _NoLastHiddenWrapper(nn.Module):
         self.model = _NoLastHiddenModel()
 
 
+class _LastHiddenModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = nn.Identity()
+        self.output_hidden_states_calls = []
+
+    def forward(self, input_ids, output_hidden_states, **_kwargs):
+        self.output_hidden_states_calls.append(output_hidden_states)
+        hidden = torch.ones((*input_ids.shape, 8), device=input_ids.device)
+        return SimpleNamespace(last_hidden_state=hidden, hidden_states=None)
+
+
+class _LastHiddenWrapper(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = _LastHiddenModel()
+
+
+def test_stop_features_use_inner_model_last_hidden_without_all_layers():
+    integration = Qwen2_5VLIntegration(Qwen2_5VLConfig(device="cpu"))
+    wrapper = _LastHiddenWrapper()
+    integration.model = wrapper
+    integration._model_loaded = True
+    integration.image_token_id = 999
+
+    hidden, vision, _n_img, _traj, _loss = integration._forward_model_inputs(
+        {"input_ids": torch.tensor([[11, 12, 13]])},
+        return_hidden_states=True,
+        skip_lm_head=True,
+        return_last_hidden_state_only=True,
+        extract_vision_hidden_states=False,
+    )
+
+    assert wrapper.model.output_hidden_states_calls == [False]
+    assert hidden.shape == (1, 3, 8)
+    assert hidden.is_inference()
+    assert vision is None
+
+
 def test_last_hidden_only_falls_back_to_hidden_state_tuple():
     integration = Qwen2_5VLIntegration(
         Qwen2_5VLConfig(
@@ -199,9 +238,48 @@ def test_correct_label_logprobs_use_sparse_predictor_union_and_fp32():
     assert lm_output["alignment"]["sample_correct_token_ids"] == [[2, 1], [0, 3]]
     assert lm_output["alignment"]["backend"] == ("hf_logits_to_keep_tensor_predictor_union_v1")
     assert lm_output["correct_label_logprobs"].dtype == torch.float32
+    assert lm_output["correct_label_rejection_log_odds"].dtype == torch.float32
     token_logits = torch.arange(5, dtype=torch.float32).square()
-    expected = F.log_softmax(token_logits, dim=-1)[torch.tensor([2, 1, 0, 3])]
+    correct_ids = torch.tensor([2, 1, 0, 3])
+    expected = F.log_softmax(token_logits, dim=-1)[correct_ids]
     torch.testing.assert_close(lm_output["correct_label_logprobs"], expected)
+    expected_log_odds = []
+    for token_id in correct_ids.tolist():
+        competing = token_logits.clone()
+        competing[token_id] = float("-inf")
+        expected_log_odds.append(token_logits[token_id] - torch.logsumexp(competing, dim=0))
+    torch.testing.assert_close(
+        lm_output["correct_label_rejection_log_odds"],
+        torch.stack(expected_log_odds),
+    )
+
+
+def test_correct_label_forward_can_return_aligned_structured_class_logits():
+    integration = Qwen2_5VLIntegration(Qwen2_5VLConfig(device="cpu"))
+    model = _SparseCorrectLogitModel()
+    integration.model = model
+    integration._model_loaded = True
+    integration.image_token_id = 999
+    input_ids = torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]])
+    labels = torch.tensor(
+        [
+            [-100, -100, 4, 1, -100, -100],
+            [-100, 0, -100, -100, -100, 4],
+        ]
+    )
+
+    _hidden, _vision, _n_img, _traj, lm_output = integration._forward_model_inputs(
+        {"input_ids": input_ids, "labels": labels},
+        return_hidden_states=False,
+        return_lm_correct_logprobs=True,
+        structured_class_token_ids=(0, 1, 2, 3),
+    )
+
+    assert lm_output["structured_class_targets"] == [1, 0]
+    assert lm_output["structured_class_logits"].dtype == torch.float32
+    token_logits = torch.arange(5, dtype=torch.float32).square()
+    expected = torch.stack((2.0 + token_logits[:4], 1.0 + token_logits[:4]))
+    torch.testing.assert_close(lm_output["structured_class_logits"], expected)
 
 
 class _LegacyTrackingLMHead(nn.Module):
@@ -288,6 +366,44 @@ def _legacy_sparse_fixture(*, raise_after_lm_head=False):
         ),
     }
     return integration, conditional, inputs
+
+
+def test_stop_features_bypass_physical_peft_lm_head_without_all_layers():
+    integration, conditional, inputs = _legacy_sparse_fixture()
+    original_lm_head = conditional.lm_head
+
+    hidden, vision, _n_img, _traj, _loss = integration._forward_model_inputs(
+        {"input_ids": inputs["input_ids"]},
+        return_hidden_states=True,
+        skip_lm_head=True,
+        return_last_hidden_state_only=True,
+        extract_vision_hidden_states=False,
+    )
+
+    assert hidden.shape == (2, 6, 2)
+    assert vision is None
+    assert original_lm_head.input_shapes == []
+    assert conditional.lm_head is original_lm_head
+    expected_first = torch.arange(6, dtype=torch.float32)
+    torch.testing.assert_close(hidden[0, :, 0], expected_first)
+
+
+def test_physical_lm_head_is_restored_when_bypassed_forward_raises():
+    integration, conditional, inputs = _legacy_sparse_fixture(
+        raise_after_lm_head=True,
+    )
+    original_lm_head = conditional.lm_head
+
+    with pytest.raises(RuntimeError, match="legacy forward failed"):
+        integration._forward_model_inputs(
+            {"input_ids": inputs["input_ids"]},
+            return_hidden_states=True,
+            skip_lm_head=True,
+            return_last_hidden_state_only=True,
+            extract_vision_hidden_states=False,
+        )
+
+    assert conditional.lm_head is original_lm_head
 
 
 def test_legacy_qwen_uses_lm_head_pre_hook_sparsely_and_preserves_gradient():

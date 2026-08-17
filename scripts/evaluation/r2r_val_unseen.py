@@ -146,6 +146,11 @@ if not hasattr(np, "bool"):
 # Import torch before habitat_sim (habitat_sim pulls torch during its __init__).
 import torch as _torch_preload  # noqa: F401
 
+from scripts.evaluation.episode_cohort import (
+    load_episode_cohort,
+    restrict_habitat_env_to_episode_keys,
+)
+
 
 LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
 LOCAL_VLNCE_DATA_ROOT = Path(
@@ -329,6 +334,7 @@ from scripts.evaluation.closed_loop_guard import (
     STOP_PROBE,
     ClosedLoopGuard,
     ClosedLoopGuardConfig,
+    should_trust_temporal_terminal,
 )
 from scripts.evaluation.navigation_metrics import aggregate_navigation_metrics
 from scripts.evaluation.rpc_protocol import (
@@ -340,6 +346,21 @@ from scripts.evaluation.rpc_protocol import (
     build_rpc_sampling_metadata,
     validate_rpc_progress_sampling_contract,
     validate_rpc_sampling_metadata,
+)
+from scripts.evaluation.stop_dagger import (
+    BoundaryProbeSweepState,
+    HistoricalFalseStopTrigger,
+    OracleRecoveryState,
+    parse_historical_false_stop_trigger,
+    prune_stop_collection_jsonl_for_resume,
+    should_finish_oracle_recovery_collection,
+    should_force_continue_negative,
+    should_record_stop_multimodal_example,
+    validate_boundary_probe_collection,
+    validate_historical_false_stop_source,
+    validate_oracle_path_collection,
+    validate_oracle_recovery_actions_per_call,
+    validate_oracle_recovery_collection,
 )
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
@@ -741,9 +762,24 @@ def _closed_loop_guard_config(args) -> ClosedLoopGuardConfig:
         )
     if int(args.closed_loop_recovery_history_keep) < 0:
         raise ValueError("closed_loop_recovery_history_keep must be >= 0")
+    recovery_actions = (
+        int(args.closed_loop_recovery_turns)
+        + int(args.closed_loop_recovery_forward_steps)
+    )
+    if recovery_actions > MAX_STEPS:
+        raise ValueError(
+            f"closed-loop recovery actions must be <= {MAX_STEPS}, got {recovery_actions}"
+        )
     return ClosedLoopGuardConfig(
         action_chunk_size=action_chunk_size,
         stop_confirmations=int(args.system2_stop_confirmations),
+        stop_confirmation_max_gap_calls=int(
+            args.system2_stop_confirmation_max_gap_calls
+        ),
+        stop_confirmation_view_sweep=bool(
+            args.system2_stop_confirmation_view_sweep
+        ),
+        stop_high_confidence_threshold=args.system2_stop_high_confidence_threshold,
         stop_probe_turn=str(args.system2_stop_probe_turn),
         loop_guard_enabled=bool(args.closed_loop_guard),
         collision_epsilon_m=float(args.closed_loop_collision_epsilon_m),
@@ -756,6 +792,8 @@ def _closed_loop_guard_config(args) -> ClosedLoopGuardConfig:
         plan_min_path_m=float(args.closed_loop_plan_min_path_m),
         plan_max_net_m=float(args.closed_loop_plan_max_net_m),
         recovery_turns=int(args.closed_loop_recovery_turns),
+        recovery_forward_steps=int(args.closed_loop_recovery_forward_steps),
+        recovery_follow_last_turn=bool(args.closed_loop_recovery_follow_last_turn),
         recovery_cooldown_steps=int(args.closed_loop_recovery_cooldown_steps),
     )
 
@@ -1241,13 +1279,7 @@ def _load_closed_loop_progress_totals(progress_file: str) -> tuple[int, int]:
 
 def _load_episode_list(path: str) -> tuple[list[tuple[str, int]], set[tuple[str, int]]]:
     """Load fixed (scene_id, episode_id) pairs for apples-to-apples comparison."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    episodes = data.get("episodes", data)
-    if not isinstance(episodes, list) or not episodes:
-        raise ValueError(f"episode_list must contain a non-empty 'episodes' array: {path}")
-    keys: list[tuple[str, int]] = []
-    for item in episodes:
-        keys.append((str(item["scene_id"]), int(item["episode_id"])))
+    keys, _ = load_episode_cohort(path)
     return keys, set(keys)
 
 
@@ -1256,6 +1288,16 @@ def _episode_list_from_args(args) -> tuple[list[tuple[str, int]] | None, set[tup
     if not path:
         return None, None
     return _load_episode_list(path)
+
+
+def _episode_metadata_from_args(
+    args,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    path = getattr(args, "episode_list", None)
+    if not path:
+        return {}
+    _, metadata = load_episode_cohort(path)
+    return metadata
 
 
 def _eval_limit(
@@ -1491,12 +1533,19 @@ def _sample_history_panoramas(
     num_history: int,
 ) -> list[dict[str, Image.Image]]:
     """Sample prompt history without mutating the full executed trajectory."""
-    if num_history <= 0:
-        return []
-    if len(history_panoramas) <= num_history:
-        return list(history_panoramas)
-    indices = np.unique(np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)).tolist()
+    indices = _sample_history_indices(len(history_panoramas), num_history)
     return [history_panoramas[i] for i in indices]
+
+
+def _sample_history_indices(available: int, num_history: int) -> list[int]:
+    """Return the exact RPC history indices used by the System2 prompt."""
+    if available <= 0 or num_history <= 0:
+        return []
+    if available <= num_history:
+        return list(range(available))
+    return np.unique(
+        np.linspace(0, available - 1, num_history, dtype=np.int32)
+    ).tolist()
 
 
 def _condition_output_ids_for_pixel_goal(
@@ -1604,6 +1653,28 @@ def _metric_distance_to_goal(env) -> float | None:
     return distance if np.isfinite(distance) else None
 
 
+def _system2_stop_rollout_label(
+    distance_to_goal_m: float,
+    *,
+    positive_radius_m: float,
+    negative_radius_m: float,
+) -> int | None:
+    """Map geodesic distance to a STOP label with an ignored margin."""
+    distance = float(distance_to_goal_m)
+    if not np.isfinite(distance) or distance < 0.0:
+        raise ValueError(f"Invalid distance_to_goal for STOP collection: {distance}")
+    if not 0.0 < positive_radius_m < negative_radius_m:
+        raise ValueError(
+            "STOP collection radii must satisfy 0 < positive < negative, got "
+            f"{positive_radius_m}, {negative_radius_m}"
+        )
+    if distance <= positive_radius_m:
+        return 1
+    if distance >= negative_radius_m:
+        return 0
+    return None
+
+
 def _debug_input_trace_enabled(args) -> bool:
     return bool(getattr(args, "debug_input_trace", True))
 
@@ -1671,6 +1742,211 @@ def _maybe_save_debug_images(
 
 
 # ── Trajectory Step Recorder (for offline HTML visualisation) ──────────
+
+
+STOP_MULTIMODAL_EXAMPLE_SCHEMA = "heatmapvln-system2-stop-multimodal-example-v1"
+
+
+class System2StopMultimodalRecorder:
+    """Persist exact train-split System2 prompt images for offline LoRA training."""
+
+    _VIEWS = ("front", "right", "back", "left")
+
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        dataset_split: str,
+        jpeg_quality: int,
+        regular_min_stop_log_odds: float | None = None,
+    ) -> None:
+        if dataset_split != "train":
+            raise ValueError(
+                "Multimodal STOP examples may only be collected from the train split"
+            )
+        if not 1 <= int(jpeg_quality) <= 100:
+            raise ValueError(f"Invalid multimodal STOP JPEG quality: {jpeg_quality}")
+        self.output_dir = Path(output_dir)
+        self.examples_dir = self.output_dir / "system2_stop_multimodal_examples"
+        self.examples_dir.mkdir(parents=True, exist_ok=True)
+        self.labels_path = self.output_dir / "system2_stop_multimodal_examples.jsonl"
+        self.dataset_split = dataset_split
+        self.jpeg_quality = int(jpeg_quality)
+        if regular_min_stop_log_odds is not None and not math.isfinite(
+            float(regular_min_stop_log_odds)
+        ):
+            raise ValueError("Multimodal regular-negative threshold must be finite")
+        self.regular_min_stop_log_odds = (
+            float(regular_min_stop_log_odds)
+            if regular_min_stop_log_odds is not None
+            else None
+        )
+        self.considered = 0
+        self.recorded = 0
+        self.skipped = 0
+        self.provenance_fallbacks = 0
+        self._recorded_episode_keys: set[tuple[str, int]] = set()
+        self.collection_namespace = hashlib.sha256(
+            str(self.output_dir.expanduser().resolve()).encode("utf-8")
+        ).hexdigest()[:12]
+
+    def _key(
+        self,
+        scene_id: str,
+        episode_id: int,
+        call_index: int,
+        protocol_seed: int,
+    ) -> str:
+        return (
+            f"src{self.collection_namespace}_{scene_id}_ep{int(episode_id):06d}_"
+            f"call{int(call_index):05d}_seed{int(protocol_seed)}"
+        )
+
+    def _view_paths(
+        self,
+        scene_id: str,
+        episode_id: int,
+        call_index: int,
+        protocol_seed: int,
+    ) -> dict[str, str]:
+        key = self._key(scene_id, episode_id, call_index, protocol_seed)
+        return {
+            view: str(Path("system2_stop_multimodal_examples") / key / f"{view}.jpg")
+            for view in self._VIEWS
+        }
+
+    def _history_view_paths(self, key: str, history_index: int) -> dict[str, str]:
+        return {
+            view: str(
+                Path("system2_stop_multimodal_examples")
+                / key
+                / f"history_{int(history_index):02d}_{view}.jpg"
+            )
+            for view in self._VIEWS
+        }
+
+    def _write_views(
+        self,
+        relative_paths: dict[str, str],
+        images: dict[str, Image.Image],
+        *,
+        key: str,
+    ) -> None:
+        from vla_rpc.core.image import encode_rgb_to_jpeg
+
+        for view in self._VIEWS:
+            image = images.get(view)
+            if not isinstance(image, Image.Image):
+                raise ValueError(f"Missing {view!r} image for STOP example {key}")
+            array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            jpeg = encode_rgb_to_jpeg(array, quality=self.jpeg_quality)
+            destination = self.output_dir / relative_paths[view]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+            with temporary.open("wb") as handle:
+                handle.write(jpeg)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+
+    def record(
+        self,
+        *,
+        scene_id: str,
+        episode_id: int,
+        system2_call_index: int,
+        protocol_seed: int,
+        instruction: str,
+        current_views: dict[str, Image.Image],
+        history_views: list[dict[str, Image.Image]],
+        history_source_indices: list[int],
+        distance_to_goal_m: float,
+        stop_target: int | None,
+        response: dict[str, Any],
+        image_size: tuple[int, int],
+        oracle_recovery_active: bool,
+    ) -> dict[str, Any] | None:
+        self.considered += 1
+        stop_policy = response.get("system2_stop_head")
+        original_output = (
+            stop_policy.get("original_output")
+            if isinstance(stop_policy, dict) and stop_policy.get("original_output")
+            else response.get("llm_output", "")
+        )
+        original_terminal = bool(_vlm_requests_stop(str(original_output)))
+        decision_scores = response.get("system2_decision_scores")
+        stop_log_odds = (
+            decision_scores.get("stop_log_odds")
+            if isinstance(decision_scores, dict)
+            else None
+        )
+        episode_key = (str(scene_id), int(episode_id))
+        episode_has_record = episode_key in self._recorded_episode_keys
+        if not should_record_stop_multimodal_example(
+            rollout_label=stop_target,
+            original_terminal=original_terminal,
+            stop_log_odds=stop_log_odds,
+            regular_min_stop_log_odds=self.regular_min_stop_log_odds,
+            episode_has_record=episode_has_record,
+        ):
+            self.skipped += 1
+            return None
+        episode_provenance_fallback = bool(
+            self.regular_min_stop_log_odds is not None
+            and not episode_has_record
+            and stop_target == 0
+            and not original_terminal
+            and float(stop_log_odds) <= self.regular_min_stop_log_odds
+        )
+
+        key = self._key(scene_id, episode_id, system2_call_index, protocol_seed)
+        relative_views = self._view_paths(
+            scene_id, episode_id, system2_call_index, protocol_seed
+        )
+        self._write_views(relative_views, current_views, key=key)
+        relative_history_views = []
+        for history_index, images in enumerate(history_views):
+            paths = self._history_view_paths(key, history_index)
+            self._write_views(paths, images, key=f"{key}/history_{history_index:02d}")
+            relative_history_views.append(paths)
+        row = {
+            "schema": STOP_MULTIMODAL_EXAMPLE_SCHEMA,
+            "key": key,
+            "dataset_split": self.dataset_split,
+            "scene_id": str(scene_id),
+            "episode_id": int(episode_id),
+            "system2_call_index": int(system2_call_index),
+            "protocol_seed": int(protocol_seed),
+            "collection_namespace": self.collection_namespace,
+            "instruction": str(instruction),
+            "distance_to_goal_m": float(distance_to_goal_m),
+            "stop_target": int(stop_target) if stop_target in (0, 1) else None,
+            "original_terminal": original_terminal,
+            "original_output": str(original_output),
+            "effective_output": str(response.get("llm_output", "")),
+            "system2_decision_scores": response.get("system2_decision_scores"),
+            "system2_stop_policy": stop_policy,
+            "deterministic_sampling": response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+            "current_views": relative_views,
+            "history_source_buffer_indices": [
+                int(index) for index in history_source_indices
+            ],
+            "history_views": relative_history_views,
+            "image_size": [int(image_size[0]), int(image_size[1])],
+            "jpeg_quality": self.jpeg_quality,
+            "oracle_recovery_active": bool(oracle_recovery_active),
+            "privileged_offline_label": True,
+            "regular_min_stop_log_odds": self.regular_min_stop_log_odds,
+            "episode_provenance_fallback": episode_provenance_fallback,
+        }
+        with self.labels_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._recorded_episode_keys.add(episode_key)
+        self.recorded += 1
+        self.provenance_fallbacks += int(episode_provenance_fallback)
+        return row
 
 
 class TrajectoryStepRecorder:
@@ -2340,7 +2616,9 @@ def _run_eval_panoramic_vlm(
 
     target_list, target_set = _episode_list_from_args(args)
     if target_list is not None:
+        selected = restrict_habitat_env_to_episode_keys(env, target_list)
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
+        print(f"Restricted Habitat iterator to {len(selected)} requested episodes")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
     print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
@@ -3351,6 +3629,27 @@ def _build_oracle_system2_from_reference_path(
     }
 
 
+def _next_shortest_path_recovery_action(
+    follower: Any,
+    goal_position: Any,
+) -> tuple[int, bool]:
+    """Return one privileged recovery action, probing in place at the goal."""
+    action = follower.get_next_action(np.asarray(goal_position, dtype=np.float32))
+    if action is None:
+        raise RuntimeError("Habitat shortest-path follower returned no recovery action")
+    action = int(action)
+    if action == int(ActionCode.STOP):
+        return int(ActionCode.LEFT), True
+    valid_actions = {
+        int(ActionCode.FORWARD),
+        int(ActionCode.LEFT),
+        int(ActionCode.RIGHT),
+    }
+    if action not in valid_actions:
+        raise RuntimeError(f"Invalid Habitat shortest-path recovery action: {action}")
+    return action, False
+
+
 def _rpc_plan_panoramic(
     client,
     *,
@@ -3371,6 +3670,7 @@ def _rpc_plan_panoramic(
     protocol_seed: int,
     require_deterministic_sampling: bool,
     oracle_system2: dict[str, Any] | None = None,
+    force_non_stop: bool = False,
 ) -> dict:
     blobs = []
     for view in ("front", "right", "back", "left"):
@@ -3400,6 +3700,8 @@ def _rpc_plan_panoramic(
     }
     if oracle_system2 is not None:
         payload["oracle_system2"] = oracle_system2
+    if force_non_stop:
+        payload["system2_force_non_stop"] = True
     result = client.infer_json("plan_panoramic", payload, blobs)
     if result is None:
         raise RuntimeError("RPC model server returned no response")
@@ -3452,8 +3754,17 @@ def run_eval_rpc_panoramic(args):
         "closed_loop_policy="
         f"action_chunk={guard_config.action_chunk_size} "
         f"stop_confirmations={guard_config.stop_confirmations} "
+        "stop_confirmation_max_gap_calls="
+        f"{guard_config.stop_confirmation_max_gap_calls} "
+        "stop_confirmation_view_sweep="
+        f"{guard_config.stop_confirmation_view_sweep} "
+        "stop_high_confidence_threshold="
+        f"{guard_config.stop_high_confidence_threshold} "
         f"stop_probe_turn={guard_config.stop_probe_turn} "
-        f"loop_guard={guard_config.loop_guard_enabled}"
+        f"loop_guard={guard_config.loop_guard_enabled} "
+        f"recovery_turns={guard_config.recovery_turns} "
+        f"recovery_forward_steps={guard_config.recovery_forward_steps} "
+        f"recovery_follow_last_turn={guard_config.recovery_follow_last_turn}"
     )
     print(
         "rpc_sampling="
@@ -3492,7 +3803,156 @@ def run_eval_rpc_panoramic(args):
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
+    collect_stop_features = bool(args.collect_system2_stop_features)
+    collect_stop_multimodal = bool(args.collect_system2_stop_multimodal_examples)
+    dataset_split = Path(args.data_path).parent.name
+    if collect_stop_multimodal and not collect_stop_features:
+        raise ValueError(
+            "--collect_system2_stop_multimodal_examples requires "
+            "--collect_system2_stop_features"
+        )
+    if collect_stop_multimodal and dataset_split != "train":
+        raise ValueError(
+            "Multimodal STOP collection is train-split only; "
+            f"got dataset split {dataset_split!r}"
+        )
+    force_continue_stop_negatives = bool(
+        args.system2_stop_collect_force_continue_negatives
+    )
+    oracle_recovery_after_negative = validate_oracle_recovery_collection(
+        collection_enabled=collect_stop_features,
+        force_continue_negatives=force_continue_stop_negatives,
+        oracle_recovery_after_negative=bool(
+            args.system2_stop_collect_oracle_recovery_after_negative
+        ),
+    )
+    oracle_path_from_start = validate_oracle_path_collection(
+        collection_enabled=collect_stop_features,
+        force_continue_negatives=force_continue_stop_negatives,
+        oracle_path_from_start=bool(
+            args.system2_stop_collect_oracle_path_from_start
+        ),
+    )
+    if oracle_path_from_start and oracle_recovery_after_negative:
+        raise ValueError(
+            "Oracle path-from-start and recovery-after-negative modes are mutually exclusive"
+        )
+    boundary_probe_sweep = validate_boundary_probe_collection(
+        collection_enabled=collect_stop_features,
+        force_continue_negatives=force_continue_stop_negatives,
+        oracle_path_from_start=oracle_path_from_start,
+        boundary_probe_sweep=bool(args.system2_stop_collect_boundary_probe_sweep),
+        min_distance_m=float(args.system2_stop_boundary_probe_min_distance_m),
+        max_distance_m=float(args.system2_stop_boundary_probe_max_distance_m),
+        probes=int(args.system2_stop_boundary_probe_views),
+    )
+    oracle_recovery_from_cohort_triggers = bool(
+        args.system2_stop_oracle_recovery_from_cohort_triggers
+    )
+    if oracle_recovery_from_cohort_triggers and not oracle_recovery_after_negative:
+        raise ValueError(
+            "Cohort-triggered oracle recovery requires the complete privileged "
+            "STOP recovery collection mode"
+        )
+    should_force_continue_negative(
+        collection_enabled=collect_stop_features,
+        force_continue_negatives=force_continue_stop_negatives,
+        terminal=False,
+        rollout_label=None,
+    )
+    should_finish_oracle_recovery_collection(
+        goal_probe_count=0,
+        max_goal_probes=int(args.system2_stop_oracle_recovery_goal_probes),
+    )
+    oracle_recovery_actions_per_call = validate_oracle_recovery_actions_per_call(
+        args.system2_stop_oracle_recovery_actions_per_call
+    )
+    stop_feature_labels_path = Path(output_path) / "system2_stop_rollout_labels.jsonl"
+    stop_multimodal_labels_path = (
+        Path(output_path) / "system2_stop_multimodal_examples.jsonl"
+    )
+    stop_multimodal_recorder = None
+    if collect_stop_features:
+        if not bool(args.rpc_require_deterministic_sampling):
+            raise ValueError(
+                "--collect_system2_stop_features requires "
+                "--rpc_require_deterministic_sampling"
+            )
+        if not (
+            0.0
+            < float(args.system2_stop_positive_radius_m)
+            < float(args.system2_stop_negative_radius_m)
+        ):
+            raise ValueError(
+                "System2 STOP collection requires 0 < positive radius < negative radius"
+            )
+        if args.overwrite_output and stop_feature_labels_path.exists():
+            stop_feature_labels_path.unlink()
+        elif stop_feature_labels_path.exists() and not args.resume:
+            raise FileExistsError(
+                f"Found existing STOP rollout labels: {stop_feature_labels_path}"
+            )
+        if collect_stop_multimodal:
+            if args.overwrite_output and stop_multimodal_labels_path.exists():
+                stop_multimodal_labels_path.unlink()
+            elif stop_multimodal_labels_path.exists() and not args.resume:
+                raise FileExistsError(
+                    "Found existing multimodal STOP rollout labels: "
+                    f"{stop_multimodal_labels_path}"
+                )
+            stop_multimodal_recorder = System2StopMultimodalRecorder(
+                Path(output_path),
+                dataset_split=dataset_split,
+                jpeg_quality=int(args.rpc_jpeg_quality),
+                regular_min_stop_log_odds=(
+                    float(args.system2_stop_multimodal_regular_min_stop_log_odds)
+                    if args.system2_stop_multimodal_regular_min_stop_log_odds
+                    is not None
+                    else None
+                ),
+            )
+        print(
+            "WARNING: privileged System2 STOP feature collection is ACTIVE; "
+            "distance-to-goal is written only as an offline training label and "
+            "must not be used by the navigation policy. "
+            f"force_continue_negatives={force_continue_stop_negatives} "
+            f"oracle_recovery_after_negative={oracle_recovery_after_negative} "
+            f"oracle_path_from_start={oracle_path_from_start} "
+            f"boundary_probe_sweep={boundary_probe_sweep} "
+            f"multimodal_examples={collect_stop_multimodal} "
+            "multimodal_regular_min_stop_log_odds="
+            f"{args.system2_stop_multimodal_regular_min_stop_log_odds} "
+            f"oracle_actions_per_call={oracle_recovery_actions_per_call}",
+            flush=True,
+        )
     target_list, target_set = _episode_list_from_args(args)
+    target_metadata = _episode_metadata_from_args(args)
+    historical_recovery_triggers: dict[
+        tuple[str, int], HistoricalFalseStopTrigger
+    ] = {}
+    if oracle_recovery_from_cohort_triggers:
+        if target_list is None:
+            raise ValueError(
+                "Cohort-triggered oracle recovery requires --episode_list"
+            )
+        for key in target_list:
+            trigger = parse_historical_false_stop_trigger(
+                target_metadata[key],
+                expected_protocol_seed=int(args.rpc_protocol_seed),
+                negative_radius_m=float(args.system2_stop_negative_radius_m),
+            )
+            validate_historical_false_stop_source(
+                trigger,
+                scene_id=key[0],
+                episode_id=key[1],
+            )
+            historical_recovery_triggers[key] = trigger
+        print(
+            "WARNING: historical false-STOP call triggers are ACTIVE for "
+            f"{len(historical_recovery_triggers)} audited episodes; this is "
+            "privileged offline collection only.",
+            flush=True,
+        )
     sucs, spls, oss, nes, done_set = _load_progress(
         progress_file,
         expected_rpc_sampling_contract=build_rpc_progress_sampling_contract(
@@ -3500,11 +3960,28 @@ def run_eval_rpc_panoramic(args):
             require_deterministic_sampling=bool(args.rpc_require_deterministic_sampling),
         ),
     )
+    if args.resume and collect_stop_features:
+        resume_label_paths = [stop_feature_labels_path]
+        if collect_stop_multimodal:
+            resume_label_paths.append(stop_multimodal_labels_path)
+        for labels_path in resume_label_paths:
+            kept_rows, dropped_rows = prune_stop_collection_jsonl_for_resume(
+                labels_path,
+                done_set,
+            )
+            print(
+                "STOP collection resume cleanup: "
+                f"path={labels_path} kept={kept_rows} "
+                f"dropped_incomplete={dropped_rows}",
+                flush=True,
+            )
     if target_set is not None and not done_set.issubset(target_set):
         unexpected = sorted(done_set - target_set)
         raise ValueError(f"RPC progress contains episodes outside the requested fixed cohort: {unexpected[:10]}")
     if target_list is not None:
+        selected = restrict_habitat_env_to_episode_keys(env, target_list)
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
+        print(f"Restricted Habitat iterator to {len(selected)} requested episodes")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
     print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
@@ -3547,6 +4024,41 @@ def run_eval_rpc_panoramic(args):
         step_id = 0
         done = False
         stop_probes = 0
+        stop_score_records: list[dict[str, Any]] = []
+        stop_head_records: list[dict[str, Any]] = []
+        collected_stop_features = 0
+        forced_continue_calls = 0
+        oracle_recovery_calls = 0
+        oracle_recovery_primitive_actions = 0
+        oracle_recovery_goal_probes = 0
+        boundary_probe_rows = 0
+        boundary_probe_turns = 0
+        oracle_recovery_state = OracleRecoveryState()
+        if oracle_path_from_start:
+            oracle_recovery_state.activate_from_start()
+        boundary_probe_state = BoundaryProbeSweepState(
+            enabled=boundary_probe_sweep,
+            min_distance_m=float(args.system2_stop_boundary_probe_min_distance_m),
+            max_distance_m=float(args.system2_stop_boundary_probe_max_distance_m),
+            max_probes=int(args.system2_stop_boundary_probe_views),
+        )
+        historical_recovery_trigger = historical_recovery_triggers.get(ep_key)
+        historical_recovery_trigger_reached = False
+        oracle_recovery_follower = None
+        oracle_recovery_goal_radius_m = 0.0
+        if oracle_recovery_after_negative or oracle_path_from_start:
+            from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+
+            oracle_recovery_goal_radius_m = max(
+                0.25,
+                float(args.system2_stop_positive_radius_m) - 0.5,
+            )
+            oracle_recovery_follower = ShortestPathFollower(
+                env._sim,
+                goal_radius=oracle_recovery_goal_radius_m,
+                return_one_hot=False,
+                stop_on_error=False,
+            )
         recovery_reasons: list[str] = []
         closed_loop_guard = ClosedLoopGuard(
             guard_config,
@@ -3664,7 +4176,13 @@ def run_eval_rpc_panoramic(args):
                 continue
 
             current_views = capture_panoramic_views(env, image_size=image_size)
-            prompt_history = _sample_history_panoramas(executed_history_panoramas, num_history)
+            prompt_history_indices = _sample_history_indices(
+                len(executed_history_panoramas), num_history
+            )
+            prompt_history = [
+                executed_history_panoramas[index]
+                for index in prompt_history_indices
+            ]
             if _debug_input_trace_enabled(args):
                 print(
                     "  [debug] RPC System2 input: "
@@ -3753,14 +4271,569 @@ def run_eval_rpc_panoramic(args):
                         "pixel_goal": response.get("pixel_goal"),
                         "pano_goal_view": response.get("pano_goal_view"),
                         "oracle_system2": response.get("oracle_system2"),
+                        "system2_stop_head": response.get("system2_stop_head"),
                         HEATMAPVLN_RPC_SAMPLING_FIELD: response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
                         "current_views": current_views,
                     }
                 )
 
             terminal = bool(response.get("terminal", False))
-            stop_decision = closed_loop_guard.observe_system2_terminal(terminal)
-            if terminal and stop_decision == STOP_PROBE:
+            if stop_multimodal_recorder is not None:
+                distance_to_goal = _metric_distance_to_goal(env)
+                if distance_to_goal is None:
+                    raise RuntimeError(
+                        "Habitat distance_to_goal metric is unavailable for "
+                        "multimodal STOP collection"
+                    )
+                rollout_label = _system2_stop_rollout_label(
+                    distance_to_goal,
+                    positive_radius_m=float(args.system2_stop_positive_radius_m),
+                    negative_radius_m=float(args.system2_stop_negative_radius_m),
+                )
+                stop_multimodal_recorder.record(
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    system2_call_index=system2_calls - 1,
+                    protocol_seed=int(args.rpc_protocol_seed),
+                    instruction=instruction,
+                    current_views=current_views,
+                    history_views=prompt_history,
+                    history_source_indices=prompt_history_indices,
+                    distance_to_goal_m=float(distance_to_goal),
+                    stop_target=rollout_label,
+                    response=response,
+                    image_size=vlm_image_size,
+                    oracle_recovery_active=oracle_recovery_state.active,
+                )
+            if collect_stop_features:
+                feature_record = response.get("system2_stop_feature")
+                if not isinstance(feature_record, dict):
+                    raise RuntimeError(
+                        "RPC server did not return system2_stop_feature while "
+                        "--collect_system2_stop_features is active"
+                    )
+                distance_to_goal = _metric_distance_to_goal(env)
+                if distance_to_goal is None:
+                    raise RuntimeError(
+                        "Habitat distance_to_goal metric is unavailable for STOP collection"
+                    )
+                rollout_label = _system2_stop_rollout_label(
+                    distance_to_goal,
+                    positive_radius_m=float(args.system2_stop_positive_radius_m),
+                    negative_radius_m=float(args.system2_stop_negative_radius_m),
+                )
+                stop_feature_row = {
+                    **feature_record,
+                    "scene_id": scene_id,
+                    "episode_id": episode_id,
+                    "data_path": str(args.data_path),
+                    "dataset_split": Path(args.data_path).parent.name,
+                    "system2_call_index": system2_calls - 1,
+                    "step": int(step_id),
+                    "distance_to_goal_m": float(distance_to_goal),
+                    "stop_target": rollout_label,
+                    "positive_radius_m": float(args.system2_stop_positive_radius_m),
+                    "negative_radius_m": float(args.system2_stop_negative_radius_m),
+                    "original_terminal": terminal,
+                    "llm_output": str(response.get("llm_output", "")),
+                    "system2_decision_scores": response.get("system2_decision_scores"),
+                    "trajectory_metrics": response.get("trajectory_metrics"),
+                }
+                boundary_probe_index = boundary_probe_state.observe(
+                    distance_m=float(distance_to_goal),
+                    rollout_label=rollout_label,
+                )
+                stop_feature_row["boundary_probe_sweep"] = (
+                    boundary_probe_index is not None
+                )
+                stop_feature_row["boundary_probe_index"] = boundary_probe_index
+                stop_feature_row["boundary_probe_views"] = int(
+                    args.system2_stop_boundary_probe_views
+                )
+                stop_feature_row["boundary_probe_activation_distance_m"] = (
+                    boundary_probe_state.activation_distance_m
+                )
+                stop_feature_row["boundary_probe_sweep_id"] = (
+                    f"{scene_id}:{episode_id}:{int(args.rpc_protocol_seed)}:boundary"
+                    if boundary_probe_index is not None
+                    else None
+                )
+                goal_probe_index = (
+                    oracle_recovery_goal_probes
+                    if oracle_recovery_state.active
+                    and rollout_label == 1
+                    and float(distance_to_goal) <= oracle_recovery_goal_radius_m
+                    else None
+                )
+                stop_feature_row["goal_probe_sweep"] = goal_probe_index is not None
+                stop_feature_row["goal_probe_index"] = goal_probe_index
+                stop_feature_row["goal_probe_sweep_id"] = (
+                    f"{scene_id}:{episode_id}:{int(args.rpc_protocol_seed)}:goal"
+                    if goal_probe_index is not None
+                    else None
+                )
+                force_continue = should_force_continue_negative(
+                    collection_enabled=collect_stop_features,
+                    force_continue_negatives=force_continue_stop_negatives,
+                    terminal=terminal,
+                    rollout_label=rollout_label,
+                )
+                oracle_recovery_override = oracle_recovery_state.active
+                historical_trigger_due = bool(
+                    historical_recovery_trigger is not None
+                    and system2_calls - 1
+                    == historical_recovery_trigger.system2_call_index
+                )
+                if historical_trigger_due:
+                    historical_recovery_trigger_reached = True
+                if oracle_recovery_after_negative:
+                    oracle_recovery_override = oracle_recovery_state.observe(
+                        terminal=terminal,
+                        rollout_label=rollout_label,
+                    )
+                if (
+                    historical_recovery_trigger is not None
+                    and not oracle_recovery_override
+                    and terminal
+                    and rollout_label == 1
+                ):
+                    oracle_recovery_override = (
+                        oracle_recovery_state.activate_from_cohort(
+                            rollout_label=rollout_label,
+                            reason="current_positive_stop",
+                        )
+                    )
+                elif historical_trigger_due and not oracle_recovery_override:
+                    oracle_recovery_override = (
+                        oracle_recovery_state.activate_from_cohort(
+                            rollout_label=rollout_label,
+                            reason="historical_false_stop_call",
+                        )
+                    )
+                if (
+                    historical_recovery_trigger is not None
+                    and system2_calls - 1
+                    > historical_recovery_trigger.system2_call_index
+                    and oracle_recovery_state.activations == 0
+                ):
+                    raise RuntimeError(
+                        "Missed historical false-STOP recovery trigger for "
+                        f"{scene_id}_{episode_id}: "
+                        f"call={historical_recovery_trigger.system2_call_index}"
+                    )
+                stop_feature_row["oracle_forced_continue"] = force_continue
+                stop_feature_row["oracle_recovery_active"] = (
+                    oracle_recovery_override
+                )
+                stop_feature_row["oracle_recovery_activation_reason"] = (
+                    oracle_recovery_state.activation_reason
+                    if oracle_recovery_override
+                    else None
+                )
+                stop_feature_row["oracle_recovery_actions_per_call"] = (
+                    oracle_recovery_actions_per_call
+                )
+                stop_feature_row["historical_false_stop_trigger_due"] = (
+                    historical_trigger_due
+                )
+                stop_feature_row["historical_false_stop_trigger"] = (
+                    {
+                        "system2_call_index": (
+                            historical_recovery_trigger.system2_call_index
+                        ),
+                        "step": historical_recovery_trigger.step,
+                        "distance_m": historical_recovery_trigger.distance_m,
+                        "protocol_seed": historical_recovery_trigger.protocol_seed,
+                        "source_labels": historical_recovery_trigger.source_labels,
+                    }
+                    if historical_recovery_trigger is not None
+                    else None
+                )
+                stop_feature_row["intervention_policy"] = (
+                    "habitat_shortest_path_recovery_from_audited_cohort"
+                    if oracle_recovery_override
+                    and oracle_recovery_state.activation_reason
+                    in {"historical_false_stop_call", "current_positive_stop"}
+                    else "habitat_shortest_path_recovery"
+                    if oracle_recovery_override
+                    else "stop_constrained_system2"
+                    if force_continue
+                    else None
+                )
+                with stop_feature_labels_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(stop_feature_row, sort_keys=True) + "\n")
+                collected_stop_features += 1
+                if force_continue:
+                    original_decision_scores = response.get("system2_decision_scores") or {}
+                    original_class_probabilities = (
+                        original_decision_scores.get("class_probabilities") or {}
+                    )
+                    stop_score_records.append(
+                        {
+                            "step": int(step_id),
+                            "decision": "oracle_force_continue",
+                            "stop_head_decision": None,
+                            "stop_head_probability": None,
+                            "stop_probability": float(
+                                original_class_probabilities.get("stop", 0.0)
+                            )
+                            if original_decision_scores
+                            else None,
+                            "stop_log_odds": float(
+                                original_decision_scores.get("stop_log_odds", 0.0)
+                            )
+                            if original_decision_scores
+                            else None,
+                        }
+                    )
+
+                if oracle_recovery_override:
+                    if oracle_recovery_follower is None:
+                        raise RuntimeError(
+                            "Oracle recovery became active without a shortest-path follower"
+                        )
+                    oracle_recovery_calls += 1
+                    if force_continue:
+                        forced_continue_calls += 1
+                    if boundary_probe_index is not None:
+                        boundary_probe_rows += 1
+                        sweep_complete = boundary_probe_state.finish_current_probe()
+                        if not sweep_complete:
+                            recovery_action = int(ActionCode.LEFT)
+                            before_position = _agent_position(env)
+                            observations, done = _apply_habitat_action(
+                                env,
+                                recovery_action,
+                            )
+                            after_position = _agent_position(env)
+                            step_id += 1
+                            oracle_recovery_primitive_actions += 1
+                            boundary_probe_turns += 1
+                            _record_post_action_step(
+                                step_recorder,
+                                env,
+                                step_id=step_id,
+                                phase="rpc_dagger_boundary_probe",
+                                action=recovery_action,
+                                image_size=image_size,
+                                vlm_output=llm_output,
+                            )
+                            print(
+                                "  [dagger] boundary view sweep: "
+                                f"index={boundary_probe_index + 1}/"
+                                f"{args.system2_stop_boundary_probe_views} "
+                                f"distance={distance_to_goal:.3f} "
+                                f"moved={float(np.linalg.norm(np.asarray(after_position) - np.asarray(before_position))):.6f}",
+                                flush=True,
+                            )
+                            continue
+                    recovery_actions: list[int] = []
+                    recovery_moved_m = 0.0
+                    executed_goal_probe = False
+                    deferred_goal_probe = False
+                    collection_stop = False
+                    primitive_budget = min(
+                        oracle_recovery_actions_per_call,
+                        max_steps_per_episode - step_id,
+                    )
+                    for _ in range(primitive_budget):
+                        recovery_action, goal_probe = (
+                            _next_shortest_path_recovery_action(
+                                oracle_recovery_follower,
+                                episode.goals[0].position,
+                            )
+                        )
+                        if goal_probe and recovery_actions:
+                            # The current System2 feature was captured before this
+                            # chunk reached the goal. Query a fresh goal view before
+                            # counting or executing an in-place probe.
+                            deferred_goal_probe = True
+                            break
+                        if goal_probe:
+                            executed_goal_probe = True
+                            oracle_recovery_goal_probes += 1
+                            collection_stop = (
+                                should_finish_oracle_recovery_collection(
+                                    goal_probe_count=oracle_recovery_goal_probes,
+                                    max_goal_probes=int(
+                                        args.system2_stop_oracle_recovery_goal_probes
+                                    ),
+                                )
+                            )
+                            if collection_stop:
+                                recovery_action = int(ActionCode.STOP)
+                                oracle_recovery_state.complete()
+                        before_position = _agent_position(env)
+                        observations, done = _apply_habitat_action(
+                            env,
+                            recovery_action,
+                        )
+                        after_position = _agent_position(env)
+                        recovery_moved_m += float(
+                            np.linalg.norm(
+                                np.asarray(after_position)
+                                - np.asarray(before_position)
+                            )
+                        )
+                        step_id += 1
+                        oracle_recovery_primitive_actions += 1
+                        recovery_actions.append(recovery_action)
+                        _record_post_action_step(
+                            step_recorder,
+                            env,
+                            step_id=step_id,
+                            phase=(
+                                "rpc_dagger_collection_stop"
+                                if collection_stop
+                                else "rpc_dagger_goal_probe"
+                                if executed_goal_probe
+                                else "rpc_dagger_shortest_path_recovery"
+                            ),
+                            action=recovery_action,
+                            image_size=image_size,
+                            vlm_output=llm_output,
+                        )
+                        if executed_goal_probe or done:
+                            break
+                    recovery_mode = (
+                        "collection_stop"
+                        if collection_stop
+                        else "goal_probe"
+                        if executed_goal_probe
+                        else "navigate_to_goal"
+                        if deferred_goal_probe
+                        else "navigate"
+                    )
+                    print(
+                        "  [dagger] persistent shortest-path recovery: "
+                        f"original={'STOP' if terminal else 'non-STOP'} "
+                        f"label={rollout_label} distance={distance_to_goal:.3f} "
+                        f"activation={oracle_recovery_state.activation_reason} "
+                        f"actions={recovery_actions} "
+                        f"mode={recovery_mode} "
+                        f"goal_probes={oracle_recovery_goal_probes}/"
+                        f"{args.system2_stop_oracle_recovery_goal_probes} "
+                        f"moved={recovery_moved_m:.3f}",
+                        flush=True,
+                    )
+                    continue
+
+                if force_continue:
+                    response = _rpc_plan_panoramic(
+                        client,
+                        instruction=instruction,
+                        current_views=current_views,
+                        history_panoramas=prompt_history,
+                        lookdown_img=lookdown_img,
+                        vlm_image_size=vlm_image_size,
+                        traj_image_size=traj_image_size,
+                        system1_coord_order=system1_coord_order,
+                        trajectory_selection=args.trajectory_selection,
+                        trajectory_x_sign=args.trajectory_x_sign,
+                        trajectory_heading_alignment=args.trajectory_heading_alignment,
+                        jpeg_quality=args.rpc_jpeg_quality,
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        system2_call_index=system2_calls - 1,
+                        protocol_seed=args.rpc_protocol_seed,
+                        require_deterministic_sampling=(
+                            args.rpc_require_deterministic_sampling
+                        ),
+                        oracle_system2=None,
+                        force_non_stop=True,
+                    )
+                    if response.get("system2_force_non_stop") is not True:
+                        raise RuntimeError(
+                            "RPC server did not acknowledge forced DAgger continuation"
+                        )
+                    terminal = bool(response.get("terminal", False))
+                    if terminal:
+                        raise RuntimeError(
+                            "Forced DAgger continuation returned a terminal response"
+                        )
+                    forced_continue_calls += 1
+                    llm_output = str(response.get("llm_output", ""))
+                    raw_actions = [
+                        int(action) for action in response.get("actions", [])
+                    ]
+                    actions = closed_loop_guard.limit_actions(raw_actions)
+                    print(
+                        "  [dagger] oracle-labelled false STOP -> "
+                        f"constrained non-STOP output: {llm_output}",
+                        flush=True,
+                    )
+                    if response.get("trajectory_summary"):
+                        trajectory_calls += 1
+                        print(
+                            "  [dagger] constrained trajectory "
+                            f"{response['trajectory_summary']}, actions={raw_actions}",
+                            flush=True,
+                        )
+                    elif raw_actions:
+                        print(
+                            f"  [dagger] constrained actions={raw_actions}",
+                            flush=True,
+                        )
+                    if step_recorder is not None:
+                        state = env._sim.get_agent(0).get_state()
+                        position = np.array(state.position, dtype=float)
+                        rotation = quaternion.as_float_array(state.rotation)
+                        step_recorder.record_step(
+                            {
+                                "step_id": step_id,
+                                "phase": "rpc_dagger_force_continue",
+                                "position": position,
+                                "heading_deg": _quat_to_heading_deg(rotation),
+                                "rotation": rotation,
+                                "distance_to_goal": _metric_distance_to_goal(env),
+                                "vlm_output": llm_output,
+                                "pixel_goal": response.get("pixel_goal"),
+                                "pano_goal_view": response.get("pano_goal_view"),
+                                "oracle_system2": response.get("oracle_system2"),
+                                HEATMAPVLN_RPC_SAMPLING_FIELD: response.get(
+                                    HEATMAPVLN_RPC_SAMPLING_FIELD
+                                ),
+                                "current_views": current_views,
+                            }
+                        )
+            stop_head = response.get("system2_stop_head") or {}
+            head_decision = str(stop_head.get("decision", ""))
+            trusted_terminal = should_trust_temporal_terminal(
+                enabled=bool(args.system2_stop_accept_temporal_confirmed),
+                decision=head_decision,
+                observed_margin=stop_head.get("temporal_min_margin"),
+                min_margin=float(args.system2_stop_temporal_trust_min_margin),
+            )
+            trusted_terminal_source = (
+                "temporal_confirms_original_stop" if trusted_terminal else None
+            )
+            if head_decision:
+                stop_head_records.append(
+                    {
+                        "step": int(step_id),
+                        "decision": head_decision,
+                        "mode": stop_head.get("mode"),
+                        "stop_probability": stop_head.get("stop_probability"),
+                        "threshold": stop_head.get("threshold"),
+                        "add_stop_threshold": stop_head.get("add_stop_threshold"),
+                        "veto_stop_threshold": stop_head.get("veto_stop_threshold"),
+                        "qwen_stop_probability": stop_head.get(
+                            "qwen_stop_probability"
+                        ),
+                        "stop_decision_class_probabilities": stop_head.get(
+                            "class_probabilities"
+                        ),
+                        "stop_decision_stop_log_odds": stop_head.get(
+                            "stop_log_odds"
+                        ),
+                        "add_min_qwen_stop_probability": stop_head.get(
+                            "add_min_qwen_stop_probability"
+                        ),
+                        "policy_kind": stop_head.get("policy_kind"),
+                        "temporal_accepted": stop_head.get("temporal_accepted"),
+                        "temporal_decision": stop_head.get("temporal_decision"),
+                        "static_add_decision": stop_head.get("static_add_decision"),
+                        "static_add_stop_probability": stop_head.get(
+                            "static_add_stop_probability"
+                        ),
+                        "temporal_min_margin": stop_head.get("temporal_min_margin"),
+                        "temporal_trust_min_margin": float(
+                            args.system2_stop_temporal_trust_min_margin
+                        ),
+                        "member_probabilities": stop_head.get(
+                            "member_probabilities"
+                        ),
+                        "member_thresholds": stop_head.get("member_thresholds"),
+                        "member_margins": stop_head.get("member_margins"),
+                        "original_output": stop_head.get("original_output"),
+                        "constrained_output": stop_head.get("constrained_output"),
+                        "constrained_generation_output": stop_head.get(
+                            "constrained_generation_output"
+                        ),
+                        "constrained_generation_fallback": stop_head.get(
+                            "constrained_generation_fallback"
+                        ),
+                        "trusted_terminal": trusted_terminal,
+                        "trusted_terminal_source": trusted_terminal_source,
+                    }
+                )
+                member_probabilities = stop_head.get("member_probabilities") or []
+                member_thresholds = stop_head.get("member_thresholds") or []
+                member_summary = ""
+                if member_probabilities:
+                    member_summary = (
+                        f" members={[round(float(value), 4) for value in member_probabilities]}"
+                        f" member_thresholds={[round(float(value), 4) for value in member_thresholds]}"
+                    )
+                print(
+                    "  [debug] System2 STOP head: "
+                    f"decision={head_decision} "
+                    f"p={float(stop_head.get('stop_probability', 0.0)):.4f} "
+                    f"effective_threshold={float(stop_head.get('threshold', 0.5)):.4f} "
+                    f"add={float(stop_head.get('add_stop_threshold', 0.5)):.4f} "
+                    f"veto={float(stop_head.get('veto_stop_threshold', 0.5)):.4f}"
+                    f"{member_summary}",
+                    flush=True,
+                )
+            decision_scores = response.get("system2_decision_scores") or {}
+            class_probabilities = decision_scores.get("class_probabilities") or {}
+            stop_probability = float(class_probabilities.get("stop", 0.0))
+            stop_vote_probability = stop_probability
+            if stop_head.get("mode") == "stop_decision_adapter":
+                stop_vote_probability = float(
+                    stop_head.get("stop_probability", stop_probability)
+                )
+            if decision_scores and (terminal or stop_probability >= 0.01):
+                print(
+                    "  [debug] System2 decision scores: "
+                    f"selected={decision_scores.get('selected')} "
+                    f"stop_p={stop_probability:.4f} "
+                    f"stop_log_odds={float(decision_scores.get('stop_log_odds', 0.0)):.3f}",
+                    flush=True,
+                )
+            terminal_vote_source = None
+            if terminal:
+                terminal_vote_source = head_decision or "system2_original_stop"
+            stop_decision = closed_loop_guard.observe_system2_terminal(
+                terminal,
+                stop_probability=(
+                    stop_vote_probability
+                    if decision_scores or stop_head.get("mode") == "stop_decision_adapter"
+                    else None
+                ),
+                trusted_terminal=trusted_terminal,
+                terminal_source=terminal_vote_source,
+            )
+            if terminal:
+                stop_score_records.append(
+                    {
+                        "step": int(step_id),
+                        "decision": str(stop_decision),
+                        "stop_head_decision": head_decision or None,
+                        "stop_head_probability": stop_head.get("stop_probability"),
+                        "stop_head_policy_kind": stop_head.get("policy_kind"),
+                        "stop_head_member_probabilities": stop_head.get(
+                            "member_probabilities"
+                        ),
+                        "stop_head_member_thresholds": stop_head.get(
+                            "member_thresholds"
+                        ),
+                        "trusted_terminal": trusted_terminal,
+                        "trusted_terminal_source": trusted_terminal_source,
+                        "terminal_vote_source": terminal_vote_source,
+                        "stop_probability": float(
+                            class_probabilities.get("stop", 0.0)
+                        )
+                        if decision_scores
+                        else None,
+                        "stop_log_odds": float(
+                            decision_scores.get("stop_log_odds", 0.0)
+                        )
+                        if decision_scores
+                        else None,
+                    }
+                )
+            if stop_decision == STOP_PROBE:
                 action = closed_loop_guard.next_stop_probe_action()
                 before_position = _agent_position(env)
                 observations, done = _apply_habitat_action(env, action)
@@ -3769,8 +4842,16 @@ def run_eval_rpc_panoramic(args):
                 step_id += 1
                 stop_probes += 1
                 print(
-                    "  [guard] unconfirmed System2 STOP; "
-                    f"probe_action={int(action)} vote={stop_probes}",
+                    "  [guard] System2 STOP verification sweep; "
+                    f"terminal={terminal} "
+                    f"trusted_terminal={trusted_terminal} "
+                    f"trusted_terminal_source={trusted_terminal_source} "
+                    f"vote_source={closed_loop_guard.stop_vote_source} "
+                    f"probe_action={int(action)} "
+                    f"vote={closed_loop_guard.stop_votes}/"
+                    f"{guard_config.stop_confirmations} "
+                    f"gap={closed_loop_guard.stop_gap_calls}/"
+                    f"{guard_config.stop_confirmation_max_gap_calls}",
                     flush=True,
                 )
                 _record_post_action_step(
@@ -3929,10 +5010,87 @@ def run_eval_rpc_panoramic(args):
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
             "rpc_action_chunk_size": guard_config.action_chunk_size,
             "system2_stop_confirmations": guard_config.stop_confirmations,
+            "system2_stop_confirmation_max_gap_calls": (
+                guard_config.stop_confirmation_max_gap_calls
+            ),
+            "system2_stop_confirmation_view_sweep": (
+                guard_config.stop_confirmation_view_sweep
+            ),
+            "system2_stop_accept_temporal_confirmed": bool(
+                args.system2_stop_accept_temporal_confirmed
+            ),
+            "system2_stop_temporal_trust_min_margin": float(
+                args.system2_stop_temporal_trust_min_margin
+            ),
+            "system2_stop_high_confidence_threshold": (
+                guard_config.stop_high_confidence_threshold
+            ),
             "system2_stop_probe_turn": guard_config.stop_probe_turn,
             "closed_loop_guard": guard_config.loop_guard_enabled,
             "closed_loop_stop_probes": stop_probes,
+            "system2_stop_score_records": stop_score_records,
+            "system2_stop_head_records": stop_head_records,
+            "system2_stop_feature_collection": collect_stop_features,
+            "system2_stop_collect_oracle_recovery_after_negative": (
+                oracle_recovery_after_negative
+            ),
+            "system2_stop_collect_oracle_path_from_start": oracle_path_from_start,
+            "system2_stop_features_collected": collected_stop_features,
+            "system2_stop_forced_continue_calls": forced_continue_calls,
+            "system2_stop_oracle_recovery_calls": oracle_recovery_calls,
+            "system2_stop_oracle_recovery_primitive_actions": (
+                oracle_recovery_primitive_actions
+            ),
+            "system2_stop_oracle_recovery_actions_per_call": (
+                oracle_recovery_actions_per_call
+            ),
+            "system2_stop_oracle_recovery_goal_probes": (
+                oracle_recovery_goal_probes
+            ),
+            "system2_stop_boundary_probe_rows": boundary_probe_rows,
+            "system2_stop_boundary_probe_turns": boundary_probe_turns,
+            "system2_stop_boundary_probe_completed": boundary_probe_state.completed,
+            "system2_stop_oracle_recovery_goal_probe_limit": int(
+                args.system2_stop_oracle_recovery_goal_probes
+            ),
+            "system2_stop_oracle_recovery_activations": (
+                oracle_recovery_state.activations
+            ),
+            "system2_stop_oracle_recovery_activation_reason": (
+                oracle_recovery_state.activation_reason
+            ),
+            "system2_stop_oracle_recovery_from_cohort_triggers": (
+                oracle_recovery_from_cohort_triggers
+            ),
+            "system2_stop_historical_trigger_reached": (
+                historical_recovery_trigger_reached
+            ),
+            "system2_stop_historical_trigger_call_index": (
+                historical_recovery_trigger.system2_call_index
+                if historical_recovery_trigger is not None
+                else None
+            ),
+            "system2_stop_historical_trigger_step": (
+                historical_recovery_trigger.step
+                if historical_recovery_trigger is not None
+                else None
+            ),
+            "system2_stop_historical_trigger_distance_m": (
+                historical_recovery_trigger.distance_m
+                if historical_recovery_trigger is not None
+                else None
+            ),
+            "system2_stop_historical_trigger_source_labels": (
+                historical_recovery_trigger.source_labels
+                if historical_recovery_trigger is not None
+                else None
+            ),
+            "system2_stop_oracle_recovery_goal_radius_m": (
+                oracle_recovery_goal_radius_m
+            ),
             "closed_loop_recoveries": recovery_reasons,
+            "closed_loop_recovery_forward_steps": guard_config.recovery_forward_steps,
+            "closed_loop_recovery_follow_last_turn": guard_config.recovery_follow_last_turn,
         }
         if bool(getattr(args, "oracle_system2", False)):
             result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
@@ -3962,10 +5120,67 @@ def run_eval_rpc_panoramic(args):
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
             "rpc_action_chunk_size": guard_config.action_chunk_size,
             "system2_stop_confirmations": guard_config.stop_confirmations,
+            "system2_stop_confirmation_max_gap_calls": (
+                guard_config.stop_confirmation_max_gap_calls
+            ),
+            "system2_stop_confirmation_view_sweep": (
+                guard_config.stop_confirmation_view_sweep
+            ),
+            "system2_stop_accept_temporal_confirmed": bool(
+                args.system2_stop_accept_temporal_confirmed
+            ),
+            "system2_stop_temporal_trust_min_margin": float(
+                args.system2_stop_temporal_trust_min_margin
+            ),
+            "system2_stop_high_confidence_threshold": (
+                guard_config.stop_high_confidence_threshold
+            ),
             "system2_stop_probe_turn": guard_config.stop_probe_turn,
+            "system2_stop_feature_collection": collect_stop_features,
+            "system2_stop_collect_oracle_recovery_after_negative": (
+                oracle_recovery_after_negative
+            ),
+            "system2_stop_collect_oracle_path_from_start": oracle_path_from_start,
+            "system2_stop_oracle_recovery_from_cohort_triggers": (
+                oracle_recovery_from_cohort_triggers
+            ),
+            "system2_stop_oracle_recovery_goal_probe_limit": int(
+                args.system2_stop_oracle_recovery_goal_probes
+            ),
+            "system2_stop_oracle_recovery_actions_per_call": (
+                oracle_recovery_actions_per_call
+            ),
+            "system2_stop_feature_labels": (
+                str(stop_feature_labels_path) if collect_stop_features else None
+            ),
+            "system2_stop_multimodal_regular_min_stop_log_odds": (
+                args.system2_stop_multimodal_regular_min_stop_log_odds
+            ),
+            "system2_stop_multimodal_examples_considered_this_process": (
+                stop_multimodal_recorder.considered
+                if stop_multimodal_recorder is not None
+                else 0
+            ),
+            "system2_stop_multimodal_examples_recorded_this_process": (
+                stop_multimodal_recorder.recorded
+                if stop_multimodal_recorder is not None
+                else 0
+            ),
+            "system2_stop_multimodal_examples_skipped_this_process": (
+                stop_multimodal_recorder.skipped
+                if stop_multimodal_recorder is not None
+                else 0
+            ),
+            "system2_stop_multimodal_episode_provenance_fallbacks_this_process": (
+                stop_multimodal_recorder.provenance_fallbacks
+                if stop_multimodal_recorder is not None
+                else 0
+            ),
             "closed_loop_guard": guard_config.loop_guard_enabled,
             "closed_loop_stop_probes": total_stop_probes,
             "closed_loop_recoveries": total_recoveries,
+            "closed_loop_recovery_forward_steps": guard_config.recovery_forward_steps,
+            "closed_loop_recovery_follow_last_turn": guard_config.recovery_follow_last_turn,
         }
     )
 
@@ -4072,7 +5287,9 @@ def run_eval(args):
 
     target_list, target_set = _episode_list_from_args(args)
     if target_list is not None:
+        selected = restrict_habitat_env_to_episode_keys(env, target_list)
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
+        print(f"Restricted Habitat iterator to {len(selected)} requested episodes")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
     print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
@@ -4642,6 +5859,166 @@ def main():
         ),
     )
     parser.add_argument(
+        "--system2_stop_confirmation_max_gap_calls",
+        type=int,
+        default=0,
+        help=(
+            "Maximum non-terminal System2 replans allowed between STOP votes. "
+            "Zero preserves strict consecutive confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_confirmation_view_sweep",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "While a STOP vote is pending, consume allowed non-terminal gap calls "
+            "as same-direction in-place view probes instead of executing their "
+            "trajectory. Requires max gap calls >= 1."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_accept_temporal_confirmed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Let a temporal verifier's unanimous confirmation of an original "
+            "System2 STOP bypass generic multi-view confirmation. Static-head "
+            "added STOP decisions still require normal confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_temporal_trust_min_margin",
+        type=float,
+        default=0.005,
+        help=(
+            "Minimum unanimous temporal-verifier margin required before an "
+            "original STOP may bypass generic confirmation. Borderline "
+            "temporal confirmations fall back to normal multi-view voting."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_high_confidence_threshold",
+        type=float,
+        default=None,
+        help=(
+            "When set, System2 STOP predictions at or above this structured-class "
+            "probability bypass confirmation; lower-confidence STOP predictions "
+            "still require --system2_stop_confirmations. Requires confirmations >= 2."
+        ),
+    )
+    parser.add_argument(
+        "--collect_system2_stop_features",
+        action="store_true",
+        help=(
+            "Collect frozen-Qwen System2 decision features and privileged geodesic "
+            "STOP labels for offline training. Never enable for official metrics."
+        ),
+    )
+    parser.add_argument(
+        "--collect_system2_stop_multimodal_examples",
+        action="store_true",
+        help=(
+            "Alongside privileged STOP features, save the exact train-split "
+            "System2 panorama/history prompt inputs for isolated LoRA training. "
+            "The loader rejects val/val_unseen examples."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_multimodal_regular_min_stop_log_odds",
+        type=float,
+        default=None,
+        help=(
+            "Optional collection-only filter: always persist labelled STOP "
+            "positives and original false STOPs, but persist regular non-STOP "
+            "rows only when their frozen-System2 STOP log-odds exceed this value."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_collect_force_continue_negatives",
+        action="store_true",
+        help=(
+            "DAgger-only oracle intervention: retain an original far-away STOP "
+            "as a negative feature, then request a STOP-constrained continuation. "
+            "Requires --collect_system2_stop_features and is never valid for metrics."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_collect_oracle_recovery_after_negative",
+        action="store_true",
+        help=(
+            "Privileged DAgger-only recovery: after recording a false original "
+            "STOP, keep querying and recording the real System2 while Habitat's "
+            "shortest-path follower supplies recovery actions. Inside the success "
+            "radius, collect a bounded set of real-policy views before a privileged "
+            "collection-only STOP. Requires forced negative continuation."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_collect_oracle_path_from_start",
+        action="store_true",
+        help=(
+            "Privileged offline collection only: query the real System2 while "
+            "Habitat's shortest-path follower supplies every environment action, "
+            "then collect bounded in-place goal views. Requires STOP feature "
+            "collection and forced negative continuation."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_collect_boundary_probe_sweep",
+        action="store_true",
+        help=(
+            "Privileged oracle-path collection only: pause once in the configured "
+            "negative distance band and collect a fixed-position multi-view sweep."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_boundary_probe_min_distance_m",
+        type=float,
+        default=3.01,
+    )
+    parser.add_argument(
+        "--system2_stop_boundary_probe_max_distance_m",
+        type=float,
+        default=6.0,
+    )
+    parser.add_argument(
+        "--system2_stop_boundary_probe_views",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--system2_stop_oracle_recovery_goal_probes",
+        type=int,
+        default=8,
+        help=(
+            "Number of real System2 views to collect after privileged recovery "
+            "reaches the goal radius before ending the collection episode."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_oracle_recovery_actions_per_call",
+        type=int,
+        default=1,
+        help=(
+            "Maximum privileged shortest-path primitive actions executed after "
+            "one real System2 query. Goal probes always use a fresh query and "
+            "one primitive action."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_oracle_recovery_from_cohort_triggers",
+        action="store_true",
+        help=(
+            "Privileged offline collection only: use each episode-list entry's "
+            "audited historical false-STOP call as a deterministic fallback "
+            "recovery trigger. A real false STOP or positive STOP may trigger "
+            "collection earlier. Requires the full oracle-recovery mode."
+        ),
+    )
+    parser.add_argument("--system2_stop_positive_radius_m", type=float, default=3.0)
+    parser.add_argument("--system2_stop_negative_radius_m", type=float, default=4.0)
+    parser.add_argument(
         "--system2_stop_probe_turn",
         choices=("left", "right"),
         default="left",
@@ -4666,6 +6043,16 @@ def main():
     parser.add_argument("--closed_loop_plan_min_path_m", type=float, default=3.0)
     parser.add_argument("--closed_loop_plan_max_net_m", type=float, default=1.5)
     parser.add_argument("--closed_loop_recovery_turns", type=int, default=3)
+    parser.add_argument("--closed_loop_recovery_forward_steps", type=int, default=0)
+    parser.add_argument(
+        "--closed_loop_recovery_follow_last_turn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Continue the latest System1 turn direction during collision recovery "
+            "instead of alternating blindly."
+        ),
+    )
     parser.add_argument("--closed_loop_recovery_cooldown_steps", type=int, default=12)
     parser.add_argument(
         "--closed_loop_recovery_history_keep",

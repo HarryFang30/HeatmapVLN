@@ -6,6 +6,11 @@ from typing import Any
 
 import torch
 
+from src.data.future_trajectory_batch import (
+    FUTURE_TARGET_KEYS,
+    stack_future_trajectory_targets,
+)
+
 
 def _heatmap_history_length(sample: dict) -> int:
     """Return the real number of heatmap histories for one sample.
@@ -128,5 +133,13 @@ def collate_fn(batch: list[dict]) -> dict[str, Any]:
             result['current_depth'] = torch.stack([s['current_depth'] for s in batch], dim=0)
         if 'intrinsics' in batch[0]:
             result['intrinsics'] = torch.stack([s['intrinsics'] for s in batch], dim=0)
+
+    # This legacy collator has no explicit Future feature flag. Preserve its
+    # disabled output exactly, while still supporting mixed batches whenever
+    # at least one sample carries a Future target. The tokenized/InternNav
+    # collators do have an explicit flag and therefore may emit an all-false
+    # fixed contract for an entirely unsupervised batch.
+    if any(any(key in sample for key in FUTURE_TARGET_KEYS) for sample in batch):
+        result.update(stack_future_trajectory_targets(batch))
 
     return result

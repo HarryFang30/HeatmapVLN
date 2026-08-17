@@ -1,0 +1,434 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1600" viewBox="0 0 2400 1600" role="img" aria-labelledby="title desc">
+  <title id="title">AMB3R-Conditioned Trajectory-Guided Heatmap Head</title>
+  <desc id="desc">Publication figure showing a frozen causal AMB3R pose stream and a frozen Qwen visual stream feeding a trajectory-guided four-direction heatmap head. Ground-truth geometry appears only in a dashed training-label path. Raw heatmap and visibility logits feed a tokenizer and zero-gated System-1 adapters.</desc>
+
+  <defs>
+    <style><![CDATA[
+      .ink { fill:#20332A; }
+      .title { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:40px; font-weight:700; fill:#1F2F28; }
+      .subtitle { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:17px; fill:#53645B; }
+      .phase { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:24px; font-weight:700; fill:#20332A; letter-spacing:.4px; }
+      .section { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:18px; font-weight:700; fill:#20332A; }
+      .module { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:21px; font-weight:700; fill:#20332A; }
+      .body { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:16px; fill:#44564D; }
+      .small { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:14px; fill:#586960; }
+      .tiny { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:12px; fill:#5E6C65; }
+      .badge { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:11px; font-weight:700; letter-spacing:.4px; }
+      .note { font-family:"Comic Sans MS","Comic Sans",Chalkboard,"Marker Felt",cursive; font-size:14px; font-weight:700; fill:#39734A; }
+      .panel { stroke-width:2.3; stroke-dasharray:9 7; stroke-linecap:round; stroke-linejoin:round; }
+      .box { fill:#FFFFFF; stroke:#397B4A; stroke-width:2.1; stroke-linejoin:round; }
+      .box-blue { fill:#FFFFFF; stroke:#4F91BD; stroke-width:2.1; stroke-linejoin:round; }
+      .box-gray { fill:#FFFFFF; stroke:#7A8580; stroke-width:2; stroke-linejoin:round; }
+      .arrow { fill:none; stroke:#397B4A; stroke-width:3.1; stroke-linecap:round; stroke-linejoin:round; marker-end:url(#arrow-green); }
+      .arrow-blue { fill:none; stroke:#4F91BD; stroke-width:3.1; stroke-linecap:round; stroke-linejoin:round; marker-end:url(#arrow-blue); }
+      .arrow-orange { fill:none; stroke:#E7894B; stroke-width:3.3; stroke-linecap:round; stroke-linejoin:round; marker-end:url(#arrow-orange); }
+      .arrow-gray { fill:none; stroke:#7D8682; stroke-width:2.8; stroke-linecap:round; stroke-linejoin:round; marker-end:url(#arrow-gray); }
+      .supervision { fill:none; stroke:#7D8682; stroke-width:2.8; stroke-dasharray:8 7; stroke-linecap:round; stroke-linejoin:round; marker-end:url(#arrow-gray); }
+    ]]></style>
+
+    <marker id="arrow-green" viewBox="0 0 12 12" refX="10.5" refY="6" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Q4,6 1,1 Z" fill="#397B4A"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 12 12" refX="10.5" refY="6" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Q4,6 1,1 Z" fill="#4F91BD"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 12 12" refX="10.5" refY="6" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Q4,6 1,1 Z" fill="#E7894B"/>
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 12 12" refX="10.5" refY="6" markerWidth="10" markerHeight="10" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Q4,6 1,1 Z" fill="#7D8682"/>
+    </marker>
+
+    <radialGradient id="hmF" cx="50%" cy="25%" r="44%">
+      <stop offset="0" stop-color="#FFF5A8"/><stop offset=".23" stop-color="#F5A13B"/><stop offset=".52" stop-color="#D44C38"/><stop offset="1" stop-color="#202A31"/>
+    </radialGradient>
+    <radialGradient id="hmR" cx="78%" cy="50%" r="44%">
+      <stop offset="0" stop-color="#FFF5A8"/><stop offset=".23" stop-color="#F5A13B"/><stop offset=".52" stop-color="#D44C38"/><stop offset="1" stop-color="#202A31"/>
+    </radialGradient>
+    <radialGradient id="hmB" cx="48%" cy="78%" r="44%">
+      <stop offset="0" stop-color="#FFF5A8"/><stop offset=".23" stop-color="#F5A13B"/><stop offset=".52" stop-color="#D44C38"/><stop offset="1" stop-color="#202A31"/>
+    </radialGradient>
+    <radialGradient id="hmL" cx="22%" cy="54%" r="44%">
+      <stop offset="0" stop-color="#FFF5A8"/><stop offset=".23" stop-color="#F5A13B"/><stop offset=".52" stop-color="#D44C38"/><stop offset="1" stop-color="#202A31"/>
+    </radialGradient>
+
+    <symbol id="rgb-frame" viewBox="0 0 92 64">
+      <rect x="2" y="2" width="88" height="60" rx="7" fill="#EAF3F2" stroke="#58776A" stroke-width="1.7"/>
+      <path d="M3 61 L26 34 L66 34 L89 61 Z" fill="#D7B98E"/>
+      <path d="M3 3 L26 34 L26 61 L3 61 Z" fill="#BFD9DD"/>
+      <path d="M89 3 L66 34 L66 61 L89 61 Z" fill="#E8D1B5"/>
+      <rect x="37" y="10" width="20" height="25" rx="2" fill="#73949B"/>
+      <rect x="41" y="14" width="12" height="17" fill="#C5E1E4"/>
+      <path d="M47 35 V61 M26 34 L4 48 M66 34 L88 48" fill="none" stroke="#8F765F" stroke-width="1.2"/>
+    </symbol>
+
+    <symbol id="camera" viewBox="0 0 90 70">
+      <path d="M18 31 L50 17 L50 53 Z" fill="#DCECF5" stroke="#3E83B1" stroke-width="2"/>
+      <rect x="7" y="25" width="20" height="34" rx="5" fill="#FFFFFF" stroke="#3E83B1" stroke-width="2"/>
+      <circle cx="17" cy="42" r="6" fill="#72ADD1"/>
+      <path d="M51 24 L78 9 M51 46 L78 61" fill="none" stroke="#83B7D4" stroke-width="2" stroke-dasharray="5 4"/>
+      <circle cx="79" cy="9" r="4" fill="#E7894B"/><circle cx="79" cy="61" r="4" fill="#E7894B"/>
+    </symbol>
+
+    <symbol id="pose-axis" viewBox="0 0 90 80">
+      <circle cx="38" cy="48" r="8" fill="#FFFFFF" stroke="#315D48" stroke-width="2"/>
+      <path d="M38 48 L70 48" stroke="#D95D4E" stroke-width="3" marker-end="url(#arrow-orange)"/>
+      <path d="M38 48 L38 14" stroke="#397B4A" stroke-width="3" marker-end="url(#arrow-green)"/>
+      <path d="M22 59 C10 38 22 21 42 19" fill="none" stroke="#4F91BD" stroke-width="2.5" stroke-dasharray="5 4"/>
+      <text x="70" y="65" text-anchor="middle" font-family="Comic Sans MS, cursive" font-size="10" fill="#B74B3D">left</text>
+      <text x="50" y="13" font-family="Comic Sans MS, cursive" font-size="10" fill="#2F7043">forward</text>
+    </symbol>
+
+    <symbol id="vision-chip" viewBox="0 0 96 78">
+      <rect x="18" y="10" width="60" height="56" rx="10" fill="#EFF4F2" stroke="#526B60" stroke-width="2"/>
+      <path d="M29 38 Q48 21 67 38 Q48 55 29 38 Z" fill="#D3ECE5" stroke="#397B4A" stroke-width="2"/>
+      <circle cx="48" cy="38" r="7" fill="#4F91BD" stroke="#FFFFFF" stroke-width="2"/>
+      <path d="M10 20 H18 M10 34 H18 M10 48 H18 M78 20 H86 M78 34 H86 M78 48 H86" stroke="#526B60" stroke-width="2"/>
+    </symbol>
+
+    <symbol id="mini-map" viewBox="0 0 100 76">
+      <path d="M9 62 C23 54 17 31 36 34 S51 61 64 43 S73 16 92 13" fill="none" stroke="#4F91BD" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="9" cy="62" r="6" fill="#E7894B" stroke="#FFFFFF" stroke-width="2"/>
+      <circle cx="92" cy="13" r="7" fill="#397B4A" stroke="#FFFFFF" stroke-width="2"/>
+      <path d="M75 12 L92 13 L87 29" fill="none" stroke="#397B4A" stroke-width="2"/>
+      <path d="M17 17 L28 12 L28 29 Z" fill="#FFFFFF" stroke="#4F91BD" stroke-width="1.7"/>
+      <path d="M47 55 L58 50 L58 67 Z" fill="#FFFFFF" stroke="#4F91BD" stroke-width="1.7"/>
+    </symbol>
+
+    <symbol id="heat-f" viewBox="0 0 72 72"><rect x="2" y="2" width="68" height="68" rx="8" fill="url(#hmF)" stroke="#426052" stroke-width="1.5"/></symbol>
+    <symbol id="heat-r" viewBox="0 0 72 72"><rect x="2" y="2" width="68" height="68" rx="8" fill="url(#hmR)" stroke="#426052" stroke-width="1.5"/></symbol>
+    <symbol id="heat-b" viewBox="0 0 72 72"><rect x="2" y="2" width="68" height="68" rx="8" fill="url(#hmB)" stroke="#426052" stroke-width="1.5"/></symbol>
+    <symbol id="heat-l" viewBox="0 0 72 72"><rect x="2" y="2" width="68" height="68" rx="8" fill="url(#hmL)" stroke="#426052" stroke-width="1.5"/></symbol>
+  </defs>
+
+  <!-- Pure white paper canvas -->
+  <rect width="2400" height="1600" fill="#FFFFFF"/>
+
+  <!-- Header -->
+  <rect x="60" y="34" width="176" height="31" rx="15" fill="#E8F3EA" stroke="#397B4A" stroke-width="1.8"/>
+  <text x="148" y="55" text-anchor="middle" class="badge" fill="#2D6C40">FIGURE 2 · METHOD</text>
+  <text x="60" y="105" class="title">AMB3R-Conditioned Trajectory-Guided Heatmap Head</text>
+  <text x="61" y="137" class="subtitle">Causal monocular poses replace simulator pose inputs; frozen visual features support structured four-direction localization.</text>
+  <path d="M60 158 C610 154 1160 163 1750 157 S2210 159 2340 155" fill="none" stroke="#F0A36B" stroke-width="7" stroke-linecap="round" opacity=".75"/>
+
+  <!-- Main outer panels -->
+  <rect x="60" y="205" width="500" height="1005" rx="30" fill="#FFF7EF" stroke="#C9895E" class="panel"/>
+  <rect x="595" y="205" width="1110" height="1005" rx="30" fill="#F1FAED" stroke="#397B4A" class="panel"/>
+  <rect x="1740" y="205" width="600" height="1005" rx="30" fill="#F7F8F5" stroke="#748078" class="panel"/>
+
+  <!-- Overlapping title tabs -->
+  <rect x="87" y="185" width="325" height="45" rx="19" fill="#FFFFFF" stroke="#C9895E" stroke-width="2"/>
+  <text x="249" y="215" text-anchor="middle" class="phase">A. Causal Input Sidecar</text>
+  <rect x="625" y="185" width="560" height="45" rx="19" fill="#FFFFFF" stroke="#397B4A" stroke-width="2.2"/>
+  <text x="905" y="215" text-anchor="middle" class="phase">B. Learned Heatmap Head</text>
+  <rect x="1458" y="187" width="213" height="39" rx="18" fill="#DDF1DA" stroke="#397B4A" stroke-width="1.7"/>
+  <text x="1564" y="212" text-anchor="middle" class="badge" fill="#2D6C40">CORE CONTRIBUTION</text>
+  <rect x="1770" y="185" width="380" height="45" rx="19" fill="#FFFFFF" stroke="#748078" stroke-width="2"/>
+  <text x="1960" y="215" text-anchor="middle" class="phase">C. Outputs &amp; Control</text>
+
+  <!-- Cross-panel arrows, drawn before modules -->
+  <path d="M520 568 C586 558 584 349 650 343" class="arrow-blue"/>
+  <text x="574" y="447" class="tiny" fill="#397DA7" transform="rotate(-83 574 447)">relative pose pᵢ</text>
+  <path d="M520 944 C584 938 584 608 650 606" class="arrow-gray"/>
+  <text x="574" y="785" class="tiny" transform="rotate(-84 574 785)">history query qᵢ</text>
+  <path d="M520 1040 C576 1035 590 943 650 929" class="arrow"/>
+  <text x="575" y="1011" class="tiny" fill="#2D6C40">current spatial features</text>
+
+  <!-- A1 Pose stream -->
+  <rect x="85" y="254" width="450" height="365" rx="23" fill="#F5FAFE" stroke="#4F91BD" stroke-width="2"/>
+  <rect x="105" y="239" width="146" height="31" rx="14" fill="#FFFFFF" stroke="#4F91BD" stroke-width="1.7"/>
+  <text x="178" y="260" text-anchor="middle" class="section" fill="#397DA7">Pose stream</text>
+
+  <g transform="translate(101 292)">
+    <use href="#rgb-frame" x="0" y="15" width="92" height="64" opacity=".5"/>
+    <use href="#rgb-frame" x="18" y="8" width="92" height="64" opacity=".72"/>
+    <use href="#rgb-frame" x="36" y="0" width="92" height="64"/>
+  </g>
+  <text x="174" y="390" text-anchor="middle" class="body">continuous Front RGB</text>
+  <text x="174" y="411" text-anchor="middle" class="tiny">strictly causal frames</text>
+
+  <path d="M236 341 C255 337 263 337 280 341" class="arrow-blue"/>
+  <rect x="280" y="286" width="222" height="118" rx="18" class="box-blue"/>
+  <rect x="300" y="299" width="72" height="23" rx="11" fill="#E5F1F8" stroke="#4F91BD"/>
+  <text x="336" y="315" text-anchor="middle" class="badge" fill="#397DA7">FROZEN</text>
+  <use href="#camera" x="296" y="326" width="77" height="60"/>
+  <text x="424" y="348" text-anchor="middle" class="module">AMB3R-VO</text>
+  <text x="424" y="373" text-anchor="middle" class="small">off-the-shelf monocular VO</text>
+  <text x="424" y="394" text-anchor="middle" class="tiny">OpenCV c2w trajectory</text>
+
+  <use href="#mini-map" x="112" y="441" width="113" height="86"/>
+  <text x="169" y="548" text-anchor="middle" class="small">causal camera trajectory</text>
+  <path d="M390 404 C388 421 383 428 380 442" class="arrow-blue"/>
+  <rect x="274" y="442" width="228" height="91" rx="17" class="box-blue"/>
+  <use href="#pose-axis" x="284" y="448" width="77" height="68"/>
+  <text x="420" y="470" text-anchor="middle" class="module">Pose Bridge</text>
+  <text x="420" y="494" text-anchor="middle" class="small">axis conversion + current-relative</text>
+  <text x="420" y="515" text-anchor="middle" class="tiny">sample the same K history IDs</text>
+  <text x="458" y="546" class="note" transform="rotate(-5 458 546)">same K IDs!</text>
+
+  <rect x="104" y="559" width="416" height="44" rx="13" fill="#FFFFFF" stroke="#4F91BD" stroke-width="1.6"/>
+  <text x="312" y="578" text-anchor="middle" class="small" fill="#356F95">pᵢ = [forward, left, cos Δyaw, sin Δyaw]</text>
+  <text x="312" y="596" text-anchor="middle" class="tiny">VO pose input for adaptation and inference</text>
+
+  <!-- A2 Visual stream -->
+  <rect x="85" y="667" width="450" height="515" rx="23" fill="#FFFFFF" stroke="#77837D" stroke-width="2"/>
+  <rect x="105" y="652" width="159" height="31" rx="14" fill="#FFFFFF" stroke="#77837D" stroke-width="1.7"/>
+  <text x="185" y="673" text-anchor="middle" class="section">Visual stream</text>
+
+  <g transform="translate(101 725)">
+    <use href="#rgb-frame" x="0" y="20" width="92" height="64" opacity=".48"/>
+    <use href="#rgb-frame" x="18" y="10" width="92" height="64" opacity=".72"/>
+    <use href="#rgb-frame" x="36" y="0" width="92" height="64"/>
+  </g>
+  <text x="175" y="831" text-anchor="middle" class="body">K history + current</text>
+  <text x="175" y="853" text-anchor="middle" class="tiny">Front RGB only</text>
+  <path d="M236 778 C257 775 267 775 284 779" class="arrow-gray"/>
+
+  <rect x="284" y="718" width="218" height="158" rx="18" class="box-gray"/>
+  <rect x="302" y="732" width="72" height="23" rx="11" fill="#EEF1EF" stroke="#77837D"/>
+  <text x="338" y="748" text-anchor="middle" class="badge" fill="#59665F">FROZEN</text>
+  <use href="#vision-chip" x="300" y="764" width="90" height="72"/>
+  <text x="437" y="787" text-anchor="middle" class="module">Qwen.visual</text>
+  <text x="437" y="812" text-anchor="middle" class="small">vision encoder only</text>
+  <text x="437" y="835" text-anchor="middle" class="tiny">no language decoder here</text>
+  <text x="393" y="861" text-anchor="middle" class="tiny">one frozen forward over independent images</text>
+
+  <path d="M394 876 C394 895 348 904 316 914" class="arrow-gray"/>
+  <path d="M404 876 C407 904 451 991 446 1013" class="arrow"/>
+  <rect x="105" y="906" width="415" height="72" rx="16" class="box-gray"/>
+  <circle cx="139" cy="941" r="16" fill="#E7EFEC" stroke="#66756D" stroke-width="1.5"/>
+  <text x="139" y="946" text-anchor="middle" class="section">q</text>
+  <text x="297" y="935" text-anchor="middle" class="body">history visual queries qᵢ</text>
+  <text x="297" y="957" text-anchor="middle" class="tiny">mean of native visual-merger tokens</text>
+
+  <rect x="105" y="1003" width="415" height="88" rx="16" class="box"/>
+  <g transform="translate(124 1022)">
+    <rect x="0" y="0" width="43" height="43" rx="5" fill="#D6EAE4" stroke="#397B4A"/>
+    <path d="M5 31 C15 10 26 37 38 12" fill="none" stroke="#397B4A" stroke-width="2"/>
+  </g>
+  <text x="307" y="1038" text-anchor="middle" class="body">current multi-level spatial maps</text>
+  <text x="307" y="1062" text-anchor="middle" class="tiny">restored ViT rasters · spatially fused in Head</text>
+  <text x="309" y="1136" text-anchor="middle" class="note" transform="rotate(-2 309 1136)">No Right / Back / Left RGB enters the Head.</text>
+
+  <!-- B1 Pose encoder -->
+  <rect x="650" y="267" width="300" height="158" rx="20" class="box"/>
+  <rect x="669" y="282" width="104" height="23" rx="11" fill="#FBE1CD" stroke="#E7894B"/>
+  <text x="721" y="298" text-anchor="middle" class="badge" fill="#A85524">VO-ADAPTED</text>
+  <use href="#pose-axis" x="667" y="318" width="80" height="70"/>
+  <text x="845" y="330" text-anchor="middle" class="module">Relative Pose Encoding</text>
+  <text x="845" y="357" text-anchor="middle" class="body">Fourier embedding + projection</text>
+  <text x="845" y="383" text-anchor="middle" class="small">one trajectory token pᵢ</text>
+  <text x="800" y="411" text-anchor="middle" class="tiny">continuous egocentric displacement and yaw</text>
+
+  <!-- B2 History encoder -->
+  <rect x="650" y="528" width="300" height="158" rx="20" class="box"/>
+  <rect x="669" y="543" width="154" height="23" rx="11" fill="#EEF1EF" stroke="#77837D"/>
+  <text x="746" y="559" text-anchor="middle" class="badge" fill="#59665F">FROZEN IN VO ADAPT</text>
+  <circle cx="710" cy="615" r="29" fill="#E5F0EC" stroke="#397B4A" stroke-width="2"/>
+  <text x="710" y="622" text-anchor="middle" class="module">qᵢ</text>
+  <text x="844" y="594" text-anchor="middle" class="module">History Query Projection</text>
+  <text x="844" y="622" text-anchor="middle" class="body">visual identity of history i</text>
+  <text x="844" y="649" text-anchor="middle" class="small">one projected history token</text>
+
+  <!-- B3 Current spatial conditioner -->
+  <rect x="650" y="786" width="300" height="303" rx="20" class="box"/>
+  <rect x="669" y="802" width="154" height="23" rx="11" fill="#EEF1EF" stroke="#77837D"/>
+  <text x="746" y="818" text-anchor="middle" class="badge" fill="#59665F">FROZEN IN VO ADAPT</text>
+  <text x="800" y="858" text-anchor="middle" class="module">Front Feature Fusion</text>
+  <text x="800" y="883" text-anchor="middle" class="body">DPT-Lite spatial fusion</text>
+  <path d="M800 899 C799 912 797 917 797 929" class="arrow"/>
+  <rect x="678" y="930" width="244" height="117" rx="17" fill="#F5FBF3" stroke="#397B4A" stroke-width="1.8"/>
+  <text x="800" y="956" text-anchor="middle" class="module">4-Direction Conditioner</text>
+  <g transform="translate(700 975)">
+    <rect x="0" y="0" width="42" height="42" rx="7" fill="#CDE7D4" stroke="#397B4A"/><text x="21" y="28" text-anchor="middle" class="section">F</text>
+    <rect x="54" y="0" width="42" height="42" rx="7" fill="#FFFFFF" stroke="#397B4A"/><text x="75" y="28" text-anchor="middle" class="section">R</text>
+    <rect x="108" y="0" width="42" height="42" rx="7" fill="#FFFFFF" stroke="#397B4A"/><text x="129" y="28" text-anchor="middle" class="section">B</text>
+    <rect x="162" y="0" width="42" height="42" rx="7" fill="#FFFFFF" stroke="#397B4A"/><text x="183" y="28" text-anchor="middle" class="section">L</text>
+  </g>
+  <text x="800" y="1071" text-anchor="middle" class="tiny">observed Front + learned R/B/L slots with pooled Front context</text>
+
+  <!-- Arrows into per-history fusion -->
+  <path d="M950 346 C988 349 994 463 1025 500" class="arrow"/>
+  <path d="M950 608 C981 610 993 610 1025 609" class="arrow"/>
+  <path d="M950 972 C984 954 992 750 1025 720" class="arrow"/>
+
+  <!-- B4 Core fusion -->
+  <rect x="1025" y="405" width="330" height="430" rx="27" fill="#FFFFFF" stroke="#2E7042" stroke-width="3"/>
+  <rect x="1048" y="423" width="79" height="25" rx="12" fill="#397B4A"/>
+  <text x="1087" y="440" text-anchor="middle" class="badge" fill="#FFFFFF">OURS</text>
+  <rect x="1138" y="423" width="104" height="25" rx="12" fill="#FBE1CD" stroke="#E7894B"/>
+  <text x="1190" y="440" text-anchor="middle" class="badge" fill="#A85524">VO-ADAPTED</text>
+  <text x="1190" y="488" text-anchor="middle" class="module">Trajectory-Guided Attention</text>
+  <text x="1190" y="516" text-anchor="middle" class="body">transformer fusion · independently per history</text>
+
+  <rect x="1065" y="554" width="91" height="66" rx="13" fill="#F2F5F3" stroke="#6E7A73" stroke-width="1.6"/>
+  <text x="1110" y="582" text-anchor="middle" class="body">history</text>
+  <text x="1110" y="605" text-anchor="middle" class="small">token qᵢ</text>
+  <rect x="1145" y="638" width="91" height="66" rx="13" fill="#F5FAFE" stroke="#4F91BD" stroke-width="1.6"/>
+  <text x="1190" y="666" text-anchor="middle" class="body">pose</text>
+  <text x="1190" y="689" text-anchor="middle" class="small">token pᵢ</text>
+  <rect x="1224" y="554" width="91" height="66" rx="13" fill="#F1FAED" stroke="#397B4A" stroke-width="1.6"/>
+  <text x="1269" y="582" text-anchor="middle" class="body">spatial</text>
+  <text x="1269" y="605" text-anchor="middle" class="small">tokens</text>
+  <path d="M1110 628 C1125 728 1265 738 1270 628" fill="none" stroke="#397B4A" stroke-width="3" stroke-linecap="round"/>
+  <path d="M1190 706 C1192 735 1192 746 1190 766" class="arrow"/>
+  <rect x="1065" y="768" width="250" height="43" rx="14" fill="#DDF1DA" stroke="#397B4A" stroke-width="1.6"/>
+  <text x="1190" y="795" text-anchor="middle" class="note">pose-conditioned correspondence</text>
+  <text x="1190" y="864" text-anchor="middle" class="note" transform="rotate(-2 1190 864)">No cross-history attention here.</text>
+
+  <!-- Fusion branches: history output and spatial output are parallel -->
+  <path d="M1355 500 C1380 494 1381 353 1400 351" class="arrow"/>
+  <text x="1369" y="417" class="tiny" transform="rotate(-84 1369 417)">history output</text>
+  <path d="M1355 641 C1375 640 1384 591 1400 586" class="arrow"/>
+  <text x="1368" y="626" class="tiny">spatial output</text>
+
+  <!-- B5 Parallel structured readout -->
+  <rect x="1400" y="272" width="265" height="163" rx="20" class="box"/>
+  <rect x="1417" y="286" width="104" height="22" rx="10" fill="#FBE1CD" stroke="#E7894B"/>
+  <text x="1469" y="301" text-anchor="middle" class="badge" fill="#A85524">VO-ADAPTED</text>
+  <text x="1532" y="338" text-anchor="middle" class="module">Visibility Readout</text>
+  <text x="1532" y="366" text-anchor="middle" class="body">history token → four logits</text>
+  <g transform="translate(1451 385)">
+    <circle cx="0" cy="0" r="8" fill="#397B4A"/><circle cx="53" cy="0" r="8" fill="#8EBE96"/><circle cx="106" cy="0" r="8" fill="#5E9E6D"/><circle cx="159" cy="0" r="8" fill="#BCD8C0"/>
+    <text x="0" y="29" text-anchor="middle" class="tiny">F</text><text x="53" y="29" text-anchor="middle" class="tiny">R</text><text x="106" y="29" text-anchor="middle" class="tiny">B</text><text x="159" y="29" text-anchor="middle" class="tiny">L</text>
+  </g>
+
+  <rect x="1400" y="488" width="265" height="192" rx="20" class="box"/>
+  <rect x="1417" y="502" width="104" height="22" rx="10" fill="#FBE1CD" stroke="#E7894B"/>
+  <text x="1469" y="517" text-anchor="middle" class="badge" fill="#A85524">VO-ADAPTED</text>
+  <text x="1532" y="555" text-anchor="middle" class="module">Coarse Spatial Readout</text>
+  <g transform="translate(1426 575)" opacity=".95">
+    <rect x="0" y="0" width="50" height="50" rx="6" fill="url(#hmF)" stroke="#397B4A"/>
+    <rect x="58" y="0" width="50" height="50" rx="6" fill="url(#hmR)" stroke="#397B4A"/>
+    <rect x="116" y="0" width="50" height="50" rx="6" fill="url(#hmB)" stroke="#397B4A"/>
+    <rect x="174" y="0" width="50" height="50" rx="6" fill="url(#hmL)" stroke="#397B4A"/>
+  </g>
+  <text x="1532" y="650" text-anchor="middle" class="body">coarse logits + enriched spatial features</text>
+  <path d="M1532 680 C1530 701 1530 710 1532 730" class="arrow"/>
+
+  <rect x="1400" y="732" width="265" height="230" rx="20" class="box"/>
+  <rect x="1417" y="747" width="154" height="22" rx="10" fill="#EEF1EF" stroke="#77837D"/>
+  <text x="1494" y="762" text-anchor="middle" class="badge" fill="#59665F">FROZEN IN VO ADAPT</text>
+  <text x="1532" y="807" text-anchor="middle" class="module">Coarse-to-Fine Localization</text>
+  <text x="1532" y="837" text-anchor="middle" class="body">conditioned current features</text>
+  <text x="1532" y="862" text-anchor="middle" class="body">+ enriched spatial features</text>
+  <text x="1532" y="887" text-anchor="middle" class="body">+ coarse attention</text>
+  <path d="M1450 918 Q1532 894 1615 918" fill="none" stroke="#8EBE96" stroke-width="9" stroke-linecap="round" opacity=".7"/>
+  <text x="1532" y="948" text-anchor="middle" class="small">final K × 4 spatial logits</text>
+
+  <!-- Fine-detail skip from conditioner to Fine module -->
+  <path d="M950 1030 C1010 1124 1270 1140 1380 913 C1387 898 1392 887 1400 873" class="arrow"/>
+  <text x="1168" y="1123" text-anchor="middle" class="tiny" fill="#2D6C40">fine-detail skip from conditioned current features</text>
+
+  <!-- Head stage note -->
+  <rect x="680" y="1147" width="940" height="39" rx="17" fill="#E2F2DD" stroke="#8EBE96" stroke-width="1.3"/>
+  <text x="1150" y="1172" text-anchor="middle" class="small">Pretrain the full Head with GT-pose inputs → adapt only pose-sensitive fusion/readouts to causal AMB3R poses → freeze the Head for navigation.</text>
+
+  <!-- C1 Raw outputs, fed by two parallel readouts -->
+  <path d="M1665 354 C1707 352 1721 320 1780 320" class="arrow"/>
+  <path d="M1665 913 C1720 904 1700 416 1780 411" class="arrow"/>
+  <rect x="1780" y="260" width="520" height="190" rx="23" fill="#FFFFFF" stroke="#397B4A" stroke-width="2.2"/>
+  <rect x="1800" y="244" width="202" height="31" rx="14" fill="#FFFFFF" stroke="#397B4A" stroke-width="1.7"/>
+  <text x="1901" y="265" text-anchor="middle" class="section">Raw predictions</text>
+  <rect x="1811" y="300" width="225" height="61" rx="14" fill="#F0F8ED" stroke="#397B4A" stroke-width="1.5"/>
+  <text x="1924" y="327" text-anchor="middle" class="body">fine heatmap logits</text>
+  <text x="1924" y="348" text-anchor="middle" class="tiny">K × 4 spatial fields</text>
+  <rect x="2050" y="300" width="220" height="61" rx="14" fill="#F0F8ED" stroke="#397B4A" stroke-width="1.5"/>
+  <text x="2160" y="327" text-anchor="middle" class="body">visibility logits</text>
+  <text x="2160" y="348" text-anchor="middle" class="tiny">K × 4 view scores</text>
+  <text x="2040" y="405" text-anchor="middle" class="note" transform="rotate(-2 2040 405)">Two consumers — no hidden RGB shortcut.</text>
+
+  <!-- Branch 1: inference view gating -->
+  <path d="M2040 450 C2034 474 2033 487 2035 507" class="arrow"/>
+  <rect x="1780" y="507" width="520" height="250" rx="23" fill="#FFFFFF" stroke="#6F9C62" stroke-width="2"/>
+  <text x="2040" y="542" text-anchor="middle" class="module">View Normalization &amp; Gating</text>
+  <text x="2040" y="568" text-anchor="middle" class="small">spatial softmax × five-way [none, F, R, B, L] confidence</text>
+  <g transform="translate(1831 596)">
+    <use href="#heat-f" x="0" y="0" width="78" height="78"/>
+    <use href="#heat-r" x="112" y="0" width="78" height="78"/>
+    <use href="#heat-b" x="224" y="0" width="78" height="78"/>
+    <use href="#heat-l" x="336" y="0" width="78" height="78"/>
+    <text x="39" y="99" text-anchor="middle" class="section">F</text><text x="151" y="99" text-anchor="middle" class="section">R</text><text x="263" y="99" text-anchor="middle" class="section">B</text><text x="375" y="99" text-anchor="middle" class="section">L</text>
+  </g>
+  <text x="2040" y="726" text-anchor="middle" class="body">K × 4 view-gated heatmaps + none probability</text>
+
+  <!-- Branch 2: raw outputs go directly to tokenizer -->
+  <path d="M1802 437 C1760 550 1767 831 1800 850" class="arrow-orange"/>
+  <text x="1770" y="685" class="tiny" fill="#A85524" transform="rotate(-88 1770 685)">RAW logits (before gating)</text>
+  <rect x="1800" y="800" width="480" height="150" rx="23" fill="#FFF7EF" stroke="#E7894B" stroke-width="2.3"/>
+  <rect x="1820" y="816" width="128" height="24" rx="11" fill="#FBE1CD" stroke="#E7894B"/>
+  <text x="1884" y="832" text-anchor="middle" class="badge" fill="#A85524">CONTROL-TRAINED</text>
+  <text x="2040" y="871" text-anchor="middle" class="module">Structured Heatmap Tokenizer</text>
+  <text x="2040" y="899" text-anchor="middle" class="body">raw logits + visibility + history age / mask</text>
+  <text x="2040" y="924" text-anchor="middle" class="small">history-major, then F / R / B / L tokens</text>
+
+  <path d="M2040 950 C2036 968 2036 976 2040 994" class="arrow-orange"/>
+  <rect x="1800" y="994" width="480" height="155" rx="23" fill="#F3FAEF" stroke="#6F9C62" stroke-width="2.3"/>
+  <rect x="1820" y="1010" width="92" height="24" rx="11" fill="#EEF1EF" stroke="#77837D"/>
+  <text x="1866" y="1026" text-anchor="middle" class="badge" fill="#59665F">FROZEN</text>
+  <rect x="1924" y="1010" width="128" height="24" rx="11" fill="#DDF1DA" stroke="#397B4A"/>
+  <text x="1988" y="1026" text-anchor="middle" class="badge" fill="#2D6C40">ADAPTERS TRAIN</text>
+  <text x="2040" y="1067" text-anchor="middle" class="module">System-1 · NextDiT</text>
+  <text x="2040" y="1095" text-anchor="middle" class="body">per-block zero-gated cross-attention</text>
+  <path d="M1885 1121 C1925 1097 1966 1141 2008 1118 S2090 1100 2140 1124" fill="none" stroke="#397B4A" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="1885" cy="1121" r="5" fill="#E7894B"/><path d="M2140 1124 L2124 1112 M2140 1124 L2125 1137" stroke="#397B4A" stroke-width="3" stroke-linecap="round"/>
+  <text x="2224" y="1128" text-anchor="end" class="tiny">local trajectory</text>
+
+  <!-- Dashed training-only label branch -->
+  <rect x="60" y="1295" width="2280" height="235" rx="29" fill="#FAFAF8" stroke="#7D8682" class="panel"/>
+  <rect x="88" y="1276" width="325" height="43" rx="18" fill="#FFFFFF" stroke="#7D8682" stroke-width="2"/>
+  <text x="250" y="1305" text-anchor="middle" class="phase">D. Training-Only Labels</text>
+  <rect x="425" y="1280" width="130" height="31" rx="14" fill="#EEF1EF" stroke="#7D8682"/>
+  <text x="490" y="1301" text-anchor="middle" class="badge" fill="#59665F">LABEL PATH ONLY</text>
+
+  <rect x="92" y="1340" width="455" height="135" rx="20" class="box-gray"/>
+  <use href="#pose-axis" x="109" y="1367" width="80" height="72"/>
+  <g transform="translate(194 1365) scale(.72)"><use href="#heat-f" x="0" y="0" width="72" height="72"/><path d="M10 60 L62 12" stroke="#FFFFFF" stroke-width="3" stroke-dasharray="5 4"/></g>
+  <text x="376" y="1375" text-anchor="middle" class="module">GT Geometry</text>
+  <text x="376" y="1404" text-anchor="middle" class="body">history/current camera poses</text>
+  <text x="376" y="1429" text-anchor="middle" class="body">four-view current depth + intrinsics</text>
+  <text x="320" y="1457" text-anchor="middle" class="tiny">available only while constructing supervision</text>
+
+  <path d="M547 1407 C574 1404 596 1404 622 1408" class="supervision"/>
+  <rect x="622" y="1340" width="365" height="135" rx="20" class="box-gray"/>
+  <text x="804" y="1374" text-anchor="middle" class="module">Target Renderer</text>
+  <path d="M672 1402 L705 1385 L738 1412 L771 1378" fill="none" stroke="#7D8682" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="672" cy="1402" r="5" fill="#4F91BD"/><circle cx="771" cy="1378" r="6" fill="#E7894B"/>
+  <text x="844" y="1404" text-anchor="middle" class="body">pinhole projection</text>
+  <text x="804" y="1430" text-anchor="middle" class="body">occlusion test + Gaussian rendering</text>
+  <text x="804" y="1457" text-anchor="middle" class="tiny">on-the-fly labels · never AMB3R inputs</text>
+
+  <path d="M987 1407 C1014 1404 1035 1404 1062 1408" class="supervision"/>
+  <rect x="1062" y="1340" width="345" height="135" rx="20" class="box-gray"/>
+  <g transform="translate(1085 1367) scale(.65)">
+    <use href="#heat-f" x="0" y="0" width="72" height="72"/><use href="#heat-r" x="80" y="0" width="72" height="72"/><use href="#heat-b" x="160" y="0" width="72" height="72"/><use href="#heat-l" x="240" y="0" width="72" height="72"/>
+  </g>
+  <text x="1235" y="1433" text-anchor="middle" class="module">GT K × 4 Heatmaps</text>
+  <text x="1235" y="1458" text-anchor="middle" class="body">+ GT visibility</text>
+
+  <path d="M1407 1407 C1431 1404 1451 1404 1477 1408" class="supervision"/>
+  <rect x="1477" y="1340" width="405" height="135" rx="20" class="box-gray"/>
+  <text x="1679" y="1375" text-anchor="middle" class="module">Multi-Task Supervision</text>
+  <text x="1679" y="1407" text-anchor="middle" class="body">spatial localization + coordinates</text>
+  <text x="1679" y="1433" text-anchor="middle" class="body">visibility / view prediction</text>
+  <path d="M1532 1455 Q1679 1429 1826 1455" fill="none" stroke="#A6ADA9" stroke-width="6" stroke-linecap="round" opacity=".55"/>
+
+  <rect x="1946" y="1340" width="360" height="135" rx="20" fill="#F1F2F0" stroke="#7D8682" stroke-width="1.8"/>
+  <text x="2126" y="1378" text-anchor="middle" class="section">GT is a teacher, not a sensor.</text>
+  <text x="2126" y="1410" text-anchor="middle" class="body">no GT pose · no depth · no intrinsics</text>
+  <text x="2126" y="1436" text-anchor="middle" class="body">enters the AMB3R / Head forward path</text>
+  <text x="2126" y="1462" text-anchor="middle" class="note" transform="rotate(-2 2126 1462)">labels stay outside!</text>
+
+  <!-- Supervision reaches raw predictions through the empty gutter only -->
+  <path d="M1680 1340 C1688 1271 1718 1241 1718 1170 L1718 492 C1718 446 1740 408 1780 404" class="supervision"/>
+  <text x="1390" y="1318" text-anchor="middle" class="tiny">dashed path supervises raw heatmap + visibility predictions only</text>
+
+  <!-- Compact legend and footer -->
+  <g transform="translate(77 1557)">
+    <rect x="0" y="-18" width="73" height="23" rx="10" fill="#E5F1F8" stroke="#4F91BD"/><text x="36" y="-2" text-anchor="middle" class="badge" fill="#397DA7">FROZEN</text>
+    <rect x="88" y="-18" width="104" height="23" rx="10" fill="#FBE1CD" stroke="#E7894B"/><text x="140" y="-2" text-anchor="middle" class="badge" fill="#A85524">VO-ADAPTED</text>
+    <rect x="207" y="-18" width="128" height="23" rx="10" fill="#DDF1DA" stroke="#397B4A"/><text x="271" y="-2" text-anchor="middle" class="badge" fill="#2D6C40">CONTROL-TRAINED</text>
+    <path d="M360 -7 H418" class="supervision"/><text x="430" y="-2" class="tiny">training labels only</text>
+  </g>
+  <text x="2325" y="1558" text-anchor="end" class="tiny">All RGB inputs to this branch are Front view; F / R / B / L denotes the fixed output direction order.</text>
+</svg>

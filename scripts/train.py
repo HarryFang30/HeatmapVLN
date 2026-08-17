@@ -54,6 +54,7 @@ _mp.set_sharing_strategy('file_system')
 
 import argparse
 import gc
+import hashlib
 import logging
 import time
 import warnings
@@ -120,8 +121,13 @@ from scripts.training import (
     set_seed,
     set_trainable_modules,
     train_one_epoch,
+    validate_heatmap_warmstart_contract,
+    verify_heatmap_warmstart_loaded,
 )
 from scripts.training.validate import validate
+from src.models.past_plan_action_checkpoint import (
+    validate_exact_past_head_warmstart,
+)
 
 from src.data.factory import build_dataset
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
@@ -252,6 +258,71 @@ def _infer_base_checkpoint_from_resume(resume_path: Path, logger) -> str | None:
         logger.warning("Resume checkpoint records missing base weights: %s", resolved)
         return None
     return str(resolved)
+
+
+def _split_stop_head_holdout(
+    dataset,
+    *,
+    fraction: float,
+    seed: int,
+    logger: logging.Logger,
+):
+    """Create deterministic clip-disjoint train/validation dataset views."""
+    fraction = float(fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            f"validation.holdout_clip_fraction must be in (0, 1), got {fraction}"
+        )
+    if not hasattr(dataset, "subset_by_clip_indices"):
+        raise TypeError(
+            "STOP-head validation requires a dataset with subset_by_clip_indices()"
+        )
+    sample_index = getattr(dataset, "sample_index", None)
+    clips = getattr(dataset, "clips", None)
+    if not sample_index or clips is None:
+        raise ValueError("STOP-head holdout requires a non-empty clip-indexed dataset")
+
+    active_clip_indices = sorted({int(clip_idx) for clip_idx, _ in sample_index})
+    if len(active_clip_indices) < 2:
+        raise ValueError(
+            "STOP-head clip-disjoint validation requires at least two indexed clips"
+        )
+    num_val_clips = max(
+        1,
+        min(
+            len(active_clip_indices) - 1,
+            int(round(len(active_clip_indices) * fraction)),
+        ),
+    )
+
+    def holdout_key(clip_idx: int) -> tuple[bytes, str]:
+        clip_name = str(clips[clip_idx])
+        digest = hashlib.sha256(f"{int(seed)}:{clip_name}".encode("utf-8")).digest()
+        return digest, clip_name
+
+    ordered = sorted(active_clip_indices, key=holdout_key)
+    val_clip_indices = set(ordered[:num_val_clips])
+    train_clip_indices = set(ordered[num_val_clips:])
+    if train_clip_indices & val_clip_indices:
+        raise RuntimeError("STOP-head train/validation clip split overlaps")
+
+    train_dataset = dataset.subset_by_clip_indices(train_clip_indices)
+    val_dataset = dataset.subset_by_clip_indices(val_clip_indices)
+    train_sample_clips = {int(clip_idx) for clip_idx, _ in train_dataset.sample_index}
+    val_sample_clips = {int(clip_idx) for clip_idx, _ in val_dataset.sample_index}
+    if train_sample_clips & val_sample_clips:
+        raise RuntimeError("STOP-head train/validation samples are not clip-disjoint")
+    logger.info(
+        "  STOP-head deterministic holdout: train=%d clips/%d samples, "
+        "val=%d clips/%d samples, fraction=%.4f seed=%d",
+        len(train_clip_indices),
+        len(train_dataset),
+        len(val_clip_indices),
+        len(val_dataset),
+        fraction,
+        int(seed),
+    )
+    return train_dataset, val_dataset
 
 
 # ============================================
@@ -467,6 +538,17 @@ def main():
                 enable_trajectory_augmentation=False,
                 **dataset_overrides,
             )
+        elif (
+            stage_cfg.get('train_system2_stop_head', False)
+            and cfg.get('validation', {}).get('enabled', True)
+        ):
+            validation_cfg = cfg.get('validation', {})
+            train_dataset, val_dataset = _split_stop_head_holdout(
+                train_dataset,
+                fraction=validation_cfg.get('holdout_clip_fraction', 0.05),
+                seed=validation_cfg.get('holdout_seed', cfg.get('seed', 42)),
+                logger=logger,
+            )
         else:
             val_dataset = None
             logger.info("  No val_root configured, skipping validation dataset")
@@ -627,12 +709,15 @@ def main():
         cfg['data'].get(
             'use_worker_tokenized_collator',
             stage_cfg.get('train_action', True)
+            or stage_cfg.get('train_future', False)
             or stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)),
         ),
     )
     stage_train_action = bool(stage_cfg.get('train_action', True))
+    stage_train_future = bool(stage_cfg.get('train_future', False))
     stage_train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
     stage_teacher_force_system2_answer = bool(stage_cfg.get('teacher_force_system2_answer', False))
+    stage_train_stop_head = bool(stage_cfg.get('train_system2_stop_head', False))
     nextdit_enabled = bool(
         cfg.get('model', {})
         .get('action_head', {})
@@ -644,7 +729,8 @@ def main():
         and (
             cfg['model'].get('heatmap', {}).get('enable', True)
             or stage_train_lm
-            or (stage_train_action and nextdit_enabled)
+            or stage_train_stop_head
+            or ((stage_train_action or stage_train_future) and nextdit_enabled)
         )
         and getattr(train_dataset, '_is_panoramic', False)
         and (val_dataset is None or getattr(val_dataset, '_is_panoramic', False))
@@ -665,11 +751,15 @@ def main():
         n_traj_query = cfg.get('model', {}).get('action_head', {}).get('nextdit', {}).get('n_query', 0)
         if not cfg.get('model', {}).get('action_head', {}).get('nextdit', {}).get('enabled', False):
             n_traj_query = 0
-        if not stage_cfg.get('train_action', False):
+        if not (
+            stage_cfg.get('train_action', False)
+            or stage_cfg.get('train_future', False)
+        ):
             n_traj_query = 0
         train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
-        sft_prompt_mode = train_lm or stage_teacher_force_system2_answer
+        sft_prompt_mode = train_lm or stage_teacher_force_system2_answer or stage_train_stop_head
         traj_cfg = cfg.get('data', {}).get('trajectory', cfg.get('data', {}).get('sliding_window', {}))
+        future_heatmap_cfg = traj_cfg.get('future_heatmap', {})
         sft_protocol = stage_cfg.get(
             'system2_sft_protocol',
             traj_cfg.get('system2_sft_protocol', 'direct'),
@@ -683,12 +773,16 @@ def main():
             sft_include_turns=stage_cfg.get('sft_include_turns', True),
             sft_include_forward=stage_cfg.get('sft_include_forward', False),
             sft_protocol=sft_protocol,
-            build_sft_labels=train_lm,
+            build_sft_labels=train_lm or stage_train_stop_head,
+            build_stop_head_targets=stage_train_stop_head,
             max_seq_length=max_seq_len,
             include_heatmap_targets=stage_uses_heatmap_targets,
             include_history_rel_poses=stage_cfg.get(
                 'retain_history_rel_poses',
                 stage_uses_heatmap_targets,
+            ),
+            include_future_heatmap_targets=bool(
+                future_heatmap_cfg.get('enabled', False)
             ),
             retain_raw_panoramic_views=stage_cfg.get(
                 'retain_raw_panoramic_views',
@@ -702,12 +796,14 @@ def main():
         )
         logger.info(
             "   ✅ Panoramic tokenized collator enabled "
-            "(n_traj_query=%d, sft_mode=%s, build_sft_labels=%s, return_lm_loss=%s, "
+            "(n_traj_query=%d, sft_mode=%s, build_sft_labels=%s, "
+            "stop_head_targets=%s, return_lm_loss=%s, "
             "protocol=%s, max_seq_len=%d, heatmap_targets=%s, raw_pano=%s, anchors=%s, "
             "heatmap_layout=%s)",
             n_traj_query,
             sft_prompt_mode,
-            train_lm,
+            train_lm or stage_train_stop_head,
+            stage_train_stop_head,
             train_lm,
             sft_protocol,
             max_seq_len,
@@ -846,10 +942,47 @@ def main():
                         len(state_to_load),
                         len(state_dict),
                     )
+                ppa_cfg = (
+                    cfg.get('model', {})
+                    .get('action_head', {})
+                    .get('nextdit', {})
+                    .get('past_plan_action', {})
+                )
+                if isinstance(ppa_cfg, dict) and ppa_cfg.get('enabled', False):
+                    past_report = validate_exact_past_head_warmstart(
+                        model=raw_model,
+                        checkpoint_state=state_to_load,
+                        expected_tensor_count=79,
+                    )
+                    logger.info(
+                        "  ✓ Strict Past Head warm-start: %d/79 tensors; "
+                        "hash/file-lock disabled",
+                        past_report['validated_tensors'],
+                    )
+                heatmap_warmstart_report = validate_heatmap_warmstart_contract(
+                    raw_model,
+                    state_to_load,
+                    stage_cfg,
+                    checkpoint_metadata=ckpt.get('metadata'),
+                    checkpoint_path=str(weights_path),
+                )
                 missing, unexpected, loaded_count = _load_normalized_state_dict(
                     raw_model,
                     state_to_load,
                 )
+                verify_heatmap_warmstart_loaded(
+                    raw_model,
+                    heatmap_warmstart_report,
+                    loaded_count=loaded_count,
+                )
+                if heatmap_warmstart_report is not None:
+                    logger.info(
+                        "  ✓ Heatmap warm-start contract passed: policy=%s "
+                        "loaded=%d counts=%s",
+                        heatmap_warmstart_report["policy"],
+                        loaded_count,
+                        heatmap_warmstart_report["counts"],
+                    )
                 logger.info(f"✓ Loaded {loaded_count} params from {weights_path.name} (weights only, fresh optimizer/scheduler)")
                 if loaded_count < len(state_to_load):
                     logger.warning(f"  ⚠ Only {loaded_count}/{len(state_to_load)} checkpoint params matched!")
@@ -1182,6 +1315,22 @@ def main():
                     heatmap_temperature=train_metrics.get('heatmap_temperature'),
                     dist_context=dist_context,
                 )
+            if stage_train_stop_head:
+                add_threshold = val_metrics.get('val_stop_add_stop_threshold')
+                veto_threshold = val_metrics.get('val_stop_veto_stop_threshold')
+                if add_threshold is None or veto_threshold is None:
+                    raise RuntimeError(
+                        "STOP-head validation did not return calibrated add/veto thresholds"
+                    )
+                stop_head_cfg = cfg.setdefault('model', {}).setdefault('stop_head', {})
+                stop_head_cfg['add_stop_threshold'] = float(add_threshold)
+                stop_head_cfg['veto_stop_threshold'] = float(veto_threshold)
+                logger.info(
+                    "  Updated checkpoint STOP policy: add_stop_threshold=%.4f "
+                    "veto_stop_threshold=%.4f",
+                    float(add_threshold),
+                    float(veto_threshold),
+                )
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -1209,10 +1358,11 @@ def main():
 
         train_traj_str = f", traj: {train_metrics['trajectory_loss']:.4f}" if train_metrics.get('trajectory_loss', 0) > 0 else ""
         train_lm_str = f", lm: {train_metrics['lm_loss']:.4f}" if train_metrics.get('lm_loss', 0) > 0 else ""
+        train_stop_str = f", stop: {train_metrics['stop_loss']:.4f}" if train_metrics.get('stop_loss', 0) > 0 else ""
         train_l2_sp_str = f", l2sp: {train_metrics['l2_sp_loss']:.6f}" if train_metrics.get('l2_sp_loss', 0) > 0 else ""
         logger.info(
             f"  Train Loss: {train_metrics['total_loss']:.4f} "
-            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str}{train_lm_str}{train_l2_sp_str})"
+            f"(hm: {train_metrics['heatmap_loss']:.4f}{train_traj_str}{train_lm_str}{train_stop_str}{train_l2_sp_str})"
         )
 
         eta = timer.get_eta(epoch, total_epochs)
@@ -1222,9 +1372,10 @@ def main():
             val_hm_mse_str = f", infer_mse: {val_metrics['val_heatmap_mse']:.6f}" if val_metrics.get('val_heatmap_mse', 0) > 0 else ""
             val_traj_str = f", traj: {val_metrics['val_trajectory_loss']:.4f}" if val_metrics.get('val_trajectory_loss', 0) > 0 else ""
             val_lm_str = f", lm: {val_metrics['val_lm_loss']:.4f}" if val_metrics.get('val_lm_loss', 0) > 0 else ""
+            val_stop_str = f", stop: {val_metrics['val_stop_loss']:.4f}" if val_metrics.get('val_stop_loss', 0) > 0 else ""
             logger.info(
                 f"  Val Loss: {val_metrics['val_loss']:.4f} "
-                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_traj_str}{val_lm_str}{val_hm_mse_str})"
+                f"(hm: {val_metrics['val_heatmap_loss']:.4f}{val_traj_str}{val_lm_str}{val_stop_str}{val_hm_mse_str})"
             )
             is_best = val_metrics['val_loss'] < best_val_loss
             if is_best:
@@ -1272,6 +1423,8 @@ def main():
             tb_writer.add_scalar('epoch/train_loss', train_metrics['total_loss'], global_epoch_counter)
             if train_metrics.get('trajectory_loss', 0) > 0:
                 tb_writer.add_scalar('epoch/train_trajectory_loss', train_metrics['trajectory_loss'], global_epoch_counter)
+            if train_metrics.get('stop_loss', 0) > 0:
+                tb_writer.add_scalar('epoch/train_stop_loss', train_metrics['stop_loss'], global_epoch_counter)
             if train_metrics.get('l2_sp_loss', 0) > 0:
                 tb_writer.add_scalar('epoch/train_l2_sp_loss', train_metrics['l2_sp_loss'], global_epoch_counter)
 
@@ -1300,9 +1453,43 @@ def main():
                         'train': train_lm,
                         'val': val_lm,
                     }, global_epoch_counter)
+                train_stop = train_metrics.get('stop_loss', 0)
+                val_stop = val_metrics.get('val_stop_loss', 0)
+                if train_stop > 0 or val_stop > 0:
+                    tb_writer.add_scalars('loss/stop', {
+                        'train': train_stop,
+                        'val': val_stop,
+                    }, global_epoch_counter)
+                for threshold_key in (
+                    'val_stop_add_stop_threshold',
+                    'val_stop_veto_stop_threshold',
+                    'val_stop_add_false_positive_rate',
+                    'val_stop_veto_recall',
+                ):
+                    if threshold_key in val_metrics:
+                        tb_writer.add_scalar(
+                            f'epoch/{threshold_key}',
+                            val_metrics[threshold_key],
+                            global_epoch_counter,
+                        )
 
-                for hm_key in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):
+                for hm_key in (
+                    'peak_loss',
+                    'vis_loss',
+                    'coord_loss',
+                    'neg_loss',
+                    'view_macro_loss',
+                    'direction_macro_loss',
+                    'panoramic_view_loss',
+                ):
+                    train_key = f'hm_{hm_key}'
                     val_key = f'val_hm_{hm_key}'
+                    if train_key in train_metrics:
+                        tb_writer.add_scalar(
+                            f'epoch/train_hm_{hm_key}',
+                            train_metrics[train_key],
+                            global_epoch_counter,
+                        )
                     if val_key in val_metrics:
                         tb_writer.add_scalar(f'epoch/val_hm_{hm_key}', val_metrics[val_key], global_epoch_counter)
 

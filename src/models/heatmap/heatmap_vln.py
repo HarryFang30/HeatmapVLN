@@ -76,6 +76,9 @@ class HeatmapVLN(nn.Module):
         heatmap_trains_backbone: bool = False,
         decoder_mode: str = "legacy",
         pose_free_config: dict[str, Any] | None = None,
+        coarse_logit_residual: bool = False,
+        restore_vit_spatial_layout: bool = False,
+        joint_panorama_inference: bool = False,
     ):
         super().__init__()
 
@@ -93,6 +96,8 @@ class HeatmapVLN(nn.Module):
         self.llm_layer_indices = llm_layer_indices
         self.enable_runtime_timing = enable_runtime_timing
         self.heatmap_trains_backbone = heatmap_trains_backbone
+        self.restore_vit_spatial_layout = bool(restore_vit_spatial_layout)
+        self.joint_panorama_inference = bool(joint_panorama_inference)
         self.decoder_mode = str(decoder_mode).strip().lower()
         if self.decoder_mode not in {"legacy", "pose_free_matcher"}:
             raise ValueError(f"decoder_mode must be 'legacy' or 'pose_free_matcher', got {decoder_mode!r}")
@@ -138,6 +143,7 @@ class HeatmapVLN(nn.Module):
             spatial_merge_size=spatial_merge_size,
             detach_features=not heatmap_trains_backbone,
             history_query_source=self.history_query_source,
+            restore_vit_spatial_layout=self.restore_vit_spatial_layout,
         )
 
         self.pose_free_matcher: PoseFreeHistoryMatcher | None = None
@@ -180,13 +186,17 @@ class HeatmapVLN(nn.Module):
                 self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
 
             # Fine localisation head (no longer needs c_llm — uses spatial_out from coarse)
-            self.fine = FineLocalization(c_fused)
+            self.fine = FineLocalization(
+                c_fused,
+                coarse_logit_residual=coarse_logit_residual,
+            )
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
             "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, "
-            "heatmap_trains_backbone=%s, decoder_mode=%s, history_query_source=%s, trainable=%s",
+            "heatmap_trains_backbone=%s, decoder_mode=%s, history_query_source=%s, "
+            "restore_vit_spatial_layout=%s, joint_panorama_inference=%s, trainable=%s",
             c_vit,
             c_llm,
             c_fused,
@@ -196,6 +206,8 @@ class HeatmapVLN(nn.Module):
             self.heatmap_trains_backbone,
             self.decoder_mode,
             self.history_query_source,
+            self.restore_vit_spatial_layout,
+            self.joint_panorama_inference,
             f"{trainable:,}",
         )
 
@@ -329,6 +341,8 @@ class HeatmapVLN(nn.Module):
         inputs: dict[str, torch.Tensor],
         num_history: int,
         history_rel_poses: torch.Tensor | None = None,
+        *,
+        return_memory_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Decode heatmaps from the most recent hooked Qwen forward."""
         device = self._decoder_device()
@@ -358,6 +372,7 @@ class HeatmapVLN(nn.Module):
             num_history=num_history,
             device=device,
             history_rel_poses=history_rel_poses,
+            return_memory_tokens=return_memory_tokens,
         )
 
     def decode_from_inputs_batch(
@@ -367,6 +382,8 @@ class HeatmapVLN(nn.Module):
         image_positions_batch: list[dict[int, tuple[int, int]]] | None = None,
         text_anchors_batch: list[dict[int, int]] | None = None,
         history_rel_poses: torch.Tensor | None = None,
+        *,
+        return_memory_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Decode batched panoramic inputs from one shared Qwen forward."""
         device = self._decoder_device()
@@ -397,6 +414,7 @@ class HeatmapVLN(nn.Module):
                 num_histories=num_histories,
                 device=device,
                 history_rel_poses=history_rel_poses,
+                return_memory_tokens=return_memory_tokens,
             )
 
         extracted = self.feat_extractor.extract_batch(
@@ -409,6 +427,7 @@ class HeatmapVLN(nn.Module):
             num_histories=num_histories,
             device=device,
             history_rel_poses=history_rel_poses,
+            return_memory_tokens=return_memory_tokens,
         )
 
     def _decode_features(
@@ -419,9 +438,11 @@ class HeatmapVLN(nn.Module):
         num_history: int,
         device: torch.device,
         history_rel_poses: torch.Tensor | None = None,
+        return_memory_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Run coarse-to-fine decoding from pre-extracted features."""
         self._reject_pose_for_pose_free(history_rel_poses)
+        self._validate_memory_request(return_memory_tokens)
         if self.decoder_mode == "pose_free_matcher":
             deepest_layer = max(self.llm_layer_indices)
             try:
@@ -452,10 +473,30 @@ class HeatmapVLN(nn.Module):
                 for key, value in result.items()
             }
         if num_history == 0:
-            return {
+            result = {
                 "visibility": torch.empty(0, 4, device=device),
                 "heatmaps": torch.empty(0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(0, 4, 64, 64, device=device),
             }
+            if return_memory_tokens:
+                fused_vit = self._fuse_view_features_batched(
+                    current_vit,
+                    self.vit_layer_indices,
+                    self.vit_dpt_fusion,
+                    device,
+                    output_layout="nchw",
+                )
+                result.update(
+                    history_memory=fused_vit.new_empty((1, 0, self.c_fused)),
+                    history_memory_mask=torch.empty(
+                        1, 0, dtype=torch.bool, device=device
+                    ),
+                    history_spatial_memory=fused_vit.new_empty(
+                        (1, 0, 4 * 8 * 8, self.c_fused)
+                    ),
+                    panoramic_vit_features=fused_vit.unsqueeze(0),
+                )
+            return result
         fused_vit = self._fuse_view_features_batched(
             current_vit,
             self.vit_layer_indices,
@@ -481,14 +522,28 @@ class HeatmapVLN(nn.Module):
         else:
             coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
-        all_heatmaps = self.fine(
+        all_heatmaps, all_heatmap_logits = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             spatial_out=coarse_results["spatial_out"],
+            return_logits=True,
         )
-        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {
+            "visibility": all_visibility,
+            "heatmaps": all_heatmaps,
+            "heatmap_logits": all_heatmap_logits,
+        }
+        if return_memory_tokens:
+            result.update(
+                history_memory=coarse_results["history_memory"].unsqueeze(0),
+                history_memory_mask=torch.ones(
+                    1, num_history, dtype=torch.bool, device=device
+                ),
+                history_spatial_memory=coarse_results["spatial_out"].unsqueeze(0),
+                panoramic_vit_features=fused_vit.unsqueeze(0),
+            )
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
+            result.update(self._build_inference_heatmaps(result))
         return result
 
     def _decode_features_batch(
@@ -499,21 +554,62 @@ class HeatmapVLN(nn.Module):
         num_histories: list[int],
         device: torch.device,
         history_rel_poses: torch.Tensor | None = None,
+        return_memory_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
         self._reject_pose_for_pose_free(history_rel_poses)
+        self._validate_memory_request(return_memory_tokens)
         batch_size = len(extracted)
         if batch_size == 0:
-            return {
+            result = {
                 "visibility": torch.empty(0, 0, 4, device=device),
                 "heatmaps": torch.empty(0, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(0, 0, 4, 64, 64, device=device),
             }
+            if return_memory_tokens:
+                result.update(
+                    history_memory=torch.empty(
+                        0, 0, self.c_fused, device=device
+                    ),
+                    history_memory_mask=torch.empty(
+                        0, 0, dtype=torch.bool, device=device
+                    ),
+                    history_spatial_memory=torch.empty(
+                        0, 0, 4 * 8 * 8, self.c_fused, device=device
+                    ),
+                    panoramic_vit_features=torch.empty(
+                        0, 4, self.c_fused, 16, 16, device=device
+                    ),
+                )
+            return result
 
         max_hist = max(num_histories) if num_histories else 0
         if max_hist == 0:
-            return {
+            result = {
                 "visibility": torch.empty(batch_size, 0, 4, device=device),
                 "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(batch_size, 0, 4, 64, 64, device=device),
             }
+            if return_memory_tokens:
+                fused_vit = self._fuse_view_features_multi_batch(
+                    feature_maps=[sample[0] for sample in extracted],
+                    layer_indices=self.vit_layer_indices,
+                    fusion_module=self.vit_dpt_fusion,
+                    device=device,
+                    output_layout="nchw",
+                )
+                result.update(
+                    history_memory=fused_vit.new_empty(
+                        (batch_size, 0, self.c_fused)
+                    ),
+                    history_memory_mask=torch.empty(
+                        batch_size, 0, dtype=torch.bool, device=device
+                    ),
+                    history_spatial_memory=fused_vit.new_empty(
+                        (batch_size, 0, 4 * 8 * 8, self.c_fused)
+                    ),
+                    panoramic_vit_features=fused_vit,
+                )
+            return result
 
         if self.decoder_mode == "pose_free_matcher":
             deepest_layer = max(self.llm_layer_indices)
@@ -553,8 +649,28 @@ class HeatmapVLN(nn.Module):
 
         current_vit_batch = []
         current_llm_batch = []
-        history_queries_tensor = None
-        history_mask = None
+        first_query = next(
+            (
+                query
+                for _current_vit, _current_llm, queries in extracted
+                for query in queries[:1]
+            ),
+            None,
+        )
+        if first_query is None:
+            raise RuntimeError(
+                "num_histories reports history but no history query was captured"
+            )
+        history_queries_tensor = torch.zeros(
+            batch_size,
+            max_hist,
+            first_query.shape[-1],
+            device=device,
+            dtype=first_query.dtype,
+        )
+        history_mask = torch.zeros(
+            batch_size, max_hist, device=device, dtype=torch.bool
+        )
 
         for batch_idx, (current_vit, current_llm, history_queries) in enumerate(extracted):
             self._validate_and_log_current_llm(current_llm)
@@ -566,27 +682,10 @@ class HeatmapVLN(nn.Module):
             current_vit_batch.append(current_vit)
             current_llm_batch.append(current_llm)
 
-            if history_queries_tensor is None:
-                if len(history_queries) == 0:
-                    raise RuntimeError("No history queries found in batched decode.")
-                query_dim = history_queries[0].shape[-1]
-                query_dtype = history_queries[0].dtype
-                history_queries_tensor = torch.zeros(
-                    batch_size,
-                    max_hist,
-                    query_dim,
-                    device=device,
-                    dtype=query_dtype,
-                )
-                history_mask = torch.zeros(batch_size, max_hist, device=device, dtype=torch.bool)
-
             if history_queries:
                 query_stack = torch.stack(history_queries, dim=0).to(device=device, dtype=history_queries_tensor.dtype)
                 history_queries_tensor[batch_idx, :expected_hist] = query_stack
                 history_mask[batch_idx, :expected_hist] = True
-
-        if history_queries_tensor is None or history_mask is None:
-            raise RuntimeError("Failed to build batched history query tensor.")
 
         fused_vit = self._fuse_view_features_multi_batch(
             feature_maps=current_vit_batch,
@@ -612,19 +711,37 @@ class HeatmapVLN(nn.Module):
         else:
             coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
-        all_heatmaps = self.fine(
+        all_heatmaps, all_heatmap_logits = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             spatial_out=coarse_results["spatial_out"],
+            return_logits=True,
         )
 
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        all_heatmap_logits = (
+            all_heatmap_logits
+            * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
 
-        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {
+            "visibility": all_visibility,
+            "heatmaps": all_heatmaps,
+            "heatmap_logits": all_heatmap_logits,
+        }
+        if return_memory_tokens:
+            result.update(
+                history_memory=coarse_results["history_memory"]
+                * history_mask_f.unsqueeze(-1),
+                history_memory_mask=history_mask,
+                history_spatial_memory=coarse_results["spatial_out"]
+                * history_mask_f[:, :, None, None],
+                panoramic_vit_features=fused_vit,
+            )
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
+            result.update(self._build_inference_heatmaps(result))
         return result
 
     def _decode_feature_tensors_batch(
@@ -635,22 +752,62 @@ class HeatmapVLN(nn.Module):
         num_histories: list[int],
         device: torch.device,
         history_rel_poses: torch.Tensor | None = None,
+        return_memory_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
         self._reject_pose_for_pose_free(history_rel_poses)
+        self._validate_memory_request(return_memory_tokens)
         timings: dict[str, float] = {}
         batch_size = len(history_queries_batch)
         if batch_size == 0:
-            return {
+            result = {
                 "visibility": torch.empty(0, 0, 4, device=device),
                 "heatmaps": torch.empty(0, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(0, 0, 4, 64, 64, device=device),
             }
+            if return_memory_tokens:
+                result.update(
+                    history_memory=torch.empty(
+                        0, 0, self.c_fused, device=device
+                    ),
+                    history_memory_mask=torch.empty(
+                        0, 0, dtype=torch.bool, device=device
+                    ),
+                    history_spatial_memory=torch.empty(
+                        0, 0, 4 * 8 * 8, self.c_fused, device=device
+                    ),
+                    panoramic_vit_features=torch.empty(
+                        0, 4, self.c_fused, 16, 16, device=device
+                    ),
+                )
+            return result
 
         max_hist = max(num_histories) if num_histories else 0
         if max_hist == 0:
-            return {
+            result = {
                 "visibility": torch.empty(batch_size, 0, 4, device=device),
                 "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(batch_size, 0, 4, 64, 64, device=device),
             }
+            if return_memory_tokens:
+                fused_vit = self._fuse_layer_tensor_batch(
+                    layer_tensors=vit_layer_tensors,
+                    layer_indices=self.vit_layer_indices,
+                    fusion_module=self.vit_dpt_fusion,
+                    output_layout="nchw",
+                )
+                result.update(
+                    history_memory=fused_vit.new_empty(
+                        (batch_size, 0, self.c_fused)
+                    ),
+                    history_memory_mask=torch.empty(
+                        batch_size, 0, dtype=torch.bool, device=device
+                    ),
+                    history_spatial_memory=fused_vit.new_empty(
+                        (batch_size, 0, 4 * 8 * 8, self.c_fused)
+                    ),
+                    panoramic_vit_features=fused_vit,
+                )
+            return result
 
         self._validate_and_log_current_llm_layer_tensors(llm_layer_tensors)
 
@@ -753,10 +910,11 @@ class HeatmapVLN(nn.Module):
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             t_fine0 = time.perf_counter()
-        all_heatmaps = self.fine(
+        all_heatmaps, all_heatmap_logits = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             spatial_out=coarse_results["spatial_out"],
+            return_logits=True,
         )
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
@@ -768,13 +926,30 @@ class HeatmapVLN(nn.Module):
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        all_heatmap_logits = (
+            all_heatmap_logits
+            * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             timings["decode_post_s"] = time.perf_counter() - t_post0
 
-        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {
+            "visibility": all_visibility,
+            "heatmaps": all_heatmaps,
+            "heatmap_logits": all_heatmap_logits,
+        }
+        if return_memory_tokens:
+            result.update(
+                history_memory=coarse_results["history_memory"]
+                * history_mask_f.unsqueeze(-1),
+                history_memory_mask=history_mask,
+                history_spatial_memory=coarse_results["spatial_out"]
+                * history_mask_f[:, :, None, None],
+                panoramic_vit_features=fused_vit,
+            )
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
+            result.update(self._build_inference_heatmaps(result))
         if self.enable_runtime_timing:
             result["timings"] = timings
         return result
@@ -793,13 +968,82 @@ class HeatmapVLN(nn.Module):
             history_mask=history_mask,
         )
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(result["heatmaps"], result["visibility"])
+            result.update(self._build_inference_heatmaps(result))
         return result
+
+    def _validate_memory_request(self, return_memory_tokens: bool) -> None:
+        if return_memory_tokens and (
+            self.decoder_mode != "legacy" or not self.enable_trajectory
+        ):
+            raise RuntimeError(
+                "Past -> Plan memory requires the trajectory-guided legacy decoder"
+            )
+
+    def _build_inference_heatmaps(
+        self,
+        result: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Build operational probabilities from the same raw logits as training."""
+        heatmap_logits = result.get("heatmap_logits")
+        if heatmap_logits is None:
+            raise RuntimeError(
+                "Heatmap inference requires raw heatmap_logits; the decoder "
+                "returned only sigmoid probabilities"
+            )
+        visibility = result["visibility"]
+        if self.joint_panorama_inference:
+            heatmaps_gated, none_probability = self._joint_panorama_probabilities(
+                heatmap_logits,
+                visibility,
+            )
+            return {
+                "heatmaps_gated": heatmaps_gated.to(result["heatmaps"].dtype),
+                "none_probability": none_probability,
+            }
+        return {
+            "heatmaps_gated": self._gated_softmax_heatmaps(
+                result["heatmaps"],
+                visibility,
+                heatmap_logits=heatmap_logits,
+            )
+        }
+
+    @staticmethod
+    def _joint_panorama_probabilities(
+        heatmap_logits: torch.Tensor,
+        visibility: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized ``4*H*W + none`` hierarchical probabilities."""
+        logits = heatmap_logits.float()
+        height, width = logits.shape[-2:]
+        spatial_probability = torch.softmax(
+            logits.reshape(*logits.shape[:-2], height * width),
+            dim=-1,
+        ).reshape_as(logits)
+
+        view_logits = visibility.float()
+        none_logit = torch.zeros(
+            *view_logits.shape[:-1],
+            1,
+            device=view_logits.device,
+            dtype=view_logits.dtype,
+        )
+        view_none_probability = torch.softmax(
+            torch.cat((none_logit, view_logits), dim=-1),
+            dim=-1,
+        )
+        view_probability = view_none_probability[..., 1:]
+        while view_probability.dim() < spatial_probability.dim():
+            view_probability = view_probability.unsqueeze(-1)
+        joint_probability = spatial_probability * view_probability
+        return joint_probability, view_none_probability[..., 0]
 
     @staticmethod
     def _gated_softmax_heatmaps(
         heatmaps: torch.Tensor,
         visibility: torch.Tensor,
+        *,
+        heatmap_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Produce inference-time probability heatmaps.
 
@@ -811,9 +1055,19 @@ class HeatmapVLN(nn.Module):
 
         Returns tensor with same shape as *heatmaps*.
         """
-        # (..., H, W) → logits → spatial softmax probability
+        # Legacy callers can omit logits; corrected training/inference passes
+        # the decoder's raw output and avoids sigmoid -> clamp -> logit.
         _H, _W = heatmaps.shape[-2], heatmaps.shape[-1]
-        logits = torch.logit(heatmaps.float().clamp(1e-6, 1 - 1e-6))
+        logits = (
+            heatmap_logits.float()
+            if heatmap_logits is not None
+            else torch.logit(heatmaps.float().clamp(1e-6, 1 - 1e-6))
+        )
+        if logits.shape != heatmaps.shape:
+            raise ValueError(
+                "heatmap_logits/heatmaps shape mismatch: "
+                f"{tuple(logits.shape)} vs {tuple(heatmaps.shape)}"
+            )
         probs = torch.softmax(logits.reshape(*logits.shape[:-2], -1), dim=-1)
         probs = probs.reshape_as(heatmaps).to(heatmaps.dtype)
         # Visibility gate

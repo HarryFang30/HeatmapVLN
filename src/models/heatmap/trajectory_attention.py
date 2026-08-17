@@ -14,6 +14,7 @@ three types of tokens to interact:
 Outputs:
   - coarse_heatmap (N, 4, 8, 8)       — per-history-location heatmap logits
   - visibility     (N, 4)             — per-view visibility logits
+  - history_memory (N, d_attn)        — compact per-history token for Plan
   - spatial_out    (N, V*H*W, d_attn) — enriched spatial features for Fine
 """
 
@@ -165,6 +166,7 @@ class TrajectoryGuidedAttention(nn.Module):
                     "visibility": torch.empty(0, 4, device=device),
                     "coarse_heatmap": torch.empty(0, 4, H, W, device=device),
                     "spatial_out": torch.empty(0, V * H * W, self.d_attn, device=device),
+                    "history_memory": torch.empty(0, self.d_attn, device=device),
                 }
             history_queries_tensor = torch.stack(history_queries, dim=0)
         else:
@@ -204,6 +206,7 @@ class TrajectoryGuidedAttention(nn.Module):
         results_vis = []
         results_hm = []
         results_spatial = []
+        results_memory = []
 
         for i in range(N):
             tokens = torch.cat([
@@ -227,11 +230,13 @@ class TrajectoryGuidedAttention(nn.Module):
             results_hm.append(hm)
             results_vis.append(vis)
             results_spatial.append(sp_out)
+            results_memory.append(hist_out)
 
         return {
             "coarse_heatmap": torch.stack(results_hm, dim=0),       # (N, 4, H, W)
             "visibility": torch.stack(results_vis, dim=0),           # (N, 4)
             "spatial_out": torch.stack(results_spatial, dim=0),      # (N, V*H*W, d_attn)
+            "history_memory": torch.stack(results_memory, dim=0),    # (N, d_attn)
         }
 
     def _forward_batch(
@@ -276,4 +281,5 @@ class TrajectoryGuidedAttention(nn.Module):
             "coarse_heatmap": heatmaps,
             "visibility": visibility,
             "spatial_out": sp_out.reshape(B, N, V * H * W, self.d_attn),  # (B, N, 256, d_attn)
+            "history_memory": hist_out.reshape(B, N, self.d_attn),  # (B, N, d_attn)
         }

@@ -206,6 +206,7 @@ set_int(trajectory, "num_history_sample", env("NUM_HISTORY_SAMPLE"))
 set_bool(trajectory, "panoramic_vlm_input", env("PANORAMIC_VLM_INPUT"))
 set_bool(trajectory, "random_subsequence", env("RANDOM_SUBSEQUENCE"))
 set_bool(trajectory, "enable_trajectory_augmentation", env("ENABLE_TRAJECTORY_AUGMENTATION"))
+set_int(trajectory, "max_clips", env("MAX_CLIPS"))
 
 llm = cfg.setdefault("model", {}).setdefault("llm", {})
 attn_impl = env("LLM_ATTN_IMPLEMENTATION")
@@ -226,7 +227,7 @@ visible_device_count = len([
     if token.strip()
 ])
 gpu["devices"] = list(range(visible_device_count))
-gpu.setdefault("multi_gpu", {})["enabled"] = True
+gpu.setdefault("multi_gpu", {})["enabled"] = visible_device_count > 1
 gpu.setdefault("backend", "nccl")
 
 log_cfg = cfg.setdefault("log", {})
@@ -326,11 +327,13 @@ print(
     )
 )
 print(
-    "  trajectory.num_history_sample=%s, panoramic_vlm_input=%s, load_lookdown_for_system2=%s"
+    "  trajectory.num_history_sample=%s, panoramic_vlm_input=%s, "
+    "load_lookdown_for_system2=%s, max_clips=%s"
     % (
         trajectory.get("num_history_sample"),
         trajectory.get("panoramic_vlm_input"),
         trajectory.get("load_lookdown_for_system2"),
+        trajectory.get("max_clips", 0),
     )
 )
 print(

@@ -1,0 +1,20 @@
+{
+  "description": "Supplemental R2R train STOP DAgger cohort for the only scene omitted by six-way balancing.",
+  "episodes": [
+    {
+      "scene_id": "gZ6f7yhEvPG",
+      "episode_id": 2021,
+      "baseline": "train_split_closed_loop_dagger"
+    },
+    {
+      "scene_id": "gZ6f7yhEvPG",
+      "episode_id": 2022,
+      "baseline": "train_split_closed_loop_dagger"
+    },
+    {
+      "scene_id": "gZ6f7yhEvPG",
+      "episode_id": 2023,
+      "baseline": "train_split_closed_loop_dagger"
+    }
+  ]
+}

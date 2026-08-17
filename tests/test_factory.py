@@ -34,6 +34,7 @@ class TestFactory:
             assert call_kwargs["split"] == "val"
             assert call_kwargs["min_history"] == 5
             assert call_kwargs["enable_augmentation"] is False
+            assert call_kwargs["load_future_trajectory_heatmap"] is False
 
     def test_build_trajectory_can_skip_duplicate_history_frames(self, minimal_cfg):
         minimal_cfg["data"]["trajectory"]["load_history_frames"] = False
@@ -41,6 +42,35 @@ class TestFactory:
             build_trajectory_dataset(minimal_cfg, split="train")
 
         assert mock_ds.call_args.kwargs["load_history_frames"] is False
+
+    def test_build_trajectory_threads_future_heatmap_config(self, minimal_cfg):
+        minimal_cfg["data"]["trajectory"]["future_heatmap"] = {
+            "enabled": True,
+            "heatmap_size": [64, 64],
+            "agent_camera_height_m": 1.25,
+        }
+        with patch("src.data.trajectory_dataset.VLNTrajectoryDataset") as mock_ds:
+            build_trajectory_dataset(minimal_cfg, split="train")
+
+        kwargs = mock_ds.call_args.kwargs
+        assert kwargs["load_future_trajectory_heatmap"] is True
+        assert kwargs["future_heatmap_size"] == (64, 64)
+        assert kwargs["future_agent_camera_height_m"] == 1.25
+
+    def test_build_trajectory_passes_stop_hard_negative_sampling(self, minimal_cfg):
+        trajectory = minimal_cfg["data"]["trajectory"]
+        trajectory["system2_stop_path_radius_m"] = 3.0
+        trajectory["system2_near_stop_hard_negative_oversample"] = 2
+        trajectory["system2_near_stop_hard_negative_min_path_m"] = 3.5
+        trajectory["system2_near_stop_hard_negative_max_path_m"] = 12.0
+        with patch("src.data.trajectory_dataset.VLNTrajectoryDataset") as mock_ds:
+            build_trajectory_dataset(minimal_cfg, split="train")
+
+        kwargs = mock_ds.call_args.kwargs
+        assert kwargs["system2_stop_path_radius_m"] == 3.0
+        assert kwargs["system2_near_stop_hard_negative_oversample"] == 2
+        assert kwargs["system2_near_stop_hard_negative_min_path_m"] == 3.5
+        assert kwargs["system2_near_stop_hard_negative_max_path_m"] == 12.0
 
     def test_build_dataset_dispatches_sliding_window(self, minimal_cfg):
         """build_dataset dispatches to sliding_window when dataset_type matches."""

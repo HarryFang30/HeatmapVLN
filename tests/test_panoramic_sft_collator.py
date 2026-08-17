@@ -1,5 +1,7 @@
 import torch
 
+from src.data.future_trajectory_batch import future_target_to_tensors
+from src.data.future_trajectory_heatmap import render_future_trajectory_heatmaps
 from src.data.panoramic_tokenized_collator import (
     IGNORE_INDEX,
     PanoramicTokenizedCollator,
@@ -63,6 +65,40 @@ class _FakeProcessor:
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
+
+
+class _StructuredTokenizer(_FakeTokenizer):
+    _class_ids = {
+        "stop": 501,
+        "front": 502,
+        "right": 503,
+        "back": 504,
+        "left": 505,
+        "turn": 506,
+    }
+
+    def encode(self, text, add_special_tokens=False):
+        for name, token_id in self._class_ids.items():
+            marker = f"view: {name}"
+            start = text.find(marker)
+            if start >= 0:
+                return [
+                    *super().encode(text[:start], add_special_tokens=add_special_tokens),
+                    401,
+                    402,
+                    token_id,
+                    *super().encode(
+                        text[start + len(marker):],
+                        add_special_tokens=add_special_tokens,
+                    ),
+                ]
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
+class _StructuredProcessor(_FakeProcessor):
+    def __init__(self):
+        super().__init__()
+        self.tokenizer = _StructuredTokenizer()
 
 
 def _sample(pixel_goal=None, discrete_action=1, is_stop=0.0, pano_view_id=None, pano_pixel_goal=None, pano_sample_kind=None):
@@ -204,6 +240,35 @@ def test_panoramic_sft_collator_structured_pano_stop_and_turn():
     assert out["sft_target_text"] == [["view: stop"], ["view: turn"]]
 
 
+def test_stop_head_supervision_uses_state_before_single_class_token():
+    collator = PanoramicTokenizedCollator(
+        _StructuredProcessor(),
+        sft_mode=True,
+        build_stop_head_targets=True,
+    )
+    out = collator([
+        _sample(
+            pano_view_id="view_stop",
+            pano_sample_kind="stop",
+        ),
+        _sample(
+            pano_view_id="front",
+            pano_pixel_goal=[128, 128],
+            pano_sample_kind="pixel",
+        ),
+    ])
+
+    assert out["system2_stop_target"].tolist() == [1.0, 0.0]
+    positions = out["system2_stop_predictor_position"]
+    input_ids = out["pano_inputs"]["input_ids"]
+    labels = out["pano_inputs"]["labels"]
+    tokenizer = collator.processor.tokenizer
+    assert input_ids[0, positions[0] + 1].item() == tokenizer._class_ids["stop"]
+    assert input_ids[1, positions[1] + 1].item() == tokenizer._class_ids["front"]
+    assert labels[0, positions[0]].item() != IGNORE_INDEX
+    assert labels[0, positions[0] + 1].item() == tokenizer._class_ids["stop"]
+
+
 def test_stage3_lean_collator_drops_only_unused_raw_inputs():
     sample = _sample(
         pano_view_id='front',
@@ -234,6 +299,47 @@ def test_stage3_lean_collator_drops_only_unused_raw_inputs():
     assert out['pano_inputs']['input_ids'].shape[1] >= 4
     assert out['trajectory'].shape == (1, 12, 32, 3)
     assert out['traj_images'].shape == (1, 12, 2, 2, 3)
+
+
+def test_panoramic_collator_stacks_future_targets_before_clearing_samples():
+    points = torch.zeros(32, 3).numpy()
+    points[:, 2] = -2.0
+    intrinsics = torch.tensor(
+        [[192.0, 0.0, 191.5], [0.0, 192.0, 191.5], [0.0, 0.0, 1.0]]
+    ).numpy()
+    sample = _sample()
+    sample.update(
+        future_target_to_tensors(
+            render_future_trajectory_heatmaps(points, intrinsics=intrinsics)
+        )
+    )
+    collator = PanoramicTokenizedCollator(
+        _FakeProcessor(),
+        include_future_heatmap_targets=True,
+    )
+
+    out = collator([sample])
+
+    assert out["future_trajectory_heatmap"].shape == (1, 4, 4, 64, 64)
+    assert out["future_trajectory_time_mask"].all()
+
+
+def test_panoramic_collator_future_targets_are_opt_in():
+    points = torch.zeros(32, 3).numpy()
+    points[:, 2] = -2.0
+    intrinsics = torch.tensor(
+        [[192.0, 0.0, 191.5], [0.0, 192.0, 191.5], [0.0, 0.0, 1.0]]
+    ).numpy()
+    sample = _sample()
+    sample.update(
+        future_target_to_tensors(
+            render_future_trajectory_heatmaps(points, intrinsics=intrinsics)
+        )
+    )
+
+    out = PanoramicTokenizedCollator(_FakeProcessor())([sample])
+
+    assert not any(key.startswith("future_trajectory_") for key in out)
 
 
 def test_worker_tokenized_heatmap_layout_places_current_before_history_anchor():

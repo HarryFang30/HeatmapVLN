@@ -1,0 +1,262 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="980" viewBox="0 0 2200 980" role="img" aria-labelledby="title desc">
+  <title id="title">Overall Navigation Architecture with AMB3R-Conditioned Heatmap Guidance</title>
+  <desc id="desc">The preserved InternNav System-2 to System-1 backbone is augmented with a causal AMB3R pose sidecar, a front-view trajectory-guided heatmap head, a structured tokenizer, and a zero-gated cross-attention branch in every frozen NextDiT block.</desc>
+
+  <defs>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; }
+      .title { font-family: Arial, Helvetica, sans-serif; font-size: 30px; font-weight: 700; fill: #1F2933; }
+      .group-title { font-family: Arial, Helvetica, sans-serif; font-size: 20px; font-weight: 700; fill: #FFFFFF; letter-spacing: .2px; }
+      .module-title { font-family: Arial, Helvetica, sans-serif; font-size: 18px; font-weight: 700; fill: #24313A; }
+      .module-sub { font-family: Arial, Helvetica, sans-serif; font-size: 14px; font-weight: 400; fill: #52616B; }
+      .small { font-family: Arial, Helvetica, sans-serif; font-size: 12px; font-weight: 400; fill: #64727C; }
+      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 11px; font-weight: 600; fill: #52616B; letter-spacing: .2px; }
+      .badge { font-family: Arial, Helvetica, sans-serif; font-size: 10px; font-weight: 700; letter-spacing: .7px; }
+      .view-label { font-family: Arial, Helvetica, sans-serif; font-size: 11px; font-weight: 700; fill: #4C5963; }
+      .flow-label { font-family: Arial, Helvetica, sans-serif; font-size: 12px; font-weight: 600; fill: #52616B; }
+    </style>
+
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4E5B64"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#D98532"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4E91C4"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#218779"/>
+    </marker>
+    <marker id="arrow-dashed" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8A9298"/>
+    </marker>
+
+    <symbol id="frame-front" viewBox="0 0 80 54">
+      <rect x="1" y="1" width="78" height="52" rx="6" fill="#E9F1F3" stroke="#7A9199" stroke-width="1.2"/>
+      <path d="M2 53 L24 28 L58 28 L78 53 Z" fill="#CEB79C"/>
+      <path d="M2 2 L24 28 L24 53 L2 53 Z" fill="#CCDEE4"/>
+      <path d="M78 2 L58 28 L58 53 L78 53 Z" fill="#E6D3BF"/>
+      <rect x="34" y="8" width="16" height="21" rx="2" fill="#73909B"/>
+      <rect x="37" y="11" width="10" height="15" fill="#B9D8E1"/>
+      <path d="M41 29 V53 M24 28 L2 40 M58 28 L78 40" fill="none" stroke="#9E836C" stroke-width="1"/>
+    </symbol>
+
+    <symbol id="heatmap" viewBox="0 0 54 54">
+      <rect x="1" y="1" width="52" height="52" rx="6" fill="#17212B" stroke="#55707A" stroke-width="1.1"/>
+      <circle cx="34" cy="22" r="15" fill="#6C2F35" opacity=".72"/>
+      <circle cx="34" cy="22" r="10" fill="#D25A32" opacity=".88"/>
+      <circle cx="34" cy="22" r="6" fill="#F0A83A"/>
+      <circle cx="34" cy="22" r="2.7" fill="#FFF3A5"/>
+    </symbol>
+
+    <symbol id="pose-path" viewBox="0 0 92 58">
+      <rect x="1" y="1" width="90" height="56" rx="7" fill="#F7FBFE" stroke="#9DBFD7" stroke-width="1"/>
+      <path d="M15 44 C25 38, 24 24, 37 25 S53 45, 65 36 S70 18, 81 14" fill="none" stroke="#4E91C4" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="15" cy="44" r="4" fill="#A8CBE2"/>
+      <circle cx="37" cy="25" r="4" fill="#86B8D8"/>
+      <circle cx="65" cy="36" r="4" fill="#68A4CC"/>
+      <path d="M77 10 L84 13 L79 19" fill="none" stroke="#2F78AB" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+
+  <rect width="2200" height="980" fill="#FFFFFF"/>
+  <text x="1100" y="45" text-anchor="middle" class="title">Overall Navigation Architecture with AMB3R-Conditioned Heatmap Guidance</text>
+
+  <!-- Group backgrounds -->
+  <rect x="45" y="105" width="805" height="330" rx="18" fill="#FFF8F1" stroke="#D98532" stroke-width="2"/>
+  <rect x="68" y="86" width="438" height="39" rx="10" fill="#D98532"/>
+  <text x="287" y="112" text-anchor="middle" class="group-title">System-2 · Slow Vision-Language Reasoning</text>
+  <rect x="681" y="120" width="140" height="25" rx="12" fill="#FFF0E1" stroke="#E5B17D"/>
+  <text x="751" y="137" text-anchor="middle" class="badge" fill="#96500F">ORIGINAL INTERNNAV</text>
+
+  <rect x="1185" y="105" width="970" height="330" rx="18" fill="#F4FAF0" stroke="#669B4B" stroke-width="2"/>
+  <rect x="1208" y="86" width="335" height="39" rx="10" fill="#669B4B"/>
+  <text x="1375" y="112" text-anchor="middle" class="group-title">System-1 · Fast Diffusion Control</text>
+  <rect x="1980" y="120" width="145" height="25" rx="12" fill="#EAF5E5" stroke="#9BC487"/>
+  <text x="2052" y="137" text-anchor="middle" class="badge" fill="#416C30">ORIGINAL INTERNNAV</text>
+
+  <rect x="145" y="520" width="1910" height="395" rx="18" fill="#F4FBF9" stroke="#218779" stroke-width="2.3"/>
+  <rect x="170" y="500" width="480" height="40" rx="10" fill="#218779"/>
+  <text x="410" y="527" text-anchor="middle" class="group-title">NEW · AMB3R-Conditioned Heatmap Guidance</text>
+  <rect x="1870" y="535" width="155" height="25" rx="12" fill="#E2F4EF" stroke="#69AA9F"/>
+  <text x="1947" y="552" text-anchor="middle" class="badge" fill="#176B60">DEPLOYMENT PATH</text>
+
+  <!-- Original backbone arrows -->
+  <path d="M235 205 H355" fill="none" stroke="#D98532" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+  <path d="M335 320 H355" fill="none" stroke="#D98532" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+  <path d="M645 245 H690" fill="none" stroke="#D98532" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+  <path d="M820 286 H900" fill="none" stroke="#4E5B64" stroke-width="2.6" marker-end="url(#arrow-gray)"/>
+  <path d="M1150 260 H1225" fill="none" stroke="#4E5B64" stroke-width="2.6" marker-end="url(#arrow-gray)"/>
+  <path d="M1420 228 H1480" fill="none" stroke="#669B4B" stroke-width="2.4" marker-end="url(#arrow-gray)"/>
+  <path d="M1900 228 H1970" fill="none" stroke="#669B4B" stroke-width="2.4" marker-end="url(#arrow-gray)"/>
+
+  <!-- System-2 inputs -->
+  <rect x="82" y="163" width="153" height="83" rx="10" fill="#FFFFFF" stroke="#E3A365" stroke-width="1.4"/>
+  <path d="M104 181 H132 L143 192 V226 H104 Z" fill="#FFF4E9" stroke="#C97A2D" stroke-width="1.3"/>
+  <path d="M132 181 V192 H143" fill="none" stroke="#C97A2D" stroke-width="1.3"/>
+  <path d="M111 201 H136 M111 209 H136 M111 217 H130" stroke="#D5A172" stroke-width="1.6" stroke-linecap="round"/>
+  <text x="184" y="196" text-anchor="middle" class="module-title">Instruction</text>
+  <text x="184" y="219" text-anchor="middle" class="module-sub">language goal</text>
+
+  <rect x="82" y="273" width="253" height="95" rx="10" fill="#FFFFFF" stroke="#E3A365" stroke-width="1.4"/>
+  <use href="#frame-front" x="97" y="291" width="65" height="44"/>
+  <use href="#frame-front" x="151" y="299" width="65" height="44" opacity=".82"/>
+  <use href="#frame-front" x="205" y="307" width="65" height="44" opacity=".67"/>
+  <text x="282" y="303" text-anchor="middle" class="module-title">Front RGB context</text>
+  <text x="282" y="326" text-anchor="middle" class="module-sub">history + current</text>
+  <text x="282" y="348" text-anchor="middle" class="small">optional look-down</text>
+
+  <!-- System-2 model -->
+  <rect x="355" y="155" width="290" height="180" rx="13" fill="#FFF2E5" stroke="#D98532" stroke-width="1.8"/>
+  <rect x="379" y="174" width="74" height="23" rx="11" fill="#FFFFFF" stroke="#E0A163"/>
+  <text x="416" y="190" text-anchor="middle" class="badge" fill="#9B5718">FROZEN</text>
+  <text x="500" y="232" text-anchor="middle" class="module-title">Qwen2.5-VL</text>
+  <text x="500" y="257" text-anchor="middle" class="module-sub">autoregressive reasoning</text>
+  <path d="M430 285 H570" stroke="#E3A365" stroke-width="1.4" stroke-linecap="round"/>
+  <text x="500" y="310" text-anchor="middle" class="small">pixel-goal context + latent queries → TRAJ states</text>
+
+  <rect x="690" y="174" width="130" height="64" rx="9" fill="#FFFFFF" stroke="#E3A365" stroke-width="1.3"/>
+  <text x="755" y="201" text-anchor="middle" class="tiny">PIXEL GOAL</text>
+  <path d="M724 216 H786" stroke="#D98532" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="785" cy="216" r="5" fill="#D98532"/>
+  <rect x="690" y="254" width="130" height="64" rx="9" fill="#FFFFFF" stroke="#E3A365" stroke-width="1.3"/>
+  <text x="755" y="281" text-anchor="middle" class="tiny">TRAJ HIDDEN STATES</text>
+  <circle cx="727" cy="298" r="5" fill="#E4A467"/>
+  <circle cx="746" cy="298" r="5" fill="#D98532"/>
+  <circle cx="765" cy="298" r="5" fill="#BD6C22"/>
+
+  <!-- Latent bridge -->
+  <rect x="900" y="187" width="250" height="146" rx="14" fill="#FAFBFC" stroke="#77858E" stroke-width="1.8"/>
+  <rect x="927" y="172" width="196" height="28" rx="9" fill="#4E5B64"/>
+  <text x="1025" y="191" text-anchor="middle" class="badge" fill="#FFFFFF">LATENT BRIDGE · FROZEN</text>
+  <text x="1025" y="237" text-anchor="middle" class="module-title">TRAJ latent states</text>
+  <path d="M957 258 H1093" stroke="#C3C9CD" stroke-width="1.5"/>
+  <text x="1025" y="286" text-anchor="middle" class="module-sub">native conditioning projector</text>
+  <text x="1025" y="312" text-anchor="middle" class="small">preserved interface</text>
+
+  <!-- System-1 -->
+  <rect x="1225" y="165" width="195" height="126" rx="11" fill="#FFFFFF" stroke="#91B47E" stroke-width="1.4"/>
+  <text x="1322" y="198" text-anchor="middle" class="module-title">Native context</text>
+  <text x="1322" y="223" text-anchor="middle" class="module-sub">latent conditioning</text>
+  <text x="1322" y="246" text-anchor="middle" class="module-sub">+ visual memory</text>
+  <text x="1322" y="272" text-anchor="middle" class="small">unchanged</text>
+
+  <rect x="1480" y="145" width="420" height="198" rx="14" fill="#F0F8EC" stroke="#669B4B" stroke-width="1.9"/>
+  <rect x="1504" y="164" width="74" height="23" rx="11" fill="#FFFFFF" stroke="#93BA80"/>
+  <text x="1541" y="180" text-anchor="middle" class="badge" fill="#487235">FROZEN</text>
+  <text x="1690" y="207" text-anchor="middle" class="module-title">NextDiT trajectory diffusion</text>
+  <text x="1690" y="233" text-anchor="middle" class="module-sub">native attention residual</text>
+  <rect x="1520" y="258" width="340" height="55" rx="9" fill="#E7F6F2" stroke="#218779" stroke-width="1.6"/>
+  <text x="1690" y="281" text-anchor="middle" class="tiny" fill="#176B60">ZERO-GATED CROSS-ATTENTION IN EACH BLOCK</text>
+  <text x="1690" y="301" text-anchor="middle" class="small" fill="#176B60">independent residual before each native FFN</text>
+  <rect x="1733" y="266" width="104" height="22" rx="10" fill="#218779"/>
+  <text x="1785" y="281" text-anchor="middle" class="badge" fill="#FFFFFF">TRAINABLE</text>
+
+  <rect x="1970" y="169" width="155" height="118" rx="11" fill="#FFFFFF" stroke="#91B47E" stroke-width="1.4"/>
+  <path d="M1997 251 C2014 241, 2023 217, 2045 222 S2073 246, 2100 194" fill="none" stroke="#669B4B" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="1997" cy="251" r="4" fill="#A8C998"/>
+  <circle cx="2045" cy="222" r="4" fill="#78A961"/>
+  <path d="M2095 192 L2103 192 L2100 201" fill="none" stroke="#507F3C" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="2047" y="201" text-anchor="middle" class="module-title">Local trajectory</text>
+  <text x="2047" y="271" text-anchor="middle" class="module-sub">actions</text>
+
+  <!-- New branch arrows, behind modules -->
+  <path d="M430 614 H500" fill="none" stroke="#4E91C4" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <path d="M750 614 H800" fill="none" stroke="#4E91C4" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <path d="M1030 614 H1080" fill="none" stroke="#4E91C4" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <path d="M430 765 H500" fill="none" stroke="#4E5B64" stroke-width="2.1" marker-end="url(#arrow-gray)"/>
+  <path d="M750 765 H800" fill="none" stroke="#4E5B64" stroke-width="2.1" marker-end="url(#arrow-gray)"/>
+  <path d="M1030 765 H1080" fill="none" stroke="#218779" stroke-width="2.5" marker-end="url(#arrow-teal)"/>
+  <path d="M1440 670 H1510" fill="none" stroke="#218779" stroke-width="2.8" marker-end="url(#arrow-teal)"/>
+  <path d="M1780 655 H1835 V343 H1690 V314" fill="none" stroke="#218779" stroke-width="3.2" stroke-linejoin="round" marker-end="url(#arrow-teal)"/>
+  <text x="1850" y="480" class="flow-label" fill="#176B60">heatmap tokens</text>
+  <text x="1850" y="500" class="small" fill="#176B60">injected into every block</text>
+  <path d="M1260 837 V790" fill="none" stroke="#8A9298" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrow-dashed)"/>
+
+  <!-- New branch inputs -->
+  <rect x="185" y="566" width="245" height="97" rx="11" fill="#FFFFFF" stroke="#8BB7D5" stroke-width="1.4"/>
+  <use href="#frame-front" x="198" y="594" width="49" height="33" opacity=".52"/>
+  <use href="#frame-front" x="218" y="590" width="49" height="33" opacity=".69"/>
+  <use href="#frame-front" x="238" y="586" width="49" height="33" opacity=".85"/>
+  <use href="#frame-front" x="258" y="582" width="49" height="33"/>
+  <text x="363" y="598" text-anchor="middle" class="module-title">Continuous Front RGB</text>
+  <text x="363" y="622" text-anchor="middle" class="module-sub">causal frame stream</text>
+  <text x="363" y="644" text-anchor="middle" class="small">episode-level VO state</text>
+
+  <rect x="185" y="715" width="245" height="100" rx="11" fill="#FFFFFF" stroke="#8A989F" stroke-width="1.4"/>
+  <use href="#frame-front" x="198" y="746" width="49" height="33" opacity=".56"/>
+  <use href="#frame-front" x="218" y="741" width="49" height="33" opacity=".74"/>
+  <use href="#frame-front" x="238" y="736" width="49" height="33"/>
+  <text x="363" y="747" text-anchor="middle" class="module-title">Sampled Front RGB</text>
+  <text x="363" y="773" text-anchor="middle" class="module-sub">K history + current</text>
+  <text x="363" y="797" text-anchor="middle" class="small">same frame IDs</text>
+
+  <!-- Frozen providers -->
+  <rect x="500" y="561" width="250" height="106" rx="12" fill="#EEF5FB" stroke="#4E91C4" stroke-width="1.8"/>
+  <rect x="520" y="578" width="74" height="22" rx="10" fill="#FFFFFF" stroke="#9ABFD9"/>
+  <text x="557" y="593" text-anchor="middle" class="badge" fill="#2E6E99">FROZEN</text>
+  <text x="625" y="624" text-anchor="middle" class="module-title">AMB3R-VO</text>
+  <text x="625" y="648" text-anchor="middle" class="module-sub">off-the-shelf monocular geometry</text>
+
+  <rect x="500" y="711" width="250" height="108" rx="12" fill="#F8FAFB" stroke="#7C8993" stroke-width="1.6"/>
+  <rect x="520" y="728" width="74" height="22" rx="10" fill="#FFFFFF" stroke="#B0BAC0"/>
+  <text x="557" y="743" text-anchor="middle" class="badge" fill="#59666F">FROZEN</text>
+  <text x="625" y="774" text-anchor="middle" class="module-title">Qwen.visual</text>
+  <text x="625" y="798" text-anchor="middle" class="module-sub">vision encoder in this branch</text>
+
+  <!-- Branch interfaces -->
+  <rect x="800" y="570" width="230" height="89" rx="11" fill="#F7FBFE" stroke="#7BAFD2" stroke-width="1.5"/>
+  <use href="#pose-path" x="817" y="585" width="84" height="53"/>
+  <text x="963" y="599" text-anchor="middle" class="module-title">Relative poses</text>
+  <text x="963" y="622" text-anchor="middle" class="module-sub">history → current</text>
+  <text x="963" y="644" text-anchor="middle" class="small">predicted at inference</text>
+  <text x="915" y="684" text-anchor="middle" class="tiny" fill="#2E6E99">REPLACES SIMULATOR GT POSE</text>
+
+  <rect x="800" y="719" width="230" height="92" rx="11" fill="#FFFFFF" stroke="#8A989F" stroke-width="1.4"/>
+  <rect x="820" y="743" width="54" height="44" rx="5" fill="#DDE9EC"/>
+  <rect x="833" y="753" width="28" height="24" rx="3" fill="#96BBC3"/>
+  <circle cx="898" cy="752" r="8" fill="#A8C5CB"/>
+  <circle cx="922" cy="752" r="8" fill="#86AFB8"/>
+  <circle cx="946" cy="752" r="8" fill="#6699A5"/>
+  <text x="963" y="783" text-anchor="middle" class="module-title">Visual features</text>
+  <text x="963" y="803" text-anchor="middle" class="small">current spatial + history queries</text>
+
+  <!-- Heatmap head -->
+  <rect x="1080" y="565" width="360" height="215" rx="14" fill="#EAF7F3" stroke="#218779" stroke-width="2.2"/>
+  <rect x="1102" y="582" width="68" height="22" rx="10" fill="#218779"/>
+  <text x="1136" y="597" text-anchor="middle" class="badge" fill="#FFFFFF">OURS</text>
+  <rect x="1288" y="582" width="127" height="22" rx="10" fill="#FFFFFF" stroke="#69AA9F"/>
+  <text x="1351" y="597" text-anchor="middle" class="badge" fill="#176B60">LEARNED HEAD</text>
+  <text x="1260" y="636" text-anchor="middle" class="module-title">Trajectory-Guided Heatmap Head</text>
+  <text x="1260" y="662" text-anchor="middle" class="module-sub">pose-conditioned visual fusion</text>
+  <text x="1260" y="685" text-anchor="middle" class="small">Front input → structured four-direction output</text>
+  <use href="#heatmap" x="1148" y="705" width="47" height="47"/>
+  <use href="#heatmap" x="1210" y="705" width="47" height="47"/>
+  <use href="#heatmap" x="1272" y="705" width="47" height="47"/>
+  <use href="#heatmap" x="1334" y="705" width="47" height="47"/>
+  <text x="1171" y="770" text-anchor="middle" class="view-label">F</text>
+  <text x="1233" y="770" text-anchor="middle" class="view-label">R</text>
+  <text x="1295" y="770" text-anchor="middle" class="view-label">B</text>
+  <text x="1357" y="770" text-anchor="middle" class="view-label">L</text>
+
+  <!-- Tokenizer -->
+  <rect x="1510" y="594" width="270" height="123" rx="13" fill="#E4F4EF" stroke="#218779" stroke-width="1.9"/>
+  <rect x="1532" y="611" width="104" height="22" rx="10" fill="#218779"/>
+  <text x="1584" y="626" text-anchor="middle" class="badge" fill="#FFFFFF">TRAINABLE</text>
+  <text x="1645" y="660" text-anchor="middle" class="module-title">Structured Heatmap Tokenizer</text>
+  <text x="1645" y="686" text-anchor="middle" class="module-sub">spatial distribution · confidence</text>
+  <text x="1645" y="707" text-anchor="middle" class="small">visibility · direction · age</text>
+
+  <!-- Training-only label cue -->
+  <rect x="1060" y="837" width="400" height="55" rx="10" fill="#FAFAFA" stroke="#8A9298" stroke-width="1.6" stroke-dasharray="7 6"/>
+  <rect x="1075" y="848" width="104" height="22" rx="10" fill="#ECEEEF"/>
+  <text x="1127" y="863" text-anchor="middle" class="badge" fill="#68747B">TRAINING ONLY</text>
+  <text x="1315" y="860" text-anchor="middle" class="module-sub">GT heatmap + visibility labels</text>
+  <text x="1315" y="881" text-anchor="middle" class="small">depth · pose · intrinsics — never inference inputs</text>
+
+  <!-- Lightweight legend / stage note -->
+  <rect x="1505" y="829" width="505" height="63" rx="10" fill="#FFFFFF" stroke="#8FC0B6" stroke-width="1.2"/>
+  <text x="1757" y="854" text-anchor="middle" class="tiny" fill="#176B60">NAVIGATION-CONTROL STAGE</text>
+  <text x="1757" y="878" text-anchor="middle" class="small">freeze heatmap head · train tokenizer + per-block adapters</text>
+</svg>

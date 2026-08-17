@@ -1,0 +1,473 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200" role="img" aria-labelledby="title desc">
+  <title id="title">HeatmapVLN method architecture with the trajectory-guided heatmap head as the central contribution</title>
+  <desc id="desc">A compact online navigation pipeline runs across the top. The large central panel explains the trajectory-guided heatmap head, including multi-scale hooks, history and relative-pose queries, trajectory-guided attention, coarse outputs, fine localization, and four directional heatmaps.</desc>
+
+  <defs>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8.6" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#588E32"/>
+    </marker>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="8.6" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#8B8B8B"/>
+    </marker>
+
+    <symbol id="panoFront" viewBox="0 0 88 58">
+      <rect x="1" y="1" width="86" height="56" rx="5" fill="#EAF1F4" stroke="#7F7F7F"/>
+      <polygon points="1,57 24,30 63,30 87,57" fill="#CDB293"/>
+      <polygon points="1,1 24,30 24,57 1,57" fill="#CBDDE5"/>
+      <polygon points="87,1 63,30 63,57 87,57" fill="#E9D4BF"/>
+      <rect x="35" y="8" width="17" height="23" fill="#7695A2"/>
+      <rect x="39" y="11" width="10" height="17" fill="#C4E3E9"/>
+      <rect x="6" y="18" width="12" height="13" rx="2" fill="#7893A5"/>
+      <rect x="68" y="21" width="14" height="10" rx="2" fill="#A98264"/>
+    </symbol>
+    <symbol id="panoSide" viewBox="0 0 88 58">
+      <rect x="1" y="1" width="86" height="56" rx="5" fill="#EAF0F2" stroke="#7F7F7F"/>
+      <polygon points="1,57 19,33 55,27 87,49 87,57" fill="#C6AA89"/>
+      <polygon points="1,1 19,33 19,57 1,57" fill="#D7E5EB"/>
+      <polygon points="87,1 55,27 55,57 87,57" fill="#E9D4BF"/>
+      <rect x="58" y="17" width="25" height="11" rx="2" fill="#A17B5D"/>
+      <rect x="56" y="31" width="27" height="9" rx="2" fill="#BB916C"/>
+      <rect x="27" y="9" width="13" height="22" fill="#82A3AF"/>
+    </symbol>
+    <symbol id="lookDown" viewBox="0 0 76 56">
+      <rect x="1" y="1" width="74" height="54" rx="5" fill="#EAF0F2" stroke="#7F7F7F"/>
+      <polygon points="1,55 16,18 60,18 75,55" fill="#CBB091"/>
+      <path d="M38 18 V55 M16 18 L1 39 M60 18 L75 39 M26 18 L20 55 M50 18 L56 55" fill="none" stroke="#987B66"/>
+      <rect x="31" y="5" width="14" height="14" rx="2" fill="#82A3AF"/>
+      <circle cx="38" cy="35" r="5" fill="#F39A3F"/>
+      <path d="M38 25 L32 33 H44 Z" fill="#FFFFFF"/>
+    </symbol>
+    <symbol id="heatmap" viewBox="0 0 58 76">
+      <rect x="1" y="1" width="56" height="74" rx="7" fill="#173A78" stroke="#7F7F7F"/>
+      <circle cx="36" cy="29" r="20" fill="#1B9CBD" opacity=".72"/>
+      <circle cx="36" cy="29" r="12" fill="#FFD84A"/>
+      <circle cx="36" cy="29" r="5" fill="#EF5B63"/>
+      <path d="M4 61 C16 48 25 68 38 57 C45 51 50 54 55 51" fill="none" stroke="#79D5DC" stroke-width="2" opacity=".75"/>
+    </symbol>
+    <symbol id="doc" viewBox="0 0 42 50">
+      <path d="M4 2 H27 L38 13 V48 H4 Z" fill="#FFFFFF" stroke="#7F7F7F" stroke-width="1.5"/>
+      <path d="M27 2 V13 H38" fill="#F5B482" stroke="#7F7F7F"/>
+      <circle cx="11" cy="12" r="5.5" fill="#FFD84A" stroke="#C65F10"/>
+      <path d="M11 9 V15 M8 12 H14 M11 24 H31 M11 31 H31 M11 38 H26" stroke="#7F7F7F" stroke-width="1.8" stroke-linecap="round"/>
+    </symbol>
+
+    <style>
+      .phase-title { font: 700 21px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; letter-spacing: .3px; }
+      .hero-title { font: 700 23px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #31551D; letter-spacing: .2px; }
+      .tab-title { font: 700 17px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; }
+      .bridge-title { font: 700 15px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; }
+      .module-title { font: 700 17px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; }
+      .section-label { font: 700 14px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #588E32; letter-spacing: .9px; }
+      .body { font: 400 14px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; }
+      .small { font: 400 12.5px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; }
+      .micro { font: 400 11.5px "Comic Sans MS", "Chalkboard SE", "Comic Sans", cursive; fill: #3B3838; }
+      .mono { font: 700 12.5px Consolas, "SFMono-Regular", Menlo, monospace; fill: #3B3838; }
+      .orange { fill: #843F0B; }
+      .green { fill: #3B5F21; }
+      .muted { fill: #707070; }
+      .phase { fill: none; stroke: #8B8B8B; stroke-width: 2.7; stroke-dasharray: 10 7; }
+      .tab { fill: #FFFFFF; stroke: #8B8B8B; stroke-width: 1.5; }
+      .orange-card { fill: #FFF3EA; stroke: #C65F10; stroke-width: 1.8; }
+      .green-card { fill: #FFFFFF; stroke: #588E32; stroke-width: 1.8; }
+      .gray-card { fill: #F4F4F4; stroke: #A5A5A5; stroke-width: 1.6; }
+      .supervision { fill: #FFFFFF; stroke: #9C9C9C; stroke-width: 1.6; stroke-dasharray: 7 5; }
+      .green-line { fill: none; stroke: #588E32; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowGreen); }
+      .gray-line { fill: none; stroke: #8B8B8B; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowGray); }
+      .tap-line { fill: none; stroke: #588E32; stroke-width: 2.2; stroke-dasharray: 7 6; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowGreen); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1200" fill="#FFFFFF"/>
+
+  <!-- Compact online pipeline across the top -->
+  <rect class="phase" x="35" y="82" width="620" height="340" rx="24"/>
+  <rect class="phase" x="945" y="82" width="620" height="340" rx="24"/>
+  <text class="phase-title" x="62" y="126">SYSTEM-2 · SLOW PANORAMIC REASONING</text>
+  <text class="phase-title" x="1255" y="126" text-anchor="middle">SYSTEM-1 · FAST DIFFUSION CONTROL</text>
+
+  <!-- System-2 supporting flow -->
+  <rect class="orange-card" x="62" y="171" width="173" height="185" rx="16"/>
+  <rect x="66" y="148" width="170" height="43" rx="11" fill="#FFF3EA" stroke="#C65F10" stroke-width="1.8"/>
+  <use href="#doc" x="78" y="156" width="20" height="24"/>
+  <text class="tab-title" x="166" y="177" text-anchor="middle">INSTRUCTION</text>
+  <use href="#doc" x="76" y="203" width="34" height="41"/>
+  <text class="small" x="117" y="218">text + history</text>
+  <text class="small" x="117" y="237">+ current RGB</text>
+  <g transform="translate(76,258)">
+    <use href="#panoFront" x="0" y="0" width="34" height="24"/>
+    <use href="#panoSide" x="39" y="0" width="34" height="24"/>
+    <use href="#panoFront" x="78" y="0" width="34" height="24"/>
+    <use href="#panoSide" x="117" y="0" width="34" height="24"/>
+    <text class="micro" x="10" y="43">F</text>
+    <text class="micro" x="49" y="43">R</text>
+    <text class="micro" x="88" y="43">B</text>
+    <text class="micro" x="127" y="43">L</text>
+  </g>
+  <text class="micro muted" x="148.5" y="328" text-anchor="middle">panoramic history + current</text>
+
+  <path d="M243 248 H259 V237 L282 263 L259 289 V278 H243 Z" fill="#F5B482"/>
+
+  <rect class="orange-card" x="284" y="153" width="213" height="221" rx="17"/>
+  <text class="module-title orange" x="390.5" y="188" text-anchor="middle">Qwen2.5-VL</text>
+  <circle cx="340" cy="237" r="28" fill="#E3EAF4" stroke="#7F7F7F"/>
+  <path d="M326 237 H354 M340 223 V251" stroke="#56708F" stroke-width="4" stroke-linecap="round"/>
+  <path d="M377 237 H417" stroke="#9C9C9C" stroke-width="4"/>
+  <path d="M417 228 L436 237 L417 246 Z" fill="#9C9C9C"/>
+  <rect x="438" y="213" width="41" height="49" rx="8" fill="#FFFFFF" stroke="#C65F10"/>
+  <path d="M447 226 H470 M447 236 H470 M447 246 H466" stroke="#C65F10" stroke-width="2.2" stroke-linecap="round"/>
+  <rect x="307" y="287" width="168" height="29" rx="14" fill="#F5B482"/>
+  <text class="small orange" x="328" y="307">1st pass · view + pixel</text>
+  <text class="micro muted" x="390.5" y="343" text-anchor="middle">shared ViT / LLM feature taps</text>
+
+  <path d="M505 248 H519 V237 L541 263 L519 289 V278 H505 Z" fill="#F5B482"/>
+
+  <rect class="orange-card" x="543" y="171" width="88" height="185" rx="15"/>
+  <text class="module-title orange" x="557" y="203">GOAL</text>
+  <rect x="554" y="220" width="66" height="83" rx="9" fill="#FFFFFF"/>
+  <text class="mono" x="560" y="242">view:</text>
+  <text class="mono" x="560" y="260">right</text>
+  <text class="mono" x="560" y="281">pixel</text>
+  <text class="mono" x="560" y="297">u, v</text>
+  <text class="micro orange" x="551" y="329">STOP bypass</text>
+
+  <!-- Compact bridge, deliberately shallow and subordinate -->
+  <path d="M638 247 H654 V236 L674 260 L654 284 V273 H638 Z" fill="#F5B482"/>
+  <rect x="670" y="185" width="260" height="160" rx="17" fill="#FFF9F5" stroke="#C65F10" stroke-width="1.8"/>
+  <rect class="tab" x="685" y="166" width="230" height="37" rx="10"/>
+  <text class="bridge-title" x="703" y="190">COMPACT LATENT BRIDGE</text>
+
+  <g transform="translate(688,222)">
+    <rect x="0" y="0" width="17" height="27" rx="5" fill="#F18A8F" stroke="#C65F10"/>
+    <rect x="21" y="0" width="17" height="27" rx="5" fill="#F18A8F" stroke="#C65F10"/>
+    <rect x="42" y="0" width="17" height="27" rx="5" fill="#F18A8F" stroke="#C65F10"/>
+    <rect x="63" y="0" width="17" height="27" rx="5" fill="#F18A8F" stroke="#C65F10"/>
+    <text class="micro orange" x="10" y="47">4 TRAJ</text>
+  </g>
+  <path d="M773 232 H786 V225 L800 239 L786 253 V246 H773 Z" fill="#F5B482"/>
+  <rect x="803" y="213" width="53" height="55" rx="9" fill="#FFFFFF" stroke="#C65F10"/>
+  <text class="micro orange" x="810" y="234">Residual</text>
+  <text class="micro orange" x="812" y="252">adapter</text>
+  <path d="M860 232 H871 V225 L884 239 L871 253 V246 H860 Z" fill="#F5B482"/>
+  <rect x="886" y="213" width="29" height="55" rx="8" fill="#FFFFFF" stroke="#588E32"/>
+  <text class="micro green" x="887" y="244">Proj.</text>
+  <g transform="translate(824,286)">
+    <rect x="0" y="0" width="16" height="23" rx="5" fill="#A9D88C" stroke="#588E32"/>
+    <rect x="20" y="0" width="16" height="23" rx="5" fill="#A9D88C" stroke="#588E32"/>
+    <rect x="40" y="0" width="16" height="23" rx="5" fill="#A9D88C" stroke="#588E32"/>
+    <rect x="60" y="0" width="16" height="23" rx="5" fill="#A9D88C" stroke="#588E32"/>
+  </g>
+  <text class="micro green" x="752" y="303" text-anchor="middle">2nd causal readout</text>
+  <text class="mono" x="800" y="331" text-anchor="middle">3584 → 1024 → 3584 → 768</text>
+  <text class="micro orange" x="809" y="282">trainable</text>
+  <text class="micro green" x="883" y="282">frozen</text>
+
+  <!-- System-1 visual memory -->
+  <rect class="gray-card" x="970" y="159" width="252" height="244" rx="16"/>
+  <text class="module-title" x="1096" y="190" text-anchor="middle">Independent Visual Memory</text>
+  <rect x="1147" y="344" width="60" height="22" rx="10" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro muted" x="1177" y="359" text-anchor="middle">FROZEN</text>
+
+  <!-- One deployed frame is duplicated into anchor/current slots. -->
+  <use href="#lookDown" x="986" y="208" width="50" height="38"/>
+  <path d="M1036 227 H1056" class="gray-line"/>
+  <rect x="1058" y="211" width="72" height="31" rx="13" fill="#FFF3EA" stroke="#C65F10"/>
+  <text class="micro orange" x="1094" y="231" text-anchor="middle">duplicate × 2</text>
+  <path d="M1130 227 H1148" class="gray-line"/>
+  <use href="#lookDown" x="1150" y="207" width="30" height="29"/>
+  <use href="#lookDown" x="1184" y="207" width="30" height="29"/>
+  <text class="micro" x="1182" y="253" text-anchor="middle">[anchor, current]</text>
+
+  <!-- DINO skip + encoded features are concatenated before a readable Q-Former. -->
+  <rect x="978" y="287" width="56" height="44" rx="8" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro" x="1006" y="305" text-anchor="middle">DINOv2</text>
+  <text class="micro" x="1006" y="322" text-anchor="middle">ViT-S/14</text>
+  <path d="M1034 309 H1056" class="gray-line"/>
+  <rect x="1058" y="287" width="54" height="44" rx="8" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro" x="1085" y="305" text-anchor="middle">Memory</text>
+  <text class="micro" x="1085" y="322" text-anchor="middle">Encoder</text>
+  <path d="M1112 309 H1127" class="gray-line"/>
+  <ellipse cx="1138" cy="309" rx="12" ry="9" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro" x="1138" y="313" text-anchor="middle">cat</text>
+  <path d="M1034 300 V274 H1138 V298" class="gray-line"/>
+  <text class="micro muted" x="1086" y="269" text-anchor="middle">original-feature skip</text>
+  <path d="M1150 309 H1160" class="gray-line"/>
+  <rect x="1162" y="287" width="54" height="44" rx="8" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro" x="1189" y="314" text-anchor="middle">Q-Former</text>
+
+  <circle cx="1027" cy="354" r="6.5" fill="#C58A56"/>
+  <circle cx="1047" cy="354" r="6.5" fill="#C58A56"/>
+  <circle cx="1067" cy="354" r="6.5" fill="#C58A56"/>
+  <text class="micro" x="1082" y="359">32×768</text>
+  <text class="micro muted" x="1096" y="391" text-anchor="middle">Memory 3L/6H · QF 32q/3L/12H</text>
+
+  <!-- System-1 fusion and diffusion control -->
+  <rect class="gray-card" x="1240" y="159" width="298" height="244" rx="16"/>
+  <text class="module-title" x="1389" y="190" text-anchor="middle">Conditioned Trajectory Diffusion</text>
+  <rect x="1261" y="207" width="255" height="61" rx="10" fill="#FFFFFF" stroke="#588E32"/>
+  <text class="micro muted" x="1326" y="221" text-anchor="middle">TOKEN CONCAT</text>
+  <circle cx="1285" cy="239" r="6" fill="#C58A56"/>
+  <circle cx="1304" cy="239" r="6" fill="#C58A56"/>
+  <circle cx="1323" cy="239" r="6" fill="#C58A56"/>
+  <text class="micro" x="1337" y="243">32</text>
+  <text class="module-title" x="1368" y="245">+</text>
+  <rect x="1391" y="228" width="17" height="22" rx="5" fill="#A9D88C" stroke="#588E32"/>
+  <rect x="1412" y="228" width="17" height="22" rx="5" fill="#A9D88C" stroke="#588E32"/>
+  <rect x="1433" y="228" width="17" height="22" rx="5" fill="#A9D88C" stroke="#588E32"/>
+  <rect x="1454" y="228" width="17" height="22" rx="5" fill="#A9D88C" stroke="#588E32"/>
+  <text class="micro green" x="1389" y="262" text-anchor="middle">36×768 · caption projector → 384</text>
+
+  <rect x="1261" y="276" width="190" height="96" rx="11" fill="#FFFFFF" stroke="#588E32" stroke-width="1.5"/>
+  <text class="module-title green" x="1356" y="299" text-anchor="middle">NextDiT × 12</text>
+  <circle cx="1284" cy="334" r="7" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <path d="M1291 334 H1301 V319 H1308 M1301 334 V353 H1308" fill="none" stroke="#8B8B8B" stroke-width="1.6"/>
+  <rect x="1310" y="305" width="96" height="27" rx="8" fill="#FFF3EA" stroke="#C65F10"/>
+  <circle cx="1321" cy="318" r="3.5" fill="#F5B482"/>
+  <circle cx="1331" cy="318" r="3.5" fill="#F5B482"/>
+  <circle cx="1341" cy="318" r="3.5" fill="#F5B482"/>
+  <path d="M1321 318 H1341" stroke="#C65F10" stroke-width="1.3"/>
+  <text class="micro orange" x="1352" y="322">Self-attn</text>
+  <rect x="1310" y="339" width="112" height="27" rx="8" fill="#F4FAEF" stroke="#588E32"/>
+  <rect x="1320" y="347" width="7" height="11" rx="2" fill="#A9D88C"/>
+  <rect x="1331" y="347" width="7" height="11" rx="2" fill="#A9D88C"/>
+  <text class="micro green" x="1345" y="357">Gated X-attn</text>
+  <path d="M1406 318 H1427 V334 H1429 M1422 352 H1427 V334" fill="none" stroke="#8B8B8B" stroke-width="1.6"/>
+  <circle cx="1438" cy="334" r="9" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="small" x="1438" y="339" text-anchor="middle">+</text>
+  <text class="micro muted" x="1460" y="298">d384</text>
+  <text class="micro muted" x="1460" y="315">6 heads</text>
+  <path d="M1457 336 C1471 324 1483 349 1497 334 C1505 325 1511 334 1517 329" fill="none" stroke="#588E32" stroke-width="3" stroke-linecap="round"/>
+  <text class="micro green" x="1460" y="359">32×3</text>
+  <text class="micro muted" x="1389" y="391" text-anchor="middle">32 cand. · 32 steps · Euler(10) · CFG 1</text>
+
+  <!-- Independent memory and goal-token routes meet only at token concat. -->
+  <path d="M1216 309 H1229 V239 H1259" class="gray-line"/>
+  <path d="M901 298 C946 298 940 146 1000 146 H1228 V207 H1364" class="green-line"/>
+  <rect x="1375" y="195" width="112" height="24" rx="11" fill="#FFFFFF" stroke="#A9D88C"/>
+  <text class="micro green" x="1431" y="211" text-anchor="middle">4 goal tokens</text>
+
+  <!-- Qwen feature taps descend into the heatmap branch -->
+  <path d="M390 375 V454 H195 V584" class="tap-line"/>
+  <path d="M390 454 H410 V584" class="tap-line"/>
+  <path d="M390 454 H302 V745" class="tap-line"/>
+  <rect x="414" y="438" width="176" height="27" rx="13" fill="#FFFFFF" stroke="#588E32" stroke-dasharray="5 4"/>
+  <text class="micro green" x="432" y="456">shared Qwen feature taps</text>
+
+  <!-- The central contribution -->
+  <rect x="50" y="500" width="1500" height="630" rx="25" fill="#F6FBF2" stroke="#588E32" stroke-width="3.4"/>
+  <rect class="tab" x="347" y="473" width="858" height="53" rx="14" stroke="#588E32" stroke-width="2"/>
+  <circle cx="379" cy="499" r="13" fill="#FFD84A" stroke="#C65F10"/>
+  <path d="M379 490 L381 496 L388 497 L382 501 L384 508 L379 504 L374 508 L376 501 L370 497 L377 496 Z" fill="#F39A3F"/>
+  <text class="hero-title" x="408" y="507">CORE CONTRIBUTION · TRAJECTORY-GUIDED HEATMAP HEAD</text>
+  <rect x="1273" y="512" width="250" height="37" rx="18" fill="#FFF7D4" stroke="#C65F10" stroke-width="1.6"/>
+  <circle cx="1295" cy="530.5" r="10" fill="#FFFFFF" stroke="#588E32"/>
+  <circle cx="1295" cy="530.5" r="6" fill="#FFD84A"/>
+  <circle cx="1295" cy="530.5" r="2.5" fill="#EF5B63"/>
+  <path d="M1295 516 V520 M1295 541 V545 M1280 530.5 H1284 M1306 530.5 H1310" stroke="#588E32" stroke-width="1.4" stroke-linecap="round"/>
+  <text class="micro green" x="1413" y="527" text-anchor="middle">TRAINING-ONLY</text>
+  <text class="micro green" x="1413" y="542" text-anchor="middle">SPATIAL GROUNDING BRANCH</text>
+
+  <text class="section-label" x="302.5" y="568" text-anchor="middle">MULTI-SCALE FEATURE SOURCES</text>
+  <text class="section-label" x="805" y="568" text-anchor="middle">TRAJECTORY-GUIDED FUSION</text>
+  <text class="section-label" x="1285" y="568" text-anchor="middle">COARSE-TO-FINE PREDICTIONS</text>
+
+  <!-- Heatmap feature sources -->
+  <rect class="green-card" x="90" y="590" width="200" height="122" rx="14"/>
+  <text class="module-title green" x="108" y="619">ViT hooks</text>
+  <g transform="translate(109,637)">
+    <rect x="0" y="0" width="20" height="22" rx="5" fill="#DAE8F6" stroke="#588E32"/>
+    <rect x="24" y="0" width="20" height="22" rx="5" fill="#DAE8F6" stroke="#588E32"/>
+    <rect x="48" y="0" width="20" height="22" rx="5" fill="#DAE8F6" stroke="#588E32"/>
+    <rect x="72" y="0" width="20" height="22" rx="5" fill="#DAE8F6" stroke="#588E32"/>
+    <text class="micro green" x="6" y="16">7</text>
+    <text class="micro green" x="27" y="16">15</text>
+    <text class="micro green" x="51" y="16">23</text>
+    <text class="micro green" x="75" y="16">31</text>
+  </g>
+  <path d="M205 642 H213 V636 L222 648 L213 660 V654 H205 Z" fill="#A9D88C"/>
+  <rect x="223" y="624" width="54" height="50" rx="9" fill="#EAF5E2" stroke="#588E32"/>
+  <rect x="231" y="641" width="7" height="13" rx="2" fill="#A9D88C"/>
+  <rect x="241" y="636" width="7" height="18" rx="2" fill="#7DB45F"/>
+  <rect x="251" y="631" width="7" height="23" rx="2" fill="#588E32"/>
+  <text class="micro green" x="250" y="668" text-anchor="middle">DPT-Lite</text>
+  <text class="mono" x="190" y="699" text-anchor="middle">4 × 256 × 16²</text>
+
+  <rect class="green-card" x="315" y="590" width="200" height="122" rx="14"/>
+  <text class="module-title green" x="333" y="619">LLM hooks</text>
+  <g transform="translate(337,637)">
+    <rect x="0" y="0" width="25" height="22" rx="5" fill="#FBE1D0" stroke="#588E32"/>
+    <rect x="31" y="0" width="25" height="22" rx="5" fill="#FBE1D0" stroke="#588E32"/>
+    <rect x="62" y="0" width="25" height="22" rx="5" fill="#FBE1D0" stroke="#588E32"/>
+    <text class="micro green" x="9" y="16">6</text>
+    <text class="micro green" x="36" y="16">13</text>
+    <text class="micro green" x="67" y="16">20</text>
+  </g>
+  <path d="M428 642 H436 V636 L445 648 L436 660 V654 H428 Z" fill="#A9D88C"/>
+  <rect x="446" y="624" width="56" height="50" rx="9" fill="#EAF5E2" stroke="#588E32"/>
+  <rect x="454" y="641" width="7" height="13" rx="2" fill="#A9D88C"/>
+  <rect x="464" y="636" width="7" height="18" rx="2" fill="#7DB45F"/>
+  <rect x="474" y="631" width="7" height="23" rx="2" fill="#588E32"/>
+  <text class="micro green" x="474" y="668" text-anchor="middle">DPT-Lite</text>
+  <text class="mono" x="415" y="699" text-anchor="middle">4 × 256 × 8²</text>
+
+  <rect class="green-card" x="90" y="747" width="425" height="125" rx="14"/>
+  <text class="module-title green" x="111" y="777">History Query + Relative Pose</text>
+  <rect x="111" y="793" width="164" height="52" rx="9" fill="#F4FAEF" stroke="#A9D88C"/>
+  <circle cx="130" cy="819" r="8" fill="#FFD84A" stroke="#7F7F7F"/>
+  <text class="small green" x="148" y="815">deepest anchor</text>
+  <text class="mono" x="148" y="835">3584 → 256</text>
+  <rect x="291" y="793" width="202" height="52" rx="9" fill="#F4FAEF" stroke="#A9D88C"/>
+  <circle cx="310" cy="819" r="8" fill="#F5B482" stroke="#7F7F7F"/>
+  <text class="small green" x="328" y="815">[dx, dy, cosψ, sinψ]</text>
+  <text class="mono" x="328" y="835">PE 4 → 132 → 256</text>
+  <text class="micro muted" x="112" y="863">derived relative pose only</text>
+
+  <!-- Supervision is visually isolated from the network -->
+  <rect class="supervision" x="90" y="910" width="425" height="174" rx="14"/>
+  <rect x="104" y="894" width="220" height="35" rx="11" fill="#F4F4F4" stroke="#8B8B8B"/>
+  <circle cx="125" cy="911.5" r="9" fill="#FFFFFF" stroke="#588E32"/>
+  <circle cx="125" cy="911.5" r="5" fill="#FFD84A"/>
+  <circle cx="125" cy="911.5" r="2" fill="#EF5B63"/>
+  <text class="tab-title" x="225" y="918" text-anchor="middle">SUPERVISION ONLY</text>
+
+  <!-- Geometry is rendered as target construction, never as a network input. -->
+  <rect x="112" y="938" width="48" height="34" rx="8" fill="#F4F4F4" stroke="#9C9C9C"/>
+  <path d="M120 948 H151 M123 955 H148 M127 962 H144" stroke="#7098A8" stroke-width="2" stroke-linecap="round"/>
+  <text class="micro muted" x="136" y="988" text-anchor="middle">depth</text>
+  <rect x="176" y="938" width="48" height="34" rx="8" fill="#F4F4F4" stroke="#9C9C9C"/>
+  <circle cx="198" cy="955" r="4" fill="#F39A3F"/>
+  <path d="M198 955 L214 947 M198 955 L210 966 M198 955 L187 945" stroke="#C65F10" stroke-width="1.8" marker-end="url(#arrowGray)"/>
+  <text class="micro muted" x="200" y="988" text-anchor="middle">pose</text>
+  <rect x="240" y="938" width="48" height="34" rx="8" fill="#F4F4F4" stroke="#9C9C9C"/>
+  <path d="M249 947 H279 V965 H249 Z M256 951 L252 961 M272 951 L276 961" fill="none" stroke="#8B8B8B" stroke-width="1.5"/>
+  <text class="micro muted" x="264" y="988" text-anchor="middle">intrinsics</text>
+  <path d="M301 949 H317 V942 L332 955 L317 968 V961 H301 Z" fill="#B0ACAC"/>
+  <use href="#heatmap" x="345" y="934" width="34" height="45"/>
+  <text class="small green" x="391" y="958">GT heatmap</text>
+
+  <line x1="112" y1="996" x2="493" y2="996" stroke="#D2D2D2" stroke-width="1.5"/>
+  <text class="micro green" x="302.5" y="1022" text-anchor="middle">L = BCE<tspan baseline-shift="sub">vis</tspan> + CE<tspan baseline-shift="sub">peak</tspan> + 0.2 L<tspan baseline-shift="sub">coord</tspan> + BCE<tspan baseline-shift="sub">neg</tspan></text>
+  <rect x="190" y="1041" width="225" height="29" rx="13" fill="#F4F4F4" stroke="#9C9C9C"/>
+  <text class="micro muted" x="302.5" y="1060" text-anchor="middle">never a network input</text>
+
+  <!-- Core trajectory-guided attention -->
+  <rect x="565" y="590" width="480" height="282" rx="18" fill="#FFFFFF" stroke="#588E32" stroke-width="2.8"/>
+  <g transform="translate(0,-10)">
+  <text class="module-title green" x="805" y="632" text-anchor="middle">Trajectory-Guided Attention</text>
+  <g transform="translate(628,651)">
+    <circle cx="10" cy="10" r="9" fill="#FFD84A" stroke="#7F7F7F"/>
+    <text class="micro green" x="10" y="14" text-anchor="middle">h</text>
+    <circle cx="39" cy="10" r="9" fill="#F5B482" stroke="#7F7F7F"/>
+    <text class="micro green" x="39" y="14" text-anchor="middle">p</text>
+    <circle cx="72" cy="10" r="7" fill="#A9D88C" stroke="#588E32"/>
+    <circle cx="94" cy="10" r="7" fill="#A9D88C" stroke="#588E32"/>
+    <circle cx="116" cy="10" r="7" fill="#A9D88C" stroke="#588E32"/>
+    <circle cx="138" cy="10" r="7" fill="#A9D88C" stroke="#588E32"/>
+    <text class="module-title green" x="157" y="16">… s₂₅₆</text>
+    <text class="small muted" x="226" y="15">1 + 1 + 256 = 258 tokens · d=256</text>
+  </g>
+  <rect x="648" y="685" width="314" height="27" rx="12" fill="#F4FAEF" stroke="#A9D88C"/>
+  <text class="micro green" x="805" y="703" text-anchor="middle">+ learnable position embedding P<tspan baseline-shift="sub">pos</tspan> [258 × 256]</text>
+
+  <!-- Code-faithful pre-norm Transformer: both residual additions are explicit. -->
+  <rect x="600" y="720" width="410" height="124" rx="13" fill="#F4FAEF" stroke="#588E32"/>
+  <text class="micro green" x="805" y="740" text-anchor="middle">PRE-NORM TRANSFORMER BLOCK × 2</text>
+  <line x1="614" y1="784" x2="996" y2="784" stroke="#D5E4CC" stroke-width="1.2"/>
+
+  <text class="mono" x="615" y="769" text-anchor="middle">x₀</text>
+  <path d="M627 764 H640" class="gray-line"/>
+  <rect x="643" y="750" width="40" height="28" rx="8" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro" x="663" y="769" text-anchor="middle">LN</text>
+  <path d="M683 764 H696" class="gray-line"/>
+  <rect x="699" y="746" width="135" height="36" rx="8" fill="#FFF3EA" stroke="#C65F10"/>
+  <text class="micro orange" x="766.5" y="759" text-anchor="middle">SELF-ATTENTION</text>
+  <text class="micro orange" x="766.5" y="776" text-anchor="middle">4 heads · 64-d each</text>
+  <path d="M834 764 H846" class="gray-line"/>
+  <rect x="849" y="750" width="72" height="28" rx="8" fill="#FFFFFF" stroke="#C65F10"/>
+  <text class="micro orange" x="885" y="769" text-anchor="middle">Add x₀</text>
+  <path d="M921 764 H935" class="gray-line"/>
+  <text class="mono" x="949" y="769" text-anchor="middle">x₁</text>
+
+  <text class="mono" x="615" y="813" text-anchor="middle">x₁</text>
+  <path d="M627 808 H640" class="gray-line"/>
+  <rect x="643" y="794" width="40" height="28" rx="8" fill="#FFFFFF" stroke="#8B8B8B"/>
+  <text class="micro" x="663" y="813" text-anchor="middle">LN</text>
+  <path d="M683 808 H696" class="gray-line"/>
+  <rect x="699" y="790" width="126" height="36" rx="8" fill="#EAF5E2" stroke="#588E32"/>
+  <text class="micro green" x="762" y="804" text-anchor="middle">FFN · GELU</text>
+  <text class="micro green" x="762" y="820" text-anchor="middle">256 → 1024 → 256</text>
+  <path d="M825 808 H837" class="gray-line"/>
+  <rect x="840" y="794" width="80" height="28" rx="8" fill="#FFFFFF" stroke="#588E32"/>
+  <text class="micro green" x="880" y="813" text-anchor="middle">Add x₁</text>
+  <path d="M920 808 H935" class="gray-line"/>
+  <text class="mono" x="949" y="813" text-anchor="middle">x₂</text>
+  <text class="micro muted" x="805" y="862" text-anchor="middle">d=256 · norm-first · dropout 0.1</text>
+  </g>
+
+  <!-- Inputs into attention and ViT bypass -->
+  <path d="M515 651 H553" class="green-line"/>
+  <path d="M515 810 H537 V663 H553" class="green-line"/>
+  <path d="M190 712 V728 H529 V997 H553" class="green-line"/>
+  <rect x="329" y="714" width="166" height="27" rx="12" fill="#FFFFFF" stroke="#A9D88C"/>
+  <text class="micro green" x="412" y="732" text-anchor="middle">ViT skip · direct 16² detail</text>
+
+  <!-- Explicit head outputs -->
+  <path d="M1045 730 H1068" class="green-line"/>
+  <rect class="green-card" x="1080" y="590" width="410" height="250" rx="17"/>
+  <text class="module-title green" x="1285" y="622" text-anchor="middle">Structured Readouts</text>
+  <path d="M1080 730 H1092 M1092 670 V790 M1092 670 H1098 M1092 730 H1098 M1092 790 H1098" fill="none" stroke="#588E32" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M1098 666 L1102 670 L1098 674 Z M1098 726 L1102 730 L1098 734 Z M1098 786 L1102 790 L1098 794 Z" fill="#588E32"/>
+  <rect x="1102" y="646" width="366" height="48" rx="10" fill="#F4FAEF" stroke="#A9D88C"/>
+  <circle cx="1124" cy="670" r="8" fill="#FFD84A" stroke="#7F7F7F"/>
+  <text class="micro green" x="1143" y="666">h′ → Vis MLP</text>
+  <text class="mono" x="1143" y="685">256 → 128 → 4</text>
+  <text class="small green" x="1371" y="675" text-anchor="middle">visibility · N × 4</text>
+  <rect x="1102" y="706" width="366" height="48" rx="10" fill="#F4FAEF" stroke="#A9D88C"/>
+  <g transform="translate(1114,718)" fill="#A9D88C" stroke="#588E32">
+    <rect x="0" y="0" width="6" height="6"/><rect x="8" y="0" width="6" height="6"/><rect x="16" y="0" width="6" height="6"/>
+    <rect x="0" y="8" width="6" height="6"/><rect x="8" y="8" width="6" height="6"/><rect x="16" y="8" width="6" height="6"/>
+    <rect x="0" y="16" width="6" height="6"/><rect x="8" y="16" width="6" height="6"/><rect x="16" y="16" width="6" height="6"/>
+  </g>
+  <text class="micro green" x="1152" y="726">S′ → Map MLP</text>
+  <text class="mono" x="1152" y="745">256 → 128 → 1</text>
+  <text class="small green" x="1371" y="737" text-anchor="middle">coarse · N × 4 × 8²</text>
+  <rect x="1102" y="766" width="366" height="48" rx="10" fill="#F4FAEF" stroke="#A9D88C"/>
+  <g transform="translate(1112,778)">
+    <rect x="0" y="0" width="28" height="23" rx="5" fill="#D9EBD0" stroke="#588E32"/>
+    <path d="M5 17 L11 10 L16 14 L23 5" fill="none" stroke="#588E32" stroke-width="2"/>
+  </g>
+  <text class="micro green" x="1152" y="786">S′ → direct</text>
+  <text class="mono" x="1152" y="805">spatial_out</text>
+  <text class="small green" x="1371" y="797" text-anchor="middle">N × 256 × 256</text>
+
+  <!-- Fine localization -->
+  <rect x="565" y="929" width="480" height="155" rx="18" fill="#FFFFFF" stroke="#588E32" stroke-width="2.8"/>
+  <text class="module-title green" x="805" y="960" text-anchor="middle">Fine Localization</text>
+  <g transform="translate(625,976)">
+    <rect x="0" y="0" width="90" height="35" rx="9" fill="#DAE8F6" stroke="#588E32"/>
+    <text class="small green" x="45" y="22" text-anchor="middle">ViT · 256</text>
+    <text class="module-title green" x="100" y="24">+</text>
+    <rect x="122" y="0" width="113" height="35" rx="9" fill="#EAF5E2" stroke="#588E32"/>
+    <text class="small green" x="178.5" y="22" text-anchor="middle">spatial · 256</text>
+    <text class="module-title green" x="245" y="24">+</text>
+    <rect x="268" y="0" width="92" height="35" rx="9" fill="#FFF3EA" stroke="#588E32"/>
+    <text class="small green" x="314" y="22" text-anchor="middle">coarse · 1</text>
+  </g>
+  <text class="mono" x="805" y="1040" text-anchor="middle">513×16² → Deconv 128×32² → Deconv 64×64²</text>
+  <text class="mono" x="805" y="1062" text-anchor="middle">→ Conv 1×64² → sigmoid</text>
+
+  <!-- Coarse/spatial outputs feed Fine, then four directional heatmaps -->
+  <path d="M1285 840 V887 H939 V920" class="green-line"/>
+  <text class="micro green" x="1112" y="882" text-anchor="middle">coarse + spatial</text>
+  <path d="M1045 997 H1112" class="green-line"/>
+  <g transform="translate(1124,951)">
+    <use href="#heatmap" x="0" y="0" width="69" height="91"/>
+    <use href="#heatmap" x="84" y="0" width="69" height="91"/>
+    <use href="#heatmap" x="168" y="0" width="69" height="91"/>
+    <use href="#heatmap" x="252" y="0" width="69" height="91"/>
+    <text class="module-title green" x="24" y="116">F</text>
+    <text class="module-title green" x="108" y="116">R</text>
+    <text class="module-title green" x="192" y="116">B</text>
+    <text class="module-title green" x="276" y="116">L</text>
+    <text class="mono" x="71" y="145">N × 4 × 64² heatmaps</text>
+  </g>
+</svg>

@@ -8,13 +8,34 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from dataclasses import dataclass
-from math import hypot
+from math import hypot, isfinite
 from typing import Sequence
 
 
 STOP_CONTINUE = "continue"
 STOP_PROBE = "probe"
 STOP_ACCEPT = "accept"
+
+
+def should_trust_temporal_terminal(
+    *,
+    enabled: bool,
+    decision: str,
+    observed_margin: float | None,
+    min_margin: float,
+) -> bool:
+    """Gate temporal STOP bypasses with an explicit calibration margin."""
+    min_margin = float(min_margin)
+    if not isfinite(min_margin) or not 0.0 <= min_margin <= 1.0:
+        raise ValueError("temporal terminal min_margin must be finite and in [0, 1]")
+    if not enabled or str(decision) != "temporal_confirms_original_stop":
+        return False
+    if observed_margin is None:
+        return False
+    observed_margin = float(observed_margin)
+    if not isfinite(observed_margin):
+        raise ValueError("temporal terminal observed_margin must be finite")
+    return observed_margin >= min_margin
 
 
 @dataclass(frozen=True)
@@ -27,6 +48,9 @@ class RecoveryEvent:
 class ClosedLoopGuardConfig:
     action_chunk_size: int = 4
     stop_confirmations: int = 1
+    stop_confirmation_max_gap_calls: int = 0
+    stop_confirmation_view_sweep: bool = False
+    stop_high_confidence_threshold: float | None = None
     stop_probe_turn: str = "left"
     loop_guard_enabled: bool = False
     collision_epsilon_m: float = 0.03
@@ -39,6 +63,8 @@ class ClosedLoopGuardConfig:
     plan_min_path_m: float = 3.0
     plan_max_net_m: float = 1.5
     recovery_turns: int = 3
+    recovery_forward_steps: int = 0
+    recovery_follow_last_turn: bool = False
     recovery_cooldown_steps: int = 12
 
     def __post_init__(self) -> None:
@@ -46,6 +72,20 @@ class ClosedLoopGuardConfig:
             raise ValueError("action_chunk_size must be >= 1")
         if self.stop_confirmations < 1:
             raise ValueError("stop_confirmations must be >= 1")
+        if self.stop_confirmation_max_gap_calls < 0:
+            raise ValueError("stop_confirmation_max_gap_calls must be >= 0")
+        if self.stop_confirmation_view_sweep and self.stop_confirmation_max_gap_calls < 1:
+            raise ValueError(
+                "stop_confirmation_view_sweep requires "
+                "stop_confirmation_max_gap_calls >= 1"
+            )
+        if self.stop_high_confidence_threshold is not None:
+            if not 0.0 <= self.stop_high_confidence_threshold <= 1.0:
+                raise ValueError("stop_high_confidence_threshold must be in [0, 1]")
+            if self.stop_confirmations < 2:
+                raise ValueError(
+                    "stop_high_confidence_threshold requires stop_confirmations >= 2"
+                )
         if self.stop_probe_turn not in {"left", "right"}:
             raise ValueError("stop_probe_turn must be 'left' or 'right'")
         if self.collision_epsilon_m < 0.0:
@@ -64,6 +104,8 @@ class ClosedLoopGuardConfig:
             raise ValueError("plan loop thresholds must be >= 0")
         if self.recovery_turns < 1:
             raise ValueError("recovery_turns must be >= 1")
+        if self.recovery_forward_steps < 0:
+            raise ValueError("recovery_forward_steps must be >= 0")
         if self.recovery_cooldown_steps < 0:
             raise ValueError("recovery_cooldown_steps must be >= 0")
 
@@ -104,8 +146,11 @@ class ClosedLoopGuard:
             maxlen=config.plan_window_calls
         )
         self._stop_votes = 0
+        self._stop_gap_calls = 0
+        self._stop_vote_source: str | None = None
         self._stop_probe_count = 0
         self._collision_streak = 0
+        self._last_turn_action: int | None = None
         self._cooldown_steps = 0
         self._recovery_count = 0
 
@@ -113,32 +158,96 @@ class ClosedLoopGuard:
     def recovery_count(self) -> int:
         return self._recovery_count
 
+    @property
+    def stop_votes(self) -> int:
+        return self._stop_votes
+
+    @property
+    def stop_gap_calls(self) -> int:
+        return self._stop_gap_calls
+
+    @property
+    def stop_vote_source(self) -> str | None:
+        return self._stop_vote_source
+
     def reset_episode(self, position: Sequence[float]) -> None:
         self._motion_positions.clear()
         self._motion_positions.append(_xz(position))
         self._plan_records.clear()
         self._stop_votes = 0
+        self._stop_gap_calls = 0
+        self._stop_vote_source = None
         self._stop_probe_count = 0
         self._collision_streak = 0
+        self._last_turn_action = None
         self._cooldown_steps = 0
         self._recovery_count = 0
 
     def limit_actions(self, actions: Sequence[int]) -> list[int]:
         return [int(action) for action in actions[: self.config.action_chunk_size]]
 
-    def observe_system2_terminal(self, terminal: bool) -> str:
-        if not terminal:
+    def observe_system2_terminal(
+        self,
+        terminal: bool,
+        *,
+        stop_probability: float | None = None,
+        trusted_terminal: bool = False,
+        terminal_source: str | None = None,
+    ) -> str:
+        if trusted_terminal and not terminal:
+            raise ValueError("trusted_terminal requires terminal=True")
+        if trusted_terminal:
             self._stop_votes = 0
+            self._stop_gap_calls = 0
+            self._stop_vote_source = None
+            return STOP_ACCEPT
+        if not terminal:
+            if terminal_source is not None:
+                raise ValueError("terminal_source requires terminal=True")
+            if (
+                self._stop_votes > 0
+                and self._stop_gap_calls
+                < self.config.stop_confirmation_max_gap_calls
+            ):
+                self._stop_gap_calls += 1
+                if self.config.stop_confirmation_view_sweep:
+                    return STOP_PROBE
+            else:
+                self._stop_votes = 0
+                self._stop_gap_calls = 0
+                self._stop_vote_source = None
             return STOP_CONTINUE
+        normalized_source = str(terminal_source or "system2_terminal").strip()
+        if not normalized_source:
+            raise ValueError("terminal_source must be non-empty when provided")
+        threshold = self.config.stop_high_confidence_threshold
+        if threshold is not None and stop_probability is not None:
+            probability = float(stop_probability)
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError("stop_probability must be in [0, 1]")
+            if probability >= threshold:
+                self._stop_votes = 0
+                self._stop_gap_calls = 0
+                self._stop_vote_source = None
+                return STOP_ACCEPT
+        if self._stop_votes > 0 and self._stop_vote_source != normalized_source:
+            self._stop_votes = 0
+        self._stop_gap_calls = 0
+        self._stop_vote_source = normalized_source
         self._stop_votes += 1
         if self._stop_votes >= self.config.stop_confirmations:
             self._stop_votes = 0
+            self._stop_gap_calls = 0
+            self._stop_vote_source = None
             return STOP_ACCEPT
         return STOP_PROBE
 
     def next_stop_probe_action(self) -> int:
         prefer_left = self.config.stop_probe_turn == "left"
-        use_left = prefer_left if self._stop_probe_count % 2 == 0 else not prefer_left
+        if self.config.stop_confirmation_view_sweep and self._stop_votes > 0:
+            use_left = prefer_left
+        else:
+            use_left = prefer_left if self._stop_probe_count % 2 == 0 else not prefer_left
         self._stop_probe_count += 1
         return self.left_action if use_left else self.right_action
 
@@ -156,6 +265,9 @@ class ClosedLoopGuard:
         if self._cooldown_steps > 0:
             self._cooldown_steps -= 1
 
+        if int(action) in {self.left_action, self.right_action}:
+            self._last_turn_action = int(action)
+
         if int(action) == self.forward_action:
             if displacement <= self.config.collision_epsilon_m:
                 self._collision_streak += 1
@@ -164,10 +276,12 @@ class ClosedLoopGuard:
         else:
             self._collision_streak = 0
 
-        if not self.config.loop_guard_enabled or self._cooldown_steps > 0:
+        if not self.config.loop_guard_enabled:
             return None
         if self._collision_streak >= self.config.collision_forward_limit:
             return self._make_recovery("collision", after)
+        if self._cooldown_steps > 0:
+            return None
 
         if len(self._motion_positions) == self._motion_positions.maxlen:
             points = list(self._motion_positions)
@@ -214,12 +328,25 @@ class ClosedLoopGuard:
         reason: str,
         current_position: tuple[float, float],
     ) -> RecoveryEvent:
-        use_left = self._recovery_count % 2 == 0
-        turn_action = self.left_action if use_left else self.right_action
-        actions = (turn_action,) * self.config.recovery_turns
+        if (
+            reason == "collision"
+            and self.config.recovery_follow_last_turn
+            and self._last_turn_action is not None
+        ):
+            turn_action = self._last_turn_action
+        else:
+            use_left = self._recovery_count % 2 == 0
+            turn_action = self.left_action if use_left else self.right_action
+        actions = (
+            (turn_action,) * self.config.recovery_turns
+            + (self.forward_action,) * self.config.recovery_forward_steps
+        )
         self._recovery_count += 1
         self._collision_streak = 0
+        self._last_turn_action = turn_action
         self._stop_votes = 0
+        self._stop_gap_calls = 0
+        self._stop_vote_source = None
         self._cooldown_steps = self.config.recovery_cooldown_steps
         self._motion_positions.clear()
         self._motion_positions.append(current_position)

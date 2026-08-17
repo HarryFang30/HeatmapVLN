@@ -1,0 +1,9 @@
+{
+  "description": "Audited historical false-STOP calls for privileged recovery collection with RPC protocol seed 119.",
+  "episodes": [
+    {"scene_id": "HxpKQynjfin", "episode_id": 7043, "historical_false_stop_system2_call_index": 11, "historical_false_stop_step": 44, "historical_false_stop_distance_m": 4.915404796600342, "historical_false_stop_rpc_protocol_seed": 119, "historical_false_stop_source_labels": "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_02/system2_stop_rollout_labels.jsonl"},
+    {"scene_id": "PuKPg4mmafe", "episode_id": 6965, "historical_false_stop_system2_call_index": 37, "historical_false_stop_step": 147, "historical_false_stop_distance_m": 4.9453325271606445, "historical_false_stop_rpc_protocol_seed": 119, "historical_false_stop_source_labels": "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_02/system2_stop_rollout_labels.jsonl"},
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8847, "historical_false_stop_system2_call_index": 26, "historical_false_stop_step": 104, "historical_false_stop_distance_m": 6.2316179275512695, "historical_false_stop_rpc_protocol_seed": 119, "historical_false_stop_source_labels": "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_02/system2_stop_rollout_labels.jsonl"},
+    {"scene_id": "kEZ7cmS4wCh", "episode_id": 9005, "historical_false_stop_system2_call_index": 24, "historical_false_stop_step": 96, "historical_false_stop_distance_m": 7.994833946228027, "historical_false_stop_rpc_protocol_seed": 119, "historical_false_stop_source_labels": "/mnt/afs/lixiaoou/intern/fjl/model/system2_stop_dagger_long6_20260716/cohort_02/system2_stop_rollout_labels.jsonl"}
+  ]
+}

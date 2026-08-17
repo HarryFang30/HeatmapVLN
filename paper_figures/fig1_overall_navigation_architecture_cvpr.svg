@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="178mm" height="70mm" viewBox="0 0 1780 700" role="img" aria-labelledby="title desc">
+  <title id="title">Historical Spatial Grounding for InternNav</title>
+  <desc id="desc">A compact three-stage method overview. System-2 turns an instruction and front-view RGB into trajectory tokens. Historical Spatial Grounding turns front-view RGB into pose and visual tokens, predicts heatmaps and visibility, and tokenizes them. System-1 injects trajectory and heatmap tokens into NextDiT to generate a local trajectory and navigation actions.</desc>
+  <defs>
+    <style><![CDATA[
+      text{font-family:Arial,Helvetica,sans-serif;fill:#303036}
+      .stage-title{font-size:36px;font-weight:700}
+      .label{font-size:27px;font-weight:400}
+      .module{font-size:31px;font-weight:700}
+      .block-label{font-size:27px;font-weight:700}
+      .panel{fill:#fff;stroke:#d7d7df;stroke-width:2.5;stroke-dasharray:8 7}
+      .purple-box{fill:#f2effc;stroke:#c5b6ef;stroke-width:2.5}
+      .blue-box{fill:#eaf4fb;stroke:#8fc1df;stroke-width:2.5}
+      .green-box{fill:#eaf7f1;stroke:#8fcab1;stroke-width:2.5}
+      .orange-box{fill:#fff1e8;stroke:#efb58c;stroke-width:2.5}
+      .neutral-box{fill:#fff;stroke:#b6b6bc;stroke-width:2.5}
+      .flow{fill:none;stroke:#a9a9ae;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round;marker-end:url(#arrow-gray)}
+      .flow-purple{fill:none;stroke:#a78bdb;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round;marker-end:url(#arrow-purple)}
+      .flow-green{fill:none;stroke:#5da783;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round;marker-end:url(#arrow-green)}
+      .connector-purple{fill:none;stroke:#a78bdb;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round}
+      .connector-green{fill:none;stroke:#5da783;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round}
+    ]]></style>
+    <marker id="arrow-gray" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto" markerUnits="userSpaceOnUse"><path d="M1 1L11 6L1 11Z" fill="#a9a9ae"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto" markerUnits="userSpaceOnUse"><path d="M1 1L11 6L1 11Z" fill="#a78bdb"/></marker>
+    <marker id="arrow-green" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto" markerUnits="userSpaceOnUse"><path d="M1 1L11 6L1 11Z" fill="#5da783"/></marker>
+
+    <symbol id="rgb-frame" viewBox="0 0 110 75">
+      <rect x="1.5" y="1.5" width="107" height="72" rx="5" fill="#fff" stroke="#aeb3b9" stroke-width="3"/>
+      <path d="M4 70L33 39H77L106 70Z" fill="#d9c5ab"/>
+      <path d="M4 5L33 39V70H4Z" fill="#d7e6eb"/>
+      <path d="M106 5L77 39V70H106Z" fill="#eadcc9"/>
+      <rect x="46" y="13" width="20" height="28" rx="2" fill="#8298a1"/>
+      <rect x="51" y="17" width="10" height="20" fill="#e5f0f2"/>
+    </symbol>
+
+    <symbol id="heatmap-a" viewBox="0 0 48 48">
+      <rect x="1" y="1" width="46" height="46" rx="6" fill="#263f7d"/>
+      <circle cx="25" cy="17" r="13" fill="#18a0aa"/>
+      <circle cx="25" cy="17" r="8" fill="#ffd65a"/>
+      <circle cx="25" cy="17" r="4" fill="#f06c72"/>
+    </symbol>
+    <symbol id="heatmap-b" viewBox="0 0 48 48">
+      <rect x="1" y="1" width="46" height="46" rx="6" fill="#263f7d"/>
+      <circle cx="37" cy="28" r="11" fill="#18a0aa"/>
+      <circle cx="37" cy="28" r="6" fill="#ffd65a"/>
+    </symbol>
+    <symbol id="heatmap-c" viewBox="0 0 48 48">
+      <rect x="1" y="1" width="46" height="46" rx="6" fill="#263f7d"/>
+      <circle cx="13" cy="34" r="10" fill="#18a0aa"/>
+      <circle cx="13" cy="34" r="5" fill="#ffd65a"/>
+    </symbol>
+  </defs>
+
+  <rect width="1780" height="700" fill="#fff"/>
+
+  <!-- Three compact stages. -->
+  <rect x="18" y="34" width="425" height="634" rx="20" class="panel"/>
+  <rect x="462" y="34" width="735" height="634" rx="20" class="panel"/>
+  <rect x="1216" y="34" width="546" height="634" rx="20" class="panel"/>
+
+  <rect x="157" y="17" width="148" height="42" fill="#fff"/>
+  <text x="231" y="49" text-anchor="middle" class="stage-title" fill="#713bb5">System-2</text>
+  <rect x="618" y="17" width="423" height="42" fill="#fff"/>
+  <text x="830" y="49" text-anchor="middle" class="stage-title" fill="#2b7d75">Historical Spatial Grounding</text>
+  <rect x="1407" y="17" width="164" height="42" fill="#fff"/>
+  <text x="1489" y="49" text-anchor="middle" class="stage-title" fill="#ef7628">System-1</text>
+
+  <!-- System-2: data to trajectory tokens. -->
+  <text x="112" y="101" text-anchor="middle" class="label">Instruction</text>
+  <rect x="46" y="119" width="132" height="92" rx="10" class="neutral-box"/>
+  <path d="M66 146H157M66 166H150M66 186H136" stroke="#85868c" stroke-width="5" stroke-linecap="round"/>
+
+  <text x="304" y="101" text-anchor="middle" class="label" fill="#8c72cd">Front RGB</text>
+  <use href="#rgb-frame" x="238" y="129" width="110" height="75" opacity=".55"/>
+  <use href="#rgb-frame" x="252" y="119" width="110" height="75"/>
+
+  <path d="M112 211V253H188" class="flow"/>
+  <path d="M304 211V253H262" class="flow"/>
+  <rect x="60" y="256" width="340" height="100" rx="14" class="purple-box"/>
+  <text x="230" y="318" text-anchor="middle" class="module" fill="#713bb5">Qwen2.5-VL</text>
+
+  <path d="M230 356V408" class="flow-purple"/>
+  <text x="230" y="446" text-anchor="middle" class="label" fill="#713bb5">TRAJ Tokens</text>
+  <g transform="translate(151 464)">
+    <rect width="28" height="28" rx="6" fill="#d8ccf4" stroke="#9c82dc" stroke-width="2"/>
+    <rect x="40" width="28" height="28" rx="6" fill="#c9b8ee" stroke="#9174d2" stroke-width="2"/>
+    <rect x="80" width="28" height="28" rx="6" fill="#b9a2e6" stroke="#835fc7" stroke-width="2"/>
+    <rect x="120" width="28" height="28" rx="6" fill="#a78bdb" stroke="#744eb9" stroke-width="2"/>
+  </g>
+
+  <!-- Historical spatial grounding: RGB to pose/visual tokens to heatmap tokens. -->
+  <text x="543" y="101" text-anchor="middle" class="label" fill="#347caf">Front RGB</text>
+  <use href="#rgb-frame" x="489" y="126" width="105" height="72" opacity=".55"/>
+  <use href="#rgb-frame" x="503" y="116" width="105" height="72"/>
+
+  <path d="M608 153H643V129H656" class="flow"/>
+  <path d="M608 153H643V274H656" class="flow"/>
+
+  <rect x="664" y="83" width="188" height="92" rx="13" class="blue-box"/>
+  <text x="758" y="139" text-anchor="middle" class="module" fill="#347caf">AMB3R-VO</text>
+  <rect x="664" y="228" width="188" height="92" rx="13" class="purple-box"/>
+  <text x="758" y="284" text-anchor="middle" class="module" fill="#713bb5">Qwen.visual</text>
+
+  <path d="M852 129H878" class="flow"/>
+  <path d="M852 274H878" class="flow"/>
+
+  <text x="922" y="91" text-anchor="middle" class="label" fill="#347caf">Pose Tokens</text>
+  <g transform="translate(883 105)">
+    <rect width="22" height="22" rx="4" fill="#9fd1e9" stroke="#4e9bc5" stroke-width="2"/>
+    <rect x="30" width="22" height="22" rx="4" fill="#83c0df" stroke="#3d8fb9" stroke-width="2"/>
+    <rect x="60" width="22" height="22" rx="4" fill="#67afd4" stroke="#2f80aa" stroke-width="2"/>
+  </g>
+  <text x="922" y="236" text-anchor="middle" class="label" fill="#713bb5">Visual Tokens</text>
+  <g transform="translate(883 250)">
+    <rect width="22" height="22" rx="4" fill="#d8ccf4" stroke="#9c82dc" stroke-width="2"/>
+    <rect x="30" width="22" height="22" rx="4" fill="#c4b2ec" stroke="#8c6fd1" stroke-width="2"/>
+    <rect x="60" width="22" height="22" rx="4" fill="#aa8dde" stroke="#7752bd" stroke-width="2"/>
+  </g>
+
+  <path d="M977 116H1007V183" class="flow"/>
+  <path d="M977 261H1007V219" class="flow"/>
+  <rect x="1015" y="146" width="160" height="115" rx="14" class="green-box"/>
+  <text x="1095" y="194" text-anchor="middle" class="module" fill="#2b7d5f">Heatmap</text>
+  <text x="1095" y="231" text-anchor="middle" class="module" fill="#2b7d5f">Head</text>
+
+  <path d="M1095 261V292" class="flow-green"/>
+  <rect x="952" y="300" width="236" height="126" rx="13" class="neutral-box"/>
+  <text x="1070" y="331" text-anchor="middle" class="label">Heatmaps</text>
+  <text x="1070" y="361" text-anchor="middle" class="label">+ Visibility</text>
+  <g transform="translate(982 369)">
+    <use href="#heatmap-a" width="48" height="48"/>
+    <use href="#heatmap-b" x="57" width="48" height="48"/>
+    <use href="#heatmap-c" x="114" width="48" height="48"/>
+    <circle cx="191" cy="13" r="8" fill="#54ad7b"/>
+    <circle cx="191" cy="36" r="8" fill="#c7ced1"/>
+  </g>
+
+  <path d="M1070 426V446" class="flow-green"/>
+  <rect x="970" y="454" width="200" height="72" rx="13" class="green-box"/>
+  <text x="1070" y="500" text-anchor="middle" class="module" fill="#2b7d5f">Tokenizer</text>
+
+  <path d="M1070 526V551" class="flow-green"/>
+  <text x="1070" y="587" text-anchor="middle" class="label" fill="#2b7d5f">Heatmap Tokens</text>
+  <g transform="translate(1011 601)">
+    <rect width="26" height="26" rx="5" fill="#bce2cc" stroke="#5da783" stroke-width="2"/>
+    <rect x="34" width="26" height="26" rx="5" fill="#9dd2b4" stroke="#4b9a71" stroke-width="2"/>
+    <rect x="68" width="26" height="26" rx="5" fill="#7fc29c" stroke="#378b5f" stroke-width="2"/>
+    <rect x="102" width="26" height="26" rx="5" fill="#65b186" stroke="#277b4e" stroke-width="2"/>
+  </g>
+
+  <!-- Token streams condition System-1. -->
+  <path d="M299 478H420V646H1268V614" class="connector-purple"/>
+  <path d="M1139 614H1268" class="connector-green"/>
+  <circle cx="1268" cy="614" r="5" fill="#9aa0a4"/>
+  <path d="M1268 608V294H1337" class="flow"/>
+
+  <!-- System-1: conditioned diffusion to trajectory and actions. -->
+  <rect x="1345" y="137" width="355" height="280" rx="17" class="orange-box"/>
+  <text x="1522" y="192" text-anchor="middle" class="module" fill="#d96521">NextDiT</text>
+
+  <rect x="1387" y="221" width="270" height="66" rx="11" fill="#fff8dc" stroke="#e3c66d" stroke-width="2.5"/>
+  <text x="1522" y="264" text-anchor="middle" class="block-label" fill="#a77b00">Diffusion Blocks</text>
+  <path d="M1522 287V303" class="flow"/>
+  <rect x="1387" y="311" width="270" height="68" rx="11" class="green-box"/>
+  <text x="1522" y="354" text-anchor="middle" class="block-label" fill="#2b7d5f">Gated X-Attn</text>
+
+  <path d="M1522 417V448" class="flow"/>
+  <rect x="1357" y="456" width="330" height="92" rx="14" class="neutral-box"/>
+  <path d="M1383 509c33-2 42-34 76-25s45 40 79 26 55-47 91-17 34 6 40-6" fill="none" stroke="#6f7076" stroke-width="5" stroke-linecap="round"/>
+  <text x="1522" y="532" text-anchor="middle" class="label">Local Trajectory</text>
+
+  <path d="M1522 548V575" class="flow"/>
+  <rect x="1419" y="583" width="206" height="61" rx="13" fill="#fff" stroke="#efa36e" stroke-width="2.5"/>
+  <path d="M1455 614h35M1478 601l13 13-13 13" fill="none" stroke="#ef7628" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="1553" y="624" text-anchor="middle" class="module" fill="#d96521">Actions</text>
+</svg>

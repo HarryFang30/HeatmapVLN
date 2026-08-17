@@ -105,6 +105,9 @@ class VLNPipelineConfig:
     heatmap_trajectory_config: dict[str, Any] | None = None
     heatmap_decoder_mode: str = "legacy"
     heatmap_pose_free_config: dict[str, Any] | None = None
+    heatmap_restore_vit_spatial_layout: bool = False
+    heatmap_coarse_logit_residual: bool = False
+    heatmap_joint_panorama_inference: bool = False
 
     # Allow heatmap loss gradients to flow back through the VLM backbone (LoRA).
     # When False (default), hooked features are detached and the backbone runs
@@ -138,6 +141,13 @@ class VLNPipelineConfig:
     nextdit_dav2_ckpt_path: str = ""
     nextdit_enable_gradient_checkpointing: bool = True
 
+    # Directed Past -> Plan -> Action chain.  Disabled by default so released
+    # InternNav/Past-Head behavior and checkpoint keys remain unchanged.
+    past_plan_action_enabled: bool = False
+    past_plan_action_plan_dim: int = 768
+    past_plan_action_memory_dim: int = 256
+    past_plan_action_bridge_heads: int = 8
+
     # Optional pano-student -> InternNav-latent adapter.  This sits before the
     # NextDiT cond_projector and preserves the original System1 visual path.
     pano_latent_adapter_enabled: bool = False
@@ -145,6 +155,16 @@ class VLNPipelineConfig:
     pano_latent_adapter_dropout: float = 0.0
     pano_latent_adapter_checkpoint_path: str = ""
     pano_latent_adapter_strict_load: bool = True
+
+    # Optional System2 STOP classifier. It consumes the causal hidden state
+    # immediately before the structured view-class token.
+    stop_head_enabled: bool = False
+    stop_head_hidden_dim: int = 512
+    stop_head_dropout: float = 0.1
+    stop_head_focal_gamma: float = 2.0
+    stop_head_focal_alpha: float = 0.5
+    stop_head_pos_weight: float = 1.0
+    stop_head_bce_mix: float = 0.5
 
     # Performance settings
     enable_gradient_checkpointing: bool = False
@@ -222,10 +242,30 @@ class VLNPipeline(nn.Module):
         self.heatmap_vln: HeatmapVLN | None = None
         self._heatmap_enabled = config.enable_heatmap
 
+        self.stop_head = None
+        if config.stop_head_enabled:
+            from .action import StopPredictionHead
+
+            self.stop_head = StopPredictionHead(
+                input_dim=config.llm_hidden_dim,
+                hidden_dim=config.stop_head_hidden_dim,
+                dropout=config.stop_head_dropout,
+                focal_gamma=config.stop_head_focal_gamma,
+                focal_alpha=config.stop_head_focal_alpha,
+                pos_weight=config.stop_head_pos_weight,
+                bce_mix=config.stop_head_bce_mix,
+            ).to(device=self.device, dtype=torch.float32)
+            logger.info(
+                "System2 STOP head enabled: input_dim=%d hidden_dim=%d dtype=float32",
+                config.llm_hidden_dim,
+                config.stop_head_hidden_dim,
+            )
+
         # ==================== Action Head (NextDiT System 1) ====================
         self.nextdit_action_head = None
         self.latent_queries = None
         self.pano_latent_adapter = None
+        self.past_plan_action = None
         self._internnav_system1_load_audit: dict[str, Any] | None = None
 
         if config.enable_action_head and config.nextdit_enabled:
@@ -286,6 +326,9 @@ class VLNPipeline(nn.Module):
                     )
         elif config.nextdit_enabled:
             logger.info("NextDiT action head disabled by config.enable_action_head=False")
+
+        if config.past_plan_action_enabled:
+            self._initialize_past_plan_action()
 
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")
@@ -353,6 +396,88 @@ class VLNPipeline(nn.Module):
         if self.pano_latent_adapter is None:
             return traj_hidden_states
         return self.pano_latent_adapter(traj_hidden_states)
+
+    def _initialize_past_plan_action(self) -> None:
+        """Construct the additive chain only under its audited native contract."""
+
+        cfg = self.config
+        if self.nextdit_action_head is None or self.latent_queries is None:
+            raise RuntimeError("Past -> Plan -> Action requires native NextDiT")
+        if self._internnav_system1_load_audit is None:
+            raise RuntimeError(
+                "Past -> Plan -> Action requires loaded native InternNav System1 weights"
+            )
+        if not self._internnav_system1_load_audit.get("latent_queries_loaded", False):
+            raise RuntimeError("Native InternNav latent_queries were not loaded")
+        required_prefixes = (
+            "cond_projector.",
+            "traj_dit.",
+            "memory_encoder.",
+            "rgb_model.",
+            "rgb_resampler.",
+            "action_encoder.",
+            "action_decoder.",
+        )
+        required_keys = {
+            key
+            for key in self.nextdit_action_head.state_dict()
+            if key.startswith(required_prefixes)
+        }
+        loaded_keys = set(
+            self._internnav_system1_load_audit.get("loaded_keys") or ()
+        )
+        missing_required = sorted(required_keys - loaded_keys)
+        if not required_keys or missing_required:
+            raise RuntimeError(
+                "Past -> Plan -> Action refuses partially loaded native System1: "
+                f"missing_required={len(missing_required)} "
+                f"first_missing={missing_required[:5]}"
+            )
+        if self.pano_latent_adapter is not None or cfg.pano_latent_adapter_enabled:
+            raise RuntimeError(
+                "Past -> Plan -> Action is mutually exclusive with pano_latent_adapter"
+            )
+        trajectory_cfg = dict(cfg.heatmap_trajectory_config or {})
+        if (
+            not cfg.enable_heatmap
+            or cfg.heatmap_decoder_mode != "legacy"
+            or not bool(trajectory_cfg.get("enable", False))
+            or cfg.heatmap_c_fused != 256
+            or cfg.past_plan_action_memory_dim != 256
+        ):
+            raise RuntimeError(
+                "Past -> Plan -> Action requires the 256-d trajectory-guided Past Head"
+            )
+        native_contract = (
+            cfg.nextdit_n_query,
+            cfg.nextdit_latent_emb_size,
+            cfg.nextdit_predict_steps,
+            cfg.past_plan_action_plan_dim,
+        )
+        if native_contract != (4, 768, 32, 768):
+            raise RuntimeError(
+                "Past -> Plan -> Action v1 requires n_query=4, plan_dim=768, predict_steps=32"
+            )
+
+        # Every native component, including cond_projector and TRAJ queries,
+        # is a fixed teacher/consumer.  Only the new chain and selected shared
+        # Past decoder modules are trainable in later stages.
+        self.nextdit_action_head.requires_grad_(False)
+        self.nextdit_action_head.eval()
+        self.latent_queries.requires_grad_(False)
+        from .past_plan_action import PastPlanActionChain
+
+        self.past_plan_action = PastPlanActionChain(
+            plan_dim=cfg.past_plan_action_plan_dim,
+            memory_dim=cfg.past_plan_action_memory_dim,
+            bridge_heads=cfg.past_plan_action_bridge_heads,
+        ).to(device=self.device, dtype=torch.float32)
+        logger.info(
+            "Past -> Plan -> Action enabled: plan_dim=%d memory_dim=%d heads=%d",
+            cfg.past_plan_action_plan_dim,
+            cfg.past_plan_action_memory_dim,
+            cfg.past_plan_action_bridge_heads,
+        )
 
     def _load_internnav_system1(self, ckpt_path: str):
         """Load InternNav System 1 weights into NextDiTActionHead + latent_queries.
@@ -556,9 +681,27 @@ class VLNPipeline(nn.Module):
             heatmap_trains_backbone=cfg.heatmap_trains_backbone,
             decoder_mode=decoder_mode,
             pose_free_config=pose_free_config,
+            coarse_logit_residual=getattr(
+                cfg,
+                "heatmap_coarse_logit_residual",
+                False,
+            ),
+            restore_vit_spatial_layout=getattr(
+                cfg,
+                "heatmap_restore_vit_spatial_layout",
+                False,
+            ),
+            joint_panorama_inference=getattr(
+                cfg,
+                "heatmap_joint_panorama_inference",
+                False,
+            ),
         )
 
-        # Move all trainable parts to correct device/dtype
+        # Keep the frozen Qwen backbone in its configured low precision, but
+        # retain every trainable heatmap parameter (and therefore Adam state)
+        # in FP32.  Casting the decoder to the backbone BF16 dtype quantizes
+        # small localization updates away.
         for module in [
             self.heatmap_vln.vit_dpt_fusion,
             self.heatmap_vln.llm_dpt_fusion,
@@ -567,7 +710,7 @@ class VLNPipeline(nn.Module):
             self.heatmap_vln.pose_free_matcher,
         ]:
             if module is not None:
-                module.to(device=self.device, dtype=cfg.dtype)
+                module.to(device=self.device, dtype=torch.float32)
 
         logger.info(
             "HeatmapVLN v2 constructed (decoder_mode=%s, LLM layers=%s)",
@@ -611,6 +754,7 @@ class VLNPipeline(nn.Module):
 
             all_visibility = []
             all_heatmaps = []
+            all_heatmap_logits = []
             for b in range(current_views.shape[0]):
                 if isinstance(instruction_text, list):
                     instruction = instruction_text[b] if b < len(instruction_text) else instruction_text[0]
@@ -623,18 +767,15 @@ class VLNPipeline(nn.Module):
                 )
                 all_visibility.append(sample_output["visibility"])
                 all_heatmaps.append(sample_output["heatmaps"])
+                all_heatmap_logits.append(sample_output["heatmap_logits"])
 
             result = {
                 "visibility": torch.stack(all_visibility, dim=0),
                 "heatmaps": torch.stack(all_heatmaps, dim=0),
+                "heatmap_logits": torch.stack(all_heatmap_logits, dim=0),
             }
             if not self.training:
-                from .heatmap.heatmap_vln import HeatmapVLN
-
-                result["heatmaps_gated"] = HeatmapVLN._gated_softmax_heatmaps(
-                    result["heatmaps"],
-                    result["visibility"],
-                )
+                result.update(self.heatmap_vln._build_inference_heatmaps(result))
             return result
 
         return self.heatmap_vln(
@@ -651,23 +792,22 @@ class VLNPipeline(nn.Module):
         return_intermediate: bool = False,
         return_heatmaps: bool = True,
         return_actions: bool = True,
+        return_future_heatmaps: bool = False,
         gt_actions: torch.Tensor | None = None,
         action_valid: torch.Tensor | None = None,
         gt_stop: torch.Tensor | None = None,
-        gt_history_heatmap: torch.Tensor | None = None,
-        gt_future_heatmap: torch.Tensor | None = None,
         current_views: dict[str, Any] | None = None,
         history_panoramas: list[dict[str, Any]] | None = None,
         panoramic_inputs: dict[str, torch.Tensor] | None = None,
         panoramic_num_histories: list[int] | None = None,
         panoramic_text_anchor_positions: list[dict[int, int]] | None = None,
+        stop_predictor_positions: torch.Tensor | None = None,
         history_rel_poses: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
         return_heatmap_logits: bool = False,
     ) -> dict[str, Any]:
         """Forward pass."""
-        del gt_stop  # Reserved for optional stop-head training compatibility.
         batch_size, num_frames = video_frames.shape[:2]
 
         if current_observation is None:
@@ -684,12 +824,24 @@ class VLNPipeline(nn.Module):
         has_tokenized_panoramic_history = panoramic_num_histories is not None and any(
             n > 0 for n in panoramic_num_histories
         )
+        use_past_plan_action = self.past_plan_action is not None and (
+            return_actions or return_future_heatmaps
+        )
         need_heatmap = (
             use_panoramic_chain
-            and return_heatmaps
+            and (return_heatmaps or use_past_plan_action)
             and (has_standard_panoramic_views or has_tokenized_panoramic_history)
         )
-        if return_heatmap_logits and not need_heatmap:
+        if return_future_heatmaps and self.past_plan_action is None:
+            raise ValueError(
+                "return_future_heatmaps=True requires past_plan_action_enabled"
+            )
+        if use_past_plan_action and not need_heatmap:
+            raise ValueError(
+                "Past -> Plan -> Action requires the panoramic Past-memory path "
+                "and at least one history anchor in the batch"
+            )
+        if return_heatmap_logits and (not return_heatmaps or not need_heatmap):
             raise ValueError(
                 "return_heatmap_logits=True requires return_heatmaps=True and "
                 "an active panoramic heatmap path with at least one history"
@@ -701,8 +853,11 @@ class VLNPipeline(nn.Module):
         # Full projected image-token features are needed for intermediate
         # inspection / legacy feature consumers, not for bridge-only Stage2.
         need_projected_sequence_features = return_intermediate
+        need_stop_features = self.stop_head is not None and gt_stop is not None
         need_traj_query_features = (
-            return_actions and self.nextdit_action_head is not None and self.latent_queries is not None
+            (return_actions or return_future_heatmaps)
+            and self.nextdit_action_head is not None
+            and self.latent_queries is not None
         )
 
         qwen_output = None
@@ -732,6 +887,7 @@ class VLNPipeline(nn.Module):
                 )
         should_run_qwen = (
             need_projected_sequence_features
+            or need_stop_features
             or need_traj_query_features
             or use_panoramic_chain
             or return_lm_loss
@@ -750,7 +906,7 @@ class VLNPipeline(nn.Module):
                 history_frames=history_frames,
                 current_frame=current_observation,
                 instruction=instruction_text,
-                return_hidden_states=need_projected_sequence_features,
+                return_hidden_states=need_projected_sequence_features or need_stop_features,
                 generate_text=False,
                 current_views=current_views,
                 history_panoramas=history_panoramas,
@@ -762,6 +918,18 @@ class VLNPipeline(nn.Module):
                 latent_queries=lq,
                 return_lm_loss=return_lm_loss,
                 return_lm_correct_logprobs=return_lm_correct_logprobs,
+                sequence_last_hidden_state_only=(
+                    need_stop_features
+                    and not need_projected_sequence_features
+                    and not need_heatmap
+                    and not return_lm_loss
+                    and not return_lm_correct_logprobs
+                ),
+                **(
+                    {"return_heatmap_memory_tokens": True}
+                    if use_past_plan_action
+                    else {}
+                ),
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
@@ -787,33 +955,111 @@ class VLNPipeline(nn.Module):
                 # ==================== Step 2: Project Hidden States ====================
                 llm_tokens = self.llm_projector(raw_hidden_states)
 
-            if return_heatmaps and need_heatmap:
+            if need_heatmap:
                 if "visibility" not in qwen_output or "heatmaps" not in qwen_output:
                     raise RuntimeError("Panoramic Qwen path did not return HeatmapVLN outputs")
                 heatmap_output = {
-                    "visibility": qwen_output["visibility"],
-                    "heatmaps": qwen_output["heatmaps"],
+                    key: qwen_output[key]
+                    for key in (
+                        "visibility",
+                        "heatmaps",
+                        "heatmap_logits",
+                        "heatmaps_gated",
+                        "none_probability",
+                        "history_memory",
+                        "history_memory_mask",
+                        "history_spatial_memory",
+                        "panoramic_vit_features",
+                    )
+                    if key in qwen_output
                 }
-                if return_heatmap_logits:
-                    if "heatmap_logits" not in qwen_output:
-                        raise RuntimeError(
-                            "Raw heatmap logits were explicitly requested but "
-                            "the active heatmap decoder did not return them"
-                        )
-                    heatmap_output["heatmap_logits"] = qwen_output["heatmap_logits"]
-                if "heatmaps_gated" in qwen_output:
-                    heatmap_output["heatmaps_gated"] = qwen_output["heatmaps_gated"]
+                if return_heatmap_logits and "heatmap_logits" not in heatmap_output:
+                    raise RuntimeError(
+                        "Raw heatmap logits were requested but not returned"
+                    )
 
         # ==================== Step 4: Action Generation ====================
         trajectory = None
         traj_hidden_states = qwen_output.get("traj_hidden_states") if qwen_output is not None else None
+        plan_z0 = None
+        plan_z = None
+        plan_diagnostics = None
+        future_output = None
+
+        if use_past_plan_action:
+            if traj_hidden_states is None or heatmap_output is None:
+                raise RuntimeError(
+                    "Future maps require TRAJ states and same-forward Past memory"
+                )
+            for key in (
+                "history_memory",
+                "history_memory_mask",
+                "panoramic_vit_features",
+            ):
+                if key not in heatmap_output:
+                    raise RuntimeError(f"Past-memory output is missing {key}")
+            plan_z0, plan_z, plan_diagnostics = self.past_plan_action.form_plan(
+                traj_hidden_states,
+                frozen_cond_projector=self.nextdit_action_head.cond_projector,
+                history_memory=heatmap_output["history_memory"],
+                history_memory_mask=heatmap_output["history_memory_mask"],
+                return_diagnostics=True,
+            )
+            if return_future_heatmaps:
+                future_output = self.past_plan_action.decode_future(
+                    plan_z,
+                    past_output=heatmap_output,
+                    past_head=self.heatmap_vln,
+                )
+
+        stop_result = None
+        if need_stop_features:
+            if stop_predictor_positions is None:
+                raise RuntimeError(
+                    "STOP-head training requires stop_predictor_positions from the collator"
+                )
+            sequence_hidden = qwen_output.get("hidden_states") if qwen_output is not None else None
+            if sequence_hidden is None or sequence_hidden.ndim != 3:
+                raise RuntimeError("STOP head requires rank-3 Qwen sequence hidden states")
+            positions = stop_predictor_positions.to(
+                device=sequence_hidden.device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+            if positions.shape != (sequence_hidden.shape[0],):
+                raise RuntimeError(
+                    "STOP predictor positions must have shape (B,), got "
+                    f"{tuple(positions.shape)} for hidden {tuple(sequence_hidden.shape)}"
+                )
+            if bool((positions < 0).any()) or bool((positions >= sequence_hidden.shape[1]).any()):
+                raise RuntimeError(
+                    f"STOP predictor positions out of bounds for sequence length {sequence_hidden.shape[1]}"
+                )
+            row_indices = torch.arange(sequence_hidden.shape[0], device=sequence_hidden.device)
+            # Qwen is frozen in STOP-head training. Clone converts inference
+            # tensors into normal tensors that the trainable MLP can save for backward.
+            stop_features = sequence_hidden[row_indices, positions].detach().clone()
+            # Keep this small calibrated classifier in FP32. Its 1e-4 updates
+            # can quantize away when parameters themselves are BF16, while the
+            # frozen Qwen forward remains BF16/no-grad.
+            with torch.autocast(device_type=stop_features.device.type, enabled=False):
+                stop_result = self.stop_head(
+                    stop_features.float(),
+                    gt_stop=gt_stop,
+                    return_loss=True,
+                )
 
         if return_actions and self.nextdit_action_head is not None and traj_hidden_states is not None:
             if not self.training:
-                condition_hidden_states = self.adapt_traj_hidden_states(traj_hidden_states)
-                trajectory = self.nextdit_action_head.get_trajectory(
-                    condition_hidden_states,
-                )
+                if plan_z is not None:
+                    trajectory = self.nextdit_action_head.get_trajectory_from_projected(
+                        plan_z
+                    )
+                else:
+                    condition_hidden_states = self.adapt_traj_hidden_states(traj_hidden_states)
+                    trajectory = self.nextdit_action_head.get_trajectory(
+                        condition_hidden_states,
+                    )
 
         # ==================== Build Output ====================
         output: dict[str, Any] = {
@@ -831,12 +1077,22 @@ class VLNPipeline(nn.Module):
             output["llm_tokens"] = llm_tokens
 
         if heatmap_output is not None:
-            output["visibility"] = heatmap_output["visibility"]
-            output["heatmaps"] = heatmap_output["heatmaps"]
-            if "heatmap_logits" in heatmap_output:
-                output["heatmap_logits"] = heatmap_output["heatmap_logits"]
-            if "heatmaps_gated" in heatmap_output:
-                output["heatmaps_gated"] = heatmap_output["heatmaps_gated"]
+            if return_heatmaps:
+                output["visibility"] = heatmap_output["visibility"]
+                output["heatmaps"] = heatmap_output["heatmaps"]
+                if return_heatmap_logits and "heatmap_logits" in heatmap_output:
+                    output["heatmap_logits"] = heatmap_output["heatmap_logits"]
+                if "heatmaps_gated" in heatmap_output:
+                    output["heatmaps_gated"] = heatmap_output["heatmaps_gated"]
+                if "none_probability" in heatmap_output:
+                    output["none_probability"] = heatmap_output["none_probability"]
+
+        if plan_z is not None:
+            output["plan_z0"] = plan_z0
+            output["plan_z"] = plan_z
+            output["delta_z"] = plan_diagnostics["delta_z"]
+        if future_output is not None:
+            output.update(future_output)
 
         if traj_hidden_states is not None:
             output["traj_hidden_states"] = traj_hidden_states
@@ -845,6 +1101,10 @@ class VLNPipeline(nn.Module):
         if qwen_output is not None and qwen_output.get("lm_correct_label_logprobs") is not None:
             output["lm_correct_label_logprobs"] = qwen_output["lm_correct_label_logprobs"]
             output["lm_correct_label_alignment"] = qwen_output["lm_correct_label_alignment"]
+        if stop_result is not None:
+            output["stop_loss"] = stop_result["loss"]
+            output["stop_probability"] = stop_result["stop_prob"]
+            output["stop_logits"] = stop_result["stop_logits"]
 
         if self.nextdit_action_head is not None:
             output["has_nextdit_action_head"] = True
@@ -865,6 +1125,7 @@ class VLNPipeline(nn.Module):
         panoramic_inputs: dict[str, torch.Tensor],
         panoramic_num_histories: list[int],
         traj_images: torch.Tensor | None = None,
+        history_rel_poses: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Two-step inference aligned with InternNav.
 
@@ -879,6 +1140,35 @@ class VLNPipeline(nn.Module):
             return None
 
         inputs = {k: v.to(self.device, non_blocking=True) for k, v in panoramic_inputs.items()}
+        past_memory_output = None
+        if self.past_plan_action is not None:
+            if len(panoramic_num_histories) != 1:
+                raise RuntimeError(
+                    "generate_trajectory currently requires batch size 1"
+                )
+            if panoramic_num_histories[0] <= 0 or history_rel_poses is None:
+                raise RuntimeError(
+                    "Past -> Plan inference requires history and relative poses "
+                    "from the same observation context"
+                )
+            self._ensure_heatmap_vln()
+            (
+                _hidden,
+                _vision,
+                _num_image_tokens,
+                past_memory_output,
+                _traj_hidden,
+                _lm_output,
+            ) = self.qwen2_5_vl._forward_batch_panorama_tokenized(
+                panoramic_inputs=inputs,
+                num_histories=panoramic_num_histories,
+                return_hidden_states=False,
+                heatmap_vln=self.heatmap_vln,
+                history_rel_poses=history_rel_poses,
+                return_heatmap_memory_tokens=True,
+            )
+            if past_memory_output is None:
+                raise RuntimeError("Failed to obtain same-context Past memory")
 
         with torch.no_grad():
             output_ids = self.qwen2_5_vl.model.generate(
@@ -899,12 +1189,24 @@ class VLNPipeline(nn.Module):
             image_grid_thw=inputs.get("image_grid_thw"),
             latent_queries=lq,
         )
-        traj_hidden_states = self.adapt_traj_hidden_states(traj_hidden_states)
-
-        trajectory = self.nextdit_action_head.get_trajectory(
-            traj_hidden_states,
-            traj_images=traj_images,
-        )
+        if self.past_plan_action is not None:
+            plan_z0, plan_z = self.past_plan_action.form_plan(
+                traj_hidden_states,
+                frozen_cond_projector=self.nextdit_action_head.cond_projector,
+                history_memory=past_memory_output["history_memory"],
+                history_memory_mask=past_memory_output["history_memory_mask"],
+            )
+            del plan_z0
+            trajectory = self.nextdit_action_head.get_trajectory_from_projected(
+                plan_z,
+                traj_images=traj_images,
+            )
+        else:
+            traj_hidden_states = self.adapt_traj_hidden_states(traj_hidden_states)
+            trajectory = self.nextdit_action_head.get_trajectory(
+                traj_hidden_states,
+                traj_images=traj_images,
+            )
         return trajectory
 
     def forward_packed(

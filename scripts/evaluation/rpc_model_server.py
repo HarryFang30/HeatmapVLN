@@ -9,12 +9,14 @@ receives discrete Habitat actions.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
 import sys
+from collections.abc import Sequence
 from concurrent import futures
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,7 @@ from scripts.training.utils import (
     extract_lora_checkpoint_state,
     load_config,
 )
+from transformers import LogitsProcessor, LogitsProcessorList
 from vla_rpc.core.image import decode_jpeg_to_rgb
 from vla_rpc.proto import vla_pb2, vla_pb2_grpc
 
@@ -51,6 +54,10 @@ from src.models.heatmap.input_constructor import (
     vlm_output_requests_stop,
     vlm_output_requests_turn,
 )
+from src.models.qwen2_5_vl.integration import (
+    DEFAULT_LORA_ADAPTER_NAME,
+    STOP_DECISION_ADAPTER_NAME,
+)
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
 from src.utils.trajectory_direction import (
     align_trajectory_endpoint_heading,
@@ -58,6 +65,10 @@ from src.utils.trajectory_direction import (
 )
 
 LOGGER = logging.getLogger("heatmapvln-rpc-server")
+
+STOP_DECISION_CHECKPOINT_SCHEMA = "heatmapvln-system2-stop-decision-adapter-v1"
+STOP_DECISION_ADD_AND_VETO_POLICY = "add_and_veto"
+STOP_DECISION_VETO_ONLY_POLICY = "veto_only"
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -166,6 +177,580 @@ def _assert_finite_state_dict(state_dict: dict[str, torch.Tensor], label: str) -
     nonfinite = [name for name, value in state_dict.items() if not bool(torch.isfinite(value.float()).all())]
     if nonfinite:
         raise RuntimeError(f"{label} contains non-finite tensors: {nonfinite[:5]}")
+
+
+def _load_system2_stop_decision_adapter(
+    checkpoint_path: str,
+    *,
+    integration: Any,
+    expected_base_checkpoint: str | None = None,
+    add_threshold_override: float | None = None,
+    veto_threshold_override: float | None = None,
+) -> dict[str, Any]:
+    """Load a STOP-only LoRA delta while proving the navigation LoRA is unchanged."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Invalid System2 STOP-decision checkpoint: {checkpoint_path}")
+    if checkpoint.get("schema") != STOP_DECISION_CHECKPOINT_SCHEMA:
+        raise RuntimeError(
+            "System2 STOP-decision checkpoint schema mismatch: "
+            f"{checkpoint.get('schema')!r}"
+        )
+    if checkpoint.get("adapter_name") != STOP_DECISION_ADAPTER_NAME:
+        raise RuntimeError(
+            "System2 STOP-decision checkpoint adapter_name mismatch: "
+            f"{checkpoint.get('adapter_name')!r}"
+        )
+    policy_kind = str(
+        checkpoint.get("policy_kind") or STOP_DECISION_ADD_AND_VETO_POLICY
+    )
+    if policy_kind not in {
+        STOP_DECISION_ADD_AND_VETO_POLICY,
+        STOP_DECISION_VETO_ONLY_POLICY,
+    }:
+        raise RuntimeError(
+            f"Unsupported System2 STOP-decision policy_kind: {policy_kind!r}"
+        )
+
+    adapter_config = checkpoint.get("adapter_config")
+    base_contract = checkpoint.get("base_contract")
+    thresholds = checkpoint.get("thresholds")
+    token_contract = checkpoint.get("token_contract")
+    state_dict = checkpoint.get("adapter_state_dict")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            adapter_config,
+            base_contract,
+            thresholds,
+            token_contract,
+            state_dict,
+        )
+    ):
+        raise RuntimeError("System2 STOP-decision checkpoint contract is incomplete")
+    _assert_finite_state_dict(state_dict, "System2 STOP-decision adapter")
+    if thresholds.get("quality_passed") is not True:
+        raise RuntimeError(
+            "STOP-decision checkpoint failed its validation quality gate: "
+            f"{thresholds.get('quality_violations')!r}"
+        )
+    add_metrics = thresholds.get("add")
+    veto_metrics = thresholds.get("veto")
+    if not isinstance(add_metrics, dict) or not isinstance(veto_metrics, dict):
+        raise RuntimeError("STOP-decision checkpoint has no calibrated add/veto metrics")
+    add_enabled = policy_kind == STOP_DECISION_ADD_AND_VETO_POLICY
+    if (
+        (add_enabled and float(add_metrics.get("recall", 0.0)) < 0.5)
+        or (add_enabled and float(add_metrics.get("false_positive_rate", 1.0)) > 0.0)
+        or float(veto_metrics.get("recall", 0.0)) < 0.98
+        or float(veto_metrics.get("negative_rejection_rate", 0.0)) < 0.2
+        or float(thresholds.get("roc_auc", 0.0)) < 0.75
+        or int(thresholds.get("veto_reference_positive_count", 0) or 0) <= 0
+    ):
+        raise RuntimeError("STOP-decision checkpoint calibration metrics are below contract")
+    if thresholds.get("policy_kind", policy_kind) != policy_kind:
+        raise RuntimeError("STOP-decision checkpoint policy_kind contract is inconsistent")
+    if bool(thresholds.get("add_enabled", add_enabled)) != add_enabled:
+        raise RuntimeError("STOP-decision checkpoint add-enabled contract is inconsistent")
+    if not add_enabled and add_threshold_override is not None:
+        raise RuntimeError("A veto-only STOP-decision policy forbids add threshold overrides")
+    training = checkpoint.get("training")
+    if not isinstance(training, dict) or not (
+        0.0 < float(training.get("holdout_scene_fraction", 0.0) or 0.0) < 1.0
+        and float(training.get("ranking_loss_weight", 0.0) or 0.0) > 0.0
+    ):
+        raise RuntimeError(
+            "STOP-decision checkpoint lacks scene-held-out ranking-loss training metadata"
+        )
+
+    rank = int(adapter_config.get("rank", 0) or 0)
+    alpha = int(adapter_config.get("alpha", 0) or 0)
+    layers = [int(value) for value in (adapter_config.get("layer_indices") or [])]
+    targets = [str(value) for value in (adapter_config.get("target_modules") or [])]
+    dropout = float(adapter_config.get("dropout", float("nan")))
+    if (
+        rank <= 0
+        or alpha <= 0
+        or not layers
+        or layers != sorted(set(layers))
+        or min(layers) < 0
+        or not targets
+        or len(targets) != len(set(targets))
+        or dropout != 0.0
+    ):
+        raise RuntimeError(
+            "Invalid System2 STOP-decision adapter config: "
+            f"rank={rank} alpha={alpha} layers={layers} targets={targets} "
+            f"dropout={dropout}"
+        )
+
+    if base_contract.get("default_adapter_name") != DEFAULT_LORA_ADAPTER_NAME:
+        raise RuntimeError("STOP-decision checkpoint targets the wrong navigation adapter")
+    if int(base_contract.get("default_lora_tensors", 0) or 0) != 224:
+        raise RuntimeError("STOP-decision checkpoint does not require all 224 navigation LoRA tensors")
+    recorded_base = str(base_contract.get("checkpoint") or "")
+    if expected_base_checkpoint and os.path.realpath(recorded_base) != os.path.realpath(
+        expected_base_checkpoint
+    ):
+        raise RuntimeError(
+            "STOP-decision checkpoint base path mismatch: "
+            f"recorded={recorded_base!r} expected={expected_base_checkpoint!r}"
+        )
+    expected_default_fingerprint = str(
+        base_contract.get("default_lora_fingerprint") or ""
+    )
+    current_default_fingerprint = integration.lora_adapter_fingerprint(
+        DEFAULT_LORA_ADAPTER_NAME
+    )
+    if current_default_fingerprint != expected_default_fingerprint:
+        raise RuntimeError(
+            "STOP-decision checkpoint navigation-LoRA fingerprint mismatch: "
+            f"current={current_default_fingerprint} "
+            f"expected={expected_default_fingerprint}"
+        )
+    current_token_contract = integration.structured_view_token_contract()
+    if token_contract != current_token_contract:
+        raise RuntimeError(
+            "STOP-decision structured-view token contract mismatch: "
+            f"checkpoint={token_contract} runtime={current_token_contract}"
+        )
+
+    add_threshold = float(
+        thresholds.get("add_stop_threshold")
+        if add_threshold_override is None
+        else add_threshold_override
+    )
+    veto_threshold = float(
+        thresholds.get("veto_stop_threshold")
+        if veto_threshold_override is None
+        else veto_threshold_override
+    )
+    if not (
+        np.isfinite(add_threshold)
+        and np.isfinite(veto_threshold)
+        and 0.0 <= veto_threshold < add_threshold <= 1.0
+    ):
+        raise RuntimeError(
+            "Invalid STOP-decision hysteresis thresholds: "
+            f"veto={veto_threshold} add={add_threshold}"
+        )
+    if not add_enabled and add_threshold != 1.0:
+        raise RuntimeError(
+            "Veto-only STOP-decision checkpoint must record add_stop_threshold=1.0"
+        )
+
+    integration.add_stop_decision_adapter(
+        adapter_name=STOP_DECISION_ADAPTER_NAME,
+        rank=rank,
+        alpha=alpha,
+        layer_indices=layers,
+        target_modules=targets,
+    )
+    loaded_tensors = integration.load_lora_adapter_state_dict(
+        STOP_DECISION_ADAPTER_NAME,
+        state_dict,
+    )
+    expected_adapter_fingerprint = str(checkpoint.get("adapter_fingerprint") or "")
+    current_adapter_fingerprint = integration.lora_adapter_fingerprint(
+        STOP_DECISION_ADAPTER_NAME
+    )
+    if not expected_adapter_fingerprint or (
+        current_adapter_fingerprint != expected_adapter_fingerprint
+    ):
+        raise RuntimeError(
+            "STOP-decision adapter fingerprint mismatch after load: "
+            f"current={current_adapter_fingerprint} "
+            f"expected={expected_adapter_fingerprint}"
+        )
+    integration.activate_lora_adapters(
+        (DEFAULT_LORA_ADAPTER_NAME,),
+        trainable_adapters=(),
+    )
+    integration.model.eval()
+    if integration.lora_adapter_fingerprint(
+        DEFAULT_LORA_ADAPTER_NAME
+    ) != expected_default_fingerprint:
+        raise RuntimeError("Navigation LoRA changed while loading STOP-decision adapter")
+    return {
+        "policy_kind": policy_kind,
+        "add_enabled": add_enabled,
+        "adapter_name": STOP_DECISION_ADAPTER_NAME,
+        "adapter_tensors": loaded_tensors,
+        "adapter_parameters": sum(value.numel() for value in state_dict.values()),
+        "adapter_fingerprint": current_adapter_fingerprint,
+        "default_lora_fingerprint": current_default_fingerprint,
+        "add_stop_threshold": add_threshold,
+        "veto_stop_threshold": veto_threshold,
+        "token_contract": current_token_contract,
+    }
+
+
+def _assert_navigation_only_lora(qwen_integration: Any, *, context: str) -> None:
+    active = qwen_integration.active_lora_adapters()
+    if active != (DEFAULT_LORA_ADAPTER_NAME,):
+        raise RuntimeError(
+            f"{context} requires navigation-only LoRA, active adapters={active}"
+        )
+
+
+def _system2_stop_decision_adapter_probe(
+    *,
+    qwen_integration: Any,
+    inputs: dict[str, torch.Tensor],
+    adapter_name: str = STOP_DECISION_ADAPTER_NAME,
+) -> dict[str, Any]:
+    """Score the six structured actions with default+STOP LoRA on one extra forward."""
+    _assert_navigation_only_lora(
+        qwen_integration,
+        context="STOP-decision adapter probe entry",
+    )
+    contract = qwen_integration.structured_view_token_contract()
+    input_ids = inputs.get("input_ids")
+    if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+        raise RuntimeError("STOP-decision probe requires rank-2 input_ids")
+    if input_ids.shape[0] != 1:
+        raise RuntimeError(
+            f"RPC STOP-decision probe requires batch size 1, got {input_ids.shape[0]}"
+        )
+    prefix_ids = torch.tensor(
+        [contract["prefix_token_ids"]],
+        device=input_ids.device,
+        dtype=input_ids.dtype,
+    )
+    probe_inputs = dict(inputs)
+    probe_inputs["input_ids"] = torch.cat([input_ids, prefix_ids], dim=1)
+    for mask_name, fill_value in (("attention_mask", 1), ("mm_token_type_ids", 0)):
+        mask = inputs.get(mask_name)
+        if mask is None:
+            continue
+        suffix = torch.full(
+            (mask.shape[0], prefix_ids.shape[1]),
+            fill_value,
+            device=mask.device,
+            dtype=mask.dtype,
+        )
+        probe_inputs[mask_name] = torch.cat([mask, suffix], dim=1)
+    probe_inputs.pop("position_ids", None)
+    probe_inputs.pop("labels", None)
+
+    try:
+        qwen_integration.activate_lora_adapters(
+            (DEFAULT_LORA_ADAPTER_NAME, adapter_name),
+            trainable_adapters=(),
+        )
+        with torch.inference_mode():
+            hidden, _vision, _num_images, _traj, _lm = (
+                qwen_integration._forward_model_inputs(
+                    probe_inputs,
+                    return_hidden_states=True,
+                    skip_lm_head=True,
+                    return_last_hidden_state_only=True,
+                    extract_vision_hidden_states=False,
+                )
+            )
+        if hidden is None:
+            raise RuntimeError("STOP-decision adapter probe returned no hidden state")
+        positions = torch.full(
+            (hidden.shape[0],),
+            hidden.shape[1] - 1,
+            device=hidden.device,
+            dtype=torch.long,
+        )
+        class_logits = qwen_integration.structured_view_class_logits(
+            hidden,
+            positions,
+        )
+        class_probabilities = torch.softmax(class_logits.float(), dim=-1)
+        stop_log_odds = class_logits[:, 0] - torch.logsumexp(
+            class_logits[:, 1:], dim=-1
+        )
+    finally:
+        qwen_integration.activate_lora_adapters(
+            (DEFAULT_LORA_ADAPTER_NAME,),
+            trainable_adapters=(),
+        )
+    _assert_navigation_only_lora(
+        qwen_integration,
+        context="STOP-decision adapter probe exit",
+    )
+    probabilities = class_probabilities[0].detach().float().cpu().tolist()
+    if len(probabilities) != len(contract["classes"]) or not all(
+        np.isfinite(value) for value in probabilities
+    ):
+        raise RuntimeError("STOP-decision adapter returned invalid class probabilities")
+    return {
+        "stop_probability": float(probabilities[0]),
+        "stop_log_odds": float(stop_log_odds[0].detach().float().cpu().item()),
+        "selected": contract["classes"][int(np.argmax(probabilities))],
+        "class_probabilities": dict(zip(contract["classes"], probabilities)),
+    }
+
+
+def _load_system2_stop_head(
+    checkpoint_path: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    add_threshold_override: float | None = None,
+    veto_threshold_override: float | None = None,
+) -> tuple[torch.nn.Module, float, float]:
+    """Load an isolated STOP classifier checkpoint with an exact state contract."""
+    from src.models.action import StopPredictionHead
+
+    checkpoint_config = _extract_checkpoint_config(checkpoint_path)
+    model_config = checkpoint_config.get("model", {})
+    llm_config = model_config.get("llm", {})
+    head_config = model_config.get("stop_head", {})
+    if not bool(head_config.get("enabled", False)):
+        raise RuntimeError("System2 STOP-head checkpoint config does not enable stop_head")
+    head = StopPredictionHead(
+        input_dim=int(llm_config.get("hidden_dim", 3584)),
+        hidden_dim=int(head_config.get("hidden_dim", 512)),
+        dropout=float(head_config.get("dropout", 0.1)),
+        focal_gamma=float(head_config.get("focal_gamma", 2.0)),
+        focal_alpha=float(head_config.get("focal_alpha", 0.5)),
+        pos_weight=float(head_config.get("pos_weight", 1.0)),
+        bce_mix=float(head_config.get("bce_mix", 0.5)),
+    )
+    checkpoint_state = _extract_checkpoint_state_dict(checkpoint_path)
+    _assert_finite_state_dict(checkpoint_state, "System2 STOP-head checkpoint")
+    normalized = {
+        _normalize_state_key(name): value
+        for name, value in checkpoint_state.items()
+    }
+    unexpected = sorted(name for name in normalized if not name.startswith("stop_head."))
+    if unexpected:
+        raise RuntimeError(
+            "System2 STOP-head checkpoint contains non-head trainable tensors: "
+            f"{unexpected[:5]}"
+        )
+    head_state = {
+        name.removeprefix("stop_head."): value
+        for name, value in normalized.items()
+    }
+    expected = head.state_dict()
+    if set(head_state) != set(expected):
+        raise RuntimeError(
+            "Incomplete System2 STOP-head checkpoint: "
+            f"found={len(head_state)} expected={len(expected)} "
+            f"missing={sorted(set(expected) - set(head_state))[:5]} "
+            f"unexpected={sorted(set(head_state) - set(expected))[:5]}"
+        )
+    mismatched = sorted(
+        name
+        for name in expected
+        if tuple(head_state[name].shape) != tuple(expected[name].shape)
+    )
+    if mismatched:
+        raise RuntimeError(f"System2 STOP-head shape mismatches: {mismatched[:5]}")
+    head.load_state_dict(head_state, strict=True)
+    # Match training: retain FP32 classifier parameters and computation even
+    # though the frozen Qwen hidden state is produced in BF16.
+    head.to(device=device, dtype=torch.float32)
+    head.requires_grad_(False)
+    head.eval()
+    legacy_threshold = float(head_config.get("inference_threshold", 0.5))
+    add_threshold = float(
+        head_config.get("add_stop_threshold", legacy_threshold)
+        if add_threshold_override is None
+        else add_threshold_override
+    )
+    veto_threshold = float(
+        head_config.get("veto_stop_threshold", legacy_threshold)
+        if veto_threshold_override is None
+        else veto_threshold_override
+    )
+    if not 0.0 <= veto_threshold < add_threshold <= 1.0:
+        raise RuntimeError(
+            "Invalid System2 STOP-head hysteresis thresholds: "
+            f"veto={veto_threshold} add={add_threshold}; expected "
+            "0 <= veto < add <= 1"
+        )
+    return head, add_threshold, veto_threshold
+
+
+def _load_system2_temporal_stop_verifier(
+    checkpoint_path: str,
+    *,
+    device: torch.device,
+) -> tuple[torch.nn.Module, torch.nn.Module, float | None]:
+    """Load the embedded frozen static prior and veto-only temporal policy."""
+    from src.models.action import StopPredictionHead
+    from src.models.action.temporal_stop_verifier import (
+        TEMPORAL_STOP_FEATURE_NAMES,
+        TEMPORAL_STOP_FEATURE_SCHEMA,
+        TemporalStopVerifier,
+        TemporalStopVerifierEnsemble,
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Invalid temporal STOP checkpoint: {checkpoint_path}")
+    stage_name = checkpoint.get("stage_name")
+    supported_stages = {
+        "system2_temporal_stop_verifier",
+        "system2_temporal_stop_verifier_ensemble",
+    }
+    if stage_name not in supported_stages:
+        raise RuntimeError(
+            "Temporal STOP checkpoint has the wrong stage_name: "
+            f"{stage_name!r}"
+        )
+    config = checkpoint.get("config")
+    if not isinstance(config, dict):
+        raise RuntimeError("Temporal STOP checkpoint has no config")
+    verifier_config = config.get("temporal_stop_verifier")
+    static_spec = config.get("source_static_stop_head")
+    if not isinstance(verifier_config, dict) or not isinstance(static_spec, dict):
+        raise RuntimeError("Temporal STOP checkpoint config is incomplete")
+    if verifier_config.get("schema") != TEMPORAL_STOP_FEATURE_SCHEMA:
+        raise RuntimeError("Temporal STOP feature schema mismatch")
+    if tuple(verifier_config.get("feature_names") or ()) != TEMPORAL_STOP_FEATURE_NAMES:
+        raise RuntimeError("Temporal STOP feature names do not match runtime code")
+    if verifier_config.get("veto_only") is not True:
+        raise RuntimeError("Temporal STOP checkpoint must be veto-only")
+    if verifier_config.get("requires_contiguous_zero_based_calls") is not True:
+        raise RuntimeError("Temporal STOP checkpoint lacks the required history contract")
+    static_head = StopPredictionHead(
+        input_dim=int(static_spec["input_dim"]),
+        hidden_dim=int(static_spec["hidden_dim"]),
+        dropout=float(static_spec["dropout"]),
+        focal_gamma=float(static_spec["focal_gamma"]),
+        focal_alpha=float(static_spec["focal_alpha"]),
+        pos_weight=float(static_spec["pos_weight"]),
+        bce_mix=float(static_spec["bce_mix"]),
+    )
+    raw_static_state = checkpoint.get("source_static_stop_head_state_dict")
+    if not isinstance(raw_static_state, dict):
+        raise RuntimeError("Temporal STOP checkpoint lacks its frozen static prior")
+    static_state = {
+        _normalize_state_key(name).removeprefix("stop_head."): value
+        for name, value in raw_static_state.items()
+        if _normalize_state_key(name).startswith("stop_head.")
+    }
+    _assert_finite_state_dict(static_state, "Temporal STOP frozen static prior")
+    if set(static_state) != set(static_head.state_dict()):
+        raise RuntimeError(
+            "Temporal STOP frozen static prior is incomplete: "
+            f"found={len(static_state)} expected={len(static_head.state_dict())}"
+        )
+    mismatched_static = [
+        name
+        for name, value in static_head.state_dict().items()
+        if tuple(static_state[name].shape) != tuple(value.shape)
+    ]
+    if mismatched_static:
+        raise RuntimeError(
+            f"Temporal STOP static-prior shape mismatch: {mismatched_static[:5]}"
+        )
+    static_head.load_state_dict(static_state, strict=True)
+
+    raw_verifier_state = checkpoint.get("trainable_state_dict")
+    if not isinstance(raw_verifier_state, dict):
+        raise RuntimeError("Temporal STOP checkpoint lacks verifier tensors")
+    state_prefix = (
+        "temporal_stop_ensemble."
+        if stage_name == "system2_temporal_stop_verifier_ensemble"
+        else "temporal_stop_verifier."
+    )
+    normalized_verifier_state = {
+        _normalize_state_key(name): value for name, value in raw_verifier_state.items()
+    }
+    unexpected_verifier = sorted(
+        name for name in normalized_verifier_state if not name.startswith(state_prefix)
+    )
+    if unexpected_verifier:
+        raise RuntimeError(
+            "Temporal STOP checkpoint contains unexpected verifier tensors: "
+            f"{unexpected_verifier[:5]}"
+        )
+    verifier_state = {
+        name.removeprefix(state_prefix): value
+        for name, value in normalized_verifier_state.items()
+        if name.startswith(state_prefix)
+    }
+    _assert_finite_state_dict(verifier_state, "Temporal STOP verifier")
+    threshold: float | None
+    if stage_name == "system2_temporal_stop_verifier":
+        threshold = float(verifier_config.get("acceptance_threshold", float("nan")))
+        if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise RuntimeError(
+                f"Invalid temporal STOP acceptance threshold: {threshold}"
+            )
+        feature_mean = verifier_state.get("feature_mean")
+        feature_scale = verifier_state.get("feature_scale")
+        if not torch.is_tensor(feature_mean) or not torch.is_tensor(feature_scale):
+            raise RuntimeError("Temporal STOP checkpoint lacks normalization tensors")
+        verifier: torch.nn.Module = TemporalStopVerifier(
+            feature_mean=feature_mean,
+            feature_scale=feature_scale,
+            hidden_dim=int(verifier_config["hidden_dim"]),
+            dropout=float(verifier_config["dropout"]),
+        )
+    else:
+        threshold = None
+        if verifier_config.get("architecture") != "scene_fold_unanimous_ensemble":
+            raise RuntimeError("Temporal STOP ensemble architecture is unsupported")
+        if verifier_config.get("aggregation") != "unanimous":
+            raise RuntimeError("Temporal STOP ensemble must use unanimous aggregation")
+        ensemble_size = int(verifier_config.get("ensemble_size", 0) or 0)
+        if ensemble_size < 2:
+            raise RuntimeError("Temporal STOP ensemble must contain at least two members")
+        raw_thresholds = verifier_config.get("acceptance_thresholds")
+        if not isinstance(raw_thresholds, list) or len(raw_thresholds) != ensemble_size:
+            raise RuntimeError(
+                "Temporal STOP ensemble thresholds do not match member count"
+            )
+        thresholds = torch.tensor(raw_thresholds, dtype=torch.float32)
+        if not bool(torch.isfinite(thresholds).all()) or bool(
+            ((thresholds < 0.0) | (thresholds > 1.0)).any()
+        ):
+            raise RuntimeError("Temporal STOP ensemble thresholds must be in [0, 1]")
+        members = []
+        for member_index in range(ensemble_size):
+            member_prefix = f"members.{member_index}."
+            feature_mean = verifier_state.get(f"{member_prefix}feature_mean")
+            feature_scale = verifier_state.get(f"{member_prefix}feature_scale")
+            if not torch.is_tensor(feature_mean) or not torch.is_tensor(feature_scale):
+                raise RuntimeError(
+                    "Temporal STOP ensemble lacks normalization tensors for "
+                    f"member {member_index}"
+                )
+            members.append(
+                TemporalStopVerifier(
+                    feature_mean=feature_mean,
+                    feature_scale=feature_scale,
+                    hidden_dim=int(verifier_config["member_hidden_dim"]),
+                    dropout=float(verifier_config["member_dropout"]),
+                )
+            )
+        verifier = TemporalStopVerifierEnsemble(members, thresholds)
+    if set(verifier_state) != set(verifier.state_dict()):
+        raise RuntimeError(
+            "Temporal STOP verifier is incomplete: "
+            f"found={len(verifier_state)} expected={len(verifier.state_dict())}"
+        )
+    mismatched_verifier = [
+        name
+        for name, value in verifier.state_dict().items()
+        if tuple(verifier_state[name].shape) != tuple(value.shape)
+    ]
+    if mismatched_verifier:
+        raise RuntimeError(
+            f"Temporal STOP verifier shape mismatch: {mismatched_verifier[:5]}"
+        )
+    verifier.load_state_dict(verifier_state, strict=True)
+    if isinstance(verifier, TemporalStopVerifierEnsemble) and not torch.allclose(
+        verifier.acceptance_thresholds.cpu(), thresholds, rtol=0.0, atol=1e-7
+    ):
+        raise RuntimeError(
+            "Temporal STOP ensemble state thresholds do not match checkpoint config"
+        )
+    for module in (static_head, verifier):
+        module.to(device=device, dtype=torch.float32)
+        module.requires_grad_(False)
+        module.eval()
+    return static_head, verifier, threshold
 
 
 def _load_compatible_state_dict(
@@ -310,6 +895,13 @@ def _parse_pixel_goal(
     return None
 
 
+def _fallback_replan_action(view_id: str | None) -> int:
+    """Turn toward a valid view after malformed waypoint text; never infer STOP."""
+    if str(view_id or "").lower() in {"right", "back"}:
+        return ActionCode.RIGHT
+    return ActionCode.LEFT
+
+
 def _condition_output_ids_for_pixel_goal(
     output_ids: torch.Tensor,
     prompt_len: int,
@@ -374,6 +966,13 @@ def _trajectory_from_condition(
         traj_images=traj_images,
         generator=generator,
     )
+
+
+def _project_trajectory_condition(action_head, traj_condition: torch.Tensor) -> torch.Tensor:
+    """Return the exact 768-D InternNav condition without projecting it twice."""
+    if traj_condition.shape[-1] == int(action_head.config.latent_emb_size):
+        return traj_condition
+    return action_head.cond_projector(traj_condition)
 
 
 def _lookdown_to_traj_tensor(lookdown_img: Image.Image, device: torch.device) -> torch.Tensor:
@@ -538,17 +1137,17 @@ def traj_to_actions(
     return actions if actions else [ActionCode.STOP]
 
 
-def _trajectory_debug_summary(
+def _trajectory_debug_metrics(
     trajectory: torch.Tensor,
     num_sample_trajs: int,
     action_scale: float,
     trajectory_x_sign: float = 1.0,
-) -> str:
+) -> dict[str, float] | None:
     if trajectory is None or trajectory.numel() == 0:
-        return "trajectory=empty"
+        return None
     trajs = trajectory[:num_sample_trajs].float().detach().cpu().numpy().copy()
     if trajs.ndim != 3 or trajs.shape[-1] < 2:
-        return f"trajectory_shape={tuple(trajectory.shape)}"
+        return None
     trajs[:, :, :2] /= float(action_scale)
     trajs[:, :, 0] *= float(trajectory_x_sign)
     cumsum_xy = np.cumsum(trajs[:, :, :2], axis=1)
@@ -557,7 +1156,481 @@ def _trajectory_debug_summary(
     goal_xy = mean_xy[-1]
     direct = float(np.linalg.norm(goal_xy))
     path_len = float(np.linalg.norm(np.diff(mean_xy, axis=0), axis=1).sum())
-    return f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), direct={direct:.2f}, path_len={path_len:.2f}"
+    return {
+        "goal_x_m": float(goal_xy[0]),
+        "goal_y_m": float(goal_xy[1]),
+        "direct_m": direct,
+        "path_len_m": path_len,
+    }
+
+
+def _trajectory_debug_summary(
+    trajectory: torch.Tensor,
+    num_sample_trajs: int,
+    action_scale: float,
+    trajectory_x_sign: float = 1.0,
+) -> str:
+    if trajectory is None or trajectory.numel() == 0:
+        return "trajectory=empty"
+    metrics = _trajectory_debug_metrics(
+        trajectory,
+        num_sample_trajs,
+        action_scale,
+        trajectory_x_sign,
+    )
+    if metrics is None:
+        return f"trajectory_shape={tuple(trajectory.shape)}"
+    return (
+        f"traj_goal=({metrics['goal_x_m']:.2f},{metrics['goal_y_m']:.2f}), "
+        f"direct={metrics['direct_m']:.2f}, path_len={metrics['path_len_m']:.2f}"
+    )
+
+
+class _StructuredViewPrefixLogitsProcessor(LogitsProcessor):
+    """Constrain only the three-token ``view: <class>`` protocol prefix."""
+
+    _LABELS = ("stop", "front", "left", "right", "back", "turn")
+
+    def __init__(
+        self,
+        *,
+        tokenizer,
+        prompt_len: int,
+        excluded_labels: Sequence[str] = (),
+    ) -> None:
+        excluded = {str(label) for label in excluded_labels}
+        unknown = excluded.difference(self._LABELS)
+        if unknown:
+            raise ValueError(f"Unknown structured view labels to exclude: {sorted(unknown)}")
+        labels = tuple(label for label in self._LABELS if label not in excluded)
+        if not labels:
+            raise ValueError("At least one structured view label must remain enabled")
+        patterns = [
+            tokenizer.encode(f"view: {label}", add_special_tokens=False)
+            for label in labels
+        ]
+        if any(len(pattern) != 3 for pattern in patterns):
+            raise RuntimeError(
+                "Structured System2 output requires three-token view decisions"
+            )
+        prefixes = {tuple(pattern[:2]) for pattern in patterns}
+        class_tokens = {int(pattern[2]) for pattern in patterns}
+        if len(prefixes) != 1 or len(class_tokens) != len(labels):
+            raise RuntimeError(
+                "Structured System2 view classes do not share a unique prefix"
+            )
+        self.prompt_len = int(prompt_len)
+        self.prefix = tuple(next(iter(prefixes)))
+        self.class_tokens = tuple(sorted(class_tokens))
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        generated_tokens = int(input_ids.shape[-1]) - self.prompt_len
+        if generated_tokens == 0:
+            allowed = (self.prefix[0],)
+        elif generated_tokens == 1:
+            allowed = (self.prefix[1],)
+        elif generated_tokens == 2:
+            allowed = self.class_tokens
+        else:
+            return scores
+
+        allowed_ids = torch.tensor(allowed, device=scores.device, dtype=torch.long)
+        constrained = torch.full_like(scores, -torch.inf)
+        constrained.index_copy_(
+            1,
+            allowed_ids,
+            scores.index_select(1, allowed_ids),
+        )
+        return constrained
+
+
+def _system2_non_stop_generation_kwargs(
+    generation_kwargs: dict[str, Any],
+    *,
+    tokenizer: Any,
+    prompt_len: int,
+) -> dict[str, Any]:
+    """Build a structured generation request that cannot select the STOP class."""
+    constrained_kwargs = dict(generation_kwargs)
+    constrained_kwargs["logits_processor"] = LogitsProcessorList(
+        [
+            _StructuredViewPrefixLogitsProcessor(
+                tokenizer=tokenizer,
+                prompt_len=prompt_len,
+                excluded_labels=("stop",),
+            )
+        ]
+    )
+    constrained_kwargs["bad_words_ids"] = _system2_stop_bad_words_ids(tokenizer)
+    return constrained_kwargs
+
+
+def _system2_non_stop_output_or_fallback(
+    output: str,
+    *,
+    system2_call_index: int,
+) -> tuple[str, bool]:
+    """Return a valid non-STOP decision, falling back without privileged state."""
+    parsed = parse_structured_pano_output(output, image_size=None)
+    if parsed.kind in {"pixel", "turn"} and not vlm_output_requests_stop(output):
+        return output, False
+    direction = "left" if int(system2_call_index) % 2 == 0 else "right"
+    return f"view: turn_{direction}", True
+
+
+def _system2_decision_scores(
+    *,
+    tokenizer,
+    sequence: torch.Tensor,
+    prompt_len: int,
+    generation_scores: Sequence[torch.Tensor],
+) -> dict[str, Any]:
+    """Score the structured System2 view decision at its first class token.
+
+    Probabilities are normalized over the six valid structured classes, not
+    over the full vocabulary. They are diagnostics, not privileged signals.
+    """
+    labels = ("stop", "front", "left", "right", "back", "turn")
+    token_ids: dict[str, int] = {}
+    prefix: list[int] | None = None
+    for label in labels:
+        encoded = tokenizer.encode(f"view: {label}", add_special_tokens=False)
+        if len(encoded) != 3:
+            return {}
+        if prefix is None:
+            prefix = encoded[:2]
+        elif encoded[:2] != prefix:
+            return {}
+        token_ids[label] = int(encoded[2])
+
+    generated = sequence[0, prompt_len:].detach().cpu().tolist()
+    decision_index = 2
+    if (
+        prefix is None
+        or generated[:2] != prefix
+        or len(generated) <= decision_index
+        or int(generated[decision_index]) not in token_ids.values()
+        or decision_index >= len(generation_scores)
+    ):
+        return {}
+
+    logits = generation_scores[decision_index][0].float()
+    class_logits = torch.stack([logits[token_ids[label]] for label in labels])
+    probabilities = torch.softmax(class_logits, dim=0).detach().cpu().tolist()
+    selected_token = int(generated[decision_index])
+    selected_label = next(
+        (label for label, token_id in token_ids.items() if token_id == selected_token),
+        "unknown",
+    )
+    stop_logit = class_logits[0]
+    non_stop_logsumexp = torch.logsumexp(class_logits[1:], dim=0)
+    return {
+        "selected": selected_label,
+        "class_probabilities": {
+            label: float(probability)
+            for label, probability in zip(labels, probabilities)
+        },
+        "stop_log_odds": float((stop_logit - non_stop_logsumexp).item()),
+    }
+
+
+def _system2_generation_decision_hidden(
+    *,
+    generation,
+    tokenizer,
+    prompt_len: int,
+) -> torch.Tensor:
+    """Return the causal hidden state that predicts the view-class token."""
+    labels = ("stop", "front", "left", "right", "back", "turn")
+    patterns = [
+        tokenizer.encode(f"view: {label}", add_special_tokens=False)
+        for label in labels
+    ]
+    if any(len(pattern) != 3 for pattern in patterns):
+        raise RuntimeError("STOP head requires three-token structured view decisions")
+    prefixes = {tuple(pattern[:2]) for pattern in patterns}
+    class_tokens = {int(pattern[2]) for pattern in patterns}
+    if len(prefixes) != 1 or len(class_tokens) != len(labels):
+        raise RuntimeError("Structured view classes do not share a unique two-token prefix")
+    generated = generation.sequences[0, prompt_len:].detach().cpu().tolist()
+    prefix = next(iter(prefixes))
+    if generated[:2] != list(prefix) or len(generated) < 3 or int(generated[2]) not in class_tokens:
+        raise RuntimeError(
+            "System2 generation did not emit the expected structured view prefix: "
+            f"generated_ids={generated[:5]}"
+        )
+    hidden_steps = getattr(generation, "hidden_states", None)
+    if hidden_steps is None or len(hidden_steps) <= 2:
+        raise RuntimeError("System2 generation did not return decision-step hidden states")
+    decision_step = hidden_steps[2]
+    if isinstance(decision_step, (tuple, list)):
+        if not decision_step:
+            raise RuntimeError("System2 decision hidden-state tuple is empty")
+        decision_step = decision_step[-1]
+    if not torch.is_tensor(decision_step) or decision_step.ndim != 3:
+        raise RuntimeError(
+            "Unexpected System2 decision hidden-state shape: "
+            f"{getattr(decision_step, 'shape', None)}"
+        )
+    return decision_step[:, -1, :].detach()
+
+
+def _system2_stop_hidden_alignment(
+    generated_hidden: torch.Tensor,
+    teacher_forced_hidden: torch.Tensor,
+) -> dict[str, float]:
+    """Measure whether training and cached generation expose the same state."""
+    if generated_hidden.shape != teacher_forced_hidden.shape:
+        raise RuntimeError(
+            "System2 STOP hidden-state shape mismatch: "
+            f"generated={tuple(generated_hidden.shape)} "
+            f"teacher_forced={tuple(teacher_forced_hidden.shape)}"
+        )
+    generated = generated_hidden.detach().float()
+    teacher_forced = teacher_forced_hidden.detach().float()
+    delta = generated - teacher_forced
+    cosine = torch.nn.functional.cosine_similarity(
+        generated,
+        teacher_forced,
+        dim=-1,
+    )
+    return {
+        "cosine_min": float(cosine.min().item()),
+        "cosine_mean": float(cosine.mean().item()),
+        "max_abs_error": float(delta.abs().max().item()),
+        "mean_abs_error": float(delta.abs().mean().item()),
+        "generated_norm_mean": float(generated.norm(dim=-1).mean().item()),
+        "teacher_forced_norm_mean": float(
+            teacher_forced.norm(dim=-1).mean().item()
+        ),
+    }
+
+
+def _system2_teacher_forced_decision_hidden(
+    *,
+    qwen_integration: Any,
+    inputs: dict[str, torch.Tensor],
+    output_ids: torch.Tensor,
+    prompt_len: int,
+) -> torch.Tensor:
+    """Recompute the decision state through the rollout-training forward path."""
+    structured_prefix = output_ids[:, prompt_len : prompt_len + 2]
+    teacher_inputs = dict(inputs)
+    teacher_inputs["input_ids"] = torch.cat(
+        [inputs["input_ids"], structured_prefix],
+        dim=1,
+    )
+    for mask_name in ("attention_mask", "mm_token_type_ids"):
+        mask = inputs.get(mask_name)
+        if mask is None:
+            continue
+        fill_value = 1 if mask_name == "attention_mask" else 0
+        suffix = torch.full(
+            (mask.shape[0], structured_prefix.shape[1]),
+            fill_value,
+            device=mask.device,
+            dtype=mask.dtype,
+        )
+        teacher_inputs[mask_name] = torch.cat([mask, suffix], dim=1)
+    teacher_inputs.pop("position_ids", None)
+    with torch.inference_mode():
+        (
+            teacher_sequence_hidden,
+            _teacher_vision_hidden,
+            _teacher_num_image_tokens,
+            _teacher_traj_hidden,
+            _teacher_lm_output,
+        ) = qwen_integration._forward_model_inputs(
+            teacher_inputs,
+            return_hidden_states=True,
+            skip_lm_head=True,
+            return_last_hidden_state_only=True,
+            extract_vision_hidden_states=False,
+        )
+    if teacher_sequence_hidden is None:
+        raise RuntimeError(
+            "System2 STOP alignment check returned no teacher-forced hidden state"
+        )
+    return teacher_sequence_hidden[:, -1, :]
+
+
+def _system2_stop_head_decision(
+    *,
+    stop_probability: float,
+    add_stop_threshold: float,
+    veto_stop_threshold: float,
+    original_output: str,
+    original_stop_probability: float | None = None,
+    add_min_qwen_stop_probability: float = 0.0,
+    constrained_output: str | None = None,
+    image_size: tuple[int, int] = (256, 256),
+    allow_add_stop: bool = True,
+) -> str:
+    """Describe the STOP-head decision without changing the waypoint prior."""
+    original_requests_stop = vlm_output_requests_stop(original_output)
+    if not original_requests_stop:
+        if not allow_add_stop:
+            return "head_keeps_original_non_stop"
+        if stop_probability >= add_stop_threshold:
+            if (
+                add_min_qwen_stop_probability > 0.0
+                and (
+                    original_stop_probability is None
+                    or original_stop_probability < add_min_qwen_stop_probability
+                )
+            ):
+                return "head_rejects_uncorroborated_stop"
+            return "head_adds_stop"
+        return "head_keeps_original_non_stop"
+    if stop_probability >= veto_stop_threshold:
+        return "head_confirms_original_stop"
+    if constrained_output is None:
+        return "head_requests_stop_veto"
+    constrained_turn = vlm_output_requests_turn(constrained_output)
+    constrained_pixel = _parse_pixel_goal(
+        constrained_output,
+        image_size,
+        allow_legacy_coord=True,
+    )
+    if constrained_turn is not None or constrained_pixel is not None:
+        return "head_vetoes_stop"
+    return "head_veto_fallback_replan"
+
+
+def _system2_temporal_stop_decision(
+    *,
+    verifier_probability: float,
+    acceptance_threshold: float,
+    original_output: str,
+) -> str:
+    """Return a veto-only decision; original non-STOP output is immutable."""
+    if not (
+        np.isfinite(verifier_probability)
+        and np.isfinite(acceptance_threshold)
+        and 0.0 <= verifier_probability <= 1.0
+        and 0.0 <= acceptance_threshold <= 1.0
+    ):
+        raise ValueError("Temporal STOP probabilities and thresholds must be in [0, 1]")
+    if not vlm_output_requests_stop(original_output):
+        return "temporal_keeps_original_non_stop"
+    if verifier_probability >= acceptance_threshold:
+        return "temporal_confirms_original_stop"
+    return "temporal_requests_stop_veto"
+
+
+def _validate_system2_stop_threshold_overrides(
+    *,
+    static_head_enabled: bool,
+    temporal_verifier_enabled: bool,
+    add_threshold_override: float | None,
+    veto_threshold_override: float | None,
+) -> None:
+    """Validate ownership of STOP thresholds before loading the model."""
+    if not temporal_verifier_enabled:
+        return
+    if veto_threshold_override is not None:
+        raise ValueError(
+            "system2_stop_veto_threshold cannot be overridden when the temporal "
+            "STOP verifier is enabled; the temporal verifier owns veto decisions"
+        )
+    if add_threshold_override is not None and not static_head_enabled:
+        raise ValueError(
+            "system2_stop_add_threshold requires a static STOP head when the "
+            "temporal STOP verifier is enabled"
+        )
+
+
+def _system2_hybrid_stop_decision(
+    *,
+    original_output: str,
+    temporal_decision: str,
+    static_add_decision: str,
+) -> str:
+    """Keep hybrid policy roles disjoint: temporal vetoes, static only adds."""
+    if vlm_output_requests_stop(original_output):
+        allowed = {
+            "temporal_confirms_original_stop",
+            "temporal_requests_stop_veto",
+            "temporal_vetoes_original_stop",
+        }
+        if temporal_decision not in allowed:
+            raise ValueError(
+                f"Invalid temporal decision for original STOP: {temporal_decision!r}"
+            )
+        return temporal_decision
+    if temporal_decision != "temporal_keeps_original_non_stop":
+        raise ValueError(
+            f"Temporal policy modified an original non-STOP: {temporal_decision!r}"
+        )
+    if static_add_decision == "head_adds_stop":
+        return "hybrid_static_adds_stop"
+    if static_add_decision in {
+        "head_keeps_original_non_stop",
+        "head_rejects_uncorroborated_stop",
+    }:
+        return "hybrid_keeps_original_non_stop"
+    raise ValueError(
+        f"Invalid static add decision for original non-STOP: {static_add_decision!r}"
+    )
+
+
+def _system2_stop_bad_words_ids(tokenizer: Any) -> list[list[int]]:
+    """Return the structured STOP class token as a generation constraint."""
+    stop_pattern = tokenizer.encode("view: stop", add_special_tokens=False)
+    if len(stop_pattern) != 3:
+        raise RuntimeError(
+            "Cannot constrain System2 STOP token: unexpected tokenization "
+            f"{stop_pattern}"
+        )
+    return [[int(stop_pattern[2])]]
+
+
+def _validate_system2_force_non_stop_request(
+    *,
+    force_non_stop: Any,
+    feature_dump_enabled: bool,
+    stop_head_enabled: bool,
+    oracle_system2_enabled: bool,
+) -> bool:
+    """Fail closed unless forced continuation is an isolated DAgger request."""
+    if not isinstance(force_non_stop, bool):
+        raise ValueError("system2_force_non_stop must be a boolean")
+    if not force_non_stop:
+        return False
+    if not feature_dump_enabled:
+        raise ValueError(
+            "system2_force_non_stop is restricted to STOP feature collection"
+        )
+    if stop_head_enabled:
+        raise ValueError(
+            "system2_force_non_stop requires the unmodified original System2 policy"
+        )
+    if oracle_system2_enabled:
+        raise ValueError("system2_force_non_stop cannot be combined with oracle System2")
+    return True
+
+
+def _system2_stop_probability(
+    stop_head: torch.nn.Module,
+    decision_hidden: torch.Tensor,
+) -> float:
+    """Read the probability returned by StopPredictionHead exactly once."""
+    output = stop_head(decision_hidden)
+    if not torch.is_tensor(output) or output.numel() != 1:
+        raise RuntimeError(
+            "System2 STOP head must return exactly one probability, got "
+            f"{getattr(output, 'shape', None)}"
+        )
+    probability = float(output.detach().float().item())
+    if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise RuntimeError(
+            f"System2 STOP head returned invalid probability: {probability}"
+        )
+    return probability
 
 
 def _pil_from_blob(blob: vla_pb2.BinaryBlob, image_size: tuple[int, int] | None = None) -> Image.Image:
@@ -572,15 +1645,375 @@ def _blobs_by_name(blobs) -> dict[str, vla_pb2.BinaryBlob]:
     return {blob.name: blob for blob in blobs}
 
 
+def _write_system2_stop_feature(
+    dump_dir: Path,
+    *,
+    decision_hidden: torch.Tensor,
+    sampling_metadata: dict[str, Any],
+    original_output: str,
+    decision_scores: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically persist one frozen-Qwen decision feature for DAgger data."""
+    if decision_hidden.shape[0] != 1 or decision_hidden.ndim != 2:
+        raise RuntimeError(
+            "System2 STOP feature dump requires hidden shape (1, D), got "
+            f"{tuple(decision_hidden.shape)}"
+        )
+    feature = decision_hidden.detach().float().cpu().contiguous().squeeze(0)
+    if not torch.isfinite(feature).all():
+        raise RuntimeError("System2 STOP feature contains non-finite values")
+
+    scene_id = str(sampling_metadata["scene_id"])
+    episode_id = int(sampling_metadata["episode_id"])
+    call_index = int(sampling_metadata["system2_call_index"])
+    protocol_seed = int(sampling_metadata["protocol_seed"])
+    safe_scene = re.sub(r"[^A-Za-z0-9_.-]+", "_", scene_id).strip("._")
+    if not safe_scene:
+        raise RuntimeError(f"Invalid scene_id for STOP feature dump: {scene_id!r}")
+    collection_root = dump_dir.expanduser().resolve().parent
+    collection_namespace = hashlib.sha256(
+        str(collection_root).encode("utf-8")
+    ).hexdigest()[:12]
+    key = (
+        f"src{collection_namespace}_{safe_scene}_ep{episode_id:06d}_"
+        f"call{call_index:05d}_seed{protocol_seed}"
+    )
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    path = dump_dir / f"{key}.pth"
+    temporary = dump_dir / f".{key}.{os.getpid()}.tmp"
+    payload = {
+        "schema": "heatmapvln-system2-stop-feature-v1",
+        "key": key,
+        "feature": feature,
+        "scene_id": scene_id,
+        "episode_id": episode_id,
+        "system2_call_index": call_index,
+        "protocol_seed": protocol_seed,
+        "collection_namespace": collection_namespace,
+        "collection_root": str(collection_root),
+        "original_output": str(original_output),
+        "decision_scores": decision_scores,
+    }
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+    return {
+        "schema": payload["schema"],
+        "key": key,
+        "path": str(path),
+        "hidden_dim": int(feature.numel()),
+        "collection_namespace": collection_namespace,
+    }
+
+
+def _augment_system2_stop_feature_with_trajectory(
+    feature_record: dict[str, Any],
+    *,
+    raw_traj_latent: torch.Tensor,
+    adapted_traj_latent: torch.Tensor,
+    projected_traj_condition: torch.Tensor,
+    trajectory: torch.Tensor,
+    trajectory_metrics: dict[str, float],
+    local_actions: list[int],
+    pixel_goal: tuple[int, int],
+    pano_goal_view: str,
+) -> dict[str, Any]:
+    """Atomically add frozen System2/System1 trajectory features to one cache row."""
+    path = Path(str(feature_record.get("path", ""))).expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"System2 STOP feature payload is missing: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != "heatmapvln-system2-stop-feature-v1"
+        or payload.get("key") != feature_record.get("key")
+    ):
+        raise RuntimeError(f"System2 STOP feature payload metadata mismatch: {path}")
+
+    latent_tensors = {
+        "raw_traj_latent": raw_traj_latent,
+        "adapted_traj_latent": adapted_traj_latent,
+        "projected_traj_condition": projected_traj_condition,
+    }
+    saved_tensors: dict[str, torch.Tensor] = {}
+    for name, value in latent_tensors.items():
+        if not torch.is_tensor(value) or value.shape[0] != 1:
+            raise RuntimeError(
+                f"System2 STOP {name} must have a singleton batch dimension, got "
+                f"{getattr(value, 'shape', None)}"
+            )
+        value = value.detach().cpu().contiguous().squeeze(0)
+        if not bool(torch.isfinite(value.float()).all()):
+            raise RuntimeError(f"System2 STOP {name} contains non-finite values")
+        saved_tensors[name] = value
+    if not torch.is_tensor(trajectory) or trajectory.ndim != 3 or trajectory.numel() == 0:
+        raise RuntimeError(
+            "System2 STOP trajectory must have shape (samples, steps, dims), got "
+            f"{getattr(trajectory, 'shape', None)}"
+        )
+    saved_trajectory = trajectory.detach().cpu().contiguous()
+    if not bool(torch.isfinite(saved_trajectory.float()).all()):
+        raise RuntimeError("System2 STOP trajectory contains non-finite values")
+
+    if not trajectory_metrics or not all(
+        np.isfinite(float(value)) for value in trajectory_metrics.values()
+    ):
+        raise RuntimeError("System2 STOP trajectory metrics must be finite")
+    payload.update(
+        {
+            "trajectory_feature_schema": (
+                "heatmapvln-system2-stop-trajectory-feature-v1"
+            ),
+            **saved_tensors,
+            "trajectory": saved_trajectory,
+            "trajectory_metrics": {
+                str(name): float(value) for name, value in trajectory_metrics.items()
+            },
+            "local_actions": [int(action) for action in local_actions],
+            "pixel_goal": [int(pixel_goal[0]), int(pixel_goal[1])],
+            "pano_goal_view": str(pano_goal_view),
+        }
+    )
+    temporary = path.with_name(f".{path.stem}.{os.getpid()}.trajectory.tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+    result = dict(feature_record)
+    result.update(
+        {
+            "trajectory_feature_schema": payload["trajectory_feature_schema"],
+            "raw_traj_latent_shape": list(saved_tensors["raw_traj_latent"].shape),
+            "adapted_traj_latent_shape": list(
+                saved_tensors["adapted_traj_latent"].shape
+            ),
+            "projected_traj_condition_shape": list(
+                saved_tensors["projected_traj_condition"].shape
+            ),
+        }
+    )
+    return result
+
+
 class HeatmapVLNRuntime:
     def __init__(self, args: argparse.Namespace):
+        self.args = args
+        if not hasattr(args, "system2_stop_decision_adapter_checkpoint"):
+            args.system2_stop_decision_adapter_checkpoint = None
+        _validate_system2_stop_threshold_overrides(
+            static_head_enabled=bool(
+                args.system2_stop_head_checkpoint
+                or args.system2_stop_decision_adapter_checkpoint
+            ),
+            temporal_verifier_enabled=bool(
+                args.system2_temporal_stop_verifier_checkpoint
+            ),
+            add_threshold_override=args.system2_stop_add_threshold,
+            veto_threshold_override=args.system2_stop_veto_threshold,
+        )
         install_numpy_legacy_aliases()
         if os.environ.get("HEATMAPVLN_FORCE_FLASH_ATTN_STUB", "0") == "1":
             install_flash_attn_stub(LOGGER)
-        self.args = args
         self.device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
         self.cfg = self._load_runtime_config(args)
         self.model, self.train_cfg = self._load_model(args, self.device)
+        self.require_deterministic_sampling = bool(
+            getattr(args, "require_deterministic_sampling", False)
+        )
+        self.system2_stop_head = None
+        self.system2_stop_add_head = None
+        self.system2_stop_decision_adapter_name = None
+        self.system2_stop_decision_adapter_metadata: dict[str, Any] = {}
+        self.system2_stop_decision_policy_kind = STOP_DECISION_ADD_AND_VETO_POLICY
+        self.system2_stop_decision_add_enabled = True
+        self.system2_temporal_static_head = None
+        self.system2_temporal_stop_verifier = None
+        self.system2_temporal_stop_acceptance_threshold = 0.5
+        self.system2_temporal_stop_policy_kind = None
+        self.system2_temporal_stop_history = None
+        self.system2_stop_add_threshold = 0.9
+        self.system2_stop_veto_threshold = 0.5
+        self.system2_stop_add_min_qwen_stop_probability = float(
+            args.system2_stop_add_min_qwen_stop_probability
+        )
+        if not (
+            np.isfinite(self.system2_stop_add_min_qwen_stop_probability)
+            and 0.0 <= self.system2_stop_add_min_qwen_stop_probability <= 1.0
+        ):
+            raise ValueError(
+                "system2_stop_add_min_qwen_stop_probability must be in [0, 1]"
+            )
+        self._system2_stop_alignment_checked = False
+        self.system2_stop_feature_dump_dir = (
+            Path(args.system2_stop_feature_dump_dir).expanduser().resolve()
+            if args.system2_stop_feature_dump_dir
+            else None
+        )
+        if self.system2_stop_feature_dump_dir is not None:
+            self.system2_stop_feature_dump_dir.mkdir(parents=True, exist_ok=True)
+            LOGGER.warning(
+                "System2 STOP DAgger feature collection is ACTIVE: %s",
+                self.system2_stop_feature_dump_dir,
+            )
+        if args.system2_stop_decision_adapter_checkpoint and (
+            args.system2_stop_head_checkpoint
+            or args.system2_temporal_stop_verifier_checkpoint
+        ):
+            raise ValueError(
+                "The STOP-decision LoRA is mutually exclusive with static/temporal "
+                "STOP policies"
+            )
+        if args.system2_stop_decision_adapter_checkpoint and int(args.workers) != 1:
+            raise ValueError(
+                "STOP-decision LoRA switches a process-global PEFT adapter stack and "
+                "therefore requires --workers 1"
+            )
+        if (
+            args.system2_stop_decision_adapter_checkpoint
+            and self.system2_stop_feature_dump_dir is not None
+        ):
+            raise ValueError(
+                "STOP-decision LoRA inference cannot run during privileged feature collection"
+            )
+        if (
+            args.system2_stop_decision_adapter_checkpoint
+            and self.system2_stop_add_min_qwen_stop_probability > 0.0
+        ):
+            raise ValueError(
+                "STOP-decision LoRA does not use the original Qwen STOP probability gate"
+            )
+        hybrid_stop_policy = bool(
+            args.system2_stop_head_checkpoint
+            and args.system2_temporal_stop_verifier_checkpoint
+        )
+        if hybrid_stop_policy and self.system2_stop_add_min_qwen_stop_probability > 0.0:
+            raise ValueError(
+                "Hybrid STOP inference requires add_min_qwen_stop_probability=0; "
+                "the Qwen STOP score is not a valid near-goal add gate"
+            )
+        if (
+            args.system2_temporal_stop_verifier_checkpoint
+            and self.system2_stop_feature_dump_dir is not None
+        ):
+            raise ValueError(
+                "Temporal STOP inference cannot be combined with privileged STOP feature collection"
+            )
+        if args.system2_temporal_stop_verifier_checkpoint:
+            if not self.require_deterministic_sampling:
+                raise ValueError(
+                    "Temporal STOP inference requires --require_deterministic_sampling"
+                )
+            from src.models.action.temporal_stop_verifier import TemporalStopEpisodeHistory
+
+            (
+                self.system2_temporal_static_head,
+                self.system2_temporal_stop_verifier,
+                self.system2_temporal_stop_acceptance_threshold,
+            ) = _load_system2_temporal_stop_verifier(
+                args.system2_temporal_stop_verifier_checkpoint,
+                device=self.device,
+            )
+            from src.models.action.temporal_stop_verifier import (
+                TemporalStopVerifierEnsemble,
+            )
+
+            if isinstance(
+                self.system2_temporal_stop_verifier,
+                TemporalStopVerifierEnsemble,
+            ):
+                self.system2_temporal_stop_policy_kind = "scene_fold_unanimous_ensemble"
+                threshold_description = (
+                    self.system2_temporal_stop_verifier.acceptance_thresholds
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+            else:
+                self.system2_temporal_stop_policy_kind = "single"
+                threshold_description = [
+                    float(self.system2_temporal_stop_acceptance_threshold)
+                ]
+            self.system2_temporal_stop_history = TemporalStopEpisodeHistory()
+            LOGGER.info(
+                "Verified veto-only System2 temporal STOP verifier: "
+                "kind=%s static_tensors=%d verifier_tensors=%d "
+                "acceptance_thresholds=%s; "
+                "original non-STOP outputs can never be changed checkpoint=%s",
+                self.system2_temporal_stop_policy_kind,
+                len(self.system2_temporal_static_head.state_dict()),
+                len(self.system2_temporal_stop_verifier.state_dict()),
+                threshold_description,
+                args.system2_temporal_stop_verifier_checkpoint,
+            )
+        if args.system2_stop_head_checkpoint:
+            (
+                loaded_stop_head,
+                self.system2_stop_add_threshold,
+                self.system2_stop_veto_threshold,
+            ) = _load_system2_stop_head(
+                args.system2_stop_head_checkpoint,
+                device=self.device,
+                dtype=self.model.config.dtype,
+                add_threshold_override=args.system2_stop_add_threshold,
+                veto_threshold_override=args.system2_stop_veto_threshold,
+            )
+            if hybrid_stop_policy:
+                self.system2_stop_add_head = loaded_stop_head
+            else:
+                self.system2_stop_head = loaded_stop_head
+            LOGGER.info(
+                "Verified isolated System2 STOP head: tensors=%d "
+                "add_threshold=%.4f veto_threshold=%.4f "
+                "add_min_qwen_stop_probability=%.6g policy_role=%s; "
+                "original Stage1-S2 LoRA remains the only Qwen adapter checkpoint=%s",
+                len(loaded_stop_head.state_dict()),
+                self.system2_stop_add_threshold,
+                self.system2_stop_veto_threshold,
+                self.system2_stop_add_min_qwen_stop_probability,
+                "add_only_with_temporal_veto" if hybrid_stop_policy else "add_and_veto",
+                args.system2_stop_head_checkpoint,
+            )
+        elif args.system2_stop_decision_adapter_checkpoint:
+            self.system2_stop_decision_adapter_metadata = (
+                _load_system2_stop_decision_adapter(
+                    args.system2_stop_decision_adapter_checkpoint,
+                    integration=self.model.qwen2_5_vl,
+                    expected_base_checkpoint=args.base_checkpoint,
+                    add_threshold_override=args.system2_stop_add_threshold,
+                    veto_threshold_override=args.system2_stop_veto_threshold,
+                )
+            )
+            self.system2_stop_decision_adapter_name = str(
+                self.system2_stop_decision_adapter_metadata["adapter_name"]
+            )
+            self.system2_stop_decision_policy_kind = str(
+                self.system2_stop_decision_adapter_metadata["policy_kind"]
+            )
+            self.system2_stop_decision_add_enabled = bool(
+                self.system2_stop_decision_adapter_metadata["add_enabled"]
+            )
+            self.system2_stop_add_threshold = float(
+                self.system2_stop_decision_adapter_metadata["add_stop_threshold"]
+            )
+            self.system2_stop_veto_threshold = float(
+                self.system2_stop_decision_adapter_metadata["veto_stop_threshold"]
+            )
+            LOGGER.info(
+                "Verified isolated System2 STOP-decision LoRA: tensors=%d "
+                "parameters=%d policy_kind=%s add_enabled=%s "
+                "add_threshold=%.4f veto_threshold=%.4f; "
+                "navigation generation and System1 latent extraction remain "
+                "default-LoRA-only checkpoint=%s",
+                self.system2_stop_decision_adapter_metadata["adapter_tensors"],
+                self.system2_stop_decision_adapter_metadata["adapter_parameters"],
+                self.system2_stop_decision_policy_kind,
+                self.system2_stop_decision_add_enabled,
+                self.system2_stop_add_threshold,
+                self.system2_stop_veto_threshold,
+                args.system2_stop_decision_adapter_checkpoint,
+            )
+        elif self.system2_stop_add_min_qwen_stop_probability > 0.0:
+            raise ValueError(
+                "system2_stop_add_min_qwen_stop_probability requires a STOP head"
+            )
         self.processor = self.model.qwen2_5_vl.processor
         self.processor.tokenizer.padding_side = "left"
         self.action_scale = self.train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
@@ -588,7 +2021,6 @@ class HeatmapVLNRuntime:
             self.train_cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("num_sample_trajs", 32)
         )
         self.has_nextdit = self.model.nextdit_action_head is not None and self.model.latent_queries is not None
-        self.require_deterministic_sampling = bool(getattr(args, "require_deterministic_sampling", False))
         self.pano_latent_adapter = self._load_adapter(args)
         if self.pano_latent_adapter is None and getattr(self.model, "pano_latent_adapter", None) is not None:
             self.pano_latent_adapter = self.model.pano_latent_adapter
@@ -799,6 +2231,17 @@ class HeatmapVLNRuntime:
         oracle_system2_text = ""
         if oracle_system2 is not None:
             oracle_system2_text = str(oracle_system2.get("text") or "").strip()
+        force_non_stop = _validate_system2_force_non_stop_request(
+            force_non_stop=payload.get("system2_force_non_stop", False),
+            feature_dump_enabled=self.system2_stop_feature_dump_dir is not None,
+            stop_head_enabled=(
+                self.system2_stop_head is not None
+                or self.system2_stop_add_head is not None
+                or self.system2_temporal_stop_verifier is not None
+                or self.system2_stop_decision_adapter_name is not None
+            ),
+            oracle_system2_enabled=bool(oracle_system2_text),
+        )
 
         messages = construct_input(
             current_views=current_views,
@@ -834,19 +2277,526 @@ class HeatmapVLNRuntime:
             )
             output_ids = torch.cat([inputs["input_ids"], oracle_suffix], dim=1)
             llm_output = oracle_system2_text
+            decision_scores: dict[str, Any] = {}
+            stop_head_result: dict[str, Any] = {}
+            stop_feature_result: dict[str, Any] = {}
         else:
-            with torch.no_grad():
-                output_ids = self.model.qwen2_5_vl.model.generate(
-                    **inputs,
-                    max_new_tokens=128,
-                    do_sample=False,
-                    use_cache=True,
-                    return_dict_in_generate=True,
-                ).sequences
-            llm_output = self.processor.tokenizer.decode(
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": 128,
+                "do_sample": False,
+                "use_cache": True,
+                "return_dict_in_generate": True,
+            }
+            if structured_pano_output:
+                generation_kwargs["logits_processor"] = LogitsProcessorList(
+                    [
+                        _StructuredViewPrefixLogitsProcessor(
+                            tokenizer=self.processor.tokenizer,
+                            prompt_len=prompt_len,
+                        )
+                    ]
+                )
+            if force_non_stop:
+                generation_kwargs["bad_words_ids"] = _system2_stop_bad_words_ids(
+                    self.processor.tokenizer
+                )
+            if self.system2_stop_decision_adapter_name is not None:
+                _assert_navigation_only_lora(
+                    self.model.qwen2_5_vl,
+                    context="Original System2 waypoint generation",
+                )
+            need_stop_decision_hidden = (
+                not force_non_stop
+                and (
+                    self.system2_stop_head is not None
+                    or self.system2_stop_add_head is not None
+                    or self.system2_temporal_stop_verifier is not None
+                    or self.system2_stop_feature_dump_dir is not None
+                )
+            )
+            with torch.inference_mode():
+                generation = self.model.qwen2_5_vl.model.generate(
+                    **generation_kwargs,
+                    output_scores=True,
+                    output_hidden_states=need_stop_decision_hidden,
+                )
+            output_ids = generation.sequences
+            original_output = self.processor.tokenizer.decode(
                 output_ids[0][prompt_len:],
                 skip_special_tokens=True,
             )
+            if force_non_stop and vlm_output_requests_stop(original_output):
+                raise RuntimeError(
+                    "Forced DAgger continuation still generated a STOP response"
+                )
+            llm_output = original_output
+            decision_scores = _system2_decision_scores(
+                tokenizer=self.processor.tokenizer,
+                sequence=output_ids,
+                prompt_len=prompt_len,
+                generation_scores=generation.scores,
+            )
+            stop_head_result = {}
+            stop_feature_result = {}
+            decision_hidden = None
+
+            if need_stop_decision_hidden:
+                decision_hidden = _system2_generation_decision_hidden(
+                    generation=generation,
+                    tokenizer=self.processor.tokenizer,
+                    prompt_len=prompt_len,
+                )
+            if self.system2_stop_feature_dump_dir is not None and not force_non_stop:
+                if sampling_metadata is None:
+                    raise RuntimeError(
+                        "System2 STOP feature collection requires deterministic sampling metadata"
+                    )
+                stop_feature_result = _write_system2_stop_feature(
+                    self.system2_stop_feature_dump_dir,
+                    decision_hidden=decision_hidden,
+                    sampling_metadata=sampling_metadata,
+                    original_output=original_output,
+                    decision_scores=decision_scores,
+                )
+
+            alignment_metrics = None
+            stop_policy_enabled = (
+                self.system2_stop_head is not None
+                or self.system2_stop_add_head is not None
+                or self.system2_temporal_stop_verifier is not None
+            )
+            if stop_policy_enabled:
+                if decision_hidden is None:
+                    raise RuntimeError("System2 STOP policy did not receive decision hidden state")
+                if not self._system2_stop_alignment_checked:
+                    teacher_decision_hidden = _system2_teacher_forced_decision_hidden(
+                        qwen_integration=self.model.qwen2_5_vl,
+                        inputs=inputs,
+                        output_ids=output_ids,
+                        prompt_len=prompt_len,
+                    )
+                    alignment_metrics = _system2_stop_hidden_alignment(
+                        decision_hidden,
+                        teacher_decision_hidden,
+                    )
+                    LOGGER.info(
+                        "System2 STOP hidden alignment: %s",
+                        json.dumps(alignment_metrics, sort_keys=True),
+                    )
+                    if alignment_metrics["cosine_min"] < 0.999:
+                        raise RuntimeError(
+                            "System2 STOP training/generation hidden states are not aligned: "
+                            f"{alignment_metrics}"
+                        )
+                    self._system2_stop_alignment_checked = True
+
+            if self.system2_stop_decision_adapter_name is not None:
+                adapter_probe = _system2_stop_decision_adapter_probe(
+                    qwen_integration=self.model.qwen2_5_vl,
+                    inputs=inputs,
+                    adapter_name=self.system2_stop_decision_adapter_name,
+                )
+                stop_probability = float(adapter_probe["stop_probability"])
+                constrained_output = None
+                constrained_generation_output = None
+                constrained_generation_fallback = False
+                decision = _system2_stop_head_decision(
+                    stop_probability=stop_probability,
+                    add_stop_threshold=self.system2_stop_add_threshold,
+                    veto_stop_threshold=self.system2_stop_veto_threshold,
+                    original_output=original_output,
+                    image_size=vlm_image_size,
+                    allow_add_stop=self.system2_stop_decision_add_enabled,
+                )
+                if decision == "head_adds_stop":
+                    llm_output = "view: stop"
+                elif decision == "head_requests_stop_veto":
+                    _assert_navigation_only_lora(
+                        self.model.qwen2_5_vl,
+                        context="STOP-veto constrained waypoint generation",
+                    )
+                    constrained_kwargs = _system2_non_stop_generation_kwargs(
+                        generation_kwargs,
+                        tokenizer=self.processor.tokenizer,
+                        prompt_len=prompt_len,
+                    )
+                    with torch.inference_mode():
+                        constrained_generation = self.model.qwen2_5_vl.model.generate(
+                            **constrained_kwargs,
+                            output_scores=False,
+                        )
+                    constrained_ids = constrained_generation.sequences
+                    constrained_generation_output = self.processor.tokenizer.decode(
+                        constrained_ids[0][prompt_len:],
+                        skip_special_tokens=True,
+                    )
+                    constrained_output, constrained_generation_fallback = (
+                        _system2_non_stop_output_or_fallback(
+                            constrained_generation_output,
+                            system2_call_index=int(
+                                (sampling_metadata or {}).get(
+                                    "system2_call_index", 0
+                                )
+                            ),
+                        )
+                    )
+                    decision = _system2_stop_head_decision(
+                        stop_probability=stop_probability,
+                        add_stop_threshold=self.system2_stop_add_threshold,
+                        veto_stop_threshold=self.system2_stop_veto_threshold,
+                        original_output=original_output,
+                        constrained_output=constrained_output,
+                        image_size=vlm_image_size,
+                        allow_add_stop=self.system2_stop_decision_add_enabled,
+                    )
+                    if decision in {
+                        "head_vetoes_stop",
+                        "head_veto_fallback_replan",
+                    }:
+                        output_ids = constrained_ids
+                        llm_output = constrained_output
+                stop_head_result = {
+                    "mode": "stop_decision_adapter",
+                    "policy_kind": self.system2_stop_decision_policy_kind,
+                    "add_enabled": self.system2_stop_decision_add_enabled,
+                    "decision": decision,
+                    "stop_probability": stop_probability,
+                    "stop_log_odds": adapter_probe["stop_log_odds"],
+                    "selected": adapter_probe["selected"],
+                    "class_probabilities": adapter_probe["class_probabilities"],
+                    "threshold": (
+                        self.system2_stop_veto_threshold
+                        if vlm_output_requests_stop(original_output)
+                        else self.system2_stop_add_threshold
+                    ),
+                    "add_stop_threshold": self.system2_stop_add_threshold,
+                    "veto_stop_threshold": self.system2_stop_veto_threshold,
+                    "qwen_stop_probability": float(
+                        (decision_scores.get("class_probabilities") or {}).get(
+                            "stop", 0.0
+                        )
+                    ),
+                    "original_output": original_output,
+                    "constrained_output": constrained_output,
+                    "constrained_generation_output": constrained_generation_output,
+                    "constrained_generation_fallback": constrained_generation_fallback,
+                }
+
+            elif self.system2_stop_head is not None:
+                head_dtype = next(self.system2_stop_head.parameters()).dtype
+                with torch.inference_mode():
+                    stop_probability = _system2_stop_probability(
+                        self.system2_stop_head,
+                        decision_hidden.to(device=self.device, dtype=head_dtype),
+                    )
+
+                constrained_output = None
+                constrained_generation_output = None
+                constrained_generation_fallback = False
+                qwen_stop_probability = float(
+                    (decision_scores.get("class_probabilities") or {}).get(
+                        "stop", 0.0
+                    )
+                )
+                decision = _system2_stop_head_decision(
+                    stop_probability=stop_probability,
+                    add_stop_threshold=self.system2_stop_add_threshold,
+                    veto_stop_threshold=self.system2_stop_veto_threshold,
+                    original_output=original_output,
+                    original_stop_probability=qwen_stop_probability,
+                    add_min_qwen_stop_probability=(
+                        self.system2_stop_add_min_qwen_stop_probability
+                    ),
+                    image_size=vlm_image_size,
+                )
+                if decision == "head_adds_stop":
+                    llm_output = "view: stop"
+                elif decision == "head_requests_stop_veto":
+                    constrained_kwargs = _system2_non_stop_generation_kwargs(
+                        generation_kwargs,
+                        tokenizer=self.processor.tokenizer,
+                        prompt_len=prompt_len,
+                    )
+                    with torch.inference_mode():
+                        constrained_generation = self.model.qwen2_5_vl.model.generate(
+                            **constrained_kwargs,
+                            output_scores=False,
+                        )
+                    constrained_ids = constrained_generation.sequences
+                    constrained_generation_output = self.processor.tokenizer.decode(
+                        constrained_ids[0][prompt_len:],
+                        skip_special_tokens=True,
+                    )
+                    constrained_output, constrained_generation_fallback = (
+                        _system2_non_stop_output_or_fallback(
+                            constrained_generation_output,
+                            system2_call_index=int(
+                                (sampling_metadata or {}).get("system2_call_index", 0)
+                            ),
+                        )
+                    )
+                    decision = _system2_stop_head_decision(
+                        stop_probability=stop_probability,
+                        add_stop_threshold=self.system2_stop_add_threshold,
+                        veto_stop_threshold=self.system2_stop_veto_threshold,
+                        original_output=original_output,
+                        original_stop_probability=qwen_stop_probability,
+                        add_min_qwen_stop_probability=(
+                            self.system2_stop_add_min_qwen_stop_probability
+                        ),
+                        constrained_output=constrained_output,
+                        image_size=vlm_image_size,
+                    )
+                    if decision in {
+                        "head_vetoes_stop",
+                        "head_veto_fallback_replan",
+                    }:
+                        output_ids = constrained_ids
+                        llm_output = constrained_output
+
+                stop_head_result = {
+                    "decision": decision,
+                    "stop_probability": stop_probability,
+                    "threshold": (
+                        self.system2_stop_veto_threshold
+                        if vlm_output_requests_stop(original_output)
+                        else self.system2_stop_add_threshold
+                    ),
+                    "add_stop_threshold": self.system2_stop_add_threshold,
+                    "veto_stop_threshold": self.system2_stop_veto_threshold,
+                    "qwen_stop_probability": qwen_stop_probability,
+                    "add_min_qwen_stop_probability": (
+                        self.system2_stop_add_min_qwen_stop_probability
+                    ),
+                    "original_output": original_output,
+                    "constrained_output": constrained_output,
+                    "constrained_generation_output": constrained_generation_output,
+                    "constrained_generation_fallback": constrained_generation_fallback,
+                }
+                if alignment_metrics is not None:
+                    stop_head_result["hidden_alignment"] = alignment_metrics
+
+            elif self.system2_temporal_stop_verifier is not None:
+                if sampling_metadata is None:
+                    raise RuntimeError(
+                        "Temporal STOP inference requires deterministic sampling metadata"
+                    )
+                qwen_stop_log_odds = decision_scores.get("stop_log_odds")
+                if qwen_stop_log_odds is None or not np.isfinite(float(qwen_stop_log_odds)):
+                    raise RuntimeError(
+                        "Temporal STOP inference requires a finite Qwen STOP log-odds"
+                    )
+                qwen_stop_probability = float(
+                    (decision_scores.get("class_probabilities") or {}).get(
+                        "stop", 0.0
+                    )
+                )
+                static_add_stop_probability = None
+                if self.system2_stop_add_head is not None:
+                    add_dtype = next(self.system2_stop_add_head.parameters()).dtype
+                    with torch.inference_mode():
+                        static_add_stop_probability = _system2_stop_probability(
+                            self.system2_stop_add_head,
+                            decision_hidden.to(device=self.device, dtype=add_dtype),
+                        )
+                static_dtype = next(self.system2_temporal_static_head.parameters()).dtype
+                with torch.inference_mode():
+                    static_stop_probability = _system2_stop_probability(
+                        self.system2_temporal_static_head,
+                        decision_hidden.to(device=self.device, dtype=static_dtype),
+                    )
+                from src.models.action.temporal_stop_verifier import TemporalStopObservation
+
+                temporal_features = self.system2_temporal_stop_history.observe(
+                    episode_key=(
+                        str(sampling_metadata["scene_id"]),
+                        int(sampling_metadata["episode_id"]),
+                        int(sampling_metadata["protocol_seed"]),
+                    ),
+                    observation=TemporalStopObservation(
+                        call_index=int(sampling_metadata["system2_call_index"]),
+                        hidden=decision_hidden.squeeze(0).detach().float().cpu(),
+                        static_stop_probability=static_stop_probability,
+                        qwen_stop_log_odds=float(qwen_stop_log_odds),
+                    ),
+                )
+                verifier_dtype = next(
+                    self.system2_temporal_stop_verifier.parameters()
+                ).dtype
+                verifier_input = temporal_features.unsqueeze(0).to(
+                    device=self.device,
+                    dtype=verifier_dtype,
+                )
+                with torch.inference_mode():
+                    if self.system2_temporal_stop_policy_kind == "single":
+                        member_probability_tensor = (
+                            self.system2_temporal_stop_verifier(verifier_input)
+                            .reshape(1)
+                        )
+                        member_threshold_tensor = torch.tensor(
+                            [self.system2_temporal_stop_acceptance_threshold],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                    elif (
+                        self.system2_temporal_stop_policy_kind
+                        == "scene_fold_unanimous_ensemble"
+                    ):
+                        member_probability_tensor = (
+                            self.system2_temporal_stop_verifier
+                            .member_probabilities(verifier_input)
+                            .reshape(-1)
+                        )
+                        member_threshold_tensor = (
+                            self.system2_temporal_stop_verifier
+                            .acceptance_thresholds
+                            .detach()
+                            .float()
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Temporal STOP policy kind was not initialized: "
+                            f"{self.system2_temporal_stop_policy_kind!r}"
+                        )
+                member_probability_tensor = member_probability_tensor.detach().float()
+                if (
+                    member_probability_tensor.shape != member_threshold_tensor.shape
+                    or not bool(torch.isfinite(member_probability_tensor).all())
+                    or bool(
+                        (
+                            (member_probability_tensor < 0.0)
+                            | (member_probability_tensor > 1.0)
+                        ).any()
+                    )
+                ):
+                    raise RuntimeError(
+                        "Temporal STOP verifier returned invalid member probabilities: "
+                        f"shape={tuple(member_probability_tensor.shape)} "
+                        f"values={member_probability_tensor.cpu().tolist()}"
+                    )
+                member_margin_tensor = (
+                    member_probability_tensor - member_threshold_tensor
+                )
+                temporal_accepted = bool((member_margin_tensor >= 0.0).all())
+                member_probabilities = member_probability_tensor.cpu().tolist()
+                member_thresholds = member_threshold_tensor.cpu().tolist()
+                member_margins = member_margin_tensor.cpu().tolist()
+                temporal_min_margin = float(member_margin_tensor.min().item())
+                # This scalar is an acceptance score for legacy logging. The exact
+                # unanimous decision and raw calibrated member values are preserved below.
+                temporal_acceptance_score = min(
+                    max(0.5 + temporal_min_margin, 0.0),
+                    1.0,
+                )
+
+                constrained_output = None
+                constrained_generation_output = None
+                constrained_generation_fallback = False
+                if not vlm_output_requests_stop(original_output):
+                    decision = "temporal_keeps_original_non_stop"
+                elif temporal_accepted:
+                    decision = "temporal_confirms_original_stop"
+                else:
+                    decision = "temporal_requests_stop_veto"
+                if decision == "temporal_requests_stop_veto":
+                    constrained_kwargs = _system2_non_stop_generation_kwargs(
+                        generation_kwargs,
+                        tokenizer=self.processor.tokenizer,
+                        prompt_len=prompt_len,
+                    )
+                    with torch.inference_mode():
+                        constrained_generation = self.model.qwen2_5_vl.model.generate(
+                            **constrained_kwargs,
+                            output_scores=False,
+                        )
+                    constrained_ids = constrained_generation.sequences
+                    constrained_generation_output = self.processor.tokenizer.decode(
+                        constrained_ids[0][prompt_len:],
+                        skip_special_tokens=True,
+                    )
+                    constrained_output, constrained_generation_fallback = (
+                        _system2_non_stop_output_or_fallback(
+                            constrained_generation_output,
+                            system2_call_index=int(
+                                sampling_metadata["system2_call_index"]
+                            ),
+                        )
+                    )
+                    output_ids = constrained_ids
+                    llm_output = constrained_output
+                    decision = "temporal_vetoes_original_stop"
+
+                temporal_decision = decision
+                static_add_decision = None
+                if (
+                    self.system2_stop_add_head is not None
+                    and not vlm_output_requests_stop(original_output)
+                ):
+                    static_add_decision = _system2_stop_head_decision(
+                        stop_probability=float(static_add_stop_probability),
+                        add_stop_threshold=self.system2_stop_add_threshold,
+                        veto_stop_threshold=self.system2_stop_veto_threshold,
+                        original_output=original_output,
+                        original_stop_probability=qwen_stop_probability,
+                        add_min_qwen_stop_probability=0.0,
+                        image_size=vlm_image_size,
+                    )
+                    decision = _system2_hybrid_stop_decision(
+                        original_output=original_output,
+                        temporal_decision=temporal_decision,
+                        static_add_decision=static_add_decision,
+                    )
+                    if decision == "hybrid_static_adds_stop":
+                        llm_output = "view: stop"
+
+                hybrid_mode = self.system2_stop_add_head is not None
+                effective_stop_probability = (
+                    float(static_add_stop_probability)
+                    if hybrid_mode and not vlm_output_requests_stop(original_output)
+                    else temporal_acceptance_score
+                )
+                effective_threshold = (
+                    self.system2_stop_add_threshold
+                    if hybrid_mode and not vlm_output_requests_stop(original_output)
+                    else 0.5
+                )
+
+                stop_head_result = {
+                    "mode": (
+                        "hybrid_static_add_temporal_veto"
+                        if hybrid_mode
+                        else "temporal_veto_only"
+                    ),
+                    "policy_kind": self.system2_temporal_stop_policy_kind,
+                    "decision": decision,
+                    "stop_probability": effective_stop_probability,
+                    "temporal_decision": temporal_decision,
+                    "static_add_decision": static_add_decision,
+                    "static_add_stop_probability": static_add_stop_probability,
+                    "temporal_acceptance_score": temporal_acceptance_score,
+                    "temporal_stop_probability": temporal_acceptance_score,
+                    "temporal_accepted": temporal_accepted,
+                    "temporal_min_margin": temporal_min_margin,
+                    "member_probabilities": member_probabilities,
+                    "member_thresholds": member_thresholds,
+                    "member_margins": member_margins,
+                    "static_stop_probability": static_stop_probability,
+                    "threshold": effective_threshold,
+                    "add_stop_threshold": (
+                        self.system2_stop_add_threshold if hybrid_mode else 1.0
+                    ),
+                    "veto_stop_threshold": 0.5,
+                    "qwen_stop_probability": qwen_stop_probability,
+                    "qwen_stop_log_odds": float(qwen_stop_log_odds),
+                    "original_output": original_output,
+                    "constrained_output": constrained_output,
+                    "constrained_generation_output": constrained_generation_output,
+                    "constrained_generation_fallback": constrained_generation_fallback,
+                    "history_length": self.system2_temporal_stop_history.length,
+                }
+                if alignment_metrics is not None:
+                    stop_head_result["hidden_alignment"] = alignment_metrics
         response: dict[str, Any] = {
             "ok": True,
             "proto_v": PROTO_VERSION,
@@ -856,7 +2806,19 @@ class HeatmapVLNRuntime:
             "actions": [],
             "terminal": False,
             "kind": "unknown",
+            "system2_force_non_stop": force_non_stop,
         }
+        if decision_scores:
+            response["system2_decision_scores"] = decision_scores
+        if stop_head_result:
+            response["system2_stop_head"] = stop_head_result
+            if stop_head_result.get("mode") in {
+                "temporal_veto_only",
+                "hybrid_static_add_temporal_veto",
+            }:
+                response["system2_temporal_stop_verifier"] = stop_head_result
+        if stop_feature_result:
+            response["system2_stop_feature"] = stop_feature_result
         if sampling_metadata is not None:
             response[HEATMAPVLN_RPC_SAMPLING_FIELD] = sampling_metadata
         if vlm_output_requests_stop(llm_output):
@@ -906,8 +2868,13 @@ class HeatmapVLNRuntime:
                 view_id=pano_goal_view,
                 structured_output=structured_pano_output,
             )
+            if self.system2_stop_decision_adapter_name is not None:
+                _assert_navigation_only_lora(
+                    self.model.qwen2_5_vl,
+                    context="System1 trajectory-latent extraction",
+                )
             with torch.no_grad():
-                traj_hs = self.model.qwen2_5_vl.generate_latents(
+                raw_traj_hs = self.model.qwen2_5_vl.generate_latents(
                     output_ids=condition_output_ids,
                     pixel_values=inputs.get("pixel_values"),
                     image_grid_thw=inputs.get("image_grid_thw"),
@@ -915,6 +2882,7 @@ class HeatmapVLNRuntime:
                     attention_mask=inputs.get("attention_mask"),
                     mm_token_type_ids=inputs.get("mm_token_type_ids"),
                 )
+                traj_hs = raw_traj_hs
                 if self.pano_latent_adapter is not None:
                     traj_hs = _maybe_apply_pano_latent_adapter(
                         traj_hs,
@@ -945,16 +2913,51 @@ class HeatmapVLNRuntime:
             if local_actions and local_actions[0] == ActionCode.STOP:
                 local_actions = [ActionCode.LEFT]
                 response["anti_deadlock"] = True
+            trajectory_summary = _trajectory_debug_summary(
+                trajectory,
+                self.num_sample_trajs,
+                self.action_scale,
+                trajectory_x_sign,
+            )
+            trajectory_metrics = _trajectory_debug_metrics(
+                trajectory,
+                self.num_sample_trajs,
+                self.action_scale,
+                trajectory_x_sign,
+            )
+            if stop_feature_result:
+                adapted_traj_hs = raw_traj_hs
+                if self.pano_latent_adapter is not None:
+                    adapted_traj_hs = _maybe_apply_pano_latent_adapter(
+                        raw_traj_hs,
+                        self.pano_latent_adapter,
+                        view_id=pano_goal_view,
+                        pixel_goal=pixel_goal,
+                        image_size=vlm_image_size,
+                        cond_projector=None,
+                    )
+                projected_traj_condition = _project_trajectory_condition(
+                    self.model.nextdit_action_head,
+                    traj_hs,
+                )
+                stop_feature_result = _augment_system2_stop_feature_with_trajectory(
+                    stop_feature_result,
+                    raw_traj_latent=raw_traj_hs,
+                    adapted_traj_latent=adapted_traj_hs,
+                    projected_traj_condition=projected_traj_condition,
+                    trajectory=trajectory,
+                    trajectory_metrics=trajectory_metrics,
+                    local_actions=[int(action) for action in local_actions],
+                    pixel_goal=pixel_goal,
+                    pano_goal_view=pano_goal_view,
+                )
+                response["system2_stop_feature"] = stop_feature_result
             response.update(
                 {
                     "kind": "trajectory",
                     "actions": [int(action) for action in local_actions],
-                    "trajectory_summary": _trajectory_debug_summary(
-                        trajectory,
-                        self.num_sample_trajs,
-                        self.action_scale,
-                        trajectory_x_sign,
-                    ),
+                    "trajectory_summary": trajectory_summary,
+                    "trajectory_metrics": trajectory_metrics,
                     "trajectory_x_sign": trajectory_x_sign,
                     "trajectory_heading_alignment": trajectory_heading_alignment,
                     "trajectory_target_heading_deg": target_heading_deg,
@@ -962,7 +2965,20 @@ class HeatmapVLNRuntime:
             )
             return response
 
-        response.update({"kind": "fallback_stop", "terminal": True, "actions": [ActionCode.STOP]})
+        fallback_action = _fallback_replan_action(pano_goal_view)
+        LOGGER.warning(
+            "Malformed non-STOP System2 output; replanning with turn action %d: %r",
+            fallback_action,
+            llm_output,
+        )
+        response.update(
+            {
+                "kind": "fallback_replan",
+                "terminal": False,
+                "actions": [fallback_action],
+                "parse_error": "malformed_non_stop_output",
+            }
+        )
         return response
 
 
@@ -1014,6 +3030,62 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--base_checkpoint", default=None)
     parser.add_argument("--pano_latent_adapter_checkpoint", default=None)
+    parser.add_argument(
+        "--system2_stop_head_checkpoint",
+        default=None,
+        help=(
+            "Optional isolated binary STOP-head checkpoint. The original Stage1-S2 "
+            "LoRA remains the only Qwen adapter; a vetoed original STOP is regenerated "
+            "with its STOP class token constrained."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_decision_adapter_checkpoint",
+        default=None,
+        help=(
+            "Optional STOP-only LoRA delta. It is added to the frozen default LoRA "
+            "for one structured-class scoring forward; waypoint generation and "
+            "System1 latent extraction remain default-LoRA-only."
+        ),
+    )
+    parser.add_argument(
+        "--system2_temporal_stop_verifier_checkpoint",
+        default=None,
+        help=(
+            "Optional veto-only temporal STOP verifier. It embeds a frozen static "
+            "STOP prior, requires deterministic contiguous episode call metadata, "
+            "and never changes an original non-STOP output into STOP."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_add_threshold",
+        type=float,
+        default=None,
+        help="Optional override for adding STOP to an original non-STOP output.",
+    )
+    parser.add_argument(
+        "--system2_stop_veto_threshold",
+        type=float,
+        default=None,
+        help="Optional override for accepting rather than vetoing an original STOP.",
+    )
+    parser.add_argument(
+        "--system2_stop_add_min_qwen_stop_probability",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum original Qwen structured STOP probability required before "
+            "the auxiliary head may replace a non-STOP output with STOP."
+        ),
+    )
+    parser.add_argument(
+        "--system2_stop_feature_dump_dir",
+        default=None,
+        help=(
+            "Optional DAgger collection directory for frozen-Qwen STOP decision "
+            "features. Requires deterministic RPC sampling metadata."
+        ),
+    )
     parser.add_argument("--internnav_model_path", default=_default_internnav_model_path())
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")

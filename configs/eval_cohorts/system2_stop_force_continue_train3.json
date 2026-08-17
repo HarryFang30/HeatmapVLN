@@ -1,0 +1,8 @@
+{
+  "description": "Train-split smoke for oracle intervention after known false System2 STOP decisions.",
+  "episodes": [
+    {"scene_id": "PuKPg4mmafe", "episode_id": 6966, "baseline_false_stop_distance_m": 4.214},
+    {"scene_id": "b8cTxDM8gDG", "episode_id": 4551, "baseline_false_stop_distance_m": 7.023},
+    {"scene_id": "E9uDoFAP3SH", "episode_id": 8846, "baseline_false_stop_distance_m": 6.082}
+  ]
+}

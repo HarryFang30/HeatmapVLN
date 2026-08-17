@@ -50,6 +50,7 @@ from .utils import (
     assert_complete_lora_checkpoint_match,
     build_l2_sp_reference,
     build_heatmap_loss_fn,
+    build_future_heatmap_loss_fn,
     compute_l2_sp_loss,
     extract_lora_checkpoint_state,
     load_config,
@@ -90,6 +91,9 @@ _LAZY_MODULES = {
     "build_optimizer": "optimizer",
     "build_scheduler": "optimizer",
     "get_heatmap_temperature": "optimizer",
+    # heatmap_warmstart.py
+    "validate_heatmap_warmstart_contract": "heatmap_warmstart",
+    "verify_heatmap_warmstart_loaded": "heatmap_warmstart",
     # preflight.py
     "run_training_preflight": "preflight",
     # plotter.py

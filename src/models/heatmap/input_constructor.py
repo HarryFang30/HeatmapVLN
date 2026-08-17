@@ -134,7 +134,10 @@ def parse_structured_pano_output(
         r"^view\s*:\s*(front|right|back|left|stop|turn_left|turn_right|turn)\s*$",
         flags=re.I,
     )
-    pixel_line_re = re.compile(r"^pixel\s*:\s*([-+]?\d+)\s+([-+]?\d+)\s*$", flags=re.I)
+    pixel_line_re = re.compile(
+        r"^pixel\s*:\s*([-+]?\d+)\s+(?:pixel\s*:\s*)?([-+]?\d+)\s*$",
+        flags=re.I,
+    )
     inline_pixel_re = re.compile(
         r"^view\s*:\s*(front|right|back|left)\s*[,;]?\s+"
         r"pixel\s*:\s*([-+]?\d+)\s+([-+]?\d+)\s*$",

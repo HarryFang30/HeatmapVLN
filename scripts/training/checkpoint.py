@@ -21,6 +21,32 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _past_plan_action_checkpoint_contract(
+    model: nn.Module,
+    cfg: dict,
+    *,
+    trainable_params: set[str],
+) -> dict | None:
+    ppa_cfg = (
+        cfg.get('model', {})
+        .get('action_head', {})
+        .get('nextdit', {})
+        .get('past_plan_action', {})
+    )
+    if not isinstance(ppa_cfg, dict) or not ppa_cfg.get('enabled', False):
+        return None
+    from src.models.past_plan_action_config import PastPlanActionConfig
+
+    runtime = PastPlanActionConfig.from_mapping(ppa_cfg).validate().runtime_manifest()
+    runtime['trainable_param_names'] = sorted(trainable_params)
+    runtime['resume_policy'] = (
+        'exact_trainable_scope_only; stage1_to_stage2_uses_weight_warmstart'
+    )
+    runtime['checkpoint_digest_enforced'] = False
+    runtime['file_lock_used'] = False
+    return runtime
+
+
 class CheckpointManager:
     """Manages checkpoint saving, loading, and cleanup."""
 
@@ -67,6 +93,14 @@ class CheckpointManager:
             'config': cfg,
             'best_val_loss': self.best_val_loss,
         }
+
+        ppa_contract = _past_plan_action_checkpoint_contract(
+            model,
+            cfg,
+            trainable_params=trainable_params,
+        )
+        if ppa_contract is not None:
+            ckpt['past_plan_action_contract'] = ppa_contract
 
         if scaler is not None:
             ckpt['scaler_state_dict'] = scaler.state_dict()
@@ -140,6 +174,27 @@ def load_checkpoint_for_resume(
     ckpt = safe_torch_load(ckpt_path)
 
     state_dict = ckpt.get('trainable_state_dict', {})
+    ppa_contract = ckpt.get('past_plan_action_contract')
+    if ppa_contract is not None:
+        if not isinstance(ppa_contract, dict):
+            raise RuntimeError('Invalid Past→Plan→Action checkpoint contract')
+        checkpoint_names = set(ppa_contract.get('trainable_param_names') or ())
+        current_names = _normalized_trainable_param_names(model)
+        if checkpoint_names != current_names:
+            raise RuntimeError(
+                'Past→Plan→Action optimizer resume requires the exact same '
+                'trainable scope. Use --load-weights (not --resume) for a '
+                'Stage-1 → Stage-2 warm start. '
+                f'missing={sorted(current_names - checkpoint_names)[:8]} '
+                f'extra={sorted(checkpoint_names - current_names)[:8]}'
+            )
+        state_names = set(state_dict)
+        if state_names != checkpoint_names:
+            raise RuntimeError(
+                'Past→Plan→Action checkpoint state/manifest key mismatch: '
+                f'missing={sorted(checkpoint_names - state_names)[:8]} '
+                f'extra={sorted(state_names - checkpoint_names)[:8]}'
+            )
     if state_dict:
         _missing, _unexpected, loaded_count = _load_normalized_state_dict(model, state_dict)
         if logger:

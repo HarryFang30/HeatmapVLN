@@ -22,6 +22,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.models.pipeline import VLNPipeline
+from src.models.past_plan_action import (
+    compute_shared_plan_action_losses,
+    verify_stage0_native_equivalence,
+)
+from src.models.past_plan_action_loss import (
+    PastPlanActionLossWeights,
+    compose_past_plan_action_loss,
+)
+from src.data.future_trajectory_batch import assert_no_future_teacher_inputs
 from src.utils.gpu_heatmap import GPUHeatmapComputer
 
 from .distributed import (
@@ -42,6 +51,7 @@ from .utils import (
     _mean_timing,
     _unwrap_model,
     build_heatmap_loss_fn,
+    build_future_heatmap_loss_fn,
     compute_l2_sp_loss,
     make_autocast_context,
 )
@@ -54,6 +64,32 @@ from .visualization import (
 logger = logging.getLogger(__name__)
 
 _TRAJECTORY_VIEW_ORDER = ("front", "right", "back", "left")
+_HEATMAP_COMPONENT_KEYS = (
+    "peak_loss",
+    "vis_loss",
+    "coord_loss",
+    "neg_loss",
+    "view_macro_loss",
+    "direction_macro_loss",
+    "panoramic_view_loss",
+)
+
+
+def _finite_module_grad_norm(module: torch.nn.Module | None) -> float:
+    """Return an FP64 L2 norm without mutating gradients."""
+
+    if module is None:
+        return 0.0
+    total = torch.zeros((), dtype=torch.float64)
+    for parameter in module.parameters():
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().double().cpu()
+        total += grad.square().sum()
+    value = float(total.sqrt().item())
+    if not math.isfinite(value):
+        raise RuntimeError("Past→Plan→Action produced a non-finite gradient norm")
+    return value
 
 
 def _prepare_trajectory_sequence_inputs(
@@ -156,6 +192,37 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
     weights are frozen.
     """
     trainable = set(stage_cfg.get("trainable_modules", []))
+    ppa_stage = stage_cfg.get("past_plan_action_stage")
+    if ppa_stage is not None:
+        from src.models.past_plan_action_training import (
+            configure_past_plan_action_stage,
+        )
+
+        chain = getattr(model_module, 'past_plan_action', None)
+        past_head = getattr(model_module, 'heatmap_vln', None)
+        action_head = getattr(model_module, 'nextdit_action_head', None)
+        if chain is None or past_head is None or action_head is None:
+            raise RuntimeError("Past→Plan→Action train mode requires all three modules")
+        configure_past_plan_action_stage(
+            stage=ppa_stage,
+            chain=chain,
+            past_head=past_head,
+            native_action_head=action_head,
+            native_cond_projector=action_head.cond_projector,
+            other_frozen_modules=tuple(
+                module
+                for module in (
+                    getattr(model_module, 'vlm_backbone', None),
+                    getattr(model_module, 'llm_projector', None),
+                )
+                if module is not None
+            ),
+        )
+        logger.info(
+            "  Past→Plan→Action selective train mode restored: %s",
+            ppa_stage,
+        )
+        return
     selective_action_modules = {
         "latent_queries",
         "cond_projector",
@@ -168,25 +235,48 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
     }
     is_selective_stage2 = (
         stage_cfg.get("bridge_only", False)
+        or "stop_head" in trainable
         or (
             stage_cfg.get("train_action", False)
             and bool(trainable & selective_action_modules)
             and "nextdit_action_head" not in trainable
         )
     )
+    is_heatmap_only = (
+        trainable == {"heatmap_vln"}
+        and not stage_cfg.get("train_action", False)
+        and not stage_cfg.get(
+            "train_lm",
+            stage_cfg.get("train_system2_sft", False),
+        )
+    )
+    is_selective_stage2 = is_selective_stage2 or is_heatmap_only
     if not is_selective_stage2:
         return
 
+    if getattr(model_module, "heatmap_vln", None) is not None:
+        if "heatmap_vln" in trainable:
+            model_module.heatmap_vln.train()
+        else:
+            model_module.heatmap_vln.eval()
+
+    # HeatmapVLN keeps the same Qwen module as ``vlm_backbone.model`` under a
+    # second parent. Apply the frozen-backbone mode *after* head.train(), or
+    # recursive train() would silently switch the shared Qwen back to train.
     vlm_backbone = getattr(model_module, "vlm_backbone", getattr(model_module, "qwen2_5_vl", None))
     if vlm_backbone is not None and not ({"lora", "vlm_lora"} & trainable):
-        # Keep the VLM itself in train mode so Transformers gradient
-        # checkpointing remains active, but disable frozen dropout noise.
-        for submodule in vlm_backbone.modules():
-            if isinstance(submodule, torch.nn.Dropout):
-                submodule.eval()
-
-    if "heatmap_vln" not in trainable and getattr(model_module, "heatmap_vln", None) is not None:
-        model_module.heatmap_vln.eval()
+        if "stop_head" in trainable or is_heatmap_only:
+            # STOP-head features must match generation exactly. No Qwen
+            # parameter needs gradients, so the entire backbone stays in eval.
+            # Heatmap-only training likewise consumes deterministic frozen
+            # Qwen features while keeping only the localization head in train.
+            vlm_backbone.eval()
+        else:
+            # Keep the VLM itself in train mode so Transformers gradient
+            # checkpointing remains active, but disable frozen dropout noise.
+            for submodule in vlm_backbone.modules():
+                if isinstance(submodule, torch.nn.Dropout):
+                    submodule.eval()
 
     if "llm_projector" not in trainable and getattr(model_module, "llm_projector", None) is not None:
         model_module.llm_projector.eval()
@@ -195,6 +285,11 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
         model_module.pano_latent_adapter.train()
     elif getattr(model_module, "pano_latent_adapter", None) is not None:
         model_module.pano_latent_adapter.eval()
+
+    if "stop_head" in trainable and getattr(model_module, "stop_head", None) is not None:
+        model_module.stop_head.train()
+    elif getattr(model_module, "stop_head", None) is not None:
+        model_module.stop_head.eval()
 
     nah = getattr(model_module, "nextdit_action_head", None)
     if nah is not None:
@@ -214,8 +309,8 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
                     submodule.train()
 
     logger.info(
-        "  Selective Stage2 mode: frozen modules eval; trainable action modules=%s",
-        sorted(trainable & selective_action_modules),
+        "  Selective train mode: frozen modules eval; trainable modules=%s",
+        sorted(trainable),
     )
 
 
@@ -272,7 +367,17 @@ def train_one_epoch(
     total_heatmap_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
     total_action_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
     total_lm_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_stop_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_stop_confusion = torch.zeros(4, device=dist_context.device, dtype=torch.float64)
     total_l2_sp_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_future_heatmap_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_preserve_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_delta_z_loss = torch.zeros((), device=dist_context.device, dtype=torch.float64)
+    total_heatmap_components = torch.zeros(
+        len(_HEATMAP_COMPONENT_KEYS),
+        device=dist_context.device,
+        dtype=torch.float64,
+    )
     total_trajectory_view_counts = torch.zeros(
         len(_TRAJECTORY_VIEW_ORDER),
         device=dist_context.device,
@@ -301,7 +406,21 @@ def train_one_epoch(
     train_future = stage_cfg.get('train_future', False)
     train_action = stage_cfg.get('train_action', True)
     train_lm = bool(stage_cfg.get('train_lm', stage_cfg.get('train_system2_sft', False)))
-    need_heatmap_targets = train_history or train_future
+    train_stop_head = bool(stage_cfg.get('train_system2_stop_head', False))
+    past_plan_action_stage = stage_cfg.get('past_plan_action_stage')
+    train_past_plan_action = past_plan_action_stage is not None
+    if train_past_plan_action and (train_lm or train_stop_head):
+        raise ValueError(
+            "Past→Plan→Action v1 cannot be combined with LM or STOP-head training"
+        )
+    stop_threshold = float(
+        cfg.get('model', {}).get('stop_head', {}).get('inference_threshold', 0.5)
+    )
+    if train_stop_head and not 0.0 < stop_threshold < 1.0:
+        raise ValueError(f"STOP-head inference threshold must be in (0, 1), got {stop_threshold}")
+    # History targets may be generated on GPU. Future tube targets are fixed
+    # expert-label tensors supplied independently by the trajectory collator.
+    need_heatmap_targets = train_history
 
     device = dist_context.device
     l2_sp_device_reference = None
@@ -310,6 +429,10 @@ def train_one_epoch(
             name: value.to(device=device, dtype=torch.float32)
             for name, value in l2_sp_reference.items()
         }
+    if train_past_plan_action and l2_sp_weight > 0.0:
+        raise ValueError(
+            "Past→Plan→Action v1 uses only action/history/future/preserve/delta losses"
+        )
 
     if dist_context.is_main:
         logger.info(
@@ -326,6 +449,23 @@ def train_one_epoch(
     hm_loss_fn.set_temperature(
         get_heatmap_temperature(cfg, global_step_offset, total_train_steps)
     )
+    future_hm_loss_fn = (
+        build_future_heatmap_loss_fn(cfg, device) if train_future else None
+    )
+    ppa_weights_cfg = loss_cfg.get('past_plan_action', {}) or {}
+    ppa_weights = PastPlanActionLossWeights(
+        action=float(ppa_weights_cfg.get('action', 1.0)),
+        history=float(ppa_weights_cfg.get('history', 0.3)),
+        future=float(ppa_weights_cfg.get('future', 0.3)),
+        preserve=float(ppa_weights_cfg.get('preserve', 0.5)),
+        delta_z=float(ppa_weights_cfg.get('delta_z', 0.01)),
+    )
+    last_ppa_grad_norms = {
+        'bridge': 0.0,
+        'future': 0.0,
+        'shared_map': 0.0,
+    }
+    stage0_equivalence_passed = False
 
     total_batches = len(train_loader)
     if max_batches is not None:
@@ -415,6 +555,15 @@ def train_one_epoch(
         gt_action = batch['action'].to(device, non_blocking=True)
         action_valid = batch['action_valid'].to(device, non_blocking=True)
         is_stop = batch['is_stop'].to(device, non_blocking=True)
+        stop_target = batch.get('system2_stop_target')
+        stop_predictor_positions = batch.get('system2_stop_predictor_position')
+        if train_stop_head:
+            if stop_target is None or stop_predictor_positions is None:
+                raise RuntimeError(
+                    "train_system2_stop_head=True requires STOP targets and predictor positions "
+                    "from PanoramicTokenizedCollator"
+                )
+            stop_target = stop_target.to(device, non_blocking=True)
         text = batch['text']
 
         gt_heatmap = None
@@ -446,6 +595,8 @@ def train_one_epoch(
 
         if enable_timing:
             forward_start = time.perf_counter()
+        if train_future:
+            assert_no_future_teacher_inputs(batch)
         with make_autocast_context(device, optim_cfg.get('amp', 'bf16')):
             if text and len(text) > 0:
                 instruction_text = list(text)
@@ -483,15 +634,22 @@ def train_one_epoch(
                 panoramic_inputs=panoramic_inputs_batch,
                 panoramic_num_histories=panoramic_num_histories,
                 panoramic_text_anchor_positions=panoramic_text_anchor_positions,
+                stop_predictor_positions=(
+                    stop_predictor_positions if train_stop_head else None
+                ),
                 history_rel_poses=history_rel_poses,
-                return_heatmaps=train_history or train_future,
+                return_heatmaps=train_history,
+                return_heatmap_logits=train_history,
+                return_future_heatmaps=train_future,
                 return_actions=train_action,
                 return_lm_loss=train_lm,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
                 action_valid=action_valid if train_action else None,
-                gt_stop=is_stop if train_action else None,
-                gt_history_heatmap=gt_heatmap if train_history else None,
-                gt_future_heatmap=gt_heatmap if train_future else None,
+                gt_stop=(
+                    stop_target
+                    if train_stop_head
+                    else (is_stop if train_action else None)
+                ),
             )
 
             heatmap_loss = torch.tensor(0.0, device=device)
@@ -511,10 +669,54 @@ def train_one_epoch(
                     gt_vis=gt_vis,
                     gt_heatmaps=gt_heatmap.to(device, non_blocking=True),
                     history_mask=hm_history_mask,
+                    pred_heatmap_logits=output.get('heatmap_logits'),
                 )
                 heatmap_loss = loss_dict['total']
 
+            future_loss_dict = None
+            future_heatmap_loss = torch.tensor(0.0, device=device)
+            if train_future:
+                required_future_batch = (
+                    'future_trajectory_heatmap',
+                    'future_trajectory_visibility',
+                    'future_trajectory_time_mask',
+                )
+                missing_future_batch = [
+                    key for key in required_future_batch if key not in batch
+                ]
+                required_future_output = (
+                    'future_visibility',
+                    'future_heatmaps',
+                    'future_heatmap_logits',
+                )
+                missing_future_output = [
+                    key for key in required_future_output if key not in output
+                ]
+                if missing_future_batch or missing_future_output:
+                    raise RuntimeError(
+                        "Future trajectory supervision is incomplete: "
+                        f"batch_missing={missing_future_batch} "
+                        f"output_missing={missing_future_output}"
+                    )
+                assert future_hm_loss_fn is not None
+                future_loss_dict = future_hm_loss_fn(
+                    pred_visibility_logits=output['future_visibility'],
+                    pred_heatmaps=output['future_heatmaps'],
+                    pred_heatmap_logits=output['future_heatmap_logits'],
+                    gt_visibility=batch['future_trajectory_visibility'].to(
+                        device, non_blocking=True
+                    ),
+                    gt_heatmaps=batch['future_trajectory_heatmap'].to(
+                        device, non_blocking=True
+                    ),
+                    future_time_mask=batch['future_trajectory_time_mask'].to(
+                        device, non_blocking=True
+                    ),
+                )
+                future_heatmap_loss = future_loss_dict['total']
+
             trajectory_loss = torch.tensor(0.0, device=device)
+            action_plan_losses = None
 
             if train_action:
                 if hasattr(model_module, 'nextdit_action_head') and model_module.nextdit_action_head is not None:
@@ -567,16 +769,63 @@ def train_one_epoch(
                                 "Unsupported trajectory_valid shape for view weighting: "
                                 f"{tuple(trajectory_valid.shape)}"
                             )
-                    traj_hidden_states = model_module.adapt_traj_hidden_states(
-                        output['traj_hidden_states']
-                    )
-                    traj_result = model_module.nextdit_action_head.compute_loss(
-                        traj_hidden_states,
-                        gt_trajectory,
-                        traj_images=traj_images,
-                        trajectory_valid=trajectory_valid,
-                    )
-                    trajectory_loss = traj_result['loss']
+                    if train_past_plan_action:
+                        for key in ('plan_z0', 'plan_z', 'delta_z'):
+                            if key not in output:
+                                raise RuntimeError(
+                                    f"Past→Plan→Action output is missing {key}"
+                                )
+                        if (
+                            stage_cfg.get('verify_stage0_equivalence', False)
+                            and not stage0_equivalence_passed
+                        ):
+                            action_cfg = model_module.nextdit_action_head.config
+                            initial_noise = torch.randn(
+                                output['plan_z'].shape[0]
+                                * int(action_cfg.num_sample_trajs),
+                                int(action_cfg.predict_steps),
+                                int(action_cfg.action_dim),
+                                device=output['plan_z'].device,
+                                dtype=output['plan_z'].dtype,
+                            )
+                            report = verify_stage0_native_equivalence(
+                                action_head=model_module.nextdit_action_head,
+                                plan_z0=output['plan_z0'],
+                                plan_z=output['plan_z'],
+                                traj_images=traj_images,
+                                initial_noise=initial_noise,
+                            )
+                            stage0_equivalence_passed = True
+                            logger.info(
+                                "  ✓ Stage-0 exact equivalence: plan=%s "
+                                "condition=%s trajectories=%s shape=%s",
+                                report.plan_equal,
+                                report.fused_condition_equal,
+                                report.raw_trajectory_equal,
+                                report.trajectory_shape,
+                            )
+                        action_plan_losses = compute_shared_plan_action_losses(
+                            action_head=model_module.nextdit_action_head,
+                            plan_z0=output['plan_z0'],
+                            plan_z=output['plan_z'],
+                            gt_trajectory=gt_trajectory,
+                            trajectory_valid=trajectory_valid,
+                            traj_images=traj_images,
+                            preserve_weight=ppa_weights.preserve,
+                            delta_weight=ppa_weights.delta_z,
+                        )
+                        trajectory_loss = action_plan_losses['action']
+                    else:
+                        traj_hidden_states = model_module.adapt_traj_hidden_states(
+                            output['traj_hidden_states']
+                        )
+                        traj_result = model_module.nextdit_action_head.compute_loss(
+                            traj_hidden_states,
+                            gt_trajectory,
+                            traj_images=traj_images,
+                            trajectory_valid=trajectory_valid,
+                        )
+                        trajectory_loss = traj_result['loss']
 
             lm_loss = torch.tensor(0.0, device=device)
             if train_lm:
@@ -586,6 +835,14 @@ def train_one_epoch(
                         "Check PanoramicTokenizedCollator labels and Qwen forward wiring."
                     )
                 lm_loss = output['lm_loss']
+
+            stop_loss = torch.tensor(0.0, device=device)
+            if train_stop_head:
+                if 'stop_loss' not in output or output['stop_loss'] is None:
+                    raise RuntimeError(
+                        "train_system2_stop_head=True but model output has no stop_loss"
+                    )
+                stop_loss = output['stop_loss']
 
             l2_sp_loss = torch.tensor(0.0, device=device)
             if l2_sp_weight > 0.0 and l2_sp_reference:
@@ -599,14 +856,39 @@ def train_one_epoch(
             heatmap_weight = loss_cfg.get('heatmap_weight', 1.0)
             trajectory_weight = loss_cfg.get('trajectory_weight', 0.0)
             lm_weight = loss_cfg.get('lm_weight', stage_cfg.get('lm_weight', 1.0))
+            stop_weight = loss_cfg.get('stop_weight', 1.0)
 
-            loss = (
-                heatmap_weight * heatmap_loss
-                + trajectory_weight * trajectory_loss
-                + lm_weight * lm_loss
-                + l2_sp_weight * l2_sp_loss
-            )
+            ppa_loss_dict = None
+            if train_past_plan_action:
+                ppa_loss_dict = compose_past_plan_action_loss(
+                    stage=past_plan_action_stage,
+                    history_loss=loss_dict,
+                    future_loss=future_loss_dict,
+                    action_plan_losses=action_plan_losses,
+                    weights=ppa_weights,
+                )
+                loss = ppa_loss_dict['total']
+            else:
+                loss = (
+                    heatmap_weight * heatmap_loss
+                    + trajectory_weight * trajectory_loss
+                    + lm_weight * lm_loss
+                    + stop_weight * stop_loss
+                    + l2_sp_weight * l2_sp_loss
+                )
             loss = loss / grad_accum_steps
+        if train_stop_head:
+            stop_probabilities = output['stop_probability'].detach().float()
+            stop_targets_bool = stop_target.detach() >= 0.5
+            stop_predictions = stop_probabilities >= stop_threshold
+            total_stop_confusion += torch.stack(
+                [
+                    (stop_predictions & stop_targets_bool).sum(),
+                    (stop_predictions & ~stop_targets_bool).sum(),
+                    (~stop_predictions & ~stop_targets_bool).sum(),
+                    (~stop_predictions & stop_targets_bool).sum(),
+                ]
+            ).to(dtype=torch.float64)
         if enable_timing:
             timing_stats['forward_s'] += time.perf_counter() - forward_start
             profiled_steps += 1
@@ -642,6 +924,18 @@ def train_one_epoch(
                 if trainable_params:
                     torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
                 optimizer.step()
+            if train_past_plan_action:
+                chain = getattr(model_module, 'past_plan_action', None)
+                past_head = getattr(model_module, 'heatmap_vln', None)
+                last_ppa_grad_norms = {
+                    'bridge': _finite_module_grad_norm(
+                        getattr(chain, 'bridge', None)
+                    ),
+                    'future': _finite_module_grad_norm(
+                        getattr(chain, 'future_head', None)
+                    ),
+                    'shared_map': _finite_module_grad_norm(past_head),
+                }
             _next_step = global_step + 1
             if tb_writer is not None and _next_step % diag_interval == 0:
                 _cached_lora_grads = _collect_lora_grad_norms(model_module)
@@ -684,7 +978,17 @@ def train_one_epoch(
                     "heatmap_loss": float(heatmap_loss.detach().item()),
                     "trajectory_loss": float(trajectory_loss.detach().item()),
                     "lm_loss": float(lm_loss.detach().item()),
+                    "stop_loss": float(stop_loss.detach().item()),
                     "l2_sp_loss": float(l2_sp_loss.detach().item()),
+                    "future_heatmap_loss": float(
+                        future_heatmap_loss.detach().item()
+                    ),
+                    "preserve_loss": float(
+                        ppa_loss_dict['preserve'].detach().item()
+                    ) if ppa_loss_dict is not None else 0.0,
+                    "delta_z_l2": float(
+                        ppa_loss_dict['delta_z_l2'].detach().item()
+                    ) if ppa_loss_dict is not None else 0.0,
                 }
 
             if log_this_step:
@@ -706,10 +1010,25 @@ def train_one_epoch(
                     if step_scalars["trajectory_loss"] > 0 else ""
                 )
                 lm_str = f", lm: {step_scalars['lm_loss']:.4f}" if train_lm else ""
+                stop_str = (
+                    f", stop: {step_scalars['stop_loss']:.4f}"
+                    if train_stop_head
+                    else ""
+                )
                 l2_sp_str = (
                     f", l2sp: {step_scalars['l2_sp_loss']:.6f}"
                     if l2_sp_weight > 0.0 and step_scalars["l2_sp_loss"] > 0
                     else ""
+                )
+                ppa_str = (
+                    ", future: "
+                    f"{step_scalars['future_heatmap_loss']:.4f}, preserve: "
+                    f"{step_scalars['preserve_loss']:.4f}, delta: "
+                    f"{step_scalars['delta_z_l2']:.6f}, grad(B/F/M): "
+                    f"{last_ppa_grad_norms['bridge']:.3e}/"
+                    f"{last_ppa_grad_norms['future']:.3e}/"
+                    f"{last_ppa_grad_norms['shared_map']:.3e}"
+                    if train_past_plan_action else ""
                 )
                 metadata = output.get('processing_metadata', {}) if isinstance(output, dict) else {}
                 input_stats_str = ""
@@ -727,7 +1046,7 @@ def train_one_epoch(
                     f"Batch {i+1}/{len(train_loader)} | "
                     f"Step {global_step} | "
                     f"Loss: {step_scalars['loss']:.4f} "
-                    f"(hm: {step_scalars['heatmap_loss']:.4f}{traj_str}{lm_str}{l2_sp_str}) | "
+                    f"(hm: {step_scalars['heatmap_loss']:.4f}{traj_str}{lm_str}{stop_str}{l2_sp_str}{ppa_str}) | "
                     f"LR: [{lr_display}]"
                     + gpu_mem_str
                     + input_stats_str
@@ -747,12 +1066,22 @@ def train_one_epoch(
                     )
                 )
                 if isinstance(loss_dict, dict):
-                    neg_str = f" neg={loss_dict.get('neg_loss', 0):.4f}" if loss_dict.get('neg_loss', 0) > 0 else ""
+                    auxiliary = " ".join(
+                        f"{key.removesuffix('_loss')}="
+                        f"{float(loss_dict[key]):.4f}"
+                        for key in (
+                            "neg_loss",
+                            "view_macro_loss",
+                            "direction_macro_loss",
+                            "panoramic_view_loss",
+                        )
+                        if key in loss_dict and float(loss_dict[key]) > 0
+                    )
                     logger.info(
                         f"  [HM] peak={loss_dict.get('peak_loss', 0):.4f} "
                         f"vis={loss_dict.get('vis_loss', 0):.4f} "
                         f"coord={loss_dict.get('coord_loss', 0):.4f}"
-                        f"{neg_str}"
+                        f"{' ' + auxiliary if auxiliary else ''}"
                     )
                 if metrics_jsonl_path is not None:
                     step_record = {
@@ -764,15 +1093,20 @@ def train_one_epoch(
                         "loss": step_scalars["loss"],
                         "heatmap_loss": step_scalars["heatmap_loss"],
                         "trajectory_loss": step_scalars["trajectory_loss"],
-                            "lm_loss": step_scalars["lm_loss"],
-                            "l2_sp_loss": step_scalars["l2_sp_loss"],
-                            "lrs": {
+                        "lm_loss": step_scalars["lm_loss"],
+                        "stop_loss": step_scalars["stop_loss"],
+                        "l2_sp_loss": step_scalars["l2_sp_loss"],
+                        "future_heatmap_loss": step_scalars["future_heatmap_loss"],
+                        "preserve_loss": step_scalars["preserve_loss"],
+                        "delta_z_l2": step_scalars["delta_z_l2"],
+                        "ppa_grad_norms": dict(last_ppa_grad_norms),
+                        "lrs": {
                             optimizer.param_groups[gi].get("name", f"g{gi}"): lr_val
                             for gi, lr_val in enumerate(all_lrs)
                         },
                     }
                     if isinstance(loss_dict, dict):
-                        for k in ('peak_loss', 'vis_loss', 'coord_loss', 'neg_loss'):
+                        for k in _HEATMAP_COMPONENT_KEYS:
                             if k in loss_dict:
                                 step_record[f'hm_{k}'] = loss_dict[k].item()
                     if show_gpu_memory:
@@ -787,10 +1121,17 @@ def train_one_epoch(
                     tb_writer.add_scalar('train/trajectory_loss', step_scalars["trajectory_loss"], actual_step)
                 if train_lm:
                     tb_writer.add_scalar('train/lm_loss', step_scalars["lm_loss"], actual_step)
+                if train_stop_head:
+                    tb_writer.add_scalar('train/stop_loss', step_scalars["stop_loss"], actual_step)
                 if l2_sp_weight > 0.0 and step_scalars["l2_sp_loss"] > 0:
                     tb_writer.add_scalar('train/l2_sp_loss', step_scalars["l2_sp_loss"], actual_step)
+                if train_past_plan_action:
+                    for key in ('future_heatmap_loss', 'preserve_loss', 'delta_z_l2'):
+                        tb_writer.add_scalar(f'train/{key}', step_scalars[key], actual_step)
+                    for key, value in last_ppa_grad_norms.items():
+                        tb_writer.add_scalar(f'train/ppa_grad_{key}', value, actual_step)
                 if isinstance(loss_dict, dict):
-                    for k in ('vis_loss', 'coord_loss', 'peak_loss', 'neg_loss'):
+                    for k in _HEATMAP_COMPONENT_KEYS:
                         if k in loss_dict:
                             tb_writer.add_scalar(f'train/hm_{k}', loss_dict[k].item(), actual_step)
                 if enable_timing:
@@ -859,13 +1200,36 @@ def train_one_epoch(
         iter_hm_t = heatmap_loss.detach().to(dtype=torch.float64)
         iter_traj_t = trajectory_loss.detach().to(dtype=torch.float64)
         iter_lm_t = lm_loss.detach().to(dtype=torch.float64)
+        iter_stop_t = stop_loss.detach().to(dtype=torch.float64)
         iter_l2_sp_t = l2_sp_loss.detach().to(dtype=torch.float64)
+        iter_future_t = future_heatmap_loss.detach().to(dtype=torch.float64)
+        iter_preserve_t = (
+            ppa_loss_dict['preserve'].detach().to(dtype=torch.float64)
+            if ppa_loss_dict is not None else torch.zeros_like(iter_future_t)
+        )
+        iter_delta_t = (
+            ppa_loss_dict['delta_z_l2'].detach().to(dtype=torch.float64)
+            if ppa_loss_dict is not None else torch.zeros_like(iter_future_t)
+        )
 
         total_loss += iter_loss_t
         total_heatmap_loss += iter_hm_t
         total_action_loss += iter_traj_t
         total_lm_loss += iter_lm_t
+        total_stop_loss += iter_stop_t
         total_l2_sp_loss += iter_l2_sp_t
+        total_future_heatmap_loss += iter_future_t
+        total_preserve_loss += iter_preserve_t
+        total_delta_z_loss += iter_delta_t
+        if isinstance(loss_dict, dict):
+            for component_index, component_key in enumerate(
+                _HEATMAP_COMPONENT_KEYS
+            ):
+                component = loss_dict.get(component_key)
+                if torch.is_tensor(component):
+                    total_heatmap_components[component_index] += (
+                        component.detach().to(dtype=torch.float64)
+                    )
         num_batches += 1
 
         if progress_interval > 0 and (num_batches <= 3 or num_batches % progress_interval == 0):
@@ -873,21 +1237,26 @@ def train_one_epoch(
             _iter_hm = float(iter_hm_t.item())
             _iter_traj = float(iter_traj_t.item())
             _iter_lm = float(iter_lm_t.item())
+            _iter_stop = float(iter_stop_t.item())
             _avg_hm = float((total_heatmap_loss / max(num_batches, 1)).item())
             pbar.set_postfix({
                 'loss': f"{_iter_loss:.4f}",
                 'hm': f"{_avg_hm:.4f}",
                 'traj': f"{_iter_traj:.4f}",
                 'lm': f"{_iter_lm:.4f}",
+                'stop': f"{_iter_stop:.4f}",
             })
 
-        del output, loss, heatmap_loss, gt_heatmap
-        del trajectory_loss, lm_loss, l2_sp_loss
+        del output, loss, heatmap_loss, future_heatmap_loss, gt_heatmap
+        del trajectory_loss, lm_loss, stop_loss, l2_sp_loss
         loss_dict = None
+        future_loss_dict = None
+        ppa_loss_dict = None
         del video_frames
         del current_views_batch, history_panoramas_batch
         del panoramic_inputs_batch, panoramic_num_histories, panoramic_text_anchor_positions
         del history_frames, current_frame, gt_action, action_valid, is_stop, text
+        del stop_target, stop_predictor_positions
         del batch
 
         if num_batches % 50 == 0:
@@ -923,7 +1292,13 @@ def train_one_epoch(
                 'total_loss': float((total_loss / num_batches).item()),
                 'heatmap_loss': float((total_heatmap_loss / num_batches).item()),
                 'lm_loss': float((total_lm_loss / num_batches).item()),
+                'stop_loss': float((total_stop_loss / num_batches).item()),
                 'l2_sp_loss': float((total_l2_sp_loss / num_batches).item()),
+                'future_heatmap_loss': float(
+                    (total_future_heatmap_loss / num_batches).item()
+                ),
+                'preserve_loss': float((total_preserve_loss / num_batches).item()),
+                'delta_z_l2': float((total_delta_z_loss / num_batches).item()),
             }
             if ema is not None:
                 with ema.apply():
@@ -986,6 +1361,17 @@ def train_one_epoch(
             if trainable_params:
                 torch.nn.utils.clip_grad_norm_(trainable_params, optim_cfg['grad_clip'])
             optimizer.step()
+        if train_past_plan_action:
+            chain = getattr(model_module, 'past_plan_action', None)
+            last_ppa_grad_norms = {
+                'bridge': _finite_module_grad_norm(getattr(chain, 'bridge', None)),
+                'future': _finite_module_grad_norm(
+                    getattr(chain, 'future_head', None)
+                ),
+                'shared_map': _finite_module_grad_norm(
+                    getattr(model_module, 'heatmap_vln', None)
+                ),
+            }
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
         if ema is not None:
@@ -1015,27 +1401,71 @@ def train_one_epoch(
             total_heatmap_loss,
             total_action_loss,
             total_lm_loss,
+            total_stop_loss,
             total_l2_sp_loss,
+            total_future_heatmap_loss,
+            total_preserve_loss,
+            total_delta_z_loss,
             torch.tensor(float(num_batches), device=device, dtype=torch.float64),
         ]
     )
     _dist_all_reduce_in_place(totals)
+    _dist_all_reduce_in_place(total_heatmap_components)
     _dist_all_reduce_in_place(total_trajectory_view_counts)
+    _dist_all_reduce_in_place(total_stop_confusion)
 
-    reduced_num_batches = max(int(totals[5].item()), 1)
+    reduced_num_batches = max(int(totals[9].item()), 1)
     view_count_metrics = {
         f'trajectory_view_count_{view}': int(total_trajectory_view_counts[idx].item())
         for idx, view in enumerate(_TRAJECTORY_VIEW_ORDER)
     }
     if dist_context.is_main and total_trajectory_view_counts.sum().item() > 0:
         logger.info("  Trajectory view samples: %s", view_count_metrics)
+    tp, fp, tn, fn = (float(value.item()) for value in total_stop_confusion)
+    stop_precision = tp / max(tp + fp, 1.0)
+    stop_recall = tp / max(tp + fn, 1.0)
+    stop_false_positive_rate = fp / max(fp + tn, 1.0)
+    stop_accuracy = (tp + tn) / max(tp + fp + tn + fn, 1.0)
+    if dist_context.is_main and train_stop_head:
+        logger.info(
+            "  STOP head @ %.3f: precision=%.4f recall=%.4f FPR=%.4f "
+            "accuracy=%.4f TP=%d FP=%d TN=%d FN=%d",
+            stop_threshold,
+            stop_precision,
+            stop_recall,
+            stop_false_positive_rate,
+            stop_accuracy,
+            int(tp),
+            int(fp),
+            int(tn),
+            int(fn),
+        )
+    heatmap_component_metrics = {
+        f"hm_{key}": (
+            total_heatmap_components[index] / reduced_num_batches
+        ).item()
+        for index, key in enumerate(_HEATMAP_COMPONENT_KEYS)
+    }
     return {
         'total_loss': (totals[0] / reduced_num_batches).item(),
         'heatmap_loss': (totals[1] / reduced_num_batches).item(),
         'trajectory_loss': (totals[2] / reduced_num_batches).item(),
         'lm_loss': (totals[3] / reduced_num_batches).item(),
-        'l2_sp_loss': (totals[4] / reduced_num_batches).item(),
+        'stop_loss': (totals[4] / reduced_num_batches).item(),
+        'stop_precision': stop_precision,
+        'stop_recall': stop_recall,
+        'stop_false_positive_rate': stop_false_positive_rate,
+        'stop_accuracy': stop_accuracy,
+        'l2_sp_loss': (totals[5] / reduced_num_batches).item(),
+        'future_heatmap_loss': (totals[6] / reduced_num_batches).item(),
+        'preserve_loss': (totals[7] / reduced_num_batches).item(),
+        'delta_z_l2': (totals[8] / reduced_num_batches).item(),
+        'ppa_bridge_grad_norm': last_ppa_grad_norms['bridge'],
+        'ppa_future_grad_norm': last_ppa_grad_norms['future'],
+        'ppa_shared_map_grad_norm': last_ppa_grad_norms['shared_map'],
+        'stage0_equivalence_passed': float(stage0_equivalence_passed),
         'optimizer_steps': global_step,
+        **heatmap_component_metrics,
         **view_count_metrics,
     }
 
@@ -1196,6 +1626,43 @@ def _log_lora_diagnostics(
 # Internal: heatmap quality diagnostics logged to TensorBoard
 # ---------------------------------------------------------------------------
 
+def _heatmap_diagnostic_distribution(
+    output: dict,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Return sigmoid heatmaps and their spatial diagnostic distribution.
+
+    New HeatmapVLN paths expose the decoder's raw logits.  Using those logits
+    directly preserves values outside the numerically invertible sigmoid
+    range.  The logit(sigmoid) reconstruction remains only for legacy outputs.
+    """
+    pred_probabilities = _select_primary_heatmap_slice(
+        output["heatmaps"].detach()
+    ).unsqueeze(1)
+    raw_logits = output.get("heatmap_logits")
+    used_raw_logits = raw_logits is not None
+    if used_raw_logits:
+        spatial_logits = _select_primary_heatmap_slice(
+            raw_logits.detach()
+        ).unsqueeze(1).float()
+        if spatial_logits.shape != pred_probabilities.shape:
+            raise ValueError(
+                "Heatmap diagnostic raw-logit shape mismatch: "
+                f"logits={tuple(spatial_logits.shape)} "
+                f"probabilities={tuple(pred_probabilities.shape)}"
+            )
+    else:
+        spatial_logits = torch.logit(
+            pred_probabilities.float().clamp(1e-6, 1 - 1e-6)
+        )
+
+    batch_size, channels, height, width = spatial_logits.shape
+    distribution = torch.softmax(
+        spatial_logits.reshape(batch_size, channels, -1),
+        dim=-1,
+    ).reshape(batch_size, channels, height, width)
+    return pred_probabilities, distribution, used_raw_logits
+
+
 def _log_heatmap_diagnostics(
     output: dict,
     gt_heatmap: torch.Tensor,
@@ -1209,15 +1676,13 @@ def _log_heatmap_diagnostics(
     show_gpu_memory = cfg['log'].get('show_gpu_memory', False)
 
     if 'heatmaps' in output and output['heatmaps'] is not None:
-        pred_hm_raw = output['heatmaps'].detach()
-
-        pred_hm_raw = _select_primary_heatmap_slice(pred_hm_raw).unsqueeze(1)
+        pred_hm_raw, pred_hm, used_raw_logits = (
+            _heatmap_diagnostic_distribution(output)
+        )
         gt_hm_for_diag = gt_heatmap
         gt_hm_for_diag = _select_primary_heatmap_slice(gt_hm_for_diag)
 
         _B, _C, _H, _W = pred_hm_raw.shape
-        _logits = torch.logit(pred_hm_raw.float().clamp(1e-6, 1 - 1e-6))
-        pred_hm = torch.softmax(_logits.reshape(_B, _C, -1), dim=-1).reshape(_B, _C, _H, _W)
 
         pred_mean = pred_hm.mean().item()
         pred_max = pred_hm.max().item()
@@ -1235,7 +1700,11 @@ def _log_heatmap_diagnostics(
         uniform_baseline = 1.0 / (_H * _W)
         peak_ratio = pred_max / uniform_baseline if uniform_baseline > 0 else 0
         if show_gpu_memory:
-            logger.info(f"[DIAG-HM] softmax: max={pred_max:.6f} ({peak_ratio:.1f}× uniform), sig_max={sig_max:.4f}")
+            source = "raw_logits" if used_raw_logits else "legacy_logit_sigmoid"
+            logger.info(
+                f"[DIAG-HM] softmax({source}): max={pred_max:.6f} "
+                f"({peak_ratio:.1f}× uniform), sig_max={sig_max:.4f}"
+            )
             logger.info(f"[DIAG-HM] gt:      mean={gt_mean:.4f}, max={gt_max:.4f}")
             if peak_ratio < 2.0:
                 logger.warning(f"[DIAG-HM] ⚠️ softmax 分布接近均匀！peak_ratio={peak_ratio:.1f}×")

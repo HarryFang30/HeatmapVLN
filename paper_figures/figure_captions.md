@@ -1,0 +1,9 @@
+# Camera-ready Figure Captions
+
+## Figure A — Historical Spatial Grounding overview
+
+**Overview of Historical Spatial Grounding for navigation.** We preserve the frozen InternNav pathway: System-2 reasons over the instruction and front-view history/current RGB, optionally taking a look-down image in a second turn only when its first response requests `down`, while System-1 diffuses a continuous local trajectory that a geometric path follower converts to discrete actions. Because this pathway does not explicitly represent where historical observations lie in the current view, we add a front-only grounding branch. Frozen AMB3R-VO estimates causal relative motion, while a separate vision-only forward reuses the same frozen Qwen.visual weights as System-2 to extract current spatial features and history queries. A learned head predicts per-history directional heatmaps and visibility; a trainable structured tokenizer injects them into every frozen NextDiT block through zero-initialized gated cross-attention adapters.
+
+## Figure B — Historical Spatial Grounding module
+
+**Historical Spatial Grounding and System-1 injection.** For each of `K` historical front observations, causal poses from frozen AMB3R-VO and features from a separate forward through the shared frozen Qwen.visual weights are fused independently to predict heatmap logits of shape `K × 4 × 64 × 64` and visibility logits of shape `K × 4`, ordered Front/Right/Back/Left. Raw predictions, age, and validity are converted into `4K` structured tokens. In each frozen NextDiT block, the post-attention trajectory state queries these tokens through an independent cross-attention branch whose zero-initialized per-head gate adds a residual before the native FFN. Dashed arrows denote training-only supervision constructed from privileged geometry; it is absent at inference.

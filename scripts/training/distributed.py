@@ -109,6 +109,10 @@ def _get_supported_trainable_sync_modules(
         "nextdit_action_head",
         "latent_queries",
         "pano_latent_adapter",
+        "stop_head",
+        "future_heatmap_head",
+        "past_plan_bridge",
+        "heatmap_memory_and_decoder",
         *_NEXTDIT_SUBMODULE_KEYS,
     }
     unsupported = sorted(trainable - supported_trainable)
@@ -121,6 +125,18 @@ def _get_supported_trainable_sync_modules(
         )
 
     sync_modules: list[tuple[str, SyncModuleOrParam]] = []
+
+    ppa = getattr(model, "past_plan_action", None)
+    if "future_heatmap_head" in trainable:
+        if ppa is None or getattr(ppa, "future_head", None) is None:
+            raise RuntimeError("future_heatmap_head is trainable but the chain is disabled")
+        if any(param.requires_grad for param in ppa.future_head.parameters()):
+            sync_modules.append(("past_plan_action.future_head", ppa.future_head))
+    if "past_plan_bridge" in trainable:
+        if ppa is None or getattr(ppa, "bridge", None) is None:
+            raise RuntimeError("past_plan_bridge is trainable but the chain is disabled")
+        if any(param.requires_grad for param in ppa.bridge.parameters()):
+            sync_modules.append(("past_plan_action.bridge", ppa.bridge))
 
     if "llm_projector" in trainable and getattr(model, "llm_projector", None) is not None:
         if any(param.requires_grad for param in model.llm_projector.parameters()):
@@ -149,6 +165,15 @@ def _get_supported_trainable_sync_modules(
             module = getattr(model.heatmap_vln, attr_name, None)
             if module is not None and any(param.requires_grad for param in module.parameters()):
                 sync_modules.append((f"heatmap_vln.{attr_name}", module))
+    elif "heatmap_memory_and_decoder" in trainable:
+        if model.heatmap_vln is None:
+            raise RuntimeError(
+                "heatmap_memory_and_decoder is trainable but heatmap_vln is disabled"
+            )
+        for attr_name in ("coarse", "fine"):
+            module = getattr(model.heatmap_vln, attr_name, None)
+            if module is not None and any(param.requires_grad for param in module.parameters()):
+                sync_modules.append((f"heatmap_vln.{attr_name}", module))
 
     nah = getattr(model, "nextdit_action_head", None)
     if "nextdit_action_head" in trainable and nah is not None:
@@ -174,6 +199,13 @@ def _get_supported_trainable_sync_modules(
         if any(param.requires_grad for param in adapter.parameters()):
             sync_modules.append(("pano_latent_adapter", adapter))
 
+    if "stop_head" in trainable:
+        stop_head = getattr(model, "stop_head", None)
+        if stop_head is None:
+            raise RuntimeError("stop_head is trainable but the model has no STOP head module.")
+        if any(param.requires_grad for param in stop_head.parameters()):
+            sync_modules.append(("stop_head", stop_head))
+
     if not sync_modules:
         raise RuntimeError(
             "Distributed mode is enabled, but no supported trainable submodules were found for synchronization."
@@ -188,9 +220,25 @@ def _broadcast_trainable_tensor(tensor: torch.Tensor, src: int = 0) -> None:
 
 
 def _all_reduce_trainable_grad(param: torch.Tensor, world_size: int) -> None:
-    if param.requires_grad and param.grad is not None:
-        _dist_all_reduce_in_place(param.grad)
-        param.grad.div_(world_size)
+    if not param.requires_grad:
+        return
+
+    # Every rank must enqueue exactly the same collective sequence.  Heatmap
+    # losses are data-dependent (for example, a local batch can contain no
+    # visible target), so a trainable parameter may have ``grad is None`` on
+    # one rank while another rank produced a real gradient.  Skipping the
+    # all-reduce in that case shifts the collective order and eventually
+    # deadlocks NCCL.  A missing local contribution is mathematically zero;
+    # materialise it and participate in the same reduction on every rank.
+    grad = param.grad
+    if grad is None:
+        grad = torch.zeros_like(
+            param,
+            memory_format=torch.preserve_format,
+        )
+        param.grad = grad
+    _dist_all_reduce_in_place(grad)
+    grad.div_(world_size)
 
 
 def initialize_trainable_module_sync(

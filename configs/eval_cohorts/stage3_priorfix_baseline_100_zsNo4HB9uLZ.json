@@ -1,0 +1,706 @@
+{
+  "description": "Exact 100-episode cohort from the Stage3 priorfix baseline (SR=0.59, SPL=0.5180783053).",
+  "source_progress": "/mnt/afs/lixiaoou/intern/fjl/model/eval_stage3_r2r_val_unseen_full_11000_alllora_h1024_internnavcoords_priorfix_epoch2_100ep_no_privileged_stop/progress.json",
+  "episodes": [
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 1,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 37
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 2,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 57
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 3,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 45
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 13,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 500
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 14,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 160
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 15,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 65
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 25,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 105
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 26,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 189
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 27,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 96
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 37,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 96
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 38,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 149
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 39,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 393
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 40,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 93
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 41,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 69
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 42,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 73
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 52,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 109
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 53,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 100
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 54,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 101
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 55,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 67
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 56,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 89
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 57,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 77
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 73,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 137
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 74,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 61
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 75,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 500
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 85,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 109
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 86,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 53
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 87,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 49
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 124,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 77
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 125,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 61
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 126,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 69
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 136,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 41
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 137,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 49
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 138,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 37
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 145,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 41
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 146,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 51
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 147,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 40
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 154,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 53
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 155,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 65
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 156,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 97
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 163,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 116
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 164,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 500
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 165,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 217
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 235,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 69
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 236,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 81
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 237,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 81
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 247,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 81
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 248,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 401
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 249,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 500
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 250,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 53
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 251,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 25
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 252,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 41
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 253,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 65
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 254,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 137
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 255,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 49
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 292,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 121
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 293,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 63
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 294,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 57
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 301,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 137
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 302,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 339
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 303,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 93
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 352,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 73
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 353,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 77
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 354,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 92
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 361,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 95
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 362,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 133
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 363,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 45
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 367,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 73
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 368,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 73
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 369,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 100
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 385,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 301
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 386,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 125
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 387,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 106
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 415,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 117
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 416,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 133
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 417,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 109
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 418,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 69
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 419,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 61
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 420,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 81
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 439,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 49
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 440,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 121
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 441,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 53
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 445,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 59
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 446,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 65
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 447,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 61
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 475,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 104
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 476,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 73
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 477,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 68
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 505,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 64
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 506,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 117
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 507,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 117
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 514,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 57
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 515,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 73
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 516,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 500
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 544,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 89
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 545,
+      "baseline_success": false,
+      "baseline_os": false,
+      "baseline_steps": 80
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 546,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 49
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 571,
+      "baseline_success": false,
+      "baseline_os": true,
+      "baseline_steps": 68
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 572,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 63
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 573,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 69
+    },
+    {
+      "scene_id": "zsNo4HB9uLZ",
+      "episode_id": 628,
+      "baseline_success": true,
+      "baseline_os": true,
+      "baseline_steps": 41
+    }
+  ]
+}

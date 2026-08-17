@@ -31,6 +31,8 @@ from src.models.heatmap.input_constructor import (
 )
 from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
 
+from .future_trajectory_batch import stack_future_trajectory_targets
+
 IGNORE_INDEX = -100
 from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
 
@@ -103,9 +105,11 @@ class PanoramicTokenizedCollator:
         sft_protocol: str = "direct",
         structured_pano_output: bool = True,
         build_sft_labels: bool = True,
+        build_stop_head_targets: bool = False,
         max_seq_length: int = 8192,
         include_heatmap_targets: bool = True,
         include_history_rel_poses: bool = True,
+        include_future_heatmap_targets: bool = False,
         retain_raw_panoramic_views: bool = True,
         compute_pano_text_anchor_positions: bool = True,
         heatmap_layout: bool = False,
@@ -125,8 +129,14 @@ class PanoramicTokenizedCollator:
             raise ValueError(f"Unsupported System2 SFT protocol: {sft_protocol}")
         self.structured_pano_output = bool(structured_pano_output)
         self.build_sft_labels = bool(build_sft_labels)
+        self.build_stop_head_targets = bool(build_stop_head_targets)
+        if self.build_stop_head_targets and not self.build_sft_labels:
+            raise ValueError("STOP-head targets require build_sft_labels=True")
         self.include_heatmap_targets = bool(include_heatmap_targets)
         self.include_history_rel_poses = bool(include_history_rel_poses)
+        self.include_future_heatmap_targets = bool(
+            include_future_heatmap_targets
+        )
         self.retain_raw_panoramic_views = bool(retain_raw_panoramic_views)
         self.compute_pano_text_anchor_positions = bool(compute_pano_text_anchor_positions)
         self.heatmap_layout = bool(heatmap_layout)
@@ -410,6 +420,72 @@ class PanoramicTokenizedCollator:
 
         return labels
 
+    def _build_stop_head_supervision(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        sft_target_texts: list[list[str]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Locate the causal state that predicts the structured view class.
+
+        The returned position is the token immediately before ``stop/front/...``.
+        It therefore cannot attend to the class label or the later pixel target.
+        """
+        targets: list[float] = []
+        predictor_positions: list[int] = []
+        structured_classes = ("stop", "front", "right", "back", "left", "turn")
+        class_patterns = {
+            name: self.processor.tokenizer.encode(
+                f"view: {name}",
+                add_special_tokens=False,
+            )
+            for name in structured_classes
+        }
+        prefixes = {tuple(pattern[:-1]) for pattern in class_patterns.values()}
+        if (
+            any(len(pattern) != 3 for pattern in class_patterns.values())
+            or len(prefixes) != 1
+            or len({pattern[-1] for pattern in class_patterns.values()})
+            != len(structured_classes)
+        ):
+            raise RuntimeError(
+                "STOP head requires structured 'view: CLASS' tokenization with "
+                "one shared two-token prefix and one distinct class token"
+            )
+        for batch_idx, texts in enumerate(sft_target_texts):
+            if len(texts) != 1:
+                raise RuntimeError(
+                    "STOP-head supervision requires one structured assistant target per sample"
+                )
+            first_line = str(texts[0]).splitlines()[0].strip().lower()
+            if not first_line.startswith("view: "):
+                raise RuntimeError(
+                    f"STOP-head target must start with 'view: ', got {texts[0]!r}"
+                )
+            view_class = first_line.removeprefix("view: ").strip()
+            if view_class not in structured_classes:
+                raise RuntimeError(f"Unsupported STOP-head view class: {view_class!r}")
+            pattern = class_patterns[view_class]
+            row = input_ids[batch_idx].tolist()
+            start = self._find_last_subsequence(row, pattern)
+            if start < 0 or len(pattern) < 2:
+                raise RuntimeError(
+                    f"Could not locate structured class tokens {pattern} in sample {batch_idx}"
+                )
+            class_position = start + len(pattern) - 1
+            predictor_position = class_position - 1
+            if int(labels[batch_idx, class_position].item()) == IGNORE_INDEX:
+                raise RuntimeError(
+                    "STOP-head class token is not inside the assistant-label span: "
+                    f"sample={batch_idx} position={class_position} target={texts[0]!r}"
+                )
+            targets.append(1.0 if view_class == "stop" else 0.0)
+            predictor_positions.append(predictor_position)
+        return (
+            torch.tensor(targets, dtype=torch.float32),
+            torch.tensor(predictor_positions, dtype=torch.long),
+        )
+
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         self._call_count += 1
         do_log = (self._call_count <= 5) or (self._call_count % 25 == 0)
@@ -440,6 +516,8 @@ class PanoramicTokenizedCollator:
             else:
                 result["trajectory_valid"] = torch.tensor(trajectory_valid)
             result["progress"] = torch.tensor([sample.get("progress", 0.0) for sample in batch])
+        if self.include_future_heatmap_targets:
+            result.update(stack_future_trajectory_targets(batch))
         if self.include_history_rel_poses and "history_rel_poses" in batch[0]:
             result["history_rel_poses"] = self._stack_padded_first_dim(batch, "history_rel_poses")
         if "traj_images" in batch[0]:
@@ -450,6 +528,17 @@ class PanoramicTokenizedCollator:
             result["pano_view_id"] = [sample.get("pano_view_id") for sample in batch]
         if "pano_pixel_goal" in batch[0]:
             result["pano_pixel_goal"] = [sample.get("pano_pixel_goal") for sample in batch]
+        for metadata_key in (
+            "stop_rollout_key",
+            "system2_replay_role",
+            "system2_original_terminal",
+            "system2_oracle_stop_target",
+            "system2_stop_pair_id",
+        ):
+            if any(metadata_key in sample for sample in batch):
+                result[metadata_key] = [
+                    sample.get(metadata_key) for sample in batch
+                ]
 
         if do_log:
             rss1 = _rss_mb()
@@ -621,6 +710,14 @@ class PanoramicTokenizedCollator:
                     )
                 pano_inputs["labels"] = labels
                 result["sft_target_text"] = sft_target_texts
+                if self.build_stop_head_targets:
+                    stop_targets, stop_positions = self._build_stop_head_supervision(
+                        pano_inputs["input_ids"],
+                        labels,
+                        sft_target_texts,
+                    )
+                    result["system2_stop_target"] = stop_targets
+                    result["system2_stop_predictor_position"] = stop_positions
 
             pano_text_anchor_positions = None
             if not use_internnav and self.compute_pano_text_anchor_positions:
