@@ -96,10 +96,6 @@ from src.data.panoramic_tokenized_collator import (
 LOGGER = logging.getLogger("heatmap_joint_pilot")
 MODES = ("head-only", "heatmap-lora", "joint-rehearsal")
 REHEARSAL_OBJECTIVES = ("hard-ce", "correct-label-logprob-mse")
-SPARSE_CORRECT_LOGPROB_BACKENDS = (
-    "hf_logits_to_keep_tensor_predictor_union_v1",
-    "lm_head_pre_hook_predictor_union_v1",
-)
 LORA_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
 
 
@@ -843,12 +839,10 @@ def sft_correct_label_logprobs(
 ) -> tuple[torch.Tensor, int, list[int], dict[str, Any]]:
     """Return row-major correct-label log probabilities and strict alignment.
 
-    The integration computes only the union of predictor positions, using
-    either HF's native tensor ``logits_to_keep`` API or a temporary input-slice
-    pre-hook on the physical conditional-generation LM head for Transformers
-    4.51. It then evaluates correct-label log probabilities in FP32. This
-    wrapper independently reconstructs shifted-label alignment from the
-    collator output and refuses any mismatch.
+    The integration computes only the union of predictor positions via HF's
+    tensor ``logits_to_keep`` API, then evaluates the correct-label log
+    probabilities in FP32.  This wrapper independently reconstructs the
+    shifted-label alignment from the collator output and refuses any mismatch.
     """
     if isinstance(samples, dict):
         samples = [samples]
@@ -898,7 +892,7 @@ def sft_correct_label_logprobs(
             f"expected={expected} reported={reported_semantic}"
         )
     backend = reported.get("backend")
-    if backend not in SPARSE_CORRECT_LOGPROB_BACKENDS:
+    if backend != "hf_logits_to_keep_tensor_predictor_union_v1":
         raise RuntimeError(f"Correct-label preservation requires the explicit sparse-logits backend, got {backend!r}")
     alignment_sha256 = _canonical_json_sha256(expected)
     telemetry = {
@@ -908,17 +902,6 @@ def sft_correct_label_logprobs(
         "predictor_position_union": reported.get("predictor_position_union"),
         "returned_logits_shape": reported.get("returned_logits_shape"),
         "returned_logprob_dtype": reported.get("returned_logprob_dtype"),
-        "conditional_generation_module": reported.get(
-            "conditional_generation_module"
-        ),
-        "lm_head_module": reported.get("lm_head_module"),
-        "native_logits_to_keep_explicit_signature": reported.get(
-            "native_logits_to_keep_explicit_signature"
-        ),
-        "lm_head_hook_call_count": reported.get("lm_head_hook_call_count"),
-        "lm_head_input_shape_before": reported.get("lm_head_input_shape_before"),
-        "lm_head_input_shape_after": reported.get("lm_head_input_shape_after"),
-        "lm_head_hook_removed": reported.get("lm_head_hook_removed"),
     }
     return (
         logprobs,
@@ -954,8 +937,6 @@ def precompute_teacher_correct_logprob_cache(
     and every module's possibly mixed train/eval flag are restored exactly so
     caching cannot perturb the optimization trajectory.
     """
-    if not planned_batches:
-        raise ValueError("Teacher correct-label cache requires planned batches")
     cuda_rng_devices = (
         [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
     )
@@ -1035,7 +1016,7 @@ def precompute_teacher_correct_logprob_cache(
                 )
                 value_sha256 = _fp32_tensor_sha256(teacher_values)
                 record_identity = {
-                    "schema": "task4_teacher_correct_logprob_record_v2",
+                    "schema": "task4_teacher_correct_logprob_record_v1",
                     "step": step,
                     "epoch": int(batch.epoch),
                     "start_position": int(batch.start_position),
@@ -1044,7 +1025,6 @@ def precompute_teacher_correct_logprob_cache(
                     "label_tokens": int(label_tokens),
                     "sample_label_tokens": sample_label_tokens,
                     "alignment_sha256": alignment["alignment_sha256"],
-                    "backend": alignment["backend"],
                     "values_sha256": value_sha256,
                 }
                 record_sha256 = _canonical_json_sha256(record_identity)
@@ -1070,20 +1050,12 @@ def precompute_teacher_correct_logprob_cache(
         raise RuntimeError("Teacher cache failed to restore RNG state exactly")
     if modes_after != modes_before:
         raise RuntimeError("Teacher cache failed to restore model modes exactly")
-    backend_counts = Counter(record["backend"] for record in records)
-    if len(backend_counts) != 1:
-        raise RuntimeError(
-            "Teacher cache changed sparse-logits backend across planned batches: "
-            f"{dict(backend_counts)}"
-        )
     cache_identity = {
-        "schema": "task4_teacher_correct_logprob_cache_v2",
+        "schema": "task4_teacher_correct_logprob_cache_v1",
         "source_lora_sha256": source_lora_sha256,
         "record_count": len(records),
         "planned_sample_count": sum(len(record["dataset_indices"]) for record in records),
         "total_label_tokens": sum(record["label_tokens"] for record in records),
-        "sparse_backend": next(iter(backend_counts)),
-        "backend_counts": dict(sorted(backend_counts.items())),
         "record_sha256": [record["record_sha256"] for record in records],
     }
     cache_sha256 = _canonical_json_sha256(cache_identity)
@@ -1985,7 +1957,6 @@ def main() -> int:
                         "label_tokens",
                         "sample_label_tokens",
                         "alignment_sha256",
-                        "backend",
                         "values_sha256",
                     )
                 }
@@ -2022,12 +1993,6 @@ def main() -> int:
                         )
                         if student_alignment["alignment_sha256"] != teacher_record["alignment_sha256"]:
                             raise RuntimeError(f"Student/teacher correct-label alignment hash mismatch at step={step}")
-                        if student_alignment["backend"] != teacher_record["backend"]:
-                            raise RuntimeError(
-                                "Student/teacher sparse-logits backend mismatch at "
-                                f"step={step}: student={student_alignment['backend']} "
-                                f"teacher={teacher_record['backend']}"
-                            )
                         difference = student_logprobs.float() - teacher_logprobs
                         preservation_loss = difference.square().mean(dtype=torch.float32)
                         weighted_preservation_loss = args.rehearsal_weight * preservation_loss
@@ -2064,7 +2029,6 @@ def main() -> int:
                 accumulate_explicit_gradients(trainable_lora, explicit_gradients)
                 rehearsal_objective_loss_value = float(preservation_loss.detach().item())
                 preservation_telemetry = {
-                    "sparse_backend": student_alignment["backend"],
                     "teacher_cache_record_sha256": teacher_record["record_sha256"],
                     "teacher_alignment_sha256": teacher_record["alignment_sha256"],
                     "student_alignment_sha256": student_alignment["alignment_sha256"],
@@ -2387,9 +2351,7 @@ def main() -> int:
             "sft_stream_algorithm": sft_stream_contract["algorithm"],
             "sft_loss_reduction": sft_loss_reduction,
             "correct_label_logprob_backend": (
-                None
-                if teacher_cache_contract is None
-                else teacher_cache_contract["sparse_backend"]
+                None if teacher_cache_contract is None else "hf_logits_to_keep_tensor_predictor_union_v1"
             ),
         },
         "train_log": train_log,

@@ -316,7 +316,7 @@ def build_explicit_dataset(
         enable_augmentation=False,
         samples_per_clip=8,
         clip_level_sampling=False,
-        load_history_frames=True,
+        load_single_view_history_frames=True,
         max_clips=0,
         max_clip_id=max_clip_id,
         selection_records=records,

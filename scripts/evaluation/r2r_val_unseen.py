@@ -324,14 +324,9 @@ if not hasattr(argparse, "BooleanOptionalAction"):
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-from scripts.evaluation.closed_loop_guard import (
-    STOP_ACCEPT,
-    STOP_PROBE,
-    ClosedLoopGuard,
-    ClosedLoopGuardConfig,
-)
 from scripts.evaluation.navigation_metrics import aggregate_navigation_metrics
 from scripts.evaluation.rpc_protocol import (
+    HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1,
     HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED,
     HEATMAPVLN_RPC_PROTOCOL_VERSION,
     HEATMAPVLN_RPC_SAMPLING_FIELD,
@@ -341,6 +336,7 @@ from scripts.evaluation.rpc_protocol import (
     validate_rpc_progress_sampling_contract,
     validate_rpc_sampling_metadata,
 )
+from src.utils.trajectory_direction import pano_recenter_turn
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
 _INPUT_CONSTRUCTOR_SPEC = importlib.util.spec_from_file_location(
@@ -696,6 +692,11 @@ def _predict_force_teacher_coord(
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
+RPC_POLICY_HEATMAPVLN = "heatmapvln"
+RPC_POLICY_INTERNNAV_NATIVE = "internnav_native"
+NATIVE_INTERNNAV_RPC_METHOD = "plan_native_internnav"
+NATIVE_INTERNNAV_CAPABILITY = "internnav-native-joint-front-history-lookdown-v1"
+NATIVE_INTERNNAV_LOOKDOWN_SIZE = (640, 480)
 DEFAULT_SCENES_DIR = "data/scene_data/mp3d_ce"
 DEFAULT_DATA_PATH = "data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -731,50 +732,6 @@ class ActionCode(IntEnum):
     RIGHT = 3
     LOOKUP = 4
     LOOKDOWN = 5
-
-
-def _closed_loop_guard_config(args) -> ClosedLoopGuardConfig:
-    action_chunk_size = int(args.rpc_action_chunk_size)
-    if action_chunk_size > MAX_LOCAL_STEPS:
-        raise ValueError(
-            f"rpc_action_chunk_size must be <= {MAX_LOCAL_STEPS}, got {action_chunk_size}"
-        )
-    if int(args.closed_loop_recovery_history_keep) < 0:
-        raise ValueError("closed_loop_recovery_history_keep must be >= 0")
-    return ClosedLoopGuardConfig(
-        action_chunk_size=action_chunk_size,
-        stop_confirmations=int(args.system2_stop_confirmations),
-        stop_probe_turn=str(args.system2_stop_probe_turn),
-        loop_guard_enabled=bool(args.closed_loop_guard),
-        collision_epsilon_m=float(args.closed_loop_collision_epsilon_m),
-        collision_forward_limit=int(args.closed_loop_collision_forward_limit),
-        motion_window_steps=int(args.closed_loop_motion_window_steps),
-        motion_min_path_m=float(args.closed_loop_motion_min_path_m),
-        motion_max_net_m=float(args.closed_loop_motion_max_net_m),
-        plan_window_calls=int(args.closed_loop_plan_window_calls),
-        plan_view_dominance=float(args.closed_loop_plan_view_dominance),
-        plan_min_path_m=float(args.closed_loop_plan_min_path_m),
-        plan_max_net_m=float(args.closed_loop_plan_max_net_m),
-        recovery_turns=int(args.closed_loop_recovery_turns),
-        recovery_cooldown_steps=int(args.closed_loop_recovery_cooldown_steps),
-    )
-
-
-def _agent_position(env) -> tuple[float, float, float]:
-    state = env._sim.get_agent(0).get_state()
-    position = np.asarray(state.position, dtype=np.float64)
-    if position.shape != (3,) or not np.isfinite(position).all():
-        raise RuntimeError(f"Invalid agent position from Habitat: {position!r}")
-    return float(position[0]), float(position[1]), float(position[2])
-
-
-def _trim_recovery_history(
-    history: list[dict[str, Image.Image]],
-    keep: int,
-) -> list[dict[str, Image.Image]]:
-    if keep <= 0:
-        return []
-    return history[-keep:]
 
 
 def _normalize_instruction(instruction: str) -> str:
@@ -1015,6 +972,102 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         print(f"Verified first scene asset: {Path(args.scenes_dir) / first_scene_id}")
 
 
+_HARD_ALLOWED_FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+
+
+def _require_path_under_fjl(value: str, *, label: str, base: Path | None = None) -> Path:
+    raw = Path(value)
+    if not raw.is_absolute():
+        raw = (base or _PROJECT_ROOT) / raw
+    resolved = raw.resolve(strict=False)
+    allowed = _HARD_ALLOWED_FJL_ROOT.resolve(strict=True)
+    if resolved != allowed and allowed not in resolved.parents:
+        raise ValueError(f"{label} must stay under {allowed}, got {resolved}")
+    return resolved
+
+
+def _preflight_trajectory_dagger_args(args) -> None:
+    if not bool(getattr(args, "collect_trajectory_dagger", False)):
+        return
+    if str(args.dataset_split) != "train":
+        raise ValueError("Trajectory DAgger collection is train-only")
+    if not args.rpc_server:
+        raise ValueError("Trajectory DAgger collection requires --rpc_server")
+    if not bool(args.rpc_require_deterministic_sampling):
+        raise ValueError("Trajectory DAgger collection requires deterministic RPC sampling")
+    if bool(getattr(args, "oracle_system2", False)) or float(args.auto_stop_distance) > 0.0:
+        raise ValueError("DAgger learner rollout forbids oracle System2 and privileged auto-stop")
+    if str(getattr(args, "rpc_policy_mode", RPC_POLICY_HEATMAPVLN)) == RPC_POLICY_INTERNNAV_NATIVE:
+        if bool(args.pano_recenter_before_system1):
+            raise ValueError(
+                "Native InternNav DAgger must preserve the original joint "
+                "System2/System1 policy"
+            )
+        if any(
+            (
+                args.checkpoint,
+                args.base_checkpoint,
+                args.pano_latent_adapter_checkpoint,
+            )
+        ):
+            raise ValueError(
+                "Native InternNav DAgger forbids external Stage1/Stage3/adapter checkpoints"
+            )
+        if bool(args.force_teacher_coord):
+            raise ValueError("Native InternNav DAgger forbids a separate teacher override")
+        rpc_fingerprint = str(args.rpc_policy_fingerprint).strip()
+        if not rpc_fingerprint:
+            raise ValueError("--rpc_policy_fingerprint is required for native InternNav")
+        if rpc_fingerprint != str(args.trajectory_dagger_policy_fingerprint).strip():
+            raise ValueError(
+                "Native RPC and DAgger policy fingerprints must be identical"
+            )
+    if bool(args.save_trajectory_steps) or int(args.debug_save_input_images) > 0:
+        raise ValueError("DAgger collection forbids duplicate trajectory/debug image dumps")
+    if not str(args.trajectory_dagger_policy_fingerprint).strip():
+        raise ValueError("--trajectory_dagger_policy_fingerprint is required")
+    max_gb = float(args.trajectory_dagger_max_gb)
+    if not math.isfinite(max_gb) or not 5.0 < max_gb <= 300.0:
+        raise ValueError("--trajectory_dagger_max_gb must be in (5, 300]")
+    if int(args.trajectory_dagger_round) < 0:
+        raise ValueError("--trajectory_dagger_round must be >= 0")
+    normal_quota = int(args.trajectory_dagger_normal_quota)
+    hard_quota = int(args.trajectory_dagger_hard_quota)
+    if normal_quota < 0 or hard_quota < 0 or normal_quota + hard_quota == 0:
+        raise ValueError("DAgger episode quotas must be non-negative and not both zero")
+    if not 1 <= int(args.trajectory_dagger_jpeg_quality) <= 95:
+        raise ValueError("--trajectory_dagger_jpeg_quality must be in [1, 95]")
+    offpath = float(args.trajectory_dagger_hard_offpath_m)
+    if not math.isfinite(offpath) or offpath <= 0.0:
+        raise ValueError("--trajectory_dagger_hard_offpath_m must be finite and > 0")
+    if int(args.trajectory_dagger_max_oracle_actions) <= 0:
+        raise ValueError("--trajectory_dagger_max_oracle_actions must be > 0")
+    min_history = int(args.trajectory_dagger_min_history)
+    if min_history < 2 or int(args.num_history) < min_history:
+        raise ValueError("DAgger requires num_history >= trajectory_dagger_min_history >= 2")
+
+    args.config = str(_require_path_under_fjl(args.config, label="config"))
+    args.data_path = str(_require_path_under_fjl(args.data_path, label="data_path"))
+    args.scenes_dir = str(_require_path_under_fjl(args.scenes_dir, label="scenes_dir"))
+    args.output_path = str(_require_path_under_fjl(args.output_path, label="output_path"))
+    args.trajectory_dagger_root = str(
+        _require_path_under_fjl(args.trajectory_dagger_root, label="trajectory_dagger_root")
+    )
+    if args.episode_list:
+        args.episode_list = str(_require_path_under_fjl(args.episode_list, label="episode_list"))
+    data_path = Path(args.data_path)
+    if "train" not in data_path.parts or data_path.name != "train.json.gz":
+        raise ValueError(f"DAgger requires the canonical R2R train annotation, got {data_path}")
+    collection_root = Path(args.trajectory_dagger_root)
+    output_root = Path(args.output_path)
+    if (
+        collection_root == output_root
+        or collection_root in output_root.parents
+        or output_root in collection_root.parents
+    ):
+        raise ValueError("Evaluation output and DAgger collection roots must be disjoint")
+
+
 def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
     """Read a checkpoint and return the tensor state dict it contains."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -1219,26 +1272,6 @@ def _load_progress(
     return sucs, spls, oss, nes, done_set
 
 
-def _load_closed_loop_progress_totals(progress_file: str) -> tuple[int, int]:
-    if not os.path.exists(progress_file):
-        return 0, 0
-    rows: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
-    with open(progress_file) as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if "scene_id" not in row or "episode_id" not in row:
-                continue
-            rows[(str(row["scene_id"]), int(row["episode_id"]))] = row
-    stop_probes = sum(int(row.get("closed_loop_stop_probes", 0) or 0) for row in rows.values())
-    recoveries = 0
-    for row in rows.values():
-        value = row.get("closed_loop_recoveries", [])
-        recoveries += len(value) if isinstance(value, list) else int(value or 0)
-    return stop_probes, recoveries
-
-
 def _load_episode_list(path: str) -> tuple[list[tuple[str, int]], set[tuple[str, int]]]:
     """Load fixed (scene_id, episode_id) pairs for apples-to-apples comparison."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1282,7 +1315,7 @@ def build_habitat_config(args):
     cfg.defrost()
 
     cfg.DATASET.TYPE = "R2RVLN-v1"
-    cfg.DATASET.SPLIT = "val_unseen"
+    cfg.DATASET.SPLIT = str(getattr(args, "dataset_split", "val_unseen"))
     cfg.DATASET.SCENES_DIR = args.scenes_dir
     cfg.DATASET.DATA_PATH = args.data_path
 
@@ -1353,24 +1386,112 @@ def build_habitat_config(args):
     return cfg
 
 
+def _habitat_episode_key(episode: Any) -> tuple[str, int]:
+    scene_id = Path(str(episode.scene_id)).stem
+    return scene_id, int(episode.episode_id)
+
+
+def _create_habitat_env(hab_cfg, args):
+    """Create Habitat Env after applying an exact fixed cohort, if supplied.
+
+    Filtering the dataset before Env construction follows the VLN-CE
+    collection pattern and avoids reset/reconfigure cycles through thousands
+    of non-target train episodes. The ordered composite-key check compensates
+    for Habitat filters that otherwise operate on episode_id alone.
+    """
+    target_list, _ = _episode_list_from_args(args)
+    if target_list is None:
+        return habitat.Env(config=hab_cfg)
+
+    if len(target_list) != len(set(target_list)):
+        raise ValueError("Fixed episode list contains duplicate (scene_id, episode_id) keys")
+    dataset = habitat.make_dataset(
+        id_dataset=hab_cfg.DATASET.TYPE,
+        config=hab_cfg.DATASET,
+    )
+    episodes_by_key: dict[tuple[str, int], Any] = {}
+    for episode in dataset.episodes:
+        key = _habitat_episode_key(episode)
+        if key in episodes_by_key:
+            raise ValueError(f"Dataset contains duplicate episode key: {key}")
+        episodes_by_key[key] = episode
+
+    missing = [key for key in target_list if key not in episodes_by_key]
+    if missing:
+        raise ValueError(
+            f"Fixed episode list contains keys absent from the configured dataset: {missing[:10]}"
+        )
+    dataset.episodes = [episodes_by_key[key] for key in target_list]
+    env = habitat.Env(config=hab_cfg, dataset=dataset)
+    actual = [_habitat_episode_key(episode) for episode in env.episodes]
+    if actual != target_list:
+        env.close()
+        raise RuntimeError("Habitat fixed-cohort order changed during Env construction")
+    print(
+        f"Habitat dataset filtered before Env construction: {len(actual)} ordered episodes",
+        flush=True,
+    )
+    return env
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 4: Agent pose tracking
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def get_agent_cam2world(env) -> np.ndarray:
-    """Extract a 4x4 camera-to-world matrix from the Habitat agent state.
+def get_agent_cam2world(env, *, require_rgb_sensor: bool = False) -> np.ndarray:
+    """Extract the RGB camera-to-world matrix from the Habitat agent state.
 
     Habitat convention: Y-up, agent faces -Z.
     The returned matrix matches the format used by the training data
     (``compute_history_rel_poses`` / ``get_trajectory_relative_to_frame``).
+
+    The R2R panoramic training data stores the RGB *sensor* pose, whose
+    translation includes the configured sensor height.  Using the agent body
+    pose here silently introduces a vertical offset (1.25 m in the current
+    VLN-CE config). Generic evaluation can fall back for old Habitat builds,
+    while trajectory DAgger sets ``require_rgb_sensor`` and fails closed.
     """
     sim = env._sim
     agent = sim.get_agent(0)
-    state = agent.get_state()
-    rot_mat = quaternion.as_rotation_matrix(state.rotation)  # 3×3
+    agent_state = agent.get_state()
+    pose_state = agent_state
+
+    sensor_states = getattr(agent_state, "sensor_states", None) or {}
+    found_rgb_sensor = False
+    for sensor_key in (
+        "rgb",
+        "RGB_SENSOR",
+        "color_sensor",
+        "rgb_sensor",
+    ):
+        if sensor_key in sensor_states:
+            pose_state = sensor_states[sensor_key]
+            found_rgb_sensor = True
+            break
+    if require_rgb_sensor and not found_rgb_sensor:
+        raise RuntimeError(
+            "trajectory DAgger requires an explicit RGB sensor pose; "
+            f"available sensor states={sorted(sensor_states)}"
+        )
+
+    rot_mat = quaternion.as_rotation_matrix(pose_state.rotation)  # 3×3
     T = np.eye(4, dtype=np.float32)
     T[:3, :3] = rot_mat
+    T[:3, 3] = pose_state.position
+    return T
+
+
+def get_agent_body_pose(env) -> np.ndarray:
+    """Return the agent-body pose used for navigation and simulator stepping.
+
+    This must stay separate from ``get_agent_cam2world``: observations use
+    the elevated RGB sensor pose, while a shadow rollout must reset the body
+    pose or it would lift the agent by the sensor height.
+    """
+    state = env._sim.get_agent(0).get_state()
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = quaternion.as_rotation_matrix(state.rotation)
     T[:3, 3] = state.position
     return T
 
@@ -1486,16 +1607,21 @@ def _eval_image_sizes(train_cfg: dict) -> tuple[tuple[int, int], tuple[int, int]
     return vlm_size, traj_size
 
 
+def _sample_history_indices(history_length: int, num_history: int) -> list[int]:
+    """Return the exact history indices used by the RPC prompt."""
+    if num_history <= 0:
+        return []
+    if history_length <= num_history:
+        return list(range(history_length))
+    return np.unique(np.linspace(0, history_length - 1, num_history, dtype=np.int32)).tolist()
+
+
 def _sample_history_panoramas(
     history_panoramas: list[dict[str, Image.Image]],
     num_history: int,
 ) -> list[dict[str, Image.Image]]:
     """Sample prompt history without mutating the full executed trajectory."""
-    if num_history <= 0:
-        return []
-    if len(history_panoramas) <= num_history:
-        return list(history_panoramas)
-    indices = np.unique(np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)).tolist()
+    indices = _sample_history_indices(len(history_panoramas), num_history)
     return [history_panoramas[i] for i in indices]
 
 
@@ -1511,12 +1637,13 @@ def _condition_output_ids_for_pixel_goal(
 ) -> torch.Tensor:
     """Use System1-compatible coordinate text in latent conditioning."""
     parsed = parse_structured_pano_output(llm_output, image_size=None)
+    has_generated_suffix = output_ids.ndim == 2 and output_ids.shape[1] > int(prompt_len)
     use_structured = structured_output or parsed.kind == "pixel"
     if use_structured:
         resolved_view = (view_id or parsed.view_id or "front").lower()
         desired_text = structured_condition_text(resolved_view, pixel_goal)
         generated_text = (llm_output or "").strip()
-        if generated_text == desired_text:
+        if generated_text == desired_text and has_generated_suffix:
             return output_ids
         print(
             f"  [debug] System1 structured coordinate text: {desired_text!r}",
@@ -1532,7 +1659,7 @@ def _condition_output_ids_for_pixel_goal(
         else:
             raise ValueError(f"Unsupported coord_order: {coord_order}")
 
-        if len(coord) >= 2 and [coord[0], coord[1]] == desired:
+        if len(coord) >= 2 and [coord[0], coord[1]] == desired and has_generated_suffix:
             return output_ids
 
         coord_text = f"{desired[0]} {desired[1]}"
@@ -2315,7 +2442,7 @@ def _run_eval_panoramic_vlm(
         )
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
-    env = habitat.Env(config=hab_cfg)
+    env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
@@ -2944,6 +3071,9 @@ def _run_eval_panoramic_vlm(
                         _last_traj_hs = _maybe_apply_pano_latent_adapter(
                             _last_traj_hs,
                             pano_latent_adapter,
+                            view_id=pano_goal_view,
+                            pixel_goal=pixel_goal,
+                            image_size=vlm_image_size,
                             cond_projector=model.nextdit_action_head.cond_projector
                             if model.nextdit_action_head is not None
                             else None,
@@ -3370,6 +3500,10 @@ def _rpc_plan_panoramic(
     system2_call_index: int,
     protocol_seed: int,
     require_deterministic_sampling: bool,
+    rpc_policy_mode: str = RPC_POLICY_HEATMAPVLN,
+    expected_policy_fingerprint: str = "",
+    phase: str = "joint",
+    pixel_goal: list[int] | None = None,
     oracle_system2: dict[str, Any] | None = None,
 ) -> dict:
     blobs = []
@@ -3396,11 +3530,29 @@ def _rpc_plan_panoramic(
         "trajectory_x_sign": trajectory_x_sign,
         "trajectory_heading_alignment": trajectory_heading_alignment,
         "require_deterministic_sampling": bool(require_deterministic_sampling),
+        "phase": str(phase),
         HEATMAPVLN_RPC_SAMPLING_FIELD: sampling_metadata,
     }
+    if pixel_goal is not None:
+        payload["pixel_goal"] = [int(pixel_goal[0]), int(pixel_goal[1])]
     if oracle_system2 is not None:
         payload["oracle_system2"] = oracle_system2
-    result = client.infer_json("plan_panoramic", payload, blobs)
+    if rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE:
+        if str(phase) != "joint":
+            raise ValueError("Native InternNav supports only the original joint planning call")
+        if not str(expected_policy_fingerprint).strip():
+            raise ValueError("Native InternNav RPC requires an expected policy fingerprint")
+        payload.update(
+            {
+                "policy_backend": RPC_POLICY_INTERNNAV_NATIVE,
+                "policy_fingerprint": str(expected_policy_fingerprint),
+                "native_protocol": NATIVE_INTERNNAV_CAPABILITY,
+            }
+        )
+        rpc_method = NATIVE_INTERNNAV_RPC_METHOD
+    else:
+        rpc_method = "plan_panoramic"
+    result = client.infer_json(rpc_method, payload, blobs)
     if result is None:
         raise RuntimeError("RPC model server returned no response")
     response, _response_blobs = result
@@ -3412,6 +3564,116 @@ def _rpc_plan_panoramic(
             f"server={response.get('proto_v')!r} "
             f"expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
         )
+    requested_phase = str(phase)
+    if response.get("phase") != requested_phase:
+        raise RuntimeError(
+            "RPC response phase mismatch: "
+            f"request={requested_phase!r} response={response.get('phase')!r}"
+        )
+    response_kind = str(response.get("kind") or "")
+    allowed_kinds = {
+        "system2": {"pano_goal", "stop", "turn", "fallback_stop"},
+        "front_system1": {"trajectory", "fallback_stop"},
+    }
+    if requested_phase in allowed_kinds and response_kind not in allowed_kinds[requested_phase]:
+        raise RuntimeError(
+            "RPC response kind is invalid for phase: "
+            f"phase={requested_phase!r} kind={response_kind!r}"
+        )
+    if rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE:
+        native_expected = {
+            "policy_backend": RPC_POLICY_INTERNNAV_NATIVE,
+            "policy_fingerprint": str(expected_policy_fingerprint),
+            "native_protocol": NATIVE_INTERNNAV_CAPABILITY,
+            "native_front_only": True,
+            "native_checkpoint_only": True,
+            "system2_source": "internnav_native",
+            "system1_source": "internnav_native_nextdit_async",
+            "oracle_system2": None,
+            "pano_goal_view": "front",
+        }
+        native_mismatches = {
+            key: {"expected": expected, "actual": response.get(key)}
+            for key, expected in native_expected.items()
+            if response.get(key) != expected
+        }
+        if native_mismatches:
+            raise RuntimeError(
+                f"Native InternNav response provenance mismatch: {native_mismatches}"
+            )
+        if response_kind not in {
+            "trajectory",
+            "stop",
+            "native_actions",
+            "fallback_stop",
+        }:
+            raise RuntimeError(
+                f"Invalid native InternNav response kind: {response_kind!r}"
+            )
+        lookdown_turns = response.get("native_lookdown_turns")
+        if (
+            isinstance(lookdown_turns, bool)
+            or not isinstance(lookdown_turns, int)
+            or lookdown_turns not in (0, 1)
+        ):
+            raise RuntimeError(
+                f"Invalid native InternNav lookdown-turn count: {lookdown_turns!r}"
+            )
+        if response_kind == "trajectory":
+            native_actions = response.get("actions")
+            if (
+                not isinstance(native_actions, list)
+                or not native_actions
+                or any(
+                    isinstance(action, bool)
+                    or not isinstance(action, int)
+                    or action not in (0, 1, 2, 3)
+                    for action in native_actions
+                )
+            ):
+                raise RuntimeError(
+                    f"Invalid native InternNav System1 action chunk: {native_actions!r}"
+                )
+            trajectory_expected = {
+                "trajectory_x_sign": 1.0,
+                "trajectory_heading_alignment": "none",
+            }
+            trajectory_mismatches = {
+                key: {"expected": expected, "actual": response.get(key)}
+                for key, expected in trajectory_expected.items()
+                if response.get(key) != expected
+            }
+            if trajectory_mismatches or not response.get("trajectory_summary"):
+                raise RuntimeError(
+                    "Native InternNav System1 provenance mismatch: "
+                    f"fields={trajectory_mismatches} "
+                    f"summary={response.get('trajectory_summary')!r}"
+                )
+    if requested_phase == "front_system1":
+        expected_pixel = (
+            [int(pixel_goal[0]), int(pixel_goal[1])]
+            if isinstance(pixel_goal, (list, tuple)) and len(pixel_goal) >= 2
+            else None
+        )
+        actual_pixel = response.get("pixel_goal")
+        if expected_pixel is None or actual_pixel != expected_pixel:
+            raise RuntimeError(
+                "front_system1 pixel echo mismatch: "
+                f"request={expected_pixel!r} response={actual_pixel!r}"
+            )
+        if response.get("pano_goal_view") != "front":
+            raise RuntimeError(
+                "front_system1 must return pano_goal_view='front', got "
+                f"{response.get('pano_goal_view')!r}"
+            )
+        if (
+            response_kind == "trajectory"
+            and response.get("trajectory_heading_alignment") != "none"
+        ):
+            raise RuntimeError(
+                "front_system1 trajectory must disable second heading alignment, got "
+                f"{response.get('trajectory_heading_alignment')!r}"
+            )
     response_sampling = validate_rpc_sampling_metadata(
         response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
         require_deterministic=True,
@@ -3424,6 +3686,44 @@ def _rpc_plan_panoramic(
     return response
 
 
+def _stage0_action_trace_entry(
+    response: dict[str, Any],
+    *,
+    system2_call_index: int,
+    phase: str,
+) -> dict[str, Any] | None:
+    """Keep the exact cross-arm evidence needed by the Stage-0 hard gate."""
+
+    arm = response.get("ppa_stage0_action_arm")
+    if arm not in {"baseline", "treatment"}:
+        return None
+    spec = response.get("treatment_spec")
+    if spec is not None and not isinstance(spec, dict):
+        raise RuntimeError("PPA Stage-0 response has invalid TreatmentSpec")
+    if response.get("kind") == "trajectory" and not isinstance(spec, dict):
+        raise RuntimeError("PPA Stage-0 trajectory response omitted TreatmentSpec")
+    sampling = response.get(HEATMAPVLN_RPC_SAMPLING_FIELD)
+    if not isinstance(sampling, dict):
+        raise RuntimeError("PPA Stage-0 response omitted deterministic sampling")
+    return {
+        "schema": "heatmapvln-ppa-stage0-call-trace-v1",
+        "arm": str(arm),
+        "phase": str(phase),
+        "system2_call_index": int(system2_call_index),
+        "sampling": dict(sampling),
+        "kind": str(response.get("kind", "")),
+        "llm_output": str(response.get("llm_output", "")),
+        "pixel_goal": response.get("pixel_goal"),
+        "pano_goal_view": response.get("pano_goal_view"),
+        "actions": [int(action) for action in response.get("actions", [])],
+        "anti_deadlock": bool(response.get("anti_deadlock", False)),
+        "bridge_memory_source": str(
+            response.get("ppa_stage0_bridge_memory_source", "")
+        ),
+        "treatment_spec": dict(spec) if isinstance(spec, dict) else None,
+    }
+
+
 def run_eval_rpc_panoramic(args):
     """Run Habitat in this process and send model inference to RPC server."""
     import yaml
@@ -3433,28 +3733,72 @@ def run_eval_rpc_panoramic(args):
     with open(args.config) as f:
         train_cfg = yaml.safe_load(f)
     panoramic_vlm_input = bool(train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False))
-    if not panoramic_vlm_input:
+    ppa_stage0_config = bool(
+        train_cfg.get("model", {}).get("past_plan_action", {}).get("enabled", False)
+    )
+    if not panoramic_vlm_input and not ppa_stage0_config:
         raise RuntimeError("--rpc_server currently supports panoramic_vlm_input configs only")
+    if ppa_stage0_config and not panoramic_vlm_input:
+        print(
+            "[rpc-eval] PPA Stage-0 uses the native InternNav independent-front "
+            "System2 protocol; allowing panoramic_vlm_input=false for this "
+            "exact-zero action gate.",
+            flush=True,
+        )
 
     vlm_image_size, traj_image_size = _eval_image_sizes(train_cfg)
     image_size = vlm_image_size
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     system1_coord_order = _system1_coord_order(args, panoramic_internnav_protocol=False)
+    rpc_policy_mode = str(args.rpc_policy_mode)
+    native_internnav_rpc = rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE
+    trajectory_cfg = train_cfg.get("data", {}).get("trajectory", {})
+    rpc_internnav_two_turn = (
+        str(trajectory_cfg.get("system2_sft_protocol", "direct")).lower()
+        == "internnav"
+        and not bool(trajectory_cfg.get("structured_pano_output", True))
+    )
+    rpc_policy_fingerprint = str(args.rpc_policy_fingerprint).strip()
+
+    if native_internnav_rpc:
+        native_options = {
+            "vlm_image_size": (vlm_image_size, (384, 384)),
+            "traj_image_size": (traj_image_size, (224, 224)),
+            "num_history<=8": (num_history <= 8, True),
+            "system1_coord_order": (system1_coord_order, "generated"),
+            "trajectory_selection": (args.trajectory_selection, "mean"),
+            "trajectory_x_sign": (float(args.trajectory_x_sign), 1.0),
+            "trajectory_heading_alignment": (
+                args.trajectory_heading_alignment,
+                "none",
+            ),
+            "pano_recenter_before_system1": (
+                bool(args.pano_recenter_before_system1),
+                False,
+            ),
+            "oracle_system2": (bool(args.oracle_system2), False),
+        }
+        native_mismatches = {
+            key: {"expected": expected, "actual": actual}
+            for key, (actual, expected) in native_options.items()
+            if actual != expected
+        }
+        if native_mismatches:
+            raise ValueError(
+                f"Native InternNav RPC option mismatch: {native_mismatches}"
+            )
+        if not rpc_policy_fingerprint:
+            raise ValueError(
+                "--rpc_policy_fingerprint is required for native InternNav RPC"
+            )
 
     print(f"Using RPC model server: {args.rpc_server}")
+    print(f"rpc_policy_mode={rpc_policy_mode}")
     print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
     print(f"trajectory_selection={args.trajectory_selection}")
     print(f"trajectory_x_sign={args.trajectory_x_sign:g}")
     print(f"trajectory_heading_alignment={args.trajectory_heading_alignment}")
-    guard_config = _closed_loop_guard_config(args)
-    print(
-        "closed_loop_policy="
-        f"action_chunk={guard_config.action_chunk_size} "
-        f"stop_confirmations={guard_config.stop_confirmations} "
-        f"stop_probe_turn={guard_config.stop_probe_turn} "
-        f"loop_guard={guard_config.loop_guard_enabled}"
-    )
     print(
         "rpc_sampling="
         f"{HEATMAPVLN_RPC_SAMPLING_PROTOCOL} "
@@ -3483,22 +3827,208 @@ def run_eval_rpc_panoramic(args):
             raise RuntimeError(
                 f"RPC server protocol mismatch: server={info.version!r} expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
             )
+        if native_internnav_rpc:
+            expected_model_version = f"internnav-native-r2r:{rpc_policy_fingerprint}"
+            if info.model_version != expected_model_version:
+                raise RuntimeError(
+                    "Native InternNav RPC model fingerprint mismatch: "
+                    f"server={info.model_version!r} "
+                    f"expected={expected_model_version!r}"
+                )
+            if NATIVE_INTERNNAV_CAPABILITY not in set(info.supported_formats):
+                raise RuntimeError(
+                    "Native InternNav RPC capability is missing: "
+                    f"{NATIVE_INTERNNAV_CAPABILITY!r}; "
+                    f"server formats={sorted(set(info.supported_formats))!r}"
+                )
+        if bool(args.pano_recenter_before_system1):
+            supported_formats = set(info.supported_formats)
+            if HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1 not in supported_formats:
+                raise RuntimeError(
+                    "RPC server lacks required two-phase recenter capability: "
+                    f"{HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1!r}; "
+                    f"server formats={sorted(supported_formats)!r}"
+                )
+    elif native_internnav_rpc:
+        raise RuntimeError(
+            "Native InternNav RPC server did not return auditable ServerInfo"
+        )
+    elif bool(args.pano_recenter_before_system1):
+        raise RuntimeError(
+            "RPC server did not return ServerInfo; two-phase recenter capability "
+            "cannot be verified"
+        )
 
     hab_cfg = build_habitat_config(args)
+    habitat_turn_angle_deg = float(hab_cfg.SIMULATOR.TURN_ANGLE)
+    print(
+        "pano_recenter_before_system1="
+        f"{bool(args.pano_recenter_before_system1)} "
+        f"habitat_turn_angle_deg={habitat_turn_angle_deg:g}"
+    )
     print("Creating Habitat environment ...")
-    env = habitat.Env(config=hab_cfg)
+    env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
+
+    dagger_api = None
+    dagger_state = None
+    dagger_collector = None
+    dagger_backend = None
+    dagger_oracle_config = None
+    if bool(getattr(args, "collect_trajectory_dagger", False)):
+        import scripts.evaluation.trajectory_dagger as dagger_api
+
+        trajectory_cfg = train_cfg.get("data", {}).get("trajectory", {})
+        predict_horizon = int(trajectory_cfg.get("predict_horizon", 32))
+        action_scale = float(trajectory_cfg.get("action_scale", 4.0))
+        if predict_horizon != 32:
+            raise ValueError(f"DAgger schema requires predict_horizon=32, got {predict_horizon}")
+        hard_capacity_bytes = int(round(float(args.trajectory_dagger_max_gb) * 1_000_000_000))
+        commit_ceiling_bytes = hard_capacity_bytes - 5_000_000_000
+        dagger_thresholds = dagger_api.CandidateThresholds(
+            hard_offpath_m=float(args.trajectory_dagger_hard_offpath_m),
+            normal_offpath_m=min(0.5, 0.5 * float(args.trajectory_dagger_hard_offpath_m)),
+        )
+        contract = {
+            "schema": "heatmapvln-trajectory-dagger-contract-v3",
+            "dataset_split": str(args.dataset_split),
+            "data_path": str(args.data_path),
+            "data_sha256": dagger_api.sha256_file(args.data_path),
+            "episode_cohort": {
+                "path": str(Path(args.episode_list).resolve()) if args.episode_list else None,
+                "sha256": dagger_api.sha256_file(args.episode_list) if args.episode_list else None,
+                "max_episodes": int(args.max_episodes) if args.max_episodes is not None else None,
+            },
+            "scenes_dir": str(args.scenes_dir),
+            "config_path": str(Path(args.config).resolve()),
+            "config_sha256": dagger_api.sha256_file(args.config),
+            "collector_code_sha256": dagger_api.sha256_file(dagger_api.__file__),
+            "evaluator_code_sha256": dagger_api.sha256_file(__file__),
+            "policy_fingerprint": str(args.trajectory_dagger_policy_fingerprint),
+            "rpc_policy_mode": rpc_policy_mode,
+            "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+            "native_protocol": (
+                NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+            ),
+            "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+            "rpc_protocol_seed": int(args.rpc_protocol_seed),
+            "rpc_model_version": getattr(info, "model_version", None),
+            "round_id": int(args.trajectory_dagger_round),
+            "rollout": {
+                "max_steps_per_episode": int(max_steps_per_episode),
+                "max_system2_calls_per_episode": int(args.max_system2_calls_per_episode),
+                "action_chunk_execution": (
+                    "internnav_native_traj_to_actions_max4_v1"
+                    if native_internnav_rpc
+                    else "native_discrete_sequence_v1"
+                ),
+            },
+            "observation": {
+                "view_order": list(dagger_api.VIEW_NAMES),
+                "vlm_image_size": list(vlm_image_size),
+                "lookdown_image_size": list(
+                    NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                    if native_internnav_rpc
+                    else traj_image_size
+                ),
+                "system1_lookdown_image_size": list(traj_image_size),
+                "jpeg_quality": int(args.trajectory_dagger_jpeg_quality),
+                "num_history": int(num_history),
+                "history_sampler": "endpoint_linspace_unique_v1",
+            },
+            "target": {
+                "predict_horizon": predict_horizon,
+                "action_scale": action_scale,
+                "camera_forward_axis": "-z",
+            },
+            "oracle": {
+                "algorithm": "monotonic_xyz_route_shadow_follower_v2",
+                "max_actions": int(args.trajectory_dagger_max_oracle_actions),
+                "goal_radius_m": 0.25,
+                "hard_offpath_m": float(args.trajectory_dagger_hard_offpath_m),
+            },
+            "candidate_classifier": {
+                "algorithm": "same_primitive_prefix_route_geometry_heading_v3",
+                "hard_offpath_m": dagger_thresholds.hard_offpath_m,
+                "normal_offpath_m": dagger_thresholds.normal_offpath_m,
+                "hard_disagreement_m": dagger_thresholds.hard_disagreement_m,
+                "normal_disagreement_m": dagger_thresholds.normal_disagreement_m,
+                "history_overlap_threshold": dagger_thresholds.history_overlap_threshold,
+                "oracle_nonoverlap_threshold": dagger_thresholds.oracle_nonoverlap_threshold,
+                "history_radius_m": dagger_thresholds.history_radius_m,
+                "wrong_branch_progress_regression_m": (
+                    dagger_thresholds.wrong_branch_progress_regression_m
+                ),
+                "wrong_branch_offpath_growth_m": (
+                    dagger_thresholds.wrong_branch_offpath_growth_m
+                ),
+                "turn_only_translation_m": dagger_thresholds.turn_only_translation_m,
+                "normal_heading_disagreement_deg": (
+                    dagger_thresholds.normal_heading_disagreement_deg
+                ),
+                "hard_heading_disagreement_deg": (
+                    dagger_thresholds.hard_heading_disagreement_deg
+                ),
+            },
+            "candidate_quotas": {
+                "normal_per_episode": int(args.trajectory_dagger_normal_quota),
+                "hard_per_episode": int(args.trajectory_dagger_hard_quota),
+                "min_history": int(args.trajectory_dagger_min_history),
+            },
+            "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+        }
+        dagger_state = dagger_api.prepare_collection(
+            args.trajectory_dagger_root,
+            contract,
+            resume=bool(args.resume),
+            hard_capacity_bytes=hard_capacity_bytes,
+            commit_ceiling_bytes=commit_ceiling_bytes,
+            verify_commits=False,
+        )
+        dagger_collector = dagger_api.TrajectoryDaggerCollector(
+            dagger_api.EpisodeTarRecorder(dagger_state),
+            max_normal_per_episode=int(args.trajectory_dagger_normal_quota),
+            max_hard_per_episode=int(args.trajectory_dagger_hard_quota),
+            thresholds=dagger_thresholds,
+        )
+        dagger_backend = dagger_api.HabitatShadowBackend(
+            env._sim,
+            goal_radius=0.25,
+        )
+        dagger_oracle_config = dagger_api.OracleRelabelConfig(
+            predict_horizon=predict_horizon,
+            action_scale=action_scale,
+            max_actions=int(args.trajectory_dagger_max_oracle_actions),
+            camera_forward_axis="-z",
+        )
+        print(
+            "[trajectory-dagger] ready "
+            f"root={dagger_state.root} committed={len(dagger_state.committed_episode_keys)} "
+            f"capacity={hard_capacity_bytes} ceiling={commit_ceiling_bytes}",
+            flush=True,
+        )
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
     target_list, target_set = _episode_list_from_args(args)
-    sucs, spls, oss, nes, done_set = _load_progress(
-        progress_file,
-        expected_rpc_sampling_contract=build_rpc_progress_sampling_contract(
+    rpc_progress_contract = {
+        **build_rpc_progress_sampling_contract(
             protocol_seed=int(args.rpc_protocol_seed),
             require_deterministic_sampling=bool(args.rpc_require_deterministic_sampling),
         ),
+        "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+        "rpc_policy_mode": rpc_policy_mode,
+        "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+        "native_protocol": (
+            NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+        ),
+        "habitat_turn_angle_deg": habitat_turn_angle_deg,
+    }
+    sucs, spls, oss, nes, done_set = _load_progress(
+        progress_file,
+        expected_rpc_sampling_contract=rpc_progress_contract,
     )
     if target_set is not None and not done_set.issubset(target_set):
         unexpected = sorted(done_set - target_set)
@@ -3512,7 +4042,6 @@ def run_eval_rpc_panoramic(args):
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
     eval_count = 0
-    total_stop_probes, total_recoveries = _load_closed_loop_progress_totals(progress_file)
 
     while True:
         process_bar.set_postfix(
@@ -3539,22 +4068,58 @@ def run_eval_rpc_panoramic(args):
         eval_count += 1
         print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
 
+        dagger_episode_key = None
+        dagger_episode_active = False
+        dagger_route_tracker = None
+        dagger_observation_cache: dict[int, Any] = {}
+        dagger_episode_commit = None
+        dagger_candidate_counts = {"dagger_normal": 0, "dagger_hard": 0, "discard": 0}
+        dagger_candidate_diagnostics: list[dict[str, Any]] = []
+        if dagger_collector is not None:
+            dagger_episode_key = (
+                f"round{int(args.trajectory_dagger_round):02d}_{scene_id}_{episode_id:06d}"
+            )
+            dagger_episode_active = dagger_episode_key not in dagger_state.committed_episode_keys
+            if dagger_episode_active:
+                dagger_goal = np.asarray(episode.goals[0].position, dtype=np.float32)
+                dagger_reference_path = _episode_reference_path(episode) or [dagger_goal.tolist()]
+                dagger_route_tracker = dagger_api.MonotonicRouteTracker(dagger_reference_path)
+                dagger_start_camera_pose = get_agent_cam2world(env, require_rgb_sensor=True)
+                dagger_start_agent_pose = get_agent_body_pose(env)
+                dagger_route_tracker.observe(dagger_start_agent_pose[:3, 3])
+                dagger_collector.begin_episode(
+                    dagger_episode_key,
+                    {
+                        "dataset_split": str(args.dataset_split),
+                        "round_id": int(args.trajectory_dagger_round),
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "instruction": instruction,
+                        "reference_path": dagger_reference_path,
+                        "goal_position": dagger_goal,
+                        "start_pose": dagger_start_camera_pose,
+                        "start_agent_pose": dagger_start_agent_pose,
+                    },
+                )
+            else:
+                print(
+                    f"  [trajectory-dagger] already committed: {dagger_episode_key}",
+                    flush=True,
+                )
+
         executed_history_panoramas: list[dict[str, Image.Image]] = []
+        executed_history_poses: list[np.ndarray] = []
+        executed_history_steps: list[int] = []
+        executed_history_call_indices: list[int] = []
         local_actions: list[int] = []
         forward_action_count = 0
         system2_calls = 0
         trajectory_calls = 0
+        stage0_action_trace: list[dict[str, Any]] = []
+        recenter_calls = 0
+        recenter_actions_executed = 0
         step_id = 0
         done = False
-        stop_probes = 0
-        recovery_reasons: list[str] = []
-        closed_loop_guard = ClosedLoopGuard(
-            guard_config,
-            forward_action=int(ActionCode.FORWARD),
-            left_action=int(ActionCode.LEFT),
-            right_action=int(ActionCode.RIGHT),
-        )
-        closed_loop_guard.reset_episode(_agent_position(env))
 
         step_recorder: TrajectoryStepRecorder | None = None
         if args.save_trajectory_steps:
@@ -3595,6 +4160,13 @@ def run_eval_rpc_panoramic(args):
             if local_actions:
                 current_views = capture_panoramic_views(env, image_size=image_size)
                 executed_history_panoramas.append(current_views)
+                executed_history_poses.append(
+                    get_agent_cam2world(
+                        env, require_rgb_sensor=dagger_collector is not None
+                    )
+                )
+                executed_history_steps.append(step_id)
+                executed_history_call_indices.append(max(system2_calls - 1, -1))
                 action = int(local_actions.pop(0))
                 forward_action_count += 1
                 if forward_action_count > MAX_STEPS:
@@ -3606,10 +4178,8 @@ def run_eval_rpc_panoramic(args):
                     local_actions = []
                     forward_action_count = 0
                     continue
-                before_position = _agent_position(env)
                 before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                 observations, done = _apply_habitat_action(env, action)
-                after_position = _agent_position(env)
                 if before is not None:
                     print(
                         f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
@@ -3624,25 +4194,6 @@ def run_eval_rpc_panoramic(args):
                     action=int(action),
                     image_size=image_size,
                 )
-                recovery = closed_loop_guard.observe_action(
-                    action,
-                    before_position,
-                    after_position,
-                )
-                if recovery is not None and not done:
-                    recovery_reasons.append(recovery.reason)
-                    local_actions = list(recovery.actions)
-                    forward_action_count = 0
-                    executed_history_panoramas = _trim_recovery_history(
-                        executed_history_panoramas,
-                        int(args.closed_loop_recovery_history_keep),
-                    )
-                    print(
-                        "  [guard] recovery: "
-                        f"reason={recovery.reason} actions={list(recovery.actions)} "
-                        f"history={len(executed_history_panoramas)}",
-                        flush=True,
-                    )
                 continue
 
             max_system2_calls = int(getattr(args, "max_system2_calls_per_episode", 0) or 0)
@@ -3664,7 +4215,8 @@ def run_eval_rpc_panoramic(args):
                 continue
 
             current_views = capture_panoramic_views(env, image_size=image_size)
-            prompt_history = _sample_history_panoramas(executed_history_panoramas, num_history)
+            prompt_history_indices = _sample_history_indices(len(executed_history_panoramas), num_history)
+            prompt_history = [executed_history_panoramas[i] for i in prompt_history_indices]
             if _debug_input_trace_enabled(args):
                 print(
                     "  [debug] RPC System2 input: "
@@ -3673,8 +4225,22 @@ def run_eval_rpc_panoramic(args):
                     f"{_views_trace_summary(current_views)}",
                     flush=True,
                 )
-            lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+            lookdown_img = capture_lookdown_view(
+                env,
+                image_size=(
+                    NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                    if native_internnav_rpc
+                    else (vlm_image_size if rpc_internnav_two_turn else traj_image_size)
+                ),
+            )
             executed_history_panoramas.append(current_views)
+            executed_history_poses.append(
+                get_agent_cam2world(
+                    env, require_rgb_sensor=dagger_collector is not None
+                )
+            )
+            executed_history_steps.append(step_id)
+            executed_history_call_indices.append(system2_calls)
             system2_calls += 1
             oracle_system2 = None
             if bool(getattr(args, "oracle_system2", False)):
@@ -3717,11 +4283,20 @@ def run_eval_rpc_panoramic(args):
                 system2_call_index=system2_calls - 1,
                 protocol_seed=args.rpc_protocol_seed,
                 require_deterministic_sampling=args.rpc_require_deterministic_sampling,
+                rpc_policy_mode=rpc_policy_mode,
+                expected_policy_fingerprint=rpc_policy_fingerprint,
+                phase="system2" if args.pano_recenter_before_system1 else "joint",
                 oracle_system2=oracle_system2,
             )
+            stage0_entry = _stage0_action_trace_entry(
+                response,
+                system2_call_index=system2_calls - 1,
+                phase="system2" if args.pano_recenter_before_system1 else "joint",
+            )
+            if stage0_entry is not None:
+                stage0_action_trace.append(stage0_entry)
             llm_output = response.get("llm_output", "")
-            raw_actions = [int(action) for action in response.get("actions", [])]
-            actions = closed_loop_guard.limit_actions(raw_actions)
+            actions = [int(action) for action in response.get("actions", [])]
             print(
                 f"  step_id: {step_id}, RPC kind={response.get('kind')}, VLM output: {llm_output}",
                 flush=True,
@@ -3729,13 +4304,11 @@ def run_eval_rpc_panoramic(args):
             if response.get("trajectory_summary"):
                 trajectory_calls += 1
                 print(
-                    f"  [debug] trajectory {response['trajectory_summary']}, actions={raw_actions}",
+                    f"  [debug] trajectory {response['trajectory_summary']}, actions={actions}",
                     flush=True,
                 )
-                if actions != raw_actions:
-                    print(f"  [guard] action chunk: {raw_actions} -> {actions}", flush=True)
-            elif raw_actions:
-                print(f"  [debug] actions={raw_actions}", flush=True)
+            elif actions:
+                print(f"  [debug] actions={actions}", flush=True)
 
             if step_recorder is not None:
                 state = env._sim.get_agent(0).get_state()
@@ -3758,35 +4331,327 @@ def run_eval_rpc_panoramic(args):
                     }
                 )
 
-            terminal = bool(response.get("terminal", False))
-            stop_decision = closed_loop_guard.observe_system2_terminal(terminal)
-            if terminal and stop_decision == STOP_PROBE:
-                action = closed_loop_guard.next_stop_probe_action()
-                before_position = _agent_position(env)
-                observations, done = _apply_habitat_action(env, action)
-                after_position = _agent_position(env)
-                closed_loop_guard.observe_action(action, before_position, after_position)
-                step_id += 1
-                stop_probes += 1
+            if args.pano_recenter_before_system1 and response.get("kind") == "pano_goal":
+                selected_view = str(response.get("pano_goal_view") or "front").lower()
+                selected_pixel = response.get("pixel_goal")
+                if not isinstance(selected_pixel, list) or len(selected_pixel) < 2:
+                    raise RuntimeError(f"System2 pano_goal response has invalid pixel_goal: {response}")
+                turn_direction, turn_count = pano_recenter_turn(
+                    selected_view,
+                    turn_angle_deg=habitat_turn_angle_deg,
+                )
+                turn_action = (
+                    ActionCode.LEFT if turn_direction == "left" else ActionCode.RIGHT
+                )
+                alignment_actions = [] if turn_direction is None else [int(turn_action)] * turn_count
+                recenter_calls += int(bool(alignment_actions))
                 print(
-                    "  [guard] unconfirmed System2 STOP; "
-                    f"probe_action={int(action)} vote={stop_probes}",
+                    "  [pano-recenter] "
+                    f"selected_view={selected_view} pixel={selected_pixel[:2]} "
+                    f"direction={turn_direction or 'none'} turns={turn_count}",
                     flush=True,
                 )
-                _record_post_action_step(
-                    step_recorder,
-                    env,
-                    step_id=step_id,
-                    phase="rpc_stop_probe",
-                    action=int(action),
-                    image_size=image_size,
-                    vlm_output=llm_output,
-                )
-                continue
 
-            if terminal:
-                if stop_decision != STOP_ACCEPT:
-                    raise RuntimeError(f"Unexpected STOP guard decision: {stop_decision!r}")
+                for alignment_action in alignment_actions:
+                    if done or step_id >= max_steps_per_episode:
+                        break
+                    before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
+                    observations, done = _apply_habitat_action(env, alignment_action)
+                    step_id += 1
+                    recenter_actions_executed += 1
+                    if before is not None:
+                        print(
+                            f"  [debug] pano recenter action={alignment_action} "
+                            f"{before} -> {_env_trace_summary(env)}",
+                            flush=True,
+                        )
+                    _record_post_action_step(
+                        step_recorder,
+                        env,
+                        step_id=step_id,
+                        phase="pano_recenter",
+                        action=int(alignment_action),
+                        image_size=image_size,
+                        vlm_output=llm_output,
+                    )
+
+                if done or step_id >= max_steps_per_episode:
+                    continue
+
+                if alignment_actions:
+                    current_views = capture_panoramic_views(env, image_size=image_size)
+                    lookdown_img = capture_lookdown_view(
+                        env,
+                        image_size=(
+                            NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                            if native_internnav_rpc
+                            else (
+                                vlm_image_size
+                                if rpc_internnav_two_turn
+                                else traj_image_size
+                            )
+                        ),
+                    )
+                    # Record only the completed cardinal turn. Intermediate 15°
+                    # frames must not evict semantic history panoramas.
+                    executed_history_panoramas.append(current_views)
+                    executed_history_poses.append(
+                        get_agent_cam2world(
+                            env, require_rgb_sensor=dagger_collector is not None
+                        )
+                    )
+                    executed_history_steps.append(step_id)
+                    executed_history_call_indices.append(system2_calls - 1)
+                response = _rpc_plan_panoramic(
+                    client,
+                    instruction=instruction,
+                    current_views=current_views,
+                    # A physical in-place turn changes heading, not location.
+                    # Reuse exactly the phase-1 history so side/back requests
+                    # do not receive an extra same-location pre-turn pano that
+                    # front requests never see.
+                    history_panoramas=prompt_history,
+                    lookdown_img=lookdown_img,
+                    vlm_image_size=vlm_image_size,
+                    traj_image_size=traj_image_size,
+                    system1_coord_order=system1_coord_order,
+                    trajectory_selection=args.trajectory_selection,
+                    trajectory_x_sign=args.trajectory_x_sign,
+                    trajectory_heading_alignment="none",
+                    jpeg_quality=args.rpc_jpeg_quality,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    system2_call_index=system2_calls - 1,
+                    protocol_seed=args.rpc_protocol_seed,
+                    require_deterministic_sampling=args.rpc_require_deterministic_sampling,
+                    rpc_policy_mode=rpc_policy_mode,
+                    expected_policy_fingerprint=rpc_policy_fingerprint,
+                    phase="front_system1",
+                    pixel_goal=[int(selected_pixel[0]), int(selected_pixel[1])],
+                )
+                stage0_entry = _stage0_action_trace_entry(
+                    response,
+                    system2_call_index=system2_calls - 1,
+                    phase="front_system1",
+                )
+                if stage0_entry is not None:
+                    stage0_action_trace.append(stage0_entry)
+                llm_output = response.get("llm_output", "")
+                actions = [int(action) for action in response.get("actions", [])]
+                print(
+                    f"  step_id: {step_id}, RPC phase=front_system1 "
+                    f"kind={response.get('kind')}, condition={llm_output}",
+                    flush=True,
+                )
+                if response.get("trajectory_summary"):
+                    trajectory_calls += 1
+                    print(
+                        f"  [debug] trajectory {response['trajectory_summary']}, actions={actions}",
+                        flush=True,
+                    )
+                if step_recorder is not None:
+                    state = env._sim.get_agent(0).get_state()
+                    pos = np.array(state.position, dtype=float)
+                    rot = quaternion.as_float_array(state.rotation)
+                    step_recorder.record_step(
+                        {
+                            "step_id": step_id,
+                            "phase": "rpc_front_system1",
+                            "position": pos,
+                            "heading_deg": _quat_to_heading_deg(rot),
+                            "rotation": rot,
+                            "distance_to_goal": _metric_distance_to_goal(env),
+                            "vlm_output": llm_output,
+                            "pixel_goal": response.get("pixel_goal"),
+                            "pano_goal_view": response.get("pano_goal_view"),
+                            HEATMAPVLN_RPC_SAMPLING_FIELD: response.get(
+                                HEATMAPVLN_RPC_SAMPLING_FIELD
+                            ),
+                            "current_views": current_views,
+                        }
+                    )
+
+            if (
+                dagger_episode_active
+                and response.get("kind") == "trajectory"
+                and dagger_route_tracker is not None
+            ):
+                history_lengths = {
+                    len(executed_history_panoramas),
+                    len(executed_history_poses),
+                    len(executed_history_steps),
+                    len(executed_history_call_indices),
+                }
+                if len(history_lengths) != 1:
+                    raise RuntimeError(f"DAgger history buffers are misaligned: {history_lengths}")
+                current_frame_id = len(executed_history_panoramas) - 1
+                if current_frame_id < 0:
+                    raise RuntimeError("DAgger trajectory candidate has no current observation")
+                current_camera_pose = executed_history_poses[current_frame_id]
+                current_agent_pose = get_agent_body_pose(env)
+                route_observation = dagger_route_tracker.observe(current_agent_pose[:3, 3])
+                if len(prompt_history_indices) < int(args.trajectory_dagger_min_history):
+                    dagger_candidate_counts["discard"] += 1
+                else:
+                    native_actions = [int(action) for action in response.get("actions", [])]
+                    native_future_poses = dagger_backend.simulate_actions(
+                        native_actions,
+                        start_pose=current_agent_pose,
+                        max_actions=int(args.trajectory_dagger_max_oracle_actions),
+                    )
+                    oracle = dagger_api.relabel_with_shadow_oracle(
+                        dagger_backend,
+                        route_tracker=dagger_route_tracker,
+                        current_pose=current_agent_pose,
+                        route_progress_m=route_observation.progress_m,
+                        goal_position=np.asarray(episode.goals[0].position, dtype=np.float32),
+                        config=dagger_oracle_config,
+                    )
+                    history_pose_array = np.stack(
+                        [executed_history_poses[index] for index in prompt_history_indices]
+                    ).astype(np.float32)
+                    native_nonstop = [action for action in native_actions if action != int(ActionCode.STOP)]
+                    native_xz = native_future_poses[:, :3, 3][:, [0, 2]]
+                    native_travel_m = float(
+                        np.linalg.norm(np.diff(native_xz, axis=0), axis=1).sum()
+                    )
+                    collision_or_stuck = bool(
+                        int(ActionCode.FORWARD) in native_nonstop and native_travel_m < 0.05
+                    )
+                    native_turns = [
+                        action
+                        for action in native_nonstop
+                        if action in (int(ActionCode.LEFT), int(ActionCode.RIGHT))
+                    ]
+                    oscillation = bool(
+                        len(native_turns) >= 3
+                        and all(
+                            native_turns[index] != native_turns[index - 1]
+                            for index in range(1, len(native_turns))
+                        )
+                    )
+                    older_poses = executed_history_poses[:-5]
+                    loop_detected = False
+                    if older_poses and route_observation.progress_delta_m <= 0.25:
+                        older_xz = np.stack(older_poses)[:, :3, 3][:, [0, 2]]
+                        current_xz = current_agent_pose[:3, 3][[0, 2]]
+                        loop_detected = bool(
+                            float(np.linalg.norm(older_xz - current_xz, axis=1).min()) <= 0.35
+                        )
+                    signals = dagger_collector.build_signals(
+                        dagger_route_tracker,
+                        current_agent_pose,
+                        history_pose_array,
+                        native_future_poses,
+                        oracle,
+                        native_kind="trajectory",
+                        route_progress_delta_m=route_observation.progress_delta_m,
+                        loop_detected=loop_detected,
+                        oscillation_detected=oscillation,
+                        collision_or_stuck=collision_or_stuck,
+                    )
+
+                    def _encoded_dagger_observation(
+                        frame_id: int,
+                        *,
+                        current_lookdown: Image.Image | None = None,
+                    ):
+                        cached = dagger_observation_cache.get(frame_id)
+                        if cached is not None and (
+                            current_lookdown is None or cached.lookdown_jpeg is not None
+                        ):
+                            return cached
+                        encoded = dagger_api.encode_history_observation(
+                            frame_id=frame_id,
+                            pose=executed_history_poses[frame_id],
+                            views=executed_history_panoramas[frame_id],
+                            primitive_step=executed_history_steps[frame_id],
+                            system2_call_index=executed_history_call_indices[frame_id],
+                            lookdown_image=current_lookdown,
+                            jpeg_quality=int(args.trajectory_dagger_jpeg_quality),
+                        )
+                        dagger_observation_cache[frame_id] = encoded
+                        return encoded
+
+                    current_observation = _encoded_dagger_observation(
+                        current_frame_id,
+                        current_lookdown=lookdown_img,
+                    )
+                    history_observations = [
+                        _encoded_dagger_observation(index)
+                        for index in prompt_history_indices
+                    ]
+                    sample_key = (
+                        f"{dagger_episode_key}:call{system2_calls - 1:04d}:"
+                        f"step{step_id:04d}"
+                    )
+                    selection = dagger_collector.consider(
+                        sample_key=sample_key,
+                        current=current_observation,
+                        history=history_observations,
+                        instruction=instruction,
+                        native_response=response,
+                        oracle=oracle,
+                        signals=signals,
+                        metadata={
+                            "round_id": int(args.trajectory_dagger_round),
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "system2_call_index": system2_calls - 1,
+                            "primitive_step": step_id,
+                            "route_raw_progress_m": route_observation.raw_progress_m,
+                            "route_progress_m": route_observation.progress_m,
+                            "route_progress_delta_m": route_observation.progress_delta_m,
+                            "offpath_m": route_observation.offpath_m,
+                            "current_camera_pose": current_camera_pose,
+                            "current_agent_pose": current_agent_pose,
+                            "native_future_poses": native_future_poses,
+                            "native_travel_m": native_travel_m,
+                        },
+                    )
+                    dagger_candidate_counts[selection.bucket] = (
+                        dagger_candidate_counts.get(selection.bucket, 0) + 1
+                    )
+                    dagger_candidate_diagnostics.append(
+                        {
+                            "key": sample_key,
+                            "bucket": selection.bucket,
+                            "tags": list(selection.tags),
+                            "hardness_score": float(selection.hardness_score),
+                            "offpath_m": float(signals.offpath_m),
+                            "native_endpoint_offpath_m": float(
+                                signals.native_endpoint_offpath_m
+                            ),
+                            "native_route_progress_delta_m": float(
+                                signals.native_route_progress_delta_m
+                            ),
+                            "native_oracle_disagreement_m": float(
+                                signals.native_oracle_disagreement
+                            ),
+                            "native_oracle_heading_disagreement_deg": float(
+                                signals.native_oracle_heading_disagreement_deg
+                            ),
+                            "native_history_overlap": float(
+                                signals.native_history_overlap
+                            ),
+                            "oracle_history_overlap": float(
+                                signals.oracle_history_overlap
+                            ),
+                        }
+                    )
+                    print(
+                        "  [trajectory-dagger] "
+                        f"candidate={sample_key} bucket={selection.bucket} "
+                        f"tags={','.join(selection.tags) or '-'} "
+                        f"offpath={signals.offpath_m:.2f} "
+                        f"endpoint_offpath={signals.native_endpoint_offpath_m:.2f} "
+                        f"native_progress_delta={signals.native_route_progress_delta_m:.2f} "
+                        f"disagreement={signals.native_oracle_disagreement:.2f} "
+                        f"heading={signals.native_oracle_heading_disagreement_deg:.1f}",
+                        flush=True,
+                    )
+
+            if response.get("terminal", False):
                 action = actions[0] if actions else ActionCode.STOP
                 observations, done = _apply_habitat_action(env, action)
                 step_id += 1
@@ -3798,26 +4663,6 @@ def run_eval_rpc_panoramic(args):
                     action=int(action),
                     image_size=image_size,
                     vlm_output=llm_output,
-                )
-                continue
-
-            plan_recovery = closed_loop_guard.observe_plan(
-                response.get("pano_goal_view"),
-                _agent_position(env),
-            )
-            if plan_recovery is not None:
-                recovery_reasons.append(plan_recovery.reason)
-                local_actions = list(plan_recovery.actions)
-                forward_action_count = 0
-                executed_history_panoramas = _trim_recovery_history(
-                    executed_history_panoramas,
-                    int(args.closed_loop_recovery_history_keep),
-                )
-                print(
-                    "  [guard] recovery before plan execution: "
-                    f"reason={plan_recovery.reason} actions={list(plan_recovery.actions)} "
-                    f"history={len(executed_history_panoramas)}",
-                    flush=True,
                 )
                 continue
 
@@ -3841,10 +4686,8 @@ def run_eval_rpc_panoramic(args):
             if first_action == ActionCode.STOP:
                 local_actions = []
                 continue
-            before_position = _agent_position(env)
             before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
             observations, done = _apply_habitat_action(env, first_action)
-            after_position = _agent_position(env)
             if before is not None:
                 print(
                     f"  [debug] executed first RPC action={int(first_action)} {before} -> {_env_trace_summary(env)}",
@@ -3861,23 +4704,22 @@ def run_eval_rpc_panoramic(args):
                 image_size=image_size,
                 vlm_output=llm_output,
             )
-            recovery = closed_loop_guard.observe_action(
-                first_action,
-                before_position,
-                after_position,
-            )
-            if recovery is not None and not done:
-                recovery_reasons.append(recovery.reason)
-                local_actions = list(recovery.actions)
-                forward_action_count = 0
-                executed_history_panoramas = _trim_recovery_history(
-                    executed_history_panoramas,
-                    int(args.closed_loop_recovery_history_keep),
-                )
+
+        if dagger_episode_active:
+            dagger_episode_commit = dagger_collector.finalize_episode()
+            if dagger_episode_commit is None:
                 print(
-                    "  [guard] recovery: "
-                    f"reason={recovery.reason} actions={list(recovery.actions)} "
-                    f"history={len(executed_history_panoramas)}",
+                    "  [trajectory-dagger] no retained sample "
+                    f"candidates={dagger_candidate_counts}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "  [trajectory-dagger] committed "
+                    f"tar={dagger_episode_commit.tar_path} "
+                    f"samples={dagger_episode_commit.sample_count} "
+                    f"frames={dagger_episode_commit.frame_count} "
+                    f"bytes={dagger_episode_commit.tar_bytes}",
                     flush=True,
                 )
 
@@ -3886,8 +4728,6 @@ def run_eval_rpc_panoramic(args):
         spls.append(metrics["spl"])
         oss.append(metrics["oracle_success"])
         nes.append(metrics["distance_to_goal"])
-        total_stop_probes += stop_probes
-        total_recoveries += len(recovery_reasons)
         if step_recorder is not None:
             step_recorder.finalize(
                 scene_id=scene_id,
@@ -3901,8 +4741,7 @@ def run_eval_rpc_panoramic(args):
         print(
             f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
             f"os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']:.4f}, "
-            f"vlm_calls: {system2_calls}, trajectory_calls: {trajectory_calls}, "
-            f"stop_probes: {stop_probes}, recoveries: {len(recovery_reasons)}"
+            f"vlm_calls: {system2_calls}, trajectory_calls: {trajectory_calls}"
         )
         result = {
             "scene_id": scene_id,
@@ -3915,25 +4754,46 @@ def run_eval_rpc_panoramic(args):
             "episode_instruction": instruction,
             "vlm_calls": system2_calls,
             "trajectory_calls": trajectory_calls,
+            "recenter_calls": recenter_calls,
+            "recenter_actions_executed": recenter_actions_executed,
             "rpc_server": args.rpc_server,
+            "rpc_policy_mode": rpc_policy_mode,
+            "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+            "native_protocol": (
+                NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+            ),
+            "rpc_model_version": getattr(info, "model_version", None),
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
             "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
             "rpc_deterministic_sampling_enabled": True,
             "rpc_protocol_seed": int(args.rpc_protocol_seed),
             "rpc_require_deterministic_sampling": bool(args.rpc_require_deterministic_sampling),
+            "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+            "habitat_turn_angle_deg": habitat_turn_angle_deg,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
             "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
-            "rpc_action_chunk_size": guard_config.action_chunk_size,
-            "system2_stop_confirmations": guard_config.stop_confirmations,
-            "system2_stop_probe_turn": guard_config.stop_probe_turn,
-            "closed_loop_guard": guard_config.loop_guard_enabled,
-            "closed_loop_stop_probes": stop_probes,
-            "closed_loop_recoveries": recovery_reasons,
+            "collect_trajectory_dagger": bool(dagger_collector is not None),
         }
+        if stage0_action_trace:
+            result["ppa_stage0_action_arm"] = stage0_action_trace[0]["arm"]
+            result["ppa_stage0_action_trace"] = stage0_action_trace
+        if dagger_collector is not None:
+            result["trajectory_dagger_episode_key"] = dagger_episode_key
+            result["trajectory_dagger_candidate_counts"] = dagger_candidate_counts
+            result["trajectory_dagger_candidate_diagnostics"] = dagger_candidate_diagnostics
+            result["trajectory_dagger_committed"] = dagger_episode_commit is not None
+            if dagger_episode_commit is not None:
+                result["trajectory_dagger_commit"] = {
+                    "tar_sha256": dagger_episode_commit.tar_sha256,
+                    "tar_bytes": dagger_episode_commit.tar_bytes,
+                    "sample_count": dagger_episode_commit.sample_count,
+                    "frame_count": dagger_episode_commit.frame_count,
+                }
+
         if bool(getattr(args, "oracle_system2", False)):
             result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
             result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
@@ -3949,23 +4809,25 @@ def run_eval_rpc_panoramic(args):
     final_result = aggregate_navigation_metrics(sucs, spls, oss, nes)
     final_result.update(
         {
+            "rpc_policy_mode": rpc_policy_mode,
+            "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+            "native_protocol": (
+                NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+            ),
+            "rpc_model_version": getattr(info, "model_version", None),
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
             "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
             "rpc_deterministic_sampling_enabled": True,
             "rpc_protocol_seed": int(args.rpc_protocol_seed),
             "rpc_require_deterministic_sampling": bool(args.rpc_require_deterministic_sampling),
+            "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+            "habitat_turn_angle_deg": habitat_turn_angle_deg,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
             "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
-            "rpc_action_chunk_size": guard_config.action_chunk_size,
-            "system2_stop_confirmations": guard_config.stop_confirmations,
-            "system2_stop_probe_turn": guard_config.stop_probe_turn,
-            "closed_loop_guard": guard_config.loop_guard_enabled,
-            "closed_loop_stop_probes": total_stop_probes,
-            "closed_loop_recoveries": total_recoveries,
         }
     )
 
@@ -4056,7 +4918,7 @@ def run_eval(args):
 
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
-    env = habitat.Env(config=hab_cfg)
+    env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
@@ -4525,6 +5387,12 @@ def main():
     )
     parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
     parser.add_argument("--data_path", type=str, default=DEFAULT_DATA_PATH)
+    parser.add_argument(
+        "--dataset_split",
+        choices=("train", "val_seen", "val_unseen"),
+        default="val_unseen",
+        help="Dataset split encoded by --data_path; collection is allowed only for train.",
+    )
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
     parser.add_argument("--gpu_id", type=int, default=0, help="Torch CUDA device id for model inference")
     parser.add_argument(
@@ -4539,6 +5407,21 @@ def main():
             "process runs Habitat only and sends panoramic observations to the "
             "model server."
         ),
+    )
+    parser.add_argument(
+        "--rpc_policy_mode",
+        choices=(RPC_POLICY_HEATMAPVLN, RPC_POLICY_INTERNNAV_NATIVE),
+        default=RPC_POLICY_HEATMAPVLN,
+        help=(
+            "RPC policy provenance contract. internnav_native requires the "
+            "official joint System2 + NextDiT server and validates it fail-closed."
+        ),
+    )
+    parser.add_argument(
+        "--rpc_policy_fingerprint",
+        type=str,
+        default="",
+        help="Expected RPC model/code closure fingerprint for fail-closed native rollouts.",
     )
     parser.add_argument(
         "--rpc_timeout_ms",
@@ -4566,6 +5449,16 @@ def main():
         action="store_true",
         default=False,
         help=("Ask the server to fail closed unless the deterministic NextDiT sampling record is complete and valid."),
+    )
+    parser.add_argument(
+        "--pano_recenter_before_system1",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run RPC planning in two phases: System2 selects a pano view/pixel, "
+            "Habitat physically turns that view to front, then frozen System1 "
+            "runs once on the newly captured front/lookdown observation."
+        ),
     )
     parser.add_argument(
         "--oracle_system2",
@@ -4621,57 +5514,6 @@ def main():
         type=int,
         default=0,
         help="Optional debug safety cap for VLM calls per episode; 0 disables the cap.",
-    )
-    parser.add_argument(
-        "--rpc_action_chunk_size",
-        type=int,
-        default=MAX_LOCAL_STEPS,
-        help=(
-            "Maximum low-level actions executed from one RPC trajectory before "
-            "System2 replans. Use 2 for tighter endpoint/obstacle feedback; 4 "
-            "reproduces the original InternNav execution cadence."
-        ),
-    )
-    parser.add_argument(
-        "--system2_stop_confirmations",
-        type=int,
-        default=1,
-        help=(
-            "Consecutive System2 STOP votes required at the same position. "
-            "Unconfirmed votes trigger an in-place probe turn; 1 disables verification."
-        ),
-    )
-    parser.add_argument(
-        "--system2_stop_probe_turn",
-        choices=("left", "right"),
-        default="left",
-        help="Direction of the first in-place STOP verification turn; later probes alternate.",
-    )
-    parser.add_argument(
-        "--closed_loop_guard",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Enable non-privileged collision and local-loop recovery using only "
-            "issued actions, agent self-motion, and predicted waypoint views."
-        ),
-    )
-    parser.add_argument("--closed_loop_collision_epsilon_m", type=float, default=0.03)
-    parser.add_argument("--closed_loop_collision_forward_limit", type=int, default=3)
-    parser.add_argument("--closed_loop_motion_window_steps", type=int, default=32)
-    parser.add_argument("--closed_loop_motion_min_path_m", type=float, default=2.0)
-    parser.add_argument("--closed_loop_motion_max_net_m", type=float, default=0.75)
-    parser.add_argument("--closed_loop_plan_window_calls", type=int, default=20)
-    parser.add_argument("--closed_loop_plan_view_dominance", type=float, default=0.9)
-    parser.add_argument("--closed_loop_plan_min_path_m", type=float, default=3.0)
-    parser.add_argument("--closed_loop_plan_max_net_m", type=float, default=1.5)
-    parser.add_argument("--closed_loop_recovery_turns", type=int, default=3)
-    parser.add_argument("--closed_loop_recovery_cooldown_steps", type=int, default=12)
-    parser.add_argument(
-        "--closed_loop_recovery_history_keep",
-        type=int,
-        default=2,
-        help="Number of most recent panoramas retained after loop recovery.",
     )
     parser.add_argument(
         "--trajectory_selection",
@@ -4748,12 +5590,39 @@ def main():
             "visualization via scripts/visualization/generate_trajectory_html.py."
         ),
     )
+    parser.add_argument(
+        "--collect_trajectory_dagger",
+        action="store_true",
+        default=False,
+        help="Collect train-only on-policy trajectory states with shadow-oracle labels.",
+    )
+    parser.add_argument(
+        "--trajectory_dagger_root",
+        type=str,
+        default="/mnt/afs/lixiaoou/intern/fjl/data/heatmap_system1_dagger_v1",
+        help="Capacity-guarded collection root; no expert data or heatmaps are copied.",
+    )
+    parser.add_argument("--trajectory_dagger_round", type=int, default=0)
+    parser.add_argument("--trajectory_dagger_max_gb", type=float, default=300.0)
+    parser.add_argument("--trajectory_dagger_normal_quota", type=int, default=1)
+    parser.add_argument("--trajectory_dagger_hard_quota", type=int, default=2)
+    parser.add_argument("--trajectory_dagger_jpeg_quality", type=int, default=75)
+    parser.add_argument("--trajectory_dagger_hard_offpath_m", type=float, default=0.75)
+    parser.add_argument("--trajectory_dagger_max_oracle_actions", type=int, default=128)
+    parser.add_argument("--trajectory_dagger_min_history", type=int, default=2)
+    parser.add_argument(
+        "--trajectory_dagger_policy_fingerprint",
+        type=str,
+        default="",
+        help="Required policy/checkpoint fingerprint used to make resume fail closed.",
+    )
     args = parser.parse_args()
     if args.oracle_system2 and not args.rpc_server:
         raise RuntimeError("--oracle_system2 currently requires --rpc_server")
     if not args.rpc_server:
         _preflight_checkpoint_args(args)
-    _resolve_eval_paths(args)
+    _resolve_eval_paths(args, split=args.dataset_split)
+    _preflight_trajectory_dagger_args(args)
     run_eval(args)
 
 

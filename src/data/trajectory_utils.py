@@ -5,6 +5,8 @@ and augmentation.
 Reference: InternNav/internnav/dataset/internvla_n1_lerobot_dataset.py
 """
 
+from __future__ import annotations
+
 import logging
 import random
 
@@ -44,6 +46,7 @@ def compute_history_rel_poses(
     history_poses: list[np.ndarray],
     current_pose: np.ndarray,
     camera_deg: float = 0,
+    camera_forward_axis: str = "+z",
 ) -> np.ndarray:
     """Compute (dx, dy, cos_yaw, sin_yaw) for each history pose relative to current.
 
@@ -57,7 +60,11 @@ def compute_history_rel_poses(
         + [np.array(p, dtype=np.float32) for p in history_poses],
         axis=0,
     )
-    rel_xyyaw = get_trajectory_relative_to_frame(all_poses, camera_deg=camera_deg)
+    rel_xyyaw = get_trajectory_relative_to_frame(
+        all_poses,
+        camera_deg=camera_deg,
+        camera_forward_axis=camera_forward_axis,
+    )
     hist_rel = rel_xyyaw[1:]
     return np.column_stack([
         hist_rel[:, :2],
@@ -77,10 +84,11 @@ def get_trajectory_relative_to_frame(
         extrinsics: Pose matrices in the convention used by InternNav's
             trajectory transform, shape (n, 4, 4).
         camera_deg: camera pitch in degrees
-        camera_forward_axis: Camera-space forward axis. InternNav's source
-            poses use ``+z``. Habitat RGB sensors face ``-z``; selecting
-            ``-z`` reflects the resulting local frame so that ``x`` remains
-            forward, ``y`` remains left, and positive yaw remains a left turn.
+        camera_forward_axis: Interpretation applied by this HeatmapVLN
+            wrapper. The legacy call path kept its historical ``+z``
+            semantics. The random-walk poses are Habitat camera-to-world
+            matrices whose RGB camera faces local ``-z``; selecting ``-z``
+            makes ``x`` forward, ``y`` left, and positive yaw a left turn.
 
     Returns:
         relative_xyyaw: (n, 3)
@@ -129,9 +137,9 @@ def get_trajectory_relative_to_frame(
     relative_xyyaw = np.concatenate((relative_translations, relative_yaws.reshape(-1, 1)), axis=-1)
 
     if camera_forward_axis == "-z":
-        # InternNav consumes (forward, left, left-positive yaw). Changing the
-        # camera forward axis from +Z to Habitat's -Z reflects forward and
-        # handedness, so x and yaw change sign while lateral y does not.
+        # Convert the legacy HeatmapVLN wrapper fields to the physical Habitat
+        # c2w convention (forward, left, left-positive yaw). The reflection
+        # changes forward and yaw signs while preserving lateral left.
         relative_xyyaw[:, 0] *= -1.0
         relative_xyyaw[:, 2] *= -1.0
 

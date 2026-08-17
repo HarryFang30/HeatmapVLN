@@ -15,6 +15,21 @@ from .heatmap_vln import HeatmapVLN
 from .heatmap_vln_loss import HeatmapVLNLoss
 from .input_constructor import construct_input, find_text_anchor_positions
 from .pose_free_matching import PoseFreeHistoryMatcher, pad_history_queries
+from .native_single_view_feature_extractor import (
+    NativeSingleViewFeatureExtractor,
+    NativeSingleViewFeatures,
+)
+from .structured_heatmap_tokenizer import (
+    HEATMAP_DIRECTION_ORDER,
+    STRUCTURED_FEATURE_DIM,
+    StructuredHeatmapTokenizer,
+)
+from .single_view_heatmap_decoder import SingleViewFourDirectionHeatmapHead
+from .single_view_panorama_conditioner import (
+    SingleViewPanoramaConditioner,
+    VIEW_ANGLES_DEGREES,
+    VIEW_NAMES,
+)
 from .target_grounded_identity import (
     PrimaryPanoramaTargets,
     TargetGroundedIdentityLoss,
@@ -36,10 +51,19 @@ __all__ = [
     "HeatmapVLN",
     "HeatmapVLNLoss",
     "PoseFreeHistoryMatcher",
+    "NativeSingleViewFeatureExtractor",
+    "NativeSingleViewFeatures",
     "PrimaryPanoramaTargets",
     "TargetGroundedIdentityLoss",
     "TargetGroundedPanoramaIdentityLoss",
     "TrajectoryGuidedAttention",
+    "HEATMAP_DIRECTION_ORDER",
+    "STRUCTURED_FEATURE_DIM",
+    "StructuredHeatmapTokenizer",
+    "SingleViewFourDirectionHeatmapHead",
+    "SingleViewPanoramaConditioner",
+    "VIEW_ANGLES_DEGREES",
+    "VIEW_NAMES",
     "__version__",
     "circular_pairwise_distances",
     "construct_input",

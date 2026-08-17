@@ -23,6 +23,8 @@ export STAGE3_EVAL_CHECKPOINT="${STAGE3_EVAL_CHECKPOINT:-${STAGE3_EVAL_TRAIN_OUT
 
 export STAGE3_EVAL_SCENES_DIR="${STAGE3_EVAL_SCENES_DIR:-${FJL_ROOT}/habitat/VLN-CE/data/scene_datasets}"
 export STAGE3_EVAL_DATA_PATH="${STAGE3_EVAL_DATA_PATH:-${FJL_ROOT}/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/val_unseen/val_unseen.json.gz}"
+export STAGE3_EVAL_DATASET_SPLIT="${STAGE3_EVAL_DATASET_SPLIT:-val_unseen}"
+export STAGE3_EVAL_EXPECTED_EPISODES="${STAGE3_EVAL_EXPECTED_EPISODES:-1839}"
 export STAGE3_EVAL_OUTPUT_PATH="${STAGE3_EVAL_OUTPUT_PATH:-${FJL_ROOT}/model/eval_stage3_r2r_val_unseen_full_11000_alllora_h1024_internnavcoords_epoch${STAGE3_EVAL_EXPECTED_EPOCH}_no_privileged_stop}"
 
 export STAGE3_EVAL_MODEL_GPU="${STAGE3_EVAL_MODEL_GPU:-0}"
@@ -31,30 +33,13 @@ export STAGE3_EVAL_RPC_HOST="${STAGE3_EVAL_RPC_HOST:-127.0.0.1}"
 export STAGE3_EVAL_RPC_PORT="${STAGE3_EVAL_RPC_PORT:-50061}"
 export STAGE3_EVAL_RPC_TIMEOUT_MS="${STAGE3_EVAL_RPC_TIMEOUT_MS:-600000}"
 export STAGE3_EVAL_RPC_JPEG_QUALITY="${STAGE3_EVAL_RPC_JPEG_QUALITY:-90}"
-export STAGE3_EVAL_RPC_PROTOCOL_SEED="${STAGE3_EVAL_RPC_PROTOCOL_SEED:-42}"
-export STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING="${STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING:-0}"
+export STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1="${STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1:-1}"
 export STAGE3_EVAL_SERVER_START_TIMEOUT_S="${STAGE3_EVAL_SERVER_START_TIMEOUT_S:-1800}"
 
 export STAGE3_EVAL_MAX_EPISODES="${STAGE3_EVAL_MAX_EPISODES:-}"
 export STAGE3_EVAL_EPISODE_LIST="${STAGE3_EVAL_EPISODE_LIST:-}"
 export STAGE3_EVAL_MAX_STEPS="${STAGE3_EVAL_MAX_STEPS:-500}"
 export STAGE3_EVAL_MAX_SYSTEM2_CALLS="${STAGE3_EVAL_MAX_SYSTEM2_CALLS:-0}"
-export STAGE3_EVAL_ACTION_CHUNK_SIZE="${STAGE3_EVAL_ACTION_CHUNK_SIZE:-4}"
-export STAGE3_EVAL_STOP_CONFIRMATIONS="${STAGE3_EVAL_STOP_CONFIRMATIONS:-1}"
-export STAGE3_EVAL_STOP_PROBE_TURN="${STAGE3_EVAL_STOP_PROBE_TURN:-left}"
-export STAGE3_EVAL_CLOSED_LOOP_GUARD="${STAGE3_EVAL_CLOSED_LOOP_GUARD:-0}"
-export STAGE3_EVAL_COLLISION_EPSILON_M="${STAGE3_EVAL_COLLISION_EPSILON_M:-0.03}"
-export STAGE3_EVAL_COLLISION_FORWARD_LIMIT="${STAGE3_EVAL_COLLISION_FORWARD_LIMIT:-3}"
-export STAGE3_EVAL_MOTION_WINDOW_STEPS="${STAGE3_EVAL_MOTION_WINDOW_STEPS:-32}"
-export STAGE3_EVAL_MOTION_MIN_PATH_M="${STAGE3_EVAL_MOTION_MIN_PATH_M:-2.0}"
-export STAGE3_EVAL_MOTION_MAX_NET_M="${STAGE3_EVAL_MOTION_MAX_NET_M:-0.75}"
-export STAGE3_EVAL_PLAN_WINDOW_CALLS="${STAGE3_EVAL_PLAN_WINDOW_CALLS:-20}"
-export STAGE3_EVAL_PLAN_VIEW_DOMINANCE="${STAGE3_EVAL_PLAN_VIEW_DOMINANCE:-0.9}"
-export STAGE3_EVAL_PLAN_MIN_PATH_M="${STAGE3_EVAL_PLAN_MIN_PATH_M:-3.0}"
-export STAGE3_EVAL_PLAN_MAX_NET_M="${STAGE3_EVAL_PLAN_MAX_NET_M:-1.5}"
-export STAGE3_EVAL_RECOVERY_TURNS="${STAGE3_EVAL_RECOVERY_TURNS:-3}"
-export STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS="${STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS:-12}"
-export STAGE3_EVAL_RECOVERY_HISTORY_KEEP="${STAGE3_EVAL_RECOVERY_HISTORY_KEEP:-2}"
 export STAGE3_EVAL_NUM_HISTORY="${STAGE3_EVAL_NUM_HISTORY:-8}"
 export STAGE3_EVAL_TRAJECTORY_SELECTION="${STAGE3_EVAL_TRAJECTORY_SELECTION:-mean}"
 # Corrected Stage3 checkpoints already emit native InternNav coordinates.
@@ -73,6 +58,19 @@ export STAGE3_EVAL_RESUME="${STAGE3_EVAL_RESUME:-1}"
 export STAGE3_EVAL_OVERWRITE="${STAGE3_EVAL_OVERWRITE:-0}"
 export STAGE3_EVAL_SAVE_TRAJECTORY_STEPS="${STAGE3_EVAL_SAVE_TRAJECTORY_STEPS:-0}"
 export STAGE3_EVAL_PREFLIGHT_ONLY="${STAGE3_EVAL_PREFLIGHT_ONLY:-0}"
+export STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING="${STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING:-1}"
+
+export STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER="${STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER:-0}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT="${STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT:-${FJL_ROOT}/data/heatmap_system1_dagger_v1}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_ROUND="${STAGE3_EVAL_TRAJECTORY_DAGGER_ROUND:-0}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_GB="${STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_GB:-300}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_NORMAL_QUOTA="${STAGE3_EVAL_TRAJECTORY_DAGGER_NORMAL_QUOTA:-1}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_QUOTA="${STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_QUOTA:-2}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_JPEG_QUALITY="${STAGE3_EVAL_TRAJECTORY_DAGGER_JPEG_QUALITY:-75}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_OFFPATH_M="${STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_OFFPATH_M:-0.75}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_ORACLE_ACTIONS="${STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_ORACLE_ACTIONS:-128}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_MIN_HISTORY="${STAGE3_EVAL_TRAJECTORY_DAGGER_MIN_HISTORY:-2}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT="${STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT:-}"
 
 export STAGE3_EVAL_CHECKPOINT_WAIT_INTERVAL_S="${STAGE3_EVAL_CHECKPOINT_WAIT_INTERVAL_S:-300}"
 export STAGE3_EVAL_CHECKPOINT_SETTLE_S="${STAGE3_EVAL_CHECKPOINT_SETTLE_S:-30}"
@@ -176,13 +174,6 @@ case "$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY" in
     exit 1
     ;;
 esac
-"$QWEN25_PYTHON" - "$STAGE3_EVAL_RPC_PROTOCOL_SEED" <<'PY'
-import sys
-
-seed = int(sys.argv[1])
-if not 0 <= seed <= (1 << 63) - 1:
-    raise SystemExit("STAGE3_EVAL_RPC_PROTOCOL_SEED must be in [0, 2**63 - 1]")
-PY
 "$QWEN25_PYTHON" - \
   "$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M" \
   "$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M" \
@@ -196,70 +187,6 @@ for name, raw in zip(names, sys.argv[1:]):
     if not math.isfinite(value) or value <= 0.0:
         raise SystemExit(f"Oracle System2 {name} must be finite and > 0, got {raw!r}")
 PY
-"$QWEN25_PYTHON" - \
-  "$STAGE3_EVAL_ACTION_CHUNK_SIZE" \
-  "$STAGE3_EVAL_STOP_CONFIRMATIONS" \
-  "$STAGE3_EVAL_COLLISION_EPSILON_M" \
-  "$STAGE3_EVAL_COLLISION_FORWARD_LIMIT" \
-  "$STAGE3_EVAL_MOTION_WINDOW_STEPS" \
-  "$STAGE3_EVAL_MOTION_MIN_PATH_M" \
-  "$STAGE3_EVAL_MOTION_MAX_NET_M" \
-  "$STAGE3_EVAL_PLAN_WINDOW_CALLS" \
-  "$STAGE3_EVAL_PLAN_VIEW_DOMINANCE" \
-  "$STAGE3_EVAL_PLAN_MIN_PATH_M" \
-  "$STAGE3_EVAL_PLAN_MAX_NET_M" \
-  "$STAGE3_EVAL_RECOVERY_TURNS" \
-  "$STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS" \
-  "$STAGE3_EVAL_RECOVERY_HISTORY_KEEP" <<'PY'
-import math
-import sys
-
-(
-    action_chunk,
-    stop_confirmations,
-    collision_epsilon,
-    collision_limit,
-    motion_window,
-    motion_min_path,
-    motion_max_net,
-    plan_window,
-    plan_dominance,
-    plan_min_path,
-    plan_max_net,
-    recovery_turns,
-    recovery_cooldown,
-    recovery_history_keep,
-) = sys.argv[1:]
-action_chunk = int(action_chunk)
-if not 1 <= action_chunk <= 4:
-    raise SystemExit(f"STAGE3_EVAL_ACTION_CHUNK_SIZE must be in [1, 4], got {action_chunk}")
-if int(stop_confirmations) < 1:
-    raise SystemExit("STAGE3_EVAL_STOP_CONFIRMATIONS must be >= 1")
-if int(collision_limit) < 1 or int(motion_window) < 2 or int(plan_window) < 2:
-    raise SystemExit("Closed-loop collision/window counts are invalid")
-if int(recovery_turns) < 1 or int(recovery_cooldown) < 0 or int(recovery_history_keep) < 0:
-    raise SystemExit("Closed-loop recovery counts are invalid")
-for name, raw in (
-    ("collision_epsilon", collision_epsilon),
-    ("motion_min_path", motion_min_path),
-    ("motion_max_net", motion_max_net),
-    ("plan_min_path", plan_min_path),
-    ("plan_max_net", plan_max_net),
-):
-    value = float(raw)
-    if not math.isfinite(value) or value < 0.0:
-        raise SystemExit(f"{name} must be finite and >= 0, got {raw!r}")
-dominance = float(plan_dominance)
-if not math.isfinite(dominance) or not 0.5 < dominance <= 1.0:
-    raise SystemExit("STAGE3_EVAL_PLAN_VIEW_DOMINANCE must be in (0.5, 1]")
-PY
-case "$STAGE3_EVAL_STOP_PROBE_TURN" in
-  left|right) ;;
-  *)
-    echo "STAGE3_EVAL_STOP_PROBE_TURN must be left or right" >&2
-    exit 1
-    ;;
-esac
 
 privileged_requested="$($QWEN25_PYTHON - "$STAGE3_EVAL_AUTO_STOP_DISTANCE" <<'PY'
 import sys
@@ -275,6 +202,33 @@ if [[ "$privileged_requested" == "1" ]] && ! is_true "$STAGE3_EVAL_ALLOW_PRIVILE
   exit 1
 fi
 
+if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER"; then
+  if [[ "$STAGE3_EVAL_DATASET_SPLIT" != "train" ]]; then
+    echo "Trajectory DAgger collection requires STAGE3_EVAL_DATASET_SPLIT=train" >&2
+    exit 1
+  fi
+  if [[ "$privileged_requested" == "1" ]]; then
+    echo "Trajectory DAgger learner rollout forbids oracle System2 and privileged auto-stop" >&2
+    exit 1
+  fi
+  if ! is_true "$STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING"; then
+    echo "Trajectory DAgger collection requires deterministic RPC sampling" >&2
+    exit 1
+  fi
+  case "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT" in
+    /mnt/afs/lixiaoou/intern/fjl|/mnt/afs/lixiaoou/intern/fjl/*) ;;
+    *)
+      echo "Trajectory DAgger root must stay under /mnt/afs/lixiaoou/intern/fjl" >&2
+      exit 1
+      ;;
+  esac
+  case "$STAGE3_EVAL_OUTPUT_PATH" in
+    "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT"|"$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT"/*)
+      echo "Evaluation output must not be inside the capacity-guarded DAgger root" >&2
+      exit 1
+      ;;
+  esac
+fi
 require_file "$STAGE3_EVAL_CONFIG"
 require_file "$STAGE3_EVAL_BASE_CKPT"
 require_file "$STAGE3_EVAL_DATA_PATH"
@@ -292,17 +246,19 @@ if [[ "$scene_count" -lt 90 ]]; then
   exit 1
 fi
 
-"$VLNCE_PYTHON" - "$STAGE3_EVAL_DATA_PATH" "$STAGE3_EVAL_SCENES_DIR" <<'PY'
+"$VLNCE_PYTHON" - "$STAGE3_EVAL_DATA_PATH" "$STAGE3_EVAL_SCENES_DIR" \
+  "$STAGE3_EVAL_EXPECTED_EPISODES" "$STAGE3_EVAL_DATASET_SPLIT" <<'PY'
 import gzip
 import json
 import sys
 from pathlib import Path
 
-data_path, scenes_dir = map(Path, sys.argv[1:])
+data_path, scenes_dir = map(Path, sys.argv[1:3])
+expected_episodes, dataset_split = int(sys.argv[3]), sys.argv[4]
 with gzip.open(data_path, "rt", encoding="utf-8") as handle:
     episodes = json.load(handle).get("episodes", [])
-if len(episodes) != 1839:
-    raise SystemExit(f"Expected 1839 R2R val_unseen episodes, found {len(episodes)}")
+if len(episodes) != expected_episodes:
+    raise SystemExit(f"Expected {expected_episodes} R2R {dataset_split} episodes, found {len(episodes)}")
 scene_id = str(episodes[0].get("scene_id", ""))
 scene_asset = scenes_dir / scene_id
 if not scene_asset.is_file():
@@ -345,6 +301,11 @@ while true; do
   sleep "$STAGE3_EVAL_CHECKPOINT_WAIT_INTERVAL_S"
 done
 
+if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER" && [[ -z "$STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT" ]]; then
+  base_sha256="$(sha256sum "$STAGE3_EVAL_BASE_CKPT" | cut -d' ' -f1)"
+  stage3_sha256="$(sha256sum "$STAGE3_EVAL_CHECKPOINT" | cut -d' ' -f1)"
+  export STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT="base:${base_sha256};stage3:${stage3_sha256}"
+fi
 PYTHONPATH="$RPC_PYTHONPATH" "$QWEN25_PYTHON" - \
   "$STAGE3_EVAL_RPC_HOST" "$STAGE3_EVAL_RPC_PORT" <<'PY'
 import socket
@@ -365,13 +326,12 @@ echo "[stage3-eval] stage3=$STAGE3_EVAL_CHECKPOINT"
 echo "[stage3-eval] scenes=$STAGE3_EVAL_SCENES_DIR (${scene_count})"
 echo "[stage3-eval] data=$STAGE3_EVAL_DATA_PATH"
 echo "[stage3-eval] rpc=$RPC_SERVER_ADDR rpc_root=$RPC_ROOT"
-echo "[stage3-eval] rpc_protocol_seed=$STAGE3_EVAL_RPC_PROTOCOL_SEED require_deterministic_sampling=$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"
 echo "[stage3-eval] model_gpu=$STAGE3_EVAL_MODEL_GPU display=$STAGE3_EVAL_DISPLAY"
 echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
 echo "[stage3-eval] oracle_strategy=$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY lookahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M min_ahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M max_side_dist_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"
 echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN heading_alignment=$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
-echo "[stage3-eval] closed_loop action_chunk=$STAGE3_EVAL_ACTION_CHUNK_SIZE stop_confirmations=$STAGE3_EVAL_STOP_CONFIRMATIONS stop_probe_turn=$STAGE3_EVAL_STOP_PROBE_TURN loop_guard=$STAGE3_EVAL_CLOSED_LOOP_GUARD"
+echo "[stage3-eval] pano_recenter_before_system1=$STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1"
 
 if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
   echo "[$(date '+%F %T')] STAGE3_EVAL_PREFLIGHT_ONLY=1; all static preflights passed"
@@ -379,11 +339,6 @@ if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
 fi
 
 mkdir -p "$LOG_DIR" "$STAGE3_EVAL_OUTPUT_PATH"
-
-server_deterministic_args=()
-if is_true "$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"; then
-  server_deterministic_args+=(--require_deterministic_sampling)
-fi
 
 env \
   PYTHONPATH="$RPC_PYTHONPATH" \
@@ -402,7 +357,6 @@ env \
     --port "$STAGE3_EVAL_RPC_PORT" \
     --workers 1 \
     --log_level INFO \
-    "${server_deterministic_args[@]}" \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID="$!"
 echo "[$(date '+%F %T')] RPC model server starting pid=$SERVER_PID log=$SERVER_LOG"
@@ -418,7 +372,6 @@ while [[ "$(($(date +%s) - start_time))" -lt "$STAGE3_EVAL_SERVER_START_TIMEOUT_
   fi
   if PYTHONPATH="$RPC_PYTHONPATH" "$VLNCE_PYTHON" - "$RPC_SERVER_ADDR" <<'PY' >/dev/null 2>&1
 import sys
-from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
 from vla_rpc.client import VLAClient
 
 client = VLAClient(server_addr=sys.argv[1], timeout_ms=5000)
@@ -427,7 +380,7 @@ try:
     info = client.get_server_info()
     if not client.health_check() or info is None:
         raise SystemExit(1)
-    if info.version != HEATMAPVLN_RPC_PROTOCOL_VERSION:
+    if info.version != "heatmapvln-r2r-json-v3":
         raise SystemExit(2)
 finally:
     client.close()
@@ -449,8 +402,7 @@ for required_log in \
   "Verified complete frozen InternNav System1 for RPC evaluation: 608 tensors" \
   "Verified complete LoRA checkpoint match: 224 tensors" \
   "Base checkpoint LoRA-only guard: loading 224/224 tensors" \
-  "Verified pano latent adapter: tensors=4 parameters=7344640 dim=3584 hidden_dim=1024" \
-  "hidden_dim=1024 dtype=torch.bfloat16"; do
+  "Verified pano latent adapter: tensors=4 parameters=7344640 dim=3584 hidden_dim=1024"; do
   if ! grep -Fq "$required_log" "$SERVER_LOG"; then
     echo "RPC startup assertion missing from server log: $required_log" >&2
     tail -200 "$SERVER_LOG" >&2 || true
@@ -468,11 +420,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scripts.evaluation.rpc_protocol import (
-    HEATMAPVLN_RPC_PROTOCOL_VERSION,
-    HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
-)
-
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "code_commit": subprocess.run(
@@ -485,13 +432,8 @@ manifest = {
     "scenes_dir": os.environ["STAGE3_EVAL_SCENES_DIR"],
     "data_path": os.environ["STAGE3_EVAL_DATA_PATH"],
     "rpc_root": os.environ["RPC_ROOT"],
-    "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
-    "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
-    "rpc_deterministic_sampling_enabled": True,
-    "rpc_protocol_seed": int(os.environ["STAGE3_EVAL_RPC_PROTOCOL_SEED"]),
-    "rpc_require_deterministic_sampling": os.environ[
-        "STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"
-    ].lower() in {"1", "true", "yes", "on"},
+    "rpc_protocol": "heatmapvln-r2r-json-v3",
+    "rpc_capability": "pano-two-phase-front-system1-v1",
     "auto_stop_distance": float(os.environ["STAGE3_EVAL_AUTO_STOP_DISTANCE"]),
     "oracle_system2": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2"].lower() in {"1", "true", "yes", "on"},
     "oracle_system2_strategy": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY"],
@@ -502,50 +444,11 @@ manifest = {
     "trajectory_x_sign": float(os.environ["STAGE3_EVAL_TRAJECTORY_X_SIGN"]),
     "trajectory_heading_alignment": os.environ["STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"],
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
-    "rpc_action_chunk_size": int(os.environ["STAGE3_EVAL_ACTION_CHUNK_SIZE"]),
-    "system2_stop_confirmations": int(os.environ["STAGE3_EVAL_STOP_CONFIRMATIONS"]),
-    "system2_stop_probe_turn": os.environ["STAGE3_EVAL_STOP_PROBE_TURN"],
-    "closed_loop_guard": os.environ["STAGE3_EVAL_CLOSED_LOOP_GUARD"].lower()
-    in {"1", "true", "yes", "on"},
-    "closed_loop_collision_epsilon_m": float(os.environ["STAGE3_EVAL_COLLISION_EPSILON_M"]),
-    "closed_loop_collision_forward_limit": int(os.environ["STAGE3_EVAL_COLLISION_FORWARD_LIMIT"]),
-    "closed_loop_motion_window_steps": int(os.environ["STAGE3_EVAL_MOTION_WINDOW_STEPS"]),
-    "closed_loop_motion_min_path_m": float(os.environ["STAGE3_EVAL_MOTION_MIN_PATH_M"]),
-    "closed_loop_motion_max_net_m": float(os.environ["STAGE3_EVAL_MOTION_MAX_NET_M"]),
-    "closed_loop_plan_window_calls": int(os.environ["STAGE3_EVAL_PLAN_WINDOW_CALLS"]),
-    "closed_loop_plan_view_dominance": float(os.environ["STAGE3_EVAL_PLAN_VIEW_DOMINANCE"]),
-    "closed_loop_plan_min_path_m": float(os.environ["STAGE3_EVAL_PLAN_MIN_PATH_M"]),
-    "closed_loop_plan_max_net_m": float(os.environ["STAGE3_EVAL_PLAN_MAX_NET_M"]),
-    "closed_loop_recovery_turns": int(os.environ["STAGE3_EVAL_RECOVERY_TURNS"]),
-    "closed_loop_recovery_cooldown_steps": int(os.environ["STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS"]),
-    "closed_loop_recovery_history_keep": int(os.environ["STAGE3_EVAL_RECOVERY_HISTORY_KEEP"]),
+    "pano_recenter_before_system1": os.environ[
+        "STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1"
+    ].lower() in {"1", "true", "yes", "on"},
 }
-path = Path(sys.argv[1])
-resume = os.environ["STAGE3_EVAL_RESUME"].lower() in {"1", "true", "yes", "on"}
-overwrite = os.environ["STAGE3_EVAL_OVERWRITE"].lower() in {"1", "true", "yes", "on"}
-if resume and overwrite:
-    raise SystemExit("STAGE3_EVAL_RESUME and STAGE3_EVAL_OVERWRITE cannot both be true")
-progress_exists = (path.parent / "progress.json").exists()
-if path.exists():
-    existing = json.loads(path.read_text())
-    comparable_existing = {key: existing.get(key) for key in manifest if key != "created_at"}
-    comparable_new = {key: value for key, value in manifest.items() if key != "created_at"}
-    if resume:
-        if comparable_existing != comparable_new:
-            raise SystemExit(
-                "Existing eval_manifest.json does not match this resume contract"
-            )
-    elif not overwrite:
-        raise SystemExit(
-            "Existing eval_manifest.json requires STAGE3_EVAL_RESUME=1 or "
-            "STAGE3_EVAL_OVERWRITE=1"
-        )
-    else:
-        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-elif progress_exists:
-    raise SystemExit("progress.json exists without eval_manifest.json; resume refused")
-else:
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+Path(sys.argv[1]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
 
 client_args=(
@@ -553,9 +456,9 @@ client_args=(
   --rpc_server "$RPC_SERVER_ADDR"
   --rpc_timeout_ms "$STAGE3_EVAL_RPC_TIMEOUT_MS"
   --rpc_jpeg_quality "$STAGE3_EVAL_RPC_JPEG_QUALITY"
-  --rpc_protocol_seed "$STAGE3_EVAL_RPC_PROTOCOL_SEED"
   --scenes_dir "$STAGE3_EVAL_SCENES_DIR"
   --data_path "$STAGE3_EVAL_DATA_PATH"
+  --dataset_split "$STAGE3_EVAL_DATASET_SPLIT"
   --output_path "$STAGE3_EVAL_OUTPUT_PATH"
   --sim_gpu_id 0
   --resize_w 256
@@ -564,21 +467,6 @@ client_args=(
   --max_steps_per_episode "$STAGE3_EVAL_MAX_STEPS"
   --auto_stop_distance "$STAGE3_EVAL_AUTO_STOP_DISTANCE"
   --max_system2_calls_per_episode "$STAGE3_EVAL_MAX_SYSTEM2_CALLS"
-  --rpc_action_chunk_size "$STAGE3_EVAL_ACTION_CHUNK_SIZE"
-  --system2_stop_confirmations "$STAGE3_EVAL_STOP_CONFIRMATIONS"
-  --system2_stop_probe_turn "$STAGE3_EVAL_STOP_PROBE_TURN"
-  --closed_loop_collision_epsilon_m "$STAGE3_EVAL_COLLISION_EPSILON_M"
-  --closed_loop_collision_forward_limit "$STAGE3_EVAL_COLLISION_FORWARD_LIMIT"
-  --closed_loop_motion_window_steps "$STAGE3_EVAL_MOTION_WINDOW_STEPS"
-  --closed_loop_motion_min_path_m "$STAGE3_EVAL_MOTION_MIN_PATH_M"
-  --closed_loop_motion_max_net_m "$STAGE3_EVAL_MOTION_MAX_NET_M"
-  --closed_loop_plan_window_calls "$STAGE3_EVAL_PLAN_WINDOW_CALLS"
-  --closed_loop_plan_view_dominance "$STAGE3_EVAL_PLAN_VIEW_DOMINANCE"
-  --closed_loop_plan_min_path_m "$STAGE3_EVAL_PLAN_MIN_PATH_M"
-  --closed_loop_plan_max_net_m "$STAGE3_EVAL_PLAN_MAX_NET_M"
-  --closed_loop_recovery_turns "$STAGE3_EVAL_RECOVERY_TURNS"
-  --closed_loop_recovery_cooldown_steps "$STAGE3_EVAL_RECOVERY_COOLDOWN_STEPS"
-  --closed_loop_recovery_history_keep "$STAGE3_EVAL_RECOVERY_HISTORY_KEEP"
   --trajectory_selection "$STAGE3_EVAL_TRAJECTORY_SELECTION"
   --trajectory_x_sign "$STAGE3_EVAL_TRAJECTORY_X_SIGN"
   --trajectory_heading_alignment "$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
@@ -586,13 +474,23 @@ client_args=(
   --no-debug_input_trace
   --debug_save_input_images 0
 )
-if is_true "$STAGE3_EVAL_REQUIRE_DETERMINISTIC_SAMPLING"; then
+if is_true "$STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING"; then
   client_args+=(--rpc_require_deterministic_sampling)
 fi
-if is_true "$STAGE3_EVAL_CLOSED_LOOP_GUARD"; then
-  client_args+=(--closed_loop_guard)
-else
-  client_args+=(--no-closed_loop_guard)
+if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER"; then
+  client_args+=(
+    --collect_trajectory_dagger
+    --trajectory_dagger_root "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT"
+    --trajectory_dagger_round "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROUND"
+    --trajectory_dagger_max_gb "$STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_GB"
+    --trajectory_dagger_normal_quota "$STAGE3_EVAL_TRAJECTORY_DAGGER_NORMAL_QUOTA"
+    --trajectory_dagger_hard_quota "$STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_QUOTA"
+    --trajectory_dagger_jpeg_quality "$STAGE3_EVAL_TRAJECTORY_DAGGER_JPEG_QUALITY"
+    --trajectory_dagger_hard_offpath_m "$STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_OFFPATH_M"
+    --trajectory_dagger_max_oracle_actions "$STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_ORACLE_ACTIONS"
+    --trajectory_dagger_min_history "$STAGE3_EVAL_TRAJECTORY_DAGGER_MIN_HISTORY"
+    --trajectory_dagger_policy_fingerprint "$STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT"
+  )
 fi
 if [[ -n "$STAGE3_EVAL_MAX_EPISODES" ]]; then
   client_args+=(--max_episodes "$STAGE3_EVAL_MAX_EPISODES")
@@ -617,6 +515,11 @@ if is_true "$STAGE3_EVAL_ORACLE_SYSTEM2"; then
 fi
 if is_true "$STAGE3_EVAL_SAVE_TRAJECTORY_STEPS"; then
   client_args+=(--save_trajectory_steps)
+fi
+if is_true "$STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1"; then
+  client_args+=(--pano_recenter_before_system1)
+else
+  client_args+=(--no-pano_recenter_before_system1)
 fi
 
 echo "[$(date '+%F %T')] Starting Habitat val_unseen client log=$CLIENT_LOG"

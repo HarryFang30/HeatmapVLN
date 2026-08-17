@@ -44,7 +44,7 @@ data:
     min_history: 5
     num_history_sample: 8
     load_depth: true
-    load_history_frames: false
+    load_single_view_history_frames: false
     cache_poses: true
     sample_stride: 2
     defer_heatmap_to_gpu: false

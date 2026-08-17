@@ -76,6 +76,9 @@ class HeatmapVLN(nn.Module):
         heatmap_trains_backbone: bool = False,
         decoder_mode: str = "legacy",
         pose_free_config: dict[str, Any] | None = None,
+        coarse_logit_residual: bool = False,
+        restore_vit_spatial_layout: bool = False,
+        joint_panorama_inference: bool = False,
     ):
         super().__init__()
 
@@ -93,6 +96,8 @@ class HeatmapVLN(nn.Module):
         self.llm_layer_indices = llm_layer_indices
         self.enable_runtime_timing = enable_runtime_timing
         self.heatmap_trains_backbone = heatmap_trains_backbone
+        self.restore_vit_spatial_layout = bool(restore_vit_spatial_layout)
+        self.joint_panorama_inference = bool(joint_panorama_inference)
         self.decoder_mode = str(decoder_mode).strip().lower()
         if self.decoder_mode not in {"legacy", "pose_free_matcher"}:
             raise ValueError(f"decoder_mode must be 'legacy' or 'pose_free_matcher', got {decoder_mode!r}")
@@ -138,6 +143,7 @@ class HeatmapVLN(nn.Module):
             spatial_merge_size=spatial_merge_size,
             detach_features=not heatmap_trains_backbone,
             history_query_source=self.history_query_source,
+            restore_vit_spatial_layout=self.restore_vit_spatial_layout,
         )
 
         self.pose_free_matcher: PoseFreeHistoryMatcher | None = None
@@ -180,13 +186,17 @@ class HeatmapVLN(nn.Module):
                 self.coarse = CoarseLocalization(c_llm=c_llm, c_fused=c_fused)
 
             # Fine localisation head (no longer needs c_llm — uses spatial_out from coarse)
-            self.fine = FineLocalization(c_fused)
+            self.fine = FineLocalization(
+                c_fused,
+                coarse_logit_residual=coarse_logit_residual,
+            )
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             "HeatmapVLN: c_vit=%d, c_llm=%d, c_fused=%d, "
             "vit_layers=%s, llm_layers=%s, enable_trajectory=%s, "
-            "heatmap_trains_backbone=%s, decoder_mode=%s, history_query_source=%s, trainable=%s",
+            "heatmap_trains_backbone=%s, decoder_mode=%s, history_query_source=%s, "
+            "restore_vit_spatial_layout=%s, joint_panorama_inference=%s, trainable=%s",
             c_vit,
             c_llm,
             c_fused,
@@ -196,6 +206,8 @@ class HeatmapVLN(nn.Module):
             self.heatmap_trains_backbone,
             self.decoder_mode,
             self.history_query_source,
+            self.restore_vit_spatial_layout,
+            self.joint_panorama_inference,
             f"{trainable:,}",
         )
 
@@ -455,6 +467,7 @@ class HeatmapVLN(nn.Module):
             return {
                 "visibility": torch.empty(0, 4, device=device),
                 "heatmaps": torch.empty(0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(0, 4, 64, 64, device=device),
             }
         fused_vit = self._fuse_view_features_batched(
             current_vit,
@@ -481,14 +494,19 @@ class HeatmapVLN(nn.Module):
         else:
             coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
-        all_heatmaps = self.fine(
+        all_heatmaps, all_heatmap_logits = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             spatial_out=coarse_results["spatial_out"],
+            return_logits=True,
         )
-        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {
+            "visibility": all_visibility,
+            "heatmaps": all_heatmaps,
+            "heatmap_logits": all_heatmap_logits,
+        }
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
+            result.update(self._build_inference_heatmaps(result))
         return result
 
     def _decode_features_batch(
@@ -506,6 +524,7 @@ class HeatmapVLN(nn.Module):
             return {
                 "visibility": torch.empty(0, 0, 4, device=device),
                 "heatmaps": torch.empty(0, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(0, 0, 4, 64, 64, device=device),
             }
 
         max_hist = max(num_histories) if num_histories else 0
@@ -513,6 +532,7 @@ class HeatmapVLN(nn.Module):
             return {
                 "visibility": torch.empty(batch_size, 0, 4, device=device),
                 "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(batch_size, 0, 4, 64, 64, device=device),
             }
 
         if self.decoder_mode == "pose_free_matcher":
@@ -612,19 +632,28 @@ class HeatmapVLN(nn.Module):
         else:
             coarse_results = self.coarse(fused_llm, history_queries_tensor)
         all_visibility = coarse_results["visibility"]
-        all_heatmaps = self.fine(
+        all_heatmaps, all_heatmap_logits = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             spatial_out=coarse_results["spatial_out"],
+            return_logits=True,
         )
 
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        all_heatmap_logits = (
+            all_heatmap_logits
+            * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
 
-        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {
+            "visibility": all_visibility,
+            "heatmaps": all_heatmaps,
+            "heatmap_logits": all_heatmap_logits,
+        }
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
+            result.update(self._build_inference_heatmaps(result))
         return result
 
     def _decode_feature_tensors_batch(
@@ -643,6 +672,7 @@ class HeatmapVLN(nn.Module):
             return {
                 "visibility": torch.empty(0, 0, 4, device=device),
                 "heatmaps": torch.empty(0, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(0, 0, 4, 64, 64, device=device),
             }
 
         max_hist = max(num_histories) if num_histories else 0
@@ -650,6 +680,7 @@ class HeatmapVLN(nn.Module):
             return {
                 "visibility": torch.empty(batch_size, 0, 4, device=device),
                 "heatmaps": torch.empty(batch_size, 0, 4, 64, 64, device=device),
+                "heatmap_logits": torch.empty(batch_size, 0, 4, 64, 64, device=device),
             }
 
         self._validate_and_log_current_llm_layer_tensors(llm_layer_tensors)
@@ -753,10 +784,11 @@ class HeatmapVLN(nn.Module):
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             t_fine0 = time.perf_counter()
-        all_heatmaps = self.fine(
+        all_heatmaps, all_heatmap_logits = self.fine(
             vit_fused=fused_vit,
             coarse_heatmap=coarse_results["coarse_heatmap"],
             spatial_out=coarse_results["spatial_out"],
+            return_logits=True,
         )
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
@@ -768,13 +800,21 @@ class HeatmapVLN(nn.Module):
         history_mask_f = history_mask.to(all_visibility.dtype)
         all_visibility = all_visibility * history_mask_f.unsqueeze(-1)
         all_heatmaps = all_heatmaps * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        all_heatmap_logits = (
+            all_heatmap_logits
+            * history_mask_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
         if self.enable_runtime_timing:
             self._sync_for_timing(device)
             timings["decode_post_s"] = time.perf_counter() - t_post0
 
-        result = {"visibility": all_visibility, "heatmaps": all_heatmaps}
+        result = {
+            "visibility": all_visibility,
+            "heatmaps": all_heatmaps,
+            "heatmap_logits": all_heatmap_logits,
+        }
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(all_heatmaps, all_visibility)
+            result.update(self._build_inference_heatmaps(result))
         if self.enable_runtime_timing:
             result["timings"] = timings
         return result
@@ -793,13 +833,74 @@ class HeatmapVLN(nn.Module):
             history_mask=history_mask,
         )
         if not self.training:
-            result["heatmaps_gated"] = self._gated_softmax_heatmaps(result["heatmaps"], result["visibility"])
+            result.update(self._build_inference_heatmaps(result))
         return result
+
+    def _build_inference_heatmaps(
+        self,
+        result: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Build operational probabilities from the same raw logits as training."""
+        heatmap_logits = result.get("heatmap_logits")
+        if heatmap_logits is None:
+            raise RuntimeError(
+                "Heatmap inference requires raw heatmap_logits; the decoder "
+                "returned only sigmoid probabilities"
+            )
+        visibility = result["visibility"]
+        if self.joint_panorama_inference:
+            heatmaps_gated, none_probability = self._joint_panorama_probabilities(
+                heatmap_logits,
+                visibility,
+            )
+            return {
+                "heatmaps_gated": heatmaps_gated.to(result["heatmaps"].dtype),
+                "none_probability": none_probability,
+            }
+        return {
+            "heatmaps_gated": self._gated_softmax_heatmaps(
+                result["heatmaps"],
+                visibility,
+                heatmap_logits=heatmap_logits,
+            )
+        }
+
+    @staticmethod
+    def _joint_panorama_probabilities(
+        heatmap_logits: torch.Tensor,
+        visibility: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized ``4*H*W + none`` hierarchical probabilities."""
+        logits = heatmap_logits.float()
+        height, width = logits.shape[-2:]
+        spatial_probability = torch.softmax(
+            logits.reshape(*logits.shape[:-2], height * width),
+            dim=-1,
+        ).reshape_as(logits)
+
+        view_logits = visibility.float()
+        none_logit = torch.zeros(
+            *view_logits.shape[:-1],
+            1,
+            device=view_logits.device,
+            dtype=view_logits.dtype,
+        )
+        view_none_probability = torch.softmax(
+            torch.cat((none_logit, view_logits), dim=-1),
+            dim=-1,
+        )
+        view_probability = view_none_probability[..., 1:]
+        while view_probability.dim() < spatial_probability.dim():
+            view_probability = view_probability.unsqueeze(-1)
+        joint_probability = spatial_probability * view_probability
+        return joint_probability, view_none_probability[..., 0]
 
     @staticmethod
     def _gated_softmax_heatmaps(
         heatmaps: torch.Tensor,
         visibility: torch.Tensor,
+        *,
+        heatmap_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Produce inference-time probability heatmaps.
 
@@ -811,9 +912,19 @@ class HeatmapVLN(nn.Module):
 
         Returns tensor with same shape as *heatmaps*.
         """
-        # (..., H, W) → logits → spatial softmax probability
+        # Legacy callers can omit logits; corrected training/inference passes
+        # the decoder's raw output and avoids sigmoid -> clamp -> logit.
         _H, _W = heatmaps.shape[-2], heatmaps.shape[-1]
-        logits = torch.logit(heatmaps.float().clamp(1e-6, 1 - 1e-6))
+        logits = (
+            heatmap_logits.float()
+            if heatmap_logits is not None
+            else torch.logit(heatmaps.float().clamp(1e-6, 1 - 1e-6))
+        )
+        if logits.shape != heatmaps.shape:
+            raise ValueError(
+                "heatmap_logits/heatmaps shape mismatch: "
+                f"{tuple(logits.shape)} vs {tuple(heatmaps.shape)}"
+            )
         probs = torch.softmax(logits.reshape(*logits.shape[:-2], -1), dim=-1)
         probs = probs.reshape_as(heatmaps).to(heatmaps.dtype)
         # Visibility gate

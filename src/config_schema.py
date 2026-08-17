@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+import warnings
 from pathlib import Path
 from typing import Any, Literal, Union
 
@@ -51,17 +53,128 @@ class _Lenient(BaseModel):
 # --- Data -------------------------------------------------------------------
 
 
+
+SINGLE_VIEW_HISTORY_CONFIG_KEY = "load_single_view_history_frames"
+DEPRECATED_HISTORY_CONFIG_KEY = "load_history_frames"
+
+
+def migrate_single_view_history_config(
+    data: Any,
+    *,
+    section_path: str,
+    warn_deprecated: bool = True,
+) -> Any:
+    """Normalize the ambiguous history-frame key without changing behavior.
+
+    ``load_single_view_history_frames`` controls only the single-view
+    ``history_frames`` tensor.  It does not control panoramic
+    ``history_panoramas``.  The old key remains readable during migration,
+    but conflicting old/new values fail closed.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    normalized = dict(data)
+    if DEPRECATED_HISTORY_CONFIG_KEY not in normalized:
+        return normalized
+
+    legacy_value = normalized.pop(DEPRECATED_HISTORY_CONFIG_KEY)
+    if (
+        SINGLE_VIEW_HISTORY_CONFIG_KEY in normalized
+        and normalized[SINGLE_VIEW_HISTORY_CONFIG_KEY] != legacy_value
+    ):
+        raise ValueError(
+            f"Conflicting history settings: "
+            f"{section_path}.{SINGLE_VIEW_HISTORY_CONFIG_KEY}="
+            f"{normalized[SINGLE_VIEW_HISTORY_CONFIG_KEY]!r}, but "
+            f"{section_path}.{DEPRECATED_HISTORY_CONFIG_KEY}={legacy_value!r}. "
+            "The setting controls only the single-view history_frames tensor; "
+            "it does not control history_panoramas."
+        )
+
+    normalized.setdefault(SINGLE_VIEW_HISTORY_CONFIG_KEY, legacy_value)
+    if warn_deprecated:
+        warnings.warn(
+            f"{section_path}.{DEPRECATED_HISTORY_CONFIG_KEY} is deprecated; use "
+            f"{section_path}.{SINGLE_VIEW_HISTORY_CONFIG_KEY}. This setting controls "
+            "only the single-view history_frames tensor; panoramic "
+            "history_panoramas are independent.",
+            FutureWarning,
+            stacklevel=3,
+        )
+    return normalized
+
+
 class SlidingWindowConfig(_Lenient):
     min_history: int = 5
     num_history_sample: int = 8
     load_depth: bool = True
     cache_poses: bool = True
     sample_stride: int = 1
+    enable_augmentation: bool = False
     clip_level_sampling: bool = True
     samples_per_clip: int = 2
     val_samples_per_clip: int = 2
     defer_heatmap_to_gpu: bool = False
-    load_history_frames: bool = True
+    # Controls only the single-view ``history_frames`` tensor. Panoramic
+    # ``history_panoramas`` are loaded independently when available.
+    load_single_view_history_frames: bool = True
+    # Keep panoramic pose/depth supervision while loading only front RGB.
+    single_view_rgb_input: bool = False
+    # Optional input-only sidecar.  When set, history_rel_poses comes 100%
+    # from causal AMB3R-VO; GT c2w remains available only to build targets.
+    amb3r_pose_cache_root: str | None = None
+    require_amb3r_pose_cache: bool = False
+    amb3r_pose_cache_max_clips: int = 16
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_history_frame_key(cls, data: Any) -> Any:
+        return migrate_single_view_history_config(
+            data,
+            section_path="data.sliding_window",
+        )
+
+    @model_validator(mode="after")
+    def _check_single_view_rgb_contract(self):
+        if self.single_view_rgb_input and not self.load_single_view_history_frames:
+            raise ValueError(
+                "single_view_rgb_input requires "
+                "load_single_view_history_frames=true"
+            )
+        if self.require_amb3r_pose_cache and not (
+            isinstance(self.amb3r_pose_cache_root, str)
+            and self.amb3r_pose_cache_root.strip()
+        ):
+            raise ValueError(
+                "require_amb3r_pose_cache=true requires amb3r_pose_cache_root"
+            )
+        if self.amb3r_pose_cache_root and not self.require_amb3r_pose_cache:
+            raise ValueError(
+                "amb3r_pose_cache_root requires require_amb3r_pose_cache=true; "
+                "an optional fallback to GT poses is forbidden"
+            )
+        if self.require_amb3r_pose_cache and not self.single_view_rgb_input:
+            raise ValueError(
+                "AMB3R pose-cache domain adaptation requires single_view_rgb_input=true"
+            )
+        if self.amb3r_pose_cache_max_clips < 1:
+            raise ValueError("amb3r_pose_cache_max_clips must be >= 1")
+        return self
+
+
+class FutureTrajectoryHeatmapDataConfig(_Strict):
+    enabled: bool = False
+    heatmap_size: list[int] = [64, 64]
+
+    @field_validator("heatmap_size")
+    @classmethod
+    def _check_fixed_heatmap_size(cls, value: list[int]) -> list[int]:
+        if value != [64, 64]:
+            raise ValueError(
+                "Future trajectory heatmap_size must be exactly [64,64]"
+            )
+        return value
 
 
 class TrajectoryConfig(_Lenient):
@@ -81,10 +194,17 @@ class TrajectoryConfig(_Lenient):
     enable_augmentation: bool = True
     enable_trajectory_augmentation: bool = True
     load_traj_images: bool = False
-    load_history_frames: bool = True
+    # Controls only the single-view ``history_frames`` tensor. Panoramic
+    # ``history_panoramas`` are loaded independently when enabled.
+    load_single_view_history_frames: bool = True
+    single_view_rgb_input: bool = False
+    amb3r_pose_cache_root: str | None = None
+    require_amb3r_pose_cache: bool = False
+    amb3r_pose_cache_max_clips: int = 16
     traj_image_size: list[int] = [224, 224]
     compute_pixel_goal: bool = False
     compute_pano_view_pixel_goal: bool | None = None
+    compute_aligned_native_pixel_goal: bool = False
     pano_max_side_dist_m: float = 6.0
     load_lookdown_for_system2: bool = False
     system2_sft_protocol: str = "direct"
@@ -101,10 +221,17 @@ class TrajectoryConfig(_Lenient):
     include_stop_samples_random_subsequence: bool = False
     panoramic_vlm_input: bool = True
     trajectory_target_convention: str = "legacy_pitched_camera"
+    future_heatmap: FutureTrajectoryHeatmapDataConfig = (
+        FutureTrajectoryHeatmapDataConfig()
+    )
 
     @model_validator(mode="before")
     @classmethod
     def _reject_removed_subinstruction_keys(cls, data: Any) -> Any:
+        data = migrate_single_view_history_config(
+            data,
+            section_path="data.trajectory",
+        )
         if isinstance(data, dict):
             removed = {"use_subinstruction", "fgr2r_subinstr_path"} & set(data)
             if removed:
@@ -159,9 +286,167 @@ class TrajectoryConfig(_Lenient):
             raise ValueError(f"system2_stop_oversample must be >= 0, got {v}")
         return v
 
+    @model_validator(mode="after")
+    def _check_amb3r_future_contract(self):
+        if self.single_view_rgb_input and not self.load_single_view_history_frames:
+            raise ValueError(
+                "single_view_rgb_input requires "
+                "load_single_view_history_frames=true"
+            )
+        if self.require_amb3r_pose_cache and not (
+            isinstance(self.amb3r_pose_cache_root, str)
+            and self.amb3r_pose_cache_root.strip()
+        ):
+            raise ValueError(
+                "require_amb3r_pose_cache=true requires amb3r_pose_cache_root"
+            )
+        if self.amb3r_pose_cache_root and not self.require_amb3r_pose_cache:
+            raise ValueError(
+                "amb3r_pose_cache_root requires "
+                "require_amb3r_pose_cache=true; GT fallback is forbidden"
+            )
+        if self.require_amb3r_pose_cache and not self.single_view_rgb_input:
+            raise ValueError(
+                "trajectory AMB3R cache requires single_view_rgb_input=true"
+            )
+        if self.require_amb3r_pose_cache and self.random_subsequence:
+            raise ValueError(
+                "endpoint-v2 AMB3R cache requires random_subsequence=false"
+            )
+        if self.amb3r_pose_cache_max_clips < 1:
+            raise ValueError("amb3r_pose_cache_max_clips must be >= 1")
+
+        if self.future_heatmap.enabled:
+            if self.predict_horizon != 32:
+                raise ValueError(
+                    "Future trajectory heatmaps require predict_horizon=32"
+                )
+            if self.trajectory_target_convention != "internnav_habitat":
+                raise ValueError(
+                    "Future trajectory heatmaps require "
+                    "trajectory_target_convention='internnav_habitat'"
+                )
+            if not self.load_traj_images or not self.require_sft_target:
+                raise ValueError(
+                    "Future trajectory heatmaps require load_traj_images=true "
+                    "and require_sft_target=true"
+                )
+            if self.enable_trajectory_augmentation:
+                raise ValueError(
+                    "Future trajectory heatmaps require "
+                    "enable_trajectory_augmentation=false so the map and "
+                    "System-1 action target remain identical"
+                )
+        return self
+
+
+class TrajectoryDaggerConfig(_Strict):
+    """Typed input contract for sealed online-correction trajectories."""
+
+    collection_roots: list[str] | str | None = None
+    collection_root: str | None = None
+    val_collection_roots: list[str] | str | None = None
+    val_collection_root: str | None = None
+    allow_unsealed_debug: bool = False
+    source_types: list[Literal["dagger_normal", "dagger_hard"]] | None = None
+    num_history: int = 8
+    verify_tar_sha256: bool = False
+    require_lookdown: bool = True
+    expected_policy_mode: str | None = None
+    expected_policy_fingerprint: str | None = None
+
+    @field_validator("num_history")
+    @classmethod
+    def _check_num_history(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("trajectory_dagger.num_history must be >= 1")
+        return value
+
+    @field_validator("collection_root", "val_collection_root")
+    @classmethod
+    def _check_single_roots(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("trajectory_dagger collection roots cannot be blank")
+        return value
+
+    @field_validator("source_types")
+    @classmethod
+    def _check_source_types(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and not value:
+            raise ValueError("trajectory_dagger.source_types cannot be empty")
+        return value
+
+    @field_validator("collection_roots", "val_collection_roots")
+    @classmethod
+    def _check_root_lists(
+        cls, value: list[str] | str | None
+    ) -> list[str] | str | None:
+        if isinstance(value, list) and not value:
+            raise ValueError("trajectory_dagger collection root lists cannot be empty")
+        if isinstance(value, list) and any(not str(root).strip() for root in value):
+            raise ValueError("trajectory_dagger collection roots cannot be blank")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("trajectory_dagger collection roots cannot be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _check_provenance_and_roots(self):
+        if (self.collection_roots is None) == (self.collection_root is None):
+            raise ValueError(
+                "set exactly one of trajectory_dagger.collection_roots or collection_root"
+            )
+        if (
+            self.val_collection_roots is not None
+            and self.val_collection_root is not None
+        ):
+            raise ValueError(
+                "set at most one of trajectory_dagger.val_collection_roots or val_collection_root"
+            )
+        if self.expected_policy_fingerprint and not self.expected_policy_mode:
+            raise ValueError(
+                "expected_policy_fingerprint requires expected_policy_mode"
+            )
+        if self.expected_policy_mode == "internnav_native":
+            fingerprint = self.expected_policy_fingerprint or ""
+            if re.fullmatch(r"internnav-native-v1:[0-9a-f]{64}", fingerprint) is None:
+                raise ValueError(
+                    "internnav_native requires expected_policy_fingerprint="
+                    "internnav-native-v1:<64 lowercase hex chars>"
+                )
+        return self
+
+
+class ExpertDaggerMixtureConfig(_Strict):
+    """Sampling contract for expert/normal-DAgger/hard-DAgger data."""
+
+    profile: str | None = "expert50_normal20_hard30"
+    weights: dict[str, float] | None = None
+    epoch_size: int | None = None
+    seed: int = 42
+
+    @model_validator(mode="after")
+    def _check_selection(self):
+        if self.profile is None and self.weights is None:
+            raise ValueError("mixture requires either profile or weights")
+        if self.profile is not None and self.weights is not None:
+            raise ValueError("mixture accepts either profile or weights, not both")
+        if self.weights is not None:
+            expected = {"expert", "dagger_normal", "dagger_hard"}
+            if set(self.weights) != expected:
+                raise ValueError(
+                    f"mixture.weights must contain exactly {sorted(expected)}"
+                )
+            if any(weight < 0 for weight in self.weights.values()):
+                raise ValueError("mixture weights must be non-negative")
+            if sum(self.weights.values()) <= 0:
+                raise ValueError("mixture weights must have a positive total")
+        if self.epoch_size is not None and self.epoch_size < 1:
+            raise ValueError("mixture.epoch_size must be >= 1")
+        return self
+
 
 class DataConfig(_Strict):
-    root: str
+    root: str | None = None
     train_split: str = "train"
     val_root: str | None = None
     val_split: str = "val"
@@ -170,11 +455,16 @@ class DataConfig(_Strict):
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    in_order: bool = False
     dataset_type: str = "sliding_window"
     sliding_window: SlidingWindowConfig | None = None
     trajectory: TrajectoryConfig | None = None
+    trajectory_dagger: TrajectoryDaggerConfig | None = None
+    mixture: ExpertDaggerMixtureConfig | None = None
     use_worker_tokenized_collator: bool | None = None
+    # ``True`` is mandatory for heatmap-control mixture training so that a
+    # deterministic sampler remains exactly replayable across mid-epoch resume.
+    # ``None`` preserves the legacy policy for unrelated training recipes.
+    in_order: bool | None = None
     shm_bypass: Union[bool, str] = "auto"
     shm_bypass_min_gb: float = 8.0
 
@@ -188,7 +478,12 @@ class DataConfig(_Strict):
     @field_validator("dataset_type")
     @classmethod
     def _check_dataset_type(cls, v: str) -> str:
-        allowed = {"sliding_window", "trajectory"}
+        allowed = {
+            "sliding_window",
+            "trajectory",
+            "trajectory_dagger",
+            "expert_dagger_mixture",
+        }
         if v not in allowed:
             raise ValueError(f"dataset_type must be one of {allowed}, got '{v}'")
         return v
@@ -210,6 +505,29 @@ class DataConfig(_Strict):
         if v < 0:
             raise ValueError(f"shm_bypass_min_gb must be >= 0, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def _check_dataset_sections(self):
+        if self.dataset_type != "trajectory_dagger" and not (
+            isinstance(self.root, str) and self.root.strip()
+        ):
+            raise ValueError(f"data.root is required for {self.dataset_type}")
+        if self.dataset_type == "trajectory" and self.trajectory is None:
+            raise ValueError("data.trajectory is required for trajectory datasets")
+        if self.dataset_type == "trajectory_dagger" and self.trajectory_dagger is None:
+            raise ValueError(
+                "data.trajectory_dagger is required for trajectory_dagger datasets"
+            )
+        if self.dataset_type == "expert_dagger_mixture":
+            if self.trajectory is None:
+                raise ValueError("data.trajectory is required for expert_dagger_mixture")
+            if self.trajectory_dagger is None:
+                raise ValueError(
+                    "data.trajectory_dagger is required for expert_dagger_mixture"
+                )
+            if self.mixture is None:
+                raise ValueError("data.mixture is required for expert_dagger_mixture")
+        return self
 
 
 # --- Model -------------------------------------------------------------------
@@ -273,6 +591,15 @@ class HeatmapModelConfig(_Lenient):
     lambda_peak: float = 1.0
     heatmap_trains_backbone: bool = False
     decoder_mode: str = "legacy"
+    restore_vit_spatial_layout: bool = False
+    coarse_logit_residual: bool = False
+    joint_panorama_inference: bool = False
+    input_mode: Literal["panoramic", "internnav_single_view"] = "panoramic"
+    feature_source: str = "vit_and_llm"
+    architecture_id: str = ""
+    output_direction_order: list[str] = ["front", "right", "back", "left"]
+    history_pose_convention: str = ""
+    conditioner_global_context: bool = True
     pose_free: HeatmapPoseFreeConfig | None = None
     trajectory: HeatmapTrajectoryConfig | None = None
 
@@ -283,6 +610,145 @@ class HeatmapModelConfig(_Lenient):
         if normalized not in {"legacy", "pose_free_matcher"}:
             raise ValueError(f"decoder_mode must be 'legacy' or 'pose_free_matcher', got {value!r}")
         return normalized
+
+    @model_validator(mode="after")
+    def _check_single_view_heatmap_contract(self):
+        if self.input_mode != "internnav_single_view":
+            return self
+        expected_architecture = (
+            "internnav_single_view_vision_only_four_direction_v2"
+        )
+        expected_pose = (
+            "habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1"
+        )
+        if self.feature_source != "vit_only":
+            raise ValueError("internnav_single_view requires feature_source=vit_only")
+        if (self.c_vit, self.c_llm, self.c_fused) != (1280, 3584, 256):
+            raise ValueError(
+                "internnav_single_view v2 requires c_vit/c_llm/c_fused="
+                "1280/3584/256"
+            )
+        if self.vit_layer_indices != [7, 15, 23, 31]:
+            raise ValueError(
+                "internnav_single_view v2 requires ViT layers [7,15,23,31]"
+            )
+        if self.architecture_id != expected_architecture:
+            raise ValueError(
+                "internnav_single_view architecture_id must be "
+                f"{expected_architecture!r}"
+            )
+        if tuple(self.output_direction_order) != (
+            "front",
+            "right",
+            "back",
+            "left",
+        ):
+            raise ValueError(
+                "internnav_single_view direction order must be "
+                "front/right/back/left"
+            )
+        if self.history_pose_convention != expected_pose:
+            raise ValueError(
+                "internnav_single_view history_pose_convention must be "
+                f"{expected_pose!r}"
+            )
+        if self.heatmap_trains_backbone:
+            raise ValueError("internnav_single_view must freeze the backbone")
+        if not self.restore_vit_spatial_layout:
+            raise ValueError(
+                "internnav_single_view requires restore_vit_spatial_layout=true"
+            )
+        if self.decoder_mode != "legacy":
+            raise ValueError("internnav_single_view requires decoder_mode=legacy")
+        if self.trajectory is None or not self.trajectory.enable:
+            raise ValueError(
+                "internnav_single_view requires heatmap.trajectory.enable=true"
+            )
+        trajectory_contract = (
+            self.trajectory.num_freqs,
+            self.trajectory.d_attn,
+            self.trajectory.num_heads,
+            self.trajectory.num_layers,
+            self.trajectory.max_spatial_range,
+        )
+        if trajectory_contract != (16, 256, 4, 2, 10.0):
+            raise ValueError(
+                "internnav_single_view v2 requires trajectory "
+                "num_freqs/d_attn/num_heads/num_layers/max_spatial_range="
+                "16/256/4/2/10.0 for the audited weight migration"
+            )
+        return self
+
+
+class HeatmapControlConfig(_Strict):
+    """Frozen heatmap producer and trainable System1 control contract."""
+
+    enabled: bool = False
+    schema_version: Literal["heatmap-control-v1"] = "heatmap-control-v1"
+    token_dim: int = 128
+    control_dim: int = 128
+    num_heads: int = 4
+    coarse_size: int = 8
+    temporal_layers: int = 1
+    temporal_heads: int = 4
+    temporal_ffn_dim: int = 512
+    dropout: float = 0.0
+    age_normalizer_steps: float = 32.0
+    heatmap_checkpoint_path: str = ""
+    heatmap_checkpoint_sha256: str = ""
+
+    @model_validator(mode="after")
+    def _check_architecture_contract(self):
+        positive_dimensions = {
+            "token_dim": self.token_dim,
+            "control_dim": self.control_dim,
+            "num_heads": self.num_heads,
+            "coarse_size": self.coarse_size,
+            "temporal_layers": self.temporal_layers,
+            "temporal_heads": self.temporal_heads,
+            "temporal_ffn_dim": self.temporal_ffn_dim,
+        }
+        invalid = [name for name, value in positive_dimensions.items() if value < 1]
+        if invalid:
+            raise ValueError(
+                "heatmap_control dimensions must be positive: " + ", ".join(invalid)
+            )
+        if self.token_dim != self.control_dim:
+            raise ValueError("heatmap_control requires token_dim == control_dim")
+        if self.control_dim % self.num_heads != 0:
+            raise ValueError("control_dim must be divisible by num_heads")
+        if self.token_dim % self.temporal_heads != 0:
+            raise ValueError("token_dim must be divisible by temporal_heads")
+        architecture = (
+            self.token_dim,
+            self.control_dim,
+            self.num_heads,
+            self.coarse_size,
+            self.temporal_layers,
+            self.temporal_heads,
+        )
+        if architecture != (128, 128, 4, 8, 1, 4):
+            raise ValueError(
+                "heatmap-control-v1 requires token/control/heads/coarse/"
+                "temporal_layers/temporal_heads=128/128/4/8/1/4"
+            )
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("heatmap_control.dropout must be in [0, 1)")
+        if self.age_normalizer_steps <= 0:
+            raise ValueError("age_normalizer_steps must be > 0")
+        if self.enabled:
+            if not self.heatmap_checkpoint_path.strip():
+                raise ValueError(
+                    "enabled heatmap_control requires heatmap_checkpoint_path"
+                )
+            if re.fullmatch(
+                r"[0-9a-f]{64}", self.heatmap_checkpoint_sha256
+            ) is None:
+                raise ValueError(
+                    "enabled heatmap_control requires a 64-character lowercase "
+                    "SHA-256 heatmap_checkpoint_sha256"
+                )
+        return self
 
 
 class NextDiTConfig(_Lenient):
@@ -306,11 +772,31 @@ class NextDiTConfig(_Lenient):
     internnav_model_path: str = ""
     pretrained_system1_path: str | None = None
     warmup_steps: int = 0
+    heatmap_control: HeatmapControlConfig | None = None
 
 
 class ActionHeadConfig(_Lenient):
     enable: bool = True
     nextdit: NextDiTConfig | None = None
+
+
+class PastPlanActionConfig(_Strict):
+    """Directed latent-chain v1; decoded maps are never injected into NextDiT."""
+
+    enabled: bool = False
+    schema_version: Literal["past-plan-action-v1"] = "past-plan-action-v1"
+    plan_dim: int = 768
+    memory_dim: int = 256
+    bridge_heads: int = 8
+
+    @model_validator(mode="after")
+    def _check_dimensions(self):
+        if (self.plan_dim, self.memory_dim, self.bridge_heads) != (768, 256, 8):
+            raise ValueError(
+                "past-plan-action-v1 requires plan_dim/memory_dim/bridge_heads="
+                "768/256/8"
+            )
+        return self
 
 
 class ModelConfig(_Lenient):
@@ -319,6 +805,7 @@ class ModelConfig(_Lenient):
     llm: LLMConfig | None = None
     heatmap: HeatmapModelConfig | None = None
     action_head: ActionHeadConfig | None = None
+    past_plan_action: PastPlanActionConfig | None = None
 
 
 # --- Optim -------------------------------------------------------------------
@@ -327,6 +814,17 @@ class ModelConfig(_Lenient):
 class OptimConfig(_Lenient):
     optimizer: str = "adamw"
     learning_rate: float = 1e-4
+    heatmap_lr: float = 2e-4
+    heatmap_tokenizer_lr: float = 1e-4
+    heatmap_control_lr: float = 5e-5
+    heatmap_gate_lr: float = 1e-4
+    heatmap_vit_lr: float | None = None
+    heatmap_fine_lr: float | None = None
+    heatmap_llm_lr: float | None = None
+    heatmap_coarse_lr: float | None = None
+    heatmap_proj_traj_lr: float | None = None
+    heatmap_new_lr: float | None = None
+    vis_head_lr: float | None = None
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     amp: str = "bf16"
@@ -362,6 +860,12 @@ class HeatmapVLNLossConfig(_Lenient):
     lambda_neg: float = 0.0
     temperature: float = 1.0
     vis_pos_weight: float = 1.0
+    lambda_view_macro: float = 0.0
+    lambda_direction_macro: float = 0.0
+    lambda_panoramic_view: float = 0.0
+    panoramic_detach_visibility: bool = False
+    coord_smooth_l1_beta: float = 0.1
+    allow_probability_fallback: bool = True
     temperature_schedule: TemperatureScheduleConfig | None = None
 
 
@@ -371,9 +875,71 @@ class LossConfig(_Lenient):
     heatmap_weight: float = 1.0
     trajectory_weight: float = 0.0
     lm_weight: float = 1.0
+    history_weight: float = 0.3
+    future_weight: float = 0.3
+    preserve_weight: float = 0.5
+    delta_z_weight: float = 0.01
+    future_heatmap: dict[str, Any] = {}
 
 
 # --- Training ----------------------------------------------------------------
+
+
+class HeatmapWarmstartContractConfig(_Strict):
+    """Fail-closed warm-start contract for HeatmapVLN training."""
+
+    policy: Literal[
+        "spatial_reset_v1",
+        "full_head_v1",
+        "internnav_single_view_head_v2",
+    ] = "spatial_reset_v1"
+    expected_lora_tensors: int = 224
+    expected_vit_dpt_tensors: int = 12
+    expected_llm_dpt_tensors: int = 10
+    expected_coarse_tensors: int = 37
+    expected_fine_tensors: int = 6
+    require_metadata: bool = True
+
+    @field_validator(
+        "expected_lora_tensors",
+        "expected_vit_dpt_tensors",
+        "expected_llm_dpt_tensors",
+        "expected_coarse_tensors",
+        "expected_fine_tensors",
+    )
+    @classmethod
+    def _positive_expected_tensor_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("warm-start tensor counts must be >= 0")
+        return value
+
+    @model_validator(mode="after")
+    def _check_policy_specific_counts(self):
+        counts = {
+            "expected_lora_tensors": self.expected_lora_tensors,
+            "expected_vit_dpt_tensors": self.expected_vit_dpt_tensors,
+            "expected_llm_dpt_tensors": self.expected_llm_dpt_tensors,
+            "expected_coarse_tensors": self.expected_coarse_tensors,
+            "expected_fine_tensors": self.expected_fine_tensors,
+        }
+        if self.policy == "internnav_single_view_head_v2":
+            expected = {
+                "expected_lora_tensors": 0,
+                "expected_vit_dpt_tensors": 12,
+                "expected_llm_dpt_tensors": 0,
+                "expected_coarse_tensors": 35,
+                "expected_fine_tensors": 6,
+            }
+            if counts != expected or not self.require_metadata:
+                raise ValueError(
+                    "internnav_single_view_head_v2 requires exact counts "
+                    f"{expected} and require_metadata=true"
+                )
+        elif any(value < 1 for value in counts.values()):
+            raise ValueError(
+                f"{self.policy} warm-start tensor counts must all be >= 1"
+            )
+        return self
 
 
 class TrainingStageConfig(_Lenient):
@@ -393,6 +959,7 @@ class TrainingStageConfig(_Lenient):
     require_complete_internnav_system1: bool | None = None
     base_checkpoint_lora_only: bool = False
     merge_frozen_lora: bool = False
+    heatmap_warmstart_contract: HeatmapWarmstartContractConfig | None = None
     retain_raw_panoramic_views: bool = True
     compute_pano_text_anchor_positions: bool = True
     retain_history_rel_poses: bool = True
@@ -402,6 +969,11 @@ class TrainingStageConfig(_Lenient):
     lm_weight: float | None = None
     trainable_modules: list[str] = []
     frozen_modules: list[str] = []
+    heatmap_trainable_parameter_prefixes: list[str] = []
+    heatmap_pose_adaptation_init: bool = False
+    required_history_pose_provider: str | None = None
+    past_plan_action_stage: str | None = None
+    trajectory_sequence_mode: str = "all"
 
     @field_validator("epochs")
     @classmethod
@@ -419,6 +991,63 @@ class TrainingStageConfig(_Lenient):
         if v not in allowed:
             raise ValueError(f"system2_sft_protocol must be one of {allowed}, got '{v}'")
         return v
+
+    @model_validator(mode="after")
+    def _check_heatmap_pose_adaptation_scope(self):
+        prefixes = self.heatmap_trainable_parameter_prefixes
+        if self.past_plan_action_stage is not None:
+            if prefixes:
+                raise ValueError(
+                    "Past->Plan->Action uses its audited shared-map scope and "
+                    "must not reuse the four-prefix pose-adaptation whitelist"
+                )
+            if not self.heatmap_pose_adaptation_init:
+                raise ValueError(
+                    "Past->Plan->Action requires exact initialization from the "
+                    "complete 79-parameter single-view Heatmap Head"
+                )
+            if self.required_history_pose_provider != "amb3r_vo_cache":
+                raise ValueError(
+                    "Past->Plan->Action requires "
+                    "required_history_pose_provider='amb3r_vo_cache'"
+                )
+            return self
+        if not prefixes and not self.heatmap_pose_adaptation_init:
+            if self.required_history_pose_provider is not None:
+                raise ValueError(
+                    "required_history_pose_provider is only valid for pose adaptation"
+                )
+            return self
+        expected = {
+            "heatmap_vln.coarse.proj_traj.",
+            "heatmap_vln.coarse.self_attn.",
+            "heatmap_vln.coarse.vis_head.",
+            "heatmap_vln.coarse.heatmap_head.",
+        }
+        if len(prefixes) != 4 or set(prefixes) != expected:
+            raise ValueError(
+                "AMB3R pose adaptation requires exactly the four audited "
+                "heatmap_trainable_parameter_prefixes"
+            )
+        if self.trainable_modules != ["heatmap_vln"]:
+            raise ValueError(
+                "AMB3R pose adaptation requires trainable_modules=['heatmap_vln']"
+            )
+        if not self.strict_trainable_modules:
+            raise ValueError(
+                "AMB3R pose adaptation requires strict_trainable_modules=true"
+            )
+        if not self.heatmap_pose_adaptation_init:
+            raise ValueError(
+                "heatmap_trainable_parameter_prefixes requires "
+                "heatmap_pose_adaptation_init=true"
+            )
+        if self.required_history_pose_provider != "amb3r_vo_cache":
+            raise ValueError(
+                "AMB3R pose adaptation requires "
+                "required_history_pose_provider='amb3r_vo_cache'"
+            )
+        return self
 
 
 class TrainingConfig(_Strict):
@@ -473,7 +1102,18 @@ class LogConfig(_Lenient):
 class ValidationConfig(_Lenient):
     enabled: bool = True
     eval_every_epochs: int = 1
+    best_selection_enabled: bool = True
     save_best_metric: str = "val_total_loss"
+    save_best_mode: Literal["min", "max"] = "min"
+    evaluate_before_training: bool = False
+    baseline_as_best_threshold: bool = False
+    baseline_overall_metric: str = "val_heatmap_joint_pck8"
+    baseline_overall_tolerance: float = 0.02
+    baseline_back_metric: str = "val_heatmap_back_pck8"
+    baseline_back_tolerance: float = 0.03
+    baseline_direction_metrics: dict[str, str] | None = None
+    baseline_direction_tolerance: float = 0.03
+    save_best_loss_tiebreak_metric: str = "val_loss"
     patience: int = 5
     val_inference_batches: int = 10
 
@@ -498,6 +1138,409 @@ class TrainConfig(_Lenient):
     gpu: GPUConfig = GPUConfig()
     log: LogConfig
     validation: ValidationConfig = ValidationConfig()
+
+    @model_validator(mode="after")
+    def _check_native_single_view_training_contract(self):
+        heatmap = self.model.heatmap
+        if heatmap is None or heatmap.input_mode != "internnav_single_view":
+            return self
+        action_head = self.model.action_head
+        nextdit = action_head.nextdit if action_head is not None else None
+        control = nextdit.heatmap_control if nextdit is not None else None
+        past_plan_action = self.model.past_plan_action
+        llm = self.model.llm
+        if control is not None and control.enabled:
+            if not heatmap.enable:
+                raise ValueError("heatmap_control requires model.heatmap.enable=true")
+            if llm is None:
+                raise ValueError("heatmap_control requires the original InternNav LLM")
+            if llm.use_lora:
+                raise ValueError("heatmap_control forbids System2 LoRA")
+            if llm.gradient_checkpointing:
+                raise ValueError(
+                    "heatmap_control freezes System2 and forbids its gradient checkpointing"
+                )
+            if action_head is None or not action_head.enable:
+                raise ValueError("heatmap_control requires model.action_head.enable=true")
+            if nextdit is None or not nextdit.enabled:
+                raise ValueError("heatmap_control requires the original NextDiT System1")
+
+            llm_path = os.path.normpath(llm.model_path.strip())
+            system1_path = os.path.normpath(nextdit.internnav_model_path.strip())
+            if not llm.model_path.strip() or not nextdit.internnav_model_path.strip():
+                raise ValueError(
+                    "heatmap_control requires one non-empty unified InternNav model path"
+                )
+            if llm_path != system1_path:
+                raise ValueError(
+                    "heatmap_control requires System2 and System1 to use the same "
+                    "original InternNav model path"
+                )
+            if nextdit.internnav_system1_path.strip():
+                raise ValueError("heatmap_control forbids internnav_system1_path overrides")
+            if nextdit.pretrained_system1_path not in (None, ""):
+                raise ValueError("heatmap_control forbids pretrained_system1_path overrides")
+            if nextdit.dav2_ckpt_path.strip():
+                raise ValueError("heatmap_control forbids external DAV2/System1 checkpoints")
+            if nextdit.warmup_steps != 0:
+                raise ValueError("heatmap_control requires NextDiT warmup_steps=0")
+
+            pano_adapter = getattr(nextdit, "pano_latent_adapter", None)
+            if isinstance(pano_adapter, dict):
+                pano_adapter_enabled = bool(pano_adapter.get("enabled", False))
+            else:
+                pano_adapter_enabled = bool(
+                    getattr(pano_adapter, "enabled", False)
+                )
+            if pano_adapter_enabled or bool(
+                getattr(nextdit, "pano_latent_adapter_enabled", False)
+            ):
+                raise ValueError("heatmap_control forbids the panoramic latent adapter")
+
+            if self.data.dataset_type not in {
+                "trajectory_dagger",
+                "expert_dagger_mixture",
+            }:
+                raise ValueError(
+                    "heatmap_control requires trajectory_dagger or expert_dagger_mixture data"
+                )
+            if self.data.dataset_type == "expert_dagger_mixture":
+                trajectory_data = self.data.trajectory
+                if trajectory_data is None:  # guarded by DataConfig; keeps this fail-closed
+                    raise ValueError(
+                        "expert_dagger_mixture requires trajectory data settings"
+                    )
+                if trajectory_data.trajectory_target_convention != "internnav_habitat":
+                    raise ValueError(
+                        "heatmap_control expert data requires "
+                        "trajectory_target_convention=internnav_habitat"
+                    )
+                if not trajectory_data.load_single_view_history_frames:
+                    raise ValueError(
+                        "heatmap_control expert data requires single-view history RGB"
+                    )
+                if not trajectory_data.load_traj_images:
+                    raise ValueError(
+                        "heatmap_control expert data requires load_traj_images=true"
+                    )
+                if trajectory_data.panoramic_vlm_input:
+                    raise ValueError(
+                        "heatmap_control requires the original front/lookdown "
+                        "InternNav System2 path (panoramic_vlm_input=false)"
+                    )
+                if trajectory_data.pixel_goal_direction != "front_down":
+                    raise ValueError(
+                        "heatmap_control requires pixel_goal_direction=front_down"
+                    )
+                if trajectory_data.predict_horizon != nextdit.predict_steps:
+                    raise ValueError(
+                        "expert trajectory predict_horizon must equal NextDiT predict_steps"
+                    )
+                mixture = self.data.mixture
+                if mixture is None or mixture.epoch_size is None:
+                    raise ValueError(
+                        "heatmap_control expert_dagger_mixture requires an explicit "
+                        "mixture.epoch_size"
+                    )
+                if self.data.in_order is not True:
+                    raise ValueError(
+                        "heatmap_control expert_dagger_mixture requires "
+                        "data.in_order=true for exact mid-epoch resume"
+                    )
+                configured_world_size = max(1, len(self.gpu.devices))
+                full_accumulation_batch = (
+                    configured_world_size
+                    * self.optim.batch_size
+                    * self.optim.grad_accum_steps
+                )
+                if mixture.epoch_size % full_accumulation_batch != 0:
+                    raise ValueError(
+                        "heatmap_control mixture.epoch_size must contain only "
+                        "full DDP gradient-accumulation windows; expected a "
+                        f"multiple of {full_accumulation_batch}"
+                    )
+                if (
+                    self.log.mid_epoch_save_every > 0
+                    and self.log.mid_epoch_save_every
+                    % self.optim.grad_accum_steps
+                    != 0
+                ):
+                    raise ValueError(
+                        "heatmap_control log.mid_epoch_save_every must align "
+                        "with optim.grad_accum_steps"
+                    )
+            for stage in self.training.stages:
+                if stage.trainable_modules != [
+                    "heatmap_tokenizer",
+                    "heatmap_control",
+                ]:
+                    raise ValueError(
+                        "heatmap_control must train exactly "
+                        "['heatmap_tokenizer', 'heatmap_control']"
+                    )
+                if not stage.strict_trainable_modules:
+                    raise ValueError(
+                        "heatmap_control requires strict_trainable_modules=true"
+                    )
+                if not stage.train_action:
+                    raise ValueError("heatmap_control requires train_action=true")
+                if stage.train_heatmap is not False:
+                    raise ValueError("heatmap_control requires train_heatmap=false")
+                if stage.train_history is not False or stage.train_future is not False:
+                    raise ValueError(
+                        "heatmap_control requires train_history=false and train_future=false"
+                    )
+                if stage.train_lm is not False or bool(stage.train_system2_sft):
+                    raise ValueError(
+                        "heatmap_control requires train_lm=false and no System2 SFT"
+                    )
+            if self.loss.trajectory_weight <= 0:
+                raise ValueError("heatmap_control requires trajectory_weight > 0")
+            if self.loss.heatmap_weight != 0 or self.loss.lm_weight != 0:
+                raise ValueError(
+                    "heatmap_control requires heatmap_weight=0 and lm_weight=0"
+                )
+            return self
+
+        if past_plan_action is not None and past_plan_action.enabled:
+            if not heatmap.enable:
+                raise ValueError("Past->Plan->Action requires Heatmap Head")
+            if llm is None or llm.use_lora or llm.gradient_checkpointing:
+                raise ValueError(
+                    "Past->Plan->Action requires a completely frozen native Qwen"
+                )
+            if action_head is None or not action_head.enable or nextdit is None or not nextdit.enabled:
+                raise ValueError(
+                    "Past->Plan->Action requires the released NextDiT System1"
+                )
+            if control is not None and control.enabled:
+                raise ValueError(
+                    "Past->Plan->Action forbids legacy heatmap control"
+                )
+            if nextdit.warmup_steps != 0:
+                raise ValueError(
+                    "Past->Plan->Action requires NextDiT warmup_steps=0 so the "
+                    "frozen native cond_projector cannot be re-enabled"
+                )
+            llm_path = os.path.normpath(llm.model_path.strip())
+            system1_path = os.path.normpath(nextdit.internnav_model_path.strip())
+            if not llm.model_path.strip() or not nextdit.internnav_model_path.strip():
+                raise ValueError(
+                    "Past->Plan->Action requires one complete native InternNav model path"
+                )
+            if llm_path != system1_path:
+                raise ValueError(
+                    "Past->Plan->Action requires Qwen and NextDiT from the same "
+                    "native InternNav model"
+                )
+            if nextdit.internnav_system1_path.strip():
+                raise ValueError(
+                    "Past->Plan->Action forbids internnav_system1_path overrides"
+                )
+            if nextdit.pretrained_system1_path not in (None, ""):
+                raise ValueError(
+                    "Past->Plan->Action forbids pretrained_system1_path overrides"
+                )
+            if nextdit.dav2_ckpt_path.strip():
+                raise ValueError(
+                    "Past->Plan->Action forbids external DAV2/System1 checkpoints"
+                )
+            pano_adapter = getattr(nextdit, "pano_latent_adapter", None)
+            if isinstance(pano_adapter, dict):
+                pano_adapter_enabled = bool(pano_adapter.get("enabled", False))
+            else:
+                pano_adapter_enabled = bool(
+                    getattr(pano_adapter, "enabled", False)
+                )
+            if pano_adapter_enabled or bool(
+                getattr(nextdit, "pano_latent_adapter_enabled", False)
+            ):
+                raise ValueError(
+                    "Past->Plan->Action forbids the panoramic latent adapter"
+                )
+            if (nextdit.n_query, nextdit.latent_emb_size, nextdit.predict_steps) != (
+                4,
+                768,
+                32,
+            ):
+                raise ValueError(
+                    "Past->Plan->Action v1 requires n_query/latent/predict_steps="
+                    "4/768/32"
+                )
+            if self.data.dataset_type != "trajectory":
+                raise ValueError(
+                    "Past->Plan->Action v1 trains on the expert trajectory dataset; "
+                    "DAgger rows need a separate AMB3R cache before they may be enabled"
+                )
+            trajectory_data = self.data.trajectory
+            if trajectory_data is None:
+                raise ValueError("Past->Plan->Action requires data.trajectory")
+            if trajectory_data.trajectory_target_convention != "internnav_habitat":
+                raise ValueError(
+                    "Past->Plan->Action requires internnav_habitat trajectory targets"
+                )
+            if trajectory_data.predict_horizon != 32:
+                raise ValueError("Past->Plan->Action requires a 32-step expert target")
+            if trajectory_data.enable_trajectory_augmentation:
+                raise ValueError(
+                    "Past->Plan->Action requires enable_trajectory_augmentation=false"
+                )
+            if not trajectory_data.require_amb3r_pose_cache:
+                raise ValueError(
+                    "Past->Plan->Action requires endpoint-v2 AMB3R history poses; "
+                    "GT fallback is forbidden"
+                )
+            if not trajectory_data.single_view_rgb_input:
+                raise ValueError(
+                    "Past->Plan->Action requires single_view_rgb_input=true"
+                )
+            if not trajectory_data.future_heatmap.enabled:
+                raise ValueError(
+                    "Past->Plan->Action requires the no-depth Future target renderer"
+                )
+            if not trajectory_data.load_single_view_history_frames:
+                raise ValueError("Past->Plan->Action requires front history RGB")
+            if not trajectory_data.load_traj_images:
+                raise ValueError("Past->Plan->Action requires native trajectory images")
+            if trajectory_data.panoramic_vlm_input:
+                raise ValueError(
+                    "Past->Plan->Action requires the native front/lookdown System2 path"
+                )
+            for stage in self.training.stages:
+                if stage.past_plan_action_stage not in {
+                    "stage1_map_pretrain",
+                    "stage2_joint",
+                }:
+                    raise ValueError(
+                        "Past->Plan->Action stage must be stage1_map_pretrain or "
+                        "stage2_joint"
+                    )
+                if not stage.train_future:
+                    raise ValueError(
+                        "Past->Plan->Action stages must supervise Future maps"
+                    )
+                if not stage.train_history:
+                    raise ValueError(
+                        "Past->Plan->Action stages must retain History supervision"
+                    )
+                if stage.train_lm or bool(stage.train_system2_sft):
+                    raise ValueError(
+                        "Past->Plan->Action keeps System2 frozen and forbids LM loss"
+                    )
+                if stage.trajectory_sequence_mode != "first_only":
+                    raise ValueError(
+                        "Past->Plan->Action requires trajectory_sequence_mode=first_only"
+                    )
+                if stage.require_complete_internnav_system1 is not True:
+                    raise ValueError(
+                        "Past->Plan->Action requires complete native InternNav System1"
+                    )
+                if stage.trainable_modules != ["past_plan_action", "heatmap_vln"]:
+                    raise ValueError(
+                        "Past->Plan->Action must train exactly "
+                        "['past_plan_action','heatmap_vln']"
+                    )
+                if not stage.strict_trainable_modules:
+                    raise ValueError(
+                        "Past->Plan->Action requires strict_trainable_modules=true"
+                    )
+                if not stage.heatmap_pose_adaptation_init:
+                    raise ValueError(
+                        "Past->Plan->Action requires exact 79-parameter Heatmap Head "
+                        "initialization"
+                    )
+                if stage.required_history_pose_provider != "amb3r_vo_cache":
+                    raise ValueError(
+                        "Past->Plan->Action requires AMB3R pose provider fail-closed"
+                    )
+                if stage.past_plan_action_stage == "stage1_map_pretrain":
+                    if stage.train_action:
+                        raise ValueError(
+                            "Past->Plan->Action Stage 1 must keep Action loss disabled"
+                        )
+                elif not stage.train_action:
+                    raise ValueError(
+                        "Past->Plan->Action Stage 2 requires native Action supervision"
+                    )
+            if self.loss.history_weight <= 0 or self.loss.future_weight <= 0:
+                raise ValueError(
+                    "Past->Plan->Action requires positive History and Future weights"
+                )
+            if self.loss.lm_weight != 0:
+                raise ValueError("Past->Plan->Action requires lm_weight=0")
+            if any(
+                stage.past_plan_action_stage == "stage2_joint"
+                for stage in self.training.stages
+            ):
+                if self.loss.trajectory_weight <= 0:
+                    raise ValueError(
+                        "Past->Plan->Action Stage 2 requires trajectory_weight > 0"
+                    )
+                if self.loss.preserve_weight <= 0:
+                    raise ValueError(
+                        "Past->Plan->Action Stage 2 requires preserve_weight > 0"
+                    )
+                if self.loss.delta_z_weight <= 0:
+                    raise ValueError(
+                        "Past->Plan->Action Stage 2 requires delta_z_weight > 0"
+                    )
+            return self
+
+        if llm is None or llm.use_lora:
+            raise ValueError(
+                "internnav_single_view requires model.llm.use_lora=false"
+            )
+        if llm.gradient_checkpointing:
+            raise ValueError(
+                "internnav_single_view frozen vision does not use gradient "
+                "checkpointing"
+            )
+        if action_head is not None and action_head.enable:
+            raise ValueError(
+                "heatmap-only training must set model.action_head.enable=false"
+            )
+        if self.data.dataset_type != "sliding_window":
+            raise ValueError(
+                "internnav_single_view four-camera supervision requires "
+                "data.dataset_type=sliding_window"
+            )
+        sliding = self.data.sliding_window
+        if sliding is None or not sliding.single_view_rgb_input:
+            raise ValueError(
+                "internnav_single_view requires "
+                "data.sliding_window.single_view_rgb_input=true"
+            )
+        if sliding.defer_heatmap_to_gpu:
+            raise ValueError(
+                "internnav_single_view requires defer_heatmap_to_gpu=false"
+            )
+        for stage in self.training.stages:
+            if stage.trainable_modules != ["heatmap_vln"]:
+                raise ValueError(
+                    "internnav_single_view must train exactly ['heatmap_vln']"
+                )
+            if not stage.strict_trainable_modules:
+                raise ValueError(
+                    "internnav_single_view requires strict_trainable_modules=true"
+                )
+            if stage.train_action:
+                raise ValueError("internnav_single_view must not train System1")
+            if bool(
+                stage.train_lm
+                if stage.train_lm is not None
+                else stage.train_system2_sft
+            ):
+                raise ValueError("internnav_single_view must not train System2")
+            contract = stage.heatmap_warmstart_contract
+            if (
+                contract is None
+                or contract.policy != "internnav_single_view_head_v2"
+            ):
+                raise ValueError(
+                    "internnav_single_view requires the provenance-locked "
+                    "internnav_single_view_head_v2 warm-start policy"
+                )
+        return self
 
 
 # --- Public API --------------------------------------------------------------
@@ -600,6 +1643,14 @@ def prepare_config_for_use(cfg: dict[str, Any]) -> dict[str, Any]:
     out = _expand_env_strings(out)
     _merge_paths_block(out)
     _apply_model_path_env_overrides(out)
+    data = out.get("data")
+    if isinstance(data, dict):
+        for section_name in ("sliding_window", "trajectory"):
+            if section_name in data:
+                data[section_name] = migrate_single_view_history_config(
+                    data[section_name],
+                    section_path=f"data.{section_name}",
+                )
     return out
 
 

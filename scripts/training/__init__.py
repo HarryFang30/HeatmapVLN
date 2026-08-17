@@ -84,12 +84,28 @@ _LAZY_MODULES = {
     "assert_complete_internnav_system1_load": "model_builder",
     "build_model": "model_builder",
     "end_nextdit_warmup": "model_builder",
+    "ensure_trainable_heatmap_fp32": "model_builder",
     "freeze_module": "model_builder",
     "set_trainable_modules": "model_builder",
     # optimizer.py
     "build_optimizer": "optimizer",
     "build_scheduler": "optimizer",
+    "ensure_heatmap_optimizer_state_fp32": "optimizer",
     "get_heatmap_temperature": "optimizer",
+    # pose_adaptation.py
+    "load_past_plan_action_initialization": "pose_adaptation",
+    "load_pose_adaptation_initialization": "pose_adaptation",
+    # heatmap_warmstart.py
+    "validate_heatmap_warmstart_contract": "heatmap_warmstart",
+    "verify_heatmap_warmstart_loaded": "heatmap_warmstart",
+    # frozen_heatmap_checkpoint.py
+    "FrozenHeatmapCheckpointError": "frozen_heatmap_checkpoint",
+    "load_frozen_heatmap_checkpoint": "frozen_heatmap_checkpoint",
+    # heatmap_control_resume.py
+    "HeatmapControlResumeError": "heatmap_control_resume",
+    "heatmap_control_enabled": "heatmap_control_resume",
+    "reject_heatmap_control_load_weights": "heatmap_control_resume",
+    "validate_heatmap_control_resume_checkpoint": "heatmap_control_resume",
     # preflight.py
     "run_training_preflight": "preflight",
     # plotter.py

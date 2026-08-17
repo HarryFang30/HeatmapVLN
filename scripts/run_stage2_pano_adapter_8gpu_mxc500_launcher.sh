@@ -105,14 +105,14 @@ export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
 
 # Stage1-S2 checkpoint (student weights)
-export STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
-export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap}"
+export STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_r2r_2ep_after_scalevln_e5_rank32_alllayer/run_20260726_222310/checkpoints/epoch_002.pth}"
+export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_r2r_2ep_after_scalevln_e5_rank32_alllayer}"
 
 # Output
-export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora}"
+export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_r2r_native_v2_h256_from_scalee5_r2re2}"
 
 mkdir -p "$REPO_ROOT/logs" "${STAGE2_ADAPTER_OUT_DIR}"
-LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage2_adapter_8gpu_mxc500.log}"
+LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage2_adapter_r2r_native_v2_h256_from_scalee5_r2re2_8gpu_mxc500.log}"
 
 # ---------------------------------------------------------------------------
 # 训练超参（空值 = 使用 adapter config YAML 默认值）
@@ -150,9 +150,10 @@ export STAGE2_ADAPTER_COND_WEIGHT="${STAGE2_ADAPTER_COND_WEIGHT:-1.0}"
 export STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-0.2}"
 
 # Native teacher sidecar collection.  This is not a new Habitat dataset; it is
-# a cache of InternNav native front/lookdown teacher latents for the existing
-# trajectory dataset, aligned later by (clip_idx,current_t).
-export STAGE2_TEACHER_SIDECAR_DIR="${STAGE2_TEACHER_SIDECAR_DIR:-/mnt/afs/lixiaoou/intern/fjl/teacher_sidecars/stage2_native_dataset}"
+# a cache of InternNav native front/lookdown teacher latents for the exact
+# pano-selected waypoint. v2 is intentionally isolated from the invalid legacy
+# dataset sidecar and cannot resume/reuse it.
+export STAGE2_TEACHER_SIDECAR_DIR="${STAGE2_TEACHER_SIDECAR_DIR:-/mnt/afs/lixiaoou/intern/fjl/teacher_sidecars/stage2_native_pano_front_aligned_v2}"
 export STAGE2_TEACHER_TENSOR_DIR="${STAGE2_TEACHER_TENSOR_DIR:-${STAGE2_TEACHER_SIDECAR_DIR}/tensors}"
 export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-${STAGE2_TEACHER_SIDECAR_DIR}/train_native_teacher.jsonl}"
 export STAGE2_TEACHER_COLLECT_CONFIG="${STAGE2_TEACHER_COLLECT_CONFIG:-configs/train_pano_adapter_stage2_8gpu.yaml}"
@@ -209,19 +210,51 @@ if stats_path.is_file():
         if key in stats:
             parts.append(f"{key}={stats[key]}")
 try:
-    parts.append(f"meta_count={sum(1 for _ in root.rglob('meta.json'))}")
-except Exception:
-    pass
+    import hashlib
+    digest = hashlib.sha256()
+    meta_count = 0
+    for path in sorted(root.rglob("meta.json")):
+        stat = path.stat()
+        rel = path.relative_to(root).as_posix()
+        digest.update(f"{rel}|{stat.st_size}|{stat.st_mtime_ns}\n".encode())
+        meta_count += 1
+    parts.append(f"meta_count={meta_count}")
+    parts.append(f"meta_manifest_sha256={digest.hexdigest()}")
+except Exception as exc:
+    parts.append(f"meta_manifest_error={type(exc).__name__}")
 print(",".join(parts) if parts else "unknown")
 PY
 }
 
+file_sha256() {
+  if [[ -f "$1" ]]; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    printf 'missing'
+  fi
+}
+
+tree_manifest_sha256() {
+  if [[ ! -d "$1" ]]; then
+    printf 'missing'
+    return 0
+  fi
+  find "$1" -maxdepth 2 -type f -printf '%P|%s|%T@\n' \
+    | LC_ALL=C sort \
+    | sha256sum \
+    | awk '{print $1}'
+}
+
 sidecar_signature() {
-  printf 'root=%s|split=%s|config=%s|model=%s|repo=%s|dataset=%s|coord_source=dataset|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|pixel_goal_direction=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s|tensor_path_mode=%s\n' \
+  printf 'root=%s|split=%s|config=%s|config_sha256=%s|collector_sha256=%s|alignment_sha256=%s|model=%s|model_manifest_sha256=%s|repo=%s|dataset=%s|schema=heatmapvln.native_teacher.v2|alignment=same_goal_frame_front_down_yx_v1|teacher_text_order=yx|coord_source=aligned_native|sample_mode=pixel|num_samples=%s|sample_stride=%s|clip_level_sampling=%s|samples_per_clip=%s|pixel_goal_direction=%s|num_sample_trajs=%s|num_inference_steps=%s|guidance=%s|traj_image_size=%s|tensor_path_mode=%s|tensor_dtype=bfloat16|seed=42|collect_gpu_devices=%s|collect_nproc=%s\n' \
     "$PANORAMIC_DATA_ROOT" \
     "$STAGE2_TEACHER_COLLECT_SPLIT" \
     "$STAGE2_TEACHER_COLLECT_CONFIG" \
+    "$(file_sha256 "$STAGE2_TEACHER_COLLECT_CONFIG")" \
+    "$(file_sha256 "$REPO_ROOT/scripts/evaluation/collect_internnav_teacher_sidecar.py")" \
+    "$(file_sha256 "$REPO_ROOT/src/data/pano_teacher_alignment.py")" \
     "$INTERNNAV_MODEL_PATH" \
+    "$(tree_manifest_sha256 "$INTERNNAV_MODEL_PATH")" \
     "$INTERNNAV_REPO" \
     "$(dataset_signature)" \
     "$STAGE2_TEACHER_COLLECT_NUM_SAMPLES" \
@@ -233,7 +266,9 @@ sidecar_signature() {
     "$STAGE2_TEACHER_COLLECT_NUM_INFERENCE_STEPS" \
     "$STAGE2_TEACHER_COLLECT_GUIDANCE_SCALE" \
     "$STAGE2_TEACHER_COLLECT_TRAJ_IMAGE_SIZE" \
-    "$STAGE2_TEACHER_TENSOR_PATH_MODE"
+    "$STAGE2_TEACHER_TENSOR_PATH_MODE" \
+    "$STAGE2_TEACHER_COLLECT_GPU_DEVICES" \
+    "${STAGE2_TEACHER_COLLECT_NPROC:-auto}"
 }
 
 parse_teacher_collect_gpus() {
@@ -315,17 +350,21 @@ ensure_native_teacher_sidecar() {
   local meta="${STAGE2_ADAPTER_TEACHER_JSONL}.meta"
   local collecting_meta="${STAGE2_ADAPTER_TEACHER_JSONL}.collecting.meta"
 
-  if ! is_truthy_launcher "$STAGE2_TEACHER_COLLECT_ENABLE"; then
-    if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
-      echo "STAGE2_TEACHER_COLLECT_ENABLE=0 but sidecar JSONL is missing or empty: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
-      exit 1
-    fi
-    echo "[launcher] 跳过 teacher sidecar 采集，使用已有: $STAGE2_ADAPTER_TEACHER_JSONL"
-    return 0
-  fi
-
   local current_sig
   current_sig="$(sidecar_signature)"
+
+  if ! is_truthy_launcher "$STAGE2_TEACHER_COLLECT_ENABLE"; then
+    if [[ ! -s "$STAGE2_ADAPTER_TEACHER_JSONL" || ! -f "$marker" || ! -f "$meta" ]]; then
+      echo "STAGE2_TEACHER_COLLECT_ENABLE=0 requires a completed JSONL/.done/.meta set: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
+      exit 1
+    fi
+    if [[ "$(cat "$meta")" != "$current_sig" ]]; then
+      echo "Existing sidecar signature does not match this code/config/data. Use the original contract or collect into a fresh directory." >&2
+      exit 1
+    fi
+    echo "[launcher] 跳过 teacher sidecar 采集，使用已验证完成的 sidecar: $STAGE2_ADAPTER_TEACHER_JSONL"
+    return 0
+  fi
 
   if [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && -f "$marker" && -f "$meta" ]] \
     && [[ "$(cat "$meta")" == "$current_sig" ]] \
@@ -357,32 +396,26 @@ ensure_native_teacher_sidecar() {
     echo "[launcher] STAGE2_TEACHER_FORCE_RECOLLECT=1，清理旧 sidecar/shard JSONL 后重新采集"
     rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
     rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
-  elif [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && ( ! -f "$marker" || ! -f "$meta" ) ]]; then
-    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
-      echo "[launcher] sidecar 缺少 .done/.meta，保留旧记录并增量恢复采集"
-      rm -f "$marker" "$collecting_meta"
-    else
-      echo "[launcher] sidecar 缺少 .done/.meta，清理旧 sidecar/shard JSONL 后重新采集"
-      rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
-      rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+  else
+    if [[ -f "$meta" && "$(cat "$meta")" != "$current_sig" ]]; then
+      echo "Completed sidecar signature mismatch. Refusing to mix records; use a fresh directory or STAGE2_TEACHER_FORCE_RECOLLECT=1." >&2
+      exit 1
     fi
-  elif [[ -f "$meta" && "$(cat "$meta")" != "$current_sig" ]]; then
-    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
-      echo "[launcher] sidecar meta 与当前参数/数据集不一致，保留旧记录并增量补齐"
-      rm -f "$marker" "$collecting_meta"
-    else
-      echo "[launcher] sidecar meta 与当前参数不一致，清理旧 sidecar/shard JSONL 后重新采集"
-      rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$meta" "$collecting_meta"
-      rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    if [[ -f "$collecting_meta" && "$(cat "$collecting_meta")" != "$current_sig" ]]; then
+      echo "Incomplete sidecar signature mismatch. Refusing incremental resume; use a fresh directory or STAGE2_TEACHER_FORCE_RECOLLECT=1." >&2
+      exit 1
     fi
-  elif [[ -f "$collecting_meta" && "$(cat "$collecting_meta")" != "$current_sig" ]]; then
-    if is_truthy_launcher "$STAGE2_TEACHER_INCREMENTAL_COLLECT"; then
-      echo "[launcher] 未完成采集的参数与当前参数不一致，保留旧记录并增量恢复"
-      rm -f "$marker" "$collecting_meta"
-    else
-      echo "[launcher] 未完成采集的参数与当前参数不一致，清理旧 shard JSONL 后重新采集"
-      rm -f "$STAGE2_ADAPTER_TEACHER_JSONL" "$marker" "$collecting_meta"
-      rm -rf "$STAGE2_TEACHER_COLLECT_SHARD_DIR"
+    if [[ -s "$STAGE2_ADAPTER_TEACHER_JSONL" && ! -f "$collecting_meta" ]]; then
+      echo "Incomplete master JSONL has no matching .collecting.meta. Refusing ambiguous resume." >&2
+      exit 1
+    fi
+    local orphan_shard=""
+    if [[ -d "$STAGE2_TEACHER_COLLECT_SHARD_DIR" ]]; then
+      orphan_shard="$(find "$STAGE2_TEACHER_COLLECT_SHARD_DIR" -maxdepth 1 -name 'shard_*.jsonl' -size +0c -print -quit 2>/dev/null || true)"
+    fi
+    if [[ -n "$orphan_shard" && ! -f "$collecting_meta" ]]; then
+      echo "Found orphan teacher shard without .collecting.meta: $orphan_shard. Refusing to attach it to a new signature." >&2
+      exit 1
     fi
   fi
 
@@ -447,7 +480,7 @@ ensure_native_teacher_sidecar() {
       --internnav-repo "$INTERNNAV_REPO"
       --model-path "$INTERNNAV_MODEL_PATH"
       --device cuda:0
-      --coord-source dataset
+      --coord-source aligned_native
       --sample-mode pixel
       --num-samples "$shard_num_samples"
       --num-shards "$collect_nproc"
@@ -510,6 +543,47 @@ ensure_native_teacher_sidecar() {
     echo "Teacher sidecar collection finished but JSONL is missing or empty: $STAGE2_ADAPTER_TEACHER_JSONL" >&2
     exit 1
   fi
+  PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python - \
+    "$STAGE2_ADAPTER_TEACHER_JSONL" "$STAGE2_TEACHER_COLLECT_NUM_SAMPLE_TRAJS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from src.data.pano_teacher_alignment import validate_aligned_native_sidecar_contract_fields
+
+jsonl = Path(sys.argv[1])
+num_sample_trajs = int(sys.argv[2])
+seen = set()
+count = 0
+for line_no, line in enumerate(jsonl.open("r", encoding="utf-8"), start=1):
+    if not line.strip():
+        continue
+    rec = json.loads(line)
+    if rec.get("status") != "ok":
+        raise RuntimeError(f"sidecar line {line_no} has status={rec.get('status')!r}")
+    validate_aligned_native_sidecar_contract_fields(rec)
+    key = rec.get("stable_sample_key")
+    if key in seen:
+        raise RuntimeError(f"duplicate stable_sample_key at line {line_no}: {key}")
+    seen.add(key)
+    teacher = rec.get("teacher") or {}
+    if teacher.get("system1_error"):
+        raise RuntimeError(f"System1 error at line {line_no}: {teacher['system1_error']}")
+    tensor = (teacher.get("system1") or {}).get("tensor_sidecar") or {}
+    tensor_path = Path(str(tensor.get("path") or ""))
+    if not tensor_path.is_file():
+        raise RuntimeError(f"missing tensor sidecar at line {line_no}: {tensor_path}")
+    if tensor.get("traj_latents_shape") != [1, 4, 3584]:
+        raise RuntimeError(f"bad raw latent shape at line {line_no}: {tensor.get('traj_latents_shape')}")
+    if tensor.get("traj_latents_768_shape") != [1, 4, 768]:
+        raise RuntimeError(f"bad cond latent shape at line {line_no}: {tensor.get('traj_latents_768_shape')}")
+    if tensor.get("dp_actions_shape") != [num_sample_trajs, 32, 3]:
+        raise RuntimeError(f"bad DP shape at line {line_no}: {tensor.get('dp_actions_shape')}")
+    count += 1
+if count == 0:
+    raise RuntimeError("validated sidecar is empty")
+print(f"[launcher] validated native-v2 sidecar records={count} unique_keys={len(seen)}", flush=True)
+PY
   printf '%s' "$current_sig" > "$meta"
   rm -f "$collecting_meta"
   touch "$marker"

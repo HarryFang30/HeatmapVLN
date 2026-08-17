@@ -362,48 +362,6 @@ class Qwen2_5VLIntegration(nn.Module):
                 return None
         return module if isinstance(module, nn.Module) else None
 
-    def _locate_conditional_generation_lm_head(
-        self,
-    ) -> tuple[str, nn.Module, nn.Module]:
-        """Find the physical conditional-generation module and its LM head.
-
-        PEFT wraps Qwen as ``PeftModel -> LoraModel ->
-        Qwen2_5_VLForConditionalGeneration``. Attribute proxying makes
-        ``hasattr(wrapper, 'lm_head')`` ambiguous, so only direct registered
-        child modules named ``lm_head`` are accepted. There must be exactly one
-        physical head; otherwise sparse predictor alignment is not safe.
-        """
-        candidates: list[tuple[str, nn.Module, nn.Module]] = []
-        for name, module in self.model.named_modules():
-            lm_head = module._modules.get("lm_head")
-            if isinstance(lm_head, nn.Module):
-                candidates.append((name, module, lm_head))
-        unique_heads = {id(lm_head) for _name, _owner, lm_head in candidates}
-        if len(unique_heads) != 1 or not candidates:
-            paths = [f"{name}.lm_head" if name else "lm_head" for name, *_ in candidates]
-            raise RuntimeError(
-                "Correct-label sparse logits require exactly one physical "
-                f"conditional-generation lm_head, found paths={paths}"
-            )
-        # ``named_modules`` de-duplicates module instances, so multiple owners
-        # of the same physical head would imply non-standard aliasing. Refuse
-        # that topology rather than guessing which forward actually calls it.
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "Correct-label sparse logits found ambiguous lm_head owners: "
-                f"{[name for name, _owner, _head in candidates]}"
-            )
-        return candidates[0]
-
-    @staticmethod
-    def _forward_explicitly_accepts(module: nn.Module, argument: str) -> bool:
-        """Return true only for a named forward parameter, never bare kwargs."""
-        try:
-            parameters = inspect.signature(module.forward).parameters
-        except (TypeError, ValueError):
-            return False
-        return argument in parameters
-
     def _setup_internal_profiler(self) -> None:
         if not self.config.enable_internal_profiling:
             return
@@ -898,11 +856,7 @@ class Qwen2_5VLIntegration(nn.Module):
         num_image_tokens = int((raw_input_ids == self.image_token_id).sum().item())
 
         n_query = 0
-        traj_hook_handle = None
-        sparse_lm_head_hook_handle = None
-        sparse_lm_head = None
-        sparse_lm_head_hook = None
-        sparse_lm_head_hook_state: dict[str, Any] | None = None
+        hook_handle = None
         need_traj_hidden = latent_queries is not None
 
         # input_ids to use for vision-feature extraction (without TRAJ tokens)
@@ -971,7 +925,7 @@ class Qwen2_5VLIntegration(nn.Module):
             if language_model_root is None:
                 raise RuntimeError("Could not locate the language model module for latent query injection")
 
-            traj_hook_handle = language_model_root.register_forward_pre_hook(
+            hook_handle = language_model_root.register_forward_pre_hook(
                 _replace_traj_embeds_hook, with_kwargs=True,
             )
 
@@ -1030,86 +984,13 @@ class Qwen2_5VLIntegration(nn.Module):
             predictor_union = torch.unique(
                 torch.cat(sample_predictor_positions), sorted=True,
             )
-            (
-                conditional_generation_path,
-                conditional_generation_model,
-                sparse_lm_head,
-            ) = self._locate_conditional_generation_lm_head()
-            native_sparse_logits = self._forward_explicitly_accepts(
-                conditional_generation_model,
-                "logits_to_keep",
-            )
-            if native_sparse_logits:
-                # New Transformers versions accept a tensor of sequence
-                # positions and apply the LM head only to those positions.
-                fwd_kwargs["logits_to_keep"] = predictor_union
-                sparse_backend = "hf_logits_to_keep_tensor_predictor_union_v1"
-            else:
-                # Transformers 4.51 Qwen2.5-VL always calls
-                # `lm_head(hidden_states)` and exposes no logits_to_keep. Slice
-                # the *input* to the physical conditional-generation LM head;
-                # index_select remains differentiable, so LoRA gradients are
-                # preserved without ever materialising [B, S, vocab] logits.
-                sparse_backend = "lm_head_pre_hook_predictor_union_v1"
-                sparse_lm_head_hook_state = {
-                    "call_count": 0,
-                    "input_shape_before": None,
-                    "input_shape_after": None,
-                    "removed": False,
-                }
-
-                def _slice_lm_head_input_hook(module, args, kwargs):
-                    del module
-                    assert sparse_lm_head_hook_state is not None
-                    sparse_lm_head_hook_state["call_count"] += 1
-                    if sparse_lm_head_hook_state["call_count"] != 1:
-                        raise RuntimeError(
-                            "Conditional-generation lm_head was called more than "
-                            "once during one sparse correct-label forward"
-                        )
-                    if args:
-                        hidden_states = args[0]
-                        input_location = "args"
-                    elif "input" in kwargs:
-                        hidden_states = kwargs["input"]
-                        input_location = "kwargs"
-                    else:
-                        raise RuntimeError(
-                            "Could not locate hidden_states input to conditional-generation lm_head"
-                        )
-                    if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
-                        raise RuntimeError(
-                            "Conditional-generation lm_head input must be [B,S,H], "
-                            f"got {type(hidden_states).__name__} "
-                            f"shape={getattr(hidden_states, 'shape', None)}"
-                        )
-                    if (
-                        hidden_states.shape[0] != raw_input_ids.shape[0]
-                        or hidden_states.shape[1] != raw_input_ids.shape[1]
-                    ):
-                        raise RuntimeError(
-                            "Conditional-generation lm_head input is not aligned "
-                            "with tokenized SFT inputs: "
-                            f"hidden={tuple(hidden_states.shape)} "
-                            f"input_ids={tuple(raw_input_ids.shape)}"
-                        )
-                    selected = hidden_states.index_select(
-                        1,
-                        predictor_union.to(device=hidden_states.device),
-                    )
-                    sparse_lm_head_hook_state["input_shape_before"] = list(
-                        hidden_states.shape
-                    )
-                    sparse_lm_head_hook_state["input_shape_after"] = list(
-                        selected.shape
-                    )
-                    if input_location == "args":
-                        return (selected, *args[1:]), kwargs
-                    new_kwargs = dict(kwargs)
-                    new_kwargs["input"] = selected
-                    return args, new_kwargs
-
-                sparse_lm_head_hook = _slice_lm_head_input_hook
+            # Qwen2.5-VL in the pinned Transformers runtime accepts a tensor of
+            # sequence positions here. This avoids materialising vocabulary
+            # logits for the (usually thousands of) image/context positions.
+            # The shape is validated after forward; an older wrapper that
+            # ignores this argument fails loudly instead of silently allocating
+            # or aligning full-sequence logits incorrectly.
+            fwd_kwargs["logits_to_keep"] = predictor_union
             skip_lm_head = False
             inner_model = None
             correct_logprob_alignment = {
@@ -1131,14 +1012,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     for positions in sample_predictor_positions
                 ],
                 "label_tokens": int(shifted_valid.sum().item()),
-                "backend": sparse_backend,
-                "conditional_generation_module": conditional_generation_path,
-                "lm_head_module": (
-                    f"{conditional_generation_path}.lm_head"
-                    if conditional_generation_path
-                    else "lm_head"
-                ),
-                "native_logits_to_keep_explicit_signature": native_sparse_logits,
+                "backend": "hf_logits_to_keep_tensor_predictor_union_v1",
             }
         if self._internal_profiler is not None:
             self._internal_profiler.reset()
@@ -1195,21 +1069,12 @@ class Qwen2_5VLIntegration(nn.Module):
             with torch.no_grad():
                 return _run_model_forward()
 
-        if sparse_lm_head_hook is not None:
-            assert sparse_lm_head is not None
-            sparse_lm_head_hook_handle = sparse_lm_head.register_forward_pre_hook(
-                sparse_lm_head_hook,
-                with_kwargs=True,
-            )
         try:
             try:
                 outputs = _run_with_runtime_context()
             except TypeError as exc:
                 if (
                     return_lm_correct_logprobs
-                    and correct_logprob_alignment is not None
-                    and correct_logprob_alignment["backend"]
-                    == "hf_logits_to_keep_tensor_predictor_union_v1"
                     and "logits_to_keep" in str(exc)
                 ):
                     raise RuntimeError(
@@ -1233,30 +1098,8 @@ class Qwen2_5VLIntegration(nn.Module):
                 fwd_kwargs["output_hidden_states"] = True
                 outputs = _run_with_runtime_context()
         finally:
-            cleanup_errors = []
-            if sparse_lm_head_hook_handle is not None:
-                hook_id = sparse_lm_head_hook_handle.id
-                try:
-                    sparse_lm_head_hook_handle.remove()
-                except Exception as exc:  # pragma: no cover - PyTorch handle failure
-                    cleanup_errors.append(f"lm_head hook remove failed: {exc!r}")
-                if (
-                    sparse_lm_head is not None
-                    and hook_id in sparse_lm_head._forward_pre_hooks
-                ):
-                    cleanup_errors.append("lm_head hook remains registered after remove")
-                if sparse_lm_head_hook_state is not None:
-                    sparse_lm_head_hook_state["removed"] = not cleanup_errors
-            if traj_hook_handle is not None:
-                try:
-                    traj_hook_handle.remove()
-                except Exception as exc:  # pragma: no cover - PyTorch handle failure
-                    cleanup_errors.append(f"trajectory hook remove failed: {exc!r}")
-            if cleanup_errors:
-                raise RuntimeError(
-                    "Failed to clean temporary Qwen forward hooks: "
-                    + "; ".join(cleanup_errors)
-                )
+            if hook_handle is not None:
+                hook_handle.remove()
 
         if self._internal_profiler is not None:
             self._last_internal_timings = self._internal_profiler.snapshot()
@@ -1275,30 +1118,6 @@ class Qwen2_5VLIntegration(nn.Module):
                     "Correct-label log-prob forward requires rank-3 `outputs.logits`"
                 )
             assert correct_logprob_alignment is not None
-            if sparse_lm_head_hook_state is not None:
-                if sparse_lm_head_hook_state["call_count"] != 1:
-                    raise RuntimeError(
-                        "Sparse lm_head pre-hook did not execute exactly once: "
-                        f"{sparse_lm_head_hook_state}"
-                    )
-                if not sparse_lm_head_hook_state["removed"]:
-                    raise RuntimeError("Sparse lm_head pre-hook was not removed")
-                correct_logprob_alignment.update(
-                    {
-                        "lm_head_hook_call_count": sparse_lm_head_hook_state[
-                            "call_count"
-                        ],
-                        "lm_head_input_shape_before": sparse_lm_head_hook_state[
-                            "input_shape_before"
-                        ],
-                        "lm_head_input_shape_after": sparse_lm_head_hook_state[
-                            "input_shape_after"
-                        ],
-                        "lm_head_hook_removed": sparse_lm_head_hook_state[
-                            "removed"
-                        ],
-                    }
-                )
             predictor_union = torch.tensor(
                 correct_logprob_alignment["predictor_position_union"],
                 device=logits.device,
@@ -1309,7 +1128,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 or logits.shape[1] != predictor_union.numel()
             ):
                 raise RuntimeError(
-                    "Qwen sparse LM-head backend returned an unexpected shape: "
+                    "Qwen did not honor tensor logits_to_keep exactly: "
                     f"logits={tuple(logits.shape)} expected_batch={lm_labels.shape[0]} "
                     f"expected_kept_positions={predictor_union.numel()}"
                 )

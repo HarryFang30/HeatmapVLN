@@ -35,9 +35,15 @@ class FineLocalization(nn.Module):
         c_fused: channel dim of DPT-fused ViT features (= d_attn of coarse).
     """
 
-    def __init__(self, c_fused: int = 256):
+    def __init__(
+        self,
+        c_fused: int = 256,
+        *,
+        coarse_logit_residual: bool = False,
+    ):
         super().__init__()
         self.c_fused = c_fused
+        self.coarse_logit_residual = bool(coarse_logit_residual)
 
         self.refine = nn.Sequential(
             nn.ConvTranspose2d(c_fused * 2 + 1, 128, kernel_size=4, stride=2, padding=1),  # -> 32x32
@@ -52,7 +58,9 @@ class FineLocalization(nn.Module):
         vit_fused: torch.Tensor,
         coarse_heatmap: torch.Tensor,
         spatial_out: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        return_logits: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             vit_fused:      ``(4, C, 16, 16)`` or ``(B, 4, C, 16, 16)``
@@ -60,19 +68,32 @@ class FineLocalization(nn.Module):
             spatial_out:    ``(N, V*H_c*W_c, d_attn)`` or ``(B, N, V*H_c*W_c, d_attn)``
         """
         if coarse_heatmap.dim() == 5:
-            return self._forward_5d(vit_fused, coarse_heatmap, spatial_out)
-        return self._forward_4d(vit_fused, coarse_heatmap, spatial_out)
+            return self._forward_5d(
+                vit_fused,
+                coarse_heatmap,
+                spatial_out,
+                return_logits=return_logits,
+            )
+        return self._forward_4d(
+            vit_fused,
+            coarse_heatmap,
+            spatial_out,
+            return_logits=return_logits,
+        )
 
     def _forward_4d(
         self,
         vit_fused: torch.Tensor,      # (V, C, 16, 16)
         coarse_heatmap: torch.Tensor,  # (N, V, H_c, W_c)
         spatial_out: torch.Tensor,     # (N, V*H_c*W_c, d_attn)
-    ) -> torch.Tensor:
+        *,
+        return_logits: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         num_hist, num_views = coarse_heatmap.shape[:2]
         H_c, W_c = coarse_heatmap.shape[2], coarse_heatmap.shape[3]
         if num_hist == 0:
-            return coarse_heatmap.new_empty((0, num_views, 64, 64))
+            empty = coarse_heatmap.new_empty((0, num_views, 64, 64))
+            return (empty, empty) if return_logits else empty
 
         spatial_size = vit_fused.shape[2:]  # (16, 16)
 
@@ -95,20 +116,38 @@ class FineLocalization(nn.Module):
 
         x = torch.cat([vit_expanded, so_up, attn], dim=1)  # (N*V, 2C+1, 16, 16)
 
-        out = self.refine(x)
-        out = torch.sigmoid(out)
-        return out.squeeze(1).reshape(num_hist, num_views, out.shape[-2], out.shape[-1])
+        refine_logits = self.refine(x)
+        if self.coarse_logit_residual:
+            coarse_logits_up = F.interpolate(
+                coarse_heatmap.reshape(num_hist * num_views, 1, H_c, W_c),
+                size=refine_logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            refine_logits = refine_logits + coarse_logits_up
+
+        logits = refine_logits.squeeze(1).reshape(
+            num_hist,
+            num_views,
+            refine_logits.shape[-2],
+            refine_logits.shape[-1],
+        )
+        heatmaps = torch.sigmoid(logits)
+        return (heatmaps, logits) if return_logits else heatmaps
 
     def _forward_5d(
         self,
         vit_fused: torch.Tensor,      # (B, V, C, 16, 16)
         coarse_heatmap: torch.Tensor,  # (B, N, V, H_c, W_c)
         spatial_out: torch.Tensor,     # (B, N, V*H_c*W_c, d_attn)
-    ) -> torch.Tensor:
+        *,
+        return_logits: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_hist, num_views = coarse_heatmap.shape[:3]
         H_c, W_c = coarse_heatmap.shape[3], coarse_heatmap.shape[4]
         if num_hist == 0:
-            return coarse_heatmap.new_empty((batch_size, 0, num_views, 64, 64))
+            empty = coarse_heatmap.new_empty((batch_size, 0, num_views, 64, 64))
+            return (empty, empty) if return_logits else empty
 
         spatial_size = vit_fused.shape[-2:]  # (16, 16)
         BNV = batch_size * num_hist * num_views
@@ -132,6 +171,22 @@ class FineLocalization(nn.Module):
 
         x = torch.cat([vit_expanded, so_up, attn], dim=1)  # (B*N*V, 2C+1, 16, 16)
 
-        out = self.refine(x)
-        out = torch.sigmoid(out)
-        return out.squeeze(1).reshape(batch_size, num_hist, num_views, out.shape[-2], out.shape[-1])
+        refine_logits = self.refine(x)
+        if self.coarse_logit_residual:
+            coarse_logits_up = F.interpolate(
+                coarse_heatmap.reshape(BNV, 1, H_c, W_c),
+                size=refine_logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            refine_logits = refine_logits + coarse_logits_up
+
+        logits = refine_logits.squeeze(1).reshape(
+            batch_size,
+            num_hist,
+            num_views,
+            refine_logits.shape[-2],
+            refine_logits.shape[-1],
+        )
+        heatmaps = torch.sigmoid(logits)
+        return (heatmaps, logits) if return_logits else heatmaps

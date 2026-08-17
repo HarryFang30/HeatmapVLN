@@ -21,10 +21,14 @@ VIEW_ID_TO_INDEX: dict[str, int] = {
     "left": 3,
 }
 
-_VIEW_CENTER_YAW_RAD = torch.tensor(
-    [0.0, math.pi / 2.0, math.pi, -math.pi / 2.0],
+GEOMETRY_CONVENTION_TRAJECTORY = "trajectory_left_positive_v2"
+GEOMETRY_CONVENTION_LEGACY_CAMERA = "camera_right_positive_v1"
+
+_VIEW_CENTER_YAW_TRAJECTORY_RAD = torch.tensor(
+    [0.0, -math.pi / 2.0, math.pi, math.pi / 2.0],
     dtype=torch.float32,
 )
+_VIEW_CENTER_YAW_LEGACY_CAMERA_RAD = -_VIEW_CENTER_YAW_TRAJECTORY_RAD
 
 
 def view_ids_to_indices(
@@ -119,6 +123,7 @@ class GeometryAwarePanoToNextDiTAdapter(nn.Module):
         dropout: float = 0.0,
         geometry_embed_dim: int = 64,
         horizontal_fov_deg: float = 90.0,
+        geometry_convention: str = GEOMETRY_CONVENTION_TRAJECTORY,
     ) -> None:
         super().__init__()
         if num_query <= 0:
@@ -132,6 +137,12 @@ class GeometryAwarePanoToNextDiTAdapter(nn.Module):
         self.num_query = int(num_query)
         self.num_layers = int(num_layers)
         self.horizontal_fov_deg = float(horizontal_fov_deg)
+        self.geometry_convention = str(geometry_convention)
+        if self.geometry_convention not in {
+            GEOMETRY_CONVENTION_TRAJECTORY,
+            GEOMETRY_CONVENTION_LEGACY_CAMERA,
+        }:
+            raise ValueError(f"Unsupported geometry_convention={geometry_convention!r}")
 
         self.student_proj = nn.Linear(self.student_dim, self.adapter_dim)
         self.view_embedding = nn.Embedding(len(VIEW_ID_TO_INDEX), geometry_embed_dim)
@@ -167,11 +178,14 @@ class GeometryAwarePanoToNextDiTAdapter(nn.Module):
         image_hw: torch.Tensor,
         *,
         horizontal_fov_deg: float = 90.0,
+        geometry_convention: str = GEOMETRY_CONVENTION_TRAJECTORY,
     ) -> torch.Tensor:
         """Return ``[x_norm, y_norm, sin(theta), cos(theta)]`` per sample.
 
         ``image_hw`` is ``[height, width]``.  The horizontal angle follows the
-        panoramic convention: front=0, right=+90, back=180, left=-90 degrees.
+        local trajectory convention: front=0, right=-90, back=180,
+        left=+90 degrees. Positive yaw points left because local trajectory
+        coordinates are ``x=forward, y=left``.
         """
         if view_indices.ndim != 1:
             raise ValueError(f"view_indices must be [B], got {tuple(view_indices.shape)}")
@@ -190,14 +204,24 @@ class GeometryAwarePanoToNextDiTAdapter(nn.Module):
         x_norm = pixel_xy[:, 0].to(dtype=dtype) / width
         y_norm = pixel_xy[:, 1].to(dtype=dtype) / height
 
-        centers = _VIEW_CENTER_YAW_RAD.to(device=device, dtype=dtype)
+        if geometry_convention == GEOMETRY_CONVENTION_TRAJECTORY:
+            centers = _VIEW_CENTER_YAW_TRAJECTORY_RAD.to(device=device, dtype=dtype)
+            pixel_sign = -1.0
+        elif geometry_convention == GEOMETRY_CONVENTION_LEGACY_CAMERA:
+            centers = _VIEW_CENTER_YAW_LEGACY_CAMERA_RAD.to(device=device, dtype=dtype)
+            pixel_sign = 1.0
+        else:
+            raise ValueError(f"Unsupported geometry_convention={geometry_convention!r}")
         center_yaw = centers[view_indices.to(device=device)]
         fov_rad = torch.as_tensor(
             math.radians(horizontal_fov_deg),
             device=device,
             dtype=dtype,
         )
-        theta = center_yaw + (x_norm - 0.5) * fov_rad
+        # Image ``u`` grows to the right, which is negative local yaw under
+        # the trajectory convention. The legacy convention is retained only
+        # for loading old geometry-aware checkpoints without changing meaning.
+        theta = center_yaw + pixel_sign * (x_norm - 0.5) * fov_rad
         return torch.stack([x_norm, y_norm, torch.sin(theta), torch.cos(theta)], dim=-1)
 
     def geometry_token(
@@ -211,6 +235,7 @@ class GeometryAwarePanoToNextDiTAdapter(nn.Module):
             pixel_xy,
             image_hw,
             horizontal_fov_deg=self.horizontal_fov_deg,
+            geometry_convention=self.geometry_convention,
         )
         view_emb = self.view_embedding(view_indices.to(device=pixel_xy.device))
         geom = torch.cat([view_emb.to(dtype=scalars.dtype), scalars], dim=-1)

@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         help="Load a previously trained head and run evaluation only.",
     )
     parser.add_argument(
+        "--standard-only",
+        action="store_true",
+        help="Evaluate only the unperturbed standard condition.",
+    )
+    parser.add_argument(
         "--selection-manifest",
         default=None,
         help=(
@@ -124,7 +129,7 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     sw_cfg.update(
         num_history_sample=args.num_history,
         load_depth=True,
-        load_history_frames=True,
+        load_single_view_history_frames=True,
         cache_poses=True,
         sample_stride=2,
         clip_level_sampling=True,
@@ -181,7 +186,7 @@ def build_dataset(
         enable_augmentation=False,
         samples_per_clip=8,
         clip_level_sampling=True,
-        load_history_frames=True,
+        load_single_view_history_frames=True,
         max_clips=0,
         max_clip_id=max_clip_id,
     )
@@ -867,7 +872,7 @@ def main() -> int:
         active_history_slots=active_history_slots,
     )
     evaluations = {"standard": standard}
-    if args.mode == "full":
+    if args.mode == "full" and not args.standard_only:
         for perturbation in (
             "zero-pose",
             "blank-images",
@@ -909,6 +914,7 @@ def main() -> int:
         "initial_head_hash": initial_head_hash,
         "train_steps": args.train_steps,
         "evaluation_only": bool(args.head_checkpoint),
+        "standard_only": bool(args.standard_only),
         "loaded_head_checkpoint": args.head_checkpoint,
         "train_samples": len(train_indices),
         "val_samples": len(val_indices),

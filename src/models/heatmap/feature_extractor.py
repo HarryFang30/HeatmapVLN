@@ -19,6 +19,7 @@ Important:
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +42,16 @@ HISTORY_QUERY_SOURCES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _ViTSpatialLayout:
+    """Per-image metadata needed to undo Qwen's visual token packing."""
+
+    grid_t: int
+    grid_h: int
+    grid_w: int
+    reverse_window_indices: torch.Tensor
+
+
 class FeatureExtractor:
     """
     Hook-based feature extractor for a frozen Qwen backbone base model.
@@ -54,6 +65,9 @@ class FeatureExtractor:
         llm_layer_indices: LLM layer indices to hook.  Should be
                            **full_attention** layers (e.g. [7, 15, 23]).
         spatial_merge_size: backbone spatial merge factor (default 2).
+        restore_vit_spatial_layout: undo Qwen visual window/merge packing.
+                           Defaults to ``False`` for legacy-checkpoint
+                           compatibility.
     """
 
     def __init__(
@@ -64,6 +78,7 @@ class FeatureExtractor:
         spatial_merge_size: int = 2,
         detach_features: bool = True,
         history_query_source: str = HISTORY_QUERY_TEXT_ANCHOR,
+        restore_vit_spatial_layout: bool = False,
     ):
         if llm_layer_indices is None:
             llm_layer_indices = [7, 15, 23]
@@ -74,6 +89,7 @@ class FeatureExtractor:
         self.llm_layer_indices = sorted(llm_layer_indices)
         self.spatial_merge_size = spatial_merge_size
         self.detach_features = detach_features
+        self.restore_vit_spatial_layout = bool(restore_vit_spatial_layout)
         self.history_query_source = str(history_query_source).strip().lower()
         if self.history_query_source not in HISTORY_QUERY_SOURCES:
             raise ValueError(
@@ -89,6 +105,7 @@ class FeatureExtractor:
         self._vit_resize_logged = False
 
         visual = self._get_visual_module(model)
+        self._vit_window_index_fn = getattr(visual, "get_window_index", None)
         num_blocks = len(visual.blocks)
         for idx in self.vit_layer_indices:
             if idx >= num_blocks:
@@ -116,11 +133,13 @@ class FeatureExtractor:
                 )
 
         logger.info(
-            "FeatureExtractor: ViT hooks %s, LLM hooks %s, detach=%s, history_query_source=%s",
+            "FeatureExtractor: ViT hooks %s, LLM hooks %s, detach=%s, "
+            "history_query_source=%s, restore_vit_spatial_layout=%s",
             self.vit_layer_indices,
             self.llm_layer_indices,
             self.detach_features,
             self.history_query_source,
+            self.restore_vit_spatial_layout,
         )
 
     # ------------------------------------------------------------------
@@ -129,6 +148,172 @@ class FeatureExtractor:
 
     def _maybe_detach(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.detach() if self.detach_features else tensor
+
+    def _build_vit_spatial_layouts(
+        self,
+        image_grid_thw: torch.Tensor | None,
+        *,
+        expected_images: int | None = None,
+    ) -> list[_ViTSpatialLayout]:
+        """Build exact inverse layouts from Qwen's own window-index routine.
+
+        Qwen packs every ``spatial_merge_size x spatial_merge_size`` patch
+        group contiguously, then reorders those groups by ``window_index``
+        before executing any visual block.  Block hooks therefore observe
+        window-ordered, merge-packed tokens rather than a raster grid.
+        """
+
+        if image_grid_thw is None:
+            raise RuntimeError(
+                "image_grid_thw is required to restore Qwen visual-block features"
+            )
+        if image_grid_thw.ndim != 2 or int(image_grid_thw.shape[1]) != 3:
+            raise RuntimeError(
+                "image_grid_thw must have shape [N,3] to restore Qwen "
+                f"visual-block features, got {tuple(image_grid_thw.shape)}"
+            )
+        num_images = int(image_grid_thw.shape[0])
+        if expected_images is not None and num_images != expected_images:
+            raise RuntimeError(
+                "Qwen visual-grid/image count mismatch: "
+                f"grid has {num_images} rows, expected {expected_images}"
+            )
+        if num_images == 0:
+            return []
+        if not callable(self._vit_window_index_fn):
+            raise RuntimeError(
+                "Qwen visual module does not expose get_window_index; "
+                "cannot safely restore visual-block token coordinates"
+            )
+
+        merge_size = int(self.spatial_merge_size)
+        if merge_size <= 0:
+            raise RuntimeError(
+                f"spatial_merge_size must be positive, got {merge_size}"
+            )
+
+        grid_rows: list[tuple[int, int, int]] = []
+        group_counts: list[int] = []
+        for image_idx, row in enumerate(image_grid_thw.detach().cpu().tolist()):
+            grid_t, grid_h, grid_w = (int(value) for value in row)
+            if min(grid_t, grid_h, grid_w) <= 0:
+                raise RuntimeError(
+                    f"image_grid_thw row {image_idx} has non-positive grid "
+                    f"{(grid_t, grid_h, grid_w)}"
+                )
+            if grid_h % merge_size or grid_w % merge_size:
+                raise RuntimeError(
+                    f"image_grid_thw row {image_idx} grid "
+                    f"{(grid_t, grid_h, grid_w)} is not divisible by "
+                    f"spatial_merge_size={merge_size}"
+                )
+            grid_rows.append((grid_t, grid_h, grid_w))
+            group_counts.append(
+                grid_t
+                * (grid_h // merge_size)
+                * (grid_w // merge_size)
+            )
+
+        window_result = self._vit_window_index_fn(image_grid_thw)
+        window_index = (
+            window_result[0]
+            if isinstance(window_result, (tuple, list))
+            else window_result
+        )
+        if not torch.is_tensor(window_index):
+            raise RuntimeError(
+                "Qwen visual get_window_index returned a non-tensor index"
+            )
+        window_index = window_index.detach().reshape(-1).to(dtype=torch.long)
+        expected_groups = sum(group_counts)
+        if int(window_index.numel()) != expected_groups:
+            raise RuntimeError(
+                "Qwen visual window index has unexpected length: "
+                f"got {int(window_index.numel())}, expected {expected_groups}"
+            )
+
+        layouts: list[_ViTSpatialLayout] = []
+        group_offset = 0
+        for image_idx, ((grid_t, grid_h, grid_w), group_count) in enumerate(
+            zip(grid_rows, group_counts)
+        ):
+            local_window_index = (
+                window_index[group_offset : group_offset + group_count]
+                - group_offset
+            )
+            expected_local = torch.arange(
+                group_count,
+                device=local_window_index.device,
+                dtype=local_window_index.dtype,
+            )
+            if not torch.equal(
+                torch.sort(local_window_index).values,
+                expected_local,
+            ):
+                raise RuntimeError(
+                    "Qwen visual window index does not preserve a contiguous "
+                    f"per-image token segment for image {image_idx}"
+                )
+            layouts.append(
+                _ViTSpatialLayout(
+                    grid_t=grid_t,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    reverse_window_indices=torch.argsort(local_window_index),
+                )
+            )
+            group_offset += group_count
+        return layouts
+
+    def _restore_vit_tokens(
+        self,
+        tokens: torch.Tensor,
+        layout: _ViTSpatialLayout,
+        *,
+        layer_idx: int,
+        image_idx: int,
+    ) -> torch.Tensor:
+        """Undo Qwen window order and merge packing into ``[T,H,W,C]``."""
+
+        if tokens.ndim != 2:
+            raise RuntimeError(
+                f"ViT layer {layer_idx} image {image_idx} must have token "
+                f"shape [N,C], got {tuple(tokens.shape)}"
+            )
+        expected_tokens = layout.grid_t * layout.grid_h * layout.grid_w
+        if int(tokens.shape[0]) != expected_tokens:
+            raise RuntimeError(
+                f"ViT layer {layer_idx} image {image_idx} produced "
+                f"{int(tokens.shape[0])} tokens, but grid "
+                f"{(layout.grid_t, layout.grid_h, layout.grid_w)} requires "
+                f"{expected_tokens}"
+            )
+
+        merge_size = int(self.spatial_merge_size)
+        merge_area = merge_size**2
+        num_groups = expected_tokens // merge_area
+        grouped = tokens.reshape(num_groups, merge_area, tokens.shape[-1])
+        reverse_indices = layout.reverse_window_indices.to(
+            device=tokens.device,
+            dtype=torch.long,
+        )
+        grouped = grouped.index_select(0, reverse_indices)
+
+        raster = grouped.reshape(
+            layout.grid_t,
+            layout.grid_h // merge_size,
+            layout.grid_w // merge_size,
+            merge_size,
+            merge_size,
+            tokens.shape[-1],
+        )
+        raster = raster.permute(0, 1, 3, 2, 4, 5).reshape(
+            layout.grid_t,
+            layout.grid_h,
+            layout.grid_w,
+            tokens.shape[-1],
+        )
+        return raster
 
     def _validate_history_visual_occurrences(
         self,
@@ -384,6 +569,14 @@ class FeatureExtractor:
             sample_offsets.append(running)
             running += count
 
+        vit_layouts = (
+            self._build_vit_spatial_layouts(
+                image_grid_thw,
+                expected_images=running,
+            )
+            if self.vit_layer_indices and self.restore_vit_spatial_layout
+            else []
+        )
         if image_grid_thw is not None:
             per_image_sizes = (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]).tolist()
         else:
@@ -423,19 +616,31 @@ class FeatureExtractor:
             prefix.append(prefix[-1] + int(size))
 
         vit_ranges_batch: list[dict[int, tuple[int, int]]] = []
-        for image_offset in sample_offsets:
+        vit_layouts_batch: list[dict[int, _ViTSpatialLayout]] = []
+        for batch_idx, image_offset in enumerate(sample_offsets):
+            if sample_image_counts[batch_idx] < 4:
+                raise RuntimeError(
+                    f"Compact batch item {batch_idx} has "
+                    f"{sample_image_counts[batch_idx]} images; four current "
+                    "panoramic views are required"
+                )
             sample_views = {}
+            sample_layouts = {}
             for view_idx in range(4):
                 global_img_idx = image_offset + view_idx
                 start = prefix[global_img_idx]
                 end = prefix[global_img_idx + 1]
                 sample_views[view_idx] = (start, end)
+                if vit_layouts:
+                    sample_layouts[view_idx] = vit_layouts[global_img_idx]
             vit_ranges_batch.append(sample_views)
+            vit_layouts_batch.append(sample_layouts)
 
         self._batch_capture_plan = {
             "image_token_positions_batch": image_token_positions_batch,
             "text_anchor_positions_batch": text_anchor_positions_batch,
             "vit_ranges_batch": vit_ranges_batch,
+            "vit_layouts_batch": vit_layouts_batch,
             "deepest_layer": max(self.llm_layer_indices),
             "history_visual_ranges_batch": history_visual_ranges_batch,
         }
@@ -482,6 +687,14 @@ class FeatureExtractor:
             raise RuntimeError(f"LLM hidden states for layer {deepest_layer} not captured. Did you run model forward?")
 
         n_hist = len(text_anchor_positions)
+        vit_layouts = (
+            self._build_vit_spatial_layouts(
+                image_grid_thw,
+                expected_images=len(image_token_positions),
+            )
+            if self.vit_layer_indices and self.restore_vit_spatial_layout
+            else []
+        )
 
         # --- current 4 views: multi-layer LLM features (8x8) ---
         current_llm: dict[int, dict[int, torch.Tensor]] = {}
@@ -514,7 +727,12 @@ class FeatureExtractor:
                     image_grid_thw,
                 )
                 if vit_tokens is not None:
-                    current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx)
+                    current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(
+                        vit_tokens,
+                        layer_idx,
+                        view_idx,
+                        layout=vit_layouts[view_idx] if vit_layouts else None,
+                    )
 
         # --- history query vectors (from deepest hooked LLM layer) ---
         if self.history_query_source == HISTORY_QUERY_TEXT_ANCHOR:
@@ -575,6 +793,15 @@ class FeatureExtractor:
             sample_image_offsets.append(running)
             running += count
 
+        vit_layouts = (
+            self._build_vit_spatial_layouts(
+                image_grid_thw,
+                expected_images=running,
+            )
+            if self.vit_layer_indices and self.restore_vit_spatial_layout
+            else []
+        )
+
         if self.history_query_source == HISTORY_QUERY_VISUAL_EQUAL_VIEW_MEAN_V1:
             if len(image_token_positions_batch) != len(text_anchor_positions_batch):
                 raise RuntimeError(
@@ -628,7 +855,12 @@ class FeatureExtractor:
                         continue
                     vit_tokens = self._get_vit_for_image(vit_out, global_img_idx, image_grid_thw)
                     if vit_tokens is not None:
-                        current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx)
+                        current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(
+                            vit_tokens,
+                            layer_idx,
+                            view_idx,
+                            layout=vit_layouts[global_img_idx] if vit_layouts else None,
+                        )
 
             if self.history_query_source == HISTORY_QUERY_TEXT_ANCHOR:
                 history_queries: list[torch.Tensor] = []
@@ -665,6 +897,11 @@ class FeatureExtractor:
             raise RuntimeError("Deepest-layer history queries were not captured in compact batch mode.")
 
         batch_size = len(self._captured_batch_queries)
+        vit_layouts_batch = self._batch_capture_plan.get("vit_layouts_batch", [])
+        if self.restore_vit_spatial_layout and len(vit_layouts_batch) != batch_size:
+            raise RuntimeError(
+                "Compact ViT capture is missing spatial-layout metadata"
+            )
         extracted = []
         for batch_idx in range(batch_size):
             current_llm: dict[int, dict[int, torch.Tensor]] = {view_idx: {} for view_idx in range(4)}
@@ -683,7 +920,16 @@ class FeatureExtractor:
                 if layer_samples is None:
                     continue
                 for view_idx, vit_tokens in layer_samples[batch_idx].items():
-                    current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx)
+                    current_vit[view_idx][layer_idx] = self._reshape_vit_tokens(
+                        vit_tokens,
+                        layer_idx,
+                        view_idx,
+                        layout=(
+                            vit_layouts_batch[batch_idx][view_idx]
+                            if self.restore_vit_spatial_layout
+                            else None
+                        ),
+                    )
 
             extracted.append((current_vit, current_llm, self._captured_batch_queries[batch_idx]))
 
@@ -698,6 +944,11 @@ class FeatureExtractor:
             raise RuntimeError("Deepest-layer history queries were not captured in compact batch mode.")
 
         batch_size = len(self._captured_batch_queries)
+        vit_layouts_batch = self._batch_capture_plan.get("vit_layouts_batch", [])
+        if self.restore_vit_spatial_layout and len(vit_layouts_batch) != batch_size:
+            raise RuntimeError(
+                "Compact ViT capture is missing spatial-layout metadata"
+            )
         llm_tensors: dict[int, torch.Tensor] = {}
         vit_tensors: dict[int, torch.Tensor] = {}
 
@@ -725,7 +976,18 @@ class FeatureExtractor:
                 view_tensors = []
                 for view_idx in range(4):
                     vit_tokens = layer_samples[batch_idx][view_idx]
-                    view_tensors.append(self._reshape_vit_tokens(vit_tokens, layer_idx, view_idx))
+                    view_tensors.append(
+                        self._reshape_vit_tokens(
+                            vit_tokens,
+                            layer_idx,
+                            view_idx,
+                            layout=(
+                                vit_layouts_batch[batch_idx][view_idx]
+                                if self.restore_vit_spatial_layout
+                                else None
+                            ),
+                        )
+                    )
                 batch_views.append(torch.stack(view_tensors, dim=0))
             vit_tensors[layer_idx] = torch.stack(batch_views, dim=0)
 
@@ -799,25 +1061,50 @@ class FeatureExtractor:
         tokens: torch.Tensor,
         layer_idx: int,
         image_idx: int,
+        *,
+        layout: _ViTSpatialLayout | None = None,
     ) -> torch.Tensor:
-        """Reshape square ViT tokens and resize to the expected 16x16 grid."""
-        num_tokens = tokens.shape[0]
-        side = int(num_tokens**0.5)
-        if side * side != num_tokens:
-            raise RuntimeError(
-                f"ViT layer {layer_idx} image {image_idx} produced {num_tokens} tokens, "
-                "which is not a square grid and cannot be reshaped into 16x16-style spatial features."
+        """Restore/reshape ViT tokens and resize to the expected 16x16 grid."""
+        if self.restore_vit_spatial_layout:
+            if layout is None:
+                raise RuntimeError(
+                    "ViT spatial-layout restoration is enabled but no layout "
+                    f"was provided for layer {layer_idx} image {image_idx}"
+                )
+            raster = self._restore_vit_tokens(
+                tokens,
+                layout,
+                layer_idx=layer_idx,
+                image_idx=image_idx,
             )
+            if layout.grid_t != 1:
+                raise RuntimeError(
+                    "Heatmap ViT features require image grid_t=1, got "
+                    f"{layout.grid_t} for image {image_idx}"
+                )
+            feat = raster[0]
+            spatial_h, spatial_w = layout.grid_h, layout.grid_w
+        else:
+            # Legacy compatibility: historical checkpoints were trained with
+            # a direct square reshape of block-hook output.
+            num_tokens = tokens.shape[0]
+            side = int(num_tokens**0.5)
+            if side * side != num_tokens:
+                raise RuntimeError(
+                    f"ViT layer {layer_idx} image {image_idx} produced {num_tokens} tokens, "
+                    "which is not a square grid and cannot be reshaped into 16x16-style spatial features."
+                )
+            feat = tokens.reshape(side, side, -1)
+            spatial_h = spatial_w = side
 
-        feat = tokens.reshape(side, side, -1)
-        if side == VIT_SPATIAL:
+        if spatial_h == VIT_SPATIAL and spatial_w == VIT_SPATIAL:
             return feat
 
         if not self._vit_resize_logged:
             logger.warning(
                 "ViT spatial grid is %dx%d instead of %dx%d; resizing hooked image features to the expected shape",
-                side,
-                side,
+                spatial_h,
+                spatial_w,
                 VIT_SPATIAL,
                 VIT_SPATIAL,
             )

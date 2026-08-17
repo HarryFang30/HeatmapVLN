@@ -351,7 +351,12 @@ def construct_input(
 
     nav_target_text = assistant_text
     if nav_target_text is None and pixel_goal is not None:
-        nav_target_text = f"{pixel_goal[0]} {pixel_goal[1]}"
+        if internnav_protocol and not structured_pano_output:
+            # Dataset coordinates are image [u,v]. Released InternNav trains
+            # System-2 to emit "v u" and swaps the pair back before System-1.
+            nav_target_text = f"{pixel_goal[1]} {pixel_goal[0]}"
+        else:
+            nav_target_text = f"{pixel_goal[0]} {pixel_goal[1]}"
 
     if nav_target_text is not None or pixel_goal is not None:
         if structured_pano_output:
@@ -473,25 +478,50 @@ def construct_input_stage2(
     instruction: str | None = None,
     pixel_goal: list[int] | None = None,
     assistant_text: str | None = None,
+    conjunction: str | None = None,
 ) -> list[dict]:
-    """Construct InternNav-aligned Stage 2 input (front-view + lookdown)."""
-    all_frames = [_ensure_pil(f) for f in history_frames]
-    all_frames.append(_ensure_pil(current_frame))
+    """Construct the released InternNav Stage-2 independent-image prompt.
 
+    InternNav does not encode the front-view history as a Qwen video. Its
+    native policy renders one image placeholder per selected history, one for
+    the current front view, and one for the look-down observation after the
+    TILT DOWN assistant turn. Keeping the images independent is part of the
+    released System-2 token and position contract.
+    """
+    history_images = [_ensure_pil(frame) for frame in history_frames]
+    current_image = _ensure_pil(current_frame)
+    resolved_conjunction = (
+        random.choice(INTERNAV_CONJUNCTIONS)
+        if conjunction is None
+        else str(conjunction)
+    )
+    if not resolved_conjunction.strip():
+        raise ValueError("InternNav conjunction must contain non-whitespace text")
     instruction_text = instruction or ""
     prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
-    if len(history_frames) > 0:
-        prompt_text += " These are your historical observations in the following video."
-
-    user_content: list[dict] = [
-        {"type": "text", "text": prompt_text},
-        {"type": "video", "video": all_frames, "nframes": len(all_frames)},
-    ]
+    user_content: list[dict] = [{"type": "text", "text": prompt_text}]
+    if history_images:
+        user_content.append({
+            "type": "text",
+            "text": " These are your historical observations: ",
+        })
+        for history_image in history_images:
+            user_content.append({"type": "image", "image": history_image})
+            user_content.append({"type": "text", "text": "\n"})
+        user_content.append({"type": "text", "text": ". "})
+    else:
+        user_content.append({"type": "text", "text": " "})
+    user_content.extend([
+        {"type": "text", "text": resolved_conjunction},
+        {"type": "image", "image": current_image},
+        {"type": "text", "text": "."},
+    ])
     messages = [{"role": "user", "content": user_content}]
 
     nav_target_text = assistant_text
     if nav_target_text is None and pixel_goal is not None:
-        nav_target_text = f"{pixel_goal[0]} {pixel_goal[1]}"
+        # Native System-2 emits "v u"; dataset coordinates are image [u,v].
+        nav_target_text = f"{pixel_goal[1]} {pixel_goal[0]}"
 
     if pixel_goal is not None:
         messages.append({
@@ -501,8 +531,9 @@ def construct_input_stage2(
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": random.choice(INTERNAV_CONJUNCTIONS)},
+                {"type": "text", "text": resolved_conjunction},
                 {"type": "image", "image": _ensure_pil(lookdown_frame)},
+                {"type": "text", "text": "."},
             ],
         })
 

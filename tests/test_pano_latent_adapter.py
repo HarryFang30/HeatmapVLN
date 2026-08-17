@@ -1,3 +1,4 @@
+import json
 import math
 from types import SimpleNamespace
 
@@ -5,13 +6,22 @@ import pytest
 import torch
 
 from src.models.adapters import GeometryAwarePanoToNextDiTAdapter, view_ids_to_indices
+from src.models.adapters.pano_latent_adapter import GEOMETRY_CONVENTION_LEGACY_CAMERA
+from src.data.pano_teacher_alignment import (
+    NATIVE_TEACHER_ALIGNMENT_VERSION,
+    NATIVE_TEACHER_SIDECAR_SCHEMA,
+    aligned_native_sidecar_contract,
+    sidecar_alignment_metadata,
+)
 from scripts.training.train_pano_latent_adapter import (
     AdapterTrainBatch,
     _compute_adapter_objective,
     _filter_records_with_pano_goals,
     _load_validated_tensor_sidecar_payload,
     _load_teacher_latents,
+    _load_teacher_records,
     _sample_from_record,
+    _split_train_val,
 )
 
 
@@ -35,14 +45,14 @@ def test_geometry_scalars_use_view_yaw_and_pixel_offset():
 
     assert torch.allclose(scalars[:, :2], torch.full((4, 2), 0.5))
     assert torch.allclose(scalars[0, 2:], torch.tensor([0.0, 1.0]), atol=1e-6)
-    assert torch.allclose(scalars[1, 2:], torch.tensor([1.0, 0.0]), atol=1e-6)
+    assert torch.allclose(scalars[1, 2:], torch.tensor([-1.0, 0.0]), atol=1e-6)
     assert torch.allclose(scalars[2, 2:], torch.tensor([0.0, -1.0]), atol=1e-6)
-    assert torch.allclose(scalars[3, 2:], torch.tensor([-1.0, 0.0]), atol=1e-6)
+    assert torch.allclose(scalars[3, 2:], torch.tensor([1.0, 0.0]), atol=1e-6)
 
 
 def test_geometry_scalars_apply_horizontal_fov():
     view_indices = view_ids_to_indices(["front"])
-    pixel_xy = torch.tensor([[256.0, 128.0]])
+    pixel_xy = torch.tensor([[192.0, 128.0]])
     image_hw = torch.tensor([[256.0, 256.0]])
 
     scalars = GeometryAwarePanoToNextDiTAdapter.geometry_scalars(
@@ -52,7 +62,24 @@ def test_geometry_scalars_apply_horizontal_fov():
         horizontal_fov_deg=90.0,
     )
 
-    expected_theta = math.radians(45.0)
+    expected_theta = math.radians(-22.5)
+    assert torch.allclose(
+        scalars[0, 2:],
+        torch.tensor([math.sin(expected_theta), math.cos(expected_theta)]),
+        atol=1e-6,
+    )
+
+
+def test_geometry_scalars_preserve_explicit_legacy_camera_convention():
+    view_indices = view_ids_to_indices(["right"])
+    scalars = GeometryAwarePanoToNextDiTAdapter.geometry_scalars(
+        view_indices,
+        torch.tensor([[192.0, 128.0]]),
+        torch.tensor([[256.0, 256.0]]),
+        horizontal_fov_deg=90.0,
+        geometry_convention=GEOMETRY_CONVENTION_LEGACY_CAMERA,
+    )
+    expected_theta = math.radians(112.5)
     assert torch.allclose(
         scalars[0, 2:],
         torch.tensor([math.sin(expected_theta), math.cos(expected_theta)]),
@@ -81,6 +108,58 @@ def test_geometry_aware_adapter_outputs_nextdit_condition_shape_and_grad():
     assert out.shape == (2, 4, 6)
     out.square().mean().backward()
     assert adapter.output_queries.grad is not None
+
+
+def test_native_teacher_loader_rejects_legacy_dataset_sidecar(tmp_path):
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "dataset_index": 0,
+                "teacher": {
+                    "coord_source": "dataset",
+                    "mode": "dataset_coord",
+                    "coord_uv": [151, 202],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _load_teacher_records(
+        path,
+        require_tensor=False,
+        require_coord_uv=False,
+        require_native_teacher=True,
+    ) == []
+
+
+def test_native_v2_tensor_fingerprint_must_match_jsonl(tmp_path):
+    tensor_path = tmp_path / "teacher.pt"
+    contract = {"goal_frame_idx": 12}
+    torch.save(
+        {
+            "dataset_index": 0,
+            "sidecar_schema": NATIVE_TEACHER_SIDECAR_SCHEMA,
+            "alignment_version": NATIVE_TEACHER_ALIGNMENT_VERSION,
+            "alignment_fingerprint": "tensor-fingerprint",
+            "alignment_contract": contract,
+            "traj_latents": torch.ones(1, 4, 6),
+        },
+        tensor_path,
+    )
+    rec = {
+        "dataset_index": 0,
+        "_tensor_path": str(tensor_path),
+        "_sidecar_coord_source": "aligned_native",
+        "sidecar_schema": NATIVE_TEACHER_SIDECAR_SCHEMA,
+        "alignment_version": NATIVE_TEACHER_ALIGNMENT_VERSION,
+        "alignment_fingerprint": "jsonl-fingerprint",
+        "alignment_contract": contract,
+    }
+    with pytest.raises(RuntimeError, match="alignment_fingerprint mismatch"):
+        _load_validated_tensor_sidecar_payload(rec)
 
 
 class _FakeDataset:
@@ -263,6 +342,131 @@ def test_filter_records_accepts_strictly_aligned_sidecar(tmp_path):
     )
 
     assert filtered == records
+
+
+def _trusted_native_record(tmp_path, dataset):
+    clip = tmp_path / "scene" / "clip_000001"
+    clip.mkdir(parents=True, exist_ok=True)
+    dataset.clips = [clip]
+    dataset._clip_dir_to_idx = {str(clip): 0}
+    dataset._clip_valid_frames = {0: [5]}
+    sample = {
+        "pano_sample_kind": "pixel",
+        "pano_view_id": "front",
+        "pano_pixel_goal": [123, 111],
+        "pano_pixel_goal_relative_len": 7,
+        "pano_goal_frame_idx": 12,
+        "aligned_native_pixel_goal_uv": [151, 202],
+        "aligned_native_goal_frame_idx": 12,
+        "aligned_native_visible": True,
+    }
+    stable_key = f"{clip}|t=5"
+    tensor_path = tmp_path / "native_teacher.pt"
+    contract = aligned_native_sidecar_contract(
+        sample,
+        stable_sample_key=stable_key,
+        current_t=5,
+    )
+    torch.save(
+        {
+            "dataset_index": 999,
+            "stable_sample_key": stable_key,
+            **contract,
+            "traj_latents": torch.ones(1, 4, 6),
+            "traj_latents_768": torch.ones(1, 4, 6),
+        },
+        tensor_path,
+    )
+    return {
+        "status": "ok",
+        "dataset_index": 999,
+        "clip_idx": 999,
+        "clip_dir": str(clip),
+        "current_t": 5,
+        "stable_sample_key": stable_key,
+        "_tensor_path": str(tensor_path),
+        "_sidecar_coord_source": "aligned_native",
+        "_sidecar_mode": "aligned_native_coord",
+        "_sidecar_pano_view_id": "front",
+        "_sidecar_pano_pixel_goal": [123, 111],
+        **contract,
+        "teacher": {
+            "coord_source": "aligned_native",
+            "mode": "aligned_native_coord",
+            "coord_uv": [151, 202],
+            "internnav_pixel_goal_yx": [202, 151],
+            "conditioned_coord_text": "202 151",
+            "pano_view_id": "front",
+            "goal_frame_idx": 12,
+        },
+        "dataset_label": sidecar_alignment_metadata(sample),
+    }
+
+
+def test_trusted_native_fast_filter_binds_live_dataset_without_loading_sample(tmp_path):
+    dataset = _FakeDataset()
+    record = _trusted_native_record(tmp_path, dataset)
+
+    def must_not_materialize(_idx):
+        raise AssertionError("trusted native startup must not load RGB sample")
+
+    dataset._build_sample = must_not_materialize
+    filtered = _filter_records_with_pano_goals(
+        [record],
+        dataset=dataset,
+        validate_sidecar_metadata=True,
+        require_native_teacher_sidecar=True,
+        trust_sidecar_pano_labels=True,
+    )
+    assert filtered == [record]
+
+
+def test_trusted_native_fast_filter_rejects_missing_clip_path(tmp_path):
+    dataset = _FakeDataset()
+    record = _trusted_native_record(tmp_path, dataset)
+    record["clip_dir"] = str(tmp_path / "other" / "missing_clip")
+
+    filtered = _filter_records_with_pano_goals(
+        [record],
+        dataset=dataset,
+        require_native_teacher_sidecar=True,
+        trust_sidecar_pano_labels=True,
+    )
+    assert filtered == []
+
+
+def test_trusted_native_fast_filter_rejects_teacher_coordinate_mismatch(tmp_path):
+    dataset = _FakeDataset()
+    record = _trusted_native_record(tmp_path, dataset)
+    record["teacher"]["coord_uv"] = [202, 151]
+
+    filtered = _filter_records_with_pano_goals(
+        [record],
+        dataset=dataset,
+        require_native_teacher_sidecar=True,
+        trust_sidecar_pano_labels=True,
+    )
+    assert filtered == []
+
+
+def test_train_val_split_never_leaks_frames_from_the_same_trajectory():
+    records = [
+        {
+            "dataset_index": idx,
+            "scene_id": "scene",
+            "trajectory_id": f"traj-{idx // 3}",
+            "clip_dir": f"/data/clip-{idx // 3}",
+        }
+        for idx in range(12)
+    ]
+    train, val = _split_train_val(
+        records,
+        SimpleNamespace(val_records=0, val_ratio=0.25, seed=42),
+    )
+    train_groups = {(r["scene_id"], r["trajectory_id"]) for r in train}
+    val_groups = {(r["scene_id"], r["trajectory_id"]) for r in val}
+    assert train_groups.isdisjoint(val_groups)
+    assert len(val) == 3
 
 
 class _FakeSystem1Head(torch.nn.Module):

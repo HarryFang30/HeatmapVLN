@@ -1,0 +1,253 @@
+seed: 42
+
+data:
+  root: /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data
+  train_split: train
+  val_split: val
+  image_size: [384, 384]
+  init_hm_size: [64, 64]
+  num_workers: 0
+  pin_memory: false
+  dataset_type: trajectory
+  use_worker_tokenized_collator: true
+  in_order: true
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 1
+    clip_level_sampling: false
+    samples_per_clip: 1
+    random_subsequence: false
+    predict_horizon: 32
+    action_scale: 4.0
+    enable_augmentation: false
+    enable_trajectory_augmentation: false
+    load_traj_images: true
+    load_single_view_history_frames: true
+    single_view_rgb_input: true
+    amb3r_pose_cache_root: /mnt/afs/lixiaoou/intern/fjl/.codex_tmp/ppa_r2r_cache_20260813/cache
+    require_amb3r_pose_cache: true
+    amb3r_pose_cache_max_clips: 1
+    traj_image_size: [224, 224]
+    compute_pixel_goal: true
+    compute_pano_view_pixel_goal: false
+    load_lookdown_for_system2: true
+    system2_sft_protocol: internnav
+    structured_pano_output: false
+    pixel_goal_direction: front_down
+    load_history_heatmap: true
+    require_sft_target: true
+    sft_include_turns: false
+    sft_include_forward: false
+    sft_num_future_steps: 4
+    system2_sample_step: 1
+    system2_min_pixel_goal_len: 3
+    system2_stop_oversample: 0
+    include_stop_samples_random_subsequence: false
+    panoramic_vlm_input: false
+    trajectory_target_convention: internnav_habitat
+    max_clips: 1
+    future_heatmap:
+      enabled: true
+      heatmap_size: [64, 64]
+
+model:
+  type: vln_pipeline
+  device: cuda
+  llm:
+    model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+    max_video_frames: -1
+    gradient_checkpointing: false
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: false
+    frozen_traj_inference_mode: true
+    traj_last_hidden_state_only: false
+  heatmap:
+    enable: true
+    input_mode: internnav_single_view
+    feature_source: vit_only
+    architecture_id: internnav_single_view_vision_only_four_direction_v2
+    output_direction_order: [front, right, back, left]
+    history_pose_convention: habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1
+    c_vit: 1280
+    c_llm: 3584
+    c_fused: 256
+    vit_layer_indices: [7, 15, 23, 31]
+    llm_layer_indices: []
+    heatmap_size: [64, 64]
+    image_size: 384
+    heatmap_trains_backbone: false
+    decoder_mode: legacy
+    restore_vit_spatial_layout: true
+    coarse_logit_residual: false
+    joint_panorama_inference: true
+    conditioner_global_context: true
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 2
+      max_spatial_range: 10.0
+  action_head:
+    enable: true
+    nextdit:
+      enabled: true
+      internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+      internnav_system1_path: ""
+      pretrained_system1_path: null
+      vlm_hidden_dim: 3584
+      latent_emb_size: 768
+      n_query: 4
+      dit_dim: 384
+      dit_layers: 12
+      dit_heads: 6
+      dit_kv_heads: 6
+      dit_ffn_dim_multiplier: 0.6666666666666666
+      predict_steps: 32
+      action_dim: 3
+      num_inference_steps: 10
+      guidance_scale: 1.0
+      num_sample_trajs: 32
+      dav2_ckpt_path: ""
+      enable_gradient_checkpointing: false
+      warmup_steps: 0
+      heatmap_control:
+        enabled: false
+  past_plan_action:
+    enabled: true
+    schema_version: past-plan-action-v1
+    plan_dim: 768
+    memory_dim: 256
+    bridge_heads: 8
+
+training:
+  stages:
+    - name: ppa_stage2_real_one_batch_smoke
+      epochs: 1
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
+      train_history: true
+      train_future: true
+      train_lm: false
+      train_system2_sft: false
+      train_action: true
+      teacher_force_system2_answer: true
+      system2_sft_protocol: internnav
+      trajectory_sequence_mode: first_only
+      strict_trainable_modules: true
+      require_complete_internnav_system1: true
+      heatmap_fp32: true
+      retain_raw_panoramic_views: false
+      compute_pano_text_anchor_positions: false
+      retain_history_rel_poses: true
+      trainable_modules: [past_plan_action, heatmap_vln]
+      heatmap_pose_adaptation_init: true
+      required_history_pose_provider: amb3r_vo_cache
+      past_plan_action_stage: stage2_joint
+      frozen_modules:
+        - vlm_backbone
+        - qwen2_5_vl
+        - latent_queries
+        - cond_projector
+        - memory_encoder
+        - rgb_resampler
+        - traj_dit
+        - action_encoder
+        - action_decoder
+        - rgb_model
+        - pos_encoding
+        - llm_projector
+
+optim:
+  optimizer: adamw
+  learning_rate: 2.0e-5
+  past_plan_action_future_lr: 1.0e-4
+  past_plan_action_bridge_lr: 2.0e-5
+  heatmap_lr: 2.0e-5
+  heatmap_coarse_lr: 2.0e-5
+  heatmap_fine_lr: 2.0e-5
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.0
+  min_lr: 1.0e-6
+  batch_size: 1
+  grad_accum_steps: 1
+  ema_decay: 0.999
+  ema_warmup_steps: 500
+
+loss:
+  heatmap_loss_type: heatmap_vln
+  heatmap_weight: 1.0
+  trajectory_weight: 1.0
+  history_weight: 0.3
+  future_weight: 0.3
+  preserve_weight: 0.5
+  delta_z_weight: 0.01
+  lm_weight: 0.0
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_kl: 0.0
+    lambda_peak: 1.0
+    lambda_neg: 0.25
+    lambda_view_macro: 0.5
+    lambda_direction_macro: 0.5
+    lambda_panoramic_view: 1.0
+    panoramic_detach_visibility: false
+    vis_pos_weight: 7.0
+    temperature: 1.0
+    coord_smooth_l1_beta: 0.1
+    allow_probability_fallback: false
+  future_heatmap:
+    lambda_vis: 1.0
+    lambda_peak: 1.0
+    lambda_neg: 0.25
+    lambda_view_macro: 0.5
+    vis_pos_weight: 1.0
+    lambda_coord: 0.0
+    lambda_direction_macro: 0.0
+    lambda_panoramic_view: 0.0
+    allow_probability_fallback: false
+
+gpu:
+  devices: [0]
+  backend: nccl
+  multi_gpu:
+    enabled: false
+    find_unused_parameters: false
+
+log:
+  out_dir: /mnt/afs/lixiaoou/intern/fjl/.codex_tmp/ppa_real_smoke_20260813/output
+  save_every_epochs: 1
+  vis_every_steps: 0
+  val_vis_batches: 0
+  max_ckpts: 1
+  use_tensorboard: false
+  enable_timing: true
+  log_interval: 1
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 1
+  mid_epoch_save_every: 0
+
+validation:
+  enabled: false
+  eval_every_epochs: 0
+  best_selection_enabled: false
+  evaluate_before_training: false
+  baseline_as_best_threshold: false
+  patience: 999

@@ -76,6 +76,7 @@ from src.models.adapters import (
     GeometryAwarePanoToNextDiTAdapter,
     PanoLatentSpaceAdapter,
 )
+from src.models.adapters.pano_latent_adapter import GEOMETRY_CONVENTION_LEGACY_CAMERA
 
 LOGGER = logging.getLogger("eval_pano_latent_adapter")
 
@@ -181,17 +182,26 @@ def _load_adapter_from_checkpoint(
             dropout=float(saved_args.get("adapter_dropout", 0.0)),
             geometry_embed_dim=geometry_embed_dim,
             horizontal_fov_deg=float(saved_args.get("adapter_horizontal_fov_deg", 90.0)),
+            # Checkpoints created before this field used camera/right-positive
+            # geometry. Preserve them; new training defaults to trajectory-v2.
+            geometry_convention=str(
+                saved_args.get(
+                    "geometry_convention",
+                    ckpt.get("geometry_convention", GEOMETRY_CONVENTION_LEGACY_CAMERA),
+                )
+            ),
         )
         adapter.load_state_dict(state_dict)
         adapter.eval()
         adapter.to(device=device, dtype=dtype)
         LOGGER.info(
-            "Loaded geometry-aware adapter from %s student_dim=%d adapter_dim=%d output_dim=%d layers=%d dtype=%s",
+            "Loaded geometry-aware adapter from %s student_dim=%d adapter_dim=%d output_dim=%d layers=%d geometry_convention=%s dtype=%s",
             path,
             student_dim,
             adapter_dim,
             output_dim,
             max(len(layer_ids), 1),
+            adapter.geometry_convention,
             next(adapter.parameters()).dtype,
         )
         return adapter, saved_args

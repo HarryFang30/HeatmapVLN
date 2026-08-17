@@ -1,11 +1,31 @@
 import numpy as np
+import pytest
 
 from src.utils.trajectory_direction import (
     align_trajectory_endpoint_heading,
+    pano_recenter_turn,
     pairwise_representation_stats,
     summarize_direction_response,
     view_pixel_target_angle_deg,
 )
+
+
+@pytest.mark.parametrize(
+    ("view_id", "direction", "count"),
+    [
+        ("front", None, 0),
+        ("right", "right", 6),
+        ("back", "right", 12),
+        ("left", "left", 6),
+    ],
+)
+def test_pano_recenter_turn_for_habitat_15_degrees(view_id, direction, count):
+    assert pano_recenter_turn(view_id, turn_angle_deg=15.0) == (direction, count)
+
+
+def test_pano_recenter_turn_rejects_residual_heading():
+    with pytest.raises(ValueError, match="not divisible"):
+        pano_recenter_turn("right", turn_angle_deg=14.0)
 
 
 def _constant_delta(dx: float, dy: float, *, candidates: int = 4, steps: int = 3) -> np.ndarray:

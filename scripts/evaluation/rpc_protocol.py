@@ -7,7 +7,10 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-HEATMAPVLN_RPC_PROTOCOL_VERSION = "heatmapvln-r2r-json-v2"
+HEATMAPVLN_RPC_PROTOCOL_VERSION = "heatmapvln-r2r-json-v3"
+HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1 = (
+    "pano-two-phase-front-system1-v1"
+)
 HEATMAPVLN_RPC_SAMPLING_PROTOCOL = "heatmapvln-nextdit-sha256-v1"
 HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED = 42
 HEATMAPVLN_RPC_SAMPLING_FIELD = "deterministic_sampling"

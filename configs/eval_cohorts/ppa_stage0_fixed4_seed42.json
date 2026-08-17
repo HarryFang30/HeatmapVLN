@@ -1,0 +1,12 @@
+{
+  "schema": "heatmapvln-ppa-stage0-fixed-cohort-v1",
+  "description": "Four-scene fixed val_unseen cohort for exact zero-bridge closed-loop equivalence only.",
+  "source": "stage3_val_unseen_scene_balanced_100_seed42 first four scenes",
+  "seed": 42,
+  "episodes": [
+    {"scene_id": "x8F5xyUWy9e", "episode_id": 1053},
+    {"scene_id": "Z6MFQCViBuw", "episode_id": 965},
+    {"scene_id": "pLe4wQe7qrG", "episode_id": 1582},
+    {"scene_id": "2azQ1b91cZZ", "episode_id": 1159}
+  ]
+}

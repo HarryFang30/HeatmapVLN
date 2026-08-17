@@ -49,7 +49,7 @@ data:
     panoramic_vlm_input: true
     # Pano history already contains the front view. Avoid loading the same eight
     # front frames a second time for the unused legacy video_frames argument.
-    load_history_frames: false
+    load_single_view_history_frames: false
     load_depth: true
     cache_poses: true
     sample_stride: 2

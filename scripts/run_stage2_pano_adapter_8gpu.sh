@@ -29,8 +29,8 @@ STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/root/autodl-tmp/vln_pano_adap
 # prefetch_factor from the config YAML do not affect this script's path,
 # and TensorBoard logging is not yet wired — only console logging is active.
 # Native teacher JSONL collected with:
-#   collect_internnav_teacher_sidecar.py --coord-source dataset --tensor-output-dir ...
-# Records are aligned by (clip_idx,current_t), not integer dataset_index.
+#   collect_internnav_teacher_sidecar.py --coord-source aligned_native --tensor-output-dir ...
+# Native-v2 records bind the exact future waypoint and reject legacy sidecars.
 STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-}"
 
 # Training hyperparams (empty values defer to adapter config YAML)
@@ -84,7 +84,7 @@ require_hf_model_dir "$INTERNNAV_BACKBONE"
 require_dir "$STAGE2_ADAPTER_DATA_ROOT"
 if [[ "$STAGE2_ADAPTER_TEACHER_MODE" == "native_sidecar" && -z "$STAGE2_ADAPTER_TEACHER_JSONL" ]]; then
   echo "STAGE2_ADAPTER_TEACHER_MODE=native_sidecar requires STAGE2_ADAPTER_TEACHER_JSONL." >&2
-  echo "Collect it with scripts/evaluation/collect_internnav_teacher_sidecar.py --coord-source dataset --tensor-output-dir ..." >&2
+  echo "Collect it with scripts/evaluation/collect_internnav_teacher_sidecar.py --coord-source aligned_native --tensor-output-dir ..." >&2
   exit 1
 fi
 

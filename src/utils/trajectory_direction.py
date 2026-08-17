@@ -16,6 +16,14 @@ VIEW_TARGET_ANGLE_DEG: dict[str, float] = {
     "right": -90.0,
 }
 
+_PANO_RECENTER_TURN: dict[str, tuple[str | None, float]] = {
+    "front": (None, 0.0),
+    "right": ("right", 90.0),
+    # Either direction is equivalent for 180 degrees. Keep right deterministic.
+    "back": ("right", 180.0),
+    "left": ("left", 90.0),
+}
+
 
 def normalize_angle_deg(angle: float | np.ndarray) -> float | np.ndarray:
     return (np.asarray(angle) + 180.0) % 360.0 - 180.0
@@ -41,6 +49,37 @@ def view_pixel_target_angle_deg(
     u = float(pixel_xy[0])
     pixel_offset_deg = -((u / width) - 0.5) * float(horizontal_fov_deg)
     return float(normalize_angle_deg(VIEW_TARGET_ANGLE_DEG[view] + pixel_offset_deg))
+
+
+def pano_recenter_turn(
+    view_id: str,
+    *,
+    turn_angle_deg: float,
+    atol: float = 1.0e-6,
+) -> tuple[str | None, int]:
+    """Return the exact discrete turn needed to make a pano view the new front.
+
+    ``right`` is negative yaw and ``left`` is positive yaw. The caller must
+    execute the returned real Habitat turns before capturing the System1
+    front/lookdown observation. Refuse non-divisible turn angles instead of
+    silently leaving a residual camera-heading error.
+    """
+    view = str(view_id).lower()
+    if view not in _PANO_RECENTER_TURN:
+        raise ValueError(f"Unsupported view_id={view_id!r}")
+    if not np.isfinite(turn_angle_deg) or float(turn_angle_deg) <= 0.0:
+        raise ValueError(f"turn_angle_deg must be positive and finite, got {turn_angle_deg!r}")
+    direction, total_deg = _PANO_RECENTER_TURN[view]
+    if direction is None:
+        return None, 0
+    raw_count = total_deg / float(turn_angle_deg)
+    count = int(round(raw_count))
+    if count <= 0 or not np.isclose(raw_count, count, rtol=0.0, atol=float(atol)):
+        raise ValueError(
+            f"Pano recenter angle {total_deg:g} is not divisible by "
+            f"Habitat TURN_ANGLE={float(turn_angle_deg):g}"
+        )
+    return direction, count
 
 
 def align_trajectory_endpoint_heading(

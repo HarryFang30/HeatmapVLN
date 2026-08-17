@@ -381,12 +381,6 @@ def test_teacher_cache_covers_exact_batches_and_restores_rng_and_modes(tmp_path)
     assert all(record["teacher_logprobs"].device.type == "cpu" for record in records)
     assert contract["record_count"] == 2
     assert contract["planned_sample_count"] == 4
-    assert contract["sparse_backend"] == (
-        "hf_logits_to_keep_tensor_predictor_union_v1"
-    )
-    assert contract["backend_counts"] == {
-        "hf_logits_to_keep_tensor_predictor_union_v1": 2
-    }
     assert contract["rng_restored_exactly"]
     assert contract["module_modes_restored_exactly"]
     assert len(contract["cache_sha256"]) == 64

@@ -150,7 +150,8 @@ adapter:
     teacher_preload_cache: true
     teacher_preload_workers: 8
     check_teacher_tensor_files: false
-    trust_native_sidecar_pano_labels: true
+    # Native-v2 recomputes the exact pano/native goal identity at startup.
+    trust_native_sidecar_pano_labels: false
 
   # Loss:
   #   raw_weight  * raw latent direction/norm distillation
@@ -167,8 +168,8 @@ adapter:
   # Teacher
   teacher:
     # Requires a JSONL collected by:
-    #   collect_internnav_teacher_sidecar.py --coord-source dataset ...
-    # Records are aligned to pano samples by (clip_idx,current_t).
+    #   collect_internnav_teacher_sidecar.py --coord-source aligned_native ...
+    # v2 binds the same future goal frame, pano/native pixels and y-x text.
     target_mode: native_sidecar
     torch_dtype: bfloat16
     attn_implementation: sdpa

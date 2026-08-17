@@ -109,6 +109,7 @@ class PanoramicTokenizedCollator:
         retain_raw_panoramic_views: bool = True,
         compute_pano_text_anchor_positions: bool = True,
         heatmap_layout: bool = False,
+        force_internnav_prompt: bool = False,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -130,6 +131,7 @@ class PanoramicTokenizedCollator:
         self.retain_raw_panoramic_views = bool(retain_raw_panoramic_views)
         self.compute_pano_text_anchor_positions = bool(compute_pano_text_anchor_positions)
         self.heatmap_layout = bool(heatmap_layout)
+        self.force_internnav_prompt = bool(force_internnav_prompt)
         self._call_count = 0
         self._tokenizer_lock = _get_tokenizer_lock(self.processor.tokenizer)
 
@@ -163,7 +165,12 @@ class PanoramicTokenizedCollator:
             k = frames.shape[0]
             if k < max_k:
                 pad_size = max_k - k
-                pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
+                if k == 0:
+                    pad_frames = frames.new_zeros(
+                        (pad_size, *frames.shape[1:])
+                    )
+                else:
+                    pad_frames = frames[-1:].repeat(pad_size, 1, 1, 1)
                 frames = torch.cat([frames, pad_frames], dim=0)
             history_frames_padded.append(frames)
 
@@ -233,9 +240,10 @@ class PanoramicTokenizedCollator:
 
         pg = sample.get("pixel_goal")
         if pg is not None:
-            coord_text = f"{int(pg[0])} {int(pg[1])}"
             if self.sft_protocol == "internnav":
+                coord_text = f"{int(pg[1])} {int(pg[0])}"
                 return ["↓", coord_text]
+            coord_text = f"{int(pg[0])} {int(pg[1])}"
             return [coord_text]
 
         turn_action_text = sample.get("turn_action_text")
@@ -428,6 +436,40 @@ class PanoramicTokenizedCollator:
         result["is_stop"] = torch.tensor([sample.get("is_stop", 0.0) for sample in batch])
         result["text"] = [sample["text"] for sample in batch]
 
+        for key in ("sample_key", "source_type"):
+            if all(key in sample for sample in batch):
+                result[key] = [sample[key] for sample in batch]
+        for key in (
+            "current_pose",
+            "current_camera_pose",
+            "current_agent_pose",
+        ):
+            if all(key in sample for sample in batch):
+                result[key] = torch.stack(
+                    [sample[key] for sample in batch], dim=0
+                )
+        for key in (
+            "history_poses",
+            "history_frame_ids",
+            "history_age_steps",
+        ):
+            if all(key in sample for sample in batch):
+                result[key] = self._stack_padded_first_dim(batch, key)
+        if all("history_valid_mask" in sample for sample in batch):
+            result["history_valid_mask"] = self._stack_padded_first_dim(
+                batch,
+                "history_valid_mask",
+            )
+            result["history_mask"] = result[
+                "history_valid_mask"
+            ].float()
+        for key in (
+            "heatmap_direction_order",
+            "history_pose_convention",
+        ):
+            if all(key in sample for sample in batch):
+                result[key] = batch[0][key]
+
         if "gt_visibility" in batch[0]:
             result["gt_visibility"] = self._stack_padded_first_dim(batch, "gt_visibility")
         if "is_flipped" in batch[0]:
@@ -454,8 +496,15 @@ class PanoramicTokenizedCollator:
         if do_log:
             rss1 = _rss_mb()
 
-        use_panoramic = "current_views" in batch[0] and "history_panoramas" in batch[0]
-        use_internnav = "lookdown_frame" in batch[0] and not use_panoramic
+        has_panoramic = "current_views" in batch[0] and "history_panoramas" in batch[0]
+        use_panoramic = has_panoramic and not self.force_internnav_prompt
+        use_internnav = "lookdown_frame" in batch[0] and (
+            self.force_internnav_prompt or not use_panoramic
+        )
+        if self.force_internnav_prompt and not use_internnav:
+            raise RuntimeError(
+                "force_internnav_prompt requires lookdown_frame for every sample"
+            )
 
         if use_panoramic or use_internnav:
             messages_batch = []
@@ -549,14 +598,81 @@ class PanoramicTokenizedCollator:
 
             has_assistant = any(len(m) > 1 for m in messages_batch)
             with self._tokenizer_lock:
-                pano_inputs = self.processor.apply_chat_template(
-                    messages_batch,
-                    tokenize=True,
-                    add_generation_prompt=not has_assistant,
-                    return_dict=True,
-                    return_tensors="pt",
-                    padding=True,
-                )
+                if self.force_internnav_prompt:
+                    # Match the released InternNav Stage-2 path exactly:
+                    # render the chat to text first, then invoke the processor
+                    # with one flat, sample-major list of independent images.
+                    # In particular, history observations are images, not a
+                    # Qwen video, so video token/position semantics must never
+                    # enter the native System-2 path.
+                    rendered_text = self.processor.apply_chat_template(
+                        messages_batch,
+                        tokenize=False,
+                        add_generation_prompt=not has_assistant,
+                    )
+                    if isinstance(rendered_text, str):
+                        rendered_text = [rendered_text]
+                    if len(rendered_text) != len(messages_batch):
+                        raise RuntimeError(
+                            "InternNav chat rendering returned an unexpected "
+                            f"batch size: {len(rendered_text)} != "
+                            f"{len(messages_batch)}"
+                        )
+
+                    native_images = []
+                    for messages in messages_batch:
+                        for message in messages:
+                            content = message.get("content", [])
+                            if not isinstance(content, list):
+                                continue
+                            for item in content:
+                                if not isinstance(item, dict):
+                                    continue
+                                item_type = item.get("type")
+                                if item_type == "video":
+                                    raise RuntimeError(
+                                        "Native InternNav System-2 input must "
+                                        "not contain video items"
+                                    )
+                                if item_type == "image":
+                                    native_images.append(item["image"])
+
+                    pano_inputs = self.processor(
+                        text=rendered_text,
+                        images=native_images,
+                        return_tensors="pt",
+                        padding=True,
+                    )
+                    image_grid = pano_inputs.get("image_grid_thw")
+                    if (
+                        image_grid is None
+                        or image_grid.ndim != 2
+                        or image_grid.shape[1] != 3
+                        or image_grid.shape[0] != len(native_images)
+                    ):
+                        grid_shape = (
+                            None if image_grid is None else tuple(image_grid.shape)
+                        )
+                        raise RuntimeError(
+                            "Native InternNav image_grid_thw does not match "
+                            "the independent image list: expected "
+                            f"[{len(native_images)},3], got {grid_shape}"
+                        )
+                    video_grid = pano_inputs.get("video_grid_thw")
+                    if video_grid is not None and int(video_grid.shape[0]) > 0:
+                        raise RuntimeError(
+                            "Native InternNav System-2 processor unexpectedly "
+                            "returned video_grid_thw"
+                        )
+                else:
+                    pano_inputs = self.processor.apply_chat_template(
+                        messages_batch,
+                        tokenize=True,
+                        add_generation_prompt=not has_assistant,
+                        return_dict=True,
+                        return_tensors="pt",
+                        padding=True,
+                    )
             del messages_batch
 
             # Only warn when sequence exceeds max length (truncation is disabled).

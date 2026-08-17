@@ -81,7 +81,7 @@ def load_audit_config(args: argparse.Namespace) -> dict[str, Any]:
         min_history=max(2, int(sw_cfg.get("min_history", 5))),
         num_history_sample=args.num_history,
         load_depth=True,
-        load_history_frames=True,
+        load_single_view_history_frames=True,
         cache_poses=True,
         sample_stride=2,
         clip_level_sampling=True,
@@ -123,7 +123,7 @@ def build_dataset(cfg: dict[str, Any], args: argparse.Namespace) -> VLNSlidingWi
         enable_augmentation=False,
         samples_per_clip=8,
         clip_level_sampling=True,
-        load_history_frames=True,
+        load_single_view_history_frames=True,
         max_clips=2,
     )
 

@@ -76,28 +76,59 @@ def test_generate_traj_from_condition_latents_uses_head_scheduler():
     assert trajectory.shape == (2, 4, 3)
 
 
-def _generate_with_seed(head: NextDiTActionHead, cond: torch.Tensor, seed: int) -> torch.Tensor:
-    generator = torch.Generator(device=cond.device)
-    generator.manual_seed(seed)
-    return head._generate_traj_from_condition_latents(
+def test_generate_traj_accepts_exact_explicit_initial_noise():
+    head = _minimal_head()
+    cond = torch.randn(1, 4, 3)
+    initial_noise = torch.arange(24, dtype=torch.float64).reshape(2, 4, 3)
+
+    trajectory = head._generate_traj_from_condition_latents(
         cond,
         predict_step_nums=4,
         guidance_scale=1.0,
         num_inference_steps=2,
         num_sample_trajs=2,
-        generator=generator,
+        initial_noise=initial_noise,
     )
 
+    assert trajectory.dtype == cond.dtype
+    assert torch.equal(trajectory, initial_noise.to(dtype=cond.dtype))
+    assert trajectory.data_ptr() != initial_noise.data_ptr()
 
-def test_generate_traj_explicit_generator_is_reproducible_and_rng_local():
+
+def test_explicit_initial_noise_rejects_ambiguous_or_invalid_inputs():
     head = _minimal_head()
-    cond = torch.zeros(1, 4, 3)
-    global_state = torch.random.get_rng_state().clone()
+    cond = torch.randn(1, 4, 3)
+    noise = torch.zeros(2, 4, 3)
 
-    first = _generate_with_seed(head, cond, 12345)
-    assert torch.equal(torch.random.get_rng_state(), global_state)
-    second = _generate_with_seed(head, cond, 12345)
-    different = _generate_with_seed(head, cond, 54321)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        head._generate_traj_from_condition_latents(
+            cond,
+            predict_step_nums=4,
+            guidance_scale=1.0,
+            num_inference_steps=2,
+            num_sample_trajs=2,
+            generator=torch.Generator(),
+            initial_noise=noise,
+        )
 
-    assert torch.equal(first, second)
-    assert not torch.equal(first, different)
+    with pytest.raises(ValueError, match="must have shape"):
+        head._generate_traj_from_condition_latents(
+            cond,
+            predict_step_nums=4,
+            guidance_scale=1.0,
+            num_inference_steps=2,
+            num_sample_trajs=2,
+            initial_noise=noise[:1],
+        )
+
+    invalid_noise = noise.clone()
+    invalid_noise[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        head._generate_traj_from_condition_latents(
+            cond,
+            predict_step_nums=4,
+            guidance_scale=1.0,
+            num_inference_steps=2,
+            num_sample_trajs=2,
+            initial_noise=invalid_noise,
+        )

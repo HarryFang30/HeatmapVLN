@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from PIL import Image
 from scripts.evaluation.rpc_protocol import (
+    HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1,
     HEATMAPVLN_RPC_PROTOCOL_VERSION,
     HEATMAPVLN_RPC_SAMPLING_FIELD,
     validate_rpc_sampling_metadata,
@@ -46,12 +47,17 @@ from vla_rpc.proto import vla_pb2, vla_pb2_grpc
 
 from src.models.heatmap.input_constructor import (
     construct_input,
+    construct_input_stage2,
     parse_structured_pano_output,
     structured_condition_text,
     vlm_output_requests_stop,
     vlm_output_requests_turn,
 )
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
+from src.models.action.treatment_spec import (
+    TrajectoryPostprocessConfig,
+    build_treatment_spec,
+)
 from src.utils.trajectory_direction import (
     align_trajectory_endpoint_heading,
     view_pixel_target_angle_deg,
@@ -310,6 +316,51 @@ def _parse_pixel_goal(
     return None
 
 
+def _internnav_requests_lookdown(llm_output: str) -> bool:
+    """Match the released InternNav first-turn LOOKDOWN action."""
+    if re.search(r"\d", llm_output or ""):
+        return False
+    action_tokens = re.findall(r"STOP|[↑←→↓]", llm_output or "")
+    return bool(action_tokens) and action_tokens[0] == "↓"
+
+
+def _parse_internnav_pixel_goal(llm_output: str) -> list[int] | None:
+    """Convert native System2 ``row col`` text into image ``[u, v]``."""
+    if not re.search(r"\d", llm_output or ""):
+        return None
+    coordinates = [int(value) for value in re.findall(r"\d+", llm_output or "")]
+    if len(coordinates) < 2:
+        raise RuntimeError(
+            "InternNav coordinate output has fewer than two integers: "
+            f"{llm_output!r}"
+        )
+    return [int(coordinates[1]), int(coordinates[0])]
+
+
+def _append_internnav_lookdown_turn(
+    messages: list[dict[str, Any]],
+    *,
+    first_output: str,
+    lookdown_frame: Image.Image,
+) -> list[dict[str, Any]]:
+    """Append the official second conversational turn after ``↓``."""
+    return [
+        *messages,
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": str(first_output)}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "you can see "},
+                {"type": "image", "image": lookdown_frame},
+                {"type": "text", "text": "."},
+            ],
+        },
+    ]
+
+
 def _condition_output_ids_for_pixel_goal(
     output_ids: torch.Tensor,
     prompt_len: int,
@@ -321,12 +372,13 @@ def _condition_output_ids_for_pixel_goal(
     structured_output: bool = False,
 ) -> torch.Tensor:
     parsed = parse_structured_pano_output(llm_output, image_size=None)
+    has_generated_suffix = output_ids.ndim == 2 and output_ids.shape[1] > int(prompt_len)
     use_structured = structured_output or parsed.kind == "pixel"
     if use_structured:
         resolved_view = (view_id or parsed.view_id or "front").lower()
         desired_text = structured_condition_text(resolved_view, pixel_goal)
         generated_text = (llm_output or "").strip()
-        if generated_text == desired_text:
+        if generated_text == desired_text and has_generated_suffix:
             return output_ids
         replacement = tokenizer.encode(desired_text, add_special_tokens=False)
     else:
@@ -337,7 +389,7 @@ def _condition_output_ids_for_pixel_goal(
             desired = [int(pixel_goal[1]), int(pixel_goal[0])]
         else:
             raise ValueError(f"Unsupported coord_order: {coord_order}")
-        if len(coord) >= 2 and [coord[0], coord[1]] == desired:
+        if len(coord) >= 2 and [coord[0], coord[1]] == desired and has_generated_suffix:
             return output_ids
         replacement = tokenizer.encode(f"{desired[0]} {desired[1]}", add_special_tokens=False)
 
@@ -589,6 +641,9 @@ class HeatmapVLNRuntime:
         )
         self.has_nextdit = self.model.nextdit_action_head is not None and self.model.latent_queries is not None
         self.require_deterministic_sampling = bool(getattr(args, "require_deterministic_sampling", False))
+        self.ppa_stage0_action_arm = str(
+            getattr(args, "ppa_stage0_action_arm", "disabled")
+        )
         self.pano_latent_adapter = self._load_adapter(args)
         if self.pano_latent_adapter is None and getattr(self.model, "pano_latent_adapter", None) is not None:
             self.pano_latent_adapter = self.model.pano_latent_adapter
@@ -599,6 +654,46 @@ class HeatmapVLNRuntime:
         LOGGER.info(
             "require_deterministic_sampling=%s",
             self.require_deterministic_sampling,
+        )
+        self._preflight_ppa_stage0_action_arm()
+
+    def _preflight_ppa_stage0_action_arm(self) -> None:
+        arm = self.ppa_stage0_action_arm
+        if arm == "disabled":
+            return
+        if arm not in {"baseline", "treatment"}:
+            raise ValueError(f"unsupported PPA Stage-0 action arm: {arm!r}")
+        if not self.require_deterministic_sampling:
+            raise RuntimeError(
+                "PPA Stage-0 A/B requires --require_deterministic_sampling"
+            )
+        chain = getattr(self.model, "past_plan_action", None)
+        if chain is None:
+            raise RuntimeError(
+                "PPA Stage-0 A/B requires model.past_plan_action.enabled=true"
+            )
+        if self.pano_latent_adapter is not None:
+            raise RuntimeError("PPA Stage-0 forbids the panoramic latent adapter")
+        heatmap_control = (
+            self.train_cfg.get("model", {})
+            .get("action_head", {})
+            .get("nextdit", {})
+            .get("heatmap_control", {})
+        )
+        if bool((heatmap_control or {}).get("enabled", False)):
+            raise RuntimeError("PPA Stage-0 forbids legacy heatmap action control")
+        bridge = chain.bridge
+        output = bridge.cross_attention.out_proj
+        if not bool(torch.equal(output.weight, torch.zeros_like(output.weight))):
+            raise RuntimeError("PPA Stage-0 requires exact-zero bridge out_proj.weight")
+        if output.bias is not None and not bool(
+            torch.equal(output.bias, torch.zeros_like(output.bias))
+        ):
+            raise RuntimeError("PPA Stage-0 requires exact-zero bridge out_proj.bias")
+        chain.eval()
+        LOGGER.info(
+            "PPA Stage-0 action arm=%s; exact-zero bridge verified",
+            arm,
         )
 
     def _load_runtime_config(self, args: argparse.Namespace) -> dict:
@@ -746,6 +841,9 @@ class HeatmapVLNRuntime:
         return adapter
 
     def plan_panoramic(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
+        phase = str(payload.get("phase", "joint")).lower()
+        if phase not in {"joint", "system2", "front_system1"}:
+            raise ValueError(f"Unsupported panoramic RPC phase={phase!r}")
         require_deterministic = self.require_deterministic_sampling or bool(
             payload.get("require_deterministic_sampling", False)
         )
@@ -776,11 +874,22 @@ class HeatmapVLNRuntime:
                     for view in ("front", "right", "back", "left")
                 }
             )
-        lookdown_img = _pil_from_blob(blob_map["lookdown"], traj_image_size)
+        lookdown_blob_img = _pil_from_blob(blob_map["lookdown"])
+        lookdown_img = (
+            lookdown_blob_img
+            if lookdown_blob_img.size == traj_image_size
+            else lookdown_blob_img.resize(traj_image_size)
+        )
         instruction = str(payload.get("instruction", ""))
         trajectory_cfg = self.train_cfg.get("data", {}).get("trajectory", {})
         internnav_protocol = trajectory_cfg.get("system2_sft_protocol", "direct").lower() == "internnav"
         structured_pano_output = bool(trajectory_cfg.get("structured_pano_output", True))
+        native_internnav_two_turn = internnav_protocol and not structured_pano_output
+        lookdown_vlm_img = (
+            lookdown_blob_img
+            if lookdown_blob_img.size == vlm_image_size
+            else lookdown_blob_img.resize(vlm_image_size)
+        )
         system1_coord_order = str(payload.get("system1_coord_order", "generated"))
         if system1_coord_order == "auto":
             system1_coord_order = "generated"
@@ -800,19 +909,41 @@ class HeatmapVLNRuntime:
         if oracle_system2 is not None:
             oracle_system2_text = str(oracle_system2.get("text") or "").strip()
 
-        messages = construct_input(
-            current_views=current_views,
-            history_panoramas=history_panoramas,
-            instruction=instruction,
-            pixel_goal=[0, 0],
-            internnav_protocol=internnav_protocol,
-            structured_pano_output=structured_pano_output,
-        )
-        messages = [m for m in messages if m["role"] != "assistant"]
+        requested_pixel = None
+        front_condition_text = None
+        if phase == "front_system1":
+            requested_pixel = payload.get("pixel_goal")
+            if not isinstance(requested_pixel, (list, tuple)) or len(requested_pixel) < 2:
+                raise ValueError("front_system1 requires pixel_goal=[u,v]")
+            requested_pixel = [int(requested_pixel[0]), int(requested_pixel[1])]
+            front_condition_text = structured_condition_text("front", requested_pixel)
+
+        if native_internnav_two_turn and phase != "front_system1":
+            messages = construct_input_stage2(
+                history_frames=[history["front"] for history in history_panoramas],
+                current_frame=current_views["front"],
+                lookdown_frame=lookdown_vlm_img,
+                instruction=instruction,
+                pixel_goal=None,
+                assistant_text=None,
+                conjunction="you can see ",
+            )
+        else:
+            messages = construct_input(
+                current_views=current_views,
+                history_panoramas=history_panoramas,
+                instruction=instruction,
+                pixel_goal=requested_pixel if requested_pixel is not None else [0, 0],
+                assistant_text=front_condition_text,
+                internnav_protocol=internnav_protocol,
+                structured_pano_output=structured_pano_output,
+            )
+        if phase != "front_system1":
+            messages = [m for m in messages if m["role"] != "assistant"]
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
-            add_generation_prompt=True,
+            add_generation_prompt=phase != "front_system1",
             return_dict=True,
             return_tensors="pt",
         )
@@ -820,7 +951,15 @@ class HeatmapVLNRuntime:
         _normalize_multimodal_inputs(inputs)
 
         prompt_len = inputs["input_ids"].shape[1]
-        if oracle_system2_text:
+        native_first_output = ""
+        native_lookdown_turns = 0
+        if phase == "front_system1":
+            # Use the exact teacher-forced assistant turn produced by the
+            # Stage1-S2 collator, including the chat-template terminator.
+            # This keeps System1 latent conditioning in-distribution.
+            llm_output = front_condition_text
+            output_ids = inputs["input_ids"]
+        elif oracle_system2_text:
             oracle_ids = self.processor.tokenizer.encode(
                 oracle_system2_text,
                 add_special_tokens=False,
@@ -847,39 +986,111 @@ class HeatmapVLNRuntime:
                 output_ids[0][prompt_len:],
                 skip_special_tokens=True,
             )
+            native_first_output = llm_output
+            if native_internnav_two_turn and _internnav_requests_lookdown(llm_output):
+                messages = _append_internnav_lookdown_turn(
+                    messages,
+                    first_output=llm_output,
+                    lookdown_frame=lookdown_vlm_img,
+                )
+                inputs = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                _normalize_multimodal_inputs(inputs)
+                prompt_len = inputs["input_ids"].shape[1]
+                with torch.no_grad():
+                    output_ids = self.model.qwen2_5_vl.model.generate(
+                        **inputs,
+                        max_new_tokens=128,
+                        do_sample=False,
+                        use_cache=True,
+                        return_dict_in_generate=True,
+                    ).sequences
+                llm_output = self.processor.tokenizer.decode(
+                    output_ids[0][prompt_len:],
+                    skip_special_tokens=True,
+                )
+                native_lookdown_turns = 1
         response: dict[str, Any] = {
             "ok": True,
             "proto_v": PROTO_VERSION,
             "llm_output": llm_output,
-            "system2_source": "oracle" if oracle_system2_text else "model",
+            "system2_source": (
+                "conditioned_front"
+                if phase == "front_system1"
+                else ("oracle" if oracle_system2_text else "model")
+            ),
             "oracle_system2": oracle_system2,
             "actions": [],
             "terminal": False,
             "kind": "unknown",
+            "phase": phase,
         }
+        if native_internnav_two_turn and phase != "front_system1":
+            response.update(
+                {
+                    "native_first_output": native_first_output,
+                    "native_lookdown_turns": native_lookdown_turns,
+                    "native_front_only": True,
+                }
+            )
+        if self.ppa_stage0_action_arm != "disabled":
+            response.update(
+                {
+                    "ppa_stage0_action_arm": self.ppa_stage0_action_arm,
+                    "ppa_stage0_bridge_memory_source": (
+                        "native_bypass"
+                        if self.ppa_stage0_action_arm == "baseline"
+                        else "finite_zero_probe"
+                    ),
+                }
+            )
         if sampling_metadata is not None:
             response[HEATMAPVLN_RPC_SAMPLING_FIELD] = sampling_metadata
-        if vlm_output_requests_stop(llm_output):
+        if phase != "front_system1" and vlm_output_requests_stop(llm_output):
             response.update({"kind": "stop", "terminal": True, "actions": [ActionCode.STOP]})
             return response
 
-        turn_dir = vlm_output_requests_turn(llm_output)
+        turn_dir = vlm_output_requests_turn(llm_output) if phase != "front_system1" else None
         if turn_dir is not None:
             action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
             response.update({"kind": "turn", "actions": [int(action)], "turn_direction": turn_dir})
             return response
 
-        pixel_goal = _parse_pixel_goal(
-            llm_output,
-            vlm_image_size,
-            # Main eval compatibility: salvage pure legacy "u v" coordinates
-            # even under the structured prompt. Malformed structured `view:`
-            # lines remain invalid in parse_structured_pano_output.
-            allow_legacy_coord=True,
-        )
-        pano_goal_view = _parse_pano_view_id(llm_output) or "front"
+        if native_internnav_two_turn:
+            pixel_goal = _parse_internnav_pixel_goal(llm_output)
+            pano_goal_view = "front"
+        else:
+            pixel_goal = _parse_pixel_goal(
+                llm_output,
+                vlm_image_size,
+                # Main eval compatibility: salvage pure legacy "u v" coordinates
+                # even under the structured prompt. Malformed structured `view:`
+                # lines remain invalid in parse_structured_pano_output.
+                allow_legacy_coord=True,
+            )
+            pano_goal_view = _parse_pano_view_id(llm_output) or "front"
+        if phase == "front_system1":
+            # The client has physically rotated the selected pano view into
+            # the agent's front camera. Never apply a second side/back heading.
+            pano_goal_view = "front"
+            trajectory_heading_alignment = "none"
         response["pixel_goal"] = pixel_goal
         response["pano_goal_view"] = pano_goal_view
+
+        if phase == "system2":
+            if pixel_goal is None:
+                response.update(
+                    {"kind": "fallback_stop", "terminal": True, "actions": [ActionCode.STOP]}
+                )
+            else:
+                response.update({"kind": "pano_goal"})
+            return response
 
         if self.has_nextdit and pixel_goal is not None:
             target_heading_deg = None
@@ -896,16 +1107,23 @@ class HeatmapVLNRuntime:
                 device=self.device,
                 dtype=self.model.config.dtype,
             )
-            condition_output_ids = _condition_output_ids_for_pixel_goal(
-                output_ids=output_ids,
-                prompt_len=prompt_len,
-                tokenizer=self.processor.tokenizer,
-                pixel_goal=pixel_goal,
-                llm_output=llm_output,
-                coord_order=system1_coord_order,
-                view_id=pano_goal_view,
-                structured_output=structured_pano_output,
-            )
+            if phase == "front_system1":
+                condition_output_ids = output_ids
+            else:
+                condition_output_ids = _condition_output_ids_for_pixel_goal(
+                    output_ids=output_ids,
+                    prompt_len=prompt_len,
+                    tokenizer=self.processor.tokenizer,
+                    pixel_goal=pixel_goal,
+                    llm_output=llm_output,
+                    coord_order=(
+                        "internnav_yx"
+                        if native_internnav_two_turn
+                        else system1_coord_order
+                    ),
+                    view_id=pano_goal_view,
+                    structured_output=structured_pano_output,
+                )
             with torch.no_grad():
                 traj_hs = self.model.qwen2_5_vl.generate_latents(
                     output_ids=condition_output_ids,
@@ -926,25 +1144,95 @@ class HeatmapVLNRuntime:
                         if self.model.nextdit_action_head is not None
                         else None,
                     )
-                trajectory = _trajectory_from_condition(
-                    self.model.nextdit_action_head,
-                    traj_hs,
-                    traj_images=traj_images,
-                    generator=trajectory_generator,
+                if self.ppa_stage0_action_arm == "disabled":
+                    trajectory = _trajectory_from_condition(
+                        self.model.nextdit_action_head,
+                        traj_hs,
+                        traj_images=traj_images,
+                        generator=trajectory_generator,
+                    )
+                else:
+                    # Baseline deliberately uses the original unprojected API.
+                    # Treatment traverses cond_projector -> exact-zero bridge ->
+                    # projected API.  The explicit per-call generator makes the
+                    # diffusion noise identical across independently launched
+                    # closed-loop arms.
+                    if self.ppa_stage0_action_arm == "baseline":
+                        trajectory = self.model.nextdit_action_head.get_trajectory(
+                            traj_hs,
+                            traj_images=traj_images,
+                            generator=trajectory_generator,
+                        )
+                    else:
+                        cond_projector = self.model.nextdit_action_head.cond_projector
+                        projector_dtype = next(cond_projector.parameters()).dtype
+                        plan_z0 = cond_projector(traj_hs.to(dtype=projector_dtype))
+                        bridge = self.model.past_plan_action.bridge
+                        memory = torch.zeros(
+                            (plan_z0.shape[0], 1, int(bridge.memory_dim)),
+                            device=plan_z0.device,
+                            dtype=torch.float32,
+                        )
+                        memory_mask = torch.ones(
+                            (plan_z0.shape[0], 1),
+                            device=plan_z0.device,
+                            dtype=torch.bool,
+                        )
+                        plan_z = bridge(plan_z0, memory, memory_mask)
+                        if not torch.equal(plan_z, plan_z0):
+                            raise RuntimeError(
+                                "PPA Stage-0 treatment bridge changed Plan tokens"
+                            )
+                        trajectory = self.model.nextdit_action_head.get_trajectory_from_projected(
+                            plan_z,
+                            traj_images=traj_images,
+                            generator=trajectory_generator,
+                        )
+            treatment_spec = None
+            if self.ppa_stage0_action_arm == "disabled":
+                local_actions = _finalize_local_actions(
+                    traj_to_actions(
+                        trajectory,
+                        num_sample_trajs=self.num_sample_trajs,
+                        action_scale=self.action_scale,
+                        trajectory_selection=trajectory_selection,
+                        trajectory_x_sign=trajectory_x_sign,
+                        target_heading_deg=target_heading_deg,
+                    )
                 )
-            local_actions = _finalize_local_actions(
-                traj_to_actions(
-                    trajectory,
-                    num_sample_trajs=self.num_sample_trajs,
-                    action_scale=self.action_scale,
+                if local_actions and local_actions[0] == ActionCode.STOP:
+                    local_actions = [ActionCode.LEFT]
+                    response["anti_deadlock"] = True
+            else:
+                postprocess = TrajectoryPostprocessConfig(
+                    num_sample_trajs=int(self.num_sample_trajs),
+                    action_scale=float(self.action_scale),
                     trajectory_selection=trajectory_selection,
                     trajectory_x_sign=trajectory_x_sign,
                     target_heading_deg=target_heading_deg,
                 )
-            )
-            if local_actions and local_actions[0] == ActionCode.STOP:
-                local_actions = [ActionCode.LEFT]
-                response["anti_deadlock"] = True
+                treatment_spec = build_treatment_spec(trajectory, postprocess)
+                local_actions = list(treatment_spec.response_actions)
+                legacy_local_actions = _finalize_local_actions(
+                    traj_to_actions(
+                        trajectory,
+                        num_sample_trajs=self.num_sample_trajs,
+                        action_scale=self.action_scale,
+                        trajectory_selection=trajectory_selection,
+                        trajectory_x_sign=trajectory_x_sign,
+                        target_heading_deg=target_heading_deg,
+                    )
+                )
+                if legacy_local_actions and legacy_local_actions[0] == ActionCode.STOP:
+                    legacy_local_actions = [ActionCode.LEFT]
+                if local_actions != [int(action) for action in legacy_local_actions]:
+                    raise RuntimeError(
+                        "PPA Stage-0 TreatmentSpec diverged from the native "
+                        f"action postprocess: spec={local_actions} "
+                        f"native={[int(action) for action in legacy_local_actions]}"
+                    )
+                if treatment_spec.trigger_anti_deadlock:
+                    response["anti_deadlock"] = True
             response.update(
                 {
                     "kind": "trajectory",
@@ -960,6 +1248,8 @@ class HeatmapVLNRuntime:
                     "trajectory_target_heading_deg": target_heading_deg,
                 }
             )
+            if treatment_spec is not None:
+                response["treatment_spec"] = treatment_spec.to_dict()
             return response
 
         response.update({"kind": "fallback_stop", "terminal": True, "actions": [ActionCode.STOP]})
@@ -1004,7 +1294,10 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             version=PROTO_VERSION,
             model_version=self.model_version,
             max_batch_size=1,
-            supported_formats=["json+jpeg"],
+            supported_formats=[
+                "json+jpeg",
+                HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1,
+            ],
         )
 
 
@@ -1025,6 +1318,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reject legacy/partial RPC requests that do not provide a valid "
             "SHA256-derived deterministic NextDiT sampling key."
+        ),
+    )
+    parser.add_argument(
+        "--ppa_stage0_action_arm",
+        choices=("disabled", "baseline", "treatment"),
+        default="disabled",
+        help=(
+            "Stage-0 only: compare the original System1 action route with the "
+            "exact-zero PPA bridge route. This does not enable trained PPA "
+            "deployment or online AMB3R memory."
         ),
     )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

@@ -63,6 +63,50 @@ def test_collect_one_pano_structured_coord_adds_teacher_metadata(monkeypatch):
     assert rec["teacher"]["structured_assistant_text"] == "view: right\npixel: 211 128"
 
 
+def test_native_coordinate_conditioning_writes_yx_text(monkeypatch):
+    monkeypatch.setattr(
+        collector,
+        "_build_second_turn",
+        lambda first_messages, first_images, *_args: (first_messages, first_images),
+    )
+
+    class Inputs:
+        def __init__(self):
+            self.input_ids = torch.tensor([[1, 2, 3]])
+
+        def to(self, _device):
+            return self
+
+    class Processor:
+        def apply_chat_template(self, messages, **_kwargs):
+            return " | ".join(
+                item["text"]
+                for message in messages
+                for item in message.get("content", [])
+                if item.get("type") == "text"
+            )
+
+        def __call__(self, **_kwargs):
+            return Inputs()
+
+    output, _ids, _inputs, _prompt_len, coord_uv, goal_yx = (
+        collector._condition_on_dataset_coord(
+            Processor(),
+            [{"role": "user", "content": [{"type": "text", "text": "go"}]}],
+            [],
+            {"aligned_native_pixel_goal_uv": [151, 202]},
+            SimpleNamespace(),
+            object(),
+            torch.device("cpu"),
+            pixel_goal_key="aligned_native_pixel_goal_uv",
+        )
+    )
+
+    assert output == "202 151"
+    assert coord_uv == [151, 202]
+    assert goal_yx == [202, 151]
+
+
 def test_incremental_resume_does_not_skip_shifted_dataset_index(tmp_path):
     old_clip = tmp_path / "old_scene" / "clip_000001"
     new_clip = tmp_path / "new_scene" / "clip_000001"

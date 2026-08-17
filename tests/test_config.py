@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from src.config_schema import TrainConfig, prepare_config_for_use, validate_config
+from src.config_schema import TrainConfig, normalize_config, prepare_config_for_use, validate_config
 
 
 class TestLoadConfig:
@@ -46,6 +46,42 @@ class TestLoadConfig:
 
 
 class TestPydanticValidation:
+    @pytest.mark.parametrize("section_name", ["sliding_window", "trajectory"])
+    def test_legacy_history_key_normalizes_to_explicit_key(
+        self, minimal_cfg, section_name
+    ):
+        section = minimal_cfg["data"][section_name]
+        section["load_history_frames"] = False
+
+        with pytest.warns(FutureWarning, match="load_single_view_history_frames"):
+            normalized = normalize_config(minimal_cfg)
+
+        normalized_section = normalized["data"][section_name]
+        assert normalized_section["load_single_view_history_frames"] is False
+        assert "load_history_frames" not in normalized_section
+
+    @pytest.mark.parametrize("section_name", ["sliding_window", "trajectory"])
+    def test_conflicting_history_keys_fail_closed(self, minimal_cfg, section_name):
+        section = minimal_cfg["data"][section_name]
+        section["load_single_view_history_frames"] = False
+        section["load_history_frames"] = True
+
+        with pytest.raises(ValueError, match="Conflicting history settings"):
+            validate_config(minimal_cfg)
+
+    def test_prepare_config_migrates_history_key_without_validation(self, minimal_cfg):
+        section = minimal_cfg["data"]["sliding_window"]
+        section["load_history_frames"] = False
+
+        with pytest.warns(FutureWarning, match="data.sliding_window"):
+            prepared = prepare_config_for_use(minimal_cfg)
+
+        assert prepared["data"]["sliding_window"] == {
+            "min_history": 5,
+            "num_history_sample": 8,
+            "load_single_view_history_frames": False,
+        }
+
     def test_trajectory_target_convention_rejects_unknown_value(self, minimal_cfg):
         minimal_cfg["data"]["dataset_type"] = "trajectory"
         minimal_cfg["data"]["trajectory"] = {

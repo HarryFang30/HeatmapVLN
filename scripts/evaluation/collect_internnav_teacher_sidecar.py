@@ -45,6 +45,7 @@ except Exception:  # pragma: no cover - tqdm is optional in cluster envs.
 from scripts.training.utils import load_config
 from src.data.factory import build_trajectory_dataset
 from src.data.pano_teacher_alignment import (
+    aligned_native_sidecar_contract,
     condition_on_pano_coord,
     has_structured_pano_pixel_goal,
     sidecar_alignment_metadata,
@@ -600,6 +601,14 @@ def _save_tensor_sidecar(
         stable_key = _stable_sample_key_from_record(sample_metadata)
         if stable_key:
             payload["stable_sample_key"] = stable_key
+        for key in (
+            "sidecar_schema",
+            "alignment_version",
+            "alignment_fingerprint",
+            "alignment_contract",
+        ):
+            if key in sample_metadata:
+                payload[key] = sample_metadata[key]
     saved: dict[str, Any] = {}
     if traj_latents is not None and args.save_traj_latents:
         payload["traj_latents"] = _cast_tensor_for_save(traj_latents, args.tensor_save_dtype)
@@ -689,14 +698,20 @@ def _condition_on_dataset_coord(
     args: argparse.Namespace,
     rng: random.Random,
     device: torch.device,
+    *,
+    pixel_goal_key: str = "pixel_goal",
 ) -> tuple[str, torch.Tensor, Any, int, list[int], list[int]]:
-    """Build InternNav two-turn context with dataset gold pixel_goal as answer."""
-    pixel_goal = sample.get("pixel_goal")
+    """Build native two-turn context with an explicit image-space ``[u,v]`` goal."""
+    pixel_goal = sample.get(pixel_goal_key)
     if pixel_goal is None:
-        raise RuntimeError("--coord-source dataset requires sample['pixel_goal']")
+        raise RuntimeError(
+            f"native coordinate conditioning requires sample[{pixel_goal_key!r}]"
+        )
     coord_uv = [int(pixel_goal[0]), int(pixel_goal[1])]
     goal_yx = [coord_uv[1], coord_uv[0]]
-    coord_text = f"{coord_uv[0]} {coord_uv[1]}"
+    # InternNav emits native coordinates as ``y x`` and its evaluator swaps
+    # them back to image ``[u,v]`` before System1 execution.
+    coord_text = f"{goal_yx[0]} {goal_yx[1]}"
 
     messages, images = _build_second_turn(
         first_messages,
@@ -910,6 +925,17 @@ def _sample_passes_mode(sample: dict[str, Any], args: argparse.Namespace) -> boo
             return args.include_stop or _sample_kind(sample) != "stop"
         raise ValueError(f"Unknown sample mode: {args.sample_mode}")
 
+    if args.coord_source == "aligned_native":
+        if args.sample_mode != "pixel":
+            raise ValueError("--coord-source aligned_native only supports --sample-mode pixel")
+        return (
+            has_structured_pano_pixel_goal(sample)
+            and str(sample.get("pano_view_id") or "").lower() == "front"
+            and sample.get("aligned_native_pixel_goal_uv") is not None
+            and int(sample.get("pano_goal_frame_idx") or -1)
+            == int(sample.get("aligned_native_goal_frame_idx") or -2)
+        )
+
     kind = _sample_kind(sample)
     if args.sample_mode == "pixel":
         if args.require_pixel_goal and sample.get("pixel_goal") is None:
@@ -941,6 +967,13 @@ def _collect_one(
 ) -> dict[str, Any]:
     _set_sample_seed(args.seed + int(idx) * 1009 + args.shard_index)
     sample_meta = _sample_metadata(dataset, idx)
+    if args.coord_source == "aligned_native":
+        alignment_meta = aligned_native_sidecar_contract(
+            sample,
+            stable_sample_key=str(sample_meta.get("stable_sample_key") or ""),
+            current_t=int(sample_meta.get("current_t", -1)),
+        )
+        sample_meta.update(alignment_meta)
     first_messages, first_images = _build_first_turn(sample, args, rng)
     first_output: str | None = None
     second_output = None
@@ -1005,6 +1038,33 @@ def _collect_one(
             device,
         )
         mode = "dataset_coord"
+    elif args.coord_source == "aligned_native" and sample.get("aligned_native_pixel_goal_uv") is not None:
+        (
+            final_output,
+            final_output_ids,
+            final_inputs,
+            prompt_len,
+            coord_uv,
+            goal_yx,
+        ) = _condition_on_dataset_coord(
+            processor,
+            first_messages,
+            first_images,
+            sample,
+            args,
+            rng,
+            device,
+            pixel_goal_key="aligned_native_pixel_goal_uv",
+        )
+        mode = "aligned_native_coord"
+        pano_teacher_metadata.update(
+            {
+                "pano_view_id": str(sample.get("pano_view_id") or "").lower(),
+                "source_coord_order": "uv",
+                "teacher_text_coord_order": "yx",
+                "goal_frame_idx": int(sample["pano_goal_frame_idx"]),
+            }
+        )
     elif coord_uv is None and args.two_turn_lookdown and 5 in first_actions:
         second_messages, second_images = _build_second_turn(
             first_messages, first_images, first_output, sample, args, rng,
@@ -1037,6 +1097,7 @@ def _collect_one(
             raise RuntimeError(f"Missing conditioned inputs for mode={mode}")
         teacher["coord_uv"] = coord_uv
         teacher["internnav_pixel_goal_yx"] = goal_yx
+        teacher["conditioned_coord_text"] = final_output
         try:
             teacher["system1"] = _run_system1(
                 model,
@@ -1077,7 +1138,7 @@ def _collect_one(
             "trajectory_valid": _jsonable(trajectory_valid),
             **(
                 sidecar_alignment_metadata(sample)
-                if args.coord_source == "pano"
+                if args.coord_source in {"pano", "aligned_native"}
                 else {}
             ),
         },
@@ -1142,12 +1203,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--coord-source",
-        choices=["pano", "dataset", "teacher"],
+        choices=["pano", "dataset", "aligned_native", "teacher"],
         default="pano",
         help=(
             "pano (recommended): single-turn structured conditioning from dataset "
             "pano_view_id + pano_pixel_goal, aligned with Stage1-S2 student targets. "
-            "dataset: legacy two-turn front_down path with dataset pixel_goal. "
+            "aligned_native: native front/lookdown teacher using the exact pano-selected "
+            "front waypoint and native y-x coordinate text (recommended for adapter training). "
+            "dataset: legacy two-turn front_down path with an independently selected pixel_goal. "
             "teacher: preserve InternNav native outputs for audit only."
         ),
     )
@@ -1277,7 +1340,7 @@ def main() -> None:
     traj_cfg["enable_trajectory_augmentation"] = False
     if args.pixel_goal_direction is not None:
         traj_cfg["pixel_goal_direction"] = str(args.pixel_goal_direction)
-    elif args.coord_source == "dataset":
+    elif args.coord_source in {"dataset", "aligned_native"}:
         traj_cfg["pixel_goal_direction"] = "front_down"
     if args.sample_stride is not None:
         traj_cfg["sample_stride"] = int(args.sample_stride)
@@ -1317,8 +1380,9 @@ def main() -> None:
         enable_trajectory_augmentation=False,
         load_history_heatmap=False,
         panoramic_vlm_input=args.coord_source == "pano",
-        compute_pixel_goal=args.coord_source in {"pano", "dataset"},
-        compute_pano_view_pixel_goal=args.coord_source == "pano",
+        compute_pixel_goal=args.coord_source in {"pano", "dataset", "aligned_native"},
+        compute_pano_view_pixel_goal=args.coord_source in {"pano", "aligned_native"},
+        compute_aligned_native_pixel_goal=args.coord_source == "aligned_native",
         pano_max_side_dist_m=float(getattr(args, "pano_max_side_dist_m", 6.0)),
         load_lookdown_for_system2=args.coord_source != "pano",
         pixel_goal_direction=traj_cfg.get("pixel_goal_direction", "front"),

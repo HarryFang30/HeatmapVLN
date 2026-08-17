@@ -1198,7 +1198,7 @@ def _build_dataset(args: argparse.Namespace, config: dict[str, Any], split: str)
         sample_stride=2,
         enable_augmentation=False,
         clip_level_sampling=False,
-        load_history_frames=True,
+        load_single_view_history_frames=True,
         max_clips=0,
         max_clip_id=int(args.max_clip_id),
     )

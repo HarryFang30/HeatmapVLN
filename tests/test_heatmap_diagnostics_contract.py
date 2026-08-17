@@ -276,3 +276,131 @@ def test_heatmap_evaluator_materializes_lazy_modules_before_loading(tmp_path):
     assert torch.equal(model.qwen2_5_vl.model.lora_A, torch.full((2, 2), 3.0))
     assert torch.equal(model.heatmap_vln.head.weight, torch.full((1, 2), 4.0))
     assert torch.equal(model.heatmap_vln.head.bias, torch.full((1,), 5.0))
+
+
+def _legacy_heatmap_pipeline():
+    class LazyQwen(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._model_loaded = False
+
+        def _load_model(self):
+            if not self._model_loaded:
+                self.model = torch.nn.Module()
+                self.model.register_parameter(
+                    "lora_A",
+                    torch.nn.Parameter(torch.zeros(2, 2)),
+                )
+                self._model_loaded = True
+
+    class DummyHeatmap(torch.nn.Module):
+        def __init__(self, qwen):
+            super().__init__()
+            self.qwen = qwen
+            self.head = torch.nn.Linear(2, 1)
+
+    class LazyPipeline(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qwen2_5_vl = LazyQwen()
+            self.heatmap_vln = None
+
+        def _ensure_heatmap_vln(self):
+            if self.heatmap_vln is None:
+                self.heatmap_vln = DummyHeatmap(self.qwen2_5_vl.model)
+
+    return LazyPipeline()
+
+
+def test_heatmap_evaluator_strictly_composes_legacy_head_with_recorded_base(
+    tmp_path,
+):
+    base_path = tmp_path / "base.pth"
+    torch.save(
+        {
+            "trainable_state_dict": {
+                "qwen2_5_vl.model.lora_A": torch.full((2, 2), 3.0),
+                # A base head must never overwrite the newly trained head.
+                "heatmap_vln.head.weight": torch.full((1, 2), -4.0),
+                "heatmap_vln.head.bias": torch.full((1,), -5.0),
+            }
+        },
+        base_path,
+    )
+    checkpoint_path = tmp_path / "legacy_heatmap.pth"
+    torch.save(
+        {
+            "stage_idx": 0,
+            "stage_name": "heatmap",
+            "config": {
+                "training": {
+                    "stages": [
+                        {
+                            "name": "heatmap",
+                            "requires_base_checkpoint": True,
+                        }
+                    ]
+                },
+                "runtime": {"base_checkpoint": str(base_path)},
+            },
+            "trainable_state_dict": {
+                "heatmap_vln.head.weight": torch.full((1, 2), 4.0),
+                "heatmap_vln.head.bias": torch.full((1,), 5.0),
+            },
+        },
+        checkpoint_path,
+    )
+
+    model = _legacy_heatmap_pipeline()
+    result = materialize_and_load_heatmap_checkpoint(
+        model,
+        str(checkpoint_path),
+    )
+
+    assert result["matched_lora_tensors"] == 1
+    assert result["matched_heatmap_head_tensors"] == 2
+    assert result["composed_base_lora_tensors"] == 1
+    assert torch.equal(
+        model.qwen2_5_vl.model.lora_A,
+        torch.full((2, 2), 3.0),
+    )
+    assert torch.equal(
+        model.heatmap_vln.head.weight,
+        torch.full((1, 2), 4.0),
+    )
+    assert torch.equal(
+        model.heatmap_vln.head.bias,
+        torch.full((1,), 5.0),
+    )
+
+
+def test_heatmap_evaluator_refuses_ambiguous_legacy_base_path(tmp_path):
+    checkpoint_path = tmp_path / "legacy_heatmap.pth"
+    torch.save(
+        {
+            "stage_idx": 0,
+            "stage_name": "heatmap",
+            "config": {
+                "training": {
+                    "stages": [
+                        {
+                            "name": "heatmap",
+                            "requires_base_checkpoint": True,
+                        }
+                    ]
+                },
+                "runtime": {"base_checkpoint": "relative/base.pth"},
+            },
+            "trainable_state_dict": {
+                "heatmap_vln.head.weight": torch.full((1, 2), 4.0),
+                "heatmap_vln.head.bias": torch.full((1,), 5.0),
+            },
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(RuntimeError, match="non-absolute base path"):
+        materialize_and_load_heatmap_checkpoint(
+            _legacy_heatmap_pipeline(),
+            str(checkpoint_path),
+        )
