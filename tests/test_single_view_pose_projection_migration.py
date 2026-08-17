@@ -131,4 +131,3 @@ def test_rejects_unapproved_projection_shapes(
             torch.zeros(weight_shape),
             torch.zeros(bias_shape),
         )
-

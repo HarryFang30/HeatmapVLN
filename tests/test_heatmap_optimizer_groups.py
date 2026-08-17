@@ -82,4 +82,3 @@ def test_heatmap_optimizer_group_learning_rates_fall_back_to_heatmap_lr():
         for group in optimizer.param_groups
         if group["name"].startswith("heatmap_")
     } == {7e-5}
-

@@ -17,4 +17,3 @@ def test_full_head_warmstart_contract_is_accepted_by_config_schema():
     assert contract.policy == "full_head_v1"
     assert contract.expected_vit_dpt_tensors == 12
     assert contract.expected_fine_tensors == 6
-

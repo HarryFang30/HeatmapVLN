@@ -20,4 +20,3 @@ cd "$REPO"
   --gap "${FUTURE_HEATMAP_GAP:-4}"
 
 echo "[future-heatmap] visualization ready: $OUTPUT_ROOT"
-
