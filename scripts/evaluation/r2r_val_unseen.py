@@ -32,7 +32,7 @@ from typing import Any
 
 faulthandler.enable()
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # ═══════════════════════════════════════════════════════════════════════
 # Section 1: Runtime patches (must be before any heavy imports)
@@ -68,16 +68,18 @@ import types as _types
 def _noop(*a, **kw):
     raise RuntimeError("flash_attn stub called – should use SDPA attention instead")
 
+
 def _make_stub(name, attrs=None):
     m = _types.ModuleType(name)
     m.__spec__ = _importlib.machinery.ModuleSpec(name, None)
-    m.__version__ = '2.7.4'
+    m.__version__ = "2.7.4"
     m.__heatmapvln_stub__ = True
     if attrs:
         for k, v in attrs.items():
             setattr(m, k, v)
     sys.modules[name] = m
     return m
+
 
 class _FlashAttnKernelStub:
     def fwd(self, *_args, **_kwargs):
@@ -92,28 +94,41 @@ class _FlashAttnKernelStub:
     def varlen_bwd(self, *_args, **_kwargs):
         return _noop(*_args, **_kwargs)
 
+
 _flash_kernel_stub = _FlashAttnKernelStub()
 
-_fa = _make_stub('flash_attn', {
-    'flash_attn_func': _noop,
-    'flash_attn_varlen_func': _noop,
-})
-_make_stub('flash_attn_2_cuda')
-_fa_iface = _make_stub('flash_attn.flash_attn_interface', {
-    'flash_attn_func': _noop,
-    'flash_attn_varlen_func': _noop,
-    'flash_attn_gpu': _flash_kernel_stub,
-    'flash_attn_cuda': _flash_kernel_stub,
-})
-_fa_bert = _make_stub('flash_attn.bert_padding', {
-    'index_first_axis': _noop,
-    'pad_input': _noop,
-    'unpad_input': _noop,
-})
-_fa_rotary = _make_stub('flash_attn.layers', {})
-_fa_rotary_mod = _make_stub('flash_attn.layers.rotary', {
-    'apply_rotary_emb': _noop,
-})
+_fa = _make_stub(
+    "flash_attn",
+    {
+        "flash_attn_func": _noop,
+        "flash_attn_varlen_func": _noop,
+    },
+)
+_make_stub("flash_attn_2_cuda")
+_fa_iface = _make_stub(
+    "flash_attn.flash_attn_interface",
+    {
+        "flash_attn_func": _noop,
+        "flash_attn_varlen_func": _noop,
+        "flash_attn_gpu": _flash_kernel_stub,
+        "flash_attn_cuda": _flash_kernel_stub,
+    },
+)
+_fa_bert = _make_stub(
+    "flash_attn.bert_padding",
+    {
+        "index_first_axis": _noop,
+        "pad_input": _noop,
+        "unpad_input": _noop,
+    },
+)
+_fa_rotary = _make_stub("flash_attn.layers", {})
+_fa_rotary_mod = _make_stub(
+    "flash_attn.layers.rotary",
+    {
+        "apply_rotary_emb": _noop,
+    },
+)
 _fa.flash_attn_interface = _fa_iface
 _fa.bert_padding = _fa_bert
 _fa.layers = _fa_rotary
@@ -121,11 +136,11 @@ _fa_rotary.rotary = _fa_rotary_mod
 
 import numpy as np
 
-if not hasattr(np, 'float'):
+if not hasattr(np, "float"):
     np.float = np.float64
-if not hasattr(np, 'int'):
+if not hasattr(np, "int"):
     np.int = np.int64
-if not hasattr(np, 'bool'):
+if not hasattr(np, "bool"):
     np.bool = np.bool_
 
 # Import torch before habitat_sim (habitat_sim pulls torch during its __init__).
@@ -136,12 +151,8 @@ LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/i
 LOCAL_VLNCE_DATA_ROOT = Path(
     os.environ.get("HEATMAPVLN_VLNCE_DATA_ROOT", str(LOCAL_FJL_ROOT / "habitat" / "VLN-CE" / "data"))
 )
-LOCAL_MP3D_ROOT = Path(
-    os.environ.get("HEATMAPVLN_MP3D_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d"))
-)
-LOCAL_R2R_DATASETS_ROOT = Path(
-    os.environ.get("HEATMAPVLN_R2R_DATASETS_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "datasets"))
-)
+LOCAL_MP3D_ROOT = Path(os.environ.get("HEATMAPVLN_MP3D_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "scene_datasets" / "mp3d")))
+LOCAL_R2R_DATASETS_ROOT = Path(os.environ.get("HEATMAPVLN_R2R_DATASETS_ROOT", str(LOCAL_VLNCE_DATA_ROOT / "datasets")))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
     os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
 )
@@ -233,11 +244,15 @@ if os.environ.get("HEATMAPVLN_PREINIT_EMPTY_GL", "0") == "1":
 import gym.spaces
 
 _OrigDiscrete = gym.spaces.Discrete
+
+
 class _PatchedDiscrete(_OrigDiscrete):
     def __init__(self, n, *args, **kwargs):
         if n == 0:
             n = 1
         super().__init__(n, *args, **kwargs)
+
+
 gym.spaces.Discrete = _PatchedDiscrete
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -269,6 +284,7 @@ from habitat.tasks.nav.nav import DistanceToGoal
 from PIL import Image
 
 if not hasattr(argparse, "BooleanOptionalAction"):
+
     class _BooleanOptionalAction(argparse.Action):
         def __init__(
             self,
@@ -309,7 +325,18 @@ if not hasattr(argparse, "BooleanOptionalAction"):
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from scripts.evaluation.navigation_metrics import aggregate_navigation_metrics
-from scripts.evaluation.rpc_protocol import HEATMAPVLN_RPC_PROTOCOL_VERSION
+from scripts.evaluation.rpc_protocol import (
+    HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1,
+    HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED,
+    HEATMAPVLN_RPC_PROTOCOL_VERSION,
+    HEATMAPVLN_RPC_SAMPLING_FIELD,
+    HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+    build_rpc_progress_sampling_contract,
+    build_rpc_sampling_metadata,
+    validate_rpc_progress_sampling_contract,
+    validate_rpc_sampling_metadata,
+)
+from src.utils.trajectory_direction import pano_recenter_turn
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
 _INPUT_CONSTRUCTOR_SPEC = importlib.util.spec_from_file_location(
@@ -346,7 +373,7 @@ except ModuleNotFoundError as exc:
 
     def _normalize_state_key(name: str) -> str:
         if name.startswith("module."):
-            name = name[len("module."):]
+            name = name[len("module.") :]
         name = name.replace(".module.", ".")
         prefix_aliases = {
             "qwen3_5.": "qwen2_5_vl.",
@@ -354,7 +381,7 @@ except ModuleNotFoundError as exc:
         }
         for old_prefix, new_prefix in prefix_aliases.items():
             if name.startswith(old_prefix):
-                return new_prefix + name[len(old_prefix):]
+                return new_prefix + name[len(old_prefix) :]
         return name
 
     def load_config(config_path: str, validate: bool = True) -> dict:
@@ -374,7 +401,12 @@ except ModuleNotFoundError as exc:
             return cfg
 
 
-def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: torch.device):
+def _load_pano_latent_adapter(
+    checkpoint_path: str,
+    hidden_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
     """Lazy loader for the pano→InternNav latent adapter.
 
     Imports are kept inside the function so vanilla Habitat eval runs without
@@ -399,6 +431,7 @@ def _load_pano_latent_adapter(checkpoint_path: str, hidden_dim: int, device: tor
         dim=hidden_dim,
         fallback_args=fallback,
         device=device,
+        dtype=dtype,
     )
     return adapter
 
@@ -440,11 +473,13 @@ def _maybe_apply_pano_latent_adapter(
         view_indices = view_ids_to_indices([goal_view], device=traj_hs.device)
         pixel_xy = torch.tensor(
             [[int(pixel_goal[0]), int(pixel_goal[1])]],
-            device=traj_hs.device, dtype=adapter_dtype,
+            device=traj_hs.device,
+            dtype=adapter_dtype,
         )
         image_hw = torch.tensor(
             [[height, width]],
-            device=traj_hs.device, dtype=adapter_dtype,
+            device=traj_hs.device,
+            dtype=adapter_dtype,
         )
         out = adapter(traj_hs.to(dtype=adapter_dtype), view_indices, pixel_xy, image_hw)
         return out.to(dtype=orig_dtype)
@@ -580,32 +615,32 @@ def _predict_force_teacher_coord(
         lookdown_pil = lookdown_pil.resize(vlm_image_size)
     history_front_pils = history_front_pils or []
     history_front_pils = [
-        (img if img.size == vlm_image_size else img.resize(vlm_image_size))
-        for img in history_front_pils
+        (img if img.size == vlm_image_size else img.resize(vlm_image_size)) for img in history_front_pils
     ]
 
     cleaned_instruction = _strip_instruction_final_period(instruction or "")
     prompt_text = PROMPT_TEMPLATE.replace("<instruction>.", cleaned_instruction)
     if history_front_pils:
         prompt_text += (
-            f" These are your historical observations: "
-            f"{(DEFAULT_IMAGE_TOKEN + chr(10)) * len(history_front_pils)}."
+            f" These are your historical observations: {(DEFAULT_IMAGE_TOKEN + chr(10)) * len(history_front_pils)}."
         )
     prompt_text += f" {INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
 
     first_images = history_front_pils + [current_front_pil]
-    first_messages = [{
-        "role": "user",
-        "content": _content_from_text_with_images(prompt_text, first_images),
-    }]
+    first_messages = [
+        {
+            "role": "user",
+            "content": _content_from_text_with_images(prompt_text, first_images),
+        }
+    ]
 
     def _run_once(messages, images):
         text = teacher_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        inputs = teacher_processor(
-            text=[text], images=images, return_tensors="pt"
-        ).to(teacher_device)
+        inputs = teacher_processor(text=[text], images=images, return_tensors="pt").to(teacher_device)
         with torch.inference_mode():
             out_ids = teacher_model.generate(
                 **inputs,
@@ -616,9 +651,7 @@ def _predict_force_teacher_coord(
                 return_dict_in_generate=True,
             ).sequences
         prompt_len = int(inputs.input_ids.shape[1])
-        return teacher_processor.tokenizer.decode(
-            out_ids[0][prompt_len:], skip_special_tokens=True
-        ).strip()
+        return teacher_processor.tokenizer.decode(out_ids[0][prompt_len:], skip_special_tokens=True).strip()
 
     turn1 = _run_once(first_messages, first_images)
     info: dict = {
@@ -636,14 +669,18 @@ def _predict_force_teacher_coord(
 
     second_text = f"{INTERNNAV_CONJUNCTIONS[0]}{DEFAULT_IMAGE_TOKEN}."
     second_messages = list(first_messages)
-    second_messages.append({
-        "role": "assistant",
-        "content": [{"type": "text", "text": turn1}],
-    })
-    second_messages.append({
-        "role": "user",
-        "content": _content_from_text_with_images(second_text, [lookdown_pil]),
-    })
+    second_messages.append(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": turn1}],
+        }
+    )
+    second_messages.append(
+        {
+            "role": "user",
+            "content": _content_from_text_with_images(second_text, [lookdown_pil]),
+        }
+    )
     second_images = first_images + [lookdown_pil]
 
     turn2 = _run_once(second_messages, second_images)
@@ -652,8 +689,14 @@ def _predict_force_teacher_coord(
     coord_uv, _ = _parse_coord(turn2)
     return coord_uv, info
 
+
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
+RPC_POLICY_HEATMAPVLN = "heatmapvln"
+RPC_POLICY_INTERNNAV_NATIVE = "internnav_native"
+NATIVE_INTERNNAV_RPC_METHOD = "plan_native_internnav"
+NATIVE_INTERNNAV_CAPABILITY = "internnav-native-joint-front-history-lookdown-v1"
+NATIVE_INTERNNAV_LOOKDOWN_SIZE = (640, 480)
 DEFAULT_SCENES_DIR = "data/scene_data/mp3d_ce"
 DEFAULT_DATA_PATH = "data/vln_ce/raw_data/r2r/{split}/{split}.json.gz"
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -780,6 +823,7 @@ def ensure_vln_measures_registered() -> None:
     """Register custom VLN measures required by Habitat-Lab 0.1.7 evaluation."""
 
     if registry.get_measure("OracleNavigationError") is None:
+
         @registry.register_measure
         class OracleNavigationError(Measure):
             cls_uuid: str = "oracle_navigation_error"
@@ -797,6 +841,7 @@ def ensure_vln_measures_registered() -> None:
                 self._metric = min(self._metric, distance_to_target)
 
     if registry.get_measure("OracleSuccess") is None:
+
         @registry.register_measure
         class OracleSuccess(Measure):
             cls_uuid: str = "oracle_success"
@@ -874,15 +919,10 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         resolved = next((p for p in data_candidates if p.exists()), None)
         if resolved is None:
             attempted = "\n  - ".join([requested_data_path, *map(str, data_candidates)])
-            raise FileNotFoundError(
-                "Could not find the VLN-CE dataset file. Tried:\n"
-                f"  - {attempted}"
-            )
+            raise FileNotFoundError(f"Could not find the VLN-CE dataset file. Tried:\n  - {attempted}")
         args.data_path = str(resolved.resolve())
     else:
-        raise FileNotFoundError(
-            f"Configured --data_path does not exist: {requested_data_path}"
-        )
+        raise FileNotFoundError(f"Configured --data_path does not exist: {requested_data_path}")
 
     first_scene_id = _first_dataset_scene_id(args.data_path)
 
@@ -932,6 +972,102 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         print(f"Verified first scene asset: {Path(args.scenes_dir) / first_scene_id}")
 
 
+_HARD_ALLOWED_FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+
+
+def _require_path_under_fjl(value: str, *, label: str, base: Path | None = None) -> Path:
+    raw = Path(value)
+    if not raw.is_absolute():
+        raw = (base or _PROJECT_ROOT) / raw
+    resolved = raw.resolve(strict=False)
+    allowed = _HARD_ALLOWED_FJL_ROOT.resolve(strict=True)
+    if resolved != allowed and allowed not in resolved.parents:
+        raise ValueError(f"{label} must stay under {allowed}, got {resolved}")
+    return resolved
+
+
+def _preflight_trajectory_dagger_args(args) -> None:
+    if not bool(getattr(args, "collect_trajectory_dagger", False)):
+        return
+    if str(args.dataset_split) != "train":
+        raise ValueError("Trajectory DAgger collection is train-only")
+    if not args.rpc_server:
+        raise ValueError("Trajectory DAgger collection requires --rpc_server")
+    if not bool(args.rpc_require_deterministic_sampling):
+        raise ValueError("Trajectory DAgger collection requires deterministic RPC sampling")
+    if bool(getattr(args, "oracle_system2", False)) or float(args.auto_stop_distance) > 0.0:
+        raise ValueError("DAgger learner rollout forbids oracle System2 and privileged auto-stop")
+    if str(getattr(args, "rpc_policy_mode", RPC_POLICY_HEATMAPVLN)) == RPC_POLICY_INTERNNAV_NATIVE:
+        if bool(args.pano_recenter_before_system1):
+            raise ValueError(
+                "Native InternNav DAgger must preserve the original joint "
+                "System2/System1 policy"
+            )
+        if any(
+            (
+                args.checkpoint,
+                args.base_checkpoint,
+                args.pano_latent_adapter_checkpoint,
+            )
+        ):
+            raise ValueError(
+                "Native InternNav DAgger forbids external Stage1/Stage3/adapter checkpoints"
+            )
+        if bool(args.force_teacher_coord):
+            raise ValueError("Native InternNav DAgger forbids a separate teacher override")
+        rpc_fingerprint = str(args.rpc_policy_fingerprint).strip()
+        if not rpc_fingerprint:
+            raise ValueError("--rpc_policy_fingerprint is required for native InternNav")
+        if rpc_fingerprint != str(args.trajectory_dagger_policy_fingerprint).strip():
+            raise ValueError(
+                "Native RPC and DAgger policy fingerprints must be identical"
+            )
+    if bool(args.save_trajectory_steps) or int(args.debug_save_input_images) > 0:
+        raise ValueError("DAgger collection forbids duplicate trajectory/debug image dumps")
+    if not str(args.trajectory_dagger_policy_fingerprint).strip():
+        raise ValueError("--trajectory_dagger_policy_fingerprint is required")
+    max_gb = float(args.trajectory_dagger_max_gb)
+    if not math.isfinite(max_gb) or not 5.0 < max_gb <= 300.0:
+        raise ValueError("--trajectory_dagger_max_gb must be in (5, 300]")
+    if int(args.trajectory_dagger_round) < 0:
+        raise ValueError("--trajectory_dagger_round must be >= 0")
+    normal_quota = int(args.trajectory_dagger_normal_quota)
+    hard_quota = int(args.trajectory_dagger_hard_quota)
+    if normal_quota < 0 or hard_quota < 0 or normal_quota + hard_quota == 0:
+        raise ValueError("DAgger episode quotas must be non-negative and not both zero")
+    if not 1 <= int(args.trajectory_dagger_jpeg_quality) <= 95:
+        raise ValueError("--trajectory_dagger_jpeg_quality must be in [1, 95]")
+    offpath = float(args.trajectory_dagger_hard_offpath_m)
+    if not math.isfinite(offpath) or offpath <= 0.0:
+        raise ValueError("--trajectory_dagger_hard_offpath_m must be finite and > 0")
+    if int(args.trajectory_dagger_max_oracle_actions) <= 0:
+        raise ValueError("--trajectory_dagger_max_oracle_actions must be > 0")
+    min_history = int(args.trajectory_dagger_min_history)
+    if min_history < 2 or int(args.num_history) < min_history:
+        raise ValueError("DAgger requires num_history >= trajectory_dagger_min_history >= 2")
+
+    args.config = str(_require_path_under_fjl(args.config, label="config"))
+    args.data_path = str(_require_path_under_fjl(args.data_path, label="data_path"))
+    args.scenes_dir = str(_require_path_under_fjl(args.scenes_dir, label="scenes_dir"))
+    args.output_path = str(_require_path_under_fjl(args.output_path, label="output_path"))
+    args.trajectory_dagger_root = str(
+        _require_path_under_fjl(args.trajectory_dagger_root, label="trajectory_dagger_root")
+    )
+    if args.episode_list:
+        args.episode_list = str(_require_path_under_fjl(args.episode_list, label="episode_list"))
+    data_path = Path(args.data_path)
+    if "train" not in data_path.parts or data_path.name != "train.json.gz":
+        raise ValueError(f"DAgger requires the canonical R2R train annotation, got {data_path}")
+    collection_root = Path(args.trajectory_dagger_root)
+    output_root = Path(args.output_path)
+    if (
+        collection_root == output_root
+        or collection_root in output_root.parents
+        or output_root in collection_root.parents
+    ):
+        raise ValueError("Evaluation output and DAgger collection roots must be disjoint")
+
+
 def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
     """Read a checkpoint and return the tensor state dict it contains."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -946,10 +1082,7 @@ def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tens
     if all(torch.is_tensor(value) for value in ckpt.values()):
         return ckpt
 
-    raise KeyError(
-        f"Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: "
-        f"{checkpoint_path}"
-    )
+    raise KeyError(f"Checkpoint does not contain model_state_dict/trainable_state_dict/state_dict: {checkpoint_path}")
 
 
 def _extract_checkpoint_config(checkpoint_path: str | None) -> dict:
@@ -998,11 +1131,7 @@ def _requires_base_checkpoint(cfg: dict, checkpoint_cfg: dict | None = None) -> 
 
 
 def _system2_sft_protocol(cfg: dict) -> str:
-    return (
-        cfg.get("data", {})
-        .get("trajectory", {})
-        .get("system2_sft_protocol", "direct")
-    ).lower()
+    return (cfg.get("data", {}).get("trajectory", {}).get("system2_sft_protocol", "direct")).lower()
 
 
 def _preflight_checkpoint_args(args) -> None:
@@ -1023,10 +1152,7 @@ def _preflight_checkpoint_args(args) -> None:
     if args.base_checkpoint:
         return
 
-    checkpoint_state_dict = (
-        _extract_checkpoint_state_dict(args.checkpoint)
-        if args.checkpoint else None
-    )
+    checkpoint_state_dict = _extract_checkpoint_state_dict(args.checkpoint) if args.checkpoint else None
     if not _checkpoint_has_base_weights(checkpoint_state_dict):
         raise ValueError(
             "This bridge-only config/checkpoint requires the Stage1-S2 panoramic System2 "
@@ -1043,10 +1169,7 @@ def _load_compatible_state_dict(
 ) -> int:
     """Load matching tensors while handling DDP and legacy backbone prefixes."""
     current_state = model.state_dict()
-    normalized_to_actual = {
-        _normalize_state_key(name): name
-        for name in current_state
-    }
+    normalized_to_actual = {_normalize_state_key(name): name for name in current_state}
 
     remapped: dict[str, torch.Tensor] = {}
     skipped_shape: list[str] = []
@@ -1059,8 +1182,7 @@ def _load_compatible_state_dict(
             continue
         if current_state[actual_name].shape != value.shape:
             skipped_shape.append(
-                f"{actual_name}: ckpt {tuple(value.shape)} vs "
-                f"model {tuple(current_state[actual_name].shape)}"
+                f"{actual_name}: ckpt {tuple(value.shape)} vs model {tuple(current_state[actual_name].shape)}"
             )
             continue
         remapped[actual_name] = value
@@ -1075,10 +1197,7 @@ def _load_compatible_state_dict(
         sample = ", ".join(skipped_missing[:5])
         print(f"  skipped unmatched keys: {len(skipped_missing)}; examples: {sample}")
     if skipped_shape:
-        print(
-            "  skipped shape-mismatched keys: "
-            f"{len(skipped_shape)}; examples: {'; '.join(skipped_shape[:3])}"
-        )
+        print(f"  skipped shape-mismatched keys: {len(skipped_shape)}; examples: {'; '.join(skipped_shape[:3])}")
     return len(remapped)
 
 
@@ -1106,7 +1225,11 @@ def _prepare_progress_file(args, output_path: str) -> str:
     return progress_file
 
 
-def _load_progress(progress_file: str) -> tuple[list[float], list[float], list[float], list[float], set]:
+def _load_progress(
+    progress_file: str,
+    *,
+    expected_rpc_sampling_contract: dict[str, Any] | None = None,
+) -> tuple[list[float], list[float], list[float], list[float], set]:
     sucs, spls, oss, nes = [], [], [], []
     done_set: set = set()
     if not os.path.exists(progress_file):
@@ -1119,8 +1242,15 @@ def _load_progress(progress_file: str) -> tuple[list[float], list[float], list[f
             if not line.strip():
                 continue
             res = json.loads(line)
+            if expected_rpc_sampling_contract is not None:
+                validate_rpc_progress_sampling_contract(
+                    res,
+                    expected=expected_rpc_sampling_contract,
+                )
             scene_id = res.get("scene_id")
             episode_id = res.get("episode_id")
+            if expected_rpc_sampling_contract is not None and (scene_id is None or episode_id is None):
+                raise ValueError("Deterministic RPC progress rows require scene_id and episode_id")
             if scene_id is None or episode_id is None:
                 loose_results.append(res)
                 continue
@@ -1161,8 +1291,9 @@ def _episode_list_from_args(args) -> tuple[list[tuple[str, int]] | None, set[tup
     return _load_episode_list(path)
 
 
-def _eval_limit(args, remaining: int, target_list: list[tuple[str, int]] | None = None,
-                done_set: set | None = None) -> int:
+def _eval_limit(
+    args, remaining: int, target_list: list[tuple[str, int]] | None = None, done_set: set | None = None
+) -> int:
     if target_list is not None:
         done = done_set or set()
         pending = sum(1 for key in target_list if key not in done)
@@ -1178,12 +1309,13 @@ def _eval_limit(args, remaining: int, target_list: list[tuple[str, int]] | None 
 # Section 3: Habitat config
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def build_habitat_config(args):
     cfg = get_habitat_default_config()
     cfg.defrost()
 
     cfg.DATASET.TYPE = "R2RVLN-v1"
-    cfg.DATASET.SPLIT = "val_unseen"
+    cfg.DATASET.SPLIT = str(getattr(args, "dataset_split", "val_unseen"))
     cfg.DATASET.SCENES_DIR = args.scenes_dir
     cfg.DATASET.DATA_PATH = args.data_path
 
@@ -1217,10 +1349,19 @@ def build_habitat_config(args):
     cfg.TASK.SUCCESS_DISTANCE = 3.0
     cfg.TASK.SENSORS = ["INSTRUCTION_SENSOR", "GPS_SENSOR", "COMPASS_SENSOR"]
     cfg.TASK.POSSIBLE_ACTIONS = [
-        "STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP", "LOOK_DOWN",
+        "STOP",
+        "MOVE_FORWARD",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "LOOK_UP",
+        "LOOK_DOWN",
     ]
     cfg.TASK.MEASUREMENTS = [
-        "DISTANCE_TO_GOAL", "SUCCESS", "SPL", "ORACLE_SUCCESS", "ORACLE_NAVIGATION_ERROR",
+        "DISTANCE_TO_GOAL",
+        "SUCCESS",
+        "SPL",
+        "ORACLE_SUCCESS",
+        "ORACLE_NAVIGATION_ERROR",
     ]
 
     cfg.TASK.DISTANCE_TO_GOAL.TYPE = "DistanceToGoal"
@@ -1245,23 +1386,112 @@ def build_habitat_config(args):
     return cfg
 
 
+def _habitat_episode_key(episode: Any) -> tuple[str, int]:
+    scene_id = Path(str(episode.scene_id)).stem
+    return scene_id, int(episode.episode_id)
+
+
+def _create_habitat_env(hab_cfg, args):
+    """Create Habitat Env after applying an exact fixed cohort, if supplied.
+
+    Filtering the dataset before Env construction follows the VLN-CE
+    collection pattern and avoids reset/reconfigure cycles through thousands
+    of non-target train episodes. The ordered composite-key check compensates
+    for Habitat filters that otherwise operate on episode_id alone.
+    """
+    target_list, _ = _episode_list_from_args(args)
+    if target_list is None:
+        return habitat.Env(config=hab_cfg)
+
+    if len(target_list) != len(set(target_list)):
+        raise ValueError("Fixed episode list contains duplicate (scene_id, episode_id) keys")
+    dataset = habitat.make_dataset(
+        id_dataset=hab_cfg.DATASET.TYPE,
+        config=hab_cfg.DATASET,
+    )
+    episodes_by_key: dict[tuple[str, int], Any] = {}
+    for episode in dataset.episodes:
+        key = _habitat_episode_key(episode)
+        if key in episodes_by_key:
+            raise ValueError(f"Dataset contains duplicate episode key: {key}")
+        episodes_by_key[key] = episode
+
+    missing = [key for key in target_list if key not in episodes_by_key]
+    if missing:
+        raise ValueError(
+            f"Fixed episode list contains keys absent from the configured dataset: {missing[:10]}"
+        )
+    dataset.episodes = [episodes_by_key[key] for key in target_list]
+    env = habitat.Env(config=hab_cfg, dataset=dataset)
+    actual = [_habitat_episode_key(episode) for episode in env.episodes]
+    if actual != target_list:
+        env.close()
+        raise RuntimeError("Habitat fixed-cohort order changed during Env construction")
+    print(
+        f"Habitat dataset filtered before Env construction: {len(actual)} ordered episodes",
+        flush=True,
+    )
+    return env
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 4: Agent pose tracking
 # ═══════════════════════════════════════════════════════════════════════
 
-def get_agent_cam2world(env) -> np.ndarray:
-    """Extract a 4x4 camera-to-world matrix from the Habitat agent state.
+
+def get_agent_cam2world(env, *, require_rgb_sensor: bool = False) -> np.ndarray:
+    """Extract the RGB camera-to-world matrix from the Habitat agent state.
 
     Habitat convention: Y-up, agent faces -Z.
     The returned matrix matches the format used by the training data
     (``compute_history_rel_poses`` / ``get_trajectory_relative_to_frame``).
+
+    The R2R panoramic training data stores the RGB *sensor* pose, whose
+    translation includes the configured sensor height.  Using the agent body
+    pose here silently introduces a vertical offset (1.25 m in the current
+    VLN-CE config). Generic evaluation can fall back for old Habitat builds,
+    while trajectory DAgger sets ``require_rgb_sensor`` and fails closed.
     """
     sim = env._sim
     agent = sim.get_agent(0)
-    state = agent.get_state()
-    rot_mat = quaternion.as_rotation_matrix(state.rotation)  # 3×3
+    agent_state = agent.get_state()
+    pose_state = agent_state
+
+    sensor_states = getattr(agent_state, "sensor_states", None) or {}
+    found_rgb_sensor = False
+    for sensor_key in (
+        "rgb",
+        "RGB_SENSOR",
+        "color_sensor",
+        "rgb_sensor",
+    ):
+        if sensor_key in sensor_states:
+            pose_state = sensor_states[sensor_key]
+            found_rgb_sensor = True
+            break
+    if require_rgb_sensor and not found_rgb_sensor:
+        raise RuntimeError(
+            "trajectory DAgger requires an explicit RGB sensor pose; "
+            f"available sensor states={sorted(sensor_states)}"
+        )
+
+    rot_mat = quaternion.as_rotation_matrix(pose_state.rotation)  # 3×3
     T = np.eye(4, dtype=np.float32)
     T[:3, :3] = rot_mat
+    T[:3, 3] = pose_state.position
+    return T
+
+
+def get_agent_body_pose(env) -> np.ndarray:
+    """Return the agent-body pose used for navigation and simulator stepping.
+
+    This must stay separate from ``get_agent_cam2world``: observations use
+    the elevated RGB sensor pose, while a shadow rollout must reset the body
+    pose or it would lift the agent by the sensor height.
+    """
+    state = env._sim.get_agent(0).get_state()
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = quaternion.as_rotation_matrix(state.rotation)
     T[:3, 3] = state.position
     return T
 
@@ -1269,6 +1499,7 @@ def get_agent_cam2world(env) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════
 # Section 5: Panoramic view capture
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def _yaw_quaternion(angle_rad: float):
     """Create a quaternion for rotation around Y-axis (up in Habitat)."""
@@ -1284,8 +1515,7 @@ def _quat_to_heading_deg(rot_xyzw: np.ndarray) -> float:
     onto the XZ ground plane, measured from +Z (north) clockwise:
     heading = arctan2(forward_x, forward_z).
     """
-    q = np.quaternion(float(rot_xyzw[3]), float(rot_xyzw[0]),
-                      float(rot_xyzw[1]), float(rot_xyzw[2]))
+    q = np.quaternion(float(rot_xyzw[3]), float(rot_xyzw[0]), float(rot_xyzw[1]), float(rot_xyzw[2]))
     rot_mat = quaternion.as_rotation_matrix(q)
     forward = rot_mat @ np.array([0.0, 0.0, -1.0], dtype=np.float64)
     heading_rad = np.arctan2(float(forward[0]), float(forward[2]))
@@ -1293,7 +1523,12 @@ def _quat_to_heading_deg(rot_xyzw: np.ndarray) -> float:
 
 
 _ACTION_NAMES: dict[int, str] = {
-    0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT", 4: "LOOKUP", 5: "LOOKDOWN",
+    0: "STOP",
+    1: "FORWARD",
+    2: "LEFT",
+    3: "RIGHT",
+    4: "LOOKUP",
+    5: "LOOKDOWN",
 }
 
 
@@ -1302,7 +1537,8 @@ def _action_name(action: int) -> str:
 
 
 def capture_panoramic_views(
-    env, image_size: tuple = (256, 256),
+    env,
+    image_size: tuple = (256, 256),
 ) -> dict[str, Image.Image]:
     """Capture 4 directional views by manipulating agent state directly.
 
@@ -1338,9 +1574,7 @@ def capture_panoramic_views(
                     flush=True,
                 )
                 _panoramic_sensor_warned = True
-            views[name] = Image.fromarray(
-                np.zeros((*image_size[::-1], 3), dtype=np.uint8)
-            )
+            views[name] = Image.fromarray(np.zeros((*image_size[::-1], 3), dtype=np.uint8))
 
     agent.set_state(orig_state, reset_sensors=True)
     return views
@@ -1373,18 +1607,21 @@ def _eval_image_sizes(train_cfg: dict) -> tuple[tuple[int, int], tuple[int, int]
     return vlm_size, traj_size
 
 
+def _sample_history_indices(history_length: int, num_history: int) -> list[int]:
+    """Return the exact history indices used by the RPC prompt."""
+    if num_history <= 0:
+        return []
+    if history_length <= num_history:
+        return list(range(history_length))
+    return np.unique(np.linspace(0, history_length - 1, num_history, dtype=np.int32)).tolist()
+
+
 def _sample_history_panoramas(
     history_panoramas: list[dict[str, Image.Image]],
     num_history: int,
 ) -> list[dict[str, Image.Image]]:
     """Sample prompt history without mutating the full executed trajectory."""
-    if num_history <= 0:
-        return []
-    if len(history_panoramas) <= num_history:
-        return list(history_panoramas)
-    indices = np.unique(
-        np.linspace(0, len(history_panoramas) - 1, num_history, dtype=np.int32)
-    ).tolist()
+    indices = _sample_history_indices(len(history_panoramas), num_history)
     return [history_panoramas[i] for i in indices]
 
 
@@ -1400,12 +1637,13 @@ def _condition_output_ids_for_pixel_goal(
 ) -> torch.Tensor:
     """Use System1-compatible coordinate text in latent conditioning."""
     parsed = parse_structured_pano_output(llm_output, image_size=None)
+    has_generated_suffix = output_ids.ndim == 2 and output_ids.shape[1] > int(prompt_len)
     use_structured = structured_output or parsed.kind == "pixel"
     if use_structured:
         resolved_view = (view_id or parsed.view_id or "front").lower()
         desired_text = structured_condition_text(resolved_view, pixel_goal)
         generated_text = (llm_output or "").strip()
-        if generated_text == desired_text:
+        if generated_text == desired_text and has_generated_suffix:
             return output_ids
         print(
             f"  [debug] System1 structured coordinate text: {desired_text!r}",
@@ -1421,7 +1659,7 @@ def _condition_output_ids_for_pixel_goal(
         else:
             raise ValueError(f"Unsupported coord_order: {coord_order}")
 
-        if len(coord) >= 2 and [coord[0], coord[1]] == desired:
+        if len(coord) >= 2 and [coord[0], coord[1]] == desired and has_generated_suffix:
             return output_ids
 
         coord_text = f"{desired[0]} {desired[1]}"
@@ -1503,10 +1741,7 @@ def _image_trace_summary(image: Image.Image) -> str:
         return "empty"
     digest = hashlib.sha1(arr.tobytes()).hexdigest()[:10]
     height, width = arr.shape[:2]
-    return (
-        f"{width}x{height}:{digest}:"
-        f"mean={float(arr.mean()):.1f}:std={float(arr.std()):.1f}"
-    )
+    return f"{width}x{height}:{digest}:mean={float(arr.mean()):.1f}:std={float(arr.std()):.1f}"
 
 
 def _views_trace_summary(views: dict[str, Image.Image]) -> str:
@@ -1525,10 +1760,7 @@ def _agent_pose_summary(env) -> str:
         rot = quaternion.as_float_array(state.rotation)
     except Exception as exc:
         return f"pose=unavailable:{type(exc).__name__}"
-    return (
-        f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
-        f"rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f},{rot[3]:.4f})"
-    )
+    return f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f},{rot[3]:.4f})"
 
 
 def _env_trace_summary(env) -> str:
@@ -1544,11 +1776,7 @@ def _tensor_trace_summary(tensor: torch.Tensor | None) -> str:
     if t.numel() == 0:
         return f"shape={tuple(t.shape)} empty"
     tf = t.float()
-    return (
-        f"shape={tuple(t.shape)} "
-        f"mean={float(tf.mean().item()):.4f} "
-        f"std={float(tf.std(unbiased=False).item()):.4f}"
-    )
+    return f"shape={tuple(t.shape)} mean={float(tf.mean().item()):.4f} std={float(tf.std(unbiased=False).item()):.4f}"
 
 
 def _maybe_save_debug_images(
@@ -1563,17 +1791,14 @@ def _maybe_save_debug_images(
     if limit <= 0 or call_idx > limit:
         return
 
-    debug_dir = (
-        Path(args.output_path)
-        / "debug_inputs"
-        / f"{scene_id}_{episode_id:04d}"
-    )
+    debug_dir = Path(args.output_path) / "debug_inputs" / f"{scene_id}_{episode_id:04d}"
     debug_dir.mkdir(parents=True, exist_ok=True)
     for name, image in images.items():
         image.save(debug_dir / f"{call_idx:04d}_{phase}_{name}.jpg")
 
 
 # ── Trajectory Step Recorder (for offline HTML visualisation) ──────────
+
 
 class TrajectoryStepRecorder:
     """Save per-step agent state, VLM outputs, and panorama images to disk.
@@ -1617,9 +1842,7 @@ class TrajectoryStepRecorder:
             "position": [float(v) for v in data["position"]],
             "heading_deg": float(data.get("heading_deg", 0.0)),
             "rotation": [float(v) for v in data.get("rotation", [0, 0, 0, 1])],
-            "distance_to_goal": float(data["distance_to_goal"])
-            if data.get("distance_to_goal") is not None
-            else None,
+            "distance_to_goal": float(data["distance_to_goal"]) if data.get("distance_to_goal") is not None else None,
         }
 
         cur_dist = step["distance_to_goal"]
@@ -1659,20 +1882,12 @@ class TrajectoryStepRecorder:
             val = data.get(num_key)
             step[num_key] = float(val) if val is not None else None
         per_q = data.get("traj_hs_per_query")
-        step["traj_hs_per_query"] = (
-            [float(v) for v in per_q] if per_q is not None else None
-        )
+        step["traj_hs_per_query"] = [float(v) for v in per_q] if per_q is not None else None
 
         # Action fields.
-        step["executed_action"] = (
-            int(data["executed_action"])
-            if data.get("executed_action") is not None
-            else None
-        )
+        step["executed_action"] = int(data["executed_action"]) if data.get("executed_action") is not None else None
         step["executed_action_name"] = (
-            _action_name(data["executed_action"])
-            if data.get("executed_action") is not None
-            else None
+            _action_name(data["executed_action"]) if data.get("executed_action") is not None else None
         )
 
         # Save panorama images as JPEG files.
@@ -1786,10 +2001,7 @@ def _trajectory_debug_summary(
     goal_xy = mean_xy[-1]
     direct = float(np.linalg.norm(goal_xy))
     path_len = float(np.linalg.norm(np.diff(mean_xy, axis=0), axis=1).sum())
-    return (
-        f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), "
-        f"direct={direct:.2f}, path_len={path_len:.2f}"
-    )
+    return f"traj_goal=({goal_xy[0]:.2f},{goal_xy[1]:.2f}), direct={direct:.2f}, path_len={path_len:.2f}"
 
 
 def _system1_coord_order(args, *, panoramic_internnav_protocol: bool) -> str:
@@ -1939,9 +2151,7 @@ def select_trajectory_xy(
         if forward_candidates:
             medoid_idx = _endpoint_medoid_index(all_trajectory)
             medoid_endpoint = all_trajectory[medoid_idx, -1, :2]
-            median_path_len = float(
-                np.median([trajectory_xy_path_len(traj) for traj in all_trajectory])
-            )
+            median_path_len = float(np.median([trajectory_xy_path_len(traj) for traj in all_trajectory]))
 
             def score(item: tuple[int, int, float, list[int]]) -> tuple[float, int, float]:
                 idx, forward_count, path_len, _actions = item
@@ -1960,10 +2170,7 @@ def select_trajectory_xy(
         idx = _endpoint_medoid_index(all_trajectory)
         return all_trajectory[idx], idx
 
-    raise ValueError(
-        f"Unsupported trajectory selection: {selection}; "
-        f"expected one of {TRAJECTORY_SELECTION_CHOICES}"
-    )
+    raise ValueError(f"Unsupported trajectory selection: {selection}; expected one of {TRAJECTORY_SELECTION_CHOICES}")
 
 
 def traj_to_actions(
@@ -1975,9 +2182,7 @@ def traj_to_actions(
 ) -> list[int]:
     """Convert InternNav trajectory predictions to discrete Habitat actions."""
     if trajectory_x_sign not in (-1.0, 1.0):
-        raise ValueError(
-            f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}"
-        )
+        raise ValueError(f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}")
     trajs = dp_actions[:num_sample_trajs].float().detach().cpu().numpy().copy()
     trajs[:, :, :2] /= action_scale
     trajs[:, :, 0] *= trajectory_x_sign
@@ -1991,13 +2196,16 @@ def traj_to_actions(
 # Section 7: VLM input preparation
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]):
     """Replicate HeatmapVLN._normalize_multimodal_inputs."""
     if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
         vgt = inputs["video_grid_thw"]
         if vgt.shape[0] > 0 and vgt[:, 0].max() > 1:
             inputs["video_grid_thw"] = torch.repeat_interleave(
-                vgt, vgt[:, 0], dim=0,
+                vgt,
+                vgt[:, 0],
+                dim=0,
             )
             inputs["video_grid_thw"][:, 0] = 1
 
@@ -2041,14 +2249,12 @@ def prepare_vlm_inputs(
 # Section 8: Model building
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _resolve_internnav_model_path(cfg: dict) -> str:
     raw = (
         os.environ.get("INTERNNAV_MODEL_PATH")
         or os.environ.get("INTERNNAV_BACKBONE")
-        or cfg.get("model", {})
-        .get("action_head", {})
-        .get("nextdit", {})
-        .get("internnav_model_path", "")
+        or cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("internnav_model_path", "")
         or cfg.get("model", {}).get("llm", {}).get("model_path", "")
     )
     resolved = os.path.expandvars(os.path.expanduser(str(raw or "").strip()))
@@ -2096,9 +2302,7 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
     else:
         single = model_dir / "model.safetensors"
         if not single.is_file():
-            raise FileNotFoundError(
-                f"No InternNav safetensors found under {internnav_path}"
-            )
+            raise FileNotFoundError(f"No InternNav safetensors found under {internnav_path}")
         weight_map = {k: single.name for k in safe_open(str(single)).keys()}  # noqa: SIM118
 
     shards: dict[str, object] = {}
@@ -2117,16 +2321,12 @@ def _verify_internnav_system1_loaded(model: torch.nn.Module, internnav_path: str
 
     rgb_key_count = sum(1 for key in weight_map if key.startswith("model.rgb_model."))
     if rgb_key_count == 0:
-        raise RuntimeError(
-            f"No model.rgb_model.* tensors in InternNav weights at {internnav_path}"
-        )
+        raise RuntimeError(f"No model.rgb_model.* tensors in InternNav weights at {internnav_path}")
 
     for ref_key, current_fn in checks:
         reference = _tensor_from_internnav(ref_key)
         current = current_fn().detach().float().cpu()
-        if current.shape != reference.shape or not torch.allclose(
-            current, reference, atol=1e-4, rtol=1e-3
-        ):
+        if current.shape != reference.shape or not torch.allclose(current, reference, atol=1e-4, rtol=1e-3):
             raise RuntimeError(
                 "InternNav System1 weights were not loaded into NextDiT "
                 f"(mismatch on {ref_key}). Check INTERNNAV_MODEL_PATH."
@@ -2165,10 +2365,7 @@ def load_model(args, device: torch.device):
     base_state_dict = None
     if args.base_checkpoint:
         base_state_dict = _extract_checkpoint_state_dict(args.base_checkpoint)
-    checkpoint_state_dict = (
-        _extract_checkpoint_state_dict(args.checkpoint)
-        if args.checkpoint else None
-    )
+    checkpoint_state_dict = _extract_checkpoint_state_dict(args.checkpoint) if args.checkpoint else None
 
     if (
         _requires_base_checkpoint(cfg, checkpoint_cfg)
@@ -2181,24 +2378,17 @@ def load_model(args, device: torch.device):
             "whose metadata records runtime.base_checkpoint."
         )
     if checkpoint_state_dict and _looks_action_only(checkpoint_state_dict) and not args.base_checkpoint:
-        print(
-            "WARNING: the main checkpoint contains only action-head weights and no "
-            "base checkpoint was loaded."
-        )
+        print("WARNING: the main checkpoint contains only action-head weights and no base checkpoint was loaded.")
     if not args.base_checkpoint and checkpoint_state_dict is None:
         print(
-            "WARNING: no checkpoint was supplied; evaluating the model initialized "
-            "from config/pretrained weights only."
+            "WARNING: no checkpoint was supplied; evaluating the model initialized from config/pretrained weights only."
         )
 
     # Qwen/LoRA is lazy.  It must exist before loading Stage 1 LoRA weights;
     # otherwise qwen*.model.* keys are silently treated as unexpected.
     model.qwen2_5_vl._load_model()
 
-    if (
-        _state_has_prefix(base_state_dict, "heatmap_vln.")
-        or _state_has_prefix(checkpoint_state_dict, "heatmap_vln.")
-    ):
+    if _state_has_prefix(base_state_dict, "heatmap_vln.") or _state_has_prefix(checkpoint_state_dict, "heatmap_vln."):
         model._ensure_heatmap_vln()
 
     if base_state_dict:
@@ -2252,7 +2442,7 @@ def _run_eval_panoramic_vlm(
         )
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
-    env = habitat.Env(config=hab_cfg)
+    env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
@@ -2261,9 +2451,7 @@ def _run_eval_panoramic_vlm(
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     internnav_protocol = _system2_sft_protocol(train_cfg) == "internnav"
-    structured_pano_output = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("structured_pano_output", True)
-    )
+    structured_pano_output = bool(train_cfg.get("data", {}).get("trajectory", {}).get("structured_pano_output", True))
     system1_coord_order = _system1_coord_order(
         args,
         panoramic_internnav_protocol=internnav_protocol,
@@ -2282,10 +2470,7 @@ def _run_eval_panoramic_vlm(
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
-    print(
-        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
-        f"this run: {eval_limit}"
-    )
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
 
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
@@ -2317,10 +2502,7 @@ def _run_eval_panoramic_vlm(
 
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
-        print(
-            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
-            f"{instruction[:80]}..."
-        )
+        print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
 
         executed_history_panoramas: list[dict[str, Image.Image]] = []
         action_seq: list[int] = []
@@ -2339,7 +2521,9 @@ def _run_eval_panoramic_vlm(
         step_recorder: TrajectoryStepRecorder | None = None
         if args.save_trajectory_steps:
             step_recorder = TrajectoryStepRecorder(
-                Path(output_path), scene_id, episode_id,
+                Path(output_path),
+                scene_id,
+                episode_id,
             )
             init_state = env._sim.get_agent(0).get_state()
             init_pos = np.array(init_state.position, dtype=float)
@@ -2393,20 +2577,19 @@ def _run_eval_panoramic_vlm(
                     awaiting_lookdown = False
                     continue
 
-                before = (
-                    _env_trace_summary(env)
-                    if _debug_input_trace_enabled(args)
-                    else None
-                )
+                before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                 observations, done = _apply_habitat_action(env, action)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="local_action", action=int(action), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="local_action",
+                    action=int(action),
+                    image_size=image_size,
                 )
                 if before is not None:
                     print(
-                        f"  [debug] executed local action={int(action)} "
-                        f"{before} -> {_env_trace_summary(env)}",
+                        f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
                         flush=True,
                     )
                 step_id += 1
@@ -2476,17 +2659,21 @@ def _run_eval_panoramic_vlm(
                     {"lookdown": turn_lookdown_img},
                 )
                 messages = copy.deepcopy(base_messages)
-                messages.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": last_llm_output}],
-                })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
-                        {"type": "image", "image": turn_lookdown_img},
-                    ],
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": last_llm_output}],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": random.choice(LEGACY_CONJUNCTIONS)},
+                            {"type": "image", "image": turn_lookdown_img},
+                        ],
+                    }
+                )
                 awaiting_lookdown = False
             else:
                 current_views = capture_panoramic_views(env, image_size=image_size)
@@ -2538,8 +2725,7 @@ def _run_eval_panoramic_vlm(
             )
             if _debug_input_trace_enabled(args):
                 print(
-                    "  [debug] processor pixel_values "
-                    f"{_tensor_trace_summary(inputs.get('pixel_values'))}",
+                    f"  [debug] processor pixel_values {_tensor_trace_summary(inputs.get('pixel_values'))}",
                     flush=True,
                 )
             system2_calls += 1
@@ -2551,8 +2737,12 @@ def _run_eval_panoramic_vlm(
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1, phase="stop",
-                    action=int(ActionCode.STOP), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
                 )
                 step_id += 1
                 continue
@@ -2566,7 +2756,7 @@ def _run_eval_panoramic_vlm(
                 ).sequences
 
             llm_output = processor.tokenizer.decode(
-                output_ids[0][inputs["input_ids"].shape[1]:],
+                output_ids[0][inputs["input_ids"].shape[1] :],
                 skip_special_tokens=True,
             )
             last_llm_output = llm_output
@@ -2575,8 +2765,12 @@ def _run_eval_panoramic_vlm(
             if _vlm_requests_stop(llm_output):
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1, phase="stop",
-                    action=int(ActionCode.STOP), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
                     vlm_output=llm_output,
                 )
                 step_id += 1
@@ -2587,8 +2781,12 @@ def _run_eval_panoramic_vlm(
                 action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
                 observations, done = _apply_habitat_action(env, action)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1, phase="turn",
-                    action=int(action), image_size=image_size,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="turn",
+                    action=int(action),
+                    image_size=image_size,
                     vlm_output=llm_output,
                 )
                 step_id += 1
@@ -2612,18 +2810,20 @@ def _run_eval_panoramic_vlm(
                 views_for_record = None
                 if executed_history_panoramas:
                     views_for_record = executed_history_panoramas[-1]
-                step_recorder.record_step({
-                    "step_id": step_id,
-                    "phase": "vlm",
-                    "position": pos,
-                    "heading_deg": _quat_to_heading_deg(rot),
-                    "rotation": rot,
-                    "distance_to_goal": _metric_distance_to_goal(env),
-                    "vlm_output": llm_output,
-                    "pixel_goal": pixel_goal,
-                    "pano_goal_view": pano_goal_view,
-                    "current_views": views_for_record,
-                })
+                step_recorder.record_step(
+                    {
+                        "step_id": step_id,
+                        "phase": "vlm",
+                        "position": pos,
+                        "heading_deg": _quat_to_heading_deg(rot),
+                        "rotation": rot,
+                        "distance_to_goal": _metric_distance_to_goal(env),
+                        "vlm_output": llm_output,
+                        "pixel_goal": pixel_goal,
+                        "pano_goal_view": pano_goal_view,
+                        "current_views": views_for_record,
+                    }
+                )
 
             # === Force-teacher full-drive (--force_teacher_coord) ============
             #
@@ -2650,7 +2850,8 @@ def _run_eval_panoramic_vlm(
                     )
                 else:
                     ld_for_teacher = capture_lookdown_view(
-                        env, image_size=vlm_image_size,
+                        env,
+                        image_size=vlm_image_size,
                     )
                     turn_lookdown_img = ld_for_teacher
 
@@ -2665,12 +2866,8 @@ def _run_eval_panoramic_vlm(
                 if front_for_teacher is not None:
                     history_front_pils: list = []
                     if len(executed_history_panoramas) > 1:
-                        hist_pano = executed_history_panoramas[
-                            -1 - num_history : -1
-                        ]
-                        history_front_pils = [
-                            h["front"] for h in hist_pano if "front" in h
-                        ]
+                        hist_pano = executed_history_panoramas[-1 - num_history : -1]
+                        history_front_pils = [h["front"] for h in hist_pano if "front" in h]
                     teacher_coord, teacher_info = _predict_force_teacher_coord(
                         force_teacher_model,
                         force_teacher_processor,
@@ -2681,9 +2878,7 @@ def _run_eval_panoramic_vlm(
                         vlm_image_size=vlm_image_size,
                         history_front_pils=history_front_pils,
                     )
-                    teacher_actions = _parse_text_actions(
-                        teacher_info.get("turn1_text") or ""
-                    )
+                    teacher_actions = _parse_text_actions(teacher_info.get("turn1_text") or "")
                     # If teacher's turn-1 contained "↓" (lookdown trigger) we
                     # already executed turn-2 internally inside
                     # _predict_force_teacher_coord. In that case the LOOKDOWN
@@ -2695,14 +2890,9 @@ def _run_eval_panoramic_vlm(
                     # an infinite "LOOKDOWN -> ↓↓ -> LOOKDOWN" loop with no
                     # step_id progress.
                     if teacher_info.get("turn2_text") is not None:
-                        teacher_actions = [
-                            a for a in teacher_actions
-                            if a != int(ActionCode.LOOKDOWN)
-                        ]
+                        teacher_actions = [a for a in teacher_actions if a != int(ActionCode.LOOKDOWN)]
 
-                student_pg_repr = (
-                    list(pixel_goal) if pixel_goal is not None else None
-                )
+                student_pg_repr = list(pixel_goal) if pixel_goal is not None else None
 
                 if teacher_coord is not None:
                     if pixel_goal is not None and has_nextdit:
@@ -2727,13 +2917,13 @@ def _run_eval_panoramic_vlm(
                         )
                 elif teacher_actions:
                     action_name_map = {
-                        0: "STOP", 1: "FORWARD", 2: "LEFT",
-                        3: "RIGHT", 5: "LOOKDOWN",
+                        0: "STOP",
+                        1: "FORWARD",
+                        2: "LEFT",
+                        3: "RIGHT",
+                        5: "LOOKDOWN",
                     }
-                    pretty_actions = [
-                        action_name_map.get(int(a), str(a))
-                        for a in teacher_actions
-                    ]
+                    pretty_actions = [action_name_map.get(int(a), str(a)) for a in teacher_actions]
                     print(
                         "  [force-teacher] action override (hist="
                         f"{teacher_info.get('n_history')}): "
@@ -2749,12 +2939,17 @@ def _run_eval_panoramic_vlm(
                         continue
                     if first_action == ActionCode.STOP:
                         observations, done = _apply_habitat_action(
-                            env, ActionCode.STOP,
+                            env,
+                            ActionCode.STOP,
                         )
                         _record_post_action_step(
-                            step_recorder, env, step_id=step_id + 1,
-                            phase="stop", action=int(ActionCode.STOP),
-                            image_size=image_size, vlm_output=llm_output,
+                            step_recorder,
+                            env,
+                            step_id=step_id + 1,
+                            phase="stop",
+                            action=int(ActionCode.STOP),
+                            image_size=image_size,
+                            vlm_output=llm_output,
                         )
                         step_id += 1
                         continue
@@ -2766,22 +2961,32 @@ def _run_eval_panoramic_vlm(
                     first_action = local_actions.pop(0)
                     if first_action == ActionCode.STOP:
                         observations, done = _apply_habitat_action(
-                            env, ActionCode.STOP,
+                            env,
+                            ActionCode.STOP,
                         )
                         _record_post_action_step(
-                            step_recorder, env, step_id=step_id + 1,
-                            phase="stop", action=int(ActionCode.STOP),
-                            image_size=image_size, vlm_output=llm_output,
+                            step_recorder,
+                            env,
+                            step_id=step_id + 1,
+                            phase="stop",
+                            action=int(ActionCode.STOP),
+                            image_size=image_size,
+                            vlm_output=llm_output,
                         )
                         step_id += 1
                         continue
                     observations, done = _apply_habitat_action(
-                        env, first_action,
+                        env,
+                        first_action,
                     )
                     _record_post_action_step(
-                        step_recorder, env, step_id=step_id + 1,
-                        phase="local_action", action=int(first_action),
-                        image_size=image_size, vlm_output=llm_output,
+                        step_recorder,
+                        env,
+                        step_id=step_id + 1,
+                        phase="local_action",
+                        action=int(first_action),
+                        image_size=image_size,
+                        vlm_output=llm_output,
                     )
                     step_id += 1
                     forward_action_count += 1
@@ -2821,7 +3026,8 @@ def _run_eval_panoramic_vlm(
 
                 print("  [debug] calling generate_latents ...", flush=True)
                 lq = model.latent_queries.expand(1, -1, -1).to(
-                    device=device, dtype=model.config.dtype,
+                    device=device,
+                    dtype=model.config.dtype,
                 )
                 condition_output_ids = _condition_output_ids_for_pixel_goal(
                     output_ids=output_ids,
@@ -2844,8 +3050,7 @@ def _run_eval_panoramic_vlm(
                     )
                     if _debug_input_trace_enabled(args):
                         _per_q = [
-                            float(_last_traj_hs[0, i].float().norm().item())
-                            for i in range(_last_traj_hs.shape[1])
+                            float(_last_traj_hs[0, i].float().norm().item()) for i in range(_last_traj_hs.shape[1])
                         ]
                         print(
                             "  [debug] traj_hs total_norm="
@@ -2856,12 +3061,9 @@ def _run_eval_panoramic_vlm(
                     if step_recorder is not None and _last_traj_hs is not None:
                         try:
                             ths = _last_traj_hs.detach()
-                            step_recorder._steps[-1]["traj_hs_total_norm"] = (
-                                float(ths.float().norm().item())
-                            )
+                            step_recorder._steps[-1]["traj_hs_total_norm"] = float(ths.float().norm().item())
                             step_recorder._steps[-1]["traj_hs_per_query"] = [
-                                float(ths[0, i].float().norm().item())
-                                for i in range(ths.shape[1])
+                                float(ths[0, i].float().norm().item()) for i in range(ths.shape[1])
                             ]
                         except Exception:
                             pass
@@ -2869,6 +3071,9 @@ def _run_eval_panoramic_vlm(
                         _last_traj_hs = _maybe_apply_pano_latent_adapter(
                             _last_traj_hs,
                             pano_latent_adapter,
+                            view_id=pano_goal_view,
+                            pixel_goal=pixel_goal,
+                            image_size=vlm_image_size,
                             cond_projector=model.nextdit_action_head.cond_projector
                             if model.nextdit_action_head is not None
                             else None,
@@ -2913,16 +3118,16 @@ def _run_eval_panoramic_vlm(
                         base_messages = None
                         awaiting_lookdown = False
                         forward_action_count = 0
-                        before = (
-                            _env_trace_summary(env)
-                            if _debug_input_trace_enabled(args)
-                            else None
-                        )
+                        before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                         observations, done = _apply_habitat_action(env, ActionCode.LEFT)
                         _record_post_action_step(
-                            step_recorder, env, step_id=step_id + 1,
-                            phase="local_action", action=int(ActionCode.LEFT),
-                            image_size=image_size, vlm_output=llm_output,
+                            step_recorder,
+                            env,
+                            step_id=step_id + 1,
+                            phase="local_action",
+                            action=int(ActionCode.LEFT),
+                            image_size=image_size,
+                            vlm_output=llm_output,
                         )
                         if before is not None:
                             print(
@@ -2934,16 +3139,16 @@ def _run_eval_panoramic_vlm(
                         step_id += 1
                         continue
 
-                    before = (
-                        _env_trace_summary(env)
-                        if _debug_input_trace_enabled(args)
-                        else None
-                    )
+                    before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                     observations, done = _apply_habitat_action(env, first_action)
                     _record_post_action_step(
-                        step_recorder, env, step_id=step_id + 1,
-                        phase="local_action", action=int(first_action),
-                        image_size=image_size, vlm_output=llm_output,
+                        step_recorder,
+                        env,
+                        step_id=step_id + 1,
+                        phase="local_action",
+                        action=int(first_action),
+                        image_size=image_size,
+                        vlm_output=llm_output,
                     )
                     if before is not None:
                         print(
@@ -2957,9 +3162,13 @@ def _run_eval_panoramic_vlm(
 
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="stop", action=int(ActionCode.STOP),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
                 continue
@@ -2972,9 +3181,13 @@ def _run_eval_panoramic_vlm(
                     continue
                 observations, done = _apply_habitat_action(env, action)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="vlm_action", action=int(action),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="vlm_action",
+                    action=int(action),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
             elif not (llm_output or "").strip():
@@ -2986,17 +3199,25 @@ def _run_eval_panoramic_vlm(
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.LEFT)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="fallback_action", action=int(ActionCode.LEFT),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="fallback_action",
+                    action=int(ActionCode.LEFT),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
             else:
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 _record_post_action_step(
-                    step_recorder, env, step_id=step_id + 1,
-                    phase="stop", action=int(ActionCode.STOP),
-                    image_size=image_size, vlm_output=llm_output,
+                    step_recorder,
+                    env,
+                    step_id=step_id + 1,
+                    phase="stop",
+                    action=int(ActionCode.STOP),
+                    image_size=image_size,
+                    vlm_output=llm_output,
                 )
                 step_id += 1
 
@@ -3274,6 +3495,15 @@ def _rpc_plan_panoramic(
     trajectory_x_sign: float,
     trajectory_heading_alignment: str,
     jpeg_quality: int,
+    scene_id: str,
+    episode_id: int,
+    system2_call_index: int,
+    protocol_seed: int,
+    require_deterministic_sampling: bool,
+    rpc_policy_mode: str = RPC_POLICY_HEATMAPVLN,
+    expected_policy_fingerprint: str = "",
+    phase: str = "joint",
+    pixel_goal: list[int] | None = None,
     oracle_system2: dict[str, Any] | None = None,
 ) -> dict:
     blobs = []
@@ -3284,6 +3514,12 @@ def _rpc_plan_panoramic(
             blobs.append(_rpc_blob_from_pil(f"history/{idx}/{view}", hist[view], jpeg_quality))
     blobs.append(_rpc_blob_from_pil("lookdown", lookdown_img, jpeg_quality))
 
+    sampling_metadata = build_rpc_sampling_metadata(
+        protocol_seed=protocol_seed,
+        scene_id=scene_id,
+        episode_id=episode_id,
+        system2_call_index=system2_call_index,
+    )
     payload = {
         "instruction": instruction,
         "num_history": len(history_panoramas),
@@ -3293,10 +3529,30 @@ def _rpc_plan_panoramic(
         "trajectory_selection": trajectory_selection,
         "trajectory_x_sign": trajectory_x_sign,
         "trajectory_heading_alignment": trajectory_heading_alignment,
+        "require_deterministic_sampling": bool(require_deterministic_sampling),
+        "phase": str(phase),
+        HEATMAPVLN_RPC_SAMPLING_FIELD: sampling_metadata,
     }
+    if pixel_goal is not None:
+        payload["pixel_goal"] = [int(pixel_goal[0]), int(pixel_goal[1])]
     if oracle_system2 is not None:
         payload["oracle_system2"] = oracle_system2
-    result = client.infer_json("plan_panoramic", payload, blobs)
+    if rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE:
+        if str(phase) != "joint":
+            raise ValueError("Native InternNav supports only the original joint planning call")
+        if not str(expected_policy_fingerprint).strip():
+            raise ValueError("Native InternNav RPC requires an expected policy fingerprint")
+        payload.update(
+            {
+                "policy_backend": RPC_POLICY_INTERNNAV_NATIVE,
+                "policy_fingerprint": str(expected_policy_fingerprint),
+                "native_protocol": NATIVE_INTERNNAV_CAPABILITY,
+            }
+        )
+        rpc_method = NATIVE_INTERNNAV_RPC_METHOD
+    else:
+        rpc_method = "plan_panoramic"
+    result = client.infer_json(rpc_method, payload, blobs)
     if result is None:
         raise RuntimeError("RPC model server returned no response")
     response, _response_blobs = result
@@ -3308,7 +3564,164 @@ def _rpc_plan_panoramic(
             f"server={response.get('proto_v')!r} "
             f"expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
         )
+    requested_phase = str(phase)
+    if response.get("phase") != requested_phase:
+        raise RuntimeError(
+            "RPC response phase mismatch: "
+            f"request={requested_phase!r} response={response.get('phase')!r}"
+        )
+    response_kind = str(response.get("kind") or "")
+    allowed_kinds = {
+        "system2": {"pano_goal", "stop", "turn", "fallback_stop"},
+        "front_system1": {"trajectory", "fallback_stop"},
+    }
+    if requested_phase in allowed_kinds and response_kind not in allowed_kinds[requested_phase]:
+        raise RuntimeError(
+            "RPC response kind is invalid for phase: "
+            f"phase={requested_phase!r} kind={response_kind!r}"
+        )
+    if rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE:
+        native_expected = {
+            "policy_backend": RPC_POLICY_INTERNNAV_NATIVE,
+            "policy_fingerprint": str(expected_policy_fingerprint),
+            "native_protocol": NATIVE_INTERNNAV_CAPABILITY,
+            "native_front_only": True,
+            "native_checkpoint_only": True,
+            "system2_source": "internnav_native",
+            "system1_source": "internnav_native_nextdit_async",
+            "oracle_system2": None,
+            "pano_goal_view": "front",
+        }
+        native_mismatches = {
+            key: {"expected": expected, "actual": response.get(key)}
+            for key, expected in native_expected.items()
+            if response.get(key) != expected
+        }
+        if native_mismatches:
+            raise RuntimeError(
+                f"Native InternNav response provenance mismatch: {native_mismatches}"
+            )
+        if response_kind not in {
+            "trajectory",
+            "stop",
+            "native_actions",
+            "fallback_stop",
+        }:
+            raise RuntimeError(
+                f"Invalid native InternNav response kind: {response_kind!r}"
+            )
+        lookdown_turns = response.get("native_lookdown_turns")
+        if (
+            isinstance(lookdown_turns, bool)
+            or not isinstance(lookdown_turns, int)
+            or lookdown_turns not in (0, 1)
+        ):
+            raise RuntimeError(
+                f"Invalid native InternNav lookdown-turn count: {lookdown_turns!r}"
+            )
+        if response_kind == "trajectory":
+            native_actions = response.get("actions")
+            if (
+                not isinstance(native_actions, list)
+                or not native_actions
+                or any(
+                    isinstance(action, bool)
+                    or not isinstance(action, int)
+                    or action not in (0, 1, 2, 3)
+                    for action in native_actions
+                )
+            ):
+                raise RuntimeError(
+                    f"Invalid native InternNav System1 action chunk: {native_actions!r}"
+                )
+            trajectory_expected = {
+                "trajectory_x_sign": 1.0,
+                "trajectory_heading_alignment": "none",
+            }
+            trajectory_mismatches = {
+                key: {"expected": expected, "actual": response.get(key)}
+                for key, expected in trajectory_expected.items()
+                if response.get(key) != expected
+            }
+            if trajectory_mismatches or not response.get("trajectory_summary"):
+                raise RuntimeError(
+                    "Native InternNav System1 provenance mismatch: "
+                    f"fields={trajectory_mismatches} "
+                    f"summary={response.get('trajectory_summary')!r}"
+                )
+    if requested_phase == "front_system1":
+        expected_pixel = (
+            [int(pixel_goal[0]), int(pixel_goal[1])]
+            if isinstance(pixel_goal, (list, tuple)) and len(pixel_goal) >= 2
+            else None
+        )
+        actual_pixel = response.get("pixel_goal")
+        if expected_pixel is None or actual_pixel != expected_pixel:
+            raise RuntimeError(
+                "front_system1 pixel echo mismatch: "
+                f"request={expected_pixel!r} response={actual_pixel!r}"
+            )
+        if response.get("pano_goal_view") != "front":
+            raise RuntimeError(
+                "front_system1 must return pano_goal_view='front', got "
+                f"{response.get('pano_goal_view')!r}"
+            )
+        if (
+            response_kind == "trajectory"
+            and response.get("trajectory_heading_alignment") != "none"
+        ):
+            raise RuntimeError(
+                "front_system1 trajectory must disable second heading alignment, got "
+                f"{response.get('trajectory_heading_alignment')!r}"
+            )
+    response_sampling = validate_rpc_sampling_metadata(
+        response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+        require_deterministic=True,
+    )
+    if response_sampling != sampling_metadata:
+        raise RuntimeError(
+            "RPC server did not echo the exact deterministic sampling record: "
+            f"request={sampling_metadata!r} response={response_sampling!r}"
+        )
     return response
+
+
+def _stage0_action_trace_entry(
+    response: dict[str, Any],
+    *,
+    system2_call_index: int,
+    phase: str,
+) -> dict[str, Any] | None:
+    """Keep the exact cross-arm evidence needed by the Stage-0 hard gate."""
+
+    arm = response.get("ppa_stage0_action_arm")
+    if arm not in {"baseline", "treatment"}:
+        return None
+    spec = response.get("treatment_spec")
+    if spec is not None and not isinstance(spec, dict):
+        raise RuntimeError("PPA Stage-0 response has invalid TreatmentSpec")
+    if response.get("kind") == "trajectory" and not isinstance(spec, dict):
+        raise RuntimeError("PPA Stage-0 trajectory response omitted TreatmentSpec")
+    sampling = response.get(HEATMAPVLN_RPC_SAMPLING_FIELD)
+    if not isinstance(sampling, dict):
+        raise RuntimeError("PPA Stage-0 response omitted deterministic sampling")
+    return {
+        "schema": "heatmapvln-ppa-stage0-call-trace-v1",
+        "arm": str(arm),
+        "phase": str(phase),
+        "system2_call_index": int(system2_call_index),
+        "sampling": dict(sampling),
+        "kind": str(response.get("kind", "")),
+        "llm_output": str(response.get("llm_output", "")),
+        "pixel_goal": response.get("pixel_goal"),
+        "pano_goal_view": response.get("pano_goal_view"),
+        "actions": [int(action) for action in response.get("actions", [])],
+        "anti_deadlock": bool(response.get("anti_deadlock", False)),
+        "bridge_memory_source": str(
+            response.get("ppa_stage0_bridge_memory_source", "")
+        ),
+        "treatment_spec": dict(spec) if isinstance(spec, dict) else None,
+    }
 
 
 def run_eval_rpc_panoramic(args):
@@ -3319,23 +3732,79 @@ def run_eval_rpc_panoramic(args):
     ensure_vln_measures_registered()
     with open(args.config) as f:
         train_cfg = yaml.safe_load(f)
-    panoramic_vlm_input = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
+    panoramic_vlm_input = bool(train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False))
+    ppa_stage0_config = bool(
+        train_cfg.get("model", {}).get("past_plan_action", {}).get("enabled", False)
     )
-    if not panoramic_vlm_input:
+    if not panoramic_vlm_input and not ppa_stage0_config:
         raise RuntimeError("--rpc_server currently supports panoramic_vlm_input configs only")
+    if ppa_stage0_config and not panoramic_vlm_input:
+        print(
+            "[rpc-eval] PPA Stage-0 uses the native InternNav independent-front "
+            "System2 protocol; allowing panoramic_vlm_input=false for this "
+            "exact-zero action gate.",
+            flush=True,
+        )
 
     vlm_image_size, traj_image_size = _eval_image_sizes(train_cfg)
     image_size = vlm_image_size
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
     system1_coord_order = _system1_coord_order(args, panoramic_internnav_protocol=False)
+    rpc_policy_mode = str(args.rpc_policy_mode)
+    native_internnav_rpc = rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE
+    trajectory_cfg = train_cfg.get("data", {}).get("trajectory", {})
+    rpc_internnav_two_turn = (
+        str(trajectory_cfg.get("system2_sft_protocol", "direct")).lower()
+        == "internnav"
+        and not bool(trajectory_cfg.get("structured_pano_output", True))
+    )
+    rpc_policy_fingerprint = str(args.rpc_policy_fingerprint).strip()
+
+    if native_internnav_rpc:
+        native_options = {
+            "vlm_image_size": (vlm_image_size, (384, 384)),
+            "traj_image_size": (traj_image_size, (224, 224)),
+            "num_history<=8": (num_history <= 8, True),
+            "system1_coord_order": (system1_coord_order, "generated"),
+            "trajectory_selection": (args.trajectory_selection, "mean"),
+            "trajectory_x_sign": (float(args.trajectory_x_sign), 1.0),
+            "trajectory_heading_alignment": (
+                args.trajectory_heading_alignment,
+                "none",
+            ),
+            "pano_recenter_before_system1": (
+                bool(args.pano_recenter_before_system1),
+                False,
+            ),
+            "oracle_system2": (bool(args.oracle_system2), False),
+        }
+        native_mismatches = {
+            key: {"expected": expected, "actual": actual}
+            for key, (actual, expected) in native_options.items()
+            if actual != expected
+        }
+        if native_mismatches:
+            raise ValueError(
+                f"Native InternNav RPC option mismatch: {native_mismatches}"
+            )
+        if not rpc_policy_fingerprint:
+            raise ValueError(
+                "--rpc_policy_fingerprint is required for native InternNav RPC"
+            )
 
     print(f"Using RPC model server: {args.rpc_server}")
+    print(f"rpc_policy_mode={rpc_policy_mode}")
     print(f"vlm_image_size={vlm_image_size}, traj_image_size={traj_image_size}")
     print(f"trajectory_selection={args.trajectory_selection}")
     print(f"trajectory_x_sign={args.trajectory_x_sign:g}")
     print(f"trajectory_heading_alignment={args.trajectory_heading_alignment}")
+    print(
+        "rpc_sampling="
+        f"{HEATMAPVLN_RPC_SAMPLING_PROTOCOL} "
+        f"protocol_seed={args.rpc_protocol_seed} "
+        f"required={bool(args.rpc_require_deterministic_sampling)}"
+    )
     if bool(getattr(args, "oracle_system2", False)):
         print(
             "[rpc-eval] --oracle_system2 is ACTIVE; System2 text will be "
@@ -3356,28 +3825,219 @@ def run_eval_rpc_panoramic(args):
         print(f"RPC server: version={info.version}, model={info.model_version}")
         if info.version != HEATMAPVLN_RPC_PROTOCOL_VERSION:
             raise RuntimeError(
-                "RPC server protocol mismatch: "
-                f"server={info.version!r} expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
+                f"RPC server protocol mismatch: server={info.version!r} expected={HEATMAPVLN_RPC_PROTOCOL_VERSION!r}"
             )
+        if native_internnav_rpc:
+            expected_model_version = f"internnav-native-r2r:{rpc_policy_fingerprint}"
+            if info.model_version != expected_model_version:
+                raise RuntimeError(
+                    "Native InternNav RPC model fingerprint mismatch: "
+                    f"server={info.model_version!r} "
+                    f"expected={expected_model_version!r}"
+                )
+            if NATIVE_INTERNNAV_CAPABILITY not in set(info.supported_formats):
+                raise RuntimeError(
+                    "Native InternNav RPC capability is missing: "
+                    f"{NATIVE_INTERNNAV_CAPABILITY!r}; "
+                    f"server formats={sorted(set(info.supported_formats))!r}"
+                )
+        if bool(args.pano_recenter_before_system1):
+            supported_formats = set(info.supported_formats)
+            if HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1 not in supported_formats:
+                raise RuntimeError(
+                    "RPC server lacks required two-phase recenter capability: "
+                    f"{HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1!r}; "
+                    f"server formats={sorted(supported_formats)!r}"
+                )
+    elif native_internnav_rpc:
+        raise RuntimeError(
+            "Native InternNav RPC server did not return auditable ServerInfo"
+        )
+    elif bool(args.pano_recenter_before_system1):
+        raise RuntimeError(
+            "RPC server did not return ServerInfo; two-phase recenter capability "
+            "cannot be verified"
+        )
 
     hab_cfg = build_habitat_config(args)
+    habitat_turn_angle_deg = float(hab_cfg.SIMULATOR.TURN_ANGLE)
+    print(
+        "pano_recenter_before_system1="
+        f"{bool(args.pano_recenter_before_system1)} "
+        f"habitat_turn_angle_deg={habitat_turn_angle_deg:g}"
+    )
     print("Creating Habitat environment ...")
-    env = habitat.Env(config=hab_cfg)
+    env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
+    dagger_api = None
+    dagger_state = None
+    dagger_collector = None
+    dagger_backend = None
+    dagger_oracle_config = None
+    if bool(getattr(args, "collect_trajectory_dagger", False)):
+        import scripts.evaluation.trajectory_dagger as dagger_api
+
+        trajectory_cfg = train_cfg.get("data", {}).get("trajectory", {})
+        predict_horizon = int(trajectory_cfg.get("predict_horizon", 32))
+        action_scale = float(trajectory_cfg.get("action_scale", 4.0))
+        if predict_horizon != 32:
+            raise ValueError(f"DAgger schema requires predict_horizon=32, got {predict_horizon}")
+        hard_capacity_bytes = int(round(float(args.trajectory_dagger_max_gb) * 1_000_000_000))
+        commit_ceiling_bytes = hard_capacity_bytes - 5_000_000_000
+        dagger_thresholds = dagger_api.CandidateThresholds(
+            hard_offpath_m=float(args.trajectory_dagger_hard_offpath_m),
+            normal_offpath_m=min(0.5, 0.5 * float(args.trajectory_dagger_hard_offpath_m)),
+        )
+        contract = {
+            "schema": "heatmapvln-trajectory-dagger-contract-v3",
+            "dataset_split": str(args.dataset_split),
+            "data_path": str(args.data_path),
+            "data_sha256": dagger_api.sha256_file(args.data_path),
+            "episode_cohort": {
+                "path": str(Path(args.episode_list).resolve()) if args.episode_list else None,
+                "sha256": dagger_api.sha256_file(args.episode_list) if args.episode_list else None,
+                "max_episodes": int(args.max_episodes) if args.max_episodes is not None else None,
+            },
+            "scenes_dir": str(args.scenes_dir),
+            "config_path": str(Path(args.config).resolve()),
+            "config_sha256": dagger_api.sha256_file(args.config),
+            "collector_code_sha256": dagger_api.sha256_file(dagger_api.__file__),
+            "evaluator_code_sha256": dagger_api.sha256_file(__file__),
+            "policy_fingerprint": str(args.trajectory_dagger_policy_fingerprint),
+            "rpc_policy_mode": rpc_policy_mode,
+            "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+            "native_protocol": (
+                NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+            ),
+            "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+            "rpc_protocol_seed": int(args.rpc_protocol_seed),
+            "rpc_model_version": getattr(info, "model_version", None),
+            "round_id": int(args.trajectory_dagger_round),
+            "rollout": {
+                "max_steps_per_episode": int(max_steps_per_episode),
+                "max_system2_calls_per_episode": int(args.max_system2_calls_per_episode),
+                "action_chunk_execution": (
+                    "internnav_native_traj_to_actions_max4_v1"
+                    if native_internnav_rpc
+                    else "native_discrete_sequence_v1"
+                ),
+            },
+            "observation": {
+                "view_order": list(dagger_api.VIEW_NAMES),
+                "vlm_image_size": list(vlm_image_size),
+                "lookdown_image_size": list(
+                    NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                    if native_internnav_rpc
+                    else traj_image_size
+                ),
+                "system1_lookdown_image_size": list(traj_image_size),
+                "jpeg_quality": int(args.trajectory_dagger_jpeg_quality),
+                "num_history": int(num_history),
+                "history_sampler": "endpoint_linspace_unique_v1",
+            },
+            "target": {
+                "predict_horizon": predict_horizon,
+                "action_scale": action_scale,
+                "camera_forward_axis": "-z",
+            },
+            "oracle": {
+                "algorithm": "monotonic_xyz_route_shadow_follower_v2",
+                "max_actions": int(args.trajectory_dagger_max_oracle_actions),
+                "goal_radius_m": 0.25,
+                "hard_offpath_m": float(args.trajectory_dagger_hard_offpath_m),
+            },
+            "candidate_classifier": {
+                "algorithm": "same_primitive_prefix_route_geometry_heading_v3",
+                "hard_offpath_m": dagger_thresholds.hard_offpath_m,
+                "normal_offpath_m": dagger_thresholds.normal_offpath_m,
+                "hard_disagreement_m": dagger_thresholds.hard_disagreement_m,
+                "normal_disagreement_m": dagger_thresholds.normal_disagreement_m,
+                "history_overlap_threshold": dagger_thresholds.history_overlap_threshold,
+                "oracle_nonoverlap_threshold": dagger_thresholds.oracle_nonoverlap_threshold,
+                "history_radius_m": dagger_thresholds.history_radius_m,
+                "wrong_branch_progress_regression_m": (
+                    dagger_thresholds.wrong_branch_progress_regression_m
+                ),
+                "wrong_branch_offpath_growth_m": (
+                    dagger_thresholds.wrong_branch_offpath_growth_m
+                ),
+                "turn_only_translation_m": dagger_thresholds.turn_only_translation_m,
+                "normal_heading_disagreement_deg": (
+                    dagger_thresholds.normal_heading_disagreement_deg
+                ),
+                "hard_heading_disagreement_deg": (
+                    dagger_thresholds.hard_heading_disagreement_deg
+                ),
+            },
+            "candidate_quotas": {
+                "normal_per_episode": int(args.trajectory_dagger_normal_quota),
+                "hard_per_episode": int(args.trajectory_dagger_hard_quota),
+                "min_history": int(args.trajectory_dagger_min_history),
+            },
+            "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+        }
+        dagger_state = dagger_api.prepare_collection(
+            args.trajectory_dagger_root,
+            contract,
+            resume=bool(args.resume),
+            hard_capacity_bytes=hard_capacity_bytes,
+            commit_ceiling_bytes=commit_ceiling_bytes,
+            verify_commits=False,
+        )
+        dagger_collector = dagger_api.TrajectoryDaggerCollector(
+            dagger_api.EpisodeTarRecorder(dagger_state),
+            max_normal_per_episode=int(args.trajectory_dagger_normal_quota),
+            max_hard_per_episode=int(args.trajectory_dagger_hard_quota),
+            thresholds=dagger_thresholds,
+        )
+        dagger_backend = dagger_api.HabitatShadowBackend(
+            env._sim,
+            goal_radius=0.25,
+        )
+        dagger_oracle_config = dagger_api.OracleRelabelConfig(
+            predict_horizon=predict_horizon,
+            action_scale=action_scale,
+            max_actions=int(args.trajectory_dagger_max_oracle_actions),
+            camera_forward_axis="-z",
+        )
+        print(
+            "[trajectory-dagger] ready "
+            f"root={dagger_state.root} committed={len(dagger_state.committed_episode_keys)} "
+            f"capacity={hard_capacity_bytes} ceiling={commit_ceiling_bytes}",
+            flush=True,
+        )
+
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
-    sucs, spls, oss, nes, done_set = _load_progress(progress_file)
     target_list, target_set = _episode_list_from_args(args)
+    rpc_progress_contract = {
+        **build_rpc_progress_sampling_contract(
+            protocol_seed=int(args.rpc_protocol_seed),
+            require_deterministic_sampling=bool(args.rpc_require_deterministic_sampling),
+        ),
+        "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+        "rpc_policy_mode": rpc_policy_mode,
+        "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+        "native_protocol": (
+            NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+        ),
+        "habitat_turn_angle_deg": habitat_turn_angle_deg,
+    }
+    sucs, spls, oss, nes, done_set = _load_progress(
+        progress_file,
+        expected_rpc_sampling_contract=rpc_progress_contract,
+    )
+    if target_set is not None and not done_set.issubset(target_set):
+        unexpected = sorted(done_set - target_set)
+        raise ValueError(f"RPC progress contains episodes outside the requested fixed cohort: {unexpected[:10]}")
     if target_list is not None:
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
-    print(
-        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
-        f"this run: {eval_limit}"
-    )
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
 
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
@@ -3406,23 +4066,67 @@ def run_eval_rpc_panoramic(args):
 
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
-        print(
-            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
-            f"{instruction[:80]}..."
-        )
+        print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
+
+        dagger_episode_key = None
+        dagger_episode_active = False
+        dagger_route_tracker = None
+        dagger_observation_cache: dict[int, Any] = {}
+        dagger_episode_commit = None
+        dagger_candidate_counts = {"dagger_normal": 0, "dagger_hard": 0, "discard": 0}
+        dagger_candidate_diagnostics: list[dict[str, Any]] = []
+        if dagger_collector is not None:
+            dagger_episode_key = (
+                f"round{int(args.trajectory_dagger_round):02d}_{scene_id}_{episode_id:06d}"
+            )
+            dagger_episode_active = dagger_episode_key not in dagger_state.committed_episode_keys
+            if dagger_episode_active:
+                dagger_goal = np.asarray(episode.goals[0].position, dtype=np.float32)
+                dagger_reference_path = _episode_reference_path(episode) or [dagger_goal.tolist()]
+                dagger_route_tracker = dagger_api.MonotonicRouteTracker(dagger_reference_path)
+                dagger_start_camera_pose = get_agent_cam2world(env, require_rgb_sensor=True)
+                dagger_start_agent_pose = get_agent_body_pose(env)
+                dagger_route_tracker.observe(dagger_start_agent_pose[:3, 3])
+                dagger_collector.begin_episode(
+                    dagger_episode_key,
+                    {
+                        "dataset_split": str(args.dataset_split),
+                        "round_id": int(args.trajectory_dagger_round),
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "instruction": instruction,
+                        "reference_path": dagger_reference_path,
+                        "goal_position": dagger_goal,
+                        "start_pose": dagger_start_camera_pose,
+                        "start_agent_pose": dagger_start_agent_pose,
+                    },
+                )
+            else:
+                print(
+                    f"  [trajectory-dagger] already committed: {dagger_episode_key}",
+                    flush=True,
+                )
 
         executed_history_panoramas: list[dict[str, Image.Image]] = []
+        executed_history_poses: list[np.ndarray] = []
+        executed_history_steps: list[int] = []
+        executed_history_call_indices: list[int] = []
         local_actions: list[int] = []
         forward_action_count = 0
         system2_calls = 0
         trajectory_calls = 0
+        stage0_action_trace: list[dict[str, Any]] = []
+        recenter_calls = 0
+        recenter_actions_executed = 0
         step_id = 0
         done = False
 
         step_recorder: TrajectoryStepRecorder | None = None
         if args.save_trajectory_steps:
             step_recorder = TrajectoryStepRecorder(
-                Path(output_path), scene_id, episode_id,
+                Path(output_path),
+                scene_id,
+                episode_id,
             )
             init_state = env._sim.get_agent(0).get_state()
             init_pos = np.array(init_state.position, dtype=float)
@@ -3456,6 +4160,13 @@ def run_eval_rpc_panoramic(args):
             if local_actions:
                 current_views = capture_panoramic_views(env, image_size=image_size)
                 executed_history_panoramas.append(current_views)
+                executed_history_poses.append(
+                    get_agent_cam2world(
+                        env, require_rgb_sensor=dagger_collector is not None
+                    )
+                )
+                executed_history_steps.append(step_id)
+                executed_history_call_indices.append(max(system2_calls - 1, -1))
                 action = int(local_actions.pop(0))
                 forward_action_count += 1
                 if forward_action_count > MAX_STEPS:
@@ -3471,8 +4182,7 @@ def run_eval_rpc_panoramic(args):
                 observations, done = _apply_habitat_action(env, action)
                 if before is not None:
                     print(
-                        f"  [debug] executed local action={int(action)} "
-                        f"{before} -> {_env_trace_summary(env)}",
+                        f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
                         flush=True,
                     )
                 step_id += 1
@@ -3505,7 +4215,8 @@ def run_eval_rpc_panoramic(args):
                 continue
 
             current_views = capture_panoramic_views(env, image_size=image_size)
-            prompt_history = _sample_history_panoramas(executed_history_panoramas, num_history)
+            prompt_history_indices = _sample_history_indices(len(executed_history_panoramas), num_history)
+            prompt_history = [executed_history_panoramas[i] for i in prompt_history_indices]
             if _debug_input_trace_enabled(args):
                 print(
                     "  [debug] RPC System2 input: "
@@ -3514,8 +4225,22 @@ def run_eval_rpc_panoramic(args):
                     f"{_views_trace_summary(current_views)}",
                     flush=True,
                 )
-            lookdown_img = capture_lookdown_view(env, image_size=traj_image_size)
+            lookdown_img = capture_lookdown_view(
+                env,
+                image_size=(
+                    NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                    if native_internnav_rpc
+                    else (vlm_image_size if rpc_internnav_two_turn else traj_image_size)
+                ),
+            )
             executed_history_panoramas.append(current_views)
+            executed_history_poses.append(
+                get_agent_cam2world(
+                    env, require_rgb_sensor=dagger_collector is not None
+                )
+            )
+            executed_history_steps.append(step_id)
+            executed_history_call_indices.append(system2_calls)
             system2_calls += 1
             oracle_system2 = None
             if bool(getattr(args, "oracle_system2", False)):
@@ -3529,9 +4254,7 @@ def run_eval_rpc_panoramic(args):
                     max_side_dist_m=float(getattr(args, "oracle_system2_max_side_dist_m", 6.0)),
                 )
                 if oracle_system2 is None:
-                    raise RuntimeError(
-                        f"Could not build oracle System2 for {scene_id}_{episode_id:04d}"
-                    )
+                    raise RuntimeError(f"Could not build oracle System2 for {scene_id}_{episode_id:04d}")
                 print(
                     "  [oracle-system2] "
                     f"{oracle_system2['text'].replace(chr(10), ' | ')} "
@@ -3553,20 +4276,35 @@ def run_eval_rpc_panoramic(args):
                 trajectory_x_sign=args.trajectory_x_sign,
                 trajectory_heading_alignment=args.trajectory_heading_alignment,
                 jpeg_quality=args.rpc_jpeg_quality,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                # Explicitly zero-based and independent of any calls made by
+                # the other experimental arm.
+                system2_call_index=system2_calls - 1,
+                protocol_seed=args.rpc_protocol_seed,
+                require_deterministic_sampling=args.rpc_require_deterministic_sampling,
+                rpc_policy_mode=rpc_policy_mode,
+                expected_policy_fingerprint=rpc_policy_fingerprint,
+                phase="system2" if args.pano_recenter_before_system1 else "joint",
                 oracle_system2=oracle_system2,
             )
+            stage0_entry = _stage0_action_trace_entry(
+                response,
+                system2_call_index=system2_calls - 1,
+                phase="system2" if args.pano_recenter_before_system1 else "joint",
+            )
+            if stage0_entry is not None:
+                stage0_action_trace.append(stage0_entry)
             llm_output = response.get("llm_output", "")
             actions = [int(action) for action in response.get("actions", [])]
             print(
-                f"  step_id: {step_id}, RPC kind={response.get('kind')}, "
-                f"VLM output: {llm_output}",
+                f"  step_id: {step_id}, RPC kind={response.get('kind')}, VLM output: {llm_output}",
                 flush=True,
             )
             if response.get("trajectory_summary"):
                 trajectory_calls += 1
                 print(
-                    f"  [debug] trajectory {response['trajectory_summary']}, "
-                    f"actions={actions}",
+                    f"  [debug] trajectory {response['trajectory_summary']}, actions={actions}",
                     flush=True,
                 )
             elif actions:
@@ -3576,19 +4314,342 @@ def run_eval_rpc_panoramic(args):
                 state = env._sim.get_agent(0).get_state()
                 pos = np.array(state.position, dtype=float)
                 rot = quaternion.as_float_array(state.rotation)
-                step_recorder.record_step({
-                    "step_id": step_id,
-                    "phase": "rpc_vlm",
-                    "position": pos,
-                    "heading_deg": _quat_to_heading_deg(rot),
-                    "rotation": rot,
-                    "distance_to_goal": _metric_distance_to_goal(env),
-                    "vlm_output": llm_output,
-                    "pixel_goal": response.get("pixel_goal"),
-                    "pano_goal_view": response.get("pano_goal_view"),
-                    "oracle_system2": response.get("oracle_system2"),
-                    "current_views": current_views,
-                })
+                step_recorder.record_step(
+                    {
+                        "step_id": step_id,
+                        "phase": "rpc_vlm",
+                        "position": pos,
+                        "heading_deg": _quat_to_heading_deg(rot),
+                        "rotation": rot,
+                        "distance_to_goal": _metric_distance_to_goal(env),
+                        "vlm_output": llm_output,
+                        "pixel_goal": response.get("pixel_goal"),
+                        "pano_goal_view": response.get("pano_goal_view"),
+                        "oracle_system2": response.get("oracle_system2"),
+                        HEATMAPVLN_RPC_SAMPLING_FIELD: response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+                        "current_views": current_views,
+                    }
+                )
+
+            if args.pano_recenter_before_system1 and response.get("kind") == "pano_goal":
+                selected_view = str(response.get("pano_goal_view") or "front").lower()
+                selected_pixel = response.get("pixel_goal")
+                if not isinstance(selected_pixel, list) or len(selected_pixel) < 2:
+                    raise RuntimeError(f"System2 pano_goal response has invalid pixel_goal: {response}")
+                turn_direction, turn_count = pano_recenter_turn(
+                    selected_view,
+                    turn_angle_deg=habitat_turn_angle_deg,
+                )
+                turn_action = (
+                    ActionCode.LEFT if turn_direction == "left" else ActionCode.RIGHT
+                )
+                alignment_actions = [] if turn_direction is None else [int(turn_action)] * turn_count
+                recenter_calls += int(bool(alignment_actions))
+                print(
+                    "  [pano-recenter] "
+                    f"selected_view={selected_view} pixel={selected_pixel[:2]} "
+                    f"direction={turn_direction or 'none'} turns={turn_count}",
+                    flush=True,
+                )
+
+                for alignment_action in alignment_actions:
+                    if done or step_id >= max_steps_per_episode:
+                        break
+                    before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
+                    observations, done = _apply_habitat_action(env, alignment_action)
+                    step_id += 1
+                    recenter_actions_executed += 1
+                    if before is not None:
+                        print(
+                            f"  [debug] pano recenter action={alignment_action} "
+                            f"{before} -> {_env_trace_summary(env)}",
+                            flush=True,
+                        )
+                    _record_post_action_step(
+                        step_recorder,
+                        env,
+                        step_id=step_id,
+                        phase="pano_recenter",
+                        action=int(alignment_action),
+                        image_size=image_size,
+                        vlm_output=llm_output,
+                    )
+
+                if done or step_id >= max_steps_per_episode:
+                    continue
+
+                if alignment_actions:
+                    current_views = capture_panoramic_views(env, image_size=image_size)
+                    lookdown_img = capture_lookdown_view(
+                        env,
+                        image_size=(
+                            NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                            if native_internnav_rpc
+                            else (
+                                vlm_image_size
+                                if rpc_internnav_two_turn
+                                else traj_image_size
+                            )
+                        ),
+                    )
+                    # Record only the completed cardinal turn. Intermediate 15°
+                    # frames must not evict semantic history panoramas.
+                    executed_history_panoramas.append(current_views)
+                    executed_history_poses.append(
+                        get_agent_cam2world(
+                            env, require_rgb_sensor=dagger_collector is not None
+                        )
+                    )
+                    executed_history_steps.append(step_id)
+                    executed_history_call_indices.append(system2_calls - 1)
+                response = _rpc_plan_panoramic(
+                    client,
+                    instruction=instruction,
+                    current_views=current_views,
+                    # A physical in-place turn changes heading, not location.
+                    # Reuse exactly the phase-1 history so side/back requests
+                    # do not receive an extra same-location pre-turn pano that
+                    # front requests never see.
+                    history_panoramas=prompt_history,
+                    lookdown_img=lookdown_img,
+                    vlm_image_size=vlm_image_size,
+                    traj_image_size=traj_image_size,
+                    system1_coord_order=system1_coord_order,
+                    trajectory_selection=args.trajectory_selection,
+                    trajectory_x_sign=args.trajectory_x_sign,
+                    trajectory_heading_alignment="none",
+                    jpeg_quality=args.rpc_jpeg_quality,
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    system2_call_index=system2_calls - 1,
+                    protocol_seed=args.rpc_protocol_seed,
+                    require_deterministic_sampling=args.rpc_require_deterministic_sampling,
+                    rpc_policy_mode=rpc_policy_mode,
+                    expected_policy_fingerprint=rpc_policy_fingerprint,
+                    phase="front_system1",
+                    pixel_goal=[int(selected_pixel[0]), int(selected_pixel[1])],
+                )
+                stage0_entry = _stage0_action_trace_entry(
+                    response,
+                    system2_call_index=system2_calls - 1,
+                    phase="front_system1",
+                )
+                if stage0_entry is not None:
+                    stage0_action_trace.append(stage0_entry)
+                llm_output = response.get("llm_output", "")
+                actions = [int(action) for action in response.get("actions", [])]
+                print(
+                    f"  step_id: {step_id}, RPC phase=front_system1 "
+                    f"kind={response.get('kind')}, condition={llm_output}",
+                    flush=True,
+                )
+                if response.get("trajectory_summary"):
+                    trajectory_calls += 1
+                    print(
+                        f"  [debug] trajectory {response['trajectory_summary']}, actions={actions}",
+                        flush=True,
+                    )
+                if step_recorder is not None:
+                    state = env._sim.get_agent(0).get_state()
+                    pos = np.array(state.position, dtype=float)
+                    rot = quaternion.as_float_array(state.rotation)
+                    step_recorder.record_step(
+                        {
+                            "step_id": step_id,
+                            "phase": "rpc_front_system1",
+                            "position": pos,
+                            "heading_deg": _quat_to_heading_deg(rot),
+                            "rotation": rot,
+                            "distance_to_goal": _metric_distance_to_goal(env),
+                            "vlm_output": llm_output,
+                            "pixel_goal": response.get("pixel_goal"),
+                            "pano_goal_view": response.get("pano_goal_view"),
+                            HEATMAPVLN_RPC_SAMPLING_FIELD: response.get(
+                                HEATMAPVLN_RPC_SAMPLING_FIELD
+                            ),
+                            "current_views": current_views,
+                        }
+                    )
+
+            if (
+                dagger_episode_active
+                and response.get("kind") == "trajectory"
+                and dagger_route_tracker is not None
+            ):
+                history_lengths = {
+                    len(executed_history_panoramas),
+                    len(executed_history_poses),
+                    len(executed_history_steps),
+                    len(executed_history_call_indices),
+                }
+                if len(history_lengths) != 1:
+                    raise RuntimeError(f"DAgger history buffers are misaligned: {history_lengths}")
+                current_frame_id = len(executed_history_panoramas) - 1
+                if current_frame_id < 0:
+                    raise RuntimeError("DAgger trajectory candidate has no current observation")
+                current_camera_pose = executed_history_poses[current_frame_id]
+                current_agent_pose = get_agent_body_pose(env)
+                route_observation = dagger_route_tracker.observe(current_agent_pose[:3, 3])
+                if len(prompt_history_indices) < int(args.trajectory_dagger_min_history):
+                    dagger_candidate_counts["discard"] += 1
+                else:
+                    native_actions = [int(action) for action in response.get("actions", [])]
+                    native_future_poses = dagger_backend.simulate_actions(
+                        native_actions,
+                        start_pose=current_agent_pose,
+                        max_actions=int(args.trajectory_dagger_max_oracle_actions),
+                    )
+                    oracle = dagger_api.relabel_with_shadow_oracle(
+                        dagger_backend,
+                        route_tracker=dagger_route_tracker,
+                        current_pose=current_agent_pose,
+                        route_progress_m=route_observation.progress_m,
+                        goal_position=np.asarray(episode.goals[0].position, dtype=np.float32),
+                        config=dagger_oracle_config,
+                    )
+                    history_pose_array = np.stack(
+                        [executed_history_poses[index] for index in prompt_history_indices]
+                    ).astype(np.float32)
+                    native_nonstop = [action for action in native_actions if action != int(ActionCode.STOP)]
+                    native_xz = native_future_poses[:, :3, 3][:, [0, 2]]
+                    native_travel_m = float(
+                        np.linalg.norm(np.diff(native_xz, axis=0), axis=1).sum()
+                    )
+                    collision_or_stuck = bool(
+                        int(ActionCode.FORWARD) in native_nonstop and native_travel_m < 0.05
+                    )
+                    native_turns = [
+                        action
+                        for action in native_nonstop
+                        if action in (int(ActionCode.LEFT), int(ActionCode.RIGHT))
+                    ]
+                    oscillation = bool(
+                        len(native_turns) >= 3
+                        and all(
+                            native_turns[index] != native_turns[index - 1]
+                            for index in range(1, len(native_turns))
+                        )
+                    )
+                    older_poses = executed_history_poses[:-5]
+                    loop_detected = False
+                    if older_poses and route_observation.progress_delta_m <= 0.25:
+                        older_xz = np.stack(older_poses)[:, :3, 3][:, [0, 2]]
+                        current_xz = current_agent_pose[:3, 3][[0, 2]]
+                        loop_detected = bool(
+                            float(np.linalg.norm(older_xz - current_xz, axis=1).min()) <= 0.35
+                        )
+                    signals = dagger_collector.build_signals(
+                        dagger_route_tracker,
+                        current_agent_pose,
+                        history_pose_array,
+                        native_future_poses,
+                        oracle,
+                        native_kind="trajectory",
+                        route_progress_delta_m=route_observation.progress_delta_m,
+                        loop_detected=loop_detected,
+                        oscillation_detected=oscillation,
+                        collision_or_stuck=collision_or_stuck,
+                    )
+
+                    def _encoded_dagger_observation(
+                        frame_id: int,
+                        *,
+                        current_lookdown: Image.Image | None = None,
+                    ):
+                        cached = dagger_observation_cache.get(frame_id)
+                        if cached is not None and (
+                            current_lookdown is None or cached.lookdown_jpeg is not None
+                        ):
+                            return cached
+                        encoded = dagger_api.encode_history_observation(
+                            frame_id=frame_id,
+                            pose=executed_history_poses[frame_id],
+                            views=executed_history_panoramas[frame_id],
+                            primitive_step=executed_history_steps[frame_id],
+                            system2_call_index=executed_history_call_indices[frame_id],
+                            lookdown_image=current_lookdown,
+                            jpeg_quality=int(args.trajectory_dagger_jpeg_quality),
+                        )
+                        dagger_observation_cache[frame_id] = encoded
+                        return encoded
+
+                    current_observation = _encoded_dagger_observation(
+                        current_frame_id,
+                        current_lookdown=lookdown_img,
+                    )
+                    history_observations = [
+                        _encoded_dagger_observation(index)
+                        for index in prompt_history_indices
+                    ]
+                    sample_key = (
+                        f"{dagger_episode_key}:call{system2_calls - 1:04d}:"
+                        f"step{step_id:04d}"
+                    )
+                    selection = dagger_collector.consider(
+                        sample_key=sample_key,
+                        current=current_observation,
+                        history=history_observations,
+                        instruction=instruction,
+                        native_response=response,
+                        oracle=oracle,
+                        signals=signals,
+                        metadata={
+                            "round_id": int(args.trajectory_dagger_round),
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "system2_call_index": system2_calls - 1,
+                            "primitive_step": step_id,
+                            "route_raw_progress_m": route_observation.raw_progress_m,
+                            "route_progress_m": route_observation.progress_m,
+                            "route_progress_delta_m": route_observation.progress_delta_m,
+                            "offpath_m": route_observation.offpath_m,
+                            "current_camera_pose": current_camera_pose,
+                            "current_agent_pose": current_agent_pose,
+                            "native_future_poses": native_future_poses,
+                            "native_travel_m": native_travel_m,
+                        },
+                    )
+                    dagger_candidate_counts[selection.bucket] = (
+                        dagger_candidate_counts.get(selection.bucket, 0) + 1
+                    )
+                    dagger_candidate_diagnostics.append(
+                        {
+                            "key": sample_key,
+                            "bucket": selection.bucket,
+                            "tags": list(selection.tags),
+                            "hardness_score": float(selection.hardness_score),
+                            "offpath_m": float(signals.offpath_m),
+                            "native_endpoint_offpath_m": float(
+                                signals.native_endpoint_offpath_m
+                            ),
+                            "native_route_progress_delta_m": float(
+                                signals.native_route_progress_delta_m
+                            ),
+                            "native_oracle_disagreement_m": float(
+                                signals.native_oracle_disagreement
+                            ),
+                            "native_oracle_heading_disagreement_deg": float(
+                                signals.native_oracle_heading_disagreement_deg
+                            ),
+                            "native_history_overlap": float(
+                                signals.native_history_overlap
+                            ),
+                            "oracle_history_overlap": float(
+                                signals.oracle_history_overlap
+                            ),
+                        }
+                    )
+                    print(
+                        "  [trajectory-dagger] "
+                        f"candidate={sample_key} bucket={selection.bucket} "
+                        f"tags={','.join(selection.tags) or '-'} "
+                        f"offpath={signals.offpath_m:.2f} "
+                        f"endpoint_offpath={signals.native_endpoint_offpath_m:.2f} "
+                        f"native_progress_delta={signals.native_route_progress_delta_m:.2f} "
+                        f"disagreement={signals.native_oracle_disagreement:.2f} "
+                        f"heading={signals.native_oracle_heading_disagreement_deg:.1f}",
+                        flush=True,
+                    )
 
             if response.get("terminal", False):
                 action = actions[0] if actions else ActionCode.STOP
@@ -3629,8 +4690,7 @@ def run_eval_rpc_panoramic(args):
             observations, done = _apply_habitat_action(env, first_action)
             if before is not None:
                 print(
-                    f"  [debug] executed first RPC action={int(first_action)} "
-                    f"{before} -> {_env_trace_summary(env)}",
+                    f"  [debug] executed first RPC action={int(first_action)} {before} -> {_env_trace_summary(env)}",
                     flush=True,
                 )
             step_id += 1
@@ -3644,6 +4704,24 @@ def run_eval_rpc_panoramic(args):
                 image_size=image_size,
                 vlm_output=llm_output,
             )
+
+        if dagger_episode_active:
+            dagger_episode_commit = dagger_collector.finalize_episode()
+            if dagger_episode_commit is None:
+                print(
+                    "  [trajectory-dagger] no retained sample "
+                    f"candidates={dagger_candidate_counts}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "  [trajectory-dagger] committed "
+                    f"tar={dagger_episode_commit.tar_path} "
+                    f"samples={dagger_episode_commit.sample_count} "
+                    f"frames={dagger_episode_commit.frame_count} "
+                    f"bytes={dagger_episode_commit.tar_bytes}",
+                    flush=True,
+                )
 
         metrics = env.get_metrics()
         sucs.append(metrics["success"])
@@ -3676,15 +4754,46 @@ def run_eval_rpc_panoramic(args):
             "episode_instruction": instruction,
             "vlm_calls": system2_calls,
             "trajectory_calls": trajectory_calls,
+            "recenter_calls": recenter_calls,
+            "recenter_actions_executed": recenter_actions_executed,
             "rpc_server": args.rpc_server,
+            "rpc_policy_mode": rpc_policy_mode,
+            "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+            "native_protocol": (
+                NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+            ),
+            "rpc_model_version": getattr(info, "model_version", None),
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+            "rpc_deterministic_sampling_enabled": True,
+            "rpc_protocol_seed": int(args.rpc_protocol_seed),
+            "rpc_require_deterministic_sampling": bool(args.rpc_require_deterministic_sampling),
+            "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+            "habitat_turn_angle_deg": habitat_turn_angle_deg,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
             "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+            "collect_trajectory_dagger": bool(dagger_collector is not None),
         }
+        if stage0_action_trace:
+            result["ppa_stage0_action_arm"] = stage0_action_trace[0]["arm"]
+            result["ppa_stage0_action_trace"] = stage0_action_trace
+        if dagger_collector is not None:
+            result["trajectory_dagger_episode_key"] = dagger_episode_key
+            result["trajectory_dagger_candidate_counts"] = dagger_candidate_counts
+            result["trajectory_dagger_candidate_diagnostics"] = dagger_candidate_diagnostics
+            result["trajectory_dagger_committed"] = dagger_episode_commit is not None
+            if dagger_episode_commit is not None:
+                result["trajectory_dagger_commit"] = {
+                    "tar_sha256": dagger_episode_commit.tar_sha256,
+                    "tar_bytes": dagger_episode_commit.tar_bytes,
+                    "sample_count": dagger_episode_commit.sample_count,
+                    "frame_count": dagger_episode_commit.frame_count,
+                }
+
         if bool(getattr(args, "oracle_system2", False)):
             result["oracle_system2_lookahead_m"] = float(args.oracle_system2_lookahead_m)
             result["oracle_system2_strategy"] = str(args.oracle_system2_strategy)
@@ -3700,7 +4809,19 @@ def run_eval_rpc_panoramic(args):
     final_result = aggregate_navigation_metrics(sucs, spls, oss, nes)
     final_result.update(
         {
+            "rpc_policy_mode": rpc_policy_mode,
+            "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+            "native_protocol": (
+                NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
+            ),
+            "rpc_model_version": getattr(info, "model_version", None),
             "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+            "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+            "rpc_deterministic_sampling_enabled": True,
+            "rpc_protocol_seed": int(args.rpc_protocol_seed),
+            "rpc_require_deterministic_sampling": bool(args.rpc_require_deterministic_sampling),
+            "pano_recenter_before_system1": bool(args.pano_recenter_before_system1),
+            "habitat_turn_angle_deg": habitat_turn_angle_deg,
             "auto_stop_distance": float(args.auto_stop_distance),
             "trajectory_selection": str(args.trajectory_selection),
             "trajectory_x_sign": float(args.trajectory_x_sign),
@@ -3728,6 +4849,7 @@ def run_eval_rpc_panoramic(args):
 # Section 9: Main evaluation loop
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def run_eval(args):
     if getattr(args, "rpc_server", ""):
         return run_eval_rpc_panoramic(args)
@@ -3742,38 +4864,25 @@ def run_eval(args):
     processor = model.qwen2_5_vl.processor
     processor.tokenizer.padding_side = "left"
 
-    action_scale = (
-        train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
-    )
-    num_sample_trajs = (
-        train_cfg.get("model", {})
-        .get("action_head", {})
-        .get("nextdit", {})
-        .get("num_sample_trajs", 32)
-    )
+    action_scale = train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
+    num_sample_trajs = train_cfg.get("model", {}).get("action_head", {}).get("nextdit", {}).get("num_sample_trajs", 32)
     has_nextdit = model.nextdit_action_head is not None and model.latent_queries is not None
     print(f"NextDiT action head available: {has_nextdit}")
     print(f"  action_scale={action_scale}, num_sample_trajs={num_sample_trajs}")
     print(f"  trajectory_selection={args.trajectory_selection}")
 
-    panoramic_vlm_input = bool(
-        train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False)
-    )
+    panoramic_vlm_input = bool(train_cfg.get("data", {}).get("trajectory", {}).get("panoramic_vlm_input", False))
     print(f"Panoramic VLM input: {panoramic_vlm_input}")
 
     pano_latent_adapter = None
     if getattr(args, "pano_latent_adapter_checkpoint", None):
-        hidden_dim = int(
-            train_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584)
-        )
-        print(
-            f"Loading pano-latent adapter from {args.pano_latent_adapter_checkpoint} "
-            f"(hidden_dim={hidden_dim})"
-        )
+        hidden_dim = int(train_cfg.get("model", {}).get("llm", {}).get("hidden_dim", 3584))
+        print(f"Loading pano-latent adapter from {args.pano_latent_adapter_checkpoint} (hidden_dim={hidden_dim})")
         pano_latent_adapter = _load_pano_latent_adapter(
             args.pano_latent_adapter_checkpoint,
             hidden_dim=hidden_dim,
             device=device,
+            dtype=model.config.dtype,
         )
     elif getattr(model, "pano_latent_adapter", None) is not None:
         pano_latent_adapter = model.pano_latent_adapter
@@ -3785,20 +4894,11 @@ def run_eval(args):
     force_teacher_device = None
     if bool(getattr(args, "force_teacher_coord", False)):
         if not getattr(args, "force_teacher_internnav_model_path", ""):
-            raise RuntimeError(
-                "--force_teacher_coord requires --force_teacher_internnav_model_path"
-            )
+            raise RuntimeError("--force_teacher_coord requires --force_teacher_internnav_model_path")
         if not getattr(args, "force_teacher_internnav_repo", ""):
-            raise RuntimeError(
-                "--force_teacher_coord requires --force_teacher_internnav_repo"
-            )
-        print(
-            f"Loading InternNav teacher VLM for --force_teacher_coord from "
-            f"{args.force_teacher_internnav_model_path}"
-        )
-        force_teacher_model, force_teacher_processor, force_teacher_device = (
-            _load_force_teacher_internnav(args, device)
-        )
+            raise RuntimeError("--force_teacher_coord requires --force_teacher_internnav_repo")
+        print(f"Loading InternNav teacher VLM for --force_teacher_coord from {args.force_teacher_internnav_model_path}")
+        force_teacher_model, force_teacher_processor, force_teacher_device = _load_force_teacher_internnav(args, device)
 
     if panoramic_vlm_input:
         return _run_eval_panoramic_vlm(
@@ -3818,7 +4918,7 @@ def run_eval(args):
 
     hab_cfg = build_habitat_config(args)
     print("Creating Habitat environment ...")
-    env = habitat.Env(config=hab_cfg)
+    env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
 
@@ -3837,10 +4937,7 @@ def run_eval(args):
         print(f"Fixed episode list ({len(target_list)}): {args.episode_list}")
     remaining = num_episodes - len(done_set)
     eval_limit = _eval_limit(args, remaining, target_list, done_set)
-    print(
-        f"Episodes already done: {len(done_set)}, remaining: {remaining}, "
-        f"this run: {eval_limit}"
-    )
+    print(f"Episodes already done: {len(done_set)}, remaining: {remaining}, this run: {eval_limit}")
 
     process_bar = tqdm.tqdm(total=eval_limit, desc="Evaluating", ncols=120)
     seen_episodes: set = set()
@@ -3873,10 +4970,7 @@ def run_eval(args):
 
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
-        print(
-            f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: "
-            f"{instruction[:80]}..."
-        )
+        print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
 
         # ── Per-episode state (InternNav dual-system logic) ──
         rgb_history: list[Image.Image] = []
@@ -3927,9 +5021,7 @@ def run_eval(args):
                 if action == ActionCode.LOOKDOWN:
                     sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
                     input_images += [lookdown_img]
-                    messages.append(
-                        {"role": "assistant", "content": [{"type": "text", "text": llm_output}]}
-                    )
+                    messages.append({"role": "assistant", "content": [{"type": "text", "text": llm_output}]})
                     input_img_id = -1
                 else:
                     sources = [
@@ -3942,13 +5034,9 @@ def run_eval(args):
                     if step_id == 0:
                         history_id = []
                     else:
-                        history_id = np.unique(
-                            np.linspace(0, step_id - 1, num_history, dtype=np.int32)
-                        ).tolist()
+                        history_id = np.unique(np.linspace(0, step_id - 1, num_history, dtype=np.int32)).tolist()
                         placeholder = (DEFAULT_IMAGE_TOKEN + "\n") * len(history_id)
-                        sources[0]["value"] += (
-                            f" These are your historical observations: {placeholder}."
-                        )
+                        sources[0]["value"] += f" These are your historical observations: {placeholder}."
 
                     history_id = sorted(history_id)
                     input_images = [rgb_history[i] for i in history_id] + cur_images
@@ -3994,7 +5082,7 @@ def run_eval(args):
                     ).sequences
 
                 llm_output = processor.tokenizer.decode(
-                    output_ids[0][inputs.input_ids.shape[1]:],
+                    output_ids[0][inputs.input_ids.shape[1] :],
                     skip_special_tokens=True,
                 )
                 print(f"  step_id: {step_id}, VLM output: {llm_output}")
@@ -4028,9 +5116,7 @@ def run_eval(args):
                         continue
 
                     lookdown_traj_img = (
-                        lookdown_img
-                        if lookdown_img.size == traj_image_size
-                        else lookdown_img.resize(traj_image_size)
+                        lookdown_img if lookdown_img.size == traj_image_size else lookdown_img.resize(traj_image_size)
                     )
                     lookdown_t = _lookdown_to_traj_tensor(lookdown_traj_img, device)
                     pix_goal_image = lookdown_t.clone()
@@ -4038,7 +5124,8 @@ def run_eval(args):
 
                     print("  [debug] calling generate_latents ...", flush=True)
                     lq = model.latent_queries.expand(1, -1, -1).to(
-                        device=device, dtype=model.config.dtype,
+                        device=device,
+                        dtype=model.config.dtype,
                     )
                     condition_output_ids = _condition_output_ids_for_pixel_goal(
                         output_ids=output_ids,
@@ -4059,8 +5146,7 @@ def run_eval(args):
                         )
                         if _debug_input_trace_enabled(args):
                             _per_q = [
-                                float(_last_traj_hs[0, i].float().norm().item())
-                                for i in range(_last_traj_hs.shape[1])
+                                float(_last_traj_hs[0, i].float().norm().item()) for i in range(_last_traj_hs.shape[1])
                             ]
                             print(
                                 "  [debug] traj_hs total_norm="
@@ -4114,9 +5200,7 @@ def run_eval(args):
             elif pix_goal_image is not None:
                 if len(local_actions) == 0:
                     lookdown_traj_img = (
-                        lookdown_img
-                        if lookdown_img.size == traj_image_size
-                        else lookdown_img.resize(traj_image_size)
+                        lookdown_img if lookdown_img.size == traj_image_size else lookdown_img.resize(traj_image_size)
                     )
                     lookdown_t = _lookdown_to_traj_tensor(lookdown_traj_img, device)
                     traj_images = torch.stack([pix_goal_image, lookdown_t]).unsqueeze(0).to(device)
@@ -4219,16 +5303,19 @@ def run_eval(args):
 # Section 10: CLI
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate VLNPipeline on VLN-CE R2R val_unseen (Habitat closed-loop)"
+    parser = argparse.ArgumentParser(description="Evaluate VLNPipeline on VLN-CE R2R val_unseen (Habitat closed-loop)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="YAML config used for training (e.g. configs/train_config_internnav.yaml)",
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="YAML config used for training (e.g. configs/train_config_internnav.yaml)")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Optional main/Stage 2 checkpoint path (.pth)")
-    parser.add_argument("--base_checkpoint", type=str, default=None,
-                        help="Optional Stage 1/base checkpoint loaded before --checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Optional main/Stage 2 checkpoint path (.pth)")
+    parser.add_argument(
+        "--base_checkpoint", type=str, default=None, help="Optional Stage 1/base checkpoint loaded before --checkpoint"
+    )
     parser.add_argument(
         "--pano_latent_adapter_checkpoint",
         type=str,
@@ -4299,13 +5386,18 @@ def main():
         help="Optional separate GPU id for the teacher VLM; -1 = use --gpu_id.",
     )
     parser.add_argument("--scenes_dir", type=str, default=DEFAULT_SCENES_DIR)
-    parser.add_argument("--data_path", type=str,
-                        default=DEFAULT_DATA_PATH)
+    parser.add_argument("--data_path", type=str, default=DEFAULT_DATA_PATH)
+    parser.add_argument(
+        "--dataset_split",
+        choices=("train", "val_seen", "val_unseen"),
+        default="val_unseen",
+        help="Dataset split encoded by --data_path; collection is allowed only for train.",
+    )
     parser.add_argument("--output_path", type=str, default="./logs/eval_r2r_val_unseen")
-    parser.add_argument("--gpu_id", type=int, default=0,
-                        help="Torch CUDA device id for model inference")
-    parser.add_argument("--sim_gpu_id", type=int, default=0,
-                        help="Habitat-Sim GL device id; keep 0 for GLX/Xvfb builds")
+    parser.add_argument("--gpu_id", type=int, default=0, help="Torch CUDA device id for model inference")
+    parser.add_argument(
+        "--sim_gpu_id", type=int, default=0, help="Habitat-Sim GL device id; keep 0 for GLX/Xvfb builds"
+    )
     parser.add_argument(
         "--rpc_server",
         type=str,
@@ -4315,6 +5407,21 @@ def main():
             "process runs Habitat only and sends panoramic observations to the "
             "model server."
         ),
+    )
+    parser.add_argument(
+        "--rpc_policy_mode",
+        choices=(RPC_POLICY_HEATMAPVLN, RPC_POLICY_INTERNNAV_NATIVE),
+        default=RPC_POLICY_HEATMAPVLN,
+        help=(
+            "RPC policy provenance contract. internnav_native requires the "
+            "official joint System2 + NextDiT server and validates it fail-closed."
+        ),
+    )
+    parser.add_argument(
+        "--rpc_policy_fingerprint",
+        type=str,
+        default="",
+        help="Expected RPC model/code closure fingerprint for fail-closed native rollouts.",
     )
     parser.add_argument(
         "--rpc_timeout_ms",
@@ -4327,6 +5434,31 @@ def main():
         type=int,
         default=90,
         help="JPEG quality for RGB observations sent to the model server.",
+    )
+    parser.add_argument(
+        "--rpc_protocol_seed",
+        type=int,
+        default=HEATMAPVLN_RPC_DEFAULT_PROTOCOL_SEED,
+        help=(
+            "Fixed cross-arm protocol seed used with scene/episode/System2 "
+            "call index to derive each NextDiT SHA256 seed."
+        ),
+    )
+    parser.add_argument(
+        "--rpc_require_deterministic_sampling",
+        action="store_true",
+        default=False,
+        help=("Ask the server to fail closed unless the deterministic NextDiT sampling record is complete and valid."),
+    )
+    parser.add_argument(
+        "--pano_recenter_before_system1",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run RPC planning in two phases: System2 selects a pano view/pixel, "
+            "Habitat physically turns that view to front, then frozen System1 "
+            "runs once on the newly captured front/lookdown observation."
+        ),
     )
     parser.add_argument(
         "--oracle_system2",
@@ -4417,10 +5549,7 @@ def main():
         "--debug_input_trace",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=(
-            "Print compact pose, distance, image hash, and processor tensor stats "
-            "for System2/System1 inputs."
-        ),
+        help=("Print compact pose, distance, image hash, and processor tensor stats for System2/System1 inputs."),
     )
     parser.add_argument(
         "--debug_save_input_images",
@@ -4441,28 +5570,59 @@ def main():
             "for raw InternNav compatibility checks."
         ),
     )
-    parser.add_argument("--max_episodes", type=int, default=None,
-                        help="Evaluate at most this many new episodes")
-    parser.add_argument("--episode_list", type=str, default=None,
-                        help="JSON file with fixed episodes [{scene_id, episode_id}, ...]")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from output_path/progress.json")
-    parser.add_argument("--overwrite_output", action="store_true",
-                        help="Delete output_path/progress.json and result.json before evaluating")
+    parser.add_argument("--max_episodes", type=int, default=None, help="Evaluate at most this many new episodes")
     parser.add_argument(
-        "--save_trajectory_steps", action="store_true", default=False,
+        "--episode_list", type=str, default=None, help="JSON file with fixed episodes [{scene_id, episode_id}, ...]"
+    )
+    parser.add_argument("--resume", action="store_true", help="Resume from output_path/progress.json")
+    parser.add_argument(
+        "--overwrite_output",
+        action="store_true",
+        help="Delete output_path/progress.json and result.json before evaluating",
+    )
+    parser.add_argument(
+        "--save_trajectory_steps",
+        action="store_true",
+        default=False,
         help=(
             "Record per-step agent state, VLM outputs, panorama images into "
             "output_path/<scene>_<ep>/trajectory_steps.json for offline HTML "
             "visualization via scripts/visualization/generate_trajectory_html.py."
         ),
     )
+    parser.add_argument(
+        "--collect_trajectory_dagger",
+        action="store_true",
+        default=False,
+        help="Collect train-only on-policy trajectory states with shadow-oracle labels.",
+    )
+    parser.add_argument(
+        "--trajectory_dagger_root",
+        type=str,
+        default="/mnt/afs/lixiaoou/intern/fjl/data/heatmap_system1_dagger_v1",
+        help="Capacity-guarded collection root; no expert data or heatmaps are copied.",
+    )
+    parser.add_argument("--trajectory_dagger_round", type=int, default=0)
+    parser.add_argument("--trajectory_dagger_max_gb", type=float, default=300.0)
+    parser.add_argument("--trajectory_dagger_normal_quota", type=int, default=1)
+    parser.add_argument("--trajectory_dagger_hard_quota", type=int, default=2)
+    parser.add_argument("--trajectory_dagger_jpeg_quality", type=int, default=75)
+    parser.add_argument("--trajectory_dagger_hard_offpath_m", type=float, default=0.75)
+    parser.add_argument("--trajectory_dagger_max_oracle_actions", type=int, default=128)
+    parser.add_argument("--trajectory_dagger_min_history", type=int, default=2)
+    parser.add_argument(
+        "--trajectory_dagger_policy_fingerprint",
+        type=str,
+        default="",
+        help="Required policy/checkpoint fingerprint used to make resume fail closed.",
+    )
     args = parser.parse_args()
     if args.oracle_system2 and not args.rpc_server:
         raise RuntimeError("--oracle_system2 currently requires --rpc_server")
     if not args.rpc_server:
         _preflight_checkpoint_args(args)
-    _resolve_eval_paths(args)
+    _resolve_eval_paths(args, split=args.dataset_split)
+    _preflight_trajectory_dagger_args(args)
     run_eval(args)
 
 

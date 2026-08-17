@@ -23,6 +23,8 @@ export STAGE3_EVAL_CHECKPOINT="${STAGE3_EVAL_CHECKPOINT:-${STAGE3_EVAL_TRAIN_OUT
 
 export STAGE3_EVAL_SCENES_DIR="${STAGE3_EVAL_SCENES_DIR:-${FJL_ROOT}/habitat/VLN-CE/data/scene_datasets}"
 export STAGE3_EVAL_DATA_PATH="${STAGE3_EVAL_DATA_PATH:-${FJL_ROOT}/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/val_unseen/val_unseen.json.gz}"
+export STAGE3_EVAL_DATASET_SPLIT="${STAGE3_EVAL_DATASET_SPLIT:-val_unseen}"
+export STAGE3_EVAL_EXPECTED_EPISODES="${STAGE3_EVAL_EXPECTED_EPISODES:-1839}"
 export STAGE3_EVAL_OUTPUT_PATH="${STAGE3_EVAL_OUTPUT_PATH:-${FJL_ROOT}/model/eval_stage3_r2r_val_unseen_full_11000_alllora_h1024_internnavcoords_epoch${STAGE3_EVAL_EXPECTED_EPOCH}_no_privileged_stop}"
 
 export STAGE3_EVAL_MODEL_GPU="${STAGE3_EVAL_MODEL_GPU:-0}"
@@ -31,6 +33,7 @@ export STAGE3_EVAL_RPC_HOST="${STAGE3_EVAL_RPC_HOST:-127.0.0.1}"
 export STAGE3_EVAL_RPC_PORT="${STAGE3_EVAL_RPC_PORT:-50061}"
 export STAGE3_EVAL_RPC_TIMEOUT_MS="${STAGE3_EVAL_RPC_TIMEOUT_MS:-600000}"
 export STAGE3_EVAL_RPC_JPEG_QUALITY="${STAGE3_EVAL_RPC_JPEG_QUALITY:-90}"
+export STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1="${STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1:-1}"
 export STAGE3_EVAL_SERVER_START_TIMEOUT_S="${STAGE3_EVAL_SERVER_START_TIMEOUT_S:-1800}"
 
 export STAGE3_EVAL_MAX_EPISODES="${STAGE3_EVAL_MAX_EPISODES:-}"
@@ -55,6 +58,19 @@ export STAGE3_EVAL_RESUME="${STAGE3_EVAL_RESUME:-1}"
 export STAGE3_EVAL_OVERWRITE="${STAGE3_EVAL_OVERWRITE:-0}"
 export STAGE3_EVAL_SAVE_TRAJECTORY_STEPS="${STAGE3_EVAL_SAVE_TRAJECTORY_STEPS:-0}"
 export STAGE3_EVAL_PREFLIGHT_ONLY="${STAGE3_EVAL_PREFLIGHT_ONLY:-0}"
+export STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING="${STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING:-1}"
+
+export STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER="${STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER:-0}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT="${STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT:-${FJL_ROOT}/data/heatmap_system1_dagger_v1}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_ROUND="${STAGE3_EVAL_TRAJECTORY_DAGGER_ROUND:-0}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_GB="${STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_GB:-300}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_NORMAL_QUOTA="${STAGE3_EVAL_TRAJECTORY_DAGGER_NORMAL_QUOTA:-1}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_QUOTA="${STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_QUOTA:-2}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_JPEG_QUALITY="${STAGE3_EVAL_TRAJECTORY_DAGGER_JPEG_QUALITY:-75}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_OFFPATH_M="${STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_OFFPATH_M:-0.75}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_ORACLE_ACTIONS="${STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_ORACLE_ACTIONS:-128}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_MIN_HISTORY="${STAGE3_EVAL_TRAJECTORY_DAGGER_MIN_HISTORY:-2}"
+export STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT="${STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT:-}"
 
 export STAGE3_EVAL_CHECKPOINT_WAIT_INTERVAL_S="${STAGE3_EVAL_CHECKPOINT_WAIT_INTERVAL_S:-300}"
 export STAGE3_EVAL_CHECKPOINT_SETTLE_S="${STAGE3_EVAL_CHECKPOINT_SETTLE_S:-30}"
@@ -186,6 +202,33 @@ if [[ "$privileged_requested" == "1" ]] && ! is_true "$STAGE3_EVAL_ALLOW_PRIVILE
   exit 1
 fi
 
+if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER"; then
+  if [[ "$STAGE3_EVAL_DATASET_SPLIT" != "train" ]]; then
+    echo "Trajectory DAgger collection requires STAGE3_EVAL_DATASET_SPLIT=train" >&2
+    exit 1
+  fi
+  if [[ "$privileged_requested" == "1" ]]; then
+    echo "Trajectory DAgger learner rollout forbids oracle System2 and privileged auto-stop" >&2
+    exit 1
+  fi
+  if ! is_true "$STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING"; then
+    echo "Trajectory DAgger collection requires deterministic RPC sampling" >&2
+    exit 1
+  fi
+  case "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT" in
+    /mnt/afs/lixiaoou/intern/fjl|/mnt/afs/lixiaoou/intern/fjl/*) ;;
+    *)
+      echo "Trajectory DAgger root must stay under /mnt/afs/lixiaoou/intern/fjl" >&2
+      exit 1
+      ;;
+  esac
+  case "$STAGE3_EVAL_OUTPUT_PATH" in
+    "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT"|"$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT"/*)
+      echo "Evaluation output must not be inside the capacity-guarded DAgger root" >&2
+      exit 1
+      ;;
+  esac
+fi
 require_file "$STAGE3_EVAL_CONFIG"
 require_file "$STAGE3_EVAL_BASE_CKPT"
 require_file "$STAGE3_EVAL_DATA_PATH"
@@ -203,17 +246,19 @@ if [[ "$scene_count" -lt 90 ]]; then
   exit 1
 fi
 
-"$VLNCE_PYTHON" - "$STAGE3_EVAL_DATA_PATH" "$STAGE3_EVAL_SCENES_DIR" <<'PY'
+"$VLNCE_PYTHON" - "$STAGE3_EVAL_DATA_PATH" "$STAGE3_EVAL_SCENES_DIR" \
+  "$STAGE3_EVAL_EXPECTED_EPISODES" "$STAGE3_EVAL_DATASET_SPLIT" <<'PY'
 import gzip
 import json
 import sys
 from pathlib import Path
 
-data_path, scenes_dir = map(Path, sys.argv[1:])
+data_path, scenes_dir = map(Path, sys.argv[1:3])
+expected_episodes, dataset_split = int(sys.argv[3]), sys.argv[4]
 with gzip.open(data_path, "rt", encoding="utf-8") as handle:
     episodes = json.load(handle).get("episodes", [])
-if len(episodes) != 1839:
-    raise SystemExit(f"Expected 1839 R2R val_unseen episodes, found {len(episodes)}")
+if len(episodes) != expected_episodes:
+    raise SystemExit(f"Expected {expected_episodes} R2R {dataset_split} episodes, found {len(episodes)}")
 scene_id = str(episodes[0].get("scene_id", ""))
 scene_asset = scenes_dir / scene_id
 if not scene_asset.is_file():
@@ -256,6 +301,11 @@ while true; do
   sleep "$STAGE3_EVAL_CHECKPOINT_WAIT_INTERVAL_S"
 done
 
+if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER" && [[ -z "$STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT" ]]; then
+  base_sha256="$(sha256sum "$STAGE3_EVAL_BASE_CKPT" | cut -d' ' -f1)"
+  stage3_sha256="$(sha256sum "$STAGE3_EVAL_CHECKPOINT" | cut -d' ' -f1)"
+  export STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT="base:${base_sha256};stage3:${stage3_sha256}"
+fi
 PYTHONPATH="$RPC_PYTHONPATH" "$QWEN25_PYTHON" - \
   "$STAGE3_EVAL_RPC_HOST" "$STAGE3_EVAL_RPC_PORT" <<'PY'
 import socket
@@ -281,6 +331,7 @@ echo "[stage3-eval] output=$STAGE3_EVAL_OUTPUT_PATH"
 echo "[stage3-eval] auto_stop=$STAGE3_EVAL_AUTO_STOP_DISTANCE oracle_system2=$STAGE3_EVAL_ORACLE_SYSTEM2"
 echo "[stage3-eval] oracle_strategy=$STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY lookahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_LOOKAHEAD_M min_ahead_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MIN_AHEAD_M max_side_dist_m=$STAGE3_EVAL_ORACLE_SYSTEM2_MAX_SIDE_DIST_M"
 echo "[stage3-eval] trajectory_selection=$STAGE3_EVAL_TRAJECTORY_SELECTION trajectory_x_sign=$STAGE3_EVAL_TRAJECTORY_X_SIGN heading_alignment=$STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"
+echo "[stage3-eval] pano_recenter_before_system1=$STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1"
 
 if is_true "$STAGE3_EVAL_PREFLIGHT_ONLY"; then
   echo "[$(date '+%F %T')] STAGE3_EVAL_PREFLIGHT_ONLY=1; all static preflights passed"
@@ -329,7 +380,7 @@ try:
     info = client.get_server_info()
     if not client.health_check() or info is None:
         raise SystemExit(1)
-    if info.version != "heatmapvln-r2r-json-v1":
+    if info.version != "heatmapvln-r2r-json-v3":
         raise SystemExit(2)
 finally:
     client.close()
@@ -381,7 +432,8 @@ manifest = {
     "scenes_dir": os.environ["STAGE3_EVAL_SCENES_DIR"],
     "data_path": os.environ["STAGE3_EVAL_DATA_PATH"],
     "rpc_root": os.environ["RPC_ROOT"],
-    "rpc_protocol": "heatmapvln-r2r-json-v1",
+    "rpc_protocol": "heatmapvln-r2r-json-v3",
+    "rpc_capability": "pano-two-phase-front-system1-v1",
     "auto_stop_distance": float(os.environ["STAGE3_EVAL_AUTO_STOP_DISTANCE"]),
     "oracle_system2": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2"].lower() in {"1", "true", "yes", "on"},
     "oracle_system2_strategy": os.environ["STAGE3_EVAL_ORACLE_SYSTEM2_STRATEGY"],
@@ -392,6 +444,9 @@ manifest = {
     "trajectory_x_sign": float(os.environ["STAGE3_EVAL_TRAJECTORY_X_SIGN"]),
     "trajectory_heading_alignment": os.environ["STAGE3_EVAL_TRAJECTORY_HEADING_ALIGNMENT"],
     "system1_coord_order": os.environ["STAGE3_EVAL_SYSTEM1_COORD_ORDER"],
+    "pano_recenter_before_system1": os.environ[
+        "STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1"
+    ].lower() in {"1", "true", "yes", "on"},
 }
 Path(sys.argv[1]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
@@ -403,6 +458,7 @@ client_args=(
   --rpc_jpeg_quality "$STAGE3_EVAL_RPC_JPEG_QUALITY"
   --scenes_dir "$STAGE3_EVAL_SCENES_DIR"
   --data_path "$STAGE3_EVAL_DATA_PATH"
+  --dataset_split "$STAGE3_EVAL_DATASET_SPLIT"
   --output_path "$STAGE3_EVAL_OUTPUT_PATH"
   --sim_gpu_id 0
   --resize_w 256
@@ -418,6 +474,24 @@ client_args=(
   --no-debug_input_trace
   --debug_save_input_images 0
 )
+if is_true "$STAGE3_EVAL_RPC_REQUIRE_DETERMINISTIC_SAMPLING"; then
+  client_args+=(--rpc_require_deterministic_sampling)
+fi
+if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER"; then
+  client_args+=(
+    --collect_trajectory_dagger
+    --trajectory_dagger_root "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT"
+    --trajectory_dagger_round "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROUND"
+    --trajectory_dagger_max_gb "$STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_GB"
+    --trajectory_dagger_normal_quota "$STAGE3_EVAL_TRAJECTORY_DAGGER_NORMAL_QUOTA"
+    --trajectory_dagger_hard_quota "$STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_QUOTA"
+    --trajectory_dagger_jpeg_quality "$STAGE3_EVAL_TRAJECTORY_DAGGER_JPEG_QUALITY"
+    --trajectory_dagger_hard_offpath_m "$STAGE3_EVAL_TRAJECTORY_DAGGER_HARD_OFFPATH_M"
+    --trajectory_dagger_max_oracle_actions "$STAGE3_EVAL_TRAJECTORY_DAGGER_MAX_ORACLE_ACTIONS"
+    --trajectory_dagger_min_history "$STAGE3_EVAL_TRAJECTORY_DAGGER_MIN_HISTORY"
+    --trajectory_dagger_policy_fingerprint "$STAGE3_EVAL_TRAJECTORY_DAGGER_POLICY_FINGERPRINT"
+  )
+fi
 if [[ -n "$STAGE3_EVAL_MAX_EPISODES" ]]; then
   client_args+=(--max_episodes "$STAGE3_EVAL_MAX_EPISODES")
 fi
@@ -441,6 +515,11 @@ if is_true "$STAGE3_EVAL_ORACLE_SYSTEM2"; then
 fi
 if is_true "$STAGE3_EVAL_SAVE_TRAJECTORY_STEPS"; then
   client_args+=(--save_trajectory_steps)
+fi
+if is_true "$STAGE3_EVAL_PANO_RECENTER_BEFORE_SYSTEM1"; then
+  client_args+=(--pano_recenter_before_system1)
+else
+  client_args+=(--no-pano_recenter_before_system1)
 fi
 
 echo "[$(date '+%F %T')] Starting Habitat val_unseen client log=$CLIENT_LOG"

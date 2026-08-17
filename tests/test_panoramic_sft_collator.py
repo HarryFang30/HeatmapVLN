@@ -148,7 +148,7 @@ def test_panoramic_sft_collator_internnav_protocol_labels_down_then_coord():
     )
 
     out = collator([_sample(pixel_goal=[12, 34])])
-    assert out["sft_target_text"] == [["↓", "12 34"]]
+    assert out["sft_target_text"] == [["↓", "34 12"]]
 
     tokenizer = collator.processor.tokenizer
     targets = out["pano_inputs"]["labels"][0]
@@ -157,7 +157,7 @@ def test_panoramic_sft_collator_internnav_protocol_labels_down_then_coord():
         [
             *tokenizer.encode("↓", add_special_tokens=False),
             tokenizer.eos_token_id,
-            *tokenizer.encode("12 34", add_special_tokens=False),
+            *tokenizer.encode("34 12", add_special_tokens=False),
             tokenizer.eos_token_id,
         ]
     )

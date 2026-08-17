@@ -14,7 +14,7 @@ can a small residual MLP translate the student VLM latent "dialect" into the
 InternNav latent "dialect" that frozen cond_projector + NextDiT can execute?
 
 Native teacher sidecars must come from InternNav's front/history + lookdown
-protocol (``collect_internnav_teacher_sidecar.py --coord-source dataset``).
+protocol (``collect_internnav_teacher_sidecar.py --coord-source aligned_native``).
 They are matched to panoramic student samples by ``(clip_idx, current_t)``,
 not by the integer dataset index.
 """
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -68,9 +69,13 @@ from tqdm import tqdm
 
 from src.data.factory import build_trajectory_dataset
 from src.data.pano_teacher_alignment import (
+    NATIVE_TEACHER_ALIGNMENT_VERSION,
+    NATIVE_TEACHER_SIDECAR_SCHEMA,
+    aligned_native_sidecar_contract,
     compute_aligned_teacher_latents_3584_batch,
     has_structured_pano_pixel_goal,
     make_teacher_turn_args,
+    validate_aligned_native_sidecar_contract_fields,
 )
 from src.data.panoramic_tokenized_collator import PanoramicTokenizedCollator
 from src.models.adapters import (
@@ -471,6 +476,9 @@ def _resolve_record_clip_idx(dataset: Any, rec: dict[str, Any]) -> int | None:
                 if _normalized_clip_dir_key(current_clip_dir) == target_key:
                     rec["_resolved_clip_idx"] = int(idx)
                     return int(idx)
+        # A recorded path is the stable identity. Never reinterpret its stale
+        # integer clip_idx as a different clip when the path is absent.
+        return None
 
     clip_idx = rec.get("clip_idx")
     if clip_idx is None:
@@ -508,6 +516,33 @@ def _record_state_is_indexable(dataset: Any, rec: dict[str, Any]) -> bool:
     return True
 
 
+def _validate_native_record_dataset_identity(
+    dataset: Any,
+    rec: dict[str, Any],
+) -> None:
+    """Bind a structurally valid native-v2 record to the live dataset index."""
+    contract = validate_aligned_native_sidecar_contract_fields(rec)
+    if rec.get("clip_dir") is None:
+        raise ValueError("native-v2 record has no clip_dir")
+    clip_idx = _resolve_record_clip_idx(dataset, rec)
+    if clip_idx is None:
+        raise ValueError(f"record clip_dir is absent from live dataset: {rec.get('clip_dir')!r}")
+    clips = getattr(dataset, "clips", None)
+    if clips is None or not (0 <= int(clip_idx) < len(clips)):
+        raise ValueError("resolved clip index is outside the live dataset")
+    current_t = int(rec.get("current_t", -1))
+    live_key = _stable_sample_key(clips[int(clip_idx)], current_t)
+    if not live_key or live_key != rec.get("stable_sample_key"):
+        raise ValueError(
+            "live dataset stable key mismatch: "
+            f"live={live_key!r} sidecar={rec.get('stable_sample_key')!r}"
+        )
+    if contract.get("stable_sample_key") != live_key:
+        raise ValueError("alignment contract is not bound to the live dataset clip/frame")
+    if not _record_state_is_indexable(dataset, rec):
+        raise ValueError("sidecar current_t is not indexable in the live dataset clip")
+
+
 def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any]:
     """Load one tensor sidecar and require it to belong to the JSONL record."""
     path = rec.get("_tensor_path")
@@ -527,6 +562,30 @@ def _load_validated_tensor_sidecar_payload(rec: dict[str, Any]) -> dict[str, Any
             f"Tensor sidecar dataset_index mismatch: path={path} "
             f"payload={payload_idx} record={expected_idx}"
         )
+    strict_alignment = (
+        str(rec.get("_sidecar_coord_source") or "").lower() == "aligned_native"
+        or rec.get("sidecar_schema") is not None
+        or payload.get("sidecar_schema") is not None
+    )
+    if strict_alignment:
+        for key, expected in (
+            ("sidecar_schema", NATIVE_TEACHER_SIDECAR_SCHEMA),
+            ("alignment_version", NATIVE_TEACHER_ALIGNMENT_VERSION),
+        ):
+            if rec.get(key) != expected or payload.get(key) != expected:
+                raise RuntimeError(
+                    f"Tensor sidecar {key} mismatch: expected={expected!r} "
+                    f"jsonl={rec.get(key)!r} tensor={payload.get(key)!r}"
+                )
+        jsonl_fingerprint = rec.get("alignment_fingerprint")
+        tensor_fingerprint = payload.get("alignment_fingerprint")
+        if not jsonl_fingerprint or tensor_fingerprint != jsonl_fingerprint:
+            raise RuntimeError(
+                "Tensor sidecar alignment_fingerprint mismatch: "
+                f"jsonl={jsonl_fingerprint!r} tensor={tensor_fingerprint!r}"
+            )
+        if payload.get("alignment_contract") != rec.get("alignment_contract"):
+            raise RuntimeError("Tensor sidecar alignment_contract does not match JSONL")
     return payload
 
 
@@ -553,7 +612,14 @@ def _load_teacher_records(
             if require_native_teacher:
                 coord_source = str(teacher.get("coord_source") or "").lower()
                 mode = str(teacher.get("mode") or "").lower()
-                if coord_source != "dataset" or mode != "dataset_coord":
+                if (
+                    coord_source != "aligned_native"
+                    or mode != "aligned_native_coord"
+                    or rec.get("sidecar_schema") != NATIVE_TEACHER_SIDECAR_SCHEMA
+                    or rec.get("alignment_version") != NATIVE_TEACHER_ALIGNMENT_VERSION
+                    or not rec.get("alignment_fingerprint")
+                    or not isinstance(rec.get("alignment_contract"), dict)
+                ):
                     continue
             tensor_info = teacher.get("system1", {}).get("tensor_sidecar", {})
             tensor_path = _resolve_tensor_path(
@@ -589,9 +655,13 @@ def _load_teacher_records(
 
 def _validate_native_teacher_sidecar_record(rec: dict[str, Any]) -> bool:
     teacher = rec.get("teacher", {}) or {}
-    if str(teacher.get("coord_source") or "").lower() != "dataset":
+    if str(teacher.get("coord_source") or "").lower() != "aligned_native":
         return False
-    if str(teacher.get("mode") or "").lower() != "dataset_coord":
+    if str(teacher.get("mode") or "").lower() != "aligned_native_coord":
+        return False
+    if rec.get("sidecar_schema") != NATIVE_TEACHER_SIDECAR_SCHEMA:
+        return False
+    if rec.get("alignment_version") != NATIVE_TEACHER_ALIGNMENT_VERSION:
         return False
     tensor_path = rec.get("_tensor_path")
     if not tensor_path or not Path(str(tensor_path)).is_file():
@@ -655,6 +725,10 @@ def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
     traj_cfg["panoramic_vlm_input"] = True
     traj_cfg["compute_pixel_goal"] = True
     traj_cfg["compute_pano_view_pixel_goal"] = True
+    traj_cfg["compute_aligned_native_pixel_goal"] = (
+        args.teacher_target_mode == "native_sidecar"
+        and not bool(args.trust_native_sidecar_pano_labels)
+    )
     traj_cfg["pano_max_side_dist_m"] = float(getattr(args, "pano_max_side_dist_m", 6.0))
     traj_cfg["load_lookdown_for_system2"] = False
     traj_cfg["load_traj_images"] = True
@@ -1129,10 +1203,17 @@ def _filter_records_with_pano_goals(
                 fallback_loaded,
             )
         if require_native_teacher_sidecar:
-            if str(rec.get("_sidecar_coord_source") or "").lower() != "dataset":
+            if str(rec.get("_sidecar_coord_source") or "").lower() != "aligned_native":
                 invalid_native += 1
                 continue
-            if str(rec.get("_sidecar_mode") or "").lower() != "dataset_coord":
+            if str(rec.get("_sidecar_mode") or "").lower() != "aligned_native_coord":
+                invalid_native += 1
+                continue
+            if (
+                rec.get("sidecar_schema") != NATIVE_TEACHER_SIDECAR_SCHEMA
+                or rec.get("alignment_version") != NATIVE_TEACHER_ALIGNMENT_VERSION
+                or not rec.get("alignment_fingerprint")
+            ):
                 invalid_native += 1
                 continue
             if rec.get("clip_idx") is None or rec.get("current_t") is None:
@@ -1145,21 +1226,35 @@ def _filter_records_with_pano_goals(
             if not _record_state_is_indexable(dataset, rec):
                 invalid_native += 1
                 continue
+            try:
+                _validate_native_record_dataset_identity(dataset, rec)
+            except Exception as exc:
+                invalid_native += 1
+                LOGGER.warning(
+                    "Skip native-v2 record dataset_index=%s: invalid contract/dataset identity (%r)",
+                    idx,
+                    exc,
+                )
+                continue
+            if trust_sidecar_pano_labels:
+                sidecar_label_checked += 1
+                filtered.append(rec)
+                continue
 
-        if trust_sidecar_pano_labels:
+        if trust_sidecar_pano_labels and not require_native_teacher_sidecar:
             pano_pixel_goal = rec.get("_sidecar_pano_pixel_goal")
             if pano_pixel_goal is None:
-                if require_native_teacher_sidecar and not validate_sidecar_metadata:
-                    trusted_without_pano_label += 1
-                    filtered.append(rec)
-                    continue
                 skipped += 1
                 continue
             sidecar_label_checked += 1
             filtered.append(rec)
             continue
 
-        fast_available, fast_goal = _try_fast_pano_goal_from_record(dataset, rec)
+        # Native-v2 validation must materialize the exact sample so the same
+        # pano goal frame and its front_down projection can be recomputed.
+        fast_available, fast_goal = (False, None)
+        if not require_native_teacher_sidecar:
+            fast_available, fast_goal = _try_fast_pano_goal_from_record(dataset, rec)
         if fast_available:
             fast_checked += 1
             if fast_goal is None:
@@ -1185,6 +1280,37 @@ def _filter_records_with_pano_goals(
                 continue
             pano_view_id = sample.get("pano_view_id")
             pano_pixel_goal = sample.get("pano_pixel_goal")
+
+        if require_native_teacher_sidecar:
+            try:
+                expected_alignment = aligned_native_sidecar_contract(
+                    sample,
+                    stable_sample_key=str(rec.get("stable_sample_key") or ""),
+                    current_t=int(rec.get("current_t", -1)),
+                )
+            except Exception as exc:
+                invalid_native += 1
+                LOGGER.warning(
+                    "Skip native-v2 record dataset_index=%s: cannot recompute alignment (%r)",
+                    idx,
+                    exc,
+                )
+                continue
+            if any(
+                rec.get(key) != expected_alignment[key]
+                for key in (
+                    "sidecar_schema",
+                    "alignment_version",
+                    "alignment_fingerprint",
+                    "alignment_contract",
+                )
+            ):
+                mismatched += 1
+                LOGGER.warning(
+                    "Skip native-v2 record dataset_index=%s: alignment contract changed",
+                    idx,
+                )
+                continue
 
         # Validate sidecar metadata against the current dataset labels.
         # This runs globally before DDP sharding so a mismatch is surfaced
@@ -1515,7 +1641,12 @@ def _split_train_val(
     records: list[dict[str, Any]],
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Deterministic split based on a stable record ordering and the seed."""
+    """Deterministic trajectory/clip-grouped split.
+
+    Adjacent frames from one navigation trajectory are highly correlated. A
+    record-level random split leaks the same clip into train and validation and
+    overstates generalization, so whole groups are held out together.
+    """
     if not records:
         return [], []
     if args.val_records > 0:
@@ -1527,13 +1658,43 @@ def _split_train_val(
     if val_size <= 0:
         return list(records), []
 
-    ordered = sorted(records, key=lambda r: int(r["dataset_index"]))
+    def group_key(rec: dict[str, Any]) -> str:
+        scene = str(rec.get("scene_id") or "")
+        trajectory = str(rec.get("trajectory_id") or "")
+        if scene and trajectory:
+            return f"scene={scene}|trajectory={trajectory}"
+        clip_dir = str(rec.get("clip_dir") or "")
+        if clip_dir:
+            return f"clip={_normalized_clip_dir_key(clip_dir)}"
+        stable = str(rec.get("stable_sample_key") or "")
+        if stable:
+            return stable.rsplit("|t=", 1)[0]
+        return f"record={int(rec['dataset_index'])}"
+
+    ordered = sorted(
+        records,
+        key=lambda r: (group_key(r), int(r["dataset_index"])),
+    )
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for rec in ordered:
+        groups.setdefault(group_key(rec), []).append(rec)
+    if len(groups) <= 1:
+        return list(ordered), []
     rng = random.Random(args.seed)
-    indices = list(range(len(ordered)))
-    rng.shuffle(indices)
-    val_pos = set(indices[:val_size])
-    train_records = [ordered[i] for i in range(len(ordered)) if i not in val_pos]
-    val_records = [ordered[i] for i in indices[:val_size]]
+    group_names = sorted(groups)
+    rng.shuffle(group_names)
+    selected: list[str] = []
+    selected_count = 0
+    for name in group_names:
+        if len(selected) >= len(group_names) - 1:
+            break
+        selected.append(name)
+        selected_count += len(groups[name])
+        if selected_count >= val_size:
+            break
+    val_groups = set(selected)
+    train_records = [rec for rec in ordered if group_key(rec) not in val_groups]
+    val_records = [rec for name in selected for rec in groups[name]]
     return train_records, val_records
 
 
@@ -2267,21 +2428,83 @@ def _save_checkpoint(
     epoch: int,
     step: int,
     metrics: dict[str, float],
+    training_contract: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     adapter_to_save = _unwrap_adapter(adapter)
     torch.save(
         {
             "adapter_type": "pano_latent_space",
+            "adapter_hidden_dim": int(args.adapter_hidden_dim),
             "adapter_state_dict": adapter_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
             "step": step,
             "metrics": metrics,
             "args": vars(args),
+            "training_contract": training_contract,
+            "sidecar_schema": training_contract.get("sidecar_schema"),
+            "alignment_version": training_contract.get("alignment_version"),
+            "sidecar_records_sha256": training_contract.get("sidecar_records_sha256"),
+            "base_checkpoint_sha256": training_contract.get("base_checkpoint_sha256"),
         },
         path,
     )
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).expanduser().open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_training_contract(
+    args: argparse.Namespace,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    record_digest = hashlib.sha256()
+    for rec in sorted(
+        records,
+        key=lambda item: str(item.get("stable_sample_key") or item.get("dataset_index")),
+    ):
+        bound = {
+            "stable_sample_key": rec.get("stable_sample_key"),
+            "alignment_fingerprint": rec.get("alignment_fingerprint"),
+            "tensor_path": rec.get("_tensor_path"),
+        }
+        record_digest.update(
+            json.dumps(bound, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        record_digest.update(b"\n")
+
+    jsonl = Path(str(args.teacher_jsonl)).expanduser()
+    meta_path = Path(str(jsonl) + ".meta")
+    sidecar_signature = meta_path.read_text(encoding="utf-8") if meta_path.is_file() else ""
+    student_config = Path(str(args.student_config)).expanduser()
+    return {
+        "contract_version": "heatmapvln-stage2-native-v2-training-v1",
+        "sidecar_schema": NATIVE_TEACHER_SIDECAR_SCHEMA
+        if args.teacher_target_mode == "native_sidecar"
+        else None,
+        "alignment_version": NATIVE_TEACHER_ALIGNMENT_VERSION
+        if args.teacher_target_mode == "native_sidecar"
+        else None,
+        "teacher_target_mode": str(args.teacher_target_mode),
+        "teacher_jsonl": str(jsonl.resolve()),
+        "sidecar_signature_sha256": hashlib.sha256(
+            sidecar_signature.encode("utf-8")
+        ).hexdigest(),
+        "sidecar_record_count": len(records),
+        "sidecar_records_sha256": record_digest.hexdigest(),
+        "dataset_root": str(Path(str(args.root)).expanduser().resolve()),
+        "base_checkpoint": str(Path(str(args.base_checkpoint)).expanduser().resolve()),
+        "base_checkpoint_sha256": _sha256_file(args.base_checkpoint),
+        "student_config": str(student_config.resolve()),
+        "student_config_sha256": _sha256_file(student_config),
+        "adapter_hidden_dim": int(args.adapter_hidden_dim),
+    }
 
 
 def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
@@ -2326,7 +2549,7 @@ def _load_adapter_config_defaults(config_path: str | None) -> dict[str, Any]:
     defaults["teacher_preload_workers"] = int(training.get("teacher_preload_workers", 4))
     defaults["check_teacher_tensor_files"] = bool(training.get("check_teacher_tensor_files", True))
     defaults["trust_native_sidecar_pano_labels"] = bool(
-        training.get("trust_native_sidecar_pano_labels", True)
+        training.get("trust_native_sidecar_pano_labels", False)
     )
 
     # Teacher
@@ -2377,7 +2600,7 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument("--teacher-jsonl", default="",
                    help=(
                        "Teacher sidecar JSONL. Required for native_sidecar mode; collect "
-                       "with collect_internnav_teacher_sidecar.py --coord-source dataset "
+                       "with collect_internnav_teacher_sidecar.py --coord-source aligned_native "
                        "--tensor-output-dir. In legacy aligned mode it may supply a "
                        "prefiltered record subset."
                    ))
@@ -2390,7 +2613,7 @@ def _parse_args_with_config() -> argparse.Namespace:
         default=adapter_defaults.get("teacher_target_mode", "aligned"),
         help=(
             "native_sidecar: use InternNav native front/lookdown teacher tensors "
-            "collected with coord_source=dataset and align by (clip_idx,current_t). "
+            "collected with coord_source=aligned_native and a native-v2 same-goal fingerprint. "
             "aligned: legacy synthetic pano teacher diagnostic path. "
             "sidecar: legacy pre-collected sidecars."
         ),
@@ -2481,13 +2704,10 @@ def _parse_args_with_config() -> argparse.Namespace:
     p.add_argument(
         "--trust-native-sidecar-pano-labels",
         action=argparse.BooleanOptionalAction,
-        default=adapter_defaults.get("trust_native_sidecar_pano_labels", True),
+        default=adapter_defaults.get("trust_native_sidecar_pano_labels", False),
         help=(
-            "For native_sidecar records, trust the pano pixel label stored in the "
-            "collector JSONL during startup filtering instead of recomputing the "
-            "projection for every record. If older native sidecars do not contain "
-            "pano labels, trust the record set and lazily skip the rare invalid "
-            "samples during batch construction."
+            "Legacy speed shortcut for non-native sidecars. Native-v2 training "
+            "always recomputes and verifies the same-goal alignment contract."
         ),
     )
     p.add_argument("--max-samples", type=int, default=adapter_defaults.get("max_samples", 0))
@@ -2556,6 +2776,10 @@ def main() -> int:
             panoramic_vlm_input=True,
             compute_pixel_goal=True,
             compute_pano_view_pixel_goal=True,
+            compute_aligned_native_pixel_goal=(
+                args.teacher_target_mode == "native_sidecar"
+                and not bool(args.trust_native_sidecar_pano_labels)
+            ),
             pano_max_side_dist_m=float(args.pano_max_side_dist_m),
             load_lookdown_for_system2=False,
             load_traj_images=True,
@@ -2574,6 +2798,10 @@ def main() -> int:
                 panoramic_vlm_input=True,
                 compute_pixel_goal=True,
                 compute_pano_view_pixel_goal=True,
+                compute_aligned_native_pixel_goal=(
+                    args.teacher_target_mode == "native_sidecar"
+                    and not bool(args.trust_native_sidecar_pano_labels)
+                ),
                 pano_max_side_dist_m=float(args.pano_max_side_dist_m),
                 load_lookdown_for_system2=False,
                 load_traj_images=True,
@@ -2594,6 +2822,13 @@ def main() -> int:
             if args.max_samples > 0 and len(records) > args.max_samples:
                 records = records[: args.max_samples]
             if not records:
+                if args.teacher_target_mode == "native_sidecar":
+                    raise RuntimeError(
+                        "No usable native-v2 aligned teacher records found in "
+                        f"{teacher_jsonl}. Legacy coord_source=dataset sidecars are "
+                        "invalid because their waypoint and u/v text may be wrong; "
+                        "re-collect with --coord-source aligned_native."
+                    )
                 raise RuntimeError(f"No usable teacher records found in {teacher_jsonl}")
             if _rank0():
                 LOGGER.info(
@@ -2613,11 +2848,10 @@ def main() -> int:
             records = _filter_records_with_pano_goals(
                 records,
                 dataset=dataset,
-                validate_sidecar_metadata=args.teacher_target_mode == "sidecar",
+                validate_sidecar_metadata=args.teacher_target_mode in {"sidecar", "native_sidecar"},
                 require_native_teacher_sidecar=args.teacher_target_mode == "native_sidecar",
                 trust_sidecar_pano_labels=(
-                    args.teacher_target_mode == "native_sidecar"
-                    and bool(args.trust_native_sidecar_pano_labels)
+                    bool(args.trust_native_sidecar_pano_labels)
                 ),
             )
         elif args.teacher_target_mode == "aligned":
@@ -2643,6 +2877,27 @@ def main() -> int:
             )
         if _rank0():
             LOGGER.info("Usable pano pixel teacher records=%d", len(records))
+
+        contract_box: list[Any] = [None, None]
+        if _rank0():
+            try:
+                contract_box[0] = _build_training_contract(args, records)
+            except Exception as exc:
+                contract_box[1] = repr(exc)
+        if _distributed_available():
+            dist.broadcast_object_list(contract_box, src=0)
+        if contract_box[1] is not None:
+            raise RuntimeError(f"Could not build Stage2 training contract: {contract_box[1]}")
+        training_contract = contract_box[0]
+        if not isinstance(training_contract, dict):
+            raise RuntimeError("Stage2 training contract broadcast returned no contract")
+        if _rank0():
+            LOGGER.info(
+                "Stage2 contract: sidecar_records=%d records_sha256=%s base_sha256=%s",
+                training_contract["sidecar_record_count"],
+                training_contract["sidecar_records_sha256"],
+                training_contract["base_checkpoint_sha256"],
+            )
 
         model = _load_student_model(cfg, args, device)
         processor = model.qwen2_5_vl.processor
@@ -2707,6 +2962,11 @@ def main() -> int:
         resume_ckpt: dict[str, Any] | None = None
         if args.resume_adapter:
             resume_ckpt = safe_torch_load(args.resume_adapter, map_location=str(device), trust_checkpoint=True)
+            if resume_ckpt.get("training_contract") != training_contract:
+                raise RuntimeError(
+                    "Resume adapter training contract mismatch. Old/foreign sidecar, "
+                    "base checkpoint, config, or adapter dimension cannot be resumed."
+                )
             adapter.load_state_dict(resume_ckpt["adapter_state_dict"])
             start_epoch = int(resume_ckpt.get("epoch", 0))
             global_step = int(resume_ckpt.get("step", 0))
@@ -3023,6 +3283,7 @@ def main() -> int:
                     epoch=epoch + 1,
                     step=global_step,
                     metrics=combined_metrics,
+                    training_contract=training_contract,
                 )
                 if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
                     _save_checkpoint(
@@ -3033,6 +3294,7 @@ def main() -> int:
                         epoch=epoch + 1,
                         step=global_step,
                         metrics=combined_metrics,
+                        training_contract=training_contract,
                     )
             if _distributed_available():
                 dist.barrier()

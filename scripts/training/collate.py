@@ -11,7 +11,8 @@ def _heatmap_history_length(sample: dict) -> int:
     """Return the real number of heatmap histories for one sample.
 
     ``history_frames`` can intentionally be a one-frame dummy tensor when
-    panoramic heatmap training sets ``load_history_frames=false``.  Building
+    panoramic heatmap training sets ``load_single_view_history_frames=false``.
+    Panoramic ``history_panoramas`` remain loaded independently.  Building
     the mask from that tensor silently masks or unmasks the wrong histories.
     Prefer occurrence-aligned panoramic/pose targets and fall back to frames.
     """

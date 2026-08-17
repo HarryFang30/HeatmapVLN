@@ -75,7 +75,38 @@ class NextDiTCrossAttn(PreTrainedModel):
                 if hasattr(m, "gradient_checkpointing"):
                     m.gradient_checkpointing = True
 
-    def forward(self, x, timestep, z_latents, **kwargs):
+    def enable_heatmap_control(
+        self,
+        *,
+        token_dim: int = 128,
+        control_dim: int = 128,
+        num_heads: int = 4,
+    ):
+        """Attach heatmap control only after the native checkpoint is loaded."""
+
+        if int(token_dim) != int(control_dim):
+            raise ValueError(
+                f"token_dim and control_dim must match, got {token_dim} and {control_dim}"
+            )
+        return self.model.enable_heatmap_control(
+            control_dim=int(control_dim),
+            num_heads=int(num_heads),
+        )
+
+    def forward(
+        self,
+        x,
+        timestep,
+        z_latents,
+        *,
+        heatmap_tokens=None,
+        heatmap_mask=None,
+        heatmap_valid=None,
+        **kwargs,
+    ):
+        del kwargs
+        if heatmap_tokens is None and (heatmap_mask is not None or heatmap_valid is not None):
+            raise ValueError("heatmap_mask/heatmap_valid require heatmap_tokens")
         model_pred = self.model(
             hidden_states=x,
             timestep=timestep,
@@ -83,5 +114,8 @@ class NextDiTCrossAttn(PreTrainedModel):
             encoder_mask=torch.ones((z_latents.shape[0], z_latents.shape[1]), device=z_latents.device),
             image_rotary_emb=None,
             cross_attention_kwargs=dict(),
+            heatmap_hidden_states=heatmap_tokens,
+            heatmap_mask=heatmap_mask,
+            heatmap_valid=heatmap_valid,
         ).sample
         return model_pred

@@ -45,6 +45,7 @@ RESNET_STD = [0.229, 0.224, 0.225]
 @dataclass
 class NextDiTActionConfig:
     """Configuration for NextDiTActionHead."""
+
     vlm_hidden_dim: int = 3584
     latent_emb_size: int = LATENT_EMB_SIZE
     n_query: int = 4
@@ -140,8 +141,50 @@ class NextDiTActionHead(nn.Module):
         logger.info(
             "NextDiTActionHead initialized: dit_layers=%d, dit_dim=%d, predict_steps=%d, "
             "total_params=%s, trainable_params=%s",
-            config.dit_layers, config.dit_dim, config.predict_steps,
-            f"{total_params:,}", f"{trainable_params:,}",
+            config.dit_layers,
+            config.dit_dim,
+            config.predict_steps,
+            f"{total_params:,}",
+            f"{trainable_params:,}",
+        )
+
+    def enable_heatmap_control(
+        self,
+        *,
+        token_dim: int = 128,
+        control_dim: int = 128,
+        num_heads: int = 4,
+    ) -> tuple[nn.Module, ...]:
+        """Attach per-block control only after native System1 loading.
+
+        Keeping this operation explicit preserves the original state dict during
+        checkpoint completeness auditing.
+        """
+
+        adapters = self.traj_dit.enable_heatmap_control(
+            token_dim=int(token_dim),
+            control_dim=int(control_dim),
+            num_heads=int(num_heads),
+        )
+        if len(adapters) != self.config.dit_layers:
+            raise RuntimeError(
+                f"expected {self.config.dit_layers} heatmap adapters, got {len(adapters)}"
+            )
+        self._heatmap_control_spec = {
+            "token_dim": int(token_dim),
+            "control_dim": int(control_dim),
+            "num_heads": int(num_heads),
+            "num_layers": len(adapters),
+        }
+        return adapters
+
+    def heatmap_control_adapters(self) -> tuple[nn.Module, ...]:
+        """Return the attached per-layer adapters, or an empty tuple."""
+
+        return tuple(
+            layer.heatmap_control
+            for layer in self.traj_dit.model.layers
+            if layer.heatmap_control is not None
         )
 
     def load_pretrained_system1(
@@ -188,8 +231,7 @@ class NextDiTActionHead(nn.Module):
                         logger.info("  Loaded latent_queries %s", tuple(ckpt_val.shape))
                     else:
                         skipped.append(
-                            f"latent_queries: ckpt {tuple(ckpt_val.shape)} "
-                            f"vs model {tuple(latent_queries.shape)}"
+                            f"latent_queries: ckpt {tuple(ckpt_val.shape)} vs model {tuple(latent_queries.shape)}"
                         )
                 continue
 
@@ -198,14 +240,14 @@ class NextDiTActionHead(nn.Module):
                     loaded_sd[ckpt_key] = ckpt_val
                 else:
                     skipped.append(
-                        f"{ckpt_key}: ckpt {tuple(ckpt_val.shape)} "
-                        f"vs model {tuple(current_sd[ckpt_key].shape)}"
+                        f"{ckpt_key}: ckpt {tuple(ckpt_val.shape)} vs model {tuple(current_sd[ckpt_key].shape)}"
                     )
 
         if skipped:
             logger.warning(
                 "Skipped %d tensors due to shape mismatch:\n  %s",
-                len(skipped), "\n  ".join(skipped),
+                len(skipped),
+                "\n  ".join(skipped),
             )
 
         missing, _unexpected = self.load_state_dict(loaded_sd, strict=False)
@@ -214,7 +256,9 @@ class NextDiTActionHead(nn.Module):
 
         logger.info(
             "System 1 weight loading complete: loaded=%d, skipped=%d, missing=%d",
-            loaded_count, len(skipped), len(real_missing),
+            loaded_count,
+            len(skipped),
+            len(real_missing),
         )
         if real_missing:
             logger.info("  Missing keys (random init): %s", real_missing)
@@ -273,13 +317,11 @@ class NextDiTActionHead(nn.Module):
         B = traj_images.shape[0]
         images_dp = traj_images.permute(0, 1, 4, 2, 3)  # (B, 2, 3, H, W)
         model_dtype = next(self.rgb_model.parameters()).dtype
-        images_dp_norm = ((images_dp.to(dtype=model_dtype) - self._resnet_mean) / self._resnet_std)
+        images_dp_norm = (images_dp.to(dtype=model_dtype) - self._resnet_mean) / self._resnet_std
 
         with torch.no_grad():
-            images_dp_feat = (
-                self.rgb_model
-                .get_intermediate_layers(images_dp_norm.flatten(0, 1))[0]
-                .unflatten(dim=0, sizes=(B, -1))
+            images_dp_feat = self.rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1))[0].unflatten(
+                dim=0, sizes=(B, -1)
             )
         # images_dp_feat: (B, 2, num_patches, 384)
 
@@ -306,23 +348,15 @@ class NextDiTActionHead(nn.Module):
         each of the N images becomes the current image for one trajectory loss.
         Evaluation still passes explicit pairs as ``(B, 2, H, W, 3)``.
         """
-        if (
-            traj_images is None
-            or traj_images.ndim != 5
-            or gt_trajectory.ndim != 4
-        ):
+        if traj_images is None or traj_images.ndim != 5 or gt_trajectory.ndim != 4:
             return traj_hidden_states, gt_trajectory, traj_images, trajectory_valid
 
         batch_size, num_frames = traj_images.shape[:2]
-        anchor_images = traj_images[:, 0:1].repeat(
-            1, num_frames, 1, 1, 1
-        ).flatten(0, 1)
+        anchor_images = traj_images[:, 0:1].repeat(1, num_frames, 1, 1, 1).flatten(0, 1)
         current_images = traj_images.flatten(0, 1)
         traj_image_pairs = torch.stack([anchor_images, current_images], dim=1)
 
-        traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(
-            1, num_frames, 1, 1
-        ).flatten(0, 1)
+        traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, num_frames, 1, 1).flatten(0, 1)
         gt_trajectory = gt_trajectory.flatten(0, 1)
         if trajectory_valid is not None:
             trajectory_valid = trajectory_valid.flatten(0, 1)
@@ -336,6 +370,85 @@ class NextDiTActionHead(nn.Module):
             )
 
         return traj_hidden_states, gt_trajectory, traj_image_pairs, trajectory_valid
+
+    @staticmethod
+    def _expand_heatmap_sequence_inputs(
+        heatmap_tokens: torch.Tensor | None,
+        heatmap_mask: torch.Tensor | None,
+        heatmap_valid: torch.Tensor | None,
+        gt_trajectory: torch.Tensor,
+        traj_images: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Align control tokens with InternNav multi-current sequence flattening."""
+
+        if heatmap_tokens is None:
+            if heatmap_mask is not None or heatmap_valid is not None:
+                raise ValueError("heatmap_mask/heatmap_valid require heatmap_tokens")
+            return None, None, None
+
+        is_sequence = (
+            traj_images is not None
+            and traj_images.ndim == 5
+            and gt_trajectory.ndim == 4
+        )
+        if not is_sequence:
+            if heatmap_tokens.ndim != 3:
+                raise ValueError(
+                    "single-current heatmap_tokens must be [B,S,D], got "
+                    f"{tuple(heatmap_tokens.shape)}"
+                )
+            return heatmap_tokens, heatmap_mask, heatmap_valid
+
+        batch_size, num_frames = gt_trajectory.shape[:2]
+        if heatmap_tokens.ndim != 4 or heatmap_tokens.shape[:2] != (
+            batch_size,
+            num_frames,
+        ):
+            raise ValueError(
+                "multi-current heatmap_tokens must be [B,N,S,D] aligned to "
+                f"{(batch_size, num_frames)}, got {tuple(heatmap_tokens.shape)}"
+            )
+        token_count = heatmap_tokens.shape[2]
+        if heatmap_mask is not None and heatmap_mask.shape != (
+            batch_size,
+            num_frames,
+            token_count,
+        ):
+            raise ValueError(
+                "multi-current heatmap_mask must be [B,N,S], got "
+                f"{tuple(heatmap_mask.shape)}"
+            )
+        if heatmap_valid is not None and heatmap_valid.shape != (
+            batch_size,
+            num_frames,
+        ):
+            raise ValueError(
+                "multi-current heatmap_valid must be [B,N], got "
+                f"{tuple(heatmap_valid.shape)}"
+            )
+        return (
+            heatmap_tokens.flatten(0, 1),
+            None if heatmap_mask is None else heatmap_mask.flatten(0, 1),
+            None if heatmap_valid is None else heatmap_valid.flatten(0, 1),
+        )
+
+    @staticmethod
+    def _heatmap_dit_kwargs(
+        heatmap_tokens: torch.Tensor | None,
+        heatmap_mask: torch.Tensor | None,
+        heatmap_valid: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor | None]:
+        """Keep the native call signature untouched when control is disabled."""
+
+        if heatmap_tokens is None:
+            if heatmap_mask is not None or heatmap_valid is not None:
+                raise ValueError("heatmap_mask/heatmap_valid require heatmap_tokens")
+            return {}
+        return {
+            "heatmap_tokens": heatmap_tokens,
+            "heatmap_mask": heatmap_mask,
+            "heatmap_valid": heatmap_valid,
+        }
 
     # ==================== Condition Fusion ====================
 
@@ -378,10 +491,7 @@ class NextDiTActionHead(nn.Module):
         if traj_cond.ndim != 3:
             raise ValueError(f"traj_cond must be [B,Q,D], got {tuple(traj_cond.shape)}")
         if traj_cond.shape[-1] != self.config.latent_emb_size:
-            raise ValueError(
-                f"Expected projected dim {self.config.latent_emb_size}, "
-                f"got {traj_cond.shape[-1]}"
-            )
+            raise ValueError(f"Expected projected dim {self.config.latent_emb_size}, got {traj_cond.shape[-1]}")
 
         if traj_images is not None:
             memory_tokens = self._encode_visual_memory(traj_images)
@@ -424,22 +534,22 @@ class NextDiTActionHead(nn.Module):
         noisy_trajectory: torch.Tensor,
         timesteps: torch.Tensor,
         traj_images: torch.Tensor | None = None,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict flow velocity from pre-projected NextDiT condition tokens."""
         latents = self._fuse_projected_conditions(traj_cond, traj_images)
         bsz = noisy_trajectory.shape[0]
         action_features = self.action_encoder(noisy_trajectory)
-        pos_ids = (
-            torch.arange(noisy_trajectory.shape[1], device=noisy_trajectory.device)
-            .reshape(1, -1)
-            .repeat(bsz, 1)
-        )
+        pos_ids = torch.arange(noisy_trajectory.shape[1], device=noisy_trajectory.device).reshape(1, -1).repeat(bsz, 1)
         pos_embed = self.pos_encoding(pos_ids).to(dtype=action_features.dtype)
         action_features = action_features + pos_embed
+        heatmap_kwargs = self._heatmap_dit_kwargs(
+            heatmap_tokens, heatmap_mask, heatmap_valid
+        )
         velocity = self.traj_dit(
-            x=action_features,
-            timestep=timesteps,
-            z_latents=latents,
+            x=action_features, timestep=timesteps, z_latents=latents, **heatmap_kwargs
         )
         return self.action_decoder(velocity)
 
@@ -464,15 +574,26 @@ class NextDiTActionHead(nn.Module):
         gt_trajectory: torch.Tensor,
         traj_images: torch.Tensor | None = None,
         trajectory_valid: torch.Tensor | None = None,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
         noisy_trajectory: torch.Tensor | None = None,
         timesteps: torch.Tensor | None = None,
         target_velocity: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute flow-matching loss from already-projected conditions."""
-        traj_cond, gt_trajectory, traj_images, trajectory_valid = (
-            self._expand_sequence_training_inputs(
-                traj_cond, gt_trajectory, traj_images, trajectory_valid,
-            )
+        heatmap_tokens, heatmap_mask, heatmap_valid = self._expand_heatmap_sequence_inputs(
+            heatmap_tokens,
+            heatmap_mask,
+            heatmap_valid,
+            gt_trajectory,
+            traj_images,
+        )
+        traj_cond, gt_trajectory, traj_images, trajectory_valid = self._expand_sequence_training_inputs(
+            traj_cond,
+            gt_trajectory,
+            traj_images,
+            trajectory_valid,
         )
         if noisy_trajectory is None or timesteps is None or target_velocity is None:
             noisy_trajectory, timesteps, target_velocity = self.sample_flow_matching_inputs(gt_trajectory)
@@ -481,6 +602,9 @@ class NextDiTActionHead(nn.Module):
             noisy_trajectory,
             timesteps,
             traj_images=traj_images,
+            heatmap_tokens=heatmap_tokens,
+            heatmap_mask=heatmap_mask,
+            heatmap_valid=heatmap_valid,
         )
         return {
             "loss": self.masked_velocity_mse(
@@ -496,6 +620,9 @@ class NextDiTActionHead(nn.Module):
         gt_trajectory: torch.Tensor,
         traj_images: torch.Tensor | None = None,
         trajectory_valid: torch.Tensor | None = None,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute flow matching training loss.
@@ -510,10 +637,18 @@ class NextDiTActionHead(nn.Module):
         Returns:
             Dict with 'loss' key
         """
-        traj_hidden_states, gt_trajectory, traj_images, trajectory_valid = (
-            self._expand_sequence_training_inputs(
-                traj_hidden_states, gt_trajectory, traj_images, trajectory_valid,
-            )
+        heatmap_tokens, heatmap_mask, heatmap_valid = self._expand_heatmap_sequence_inputs(
+            heatmap_tokens,
+            heatmap_mask,
+            heatmap_valid,
+            gt_trajectory,
+            traj_images,
+        )
+        traj_hidden_states, gt_trajectory, traj_images, trajectory_valid = self._expand_sequence_training_inputs(
+            traj_hidden_states,
+            gt_trajectory,
+            traj_images,
+            trajectory_valid,
         )
         latents = self._fuse_conditions(traj_hidden_states, traj_images)
 
@@ -542,10 +677,14 @@ class NextDiTActionHead(nn.Module):
         action_features = action_features + pos_embed
 
         # NextDiT forward
+        heatmap_kwargs = self._heatmap_dit_kwargs(
+            heatmap_tokens, heatmap_mask, heatmap_valid
+        )
         noise_pred = self.traj_dit(
             x=action_features,
             timestep=timesteps,
             z_latents=latents,
+            **heatmap_kwargs,
         )
         noise_pred = self.action_decoder(noise_pred)  # (B, T, action_dim)
 
@@ -566,6 +705,72 @@ class NextDiTActionHead(nn.Module):
 
         return {"loss": loss_val}
 
+    @staticmethod
+    def _prepare_cfg_heatmap_inputs(
+        heatmap_tokens: torch.Tensor | None,
+        heatmap_mask: torch.Tensor | None,
+        heatmap_valid: torch.Tensor | None,
+        *,
+        batch_size: int,
+        num_sample_trajs: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Build [unconditional, conditional] control batches in native CFG order."""
+
+        if num_sample_trajs <= 0:
+            raise ValueError("num_sample_trajs must be positive")
+        if heatmap_tokens is None:
+            if heatmap_mask is not None or heatmap_valid is not None:
+                raise ValueError("heatmap_mask/heatmap_valid require heatmap_tokens")
+            return None, None, None
+        if heatmap_tokens.ndim != 3 or heatmap_tokens.shape[0] != batch_size:
+            raise ValueError(
+                "heatmap_tokens must be [B,S,D] with B matching conditions, got "
+                f"{tuple(heatmap_tokens.shape)}"
+            )
+
+        token_count = heatmap_tokens.shape[1]
+        if heatmap_mask is None:
+            heatmap_mask = torch.ones(
+                (batch_size, token_count),
+                dtype=torch.bool,
+                device=heatmap_tokens.device,
+            )
+        elif heatmap_mask.dtype != torch.bool or heatmap_mask.shape != (
+            batch_size,
+            token_count,
+        ):
+            raise ValueError(
+                "heatmap_mask must be bool [B,S], got "
+                f"dtype={heatmap_mask.dtype} shape={tuple(heatmap_mask.shape)}"
+            )
+        if heatmap_valid is None:
+            conditional_valid = heatmap_mask.any(dim=1)
+        else:
+            if heatmap_valid.dtype != torch.bool or heatmap_valid.shape != (
+                batch_size,
+            ):
+                raise ValueError(
+                    "heatmap_valid must be bool [B], got "
+                    f"dtype={heatmap_valid.dtype} shape={tuple(heatmap_valid.shape)}"
+                )
+            conditional_valid = heatmap_valid & heatmap_mask.any(dim=1)
+
+        # The unconditional half receives explicit zero KV and valid=False.
+        # Repeat-interleave exactly mirrors native condition token ordering.
+        cfg_tokens = torch.cat(
+            (torch.zeros_like(heatmap_tokens), heatmap_tokens),
+            dim=0,
+        ).repeat_interleave(num_sample_trajs, dim=0)
+        cfg_mask = torch.cat((heatmap_mask, heatmap_mask), dim=0).repeat_interleave(
+            num_sample_trajs,
+            dim=0,
+        )
+        cfg_valid = torch.cat(
+            (torch.zeros_like(conditional_valid), conditional_valid),
+            dim=0,
+        ).repeat_interleave(num_sample_trajs, dim=0)
+        return cfg_tokens, cfg_mask, cfg_valid
+
     # ==================== Flow Matching Inference ====================
 
     def _generate_traj_from_condition_latents(
@@ -576,6 +781,11 @@ class NextDiTActionHead(nn.Module):
         guidance_scale: float,
         num_inference_steps: int,
         num_sample_trajs: int,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         device = latents_cond.device
         dtype = latents_cond.dtype
@@ -585,14 +795,47 @@ class NextDiTActionHead(nn.Module):
         hidden_states_null = torch.zeros_like(latents_cond)
         hidden_states_input = torch.cat([hidden_states_null, latents_cond], dim=0)
         hidden_states_input = hidden_states_input.repeat_interleave(num_sample_trajs, dim=0)
-
-        # Initialize random noise
-        traj_latents = randn_tensor(
-            shape=(batch_size * num_sample_trajs, predict_step_nums, self.config.action_dim),
-            generator=None,
-            device=device,
-            dtype=dtype,
+        cfg_heatmap_tokens, cfg_heatmap_mask, cfg_heatmap_valid = (
+            self._prepare_cfg_heatmap_inputs(
+                heatmap_tokens,
+                heatmap_mask,
+                heatmap_valid,
+                batch_size=batch_size,
+                num_sample_trajs=num_sample_trajs,
+            )
         )
+
+        # An explicit tensor is stronger than a seed: paired native/control
+        # calls remain sample-aligned even if an earlier random operation or
+        # the generator implementation changes. Clone because schedulers are
+        # allowed to update their sample argument in-place.
+        expected_noise_shape = (
+            batch_size * num_sample_trajs,
+            predict_step_nums,
+            self.config.action_dim,
+        )
+        if initial_noise is not None:
+            if generator is not None:
+                raise ValueError("generator and initial_noise are mutually exclusive")
+            if not isinstance(initial_noise, torch.Tensor):
+                raise TypeError("initial_noise must be a torch.Tensor")
+            if tuple(initial_noise.shape) != expected_noise_shape:
+                raise ValueError(
+                    "initial_noise must have shape "
+                    f"{expected_noise_shape}, got {tuple(initial_noise.shape)}"
+                )
+            if not initial_noise.is_floating_point():
+                raise TypeError("initial_noise must have a floating-point dtype")
+            if not bool(torch.isfinite(initial_noise).all().item()):
+                raise ValueError("initial_noise must contain only finite values")
+            traj_latents = initial_noise.detach().to(device=device, dtype=dtype).clone()
+        else:
+            traj_latents = randn_tensor(
+                shape=expected_noise_shape,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
 
         # Reuse the existing noise scheduler to avoid repeated allocations.
         # Reset timesteps for inference (training config is preserved after this call).
@@ -615,10 +858,14 @@ class NextDiTActionHead(nn.Module):
             if hasattr(self.noise_scheduler, "scale_model_input"):
                 latent_model_input = self.noise_scheduler.scale_model_input(latent_model_input, t)
 
+            heatmap_kwargs = self._heatmap_dit_kwargs(
+                cfg_heatmap_tokens, cfg_heatmap_mask, cfg_heatmap_valid
+            )
             noise_pred = self.traj_dit(
                 x=latent_model_input,
                 timestep=t.unsqueeze(0).expand(latent_model_input.shape[0]).to(device, torch.long),
                 z_latents=hidden_states_input,
+                **heatmap_kwargs,
             )
             noise_pred = self.action_decoder(noise_pred)
 
@@ -639,6 +886,11 @@ class NextDiTActionHead(nn.Module):
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Generate trajectory via iterative flow matching denoising with CFG.
@@ -661,6 +913,11 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             num_sample_trajs=num_sample_trajs,
+            heatmap_tokens=heatmap_tokens,
+            heatmap_mask=heatmap_mask,
+            heatmap_valid=heatmap_valid,
+            generator=generator,
+            initial_noise=initial_noise,
         )
 
     @torch.no_grad()
@@ -672,6 +929,11 @@ class NextDiTActionHead(nn.Module):
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate trajectories from pre-projected NextDiT condition tokens."""
         latents_cond = self._fuse_projected_conditions(traj_cond, traj_images)
@@ -681,6 +943,11 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             num_sample_trajs=num_sample_trajs,
+            heatmap_tokens=heatmap_tokens,
+            heatmap_mask=heatmap_mask,
+            heatmap_valid=heatmap_valid,
+            generator=generator,
+            initial_noise=initial_noise,
         )
 
     @torch.no_grad()
@@ -688,6 +955,12 @@ class NextDiTActionHead(nn.Module):
         self,
         traj_hidden_states: torch.Tensor,
         traj_images: torch.Tensor | None = None,
+        *,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         High-level trajectory inference interface.
@@ -703,6 +976,11 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=self.config.guidance_scale,
             num_inference_steps=self.config.num_inference_steps,
             num_sample_trajs=self.config.num_sample_trajs,
+            heatmap_tokens=heatmap_tokens,
+            heatmap_mask=heatmap_mask,
+            heatmap_valid=heatmap_valid,
+            generator=generator,
+            initial_noise=initial_noise,
         )
 
     @torch.no_grad()
@@ -710,6 +988,12 @@ class NextDiTActionHead(nn.Module):
         self,
         traj_cond: torch.Tensor,
         traj_images: torch.Tensor | None = None,
+        *,
+        heatmap_tokens: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """High-level inference interface for direct 768-dim conditions."""
         self.eval()
@@ -720,4 +1004,9 @@ class NextDiTActionHead(nn.Module):
             guidance_scale=self.config.guidance_scale,
             num_inference_steps=self.config.num_inference_steps,
             num_sample_trajs=self.config.num_sample_trajs,
+            heatmap_tokens=heatmap_tokens,
+            heatmap_mask=heatmap_mask,
+            heatmap_valid=heatmap_valid,
+            generator=generator,
+            initial_noise=initial_noise,
         )

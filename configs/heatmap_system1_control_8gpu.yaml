@@ -1,0 +1,284 @@
+seed: 42
+
+# Frozen single-view heatmap -> trainable residual control on the released
+# InternNav System1 path. The unified InternNav path is intentionally fixed;
+# only the frozen heatmap dependency and sealed DAgger roots are injected by
+# the fail-closed launcher.
+paths:
+  dataset_root: ${R2R_EXPERT_ROOT}
+  log_out_dir: ${HEATMAP_CONTROL_OUT_DIR}
+  tensorboard_dir: ${HEATMAP_CONTROL_TB_DIR}
+
+data:
+  train_split: train
+  val_split: val
+  image_size: [384, 384]
+  init_hm_size: [64, 64]
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  dataset_type: expert_dagger_mixture
+  use_worker_tokenized_collator: true
+  # Required for deterministic sampler order and exact skip-based mid-epoch
+  # resume when DataLoader workers finish samples at different speeds.
+  in_order: true
+  shm_bypass: auto
+  shm_bypass_min_gb: 8.0
+
+  # Expert trajectories supply 50% of every deterministic global epoch plan.
+  # No heatmap files are loaded: the frozen heatmap branch runs online.
+  trajectory:
+    min_history: 5
+    num_history_sample: 8
+    panoramic_vlm_input: false
+    load_single_view_history_frames: true
+    load_depth: false
+    cache_poses: true
+    sample_stride: 2
+    clip_level_sampling: false
+    samples_per_clip: 5
+    val_samples_per_clip: 2
+    random_subsequence: false
+    min_subsequence_length: 30
+    subsequence_samples_per_clip: 5
+    include_stop_samples_random_subsequence: false
+    predict_horizon: 32
+    action_scale: 4.0
+    trajectory_target_convention: internnav_habitat
+    enable_augmentation: false
+    enable_trajectory_augmentation: false
+    compute_pixel_goal: true
+    compute_pano_view_pixel_goal: false
+    load_lookdown_for_system2: true
+    system2_sft_protocol: internnav
+    structured_pano_output: false
+    pixel_goal_direction: front_down
+    load_history_heatmap: false
+    require_sft_target: true
+    sft_include_turns: false
+    sft_include_forward: false
+    system2_sample_step: 1
+    system2_min_pixel_goal_len: 3
+    system2_stop_oversample: 0
+    load_traj_images: true
+    traj_image_size: [224, 224]
+
+  # The launcher reads the sealed training_roots.json and exports these exact
+  # four roots plus the common native-policy fingerprint before validation.
+  # These four storage shards are consumed by all eight DDP ranks through the
+  # deterministic global mixture plan; shard count is not GPU count.
+  trajectory_dagger:
+    collection_roots:
+      - ${DAGGER_ROOT_00}
+      - ${DAGGER_ROOT_01}
+      - ${DAGGER_ROOT_02}
+      - ${DAGGER_ROOT_03}
+    allow_unsealed_debug: false
+    source_types: [dagger_normal, dagger_hard]
+    num_history: 8
+    verify_tar_sha256: false
+    require_lookdown: true
+    expected_policy_mode: internnav_native
+    expected_policy_fingerprint: ${DAGGER_POLICY_FINGERPRINT}
+
+  mixture:
+    profile: expert50_normal20_hard30
+    seed: 42
+    # Formal recipe lock: 36k expert, 14.4k normal, 21.6k hard per epoch.
+    epoch_size: 72000
+
+model:
+  type: vln_pipeline
+  device: cuda
+
+  # Released InternNav System2/Qwen, frozen exactly as shipped.
+  llm:
+    model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    max_video_frames: -1
+    gradient_checkpointing: false
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: false
+    frozen_traj_inference_mode: true
+    traj_last_hidden_state_only: false
+
+  # The only externally loaded weights are model.heatmap_vln parameters from
+  # HEATMAP_CONTROL_CKPT, verified by the exact SHA below. Its predictions are
+  # generated online and detached before the trainable tokenizer.
+  heatmap:
+    enable: true
+    input_mode: internnav_single_view
+    feature_source: vit_only
+    architecture_id: internnav_single_view_vision_only_four_direction_v2
+    output_direction_order: [front, right, back, left]
+    history_pose_convention: habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1
+    c_vit: 1280
+    c_llm: 3584
+    c_fused: 256
+    vit_layer_indices: [7, 15, 23, 31]
+    llm_layer_indices: []
+    heatmap_size: [64, 64]
+    image_size: 384
+    heatmap_trains_backbone: false
+    decoder_mode: legacy
+    restore_vit_spatial_layout: true
+    coarse_logit_residual: false
+    joint_panorama_inference: true
+    conditioner_global_context: true
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 2
+      max_spatial_range: 10.0
+
+  # Released InternNav System1: native cond_projector, DINO/QFormer memory and
+  # all twelve NextDiT blocks stay frozen. Only zero-gated residual controls
+  # and the shared structured heatmap tokenizer are trainable.
+  action_head:
+    enable: true
+    nextdit:
+      internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+      enabled: true
+      vlm_hidden_dim: 3584
+      latent_emb_size: 768
+      n_query: 4
+      dit_dim: 384
+      dit_layers: 12
+      dit_heads: 6
+      dit_kv_heads: 6
+      dit_ffn_dim_multiplier: 0.6666666666666666
+      predict_steps: 32
+      action_dim: 3
+      num_inference_steps: 10
+      guidance_scale: 1.0
+      num_sample_trajs: 32
+      dav2_ckpt_path: ""
+      internnav_system1_path: ""
+      pretrained_system1_path: null
+      enable_gradient_checkpointing: false
+      warmup_steps: 0
+      heatmap_control:
+        enabled: true
+        schema_version: heatmap-control-v1
+        token_dim: 128
+        control_dim: 128
+        num_heads: 4
+        coarse_size: 8
+        temporal_layers: 1
+        temporal_heads: 4
+        temporal_ffn_dim: 512
+        dropout: 0.0
+        age_normalizer_steps: 32.0
+        heatmap_checkpoint_path: ${HEATMAP_CONTROL_CKPT}
+        heatmap_checkpoint_sha256: ${HEATMAP_CONTROL_CKPT_SHA256}
+
+training:
+  stages:
+    - name: heatmap_system1_control
+      epochs: 3
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: false
+      train_history: false
+      train_future: false
+      train_lm: false
+      train_system2_sft: false
+      train_action: true
+      teacher_force_system2_answer: true
+      system2_sft_protocol: internnav
+      sft_include_turns: false
+      sft_include_forward: false
+      strict_trainable_modules: true
+      requires_base_checkpoint: false
+      require_complete_internnav_system1: true
+      bridge_only: false
+      retain_raw_panoramic_views: false
+      compute_pano_text_anchor_positions: false
+      retain_history_rel_poses: true
+      trainable_modules:
+        - heatmap_tokenizer
+        - heatmap_control
+      frozen_modules:
+        - vlm_backbone
+        - qwen2_5_vl
+        - lora
+        - heatmap_vln
+        - latent_queries
+        - cond_projector
+        - memory_encoder
+        - rgb_resampler
+        - traj_dit
+        - action_encoder
+        - action_decoder
+        - rgb_model
+        - pos_encoding
+        - llm_projector
+        - pano_latent_adapter
+
+optim:
+  optimizer: adamw
+  learning_rate: 5.0e-5
+  heatmap_tokenizer_lr: 1.0e-4
+  heatmap_control_lr: 5.0e-5
+  heatmap_gate_lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr: 1.0e-6
+  batch_size: 1
+  grad_accum_steps: 4
+  ema_decay: 0.999
+  ema_warmup_steps: 500
+
+loss:
+  heatmap_loss_type: heatmap_vln
+  heatmap_weight: 0.0
+  trajectory_weight: 1.0
+  lm_weight: 0.0
+
+gpu:
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
+  backend: nccl
+  multi_gpu:
+    enabled: true
+    find_unused_parameters: false
+
+log:
+  save_every_epochs: 1
+  vis_every_steps: 500
+  val_vis_batches: 0
+  max_ckpts: 6
+  use_tensorboard: true
+  enable_timing: true
+  epoch_boundary_cooldown_s: 8
+  log_interval: 20
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  mid_epoch_save_every: 1000
+  notify:
+    enabled: false
+
+validation:
+  # Formal control training performs no train-side validation, evaluation,
+  # early stopping, or best-checkpoint selection. The launcher evaluates only
+  # the complete epoch_003.pth once, on the full 1839-episode val_unseen split.
+  enabled: false
+  eval_every_epochs: 0
+  best_selection_enabled: false
+  evaluate_before_training: false
+  baseline_as_best_threshold: false
+  save_best_metric: val_total_loss
+  patience: 999
+  val_inference_batches: 0

@@ -33,6 +33,8 @@ from diffusers.models.normalization import (
 )
 from diffusers.utils import is_torch_version, logging
 
+from ..heatmap_control import HeatmapControlAdapter
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -118,6 +120,35 @@ class LuminaNextDiTBlock(nn.Module):
 
         self.norm1_context = RMSNorm(cross_attention_dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
 
+        self.heatmap_control: HeatmapControlAdapter | None = None
+
+    def enable_heatmap_control(
+        self,
+        *,
+        control_dim: int = 128,
+        num_heads: int = 4,
+    ) -> HeatmapControlAdapter:
+        """Attach this block's independent control branch after native loading."""
+
+        if self.heatmap_control is not None:
+            if (
+                self.heatmap_control.control_dim != int(control_dim)
+                or self.heatmap_control.num_heads != int(num_heads)
+            ):
+                raise ValueError(
+                    "heatmap control is already enabled with a different configuration"
+                )
+            return self.heatmap_control
+
+        adapter = HeatmapControlAdapter(
+            model_dim=self.attn2.to_q.in_features,
+            control_dim=int(control_dim),
+            num_heads=int(num_heads),
+            norm_eps=float(getattr(self.norm2, "eps", 1e-5)),
+        ).to(device=self.gate.device)
+        self.heatmap_control = adapter
+        return adapter
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -127,6 +158,9 @@ class LuminaNextDiTBlock(nn.Module):
         encoder_mask: torch.Tensor,
         temb: torch.Tensor,
         cross_attention_kwargs: dict[str, Any] | None = None,
+        heatmap_hidden_states: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
     ):
         """
         Perform a forward pass through the LuminaNextDiTBlock.
@@ -170,6 +204,24 @@ class LuminaNextDiTBlock(nn.Module):
         hidden_states = self.attn2.to_out[0](mixed_attn_output)
 
         hidden_states = residual + gate_msa.unsqueeze(1).tanh() * self.norm2(hidden_states)
+
+        # Inject only after the complete native attention residual and before
+        # the native FFN. None is a hard runtime bypass; at gate=0 the added
+        # residual is exactly zero.
+        if heatmap_hidden_states is not None:
+            if self.heatmap_control is None:
+                raise RuntimeError(
+                    "heatmap tokens were supplied but this NextDiT block has no heatmap control"
+                )
+            heatmap_delta = self.heatmap_control(
+                hidden_states,
+                heatmap_hidden_states,
+                heatmap_mask=heatmap_mask,
+                heatmap_valid=heatmap_valid,
+            )
+            hidden_states = hidden_states + heatmap_delta.to(dtype=hidden_states.dtype)
+        elif heatmap_mask is not None or heatmap_valid is not None:
+            raise ValueError("heatmap_mask/heatmap_valid require heatmap_hidden_states")
 
         mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
 
@@ -296,6 +348,25 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
 
+    def enable_heatmap_control(
+        self,
+        *,
+        control_dim: int = 128,
+        num_heads: int = 4,
+    ) -> tuple[HeatmapControlAdapter, ...]:
+        """Attach one independent control adapter to every frozen native block."""
+
+        adapters = tuple(
+            layer.enable_heatmap_control(
+                control_dim=control_dim,
+                num_heads=num_heads,
+            )
+            for layer in self.layers
+        )
+        if len(adapters) != len(self.layers):
+            raise RuntimeError("failed to attach heatmap control to every NextDiT block")
+        return adapters
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -305,6 +376,9 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         image_rotary_emb: torch.Tensor,
         cross_attention_kwargs: dict[str, Any] | None = None,
         return_dict=True,
+        heatmap_hidden_states: torch.Tensor | None = None,
+        heatmap_mask: torch.Tensor | None = None,
+        heatmap_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of LuminaNextDiT.
@@ -346,6 +420,9 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
                     encoder_mask,
                     temb,
                     cross_attention_kwargs,
+                    heatmap_hidden_states,
+                    heatmap_mask,
+                    heatmap_valid,
                     **ckpt_kwargs,
                 )
             else:
@@ -357,6 +434,9 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
                     encoder_mask,
                     temb=temb,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    heatmap_hidden_states=heatmap_hidden_states,
+                    heatmap_mask=heatmap_mask,
+                    heatmap_valid=heatmap_valid,
                 )
 
         hidden_states = self.norm_out(hidden_states, temb)

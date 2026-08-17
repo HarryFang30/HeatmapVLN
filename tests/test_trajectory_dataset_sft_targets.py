@@ -63,3 +63,48 @@ def test_system1_goal_length_prefers_structured_pano_goal():
     }
 
     assert VLNTrajectoryDataset._system1_goal_relative_len(result) == 7
+
+
+def test_exact_native_projection_keeps_the_pano_goal_frame():
+    dataset = _dataset_stub()
+    poses = [object() for _ in range(10)]
+    calls = []
+    dataset._load_poses_for_direction = lambda _clip_idx, direction: (
+        poses if direction == "front_down" else None
+    )
+    dataset._load_depth = lambda *_args, **_kwargs: "depth"
+
+    def project(current_pose, goal_pose, **kwargs):
+        calls.append((current_pose, goal_pose, kwargs))
+        return [151, 202]
+
+    dataset._compute_pixel_goal = project
+    result = dataset._project_exact_goal_to_native_view(
+        clip_idx=0,
+        clip_dir=None,
+        current_t=4,
+        num_frames=10,
+        goal_relative_len=3,
+        img_size=(256, 256),
+    )
+
+    assert result == [151, 202]
+    assert calls[0][0] is poses[4]
+    assert calls[0][1] is poses[7]
+
+
+def test_exact_native_projection_does_not_search_for_a_different_waypoint():
+    dataset = _dataset_stub()
+    poses = [object() for _ in range(10)]
+    dataset._load_poses_for_direction = lambda *_args: poses
+    dataset._load_depth = lambda *_args, **_kwargs: "depth"
+    dataset._compute_pixel_goal = lambda *_args, **_kwargs: None
+
+    assert dataset._project_exact_goal_to_native_view(
+        clip_idx=0,
+        clip_dir=None,
+        current_t=4,
+        num_frames=10,
+        goal_relative_len=3,
+        img_size=(256, 256),
+    ) is None

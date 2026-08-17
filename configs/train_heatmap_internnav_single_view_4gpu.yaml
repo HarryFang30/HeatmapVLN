@@ -1,0 +1,234 @@
+seed: 42
+
+# All host-specific locations are supplied by the launcher.  Keeping them as
+# environment variables lets the exact same validated config run on the
+# development host and in the single-node 4-GPU cluster container.
+paths:
+  dataset_root: ${HEATMAP_DATA_ROOT}
+  log_out_dir: ${SINGLE_VIEW_HM_OUT_DIR}
+  tensorboard_dir: ${SINGLE_VIEW_HM_TB_DIR}
+  internnav_model_path: ${INTERNNAV_MODEL_PATH}
+
+data:
+  # The random-walk root has no train/val directories.  VLNSlidingWindowDataset
+  # therefore applies its deterministic scene-name MD5 split: 54 train scenes
+  # (5177 clips) and 7 val scenes (823 clips), with zero scene overlap.
+  train_split: train
+  val_split: val
+  image_size: [384, 384]
+  init_hm_size: [64, 64]
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  dataset_type: sliding_window
+  use_worker_tokenized_collator: false
+  shm_bypass: auto
+  shm_bypass_min_gb: 8.0
+
+  sliding_window:
+    min_history: 5
+    num_history_sample: 8
+    load_depth: true
+    cache_poses: true
+    sample_stride: 2
+    enable_augmentation: false
+    clip_level_sampling: true
+    samples_per_clip: 15
+    # 823 clips * 8 samples = 6584, exactly divisible by 4 ranks.  This avoids
+    # DistributedSampler padding/duplication in the full validation metrics.
+    val_samples_per_clip: 8
+    defer_heatmap_to_gpu: false
+    load_single_view_history_frames: true
+    single_view_rgb_input: true
+
+model:
+  type: vln_pipeline
+  device: cuda
+
+  llm:
+    backbone_type: qwen2_5_vl
+    hidden_dim: 3584
+    token_dim: 896
+    torch_dtype: bfloat16
+    # The language stack is never executed in this heatmap-only stage.  SDPA
+    # avoids making FlashAttention a cluster launch dependency.
+    attn_implementation: sdpa
+    max_video_frames: -1
+    gradient_checkpointing: false
+    enable_packing: false
+    max_seq_length: 8192
+    spatial_merge_size: 2
+    use_lora: false
+
+  heatmap:
+    enable: true
+    input_mode: internnav_single_view
+    feature_source: vit_only
+    architecture_id: internnav_single_view_vision_only_four_direction_v2
+    output_direction_order: [front, right, back, left]
+    # This string is checked fail-closed by the static training preflight.  It
+    # must remain synchronized with the final real-data geometry audit.
+    history_pose_convention: habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1
+    c_vit: 1280
+    c_llm: 3584
+    c_fused: 256
+    vit_layer_indices: [7, 15, 23, 31]
+    llm_layer_indices: []
+    heatmap_size: [64, 64]
+    image_size: 384
+    heatmap_trains_backbone: false
+    decoder_mode: legacy
+    restore_vit_spatial_layout: true
+    coarse_logit_residual: false
+    joint_panorama_inference: true
+    conditioner_global_context: true
+
+    trajectory:
+      enable: true
+      num_freqs: 16
+      d_attn: 256
+      num_heads: 4
+      num_layers: 2
+      max_spatial_range: 10.0
+
+  # System1 is not instantiated in this heatmap-only training process.  A
+  # downstream deployment can load untouched native InternNav System1.
+  action_head:
+    enable: false
+
+training:
+  stages:
+    - name: internnav_single_view_heatmap_only
+      epochs: 6
+      hm_size: [64, 64]
+      heatmap_loss_type: heatmap_vln
+      train_heatmap: true
+      train_history: true
+      train_future: false
+      train_lm: false
+      train_system2_sft: false
+      train_action: false
+      strict_trainable_modules: true
+      heatmap_fp32: true
+      retain_raw_panoramic_views: false
+      compute_pano_text_anchor_positions: false
+      retain_history_rel_poses: true
+      trainable_modules:
+        - heatmap_vln
+      frozen_modules:
+        - vlm_backbone
+        - qwen2_5_vl
+        - lora
+        - nextdit_action_head
+        - latent_queries
+        - llm_projector
+        - pano_latent_adapter
+      # --load-weights must point to the separately derived 53-tensor artifact,
+      # never to the legacy full checkpoint that also contains Qwen LoRA.
+      heatmap_warmstart_contract:
+        policy: internnav_single_view_head_v2
+        expected_lora_tensors: 0
+        expected_vit_dpt_tensors: 12
+        expected_llm_dpt_tensors: 0
+        expected_coarse_tensors: 35
+        expected_fine_tensors: 6
+        require_metadata: true
+
+optim:
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  heatmap_lr: 1.0e-4
+  # Reused legacy tensors move conservatively; the two new panorama
+  # conditioners use the larger new-module learning rate.
+  heatmap_vit_lr: 5.0e-5
+  heatmap_coarse_lr: 1.0e-4
+  heatmap_fine_lr: 5.0e-5
+  heatmap_new_lr: 2.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: bf16
+  scheduler: cosine
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  # Four-card setting: 2 samples/rank, 4 ranks, accumulation 4 gives
+  # an effective global batch of 32 while each forward carries 18 RGB images.
+  batch_size: 2
+  grad_accum_steps: 4
+  ema_decay: 0.999
+  ema_warmup_steps: 500
+
+loss:
+  heatmap_loss_type: heatmap_vln
+  heatmap_vln:
+    lambda_vis: 1.0
+    lambda_coord: 0.2
+    lambda_kl: 0.0
+    lambda_peak: 1.0
+    lambda_neg: 0.25
+    # Explicit panoramic and macro terms prevent the abundant/front direction
+    # from hiding a side/back collapse.
+    lambda_view_macro: 0.5
+    lambda_direction_macro: 0.5
+    lambda_panoramic_view: 1.0
+    panoramic_detach_visibility: false
+    temperature: 1.0
+    vis_pos_weight: 7.0
+    coord_smooth_l1_beta: 0.1
+    allow_probability_fallback: false
+    temperature_schedule:
+      enabled: false
+      mode: cosine
+      start: 1.0
+      end: 1.0
+  heatmap_weight: 1.0
+  trajectory_weight: 0.0
+  lm_weight: 0.0
+
+gpu:
+  devices: [0, 1, 2, 3]
+  backend: nccl
+  multi_gpu:
+    enabled: true
+    find_unused_parameters: false
+
+log:
+  save_every_epochs: 1
+  vis_every_steps: 1000
+  val_vis_batches: 0
+  max_ckpts: 8
+  use_tensorboard: true
+  enable_timing: true
+  epoch_boundary_cooldown_s: 8
+  log_interval: 20
+  show_gpu_memory: true
+  tqdm_ncols: 120
+  log_level: INFO
+  diag_interval: 100
+  mid_epoch_save_every: 1000
+  notify:
+    enabled: false
+
+validation:
+  enabled: true
+  eval_every_epochs: 1
+  # Direction-macro localization is the primary generalization objective.
+  save_best_metric: val_heatmap_macro_joint_pck8
+  save_best_mode: max
+  evaluate_before_training: true
+  baseline_as_best_threshold: true
+  baseline_overall_metric: val_heatmap_joint_pck8
+  baseline_overall_tolerance: 0.02
+  baseline_back_metric: val_heatmap_back_pck8
+  baseline_back_tolerance: 0.03
+  baseline_direction_metrics:
+    front: val_heatmap_front_pck8
+    right: val_heatmap_right_pck8
+    back: val_heatmap_back_pck8
+    left: val_heatmap_left_pck8
+    view5: val_heatmap_view5_accuracy
+  baseline_direction_tolerance: 0.03
+  save_best_loss_tiebreak_metric: val_loss
+  patience: 3
+  # Only controls the auxiliary MSE pass; PCK/view metrics still use every
+  # validation batch and are DDP all-reduced.
+  val_inference_batches: 10

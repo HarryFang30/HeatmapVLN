@@ -28,6 +28,11 @@ else:
 from .augmentation import ColorJitterAugmentation, GaussianNoiseAugmentation, InternNavStyleAugmentation
 from .heatmap_geometry import compute_history_heatmap
 from .trajectory_utils import compute_history_rel_poses
+from .amb3r_pose_cache import (
+    AMB3RPoseCache,
+    AMB3RPoseCacheError,
+    AMB3R_POSE_PROVIDER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,43 @@ _FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 4)
 def _require_cv2() -> None:
     if cv2 is None:
         raise ImportError("opencv-python is required for dataset image decoding") from _CV2_IMPORT_ERROR
+
+
+def _resolve_single_view_history_frames(
+    *,
+    load_single_view_history_frames: bool | None,
+    load_history_frames: bool | None,
+) -> bool:
+    """Resolve the explicit setting and its deprecated constructor alias."""
+    if (
+        load_single_view_history_frames is not None
+        and load_history_frames is not None
+        and load_single_view_history_frames != load_history_frames
+    ):
+        raise ValueError(
+            "Conflicting dataset arguments: load_single_view_history_frames="
+            f"{load_single_view_history_frames!r}, but deprecated "
+            f"load_history_frames={load_history_frames!r}"
+        )
+    if load_history_frames is not None:
+        logger.warning(
+            "Dataset argument load_history_frames is deprecated; use "
+            "load_single_view_history_frames. It controls only the single-view "
+            "history_frames tensor, not history_panoramas."
+        )
+    value = (
+        load_single_view_history_frames
+        if load_single_view_history_frames is not None
+        else load_history_frames
+        if load_history_frames is not None
+        else True
+    )
+    if type(value) is not bool:
+        raise TypeError(
+            "load_single_view_history_frames must be a boolean, "
+            f"got {value!r}"
+        )
+    return value
 
 
 def _evict_from_page_cache(filepath):
@@ -106,7 +148,7 @@ class VLNSlidingWindowDataset(Dataset):
         load_depth: bool = True,
         cache_poses: bool = True,
         sample_stride: int = 1,  # 采样步长：每隔 N 帧采样一次，1 表示不跳过
-        enable_augmentation: bool = True,  # 是否启用数据增强
+        enable_augmentation: bool = False,  # 是否启用数据增强（必须显式开启）
         # Clip-level 采样策略（解决样本高度相关性问题）
         samples_per_clip: int = 2,  # 每个 clip 每 epoch 采样的样本数
         clip_level_sampling: bool = True,  # 是否启用 clip-level 采样
@@ -119,13 +161,58 @@ class VLNSlidingWindowDataset(Dataset):
         chunk_cache_size: int = 6,  # chunks 模式下缓存的数组个数（worker 内）
         metadata_cache_size: int = 500,  # 元数据 LRU 缓存大小（clip 数量），防止 worker 内存无限增长
         defer_heatmap_to_gpu: bool = False,  # 兼容 train.py 传入（由 GPUHeatmapComputer 处理）
-        load_history_frames: bool = True,
+        load_history_frames: bool | None = None,  # deprecated constructor alias
         max_clips: int = 0,
+        max_clip_id: int = 0,
+        load_single_view_history_frames: bool | None = None,
+        single_view_rgb_input: bool = False,
+        amb3r_pose_cache_root: str | None = None,
+        require_amb3r_pose_cache: bool = False,
+        amb3r_pose_cache_max_clips: int = 16,
     ):
         self.root = Path(root).expanduser()
         self.defer_heatmap_to_gpu = defer_heatmap_to_gpu
-        self.load_history_frames = load_history_frames
+        self.load_single_view_history_frames = _resolve_single_view_history_frames(
+            load_single_view_history_frames=load_single_view_history_frames,
+            load_history_frames=load_history_frames,
+        )
+        if type(single_view_rgb_input) is not bool:
+            raise TypeError(
+                "single_view_rgb_input must be a boolean, "
+                f"got {single_view_rgb_input!r}"
+            )
+        self.single_view_rgb_input = single_view_rgb_input
+        if self.single_view_rgb_input and not self.load_single_view_history_frames:
+            raise ValueError(
+                "single_view_rgb_input requires "
+                "load_single_view_history_frames=true"
+            )
+        if bool(amb3r_pose_cache_root) != bool(require_amb3r_pose_cache):
+            raise ValueError(
+                "AMB3R pose-cache mode must be explicitly required and may not "
+                "silently fall back to GT poses"
+            )
+        if require_amb3r_pose_cache and not self.single_view_rgb_input:
+            raise ValueError(
+                "AMB3R pose-cache mode requires single_view_rgb_input=true"
+            )
+        self.require_amb3r_pose_cache = bool(require_amb3r_pose_cache)
+        self.amb3r_pose_cache = (
+            AMB3RPoseCache(
+                amb3r_pose_cache_root,
+                dataset_root=self.root,
+                num_history=num_history_sample,
+                min_history=min_history,
+                max_cached_clips=amb3r_pose_cache_max_clips,
+            )
+            if self.require_amb3r_pose_cache
+            else None
+        )
         self.max_clips = max(0, int(max_clips or 0))
+        # Collection jobs use monotonically increasing global clip ids.  A
+        # ceiling lets diagnostics reproduce an earlier append-only snapshot
+        # without copying or mutating the dataset on disk.
+        self.max_clip_id = max(0, int(max_clip_id or 0))
         self.split = split
         self.min_history = min_history
         self.num_history_sample = num_history_sample
@@ -138,6 +225,9 @@ class VLNSlidingWindowDataset(Dataset):
         # Clip-level 采样配置
         self.samples_per_clip = samples_per_clip
         self.clip_level_sampling = clip_level_sampling
+        self.dynamic_sampling_enabled = bool(
+            split == 'train' and self.clip_level_sampling
+        )
         self._epoch = 0  # 当前 epoch，用于随机采样
         self._rng = np.random.RandomState(42)  # 可重复的随机数生成器
 
@@ -206,6 +296,32 @@ class VLNSlidingWindowDataset(Dataset):
             f"{len(self.sample_index)} samples, mode={sampling_mode}, "
             f"samples_per_clip={self.samples_per_clip}, min_history={min_history}"
         )
+        panoramic_history_enabled = self._is_panoramic and not self.single_view_rgb_input
+        single_view_status = (
+            "enabled"
+            if self.load_single_view_history_frames
+            else "disabled (history_frames is a one-frame zero placeholder)"
+        )
+        if panoramic_history_enabled:
+            panoramic_status = (
+                f"enabled (K={self.num_history_sample}, 4 views/history; "
+                "independent of load_single_view_history_frames)"
+            )
+        elif self._is_panoramic:
+            panoramic_status = "disabled (front-only model input; four-view GT retained)"
+        else:
+            panoramic_status = "not available for this dataset"
+        logger.info(
+            "History visual inputs: single_view_history_frames=%s; "
+            "history_panoramas=%s",
+            single_view_status,
+            panoramic_status,
+        )
+
+    @property
+    def load_history_frames(self) -> bool:
+        """Deprecated attribute alias kept for out-of-tree callers."""
+        return self.load_single_view_history_frames
 
     def _lru_put(self, cache: OrderedDict, key, value, max_size: int):
         """向 LRU 缓存写入条目，超过上限时淘汰最旧条目。"""
@@ -367,6 +483,12 @@ class VLNSlidingWindowDataset(Dataset):
                 d for d in scene_dir.iterdir()
                 if d.is_dir() and d.name.startswith('clip_')
             ])
+            if self.max_clip_id > 0:
+                clip_dirs = [
+                    clip_dir
+                    for clip_dir in clip_dirs
+                    if self._numeric_clip_id(clip_dir) <= self.max_clip_id
+                ]
             clips.extend(clip_dirs)
 
         if len(clips) == 0:
@@ -384,6 +506,15 @@ class VLNSlidingWindowDataset(Dataset):
 
         logger.info(f"Found {len(clips)} clips in {len(scene_dirs)} scenes")
         return clips
+
+    @staticmethod
+    def _numeric_clip_id(clip_dir: Path) -> int:
+        """Parse the numeric suffix of a ``clip_XXXXXX`` directory."""
+        suffix = clip_dir.name.removeprefix("clip_")
+        try:
+            return int(suffix)
+        except ValueError as exc:
+            raise ValueError(f"Invalid clip directory name: {clip_dir}") from exc
 
     def _precompute_valid_frames(self):
         """预计算每个 clip 的有效帧索引列表（用于 clip-level 采样）
@@ -445,9 +576,36 @@ class VLNSlidingWindowDataset(Dataset):
 
                 valid_frames = list(range(self.min_history, T))
 
+                if self.amb3r_pose_cache is not None:
+                    # Sparse causal endpoint caches define the complete and
+                    # only set of model-input occurrences.  Index directly
+                    # from the cache rather than constructing every RGB frame
+                    # and discovering missing VO rows in __getitem__.
+                    cached_current_ids = self.amb3r_pose_cache.current_frame_ids(
+                        clip_dir,
+                        expected_frame_count=T,
+                    )
+                    available = set(valid_frames)
+                    invalid = [
+                        int(frame_id)
+                        for frame_id in cached_current_ids.tolist()
+                        if int(frame_id) not in available
+                    ]
+                    if invalid:
+                        raise AMB3RPoseCacheError(
+                            "AMB3R cache contains current-frame IDs outside "
+                            f"the dataset-valid range for {clip_dir}: {invalid}"
+                        )
+                    valid_frames = cached_current_ids.tolist()
+
                 if len(valid_frames) > 0:
                     self._clip_valid_frames[clip_idx] = valid_frames
 
+            except AMB3RPoseCacheError:
+                # Required AMB3R input data is a run-level identity contract,
+                # not an optional clip-quality filter.  Skipping here would
+                # silently alter the train/val population or fall back to GT.
+                raise
             except Exception as e:
                 logger.warning(f"Failed to precompute valid frames for clip {clip_dir}: {e}")
                 continue
@@ -723,7 +881,16 @@ class VLNSlidingWindowDataset(Dataset):
                         continue
 
                     # 每个子序列采样 samples_per_clip 个样本
-                    subseq_valid_frames = list(range(subseq_valid_start, subseq_valid_end))
+                    # Filter the prevalidated population instead of rebuilding
+                    # a dense frame range.  In AMB3R mode ``valid_frames`` is
+                    # the sparse causal endpoint set; reconstructing range()
+                    # here would silently put non-cached current IDs back into
+                    # sample_index.
+                    subseq_valid_frames = [
+                        frame_idx
+                        for frame_idx in valid_frames
+                        if subseq_valid_start <= frame_idx < subseq_valid_end
+                    ]
                     num_samples = min(self.samples_per_clip, len(subseq_valid_frames))
 
                     if num_samples > 0:
@@ -942,11 +1109,17 @@ class VLNSlidingWindowDataset(Dataset):
 
         return image_tensor
 
-    def _load_frames(self, clip_dir: Path, frame_indices: np.ndarray) -> torch.Tensor:
-        """加载多帧图像"""
+    def _load_frames(
+        self,
+        clip_dir: Path,
+        frame_indices: np.ndarray,
+        *,
+        direction: str | None = None,
+    ) -> torch.Tensor:
+        """加载多帧图像；``direction='front'`` locks native InternNav input."""
         frames = []
         for idx in frame_indices:
-            frame = self._load_frame(clip_dir, idx)
+            frame = self._load_frame(clip_dir, idx, direction=direction)
             frames.append(frame)
 
         return torch.stack(frames, dim=0)  # [K, C, H, W]
@@ -1191,18 +1364,26 @@ class VLNSlidingWindowDataset(Dataset):
 
             # 3. 加载历史帧
             history_frames = (
-                self._load_frames(clip_dir, history_indices)
-                if self.load_history_frames else
+                self._load_frames(
+                    clip_dir,
+                    history_indices,
+                    direction="front" if self.single_view_rgb_input else None,
+                )
+                if self.load_single_view_history_frames else
                 torch.zeros(1, 3, self.image_size[1], self.image_size[0])
             )
 
             # 4. 加载当前帧
-            if self._is_panoramic:
+            if self._is_panoramic and not self.single_view_rgb_input:
                 current_views = self._load_all_views(clip_dir, current_t)
                 current_frame = current_views[0]
                 history_panoramas = self._load_history_panoramas(clip_dir, history_indices)
             else:
-                current_frame = self._load_frame(clip_dir, current_t)
+                current_frame = self._load_frame(
+                    clip_dir,
+                    current_t,
+                    direction="front" if self.single_view_rgb_input else None,
+                )
                 current_views = None
                 history_panoramas = None
 
@@ -1279,7 +1460,24 @@ class VLNSlidingWindowDataset(Dataset):
                 "discrete_action": discrete_action,    # int (0-3)
                 "is_stop": is_stop,                    # float (0 or 1)
                 "text": text,                          # str
+                # Stable, human-readable occurrence identity used by strict
+                # distributed smoke audits.  It is metadata only and never
+                # enters the Heatmap Head.
+                "sample_identity": (
+                    f"{clip_dir.relative_to(self.root).as_posix()}"
+                    f"@{int(current_t):06d}"
+                ),
             }
+            if self.single_view_rgb_input:
+                result["heatmap_direction_order"] = (
+                    "front",
+                    "right",
+                    "back",
+                    "left",
+                )
+                result["history_pose_convention"] = (
+                    "habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1"
+                )
             if gt_visibility is not None:
                 result["gt_visibility"] = gt_visibility  # [N, 4]
             if current_views is not None:
@@ -1287,9 +1485,30 @@ class VLNSlidingWindowDataset(Dataset):
             if history_panoramas is not None:
                 result["history_panoramas"] = history_panoramas  # [N, 4, 3, H, W]
 
+            if self.amb3r_pose_cache is not None:
+                # GT c2w above is intentionally retained only for heatmap and
+                # visibility supervision.  The model input is 100% cached VO.
+                input_rel_poses = self.amb3r_pose_cache.lookup(
+                    clip_dir,
+                    current_frame_id=current_t,
+                    history_frame_ids=history_indices,
+                )
+            else:
+                input_rel_poses = compute_history_rel_poses(
+                    history_poses,
+                    current_pose,
+                    camera_forward_axis=(
+                        "-z" if self.single_view_rgb_input else "+z"
+                    ),
+                )
             result["history_rel_poses"] = torch.from_numpy(
-                compute_history_rel_poses(history_poses, current_pose)
+                input_rel_poses
             ).float()                                              # [K, 4]
+            result["history_pose_provider"] = (
+                AMB3R_POSE_PROVIDER
+                if self.amb3r_pose_cache is not None
+                else "habitat_gt"
+            )
 
             if self.defer_heatmap_to_gpu:
                 result["history_poses"] = torch.from_numpy(
@@ -1309,8 +1528,20 @@ class VLNSlidingWindowDataset(Dataset):
 
             return result
 
+        except AMB3RPoseCacheError:
+            # A missing or identity-mismatched VO row is a run-level contract
+            # failure, never a recoverable corrupt sample.
+            raise
         except (FileNotFoundError, ValueError, KeyError, OSError,
                 IndexError, TypeError, json.JSONDecodeError) as e:
+            if self.require_amb3r_pose_cache:
+                # A zero-pose dummy would violate the declared 100%-AMB3R
+                # training input distribution, even if the original failure
+                # occurred while decoding RGB or constructing a GT label.
+                raise RuntimeError(
+                    "AMB3R pose-cache training forbids dummy-sample fallback: "
+                    f"clip={clip_dir}, current={current_t}: {e}"
+                ) from e
             with self._sample_failure_lock:
                 self._sample_failure_count += 1
                 failure_count = self._sample_failure_count
@@ -1333,14 +1564,18 @@ class VLNSlidingWindowDataset(Dataset):
         target_w, target_h = self.image_size
         hm_w, hm_h = self.hm_size
         K_heatmap = self.num_history_sample
-        K_frames = self.num_history_sample if self.load_history_frames else 1
+        K_frames = self.num_history_sample if self.load_single_view_history_frames else 1
+        # Keep this helper usable by lightweight contract tests that construct
+        # the dataset with object.__new__ and set only the legacy fields.
+        single_view_rgb_input = getattr(self, "single_view_rgb_input", False)
+        require_amb3r_pose_cache = getattr(
+            self, "require_amb3r_pose_cache", False
+        )
 
         if self._is_panoramic:
             result = {
                 "history_frames": torch.zeros(K_frames, 3, target_h, target_w),
                 "current_frame": torch.zeros(3, target_h, target_w),
-                "current_views": torch.zeros(4, 3, target_h, target_w),
-                "history_panoramas": torch.zeros(K_heatmap, 4, 3, target_h, target_w),
                 "heatmap": torch.zeros(K_heatmap, 4, hm_h, hm_w),
                 "gt_visibility": torch.zeros(K_heatmap, 4),
                 "action": torch.zeros(2),
@@ -1349,6 +1584,11 @@ class VLNSlidingWindowDataset(Dataset):
                 "is_stop": 0.0,
                 "text": "",
             }
+            if not single_view_rgb_input:
+                result["current_views"] = torch.zeros(4, 3, target_h, target_w)
+                result["history_panoramas"] = torch.zeros(
+                    K_heatmap, 4, 3, target_h, target_w
+                )
         else:
             result = {
                 "history_frames": torch.zeros(K_frames, 3, target_h, target_w),
@@ -1361,6 +1601,21 @@ class VLNSlidingWindowDataset(Dataset):
                 "text": "",
             }
         result["history_rel_poses"] = torch.zeros(K_heatmap, 4)
+        result["history_pose_provider"] = (
+            AMB3R_POSE_PROVIDER
+            if require_amb3r_pose_cache
+            else "habitat_gt"
+        )
+        if single_view_rgb_input:
+            result["heatmap_direction_order"] = (
+                "front",
+                "right",
+                "back",
+                "left",
+            )
+            result["history_pose_convention"] = (
+                "habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1"
+            )
         if self.defer_heatmap_to_gpu:
             result["history_poses"] = torch.zeros(K_heatmap, 4, 4)
             result["current_pose"] = torch.zeros(4, 4)

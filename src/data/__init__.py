@@ -17,6 +17,7 @@ import importlib
 from .factory import (
     build_dataset,
     build_sliding_window_dataset,
+    build_trajectory_dagger_dataset,
     build_trajectory_dataset,
 )
 from .packing_collator import PackingCollatorForVLN
@@ -25,11 +26,17 @@ __all__ = [
     'PackingCollatorForVLN',
     'VLNSlidingWindowDataset',
     'VLNTrajectoryDataset',
+    'TrajectoryDaggerDataset',
+    'SourceMixtureDataset',
+    'DeterministicMixtureSampler',
     'build_dataset',
     'build_sliding_window_dataset',
+    'build_trajectory_dagger_dataset',
     'build_trajectory_dataset',
+    'build_expert_dagger_mixture',
     'create_sliding_window_dataloader',
     'create_trajectory_dataloader',
+    'trajectory_dagger_collate_fn',
 ]
 
 _LAZY_ATTRS = {
@@ -37,6 +44,20 @@ _LAZY_ATTRS = {
     "create_sliding_window_dataloader": ("sliding_window_dataset", "create_sliding_window_dataloader"),
     "VLNTrajectoryDataset": ("trajectory_dataset", "VLNTrajectoryDataset"),
     "create_trajectory_dataloader": ("trajectory_dataset", "create_trajectory_dataloader"),
+    "TrajectoryDaggerDataset": ("trajectory_dagger_dataset", "TrajectoryDaggerDataset"),
+    "SourceMixtureDataset": ("trajectory_dagger_dataset", "SourceMixtureDataset"),
+    "DeterministicMixtureSampler": (
+        "trajectory_dagger_dataset",
+        "DeterministicMixtureSampler",
+    ),
+    "build_expert_dagger_mixture": (
+        "trajectory_dagger_dataset",
+        "build_expert_dagger_mixture",
+    ),
+    "trajectory_dagger_collate_fn": (
+        "trajectory_dagger_dataset",
+        "trajectory_dagger_collate_fn",
+    ),
 }
 
 

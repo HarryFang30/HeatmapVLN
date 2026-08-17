@@ -41,10 +41,12 @@ from scripts.training.utils import (
     _load_normalized_state_dict,
     _normalize_state_key,
     assert_complete_lora_checkpoint_match,
+    extract_lora_checkpoint_state,
     load_config,
     make_autocast_context,
     safe_torch_load,
 )
+from scripts.training.validate import _HeatmapJointMetricAccumulator
 
 from src.data.factory import build_sliding_window_dataset
 from src.utils.gpu_heatmap import GPUHeatmapComputer
@@ -55,6 +57,97 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("eval_heatmap")
+
+HEATMAP_DIRECTIONS = ("front", "right", "back", "left")
+
+
+def _checkpoint_stage_config(checkpoint: dict) -> dict:
+    cfg = checkpoint.get("config", {})
+    stages = cfg.get("training", {}).get("stages", [])
+    stage_idx = checkpoint.get("stage_idx")
+    if isinstance(stage_idx, int) and 0 <= stage_idx < len(stages):
+        candidate = stages[stage_idx]
+        if (
+            not checkpoint.get("stage_name")
+            or candidate.get("name") == checkpoint.get("stage_name")
+        ):
+            return candidate
+    for candidate in stages:
+        if candidate.get("name") == checkpoint.get("stage_name"):
+            return candidate
+    return {}
+
+
+def _compose_legacy_dependent_heatmap_state(
+    model,
+    checkpoint: dict,
+    checkpoint_path: str,
+    state: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], int, str | None]:
+    """Strictly add base LoRA to a legacy dependent heatmap checkpoint.
+
+    Older heatmap checkpoints contain only the 65 trainable head tensors.
+    Composition is permitted solely when their embedded stage explicitly
+    declares the base dependency and records an existing absolute base path.
+    The current checkpoint always wins, and only LoRA tensors are taken from
+    the base; the normal completeness/shape checks still run afterwards.
+    """
+    expected_lora = {
+        _normalize_state_key(name)
+        for name, _parameter in model.named_parameters()
+        if "lora_" in _normalize_state_key(name)
+    }
+    checkpoint_lora = {
+        _normalize_state_key(name)
+        for name in state
+        if "lora_" in _normalize_state_key(name)
+    }
+    if expected_lora <= checkpoint_lora:
+        return state, 0, None
+
+    stage_cfg = _checkpoint_stage_config(checkpoint)
+    requires_base = bool(
+        stage_cfg.get("requires_base_checkpoint", False)
+        or stage_cfg.get("bridge_only", False)
+    )
+    if not requires_base:
+        return state, 0, None
+
+    raw_base_path = checkpoint.get("config", {}).get("runtime", {}).get(
+        "base_checkpoint"
+    )
+    if not raw_base_path:
+        raise RuntimeError(
+            "Legacy heatmap checkpoint is missing LoRA tensors and declares "
+            "requires_base_checkpoint, but config.runtime.base_checkpoint is absent"
+        )
+    base_path = Path(str(raw_base_path))
+    if not base_path.is_absolute():
+        raise RuntimeError(
+            "Legacy heatmap checkpoint records a non-absolute base path; "
+            f"refusing ambiguous composition: {base_path}"
+        )
+    if base_path.resolve() == Path(checkpoint_path).resolve():
+        raise RuntimeError(
+            "Legacy heatmap checkpoint base path points to itself: "
+            f"{base_path}"
+        )
+    if not base_path.is_file():
+        raise FileNotFoundError(
+            "Legacy heatmap checkpoint base does not exist: "
+            f"{base_path}"
+        )
+
+    base_checkpoint = safe_torch_load(str(base_path))
+    base_state = base_checkpoint.get("trainable_state_dict", {})
+    base_lora = extract_lora_checkpoint_state(base_state)
+    if not base_lora:
+        raise RuntimeError(
+            "Legacy heatmap checkpoint base contains no LoRA tensors: "
+            f"{base_path}"
+        )
+    composed = {**base_lora, **state}
+    return composed, len(base_lora), str(base_path)
 
 
 def materialize_and_load_heatmap_checkpoint(model, checkpoint_path: str) -> dict[str, int]:
@@ -71,6 +164,14 @@ def materialize_and_load_heatmap_checkpoint(model, checkpoint_path: str) -> dict
         raise RuntimeError(f"Checkpoint has no trainable_state_dict: {checkpoint_path}")
 
     model.qwen2_5_vl._load_model()
+    state, composed_base_lora, composed_base_path = (
+        _compose_legacy_dependent_heatmap_state(
+            model,
+            checkpoint,
+            checkpoint_path,
+            state,
+        )
+    )
     matched_lora = assert_complete_lora_checkpoint_match(
         model,
         state,
@@ -106,15 +207,23 @@ def materialize_and_load_heatmap_checkpoint(model, checkpoint_path: str) -> dict
 
     _missing, _unexpected, loaded = _load_normalized_state_dict(model, state)
     logger.info(
-        "Loaded validated heatmap checkpoint: total=%d LoRA=%d head=%d",
+        "Loaded validated heatmap checkpoint: total=%d LoRA=%d head=%d "
+        "legacy_base_lora=%d",
         loaded,
         matched_lora,
         len(expected_head),
+        composed_base_lora,
     )
+    if composed_base_path is not None:
+        logger.warning(
+            "Legacy dependent checkpoint composed with recorded base LoRA: %s",
+            composed_base_path,
+        )
     return {
         "loaded_tensors": loaded,
         "matched_lora_tensors": matched_lora,
         "matched_heatmap_head_tensors": len(expected_head),
+        "composed_base_lora_tensors": composed_base_lora,
     }
 
 
@@ -136,6 +245,116 @@ def select_primary_heatmap_slice(heatmaps: torch.Tensor) -> torch.Tensor:
     if heatmaps.dim() == 4:
         return heatmaps[:, -1]
     return heatmaps
+
+
+def select_evaluation_heatmaps(
+    output: dict[str, Any],
+    *,
+    joint_panorama_inference: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, str]:
+    """Select the exact heatmaps used by the configured inference policy.
+
+    Historical configs are intentionally kept on the raw ``heatmaps`` output
+    so existing checkpoint reports remain comparable.  Joint-panorama configs
+    must use the normalized operational distribution, including its explicit
+    ``none`` probability, and fail closed if either output is absent.
+    """
+
+    output_key = "heatmaps_gated" if joint_panorama_inference else "heatmaps"
+    heatmaps = output.get(output_key)
+    if not torch.is_tensor(heatmaps):
+        raise RuntimeError(
+            f"Heatmap evaluation requires tensor output[{output_key!r}] "
+            f"when joint_panorama_inference={joint_panorama_inference}"
+        )
+    if not bool(torch.isfinite(heatmaps).all()):
+        raise RuntimeError(f"Non-finite values found in output[{output_key!r}]")
+
+    none_probability = None
+    if joint_panorama_inference:
+        if heatmaps.ndim not in (4, 5) or int(heatmaps.shape[-3]) != 4:
+            raise RuntimeError(
+                "Joint-panorama operational heatmaps must be [N,4,H,W] or "
+                f"[B,N,4,H,W], got {tuple(heatmaps.shape)}"
+            )
+        if bool((heatmaps < 0).any()):
+            raise RuntimeError("Joint-panorama operational heatmaps contain negative probabilities")
+        none_probability = output.get("none_probability")
+        if not torch.is_tensor(none_probability):
+            raise RuntimeError(
+                "joint_panorama_inference requires output['none_probability']"
+            )
+        expected_none_shape = tuple(heatmaps.shape[:-3])
+        if tuple(none_probability.shape) != expected_none_shape:
+            raise RuntimeError(
+                "none_probability/heatmaps leading-shape mismatch: "
+                f"{tuple(none_probability.shape)} vs {expected_none_shape}"
+            )
+        if not bool(torch.isfinite(none_probability).all()):
+            raise RuntimeError("Non-finite values found in none_probability")
+        if bool(((none_probability < 0) | (none_probability > 1)).any()):
+            raise RuntimeError("none_probability must lie in [0,1]")
+
+        total_probability = (
+            heatmaps.float().sum(dim=(-3, -2, -1))
+            + none_probability.float()
+        )
+        if not torch.allclose(
+            total_probability,
+            torch.ones_like(total_probability),
+            rtol=0.03,
+            atol=0.03,
+        ):
+            raise RuntimeError(
+                "Joint-panorama operational probabilities are not normalized; "
+                f"mass range=({float(total_probability.min()):.6f}, "
+                f"{float(total_probability.max()):.6f})"
+            )
+
+    return heatmaps.float(), none_probability, output_key
+
+
+def operational_view_logits(
+    heatmaps_gated: torch.Tensor,
+    none_probability: torch.Tensor,
+) -> torch.Tensor:
+    """Convert operational view/none masses to legacy-compatible 4-way logits."""
+
+    view_probability = heatmaps_gated.float().sum(dim=(-2, -1))
+    none_probability = none_probability.float()
+    if tuple(view_probability.shape[:-1]) != tuple(none_probability.shape):
+        raise ValueError(
+            "Operational view/none probability shape mismatch: "
+            f"{tuple(view_probability.shape)} vs {tuple(none_probability.shape)}"
+        )
+    epsilon = torch.finfo(view_probability.dtype).tiny
+    return (
+        view_probability.clamp_min(epsilon).log()
+        - none_probability.clamp_min(epsilon).log().unsqueeze(-1)
+    )
+
+
+def summarize_joint_panorama_metrics(
+    accumulator: _HeatmapJointMetricAccumulator,
+) -> dict[str, Any]:
+    metrics = accumulator.compute()
+    per_direction = {}
+    for direction in HEATMAP_DIRECTIONS:
+        per_direction[direction] = {
+            "count": int(metrics[f"val_heatmap_{direction}_count"]),
+            "pck8": float(metrics[f"val_heatmap_{direction}_pck8"]),
+        }
+    return {
+        "valid_samples": int(metrics["val_heatmap_valid_count"]),
+        "visible_samples": int(metrics["val_heatmap_visible_count"]),
+        "none_samples": int(metrics["val_heatmap_none_count"]),
+        "view5_accuracy": float(metrics["val_heatmap_view5_accuracy"]),
+        "joint_pck4": float(metrics["val_heatmap_joint_pck4"]),
+        "joint_pck8": float(metrics["val_heatmap_joint_pck8"]),
+        "pixel_error_median": float(metrics["val_heatmap_pixel_error_median"]),
+        "pixel_error_p90": float(metrics["val_heatmap_pixel_error_p90"]),
+        "per_direction": per_direction,
+    }
 
 
 def compute_metrics(pred_hm: np.ndarray, gt_hm: np.ndarray) -> dict[str, float]:
@@ -278,6 +497,9 @@ def evaluate_heatmap(
     save_dir: Path,
     max_samples: int = 200,
     num_vis: int = 20,
+    joint_panorama_inference: bool = False,
+    amp: str = "bf16",
+    amp_mode: str | None = None,
 ):
     """运行完整的热力图评估"""
     model.eval()
@@ -285,8 +507,11 @@ def evaluate_heatmap(
     all_metrics = []
     nonempty_metrics = []
     empty_metrics = []
+    joint_accumulator: _HeatmapJointMetricAccumulator | None = None
+    output_source: str | None = None
 
     num_batches = 0
+    save_dir.mkdir(parents=True, exist_ok=True)
     vis_dir = save_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,7 +565,10 @@ def evaluate_heatmap(
             history_rel_poses = history_rel_poses.to(device)
 
         # 模型推理（完整扩散）
-        with make_autocast_context(device, cfg.get('optim', {}).get('amp', 'bf16')):
+        with make_autocast_context(
+            device,
+            amp if amp_mode is None else amp_mode,
+        ):
             output = model(
                 video_frames=video_frames,
                 instruction_text=instruction,
@@ -351,12 +579,77 @@ def evaluate_heatmap(
                 return_heatmaps=True,
             )
 
-        # 获取预测热力图
-        pred_heatmap = output.get('heatmaps')
-        if pred_heatmap is None:
-            continue
+        # Select the configured operational output. Joint inference must never
+        # be evaluated through the decoder's raw sigmoid compatibility tensor.
+        pred_heatmap, none_probability, batch_output_source = (
+            select_evaluation_heatmaps(
+                output,
+                joint_panorama_inference=joint_panorama_inference,
+            )
+        )
+        if output_source is None:
+            output_source = batch_output_source
+            logger.info(
+                "Heatmap metric source: %s (joint_panorama_inference=%s)",
+                output_source,
+                joint_panorama_inference,
+            )
+        elif batch_output_source != output_source:
+            raise RuntimeError(
+                "Heatmap output source changed during one evaluation: "
+                f"{output_source!r} -> {batch_output_source!r}"
+            )
 
-        pred_heatmap = pred_heatmap.float()
+        gt_visibility = batch.get("gt_visibility")
+        history_mask = batch.get("history_mask")
+        is_panorama = (
+            pred_heatmap.ndim in (4, 5)
+            and int(pred_heatmap.shape[-3]) == 4
+            and gt_heatmap.ndim in (4, 5)
+            and int(gt_heatmap.shape[-3]) == 4
+        )
+        if joint_panorama_inference and not is_panorama:
+            raise RuntimeError(
+                "joint_panorama_inference evaluation requires panoramic "
+                f"prediction/GT tensors, got pred={tuple(pred_heatmap.shape)} "
+                f"gt={tuple(gt_heatmap.shape)}"
+            )
+        if joint_panorama_inference and gt_visibility is None:
+            raise RuntimeError(
+                "joint_panorama_inference evaluation requires batch['gt_visibility']"
+            )
+
+        if is_panorama and gt_visibility is not None:
+            gt_visibility = gt_visibility.to(device)
+            if joint_panorama_inference:
+                if none_probability is None:  # guarded by selector
+                    raise RuntimeError("Joint evaluation lost none_probability")
+                pred_visibility_logits = operational_view_logits(
+                    pred_heatmap,
+                    none_probability,
+                )
+            else:
+                pred_visibility_logits = output.get("visibility")
+                if not torch.is_tensor(pred_visibility_logits):
+                    raise RuntimeError(
+                        "Panoramic legacy evaluation requires output['visibility'] "
+                        "for joint view+peak metrics"
+                    )
+
+            if joint_accumulator is None:
+                joint_accumulator = _HeatmapJointMetricAccumulator(
+                    heatmap_size=tuple(
+                        int(value) for value in gt_heatmap.shape[-2:]
+                    ),
+                    device=device,
+                )
+            joint_accumulator.update(
+                pred_visibility_logits=pred_visibility_logits,
+                pred_heatmaps=pred_heatmap,
+                gt_visibility=gt_visibility,
+                gt_heatmaps=gt_heatmap,
+                history_mask=history_mask,
+            )
 
         metric_pred_heatmap = flatten_heatmap_slices(pred_heatmap)
         metric_gt_heatmap = flatten_heatmap_slices(gt_heatmap)
@@ -412,7 +705,18 @@ def evaluate_heatmap(
         'nonempty_samples': len(nonempty_metrics),
         'empty_samples': len(empty_metrics),
         'empty_ratio': len(empty_metrics) / max(len(all_metrics), 1),
+        'joint_panorama_inference': bool(joint_panorama_inference),
+        'heatmap_output_source': output_source,
     }
+
+    if joint_panorama_inference and joint_accumulator is None:
+        raise RuntimeError(
+            "Joint-panorama evaluation completed without any valid joint metric batch"
+        )
+    if joint_accumulator is not None:
+        results["joint_panorama"] = summarize_joint_panorama_metrics(
+            joint_accumulator
+        )
 
     if nonempty_metrics:
         results['nonempty'] = {
@@ -451,6 +755,11 @@ def main():
 
     # Load config
     cfg = load_config(args.config)
+    heatmap_cfg = cfg.get('model', {}).get('heatmap', {})
+    joint_panorama_inference = bool(
+        heatmap_cfg.get('joint_panorama_inference', False)
+    )
+    amp_mode = cfg.get('optim', {}).get('amp', 'bf16')
 
     device = torch.device(args.device)
 
@@ -466,6 +775,14 @@ def main():
     logger.info("Building model...")
     model = build_model(cfg)
     materialize_and_load_heatmap_checkpoint(model, args.checkpoint)
+    materialized_joint_mode = bool(
+        getattr(model.heatmap_vln, "joint_panorama_inference", False)
+    )
+    if materialized_joint_mode != joint_panorama_inference:
+        raise RuntimeError(
+            "Materialized HeatmapVLN/config joint inference mismatch: "
+            f"model={materialized_joint_mode} config={joint_panorama_inference}"
+        )
     model = model.to(device)
     model.eval()
 
@@ -515,6 +832,7 @@ def main():
     logger.info(f"  Checkpoint: {args.checkpoint}")
     logger.info(f"  Max samples: {args.max_samples}")
     logger.info(f"  Visualizations: {args.num_vis} batches")
+    logger.info(f"  Joint panorama inference: {joint_panorama_inference}")
     logger.info(f"  Output: {save_dir}")
     logger.info("=" * 60)
 
@@ -526,6 +844,8 @@ def main():
         save_dir=save_dir,
         max_samples=args.max_samples,
         num_vis=args.num_vis,
+        joint_panorama_inference=joint_panorama_inference,
+        amp=amp_mode,
     )
 
     # Print results
@@ -535,6 +855,21 @@ def main():
     logger.info(f"Total samples: {results['total_samples']}")
     logger.info(f"Non-empty GT: {results['nonempty_samples']} ({1 - results['empty_ratio']:.1%})")
     logger.info(f"Empty GT: {results['empty_samples']} ({results['empty_ratio']:.1%})")
+    logger.info(f"Heatmap output source: {results['heatmap_output_source']}")
+
+    if 'joint_panorama' in results:
+        joint = results['joint_panorama']
+        logger.info("")
+        logger.info("Joint panoramic localization:")
+        logger.info(f"  Joint PCK@4: {joint['joint_pck4']:.4f}")
+        logger.info(f"  Joint PCK@8: {joint['joint_pck8']:.4f}")
+        logger.info(f"  View+none accuracy: {joint['view5_accuracy']:.4f}")
+        for direction in HEATMAP_DIRECTIONS:
+            direction_metrics = joint['per_direction'][direction]
+            logger.info(
+                f"  {direction:>5s}: n={direction_metrics['count']} "
+                f"PCK@8={direction_metrics['pck8']:.4f}"
+            )
 
     if 'nonempty' in results:
         r = results['nonempty']

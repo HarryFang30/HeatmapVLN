@@ -5,6 +5,7 @@ Model construction and freeze/unfreeze strategies.
 import logging
 from pathlib import Path
 
+import torch
 import torch.nn as nn
 
 from src.models.lora_utils import resolve_lora_layer_indices
@@ -44,6 +45,8 @@ def build_model(
     action_cfg = model_cfg.get('action_head', {})
     nextdit_cfg = action_cfg.get('nextdit', {})
     pano_adapter_cfg = nextdit_cfg.get('pano_latent_adapter', {})
+    heatmap_control_cfg = nextdit_cfg.get('heatmap_control') or {}
+    past_plan_action_cfg = model_cfg.get('past_plan_action') or {}
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
 
@@ -96,6 +99,25 @@ def build_model(
         heatmap_lambda_kl=heatmap_cfg.get('lambda_kl', heatmap_cfg.get('lambda_pos', 1.0)),
         heatmap_lambda_peak=heatmap_cfg.get('lambda_peak', 1.0),
         heatmap_trajectory_config=heatmap_cfg.get('trajectory', None),
+        heatmap_decoder_mode=heatmap_cfg.get('decoder_mode', 'legacy'),
+        heatmap_pose_free_config=heatmap_cfg.get('pose_free', None),
+        heatmap_restore_vit_spatial_layout=heatmap_cfg.get(
+            'restore_vit_spatial_layout',
+            False,
+        ),
+        heatmap_coarse_logit_residual=heatmap_cfg.get(
+            'coarse_logit_residual',
+            False,
+        ),
+        heatmap_joint_panorama_inference=heatmap_cfg.get(
+            'joint_panorama_inference',
+            False,
+        ),
+        heatmap_input_mode=heatmap_cfg.get('input_mode', 'panoramic'),
+        heatmap_conditioner_global_context=heatmap_cfg.get(
+            'conditioner_global_context',
+            True,
+        ),
 
         use_lora=llm_cfg.get('use_lora', False),
         lora_rank=llm_cfg.get('lora_rank', 16),
@@ -124,12 +146,30 @@ def build_model(
         nextdit_num_sample_trajs=nextdit_cfg.get('num_sample_trajs', 32),
         nextdit_dav2_ckpt_path=nextdit_cfg.get('dav2_ckpt_path', ''),
         nextdit_enable_gradient_checkpointing=nextdit_cfg.get('enable_gradient_checkpointing', True),
+        nextdit_heatmap_control_enabled=heatmap_control_cfg.get('enabled', False),
+        nextdit_heatmap_control_token_dim=heatmap_control_cfg.get('token_dim', 128),
+        nextdit_heatmap_control_dim=heatmap_control_cfg.get('control_dim', 128),
+        nextdit_heatmap_control_heads=heatmap_control_cfg.get('num_heads', 4),
+        nextdit_heatmap_tokenizer_hidden_dim=heatmap_control_cfg.get('mlp_hidden_dim', 256),
+        nextdit_heatmap_temporal_heads=heatmap_control_cfg.get('temporal_heads', 4),
+        nextdit_heatmap_temporal_ffn_dim=heatmap_control_cfg.get('temporal_ffn_dim', 512),
+        nextdit_heatmap_control_dropout=heatmap_control_cfg.get('dropout', 0.0),
+        nextdit_heatmap_age_scale_steps=heatmap_control_cfg.get(
+            'age_normalizer_steps', 32.0,
+        ),
 
         pano_latent_adapter_enabled=pano_adapter_cfg.get('enabled', False),
         pano_latent_adapter_hidden_dim=pano_adapter_cfg.get('hidden_dim', 1024),
         pano_latent_adapter_dropout=pano_adapter_cfg.get('dropout', 0.0),
         pano_latent_adapter_checkpoint_path=pano_adapter_cfg.get('pretrained_path', ''),
         pano_latent_adapter_strict_load=pano_adapter_cfg.get('strict_load', True),
+
+        past_plan_action_enabled=past_plan_action_cfg.get('enabled', False),
+        past_plan_action_plan_dim=past_plan_action_cfg.get('plan_dim', 768),
+        past_plan_action_memory_dim=past_plan_action_cfg.get('memory_dim', 256),
+        past_plan_action_bridge_heads=past_plan_action_cfg.get(
+            'bridge_heads', 8
+        ),
 
         verbose=verbose,
     )
@@ -173,6 +213,13 @@ def build_model(
                 pano_adapter_cfg.get('hidden_dim', 1024),
                 pano_adapter_cfg.get('pretrained_path', '') or '<none>',
             )
+        if past_plan_action_cfg.get('enabled', False):
+            logger.info(
+                "   Past->Plan->Action -> enabled=True, M=%s, Z=%s, heads=%s",
+                past_plan_action_cfg.get('memory_dim', 256),
+                past_plan_action_cfg.get('plan_dim', 768),
+                past_plan_action_cfg.get('bridge_heads', 8),
+            )
         if s1_ckpt:
             logger.info("   System1 pretrained → %s", s1_ckpt)
 
@@ -211,7 +258,10 @@ def assert_complete_internnav_system1_load(
     required_keys = {
         key
         for key in head_keys
-        if key.startswith(_INTERNNAV_SYSTEM1_REQUIRED_PREFIXES)
+        if (
+            key.startswith(_INTERNNAV_SYSTEM1_REQUIRED_PREFIXES)
+            and '.heatmap_control.' not in key
+        )
     }
     loaded_keys = set(audit.get('loaded_keys') or ())
     missing_keys = sorted(required_keys - loaded_keys)
@@ -245,6 +295,78 @@ def freeze_module(module: nn.Module, freeze: bool = True):
         param.requires_grad = not freeze
 
 
+def ensure_trainable_heatmap_fp32(
+    model: VLNPipeline,
+    stage_cfg: dict,
+    logger: logging.Logger | None = None,
+) -> int:
+    """Keep trainable HeatmapVLN modules in FP32 without touching Qwen.
+
+    ``VLNPipeline._ensure_heatmap_vln`` follows the pipeline compute dtype
+    (normally BF16).  That is appropriate for the frozen backbone, but AdamW
+    would then also keep the trainable heatmap parameters and moment buffers in
+    BF16.  Promote only the decoder modules selected by the current heatmap
+    mode; ``heatmap_vln.qwen`` remains untouched.
+
+    Set ``training.stages[].heatmap_fp32=false`` to retain the legacy storage
+    dtype for an older experiment.
+    """
+    if not stage_cfg.get('heatmap_fp32', True):
+        return 0
+    if 'heatmap_vln' not in set(stage_cfg.get('trainable_modules', [])):
+        return 0
+
+    heatmap_vln = getattr(model, 'heatmap_vln', None)
+    if heatmap_vln is None:
+        raise RuntimeError(
+            "heatmap_vln is trainable but has not been constructed before dtype setup"
+        )
+
+    pose_free_matcher = getattr(heatmap_vln, 'pose_free_matcher', None)
+    explicit_head_modules = getattr(heatmap_vln, 'trainable_head_modules', None)
+    if callable(explicit_head_modules):
+        modules = [
+            (module.__class__.__name__, module)
+            for module in explicit_head_modules()
+        ]
+    elif pose_free_matcher is not None:
+        modules = [('pose_free_matcher', pose_free_matcher)]
+    else:
+        modules = [
+            ('vit_dpt_fusion', getattr(heatmap_vln, 'vit_dpt_fusion', None)),
+            ('llm_dpt_fusion', getattr(heatmap_vln, 'llm_dpt_fusion', None)),
+            ('coarse', getattr(heatmap_vln, 'coarse', None)),
+            ('fine', getattr(heatmap_vln, 'fine', None)),
+        ]
+
+    promoted = 0
+    promoted_names = []
+    for name, module in modules:
+        if module is None:
+            continue
+        module.float()
+        module_params = list(module.parameters())
+        promoted += sum(param.numel() for param in module_params)
+        promoted_names.append(name)
+        non_fp32 = [
+            str(param.dtype)
+            for param in module_params
+            if param.is_floating_point() and param.dtype != torch.float32
+        ]
+        if non_fp32:
+            raise RuntimeError(
+                f"Failed to promote heatmap_vln.{name} to FP32: {non_fp32[:3]}"
+            )
+
+    if logger is not None:
+        logger.info(
+            "  ✓ Heatmap trainable storage: FP32 (%s; %s params); frozen Qwen unchanged",
+            ", ".join(promoted_names),
+            f"{promoted:,}",
+        )
+    return promoted
+
+
 _NEXTDIT_SUBMODULES = {
     'cond_projector': 'cond_projector',
     'traj_dit': 'traj_dit',
@@ -266,6 +388,10 @@ def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
             group = 'latent_queries'
         elif name.startswith('pano_latent_adapter.'):
             group = 'pano_latent_adapter'
+        elif name.startswith('heatmap_tokenizer.'):
+            group = 'heatmap_tokenizer'
+        elif '.heatmap_control.' in name:
+            group = 'heatmap_control'
         elif name.startswith('nextdit_action_head.'):
             parts = name.split('.')
             group = '.'.join(parts[:2]) if len(parts) > 1 else 'nextdit_action_head'
@@ -281,10 +407,16 @@ def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
 
 
 def _is_allowed_trainable_name(name: str, trainable_modules: set[str]) -> bool:
+    if 'past_plan_action' in trainable_modules and name.startswith('past_plan_action.'):
+        return True
     if 'latent_queries' in trainable_modules and name == 'latent_queries':
         return True
     if 'pano_latent_adapter' in trainable_modules and name.startswith('pano_latent_adapter.'):
         return True
+    if 'heatmap_tokenizer' in trainable_modules and name.startswith('heatmap_tokenizer.'):
+        return True
+    if 'heatmap_control' in trainable_modules and '.heatmap_control.' in name:
+        return name.startswith('nextdit_action_head.traj_dit.model.layers.')
     if 'nextdit_action_head' in trainable_modules and name.startswith('nextdit_action_head.'):
         return True
     for cfg_name, attr_name in _NEXTDIT_SUBMODULES.items():
@@ -330,13 +462,99 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     freeze_module(model, freeze=True)
 
     trainable = stage_cfg.get('trainable_modules', [])
+    ppa_enabled = getattr(model, 'past_plan_action', None) is not None
 
-    if 'heatmap_vln' in trainable and hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
-        freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
-        freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
-        freeze_module(model.heatmap_vln.coarse, freeze=False)
-        freeze_module(model.heatmap_vln.fine, freeze=False)
-        logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
+    if ppa_enabled:
+        if trainable != ['past_plan_action', 'heatmap_vln']:
+            raise ValueError(
+                "Past->Plan->Action requires trainable_modules="
+                "['past_plan_action','heatmap_vln']"
+            )
+        if model.heatmap_vln is None:
+            raise RuntimeError(
+                "Past->Plan->Action requires the single-view Head to be materialized"
+            )
+        from src.models.past_plan_action_training import (
+            configure_past_plan_action_stage,
+        )
+
+        ppa_stage = str(
+            stage_cfg.get(
+                'past_plan_action_stage',
+                'stage2_joint' if stage_cfg.get('train_action', False)
+                else 'stage1_map_pretrain',
+            )
+        )
+        audit = configure_past_plan_action_stage(
+            stage=ppa_stage,
+            chain=model.past_plan_action,
+            past_head=model.heatmap_vln,
+            native_action_head=model.nextdit_action_head,
+            native_cond_projector=model.nextdit_action_head.cond_projector,
+            other_frozen_modules=(model.qwen2_5_vl, model.llm_projector),
+        )
+        model.latent_queries.requires_grad_(False)
+        logger.info(
+            "  ✓ Past->Plan->Action scope: stage=%s tensors=%d params=%s "
+            "(future=%d bridge=%d shared_past=%d)",
+            audit.stage,
+            audit.trainable_tensors,
+            f"{audit.trainable_parameters:,}",
+            audit.future_tensors,
+            audit.bridge_tensors,
+            audit.shared_past_tensors,
+        )
+
+    from .pose_adaptation import (
+        EXPECTED_POSE_ADAPTATION_TENSORS,
+        configured_pose_adaptation_prefixes,
+    )
+
+    pose_adaptation_prefixes = configured_pose_adaptation_prefixes(stage_cfg)
+    if ppa_enabled:
+        # The exact scope was established above; do not run any legacy
+        # unfreezing branch below.
+        pass
+    elif pose_adaptation_prefixes:
+        if trainable != ['heatmap_vln']:
+            raise ValueError(
+                "heatmap_trainable_parameter_prefixes requires "
+                "trainable_modules=['heatmap_vln']"
+            )
+        selected = []
+        for name, parameter in model.named_parameters():
+            if name.startswith(pose_adaptation_prefixes):
+                parameter.requires_grad_(True)
+                selected.append(name)
+        if len(selected) != EXPECTED_POSE_ADAPTATION_TENSORS:
+            raise RuntimeError(
+                "AMB3R pose adaptation expected exactly "
+                f"{EXPECTED_POSE_ADAPTATION_TENSORS} trainable tensors, "
+                f"found {len(selected)}"
+            )
+        logger.info(
+            "  ✓ Unfrozen: AMB3R pose-adaptation whitelist (%d tensors, 4 prefixes)",
+            len(selected),
+        )
+    elif 'heatmap_vln' in trainable and hasattr(model, 'heatmap_vln') and model.heatmap_vln is not None:
+        explicit_head_modules = getattr(model.heatmap_vln, 'trainable_head_modules', None)
+        if callable(explicit_head_modules):
+            modules = tuple(explicit_head_modules())
+            for module in modules:
+                freeze_module(module, freeze=False)
+            logger.info(
+                "  ✓ Unfrozen: heatmap_vln explicit single-view head (%d modules)",
+                len(modules),
+            )
+        elif model.heatmap_vln.pose_free_matcher is not None:
+            freeze_module(model.heatmap_vln.pose_free_matcher, freeze=False)
+            logger.info("  ✓ Unfrozen: heatmap_vln (pose_free_matcher)")
+        else:
+            freeze_module(model.heatmap_vln.vit_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.llm_dpt_fusion, freeze=False)
+            freeze_module(model.heatmap_vln.coarse, freeze=False)
+            freeze_module(model.heatmap_vln.fine, freeze=False)
+            logger.info("  ✓ Unfrozen: heatmap_vln (vit_dpt + llm_dpt + coarse + fine)")
 
     if 'nextdit_action_head' in trainable:
         if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
@@ -356,6 +574,32 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
     ):
         freeze_module(model.pano_latent_adapter, freeze=False)
         logger.info("  ✓ Unfrozen: pano_latent_adapter")
+
+    if 'heatmap_tokenizer' in trainable:
+        tokenizer = getattr(model, 'heatmap_tokenizer', None)
+        if tokenizer is None:
+            raise RuntimeError("heatmap_tokenizer requested but control is not enabled")
+        freeze_module(tokenizer, freeze=False)
+        tokenizer.float()
+        logger.info("  ✓ Unfrozen: structured heatmap_tokenizer")
+
+    if 'heatmap_control' in trainable:
+        head = getattr(model, 'nextdit_action_head', None)
+        adapters_fn = getattr(head, 'heatmap_control_adapters', None)
+        adapters = tuple(adapters_fn()) if callable(adapters_fn) else ()
+        expected = int(getattr(getattr(model, 'config', None), 'nextdit_dit_layers', 0))
+        if not adapters or (expected and len(adapters) != expected):
+            raise RuntimeError(
+                f"heatmap_control requested but expected {expected} adapters, "
+                f"found {len(adapters)}"
+            )
+        for adapter in adapters:
+            freeze_module(adapter, freeze=False)
+            adapter.float()
+        logger.info(
+            "  ✓ Unfrozen: %d per-layer heatmap control adapters",
+            len(adapters),
+        )
 
     # Fine-grained NextDiT sub-module unfreezing.
     if hasattr(model, 'nextdit_action_head') and model.nextdit_action_head is not None:
@@ -391,6 +635,7 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
             logger.info("    - %s: %s params", group, f"{count:,}")
     else:
         logger.warning("  ⚠️ No trainable parameters after applying stage config")
+    ensure_trainable_heatmap_fp32(model, stage_cfg, logger=logger)
     _assert_trainable_scope(model, stage_cfg, logger)
 
 

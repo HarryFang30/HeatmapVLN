@@ -820,7 +820,14 @@ class Qwen2_5VLIntegration(nn.Module):
         skip_lm_head: bool = False,
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, torch.Tensor | None, torch.Tensor | None]:
+        return_lm_correct_logprobs: bool = False,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+        torch.Tensor | None,
+        torch.Tensor | dict[str, Any] | None,
+    ]:
         """Run Qwen on already prepared multimodal inputs.
 
         Aligned with InternNav's traj-token mechanism:
@@ -836,8 +843,16 @@ class Qwen2_5VLIntegration(nn.Module):
             latent_queries: (B, n_query, hidden_dim) learnable trajectory
                 condition vectors injected at TRAJ_TOKEN_INDEX positions.
         """
+        if return_lm_loss and return_lm_correct_logprobs:
+            raise ValueError(
+                "return_lm_loss and return_lm_correct_logprobs are mutually exclusive"
+            )
         raw_input_ids = inputs["input_ids"]
-        lm_labels = inputs.get("labels") if return_lm_loss else None
+        lm_labels = (
+            inputs.get("labels")
+            if (return_lm_loss or return_lm_correct_logprobs)
+            else None
+        )
         num_image_tokens = int((raw_input_ids == self.image_token_id).sum().item())
 
         n_query = 0
@@ -942,11 +957,69 @@ class Qwen2_5VLIntegration(nn.Module):
             inner_model = None
             if need_traj_hidden:
                 fwd_kwargs["output_hidden_states"] = True
+        correct_logprob_alignment = None
+        if return_lm_correct_logprobs:
+            if lm_labels is None:
+                raise ValueError(
+                    "return_lm_correct_logprobs=True requires `labels` in panoramic_inputs"
+                )
+            if lm_labels.ndim != 2 or lm_labels.shape != raw_input_ids.shape:
+                raise ValueError(
+                    "Correct-label log-prob labels must match input_ids: "
+                    f"labels={tuple(lm_labels.shape)} input_ids={tuple(raw_input_ids.shape)}"
+                )
+            shifted_valid = lm_labels[:, 1:] != -100
+            sample_predictor_positions = [
+                torch.nonzero(shifted_valid[row], as_tuple=False).flatten()
+                for row in range(shifted_valid.shape[0])
+            ]
+            if not any(positions.numel() for positions in sample_predictor_positions):
+                raise ValueError(
+                    "Correct-label log-prob forward has no non-ignored shifted labels"
+                )
+            sample_correct_token_ids = [
+                lm_labels[row, positions + 1]
+                for row, positions in enumerate(sample_predictor_positions)
+            ]
+            predictor_union = torch.unique(
+                torch.cat(sample_predictor_positions), sorted=True,
+            )
+            # Qwen2.5-VL in the pinned Transformers runtime accepts a tensor of
+            # sequence positions here. This avoids materialising vocabulary
+            # logits for the (usually thousands of) image/context positions.
+            # The shape is validated after forward; an older wrapper that
+            # ignores this argument fails loudly instead of silently allocating
+            # or aligning full-sequence logits incorrectly.
+            fwd_kwargs["logits_to_keep"] = predictor_union
+            skip_lm_head = False
+            inner_model = None
+            correct_logprob_alignment = {
+                "schema": "shifted_correct_label_predictors_v1",
+                "ignore_index": -100,
+                "batch_size": int(lm_labels.shape[0]),
+                "sequence_length": int(lm_labels.shape[1]),
+                "sample_predictor_positions": [
+                    positions.detach().cpu().tolist()
+                    for positions in sample_predictor_positions
+                ],
+                "sample_correct_token_ids": [
+                    token_ids.detach().cpu().tolist()
+                    for token_ids in sample_correct_token_ids
+                ],
+                "predictor_position_union": predictor_union.detach().cpu().tolist(),
+                "sample_label_tokens": [
+                    int(positions.numel())
+                    for positions in sample_predictor_positions
+                ],
+                "label_tokens": int(shifted_valid.sum().item()),
+                "backend": "hf_logits_to_keep_tensor_predictor_union_v1",
+            }
         if self._internal_profiler is not None:
             self._internal_profiler.reset()
 
         qwen_needs_grad = (
             return_lm_loss
+            or return_lm_correct_logprobs
             or self._model_has_trainable_parameters()
             or (latent_queries is not None and latent_queries.requires_grad)
         )
@@ -997,7 +1070,19 @@ class Qwen2_5VLIntegration(nn.Module):
                 return _run_model_forward()
 
         try:
-            outputs = _run_with_runtime_context()
+            try:
+                outputs = _run_with_runtime_context()
+            except TypeError as exc:
+                if (
+                    return_lm_correct_logprobs
+                    and "logits_to_keep" in str(exc)
+                ):
+                    raise RuntimeError(
+                        "The loaded Qwen wrapper does not support tensor "
+                        "`logits_to_keep`; refusing an implicit full-logits "
+                        "fallback for correct-label preservation"
+                    ) from exc
+                raise
             if (
                 use_last_hidden_state_only
                 and self._last_hidden_state_from_outputs(outputs) is None
@@ -1023,7 +1108,64 @@ class Qwen2_5VLIntegration(nn.Module):
 
         traj_hidden_states = None
         hidden_states = None
-        lm_loss = getattr(outputs, "loss", None) if return_lm_loss else None
+        lm_output: torch.Tensor | dict[str, Any] | None = (
+            getattr(outputs, "loss", None) if return_lm_loss else None
+        )
+        if return_lm_correct_logprobs:
+            logits = getattr(outputs, "logits", None)
+            if logits is None or logits.ndim != 3:
+                raise RuntimeError(
+                    "Correct-label log-prob forward requires rank-3 `outputs.logits`"
+                )
+            assert correct_logprob_alignment is not None
+            predictor_union = torch.tensor(
+                correct_logprob_alignment["predictor_position_union"],
+                device=logits.device,
+                dtype=torch.long,
+            )
+            if (
+                logits.shape[0] != lm_labels.shape[0]
+                or logits.shape[1] != predictor_union.numel()
+            ):
+                raise RuntimeError(
+                    "Qwen did not honor tensor logits_to_keep exactly: "
+                    f"logits={tuple(logits.shape)} expected_batch={lm_labels.shape[0]} "
+                    f"expected_kept_positions={predictor_union.numel()}"
+                )
+            flat_correct_logprobs = []
+            for row, (positions_list, token_ids_list) in enumerate(
+                zip(
+                    correct_logprob_alignment["sample_predictor_positions"],
+                    correct_logprob_alignment["sample_correct_token_ids"],
+                )
+            ):
+                positions = torch.tensor(
+                    positions_list, device=logits.device, dtype=torch.long,
+                )
+                token_ids = torch.tensor(
+                    token_ids_list, device=logits.device, dtype=torch.long,
+                )
+                kept_columns = torch.searchsorted(predictor_union, positions)
+                selected_logits = logits[row, kept_columns].float()
+                correct_logits = selected_logits.gather(
+                    dim=-1, index=token_ids.unsqueeze(-1),
+                ).squeeze(-1)
+                flat_correct_logprobs.append(
+                    correct_logits - torch.logsumexp(selected_logits, dim=-1)
+                )
+            correct_logprobs = torch.cat(flat_correct_logprobs, dim=0)
+            if correct_logprobs.dtype != torch.float32:
+                raise RuntimeError(
+                    "Correct-label log probabilities must be accumulated in FP32"
+                )
+            correct_logprob_alignment["returned_logits_shape"] = list(logits.shape)
+            correct_logprob_alignment["returned_logprob_dtype"] = str(
+                correct_logprobs.dtype
+            )
+            lm_output = {
+                "correct_label_logprobs": correct_logprobs,
+                "alignment": correct_logprob_alignment,
+            }
 
         if return_hidden_states:
             layer_idx = self.config.hidden_layer_for_features
@@ -1055,7 +1197,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 hidden_states, vision_input_ids,
             )
 
-        return hidden_states, vision_hidden_states, num_image_tokens, traj_hidden_states, lm_loss
+        return hidden_states, vision_hidden_states, num_image_tokens, traj_hidden_states, lm_output
 
     def _forward_single_panorama(
         self,
@@ -1190,7 +1332,15 @@ class Qwen2_5VLIntegration(nn.Module):
         history_rel_poses: torch.Tensor | None = None,
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, dict[str, torch.Tensor] | None, torch.Tensor | None, torch.Tensor | None]:
+        return_lm_correct_logprobs: bool = False,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+        dict[str, torch.Tensor] | None,
+        torch.Tensor | None,
+        torch.Tensor | dict[str, Any] | None,
+    ]:
         """Forward already-tokenized batch through one Qwen pass.
 
         When ``heatmap_vln`` is None the heatmap hook/decode pipeline is
@@ -1236,20 +1386,26 @@ class Qwen2_5VLIntegration(nn.Module):
 
         need_grad = (
             return_lm_loss
+            or return_lm_correct_logprobs
             or return_hidden_states
             or latent_queries is not None
             or (heatmap_vln is not None and self.config.heatmap_trains_backbone)
         )
-        skip_lm = (heatmap_vln is None) and not return_lm_loss
+        skip_lm = (
+            (heatmap_vln is None)
+            and not return_lm_loss
+            and not return_lm_correct_logprobs
+        )
         if need_grad:
-            hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_loss = self._forward_model_inputs(
+            hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_output = self._forward_model_inputs(
                 inputs, return_hidden_states,
                 skip_lm_head=skip_lm, latent_queries=latent_queries,
                 return_lm_loss=return_lm_loss,
+                return_lm_correct_logprobs=return_lm_correct_logprobs,
             )
         else:
             with torch.inference_mode():
-                hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_loss = self._forward_model_inputs(
+                hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_output = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True, latent_queries=latent_queries,
                 )
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
@@ -1276,7 +1432,7 @@ class Qwen2_5VLIntegration(nn.Module):
                 }
                 heatmap_output["timings"].update(decode_timings)
                 heatmap_output["timings"].update(internal_timings)
-        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs, lm_loss
+        return hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hs, lm_output
 
     def _forward_batch(
         self,
@@ -1380,6 +1536,7 @@ class Qwen2_5VLIntegration(nn.Module):
         history_rel_poses: torch.Tensor | None = None,
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
+        return_lm_correct_logprobs: bool = False,
     ) -> dict[str, Any]:
         """Forward pass through Qwen2.5-VL with batch processing."""
         # Ensure model is loaded
@@ -1387,12 +1544,12 @@ class Qwen2_5VLIntegration(nn.Module):
             self._load_model()
 
         traj_hidden_states = None
-        lm_loss = None
+        lm_output: torch.Tensor | dict[str, Any] | None = None
 
         if panoramic_inputs is not None:
             if panoramic_num_histories is None:
                 raise ValueError("panoramic_num_histories is required with panoramic_inputs")
-            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hidden_states, lm_loss = (
+            hidden_states, vision_hidden_states, num_image_tokens, heatmap_output, traj_hidden_states, lm_output = (
                 self._forward_batch_panorama_tokenized(
                     panoramic_inputs=panoramic_inputs,
                     num_histories=panoramic_num_histories,
@@ -1402,6 +1559,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     history_rel_poses=history_rel_poses,
                     latent_queries=latent_queries,
                     return_lm_loss=return_lm_loss,
+                    return_lm_correct_logprobs=return_lm_correct_logprobs,
                 )
             )
         elif current_views is not None and history_panoramas is not None:
@@ -1446,8 +1604,17 @@ class Qwen2_5VLIntegration(nn.Module):
         }
         if traj_hidden_states is not None:
             result["traj_hidden_states"] = traj_hidden_states
-        if lm_loss is not None:
-            result["lm_loss"] = lm_loss
+        if return_lm_loss and lm_output is not None:
+            result["lm_loss"] = lm_output
+        if return_lm_correct_logprobs:
+            if not isinstance(lm_output, dict):
+                raise RuntimeError(
+                    "Correct-label log-prob forward returned no structured LM output"
+                )
+            result["lm_correct_label_logprobs"] = lm_output[
+                "correct_label_logprobs"
+            ]
+            result["lm_correct_label_alignment"] = lm_output["alignment"]
         if heatmap_output is not None:
             result.update(heatmap_output)
         else:

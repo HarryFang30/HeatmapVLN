@@ -1,0 +1,258 @@
+% !TEX program = xelatex
+% Standalone Chinese Method draft. When merging into the CVPR template,
+% keep the section body and replace this preamble/bibliography as needed.
+\documentclass[10pt]{ctexart}
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0pt}
+
+\begin{document}
+
+\setcounter{section}{2}
+\section{方法}
+
+本文在 InternNav~\cite{internnav} 的原生导航主干中引入显式空间历史。给定导航指令和截至当前时刻的 RGB 观测，系统先保留原生语义条件，再从 RGB 历史估计相对相机运动，预测历史位置在当前四视角中的空间分布，并将该分布编码为条件 token 注入轨迹扩散网络。因而，热力图不是独立任务输出，而是连接历史几何估计与局部动作生成的中间表示。
+
+\subsection{整体架构}
+
+给定导航指令 $q$ 和因果观测前缀
+\begin{equation}
+  \mathcal{L}_{t}=\{I_{1},I_{2},\ldots,I_{t}\},
+  \qquad I_i\in\mathbb{R}^{H\times W\times 3},
+\end{equation}
+系统在时刻 $t$ 不访问任何未来图像。原生 System-2 首先从指令与历史、当前观测中提取语义条件
+\begin{equation}
+  \mathbf{C}_{t}=\mathcal{G}_{\mathrm{S2}}(q,\mathcal{L}_{t}).
+\end{equation}
+这里 $\mathbf{C}_{t}$ 统称 InternNav 已有的像素目标相关语义表征与视觉条件；本文不改变其提示、生成或条件接口。
+
+原生语义条件能够说明任务目标及下一步应关注的区域，但并不显式保存过去观测在当前相机坐标系中的位置。长程导航中的转向、回看和局部纠错因而需要额外回答一个几何问题：已经经过的位置现在落在当前相机的哪个方向和哪个像素。本文将这一问题分解为“RGB 历史相对位姿估计、几何条件化热力图预测、热力图条件 token 编码”三个连续步骤，并在轨迹扩散的每一层用同一组空间历史进行条件化。整个过程仍由原生语义规划目标驱动，新增表征仅补充其缺少的显式历史几何。
+
+统一导航映射中的新增信息流定义为
+\begin{align}
+  \widehat{\mathbf{P}}_{t}
+  &=\mathcal{G}_{\mathrm{pose}}(\mathcal{L}_{t}), \\
+  (\widehat{\mathcal{H}}_{t},\widehat{\mathbf{v}}_{t})
+  &=\mathcal{G}_{\mathrm{hm}}
+    \bigl(\mathcal{E}_{\mathrm{vis}}(\mathcal{L}_{t}),
+    \widehat{\mathbf{P}}_{t}\bigr), \\
+  \mathbf{Z}^{\mathrm{hm}}_{t}
+  &=\mathcal{E}_{\mathrm{hm}}
+    (\widehat{\mathcal{H}}_{t},\widehat{\mathbf{v}}_{t}), \\
+  \widehat{\mathcal{W}}_{t}
+  &=\mathcal{G}_{\mathrm{S1}}
+    (\mathbf{C}_{t},\mathbf{Z}^{\mathrm{hm}}_{t}).
+\end{align}
+最终任务输出 $\widehat{\mathcal{W}}_{t}\in\mathbb{R}^{32\times3}$ 是由 32 个稠密 waypoint 表示的局部导航轨迹。$\widehat{\mathcal{H}}_{t}$ 则是服务于轨迹生成的结构化空间条件，而非与轨迹并列的最终预测目标。
+
+上述定义强调系统只有一个导航输出和一条条件生成链。$\mathbf{C}_t$ 表达语言与当前任务语义，$\widehat{\mathbf{P}}_t$ 将图像历史转化为当前参考系下的几何关系，$\widehat{\mathcal{H}}_t$ 将低维位姿展开为可见性和像素位置，$\mathbf{Z}^{\mathrm{hm}}_t$ 再把稠密空间场变为可供扩散 Transformer 查询的有限条件序列。四种表示依次提高空间可用性，并最终共同决定局部轨迹。
+
+\subsection{基于 RGB 历史的相对位姿估计}
+
+为了确定历史观测相对当前相机的空间位置，我们使用冻结的 AMB3R~\cite{amb3r} 作为 RGB 历史几何估计模块。它接收已经观测到的前视 RGB 历史并输出相机位姿序列：
+\begin{equation}
+  \{\widehat{\mathbf{T}}_{1},\ldots,
+  \widehat{\mathbf{T}}_{t}\}
+  =\mathcal{G}_{\mathrm{pose}}(\mathcal{L}_{t}),
+  \qquad \widehat{\mathbf{T}}_i\in\mathrm{SE}(3).
+\end{equation}
+我们只使用这一输入输出关系，不改变或训练 AMB3R 的内部模型。
+
+需要区分位姿估计模块的观测集合与 Heatmap Head 的历史槽。前者顺序接收截至时刻 $t$ 的全部可用前视 RGB，以维持跨帧相机运动的一致估计；后者只从这些已观测帧中选择至多 $K$ 个代表性历史位置进行空间定位。也就是说，完整 RGB 历史用于估计几何状态，稀疏历史槽用于控制热力图输出规模，两者共享同一因果观测前缀。
+
+令 $\Gamma_t=\{\tau_1,\ldots,\tau_K\}$ 为从已观测历史中选取的时刻，$K\leq 8$ 且 $\tau_k<t$。在统一相机坐标约定后，第 $k$ 个历史帧相对当前帧的变换为
+\begin{equation}
+  \widehat{\mathbf{T}}_{t\leftarrow\tau_k}
+  =\widehat{\mathbf{T}}_{t}^{-1}
+   \widehat{\mathbf{T}}_{\tau_k}.
+\end{equation}
+随后将其压缩为适合平面导航的四维几何描述
+\begin{equation}
+  \widehat{\mathbf{p}}_{t\leftarrow\tau_k}
+  =\bigl[
+    \Delta\widehat{f}_k,
+    \Delta\widehat{l}_k,
+    \cos(\Delta\widehat{\psi}_k),
+    \sin(\Delta\widehat{\psi}_k)
+  \bigr]\in\mathbb{R}^{4},
+\end{equation}
+其中 $\Delta\widehat{f}_k$、$\Delta\widehat{l}_k$ 和 $\Delta\widehat{\psi}_k$ 分别表示前向位移、左向位移与相对航向。于是
+\begin{equation}
+  \widehat{\mathbf{P}}_t
+  =\{\widehat{\mathbf{p}}_{t\leftarrow\tau_k}\}_{k=1}^{K}
+  \in\mathbb{R}^{K\times4}.
+\end{equation}
+部署时，该模块只读取 RGB 历史，不读取 simulator GT pose；GT 几何仅在训练期间构造监督标签。
+
+采用相对于当前帧的表示还有两个作用。首先，任意共同的全局坐标变换会在 $\widehat{\mathbf{T}}_{t}^{-1}\widehat{\mathbf{T}}_{\tau_k}$ 中抵消，因此 Heatmap Head 不依赖 episode 的世界坐标原点。其次，正余弦航向表示避免角度在 $-\pi$ 与 $\pi$ 处的不连续，使相邻历史姿态在输入空间中保持连续。由此得到的 $\widehat{\mathbf{P}}_t$ 是后续热力图预测唯一使用的显式几何输入。
+
+\subsection{轨迹引导的多视角热力图预测}
+
+\paragraph{视觉与方向空间。}
+冻结但实际执行的 Qwen.visual 对当前帧和选中的历史帧进行编码：
+\begin{equation}
+  \bigl(\mathbf{F}_t,\{\mathbf{h}_k\}_{k=1}^{K}\bigr)
+  =\mathcal{E}_{\mathrm{vis}}
+   \bigl(I_t,\{I_{\tau_k}\}_{k=1}^{K}\bigr).
+\end{equation}
+$\mathbf{F}_t$ 保留当前前视图的空间布局，$\mathbf{h}_k$ 是历史视觉 token。Front 使用真实前视空间特征；Right、Back 和 Left 使用由可学习空间查询、固定方向编码及前视全局上下文构造的方向条件化空间槽。将四个方向展开后记为
+\begin{equation}
+  \mathbf{S}_t
+  =\operatorname{Concat}_{d\in\{\mathrm{F,R,B,L}\}}
+   (\mathbf{S}_t^d)
+  \in\mathbb{R}^{4hw\times d_h}.
+\end{equation}
+因此，四视角表示是四组 spatial tokens，而不是四个单独 token；侧后方向也不额外读取侧后 RGB。
+
+当前图和历史图采用非对称表征：当前图保留二维栅格，以支持最终像素定位；历史图压缩为紧凑 token，以提供观测身份和外观线索。侧后空间槽也不是图像生成结果，而是带有明确朝向先验的可学习空间载体。这样的设计使单目前视输入能够在统一坐标约定下输出四方向分布，同时避免将不存在的侧后视觉证据误写成真实观测。
+
+\paragraph{轨迹引导融合。}
+相对位姿经 Fourier 映射和线性投影得到 trajectory token，历史视觉表示也投影至同一维度：
+\begin{equation}
+  \mathbf{r}_k
+  =\mathbf{W}_{p}\phi
+   (\widehat{\mathbf{p}}_{t\leftarrow\tau_k}),
+  \qquad
+  \overline{\mathbf{h}}_k=\mathbf{W}_{h}\mathbf{h}_k.
+\end{equation}
+对每个历史位置，轨迹引导 Transformer 处理
+\begin{equation}
+  \mathbf{Y}_k
+  =\mathcal{T}_{\mathrm{hm}}
+   \bigl([\overline{\mathbf{h}}_k;
+          \mathbf{r}_k;\mathbf{S}_t]\bigr)
+  \in\mathbb{R}^{(2+4hw)\times d_h}.
+\end{equation}
+历史 token 提供观测身份，trajectory token 提供相对几何，四方向 spatial tokens 承载当前视角内的像素定位。网络由此预测 visibility logits $\bm{\ell}_k\in\mathbb{R}^{4}$、四方向 coarse heatmap，以及 fine spatial logits
+\begin{equation}
+  \mathbf{A}_k\in\mathbb{R}^{4\times64\times64}.
+\end{equation}
+实现中，条件空间分布与方向概率分别为
+\begin{align}
+  \Pi_k^d(u,v)
+  &=\operatorname{softmax}_{u,v}(\mathbf{A}_k^d)(u,v), \\
+  [\alpha_k^{\varnothing},\alpha_k^{\mathrm{F}},
+   \alpha_k^{\mathrm{R}},\alpha_k^{\mathrm{B}},
+   \alpha_k^{\mathrm{L}}]
+  &=\operatorname{softmax}
+    ([0,\ell_k^{\mathrm{F}},\ell_k^{\mathrm{R}},
+       \ell_k^{\mathrm{B}},\ell_k^{\mathrm{L}}]), \\
+  \widehat{H}_k^d(u,v)
+  &=\alpha_k^d\Pi_k^d(u,v).
+\end{align}
+最后一式与代码中的 joint-panorama 推理输出一致。需要强调的是，后续 Heatmap Tokenizer 不读取已经相乘的 gated heatmap；它保留 raw spatial logits 与 raw visibility logits，以免过早丢失空间不确定性和方向置信度。
+
+这一层次化输出把“是否处于某个方向”和“在该方向中的具体位置”分开建模。$\bm{\ell}_k$ 在 none 与四个方向之间分配概率质量，$\Pi_k^d$ 则是在给定方向后归一化的像素分布。二者相乘得到便于解释和可视化的全景热力图，但条件编码仍保留二者的独立数值。因此，当方向判断尚不确定时，轨迹模型仍可读取各视角内部的候选峰、分布宽度和熵，而不是只接收被门控后接近零的响应。
+
+\subsection{热力图条件化的轨迹生成}
+
+\paragraph{结构化 Heatmap Tokenizer。}
+Tokenizer 接收从 Heatmap Head 显式 detach 的 fine logits $\mathbf{A}_t$、visibility logits $\bm{\ell}_t$、历史有效掩码 $\mathbf{m}_t$ 与历史年龄 $\mathbf{a}_t$。对每个历史--方向对 $(k,d)$，它先对 $\mathbf{A}_k^d$ 做视角内空间 softmax，再构造一个结构向量
+\begin{equation}
+  \mathbf{u}_{k,d}
+  =\bigl[
+    \operatorname{Pool}_{8\times8}(\Pi_k^d);
+    \operatorname{Mom}(\Pi_k^d);
+    \ell_k^d;\alpha_k^d;\alpha_k^{\varnothing};
+    \sin\theta_d;\cos\theta_d;
+    \widetilde{a}_k;\rho_k
+  \bigr].
+\end{equation}
+其中 $\operatorname{Mom}(\cdot)$ 汇总二维均值、方差、协方差、归一化熵和峰值概率，$\widetilde{a}_k$ 与 $\rho_k$ 分别编码历史年龄和时序排序。共享 MLP 将每个结构向量映射为 token，再由一层 temporal Transformer 建模不同历史和方向之间的关系：
+\begin{equation}
+  \mathbf{Z}^{\mathrm{hm}}_t
+  =\mathcal{T}_{\mathrm{temp}}
+   \left(
+   \{\operatorname{MLP}(\mathbf{u}_{k,d})\}_{k,d}
+   \right)
+  \in\mathbb{R}^{4K\times d_z}.
+\end{equation}
+token 按 history-major、view-major 排列，并使用由历史掩码扩展得到的 token mask。
+
+该编码同时保留分布形状、方向置信度和时间属性。$8\times8$ 概率摘要描述主要空间质量，矩与熵刻画单峰、多峰及扩散程度，raw visibility logit 与五类概率保留校准前后的方向证据，年龄和排序则让模型区分近期位置与更早历史。无效历史对应的四个 token 全部被 mask，不参与后续 cross-attention。因而，Tokenizer 的作用不是重新预测热力图，而是把 Head 的结构化输出变换为紧凑、可查询且具有明确语义的空间记忆。
+
+\paragraph{逐层残差条件化。}
+原生 System-2 语义条件 $\mathbf{C}_t$ 仍通过 NextDiT 已有的 cross-attention 路径参与每个 block。设 $\mathbf{X}_{l}^{\mathrm{nat}}$ 为第 $l$ 层完成全部原生 attention residual 后的状态。新增适配器以该状态为 query、以 $\mathbf{Z}^{\mathrm{hm}}_t$ 为 key/value：
+\begin{align}
+  \Delta\mathbf{X}_{l}
+  &=m_t\mathbf{W}_{l}^{o}
+    \operatorname{Concat}_{r}
+    \left[
+      \tanh(g_{l,r})
+      \operatorname{Attn}_{l,r}
+      \bigl(\operatorname{LN}(\mathbf{X}_{l}^{\mathrm{nat}}),
+            \operatorname{LN}(\mathbf{Z}^{\mathrm{hm}}_t)\bigr)
+    \right], \\
+  \widetilde{\mathbf{X}}_{l}
+  &=\mathbf{X}_{l}^{\mathrm{nat}}+\Delta\mathbf{X}_{l}, \\
+  \mathbf{X}_{l+1}
+  &=\widetilde{\mathbf{X}}_{l}
+    +\operatorname{FFNResidual}_{l}
+     (\widetilde{\mathbf{X}}_{l}).
+\end{align}
+$m_t$ 表示样本是否具有有效热力图 token。每个 NextDiT block 拥有独立适配器和逐头 gate $g_{l,r}$；gate 以零初始化，因此初始时新增残差严格为零。注入位置位于完整原生 attention residual 之后、原生 FFN 之前，故热力图是对原有语义与视觉条件的增量空间补充，而不是对它们的替换。
+
+这种放置方式保持了原生 block 的条件计算顺序：轨迹 token 先完成自注意力以及对 System-2 条件的原生 cross-attention，随后才查询显式空间历史。每层使用相同的 $\mathbf{Z}^{\mathrm{hm}}_t$，但具有独立的归一化、注意力投影、输出投影和逐头 gate，因此不同深度可以学习不同强度与不同语义的空间修正。零初始化进一步保证加载原生权重时模型函数不发生突变，只有在轨迹监督提供稳定梯度后，新增残差才逐步获得控制能力。
+
+在热力图条件化训练中，System-2、Heatmap Head 和原生 System-1 主干均冻结；Heatmap Head 输出在 Tokenizer 前 detach。可训练部分仅为 Structured Heatmap Tokenizer 与各 NextDiT block 的 heatmap control adapter。完成训练后的推理阶段则冻结全部模块。
+
+\subsection{训练目标}
+
+\paragraph{Heatmap Head 训练与位姿域适配。}
+GT pose、depth 和 intrinsics 仅用于把历史相机中心投影至当前 Front、Right、Back、Left 平面并生成 heatmap 与 visibility 标签。Head 预训练采用
+\begin{equation}
+  \mathcal{L}_{\mathrm{hm}}
+  =\mathcal{L}_{\mathrm{vis}}
+  +\mathcal{L}_{\mathrm{sp}}
+  +0.2\mathcal{L}_{\mathrm{coord}}
+  +0.25\mathcal{L}_{\mathrm{neg}}
+  +0.5\mathcal{L}_{\mathrm{sp}}^{\mathrm{macro}}
+  +\mathcal{L}_{\mathrm{5way}}
+  +0.5\mathcal{L}_{\mathrm{dir}}^{\mathrm{macro}}.
+\end{equation}
+各项分别监督 visibility、可见视角内的像素分布、soft-argmax 坐标、不可见视角抑制、方向均衡的空间定位以及 none/四方向分类。AMB3R-pose 域适配沿用同一监督，但以预测历史相对位姿替代 GT 位姿作为 Head 输入；仅更新 pose projection、轨迹引导 Transformer、visibility head 和 coarse heatmap head，其余视觉与 fine decoder 参数冻结。
+
+这里的 GT pose 不会作为适配阶段的模型输入。它只与训练相机内参和深度共同生成四方向可见性及像素监督，模型实际接收的位姿全部来自 RGB 历史几何估计。该设置把域适配目标限定为：在预测位姿包含平移、尺度和航向误差时，仍恢复由真实几何定义的空间历史，而不改变视觉编码器或 fine localization 的既有能力。
+
+\paragraph{Heatmap injection 训练。}
+第二阶段固定 Head 输出和原生导航模型，只通过轨迹目标训练 Tokenizer 与逐层适配器。给定真实轨迹 $\mathcal{W}_0$、噪声 $\bm{\epsilon}$ 和扩散时刻 $s$，采用
+\begin{equation}
+  \mathbf{X}_{s}
+  =(1-\sigma_s)\mathcal{W}_0+\sigma_s\bm{\epsilon},
+  \qquad
+  \mathbf{V}_{s}^{\mathrm{gt}}
+  =\bm{\epsilon}-\mathcal{W}_0,
+\end{equation}
+并最小化 flow-matching 速度回归误差
+\begin{equation}
+  \mathcal{L}_{\mathrm{traj}}
+  =\mathbb{E}_{s,\bm{\epsilon}}
+   \left[
+   \left\|
+   \mathcal{G}_{\mathrm{S1}}
+   (\mathbf{X}_s,s,\mathbf{C}_t,
+    \mathbf{Z}^{\mathrm{hm}}_t)
+   -\mathbf{V}_{s}^{\mathrm{gt}}
+   \right\|_2^2
+   \right].
+\end{equation}
+该阶段的 heatmap loss 与 language-model loss 权重均为零。
+
+两阶段目标彼此解耦但服务于同一导航映射。第一阶段使热力图适应部署时的 RGB 历史位姿误差；第二阶段固定该空间表示，仅学习如何利用它修正原生轨迹速度场。显式 detach 防止轨迹损失反向改变 Heatmap Head，从而避免动作数据规模和方向偏差破坏已经建立的定位能力。
+
+\begin{thebibliography}{2}
+\bibitem{internnav}
+M. Wei et al.
+\newblock Ground Slow, Move Fast: A Dual-System Foundation Model for Generalizable Vision-and-Language Navigation.
+\newblock 2025.
+
+\bibitem{amb3r}
+H. Wang and L. Agapito.
+\newblock AMB3R: Accurate Feed-forward Metric-scale 3D Reconstruction with Backend.
+\newblock 2025.
+\end{thebibliography}
+
+\end{document}

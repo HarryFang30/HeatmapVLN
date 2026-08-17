@@ -21,6 +21,14 @@ class TestFactory:
             assert call_kwargs["split"] == "train"
             assert call_kwargs["min_history"] == 5
             assert call_kwargs["image_size"] == (256, 256)
+            assert call_kwargs["enable_augmentation"] is False
+
+    def test_build_sliding_window_explicitly_enables_augmentation(self, minimal_cfg):
+        minimal_cfg["data"]["sliding_window"]["enable_augmentation"] = True
+        with patch("src.data.sliding_window_dataset.VLNSlidingWindowDataset") as mock_ds:
+            build_sliding_window_dataset(minimal_cfg, split="train")
+
+        assert mock_ds.call_args.kwargs["enable_augmentation"] is True
 
     def test_build_trajectory_extracts_params(self, minimal_cfg):
         """Factory extracts trajectory-specific params."""
@@ -34,13 +42,71 @@ class TestFactory:
             assert call_kwargs["split"] == "val"
             assert call_kwargs["min_history"] == 5
             assert call_kwargs["enable_augmentation"] is False
+            assert call_kwargs["compute_aligned_native_pixel_goal"] is False
 
-    def test_build_trajectory_can_skip_duplicate_history_frames(self, minimal_cfg):
-        minimal_cfg["data"]["trajectory"]["load_history_frames"] = False
+    def test_build_trajectory_aligned_native_projection_is_explicit_opt_in(self, minimal_cfg):
+        minimal_cfg["data"]["dataset_type"] = "trajectory"
+        minimal_cfg["data"]["trajectory"]["compute_aligned_native_pixel_goal"] = True
         with patch("src.data.trajectory_dataset.VLNTrajectoryDataset") as mock_ds:
             build_trajectory_dataset(minimal_cfg, split="train")
 
-        assert mock_ds.call_args.kwargs["load_history_frames"] is False
+        assert mock_ds.call_args.kwargs["compute_aligned_native_pixel_goal"] is True
+
+    def test_build_trajectory_can_skip_duplicate_history_frames(self, minimal_cfg):
+        minimal_cfg["data"]["trajectory"]["load_single_view_history_frames"] = False
+        with patch("src.data.trajectory_dataset.VLNTrajectoryDataset") as mock_ds:
+            build_trajectory_dataset(minimal_cfg, split="train")
+
+        assert mock_ds.call_args.kwargs["load_single_view_history_frames"] is False
+
+    def test_factory_accepts_deprecated_history_key(self, minimal_cfg):
+        minimal_cfg["data"]["sliding_window"]["load_history_frames"] = False
+        with patch("src.data.sliding_window_dataset.VLNSlidingWindowDataset") as mock_ds:
+            with __import__("pytest").warns(
+                FutureWarning, match="load_single_view_history_frames"
+            ):
+                build_sliding_window_dataset(minimal_cfg, split="train")
+
+        assert mock_ds.call_args.kwargs["load_single_view_history_frames"] is False
+
+    def test_factory_rejects_conflicting_history_keys(self, minimal_cfg):
+        section = minimal_cfg["data"]["trajectory"]
+        section["load_single_view_history_frames"] = False
+        section["load_history_frames"] = True
+        with patch("src.data.trajectory_dataset.VLNTrajectoryDataset"):
+            with __import__("pytest").raises(
+                ValueError, match="Conflicting history settings"
+            ):
+                build_trajectory_dataset(minimal_cfg, split="train")
+
+    def test_deprecated_history_override_takes_precedence(self, minimal_cfg):
+        minimal_cfg["data"]["sliding_window"][
+            "load_single_view_history_frames"
+        ] = True
+        with patch("src.data.sliding_window_dataset.VLNSlidingWindowDataset") as mock_ds:
+            with __import__("pytest").warns(FutureWarning):
+                build_sliding_window_dataset(
+                    minimal_cfg,
+                    split="train",
+                    load_history_frames=False,
+                )
+
+        assert mock_ds.call_args.kwargs["load_single_view_history_frames"] is False
+
+    def test_panoramic_dummy_keeps_full_history_when_single_view_is_disabled(self):
+        from src.data.sliding_window_dataset import VLNSlidingWindowDataset
+
+        dataset = object.__new__(VLNSlidingWindowDataset)
+        dataset.image_size = (8, 6)
+        dataset.hm_size = (4, 3)
+        dataset.num_history_sample = 5
+        dataset.load_single_view_history_frames = False
+        dataset.defer_heatmap_to_gpu = False
+        dataset._is_panoramic = True
+
+        sample = dataset._get_dummy_sample()
+        assert sample["history_frames"].shape == (1, 3, 6, 8)
+        assert sample["history_panoramas"].shape == (5, 4, 3, 6, 8)
 
     def test_build_dataset_dispatches_sliding_window(self, minimal_cfg):
         """build_dataset dispatches to sliding_window when dataset_type matches."""

@@ -109,6 +109,9 @@ def _get_supported_trainable_sync_modules(
         "nextdit_action_head",
         "latent_queries",
         "pano_latent_adapter",
+        "heatmap_tokenizer",
+        "heatmap_control",
+        "past_plan_action",
         *_NEXTDIT_SUBMODULE_KEYS,
     }
     unsupported = sorted(trainable - supported_trainable)
@@ -142,13 +145,77 @@ def _get_supported_trainable_sync_modules(
             )
         sync_modules.append(("vlm_lora", nn.ParameterList(lora_params)))
 
+    ppa_enabled = "past_plan_action" in trainable
     if "heatmap_vln" in trainable:
         if model.heatmap_vln is None:
             raise RuntimeError("heatmap_vln is trainable but has not been constructed before distributed sync.")
-        for attr_name in ["vit_dpt_fusion", "llm_dpt_fusion", "coarse", "fine"]:
-            module = getattr(model.heatmap_vln, attr_name, None)
-            if module is not None and any(param.requires_grad for param in module.parameters()):
-                sync_modules.append((f"heatmap_vln.{attr_name}", module))
+        explicit_head_modules = getattr(
+            model.heatmap_vln,
+            "trainable_head_modules",
+            None,
+        )
+        if ppa_enabled:
+            for attr_name in ("coarse", "fine"):
+                module = getattr(model.heatmap_vln, attr_name, None)
+                if module is not None and any(
+                    parameter.requires_grad for parameter in module.parameters()
+                ):
+                    sync_modules.append((f"heatmap_vln.{attr_name}", module))
+        elif callable(explicit_head_modules):
+            child_names = {
+                id(child): name
+                for name, child in model.heatmap_vln.named_children()
+            }
+            for index, module in enumerate(explicit_head_modules()):
+                if not isinstance(module, nn.Module):
+                    raise RuntimeError(
+                        "heatmap_vln.trainable_head_modules() must return "
+                        f"nn.Module objects, got {type(module).__name__} at {index}"
+                    )
+                if any(param.requires_grad for param in module.parameters()):
+                    attr_name = child_names.get(
+                        id(module),
+                        f"trainable_head_modules[{index}]",
+                    )
+                    sync_modules.append((f"heatmap_vln.{attr_name}", module))
+        else:
+            for attr_name in ["vit_dpt_fusion", "llm_dpt_fusion", "coarse", "fine"]:
+                module = getattr(model.heatmap_vln, attr_name, None)
+                if module is not None and any(param.requires_grad for param in module.parameters()):
+                    sync_modules.append((f"heatmap_vln.{attr_name}", module))
+
+    if "past_plan_action" in trainable:
+        chain = getattr(model, "past_plan_action", None)
+        if chain is None:
+            raise RuntimeError(
+                "past_plan_action is trainable but the model has no chain"
+            )
+        for attr_name in ("bridge", "future_head"):
+            module = getattr(chain, attr_name, None)
+            if module is not None and any(
+                parameter.requires_grad for parameter in module.parameters()
+            ):
+                sync_modules.append((f"past_plan_action.{attr_name}", module))
+
+    if "heatmap_tokenizer" in trainable:
+        tokenizer = getattr(model, "heatmap_tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("heatmap_tokenizer is trainable but missing")
+        if any(param.requires_grad for param in tokenizer.parameters()):
+            sync_modules.append(("heatmap_tokenizer", tokenizer))
+
+    if "heatmap_control" in trainable:
+        head = getattr(model, "nextdit_action_head", None)
+        adapters_fn = getattr(head, "heatmap_control_adapters", None)
+        adapters = tuple(adapters_fn()) if callable(adapters_fn) else ()
+        if not adapters:
+            raise RuntimeError("heatmap_control is trainable but no adapters are attached")
+        for index, adapter in enumerate(adapters):
+            if any(param.requires_grad for param in adapter.parameters()):
+                sync_modules.append((
+                    f"nextdit_action_head.heatmap_control[{index}]",
+                    adapter,
+                ))
 
     nah = getattr(model, "nextdit_action_head", None)
     if "nextdit_action_head" in trainable and nah is not None:
@@ -179,6 +246,49 @@ def _get_supported_trainable_sync_modules(
             "Distributed mode is enabled, but no supported trainable submodules were found for synchronization."
         )
 
+    # This project performs manual parameter broadcast/all-reduce instead of
+    # wrapping the whole pipeline in DDP.  Missing even one newly introduced
+    # tensor silently lets ranks initialize and optimize different models;
+    # listing a shared tensor twice corrupts the collective sequence.  Enforce
+    # exact, duplicate-free coverage before the first collective.
+    synchronized_ids: list[int] = []
+    synchronized_names: dict[int, str] = {}
+    duplicates: list[str] = []
+    for sync_name, module_or_param in sync_modules:
+        parameters = (
+            (module_or_param,)
+            if isinstance(module_or_param, nn.Parameter)
+            else tuple(module_or_param.parameters())
+        )
+        for parameter in parameters:
+            if not parameter.requires_grad:
+                continue
+            parameter_id = id(parameter)
+            if parameter_id in synchronized_names:
+                duplicates.append(
+                    f"{synchronized_names[parameter_id]} and {sync_name}"
+                )
+            else:
+                synchronized_names[parameter_id] = sync_name
+            synchronized_ids.append(parameter_id)
+
+    named_trainable = {
+        id(parameter): name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    synchronized_set = set(synchronized_ids)
+    missing = sorted(
+        named_trainable[parameter_id]
+        for parameter_id in named_trainable.keys() - synchronized_set
+    )
+    extra = len(synchronized_set - named_trainable.keys())
+    if duplicates or missing or extra:
+        raise RuntimeError(
+            "Distributed trainable-parameter sync coverage mismatch: "
+            f"duplicates={duplicates[:8]}, missing={missing[:8]}, extra={extra}"
+        )
+
     return sync_modules
 
 
@@ -188,9 +298,25 @@ def _broadcast_trainable_tensor(tensor: torch.Tensor, src: int = 0) -> None:
 
 
 def _all_reduce_trainable_grad(param: torch.Tensor, world_size: int) -> None:
-    if param.requires_grad and param.grad is not None:
-        _dist_all_reduce_in_place(param.grad)
-        param.grad.div_(world_size)
+    if not param.requires_grad:
+        return
+
+    # Every rank must enqueue exactly the same collective sequence.  Heatmap
+    # losses are data-dependent (for example, a local batch can contain no
+    # visible target), so a trainable parameter may have ``grad is None`` on
+    # one rank while another rank produced a real gradient.  Skipping the
+    # all-reduce in that case shifts the collective order and eventually
+    # deadlocks NCCL.  A missing local contribution is mathematically zero;
+    # materialise it and participate in the same reduction on every rank.
+    grad = param.grad
+    if grad is None:
+        grad = torch.zeros_like(
+            param,
+            memory_format=torch.preserve_format,
+        )
+        param.grad = grad
+    _dist_all_reduce_in_place(grad)
+    grad.div_(world_size)
 
 
 def initialize_trainable_module_sync(

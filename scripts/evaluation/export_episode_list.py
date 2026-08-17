@@ -22,11 +22,16 @@ from scripts.evaluation.r2r_val_unseen import (
 )
 
 
-def export_episodes(scenes_dir: str, data_path: str, count: int) -> list[dict]:
+def export_episodes(scenes_dir: str, data_path: str, count: int, dataset_split: str = "val_unseen") -> list[dict]:
     from types import SimpleNamespace
 
     ensure_vln_measures_registered()
-    args = SimpleNamespace(scenes_dir=scenes_dir, data_path=data_path, sim_gpu_id=0)
+    args = SimpleNamespace(
+        scenes_dir=scenes_dir,
+        data_path=data_path,
+        dataset_split=dataset_split,
+        sim_gpu_id=0,
+    )
     env = habitat.Env(config=build_habitat_config(args))
     episodes: list[dict] = []
     seen: set[tuple[str, int]] = set()
@@ -61,13 +66,18 @@ def main() -> int:
         type=str,
         default="/workspace/InternNav/data/vln_ce/raw_data/r2r/{split}/{split}.json.gz",
     )
+    parser.add_argument(
+        "--dataset_split",
+        choices=("train", "val_seen", "val_unseen"),
+        default="val_unseen",
+    )
     parser.add_argument("--count", type=int, default=20)
     parser.add_argument("--output", type=str, required=True)
     args = parser.parse_args()
 
-    episodes = export_episodes(args.scenes_dir, args.data_path, args.count)
+    episodes = export_episodes(args.scenes_dir, args.data_path, args.count, args.dataset_split)
     out = {
-        "split": "val_unseen",
+        "split": args.dataset_split,
         "scenes_dir": args.scenes_dir,
         "data_path": args.data_path,
         "count": len(episodes),

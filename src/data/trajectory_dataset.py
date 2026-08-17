@@ -24,6 +24,9 @@ except ImportError as exc:  # pragma: no cover - exercised in lightweight test e
 else:
     _CV2_IMPORT_ERROR = None
 
+from .amb3r_pose_cache import AMB3R_POSE_PROVIDER, AMB3RPoseCacheError
+from .future_trajectory_batch import future_target_to_tensors
+from .future_trajectory_heatmap import build_future_target_from_system1_action
 from .heatmap_geometry import compute_history_heatmap
 from .pano_view_pixel_goal import (
     PANO_HORIZONTAL_VIEWS,
@@ -50,6 +53,37 @@ from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
 def _require_cv2() -> None:
     if cv2 is None:
         raise ImportError("opencv-python is required for trajectory image decoding") from _CV2_IMPORT_ERROR
+
+
+HABITAT_HISTORY_POSE_CONVENTION = (
+    "habitat_c2w_minus_z__forward_left_cos_yaw_sin_yaw__v1"
+)
+LEGACY_HISTORY_POSE_CONVENTION = (
+    "legacy_c2w_plus_z__forward_left_cos_yaw_sin_yaw__v1"
+)
+HEATMAP_DIRECTION_ORDER = ("front", "right", "back", "left")
+
+
+def _history_temporal_metadata(
+    history_indices: list[int],
+    current_t: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the frame-id, validity, float mask, and age contract."""
+    frame_ids = torch.as_tensor(history_indices, dtype=torch.long)
+    ages = int(current_t) - frame_ids
+    if torch.any(ages < 0):
+        raise ValueError("history frame IDs cannot be newer than the current frame")
+    valid = torch.ones(frame_ids.shape, dtype=torch.bool)
+    return frame_ids, valid, valid.float(), ages
+
+
+def _history_pose_contract(
+    trajectory_target_convention: str,
+) -> tuple[str, str]:
+    """Select the audited frame convention without changing legacy samples."""
+    if trajectory_target_convention == "internnav_habitat":
+        return "-z", HABITAT_HISTORY_POSE_CONVENTION
+    return "+z", LEGACY_HISTORY_POSE_CONVENTION
 
 
 class VLNTrajectoryDataset(VLNSlidingWindowDataset):
@@ -103,7 +137,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         action_scale: float = 4.0,
         enable_trajectory_augmentation: bool = True,
         load_traj_images: bool = False,
-        load_history_frames: bool = True,
+        load_history_frames: bool | None = None,  # deprecated constructor alias
         traj_image_size: tuple[int, int] = (224, 224),
         compute_pixel_goal: bool = False,
         load_lookdown_for_system2: bool = False,
@@ -120,9 +154,17 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # Stage 2: 前视图+lookdown (InternNav aligned) vs 全景图 VLM 输入
         panoramic_vlm_input: bool = True,
         compute_pano_view_pixel_goal: bool | None = None,
+        compute_aligned_native_pixel_goal: bool = False,
         pano_max_side_dist_m: float = 6.0,
         trajectory_target_convention: str = "legacy_pitched_camera",
         max_clips: int = 0,
+        load_single_view_history_frames: bool | None = None,
+        single_view_rgb_input: bool = False,
+        amb3r_pose_cache_root: str | None = None,
+        require_amb3r_pose_cache: bool = False,
+        amb3r_pose_cache_max_clips: int = 16,
+        load_future_trajectory_heatmap: bool = False,
+        future_heatmap_size: tuple[int, int] = (64, 64),
     ):
         # ``VLNSlidingWindowDataset.__init__`` calls ``self._build_sample_index()``
         # before its chunk caches / panoramic detection fields are fully
@@ -131,6 +173,14 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # the InternNav index after ``super().__init__`` completes.
         actual_require_sft_target = require_sft_target
         self.require_sft_target = False
+        if require_amb3r_pose_cache and random_subsequence:
+            raise ValueError(
+                "endpoint-v2 AMB3R cache requires random_subsequence=false; "
+                "cached history identities always start at frame zero"
+            )
+        # Set before the parent constructor so its history-input log reports
+        # the effective panoramic path for trajectory datasets accurately.
+        self.panoramic_vlm_input = panoramic_vlm_input
         self.include_stop_samples_random_subsequence = include_stop_samples_random_subsequence
         super().__init__(
             root=root,
@@ -150,6 +200,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             subsequence_samples_per_clip=subsequence_samples_per_clip,
             include_stop_samples_random_subsequence=include_stop_samples_random_subsequence,
             load_history_frames=load_history_frames,
+            load_single_view_history_frames=load_single_view_history_frames,
+            single_view_rgb_input=single_view_rgb_input,
+            amb3r_pose_cache_root=amb3r_pose_cache_root,
+            require_amb3r_pose_cache=require_amb3r_pose_cache,
+            amb3r_pose_cache_max_clips=amb3r_pose_cache_max_clips,
             max_clips=max_clips,
         )
 
@@ -176,6 +231,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         if compute_pano_view_pixel_goal is None:
             compute_pano_view_pixel_goal = panoramic_vlm_input and self.compute_pixel_goal
         self.compute_pano_view_pixel_goal = bool(compute_pano_view_pixel_goal)
+        self.compute_aligned_native_pixel_goal = bool(compute_aligned_native_pixel_goal)
         self.pano_max_side_dist_m = float(pano_max_side_dist_m)
         allowed_target_conventions = {
             "legacy_pitched_camera",
@@ -188,6 +244,35 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 f"{trajectory_target_convention!r}"
             )
         self.trajectory_target_convention = trajectory_target_convention
+        self.load_future_trajectory_heatmap = bool(load_future_trajectory_heatmap)
+        self.future_heatmap_size = tuple(int(v) for v in future_heatmap_size)
+        if self.load_future_trajectory_heatmap:
+            if self.predict_horizon != 32:
+                raise ValueError(
+                    "Future trajectory heatmaps require predict_horizon=32"
+                )
+            if self.future_heatmap_size != (64, 64):
+                raise ValueError(
+                    "Future trajectory heatmaps require heatmap_size=(64,64)"
+                )
+            if self.trajectory_target_convention != "internnav_habitat":
+                raise ValueError(
+                    "Future trajectory heatmaps require "
+                    "trajectory_target_convention='internnav_habitat'"
+                )
+            if not self.load_traj_images or not self.require_sft_target:
+                raise ValueError(
+                    "Future trajectory heatmaps require the expert native "
+                    "System-1 path: load_traj_images=true and "
+                    "require_sft_target=true"
+                )
+            # The map must be rendered from the exact action target.  Applying
+            # two independent random augmentations would break that identity.
+            if self.enable_trajectory_augmentation:
+                raise ValueError(
+                    "Future trajectory heatmaps require "
+                    "enable_trajectory_augmentation=false"
+                )
 
         if self.require_sft_target:
             self._build_sample_index()
@@ -217,8 +302,12 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             f"system2_stop_oversample={self.system2_stop_oversample}, "
             f"panoramic_vlm_input={self.panoramic_vlm_input}, "
             f"compute_pano_view_pixel_goal={self.compute_pano_view_pixel_goal}, "
+            f"compute_aligned_native_pixel_goal={self.compute_aligned_native_pixel_goal}, "
             f"pano_max_side_dist_m={self.pano_max_side_dist_m}, "
-            f"trajectory_target_convention={self.trajectory_target_convention}"
+            f"trajectory_target_convention={self.trajectory_target_convention}, "
+            f"history_pose_provider="
+            f"{'amb3r_vo_cache' if self.amb3r_pose_cache is not None else 'habitat_gt'}, "
+            f"load_future_trajectory_heatmap={self.load_future_trajectory_heatmap}"
         )
 
     def set_epoch(self, epoch: int):
@@ -348,6 +437,46 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         goal_len, canonical, legacy_uv = pano_goal
         return goal_len, canonical.view_id, [canonical.u, canonical.v], legacy_uv
 
+    def _project_exact_goal_to_native_view(
+        self,
+        clip_idx: int,
+        clip_dir: Path,
+        current_t: int,
+        num_frames: int,
+        goal_relative_len: int,
+        img_size: int | tuple[int, int],
+        *,
+        direction: str = "front_down",
+    ) -> list[int] | None:
+        """Project the pano-selected waypoint into the native teacher camera.
+
+        This deliberately does *not* search for another visible waypoint. The
+        pano student and native InternNav teacher must describe the exact same
+        future frame, otherwise latent distillation has contradictory targets.
+        """
+        goal_len = int(goal_relative_len)
+        goal_frame_idx = int(current_t) + goal_len
+        if goal_len <= 0 or goal_frame_idx >= int(num_frames):
+            return None
+
+        poses = self._load_poses_for_direction(clip_idx, direction)
+        if current_t >= len(poses) or goal_frame_idx >= len(poses):
+            return None
+        depth = self._load_depth(clip_dir, current_t, direction=direction)
+        if isinstance(img_size, (tuple, list)):
+            proj_size: int | tuple[int, int] = (int(img_size[0]), int(img_size[1]))
+        else:
+            proj_size = int(img_size)
+        projected = self._compute_pixel_goal(
+            poses[current_t],
+            poses[goal_frame_idx],
+            img_size=proj_size,
+            depth_map=depth,
+        )
+        if projected is None:
+            return None
+        return [int(projected[0]), int(projected[1])]
+
     def _internnav_sft_frame_kind(
         self,
         clip_idx: int,
@@ -408,10 +537,26 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     continue
                 actions = self._align_internnav_discrete_actions(raw_actions)
                 actions_len = len(actions)
+                eligible_current_ids = set(
+                    int(frame_id)
+                    for frame_id in self._clip_valid_frames.get(clip_idx, [])
+                )
+                if self.amb3r_pose_cache is not None and not eligible_current_ids:
+                    raise AMB3RPoseCacheError(
+                        f"No endpoint-v2 rows are eligible for {clip_dir}"
+                    )
 
-                num_rounds = actions_len // sample_step
-                for n in range(num_rounds + 1):
-                    start_frame_id = n * sample_step
+                if self.amb3r_pose_cache is not None:
+                    # Endpoint-v2 IDs (19, 27, 35, ...) are intentionally not
+                    # aligned to the legacy System2 sample_step grid.  The
+                    # cache is the authoritative occurrence population.
+                    candidate_current_ids = sorted(eligible_current_ids)
+                else:
+                    num_rounds = actions_len // sample_step
+                    candidate_current_ids = [
+                        n * sample_step for n in range(num_rounds + 1)
+                    ]
+                for start_frame_id in candidate_current_ids:
                     if (
                         start_frame_id == actions_len
                         or start_frame_id == actions_len - 1
@@ -437,12 +582,21 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                         turn_samples += 1
 
                 last_frame = num_frames - 1
-                if not self.load_traj_images and last_frame >= self.min_history:
+                if (
+                    not self.load_traj_images
+                    and last_frame >= self.min_history
+                    and last_frame in eligible_current_ids
+                ):
                     for _ in range(stop_repeat):
                         sample_idx = len(self.sample_index)
                         self.sample_index.append((clip_idx, last_frame))
                         self._sample_subsequence_range[sample_idx] = (0, num_frames)
                         stop_samples += 1
+            except AMB3RPoseCacheError:
+                # The provider is a run-level input contract.  Silently
+                # dropping a cache-mismatched expert clip would change the
+                # population and hide a GT fallback.
+                raise
             except Exception as exc:
                 logger.warning("Failed to build InternNav SFT index for %s: %s", clip_dir, exc)
                 skipped += 1
@@ -819,7 +973,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         # 3. 加载历史帧
         history_frames = (
             self._load_frames(clip_dir, history_indices)
-            if self.load_history_frames
+            if self.load_single_view_history_frames
             else torch.zeros(1, 3, self.image_size[1], self.image_size[0])
         )
 
@@ -872,7 +1026,13 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
 
         gt_visibility = None
         if self.load_history_heatmap:
-            if self._is_panoramic and self.panoramic_vlm_input:
+            # Supervision geometry is independent of the System-2 image
+            # protocol.  PPA deliberately feeds native front/lookdown RGB to
+            # Qwen (panoramic_vlm_input=false) while the existing Past Head
+            # still predicts fixed-K F/R/B/L maps.  Always build the four-view
+            # target for a panoramic source; otherwise the native protocol
+            # would silently collapse History supervision to one 64x64 map.
+            if self._is_panoramic:
                 heatmap_tensor, gt_visibility = self._compute_per_history_multiview_heatmaps(
                     clip_idx=clip_idx,
                     clip_dir=clip_dir,
@@ -895,7 +1055,7 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                     depth_normalize=not self._depth_is_meters,
                 )
                 heatmap_tensor = torch.from_numpy(heatmap).float()
-        elif self._is_panoramic and self.panoramic_vlm_input:
+        elif self._is_panoramic:
             heatmap_tensor = torch.zeros(len(history_indices), 4, hm_h, hm_w)
         else:
             heatmap_tensor = torch.zeros(hm_h, hm_w)
@@ -947,6 +1107,19 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             "is_stop": is_stop,                      # float
             "text": text,                            # str
         }
+        (
+            history_frame_ids,
+            history_valid_mask,
+            history_mask,
+            history_age_steps,
+        ) = _history_temporal_metadata(history_indices, current_t)
+        result.update(
+            history_frame_ids=history_frame_ids,
+            history_valid_mask=history_valid_mask,
+            history_mask=history_mask,
+            history_age_steps=history_age_steps,
+            heatmap_direction_order=HEATMAP_DIRECTION_ORDER,
+        )
         if turn_actions:
             result["turn_actions"] = turn_actions
             result["turn_action_text"] = "".join(
@@ -982,12 +1155,27 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             )
             if pano_result is not None:
                 goal_len, view_id, pano_pg, legacy_uv = pano_result
+                goal_frame_idx = current_t + int(goal_len)
                 result["pano_view_id"] = view_id
                 result["pano_pixel_goal"] = pano_pg
                 result["pano_pixel_goal_relative_len"] = goal_len
+                result["pano_goal_frame_idx"] = goal_frame_idx
                 result["pano_sample_kind"] = "pixel"
                 if legacy_uv is not None:
                     result["legacy_front_pixel_goal"] = legacy_uv
+                if self.compute_aligned_native_pixel_goal:
+                    aligned_native_uv = self._project_exact_goal_to_native_view(
+                        clip_idx=clip_idx,
+                        clip_dir=clip_dir,
+                        current_t=current_t,
+                        num_frames=T,
+                        goal_relative_len=goal_len,
+                        img_size=self.image_size,
+                        direction="front_down",
+                    )
+                    result["aligned_native_pixel_goal_uv"] = aligned_native_uv
+                    result["aligned_native_goal_frame_idx"] = goal_frame_idx
+                    result["aligned_native_visible"] = aligned_native_uv is not None
             elif float(result.get("is_stop", 0.0)) > 0.5:
                 result["pano_view_id"] = VIEW_STOP
                 result["pano_sample_kind"] = "stop"
@@ -1090,6 +1278,34 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
             result["trajectory"] = torch.from_numpy(traj_poses)  # [N, predict_horizon, 3]
             result["trajectory_valid"] = torch.from_numpy(traj_valids)  # [N]
 
+        if self.load_future_trajectory_heatmap and has_system1_goal:
+            # ``InternNavHeatmapControlCollator`` canonicalizes the first
+            # trajectory slot for native System-1.  Render from that exact
+            # tensor, not from another resampling of the remaining route.
+            system1_trajectory = result["trajectory"]
+            system1_valid = result["trajectory_valid"]
+            if system1_trajectory.ndim == 3:
+                system1_trajectory = system1_trajectory[0]
+            if torch.is_tensor(system1_valid):
+                system1_valid = system1_valid.reshape(-1)[0]
+            if (
+                tuple(system1_trajectory.shape) == (32, 3)
+                and float(system1_valid) > 0.0
+            ):
+                expert_future_end = min(goal_frame_idx + 1, subseq_end, T)
+                target = build_future_target_from_system1_action(
+                    system1_trajectory.detach().cpu().numpy(),
+                    action_scale=self.action_scale,
+                    current_camera_c2w=current_pose,
+                    expert_future_camera_c2w=np.stack(
+                        poses[current_t:expert_future_end], axis=0
+                    ),
+                    intrinsics=K,
+                    image_size=img_size,
+                    heatmap_size=self.future_heatmap_size,
+                )
+                result.update(future_target_to_tensors(target))
+
         if gt_visibility is not None:
             result["gt_visibility"] = gt_visibility  # [N, 4]
         if current_views is not None:
@@ -1110,9 +1326,32 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
                 ld = current_frame
             result["lookdown_frame"] = ld  # [3, H, W]
 
+        (
+            history_camera_forward_axis,
+            history_pose_convention,
+        ) = _history_pose_contract(self.trajectory_target_convention)
+        if self.amb3r_pose_cache is not None:
+            input_rel_poses = self.amb3r_pose_cache.lookup(
+                clip_dir,
+                current_frame_id=current_t,
+                history_frame_ids=np.asarray(history_indices, dtype=np.int64),
+            )
+            history_pose_provider = AMB3R_POSE_PROVIDER
+        else:
+            input_rel_poses = compute_history_rel_poses(
+                history_poses,
+                current_pose,
+                camera_forward_axis=history_camera_forward_axis,
+            )
+            history_pose_provider = "habitat_gt"
         result["history_rel_poses"] = torch.from_numpy(
-            compute_history_rel_poses(history_poses, current_pose)
+            input_rel_poses
         ).float()                                              # [K, 4]
+        result["history_pose_convention"] = history_pose_convention
+        result["history_pose_provider"] = history_pose_provider
+        result["sample_identity"] = (
+            f"{clip_dir.relative_to(self.root).as_posix()}@{int(current_t):06d}"
+        )
 
         if self.defer_heatmap_to_gpu:
             result["history_poses"] = torch.from_numpy(
@@ -1146,6 +1385,11 @@ class VLNTrajectoryDataset(VLNSlidingWindowDataset):
         for candidate_idx in self._candidate_retry_indices(idx):
             try:
                 result = self._build_sample(candidate_idx)
+            except AMB3RPoseCacheError:
+                # Provider identity errors are not corrupt-example retries.
+                # Retrying another clip would hide an incomplete endpoint
+                # cache and alter the expert population.
+                raise
             except Exception as exc:
                 last_exception = exc
                 clip_idx, current_t = self.sample_index[candidate_idx]
