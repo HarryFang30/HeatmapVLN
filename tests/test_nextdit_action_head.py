@@ -61,6 +61,28 @@ def test_sample_flow_matching_inputs_uses_head_scheduler():
     assert target.shape == gt.shape
 
 
+def test_projected_velocity_casts_fp32_trajectory_to_bf16_encoder_without_autocast():
+    head = _minimal_head()
+    head.action_encoder = torch.nn.Linear(3, 3, bias=False).to(
+        dtype=torch.bfloat16
+    )
+    head._fuse_projected_conditions = lambda condition, _images: condition
+    head._heatmap_dit_kwargs = lambda *_args: {}
+    condition = torch.randn(2, 4, 3, dtype=torch.bfloat16)
+    noisy = torch.randn(2, 4, 3, dtype=torch.float32)
+    timesteps = torch.tensor([3, 1])
+
+    with torch.no_grad():
+        velocity = head.predict_velocity_from_projected(
+            condition,
+            noisy,
+            timesteps,
+        )
+
+    assert velocity.dtype == torch.bfloat16
+    assert noisy.dtype == torch.float32
+
+
 def test_generate_traj_from_condition_latents_uses_head_scheduler():
     head = _minimal_head()
     cond = torch.randn(1, 4, 3)

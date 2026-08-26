@@ -178,6 +178,9 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
     pose_adaptation = is_pose_adaptation_stage(stage_cfg)
     ppa_chain = getattr(model_module, "past_plan_action", None)
     ppa_enabled = ppa_chain is not None
+    ppa_bridge_only = bool(
+        stage_cfg.get("past_plan_action_bridge_only", False)
+    )
     selective_action_modules = {
         "latent_queries",
         "cond_projector",
@@ -223,15 +226,16 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
                 # frozen visual conditioners must stay deterministic.
                 model_module.heatmap_vln.eval()
                 coarse = model_module.heatmap_vln.coarse
-                for module_name in (
-                    "proj_history",
-                    "proj_traj",
-                    "self_attn",
-                    "vis_head",
-                    "heatmap_head",
-                ):
-                    getattr(coarse, module_name).train()
-                model_module.heatmap_vln.fine.train()
+                if not ppa_bridge_only:
+                    for module_name in (
+                        "proj_history",
+                        "proj_traj",
+                        "self_attn",
+                        "vis_head",
+                        "heatmap_head",
+                    ):
+                        getattr(coarse, module_name).train()
+                    model_module.heatmap_vln.fine.train()
             elif pose_adaptation:
                 # Recursive head.train() would reactivate dropout/stochastic
                 # behavior in frozen DPT/Fine branches.  Only the four
@@ -307,7 +311,8 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
 
     if ppa_enabled:
         ppa_chain.eval()
-        ppa_chain.future_head.train()
+        if not ppa_bridge_only:
+            ppa_chain.future_head.train()
         if str(stage_cfg.get("past_plan_action_stage", "stage2_joint")) == "stage2_joint":
             ppa_chain.bridge.train()
 

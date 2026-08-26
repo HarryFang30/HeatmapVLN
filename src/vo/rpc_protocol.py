@@ -272,6 +272,115 @@ def model_pose_fields_from_query(
     return model_fields
 
 
+def validate_model_pose_fields(
+    payload: Mapping[str, Any],
+    *,
+    num_history: int,
+) -> dict[str, Any]:
+    """Validate AMB3R fields received by the formal PPA model RPC.
+
+    This is the server-side inverse of :func:`model_pose_fields_from_query`.
+    Only causal AMB3R relative poses are accepted; simulator c2w fields and
+    zero-filled warmup placeholders are forbidden.
+    """
+    count = _integer(num_history, name="num_history")
+    if payload.get("pose_provider") != AMB3R_VO_POSE_PROVIDER:
+        raise ValueError(
+            "formal PPA RPC requires pose_provider='amb3r_vo_da3'"
+        )
+    forbidden = [key for key in ("current_c2w", "history_c2w") if key in payload]
+    if forbidden:
+        raise ValueError(f"formal PPA RPC forbids privileged pose fields: {forbidden}")
+
+    ready = payload.get("pose_ready")
+    if type(ready) is not bool:
+        raise TypeError("pose_ready must be a JSON boolean")
+    current_frame_id = _integer(
+        payload.get("vo_current_frame_id"), name="vo_current_frame_id"
+    )
+    raw_history_ids = payload.get("vo_history_frame_ids")
+    if not isinstance(raw_history_ids, list):
+        raise TypeError("vo_history_frame_ids must be a JSON list")
+    history_ids = [
+        _integer(value, name=f"vo_history_frame_ids[{index}]")
+        for index, value in enumerate(raw_history_ids)
+    ]
+    if len(history_ids) != count:
+        raise ValueError(
+            "VO history identity count differs from history RGB count: "
+            f"ids={len(history_ids)} rgb={count}"
+        )
+    if any(frame_id >= current_frame_id for frame_id in history_ids):
+        raise ValueError("formal PPA history frames must be strictly before current")
+    if any(right <= left for left, right in zip(history_ids, history_ids[1:])):
+        raise ValueError("formal PPA history frame IDs must be strictly increasing")
+
+    phase = payload.get("vo_provider_phase")
+    if not isinstance(phase, str) or not phase.strip():
+        raise ValueError("vo_provider_phase must be a non-empty string")
+    revision = _integer(
+        payload.get("vo_trajectory_revision"), name="vo_trajectory_revision"
+    )
+
+    current_step = _integer(
+        payload.get("current_capture_step"), name="current_capture_step"
+    )
+    raw_history_steps = payload.get("history_capture_steps")
+    raw_ages = payload.get("history_age_steps")
+    if not isinstance(raw_history_steps, list) or not isinstance(raw_ages, list):
+        raise TypeError("history_capture_steps and history_age_steps must be lists")
+    history_steps = [
+        _integer(value, name=f"history_capture_steps[{index}]")
+        for index, value in enumerate(raw_history_steps)
+    ]
+    ages = [
+        _integer(value, name=f"history_age_steps[{index}]")
+        for index, value in enumerate(raw_ages)
+    ]
+    if len(history_steps) != count or len(ages) != count:
+        raise ValueError("history capture metadata does not match history RGB count")
+    if any(step > current_step for step in history_steps):
+        raise ValueError("history capture steps must be causal")
+    expected_ages = [current_step - step for step in history_steps]
+    if ages != expected_ages:
+        raise ValueError(
+            f"history ages mismatch: expected={expected_ages}, got={ages}"
+        )
+
+    result: dict[str, Any] = {
+        "pose_provider": AMB3R_VO_POSE_PROVIDER,
+        "pose_ready": ready,
+        "vo_current_frame_id": current_frame_id,
+        "vo_history_frame_ids": np.asarray(history_ids, dtype=np.int64),
+        "vo_provider_phase": phase,
+        "vo_trajectory_revision": revision,
+        "current_capture_step": current_step,
+        "history_capture_steps": np.asarray(history_steps, dtype=np.int64),
+        "history_age_steps": np.asarray(ages, dtype=np.int64),
+    }
+    raw_relative = payload.get("history_rel_poses")
+    if not ready:
+        if raw_relative is not None and np.asarray(raw_relative).size:
+            raise ValueError(
+                "AMB3R warmup must not expose zero/placeholder relative poses"
+            )
+        result["history_rel_poses"] = np.empty((0, 4), dtype=np.float32)
+        return result
+
+    if count == 0:
+        raise ValueError("pose_ready cannot be true without history")
+    relative = np.asarray(raw_relative, dtype=np.float32)
+    if relative.shape != (count, 4) or not np.isfinite(relative).all():
+        raise ValueError(
+            f"history_rel_poses must be finite [{count},4], got {relative.shape}"
+        )
+    yaw_norm = np.linalg.norm(relative[:, 2:4], axis=1)
+    if not np.allclose(yaw_norm, 1.0, atol=2e-3, rtol=0.0):
+        raise ValueError("history_rel_poses yaw must be unit (cos,sin)")
+    result["history_rel_poses"] = np.ascontiguousarray(relative)
+    return result
+
+
 __all__ = [
     "AMB3R_VO_FRONT_BLOB_NAME",
     "AMB3R_VO_INGEST_METHOD",
@@ -282,6 +391,7 @@ __all__ = [
     "HABITAT_GT_POSE_PROVIDER",
     "VOFrameLedger",
     "model_pose_fields_from_query",
+    "validate_model_pose_fields",
     "native_front_rgb",
     "unique_past_vo_records",
     "validate_ingest_response",

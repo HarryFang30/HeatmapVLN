@@ -25,7 +25,12 @@ INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/Inter
 PPA_DATA_ROOT="${PPA_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train}"
 PPA_AMB3R_CACHE_ROOT="${PPA_AMB3R_CACHE_ROOT:-}"
 PPA_PAST_INIT_CHECKPOINT="${PPA_PAST_INIT_CHECKPOINT:-}"
+PPA_STAGE1_BEST_CHECKPOINT="${PPA_STAGE1_BEST_CHECKPOINT:-}"
 PPA_OUTPUT_ROOT="${PPA_OUTPUT_ROOT:-}"
+# ``stage2_only`` is the fail-safe retry path after a completed Stage 1.  It
+# validates the Stage-1 deployment checkpoint, starts a fresh optimizer and
+# exact-zero bridge, and never reuses a partial Stage-2 run.
+PPA_RUN_MODE="${PPA_RUN_MODE:-two_stage}"
 
 PPA_STAGE1_OUTPUT_ROOT="${PPA_STAGE1_OUTPUT_ROOT:-${PPA_OUTPUT_ROOT}/stage1_map_pretrain}"
 PPA_STAGE2_OUTPUT_ROOT="${PPA_STAGE2_OUTPUT_ROOT:-${PPA_OUTPUT_ROOT}/stage2_joint}"
@@ -156,7 +161,7 @@ assert_pairwise_nonoverlap() {
     "$PPA_OUTPUT_ROOT"
     "$PPA_DATA_ROOT"
     "$PPA_AMB3R_CACHE_ROOT"
-    "$PPA_PAST_INIT_CHECKPOINT"
+    "$PPA_INITIALIZER_CHECKPOINT"
   )
   local i j
   for ((i = 0; i < ${#paths[@]}; i++)); do
@@ -181,8 +186,22 @@ command -v realpath >/dev/null 2>&1 \
   || die "realpath is required for formal path containment checks"
 require_nonempty PPA_ALLOWED_ROOT "$PPA_ALLOWED_ROOT"
 require_nonempty PPA_AMB3R_CACHE_ROOT "$PPA_AMB3R_CACHE_ROOT"
-require_nonempty PPA_PAST_INIT_CHECKPOINT "$PPA_PAST_INIT_CHECKPOINT"
 require_nonempty PPA_OUTPUT_ROOT "$PPA_OUTPUT_ROOT"
+case "$PPA_RUN_MODE" in
+  two_stage)
+    require_nonempty PPA_PAST_INIT_CHECKPOINT "$PPA_PAST_INIT_CHECKPOINT"
+    PPA_INITIALIZER_CHECKPOINT="$PPA_PAST_INIT_CHECKPOINT"
+    PPA_INITIALIZER_KIND="past-init"
+    ;;
+  stage2_only)
+    require_nonempty PPA_STAGE1_BEST_CHECKPOINT "$PPA_STAGE1_BEST_CHECKPOINT"
+    PPA_INITIALIZER_CHECKPOINT="$PPA_STAGE1_BEST_CHECKPOINT"
+    PPA_INITIALIZER_KIND="stage1"
+    ;;
+  *)
+    die "PPA_RUN_MODE must be two_stage or stage2_only, got '$PPA_RUN_MODE'"
+    ;;
+esac
 
 PPA_ALLOWED_ROOT="$(canonicalize_missing_ok "$PPA_ALLOWED_ROOT")" \
   || die "cannot resolve PPA_ALLOWED_ROOT: $PPA_ALLOWED_ROOT"
@@ -199,7 +218,12 @@ PPA_QWEN_PYTHON="$(resolve_formal_path PPA_QWEN_PYTHON "$PPA_QWEN_PYTHON")"
 INTERNNAV_MODEL_PATH="$(resolve_formal_path INTERNNAV_MODEL_PATH "$INTERNNAV_MODEL_PATH")"
 PPA_DATA_ROOT="$(resolve_formal_path PPA_DATA_ROOT "$PPA_DATA_ROOT")"
 PPA_AMB3R_CACHE_ROOT="$(resolve_formal_path PPA_AMB3R_CACHE_ROOT "$PPA_AMB3R_CACHE_ROOT")"
-PPA_PAST_INIT_CHECKPOINT="$(resolve_formal_path PPA_PAST_INIT_CHECKPOINT "$PPA_PAST_INIT_CHECKPOINT")"
+PPA_INITIALIZER_CHECKPOINT="$(resolve_formal_path PPA_INITIALIZER_CHECKPOINT "$PPA_INITIALIZER_CHECKPOINT")"
+if [[ "$PPA_RUN_MODE" == "two_stage" ]]; then
+  PPA_PAST_INIT_CHECKPOINT="$PPA_INITIALIZER_CHECKPOINT"
+else
+  PPA_STAGE1_BEST_CHECKPOINT="$PPA_INITIALIZER_CHECKPOINT"
+fi
 PPA_OUTPUT_ROOT="$(resolve_formal_path PPA_OUTPUT_ROOT "$PPA_OUTPUT_ROOT")"
 PPA_STAGE1_OUTPUT_ROOT="$(resolve_formal_path PPA_STAGE1_OUTPUT_ROOT "$PPA_STAGE1_OUTPUT_ROOT")"
 PPA_STAGE2_OUTPUT_ROOT="$(resolve_formal_path PPA_STAGE2_OUTPUT_ROOT "$PPA_STAGE2_OUTPUT_ROOT")"
@@ -220,8 +244,8 @@ PPA_RUNTIME_CACHE_ROOT="$(resolve_formal_path PPA_RUNTIME_CACHE_ROOT "$PPA_OUTPU
   || die "expert dataset root missing: $PPA_DATA_ROOT"
 [[ ! -e "$PPA_AMB3R_CACHE_ROOT" || -d "$PPA_AMB3R_CACHE_ROOT" ]] \
   || die "AMB3R cache root exists but is not a directory: $PPA_AMB3R_CACHE_ROOT"
-[[ -f "$PPA_PAST_INIT_CHECKPOINT" && -s "$PPA_PAST_INIT_CHECKPOINT" ]] \
-  || die "Past initializer is missing/empty: $PPA_PAST_INIT_CHECKPOINT"
+[[ -f "$PPA_INITIALIZER_CHECKPOINT" && -s "$PPA_INITIALIZER_CHECKPOINT" ]] \
+  || die "initializer is missing/empty: $PPA_INITIALIZER_CHECKPOINT"
 [[ ! -e "$PPA_OUTPUT_ROOT" || -d "$PPA_OUTPUT_ROOT" ]] \
   || die "output root exists but is not a directory: $PPA_OUTPUT_ROOT"
 [[ -f "$PPA_STAGE1_CONFIG" && -s "$PPA_STAGE1_CONFIG" ]] \
@@ -287,13 +311,16 @@ done
 [[ "$PPA_STAGE1_MASTER_PORT" != "$PPA_STAGE2_MASTER_PORT" ]] \
   || die "Stage 1 and Stage 2 must use different rendezvous ports"
 
-[[ ! -e "$PPA_STAGE1_OUTPUT_ROOT" && ! -L "$PPA_STAGE1_OUTPUT_ROOT" ]] \
-  || die "refusing to reuse Stage-1 output: $PPA_STAGE1_OUTPUT_ROOT"
+if [[ "$PPA_RUN_MODE" == "two_stage" ]]; then
+  [[ ! -e "$PPA_STAGE1_OUTPUT_ROOT" && ! -L "$PPA_STAGE1_OUTPUT_ROOT" ]] \
+    || die "refusing to reuse Stage-1 output: $PPA_STAGE1_OUTPUT_ROOT"
+fi
 [[ ! -e "$PPA_STAGE2_OUTPUT_ROOT" && ! -L "$PPA_STAGE2_OUTPUT_ROOT" ]] \
   || die "refusing to reuse Stage-2 output: $PPA_STAGE2_OUTPUT_ROOT"
 
 export PPA_ALLOWED_ROOT PPA_REPO_ROOT PPA_QWEN_PYTHON INTERNNAV_MODEL_PATH
 export PPA_DATA_ROOT PPA_AMB3R_CACHE_ROOT PPA_PAST_INIT_CHECKPOINT
+export PPA_STAGE1_BEST_CHECKPOINT PPA_RUN_MODE
 export PPA_OUTPUT_ROOT PPA_STAGE1_OUTPUT_ROOT PPA_STAGE2_OUTPUT_ROOT
 export PPA_TENSORBOARD_ROOT PPA_RUNTIME_CACHE_ROOT
 
@@ -347,10 +374,10 @@ log "validating both YAML files against the live schema"
   --config "$PPA_STAGE2_CONFIG" \
   --expected-stage stage2_joint
 
-log "validating the exact 79-tensor Past initializer (fresh optimizer semantics)"
+log "validating ${PPA_INITIALIZER_KIND} initializer (fresh optimizer semantics)"
 "$PPA_QWEN_PYTHON" "$PPA_CONTRACT_CHECKER" checkpoint \
-  --path "$PPA_PAST_INIT_CHECKPOINT" \
-  --kind past-init
+  --path "$PPA_INITIALIZER_CHECKPOINT" \
+  --kind "$PPA_INITIALIZER_KIND"
 
 readonly ready_marker="${PPA_AMB3R_CACHE_ROOT}/_control/cache.ready.json"
 ready_marker_complete() {
@@ -428,26 +455,31 @@ run_stage() {
 }
 
 cd "$PPA_REPO_ROOT"
-run_stage \
-  stage1_map_pretrain \
-  "$PPA_STAGE1_CONFIG" \
-  "$PPA_PAST_INIT_CHECKPOINT" \
-  "$PPA_STAGE1_EPOCHS" \
-  "$PPA_STAGE1_MASTER_PORT" \
-  "$stage1_log"
+if [[ "$PPA_RUN_MODE" == "two_stage" ]]; then
+  run_stage \
+    stage1_map_pretrain \
+    "$PPA_STAGE1_CONFIG" \
+    "$PPA_PAST_INIT_CHECKPOINT" \
+    "$PPA_STAGE1_EPOCHS" \
+    "$PPA_STAGE1_MASTER_PORT" \
+    "$stage1_log"
 
-stage1_best="$(
-  "$PPA_QWEN_PYTHON" "$PPA_CONTRACT_CHECKER" run-best \
-    --output-root "$PPA_STAGE1_OUTPUT_ROOT" \
-    --kind stage1
-)"
-[[ -n "$stage1_best" ]] || die "Stage-1 best resolver returned an empty path"
-stage1_best="$(resolve_formal_path PPA_STAGE1_BEST_CHECKPOINT "$stage1_best")"
-[[ -f "$stage1_best" && -s "$stage1_best" ]] \
-  || die "validated Stage-1 best is missing/empty: $stage1_best"
-is_strict_descendant "$stage1_best" "$PPA_STAGE1_OUTPUT_ROOT" \
-  || die "Stage-1 best escapes its Stage-1 output root: $stage1_best"
-log "Stage 1 complete; validated EMA/deployment checkpoint: $stage1_best"
+  stage1_best="$(
+    "$PPA_QWEN_PYTHON" "$PPA_CONTRACT_CHECKER" run-best \
+      --output-root "$PPA_STAGE1_OUTPUT_ROOT" \
+      --kind stage1
+  )"
+  [[ -n "$stage1_best" ]] || die "Stage-1 best resolver returned an empty path"
+  stage1_best="$(resolve_formal_path PPA_STAGE1_BEST_CHECKPOINT "$stage1_best")"
+  [[ -f "$stage1_best" && -s "$stage1_best" ]] \
+    || die "validated Stage-1 best is missing/empty: $stage1_best"
+  is_strict_descendant "$stage1_best" "$PPA_STAGE1_OUTPUT_ROOT" \
+    || die "Stage-1 best escapes its Stage-1 output root: $stage1_best"
+  log "Stage 1 complete; validated EMA/deployment checkpoint: $stage1_best"
+else
+  stage1_best="$PPA_STAGE1_BEST_CHECKPOINT"
+  log "Stage-2-only retry: using validated Stage-1 best $stage1_best"
+fi
 
 # Deliberately use --load-weights, not --resume: only the complete Past Head
 # and trained Future Head cross the boundary. The Stage-2 optimizer/scheduler
@@ -471,7 +503,7 @@ stage2_best="$(resolve_formal_path PPA_STAGE2_BEST_CHECKPOINT "$stage2_best")"
   || die "validated Stage-2 best is missing/empty: $stage2_best"
 is_strict_descendant "$stage2_best" "$PPA_STAGE2_OUTPUT_ROOT" \
   || die "Stage-2 best escapes its Stage-2 output root: $stage2_best"
-log "two-stage training complete"
+log "${PPA_RUN_MODE} training complete"
 log "Stage-1 best: $stage1_best"
 log "Stage-2 best: $stage2_best"
 log "launcher logs: $PPA_OUTPUT_ROOT/_launcher"

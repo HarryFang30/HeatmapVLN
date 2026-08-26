@@ -337,6 +337,30 @@ from scripts.evaluation.rpc_protocol import (
     validate_rpc_sampling_metadata,
 )
 from src.utils.trajectory_direction import pano_recenter_turn
+# Load the two pure NumPy VO client modules without executing ``src.vo``'s
+# package initializer.  The Habitat/vlnce environment intentionally does not
+# install the training stack's pydantic dependency.
+_PURE_VO_PACKAGE_NAME = "_heatmapvln_eval_vo"
+_PURE_VO_DIR = _PROJECT_ROOT / "src" / "vo"
+_pure_vo_package = _types.ModuleType(_PURE_VO_PACKAGE_NAME)
+_pure_vo_package.__path__ = [str(_PURE_VO_DIR)]
+sys.modules[_PURE_VO_PACKAGE_NAME] = _pure_vo_package
+for _pure_vo_module_name in ("rpc_protocol", "rpc_client"):
+    _pure_vo_spec = _importlib.util.spec_from_file_location(
+        f"{_PURE_VO_PACKAGE_NAME}.{_pure_vo_module_name}",
+        _PURE_VO_DIR / f"{_pure_vo_module_name}.py",
+    )
+    if _pure_vo_spec is None or _pure_vo_spec.loader is None:
+        raise ImportError(f"could not load pure VO module {_pure_vo_module_name}")
+    _pure_vo_module = _importlib.util.module_from_spec(_pure_vo_spec)
+    sys.modules[_pure_vo_spec.name] = _pure_vo_module
+    _pure_vo_spec.loader.exec_module(_pure_vo_module)
+_pure_vo_protocol = sys.modules[f"{_PURE_VO_PACKAGE_NAME}.rpc_protocol"]
+_pure_vo_client = sys.modules[f"{_PURE_VO_PACKAGE_NAME}.rpc_client"]
+AMB3R_VO_POSE_PROVIDER = _pure_vo_protocol.AMB3R_VO_POSE_PROVIDER
+AMB3R_VO_RPC_PROTOCOL_VERSION = _pure_vo_protocol.AMB3R_VO_RPC_PROTOCOL_VERSION
+OnlineVORPCBridge = _pure_vo_client.OnlineVORPCBridge
+sample_unique_past_indices = _pure_vo_client.sample_unique_past_indices
 
 _INPUT_CONSTRUCTOR_PATH = _PROJECT_ROOT / "src" / "models" / "heatmap" / "input_constructor.py"
 _INPUT_CONSTRUCTOR_SPEC = importlib.util.spec_from_file_location(
@@ -2515,6 +2539,8 @@ def _run_eval_panoramic_vlm(
         forward_action_count = 0
         system2_calls = 0
         trajectory_calls = 0
+        ppa_applied_calls = 0
+        ppa_warmup_calls = 0
         step_id = 0
         done = False
 
@@ -3505,6 +3531,9 @@ def _rpc_plan_panoramic(
     phase: str = "joint",
     pixel_goal: list[int] | None = None,
     oracle_system2: dict[str, Any] | None = None,
+    model_pose_fields: dict[str, Any] | None = None,
+    current_capture_step: int | None = None,
+    history_capture_steps: list[int] | None = None,
 ) -> dict:
     blobs = []
     for view in ("front", "right", "back", "left"):
@@ -3533,6 +3562,25 @@ def _rpc_plan_panoramic(
         "phase": str(phase),
         HEATMAPVLN_RPC_SAMPLING_FIELD: sampling_metadata,
     }
+    if model_pose_fields is not None:
+        if current_capture_step is None or history_capture_steps is None:
+            raise ValueError(
+                "online pose fields require current/history capture steps"
+            )
+        history_steps = [int(value) for value in history_capture_steps]
+        current_step = int(current_capture_step)
+        if len(history_steps) != len(history_panoramas):
+            raise ValueError("history capture steps do not match history RGB")
+        payload.update(model_pose_fields)
+        payload.update(
+            {
+                "current_capture_step": current_step,
+                "history_capture_steps": history_steps,
+                "history_age_steps": [
+                    current_step - value for value in history_steps
+                ],
+            }
+        )
     if pixel_goal is not None:
         payload["pixel_goal"] = [int(pixel_goal[0]), int(pixel_goal[1])]
     if oracle_system2 is not None:
@@ -3859,6 +3907,49 @@ def run_eval_rpc_panoramic(args):
             "cannot be verified"
         )
 
+    vo_bridge: OnlineVORPCBridge | None = None
+    if args.history_pose_source == AMB3R_VO_POSE_PROVIDER:
+        if not str(args.amb3r_vo_rpc_server).strip():
+            raise ValueError(
+                "--history_pose_source amb3r_vo_da3 requires "
+                "--amb3r_vo_rpc_server host:port"
+            )
+        if bool(args.pano_recenter_before_system1):
+            raise ValueError(
+                "formal online PPA uses native front-only InternNav and forbids "
+                "pano_recenter_before_system1"
+            )
+        if info is None or "ppa-online-amb3r-v1" not in set(info.supported_formats):
+            raise RuntimeError(
+                "model RPC lacks formal PPA online-AMB3R capability"
+            )
+        vo_client = VLAClient(
+            server_addr=args.amb3r_vo_rpc_server,
+            timeout_ms=args.amb3r_vo_rpc_timeout_ms,
+            jpeg_quality=args.amb3r_vo_rpc_jpeg_quality,
+        )
+        vo_client.connect()
+        if not vo_client.health_check():
+            raise RuntimeError(
+                f"AMB3R VO RPC server is not healthy: {args.amb3r_vo_rpc_server}"
+            )
+        vo_info = vo_client.get_server_info()
+        if (
+            vo_info is None
+            or vo_info.version != AMB3R_VO_RPC_PROTOCOL_VERSION
+            or vo_info.model_version != "amb3r-vo-da3-online"
+        ):
+            raise RuntimeError(f"unexpected AMB3R VO server identity: {vo_info}")
+        vo_bridge = OnlineVORPCBridge(
+            vo_client,
+            jpeg_quality=args.amb3r_vo_rpc_jpeg_quality,
+        )
+        print(
+            "Online AMB3R VO enabled: "
+            f"server={args.amb3r_vo_rpc_server} protocol={vo_info.version}",
+            flush=True,
+        )
+
     hab_cfg = build_habitat_config(args)
     habitat_turn_angle_deg = float(hab_cfg.SIMULATOR.TURN_ANGLE)
     print(
@@ -4025,6 +4116,7 @@ def run_eval_rpc_panoramic(args):
             NATIVE_INTERNNAV_CAPABILITY if native_internnav_rpc else None
         ),
         "habitat_turn_angle_deg": habitat_turn_angle_deg,
+        "history_pose_source": str(args.history_pose_source),
     }
     sucs, spls, oss, nes, done_set = _load_progress(
         progress_file,
@@ -4067,6 +4159,12 @@ def run_eval_rpc_panoramic(args):
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
+
+        if vo_bridge is not None:
+            vo_bridge.reset_episode(
+                f"{scene_id}/{episode_id:04d}",
+                max_frames=int(max_steps_per_episode) + 1,
+            )
 
         dagger_episode_key = None
         dagger_episode_active = False
@@ -4111,10 +4209,13 @@ def run_eval_rpc_panoramic(args):
         executed_history_poses: list[np.ndarray] = []
         executed_history_steps: list[int] = []
         executed_history_call_indices: list[int] = []
+        executed_history_vo_frame_ids: list[int] = []
         local_actions: list[int] = []
         forward_action_count = 0
         system2_calls = 0
         trajectory_calls = 0
+        ppa_applied_calls = 0
+        ppa_warmup_calls = 0
         stage0_action_trace: list[dict[str, Any]] = []
         recenter_calls = 0
         recenter_actions_executed = 0
@@ -4143,6 +4244,17 @@ def run_eval_rpc_panoramic(args):
 
         while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
+            current_vo_frame_id: int | None = None
+            if vo_bridge is not None:
+                front_rgb = _extract_rgb_array(observations)
+                if front_rgb is None:
+                    raise RuntimeError(
+                        "could not extract native horizontal front RGB for AMB3R"
+                    )
+                current_vo_frame_id = vo_bridge.ingest_rgb(
+                    front_rgb,
+                    capture_step=step_id,
+                )
             stop_result = _maybe_stop_at_success(env, args, step_id)
             if stop_result is not None:
                 observations, done, new_step_id = stop_result
@@ -4160,13 +4272,14 @@ def run_eval_rpc_panoramic(args):
             if local_actions:
                 current_views = capture_panoramic_views(env, image_size=image_size)
                 executed_history_panoramas.append(current_views)
-                executed_history_poses.append(
-                    get_agent_cam2world(
-                        env, require_rgb_sensor=dagger_collector is not None
+                if dagger_collector is not None:
+                    executed_history_poses.append(
+                        get_agent_cam2world(env, require_rgb_sensor=True)
                     )
-                )
                 executed_history_steps.append(step_id)
                 executed_history_call_indices.append(max(system2_calls - 1, -1))
+                if current_vo_frame_id is not None:
+                    executed_history_vo_frame_ids.append(current_vo_frame_id)
                 action = int(local_actions.pop(0))
                 forward_action_count += 1
                 if forward_action_count > MAX_STEPS:
@@ -4215,8 +4328,40 @@ def run_eval_rpc_panoramic(args):
                 continue
 
             current_views = capture_panoramic_views(env, image_size=image_size)
-            prompt_history_indices = _sample_history_indices(len(executed_history_panoramas), num_history)
+            if vo_bridge is not None and current_vo_frame_id is None:
+                raise RuntimeError("online AMB3R current frame identity is missing")
+            prompt_history_indices = (
+                sample_unique_past_indices(
+                    executed_history_vo_frame_ids,
+                    current_frame_id=current_vo_frame_id,
+                    max_history=num_history,
+                )
+                if vo_bridge is not None
+                else _sample_history_indices(
+                    len(executed_history_panoramas), num_history
+                )
+            )
             prompt_history = [executed_history_panoramas[i] for i in prompt_history_indices]
+            prompt_history_steps = [executed_history_steps[i] for i in prompt_history_indices]
+            external_pose_fields = None
+            if vo_bridge is not None:
+                prompt_vo_ids = [
+                    executed_history_vo_frame_ids[i]
+                    for i in prompt_history_indices
+                ]
+                external_pose_fields = vo_bridge.query_model_pose_fields(
+                    current_frame_id=current_vo_frame_id,
+                    history_frame_ids=prompt_vo_ids,
+                )
+                print(
+                    "  [amb3r-vo] "
+                    f"frame={external_pose_fields['vo_current_frame_id']} "
+                    f"history={external_pose_fields['vo_history_frame_ids']} "
+                    f"ready={external_pose_fields['pose_ready']} "
+                    f"phase={external_pose_fields['vo_provider_phase']} "
+                    f"revision={external_pose_fields['vo_trajectory_revision']}",
+                    flush=True,
+                )
             if _debug_input_trace_enabled(args):
                 print(
                     "  [debug] RPC System2 input: "
@@ -4234,13 +4379,14 @@ def run_eval_rpc_panoramic(args):
                 ),
             )
             executed_history_panoramas.append(current_views)
-            executed_history_poses.append(
-                get_agent_cam2world(
-                    env, require_rgb_sensor=dagger_collector is not None
+            if dagger_collector is not None:
+                executed_history_poses.append(
+                    get_agent_cam2world(env, require_rgb_sensor=True)
                 )
-            )
             executed_history_steps.append(step_id)
             executed_history_call_indices.append(system2_calls)
+            if current_vo_frame_id is not None:
+                executed_history_vo_frame_ids.append(current_vo_frame_id)
             system2_calls += 1
             oracle_system2 = None
             if bool(getattr(args, "oracle_system2", False)):
@@ -4287,7 +4433,30 @@ def run_eval_rpc_panoramic(args):
                 expected_policy_fingerprint=rpc_policy_fingerprint,
                 phase="system2" if args.pano_recenter_before_system1 else "joint",
                 oracle_system2=oracle_system2,
+                model_pose_fields=external_pose_fields,
+                current_capture_step=step_id,
+                history_capture_steps=prompt_history_steps,
             )
+            if vo_bridge is not None:
+                if response.get("ppa_runtime") != "ppa-online-amb3r-v1":
+                    raise RuntimeError("model response omitted formal PPA runtime identity")
+                if response.get("pose_provider") != AMB3R_VO_POSE_PROVIDER:
+                    raise RuntimeError("model response changed the AMB3R pose provider")
+                if response.get("pose_ready") is not external_pose_fields["pose_ready"]:
+                    raise RuntimeError("model response pose_ready differs from VO query")
+                if response.get("kind") == "trajectory":
+                    if external_pose_fields["pose_ready"]:
+                        if response.get("ppa_applied") is not True:
+                            raise RuntimeError(
+                                "ready AMB3R trajectory call did not apply trained PPA"
+                            )
+                        ppa_applied_calls += 1
+                    else:
+                        if response.get("ppa_applied") is not False:
+                            raise RuntimeError(
+                                "AMB3R warmup trajectory unexpectedly applied PPA"
+                            )
+                        ppa_warmup_calls += 1
             stage0_entry = _stage0_action_trace_entry(
                 response,
                 system2_call_index=system2_calls - 1,
@@ -4395,11 +4564,10 @@ def run_eval_rpc_panoramic(args):
                     # Record only the completed cardinal turn. Intermediate 15°
                     # frames must not evict semantic history panoramas.
                     executed_history_panoramas.append(current_views)
-                    executed_history_poses.append(
-                        get_agent_cam2world(
-                            env, require_rgb_sensor=dagger_collector is not None
+                    if dagger_collector is not None:
+                        executed_history_poses.append(
+                            get_agent_cam2world(env, require_rgb_sensor=True)
                         )
-                    )
                     executed_history_steps.append(step_id)
                     executed_history_call_indices.append(system2_calls - 1)
                 response = _rpc_plan_panoramic(
@@ -4777,6 +4945,9 @@ def run_eval_rpc_panoramic(args):
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
             "collect_trajectory_dagger": bool(dagger_collector is not None),
+            "history_pose_source": str(args.history_pose_source),
+            "ppa_applied_calls": int(ppa_applied_calls),
+            "ppa_warmup_calls": int(ppa_warmup_calls),
         }
         if stage0_action_trace:
             result["ppa_stage0_action_arm"] = stage0_action_trace[0]["arm"]
@@ -4805,6 +4976,8 @@ def run_eval_rpc_panoramic(args):
 
     env.close()
     client.close()
+    if vo_bridge is not None:
+        vo_bridge.client.close()
 
     final_result = aggregate_navigation_metrics(sucs, spls, oss, nes)
     final_result.update(
@@ -4828,6 +5001,7 @@ def run_eval_rpc_panoramic(args):
             "trajectory_heading_alignment": str(args.trajectory_heading_alignment),
             "system1_coord_order": str(system1_coord_order),
             "oracle_system2": bool(getattr(args, "oracle_system2", False)),
+            "history_pose_source": str(args.history_pose_source),
         }
     )
 
@@ -5409,6 +5583,31 @@ def main():
         ),
     )
     parser.add_argument(
+        "--history_pose_source",
+        choices=("disabled", AMB3R_VO_POSE_PROVIDER),
+        default="disabled",
+        help=(
+            "Formal PPA requires amb3r_vo_da3. disabled preserves non-PPA "
+            "legacy RPC evaluations. Habitat GT pose is never an accepted PPA input."
+        ),
+    )
+    parser.add_argument(
+        "--amb3r_vo_rpc_server",
+        type=str,
+        default="",
+        help="Independent online AMB3R-VO server host:port.",
+    )
+    parser.add_argument(
+        "--amb3r_vo_rpc_timeout_ms",
+        type=int,
+        default=600000,
+    )
+    parser.add_argument(
+        "--amb3r_vo_rpc_jpeg_quality",
+        type=int,
+        default=95,
+    )
+    parser.add_argument(
         "--rpc_policy_mode",
         choices=(RPC_POLICY_HEATMAPVLN, RPC_POLICY_INTERNNAV_NATIVE),
         default=RPC_POLICY_HEATMAPVLN,
@@ -5617,6 +5816,19 @@ def main():
         help="Required policy/checkpoint fingerprint used to make resume fail closed.",
     )
     args = parser.parse_args()
+    if args.history_pose_source == AMB3R_VO_POSE_PROVIDER:
+        if not args.rpc_server:
+            raise ValueError("online AMB3R PPA requires --rpc_server")
+        if not str(args.amb3r_vo_rpc_server).strip():
+            raise ValueError("online AMB3R PPA requires --amb3r_vo_rpc_server")
+        if int(args.amb3r_vo_rpc_timeout_ms) <= 0:
+            raise ValueError("amb3r_vo_rpc_timeout_ms must be positive")
+        if not 1 <= int(args.amb3r_vo_rpc_jpeg_quality) <= 100:
+            raise ValueError("amb3r_vo_rpc_jpeg_quality must be in [1,100]")
+        if bool(args.pano_recenter_before_system1):
+            raise ValueError(
+                "online AMB3R PPA requires --no-pano_recenter_before_system1"
+            )
     if args.oracle_system2 and not args.rpc_server:
         raise RuntimeError("--oracle_system2 currently requires --rpc_server")
     if not args.rpc_server:

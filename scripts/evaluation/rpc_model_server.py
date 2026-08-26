@@ -62,12 +62,17 @@ from src.utils.trajectory_direction import (
     align_trajectory_endpoint_heading,
     view_pixel_target_angle_deg,
 )
+from src.vo.rpc_protocol import (
+    AMB3R_VO_POSE_PROVIDER,
+    validate_model_pose_fields,
+)
 
 LOGGER = logging.getLogger("heatmapvln-rpc-server")
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 PROTO_VERSION = HEATMAPVLN_RPC_PROTOCOL_VERSION
+PPA_ONLINE_AMB3R_CAPABILITY = "ppa-online-amb3r-v1"
 LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
     os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
@@ -644,6 +649,9 @@ class HeatmapVLNRuntime:
         self.ppa_stage0_action_arm = str(
             getattr(args, "ppa_stage0_action_arm", "disabled")
         )
+        self.ppa_online_amb3r = bool(
+            getattr(args, "require_ppa_online_amb3r", False)
+        )
         self.pano_latent_adapter = self._load_adapter(args)
         if self.pano_latent_adapter is None and getattr(self.model, "pano_latent_adapter", None) is not None:
             self.pano_latent_adapter = self.model.pano_latent_adapter
@@ -656,6 +664,88 @@ class HeatmapVLNRuntime:
             self.require_deterministic_sampling,
         )
         self._preflight_ppa_stage0_action_arm()
+        self.ppa_checkpoint_contract = self._preflight_ppa_online_amb3r()
+        self.model_version = (
+            f"ppa-stage2-online-amb3r:{Path(args.checkpoint).resolve().parents[1].name}"
+            if self.ppa_online_amb3r
+            else "heatmapvln-r2r"
+        )
+
+    def _preflight_ppa_online_amb3r(self) -> dict[str, Any] | None:
+        if not self.ppa_online_amb3r:
+            return None
+        if not self.args.checkpoint:
+            raise RuntimeError("formal PPA online runtime requires --checkpoint")
+        if self.ppa_stage0_action_arm != "disabled":
+            raise RuntimeError("formal PPA runtime cannot enable Stage-0 A/B mode")
+        if self.pano_latent_adapter is not None:
+            raise RuntimeError("formal PPA runtime forbids panoramic latent adapter")
+        chain = getattr(self.model, "past_plan_action", None)
+        if chain is None or self.model.heatmap_vln is None:
+            raise RuntimeError("checkpoint/config did not construct the PPA and Past heads")
+        heatmap_control = (
+            self.train_cfg.get("model", {})
+            .get("action_head", {})
+            .get("nextdit", {})
+            .get("heatmap_control", {})
+        )
+        if bool((heatmap_control or {}).get("enabled", False)):
+            raise RuntimeError("formal PPA runtime forbids legacy heatmap control")
+
+        payload = torch.load(
+            self.args.checkpoint,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("PPA checkpoint payload must be a mapping")
+        contract = payload.get("past_plan_action_contract")
+        if not isinstance(contract, dict):
+            raise RuntimeError("PPA checkpoint lacks past_plan_action_contract")
+        expected = {
+            "schema": "past-plan-action-checkpoint-v1",
+            "stage": "stage2_joint",
+            "complete_heatmap_head_tensors": 79,
+            "bridge_in_deployment_state": True,
+            "stage1_to_stage2_fresh_optimizer": True,
+        }
+        mismatches = {
+            key: {"expected": value, "actual": contract.get(key)}
+            for key, value in expected.items()
+            if contract.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(f"invalid Stage-2 PPA checkpoint contract: {mismatches}")
+        state = _extract_checkpoint_state_dict(self.args.checkpoint)
+        normalized = {_normalize_state_key(name) for name in state}
+        family_counts = {
+            "heatmap": sum(name.startswith("heatmap_vln.") for name in normalized),
+            "future": sum(
+                name.startswith("past_plan_action.future_head.")
+                for name in normalized
+            ),
+            "bridge": sum(
+                name.startswith("past_plan_action.bridge.") for name in normalized
+            ),
+        }
+        expected_future = int(contract.get("complete_future_head_tensors", -1))
+        if family_counts != {
+            "heatmap": 79,
+            "future": expected_future,
+            "bridge": 10,
+        }:
+            raise RuntimeError(
+                "PPA deployment tensor coverage mismatch: "
+                f"observed={family_counts} future_contract={expected_future}"
+            )
+        self.model.requires_grad_(False)
+        self.model.eval()
+        LOGGER.info(
+            "Formal PPA online AMB3R runtime enabled: checkpoint=%s tensors=%s",
+            self.args.checkpoint,
+            family_counts,
+        )
+        return dict(contract)
 
     def _preflight_ppa_stage0_action_arm(self) -> None:
         arm = self.ppa_stage0_action_arm
@@ -840,6 +930,64 @@ class HeatmapVLNRuntime:
         )
         return adapter
 
+    def _build_ppa_past_output(
+        self,
+        *,
+        current_front: Image.Image,
+        history_front: list[Image.Image],
+        metadata: dict[str, Any],
+    ) -> dict[str, torch.Tensor] | None:
+        if not metadata["pose_ready"]:
+            return None
+        if not history_front:
+            raise RuntimeError("pose_ready PPA request has no history RGB")
+        fixed_slots = 8
+        if len(history_front) > fixed_slots:
+            raise ValueError("PPA supports at most eight history frames")
+        padding = [
+            Image.new("RGB", current_front.size, color=(0, 0, 0))
+            for _ in range(fixed_slots - len(history_front))
+        ]
+        encoded = self.processor.image_processor(
+            images=list(history_front) + padding + [current_front],
+            return_tensors="pt",
+        )
+        required = {"pixel_values", "image_grid_thw"}
+        if required - set(encoded):
+            raise RuntimeError(
+                f"PPA image processor omitted {sorted(required - set(encoded))}"
+            )
+        relative = np.asarray(metadata["history_rel_poses"], dtype=np.float32)
+        if relative.shape != (len(history_front), 4):
+            raise RuntimeError("PPA pose/RGB history count diverged after validation")
+        padded_relative = np.zeros((fixed_slots, 4), dtype=np.float32)
+        padded_relative[: len(history_front)] = relative
+        history_mask = torch.zeros((1, fixed_slots), dtype=torch.bool)
+        history_mask[:, : len(history_front)] = True
+        output = self.model._forward_frozen_single_view_heatmap(
+            inputs={
+                "pixel_values": encoded["pixel_values"],
+                "image_grid_thw": encoded["image_grid_thw"],
+            },
+            num_histories=[fixed_slots],
+            history_rel_poses=torch.from_numpy(padded_relative).unsqueeze(0),
+            explicit_history_mask=history_mask,
+            return_memory_tokens=True,
+        )
+        required_output = {
+            "history_memory",
+            "history_memory_mask",
+            "panoramic_vit_features",
+        }
+        missing = sorted(required_output - set(output))
+        if missing:
+            raise RuntimeError(f"Past Head omitted PPA memory outputs: {missing}")
+        if not torch.equal(
+            output["history_memory_mask"].detach().cpu(), history_mask
+        ):
+            raise RuntimeError("Past Head changed the authoritative history mask")
+        return output
+
     def plan_panoramic(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
         phase = str(payload.get("phase", "joint")).lower()
         if phase not in {"joint", "system2", "front_system1"}:
@@ -866,14 +1014,20 @@ class HeatmapVLNRuntime:
             view: _pil_from_blob(blob_map[f"current/{view}"], vlm_image_size)
             for view in ("front", "right", "back", "left")
         }
+        num_history = int(payload.get("num_history", 0))
         history_panoramas: list[dict[str, Image.Image]] = []
-        for hist_idx in range(int(payload.get("num_history", 0))):
+        for hist_idx in range(num_history):
             history_panoramas.append(
                 {
                     view: _pil_from_blob(blob_map[f"history/{hist_idx}/{view}"], vlm_image_size)
                     for view in ("front", "right", "back", "left")
                 }
             )
+        ppa_pose_metadata = (
+            validate_model_pose_fields(payload, num_history=num_history)
+            if self.ppa_online_amb3r
+            else None
+        )
         lookdown_blob_img = _pil_from_blob(blob_map["lookdown"])
         lookdown_img = (
             lookdown_blob_img
@@ -1031,6 +1185,19 @@ class HeatmapVLNRuntime:
             "kind": "unknown",
             "phase": phase,
         }
+        if self.ppa_online_amb3r:
+            response.update(
+                {
+                    "ppa_runtime": PPA_ONLINE_AMB3R_CAPABILITY,
+                    "pose_provider": AMB3R_VO_POSE_PROVIDER,
+                    "pose_ready": bool(ppa_pose_metadata["pose_ready"]),
+                    "vo_provider_phase": ppa_pose_metadata["vo_provider_phase"],
+                    "vo_trajectory_revision": int(
+                        ppa_pose_metadata["vo_trajectory_revision"]
+                    ),
+                    "ppa_applied": False,
+                }
+            )
         if native_internnav_two_turn and phase != "front_system1":
             response.update(
                 {
@@ -1124,6 +1291,15 @@ class HeatmapVLNRuntime:
                     view_id=pano_goal_view,
                     structured_output=structured_pano_output,
                 )
+            ppa_past_output = None
+            if self.ppa_online_amb3r:
+                ppa_past_output = self._build_ppa_past_output(
+                    current_front=current_views["front"],
+                    history_front=[
+                        panorama["front"] for panorama in history_panoramas
+                    ],
+                    metadata=ppa_pose_metadata,
+                )
             with torch.no_grad():
                 traj_hs = self.model.qwen2_5_vl.generate_latents(
                     output_ids=condition_output_ids,
@@ -1144,7 +1320,77 @@ class HeatmapVLNRuntime:
                         if self.model.nextdit_action_head is not None
                         else None,
                     )
-                if self.ppa_stage0_action_arm == "disabled":
+                if self.ppa_online_amb3r and ppa_past_output is not None:
+                    plan_z0, plan_z, plan_diagnostics = (
+                        self.model.past_plan_action.form_plan(
+                            traj_hs,
+                            frozen_cond_projector=(
+                                self.model.nextdit_action_head.cond_projector
+                            ),
+                            history_memory=ppa_past_output["history_memory"],
+                            history_memory_mask=ppa_past_output[
+                                "history_memory_mask"
+                            ],
+                            return_diagnostics=True,
+                        )
+                    )
+                    trajectory = (
+                        self.model.nextdit_action_head.get_trajectory_from_projected(
+                            plan_z,
+                            traj_images=traj_images,
+                            generator=trajectory_generator,
+                        )
+                    )
+                    future_output = self.model.past_plan_action.decode_future(
+                        plan_z,
+                        past_output=ppa_past_output,
+                        past_head=self.model.heatmap_vln,
+                        time_mask=None,
+                    )
+                    future_confidence = future_output[
+                        "future_visibility_probability"
+                    ].detach().float()
+                    future_peak = future_output[
+                        "future_heatmaps_gated"
+                    ].detach().float().amax(dim=(-2, -1))
+                    response.update(
+                        {
+                            "ppa_applied": True,
+                            "ppa_history_count": int(
+                                ppa_past_output["history_memory_mask"].sum().item()
+                            ),
+                            "ppa_delta_z_l2": float(
+                                plan_diagnostics["delta_z"].float().norm().item()
+                            ),
+                            "future_visibility_probability": (
+                                future_confidence.cpu().tolist()
+                            ),
+                            "future_heatmap_peak": future_peak.cpu().tolist(),
+                            "future_direction_order": [
+                                "front",
+                                "right",
+                                "back",
+                                "left",
+                            ],
+                            "future_time_ranges": [
+                                [1, 8],
+                                [9, 16],
+                                [17, 24],
+                                [25, 32],
+                            ],
+                        }
+                    )
+                elif self.ppa_online_amb3r:
+                    # Deployment is native until AMB3R's first official map
+                    # endpoint; no zero pose token is ever fabricated.
+                    trajectory = _trajectory_from_condition(
+                        self.model.nextdit_action_head,
+                        traj_hs,
+                        traj_images=traj_images,
+                        generator=trajectory_generator,
+                    )
+                    response["ppa_skip_reason"] = "amb3r_map_warmup"
+                elif self.ppa_stage0_action_arm == "disabled":
                     trajectory = _trajectory_from_condition(
                         self.model.nextdit_action_head,
                         traj_hs,
@@ -1261,7 +1507,7 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
         self.runtime = runtime
         self.started = int(torch.cuda.Event(enable_timing=False) is not None)
         self.requests_processed = 0
-        self.model_version = "heatmapvln-r2r"
+        self.model_version = runtime.model_version
 
     def InferJSON(self, request: vla_pb2.JSONRequest, context) -> vla_pb2.JSONResponse:
         try:
@@ -1297,6 +1543,11 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             supported_formats=[
                 "json+jpeg",
                 HEATMAPVLN_RPC_CAPABILITY_PANO_TWO_PHASE_FRONT_SYSTEM1,
+                *(
+                    [PPA_ONLINE_AMB3R_CAPABILITY]
+                    if self.runtime.ppa_online_amb3r
+                    else []
+                ),
             ],
         )
 
@@ -1318,6 +1569,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reject legacy/partial RPC requests that do not provide a valid "
             "SHA256-derived deterministic NextDiT sampling key."
+        ),
+    )
+    parser.add_argument(
+        "--require_ppa_online_amb3r",
+        action="store_true",
+        help=(
+            "Require a complete Stage-2 PPA checkpoint and causal AMB3R pose "
+            "metadata on every planning request."
         ),
     )
     parser.add_argument(

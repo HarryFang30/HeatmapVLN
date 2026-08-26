@@ -55,6 +55,7 @@ def configure_past_plan_action_stage(
     native_action_head: nn.Module,
     native_cond_projector: nn.Module,
     other_frozen_modules: Iterable[nn.Module] = (),
+    bridge_only: bool = False,
 ) -> TrainableScopeAudit:
     """Set exactly the approved Stage-1 or Stage-2 parameter scope."""
 
@@ -73,18 +74,20 @@ def configure_past_plan_action_stage(
     for module in other_frozen_modules:
         _freeze_and_eval(module)
 
-    chain.future_head.requires_grad_(True)
-    chain.future_head.train()
+    if not bridge_only:
+        chain.future_head.requires_grad_(True)
+        chain.future_head.train()
     if stage == "stage2_joint":
         chain.bridge.requires_grad_(True)
         chain.bridge.train()
 
     selected_past_names: list[str] = []
-    for name, parameter in past_head.named_parameters():
-        if _matches_prefix(name, _PAST_TRAINABLE_PREFIXES):
-            parameter.requires_grad_(True)
-            selected_past_names.append(name)
-    if not selected_past_names:
+    if not bridge_only:
+        for name, parameter in past_head.named_parameters():
+            if _matches_prefix(name, _PAST_TRAINABLE_PREFIXES):
+                parameter.requires_grad_(True)
+                selected_past_names.append(name)
+    if not bridge_only and not selected_past_names:
         raise PastPlanActionContractError(
             "Past Head exposes none of the expected memory/shared-decoder parameters"
         )
@@ -105,9 +108,10 @@ def configure_past_plan_action_stage(
         raise PastPlanActionContractError(
             "Past Head must expose trajectory-guided coarse and fine modules"
         )
-    for name in required_coarse:
-        getattr(coarse, name).train()
-    fine.train()
+    if not bridge_only:
+        for name in required_coarse:
+            getattr(coarse, name).train()
+        fine.train()
 
     if native_action_head.training or native_cond_projector.training:
         raise AssertionError("native action modules must remain eval")
@@ -133,6 +137,10 @@ def configure_past_plan_action_stage(
         raise AssertionError("Stage 1 bridge must be frozen")
     if stage == "stage2_joint" and counts["bridge"] == 0:
         raise AssertionError("Stage 2 bridge must be trainable")
+    if bridge_only and (counts["future"] != 0 or counts["past"] != 0):
+        raise AssertionError(
+            "PPA bridge-only refinement must freeze Future and shared Past"
+        )
 
     return TrainableScopeAudit(
         stage=stage,

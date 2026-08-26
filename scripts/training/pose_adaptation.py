@@ -28,6 +28,7 @@ HEATMAP_HEAD_PREFIXES = (
 EXPECTED_POSE_ADAPTATION_TENSORS = 34
 EXPECTED_COMPLETE_HEATMAP_HEAD_TENSORS = 79
 PPA_FUTURE_PREFIX = "past_plan_action.future_head."
+PPA_BRIDGE_PREFIX = "past_plan_action.bridge."
 
 
 def configured_pose_adaptation_prefixes(stage_cfg: Mapping[str, Any]) -> tuple[str, ...]:
@@ -154,6 +155,7 @@ def load_past_plan_action_initialization(
     checkpoint_path: str | Path,
     *,
     stage: str,
+    load_trained_bridge: bool = False,
 ) -> dict[str, Any]:
     """Load exact learned inputs for PPA with a fresh optimizer.
 
@@ -198,6 +200,11 @@ def load_past_plan_action_initialization(
         for name, parameter in model.named_parameters()
         if _normalize_state_key(name).startswith(PPA_FUTURE_PREFIX)
     }
+    expected_bridge = {
+        _normalize_state_key(name): parameter.detach()
+        for name, parameter in model.named_parameters()
+        if _normalize_state_key(name).startswith(PPA_BRIDGE_PREFIX)
+    }
     if stage == "stage2_joint":
         source_future = {
             name: tensor
@@ -211,10 +218,25 @@ def load_past_plan_action_initialization(
                 f"extra={sorted(set(source_future) - set(expected_future))[:8]}"
             )
         selected.update(source_future)
+        if load_trained_bridge:
+            source_bridge = {
+                name: tensor
+                for name, tensor in normalized_source.items()
+                if name.startswith(PPA_BRIDGE_PREFIX)
+            }
+            if not expected_bridge or set(source_bridge) != set(expected_bridge):
+                raise RuntimeError(
+                    "PPA action refinement initializer lacks the exact trained Bridge: "
+                    f"missing={sorted(set(expected_bridge) - set(source_bridge))[:8]} "
+                    f"extra={sorted(set(source_bridge) - set(expected_bridge))[:8]}"
+                )
+            selected.update(source_bridge)
 
     expected_selected = {**expected_head}
     if stage == "stage2_joint":
         expected_selected.update(expected_future)
+        if load_trained_bridge:
+            expected_selected.update(expected_bridge)
     shape_mismatch = sorted(
         name
         for name in expected_selected
@@ -233,10 +255,14 @@ def load_past_plan_action_initialization(
 
     bridge = getattr(getattr(model, "past_plan_action", None), "bridge", None)
     out_proj = getattr(getattr(bridge, "cross_attention", None), "out_proj", None)
-    if out_proj is None or not torch.equal(
-        out_proj.weight.detach(), torch.zeros_like(out_proj.weight)
-    ) or not torch.equal(
-        out_proj.bias.detach(), torch.zeros_like(out_proj.bias)
+    if not load_trained_bridge and (
+        out_proj is None
+        or not torch.equal(
+            out_proj.weight.detach(), torch.zeros_like(out_proj.weight)
+        )
+        or not torch.equal(
+            out_proj.bias.detach(), torch.zeros_like(out_proj.bias)
+        )
     ):
         raise RuntimeError(
             "PPA bridge output projection must remain exact zero at fresh init"
@@ -249,9 +275,12 @@ def load_past_plan_action_initialization(
         "loaded_future_head_tensors": (
             len(expected_future) if stage == "stage2_joint" else 0
         ),
+        "loaded_bridge_tensors": (
+            len(expected_bridge) if load_trained_bridge else 0
+        ),
         "loaded_tensor_count": loaded,
         "model_missing_key_count": len(missing),
-        "bridge_zero_initialized": True,
+        "bridge_zero_initialized": not load_trained_bridge,
         "fresh_optimizer_scheduler": True,
         "hash_locking": False,
     }

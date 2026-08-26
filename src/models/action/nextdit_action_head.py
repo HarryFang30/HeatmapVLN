@@ -541,7 +541,7 @@ class NextDiTActionHead(nn.Module):
         """Predict flow velocity from pre-projected NextDiT condition tokens."""
         latents = self._fuse_projected_conditions(traj_cond, traj_images)
         bsz = noisy_trajectory.shape[0]
-        action_features = self.action_encoder(noisy_trajectory)
+        action_features = self._encode_action_trajectory(noisy_trajectory)
         pos_ids = torch.arange(noisy_trajectory.shape[1], device=noisy_trajectory.device).reshape(1, -1).repeat(bsz, 1)
         pos_embed = self.pos_encoding(pos_ids).to(dtype=action_features.dtype)
         action_features = action_features + pos_embed
@@ -552,6 +552,27 @@ class NextDiTActionHead(nn.Module):
             x=action_features, timestep=timesteps, z_latents=latents, **heatmap_kwargs
         )
         return self.action_decoder(velocity)
+
+    def _encode_action_trajectory(
+        self, trajectory: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the native action encoder with explicit parameter dtype.
+
+        Training normally executes under BF16 autocast, while validation is
+        deliberately no-grad without autocast.  Flow-matching targets remain
+        FP32 for numerically stable loss computation, so relying on autocast
+        makes validation feed Float input into a BF16 Linear.  Cast only the
+        encoder input here; the target and all reported losses remain FP32.
+        """
+        parameter = next(self.action_encoder.parameters(), None)
+        if parameter is None:
+            return self.action_encoder(trajectory)
+        if trajectory.device != parameter.device:
+            raise RuntimeError(
+                "action trajectory and encoder must share device: "
+                f"trajectory={trajectory.device}, encoder={parameter.device}"
+            )
+        return self.action_encoder(trajectory.to(dtype=parameter.dtype))
 
     @staticmethod
     def masked_velocity_mse(
@@ -671,7 +692,9 @@ class NextDiTActionHead(nn.Module):
         noisy_trajectory = (1 - sigmas) * gt_trajectory + sigmas * noise
 
         # Encode noisy trajectory
-        action_features = self.action_encoder(noisy_trajectory)  # (B, T, dit_dim)
+        action_features = self._encode_action_trajectory(
+            noisy_trajectory
+        )  # (B, T, dit_dim)
         pos_ids = torch.arange(gt_trajectory.shape[1], device=device).reshape(1, -1).repeat(bsz, 1)
         pos_embed = self.pos_encoding(pos_ids).to(dtype=action_features.dtype)
         action_features = action_features + pos_embed
@@ -844,7 +867,7 @@ class NextDiTActionHead(nn.Module):
 
         # Iterative denoising
         for t in self.noise_scheduler.timesteps:
-            latent_features = self.action_encoder(traj_latents)
+            latent_features = self._encode_action_trajectory(traj_latents)
             pos_ids = (
                 torch.arange(latent_features.shape[1], device=device)
                 .reshape(1, -1)

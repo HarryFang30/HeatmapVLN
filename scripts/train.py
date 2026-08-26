@@ -1354,6 +1354,9 @@ def main():
                 raw_model,
                 weights_path,
                 stage=str(ppa_stage),
+                load_trained_bridge=bool(
+                    stage_cfg.get('past_plan_action_bridge_only', False)
+                ),
             )
         else:
             single_view_warmstart_report = load_pose_adaptation_initialization(

@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# Full 8-GPU R2R val-unseen evaluation for trained Past -> Plan -> Action.
+# One model RPC + one causal AMB3R-VO RPC + one Habitat shard share each GPU.
+
+set -Eeuo pipefail
+
+FJL_ROOT="${PPA_EVAL_FJL_ROOT:-/mnt/afs/lixiaoou/intern/fjl}"
+REPO="${PPA_EVAL_REPO:-$FJL_ROOT/HeatmapVLN}"
+RPC_ROOT="${PPA_EVAL_RPC_ROOT:-$FJL_ROOT/rpc}"
+INTERNNAV_REPO="${PPA_EVAL_INTERNNAV_REPO:-$FJL_ROOT/InternNav}"
+INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-$FJL_ROOT/InternNav-Model}"
+AMB3R_ROOT="${PPA_EVAL_AMB3R_ROOT:-$FJL_ROOT/amb3r}"
+DA3_CHECKPOINT="${PPA_EVAL_DA3_CHECKPOINT:-$AMB3R_ROOT/checkpoints/DA3NESTED-GIANT-LARGE}"
+QWEN_PYTHON="${PPA_EVAL_QWEN_PYTHON:-$FJL_ROOT/envs/qwen25/bin/python}"
+VLNCE_PYTHON="${PPA_EVAL_VLNCE_PYTHON:-$FJL_ROOT/envs/vlnce/bin/python}"
+
+PPA_CHECKPOINT="${PPA_EVAL_CHECKPOINT:-$FJL_ROOT/model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint/run_20260818_104438/checkpoints/best.pth}"
+PPA_CONFIG="${PPA_EVAL_CONFIG:-$REPO/configs/ppa_stage2_joint_8gpu.yaml}"
+PPA_TRAIN_DATA="$FJL_ROOT/r2r_paronamic_data/train"
+PPA_TRAIN_CACHE="$FJL_ROOT/data/amb3r_endpoint_v2_full_r2r"
+PPA_STAGE2_OUTPUT_ROOT="$FJL_ROOT/model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint"
+PPA_TENSORBOARD_ROOT="$FJL_ROOT/model/output_past_plan_action_v1_8gpu_stage2_retry1/tensorboard"
+
+LOCKED_PLAN="$FJL_ROOT/evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802"
+COHORTS_DIR="$LOCKED_PLAN/cohorts"
+MERGE_TOOL="$LOCKED_PLAN/tools/merge_shards.py"
+DATASET="$FJL_ROOT/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/val_unseen/val_unseen.json.gz"
+SCENES_DIR="$FJL_ROOT/habitat/VLN-CE/data/scene_datasets"
+EXPECTED_EPISODES=1839
+
+MODEL_SERVER="$REPO/scripts/evaluation/rpc_model_server.py"
+VO_SERVER="$REPO/scripts/amb3r_vo/rpc_amb3r_vo_server.py"
+CLIENT="$REPO/scripts/evaluation/r2r_val_unseen.py"
+OUTPUT_ROOT="${PPA_EVAL_OUTPUT_ROOT:-$FJL_ROOT/model/eval_ppa_stage2_online_amb3r_r2r_val_unseen_8gpu}"
+WORKERS_DIR="$OUTPUT_ROOT/workers"
+MERGED_DIR="$OUTPUT_ROOT/merged"
+RUN_STAMP="${PPA_EVAL_RUN_STAMP:-$(date +%Y%m%d_%H%M%S)_job${JOB_ID:-$$}}"
+RUNTIME_DIR="$OUTPUT_ROOT/runtime/$RUN_STAMP"
+
+GPU_CSV="${PPA_EVAL_GPU_DEVICES:-0,1,2,3,4,5,6,7}"
+NUM_SHARDS=8
+MODEL_PORT_BASE="${PPA_EVAL_MODEL_PORT_BASE:-52400}"
+VO_PORT_BASE="${PPA_EVAL_VO_PORT_BASE:-52500}"
+DISPLAY_BASE="${PPA_EVAL_DISPLAY_BASE:-360}"
+SERVER_START_TIMEOUT_S="${PPA_EVAL_SERVER_START_TIMEOUT_S:-3600}"
+SERVER_STAGGER_S="${PPA_EVAL_SERVER_STAGGER_S:-15}"
+RPC_TIMEOUT_MS="${PPA_EVAL_RPC_TIMEOUT_MS:-600000}"
+
+X11_BUNDLE="$FJL_ROOT/tools/x11_headless_bundle_ubuntu22_20260801_v4"
+XVFB_BIN="$X11_BUNDLE/bin/Xvfb"
+XDPYINFO_BIN="$X11_BUNDLE/bin/xdpyinfo"
+XKBCOMP_BIN="$X11_BUNDLE/bin/xkbcomp"
+X11_DRI_PATH="$X11_BUNDLE/dri"
+X11_FONT_PATH="$X11_BUNDLE/share/fonts/misc"
+X11_XKB_PATH="$X11_BUNDLE/share/X11/xkb"
+
+export MACA_HOME="${MACA_HOME:-/opt/maca-3.3.0}"
+export MACA_PATH="${MACA_PATH:-$MACA_HOME}"
+export MACA_DIR="${MACA_DIR:-$MACA_HOME}"
+export LD_LIBRARY_PATH="$MACA_HOME/lib:$MACA_HOME/ompi/lib:$MACA_HOME/ucx/lib:/opt/mxdriver/lib:${LD_LIBRARY_PATH:-}"
+export INTERNNAV_MODEL_PATH INTERNNAV_REPO
+export PPA_DATA_ROOT="$PPA_TRAIN_DATA"
+export PPA_AMB3R_CACHE_ROOT="$PPA_TRAIN_CACHE"
+export PPA_STAGE2_OUTPUT_ROOT PPA_TENSORBOARD_ROOT
+export USE_TF=0 TRANSFORMERS_NO_TF=1 TF_CPP_MIN_LOG_LEVEL=3
+export TOKENIZERS_PARALLELISM=false
+export DA3_DISABLE_XFORMERS=1
+export DA3_SDPA_QUERY_CHUNK_SIZE=256
+
+RPC_PYTHONPATH="$LOCKED_PLAN/tools:$RPC_ROOT/src:$REPO:$INTERNNAV_REPO${PYTHONPATH:+:$PYTHONPATH}"
+SERVER_LD_LIBRARY_PATH="$MACA_HOME/lib:$MACA_HOME/ompi/lib:$MACA_HOME/ucx/lib:/opt/mxdriver/lib"
+CLIENT_LD_LIBRARY_PATH="$X11_BUNDLE/mesa_lib:$LD_LIBRARY_PATH"
+TOOL_LD_LIBRARY_PATH="$X11_BUNDLE/lib:$LD_LIBRARY_PATH"
+
+declare -a GPUS MODEL_PIDS VO_PIDS CLIENT_PIDS XVFB_PIDS
+
+die() { printf '[ppa-eval] ERROR: %s\n' "$*" >&2; exit 2; }
+require_file() { [[ -s "$1" ]] || die "missing file: $1"; }
+require_dir() { [[ -d "$1" ]] || die "missing directory: $1"; }
+
+stop_pid() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  for pid in "${CLIENT_PIDS[@]:-}"; do stop_pid "$pid"; done
+  for pid in "${MODEL_PIDS[@]:-}"; do stop_pid "$pid"; done
+  for pid in "${VO_PIDS[@]:-}"; do stop_pid "$pid"; done
+  for pid in "${XVFB_PIDS[@]:-}"; do stop_pid "$pid"; done
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+for file in "$PPA_CHECKPOINT" "$PPA_CONFIG" "$MODEL_SERVER" "$VO_SERVER" "$CLIENT" "$MERGE_TOOL" "$DATASET" "$DA3_CHECKPOINT/model.safetensors" "$AMB3R_ROOT/slam/slam_config.yaml"; do
+  require_file "$file"
+done
+for directory in "$REPO" "$RPC_ROOT/src/vla_rpc" "$INTERNNAV_MODEL_PATH" "$SCENES_DIR" "$COHORTS_DIR" "$X11_BUNDLE" "$X11_DRI_PATH" "$X11_FONT_PATH" "$X11_XKB_PATH"; do
+  require_dir "$directory"
+done
+for executable in "$QWEN_PYTHON" "$VLNCE_PYTHON" "$XVFB_BIN" "$XDPYINFO_BIN" "$XKBCOMP_BIN"; do
+  [[ -x "$executable" ]] || die "missing executable: $executable"
+done
+
+IFS=',' read -r -a GPUS <<< "$GPU_CSV"
+[[ "${#GPUS[@]}" -eq 8 ]] || die "PPA_EVAL_GPU_DEVICES must contain 8 IDs"
+[[ "$(printf '%s\n' "${GPUS[@]}" | sort -u | wc -l | tr -d ' ')" -eq 8 ]] || die "GPU IDs must be unique"
+for rank in $(seq 0 7); do
+  [[ "${GPUS[$rank]}" =~ ^[0-9]+$ ]] || die "invalid GPU ID: ${GPUS[$rank]}"
+  require_file "$COHORTS_DIR/shard_$(printf '%02d' "$rank").json"
+  require_file "$COHORTS_DIR/dataset_shard_$(printf '%02d' "$rank").json.gz"
+done
+
+mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$RUNTIME_DIR/ranks"
+export PYTHONDONTWRITEBYTECODE=1
+
+echo "[ppa-eval] starting 8 isolated Xvfb displays"
+for rank in $(seq 0 7); do
+  display_num=$((DISPLAY_BASE + rank))
+  display="127.0.0.1:${display_num}.0"
+  log="$RUNTIME_DIR/logs/xvfb_${rank}.log"
+  runtime="$RUNTIME_DIR/ranks/rank_$(printf '%02d' "$rank")/xvfb"
+  mkdir -p "$runtime/.xkb-cache"
+  if env LD_LIBRARY_PATH="$TOOL_LD_LIBRARY_PATH" DISPLAY="$display" \
+    timeout 5 "$XDPYINFO_BIN" >/dev/null 2>&1; then
+    die "DISPLAY=$display is already active; choose another PPA_EVAL_DISPLAY_BASE"
+  fi
+  (
+    cd "$runtime"
+    exec 9<"$runtime/.xkb-cache"
+    exec env \
+      PATH="$X11_BUNDLE/bin:$PATH" \
+      LD_LIBRARY_PATH="$TOOL_LD_LIBRARY_PATH" \
+      LIBGL_DRIVERS_PATH="$X11_DRI_PATH" \
+      LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+      MESA_LOADER_DRIVER_OVERRIDE=swrast \
+      "$XVFB_BIN" ":$display_num" -screen 0 1024x768x24 \
+      -nolock -nolisten unix -listen tcp +iglx -ac \
+      -fp "$X11_FONT_PATH" -xkbdir "$X11_XKB_PATH"
+  ) >"$log" 2>&1 &
+  XVFB_PIDS[$rank]="$!"
+  ready=0
+  for _ in $(seq 1 60); do
+    if env LD_LIBRARY_PATH="$TOOL_LD_LIBRARY_PATH" DISPLAY="$display" \
+      timeout 5 "$XDPYINFO_BIN" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    kill -0 "${XVFB_PIDS[$rank]}" 2>/dev/null || break
+    sleep 1
+  done
+  [[ "$ready" -eq 1 ]] || die "Xvfb rank $rank failed; see $log"
+done
+
+echo "[ppa-eval] starting model RPC servers"
+for rank in $(seq 0 7); do
+  gpu="${GPUS[$rank]}"
+  port=$((MODEL_PORT_BASE + rank))
+  runtime="$RUNTIME_DIR/ranks/rank_$(printf '%02d' "$rank")/model"
+  log="$RUNTIME_DIR/logs/model_${rank}.log"
+  mkdir -p "$runtime"/{tmp,xdg,hf,torch_extensions,triton,matplotlib}
+  env \
+    PYTHONPATH="$RPC_PYTHONPATH" LD_LIBRARY_PATH="$SERVER_LD_LIBRARY_PATH" \
+    CUDA_VISIBLE_DEVICES="$gpu" TMPDIR="$runtime/tmp" \
+    XDG_CACHE_HOME="$runtime/xdg" HF_HOME="$runtime/hf" \
+    TORCH_EXTENSIONS_DIR="$runtime/torch_extensions" \
+    TRITON_CACHE_DIR="$runtime/triton" MPLCONFIGDIR="$runtime/matplotlib" \
+    HEATMAPVLN_FORCE_FLASH_ATTN_STUB=0 \
+    "$QWEN_PYTHON" -u "$MODEL_SERVER" \
+      --config "$PPA_CONFIG" --checkpoint "$PPA_CHECKPOINT" \
+      --internnav_model_path "$INTERNNAV_MODEL_PATH" \
+      --gpu_id 0 --host 127.0.0.1 --port "$port" --workers 1 \
+      --require_deterministic_sampling --require_ppa_online_amb3r \
+      --log_level INFO >"$log" 2>&1 &
+  MODEL_PIDS[$rank]="$!"
+  sleep "$SERVER_STAGGER_S"
+done
+
+echo "[ppa-eval] starting online AMB3R RPC servers"
+for rank in $(seq 0 7); do
+  gpu="${GPUS[$rank]}"
+  port=$((VO_PORT_BASE + rank))
+  runtime="$RUNTIME_DIR/ranks/rank_$(printf '%02d' "$rank")/vo"
+  log="$RUNTIME_DIR/logs/vo_${rank}.log"
+  mkdir -p "$runtime"/{tmp,xdg,hf,triton}
+  env \
+    PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" \
+    LD_LIBRARY_PATH="$SERVER_LD_LIBRARY_PATH" CUDA_VISIBLE_DEVICES="$gpu" \
+    TMPDIR="$runtime/tmp" XDG_CACHE_HOME="$runtime/xdg" \
+    HF_HOME="$runtime/hf" TRITON_CACHE_DIR="$runtime/triton" \
+    "$QWEN_PYTHON" -u "$VO_SERVER" \
+      --repo "$REPO" --amb3r-root "$AMB3R_ROOT" \
+      --da3-checkpoint "$DA3_CHECKPOINT" --device cuda:0 \
+      --host 127.0.0.1 --port "$port" \
+      --map-init-window 20 --map-every 8 --max-history 8 \
+      --resolution 518 392 --translation-scale 1.0 \
+      --max-frames-limit 4096 --max-message-mb 32 \
+      --log-level INFO >"$log" 2>&1 &
+  VO_PIDS[$rank]="$!"
+  sleep "$SERVER_STAGGER_S"
+done
+
+echo "[ppa-eval] waiting for 16 RPC servers"
+deadline=$(( $(date +%s) + SERVER_START_TIMEOUT_S ))
+for rank in $(seq 0 7); do
+  model_addr="127.0.0.1:$((MODEL_PORT_BASE + rank))"
+  vo_addr="127.0.0.1:$((VO_PORT_BASE + rank))"
+  while true; do
+    kill -0 "${MODEL_PIDS[$rank]}" 2>/dev/null || {
+      tail -120 "$RUNTIME_DIR/logs/model_${rank}.log" >&2
+      die "model server rank $rank exited"
+    }
+    kill -0 "${VO_PIDS[$rank]}" 2>/dev/null || {
+      tail -120 "$RUNTIME_DIR/logs/vo_${rank}.log" >&2
+      die "VO server rank $rank exited"
+    }
+    if PYTHONPATH="$RPC_PYTHONPATH" "$VLNCE_PYTHON" - "$model_addr" "$vo_addr" <<'PY' >/dev/null 2>&1
+import sys
+from vla_rpc.client import VLAClient
+
+for address, expected in (
+    (sys.argv[1], "ppa-online-amb3r-v1"),
+    (sys.argv[2], "json+jpeg"),
+):
+    client = VLAClient(server_addr=address, timeout_ms=5000)
+    try:
+        client.connect()
+        info = client.get_server_info()
+        if not client.health_check() or info is None:
+            raise SystemExit(1)
+        if expected not in set(info.supported_formats):
+            raise SystemExit(2)
+    finally:
+        client.close()
+PY
+    then
+      break
+    fi
+    (( $(date +%s) < deadline )) || die "RPC startup timeout at rank $rank"
+    sleep 10
+  done
+  grep -F "Formal PPA online AMB3R runtime enabled" \
+    "$RUNTIME_DIR/logs/model_${rank}.log" >/dev/null \
+    || die "model rank $rank lacks PPA preflight evidence"
+  echo "[ppa-eval] rank=$rank model=$model_addr vo=$vo_addr ready"
+done
+
+echo "[ppa-eval] starting all 1,839 val-unseen episodes across 8 shards"
+for rank in $(seq 0 7); do
+  gpu="${GPUS[$rank]}"
+  shard="$(printf '%02d' "$rank")"
+  display="127.0.0.1:$((DISPLAY_BASE + rank)).0"
+  output="$WORKERS_DIR/shard_${shard}"
+  log="$RUNTIME_DIR/logs/client_${rank}.log"
+  mkdir -p "$output"
+  env \
+    PYTHONPATH="$RPC_PYTHONPATH" LD_LIBRARY_PATH="$CLIENT_LD_LIBRARY_PATH" \
+    DISPLAY="$display" CUDA_VISIBLE_DEVICES="$gpu" HABITAT_GL_GPU_ID=0 \
+    LIBGL_DRIVERS_PATH="$X11_DRI_PATH" LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=swrast \
+    HEATMAPVLN_PREINIT_GL=0 HEATMAPVLN_PREINIT_EMPTY_GL=1 \
+    "$VLNCE_PYTHON" -u "$CLIENT" \
+      --config "$PPA_CONFIG" \
+      --rpc_server "127.0.0.1:$((MODEL_PORT_BASE + rank))" \
+      --history_pose_source amb3r_vo_da3 \
+      --amb3r_vo_rpc_server "127.0.0.1:$((VO_PORT_BASE + rank))" \
+      --amb3r_vo_rpc_timeout_ms "$RPC_TIMEOUT_MS" \
+      --amb3r_vo_rpc_jpeg_quality 95 \
+      --rpc_timeout_ms "$RPC_TIMEOUT_MS" --rpc_jpeg_quality 90 \
+      --rpc_protocol_seed 42 --rpc_require_deterministic_sampling \
+      --rpc_policy_mode heatmapvln \
+      --scenes_dir "$SCENES_DIR" \
+      --data_path "$COHORTS_DIR/dataset_shard_${shard}.json.gz" \
+      --dataset_split val_unseen --episode_list "$COHORTS_DIR/shard_${shard}.json" \
+      --output_path "$output" --sim_gpu_id 0 \
+      --resize_w 384 --resize_h 384 --num_history 8 \
+      --max_steps_per_episode 500 --max_system2_calls_per_episode 0 \
+      --auto_stop_distance 0 --trajectory_selection mean \
+      --trajectory_x_sign 1 --trajectory_heading_alignment none \
+      --system1_coord_order generated --no-pano_recenter_before_system1 \
+      --no-debug_input_trace --debug_save_input_images 0 --resume \
+      >"$log" 2>&1 &
+  CLIENT_PIDS[$rank]="$!"
+done
+
+remaining=("${CLIENT_PIDS[@]}")
+while ((${#remaining[@]})); do
+  finished=""
+  if ! wait -n -p finished "${remaining[@]}"; then
+    for rank in $(seq 0 7); do
+      tail -80 "$RUNTIME_DIR/logs/client_${rank}.log" >&2 || true
+    done
+    die "a Habitat evaluation shard failed"
+  fi
+  next=()
+  for pid in "${remaining[@]}"; do
+    [[ "$pid" == "$finished" ]] || next+=("$pid")
+  done
+  remaining=("${next[@]}")
+  echo "[ppa-eval] client pid=$finished complete; remaining=${#remaining[@]}"
+done
+
+"$QWEN_PYTHON" "$MERGE_TOOL" \
+  --dataset "$DATASET" --cohorts-dir "$COHORTS_DIR" \
+  --workers-dir "$WORKERS_DIR" --output-dir "$MERGED_DIR" \
+  --num-shards 8 --expected-episodes "$EXPECTED_EPISODES" \
+  --protocol heatmapvln-r2r-json-v3 \
+  --sampling-protocol heatmapvln-nextdit-sha256-v1 \
+  --protocol-seed 42 --evaluation-arm ppa_stage2_online_amb3r
+
+"$QWEN_PYTHON" - "$MERGED_DIR" "$EXPECTED_EPISODES" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root, expected = Path(sys.argv[1]), int(sys.argv[2])
+rows = [json.loads(line) for line in (root / "progress.json").read_text().splitlines() if line.strip()]
+if len(rows) != expected:
+    raise SystemExit(f"merged episode count mismatch: {len(rows)} != {expected}")
+if any(row.get("history_pose_source") != "amb3r_vo_da3" for row in rows):
+    raise SystemExit("merged result contains a non-AMB3R pose provider")
+applied = sum(int(row.get("ppa_applied_calls", 0)) for row in rows)
+if applied <= 0:
+    raise SystemExit("trained PPA was never applied after AMB3R warmup")
+result = json.loads((root / "result.json").read_text())
+if int(result.get("total_episodes", -1)) != expected:
+    raise SystemExit("merged result total_episodes mismatch")
+print(json.dumps({"status": "passed", "episodes": expected, "ppa_applied_calls": applied, "result": result}, sort_keys=True))
+PY
+
+echo "[ppa-eval] COMPLETE result=$MERGED_DIR/result.json"
+echo "[ppa-eval] merged progress=$MERGED_DIR/progress.json"
+echo "[ppa-eval] runtime logs=$RUNTIME_DIR/logs"

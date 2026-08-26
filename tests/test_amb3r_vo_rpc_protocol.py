@@ -25,6 +25,7 @@ VOFrameLedger = _protocol.VOFrameLedger
 model_pose_fields_from_query = _protocol.model_pose_fields_from_query
 native_front_rgb = _protocol.native_front_rgb
 unique_past_vo_records = _protocol.unique_past_vo_records
+validate_model_pose_fields = _protocol.validate_model_pose_fields
 
 
 def test_client_protocol_constants_match_vo_server_contract() -> None:
@@ -180,3 +181,54 @@ def test_query_contract_preserves_duplicate_and_current_prompt_slots() -> None:
             current_frame_id=2,
             history_frame_ids=[2, 1],
         )
+
+
+def _formal_model_payload(*, ready: bool) -> dict:
+    payload = {
+        "pose_provider": AMB3R_VO_POSE_PROVIDER,
+        "pose_ready": ready,
+        "vo_current_frame_id": 20,
+        "vo_history_frame_ids": [0, 9, 19],
+        "vo_provider_phase": "stateful_backend" if ready else "map_warmup",
+        "vo_trajectory_revision": 1 if ready else 0,
+        "current_capture_step": 24,
+        "history_capture_steps": [0, 10, 23],
+        "history_age_steps": [24, 14, 1],
+    }
+    if ready:
+        payload["history_rel_poses"] = [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.5, 0.2, 0.0, 1.0],
+            [0.1, -0.2, -1.0, 0.0],
+        ]
+    return payload
+
+
+def test_formal_model_payload_accepts_ready_amb3r_and_preserves_identity() -> None:
+    result = validate_model_pose_fields(_formal_model_payload(ready=True), num_history=3)
+    assert result["pose_ready"] is True
+    np.testing.assert_array_equal(result["vo_history_frame_ids"], [0, 9, 19])
+    assert result["history_rel_poses"].shape == (3, 4)
+
+
+def test_formal_model_payload_warmup_has_no_forged_pose() -> None:
+    payload = _formal_model_payload(ready=False)
+    result = validate_model_pose_fields(payload, num_history=3)
+    assert result["pose_ready"] is False
+    assert result["history_rel_poses"].shape == (0, 4)
+
+    payload["history_rel_poses"] = [[0.0, 0.0, 0.0, 0.0]] * 3
+    with pytest.raises(ValueError, match="warmup"):
+        validate_model_pose_fields(payload, num_history=3)
+
+
+def test_formal_model_payload_rejects_gt_or_noncausal_identity() -> None:
+    payload = _formal_model_payload(ready=True)
+    payload["current_c2w"] = np.eye(4).tolist()
+    with pytest.raises(ValueError, match="privileged"):
+        validate_model_pose_fields(payload, num_history=3)
+
+    payload = _formal_model_payload(ready=True)
+    payload["vo_history_frame_ids"][-1] = payload["vo_current_frame_id"]
+    with pytest.raises(ValueError, match="strictly before"):
+        validate_model_pose_fields(payload, num_history=3)

@@ -492,6 +492,9 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
             native_action_head=model.nextdit_action_head,
             native_cond_projector=model.nextdit_action_head.cond_projector,
             other_frozen_modules=(model.qwen2_5_vl, model.llm_projector),
+            bridge_only=bool(
+                stage_cfg.get('past_plan_action_bridge_only', False)
+            ),
         )
         model.latent_queries.requires_grad_(False)
         logger.info(

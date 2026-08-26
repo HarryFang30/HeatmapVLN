@@ -955,6 +955,7 @@ class TrainingStageConfig(_Lenient):
     train_action: bool = True
     strict_trainable_modules: bool = False
     bridge_only: bool = False
+    past_plan_action_bridge_only: bool = False
     requires_base_checkpoint: bool = False
     require_complete_internnav_system1: bool | None = None
     base_checkpoint_lora_only: bool = False
@@ -1439,6 +1440,14 @@ class TrainConfig(_Lenient):
                     raise ValueError(
                         "Past->Plan->Action must train exactly "
                         "['past_plan_action','heatmap_vln']"
+                    )
+                if (
+                    stage.past_plan_action_bridge_only
+                    and stage.past_plan_action_stage != "stage2_joint"
+                ):
+                    raise ValueError(
+                        "past_plan_action_bridge_only is valid only for "
+                        "stage2_joint action refinement"
                     )
                 if not stage.strict_trainable_modules:
                     raise ValueError(

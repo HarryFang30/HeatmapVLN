@@ -346,6 +346,21 @@ class CheckpointManager:
                     'past_plan_action.future_head.'
                 )
             }
+            complete_future = {
+                name: normalized_state_dict[name]
+                for name in future_names
+            }
+            # Bridge-only action refinement freezes the Future Head, but its
+            # deployment checkpoint must remain self-contained.  Trainable
+            # EMA tensors override this frozen snapshot in ordinary stages.
+            trainable_state_dict = {
+                **complete_future,
+                **trainable_state_dict,
+            }
+            # ``ckpt`` was constructed above.  Rebind its deployment entry to
+            # the self-contained mapping after adding frozen Future tensors;
+            # otherwise it retains the pre-merge dict object.
+            ckpt['trainable_state_dict'] = trainable_state_dict
             missing_future = sorted(future_names - set(trainable_state_dict))
             if not future_names or missing_future:
                 raise RuntimeError(

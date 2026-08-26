@@ -32,6 +32,7 @@ printf 'schema\n' > "$REPO_ROOT/src/config_schema.py"
 printf 'train\n' > "$REPO_ROOT/scripts/train.py"
 printf 'checker\n' > "$REPO_ROOT/scripts/tools/checker.py"
 printf 'checkpoint\n' > "$ALLOWED_ROOT/model/past-best.pth"
+printf 'stage1 checkpoint\n' > "$ALLOWED_ROOT/model/stage1-best.pth"
 printf '%s\n' \
   '{"schema":"heatmapvln-amb3r-endpoint-pose-cache-ready-v2","complete":true}' \
   > "$ALLOWED_ROOT/amb3r-cache/_control/cache.ready.json"
@@ -173,6 +174,27 @@ run_success_case() {
 
 run_success_case 0 7 output-workers-zero
 run_success_case 2 7 output-workers-two
+
+# A failed Stage 2 can restart from a completed Stage-1 deployment checkpoint
+# without rerunning Stage 1 or restoring its optimizer/scheduler.
+: > "$FAKE_LOG"
+env \
+  "${common_env[@]}" \
+  PPA_RUN_MODE=stage2_only \
+  PPA_STAGE1_BEST_CHECKPOINT="$ALLOWED_ROOT/model/stage1-best.pth" \
+  PPA_OUTPUT_ROOT="$ALLOWED_ROOT/output-stage2-only" \
+  PPA_NUM_WORKERS=0 \
+  bash "$LAUNCHER" > "$TEST_ROOT/stage2-only.out" 2>&1
+grep -F 'torch.distributed.run' "$FAKE_LOG" > "$TEST_ROOT/stage2-only.training"
+[[ "$(wc -l < "$TEST_ROOT/stage2-only.training" | tr -d ' ')" == "1" ]]
+grep -F '|--config|' "$TEST_ROOT/stage2-only.training" | grep -F 'ppa_stage2.yaml' >/dev/null
+grep -F '|checkpoint|--path|' "$FAKE_LOG" | grep -F '|--kind|stage1' >/dev/null
+if grep -F '|run-best|--output-root|' "$FAKE_LOG" | grep -F '|--kind|stage1' >/dev/null; then
+  printf 'stage2-only mode unexpectedly resolved or ran Stage 1\n' >&2
+  exit 1
+fi
+grep -F 'Stage-2-only retry: using validated Stage-1 best' \
+  "$TEST_ROOT/stage2-only.out" >/dev/null
 
 # Exactly eight unique numeric devices are required before any Python starts.
 : > "$FAKE_LOG"
