@@ -170,6 +170,9 @@ def build_model(
         past_plan_action_bridge_heads=past_plan_action_cfg.get(
             'bridge_heads', 8
         ),
+        past_plan_action_max_delta_ratio=past_plan_action_cfg.get(
+            'max_delta_ratio'
+        ),
 
         verbose=verbose,
     )
@@ -215,10 +218,12 @@ def build_model(
             )
         if past_plan_action_cfg.get('enabled', False):
             logger.info(
-                "   Past->Plan->Action -> enabled=True, M=%s, Z=%s, heads=%s",
+                "   Past->Plan->Action -> enabled=True, M=%s, Z=%s, heads=%s, "
+                "max_delta_ratio=%s",
                 past_plan_action_cfg.get('memory_dim', 256),
                 past_plan_action_cfg.get('plan_dim', 768),
                 past_plan_action_cfg.get('bridge_heads', 8),
+                past_plan_action_cfg.get('max_delta_ratio'),
             )
         if s1_ckpt:
             logger.info("   System1 pretrained → %s", s1_ckpt)

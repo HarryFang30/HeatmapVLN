@@ -445,6 +445,32 @@ def train_one_epoch(
         preserve=float(loss_cfg.get('preserve_weight', 0.5)),
         delta_z=float(loss_cfg.get('delta_z_weight', 0.01)),
     )
+    ppa_delta_relative = bool(loss_cfg.get('delta_z_relative', False))
+    ppa_advantage_reference = (
+        float(loss_cfg.get('action_advantage_reference_mse', 0.125))
+        if bool(loss_cfg.get('action_advantage_enabled', False))
+        else None
+    )
+    ppa_advantage_max_weight = float(
+        loss_cfg.get('action_advantage_max_weight', 4.0)
+    )
+    total_delta_ratio = torch.zeros(
+        (), device=dist_context.device, dtype=torch.float64
+    )
+    total_delta_boundary_frac = torch.zeros(
+        (), device=dist_context.device, dtype=torch.float64
+    )
+    ppa_max_delta_ratio = (
+        getattr(
+            getattr(
+                getattr(model_module, 'past_plan_action', None), 'bridge', None
+            ),
+            'max_delta_ratio',
+            None,
+        )
+        if ppa_enabled
+        else None
+    )
 
     l2_sp_device_reference = None
     if l2_sp_weight > 0.0 and l2_sp_reference:
@@ -787,6 +813,9 @@ def train_one_epoch(
                             traj_images=traj_images,
                             preserve_weight=0.0,
                             delta_weight=0.0,
+                            delta_relative=ppa_delta_relative,
+                            advantage_reference_mse=ppa_advantage_reference,
+                            advantage_max_weight=ppa_advantage_max_weight,
                         )
                         trajectory_loss = action_plan_losses['action']
                     else:
@@ -1163,6 +1192,15 @@ def train_one_epoch(
         else:
             iter_preserve_t = torch.zeros_like(iter_future_t)
             iter_delta_z_t = torch.zeros_like(iter_future_t)
+        if ppa_enabled and torch.is_tensor(output.get('delta_token_ratio')):
+            delta_token_ratio = output['delta_token_ratio'].detach().to(
+                dtype=torch.float64
+            )
+            total_delta_ratio += delta_token_ratio.mean()
+            if ppa_max_delta_ratio is not None:
+                total_delta_boundary_frac += (
+                    delta_token_ratio >= 0.95 * float(ppa_max_delta_ratio)
+                ).double().mean()
 
         total_loss += iter_loss_t
         total_heatmap_loss += iter_hm_t
@@ -1338,6 +1376,8 @@ def train_one_epoch(
             total_preserve_loss,
             total_delta_z_loss,
             torch.tensor(float(num_batches), device=device, dtype=torch.float64),
+            total_delta_ratio,
+            total_delta_boundary_frac,
         ]
     )
     _dist_all_reduce_in_place(totals)
@@ -1366,6 +1406,8 @@ def train_one_epoch(
         'future_heatmap_loss': (totals[5] / reduced_num_batches).item(),
         'preserve_loss': (totals[6] / reduced_num_batches).item(),
         'delta_z_loss': (totals[7] / reduced_num_batches).item(),
+        'delta_token_ratio_mean': (totals[9] / reduced_num_batches).item(),
+        'delta_at_boundary_frac': (totals[10] / reduced_num_batches).item(),
         'optimizer_steps': global_step,
         **heatmap_component_metrics,
         **view_count_metrics,

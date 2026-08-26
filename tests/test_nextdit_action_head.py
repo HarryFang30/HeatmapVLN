@@ -86,6 +86,7 @@ def test_projected_velocity_casts_fp32_trajectory_to_bf16_encoder_without_autoca
 def test_generate_traj_from_condition_latents_uses_head_scheduler():
     head = _minimal_head()
     cond = torch.randn(1, 4, 3)
+    training_timesteps = head.noise_scheduler.timesteps.clone()
 
     trajectory = head._generate_traj_from_condition_latents(
         cond,
@@ -96,6 +97,35 @@ def test_generate_traj_from_condition_latents_uses_head_scheduler():
     )
 
     assert trajectory.shape == (2, 4, 3)
+    # Sampling must run on an isolated scheduler copy: the shared training
+    # scheduler keeps its full schedule for sample_flow_matching_inputs.
+    assert torch.equal(head.noise_scheduler.timesteps, training_timesteps)
+
+
+def test_sampling_does_not_break_subsequent_flow_matching_training():
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+    head = _minimal_head()
+    head.noise_scheduler = FlowMatchEulerDiscreteScheduler()
+
+    head._generate_traj_from_condition_latents(
+        torch.randn(1, 4, 3),
+        predict_step_nums=4,
+        guidance_scale=1.0,
+        num_inference_steps=2,
+        num_sample_trajs=2,
+    )
+
+    # Before the isolated-scheduler fix, set_timesteps left a 2-entry
+    # inference schedule behind and this indexing raised IndexError.
+    gt = torch.randn(2, 4, 3)
+    noisy, timesteps, target = head.sample_flow_matching_inputs(gt)
+    assert noisy.shape == gt.shape
+    assert timesteps.shape == (2,)
+    assert target.shape == gt.shape
+    assert len(head.noise_scheduler.timesteps) == int(
+        head.noise_scheduler.config.num_train_timesteps
+    )
 
 
 def test_generate_traj_accepts_exact_explicit_initial_noise():

@@ -46,6 +46,75 @@ from .visualization import (
 
 logger = logging.getLogger(__name__)
 
+
+def _accumulate_ppa_rollout_stats(
+    *,
+    action_head,
+    plan_z: torch.Tensor,
+    plan_z0: torch.Tensor,
+    gt_trajectory: torch.Tensor,
+    trajectory_valid: torch.Tensor | None,
+    traj_images: torch.Tensor | None,
+    postprocess_config,
+    batch_index: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample bridged vs native banks under shared noise and score them.
+
+    Returns ``[pairs, endpoint_err, endpoint_err_native, endpoint_gap,
+    agreement]`` sums for one batch.  Noise is seeded by the batch index only,
+    so the metric is comparable across epochs and the native/bridged rollouts
+    differ exclusively through the Plan delta.
+    """
+
+    from src.models.action.rollout_metrics import compute_rollout_pair_metrics
+
+    stats = torch.zeros(5, device=device, dtype=torch.float64)
+    num_samples = int(action_head.config.num_sample_trajs)
+    predict_steps = int(action_head.config.predict_steps)
+    action_dim = int(action_head.config.action_dim)
+    for b in range(plan_z.shape[0]):
+        if trajectory_valid is not None and float(trajectory_valid[b]) <= 0.0:
+            continue
+        generator = torch.Generator(device=device)
+        generator.manual_seed(20260826 + 1_000_003 * int(batch_index) + b)
+        noise = torch.randn(
+            (num_samples, predict_steps, action_dim),
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        images = None if traj_images is None else traj_images[b : b + 1]
+        bank_bridged = action_head.get_trajectory_from_projected(
+            plan_z[b : b + 1],
+            traj_images=images,
+            initial_noise=noise.clone(),
+        )
+        bank_native = action_head.get_trajectory_from_projected(
+            plan_z0[b : b + 1],
+            traj_images=images,
+            initial_noise=noise.clone(),
+        )
+        pair_metrics = compute_rollout_pair_metrics(
+            bank_bridged=bank_bridged,
+            bank_native=bank_native,
+            gt_trajectory=gt_trajectory[b],
+            config=postprocess_config,
+        )
+        stats += torch.tensor(
+            [
+                1.0,
+                pair_metrics["endpoint_error"],
+                pair_metrics["endpoint_error_native"],
+                pair_metrics["endpoint_gap_to_native"],
+                pair_metrics["action_agreement"],
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+    return stats
+
+
 _HEATMAP_VIEW_NAMES = ("front", "right", "back", "left")
 _HEATMAP_COMPONENT_KEYS = (
     "peak_loss",
@@ -435,8 +504,45 @@ def validate(
         preserve=float(loss_cfg.get('preserve_weight', 0.5)),
         delta_z=float(loss_cfg.get('delta_z_weight', 0.01)),
     )
+    ppa_delta_relative = bool(loss_cfg.get('delta_z_relative', False))
+    ppa_advantage_reference = (
+        float(loss_cfg.get('action_advantage_reference_mse', 0.125))
+        if bool(loss_cfg.get('action_advantage_enabled', False))
+        else None
+    )
+    ppa_advantage_max_weight = float(
+        loss_cfg.get('action_advantage_max_weight', 4.0)
+    )
 
     val_inference_batches = cfg.get('validation', {}).get('val_inference_batches', 10)
+    val_rollout_batches = int(
+        cfg.get('validation', {}).get('val_rollout_batches', 0)
+    )
+    rollout_postprocess_config = None
+    if train_past_plan_action and val_rollout_batches > 0:
+        from src.models.action.treatment_spec import TrajectoryPostprocessConfig
+
+        action_head_for_rollout = getattr(
+            model_module, 'nextdit_action_head', None
+        )
+        if action_head_for_rollout is None:
+            raise RuntimeError(
+                "val_rollout_batches > 0 requires the NextDiT action head"
+            )
+        # Deployment-default post-processing, matching the certified
+        # closed-loop evaluation (selection=mean, x_sign=1, no heading fix).
+        rollout_postprocess_config = TrajectoryPostprocessConfig(
+            num_sample_trajs=int(
+                action_head_for_rollout.config.num_sample_trajs
+            ),
+            action_scale=float(
+                cfg.get('data', {})
+                .get('trajectory', {})
+                .get('action_scale', 4.0)
+            ),
+        )
+    # [count, endpoint_err_z, endpoint_err_z0, endpoint_gap, agreement]
+    rollout_stats = torch.zeros(5, device=device, dtype=torch.float64)
 
     total_val_batches = len(val_loader)
     if max_batches is not None:
@@ -737,8 +843,26 @@ def validate(
                             traj_images=traj_images,
                             preserve_weight=ppa_weights.preserve,
                             delta_weight=ppa_weights.delta_z,
+                            delta_relative=ppa_delta_relative,
+                            advantage_reference_mse=ppa_advantage_reference,
+                            advantage_max_weight=ppa_advantage_max_weight,
                         )
                         trajectory_loss = action_plan_losses['action']
+                        if (
+                            rollout_postprocess_config is not None
+                            and num_batches < val_rollout_batches
+                        ):
+                            rollout_stats += _accumulate_ppa_rollout_stats(
+                                action_head=model_module.nextdit_action_head,
+                                plan_z=output['plan_z'],
+                                plan_z0=output['plan_z0'],
+                                gt_trajectory=gt_trajectory,
+                                trajectory_valid=trajectory_valid,
+                                traj_images=traj_images,
+                                postprocess_config=rollout_postprocess_config,
+                                batch_index=i,
+                                device=device,
+                            )
                     else:
                         traj_hidden_states = model_module.adapt_traj_hidden_states(
                             output['traj_hidden_states']
@@ -904,6 +1028,7 @@ def validate(
     _dist_all_reduce_in_place(totals)
     _dist_all_reduce_in_place(total_heatmap_components)
     _dist_all_reduce_in_place(future_tube_stats)
+    _dist_all_reduce_in_place(rollout_stats)
     heatmap_joint_metrics.all_reduce()
     val_heatmap_joint_metrics = heatmap_joint_metrics.compute()
 
@@ -1002,6 +1127,39 @@ def validate(
         'val_hm_vis_loss': avg_vis_loss,
         'val_hm_coord_loss': avg_coord_loss,
     }
+    if rollout_postprocess_config is not None:
+        rollout_pairs = rollout_stats[0].item()
+        if rollout_pairs <= 0:
+            raise RuntimeError(
+                "val_rollout_batches > 0 but no valid PPA rollout pair was "
+                "evaluated; sampled-rollout checkpoint selection would be blind"
+            )
+        result.update(
+            {
+                'val_rollout_pairs': rollout_pairs,
+                'val_rollout_endpoint_error': (
+                    rollout_stats[1] / rollout_pairs
+                ).item(),
+                'val_rollout_endpoint_error_native': (
+                    rollout_stats[2] / rollout_pairs
+                ).item(),
+                'val_rollout_endpoint_gap': (
+                    rollout_stats[3] / rollout_pairs
+                ).item(),
+                'val_rollout_action_agreement': (
+                    rollout_stats[4] / rollout_pairs
+                ).item(),
+            }
+        )
+        logger.info(
+            "  🎯 PPA rollout (%d pairs, shared noise): endpoint bridged=%.3fm "
+            "native=%.3fm gap=%.3fm action_agreement=%.3f",
+            int(rollout_pairs),
+            result['val_rollout_endpoint_error'],
+            result['val_rollout_endpoint_error_native'],
+            result['val_rollout_endpoint_gap'],
+            result['val_rollout_action_agreement'],
+        )
     result.update(val_heatmap_component_metrics)
     result.update(val_heatmap_joint_metrics)
     if train_future:

@@ -90,14 +90,24 @@ class PastToPlanBridge(nn.Module):
         plan_dim: int = PLAN_TOKEN_DIM,
         memory_dim: int = MEMORY_TOKEN_DIM,
         num_heads: int = 8,
+        max_delta_ratio: float | None = None,
     ) -> None:
         super().__init__()
         if plan_dim <= 0 or memory_dim <= 0 or num_heads <= 0:
             raise ValueError("bridge dimensions and num_heads must be positive")
         if plan_dim % num_heads:
             raise ValueError("plan_dim must be divisible by num_heads")
+        if max_delta_ratio is not None and not 0.0 < float(max_delta_ratio) <= 1.0:
+            raise ValueError("max_delta_ratio must be in (0, 1] or None")
         self.plan_dim = int(plan_dim)
         self.memory_dim = int(memory_dim)
+        # Hard trust region: per-token ||delta|| may never exceed this fraction
+        # of the native ||plan_z0|| token norm, in training AND deployment.  A
+        # soft penalty loses the argmin race against the action loss (measured:
+        # unconstrained refinement drifted to per-element delta RMS ~0.7 for a
+        # <=4% teacher-forced gain and collapsed closed-loop SR), so the frozen
+        # NextDiT must be protected by construction, not by loss weighting.
+        self.max_delta_ratio = None if max_delta_ratio is None else float(max_delta_ratio)
         self.plan_norm = nn.LayerNorm(plan_dim)
         self.memory_norm = nn.LayerNorm(memory_dim)
         self.cross_attention = nn.MultiheadAttention(
@@ -135,6 +145,11 @@ class PastToPlanBridge(nn.Module):
             result = plan_z0
             diagnostics = {
                 "delta_z": torch.zeros_like(plan_z0),
+                "delta_token_ratio": torch.zeros(
+                    plan_z0.shape[:2],
+                    dtype=torch.float32,
+                    device=plan_z0.device,
+                ),
                 "sample_has_memory": torch.zeros(
                     plan_z0.shape[0], dtype=torch.bool, device=plan_z0.device
                 ),
@@ -192,10 +207,28 @@ class PastToPlanBridge(nn.Module):
                     key_padding_mask=key_padding_mask,
                     need_weights=False,
                 )
+                if self.max_delta_ratio is not None:
+                    # Per-token norm cap relative to the native Plan token.  An
+                    # exact-zero delta stays exact zero (scale caps at 1), so
+                    # the zero-bridge bitwise-identity guarantee is preserved.
+                    z0_subset = plan_z0.index_select(0, idx).to(dtype=torch.float32)
+                    delta_norm = attention.norm(dim=-1, keepdim=True)
+                    z0_norm = z0_subset.norm(dim=-1, keepdim=True)
+                    scale = torch.clamp(
+                        self.max_delta_ratio * z0_norm / delta_norm.clamp_min(1e-12),
+                        max=1.0,
+                    )
+                    attention = attention * scale
             delta.index_copy_(0, idx, attention.to(dtype=plan_z0.dtype))
         result = plan_z0 + delta
+        with torch.no_grad():
+            delta_token_ratio = (
+                delta.float().norm(dim=-1)
+                / plan_z0.float().norm(dim=-1).clamp_min(1e-12)
+            )
         diagnostics = {
             "delta_z": delta,
+            "delta_token_ratio": delta_token_ratio,
             "sample_has_memory": sample_has_memory,
         }
         return (result, diagnostics) if return_diagnostics else result
@@ -494,12 +527,14 @@ class PastPlanActionChain(nn.Module):
         plan_dim: int = PLAN_TOKEN_DIM,
         memory_dim: int = MEMORY_TOKEN_DIM,
         bridge_heads: int = 8,
+        max_delta_ratio: float | None = None,
     ) -> None:
         super().__init__()
         self.bridge = PastToPlanBridge(
             plan_dim=plan_dim,
             memory_dim=memory_dim,
             num_heads=bridge_heads,
+            max_delta_ratio=max_delta_ratio,
         )
         self.future_head = FutureTrajectoryHeatmapHead(plan_dim=plan_dim)
 
@@ -557,15 +592,33 @@ def compute_shared_plan_action_losses(
     traj_images: torch.Tensor | None,
     preserve_weight: float = 0.5,
     delta_weight: float = 0.01,
+    delta_relative: bool = False,
+    advantage_reference_mse: float | None = None,
+    advantage_max_weight: float = 4.0,
 ) -> dict[str, torch.Tensor]:
     """Compute action and native-preservation losses with shared randomness.
 
     This is intentionally not two calls to ``compute_loss``: those would draw
     different noise/timesteps and make the preservation target meaningless.
+
+    ``delta_relative`` reports the delta penalty as the scale-free per-token
+    ratio ``||delta||^2 / ||plan_z0||^2`` instead of the absolute per-element
+    mean square.  ``advantage_reference_mse`` enables advantage weighting: each
+    sample's action loss is scaled by ``clamp(native_mse / reference, max=
+    advantage_max_weight)`` under shared noise, so the bridge is pushed only
+    where the frozen native System1 is actually wrong.  The bulk of the native
+    residual is irreducible multimodality; uniform weighting turns that floor
+    into pure drift pressure on the Plan tokens.
     """
 
     if preserve_weight < 0.0 or delta_weight < 0.0:
         raise ValueError("preserve_weight and delta_weight must be non-negative")
+    if advantage_reference_mse is not None:
+        reference = float(advantage_reference_mse)
+        if not torch.isfinite(torch.tensor(reference)) or reference <= 0.0:
+            raise ValueError("advantage_reference_mse must be a positive finite value")
+        if float(advantage_max_weight) < 1.0:
+            raise ValueError("advantage_max_weight must be >= 1")
     required = (
         "_expand_sequence_training_inputs",
         "sample_flow_matching_inputs",
@@ -635,11 +688,6 @@ def compute_shared_plan_action_losses(
         timesteps,
         traj_images=expanded_images,
     )
-    action_loss = action_head.masked_velocity_mse(
-        velocity,
-        target_velocity,
-        trajectory_valid=expanded_valid,
-    )
     with torch.no_grad():
         native_velocity = action_head.predict_velocity_from_projected(
             expanded_z0,
@@ -647,18 +695,58 @@ def compute_shared_plan_action_losses(
             timesteps,
             traj_images=expanded_images,
         )
+    advantage_weights = None
+    if advantage_reference_mse is not None:
+        with torch.no_grad():
+            native_per_sample = (
+                (native_velocity.float() - target_velocity.float())
+                .square()
+                .mean(dim=(1, 2))
+            )
+            advantage_weights = torch.clamp(
+                native_per_sample / float(advantage_reference_mse),
+                max=float(advantage_max_weight),
+            )
+    if advantage_weights is None:
+        action_loss = action_head.masked_velocity_mse(
+            velocity,
+            target_velocity,
+            trajectory_valid=expanded_valid,
+        )
+    else:
+        # Weighted numerator over the UNWEIGHTED valid denominator: with all
+        # weights at 1 this is exactly masked_velocity_mse, and a per-rank
+        # batch of one still sees its weight (a weighted mean would cancel it).
+        per_sample = (
+            (velocity.float() - target_velocity.float()).square().mean(dim=(1, 2))
+        )
+        valid = (
+            torch.ones_like(per_sample)
+            if expanded_valid is None
+            else expanded_valid.float()
+        )
+        denominator = valid.sum()
+        if denominator <= 0:
+            action_loss = per_sample.sum() * 0.0
+        else:
+            action_loss = (per_sample * valid * advantage_weights).sum() / denominator
     preserve_loss = action_head.masked_velocity_mse(
         velocity,
         native_velocity,
         trajectory_valid=expanded_valid,
     )
-    delta_loss = (plan_z.float() - plan_z0.float()).square().mean()
+    if delta_relative:
+        delta_sq = (plan_z.float() - plan_z0.float()).square().sum(dim=-1)
+        z0_sq = plan_z0.float().square().sum(dim=-1).clamp_min(1e-12)
+        delta_loss = (delta_sq / z0_sq).mean()
+    else:
+        delta_loss = (plan_z.float() - plan_z0.float()).square().mean()
     total = (
         action_loss
         + float(preserve_weight) * preserve_loss
         + float(delta_weight) * delta_loss
     )
-    return {
+    result = {
         "total": total,
         "action": action_loss,
         "preserve": preserve_loss,
@@ -668,6 +756,9 @@ def compute_shared_plan_action_losses(
         "shared_noisy_trajectory": noisy,
         "shared_timesteps": timesteps,
     }
+    if advantage_weights is not None:
+        result["advantage_weight_mean"] = advantage_weights.mean()
+    return result
 
 
 def decode_future_from_shared_past_head(

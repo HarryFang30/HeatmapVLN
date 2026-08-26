@@ -1350,14 +1350,24 @@ def main():
             )
         ppa_stage = stage_cfg.get('past_plan_action_stage')
         if ppa_stage is not None:
+            ppa_reset_bridge = bool(
+                stage_cfg.get('past_plan_action_reset_bridge', False)
+            )
             single_view_warmstart_report = load_past_plan_action_initialization(
                 raw_model,
                 weights_path,
                 stage=str(ppa_stage),
                 load_trained_bridge=bool(
                     stage_cfg.get('past_plan_action_bridge_only', False)
-                ),
+                )
+                and not ppa_reset_bridge,
             )
+            if ppa_reset_bridge:
+                logger.info(
+                    "  ✓ PPA bridge retrains from its exact-zero fresh state "
+                    "(past_plan_action_reset_bridge=true); the trained Stage-2 "
+                    "bridge in the base checkpoint was intentionally not loaded"
+                )
         else:
             single_view_warmstart_report = load_pose_adaptation_initialization(
                 raw_model,

@@ -788,6 +788,10 @@ class PastPlanActionConfig(_Strict):
     plan_dim: int = 768
     memory_dim: int = 256
     bridge_heads: int = 8
+    # Hard trust region on the bridge residual: per-token ||delta|| is capped
+    # at this fraction of the native Plan token norm in training AND
+    # deployment.  ``None`` keeps the legacy unconstrained bridge.
+    max_delta_ratio: float | None = None
 
     @model_validator(mode="after")
     def _check_dimensions(self):
@@ -795,6 +799,12 @@ class PastPlanActionConfig(_Strict):
             raise ValueError(
                 "past-plan-action-v1 requires plan_dim/memory_dim/bridge_heads="
                 "768/256/8"
+            )
+        if self.max_delta_ratio is not None and not (
+            0.0 < self.max_delta_ratio <= 1.0
+        ):
+            raise ValueError(
+                "past_plan_action.max_delta_ratio must be in (0, 1] or null"
             )
         return self
 
@@ -879,7 +889,24 @@ class LossConfig(_Lenient):
     future_weight: float = 0.3
     preserve_weight: float = 0.5
     delta_z_weight: float = 0.01
+    # Report the PPA delta penalty as the scale-free per-token ratio
+    # ||delta||^2/||plan_z0||^2 instead of the absolute per-element mean.
+    delta_z_relative: bool = False
+    # Advantage-weighted PPA action loss: scale each sample's velocity MSE by
+    # clamp(native_mse/reference, max=max_weight) under shared noise, so the
+    # bridge is trained only where frozen native System1 is actually wrong.
+    action_advantage_enabled: bool = False
+    action_advantage_reference_mse: float = 0.125
+    action_advantage_max_weight: float = 4.0
     future_heatmap: dict[str, Any] = {}
+
+    @model_validator(mode="after")
+    def _check_action_advantage(self):
+        if self.action_advantage_reference_mse <= 0:
+            raise ValueError("action_advantage_reference_mse must be positive")
+        if self.action_advantage_max_weight < 1.0:
+            raise ValueError("action_advantage_max_weight must be >= 1")
+        return self
 
 
 # --- Training ----------------------------------------------------------------
@@ -974,6 +1001,10 @@ class TrainingStageConfig(_Lenient):
     heatmap_pose_adaptation_init: bool = False
     required_history_pose_provider: str | None = None
     past_plan_action_stage: str | None = None
+    # Bridge-only refinement normally warm-starts the trained Stage-2 bridge.
+    # Setting this retrains the bridge from its exact-zero fresh state while
+    # still loading the frozen Heatmap and Future heads from the base.
+    past_plan_action_reset_bridge: bool = False
     trajectory_sequence_mode: str = "all"
 
     @field_validator("epochs")
@@ -1012,7 +1043,19 @@ class TrainingStageConfig(_Lenient):
                     "Past->Plan->Action requires "
                     "required_history_pose_provider='amb3r_vo_cache'"
                 )
+            if (
+                self.past_plan_action_reset_bridge
+                and not self.past_plan_action_bridge_only
+            ):
+                raise ValueError(
+                    "past_plan_action_reset_bridge is valid only for "
+                    "bridge-only action refinement"
+                )
             return self
+        if self.past_plan_action_reset_bridge:
+            raise ValueError(
+                "past_plan_action_reset_bridge requires a Past->Plan->Action stage"
+            )
         if not prefixes and not self.heatmap_pose_adaptation_init:
             if self.required_history_pose_provider is not None:
                 raise ValueError(
@@ -1117,6 +1160,17 @@ class ValidationConfig(_Lenient):
     save_best_loss_tiebreak_metric: str = "val_loss"
     patience: int = 5
     val_inference_batches: int = 10
+    # Per-rank number of PPA validation batches that additionally run the real
+    # sampler (bridged vs native under shared noise) and score the deployment
+    # post-processing.  0 disables sampled-rollout validation.
+    val_rollout_batches: int = 0
+
+    @field_validator("val_rollout_batches")
+    @classmethod
+    def _non_negative_rollout_batches(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"val_rollout_batches must be >= 0, got {v}")
+        return v
 
 
 # --- Top-level ---------------------------------------------------------------
@@ -1493,6 +1547,16 @@ class TrainConfig(_Lenient):
                     raise ValueError(
                         "Past->Plan->Action Stage 2 requires delta_z_weight > 0"
                     )
+            validation = self.validation
+            if (
+                validation is not None
+                and str(validation.save_best_metric).startswith("val_rollout")
+                and int(getattr(validation, "val_rollout_batches", 0)) <= 0
+            ):
+                raise ValueError(
+                    "save_best_metric=val_rollout_* requires "
+                    "validation.val_rollout_batches > 0"
+                )
             return self
 
         if llm is None or llm.use_lora:

@@ -172,6 +172,7 @@ class VLNPipelineConfig:
     past_plan_action_plan_dim: int = 768
     past_plan_action_memory_dim: int = 256
     past_plan_action_bridge_heads: int = 8
+    past_plan_action_max_delta_ratio: float | None = None
 
     # Performance settings
     enable_gradient_checkpointing: bool = False
@@ -379,16 +380,19 @@ class VLNPipeline(nn.Module):
                     plan_dim=config.past_plan_action_plan_dim,
                     memory_dim=config.past_plan_action_memory_dim,
                     bridge_heads=config.past_plan_action_bridge_heads,
+                    max_delta_ratio=config.past_plan_action_max_delta_ratio,
                 ).to(device=self.device, dtype=torch.float32)
                 # The new bridge is the only communication into the action
                 # path. Native Plan/Action components are immutable.
                 self.nextdit_action_head.requires_grad_(False).eval()
                 self.latent_queries.requires_grad_(False)
                 logger.info(
-                    "Past->Plan->Action enabled: M=%d, Z=%d, heads=%d; native System1 frozen",
+                    "Past->Plan->Action enabled: M=%d, Z=%d, heads=%d, "
+                    "max_delta_ratio=%s; native System1 frozen",
                     config.past_plan_action_memory_dim,
                     config.past_plan_action_plan_dim,
                     config.past_plan_action_bridge_heads,
+                    config.past_plan_action_max_delta_ratio,
                 )
         elif config.nextdit_enabled:
             logger.info("NextDiT action head disabled by config.enable_action_head=False")
@@ -1361,6 +1365,7 @@ class VLNPipeline(nn.Module):
             output["plan_z0"] = plan_z0
             output["plan_z"] = plan_z
             output["delta_z"] = plan_diagnostics["delta_z"]
+            output["delta_token_ratio"] = plan_diagnostics["delta_token_ratio"]
             output["plan_sample_has_memory"] = plan_diagnostics[
                 "sample_has_memory"
             ]

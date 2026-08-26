@@ -21,6 +21,7 @@ Training loss: Flow Matching velocity prediction MSE.
 Inference: Euler ODE solver with Classifier-Free Guidance.
 """
 
+import copy
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -860,13 +861,24 @@ class NextDiTActionHead(nn.Module):
                 dtype=dtype,
             )
 
-        # Reuse the existing noise scheduler to avoid repeated allocations.
-        # Reset timesteps for inference (training config is preserved after this call).
+        # Sample on a fresh scheduler instance built from the shared training
+        # config.  ``set_timesteps`` mutates scheduler state, so reusing
+        # ``self.noise_scheduler`` here would leave a 10-entry inference
+        # schedule behind and break the next ``sample_flow_matching_inputs``
+        # call (its indices span the full training schedule).  A per-call
+        # instance also resets the scheduler's internal step index.
+        scheduler_from_config = getattr(
+            type(self.noise_scheduler), "from_config", None
+        )
+        if scheduler_from_config is not None:
+            sampling_scheduler = scheduler_from_config(self.noise_scheduler.config)
+        else:
+            sampling_scheduler = copy.deepcopy(self.noise_scheduler)
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        self.noise_scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
+        sampling_scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
         # Iterative denoising
-        for t in self.noise_scheduler.timesteps:
+        for t in sampling_scheduler.timesteps:
             latent_features = self._encode_action_trajectory(traj_latents)
             pos_ids = (
                 torch.arange(latent_features.shape[1], device=device)
@@ -878,8 +890,10 @@ class NextDiTActionHead(nn.Module):
 
             # Double for CFG
             latent_model_input = latent_features.repeat(2, 1, 1)
-            if hasattr(self.noise_scheduler, "scale_model_input"):
-                latent_model_input = self.noise_scheduler.scale_model_input(latent_model_input, t)
+            if hasattr(sampling_scheduler, "scale_model_input"):
+                latent_model_input = sampling_scheduler.scale_model_input(
+                    latent_model_input, t
+                )
 
             heatmap_kwargs = self._heatmap_dit_kwargs(
                 cfg_heatmap_tokens, cfg_heatmap_mask, cfg_heatmap_valid
@@ -896,7 +910,9 @@ class NextDiTActionHead(nn.Module):
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-            traj_latents = self.noise_scheduler.step(noise_pred, t, traj_latents).prev_sample
+            traj_latents = sampling_scheduler.step(
+                noise_pred, t, traj_latents
+            ).prev_sample
 
         return traj_latents
 
