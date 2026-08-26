@@ -23,7 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 DEFAULT_DATASET = FJL_ROOT / "habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz"
 
 

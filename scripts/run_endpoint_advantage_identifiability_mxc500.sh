@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FJL_ROOT=/mnt/afs/lixiaoou/intern/fjl
+FJL_ROOT=/mnt/afs/liwenhao/agent/370910109
 REPO_ROOT=${ENDPOINT_PROBE_REPO_ROOT:-${FJL_ROOT}/HeatmapVLN}
 PYTHON_BIN=${ENDPOINT_PROBE_PYTHON:-${FJL_ROOT}/envs/qwen25/bin/python}
 

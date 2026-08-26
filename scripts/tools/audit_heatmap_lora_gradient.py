@@ -92,7 +92,7 @@ def load_audit_config(args: argparse.Namespace) -> dict[str, Any]:
     model_cfg = cfg["model"]
     model_cfg["device"] = args.device
     llm_cfg = model_cfg["llm"]
-    llm_cfg["model_path"] = "/mnt/afs/lixiaoou/intern/fjl/InternNav-Model"
+    llm_cfg["model_path"] = "/mnt/afs/liwenhao/agent/370910109/InternNav-Model"
     llm_cfg["attn_implementation"] = "sdpa"
     llm_cfg["gradient_checkpointing"] = args.gradient_checkpointing == "on"
     llm_cfg["enable_compile"] = False

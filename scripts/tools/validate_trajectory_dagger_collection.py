@@ -11,7 +11,7 @@ Expected collection layout::
 The validator never extracts tar files. It checks path containment, the
 manifest/progress/commit chain, archive hashes and safe members, every JPEG,
 and the native trajectory tensor shape [sample_count, 32, 3]. The collection
-and every referenced path must remain below /mnt/afs/lixiaoou/intern/fjl.
+and every referenced path must remain below /mnt/afs/liwenhao/agent/370910109.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ import numpy as np
 from PIL import Image
 
 
-FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 HARD_CAPACITY_BYTES = 300_000_000_000
 MANIFEST_SCHEMA = "heatmapvln-trajectory-dagger-collection-v1"
 COMMIT_SCHEMA = "heatmapvln-trajectory-dagger-episode-commit-v1"

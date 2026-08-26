@@ -12,19 +12,19 @@ set -u
 set -o pipefail
 umask 027
 
-readonly REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
+readonly REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
 
 # Pin the producer run, not runs/latest. best.pth is intentionally selected by
 # pathname only; its checksum is computed after run completion because epochs
 # 5/6 may still replace the current incumbent.
-readonly HEATMAP_RUN="/mnt/afs/lixiaoou/intern/fjl/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402"
+readonly HEATMAP_RUN="/mnt/afs/liwenhao/agent/370910109/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402"
 readonly HEATMAP_BEST="${HEATMAP_RUN}/checkpoints/best.pth"
 readonly HEATMAP_SUMMARY="${HEATMAP_RUN}/manifest/summary.json"
 readonly HEATMAP_METRICS="${HEATMAP_RUN}/logs/metrics.jsonl"
 
 # This is atomically published only after all four DAgger shards and their
 # sample indexes pass the finalizer's full validation.
-readonly DAGGER_MANIFEST="/mnt/afs/lixiaoou/intern/fjl/data/heatmap_system1_training_v1/rollout_control/round_000/full_train_4way_seed17/training_roots.json"
+readonly DAGGER_MANIFEST="/mnt/afs/liwenhao/agent/370910109/data/heatmap_system1_training_v1/rollout_control/round_000/full_train_4way_seed17/training_roots.json"
 
 readonly CONTROL_LAUNCHER="${REPO_ROOT}/scripts/run_heatmap_system1_control_8gpu_mxc500.sh"
 

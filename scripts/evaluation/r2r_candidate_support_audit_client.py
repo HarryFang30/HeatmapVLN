@@ -37,7 +37,7 @@ from typing import Any
 faulthandler.enable()
 
 _LOCKED_HEATMAP_REPO = Path(
-    os.environ.get("HEATMAPVLN_REPO", "/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN")
+    os.environ.get("HEATMAPVLN_REPO", "/mnt/afs/liwenhao/agent/370910109/HeatmapVLN")
 ).resolve()
 sys.path.insert(0, str(_LOCKED_HEATMAP_REPO))
 
@@ -154,7 +154,7 @@ if not hasattr(np, "bool"):
 import torch as _torch_preload  # noqa: F401
 
 
-LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 LOCAL_VLNCE_DATA_ROOT = Path(
     os.environ.get("HEATMAPVLN_VLNCE_DATA_ROOT", str(LOCAL_FJL_ROOT / "habitat" / "VLN-CE" / "data"))
 )
@@ -5351,7 +5351,7 @@ def main():
     parser.add_argument(
         "--candidate_audit_root",
         required=True,
-        help="Shared compact audit dataset root under /mnt/afs/lixiaoou/intern/fjl.",
+        help="Shared compact audit dataset root under /mnt/afs/liwenhao/agent/370910109.",
     )
     parser.add_argument("--candidate_audit_shard_id", type=int, required=True)
     parser.add_argument(

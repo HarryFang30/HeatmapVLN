@@ -8,7 +8,7 @@
 #   WORLD_SIZE（机器数）、RANK（本机序号 0..WORLD_SIZE-1），且需自行改用
 #   torchrun 的 --nnodes / --node_rank。
 #
-# Conda 环境固定为：conda activate /mnt/afs/lixiaoou/intern/fjl/envs/qwen25
+# Conda 环境固定为：conda activate /mnt/afs/liwenhao/agent/370910109/envs/qwen25
 # 若非交互 shell 里没有 conda 命令，请先 source conda.sh（见下方 CONDA_INIT_SH）
 # 或根据实际情况修改「路径默认值」块中的数据/模型路径。
 #
@@ -53,10 +53,10 @@ if [[ "${WORLD_SIZE}" == "1" && "${RANK}" == "0" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Conda：激活环境固定为 /mnt/afs/lixiaoou/intern/fjl/envs/qwen25
+# Conda：激活环境固定为 /mnt/afs/liwenhao/agent/370910109/envs/qwen25
 # 与 run_stage1_s2_8gpu_mxc500_launcher.sh 一致；集群镜像常见 /opt/conda
 # ---------------------------------------------------------------------------
-QWEN25_ENV="/mnt/afs/lixiaoou/intern/fjl/envs/qwen25"
+QWEN25_ENV="/mnt/afs/liwenhao/agent/370910109/envs/qwen25"
 
 activate_qwen25_via_path() {
   if [[ ! -x "${QWEN25_ENV}/bin/python" ]]; then
@@ -75,8 +75,8 @@ if [[ -n "${CONDA_INIT_SH:-}" && -f "${CONDA_INIT_SH}" ]]; then
   _CONDA_SH="${CONDA_INIT_SH}"
 elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
   _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
-elif [[ -f "/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh" ]]; then
-  _CONDA_SH="/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh"
+elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
+  _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
   _CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
 fi
@@ -99,17 +99,17 @@ fi
 # ---------------------------------------------------------------------------
 # 路径默认值（请按你机器上实际位置修改）
 # ---------------------------------------------------------------------------
-export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
-export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/lixiaoou/intern/fjl/InternNav}"
+export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
+export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/liwenhao/agent/370910109/InternNav}"
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
-export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
+export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data}"
 
 # Stage1-S2 checkpoint (student weights)
-export STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_r2r_2ep_after_scalevln_e5_rank32_alllayer/run_20260726_222310/checkpoints/epoch_002.pth}"
-export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_r2r_2ep_after_scalevln_e5_rank32_alllayer}"
+export STAGE2_ADAPTER_LOAD_WEIGHTS="${STAGE2_ADAPTER_LOAD_WEIGHTS:-/mnt/afs/liwenhao/agent/370910109/model/output_stage1_s2_r2r_2ep_after_scalevln_e5_rank32_alllayer/run_20260726_222310/checkpoints/epoch_002.pth}"
+export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage1_s2_r2r_2ep_after_scalevln_e5_rank32_alllayer}"
 
 # Output
-export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_r2r_native_v2_h256_from_scalee5_r2re2}"
+export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage2_adapter_r2r_native_v2_h256_from_scalee5_r2re2}"
 
 mkdir -p "$REPO_ROOT/logs" "${STAGE2_ADAPTER_OUT_DIR}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage2_adapter_r2r_native_v2_h256_from_scalee5_r2re2_8gpu_mxc500.log}"
@@ -153,7 +153,7 @@ export STAGE2_ADAPTER_GT_WEIGHT="${STAGE2_ADAPTER_GT_WEIGHT:-0.2}"
 # a cache of InternNav native front/lookdown teacher latents for the exact
 # pano-selected waypoint. v2 is intentionally isolated from the invalid legacy
 # dataset sidecar and cannot resume/reuse it.
-export STAGE2_TEACHER_SIDECAR_DIR="${STAGE2_TEACHER_SIDECAR_DIR:-/mnt/afs/lixiaoou/intern/fjl/teacher_sidecars/stage2_native_pano_front_aligned_v2}"
+export STAGE2_TEACHER_SIDECAR_DIR="${STAGE2_TEACHER_SIDECAR_DIR:-/mnt/afs/liwenhao/agent/370910109/teacher_sidecars/stage2_native_pano_front_aligned_v2}"
 export STAGE2_TEACHER_TENSOR_DIR="${STAGE2_TEACHER_TENSOR_DIR:-${STAGE2_TEACHER_SIDECAR_DIR}/tensors}"
 export STAGE2_ADAPTER_TEACHER_JSONL="${STAGE2_ADAPTER_TEACHER_JSONL:-${STAGE2_TEACHER_SIDECAR_DIR}/train_native_teacher.jsonl}"
 export STAGE2_TEACHER_COLLECT_CONFIG="${STAGE2_TEACHER_COLLECT_CONFIG:-configs/train_pano_adapter_stage2_8gpu.yaml}"

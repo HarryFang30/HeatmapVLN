@@ -32,10 +32,10 @@ four-worker wrapper delegates to the audited endpoint-v2 cache pipeline; it
 does not train the PPA heads.
 
 ```bash
-export PPA_REPO_ROOT=/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
-export PPA_ALLOWED_ROOT=/mnt/afs/lixiaoou/intern/fjl
-export PPA_DATA_ROOT=/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train
-export PPA_AMB3R_CACHE_ROOT=/mnt/afs/lixiaoou/intern/fjl/data/amb3r_endpoint_v2_full_r2r
+export PPA_REPO_ROOT=/mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+export PPA_ALLOWED_ROOT=/mnt/afs/liwenhao/agent/370910109
+export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train
+export PPA_AMB3R_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/data/amb3r_endpoint_v2_full_r2r
 
 cd "$PPA_REPO_ROOT"
 ALLOWED_ROOT="$PPA_ALLOWED_ROOT" \
@@ -50,15 +50,15 @@ bash scripts/run_amb3r_pose_training_cache_4gpu_mxc500.sh
 ## Website training command (4 GPU, Stage 1 → Stage 2)
 
 ```bash
-export PPA_REPO_ROOT=/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
-export PPA_ALLOWED_ROOT=/mnt/afs/lixiaoou/intern/fjl
-export PPA_QWEN_PYTHON=/mnt/afs/lixiaoou/intern/fjl/envs/qwen25/bin/python
-export INTERNNAV_MODEL_PATH=/mnt/afs/lixiaoou/intern/fjl/InternNav-Model
-export PPA_DATA_ROOT=/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train
+export PPA_REPO_ROOT=/mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+export PPA_ALLOWED_ROOT=/mnt/afs/liwenhao/agent/370910109
+export PPA_QWEN_PYTHON=/mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python
+export INTERNNAV_MODEL_PATH=/mnt/afs/liwenhao/agent/370910109/InternNav-Model
+export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train
 
-export PPA_AMB3R_CACHE_ROOT=/mnt/afs/lixiaoou/intern/fjl/data/amb3r_endpoint_v2_full_r2r
-export PPA_PAST_INIT_CHECKPOINT=/mnt/afs/lixiaoou/intern/fjl/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402/checkpoints/best.pth
-export PPA_OUTPUT_ROOT=/mnt/afs/lixiaoou/intern/fjl/model/output_past_plan_action_v1_4gpu
+export PPA_AMB3R_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/data/amb3r_endpoint_v2_full_r2r
+export PPA_PAST_INIT_CHECKPOINT=/mnt/afs/liwenhao/agent/370910109/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402/checkpoints/best.pth
+export PPA_OUTPUT_ROOT=/mnt/afs/liwenhao/agent/370910109/model/output_past_plan_action_v1_4gpu
 
 export PPA_GPU_DEVICES=0,1,2,3
 export PPA_WAIT_FOR_CACHE=1

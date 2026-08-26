@@ -4,8 +4,8 @@
 # no smoke and never reruns AMB3R.
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 QWEN25_PYTHON="${ALLOWED_ROOT}/envs/qwen25/bin/python"
 
 DATASET_ROOT="${ALLOWED_ROOT}/data/heatmap_randomwalk_train_v1"

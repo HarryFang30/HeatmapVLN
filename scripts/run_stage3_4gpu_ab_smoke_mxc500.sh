@@ -9,16 +9,16 @@ cd "$REPO_ROOT"
 export GPU_DEVICES="${STAGE3_AB_GPU_DEVICES:-0,1,2,3}"
 export NPROC_PER_NODE="${STAGE3_AB_NPROC_PER_NODE:-4}"
 
-export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
-export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
-export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/lixiaoou/intern/fjl/InternNav}"
+export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data}"
+export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
+export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/liwenhao/agent/370910109/InternNav}"
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 
 export STAGE3_CONFIG="${STAGE3_CONFIG:-configs/train_stage3_pano_system1_h1024_8gpu.yaml}"
-export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
+export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/liwenhao/agent/370910109/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
 # Same h1024 adapter architecture as the formal Stage2 output. Override this
 # with STAGE3_ADAPTER_CKPT if a newer smoke/formal adapter is preferred.
-export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/smoke_stage2_prefetch_fix_detached_4gpu_256_20260709_095659/latest.pth}"
+export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/liwenhao/agent/370910109/model/smoke_stage2_prefetch_fix_detached_4gpu_256_20260709_095659/latest.pth}"
 
 export STAGE3_EPOCHS=1
 export STAGE3_BATCH_SIZE=8
@@ -43,8 +43,8 @@ export KEEP_TMP_CONFIGS=0
 
 BASE_PORT="${STAGE3_AB_MASTER_PORT:-29630}"
 STAMP="${STAGE3_AB_TAG:-$(date +%Y%m%d_%H%M%S)}"
-MODEL_ROOT="${STAGE3_AB_MODEL_ROOT:-/mnt/afs/lixiaoou/intern/fjl/model}"
-TB_ROOT="${STAGE3_AB_TB_ROOT:-/mnt/afs/lixiaoou/intern/fjl/tensorlog}"
+MODEL_ROOT="${STAGE3_AB_MODEL_ROOT:-/mnt/afs/liwenhao/agent/370910109/model}"
+TB_ROOT="${STAGE3_AB_TB_ROOT:-/mnt/afs/liwenhao/agent/370910109/tensorlog}"
 LOG_ROOT="${STAGE3_AB_LOG_ROOT:-$REPO_ROOT/logs}"
 RUN_BASELINE="${STAGE3_AB_RUN_BASELINE:-1}"
 

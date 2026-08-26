@@ -24,7 +24,7 @@ from src.data.trajectory_dagger_dataset import (
 )
 
 
-ALLOWED_TMP_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl/tmp")
+ALLOWED_TMP_ROOT = Path("/mnt/afs/liwenhao/agent/370910109/tmp")
 CONTRACT = {
     "schema": "heatmapvln-trajectory-dagger-contract-test-v1",
     "observation": {

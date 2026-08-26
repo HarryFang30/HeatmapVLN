@@ -8,8 +8,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --signal=B:TERM@300
 #SBATCH --open-mode=append
-#SBATCH --output=/mnt/afs/lixiaoou/intern/fjl/data/heatmap_system1_training_v1/cluster_logs/%x_%j.out
-#SBATCH --error=/mnt/afs/lixiaoou/intern/fjl/data/heatmap_system1_training_v1/cluster_logs/%x_%j.err
+#SBATCH --output=/mnt/afs/liwenhao/agent/370910109/data/heatmap_system1_training_v1/cluster_logs/%x_%j.out
+#SBATCH --error=/mnt/afs/liwenhao/agent/370910109/data/heatmap_system1_training_v1/cluster_logs/%x_%j.err
 
 # Train the structured heatmap residual control on the released InternNav path.
 # Data collection is deliberately out of scope: this launcher consumes only a
@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 027
 
-readonly ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+readonly ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 readonly REPO_ROOT="${ALLOWED_ROOT}/HeatmapVLN"
 readonly NATIVE_INTERNNAV_MODEL="${ALLOWED_ROOT}/InternNav-Model"
 readonly NATIVE_MODEL_MANIFEST="${ALLOWED_ROOT}/evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802/manifests/internnav_model.sha256"

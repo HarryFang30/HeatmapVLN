@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO=/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
-PY=/mnt/afs/lixiaoou/intern/fjl/envs/qwen25/bin/python
-CLIP_DIR=${FUTURE_HEATMAP_CLIP_DIR:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train/S9hNv5qa7GM/clip_007409}
-OUTPUT_ROOT=${FUTURE_HEATMAP_OUTPUT_ROOT:-/mnt/afs/lixiaoou/intern/fjl/model/future_heatmap_visualization_v1}
+REPO=/mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+PY=/mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python
+CLIP_DIR=${FUTURE_HEATMAP_CLIP_DIR:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train/S9hNv5qa7GM/clip_007409}
+OUTPUT_ROOT=${FUTURE_HEATMAP_OUTPUT_ROOT:-/mnt/afs/liwenhao/agent/370910109/model/future_heatmap_visualization_v1}
 
-export MPLCONFIGDIR=/mnt/afs/lixiaoou/intern/fjl/model/.runtime_cache/matplotlib_future_heatmap
+export MPLCONFIGDIR=/mnt/afs/liwenhao/agent/370910109/model/.runtime_cache/matplotlib_future_heatmap
 mkdir -p "$OUTPUT_ROOT" "$MPLCONFIGDIR"
 
 cd "$REPO"

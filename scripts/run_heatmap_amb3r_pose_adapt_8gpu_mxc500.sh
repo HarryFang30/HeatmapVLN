@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 QWEN25_ENV="${ALLOWED_ROOT}/envs/qwen25"
 cd "$REPO_ROOT"
 

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 027
 
-readonly FJL_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+readonly FJL_ROOT="/mnt/afs/liwenhao/agent/370910109"
 readonly CONTROL_CHECKPOINT="${FJL_ROOT}/model/output_heatmap_system1_control_v1/runs/run_20260807_112540/checkpoints/epoch_003.pth"
 readonly EXPECTED_CONTROL_SHA256="a556329887be4e6d33f129e1bc670c6515d6a3634b2f3a210ff40b8d21dc9635"
 readonly HEATMAP_CHECKPOINT="${FJL_ROOT}/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402/checkpoints/best.pth"

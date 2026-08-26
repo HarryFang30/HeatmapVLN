@@ -96,7 +96,7 @@ common_env=(
 # initializer. These assertions are intentionally exact enough to catch a
 # parent-root or smoke-subset regression in documentation.
 grep -F \
-  'export PPA_DATA_ROOT=/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train' \
+  'export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train' \
   "$WEBSITE" >/dev/null
 grep -F 'ALLOWED_ROOT="$PPA_ALLOWED_ROOT" \' "$WEBSITE" >/dev/null
 grep -F 'DATASET_ROOT="$PPA_DATA_ROOT" \' "$WEBSITE" >/dev/null
@@ -106,10 +106,10 @@ grep -F 'MAX_CLIPS_PER_SPLIT=0 \' "$WEBSITE" >/dev/null
 grep -F 'bash scripts/run_amb3r_pose_training_cache_4gpu_mxc500.sh' \
   "$WEBSITE" >/dev/null
 grep -F \
-  'export PPA_PAST_INIT_CHECKPOINT=/mnt/afs/lixiaoou/intern/fjl/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402/checkpoints/best.pth' \
+  'export PPA_PAST_INIT_CHECKPOINT=/mnt/afs/liwenhao/agent/370910109/model/output_heatmap_internnav_single_view_v1_4gpu/runs/run_20260803_143402/checkpoints/best.pth' \
   "$WEBSITE" >/dev/null
 grep -F \
-  'PPA_DATA_ROOT="${PPA_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train}"' \
+  'PPA_DATA_ROOT="${PPA_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train}"' \
   "$LAUNCHER" >/dev/null
 
 run_success_case() {

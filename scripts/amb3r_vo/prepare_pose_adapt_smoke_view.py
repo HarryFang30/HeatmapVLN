@@ -91,7 +91,7 @@ def main() -> int:
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--smoke-root", required=True)
     parser.add_argument("--num-train-clips", type=int, default=2)
-    parser.add_argument("--allowed-root", default="/mnt/afs/lixiaoou/intern/fjl")
+    parser.add_argument("--allowed-root", default="/mnt/afs/liwenhao/agent/370910109")
     args = parser.parse_args()
     if args.num_train_clips < 1:
         raise ValueError("--num-train-clips must be positive")

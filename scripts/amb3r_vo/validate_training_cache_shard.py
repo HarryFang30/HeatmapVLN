@@ -37,7 +37,7 @@ def main() -> int:
     parser.add_argument("--shard-id", type=int, required=True)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--write-ready", action="store_true")
-    parser.add_argument("--allowed-root", default="/mnt/afs/lixiaoou/intern/fjl")
+    parser.add_argument("--allowed-root", default="/mnt/afs/liwenhao/agent/370910109")
     args = parser.parse_args()
 
     allowed_root = Path(args.allowed_root).expanduser().resolve(strict=True)

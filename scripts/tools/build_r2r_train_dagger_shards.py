@@ -29,7 +29,7 @@ else:
     import build_r2r_train_dagger_cohort as cohort
 
 
-FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 DEFAULT_DATASET = (
     FJL_ROOT
     / "habitat/VLN-CE/data/datasets/"

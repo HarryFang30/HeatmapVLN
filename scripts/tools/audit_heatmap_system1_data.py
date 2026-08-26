@@ -27,7 +27,7 @@ from typing import Any, Iterable
 import numpy as np
 
 
-FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 DEFAULT_EXPERT_ROOT = FJL_ROOT / "r2r_paronamic_data" / "train"
 DEFAULT_HEATMAP_ROOT = FJL_ROOT / "data" / "heatmap_randomwalk_train_v1"
 DEFAULT_OUTPUT_ROOT = FJL_ROOT / "data" / "heatmap_system1_training_v1"

@@ -17,10 +17,10 @@ seed: 42
 # No teacher sidecar is required for this stage.
 
 paths:
-  dataset_root: /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data
-  log_out_dir: /mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords
-  tensorboard_dir: /mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords
-  internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+  dataset_root: /mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data
+  log_out_dir: /mnt/afs/liwenhao/agent/370910109/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords
+  tensorboard_dir: /mnt/afs/liwenhao/agent/370910109/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords
+  internnav_model_path: /mnt/afs/liwenhao/agent/370910109/InternNav-Model
 
 data:
   train_split: train
@@ -146,7 +146,7 @@ model:
         enabled: true
         hidden_dim: 1024
         dropout: 0.0
-        pretrained_path: /mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth
+        pretrained_path: /mnt/afs/liwenhao/agent/370910109/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth
         strict_load: true
 
 training:

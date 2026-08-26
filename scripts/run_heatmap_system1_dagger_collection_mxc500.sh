@@ -14,7 +14,7 @@ unset BASH_ENV ENV
 readonly FIXED_SYSTEM_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/maca-3.3.0/bin:/opt/maca-3.3.0/ompi/bin:/opt/mxdriver/bin"
 export PATH="$FIXED_SYSTEM_PATH"
 
-readonly ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+readonly ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 readonly ABSOLUTE_HARD_LIMIT_BYTES=300000000000
 readonly CAPACITY_RESERVE_BYTES=5000000000
 readonly EXPECTED_REPO_ROOT="${ALLOWED_ROOT}/HeatmapVLN"
@@ -308,7 +308,7 @@ identity = {
         "native_protocol": native_protocol,
         "repo_root": repo_root,
         "base_launcher": base_launcher,
-        "model_root": "/mnt/afs/lixiaoou/intern/fjl/InternNav-Model",
+        "model_root": "/mnt/afs/liwenhao/agent/370910109/InternNav-Model",
         "system2": "internnav_native_qwen",
         "system1": "internnav_native_nextdit_async",
         "external_checkpoint": False,

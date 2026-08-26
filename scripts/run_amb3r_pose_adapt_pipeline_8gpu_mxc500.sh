@@ -4,8 +4,8 @@
 # checkpoint digest or uses locks.
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 cd "$REPO_ROOT"
 
 export AMB3R_GPU_DEVICES="${AMB3R_GPU_DEVICES:-0,1,2,3,4,5,6,7}"

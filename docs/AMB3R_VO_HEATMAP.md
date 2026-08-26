@@ -31,7 +31,7 @@ age stay unchanged. Feeding only the sampled sparse RGB frames to VO is invalid.
   `torch.load(weights_only=True)` and requires exact heatmap parameter
   coverage.
 
-All caches are explicitly placed below `/mnt/afs/lixiaoou/intern/fjl/`; the
+All caches are explicitly placed below `/mnt/afs/liwenhao/agent/370910109/`; the
 existing `qwen25` environment is used and no Conda environment is created.
 
 ## Causal online service
@@ -40,7 +40,7 @@ Run the pose model in its own process.  The service is deliberately
 single-session and single-worker because AMB3R's keyframe map is mutable:
 
 ```bash
-cd /mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 
 AMB3R_GPU_DEVICE=0 \
 AMB3R_RPC_PORT=50081 \
@@ -55,11 +55,11 @@ scale.  There is no checkpoint hash pin, run lock, or file lock in this path.
 The real 20-frame initialization plus one-frame incremental mapping smoke is:
 
 ```bash
-/mnt/afs/lixiaoou/intern/fjl/envs/qwen25/bin/python \
+/mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python \
   scripts/amb3r_vo/smoke_online_rpc_client.py \
-  --repo /mnt/afs/lixiaoou/intern/fjl/HeatmapVLN \
-  --rpc-root /mnt/afs/lixiaoou/intern/fjl/rpc \
-  --clip /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train/17DRP5sb8fy/clip_004345 \
+  --repo /mnt/afs/liwenhao/agent/370910109/HeatmapVLN \
+  --rpc-root /mnt/afs/liwenhao/agent/370910109/rpc \
+  --clip /mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train/17DRP5sb8fy/clip_004345 \
   --server 127.0.0.1:50081 \
   --max-frames 21
 ```
@@ -79,7 +79,7 @@ shard), or a future multi-session backend.
 ## Smoke run
 
 ```bash
-cd /mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 
 AMB3R_GPU_DEVICE=0 \
 AMB3R_MAX_FRAMES=20 \
@@ -91,7 +91,7 @@ bash scripts/run_amb3r_vo_heatmap_eval_mxc500.sh
 ## Full 33-frame paired audit
 
 ```bash
-cd /mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 
 AMB3R_GPU_DEVICE=0 \
 RUN_TAG=expert_clip_004345_full \

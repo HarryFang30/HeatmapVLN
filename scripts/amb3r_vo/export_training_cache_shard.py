@@ -296,7 +296,7 @@ def main() -> int:
     parser.add_argument("--resolution", nargs=2, type=int, default=(518, 392))
     parser.add_argument("--clip-retries", type=int, default=2)
     parser.add_argument("--progress-every", type=int, default=10)
-    parser.add_argument("--allowed-root", default="/mnt/afs/lixiaoou/intern/fjl")
+    parser.add_argument("--allowed-root", default="/mnt/afs/liwenhao/agent/370910109")
     args = parser.parse_args()
 
     allowed_root = Path(args.allowed_root).expanduser().resolve(strict=True)

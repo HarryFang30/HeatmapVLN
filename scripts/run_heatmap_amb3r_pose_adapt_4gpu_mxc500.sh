@@ -2,8 +2,8 @@
 # Four-rank Head-only AMB3R pose-domain adaptation.
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 cd "$REPO_ROOT"
 
 export EXPECTED_NUM_GPUS=4

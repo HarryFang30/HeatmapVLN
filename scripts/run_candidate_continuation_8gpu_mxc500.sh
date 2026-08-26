@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-FJL_ROOT=/mnt/afs/lixiaoou/intern/fjl
+FJL_ROOT=/mnt/afs/liwenhao/agent/370910109
 REPO="$FJL_ROOT/HeatmapVLN"
 QWEN_PYTHON="$FJL_ROOT/envs/qwen25/bin/python"
 SOURCE_AUDIT="$FJL_ROOT/data/candidate_support_audit_v2/train_balanced_512_native_seed42"

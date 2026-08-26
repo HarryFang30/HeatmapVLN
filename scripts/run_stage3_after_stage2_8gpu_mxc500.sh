@@ -17,21 +17,21 @@ export MASTER_PORT_STAGE3="${MASTER_PORT_STAGE3:-$MASTER_PORT}"
 export GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
-export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
-export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
-export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/lixiaoou/intern/fjl/InternNav}"
+export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data}"
+export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
+export INTERNNAV_REPO="${INTERNNAV_REPO:-/mnt/afs/liwenhao/agent/370910109/InternNav}"
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
 
 export STAGE3_CONFIG="${STAGE3_CONFIG:-configs/train_stage3_pano_system1_h1024_8gpu.yaml}"
-export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
+export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/liwenhao/agent/370910109/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
 
-export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora_h1024}"
+export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage2_adapter_full_11000_alllora_h1024}"
 export STAGE2_ADAPTER_FINAL_EPOCH="${STAGE2_ADAPTER_FINAL_EPOCH:-3}"
 printf -v STAGE2_FINAL_CHECKPOINT_NAME 'epoch_%03d.pth' "$STAGE2_ADAPTER_FINAL_EPOCH"
 export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-${STAGE2_ADAPTER_OUT_DIR}/${STAGE2_FINAL_CHECKPOINT_NAME}}"
 
-export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix}"
+export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/liwenhao/agent/370910109/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix}"
 export LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage3_pano_system1_full_11000_alllora_h1024_internnavcoords_priorfix_8gpu_mxc500.log}"
 
 # Batch/runtime settings passed the four-GPU 100-step smoke; the corrected
@@ -70,7 +70,7 @@ export STAGE_DRY_RUN=0
 
 export STAGE3_CHECKPOINT_WAIT_INTERVAL_S="${STAGE3_CHECKPOINT_WAIT_INTERVAL_S:-300}"
 export STAGE3_CHECKPOINT_SETTLE_S="${STAGE3_CHECKPOINT_SETTLE_S:-30}"
-QWEN_PYTHON="${QWEN_PYTHON:-/mnt/afs/lixiaoou/intern/fjl/envs/qwen25/bin/python}"
+QWEN_PYTHON="${QWEN_PYTHON:-/mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python}"
 
 require_file() {
   if [[ ! -s "$1" ]]; then

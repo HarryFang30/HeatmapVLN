@@ -30,7 +30,7 @@ from scripts.tools import build_r2r_train_dagger_shards as shard_builder
 from src.data.trajectory_dagger_dataset import TrajectoryDaggerDataset
 
 
-FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 OUTPUT_SCHEMA = "heatmapvln-trajectory-dagger-training-roots-v1"
 COLLECTION_SCHEMA = "heatmapvln-trajectory-dagger-collection-v1"
 WRAPPER_SCHEMA = "heatmap-system1-trajectory-dagger-wrapper-v4"

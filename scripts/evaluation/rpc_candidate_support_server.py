@@ -29,7 +29,7 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 HEATMAP_REPO = Path(os.environ.get("HEATMAPVLN_REPO", str(FJL_ROOT / "HeatmapVLN")))
 INTERNNAV_REPO = Path(os.environ.get("INTERNNAV_REPO", str(FJL_ROOT / "InternNav")))
 

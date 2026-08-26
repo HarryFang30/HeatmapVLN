@@ -2,8 +2,8 @@
 # Four persistent AMB3R workers using the shared endpoint-v2 cache contract.
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 cd "$REPO_ROOT"
 
 export EXPECTED_NUM_GPUS=4

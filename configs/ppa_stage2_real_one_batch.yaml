@@ -1,7 +1,7 @@
 seed: 42
 
 data:
-  root: /mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data
+  root: /mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data
   train_split: train
   val_split: val
   image_size: [384, 384]
@@ -27,7 +27,7 @@ data:
     load_traj_images: true
     load_single_view_history_frames: true
     single_view_rgb_input: true
-    amb3r_pose_cache_root: /mnt/afs/lixiaoou/intern/fjl/.codex_tmp/ppa_r2r_cache_20260813/cache
+    amb3r_pose_cache_root: /mnt/afs/liwenhao/agent/370910109/.codex_tmp/ppa_r2r_cache_20260813/cache
     require_amb3r_pose_cache: true
     amb3r_pose_cache_max_clips: 1
     traj_image_size: [224, 224]
@@ -57,7 +57,7 @@ model:
   type: vln_pipeline
   device: cuda
   llm:
-    model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+    model_path: /mnt/afs/liwenhao/agent/370910109/InternNav-Model
     backbone_type: qwen2_5_vl
     hidden_dim: 3584
     token_dim: 896
@@ -102,7 +102,7 @@ model:
     enable: true
     nextdit:
       enabled: true
-      internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+      internnav_model_path: /mnt/afs/liwenhao/agent/370910109/InternNav-Model
       internnav_system1_path: ""
       pretrained_system1_path: null
       vlm_hidden_dim: 3584
@@ -230,7 +230,7 @@ gpu:
     find_unused_parameters: false
 
 log:
-  out_dir: /mnt/afs/lixiaoou/intern/fjl/.codex_tmp/ppa_real_smoke_20260813/output
+  out_dir: /mnt/afs/liwenhao/agent/370910109/.codex_tmp/ppa_real_smoke_20260813/output
   save_every_epochs: 1
   vis_every_steps: 0
   val_vis_batches: 0

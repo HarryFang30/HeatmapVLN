@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 REPO_ROOT="${PPA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-FJL_ROOT="${PPA_ALLOWED_ROOT:-/mnt/afs/lixiaoou/intern/fjl}"
+FJL_ROOT="${PPA_ALLOWED_ROOT:-/mnt/afs/liwenhao/agent/370910109}"
 QWEN_PYTHON="${PPA_QWEN_PYTHON:-${FJL_ROOT}/envs/qwen25/bin/python}"
 VLNCE_PYTHON="${PPA_VLNCE_PYTHON:-${FJL_ROOT}/envs/vlnce/bin/python}"
 RPC_ROOT="${PPA_RPC_ROOT:-${FJL_ROOT}/rpc}"

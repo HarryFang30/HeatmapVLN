@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-QWEN25_ENV="/mnt/afs/lixiaoou/intern/fjl/envs/qwen25"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+QWEN25_ENV="/mnt/afs/liwenhao/agent/370910109/envs/qwen25"
 cd "$REPO_ROOT"
 
 # MXC500 runtime.  These defaults match the launchers that have already run
@@ -30,13 +30,13 @@ export CONDA_PREFIX="$QWEN25_ENV"
 export CONDA_DEFAULT_ENV=qwen25
 hash -r
 
-export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
+export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
 export INTERNNAV_BACKBONE="$INTERNNAV_MODEL_PATH"
-export HEATMAP_DATA_ROOT="${HEATMAP_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/data/heatmap_randomwalk_train_v1}"
+export HEATMAP_DATA_ROOT="${HEATMAP_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/data/heatmap_randomwalk_train_v1}"
 
 # All artifacts for this experiment live below one root: run checkpoints,
 # TensorBoard files, launcher logs, and the audited initializer.
-export SINGLE_VIEW_HM_EXPERIMENT_ROOT="${SINGLE_VIEW_HM_EXPERIMENT_ROOT:-/mnt/afs/lixiaoou/intern/fjl/model/output_heatmap_internnav_single_view_v1}"
+export SINGLE_VIEW_HM_EXPERIMENT_ROOT="${SINGLE_VIEW_HM_EXPERIMENT_ROOT:-/mnt/afs/liwenhao/agent/370910109/model/output_heatmap_internnav_single_view_v1}"
 export SINGLE_VIEW_HM_OUT_DIR="${SINGLE_VIEW_HM_OUT_DIR:-$SINGLE_VIEW_HM_EXPERIMENT_ROOT/runs}"
 export SINGLE_VIEW_HM_TB_DIR="${SINGLE_VIEW_HM_TB_DIR:-$SINGLE_VIEW_HM_EXPERIMENT_ROOT/tensorboard}"
 export SINGLE_VIEW_HM_INIT_CKPT="${SINGLE_VIEW_HM_INIT_CKPT:-$SINGLE_VIEW_HM_EXPERIMENT_ROOT/init/from_legacy_heatmap_53tensors_v2.pth}"

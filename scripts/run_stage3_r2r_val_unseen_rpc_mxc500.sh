@@ -7,7 +7,7 @@ set -Eeuo pipefail
 REPO_ROOT="${HEATMAPVLN_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_ROOT"
 
-export FJL_ROOT="${FJL_ROOT:-/mnt/afs/lixiaoou/intern/fjl}"
+export FJL_ROOT="${FJL_ROOT:-/mnt/afs/liwenhao/agent/370910109}"
 export RPC_ROOT="${RPC_ROOT:-${FJL_ROOT}/rpc}"
 QWEN25_PYTHON="${QWEN25_PYTHON:-${FJL_ROOT}/envs/qwen25/bin/python}"
 VLNCE_PYTHON="${VLNCE_PYTHON:-${FJL_ROOT}/envs/vlnce/bin/python}"
@@ -216,9 +216,9 @@ if is_true "$STAGE3_EVAL_COLLECT_TRAJECTORY_DAGGER"; then
     exit 1
   fi
   case "$STAGE3_EVAL_TRAJECTORY_DAGGER_ROOT" in
-    /mnt/afs/lixiaoou/intern/fjl|/mnt/afs/lixiaoou/intern/fjl/*) ;;
+    /mnt/afs/liwenhao/agent/370910109|/mnt/afs/liwenhao/agent/370910109/*) ;;
     *)
-      echo "Trajectory DAgger root must stay under /mnt/afs/lixiaoou/intern/fjl" >&2
+      echo "Trajectory DAgger root must stay under /mnt/afs/liwenhao/agent/370910109" >&2
       exit 1
       ;;
   esac

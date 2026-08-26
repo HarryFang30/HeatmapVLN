@@ -15,9 +15,9 @@ from typing import Any
 
 
 NATIVE_DEPENDENCY_SCHEMA = "native-internnav-checkpoint-v1"
-NATIVE_MODEL_PATH = "/mnt/afs/lixiaoou/intern/fjl/InternNav-Model"
+NATIVE_MODEL_PATH = "/mnt/afs/liwenhao/agent/370910109/InternNav-Model"
 NATIVE_MODEL_MANIFEST_PATH = (
-    "/mnt/afs/lixiaoou/intern/fjl/evaluation_plans/"
+    "/mnt/afs/liwenhao/agent/370910109/evaluation_plans/"
     "internnav_native_r2r_val_unseen_8gpu_20260802/manifests/"
     "internnav_model.sha256"
 )

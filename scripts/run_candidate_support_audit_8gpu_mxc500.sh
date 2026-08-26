@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-FJL_ROOT=/mnt/afs/lixiaoou/intern/fjl
+FJL_ROOT=/mnt/afs/liwenhao/agent/370910109
 REPO="$FJL_ROOT/HeatmapVLN"
 INTERNNAV_REPO="$FJL_ROOT/InternNav"
 PLAN="$FJL_ROOT/evaluation_plans/heatmap_control_r2r_val_unseen_8gpu_20260804"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FJL_ROOT=${FJL_ROOT:-/mnt/afs/lixiaoou/intern/fjl}
+FJL_ROOT=${FJL_ROOT:-/mnt/afs/liwenhao/agent/370910109}
 REPO=${REPO:-${FJL_ROOT}/HeatmapVLN}
 AMB3R_ROOT=${AMB3R_ROOT:-${FJL_ROOT}/amb3r}
 RPC_ROOT=${RPC_ROOT:-${FJL_ROOT}/rpc}

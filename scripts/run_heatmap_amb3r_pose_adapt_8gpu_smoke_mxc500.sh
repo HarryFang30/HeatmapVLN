@@ -2,8 +2,8 @@
 # Dedicated no-checkpoint, one-step-per-rank AMB3R pose-adaptation smoke.
 set -Eeuo pipefail
 
-REPO_ROOT="/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN"
-ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+REPO_ROOT="/mnt/afs/liwenhao/agent/370910109/HeatmapVLN"
+ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 QWEN_PYTHON="${ALLOWED_ROOT}/envs/qwen25/bin/python"
 SOURCE_DATA_ROOT="${SOURCE_DATA_ROOT:-${ALLOWED_ROOT}/data/heatmap_randomwalk_train_v1}"
 EXPECTED_NUM_GPUS="${EXPECTED_NUM_GPUS:-8}"

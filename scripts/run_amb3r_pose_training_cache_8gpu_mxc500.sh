@@ -5,7 +5,7 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TOOLS_DIR="${REPO_ROOT}/scripts"
-ALLOWED_ROOT=${ALLOWED_ROOT:-/mnt/afs/lixiaoou/intern/fjl}
+ALLOWED_ROOT=${ALLOWED_ROOT:-/mnt/afs/liwenhao/agent/370910109}
 QWEN_PYTHON=${QWEN_PYTHON:-${ALLOWED_ROOT}/envs/qwen25/bin/python}
 HEATMAP_REPO=${HEATMAP_REPO:-${REPO_ROOT}}
 AMB3R_ROOT=${AMB3R_ROOT:-${ALLOWED_ROOT}/amb3r}

@@ -73,7 +73,7 @@ MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 PROTO_VERSION = HEATMAPVLN_RPC_PROTOCOL_VERSION
 PPA_ONLINE_AMB3R_CAPABILITY = "ppa-online-amb3r-v1"
-LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
     os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
 )

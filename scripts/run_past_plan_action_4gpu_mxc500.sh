@@ -16,13 +16,13 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PPA_REPO_ROOT="${PPA_REPO_ROOT:-${DEFAULT_REPO_ROOT}}"
-PPA_ALLOWED_ROOT="${PPA_ALLOWED_ROOT:-/mnt/afs/lixiaoou/intern/fjl}"
-PPA_QWEN_PYTHON="${PPA_QWEN_PYTHON:-/mnt/afs/lixiaoou/intern/fjl/envs/qwen25/bin/python}"
-INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
+PPA_ALLOWED_ROOT="${PPA_ALLOWED_ROOT:-/mnt/afs/liwenhao/agent/370910109}"
+PPA_QWEN_PYTHON="${PPA_QWEN_PYTHON:-/mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python}"
+INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
 # R2R is physically <corpus>/train/<scene>/clip_*.  This must be the direct
 # scene root so VLNSlidingWindowDataset applies its deterministic MD5 scene
 # auto-split for the configured logical train/val datasets.
-PPA_DATA_ROOT="${PPA_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data/train}"
+PPA_DATA_ROOT="${PPA_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train}"
 PPA_AMB3R_CACHE_ROOT="${PPA_AMB3R_CACHE_ROOT:-}"
 PPA_PAST_INIT_CHECKPOINT="${PPA_PAST_INIT_CHECKPOINT:-}"
 PPA_OUTPUT_ROOT="${PPA_OUTPUT_ROOT:-}"

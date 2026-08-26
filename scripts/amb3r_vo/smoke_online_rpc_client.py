@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         "--rpc-root",
         default=os.environ.get(
             "RPC_ROOT",
-            "/mnt/afs/lixiaoou/intern/fjl/rpc",
+            "/mnt/afs/liwenhao/agent/370910109/rpc",
         ),
         help="Repository containing src/vla_rpc",
     )

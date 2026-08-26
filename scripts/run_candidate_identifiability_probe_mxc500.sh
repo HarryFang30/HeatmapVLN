@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT=/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN
-PYTHON_BIN=/mnt/afs/lixiaoou/intern/fjl/envs/qwen25/bin/python
-AUDIT_ROOT=${PROBE_AUDIT_ROOT:-/mnt/afs/lixiaoou/intern/fjl/data/candidate_support_audit_v2/train_balanced_512_native_seed42}
-OUTPUT_DIR=${PROBE_OUTPUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/candidate_identifiability_probe_v2/train_balanced_512_native_seed42}
+PROJECT_ROOT=/mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+PYTHON_BIN=/mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python
+AUDIT_ROOT=${PROBE_AUDIT_ROOT:-/mnt/afs/liwenhao/agent/370910109/data/candidate_support_audit_v2/train_balanced_512_native_seed42}
+OUTPUT_DIR=${PROBE_OUTPUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/candidate_identifiability_probe_v2/train_balanced_512_native_seed42}
 GPU_DEVICE=${PROBE_GPU_DEVICE:-0}
 
 cd "$PROJECT_ROOT"

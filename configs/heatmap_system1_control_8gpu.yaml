@@ -93,7 +93,7 @@ model:
 
   # Released InternNav System2/Qwen, frozen exactly as shipped.
   llm:
-    model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+    model_path: /mnt/afs/liwenhao/agent/370910109/InternNav-Model
     backbone_type: qwen2_5_vl
     hidden_dim: 3584
     token_dim: 896
@@ -145,7 +145,7 @@ model:
   action_head:
     enable: true
     nextdit:
-      internnav_model_path: /mnt/afs/lixiaoou/intern/fjl/InternNav-Model
+      internnav_model_path: /mnt/afs/liwenhao/agent/370910109/InternNav-Model
       enabled: true
       vlm_hidden_dim: 3584
       latent_emb_size: 768

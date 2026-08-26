@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 export STAGE2_ADAPTER_STUDENT_CONFIG="${STAGE2_ADAPTER_STUDENT_CONFIG:-configs/train_pano_adapter_stage2_8gpu.yaml}"
 export STAGE2_ADAPTER_CONFIG="${STAGE2_ADAPTER_CONFIG:-configs/adapter_pano_stage2_h1024.yaml}"
-export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_r2r_native_v2_h1024_from_scalee5_r2re2}"
+export STAGE2_ADAPTER_OUT_DIR="${STAGE2_ADAPTER_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage2_adapter_r2r_native_v2_h1024_from_scalee5_r2re2}"
 export LOG_FILE="${LOG_FILE:-${REPO_ROOT}/logs/stage2_adapter_r2r_native_v2_h1024_from_scalee5_r2re2_8gpu_mxc500.log}"
 
 # Collect or resume only the fresh, signature-matched native-v2 sidecar. The

@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-FJL_ROOT="${PPA_EVAL_FJL_ROOT:-/mnt/afs/lixiaoou/intern/fjl}"
+FJL_ROOT="${PPA_EVAL_FJL_ROOT:-/mnt/afs/liwenhao/agent/370910109}"
 REPO="${PPA_EVAL_REPO:-$FJL_ROOT/HeatmapVLN}"
 RPC_ROOT="${PPA_EVAL_RPC_ROOT:-$FJL_ROOT/rpc}"
 INTERNNAV_REPO="${PPA_EVAL_INTERNNAV_REPO:-$FJL_ROOT/InternNav}"

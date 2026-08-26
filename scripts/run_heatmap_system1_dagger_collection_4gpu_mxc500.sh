@@ -20,7 +20,7 @@ umask 077
 readonly FIXED_SYSTEM_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/maca-3.3.0/bin:/opt/maca-3.3.0/ompi/bin:/opt/mxdriver/bin"
 export PATH="$FIXED_SYSTEM_PATH"
 
-readonly ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+readonly ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 readonly REPO_ROOT="${ALLOWED_ROOT}/HeatmapVLN"
 readonly PYTHON="${ALLOWED_ROOT}/envs/qwen25/bin/python"
 readonly SHARD_BUILDER="${REPO_ROOT}/scripts/tools/build_r2r_train_dagger_shards.py"

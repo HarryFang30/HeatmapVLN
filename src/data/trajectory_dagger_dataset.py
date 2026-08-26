@@ -26,7 +26,7 @@ from torch.utils.data import Dataset, Sampler
 from .trajectory_utils import compute_history_rel_poses
 
 
-FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 COLLECTION_SCHEMA = "heatmapvln-trajectory-dagger-collection-v1"
 COMMIT_SCHEMA = "heatmapvln-trajectory-dagger-episode-commit-v1"
 SAMPLE_SCHEMA = "heatmapvln-trajectory-dagger-sample-v1"

@@ -57,7 +57,7 @@ FINE_PREFIX = "heatmap_vln.fine."
 EXCLUDED_COARSE_PREFIX = "heatmap_vln.coarse.proj_history."
 
 # Audited on
-# /mnt/afs/lixiaoou/intern/fjl/model/output/run_20260519_232017/
+# /mnt/afs/liwenhao/agent/370910109/model/output/run_20260519_232017/
 # checkpoints/latest.pth.  A different source must receive a new policy/version.
 EXPECTED_SOURCE_COUNTS = {
     "lora": 224,

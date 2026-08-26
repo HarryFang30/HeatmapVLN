@@ -41,7 +41,7 @@ echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} WORLD_SIZE=${WORLD_S
 # ---------------------------------------------------------------------------
 # Conda environment
 # ---------------------------------------------------------------------------
-QWEN25_ENV="/mnt/afs/lixiaoou/intern/fjl/envs/qwen25"
+QWEN25_ENV="/mnt/afs/liwenhao/agent/370910109/envs/qwen25"
 
 activate_qwen25_via_path() {
   if [[ ! -x "${QWEN25_ENV}/bin/python" ]]; then
@@ -60,8 +60,8 @@ if [[ -n "${CONDA_INIT_SH:-}" && -f "${CONDA_INIT_SH}" ]]; then
   _CONDA_SH="${CONDA_INIT_SH}"
 elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
   _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
-elif [[ -f "/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh" ]]; then
-  _CONDA_SH="/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh"
+elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
+  _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
   _CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
 fi
@@ -83,16 +83,16 @@ fi
 # ---------------------------------------------------------------------------
 # Cluster paths and tunables
 # ---------------------------------------------------------------------------
-export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
+export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
-export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
+export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data}"
 
 export STAGE3_CONFIG="${STAGE3_CONFIG:-configs/train_stage3_pano_system1_h1024_8gpu.yaml}"
-export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
-export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth}"
-export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
-export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
-export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/lixiaoou/intern/fjl/tmp}"
+export STAGE3_BASE_CKPT="${STAGE3_BASE_CKPT:-/mnt/afs/liwenhao/agent/370910109/model/output_stage1_s2_full_11000_rank32_alllayer_from_heatmap/run_20260701_212615/checkpoints/epoch_005.pth}"
+export STAGE3_ADAPTER_CKPT="${STAGE3_ADAPTER_CKPT:-/mnt/afs/liwenhao/agent/370910109/model/output_stage2_adapter_full_11000_alllora_h1024/latest.pth}"
+export STAGE3_OUT_DIR="${STAGE3_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
+export STAGE3_TB_DIR="${STAGE3_TB_DIR:-/mnt/afs/liwenhao/agent/370910109/tensorlog/heatmapvln_stage3_pano_system1_full_11000_alllora_h1024_internnavcoords}"
+export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/liwenhao/agent/370910109/tmp}"
 
 export GPU_DEVICES="${GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"

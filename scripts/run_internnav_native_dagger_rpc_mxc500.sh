@@ -11,7 +11,7 @@ unset BASH_ENV ENV
 readonly FIXED_SYSTEM_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/maca-3.3.0/bin:/opt/maca-3.3.0/ompi/bin:/opt/mxdriver/bin"
 export PATH="$FIXED_SYSTEM_PATH"
 
-readonly ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
+readonly ALLOWED_ROOT="/mnt/afs/liwenhao/agent/370910109"
 readonly EXPECTED_MODEL_MANIFEST_SHA256="f37a6df2e0703e38c34ccdba89c861bb8490ad3a36201bc1ec24a7509bf56581"
 readonly EXPECTED_RUNTIME_MANIFEST_SHA256="99844c9592b40c6756a7b1fcf124e3fe2d0db15236abdf965b4f4588cb3d1eef"
 readonly EXPECTED_PLAN_MANIFEST_SHA256="db1821a78cac9f5df77d6b0d19a1ad49c2beaf82a1e5936e7373c1394a9e9fcd"
@@ -332,11 +332,11 @@ closure = {
     },
     "internnav_runtime_sources": manifest_rows(
         runtime_manifest,
-        "/mnt/afs/lixiaoou/intern/fjl/InternNav/",
+        "/mnt/afs/liwenhao/agent/370910109/InternNav/",
     ),
     "rpc_runtime_sources": manifest_rows(
         runtime_manifest,
-        "/mnt/afs/lixiaoou/intern/fjl/rpc/src/vla_rpc/",
+        "/mnt/afs/liwenhao/agent/370910109/rpc/src/vla_rpc/",
     ),
     "harness_sources": [
         {"path": original_server, "sha256": original_server_sha},

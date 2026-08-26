@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/mnt/afs/lixiaoou/intern/fjl
+ROOT=/mnt/afs/liwenhao/agent/370910109
 REPO=$ROOT/HeatmapVLN
 AMB3R_REPO=$ROOT/amb3r
 PY=$ROOT/envs/qwen25/bin/python

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-FJL_ROOT=/mnt/afs/lixiaoou/intern/fjl
+FJL_ROOT=/mnt/afs/liwenhao/agent/370910109
 REPO="$FJL_ROOT/HeatmapVLN"
 MODEL_ROOT="$FJL_ROOT/model/candidate_continuation_v1"
 LAUNCHER="$REPO/scripts/run_candidate_continuation_8gpu_mxc500.sh"

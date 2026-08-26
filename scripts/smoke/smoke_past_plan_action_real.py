@@ -21,32 +21,32 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-REPO_ROOT_DEFAULT = Path("/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN")
+REPO_ROOT_DEFAULT = Path("/mnt/afs/liwenhao/agent/370910109/HeatmapVLN")
 CONFIG_DEFAULT = (
     Path(__file__).resolve().parents[2]
     / "configs/ppa_stage2_real_one_batch.yaml"
 )
 CHECKPOINT_DEFAULT = Path(
-    "/mnt/afs/lixiaoou/intern/fjl/"
+    "/mnt/afs/liwenhao/agent/370910109/"
     "model/output_heatmap_internnav_single_view_v1_4gpu/"
     "runs/run_20260803_143402/checkpoints/best.pth"
 )
-DATASET_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data")
+DATASET_ROOT = Path("/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data")
 EXACT_CLIP = DATASET_ROOT / "train/17DRP5sb8fy/clip_004345"
 EXACT_CURRENT_T = 19
 EXACT_SAMPLE_ID = "train/17DRP5sb8fy/clip_004345@000019"
 EXACT_PIXEL_GOAL = [189, 303]
 EXACT_GOAL_LEN = 13
 CACHE_ROOT = Path(
-    "/mnt/afs/lixiaoou/intern/fjl/.codex_tmp/"
+    "/mnt/afs/liwenhao/agent/370910109/.codex_tmp/"
     "ppa_r2r_cache_20260813/cache"
 )
 REPORT_DEFAULT = Path(
-    "/mnt/afs/lixiaoou/intern/fjl/.codex_tmp/"
+    "/mnt/afs/liwenhao/agent/370910109/.codex_tmp/"
     "ppa_real_smoke_20260813/report.json"
 )
 VISUALIZATION_DEFAULT = Path(
-    "/mnt/afs/lixiaoou/intern/fjl/.codex_tmp/"
+    "/mnt/afs/liwenhao/agent/370910109/.codex_tmp/"
     "ppa_real_smoke_20260813/future_heatmap_strip.png"
 )
 

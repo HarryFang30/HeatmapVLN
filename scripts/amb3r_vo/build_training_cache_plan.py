@@ -160,7 +160,7 @@ def main() -> int:
     parser.add_argument("--map-every", type=int, default=8)
     parser.add_argument("--max-clips-per-split", type=int, default=0)
     parser.add_argument(
-        "--allowed-root", default="/mnt/afs/lixiaoou/intern/fjl"
+        "--allowed-root", default="/mnt/afs/liwenhao/agent/370910109"
     )
     args = parser.parse_args()
 

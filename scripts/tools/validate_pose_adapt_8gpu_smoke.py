@@ -15,7 +15,7 @@ def main() -> int:
     parser.add_argument("--preflight-report", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--world-size", type=int, default=8)
-    parser.add_argument("--allowed-root", default="/mnt/afs/lixiaoou/intern/fjl")
+    parser.add_argument("--allowed-root", default="/mnt/afs/liwenhao/agent/370910109")
     args = parser.parse_args()
     if args.world_size < 1:
         raise ValueError("--world-size must be positive")

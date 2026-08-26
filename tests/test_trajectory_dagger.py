@@ -18,7 +18,7 @@ from PIL import Image
 from scripts.evaluation import trajectory_dagger as td
 
 
-ALLOWED_TMP_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl/tmp")
+ALLOWED_TMP_ROOT = Path("/mnt/afs/liwenhao/agent/370910109/tmp")
 CONTRACT = {
     "dataset": "r2r",
     "split": "train",

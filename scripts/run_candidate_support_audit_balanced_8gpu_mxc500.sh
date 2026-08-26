@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-FJL_ROOT=/mnt/afs/lixiaoou/intern/fjl
+FJL_ROOT=/mnt/afs/liwenhao/agent/370910109
 REPO="$FJL_ROOT/HeatmapVLN"
 
 export AUDIT_DATASET_SPLIT=train

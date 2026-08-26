@@ -34,7 +34,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-FJL_ROOT = Path(os.environ.get("FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+FJL_ROOT = Path(os.environ.get("FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 RPC_SRC = Path(os.environ.get("RPC_ROOT", str(FJL_ROOT / "rpc"))) / "src"
 if RPC_SRC.is_dir() and str(RPC_SRC) not in sys.path:
     sys.path.insert(0, str(RPC_SRC))

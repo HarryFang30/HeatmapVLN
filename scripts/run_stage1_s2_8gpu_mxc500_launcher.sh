@@ -8,7 +8,7 @@
 #   WORLD_SIZE（机器数）、RANK（本机序号 0..WORLD_SIZE-1），且需自行改用
 #   torchrun 的 --nnodes / --node_rank（当前仓库 scripts 仍为单机 torchrun）。
 #
-# Conda 环境固定为：conda activate /mnt/afs/lixiaoou/intern/fjl/envs/qwen25
+# Conda 环境固定为：conda activate /mnt/afs/liwenhao/agent/370910109/envs/qwen25
 # 若非交互 shell 里没有 conda 命令，请先 source conda.sh（见下方 CONDA_INIT_SH）
 # 或根据实际情况修改「路径默认值」块中的数据/模型路径。
 
@@ -43,11 +43,11 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} WORLD_SIZE=${WORLD_SIZE} RANK=${RANK}"
 
 # ---------------------------------------------------------------------------
-# Conda：激活环境固定为 /mnt/afs/lixiaoou/intern/fjl/envs/qwen25
+# Conda：激活环境固定为 /mnt/afs/liwenhao/agent/370910109/envs/qwen25
 # 集群镜像未必暴露 conda shell hook；若 qwen25 路径存在，则直接通过
 # PATH 激活，和 Stage2/Stage3 launcher 保持一致。
 # ---------------------------------------------------------------------------
-QWEN25_ENV="/mnt/afs/lixiaoou/intern/fjl/envs/qwen25"
+QWEN25_ENV="/mnt/afs/liwenhao/agent/370910109/envs/qwen25"
 
 activate_qwen25_via_path() {
   if [[ ! -x "${QWEN25_ENV}/bin/python" ]]; then
@@ -66,8 +66,8 @@ if [[ -n "${CONDA_INIT_SH:-}" && -f "${CONDA_INIT_SH}" ]]; then
   _CONDA_SH="${CONDA_INIT_SH}"
 elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
   _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
-elif [[ -f "/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh" ]]; then
-  _CONDA_SH="/mnt/afs/lixiaoou/intern/fjl/miniconda3/etc/profile.d/conda.sh"
+elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
+  _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
   _CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
 fi
@@ -90,14 +90,14 @@ fi
 # ---------------------------------------------------------------------------
 # 路径默认值（请按你机器上实际位置修改）
 # ---------------------------------------------------------------------------
-export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/lixiaoou/intern/fjl/InternNav-Model}"
+export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-/mnt/afs/liwenhao/agent/370910109/InternNav-Model}"
 export INTERNNAV_BACKBONE="${INTERNNAV_BACKBONE:-$INTERNNAV_MODEL_PATH}"
-export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/lixiaoou/intern/fjl/r2r_paronamic_data}"
+export PANORAMIC_DATA_ROOT="${PANORAMIC_DATA_ROOT:-/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data}"
 
-export STAGE1_S2_LOAD_WEIGHTS="${STAGE1_S2_LOAD_WEIGHTS:-/mnt/afs/lixiaoou/intern/fjl/model/output/run_20260519_232017/checkpoints/latest.pth}"
-export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/lixiaoou/intern/fjl/model/output_stage1_s2}"
-export STAGE1_S2_TB_DIR="${STAGE1_S2_TB_DIR:-/mnt/afs/lixiaoou/intern/fjl/tensorlog/heatmapvln_stage1_s2_8gpu}"
-export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/lixiaoou/intern/fjl/tmp}"
+export STAGE1_S2_LOAD_WEIGHTS="${STAGE1_S2_LOAD_WEIGHTS:-/mnt/afs/liwenhao/agent/370910109/model/output/run_20260519_232017/checkpoints/latest.pth}"
+export STAGE1_S2_OUT_DIR="${STAGE1_S2_OUT_DIR:-/mnt/afs/liwenhao/agent/370910109/model/output_stage1_s2}"
+export STAGE1_S2_TB_DIR="${STAGE1_S2_TB_DIR:-/mnt/afs/liwenhao/agent/370910109/tensorlog/heatmapvln_stage1_s2_8gpu}"
+export STAGE_TMP_DIR="${STAGE_TMP_DIR:-/mnt/afs/liwenhao/agent/370910109/tmp}"
 
 mkdir -p "$REPO_ROOT/logs" "${STAGE1_S2_OUT_DIR}" "${STAGE1_S2_TB_DIR}" "${STAGE_TMP_DIR}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/stage1_s2_8gpu_mxc500.log}"

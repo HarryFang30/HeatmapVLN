@@ -1,14 +1,14 @@
 # 集群 Habitat/GLX 无头运行环境交接：Xvfb、XKB bundle 与 llvmpipe
 
 更新日期：2026-08-03
-适用环境：`finn_cci_c500` 开发机及其集群任务容器，`habitat_sim 0.1.7` 的 GLX 构建，`/mnt/afs/lixiaoou/intern/fjl/envs/vlnce`
+适用环境：`finn_cci_c500` 开发机及其集群任务容器，`habitat_sim 0.1.7` 的 GLX 构建，`/mnt/afs/liwenhao/agent/370910109/envs/vlnce`
 
 ## 结论先行
 
 当前集群上已经跑通并完成 1839 个 R2R `val_unseen` episode 的稳定方案是：
 
 1. 不依赖作业镜像中的系统 X11/OpenGL 包，固定使用：
-   `/mnt/afs/lixiaoou/intern/fjl/tools/x11_headless_bundle_ubuntu22_20260801_v4`
+   `/mnt/afs/liwenhao/agent/370910109/tools/x11_headless_bundle_ubuntu22_20260801_v4`
 2. 每个 Habitat client 使用一个独立 Xvfb display。
 3. 使用 bundle 内的 Mesa GLX，并显式强制 `llvmpipe` 软件渲染。
 4. 不强制 NVIDIA GLX；必须清掉可能继承的 `__GLX_VENDOR_LIBRARY_NAME` 和 `__EGL_VENDOR_LIBRARY_FILENAMES`。
@@ -22,7 +22,7 @@
 稳定 bundle：
 
 ```text
-/mnt/afs/lixiaoou/intern/fjl/tools/x11_headless_bundle_ubuntu22_20260801_v4/
+/mnt/afs/liwenhao/agent/370910109/tools/x11_headless_bundle_ubuntu22_20260801_v4/
 ├── bin/Xvfb
 ├── bin/xdpyinfo
 ├── bin/glxinfo
@@ -50,7 +50,7 @@ XKB data files  294
 完整、已验证的 8 卡启动实现：
 
 ```text
-/mnt/afs/lixiaoou/intern/fjl/evaluation_plans/
+/mnt/afs/liwenhao/agent/370910109/evaluation_plans/
   stage3_priorfix_r2r_val_unseen_epoch2_8gpu_20260801/
   scripts/run_8gpu_rpc_eval.sh
 ```
@@ -58,7 +58,7 @@ XKB data files  294
 当前评测端针对 GLX/import 顺序的保护代码：
 
 ```text
-/mnt/afs/lixiaoou/intern/fjl/HeatmapVLN/scripts/evaluation/r2r_val_unseen.py
+/mnt/afs/liwenhao/agent/370910109/HeatmapVLN/scripts/evaluation/r2r_val_unseen.py
 ```
 
 ## 实际遇到的坑与根因
@@ -76,7 +76,7 @@ Missing command: Xvfb
 解决办法是使用固定 bundle 中的绝对路径，而不是 `command -v Xvfb` 找系统命令：
 
 ```bash
-X11_BUNDLE=/mnt/afs/lixiaoou/intern/fjl/tools/x11_headless_bundle_ubuntu22_20260801_v4
+X11_BUNDLE=/mnt/afs/liwenhao/agent/370910109/tools/x11_headless_bundle_ubuntu22_20260801_v4
 XVFB_BIN="$X11_BUNDLE/bin/Xvfb"
 XDPYINFO_BIN="$X11_BUNDLE/bin/xdpyinfo"
 GLXINFO_BIN="$X11_BUNDLE/bin/glxinfo"
@@ -117,7 +117,7 @@ Failed to activate virtual core keyboard: 2
 对应证据：
 
 ```text
-/mnt/afs/lixiaoou/intern/fjl/model/
+/mnt/afs/liwenhao/agent/370910109/model/
   eval_stage3_r2r_val_unseen_after_scale_stage3_r2r_epoch2_8gpu_rpcv2_x11bundle/
   runtime/20260801_141627_job1/logs/xvfb_0.log
 ```
@@ -211,7 +211,7 @@ GPU 仍用于 8 个模型 RPC server；Habitat 画面渲染本身走 CPU llvmpip
 ```bash
 export EVAL_DISPLAY_BASE=280
 export EVAL_RPC_PORT_BASE=51400
-export EVAL_OUTPUT_ROOT=/mnt/afs/lixiaoou/intern/fjl/model/<unique_eval_name>
+export EVAL_OUTPUT_ROOT=/mnt/afs/liwenhao/agent/370910109/model/<unique_eval_name>
 ```
 
 ### 7. X11 bundle 不应污染模型 server 的运行环境
@@ -237,7 +237,7 @@ export LD_LIBRARY_PATH="$X11_BUNDLE/lib:$LD_LIBRARY_PATH"
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-FJL_ROOT=/mnt/afs/lixiaoou/intern/fjl
+FJL_ROOT=/mnt/afs/liwenhao/agent/370910109
 X11_BUNDLE="$FJL_ROOT/tools/x11_headless_bundle_ubuntu22_20260801_v4"
 XVFB_BIN="$X11_BUNDLE/bin/Xvfb"
 XDPYINFO_BIN="$X11_BUNDLE/bin/xdpyinfo"
@@ -371,7 +371,7 @@ env -u __GLX_VENDOR_LIBRARY_NAME -u __EGL_VENDOR_LIBRARY_FILENAMES \
   HEATMAPVLN_PREINIT_EMPTY_GL=1 \
   HABITAT_GL_GPU_ID=0 \
   OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THREADS=1 \
-  /mnt/afs/lixiaoou/intern/fjl/envs/vlnce/bin/python -u <collector.py> <args...>
+  /mnt/afs/liwenhao/agent/370910109/envs/vlnce/bin/python -u <collector.py> <args...>
 ```
 
 最后一条命令中的 `<collector.py> <args...>` 是占位符，不应原样执行。完整任务请复制上面列出的已验证 launcher，再替换数据、cohort、RPC server 和输出路径。
@@ -381,7 +381,7 @@ env -u __GLX_VENDOR_LIBRARY_NAME -u __EGL_VENDOR_LIBRARY_FILENAMES \
 ### 1. bundle 完整性
 
 ```bash
-X11_BUNDLE=/mnt/afs/lixiaoou/intern/fjl/tools/x11_headless_bundle_ubuntu22_20260801_v4
+X11_BUNDLE=/mnt/afs/liwenhao/agent/370910109/tools/x11_headless_bundle_ubuntu22_20260801_v4
 test "$(uname -m)" = x86_64
 getconf GNU_LIBC_VERSION
 sha256sum -c "$X11_BUNDLE/manifest.sha256"
@@ -410,7 +410,7 @@ env -u __GLX_VENDOR_LIBRARY_NAME -u __EGL_VENDOR_LIBRARY_FILENAMES \
   LD_LIBRARY_PATH="$X11_BUNDLE/mesa_lib:${LD_LIBRARY_PATH:-}" \
   LIBGL_DRIVERS_PATH="$X11_BUNDLE/dri" \
   LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=swrast \
-  /mnt/afs/lixiaoou/intern/fjl/envs/vlnce/bin/python -c \
+  /mnt/afs/liwenhao/agent/370910109/envs/vlnce/bin/python -c \
   'import magnum, habitat_sim; print("magnum/habitat_sim import OK")'
 ```
 
@@ -421,7 +421,7 @@ env -u __GLX_VENDOR_LIBRARY_NAME -u __EGL_VENDOR_LIBRARY_FILENAMES \
 v4 + 独立 Xvfb + llvmpipe 已经完成一轮 8 shard 全量 R2R `val_unseen` 评测：
 
 ```text
-/mnt/afs/lixiaoou/intern/fjl/model/
+/mnt/afs/liwenhao/agent/370910109/model/
   eval_stage3_priorfix_r2r_val_unseen_epoch2_8gpu_rpcv2_x11bundle_v4/
   merged/manifest.json
 ```

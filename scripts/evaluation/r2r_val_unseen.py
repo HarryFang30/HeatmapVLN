@@ -147,7 +147,7 @@ if not hasattr(np, "bool"):
 import torch as _torch_preload  # noqa: F401
 
 
-LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/lixiaoou/intern/fjl"))
+LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 LOCAL_VLNCE_DATA_ROOT = Path(
     os.environ.get("HEATMAPVLN_VLNCE_DATA_ROOT", str(LOCAL_FJL_ROOT / "habitat" / "VLN-CE" / "data"))
 )
@@ -996,7 +996,7 @@ def _resolve_eval_paths(args, split: str = "val_unseen") -> None:
         print(f"Verified first scene asset: {Path(args.scenes_dir) / first_scene_id}")
 
 
-_HARD_ALLOWED_FJL_ROOT = Path("/mnt/afs/lixiaoou/intern/fjl")
+_HARD_ALLOWED_FJL_ROOT = Path("/mnt/afs/liwenhao/agent/370910109")
 
 
 def _require_path_under_fjl(value: str, *, label: str, base: Path | None = None) -> Path:
@@ -5798,7 +5798,7 @@ def main():
     parser.add_argument(
         "--trajectory_dagger_root",
         type=str,
-        default="/mnt/afs/lixiaoou/intern/fjl/data/heatmap_system1_dagger_v1",
+        default="/mnt/afs/liwenhao/agent/370910109/data/heatmap_system1_dagger_v1",
         help="Capacity-guarded collection root; no expert data or heatmaps are copied.",
     )
     parser.add_argument("--trajectory_dagger_round", type=int, default=0)

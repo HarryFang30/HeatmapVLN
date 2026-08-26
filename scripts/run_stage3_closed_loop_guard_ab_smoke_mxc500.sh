@@ -5,7 +5,7 @@ set -Eeuo pipefail
 REPO_ROOT="${HEATMAPVLN_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_ROOT"
 
-export FJL_ROOT="${FJL_ROOT:-/mnt/afs/lixiaoou/intern/fjl}"
+export FJL_ROOT="${FJL_ROOT:-/mnt/afs/liwenhao/agent/370910109}"
 export STAGE3_EVAL_MODEL_GPU="${STAGE3_EVAL_MODEL_GPU:-7}"
 export STAGE3_EVAL_RPC_PORT="${STAGE3_EVAL_RPC_PORT:-50067}"
 export STAGE3_EVAL_DISPLAY="${STAGE3_EVAL_DISPLAY:-localhost:200.0}"
