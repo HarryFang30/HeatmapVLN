@@ -340,34 +340,25 @@ class InternNavHeatmapControlCollator:
         # System-2 history.  History supervision, however, belongs to the
         # original fixed-K heatmap slots.  Restore both target tensors from
         # ``samples`` before the native collator clears its private copies.
-        # This keeps Past loss aligned with history_valid_mask and prevents a
-        # PPA Stage-1/2 batch from silently losing History supervision.
-        if not all("heatmap" in sample for sample in samples):
-            raise ValueError(
-                "Past->Plan->Action joint batches require fixed-K heatmap targets"
+        # This keeps Past loss aligned with history_valid_mask.  Batches that
+        # carry no fixed-K targets simply pass through without them.
+        if all("heatmap" in sample for sample in samples):
+            result["heatmap"] = self.native_collator._stack_padded_first_dim(
+                samples, "heatmap"
             )
-        if not all("gt_visibility" in sample for sample in samples):
-            raise ValueError(
-                "Past->Plan->Action joint batches require fixed-K visibility targets"
+        if all("gt_visibility" in sample for sample in samples):
+            result["gt_visibility"] = (
+                self.native_collator._stack_padded_first_dim(
+                    samples, "gt_visibility"
+                )
             )
-        result["heatmap"] = self.native_collator._stack_padded_first_dim(
-            samples, "heatmap"
-        )
-        result["gt_visibility"] = (
-            self.native_collator._stack_padded_first_dim(
-                samples, "gt_visibility"
-            )
-        )
         result["heatmap_single_view_inputs"] = heatmap_inputs
         result["heatmap_single_view_num_histories"] = num_histories
         result["heatmap_control_history_mask"] = result["history_valid_mask"]
         result["native_system2_num_histories"] = native_num_histories
         identities = [sample.get("sample_identity") for sample in samples]
-        if any(identity is None or str(identity) == "" for identity in identities):
-            raise ValueError(
-                "Past->Plan->Action joint batches require stable sample_identity"
-            )
-        result["sample_identity"] = [str(identity) for identity in identities]
+        if all(identity is not None and str(identity) != "" for identity in identities):
+            result["sample_identity"] = [str(identity) for identity in identities]
         if self.required_history_pose_provider is not None:
             result["history_pose_provider"] = [
                 self.required_history_pose_provider for _ in samples

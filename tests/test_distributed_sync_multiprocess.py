@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -15,8 +16,11 @@ def _rank_local_missing_grad_worker(
     world_size: int,
     rendezvous_file: str,
 ) -> None:
-    # The Codex macOS runner has no resolvable host name; bind Gloo explicitly.
-    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    # macOS runners have no resolvable host name; bind Gloo to loopback
+    # explicitly.  The interface is lo0 on macOS and lo on Linux.
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
     dist.init_process_group(
         backend="gloo",
         init_method=f"file://{rendezvous_file}",

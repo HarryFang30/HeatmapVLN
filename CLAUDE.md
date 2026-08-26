@@ -61,16 +61,13 @@ ssh finn_cci_c500 'bash -lc "cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN && 
 
 ## 已知失败的测试（与你的改动无关）
 
-以下 7 个失败 + 1 个收集错误在干净的 `main` 上就存在，基线是 **980 passed**。
-看到它们不用排查，也不要试图「顺手修好」——先确认不是你引入的即可：
+基线是 **987 passed**，只剩 1 个收集错误：
 
-- `test_distributed_sync_multiprocess.py::test_rank_local_missing_gradients_keep_collectives_and_updates_aligned`
-- `test_internnav_heatmap_control_collator.py`（3 个）
-- `test_target_grounded_identity.py`（3 个）
-- `test_stage3_dataloader_order.py` — 收集错误：从 `scripts.train` 导入
-  `_dataloader_in_order_kwargs`，但该函数已不存在
+- `test_stage3_dataloader_order.py` — 从 `scripts.train` 导入 `_dataloader_in_order_kwargs`，
+  但该 helper 从未存在。`in_order` 功能本身是好的，逻辑内联在 `scripts/train.py` 里；
+  测试期待的是一个没被抽出来的函数。修它需要做重构，不要顺手改。
 
-判断是否为回归的办法：把干净的 HEAD 导出到临时目录单独跑，不要动真实仓库。
+判断某个失败是否为你引入的回归：把干净的 HEAD 导出到临时目录单独跑，不要动真实仓库。
 
 ```bash
 git -c safe.directory=$R -C $R archive HEAD | tar -x -C /tmp/hv-head

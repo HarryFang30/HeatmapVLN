@@ -373,6 +373,9 @@ def _pipeline_stub(*, include_logits: bool = True):
     pipeline.nextdit_action_head = None
     pipeline.latent_queries = None
     pipeline.llm_projector = nn.Identity()
+    pipeline._heatmap_control_enabled = False
+    pipeline.past_plan_action = None
+    pipeline.pano_latent_adapter = None
     return pipeline
 
 
@@ -422,14 +425,14 @@ def test_pipeline_raw_logit_opt_in_fails_if_decoder_does_not_supply_logits():
 def test_pipeline_raw_logit_opt_in_requires_an_active_heatmap_path():
     pipeline = _pipeline_stub()
 
-    with pytest.raises(ValueError, match="active panoramic heatmap path"):
+    with pytest.raises(ValueError, match="active heatmap path"):
         pipeline(
             return_heatmap_logits=True,
             return_heatmaps=False,
             **_pipeline_inputs(),
         )
 
-    with pytest.raises(ValueError, match="active panoramic heatmap path"):
+    with pytest.raises(ValueError, match="active heatmap path"):
         pipeline(
             video_frames=torch.zeros(1, 2, 3, 2, 2),
             return_actions=False,
