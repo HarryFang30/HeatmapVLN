@@ -47,6 +47,28 @@ manifest.sha256 sha256 c9d05c514cc1d93ad676f4ef5fe6447be9d9d7a9dc6a26af621f83e29
 XKB data files  294
 ```
 
+### 2026-08-27 迁移修复（上面两个哈希已失效）
+
+`/mnt/afs/lixiaoou` 旧根消失后，bundle 有三处随迁移断裂并已修复：
+
+- `bin/xkbcomp` wrapper 原来写死旧根绝对路径（Xvfb 启动时报
+  `Failed to activate virtual core keyboard`），已改为按 `dirname $0` 自定位，
+  以后搬家不会再断。
+- `manifest.sha256` 的 836 条目与 `manifest.json` 内的路径已整体改写到新根，
+  并刷新了 `bin/xkbcomp` 与 `manifest.json` 两行哈希；`sha256sum -c` 全量通过。
+  修复前的原件保留为 `*.bak_pre_migration_fix_20260827`。
+- 顺带修复的 vlnce 环境迁移残留：`site-packages` 里 `habitat-sim.pth`、
+  `magnum-bindings.pth`、`__editable___habitat_0_1_7_finder.py` 的旧根路径，
+  以及 egg 内指向旧根的 `habitat_sim_bindings*.so` 符号链接（曾导致
+  `import habitat` 失败）。
+
+修复后的清单摘要：
+
+```text
+manifest.json   sha256 6e58262aab318864a672b66d8fe9e582b156519c907e63f2f366a166d06940e5
+manifest.sha256 sha256 84779cff58b0bf45df81155b3b9de2e5da02429ec1647ee641669cd435f3d815
+```
+
 完整、已验证的 8 卡启动实现：
 
 ```text

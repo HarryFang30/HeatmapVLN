@@ -19,11 +19,41 @@ SR collapsed 62.5% → 18.1% (OS 70.6% → 20.4%). v2 changes, all in
   by real sampled rollouts (bridged vs native under shared noise, exact
   deployment post-processing), not by teacher-forced velocity MSE.
 
-## Prerequisite 1: re-collected expert data
+## Prerequisite 1: re-collect the R2R panoramic expert data
 
-The original `r2r_paronamic_data` was deleted. Point `PPA_DATA_ROOT` at the
-re-collected direct scene root (`<root>/<scene>/clip_*`). The dataset
-reproduces the deterministic scene-level MD5 train/validation split.
+The original `r2r_paronamic_data` was deleted. Re-collect with the fixed
+reset-driven collector (`--depth-directions front front_down`) through
+`run_collect_panoramic_mxc500.sh` — deployed in `<root>/habitat/VLN-CE`,
+canonical copy in `scripts/run_collect_panoramic_mxc500.sh`. It starts one
+bundle Xvfb + llvmpipe display per worker (no NVIDIA EGL on this node) and
+shards episodes by stable hash with disjoint clip-id blocks, so all workers
+share one output root and re-running the same command resumes.
+
+Audit 20 clips first (minutes), inside tmux:
+
+```bash
+cd /mnt/afs/liwenhao/agent/370910109/habitat/VLN-CE
+./run_collect_panoramic_mxc500.sh \
+  /mnt/afs/liwenhao/agent/370910109/r2r_panoramic_audit_v2 train 20 4 230
+```
+
+Verify every clip has `depth_front_down` in its first chunk and that
+`meta.json` scene/episode ids come from the reset-driven episode (the audit
+snippet in `docs/server_habitat_panoramic_recollect_plan.md` §4, pointed at
+this output). Then run the formal collection (measured ~15-20 s/clip/worker,
+so 5000 clips on 8 workers is an afternoon):
+
+```bash
+cd /mnt/afs/liwenhao/agent/370910109/habitat/VLN-CE
+./run_collect_panoramic_mxc500.sh \
+  /mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2 train 5000 8 230
+```
+
+Notes: a worker stops early once Habitat's episode iterator cycles through
+its whole residue class, so per-worker counts can land slightly under target
+on full-split runs; the launcher prints the final clip count. The training
+dataset reproduces the deterministic scene-level MD5 train/val split from the
+direct scene root (`<output>/train/<scene>/clip_*`).
 
 ## Prerequisite 2: rebuild the AMB3R endpoint cache on the NEW data
 
@@ -34,7 +64,7 @@ so build a fresh cache (new directory, do not mix with v2-era entries):
 ```bash
 export PPA_REPO_ROOT=/mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 export PPA_ALLOWED_ROOT=/mnt/afs/liwenhao/agent/370910109
-export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train
+export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2/train
 export PPA_AMB3R_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/data/amb3r_endpoint_v3_full_r2r
 
 cd "$PPA_REPO_ROOT"
@@ -60,7 +90,7 @@ intentionally ignored. Optimizer/scheduler are fresh; never pass `--resume`.
 ```bash
 cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 
-export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_paronamic_data/train
+export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2/train
 export PPA_AMB3R_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/data/amb3r_endpoint_v3_full_r2r
 export INTERNNAV_MODEL_PATH=/mnt/afs/liwenhao/agent/370910109/InternNav-Model
 
