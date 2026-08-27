@@ -4,15 +4,44 @@
 
 ---
 
-## 1. 开发模式：本地编辑，远端执行
+## 1. 开发模式：本地编辑，开发机验证，集群任务走网站提交
 
-代码在**本地 Mac** 上编辑，在**沐曦 C500 集群节点**上执行（ssh 别名 `finn_cci_c500`）。
+代码在**本地 Mac** 上编辑；ssh 别名 `finn_cci_c500` 连的是**开发机**，不是集群
+计算节点。正式的训练/评测/采集任务在**网站上提交**，落到一个挂载 `/mnt/afs`
+共享存储的**空白容器**里执行。
 
 ```
-本地 Mac (编辑)  ──push──▶  GitHub  ──pull──▶  服务器 (跑训练/测试)
+本地 Mac (编辑) ──push──▶ GitHub ──pull──▶ 开发机 (测试/冒烟/看日志)
+                                              │
+                          网站提交 ──▶ 集群空白容器 (正式训练/评测/采集)
 ```
 
-一轮迭代：本地改 → `git commit`（钩子自动推送）→ 服务器 `git pull` → 跑。
+一轮迭代：本地改 → `git commit`（钩子自动推送）→ 开发机 `git pull` 验证 →
+把正式任务写成提交物交网站。
+
+### 1.1 网站提交物的形态
+
+一段 shell：`cd 工作区` + 一串 `export` + 一条 `bash scripts/xxx.sh`（或直接的
+python 命令）。形如：
+
+```bash
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+
+export PPA_DATA_ROOT=...
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+bash scripts/run_xxx_mxc500.sh
+```
+
+由此对脚本的硬约束（写新启动脚本时必须满足）：
+
+- **参数用环境变量传**，不要依赖交互输入；位置参数只留给开发机冒烟。
+- **容器是空白的**：只保证挂载 `/mnt/afs` 和 `/opt/maca-*`。不要假设
+  `/opt/conda`、tmux、已起的 Xvfb、任何交互态存在。conda 环境一律用绝对路径
+  的 `bin/python` 直接调，不要 `conda activate`。
+- **不要教用户对集群任务套 tmux** —— 网站任务本身就是常驻进程。tmux 只用于
+  确需在开发机上直跑的较长调试任务（这条 ssh 链路经中转，掉线杀裸进程）。
+- 所有路径写 `/mnt/afs` 绝对路径（脚本里已如此，见 §6）。
 
 **为什么不在服务器上跑 Claude Code。** 该节点出口在上海，`api.anthropic.com` 返回
 `forbidden / Request not allowed`（地域限制）。**不要尝试绕过它。** 同理，VS Code
@@ -29,7 +58,10 @@ Remote-SSH 里的 Claude 扩展跑在远端，一样不可用。
 
 ---
 
-## 2. 服务器环境
+## 2. 开发机与共享存储环境
+
+下表对开发机和网站提交的集群容器都成立：工作区在共享存储 `/mnt/afs` 上，
+两边看到的是同一份。
 
 | 项 | 值 |
 |---|---|
@@ -117,16 +149,25 @@ git -c safe.directory=$R -C $R ls-files --others --exclude-standard -z \
 ssh finn_cci_c500 'bash -lc "cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN && /mnt/afs/liwenhao/agent/370910109/envs/qwen25/bin/python -m pytest tests/ -q --continue-on-collection-errors"'
 ```
 
-全量约 2.5 分钟。长任务（训练、评测）**务必套 tmux** —— 这条链路经过中转，掉线会
-连带杀掉裸跑的进程。
+全量约 2.5 分钟，在开发机上直接跑。正式长任务（训练、评测、采集）**不在开发机
+上跑**，写成提交物走网站（见 §1.1）；只有确需在开发机上直跑的较长调试任务才套
+tmux —— 这条链路经过中转，掉线会连带杀掉裸跑的进程。
 
 ### 基线
 
-**987 passed / 1 skipped / 1 collection error。** 只有这一个已知错误：
+**1004 passed / 1 skipped / 1 collection error。** 只有这一个已知错误：
 
 - `test_stage3_dataloader_order.py` — 从 `scripts.train` 导入 `_dataloader_in_order_kwargs`，
   但这个 helper 从未存在。`in_order` 功能本身是好的，逻辑内联在 `scripts/train.py:1234`。
   测试期待的是一个没被抽出来的函数，**修它等于做重构，不要顺手改**。
+
+已知的环境性抖动（不算基线破坏，先看机器状态再怀疑代码）：
+
+- `test_trajectory_dagger.py::test_same_host_multiprocess_commits_share_one_locked_ledger`
+  在开发机高负载/冷 AFS 时偶发失败，签名是 `assert None == 0`（spawn 出的 8 个
+  子进程要从 AFS 重新 import 整条依赖链，30 秒 join 超时时子进程还活着）。冷缓存
+  时全量套件本身也会从 2.5 分钟膨胀到小时级。同理，**空白容器里的任务启动要几分
+  钟才见第一行日志，不要急着杀**。
 
 ### 判断一个失败是不是你引入的
 

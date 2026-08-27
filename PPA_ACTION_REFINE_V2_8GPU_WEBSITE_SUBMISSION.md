@@ -25,28 +25,42 @@ The original `r2r_paronamic_data` was deleted. Re-collect with the fixed
 reset-driven collector (`--depth-directions front front_down`) through
 `run_collect_panoramic_mxc500.sh` — deployed in `<root>/habitat/VLN-CE`,
 canonical copy in `scripts/run_collect_panoramic_mxc500.sh`. It starts one
-bundle Xvfb + llvmpipe display per worker (no NVIDIA EGL on this node) and
-shards episodes by stable hash with disjoint clip-id blocks, so all workers
-share one output root and re-running the same command resumes.
+bundle Xvfb + llvmpipe display per worker (no NVIDIA EGL on this cluster),
+shards episodes by stable hash with disjoint clip-id blocks so all workers
+share one output root, and re-running the same submission resumes.  The
+script is blank-container safe: parameters arrive as environment variables
+and the vlnce python is called by absolute path (no conda activation).
 
-Audit 20 clips first (minutes), inside tmux:
+Website submission — audit 20 clips first (finishes in minutes):
 
 ```bash
 cd /mnt/afs/liwenhao/agent/370910109/habitat/VLN-CE
-./run_collect_panoramic_mxc500.sh \
-  /mnt/afs/liwenhao/agent/370910109/r2r_panoramic_audit_v2 train 20 4 230
+
+export OUTPUT_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_panoramic_audit_v2
+export SPLIT=train
+export TOTAL_CLIPS=20
+export NUM_WORKERS=4
+export BASE_DISPLAY=230
+
+bash run_collect_panoramic_mxc500.sh
 ```
 
 Verify every clip has `depth_front_down` in its first chunk and that
 `meta.json` scene/episode ids come from the reset-driven episode (the audit
 snippet in `docs/server_habitat_panoramic_recollect_plan.md` §4, pointed at
-this output). Then run the formal collection (measured ~15-20 s/clip/worker,
-so 5000 clips on 8 workers is an afternoon):
+this output). Then submit the formal collection (measured ~15-20 s/clip per
+worker, so 5000 clips on 8 workers is an afternoon):
 
 ```bash
 cd /mnt/afs/liwenhao/agent/370910109/habitat/VLN-CE
-./run_collect_panoramic_mxc500.sh \
-  /mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2 train 5000 8 230
+
+export OUTPUT_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2
+export SPLIT=train
+export TOTAL_CLIPS=5000
+export NUM_WORKERS=8
+export BASE_DISPLAY=230
+
+bash run_collect_panoramic_mxc500.sh
 ```
 
 Notes: a worker stops early once Habitat's episode iterator cycles through

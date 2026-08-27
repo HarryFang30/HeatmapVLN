@@ -7,18 +7,24 @@ set -euo pipefail
 # Canonical copy lives in HeatmapVLN/scripts/; the deployed copy runs from
 # <root>/habitat/VLN-CE (python -m collect must import from that tree).
 #
-# No NVIDIA EGL exists on this node.  Rendering uses the certified headless
-# stack from the 8-GPU eval: per-worker Xvfb from the x11 bundle with Mesa
-# llvmpipe software GLX.  Workers shard episodes by stable hash
+# No NVIDIA EGL exists on this cluster.  Rendering uses the certified
+# headless stack from the 8-GPU eval: per-worker Xvfb from the x11 bundle
+# with Mesa llvmpipe software GLX.  Workers shard episodes by stable hash
 # (--episode-modulo/remainder) and own disjoint clip-id blocks, so they can
 # share one output root without collisions.  Re-running the same command
 # resumes: already-collected episodes are skipped per shard.
+#
+# Built for website cluster submission into a blank container that mounts
+# /mnt/afs: parameters arrive as environment variables (OUTPUT_ROOT, SPLIT,
+# TOTAL_CLIPS, NUM_WORKERS, BASE_DISPLAY), everything runs from absolute
+# /mnt/afs paths, and the vlnce python is invoked directly — no conda
+# activation, no tmux, no pre-existing displays assumed.  Positional
+# arguments override the environment for dev-machine smokes.
 # ============================================================
 
 ROOT="/mnt/afs/liwenhao/agent/370910109"
 PROJECT_DIR="${ROOT}/habitat/VLN-CE"
-CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
-CONDA_ENV="${ROOT}/envs/vlnce"
+VLNCE_PYTHON="${ROOT}/envs/vlnce/bin/python"
 X11_BUNDLE="${ROOT}/tools/x11_headless_bundle_ubuntu22_20260801_v4"
 XVFB_BIN="${X11_BUNDLE}/bin/Xvfb"
 XDPYINFO_BIN="${X11_BUNDLE}/bin/xdpyinfo"
@@ -27,11 +33,11 @@ X11_DRI_PATH="${X11_BUNDLE}/dri"
 X11_FONT_PATH="${X11_BUNDLE}/share/fonts/misc"
 X11_XKB_PATH="${X11_BUNDLE}/share/X11/xkb"
 
-OUTPUT="${1:-${ROOT}/r2r_panoramic_data_v2}"
-SPLIT="${2:-train}"
-TOTAL_CLIPS="${3:-5000}"
-NUM_WORKERS="${4:-8}"
-BASE_DISPLAY="${5:-230}"
+OUTPUT="${1:-${OUTPUT_ROOT:-${ROOT}/r2r_panoramic_data_v2}}"
+SPLIT="${2:-${SPLIT:-train}}"
+TOTAL_CLIPS="${3:-${TOTAL_CLIPS:-5000}}"
+NUM_WORKERS="${4:-${NUM_WORKERS:-8}}"
+BASE_DISPLAY="${5:-${BASE_DISPLAY:-230}}"
 
 CLIP_ID_BLOCK=100000
 LP_THREADS="${COLLECT_LP_NUM_THREADS:-8}"
@@ -55,9 +61,9 @@ fi
 if [[ "$NUM_WORKERS" -gt "$TOTAL_CLIPS" ]]; then
   NUM_WORKERS="$TOTAL_CLIPS"
 fi
-for path in "$PROJECT_DIR/collect/panoramic/collector.py" "$CONDA_SH" \
+for path in "$PROJECT_DIR/collect/panoramic/collector.py" \
     "$XVFB_BIN" "$XDPYINFO_BIN" "$GLXINFO_BIN" "$X11_DRI_PATH/swrast_dri.so" \
-    "$X11_XKB_PATH" "$X11_FONT_PATH" "${CONDA_ENV}/bin/python"; do
+    "$X11_XKB_PATH" "$X11_FONT_PATH" "$VLNCE_PYTHON"; do
   if [[ ! -e "$path" ]]; then
     echo "[ERROR] Missing required path: $path" >&2
     exit 1
@@ -172,14 +178,9 @@ done
 # ------------------------------------------------------------
 # 2. Sharded collection workers.
 # ------------------------------------------------------------
-# shellcheck source=/dev/null
-source "$CONDA_SH"
-conda activate "$CONDA_ENV"
-if [[ "$(command -v python)" != "${CONDA_ENV}/bin/python" ]]; then
-  echo "[ERROR] wrong Python after conda activate: $(command -v python)" >&2
-  exit 1
-fi
-echo "[INFO] Python: $(command -v python) ($(python --version 2>&1))"
+# Blank cluster containers only mount /mnt/afs: call the env python by
+# absolute path instead of depending on /opt/conda + activation.
+echo "[INFO] Python: $VLNCE_PYTHON ($("$VLNCE_PYTHON" --version 2>&1))"
 
 BASE_COUNT=$((TOTAL_CLIPS / NUM_WORKERS))
 REMAINDER=$((TOTAL_CLIPS % NUM_WORKERS))
@@ -206,7 +207,7 @@ run_worker() {
     unset WAYLAND_DISPLAY EGL_PLATFORM __EGL_VENDOR_LIBRARY_FILENAMES
     unset __GLX_VENDOR_LIBRARY_NAME LIBGL_ALWAYS_INDIRECT
     unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_DRIVERS_PATH
-    exec python -m collect panoramic \
+    exec "$VLNCE_PYTHON" -m collect panoramic \
       --output "$OUTPUT" \
       --split "$SPLIT" \
       --num-clips "$id_end" \
