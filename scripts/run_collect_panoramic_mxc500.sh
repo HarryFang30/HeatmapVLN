@@ -204,9 +204,17 @@ run_worker() {
     export LP_NUM_THREADS="$LP_THREADS"
     export OMP_NUM_THREADS="$LP_THREADS"
     ulimit -c 0
+    # Blank cluster containers ship no system GL at all (magnum dlopens
+    # libOpenGL.so.0), so the client uses the bundle's Mesa/GLVND stack with
+    # forced llvmpipe software rendering — the same certified client setup as
+    # the 8-GPU eval.  This path is worker-local; never inject it globally.
+    export LD_LIBRARY_PATH="${X11_BUNDLE}/mesa_lib:${LD_LIBRARY_PATH:-}"
+    export LIBGL_DRIVERS_PATH="$X11_DRI_PATH"
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    export MESA_LOADER_DRIVER_OVERRIDE=swrast
     unset WAYLAND_DISPLAY EGL_PLATFORM __EGL_VENDOR_LIBRARY_FILENAMES
     unset __GLX_VENDOR_LIBRARY_NAME LIBGL_ALWAYS_INDIRECT
-    unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_DRIVERS_PATH
     exec "$VLNCE_PYTHON" -m collect panoramic \
       --output "$OUTPUT" \
       --split "$SPLIT" \
