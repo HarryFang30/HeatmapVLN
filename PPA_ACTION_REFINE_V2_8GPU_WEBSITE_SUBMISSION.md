@@ -71,24 +71,27 @@ direct scene root (`<output>/train/<scene>/clip_*`).
 
 ## Prerequisite 2: rebuild the AMB3R endpoint cache on the NEW data
 
-The old `amb3r_endpoint_v2_full_r2r` cache is keyed to the deleted clips. The
-config sets `require_amb3r_pose_cache: true`, which fail-closes on any miss,
-so build a fresh cache (new directory, do not mix with v2-era entries):
+The old `amb3r_endpoint_v2_full_r2r` cache was keyed to the deleted clips and
+has been removed. The config sets `require_amb3r_pose_cache: true`, which
+fail-closes on any miss, so build a fresh endpoint cache into a new
+directory. Submit only AFTER the collection job has fully finished: the plan
+is frozen against the clips present on disk at build time. The job must be
+allocated exactly 8 GPUs (the script fail-closes otherwise); it is
+resume-safe — resubmitting the same command skips valid clips.
+`RUNTIME_CACHE_ROOT` reuses the existing warm model/HF/triton runtime cache,
+which is not keyed to the data.
 
 ```bash
-export PPA_REPO_ROOT=/mnt/afs/liwenhao/agent/370910109/HeatmapVLN
-export PPA_ALLOWED_ROOT=/mnt/afs/liwenhao/agent/370910109
-export PPA_DATA_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2/train
-export PPA_AMB3R_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/data/amb3r_endpoint_v3_full_r2r
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 
-cd "$PPA_REPO_ROOT"
-ALLOWED_ROOT="$PPA_ALLOWED_ROOT" \
-DATASET_ROOT="$PPA_DATA_ROOT" \
-CACHE_ROOT="$PPA_AMB3R_CACHE_ROOT" \
-RUNTIME_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/amb3r/checkpoints/runtime_cache_ppa_r2r_8gpu_v3 \
-SPLITS=train,val \
-MAX_CLIPS_PER_SPLIT=0 \
-AMB3R_GPU_DEVICES=0,1,2,3,4,5,6,7 \
+export ALLOWED_ROOT=/mnt/afs/liwenhao/agent/370910109
+export DATASET_ROOT=/mnt/afs/liwenhao/agent/370910109/r2r_panoramic_data_v2/train
+export CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/data/amb3r_endpoint_v3_full_r2r
+export RUNTIME_CACHE_ROOT=/mnt/afs/liwenhao/agent/370910109/amb3r/checkpoints/runtime_cache_ppa_r2r_8gpu
+export SPLITS=train,val
+export MAX_CLIPS_PER_SPLIT=0
+export AMB3R_GPU_DEVICES=0,1,2,3,4,5,6,7
+
 bash scripts/run_amb3r_pose_training_cache_8gpu_mxc500.sh
 ```
 
