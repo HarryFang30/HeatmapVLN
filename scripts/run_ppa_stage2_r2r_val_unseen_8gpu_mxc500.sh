@@ -16,8 +16,11 @@ VLNCE_PYTHON="${PPA_EVAL_VLNCE_PYTHON:-$FJL_ROOT/envs/vlnce/bin/python}"
 
 PPA_CHECKPOINT="${PPA_EVAL_CHECKPOINT:-$FJL_ROOT/model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint/run_20260818_104438/checkpoints/best.pth}"
 PPA_CONFIG="${PPA_EVAL_CONFIG:-$REPO/configs/ppa_stage2_joint_8gpu.yaml}"
-PPA_TRAIN_DATA="$FJL_ROOT/r2r_paronamic_data/train"
-PPA_TRAIN_CACHE="$FJL_ROOT/data/amb3r_endpoint_v2_full_r2r"
+# Only used to expand $PPA_DATA_ROOT/$PPA_AMB3R_CACHE_ROOT placeholders when
+# the train config is loaded; the eval itself never reads training data.  The
+# original v1 dataset and cache were deleted — default to their v2 successors.
+PPA_TRAIN_DATA="${PPA_EVAL_TRAIN_DATA:-$FJL_ROOT/r2r_panoramic_data_v2/train}"
+PPA_TRAIN_CACHE="${PPA_EVAL_TRAIN_CACHE:-$FJL_ROOT/data/amb3r_endpoint_v3_full_r2r}"
 PPA_STAGE2_OUTPUT_ROOT="$FJL_ROOT/model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint"
 PPA_TENSORBOARD_ROOT="$FJL_ROOT/model/output_past_plan_action_v1_8gpu_stage2_retry1/tensorboard"
 
