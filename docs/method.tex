@@ -1,12 +1,9 @@
-% !TEX program = xelatex
-% Standalone Chinese Method draft. When merging into the CVPR template,
-% keep the section body and replace this preamble/bibliography as needed.
-
 \documentclass[10pt]{ctexart}
 
 \usepackage[a4paper,margin=2.3cm]{geometry}
 \usepackage{amsmath,amssymb,bm}
 \usepackage[hidelinks]{hyperref}
+\usepackage{graphicx}
 
 \setlength{\parindent}{2em}
 \setlength{\parskip}{0pt}
@@ -17,11 +14,10 @@
 
 \section{方法}
 
-我们在 InternNav~\cite{internnav} 的视觉语言规划器之后构建三个共享 Plan 的下游头。原生 System-2 保留指令理解、高层目标推理和 TRAJ latent 生成能力；InternNav 中原称 System-1 的轨迹扩散模块在本文中统一记为冻结的 \emph{Action Head}。在此基础上，我们引入 \emph{History Head} 和 \emph{Future Head}：前者从 RGB 历史和估计相对位姿中恢复已访问位置的四方向空间分布，后者从当前计划表示中预测未来局部轨迹的四方向热力图。
+我们在 InternNav~\cite{internnav} 的视觉语言规划器之后组织三个功能明确、但共享计划表示的下游头。原生 System-2 保留指令理解、高层目标推理和 TRAJ latent 生成能力；InternNav 中原称 System-1 的轨迹扩散模块在本文中统一记为冻结的 \emph{Action Head}。在此基础上，我们引入 \emph{History Head} 和 \emph{Future Head}：前者从 RGB 历史和估计相对位姿中恢复已访问位置的四方向空间分布，后者从当前计划表示中预测未来局部轨迹的四方向热力图。
 
 三个 Head 并非彼此独立的辅助任务。History Head 输出紧凑历史记忆，该记忆通过唯一的 Past-to-Plan Bridge 修正原生计划表示；Future Head 与 Action Head 随后并行读取同一个共享 Plan。整体信息流可以概括为
 \[
-\boxed{
 \mathrm{History}
 \longrightarrow
 \mathrm{Plan}
@@ -30,9 +26,14 @@
 \mathrm{Future\ Heatmap},
 \mathrm{Action\ Trajectory}
 \right\}.
-}
 \]
 历史和未来热力图均作为空间监督与可解释输出，其解码结果不会以显式控制信号重新输入 Action Head。
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=1\linewidth]{past_plan_action_main_overview_v5.png}
+    \caption{Overall Stucture}
+\end{figure}
 
 \subsection{Past--Plan--Action 整体框架}
 
@@ -201,7 +202,8 @@ Past-to-Plan Bridge 使用一次多头交叉注意力，将 History Head 输出�
 \begin{aligned}
 \Delta\mathbf{Z}_t
 &=
-\operatorname{MHA}_{\mathbf{W}_{o}}
+\mathbf{W}_{o}\,
+\operatorname{MHA}
 \left(
 \operatorname{LN}(\mathbf{Z}^{0}_t),
 \operatorname{LN}(\mathbf{M}_t),
@@ -213,7 +215,7 @@ Past-to-Plan Bridge 使用一次多头交叉注意力，将 History Head 输出�
 \end{aligned}
 \label{eq:bridge}
 \end{equation}
-其中，attention mask 屏蔽无效历史槽，下标表示 MHA 的输出投影为 $\mathbf{W}_{o}$。该输出投影采用零初始化，而 query、key 和 value 投影采用常规初始化。因此在训练开始时
+其中，attention mask 屏蔽无效历史槽。输出投影 $\mathbf{W}_{o}$ 采用零初始化，而 MHA 内部的 query、key 和 value 投影采用常规初始化。因此在训练开始时
 \[
 \Delta\mathbf{Z}_t=\mathbf{0},
 \qquad
@@ -240,7 +242,7 @@ History Head 与 Future Head 采用明确的部分参数共享。二者共享：
     \item Fine Decoder 中负责空间细化的主干网络。
 \end{itemize}
 
-二者分别保留独立的输入适配与输出参数。History-specific 模块包括 trajectory-guided Transformer、历史 token/空间 token 的输入投影以及历史输出投影；Future-specific 模块包括 Plan projector、Future type embedding、四个 horizon embeddings、learned spatial queries 和 Future 输出投影。由此，两个 Head 在同一个四方向规范坐标系中复用空间解码能力，同时保留历史单点分布与未来多点 tube 在输入语义和输出统计上的差异。
+二者分别保留独立的输入适配与输出参数。History-specific 模块包括 trajectory-guided Transformer、历史 token/空间 token 的输入投影以及历史输出投影；Future-specific 模块包括 Plan projector、past/future 类型嵌入、四个 horizon embedding 和 future 输出投影。由此，两个 Head 在同一个四方向规范坐标系中复用空间解码能力，同时保留历史单点分布与未来多点 tube 在输入语义和输出统计上的差异。
 
 冻结的 Action Head 同样以共享 Plan $\mathbf{Z}_t$ 为条件，并沿用 InternNav 原生 NextDiT flow-matching 解码器产生包含 32 个 waypoint 的局部轨迹。Future Head 的预测结果不会输入 Action Head，Action Head 的轨迹也不会回写 History Head。二者的联系来自对同一个共享 Plan 的并行读取，以及训练过程中施加在该表示上的未来空间监督和动作监督。
 
