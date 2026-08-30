@@ -4373,9 +4373,12 @@ def run_eval_rpc_panoramic(args):
             lookdown_img = capture_lookdown_view(
                 env,
                 image_size=(
+                    # The released InternNav System2 was trained on 640x480
+                    # conversational lookdowns; the certified native replica
+                    # enforces that size, so the two-turn protocol must too.
                     NATIVE_INTERNNAV_LOOKDOWN_SIZE
-                    if native_internnav_rpc
-                    else (vlm_image_size if rpc_internnav_two_turn else traj_image_size)
+                    if (native_internnav_rpc or rpc_internnav_two_turn)
+                    else traj_image_size
                 ),
             )
             executed_history_panoramas.append(current_views)
@@ -4553,12 +4556,8 @@ def run_eval_rpc_panoramic(args):
                         env,
                         image_size=(
                             NATIVE_INTERNNAV_LOOKDOWN_SIZE
-                            if native_internnav_rpc
-                            else (
-                                vlm_image_size
-                                if rpc_internnav_two_turn
-                                else traj_image_size
-                            )
+                            if (native_internnav_rpc or rpc_internnav_two_turn)
+                            else traj_image_size
                         ),
                     )
                     # Record only the completed cardinal turn. Intermediate 15°

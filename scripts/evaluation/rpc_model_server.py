@@ -53,6 +53,14 @@ from src.models.heatmap.input_constructor import (
     vlm_output_requests_stop,
     vlm_output_requests_turn,
 )
+from src.models.heatmap.native_internnav_exact import (
+    NATIVE_LOOKDOWN_SIZE,
+    append_native_lookdown_turn,
+    build_native_messages,
+    finalize_native_local_actions,
+    native_requests_lookdown,
+    parse_native_actions,
+)
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
 from src.models.action.treatment_spec import (
     TrajectoryPostprocessConfig,
@@ -1039,11 +1047,24 @@ class HeatmapVLNRuntime:
         internnav_protocol = trajectory_cfg.get("system2_sft_protocol", "direct").lower() == "internnav"
         structured_pano_output = bool(trajectory_cfg.get("structured_pano_output", True))
         native_internnav_two_turn = internnav_protocol and not structured_pano_output
-        lookdown_vlm_img = (
-            lookdown_blob_img
-            if lookdown_blob_img.size == vlm_image_size
-            else lookdown_blob_img.resize(vlm_image_size)
-        )
+        if native_internnav_two_turn:
+            # The released System2 was trained on 640x480 conversational
+            # lookdowns and the certified native replica enforces that size.
+            # Feeding a 384x384 resize shifts both the vision-token layout and
+            # the coordinate domain of the second turn — fail closed instead.
+            if lookdown_blob_img.size != NATIVE_LOOKDOWN_SIZE:
+                raise ValueError(
+                    "native InternNav two-turn protocol requires a "
+                    f"{NATIVE_LOOKDOWN_SIZE} conversational lookdown blob, got "
+                    f"{lookdown_blob_img.size}"
+                )
+            lookdown_vlm_img = lookdown_blob_img
+        else:
+            lookdown_vlm_img = (
+                lookdown_blob_img
+                if lookdown_blob_img.size == vlm_image_size
+                else lookdown_blob_img.resize(vlm_image_size)
+            )
         system1_coord_order = str(payload.get("system1_coord_order", "generated"))
         if system1_coord_order == "auto":
             system1_coord_order = "generated"
@@ -1072,15 +1093,16 @@ class HeatmapVLNRuntime:
             requested_pixel = [int(requested_pixel[0]), int(requested_pixel[1])]
             front_condition_text = structured_condition_text("front", requested_pixel)
 
+        native_prompt_images: list[Image.Image] | None = None
         if native_internnav_two_turn and phase != "front_system1":
-            messages = construct_input_stage2(
-                history_frames=[history["front"] for history in history_panoramas],
-                current_frame=current_views["front"],
-                lookdown_frame=lookdown_vlm_img,
-                instruction=instruction,
-                pixel_goal=None,
-                assistant_text=None,
-                conjunction="you can see ",
+            # Byte-exact certified-native prompt. construct_input_stage2 is the
+            # TRAINING contract; against the frozen released System2 its "\n"
+            # separators and appended instruction period measurably change
+            # greedy decoding, so evaluation must use the replica construction.
+            messages, native_prompt_images = build_native_messages(
+                instruction,
+                [history["front"] for history in history_panoramas],
+                current_views["front"],
             )
         else:
             messages = construct_input(
@@ -1141,11 +1163,17 @@ class HeatmapVLNRuntime:
                 skip_special_tokens=True,
             )
             native_first_output = llm_output
-            if native_internnav_two_turn and _internnav_requests_lookdown(llm_output):
-                messages = _append_internnav_lookdown_turn(
+            if native_internnav_two_turn and native_requests_lookdown(llm_output):
+                if native_prompt_images is None:
+                    raise RuntimeError(
+                        "native two-turn lookdown requested outside the "
+                        "native prompt construction path"
+                    )
+                messages, native_prompt_images = append_native_lookdown_turn(
                     messages,
-                    first_output=llm_output,
-                    lookdown_frame=lookdown_vlm_img,
+                    native_prompt_images,
+                    llm_output,
+                    lookdown_vlm_img,
                 )
                 inputs = self.processor.apply_chat_template(
                     messages,
@@ -1219,15 +1247,58 @@ class HeatmapVLNRuntime:
             )
         if sampling_metadata is not None:
             response[HEATMAPVLN_RPC_SAMPLING_FIELD] = sampling_metadata
-        if phase != "front_system1" and vlm_output_requests_stop(llm_output):
-            response.update({"kind": "stop", "terminal": True, "actions": [ActionCode.STOP]})
-            return response
-
-        turn_dir = vlm_output_requests_turn(llm_output) if phase != "front_system1" else None
-        if turn_dir is not None:
-            action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
-            response.update({"kind": "turn", "actions": [int(action)], "turn_direction": turn_dir})
-            return response
+        if phase != "front_system1" and native_internnav_two_turn:
+            # Certified-native action semantics: with no digits in the final
+            # output, execute the FULL parsed arrow chunk (including ↑ forward
+            # and ↓ lookdown) capped to the four-step local queue, exactly as
+            # the 62.5% replica stack does.  The v3 single-turn/fallback_stop
+            # handling deadlocked warmup phases and killed 41% of episodes.
+            if not re.search(r"\d", llm_output or ""):
+                native_action_chunk = parse_native_actions(llm_output)
+                if not native_action_chunk:
+                    response.update(
+                        {
+                            "kind": "fallback_stop",
+                            "terminal": True,
+                            "actions": [ActionCode.STOP],
+                        }
+                    )
+                    return response
+                if native_action_chunk[0] == ActionCode.STOP:
+                    response.update(
+                        {
+                            "kind": "stop",
+                            "terminal": True,
+                            "actions": [ActionCode.STOP],
+                        }
+                    )
+                    return response
+                response.update(
+                    {
+                        "kind": "native_actions",
+                        "actions": finalize_native_local_actions(
+                            native_action_chunk
+                        ),
+                    }
+                )
+                return response
+        elif phase != "front_system1":
+            if vlm_output_requests_stop(llm_output):
+                response.update(
+                    {"kind": "stop", "terminal": True, "actions": [ActionCode.STOP]}
+                )
+                return response
+            turn_dir = vlm_output_requests_turn(llm_output)
+            if turn_dir is not None:
+                action = ActionCode.LEFT if turn_dir == "left" else ActionCode.RIGHT
+                response.update(
+                    {
+                        "kind": "turn",
+                        "actions": [int(action)],
+                        "turn_direction": turn_dir,
+                    }
+                )
+                return response
 
         if native_internnav_two_turn:
             pixel_goal = _parse_internnav_pixel_goal(llm_output)
