@@ -2,6 +2,7 @@
 
 \usepackage[a4paper,margin=2.3cm]{geometry}
 \usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
 \usepackage[hidelinks]{hyperref}
 \usepackage{graphicx}
 
@@ -14,9 +15,18 @@
 
 \section{方法}
 
-我们在 InternNav~\cite{internnav} 的视觉语言规划器之后组织三个功能明确、但共享计划表示的下游头。原生 System-2 保留指令理解、高层目标推理和 TRAJ latent 生成能力；InternNav 中原称 System-1 的轨迹扩散模块在本文中统一记为冻结的 \emph{Action Head}。在此基础上，我们引入 \emph{History Head} 和 \emph{Future Head}：前者从 RGB 历史和估计相对位姿中恢复已访问位置的四方向空间分布，后者从当前计划表示中预测未来局部轨迹的四方向热力图。
+\paragraph{任务设定与目标。}
+本文研究连续环境下的视觉语言导航（VLN-CE~\cite{vlnce}）：给定自然语言指令 $q$，机器人在每个时刻 $t$ 仅获得第一人称前视 RGB 观测 $I_t$，并在未知环境中执行移动，直至到达指令所描述的目标。记因果观测历史为 $\mathcal{O}_t=\{I_1,\ldots,I_t\}$，策略在每个决策时刻输出由 32 个 waypoint 组成的局部轨迹 $\mathcal{W}_t$，再经离散化执行。整个过程不提供 GT 位姿、深度或任何外部地图。
 
-三个 Head 并非彼此独立的辅助任务。History Head 输出紧凑历史记忆，该记忆通过唯一的 Past-to-Plan Bridge 修正原生计划表示；Future Head 与 Action Head 随后并行读取同一个共享 Plan。整体信息流可以概括为
+在此设定上，本文将\textbf{显式时空认知}定义为一个可监督的预测问题。对任一历史时刻 $\tau$，记其观测位姿在\emph{当前第一人称参考系}（以当前相机为原点、当前朝向为正前方）中的平面位置与朝向为 $\mathbf{x}_{t\leftarrow\tau}$。认知目标是从纯视觉历史逼近条件分布
+\[
+p\left(\mathbf{x}_{t\leftarrow\tau}\mid\mathcal{O}_t\right),
+\qquad \tau\in\Gamma_t,
+\]
+其中 $\Gamma_t$ 为选定的至多 $K=8$ 个历史时刻。我们以四个规范方向 $\mathcal{V}=\{\mathrm{Front},\mathrm{Right},\mathrm{Back},\mathrm{Left}\}$ 拼成完整的第一人称全景参考系，并用各方向上的空间热力图与方向可见性作为该分布的离散参数化——即历史路点的 affordance map。$K$ 个历史路点的分布集合刻画了"哪些位置被访问过、它们如今在我的哪个方向、多远"，构成一种无需全局坐标系、以当前视点为锚的第一人称拓扑。由此，原本隐式的本体--环境时空记忆被转化为可学习、可监督、可观测的模型能力。
+
+\paragraph{框架概览。}
+围绕这一目标，本文方法由三部分组成：(1) 基于快慢系统的 VLA backbone，在统一框架内解耦长期高层意图与短期精细动作（3.1 节）；(2) 基于第一人称拓扑的显式时空认知机制，从历史 RGB 中估计相对位姿并预测历史路点的 affordance map（3.2 节）；(3) 时空认知与导航决策的关联学习，经共享计划表示将认知耦合进动作生成（3.3 节）。配套的结构化数据生成与分阶段优化在 3.4 节给出。整体框架如图~1 所示，记为 Past--Plan--Action（PPA），其信息流为
 \[
 \mathrm{History}
 \longrightarrow
@@ -25,45 +35,43 @@
 \left\{
 \mathrm{Future\ Heatmap},
 \mathrm{Action\ Trajectory}
-\right\}.
+\right\},
 \]
-历史和未来热力图均作为空间监督与可解释输出，其解码结果不会以显式控制信号重新输入 Action Head。
+历史认知只沿时间因果方向汇入决策，历史与未来之间不存在反向通路。
 
 \begin{figure}[h]
     \centering
-    \includegraphics[width=1\linewidth]{past_plan_action_main_overview_v5.png}
-    \caption{Overall Stucture}
+    \includegraphics[width=1\linewidth]{figures/past_plan_action_main_overview_v6.png}
+    \caption{Past--Plan--Action 整体框架。慢系统从指令与 RGB 历史生成原生 Plan $\mathbf{Z}^{0}$；相对位姿估计模块从同一 RGB 历史恢复历史观测的相对位姿；History Head 据此预测四方向历史 affordance map 并输出紧凑记忆 $\mathbf{M}$；Past-to-Plan Bridge 将 $\mathbf{M}$ 汇入 Plan 得到共享 Plan $\mathbf{Z}$；Future Head 与快系统的动作解码器并行读取 $\mathbf{Z}$，分别解码未来热力图与动作轨迹。History 与 Future 共享同一空间解码器。}
+    \label{fig:overview}
 \end{figure}
 
-\subsection{Past--Plan--Action 整体框架}
+\subsection{基于快慢系统的 VLA Backbone}
+\label{sec:backbone}
 
-给定导航指令 $q$ 和截至时刻 $t$ 的因果观测历史
-\[
-\mathcal{O}_t=\{I_1,\ldots,I_t\},
-\]
-冻结的 System-2 首先完成原生的高层目标推理，并输出四个 TRAJ token 的隐藏状态
-$\mathbf{H}^{\mathrm{traj}}_t$。冻结的原生条件投影器
-$\phi_{\mathrm{cond}}$ 将其映射为
+本文的 VLA backbone 遵循快慢系统设计：慢系统基于语言指令与观测历史推理长期的高层导航意图，快系统结合该意图与当前短期视觉状态生成精细动作，从而在统一框架内解耦不同时间尺度的决策与控制。慢系统执行完整的视觉语言推理，并将高层意图汇聚为四个 latent plan token；经条件投影 $\phi_{\mathrm{cond}}$ 后得到
 \[
 \mathbf{Z}^{0}_t
 =
 \phi_{\mathrm{cond}}
-\left(
-\mathbf{H}^{\mathrm{traj}}_t
-\right)
+\bigl(
+\mathrm{Slow}(q,\mathcal{O}_t)
+\bigr)
 \in
 \mathbb{R}^{4\times768},
 \]
-我们将其记为原生 Plan。
+记为\textbf{原生 Plan}。它是慢系统对"接下来应当去哪里"的意图表示；停止判定同样由慢系统给出。快系统是一个 flow-matching 轨迹解码器，以 Plan 为条件、结合当前视觉状态 $\mathbf{J}_t$ 生成 32 个 waypoint 的局部轨迹，推理时沿用多样本生成、轨迹聚合与离散动作后处理。
 
-与此同时，History Head 根据当前与历史 RGB，以及 AMB3R 估计的历史相对位姿，输出历史热力图、四方向可见性和紧凑历史记忆。Past-to-Plan Bridge 以原生 Plan 为 query、以历史记忆为 key/value，形成共享 Plan。Future Head 和 Action Head 再分别从该表示解码未来空间分布和局部动作轨迹：
+我们将该 backbone 实例化于预训练的 InternNav~\cite{internnav} 双系统模型：慢系统对应其 System-2（Qwen2.5-VL~\cite{qwen25vl} 规划器），快系统对应其 System-1（NextDiT 轨迹扩散模块）。骨干在本文全部训练阶段保持冻结——学习容量由此集中于时空认知及其与决策的耦合，性能变化也可严格归因于认知的引入。
+
+该 backbone 有一个对本文至关重要的结构性质：\textbf{Plan 是慢系统与快系统之间唯一的意图通道}。显式时空认知因此不必侵入骨干内部，只需修正这四个 Plan token 即可影响后续行为。引入认知模块后的整体前向为
 \begin{equation}
 \begin{aligned}
 \mathbf{Z}^{0}_t
 &=
 \phi_{\mathrm{cond}}
 \bigl(
-\mathrm{System2}(q,\mathcal{O}_t)
+\mathrm{Slow}(q,\mathcal{O}_t)
 \bigr),\\
 \bigl(
 \widehat{\mathcal{H}}^{\mathrm{hist}}_t,
@@ -96,44 +104,17 @@ $\phi_{\mathrm{cond}}$ 将其映射为
 \mathrm{ActionHead}
 \bigl(
 \mathbf{Z}_t,\mathbf{J}_t
-\bigr).
+\bigr),
 \end{aligned}
 \label{eq:overview}
 \end{equation}
+其中 $\widehat{\mathbf{P}}_t$ 为从 RGB 历史估计的相对位姿（3.2 节），$\widehat{\mathcal{H}}$、$\widehat{\bm{\ell}}$ 分别为历史/未来热力图及其方向可见性，$\mathbf{M}_t$ 为紧凑历史记忆，$\mathbf{F}_t$ 为空间解码复用的当前视觉特征。历史信息只通过四个共享 Plan token 影响未来空间预测与动作生成。
 
-其中，
-\[
-\widehat{\mathcal{H}}^{\mathrm{hist}}_t
-\in
-\mathbb{R}^{K\times4\times64\times64},
-\qquad
-\mathbf{M}_t
-\in
-\mathbb{R}^{K\times256},
-\]
-$K\leq8$ 为当前样本中的有效历史槽数。Future Head 输出四个时间段的未来轨迹热力图，
-\[
-\widehat{\mathcal{H}}^{\mathrm{fut}}_t
-\in
-\mathbb{R}^{4\times4\times64\times64}.
-\]
-$\mathbf{F}_t$ 表示空间热力图解码所需的当前视觉特征，$\mathbf{J}_t$ 表示 InternNav 原生轨迹扩散模块使用的视觉条件。Action Head 输出由 32 个重采样 waypoint 表示的局部轨迹；推理时继续沿用 InternNav 原有的多样本生成、轨迹聚合与离散动作后处理。
+\subsection{基于第一人称拓扑的显式时空认知}
+\label{sec:cognition}
 
-该设计不改变 System-2 的目标生成和 STOP 语义，也不在冻结的 Action Head 内部增加逐层条件支路。历史信息只通过四个共享 Plan tokens 影响未来空间预测与动作生成。
-
-完整导航过程中，System-2 仍执行原生 Qwen2.5-VL 的视觉编码和语言推理。History Head 额外复用冻结的 Qwen.visual 提取当前与历史图像的空间特征，但不重复运行 Qwen 语言 Transformer。System-2 提供当前任务和目标语义，History Head 提供历史几何与视觉记忆，两者仅在共享 Plan 中汇合。
-
-\subsection{基于 RGB 历史的相对位姿估计}
-
-为了确定历史位置在当前参考系中的方向和距离，我们采用冻结的 AMB3R~\cite{amb3r} 作为因果 RGB 几何模块。AMB3R 顺序处理截至当前时刻已经观测到的前视 RGB，并输出对应的 camera-to-world 位姿。本文只使用其从 RGB 历史到相机轨迹的输入输出关系，不修改或训练其内部参数。
-
-AMB3R 使用完整的已观测图像前缀，以利用中间帧维持远距离历史与当前帧之间的几何关联。History Head 则只从中选择至多 $K=8$ 个历史时刻
-\[
-\Gamma_t=\{\tau_1,\ldots,\tau_K\}
-\]
-作为输出槽。因此，位姿估计的时间分辨率与历史热力图的输出槽数相互独立。
-
-设 $\widehat{\mathbf{T}}_i$ 为 AMB3R 输出的 camera-to-world 位姿，则历史时刻 $\tau_k$ 相对于当前时刻 $t$ 的变换及其平面表示为
+\paragraph{因果相对位姿估计。}
+显式时空认知的前提是回答"历史观测相对当前视角在哪里"。本文将其化为纯 RGB 的前馈推断：采用 AMB3R~\cite{amb3r} 作为因果几何模块，顺序处理已观测的前视图像前缀并输出各帧位姿，借助中间帧维持远距离历史与当前帧之间的几何关联。History Head 只从中选择 $\Gamma_t$ 中至多 $K$ 个时刻作为输出槽，位姿估计的时间分辨率与输出槽数相互独立。设 $\widehat{\mathbf{T}}_i$ 为估计的 camera-to-world 位姿，历史时刻 $\tau_k$ 相对当前的变换及其平面表示为
 \begin{equation}
 \widehat{\mathbf{T}}_{t\leftarrow\tau_k}
 =
@@ -147,57 +128,47 @@ AMB3R 使用完整的已观测图像前缀，以利用中间帧维持远距离�
 \Delta\widehat l_k,\,
 \cos\Delta\widehat\psi_k,\,
 \sin\Delta\widehat\psi_k
-\right].
+\right],
 \label{eq:relative_pose}
 \end{equation}
-其中，$\Delta\widehat f_k$ 和 $\Delta\widehat l_k$ 分别表示当前机器人坐标系中的前向位移和左向位移，$\Delta\widehat\psi_k$ 表示相对航向角。采用相对表示可以消除 episode 世界坐标原点的影响；使用航向角的正余弦形式则避免了 $-\pi$ 与 $\pi$ 之间的不连续。
+其中 $\Delta\widehat f_k$、$\Delta\widehat l_k$ 为当前机器人坐标系中的前向与左向位移，$\Delta\widehat\psi_k$ 为相对航向角。相对表示消除了世界坐标原点的影响，正余弦形式避免了航向角在 $\pm\pi$ 处的不连续。推理阶段该模块只读取 RGB；GT 位姿、深度与内参仅用于监督标签构造与离线评测（3.4 节），从不作为模型输入。
 
-所有预测位姿在输入 History Head 前均转换到与训练标签一致的相机和机器人坐标约定。推理阶段，该模块只读取 RGB 历史，不访问 simulator GT pose。GT pose、depth 和 camera intrinsics 仅用于历史热力图标签的生成与离线评测，不作为模型输入。
+\paragraph{历史编码与四方向规范槽。}
+History Head 复用骨干的视觉编码器（不重复执行语言推理）：当前图像保留多层二维空间特征以支持像素级定位，每张历史图像压缩为一个紧凑视觉 token 以描述该次观测的外观与身份。空间支路在四个规范方向上组织：Front 槽直接采用当前前视图的真实空间特征；Right、Back、Left 槽由可学习的规范空间查询、方向编码与前视全局上下文构成——它们是带方向语义的规范空间槽，而非合成的侧后视图。
 
-\subsection{History Head：历史空间分布与紧凑记忆}
-
-History Head 复用冻结的 Qwen.visual 对当前前视图和选中的历史前视图进行编码。当前图像保留二维空间特征，以支持像素级定位；每张历史图像则被压缩为紧凑的历史视觉 token，用于描述该历史观测的外观与身份。
-
-辅助空间支路只读取当前前视 RGB。Front 方向直接使用当前前视图的真实空间特征；Right、Back 和 Left 方向则由可学习的规范空间查询、固定方向编码以及当前前视图的全局上下文构造。后三者是带有方向语义的规范空间槽，而不是合成出的侧后图像，也不表示模型额外读取了侧后 RGB。
-
-对于第 $k$ 个历史位置，相对位姿
-$\widehat{\mathbf{p}}_{t\leftarrow\tau_k}$
-经过 Fourier 编码和线性投影后形成 trajectory token。该 token 与历史视觉 token、四方向空间 tokens 一同输入两层 trajectory-guided Transformer。历史视觉 token 描述“这是哪一次历史观测”，trajectory token 描述“该历史位置相对当前相机在哪里”，四方向空间 tokens 则承载规范视角中的像素布局。
-
-两层 Transformer 联合更新历史 token 和四方向空间 tokens。记更新后的历史 token 为
-$\mathbf{h}'_{t,k}\in\mathbb{R}^{256}$，更新后的空间表示为
-$\mathbf{S}'_{t,k}$。二者承担不同的解码职责：
-
-\begin{itemize}
-    \item 更新后的历史 token $\mathbf{h}'_{t,k}$ 用于预测第 $k$ 个历史位置在 Front、Right、Back 和 Left 四个方向上的 visibility logits；
-    \item 更新后的空间 tokens $\mathbf{S}'_{t,k}$ 用于生成低分辨率 coarse heatmap，并向 Fine Decoder 提供四方向空间表示；
-    \item 更新后的历史 token 同时被保留为 compact memory
-    $\mathbf{m}_{t,k}=\mathbf{h}'_{t,k}$，作为 History Head 向共享 Plan 传递信息的接口。
-\end{itemize}
-
-所有历史槽的 compact memory 组成
+\paragraph{轨迹引导的时空关联。}
+History Head 的整体机制如图~2 所示。对第 $k$ 个历史槽，相对位姿 $\widehat{\mathbf{p}}_{t\leftarrow\tau_k}$ 经 Fourier 编码与线性投影形成 trajectory token，与历史视觉 token、四方向空间 token 一同输入两层 trajectory-guided Transformer：历史 token 回答"这是哪次观测"，trajectory token 回答"它相对当前在哪里"，空间 token 承载规范视角中的像素布局。三者在同一注意力空间中联合更新，迫使模型建立历史观测之间的时空关联。更新后的历史 token $\mathbf{h}'_{t,k}\in\mathbb{R}^{256}$ 预测该路点的四方向 visibility，并被保留为 compact memory $\mathbf{m}_{t,k}=\mathbf{h}'_{t,k}$；更新后的空间 token 先解码 $8\times8$ 的 coarse heatmap，再由 Fine Decoder 结合当前图像多尺度特征细化为最终热力图：
 \[
-\mathbf{M}_t
-=
-[
-\mathbf{m}_{t,1},
-\ldots,
-\mathbf{m}_{t,K}
-]
+\widehat{\mathcal{H}}^{\mathrm{hist}}_t
+\in
+\mathbb{R}^{K\times4\times64\times64},
+\qquad
+\mathbf{M}_t=[\mathbf{m}_{t,1},\ldots,\mathbf{m}_{t,K}]
 \in
 \mathbb{R}^{K\times256}.
 \]
-需要强调的是，coarse heatmap 实际由四方向空间 tokens 解码，而不是直接由 compact memory 预测。历史 token 与空间 tokens 通过同一个 trajectory-guided Transformer 联合更新：visibility 监督直接约束更新后的历史 token，空间定位监督则约束四方向空间 tokens；二者之间的自注意力交互共同塑造 History representation。Compact memory 是该共享历史表示与后续 Plan 之间的唯一通信接口，但并非完整热力图预测的唯一瓶颈。
+训练与后续共享解码均保留原始 logits，以保存峰值宽度、多峰结构与方向不确定性；可视化与评测时再将方向概率与方向内空间概率组合为全景热力图。$\mathbf{M}_t$ 是历史表征与 Plan 之间的唯一通信接口；无效历史槽在损失与注意力中一并屏蔽，无任何有效槽时系统精确退化为原生骨干（附录~B）。
 
-Fine Decoder 进一步结合 coarse heatmap、更新后的空间 tokens 和当前图像的多尺度空间特征，生成最终的四方向历史热力图 logits。训练和后续共享解码均保留原始空间 logits 与 visibility logits，避免过早丢失峰值宽度、多峰结构和方向不确定性。可视化与联合 PCK 评测时，再将四方向概率与各方向内部的空间概率组合成全景热力图。
+\begin{figure}[h]
+    \centering
+    \fbox{\begin{minipage}{0.93\linewidth}\small
+    \textbf{【图待制作——内容规格】}History Head 机制图：
+    (i) 左侧输入列：当前前视 RGB $\rightarrow$ 空间特征（Front 槽）与可学习 Right/Back/Left 规范槽；$K$ 张历史 RGB $\rightarrow$ 紧凑历史 token；相对位姿 $\rightarrow$ Fourier $\rightarrow$ trajectory token。
+    (ii) 中部：每个历史槽的 $[\,$历史 token、trajectory token、$4\times8\times8$ 空间 token$\,]$ 进入两层 Transformer 联合更新（画出 token 序列与自注意力）。
+    (iii) 右侧三条输出支路：历史 token $\rightarrow$ visibility 与 compact memory $\mathbf{m}_{t,k}$（标注"$\rightarrow$ Bridge"）；空间 token $\rightarrow$ coarse $8\times8$ $\rightarrow$ Fine Decoder（融合当前多尺度特征）$\rightarrow$ $4\times64\times64$ affordance map。
+    配色沿用图~1 的 token 色系（Visual/Pose/Memory）。
+    \end{minipage}}
+    \caption{History Head：从历史观测与相对位姿到第一人称 affordance map 与紧凑记忆。}
+    \label{fig:historyhead}
+\end{figure}
 
-无效历史槽同时在 History loss 和 Bridge attention 中被屏蔽。当当前样本不存在有效历史槽时，Past-to-Plan Bridge 执行严格恒等旁路，系统退化为原生 InternNav。
+\subsection{时空认知与导航决策的关联学习}
+\label{sec:association}
 
-历史监督标签通过将历史相机中心投影到当前 Front、Right、Back 和 Left 四个规范方向生成。GT pose、depth 和 camera intrinsics 只用于离线标签构造；模型前向始终使用 AMB3R 估计的相对位姿。具体的投影、可见性判断和标签核函数在附录中给出。
+显式时空认知若只是独立的辅助任务，则无法保证真正服务于导航。本节机制让认知结果直接参与行为生成，同时遵循一条设计原则：\textbf{认知增强不得破坏骨干的原生能力}。关联仅沿时间因果方向发生——历史记忆经 Bridge 汇入 Plan，未来预测与动作生成从同一共享 Plan 读取，反向通路不存在。
 
-\subsection{共享 Plan、Future Head 与 Action Head}
-
-Past-to-Plan Bridge 使用一次多头交叉注意力，将 History Head 输出的 compact memory 传递给原生 Plan：
+\paragraph{Past-to-Plan Bridge。}
+Bridge 用一次多头交叉注意力将 compact memory 传递给原生 Plan：
 \begin{equation}
 \begin{aligned}
 \Delta\mathbf{Z}_t
@@ -211,64 +182,72 @@ Past-to-Plan Bridge 使用一次多头交叉注意力，将 History Head 输出�
 \right),\\
 \mathbf{Z}_t
 &=
-\mathbf{Z}^{0}_t+\Delta\mathbf{Z}_t.
+\mathbf{Z}^{0}_t+\Delta\mathbf{Z}_t,
 \end{aligned}
 \label{eq:bridge}
 \end{equation}
-其中，attention mask 屏蔽无效历史槽。输出投影 $\mathbf{W}_{o}$ 采用零初始化，而 MHA 内部的 query、key 和 value 投影采用常规初始化。因此在训练开始时
-\[
-\Delta\mathbf{Z}_t=\mathbf{0},
+输出投影 $\mathbf{W}_{o}$ 零初始化，因此训练起点处 $\mathbf{Z}_t=\mathbf{Z}^{0}_t$，新分支不会立即扰动原生动作条件，而 $\mathbf{W}_{o}$ 在首次反传即获得有效梯度。在此之上，Bridge 对每个 Plan token 的修正量施加硬信任域：
+\begin{equation}
+\Delta\mathbf{z}
+\leftarrow
+\Delta\mathbf{z}\cdot
+\min\!\left(
+1,\;
+\frac{\rho\,\|\mathbf{z}^{0}\|}{\|\Delta\mathbf{z}\|}
+\right),
 \qquad
-\mathbf{Z}_t=\mathbf{Z}^{0}_t,
-\]
-新增分支不会立即改变原生动作条件，同时 $\mathbf{W}_{o}$ 在首次反向传播中仍可获得有效梯度。Bridge 只作用于四个 Plan tokens，不在 NextDiT 的内部层重复插入。
+\rho=0.05,
+\label{eq:trust_region}
+\end{equation}
+即修正范数不超过对应原生 token 范数的 $5\%$，训练与部署一致生效。该约束从结构上保证共享 Plan 始终处于原生意图的邻域内。Bridge 只作用于四个 Plan token，不在动作解码器内部插入逐层条件支路。
 
-Future Head 直接读取四个共享 Plan tokens，不额外引入 Future-query cross-attention。我们将 expert 局部轨迹重采样为 32 个 waypoint，并按照轨迹进度划分为四个连续时间段：
+\paragraph{Future Head：历史与未来的统一空间语义。}
+历史路点以 affordance map 表达后，慢系统的未来意图可以在同一空间语义下解释。Future Head 直接读取四个共享 Plan token——其本身不含注意力模块，仅由线性投影、类型与时段嵌入、可学习空间查询及共享解码头构成，因此三个输出头之间的全部关联都发生在共享 Plan 上。expert 局部轨迹重采样为 32 个 waypoint 并按进度分为四段（$1$--$8$、$9$--$16$、$17$--$24$、$25$--$32$），四个 Plan token 分别解码对应时间段在四个规范方向中的空间 tube：
 \[
-1\text{--}8,\qquad
-9\text{--}16,\qquad
-17\text{--}24,\qquad
-25\text{--}32.
+\widehat{\mathcal{H}}^{\mathrm{fut}}_t
+\in
+\mathbb{R}^{4\times4\times64\times64},
 \]
-四个 Plan tokens 分别用于解码对应时间段在 Front、Right、Back 和 Left 四个规范方向中的空间 tube。每个 tube 描述一段未来轨迹在当前参考系中的空间支持区域，而不是单个未来目标点。
+每个 tube 描述一段未来轨迹的空间支持区域而非单个目标点。History 与 Future 共享四方向 visibility 头、coarse 头与空间细化主干，各自保留输入适配与输出投影（完整清单见附录~B）。由此，"我从哪里来"与"我要到哪里去"在同一四方向规范坐标系中共享几何词汇，历史与未来的时空关系得以在共享 Plan 上直接关联。
 
-Future 标签由这 32 个重采样 waypoint 的三维相对几何生成，而不是直接使用原始未来第 $t+n$ 帧。标签构造不使用 GT depth。对于平坦路段，我们采用与历史标签一致的 $1.25\,\mathrm{m}$ agent-to-camera 高度；对于楼梯等存在垂直运动的区域，则保留 expert 轨迹中的相对高度变化。随后将各段 waypoint 投影到当前四个规范方向，并栅格化为未来轨迹 tube。具体的重采样、投影和 rasterization 过程见附录。
+\paragraph{与动作生成的耦合。}
+动作解码器同样以共享 Plan $\mathbf{Z}_t$ 为条件生成局部轨迹。三个输出头之间不存在显式铰链：Future 的预测不输入动作解码器，动作轨迹也不回写 History；耦合来自对同一共享 Plan 的并行读取，以及训练中施加其上的历史、未来与动作监督（3.4 节）。动作解码器参数虽不更新，其输出对 Plan 的梯度仍回传至 Bridge 与 History Head，动作监督由此参与塑造时空记忆本身。热力图作为监督与可解释输出，不以解码后的像素形式回流进策略。三个头的关系可概括为：History 提供过去的空间记忆，Bridge 将其汇入当前 Plan，Future 解释该 Plan 的未来展开，动作解码器将同一 Plan 变为可执行轨迹。
 
-History Head 与 Future Head 采用明确的部分参数共享。二者共享：
+\subsection{结构化数据生成与分阶段优化}
+\label{sec:training}
+
+显式时空认知没有现成的监督来源，本文以结构化的数据自动生成流程构造之，并以分阶段优化使时空理解、高层意图与低层控制逐步协同。
+
+\paragraph{结构化数据自动生成。}
+训练数据基于 VLN-CE 的 R2R expert 轨迹自动构建：在 Habitat 中回放 expert episode，采集全景观测（四方向 RGB、深度）与相机位姿；模型输入只使用前视 RGB，全景信息仅服务于标签构造与评测。每条轨迹按时间步展开为因果滑动窗口样本，每个样本以当前时刻为参考、从历史前缀中采样至多 $K$ 个历史槽。全部监督标签自动生成（图~3）：
 
 \begin{itemize}
-    \item 四方向 visibility MLP；
-    \item coarse heatmap MLP；
-    \item Fine Decoder 中负责空间细化的主干网络。
+    \item \textbf{历史标签}：将各历史相机中心经 GT 位姿变换到当前坐标系，投影至四个规范方向，结合深度做遮挡与可见性判定，以自适应空间核栅格化为热力图标签；
+    \item \textbf{未来标签}：由 32 个重采样 waypoint 的三维相对几何生成（不使用未来帧与 GT 深度），平坦路段取与当前相机同高的相对高度、楼梯等垂直运动保留 expert 相对高度，再按时间段投影并栅格化为 tube；
+    \item \textbf{因果位姿缓存}：对每条轨迹按与在线推理一致的因果前缀流程离线运行位姿估计并缓存，训练输入 $100\%$ 使用估计位姿而非 GT，使 History Head 在训练期即适配推理时的位姿误差分布。
 \end{itemize}
 
-二者分别保留独立的输入适配与输出参数。History-specific 模块包括 trajectory-guided Transformer、历史 token/空间 token 的输入投影以及历史输出投影；Future-specific 模块包括 Plan projector、past/future 类型嵌入、四个 horizon embedding 和 future 输出投影。由此，两个 Head 在同一个四方向规范坐标系中复用空间解码能力，同时保留历史单点分布与未来多点 tube 在输入语义和输出统计上的差异。
+数据划分采用确定性的场景级散列，训练与验证场景不相交。投影、可见性判定、核函数与重采样细节见附录~A。
 
-冻结的 Action Head 同样以共享 Plan $\mathbf{Z}_t$ 为条件，并沿用 InternNav 原生 NextDiT flow-matching 解码器产生包含 32 个 waypoint 的局部轨迹。Future Head 的预测结果不会输入 Action Head，Action Head 的轨迹也不会回写 History Head。二者的联系来自对同一个共享 Plan 的并行读取，以及训练过程中施加在该表示上的未来空间监督和动作监督。
+\begin{figure}[h]
+    \centering
+    \fbox{\begin{minipage}{0.93\linewidth}\small
+    \textbf{【图待制作——内容规格】}结构化标签生成示意图，左右两栏：
+    (i) 左栏"历史标签"：俯视小地图画出 expert 轨迹与历史相机位置、当前位姿及其四方向视锥；向下箭头到四张 $64\times64$ 标签热力图（可见方向为高斯峰、被遮挡方向标记不可见），标注"GT 位姿/深度仅在此处使用"。
+    (ii) 右栏"未来标签"：同一俯视图上画 32 个重采样 waypoint 按四个时间段着色；向下箭头到 $4\times4$ 网格的 tube 标签（每行一个时间段、每列一个方向）。
+    (iii) 底部横条"因果位姿缓存"：时间轴上顺序 ingest 的 RGB 前缀 $\rightarrow$ 估计位姿行，标注"与在线推理同分布"。
+    \end{minipage}}
+    \caption{结构化数据自动生成：历史 affordance map 标签、未来轨迹 tube 标签与因果位姿缓存均从 expert 轨迹自动构造，无需人工标注。}
+    \label{fig:labels}
+\end{figure}
 
-因此，三个 Head 的关系可以概括为：History Head 提供过去的空间记忆，Bridge 将该记忆汇入当前 Plan，Future Head 解释该 Plan 在图像空间中的未来展开，Action Head 则将同一 Plan 解码为可执行的度量轨迹。
+\paragraph{训练目标。}
+History 的监督目标 $\mathcal{L}_{\mathrm{hist}}$ 包含四方向 visibility、热力图空间定位（含 soft-argmax 坐标项）、不可见方向抑制与方向不均衡校正；验证使用可见性、PCK 与像素定位误差。Future tube 可跨越多个方向，故 $\mathcal{L}_{\mathrm{fut}}$ 不含单点坐标项与互斥视角分类，由 visibility、tube 空间分布、不可见抑制与方向均衡项组成；Soft-IoU、top-$k$ support recall 与 visibility F1 仅作验证指标。各项权重见附录~C。
 
-\subsection{训练目标与优化策略}
+\paragraph{分阶段优化。}
+训练策略围绕一对内在张力展开：时空认知必须\emph{参与}决策（需要动作梯度流入认知分支），又必须\emph{不破坏}骨干先验（expert 监督中存在大量不可约的多模态残差，若不加约束地推动 Plan，模型会为微小的 teacher-forced 增益漂移出原生意图邻域，损害闭环行为）。本文以三个阶段化解该张力，从空间对齐、到受保护的耦合、再到信任域内收敛。历史空间分支在此前已完成预训练与位姿域适配（从 GT 位姿切换到估计位姿分布），作为初始化。
 
-我们首先使用已有的 History Head checkpoint 初始化历史空间分支。正式联合训练包含 Stage 1 和 Stage 2 两个阶段。
-
-History Head 的监督目标记为
-\[
-\mathcal{L}_{\mathrm{hist}},
-\]
-其包含四方向 visibility、coarse/fine 空间定位、不可见方向抑制以及方向不均衡校正等现有目标。由于历史目标对应单个历史位置，验证时使用方向可见性、PCK 和像素定位误差等指标。
-
-Future tube 可能同时跨越多个规范方向，因此不使用单点 soft-argmax 或互斥视角分类。Future Head 的训练目标
-$\mathcal{L}_{\mathrm{fut}}$
-包括四方向 visibility、空间 tube 分布、不可见方向抑制和方向不均衡校正。Soft-IoU、top-$k$ support recall 和 visibility F1 仅作为 Future Head 的验证指标，不参与训练损失。
-
-\paragraph{Stage 1：历史--未来空间对齐。}
-
-Stage 1 从预训练的 History checkpoint 初始化，并保持 Past-to-Plan Bridge 为冻结的零映射，因此
-\[
-\mathbf{Z}_t=\mathbf{Z}^{0}_t.
-\]
-该阶段继续训练 History memory encoder，包括 trajectory-guided Transformer、compact memory 分支和历史热力图解码模块；同时训练 Future Head 以及 History/Future 共享的 visibility、coarse map 和 Fine Decoder 参数。其训练目标为
+\textbf{Stage 1（历史--未来空间对齐）}保持 Bridge 为零映射（$\mathbf{Z}_t=\mathbf{Z}^{0}_t$），训练历史分支的轨迹引导 Transformer 与输入投影、Future Head 及共享解码头：
 \begin{equation}
 \mathcal{L}_{\mathrm{stage1}}
 =
@@ -277,14 +256,9 @@ Stage 1 从预训练的 History checkpoint 初始化，并保持 Past-to-Plan Br
 \lambda_f\mathcal{L}_{\mathrm{fut}}.
 \label{eq:stage1}
 \end{equation}
+保留 History loss 使未来 tube 解码的学习不侵蚀已有的历史定位能力，并让历史与未来预测在同一规范坐标系中完成参数对齐。
 
-System-2、Qwen.visual、原生条件投影器、Past-to-Plan Bridge 和 Action Head 在该阶段保持冻结。继续使用 History loss 的目的，是在学习未来 tube 解码时维持已有的历史定位能力，并使历史与未来空间预测在同一规范坐标系中完成参数对齐。
-
-\paragraph{Stage 2：Past--Plan--Action 联合训练。}
-
-Stage 2 从最佳 Stage 1 checkpoint 初始化，并启用零初始化的 Past-to-Plan Bridge。该阶段联合更新 History memory encoder、History/Future 热力图分支、共享空间解码模块和 Bridge；System-2、Qwen.visual、原生条件投影器以及 Action Head 继续保持冻结。
-
-虽然 Action Head 参数不更新，其输出关于输入 Plan 的梯度仍可回传至 Bridge 和 History Head。除原生 flow-matching 动作目标外，我们进一步加入 native preservation loss。对于相同的 noisy trajectory、diffusion timestep 和原生视觉条件，分别使用共享 Plan $\mathbf{Z}_t$ 和原生 Plan $\mathbf{Z}^{0}_t$ 计算冻结 Action Head 的速度预测：
+\textbf{Stage 2（认知--决策联合训练）}启用零初始化的 Bridge，联合更新认知分支与 Bridge。除动作目标 $\mathcal{L}_{\mathrm{act}}$（flow matching）外，加入 native preservation loss：对同一组 noisy trajectory 与扩散时间步，分别以共享 Plan 和原生 Plan 计算动作解码器的速度预测并约束一致，
 \begin{equation}
 \mathcal{L}_{\mathrm{pres}}
 =
@@ -301,36 +275,50 @@ Stage 2 从最佳 Stage 1 checkpoint 初始化，并启用零初始化的 Past-t
 \mathbf{X}_s,s,\mathbf{Z}^{0}_t,\mathbf{J}_t
 \right)
 \right]
-\right\|_2^2.
+\right\|_2^2,
 \label{eq:preservation}
 \end{equation}
-其中，$\operatorname{sg}[\cdot]$ 表示停止梯度。该目标约束新增历史分支不要无条件偏离原生动作先验。
-
-Stage 2 的总目标为
+两条支路共享同一组噪声与时间步（$\operatorname{sg}$ 为停止梯度）。总目标为
 \begin{equation}
-\begin{aligned}
 \mathcal{L}_{\mathrm{stage2}}
-={}&
+=
 \lambda_a\mathcal{L}_{\mathrm{act}}
 +
 \lambda_h\mathcal{L}_{\mathrm{hist}}
 +
 \lambda_f\mathcal{L}_{\mathrm{fut}}
 +
-\lambda_p\mathcal{L}_{\mathrm{pres}}\\
-&+
+\lambda_p\mathcal{L}_{\mathrm{pres}}
++
 \lambda_{\Delta}
 \left\|
 \mathbf{Z}_t-\mathbf{Z}^{0}_t
-\right\|_2^2,
-\end{aligned}
+\right\|_2^2.
 \label{eq:stage2}
 \end{equation}
-其中，$\mathcal{L}_{\mathrm{act}}$ 为原生 NextDiT 的 flow-matching 轨迹目标，最后一项直接限制共享 Plan 相对于原生 Plan 的残差幅度。
 
-推理时，模型只读取指令和截至当前时刻的 RGB。AMB3R 从 RGB 历史中估计相对位姿，History Head 生成历史热力图和 compact memory，Past-to-Plan Bridge 形成共享 Plan，Future Head 输出该 Plan 的未来空间解释，Action Head 则产生最终局部轨迹。History 和 Future heatmap 均可用于可视化和诊断，但不会以解码后的像素表示重新输入导航策略。
+\textbf{Stage 3（信任域内的桥接收敛）}处理上述张力中最关键的一环：动作残差的主体是不可约的多模态噪声，均匀的动作监督会将其转化为对 Plan 的持续漂移压力。为此，Stage 3 冻结全部热力图分支，将 Bridge 重置为零态后在信任域内单独重训，并作三项重构：(i) 启用式~\eqref{eq:trust_region} 的硬信任域，将残差惩罚替换为逐 token 的尺度无关形式 $\|\Delta\mathbf{z}\|^2/\|\mathbf{z}^{0}\|^2$，并以 preservation 为主导权重，使"静默 Bridge"成为无增益方向上的默认最优解；(ii) 以 advantage 加权动作损失，
+\begin{equation}
+w
+=
+\min\!\left(
+\frac{
+\bigl\|
+\mathbf{V}_{\mathrm{act}}(\mathbf{X}_s,s,\mathbf{Z}^{0}_t,\mathbf{J}_t)-\mathbf{V}^{\ast}
+\bigr\|_2^2
+}{
+m_{\mathrm{ref}}
+},\;
+c
+\right),
+\label{eq:advantage}
+\end{equation}
+动作监督仅在原生快系统确实出错的样本上（原生速度误差超出参考水平 $m_{\mathrm{ref}}$）向 Bridge 施压；(iii) checkpoint 依据真实采样 rollout 的端点误差选择——在共享噪声与一致的部署后处理下对比桥接与原生轨迹，而非 teacher-forced 误差。小权重的未来空间监督经共享 Plan 继续约束桥接方向，保持修正的空间可解释性。无约束桥接对闭环性能的破坏在实验部分通过消融量化。
 
-\begin{thebibliography}{2}
+\paragraph{推理。}
+推理时模型只读取指令与截至当前的 RGB：估计相对位姿、生成历史 affordance map 与 compact memory、在信任域内形成共享 Plan，随后并行解码未来热力图与动作轨迹。热力图用于可视化与诊断，不回流进策略。
+
+\begin{thebibliography}{9}
 
 \bibitem{internnav}
 M. Wei et al.
@@ -344,6 +332,75 @@ H. Wang and L. Agapito.
 with Backend.
 \newblock 2025.
 
+\bibitem{qwen25vl}
+S. Bai et al.
+\newblock Qwen2.5-VL Technical Report.
+\newblock 2025.
+
+\bibitem{vlnce}
+J. Krantz, E. Wijmans, A. Majumdar, D. Batra, and S. Lee.
+\newblock Beyond the Nav-Graph: Vision-and-Language Navigation in
+Continuous Environments.
+\newblock In ECCV, 2020.
+
 \end{thebibliography}
+
+\section*{附录 A：标签构造细节}
+
+\paragraph{四方向规范参考系。}
+以当前相机为原点、当前朝向为正前方，四个规范方向对应偏航角 $0^{\circ}$（Front）、$-90^{\circ}$（Right）、$180^{\circ}$（Back）、$+90^{\circ}$（Left），各自以针孔模型投影到 $64\times64$ 网格。
+
+\paragraph{历史标签。}
+对历史时刻 $\tau_k$，将其相机中心经 GT 位姿变换到当前坐标系，分别投影至四个规范方向；落在视锥内的方向进行深度遮挡测试（沿投影射线比较该方向深度图），通过者记为可见。可见方向以该投影点为中心、按投影几何自适应确定 $\sigma$ 的高斯核栅格化为空间标签；不可见方向仅提供负类 visibility 标签。标签在数据加载阶段按样本即时构造，GT 位姿、深度与内参不进入模型输入。
+
+\paragraph{未来标签。}
+未来监督由 expert 局部轨迹的 32 个重采样 waypoint 生成。平坦路段的 waypoint 高度取为与当前相机同高（相对高度为零）；对楼梯、电梯等存在垂直运动的片段，按动作对齐插值保留 expert 轨迹中的相对高度变化。每个时间段（8 个 waypoint）投影到四个规范方向后，以每 waypoint 一个高斯（三维支撑尺度 $1.5\,\mathrm{m}$，像素域 $\sigma\in[4,8]$）叠加栅格化为 tube 标签，并配套各时间段$\times$方向的 visibility 标签与时间段有效掩码。全程不使用未来帧图像与 GT 深度。
+
+\paragraph{因果位姿缓存。}
+离线缓存严格复现在线推理的因果流程：每条轨迹从头顺序 ingest 前视 RGB（前 20 帧初始化，其后增量建图），在各地图更新端点处快照当帧的全前缀估计位姿；快照先于任何后续帧的 ingest，未来信息不可能泄漏进早期训练行。缓存不做逐 episode 的尺度标定。训练数据加载器只接受该缓存（缺失即报错），不存在回退到 GT 位姿的路径。
+
+\section*{附录 B：模块细节与冻结策略}
+
+\paragraph{模块--实现对照。}
+慢系统为 InternNav System-2（Qwen2.5-VL 视觉语言规划器）；快系统为 InternNav System-1（12 层 NextDiT flow-matching 解码器，隐藏维 384，动作维 3，32 步）；条件投影 $\phi_{\mathrm{cond}}$ 为骨干原生的两层 MLP（$3584\!\to\!768$）。History Head 的视觉支路复用 Qwen2.5-VL 的视觉编码器：当前帧 hook 第 $\{7,15,23,31\}$ 层 ViT 特征（$1280$ 维、$16\times16$ 栅格）经 DPT 式融合；每张历史帧取 visual-merger 输出 token 的空间均值（$3584$ 维）。相对位姿四分量除以 $10$ 后作 16 频带正余弦编码（含原值共 $132$ 维），线性投影到融合维 $256$。每个历史槽的 token 序列为 $[\,$历史 token、trajectory token、$4\times8\times8$ 空间 token$\,]$ 共 258 个，经 2 层、4 头、FFN 1024 的 Transformer 编码器联合更新。
+
+\paragraph{Bridge。}
+多头交叉注意力（8 头，query 维 768，key/value 维 256），query/key/value 投影保持默认初始化，输出投影权重与偏置零初始化；query 侧与 key/value 侧各有独立 LayerNorm。该分支以 FP32 计算并禁用混合精度。无效历史槽经 key padding mask 屏蔽；当样本不存在有效历史槽时跳过注意力计算，输出与原生 Plan 逐比特一致。信任域截断（式~\ref{eq:trust_region}）在缩放系数封顶为 1 的形式下实现，零修正保持精确为零。
+
+\paragraph{History/Future 参数共享清单。}
+共享模块：四方向 visibility MLP、coarse heatmap MLP、Fine Decoder 空间细化主干（Future 经函数式调用替换最后一层输出投影）。History 专属：trajectory-guided Transformer、历史/空间 token 输入投影与位置嵌入。Future 专属（共 11 个张量）：Plan 投影、future 类型嵌入、4 个时间段嵌入、可学习空间查询（$4\times8\times8\times256$）、summary/spatial 两个 LayerNorm、future 输出投影。
+
+\paragraph{精确行为边界。}
+(i) Right/Back/Left 规范槽不读取任何侧后 RGB，方向编码为固定角基经可学习两层 MLP；(ii) coarse heatmap 由空间 token 解码，compact memory 不直接预测热力图，二者经联合注意力共享历史表征；(iii) 空间监督只施加在 $64\times64$ 的 fine logits 上，coarse 图作为 Fine Decoder 的中间输入间接受约束；(iv) preservation 的两条支路必须共享同一组噪声与时间步，否则目标退化为对随机性的拟合；(v) 历史与未来热力图的解码结果不以任何显式控制信号回流进动作解码器。
+
+\paragraph{各阶段冻结策略。}
+骨干（慢系统、视觉编码器、条件投影、动作解码器）在所有阶段冻结。历史分支的多尺度特征融合与四方向规范槽构造在预训练与位姿域适配阶段训练，进入 Stage 1--3 后冻结继承。各阶段可训练集合：Stage 1 为历史分支的 Transformer 与输入投影、Future Head、共享解码头；Stage 2 在此之上加 Bridge；Stage 3 仅 Bridge（自零态重训）。
+
+\section*{附录 C：训练超参数}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+ & Stage 1 & Stage 2 & Stage 3 \\
+\midrule
+$\lambda_a$（action） & --- & $1.0$ & $1.0$（advantage 加权） \\
+$\lambda_h$（history） & $0.3$ & $0.3$ & $\approx0$ \\
+$\lambda_f$（future） & $0.3$ & $0.3$ & $0.1$ \\
+$\lambda_p$（preservation） & --- & $0.5$ & $2.0$ \\
+$\lambda_{\Delta}$（plan 残差） & --- & $0.01$（绝对） & $10$（相对 $\|\Delta\mathbf{z}\|^2/\|\mathbf{z}^0\|^2$） \\
+信任域 $\rho$ & --- & --- & $0.05$ \\
+advantage（$m_{\mathrm{ref}}$ / $c$） & --- & --- & $0.125$ / $4$ \\
+可训练模块 & 认知分支+共享头 & +Bridge & 仅 Bridge（重置为零） \\
+epoch & 4 & 4 & 3 \\
+选点指标 & 历史/未来验证指标 & 验证综合指标 & 采样 rollout 端点误差 \\
+\bottomrule
+\end{tabular}
+\caption{分阶段损失权重与训练设置。}
+\label{tab:hparams}
+\end{table}
+
+学习率（AdamW，weight decay $10^{-2}$）：Stage 1 中 Future Head $10^{-4}$、历史分支 $2\times10^{-5}$、Fine Decoder $5\times10^{-6}$；Stage 2 相应降为 $5\times10^{-5}$、$10^{-5}$、$5\times10^{-6}$，Bridge $2\times10^{-5}$；Stage 3 中 Bridge $10^{-5}$。全局 batch 为 8（8 卡$\times$每卡 1$\times$无累积），训练维护 EMA 权重。历史监督内部权重：visibility $1.0$（正类权重 $7$）、空间 CE $1.0$、soft-argmax 坐标 $0.2$、不可见抑制 $0.25$、视角宏平衡 $0.5$、方向宏平衡 $0.5$、全景视角分类 $1.0$；未来监督权重：visibility $1.0$（正类权重 $1$）、tube 空间分布 $1.0$、不可见抑制 $0.25$、视角宏平衡 $0.5$，坐标项与方向宏平衡项置零。历史槽数 $K\in[5,8]$（每样本至少 5 个有效历史帧）。
 
 \end{document}
