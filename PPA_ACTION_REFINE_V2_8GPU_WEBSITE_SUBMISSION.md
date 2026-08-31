@@ -162,6 +162,14 @@ export TRITON_CACHE_DIR=$RUNTIME_ROOT/triton
 - Startup log must show `PPA bridge retrains from its exact-zero fresh state`
   and `max_delta_ratio=0.05`.
 
+## Outcome (2026-09-01)
+
+This pipeline, together with the byte-exact native System2 evaluation fix
+(commit ed46c76), closed the loop at **SR 62.81% / SPL 55.04%** on the full
+1839-episode R2R val-unseen — statistically equal to the native baseline
+(62.48% / 55.23%) with the bridge active on 99.6% of episodes. Full evidence
+chain and artifact index: `docs/ppa_v2_sr_recovery_report.md`.
+
 ## Acceptance gate before any full evaluation
 
 Deploy the selected `best_deployment_full.pth` with `PPA_EVAL_CONFIG` pointing
