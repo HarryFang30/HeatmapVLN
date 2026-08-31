@@ -87,3 +87,7 @@ nohup.out
 *.synctex.gz
 /docs/method.out
 /docs/method.pdf
+
+# Microsoft Office lock/temp files
+~$*
+**/~$*
