@@ -4,7 +4,7 @@ set -Eeuo pipefail
 readonly TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly STAGE_ROOT="$(cd "${TEST_DIR}/.." && pwd)"
 readonly LAUNCHER="${STAGE_ROOT}/scripts/run_past_plan_action_8gpu_mxc500.sh"
-readonly WEBSITE="${STAGE_ROOT}/PPA_8GPU_WEBSITE_SUBMISSION.md"
+readonly WEBSITE="${STAGE_ROOT}/docs/experiments/legacy/ppa-stage12-submission-8gpu.md"
 readonly TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ppa-launcher-test.XXXXXX")"
 readonly ALLOWED_ROOT="${TEST_ROOT}/allowed"
 readonly REPO_ROOT="${ALLOWED_ROOT}/repo"

@@ -12,8 +12,10 @@
    什么数值算"没测出来"。看到结果再补判据，等于没有判据。
 3. 跑完补 **"结果 / 结论 / 边界"**，状态改成 ✅ / ❌ / ⚠️。
    "边界"一段是强制的：这个结论**不能**推广到哪里。
-4. 详细证据链另开 `docs/<name>_report.md`，台账只留一句话结论 + 链接。
-   复现命令另开 `docs/<name>_runbook.md` 或写进 `scripts/run_*.sh`。
+4. 详细证据链另开 `expNN-<名字>-report.md`，台账只留一句话结论 + 链接。
+   复现命令另开 `expNN-<名字>-runbook.md`（或网站提交物 `-submission.md`），
+   两者都放在本目录下，文件名前缀与编号一致，这样按名字排序就是按编号排序。
+   未编号的历史材料放 `legacy/`。
 5. **每个数字都要带产物路径**。台账里出现的任何指标，都要能在 §4 的路径下查到原始文件。
 6. 集群任务一律走网站提交（形态见 `CLAUDE.md` §1.1），提交物本身进仓库，不要只留在聊天里。
 
@@ -64,8 +66,8 @@ delta 惩罚 + advantage 加权 action loss + **采样 rollout 终点误差**作
 **教训.** stage0 的 A/B 只审计了"v3 栈内部零桥前向等价"，从未审计"v3 栈 ≟ 认证复刻栈"。
 **冻结模块的输入保真度必须逐字节对齐，不能靠栈内自洽。**
 
-📄 [docs/ppa_v2_sr_recovery_report.md](ppa_v2_sr_recovery_report.md) ｜
-🔁 `PPA_ACTION_REFINE_V2_8GPU_WEBSITE_SUBMISSION.md`
+📄 [exp01-sr-recovery-report.md](exp01-sr-recovery-report.md) ｜
+🔁 [exp01-sr-recovery-submission.md](exp01-sr-recovery-submission.md)
 
 ---
 
@@ -113,8 +115,8 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
 → EXP-03；③ 数据是 random-walk，不是部署评测的 R2R。四条训练曲线在后 8000 步全部走平，
 所以不是训练不足造成的。
 
-📄 [docs/heatmap_shortcut_probe_report.md](heatmap_shortcut_probe_report.md) ｜
-🔁 [docs/heatmap_shortcut_probe_runbook.md](heatmap_shortcut_probe_runbook.md) ｜
+📄 [exp02-shortcut-probe-report.md](exp02-shortcut-probe-report.md) ｜
+🔁 [exp02-shortcut-probe-runbook.md](exp02-shortcut-probe-runbook.md) ｜
 `scripts/run_heatmap_shortcut_diagnostic_8gpu_mxc500.sh`
 
 ---

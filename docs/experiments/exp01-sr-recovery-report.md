@@ -98,4 +98,4 @@ input_ids / pixel_values / image_grid_thw 与复刻实现全部相等）；
 | 认证复刻栈（golden 参照） | `evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802/tools/` |
 | 20 集探针 | `tmp/native_fix_dead20_out/` + `tmp/native_fix_dead20_cohort.json` |
 | 关键 commit | 重训 `e73b774`；采集器 `77e374a`/`9a9ca49`；栈修复 `ed46c76` |
-| 复现命令 | `PPA_ACTION_REFINE_V2_8GPU_WEBSITE_SUBMISSION.md` |
+| 复现命令 | `docs/experiments/exp01-sr-recovery-submission.md` |

@@ -47,7 +47,7 @@ bash run_collect_panoramic_mxc500.sh
 
 Verify every clip has `depth_front_down` in its first chunk and that
 `meta.json` scene/episode ids come from the reset-driven episode (the audit
-snippet in `docs/server_habitat_panoramic_recollect_plan.md` §4, pointed at
+snippet in `docs/ops/server_habitat_panoramic_recollect_plan.md` §4, pointed at
 this output). Then submit the formal collection (measured ~15-20 s/clip per
 worker, so 5000 clips on 8 workers is an afternoon):
 
@@ -168,7 +168,7 @@ This pipeline, together with the byte-exact native System2 evaluation fix
 (commit ed46c76), closed the loop at **SR 62.81% / SPL 55.04%** on the full
 1839-episode R2R val-unseen — statistically equal to the native baseline
 (62.48% / 55.23%) with the bridge active on 99.6% of episodes. Full evidence
-chain and artifact index: `docs/ppa_v2_sr_recovery_report.md`.
+chain and artifact index: `docs/experiments/exp01-sr-recovery-report.md`.
 
 ## Acceptance gate before any full evaluation
 

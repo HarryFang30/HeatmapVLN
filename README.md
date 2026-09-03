@@ -502,11 +502,11 @@ An interactive launcher is also available: `./docker/docker-run.sh`
 
 | Document | Description |
 |:---------|:------------|
-| [`docs/loss.md`](docs/loss.md) | Loss function components and weighting strategy |
-| [`docs/heatmap_loss_strategy.md`](docs/heatmap_loss_strategy.md) | Temperature scheduling and heatmap loss design |
-| [`docs/training_outputs.md`](docs/training_outputs.md) | Output directory structure and metrics format |
-| [`docs/troubleshooting-guide.md`](docs/troubleshooting-guide.md) | Common issues and debugging guide |
-| [`docs/ReadBeforeEvaluatingHabitat.md`](docs/ReadBeforeEvaluatingHabitat.md) | Habitat R2R evaluation setup notes |
+| [`docs/loss.md`](docs/design/loss.md) | Loss function components and weighting strategy |
+| [`docs/heatmap_loss_strategy.md`](docs/design/heatmap_loss_strategy.md) | Temperature scheduling and heatmap loss design |
+| [`docs/training_outputs.md`](docs/ops/training_outputs.md) | Output directory structure and metrics format |
+| [`docs/troubleshooting-guide.md`](docs/ops/troubleshooting-guide.md) | Common issues and debugging guide |
+| [`docs/ReadBeforeEvaluatingHabitat.md`](docs/ops/ReadBeforeEvaluatingHabitat.md) | Habitat R2R evaluation setup notes |
 
 ## Acknowledgements
 

@@ -85,8 +85,8 @@ nohup.out
 /evaluation_artifacts/
 *.aux
 *.synctex.gz
-/docs/method.out
-/docs/method.pdf
+/docs/paper/method.out
+/docs/paper/method.pdf
 
 # Microsoft Office lock/temp files
 ~$*

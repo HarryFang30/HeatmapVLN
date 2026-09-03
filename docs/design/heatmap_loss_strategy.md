@@ -11,7 +11,7 @@
 
 这些内容**不是当前主训练路径正在使用的实现**。
 
-当前仓库真实生效的主路径请以 `docs/loss.md` 为准。那里记录的是：
+当前仓库真实生效的主路径请以 `docs/design/loss.md` 为准。那里记录的是：
 
 - `HeatmapVLNLoss`
 - `visibility BCE`
@@ -38,7 +38,7 @@
 
 如果你想了解“现在代码里到底在训练什么”，请优先阅读：
 
-1. `docs/loss.md`
+1. `docs/design/loss.md`
 2. `src/models/heatmap/heatmap_vln_loss.py`
 3. `scripts/training/train_loop.py`
 4. `scripts/training/validate.py`
