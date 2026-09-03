@@ -248,8 +248,8 @@ bug，其实是桩没跟上 —— 加属性时记得同步更新桩。
 ## 8. 实验台账
 
 **所有实验记在 `docs/experiments/`，不要只留在聊天里。**
-台账是 `docs/experiments/README.md`。 那份文档记的是
-*为什么跑、判据是什么、结论能支撑到哪一步*，结果本身在各自的 `docs/*_report.md` 里。
+台账是 `docs/experiments/README.md`，记的是*为什么跑、判据是什么、结论能支撑到哪一步*；
+结果本身在同目录的 `expNN-<名字>-report.md` 里。
 
 跑新实验之前：
 
