@@ -34,6 +34,8 @@
 | [EXP-07](#exp-07-主表第二个种子parity--ne-是否可复现长路径增益是否存在) | 主表 parity + NE 改善在第二个种子上是否复现；长路径（≥10 m）增益是否存在 | 🔬 | 2026-09-03 提交桥臂（种子 1337），native 臂待提 |
 | [EXP-08](#exp-08-阶段二联合训练买到了什么) | 阶段二（认知头与动作联合训练）对最终桥的行为有没有可测影响 | 🔬 | 2026-09-03 提交（链式任务第 4 臂） |
 | [EXP-09](#exp-09-阶段三配方里哪一项真的在起作用) | 阶段三五处改动里，信赖域 / advantage / 惩罚重校准 / rollout 选点各自有没有可测效应 | 🔬 | 2026-09-03 提交 A/B/C（链式任务前 3 臂）；D 免费；参照重验待跑 |
+| [EXP-10](#exp-10-未来认知头与桥的关联是否可观测) | 注入的历史记忆是否改变未来预测（关联的可观测性）；Z 的第 i 个向量是否真的绑定第 i 段 | 🔬 | 2026-09-04 桥开臂随 EXP-09-R 跑；桥关臂待跑；token 绑定探针待写 |
+| [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | 🔬 | 2026-09-04 开发机全量 val 在跑（40 集预览已看到，见条目） |
 
 ---
 
@@ -359,6 +361,62 @@ epoch、选点与 v2 相同；`val_rollout_batches: 64`（512 对）。链式启
 
 ---
 
+### EXP-10 未来认知头与桥的关联是否可观测
+
+**问题.** 方法节说三类输出经同一个 Z_t 关联、信息沿"历史认知 → Z_t → {未来热力图, 动作}"单向流动。
+桥的 Δ 只有 ~2%，那么注入到底有没有**改变未来预测**？如果未来指标对桥开/关完全不敏感，
+"关联"就只是结构上的说法，没有可观测证据。第二个问题是结构性的：未来头把 Z_t 的第 i 个
+向量解码成第 i 段路点，这个绑定是真的还是装饰？
+
+**假设.** H1：桥开时未来指标与桥关（Δ=0）有可测差异。
+H2：打乱 Z_t 的 4 个向量顺序会明显破坏未来预测（说明 token↔时段绑定是真实结构）。
+
+**判据（预注册，2026-09-04）.** 已知信息披露：v2 checkpoint 在 **64 对**规模下的未来指标已见过
+（Soft-IoU 0.2397 / top-k 召回 0.7717 / 可见性 F1 0.9148，`run_20260829_115642` epoch 4）；
+**桥关臂的数字尚未产生**，H1 的判据据此在看到它之前写死。
+- **H1 支持**：桥开 vs 桥关的 top-k 支持召回差 > 1pt，或 Soft-IoU 差 > 0.01（同 checkpoint、
+  同 val 集、同一次数据顺序）。→ 可写"历史注入改变了未来预测"。
+- **H1 否定**：两者三项指标差都 < 0.2pt / 0.002。→ 未来头对注入不敏感，方法节的"关联"
+  只保留结构描述（同一 Z_t 解码），不声称可观测效应。
+- **H1 没测出来**：落在中间。→ 记为趋势，不进主张。
+- **H2 支持**：打乱后 Soft-IoU 或 top-k 召回相对不打乱下降 > 20%（相对值）。→ 可写
+  "第 i 个向量负责第 i 段"。**否定**：下降 < 5%。→ 删掉逐段对应的说法，改写成
+  "N_z 个向量共同解码未来区域"。**没测出来**：5%–20%。
+- 附带（无判据、只报告）：未来侧/后视角 Soft-IoU ≈ 0 与 Soft-IoU 在训练中随 loss 下降而下降
+  的现象，如实写进实验，并以 top-k 召回作为主指标（EXP-11 给出标签层面的原因）。
+
+**设置.** H1 = 两次 `--validate-only`：桥开用
+`configs/ablation/exp09r_stage3_v2_revalidate_512_8gpu.yaml`（与 EXP-09-R 同一次运行，未来指标顺带产出）；
+桥关同 config 但 `past_plan_action_reset_bridge: true`（桥归零 ⇒ Δ=0，前向与 native 逐位一致）。
+**代价：开发机 8 卡 × 约 0.5 h**（桥开臂已随 EXP-09-R 在跑）。
+H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_z / past_output / past_head` 后
+用打乱的 plan_z 再解一次，同一前向、同一 batch），**尚未实现**，优先级低于 EXP-04。
+
+---
+
+### EXP-11 四方向表征的标签覆盖率
+
+**问题.** "只预测前视 / 更少方向"的重训消融要改模型和标签、重训阶段一（7.5 h），而结论可以从
+标签本身读出来：历史路点根本不在前视里。所以用**描述统计**替代那次重训，直接回答"为什么要四方向"。
+
+**这不是假设检验**，没有支持/否定判据；预先声明的是**它能许可什么措辞**：
+- 若"任一视角都不可见"的比例 < 10% 且非前视占绝大多数 → 可写"历史路点绝大多数不在前视视野内，
+  只前视的表征无法表达它们"，并据此说明四方向的必要性；
+- 若未来标签的侧/后视支持比例 < 5% → 必须如实写"四方向在未来头上主要起统一坐标系的作用"，
+  不得把四方向说成对未来预测的增益。
+
+**已看到的部分结果（诚实披露）.** 40 个 val 样本（320 个历史槽位）的预览：历史可见比例
+前 0.0% / 右 9.4% / 后 83.4% / 左 2.2%，任一视角都不可见 5.0%，可见但从不在前视 95.0%；
+未来时段×视角 bin 前 91.9% / 右 8.1% / 后 0.0% / 左 2.5%，仅前视 89.4%。上面的措辞规则是在
+看到这份预览**之后**写的——因此本条目按"描述统计"报告，不作为检验任何假设的证据。
+
+**设置.** `scripts/tools/summarize_direction_coverage.py --config configs/ppa_action_refine_v2_8gpu.yaml
+--split val --max-samples 0`，走生产数据集（v2 数据 + AMB3R 缓存 val 划分，4734 个样本），
+标签由 `_compute_per_history_multiview_heatmaps` / 未来标签渲染器生成，与训练看到的完全一致。
+纯 CPU，**代价约 1 h**，产物 `model/exp11_direction_coverage/coverage_val_full.json`。
+
+---
+
 ## 4. 公共资源
 
 所有路径都在 `/mnt/afs/liwenhao/agent/370910109/` 下（旧路径 `/mnt/afs/lixiaoou/intern/fjl`
@@ -382,6 +440,8 @@ epoch、选点与 v2 相同；`val_rollout_batches: 64`（512 对）。链式启
 | Stage2 联合 best（79 Heatmap + 11 Future 张量来源） | `model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint/run_20260818_104438/checkpoints/best.pth` |
 | Stage1 对齐 best（EXP-08 的父 checkpoint：79 Heatmap + 11 Future，桥 0 张量） | `model/output_past_plan_action_v1_8gpu/stage1_map_pretrain/run_20260817_205027/checkpoints/best.pth` |
 | 阶段三消融臂输出（EXP-08/09） | `model/ablation_stage3/<arm>/run_*/` |
+| EXP-09-R / EXP-10 桥开重验（512 对） | `model/exp09r_revalidate_512/{best,epoch_004}/run_*/manifest/pre_training_validation.json` |
+| EXP-11 方向覆盖率 | `model/exp11_direction_coverage/coverage_val_full.json` |
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 
