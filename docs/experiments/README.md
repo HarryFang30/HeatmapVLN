@@ -29,8 +29,9 @@
 | [EXP-02](#exp-02-历史认知头是不是在用视觉定位历史) | 历史认知头到底是"从视觉定位历史"，还是"把位姿投影出来" | ❌ | 是投影。定位完全由位姿决定，外观只贡献可见性（AUPRC +4~6 点） |
 | [EXP-03](#exp-03-部署头本身是否也只看位姿) | 部署权重（而非探针）是否也只看位姿 | ⏳ | — |
 | [EXP-04](#exp-04-位姿有噪声时外观是否变重要) | 位姿换成 AMB3R VO（有噪声）后，外观是否变重要 | ⏳ | — |
-| [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | ⏳ | — |
-| [EXP-06](#exp-06-零桥在修复栈上是否等于-native) | 修复后的评测栈跑零桥，是否精确等于 native | ⏳ | — |
+| [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | 🔬 | 2026-09-03 提交，全量 1839 集 |
+| [EXP-06](#exp-06-零桥在修复栈上是否等于-native) | 修复后的评测栈跑零桥，是否精确等于 native | ⏳ | 2026-09-03 消融规划暂缓（见条目） |
+| [EXP-07](#exp-07-主表第二个种子parity--ne-是否可复现长路径增益是否存在) | 主表 parity + NE 改善在第二个种子上是否复现；长路径（≥10 m）增益是否存在 | 🔬 | 2026-09-03 提交桥臂（种子 1337），native 臂待提 |
 
 ---
 
@@ -194,13 +195,23 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
   信赖域挽回了 X 个点"。
 - **否定**：SR 落在 62.8% ± 1.5pt。→ **信赖域的卖点必须改写**成"可控性与防御性设计"，
   不能声称它挽救了 SR。这个结果同样要如实写。
+- **没测出来**（2026-09-03 开跑前补的第三档）：SR 比 62.8% 低 1.5–3pt。→ 方向支持但幅度
+  在单种子噪声边缘，只能写"无约束注入有害但幅度有限"，不得写"挽回了 X 个点"；
+  要写具体分数必须再补一个种子。
+- 判读一律用同 episode 配对 bootstrap（`scripts/tools/paired_closed_loop_bootstrap.py`，
+  分别对 native 与 v2 终局配对），不用裸均值差。
 
-**设置.** 一次网站提交，复用 `scripts/run_ppa_stage2_r2r_val_unseen_8gpu_mxc500.sh`，
-只把 `PPA_EVAL_CHECKPOINT` 指向 v1 refine 的
-`model/output_past_plan_action_action_refine_v1_8gpu/run_20260818_225001/checkpoints/best.pth`
-和对应的 v1 config，换新的 `PPA_EVAL_OUTPUT_ROOT`。
-**代价：8 卡 × 约 40 小时全量**；想省可以用按死亡/存活分层抽样的固定 600 集子集
-（~13 小时），但那样四格必须用同一子集重算。
+**设置.** 一次网站提交，复用 `scripts/run_ppa_stage2_r2r_val_unseen_8gpu_mxc500.sh`
+（修复栈，与 EXP-01 终局评测同一套；协议种子 42），只换四个变量：
+`PPA_EVAL_CHECKPOINT` → `model/output_past_plan_action_action_refine_v1_8gpu/run_20260818_225001/checkpoints/best_deployment_full.pth`
+（自足部署文件：79+11+10 张量，v1 评测当年加载的就是它；`best.pth` 缺 11 个冻结的未来头张量，评测端预检会拒绝。
+桥 out_proj 权重 RMS 0.0032，是 v2 的 5 倍）；`PPA_EVAL_CONFIG` →
+`configs/ppa_action_refine_8gpu.yaml`（与该 run 的 manifest 在模型字段上逐项相同：
+无 `max_delta_ratio` ⇒ 部署端不截断，preserve 0.5 / delta 0.01 绝对，teacher-forced 选点）；
+`PPA_EVAL_OUTPUT_ROOT` → `model/eval_ppa_refine_v1_unconstrained_nativefix_r2r_val_unseen_8gpu`；
+`PPA_EVAL_ARM` → `ppa_refine_v1_unconstrained_online_amb3r`。全量 1839 集，不用子集。
+**代价：8 卡 × 约 18 小时**（EXP-01 终局实测 07:54 → 次日 01:55）。
+提交物：[exp05-v1-bridge-fixed-stack-submission.md](exp05-v1-bridge-fixed-stack-submission.md)。
 
 ---
 
@@ -218,8 +229,51 @@ EXP-01 的栈修复只验证到 token parity（前向逐位相等），没有验
 - **否定**：显著偏离。→ **修复栈仍与认证复刻栈不等价，EXP-01 之后所有基于该栈的
   结论都要重新审视**，优先级立刻升到最高。
 
-**设置.** 同 EXP-05 的评测提交，用 stage0 零桥 arm 开关。
-**代价：8 卡 × 约 40 小时**（或同一 600 集子集 ~13 小时）。几乎是顺手的，强烈建议跟 EXP-05 一起提。
+**设置.** 同 EXP-05 的评测提交，用 stage0 零桥 arm 开关（`--ppa_stage0_action_arm baseline`，
+启动脚本尚未透传，且脚本末尾的"PPA 至少生效一次"检查要绕过）。**代价：8 卡 × 约 18 小时。**
+
+**状态（2026-09-03）.** 消融规划里决定**暂缓**：stage0 treatment 臂已在代码里逐张量验证
+`plan_z == plan_z0`，EXP-01 的死亡集也已恢复到 native 水位（67.68% vs 68.34%），
+这 18 小时目前买不到论文里的新主张。全文对照只用一个定义（认证复刻栈的 native），
+EXP-07 的第二个种子也按此跑。若 EXP-05 或 EXP-07 出现无法用桥解释的偏差，本条立刻升为最高优先级。
+
+---
+
+### EXP-07 主表第二个种子：parity + NE 是否可复现，长路径增益是否存在
+
+**问题.** 主表（EXP-01 终局 vs native）只有协议种子 42 这一份配对样本。同 1839 集、同种子的
+配对 bootstrap（2000 次重采样）给出：SR +0.33 [−1.25, +2.01]、SPL −0.19 [−1.50, +1.17]、
+OS +1.14 [−0.16, +2.34]、**NE −0.16 m [−0.30, −0.02]**；预先取整的长路径分层
+（测地距离 ≥ 10 m，546 集）：SR +1.65 [−1.10, +4.58]、SPL +0.89、OS +1.28、
+**NE −0.33 m [−0.69, −0.01]**；其余分层 ≈0（8.4–10.4 m 一段甚至 SR −1.96）。
+这些是单种子、其中长路径是事后看到的分层——都还不能写成主张。
+（产物：`model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`，
+脚本 `scripts/tools/paired_closed_loop_bootstrap.py`。）
+
+**假设.** H1（主表）：SR/SPL 与 native 持平、NE 改善在第二个种子上复现。
+H2（长路径）：桥的增益集中在测地距离 ≥ 10 m 的 episode。
+
+**判据（预注册，2026-09-03，在种子 1337 出任何结果之前写死；阈值固定 10 m，不再换）.**
+- **H1 支持**：两种子合并（2×1839 配对）SR 与 SPL 的 95% CI 都包含 0 且下界 > −1.5pt，
+  且 NE 的 95% CI 上界 < 0。→ 主表写"SR/SPL 持平、NE 显著改善"。
+- **H1 否定**：SR 或 SPL 的合并 CI 上界 < −1.5pt（桥有害）→ "不劣于 native"不成立，如实写；
+  或 NE 合并 CI 包含 0 且点估计 > −0.05 m → 删除 NE 主张。
+- **H1 没测出来**：NE 合并 CI 包含 0 但点估计 ≤ −0.10 m，或两种子 NE 方向相反
+  → 只写趋势不写主张，补第三个种子再定。
+- **H2 支持**：种子 1337 的 ≥10 m 分层 SR 差 > 0 且 NE 差 < 0（与种子 42 同向），
+  且合并配对 CI 在 SR 或 NE 至少一项上不含 0 → 写"长路径上提升"，intro 改为"长路径上提升、全量不劣"。
+- **H2 否定**：种子 1337 分层 SR 差 ≤ 0 或 NE 差 ≥ 0（方向翻转）→ 长路径主张整体删除，
+  不换阈值重试。
+- **H2 没测出来**：同向但合并 CI 在 SR 和 NE 上都含 0 → 作为描述性观察放在分析段，不进主张。
+
+**设置.** 两臂全量 1839 集、协议种子 1337、其余与种子 42 完全一致。桥臂：修复栈
+`scripts/run_ppa_stage2_r2r_val_unseen_8gpu_mxc500.sh`（`PPA_EVAL_PROTOCOL_SEED=1337`，
+checkpoint/config 与 EXP-01 终局相同，输出根
+`model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu_seed1337`）。native 臂：认证复刻栈
+（把 `evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802` 复制为新 plan 目录、
+只改 `PROTOCOL_SEED`，原件不动；提交物待补）。分析：`paired_closed_loop_bootstrap.py`
+逐种子 + 合并。**代价：8 卡 × 约 18 小时 × 2 臂。**
+提交物：[exp07-seed1337-submission.md](exp07-seed1337-submission.md)。
 
 ---
 
@@ -242,9 +296,10 @@ EXP-01 的栈修复只验证到 token parity（前向逐位相等），没有验
 |---|---|
 | 认证复刻栈（62.5% 的 golden 参照，**不在 git 仓库里**） | `evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802/tools/` |
 | 部署 checkpoint（v2 信赖域桥） | `model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth` |
-| v1 漂移桥 checkpoint（EXP-05 用） | `model/output_past_plan_action_action_refine_v1_8gpu/run_20260818_225001/checkpoints/best.pth` |
+| v1 漂移桥 checkpoint（EXP-05 用；部署必须用 `best_deployment_full.pth`，`best.pth` 缺未来头张量） | `model/output_past_plan_action_action_refine_v1_8gpu/run_20260818_225001/checkpoints/best_deployment_full.pth` |
 | Stage2 联合 best（79 Heatmap + 11 Future 张量来源） | `model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint/run_20260818_104438/checkpoints/best.pth` |
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
+| 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 
 ### 数据集
 

@@ -48,6 +48,11 @@ DISPLAY_BASE="${PPA_EVAL_DISPLAY_BASE:-360}"
 SERVER_START_TIMEOUT_S="${PPA_EVAL_SERVER_START_TIMEOUT_S:-3600}"
 SERVER_STAGGER_S="${PPA_EVAL_SERVER_STAGGER_S:-15}"
 RPC_TIMEOUT_MS="${PPA_EVAL_RPC_TIMEOUT_MS:-600000}"
+# Deterministic-sampling protocol seed and the merged-result arm label.  Seed
+# 42 is the certified main-table run; a second seed must land in its own
+# PPA_EVAL_OUTPUT_ROOT so --resume never mixes seeds.
+PROTOCOL_SEED="${PPA_EVAL_PROTOCOL_SEED:-42}"
+EVAL_ARM="${PPA_EVAL_ARM:-ppa_stage2_online_amb3r}"
 
 X11_BUNDLE="$FJL_ROOT/tools/x11_headless_bundle_ubuntu22_20260801_v4"
 XVFB_BIN="$X11_BUNDLE/bin/Xvfb"
@@ -119,6 +124,7 @@ done
 
 IFS=',' read -r -a GPUS <<< "$GPU_CSV"
 [[ "${#GPUS[@]}" -eq 8 ]] || die "PPA_EVAL_GPU_DEVICES must contain 8 IDs"
+[[ "$PROTOCOL_SEED" =~ ^[0-9]+$ ]] || die "PPA_EVAL_PROTOCOL_SEED must be a non-negative integer"
 [[ "$(printf '%s\n' "${GPUS[@]}" | sort -u | wc -l | tr -d ' ')" -eq 8 ]] || die "GPU IDs must be unique"
 for rank in $(seq 0 7); do
   [[ "${GPUS[$rank]}" =~ ^[0-9]+$ ]] || die "invalid GPU ID: ${GPUS[$rank]}"
@@ -260,7 +266,7 @@ PY
   echo "[ppa-eval] rank=$rank model=$model_addr vo=$vo_addr ready"
 done
 
-echo "[ppa-eval] starting all 1,839 val-unseen episodes across 8 shards"
+echo "[ppa-eval] starting all 1,839 val-unseen episodes across 8 shards (protocol seed $PROTOCOL_SEED, arm $EVAL_ARM)"
 for rank in $(seq 0 7); do
   gpu="${GPUS[$rank]}"
   shard="$(printf '%02d' "$rank")"
@@ -282,7 +288,7 @@ for rank in $(seq 0 7); do
       --amb3r_vo_rpc_timeout_ms "$RPC_TIMEOUT_MS" \
       --amb3r_vo_rpc_jpeg_quality 95 \
       --rpc_timeout_ms "$RPC_TIMEOUT_MS" --rpc_jpeg_quality 90 \
-      --rpc_protocol_seed 42 --rpc_require_deterministic_sampling \
+      --rpc_protocol_seed "$PROTOCOL_SEED" --rpc_require_deterministic_sampling \
       --rpc_policy_mode heatmapvln \
       --scenes_dir "$SCENES_DIR" \
       --data_path "$COHORTS_DIR/dataset_shard_${shard}.json.gz" \
@@ -321,7 +327,7 @@ done
   --num-shards 8 --expected-episodes "$EXPECTED_EPISODES" \
   --protocol heatmapvln-r2r-json-v3 \
   --sampling-protocol heatmapvln-nextdit-sha256-v1 \
-  --protocol-seed 42 --evaluation-arm ppa_stage2_online_amb3r
+  --protocol-seed "$PROTOCOL_SEED" --evaluation-arm "$EVAL_ARM"
 
 "$QWEN_PYTHON" - "$MERGED_DIR" "$EXPECTED_EPISODES" <<'PY'
 import json
