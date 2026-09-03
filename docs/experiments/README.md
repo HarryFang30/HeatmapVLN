@@ -27,7 +27,7 @@
 |---|---|---|---|
 | [EXP-01](#exp-01-把闭环-sr-拉回-native-水平) | 桥接上线后闭环 SR 从 62.5% 掉到 18.1%，能不能在不改架构、不做部署端衰减的前提下拉回来 | ✅ | 能。SR 62.81% vs native 62.48%，桥生效率 99.6% |
 | [EXP-02](#exp-02-历史认知头是不是在用视觉定位历史) | 历史认知头到底是"从视觉定位历史"，还是"把位姿投影出来" | ❌ | 是投影。定位完全由位姿决定，外观只贡献可见性（AUPRC +4~6 点） |
-| [EXP-03](#exp-03-部署头本身是否也只看位姿) | 部署权重（而非探针）是否也只看位姿 | ⏳ | — |
+| [EXP-03](#exp-03-部署头本身是否也只看位姿) | 部署权重（而非探针）是否也只看位姿 | ⏳ | 工具与输入已就绪（2026-09-04），等开发机 GPU |
 | [EXP-04](#exp-04-位姿有噪声时外观是否变重要) | 位姿换成 AMB3R VO（有噪声）后，外观是否变重要 | ⏳ | — |
 | [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | 🔬 | 2026-09-03 提交，全量 1839 集 |
 | [EXP-06](#exp-06-零桥在修复栈上是否等于-native) | 修复后的评测栈跑零桥，是否精确等于 native | ⏳ | 2026-09-03 消融规划暂缓（见条目） |
@@ -144,13 +144,23 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
   掉 >5pt）。→ 说明长训练确实用上了外观，措辞可以放宽，但要给出具体是哪一项在用。
 - **测不出来**：两个指标落在中间区间 → 说明干预强度不合适，换更强的干预（单槽位替换）再来。
 
-**设置.** 纯评测，无训练：`diagnose_heatmap_shortcuts.py --architecture internnav_single_view
---mode full --head-checkpoint <部署头> --standard-only 关闭`，跑全部六项干预。
-需要先把部署 checkpoint 里的历史头张量抽成 head-only 格式（`head_state_dict` +
-`initial_head_hash`）。**代价：1 卡、约 1 小时**（400 样本 × 7 条件）。
+**设置（2026-09-04 确定，判据未改）.** 纯评测，无训练：
+`diagnose_heatmap_shortcuts.py --architecture internnav_single_view --mode full
+--head-checkpoint <部署头>`，跑全部六项干预。
 
-**注意.** 部署头是在 R2R + AMB3R 位姿上训的，若在 random-walk + GT 位姿上评测，
-分布偏移会混进来。要么换 R2R 验证集评测，要么明确写清这是跨分布干预。
+- **head-only 抽取已完成**：新工具 `scripts/tools/derive_probe_head_checkpoint.py` 按探针自己的
+  config 构建头、用部署 checkpoint 覆盖同名张量，fail-closed 校验键集与形状。产物
+  `model/exp03_deployment_head/head_v2_best.pth`：**79 个张量来自部署 checkpoint**，
+  另 2 个来自新建（`{vit,coarse}_panorama_conditioner.direction_angles_degrees`——四个规范视角的
+  常量方位缓冲，不是学习权重），`initial_head_hash=e00d5058…`。
+- **在分布内评测**（解决原条目记的偏移问题）：数据用 `r2r_panoramic_data_v2/train` 的 val 划分
+  + `data/amb3r_endpoint_v3_full_r2r`（`SHORTCUT_AMB3R_POSE_CACHE_ROOT` 同款开关），
+  与部署头的训练分布一致；开发机 CPU 冒烟已确认可读（5475 个 val 样本、provider=`amb3r_vo_cache`、
+  标签形状 `[8,4,64,64]`）。
+- **代价：1 卡、约 1 小时**（400 样本 × 7 条件），开发机直跑，不走网站提交。
+
+**边界（预先声明）.** 结论只对"部署头 + VO 位姿 + R2R 分布"成立；它与 EXP-02（从零探针、
+真值位姿、random-walk）不样本匹配，两张表各自读，不能交叉比较绝对值。
 
 ---
 
@@ -470,6 +480,7 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
 | EXP-11 方向覆盖率 | `model/exp11_direction_coverage/coverage_val_full.json` |
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
 | 捷径诊断（VO 位姿域，EXP-04） | `model/heatmap_shortcut_probe_vo_v1/seed_{42,1337}/` |
+| EXP-03 部署头（head-only 格式） | `model/exp03_deployment_head/head_v2_best.pth` |
 | 位姿域偏移代价（真值训练→VO 评测） | `model/output_heatmap_amb3r_pose_adapt_endpoint_v2_4gpu/runs/run_20260814_234429/logs/metrics.jsonl` 的 `pre_training_validation` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 
