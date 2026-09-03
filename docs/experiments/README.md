@@ -271,9 +271,13 @@ H2（长路径）：桥的增益集中在测地距离 ≥ 10 m 的 episode。
 **设置.** 两臂全量 1839 集、协议种子 1337、其余与种子 42 完全一致。桥臂：修复栈
 `scripts/run_ppa_stage2_r2r_val_unseen_8gpu_mxc500.sh`（`PPA_EVAL_PROTOCOL_SEED=1337`，
 checkpoint/config 与 EXP-01 终局相同，输出根
-`model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu_seed1337`）。native 臂：认证复刻栈
-（把 `evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802` 复制为新 plan 目录、
-只改 `PROTOCOL_SEED`，原件不动；提交物待补）。分析：`paired_closed_loop_bootstrap.py`
+`model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu_seed1337`）。native 臂：认证复刻栈的 plan 副本
+`evaluation_plans/internnav_native_r2r_val_unseen_8gpu_seed1337`，跑在锁定代码
+`HeatmapVLN_native_lock_bd5ead1`（`git archive bd5ead1`）上，原件不动；启动脚本相对金参照只差
+5 行（根路径、锁定 repo、plan 路径、输出根、种子），细节与导入检查见提交物。
+**边界（预先声明）**：锁定 manifest 里 `scripts/training/utils.py` 的原版本是 2026-08-02 服务器工作区
+未提交的状态，git 中不存在；副本用 bd5ead1 版本（差异只在 LoRA 计数与训练损失构造器，
+不在 native 评测路径上）。其余 3 个 HeatmapVLN 运行时文件与锁定 hash 逐字节相同。分析：`paired_closed_loop_bootstrap.py`
 逐种子 + 合并。**代价：8 卡 × 约 18 小时 × 2 臂。**
 提交物：[exp07-seed1337-submission.md](exp07-seed1337-submission.md)。
 
@@ -345,8 +349,11 @@ checkpoint/config 与 EXP-01 终局相同，输出根
 C `preserve_weight 0.5 / delta_z_weight 0.01 / delta_z_relative false`。父 checkpoint、数据、
 epoch、选点与 v2 相同；`val_rollout_batches: 64`（512 对）。链式启动
 `scripts/run_stage3_ablation_chain_8gpu_mxc500.sh`，顺序 A → B → C → EXP-08，单臂失败不阻塞后续。
-**参照重验（EXP-09-R）**：v2 的 `best.pth`（epoch 3）与 `epoch_004.pth` 各用 512 对重验一遍
-（需要给 `scripts/train.py` 加 `--validate-only`，待做）。**代价：8 卡 × 约 5–6 h × 3 臂 +
+**参照重验（EXP-09-R）**：v2 的 `best.pth`（epoch 3）与 `epoch_004.pth` 各用 512 对重验一遍：
+`scripts/train.py --validate-only --load-weights <ckpt> --config configs/ablation/exp09r_stage3_v2_revalidate_512_8gpu.yaml`
+（该 config 与 v2 只差：加载已训练的桥 `past_plan_action_reset_bridge: false`、
+`evaluate_before_training: true`、`val_rollout_batches: 64`；结果在 run 目录
+`manifest/pre_training_validation.json`）。**代价：8 卡 × 约 5–6 h × 3 臂 +
 重验约 1 h。** 单训练种子起步，边缘结论再补种子（2026-09-03 规划决定）。
 提交物：[exp08-exp09-stage3-ablation-submission.md](exp08-exp09-stage3-ablation-submission.md)。
 
@@ -396,6 +403,20 @@ epoch、选点与 v2 相同；`val_rollout_batches: 64`（512 对）。链式启
    （所有指标同向、两种子一致），但下次不一定，而"事后判据"没有任何约束力。
 4. **探针的训练预算会左右结论方向。** 短预算天然偏向易学的捷径（位姿→像素是低维光滑映射，
    视觉定位不是）。EXP-02 用 12000 步并确认四条曲线全部走平，才排除了"训练不足"这个解释。
-5. **诊断脚本可能是给旧架构写的。** `diagnose_heatmap_shortcuts.py` 原本只支持
+5. **认证复刻栈跑不了现行 HEAD。** 它的 `manifests/runtime_code.sha256` 把 4 个 HeatmapVLN
+   运行时文件锁在 2026-08-02 的版本上，启动脚本还断言 RPC 协议号是 `heatmapvln-r2r-json-v2`；
+   现在 HEAD 上协议号已是 v3，3 个文件改过。要再跑 native 臂，必须在锁定 checkout
+   （`HeatmapVLN_native_lock_bd5ead1`）上跑，见 EXP-07 提交物。**永远不要为了让金参照跑起来
+   去改它的 manifest 或启动脚本**——那等于把基线改掉。
+
+6. **本地跑不了配置校验。** 本机 python 没有 `yaml`/`pydantic`，`load_and_validate_config`
+   只能在开发机上跑（`envs/qwen25/bin/python`）。新配置一律 scp 到开发机验一遍 schema 再提交。
+
+7. **`tests/test_config.py::test_paths_merge_overrides_data_and_log` 有导入顺序依赖。**
+   单独跑通过；在某些前置 import（例如先 import `scripts.train`）之后跑会失败。已确认在
+   **干净 HEAD** 上也如此，与本轮改动无关，也不在 §4 的基线计数里 —— 但看到它失败先换个
+   顺序单独复现，别急着归因给自己的改动。
+
+8. **诊断脚本可能是给旧架构写的。** `diagnose_heatmap_shortcuts.py` 原本只支持
    legacy 全景 + LoRA 栈；论文写的是 `internnav_single_view`。跑之前先确认脚本跑的
    是不是论文里那个架构，否则结论无效。

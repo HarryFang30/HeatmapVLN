@@ -175,6 +175,15 @@ def _dataset_uses_dynamic_sampling(dataset) -> bool:
     return True if explicit is None else bool(explicit)
 
 
+def _check_validate_only_flags(*, validate_only: bool, evaluate_before_training: bool) -> None:
+    """``--validate-only`` runs nothing but the pre-training validation pass."""
+    if validate_only and not evaluate_before_training:
+        raise ValueError(
+            "--validate-only requires validation.evaluate_before_training=true "
+            "(the pre-training validation pass is the only thing it runs)"
+        )
+
+
 def _install_baseline_best_threshold(
     checkpoint_manager,
     value: float,
@@ -298,6 +307,9 @@ def main():
                         help='覆盖配置中的 epoch 数量')
     parser.add_argument('--dry-run', action='store_true',
                         help='执行一批完整训练 preflight（含 backward/DDP/optimizer），不保存 checkpoint')
+    parser.add_argument('--validate-only', action='store_true',
+                        help='只对加载的权重跑一遍验证（需 validation.evaluate_before_training=true），'
+                             '写出 pre_training_validation 记录后退出，不训练、不保存 checkpoint')
     parser.add_argument('--max-batches', type=int, default=None,
                         help='每个 epoch 最多处理的 batch 数')
     parser.add_argument('--distributed', action='store_true',
@@ -1826,6 +1838,10 @@ def main():
             "validation.evaluate_before_training=true requires "
             "validation.enabled=true"
         )
+    _check_validate_only_flags(
+        validate_only=bool(args.validate_only),
+        evaluate_before_training=evaluate_before_training,
+    )
     if (
         constrained_selection
         and checkpoint_selector.baseline_metrics is None
@@ -1964,6 +1980,29 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         _malloc_trim()
+
+    if args.validate_only:
+        if dist_context.is_main:
+            _append_jsonl(
+                metrics_jsonl_path,
+                {
+                    "record_type": "validate_only_complete",
+                    "stage": stage_name,
+                    "load_weights": args.load_weights,
+                    "save_best_metric": save_best_metric,
+                    "metric_value": baseline_metric_value,
+                },
+            )
+            logger.info(
+                "✅ --validate-only: pre-training validation written to %s; "
+                "no training performed",
+                manifest_dir / "pre_training_validation.json",
+            )
+        _dist_barrier()
+        if tb_writer is not None:
+            tb_writer.close()
+        cleanup_distributed()
+        return
 
     timer = TrainingTimer(total_epochs=total_epochs)
     timer.start()
