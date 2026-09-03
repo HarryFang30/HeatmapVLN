@@ -84,6 +84,17 @@ def matched_contract(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
         mode: report["selection_contract"]["train"]["sample_identity_sha256"]
         for mode, report in reports.items()
     }
+    # Ground-truth and AMB3R-VO poses are different experiments: the cache
+    # restricts usable frames, so mixing the two domains in one table would
+    # compare probes that never saw the same samples.
+    pose_sources = {
+        mode: report.get("history_pose_source", "simulator_ground_truth")
+        for mode, report in reports.items()
+    }
+    pose_cache_roots = {
+        mode: report.get("amb3r_pose_cache_root")
+        for mode, report in reports.items()
+    }
     checks = {
         "same_initial_head_hash": len(set(hashes.values())) == 1,
         "same_checkpoint": len(set(checkpoints.values())) == 1,
@@ -93,6 +104,8 @@ def matched_contract(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "same_head_numel": len(set(head_numel.values())) == 1,
         "same_train_selection": len(set(train_hashes.values())) == 1,
         "same_val_selection": len(set(val_hashes.values())) == 1,
+        "same_history_pose_source": len(set(pose_sources.values())) == 1,
+        "same_pose_cache_root": len(set(pose_cache_roots.values())) == 1,
         "qwen_fully_frozen": all(value == 0 for value in qwen_trainable.values()),
         "all_lora_tensors_matched": all(
             int(report["load"]["matched_lora_tensors"])
@@ -104,6 +117,7 @@ def matched_contract(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "passed": all(checks.values()),
         "checks": checks,
         "architecture": sorted(set(architectures.values())),
+        "history_pose_source": sorted(set(pose_sources.values())),
         "modes": sorted(reports),
         "initial_head_hashes": hashes,
         "val_selection_sha256": val_hashes,

@@ -166,11 +166,17 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
   （GT 位姿下是 +6.8 / +0.1，不稳定）。→ 可以写"外观在位姿不可靠时承担纠错"。
 - **否定**：差距仍不稳定或 < 3pt。→ EXP-02 的结论原样成立，不必加限定语。
 
-**设置.** 同 EXP-02，但数据换成带 AMB3R 缓存的配置
-（`amb3r_pose_cache_root` + `require_amb3r_pose_cache: true`），
-数据根用 `r2r_panoramic_data_v2/train` + `data/amb3r_endpoint_v3_full_r2r`。
-**代价：8 卡 × 约 5 小时**（4 模式 × 2 种子）。
-注意 AMB3R 缓存模式下 `single_view_rgb_input` 必须为 true，且有效帧由缓存决定。
+**设置（2026-09-04 确定）.** 同 EXP-02，唯一变量是位姿来源：探针新增
+`--amb3r-pose-cache-root`（启动脚本 `SHORTCUT_AMB3R_POSE_CACHE_ROOT`），数据仍用
+`data/heatmap_randomwalk_train_v1`，位姿来自 `data/heatmap_randomwalk_amb3r_endpoint_cache_v2_4gpu`。
+机制已在开发机 CPU 冒烟验证（provider=`amb3r_vo_cache`、位姿有限且异于真值、非单视角架构 fail-closed）；
+summarizer 新增两项检查，拒绝把真值域与 VO 域混进同一张表。**代价：8 卡 × 约 6 小时**（4 模式 × 2 种子）。
+
+**边界（预先声明）**：缓存只覆盖 62/78 个场景并限制可用帧，同一 val 划分下带缓存 6578 样本、
+真值 6584 样本 —— 本实验**不与 EXP-02 样本匹配**，只能做 VO 域内部比较，绝对数字不可与 EXP-02 对齐着读。
+"真值训练 / VO 评测"这一臂**不另跑**，引用既有产物（0.9079 → 0.4984，适配后 0.5935），
+边界同样写在提交物里。
+提交物：[exp04-vo-pose-probe-submission.md](exp04-vo-pose-probe-submission.md)。
 
 ---
 
@@ -443,6 +449,8 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
 | EXP-09-R / EXP-10 桥开重验（512 对） | `model/exp09r_revalidate_512/{best,epoch_004}/run_*/manifest/pre_training_validation.json` |
 | EXP-11 方向覆盖率 | `model/exp11_direction_coverage/coverage_val_full.json` |
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
+| 捷径诊断（VO 位姿域，EXP-04） | `model/heatmap_shortcut_probe_vo_v1/seed_{42,1337}/` |
+| 位姿域偏移代价（真值训练→VO 评测） | `model/output_heatmap_amb3r_pose_adapt_endpoint_v2_4gpu/runs/run_20260814_234429/logs/metrics.jsonl` 的 `pre_training_validation` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 
 ### 数据集

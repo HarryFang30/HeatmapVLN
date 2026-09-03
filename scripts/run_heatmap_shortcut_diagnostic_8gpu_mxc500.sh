@@ -25,6 +25,12 @@ SHORTCUT_ARCHITECTURE=${SHORTCUT_ARCHITECTURE:-internnav_single_view}
 SHORTCUT_CONFIG=${SHORTCUT_CONFIG:-${REPO_ROOT}/configs/train_heatmap_internnav_single_view_8gpu.yaml}
 SHORTCUT_DATA_ROOT=${SHORTCUT_DATA_ROOT:-${ALLOWED_ROOT}/data/heatmap_randomwalk_train_v1}
 SHORTCUT_OUTPUT_ROOT=${SHORTCUT_OUTPUT_ROOT:-${ALLOWED_ROOT}/model/heatmap_shortcut_probe_v1}
+# Optional AMB3R VO endpoint cache: when set, every history relative pose comes
+# from the deployment pose domain instead of simulator ground truth (EXP-04).
+# The cache also restricts usable frames, so such a run is NOT sample-matched
+# to a ground-truth-pose run; the summarizer refuses to mix the two domains.
+SHORTCUT_AMB3R_POSE_CACHE_ROOT=${SHORTCUT_AMB3R_POSE_CACHE_ROOT:-}
+SHORTCUT_AMB3R_POSE_CACHE_MAX_CLIPS=${SHORTCUT_AMB3R_POSE_CACHE_MAX_CLIPS:-16}
 # Optional: only legacy_panoramic consumes a frozen Stage1-S2 LoRA checkpoint.
 SHORTCUT_CHECKPOINT=${SHORTCUT_CHECKPOINT:-}
 
@@ -76,6 +82,13 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export INTERNNAV_MODEL_PATH
 
 die() { echo "[shortcut] ERROR: $*" >&2; exit 2; }
+
+if [[ -n "${SHORTCUT_AMB3R_POSE_CACHE_ROOT}" ]]; then
+  [[ "${SHORTCUT_ARCHITECTURE}" == internnav_single_view ]] \
+    || die "SHORTCUT_AMB3R_POSE_CACHE_ROOT requires SHORTCUT_ARCHITECTURE=internnav_single_view"
+  [[ -d "${SHORTCUT_AMB3R_POSE_CACHE_ROOT}" ]] \
+    || die "missing SHORTCUT_AMB3R_POSE_CACHE_ROOT: ${SHORTCUT_AMB3R_POSE_CACHE_ROOT}"
+fi
 
 for path in \
   "${QWEN_PYTHON}" \
@@ -180,6 +193,10 @@ for seed in "${seeds[@]}"; do
 
     declare -a extra=()
     [[ -n "${SHORTCUT_CHECKPOINT}" ]] && extra+=(--checkpoint "${SHORTCUT_CHECKPOINT}")
+    if [[ -n "${SHORTCUT_AMB3R_POSE_CACHE_ROOT}" ]]; then
+      extra+=(--amb3r-pose-cache-root "${SHORTCUT_AMB3R_POSE_CACHE_ROOT}")
+      extra+=(--amb3r-pose-cache-max-clips "${SHORTCUT_AMB3R_POSE_CACHE_MAX_CLIPS}")
+    fi
 
     CUDA_VISIBLE_DEVICES="${gpu}" PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
       "${QWEN_PYTHON}" "${REPO_ROOT}/scripts/tools/diagnose_heatmap_shortcuts.py" \

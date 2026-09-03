@@ -93,6 +93,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--data-root", required=True)
+    parser.add_argument(
+        "--amb3r-pose-cache-root",
+        default=None,
+        help=(
+            "Read every history relative pose from this AMB3R VO endpoint cache "
+            "instead of the simulator ground truth (deployment pose domain). "
+            "Requires --architecture internnav_single_view; the cache also "
+            "restricts the usable frames, so a cached run is NOT sample-matched "
+            "to a ground-truth-pose run."
+        ),
+    )
+    parser.add_argument(
+        "--amb3r-pose-cache-max-clips",
+        type=int,
+        default=16,
+        help="LRU size for the pose cache reader (default 16, as in training)",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-history", type=int, default=2)
@@ -202,6 +219,23 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     # RGB must not reach it; its collator rejects those keys fail-closed.
     sw_cfg["single_view_rgb_input"] = single_view
 
+    cache_root = getattr(args, "amb3r_pose_cache_root", None)
+    if cache_root:
+        if not single_view:
+            raise ValueError(
+                "--amb3r-pose-cache-root requires --architecture "
+                "internnav_single_view (the cache path is fail-closed to the "
+                "single-view history contract)"
+            )
+        sw_cfg["amb3r_pose_cache_root"] = str(Path(cache_root).resolve())
+        sw_cfg["require_amb3r_pose_cache"] = True
+        sw_cfg["amb3r_pose_cache_max_clips"] = int(
+            args.amb3r_pose_cache_max_clips
+        )
+    else:
+        sw_cfg["amb3r_pose_cache_root"] = None
+        sw_cfg["require_amb3r_pose_cache"] = False
+
     model_cfg = cfg["model"]
     model_cfg["device"] = args.device
     llm_cfg = model_cfg["llm"]
@@ -274,6 +308,11 @@ def build_dataset(
         single_view_rgb_input=bool(sw_cfg.get("single_view_rgb_input", False)),
         max_clips=0,
         max_clip_id=max_clip_id,
+        amb3r_pose_cache_root=sw_cfg.get("amb3r_pose_cache_root"),
+        require_amb3r_pose_cache=bool(sw_cfg.get("require_amb3r_pose_cache", False)),
+        amb3r_pose_cache_max_clips=int(
+            sw_cfg.get("amb3r_pose_cache_max_clips", 16)
+        ),
     )
 
 
@@ -1173,6 +1212,15 @@ def main() -> int:
             "constant_identity_rel_pose" if single_view else "pose_input_removed"
         ),
         "data_root": str(Path(args.data_root).resolve()),
+        "history_pose_source": (
+            "amb3r_vo_cache" if getattr(args, "amb3r_pose_cache_root", None)
+            else "simulator_ground_truth"
+        ),
+        "amb3r_pose_cache_root": (
+            str(Path(args.amb3r_pose_cache_root).resolve())
+            if getattr(args, "amb3r_pose_cache_root", None)
+            else None
+        ),
         "load": load_info,
         "initial_head_hash": initial_head_hash,
         "train_steps": args.train_steps,
