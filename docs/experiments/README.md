@@ -32,6 +32,8 @@
 | [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | 🔬 | 2026-09-03 提交，全量 1839 集 |
 | [EXP-06](#exp-06-零桥在修复栈上是否等于-native) | 修复后的评测栈跑零桥，是否精确等于 native | ⏳ | 2026-09-03 消融规划暂缓（见条目） |
 | [EXP-07](#exp-07-主表第二个种子parity--ne-是否可复现长路径增益是否存在) | 主表 parity + NE 改善在第二个种子上是否复现；长路径（≥10 m）增益是否存在 | 🔬 | 2026-09-03 提交桥臂（种子 1337），native 臂待提 |
+| [EXP-08](#exp-08-阶段二联合训练买到了什么) | 阶段二（认知头与动作联合训练）对最终桥的行为有没有可测影响 | 🔬 | 2026-09-03 提交（链式任务第 4 臂） |
+| [EXP-09](#exp-09-阶段三配方里哪一项真的在起作用) | 阶段三五处改动里，信赖域 / advantage / 惩罚重校准 / rollout 选点各自有没有可测效应 | 🔬 | 2026-09-03 提交 A/B/C（链式任务前 3 臂）；D 免费；参照重验待跑 |
 
 ---
 
@@ -277,6 +279,79 @@ checkpoint/config 与 EXP-01 终局相同，输出根
 
 ---
 
+### EXP-08 阶段二（联合训练）买到了什么
+
+**问题.** 方法节给阶段二的理由是"动作监督的梯度必须流入认知分支，认知才能学到对决策有用的内容"。
+这句话没有数据支撑。最终部署的桥是阶段三**从零**重训的，认知头在阶段三全程冻结——所以阶段二
+留给最终模型的唯一东西就是"被动作损失塑形过的认知头权重"。它有没有可测影响？
+
+**假设.** 有：接阶段二权重的桥（现行 v2）应比接阶段一权重（认知头从未见过动作损失）的桥
+在 rollout 上更好。
+
+**判据（预注册，2026-09-03，开跑前写死；全部在 v2 数据 val 划分、512 对共享噪声 rollout 上读）.**
+- **支持**：接阶段一权重的臂，其 best checkpoint 的 bridged rollout 终点误差比 v2 参照
+  （同样 512 对重验）差 > 0.03 m 且配对 bootstrap 95% CI 不含 0；或动作一致率低 > 5pt。
+  → 阶段二的理由句成立，可写。
+- **否定**：|终点误差差| ≤ 0.01 m 且一致率变化在 ±2pt 内，且认知指标（PCK@8、top-k 召回）
+  两臂差 ≤ 1pt。→ 阶段二对最终桥**无可测影响**，方法节删掉理由句，训练故事简化为
+  "阶段一 → 阶段三"（阶段二降为可选）。
+- **没测出来**：落在两者之间。→ 补第二个训练种子再定。
+- 认知指标附带判读：两臂的头都冻结、各自等于父 checkpoint 的头，因此两臂 PCK@8 / F1 /
+  top-k 召回的差就是"阶段二对认知的影响"；差 > 2pt 记为阶段二改变了认知（方向另记）。
+
+**设置.** 配方与 v2 完全相同（`configs/ablation/exp08_stage3_from_stage1_heads_8gpu.yaml`
+与 v2 config 只差 `val_rollout_batches: 8 → 64`），**唯一变量是 `--load-weights` 的父 checkpoint**：
+阶段一 `model/output_past_plan_action_v1_8gpu/stage1_map_pretrain/run_20260817_205027/checkpoints/best.pth`
+（79 热力图 + 11 未来头，桥 0 张量；loader 只取头，桥从零起）。v2 数据、3 epoch、
+按 512 对 rollout 终点误差选点。**代价：8 卡 × 约 5–6 h**（链式任务第 4 臂）。
+提交物：[exp08-exp09-stage3-ablation-submission.md](exp08-exp09-stage3-ablation-submission.md)。
+
+---
+
+### EXP-09 阶段三配方里哪一项真的在起作用
+
+**问题.** 阶段三相对 v1 改了五处：① 硬信赖域 ρ=0.05；② 保持 2.0 + 相对 Δ 惩罚 ×10（v1 为
+0.5 + 0.01 绝对）；③ advantage 加权；④ rollout 终点误差选点（v1 用 teacher-forced MSE）；
+⑤ 桥从零重置。EXP-05 测的是"全关"的闭环代价；本实验在开环上逐项拆：哪些是必要的，
+哪些只是防御性设计。⑤ 不做（热启动阶段二桥就是 v1，被 EXP-05 覆盖）。
+
+**参照数字（v2 run，64 对 rollout，`run_20260829_115642`）.** 训练侧 Δ 相对幅度均值
+0.017–0.020，贴边比例 0.05%–0.5%；bridged 终点误差 1.269–1.275 m vs native 1.281–1.285 m；
+动作一致率 0.70–0.81；preserve 损失 1e-4。64 对下 bridged−native 的差本身在噪声内，
+所以所有臂（含参照）统一用 **512 对**（`val_rollout_batches: 64`）重读。
+
+**假设.** ①②③④ 各自都有可测效应（这是方法节的隐含主张）。
+
+**判据（预注册，2026-09-03，开跑前写死；"v2@512"指参照重验后的数字，见设置）.**
+- **臂 A（去 ρ）**：支持 ρ 必要 —— best checkpoint 的训练侧 `delta_token_ratio_mean` > 0.10，
+  或 bridged−native 终点误差差 > +0.03 m 且 512 对配对 CI 不含 0。否定（ρ 冗余）——
+  Δ 均值 ≤ 0.05 且 bridged−native 差的 CI 含 0 → 方法节把 ρ 降为"防御性截断，
+  v2 配方下训练中未触发"。没测出来 —— 0.05 < Δ ≤ 0.10 且 CI 含 0。
+- **臂 B（去 advantage）**：支持 —— B 的 bridged 终点误差比 v2@512 差 > 0.03 m 且 CI 不含 0，
+  或一致率比 v2@512 低 > 5pt。否定 —— |差| ≤ 0.01 m 且一致率在 ±2pt 内 → advantage
+  从方法节删除或降为实现细节。没测出来 —— 其余。
+- **臂 C（惩罚退回 v1 值、保留 ρ）**：支持重校准必要 —— best checkpoint 的
+  `delta_at_boundary_frac` > 0.20（Δ 顶到上限）或 preserve 损失 > 10× v2@512。否定 ——
+  贴边 < 0.05 且 bridged−native 差的 CI 含 0 → 有 ρ 兜底时惩罚校准冗余。没测出来 —— 其余。
+- **臂 D（选点指标，免费）**：v2 run 按 `val_trajectory_loss` 最小选的是 epoch 4（0.3432），
+  按 rollout 选的是 epoch 3（1.2688 vs epoch 4 的 1.275，64 对下不可分）。支持 ——
+  两个 checkpoint 在 512 对重验下 rollout 终点误差差 > 0.02 m 且 CI 不含 0。否定 ——
+  差 ≤ 0.005 m，或 CI 含 0 且差 ≤ 0.01 m → 选点指标无可测影响，方法节把"模型选择看真实
+  生成效果"降为流程说明。没测出来 —— 其余。
+- 判据双向都接受：四项里任何一项被否定，方法节对应的句子就删或降级，不改判据。
+
+**设置.** 三个重训臂各自从 v2 config 派生、**只改一处**（`configs/ablation/exp09{a,b,c}_*.yaml`，
+派生 diff 已在 commit 里核对）：A `max_delta_ratio: null`；B `action_advantage_enabled: false`；
+C `preserve_weight 0.5 / delta_z_weight 0.01 / delta_z_relative false`。父 checkpoint、数据、
+epoch、选点与 v2 相同；`val_rollout_batches: 64`（512 对）。链式启动
+`scripts/run_stage3_ablation_chain_8gpu_mxc500.sh`，顺序 A → B → C → EXP-08，单臂失败不阻塞后续。
+**参照重验（EXP-09-R）**：v2 的 `best.pth`（epoch 3）与 `epoch_004.pth` 各用 512 对重验一遍
+（需要给 `scripts/train.py` 加 `--validate-only`，待做）。**代价：8 卡 × 约 5–6 h × 3 臂 +
+重验约 1 h。** 单训练种子起步，边缘结论再补种子（2026-09-03 规划决定）。
+提交物：[exp08-exp09-stage3-ablation-submission.md](exp08-exp09-stage3-ablation-submission.md)。
+
+---
+
 ## 4. 公共资源
 
 所有路径都在 `/mnt/afs/liwenhao/agent/370910109/` 下（旧路径 `/mnt/afs/lixiaoou/intern/fjl`
@@ -298,6 +373,8 @@ checkpoint/config 与 EXP-01 终局相同，输出根
 | 部署 checkpoint（v2 信赖域桥） | `model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth` |
 | v1 漂移桥 checkpoint（EXP-05 用；部署必须用 `best_deployment_full.pth`，`best.pth` 缺未来头张量） | `model/output_past_plan_action_action_refine_v1_8gpu/run_20260818_225001/checkpoints/best_deployment_full.pth` |
 | Stage2 联合 best（79 Heatmap + 11 Future 张量来源） | `model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint/run_20260818_104438/checkpoints/best.pth` |
+| Stage1 对齐 best（EXP-08 的父 checkpoint：79 Heatmap + 11 Future，桥 0 张量） | `model/output_past_plan_action_v1_8gpu/stage1_map_pretrain/run_20260817_205027/checkpoints/best.pth` |
+| 阶段三消融臂输出（EXP-08/09） | `model/ablation_stage3/<arm>/run_*/` |
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 
