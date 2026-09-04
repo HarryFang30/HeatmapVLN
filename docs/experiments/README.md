@@ -508,14 +508,20 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
    （`HeatmapVLN_native_lock_bd5ead1`）上跑，见 EXP-07 提交物。**永远不要为了让金参照跑起来
    去改它的 manifest 或启动脚本**——那等于把基线改掉。
 
-6. **本地跑不了配置校验。** 本机 python 没有 `yaml`/`pydantic`，`load_and_validate_config`
+6. **plan 副本要重写"每一份" manifest 的路径，不只是代码 manifest。** EXP-07 native 臂首次提交
+   在静态预检就挂了：`manifests/internnav_model.sha256` 还是迁移前的旧路径，`validate_inputs.py`
+   报 closure mismatch。金参照的三份 manifest（runtime_code / plan_code / internnav_model）
+   全部写死绝对路径，漏一份就死在预检。改路径后 hash 逐项复验通过（模型 14/14），
+   说明只是路径过期，不是内容变了。
+
+7. **本地跑不了配置校验。** 本机 python 没有 `yaml`/`pydantic`，`load_and_validate_config`
    只能在开发机上跑（`envs/qwen25/bin/python`）。新配置一律 scp 到开发机验一遍 schema 再提交。
 
-7. **`tests/test_config.py::test_paths_merge_overrides_data_and_log` 有导入顺序依赖。**
+8. **`tests/test_config.py::test_paths_merge_overrides_data_and_log` 有导入顺序依赖。**
    单独跑通过；在某些前置 import（例如先 import `scripts.train`）之后跑会失败。已确认在
    **干净 HEAD** 上也如此，与本轮改动无关，也不在 §4 的基线计数里 —— 但看到它失败先换个
    顺序单独复现，别急着归因给自己的改动。
 
-8. **诊断脚本可能是给旧架构写的。** `diagnose_heatmap_shortcuts.py` 原本只支持
+9. **诊断脚本可能是给旧架构写的。** `diagnose_heatmap_shortcuts.py` 原本只支持
    legacy 全景 + LoRA 栈；论文写的是 `internnav_single_view`。跑之前先确认脚本跑的
    是不是论文里那个架构，否则结论无效。

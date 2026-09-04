@@ -72,6 +72,30 @@ bash scripts/run_8gpu_rpc_eval.sh
 启动脚本先做静态预检 + 8 路各 1 集的 smoke，再跑全量；成功标志 `[eval] COMPLETE`，结果在
 `model/eval_internnav_native_r2r_val_unseen_8gpu_rpcv2_x11bundle_v4_seed1337/merged/result.json`。
 
+### 2026-09-04：首次提交失败与修复（已修，命令不变）
+
+首次提交在静态预检阶段就退出（输出根只建了空的 `runtime/logs`，没有 `eval_contract.json`）。
+原因：plan 副本里 **`manifests/internnav_model.sha256` 仍是迁移前的旧路径**——我当时只重写了
+`runtime_code.sha256` 和 `plan_code.sha256`，漏了这份模型 manifest，于是
+`validate_inputs.py` 报 closure mismatch（14 个文件"missing 新路径 / extra 旧路径"）。
+
+修复只改路径、**不动任何 hash**，并逐项验证过：
+
+| 检查 | 结果 |
+|---|---|
+| `sha256sum -c internnav_model.sha256`（改路径后，读 ~16 GB） | 14/14 全部 OK —— 模型闭包与认证运行逐字节相同 |
+| `plan_code.sha256` / `runtime_code.sha256` | 全部 OK（模型 manifest 的条目已同步重算） |
+| `validate_inputs.py` | `"status": "passed"`，`tensor_count: 1338` |
+| `build_shards.py` | `union_exact: true`，1839 集；shard 00/03/07 与金参照**逐字节相同** |
+| server / client 导入断言（协议 v2） | 均通过 |
+| 金参照目录 | 未改动（mtime 仍为 2026-08-02） |
+
+> 金参照自己的 `plan_code.sha256` 现在 `sha256sum -c` 一条也过不了——它列的是迁移前的旧路径，
+> 文件已不存在。这正是副本必须重写路径的原因，不是金参照被动过。
+
+上面的提交命令原样重提即可（预检产物 `cohorts/`、`input_validation.json` 会被幂等重建；
+失败运行留下的 `.eval.lock` 是空文件，flock 不受影响）。
+
 ## 跑完后的判读
 
 对每个种子分别、再对两种子合并（把两个 progress.jsonl 各自配对后拼接）跑
