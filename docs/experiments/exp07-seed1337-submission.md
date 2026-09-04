@@ -96,6 +96,43 @@ bash scripts/run_8gpu_rpc_eval.sh
 上面的提交命令原样重提即可（预检产物 `cohorts/`、`input_validation.json` 会被幂等重建；
 失败运行留下的 `.eval.lock` 是空文件，flock 不受影响）。
 
+### 2026-09-04 第二次失败：容器里没有 `git`（已修，命令仍不变）
+
+第二次仍在预检退出，网站日志给出了确切位置：
+
+```
+[eval] locked runtime-code hashes passed
+[eval] locked evaluation-plan hashes passed
+X11 host ABI compatible: architecture=x86_64, glibc 2.35
+[eval] X11/Mesa bundle hash verification passed
+Traceback ... validate_inputs.py line 139, in main
+    source_commit = git_head(args.internnav_repo)
+FileNotFoundError: [Errno 2] No such file or directory: 'git'
+```
+
+`validate_inputs.py` 用 `subprocess` 调 `git` 验证 InternNav 源码 commit 与工作树干净；
+**空白容器里没有 git**（开发机上有 `/usr/bin/git`，所以开发机复现不出来）。
+
+**为什么不能"用 conda 环境的 git"**：`envs/qwen25`、`envs/vlnce` 都没有 git，`/opt/conda` 里也没有
+（`/opt/conda/bin/git` 与 `pkgs/git-*` 都不存在）；而且按 `CLAUDE.md` §1.1，容器只保证挂载
+`/mnt/afs` 与 `/opt/maca-*`，**`/opt/conda` 在容器里本来就不可见**。所以唯一可行的方向是把 git
+放到共享存储上——即本 plan 早已在用的 X11 bundle 那套办法。
+
+**做法**：`$PLAN/bin/` 里放一个自包含 git（wrapper + 3.7 MB 二进制 + libpcre2/libz，glibc 用宿主的，
+本 plan 已经为 X11 bundle 卡了 ≥ 2.35 这道门），启动脚本前置 `export PATH="$PLAN/bin:$PATH"`，
+**只多这一条命令**。验证：
+
+| 检查 | 结果 |
+|---|---|
+| `env -i PATH=$PLAN/bin git --version` | `git version 2.34.1`（空环境、PATH 只有 bundle 也能跑） |
+| 同上跑 `rev-parse HEAD` | `7a5c624…` = `EXPECTED_SOURCE_COMMIT` |
+| 同上跑 `status --porcelain` | 空（工作树干净） |
+| `validate_inputs.py`（PATH 里**没有**系统 git） | `"status": "passed"`，`tensor_count: 1338` |
+| 三份 manifest 复验 | 16 / 30 / 14 全 OK（新增的 4 个 bundle 文件也已 pin 进 `plan_code`） |
+
+副本启动脚本现在相对金参照共 3 处改动：5 行路径/种子、1 行 PATH 前置、1 段自记录
+（`runtime/<stamp>/logs/launcher.log`，下次再失败我直接读它，不用再找网站日志）。
+
 ## 跑完后的判读
 
 对每个种子分别、再对两种子合并（把两个 progress.jsonl 各自配对后拼接）跑

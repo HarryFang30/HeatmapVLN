@@ -514,14 +514,20 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
    全部写死绝对路径，漏一份就死在预检。改路径后 hash 逐项复验通过（模型 14/14），
    说明只是路径过期，不是内容变了。
 
-7. **本地跑不了配置校验。** 本机 python 没有 `yaml`/`pydantic`，`load_and_validate_config`
+7. **空白容器里没有 `git`，而且没有任何 conda 环境自带 git。** EXP-07 native 臂第二次失败于
+   `validate_inputs.py` 调 `git` 验 InternNav commit：开发机有 `/usr/bin/git`（复现不出来），
+   容器没有；`envs/*` 与 `/opt/conda` 都不带 git，且 `/opt/conda` 在容器里根本不挂载。
+   解法是把自包含 git 放到 `/mnt/afs` 上并前置 PATH（与 X11 bundle 同一套办法）。
+   **凡是容器里要用的可执行文件，都必须在 `/mnt/afs` 上自带一份。**
+
+8. **本地跑不了配置校验。** 本机 python 没有 `yaml`/`pydantic`，`load_and_validate_config`
    只能在开发机上跑（`envs/qwen25/bin/python`）。新配置一律 scp 到开发机验一遍 schema 再提交。
 
-8. **`tests/test_config.py::test_paths_merge_overrides_data_and_log` 有导入顺序依赖。**
+9. **`tests/test_config.py::test_paths_merge_overrides_data_and_log` 有导入顺序依赖。**
    单独跑通过；在某些前置 import（例如先 import `scripts.train`）之后跑会失败。已确认在
    **干净 HEAD** 上也如此，与本轮改动无关，也不在 §4 的基线计数里 —— 但看到它失败先换个
    顺序单独复现，别急着归因给自己的改动。
 
-9. **诊断脚本可能是给旧架构写的。** `diagnose_heatmap_shortcuts.py` 原本只支持
+10. **诊断脚本可能是给旧架构写的。** `diagnose_heatmap_shortcuts.py` 原本只支持
    legacy 全景 + LoRA 栈；论文写的是 `internnav_single_view`。跑之前先确认脚本跑的
    是不是论文里那个架构，否则结论无效。
