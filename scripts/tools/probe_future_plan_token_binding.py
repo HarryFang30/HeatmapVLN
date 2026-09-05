@@ -37,6 +37,16 @@ Arms
 Criteria live in the ledger (pre-registered 2026-09-04) and are read off the
 relative drop of ``soft_iou`` / ``topk_support_recall`` against ``identity``.
 This tool prints the drops; it does not judge them.
+
+Per-batch statistics are written next to the summary as ``.npz`` so the arms can
+be re-scored on any subset and so a *paired* bootstrap over batches is possible:
+every arm sees the same resampled batch indices, which is the only way to put an
+interval on a difference between arms that share one forward pass.
+
+``--shard-index`` / ``--shard-count`` split the val set into **contiguous**
+blocks.  Contiguous rather than strided on purpose: ``cross_sample`` reads the
+previous batch's Z, and striding would silently change what "the previous batch"
+means between a sharded and an unsharded run.
 """
 
 from __future__ import annotations
@@ -51,8 +61,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
-from torch.utils.data import DataLoader  # noqa: E402
+from torch.utils.data import DataLoader, Subset  # noqa: E402
 from transformers import AutoProcessor  # noqa: E402
 
 from scripts.training.model_builder import build_model  # noqa: E402
@@ -98,6 +109,99 @@ def permute_plan_z(plan_z: torch.Tensor, arm: str, generator: torch.Generator) -
             out[row] = plan_z[row].index_select(0, order)
         return out
     raise ValueError(f"unknown arm {arm}")
+
+
+ARMS = tuple(FIXED_ARMS) + ("random_derangement", "cross_sample")
+
+
+def metrics_of(summed: "np.ndarray") -> Any:
+    return future_tube_metrics_from_statistics(torch.from_numpy(summed))
+
+
+def merge_and_report(args: argparse.Namespace) -> None:
+    """Pool per-batch statistics from shards and put a paired interval on them.
+
+    The bootstrap resamples *batches*, using the same resampled indices for
+    every arm.  Arms share one forward pass per batch, so a drop between two
+    arms is a paired quantity; resampling them independently would inflate the
+    interval with variance that the comparison does not actually carry.
+    """
+    stacks: dict[str, Any] = {}
+    for path in args.merge:
+        with np.load(path) as handle:
+            for arm in ARMS:
+                stacks.setdefault(arm, []).append(handle[arm])
+    per_arm = {arm: np.concatenate(stacks[arm], axis=0) for arm in ARMS}
+    n_batches = per_arm["identity"].shape[0]
+    if any(per_arm[arm].shape[0] != n_batches for arm in ARMS):
+        raise SystemExit("arms disagree on batch count; the shards are not paired")
+
+    point = {arm: metrics_of(per_arm[arm].sum(axis=0)) for arm in ARMS}
+    base = point["identity"]
+
+    rng = np.random.default_rng(0)
+    draws: dict[str, dict[str, list[float]]] = {
+        arm: {"soft_iou": [], "topk": []} for arm in ARMS
+    }
+    for _ in range(args.bootstrap):
+        picks = rng.integers(0, n_batches, size=n_batches)
+        resampled = {arm: per_arm[arm][picks].sum(axis=0) for arm in ARMS}
+        ref = metrics_of(resampled["identity"])
+        for arm in ARMS:
+            m = metrics_of(resampled[arm])
+            if ref.soft_iou:
+                draws[arm]["soft_iou"].append(
+                    (ref.soft_iou - m.soft_iou) / ref.soft_iou * 100.0
+                )
+            if ref.topk_support_recall:
+                draws[arm]["topk"].append(
+                    (ref.topk_support_recall - m.topk_support_recall)
+                    / ref.topk_support_recall
+                    * 100.0
+                )
+
+    def interval(values: list[float]) -> dict[str, float]:
+        array = np.asarray(values)
+        return {
+            "lo95": float(np.percentile(array, 2.5)),
+            "hi95": float(np.percentile(array, 97.5)),
+            "median": float(np.median(array)),
+        }
+
+    result: dict[str, Any] = {
+        "schema": SCHEMA + "-merged",
+        "batches_scored": int(n_batches),
+        "supported_view_bins": base.supported_view_bins,
+        "bootstrap_resamples": args.bootstrap,
+        "merged_from": [str(path) for path in args.merge],
+        "arms": {},
+    }
+    for arm in ARMS:
+        m = point[arm]
+        result["arms"][arm] = {
+            "soft_iou": m.soft_iou,
+            "topk_support_recall": m.topk_support_recall,
+            "supported_view_bins": m.supported_view_bins,
+            "soft_iou_relative_drop_pct": (
+                None if not base.soft_iou
+                else (base.soft_iou - m.soft_iou) / base.soft_iou * 100.0
+            ),
+            "topk_relative_drop_pct": (
+                None if not base.topk_support_recall
+                else (base.topk_support_recall - m.topk_support_recall)
+                / base.topk_support_recall * 100.0
+            ),
+            "soft_iou_drop_ci": interval(draws[arm]["soft_iou"]),
+            "topk_drop_ci": interval(draws[arm]["topk"]),
+        }
+
+    args.output_json.parent.mkdir(parents=True, exist_ok=True)
+    args.output_json.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    print(f"wrote {args.output_json}")
 
 
 def to_device(value: Any, device: torch.device) -> Any:
@@ -157,7 +261,21 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument(
+        "--merge",
+        type=Path,
+        action="append",
+        default=[],
+        help="per-batch .npz files to pool; with this the probe only reports",
+    )
+    parser.add_argument("--bootstrap", type=int, default=2000)
     args = parser.parse_args()
+
+    if args.merge:
+        merge_and_report(args)
+        return
 
     cfg = load_and_validate_config(str(args.config))
     torch.manual_seed(args.seed)
@@ -171,7 +289,19 @@ def main() -> None:
         random_subsequence=False,
         enable_trajectory_augmentation=False,
     )
-    print(f"val dataset: {len(val_dataset)} samples", flush=True)
+    total_samples = len(val_dataset)
+    if args.shard_count > 1:
+        block = -(-total_samples // args.shard_count)
+        start = args.shard_index * block
+        stop = min(start + block, total_samples)
+        val_dataset = Subset(val_dataset, list(range(start, stop)))
+        print(
+            f"val dataset: {total_samples} samples, contiguous shard "
+            f"{args.shard_index}/{args.shard_count} = [{start}, {stop})",
+            flush=True,
+        )
+    else:
+        print(f"val dataset: {total_samples} samples", flush=True)
 
     processor = AutoProcessor.from_pretrained(
         cfg["model"]["llm"]["model_path"],
@@ -236,6 +366,9 @@ def main() -> None:
     stats: dict[str, torch.Tensor] = {
         arm: torch.zeros(17, dtype=torch.float64, device=device) for arm in arms
     }
+    # One 17-vector per batch per arm.  These are additive, so any subset can be
+    # re-scored exactly and a paired bootstrap becomes possible.
+    per_batch: dict[str, list[Any]] = {arm: [] for arm in arms}
     generator = torch.Generator().manual_seed(args.seed)
     previous_plan_z: torch.Tensor | None = None
     batches_used = 0
@@ -267,13 +400,15 @@ def main() -> None:
             time_mask = to_device(batch["future_trajectory_time_mask"], device)
 
             def score(arm: str, decoded: dict[str, torch.Tensor]) -> None:
-                stats[arm] += future_tube_sufficient_statistics(
+                batch_stats = future_tube_sufficient_statistics(
                     pred_visibility_logits=decoded["future_visibility"],
                     pred_heatmaps=decoded["future_heatmaps"],
                     gt_visibility=gt_visibility,
                     gt_heatmaps=gt_heatmaps,
                     future_time_mask=time_mask,
                 )
+                stats[arm] += batch_stats
+                per_batch[arm].append(batch_stats.detach().cpu().numpy().copy())
 
             plan_z = captured["plan_z"]
             # ``cross_sample`` needs a Z from an earlier batch, so the very
@@ -337,6 +472,8 @@ def main() -> None:
         "arms_share_one_sample_set": aligned,
         "arms": {},
         "inputs": {
+            "shard_index": args.shard_index,
+            "shard_count": args.shard_count,
             "config": str(args.config),
             "checkpoint": str(args.checkpoint),
             "max_batches": args.max_batches,
@@ -360,6 +497,11 @@ def main() -> None:
             ),
         }
 
+    stats_path = args.output_json.with_suffix(".per_batch.npz")
+    np.savez_compressed(
+        stats_path, **{arm: np.stack(per_batch[arm]) for arm in arms}
+    )
+    result["per_batch_stats"] = str(stats_path)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(
         json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
