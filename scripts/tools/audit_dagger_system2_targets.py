@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dagger_system2_sft import (  # noqa: E402
     CORRECTED_KINDS,
+    STOP_KINDS,
     load_oracle_views,
     oracle_stops_within,
     plan_for_sample,
@@ -135,14 +136,20 @@ def main() -> None:
             if stops:
                 within_horizon[source] += 1
 
+        row = oracle_views.get(key)
         plan = plan_for_sample(
             sample,
-            oracle_views.get(key),
+            row,
             max_turns=args.max_turns,
             stop_supervision=bool(args.stop_supervision),
             stop_horizon_m=float(args.stop_horizon_m),
         )
         kind = plan.get("kind")
+        # Same rule as DaggerSystem2SFTDataset, so these counts are the ones the
+        # training log will print: no direction row drops everything but a stop.
+        if row is None and kind not in STOP_KINDS:
+            dropped["no_oracle_row"] += 1
+            continue
         if kind is None:
             dropped[str(plan.get("reason") or "unlabelled")] += 1
             continue

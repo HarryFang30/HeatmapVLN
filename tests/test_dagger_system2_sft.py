@@ -425,3 +425,32 @@ def test_the_exp13_summary_numbers_do_not_move_without_stop_supervision() -> Non
     assert summary["corrected_stop_fraction"] == 0
     assert summary["states"] == summary["unique_states"] == 2
     assert summary["stop_supervision"] is False
+
+
+def test_a_stop_needs_no_direction_row_but_everything_else_still_does() -> None:
+    # The states with no EXP-12 row are the ones already inside the oracle's
+    # goal tolerance; under stop supervision they are STOP targets, not drops.
+    at_goal = _terminal_sample("a", travelled_m=0.0, oracle_actions=[])
+    walking = _sample("b", pixel_goal=[30, 40])
+    samples = [at_goal, walking]
+
+    with_stop = sft.DaggerSystem2SFTDataset(
+        _FakeDagger(samples), oracle_views={}, stop_supervision=True
+    )
+    assert len(with_stop) == 1
+    assert with_stop.plans[0]["kind"] == "correct_stop"
+    assert with_stop.dropped == {"no_oracle_row": 1}
+
+    # The EXP-13 arms (no stop supervision) drop both, exactly as before: with
+    # nothing left to label the constructor refuses.
+    with pytest.raises(sft.DaggerSystem2SFTError, match="no DAgger state could be relabelled"):
+        sft.DaggerSystem2SFTDataset(_FakeDagger(samples), oracle_views={})
+
+    # And a row-less walking state is still dropped even under stop supervision.
+    mixed = sft.DaggerSystem2SFTDataset(
+        _FakeDagger([walking, _sample("c", pixel_goal=[1, 2])]),
+        oracle_views={"c": _row(0, 0)},
+        stop_supervision=True,
+    )
+    assert len(mixed) == 1
+    assert mixed.dropped == {"no_oracle_row": 1}

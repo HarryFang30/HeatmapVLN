@@ -69,6 +69,7 @@ RELABEL_KINDS = (
     "correct_stop",
 )
 CORRECTED_KINDS = ("correct_turn", "correct_stop")
+STOP_KINDS = ("correct_stop", "keep_stop")
 
 
 class DaggerSystem2SFTError(ValueError):
@@ -307,9 +308,6 @@ class DaggerSystem2SFTDataset(Dataset):
                 if (self.scene_split == "val") != in_val:
                     continue
             row = self.oracle_views.get(key)
-            if row is None and self.require_oracle_row:
-                self.dropped["no_oracle_row"] = self.dropped.get("no_oracle_row", 0) + 1
-                continue
             plan = plan_for_sample(
                 sample,
                 row,
@@ -317,6 +315,18 @@ class DaggerSystem2SFTDataset(Dataset):
                 stop_supervision=self.stop_supervision,
                 stop_horizon_m=self.stop_horizon_m,
             )
+            # A direction row is what keeps a turn from being guessed; a stop
+            # needs no direction.  The states with no row are exactly the ones
+            # already inside the oracle's goal tolerance (empty oracle.actions,
+            # so EXP-12 D1 had no first move to project), which under stop
+            # supervision are the clearest STOP targets there are.
+            if (
+                row is None
+                and self.require_oracle_row
+                and plan.get("kind") not in STOP_KINDS
+            ):
+                self.dropped["no_oracle_row"] = self.dropped.get("no_oracle_row", 0) + 1
+                continue
             if plan.get("kind") is None:
                 reason = str(plan.get("reason") or "unlabelled")
                 self.dropped[reason] = self.dropped.get(reason, 0) + 1
@@ -415,6 +425,7 @@ __all__ = [
     "DaggerSystem2SFTDataset",
     "DaggerSystem2SFTError",
     "RELABEL_KINDS",
+    "STOP_KINDS",
     "leading_turn_run",
     "load_oracle_views",
     "native_pixel_answer",

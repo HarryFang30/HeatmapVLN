@@ -70,8 +70,12 @@ checkpoint init: {... 'loaded_heatmap_head_tensors': 79, 'loaded_future_head_ten
 
 - **`loaded_bridge_tensors` 必须是 10。** 探的是**部署时那个模型**（`Z = Z0 + bridge(M)`），
   桥归零跑出来的是另一个模型，与其它 EXP-1x 的数字不同源。
-- **`skipped_unjoined` 应当是 0**（写在 `features_shard*.npz.json` 里）。
-  不是 0 说明 join 掉了状态，先查 `--per-state-jsonl` 是不是同一轮采集的产物。
+- **`skipped_unjoined` 合计应当是 312**（写在 `features_shard*.npz.json` 里，逐片相加）。
+  dataset 类看到 31128 个 hard/normal 状态，而 D1 的 `d1_per_state.jsonl` 只有 30816 行：
+  差的 312 个是 oracle **已经在 0.3 m 容差内**、`oracle.actions` 为空的状态——没有首步方向，
+  D1 本来就给不出 `oracle_view`（EXP-14 预检 2026-09-06 核对：`oracle_first_action.empty` = 312）。
+  合计不是 312 才说明 join 错了，先查 `--per-state-jsonl` 是不是同一轮采集的产物。
+  日志里 `visited` 与 `cached` 之差就是这些状态在该片里的个数。
 
 冷 AFS 下模型加载要几分钟才见第一行进度，**不要急着杀**（`CLAUDE.md` §4）。
 

@@ -1146,6 +1146,24 @@ s ≥ 0.03 则 K = 1，否则 K = min(8, ⌈0.03 / s⌉)——把 `correct_stop`
 判据的四个阈值不依赖这些数；这一段只决定了 K 和"1 m 内有没有样本"。正式的预检产物是
 `model/exp14_relabel_audit.json`（走 dataset 类与 `plan_for_sample`，计数以它为准）。
 
+**预检结果（2026-09-06，`model/exp14_relabel_audit.json`；预检，不是判据）.** 走 dataset 类与
+`plan_for_sample`，31128 个状态零丢弃：`correct_stop` **2564**（hard 2525 / normal 39）、
+`correct_turn` 3717（11.9%，与 shard_00 预览的 12.9% 同量级）、`keep_pixel` 24847。
+`terminal_routes.within_horizon` = 2564，与 `correct_stop` 逐个相等——native 没有已停的状态，
+规则没有旁路。s = 0.0824 → **K = 1**，config 不改。八条 `stop_examples` 逐条看过：native 输出
+都是像素坐标、`oracle_remaining_m` 在 0.25–1.0 之间、`oracle_kind` 全为 `route_recovery`。
+`correct_stop` 里带 `necessary_backtrack` 的 2177/2564——oracle 要往回走才到终点，正是
+"走过了没停"。`recovery_slice`（wrong_branch ∪ off_route）里转向改写 4441、停改写 632，
+与 EXP-12 的定位一致。
+shard_00 全部 7748 个状态的 native 文本与像素目标逐一相符，**没有任何 STOP 文本**——
+"native 在这些状态上为 0"在文本层面也成立。EXP-13 预览里 shard_00 的"丢弃 62"是 dataset 类的
+`no_oracle_row`：就是 oracle 已在容差内、`actions` 为空、D1 没有行的那批状态（全集 312 个）。
+它们是最干净的 STOP 目标，dataset 类原本在打标**之前**就把它们丢了，审计工具却把它们计了进去，
+训练日志和预检的 `correct_stop` 会差 312。已改成**只有停不需要方向行**（`STOP_KINDS` 豁免），
+审计工具同步同一条规则；13-B 模式下行为不变（仍丢 312）。改完复跑审计（改前副本存为
+`model/exp14_relabel_audit.prefix.json`）：`kinds` / `dropped` / 分来源计数逐项不变，
+所以训练日志里的 `correct_stop` 现在应当正好等于预检的 **2564**（train 切片按场景比例约四分之三）。
+
 **边界（预先声明）.**
 ① 早停的改正样本不存在于这份采集，早停只由 `stop_false_alarm`（决策级）与 14-C 的否决项兜住；
 一个在 DAgger 没覆盖的状态上学会早停的模型只会在闭环里被抓到。
