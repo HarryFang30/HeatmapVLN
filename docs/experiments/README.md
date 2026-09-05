@@ -35,7 +35,7 @@
 |---|---|---|---|
 | [EXP-01](#exp-01-把闭环-sr-拉回-native-水平) | 桥接上线后闭环 SR 从 62.5% 掉到 18.1%，能不能在不改架构、不做部署端衰减的前提下拉回来 | ✅ | 能。SR 62.81% vs native 62.48%，桥生效率 99.6% |
 | [EXP-02](#exp-02-历史认知头是不是在用视觉定位历史) | 历史认知头到底是"从视觉定位历史"，还是"把位姿投影出来" | ❌ | 是投影。定位完全由位姿决定，外观只贡献可见性（AUPRC +4~6 点） |
-| [EXP-03](#exp-03-部署头本身是否也只看位姿) | 部署权重（而非探针）是否也只看位姿 | ⏳ | 工具与输入已就位，8 卡全空、无任务在跑——可直接开跑（1 卡 × 1 h）|
+| [EXP-03](#exp-03-部署头本身是否也只看位姿) | 部署权重（而非探针）是否也只看位姿 | ✅ | 是。位姿与标签同步错位后恢复到基准的 **99.5%**、历史图整体倒序只掉 **0.92pt**；外观只买到可见性（全黑图 vis-F1 −15.5pt vs 定位 −7.7pt）|
 | [EXP-04](#exp-04-位姿有噪声时外观是否变重要) | 位姿换成 AMB3R VO（有噪声）后，外观是否变重要 | ❌ | 判据要求两种子 full−pose-only 都 > 3pt，实测 +10.1 / +0.3pt，种子间不稳定 |
 | [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | ❌ | 无约束桥在修复栈上 61.61%（vs v2 62.81%，CI 含 0）——18.1% 几乎全是评测栈 |
 | [EXP-06](#exp-06-零桥在修复栈上是否等于-native) | 修复后的评测栈跑零桥，是否精确等于 native | ⏳ | 2026-09-03 消融规划暂缓（见条目） |
@@ -192,6 +192,37 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
 
 **边界（预先声明）.** 结论只对"部署头 + VO 位姿 + R2R 分布"成立；它与 EXP-02（从零探针、
 真值位姿、random-walk）不样本匹配，两张表各自读，不能交叉比较绝对值。
+
+**结果（2026-09-05）.** 纯评测无训练（`evaluation_only: true`），val 划分 4 个场景 / 858 clips
+（与 22 个训练场景不相交），7 条件 × 400 样本 / 3049 个可见历史槽位，单卡 51 分钟。
+
+| 干预 | joint_pck8 | Δpck8 | 恢复率 | vis F1 |
+|---|---|---|---|---|
+| 无干预（基准） | **0.9308** | — | 1.000 | 0.9561 |
+| history-shuffle | 0.9216 | **−0.92pt** | 0.990 | 0.9555 |
+| current-shuffle | 0.9272 | −0.36pt | 0.996 | 0.9557 |
+| blank-images | 0.8537 | −7.71pt | 0.917 | **0.8015** |
+| zero-pose | 0.5100 | −42.08pt | 0.548 | 0.8421 |
+| pose-conflict | 0.7665 | −16.43pt | 0.823 | 0.8892 |
+| pose-conflict-shifted-target | 0.9259 | −0.49pt | **0.9947** | 0.9573 |
+
+**结论.** ✅ **支持假设。** 两项判据都过：`shifted-target` 恢复率 **0.9947**（支持线 ≥0.95）、
+`history-shuffle` 变化 **−0.92pt**（支持线 |Δ| ≤ 2pt）。**部署权重与探针行为一致——
+它也是位姿投影器**，长训练没有凭空长出视觉定位能力。最干净的证据仍是错位对：
+位姿错一格崩到 0.7665，标签也同步错一格立刻回到 0.9259。外观唯一稳定买到的是**可见性**：
+图像全黑时可见性 F1 掉 15.5pt，而定位只掉 7.7pt——**可见性的相对损失是定位的两倍**。
+
+至此 EXP-02（可识别性：这个头**能不能**从视觉定位）与 EXP-03（归因：部署的头**实际上**
+靠什么定位）两问都有答案，方法节里"从视觉定位历史"的表述**两条线都不支持**。
+
+**边界（补充）.**
+② zero-pose 下仍有 `joint_pck8=0.5100`，报告 §5 把它解释为**位置先验**
+（历史标签 82.27% 落在后视），但**没有测**——缺一个"位姿清零 + 图像清零"的双清对照。
+这是解释，不是测量，不写进论文。
+③ **单种子**（seed 42）。本次是评测不是训练，种子只影响 400 个样本的抽样；
+两项判据分别以 4.5pt 与 1.1pt 余量过线，但**抽样噪声本身没有被量化**。
+
+📄 [exp03-deployment-head-report.md](exp03-deployment-head-report.md)
 
 ---
 
@@ -812,6 +843,7 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
 | 捷径诊断（VO 位姿域，EXP-04） | `model/heatmap_shortcut_probe_vo_v1/seed_{42,1337}/` |
 | EXP-03 部署头（head-only 格式；79 张量来自部署 ckpt + 2 张常量缓冲，`initial_head_hash=e00d5058…`，按 `configs/train_heatmap_internnav_single_view_8gpu.yaml` 构建） | `model/exp03_deployment_head/head_v2_best.pth` |
+| EXP-03 七条件干预结果（部署头，VO 位姿，val 4 场景） | `model/exp03_deployment_head/probe_full_v2/full/report.json` + `run.log` |
 | 位姿域偏移代价（真值训练→VO 评测） | `model/output_heatmap_amb3r_pose_adapt_endpoint_v2_4gpu/runs/run_20260814_234429/logs/metrics.jsonl` 的 `pre_training_validation` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 | 合并两种子配对 bootstrap（主表判据来源，20000 次重采样） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_pooled_seeds42_1337.json` |
