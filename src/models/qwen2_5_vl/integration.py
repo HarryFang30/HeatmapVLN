@@ -38,6 +38,10 @@ VIEW_NAMES = ("front", "right", "back", "left")
 # the LLM forward pass.  The token ID matches InternNav's vocabulary entry so
 # that the same backbone weights are compatible.
 TRAJ_TOKEN_INDEX = 151667
+# One more unused id from the same reserved block (added tokens stop at
+# 151664, the embedding table runs to 152063).  It carries the Past Head
+# memory into System2's prompt; see src/models/system2_memory.py.
+MEMORY_TOKEN_INDEX = 151668
 
 # Import sequence packing utilities
 try:
@@ -821,6 +825,7 @@ class Qwen2_5VLIntegration(nn.Module):
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        memory_embeds: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -858,6 +863,7 @@ class Qwen2_5VLIntegration(nn.Module):
         n_query = 0
         hook_handle = None
         need_traj_hidden = latent_queries is not None
+        replacements: list[tuple[int, torch.Tensor]] = []
 
         # input_ids to use for vision-feature extraction (without TRAJ tokens)
         vision_input_ids = raw_input_ids
@@ -899,34 +905,62 @@ class Qwen2_5VLIntegration(nn.Module):
                         [inputs["mm_token_type_ids"], mm_ext], dim=1,
                     )
 
-            # Pre-hook: replace TRAJ_TOKEN_INDEX embeddings with latent_queries
-            # (InternNav-style mask-based replacement)
-            lq = latent_queries
-            _traj_token_id = TRAJ_TOKEN_INDEX
-            _input_ids_ref = inputs["input_ids"]
+            replacements.append((TRAJ_TOKEN_INDEX, latent_queries))
 
-            def _replace_traj_embeds_hook(module, args, kwargs):
-                embeds = kwargs.get('inputs_embeds')
-                if embeds is not None:
-                    traj_mask = _input_ids_ref == _traj_token_id
-                    if traj_mask.any():
-                        embeds = embeds.clone()
-                        flat_lq = lq.to(dtype=embeds.dtype, device=embeds.device)
-                        embeds[traj_mask] = flat_lq.reshape(-1, flat_lq.shape[-1])
-                        kwargs = dict(kwargs)
-                        kwargs['inputs_embeds'] = embeds
-                return args, kwargs
+        if memory_embeds is not None:
+            # Placed inside the user turn by the collator, so System2 can read
+            # the history memory while it is still choosing where to go.
+            replacements.append((MEMORY_TOKEN_INDEX, memory_embeds))
 
-            language_model_root = (
-                self._get_nested_module(self.model, "model.language_model")
-                or self._get_nested_module(self.model, "language_model")
-                or self._get_nested_module(self.model, "model")
-            )
-            if language_model_root is None:
-                raise RuntimeError("Could not locate the language model module for latent query injection")
+        if replacements:
+            # Substitute at the token-embedding lookup rather than at the
+            # language-model boundary.  Attribute-path guessing does not
+            # survive a PEFT wrapper -- under LoRA the old lookup resolved to a
+            # module that is never called with ``inputs_embeds``, so the hook
+            # silently did nothing and the injected vectors never reached the
+            # model.  ``get_input_embeddings()`` is resolved by the wrapper
+            # itself, is always called with the ids, and runs before image
+            # features are scattered in (which only touch image positions), so
+            # the result is identical for text sentinels and no longer depends
+            # on how the backbone happens to be wrapped.
+            _replacements = list(replacements)
+            _injection_calls = {"count": 0}
 
-            hook_handle = language_model_root.register_forward_pre_hook(
-                _replace_traj_embeds_hook, with_kwargs=True,
+            def _replace_sentinel_embeds_hook(module, args, output):
+                if not args:
+                    return output
+                ids = args[0]
+                if not torch.is_tensor(ids) or ids.shape != output.shape[:-1]:
+                    return output
+                replaced = None
+                for token_id, source in _replacements:
+                    mask = ids == token_id
+                    slots = int(mask.sum().item())
+                    if slots == 0:
+                        continue
+                    flat = source.reshape(-1, source.shape[-1])
+                    if flat.shape[0] != slots:
+                        raise RuntimeError(
+                            f"sentinel {token_id} appears {slots} times but "
+                            f"{flat.shape[0]} embeddings were supplied"
+                        )
+                    if replaced is None:
+                        replaced = output.clone()
+                    replaced[mask] = flat.to(
+                        dtype=replaced.dtype, device=replaced.device
+                    )
+                if replaced is None:
+                    return output
+                _injection_calls["count"] += 1
+                return replaced
+
+            embedding_module = self.model.get_input_embeddings()
+            if embedding_module is None:
+                raise RuntimeError(
+                    "Could not locate the input embedding module for sentinel injection"
+                )
+            hook_handle = embedding_module.register_forward_hook(
+                _replace_sentinel_embeds_hook
             )
 
         inner_model = getattr(self.model, "model", None) if skip_lm_head else None
@@ -1022,6 +1056,7 @@ class Qwen2_5VLIntegration(nn.Module):
             or return_lm_correct_logprobs
             or self._model_has_trainable_parameters()
             or (latent_queries is not None and latent_queries.requires_grad)
+            or (memory_embeds is not None and memory_embeds.requires_grad)
         )
 
         def _filter_kwargs_for_forward(module: nn.Module, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1100,6 +1135,12 @@ class Qwen2_5VLIntegration(nn.Module):
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
+        if replacements and _injection_calls["count"] == 0:
+            raise RuntimeError(
+                "sentinel embeddings were prepared but never substituted; the "
+                "backbone did not route its ids through get_input_embeddings(), "
+                "so TRAJ/memory vectors did not reach the model"
+            )
 
         if self._internal_profiler is not None:
             self._last_internal_timings = self._internal_profiler.snapshot()
@@ -1133,6 +1174,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     f"expected_kept_positions={predictor_union.numel()}"
                 )
             flat_correct_logprobs = []
+            predicted_token_ids: list[list[int]] = []
             for row, (positions_list, token_ids_list) in enumerate(
                 zip(
                     correct_logprob_alignment["sample_predictor_positions"],
@@ -1153,6 +1195,13 @@ class Qwen2_5VLIntegration(nn.Module):
                 flat_correct_logprobs.append(
                     correct_logits - torch.logsumexp(selected_logits, dim=-1)
                 )
+                # What the model would actually emit at each supervised
+                # position.  Greedy decoding's first token is exactly this
+                # argmax at the first supervised position, because that step
+                # conditions on the prompt alone.
+                predicted_token_ids.append(
+                    selected_logits.argmax(dim=-1).detach().cpu().tolist()
+                )
             correct_logprobs = torch.cat(flat_correct_logprobs, dim=0)
             if correct_logprobs.dtype != torch.float32:
                 raise RuntimeError(
@@ -1162,8 +1211,12 @@ class Qwen2_5VLIntegration(nn.Module):
             correct_logprob_alignment["returned_logprob_dtype"] = str(
                 correct_logprobs.dtype
             )
+            correct_logprob_alignment["sample_predicted_token_ids"] = (
+                predicted_token_ids
+            )
             lm_output = {
                 "correct_label_logprobs": correct_logprobs,
+                "predicted_token_ids": predicted_token_ids,
                 "alignment": correct_logprob_alignment,
             }
 
@@ -1333,6 +1386,7 @@ class Qwen2_5VLIntegration(nn.Module):
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        memory_embeds: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -1389,6 +1443,7 @@ class Qwen2_5VLIntegration(nn.Module):
             or return_lm_correct_logprobs
             or return_hidden_states
             or latent_queries is not None
+            or memory_embeds is not None
             or (heatmap_vln is not None and self.config.heatmap_trains_backbone)
         )
         skip_lm = (
@@ -1402,11 +1457,13 @@ class Qwen2_5VLIntegration(nn.Module):
                 skip_lm_head=skip_lm, latent_queries=latent_queries,
                 return_lm_loss=return_lm_loss,
                 return_lm_correct_logprobs=return_lm_correct_logprobs,
+                memory_embeds=memory_embeds,
             )
         else:
             with torch.inference_mode():
                 hidden_states, vision_hidden_states, num_image_tokens, traj_hs, lm_output = self._forward_model_inputs(
                     inputs, False, skip_lm_head=True, latent_queries=latent_queries,
+                    memory_embeds=memory_embeds,
                 )
         t2 = time.perf_counter() if self.config.enable_runtime_timing else 0.0
         internal_timings = self._consume_internal_timings() if self.config.enable_runtime_timing else {}
@@ -1537,6 +1594,7 @@ class Qwen2_5VLIntegration(nn.Module):
         latent_queries: torch.Tensor | None = None,
         return_lm_loss: bool = False,
         return_lm_correct_logprobs: bool = False,
+        memory_embeds: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Forward pass through Qwen2.5-VL with batch processing."""
         # Ensure model is loaded
@@ -1560,6 +1618,7 @@ class Qwen2_5VLIntegration(nn.Module):
                     latent_queries=latent_queries,
                     return_lm_loss=return_lm_loss,
                     return_lm_correct_logprobs=return_lm_correct_logprobs,
+                    memory_embeds=memory_embeds,
                 )
             )
         elif current_views is not None and history_panoramas is not None:
@@ -1574,6 +1633,11 @@ class Qwen2_5VLIntegration(nn.Module):
                 )
             )
             traj_hidden_states = traj_hs
+        elif memory_embeds is not None:
+            raise RuntimeError(
+                "System2 memory tokens require the tokenized panoramic path; "
+                "the legacy per-sample paths cannot place them"
+            )
         else:
             hidden_states, vision_hidden_states, num_image_tokens, heatmap_output = (
                 self._forward_batch(

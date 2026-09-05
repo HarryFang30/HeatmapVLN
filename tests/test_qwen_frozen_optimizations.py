@@ -63,10 +63,17 @@ class _NoLastHiddenModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.language_model = nn.Identity()
+        # Sentinel embeddings are substituted at the embedding lookup, and the
+        # integration refuses a forward where that substitution never happened
+        # -- a silent no-op there is what kept EXP-13's memory tokens out of the
+        # language model entirely.  A stub that skipped the lookup would
+        # exercise a path production cannot take, so this one performs it.
+        self.embed_tokens = nn.Embedding(TRAJ_TOKEN_INDEX + 16, 8)
         self.output_hidden_states_calls = []
 
     def forward(self, input_ids, output_hidden_states, **_kwargs):
         self.output_hidden_states_calls.append(output_hidden_states)
+        self.embed_tokens(input_ids)
         hidden = torch.ones((*input_ids.shape, 8), device=input_ids.device)
         return SimpleNamespace(
             last_hidden_state=None,
@@ -78,6 +85,9 @@ class _NoLastHiddenWrapper(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.model = _NoLastHiddenModel()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
 
 
 def test_last_hidden_only_falls_back_to_hidden_state_tuple():

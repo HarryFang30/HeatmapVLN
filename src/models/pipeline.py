@@ -33,6 +33,7 @@ from .heatmap import (
 )
 from .qwen2_5_vl import Qwen2_5VLConfig, Qwen2_5VLIntegration
 from .past_plan_action import PastPlanActionChain
+from .system2_memory import System2MemoryTokens
 
 logger = logging.getLogger(__name__)
 VIEW_NAMES = ("front", "right", "back", "left")
@@ -174,6 +175,15 @@ class VLNPipelineConfig:
     past_plan_action_bridge_heads: int = 8
     past_plan_action_max_delta_ratio: float | None = None
 
+    # History memory as extra System2 prompt tokens.  This is the alternative
+    # injection point to the Plan bridge above: the memory reaches the language
+    # model while it still decides where to go, instead of the local controller
+    # that only executes that decision.
+    system2_memory_enabled: bool = False
+    system2_memory_mode: str = "memory"
+    system2_memory_num_tokens: int = 8
+    system2_memory_dim: int = 256
+
     # Performance settings
     enable_gradient_checkpointing: bool = False
     verbose: bool = False
@@ -258,6 +268,7 @@ class VLNPipeline(nn.Module):
         self.latent_queries = None
         self.pano_latent_adapter = None
         self.past_plan_action: PastPlanActionChain | None = None
+        self.system2_memory: System2MemoryTokens | None = None
         self._internnav_system1_load_audit: dict[str, Any] | None = None
 
         if config.enable_action_head and config.nextdit_enabled:
@@ -396,6 +407,37 @@ class VLNPipeline(nn.Module):
                 )
         elif config.nextdit_enabled:
             logger.info("NextDiT action head disabled by config.enable_action_head=False")
+
+        if config.system2_memory_enabled:
+            # Built at pipeline scope on purpose: this arm trains System2 with
+            # the action head switched off, so it cannot hang off the NextDiT
+            # construction branch.
+            if config.past_plan_action_enabled:
+                raise RuntimeError(
+                    "System2 memory tokens and the Plan bridge are two different "
+                    "injection points for the same memory; enable exactly one"
+                )
+            if self._heatmap_control_enabled:
+                raise RuntimeError(
+                    "System2 memory tokens forbid legacy per-layer heatmap control"
+                )
+            if not config.enable_heatmap:
+                raise RuntimeError(
+                    "System2 memory tokens require the Past Head that produces them"
+                )
+            self.system2_memory = System2MemoryTokens(
+                memory_dim=config.system2_memory_dim,
+                embed_dim=config.llm_hidden_dim,
+                num_tokens=config.system2_memory_num_tokens,
+                mode=config.system2_memory_mode,
+            ).to(device=self.device, dtype=torch.float32)
+            logger.info(
+                "System2 memory tokens enabled: mode=%s, tokens=%d, M=%d -> %d",
+                config.system2_memory_mode,
+                config.system2_memory_num_tokens,
+                config.system2_memory_dim,
+                config.llm_hidden_dim,
+            )
 
         logger.info("=" * 60)
         logger.info("Pipeline initialization complete")
@@ -660,7 +702,7 @@ class VLNPipeline(nn.Module):
 
         input_mode = str(getattr(cfg, "heatmap_input_mode", "panoramic")).strip().lower()
         if input_mode == "internnav_single_view":
-            if cfg.use_lora:
+            if cfg.use_lora and not cfg.system2_memory_enabled:
                 raise RuntimeError("internnav_single_view forbids LoRA")
             if cfg.heatmap_trains_backbone:
                 raise RuntimeError("internnav_single_view requires heatmap_trains_backbone=false")
@@ -703,6 +745,10 @@ class VLNPipeline(nn.Module):
                 spatial_merge_size=getattr(cfg, "spatial_merge_size", 2),
                 require_frozen_backbone=True,
                 reject_lora=True,
+                # The System2 memory arm adapts the language model, so the
+                # released-and-frozen contract is checked where it actually
+                # matters: the visual tower these features come from.
+                scope_checks_to_visual=bool(cfg.system2_memory_enabled),
                 restore_vit_spatial_layout=True,
             )
         elif input_mode == "panoramic":
@@ -958,6 +1004,8 @@ class VLNPipeline(nn.Module):
         return_lm_correct_logprobs: bool = False,
         return_heatmap_logits: bool = False,
         return_future_heatmaps: bool = False,
+        return_history_memory: bool = False,
+        inject_system2_memory: bool = False,
         action_initial_noise: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Forward pass."""
@@ -1068,8 +1116,20 @@ class VLNPipeline(nn.Module):
             raise ValueError(
                 "single_view_inputs require model.heatmap.input_mode=internnav_single_view"
             )
+        memory_tokens_requested = bool(
+            inject_system2_memory and self.system2_memory is not None
+        )
+        if inject_system2_memory and self.system2_memory is None:
+            raise RuntimeError(
+                "inject_system2_memory=True but the pipeline was built without "
+                "model.system2_memory"
+            )
         need_single_view_heatmap = has_single_view_heatmap and (
-            return_heatmaps or control_requested or ppa_requested
+            return_heatmaps
+            or control_requested
+            or ppa_requested
+            or return_history_memory
+            or memory_tokens_requested
         )
         need_heatmap = need_panorama_heatmap or need_single_view_heatmap
         if return_heatmap_logits and not need_heatmap:
@@ -1139,10 +1199,17 @@ class VLNPipeline(nn.Module):
                 history_rel_poses=history_rel_poses,
                 explicit_history_mask=(
                     semantic_history_mask
-                    if (control_requested or ppa_requested)
+                    if (
+                        control_requested
+                        or ppa_requested
+                        or return_history_memory
+                        or memory_tokens_requested
+                    )
                     else None
                 ),
-                return_memory_tokens=ppa_requested,
+                return_memory_tokens=(
+                    ppa_requested or return_history_memory or memory_tokens_requested
+                ),
             )
         if control_requested:
             if self.heatmap_tokenizer is None:
@@ -1173,6 +1240,33 @@ class VLNPipeline(nn.Module):
             heatmap_control_output["sample_valid"] = (
                 heatmap_control_output["token_mask"].any(dim=1)
             )
+        system2_memory_embeds = None
+        if memory_tokens_requested:
+            if self.system2_memory.mode == "constant":
+                # The control arm must not read M_t at all, so it is sized from
+                # the batch instead of from the memory tensor.
+                system2_memory_embeds = self.system2_memory(
+                    None, None, batch_size=batch_size
+                )
+            else:
+                if heatmap_output is None:
+                    raise RuntimeError(
+                        "System2 memory tokens requested but the Past Head "
+                        "produced no output"
+                    )
+                missing_memory = sorted(
+                    {"history_memory", "history_memory_mask"} - set(heatmap_output)
+                )
+                if missing_memory:
+                    raise RuntimeError(
+                        "System2 memory tokens need the Past Head memory: "
+                        f"missing={missing_memory}"
+                    )
+                system2_memory_embeds = self.system2_memory(
+                    heatmap_output["history_memory"],
+                    heatmap_output["history_memory_mask"],
+                )
+
         should_run_qwen = (
             need_projected_sequence_features
             or need_traj_query_features
@@ -1215,6 +1309,7 @@ class VLNPipeline(nn.Module):
                 latent_queries=lq,
                 return_lm_loss=return_lm_loss,
                 return_lm_correct_logprobs=return_lm_correct_logprobs,
+                memory_embeds=system2_memory_embeds,
             )
             if self.config.enable_runtime_timing:
                 qwen_end = time.perf_counter()
@@ -1360,6 +1455,24 @@ class VLNPipeline(nn.Module):
                 output["heatmap_direction_order"] = heatmap_output[
                     "heatmap_direction_order"
                 ]
+            if return_history_memory:
+                missing_memory = sorted(
+                    {"history_memory", "history_memory_mask"}
+                    - set(heatmap_output)
+                )
+                if missing_memory:
+                    raise RuntimeError(
+                        "return_history_memory=True but the Past Head "
+                        f"returned no memory tokens: missing={missing_memory}"
+                    )
+                output["history_memory"] = heatmap_output["history_memory"]
+                output["history_memory_mask"] = heatmap_output[
+                    "history_memory_mask"
+                ]
+
+        if system2_memory_embeds is not None:
+            output["system2_memory_tokens"] = int(system2_memory_embeds.shape[1])
+            output["system2_memory_mode"] = self.system2_memory.mode
 
         if plan_z0 is not None:
             output["plan_z0"] = plan_z0
@@ -1384,6 +1497,9 @@ class VLNPipeline(nn.Module):
         if qwen_output is not None and qwen_output.get("lm_correct_label_logprobs") is not None:
             output["lm_correct_label_logprobs"] = qwen_output["lm_correct_label_logprobs"]
             output["lm_correct_label_alignment"] = qwen_output["lm_correct_label_alignment"]
+            output["lm_predicted_token_ids"] = qwen_output[
+                "lm_correct_label_alignment"
+            ]["sample_predicted_token_ids"]
 
         if self.nextdit_action_head is not None:
             output["has_nextdit_action_head"] = True

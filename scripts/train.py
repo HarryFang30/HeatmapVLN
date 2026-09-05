@@ -54,6 +54,7 @@ _mp.set_sharing_strategy('file_system')
 
 import argparse
 import gc
+import json
 import logging
 import math
 import time
@@ -613,6 +614,17 @@ def main():
     logger.info(f"  Train: {len(train_dataset)} samples")
     if val_dataset is not None:
         logger.info(f"  Val: {len(val_dataset)} samples")
+    # Relabelled DAgger supervision is the whole content of the EXP-13 arms, so
+    # what it actually produced belongs in the run's own log rather than in a
+    # module logger the run never attaches.
+    for split_name, split_dataset in (('train', train_dataset), ('val', val_dataset)):
+        summary_fn = getattr(split_dataset, 'summary', None)
+        if callable(summary_fn):
+            logger.info(
+                "  System2 SFT relabelling (%s): %s",
+                split_name,
+                json.dumps(summary_fn(), ensure_ascii=False, sort_keys=True),
+            )
     else:
         if not cfg.get('validation', {}).get('enabled', True):
             logger.info("  Val: disabled (validation.enabled=false)")
@@ -622,6 +634,15 @@ def main():
     # 构建模型
     logger.info("🏗️  Building model...")
     model = build_model(cfg, verbose=dist_context.is_main)
+
+    system2_memory_model_cfg = cfg.get('model', {}).get('system2_memory', {}) or {}
+    if system2_memory_model_cfg.get('enabled', False):
+        logger.info(
+            "  System2 memory tokens: mode=%s, tokens=%d (the treatment and "
+            "control arms differ only here)",
+            system2_memory_model_cfg.get('mode', 'memory'),
+            int(system2_memory_model_cfg.get('num_tokens', 8)),
+        )
 
     nextdit_cfg = cfg.get('model', {}).get('action_head', {}).get('nextdit', {})
     default_require_complete_system1 = bool(
@@ -941,9 +962,22 @@ def main():
         .get('past_plan_action', {})
         .get('enabled', False)
     )
+    system2_memory_enabled = bool(
+        cfg.get('model', {})
+        .get('system2_memory', {})
+        .get('enabled', False)
+    )
     use_heatmap_control_collator = (
-        (heatmap_control_collator_enabled or past_plan_action_enabled)
-        and (stage_train_action or stage_train_future)
+        (
+            heatmap_control_collator_enabled
+            or past_plan_action_enabled
+            or system2_memory_enabled
+        )
+        and (
+            stage_train_action
+            or stage_train_future
+            or (system2_memory_enabled and stage_train_lm)
+        )
         and use_worker_tokenized_collator
     )
     use_panoramic_tokenized_collator = (
@@ -996,6 +1030,12 @@ def main():
         n_traj_query = int(
             cfg['model']['action_head']['nextdit'].get('n_query', 4)
         )
+        if system2_memory_enabled:
+            # The released policy generates its text without TRAJ tokens; they
+            # only exist to extract Z for System1, which this stage does not
+            # train.  Appending them here would supervise a prompt the
+            # evaluator never produces.
+            n_traj_query = 0
         require_amb3r_provider = bool(
             past_plan_action_enabled
             and (
@@ -1012,6 +1052,7 @@ def main():
                 "Past→Plan Stage1/2 expert training requires trajectory "
                 "endpoint-v2 AMB3R cache; GT history-pose fallback is forbidden"
             )
+        system2_memory_cfg = cfg.get('model', {}).get('system2_memory', {}) or {}
         actual_collate_fn = InternNavHeatmapControlCollator(
             control_processor,
             n_traj_query=n_traj_query,
@@ -1020,6 +1061,15 @@ def main():
             include_future_trajectory_targets=stage_train_future,
             required_history_pose_provider=(
                 AMB3R_POSE_PROVIDER if require_amb3r_provider else None
+            ),
+            build_sft_labels=bool(system2_memory_enabled and stage_train_lm),
+            memory_token_count=(
+                int(system2_memory_cfg.get('num_tokens', 8))
+                if system2_memory_enabled
+                else 0
+            ),
+            internnav_conjunction=(
+                'you can see ' if system2_memory_enabled else None
             ),
         )
         logger.info(
@@ -1329,6 +1379,13 @@ def main():
     warmstart_contract = stage_cfg.get('heatmap_warmstart_contract') or {}
     warmstart_policy = warmstart_contract.get('policy')
     pose_adaptation_init = bool(stage_cfg.get('heatmap_pose_adaptation_init', False))
+    frozen_past_head_init = bool(stage_cfg.get('load_frozen_past_head', False))
+    if frozen_past_head_init and not args.load_weights:
+        raise ValueError(
+            "load_frozen_past_head requires the deployed checkpoint via "
+            "--load-weights; the Past Head is an input to this stage, not "
+            "something it learns"
+        )
     single_view_artifact_loaded = False
     single_view_warmstart_report = None
     if (
@@ -1350,6 +1407,32 @@ def main():
             "A new AMB3R pose-adaptation run requires the current GT-pose "
             "best.pth via --load-weights"
         )
+    if args.load_weights and frozen_past_head_init:
+        weights_path = Path(args.load_weights)
+        if not weights_path.exists():
+            raise FileNotFoundError(
+                f"Frozen Past Head initializer not found: {weights_path}"
+            )
+        single_view_warmstart_report = load_pose_adaptation_initialization(
+            raw_model,
+            weights_path,
+        )
+        single_view_artifact_loaded = True
+        cfg.setdefault('runtime', {})['frozen_past_head_checkpoint'] = str(
+            weights_path.resolve()
+        )
+        logger.info(
+            "  ✓ Loaded the deployed Past Head as a frozen input: tensors=%d "
+            "(nothing else from that checkpoint is used)",
+            single_view_warmstart_report['loaded_tensor_count'],
+        )
+        if dist_context.is_main:
+            _write_json(
+                manifest_dir / 'frozen_past_head_init.json',
+                single_view_warmstart_report,
+            )
+        torch.cuda.empty_cache()
+
     if args.load_weights and pose_adaptation_init:
         if resume_path and Path(resume_path).exists():
             raise ValueError(

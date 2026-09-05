@@ -213,8 +213,16 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
         trainable == {"heatmap_tokenizer", "heatmap_control"}
         and stage_cfg.get("train_action", False)
     )
+    # System2 memory-token SFT: LoRA and the projector train, both cognition
+    # heads and System1 stay frozen.  Without this the frozen Past Head would
+    # be left in train mode by the recursive model.train() above.
+    is_system2_memory = "system2_memory" in trainable
     is_selective_stage2 = (
-        is_selective_stage2 or is_heatmap_only or is_heatmap_control or ppa_enabled
+        is_selective_stage2
+        or is_heatmap_only
+        or is_heatmap_control
+        or is_system2_memory
+        or ppa_enabled
     )
     if not is_selective_stage2:
         return
@@ -308,6 +316,10 @@ def _apply_bridge_only_train_mode(model_module: VLNPipeline, stage_cfg: dict, lo
             adapters = tuple(adapters_fn()) if callable(adapters_fn) else ()
             for adapter in adapters:
                 adapter.train()
+
+    memory_tokens = getattr(model_module, "system2_memory", None)
+    if memory_tokens is not None:
+        memory_tokens.train(is_system2_memory)
 
     if ppa_enabled:
         ppa_chain.eval()
@@ -425,6 +437,9 @@ def train_one_epoch(
         .get('action_head', {})
         .get('nextdit', {})
         .get('heatmap_control', {})
+    )
+    system2_memory_enabled = bool(
+        cfg.get('model', {}).get('system2_memory', {}).get('enabled', False)
     )
     heatmap_control_enabled = bool(heatmap_control_cfg.get('enabled', False))
     ppa_enabled = getattr(model_module, 'past_plan_action', None) is not None
@@ -712,6 +727,7 @@ def train_one_epoch(
                 return_actions=train_action,
                 return_future_heatmaps=train_future and ppa_enabled,
                 return_lm_loss=train_lm,
+                inject_system2_memory=system2_memory_enabled,
                 gt_actions=gt_action.unsqueeze(1) if train_action else None,
                 action_valid=action_valid if train_action else None,
                 gt_stop=is_stop if train_action else None,

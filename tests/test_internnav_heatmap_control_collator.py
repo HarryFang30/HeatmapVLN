@@ -44,6 +44,9 @@ try:
     )
     _integration = types.ModuleType(_INTEGRATION_MODULE)
     _integration.TRAJ_TOKEN_INDEX = 151667
+    # The collator also carries the System2 memory sentinel now; a stub that
+    # lags the real module fails at import, not at the assertion (CLAUDE.md 5.1).
+    _integration.MEMORY_TOKEN_INDEX = 151668
     sys.modules[_INTEGRATION_MODULE] = _integration
 
     _package = types.ModuleType(_PACKAGE_NAME)

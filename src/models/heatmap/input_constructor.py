@@ -479,6 +479,7 @@ def construct_input_stage2(
     pixel_goal: list[int] | None = None,
     assistant_text: str | None = None,
     conjunction: str | None = None,
+    memory_placeholder: str | None = None,
 ) -> list[dict]:
     """Construct the released InternNav Stage-2 independent-image prompt.
 
@@ -500,6 +501,11 @@ def construct_input_stage2(
     instruction_text = instruction or ""
     prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
     user_content: list[dict] = [{"type": "text", "text": prompt_text}]
+    if memory_placeholder:
+        # Reserved slots the collator rewrites into memory sentinels.  They sit
+        # before the observations so the language model reads "where I have
+        # been" as part of the same user turn that asks where to go next.
+        user_content.append({"type": "text", "text": memory_placeholder})
     if history_images:
         user_content.append({
             "type": "text",

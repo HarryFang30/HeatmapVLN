@@ -53,6 +53,9 @@ class InternNavHeatmapControlCollator:
         teacher_force_system2_answer: bool = True,
         include_future_trajectory_targets: bool = False,
         required_history_pose_provider: str | None = None,
+        build_sft_labels: bool = False,
+        memory_token_count: int = 0,
+        internnav_conjunction: str | None = None,
     ) -> None:
         image_processor = getattr(processor, "image_processor", None)
         if image_processor is None or not callable(image_processor):
@@ -60,8 +63,15 @@ class InternNavHeatmapControlCollator:
                 "InternNavHeatmapControlCollator requires an AutoProcessor "
                 "with a callable image_processor"
             )
-        if int(n_traj_query) <= 0:
-            raise ValueError("n_traj_query must be positive for System-1 training")
+        if int(n_traj_query) < 0:
+            raise ValueError("n_traj_query must be non-negative")
+        if int(n_traj_query) == 0 and not build_sft_labels:
+            # Zero TRAJ tokens only makes sense for a System2 text stage; any
+            # System1 path needs them to receive a conditioning Plan.
+            raise ValueError(
+                "n_traj_query=0 is only valid for System2 SFT "
+                "(build_sft_labels=True)"
+            )
         self.image_processor = image_processor
         self.include_future_trajectory_targets = bool(
             include_future_trajectory_targets
@@ -77,14 +87,16 @@ class InternNavHeatmapControlCollator:
             n_traj_query=int(n_traj_query),
             sft_mode=bool(teacher_force_system2_answer),
             sft_protocol="internnav",
-            build_sft_labels=False,
             max_seq_length=int(max_seq_length),
+            build_sft_labels=bool(build_sft_labels),
             include_heatmap_targets=False,
             include_history_rel_poses=True,
             retain_raw_panoramic_views=False,
             compute_pano_text_anchor_positions=False,
             heatmap_layout=False,
             force_internnav_prompt=True,
+            memory_token_count=int(memory_token_count),
+            internnav_conjunction=internnav_conjunction,
         )
 
     @staticmethod

@@ -39,7 +39,9 @@ def assert_single_view_training_contract(
         return None
 
     llm_cfg = cfg.get("model", {}).get("llm", {})
-    if llm_cfg.get("use_lora") is not False:
+    system2_memory_cfg = cfg.get("model", {}).get("system2_memory", {}) or {}
+    system2_memory_enabled = bool(system2_memory_cfg.get("enabled", False))
+    if llm_cfg.get("use_lora") is not False and not system2_memory_enabled:
         raise RuntimeError("internnav_single_view requires model.llm.use_lora=false")
     if heatmap_cfg.get("heatmap_trains_backbone") is not False:
         raise RuntimeError(
@@ -301,6 +303,105 @@ def assert_single_view_training_contract(
             "trainable_parameter_tensors": len(trainable_ids),
             "optimizer_parameter_tensors": len(optimizer_ids),
             "optimizer_groups": len(optimizer.param_groups),
+        }
+
+    if system2_memory_enabled:
+        module = _unwrap_model(model)
+        # This arm trains System2, not the Past Head.  It therefore cannot go
+        # through the heatmap-only tail below, and needs its own contract:
+        # everything the head reads stays released and frozen, and the only
+        # things that move are the LoRA adapters and the memory projection.
+        expected_trainable = ["lora", "system2_memory"]
+        if sorted(stage_cfg.get("trainable_modules", ())) != expected_trainable:
+            raise RuntimeError(
+                f"System2 memory training must train exactly {expected_trainable}"
+            )
+        if stage_cfg.get("strict_trainable_modules") is not True:
+            raise RuntimeError(
+                "System2 memory training requires strict_trainable_modules=true"
+            )
+        if getattr(module, "past_plan_action", None) is not None:
+            raise RuntimeError("System2 memory training forbids the Plan bridge")
+        if getattr(module, "_heatmap_control_enabled", False):
+            raise RuntimeError("System2 memory training forbids legacy heatmap control")
+        if getattr(module, "pano_latent_adapter", None) is not None:
+            raise RuntimeError("System2 memory training forbids panoramic adapters")
+        if getattr(module, "nextdit_action_head", None) is not None:
+            raise RuntimeError(
+                "System2 memory training supervises text only; System1 must not "
+                "be constructed"
+            )
+        memory_tokens = getattr(module, "system2_memory", None)
+        if memory_tokens is None:
+            raise RuntimeError("System2 memory training requires the memory module")
+        heatmap_head = getattr(module, "heatmap_vln", None)
+        if heatmap_head is None:
+            raise RuntimeError("System2 memory training requires the Past Head")
+        if any(parameter.requires_grad for parameter in heatmap_head.parameters()):
+            raise RuntimeError("the Past Head must stay frozen; it only produces M_t")
+
+        visual = getattr(getattr(module.qwen2_5_vl, "model", None), "visual", None)
+        if visual is None:
+            visual = getattr(
+                getattr(getattr(module.qwen2_5_vl, "model", None), "model", None),
+                "visual",
+                None,
+            )
+        if visual is None:
+            raise RuntimeError("could not locate the visual tower to verify it")
+        visual_adapted = sorted(
+            name for name, _ in visual.named_parameters() if "lora" in name.lower()
+        )
+        if visual_adapted:
+            raise RuntimeError(
+                "LoRA reached the visual tower the Past Head reads, so M_t would "
+                f"no longer come from the released features: {visual_adapted[:8]}"
+            )
+        if any(parameter.requires_grad for parameter in visual.parameters()):
+            raise RuntimeError("the visual tower must remain frozen")
+
+        named = dict(module.named_parameters())
+        trainable_names = sorted(
+            name for name, parameter in named.items() if parameter.requires_grad
+        )
+        invalid = [
+            name
+            for name in trainable_names
+            if "lora_" not in name and not name.startswith("system2_memory.")
+        ]
+        if invalid or not trainable_names:
+            raise RuntimeError(
+                "only LoRA and the memory projection may be trainable; "
+                f"violations={invalid[:8]}"
+            )
+        trainable_ids = {
+            id(parameter) for parameter in named.values() if parameter.requires_grad
+        }
+        optimizer_ids: list[int] = []
+        for index, group in enumerate(optimizer.param_groups):
+            group_name = group.get("name")
+            if not isinstance(group_name, str) or not (
+                group_name.startswith("vlm_lora")
+                or group_name.startswith("system2_memory")
+            ):
+                raise RuntimeError(
+                    f"optimizer group {index} is not a System2 memory group: "
+                    f"{group_name!r}"
+                )
+            optimizer_ids.extend(id(parameter) for parameter in group["params"])
+        if len(optimizer_ids) != len(set(optimizer_ids)):
+            raise RuntimeError("System2 memory optimizer contains duplicate parameters")
+        if set(optimizer_ids) != trainable_ids:
+            raise RuntimeError(
+                "System2 memory optimizer does not exactly cover the trainable "
+                f"tensors: missing={len(trainable_ids - set(optimizer_ids))}, "
+                f"extra={len(set(optimizer_ids) - trainable_ids)}"
+            )
+        return {
+            "trainable_parameter_tensors": len(trainable_ids),
+            "optimizer_parameter_tensors": len(optimizer_ids),
+            "optimizer_groups": len(optimizer.param_groups),
+            "system2_memory_mode": memory_tokens.mode,
         }
 
     warmstart = stage_cfg.get("heatmap_warmstart_contract") or {}

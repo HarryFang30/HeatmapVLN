@@ -106,6 +106,20 @@ def build_optimizer(model: VLNPipeline, cfg: dict, stage_cfg: dict) -> torch.opt
                     default_wd,
                 )
 
+    memory_tokens = getattr(model, 'system2_memory', None)
+    if memory_tokens is not None and any(
+        parameter.requires_grad for parameter in memory_tokens.parameters()
+    ):
+        memory_lr = optim_cfg.get('system2_memory_lr', 1e-4)
+        groups = get_param_groups_with_wd(
+            memory_tokens, memory_lr, 'system2_memory', default_wd
+        )
+        param_groups.extend(groups)
+        if groups:
+            logger.info(
+                "  Param group: system2_memory (lr=%s, wd=%s)", memory_lr, default_wd
+            )
+
     # HeatmapVLN v2 param groups
     heatmap_lr = optim_cfg.get('heatmap_lr', 2e-4)
     def heatmap_group_lr(name: str) -> float:

@@ -112,6 +112,7 @@ def _get_supported_trainable_sync_modules(
         "heatmap_tokenizer",
         "heatmap_control",
         "past_plan_action",
+        "system2_memory",
         *_NEXTDIT_SUBMODULE_KEYS,
     }
     unsupported = sorted(trainable - supported_trainable)
@@ -183,6 +184,16 @@ def _get_supported_trainable_sync_modules(
                 module = getattr(model.heatmap_vln, attr_name, None)
                 if module is not None and any(param.requires_grad for param in module.parameters()):
                     sync_modules.append((f"heatmap_vln.{attr_name}", module))
+
+    if "system2_memory" in trainable:
+        memory_tokens = getattr(model, "system2_memory", None)
+        if memory_tokens is None:
+            raise RuntimeError(
+                "system2_memory is trainable but the model has no memory-token "
+                "module; it is built from model.system2_memory.enabled"
+            )
+        if any(parameter.requires_grad for parameter in memory_tokens.parameters()):
+            sync_modules.append(("system2_memory", memory_tokens))
 
     if "past_plan_action" in trainable:
         chain = getattr(model, "past_plan_action", None)

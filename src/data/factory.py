@@ -7,6 +7,7 @@ evaluation scripts, and visualization scripts.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Union
 
@@ -218,6 +219,48 @@ def build_trajectory_dataset(
     return VLNTrajectoryDataset(**kwargs)
 
 
+_SEALED_DAGGER_READERS: dict[str, Any] = {}
+
+
+def _sealed_dagger_reader(dataset_cls: Any, kwargs: dict[str, Any]) -> Any:
+    """Build a sealed-collection reader once per process, then reuse it.
+
+    Constructing one costs a pass over every ``episode.tar`` in the collection
+    to verify the ledger -- around fifteen minutes for the 10804-episode round
+    on shared storage.  Train and validation read the *same* sealed pool and
+    are separated afterwards (by scene, by source type, or by an index view),
+    so building it twice doubles the startup of every run for nothing, and
+    multiplies that by the rank count on a multi-GPU job.
+
+    The reader is immutable after construction, so sharing one between two
+    views is safe.  The key is the full constructor argument set, so any
+    difference at all -- different roots, source types, history length, image
+    size -- builds its own reader rather than silently returning the wrong one.
+    """
+    key = json.dumps(
+        {name: _hashable(value) for name, value in sorted(kwargs.items())},
+        sort_keys=True,
+        default=str,
+    )
+    cached = _SEALED_DAGGER_READERS.get(key)
+    if cached is not None:
+        logger.info(
+            "Reusing the sealed DAgger reader already built in this process "
+            "(%d states); the ledger pass is not repeated",
+            len(cached),
+        )
+        return cached
+    dataset = dataset_cls(**kwargs)
+    _SEALED_DAGGER_READERS[key] = dataset
+    return dataset
+
+
+def _hashable(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return str(value)
+
+
 def build_trajectory_dagger_dataset(
     cfg: dict[str, Any],
     split: str = "train",
@@ -265,8 +308,43 @@ def build_trajectory_dagger_dataset(
             "expected_policy_fingerprint"
         ),
     }
+    scene_split = overrides.pop("scene_split", None)
     kwargs.update(overrides)
-    return TrajectoryDaggerDataset(**kwargs)
+    dataset = _sealed_dagger_reader(TrajectoryDaggerDataset, kwargs)
+
+    sft_cfg = data_cfg.get("dagger_system2_sft") or {}
+    if not sft_cfg.get("enabled", False):
+        return dataset
+
+    # System2 supervision is a property of the *labels*, not of the reader, so
+    # it is attached here rather than inside the sealed-collection dataset.
+    from .dagger_system2_sft import DaggerSystem2SFTDataset
+
+    oracle_views = sft_cfg.get("oracle_views_jsonl")
+    if use_validation_roots and sft_cfg.get("val_oracle_views_jsonl"):
+        oracle_views = sft_cfg["val_oracle_views_jsonl"]
+    if not oracle_views:
+        raise ValueError(
+            "data.dagger_system2_sft.oracle_views_jsonl is required when the "
+            "System2 SFT relabelling is enabled"
+        )
+    if scene_split is None:
+        scene_split = (
+            "val" if split != data_cfg.get("train_split", "train") else "train"
+        )
+    wrapped = DaggerSystem2SFTDataset(
+        dataset,
+        oracle_views=oracle_views,
+        max_turns=int(sft_cfg.get("max_turns", 4)),
+        scene_split=str(scene_split),
+        val_scene_pct=int(sft_cfg.get("val_scene_pct", 25)),
+    )
+    logger.info(
+        "DAgger System2 SFT relabelling (%s): %s",
+        scene_split,
+        json.dumps(wrapped.summary(), ensure_ascii=False, sort_keys=True),
+    )
+    return wrapped
 
 
 def build_expert_dagger_mixture_dataset(

@@ -715,6 +715,19 @@ class TrajectoryDaggerDataset(Dataset):
     def sample_keys(self) -> tuple[str, ...]:
         return tuple(record.sample_key for record in self._records)
 
+    def sample_metadata(self, index: int) -> dict[str, Any]:
+        """Return one row's sealed ``samples.jsonl`` record.
+
+        Reading provenance (native answer, oracle actions, failure tags) must
+        not require decoding that episode's JPEGs, so relabelling passes can
+        plan the whole collection before any image is touched.
+        """
+        if index < 0:
+            index += len(self._records)
+        if index < 0 or index >= len(self._records):
+            raise IndexError(index)
+        return self._records[index].sample
+
     def __len__(self) -> int:
         return len(self._records)
 

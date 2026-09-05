@@ -445,6 +445,32 @@ class ExpertDaggerMixtureConfig(_Strict):
         return self
 
 
+class DaggerSystem2SFTConfig(_Strict):
+    """Where the oracle directions come from when relabelling DAgger rows."""
+
+    enabled: bool = False
+    oracle_views_jsonl: str | None = None
+    val_oracle_views_jsonl: str | None = None
+    max_turns: int = 4
+    # The DAgger collection is one pool, so train/val are cut by scene with the
+    # same hash the EXP-13 readout probe uses.  Keeping the two experiments on
+    # the same held-out scenes is what makes their conclusions comparable.
+    val_scene_pct: int = 25
+
+    @model_validator(mode="after")
+    def _check_source(self):
+        if self.enabled and not (self.oracle_views_jsonl or "").strip():
+            raise ValueError(
+                "dagger_system2_sft.enabled requires oracle_views_jsonl "
+                "(EXP-12 d1_per_state.jsonl)"
+            )
+        if self.max_turns < 1:
+            raise ValueError("dagger_system2_sft.max_turns must be >= 1")
+        if not 0 < self.val_scene_pct < 100:
+            raise ValueError("dagger_system2_sft.val_scene_pct must be in (0, 100)")
+        return self
+
+
 class DataConfig(_Strict):
     root: str | None = None
     train_split: str = "train"
@@ -458,6 +484,7 @@ class DataConfig(_Strict):
     dataset_type: str = "sliding_window"
     sliding_window: SlidingWindowConfig | None = None
     trajectory: TrajectoryConfig | None = None
+    dagger_system2_sft: DaggerSystem2SFTConfig | None = None
     trajectory_dagger: TrajectoryDaggerConfig | None = None
     mixture: ExpertDaggerMixtureConfig | None = None
     use_worker_tokenized_collator: bool | None = None
@@ -809,6 +836,38 @@ class PastPlanActionConfig(_Strict):
         return self
 
 
+class System2MemoryConfig(_Strict):
+    """History memory injected as extra System2 prompt tokens.
+
+    The alternative injection point to the Plan bridge: EXP-05/EXP-07 showed
+    the bridge can only modulate execution, while EXP-12 located the failures
+    in System2's own decision.  ``mode`` selects the arm; ``constant`` is the
+    control that holds token count and parameter budget fixed while removing
+    all dependence on the memory.
+    """
+
+    enabled: bool = False
+    schema_version: Literal["system2-memory-v1"] = "system2-memory-v1"
+    mode: Literal["memory", "constant", "off"] = "memory"
+    num_tokens: int = 8
+    memory_dim: int = 256
+
+    @model_validator(mode="after")
+    def _check_shape(self):
+        if self.enabled and self.mode == "off":
+            raise ValueError(
+                "system2_memory.enabled=true with mode='off' is contradictory; "
+                "disable the block instead"
+            )
+        if self.num_tokens < 1:
+            raise ValueError("system2_memory.num_tokens must be >= 1")
+        if self.memory_dim != 256:
+            raise ValueError(
+                "system2_memory.memory_dim must match the Past Head bottleneck (256)"
+            )
+        return self
+
+
 class ModelConfig(_Lenient):
     type: str = "vln_pipeline"
     device: str = "cuda"
@@ -816,6 +875,7 @@ class ModelConfig(_Lenient):
     heatmap: HeatmapModelConfig | None = None
     action_head: ActionHeadConfig | None = None
     past_plan_action: PastPlanActionConfig | None = None
+    system2_memory: System2MemoryConfig | None = None
 
 
 # --- Optim -------------------------------------------------------------------
@@ -828,6 +888,7 @@ class OptimConfig(_Lenient):
     heatmap_tokenizer_lr: float = 1e-4
     heatmap_control_lr: float = 5e-5
     heatmap_gate_lr: float = 1e-4
+    system2_memory_lr: float = 1e-4
     heatmap_vit_lr: float | None = None
     heatmap_fine_lr: float | None = None
     heatmap_llm_lr: float | None = None
@@ -999,6 +1060,10 @@ class TrainingStageConfig(_Lenient):
     frozen_modules: list[str] = []
     heatmap_trainable_parameter_prefixes: list[str] = []
     heatmap_pose_adaptation_init: bool = False
+    # Load exactly the 79-tensor Past Head from --load-weights and freeze it.
+    # Unlike heatmap_pose_adaptation_init this makes no claim about *training*
+    # the head, so it does not drag in the AMB3R adaptation whitelist.
+    load_frozen_past_head: bool = False
     required_history_pose_provider: str | None = None
     past_plan_action_stage: str | None = None
     # Bridge-only refinement normally warm-starts the trained Stage-2 bridge.
@@ -1055,6 +1120,11 @@ class TrainingStageConfig(_Lenient):
         if self.past_plan_action_reset_bridge:
             raise ValueError(
                 "past_plan_action_reset_bridge requires a Past->Plan->Action stage"
+            )
+        if self.load_frozen_past_head and self.heatmap_pose_adaptation_init:
+            raise ValueError(
+                "load_frozen_past_head and heatmap_pose_adaptation_init are "
+                "mutually exclusive"
             )
         if not prefixes and not self.heatmap_pose_adaptation_init:
             if self.required_history_pose_provider is not None:
@@ -1203,6 +1273,7 @@ class TrainConfig(_Lenient):
         nextdit = action_head.nextdit if action_head is not None else None
         control = nextdit.heatmap_control if nextdit is not None else None
         past_plan_action = self.model.past_plan_action
+        system2_memory = self.model.system2_memory
         llm = self.model.llm
         if control is not None and control.enabled:
             if not heatmap.enable:
@@ -1556,6 +1627,114 @@ class TrainConfig(_Lenient):
                 raise ValueError(
                     "save_best_metric=val_rollout_* requires "
                     "validation.val_rollout_batches > 0"
+                )
+            return self
+
+        if system2_memory is not None and system2_memory.enabled:
+            if not heatmap.enable:
+                raise ValueError(
+                    "System2 memory tokens require the Past Head that produces them"
+                )
+            if past_plan_action is not None and past_plan_action.enabled:
+                raise ValueError(
+                    "the Plan bridge and System2 memory tokens are two injection "
+                    "points for the same memory; enable exactly one"
+                )
+            if control is not None and control.enabled:
+                raise ValueError(
+                    "System2 memory tokens forbid legacy heatmap control"
+                )
+            if llm is None or not llm.use_lora:
+                raise ValueError(
+                    "the System2 memory arm exists to train System2: "
+                    "model.llm.use_lora=true"
+                )
+            if action_head is not None and action_head.enable:
+                raise ValueError(
+                    "the System2 memory arm supervises System2 text only: "
+                    "model.action_head.enable=false"
+                )
+            if self.data.dataset_type != "trajectory_dagger":
+                raise ValueError(
+                    "System2 memory training reads sealed DAgger recovery states "
+                    "(data.dataset_type=trajectory_dagger)"
+                )
+            dagger_sft = self.data.dagger_system2_sft
+            if dagger_sft is None or not dagger_sft.enabled:
+                raise ValueError(
+                    "System2 memory training requires "
+                    "data.dagger_system2_sft.enabled=true so its targets are "
+                    "oracle-relabelled rather than guessed"
+                )
+            dagger = self.data.trajectory_dagger
+            if dagger is None:
+                raise ValueError("data.trajectory_dagger is required")
+            if dagger.num_history != system2_memory.num_tokens:
+                raise ValueError(
+                    "one memory token per history slot: "
+                    f"num_history={dagger.num_history} vs "
+                    f"num_tokens={system2_memory.num_tokens}"
+                )
+            if self.loss.lm_weight <= 0:
+                raise ValueError("System2 memory training requires loss.lm_weight > 0")
+            if self.loss.heatmap_weight != 0 or self.loss.trajectory_weight != 0:
+                raise ValueError(
+                    "System2 memory training supervises the language model only: "
+                    "heatmap_weight=0 and trajectory_weight=0"
+                )
+            for stage in self.training.stages:
+                if not stage.strict_trainable_modules:
+                    raise ValueError(
+                        "System2 memory training requires strict_trainable_modules=true"
+                    )
+                if sorted(stage.trainable_modules) != ["lora", "system2_memory"]:
+                    raise ValueError(
+                        "System2 memory training must train exactly "
+                        "['lora','system2_memory']"
+                    )
+                if stage.train_action:
+                    raise ValueError(
+                        "System2 memory training keeps System1 frozen: train_action=false"
+                    )
+                if (
+                    stage.train_heatmap is True
+                    or stage.train_history is True
+                    or stage.train_future is True
+                ):
+                    raise ValueError(
+                        "System2 memory training keeps both cognition heads frozen"
+                    )
+                if not (stage.train_lm or stage.train_system2_sft):
+                    raise ValueError(
+                        "System2 memory training requires the System2 SFT loss"
+                    )
+                if (stage.system2_sft_protocol or "internnav") != "internnav":
+                    raise ValueError(
+                        "System2 memory training uses the released InternNav protocol"
+                    )
+                if getattr(stage, "teacher_force_system2_answer", False) is not True:
+                    raise ValueError(
+                        "System2 memory training teacher-forces the answer it supervises"
+                    )
+                if not stage.load_frozen_past_head:
+                    raise ValueError(
+                        "System2 memory training needs the deployed Past Head: "
+                        "load_frozen_past_head=true"
+                    )
+                if stage.heatmap_pose_adaptation_init:
+                    raise ValueError(
+                        "System2 memory training does not adapt the Past Head; "
+                        "use load_frozen_past_head instead"
+                    )
+            validation = self.validation
+            if (
+                validation is not None
+                and validation.enabled
+                and str(validation.save_best_metric) != "val_lm_loss"
+            ):
+                raise ValueError(
+                    "System2 memory training selects on val_lm_loss over the "
+                    "held-out scenes"
                 )
             return self
 

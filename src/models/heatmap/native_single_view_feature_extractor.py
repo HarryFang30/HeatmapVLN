@@ -67,7 +67,10 @@ class NativeSingleViewFeatureExtractor:
         vit_output_spatial: Fixed heatmap ViT raster size.
         merged_output_spatial: Fixed heatmap final-visual raster size.
         require_frozen_backbone: Fail if any native model tensor is trainable.
-        reject_lora: Fail if the model hierarchy contains LoRA/PEFT names.
+        reject_lora: Fail if the checked hierarchy contains LoRA/PEFT names.
+        scope_checks_to_visual: Apply ``reject_lora`` and
+            ``require_frozen_backbone`` to the visual tower alone instead of
+            the whole model, for stages that train the language model.
         restore_vit_spatial_layout: Undo Qwen window packing using the visual
             module's own ``get_window_index`` implementation.
 
@@ -86,6 +89,7 @@ class NativeSingleViewFeatureExtractor:
         merged_output_spatial: int = 8,
         require_frozen_backbone: bool = True,
         reject_lora: bool = True,
+        scope_checks_to_visual: bool = False,
         restore_vit_spatial_layout: bool = True,
     ) -> None:
         if not vit_layer_indices:
@@ -102,12 +106,21 @@ class NativeSingleViewFeatureExtractor:
         self.merged_output_spatial = int(merged_output_spatial)
         self.restore_vit_spatial_layout = bool(restore_vit_spatial_layout)
 
-        if reject_lora:
-            self._assert_no_lora(model)
-        if require_frozen_backbone:
-            self._assert_frozen(model)
-
         self._visual = self._get_visual_module(model)
+        # What this extractor promises is that the *visual tower it reads* is
+        # the released one, untouched and frozen -- that is the distribution
+        # the Past Head was trained on.  By default the promise is enforced
+        # over the whole model, which is right for stages that keep all of
+        # Qwen frozen.  A stage that adapts the language model (EXP-13's
+        # System2 memory arm) narrows it to the visual tower instead: LoRA on
+        # text layers cannot reach these features, and pretending otherwise
+        # would mean either giving up the contract or giving up the arm.
+        checked = self._visual if scope_checks_to_visual else model
+        if reject_lora:
+            self._assert_no_lora(checked)
+        if require_frozen_backbone:
+            self._assert_frozen(checked)
+
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._vit_captures: dict[int, torch.Tensor] = {}
         for layer_index in self.vit_layer_indices:

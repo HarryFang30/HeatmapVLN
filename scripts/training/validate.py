@@ -469,6 +469,9 @@ def validate(
         .get('nextdit', {})
         .get('heatmap_control', {})
     )
+    system2_memory_enabled = bool(
+        cfg.get('model', {}).get('system2_memory', {}).get('enabled', False)
+    )
     heatmap_control_enabled = bool(heatmap_control_cfg.get('enabled', False))
     if train_past_plan_action and heatmap_control_enabled:
         raise ValueError(
@@ -677,6 +680,7 @@ def validate(
                     return_future_heatmaps=train_future,
                     return_actions=train_action,
                     return_lm_loss=train_lm,
+                    inject_system2_memory=system2_memory_enabled,
                     gt_actions=gt_action.unsqueeze(1) if train_action else None,
                     action_valid=action_valid if train_action else None,
                     gt_stop=is_stop if train_action else None,

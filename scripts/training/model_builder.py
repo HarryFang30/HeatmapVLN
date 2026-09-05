@@ -47,6 +47,7 @@ def build_model(
     pano_adapter_cfg = nextdit_cfg.get('pano_latent_adapter', {})
     heatmap_control_cfg = nextdit_cfg.get('heatmap_control') or {}
     past_plan_action_cfg = model_cfg.get('past_plan_action') or {}
+    system2_memory_cfg = model_cfg.get('system2_memory') or {}
     resolved_lora_layers = resolve_lora_layer_indices(llm_cfg, heatmap_cfg, logger=logger)
     llm_model_path = llm_cfg.get('model_path', './models/internnav_backbone')
 
@@ -174,6 +175,11 @@ def build_model(
             'max_delta_ratio'
         ),
 
+        system2_memory_enabled=system2_memory_cfg.get('enabled', False),
+        system2_memory_mode=system2_memory_cfg.get('mode', 'memory'),
+        system2_memory_num_tokens=system2_memory_cfg.get('num_tokens', 8),
+        system2_memory_dim=system2_memory_cfg.get('memory_dim', 256),
+
         verbose=verbose,
     )
 
@@ -224,6 +230,12 @@ def build_model(
                 past_plan_action_cfg.get('plan_dim', 768),
                 past_plan_action_cfg.get('bridge_heads', 8),
                 past_plan_action_cfg.get('max_delta_ratio'),
+            )
+        if system2_memory_cfg.get('enabled', False):
+            logger.info(
+                "   System2 memory tokens -> enabled=True, mode=%s, tokens=%s",
+                system2_memory_cfg.get('mode', 'memory'),
+                system2_memory_cfg.get('num_tokens', 8),
             )
         if s1_ckpt:
             logger.info("   System1 pretrained → %s", s1_ckpt)
@@ -395,6 +407,8 @@ def _trainable_summary(model: VLNPipeline) -> dict[str, int]:
             group = 'pano_latent_adapter'
         elif name.startswith('heatmap_tokenizer.'):
             group = 'heatmap_tokenizer'
+        elif name.startswith('system2_memory.'):
+            group = 'system2_memory'
         elif '.heatmap_control.' in name:
             group = 'heatmap_control'
         elif name.startswith('nextdit_action_head.'):
@@ -428,6 +442,8 @@ def _is_allowed_trainable_name(name: str, trainable_modules: set[str]) -> bool:
         if cfg_name in trainable_modules and name.startswith(f'nextdit_action_head.{attr_name}.'):
             return True
     if 'heatmap_vln' in trainable_modules and name.startswith('heatmap_vln.'):
+        return True
+    if 'system2_memory' in trainable_modules and name.startswith('system2_memory.'):
         return True
     if 'llm_projector' in trainable_modules and name.startswith('llm_projector.'):
         return True
@@ -617,6 +633,18 @@ def set_trainable_modules(model: VLNPipeline, stage_cfg: dict, logger):
                 if submod is not None:
                     freeze_module(submod, freeze=False)
                     logger.info("  ✓ Unfrozen: nextdit_action_head.%s", attr_name)
+
+    if 'system2_memory' in trainable:
+        memory_tokens = getattr(model, 'system2_memory', None)
+        if memory_tokens is None:
+            raise RuntimeError(
+                "system2_memory requested but model.system2_memory was not built"
+            )
+        freeze_module(memory_tokens, freeze=False)
+        memory_tokens.float()
+        logger.info(
+            "  ✓ Unfrozen: System2 memory tokens (mode=%s)", memory_tokens.mode
+        )
 
     if 'llm_projector' in trainable and hasattr(model, 'llm_projector'):
         freeze_module(model.llm_projector, freeze=False)

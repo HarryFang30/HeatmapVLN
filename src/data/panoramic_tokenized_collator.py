@@ -29,7 +29,10 @@ from src.models.heatmap.input_constructor import (
     find_text_anchor_positions,
     format_structured_pano_assistant_text,
 )
-from src.models.qwen2_5_vl.integration import TRAJ_TOKEN_INDEX
+from src.models.qwen2_5_vl.integration import (
+    MEMORY_TOKEN_INDEX,
+    TRAJ_TOKEN_INDEX,
+)
 
 IGNORE_INDEX = -100
 from ._constants import SYSTEM2_ACTION_TEXT as _SYSTEM2_ACTION_TEXT
@@ -110,6 +113,9 @@ class PanoramicTokenizedCollator:
         compute_pano_text_anchor_positions: bool = True,
         heatmap_layout: bool = False,
         force_internnav_prompt: bool = False,
+        memory_token_count: int = 0,
+        memory_placeholder_token: str = "<|fim_pad|>",
+        internnav_conjunction: str | None = None,
     ):
         self.processor = processor
         self.processor.tokenizer.padding_side = "left"
@@ -132,6 +138,33 @@ class PanoramicTokenizedCollator:
         self.compute_pano_text_anchor_positions = bool(compute_pano_text_anchor_positions)
         self.heatmap_layout = bool(heatmap_layout)
         self.force_internnav_prompt = bool(force_internnav_prompt)
+        self.memory_token_count = int(memory_token_count)
+        if self.memory_token_count < 0:
+            raise ValueError("memory_token_count must be >= 0")
+        self.memory_placeholder_token = str(memory_placeholder_token)
+        self._memory_placeholder_id: int | None = None
+        if self.memory_token_count > 0:
+            if not self.force_internnav_prompt:
+                raise ValueError(
+                    "memory tokens are only defined for the native InternNav "
+                    "prompt (force_internnav_prompt=True)"
+                )
+            resolved = self.processor.tokenizer.convert_tokens_to_ids(
+                self.memory_placeholder_token
+            )
+            unknown = getattr(self.processor.tokenizer, "unk_token_id", None)
+            if resolved is None or (unknown is not None and resolved == unknown):
+                raise ValueError(
+                    "memory placeholder must be a single existing token, "
+                    f"got {self.memory_placeholder_token!r}"
+                )
+            self._memory_placeholder_id = int(resolved)
+        # The released policy always says "you can see "; training-time
+        # conjunction sampling is augmentation the DAgger arms must not use,
+        # because their targets are the frozen policy's own answers.
+        self.internnav_conjunction = (
+            None if internnav_conjunction is None else str(internnav_conjunction)
+        )
         self._call_count = 0
         self._tokenizer_lock = _get_tokenizer_lock(self.processor.tokenizer)
 
@@ -209,6 +242,30 @@ class PanoramicTokenizedCollator:
 
         return torch.stack(padded_tensors, dim=0)
 
+    def _memory_placeholder_text(self) -> str | None:
+        if self.memory_token_count <= 0:
+            return None
+        slots = self.memory_placeholder_token * self.memory_token_count
+        return f" Your memory of where you have been: {slots}."
+
+    def _rewrite_memory_placeholders(self, input_ids: torch.Tensor) -> None:
+        """Turn the reserved placeholder token into the memory sentinel.
+
+        Fails closed on the count: a row that does not carry exactly
+        ``memory_token_count`` placeholders would silently train System2 on
+        embeddings that do not line up with its history slots.
+        """
+        if self.memory_token_count <= 0 or self._memory_placeholder_id is None:
+            return
+        hits = input_ids == self._memory_placeholder_id
+        per_row = hits.sum(dim=1)
+        if not bool(torch.all(per_row == self.memory_token_count)):
+            raise RuntimeError(
+                "memory placeholder count mismatch: expected "
+                f"{self.memory_token_count} per sample, got {per_row.tolist()}"
+            )
+        input_ids[hits] = MEMORY_TOKEN_INDEX
+
     @staticmethod
     def _find_last_subsequence(seq: list[int], pattern: list[int]) -> int:
         if not pattern or len(pattern) > len(seq):
@@ -231,6 +288,19 @@ class PanoramicTokenizedCollator:
         )
 
     def _assistant_texts_for_sft(self, sample: dict[str, Any]) -> list[str]:
+        # DAgger relabelling decides the target outside the collator, because
+        # the decision needs the oracle.  An explicit list wins over every rule
+        # below so the supervision stays auditable per sample.
+        explicit = sample.get("system2_target_texts")
+        if explicit is not None:
+            if not isinstance(explicit, (list, tuple)) or not all(
+                isinstance(value, str) and value for value in explicit
+            ):
+                raise ValueError(
+                    "system2_target_texts must be a non-empty list of non-empty strings"
+                )
+            return list(explicit)
+
         structured = self._structured_pano_assistant_text(sample)
         if structured is not None:
             return [structured]
@@ -527,6 +597,8 @@ class PanoramicTokenizedCollator:
                             instruction=sample.get("text"),
                             pixel_goal=pg,
                             assistant_text=assistant_text,
+                            conjunction=self.internnav_conjunction,
+                            memory_placeholder=self._memory_placeholder_text(),
                         )
                     )
                     sft_target_texts.append(assistant_texts)
@@ -674,6 +746,8 @@ class PanoramicTokenizedCollator:
                         padding=True,
                     )
             del messages_batch
+
+            self._rewrite_memory_placeholders(pano_inputs["input_ids"])
 
             # Only warn when sequence exceeds max length (truncation is disabled).
             seq_len = int(pano_inputs["input_ids"].shape[1])
