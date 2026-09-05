@@ -18,8 +18,19 @@
 两份 config 只差 `past_plan_action_reset_bridge` 一行；都基于认证 v2 配方，只把
 `val_rollout_batches` 从 8 提到 64（即 64 对 → 512 对），并打开 `evaluate_before_training`。
 
-## 跑法（开发机，8 卡）
+## 跑法
 
+> ⚠️ **2026-09-05 更新：本节的"开发机 8 卡直跑"已作废。** 台账 §0 第 7 条规定
+> **开发机最多 3 张卡**，4 卡及以上一律走网页提交。下面这段保留是因为 **EXP-09-R 参照臂
+> 与 EXP-10 桥开臂确实是 2026-09-04 用它在开发机上跑出来的**（那是本规定生效之前），
+> 是既有结果的出处记录，**不要照抄再跑**。
+>
+> 尚未跑的 **EXP-10 桥关臂**请用网页提交物：
+> [exp10-bridge-off-submission.md](exp10-bridge-off-submission.md)。
+> 它必须与桥开臂同为 8 卡——world size 会改变 val 分片与 512 对 rollout 的配对，
+> 缩成 3 卡的数**不能**与桥开臂比较。
+
+以下为历史记录（EXP-09-R / EXP-10 桥开臂的实际跑法）。
 ssh 链路经中转、掉线会杀裸进程，所以用 tmux：
 
 ```bash
@@ -51,7 +62,8 @@ for ckpt in best epoch_004; do
 done
 ```
 
-EXP-10 桥关臂：同一脚本，把 config 换成 `exp10_bridge_off_revalidate_512_8gpu.yaml`、
+EXP-10 桥关臂：**改走网页提交**，见 [exp10-bridge-off-submission.md](exp10-bridge-off-submission.md)。
+内容与上面同一脚本、只换 config 为 `exp10_bridge_off_revalidate_512_8gpu.yaml`、
 输出根换成 `model/exp10_bridge_off_512/best`，只跑 `best.pth`（与桥开臂同一 checkpoint）。
 启动日志必须出现 `PPA bridge retrains from its exact-zero fresh state`——那是桥关臂的证据；
 桥开臂**不应**出现这句。
@@ -73,4 +85,10 @@ for path in sorted(glob.glob('/mnt/afs/liwenhao/agent/370910109/model/exp*_512/*
 PY
 ```
 
+指标在 `manifest/pre_training_validation.json` 的 `metrics` 字段，
+**不在 `logs/metrics.jsonl`**（那里只有 run/checkpoint 记账行）——台账 §5 第 16 条。
+
 判据在台账里，不在这里；EXP-09 的消融臂一律与"v2@512"比较，不与 v2 run 自己的 64 对数字比较。
+
+桥开臂的全部读数已经入库到台账的 EXP-10 条目（未来头 / 历史头 / rollout 三组），
+引用时直接引台账，不要重新从日志里抄。

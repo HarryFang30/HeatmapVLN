@@ -18,6 +18,14 @@
    未编号的历史材料放 `legacy/`。
 5. **每个数字都要带产物路径**。台账里出现的任何指标，都要能在 §4 的路径下查到原始文件。
 6. 集群任务一律走网站提交（形态见 `CLAUDE.md` §1.1），提交物本身进仓库，不要只留在聊天里。
+7. **开发机最多用 3 张卡**（2026-09-05 定）。需要 4 卡及以上的任务——尤其是 8 卡分布式——
+   **一律走网页提交**，不在开发机上直跑。开发机只用于：纯 CPU 分析、单卡/≤3 卡的短探针、
+   冒烟与看日志。
+   两个容易踩的推论：
+   - **改卡数不是免费的。** 分布式验证的 world size 会改变 val 分片与配对 rollout 的配对方式，
+     所以"把 8 卡臂缩成 3 卡跑"**不能**与既有的 8 卡臂比较——要么整条线重跑，要么走网页提交。
+   - 本目录下几份早期 runbook（如 `exp09r-exp10-revalidate-runbook.md`）写着"开发机 8 卡直跑"，
+     那是本条生效之前写的，**已过期**，以本条为准。
 
 状态图例：✅ 已定论 ｜ ⚠️ 有结论但边界重要 ｜ ❌ 假设被否定 ｜ 🔬 进行中 ｜ ⏳ 待跑
 
@@ -34,7 +42,7 @@
 | [EXP-07](#exp-07-主表第二个种子parity--ne-是否可复现长路径增益是否存在) | 主表 parity + NE 改善在第二个种子上是否复现；长路径（≥10 m）增益是否存在 | ⚠️ | H1 支持但擦边（SR −0.33 [−1.50, +0.79]，NE −0.11 [−0.21, −0.01]）；**H2 否定，长路径主张删除** |
 | [EXP-08](#exp-08-阶段二联合训练买到了什么) | 阶段二（认知头与动作联合训练）对最终桥的行为有没有可测影响 | ❌ | 对桥无可测影响（四项判据全在容差内）；反而把未来头 Soft-IoU 从 0.387 压到 0.239 |
 | [EXP-09](#exp-09-阶段三配方里哪一项真的在起作用) | 阶段三五处改动里，信赖域 / advantage / 惩罚重校准 / rollout 选点各自有没有可测效应 | ⚠️ | 只有**惩罚重校准**有效应（去掉它 93% token 顶到 ρ 上限）；ρ 本身从不触发、选点指标无差别 |
-| [EXP-10](#exp-10-未来认知头与桥的关联是否可观测) | 注入的历史记忆是否改变未来预测（关联的可观测性）；Z 的第 i 个向量是否真的绑定第 i 段 | 🔬 | 桥开臂已出数（@512 侧后三视角 IoU 合计 < 0.006）；桥关臂待跑；H1 须按 EXP-12 收窄为"前视内部分布" |
+| [EXP-10](#exp-10-未来认知头与桥的关联是否可观测) | 注入的历史记忆是否改变未来预测（关联的可观测性）；Z 的第 i 个向量是否真的绑定第 i 段 | 🔬 | 桥开臂全部读数已入库（@512 侧后三视角 IoU 合计 < 0.006）；桥关臂需 8 卡、走网页提交；H1 须按 EXP-12 收窄为"前视内部分布" |
 | [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | ⚠️ | 历史路点 99.7% 不在前视（后视 82.3%）；未来 92.6% 在前视、侧后 ≈5% |
 | [EXP-12](#exp-12-恢复状态决策层的三个门控诊断) | 把认知的作用点从 System1 的条件挪到 System2 的决策层，值不值得做 | ⚠️ | H-D2 否定：零样本未来头是常数"前"预测器（oracle 非前视的 937 个状态里只对 1 个）；D1/D3 没测出来，D3a 判据因选择偏差作废 |
 
@@ -505,22 +513,78 @@ H2：打乱 Z_t 的 4 个向量顺序会明显破坏未来预测（说明 token�
 **设置.** H1 = 两次 `--validate-only`：桥开用
 `configs/ablation/exp09r_stage3_v2_revalidate_512_8gpu.yaml`（与 EXP-09-R 同一次运行，未来指标顺带产出）；
 桥关同 config 但 `past_plan_action_reset_bridge: true`（桥归零 ⇒ Δ=0，前向与 native 逐位一致）。
-**代价：开发机 8 卡 × 约 0.5 h**。
+**代价：8 卡 × 约 0.5 h；按 §0 第 7 条走网页提交，不在开发机上跑。**
+H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_z / past_output / past_head` 后
+用打乱的 plan_z 再解一次，同一前向、同一 batch），**尚未实现**；它是单卡的，可以在开发机上跑。
 
 **桥开臂已完成（2026-09-04，`exp09r_revalidate_512/best/run_20260904_050155`）**，
-但**数字只写进了 `logs/train.log`，`logs/metrics.jsonl` 里没有**（`--validate-only` 不落指标行，
-见 §5 第 16 条）。@512 对的读数：
+数字在 `manifest/pre_training_validation.json` 的 `metrics` 字段（不在 `metrics.jsonl`，见 §5 第 16 条）。
+下面是该次 `--validate-only` 的**全部**读数，一次性入库。
+
+*未来认知头（H1 的桥开侧）*
 
 | 量 | @512（本次） | @64（判据里已披露的） |
 |---|---|---|
-| Future Soft-IoU | **0.2394** | 0.2397 |
-| top-k 支持召回 | **0.7718** | 0.7717 |
-| 可见性 F1 | **0.9150** | 0.9148 |
+| `val_future_soft_iou` | **0.2394** | 0.2397 |
+| `val_future_topk_support_recall` | **0.7718** | 0.7717 |
+| `val_future_visibility_f1` | **0.9150** | 0.9148 |
+| `val_future_heatmap_loss` | 11.0489 | — |
+| 有效时间 bin / 有支持视角 bin | 18944 / 19466 | — |
 
-逐视角（同一次）：**front IoU=0.2653 (n=17549) ｜ right=0.0043 (n=885) ｜
-back=0.0002 (n=63) ｜ left=0.0015 (n=969)**。
+逐视角 Soft-IoU（同一次）：
+
+| 视角 | Soft-IoU | 支持样本数 | 占比 |
+|---|---|---|---|
+| front | **0.2653** | 17549 | 90.2% |
+| right | 0.0043 | 885 | 4.5% |
+| back | **0.0002** | 63 | 0.3% |
+| left | 0.0015 | 969 | 5.0% |
+
+**侧后三视角 Soft-IoU 合计 < 0.006**，且 back 的支持样本只有 63 个。
+
+*历史认知头（同一次运行顺带产出，与 EXP-11 独立互证）*
+
+| 量 | 值 |
+|---|---|
+| `val_heatmap_joint_pck4 / pck8` | 0.8378 / **0.9281** |
+| `val_heatmap_macro_joint_pck4 / pck8`（按视角宏平均） | 0.5302 / 0.6763 |
+| `val_heatmap_view5_accuracy` | 0.9723 |
+| `val_heatmap_visibility_micro_f1` | 0.9598 |
+| 像素误差 中位 / P90 | 1.414 / 5.099 |
+
+| 视角 | PCK@4 | PCK@8 | 样本数 | 占比 |
+|---|---|---|---|---|
+| front | 0.0294 | **0.1961** | **102** | **0.27%** |
+| right | 0.6109 | 0.7879 | 2688 | 7.09% |
+| back | 0.8750 | **0.9528** | **31171** | **82.27%** |
+| left | 0.6055 | 0.7682 | 2010 | 5.31% |
+| 不可见 | — | — | 1917 | 5.06% |
+
+（可见 35971 / 有效 37888。）**这是对 EXP-11 历史侧结论的独立复现**：EXP-11 用
+`summarize_direction_coverage` 单独统计标签，得"历史路点 99.7% 不在前视、后视 82.3%"；
+这里由训练侧的 val 指标另一条代码路径得到 **99.73% 不在前视、后视 82.27%**。两者小数点后两位一致。
+顺带注意 front 只有 102 个样本、PCK@8 仅 0.196——**前视那一档的历史精度是在 102 个样本上算的，
+不要单独引用**。
+
+*rollout（与 EXP-09-R 参照臂是同一次运行，此处只做归档）*
+
+| 量 | 值 |
+|---|---|
+| `val_rollout_endpoint_error` / `_native` | 1.2746 / 1.2888 |
+| 两者之差（EXP-08/09 报告里的"与 native 的差"） | −0.0142 |
+| `val_rollout_endpoint_gap` | 0.0435 |
+| `val_rollout_action_agreement` | 0.7656 |
+| `val_rollout_pairs` | 512 |
+
+⚠️ **`val_rollout_endpoint_gap`（0.0435）不是上面两个均值之差（−0.0142）**，两者口径不同，
+引用时不要互换。
 
 **桥关臂仍未跑**，所以 H1 还没有判定——上表只是它的一半。
+2026-09-05 曾按 runbook 在开发机上以 8 卡起过一次桥关臂，**起后即按新的机器策略停掉
+（开发机最多 3 卡，8 卡任务走网页提交，见 §0）**；该次未产出任何数字，
+`model/exp10_bridge_off_512/` 为空。桥关臂必须与桥开臂同为 8 卡（world size 会改变
+val 分片与 512 对 rollout 的配对），所以它**只能走网页提交**，提交物见
+[exp10-bridge-off-submission.md](exp10-bridge-off-submission.md)。
 
 **EXP-12 对 H1 的影响（必须在跑桥关臂之前读）.** EXP-12 D2 测到未来头的**方向输出**
 （四视角可见性 argmax）在恢复状态下是常数"前"（3743/3766），上表的逐视角 IoU 是同一件事
@@ -534,8 +598,6 @@ back=0.0002 (n=63) ｜ left=0.0015 (n=969)**。
 ⇒ **H1 应当重新表述为"注入是否改变前视内部的空间分布"**，判据沿用原来的
 （top-k 差 > 1pt 或 Soft-IoU 差 > 0.01）不变，但结论的措辞不能再写成"改变未来预测"，
 只能写成"改变前视未来热力图的空间分布"。这属于**收窄结论范围**，不是放宽判据。
-H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_z / past_output / past_head` 后
-用打乱的 plan_z 再解一次，同一前向、同一 batch），**尚未实现**，优先级低于 EXP-04。
 
 ---
 
@@ -745,12 +807,11 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
 | v1 漂移桥 checkpoint（EXP-05 用；部署必须用 `best_deployment_full.pth`，`best.pth` 缺未来头张量） | `model/output_past_plan_action_action_refine_v1_8gpu/run_20260818_225001/checkpoints/best_deployment_full.pth` |
 | Stage2 联合 best（79 Heatmap + 11 Future 张量来源） | `model/output_past_plan_action_v1_8gpu_stage2_retry1/stage2_joint/run_20260818_104438/checkpoints/best.pth` |
 | Stage1 对齐 best（EXP-08 的父 checkpoint：79 Heatmap + 11 Future，桥 0 张量） | `model/output_past_plan_action_v1_8gpu/stage1_map_pretrain/run_20260817_205027/checkpoints/best.pth` |
-| 阶段三消融臂输出（EXP-08/09） | `model/ablation_stage3/<arm>/run_*/` |
-| EXP-09-R / EXP-10 桥开重验（512 对） | `model/exp09r_revalidate_512/{best,epoch_004}/run_*/manifest/pre_training_validation.json` |
-| EXP-11 方向覆盖率 | `model/exp11_direction_coverage/coverage_val_full.json` |
+| EXP-09-R 参照 / **EXP-10 桥开臂**（512 对，同一次运行） | `model/exp09r_revalidate_512/{best,epoch_004}/run_*/manifest/pre_training_validation.json` 的 `metrics` 字段（**不是** `logs/metrics.jsonl`）|
+| EXP-10 桥关臂（**待跑**，8 卡走网页提交） | `model/exp10_bridge_off_512/best/run_*/manifest/pre_training_validation.json`（目录现为空）|
 | 捷径诊断结果 | `model/heatmap_shortcut_probe_v1/seed_{42,1337}/` |
 | 捷径诊断（VO 位姿域，EXP-04） | `model/heatmap_shortcut_probe_vo_v1/seed_{42,1337}/` |
-| EXP-03 部署头（head-only 格式） | `model/exp03_deployment_head/head_v2_best.pth` |
+| EXP-03 部署头（head-only 格式；79 张量来自部署 ckpt + 2 张常量缓冲，`initial_head_hash=e00d5058…`，按 `configs/train_heatmap_internnav_single_view_8gpu.yaml` 构建） | `model/exp03_deployment_head/head_v2_best.pth` |
 | 位姿域偏移代价（真值训练→VO 评测） | `model/output_heatmap_amb3r_pose_adapt_endpoint_v2_4gpu/runs/run_20260814_234429/logs/metrics.jsonl` 的 `pre_training_validation` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
 | 合并两种子配对 bootstrap（主表判据来源，20000 次重采样） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_pooled_seeds42_1337.json` |
@@ -758,8 +819,6 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
 | native 种子 1337 评测 | `model/eval_internnav_native_r2r_val_unseen_8gpu_rpcv2_x11bundle_v4_seed1337/merged/` |
 | v1 无约束桥 · 修复栈评测（EXP-05） | `model/eval_ppa_refine_v1_unconstrained_nativefix_r2r_val_unseen_8gpu/merged/` + `analysis/` |
 | 阶段三消融四臂（EXP-08/09） | `model/ablation_stage3/{exp09a,exp09b,exp09c,exp08}/run_*/` |
-| v2 参照 512 对重验（EXP-09-R） | `model/exp09r_revalidate_512/{best,epoch_004}/run_*/manifest/pre_training_validation.json` |
-| VO 位姿域捷径探针（EXP-04） | `model/heatmap_shortcut_probe_vo_v1/seed_{42,1337}/` |
 | 四方向标签覆盖率（EXP-11） | `model/exp11_direction_coverage/coverage_val_full.json` |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
@@ -839,11 +898,12 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
    （未来头 3743/3766，System2 12756/12757），Δ ≈ 0 是结构决定的，不是能力差异。
    一行 `Counter(preds)` 比事后解释 Δ 为什么是 0 便宜得多。
 
-16. **`--validate-only` 的指标只写 `logs/train.log`，不进 `logs/metrics.jsonl`。**
-   EXP-10 的桥开臂 2026-09-04 就跑完了，但因为只翻 `metrics.jsonl`（里面只有 3 行
-   run/checkpoint 记录、没有任何指标键），一度被当成"还没出数"。未来头指标在 train.log 里长这样：
-   `[Future tube] soft-IoU=… top-k-support=… vis-F1=… | front:IoU=…(n=…) right:… back:… left:…`。
-   **验证类运行找数字，先 grep train.log。**
+16. **`--validate-only` 的指标落在 `manifest/pre_training_validation.json` 的 `metrics` 字段。**
+   不在 `logs/metrics.jsonl`（那里只有 3 行 run/checkpoint 记账、没有任何指标键），
+   `logs/train.log` 里另有一份人读的摘要。EXP-10 的桥开臂 2026-09-04 就跑完了，
+   却一度被当成"还没出数"——因为只翻了 `metrics.jsonl`。
+   **`exp09r-exp10-revalidate-runbook.md` 的"读结果"段早就给了现成的读取脚本：
+   验证类运行找数字，先读该实验自己的 runbook，再自己去翻日志。**
 
 17. **开发机上有一批指向迁移前路径的僵尸进程，盘点时别误认成自己的活。**
    `/mnt/afs/lixiaoou/intern/fjl` 下的 tensorboard（已存活 65 天）及其 data server、
