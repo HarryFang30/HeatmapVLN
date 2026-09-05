@@ -61,26 +61,40 @@ R=/mnt/afs/liwenhao/agent/370910109
 
 ## D2 — 未来头零样本方向准确率（GPU 7 → 6 → 5 → 4）
 
-四片并行，每片一张卡，**从 7 号卡开始往下排**。片由 episode key 的哈希决定，与 GPU 编号无关，
-所以换卡不改分片结果。
+四片并行，每片一张卡，**从 7 号卡开始往下排**。分片是 `dataset index % shard_count`，与 GPU 编号无关，
+所以换卡不改分片结果。（原文写成"按 episode key 哈希"，是笔误，2026-09-05 随结果一起更正。）
+`--max-states` 是**四片合计**预算，每片实际跑 `max-states // shard-count`。
+
+**`configs/ppa_action_refine_v2_8gpu.yaml` 里有 5 个 `$VAR` 占位，不导就会在加载 processor 时
+抛 `HFValidationError: ... '$INTERNNAV_MODEL_PATH'`——而且是在冷 AFS 载完模型之后才抛，白等 20 分钟。**
+（第一次四片启动就是这么挂的，2026-09-05。）
 
 ```bash
-ssh finn_cci_c500 'bash -lc "
+ssh finn_cci_c500 'bash -l -s' <<'SH'
 R=/mnt/afs/liwenhao/agent/370910109
-cd \$R/HeatmapVLN
+export PPA_DATA_ROOT=$R/r2r_panoramic_data_v2/train
+export PPA_AMB3R_CACHE_ROOT=$R/data/amb3r_endpoint_v3_full_r2r
+export INTERNNAV_MODEL_PATH=$R/InternNav-Model
+export PPA_ACTION_REFINE_OUTPUT_ROOT=$R/model/exp12_recovery_gate/_cfg_unused
+export PPA_TENSORBOARD_ROOT=$R/model/exp12_recovery_gate/_cfg_unused/tensorboard
+export OMP_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false PYTHONDONTWRITEBYTECODE=1
+RUNTIME=$R/model/output_past_plan_action_v1_8gpu_stage2_retry1/_runtime_cache
+export HF_HOME=$RUNTIME/huggingface TORCH_HOME=$RUNTIME/torch XDG_CACHE_HOME=$RUNTIME/xdg
+export MPLCONFIGDIR=$RUNTIME/matplotlib TRITON_CACHE_DIR=$RUNTIME/triton
+cd $R/HeatmapVLN
 for i in 0 1 2 3; do
-  gpu=\$((7 - i))
-  CUDA_VISIBLE_DEVICES=\$gpu \$R/envs/qwen25/bin/python scripts/tools/probe_future_head_recovery.py \
-    --collection-root \$R/data/heatmap_system1_dagger_v1/round_000/full_train_4way_seed17 \
-    --checkpoint \$R/model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth \
+  gpu=$((7 - i))
+  CUDA_VISIBLE_DEVICES=$gpu setsid nohup $R/envs/qwen25/bin/python scripts/tools/probe_future_head_recovery.py \
+    --collection-root $R/data/heatmap_system1_dagger_v1/round_000/full_train_4way_seed17 \
+    --checkpoint $R/model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth \
     --config configs/ppa_action_refine_v2_8gpu.yaml \
+    --per-state-jsonl $R/model/exp12_recovery_gate/d1_per_state.jsonl \
     --bucket dagger_hard --max-states 4000 \
-    --shard-index \$i --shard-count 4 \
-    --output-json \$R/model/exp12_recovery_gate/d2_future_head_shard\${i}.json \
-    > \$R/model/exp12_recovery_gate/d2_shard\${i}.log 2>&1 &
+    --shard-index $i --shard-count 4 \
+    --output-json $R/model/exp12_recovery_gate/d2_future_head_shard${i}.json \
+    > $R/model/exp12_recovery_gate/d2_shard${i}.log 2>&1 < /dev/null &
 done
-wait
-"'
+SH
 ```
 
 合并四片并按判据读数：
@@ -99,6 +113,8 @@ R=/mnt/afs/liwenhao/agent/370910109
 
 要点：
 
+- 用 `setsid nohup` 起，**掉线不杀进程**（这条 ssh 链路经中转）；冷 AFS 下模型加载要几分钟才见第一行进度。
+- `--per-state-jsonl` 是必填的：oracle 方向必须从 D1 的产物读，不能在 D2 里重算。
 - 位姿用 DAgger tar 里的 **Habitat 真值位姿**（判据边界③已声明这让 D2 的正面结果成为上界）。
 - oracle 方向与 D1 用**同一个投影函数**，两边的 `top1` 定义必须逐字一致，否则 D2 的对照失效。
 - 四视角都不可见的状态在两侧**同时**剔除，剔除数写进产物。
