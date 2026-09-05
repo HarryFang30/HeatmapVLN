@@ -50,6 +50,37 @@ SCHEMA = "heatmapvln-exp15-pose-noise-readout-v1"
 POSE_DEPENDENT = ("geometry", "system2_geometry")
 
 
+def decompose_geometry(data: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Split the 80-dim geometry vector into the four things it is made of.
+
+    A flat noise curve has two very different explanations: the readout is
+    robust to pose error, or the readout was never reading the poses.  These
+    blocks tell them apart.
+
+    ``visibility`` is not an input -- it is the frozen head's own output, read
+    from the cached forward pass, so perturbing ``history_rel_poses`` in the
+    ``.npz`` cannot change it.  If the signal lives there, the sweep held its
+    value by keeping a clean pose-derived feature, and under real VO (where the
+    head sees the noisy poses too) it would move.
+    """
+    states = int(np.asarray(data["oracle_view"]).shape[0])
+
+    def flat(name: str) -> np.ndarray:
+        return np.asarray(data[name], dtype=np.float32).reshape(states, -1)
+
+    pose = flat("history_rel_poses")
+    visibility = flat("history_visibility")
+    age = flat("history_age_steps")
+    mask = np.asarray(data["history_memory_mask"], dtype=np.float32).reshape(states, -1)
+    return {
+        "geo_pose": pose,
+        "geo_visibility": visibility,
+        "geo_age_mask": np.concatenate([age, mask], axis=1),
+        "geo_pose_age_mask": np.concatenate([pose, age, mask], axis=1),
+        "geo_visibility_age_mask": np.concatenate([visibility, age, mask], axis=1),
+    }
+
+
 def _load_readout_tool() -> types.ModuleType:
     path = PROJECT_ROOT / "scripts/tools/fit_recovery_readout.py"
     spec = importlib.util.spec_from_file_location("_exp13_fit_recovery_readout", path)
@@ -189,6 +220,18 @@ def main() -> None:
         default="system2,memory",
         help="pose-independent arms, fit once as fixed lines",
     )
+    parser.add_argument(
+        "--decompose",
+        action="store_true",
+        help="also fit the four blocks of the geometry vector separately, "
+        "clean and at --decompose-level, to locate where the signal lives",
+    )
+    parser.add_argument(
+        "--decompose-level",
+        type=int,
+        default=3,
+        help="index into the noise levels used for the perturbed half of --decompose",
+    )
     args = parser.parse_args()
 
     tool = _load_readout_tool()
@@ -299,10 +342,50 @@ def main() -> None:
             )
         levels.append(entry)
 
+    decomposition: dict[str, Any] = {}
+    if args.decompose:
+        if not 0 <= args.decompose_level < len(translations):
+            raise SystemExit(f"--decompose-level must index into {len(translations)} levels")
+        d_t, d_r = translations[args.decompose_level], rotations[args.decompose_level]
+        noisy = dict(data)
+        noisy["history_rel_poses"] = perturb_rel_poses(
+            clean_poses,
+            translation_m=d_t,
+            rotation_deg=d_r,
+            ages=ages,
+            drift=(args.noise_model == "drift"),
+            rng=np.random.default_rng(seeds[0]),
+        )
+        clean_blocks = decompose_geometry(data)
+        noisy_blocks = decompose_geometry(noisy)
+        print(f"\n[decompose] clean vs t={d_t}m r={d_r}deg", flush=True)
+        for name in sorted(clean_blocks):
+            clean = _fit_and_score(
+                tool, clean_blocks[name], oracle, source_type, tags, selectors, decays, args, seeds[0]
+            )
+            perturbed = _fit_and_score(
+                tool, noisy_blocks[name], oracle, source_type, tags, selectors, decays, args, seeds[0]
+            )
+            decomposition[name] = {
+                "feature_dim": int(clean_blocks[name].shape[1]),
+                "clean": clean["val"],
+                "perturbed": perturbed["val"],
+                "translation_m": d_t,
+                "rotation_deg": d_r,
+            }
+            print(
+                f"  {name:24s} dim={clean_blocks[name].shape[1]:3d} "
+                f"clean_recovery={clean['val']['recovery_nonfront_recall']:.4f} "
+                f"noisy_recovery={perturbed['val']['recovery_nonfront_recall']:.4f} "
+                f"clean_fa={clean['val']['normal_false_alarm']:.4f}",
+                flush=True,
+            )
+
     report = {
         "schema": SCHEMA,
         "features": str(args.features),
         "noise_model": args.noise_model,
+        "decomposition": decomposition,
         "recipe": {
             "readout": "multinomial logistic regression, inverse-frequency class weights",
             "epochs": args.epochs,

@@ -147,3 +147,46 @@ def test_the_recipe_is_imported_from_exp13a_not_reimplemented() -> None:
     readout = tool._load_readout_tool()
     for name in ("scene_split", "build_arms", "fit_linear", "score", "predict"):
         assert hasattr(readout, name), name
+
+
+def test_decompose_splits_the_eighty_dims_into_its_four_sources() -> None:
+    n, k = 32, 8
+    data = {
+        "oracle_view": np.zeros(n, dtype=np.int64),
+        "history_rel_poses": np.zeros((n, k, 4), dtype=np.float32),
+        "history_visibility": np.ones((n, k, 4), dtype=np.float32),
+        "history_age_steps": np.full((n, k), 3.0, dtype=np.float32),
+        "history_memory_mask": np.ones((n, k), dtype=np.float32),
+    }
+    blocks = tool.decompose_geometry(data)
+    assert blocks["geo_pose"].shape == (n, 32)
+    assert blocks["geo_visibility"].shape == (n, 32)
+    assert blocks["geo_age_mask"].shape == (n, 16)
+    assert blocks["geo_pose_age_mask"].shape == (n, 48)
+    assert blocks["geo_visibility_age_mask"].shape == (n, 48)
+    # The union is the 80-dim arm fit_recovery_readout builds.
+    assert blocks["geo_pose"].shape[1] + blocks["geo_visibility_age_mask"].shape[1] == 80
+
+
+def test_visibility_is_immune_to_pose_noise_which_is_the_whole_point() -> None:
+    # visibility is the frozen head's cached output, so perturbing the poses in
+    # the npz cannot move it; the decomposition exists to make that visible
+    # instead of letting it prop up the full arm's noise curve.
+    n, k = 16, 8
+    rng = np.random.default_rng(0)
+    data = {
+        "oracle_view": np.zeros(n, dtype=np.int64),
+        "history_rel_poses": rng.normal(size=(n, k, 4)).astype(np.float32),
+        "history_visibility": rng.normal(size=(n, k, 4)).astype(np.float32),
+        "history_age_steps": np.zeros((n, k), dtype=np.float32),
+        "history_memory_mask": np.ones((n, k), dtype=np.float32),
+    }
+    noisy = dict(data)
+    noisy["history_rel_poses"] = tool.perturb_rel_poses(
+        data["history_rel_poses"], translation_m=1.0, rotation_deg=30.0,
+        ages=data["history_age_steps"], drift=False, rng=np.random.default_rng(1),
+    )
+    before, after = tool.decompose_geometry(data), tool.decompose_geometry(noisy)
+    assert np.array_equal(before["geo_visibility"], after["geo_visibility"])
+    assert np.array_equal(before["geo_age_mask"], after["geo_age_mask"])
+    assert not np.array_equal(before["geo_pose"], after["geo_pose"])
