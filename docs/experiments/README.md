@@ -46,6 +46,7 @@
 | [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | ⚠️ | 历史路点 99.7% 不在前视（后视 82.3%）；未来 92.6% 在前视、侧后 ≈5% |
 | [EXP-12](#exp-12-恢复状态决策层的三个门控诊断) | 把认知的作用点从 System1 的条件挪到 System2 的决策层，值不值得做 | ⚠️ | H-D2 否定：零样本未来头是常数"前"预测器（oracle 非前视的 937 个状态里只对 1 个）；D1/D3 没测出来，D3a 判据因选择偏差作废 |
 | [EXP-13](#exp-13-把认知的作用点挪到-system2-的提示里) | 把 `M_t` 从 Z 挪进 System2 的提示，认知能不能改变"去哪"这个决定 | ⏳ | 三段式已预注册：13-A 读出探针（8 卡 1.5 h）→ 13-B 提示注入 LoRA 两臂 → 13-C 闭环；总门 3×3 已填满 |
+| [EXP-14](#exp-14-把停的决定也放进同一次微调) | 把停的决定放进同一次决策层微调：OS−SR 8.9pt 那一格能不能在决策级被打开 | ⏳ | 已预注册：**顶替** 13-B 的那次训练（同两臂 + 停重标），停/转向判据分别读，14-C 加早停否决项 |
 
 ### 跨实验：未来头退化的三层证据链
 
@@ -1072,6 +1073,94 @@ System1 不构建。**代价：8 卡 × 约 3–4 h × 2 臂**，走网页提交
 
 ---
 
+### EXP-14 把停的决定也放进同一次微调
+
+**问题.** EXP-12 定位了决策层在恢复上的失败；§4 自己的数字说同一层在**停**上也失败：
+当前方法 OS 71.72 / SR 62.81，**OS − SR = 8.91pt**（native 8.10pt）——路径已经进过 3 m 圈，
+最后没停在里面；NE 平均 3.98 m 正卡在阈值边上。机制与恢复同源：专家轨迹每集只有一次停、
+零次掉头，决策器恰好在决定成败的两类决定上没受过训练。EXP-13 只监督了掉头；本实验把停
+加进**同一次**微调，两类决定一起学、分别读。
+
+**为什么现在做、为什么并入 13-B.** 停这一格的天花板（8.9pt）比恢复（3.7pt）高一倍以上，
+而且不需要改任何导航行为。并入 13-B 不多花一个卡时：同样两臂、同样 LoRA、同样锚定，
+只多一条重标规则。13-B 的转向判据在同一对 checkpoint 上原样读。
+
+**数据事实（写判据前核实的，决定了本实验的形状）.** 采集器 `classify_candidate` 只保留
+`native_kind == "trajectory"` 的状态，native 自己答 STOP 或箭头的状态**一律丢弃**。于是
+(i) "native 停早了"这一类改正在这份采集里**不存在**；(ii) 保留下来的状态上 native 的停误报率
+恒为 0，训练臂的误报率就是它**引入**的早停，可以直接当约束用。oracle 不把 STOP 写进
+`actions`，而用 `terminal` + `travelled_m`（影子路线到终点的路程）表达"到了"。
+
+**假设 H-14.** 把"oracle 路线在 1 m 内以终点收尾、native 仍在走"的状态改标为 STOP 后，
+微调出的 System2 在留出场景的这类状态上会停，且不在不该停的状态上停。
+**不预期记忆臂在停上优于常数臂**：停缺的是进度这类语义状态，`M_t` 里是几何。两臂之差照报，
+不作判据；若差异显著，先复现再谈。
+
+**判据（预注册，2026-09-06，写于任何读数之前；读数由 `scripts/tools/eval_system2_recovery_decisions.py`
+产生，该工具的停指标与本判据同一次提交）.** val 场景同 13-B（同一个 25% 场景哈希，**不过采样**）：
+
+- `stop_recall` = val 中 `correct_stop` 状态上，答案**首 token** 为 `STOP` 的比例
+  （`STOP` 在该 tokenizer 里是单个 token，id 50669，工具启动时核对）；
+- `stop_false_alarm` = val 中**其余全部**状态上，首 token 为 `STOP` 的比例。
+  native 在这些状态上为 0（见数据事实），所以这个数就是引入的早停率；
+- 13-B 的 `recovery_turn_accuracy` 与 `normal_preservation` 照旧读。
+
+| 判定 | 条件（读 **memory 臂**；13-A 否定时只跑并读 constant 臂） |
+|---|---|
+| ✅ **支持** | `stop_recall ≥ 0.50` **且** `stop_false_alarm ≤ 0.02` **且** `normal_preservation ≥ 0.90` |
+| ❌ **否定** | `stop_recall < 0.20` **或** `stop_false_alarm > 0.05` |
+| ⚠️ **没测出来** | 其余 |
+
+停的判定与 13-B 的转向判定**分别**做，互不折算，合成总门：
+
+| 转向（13-B 判据） | 停（EXP-14 判据） | 决定 |
+|---|---|---|
+| 支持 | 支持 | 跑 14-C，两类决定一起测 |
+| 支持 | 没测出来 / 否定 | 跑 14-C，论文只写恢复；停只作为发现（8.9pt 未解决）保留 |
+| 没测出来 / 否定 | 支持 | 跑 14-C，论文只写停；记忆的功劳按 13-A/13-B 的格子处理 |
+| 没测出来 / 否定 | 没测出来 / 否定 | **停**。记为"决策层微调在两类决定上都未证实" |
+
+**14-C 闭环（顶替 13-C）.** 判据与 13-C 相同（两协议种子 42/1337、全量 1839 集、
+合并 SR 差的 95% CI 下界 > 0 为支持），**外加一条否决项**：早停率（停下且从未进过 3 m 圈）
+相对 native 上升超过 **0.5pt**，SR 涨多少都判否定；OS 下降超过 1pt 记为早停泄漏的旁证。
+附带（无判据）：OS − SR 是否收窄。13-C 关于先补 AMB3R VO 缓存的要求原样适用。
+
+**设置.** `configs/ablation/exp14{a,b}_*.yaml` = 13-B 两臂 + `stop_supervision: true`、
+`stop_horizon_m: 1.0`、`stop_oversample: K`；`tests/test_exp14_configs.py` 把三组 diff 钉死
+（exp14a−exp13a、exp14b−exp13b 各恰为 stage 名 + 三个 `stop_*` 键，exp14a−exp14b 恰为
+`mode` 一行 + stage 名）。规则（`src/data/dagger_system2_sft.py`）：`oracle.terminal` 且
+`travelled_m ≤ 1.0` 且 native 发了像素目标 → `["STOP"]`，排在转向规则**前**
+（1 m 内的 STOP 落在 3 m 成功半径内，朝向无关）。`stop_horizon_m` 在读数前写死。
+**`stop_oversample` 的规则也写死**：设 s = 预检 `kinds.correct_stop / states_labelled`，
+s ≥ 0.03 则 K = 1，否则 K = min(8, ⌈0.03 / s⌉)——把 `correct_stop` 行的有效占比抬到 3%，
+只作用于 train 切片，val 永不过采样。启动脚本复用 13-B 的（`EXP13_ARMS="exp14a exp14b"`）。
+代价：8 卡 × 约 3–4 h × 2 臂，与 13-B 相同，**顶替**它而不是叠加。
+
+**开发期预览披露.** 写判据的同一个会话里，先用一段纯 CPU 脚本扫了全部 10804 个 `episode.tar`
+里的 `samples.jsonl`（不经 dataset 类、不核 sha256），只为核实上面"数据事实"那一段并给 K 定值：
+31128 个 hard/normal 状态 **100% 为 `native_kind == "trajectory"`、100% 带像素目标**
+（native 的 STOP 状态确实不存在）；`oracle.terminal` 6222 个（hard 5256 / normal 966），
+按 `travelled_m` 分桶：0–0.3 m 938、0.3–0.5 m 241、0.5–1.0 m 1353、1.0–1.5 m 806、1.5–2.0 m 708、
+2.0–3.0 m 1783、>3 m 393；`oracle.actions` 为空（已在 0.3 m 容差内）312 个。
+**1 m 内共 2532 个，占 8.1%，按上面写死的规则 K = 1**，两个 config 里本来就是 1，未改。
+判据的四个阈值不依赖这些数；这一段只决定了 K 和"1 m 内有没有样本"。正式的预检产物是
+`model/exp14_relabel_audit.json`（走 dataset 类与 `plan_for_sample`，计数以它为准）。
+
+**边界（预先声明）.**
+① 早停的改正样本不存在于这份采集，早停只由 `stop_false_alarm`（决策级）与 14-C 的否决项兜住；
+一个在 DAgger 没覆盖的状态上学会早停的模型只会在闭环里被抓到。
+② "到了"由影子 oracle 定义（Habitat 真值位姿、`goal_tolerance_m = 0.3`），horizon 是沿路线的路程
+不是直线距离；1–3 m 之间的状态（停下也算成功）仍是 `keep_pixel`，`stop_recall` 不度量它们。
+③ 记忆臂沿用 13-A/B 的位姿域边界（真值 vs VO）。
+④ 单训练种子起步。
+⑤ 决策级指标是首 token 的 argmax，等于贪心解码的首 token；闭环里的停还要经过 RPC 路径的
+解析与执行，14-C 才是最终的数。
+
+🔁 [exp13-decision-layer-runbook.md](exp13-decision-layer-runbook.md) §0b/§2 ｜
+📤 [exp14-system2-stop-submission.md](exp14-system2-stop-submission.md)
+
+---
+
 ## 4. 公共资源
 
 所有路径都在 `/mnt/afs/liwenhao/agent/370910109/` 下（旧路径 `/mnt/afs/lixiaoou/intern/fjl`
@@ -1117,6 +1206,9 @@ System1 不构建。**代价：8 卡 × 约 3–4 h × 2 臂**，走网页提交
 | EXP-13-A 读出结果（**待跑**，判据来源） | `model/exp13_decision_features/readout.json` |
 | EXP-13-B 两臂训练（**待跑**，8 卡 × 3–4 h × 2） | `model/exp13_system2_memory/{exp13a,exp13b}/run_*/` |
 | EXP-13-B 决策评测（**待跑**，判据来源） | `model/exp13_system2_memory/{exp13a,exp13b}/decisions.json` |
+| EXP-14 重标预检（纯 CPU，含终点路线分布，**不是判据**） | `model/exp14_relabel_audit.json` |
+| EXP-14 两臂训练（**待跑**，顶替 13-B，8 卡 × 3–4 h × 2） | `model/exp14_system2_memory_stop/{exp14a,exp14b}/run_*/` |
+| EXP-14 决策评测（**待跑**，判据来源） | `model/exp14_system2_memory_stop/{exp14a,exp14b}/decisions.json` |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |
@@ -1236,3 +1328,10 @@ System1 不构建。**代价：8 卡 × 约 3–4 h × 2 臂**，走网页提交
    全量的 CI [4.40, 5.72] 内——但**"没出事"是结果出来之后才知道的**。
    要让这一步干净，三件事必须同时做到：**判据一字不动**、**旧读数原样保留不撤回**、
    **在决定加数据的当时就写死"落在哪一边都照报"**。三条缺一条，这就是加样本加到出想要的结论。
+
+21. **设计监督之前先看采集器保留了什么。** DAgger 采集器只保留 `native_kind == "trajectory"`
+   的状态（native 发了像素目标）；native 自己答 STOP / 箭头的状态在 `classify_candidate`
+   里一律丢弃。于是"native 停早了"这类改正在数据里根本不存在，`keep_turn` / `keep_stop`
+   两条重标规则在这份采集上永远不会触发。oracle 也不把 STOP 写进 `actions`，"到了"藏在
+   `terminal` + `travelled_m` 里。EXP-14 的规则是读完 `scripts/evaluation/trajectory_dagger.py`
+   之后才定型的；按"oracle 首步是 STOP"去写，会得到**零个样本而且不报错**。

@@ -11,6 +11,10 @@
 # both is the point: a DAgger fine-tune can improve the policy on its own, and
 # without the control arm no gain could be attributed to the memory.
 #
+# EXP-14 reuses this launcher with EXP13_ARMS="exp14a exp14b": the same two
+# arms, trained on data that also carries the stop relabelling
+# (data.dagger_system2_sft.stop_supervision=true).  Ledger: EXP-14.
+#
 # A failed arm is reported and the chain continues, so one bad arm does not
 # cost the other one's GPU hours.
 #
@@ -53,6 +57,8 @@ arm_config() {
   case "$1" in
     exp13a) echo "$REPO/configs/ablation/exp13a_system2_memory_lora_8gpu.yaml" ;;
     exp13b) echo "$REPO/configs/ablation/exp13b_system2_constant_lora_8gpu.yaml" ;;
+    exp14a) echo "$REPO/configs/ablation/exp14a_system2_memory_stop_lora_8gpu.yaml" ;;
+    exp14b) echo "$REPO/configs/ablation/exp14b_system2_constant_stop_lora_8gpu.yaml" ;;
     *) return 1 ;;
   esac
 }

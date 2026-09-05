@@ -456,6 +456,15 @@ class DaggerSystem2SFTConfig(_Strict):
     # same hash the EXP-13 readout probe uses.  Keeping the two experiments on
     # the same held-out scenes is what makes their conclusions comparable.
     val_scene_pct: int = 25
+    # EXP-14: also supervise the stop decision.  A state whose oracle route
+    # ends at the goal within stop_horizon_m metres is relabelled STOP when
+    # native kept walking.  Off by default so the EXP-13 arms stay exactly what
+    # their ledger entry registered.
+    stop_supervision: bool = False
+    stop_horizon_m: float = 1.0
+    # Training-only repetition of the correct_stop rows; the val slice is never
+    # oversampled because the decision metrics are read there.
+    stop_oversample: int = 1
 
     @model_validator(mode="after")
     def _check_source(self):
@@ -468,6 +477,18 @@ class DaggerSystem2SFTConfig(_Strict):
             raise ValueError("dagger_system2_sft.max_turns must be >= 1")
         if not 0 < self.val_scene_pct < 100:
             raise ValueError("dagger_system2_sft.val_scene_pct must be in (0, 100)")
+        if not 0.0 < self.stop_horizon_m <= 3.0:
+            raise ValueError(
+                "dagger_system2_sft.stop_horizon_m must be in (0, 3]: R2R counts a "
+                "stop within 3 m as success, so a longer horizon would label STOP "
+                "where stopping fails"
+            )
+        if self.stop_oversample < 1:
+            raise ValueError("dagger_system2_sft.stop_oversample must be >= 1")
+        if self.stop_oversample > 1 and not self.stop_supervision:
+            raise ValueError(
+                "dagger_system2_sft.stop_oversample > 1 requires stop_supervision=true"
+            )
         return self
 
 

@@ -259,3 +259,169 @@ def test_dataset_refuses_a_reader_without_sealed_metadata() -> None:
 
     with pytest.raises(sft.DaggerSystem2SFTError, match="sample_metadata"):
         sft.DaggerSystem2SFTDataset(_NoMetadata(), oracle_views={})
+
+
+# --- EXP-14: the stop decision -------------------------------------------------
+
+
+def _terminal_sample(
+    key: str,
+    *,
+    travelled_m: Any,
+    terminal: bool = True,
+    pixel_goal: list[int] | None = None,
+    native_actions: list[int] | None = None,
+    oracle_actions: list[int] | None = None,
+    use_default_pixel: bool = True,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    if pixel_goal is None and use_default_pixel:
+        pixel_goal = [10, 20]
+    sample = _sample(
+        key,
+        pixel_goal=pixel_goal,
+        native_actions=native_actions,
+        oracle_actions=oracle_actions,
+        **kwargs,
+    )
+    sample["oracle"]["terminal"] = terminal
+    sample["oracle"]["travelled_m"] = travelled_m
+    sample["oracle"]["kind"] = "route_recovery"
+    return sample
+
+
+def _scene_in(split: str) -> str:
+    for index in range(1000):
+        name = f"scene_{index:04d}"
+        in_val = sft.scene_bucket(name) < 25
+        if (split == "val") == in_val:
+            return name
+    raise AssertionError("no scene name landed in the requested split")
+
+
+def test_stop_supervision_is_off_unless_requested() -> None:
+    # The EXP-13 arms must relabel exactly as their ledger entry registered.
+    sample = _terminal_sample("k", travelled_m=0.4)
+    assert sft.plan_for_sample(sample, _row(0, 0))["kind"] == "keep_pixel"
+
+
+def test_an_oracle_at_the_goal_relabels_a_walking_native_to_stop() -> None:
+    sample = _terminal_sample("k", travelled_m=0.4)
+    plan = sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True, stop_horizon_m=1.0)
+    assert plan["kind"] == "correct_stop"
+    assert plan["target_texts"] == ["STOP"]
+    assert plan["drop_pixel_goal"] is True
+    assert plan["oracle_remaining_m"] == pytest.approx(0.4)
+    assert plan["oracle_kind"] == "route_recovery"
+
+
+def test_a_terminal_route_longer_than_the_horizon_is_not_a_stop() -> None:
+    sample = _terminal_sample("k", travelled_m=1.6)
+    plan = sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True, stop_horizon_m=1.0)
+    assert plan["kind"] == "keep_pixel"
+    # Exactly on the horizon counts as within it.
+    on_edge = _terminal_sample("k", travelled_m=1.0)
+    assert sft.plan_for_sample(on_edge, _row(0, 0), stop_supervision=True)["kind"] == "correct_stop"
+
+
+def test_a_non_terminal_route_is_never_a_stop_even_when_short() -> None:
+    sample = _terminal_sample("k", travelled_m=0.2, terminal=False)
+    assert sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True)["kind"] == "keep_pixel"
+
+
+def test_stop_outranks_a_disagreeing_turn_and_only_when_switched_on() -> None:
+    sample = _terminal_sample("k", travelled_m=0.5, oracle_actions=[2, 2, 1])
+    assert sft.plan_for_sample(sample, _row(3, 0), stop_supervision=True)["kind"] == "correct_stop"
+    assert sft.plan_for_sample(sample, _row(3, 0))["kind"] == "correct_turn"
+
+
+def test_a_native_that_already_stopped_is_kept_not_corrected() -> None:
+    sample = _terminal_sample(
+        "k", travelled_m=0.1, native_actions=[0], use_default_pixel=False
+    )
+    plan = sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True)
+    assert plan["kind"] == "keep_stop"
+    assert plan["target_texts"] == ["STOP"]
+
+
+def test_malformed_terminal_metadata_never_produces_a_stop() -> None:
+    sample = _terminal_sample("k", travelled_m="nan")
+    assert sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True)["kind"] == "keep_pixel"
+    sample["oracle"]["travelled_m"] = None
+    assert sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True)["kind"] == "keep_pixel"
+    sample["oracle"]["travelled_m"] = -0.5
+    assert sft.plan_for_sample(sample, _row(0, 0), stop_supervision=True)["kind"] == "keep_pixel"
+    assert sft.oracle_stops_within({"terminal": True, "travelled_m": "0.2"}, 1.0) == (True, 0.2)
+    assert sft.oracle_stops_within("not a dict", 1.0) == (False, None)
+
+
+def test_stop_oversampling_applies_to_train_only_and_is_reported() -> None:
+    train_scene, val_scene = _scene_in("train"), _scene_in("val")
+    samples = [
+        _terminal_sample("a", travelled_m=0.3, scene_id=train_scene),
+        _sample("b", pixel_goal=[30, 40], scene_id=train_scene),
+        _terminal_sample("c", travelled_m=0.3, scene_id=val_scene),
+    ]
+    views = {key: _row(0, 0) for key in "abc"}
+
+    train = sft.DaggerSystem2SFTDataset(
+        _FakeDagger(samples),
+        oracle_views=views,
+        scene_split="train",
+        stop_supervision=True,
+        stop_oversample=3,
+    )
+    assert len(train) == 4  # a x3 + b
+    summary = train.summary()
+    assert summary["states"] == 4
+    assert summary["unique_states"] == 2
+    assert summary["oversampled_copies"] == 2
+    assert summary["kinds"] == {"correct_stop": 1, "keep_pixel": 1}
+    assert summary["corrected_fraction"] == pytest.approx(0.5)
+    assert summary["corrected_stop_fraction"] == pytest.approx(0.5)
+    assert summary["corrected_turn_fraction"] == 0
+    targets = [train[index]["system2_target_texts"] for index in range(len(train))]
+    assert targets.count(["STOP"]) == 3
+    assert "pixel_goal" not in train[0]
+
+    val = sft.DaggerSystem2SFTDataset(
+        _FakeDagger(samples),
+        oracle_views=views,
+        scene_split="val",
+        stop_supervision=True,
+        stop_oversample=3,
+    )
+    assert len(val) == 1
+    assert val.summary()["stop_oversample"] == 1
+    assert val.summary()["oversampled_copies"] == 0
+
+
+def test_stop_knobs_are_validated() -> None:
+    samples = [_sample("a", pixel_goal=[10, 20])]
+    views = {"a": _row(0, 0)}
+    with pytest.raises(sft.DaggerSystem2SFTError, match="stop_horizon_m"):
+        sft.DaggerSystem2SFTDataset(
+            _FakeDagger(samples), oracle_views=views, stop_supervision=True, stop_horizon_m=0.0
+        )
+    with pytest.raises(sft.DaggerSystem2SFTError, match="stop_oversample"):
+        sft.DaggerSystem2SFTDataset(_FakeDagger(samples), oracle_views=views, stop_oversample=0)
+    with pytest.raises(sft.DaggerSystem2SFTError, match="requires stop_supervision"):
+        sft.DaggerSystem2SFTDataset(_FakeDagger(samples), oracle_views=views, stop_oversample=2)
+
+
+def test_the_exp13_summary_numbers_do_not_move_without_stop_supervision() -> None:
+    # The 13-B log line reads corrected_fraction; adding EXP-14 must not change it.
+    samples = [
+        _terminal_sample("a", travelled_m=0.2, oracle_actions=[2, 2, 2], tags=["wrong_branch"]),
+        _sample("b", pixel_goal=[1, 2]),
+    ]
+    dataset = sft.DaggerSystem2SFTDataset(
+        _FakeDagger(samples), oracle_views={"a": _row(3, 0), "b": _row(0, 0)}
+    )
+    summary = dataset.summary()
+    assert summary["kinds"] == {"correct_turn": 1, "keep_pixel": 1}
+    assert summary["corrected_fraction"] == pytest.approx(0.5)
+    assert summary["corrected_turn_fraction"] == pytest.approx(0.5)
+    assert summary["corrected_stop_fraction"] == 0
+    assert summary["states"] == summary["unique_states"] == 2
+    assert summary["stop_supervision"] is False

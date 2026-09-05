@@ -338,6 +338,9 @@ def build_trajectory_dagger_dataset(
         max_turns=int(sft_cfg.get("max_turns", 4)),
         scene_split=str(scene_split),
         val_scene_pct=int(sft_cfg.get("val_scene_pct", 25)),
+        stop_supervision=bool(sft_cfg.get("stop_supervision", False)),
+        stop_horizon_m=float(sft_cfg.get("stop_horizon_m", 1.0)),
+        stop_oversample=int(sft_cfg.get("stop_oversample", 1)),
     )
     logger.info(
         "DAgger System2 SFT relabelling (%s): %s",

@@ -19,6 +19,22 @@ Two numbers decide the arm, and both are properties of a single forward pass:
 Both are reported per arm and per relabel kind, together with the distribution
 of first tokens.  EXP-12 spent a whole probe comparing two constant predictors
 because nobody printed that distribution first.
+
+EXP-14 adds the stop decision on the same forward pass:
+
+``stop_recall``
+    on val states the relabeller marked ``correct_stop`` (the oracle's route
+    ends at the goal within the horizon, native kept walking), is the first
+    token ``STOP``?
+
+``stop_false_alarm``
+    on every other val state, is the first token ``STOP``?  Native never stops
+    on these states by construction -- the collector kept only states where it
+    emitted a pixel goal -- so this rate is exactly the early stops the
+    fine-tune *introduced*, and the criterion caps it.
+
+``STOP`` is one token in the released tokenizer (checked at start-up), so the
+first-token argmax is the whole answer.
 """
 
 from __future__ import annotations
@@ -34,9 +50,15 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-SCHEMA = "heatmapvln-exp13-system2-decisions-v1"
+SCHEMA = "heatmapvln-exp13-system2-decisions-v2"
 ARROW_LEFT = "←"
 ARROW_RIGHT = "→"
+STOP_TEXT = "STOP"
+STOP_TARGET_KINDS = ("correct_stop", "keep_stop")
+
+
+def _rate(rows: list[dict[str, Any]], key: str) -> float | None:
+    return sum(1 for s in rows if s[key]) / len(rows) if rows else None
 
 
 def merge(paths: list[Path], output: Path) -> None:
@@ -89,12 +111,35 @@ def summarise(states: list[dict[str, Any]]) -> dict[str, Any]:
         else None
     )
 
+    # Stop metrics (EXP-14).  Rows written by the v1 schema carry no
+    # predicted_is_stop and are excluded, never defaulted to "did not stop".
+    stop_scored = [
+        s for s in by_kind.get("correct_stop", []) if s.get("predicted_is_stop") is not None
+    ]
+    non_stop = [
+        s
+        for kind, rows in by_kind.items()
+        if kind not in STOP_TARGET_KINDS
+        for s in rows
+        if s.get("predicted_is_stop") is not None
+    ]
+    false_alarm_by_source: dict[str, float | None] = {}
+    for source in sorted({str(s["source_type"]) for s in non_stop}):
+        false_alarm_by_source[source] = _rate(
+            [s for s in non_stop if str(s["source_type"]) == source], "predicted_is_stop"
+        )
+
     return {
         "state_count": len(states),
         "recovery_turn_accuracy": turn_accuracy,
         "recovery_turn_states": len(scored),
         "normal_preservation": preservation,
         "normal_preservation_states": len(preserved),
+        "stop_recall": _rate(stop_scored, "predicted_is_stop"),
+        "stop_recall_states": len(stop_scored),
+        "stop_false_alarm": _rate(non_stop, "predicted_is_stop"),
+        "stop_false_alarm_states": len(non_stop),
+        "stop_false_alarm_by_source": false_alarm_by_source,
         "by_kind": {
             kind: {
                 "states": len(rows),
@@ -105,6 +150,10 @@ def summarise(states: list[dict[str, Any]]) -> dict[str, Any]:
                     sum(1 for s in rows if s["all_supervised_tokens_match"]) / len(rows)
                     if rows
                     else None
+                ),
+                "predicted_stop": _rate(
+                    [s for s in rows if s.get("predicted_is_stop") is not None],
+                    "predicted_is_stop",
                 ),
                 "first_token_texts": dict(
                     Counter(str(s["predicted_first_text"]) for s in rows).most_common(8)
@@ -197,6 +246,10 @@ def main() -> None:
         # Held-out scenes only: the arms trained on the complement of this.
         scene_split="val",
         val_scene_pct=int(sft_cfg.get("val_scene_pct", 25)),
+        # Same relabelling the arm trained on; the val slice is never oversampled.
+        stop_supervision=bool(sft_cfg.get("stop_supervision", False)),
+        stop_horizon_m=float(sft_cfg.get("stop_horizon_m", 1.0)),
+        stop_oversample=1,
     )
     print(f"val states: {len(dataset)} | {json.dumps(dataset.summary(), ensure_ascii=False)}", flush=True)
 
@@ -207,6 +260,14 @@ def main() -> None:
         use_fast=False,
     )
     tokenizer = processor.tokenizer
+    stop_ids = [int(v) for v in tokenizer.encode(STOP_TEXT, add_special_tokens=False)]
+    if len(stop_ids) != 1:
+        raise SystemExit(
+            f"{STOP_TEXT!r} is not a single token in this tokenizer ({stop_ids}); the "
+            "first-token stop metrics would be reading a fragment"
+        )
+    stop_token_id = stop_ids[0]
+    print(f"STOP token id: {stop_token_id}", flush=True)
     collator = InternNavHeatmapControlCollator(
         processor,
         n_traj_query=0,
@@ -299,6 +360,8 @@ def main() -> None:
                     "target_first_text": target_first_text,
                     "predicted_direction": _direction_of(predicted_first_text),
                     "target_direction": _direction_of(target_first_text),
+                    "predicted_is_stop": int(predicted[0]) == stop_token_id,
+                    "target_is_stop": plan["kind"] in STOP_TARGET_KINDS,
                     "first_token_match": int(predicted[0]) == int(correct[0]),
                     "all_supervised_tokens_match": [int(v) for v in predicted]
                     == [int(v) for v in correct],
@@ -321,6 +384,9 @@ def main() -> None:
         "collection_root": str(args.collection_root),
         "oracle_views": str(args.oracle_views),
         "system2_memory_mode": memory_cfg.get("mode"),
+        "stop_supervision": bool(sft_cfg.get("stop_supervision", False)),
+        "stop_horizon_m": float(sft_cfg.get("stop_horizon_m", 1.0)),
+        "stop_token_id": stop_token_id,
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
         "elapsed_seconds": time.perf_counter() - started,

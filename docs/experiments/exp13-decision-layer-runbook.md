@@ -49,6 +49,31 @@ cd \$R/HeatmapVLN && \$R/envs/qwen25/bin/python scripts/tools/audit_dagger_syste
 
 这份产物**不是判据**，是预检；它不进 13-A/13-B 的任何结论。
 
+### 0b. EXP-14 的预检（同一个工具，加两个开关）
+
+```bash
+ssh finn_cci_c500 'bash -lc "
+R=/mnt/afs/liwenhao/agent/370910109
+cd \$R/HeatmapVLN && \$R/envs/qwen25/bin/python scripts/tools/audit_dagger_system2_targets.py \
+  --collection-root \$R/data/heatmap_system1_dagger_v1/round_000/full_train_4way_seed17 \
+  --oracle-views \$R/model/exp12_recovery_gate/d1_per_state.jsonl \
+  --stop-supervision --stop-horizon-m 1.0 \
+  --output-json \$R/model/exp14_relabel_audit.json
+"'
+```
+
+多盯三件事：
+
+1. `terminal_routes.travelled_m_bins` —— oracle 以终点收尾的状态按路程分桶。
+   `stop_horizon_m = 1.0` 是预注册值；这张表只能**否决**它（1 m 内几乎没有状态），
+   不能用来往上调。
+2. `kinds.correct_stop` 与 `terminal_routes.within_horizon` —— 前者应等于后者减去
+   native 已经停下的状态数（这份采集里后者恒为 0，所以两者应相等）。
+3. `stop_examples` —— `native_llm_output` 应是一对像素坐标（native 还在走），
+   `oracle_remaining_m ≤ 1.0`，`target_texts == ["STOP"]`。
+
+`stop_oversample` 按台账 EXP-14 里写死的规则从 `kinds` 算出，填进两个 config 后再提交。
+
 ---
 
 ## 1. 13-A 读出探针（8 卡 × 约 1.5 h，网页提交）
@@ -126,6 +151,13 @@ CUDA_VISIBLE_DEVICES=0 $PY scripts/tools/eval_system2_recovery_decisions.py \
 判据要的两个数在 `recovery_turn_accuracy` 与 `normal_preservation`。
 **同时看 `by_kind.*.first_token_texts`**：两臂都恒输出同一个 token 的话，
 差值为 0 是结构决定的，不是能力差异（EXP-12 D2 就是这么翻的车）。
+
+**EXP-14 的臂**用同一条命令：config 换成 `configs/ablation/exp14a_system2_memory_stop_lora_8gpu.yaml`
+（或 `exp14b_*`），`--checkpoint` 与 `--output-json` 指到 `model/exp14_system2_memory_stop/{exp14a,exp14b}/`。
+工具从 config 读 `stop_supervision` / `stop_horizon_m`，val 切片按同一规则重标、**不过采样**，
+多出 `stop_recall`、`stop_false_alarm`、`stop_false_alarm_by_source` 三个数，
+以及每类的 `predicted_stop`。启动时打印 `STOP token id: 50669`——STOP 在这个 tokenizer
+里是单个 token，首 token 就是整个答案。
 
 ---
 
