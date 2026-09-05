@@ -45,6 +45,7 @@
 | [EXP-10](#exp-10-未来认知头与桥的关联是否可观测) | 注入的历史记忆是否改变未来预测（关联的可观测性）；Z 的第 i 个向量是否真的绑定第 i 段 | 🔬 | 桥开臂全部读数已入库（@512 侧后三视角 IoU 合计 < 0.006）；桥关臂需 8 卡、走网页提交；H1 须按 EXP-12 收窄为"前视内部分布" |
 | [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | ⚠️ | 历史路点 99.7% 不在前视（后视 82.3%）；未来 92.6% 在前视、侧后 ≈5% |
 | [EXP-12](#exp-12-恢复状态决策层的三个门控诊断) | 把认知的作用点从 System1 的条件挪到 System2 的决策层，值不值得做 | ⚠️ | H-D2 否定：零样本未来头是常数"前"预测器（oracle 非前视的 937 个状态里只对 1 个）；D1/D3 没测出来，D3a 判据因选择偏差作废 |
+| [EXP-13](#exp-13-把认知的作用点挪到-system2-的提示里) | 把 `M_t` 从 Z 挪进 System2 的提示，认知能不能改变"去哪"这个决定 | ⏳ | 三段式已预注册：13-A 读出探针（8 卡 1.5 h）→ 13-B 提示注入 LoRA 两臂 → 13-C 闭环；总门 3×3 已填满 |
 
 ### 跨实验：未来头退化的三层证据链
 
@@ -158,17 +159,12 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
 
 条目按"性价比 = 结论价值 / 卡时"排序。**开跑前把判据再读一遍，跑完只填结果，不改判据。**
 
-> ⚠️ **未登记的在制品（2026-09-05 发现）.** 工作区里有一套 **EXP-13 的工具已经写好**
-> （`scripts/tools/cache_recovery_decision_features.py`、`scripts/tools/fit_recovery_readout.py`、
-> `tests/test_recovery_readout.py`，以及 `src/models/pipeline.py` 的 21 行改动），
-> 文件时间 02:07–02:09，均为 `git add -N` 未提交状态。
-> 它问的是比"微调未来头"更靠前的一问：**历史记忆 `M_t` 里是否携带 System2 自己的摘要
-> 里没有的决策信息**（臂：`system2` / `system2_memory` / `geometry` / `plan_z0`；
-> 主指标 `hard_macro_accuracy` 与 `recovery_nonfront_recall`；场景不相交，dev 只用于选权重衰减）。
->
-> **但它还没有台账条目，判据也没写。** 已核对：本地与服务器上**都没有任何产物**，
-> 所以按 §0 第 2 条，**预注册窗口仍然开着**——判据必须在跑出第一个数字之前写死并 commit。
-> 在那之前这套工具不要跑。
+> ✅ **上一条"未登记的在制品"已结清（2026-09-05）.** 那套 EXP-13 工具当时只有代码、
+> 没有台账条目也没有判据。现在判据已按 §0 第 2 条写死并随本次提交入库，
+> 见下面的 [EXP-13](#exp-13-把认知的作用点挪到-system2-的提示里)。
+> 结清时复核过：本地与服务器上**都没有任何 EXP-13 产物**（`model/exp13*` 不存在），
+> 所以判据确实写在第一个数字之前。工具本身也一并补齐：读出探针之外多了
+> System2 提示注入与 DAgger 重标那条线。
 
 ### EXP-03 部署头本身是否也只看位姿
 
@@ -825,6 +821,166 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
 
 ---
 
+### EXP-13 把认知的作用点挪到 System2 的提示里
+
+**问题.** EXP-05/07/09 合起来说明桥只能改"怎么走"，EXP-12 又测到"去哪"这个决定在恢复状态下
+由 System2 做、而且做错：native 在 12757 个可配对 hard 状态里 12756 次答"前"，
+`wrong_branch` 上 oracle 有 90.4% 不在前视、native 只有 8.3% 猜对。
+**记忆的内容可能是对的，位置放错了。** 本实验把 `M_t` 从 Z 挪到 System2 的提示里
+（K 个额外 token），用 DAgger 恢复状态微调 System2，再问三个递进的问题：
+
+- **13-A（可读性）**：`M_t` 里有没有 System2 自己没有的、与方向决策相关的信息？
+- **13-B（可学性）**：把它放进提示、微调之后，System2 在留出场景上的恢复方向决策是否改变？
+- **13-C（有效性）**：闭环 SR/NE 是否改变？
+
+**为什么必须有 13-A.** 13-B/13-C 各要以天计的卡时，而 13-A 只要一次前向缓存加纯 CPU 拟合。
+更重要的是它能提前区分两种都会让 13-B "涨"的解释：**记忆真的带来了信息**，
+还是**只是在 DAgger 数据上微调了策略**。
+
+---
+
+#### 13-A 读出探针（先跑这个）
+
+**假设.** H-A：在留出场景的恢复状态上，"System2 摘要 + `M_t`"训练出的方向读出头，
+显著优于"只有 System2 摘要"的读出头。
+
+**判据（预注册，2026-09-05，写于任何读数之前）.**
+全部在 **scene-disjoint 的 val 划分**（`md5(scene_id) % 100 < 25`）上读，
+读出头一律是带逆频率类权重的多项 logistic 回归，权重衰减在 **dev**（`25 ≤ bucket < 40`）
+上选、绝不在 val 上选。四个臂：`system2`（`traj_hidden`，4×3584，对零假设最有利的最强 System2 表征）、
+`system2_memory`、`memory`、`geometry`（相对位姿 + 可见性 + age + mask）。
+
+指标定义：
+- `recovery_nonfront_recall` = 在 val 的 hard 状态中带 `wrong_branch` 或 `off_route` 标签、
+  **且 oracle 不在前视**的子集上，预测视角 == oracle 视角的比例；
+- `hard_macro_accuracy` = 全部 val hard 状态按 oracle 四视角宏平均的 top-1 准确率；
+- `normal_false_alarm` = 在 `dagger_normal` 且 oracle 在前视的 val 状态上，预测非前视的比例；
+- `Δ_recovery` / `Δ_macro` = `system2_memory` 减 `system2`，单位 pt。
+
+| 判定 | 条件 |
+|---|---|
+| ✅ **支持** | `Δ_recovery ≥ +10pt` **且** `system2_memory` 的 `recovery_nonfront_recall ≥ 0.30` **且** `normal_false_alarm ≤ 0.10` |
+| ❌ **否定** | `Δ_recovery ≤ +2pt` **或** `system2_memory` 的 `recovery_nonfront_recall < 0.15` |
+| ⚠️ **没测出来** | 其余 |
+
+参照基线一并报告，不作判据：常数"前"预测器、native System2 的提议方向
+（EXP-12 测得 hard 全集 0.636、`wrong_branch` 0.083）。
+
+**必须一并写出的诚实条款（不是判据，是措辞约束）.** 若 `geometry` 臂相对 `system2` 的增益
+与 `memory` 臂相差在 **3pt 以内**，则论文**不得**把这条写成"学到的记忆表征带来的增益"，
+只能写成"System2 缺的是相对位姿与遮挡这类几何量"。
+**这是预期中的结果，必须提前把措辞钉死**：EXP-02（探针）、EXP-04（VO 位姿域）与
+EXP-03（**部署权重 + VO 位姿**：位姿换常量掉 42.08pt，历史图倒序只掉 0.92pt）
+三个实验已经把"`M_t` 的定位成分几乎完全由相对位姿决定"测到了部署权重上。
+所以 13-A 真正在问的是**这份几何量对决策有没有用**，而不是"记忆表征学得好不好"。
+
+**设置.** `scripts/run_exp13_feature_cache_8gpu_mxc500.sh`：8 张卡各跑一个独立单卡 worker
+（`index % 8`），缓存全部 30816 个候选状态的 `traj_hidden` / `plan_z0` / `M_t` / 位姿 / 可见性 /
+未来头首个时间 bin，再纯 CPU 合并 + 拟合。**代价：8 卡 × 约 1.5 h**（按 EXP-12 D2 实测
+0.8 状态/秒/卡换算），走网页提交。oracle 方向从 EXP-12 的 `d1_per_state.jsonl` join，
+不重算——D1/D2/13-A 共用同一个实现。
+
+**开发期预览披露.** ① 写工具时用 8 个状态跑过 GPU 冒烟，只看了张量形状与
+`{"front": 8}` 的 oracle 计数；② 验证重标规则时在 **shard_00**（7686 个状态 / 59 个场景）
+上跑过纯 CPU 的标签自检，看到 `keep_pixel` 6692 / `correct_turn` 994
+（改写率 12.9%，其中 993 个落在 `dagger_hard`），并核对了每一类各一条样例的解码标签
+（`correct_turn` → `'→→→<|im_end|>'`，`keep_pixel` → `'↓<|im_end|>460 197<|im_end|>'`）。
+两项都在判据写死之后、任何 13-A/13-B 读数之前，且**都不是判据的输入**——
+上表没有任何一条依赖改写率。按台账 §0 的规矩仍然如实披露。
+
+---
+
+#### 13-B System2 提示注入 + LoRA 微调
+
+**假设.** H-B：把 `M_t` 放进提示后，System2 在留出场景的恢复状态上给出的方向明显更接近 oracle，
+而在正常状态上的行为基本不变。
+
+**两臂只差一行.** `configs/ablation/exp13a_system2_memory_lora_8gpu.yaml`（`mode: memory`）
+与 `exp13b_system2_constant_lora_8gpu.yaml`（`mode: constant`）。控制臂保留**同样数量、同样位置、
+同样参数量**的记忆 token，只是它们不依赖 `M_t`。**没有这个控制臂，任何涨幅都无法归因**——
+这正是 EXP-01 同时改两个变量、事后要用 EXP-05 才拆开的那个错误。
+
+**标签.** DAgger 状态的 System2 答案按 oracle 重标（`src/data/dagger_system2_sft.py`）：
+native 的方向与 oracle 一致时**原样复现 native 自己的输出**（自蒸馏，保住既有行为），
+不一致且 oracle 首步是转向时**改成 oracle 的转向箭头**。两种都是合法的 native 输出格式，
+所以训练出来的策略能直接走已认证的 RPC 路径，评测端一行不改。
+
+**判据（预注册，2026-09-05；读数由 `scripts/tools/eval_system2_recovery_decisions.py`
+产生，该工具与本判据同一次提交）.** 两项都在 **val 场景**（同一个 25% 场景哈希）上算：
+
+- `recovery_turn_accuracy` = 在 `correct_turn` 状态上，**答案第一个 token 的 argmax**
+  解码出的转向方向（左/右）与 oracle 一致的比例；没有箭头或两个箭头都有记为错。
+  贪心解码的第一个 token 只依赖提示，所以这个 argmax **就是**解码器会吐出的那个 token，
+  两者不可能对不上——因此工具里没有生成循环。
+- `normal_preservation` = 在 `keep_pixel` 且 `dagger_normal` 状态上，**每一个**被监督位置的
+  argmax 都等于标签的比例（teacher-forced 逐 token 复现 native 自己的答案）。
+  它抓的是"靠忘掉怎么导航来换恢复分数"这种赢法。
+
+两项都按 relabel 类别分别报告，并**一并打印第一个 token 的分布**（台账 §5 第 15 条：
+配对比较之前先确认两侧不是常数）。
+
+| 判定 | 条件 |
+|---|---|
+| ✅ **支持** | `recovery_turn_accuracy`（memory 臂）减（constant 臂）**≥ +10pt** **且** memory 臂 ≥ 0.50 **且** memory 臂的 `normal_preservation ≥ 0.90` |
+| ❌ **否定** | 两臂差 **≤ +2pt**，**或** memory 臂 `normal_preservation < 0.75`（策略被微调带偏，闭环没有意义） |
+| ⚠️ **没测出来** | 其余 |
+
+**设置.** `scripts/run_exp13_system2_memory_8gpu_mxc500.sh`，两臂串行，各 2 epoch。
+数据是全部 30816 个 DAgger 状态按场景切 75/25；训练臂只看 train 场景。
+Past Head 用 `load_frozen_past_head` 从 v2 `best.pth` 精确载入 79 个张量并冻结，
+System1 不构建。**代价：8 卡 × 约 3–4 h × 2 臂**，走网页提交。
+
+---
+
+#### 13-C 闭环（只有 13-A 与 13-B 都不否定才跑）
+
+**假设.** H-C：闭环 SR 相对 native 提升，且提升来自恢复型失败。
+
+**判据（预注册）.** 两个协议种子（42/1337）全量 1839 集，配对 bootstrap 与 EXP-07 同一套工具：
+- ✅ **支持**：合并 SR 差的 95% CI **下界 > 0**；
+- ❌ **否定**：合并 SR 差的 CI 上界 < 0，或 CI 含 0 且点估计 < +0.5pt；
+- ⚠️ **没测出来**：其余。
+- 附带（无判据）：D3b 口径的徘徊型失败占比是否下降。
+
+**上限先算清楚.** D3b 测得徘徊型失败占全部 episode **14.8%–15.9%**（四臂一致）。
+即便把其中四分之一救回来也只有约 **+3.7pt**，救回十分之一约 **+1.5pt**。
+**任何"大幅提升"的预期都与这个上限矛盾**，判据按此设定。
+
+---
+
+#### 总门（3×3 全填，落在哪一格就按哪一格执行）
+
+| 13-A | 13-B | 决定 |
+|---|---|---|
+| 支持 | 支持 | 跑 13-C，论文写"认知作用于决策层" |
+| 支持 | 没测出来 | 补第二个训练种子后再判 13-B；不跑 13-C |
+| 支持 | 否定 | **停**。写成"`M_t` 可读但 System2 学不会用"，这是有内容的否定结论 |
+| 没测出来 | 支持 | 跑 13-C，但论文只能写"提示注入有效"，**不得**声称是记忆的功劳 |
+| 没测出来 | 没测出来 | **停**，记为"决策层方向未被证实"，不再投入 |
+| 没测出来 | 否定 | **停**，同上 |
+| 否定 | — | **停**，不跑 13-B/13-C。写成"`M_t` 不含 System2 之外的决策信息"，与 EXP-02/04 自洽 |
+
+九格都有归宿：13-A 否定时 13-B 根本不跑，所以最后一行的 "—" 覆盖了 13-B 的三种可能。
+**落在哪一格就执行哪一格**，不许因为"看着有希望"跳到下一段（台账 §5 第 13 条就是为这个写的）。
+
+**边界（预先声明）.**
+① DAgger 采集跑在 **R2R train 场景**、用 **native 策略**；13-A/13-B 的留出场景仍在这个分布内，
+向 val_unseen 的外推要靠 13-C，不能由 A/B 代替。
+② 13-A/13-B 用 DAgger tar 里的 **Habitat 真值位姿**，不是部署期的 AMB3R VO；
+已知位姿域偏移把 pck8 从 0.88 压到 0.66，所以**正面结果是上界**（EXP-12 边界③同款）。
+部署前必须给 DAgger 集补 AMB3R 缓存并复验，否则 13-C 与 13-A/B 不同域。
+③ 13-B 的重标只覆盖"oracle 首步是转向"的状态；oracle 直行但方向仍不对的状态**不被监督**，
+所以 `recovery_turn_accuracy` 不是"恢复能力"的完整度量。
+④ 两臂都只有单训练种子起步；擦边结论必须补种子。
+⑤ 13-A 是**线性读出**：否定只否定"线性可读"，不否定"非线性可读"。若 13-A 否定而
+仍想继续，必须换更强的读出头**重新预注册**，不能在同一份数据上换模型再读一次。
+
+🔁 [exp13-decision-layer-runbook.md](exp13-decision-layer-runbook.md) ｜
+📤 [exp13-feature-cache-submission.md](exp13-feature-cache-submission.md) ｜
+📤 [exp13-system2-memory-submission.md](exp13-system2-memory-submission.md)
+
+---
+
 ## 4. 公共资源
 
 所有路径都在 `/mnt/afs/liwenhao/agent/370910109/` 下（旧路径 `/mnt/afs/lixiaoou/intern/fjl`
@@ -864,6 +1020,11 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
 | v1 无约束桥 · 修复栈评测（EXP-05） | `model/eval_ppa_refine_v1_unconstrained_nativefix_r2r_val_unseen_8gpu/merged/` + `analysis/` |
 | 阶段三消融四臂（EXP-08/09） | `model/ablation_stage3/{exp09a,exp09b,exp09c,exp08}/run_*/` |
 | 四方向标签覆盖率（EXP-11） | `model/exp11_direction_coverage/coverage_val_full.json` |
+| EXP-13 重标预检（纯 CPU，**不是判据**，只看改了多少、改在哪里） | `model/exp13_relabel_audit.json` |
+| EXP-13-A 决策特征缓存（**待跑**，8 卡 1.5 h 走网页提交） | `model/exp13_decision_features/features_merged.npz` + 逐片 `features_shard{0..7}.npz` |
+| EXP-13-A 读出结果（**待跑**，判据来源） | `model/exp13_decision_features/readout.json` |
+| EXP-13-B 两臂训练（**待跑**，8 卡 × 3–4 h × 2） | `model/exp13_system2_memory/{exp13a,exp13b}/run_*/` |
+| EXP-13-B 决策评测（**待跑**，判据来源） | `model/exp13_system2_memory/{exp13a,exp13b}/decisions.json` |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |
@@ -942,14 +1103,25 @@ native 仅 8.3%/29.3% 正确、中位夹角 124°/74°）。这只能作为 **EX
    （未来头 3743/3766，System2 12756/12757），Δ ≈ 0 是结构决定的，不是能力差异。
    一行 `Counter(preds)` 比事后解释 Δ 为什么是 0 便宜得多。
 
-16. **`--validate-only` 的指标落在 `manifest/pre_training_validation.json` 的 `metrics` 字段。**
+16. **注入型改动必须先证明"它真的进去了"，再谈效果。** EXP-13 的记忆 token 一开始
+   **完全没有到达语言模型**：提示里 8 个哨兵 token 就位、`M_t` 范数 96.2、投影输出范数 53.7，
+   一切看着都对，但把投影权重放大 50 倍，LM loss **一个 bit 都不动**（Δ=0.0）。
+   原因是替换用的 forward pre-hook 挂在按属性路径猜出来的"语言模型根"上，而套了 LoRA 之后
+   `self.model` 变成 `PeftModelForCausalLM`，两条路径都解析成 `None`，回退到一个
+   **从来不会以 `inputs_embeds` 被调用**的模块——hook 触发 0 次，静默失效。
+   改成挂在 `get_input_embeddings()` 上（由 wrapper 自己解析、必然收到 ids、在图像特征
+   写入之前执行，对文本哨兵等价），并加了一条"准备了替换却一次都没发生就抛错"的兜底。
+   **教训：`scale × 50 → Δloss` 这种一行的干预检查，比任何代码走读都快也都可靠。**
+   没有它，两条臂会各自训练完、得出"记忆没用"的结论，而真实原因是记忆根本没接进去。
+
+17. **`--validate-only` 的指标落在 `manifest/pre_training_validation.json` 的 `metrics` 字段。**
    不在 `logs/metrics.jsonl`（那里只有 3 行 run/checkpoint 记账、没有任何指标键），
    `logs/train.log` 里另有一份人读的摘要。EXP-10 的桥开臂 2026-09-04 就跑完了，
    却一度被当成"还没出数"——因为只翻了 `metrics.jsonl`。
    **`exp09r-exp10-revalidate-runbook.md` 的"读结果"段早就给了现成的读取脚本：
    验证类运行找数字，先读该实验自己的 runbook，再自己去翻日志。**
 
-17. **开发机上有一批指向迁移前路径的僵尸进程，盘点时别误认成自己的活。**
+18. **开发机上有一批指向迁移前路径的僵尸进程，盘点时别误认成自己的活。**
    `/mnt/afs/lixiaoou/intern/fjl` 下的 tensorboard（已存活 65 天）及其 data server、
    以及一个等待早已退出的 pytest 的 `while pgrep …; do sleep 2; done` 循环（31 天），
    都还在进程表里。它们**不占卡、不写本工作区**，但会让 `ps | grep` 看起来"有任务在跑"。
