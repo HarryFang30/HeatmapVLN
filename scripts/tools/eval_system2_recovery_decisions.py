@@ -129,6 +129,40 @@ def summarise(states: list[dict[str, Any]]) -> dict[str, Any]:
             [s for s in non_stop if str(s["source_type"]) == source], "predicted_is_stop"
         )
 
+    # 84.9% of the stop rows carry ``necessary_backtrack`` (5x lift over the
+    # base rate), so a model that learned "this looks like a backtrack state"
+    # would score well on stop_recall without ever judging the goal.  Splitting
+    # the recall on that tag is what tells the two apart; the ledger's wording
+    # constraint depends on this number, so it is computed here rather than by
+    # hand afterwards.
+    def _tagged(rows: list[dict[str, Any]], tag: str, present: bool) -> list[dict[str, Any]]:
+        return [s for s in rows if (tag in (s.get("failure_tags") or [])) is present]
+
+    stop_recall_by_backtrack = {
+        "with_necessary_backtrack": _rate(
+            _tagged(stop_scored, "necessary_backtrack", True), "predicted_is_stop"
+        ),
+        "with_necessary_backtrack_states": len(
+            _tagged(stop_scored, "necessary_backtrack", True)
+        ),
+        "without_necessary_backtrack": _rate(
+            _tagged(stop_scored, "necessary_backtrack", False), "predicted_is_stop"
+        ),
+        "without_necessary_backtrack_states": len(
+            _tagged(stop_scored, "necessary_backtrack", False)
+        ),
+    }
+    # The mirror image: firing STOP on non-stop states that merely look like
+    # backtracks is the same shortcut seen from the false-alarm side.
+    false_alarm_by_backtrack = {
+        "with_necessary_backtrack": _rate(
+            _tagged(non_stop, "necessary_backtrack", True), "predicted_is_stop"
+        ),
+        "without_necessary_backtrack": _rate(
+            _tagged(non_stop, "necessary_backtrack", False), "predicted_is_stop"
+        ),
+    }
+
     return {
         "state_count": len(states),
         "recovery_turn_accuracy": turn_accuracy,
@@ -140,6 +174,8 @@ def summarise(states: list[dict[str, Any]]) -> dict[str, Any]:
         "stop_false_alarm": _rate(non_stop, "predicted_is_stop"),
         "stop_false_alarm_states": len(non_stop),
         "stop_false_alarm_by_source": false_alarm_by_source,
+        "stop_recall_by_backtrack": stop_recall_by_backtrack,
+        "stop_false_alarm_by_backtrack": false_alarm_by_backtrack,
         "by_kind": {
             kind: {
                 "states": len(rows),

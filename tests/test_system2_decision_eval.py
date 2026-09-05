@@ -119,3 +119,41 @@ def test_an_empty_report_carries_none_not_zero() -> None:
     assert report["stop_false_alarm"] is None
     assert report["recovery_turn_accuracy"] is None
     assert report["stop_false_alarm_by_source"] == {}
+
+
+def test_stop_recall_is_split_on_the_backtrack_tag() -> None:
+    # 84.9% of the stop rows carry necessary_backtrack, so a model that learned
+    # the tag rather than the goal would look good overall and bad off-tag.
+    def tagged(kind: str, *, stop: bool, tag: bool) -> dict[str, Any]:
+        row = _state(kind, predicted_stop=stop)
+        row["failure_tags"] = ["necessary_backtrack"] if tag else ["wrong_branch"]
+        return row
+
+    states = [
+        tagged("correct_stop", stop=True, tag=True),
+        tagged("correct_stop", stop=True, tag=True),
+        tagged("correct_stop", stop=False, tag=False),
+        tagged("correct_stop", stop=False, tag=False),
+        tagged("keep_pixel", stop=True, tag=True),
+        tagged("keep_pixel", stop=False, tag=False),
+    ]
+    report = tool.summarise(states)
+    assert report["stop_recall"] == pytest.approx(0.5)
+    split = report["stop_recall_by_backtrack"]
+    assert split["with_necessary_backtrack"] == pytest.approx(1.0)
+    assert split["with_necessary_backtrack_states"] == 2
+    assert split["without_necessary_backtrack"] == pytest.approx(0.0)
+    assert split["without_necessary_backtrack_states"] == 2
+    fa = report["stop_false_alarm_by_backtrack"]
+    assert fa["with_necessary_backtrack"] == pytest.approx(1.0)
+    assert fa["without_necessary_backtrack"] == pytest.approx(0.0)
+
+
+def test_the_backtrack_split_is_none_when_a_side_is_empty() -> None:
+    row = _state("correct_stop", predicted_stop=True)
+    row["failure_tags"] = ["necessary_backtrack"]
+    report = tool.summarise([row])
+    split = report["stop_recall_by_backtrack"]
+    assert split["with_necessary_backtrack"] == pytest.approx(1.0)
+    assert split["without_necessary_backtrack"] is None
+    assert split["without_necessary_backtrack_states"] == 0
