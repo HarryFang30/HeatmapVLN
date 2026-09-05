@@ -158,6 +158,18 @@ InternNav ViT、全程冻结无 LoRA。四种输入配置共享同一种子、�
 
 条目按"性价比 = 结论价值 / 卡时"排序。**开跑前把判据再读一遍，跑完只填结果，不改判据。**
 
+> ⚠️ **未登记的在制品（2026-09-05 发现）.** 工作区里有一套 **EXP-13 的工具已经写好**
+> （`scripts/tools/cache_recovery_decision_features.py`、`scripts/tools/fit_recovery_readout.py`、
+> `tests/test_recovery_readout.py`，以及 `src/models/pipeline.py` 的 21 行改动），
+> 文件时间 02:07–02:09，均为 `git add -N` 未提交状态。
+> 它问的是比"微调未来头"更靠前的一问：**历史记忆 `M_t` 里是否携带 System2 自己的摘要
+> 里没有的决策信息**（臂：`system2` / `system2_memory` / `geometry` / `plan_z0`；
+> 主指标 `hard_macro_accuracy` 与 `recovery_nonfront_recall`；场景不相交，dev 只用于选权重衰减）。
+>
+> **但它还没有台账条目，判据也没写。** 已核对：本地与服务器上**都没有任何产物**，
+> 所以按 §0 第 2 条，**预注册窗口仍然开着**——判据必须在跑出第一个数字之前写死并 commit。
+> 在那之前这套工具不要跑。
+
 ### EXP-03 部署头本身是否也只看位姿
 
 **问题.** EXP-02 的结论是对**探针**成立的。走完 Stage1/Stage2 的**部署权重**是否同样
