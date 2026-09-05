@@ -36,6 +36,7 @@
 | [EXP-09](#exp-09-阶段三配方里哪一项真的在起作用) | 阶段三五处改动里，信赖域 / advantage / 惩罚重校准 / rollout 选点各自有没有可测效应 | ⚠️ | 只有**惩罚重校准**有效应（去掉它 93% token 顶到 ρ 上限）；ρ 本身从不触发、选点指标无差别 |
 | [EXP-10](#exp-10-未来认知头与桥的关联是否可观测) | 注入的历史记忆是否改变未来预测（关联的可观测性）；Z 的第 i 个向量是否真的绑定第 i 段 | 🔬 | 2026-09-04 桥开臂随 EXP-09-R 跑；桥关臂待跑；token 绑定探针待写 |
 | [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | ⚠️ | 历史路点 99.7% 不在前视（后视 82.3%）；未来 92.6% 在前视、侧后 ≈5% |
+| [EXP-12](#exp-12-恢复状态决策层的三个门控诊断) | 把认知的作用点从 System1 的条件挪到 System2 的决策层，值不值得做 | ⏳ | 三个门控诊断（靶子 D1 / 能力 D2 / 上限 D3），2026-09-05 预注册，任一否定即停 |
 
 ---
 
@@ -528,6 +529,92 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
 不说明模型预测得多准（那是 EXP-02/03/04）；② 只在 R2R 专家轨迹上成立：机器人沿指令前进，
 来路自然落在身后，换成往复/搜索类任务分布会变；③ val 划分（26 场景的 MD5 val 侧），
 未跨数据集验证。
+
+---
+
+### EXP-12 恢复状态决策层的三个门控诊断
+
+**问题.** EXP-05/07/09 合起来说明：桥接作用在 System1 的**条件**上，而 System1 只是"朝给定像素目标走四步"
+的局部控制器——真正需要记忆的决策（去哪、要不要回头、停不停）全在 System2 的文本输出里，桥碰不到。
+提出的改法是把认知的作用点挪到**决策层**：历史图判重访 → 未来头出恢复提议 → 覆盖 System2 的像素目标。
+这个改法要动 RPC server、要重训未来头、要重跑两种子闭环，代价以周计。**在投入之前，先花 CPU/单卡量级
+的三个诊断确认三个必要条件**：靶子存在（D1）、现有未来头够得着（D2）、上限够高（D3）。任一不过就停。
+
+**假设.**
+- **H-D1（靶子）**：在 DAgger 判定的 hard 恢复状态里，oracle 的正确去向经常不在前视，
+  且 native System2 的提议方向与 oracle 差得远。
+- **H-D2（能力）**：现有未来认知头**零样本**（不微调）在这些状态上给出的方向，比 System2 的提议更准。
+- **H-D3（上限）**：重访/徘徊型失败在闭环失败里占比足够高，救回其中一部分能换来 ≥2pt SR。
+
+**判据（预注册，2026-09-05 写于任何数字之前）.**
+
+*D1 — 全部在 `dagger_hard` 桶上判，`dagger_normal` 单独报不作判据。*
+指标定义：`oracle_outside_front_frac` = oracle 未来位姿序列中**第一个离开当前位置 ≥0.5 m 的点**，
+在当前相机系下按 HFOV 90° / 384² 四视角唯一投影（`_project_unique_view`，`camera_forward_axis=-z`）
+落在**非 front 视角或四视角都不可见**的比例；`native_oracle_angle_deg` = native 未来终点方向与
+oracle 未来终点方向在当前相机系 xz 平面上的夹角，报中位数与 `frac(>45°)`。
+
+- **支持**：`oracle_outside_front_frac ≥ 0.30` **且** `frac(native_oracle_angle > 45°) ≥ 0.40`。
+  → 存在"oracle 要求转向/回头、而 native 提议指向别处"的状态，决策层有可干预对象。
+- **否定**：`oracle_outside_front_frac < 0.15` **或** `frac(native_oracle_angle > 45°) < 0.20`。
+  → 要么正确去向本来就在前面（四方向未来表征在恢复状态也没用），要么 System2 的提议本来就对
+  （失败在执行层而非决策层）。两种情况都说明决策层没有靶子，**EXP-12 后续全停**。
+- **没测出来**：落在中间区间，或 hard 状态样本 < 2000。
+
+*D2 — 在 D1 的同一批 hard 状态的子采样上。*
+指标：`top1_view_acc` = 预测方向 == oracle 方向（D1 的四视角唯一投影结果；四视角都不可见的样本剔除）
+的比例，预测方向取未来头**第一个时间 bin** 的四视角可见性 logit 的 argmax；同一批上算
+`system2_top1_acc`（native 提议方向经同样投影得到的视角）。
+
+- **支持**：`top1_view_acc − system2_top1_acc ≥ +10pt` **且** `top1_view_acc ≥ 0.50`。
+  → 现有未来头零样本就够用作提议器，决策层可以先不做 DAgger 微调。
+- **否定**：差值 ≤ +2pt **或** `top1_view_acc < 0.35`（四选一随机基线 0.25 + 余量）。
+  → **现有未来头不能零样本当提议器**。这不否定整个设计，但决策层必须先做 DAgger 微调
+  （+1~2 天），是否继续由 D1/D3 决定。
+- **没测出来**：之间。
+
+*D3 — 两个独立估计都要过。*
+`revisit_state_frac` = 被打上 `loop` / `avoidable_revisit` / `oscillation` 任一标签的候选状态占比；
+`episode_gap` = 含此类状态的 episode 失败率 − 不含的 episode 失败率（失败 = 末帧位置到目标 > 3 m）；
+`wandering_fail_frac` = val_unseen 失败集（SR=0）中 `steps ≥ 3 × geodesic / 0.25` 的比例。
+
+- **支持**：`revisit_state_frac ≥ 0.05` **且** `episode_gap ≥ +10pt` **且** `wandering_fail_frac ≥ 0.15`。
+- **否定**：`revisit_state_frac < 0.02` **或** `wandering_fail_frac < 0.05`。
+  → 上限太低（救回四分之一也 < 1pt SR），不值得建决策层。
+- **没测出来**：之间。
+
+*总门（三项合起来才决定是否进入实现）.*
+
+| D1 | D3 | D2 | 决定 |
+|---|---|---|---|
+| 支持 | 支持 | 支持 | 进实现，未来头零样本直接当提议器 |
+| 支持 | 支持 | 否定/没测出来 | 进实现，但先加 DAgger 微调臂（+1~2 天） |
+| 否定 | — | — | **停**，写成"决策层方向不成立"，论文不加这条线 |
+| — | 否定 | — | **停**，写成"上限不足" |
+
+**设置（2026-09-05 确定）.** 三项都在开发机上跑，不走网站提交。GPU 占用顺序 7 → 6 → 5 → 4，不占 0 卡。
+
+- **D1 + D3a**：`scripts/tools/summarize_recovery_state_geometry.py`，读
+  `data/heatmap_system1_dagger_v1/round_000/full_train_4way_seed17` 的 4 个 shard
+  （10804 个 episode tar / ~32k 候选状态；样本记录里直接存了 `native_future_poses`、
+  `current_camera_pose`、`candidate_signals`、`failure_tags`，无需重放动作）。**纯 CPU。**
+- **D3b**：`scripts/tools/summarize_wandering_failures.py`，读四个已完成评测的
+  `merged/progress.jsonl` + `val_unseen.json.gz` 的 `info.geodesic_distance`。**纯 CPU。**
+  （评测 worker 只留了 `progress.json`/`result.json`，**没有逐步位置轨迹**——`TrajectoryStepRecorder`
+  只在 DAgger 采集路径里启用——所以 val_unseen 侧只能做超额步数代理，这是 D3 拆成两个估计的原因。）
+- **D2**：`scripts/tools/probe_future_head_recovery.py`，部署 checkpoint（v2 `best.pth`）
+  + DAgger hard 状态子采样（目标 4000，按 episode key 哈希分 4 片），**GPU 7/6/5/4 各一片**。
+
+**边界（预先声明）.**
+① DAgger 采集跑在 **R2R train 场景**、用 **native 策略**——D1/D3a 描述的是"native 策略在 train 场景
+遇到的恢复状态"，向 val_unseen 和当前方法的外推**未经验证**。
+② D3b 的"徘徊"是**超额步数代理**，不是重访的测量；它是重访型失败的**上界**，不能反过来当重访率读。
+③ D2 用 DAgger tar 里存的 **Habitat 真值位姿**，不是部署时的 AMB3R VO；已知位姿域偏移会把 pck8
+从 0.88 压到 0.66，所以 D2 的正面结果是**上界**。
+④ D2 测的是**零样本**能力，否定不代表微调后也不行（这正是"总门"第二行的存在理由）。
+⑤ 三个诊断**都不测闭环 SR**——它们只决定"值不值得做"，任何一条都不能作为 SR 主张的证据。
+
+🔁 [exp12-recovery-decision-gate-runbook.md](exp12-recovery-decision-gate-runbook.md)
 
 ---
 
