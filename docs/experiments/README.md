@@ -28,12 +28,12 @@
 | [EXP-01](#exp-01-把闭环-sr-拉回-native-水平) | 桥接上线后闭环 SR 从 62.5% 掉到 18.1%，能不能在不改架构、不做部署端衰减的前提下拉回来 | ✅ | 能。SR 62.81% vs native 62.48%，桥生效率 99.6% |
 | [EXP-02](#exp-02-历史认知头是不是在用视觉定位历史) | 历史认知头到底是"从视觉定位历史"，还是"把位姿投影出来" | ❌ | 是投影。定位完全由位姿决定，外观只贡献可见性（AUPRC +4~6 点） |
 | [EXP-03](#exp-03-部署头本身是否也只看位姿) | 部署权重（而非探针）是否也只看位姿 | ⏳ | 工具与输入已就绪（2026-09-04），等开发机 GPU |
-| [EXP-04](#exp-04-位姿有噪声时外观是否变重要) | 位姿换成 AMB3R VO（有噪声）后，外观是否变重要 | ⏳ | — |
-| [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | 🔬 | 2026-09-03 提交，全量 1839 集 |
+| [EXP-04](#exp-04-位姿有噪声时外观是否变重要) | 位姿换成 AMB3R VO（有噪声）后，外观是否变重要 | ❌ | 判据要求两种子 full−pose-only 都 > 3pt，实测 +10.1 / +0.3pt，种子间不稳定 |
+| [EXP-05](#exp-05-信赖域重训到底值多少-sr) | 信赖域重训本身值多少 SR（把 v1 桥放到修复后的评测栈上） | ❌ | 无约束桥在修复栈上 61.61%（vs v2 62.81%，CI 含 0）——18.1% 几乎全是评测栈 |
 | [EXP-06](#exp-06-零桥在修复栈上是否等于-native) | 修复后的评测栈跑零桥，是否精确等于 native | ⏳ | 2026-09-03 消融规划暂缓（见条目） |
-| [EXP-07](#exp-07-主表第二个种子parity--ne-是否可复现长路径增益是否存在) | 主表 parity + NE 改善在第二个种子上是否复现；长路径（≥10 m）增益是否存在 | 🔬 | 2026-09-03 提交桥臂（种子 1337），native 臂待提 |
-| [EXP-08](#exp-08-阶段二联合训练买到了什么) | 阶段二（认知头与动作联合训练）对最终桥的行为有没有可测影响 | 🔬 | 2026-09-03 提交（链式任务第 4 臂） |
-| [EXP-09](#exp-09-阶段三配方里哪一项真的在起作用) | 阶段三五处改动里，信赖域 / advantage / 惩罚重校准 / rollout 选点各自有没有可测效应 | 🔬 | 2026-09-03 提交 A/B/C（链式任务前 3 臂）；D 免费；参照重验待跑 |
+| [EXP-07](#exp-07-主表第二个种子parity--ne-是否可复现长路径增益是否存在) | 主表 parity + NE 改善在第二个种子上是否复现；长路径（≥10 m）增益是否存在 | ⚠️ | H1 支持但擦边（SR −0.33 [−1.50, +0.79]，NE −0.11 [−0.21, −0.01]）；**H2 否定，长路径主张删除** |
+| [EXP-08](#exp-08-阶段二联合训练买到了什么) | 阶段二（认知头与动作联合训练）对最终桥的行为有没有可测影响 | ❌ | 对桥无可测影响（四项判据全在容差内）；反而把未来头 Soft-IoU 从 0.387 压到 0.239 |
+| [EXP-09](#exp-09-阶段三配方里哪一项真的在起作用) | 阶段三五处改动里，信赖域 / advantage / 惩罚重校准 / rollout 选点各自有没有可测效应 | ⚠️ | 只有**惩罚重校准**有效应（去掉它 93% token 顶到 ρ 上限）；ρ 本身从不触发、选点指标无差别 |
 | [EXP-10](#exp-10-未来认知头与桥的关联是否可观测) | 注入的历史记忆是否改变未来预测（关联的可观测性）；Z 的第 i 个向量是否真的绑定第 i 段 | 🔬 | 2026-09-04 桥开臂随 EXP-09-R 跑；桥关臂待跑；token 绑定探针待写 |
 | [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | ⚠️ | 历史路点 99.7% 不在前视（后视 82.3%）；未来 92.6% 在前视、侧后 ≈5% |
 
@@ -188,6 +188,20 @@ summarizer 新增两项检查，拒绝把真值域与 VO 域混进同一张表�
 边界同样写在提交物里。
 提交物：[exp04-vo-pose-probe-submission.md](exp04-vo-pose-probe-submission.md)。
 
+**结果.** ❌ 假设被否定：`full − pose-only` 的 pck8 差距为 **+10.1pt（种子 42）/ +0.3pt（种子 1337）**，
+不满足"两种子都 > 3pt"，与 EXP-02 在 GT 位姿下的 +6.8 / +0.1pt 一样种子间不稳定。
+**"位姿不可靠时外观承担纠错"这句不能写进论文。**
+
+描述性观察（无预注册判据，只能作现象记录）：VO 域下 full 的 pck8 只有 0.66（GT 域 0.88），
+pose-only 从 0.848 掉到 0.564 / 0.647，涂黑图像让**可见性 F1 塌到 0.000 / 0.373**（GT 域是 0.56 / 0.60），
+vision-only 首次稳定高于地板（+1.5 / +2.5pt）；而 history-shuffle 仍无影响、pose-conflict 仍塌到地板且
+目标同步滚完全恢复——**定位仍由位姿驱动**，与 EXP-02 一致。
+
+**边界（补充）.** 语料仍是 random-walk（只换位姿来源这一个变量，故可与 EXP-02 直接对照）；
+仍是从零 head-only 探针而非部署权重（那是 EXP-03）；上述描述性观察不能作为论文主张。
+
+📄 [exp04-vo-pose-probe-report.md](exp04-vo-pose-probe-report.md)
+
 ---
 
 ### EXP-05 信赖域重训到底值多少 SR
@@ -232,6 +246,20 @@ summarizer 新增两项检查，拒绝把真值域与 VO 域混进同一张表�
 `PPA_EVAL_ARM` → `ppa_refine_v1_unconstrained_online_amb3r`。全量 1839 集，不用子集。
 **代价：8 卡 × 约 18 小时**（EXP-01 终局实测 07:54 → 次日 01:55）。
 提交物：[exp05-v1-bridge-fixed-stack-submission.md](exp05-v1-bridge-fixed-stack-submission.md)。
+
+**结果.** ❌ 假设被否定。修复栈、全量 1839 集、种子 42：无约束桥 **SR 61.61%**（SPL 54.70 / OS 71.62 / NE 3.97 m）
+vs v2 62.81% vs native 62.48%。配对 bootstrap：v1 − v2 **SR −1.20 [−3.21, +0.76]**（落在 62.8 ± 1.5pt 内）；
+v1 − native SR −0.87 [−2.94, +1.09]。
+
+**结论.** 按预注册的后果条款执行：**信赖域的卖点改写成"可控性与防御性设计"，不得声称它挽回了 SR。**
+这条同时改写了 EXP-01 的归因——同一个漂移桥只换评测栈是 18.11% → 61.61%（**+43.5pt**），
+而在修复栈上换桥只有 +1.20pt 且 CI 含 0：**62.5% → 18.1% 的崩塌几乎全部来自评测协议缺陷**，
+桥漂移的代价上限约 3pt（CI 上界）。
+
+**边界.** 单种子；只对这一个 v1 checkpoint 成立（其桥 out_proj 权重 RMS 是 v2 的 5 倍）；
+v1↔v2 差的不止信赖域一项（逐项拆分见 EXP-09）；只在 R2R val-unseen 上成立。
+
+📄 [exp05-v1-bridge-fixed-stack-report.md](exp05-v1-bridge-fixed-stack-report.md)
 
 ---
 
@@ -299,6 +327,21 @@ checkpoint/config 与 EXP-01 终局相同，输出根
 逐种子 + 合并。**代价：8 卡 × 约 18 小时 × 2 臂。**
 提交物：[exp07-seed1337-submission.md](exp07-seed1337-submission.md)。
 
+**结果.** 种子 1337 全量：桥臂 61.17% / native 62.15%（种子 42 是 62.81% / 62.48%）——**方向翻转**。
+3678 个配对差合并（20000 次重采样）：SR **−0.33 [−1.50, +0.79]**、SPL −0.56 [−1.47, +0.39]、
+OS +0.54 [−0.33, +1.41]、NE **−0.11 [−0.21, −0.01]**；合并 ≥10 m 分层 SR +0.37 [−1.65, +2.56]。
+
+**结论.** H1 ✅ 支持但**擦边**：三条件全部满足，但 SR 下界 −1.4954 只比判据线 −1.5 高 **0.005pt**
+（换 6 个 bootstrap 种子、20000 次重采样稳定复现，不是抖动）。主表可写"SR/SPL 与 native 持平、
+NE 显著改善 −0.11 m"，**不得写"SR 优于 native"**。
+H2 ❌ 否定：种子 1337 的 ≥10 m 分层 SR 为 −0.92pt（方向翻转），按预注册**长路径主张整体删除、不换阈值重试**；
+intro 的"提升成功率与路径效率"改为"在不损失 SR/SPL 的前提下降低导航终点误差"。
+
+**边界.** 两个协议种子只改采样噪声、不改 System2 贪心解码；NE 的 −0.11 m 虽显著但只占 native 的 2.6%、
+CI 上界仅 −0.007 m；仅 R2R val-unseen 11 场景；两臂用不同栈实现（已逐 token 对齐但不是同一份代码）。
+
+📄 [exp07-seed1337-report.md](exp07-seed1337-report.md)
+
 ---
 
 ### EXP-08 阶段二（联合训练）买到了什么
@@ -327,6 +370,18 @@ checkpoint/config 与 EXP-01 终局相同，输出根
 （79 热力图 + 11 未来头，桥 0 张量；loader 只取头，桥从零起）。v2 数据、3 epoch、
 按 512 对 rollout 终点误差选点。**代价：8 卡 × 约 5–6 h**（链式任务第 4 臂）。
 提交物：[exp08-exp09-stage3-ablation-submission.md](exp08-exp09-stage3-ablation-submission.md)。
+
+**结果.** ❌ 假设被否定，四项判据全部落在容差内：rollout 终点误差 1.2788 vs v2@512 的 1.2746（+0.0042 ≤ 0.01）、
+动作一致率 0.779 vs 0.766（+1.4pt，在 ±2pt 内）、历史 PCK@8 −0.14pt、未来 top-k 支持召回 −0.33pt（均 ≤ 1pt）。
+
+**结论.** 阶段二对最终桥**没有可测影响**：方法节里"动作监督的梯度必须流入认知分支，认知才能学到
+对决策有用的内容"一句删除，训练故事简化为"阶段一 → 阶段三"。**未被判据覆盖但更重要的发现**：
+未来头 Soft-IoU 在阶段一父权重下是 **0.3873**，阶段二父权重下只有 **0.2394**（−14.8pt，两臂的头都冻结，
+差别就是阶段二留下的）——阶段二不但没给桥买到东西，还把未来热力图质量压低了近 15 个点。
+
+**边界.** 单训练种子；结论建立在开环 512 对 rollout 上，不是闭环 SR。
+
+📄 [exp08-exp09-stage3-ablation-report.md](exp08-exp09-stage3-ablation-report.md)
 
 ---
 
@@ -374,6 +429,29 @@ epoch、选点与 v2 相同；`val_rollout_batches: 64`（512 对）。链式启
 `manifest/pre_training_validation.json`）。**代价：8 卡 × 约 5–6 h × 3 臂 +
 重验约 1 h。** 单训练种子起步，边缘结论再补种子（2026-09-03 规划决定）。
 提交物：[exp08-exp09-stage3-ablation-submission.md](exp08-exp09-stage3-ablation-submission.md)。
+
+**结果（各臂 best epoch，512 对 rollout；参照为 v2 的 512 对重验）.**
+
+| 臂 | rollout | 与同批 native 的差 | 一致率 | Δ 相对幅度 | 贴边比例 | 判定 |
+|---|---|---|---|---|---|---|
+| v2 参照 | 1.2746 | −0.0142 | 0.766 | 0.0196 | 0.004 | — |
+| A 去 ρ | 1.2744 | −0.0134 | 0.775 | 0.0191 | **0.000** | ❌ 否定 |
+| B 去 advantage | 1.2784 | −0.0094 | **0.871** | 0.0157 | 0.002 | ⚠️ 没测出来 |
+| C 惩罚退回 v1 | **1.2594** | −0.0284 | **0.432** | **0.0494** | **0.928** | ✅ 支持 |
+| D 选点改 MSE（epoch 4 ckpt） | 1.2743 | — | 0.731 | — | — | ❌ 否定 |
+
+**结论.** 五项里只有**惩罚重校准**被证实有效应：退回 v1 软惩罚后 92.8% 的 token 顶到 ρ 上限、Δ 逼近 0.05、
+一致率塌到 0.43。ρ 本身在 v2 配方下**从不触发**（v2 自己贴边 0.4%，去掉 ρ 后 Δ 仍只有 1.9%），
+只能写成**防御性截断**而非必要机制——它与惩罚重校准是配套的，不是两道独立保险；
+advantage 加权不改善终点误差、只把一致率从 0.87 拉到 0.77（落在判据夹缝，要写需补种子）；
+选点指标 1.2746 vs 1.2743（差 0.0003 ≤ 0.005）**降级为流程说明**。
+一个必须一并写出的反直觉现象：C 臂开环终点误差最好却离 native 最远，说明**开环终点误差不能单独用来选配方**
+——它奖励更激进的干预，而闭环并不买账（EXP-05：v1 的全套激进配方闭环只有 61.61%）。
+
+**边界.** 单训练种子；全部为开环结论，开环与闭环排序不一致；各臂 native 基线在 1.2878–1.2922 之间，
+比较一律用同批 native 的差；只在 v2 数据的 val 划分上成立。
+
+📄 [exp08-exp09-stage3-ablation-report.md](exp08-exp09-stage3-ablation-report.md)
 
 ---
 
@@ -465,6 +543,9 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
 | native System1 闭环 SR（R2R val-unseen 全量 1839） | 62.48% / SPL 55.23% / OS 70.58% / NE 4.15 m | `model/eval_internnav_native_r2r_val_unseen_4gpu_rpcv2_x11bundle_v4/merged/` |
 | 当前方法闭环 SR | 62.81% / SPL 55.04% / OS 71.72% / NE 3.98 m | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/merged/result.json` |
 | v1（病灶对照） | 18.11% / SPL 15.62% | `model/eval_ppa_action_refine_online_amb3r_r2r_val_unseen_8gpu/merged/` |
+| v1 无约束桥 · **修复栈** 种子 42 | 61.61% / SPL 54.70% / OS 71.62% / NE 3.97 m | `model/eval_ppa_refine_v1_unconstrained_nativefix_r2r_val_unseen_8gpu/merged/result.json` |
+| 当前方法 种子 1337 | 61.17% / SPL 54.10% / OS 70.85% / NE 4.02 m | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu_seed1337/merged/result.json` |
+| native 种子 1337 | 62.15% / SPL 55.02% / OS 70.91% / NE 4.08 m | `model/eval_internnav_native_r2r_val_unseen_8gpu_rpcv2_x11bundle_v4_seed1337/merged/result.json` |
 
 ### 金参照与产物
 
@@ -483,6 +564,14 @@ H2 需要一个探针工具（`chain.decode_future` 外包一层，捕获 `plan_
 | EXP-03 部署头（head-only 格式） | `model/exp03_deployment_head/head_v2_best.pth` |
 | 位姿域偏移代价（真值训练→VO 评测） | `model/output_heatmap_amb3r_pose_adapt_endpoint_v2_4gpu/runs/run_20260814_234429/logs/metrics.jsonl` 的 `pre_training_validation` |
 | 种子 42 配对 bootstrap（终局 vs native，含 ≥10 m 分层） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_seed42.json`（`scripts/tools/paired_closed_loop_bootstrap.py`） |
+| 合并两种子配对 bootstrap（主表判据来源，20000 次重采样） | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu/analysis/paired_vs_native_pooled_seeds42_1337.json` |
+| 桥臂 种子 1337 评测 | `model/eval_ppa_refine_v2_nativefix_r2r_val_unseen_8gpu_seed1337/merged/` |
+| native 种子 1337 评测 | `model/eval_internnav_native_r2r_val_unseen_8gpu_rpcv2_x11bundle_v4_seed1337/merged/` |
+| v1 无约束桥 · 修复栈评测（EXP-05） | `model/eval_ppa_refine_v1_unconstrained_nativefix_r2r_val_unseen_8gpu/merged/` + `analysis/` |
+| 阶段三消融四臂（EXP-08/09） | `model/ablation_stage3/{exp09a,exp09b,exp09c,exp08}/run_*/` |
+| v2 参照 512 对重验（EXP-09-R） | `model/exp09r_revalidate_512/{best,epoch_004}/run_*/manifest/pre_training_validation.json` |
+| VO 位姿域捷径探针（EXP-04） | `model/heatmap_shortcut_probe_vo_v1/seed_{42,1337}/` |
+| 四方向标签覆盖率（EXP-11） | `model/exp11_direction_coverage/coverage_val_full.json` |
 
 ### 数据集
 

@@ -87,8 +87,8 @@ def fmt(entry: dict, metric: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--treatment", type=Path, required=True, help="merged/progress.jsonl of the treatment arm")
-    parser.add_argument("--control", type=Path, required=True, help="merged/progress.jsonl of the control arm")
+    parser.add_argument("--treatment", type=Path, required=True, action="append", help="merged/progress.jsonl of the treatment arm; repeat to pool several matched pairs (e.g. two protocol seeds)")
+    parser.add_argument("--control", type=Path, required=True, action="append", help="merged/progress.jsonl of the control arm; repeat once per --treatment, in the same order")
     parser.add_argument("--dataset", type=Path, default=None, help="val_unseen.json.gz for geodesic strata")
     parser.add_argument("--geodesic-min", type=float, action="append", default=[], help="pre-declared stratum: geodesic distance >= this many metres")
     parser.add_argument("--bootstrap-draws", type=int, default=2000)
@@ -97,20 +97,36 @@ def main() -> None:
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
 
-    treatment = load_progress(args.treatment)
-    control = load_progress(args.control)
-    ids = sorted(set(treatment) & set(control), key=int)
-    if not ids:
-        raise SystemExit("no paired episodes")
-    missing = (set(treatment) | set(control)) - set(ids)
+    if len(args.treatment) != len(args.control):
+        raise SystemExit("--treatment and --control must be repeated the same number of times")
+    # Pooling several pairs keeps every episode's own control: each pair is
+    # matched on its own, then the per-episode differences are pooled, so a
+    # bootstrap over the pool resamples matched differences, never raw scores.
+    treatment: dict[str, dict] = {}
+    control: dict[str, dict] = {}
+    ids: list[str] = []
+    missing_total = 0
+    for index, (t_path, c_path) in enumerate(zip(args.treatment, args.control, strict=True)):
+        t_rows = load_progress(t_path)
+        c_rows = load_progress(c_path)
+        pair_ids = sorted(set(t_rows) & set(c_rows), key=int)
+        if not pair_ids:
+            raise SystemExit(f"no paired episodes between {t_path} and {c_path}")
+        missing_total += len((set(t_rows) | set(c_rows)) - set(pair_ids))
+        for episode in pair_ids:
+            key = f"{index}:{episode}"
+            treatment[key] = t_rows[episode]
+            control[key] = c_rows[episode]
+            ids.append(key)
     rng = random.Random(args.bootstrap_seed)
 
     report = {
         "label": args.label,
-        "treatment": str(args.treatment),
-        "control": str(args.control),
+        "treatment": [str(path) for path in args.treatment],
+        "control": [str(path) for path in args.control],
+        "pairs_pooled": len(args.treatment),
         "paired_episodes": len(ids),
-        "unpaired_episodes": len(missing),
+        "unpaired_episodes": missing_total,
         "bootstrap_draws": args.bootstrap_draws,
         "bootstrap_seed": args.bootstrap_seed,
         "strata": {"all": compare(treatment, control, ids, rng, args.bootstrap_draws)},
@@ -120,7 +136,7 @@ def main() -> None:
             raise SystemExit("--geodesic-min requires --dataset")
         geodesic = load_geodesic(args.dataset)
         for threshold in args.geodesic_min:
-            subset = [i for i in ids if geodesic[i] >= threshold]
+            subset = [i for i in ids if geodesic[i.split(":", 1)[1]] >= threshold]
             report["strata"][f"geodesic_ge_{threshold:g}m"] = compare(
                 treatment, control, subset, rng, args.bootstrap_draws
             )
@@ -130,7 +146,7 @@ def main() -> None:
     only_c = sum(1 for i in ids if control[i]["success"] and not treatment[i]["success"])
     report["success_overlap"] = {"both": both, "treatment_only": only_t, "control_only": only_c}
 
-    print(f"# {args.label}: {len(ids)} paired episodes ({len(missing)} unpaired dropped)")
+    print(f"# {args.label}: {len(ids)} paired episodes from {len(args.treatment)} pair(s) ({missing_total} unpaired dropped)")
     print("| stratum | n | SR | SPL | OS | NE |")
     print("|---|---|---|---|---|---|")
     for name, entry in report["strata"].items():
