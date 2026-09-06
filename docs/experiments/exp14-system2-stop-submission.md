@@ -36,6 +36,32 @@ bash scripts/run_exp13_system2_memory_8gpu_mxc500.sh
 启动脚本与 13-B 是同一个（变量名也沿用 `EXP13_*`），只是 `EXP13_ARMS` 与
 `EXP13_TRAIN_ROOT` 不同。13-A 否定时把 `EXP13_ARMS` 改成 `"exp14b"`。
 
+### 4 卡版本（2026-09-06 加）
+
+同一个脚本按 `CUDA_VISIBLE_DEVICES` 的张数选配置：4 张就用 `configs/ablation/exp14{a,b}_*_4gpu.yaml`。
+两份 4 卡配置与 8 卡的差别**只有两行**（`tests/test_exp14_configs.py` 钉死）：`gpu.devices` 四张、
+`optim.grad_accum_steps` 2 → 4。采样器把每个优化步的 16 个样本分给 4 个 rank 而不是 8 个，
+样本集合、优化步数、cosine 调度、EMA 预热都与 8 卡相同，只有 `val_lm_loss` 的分片略有不同。
+代价约 **4 卡 × 7 h × 2 臂 ≈ 14 h**。
+
+```bash
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+
+R=/mnt/afs/liwenhao/agent/370910109
+export EXP13_FJL_ROOT=$R
+export EXP13_TRAIN_ROOT=$R/model/exp14_system2_memory_stop
+export EXP13_DAGGER_ROOT=$R/data/heatmap_system1_dagger_v1/round_000/full_train_4way_seed17
+export EXP13_ORACLE_VIEWS=$R/model/exp12_recovery_gate/d1_per_state.jsonl
+export EXP13_PARENT_CHECKPOINT=$R/model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth
+export EXP13_ARMS="exp14a exp14b"
+export EXP13_EPOCHS=2
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+bash scripts/run_exp13_system2_memory_8gpu_mxc500.sh
+```
+
+日志第一行应是 `[exp13-train] world size: 4`，train.log 里 `world_size=4`；其余确认项同上。
+
 ---
 
 ## 两臂差在哪里

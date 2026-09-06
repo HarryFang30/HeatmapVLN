@@ -15,6 +15,11 @@
 # arms, trained on data that also carries the stop relabelling
 # (data.dagger_system2_sft.stop_supervision=true).  Ledger: EXP-14.
 #
+# GPU count follows CUDA_VISIBLE_DEVICES and must be 4 or 8; the matching
+# configs/ablation/<arm>_..._{4,8}gpu.yaml is selected.  The 4-GPU configs
+# double grad_accum_steps so every optimizer step still consumes the same
+# 16-sample window (2026-09-06).  Only the EXP-14 arms have 4-GPU configs.
+#
 # A failed arm is reported and the chain continues, so one bad arm does not
 # cost the other one's GPU hours.
 #
@@ -53,12 +58,17 @@ export MPLCONFIGDIR="$RUNTIME_ROOT/matplotlib"
 export TRITON_CACHE_DIR="$RUNTIME_ROOT/triton"
 
 die() { printf '[exp13-train] ERROR: %s\n' "$*" >&2; exit 2; }
+
+IFS=',' read -r -a gpus <<< "$CUDA_VISIBLE_DEVICES"
+NPROC="${#gpus[@]}"
+[[ "$NPROC" -eq 8 || "$NPROC" -eq 4 ]] || die "4 or 8 GPUs are required (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
+
 arm_config() {
   case "$1" in
-    exp13a) echo "$REPO/configs/ablation/exp13a_system2_memory_lora_8gpu.yaml" ;;
-    exp13b) echo "$REPO/configs/ablation/exp13b_system2_constant_lora_8gpu.yaml" ;;
-    exp14a) echo "$REPO/configs/ablation/exp14a_system2_memory_stop_lora_8gpu.yaml" ;;
-    exp14b) echo "$REPO/configs/ablation/exp14b_system2_constant_stop_lora_8gpu.yaml" ;;
+    exp13a) echo "$REPO/configs/ablation/exp13a_system2_memory_lora_${NPROC}gpu.yaml" ;;
+    exp13b) echo "$REPO/configs/ablation/exp13b_system2_constant_lora_${NPROC}gpu.yaml" ;;
+    exp14a) echo "$REPO/configs/ablation/exp14a_system2_memory_stop_lora_${NPROC}gpu.yaml" ;;
+    exp14b) echo "$REPO/configs/ablation/exp14b_system2_constant_stop_lora_${NPROC}gpu.yaml" ;;
     *) return 1 ;;
   esac
 }
@@ -96,8 +106,12 @@ PY
 export DAGGER_POLICY_FINGERPRINT="$fingerprints"
 echo "[exp13-train] policy fingerprint: $DAGGER_POLICY_FINGERPRINT"
 
-IFS=',' read -r -a gpus <<< "$CUDA_VISIBLE_DEVICES"
-[[ "${#gpus[@]}" -eq 8 ]] || die "exactly 8 GPUs are required (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
+echo "[exp13-train] world size: $NPROC (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
+for arm in $ARMS; do echo "[exp13-train] $arm -> $(arm_config "$arm")"; done
+if [[ "${EXP13_DRY_RUN:-0}" == "1" ]]; then
+  echo "[exp13-train] EXP13_DRY_RUN=1: preflight passed, not launching"
+  exit 0
+fi
 
 cd "$REPO" || die "cannot cd to $REPO"
 mkdir -p "$ROOT"
@@ -111,7 +125,7 @@ for arm in $ARMS; do
   mkdir -p "$EXP13_OUTPUT_ROOT"
   echo "[exp13-train] ===== $arm config=$cfg out=$EXP13_OUTPUT_ROOT $(date -u +%FT%TZ)"
   if "$PYTHON" -m torch.distributed.run \
-      --nproc_per_node=8 --master_addr=127.0.0.1 --master_port="$port" \
+      --nproc_per_node="$NPROC" --master_addr=127.0.0.1 --master_port="$port" \
       scripts/train.py --config "$cfg" --load-weights "$PARENT" \
       --distributed --epochs "$EPOCHS" --num-workers 2 --pin-memory --prefetch-factor 2; then
     summary+=("$arm: OK")
