@@ -109,8 +109,10 @@ from scripts.training import (
     build_model,
     build_optimizer,
     build_scheduler,
+    check_pinned_source_fingerprint,
     cleanup_distributed,
     collate_fn,
+    compute_source_fingerprint,
     extract_lora_checkpoint_state,
     init_distributed_context,
     initialize_trainable_module_sync,
@@ -434,6 +436,9 @@ def main():
         _write_yaml(manifest_dir / "config.yaml", cfg)
         _write_json(manifest_dir / "args.json", vars(args))
         _write_json(manifest_dir / "git.json", _capture_git_state(project_root))
+        source_fingerprint = compute_source_fingerprint(project_root)
+        _write_json(manifest_dir / "source_fingerprint.json", source_fingerprint)
+        check_pinned_source_fingerprint(source_fingerprint["fingerprint"])
         _write_json(
             manifest_dir / "env.json",
             _capture_env_state(args=args, run_dir=run_dir, cfg=cfg, is_resuming=is_resuming),

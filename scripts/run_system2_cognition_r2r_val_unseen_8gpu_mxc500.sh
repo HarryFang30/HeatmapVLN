@@ -20,7 +20,9 @@ QWEN_PYTHON="${COG_EVAL_QWEN_PYTHON:-$FJL_ROOT/envs/qwen25/bin/python}"
 VLNCE_PYTHON="${COG_EVAL_VLNCE_PYTHON:-$FJL_ROOT/envs/vlnce/bin/python}"
 
 PPA_CHECKPOINT="${COG_EVAL_CHECKPOINT:?set COG_EVAL_CHECKPOINT to the trained best.pth of the arm}"
-PPA_CONFIG="${COG_EVAL_CONFIG:-$REPO/configs/ablation/exp17b_c3_geometry_prefix_stop_lora_8gpu.yaml}"
+# The *deployment* config: the training arm config keeps action_head.enable=false
+# and would start a server with no System1 to execute the pixel goals.
+PPA_CONFIG="${COG_EVAL_CONFIG:-$REPO/configs/exp17b_system2_cognition_eval_8gpu.yaml}"
 # Only used to expand $PPA_DATA_ROOT/$PPA_AMB3R_CACHE_ROOT placeholders when
 # the train config is loaded; the eval itself never reads training data.  The
 # original v1 dataset and cache were deleted — default to their v2 successors.
@@ -293,6 +295,17 @@ PY
   echo "[cog-eval] rank=$rank model=$model_addr vo=$vo_addr ready"
 done
 
+# The evaluation reads this shared checkout live for many hours; an edit landing
+# mid-run would change the servers restarted afterwards.  Record the tree now and
+# check it again before the merge (ledger §5, lesson 27).
+SOURCE_FINGERPRINT="$("$QWEN_PYTHON" "$REPO/scripts/tools/source_fingerprint.py" "$REPO")" \
+  || die "cannot fingerprint the source tree"
+printf '%s\n' "$SOURCE_FINGERPRINT" > "$RUNTIME_DIR/source_fingerprint.txt"
+echo "[cog-eval] source fingerprint: $SOURCE_FINGERPRINT"
+if git_status="$(git -c safe.directory="$REPO" -C "$REPO" status --short --untracked-files=no 2>/dev/null)"; then
+  [[ -z "$git_status" ]] || die "refusing to evaluate an unversioned tree: $REPO has uncommitted changes"
+fi
+
 echo "[cog-eval] starting $EXPECTED_EPISODES val-unseen episodes across 8 shards (protocol seed $PROTOCOL_SEED, arm $EVAL_ARM)"
 for rank in $(seq 0 7); do
   gpu="${GPUS[$rank]}"
@@ -347,6 +360,10 @@ while ((${#remaining[@]})); do
   remaining=("${next[@]}")
   echo "[cog-eval] client pid=$finished complete; remaining=${#remaining[@]}"
 done
+
+fingerprint_now="$("$QWEN_PYTHON" "$REPO/scripts/tools/source_fingerprint.py" "$REPO")" || fingerprint_now="unavailable"
+[[ "$fingerprint_now" == "$SOURCE_FINGERPRINT" ]] \
+  || die "the source tree changed during the run ($SOURCE_FINGERPRINT -> $fingerprint_now); the shards are not one arm"
 
 "$QWEN_PYTHON" "$MERGE_TOOL" \
   --dataset "$DATASET" --cohorts-dir "$COHORTS_DIR" \

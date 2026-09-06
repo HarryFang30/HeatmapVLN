@@ -76,7 +76,10 @@ def _clear_directory(path: Path) -> None:
 def _run_git_command(project_dir: Path, args: list[str], timeout_s: float = 5.0) -> str:
     try:
         result = subprocess.run(
-            ["git", *args],
+            # The shared checkout is owned by another uid, so without
+            # ``safe.directory`` git refuses every command and the manifest
+            # silently records "no git" instead of the commit (2026-09-06).
+            ["git", "-c", f"safe.directory={project_dir}", *args],
             cwd=project_dir,
             check=True,
             capture_output=True,

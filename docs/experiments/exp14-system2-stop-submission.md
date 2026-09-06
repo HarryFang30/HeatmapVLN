@@ -95,6 +95,34 @@ bash scripts/run_exp13_system2_memory_8gpu_mxc500.sh
 
 ---
 
+## 重跑（2026-09-06；第一次提交两臂都作废）
+
+第一次 4 卡提交里 `exp14a` 死于半同步的检出、`exp14b` 训的代码不对应任何 commit（台账 EXP-14「运行记录」
+与 §5 第 27 条）。**判据一字不动**，两臂在同一个 commit 上重跑一次。8 卡约 3–4 h × 2：
+
+```bash
+cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
+
+R=/mnt/afs/liwenhao/agent/370910109
+export EXP13_FJL_ROOT=$R
+export EXP13_TRAIN_ROOT=$R/model/exp14_system2_memory_stop
+export EXP13_DAGGER_ROOT=$R/data/heatmap_system1_dagger_v1/round_000/full_train_4way_seed17
+export EXP13_ORACLE_VIEWS=$R/model/exp12_recovery_gate/d1_per_state.jsonl
+export EXP13_PARENT_CHECKPOINT=$R/model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth
+export R2R_TRAIN_JSON=$R/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz
+export EXP13_ARMS="exp14a exp14b"
+export EXP13_EPOCHS=2
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+bash scripts/run_exp13_system2_memory_8gpu_mxc500.sh
+```
+
+`R2R_TRAIN_JSON` 在本实验里用不到（`cognition_prefix: false`），但启动脚本要它存在。
+新的 run 目录会多出 `manifest/source_fingerprint.json`；**两臂的指纹必须逐字相同**，
+日志开头也会打印 `[exp13-train] source fingerprint:` 与 `commit: <短哈希> (clean)`。
+检出有未提交改动时脚本直接退出，不会再出现"半同步的树"。
+旧的 `run_20260906_09*` 保留作参照，不作判据来源。
+
 ## 起步很慢是正常的
 
 同 13-B：sealed 账本要过一遍（约 15 分钟），之后才载 7B 模型；第一行训练日志约 20 分钟后出现。

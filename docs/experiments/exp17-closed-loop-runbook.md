@@ -28,7 +28,7 @@ cd /mnt/afs/liwenhao/agent/370910109/HeatmapVLN
 
 R=/mnt/afs/liwenhao/agent/370910109
 export COG_EVAL_CHECKPOINT=$R/model/exp17_cognition_prefix/exp17b/run_XXXXXXXX_XXXXXX/checkpoints/best.pth   # 填实际 run
-export COG_EVAL_CONFIG=$R/HeatmapVLN/configs/ablation/exp17b_c3_geometry_prefix_stop_lora_8gpu.yaml
+export COG_EVAL_CONFIG=$R/HeatmapVLN/configs/exp17b_system2_cognition_eval_8gpu.yaml   # 部署配置，不是训练臂配置
 export COG_EVAL_OUTPUT_ROOT=$R/model/eval_system2_cognition_exp17b_canary600_r2r_val_unseen_8gpu
 export COG_EVAL_ARM=system2_cognition_exp17b_canary600
 export COG_EVAL_MAX_EPISODES_PER_SHARD=75
@@ -39,8 +39,14 @@ bash scripts/run_system2_cognition_r2r_val_unseen_8gpu_mxc500.sh
 ```
 
 `COG_EVAL_MAX_EPISODES_PER_SHARD=75` 取 8 个锁定分片各自前 75 集（迭代器顺序，确定性），合 600 集。
-配对读数：与 native 种子 42 的 `merged/progress.json` 按 episode_id 取交集，用
-`scripts/tools/paired_closed_loop_bootstrap.py`；**配对差 < −3 pt 即停**（约 2.3 个标准误）。
+配对读数：与 native 种子 42 的
+`model/eval_internnav_native_r2r_val_unseen_4gpu_rpcv2_x11bundle_v4/merged/progress.jsonl`（1839 集，SR 62.48%）
+按 episode_id 取交集，用 `scripts/tools/paired_closed_loop_bootstrap.py`；**配对差 < −3 pt 即停**（约 2.3 个标准误）。
+
+**中断的金丝雀不要 `--resume` 续跑。** 客户端的 `--max_episodes` 限的是"这次新跑多少集"
+（`_eval_limit`：`min(未完成集数, max_episodes)`），不是"总共跑到多少集"。某个分片跑了 40 集后中断，
+续跑会再取 75 集新的、变成 115 集，那一片就不是"前 75 集"了。合并时 `--expected-episodes 600` 对不上会直接报错
+（失败是关闭的，不会静默混入），但省事的做法是：删掉那个分片的输出根重跑。
 同时报：动作序列与 native 完全一致的 episode 比例（`native_audit_agrees` 逐调用为真的集数）、被覆盖成 STOP 的集的 NE 分布、
 2 m 严格半径下的 SR。
 
@@ -60,7 +66,19 @@ bash scripts/run_system2_cognition_r2r_val_unseen_8gpu_mxc500.sh
 2. 掉 ≥ 5 pt → 先在台账登记 exp17c（`configs/ablation/exp17c_c3_geometry_prefix_stop_posenoise_lora_8gpu.yaml`，
    训练期 EXP-15 噪声增广），网站提交 `EXP13_ARMS="exp17c"`，复读后再进金丝雀。
 
-## 4. 启动后先确认的三件事
+## 4. 作业在跑的时候不要动共享检出
+
+集群容器和开发机看的是同一份 `/mnt/afs/.../HeatmapVLN`，而且是**实时**读：`git pull` 或往服务器打 patch，
+等于改了正在跑的任务。2026-09-06 的 EXP-14 就是这么废掉一臂的（台账 §5 第 27 条）。
+本地 commit 无害（服务器只在 pull 时才变），**pull 要等作业跑完**。
+
+现在两条启动脚本都会自己挡一道：preflight 算一次源码指纹（`scripts/tools/source_fingerprint.py`，
+`src/**.py` + `scripts/**.py` + `configs/**.yaml` 的 sha256）并 `export HEATMAPVLN_SOURCE_FINGERPRINT`，
+训练的每个臂启动时比对，不一致就拒跑；检出有未提交改动时训练脚本直接 die；评测脚本在合并前复核一次指纹。
+每个 run 目录里 `manifest/source_fingerprint.json` 与 `git.json` 记下这次跑的是哪份代码——
+**比较两个臂之前先比这两个文件**。
+
+## 5. 启动后先确认的三件事
 
 `runtime/<stamp>/logs/model_0.log` 里：
 

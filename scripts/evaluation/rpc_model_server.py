@@ -722,6 +722,15 @@ class HeatmapVLNRuntime:
             raise RuntimeError(f"unsupported memory-token mode for deployment: {mode!r}")
         if mode == "memory" and self.model.heatmap_vln is None:
             raise RuntimeError("memory mode needs the frozen Past Head")
+        if not self.has_nextdit:
+            # The arm's training config keeps action_head.enable=false, so
+            # starting the closed loop from it would leave every pixel goal with
+            # nothing to execute.  Deployment needs configs/exp17b_system2_cognition_eval_8gpu.yaml.
+            raise RuntimeError(
+                "the cognition arm drives the closed loop and needs System1: this "
+                "config built no NextDiT action head. Pass the deployment config "
+                "(configs/exp17b_system2_cognition_eval_8gpu.yaml), not the training arm config"
+            )
         backbone = self.model.qwen2_5_vl
         if not bool(getattr(backbone.config, "use_lora", False)) or not callable(
             getattr(backbone.model, "disable_adapter", None)

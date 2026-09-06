@@ -70,7 +70,7 @@ cd $R/HeatmapVLN
 ARM=exp17b; CFG=configs/ablation/exp17b_c3_geometry_prefix_stop_lora_8gpu.yaml
 for i in 0 1 2; do
   CUDA_VISIBLE_DEVICES=$((5+i)) setsid nohup $PY scripts/tools/eval_system2_cognition_prefix.py \
-    --config $CFG --checkpoint $R/model/exp17_cognition_prefix/$ARM/run_*/checkpoints/best.pth \
+    --config $CFG --checkpoint $R/model/exp17_cognition_prefix/$ARM/latest/checkpoints/best.pth \
     --parent-checkpoint $R/model/output_past_plan_action_refine_v2_8gpu/run_20260829_115642/checkpoints/best.pth \
     --collection-root $D --oracle-views $EXP13_ORACLE_VIEWS \
     --passes natural,placeholder,no_pose --shard-index $i --shard-count 3 \
@@ -87,6 +87,10 @@ $PY scripts/tools/eval_system2_cognition_prefix.py --passes natural,placeholder,
 
 exp17a 把 `--passes natural,no_pose`；exp14a/exp14b 用各自的 config 与 checkpoint、`--passes natural`，
 输出到 `model/exp17_cognition_prefix/{exp14a,exp14b}/decisions_generated.json`，这样四臂是同一口径。
+EXP-14 两臂取**重跑后**的 8 卡 run（`configs/ablation/exp14{a,b}_*_8gpu.yaml`，见
+[exp14 提交物](exp14-system2-stop-submission.md#重跑2026-09-06第一次提交两臂都作废)）；
+2026-09-06 上午那次 4 卡 run 的代码版本不可证，不作判据来源。
+`latest` 是该臂最新一次 run 的符号链接；四臂的 `manifest/source_fingerprint.json` 应当相同，读数前先对一眼。
 
 **读数之前先看 `passes.natural.decision_distribution`**：一个恒答同一 token 的模型什么差值都是 0。
 

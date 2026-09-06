@@ -73,6 +73,8 @@ arm_config() {
     exp14b) echo "$REPO/configs/ablation/exp14b_system2_constant_stop_lora_${NPROC}gpu.yaml" ;;
     exp17a) echo "$REPO/configs/ablation/exp17a_c1_geometry_stop_lora_${NPROC}gpu.yaml" ;;
     exp17b) echo "$REPO/configs/ablation/exp17b_c3_geometry_prefix_stop_lora_${NPROC}gpu.yaml" ;;
+    # Only registered in the ledger after a noise read says the pose domain needs it.
+    exp17c) echo "$REPO/configs/ablation/exp17c_c3_geometry_prefix_stop_posenoise_lora_${NPROC}gpu.yaml" ;;
     *) return 1 ;;
   esac
 }
@@ -110,6 +112,24 @@ PY
 [[ "$(wc -l <<< "$fingerprints")" -eq 1 ]] || die "shards disagree on the collecting policy"
 export DAGGER_POLICY_FINGERPRINT="$fingerprints"
 echo "[exp13-train] policy fingerprint: $DAGGER_POLICY_FINGERPRINT"
+
+# The cluster job reads this shared checkout live, one arm after another, so an
+# edit that lands mid-job hands later arms different code than earlier ones.
+# 2026-09-06: exp14a died on a half-applied edit and exp14b's code provenance is
+# unprovable.  Pin the tree for the whole job and refuse an unversioned one.
+SOURCE_FINGERPRINT="$("$PYTHON" "$REPO/scripts/tools/source_fingerprint.py" "$REPO")" \
+  || die "cannot fingerprint the source tree"
+export HEATMAPVLN_SOURCE_FINGERPRINT="$SOURCE_FINGERPRINT"
+echo "[exp13-train] source fingerprint: $SOURCE_FINGERPRINT"
+if git_status="$(git -c safe.directory="$REPO" -C "$REPO" status --short --untracked-files=no 2>/dev/null)"; then
+  if [[ -n "$git_status" ]]; then
+    printf '[exp13-train] uncommitted changes in %s:\n%s\n' "$REPO" "$git_status" >&2
+    die "refusing to train on an unversioned tree; commit or restore it first"
+  fi
+  echo "[exp13-train] commit: $(git -c safe.directory="$REPO" -C "$REPO" rev-parse --short HEAD 2>/dev/null) (clean)"
+else
+  echo "[exp13-train] WARNING: git is unusable here; the source fingerprint above is the only provenance record"
+fi
 
 echo "[exp13-train] world size: $NPROC (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
 for arm in $ARMS; do echo "[exp13-train] $arm -> $(arm_config "$arm")"; done

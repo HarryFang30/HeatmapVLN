@@ -1283,6 +1283,22 @@ s ≥ 0.03 则 K = 1，否则 K = min(8, ⌈0.03 / s⌉)——把 `correct_stop`
 只是分给 4 个 rank；`val_lm_loss` 分片略有不同，理论上可能影响两个 epoch 之间的选点。代价 4 卡 × 约 7 h × 2 臂。
 无论哪种卡数，读数都由同一个单卡评测工具产生，与 §0 第 7 条"改卡数不能与既有臂比较"的顾虑无关：本实验没有既有臂。
 
+**运行记录（2026-09-06；这不是结果，判据一字未动）.** 第一次提交（4 卡）两臂都作废：
+
+- `exp14a` 起跑 14 分钟后死在第一次验证的取批上：`construct_input_stage2() got an unexpected
+  keyword argument 'memory_placeholder_position'`。集群作业实时读共享检出，而那一刻本地会话
+  正把 EXP-17 的改动同步进去，收集器已是新版、输入构造器还是旧版（§5 第 27 条）。
+  顺带暴露一件事：`mode=memory` 在此之前**从未真的训练过**——13-B 两臂始终"待跑"，
+  13-A 只是特征缓存与线性读出。所以这一臂的过冻结历史头前向路径还没有任何一次跑通的记录。
+- `exp14b` 两分钟后起跑，撞上自洽的一刻并跑完 6 小时（best `val_lm_loss` 0.1964 @ epoch 2）。
+  但它的 `best.pth` 里带 `system2_memory.geometry_projection`（该参数只存在于 4ec4628 之后），
+  而作业起跑时 HEAD 还是 a2cb20b（4ec4628 是 09:39 才 pull 的）——**它训的代码不对应任何 commit**；
+  `manifest/git.json` 三个字段又全是 null，无从复原。权重没坏，但版本不可证。
+
+处理：两臂在同一个 commit 上重跑，**判据、`stop_horizon_m`、K 全部不变**；重跑后每个 run 目录里
+`manifest/source_fingerprint.json` 与 `git.json` 记下代码版本，两臂必须逐字相同，否则该次作废。
+旧的 `exp14b/run_20260906_091822` 保留作参照，**不作判据来源**；EXP-17 的基线臂也取重跑后的 `exp14b`。
+
 **开发期预览披露.** 写判据的同一个会话里，先用一段纯 CPU 脚本扫了全部 10804 个 `episode.tar`
 里的 `samples.jsonl`（不经 dataset 类、不核 sha256），只为核实上面"数据事实"那一段并给 K 定值：
 31128 个 hard/normal 状态 **100% 为 `native_kind == "trajectory"`、100% 带像素目标**
@@ -1618,6 +1634,11 @@ C3 − C1 一并报告，回答"认知监督作辅助任务值不值"，不作�
 代码：`src/models/system2_memory.py`（geometry 模式）、`src/data/dagger_system2_sft.py`（前缀标签、占位）、
 `src/models/heatmap/input_constructor.py`（哨兵位置、首轮文本）、`src/models/qwen2_5_vl/integration.py::generate_with_sentinels`。
 
+**这次跑的是哪份代码（2026-09-06 21:13 记，为 EXP-14 的教训补的）.** `exp17a` 于 20:26 起跑时共享检出停在
+`164c67d`，工作区干净，源码指纹 `91a5ff64…de87`（299 个文件，与该 commit 的纯净导出逐字相同）。
+两臂串行，`exp17b` 要几小时后才起跑，**在它起跑前不要 pull、不要往服务器打 patch**；
+跑完后重算一次指纹，与这个值相同才说得上"两臂只差注册过的配置行"（§5 第 27 条）。
+
 **预览披露.** 开发机 CPU 冒烟（shard_00 的 train 切片，5318 状态）：`correct_stop` 410、`correct_turn` 717、占位行 1031（19.4%），
 进度分布 一 2749 / 二 1094 / 三 750 / 四 315 / 到 410；六种（类别 × 占位）样本的标签定位全部成功，8 个哨兵在当前帧之后。
 单卡 GPU 冒烟（开发机 GPU 7，未训练的 exp17b 模型，val 切片 3 个状态）：训练前向 `lm_loss` 5.5066，
@@ -1856,3 +1877,18 @@ RPC server 冒烟（同日，GPU 7，`--system2_cognition_arm --cognition_audit_
    部署期 VO 吃的是每个基元步一帧。所以 13-C 那句"给 DAgger 集补 AMB3R 缓存"在这份采集上**不可能**做到，
    要 VO 域的 DAgger 位姿只能重新采集并让 `TrajectoryStepRecorder` 存下每一步的前视帧。
    写监督之前先看采集器保留了什么（第 22 条）在这里再中一次：这次是帧，不是状态。
+
+27. **集群任务实时读共享检出：本地一改，就等于改了正在跑的任务。** 2026-09-06 的 EXP-14 作业
+   （09:02 起）跑的时候，`/mnt/afs/.../HeatmapVLN` 正被本地会话改着：`exp14a` 在 09:16 死于
+   `construct_input_stage2() got an unexpected keyword argument 'memory_placeholder_position'`
+   —— 收集器已是新版、构造器还是旧版，一棵**半同步的树**。两分钟后起的 `exp14b` 撞上了自洽的一刻，
+   跑完了 6 小时；但它的 `best.pth` 里带着 `system2_memory.geometry_projection`（该参数只存在于 4ec4628 之后），
+   而当时 HEAD 还是 a2cb20b（4ec4628 是 09:39 才 pull 的）——**它训的代码不对应任何一个 commit**。
+   run manifest 本该记下这件事，但 `git.json` 三个字段全是 null：容器里以 root 跑、仓库属主是 uid 1024，
+   git 因 `dubious ownership` 拒绝执行，`_run_git_command` 把异常吞成空串（§3.2 的坑在这里第二次咬人）。
+   处理：① `_run_git_command` 带 `-c safe.directory=`，manifest 从此记得下 commit 与 dirty 状态；
+   ② 新增与 git 无关的**源码指纹**（`scripts/tools/source_fingerprint.py`，`src/**.py`+`scripts/**.py`+`configs/**.yaml`
+   的 sha256），启动脚本在 preflight 算一次并 `export HEATMAPVLN_SOURCE_FINGERPRINT`，
+   每个臂启动时比对，**树变了就拒跑**——串行多臂作业里这正是"后面的臂和前面的臂不是同一份代码"的判据；
+   ③ 训练启动脚本遇到未提交改动直接 die，评测启动脚本在合并前复核指纹。
+   操作上的铁律：**任务在跑就不要 `git pull`、不要往服务器打 patch**；本地 commit 无害（服务器只在 pull 时才变）。

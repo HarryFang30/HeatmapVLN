@@ -25,6 +25,11 @@ from .manifest import (
     _write_json,
     _write_yaml,
 )
+from .source_fingerprint import (
+    SOURCE_FINGERPRINT_ENV,
+    check_pinned_source_fingerprint,
+    compute_source_fingerprint,
+)
 from .memory import (
     _CG_LIMIT_GB,
     ShmBypassCollate,
