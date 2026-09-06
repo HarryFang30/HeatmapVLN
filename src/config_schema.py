@@ -914,10 +914,19 @@ class System2MemoryConfig(_Strict):
     # can also be read without odometry.  A free parameter: fix it before any
     # number is read and report every dependence figure "under this fraction".
     pose_dropout: float = 0.0
+    # Training-time pose noise (EXP-15's drift model) so a geometry arm trained
+    # on simulator-true poses is read closer to the AMB3R deployment domain.
+    # Zero keeps the exact registered EXP-17 arms.
+    pose_noise_translation_m: float = 0.0
+    pose_noise_rotation_deg: float = 0.0
+    pose_noise_drift: bool = True
     # Where the sentinel tokens sit in the released prompt.  EXP-13/14 put them
     # before the history images; EXP-17 puts the pose tokens after the current
     # view so their states can integrate every image in context.
     placeholder_position: Literal["before_history", "after_current"] = "before_history"
+    # Evaluation/deployment config (RPC server): System1 is built, no DAgger
+    # data or training stages are policed.  Never set it on a training arm.
+    deployment: bool = False
 
     @model_validator(mode="after")
     def _check_shape(self):
@@ -938,6 +947,10 @@ class System2MemoryConfig(_Strict):
             raise ValueError("system2_memory.pose_dropout must be in [0, 1)")
         if self.pose_dropout > 0.0 and self.mode != "geometry":
             raise ValueError("system2_memory.pose_dropout only applies to mode='geometry'")
+        if self.pose_noise_translation_m < 0.0 or self.pose_noise_rotation_deg < 0.0:
+            raise ValueError("system2_memory.pose_noise_* sigmas must be >= 0")
+        if (self.pose_noise_translation_m > 0.0 or self.pose_noise_rotation_deg > 0.0) and self.mode != "geometry":
+            raise ValueError("system2_memory.pose_noise_* only apply to mode='geometry'")
         return self
 
 
@@ -1723,6 +1736,15 @@ class TrainConfig(_Lenient):
                     "the System2 memory arm exists to train System2: "
                     "model.llm.use_lora=true"
                 )
+            if system2_memory.deployment:
+                # EXP-17 deployment config: the released System1 must be built
+                # for the RPC server, and there is nothing to train.
+                if action_head is None or not action_head.enable:
+                    raise ValueError(
+                        "system2_memory.deployment=true is an RPC-server config: "
+                        "model.action_head.enable=true"
+                    )
+                return self
             if action_head is not None and action_head.enable:
                 raise ValueError(
                     "the System2 memory arm supervises System2 text only: "

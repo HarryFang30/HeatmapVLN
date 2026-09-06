@@ -182,6 +182,9 @@ def build_model(
         system2_memory_pose_num_freqs=system2_memory_cfg.get('pose_num_freqs', 16),
         system2_memory_pose_max_range=system2_memory_cfg.get('pose_max_range', 10.0),
         system2_memory_pose_dropout=system2_memory_cfg.get('pose_dropout', 0.0),
+        system2_memory_pose_noise_translation_m=system2_memory_cfg.get('pose_noise_translation_m', 0.0),
+        system2_memory_pose_noise_rotation_deg=system2_memory_cfg.get('pose_noise_rotation_deg', 0.0),
+        system2_memory_pose_noise_drift=system2_memory_cfg.get('pose_noise_drift', True),
 
         verbose=verbose,
     )

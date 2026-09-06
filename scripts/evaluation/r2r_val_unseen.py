@@ -4216,6 +4216,7 @@ def run_eval_rpc_panoramic(args):
         trajectory_calls = 0
         ppa_applied_calls = 0
         ppa_warmup_calls = 0
+        cognition_applied_calls = 0
         stage0_action_trace: list[dict[str, Any]] = []
         recenter_calls = 0
         recenter_actions_executed = 0
@@ -4441,23 +4442,31 @@ def run_eval_rpc_panoramic(args):
                 history_capture_steps=prompt_history_steps,
             )
             if vo_bridge is not None:
-                if response.get("ppa_runtime") != "ppa-online-amb3r-v1":
-                    raise RuntimeError("model response omitted formal PPA runtime identity")
+                runtime_identity = response.get("ppa_runtime")
+                if runtime_identity not in ("ppa-online-amb3r-v1", "system2-cognition-arm-v1"):
+                    raise RuntimeError("model response omitted a formal AMB3R runtime identity")
+                # EXP-17: the cognition arm reports cognition_applied instead of
+                # ppa_applied; the Plan bridge stays off by construction.
+                cognition_runtime = runtime_identity == "system2-cognition-arm-v1"
+                applied_key = "cognition_applied" if cognition_runtime else "ppa_applied"
                 if response.get("pose_provider") != AMB3R_VO_POSE_PROVIDER:
                     raise RuntimeError("model response changed the AMB3R pose provider")
                 if response.get("pose_ready") is not external_pose_fields["pose_ready"]:
                     raise RuntimeError("model response pose_ready differs from VO query")
                 if response.get("kind") == "trajectory":
                     if external_pose_fields["pose_ready"]:
-                        if response.get("ppa_applied") is not True:
+                        if response.get(applied_key) is not True:
                             raise RuntimeError(
-                                "ready AMB3R trajectory call did not apply trained PPA"
+                                f"ready AMB3R trajectory call did not apply the arm ({applied_key})"
                             )
-                        ppa_applied_calls += 1
+                        if cognition_runtime:
+                            cognition_applied_calls += 1
+                        else:
+                            ppa_applied_calls += 1
                     else:
-                        if response.get("ppa_applied") is not False:
+                        if response.get(applied_key) is not False:
                             raise RuntimeError(
-                                "AMB3R warmup trajectory unexpectedly applied PPA"
+                                f"AMB3R warmup trajectory unexpectedly applied the arm ({applied_key})"
                             )
                         ppa_warmup_calls += 1
             stage0_entry = _stage0_action_trace_entry(
@@ -4947,6 +4956,7 @@ def run_eval_rpc_panoramic(args):
             "history_pose_source": str(args.history_pose_source),
             "ppa_applied_calls": int(ppa_applied_calls),
             "ppa_warmup_calls": int(ppa_warmup_calls),
+            "cognition_applied_calls": int(cognition_applied_calls),
         }
         if stage0_action_trace:
             result["ppa_stage0_action_arm"] = stage0_action_trace[0]["arm"]

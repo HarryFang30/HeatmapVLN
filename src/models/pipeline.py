@@ -188,6 +188,10 @@ class VLNPipelineConfig:
     system2_memory_pose_num_freqs: int = 16
     system2_memory_pose_max_range: float = 10.0
     system2_memory_pose_dropout: float = 0.0
+    # Training-time pose noise (EXP-15's model) towards the AMB3R deployment domain.
+    system2_memory_pose_noise_translation_m: float = 0.0
+    system2_memory_pose_noise_rotation_deg: float = 0.0
+    system2_memory_pose_noise_drift: bool = True
 
     # Performance settings
     enable_gradient_checkpointing: bool = False
@@ -438,6 +442,9 @@ class VLNPipeline(nn.Module):
                 pose_num_freqs=config.system2_memory_pose_num_freqs,
                 pose_max_range=config.system2_memory_pose_max_range,
                 pose_dropout=config.system2_memory_pose_dropout,
+                pose_noise_translation_m=config.system2_memory_pose_noise_translation_m,
+                pose_noise_rotation_deg=config.system2_memory_pose_noise_rotation_deg,
+                pose_noise_drift=config.system2_memory_pose_noise_drift,
             ).to(device=self.device, dtype=torch.float32)
             logger.info(
                 "System2 memory tokens enabled: mode=%s, tokens=%d, M=%d -> %d",
@@ -1277,6 +1284,7 @@ class VLNPipeline(nn.Module):
                     None,
                     semantic_history_mask,
                     history_rel_poses=history_rel_poses,
+                    history_age_steps=history_age_steps,
                     force_no_pose=bool(force_no_pose_tokens),
                 )
             else:

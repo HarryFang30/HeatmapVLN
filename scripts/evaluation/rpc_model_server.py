@@ -61,6 +61,8 @@ from src.models.heatmap.native_internnav_exact import (
     native_requests_lookdown,
     parse_native_actions,
 )
+from src.data.dagger_system2_sft import parse_cognition_prefix
+from src.models.qwen2_5_vl.integration import MEMORY_TOKEN_INDEX
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
 from src.models.action.treatment_spec import (
     TrajectoryPostprocessConfig,
@@ -81,6 +83,10 @@ MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 PROTO_VERSION = HEATMAPVLN_RPC_PROTOCOL_VERSION
 PPA_ONLINE_AMB3R_CAPABILITY = "ppa-online-amb3r-v1"
+# EXP-17: the fine-tuned System2 decides (pose tokens + cognition prefix); Z0
+# for System1 is taken from the native weights with the adapters disabled.
+SYSTEM2_COGNITION_CAPABILITY = "system2-cognition-arm-v1"
+MEMORY_PLACEHOLDER_TOKEN = "<|fim_pad|>"
 LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
     os.environ.get("HEATMAPVLN_INTERNNAV_MODEL_PATH", str(LOCAL_FJL_ROOT / "InternNav-Model"))
@@ -660,6 +666,9 @@ class HeatmapVLNRuntime:
         self.ppa_online_amb3r = bool(
             getattr(args, "require_ppa_online_amb3r", False)
         )
+        self.system2_cognition_arm = bool(getattr(args, "system2_cognition_arm", False))
+        self.cognition_audit_native = bool(getattr(args, "cognition_audit_native", False))
+        self.cognition_max_new_tokens = int(getattr(args, "cognition_max_new_tokens", 96))
         self.pano_latent_adapter = self._load_adapter(args)
         if self.pano_latent_adapter is None and getattr(self.model, "pano_latent_adapter", None) is not None:
             self.pano_latent_adapter = self.model.pano_latent_adapter
@@ -673,11 +682,88 @@ class HeatmapVLNRuntime:
         )
         self._preflight_ppa_stage0_action_arm()
         self.ppa_checkpoint_contract = self._preflight_ppa_online_amb3r()
-        self.model_version = (
-            f"ppa-stage2-online-amb3r:{Path(args.checkpoint).resolve().parents[1].name}"
-            if self.ppa_online_amb3r
-            else "heatmapvln-r2r"
-        )
+        self.cognition_contract = self._preflight_system2_cognition_arm()
+        if self.ppa_online_amb3r:
+            self.model_version = (
+                f"ppa-stage2-online-amb3r:{Path(args.checkpoint).resolve().parents[1].name}"
+            )
+        elif self.system2_cognition_arm:
+            self.model_version = (
+                f"system2-cognition-arm:{Path(args.checkpoint).resolve().parents[1].name}"
+            )
+        else:
+            self.model_version = "heatmapvln-r2r"
+
+    def _preflight_system2_cognition_arm(self) -> dict[str, Any] | None:
+        """Fail closed unless the loaded model is exactly an EXP-17 arm.
+
+        The arm needs: the trained checkpoint (LoRA + memory tokens), an
+        unmerged PEFT wrapper (so native Z0 can be taken with the adapters
+        disabled), the memory-token module in a deployable mode, the Plan bridge
+        off, and the released two-turn protocol.
+        """
+        if not self.system2_cognition_arm:
+            return None
+        if not self.args.checkpoint:
+            raise RuntimeError("the System2 cognition arm requires --checkpoint (LoRA + memory tokens)")
+        if self.ppa_online_amb3r:
+            raise RuntimeError(
+                "the cognition arm keeps the Plan bridge off: do not pass --require_ppa_online_amb3r"
+            )
+        if self.ppa_stage0_action_arm != "disabled":
+            raise RuntimeError("the cognition arm cannot run with the Stage-0 A/B mode")
+        if self.pano_latent_adapter is not None:
+            raise RuntimeError("the cognition arm forbids a panoramic latent adapter")
+        memory = getattr(self.model, "system2_memory", None)
+        if memory is None:
+            raise RuntimeError("config did not build model.system2_memory; the cognition arm needs it")
+        mode = str(memory.mode)
+        if mode not in ("geometry", "constant", "memory"):
+            raise RuntimeError(f"unsupported memory-token mode for deployment: {mode!r}")
+        if mode == "memory" and self.model.heatmap_vln is None:
+            raise RuntimeError("memory mode needs the frozen Past Head")
+        backbone = self.model.qwen2_5_vl
+        if not bool(getattr(backbone.config, "use_lora", False)) or not callable(
+            getattr(backbone.model, "disable_adapter", None)
+        ):
+            raise RuntimeError(
+                "the cognition arm needs an unmerged PEFT LoRA so native Z0 can be "
+                "taken with the adapters disabled"
+            )
+        trajectory_cfg = self.train_cfg.get("data", {}).get("trajectory", {}) or {}
+        internnav_protocol = str(trajectory_cfg.get("system2_sft_protocol", "direct")).lower() == "internnav"
+        structured = bool(trajectory_cfg.get("structured_pano_output", True))
+        if not internnav_protocol or structured:
+            raise RuntimeError(
+                "the cognition arm serves the released two-turn InternNav protocol "
+                "(data.trajectory.system2_sft_protocol=internnav, structured_pano_output=false)"
+            )
+        state = _extract_checkpoint_state_dict(self.args.checkpoint)
+        normalized = {_normalize_state_key(name) for name in state}
+        counts = {
+            "lora": sum("lora_" in name for name in normalized),
+            "system2_memory": sum(name.startswith("system2_memory.") for name in normalized),
+        }
+        if counts["lora"] == 0 or counts["system2_memory"] == 0:
+            raise RuntimeError(f"cognition arm checkpoint lacks LoRA or memory-token tensors: {counts}")
+        memory_cfg = self.train_cfg.get("model", {}).get("system2_memory", {}) or {}
+        sft_cfg = self.train_cfg.get("data", {}).get("dagger_system2_sft", {}) or {}
+        contract = {
+            "runtime": SYSTEM2_COGNITION_CAPABILITY,
+            "mode": mode,
+            "num_tokens": int(memory.num_tokens),
+            "placeholder_position": str(memory_cfg.get("placeholder_position", "before_history")),
+            "cognition_prefix": bool(sft_cfg.get("cognition_prefix", False)),
+            # The training collator fixed the conjunction; the decision prompt
+            # must be the training prompt, not the certified-native one.
+            "conjunction": "you can see ",
+            "checkpoint_tensors": counts,
+            "audit_native": self.cognition_audit_native,
+        }
+        self.model.requires_grad_(False)
+        self.model.eval()
+        LOGGER.info("System2 cognition arm runtime enabled: %s", json.dumps(contract, sort_keys=True))
+        return contract
 
     def _preflight_ppa_online_amb3r(self) -> dict[str, Any] | None:
         if not self.ppa_online_amb3r:
@@ -997,6 +1083,350 @@ class HeatmapVLNRuntime:
         return output
 
     def plan_panoramic(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
+        if not self.system2_cognition_arm:
+            return self._plan_panoramic_native(payload, blobs)
+        return self._plan_with_cognition_arm(payload, blobs)
+
+    # ------------------------------------------------------------------
+    # EXP-17 System2 cognition arm
+    # ------------------------------------------------------------------
+    def _cognition_identity_fields(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        applied: bool,
+        skip_reason: str | None = None,
+    ) -> dict[str, Any]:
+        contract = self.cognition_contract or {}
+        fields: dict[str, Any] = {
+            # The client validates a formal AMB3R runtime identity on every
+            # response; this arm advertises its own, never the PPA one.
+            "ppa_runtime": SYSTEM2_COGNITION_CAPABILITY,
+            "cognition_runtime": SYSTEM2_COGNITION_CAPABILITY,
+            "pose_provider": AMB3R_VO_POSE_PROVIDER,
+            "pose_ready": bool(metadata["pose_ready"]) if metadata else False,
+            "vo_provider_phase": metadata["vo_provider_phase"] if metadata else None,
+            "vo_trajectory_revision": (
+                int(metadata["vo_trajectory_revision"]) if metadata else None
+            ),
+            "ppa_applied": False,
+            "cognition_applied": bool(applied),
+            "cognition_mode": str(contract.get("mode")),
+            "cognition_prefix_arm": bool(contract.get("cognition_prefix", False)),
+            "z0_source": "native_adapters_disabled",
+        }
+        if skip_reason:
+            fields["cognition_skip_reason"] = skip_reason
+        return fields
+
+    def _rewrite_memory_placeholders(self, input_ids: torch.Tensor, expected: int) -> None:
+        """The training collator's rewrite: placeholder text tokens -> memory sentinels."""
+        placeholder_id = int(self.processor.tokenizer.convert_tokens_to_ids(MEMORY_PLACEHOLDER_TOKEN))
+        hits = input_ids == placeholder_id
+        count = int(hits.sum().item())
+        if count != int(expected):
+            raise RuntimeError(
+                f"memory placeholder count mismatch: expected {expected}, got {count}"
+            )
+        input_ids[hits] = MEMORY_TOKEN_INDEX
+
+    def _cognition_prompt_inputs(self, messages: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        _normalize_multimodal_inputs(inputs)
+        self._rewrite_memory_placeholders(
+            inputs["input_ids"], int(self.model.system2_memory.num_tokens)
+        )
+        return inputs
+
+    def _cognition_memory_embeds(
+        self,
+        *,
+        current_front: Image.Image,
+        history_front: list[Image.Image],
+        metadata: dict[str, Any],
+    ) -> torch.Tensor:
+        memory = self.model.system2_memory
+        slots = int(memory.num_tokens)
+        count = len(history_front)
+        if count > slots:
+            raise ValueError(f"the cognition arm supports at most {slots} history frames")
+        relative = np.asarray(metadata["history_rel_poses"], dtype=np.float32)
+        if relative.shape != (count, 4):
+            raise RuntimeError("AMB3R pose/RGB history count diverged after validation")
+        padded = np.zeros((slots, 4), dtype=np.float32)
+        padded[:count] = relative
+        mask = torch.zeros((1, slots), dtype=torch.bool, device=self.device)
+        mask[:, :count] = True
+        poses = torch.from_numpy(padded).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            if memory.mode == "geometry":
+                return memory(None, mask, history_rel_poses=poses)
+            if memory.mode == "constant":
+                return memory(None, None, batch_size=1)
+            past = self._build_ppa_past_output(
+                current_front=current_front, history_front=history_front, metadata=metadata
+            )
+            if past is None:
+                raise RuntimeError("the memory-mode cognition arm needs a ready Past Head output")
+            return memory(past["history_memory"], past["history_memory_mask"])
+
+    def _native_condition_ids(self, prompt_ids: torch.Tensor, pixel_goal: list[int]) -> torch.Tensor:
+        """Native two-turn transcript ids: prompt + "v u" + <eos>, exactly what the replica generates."""
+        tokenizer = self.processor.tokenizer
+        answer = tokenizer.encode(f"{int(pixel_goal[1])} {int(pixel_goal[0])}", add_special_tokens=False)
+        eos = getattr(tokenizer, "eos_token_id", None)
+        if eos is not None:
+            answer = [*answer, int(eos)]
+        suffix = torch.tensor([answer], device=prompt_ids.device, dtype=prompt_ids.dtype)
+        return torch.cat([prompt_ids, suffix], dim=1)
+
+    @staticmethod
+    def _decision_class(text: str) -> str:
+        stripped = (text or "").strip()
+        if re.search(r"\d", stripped):
+            return "pixel"
+        if "STOP" in stripped:
+            return "stop"
+        if native_requests_lookdown(stripped):
+            return "lookdown"
+        if stripped.startswith("←"):
+            return "turn_left"
+        if stripped.startswith("→"):
+            return "turn_right"
+        return "other"
+
+    def _plan_with_cognition_arm(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
+        phase = str(payload.get("phase", "joint")).lower()
+        if phase != "joint":
+            raise ValueError("the System2 cognition arm only serves phase=joint requests")
+        if payload.get("oracle_system2") is not None:
+            raise ValueError("the System2 cognition arm refuses oracle System2 input")
+        num_history = int(payload.get("num_history", 0))
+        metadata = validate_model_pose_fields(payload, num_history=num_history)
+        if not metadata["pose_ready"] or num_history == 0:
+            # AMB3R warmup: exactly the certified native policy, adapters off,
+            # the same choice the PPA deployment made before its first map.
+            with self.model.qwen2_5_vl.adapters_disabled():
+                response = self._plan_panoramic_native(payload, blobs)
+            response.update(
+                self._cognition_identity_fields(
+                    metadata,
+                    applied=False,
+                    skip_reason="amb3r_map_warmup" if not metadata["pose_ready"] else "no_history",
+                )
+            )
+            return response
+
+        contract = self.cognition_contract or {}
+        require_deterministic = self.require_deterministic_sampling or bool(
+            payload.get("require_deterministic_sampling", False)
+        )
+        sampling_metadata = validate_rpc_sampling_metadata(
+            payload.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+            require_deterministic=require_deterministic,
+        )
+        if sampling_metadata is None:
+            raise ValueError("the cognition arm requires deterministic sampling metadata")
+        trajectory_generator = torch.Generator(device=self.device)
+        trajectory_generator.manual_seed(int(sampling_metadata["per_call_seed"]))
+
+        blob_map = _blobs_by_name(blobs)
+        vlm_image_size = tuple(payload.get("vlm_image_size") or self.train_cfg["data"]["image_size"])
+        traj_image_size = tuple(
+            payload.get("traj_image_size")
+            or self.train_cfg.get("data", {}).get("trajectory", {}).get("traj_image_size", [224, 224])
+        )
+        current_front = _pil_from_blob(blob_map["current/front"], vlm_image_size)
+        history_front = [
+            _pil_from_blob(blob_map[f"history/{index}/front"], vlm_image_size)
+            for index in range(num_history)
+        ]
+        lookdown_blob_img = _pil_from_blob(blob_map["lookdown"])
+        if lookdown_blob_img.size != NATIVE_LOOKDOWN_SIZE:
+            raise ValueError(
+                "the cognition arm serves the native two-turn protocol and needs a "
+                f"{NATIVE_LOOKDOWN_SIZE} conversational lookdown blob, got {lookdown_blob_img.size}"
+            )
+        lookdown_img = (
+            lookdown_blob_img
+            if lookdown_blob_img.size == traj_image_size
+            else lookdown_blob_img.resize(traj_image_size)
+        )
+        instruction = str(payload.get("instruction", ""))
+        trajectory_selection = str(payload.get("trajectory_selection", "mean"))
+        trajectory_x_sign = float(payload.get("trajectory_x_sign", 1.0))
+        trajectory_heading_alignment = str(payload.get("trajectory_heading_alignment", "none")).lower()
+        if trajectory_x_sign not in (-1.0, 1.0):
+            raise ValueError(f"trajectory_x_sign must be -1 or 1, got {trajectory_x_sign}")
+        if trajectory_heading_alignment != "none":
+            raise ValueError("the cognition arm serves the front-only protocol: trajectory_heading_alignment=none")
+
+        # ---- decision pass: the fine-tuned System2, pose tokens in, adapters on
+        backbone = self.model.qwen2_5_vl
+        tokenizer = self.processor.tokenizer
+        placeholder_text = MEMORY_PLACEHOLDER_TOKEN * int(contract["num_tokens"])
+        messages = construct_input_stage2(
+            history_frames=history_front,
+            current_frame=current_front,
+            lookdown_frame=lookdown_blob_img,
+            instruction=instruction,
+            pixel_goal=None,
+            assistant_text=None,
+            conjunction=str(contract["conjunction"]),
+            memory_placeholder=placeholder_text,
+            memory_placeholder_position=str(contract["placeholder_position"]),
+        )
+        inputs = self._cognition_prompt_inputs(messages)
+        embeds = self._cognition_memory_embeds(
+            current_front=current_front, history_front=history_front, metadata=metadata
+        )
+        new_ids = backbone.generate_with_sentinels(
+            inputs, memory_embeds=embeds, max_new_tokens=self.cognition_max_new_tokens
+        )
+        generated_text = tokenizer.decode(new_ids[0].tolist(), skip_special_tokens=True)
+        if bool(contract.get("cognition_prefix", False)):
+            fields, decision_text = parse_cognition_prefix(generated_text)
+        else:
+            fields, decision_text = None, generated_text
+        decision_text = decision_text.strip()
+
+        response: dict[str, Any] = {
+            "ok": True,
+            "proto_v": PROTO_VERSION,
+            "llm_output": decision_text,
+            "system2_source": "system2_cognition_arm",
+            "oracle_system2": None,
+            "actions": [],
+            "terminal": False,
+            "kind": "unknown",
+            "phase": phase,
+            "native_first_output": decision_text,
+            "native_lookdown_turns": 0,
+            "native_front_only": True,
+            "cognition_generated_text": generated_text,
+            "cognition_prefix_fields": fields,
+            "cognition_prefix_wellformed": bool(fields is not None) if contract.get("cognition_prefix") else None,
+            "cognition_decision_text": decision_text,
+            "cognition_history_count": num_history,
+        }
+        response.update(self._cognition_identity_fields(metadata, applied=True))
+
+        # ---- second turn (look-down) with the same fine-tuned model
+        second_turn_text: str | None = None
+        pixel_goal: list[int] | None = None
+        if native_requests_lookdown(decision_text):
+            messages_second = _append_internnav_lookdown_turn(
+                messages, first_output=generated_text, lookdown_frame=lookdown_blob_img
+            )
+            inputs_second = self._cognition_prompt_inputs(messages_second)
+            new_ids_second = backbone.generate_with_sentinels(
+                inputs_second, memory_embeds=embeds, max_new_tokens=self.cognition_max_new_tokens
+            )
+            second_turn_text = tokenizer.decode(new_ids_second[0].tolist(), skip_special_tokens=True).strip()
+            response["cognition_second_turn_text"] = second_turn_text
+            response["native_lookdown_turns"] = 1
+            response["llm_output"] = second_turn_text
+            if re.search(r"\d", second_turn_text):
+                pixel_goal = _parse_internnav_pixel_goal(second_turn_text)
+        elif re.search(r"\d", decision_text):
+            pixel_goal = _parse_internnav_pixel_goal(decision_text)
+
+        if self.cognition_audit_native:
+            audit_messages, _images = build_native_messages(instruction, history_front, current_front)
+            audit_inputs = self.processor.apply_chat_template(
+                audit_messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+            )
+            audit_inputs = {k: v.to(self.device) for k, v in audit_inputs.items()}
+            _normalize_multimodal_inputs(audit_inputs)
+            audit_prompt_len = int(audit_inputs["input_ids"].shape[1])
+            with torch.no_grad(), backbone.adapters_disabled():
+                audit_ids = backbone.model.generate(
+                    **audit_inputs, max_new_tokens=128, do_sample=False, use_cache=True, return_dict_in_generate=True
+                ).sequences
+            audit_text = tokenizer.decode(audit_ids[0][audit_prompt_len:], skip_special_tokens=True)
+            response["native_audit_first_output"] = audit_text
+            response["native_audit_agrees"] = self._decision_class(audit_text) == self._decision_class(decision_text)
+
+        if pixel_goal is None:
+            final_text = second_turn_text if second_turn_text is not None else decision_text
+            chunk = parse_native_actions(final_text)
+            if not chunk:
+                response.update({"kind": "fallback_stop", "terminal": True, "actions": [ActionCode.STOP]})
+                return response
+            if chunk[0] == ActionCode.STOP:
+                response.update({"kind": "stop", "terminal": True, "actions": [ActionCode.STOP]})
+                return response
+            response.update({"kind": "native_actions", "actions": finalize_native_local_actions(chunk)})
+            return response
+
+        response["pixel_goal"] = pixel_goal
+        response["pano_goal_view"] = "front"
+        if not self.has_nextdit:
+            response.update({"kind": "pano_goal"})
+            return response
+
+        # ---- Z0 pass: the certified native transcript, adapters off.  For a
+        # given pixel goal this is byte-identical to the native execution path.
+        native_messages, native_images = build_native_messages(instruction, history_front, current_front)
+        native_messages, native_images = append_native_lookdown_turn(
+            native_messages, native_images, "↓", lookdown_blob_img
+        )
+        native_inputs = self.processor.apply_chat_template(
+            native_messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+        )
+        native_inputs = {k: v.to(self.device) for k, v in native_inputs.items()}
+        _normalize_multimodal_inputs(native_inputs)
+        condition_ids = self._native_condition_ids(native_inputs["input_ids"], pixel_goal)
+        lookdown_t = _lookdown_to_traj_tensor(lookdown_img, self.device)
+        traj_images = torch.stack([lookdown_t.clone(), lookdown_t]).unsqueeze(0).to(self.device)
+        lq = self.model.latent_queries.expand(1, -1, -1).to(device=self.device, dtype=self.model.config.dtype)
+        with torch.no_grad(), backbone.adapters_disabled():
+            traj_hs = backbone.generate_latents(
+                output_ids=condition_ids,
+                pixel_values=native_inputs.get("pixel_values"),
+                image_grid_thw=native_inputs.get("image_grid_thw"),
+                latent_queries=lq,
+                attention_mask=native_inputs.get("attention_mask"),
+                mm_token_type_ids=native_inputs.get("mm_token_type_ids"),
+            )
+            trajectory = _trajectory_from_condition(
+                self.model.nextdit_action_head, traj_hs, traj_images=traj_images, generator=trajectory_generator
+            )
+        local_actions = _finalize_local_actions(
+            traj_to_actions(
+                trajectory,
+                num_sample_trajs=self.num_sample_trajs,
+                action_scale=self.action_scale,
+                trajectory_selection=trajectory_selection,
+                trajectory_x_sign=trajectory_x_sign,
+                target_heading_deg=None,
+            )
+        )
+        if local_actions and local_actions[0] == ActionCode.STOP:
+            local_actions = [ActionCode.LEFT]
+            response["anti_deadlock"] = True
+        response.update(
+            {
+                "kind": "trajectory",
+                "actions": [int(action) for action in local_actions],
+                "trajectory_summary": _trajectory_debug_summary(
+                    trajectory, self.num_sample_trajs, self.action_scale, trajectory_x_sign
+                ),
+                "trajectory_x_sign": trajectory_x_sign,
+                "trajectory_heading_alignment": trajectory_heading_alignment,
+                "trajectory_target_heading_deg": None,
+            }
+        )
+        return response
+
+    def _plan_panoramic_native(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
         phase = str(payload.get("phase", "joint")).lower()
         if phase not in {"joint", "system2", "front_system1"}:
             raise ValueError(f"Unsupported panoramic RPC phase={phase!r}")
@@ -1619,6 +2049,11 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
                     if self.runtime.ppa_online_amb3r
                     else []
                 ),
+                *(
+                    [SYSTEM2_COGNITION_CAPABILITY]
+                    if getattr(self.runtime, "system2_cognition_arm", False)
+                    else []
+                ),
             ],
         )
 
@@ -1660,6 +2095,22 @@ def parse_args() -> argparse.Namespace:
             "deployment or online AMB3R memory."
         ),
     )
+    parser.add_argument(
+        "--system2_cognition_arm",
+        action="store_true",
+        help=(
+            "EXP-17: decide with the fine-tuned System2 (odometry pose tokens and, "
+            "if trained so, an explicit cognition prefix written before the answer); "
+            "strip the prefix, and take Z0 for System1 from the native weights with "
+            "the adapters disabled.  Requires causal AMB3R pose metadata on every request."
+        ),
+    )
+    parser.add_argument(
+        "--cognition_audit_native",
+        action="store_true",
+        help="Also decode the native first turn (adapters off) on every ready call and record agreement.",
+    )
+    parser.add_argument("--cognition_max_new_tokens", type=int, default=96)
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 

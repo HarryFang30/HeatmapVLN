@@ -9,6 +9,7 @@ Features:
 Sequence packing is currently disabled on the shared stack.
 """
 
+import contextlib
 import inspect
 import json
 import logging
@@ -1829,6 +1830,26 @@ class Qwen2_5VLIntegration(nn.Module):
         if traj_hidden_states is None:
             raise RuntimeError("extract_traj_hidden_states: forward returned no traj_hidden_states")
         return traj_hidden_states.contiguous()
+
+    @contextlib.contextmanager
+    def adapters_disabled(self):
+        """Run the backbone as the released model: PEFT adapters off for the block.
+
+        The EXP-17 deployment decides with the fine-tuned System2 but takes
+        the TRAJ latent (Z0 for System1) from the *native* weights, so the
+        execution path is byte-identical to the certified replica for a given
+        decision.  Without an unmerged PEFT wrapper there is nothing to
+        disable and the block runs unchanged; a merged LoRA cannot be
+        disabled, which the cognition-arm preflight refuses.
+        """
+        if not self._model_loaded:
+            self._load_model()
+        disable = getattr(self.model, "disable_adapter", None)
+        if not callable(disable):
+            yield
+            return
+        with disable():
+            yield
 
     def generate_with_sentinels(
         self,

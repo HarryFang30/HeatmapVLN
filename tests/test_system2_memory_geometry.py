@@ -103,3 +103,30 @@ def test_sinusoidal_encoding_matches_the_past_heads_layout() -> None:
     encoded = system2_memory.sinusoidal_pose_encoding(poses, num_freqs=2, max_spatial_range=10.0)
     assert encoded.shape == (1, 1, 4 * (1 + 2 * 2))
     assert torch.allclose(encoded[0, 0, :4], poses[0, 0] / 10.0)
+
+
+def test_pose_noise_perturbs_only_in_training_and_keeps_the_yaw_unit_norm() -> None:
+    module = _module("geometry", pose_noise_translation_m=0.2, pose_noise_rotation_deg=10.0, pose_noise_drift=True)
+    poses = torch.zeros(4, 4, 4)
+    poses[:, :, 2] = 1.0
+    mask = torch.ones(4, 4, dtype=torch.bool)
+    ages = torch.arange(4).repeat(4, 1)
+    module.eval()
+    clean = module(None, mask, history_rel_poses=poses, history_age_steps=ages)
+    torch.manual_seed(3)
+    module.train()
+    noisy = module(None, mask, history_rel_poses=poses, history_age_steps=ages)
+    assert not torch.allclose(clean, noisy)
+    module.eval()
+    again = module(None, mask, history_rel_poses=poses, history_age_steps=ages)
+    assert torch.allclose(clean, again)
+    perturbed = system2_memory.perturb_rel_poses(
+        poses, translation_m=0.2, rotation_deg=10.0, ages=ages, drift=True, generator=torch.Generator().manual_seed(0)
+    )
+    norms = torch.sqrt(perturbed[:, :, 2] ** 2 + perturbed[:, :, 3] ** 2)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+    with pytest.raises(ValueError, match="history_age_steps"):
+        system2_memory.perturb_rel_poses(poses, translation_m=0.2, rotation_deg=0.0, ages=None, drift=True)
+    assert torch.allclose(
+        system2_memory.perturb_rel_poses(poses, translation_m=0.0, rotation_deg=0.0, ages=ages, drift=True), poses
+    )

@@ -65,6 +65,54 @@ VISION_START_TOKEN_ID = 151652  # Qwen2.5-VL <|vision_start|>; one per image in 
 _DIGITS = re.compile(r"\d")
 
 
+def perturb_rel_poses_np(
+    poses,
+    *,
+    translation_m: float,
+    rotation_deg: float,
+    ages,
+    drift: bool,
+    seed: int,
+):
+    """EXP-15's pose-noise model (numpy): additive metres, a yaw rotation of (cos, sin).
+
+    Reads an arm trained on simulator-true poses at the deployment noise level
+    before any closed loop is spent.  Deterministic per ``seed``.
+    """
+    import math
+
+    import numpy as np
+
+    out = np.array(poses, dtype=np.float32, copy=True)
+    if out.ndim != 3 or out.shape[-1] != 4:
+        raise ValueError(f"poses must be [B,K,4], got {out.shape}")
+    batch, slots, _ = out.shape
+    rng = np.random.default_rng(int(seed))
+    if drift:
+        if ages is None:
+            raise ValueError("drift noise needs history_age_steps")
+        scale = np.sqrt(1.0 + np.asarray(ages, dtype=np.float32).reshape(batch, slots))
+    else:
+        scale = np.ones((batch, slots), dtype=np.float32)
+    if translation_m > 0.0:
+        out[:, :, 0] += rng.normal(0.0, 1.0, size=(batch, slots)).astype(np.float32) * translation_m * scale
+        out[:, :, 1] += rng.normal(0.0, 1.0, size=(batch, slots)).astype(np.float32) * translation_m * scale
+    if rotation_deg > 0.0:
+        delta = math.radians(rotation_deg) * scale * rng.normal(0.0, 1.0, size=(batch, slots)).astype(np.float32)
+        cos_d, sin_d = np.cos(delta), np.sin(delta)
+        cos_y, sin_y = out[:, :, 2].copy(), out[:, :, 3].copy()
+        out[:, :, 2] = cos_y * cos_d - sin_y * sin_d
+        out[:, :, 3] = sin_y * cos_d + cos_y * sin_d
+    return out
+
+
+def state_noise_seed(base_seed: int, sample_key: str) -> int:
+    import hashlib
+
+    digest = hashlib.md5(f"{int(base_seed)}:{sample_key}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
 def prompt_inputs_from_batch(pano_inputs: dict[str, Any]) -> dict[str, Any]:
     """Cut a teacher-forced, batch-of-one row down to the prompt of its first assistant turn.
 
@@ -354,6 +402,10 @@ def main() -> None:
     parser.add_argument("--reference-path-json", type=Path, default=None, help="overrides data.dagger_system2_sft.reference_path_json")
     parser.add_argument("--passes", default="natural,placeholder,no_pose")
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--pose-noise-translation-m", type=float, default=0.0, help="EXP-15 noise on the input poses (all passes)")
+    parser.add_argument("--pose-noise-rotation-deg", type=float, default=0.0)
+    parser.add_argument("--pose-noise-no-drift", action="store_true", help="constant sigma instead of sqrt(1+age) drift")
+    parser.add_argument("--pose-noise-seed", type=int, default=42)
     parser.add_argument("--max-states", type=int, default=0)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
@@ -530,6 +582,16 @@ def main() -> None:
             sample = dataset[index]
             plan = dataset.plans[index]
             batch = collator([sample])
+            if args.pose_noise_translation_m > 0.0 or args.pose_noise_rotation_deg > 0.0:
+                noisy = perturb_rel_poses_np(
+                    batch["history_rel_poses"].cpu().numpy(),
+                    translation_m=args.pose_noise_translation_m,
+                    rotation_deg=args.pose_noise_rotation_deg,
+                    ages=batch["history_age_steps"].cpu().numpy() if batch.get("history_age_steps") is not None else None,
+                    drift=not args.pose_noise_no_drift,
+                    seed=state_noise_seed(args.pose_noise_seed, plan["sample_key"]),
+                )
+                batch["history_rel_poses"] = torch.from_numpy(noisy)
             prompt = prompt_inputs_from(batch)
             truth_fields = None
             if prefix_arm:
@@ -593,6 +655,12 @@ def main() -> None:
                 "max_new_tokens": args.max_new_tokens,
                 "shard": [args.shard_index, args.shard_count],
                 "placeholder_fraction_trained": float(sft_cfg.get("prefix_placeholder_fraction", 0.0)),
+                "pose_noise": {
+                    "translation_m": args.pose_noise_translation_m,
+                    "rotation_deg": args.pose_noise_rotation_deg,
+                    "drift": not args.pose_noise_no_drift,
+                    "seed": args.pose_noise_seed,
+                },
             },
             "states_records": states,
             "states": states,

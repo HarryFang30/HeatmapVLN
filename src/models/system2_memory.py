@@ -26,7 +26,10 @@ reads receive gradient:
     ``pose_dropout`` blanks all K pose tokens for a fraction of training samples
     (the ``absent`` embedding), so the model can also be evaluated without
     odometry -- that reading is the "how much geometry did the VLA internalise"
-    number.
+    number.  ``pose_noise_*`` perturb the training poses the way EXP-15 did
+    (Gaussian metres on the offsets, a Gaussian yaw rotation of the (cos, sin)
+    pair, optionally scaled by sqrt(1 + age) so older slots drift more), because
+    the sealed training poses are simulator truth while deployment reads AMB3R.
 ``constant``
     the control.  Identical token count, identical position, identical
     trainable-parameter budget, but the embeddings do not depend on ``M_t`` or
@@ -74,6 +77,44 @@ def sinusoidal_pose_encoding(
     return torch.cat([x_norm, angles.sin().flatten(-2), angles.cos().flatten(-2)], dim=-1)
 
 
+def perturb_rel_poses(
+    poses: torch.Tensor,
+    *,
+    translation_m: float,
+    rotation_deg: float,
+    ages: torch.Tensor | None,
+    drift: bool,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """EXP-15's pose-noise model in torch: additive metres, a yaw rotation of (cos, sin).
+
+    ``poses`` is ``[B, K, 4]``.  With ``drift`` the per-slot sigma is scaled by
+    ``sqrt(1 + age_steps)``.  The yaw pair is *rotated*, never perturbed
+    component-wise, so its unit norm survives and a reader cannot detect the
+    corruption instead of the pose error it stands for.
+    """
+    out = poses.clone()
+    batch, slots, _ = out.shape
+    if drift:
+        if ages is None:
+            raise ValueError("drift noise needs history_age_steps")
+        scale = torch.sqrt(1.0 + ages.to(device=out.device, dtype=out.dtype).reshape(batch, slots))
+    else:
+        scale = torch.ones((batch, slots), device=out.device, dtype=out.dtype)
+    if translation_m > 0.0:
+        noise = torch.randn((batch, slots, 2), device=out.device, dtype=out.dtype, generator=generator)
+        out[:, :, :2] = out[:, :, :2] + noise * float(translation_m) * scale.unsqueeze(-1)
+    if rotation_deg > 0.0:
+        delta = math.radians(float(rotation_deg)) * scale * torch.randn(
+            (batch, slots), device=out.device, dtype=out.dtype, generator=generator
+        )
+        cos_d, sin_d = torch.cos(delta), torch.sin(delta)
+        cos_y, sin_y = out[:, :, 2].clone(), out[:, :, 3].clone()
+        out[:, :, 2] = cos_y * cos_d - sin_y * sin_d
+        out[:, :, 3] = sin_y * cos_d + cos_y * sin_d
+    return out
+
+
 class System2MemoryTokens(nn.Module):
     """Turn ``[B, K, memory_dim]`` history memory or ``[B, K, 4]`` poses into ``[B, K, embed_dim]``."""
 
@@ -88,6 +129,9 @@ class System2MemoryTokens(nn.Module):
         pose_num_freqs: int = 16,
         pose_max_range: float = 10.0,
         pose_dropout: float = 0.0,
+        pose_noise_translation_m: float = 0.0,
+        pose_noise_rotation_deg: float = 0.0,
+        pose_noise_drift: bool = True,
     ) -> None:
         super().__init__()
         if mode not in MEMORY_MODES:
@@ -98,6 +142,8 @@ class System2MemoryTokens(nn.Module):
             raise ValueError("pose_num_freqs and pose_max_range must be positive")
         if not 0.0 <= float(pose_dropout) < 1.0:
             raise ValueError("pose_dropout must be in [0, 1)")
+        if float(pose_noise_translation_m) < 0.0 or float(pose_noise_rotation_deg) < 0.0:
+            raise ValueError("pose noise sigmas must be >= 0")
         self.mode = str(mode)
         self.memory_dim = int(memory_dim)
         self.embed_dim = int(embed_dim)
@@ -105,6 +151,9 @@ class System2MemoryTokens(nn.Module):
         self.pose_num_freqs = int(pose_num_freqs)
         self.pose_max_range = float(pose_max_range)
         self.pose_dropout = float(pose_dropout)
+        self.pose_noise_translation_m = float(pose_noise_translation_m)
+        self.pose_noise_rotation_deg = float(pose_noise_rotation_deg)
+        self.pose_noise_drift = bool(pose_noise_drift)
 
         self.memory_norm = nn.LayerNorm(memory_dim)
         self.projection = nn.Linear(memory_dim, embed_dim)
@@ -139,6 +188,10 @@ class System2MemoryTokens(nn.Module):
             )
         return mask.to(dtype=torch.bool)
 
+    @property
+    def pose_noise_enabled(self) -> bool:
+        return self.pose_noise_translation_m > 0.0 or self.pose_noise_rotation_deg > 0.0
+
     # ------------------------------------------------------------------ forward
     def forward(
         self,
@@ -147,6 +200,7 @@ class System2MemoryTokens(nn.Module):
         *,
         batch_size: int | None = None,
         history_rel_poses: torch.Tensor | None = None,
+        history_age_steps: torch.Tensor | None = None,
         force_no_pose: bool = False,
     ) -> torch.Tensor:
         if self.mode == "off":
@@ -168,7 +222,10 @@ class System2MemoryTokens(nn.Module):
 
         if self.mode == "geometry":
             return self.forward_geometry(
-                history_rel_poses, memory_mask, force_no_pose=force_no_pose
+                history_rel_poses,
+                memory_mask,
+                history_age_steps=history_age_steps,
+                force_no_pose=force_no_pose,
             )
 
         if memory is None or memory_mask is None:
@@ -198,13 +255,15 @@ class System2MemoryTokens(nn.Module):
         history_rel_poses: torch.Tensor | None,
         history_mask: torch.Tensor | None,
         *,
+        history_age_steps: torch.Tensor | None = None,
         force_no_pose: bool = False,
     ) -> torch.Tensor:
         """Pose tokens: sinusoidal encoding -> projection, absent where the slot is padded.
 
         ``force_no_pose`` blanks every slot (evaluation without odometry).  During
         training, ``pose_dropout`` does the same for a Bernoulli fraction of the
-        batch so that evaluation state is in-distribution.
+        batch so that evaluation state is in-distribution, and ``pose_noise_*``
+        perturb the (simulator-true) training poses towards deployment error.
         """
         if self.mode != "geometry":
             raise RuntimeError("forward_geometry is only valid in mode='geometry'")
@@ -225,6 +284,14 @@ class System2MemoryTokens(nn.Module):
         poses = history_rel_poses.to(device=device, dtype=torch.float32)
         if not torch.isfinite(poses).all():
             raise ValueError("history_rel_poses contains non-finite values")
+        if self.training and self.pose_noise_enabled:
+            poses = perturb_rel_poses(
+                poses,
+                translation_m=self.pose_noise_translation_m,
+                rotation_deg=self.pose_noise_rotation_deg,
+                ages=history_age_steps,
+                drift=self.pose_noise_drift,
+            )
         encoded = sinusoidal_pose_encoding(
             poses, num_freqs=self.pose_num_freqs, max_spatial_range=self.pose_max_range
         ).to(dtype=weight_dtype)
@@ -244,5 +311,6 @@ class System2MemoryTokens(nn.Module):
         return (
             f"mode={self.mode}, num_tokens={self.num_tokens}, "
             f"memory_dim={self.memory_dim}, embed_dim={self.embed_dim}, "
-            f"pose_pe_dim={pose_pe_dim(self.pose_num_freqs)}, pose_dropout={self.pose_dropout}"
+            f"pose_pe_dim={pose_pe_dim(self.pose_num_freqs)}, pose_dropout={self.pose_dropout}, "
+            f"pose_noise=({self.pose_noise_translation_m} m, {self.pose_noise_rotation_deg} deg, drift={self.pose_noise_drift})"
         )

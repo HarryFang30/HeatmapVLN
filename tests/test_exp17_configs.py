@@ -66,3 +66,52 @@ def test_exp17b_is_exp17a_plus_the_cognition_prefix() -> None:
 def test_placeholder_fraction_is_the_registered_value() -> None:
     lines = _substantive_lines("exp17b_c3_geometry_prefix_stop_lora_8gpu.yaml")
     assert "    prefix_placeholder_fraction: 0.2" in lines
+
+
+def test_exp17c_is_exp17b_plus_training_pose_noise() -> None:
+    changed = _changed(
+        "exp17b_c3_geometry_prefix_stop_lora_8gpu.yaml",
+        "exp17c_c3_geometry_prefix_stop_posenoise_lora_8gpu.yaml",
+    )
+    assert sorted(changed) == sorted(
+        [
+            "+    pose_noise_translation_m: 0.2",
+            "+    pose_noise_rotation_deg: 10.0",
+            "+    pose_noise_drift: true",
+            "-    - name: exp17b_c3_geometry_prefix_stop",
+            "+    - name: exp17c_c3_geometry_prefix_stop_posenoise",
+        ]
+    )
+
+
+def test_deployment_config_is_the_training_arm_plus_system1_and_the_server_protocol() -> None:
+    """The RPC-server config must decide exactly like the training arm.
+
+    Everything that shapes the decision (LLM, LoRA, pose tokens, prefix, data
+    relabelling keys) is identical; only the registered deployment keys differ.
+    """
+    import copy
+
+    import yaml
+
+    train = yaml.safe_load((_CONFIGS / "exp17b_c3_geometry_prefix_stop_lora_8gpu.yaml").read_text(encoding="utf-8"))
+    deploy = yaml.safe_load((_CONFIGS.parent / "exp17b_system2_cognition_eval_8gpu.yaml").read_text(encoding="utf-8"))
+    expected = copy.deepcopy(train)
+    expected["model"]["heatmap"]["enable"] = False
+    expected["model"]["system2_memory"]["deployment"] = True
+    expected["model"]["action_head"] = deploy["model"]["action_head"]  # the released System1 block
+    assert deploy["model"]["action_head"]["enable"] is True
+    assert deploy["model"]["action_head"]["nextdit"]["enabled"] is True
+    assert deploy["model"]["action_head"]["nextdit"]["internnav_model_path"] == "$INTERNNAV_MODEL_PATH"
+    assert deploy["model"]["action_head"]["nextdit"]["num_sample_trajs"] == 32
+    expected["data"]["trajectory"] = {
+        "action_scale": 4.0,
+        "traj_image_size": [224, 224],
+        "system2_sft_protocol": "internnav",
+        "structured_pano_output": False,
+    }
+    stage = expected["training"]["stages"][0]
+    stage["name"] = "exp17b_system2_cognition_eval"
+    stage["require_complete_internnav_system1"] = True
+    stage["load_frozen_past_head"] = False
+    assert deploy == expected
