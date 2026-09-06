@@ -71,6 +71,162 @@ RELABEL_KINDS = (
 CORRECTED_KINDS = ("correct_turn", "correct_stop")
 STOP_KINDS = ("correct_stop", "keep_stop")
 
+# ---------------------------------------------------------------------------
+# EXP-17 cognition prefix: an explicit, supervised sentence System2 writes in
+# front of its native answer.  Every character is chosen so the released
+# parsers cannot mistake it for an answer: no ASCII digit (pixel goal), no
+# arrow (primitive action), no "STOP".
+# ---------------------------------------------------------------------------
+PREFIX_HEAD = "记忆："
+PREFIX_SLOT_SEP = "、"
+PREFIX_PROGRESS_HEAD = "；进度："
+PREFIX_END = "。"
+PREFIX_VIEW_CHARS = ("前", "右", "后", "左")  # canonical view order front/right/back/left
+PREFIX_DISTANCE_CHARS = ("近", "中", "远")
+PREFIX_PROGRESS_CHARS = ("一", "二", "三", "四", "五", "六", "七", "八", "九")
+PREFIX_ARRIVED_CHAR = "到"
+PREFIX_ABSENT = "空"
+PREFIX_UNKNOWN = "未知"
+_NATIVE_UNSAFE = re.compile(r"[0-9↑←→↓]|STOP")
+_PREFIX_PATTERN = re.compile(
+    rf"^{re.escape(PREFIX_HEAD)}(?P<slots>.*?){re.escape(PREFIX_PROGRESS_HEAD)}"
+    rf"(?P<progress>.*?){re.escape(PREFIX_END)}(?P<rest>.*)$",
+    re.S,
+)
+
+
+def canonical_view_index(forward_m: float, left_m: float) -> int:
+    """Which 90-degree canonical view a planar offset falls in (0 front, 1 right, 2 back, 3 left)."""
+    angle = math.degrees(math.atan2(float(left_m), float(forward_m)))
+    if -45.0 <= angle < 45.0:
+        return 0
+    if 45.0 <= angle < 135.0:
+        return 3
+    if -135.0 <= angle < -45.0:
+        return 1
+    return 2
+
+
+def distance_bin_index(distance_m: float, bins_m: Sequence[float]) -> int:
+    for index, edge in enumerate(bins_m):
+        if float(distance_m) < float(edge):
+            return index
+    return len(bins_m)
+
+
+def progress_bin_index(route_progress_m: float, path_length_m: float, bins: int) -> int | None:
+    if not (math.isfinite(route_progress_m) and math.isfinite(path_length_m)) or path_length_m <= 0:
+        return None
+    frac = min(1.0, max(0.0, float(route_progress_m) / float(path_length_m)))
+    return int(min(int(bins) - 1, math.floor(frac * int(bins))))
+
+
+def progress_char(bin_index: int | None, *, arrived: bool) -> str | None:
+    if arrived:
+        return PREFIX_ARRIVED_CHAR
+    if bin_index is None:
+        return None
+    return PREFIX_PROGRESS_CHARS[int(bin_index)]
+
+
+def build_cognition_prefix(
+    rel_poses: Sequence[Sequence[float]],
+    valid_mask: Sequence[Any],
+    progress: str,
+    *,
+    distance_bins_m: Sequence[float] = (2.0, 5.0),
+) -> str:
+    """Render the explicit cognition sentence for one state.
+
+    ``rel_poses`` is ``[K, 4]`` (forward_m, left_m, cos_yaw, sin_yaw) in the
+    current robot frame; padded slots render as ``空``.  The result is
+    guaranteed native-safe (see ``_NATIVE_UNSAFE``).
+    """
+    slots: list[str] = []
+    for pose, valid in zip(rel_poses, valid_mask):
+        if not bool(valid):
+            slots.append(PREFIX_ABSENT)
+            continue
+        forward_m, left_m = float(pose[0]), float(pose[1])
+        view = PREFIX_VIEW_CHARS[canonical_view_index(forward_m, left_m)]
+        dist = PREFIX_DISTANCE_CHARS[
+            min(distance_bin_index(math.hypot(forward_m, left_m), distance_bins_m), len(PREFIX_DISTANCE_CHARS) - 1)
+        ]
+        slots.append(view + dist)
+    text = PREFIX_HEAD + PREFIX_SLOT_SEP.join(slots) + PREFIX_PROGRESS_HEAD + str(progress) + PREFIX_END
+    assert_prefix_native_safe(text)
+    return text
+
+
+def placeholder_prefix(num_slots: int) -> str:
+    """The content-free prefix of the same shape: every slot and the progress read 未知."""
+    text = (
+        PREFIX_HEAD
+        + PREFIX_SLOT_SEP.join([PREFIX_UNKNOWN] * int(num_slots))
+        + PREFIX_PROGRESS_HEAD
+        + PREFIX_UNKNOWN
+        + PREFIX_END
+    )
+    assert_prefix_native_safe(text)
+    return text
+
+
+def assert_prefix_native_safe(text: str) -> None:
+    match = _NATIVE_UNSAFE.search(text)
+    if match is not None:
+        raise ValueError(
+            f"cognition prefix contains {match.group(0)!r}, which the released "
+            "answer parsers would read as a pixel goal or primitive action"
+        )
+
+
+def parse_cognition_prefix(text: str) -> tuple[dict[str, Any] | None, str]:
+    """Split ``prefix + answer`` back into fields and the native answer.
+
+    Returns ``(fields, remainder)``; ``fields`` is ``None`` when no well-formed
+    prefix opens the text, in which case ``remainder`` is the whole text.
+    ``fields['slots']`` is a list of ``(view_char, distance_char)`` tuples,
+    ``PREFIX_ABSENT`` or ``PREFIX_UNKNOWN`` per slot.
+    """
+    match = _PREFIX_PATTERN.match(text)
+    if match is None:
+        return None, text
+    slots: list[Any] = []
+    raw_slots = match.group("slots")
+    for token in (raw_slots.split(PREFIX_SLOT_SEP) if raw_slots else []):
+        if token in (PREFIX_ABSENT, PREFIX_UNKNOWN):
+            slots.append(token)
+        elif len(token) == 2 and token[0] in PREFIX_VIEW_CHARS and token[1] in PREFIX_DISTANCE_CHARS:
+            slots.append((token[0], token[1]))
+        else:
+            slots.append(("?", "?"))
+    return {"slots": slots, "progress": match.group("progress")}, match.group("rest")
+
+
+def load_reference_path_lengths(path: str | Path) -> dict[str, float]:
+    """Reference-path polyline length per R2R episode id, from train.json.gz."""
+    import gzip
+
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        episodes = json.load(handle)["episodes"]
+    lengths: dict[str, float] = {}
+    for episode in episodes:
+        points = episode.get("reference_path") or []
+        total = 0.0
+        for a, b in zip(points[:-1], points[1:]):
+            total += math.dist([float(v) for v in a], [float(v) for v in b])
+        lengths[str(episode["episode_id"])] = total
+    return lengths
+
+
+def placeholder_selected(sample_key: str, fraction: float) -> bool:
+    """Deterministic per-state coin: the placeholder set never changes between runs."""
+    if fraction <= 0.0:
+        return False
+    digest = hashlib.md5(f"prefix-placeholder:{sample_key}".encode("utf-8")).hexdigest()
+    return (int(digest[:8], 16) % 10_000) < int(round(float(fraction) * 10_000))
+
 
 class DaggerSystem2SFTError(ValueError):
     """The relabelling contract was violated by the inputs."""
@@ -252,6 +408,11 @@ class DaggerSystem2SFTDataset(Dataset):
         stop_supervision: bool = False,
         stop_horizon_m: float = 1.0,
         stop_oversample: int = 1,
+        cognition_prefix: bool = False,
+        prefix_placeholder_fraction: float = 0.0,
+        reference_path_json: str | Path | dict[str, float] | None = None,
+        prefix_distance_bins_m: Sequence[float] = (2.0, 5.0),
+        prefix_progress_bins: int = 4,
     ) -> None:
         if not hasattr(dataset, "sample_metadata"):
             raise DaggerSystem2SFTError(
@@ -284,6 +445,31 @@ class DaggerSystem2SFTDataset(Dataset):
             if isinstance(oracle_views, dict)
             else load_oracle_views(oracle_views)
         )
+        # EXP-17 cognition prefix.  Progress needs the reference-path length
+        # per episode; the val slice never receives a placeholder.
+        self.cognition_prefix = bool(cognition_prefix)
+        if not 0.0 <= float(prefix_placeholder_fraction) < 1.0:
+            raise DaggerSystem2SFTError("prefix_placeholder_fraction must be in [0, 1)")
+        if float(prefix_placeholder_fraction) > 0.0 and not self.cognition_prefix:
+            raise DaggerSystem2SFTError("prefix_placeholder_fraction > 0 requires cognition_prefix")
+        self.prefix_placeholder_fraction = (
+            float(prefix_placeholder_fraction) if self.scene_split != "val" else 0.0
+        )
+        self.prefix_distance_bins_m = tuple(float(v) for v in prefix_distance_bins_m)
+        self.prefix_progress_bins = int(prefix_progress_bins)
+        if self.cognition_prefix and not 2 <= self.prefix_progress_bins <= len(PREFIX_PROGRESS_CHARS):
+            raise DaggerSystem2SFTError("prefix_progress_bins must be in [2, 9]")
+        self.reference_path_lengths: dict[str, float] | None = None
+        if self.cognition_prefix:
+            if reference_path_json is None:
+                raise DaggerSystem2SFTError(
+                    "cognition_prefix requires reference_path_json (R2R train.json.gz)"
+                )
+            self.reference_path_lengths = (
+                dict(reference_path_json)
+                if isinstance(reference_path_json, dict)
+                else load_reference_path_lengths(reference_path_json)
+            )
 
         # Observation-contract passthrough: the enclosing trainer picks its
         # collator from these, so a wrapper that hid them would silently switch
@@ -335,6 +521,25 @@ class DaggerSystem2SFTDataset(Dataset):
             plan["source_type"] = str(sample.get("source_type") or "")
             plan["scene_id"] = scene_id
             plan["failure_tags"] = list(sample.get("failure_tags") or [])
+            if self.cognition_prefix:
+                oracle = sample.get("oracle") if isinstance(sample.get("oracle"), dict) else {}
+                arrived, _remaining = oracle_stops_within(oracle, self.stop_horizon_m)
+                try:
+                    route_progress_m = float(sample.get("route_progress_m"))
+                except (TypeError, ValueError):
+                    route_progress_m = float("nan")
+                path_length = float(
+                    (self.reference_path_lengths or {}).get(str(sample.get("episode_id")), float("nan"))
+                )
+                char = progress_char(
+                    progress_bin_index(route_progress_m, path_length, self.prefix_progress_bins),
+                    arrived=bool(arrived),
+                )
+                if char is None:
+                    self.dropped["no_progress_label"] = self.dropped.get("no_progress_label", 0) + 1
+                    continue
+                plan["prefix_progress"] = char
+                plan["prefix_placeholder"] = placeholder_selected(key, self.prefix_placeholder_fraction)
             self.indices.append(index)
             self.plans.append(plan)
 
@@ -402,6 +607,23 @@ class DaggerSystem2SFTDataset(Dataset):
             "scene_split": self.scene_split,
             "val_scene_pct": self.val_scene_pct,
             "scenes": len({plan["scene_id"] for plan in self.plans}),
+            "cognition_prefix": self.cognition_prefix,
+            "prefix_placeholder_fraction": self.prefix_placeholder_fraction,
+            "prefix_placeholder_rows": sum(
+                1 for plan in self.plans if plan.get("prefix_placeholder") and not plan.get("oversampled")
+            ),
+            "prefix_progress_dist": (
+                {
+                    char: sum(
+                        1
+                        for plan in self.plans
+                        if plan.get("prefix_progress") == char and not plan.get("oversampled")
+                    )
+                    for char in sorted({str(p.get("prefix_progress")) for p in self.plans if p.get("prefix_progress")})
+                }
+                if self.cognition_prefix
+                else None
+            ),
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -415,7 +637,32 @@ class DaggerSystem2SFTDataset(Dataset):
         if plan["drop_pixel_goal"]:
             for key in ("pixel_goal", "pano_pixel_goal", "pano_sample_kind", "pano_view_id"):
                 sample.pop(key, None)
-        sample["system2_target_texts"] = list(plan["target_texts"])
+        target_texts = list(plan["target_texts"])
+        if self.cognition_prefix:
+            rel_poses = sample.get("history_rel_poses")
+            valid_mask = sample.get("history_valid_mask")
+            if rel_poses is None or valid_mask is None:
+                raise DaggerSystem2SFTError(
+                    "cognition_prefix needs history_rel_poses and history_valid_mask on every row"
+                )
+            rel_list = rel_poses.tolist() if hasattr(rel_poses, "tolist") else list(rel_poses)
+            mask_list = valid_mask.tolist() if hasattr(valid_mask, "tolist") else list(valid_mask)
+            truth = build_cognition_prefix(
+                rel_list,
+                mask_list,
+                plan["prefix_progress"],
+                distance_bins_m=self.prefix_distance_bins_m,
+            )
+            is_placeholder = bool(plan.get("prefix_placeholder", False))
+            prefix = placeholder_prefix(len(mask_list)) if is_placeholder else truth
+            # The prefix is written in the first assistant turn, in front of the
+            # look-down request, the turn or the STOP.  The second turn (the pixel
+            # coordinates after the look-down image) is untouched.
+            target_texts[0] = prefix + target_texts[0]
+            sample["cognition_prefix_text"] = prefix
+            sample["cognition_prefix_truth"] = truth
+            sample["cognition_prefix_is_placeholder"] = is_placeholder
+        sample["system2_target_texts"] = target_texts
         sample["system2_relabel_kind"] = plan["kind"]
         return sample
 

@@ -183,6 +183,11 @@ class VLNPipelineConfig:
     system2_memory_mode: str = "memory"
     system2_memory_num_tokens: int = 8
     system2_memory_dim: int = 256
+    # ``geometry`` mode only: the odometry pose tokens' encoding and the
+    # training-time fraction of samples whose pose tokens are blanked.
+    system2_memory_pose_num_freqs: int = 16
+    system2_memory_pose_max_range: float = 10.0
+    system2_memory_pose_dropout: float = 0.0
 
     # Performance settings
     enable_gradient_checkpointing: bool = False
@@ -421,15 +426,18 @@ class VLNPipeline(nn.Module):
                 raise RuntimeError(
                     "System2 memory tokens forbid legacy per-layer heatmap control"
                 )
-            if not config.enable_heatmap:
+            if not config.enable_heatmap and config.system2_memory_mode == "memory":
                 raise RuntimeError(
-                    "System2 memory tokens require the Past Head that produces them"
+                    "System2 memory tokens in mode='memory' require the Past Head that produces them"
                 )
             self.system2_memory = System2MemoryTokens(
                 memory_dim=config.system2_memory_dim,
                 embed_dim=config.llm_hidden_dim,
                 num_tokens=config.system2_memory_num_tokens,
                 mode=config.system2_memory_mode,
+                pose_num_freqs=config.system2_memory_pose_num_freqs,
+                pose_max_range=config.system2_memory_pose_max_range,
+                pose_dropout=config.system2_memory_pose_dropout,
             ).to(device=self.device, dtype=torch.float32)
             logger.info(
                 "System2 memory tokens enabled: mode=%s, tokens=%d, M=%d -> %d",
@@ -1006,6 +1014,9 @@ class VLNPipeline(nn.Module):
         return_future_heatmaps: bool = False,
         return_history_memory: bool = False,
         inject_system2_memory: bool = False,
+        # ``geometry`` memory tokens only: blank every pose token (evaluate the
+        # fine-tuned System2 without odometry).
+        force_no_pose_tokens: bool = False,
         action_initial_noise: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Forward pass."""
@@ -1124,12 +1135,17 @@ class VLNPipeline(nn.Module):
                 "inject_system2_memory=True but the pipeline was built without "
                 "model.system2_memory"
             )
+        # Only the ``memory`` arm reads the Past Head; ``geometry`` reads the
+        # odometry poses and ``constant`` reads nothing, so neither needs it.
+        memory_tokens_need_past_head = bool(
+            memory_tokens_requested and self.system2_memory.mode == "memory"
+        )
         need_single_view_heatmap = has_single_view_heatmap and (
             return_heatmaps
             or control_requested
             or ppa_requested
             or return_history_memory
-            or memory_tokens_requested
+            or memory_tokens_need_past_head
         )
         need_heatmap = need_panorama_heatmap or need_single_view_heatmap
         if return_heatmap_logits and not need_heatmap:
@@ -1247,6 +1263,21 @@ class VLNPipeline(nn.Module):
                 # the batch instead of from the memory tensor.
                 system2_memory_embeds = self.system2_memory(
                     None, None, batch_size=batch_size
+                )
+            elif self.system2_memory.mode == "geometry":
+                if history_rel_poses is None:
+                    raise RuntimeError(
+                        "System2 geometry tokens need history_rel_poses (the odometry poses)"
+                    )
+                if semantic_history_mask is None:
+                    raise RuntimeError(
+                        "System2 geometry tokens need an explicit history_valid_mask"
+                    )
+                system2_memory_embeds = self.system2_memory(
+                    None,
+                    semantic_history_mask,
+                    history_rel_poses=history_rel_poses,
+                    force_no_pose=bool(force_no_pose_tokens),
                 )
             else:
                 if heatmap_output is None:

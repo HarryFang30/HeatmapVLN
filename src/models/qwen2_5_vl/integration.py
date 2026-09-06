@@ -1830,6 +1830,101 @@ class Qwen2_5VLIntegration(nn.Module):
             raise RuntimeError("extract_traj_hidden_states: forward returned no traj_hidden_states")
         return traj_hidden_states.contiguous()
 
+    def generate_with_sentinels(
+        self,
+        inputs: dict[str, torch.Tensor],
+        *,
+        memory_embeds: torch.Tensor | None,
+        max_new_tokens: int = 64,
+        forced_prefix_ids: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Greedy-decode from prepared multimodal inputs with the memory sentinels substituted.
+
+        Mirrors the sentinel hook of ``_forward_model_inputs`` (same embedding
+        lookup, same fail-closed substitution count) but drives ``generate``
+        instead of a single forward, so an EXP-17 arm can be *read* the way it
+        is deployed: the first assistant turn is produced token by token from
+        the prompt alone.  ``forced_prefix_ids`` are appended to the prompt
+        before decoding (the placeholder-prefix pass).  Only the new tokens are
+        returned, ``[B, T_new]``.
+        """
+        if not self._model_loaded:
+            self._load_model()
+        device = self.device
+        ids = inputs["input_ids"].to(device)
+        attention = inputs.get("attention_mask")
+        attention = attention.to(device) if attention is not None else torch.ones_like(ids)
+        mm_types = inputs.get("mm_token_type_ids")
+        mm_types = mm_types.to(device) if mm_types is not None else None
+        if forced_prefix_ids:
+            suffix = torch.tensor(
+                [list(int(v) for v in forced_prefix_ids)] * int(ids.shape[0]),
+                device=device,
+                dtype=ids.dtype,
+            )
+            ids = torch.cat([ids, suffix], dim=1)
+            attention = torch.cat([attention, torch.ones_like(suffix)], dim=1)
+            if mm_types is not None:
+                mm_types = torch.cat(
+                    [mm_types, torch.zeros_like(suffix, dtype=mm_types.dtype)], dim=1
+                )
+        gen_inputs: dict[str, torch.Tensor] = {"input_ids": ids, "attention_mask": attention}
+        if mm_types is not None:
+            gen_inputs["mm_token_type_ids"] = mm_types
+        for key in ("pixel_values", "image_grid_thw"):
+            value = inputs.get(key)
+            if value is not None:
+                gen_inputs[key] = value.to(device)
+
+        hook_handle = None
+        substitutions = {"count": 0}
+        if memory_embeds is not None:
+            flat = memory_embeds.reshape(-1, memory_embeds.shape[-1])
+
+            def _replace_memory_sentinels(module, args, output):
+                if not args:
+                    return output
+                token_ids = args[0]
+                if not torch.is_tensor(token_ids) or token_ids.shape != output.shape[:-1]:
+                    return output
+                mask = token_ids == MEMORY_TOKEN_INDEX
+                slots = int(mask.sum().item())
+                if slots == 0:
+                    return output
+                if flat.shape[0] != slots:
+                    raise RuntimeError(
+                        f"memory sentinel appears {slots} times but {flat.shape[0]} "
+                        "embeddings were supplied"
+                    )
+                replaced = output.clone()
+                replaced[mask] = flat.to(dtype=replaced.dtype, device=replaced.device)
+                substitutions["count"] += 1
+                return replaced
+
+            embedding_module = self.model.get_input_embeddings()
+            if embedding_module is None:
+                raise RuntimeError(
+                    "Could not locate the input embedding module for sentinel injection"
+                )
+            hook_handle = embedding_module.register_forward_hook(_replace_memory_sentinels)
+        try:
+            with torch.no_grad():
+                generated = self.model.generate(
+                    **gen_inputs,
+                    max_new_tokens=int(max_new_tokens),
+                    do_sample=False,
+                    use_cache=True,
+                )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+        if memory_embeds is not None and substitutions["count"] == 0:
+            raise RuntimeError(
+                "memory sentinel embeddings were prepared but never substituted "
+                "during generate; the prompt carries no memory sentinels"
+            )
+        return generated[:, ids.shape[1] :]
+
     def generate_latents(
         self,
         output_ids: torch.Tensor,

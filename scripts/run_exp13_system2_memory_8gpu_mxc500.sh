@@ -39,6 +39,8 @@ PARENT="${EXP13_PARENT_CHECKPOINT:-$FJL_ROOT/model/output_past_plan_action_refin
 
 export INTERNNAV_MODEL_PATH="${INTERNNAV_MODEL_PATH:-$FJL_ROOT/InternNav-Model}"
 export EXP13_ORACLE_VIEWS="${EXP13_ORACLE_VIEWS:-$FJL_ROOT/model/exp12_recovery_gate/d1_per_state.jsonl}"
+# EXP-17 (C3): reference-path lengths are the progress denominator of the cognition prefix.
+export R2R_TRAIN_JSON="${R2R_TRAIN_JSON:-$FJL_ROOT/habitat/VLN-CE/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
@@ -69,6 +71,8 @@ arm_config() {
     exp13b) echo "$REPO/configs/ablation/exp13b_system2_constant_lora_${NPROC}gpu.yaml" ;;
     exp14a) echo "$REPO/configs/ablation/exp14a_system2_memory_stop_lora_${NPROC}gpu.yaml" ;;
     exp14b) echo "$REPO/configs/ablation/exp14b_system2_constant_stop_lora_${NPROC}gpu.yaml" ;;
+    exp17a) echo "$REPO/configs/ablation/exp17a_c1_geometry_stop_lora_${NPROC}gpu.yaml" ;;
+    exp17b) echo "$REPO/configs/ablation/exp17b_c3_geometry_prefix_stop_lora_${NPROC}gpu.yaml" ;;
     *) return 1 ;;
   esac
 }
@@ -77,6 +81,7 @@ arm_config() {
 [[ -d "$DAGGER_ROOT" ]] || die "missing DAgger collection: $DAGGER_ROOT"
 [[ -f "$PARENT" ]] || die "missing parent checkpoint: $PARENT"
 [[ -f "$EXP13_ORACLE_VIEWS" ]] || die "missing oracle rows: $EXP13_ORACLE_VIEWS"
+[[ -f "$R2R_TRAIN_JSON" ]] || die "missing R2R train annotation: $R2R_TRAIN_JSON"
 [[ -e "$INTERNNAV_MODEL_PATH" ]] || die "missing model path: $INTERNNAV_MODEL_PATH"
 for arm in $ARMS; do
   cfg="$(arm_config "$arm")" || die "unknown arm: $arm"

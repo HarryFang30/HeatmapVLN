@@ -1,4 +1,4 @@
-"""Project the Past Head memory into System2's token embedding space.
+"""Project the Past Head memory -- or the raw history geometry -- into System2's token embedding space.
 
 Every EXP-01..EXP-12 result describes a model in which the history memory
 ``M_t`` reaches only the *execution* layer: it is injected into ``Z``, which
@@ -13,16 +13,26 @@ to where the robot has been while it is still deciding where to go.  Nothing
 else about the released prompt changes.
 
 ``mode`` selects the arm, and the arms are constructed to be exactly
-comparable:
+comparable -- every mode owns the same parameter tensors, only the ones it
+reads receive gradient:
 
 ``memory``
-    the real thing: each history slot is projected into an embedding.
+    each history slot's ``M_t`` vector is projected into an embedding.
+``geometry``
+    each history slot's relative pose (forward, left, cos yaw, sin yaw) from the
+    odometry module is sinusoidally encoded and projected.  EXP-13-A/EXP-15/EXP-16
+    showed the decision-relevant content of ``M_t`` is this pose, so the arm
+    gives System2 the odometry directly and lets the fine-tune do the cognition.
+    ``pose_dropout`` blanks all K pose tokens for a fraction of training samples
+    (the ``absent`` embedding), so the model can also be evaluated without
+    odometry -- that reading is the "how much geometry did the VLA internalise"
+    number.
 ``constant``
     the control.  Identical token count, identical position, identical
-    trainable-parameter budget, but the embeddings do not depend on ``M_t`` at
-    all.  Any gain the ``memory`` arm shows over this one cannot be explained by
-    "the prompt got longer" or "System2 was fine-tuned on DAgger data", which
-    is the confound that would otherwise sink the claim.
+    trainable-parameter budget, but the embeddings do not depend on ``M_t`` or
+    the poses at all.  Any gain the other arms show over this one cannot be
+    explained by "the prompt got longer" or "System2 was fine-tuned on DAgger
+    data", which is the confound that would otherwise sink the claim.
 ``off``
     no memory tokens are emitted; the caller must not place placeholders.
 
@@ -33,14 +43,39 @@ being silently indistinguishable from "my eighth memory is the zero vector".
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
-MEMORY_MODES = ("memory", "constant", "off")
+MEMORY_MODES = ("memory", "constant", "geometry", "off")
+POSE_DIM = 4  # forward_m, left_m, cos_yaw, sin_yaw
+
+
+def pose_pe_dim(num_freqs: int) -> int:
+    return POSE_DIM * (1 + 2 * int(num_freqs))
+
+
+def sinusoidal_pose_encoding(
+    poses: torch.Tensor, *, num_freqs: int, max_spatial_range: float
+) -> torch.Tensor:
+    """The Past Head's own pose encoding, kept identical so the two arms read the same numbers.
+
+    ``poses`` is ``[..., 4]``; the result is ``[..., 4 * (1 + 2 * num_freqs)]``:
+    the normalised values followed by their sines and cosines at ``num_freqs``
+    octave-spaced frequencies (see ``src/models/heatmap/trajectory_attention.py``).
+    """
+    if poses.shape[-1] != POSE_DIM:
+        raise ValueError(f"poses must end with {POSE_DIM} channels, got {tuple(poses.shape)}")
+    x_norm = poses / float(max_spatial_range)
+    freqs = torch.arange(int(num_freqs), device=poses.device, dtype=poses.dtype)
+    freqs = 2.0 * math.pi * (2.0 ** freqs)
+    angles = x_norm.unsqueeze(-1) * freqs
+    return torch.cat([x_norm, angles.sin().flatten(-2), angles.cos().flatten(-2)], dim=-1)
 
 
 class System2MemoryTokens(nn.Module):
-    """Turn ``[B, K, memory_dim]`` history memory into ``[B, K, embed_dim]``."""
+    """Turn ``[B, K, memory_dim]`` history memory or ``[B, K, 4]`` poses into ``[B, K, embed_dim]``."""
 
     def __init__(
         self,
@@ -50,37 +85,69 @@ class System2MemoryTokens(nn.Module):
         num_tokens: int = 8,
         mode: str = "memory",
         init_std: float = 0.02,
+        pose_num_freqs: int = 16,
+        pose_max_range: float = 10.0,
+        pose_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if mode not in MEMORY_MODES:
             raise ValueError(f"mode must be one of {MEMORY_MODES}, got {mode!r}")
         if memory_dim <= 0 or embed_dim <= 0 or num_tokens <= 0:
             raise ValueError("memory_dim, embed_dim and num_tokens must be positive")
+        if pose_num_freqs <= 0 or pose_max_range <= 0:
+            raise ValueError("pose_num_freqs and pose_max_range must be positive")
+        if not 0.0 <= float(pose_dropout) < 1.0:
+            raise ValueError("pose_dropout must be in [0, 1)")
         self.mode = str(mode)
         self.memory_dim = int(memory_dim)
         self.embed_dim = int(embed_dim)
         self.num_tokens = int(num_tokens)
+        self.pose_num_freqs = int(pose_num_freqs)
+        self.pose_max_range = float(pose_max_range)
+        self.pose_dropout = float(pose_dropout)
 
         self.memory_norm = nn.LayerNorm(memory_dim)
         self.projection = nn.Linear(memory_dim, embed_dim)
         self.slot_embedding = nn.Parameter(torch.empty(num_tokens, embed_dim))
         self.absent_embedding = nn.Parameter(torch.empty(embed_dim))
-        # Present in every mode so the two arms have the same parameter count
-        # and the same optimizer state shape; only ``constant`` reads it.
+        # Present in every mode so the arms have the same parameter set and the
+        # same optimizer state shape; only ``constant`` reads it.
         self.constant_embedding = nn.Parameter(torch.empty(num_tokens, embed_dim))
+        # Likewise present in every mode; only ``geometry`` reads it.
+        self.geometry_projection = nn.Linear(pose_pe_dim(self.pose_num_freqs), embed_dim)
 
         nn.init.normal_(self.projection.weight, std=init_std)
         nn.init.zeros_(self.projection.bias)
+        nn.init.normal_(self.geometry_projection.weight, std=init_std)
+        nn.init.zeros_(self.geometry_projection.bias)
         nn.init.normal_(self.slot_embedding, std=init_std)
         nn.init.normal_(self.absent_embedding, std=init_std)
         nn.init.normal_(self.constant_embedding, std=init_std)
 
+    # ------------------------------------------------------------------ helpers
+    def _slot(self, batch_size: int, dtype: torch.dtype) -> torch.Tensor:
+        return self.slot_embedding.to(dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _absent(self, batch_size: int, dtype: torch.dtype) -> torch.Tensor:
+        absent = self.absent_embedding.to(dtype=dtype).view(1, 1, -1)
+        return absent.expand(batch_size, self.num_tokens, -1)
+
+    def _check_mask(self, mask: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if mask.shape != (batch_size, self.num_tokens):
+            raise ValueError(
+                f"history mask must be [B,{self.num_tokens}], got {tuple(mask.shape)}"
+            )
+        return mask.to(dtype=torch.bool)
+
+    # ------------------------------------------------------------------ forward
     def forward(
         self,
         memory: torch.Tensor | None,
         memory_mask: torch.Tensor | None,
         *,
         batch_size: int | None = None,
+        history_rel_poses: torch.Tensor | None = None,
+        force_no_pose: bool = False,
     ) -> torch.Tensor:
         if self.mode == "off":
             raise RuntimeError(
@@ -90,14 +157,19 @@ class System2MemoryTokens(nn.Module):
 
         if self.mode == "constant":
             if batch_size is None:
-                if memory is None:
+                if memory is None and history_rel_poses is None:
                     raise ValueError(
-                        "the constant arm needs either a batch_size or a memory "
-                        "tensor to size its output"
+                        "the constant arm needs a batch_size, a memory tensor or a "
+                        "pose tensor to size its output"
                     )
-                batch_size = int(memory.shape[0])
+                batch_size = int((memory if memory is not None else history_rel_poses).shape[0])
             tokens = self.constant_embedding.unsqueeze(0).expand(batch_size, -1, -1)
             return tokens.contiguous()
+
+        if self.mode == "geometry":
+            return self.forward_geometry(
+                history_rel_poses, memory_mask, force_no_pose=force_no_pose
+            )
 
         if memory is None or memory_mask is None:
             raise ValueError("mode='memory' requires both memory and memory_mask")
@@ -118,15 +190,59 @@ class System2MemoryTokens(nn.Module):
         weight_dtype = self.projection.weight.dtype
         projected = self.projection(self.memory_norm(memory.to(dtype=weight_dtype)))
         valid = memory_mask.to(device=projected.device, dtype=torch.bool).unsqueeze(-1)
-        absent = self.absent_embedding.to(dtype=projected.dtype).view(1, 1, -1)
-        tokens = torch.where(valid, projected, absent.expand_as(projected))
-        return tokens + self.slot_embedding.to(dtype=projected.dtype).unsqueeze(0)
+        tokens = torch.where(valid, projected, self._absent(projected.shape[0], projected.dtype))
+        return tokens + self._slot(projected.shape[0], projected.dtype)
+
+    def forward_geometry(
+        self,
+        history_rel_poses: torch.Tensor | None,
+        history_mask: torch.Tensor | None,
+        *,
+        force_no_pose: bool = False,
+    ) -> torch.Tensor:
+        """Pose tokens: sinusoidal encoding -> projection, absent where the slot is padded.
+
+        ``force_no_pose`` blanks every slot (evaluation without odometry).  During
+        training, ``pose_dropout`` does the same for a Bernoulli fraction of the
+        batch so that evaluation state is in-distribution.
+        """
+        if self.mode != "geometry":
+            raise RuntimeError("forward_geometry is only valid in mode='geometry'")
+        if history_rel_poses is None or history_mask is None:
+            raise ValueError("mode='geometry' requires history_rel_poses and a history mask")
+        if history_rel_poses.ndim != 3 or history_rel_poses.shape[-1] != POSE_DIM:
+            raise ValueError(
+                f"history_rel_poses must be [B,K,{POSE_DIM}], got {tuple(history_rel_poses.shape)}"
+            )
+        if history_rel_poses.shape[1] != self.num_tokens:
+            raise ValueError(
+                f"history_rel_poses carries {history_rel_poses.shape[1]} slots but the "
+                f"prompt reserves {self.num_tokens} memory tokens; they must match"
+            )
+        batch_size = int(history_rel_poses.shape[0])
+        weight_dtype = self.geometry_projection.weight.dtype
+        device = self.geometry_projection.weight.device
+        poses = history_rel_poses.to(device=device, dtype=torch.float32)
+        if not torch.isfinite(poses).all():
+            raise ValueError("history_rel_poses contains non-finite values")
+        encoded = sinusoidal_pose_encoding(
+            poses, num_freqs=self.pose_num_freqs, max_spatial_range=self.pose_max_range
+        ).to(dtype=weight_dtype)
+        projected = self.geometry_projection(encoded)
+        valid = self._check_mask(history_mask.to(device=device), batch_size)
+        if force_no_pose:
+            valid = torch.zeros_like(valid)
+        elif self.training and self.pose_dropout > 0.0:
+            keep = torch.rand(batch_size, device=device) >= self.pose_dropout
+            valid = valid & keep.unsqueeze(1)
+        tokens = torch.where(
+            valid.unsqueeze(-1), projected, self._absent(batch_size, projected.dtype)
+        )
+        return tokens + self._slot(batch_size, projected.dtype)
 
     def extra_repr(self) -> str:
         return (
             f"mode={self.mode}, num_tokens={self.num_tokens}, "
-            f"memory_dim={self.memory_dim}, embed_dim={self.embed_dim}"
+            f"memory_dim={self.memory_dim}, embed_dim={self.embed_dim}, "
+            f"pose_pe_dim={pose_pe_dim(self.pose_num_freqs)}, pose_dropout={self.pose_dropout}"
         )
-
-
-__all__ = ["MEMORY_MODES", "System2MemoryTokens"]

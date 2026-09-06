@@ -465,6 +465,19 @@ class DaggerSystem2SFTConfig(_Strict):
     # Training-only repetition of the correct_stop rows; the val slice is never
     # oversampled because the decision metrics are read there.
     stop_oversample: int = 1
+    # EXP-17 (C3): System2 first writes an explicit cognition prefix -- each
+    # history slot's canonical view and distance bin, then the route progress
+    # quarter or "arrived" -- and only then its native answer.  Labels come
+    # from the sealed poses, route_progress_m and the R2R reference path.
+    cognition_prefix: bool = False
+    # Fraction of *training* rows whose prefix is replaced by the content-free
+    # placeholder, so that a placeholder prefix at inference is in-distribution
+    # (the load-bearing test).  Fixed before any number is read.
+    prefix_placeholder_fraction: float = 0.0
+    # train.json.gz of R2R_VLNCE: reference_path lengths are the progress denominator.
+    reference_path_json: str | None = None
+    prefix_distance_bins_m: list[float] = [2.0, 5.0]
+    prefix_progress_bins: int = 4
 
     @model_validator(mode="after")
     def _check_source(self):
@@ -473,6 +486,24 @@ class DaggerSystem2SFTConfig(_Strict):
                 "dagger_system2_sft.enabled requires oracle_views_jsonl "
                 "(EXP-12 d1_per_state.jsonl)"
             )
+        if self.cognition_prefix and not (self.reference_path_json or "").strip():
+            raise ValueError(
+                "dagger_system2_sft.cognition_prefix requires reference_path_json "
+                "(the R2R train.json.gz whose reference_path lengths are the "
+                "progress denominator)"
+            )
+        if not 0.0 <= self.prefix_placeholder_fraction < 1.0:
+            raise ValueError("dagger_system2_sft.prefix_placeholder_fraction must be in [0, 1)")
+        if self.prefix_placeholder_fraction > 0.0 and not self.cognition_prefix:
+            raise ValueError(
+                "dagger_system2_sft.prefix_placeholder_fraction > 0 requires cognition_prefix=true"
+            )
+        if len(self.prefix_distance_bins_m) < 1 or sorted(self.prefix_distance_bins_m) != list(
+            self.prefix_distance_bins_m
+        ) or min(self.prefix_distance_bins_m) <= 0:
+            raise ValueError("dagger_system2_sft.prefix_distance_bins_m must be positive and increasing")
+        if not 2 <= self.prefix_progress_bins <= 9:
+            raise ValueError("dagger_system2_sft.prefix_progress_bins must be in [2, 9]")
         if self.max_turns < 1:
             raise ValueError("dagger_system2_sft.max_turns must be >= 1")
         if not 0 < self.val_scene_pct < 100:
@@ -869,9 +900,24 @@ class System2MemoryConfig(_Strict):
 
     enabled: bool = False
     schema_version: Literal["system2-memory-v1"] = "system2-memory-v1"
-    mode: Literal["memory", "constant", "off"] = "memory"
+    # ``geometry`` (EXP-17): the odometry poses themselves are the tokens; the
+    # Past Head is not consulted.  EXP-13-A/EXP-15/EXP-16 showed the pose is
+    # the decision-relevant content of M_t, and the head's outputs are
+    # scene-leaked (ledger lesson 23).
+    mode: Literal["memory", "constant", "geometry", "off"] = "memory"
     num_tokens: int = 8
     memory_dim: int = 256
+    # geometry mode only
+    pose_num_freqs: int = 16
+    pose_max_range: float = 10.0
+    # Fraction of training samples whose pose tokens are blanked, so the arm
+    # can also be read without odometry.  A free parameter: fix it before any
+    # number is read and report every dependence figure "under this fraction".
+    pose_dropout: float = 0.0
+    # Where the sentinel tokens sit in the released prompt.  EXP-13/14 put them
+    # before the history images; EXP-17 puts the pose tokens after the current
+    # view so their states can integrate every image in context.
+    placeholder_position: Literal["before_history", "after_current"] = "before_history"
 
     @model_validator(mode="after")
     def _check_shape(self):
@@ -886,6 +932,12 @@ class System2MemoryConfig(_Strict):
             raise ValueError(
                 "system2_memory.memory_dim must match the Past Head bottleneck (256)"
             )
+        if self.pose_num_freqs < 1 or self.pose_max_range <= 0:
+            raise ValueError("system2_memory.pose_num_freqs >= 1 and pose_max_range > 0")
+        if not 0.0 <= self.pose_dropout < 1.0:
+            raise ValueError("system2_memory.pose_dropout must be in [0, 1)")
+        if self.pose_dropout > 0.0 and self.mode != "geometry":
+            raise ValueError("system2_memory.pose_dropout only applies to mode='geometry'")
         return self
 
 
@@ -1652,9 +1704,10 @@ class TrainConfig(_Lenient):
             return self
 
         if system2_memory is not None and system2_memory.enabled:
-            if not heatmap.enable:
+            if not heatmap.enable and system2_memory.mode == "memory":
                 raise ValueError(
-                    "System2 memory tokens require the Past Head that produces them"
+                    "System2 memory tokens in mode='memory' require the Past Head "
+                    "that produces them"
                 )
             if past_plan_action is not None and past_plan_action.enabled:
                 raise ValueError(

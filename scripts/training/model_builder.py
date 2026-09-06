@@ -179,6 +179,9 @@ def build_model(
         system2_memory_mode=system2_memory_cfg.get('mode', 'memory'),
         system2_memory_num_tokens=system2_memory_cfg.get('num_tokens', 8),
         system2_memory_dim=system2_memory_cfg.get('memory_dim', 256),
+        system2_memory_pose_num_freqs=system2_memory_cfg.get('pose_num_freqs', 16),
+        system2_memory_pose_max_range=system2_memory_cfg.get('pose_max_range', 10.0),
+        system2_memory_pose_dropout=system2_memory_cfg.get('pose_dropout', 0.0),
 
         verbose=verbose,
     )
@@ -233,9 +236,10 @@ def build_model(
             )
         if system2_memory_cfg.get('enabled', False):
             logger.info(
-                "   System2 memory tokens -> enabled=True, mode=%s, tokens=%s",
+                "   System2 memory tokens -> enabled=True, mode=%s, tokens=%s, pose_dropout=%s",
                 system2_memory_cfg.get('mode', 'memory'),
                 system2_memory_cfg.get('num_tokens', 8),
+                system2_memory_cfg.get('pose_dropout', 0.0),
             )
         if s1_ckpt:
             logger.info("   System1 pretrained → %s", s1_ckpt)

@@ -480,6 +480,8 @@ def construct_input_stage2(
     assistant_text: str | None = None,
     conjunction: str | None = None,
     memory_placeholder: str | None = None,
+    memory_placeholder_position: str = "before_history",
+    first_assistant_text: str | None = None,
 ) -> list[dict]:
     """Construct the released InternNav Stage-2 independent-image prompt.
 
@@ -500,8 +502,13 @@ def construct_input_stage2(
         raise ValueError("InternNav conjunction must contain non-whitespace text")
     instruction_text = instruction or ""
     prompt_text = INTERNAV_BASE_PROMPT.format(instruction=instruction_text)
+    if memory_placeholder_position not in ("before_history", "after_current"):
+        raise ValueError(
+            "memory_placeholder_position must be 'before_history' or 'after_current', "
+            f"got {memory_placeholder_position!r}"
+        )
     user_content: list[dict] = [{"type": "text", "text": prompt_text}]
-    if memory_placeholder:
+    if memory_placeholder and memory_placeholder_position == "before_history":
         # Reserved slots the collator rewrites into memory sentinels.  They sit
         # before the observations so the language model reads "where I have
         # been" as part of the same user turn that asks where to go next.
@@ -522,6 +529,11 @@ def construct_input_stage2(
         {"type": "image", "image": current_image},
         {"type": "text", "text": "."},
     ])
+    if memory_placeholder and memory_placeholder_position == "after_current":
+        # EXP-17: the odometry pose tokens sit after the current view, so their
+        # own states can integrate every image already in context and the
+        # answer that follows can attend to them.
+        user_content.append({"type": "text", "text": memory_placeholder})
     messages = [{"role": "user", "content": user_content}]
 
     nav_target_text = assistant_text
@@ -530,9 +542,11 @@ def construct_input_stage2(
         nav_target_text = f"{pixel_goal[1]} {pixel_goal[0]}"
 
     if pixel_goal is not None:
+        # The released first turn is the bare look-down request; EXP-17's
+        # cognition prefix is written in front of it (``first_assistant_text``).
         messages.append({
             "role": "assistant",
-            "content": [{"type": "text", "text": "↓"}],
+            "content": [{"type": "text", "text": first_assistant_text or "↓"}],
         })
         messages.append({
             "role": "user",

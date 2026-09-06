@@ -341,6 +341,17 @@ def build_trajectory_dagger_dataset(
         stop_supervision=bool(sft_cfg.get("stop_supervision", False)),
         stop_horizon_m=float(sft_cfg.get("stop_horizon_m", 1.0)),
         stop_oversample=int(sft_cfg.get("stop_oversample", 1)),
+        cognition_prefix=bool(sft_cfg.get("cognition_prefix", False)),
+        # The val slice never sees a placeholder: the placeholder pass at
+        # evaluation is applied explicitly by the evaluator.
+        prefix_placeholder_fraction=(
+            float(sft_cfg.get("prefix_placeholder_fraction", 0.0))
+            if scene_split != "val"
+            else 0.0
+        ),
+        reference_path_json=sft_cfg.get("reference_path_json"),
+        prefix_distance_bins_m=list(sft_cfg.get("prefix_distance_bins_m", [2.0, 5.0])),
+        prefix_progress_bins=int(sft_cfg.get("prefix_progress_bins", 4)),
     )
     logger.info(
         "DAgger System2 SFT relabelling (%s): %s",

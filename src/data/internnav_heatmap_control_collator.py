@@ -55,6 +55,7 @@ class InternNavHeatmapControlCollator:
         required_history_pose_provider: str | None = None,
         build_sft_labels: bool = False,
         memory_token_count: int = 0,
+        memory_placeholder_position: str = "before_history",
         internnav_conjunction: str | None = None,
     ) -> None:
         image_processor = getattr(processor, "image_processor", None)
@@ -96,6 +97,7 @@ class InternNavHeatmapControlCollator:
             heatmap_layout=False,
             force_internnav_prompt=True,
             memory_token_count=int(memory_token_count),
+            memory_placeholder_position=str(memory_placeholder_position),
             internnav_conjunction=internnav_conjunction,
         )
 

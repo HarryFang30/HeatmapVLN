@@ -1068,6 +1068,9 @@ def main():
                 if system2_memory_enabled
                 else 0
             ),
+            memory_placeholder_position=str(
+                system2_memory_cfg.get('placeholder_position', 'before_history')
+            ),
             internnav_conjunction=(
                 'you can see ' if system2_memory_enabled else None
             ),

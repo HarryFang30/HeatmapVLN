@@ -116,8 +116,14 @@ class PanoramicTokenizedCollator:
         memory_token_count: int = 0,
         memory_placeholder_token: str = "<|fim_pad|>",
         internnav_conjunction: str | None = None,
+        memory_placeholder_position: str = "before_history",
     ):
         self.processor = processor
+        if memory_placeholder_position not in ("before_history", "after_current"):
+            raise ValueError(
+                "memory_placeholder_position must be 'before_history' or 'after_current'"
+            )
+        self.memory_placeholder_position = str(memory_placeholder_position)
         self.processor.tokenizer.padding_side = "left"
         # Truncate from left so oldest history tokens are dropped first,
         # preserving the current observation and assistant response.
@@ -589,6 +595,11 @@ class PanoramicTokenizedCollator:
                     pg = sample.get("pixel_goal")
                     assistant_texts = self._assistant_texts_for_sft(sample) if self.sft_mode else []
                     assistant_text = assistant_texts[-1] if assistant_texts else None
+                    # A two-turn target ("prefix↓", "v u") overrides the bare
+                    # look-down first turn; a one-turn target leaves it alone.
+                    first_assistant_text = (
+                        assistant_texts[0] if len(assistant_texts) >= 2 else None
+                    )
                     messages_batch.append(
                         construct_input_stage2(
                             history_frames=history_list,
@@ -599,6 +610,8 @@ class PanoramicTokenizedCollator:
                             assistant_text=assistant_text,
                             conjunction=self.internnav_conjunction,
                             memory_placeholder=self._memory_placeholder_text(),
+                            memory_placeholder_position=self.memory_placeholder_position,
+                            first_assistant_text=first_assistant_text,
                         )
                     )
                     sft_target_texts.append(assistant_texts)
