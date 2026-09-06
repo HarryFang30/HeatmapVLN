@@ -1263,6 +1263,9 @@ System1 不构建。**代价：8 卡 × 约 3–4 h × 2 臂**，走网页提交
 合并 SR 差的 95% CI 下界 > 0 为支持），**外加一条否决项**：早停率（停下且从未进过 3 m 圈）
 相对 native 上升超过 **0.5pt**，SR 涨多少都判否定；OS 下降超过 1pt 记为早停泄漏的旁证。
 附带（无判据）：OS − SR 是否收窄。13-C 关于先补 AMB3R VO 缓存的要求原样适用。
+**14-C 准入（2026-09-06 补，写于 EXP-14 出任何读数之前）**：进入 14-C 还要求该臂在 val 的 `dagger_normal` 状态上
+`stop_false_alarm ≤ 0.002`。理由：native 每集平均 17 次慢系统调用（EXP-16 实测分布，中位 13 / p90 25），
+逐状态 0.02 的线对应约三成 episode 至少误停一次，0.002 对应约 3%。EXP-14 自身的支持 / 否定判据一字不动。
 
 **设置.** `configs/ablation/exp14{a,b}_*.yaml` = 13-B 两臂 + `stop_supervision: true`、
 `stop_horizon_m: 1.0`、`stop_oversample: K`；`tests/test_exp14_configs.py` 把三组 diff 钉死
@@ -1274,6 +1277,10 @@ System1 不构建。**代价：8 卡 × 约 3–4 h × 2 臂**，走网页提交
 s ≥ 0.03 则 K = 1，否则 K = min(8, ⌈0.03 / s⌉)——把 `correct_stop` 行的有效占比抬到 3%，
 只作用于 train 切片，val 永不过采样。启动脚本复用 13-B 的（`EXP13_ARMS="exp14a exp14b"`）。
 代价：8 卡 × 约 3–4 h × 2 臂，与 13-B 相同，**顶替**它而不是叠加。
+**4 卡变体（2026-09-06 加，判据不变）**：`configs/ablation/exp14{a,b}_*_4gpu.yaml` 与 8 卡配置只差 `gpu.devices` 与
+`grad_accum_steps` 2→4（`tests/test_exp14_configs.py` 钉死）。每个优化步消耗的 16 个样本集合、优化步数与调度都与 8 卡相同，
+只是分给 4 个 rank；`val_lm_loss` 分片略有不同，理论上可能影响两个 epoch 之间的选点。代价 4 卡 × 约 7 h × 2 臂。
+无论哪种卡数，读数都由同一个单卡评测工具产生，与 §0 第 7 条"改卡数不能与既有臂比较"的顾虑无关：本实验没有既有臂。
 
 **开发期预览披露.** 写判据的同一个会话里，先用一段纯 CPU 脚本扫了全部 10804 个 `episode.tar`
 里的 `samples.jsonl`（不经 dataset 类、不核 sha256），只为核实上面"数据事实"那一段并给 K 定值：
@@ -1322,6 +1329,8 @@ shard_00 全部 7748 个状态的 native 文本与像素目标逐一相符，**�
 ④ 单训练种子起步。
 ⑤ 决策级指标是首 token 的 argmax，等于贪心解码的首 token；闭环里的停还要经过 RPC 路径的
 解析与执行，14-C 才是最终的数。
+⑥（2026-09-06 补）exp14a 的 `M_t` 来自冻结历史头，该头训在 R2R v2 的 26 个场景上、其中 6 个落在 val 的 17 个场景里
+（§5 第 23/24 条）；exp14a 在 val 上占了便宜，exp14b（constant）干净。两臂之差若为正，先按此折扣读。
 
 🔁 [exp13-decision-layer-runbook.md](exp13-decision-layer-runbook.md) §0b/§2 ｜
 📤 [exp14-system2-stop-submission.md](exp14-system2-stop-submission.md)
