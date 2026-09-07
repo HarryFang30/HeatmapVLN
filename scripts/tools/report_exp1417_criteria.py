@@ -32,6 +32,19 @@ def _pt(value: float | None) -> str:
     return "  n/a " if value is None else f"{value * 100:+.2f}pt"
 
 
+def _sub(a: float | None, b: float | None) -> float | None:
+    """A metric with no states behind it stays missing rather than becoming 0."""
+    return None if (a is None or b is None) else a - b
+
+
+def _ge(value: float | None, bound: float) -> bool:
+    return value is not None and value >= bound
+
+
+def _le(value: float | None, bound: float) -> bool:
+    return value is not None and value <= bound
+
+
 def _load(path: Path | None) -> dict[str, Any] | None:
     return json.loads(path.read_text()) if path else None
 
@@ -55,17 +68,21 @@ def exp14(a: dict[str, Any], b: dict[str, Any]) -> str:
     turn_b = b["recovery_turn_accuracy"]
     normal_fa = (a.get("stop_false_alarm_by_source") or {}).get("dagger_normal")
 
-    if recall < 0.20 or false_alarm > 0.05:
+    if recall is None or false_alarm is None:
+        stop_verdict = UNMEASURED
+    elif recall < 0.20 or false_alarm > 0.05:
         stop_verdict = NEGATE
-    elif recall >= 0.50 and false_alarm <= 0.02 and preservation >= 0.90:
+    elif recall >= 0.50 and false_alarm <= 0.02 and _ge(preservation, 0.90):
         stop_verdict = SUPPORT
     else:
         stop_verdict = UNMEASURED
 
-    delta_turn = turn_a - turn_b
-    if delta_turn <= 0.02 or a["normal_preservation"] < 0.75:
+    delta_turn = _sub(turn_a, turn_b)
+    if delta_turn is None:
+        turn_verdict = UNMEASURED
+    elif delta_turn <= 0.02 or (preservation is not None and preservation < 0.75):
         turn_verdict = NEGATE
-    elif delta_turn >= 0.10 and turn_a >= 0.50 and preservation >= 0.90:
+    elif delta_turn >= 0.10 and _ge(turn_a, 0.50) and _ge(preservation, 0.90):
         turn_verdict = SUPPORT
     else:
         turn_verdict = UNMEASURED
@@ -105,23 +122,30 @@ def exp17(b17: dict, a17: dict | None, b14: dict | None, a14: dict | None,
     view_macro = prefix.get("slot_view_macro_acc")
     progress_macro = prefix.get("progress_macro_acc")
 
-    v1a = SUPPORT if (view_macro or 0) >= 0.90 else NEGATE
+    v1a = SUPPORT if _ge(view_macro, 0.90) else (NEGATE if view_macro is not None else UNMEASURED)
     _row(rows, "1a 方位宏准确率 (C3 自然)", view_macro, "支持 ≥ 0.90 / 否定 < 0.90", v1a)
 
-    v1c = SUPPORT if (progress_macro or 0) >= 0.62 else (NEGATE if (progress_macro or 0) <= 0.52 else UNMEASURED)
+    v1c = SUPPORT if _ge(progress_macro, 0.62) else (NEGATE if _le(progress_macro, 0.52) else UNMEASURED)
     _row(rows, "1c 进度宏准确率 (C3 自然)", progress_macro, "支持 ≥ 0.62 / 否定 ≤ 0.52", v1c)
 
     no_pose = (b17["passes"].get("no_pose") or {}).get("prefix") or {}
     view_nopose = no_pose.get("slot_view_macro_acc")
-    v1d = SUPPORT if (view_nopose or 0) >= 0.45 else (NEGATE if (view_nopose or 0) <= 0.30 else UNMEASURED)
+    v1d = SUPPORT if _ge(view_nopose, 0.45) else (NEGATE if _le(view_nopose, 0.30) else UNMEASURED)
     _row(rows, "1d 不给位姿的方位宏准确率", view_nopose, "支持 ≥ 0.45 / 否定 ≤ 0.30", v1d)
 
     ph = b17["passes"].get("placeholder")
     if ph:
-        d_stop = nat["stop_recall"] - ph["stop_recall"]
-        d_turn = nat["recovery_turn_accuracy"] - ph["recovery_turn_accuracy"]
-        best = max(d_stop, d_turn)
-        v2a = SUPPORT if best >= 0.05 else (f"{NEGATE}（记为装饰）" if (d_stop <= 0.02 and d_turn <= 0.02) else UNMEASURED)
+        d_stop = _sub(nat["stop_recall"], ph["stop_recall"])
+        d_turn = _sub(nat["recovery_turn_accuracy"], ph["recovery_turn_accuracy"])
+        seen = [d for d in (d_stop, d_turn) if d is not None]
+        if not seen:
+            v2a = UNMEASURED
+        elif max(seen) >= 0.05:
+            v2a = SUPPORT
+        elif _le(d_stop, 0.02) and _le(d_turn, 0.02):
+            v2a = f"{NEGATE}（记为装饰）"
+        else:
+            v2a = UNMEASURED
         _row(rows, "2a 自然−占位 · stop_recall", _pt(d_stop), "支持任一 ≥ +5pt", "")
         _row(rows, "2a 自然−占位 · turn_accuracy", _pt(d_turn), "两项都 ≤ +2pt → 装饰", v2a)
 
@@ -145,17 +169,17 @@ def exp17(b17: dict, a17: dict | None, b14: dict | None, a14: dict | None,
 
     if b14:
         base = b14["passes"]["natural"]
-        d_turn3a = nat["recovery_turn_accuracy"] - base["recovery_turn_accuracy"]
-        v3a = SUPPORT if d_turn3a >= 0.05 else (NEGATE if d_turn3a <= 0.02 else UNMEASURED)
+        d_turn3a = _sub(nat["recovery_turn_accuracy"], base["recovery_turn_accuracy"])
+        v3a = SUPPORT if _ge(d_turn3a, 0.05) else (NEGATE if _le(d_turn3a, 0.02) else UNMEASURED)
         _row(rows, "3a 转向 C3 − exp14b", _pt(d_turn3a), "支持 ≥ +5pt / 否定 ≤ +2pt（预期落否定）", v3a)
-        d_stop3b = nat["stop_recall"] - base["stop_recall"]
-        fa_ok = nat["stop_false_alarm"] <= 0.02
-        v3b = (SUPPORT if (d_stop3b >= 0.05 and fa_ok) else (NEGATE if d_stop3b <= 0.02 else UNMEASURED))
+        d_stop3b = _sub(nat["stop_recall"], base["stop_recall"])
+        fa_ok = _le(nat["stop_false_alarm"], 0.02)
+        v3b = (SUPPORT if (_ge(d_stop3b, 0.05) and fa_ok) else (NEGATE if _le(d_stop3b, 0.02) else UNMEASURED))
         _row(rows, "3b 停 C3 − exp14b", _pt(d_stop3b), "支持 ≥ +5pt 且误报 ≤ 0.02", "")
         _row(rows, "3b C3 stop_false_alarm", nat["stop_false_alarm"], "≤ 0.02", v3b)
 
     pres, nonpix, fa_norm = nat["preservation_generated"], nat["nonpixel_on_normal"], nat["stop_false_alarm_normal"]
-    v4 = SUPPORT if (pres >= 0.98 and nonpix <= 0.005 and fa_norm <= 0.002) else NEGATE
+    v4 = SUPPORT if (_ge(pres, 0.98) and _le(nonpix, 0.005) and _le(fa_norm, 0.002)) else NEGATE
     _row(rows, "4 preservation_generated", pres, "≥ 0.98", "")
     _row(rows, "4 nonpixel_on_normal", nonpix, "≤ 0.005", "")
     _row(rows, "4 stop_false_alarm_normal", fa_norm, "≤ 0.002", v4)
@@ -164,16 +188,16 @@ def exp17(b17: dict, a17: dict | None, b14: dict | None, a14: dict | None,
     extra: list = []
     if a17:
         na = a17["passes"]["natural"]
-        _row(extra, "C3 − C1 · turn", _pt(nat["recovery_turn_accuracy"] - na["recovery_turn_accuracy"]), "报告，不作承重", "")
-        _row(extra, "C3 − C1 · stop_recall", _pt(nat["stop_recall"] - na["stop_recall"]), "报告，不作承重", "")
+        _row(extra, "C3 − C1 · turn", _pt(_sub(nat["recovery_turn_accuracy"], na["recovery_turn_accuracy"])), "报告，不作承重", "")
+        _row(extra, "C3 − C1 · stop_recall", _pt(_sub(nat["stop_recall"], na["stop_recall"])), "报告，不作承重", "")
     if a14 and b14:
         _row(extra, "exp14a − exp14b · stop_recall (生成)",
-             _pt(a14["passes"]["natural"]["stop_recall"] - b14["passes"]["natural"]["stop_recall"]), "同一口径", "")
+             _pt(_sub(a14["passes"]["natural"]["stop_recall"], b14["passes"]["natural"]["stop_recall"])), "同一口径", "")
     for tag, clean, noisy in (("C3", b17, noise_b), ("C1", a17, noise_a)):
         if clean and noisy:
             c, n = clean["passes"]["natural"], noisy["passes"]["natural"]
-            _row(extra, f"{tag} 位姿噪声 · stop_recall", _pt(n["stop_recall"] - c["stop_recall"]), "掉 ≥ 5pt 则先训 exp17c", "")
-            _row(extra, f"{tag} 位姿噪声 · turn", _pt(n["recovery_turn_accuracy"] - c["recovery_turn_accuracy"]), "掉 ≥ 5pt 则先训 exp17c", "")
+            _row(extra, f"{tag} 位姿噪声 · stop_recall", _pt(_sub(n["stop_recall"], c["stop_recall"])), "掉 ≥ 5pt 则先训 exp17c", "")
+            _row(extra, f"{tag} 位姿噪声 · turn", _pt(_sub(n["recovery_turn_accuracy"], c["recovery_turn_accuracy"])), "掉 ≥ 5pt 则先训 exp17c", "")
     if extra:
         _print("附带读数（无判据）", extra)
 
