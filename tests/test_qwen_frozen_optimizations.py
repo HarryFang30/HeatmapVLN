@@ -201,18 +201,77 @@ def test_correct_label_logprobs_use_sparse_predictor_union_and_fp32():
     torch.testing.assert_close(lm_output["correct_label_logprobs"], expected)
 
 
-class _NoSparseLogitsModel(nn.Module):
+class _FullLogitsModel(nn.Module):
+    """A wrapper predating tensor ``logits_to_keep``, as in transformers 4.51."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.body_calls = 0
+
     def forward(self, input_ids, output_hidden_states, return_dict, use_cache):
-        del input_ids, output_hidden_states, return_dict, use_cache
-        raise AssertionError("forward body should not run")
+        del output_hidden_states, return_dict, use_cache
+        self.body_calls += 1
+        batch, sequence = input_ids.shape
+        vocabulary = 5
+        row = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1)
+        position = torch.arange(sequence, dtype=torch.float32).view(1, sequence, 1)
+        token = torch.arange(vocabulary, dtype=torch.float32).view(1, 1, vocabulary)
+        logits = row + position + token.square() * self.scale
+        return SimpleNamespace(logits=logits, loss=None, hidden_states=None)
 
 
-def test_correct_label_logprobs_refuse_silent_full_logits_fallback():
+def test_correct_label_logprobs_fall_back_to_aligned_full_logits():
+    """Same numbers as the sparse path, from a wrapper that cannot subset."""
     integration = Qwen2_5VLIntegration(Qwen2_5VLConfig(device="cpu"))
-    integration.model = _NoSparseLogitsModel()
+    model = _FullLogitsModel()
+    integration.model = model
     integration._model_loaded = True
     integration.image_token_id = 999
-    with torch.no_grad(), pytest.raises(RuntimeError, match="refusing an implicit"):
+    input_ids = torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]])
+    labels = torch.tensor(
+        [
+            [-100, -100, 2, 1, -100, -100],
+            [-100, 0, -100, -100, -100, 3],
+        ]
+    )
+
+    _hidden, _vision, _n_img, _traj, lm_output = integration._forward_model_inputs(
+        {"input_ids": input_ids, "labels": labels},
+        return_hidden_states=False,
+        return_lm_correct_logprobs=True,
+    )
+
+    # The first attempt is rejected while binding arguments, so the body runs once.
+    assert model.body_calls == 1
+    alignment = lm_output["alignment"]
+    assert alignment["backend"] == "hf_full_logits_predictor_gather_v1"
+    assert alignment["full_sequence_logits"] is True
+    assert alignment["sample_predictor_positions"] == [[1, 2], [0, 4]]
+    assert alignment["sample_correct_token_ids"] == [[2, 1], [0, 3]]
+    assert lm_output["correct_label_logprobs"].dtype == torch.float32
+    token_logits = torch.arange(5, dtype=torch.float32).square()
+    expected = F.log_softmax(token_logits, dim=-1)[torch.tensor([2, 1, 0, 3])]
+    torch.testing.assert_close(lm_output["correct_label_logprobs"], expected)
+
+
+class _MisalignedLogitsModel(nn.Module):
+    """Returns logits for the wrong number of columns; must be refused."""
+
+    def forward(self, input_ids, output_hidden_states, return_dict, use_cache):
+        del output_hidden_states, return_dict, use_cache
+        batch, sequence = input_ids.shape
+        return SimpleNamespace(
+            logits=torch.zeros(batch, sequence - 1, 5), loss=None, hidden_states=None
+        )
+
+
+def test_correct_label_logprobs_refuse_logits_it_cannot_align():
+    integration = Qwen2_5VLIntegration(Qwen2_5VLConfig(device="cpu"))
+    integration.model = _MisalignedLogitsModel()
+    integration._model_loaded = True
+    integration.image_token_id = 999
+    with torch.no_grad(), pytest.raises(RuntimeError, match="cannot align"):
         integration._forward_model_inputs(
             {
                 "input_ids": torch.tensor([[1, 2, 3]]),

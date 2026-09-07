@@ -1113,12 +1113,27 @@ class Qwen2_5VLIntegration(nn.Module):
                     return_lm_correct_logprobs
                     and "logits_to_keep" in str(exc)
                 ):
-                    raise RuntimeError(
-                        "The loaded Qwen wrapper does not support tensor "
-                        "`logits_to_keep`; refusing an implicit full-logits "
-                        "fallback for correct-label preservation"
-                    ) from exc
-                raise
+                    # Transformers 4.51's Qwen2.5-VL forward has no
+                    # ``logits_to_keep`` at all, so the position-subset trick is
+                    # simply unavailable here.  Retry over the full sequence and
+                    # gather the very same supervised positions: the alignment
+                    # record below says which path produced the numbers, and the
+                    # shape check still refuses anything it cannot align.
+                    if "logits_to_keep" not in fwd_kwargs:
+                        raise
+                    fwd_kwargs.pop("logits_to_keep")
+                    assert correct_logprob_alignment is not None
+                    correct_logprob_alignment["backend"] = (
+                        "hf_full_logits_predictor_gather_v1"
+                    )
+                    correct_logprob_alignment["full_sequence_logits"] = True
+                    logger.info(
+                        "Qwen forward does not take logits_to_keep; gathering "
+                        "correct-label log probs from full-sequence logits"
+                    )
+                    outputs = _run_with_runtime_context()
+                else:
+                    raise
             if (
                 use_last_hidden_state_only
                 and self._last_hidden_state_from_outputs(outputs) is None
@@ -1165,14 +1180,21 @@ class Qwen2_5VLIntegration(nn.Module):
                 device=logits.device,
                 dtype=torch.long,
             )
+            full_sequence_logits = bool(
+                correct_logprob_alignment.get("full_sequence_logits", False)
+            )
+            expected_columns = (
+                int(lm_labels.shape[1]) if full_sequence_logits else predictor_union.numel()
+            )
             if (
                 logits.shape[0] != lm_labels.shape[0]
-                or logits.shape[1] != predictor_union.numel()
+                or logits.shape[1] != expected_columns
             ):
                 raise RuntimeError(
-                    "Qwen did not honor tensor logits_to_keep exactly: "
+                    "Qwen returned logits this forward cannot align: "
                     f"logits={tuple(logits.shape)} expected_batch={lm_labels.shape[0]} "
-                    f"expected_kept_positions={predictor_union.numel()}"
+                    f"expected_columns={expected_columns} "
+                    f"(full_sequence={full_sequence_logits})"
                 )
             flat_correct_logprobs = []
             predicted_token_ids: list[list[int]] = []
@@ -1188,7 +1210,14 @@ class Qwen2_5VLIntegration(nn.Module):
                 token_ids = torch.tensor(
                     token_ids_list, device=logits.device, dtype=torch.long,
                 )
-                kept_columns = torch.searchsorted(predictor_union, positions)
+                # Position p predicts the label at p+1, so on full-sequence
+                # logits the supervised columns are the predictor positions
+                # themselves; on a kept subset they are their ranks in the union.
+                kept_columns = (
+                    positions
+                    if full_sequence_logits
+                    else torch.searchsorted(predictor_union, positions)
+                )
                 selected_logits = logits[row, kept_columns].float()
                 correct_logits = selected_logits.gather(
                     dim=-1, index=token_ids.unsqueeze(-1),
