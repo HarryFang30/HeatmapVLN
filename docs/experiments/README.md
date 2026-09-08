@@ -1896,8 +1896,8 @@ exp17b 同形：撤前缀内容掉 17.66pt（0.2777 → 0.1011），跨臂对照
 | EXP-16 进度/到达读出 + 3a 净收益曲线（判据来源，**已跑**，2026-09-06） | `model/exp16_progress_probe/readout_progress.json` + `probe.log` |
 | EXP-16 场景泄漏 preflight 输出（2026-09-06） | `model/exp16_progress_probe/scene_split_leakage.json` |
 | EXP-17 两臂训练（**已跑**，2026-09-06/07，8 卡 × 3.2 h × 2） | `model/exp17_cognition_prefix/exp17a/run_20260906_202621/`、`exp17b/run_20260907_001026/` |
-| EXP-17 生成式决策评测（**已跑** exp17b 与 exp14b，2026-09-08，判据来源） | `model/exp17_cognition_prefix/{exp17b,exp14b}/decisions_generated.json` |
-| EXP-17 位姿噪声读数（**已跑**，0.2 m / 10°，边界②的规则来源） | `model/exp17_cognition_prefix/exp17b/decisions_generated_posenoise.json` |
+| EXP-17 生成式决策评测（**已跑** 四臂同口径，2026-09-08，判据来源） | `model/exp17_cognition_prefix/{exp17a,exp17b,exp14a,exp14b}/decisions_generated.json` |
+| EXP-17 位姿噪声读数（**已跑** exp17a/exp17b，0.2 m / 10°，边界②的规则来源） | `model/exp17_cognition_prefix/{exp17a,exp17b}/decisions_generated_posenoise.json` |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |
