@@ -46,10 +46,10 @@
 | [EXP-11](#exp-11-四方向表征的标签覆盖率) | 四方向表征在标签层面覆盖了什么——替代"只预测更少方向"的重训消融 | ⚠️ | 历史路点 99.7% 不在前视（后视 82.3%）；未来 92.6% 在前视、侧后 ≈5% |
 | [EXP-12](#exp-12-恢复状态决策层的三个门控诊断) | 把认知的作用点从 System1 的条件挪到 System2 的决策层，值不值得做 | ⚠️ | H-D2 否定：零样本未来头是常数"前"预测器（oracle 非前视的 937 个状态里只对 1 个）；D1/D3 没测出来，D3a 判据因选择偏差作废 |
 | [EXP-13](#exp-13-把认知的作用点挪到-system2-的提示里) | 把 `M_t` 从 Z 挪进 System2 的提示，认知能不能改变"去哪"这个决定 | ⚠️ | **13-A 没测出来**：Δ_recovery +12.64pt、召回 0.4898 都过线，但误报率 0.3761 远超 ≤0.10（七个臂无一过线，是线设错了）。**诚实条款已触发**——80 维手工几何量（0.5227）压过 2056 维 `M_t`（0.5085），差 1.42pt < 3pt，论文只能写"缺的是几何量"。13-B 可跑但归因已被封顶 |
-| [EXP-14](#exp-14-把停的决定也放进同一次微调) | 把停的决定放进同一次决策层微调：OS−SR 8.9pt 那一格能不能在决策级被打开 | ⏳ | 已预注册：**顶替** 13-B 的那次训练（同两臂 + 停重标），停/转向判据分别读，14-C 加早停否决项 |
+| [EXP-14](#exp-14-把停的决定也放进同一次微调) | 把停的决定放进同一次决策层微调：OS−SR 8.9pt 那一格能不能在决策级被打开 | ❌ | **总门判停**（2026-09-08）：转向否定（记忆−常数 −0.69pt，两臂都 ≈0.39），停没测出来（召回 0.956 但误报 0.045、逐 token 保持 0.584 < 0.75 的否定线）。14-C 不跑 |
 | [EXP-15](#exp-15-几何优势扛不扛得住部署期的位姿误差) | 13-A 的几何优势用的是 Habitat 真值位姿，换成部署期的 VO 量级噪声还在不在 | ⚠️ | 判据档 0.5028 ≥ 0.45 **过线（支持）**，但成分分解显示读的是没被加噪的 `visibility` 替身。两条更硬的读数：**16 维 `age+mask`（0.4221）压过 14336 维 `system2`（0.3633）→ 13-A 的 Δ 全被过拟合放大**；按记账基线重算，度量位姿在噪声下只值 **+5.9pt**（干净 +11.2pt），不是 +15.94pt |
 | [EXP-16](#exp-16-进度是否已经可读到达读出能否在集级净赚) | 慢系统隐状态是否已含"进度 / 到达"信息、超出时间记账量；用现成特征读出"到达"并覆盖成 STOP，在集级能否净赚 | ✅ | 两条假设都支持：慢系统不含超出记账量的分段进度（PCA 最优档比 age+mask 低 6.8pt），"到达"可读（AUC 0.90）但集级净收益峰值只有 +0.34pt → **零训练覆盖金丝雀取消** |
-| [EXP-17](#exp-17-认知前缀慢系统在决定之前显式写出来路与进度) | 位姿作输入 token、慢系统在答案之前生成显式认知前缀（方位/远近/进度）：前缀可学否、决定读不读它、停/转向改善否、正常状态保持否 | ⏳ | 判据已预注册（2026-09-06），代码与测试已入库，待网站提交 exp17a/exp17b |
+| [EXP-17](#exp-17-认知前缀慢系统在决定之前显式写出来路与进度) | 位姿作输入 token、慢系统在答案之前生成显式认知前缀（方位/远近/进度）：前缀可学否、决定读不读它、停/转向改善否、正常状态保持否 | ❌ | **主张不成立**（2026-09-08）：格式门 0.607 < 0.90，撤位姿后塌到 0.067（无内化），保持门差 4×（不进闭环），同口径比 constant 基线转向 −12.0pt / 停 −6.3pt。成立的只有进度可读（+12.0pt vs 记账量）与「前缀改变决定」（槽位承重，非内容承重） |
 
 ### 跨实验：未来头退化的三层证据链
 
@@ -1855,14 +1855,15 @@ native SR 62.48%，掉 8.5pt 会落到 54% 上下，**低于 SR ≥ 60% 的地�
 | EXP-13-B 两臂训练（**待跑**，8 卡 × 3–4 h × 2） | `model/exp13_system2_memory/{exp13a,exp13b}/run_*/` |
 | EXP-13-B 决策评测（**待跑**，判据来源） | `model/exp13_system2_memory/{exp13a,exp13b}/decisions.json` |
 | EXP-14 重标预检（纯 CPU，含终点路线分布，**不是判据**） | `model/exp14_relabel_audit.json` |
-| EXP-14 两臂训练（**待跑**，顶替 13-B，8 卡 × 3–4 h × 2） | `model/exp14_system2_memory_stop/{exp14a,exp14b}/run_*/` |
-| EXP-14 决策评测（**待跑**，判据来源） | `model/exp14_system2_memory_stop/{exp14a,exp14b}/decisions.json` |
+| EXP-14 两臂训练（**已跑**，2026-09-07，8 卡；作废的 09-06 那次见「运行记录」） | `model/exp14_system2_memory_stop/exp14a/run_20260907_042842/`、`exp14b/run_20260907_101400/` |
+| EXP-14 决策评测（**已跑**，2026-09-08，判据来源） | `model/exp14_system2_memory_stop/{exp14a,exp14b}/decisions.json` |
 | EXP-15 位姿噪声扫描（判据来源） | `model/exp15_pose_noise/readout_noise_sweep.json` |
 | EXP-15 成分分解（解释用，非判据） | `model/exp15_pose_noise/readout_noise_sweep_decomposed.json` |
 | EXP-16 进度/到达读出 + 3a 净收益曲线（判据来源，**已跑**，2026-09-06） | `model/exp16_progress_probe/readout_progress.json` + `probe.log` |
 | EXP-16 场景泄漏 preflight 输出（2026-09-06） | `model/exp16_progress_probe/scene_split_leakage.json` |
-| EXP-17 两臂训练（**待跑**，8 卡 × 4–5 h × 2） | `model/exp17_cognition_prefix/{exp17a,exp17b}/run_*/` |
-| EXP-17 生成式决策评测（判据来源；exp14a/b 同口径重读也放这里） | `model/exp17_cognition_prefix/{exp17a,exp17b,exp14a,exp14b}/decisions_generated.json` |
+| EXP-17 两臂训练（**已跑**，2026-09-06/07，8 卡 × 3.2 h × 2） | `model/exp17_cognition_prefix/exp17a/run_20260906_202621/`、`exp17b/run_20260907_001026/` |
+| EXP-17 生成式决策评测（**已跑** exp17b 与 exp14b，2026-09-08，判据来源） | `model/exp17_cognition_prefix/{exp17b,exp14b}/decisions_generated.json` |
+| EXP-17 位姿噪声读数（**已跑**，0.2 m / 10°，边界②的规则来源） | `model/exp17_cognition_prefix/exp17b/decisions_generated_posenoise.json` |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |
