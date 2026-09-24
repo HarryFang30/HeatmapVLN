@@ -3961,6 +3961,11 @@ def run_eval_rpc_panoramic(args):
     env = _create_habitat_env(hab_cfg, args)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
+    step_tracer = None
+    if getattr(args, "step_state_trace_dir", None) is not None:
+        from scripts.exp19.step_trace import StepStateTracer
+
+        step_tracer = StepStateTracer(args.step_state_trace_dir, hab_cfg.SIMULATOR.RGB_SENSOR)
 
     dagger_api = None
     dagger_state = None
@@ -4165,6 +4170,8 @@ def run_eval_rpc_panoramic(args):
                 f"{scene_id}/{episode_id:04d}",
                 max_frames=int(max_steps_per_episode) + 1,
             )
+        if step_tracer is not None:
+            step_tracer.begin_episode(scene_id, episode_id, episode, instruction, env._sim.get_agent(0).get_state())
 
         dagger_episode_key = None
         dagger_episode_active = False
@@ -4256,9 +4263,19 @@ def run_eval_rpc_panoramic(args):
                     front_rgb,
                     capture_step=step_id,
                 )
+            if step_tracer is not None:
+                step_tracer.record_state(
+                    step_id,
+                    env._sim.get_agent(0).get_state(),
+                    observations,
+                    vo_frame_id=current_vo_frame_id,
+                    queue_len=len(local_actions),
+                )
             stop_result = _maybe_stop_at_success(env, args, step_id)
             if stop_result is not None:
                 observations, done, new_step_id = stop_result
+                if step_tracer is not None:
+                    step_tracer.record_action(step_id, int(ActionCode.STOP), "auto_stop", None)
                 _record_post_action_step(
                     step_recorder,
                     env,
@@ -4299,6 +4316,8 @@ def run_eval_rpc_panoramic(args):
                         f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
                         flush=True,
                     )
+                if step_tracer is not None:
+                    step_tracer.record_action(step_id, action, "local_action", system2_calls - 1)
                 step_id += 1
                 _record_post_action_step(
                     step_recorder,
@@ -4317,6 +4336,8 @@ def run_eval_rpc_panoramic(args):
                     flush=True,
                 )
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                if step_tracer is not None:
+                    step_tracer.record_action(step_id, int(ActionCode.STOP), "max_system2_stop", None)
                 step_id += 1
                 _record_post_action_step(
                     step_recorder,
@@ -4538,6 +4559,12 @@ def run_eval_rpc_panoramic(args):
                         break
                     before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                     observations, done = _apply_habitat_action(env, alignment_action)
+                    if step_tracer is not None:
+                        # The loop never revisits recenter steps, so record their state here.
+                        step_tracer.record_action(step_id, alignment_action, "pano_recenter", system2_calls - 1)
+                        step_tracer.record_state(
+                            step_id + 1, env._sim.get_agent(0).get_state(), observations, vo_frame_id=None, queue_len=0
+                        )
                     step_id += 1
                     recenter_actions_executed += 1
                     if before is not None:
@@ -4830,6 +4857,10 @@ def run_eval_rpc_panoramic(args):
             if response.get("terminal", False):
                 action = actions[0] if actions else ActionCode.STOP
                 observations, done = _apply_habitat_action(env, action)
+                if step_tracer is not None:
+                    step_tracer.record_action(
+                        step_id, action, "terminal", system2_calls - 1, response_kind=response.get("kind")
+                    )
                 step_id += 1
                 _record_post_action_step(
                     step_recorder,
@@ -4844,6 +4875,14 @@ def run_eval_rpc_panoramic(args):
 
             if not actions:
                 observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                if step_tracer is not None:
+                    step_tracer.record_action(
+                        step_id,
+                        int(ActionCode.STOP),
+                        "rpc_empty_actions",
+                        system2_calls - 1,
+                        response_kind=response.get("kind"),
+                    )
                 step_id += 1
                 _record_post_action_step(
                     step_recorder,
@@ -4869,6 +4908,8 @@ def run_eval_rpc_panoramic(args):
                     f"  [debug] executed first RPC action={int(first_action)} {before} -> {_env_trace_summary(env)}",
                     flush=True,
                 )
+            if step_tracer is not None:
+                step_tracer.record_action(step_id, first_action, "rpc_first", system2_calls - 1)
             step_id += 1
             forward_action_count += 1
             _record_post_action_step(
@@ -4913,6 +4954,16 @@ def run_eval_rpc_panoramic(args):
                 total_steps=step_id,
                 vlm_calls=system2_calls,
                 traj_calls=trajectory_calls,
+            )
+        if step_tracer is not None:
+            step_tracer.end_episode(
+                step_id,
+                env._sim.get_agent(0).get_state(),
+                observations,
+                metrics,
+                done=done,
+                max_steps=max_steps_per_episode,
+                system2_calls=system2_calls,
             )
         print(
             f"  => success: {metrics['success']}, spl: {metrics['spl']:.4f}, "
@@ -5799,6 +5850,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--step_state_trace_dir",
+        type=str,
+        default=None,
+        help=(
+            "EXP-19 (RPC path only): write a read-only per-step trace (true agent state, native front RGB, "
+            "executed actions) to <dir>/<scene>_<ep>/steps.jsonl via scripts/exp19/step_trace.py. "
+            "Default: off."
+        ),
+    )
+    parser.add_argument(
         "--collect_trajectory_dagger",
         action="store_true",
         default=False,
@@ -5840,6 +5901,8 @@ def main():
             )
     if args.oracle_system2 and not args.rpc_server:
         raise RuntimeError("--oracle_system2 currently requires --rpc_server")
+    if args.step_state_trace_dir is not None and not args.rpc_server:
+        raise ValueError("--step_state_trace_dir is wired into the RPC path only; it requires --rpc_server")
     if not args.rpc_server:
         _preflight_checkpoint_args(args)
     _resolve_eval_paths(args, split=args.dataset_split)
