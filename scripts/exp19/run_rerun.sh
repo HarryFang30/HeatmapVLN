@@ -575,10 +575,13 @@ for j in "${!GPUS[@]}"; do
     exec "${CMD[@]}"
   ) >"$dir/logs/xvfb.log" 2>&1 &
   XVFB_PIDS[j]="$!"
+  # Readiness = the display's TCP port accepts a connection (bash /dev/tcp, no binary
+  # load). The eval launcher probed with xdpyinfo under `timeout 5`, but on a cold AFS
+  # the FUSE read of the xdpyinfo binary alone can take longer than that, so every
+  # probe was killed while Xvfb was already listening (smoke1, 2026-09-24).
   ready=0
-  for _ in $(seq 1 60); do
-    if env LD_LIBRARY_PATH="$TOOL_LD_LIBRARY_PATH" DISPLAY="$(display_of "$j")" \
-      timeout 5 "$XDPYINFO_BIN" >/dev/null 2>&1; then
+  for _ in $(seq 1 300); do
+    if timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$((6000 + DISPLAY_BASE + j))" 2>/dev/null; then
       ready=1
       break
     fi
