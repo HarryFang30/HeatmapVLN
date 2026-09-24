@@ -1054,7 +1054,7 @@ def main(argv=None) -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     tiers = {}
-    for tier in args.tiers:
+    for tier in args.tiers.replace(",", "").replace(" ", "").upper():
         if tier not in TIER_ORDER:
             raise SystemExit(f"unknown tier {tier!r}")
         td = load_tier(tier, args.dumps_root, args.workers, args.clip_list, log)
