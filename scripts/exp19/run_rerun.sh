@@ -47,6 +47,10 @@
 #   EXP19_SRC, EXP19_ROOT, EXP19_LISTS must be absolute paths
 #   EXP19_TRACE_DIAGNOSTICS   1 (default) | 0, passed to the trace server
 #   EXP19_SERVER_START_TIMEOUT_S   3600
+#   EXP19_RUNTIME_ROOT   absolute dir for the model / VO servers' scratch caches (TMPDIR, HF, Triton,
+#                   torch extensions); default: inside the run dir. On the dev machine point it at
+#                   local disk (e.g. /tmp/exp19_runtime): on a slow AFS, cache writes stall startup.
+#                   Caches only; nothing in them reaches a result.
 #   EXP19_DRY_RUN=1 run every check and print every command; start nothing, write nothing
 set -euo pipefail
 # A closed stdout/stderr (dropped ssh, `| head`) must fail a write, not kill the launcher
@@ -63,8 +67,9 @@ TRACE_DIAGNOSTICS="${EXP19_TRACE_DIAGNOSTICS:-1}"
 SERVER_START_TIMEOUT_S="${EXP19_SERVER_START_TIMEOUT_S:-3600}"
 DRY_RUN="${EXP19_DRY_RUN:-0}"
 ALLOW_BUSY_GPU="${EXP19_ALLOW_BUSY_GPU:-0}"
+RUNTIME_ROOT="${EXP19_RUNTIME_ROOT:-}"
 # A relative path would resolve against whatever directory the website / setsid shell starts in.
-for var in EXP19_SRC EXP19_ROOT EXP19_LISTS; do
+for var in EXP19_SRC EXP19_ROOT EXP19_LISTS EXP19_RUNTIME_ROOT; do
   if [[ -n "${!var:-}" && "${!var}" != /* ]]; then
     printf '[exp19-rerun] ERROR: %s must be an absolute path, got %s\n' "$var" "${!var}" >&2 || true
     exit 2
@@ -214,6 +219,10 @@ trap 'exit 130' INT TERM
 trap 'exit 129' HUP
 
 rank_dir() { printf '%s/gpu%d' "$RUN_DIR" "$1"; }
+runtime_dir() {  # $1 = rank; server scratch caches (EXP19_RUNTIME_ROOT, else inside the rank dir)
+  if [[ -n "$RUNTIME_ROOT" ]]; then printf '%s/%s/gpu%d' "$RUNTIME_ROOT" "$RUN" "$1"
+  else printf '%s/runtime' "$(rank_dir "$1")"; fi
+}
 display_of() { printf '127.0.0.1:%d.0' "$((DISPLAY_BASE + $1))"; }
 qcmd() { printf '%q ' "${CMD[@]}"; }
 
@@ -229,7 +238,7 @@ build_xvfb_cmd() {  # $1 = rank; run from runtime/xvfb with fd 9 on its .xkb-cac
 build_model_cmd() {  # $1 = rank
   local dir runtime
   dir=$(rank_dir "$1")
-  runtime="$dir/runtime/model"
+  runtime="$(runtime_dir "$1")/model"
   CMD=(env PYTHONPATH="$RPC_PYTHONPATH" LD_LIBRARY_PATH="$SERVER_LD_LIBRARY_PATH"
     CUDA_VISIBLE_DEVICES="${GPUS[$1]}" TMPDIR="$runtime/tmp"
     XDG_CACHE_HOME="$runtime/xdg" HF_HOME="$runtime/hf"
@@ -247,7 +256,7 @@ build_model_cmd() {  # $1 = rank
 
 build_vo_cmd() {  # $1 = rank
   local runtime
-  runtime="$(rank_dir "$1")/runtime/vo"
+  runtime="$(runtime_dir "$1")/vo"
   CMD=(env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH"
     LD_LIBRARY_PATH="$SERVER_LD_LIBRARY_PATH" CUDA_VISIBLE_DEVICES="${GPUS[$1]}"
     TMPDIR="$runtime/tmp" XDG_CACHE_HOME="$runtime/xdg"
@@ -552,7 +561,7 @@ printf '%s\n' "$SOURCE_FINGERPRINT" > "$RUN_DIR/source_fingerprint.txt"
 for j in "${!GPUS[@]}"; do
   dir=$(rank_dir "$j")
   mkdir -p "$dir/logs" "$dir/trace" "$dir/steps" "$dir/client_out" "$dir/runtime/xvfb/.xkb-cache" \
-    "$dir/runtime/model"/{tmp,xdg,hf,torch_extensions,triton,matplotlib} "$dir/runtime/vo"/{tmp,xdg,hf,triton}
+    "$(runtime_dir "$j")/model"/{tmp,xdg,hf,torch_extensions,triton,matplotlib} "$(runtime_dir "$j")/vo"/{tmp,xdg,hf,triton}
   cp "$LISTS_DIR/gpu$j.json" "$dir/episode_list.json"
 done
 emit_commands > "$RUN_DIR/commands.txt"
