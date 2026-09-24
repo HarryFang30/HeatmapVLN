@@ -13,6 +13,11 @@ with everything a figure needs, computed exactly as ``compute_metrics.py`` does:
   (``validate.py``), over GT-visible slots;
 * the constant "always behind" floor: class back, peak (32, 32), never none.
 
+Designed routes (tier E, ``fig_routes``): ``route_split`` (frame where the
+route turns back), ``route_key_rows`` (the ``select_cases`` pattern rule on one
+dump) and ``front_tally`` (per scored row: past positions in the front view and
+the prediction's joint PCK@8 hits among them).
+
 Nothing here draws; ``common_draw.py`` and the figure modules do.  numpy + PIL.
 """
 from __future__ import annotations
@@ -102,8 +107,8 @@ class Dump:
                 return h
         return DEFAULT_CAMERA_HEIGHT_M
 
-    def query_rows(self, arm: str) -> List[int]:
-        """Scored rows (cache endpoints) on which ``arm`` has a prediction."""
+    def query_rows(self, arm: Optional[str]) -> List[int]:
+        """Scored rows (cache endpoints) on which ``arm`` has a prediction (``None``: every endpoint row)."""
         t = self.arrays["current_frame_ids"].astype(np.int64)
         if "cache_endpoint_frame_ids" in self.arrays and self.arrays["cache_endpoint_frame_ids"].size:
             ok = np.isin(t, self.arrays["cache_endpoint_frame_ids"].astype(np.int64))
@@ -183,6 +188,7 @@ class CaseRow:
     floor_err: np.ndarray  # [8] always-behind bearing error
     floor_joint8: np.ndarray  # [8] always-behind joint PCK@8 hit
     groups: List[List[int]] = field(default_factory=list)  # visible slots sharing a camera centre
+    gt_peak_elev: Optional[np.ndarray] = None  # [8] elevation (deg, up-positive) of the GT peak, NaN if not visible
 
     @property
     def hist_pos(self) -> np.ndarray:
@@ -299,6 +305,8 @@ def case_row(dump: Dump, i: int) -> CaseRow:
     if float(np.max(np.asarray(geo.circular_abs_diff(b_c2w, gt_bearing))[check], initial=0.0)) > 1.0:
         raise ValueError(f"{dump.path}: row {i}: gt_rel_poses and history_c2w disagree")
     row.groups = _group_same_spot(row.hist_pos, [int(k) for k in np.nonzero(visible)[0]])
+    _, gt_el = geo.pixel_to_bearing_elev(tv, gt_yx[:, 1], gt_yx[:, 0])
+    row.gt_peak_elev = np.where(visible, np.asarray(gt_el, dtype=np.float64), np.nan)
     return row
 
 
@@ -323,6 +331,86 @@ def key_rows(dump: Dump, arm: str = "vo") -> List[int]:
     for i in (first, widest, last):
         if i not in out:
             out.append(i)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Designed routes (tier E): where the route turns back, key rows, front-view tally
+# --------------------------------------------------------------------------- #
+ROUTE_PATTERNS = ("out_and_back", "loop")
+ROUTE_ROLES = ("before_turnaround", "turnaround", "after_turnaround", "return_to_start")
+BACK_AT_START_M = 1.0  # a final row closer than this to frame 0 counts as "back at the start"
+
+
+def route_split(dump: Dump, pattern: str) -> dict:
+    """Frame at which the route turns back: {"frame", "rule"}.
+
+    out_and_back with a palindromic ``reference_path``: the route's own
+    turnaround (``geo.out_and_back_turnaround``, the frame compute_metrics
+    stores as ``turnaround_frame``).  Otherwise (loops, and any clip without
+    such a path): the frame farthest (3D euclidean) from frame 0, first max.
+    """
+    if pattern == "out_and_back":
+        turn = geo.out_and_back_turnaround(dump.positions, dump.reference_path())
+        if turn["frame"] >= 0:
+            return {"frame": int(turn["frame"]), "rule": "route turnaround (reference_path midpoint)"}
+    d = np.linalg.norm(dump.positions - dump.positions[0], axis=1)
+    return {"frame": int(np.argmax(d)), "rule": "frame farthest from the start"}
+
+
+def route_key_rows(dump: Dump, pattern: str, arm: str = "vo", turnaround_frame: Optional[int] = None):
+    """Key rows of the route-pattern figure, the rule of ``select_cases.pattern_figure`` on one dump.
+
+    Returns ``(rows, roles, info)``.  Turnaround row: out_and_back with a
+    route turnaround frame -> the scored row nearest to it (ties: earlier);
+    otherwise the scored row farthest (3D) from frame 0 (ties: earliest).  Key
+    rows: the scored rows just before and after it, the row itself, and the
+    final row.  ``cases.json`` stays authoritative for tier E; this is the
+    fallback for a dump without a pick (and for development stand-ins).
+    """
+    rows = dump.query_rows(arm)
+    if not rows:
+        raise ValueError(f"{dump.path}: no scored rows with arm {arm!r}")
+    t = dump.arrays["current_frame_ids"][rows].astype(np.int64)
+    cur = geo.c2w_position(dump.arrays["current_c2w"][rows].astype(np.float64))
+    dist = np.linalg.norm(cur - dump.positions[0], axis=-1)
+    frame = turnaround_frame
+    if frame is None and pattern == "out_and_back":
+        turn = geo.out_and_back_turnaround(dump.positions, dump.reference_path())
+        frame = turn["frame"] if turn["frame"] >= 0 else None
+    if pattern == "out_and_back" and frame is not None and frame >= 0:
+        j = int(np.abs(t - int(frame)).argmin())
+        rule = "route turnaround frame -> nearest scored row"
+    else:
+        j = int(dist.argmax())
+        rule = "scored row farthest (3D euclidean) from the first frame"
+    picked, roles = [], []
+    for jj, role in ((j - 1, "before_turnaround"), (j, "turnaround"), (j + 1, "after_turnaround")):
+        if 0 <= jj < len(rows):
+            picked.append(rows[jj])
+            roles.append(role)
+    final = [i for i in rows if int(dump.arrays["current_frame_ids"][i]) == dump.frame_count - 1]
+    last = final[-1] if final else rows[-1]
+    if last not in picked:
+        picked.append(last)
+        roles.append("return_to_start")
+    info = {"turnaround_rule": rule, "turnaround_frame": None if frame is None else int(frame),
+            "turnaround_row_t": int(t[j])}
+    return picked, roles, info
+
+
+def front_tally(dump: Dump, arm: str = "vo") -> List[dict]:
+    """Per scored row: GT-visible past positions, those in the front view, and the front ones predicted right.
+
+    "Predicted right" is the joint PCK@8 hit of ``case_row`` (validate.py rule).
+    """
+    out = []
+    for i in dump.query_rows(arm):
+        r = case_row(dump, i)
+        front = r.visible & (r.gt_class == 1 + geo.FRONT)
+        out.append({"row": int(i), "t": r.frame, "n_visible": r.n_visible, "n_front": int(front.sum()),
+                    "hits_front": int((r.arms[arm].joint8 & front).sum()),
+                    "dist_from_start_m": float(np.linalg.norm(r.cur_pos - dump.positions[0]))})
     return out
 
 

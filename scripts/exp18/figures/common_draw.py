@@ -337,6 +337,192 @@ def draw_route(ax, xz: np.ndarray, color: str = style.INK_2, lw: float = 1.0, st
 
 
 # --------------------------------------------------------------------------- #
+# Route legs (designed routes: outbound vs return)
+# --------------------------------------------------------------------------- #
+LEG_OUT_LS = "-"  # outbound leg: solid
+LEG_BACK_LS = (0, (2.4, 1.4))  # return leg: dashed
+LEG_COLOR = style.INK_2
+
+
+def _thin_display(P: np.ndarray, min_px: float) -> np.ndarray:
+    """Drop display points closer than ``min_px`` to the previous kept one (the last point is always kept)."""
+    keep = [0]
+    for i in range(1, len(P)):
+        if np.hypot(*(P[i] - P[keep[-1]])) >= min_px:
+            keep.append(i)
+    if keep[-1] != len(P) - 1:
+        if len(keep) > 1:
+            keep[-1] = len(P) - 1
+        elif np.hypot(*(P[-1] - P[0])) > 0:
+            keep.append(len(P) - 1)
+    return P[keep]
+
+
+def offset_polyline(ax, xy, offset_pt: float, min_step_pt: float = 0.6) -> np.ndarray:
+    """Polyline (data coords) shifted ``offset_pt`` to the right of its direction of travel as drawn.
+
+    Offsets are taken in display space (so they print at the same size at
+    any map scale) with mitred joints (miter length capped at 2x); points
+    closer than ``min_step_pt`` are merged first, so turning on the spot adds
+    no spikes.  Two legs travelling the same corridor in opposite directions
+    therefore separate into two parallel lanes ("keep right").
+    """
+    T = ax.transData
+    px = ax.figure.dpi / 72.0
+    P = _thin_display(T.transform(np.asarray(xy, dtype=float).reshape(-1, 2)), min_step_pt * px)
+    if len(P) < 2:
+        return T.inverted().transform(P)
+    seg = np.diff(P, axis=0)
+    u = seg / np.linalg.norm(seg, axis=1, keepdims=True)
+    nseg = np.stack([u[:, 1], -u[:, 0]], axis=1)  # right-hand normal (display y is up)
+    n = np.zeros_like(P)
+    n[0], n[-1] = nseg[0], nseg[-1]
+    if len(P) > 2:
+        m = nseg[:-1] + nseg[1:]
+        ln = np.linalg.norm(m, axis=1, keepdims=True)
+        m = np.where(ln > 1e-6, m / np.maximum(ln, 1e-12), nseg[1:])
+        cos = np.sum(m * nseg[1:], axis=1, keepdims=True)
+        n[1:-1] = m / np.maximum(cos, 0.5)
+    return T.inverted().transform(P + n * offset_pt * px)
+
+
+def chevrons(ax, xy, spacing_pt: float = 26.0, size_pt: float = 1.7, color=LEG_COLOR, lw: float = 0.7,
+             end_pt: float = 7.0, zorder: float = 3.2, clip_path=None) -> int:
+    """Open chevrons (">") along a polyline (data coords) pointing along its direction; returns how many.
+
+    Evenly spaced ``spacing_pt`` apart and centred on the polyline, none within
+    ``end_pt`` of either end; one in the middle when the line is shorter.
+    """
+    T = ax.transData
+    px = ax.figure.dpi / 72.0
+    P = _thin_display(T.transform(np.asarray(xy, dtype=float).reshape(-1, 2)), 0.3 * px)
+    if len(P) < 2:
+        return 0
+    seg = np.diff(P, axis=0)
+    ln = np.linalg.norm(seg, axis=1)
+    s = np.concatenate([[0.0], np.cumsum(ln)])
+    total = s[-1] / px  # points
+    if total < 2 * size_pt + 2:
+        return 0
+    n = int((total - 2 * end_pt) // spacing_pt) + 1 if total > 2 * end_pt else 1
+    at = total / 2 + (np.arange(n) - (n - 1) / 2) * spacing_pt
+    a, b = size_pt * px, size_pt * 0.95 * px
+    for x in at:
+        j = int(np.clip(np.searchsorted(s, x * px) - 1, 0, len(seg) - 1))
+        d = seg[j] / ln[j]
+        p = P[j] + d * (x * px - s[j])
+        nn = np.array([-d[1], d[0]])
+        pts = T.inverted().transform(np.array([p - a * d + b * nn, p + a * d, p - a * d - b * nn]))
+        line, = ax.plot(pts[:, 0], pts[:, 1], color=color, lw=lw, solid_capstyle="round", solid_joinstyle="miter",
+                        zorder=zorder)
+        if clip_path is not None:
+            line.set_clip_path(clip_path)
+    return n
+
+
+def draw_route_legs(ax, xy, split: int, color=LEG_COLOR, lw: float = 1.0, alpha: float = 1.0,
+                    offset_pt: float = 1.3, chevron_spacing_pt: Optional[float] = 26.0, zorder: float = 3,
+                    clip_path=None) -> dict:
+    """Route ``xy`` [T, 2] (data coords) as two legs split at index ``split``.
+
+    Outbound ``xy[:split + 1]`` solid, return ``xy[split:]`` dashed; each leg is
+    shifted ``offset_pt`` to its own right-hand side (``offset_polyline``) so a
+    return that retraces the outbound path stays visible beside it; chevrons
+    every ``chevron_spacing_pt`` (None: no chevrons) give the direction of
+    travel.  Call after the axes' limits and position are final.  Returns
+    {"out": [n, 2] or None, "back": [n, 2] or None} (the drawn, offset lines).
+    """
+    xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+    split = int(np.clip(split, 0, len(xy) - 1))
+    out = {"out": None, "back": None}
+    for key, part, ls in (("out", xy[:split + 1], LEG_OUT_LS), ("back", xy[split:], LEG_BACK_LS)):
+        if len(part) < 2 or np.ptp(part, axis=0).max() <= 0:
+            continue
+        line_xy = offset_polyline(ax, part, offset_pt)
+        line, = ax.plot(line_xy[:, 0], line_xy[:, 1], color=color, lw=lw, ls=ls, alpha=alpha, zorder=zorder,
+                        solid_capstyle="round", solid_joinstyle="round", dash_capstyle="butt")
+        if clip_path is not None:
+            line.set_clip_path(clip_path)
+        if chevron_spacing_pt:
+            chevrons(ax, line_xy, spacing_pt=chevron_spacing_pt, color=color, zorder=zorder + 0.2,
+                     clip_path=clip_path)
+        out[key] = line_xy
+    return out
+
+
+def turn_marker(ax, x: float, y: float, size: float = 3.6, zorder: float = 6.5):
+    """White diamond with an ink edge: where the route turns back."""
+    return ax.plot([x], [y], marker="D", ms=size, mfc="white", mec=style.INK, mew=0.8, zorder=zorder)
+
+
+def place_near(ax, anchors_xy, obstacles_xy, limits, boxes_pt, radii_pt=(2.5, 4.5, 7.0, 10.0, 14.0, 19.0, 25.0),
+               n_dir: int = 16, margin_pt: float = 1.0, fixed_boxes=(),
+               clear_pt: float = 4.5, order: Optional[Sequence[int]] = None, away_from=None,
+               away_weight: float = 0.0) -> List[Tuple[float, float, float, float]]:
+    """Greedy label placement beside points: returns (x, y, gap_pt, score) per anchor, in anchor order.
+
+    Label i is a box of ``boxes_pt[i]`` = (w, h) points whose edge lies ``r``
+    points from its anchor (``r`` in ``radii_pt``) in one of ``n_dir``
+    directions, so a wide label never covers its own anchor.  It
+    maximises the clearance (points; ``clear_pt`` counts as clear enough) to
+    ``obstacles_xy`` (route points, markers), to every anchor, to the labels
+    placed before it and to ``fixed_boxes`` ((cx, cy, w, h) in data coords /
+    points), staying inside ``limits`` = (x0, x1, z0, z1); each point of gap
+    costs 0.12, so the nearest clear spot wins.  ``order``: the order in
+    which labels are placed (default: as given); ``score`` is each label's
+    clearance minus its gap cost, for comparing orders.  ``away_from`` (a data
+    point, e.g. the route's centroid) with ``away_weight`` > 0 adds
+    ``away_weight * cos`` of the angle between the placement direction and
+    the direction from that point to the anchor, so labels fan outward.
+    """
+    T = ax.transData
+    px = ax.figure.dpi / 72.0
+    anchors = T.transform(np.asarray(anchors_xy, dtype=float).reshape(-1, 2)) / px
+    obst = (T.transform(np.asarray(obstacles_xy, dtype=float).reshape(-1, 2)) / px if len(obstacles_xy)
+            else np.zeros((0, 2)))
+    x0, x1, z0, z1 = limits
+    corners = T.transform(np.array([[x0, z0], [x1, z1]])) / px
+    lo, hi = corners.min(0), corners.max(0)
+    placed = [(T.transform((cx, cy)) / px, w, h) for cx, cy, w, h in fixed_boxes]
+    away = None if away_from is None or away_weight <= 0 else T.transform(np.asarray(away_from, dtype=float)) / px
+    out = {}
+    for i in (range(len(anchors)) if order is None else order):
+        a = anchors[i]
+        w, h = boxes_pt[i]
+        best, best_score = None, -np.inf
+        for r in radii_pt:
+            for k in range(n_dir):
+                ang = 2 * math.pi * k / n_dir
+                d = np.array([math.cos(ang), math.sin(ang)])
+                reach = min(w / 2 / (abs(d[0]) + 1e-9), h / 2 / (abs(d[1]) + 1e-9))  # centre-to-edge along d
+                c = a + (r + reach) * d
+                if not (lo[0] + w / 2 + margin_pt <= c[0] <= hi[0] - w / 2 - margin_pt
+                        and lo[1] + h / 2 + margin_pt <= c[1] <= hi[1] - h / 2 - margin_pt):
+                    continue
+                dx = np.maximum(np.abs(obst[:, 0] - c[0]) - w / 2, 0.0) if len(obst) else np.array([10.0])
+                dy = np.maximum(np.abs(obst[:, 1] - c[1]) - h / 2, 0.0) if len(obst) else np.array([0.0])
+                ax_ = np.maximum(np.abs(anchors[:, 0] - c[0]) - w / 2, 0.0)
+                ay_ = np.maximum(np.abs(anchors[:, 1] - c[1]) - h / 2, 0.0)
+                clear = [float(np.min(np.hypot(dx, dy))), float(np.min(np.hypot(ax_, ay_)))]
+                for q, qw, qh in placed:  # gap between two boxes (negative when they overlap)
+                    clear.append(max(abs(q[0] - c[0]) - (w + qw) / 2, abs(q[1] - c[1]) - (h + qh) / 2))
+                score = min(min(clear), clear_pt) - 0.12 * r
+                if away is not None:
+                    u = a - away
+                    nu = float(np.hypot(*u))
+                    if nu > 1e-6:
+                        score += away_weight * float(np.dot(d, u / nu))
+                if score > best_score:
+                    best, best_score = (c, r), score
+        if best is None:
+            best, best_score = (a + np.array([radii_pt[0] + w / 2, 0.0]), radii_pt[0]), -np.inf
+        placed.append((best[0], w, h))
+        xy = T.inverted().transform(best[0] * px)
+        out[i] = (float(xy[0]), float(xy[1]), float(best[1]), float(best_score))
+    return [out[i] for i in sorted(out)]
+
+
+# --------------------------------------------------------------------------- #
 # Heading-up local disc (map inset)
 # --------------------------------------------------------------------------- #
 def bearing_to_xy(bearing_deg, radius=1.0) -> Tuple[np.ndarray, np.ndarray]:
@@ -398,7 +584,8 @@ def dodge_1d(targets, widths, lo: float, hi: float, gap: float, periodic: bool =
 
 
 def draw_local_disc(ax, level, center_xz, forward_xz, half_m: float, past_xz=None, radius_frac: float = 0.74,
-                    letters=("F", "R", "B", "L"), sat: float = 0.25, white: float = 0.4, out_px: int = 640):
+                    letters=("F", "R", "B", "L"), sat: float = 0.25, white: float = 0.4, out_px: int = 640,
+                    past_split: Optional[int] = None):
     """Round heading-up map around the robot; its rim is the bearing ring the strip unrolls.
 
     The axes spans +-``half_m / radius_frac`` metres; the disc (radius
@@ -406,6 +593,11 @@ def draw_local_disc(ax, level, center_xz, forward_xz, half_m: float, past_xz=Non
     bearings +-45 / +-135 deg.  Returns the :class:`EgoCrop` (world ->
     heading-up metres via ``world_to_local``).  Sector letters and badges go
     outside the disc (``disc_rim_labels``).
+
+    ``past_split``: index into ``past_xz`` where the route turned back; the
+    route so far is then drawn as two legs (``draw_route_legs``: outbound
+    solid, return dashed, each on its own right-hand side).  ``None`` (the
+    default) draws the single grey line of the case figure.
     """
     lim = half_m / radius_frac
     img = (mute_map(level.rgb(), sat=sat, white=white) * 255).astype(np.uint8)
@@ -420,7 +612,11 @@ def draw_local_disc(ax, level, center_xz, forward_xz, half_m: float, past_xz=Non
     ax.set_autoscale_on(False)
     clean_axes(ax)
     ax.patch.set_visible(False)
-    if past_xz is not None and len(past_xz) > 1:
+    if past_xz is not None and len(past_xz) > 1 and past_split is not None:
+        a, b = crop.world_to_local(past_xz[:, 0], past_xz[:, 1])
+        draw_route_legs(ax, np.stack([a, b], axis=1), past_split, lw=0.8, alpha=0.8, offset_pt=1.0,
+                        chevron_spacing_pt=None, zorder=2, clip_path=Circle((0, 0), half_m, transform=ax.transData))
+    elif past_xz is not None and len(past_xz) > 1:
         a, b = crop.world_to_local(past_xz[:, 0], past_xz[:, 1])
         line, = ax.plot(a, b, color=style.INK_2, lw=0.8, alpha=0.75, solid_capstyle="round", zorder=2)
         line.set_clip_path(Circle((0, 0), half_m, transform=ax.transData))
@@ -429,6 +625,22 @@ def draw_local_disc(ax, level, center_xz, forward_xz, half_m: float, past_xz=Non
         ax.plot([0, x], [0, y], color=style.INK_2, lw=0.45, ls=(0, (2.0, 1.6)), alpha=0.8, zorder=1.5)
     ax.add_patch(Circle((0, 0), half_m, fill=False, ec=style.MUTED, lw=0.6, zorder=3))
     return crop
+
+
+def disc_rim_layout(ax, half_m: float, groups: Sequence[Sequence[int]], bearings: Sequence[float],
+                    gap_pt: float = 1.0, offset_pt: float = 5.2):
+    """Where ``disc_rim_labels`` puts its badges, without drawing: (labels, theta, placed, widths).
+
+    ``theta`` / ``placed``: true and dodged plot angles (degrees), ``widths``:
+    angular width of each badge on the ring.
+    """
+    per_pt = pts_to_data(ax, 1.0)[0]
+    ring_pt = half_m / per_pt + offset_pt
+    labels = [f"{g[0] + 1}" if len(g) == 1 else f"{g[0] + 1}–{g[-1] + 1}" for g in groups]
+    widths = np.array([math.degrees(badge_width_pt(lab) / ring_pt) for lab in labels])
+    theta = np.array([90.0 + b for b in bearings])  # heading-up: bearing 0 = up, left-positive = counter-clockwise
+    placed = dodge_1d(theta, widths, 0.0, 360.0, math.degrees(gap_pt / ring_pt), periodic=True)
+    return labels, theta, placed, widths
 
 
 def disc_rim_labels(ax, half_m: float, groups: Sequence[Sequence[int]], bearings: Sequence[float],
@@ -444,10 +656,7 @@ def disc_rim_labels(ax, half_m: float, groups: Sequence[Sequence[int]], bearings
     per_pt = pts_to_data(ax, 1.0)[0]
     r_pt = half_m / per_pt  # disc radius in points
     ring_pt = r_pt + offset_pt
-    labels = [f"{g[0] + 1}" if len(g) == 1 else f"{g[0] + 1}–{g[-1] + 1}" for g in groups]
-    widths = np.array([math.degrees(badge_width_pt(lab) / ring_pt) for lab in labels])
-    theta = np.array([90.0 + b for b in bearings])  # heading-up: bearing 0 = up, left-positive = counter-clockwise
-    placed = dodge_1d(theta, widths, 0.0, 360.0, math.degrees(gap_pt / ring_pt), periodic=True)
+    labels, theta, placed, widths = disc_rim_layout(ax, half_m, groups, bearings, gap_pt=gap_pt, offset_pt=offset_pt)
     out = []
     for g, lab, t, p, w in zip(groups, labels, theta, placed, widths):
         k = g[0]
@@ -464,20 +673,55 @@ def disc_rim_labels(ax, half_m: float, groups: Sequence[Sequence[int]], bearings
 
 
 def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float]] = (), offset_pt: float = 5.2,
-                        names=("F", "R", "B", "L"), fs: float = 6.0, letter_pt: float = 4.6) -> None:
+                        names=("F", "R", "B", "L"), fs: float = 6.0, letter_pt: float = 4.6,
+                        displaced: str = "outward", rays: Sequence[float] = ()) -> None:
     """Sector letters at the sector centres on the badge ring outside the rim.
 
     ``occupied``: ``(theta, half_width)`` degrees from ``disc_rim_labels``;
     where a badge takes the letter's place the letter moves radially outward,
     past the badges, so it always marks the centre of its sector.
+    ``displaced="inside"`` moves it just inside the rim instead, at the angle
+    within +-38 deg of the sector centre nearest to it that keeps clear of
+    ``rays`` (plot angles of the blue rays, degrees).  ``displaced="slide"``:
+    R/L go outward as by default (nothing sits beside the disc); F/B first
+    slide along the badge ring to the free spot nearest the centre within
+    +-38 deg (they stay in their own 90 deg sector), else go inside as above.
+    Both keep F/B inside the inset's square, out of the block headers.
     """
     per_pt = pts_to_data(ax, 1.0)[0]
     ring_pt = half_m / per_pt + offset_pt
+    inner_pt = half_m / per_pt - letter_pt / 2 - 2.4
     half_letter = math.degrees((letter_pt / 2 + 0.8) / ring_pt)
+    steps = sorted(np.arange(-38.0, 38.01, 1.0), key=lambda v: (abs(v), v))
+
+    def is_free(th):
+        return all(abs((th - t + 180) % 360 - 180) > w + half_letter for t, w in occupied)
+
+    def inside_angle(th):
+        if not len(rays):
+            return th
+        need = math.degrees((letter_pt / 2 + 1.4) / max(inner_pt, 1.0))
+        dist = {d: min(abs((th + d - r + 180) % 360 - 180) for r in rays) for d in steps}
+        ok = [d for d in steps if dist[d] >= need]
+        return th + (ok[0] if ok else max(steps, key=lambda d: dist[d]))
+
     for name, centre_bearing in zip(names, geo.VIEW_YAWS_DEG):
         theta = 90.0 + centre_bearing
-        free = all(abs((theta - t + 180) % 360 - 180) > w + half_letter for t, w in occupied)
-        radius = ring_pt if free else ring_pt + 3.7 + letter_pt / 2 + 1.0
+        free = is_free(theta)
+        side = abs(abs(centre_bearing) - 90.0) < 1e-6  # R or L
+        if free:
+            radius = ring_pt
+        elif displaced == "inside" or (displaced == "slide" and not side):
+            radius = None
+            if displaced == "slide":
+                for d in steps:
+                    if is_free(theta + d):
+                        theta, radius = theta + d, ring_pt
+                        break
+            if radius is None:
+                theta, radius = inside_angle(theta), inner_pt
+        else:
+            radius = ring_pt + 3.7 + letter_pt / 2 + 1.0
         x = radius * per_pt * math.cos(math.radians(theta))
         y = radius * per_pt * math.sin(math.radians(theta))
         ax.text(x, y, name, ha="center", va="center", fontsize=fs, fontweight="bold",
@@ -567,6 +811,95 @@ def quietest_panel(*strips: np.ndarray, empty: float = 0.05) -> int:
         if peaks[v] < empty:
             return v
     return int(np.argmin(peaks))
+
+
+LABEL_PILL = dict(boxstyle="round,pad=0.22,rounding_size=0.55", fc="white", ec="none", alpha=0.86)
+
+
+def fixed_label_panel(strips: Sequence[np.ndarray], width_deg: float, prefer: int = 0, max_heat: float = 0.35,
+                      start_deg: float = 1.0) -> int:
+    """One strip panel for the in-row labels of a whole figure (so they never change sides).
+
+    ``strips``: every heat strip the labels will sit on (all rows of all
+    blocks).  The label covers ``[v * 90 + start_deg, + width_deg]`` of panel
+    ``v``; the preferred panel (default the front view, the left end of each
+    row) is kept while the heat under the label stays below ``max_heat`` in
+    every strip (a backing pill keeps faint heat readable); otherwise the
+    panel with the least heat under the label, in F, R, B, L order on ties.
+    """
+    heat = []
+    for v in range(4):
+        m = 0.0
+        for s in strips:
+            q = s.shape[1] / 360.0
+            a = int((v * 90 + start_deg) * q)
+            b = max(int((v * 90 + start_deg + width_deg) * q), a + 1)
+            m = max(m, float(s[:, a:b].max()))
+        heat.append(m)
+    if heat[prefer] < max_heat:
+        return prefer
+    return int(np.argmin(heat))
+
+
+def row_label(ax, x: float, text: str, fs: float, color: str = style.INK_2, zorder: float = 6.2):
+    """Row name ("ground truth") at strip coordinate ``x`` (left end), on a white pill so heat under it stays readable."""
+    return ax.text(x, 0, text, ha="left", va="center", fontsize=fs, color=color, zorder=zorder, bbox=dict(LABEL_PILL))
+
+
+def route_frame(xz: np.ndarray, split: Optional[int], aspect_hw: float, pad: float):
+    """Map rotation for a route panel: (centre_xz, forward_xz) of the heading-up crop that shows the route largest.
+
+    Only quarter turns (walls stay axis-aligned): the one whose padded route
+    box fits an axes of height/width ``aspect_hw`` at the largest scale; of
+    the two with that scale, the one with the start below ``xz[split]`` (the
+    outbound leg goes up the page; ``split=None``: below the last point);
+    the unrotated map on a full tie.  A top-down map has no preferred
+    orientation, so this only changes the scale.
+    """
+    from scripts.exp18.topdown.topdown_io import EgoCrop
+
+    xz = np.asarray(xz, dtype=float).reshape(-1, 2)
+    split = len(xz) - 1 if split is None else int(split)
+    centre = (xz.min(0) + xz.max(0)) / 2.0
+    best = None
+    for n, fwd in enumerate(((0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))):
+        crop = EgoCrop(centre, fwd, 1.0, 2)
+        a, b = crop.world_to_local(xz[:, 0], xz[:, 1])
+        scale = min(1.0 / (np.ptp(a) + 2 * pad), aspect_hw / (np.ptp(b) + 2 * pad))
+        key = (round(float(scale), 6), bool(b[0] <= b[split] + 1e-6), -n)
+        if best is None or key > best[0]:
+            best = (key, fwd)
+    return centre, np.asarray(best[1])
+
+
+def _segments_cross(p1, p2, q1, q2) -> bool:
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    d1, d2 = orient(q1, q2, p1), orient(q1, q2, p2)
+    d3, d4 = orient(p1, p2, q1), orient(p1, p2, q2)
+    return d1 * d2 < 0 and d3 * d4 < 0
+
+
+def uncross(anchors, centres, max_pass: int = 6) -> List[int]:
+    """Permutation of ``centres`` (label positions) so that no two anchor->label leaders cross.
+
+    Swaps the labels of any crossing pair until none cross (or ``max_pass``
+    sweeps); returns ``perm`` with label ``i`` placed at ``centres[perm[i]]``.
+    """
+    A = [np.asarray(a, dtype=float) for a in anchors]
+    C = [np.asarray(c, dtype=float) for c in centres]
+    perm = list(range(len(A)))
+    for _ in range(max_pass):
+        changed = False
+        for i in range(len(A)):
+            for j in range(i + 1, len(A)):
+                if _segments_cross(A[i], C[perm[i]], A[j], C[perm[j]]):
+                    perm[i], perm[j] = perm[j], perm[i]
+                    changed = True
+        if not changed:
+            break
+    return perm
 
 
 def cluster_1d(values: Sequence[float], tol: float) -> List[List[int]]:
