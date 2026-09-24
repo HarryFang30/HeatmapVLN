@@ -84,6 +84,8 @@ def _runtime():
     runtime.num_sample_trajs = 32
     runtime.action_scale = 4.0
     runtime.ppa_stage0_action_arm = "disabled"
+    runtime.ppa_online_amb3r = False
+    runtime.system2_cognition_arm = False
     return runtime, qwen
 
 
@@ -216,10 +218,15 @@ class _InternNavProcessor:
 
 def test_internnav_rpc_runs_second_lookdown_generation(monkeypatch):
     monkeypatch.setattr(server, "_blobs_by_name", lambda _blobs: defaultdict(object))
+    # Views are resized to the requested VLM size; the lookdown blob is decoded
+    # at its native size, which the two-turn protocol requires to be 640x480.
     monkeypatch.setattr(
         server,
         "_pil_from_blob",
-        lambda *_args, **_kwargs: Image.new("RGB", (384, 384)),
+        lambda _blob, image_size=None: Image.new(
+            "RGB",
+            tuple(image_size) if image_size is not None else server.NATIVE_LOOKDOWN_SIZE,
+        ),
     )
 
     runtime = object.__new__(server.HeatmapVLNRuntime)
@@ -243,6 +250,8 @@ def test_internnav_rpc_runs_second_lookdown_generation(monkeypatch):
     runtime.num_sample_trajs = 32
     runtime.action_scale = 4.0
     runtime.ppa_stage0_action_arm = "disabled"
+    runtime.ppa_online_amb3r = False
+    runtime.system2_cognition_arm = False
 
     response = runtime.plan_panoramic(
         {
