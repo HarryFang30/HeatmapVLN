@@ -77,9 +77,20 @@ H2 D 支持、C 没测出来（GT 臂同为没测出来 → 不归因）；H3 VO
 
 ## 5. 图
 
-最终图集由 `scripts/exp18/figures/make_all.py` 生成（中英两版，PDF + 400 dpi PNG + caption + manifest），见第 6 节路径。
+最终图集由 `scripts/exp18/figures/make_all.py` 在 `1eafaae` 上生成（`--main-index 3`，中英两版，PDF + 400 dpi PNG + caption），
+输出 `model/exp18_first_person_viz/figures/`，`manifest.json` 记每个文件的 sha256、代码版本、所用 metrics / cases / 导出的 sha256 与自检结果。
+
+| 图 | 文件 | 内容 |
+|---|---|---|
+| 图 1 主案例 | `fig1_main_case[_zh]` | C 层预注册候选 3（TbHJrupSAjP 第 359 集，第 20/76/81 帧）：俯视路线 ↔ 局部地图 ↔ 环视上的真值/预测 affordance map；K1 有 3 个 miss（3/6），K2、K3 为 8/8，而恒答正后方分别 0/6、1/8、1/8 |
+| 图 2 画廊 | `fig2_gallery[_zh]` | C / D / E 三层 × 10/50/90 分位（预注册规则挑的集，每集展示最接近该集中位误差的那一帧） |
+| 图 3 定量 | `fig3_metrics[_zh]` | (a) 各层 joint PCK@8 与平凡基线；(b) 方位误差累积分布；(c) 按来路所在视角；(d) 按历史年龄 |
+| 图 4 设计路线 | `fig4_route_out_and_back[_zh]`、`fig4_route_loop[_zh]` | E 层两种路线的中位集；去而复返的回程上 20 个来路落在前视、3 个预测正确 |
+| 补充 | `supp/candidate{1..5}_*`、`supp/figS_gallery_all`、`supp/anim_main_case.{mp4,gif}` | 5 个主图候选（第 2、4 个是同一条 R2R 路径）、A–E 全层画廊、主案例动画 |
+
 作图口径（用户 2026-09-24 定）：位姿是中间量、计算里照常用，但图里不画位姿、VO、里程计或按位姿拆分的对比；热力统一称 affordance map；
-预测一律为部署设置的输出。图里 miss 编号与行首 joint PCK@8 用同一条规则。
+预测一律为部署设置的输出。图里 miss 编号与行首 joint PCK@8 用同一条规则。`make_all` 在保存前遍历每张图的全部文字做口径检查
+（位姿/里程计/热力等词一律报错），并逐行复核图上数字与 `slots.parquet` 一致。
 
 ## 6. 产物
 
