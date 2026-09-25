@@ -105,6 +105,19 @@ ssh finn_cci_c500 'bash -lc "cd $SRC && EXP19_FIG_MAIN=1 bash scripts/exp19/run_
 **作图口径**：图里不出现位姿、VO、里程计或位姿臂对比；热力统一叫 affordance map；左 / 右 / 后扇区压灰注明"未输入模型（仅展示）"；
 俯视图不画朝向箭头；数据流不画"未来图 → 动作"。
 
+## 7. 图 v2（论文级改版：在线时间线 + 动画；运行记录 4）
+
+```bash
+# 在线时间线数据（呈现用，写 records_v2/，不改 records/、metrics/）
+ssh finn_cci_c500 'bash -lc "cd $SRC && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$SRC $R/envs/qwen25/bin/python -m scripts.exp19.build_timeline --run main --self-check"'
+# 逐集页 + 主图 T/F（+ EXP19_FIG_ANIM=1 时生成主案例 MP4/GIF 动画；动画需要开发机的 /opt/conda/bin/ffmpeg）
+ssh -n -f finn_cci_c500 'bash -lc "cd $SRC && EXP19_FIG_ANIM=1 setsid nohup bash scripts/exp19/run_figures_v2.sh > $EXP/logs/figures_v2.out 2>&1 < /dev/null &"'
+```
+
+输出 `figures_v2/`（逐集页、`main/`、`anim/`、`manifest.json`）。热力场为显示做了高斯平滑（环视条带 σ = 2°、时间线方位向 σ = 3.5°，
+按峰值重标），圆点标的是未平滑的峰值；图注已写明。2026-09-25 的正式 v2 输出由改版后的工作树代码在开发机本地盘渲染、
+逐文件 sha256 校验后拷入 `figures_v2/`（当时 AFS 满盘）。
+
 ## 测试
 
 ```bash

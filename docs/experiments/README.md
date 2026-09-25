@@ -2197,6 +2197,18 @@ pLe4wQe7qrG_1777 在 500 步里只有 13 / 7 个就绪调用（大量原地转�
 ⑥ 复跑在 `e894d88` 上（非主表评测的 `ed46c76`），11/15 集逐调用有分歧但结局全同；单种子；MACA bf16。
 ⑦ 案例按结局类别选、每类 3 集：图是典型示例，不是各类行为的统计描述；主图只画 K2、K3，四个时刻见逐集页。
 
+**运行记录（4）：看到结果之后的图面改版（2026-09-24，用户要求"论文级"；判据与判定未改）.** 用户接受结论，要求热力标记更小更清楚、
+读者易懂、并展示 affordance map **在线运行时**的样子。改版只动呈现，不动任何进入判定的量：
+1. **案例、关键时刻、每个时刻画的元素都不变**（决策所用图 + 像素目标 + 快系统路径；送入慢系统的历史帧；压灰环境上的 360° 预测历史
+   affordance map + 真实来路方向；四个时段的预测未来 affordance map + 快系统路径；慢系统文本 + 执行动作块）。标记改小（预测峰值为
+   小实心点、真实方向为小空心圈，热力改为淡色场），术语对齐正文（慢系统 / 快系统 / 历史认知头 / 未来认知头）。
+2. **对全部 15 集统一新增"在线运行"时间线**：横轴步数、纵轴方位（左为正、±180° 为正后方），每个就绪调用一列预测历史 affordance map，
+   叠真实来路方向与预测峰值；下方一条未来 affordance map 与快系统路径终点；再下方是实际执行的转向。数据由新脚本
+   `scripts/exp19/build_timeline.py` 从同一批追踪 / 状态 / 重渲染计算，写到 `records_v2/`（**不改写** `records/`、`metrics/`），
+   自检核对：关键时刻行与 v1 图包逐项相同、左转后来路方向向负侧移动、前进调用的快系统路径方位 ≈ 0。
+3. 主图 5 个案例另做在线运行动画（MP4 / GIF）供补充材料与报告用。v1 图保留在 `figures/`，v2 在 `figures_v2/`。
+改版发生在看到结果之后，但它不选择案例、不选择时刻、不改任何数字；新增的时间线对所有集一视同仁，弱的集（楼梯、徘徊）照样画。
+
 ---
 
 ## 4. 公共资源
@@ -2259,6 +2271,8 @@ pLe4wQe7qrG_1777 在 500 步里只有 13 / 7 个就绪调用（大量原地转�
 | EXP-19 重渲染（4 视角 HFOV 90 + 前视深度，自检逐帧一致） | `model/exp19_behavior_viz/renders/` |
 | EXP-19 指标与判定（判据来源） | `model/exp19_behavior_viz/metrics/{metrics.json, summary.md, calls.jsonl}` |
 | EXP-19 图（15 集逐集页 + 主图 T/F，中英，PDF/PNG/caption） | `model/exp19_behavior_viz/figures/`（`manifest.json` 记来源与 sha256） |
+| EXP-19 在线时间线数据（呈现用，不进判定；运行记录 4） | `model/exp19_behavior_viz/records_v2/<ep_key>_timeline.{npz,json}` + `timeline_self_check.json` |
+| EXP-19 图 v2（论文级改版：15 集逐集页含在线时间线、主图 T/F、主案例动画 MP4/GIF，中英） | `model/exp19_behavior_viz/figures_v2/`（`anim/` 为动画；`manifest.json` 记来源与 sha256） |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |
