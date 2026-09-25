@@ -8,16 +8,36 @@ is re-derived here.
 
 Visual vocabulary (one meaning per encoding, used by every EXP-18 figure):
 
-* **Blue = ground truth.**  Numbered badges 1..8 are the K = 8 past camera
-  positions (1 = oldest), filled with ``style.history_color`` (light = older);
-  the number, not the shade, identifies a slot.  The ground-truth heat row is a
-  blue sequential ramp (``GT_CMAP``).
-* **Orange = prediction.**  ``PRED_CMAP`` (= ``style.HEAT_CMAP_OPAQUE``) for the
-  predicted heat row; a black x with a white halo marks a predicted peak.
-* **Grey = context.**  Maps and the three surround views the model never sees
-  are desaturated and lightened; only the front view keeps its colour.
-* **Black = the robot** (triangle pointing along the heading) and key positions
-  (``K1`` badges with a heading arrow).
+* **Blue = ground truth / past positions, and nothing else.**  Numbered
+  badges 1..8 are the K = 8 past positions (1 = oldest), filled with
+  ``style.history_color`` (light = older); the number, not the shade,
+  identifies a slot.  The ground-truth affordance map row is a blue
+  sequential ramp (``GT_CMAP``).
+* **Orange = prediction, and nothing else.**  ``PRED_CMAP`` (=
+  ``style.HEAT_CMAP_OPAQUE``) for the predicted affordance map row; a black x
+  with a white halo marks a predicted peak (``peak_marks``).
+* **Misses (D1, D2).**  A slot is missed iff it fails joint PCK@8
+  (``data.CaseRow.misses``); its number is ink in a small white disc ringed
+  in dark orange (``miss_badge``), next to its own x or moved and joined to it
+  by a short ink leader (``place_miss_labels`` / ``draw_miss_labels``), with
+  an optional dotted connector from its true-bearing tick to the x
+  (``draw_miss_connectors``).  Never a blue badge on the orange row.
+* **Row names (D3)** "ground truth" / "prediction" sit in a fixed gutter left
+  of the strip with a tiny colour key (``gutter_row_label``), in every block.
+* **Elevation window (D4)**: ``elevation_window(rows)`` -- +-10 deg, widened
+  just enough for every GT-visible and drawn predicted peak of the rows shown,
+  at most +-45 deg; ``elevation_text`` words it for the caption.
+* **Notes (D5)** are wrapped, never dropped: ``wrap_notes`` lays them out on
+  as many lines as needed, ``draw_note`` draws one (blue badge for a slot no
+  view shows, orange-ringed badge for a miss the model calls not visible).
+* **Frame labels (D6)**: ``frame_label`` -> "frame 35 of 79" /
+  "第 35 帧（共 79 帧）" (1-based count).
+* **Grey = context.**  Maps and the three current views the model is not
+  given are desaturated and lightened; only the front view keeps its colour.
+* **Black = the robot** (arrowhead pointing where it faces) and key positions
+  (``K1`` badges with a facing arrow).
+* Bold Chinese text is drawn with a thin stroke of its own colour
+  (``bold_effects``; the CJK font has no bold face).
 
 The surround strip is the heading-centred ring of ``geo.stitch_ring`` rolled so
 that it starts at the left edge of the front view (bearing +45 deg) and runs
@@ -47,6 +67,7 @@ from matplotlib import font_manager  # noqa: E402
 from matplotlib import patheffects as pe  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, to_rgb  # noqa: E402
 from matplotlib.patches import Circle, FancyArrowPatch, Polygon, Rectangle  # noqa: E402
+from matplotlib.transforms import Bbox  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Style
@@ -60,6 +81,11 @@ HALO = [pe.withStroke(linewidth=1.6, foreground="white")]
 HALO_THIN = [pe.withStroke(linewidth=1.1, foreground="white")]
 BADGE_FS = 5.6
 STRIP_START_DEG = 45.0  # the strip starts at the front view's left edge
+EL_DEFAULT = 10.0  # D4: affordance map rows show +-10 deg of elevation ...
+EL_MARGIN = 3.0  # ... widened to include every peak with this much room for its mark ...
+EL_MAX = 45.0  # ... up to +-45 deg (a view's vertical field of view)
+GT_INK = style.GT_INK
+PRED_INK = style.PRED_INK
 
 
 def setup(lang: str = "en") -> None:
@@ -266,13 +292,27 @@ def heading_arrow(ax, p, forward_xy, length: float, color: str = style.INK, lw: 
 
 
 def scale_bar(ax, x: float, y: float, length: float, label: str, fs: float = 5.8, ha: str = "left",
-              color: str = style.INK, zorder: float = 9) -> None:
-    """Horizontal bar of ``length`` data units starting at x (``ha='right'``: ending at x), label above."""
+              color: str = style.INK, zorder: float = 9):
+    """Horizontal bar of ``length`` data units starting at x (``ha='right'``: ending at x), label above.
+
+    Returns ``(line, label)`` (see ``inset_from_frame_pt``)."""
     x0 = x if ha == "left" else x - length
-    ax.plot([x0, x0 + length], [y, y], color=color, lw=1.0, solid_capstyle="butt", zorder=zorder,
-            path_effects=HALO_THIN)
-    ax.annotate(label, (x0 + length / 2, y), xytext=(0, 1.6), textcoords="offset points", ha="center",
-                va="bottom", fontsize=fs, color=color, path_effects=HALO, zorder=zorder)
+    line, = ax.plot([x0, x0 + length], [y, y], color=color, lw=1.0, solid_capstyle="butt", zorder=zorder,
+                    path_effects=HALO_THIN)
+    text = ax.annotate(label, (x0 + length / 2, y), xytext=(0, 1.6), textcoords="offset points", ha="center",
+                       va="bottom", fontsize=fs, color=color, path_effects=HALO, zorder=zorder)
+    return line, text
+
+
+def inset_from_frame_pt(ax, artists) -> float:
+    """Smallest distance (pt) from the drawn extents of ``artists`` to the frame of ``ax`` (negative: outside)."""
+    rend = ax.figure.canvas.get_renderer()
+    box = ax.get_window_extent(rend)
+    d = []
+    for a in artists:
+        bb = a.get_window_extent(rend)
+        d += [bb.x0 - box.x0, box.x1 - bb.x1, bb.y0 - box.y0, box.y1 - bb.y1]
+    return float(min(d)) * 72.0 / ax.figure.dpi if d else float("nan")
 
 
 def nice_length(target: float, choices=(0.25, 0.5, 1, 2, 5, 10, 20, 50)) -> float:
@@ -542,7 +582,7 @@ def dodge_1d(targets, widths, lo: float, hi: float, gap: float, periodic: bool =
     if n == 0:
         return t
     period = hi - lo
-    order = np.argsort(t)
+    order = np.argsort(t, kind="stable")
     if periodic:  # start the sweep in the widest empty gap so no cluster straddles the cut
         ts = t[order]
         gaps = np.diff(np.concatenate([ts, ts[:1] + period]))
@@ -627,41 +667,63 @@ def draw_local_disc(ax, level, center_xz, forward_xz, half_m: float, past_xz=Non
     return crop
 
 
+def _badge_support(label: str, u) -> float:
+    """Half extent (pt) of a history badge along unit direction ``u``: a disc for one digit, else its box."""
+    if len(label) == 1:
+        return badge_width_pt(label) / 2
+    w, h = badge_width_pt(label), 7.4
+    return abs(u[0]) * w / 2 + abs(u[1]) * h / 2
+
+
 def disc_rim_layout(ax, half_m: float, groups: Sequence[Sequence[int]], bearings: Sequence[float],
                     gap_pt: float = 1.0, offset_pt: float = 5.2):
     """Where ``disc_rim_labels`` puts its badges, without drawing: (labels, theta, placed, widths).
 
     ``theta`` / ``placed``: true and dodged plot angles (degrees), ``widths``:
-    angular width of each badge on the ring.
+    angular width of each badge on the ring.  Badges are dodged in the order of
+    their bearings (ties: slot order), so their leaders never cross; a pill
+    badge ("1–3") is measured by its real extent along the rim (its width
+    beside the disc, its height above or below it).
     """
     per_pt = pts_to_data(ax, 1.0)[0]
-    ring_pt = half_m / per_pt + offset_pt
+    r_pt = half_m / per_pt
     labels = [f"{g[0] + 1}" if len(g) == 1 else f"{g[0] + 1}–{g[-1] + 1}" for g in groups]
-    widths = np.array([math.degrees(badge_width_pt(lab) / ring_pt) for lab in labels])
     theta = np.array([90.0 + b for b in bearings])  # heading-up: bearing 0 = up, left-positive = counter-clockwise
-    placed = dodge_1d(theta, widths, 0.0, 360.0, math.degrees(gap_pt / ring_pt), periodic=True)
+    widths = []
+    for lab, t in zip(labels, theta):
+        u = np.array([math.cos(math.radians(t)), math.sin(math.radians(t))])
+        tang = np.array([-u[1], u[0]])
+        ring = r_pt + (offset_pt - 3.7) + _badge_support(lab, u)
+        widths.append(math.degrees(2 * _badge_support(lab, tang) / ring))
+    widths = np.array(widths)
+    ring0 = r_pt + offset_pt
+    # bearing -180 and +180 are one angle: normalise before sorting; ties in slot order
+    order_key = np.mod(theta, 360.0) + 1e-6 * np.array([g[0] for g in groups], dtype=float)
+    placed = dodge_1d(order_key, widths, 0.0, 360.0, math.degrees(gap_pt / ring0), periodic=True)
     return labels, theta, placed, widths
 
 
 def disc_rim_labels(ax, half_m: float, groups: Sequence[Sequence[int]], bearings: Sequence[float],
                     num: int = 8, gap_pt: float = 1.0, offset_pt: float = 5.2) -> List[Tuple[float, float]]:
-    """Numbered badges just outside the disc rim at each group's bearing, dodged along the rim.
+    """Numbered badges just outside the disc rim at each group's bearing, dodged along the rim in bearing order.
 
     Returns ``(theta, half_width)`` in degrees (plot angle, 0 = +x, counter-
-    clockwise) of every placed badge, for ``disc_sector_letters`` to avoid.  A
-    thin leader joins a dodged badge to its true bearing on the rim.
+    clockwise) of every placed badge.  A thin leader joins a dodged badge to
+    its true bearing on the rim.  A badge's centre sits ``offset_pt - 3.7`` pt
+    plus its own half extent outside the rim, so a pill beside the disc keeps
+    the same clearance as a disc badge.
     """
     if not groups:
         return []
     per_pt = pts_to_data(ax, 1.0)[0]
     r_pt = half_m / per_pt  # disc radius in points
-    ring_pt = r_pt + offset_pt
     labels, theta, placed, widths = disc_rim_layout(ax, half_m, groups, bearings, gap_pt=gap_pt, offset_pt=offset_pt)
     out = []
     for g, lab, t, p, w in zip(groups, labels, theta, placed, widths):
         k = g[0]
         u_t = np.array([math.cos(math.radians(t)), math.sin(math.radians(t))])
         u_p = np.array([math.cos(math.radians(p)), math.sin(math.radians(p))])
+        ring_pt = r_pt + (offset_pt - 3.7) + _badge_support(lab, u_p)
         c = u_p * ring_pt * per_pt
         if abs(((p - t + 180) % 360) - 180) > 0.8:
             rim, mid = u_t * half_m, u_t * (r_pt + 1.8) * per_pt
@@ -672,29 +734,90 @@ def disc_rim_labels(ax, half_m: float, groups: Sequence[Sequence[int]], bearings
     return out
 
 
+def _rendered_obstacles(ax, skip=()) -> list:
+    """Display-space extents of what is drawn on ``ax`` outside the plot's clip: badges (bbox texts), other
+    texts, clip-free or haloed lines (leaders, arrows, scale bars) and clip-free patches."""
+    rend = ax.figure.canvas.get_renderer()
+    out = []
+    for t in ax.texts:
+        if t in skip or not t.get_text().strip():
+            continue
+        if t.get_bbox_patch() is not None:
+            t.update_bbox_position_size(rend)
+            out.append(t.get_bbox_patch().get_window_extent(rend))
+        else:
+            out.append(t.get_window_extent(rend))
+    for ln in ax.lines:
+        if (not ln.get_clip_on() or ln.get_path_effects()) and len(ln.get_xdata()) > 1:
+            xy = ax.transData.transform(np.column_stack([ln.get_xdata(), ln.get_ydata()]))
+            for i in range(len(xy) - 1):  # per segment: a bent leader is not its bounding box
+                seg = xy[i:i + 2]
+                n = max(2, int(np.hypot(*(seg[1] - seg[0])) / 3.0))
+                for q in np.linspace(seg[0], seg[1], n):
+                    out.append(Bbox.from_bounds(q[0] - 0.4, q[1] - 0.4, 0.8, 0.8))
+    for pa in ax.patches:
+        if not pa.get_clip_on():
+            out.append(pa.get_window_extent(rend))
+    return out
+
+
+def _inner_obstacles(ax) -> list:
+    """Display-space points (as tiny boxes) of every line and marker drawn on ``ax`` except the map image:
+    rays, past-position dots, the route, view seams, the robot."""
+    out = []
+    for ln in ax.lines:
+        xd, yd = np.asarray(ln.get_xdata(), dtype=float), np.asarray(ln.get_ydata(), dtype=float)
+        if not len(xd):
+            continue
+        xy = ax.transData.transform(np.column_stack([xd, yd]))
+        ms = float(ln.get_markersize()) * ax.figure.dpi / 72.0 if ln.get_marker() not in (None, "None", "") else 0.0
+        if len(xy) == 1 or ms > 0:
+            for q in xy:
+                h = max(ms / 2, 0.8)
+                out.append(Bbox.from_bounds(q[0] - h, q[1] - h, 2 * h, 2 * h))
+        for i in range(len(xy) - 1):
+            seg = xy[i:i + 2]
+            n = max(2, int(np.hypot(*(seg[1] - seg[0])) / 2.5))
+            for q in np.linspace(seg[0], seg[1], n):
+                out.append(Bbox.from_bounds(q[0] - 0.5, q[1] - 0.5, 1.0, 1.0))
+    for pa in ax.patches:
+        if isinstance(pa, Polygon):
+            out.append(pa.get_window_extent(ax.figure.canvas.get_renderer()))
+    return out
+
+
 def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float]] = (), offset_pt: float = 5.2,
                         names=("F", "R", "B", "L"), fs: float = 6.0, letter_pt: float = 4.6,
-                        displaced: str = "outward", rays: Sequence[float] = ()) -> None:
-    """Sector letters at the sector centres on the badge ring outside the rim.
+                        displaced: str = "outward", rays: Sequence[float] = (), obstacles: str = "auto",
+                        bounds=None) -> None:
+    """Sector letters at the sector centres on the badge ring outside the rim, never under a badge.
 
-    ``occupied``: ``(theta, half_width)`` degrees from ``disc_rim_labels``;
-    where a badge takes the letter's place the letter moves radially outward,
-    past the badges, so it always marks the centre of its sector.
-    ``displaced="inside"`` moves it just inside the rim instead, at the angle
-    within +-38 deg of the sector centre nearest to it that keeps clear of
-    ``rays`` (plot angles of the blue rays, degrees).  ``displaced="slide"``:
-    R/L go outward as by default (nothing sits beside the disc); F/B first
-    slide along the badge ring to the free spot nearest the centre within
-    +-38 deg (they stay in their own 90 deg sector), else go inside as above.
-    Both keep F/B inside the inset's square, out of the block headers.
+    Call after the badges, leaders, arrow and scale bar are drawn: with
+    ``obstacles="auto"`` (default) every letter is tested against their real
+    drawn extents (a pill badge beside the disc reaches far out radially).  A
+    blocked letter first slides along the ring to the free spot nearest its
+    sector centre within +-38 deg (it stays in its own 90 deg sector); then
+    (``displaced="outward"`` or ``"slide"``) it moves radially outward past
+    the badges at its sector centre, up to 14 pt, while that stays clear and
+    inside ``bounds`` (a display-space box, default the axes: pass the free
+    room around the disc to let a blocked F or B sit just beyond the badges);
+    else it goes just inside the rim at the angle within +-38 deg of the
+    centre nearest to it that keeps clear of ``rays`` (plot angles of the
+    blue rays, degrees) and of the drawn dots and badges.
+    ``displaced="inside"`` skips the outward step.  ``obstacles="angles"``:
+    the old angular test against ``occupied`` only.
     """
     per_pt = pts_to_data(ax, 1.0)[0]
-    ring_pt = half_m / per_pt + offset_pt
-    inner_pt = half_m / per_pt - letter_pt / 2 - 2.4
-    half_letter = math.degrees((letter_pt / 2 + 0.8) / ring_pt)
+    px = ax.figure.dpi / 72.0
+    r_pt = half_m / per_pt
+    ring_pt = r_pt + offset_pt
+    inner_pt = r_pt - letter_pt / 2 - 2.4
     steps = sorted(np.arange(-38.0, 38.01, 1.0), key=lambda v: (abs(v), v))
+    obst = _rendered_obstacles(ax) if obstacles == "auto" else []
+    half_letter = math.degrees((letter_pt / 2 + 0.8) / ring_pt)
+    ax_box = ax.get_window_extent() if bounds is None else bounds
 
-    def is_free(th):
+    def ang_free(th):
         return all(abs((th - t + 180) % 360 - 180) > w + half_letter for t, w in occupied)
 
     def inside_angle(th):
@@ -705,27 +828,55 @@ def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float
         ok = [d for d in steps if dist[d] >= need]
         return th + (ok[0] if ok else max(steps, key=lambda d: dist[d]))
 
+    rend = ax.figure.canvas.get_renderer()
     for name, centre_bearing in zip(names, geo.VIEW_YAWS_DEG):
-        theta = 90.0 + centre_bearing
-        free = is_free(theta)
-        side = abs(abs(centre_bearing) - 90.0) < 1e-6  # R or L
-        if free:
-            radius = ring_pt
-        elif displaced == "inside" or (displaced == "slide" and not side):
-            radius = None
-            if displaced == "slide":
+        col = style.INK if name == names[0] else style.MUTED
+        t = ax.text(0, 0, name, ha="center", va="center", fontsize=fs, fontweight="bold", color=col, zorder=6,
+                    path_effects=bold_effects(name, col, halo=1.1) if has_cjk(name) else HALO_THIN)
+        centre = 90.0 + centre_bearing
+
+        def put(th, radius_pt):
+            t.set_position((radius_pt * per_pt * math.cos(math.radians(th)),
+                            radius_pt * per_pt * math.sin(math.radians(th))))
+
+        def free():
+            bb = t.get_window_extent(rend)
+            if obstacles != "auto":
+                th = math.degrees(math.atan2(*t.get_position()[::-1]))
+                return ang_free(th)
+            if bb.x0 < ax_box.x0 - 1.0 or bb.x1 > ax_box.x1 + 1.0 or bb.y0 < ax_box.y0 - 1.0 or bb.y1 > ax_box.y1 + 1.0:
+                return False
+            return not any(bb.x0 - 0.8 * px < o.x1 and o.x0 < bb.x1 + 0.8 * px and bb.y0 - 0.8 * px < o.y1
+                           and o.y0 < bb.y1 + 0.8 * px for o in obst)
+
+        done = False
+        for d in ([0.0] if displaced == "inside" else steps):
+            put(centre + d, ring_pt)
+            if free():
+                done = True
+                break
+        if not done and displaced in ("outward", "slide"):
+            for extra in np.arange(1.0, 14.01, 1.0):
+                put(centre, ring_pt + extra)
+                if free():
+                    done = True
+                    break
+        if not done and obstacles == "auto":  # just inside the rim, clear of the rays, dots and badges
+            inner_obst = obst + _inner_obstacles(ax)
+            for rad in (inner_pt, inner_pt - 3.0, inner_pt - 6.0):
                 for d in steps:
-                    if is_free(theta + d):
-                        theta, radius = theta + d, ring_pt
+                    put(centre + d, rad)
+                    bb = t.get_window_extent(rend)
+                    if not any(bb.x0 - 0.6 * px < o.x1 and o.x0 < bb.x1 + 0.6 * px and bb.y0 - 0.6 * px < o.y1
+                               and o.y0 < bb.y1 + 0.6 * px for o in inner_obst):
+                        done = True
                         break
-            if radius is None:
-                theta, radius = inside_angle(theta), inner_pt
-        else:
-            radius = ring_pt + 3.7 + letter_pt / 2 + 1.0
-        x = radius * per_pt * math.cos(math.radians(theta))
-        y = radius * per_pt * math.sin(math.radians(theta))
-        ax.text(x, y, name, ha="center", va="center", fontsize=fs, fontweight="bold",
-                color=style.INK if name == names[0] else style.MUTED, zorder=6, path_effects=HALO_THIN)
+                if done:
+                    break
+        if not done:
+            put(inside_angle(centre), inner_pt)
+        if obstacles == "auto":
+            obst.append(t.get_window_extent(rend))
 
 
 def disc_direction_arrow(ax, half_m: float, start_bearing: float = STRIP_START_DEG, sweep_deg: float = 34.0,
@@ -756,11 +907,73 @@ def ring_to_strip(ring: np.ndarray) -> np.ndarray:
     return np.roll(ring, -int(round(shift)), axis=1)
 
 
-def rgb_strip(views: np.ndarray, width: int, elev: float, observed=(geo.FRONT,), sat: float = 0.12,
+def elev_window(elev) -> Tuple[float, float]:
+    """(lo, hi) degrees of an elevation window given as a half-width (``8`` -> (-8, 8)) or a (lo, hi) pair."""
+    if np.ndim(elev) == 0:
+        e = float(elev)
+        return -e, e
+    lo, hi = elev
+    return float(lo), float(hi)
+
+
+def elevation_window(rows, arm: str = "vo", default: float = None, margin: float = None, cap: float = None,
+                     ) -> Tuple[float, float]:
+    """The one elevation-window rule of every EXP-18 figure (orchestrator decision D4).
+
+    ``(lo, hi)`` degrees for the affordance map rows of one figure block showing
+    ``rows`` (``data.CaseRow``): ``+-EL_DEFAULT`` (10 deg), widened on each side
+    just enough (``EL_MARGIN`` so the x mark fits, whole degrees) to include
+    every GT-visible slot's ground-truth peak and every drawn predicted peak
+    (GT-visible slots with P(not visible) <= 0.5, ``CaseRow.peak_slots``), at
+    most ``+-EL_MAX`` (45 deg, the views' own vertical field of view).  State it
+    in the caption with ``elevation_text``.
+    """
+    default = EL_DEFAULT if default is None else float(default)
+    margin = EL_MARGIN if margin is None else float(margin)
+    cap = EL_MAX if cap is None else float(cap)
+    els: List[float] = []
+    for r in rows:
+        if r.gt_peak_elev is not None:
+            els += [float(v) for v in np.asarray(r.gt_peak_elev)[r.visible]]
+        p = r.arms[arm]
+        els += [float(p.peak_elev[k]) for k in r.peak_slots(arm)]
+    els = [v for v in els if np.isfinite(v)]
+    lo, hi = -default, default
+    if els:
+        lo = min(lo, float(math.floor(min(els) - margin)))
+        hi = max(hi, float(math.ceil(max(els) + margin)))
+    return max(lo, -cap), min(hi, cap)
+
+
+def fmt_deg(v: float, signed: bool = True) -> str:
+    """"−12°" / "+10°" / "0°" (a real minus sign)."""
+    v = int(round(float(v)))
+    if v == 0 or not signed:
+        return f"{abs(v) if not signed else 0}°"
+    return f"{'+' if v > 0 else '−'}{abs(v)}°"
+
+
+ELEV_TEXT = {"en": "rows show elevation {lo} to {hi}", "zh": "各行显示仰角 {lo} 至 {hi}"}
+
+
+def elevation_text(win, lang: str = "en") -> str:
+    """Caption wording of an elevation window: "rows show elevation −10° to +10°"."""
+    lo, hi = elev_window(win)
+    return ELEV_TEXT["zh" if lang == "zh" else "en"].format(lo=fmt_deg(lo), hi=fmt_deg(hi))
+
+
+def strip_height_in(width_in: float, elev) -> float:
+    """Height (in) of a strip row of ``width_in`` over window ``elev`` (square degrees)."""
+    lo, hi = elev_window(elev)
+    return width_in * (hi - lo) / 360.0
+
+
+def rgb_strip(views: np.ndarray, width: int, elev, observed=(geo.FRONT,), sat: float = 0.12,
               white: float = 0.5) -> np.ndarray:
-    """[h, width, 3] float strip of the four views; views not in ``observed`` are muted."""
-    h = int(round(width * 2 * elev / 360.0))
-    ring, _ = geo.stitch_ring_rgb(views, width=width, height=h, elev_top=elev, elev_bottom=-elev)
+    """[h, width, 3] float strip of the four views over ``elev`` (half-width or (lo, hi)); others muted."""
+    lo, hi = elev_window(elev)
+    h = int(round(width * (hi - lo) / 360.0))
+    ring, _ = geo.stitch_ring_rgb(views, width=width, height=h, elev_top=hi, elev_bottom=lo)
     strip = ring_to_strip(ring).astype(np.float32) / 255.0
     out = mute(strip, sat=sat, white=white)
     q = width // 4
@@ -769,38 +982,42 @@ def rgb_strip(views: np.ndarray, width: int, elev: float, observed=(geo.FRONT,),
     return out
 
 
-def heat_strip(maps: np.ndarray, width: int, elev: float) -> np.ndarray:
-    """[h, width] strip of four 64x64 label-convention maps (0 outside every view)."""
-    h = int(round(width * 2 * elev / 360.0))
-    ring, _ = geo.stitch_ring(maps, width=width, height=h, elev_top=elev, elev_bottom=-elev, fill=0.0)
+def heat_strip(maps: np.ndarray, width: int, elev) -> np.ndarray:
+    """[h, width] strip of four 64x64 label-convention maps over ``elev`` (0 outside every view)."""
+    lo, hi = elev_window(elev)
+    h = int(round(width * (hi - lo) / 360.0))
+    ring, _ = geo.stitch_ring(maps, width=width, height=h, elev_top=hi, elev_bottom=lo, fill=0.0)
     return ring_to_strip(np.clip(ring, 0.0, 1.0))
 
 
-def setup_strip_axes(ax, elev: float) -> None:
+def setup_strip_axes(ax, elev) -> None:
+    lo, hi = elev_window(elev)
     ax.set_xlim(0, 360)
-    ax.set_ylim(-elev, elev)
+    ax.set_ylim(lo, hi)
     ax.set_autoscale_on(False)
     clean_axes(ax)
 
 
-def draw_rgb_row(ax, strip: np.ndarray, elev: float, frame_views=(geo.FRONT,)) -> None:
-    ax.imshow(strip, extent=(0, 360, -elev, elev), aspect="auto", interpolation="bilinear", zorder=0)
+def draw_rgb_row(ax, strip: np.ndarray, elev, frame_views=(geo.FRONT,)) -> None:
+    lo, hi = elev_window(elev)
+    ax.imshow(strip, extent=(0, 360, lo, hi), aspect="auto", interpolation="bilinear", zorder=0)
     setup_strip_axes(ax, elev)
     for s in (90, 180, 270):
         ax.axvline(s, color="white", lw=0.9, zorder=2)
     for v in frame_views:
-        ax.add_patch(Rectangle((v * 90, -elev), 90, 2 * elev, fill=False, ec=style.INK, lw=1.0, zorder=5,
+        ax.add_patch(Rectangle((v * 90, lo), 90, hi - lo, fill=False, ec=style.INK, lw=1.0, zorder=5,
                                clip_on=False))
 
 
-def draw_heat_row(ax, strip: np.ndarray, elev: float, cmap, top: float = HEAT_TOP) -> None:
+def draw_heat_row(ax, strip: np.ndarray, elev, cmap, top: float = HEAT_TOP) -> None:
     """Heat strip coloured linearly by value (0..1 -> the first ``top`` of ``cmap``) on a framed row."""
-    ax.imshow(cmap(top * np.clip(strip, 0, 1)), extent=(0, 360, -elev, elev), aspect="auto",
+    lo, hi = elev_window(elev)
+    ax.imshow(cmap(top * np.clip(strip, 0, 1)), extent=(0, 360, lo, hi), aspect="auto",
               interpolation="bilinear", zorder=0)
     setup_strip_axes(ax, elev)
     for s in (90, 180, 270):
         ax.axvline(s, color=style.GRID, lw=0.6, zorder=1)
-    ax.add_patch(Rectangle((0, -elev), 360, 2 * elev, fill=False, ec=style.AXIS, lw=0.5, zorder=4, clip_on=False))
+    ax.add_patch(Rectangle((0, lo), 360, hi - lo, fill=False, ec=style.AXIS, lw=0.5, zorder=4, clip_on=False))
 
 
 def quietest_panel(*strips: np.ndarray, empty: float = 0.05) -> int:
@@ -922,3 +1139,464 @@ def azimuth_axis(ax, labels: Sequence[str], fs: float = 6.0) -> None:
     ax.set_xticks([0, 90, 180, 270, 360], minor=True)
     ax.tick_params(axis="x", which="major", length=0, pad=3.0)
     ax.tick_params(axis="x", which="minor", length=2.4, width=0.5, color=style.AXIS)
+
+
+# --------------------------------------------------------------------------- #
+# Frame numbers (D6): one wording in every figure
+# --------------------------------------------------------------------------- #
+FRAME_LABEL = {"en": "frame {n} of {T}", "zh": "第 {n} 帧（共 {T} 帧）"}
+
+
+def frame_label(frame_id: int, frame_count: int, lang: str = "en") -> str:
+    """"frame 35 of 79": a 1-based count (the dump's 0-based frame id + 1) out of the clip's frame count."""
+    return FRAME_LABEL["zh" if lang == "zh" else "en"].format(n=int(frame_id) + 1, T=int(frame_count))
+
+
+# --------------------------------------------------------------------------- #
+# Bold Chinese text: the CJK font has no bold face, so bold is drawn as a thin stroke of the text's own colour
+# --------------------------------------------------------------------------- #
+def has_cjk(text: str) -> bool:
+    """True when ``text`` holds CJK ideographs or full-width forms."""
+    return any("　" <= ch <= "鿿" or "＀" <= ch <= "￯" for ch in str(text))
+
+
+def bold_effects(text: str, color, halo: Optional[float] = None, stroke_pt: float = 0.45):
+    """``path_effects`` for bold ``text``: with CJK characters a ``stroke_pt`` stroke in ``color`` (fake bold,
+    since the CJK font has no bold face), under an optional white ``halo`` of that line width; ``None`` when
+    neither applies (Latin bold comes from the font)."""
+    effects = []
+    if halo:
+        effects.append(pe.Stroke(linewidth=halo, foreground="white"))
+    if has_cjk(text):
+        effects.append(pe.Stroke(linewidth=stroke_pt, foreground=color))
+    return effects + [pe.Normal()] if effects else None
+
+
+# --------------------------------------------------------------------------- #
+# Row names in a fixed left gutter (D3)
+# --------------------------------------------------------------------------- #
+ROW_LABEL_FS = 5.8
+
+
+def gutter_row_label(ax_row, text: str, kind: str, fs: float = ROW_LABEL_FS, gap_pt: float = 4.0,
+                     key_w_pt: float = 19.0, key_h_pt: float = 2.3, zorder: float = 6):
+    """Row name ("ground truth" / "prediction") right-aligned in the gutter left of ``ax_row``, outside the strip.
+
+    ``kind`` "gt" (blue text, blue ramp key) or "pred" (orange).  The name sits
+    just above the row's middle and a tiny colour ramp key (``key_w_pt`` x
+    ``key_h_pt``) just below it, both ending ``gap_pt`` left of the row.  The
+    same place in every block of every figure, whatever the maps show.  Bold
+    (a CJK name gets ``bold_effects``).  Returns ``(text, key_axes)`` so a
+    caller can keep other marks clear of them.
+    """
+    fig = ax_row.figure
+    box = ax_row.get_position()
+    W, H = fig.get_size_inches() * 72.0
+    x_right = box.x0 - gap_pt / W
+    yc = (box.y0 + box.y1) / 2.0
+    color, cmap = (GT_INK, GT_CMAP) if kind == "gt" else (PRED_INK, PRED_CMAP)
+    t = fig.text(x_right, yc + 1.9 / H, text, ha="right", va="bottom", fontsize=fs, color=color, fontweight="bold",
+                 zorder=zorder, path_effects=bold_effects(text, color, stroke_pt=0.065 * fs))
+    key = fig.add_axes([x_right - key_w_pt / W, yc - (1.0 + key_h_pt) / H, key_w_pt / W, key_h_pt / H])
+    key.imshow(cmap(HEAT_TOP * np.linspace(0.0, 1.0, 64))[None], aspect="auto", extent=(0, 1, 0, 1),
+               interpolation="bilinear")
+    key.set_xlim(0, 1)
+    key.set_ylim(0, 1)
+    key.axis("off")
+    return t, key
+
+
+def gutter_width_pt(fig, texts: Sequence[str], fs: float = ROW_LABEL_FS, gap_pt: float = 4.0) -> float:
+    """Gutter width (pt) the row names need (bold ``fs``) plus ``gap_pt``."""
+    return max(text_width_pt(fig, t, fs, fontweight="bold") for t in texts) + gap_pt
+
+
+# --------------------------------------------------------------------------- #
+# Notes (D5): never dropped -- wrapped onto as many lines as they need
+# --------------------------------------------------------------------------- #
+NOTE_FS = 5.7
+NOTE_BADGE_GAP_PT = 1.4  # between a note's badge and its text
+NOTE_SEP_PT = 10.0  # between two notes on one line
+
+
+def note_width_pt(fig, item: dict, fs: float = NOTE_FS) -> float:
+    """Width (pt) of a note: its badge (``item["label"]``, may be empty) + gap + text."""
+    w = text_width_pt(fig, item["text"], fs)
+    if item.get("label"):
+        w += badge_width_pt(item["label"]) + NOTE_BADGE_GAP_PT
+    return w
+
+
+def split_note(fig, item: dict, max_pt: float, fs: float = NOTE_FS) -> List[dict]:
+    """A note wider than ``max_pt``: cut its text at " · " (then at spaces) so each part fits; the parts after the
+    first carry no badge (``continuation``).  Nothing is dropped."""
+    parts = item["text"].split(" · ")
+    out, cur = [], dict(item, text=parts[0])
+    for part in parts[1:]:
+        trial = dict(cur, text=cur["text"] + " · " + part)
+        if note_width_pt(fig, trial, fs) <= max_pt:
+            cur = trial
+        else:
+            out.append(cur)
+            cur = dict(item, text="· " + part, label="", continuation=True)
+    out.append(cur)
+    final = []
+    for it in out:  # a part still too wide (one long clause): break at spaces
+        if note_width_pt(fig, it, fs) <= max_pt or " " not in it["text"]:
+            final.append(it)
+            continue
+        words, line = it["text"].split(" "), ""
+        first = True
+        for w in words:
+            trial = w if not line else line + " " + w
+            probe = dict(it, text=trial) if first else dict(it, text=trial, label="")
+            if line and note_width_pt(fig, probe, fs) > max_pt:
+                final.append(dict(it, text=line) if first else dict(it, text=line, label="", continuation=True))
+                first, line = False, w
+            else:
+                line = trial
+        final.append(dict(it, text=line) if first else dict(it, text=line, label="", continuation=True))
+    return final
+
+
+def wrap_notes(fig, items: Sequence[dict], line_pt: float, first_pt: Optional[float] = None,
+               fs: float = NOTE_FS, sep_pt: float = NOTE_SEP_PT):
+    """Lay notes out left to right: ``(first, lines)`` with every note placed (D5).
+
+    ``first``: the notes that fit, in order, into ``first_pt`` points (a line
+    shared with other marks, e.g. the space left of a block's lane badges;
+    ``None``: no such line); ``lines``: the rest on full lines of ``line_pt``
+    points, as many as they need.  Each entry is ``(x_pt, item)``, x from the
+    line's left end.  A note wider than a whole line is split
+    (``split_note``) first.
+    """
+    flat: List[dict] = []
+    for it in items:
+        flat += split_note(fig, it, line_pt, fs) if note_width_pt(fig, it, fs) > line_pt else [dict(it)]
+    first: list = []
+    lines: list = []
+    x = 0.0
+    j = 0
+    if first_pt is not None:
+        while j < len(flat) and x + note_width_pt(fig, flat[j], fs) <= first_pt:
+            first.append((x, flat[j]))
+            x += note_width_pt(fig, flat[j], fs) + sep_pt
+            j += 1
+    cur: list = []
+    x = 0.0
+    for it in flat[j:]:
+        w = note_width_pt(fig, it, fs)
+        if cur and x + w > line_pt:
+            lines.append(cur)
+            cur, x = [], 0.0
+        cur.append((x, it))
+        x += w + sep_pt
+    if cur:
+        lines.append(cur)
+    return first, lines
+
+
+def draw_note(ax, x: float, y: float, item: dict, per_pt: float, fs: float = NOTE_FS, color: str = style.INK_2,
+              num: int = 8) -> None:
+    """One note at data (x, y), left end: its badge -- a blue past-position badge (``item["style"]`` "hist") or an
+    orange-ringed miss badge ("miss") -- then its text.  ``per_pt``: data units per point along x."""
+    if item.get("label"):
+        bw = badge_width_pt(item["label"]) * per_pt
+        if item.get("style") == "miss":
+            miss_badge(ax, x + bw / 2, y, item["label"])
+        else:
+            history_badge(ax, x + bw / 2, y, item["label"], item["slots"][0], num=num)
+        x += bw + NOTE_BADGE_GAP_PT * per_pt
+    ax.text(x, y, item["text"], ha="left", va="center", fontsize=fs, color=color)
+
+
+# --------------------------------------------------------------------------- #
+# Predicted peaks and numbered misses (D1, D2)
+# --------------------------------------------------------------------------- #
+MARK_PT = 4.4  # size of the predicted-peak x
+MERGE_DEG = 4.0  # hits closer than this share one x
+STAGGER_PT = 2.6  # vertical offset of an x that would touch its neighbour
+MISS_BH = 3.9  # half height of a numbered badge (pt)
+LABEL_CLEAR_PT = 3.5  # a badge without a leader keeps at least this far from any other x (2 pt with one)
+BELOW_LANE_PT = 8.6  # centre of a badge in the lane under a prediction row (the true-bearing ticks take 1..4 pt)
+BELOW_LANE_H_PT = BELOW_LANE_PT + MISS_BH + 0.8  # room that lane needs under the row
+MISS_RING = "#b53f12"  # the miss badge's ring: a dark step of the prediction orange (reads on the orange map)
+LEADER_COLOR = style.INK  # a moved badge's leader: ink with a white halo (an orange line vanishes on the map)
+
+
+def miss_badge(ax, x, y, label: str, transform=None, zorder: float = 8, fs: float = BADGE_FS):
+    """A missed slot's number (D2): ink digits in a small white disc ringed in the prediction orange.
+
+    Same box as ``history_badge`` (``badge_width_pt`` holds); never blue, so it
+    cannot be read as a ground-truth past position.
+    """
+    box = "circle,pad=0.22" if len(label) == 1 else "round,pad=0.24,rounding_size=0.62"
+    kw = dict(ha="center", va="center", fontsize=fs, fontweight="bold", transform=transform or ax.transData,
+              clip_on=False)
+    # a white outline under the ring keeps it visible on the orange map
+    ax.text(x, y, label, color=(1, 1, 1, 0), zorder=zorder - 0.01,
+            bbox=dict(boxstyle=box, fc="white", ec="white", lw=2.4), **kw)
+    return ax.text(x, y, label, color=style.INK, zorder=zorder,
+                   bbox=dict(boxstyle=box, fc="white", ec=MISS_RING, lw=0.95), **kw)
+
+
+def slots_label(slots: Sequence[int]) -> str:
+    """1-based slot list as runs: [0, 1, 2, 5] -> "1–3, 6"."""
+    runs, out = sorted(int(k) for k in slots), []
+    for k in runs:
+        if out and k == out[-1][-1] + 1:
+            out[-1].append(k)
+        else:
+            out.append([k])
+    return ", ".join(str(r[0] + 1) if len(r) == 1 else f"{r[0] + 1}–{r[-1] + 1}" for r in out)
+
+
+def _cluster_2d(pts: Sequence[Tuple[float, float]], tol: float) -> List[List[int]]:
+    """Greedy clusters (sweep in x): a point joins the first cluster whose centroid is within ``tol`` in both
+    coordinates."""
+    order = sorted(range(len(pts)), key=lambda i: (pts[i][0], pts[i][1]))
+    out: List[List[int]] = []
+    for i in order:
+        for cl in out:
+            cx = float(np.mean([pts[j][0] for j in cl]))
+            cy = float(np.mean([pts[j][1] for j in cl]))
+            if abs(pts[i][0] - cx) <= tol and abs(pts[i][1] - cy) <= tol:
+                cl.append(i)
+                break
+        else:
+            out.append([i])
+    return out
+
+
+def peak_marks(row, arm: str, elev, ppd: float, merge_deg: float = MERGE_DEG, mark_pt: float = MARK_PT,
+               stagger_pt: float = STAGGER_PT) -> List[dict]:
+    """The x marks of one prediction row, in strip degrees (the rows are square degrees, ``ppd`` pt per degree).
+
+    One x per GT-visible slot with a predicted peak (``CaseRow.peak_slots``):
+    hits within ``merge_deg`` of each other (in bearing and elevation) share
+    one x; misses (D1) never share an x with a hit, and misses whose peaks lie
+    within one mark width of each other (they would print as one blot) share
+    one x and one numbered badge ("1–3").  Marks that would still touch are
+    staggered vertically by ``stagger_pt``; an x never crosses the row's
+    top or bottom edge, and reaches at most 1 pt past a strip end (a peak
+    right at the end moves inward by < 1.2 deg, under one map pixel;
+    ``x_peak`` keeps the exact place).  Slots with no ground-truth view get no x (their map still shows in
+    the row; their notes give P(not visible)).  Returns [{"x", "y", "y_peak",
+    "slots", "miss", "slot", "label"}] sorted by x; ``slot`` is the one slot of
+    a single-slot mark (else None, kept for older callers); ``label`` the miss
+    badge text (``slots_label``).
+    """
+    lo, hi = elev_window(elev)
+    p = row.arms[arm]
+    peaks = row.peak_slots(arm)
+    missed = set(row.misses(arm))
+    marks = []
+    for group, is_miss, tol in (([k for k in peaks if k not in missed], False, merge_deg),
+                                ([k for k in peaks if k in missed], True, 0.8 * mark_pt / ppd)):
+        pts = [(float(strip_x(p.peak_bearing[k])), float(p.peak_elev[k])) for k in group]
+        for cl in _cluster_2d(pts, tol):
+            ks = sorted(group[i] for i in cl)
+            x = float(np.mean([pts[i][0] for i in cl]))
+            y = float(np.mean([pts[i][1] for i in cl]))
+            marks.append({"x": x, "y": y, "y_peak": y, "slots": ks, "miss": is_miss,
+                          "slot": ks[0] if (is_miss and len(ks) == 1) else None,
+                          "label": slots_label(ks) if is_miss else ""})
+    x_edge = max(mark_pt / 2 - 1.2, 0.0) / ppd  # an x may reach 1 pt past a strip end, never into the row names
+    for m in marks:
+        m["x_peak"] = m["x"]
+        m["x"] = float(np.clip(m["x"], x_edge, 360.0 - x_edge))  # moves a peak at a strip end by < 1.2 deg
+    marks.sort(key=lambda m: (m["x"], m["y"]))
+    sign = 1.0
+    off = [0.0] * len(marks)
+    for j in range(1, len(marks)):
+        a, b = marks[j - 1], marks[j]
+        if ((b["x"] - a["x"]) * ppd < mark_pt + 3.4 and abs(b["y"] - a["y"]) * ppd < mark_pt + 1.0):
+            if off[j - 1] == 0.0:
+                off[j - 1] = sign * stagger_pt
+            off[j] = -np.sign(off[j - 1]) * stagger_pt
+            sign = -sign
+    edge = (mark_pt / 2 + 1.0) / ppd
+    for m, o in zip(marks, off):
+        m["y"] = float(np.clip(m["y"] + o / ppd, lo + edge, hi - edge))
+    return marks
+
+
+def place_miss_labels(marks: Sequence[dict], ppd: float, elev, heat=None, below: bool = False,
+                      mark_pt: float = MARK_PT, lines: Sequence[Sequence[Tuple[float, float]]] = ()) -> dict:
+    """Where each numbered miss's badge goes (pure layout, strip degrees; D2).
+
+    ``marks``: ``peak_marks`` output; one badge per miss mark.  A
+    badge sits beside its own x, or slides along one of the lanes inside the
+    row (every 2 pt between the frame's inner edges), or -- with ``below`` --
+    in the lane ``BELOW_LANE_PT`` under the row.  It never overlaps another x
+    or badge, its leader (drawn when it is not level with its x or has slid
+    away) never runs through another x or badge, and a badge without a leader
+    is clearly nearer its own x than any other (``LABEL_CLEAR_PT``).  Among the
+    rest: nearest its x, inside the row before the lane below, then least heat
+    under it (``heat(x0, x1, y0, y1)`` in degrees, optional).  ``lines``:
+    polylines (strip degrees) a badge should not sit on (the dotted
+    connectors, ``miss_connectors``).  Returns
+    ``{"labels": {mark index: {"cx", "cy", "label", "slots", "leader": ((x0, y0),
+    (x1, y1)) or None, "below": bool}}, "clean": bool}`` -- ``clean`` False when some badge could
+    not avoid an overlap or a crossing (then call again with ``below=True``).
+    """
+    lo, hi = elev_window(elev)
+    Ylo, Yhi, W = lo * ppd, hi * ppd, 360.0 * ppd
+    half = mark_pt / 2 + 0.8
+    bh = MISS_BH
+    boxes = [(m["x"] * ppd - half, m["x"] * ppd + half, m["y"] * ppd - half, m["y"] * ppd + half) for m in marks]
+    in_lo, in_hi = Ylo + bh + 0.9, Yhi - bh - 0.9
+    grid = list(np.arange(in_lo, in_hi + 1e-6, 2.0)) if in_hi >= in_lo else [(Ylo + Yhi) / 2]
+    below_y = Ylo - BELOW_LANE_PT
+
+    def gap(b, lo_, hi_, ylo, yhi):
+        b0, b1, c0, c1 = b
+        return math.hypot(max(0.0, b0 - hi_, lo_ - b1), max(0.0, c0 - yhi, ylo - c1))
+
+    def overlap(b, lo_, hi_, ylo, yhi):
+        b0, b1, c0, c1 = b
+        return max(0.0, min(hi_, b1) - max(lo_, b0)) * max(0.0, min(yhi, c1) - max(ylo, c0))
+
+    def crosses(p0, p1, skip):
+        ts = np.linspace(0.0, 1.0, 20)
+        qx, qy = p0[0] + ts * (p1[0] - p0[0]), p0[1] + ts * (p1[1] - p0[1])
+        return any(np.any((qx > b0 + 0.3) & (qx < b1 - 0.3) & (qy > c0 + 0.3) & (qy < c1 - 0.3))
+                   for j, (b0, b1, c0, c1) in enumerate(boxes) if j != skip)
+
+    line_pts = []
+    for ln in lines:
+        q = np.asarray(ln, dtype=float) * ppd
+        for a_, b_ in zip(q[:-1], q[1:]):
+            n_ = max(2, int(np.hypot(*(b_ - a_)) / 1.0))
+            line_pts.append(np.linspace(a_, b_, n_))
+    line_pts = np.concatenate(line_pts) if line_pts else np.zeros((0, 2))
+
+    def on_line(lo_, hi_, ylo, yhi):
+        if not len(line_pts):
+            return False
+        return bool(np.any((line_pts[:, 0] > lo_ - 0.4) & (line_pts[:, 0] < hi_ + 0.4)
+                           & (line_pts[:, 1] > ylo - 0.4) & (line_pts[:, 1] < yhi + 0.4)))
+
+    out, clean = {}, True
+    for j_own, m in sorted([(j, m) for j, m in enumerate(marks) if m.get("miss", m.get("slot") is not None)],
+                           key=lambda jm: jm[1]["x"]):
+        label = m.get("label") or slots_label(m["slots"])
+        bw = badge_width_pt(label)
+        xp, yp = m["x"] * ppd, m["y"] * ppd
+        others = [j for j in range(len(boxes)) if j != j_own]
+        lanes = [(float(np.clip(yp, in_lo, in_hi)) if in_hi >= in_lo else grid[0], False)]
+        lanes += [(float(y), False) for y in grid]
+        if below:
+            lanes.append((below_y, True))
+        best = None
+        for ly, is_below in lanes:
+            cands = []
+            for shift in np.arange(0.0, 96.0, 1.5):
+                for sgn in (1.0, -1.0):
+                    a = xp + sgn * (half + 0.6 + shift)
+                    lo_, hi_ = (a, a + bw) if sgn > 0 else (a - bw, a)
+                    cands.append((lo_, hi_, sgn, shift))
+            if abs(ly - yp) >= half + bh + 0.4:  # straight above / below its x
+                cands.append((xp - bw / 2, xp + bw / 2, 0.0, 0.0))
+            for lo_, hi_, sgn, shift in cands:
+                if lo_ < 0.5 or hi_ > W - 0.5:
+                    continue
+                ylo, yhi = ly - bh, ly + bh
+                hard = sum(overlap(boxes[j], lo_, hi_, ylo, yhi) for j in others)
+                if sgn == 0.0:
+                    hard += overlap(boxes[j_own], lo_, hi_, ylo, yhi)
+                cx = (lo_ + hi_) / 2
+                d = np.array([cx - xp, ly - yp])
+                dist = float(np.hypot(*d))
+                u = d / max(dist, 1e-9)
+                p0 = (xp + u[0] * half * 0.85, yp + u[1] * half * 0.85)
+                rb = bh if bw <= 7.5 else min(bw / 2 / (abs(u[0]) + 1e-9), bh / (abs(u[1]) + 1e-9))
+                p1 = (cx - u[0] * (rb + 0.2), ly - u[1] * (rb + 0.2))
+                leader = (shift > 0 or abs(ly - yp) > 1.5 or is_below or sgn == 0.0) and math.hypot(
+                    p1[0] - p0[0], p1[1] - p0[1]) >= 1.2
+                cross = leader and crosses(p0, p1, j_own)
+                near = min([gap(boxes[j], lo_, hi_, ylo, yhi) for j in others], default=99.0)
+                ambiguous = near < (LABEL_CLEAR_PT if not leader else 2.0)  # nearer another x than its own
+                soft = (shift + 0.8 * abs(ly - yp) + (2.0 if leader else 0.0)
+                        + 2.0 * max(0.0, LABEL_CLEAR_PT - near) + (8.0 if is_below else 0.0))
+                h = heat(lo_ / ppd, hi_ / ppd, ylo / ppd, yhi / ppd) if heat is not None else 0.0
+                cost = (hard > 0.01, cross, ambiguous, on_line(lo_, hi_, ylo, yhi), hard, soft, h)
+                if best is None or cost < best[0]:
+                    best = (cost, cx, ly, p0, p1, leader, is_below)
+        cost, cx, ly, p0, p1, leader, is_below = best
+        if cost[0] or cost[1]:
+            clean = False
+        out[j_own] = {"cx": cx / ppd, "cy": ly / ppd, "below": bool(is_below), "label": label,
+                      "slots": list(m["slots"]),
+                      "leader": ((p0[0] / ppd, p0[1] / ppd), (p1[0] / ppd, p1[1] / ppd)) if leader else None}
+        boxes.append((cx - bw / 2, cx + bw / 2, ly - bh, ly + bh))
+    return {"labels": out, "clean": clean}
+
+
+def heat_lookup(strip: np.ndarray, elev):
+    """``heat(x0, x1, y0, y1)`` (strip degrees) summing ``strip`` under a box, for ``place_miss_labels``."""
+    lo, hi = elev_window(elev)
+    h, w = strip.shape[:2]
+
+    def heat(x0, x1, y0, y1):
+        c0, c1 = int(max(0, x0) * w / 360.0), int(min(360, x1) * w / 360.0)
+        r0, r1 = int((hi - min(hi, y1)) * h / (hi - lo)), int((hi - max(lo, y0)) * h / (hi - lo))
+        return float(strip[r0:max(r1, r0 + 1), c0:max(c1, c0 + 1)].sum())
+
+    return heat
+
+
+def draw_peak_marks(ax, marks: Sequence[dict], size: float = MARK_PT) -> None:
+    for m in marks:
+        peak_mark(ax, m["x"], m["y"], size=size)
+
+
+CONNECTOR_MAX_DEG = 45.0  # a miss farther than this from its true bearing gets no dotted connector
+
+
+def miss_connectors(row, marks: Sequence[dict], elev, ppd: float, mark_pt: float = MARK_PT,
+                    max_deg: float = CONNECTOR_MAX_DEG) -> List[list]:
+    """Per numbered miss: [(x0, y0), (x1, y1)] in strip degrees, from its true-bearing tick (the row's bottom
+    edge) to the edge of its own x -- none when the x sits on the tick, or lies more than ``max_deg`` along the
+    strip from it (a line across whole views would cross other marks; the numbers still pair the x with its
+    tick and lane badge)."""
+    lo, _ = elev_window(elev)
+    out = []
+    for m in marks:
+        if not m.get("miss", m.get("slot") is not None):
+            continue
+        for k in m["slots"]:
+            x0, y0 = float(strip_x(row.gt_bearing[k])), lo
+            if abs(m["x"] - x0) > max_deg:
+                continue
+            d = np.array([(m["x"] - x0) * ppd, (m["y"] - y0) * ppd])
+            n = float(np.hypot(*d))
+            if n < mark_pt / 2 + 1.5:
+                continue
+            end = np.array([m["x"], m["y"]]) - d / n * (mark_pt / 2 + 0.9) / ppd
+            out.append([(x0, y0), (float(end[0]), float(end[1]))])
+    return out
+
+
+def draw_miss_connectors(ax, row, marks: Sequence[dict], elev, ppd: float, mark_pt: float = MARK_PT) -> None:
+    """Thin dotted line from each miss's true-bearing tick (the row's bottom edge) to its own x (D2), when they
+    lie within ``CONNECTOR_MAX_DEG`` of each other.
+
+    Drawn over the x marks (under badges and leaders), so a connector that
+    passes another x visibly runs on to its own."""
+    for (x0, y0), (x1, y1) in miss_connectors(row, marks, elev, ppd, mark_pt):
+        ax.plot([x0, x1], [y0, y1], color=style.INK_2, lw=0.55, ls=(0, (0.9, 1.1)), zorder=7.2,
+                clip_on=False, solid_capstyle="round", dash_capstyle="round")
+
+
+def draw_miss_labels(ax, placed: dict) -> List[int]:
+    """Leaders (ink, white halo) and ``miss_badge``s of ``place_miss_labels``; returns the slots numbered."""
+    done = []
+    for _, lab in sorted(placed["labels"].items()):
+        if lab["leader"] is not None:
+            (x0, y0), (x1, y1) = lab["leader"]
+            ax.plot([x0, x1], [y0, y1], color=LEADER_COLOR, lw=0.6, zorder=7.6, clip_on=False, solid_capstyle="butt",
+                    path_effects=[pe.withStroke(linewidth=1.5, foreground="white")])
+        miss_badge(ax, lab["cx"], lab["cy"], lab["label"], zorder=8)
+        done += [int(k) for k in lab["slots"]]
+    return done

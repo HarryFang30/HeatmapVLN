@@ -1,16 +1,24 @@
 """Paper figure style for EXP-18: fonts, sizes, and the validated palette.
 
-Color roles (validated with the dataviz palette checker, light surface #fcfcfb):
+Colour roles (one meaning per hue across every EXP-18 figure; validated with
+the dataviz palette checker on the light surface #fcfcfb):
 
-* tiers A–E: categorical slots 1–5 in fixed order (blue, orange, aqua, yellow,
-  magenta).  Three slots sit below 3:1 contrast, so tiers are always direct-
-  labelled on an axis and never identified by color alone.
-* pose arms: same tier color, filled marker = VO (deployed), hollow = GT pose.
-* history index k = 1..K: a single-hue blue ramp, oldest light -> newest dark.
-  Eight steps of one hue cannot all be told apart, so every history marker also
+* **Blue (#2a78d6 family) = ground truth / past positions only.**  History
+  index k = 1..K is a single-hue blue ramp, oldest light -> newest dark.  Eight
+  steps of one hue cannot all be told apart, so every history marker also
   carries its number; the ramp only adds a sense of "older vs newer".
-* predicted heat: a single-hue orange ramp from transparent to deep red-orange,
-  so it never collides with the blue history markers.
+* **Orange (#eb6834 family) = prediction only.**  The predicted affordance map
+  is a single-hue orange ramp; ``PRED_INK`` rings a missed slot's number.
+* Tiers A-E are never told apart by blue vs orange.  A chart whose marks are
+  all predictions (the quantitative figure) draws every tier in the orange
+  family: ``TIER_PRED_SHADES`` (an ordinal light -> dark ramp, passes the
+  checker's ``--ordinal`` gates) together with ``TIER_MARKERS`` and direct
+  labels; the constant always-behind guess is grey (``FLOOR_COLOR``).
+* ``TIER_COLORS`` holds categorical tier hues outside the blue / orange
+  families (aqua, yellow, magenta, green, violet; adjacent CVD dE >= 9.1).  The
+  paper figures do not use them; they exist for non-prediction tier keys only
+  and never for prediction marks.  Three sit below 3:1 contrast, so anything
+  drawn in them is direct-labelled.
 """
 from __future__ import annotations
 
@@ -28,14 +36,30 @@ MUTED = "#898781"
 GRID = "#e1e0d9"
 AXIS = "#c3c2b7"
 
+# Categorical tier hues, outside the ground-truth blue and prediction orange families (see the module
+# doc: not for prediction marks; unused by the paper figures).
 TIER_COLORS = {
-    "A": "#2a78d6",
-    "B": "#eb6834",
-    "C": "#1baf7a",
-    "D": "#eda100",
-    "E": "#e87ba4",
+    "A": "#1baf7a",  # aqua
+    "B": "#eda100",  # yellow
+    "C": "#e87ba4",  # magenta
+    "D": "#008300",  # green
+    "E": "#4a3aa7",  # violet
 }
+# Prediction marks per tier: one orange hue, light -> dark A..E (ordinal ramp, light end 2.41:1 on SURFACE).
+TIER_PRED_SHADES = {
+    "A": "#f08a55",
+    "B": "#eb6834",
+    "C": "#c94f1e",
+    "D": "#9a3810",
+    "E": "#6b2408",
+}
+TIER_MARKERS = {"A": "o", "B": "s", "C": "^", "D": "v", "E": "P"}  # never "D" (the diamond marks the baseline)
 FLOOR_COLOR = "#c3c2b7"
+
+GT_COLOR = "#2a78d6"  # ground truth / past positions
+GT_INK = "#1c5cab"  # dark step of the ground-truth ramp (text, carets, keys)
+PRED_COLOR = "#eb6834"  # prediction
+PRED_INK = "#c94f1e"  # dark step of the prediction ramp (miss rings, leaders, text keys)
 
 # Blue ramp 250 -> 700 from the reference palette.
 _HISTORY_RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"]

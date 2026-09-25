@@ -3,69 +3,107 @@
 
 Layout (7.0 in wide, double column; one block per key position K1..Kn):
 
-  a  Route           b  Local map, heading up    c  Front (model input) | Right | Back | Left
-  +---------+        K1 frame 19                        metrics of the row (right-aligned)
-  | top-down|        ( disc )   lane: numbered badges at the true bearings
-  |  map    |                   RGB row: the four views unrolled clockwise
-  |  route, |                   ground-truth heat row (blue)
-  |  K1..Kn |                   predicted heat row (orange) with an x per predicted peak
-  +---------+        K2 ...
+  a  Route          b  Local map (robot facing up)    c  Front · model input | Right | Back | Left
+  +---------+       K1 frame 20 of 79                       metrics of the row (right-aligned)
+  | top-down|                        notes (slots with no view / predicted not visible), wrapped
+  |  map,   |       ( disc )         lane: numbered blue badges at the true bearings
+  | cropped |                        RGB row: the four current views unrolled clockwise (+-15 deg)
+  | to the  |       ground truth ▬   ground-truth affordance map row (blue)
+  |  route  |       prediction   ▬   predicted affordance map row (orange), x per predicted peak
+  +---------+                        (lane under the row for numbered misses, only when needed)
 
-Encodings (one meaning each; see ``common_draw`` for the shared vocabulary):
+Encodings (one meaning each; ``common_draw`` holds the shared vocabulary):
 
-* a  Route: muted top-down map (a light plate where there is no floor), the
-  whole route (grey line, open circle = start), each key position as a black
-  dot + heading arrow + ``K`` badge; tier, scene and episode underneath.
-* b  Local map: the map around the robot, rotated heading-up and clipped to a
-  disc whose rim IS the bearing ring that c unrolls.  Dashed radii are the
-  view seams (+-45 deg, +-135 deg), so the four sectors are the four panels
-  of c; letters F/R/B/L mark the sector centres outside the rim (moved
-  outward past the badges when one sits there).  The grey line is the route
-  so far.  Every past position that is visible in the ground truth gets a
-  blue line from the robot through its true position (dot) to the rim and
-  its number just outside the rim at that bearing (slots at one spot share a
-  badge, "1–6").  Badges only slide along the rim (thin leader); dots never
-  move, so distances and order on the map are true.  The curved arrow (first
-  block) shows where c starts and that it runs clockwise.  Scale bar per row.
-* c  Surround strip, horizontal axis = bearing, square degrees, starting at
-  the front view's left edge (+45 deg) and running clockwise F, R, B, L, so
-  the front view is one whole panel and reading the rim of b clockwise gives
-  the order of c.
-  - lane: the same numbered badges as b, dodged sideways, leaders to the true
-    bearing; the blue guide line continues through the RGB row.  Slots with
-    no ground-truth view (e.g. the current position) get a one-line note.
-  - RGB row: only the front view is the model's image input: framed, in
-    colour, headed "model input".  Right/back/left are washed out and
-    bracketed "images not given to the model"; they are display only.
+* **Blue = ground truth / past positions, orange = prediction, never swapped
+  and never used for anything else** (``style``).
+* a  Route: muted top-down map cropped to the route's bounding box plus
+  ``ROUTE_PAD_M`` (``FittedRoutePanel``; a quarter turn when that shows the
+  route larger), the whole route (grey line, open circle = start), each key
+  position as a black dot + facing arrow + ``K`` badge fanned out clear of the
+  route (leaders when moved, never crossing); scale bar in a band >= 2 pt
+  inside the map frame; tier, scene and episode underneath.
+* b  Local map: the map around the robot, rotated so the robot faces up and
+  clipped to a disc whose rim IS the bearing ring that c unrolls.  Dashed
+  radii are the view seams (+-45 deg, +-135 deg), so the four sectors are the
+  four panels of c.  The grey line is the route so far.  Every past position
+  visible in the ground truth gets a blue line from the robot through its true
+  position (dot) to the rim and its number just outside the rim (slots at one
+  spot share a badge, "1–6"); badges are dodged along the rim in bearing
+  order (thin leader when moved; dots never move).  Sector letters F/R/B/L
+  sit at the sector centres on the badge ring and are tested against the
+  drawn badges, leaders and scale bar: blocked, they slide within their own
+  sector, else move outward past the badges (into the free room of the block
+  above / below / beside the disc), else just inside the rim -- never under a
+  badge.  Each disc is as large as its rim badges allow: a pill badge ("1–3")
+  that would run into the row names or column a first nudges the disc
+  sideways (<= 5 pt), then shrinks it (``fit_inset``).  The curved arrow
+  (first block) shows where c starts and that it runs clockwise.  Scale bar
+  per block, one shared corner.
+* c  Surround strip, horizontal axis = bearing in square degrees, starting at
+  the front view's left edge (+45 deg) and running clockwise F, R, B, L.
+  - header: "K1  frame 20 of 79" (``cd.frame_label``: 1-based count, D6), then
+    right-aligned the bearing error of the predicted peaks (median, max over
+    GT-visible slots) and joint PCK@8 hits/visible, and in grey the constant
+    "always-behind guess: median .., PCK@8 ../.." for reference.  A header
+    that would collide with a long frame/role text wraps the reference onto a
+    second line.
+  - notes (D5): slots that need words -- "8 = previous frame (at the robot):
+    not visible · predicted P(not visible) = 1.00", runs of consecutive slots
+    no view shows ("2–4 not visible in any view · predicted P(not visible)
+    0.67–0.98"), and GT-visible slots the model calls not visible (a miss
+    without an x; its number in the miss badge).  Notes go left of the lane
+    badges when they fit, else onto note lines (the block grows); a note is
+    never dropped.  ``data.check_accounting`` raises unless every valid slot
+    has a lane badge or a note and every miss is numbered exactly once.
+  - lane: the numbered blue badges, dodged sideways, leaders to the true
+    bearing; the blue guide line continues through the RGB row.
+  - RGB row: of the four current views only the framed front view is given
+    to the model (the model also receives the past frames' front images);
+    right/back/left are washed out and bracketed "shown for reference only".
   - ground-truth affordance map row (blue) and predicted affordance map row
-    (orange; the deployed model's output): each slot's map divided by its own
-    peak (the prediction also x (1 - P(none))), max over slots, colour linear
-    in that value, the same ramp position for both rows.
-  - x = predicted peak (joint argmax of heatmaps_gated) at its bearing and
-    elevation; peaks within 4 deg of each other share one x, and marks that
-    would touch are staggered vertically by 2.6 pt.  A peak that misses its
-    true bearing by more than 5 deg is drawn alone with its slot badge.
+    (orange; always the deployed model's output): each slot's map divided by
+    its own peak (the prediction also x (1 - P(not visible))), max over
+    slots, colour linear in that value, the same ramp position in both rows.
+    Row names "ground truth" / "prediction" sit in a fixed gutter left of the
+    strip with a tiny colour key (D3), in every block.
+  - elevation window (D4, ``cd.elevation_window``): +-10 deg, widened per
+    block just enough to include every GT-visible and predicted peak (at most
+    +-45 deg); the caption states each block's window.
+  - x = predicted peak (joint argmax of heatmaps_gated) of each GT-visible
+    slot with P(not visible) <= 0.5; hits within 4 deg share one x, touching
+    marks are staggered vertically.  A slot is **missed** iff it fails joint
+    PCK@8 (D1, ``CaseRow.misses``: 5-way view class wrong or per-view argmax
+    > 8 px from the GT peak in the GT view -- the fields and rule of
+    ``compute_metrics``), so a block's numbered misses = its header's
+    n - hits.  A missed x carries its number in ink in a white disc ringed
+    orange (D2, ``cd.miss_badge``), beside it or, when crowded, moved along a
+    lane inside the row or to a lane under the row, joined by a short ink
+    leader (white halo); misses whose peaks would print as one blot share one
+    x and one badge ("4–5"); a thin dotted grey line joins the x to the slot's
+    true bearing (blue tick under the row) when they are < 45 deg apart
+    (``cd.CONNECTOR_MAX_DEG``).  Slots no view shows get no x
+    (their map shows in the row, their note gives P(not visible)).
   - short blue ticks under the prediction row repeat the true bearings.
-  - header: bearing error of the predicted peaks (median, max over GT-visible
-    slots) and joint PCK@8 (validate.py rule), then the constant "always
-    behind" guess (back view, centre pixel) in grey for reference.
 
 Figure policy (user decision, 2026-09-24): the figure shows the affordance map
-only.  It never mentions poses, odometry or the pose-source ablation; the
-prediction drawn is always the deployed model's (the dump's ``vo`` arm).  The
-pose-source split stays in the EXP-18 ledger/report.  Honesty that remains on
-the figure: only the front image is marked as model input, the other three
-are marked display-only; ground truth blue vs prediction orange, never
-swapped; misses are shown, not hidden.
+only.  It never mentions poses, their sources or the pose-source ablation; the
+prediction drawn is always the deployed model's (the dump's ``vo`` arm).
+Honesty that remains on the figure: of the current views only the front view
+is marked as model input, the other three display-only; ground truth blue vs
+prediction orange, never swapped; misses shown (numbered), never hidden; the
+always-behind guess as a reference; no claim of localization from vision.
 
-Extensions (``CaseOptions``, used by ``fig_routes``): title line, per-block role
-text, a replacement route panel and a panel under it, route legs in the insets,
-sector letters kept out of the headers, clamped peaks, merged notes.  With no
-options the output is unchanged, pixel for pixel.
+Options (``CaseOptions``, used by ``fig_routes`` and ``make_all``): title line
+(+ note), a banner, per-block role text, a replacement route panel and a panel
+under it, route legs in the insets, the sector-letter fallback, scene text and
+caption overrides.  The D1-D7 conventions are always on; the older switches
+(``row_labels``, ``miss_lane``, ``wrap_notes``, ``merge_notes``,
+``gt_carets``, ``clamp_peaks``, ``wording``) are accepted for compatibility and
+no longer change anything.
 
 Usage (repo root on PYTHONPATH):
   python -m scripts.exp18.figures.fig_case --dump <clip.npz> [--rows 0,2,8] [--topdown-root DIR]
-      [--clip-root DIR] [--lang en|zh] --out <dir/stem>
+      [--clip-root DIR] [--lang en|zh] [--title T] [--title-note N] --out <dir/stem>
 Writes <stem>.pdf (vector, TrueType fonts embedded), <stem>.png (400 dpi) and
 <stem>_caption.txt.
 """
@@ -73,9 +111,9 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -92,238 +130,196 @@ from matplotlib.patches import Rectangle  # noqa: E402  (matplotlib is configure
 LABELS: Dict[str, Dict[str, object]] = {
     "en": {
         "a": "Route",
-        "b": "Local map, heading up",
+        "b": "Local map (robot facing up)",
         "views": ("Front · model input", "Right", "Back", "Left"),
         "sectors": ("F", "R", "B", "L"),
-        "not_given": "images not given to the model (display only)",
-        "frame": "frame {t}",
-        "frame_last": "frame {t} (last)",
+        "not_given": "shown for reference only (not given to the model)",
+        "frame": "frame {n} of {T}",
+        "frame_last": "frame {n} of {T}",
         "gt_row": "ground truth",
         "pred_row": "prediction",
         "metric_main": "bearing error median {med:.1f}°, max {mx:.1f}°  ·  PCK@8 {hits}/{n}",
-        "metric_floor": "always-behind guess {med:.0f}°, {hits}/{n}",
+        "metric_floor": "always-behind guess: median {med:.0f}°, PCK@8 {hits}/{n}",
         "sep": "   ·   ",
-        "current": "= current position: not visible · predicted P(not visible) = {p:.2f}",
+        "role_sep": " · ",
+        # notes (D5, D6); {ps} = "= 0.77" for one slot, "0.67–0.98" for a run
+        "note_previous": "= previous frame (at the robot): not visible · predicted P(not visible) {ps}",
+        "note_at_robot": "at the robot: not visible · predicted P(not visible) {ps}",
+        "note_at_robot_prev": "at the robot (8 = previous frame): not visible · predicted P(not visible) {ps}",
+        "note_not_visible": "not visible in any view · predicted P(not visible) {ps}",
+        "note_predicted_none": "visible, but predicted P(not visible) {ps}",
+        "ps_one": "= {p:.2f}",
+        "ps_range": "{a:.2f}–{b:.2f}",
+        # older keys (fig_anim reads some); same wording
+        "current": "= previous frame (at the robot): not visible · predicted P(not visible) = {p:.2f}",
         "not_visible": "not visible in any view · predicted P(not visible) = {p:.2f}",
-        "pred_none": "predicted not visible (P = {p:.2f})",
-        "not_visible_n": "not visible in any view · predicted P(not visible) = {ps}",
-        "pred_none_n": "predicted not visible (P = {ps})",
-        "false_pos": "not visible, predicted here",
-        "axis": ("0° (heading)", "−90°", "180°", "+90°"),
+        "pred_none": "visible, but predicted P(not visible) = {p:.2f}",
+        "not_visible_n": "not visible in any view · predicted P(not visible) {ps}",
+        "pred_none_n": "visible, but predicted P(not visible) {ps}",
+        "false_pos": "not visible in any view, predicted here",
+        "axis": ("0° (straight ahead)", "−90°", "180°", "+90°"),
         "legend_hist": "past position k (1 = oldest)",
         "legend_gt": "ground-truth affordance map",
         "legend_pred": "predicted affordance map",
-        "legend_peak": "predicted peak (numbered: miss > 5°)",
+        "legend_peak": "predicted peak",
+        "legend_miss": "miss (fails joint PCK@8)",
         "legend_robot": "robot",
         "scene": "{tier} {scene}\nepisode {ep} · {T} frames",
         "start": "start",
     },
     "zh": {
         "a": "路线",
-        "b": "局部地图（朝向朝上）",
+        "b": "局部地图（机器人朝上）",
         "views": ("前 · 模型输入", "右", "后", "左"),
         "sectors": ("前", "右", "后", "左"),
-        "not_given": "模型看不到这三张图（仅作展示）",
-        "frame": "第 {t} 帧",
-        "frame_last": "第 {t} 帧（末帧）",
+        "not_given": "仅作展示（不输入模型）",
+        "frame": "第 {n} 帧（共 {T} 帧）",
+        "frame_last": "第 {n} 帧（共 {T} 帧）",
         "gt_row": "真值",
         "pred_row": "预测",
         "metric_main": "方位误差 中位 {med:.1f}°，最大 {mx:.1f}°  ·  PCK@8 {hits}/{n}",
-        "metric_floor": "恒答正后方 {med:.0f}°，{hits}/{n}",
+        "metric_floor": "恒答正后方：中位 {med:.0f}°，PCK@8 {hits}/{n}",
         "sep": "  ·  ",
-        "current": "= 当前位置：不可见 · 预测不可见概率 {p:.2f}",
+        "role_sep": " · ",
+        "note_previous": "= 上一帧（与机器人重合）：不可见 · 预测不可见概率 {ps}",
+        "note_at_robot": "与机器人重合：不可见 · 预测不可见概率 {ps}",
+        "note_at_robot_prev": "与机器人重合（8 = 上一帧）：不可见 · 预测不可见概率 {ps}",
+        "note_not_visible": "任何视角都不可见 · 预测不可见概率 {ps}",
+        "note_predicted_none": "可见，但预测不可见概率 {ps}",
+        "ps_one": "{p:.2f}",
+        "ps_range": "{a:.2f}–{b:.2f}",
+        "current": "= 上一帧（与机器人重合）：不可见 · 预测不可见概率 {p:.2f}",
         "not_visible": "任何视角都不可见 · 预测不可见概率 {p:.2f}",
-        "pred_none": "预测为不可见（{p:.2f}）",
+        "pred_none": "可见，但预测不可见概率 {p:.2f}",
         "not_visible_n": "任何视角都不可见 · 预测不可见概率 {ps}",
-        "pred_none_n": "预测为不可见（{ps}）",
-        "false_pos": "不可见，却预测在此",
-        "axis": ("0°（朝向）", "−90°", "180°", "+90°"),
+        "pred_none_n": "可见，但预测不可见概率 {ps}",
+        "false_pos": "任何视角都不可见，却预测在此",
+        "axis": ("0°（正前方）", "−90°", "180°", "+90°"),
         "legend_hist": "历史位置 k（1 = 最早）",
         "legend_gt": "真值 affordance map",
         "legend_pred": "预测 affordance map",
-        "legend_peak": "预测峰值（编号 = 偏差 > 5°）",
+        "legend_peak": "预测峰值",
+        "legend_miss": "未命中（joint PCK@8 不通过）",
         "legend_robot": "机器人",
         "scene": "{tier} {scene}\n第 {ep} 集 · {T} 帧",
         "start": "起点",
     },
 }
 
-CAPTION = {
-    "en": (
-        "Predicted affordance maps at {n} key positions of one episode ({tier} {scene}, episode {ep}; key positions = "
-        "first scored frame, frame with the widest ground-truth bearing spread, last frame). (a) Route on the top-down "
-        "map. (b) Map around each key position, heading up; its rim is the bearing ring that (c) unrolls clockwise from "
-        "the front view's left edge (arrow); dashed radii are the view seams. Blue lines run from the robot through "
-        "each past position (dot; 1 = oldest of the 8 queried) to its number on the rim. (c) The surround view on the "
-        "same bearings: only the framed front image is given to the model; the right, back and left images are shown "
-        "for reference only. Below it, the ground-truth affordance map (blue) and the predicted affordance map "
-        "(orange), both over ±8° of elevation around the horizon (the images span ±15°); each slot's map is divided by its own peak (the prediction also multiplied by its predicted "
-        "visibility), the maximum over slots is shown, and colour is linear in that value in both rows. Maps stop at "
-        "view seams because every label and prediction lives in one 90° view. x: predicted peak of each slot (peaks "
-        "within 4° merged; touching marks staggered vertically); a peak more than 5° from its true bearing is "
-        "numbered. Blue ticks under the prediction repeat the true bearings. Headers: bearing error of the predicted "
-        "peaks over visible slots (median, max) and joint PCK@8, and for reference the constant 'always behind' guess."
-    ),
-    "zh": (
-        "同一集（{tier} {scene}，第 {ep} 集）{n} 个关键位置上的预测 affordance map（关键位置：第一个评分帧、真值方位跨度"
-        "最大的帧、末帧）。(a) 俯视图上的路线。(b) 各关键位置的局部地图，朝向朝上；圆周就是 (c) 从前视左缘顺时针展开的"
-        "方位环（箭头），虚线半径为视角分界。蓝线从机器人穿过每个历史位置（圆点；8 个查询中 1 = 最早）连到圆周上的编号。"
-        "(c) 同一方位轴上的环视：只有加框的前视图是模型输入，右/后/左三张仅作展示。下方为真值 affordance map（蓝）与"
-        "预测 affordance map（橙），两行都只显示地平线上下 ±8° 的仰角范围（环视图为 ±15°）；每个槽位的图除以自身峰值（预测再乘以其预测可见概率），显示各槽位的最大值，两行都按该值"
-        "线性着色。图在视角分界处截断，因为每个标签和预测都只落在一个 90° 视角里。×：各槽位的预测峰值（4° 内合并，相互挨着"
-        "的上下错开）；偏离真值方位 5° 以上的单独编号。预测行下方的蓝色短线重复真值方位。行首：可见槽位上预测峰值的方位"
-        "误差（中位、最大）与 joint PCK@8，以及作参照的恒答正后方基线。"
-    ),
-}
+# Kept for callers that lay it over LABELS (``labels_for(lang, "revised")``): the D1-D7 wording is LABELS now.
+LABELS_REVISED: Dict[str, Dict[str, object]] = {"en": {}, "zh": {}}
 
 # The prediction drawn is always the deployed model's output (dump arm "vo").
 ARM = "vo"
 
-# Wording of the revised layout (``CaseOptions.wording="revised"``), laid over LABELS: the reference
-# guess's numbers are named, one notation for P(not visible), the current-position note names the past
-# frame, and zh uses half-width parentheses (the CJK font's full-width ones print with wide gaps).
-LABELS_REVISED: Dict[str, Dict[str, object]] = {
-    "en": {
-        "metric_floor": "always-behind guess: median {med:.0f}°, PCK@8 {hits}/{n}",
-        "current": "= frame {f}, same spot as now: not visible · predicted P(not visible) = {p:.2f}",
-        "pred_none": "visible, but predicted P(not visible) = {p:.2f}",
-        "pred_none_n": "visible, but predicted P(not visible) = {ps}",
-        "legend_peak": "predicted peak (misses > 5° numbered below the row)",
-        "misses": "misses",
-    },
-    "zh": {
-        "b": "局部地图(前方朝上)",
-        "frame_last": "第 {t} 帧(末帧)",
-        "metric_floor": "恒答正后方：中位 {med:.0f}°，PCK@8 {hits}/{n}",
-        "current": "= 第 {f} 帧，与当前位置重合：不可见 · 预测不可见概率 {p:.2f}",
-        "pred_none": "可见，但预测不可见概率 {p:.2f}",
-        "pred_none_n": "可见，但预测不可见概率 {ps}",
-        "pred_none_n_sep": "、",
-        "axis": ("0°(朝向)", "−90°", "180°", "+90°"),
-        "legend_peak": "预测峰值(偏差 > 5° 的在行下方编号)",
-        "legend_hist": "历史位置 k(1 = 最早)",
-        "not_given": "模型看不到这三张图(仅作展示)",
-    },
-}
-
 
 def labels_for(lang: str, wording: str = "approved") -> dict:
-    """``LABELS[lang]``, with ``LABELS_REVISED[lang]`` laid over it for ``wording="revised"``."""
+    """``LABELS[lang]`` (a copy); ``wording`` is accepted for compatibility (one wording since D6)."""
     L = dict(LABELS[lang])
-    if wording == "revised":
-        L.update(LABELS_REVISED[lang])
+    L.update(LABELS_REVISED.get(lang, {}))
     return L
 
 
-# Caption sentences of the revised layout (``case_caption``); the approved layout keeps CAPTION.
+# Caption parts.  "{elev_window}" is replaced by make_case_figure with the blocks' elevation windows (D4), also in
+# a caption a caller passes through ``CaseOptions.caption`` (fig_routes builds one from these parts).
+KEY_RULE = {
+    "en": ("key positions: first scored frame, frame with the widest ground-truth bearing spread, last frame (the "
+           "middle scored frame when the widest spread is at the first or last frame)"),
+    "zh": "关键位置：第一个评分帧、真值方位跨度最大的帧、末帧（跨度最大的帧恰为首帧或末帧时改取中间的评分帧）",
+}
 CAPTION_PARTS = {
     "en": {
-        "head": ("Predicted affordance maps at {n} key positions of one episode ({tier} {scene}, episode {ep}; key "
-                 "positions = first scored frame, frame with the widest ground-truth bearing spread, last frame). "),
+        "head": "Predicted affordance maps at {n} key positions of one episode ({tier} {scene}, episode {ep}; {rule}). ",
         "a": "(a) Route on the top-down map. ",
-        "b": ("(b) Map around each key position, heading up; its rim is the bearing ring that (c) unrolls clockwise "
-              "from the front view's left edge (arrow); dashed radii are the view seams. Blue lines run from the robot "
-              "through each past position (dot; 1 = oldest of the 8 queried) to its number on the rim. "),
-        "c": ("(c) The surround view on the same bearings: only the framed front image is given to the model; the "
-              "right, back and left images are shown for reference only. Below it, the ground-truth affordance map "
-              "(blue) and the predicted affordance map (orange), both over ±8° of elevation around the horizon (the "
-              "images span ±15°); each slot's map is divided by its own peak (the prediction also multiplied by its "
-              "predicted visibility), the maximum over slots is shown, and colour is linear in that value in both "
-              "rows. Maps stop at view seams because every label and prediction lives in one 90° view. "),
-        "x": "x: predicted peak of each slot (peaks within 4° merged; touching marks staggered vertically). ",
-        "x_lane": ("A peak more than 5° from its true bearing is a miss: its slot number sits under the row, joined "
-                   "to its x by a line. "),
-        "x_inline": "A peak more than 5° from its true bearing is numbered beside its x. ",
-        "carets": ("A caret at a row's edge marks a peak beyond the row's elevation range (blue: ground truth; "
-                   "black: prediction, whose x is then drawn at the edge). "),
-        "carets_pred": ("A predicted peak beyond the row's elevation range is drawn at the row's edge with a "
-                        "caret. "),
-        "carets_gt": "A blue caret at the ground-truth row's edge marks a ground-truth peak beyond its range. ",
+        "b": ("(b) Map around each key position, robot facing up; its rim is the bearing ring that (c) unrolls "
+              "clockwise from the front view's left edge (arrow); dashed radii are the view seams. Blue lines run from "
+              "the robot through each past position (dot; 1 = oldest of the 8 queried) to its number on the rim. "),
+        "c": ("(c) The surround view on the same bearings: of the four current views, only the framed front view is "
+              "given to the model; right, back and left are shown for reference (the model also receives the past "
+              "frames' front images). Below it, the ground-truth affordance map (blue) and the predicted affordance "
+              "map (orange; the deployed model's output); {elev_window} (the images span ±15°). Each slot's map is "
+              "divided by its own peak (the prediction also multiplied by its predicted visibility), the maximum over "
+              "slots is shown, and colour is linear in that value in both rows. Maps stop at view seams because every "
+              "label and prediction lives in one 90° view. "),
+        "x": ("×: predicted peak of each slot visible in the ground truth (hits within 4° share one ×; missed slots "
+              "whose peaks coincide share one × and one number, e.g. 4–5; touching marks are staggered vertically). "),
+        "misses": ("A slot is missed when it fails joint PCK@8 (predicted view wrong, or peak more than 8 px of 64 from "
+                   "the true peak in that view); its number, in a white disc ringed in orange, sits at its own × (joined "
+                   "to it by a short dark leader where it had to move), and a dotted line joins the × to the slot's "
+                   "true bearing when they are less than 45° apart. A missed slot the model calls not visible (P(not visible) > 0.5) has no ×; its "
+                   "orange-ringed number is in the notes. Each block's numbered misses equal its visible slots minus "
+                   "its PCK@8 hits. "),
         "ticks": "Blue ticks under the prediction repeat the true bearings. ",
-        "notes": ("Notes above the images list past positions that no view shows (the current spot, or out of "
-                  "sight) and visible ones the model calls not visible, each with the predicted probability of "
-                  "'not visible'. "),
-        "headers": ("Headers: bearing error of the predicted peaks over visible slots (median, max) and joint "
-                    "PCK@8, and for reference the constant 'always behind' guess (back view, centre pixel)."),
+        "notes": ("Notes above the images list past positions that no view shows (the previous frame at the robot, "
+                  "or out of sight), with the predicted probability P(not visible); they are not scored and get no ×, "
+                  "but one predicted visible still shows in the orange row. "),
+        "headers": ("Headers: frame (counted from 1), bearing error of the predicted peaks over visible slots (median, "
+                    "max) and joint PCK@8, and for reference the constant always-behind guess (back view, centre "
+                    "pixel)."),
+        # older keys (fig_routes' caption_marks callers); folded into the parts above
+        "x_lane": "", "x_inline": "", "carets": "", "carets_pred": "", "carets_gt": "",
     },
     "zh": {
-        "head": ("同一集（{tier} {scene}，第 {ep} 集）{n} 个关键位置上的预测 affordance map（关键位置：第一个评分帧、"
-                 "真值方位跨度最大的帧、末帧）。"),
+        "head": "同一集（{tier} {scene}，第 {ep} 集）{n} 个关键位置上的预测 affordance map（{rule}）。",
         "a": "(a) 俯视图上的路线。",
-        "b": ("(b) 各关键位置的局部地图，前方朝上；圆周就是 (c) 从前视左缘顺时针展开的方位环（箭头），虚线半径为视角分界。"
+        "b": ("(b) 各关键位置的局部地图，机器人朝上；圆周就是 (c) 从前视左缘顺时针展开的方位环（箭头），虚线半径为视角分界。"
               "蓝线从机器人穿过每个历史位置（圆点；8 个查询中 1 = 最早）连到圆周上的编号。"),
-        "c": ("(c) 同一方位轴上的环视：只有加框的前视图是模型输入，右/后/左三张仅作展示。下方为真值 affordance map（蓝）"
-              "与预测 affordance map（橙），两行都只显示地平线上下 ±8° 的仰角范围（环视图为 ±15°）；每个槽位的图除以"
-              "自身峰值（预测再乘以其预测可见概率），显示各槽位的最大值，两行都按该值线性着色。图在视角分界处截断，因为"
-              "每个标签和预测都只落在一个 90° 视角里。"),
-        "x": "×：各槽位的预测峰值（4° 内合并，相互挨着的上下错开）。",
-        "x_lane": "偏离真值方位 5° 以上的算作偏差：其槽位编号放在该行下方，并用细线连到对应的 ×。",
-        "x_inline": "偏离真值方位 5° 以上的在 × 旁编号。",
-        "carets": "行边的小三角表示峰值落在该行仰角范围之外（蓝：真值；黑：预测，其 × 画在行边）。",
-        "carets_pred": "落在该行仰角范围之外的预测峰值画在行边并加小三角。",
-        "carets_gt": "真值行边的蓝色小三角表示真值峰值落在该行范围之外。",
+        "c": ("(c) 同一方位轴上的环视：当前四个视角中只有加框的前视图输入模型，右/后/左仅作展示（模型另外还接收历史帧的前视图）。"
+              "下方为真值 affordance map（蓝）与预测 affordance map（橙，即部署模型的输出）；{elev_window}（环视图为 ±15°）。"
+              "每个槽位的图除以自身峰值（预测再乘以其预测可见概率），显示各槽位的最大值，两行都按该值线性着色。图在视角分界处截断，"
+              "因为每个标签和预测都只落在一个 90° 视角里。"),
+        "x": "×：真值可见的各槽位的预测峰值（命中的槽位 4° 内共用一个 ×；峰值重合的未命中槽位共用一个 × 和一个编号，如 4–5；相互挨着的上下错开）。",
+        "misses": ("joint PCK@8 不通过（预测视角错误，或峰值在该视角中距真值峰值超过 8 px（共 64 px））即为未命中：其编号写在橙色描边"
+                   "的白色圆内，放在对应的 × 旁（需要挪开时用深色短线相连），两者相距 45° 以内时再用虚线把 × 连到该槽位的真值方位。模型判为不可见"
+                   "（预测不可见概率 > 0.5）的未命中槽位没有 ×，其橙色描边编号列在注释中。每个关键位置的编号未命中数等于可见槽位数"
+                   "减去 PCK@8 命中数。"),
         "ticks": "预测行下方的蓝色短线重复真值方位。",
-        "notes": "图像上方的注释列出任何视角都看不到的历史位置（当前所在处或视线之外），以及可见却被模型判为不可见的位置，并给出预测的不可见概率。",
-        "headers": "行首：可见槽位上预测峰值的方位误差（中位、最大）与 joint PCK@8，以及作参照的恒答正后方基线（后视中心像素）。",
+        "notes": "图像上方的注释列出任何视角都看不到的历史位置（与机器人重合的上一帧，或视线之外），并给出预测不可见概率；这些槽位不计分、没有 ×，但被预测为可见的仍会出现在橙色行中。",
+        "headers": "行首：帧号（从 1 数起）、可见槽位上预测峰值的方位误差（中位、最大）与 joint PCK@8，以及作参照的恒答正后方基线（后视中心像素）。",
+        "x_lane": "", "x_inline": "", "carets": "", "carets_pred": "", "carets_gt": "",
     },
 }
+# The whole default caption with the fig_case key rule (kept as a name for callers).
+CAPTION = {lang: "".join(P[k] for k in ("head", "a", "b", "c", "x", "misses", "ticks", "notes", "headers"))
+           for lang, P in CAPTION_PARTS.items()}
 
 
 @dataclass
 class CaseOptions:
-    """Optional extensions of the case layout (used by ``fig_routes``); ``None`` fields change nothing.
+    """Optional extensions of the case layout (``fig_routes``, ``make_all``); ``None`` fields change nothing.
 
-    * ``title`` / ``title_note``: a title line (bold) and a muted note after it,
-      in a band of ``TITLE_H`` added above the panel names.
+    * ``title`` / ``title_note``: a title line (bold) and a muted note after it
+      (italic in en only), in a band of ``TITLE_H`` added above the panel names.
+    * ``banner`` (+ ``banner_italic``): one muted line above the panel names
+      (a development stand-in notice), without a title.
     * ``roles``: per key position, text appended to the block header after the
-      frame ("frame 83 · after the turnaround").
-    * ``route_panel``: ``f(ax, level, dump, recs, L)`` drawn instead of
-      ``draw_route_panel`` into panel a.
+      frame ("frame 84 of 120 · after the turnaround").
+    * ``route_panel``: ``f(ax, level, dump, recs, L)`` drawn instead of the
+      fitted route panel into panel a (an object with ``height(fig, dump, w,
+      h_max)`` is sized like ``FittedRoutePanel``).
     * ``route_foot_h`` / ``route_foot``: height (in) reserved at the bottom of
       column a, under the map and its scene note, and ``f(page, x, y_top, w, h)``
       drawing into it.
     * ``split_frame``: frame where the route turned back; insets past it draw
       the route so far as outbound (solid) and return (dashed) legs.
-    * ``letters``: where a sector letter displaced by badges goes:
-      "outward" (default, past the badges), "slide" (along the badge ring,
-      within its own sector; just inside the rim when the arc is full) or
-      "inside" (just inside the rim).  The last two keep letters out of the
-      block headers when return-leg badges crowd the front.
-    * ``clamp_peaks``: a predicted peak above or below the heat row's +-8 deg
-      is drawn at the row's edge with a caret pointing to its side (instead of
-      far outside the row, over the lane or the header).
-    * ``merge_notes``: slots with the same note ("predicted not visible")
-      share one note with all their badges, so no note is dropped for lack of
-      room.
+    * ``letters``: fallback of a blocked sector letter after sliding within
+      its sector: "outward" (default; R/L outward, then inside the rim),
+      "slide" (outward for all four, then inside) or "inside".
+    * ``route_fit`` (default True): panel a cropped to the route plus
+      ``ROUTE_PAD_M`` (``FittedRoutePanel``); False: the older whole-map panel.
+    * ``scale_corner``: "fixed" (default; the insets' scale bars share the
+      corner clear of badges in every block) or "auto" (per block).
     * ``scene_text``: the two lines under the map, instead of ``L["scene"]``.
-    * ``caption``: caption text written instead of ``CAPTION[lang]``.
+    * ``caption``: caption text written instead of the built one ("{elev_window}"
+      is still filled in).
+    * ``caption_extra``: a sentence appended to the caption (e.g. "Candidates 2
+      and 4 are two instructions of one R2R path.").
+    * ``key_rule``: the words for how the key positions were chosen (default
+      ``KEY_RULE``, the rule of ``data.key_rows``).
 
-    Revised layout (review 2026-09-24; ``CaseOptions.revised()`` turns all of
-    these on, each can also be used alone):
-
-    * ``row_labels="fixed"``: the "ground truth" / "prediction" names sit at
-      one strip panel for the whole figure (the front view's left end unless
-      heat lies there in some block; ``cd.fixed_label_panel``) on a white
-      pill, instead of each block's quietest panel.
-    * ``miss_lane``: a numbered miss is not labelled inside the prediction
-      row; its slot badge goes to a lane under the row (dodged sideways) with
-      a thin line to its own x.  Adds ``MISS_LANE_H`` to every block when any
-      block has a miss.
-    * ``wrap_notes``: notes ("not visible ...") never get dropped: a note
-      goes left of the lane badges only with a clear gap to them, else onto
-      note lines between the block header and the lane (``NOTE_LINE_H``
-      each); nothing is appended to the right of the badge row.
-    * ``gt_carets``: a blue caret at the ground-truth row's edge where a
-      visible slot's ground-truth peak lies beyond the row's +-8 deg.
-    * ``route_fit``: panel a cropped to the route (+ ``ROUTE_PAD_M``), turned
-      by a quarter turn when that shows it larger, and only as tall as that
-      needs (top-aligned; the rest of column a goes to ``route_foot``); the
-      scale bar sits in a band inside the frame.
-    * ``scale_corner="fixed"``: the insets' scale bars share one corner (the
-      one clear of badges in every block).
-    * ``wording="revised"``: ``LABELS_REVISED`` over ``LABELS``.
-    * ``banner`` (+ ``banner_italic``): one muted line above the panel names
-      (a development stand-in notice), without a title.
+    Accepted for compatibility, no effect since the D1-D7 revision (the
+    conventions are always on): ``row_labels``, ``miss_lane``, ``wrap_notes``,
+    ``merge_notes``, ``gt_carets``, ``clamp_peaks``, ``wording``.
     """
 
     title: Optional[str] = None
@@ -334,50 +330,51 @@ class CaseOptions:
     route_foot: Optional[Callable] = None
     split_frame: Optional[int] = None
     letters: str = "outward"
-    clamp_peaks: bool = False
-    merge_notes: bool = False
+    clamp_peaks: bool = True
+    merge_notes: bool = True
     scene_text: Optional[str] = None
     caption: Optional[str] = None
-    row_labels: str = "quietest"
-    miss_lane: bool = False
-    wrap_notes: bool = False
-    gt_carets: bool = False
-    route_fit: bool = False
-    scale_corner: str = "auto"
-    wording: str = "approved"
+    row_labels: str = "gutter"
+    miss_lane: bool = True
+    wrap_notes: bool = True
+    gt_carets: bool = True
+    route_fit: bool = True
+    scale_corner: str = "fixed"
+    wording: str = "revised"
     banner: Optional[str] = None
     banner_italic: bool = True
+    caption_extra: Optional[str] = None
+    key_rule: Optional[str] = None
 
     @classmethod
     def revised(cls, **kw) -> "CaseOptions":
-        """Every fix of the 2026-09-24 review on (fixed row labels, miss lane, wrapped and merged notes,
-        ground-truth and clamped-peak carets, fitted route panel, one inset scale-bar corner, revised wording);
-        ``kw`` overrides any field."""
-        base = dict(row_labels="fixed", miss_lane=True, wrap_notes=True, merge_notes=True, gt_carets=True,
-                    clamp_peaks=True, route_fit=True, scale_corner="fixed", wording="revised")
-        base.update(kw)
-        return cls(**base)
+        """The layout of the 2026-09-24 review (now the default); ``kw`` overrides any field."""
+        return cls(**kw)
 
     @property
     def is_approved_layout(self) -> bool:
-        return (self.row_labels == "quietest" and not self.miss_lane and not self.wrap_notes and not self.gt_carets
-                and not self.route_fit and self.scale_corner == "auto" and self.wording == "approved")
+        """Always False: the approved (pre-review) layout was retired by the D1-D7 decisions."""
+        return False
+
 
 # --------------------------------------------------------------------------- #
 # Geometry of the page (inches)
 # --------------------------------------------------------------------------- #
 FIG_W = style.WIDTH_DOUBLE  # 7.0
-W_STRIP = 4.54
-X_STRIP = FIG_W - 0.02 - W_STRIP
-X_ROUTE, W_ROUTE = 0.0, 1.20
-X_INSET = 1.28
-W_INSET = X_STRIP - 0.13 - X_INSET
+X_ROUTE, W_ROUTE = 0.0, 1.02
+X_INSET = 1.10
+W_INSET = 0.96
+GUTTER_W = 0.58  # row names (D3) between the inset column and the strip
+X_STRIP = X_INSET + W_INSET + GUTTER_W
+W_STRIP = FIG_W - 0.02 - X_STRIP
+PPD = W_STRIP * 72.0 / 360.0  # points per degree on the strip (both axes: square degrees)
 EL_RGB = 15.0  # RGB row: elevation +-15 deg
-EL_HEAT = 8.0  # heat rows: +-8 deg (history camera centres sit near the horizon)
+EL_HEAT = cd.EL_DEFAULT  # default half window of the affordance map rows (D4: widened per block, cd.elevation_window)
 RGB_H = W_STRIP * 2 * EL_RGB / 360.0  # square degrees
-HEAT_H = W_STRIP * 2 * EL_HEAT / 360.0
+HEAT_H = W_STRIP * 2 * EL_HEAT / 360.0  # at the default window
 TOP_H = 0.31
 HDR_H = 0.15
+HDR2_H = 0.12  # second header line (reference numbers wrapped)
 LANE_H = 0.14
 ROW_GAP = 0.028
 BLOCK_GAP = 0.10
@@ -387,28 +384,26 @@ BODY_H = LANE_H + RGB_H + 2 * ROW_GAP + 2 * HEAT_H
 BLOCK_H = HDR_H + BODY_H
 RGB_RING_W = 1816  # ring columns per 360 deg (multiple of 8: exact roll), ~400 dpi at W_STRIP
 HEAT_RING_W = 1440
-MISS_DEG = 5.0  # a predicted peak further than this from its true bearing is drawn alone and numbered
-MERGE_DEG = 4.0  # other peaks closer than this share one x (about the width of the mark)
-MARK_PT = 4.4  # size of the predicted-peak x
-STAGGER_PT = 2.6  # vertical offset of an x that would touch its neighbour
+MISS_DEG = 5.0  # unused since D1 (misses = joint PCK@8 failures, data.CaseRow.misses); kept for importers
+MERGE_DEG = cd.MERGE_DEG
+MARK_PT = cd.MARK_PT
+STAGGER_PT = cd.STAGGER_PT
 FS = {"title": 7.0, "name": 6.6, "header": 6.3, "small": 5.8, "note": 5.7, "legend": 6.1, "axis": 6.0}
-# revised layout (CaseOptions)
-NOTE_LINE_H = 0.13  # one note line between a block header and its lane (wrap_notes)
-MISS_LANE_H = 0.17  # lane under the prediction row for the numbered misses (miss_lane)
-MISS_BADGE_PT = 8.3  # badge centre below the row's bottom edge (the true-bearing ticks take the first 4 pt)
-NOTE_GAP_PT = 14.0  # a note left of the lane badges keeps at least this far from them (wrap_notes)
-CARET_PT = 4.4  # size of an off-row caret
-GT_INK = "#1c5cab"  # dark tone of the ground-truth ramp (carets)
+NOTE_LINE_H = 0.13  # one note line between a block header and its lane
+MISS_LANE_H = cd.BELOW_LANE_H_PT / 72.0  # lane under the prediction row for miss badges that do not fit inside it
+MISS_BADGE_PT = cd.BELOW_LANE_PT
+NOTE_GAP_PT = 14.0  # a note left of the lane badges keeps at least this far from them
+CARET_PT = 4.4
+GT_INK = style.GT_INK
 ROUTE_PAD_M = 0.45  # route_fit: margin around the route (metres)
+TITLE_H = 0.25  # optional title band (CaseOptions.title)
 BANNER_H = 0.20  # height of the optional banner line
+_DROPPED: List[str] = []  # kept for importers; notes are never dropped any more
 
 
 def fig_height(n_blocks: int) -> float:
+    """Height of a figure of ``n_blocks`` default blocks (no notes, +-10 deg rows, no miss lane)."""
     return TOP_H + n_blocks * BLOCK_H + (n_blocks - 1) * BLOCK_GAP + AXIS_H + LEGEND_H
-
-
-TITLE_H = 0.25  # optional title band (CaseOptions.title)
-_DROPPED: List[str] = []  # notes the current figure left out (make_case_figure returns them as "notes_dropped")
 
 
 class Page:
@@ -427,11 +422,20 @@ class Page:
         y = y + self.y0
         return self.fig.text(x / FIG_W, 1 - y / self.h, s, **kw)
 
+    def bbox(self, x: float, y_top: float, w: float, h: float):
+        """Display-space box of a page rectangle (inches from the top-left, like ``ax``)."""
+        from matplotlib.transforms import Bbox
+
+        y_top = y_top + self.y0
+        dpi = self.fig.dpi
+        return Bbox.from_bounds(x * dpi, (self.h - y_top - h) * dpi, w * dpi, h * dpi)
+
 
 # --------------------------------------------------------------------------- #
-# Panels
+# Panel a
 # --------------------------------------------------------------------------- #
 def draw_route_panel(ax, level, dump: dd.Dump, rows: Sequence[dd.CaseRow], L: dict) -> None:
+    """The older whole-map panel a (``CaseOptions(route_fit=False)``)."""
     xz = dump.positions[:, [0, 2]]
     limits = cd.fit_limits(xz, pad=0.7, aspect_hw=cd.axes_aspect_hw(ax))
     cd.draw_topdown(ax, level, limits, sat=0.2, white=0.56)
@@ -443,7 +447,6 @@ def draw_route_panel(ax, level, dump: dd.Dump, rows: Sequence[dd.CaseRow], L: di
         f = forward_from_c2w(r.cur_c2w)
         cd.heading_arrow(ax, p, f, 15.0 * per_pt, zorder=6)
         ax.plot(*p, marker="o", ms=3.0, mfc=style.INK, mec="white", mew=0.5, zorder=7)
-        # badge beside the route, on the side (left/right of the heading, or behind) with most room
         right = np.array([-f[1], f[0]])
         best, best_score = None, -np.inf
         for side in (right, -right, -f, (right - f) / np.sqrt(2), (-right - f) / np.sqrt(2)):
@@ -455,7 +458,8 @@ def draw_route_panel(ax, level, dump: dd.Dump, rows: Sequence[dd.CaseRow], L: di
                 best, best_score = q, score
         cd.key_badge(ax, best[0], best[1], f"K{n + 1}", fs=6.0)
     bar = cd.nice_length(0.4 * (limits[1] - limits[0]))
-    cd.scale_bar(ax, limits[0] + 5 * per_pt, limits[2] + 6.5 * per_pt, bar, f"{bar:g} m")
+    # bar 12 pt below the frame's top: its label (above the bar) keeps >= 2 pt inside the map
+    cd.scale_bar(ax, limits[0] + 5 * per_pt, limits[2] + 12.0 * per_pt, bar, f"{bar:g} m")
 
 
 def _leader(ax, anchor, centre, w_pt: float, h_pt: float, color=style.INK_2, lw: float = 0.5, zorder: float = 7.5):
@@ -502,6 +506,7 @@ class FittedRoutePanel:
         self.pad = pad
         self.min_h = min_h
         self._frame = None
+        self.scale_bar_inset_pt = None  # set when drawn: the scale bar's (and its label's) distance to the frame
 
     # ---- geometry
     def _bottom_band_pt(self, fig) -> float:
@@ -560,7 +565,24 @@ class FittedRoutePanel:
             return np.stack([np.asarray(a, dtype=float), np.asarray(b, dtype=float)], axis=-1)
 
         xy = local(world[:, 0], world[:, 1])
-        x0, x1, y0, y1 = cd.fit_limits(xy, pad=self.pad, aspect_hw=aspect)
+        # the route + pad, grown until every K position's facing arrow (13 pt) also fits with 3 pt to spare
+        pts = xy
+        for _ in range(3):
+            x0, x1, y0, y1 = cd.fit_limits(pts, pad=self.pad, aspect_hw=aspect)
+            m_per_pt = (x1 - x0) / w_pt
+            tips = []
+            for r in recs:
+                p = local(r.cur_pos[0], r.cur_pos[2])
+                fw = forward_from_c2w(r.cur_c2w)
+                f = local(centre[0] + fw[0], centre[1] + fw[1])
+                f = f / (np.linalg.norm(f) + 1e-12)
+                tips.append(p + f * 16.0 * m_per_pt)
+            tips = np.asarray(tips).reshape(-1, 2)
+            inside = (np.all(tips[:, 0] >= x0 + 3 * m_per_pt) and np.all(tips[:, 0] <= x1 - 3 * m_per_pt)
+                      and np.all(tips[:, 1] >= y0 + 3 * m_per_pt) and np.all(tips[:, 1] <= y1 - 3 * m_per_pt))
+            if inside:
+                break
+            pts = np.concatenate([xy, tips], axis=0)  # fit_limits pads them like the route
         m_per_pt = (x1 - x0) / w_pt
         limits = (x0, x1, y0 - bot_pt * m_per_pt, y1 + top_pt * m_per_pt)
         half = 1.01 * max(abs(v) for v in limits)
@@ -637,7 +659,8 @@ class FittedRoutePanel:
                 _leader(ax, xy[0], (x, y), *boxes[nk], color=style.MUTED, lw=0.45, zorder=5.5)
             ax.text(x, y, self.start_text, ha="center", va="center", fontsize=5.8, color=style.INK_2,
                     path_effects=cd.HALO, zorder=8)
-        cd.scale_bar(ax, bx - (bar_box[0] / 2 - 1.0) * per_pt, by - 3.0 * per_pt, bar, f"{bar:g} m")
+        sb = cd.scale_bar(ax, bx - (bar_box[0] / 2 - 1.0) * per_pt, by - 3.0 * per_pt, bar, f"{bar:g} m")
+        self.scale_bar_inset_pt = round(cd.inset_from_frame_pt(ax, sb), 2)  # judge rule: >= 2 pt inside the map
         if self.legend:
             self._draw_legend(ax, limits, per_pt, w_pt, bot_pt)
 
@@ -664,6 +687,11 @@ class FittedRoutePanel:
                     path_effects=cd.HALO, zorder=8)
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Panel b
+# --------------------------------------------------------------------------- #
 INSET_CORNERS = {135.0: (-1, 1), 45.0: (1, 1), 225.0: (-1, -1), 315.0: (1, -1)}  # plot angle -> signs
 ARROW_MID = 90.0 + cd.STRIP_START_DEG - 17.0  # plot angle of the middle of the first block's direction arrow
 
@@ -674,14 +702,24 @@ def inset_half(r: dd.CaseRow) -> float:
     return max(1.0, 1.12 * far)
 
 
-def inset_corner_clearance(ax, r: dd.CaseRow, show_arrow: bool) -> Dict[float, float]:
+def _arrow_fits(occupied, show_arrow: bool) -> bool:
+    return show_arrow and all(abs((t - ARROW_MID + 180) % 360 - 180) > 17.0 + w + 4.0 for t, w in occupied)
+
+
+INSET_RADIUS_FRAC = 0.74  # disc radius / half the inset square (cd.draw_local_disc's default)
+INSET_RADIUS_FRACS = (0.74, 0.71, 0.68, 0.65, 0.62)  # tried in turn when a rim badge would run into the gutter
+INSET_SHIFTS_PT = (0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0, -5.0)  # sideways nudges of the inset (pt)
+
+
+def inset_corner_clearance(ax, r: dd.CaseRow, show_arrow: bool,
+                           radius_frac: float = INSET_RADIUS_FRAC) -> Dict[float, float]:
     """Per free corner of the inset square (plot angle 45/135/225/315): angular clearance to the rim badges.
 
     The same badge layout ``draw_inset`` will draw (nothing is drawn here); the
     top-left corner is not free when the direction arrow is drawn there.
     """
     half = inset_half(r)
-    lim = half / 0.74
+    lim = half / radius_frac
     ax.set_xlim(-lim, lim)  # draw_local_disc's limits, so the point scale is the drawn one
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal")
@@ -691,27 +729,83 @@ def inset_corner_clearance(ax, r: dd.CaseRow, show_arrow: bool) -> Dict[float, f
         _, _, placed, widths = cd.disc_rim_layout(ax, half, r.groups, bearings)
         occupied = [(float(p % 360.0), float(w / 2)) for p, w in zip(placed, widths)]
     corners = dict(INSET_CORNERS)
-    if show_arrow and all(abs((t - ARROW_MID + 180) % 360 - 180) > 17.0 + w + 4.0 for t, w in occupied):
+    if _arrow_fits(occupied, show_arrow):
         corners.pop(135.0)
     return {c: min([abs((c - t + 180) % 360 - 180) for t, _ in occupied] + [360.0]) for c in corners}
 
 
+def rim_badge_boxes(ax, r: dd.CaseRow, radius_frac: float = INSET_RADIUS_FRAC) -> list:
+    """Display-space boxes of the rim badges ``draw_inset`` would draw on ``ax`` at ``radius_frac`` (sets the
+    axes' limits as ``draw_local_disc`` will; draws nothing)."""
+    from matplotlib.transforms import Bbox
+
+    half = inset_half(r)
+    lim = half / radius_frac
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+    if not r.groups:
+        return []
+    labels, _, placed, _ = cd.disc_rim_layout(ax, half, r.groups, [float(r.gt_bearing[g[0]]) for g in r.groups])
+    per_pt = cd.pts_to_data(ax, 1.0)[0]
+    r_pt = half / per_pt
+    px = ax.figure.dpi / 72.0
+    out = []
+    for lab, p in zip(labels, placed):
+        u = np.array([math.cos(math.radians(p)), math.sin(math.radians(p))])
+        c = ax.transData.transform(u * (r_pt + 1.5 + cd._badge_support(lab, u)) * per_pt)
+        w, h = cd.badge_width_pt(lab) * px, 7.4 * px
+        out.append(Bbox.from_bounds(c[0] - w / 2, c[1] - h / 2, w, h))
+    return out
+
+
+def fit_inset(ax, r: dd.CaseRow, keepout: Sequence, margin_pt: float = 1.5) -> Tuple[float, float, bool]:
+    """Largest disc (``INSET_RADIUS_FRACS``), then smallest sideways nudge (``INSET_SHIFTS_PT``), whose rim badges
+    keep ``margin_pt`` clear of every display box in ``keepout`` (row names and their keys in the gutter, the
+    route panel); moves ``ax`` by the nudge.  Returns ``(radius_frac, shift_pt, ok)``."""
+    fig = ax.figure
+    px = fig.dpi / 72.0
+    pos0 = ax.get_position()
+    m = margin_pt * px
+    W = fig.get_size_inches()[0] * fig.dpi
+
+    def clear(boxes):
+        return not any(b.x0 - m < k.x1 and k.x0 < b.x1 + m and b.y0 - m < k.y1 and k.y0 < b.y1 + m
+                       for b in boxes for k in keepout)
+
+    for rf in INSET_RADIUS_FRACS:
+        for dx in INSET_SHIFTS_PT:
+            ax.set_position([pos0.x0 + dx * px / W, pos0.y0, pos0.width, pos0.height])
+            if clear(rim_badge_boxes(ax, r, rf)):
+                return rf, dx, True
+    ax.set_position(pos0)
+    return INSET_RADIUS_FRACS[-1], 0.0, False
+
+
 def draw_inset(ax, level, dump: dd.Dump, r: dd.CaseRow, show_arrow: bool, L: dict,
                split_frame: Optional[int] = None, letters: str = "outward",
-               scale_corner: Optional[float] = None) -> None:
-    """Panel b for one key position (``split_frame``/``letters_inside``: see :class:`CaseOptions`).
+               scale_corner: Optional[float] = None, radius_frac: float = INSET_RADIUS_FRAC,
+               letter_bounds=None) -> None:
+    """Panel b for one key position (``split_frame`` / ``letters``: see :class:`CaseOptions`).
 
+    Draw order: map disc, blue rays and dots, robot, rim badges (bearing
+    order), direction arrow, scale bar, then the sector letters, which are
+    placed against everything already drawn (``cd.disc_sector_letters``).
     ``scale_corner``: plot angle (45, 135, 225, 315) of the corner for the
     scale bar; default the free corner farthest from every badge.
+    ``radius_frac``: disc radius / half the inset square (``fit_inset``).
+    ``letter_bounds``: display box a displaced sector letter may use (default
+    the inset square), e.g. the free room above and below the disc in a tall
+    block, so a blocked F or B can sit just outside the badges.
     """
     fwd = forward_from_c2w(r.cur_c2w)
     half = inset_half(r)
     past = dump.positions[: r.frame + 1][:, [0, 2]]
     if split_frame is not None:
-        crop = cd.draw_local_disc(ax, level, r.cur_pos[[0, 2]], fwd, half, past_xz=past,
+        crop = cd.draw_local_disc(ax, level, r.cur_pos[[0, 2]], fwd, half, past_xz=past, radius_frac=radius_frac,
                                   past_split=split_frame if split_frame < r.frame else len(past) - 1)
     else:
-        crop = cd.draw_local_disc(ax, level, r.cur_pos[[0, 2]], fwd, half, past_xz=past)
+        crop = cd.draw_local_disc(ax, level, r.cur_pos[[0, 2]], fwd, half, past_xz=past, radius_frac=radius_frac)
     per_pt = cd.pts_to_data(ax, 1.0)[0]
     bearings = []
     for g in r.groups:
@@ -724,20 +818,10 @@ def draw_inset(ax, level, dump: dd.Dump, r: dd.CaseRow, show_arrow: bool, L: dic
         bearings.append(float(r.gt_bearing[k]))
     cd.robot_glyph(ax, 0.0, 0.0, (0.0, 1.0), size_pt=6.6, zorder=6)
     occupied = cd.disc_rim_labels(ax, half, r.groups, bearings)
-    if letters != "outward":  # the arrow's arc (if drawn) is taken too, so a sliding letter avoids it
-        mid = 90.0 + cd.STRIP_START_DEG - 17.0
-        arrow = show_arrow and all(abs((t - mid + 180) % 360 - 180) > 17.0 + w + 4.0 for t, w in occupied)
-        cd.disc_sector_letters(ax, half, list(occupied) + ([(mid, 19.0)] if arrow else []), names=L["sectors"],
-                               displaced=letters, rays=[90.0 + b for b in bearings])
-    else:
-        cd.disc_sector_letters(ax, half, occupied, names=L["sectors"])
-    corners = {135.0: (-1, 1), 45.0: (1, 1), 225.0: (-1, -1), 315.0: (1, -1)}  # plot angle -> signs
-    if show_arrow:  # the arrow sits outside the rim from the strip start (+45 deg bearing) clockwise
-        mid = 90.0 + cd.STRIP_START_DEG - 17.0
-        if all(abs((t - mid + 180) % 360 - 180) > 17.0 + w + 4.0 for t, w in occupied):
-            cd.disc_direction_arrow(ax, half)
-            corners.pop(135.0)
-    # scale bar in the square's free corner (outside the disc) farthest from every badge
+    corners = dict(INSET_CORNERS)
+    if _arrow_fits(occupied, show_arrow):
+        cd.disc_direction_arrow(ax, half)
+        corners.pop(135.0)
     lim = ax.get_xlim()[1]
 
     def clearance(theta):
@@ -751,422 +835,292 @@ def draw_inset(ax, level, dump: dd.Dump, r: dd.CaseRow, show_arrow: bool, L: dic
     x = sx * (lim - 1.0 * per_pt)
     y = sy * (lim - (8.5 if sy > 0 else 2.5) * per_pt)
     cd.scale_bar(ax, x, y, bar, f"{bar:g} m", fs=5.6, ha="left" if sx < 0 else "right")
+    cd.disc_sector_letters(ax, half, occupied, names=L["sectors"], displaced=letters,
+                           rays=[90.0 + b for b in bearings], bounds=letter_bounds)
 
 
-def _metrics_text(r: dd.CaseRow, arm: str, L: dict):
-    """(main, rest): the prediction's numbers, then the always-behind guess for reference."""
-    s = r.summary(arm)
-    main = L["metric_main"].format(med=s["median"], mx=s["max"], hits=s["hits"], n=s["n"])
-    sf = r.summary("floor")
-    return main, L["sep"] + L["metric_floor"].format(med=sf["median"], hits=sf["hits"], n=sf["n"])
+# --------------------------------------------------------------------------- #
+# Notes (D5) and the block plan
+# --------------------------------------------------------------------------- #
+def _ps(p: Sequence[float], L: dict) -> str:
+    if len(p) == 1 or max(p) - min(p) < 0.005:
+        return L["ps_one"].format(p=p[0])
+    return L["ps_range"].format(a=min(p), b=max(p))
 
 
-def _place_peak_labels(ax, fig, strip: np.ndarray, marks, pt_per_deg: float, texts: Dict[int, str]) -> None:
-    """Slot badge (+ text) beside each numbered x, clear of every other x and label.
+def note_items(r: dd.CaseRow, L: dict, arm: str = ARM) -> List[dict]:
+    """The notes of one block (``data.row_notes`` + wording): [{"kind", "slots", "label", "style", "text"}].
 
-    ``marks``: (x, y, slot or None) of all drawn x marks.  A label goes on the
-    side with more free room (less heat on a tie); when that side is taken it
-    slides further out, joined to its x by a thin leader.
+    ``style`` "hist" (blue past-position badge: no view shows the slot) or
+    "miss" (orange-ringed: GT-visible, predicted not visible -- a numbered miss).
     """
-    half_mark = MARK_PT / 2 + 0.8
-    taken = [(x * pt_per_deg - half_mark, x * pt_per_deg + half_mark) for x, _, _ in marks]
-    q = strip.shape[1] / 360.0
-
-    def heat(a_pt, b_pt):
-        a, b = a_pt / pt_per_deg, b_pt / pt_per_deg
-        if a < 0 or b > 360:
-            return np.inf
-        return float(strip[:, int(a * q):max(int(b * q), int(a * q) + 1)].sum())
-
-    def overlap(a, b):
-        return sum(max(0.0, min(b, hi) - max(a, lo)) for lo, hi in taken)
-
-    for x, y, k in sorted([m for m in marks if m[2] is not None], key=lambda m: m[0]):
-        text = texts.get(k, "")
-        bw = cd.badge_width_pt(str(k + 1))
-        tw = cd.text_width_pt(fig, text, FS["small"]) + 1.6 if text else 0.0
-        width = bw + tw
-        xp = x * pt_per_deg
-        best = None
-        for shift in np.arange(0.0, 60.0, 1.5):
-            for sgn in (1.0, -1.0):
-                a = xp + sgn * (half_mark + 0.6 + shift)
-                lo, hi = (a, a + width) if sgn > 0 else (a - width, a)
-                if lo < 0 or hi > 360 * pt_per_deg:
-                    continue
-                cost = (overlap(lo, hi), heat(lo, hi))
-                if best is None or cost < best[0]:
-                    best = (cost, sgn, lo, hi, shift)
-            if best is not None and best[0][0] == 0.0:
-                break
-        (_, sgn, lo, hi, shift) = best
-        cx = (lo + bw / 2) if sgn > 0 else (hi - bw / 2)
-        if shift > 0:
-            edge = xp + sgn * half_mark
-            ax.plot([edge / pt_per_deg, (cx - sgn * bw / 2) / pt_per_deg], [y, y], color=style.INK_2, lw=0.5,
-                    zorder=6.5)
-        cd.history_badge(ax, cx / pt_per_deg, y, str(k + 1), k, zorder=8)
-        if text:
-            tx = cx + sgn * (bw / 2 + 1.6)
-            ax.text(tx / pt_per_deg, y, text, ha="left" if sgn > 0 else "right", va="center",
-                    fontsize=FS["small"], color=style.INK, zorder=8, path_effects=cd.HALO)
-        taken.append((lo, hi))
+    out = []
+    for note in dd.row_notes(r, arm):
+        kind, ks = note["kind"], note["slots"]
+        key = {"previous": "note_previous", "at_robot": "note_at_robot", "not_visible": "note_not_visible",
+               "predicted_none": "note_predicted_none"}[kind]
+        if kind == "at_robot" and dd.K - 1 in ks:
+            key = "note_at_robot_prev"
+        out.append({"kind": kind, "slots": list(ks), "label": dd.group_label(ks),
+                    "style": "miss" if kind == "predicted_none" else "hist",
+                    "text": L[key].format(ps=_ps(note["p"], L))})
+    return out
 
 
-@dataclass
-class BlockExt:
-    """Revised-layout settings of one block (``make_case_figure`` fills it from :class:`CaseOptions`)."""
-
-    note_lines: List[list]  # wrap_notes: note lines between the header and the lane ([(x deg, slots, text)])
-    lane_notes: List[tuple]  # wrap_notes: notes left of the lane badges ([(x deg, slots, text)])
-    wrap_notes: bool = False
-    miss_lane: bool = False  # reserve MISS_LANE_H under the prediction row and number misses there
-    label_panel: Optional[int] = None  # row_labels="fixed": strip panel of the row names
-    gt_carets: bool = False
-
-    @property
-    def extra_h(self) -> float:
-        return len(self.note_lines) * NOTE_LINE_H + (MISS_LANE_H if self.miss_lane else 0.0)
+def _note_width_pt(fig, item: dict) -> float:
+    return cd.note_width_pt(fig, item, FS["note"])
 
 
 def lane_layout(r: dd.CaseRow):
     """(targets, centres, labels, spans) of the ground-truth badges in a block's lane (strip degrees)."""
-    ppd = W_STRIP * 72.0 / 360.0
     targets = np.array([float(cd.strip_x(r.gt_bearing[g[0]])) for g in r.groups])
     labels = [dd.group_label(g) for g in r.groups]
-    xs = cd.dodge_1d(targets, [cd.badge_width_pt(s) / ppd for s in labels], 0.0, 360.0, 1.0 / ppd)
-    spans = [(x - cd.badge_width_pt(s) / ppd / 2, x + cd.badge_width_pt(s) / ppd / 2) for x, s in zip(xs, labels)]
+    xs = cd.dodge_1d(targets, [cd.badge_width_pt(s) / PPD for s in labels], 0.0, 360.0, 1.0 / PPD)
+    spans = [(x - cd.badge_width_pt(s) / PPD / 2, x + cd.badge_width_pt(s) / PPD / 2) for x, s in zip(xs, labels)]
     return targets, xs, labels, spans
 
 
-def note_items(r: dd.CaseRow, p, L: dict, merge: bool) -> List[tuple]:
-    """Notes of one block as (slots, text): no ground-truth view (the current spot, or out of sight), and
-    visible slots the prediction calls not visible (P(not visible) > 0.5); ``merge``: one note per kind."""
-    current = [k for k in r.invisible_slots() if r.gt_dist[k] < 0.1]
-    unseen = [k for k in r.invisible_slots() if r.gt_dist[k] >= 0.1]
-    pred_none = [k for k in range(dd.K) if r.visible[k] and p.none_p[k] > 0.5]
-    out = [([k], L["current"].format(p=p.none_p[k], f=int(r.hist_frames[k]))) for k in current]
-    sep = L.get("pred_none_n_sep", ", ")
-    for ks, key in ((unseen, "not_visible"), (pred_none, "pred_none")):
-        if merge and len(ks) > 1:
-            out.append((ks, L[key + "_n"].format(ps=sep.join(f"{p.none_p[k]:.2f}" for k in ks))))
-        else:
-            out += [([k], L[key].format(p=p.none_p[k])) for k in ks]
-    return out
+def _split_note(fig, item: dict, max_pt: float) -> List[dict]:
+    """A note wider than a whole line, cut so each part fits (``cd.split_note``; continuations get no badge)."""
+    return cd.split_note(fig, item, max_pt, FS["note"])
 
 
-def _note_width_pt(fig, ks, text: str) -> float:
-    return sum(cd.badge_width_pt(str(k + 1)) for k in ks) + 1.0 * (len(ks) - 1) + 1.2 + cd.text_width_pt(
-        fig, text, FS["note"])
-
-
-def layout_notes(fig, items: Sequence[tuple], lane_spans: Sequence[tuple]):
-    """``wrap_notes``: (lane_notes, note_lines) for a block's notes; every note is placed.
+def layout_notes(fig, items: Sequence[dict], lane_spans: Sequence[tuple]):
+    """(lane_notes, note_lines) for a block's notes, in strip degrees; every note is placed (D5, ``cd.wrap_notes``).
 
     Notes go left of the lane badges while they fit with ``NOTE_GAP_PT`` to
     spare (never to the right of the badge row, where their badges would read
-    as more past positions); the rest flow onto full-width note lines.
+    as more past positions); the rest flow onto full-width note lines, as
+    many as they need.
     """
-    ppd = W_STRIP * 72.0 / 360.0
-    left_hi = min([a for a, _ in lane_spans], default=360.0 + NOTE_GAP_PT / ppd) - NOTE_GAP_PT / ppd
-    lane, lines, cur, x, cx = [], [], [], 1.0, 1.0
-    rest = False
-    for ks, text in items:
-        w = _note_width_pt(fig, ks, text) / ppd
-        if not rest and x + w <= left_hi:
-            lane.append((x, ks, text))
-            x += w + 8.0 / ppd
-            continue
-        rest = True
-        if cur and cx + w > 359.0:
-            lines.append(cur)
-            cur, cx = [], 1.0
-        cur.append((cx, ks, text))
-        cx += w + 10.0 / ppd
-    if cur:
-        lines.append(cur)
-    return lane, lines
+    line_pt = 358.0 * PPD
+    left_hi = min([a for a, _ in lane_spans], default=360.0 + NOTE_GAP_PT / PPD) - NOTE_GAP_PT / PPD
+    first, lines = cd.wrap_notes(fig, items, line_pt, first_pt=max((left_hi - 1.0) * PPD, 0.0), fs=FS["note"],
+                                 sep_pt=8.0)
+    lane = [(1.0 + x / PPD, it) for x, it in first]
+    return lane, [[(1.0 + x / PPD, it) for x, it in line] for line in lines]
 
 
-def _draw_note(ax, fig, x: float, ks, text: str, y: float) -> None:
-    ppd = W_STRIP * 72.0 / 360.0
-    for k in ks:
-        bw = cd.badge_width_pt(str(k + 1)) / ppd
-        cd.history_badge(ax, x + bw / 2, y, str(k + 1), k)
-        x += bw + 1.0 / ppd
-    ax.text(x - 1.0 / ppd + 1.2 / ppd, y, text, ha="left", va="center", fontsize=FS["note"], color=style.INK_2)
+def _draw_note(ax, x: float, item: dict, y: float) -> None:
+    cd.draw_note(ax, x, y, item, per_pt=1.0 / PPD, fs=FS["note"])
 
 
-def _draw_miss_lane(ax_pr, fig, drawn, texts: Dict[int, str], ppd: float) -> None:
-    """``miss_lane``: each numbered miss's badge (+ text) in the lane under the row, a line to its own x."""
-    misses = sorted([m for m in drawn if m[2] is not None], key=lambda m: m[0])
-    if not misses:
-        return
-    bw = [cd.badge_width_pt(str(k + 1)) for _, _, k in misses]
-    tw = [(cd.text_width_pt(fig, texts[k], FS["small"]) + 1.6) if texts.get(k) else 0.0 for _, _, k in misses]
-    widths = [(b + t) / ppd for b, t in zip(bw, tw)]
-    targets = [x - b / 2 / ppd + w / 2 for (x, _, _), b, w in zip(misses, bw, widths)]
-    centres = cd.dodge_1d(np.asarray(targets), widths, 0.0, 360.0, 1.6 / ppd)
-    y_b = -EL_HEAT - MISS_BADGE_PT / ppd
-    for (x, y, k), b, w, c in zip(misses, bw, widths, centres):
-        bx = c - w / 2 + b / 2 / ppd
-        ax_pr.plot([bx, x], [y_b + 3.6 / ppd, y], color=style.INK_2, lw=0.55, zorder=6.6, clip_on=False,
-                   solid_capstyle="butt", path_effects=cd.HALO_THIN)
-        cd.history_badge(ax_pr, bx, y_b, str(k + 1), k, zorder=8).set_clip_on(False)
-        if texts.get(k):
-            t = ax_pr.text(bx + (b / 2 + 1.6) / ppd, y_b, texts[k], ha="left", va="center", fontsize=FS["small"],
-                           color=style.INK, zorder=8, path_effects=cd.HALO)
-            t.set_clip_on(False)
+@dataclass
+class BlockPlan:
+    """Everything one block needs, decided before the page exists (its height depends on it)."""
+
+    r: dd.CaseRow
+    win: Tuple[float, float]
+    gt_strip: np.ndarray
+    pr_strip: np.ndarray
+    marks: List[dict]
+    placed: dict
+    below: bool
+    items: List[dict]
+    lane_notes: list
+    note_lines: list
+    hdr_lines: int = 1
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def heat_h(self) -> float:
+        return cd.strip_height_in(W_STRIP, self.win)
+
+    @property
+    def body_h(self) -> float:
+        return LANE_H + RGB_H + 2 * ROW_GAP + 2 * self.heat_h
+
+    @property
+    def top_h(self) -> float:
+        """Header line(s) and note lines, above the lane."""
+        return HDR_H + (self.hdr_lines - 1) * HDR2_H + len(self.note_lines) * NOTE_LINE_H
+
+    @property
+    def height(self) -> float:
+        return self.top_h + self.body_h + (MISS_LANE_H if self.below else 0.0)
 
 
-def draw_block(page: Page, y_top: float, n: int, r: dd.CaseRow, views: np.ndarray, arm: str, L: dict,
-               last: bool, role: Optional[str] = None, clamp_peaks: bool = False, merge_notes: bool = False,
-               ext: Optional[BlockExt] = None):
-    """One key position: header, lane, RGB row, both heat rows (options: see :class:`CaseOptions`).
+def _metrics_text(r: dd.CaseRow, arm: str, L: dict):
+    """(main, reference): the prediction's numbers, then the always-behind guess."""
+    s = r.summary(arm)
+    main = L["metric_main"].format(med=s["median"], mx=s["max"], hits=s["hits"], n=s["n"])
+    sf = r.summary("floor")
+    return main, L["metric_floor"].format(med=sf["median"], hits=sf["hits"], n=sf["n"])
 
-    ``ext`` (:class:`BlockExt`): the revised layout's per-block settings; ``None`` = the approved block.
+
+def _frame_text(r: dd.CaseRow, frame_count: int, L: dict) -> str:
+    return L["frame"].format(n=r.frame + 1, T=frame_count)
+
+
+def plan_block(fig_m, n: int, r: dd.CaseRow, L: dict, frame_count: int, role: Optional[str] = None,
+               arm: str = ARM) -> BlockPlan:
+    """Window, marks, miss badges, notes and header lines of block ``n`` (``fig_m``: a figure for measuring)."""
+    warnings = []
+    win = cd.elevation_window([r], arm)
+    if win != (-cd.EL_DEFAULT, cd.EL_DEFAULT):
+        warnings.append(f"K{n + 1}: elevation window widened to {cd.fmt_deg(win[0])}..{cd.fmt_deg(win[1])}")
+    gt_strip = cd.heat_strip(dd.gt_composite(r), HEAT_RING_W, win)
+    pr_strip = cd.heat_strip(dd.pred_composite(r, arm), HEAT_RING_W, win)
+    marks = cd.peak_marks(r, arm, win, PPD)
+    heat = cd.heat_lookup(pr_strip, win)
+    conn = cd.miss_connectors(r, marks, win, PPD)
+    placed = cd.place_miss_labels(marks, PPD, win, heat=heat, below=False, lines=conn)
+    below = False
+    if not placed["clean"]:
+        placed_b = cd.place_miss_labels(marks, PPD, win, heat=heat, below=True, lines=conn)
+        below = any(v["below"] for v in placed_b["labels"].values())
+        placed = placed_b
+        if below:
+            warnings.append(f"K{n + 1}: miss badges need the lane under the prediction row")
+        if not placed["clean"]:
+            warnings.append(f"K{n + 1}: a miss badge overlaps or its leader crosses another mark")
+    items = note_items(r, L, arm)
+    lane_notes, note_lines = layout_notes(fig_m, items, lane_layout(r)[3])
+    if len(note_lines) > 1:
+        warnings.append(f"K{n + 1}: notes wrap onto {len(note_lines)} lines")
+    # header: one line unless the frame (+ role) text would run into the numbers
+    main, rest = _metrics_text(r, arm, L)
+    w_left = (cd.text_width_pt(fig_m, _frame_text(r, frame_count, L) + ((L["role_sep"] + role) if role else ""),
+                               FS["header"], fontweight="bold" if role else "normal") / 72.0 + 0.25)
+    w_right = cd.text_width_pt(fig_m, main + L["sep"] + rest, FS["header"]) / 72.0
+    hdr_lines = 1 if X_INSET + w_left + 0.12 <= X_STRIP + W_STRIP - w_right else 2
+    return BlockPlan(r=r, win=win, gt_strip=gt_strip, pr_strip=pr_strip, marks=marks, placed=placed, below=below,
+                     items=items, lane_notes=lane_notes, note_lines=note_lines, hdr_lines=hdr_lines,
+                     warnings=warnings)
+
+
+def draw_block(page: Page, y_top: float, n: int, plan: BlockPlan, views: np.ndarray, arm: str, L: dict,
+               last: bool, role: Optional[str] = None, frame_count: int = 0, keepout: Optional[list] = None):
+    """One key position: header, notes, lane, RGB row, both affordance map rows.
+
+    Returns ``(ax_inset, numbered_on_row)`` (the slots whose miss badge sits on the prediction row); the row
+    names and their keys are appended to ``keepout`` (artists the inset's rim badges must not touch).
     """
     fig = page.fig
-    # ---- header: K badge + frame (inset column), metrics (right-aligned over the strip)
+    r, win = plan.r, plan.win
+    lo, hi = win
+    # ---- header: K badge + frame (inset column), numbers (right-aligned over the strip)
     y_mid = y_top + HDR_H * 0.45
     page.text(X_INSET, y_mid, f"K{n + 1}", ha="left", va="center", fontsize=FS["header"], fontweight="bold",
               color="white", bbox=dict(boxstyle="round,pad=0.22,rounding_size=0.3", fc=style.INK, ec="none"))
-    frame_txt = (L["frame_last"] if r.is_final else L["frame"]).format(t=r.frame)
-    t_frame = page.text(X_INSET + 0.25, y_mid, frame_txt, ha="left", va="center", fontsize=FS["header"],
-                        color=style.INK)
-    if role:  # "· after the turnaround", bold, right after the frame
+    t_frame = page.text(X_INSET + 0.25, y_mid, _frame_text(r, frame_count, L), ha="left", va="center",
+                        fontsize=FS["header"], color=style.INK)
+    if role:
         w_frame = t_frame.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
-        page.text(X_INSET + 0.25 + w_frame, y_mid, L.get("role_sep", " · ") + role, ha="left", va="center",
-                  fontsize=FS["header"], color=style.INK, fontweight="bold")
+        page.text(X_INSET + 0.25 + w_frame, y_mid, L["role_sep"] + role, ha="left", va="center",
+                  fontsize=FS["header"], color=style.INK, fontweight="bold",
+                  path_effects=cd.bold_effects(role, style.INK))
     main, rest = _metrics_text(r, arm, L)
-    t_rest = page.text(X_STRIP + W_STRIP, y_mid, rest, ha="right", va="center", fontsize=FS["header"],
-                       color=style.MUTED)
-    w_rest = t_rest.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
-    page.text(X_STRIP + W_STRIP - w_rest, y_mid, main, ha="right", va="center", fontsize=FS["header"],
-              color=style.INK)
+    x_end = X_STRIP + W_STRIP
+    if plan.hdr_lines == 1:
+        t_rest = page.text(x_end, y_mid, L["sep"] + rest, ha="right", va="center", fontsize=FS["header"],
+                           color=style.MUTED)
+        w_rest = t_rest.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
+        page.text(x_end - w_rest, y_mid, main, ha="right", va="center", fontsize=FS["header"], color=style.INK)
+    else:
+        page.text(x_end, y_mid, main, ha="right", va="center", fontsize=FS["header"], color=style.INK)
+        page.text(x_end, y_mid + HDR2_H, rest, ha="right", va="center", fontsize=FS["header"], color=style.MUTED)
 
     # ---- axes
-    y_lane = y_top + HDR_H + (len(ext.note_lines) * NOTE_LINE_H if ext is not None else 0.0)
+    y_notes = y_top + HDR_H + (plan.hdr_lines - 1) * HDR2_H
+    y_lane = y_notes + len(plan.note_lines) * NOTE_LINE_H
     y_rgb = y_lane + LANE_H
     y_gt = y_rgb + RGB_H + ROW_GAP
-    y_pr = y_gt + HEAT_H + ROW_GAP
+    y_pr = y_gt + plan.heat_h + ROW_GAP
     ax_lane = page.ax(X_STRIP, y_lane, W_STRIP, LANE_H)
     ax_rgb = page.ax(X_STRIP, y_rgb, W_STRIP, RGB_H)
-    ax_gt = page.ax(X_STRIP, y_gt, W_STRIP, HEAT_H)
-    ax_pr = page.ax(X_STRIP, y_pr, W_STRIP, HEAT_H)
-    side = min(W_INSET, BODY_H)
-    ax_in = page.ax(X_INSET + (W_INSET - side) / 2, y_lane + (BODY_H - side) / 2, side, side)
+    ax_gt = page.ax(X_STRIP, y_gt, W_STRIP, plan.heat_h)
+    ax_pr = page.ax(X_STRIP, y_pr, W_STRIP, plan.heat_h)
+    side = min(W_INSET, plan.body_h)
+    ax_in = page.ax(X_INSET + (W_INSET - side) / 2, y_lane + (plan.body_h - side) / 2, side, side)
 
     cd.draw_rgb_row(ax_rgb, cd.rgb_strip(views, RGB_RING_W, EL_RGB), EL_RGB)
-    gt_strip = cd.heat_strip(dd.gt_composite(r), HEAT_RING_W, EL_HEAT)
-    pr_strip = cd.heat_strip(dd.pred_composite(r, arm), HEAT_RING_W, EL_HEAT)
-    cd.draw_heat_row(ax_gt, gt_strip, EL_HEAT, cd.GT_CMAP)
-    cd.draw_heat_row(ax_pr, pr_strip, EL_HEAT, cd.PRED_CMAP)
-    if ext is not None and ext.label_panel is not None:  # one place for the whole figure, on a pill
-        for ax, label in ((ax_gt, L["gt_row"]), (ax_pr, L["pred_row"])):
-            cd.row_label(ax, ext.label_panel * 90 + 2.0, label, FS["small"])
-    else:
-        v_label = cd.quietest_panel(gt_strip, pr_strip)
-        for ax, label in ((ax_gt, L["gt_row"]), (ax_pr, L["pred_row"])):
-            ax.text(v_label * 90 + 2.0, 0, label, ha="left", va="center", fontsize=FS["small"], color=style.INK_2,
-                    zorder=6, path_effects=cd.HALO)
-    if ext is not None and ext.gt_carets and r.gt_peak_elev is not None:
-        _draw_gt_carets(ax_gt, r)
-    if ext is not None:  # note lines between the header and the lane
-        for i, line in enumerate(ext.note_lines):
-            ax_note = page.ax(X_STRIP, y_top + HDR_H + i * NOTE_LINE_H, W_STRIP, NOTE_LINE_H)
-            ax_note.set_xlim(0, 360)
-            ax_note.set_ylim(0, 1)
-            ax_note.axis("off")
-            for x, ks, text in line:
-                _draw_note(ax_note, fig, x, ks, text, 0.5)
+    cd.draw_heat_row(ax_gt, plan.gt_strip, win, cd.GT_CMAP)
+    cd.draw_heat_row(ax_pr, plan.pr_strip, win, cd.PRED_CMAP)
+    for ax_row, text, kind in ((ax_gt, L["gt_row"], "gt"), (ax_pr, L["pred_row"], "pred")):
+        artists = cd.gutter_row_label(ax_row, text, kind)
+        if keepout is not None:
+            keepout.extend(artists)
+
+    for i, line in enumerate(plan.note_lines):  # note lines between the header and the lane
+        ax_note = page.ax(X_STRIP, y_notes + i * NOTE_LINE_H, W_STRIP, NOTE_LINE_H)
+        ax_note.set_xlim(0, 360)
+        ax_note.set_ylim(0, 1)
+        ax_note.axis("off")
+        for x, it in line:
+            _draw_note(ax_note, x, it, 0.5)
     ax_lane.set_xlim(0, 360)
     ax_lane.set_ylim(0, 1)
     ax_lane.axis("off")
 
     # ---- ground truth: numbered badges in the lane, guide through the RGB row, ticks under the prediction
-    pt_per_deg = W_STRIP * 72.0 / 360.0
-    groups = r.groups
-    targets = np.array([float(cd.strip_x(r.gt_bearing[g[0]])) for g in groups])
-    labels = [dd.group_label(g) for g in groups]
-    xs = cd.dodge_1d(targets, [cd.badge_width_pt(s) / pt_per_deg for s in labels], 0.0, 360.0, 1.0 / pt_per_deg)
+    targets, xs, labels, _ = lane_layout(r)
     y_badge = 0.56
     tick = cd.pts_to_data(ax_pr, 0.0, 1.0)[1]
-    for g, t, x, lab in zip(groups, targets, xs, labels):
+    for g, t, x, lab in zip(r.groups, targets, xs, labels):
         k = g[0]
         col = cd.history_line_color(k)
         ax_lane.plot([x, x, t, t], [y_badge, 0.34, 0.12, 0.0], color=col, lw=0.55, zorder=3, clip_on=False,
                      solid_joinstyle="round")
         cd.history_badge(ax_lane, x, y_badge, lab, k)
         ax_rgb.plot([t, t], [-EL_RGB, EL_RGB], color=col, lw=0.55, zorder=3)
-        ax_pr.plot([t, t], [-EL_HEAT - 1.0 * tick, -EL_HEAT - 4.0 * tick], color=col, lw=0.8, zorder=3,
-                   clip_on=False, solid_capstyle="butt")
-    lane_spans = [(x - cd.badge_width_pt(s) / pt_per_deg / 2, x + cd.badge_width_pt(s) / pt_per_deg / 2)
-                  for x, s in zip(xs, labels)]
+        ax_pr.plot([t, t], [lo - 1.0 * tick, lo - 4.0 * tick], color=col, lw=0.8, zorder=3, clip_on=False,
+                   solid_capstyle="butt")
+    for x, it in plan.lane_notes:
+        _draw_note(ax_lane, x, it, y_badge)
 
-    # ---- predicted peaks: one x per cluster; misses > MISS_DEG alone, with the slot's badge.  Marks
-    #      closer than their own width are staggered vertically (+-STAGGER_PT) so none fuse into a blob.
-    p = r.arms[arm]
-    shown = [k for k in range(dd.K) if r.valid[k] and p.none_p[k] <= 0.5 and p.peak_view[k] >= 0]
-    alone = [k for k in shown if (not r.visible[k]) or p.err[k] > MISS_DEG]
-    merged = [k for k in shown if k not in alone]
-    px = {k: float(cd.strip_x(p.peak_bearing[k])) for k in shown}
-    marks = []  # (x, elevation, slot needing a label or None)
-    for cl in cd.cluster_1d([px[k] for k in merged], MERGE_DEG):
-        ks = [merged[i] for i in cl]
-        marks.append((float(np.mean([px[k] for k in ks])), float(np.mean([p.peak_elev[k] for k in ks])), None))
-    marks += [(px[k], float(p.peak_elev[k]), k) for k in alone]
-    marks.sort(key=lambda m: m[0])
-    per_pt_y = cd.pts_to_data(ax_pr, 0.0, 1.0)[1]
-    offsets, sign = [0.0] * len(marks), 1.0
-    for j in range(1, len(marks)):
-        if (marks[j][0] - marks[j - 1][0]) * pt_per_deg < MARK_PT + 3.4:  # x plus its halo
-            if offsets[j - 1] == 0.0:
-                offsets[j - 1] = sign * STAGGER_PT
-            offsets[j] = -np.sign(offsets[j - 1]) * STAGGER_PT
-            sign = -sign
-    drawn = []
-    marks_y = []
-    for (x, el, k), off in zip(marks, offsets):
-        if clamp_peaks:  # keep the x inside the row; a caret at the edge says the peak lies beyond it
-            if abs(el) > EL_HEAT:  # caret tip at the edge, the x just inside it (clear of the caret)
-                s = 1.0 if el > 0 else -1.0
-                y = s * (EL_HEAT - (CARET_PT + 3.0 + abs(off)) * per_pt_y)  # a stagger only moves it inward
-                ax_pr.plot([x], [s * (EL_HEAT - (CARET_PT / 2 + 0.4) * per_pt_y)], marker="^" if s > 0 else "v",
-                           ms=CARET_PT, color=style.INK, mec="white", mew=0.5, zorder=7.5)
-            else:
-                edge = EL_HEAT - (MARK_PT / 2 + 1.0) * per_pt_y
-                y = float(np.clip(el + off * per_pt_y, -edge, edge))
-            cd.peak_mark(ax_pr, x, y, size=MARK_PT)
-        else:
-            y = el + off * per_pt_y
-            cd.peak_mark(ax_pr, x, y, size=MARK_PT)
-        drawn.append((x, 0.0, k))
-        marks_y.append((x, float(y), k))
-    texts = {}
-    for k in alone:
-        if not r.visible[k]:
-            texts[k] = L["false_pos"]
-    if ext is not None and ext.miss_lane:
-        _draw_miss_lane(ax_pr, fig, marks_y, texts, pt_per_deg)
-    else:
-        _place_peak_labels(ax_pr, fig, pr_strip, drawn, pt_per_deg, texts)
-
-    # ---- notes (slot badge + text) for slots without a GT view or predicted "not visible"
-    notes = []
-    for k in r.invisible_slots():
-        notes.append((k, L["current" if r.gt_dist[k] < 0.1 else "not_visible"].format(p=p.none_p[k],
-                                                                                     f=int(r.hist_frames[k]))))
-    for k in range(dd.K):
-        if r.visible[k] and p.none_p[k] > 0.5:
-            notes.append((k, L["pred_none"].format(p=p.none_p[k])))
-    # notes go left of the lane badges, else right of them; a note that fits nowhere is reported, not drawn
-    free = [(1.0, min([a for a, _ in lane_spans], default=360.0) - 2.0),
-            (max([b for _, b in lane_spans], default=0.0) + 2.0, 359.0)]
-    if ext is not None and ext.wrap_notes:  # laid out beforehand (layout_notes): nothing is dropped
-        for x, ks, text in ext.lane_notes:
-            _draw_note(ax_lane, fig, x, ks, text, y_badge)
-        notes = []
-    elif merge_notes:
-        _draw_merged_notes(ax_lane, fig, r, p, L, free, y_badge, pt_per_deg)
-        notes = []
-    for k, text in notes:
-        bw = cd.badge_width_pt(str(k + 1)) / pt_per_deg
-        width = bw + (1.2 + cd.text_width_pt(fig, text, FS["note"])) / pt_per_deg
-        for j, (lo, hi) in enumerate(free):
-            if hi - lo >= width:
-                cd.history_badge(ax_lane, lo + bw / 2, y_badge, str(k + 1), k)
-                ax_lane.text(lo + bw + 1.2 / pt_per_deg, y_badge, text, ha="left", va="center",
-                             fontsize=FS["note"], color=style.INK_2)
-                free[j] = (lo + width + 8.0 / pt_per_deg, hi)
-                break
-        else:
-            print(f"[fig_case] frame {r.frame}: no room for the note on slot {k + 1}: {text}")
-            _DROPPED.append(f"frame {r.frame}, slot {k + 1}: {text}")
+    # ---- predicted peaks, misses (D1/D2)
+    cd.draw_miss_connectors(ax_pr, r, plan.marks, win, PPD)
+    cd.draw_peak_marks(ax_pr, plan.marks)
+    numbered = cd.draw_miss_labels(ax_pr, plan.placed)
 
     if last:
-        cd.azimuth_axis(ax_pr, L["axis"], fs=FS["axis"])
-        lane_pt = MISS_LANE_H * 72.0 if (ext is not None and ext.miss_lane) else 0.0
-        ax_pr.tick_params(axis="x", which="major", pad=5.5 + lane_pt)
-        if lane_pt:
-            ax_pr.tick_params(axis="x", which="minor", length=2.4 + lane_pt)
-    return ax_in
-
-
-def _draw_gt_carets(ax_gt, r: dd.CaseRow) -> None:
-    """``gt_carets``: blue caret at the ground-truth row's edge where a visible slot's peak lies beyond it."""
-    per_pt_y = cd.pts_to_data(ax_gt, 0.0, 1.0)[1]
-    el = np.nan_to_num(r.gt_peak_elev, nan=0.0)
-    done = []
-    for k in np.nonzero(r.visible & (np.abs(el) > EL_HEAT - 1.0))[0]:
-        x = float(cd.strip_x(r.gt_bearing[k]))
-        s = 1.0 if el[k] > 0 else -1.0
-        if any(abs(x - x0) < 1.5 and s == s0 for x0, s0 in done):
-            continue
-        done.append((x, s))
-        ax_gt.plot([x], [s * (EL_HEAT - (CARET_PT / 2 + 0.4) * per_pt_y)], ls="none", marker="^" if s > 0 else "v",
-                   ms=CARET_PT, mfc=GT_INK, mec="white", mew=0.5, zorder=6, clip_on=False)
-
-
-def _draw_merged_notes(ax_lane, fig, r: dd.CaseRow, p, L: dict, free: list, y_badge: float,
-                       pt_per_deg: float) -> None:
-    """``CaseOptions.merge_notes``: one note per kind, carrying every slot's badge and P(not visible)."""
-    current = [k for k in r.invisible_slots() if r.gt_dist[k] < 0.1]
-    unseen = [k for k in r.invisible_slots() if r.gt_dist[k] >= 0.1]
-    pred_none = [k for k in range(dd.K) if r.visible[k] and p.none_p[k] > 0.5]
-    notes = [([k], L["current"].format(p=p.none_p[k])) for k in current]
-    for ks, key in ((unseen, "not_visible"), (pred_none, "pred_none")):
-        if len(ks) == 1:
-            notes.append((ks, L[key].format(p=p.none_p[ks[0]])))
-        elif ks:
-            notes.append((ks, L[key + "_n"].format(ps=", ".join(f"{p.none_p[k]:.2f}" for k in ks))))
-    gap = 1.0 / pt_per_deg
-    for ks, text in notes:
-        bws = [cd.badge_width_pt(str(k + 1)) / pt_per_deg for k in ks]
-        badges = sum(bws) + gap * (len(ks) - 1)
-        width = badges + (1.2 + cd.text_width_pt(fig, text, FS["note"])) / pt_per_deg
-        for j, (lo, hi) in enumerate(free):
-            if hi - lo >= width:
-                x = lo
-                for k, bw in zip(ks, bws):
-                    cd.history_badge(ax_lane, x + bw / 2, y_badge, str(k + 1), k)
-                    x += bw + gap
-                ax_lane.text(lo + badges + 1.2 / pt_per_deg, y_badge, text, ha="left", va="center",
-                             fontsize=FS["note"], color=style.INK_2)
-                free[j] = (lo + width + 8.0 / pt_per_deg, hi)
-                break
+        if plan.below:  # degree labels under the miss lane, on an axis of their own (no ticks through the lane)
+            ax_ax = page.ax(X_STRIP, y_pr + plan.heat_h + MISS_LANE_H, W_STRIP, 0.001)
+            ax_ax.set_xlim(0, 360)
+            cd.clean_axes(ax_ax)
+            ax_ax.patch.set_visible(False)
+            cd.azimuth_axis(ax_ax, L["axis"], fs=FS["axis"])
+            ax_ax.tick_params(axis="x", which="major", pad=3.0)
         else:
-            print(f"[fig_case] frame {r.frame}: no room for the note on slots {[k + 1 for k in ks]}: {text}")
-            _DROPPED.append(f"frame {r.frame}, slots {[k + 1 for k in ks]}: {text}")
+            cd.azimuth_axis(ax_pr, L["axis"], fs=FS["axis"])
+            ax_pr.tick_params(axis="x", which="major", pad=5.5)
+    return ax_in, numbered
 
 
 def draw_top_band(page: Page, L: dict) -> None:
     y_names = TOP_H - 0.085
-    page.text(X_ROUTE, y_names, "a", ha="left", va="center", fontsize=FS["title"] + 0.5, fontweight="bold",
-              color=style.INK)
-    page.text(X_ROUTE + 0.13, y_names, L["a"], ha="left", va="center", fontsize=FS["name"], color=style.INK)
-    page.text(X_INSET, y_names, "b", ha="left", va="center", fontsize=FS["title"] + 0.5, fontweight="bold",
-              color=style.INK)
-    page.text(X_INSET + 0.13, y_names, L["b"], ha="left", va="center", fontsize=FS["name"], color=style.INK)
-    page.text(X_STRIP, y_names, "c", ha="left", va="center", fontsize=FS["title"] + 0.5, fontweight="bold",
-              color=style.INK)
+    for x, letter, name in ((X_ROUTE, "a", L["a"]), (X_INSET, "b", L["b"])):
+        page.text(x, y_names, letter, ha="left", va="center", fontsize=FS["title"] + 0.5, fontweight="bold",
+                  color=style.INK)
+        page.text(x + 0.13, y_names, name, ha="left", va="center", fontsize=FS["name"], color=style.INK)
+    page.text(X_STRIP - 0.10, y_names, "c", ha="left", va="center", fontsize=FS["title"] + 0.5,
+              fontweight="bold", color=style.INK)
     q = W_STRIP / 4
     for v, name in enumerate(L["views"]):
         page.text(X_STRIP + (v + 0.5) * q, y_names, name, ha="center", va="center", fontsize=FS["name"],
-                  color=style.INK if v == 0 else style.INK_2, fontweight="bold" if v == 0 else "normal")
-    # bracket over the three views the model never sees
+                  color=style.INK if v == 0 else style.INK_2, fontweight="bold" if v == 0 else "normal",
+                  path_effects=cd.bold_effects(name, style.INK) if v == 0 else None)
+    # bracket over the three views not given to the model, its note set into the top line
+    fig = page.fig
     y_br = y_names - 0.085
     ax = page.ax(X_STRIP + q + 0.02, y_br - 0.03, 3 * q - 0.04, 0.06)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.plot([0, 0, 1, 1], [0.1, 0.55, 0.55, 0.1], color=style.MUTED, lw=0.6, solid_joinstyle="miter")
-    page.text(X_STRIP + 2.5 * q, y_br - 0.075, L["not_given"], ha="center", va="center", fontsize=FS["small"],
-              color=style.INK_2, fontstyle="italic")
+    w_note = cd.text_width_pt(fig, L["not_given"], FS["small"], fontstyle="italic") / 72.0 + 0.14
+    frac = w_note / (3 * q - 0.04)
+    ax.plot([0, 0, 0.5 - frac / 2], [0.1, 0.55, 0.55], color=style.MUTED, lw=0.6, solid_joinstyle="miter")
+    ax.plot([0.5 + frac / 2, 1, 1], [0.55, 0.55, 0.1], color=style.MUTED, lw=0.6, solid_joinstyle="miter")
+    ax.text(0.5, 0.55, L["not_given"], ha="center", va="center", fontsize=FS["small"], color=style.INK_2,
+            fontstyle="italic" if not any("一" <= ch <= "鿿" for ch in L["not_given"]) else "normal")
 
 
-def draw_legend(page: Page, y_top: float, arm: str, L: dict) -> None:
-    """One line, five entries, spread over the full width."""
+def draw_legend(page: Page, y_top: float, arm: str, L: dict) -> List[str]:
+    """One line of six entries over the full width (the font shrinks to 5.8 pt before entries crowd).
+
+    Returns warnings (entries closer than 6 pt).
+    """
     fig = page.fig
     ax = page.ax(0.0, y_top, FIG_W, LEGEND_H)
     w_pt, h_pt = FIG_W * 72.0, LEGEND_H * 72.0
@@ -1192,84 +1146,123 @@ def draw_legend(page: Page, y_top: float, arm: str, L: dict) -> None:
         (swatch(cd.GT_CMAP), 18.0, L["legend_gt"]),
         (swatch(cd.PRED_CMAP), 18.0, L["legend_pred"]),
         (lambda x: cd.peak_mark(ax, x + 3.0, y), 6.0, L["legend_peak"]),
+        (lambda x: cd.miss_badge(ax, x + 3.7, y, "3"), 7.4, L.get("legend_miss", "")),
         (lambda x: cd.robot_glyph(ax, x + 3.0, y, (0.0, 1.0), size_pt=6.4), 6.0, L["legend_robot"]),
     ]
+    entries = [e for e in entries if e[2]]
     inner = 3.0
-    widths = [cd.text_width_pt(fig, text, FS["legend"]) for _, _, text in entries]
-    total = sum(gw + inner + tw for (_, gw, _), tw in zip(entries, widths))
-    gap = min(18.0, (w_pt - 2.0 - total) / (len(entries) - 1))
+    warnings = []
+    for fs in (FS["legend"], 5.8):
+        widths = [cd.text_width_pt(fig, text, fs) for _, _, text in entries]
+        total = sum(gw + inner + tw for (_, gw, _), tw in zip(entries, widths))
+        gap = min(18.0, (w_pt - 2.0 - total) / (len(entries) - 1))
+        if gap >= 8.0:
+            break
+    if gap < 6.0:
+        warnings.append(f"legend entries only {gap:.1f} pt apart")
     x = 1.0
     for (draw, gw, text), tw in zip(entries, widths):
         draw(x)
-        ax.text(x + gw + inner, y, text, ha="left", va="center", fontsize=FS["legend"], color=style.INK)
+        ax.text(x + gw + inner, y, text, ha="left", va="center", fontsize=fs, color=style.INK)
         x += gw + inner + tw + gap
+    return warnings
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def numbered_misses(r: dd.CaseRow, arm: str = ARM) -> List[int]:
-    """Slots whose predicted peak is drawn alone and numbered: shown, and not visible or > MISS_DEG off."""
-    p = r.arms[arm]
-    shown = [k for k in range(dd.K) if r.valid[k] and p.none_p[k] <= 0.5 and p.peak_view[k] >= 0]
-    return [k for k in shown if (not r.visible[k]) or p.err[k] > MISS_DEG]
+    """Slots numbered on the prediction row: missed (D1: fail joint PCK@8) and drawn as an x."""
+    return r.misses_with_peak(arm)
 
 
-def case_caption(lang: str, opt: CaseOptions, **fmt) -> str:
-    """Caption of the case figure: ``CAPTION[lang]`` for the approved layout, else built from CAPTION_PARTS."""
-    if opt.is_approved_layout and not opt.clamp_peaks:
-        return CAPTION[lang].format(**fmt)
+def caption_marks(lang: str, opt: Optional[CaseOptions] = None) -> str:
+    """The x / miss / tick / note / header sentences of the caption (``opt`` accepted for compatibility)."""
     P = CAPTION_PARTS[lang]
-    return (P["head"] + P["a"] + P["b"] + P["c"]).format(**fmt) + caption_marks(lang, opt)
+    return P["x"] + P["misses"] + P["ticks"] + P["notes"] + P["headers"]
 
 
-def caption_marks(lang: str, opt: CaseOptions) -> str:
-    """The x / caret / tick / note / header sentences of the caption, matching the options drawn."""
+def case_caption(lang: str, opt: Optional[CaseOptions] = None, **fmt) -> str:
+    """Caption of the case figure from ``CAPTION_PARTS`` ("{elev_window}" left for ``make_case_figure``)."""
+    opt = opt or CaseOptions()
     P = CAPTION_PARTS[lang]
-    text = P["x"] + (P["x_lane"] if opt.miss_lane else P["x_inline"])
-    if opt.gt_carets and opt.clamp_peaks:
-        text += P["carets"]
-    elif opt.clamp_peaks:
-        text += P["carets_pred"]
-    elif opt.gt_carets:
-        text += P["carets_gt"]
-    text += P["ticks"]
-    if opt.wrap_notes:
-        text += P["notes"]
-    return text + P["headers"]
+    fmt.setdefault("rule", opt.key_rule or KEY_RULE[lang])
+    head = P["head"].format(**fmt)
+    return head + P["a"] + P["b"] + P["c"] + caption_marks(lang, opt)
 
 
-def _choose_scale_corner(insets, recs) -> Optional[float]:
+def window_caption(wins: Sequence[Tuple[float, float]], lang: str) -> str:
+    """"rows show elevation −10° to +10°", with the blocks that differ named: "(K2: −26° to +10°)"."""
+    wins = [tuple(w) for w in wins]
+    base = max(set(wins), key=lambda w: (wins.count(w), w == (-cd.EL_DEFAULT, cd.EL_DEFAULT)))
+    text = cd.elevation_text(base, lang)
+    other = [(i, w) for i, w in enumerate(wins) if w != base]
+    if not other:
+        return text
+    if lang == "zh":
+        return text + "（" + "；".join(f"K{i + 1}：{cd.fmt_deg(w[0])} 至 {cd.fmt_deg(w[1])}" for i, w in other) + "）"
+    return text + " (" + "; ".join(f"K{i + 1}: {cd.fmt_deg(w[0])} to {cd.fmt_deg(w[1])}" for i, w in other) + ")"
+
+
+def wrap_text(fig, text: str, width_in: float, fs: float) -> str:
+    """Word-wrap each line of ``text`` to ``width_in`` at ``fs`` (a word longer than the width stays whole)."""
+    out = []
+    for line in text.split("\n"):
+        cur = ""
+        for word in line.split(" "):
+            trial = word if not cur else cur + " " + word
+            if cur and cd.text_width_pt(fig, trial, fs) / 72.0 > width_in:
+                out.append(cur)
+                cur = word
+            else:
+                cur = trial
+        out.append(cur)
+    return "\n".join(out)
+
+
+def _choose_scale_corner(insets, recs) -> Tuple[Optional[float], List[str]]:
     """``scale_corner="fixed"``: the inset corner with the most clearance from the badges in every block."""
-    clear = [inset_corner_clearance(ax, r, show_arrow=(n == 0)) for n, (ax, r) in enumerate(zip(insets, recs))]
+    return _choose_scale_corner_from([inset_corner_clearance(ax, r, show_arrow=(n == 0))
+                                      for n, (ax, r) in enumerate(zip(insets, recs))])
+
+
+def _choose_scale_corner_from(clear: Sequence[Dict[float, float]]) -> Tuple[Optional[float], List[str]]:
+    """The corner (plot angle) free in every block with the most clearance from the badges (``inset_corner_clearance``
+    per block), and a warning when that clearance is under 12 deg."""
     common = [c for c in (45.0, 135.0, 315.0, 225.0) if all(c in cl for cl in clear)]
     if not common:
-        return None
+        return None, []
     best = max(common, key=lambda c: (round(min(cl[c] for cl in clear)), -common.index(c)))
     worst = min(cl[best] for cl in clear)
-    if worst < 12.0:
-        print(f"[fig_case] inset scale bars: corner {best:g} deg is only {worst:.0f} deg from a badge in some block")
-    return best
+    warn = [] if worst >= 12.0 else [f"inset scale bars: corner {best:g} deg is {worst:.0f} deg from a badge"]
+    return best, warn
 
 
 def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_root=None, clip_root_override=None,
-                     out_stem="case", lang: str = "en", options: Optional[CaseOptions] = None) -> dict:
-    """Render the case figure for one dump; returns {"files": [...], "rows": [...], "stats": [...]}.
+                     out_stem="case", lang: str = "en", options: Optional[CaseOptions] = None,
+                     title: Optional[str] = None, title_note: Optional[str] = None,
+                     caption_extra: Optional[str] = None, key_rule: Optional[str] = None) -> dict:
+    """Render the case figure for one dump.
 
-    ``options`` (:class:`CaseOptions`) adds the route-figure extensions and the
-    revised layout; without it the output is the case figure exactly.  The
-    result also has "notes_dropped" (notes that found no room and were left
-    out; always empty with ``wrap_notes``) and "layout" (what the revised
-    layout decided: label panel, scale-bar corner, note lines, miss lane).
+    ``title`` / ``title_note`` / ``caption_extra`` / ``key_rule`` override the
+    same :class:`CaseOptions` fields.  Returns {"files", "rows", "stats",
+    "size_in", "windows", "warnings", "layout", "notes_dropped"}: ``warnings``
+    lists what a reviewer should know (widened windows, wrapped notes, miss
+    badges moved under a row, a crowded legend); ``notes_dropped`` is always
+    empty (a slot without a badge or a note raises instead, D5).
     """
     cd.setup(lang)
+    import dataclasses
+
     import matplotlib.pyplot as plt  # after setup(): Agg backend, fonts registered
 
     arm = ARM
-    opt = options or CaseOptions()
-    L = labels_for(lang, opt.wording) if opt.wording != "approved" else LABELS[lang]
-    if opt.wording != "approved" and not opt.miss_lane:
-        L["legend_peak"] = LABELS[lang]["legend_peak"]
+    opt = dataclasses.replace(options) if options is not None else CaseOptions()
+    for name, val in (("title", title), ("title_note", title_note), ("caption_extra", caption_extra),
+                      ("key_rule", key_rule)):
+        if val is not None:
+            setattr(opt, name, val)
+    L = labels_for(lang)
     dump = dd.load_dump(dump_npz_path)
     if arm not in dump.arms:
         raise ValueError(f"arm {arm!r} not in dump arms {dump.arms}")
@@ -1280,107 +1273,122 @@ def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_ro
     recs = [dd.case_row(dump, i) for i in rows]
     clip_dir = dd.resolve_clip_dir(dump, clip_root_override)
     level = dd.topdown_level(dump, float(np.median(dump.positions[:, 1])), root=topdown_root)
-
     if opt.roles is not None and len(opt.roles) != len(recs):
         raise ValueError(f"roles {opt.roles}: need one per row ({len(recs)})")
+    roles = list(opt.roles) if opt.roles is not None else [None] * len(recs)
     del _DROPPED[:]
 
-    # ---- revised layout: decided before the page exists (block heights depend on it)
-    exts: Optional[List[BlockExt]] = None
-    layout: dict = {}
-    if not opt.is_approved_layout:
-        fig_m = plt.figure(figsize=(FIG_W, 2.0))  # only for measuring text
-        ppd = W_STRIP * 72.0 / 360.0
-        label_panel = None
-        if opt.row_labels == "fixed":
-            strips = []
-            for r in recs:
-                strips += [cd.heat_strip(dd.gt_composite(r), HEAT_RING_W, EL_HEAT),
-                           cd.heat_strip(dd.pred_composite(r, arm), HEAT_RING_W, EL_HEAT)]
-            w_deg = (max(cd.text_width_pt(fig_m, L[k], FS["small"]) for k in ("gt_row", "pred_row")) + 5.0) / ppd
-            label_panel = cd.fixed_label_panel(strips, w_deg)
-        lane = bool(opt.miss_lane and any(numbered_misses(r, arm) for r in recs))
-        exts = []
-        for r in recs:
-            lane_notes, note_lines = [], []
-            if opt.wrap_notes:
-                items = note_items(r, r.arms[arm], L, opt.merge_notes)
-                lane_notes, note_lines = layout_notes(fig_m, items, lane_layout(r)[3])
-            exts.append(BlockExt(note_lines=note_lines, lane_notes=lane_notes, wrap_notes=opt.wrap_notes,
-                                 miss_lane=lane, label_panel=label_panel, gt_carets=opt.gt_carets))
-        plt.close(fig_m)
-        layout = {"label_panel": label_panel, "miss_lane": lane, "note_lines": [len(e.note_lines) for e in exts]}
-    block_h = [BLOCK_H + (e.extra_h if exts else 0.0) for e in (exts or [None] * len(recs))]
+    # ---- every block planned before the page exists (heights depend on windows, notes, miss lanes)
+    fig_m = plt.figure(figsize=(FIG_W, 2.0))
+    plans = [plan_block(fig_m, n, r, L, dump.frame_count, roles[n], arm) for n, r in enumerate(recs)]
+    plt.close(fig_m)
+    warnings: List[str] = [w for p in plans for w in p.warnings]
 
     title_h = TITLE_H if opt.title else (BANNER_H if opt.banner else 0.0)
-    height = fig_height(len(recs)) + title_h
-    if exts:
-        height += sum(block_h) - len(recs) * BLOCK_H
+    blocks_h = sum(p.height for p in plans) + (len(plans) - 1) * BLOCK_GAP
+    height = TOP_H + blocks_h + AXIS_H + LEGEND_H + title_h
     fig = plt.figure(figsize=(FIG_W, height))
     page = Page(fig, height, y0=title_h)
     if opt.title:
         t = page.text(X_ROUTE, -title_h + 0.11, opt.title, ha="left", va="center", fontsize=FS["title"] + 0.8,
-                      fontweight="bold", color=style.INK)
+                      fontweight="bold", color=style.INK, path_effects=cd.bold_effects(opt.title, style.INK))
         if opt.title_note:
             w = t.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
             page.text(X_ROUTE + w + 0.12, -title_h + 0.11, opt.title_note, ha="left", va="center",
-                      fontsize=FS["name"], color=style.INK_2, fontstyle="italic")
+                      fontsize=FS["name"], color=style.INK_2, fontstyle="italic" if lang != "zh" else "normal")
     elif opt.banner:
         page.text(X_ROUTE, -title_h + 0.09, opt.banner, ha="left", va="center", fontsize=FS["name"],
                   color=style.INK_2, fontstyle="italic" if (opt.banner_italic and lang != "zh") else "normal")
     draw_top_band(page, L)
     insets = []
-    for n, r in enumerate(recs):
-        y_top = TOP_H + n * (BLOCK_H + BLOCK_GAP) + (sum(block_h[:n]) - n * BLOCK_H if exts else 0.0)
+    keepout_artists: list = []
+    y = TOP_H
+    for n, (plan, r) in enumerate(zip(plans, recs)):
         views = dd.surround_views(clip_dir, r.frame)
-        role = opt.roles[n] if opt.roles is not None else None
-        insets.append(draw_block(page, y_top, n, r, views, arm, L, last=(n == len(recs) - 1), role=role,
-                                 clamp_peaks=opt.clamp_peaks, merge_notes=opt.merge_notes,
-                                 ext=exts[n] if exts else None))
-    corner = _choose_scale_corner(insets, recs) if opt.scale_corner == "fixed" else None
-    layout["scale_corner"] = corner
-    for n, (ax_in, r) in enumerate(zip(insets, recs)):
-        lvl = dd.topdown_level(dump, float(r.cur_pos[1]), root=topdown_root)
-        draw_inset(ax_in, lvl, dump, r, show_arrow=(n == 0), L=L, split_frame=opt.split_frame,
-                   letters=opt.letters, scale_corner=corner)
+        ax_in, numbered = draw_block(page, y, n, plan, views, arm, L, last=(n == len(recs) - 1), role=roles[n],
+                                     frame_count=dump.frame_count, keepout=keepout_artists)
+        y_lane = y + plan.top_h
+        insets.append((ax_in, page.bbox(X_INSET, y_lane, W_INSET, plan.body_h)))
+        badge_slots = [k for g in r.groups for k in g]
+        note_slots = [k for it in plan.items for k in it["slots"]]
+        in_notes = [k for it in plan.items if it["kind"] == "predicted_none" for k in it["slots"]]
+        dd.check_accounting(r, arm, badge_slots, note_slots, numbered, in_notes)
+        y += plan.height + BLOCK_GAP
+    y_axis = y - BLOCK_GAP
 
+    # ---- column a: route panel (fitted to the route), scene note, optional foot
     y_route = TOP_H + HDR_H
-    y_axis = TOP_H + len(recs) * BLOCK_H + (len(recs) - 1) * BLOCK_GAP
-    if exts:
-        y_axis += sum(block_h) - len(recs) * BLOCK_H
-    scene_h = 0.20  # two lines under the map: tier + scene, episode + length
+    scene_h = 0.20
+    ep = dump.episode_id
+    if ep.startswith(f"exp18E_{dump.scene}_"):  # designed routes: "exp18E_<scene>_loop1" -> "loop1"
+        ep = ep[len(f"exp18E_{dump.scene}_"):]
     scene_text = opt.scene_text if opt.scene_text is not None else L["scene"].format(
-        tier=dump.tier_name(lang), scene=dump.scene, ep=dump.episode_id, T=dump.frame_count)
+        tier=dump.tier_name(lang), scene=dump.scene, ep=ep, T=dump.frame_count)
+    scene_text = wrap_text(fig, scene_text, W_ROUTE, FS["note"])
+    scene_h = max(scene_h, 0.095 * (scene_text.count("\n") + 1) + 0.01)
     panel = opt.route_panel
     if opt.route_fit and panel is None:
         panel = FittedRoutePanel(start_text=L["start"])
+    layout: dict = {"windows": [list(p.win) for p in plans], "note_lines": [len(p.note_lines) for p in plans],
+                    "header_lines": [p.hdr_lines for p in plans], "miss_lane": [p.below for p in plans],
+                    "label_panel": "gutter"}
+    col_a = []  # display boxes of what column a draws (the insets' rim badges keep clear of them)
     if opt.route_fit and hasattr(panel, "height"):
-        # the route panel only as tall as the route needs; column a's rest goes to the foot (or stays blank)
         avail = y_axis + AXIS_H - y_route - scene_h
         foot = opt.route_foot if opt.route_foot is not None and opt.route_foot_h > 0 else None
         foot_min = opt.route_foot_h if foot is not None else 0.0
         h_route = panel.height(fig, dump, W_ROUTE, avail - foot_min)
         ax_route = page.ax(X_ROUTE, y_route, W_ROUTE, h_route)
         panel(ax_route, level, dump, recs, L)
-        page.text(X_ROUTE, y_route + h_route + 0.035, scene_text, ha="left", va="top", fontsize=FS["note"],
-                  color=style.MUTED, linespacing=1.15)
+        t_scene = page.text(X_ROUTE, y_route + h_route + 0.035, scene_text, ha="left", va="top", fontsize=FS["note"],
+                            color=style.MUTED, linespacing=1.15)
+        col_a += [page.bbox(X_ROUTE, y_route, W_ROUTE, h_route), t_scene]
         if foot is not None:
             foot_h = avail - h_route
             foot_max = getattr(foot, "max_h", None)
             if foot_max is not None:
                 foot_h = min(foot_h, foot_max)
             foot(page, X_ROUTE, y_route + h_route + scene_h, W_ROUTE, foot_h)
+            col_a.append(page.bbox(X_ROUTE, y_route + h_route + scene_h, W_ROUTE, foot_h))
             layout["foot_h"] = round(foot_h, 3)
         layout["route_h"] = round(h_route, 3)
+        layout["route_scale_bar_inset_pt"] = getattr(panel, "scale_bar_inset_pt", None)
+        if layout["route_scale_bar_inset_pt"] is not None and layout["route_scale_bar_inset_pt"] < 2.0:
+            warnings.append(f"route scale bar only {layout['route_scale_bar_inset_pt']} pt inside the map")
     else:
         y_bottom = y_axis + AXIS_H - opt.route_foot_h
         ax_route = page.ax(X_ROUTE, y_route, W_ROUTE, y_bottom - scene_h - y_route)
         (panel or draw_route_panel)(ax_route, level, dump, recs, L)
-        page.text(X_ROUTE, y_bottom - scene_h + 0.035, scene_text, ha="left", va="top", fontsize=FS["note"],
-                  color=style.MUTED, linespacing=1.15)
+        t_scene = page.text(X_ROUTE, y_bottom - scene_h + 0.035, scene_text, ha="left", va="top", fontsize=FS["note"],
+                            color=style.MUTED, linespacing=1.15)
+        col_a += [page.bbox(X_ROUTE, y_route, W_ROUTE, y_bottom - y_route)]
         if opt.route_foot is not None and opt.route_foot_h > 0:
             opt.route_foot(page, X_ROUTE, y_bottom, W_ROUTE, opt.route_foot_h)
-    draw_legend(page, y_axis + AXIS_H, arm, L)
+            col_a.append(page.bbox(X_ROUTE, y_bottom, W_ROUTE, opt.route_foot_h))
+
+    # ---- panel b: each disc as large as its rim badges allow beside the row names and column a
+    rend = fig.canvas.get_renderer()
+    keepout = [a if hasattr(a, "x0") else a.get_window_extent(rend) for a in keepout_artists + col_a]
+    fits = []
+    for n, ((ax_in, _), r) in enumerate(zip(insets, recs)):
+        rf, dx, ok = fit_inset(ax_in, r, keepout)
+        fits.append((rf, dx))
+        if not ok:
+            warnings.append(f"K{n + 1}: a rim badge of the local map touches a row name or column a")
+    corner = None
+    if opt.scale_corner == "fixed":
+        clear = [inset_corner_clearance(ax, r, show_arrow=(n == 0), radius_frac=rf)
+                 for n, ((ax, _), r, (rf, _)) in enumerate(zip(insets, recs, fits))]
+        corner, w = _choose_scale_corner_from(clear)
+        warnings += w
+    for n, ((ax_in, bounds), r, (rf, _)) in enumerate(zip(insets, recs, fits)):
+        lvl = dd.topdown_level(dump, float(r.cur_pos[1]), root=topdown_root)
+        draw_inset(ax_in, lvl, dump, r, show_arrow=(n == 0), L=L, split_frame=opt.split_frame,
+                   letters=opt.letters, scale_corner=corner, radius_frac=rf, letter_bounds=bounds)
+    layout["scale_corner"] = corner
+    layout["inset_radius_frac"] = [rf for rf, _ in fits]
+    layout["inset_shift_pt"] = [dx for _, dx in fits]
+    warnings += draw_legend(page, y_axis + AXIS_H, arm, L)
 
     out = Path(out_stem)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1390,17 +1398,21 @@ def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_ro
     plt.close(fig)
     caption = opt.caption if opt.caption is not None else case_caption(
         lang, opt, n=len(recs), tier=dump.tier_name(lang), scene=dump.scene, ep=dump.episode_id)
+    caption = caption.replace("{elev_window}", window_caption([p.win for p in plans], lang))
+    if opt.caption_extra:
+        caption = caption.rstrip() + " " + opt.caption_extra
     cap_path = out.parent / (out.name + "_caption.txt")
     cap_path.write_text(caption + "\n", encoding="utf-8")
     files.append(cap_path)
     stats = []
-    for n, r in enumerate(recs):
-        entry = {"key": f"K{n + 1}", "row": r.index, "frame": r.frame}
+    for n, (r, plan) in enumerate(zip(recs, plans)):
+        entry = {"key": f"K{n + 1}", "row": r.index, "frame": r.frame, "window": list(plan.win),
+                 "misses": [k + 1 for k in r.misses(arm)]}
         for a in list(r.arms) + ["floor"]:
             entry[a] = r.summary(a)
         stats.append(entry)
     return {"files": [str(f) for f in files], "rows": rows, "stats": stats, "size_in": (FIG_W, height),
-            "notes_dropped": list(_DROPPED), "layout": layout}
+            "windows": [list(p.win) for p in plans], "warnings": warnings, "layout": layout, "notes_dropped": []}
 
 
 def main(argv=None) -> int:
@@ -1411,20 +1423,23 @@ def main(argv=None) -> int:
     ap.add_argument("--clip-root", default=None, help="local copy of the clips: <root>/<scene>/<clip>/chunks")
     ap.add_argument("--out", default="case", help="output stem (writes .pdf, .png, _caption.txt)")
     ap.add_argument("--lang", default="en", choices=sorted(LABELS))
-    ap.add_argument("--revised", action="store_true",
-                    help="the revised layout (CaseOptions.revised(): review fixes of 2026-09-24)")
+    ap.add_argument("--title", default=None)
+    ap.add_argument("--title-note", default=None)
+    ap.add_argument("--caption-extra", default=None)
+    ap.add_argument("--revised", action="store_true", help="accepted for compatibility (the layout is always revised)")
     args = ap.parse_args(argv)
     rows = [int(x) for x in args.rows.split(",")] if args.rows else None
     res = make_case_figure(args.dump, rows=rows, topdown_root=args.topdown_root, clip_root_override=args.clip_root,
-                           out_stem=args.out, lang=args.lang,
-                           options=CaseOptions.revised() if args.revised else None)
+                           out_stem=args.out, lang=args.lang, title=args.title, title_note=args.title_note,
+                           caption_extra=args.caption_extra)
     for f in res["files"]:
         print(f)
     for s in res["stats"]:
         print(s)
     print("size_in", tuple(round(v, 3) for v in res["size_in"]))
-    if args.revised:
-        print("layout", res["layout"], "notes_dropped", res["notes_dropped"])
+    print("layout", res["layout"])
+    for w in res["warnings"]:
+        print("warning:", w)
     return 0
 
 

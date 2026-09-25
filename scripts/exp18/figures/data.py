@@ -13,6 +13,20 @@ with everything a figure needs, computed exactly as ``compute_metrics.py`` does:
   (``validate.py``), over GT-visible slots;
 * the constant "always behind" floor: class back, peak (32, 32), never none.
 
+The miss rule every figure uses (orchestrator decision D1): a slot is
+**missed** iff it is GT-visible and fails joint PCK@8 -- 5-way view class wrong
+(``visibility_logits`` with class 0 = none, vs ``gt_view_class``), or the
+per-view argmax (``pred_*_view_peak_yx``) more than 8 px from
+``gt_view_peak_yx`` in the GT view.  These are exactly the fields and the rule
+of ``compute_metrics.py``, so the misses of a row number ``n_visible - hits``
+of its header.  ``CaseRow.misses`` / ``CaseRow.misses_with_peak`` /
+``CaseRow.misses_predicted_none`` split them by what a figure can draw (an x at
+the joint argmax of ``heatmaps_gated``, ``pred_*_gated_argmax``, or a note
+when the prediction says "not visible").  ``row_notes`` groups the slots that
+need a note (no view shows them, or visible but predicted not visible) into
+runs of consecutive slots, and ``check_accounting`` asserts that every valid
+slot of a row ends up with a badge or a note and every miss is numbered.
+
 Designed routes (tier E, ``fig_routes``): ``route_split`` (frame where the
 route turns back), ``route_key_rows`` (the ``select_cases`` pattern rule on one
 dump) and ``front_tally`` (per scored row: past positions in the front view and
@@ -41,6 +55,8 @@ K = 8
 PCK_RADIUS_PX = 8
 DEFAULT_CAMERA_HEIGHT_M = 1.25  # camera above the navmesh in every EXP-18 render
 SAME_SPOT_M = 0.05  # history slots closer than this share one marker ("1–6")
+AT_ROBOT_M = 0.1  # a past position closer than this to the robot: "at the robot" (the previous frame, typically)
+NONE_THRESHOLD = 0.5  # P(not visible) above this: the prediction says "not visible" (no x is drawn)
 
 TIER_NAMES = {
     "A": "training scene",
@@ -220,10 +236,105 @@ class CaseRow:
     def invisible_slots(self) -> List[int]:
         return [int(k) for k in np.nonzero(self.valid & ~self.visible)[0]]
 
+    # ---- the D1 miss rule (see the module doc) --------------------------------
+    def misses(self, arm: str) -> List[int]:
+        """GT-visible slots failing joint PCK@8 (the header's ``n - hits``)."""
+        return [int(k) for k in np.nonzero(self.visible & ~self.arms[arm].joint8)[0]]
+
+    def peak_slots(self, arm: str) -> List[int]:
+        """GT-visible slots whose prediction is drawn as an x: P(not visible) <= 0.5 and a joint argmax."""
+        p = self.arms[arm]
+        return [int(k) for k in np.nonzero(self.visible & (p.none_p <= NONE_THRESHOLD) & (p.peak_view >= 0))[0]]
+
+    def misses_with_peak(self, arm: str) -> List[int]:
+        """Missed slots with an x (numbered on the prediction row)."""
+        drawn = set(self.peak_slots(arm))
+        return [k for k in self.misses(arm) if k in drawn]
+
+    def misses_predicted_none(self, arm: str) -> List[int]:
+        """Missed slots without an x (the model calls them not visible): numbered in a note."""
+        drawn = set(self.peak_slots(arm))
+        return [k for k in self.misses(arm) if k not in drawn]
+
+    def false_positive_slots(self, arm: str) -> List[int]:
+        """Slots no view shows that the prediction still calls visible (P(not visible) <= 0.5).
+
+        Not scored (joint PCK@8 counts GT-visible slots only); their map shows in
+        the prediction row, weighted by the predicted visibility, and their note
+        gives P(not visible)."""
+        p = self.arms[arm]
+        return [k for k in self.invisible_slots() if p.none_p[k] <= NONE_THRESHOLD]
+
 
 def group_label(group: Sequence[int]) -> str:
     """Slot numbers are 1-based in every figure: [0] -> "1", [0..5] -> "1–6"."""
     return str(group[0] + 1) if len(group) == 1 else f"{group[0] + 1}–{group[-1] + 1}"
+
+
+def slot_runs(slots: Sequence[int]) -> List[List[int]]:
+    """Runs of consecutive slot indices: [0, 1, 2, 5] -> [[0, 1, 2], [5]]."""
+    runs: List[List[int]] = []
+    for k in sorted(int(s) for s in slots):
+        if runs and k == runs[-1][-1] + 1:
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    return runs
+
+
+NOTE_KINDS = ("previous", "at_robot", "not_visible", "predicted_none")
+
+
+def row_notes(row: "CaseRow", arm: str) -> List[dict]:
+    """The notes a figure prints for one row, as data: ``{"kind", "slots", "p"}`` per run of consecutive slots.
+
+    kinds (in this order):
+
+    * ``previous``: slot 8 (the previous frame) at the robot (closer than
+      ``AT_ROBOT_M``) -- no view can show it;
+    * ``at_robot``: other past positions at the robot (the robot stood still);
+    * ``not_visible``: no view shows the past position (out of sight);
+    * ``predicted_none``: GT-visible, but the prediction says not visible
+      (P(not visible) > 0.5) -- a miss (D1) without an x, numbered in its note.
+
+    ``p`` = P(not visible) of each slot of the run.  A run of ``at_robot`` that
+    reaches slot 8 absorbs it (one note "6–8 at the robot").
+    """
+    p = row.arms[arm].none_p
+    inv = row.invisible_slots()
+    at = [k for k in inv if row.gt_dist[k] < AT_ROBOT_M]
+    unseen = [k for k in inv if row.gt_dist[k] >= AT_ROBOT_M]
+    out: List[dict] = []
+    for run in slot_runs(at):
+        kind = "previous" if run == [K - 1] else "at_robot"
+        out.append({"kind": kind, "slots": run, "p": [float(p[k]) for k in run]})
+    for run in slot_runs(unseen):
+        out.append({"kind": "not_visible", "slots": run, "p": [float(p[k]) for k in run]})
+    for run in slot_runs(row.misses_predicted_none(arm)):
+        out.append({"kind": "predicted_none", "slots": run, "p": [float(p[k]) for k in run]})
+    return out
+
+
+def check_accounting(row: "CaseRow", arm: str, badge_slots: Sequence[int], note_slots: Sequence[int],
+                     numbered_on_row: Sequence[int], numbered_in_notes: Sequence[int]) -> None:
+    """Raise ``RuntimeError`` unless every valid slot of ``row`` has a badge or a note, and the numbered misses
+    (on the prediction row + in notes) are exactly ``row.misses(arm)`` (= header n - hits), each once."""
+    valid = {int(k) for k in np.nonzero(row.valid)[0]}
+    shown = set(int(k) for k in badge_slots) | set(int(k) for k in note_slots)
+    missing = sorted(valid - shown)
+    numbered = [int(k) for k in numbered_on_row] + [int(k) for k in numbered_in_notes]
+    s = row.summary(arm)
+    problems = []
+    if missing:
+        problems.append(f"slots {[k + 1 for k in missing]} have neither a badge nor a note")
+    if sorted(numbered) != sorted(row.misses(arm)) or len(numbered) != len(set(numbered)):
+        problems.append(f"numbered misses {sorted(k + 1 for k in numbered)} != joint PCK@8 misses "
+                        f"{[k + 1 for k in row.misses(arm)]}")
+    if len(numbered) != s["n"] - s["hits"]:
+        problems.append(f"{len(numbered)} numbered misses, header says {s['n'] - s['hits']} (n {s['n']} - hits "
+                        f"{s['hits']})")
+    if problems:
+        raise RuntimeError(f"frame {row.frame} (row {row.index}): " + "; ".join(problems))
 
 
 def _group_same_spot(pos: np.ndarray, slots: Sequence[int], tol: float = SAME_SPOT_M) -> List[List[int]]:

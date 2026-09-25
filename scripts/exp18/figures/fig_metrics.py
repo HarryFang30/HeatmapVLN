@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """EXP-18 quantitative figure: how accurate the predicted affordance map is, per tier.
 
-Layout (7.0 in wide, about 3.0 in tall, double column; read row by row):
+Layout (7.0 in wide, about 3.5 in tall with five tiers, double column; read row by row):
 
   a  Joint PCK@8 (%) by tier                 b  Bearing error of the predicted peak
-     A Training scenes    ◆--      ●-- 90.5     share   ___-------------             median (°)
-       22 scenes · n=...                        <= x   /|    - - - - -        prediction  always
-     B Held-out scenes    ◆--      ■-- 93.0           / |- -                             behind
-       0    25   50   75   100                      0 |5  15    30    45       ●  A   2.1   14.3
-                                                  miss > 5°                    ■  B   1.8   12.9
+     A Training scenes    ◆--      ●-- 90.5     share   ___●___■___▲___▼___⬟      median (°)
+       22 scenes · n=11,107                     <= x   /    - - - - -                      always
+     B Held-out scenes    ◆--      ■-- 93.0         / - -                  -●-  A  prediction behind
+       ...                                      0 |    15    30    45    -■-  B   2.13  14.3 ...
+       0    25   50   75   100
   c  Joint PCK@8 (%) by the view ...         d  Joint PCK@8 (%) by frames since the past position
-        Front       n  Right     n  Back      n   tier lines (solid, one marker per tier),
-     A  ○ n<100  0.0   ●      82.2  ◆  ●   92.9   always behind (thin dashed grey)
-                  11           991         8,948  1-10  11-20  21-40  41-80  >80
-     B  ■ far   14.5   ...
-  legend: tier key + prediction · always behind · 95% CI · hollow = n < 100
+        Front          n  Right     n  Back      n   one solid orange line per tier (end labels right,
+     A  ○ n<100      0.0  ●       79.9  ◆  ●   92.9   "A n=71" when the last cell is hollow), the
+                      11           991        8,948   always-behind guess as thin dashed grey lines
+     B  ■ far below  14.5 ...                         without markers
+          the rest   166                              1-10  11-20  21-40  41-80  >80
+     E  ⬟ weak spot  26.3 ...
+                     628
+  legend (lines balanced): tier key + prediction | always-behind guess · 95% CI · hollow = n < 100
 
 What is plotted (every number comes from ``compute_metrics.py`` outputs):
 
@@ -23,37 +26,51 @@ What is plotted (every number comes from ``compute_metrics.py`` outputs):
   The prediction is the dump's ``vo`` arm = the deployed model's output.
 * b  cumulative distribution of the bearing error of the predicted peak over
   the tier's GT-visible past positions (``slots.parquet``,
-  ``pred_vo_bearing_err``; an undefined error counts as a miss at every x, as
-  in ``bearing_err_le15_share``), x from 0 to 45 deg (ticks every 15 deg, the
-  pre-registered 15 deg share); a thin reference line at 5 deg, the threshold
-  beyond which the per-episode figures number a predicted peak as a miss.  The
-  medians (``bearing_err_median_deg`` in ``metrics.json``) are where each curve
-  crosses 50 %; they are listed in the table beside the plot, not marked on the
-  curves (the tiers' medians lie within a fraction of a degree of each other).
+  ``pred_vo_bearing_err``; an undefined error would count as a miss at every
+  x, as in ``bearing_err_le15_share``; the final tables have none), x from 0
+  to 45 deg, ticks every 15 deg (the pre-registered 15 deg share).  No
+  reference line: a past position is a miss in every EXP-18 figure iff it
+  fails joint PCK@8, there is no separate angular miss rule.  The medians
+  (``bearing_err_median_deg``) are where each curve crosses 50 %; they are
+  listed only in the key table beside the plot, the prediction's with two
+  decimals as in the ledger (the tiers' medians lie within 2 deg of each other,
+  dots at y = 50 would sit on top of one another).  Each
+  prediction curve wears ONE tier marker, at a staggered x per tier
+  (``CDF_MARK_X``), so the key table's glyph identifies the curve.
 * c  joint PCK@8 split by the GT view of the past position (``strata.gt_view``);
-  each cell prints its value with n under it.  n < 100 cells hollow, grey and
-  flagged "n<100" (ledger: report only, no conclusion).  A cell with n >= 100
-  that lies ``FAR_BELOW_PT`` or more below every other view of its tier is
-  annotated "far below the rest" where the annotation fits.  The
+  each cell prints its value with n under it, right of its 0-100 track.
+  n < 100 cells hollow, grey and flagged "n<100" (ledger: report only, no
+  conclusion).  A cell with n >= 100 that lies ``FAR_BELOW_PT`` or more below
+  every other view of its tier is annotated: "weak spot" (one bold ink line
+  level with its mark) when it also holds at least ``WEAK_SHARE`` of the tier's
+  visible past positions, a common failure rather than a rare one (final data:
+  the front view of E, 26.3 %, n = 628, 12.6 % of E); otherwise "far below / the
+  rest" in grey italics on two lines level with its value and n lines (final
+  data: the front view of B, 14.5 %, n = 166, 0.4 % of B).  The caption names
+  the cells with their shares and, for a weak spot, the view's largest share in
+  the other tiers (front view: at most 0.4 % in A-D).  The front column is
+  wider (``C_EXTRA``) to hold these annotations and the n < 100 flags.  The
   always-behind baseline is 0 outside the back view by construction, so it is
   drawn only in the back column.
 * d  joint PCK@8 by the age of the past position (``strata.age``: frames since
   it was visited; 1-10, 11-20, 21-40, 41-80, >80), or by distance with
   ``panel_d="distance"`` (``strata.distance``: 0-2, 2-5, 5-10, >10 m).  The
   always-behind baseline is one thin dashed grey line per tier without markers
-  (a reference, not a series to identify); hollow n < 100 cells carry their n
-  where the label fits.
+  (a reference, not a series to identify), labelled once.  A hollow n < 100
+  cell carries its n: in the tier's end label when it is the last cell, else
+  beside the marker where the label fits (``warnings`` otherwise).  Bins with
+  no past position of a tier (final data: D beyond 80 frames) are named in the
+  caption.
 
-Why age and not distance in d (A/B preliminary numbers, ``metrics_prelim_AB``):
-over the cells with n >= 100, the prediction's PCK@8 moves by at most 5.4 pt
-across the distance bins (A: 89.3-94.7, B: 91.2-95.4) but by up to 18.4 pt
-across the age bins (B: 93.8 at 21-40 frames down to 75.5 beyond 80 frames),
-and the always-behind baseline spans 50.5 / 53.4 pt across age (A / B; B falls
-from 75.6 to 22.1) against 29.6 / 17.1 pt across distance.  Age therefore shows both where the prediction degrades (the oldest
-positions) and why the baseline is not a fair ceiling (it works only for
-positions just walked away from).  ``stats["family_spread"]`` recomputes this
-comparison on whatever tiers are present, so the choice can be revisited when
-C/D/E land.
+Why age and not distance in d (final tables, cells with n >= 100): the
+prediction's PCK@8 moves by at most 7.4 pt across the distance bins but by up
+to 51.5 pt across the age bins (E: 87.9 at 1-10 frames down to 36.3 beyond 80
+frames; B 18.4 pt, C 15.5 pt), and the always-behind baseline spans 48-63 pt
+across age against 17-30 pt across distance.  Age therefore shows both where
+the prediction degrades (the oldest positions) and why the baseline is not a
+fair ceiling (it works only for positions just walked away from).
+``stats["family_spread"]`` recomputes this comparison on whatever tiers are
+present.
 
 Confidence intervals: a and the medians of b are the ledger's scene-cluster
 bootstrap CIs as stored in ``metrics.json``.  For c and d the figure applies
@@ -62,30 +79,35 @@ the SAME resamples (``SceneBootstrap`` with the tier's stream
 ``metrics.json``) to each cell; the headline PCK@8 CI is recomputed that way
 and must reproduce ``metrics.json`` exactly (``stats["checks"]``).  Cell point
 values must equal ``metrics.json`` strata values, or the figure refuses to draw
-(mismatched files).
+(mismatched files).  Whiskers are one thin dark path with end caps drawn OVER
+the marker, so an interval narrower than the marker still shows as an I-beam.
 
 Figure policy (user decision, 2026-09-24): the figure never shows or mentions
-poses, odometry or the pose-source ablation; the only prediction drawn is the
-deployed model's (the ``vo`` arm).  The GT-pose arm's columns
-(``pred_gt_*``) are never read.  Honesty that remains: the constant "always
-behind" baseline is drawn next to every prediction it applies to; failures
-(e.g. the front view) are shown, not cropped; n < 100 cells are drawn but
-flagged; absent tiers are left out and named in the caption.
+how positions were obtained; the only prediction drawn is the deployed model's
+(the ``vo`` arm).  The other arm's columns are never read.  Honesty that
+remains: the constant always-behind guess is drawn next to every
+prediction it applies to; failures (the front view, the oldest positions of E)
+are shown and annotated, not cropped; n < 100 cells are drawn but flagged;
+absent tiers are left out and named in the caption.
 
-Colour: every coloured mark on this figure is a prediction, so all of them
-are orange, the set-wide prediction colour (blue means ground truth in every
-EXP-18 figure and never appears here).  Tiers are told apart inside the orange
-family by ``TIER_STYLE``: a light-to-dark ramp A -> E (fixed per tier, so a
-tier looks the same whichever tiers are present) plus one marker shape per
-tier (never the diamond, which is the baseline).  Every tier is also labelled
-directly (row labels in a and c, the key table in b, end labels in d), and
-text never wears a tier colour.  Grey = the baseline; dark grey whiskers = CIs,
-drawn over the marker with a white halo so an interval narrower than the
-marker still shows.  ``style.TIER_COLORS`` is not used.
+Colour (orchestrator decision D7): blue means ground truth in every EXP-18
+figure and never appears here; every coloured mark on this figure is a
+prediction, so all of them are in the prediction orange family.  Tiers are told
+apart by row position (a, c), direct labels (row labels in a and c, the key
+table in b, end labels in d) and marker shape; inside the orange family each
+tier also has a fixed shade (``style.TIER_PRED_SHADES``, light A -> dark E)
+and shape (``style.TIER_MARKERS``, except that the filled plus is drawn as a
+pentagon here: ``MARKER_OVERRIDE``).  Text never wears a tier colour.  Grey =
+the baseline; dark grey = CI whiskers.  ``style.TIER_COLORS`` is not used.
+Every marker is drawn with an explicit ``color`` too, so no invisible default
+cycle colour (matplotlib's blue C0) sits in the file.
 
 Coarse intervals: a scene bootstrap over S scenes has only C(2S-1, S) distinct
-resamples (35 for S = 4); tiers with fewer than ``FEW_SCENES`` scenes are named
-in the caption as having coarse intervals.
+resamples (35 for S = 4); tiers with fewer than ``FEW_SCENES`` scenes (final
+data: B) are named in the caption as having coarse intervals.
+
+Chinese text uses full-width （） throughout (figure and caption; orchestrator
+decision D6).
 
 Usage (repo root on PYTHONPATH):
   python -m scripts.exp18.figures.fig_metrics --metrics-dir DIR [--slots FILE] [--panel-d age|distance]
@@ -150,13 +172,13 @@ LABELS: Dict[str, Dict[str, object]] = {
                  "distance": ("0–2", "2–5", "5–10", ">10")},
         "median_head": "median (°)",
         "col_pred": "prediction",
-        "col_base": ("always", "behind"),  # a two-line column head
-        "ref_b": "miss > 5°",
-        "base_short": "always behind",
+        "col_base": ("always-behind", "guess"),  # a two-line column head; only the last line shares its row
+        "base_short": "always-behind guess",
         "far_below": ("far below", "the rest"),
+        "weak_spot": "weak spot",
         "flag_n": "n={n}",
         "legend_pred": "prediction (deployed model), shade and marker = tier",
-        "legend_base": "always behind (constant baseline)",
+        "legend_base": "always-behind guess (constant baseline)",
         "legend_ci": "95% CI, scene bootstrap",
         "legend_flag": "hollow: n < 100, not interpreted",
     },
@@ -174,15 +196,15 @@ LABELS: Dict[str, Dict[str, object]] = {
         "x_b": "方位误差 x（°）",
         "y_b": "占比 ≤ x（%）",
         "x_d": {"age": "历史位置距今帧数", "distance": "到历史位置的距离（m）"},
-        "y_d": "PCK@8 (%)",
+        "y_d": "PCK@8（%）",
         "bins": {"age": ("1–10", "11–20", "21–40", "41–80", ">80"),
                  "distance": ("0–2", "2–5", "5–10", ">10")},
         "median_head": "中位数（°）",
         "col_pred": "预测",
         "col_base": ("恒答", "正后方"),
-        "ref_b": "偏差 > 5°",
         "base_short": "恒答正后方",
         "far_below": ("远低于", "其他视角"),
+        "weak_spot": "明显短板",
         "flag_n": "n={n}",
         "legend_pred": "预测（部署模型），深浅与形状 = 层级",
         "legend_base": "恒答正后方（常数基线）",
@@ -198,43 +220,72 @@ CAPTION = {
         "predicted peak lies within 8 px (of 64) of the ground-truth peak in that view; the denominator is the past "
         "positions visible in some view (n). Orange marks and solid lines: prediction; each tier has its own shade "
         "(light to dark from A to E) and marker shape, and is labelled directly. Grey diamonds and dashed lines: the "
-        "constant 'always behind' baseline, which always answers the back view with its peak at the view centre "
+        "constant always-behind guess, which always answers the back view with its peak at the view centre "
         "(pixel 32, 32) and never 'not visible'. Whiskers: 95% confidence intervals from a scene-cluster bootstrap "
         "({reps} resamples of whole scenes, seed {seed}).{coarse} (a) Joint PCK@8 per tier; the prediction's value is "
         "printed on the right, the baseline's beside its mark. (b) Share of visible past positions whose bearing "
         "error, the angle between the direction of the predicted peak and the true direction of the past position, "
         "is at most x (x up to 45°). Each curve crosses 50% at its median; the medians are listed on the right. The "
-        "thin vertical line marks 5°, beyond which the per-episode figures number a predicted peak as a miss. "
-        "(c) Joint PCK@8 by the view the past position lies in; each cell prints its value with n beneath. The "
-        "baseline scores 0 outside the back view by construction and is drawn only there.{far} (d) {panel_d} The "
-        "baseline is drawn as thin dashed lines without markers. In (c) and (d) the intervals apply each tier's "
-        "bootstrap resamples to the cell. Hollow marks are cells with n < 100 (flagged in (c), labelled with their n "
-        "in (d) where the label fits): their values are reported, not interpreted."
+        "single marker on each prediction curve only identifies its tier. (c) Joint PCK@8 by the view the past "
+        "position lies in; each cell prints its value with n beneath. The baseline scores 0 outside the back view by "
+        "construction and is drawn only there.{far} (d) {panel_d}{nodata} The baseline is drawn as thin dashed lines "
+        "without markers. In (c) and (d) the intervals apply each tier's bootstrap resamples to the cell. Hollow "
+        "marks are cells with n < 100; their values are reported, not interpreted ((c) flags them 'n<100', (d) "
+        "prints their n{where_fits})."
     ),
     "zh": (
         "预测 affordance map（部署模型的输出）在{tiers_text}上的准确率。{missing}joint PCK@8：预测所在视角正确、且预测"
         "峰值与该视角真值峰值相距不超过 8 像素（共 64）时，该历史位置记为正确；分母为在某个视角中可见的历史位置数（n）。"
         "橙色标记与实线：预测；每个层级有各自的深浅（A 到 E 由浅到深）和标记形状，并直接标注。灰色菱形与虚线：常数"
-        "“恒答正后方”基线，即永远判为后视、峰值在视角中心像素 (32, 32)、从不判“不可见”。误差线：以场景为簇的 "
-        "bootstrap 95% 置信区间（整场景重采样 {reps} 次，种子 {seed}）。{coarse}(a) 各层级的 joint PCK@8；预测的数值"
-        "标在右侧，基线的数值标在其标记旁。(b) 方位误差（预测峰值方向与历史位置真实方向的夹角）不超过 x 的可见历史位置"
-        "占比（x 至 45°）。各曲线与 50% 的交点即其中位数，数值列在右侧。细竖线标出 5°：逐集图中偏差超过 5° 的预测峰值"
-        "会被单独编号。(c) 按历史位置所在视角的 joint PCK@8，每格给出数值，其下为 n；基线在后视以外按构造恒为 0，只在"
-        "后视中画出。{far}(d) {panel_d}基线画成不带标记的细虚线。(c)(d) 的区间把各层级的 bootstrap 重采样用于每一格。"
-        "空心标记为 n < 100 的格子（(c) 中标注 n<100，(d) 中放得下时标出其 n）：只报数，不下结论。"
+        "“恒答正后方”基线，即永远判为后视、峰值在视角中心像素（32, 32）、从不判“不可见”。误差线：以场景为簇的 "
+        "bootstrap 95% 置信区间（整场景重采样 {reps} 次，种子 {seed}）。{coarse}（a）各层级的 joint PCK@8；预测的数值"
+        "标在右侧，基线的数值标在其标记旁。（b）方位误差（预测峰值方向与历史位置真实方向的夹角）不超过 x 的可见历史位置"
+        "占比（x 至 45°）。各曲线与 50% 的交点即其中位数，数值列在右侧；每条预测曲线上的单个标记只用于区分层级。"
+        "（c）按历史位置所在视角的 joint PCK@8，每格给出数值，其下为 n；基线在后视以外按构造恒为 0，只在后视中画出。"
+        "{far}（d）{panel_d}{nodata}基线画成不带标记的细虚线。（c）（d）的区间把各层级的 bootstrap 重采样用于每一格。"
+        "空心标记为 n < 100 的格子，只报数，不下结论；（c）中标注“n<100”，（d）中{where_fits}标出其 n。"
     ),
 }
+WHERE_FITS = {"en": " where the label fits", "zh": "放得下时"}
 COARSE_TEXT = {  # tiers with few scenes: their scene bootstrap has few distinct resamples
-    "en": {"one": " Tier {tiers} has only {scenes} scenes, so its intervals are coarse (a bootstrap over {scenes} "
-                  "scenes has only {distinct} distinct resamples).",
-           "many": " Tiers {tiers} have only {scenes} scenes, so their intervals are coarse (a bootstrap over that "
-                   "few scenes has only {distinct} distinct resamples)."},
-    "zh": {"one": "{tiers} 层只有 {scenes} 个场景，其区间较粗（{scenes} 个场景的整场景重采样只有 {distinct} 种不同组合）。",
-           "many": "{tiers} 层分别只有 {scenes} 个场景，其区间较粗（整场景重采样分别只有 {distinct} 种不同组合）。"},
+    "en": {"one": " Tier {tiers}'s intervals come from only {scenes} scene clusters and are coarse (a bootstrap "
+                  "over {scenes} scenes has only {distinct} distinct resamples).",
+           "many": " The intervals of tiers {tiers} come from only {scenes} scene clusters and are coarse (a "
+                   "bootstrap over that few scenes has only {distinct} distinct resamples)."},
+    "zh": {"one": "{tiers} 层的区间只来自 {scenes} 个场景簇，较粗（{scenes} 个场景的整场景重采样只有 {distinct} 种不同"
+                  "组合）。",
+           "many": "{tiers} 层的区间分别只来自 {scenes} 个场景簇，较粗（整场景重采样分别只有 {distinct} 种不同组合）。"},
 }
-FAR_TEXT = {
-    "en": " A cell {pt} or more points below every other view of its tier is marked 'far below the rest'.",
-    "zh": "比同层级其他所有视角都低至少 {pt} 个百分点的格子标注“远低于其他视角”。",
+FAR_TEXT = {  # (c): annotated cells; {weak} / {far}: the cells, each FAR_CELL_TEXT
+    "en": {"both": " Cells {pt} or more points below every other view of their tier are annotated: 'weak spot' when "
+                   "they hold at least {share}% of the tier's visible past positions ({weak}), otherwise 'far below "
+                   "the rest' ({far}).",
+           "weak": " Cells {pt} or more points below every other view of their tier that hold at least {share}% of "
+                   "the tier's visible past positions are marked 'weak spot' ({weak}).",
+           "far": " Cells {pt} or more points below every other view of their tier are marked 'far below the rest' "
+                  "({far})."},
+    "zh": {"both": "比同层级其他所有视角都低至少 {pt} 个百分点的格子加注：占该层可见历史位置至少 {share}% 的标“明显短板”"
+                   "（{weak}），其余标“远低于其他视角”（{far}）。",
+           "weak": "比同层级其他所有视角都低至少 {pt} 个百分点、且占该层可见历史位置至少 {share}% 的格子标“明显短板”"
+                   "（{weak}）。",
+           "far": "比同层级其他所有视角都低至少 {pt} 个百分点的格子标注“远低于其他视角”（{far}）。"},
+}
+FAR_CELL_TEXT = {
+    "en": "{view} view of {t}: {pct}%, n = {n}, {share}% of {t}'s visible past positions",
+    "zh": "{t} 层{view}视：{pct}%，n = {n}，占该层可见历史位置的 {share}%",
+}
+CELL_SEP = {"en": "; ", "zh": "；"}
+WEAK_WHY = {  # why a weak spot matters: the view is common in its tier and rare in every other tier
+    "en": " Past positions in the {view} view{gloss} make up at most {other}% of the visible past positions in "
+          "{others} but {share}% in {t}, which makes the {view} view of {t} the prediction's notable weak spot.",
+    "zh": "落在{view}视{gloss}的历史位置在 {others} 层{each}至多占可见历史位置的 {other}%，在 {t} 层占 {share}%，"
+          "因此 {t} 层{view}视是预测的明显短板。",
+}
+VIEW_GLOSS = {"en": {"front": ", ahead of the robot,"}, "zh": {"front": "（机器人前方）"}}
+NODATA_TEXT = {  # (d): bins a tier has no past position in
+    "en": {"one": " Tier {tiers} has no past position in the {bins} bin.",
+           "many": " Tiers {tiers} have no past position in the {bins} bin."},
+    "zh": {"one": "{tiers} 层没有落在“{bins}”一格的历史位置。", "many": "{tiers} 层没有落在“{bins}”一格的历史位置。"},
 }
 PANEL_D_TEXT = {
     "en": {"age": "Joint PCK@8 by frames elapsed since the past position was visited (the 8 past positions are "
@@ -247,7 +298,7 @@ TIERS_TEXT = {
     "en": {"A": "training scenes (A)", "B": "held-out scenes (B)", "C": "unseen scenes (C)",
            "D": "a second dataset, HM3D (D)", "E": "designed out-and-back and loop routes (E)"},
     "zh": {"A": "训练场景（A）", "B": "留出场景（B）", "C": "未见场景（C）", "D": "跨数据集 HM3D（D）",
-           "E": "设计路线（去而复返、绕圈，E）"},
+           "E": "设计路线（去而复返、绕圈；E）"},
 }
 MISSING_TEXT = {  # absent tiers, by why they are absent
     "en": {"not dumped": " Tier{s} {tiers} not shown: no results yet.",
@@ -260,7 +311,8 @@ MISSING_TEXT = {  # absent tiers, by why they are absent
 # Geometry of the page (inches, from the top-left corner)
 # --------------------------------------------------------------------------- #
 FIG_W = style.WIDTH_DOUBLE  # 7.0
-L_W = 3.40  # left column: a above c (both one row per tier)
+PAD_L = 0.02  # panel and tier letters keep this far from the page's left edge (their ink would touch it at 0)
+L_W = 3.52  # left column: a above c (both one row per tier)
 R_X = 3.70  # right column: b above d (line charts)
 TITLE_H = 0.20
 AXIS_H = 0.19  # tick labels under the dot panels
@@ -268,13 +320,17 @@ HDR_C = 0.14  # view names over the columns of c
 ROW_GAP = 0.10  # between the top and bottom rows
 LEGEND_ROW_H = 0.19  # one legend line (the legend wraps onto a second line when it does not fit)
 PITCH_MIN, PITCH_MAX = 0.18, 0.50  # tier row pitch in a and c (rows fill the panel height)
+PITCH_C_MIN = 0.235  # c: each cell prints two lines (value over n), so its rows need more room than a's
 PLOT_MIN_H = 0.82  # line charts b, d: plot height at least this
 LINE_BOTTOM = 0.31  # tick labels + axis label under b, d
 A_TRK_X, A_TRK_W = 1.13, 1.80  # a: value axis
-C_X0 = 0.20  # c: first view column (tier letters left of it)
-C_COL_GAP = 0.12
+C_X0 = 0.17  # c: first view column (tier letters left of it)
+C_COL_GAP = 0.085
+C_EXTRA = {geo.FRONT: 0.16}  # c: extra width of a view column (in): the front column carries the n < 100 flags
+# and the "far below the rest" / "weak spot" annotations, the other columns only a dot and its interval
 C_N_W = 0.25  # c: text column right of each track (value over n)
 C_TXT_GAP = 0.03  # c: between a track and its text column
+C_LINE_DY = (-3.3, 3.6)  # c: the value line and the n line, points above / below the row's centre
 LINE_X = R_X + 0.40  # b, d: left edge of the plot (y tick labels + y label left of it)
 LINE_W = 1.90  # b, d: plot width; the gutter right of it holds b's table and d's end labels
 FS = {"letter": 7.6, "title": 6.8, "label": 6.4, "sub": 5.7, "tick": 5.9, "value": 6.2, "small": 5.7,
@@ -288,33 +344,34 @@ CAP_PT = 1.4  # half-length of a CI end cap
 LINE_LW = 1.15
 BASE_LW_D = 0.75  # d: the baseline's thin dashed lines
 BASE_DASH = (0, (3.2, 1.8))
-REF_DEG = 5.0  # b: reference line at the per-episode figures' numbered-miss threshold
-FAR_BELOW_PT = 25.0  # c: annotate a cell this far below every other view of its tier
+CDF_MARK_X = {"A": 18.0, "B": 24.0, "C": 30.0, "D": 36.0, "E": 42.0}  # b: where each curve wears its tier
+# marker (staggered, so the markers of curves that run close together never overlap)
+FAR_BELOW_PT = 25.0  # c: annotate a cell this far below every other view of its tier ...
+WEAK_SHARE = 0.05  # ... as the tier's "weak spot" when it also holds at least this share of the tier's visible
+# past positions (a common failure, not a rare one); otherwise as "far below the rest"
 FEW_SCENES = 10  # tiers with fewer scenes get the "coarse intervals" caption sentence
 
 # Tier identity inside the prediction's orange family (every coloured mark here is a prediction; blue means
-# ground truth across the EXP-18 figure set and never appears on this figure).  Shades: a light-to-dark ramp
-# in the hue of style.HEAT_CMAP_OPAQUE (the predicted affordance map), CIELAB L* 75 / 60 / 48 / 33 / 21, fixed
-# per tier; shapes: one per tier, never the diamond (the baseline).  (shade, marker, size factor) — the factor
-# evens out the visual size of the shapes.
-TIER_STYLE = {
-    "A": ("#f4a57c", "o", 1.00),
-    "B": ("#eb6834", "s", 0.88),
-    "C": ("#c24a17", "^", 1.10),
-    "D": ("#8f2c08", "v", 1.10),
-    "E": ("#5e1c05", "p", 1.06),
-}
+# ground truth across the EXP-18 figure set and never appears on this figure).  The shades and shapes are the
+# set-wide ones in ``style`` (``TIER_PRED_SHADES``: a light-to-dark orange ramp A -> E, fixed per tier;
+# ``TIER_MARKERS``: one shape per tier, never the diamond, which is the baseline).  The factor below only evens
+# out the visual size of the shapes.
+MARKER_SIZE_FACTOR = {"o": 1.00, "s": 0.88, "^": 1.10, "v": 1.10, "P": 1.00, "p": 1.06}
+# A filled plus ("P") reads as a crosshair once a CI whisker crosses it at this size (panels a, d), so this
+# figure draws it as a pentagon; the other shapes are style's.
+MARKER_OVERRIDE = {"P": "p"}
 
 
 def tier_color(t: str) -> str:
     """The tier's shade of prediction orange (never blue: blue is ground truth in every EXP-18 figure)."""
-    return TIER_STYLE.get(t, ("#eb6834", "o", 1.0))[0]
+    return style.TIER_PRED_SHADES.get(t, style.PRED_COLOR)
 
 
 def tier_marker(t: str) -> Tuple[str, float]:
     """(matplotlib marker, size factor) of the tier."""
-    _, m, f = TIER_STYLE.get(t, ("#eb6834", "o", 1.0))
-    return m, f
+    m = style.TIER_MARKERS.get(t, "o")
+    m = MARKER_OVERRIDE.get(m, m)
+    return m, MARKER_SIZE_FACTOR.get(m, 1.0)
 
 
 def distinct_resamples(n_scenes: int) -> int:
@@ -331,7 +388,7 @@ def load_metrics(metrics_dir) -> dict:
 
 
 def load_slots(metrics_dir, path=None, columns: Sequence[str] = SLOT_COLUMNS) -> pd.DataFrame:
-    """The columns of ``slots.parquet`` (or ``.csv.gz``) the figure needs; never the GT-pose arm's."""
+    """The columns of ``slots.parquet`` (or ``.csv.gz``) the figure needs; never the other arm's."""
     d = Path(metrics_dir)
     candidates = [Path(path)] if path else [d / "slots.parquet", d / "slots.csv.gz"]
     for c in candidates:
@@ -522,9 +579,10 @@ def tier_mark(ax, x, y, t: str, hollow: bool = False, scale: float = 1.0, zorder
     m, f = tier_marker(t)
     ms = DOT_MS * f * scale
     if hollow:
-        return ax.plot([x], [y], m, ms=ms - 0.4, mfc="white", mec=style.MUTED, mew=0.8, zorder=zorder,
-                       clip_on=False, **kw)
-    return ax.plot([x], [y], m, ms=ms, mfc=tier_color(t), mec="white", mew=0.6, zorder=zorder, clip_on=False, **kw)
+        return ax.plot([x], [y], m, color=style.MUTED, ms=ms - 0.4, mfc="white", mec=style.MUTED, mew=0.8,
+                       zorder=zorder, clip_on=False, **kw)
+    return ax.plot([x], [y], m, color=tier_color(t), ms=ms, mfc=tier_color(t), mec="white", mew=0.6, zorder=zorder,
+                   clip_on=False, **kw)
 
 
 def mark_radius_pt(t: str, scale: float = 1.0) -> float:
@@ -534,16 +592,18 @@ def mark_radius_pt(t: str, scale: float = 1.0) -> float:
 def dot(ax, x, y, color, hollow: bool = False, ms: float = DOT_MS, zorder: float = 5, **kw):
     """A plain circle (legend glyphs)."""
     if hollow:
-        return ax.plot([x], [y], "o", ms=ms - 0.4, mfc="white", mec=style.MUTED, mew=0.8, zorder=zorder,
-                       clip_on=False, **kw)
-    return ax.plot([x], [y], "o", ms=ms, mfc=color, mec="white", mew=0.6, zorder=zorder, clip_on=False, **kw)
+        return ax.plot([x], [y], "o", color=style.MUTED, ms=ms - 0.4, mfc="white", mec=style.MUTED, mew=0.8,
+                       zorder=zorder, clip_on=False, **kw)
+    return ax.plot([x], [y], "o", color=color, ms=ms, mfc=color, mec="white", mew=0.6, zorder=zorder, clip_on=False,
+                   **kw)
 
 
 def diamond(ax, x, y, hollow: bool = False, ms: float = DIA_MS, zorder: float = 4, **kw):
     if hollow:
-        return ax.plot([x], [y], "D", ms=ms - 0.4, mfc="white", mec=style.MUTED, mew=0.7, zorder=zorder,
-                       clip_on=False, **kw)
-    return ax.plot([x], [y], "D", ms=ms, mfc=style.MUTED, mec="white", mew=0.5, zorder=zorder, clip_on=False, **kw)
+        return ax.plot([x], [y], "D", color=style.MUTED, ms=ms - 0.4, mfc="white", mec=style.MUTED, mew=0.7,
+                       zorder=zorder, clip_on=False, **kw)
+    return ax.plot([x], [y], "D", color=style.MUTED, ms=ms, mfc=style.MUTED, mec="white", mew=0.5, zorder=zorder,
+                   clip_on=False, **kw)
 
 
 def whisker(ax, lo, hi, y, color, lw: float = CI_LW, horizontal: bool = True, zorder: float = 7,
@@ -606,7 +666,7 @@ def draw_panel_a(page: Page, y_top: float, h: float, data: dict, L: dict) -> Non
     n = len(tiers)
     rows_h = h - TITLE_H - AXIS_H
     pitch = min(PITCH_MAX, rows_h / max(n, 1))
-    panel_title(page, 0.0, y_top + 0.13, "a", L["title_a"])
+    panel_title(page, PAD_L, y_top + 0.13, "a", L["title_a"])
     ax = page.ax(A_TRK_X, y_top + TITLE_H, A_TRK_W, rows_h)
     ax.set_xlim(0, 100)
     row_axes_limits(ax, n, rows_h, pitch)
@@ -634,7 +694,7 @@ def draw_panel_a(page: Page, y_top: float, h: float, data: dict, L: dict) -> Non
                 clip_on=False)
         # tier label left of the axis: bold letter, name, and "scenes · n" under it
         y_mid = y_top + TITLE_H + rows_h / 2 + (i - (n - 1) / 2) * pitch
-        page.text(0.0, y_mid - 0.034, t, ha="left", va="center", fontsize=FS["label"] + 0.4, fontweight="bold",
+        page.text(PAD_L, y_mid - 0.034, t, ha="left", va="center", fontsize=FS["label"] + 0.4, fontweight="bold",
                   color=style.INK)
         page.text(0.13, y_mid - 0.034, L["tiers"][t], ha="left", va="center", fontsize=FS["label"], color=style.INK)
         page.text(0.13, y_mid + 0.053, L["tier_sub"].format(s=d["n_scenes"], n=fmt_n(d["n"])), ha="left",
@@ -650,25 +710,41 @@ def _far_below(tier_views: Dict[str, dict], name: str) -> bool:
     return bool(others) and 100 * (min(others) - c["pred"]) >= FAR_BELOW_PT
 
 
+def _weak_spot(d: dict, name: str) -> bool:
+    """A far-below cell that is not rare: it holds at least WEAK_SHARE of the tier's visible past positions."""
+    return _far_below(d["view"], name) and d["view"][name]["n"] >= WEAK_SHARE * max(d["n"], 1)
+
+
+def column_widths() -> List[float]:
+    """Widths (in) of the four view columns of c: equal, plus ``C_EXTRA`` for the annotated front column."""
+    base = (L_W - C_X0 - 3 * C_COL_GAP - sum(C_EXTRA.values())) / 4.0
+    return [base + C_EXTRA.get(v, 0.0) for v in range(len(geo.VIEW_NAMES))]
+
+
 def draw_panel_c(page: Page, y_top: float, h: float, data: dict, L: dict, notes: dict) -> None:
     tiers = data["tiers"]
     n = len(tiers)
     fig = page.fig
     rows_h = h - TITLE_H - HDR_C - AXIS_H
     pitch = min(PITCH_MAX, rows_h / max(n, 1))
-    panel_title(page, 0.0, y_top + 0.13, "c", L["title_c"])
-    col_w = (L_W - C_X0 - 3 * C_COL_GAP) / 4.0
-    trk_w = col_w - C_N_W - C_TXT_GAP
+    panel_title(page, PAD_L, y_top + 0.13, "c", L["title_c"])
+    col_ws = column_widths()
     y_rows = y_top + TITLE_H + HDR_C
     for i, t in enumerate(tiers):
         y_mid = y_rows + rows_h / 2 + (i - (n - 1) / 2) * pitch
-        page.text(0.0, y_mid, t, ha="left", va="center", fontsize=FS["label"] + 0.4, fontweight="bold",
+        page.text(PAD_L, y_mid, t, ha="left", va="center", fontsize=FS["label"] + 0.4, fontweight="bold",
                   color=style.INK)
     fs_far = FS["small"] - 0.2
     far_lines = L["far_below"]
-    far_w = max(cd.text_width_pt(fig, s, fs_far, fontstyle="italic") for s in far_lines)
+    far_w = [cd.text_width_pt(fig, s, fs_far, fontstyle="italic") for s in far_lines]
+    weak_txt = L["weak_spot"]
+    weak_fx = cd.bold_effects(weak_txt, style.INK)  # zh: stroke bold (the CJK font has no bold face)
+    weak_kw = {} if weak_fx else {"fontweight": "bold"}
+    weak_w = cd.text_width_pt(fig, weak_txt, FS["small"], **weak_kw) + (0.45 if weak_fx else 0.0)
     for v, name in enumerate(geo.VIEW_NAMES):
-        x0 = C_X0 + v * (col_w + C_COL_GAP)
+        col_w = col_ws[v]
+        trk_w = col_w - C_N_W - C_TXT_GAP
+        x0 = C_X0 + sum(col_ws[:v]) + v * C_COL_GAP
         page.text(x0 + trk_w / 2, y_rows - 0.06, L["views"][v], ha="center", va="baseline", fontsize=FS["label"],
                   color=style.INK)
         page.text(x0 + col_w, y_rows - 0.06, L["n_head"], ha="right", va="baseline", fontsize=FS["sub"],
@@ -693,9 +769,9 @@ def draw_panel_c(page: Page, y_top: float, h: float, data: dict, L: dict, notes:
             c = views[name]
             # text column: the value (ink) over n (grey); both grey for an n < 100 cell
             val = fmt_pct(c["pred"])
-            ax.text(x_txt, i - 3.3 / py, val, ha="right", va="center", fontsize=FS["value"],
+            ax.text(x_txt, i + C_LINE_DY[0] / py, val, ha="right", va="center", fontsize=FS["value"],
                     color=style.INK if c["allowed"] else style.MUTED, clip_on=False)
-            ax.text(x_txt, i + 3.6 / py, fmt_n(c["n"]), ha="right", va="center", fontsize=FS["small"],
+            ax.text(x_txt, i + C_LINE_DY[1] / py, fmt_n(c["n"]), ha="right", va="center", fontsize=FS["small"],
                     color=style.INK_2 if c["allowed"] else style.MUTED, clip_on=False)
             if c["pred"] is None:
                 continue
@@ -712,15 +788,25 @@ def draw_panel_c(page: Page, y_top: float, h: float, data: dict, L: dict, notes:
                 ax.text(xf, i, L["flag"], ha="left" if right else "right", va="center", fontsize=FS["small"],
                         color=style.MUTED, fontstyle="italic", clip_on=False)
             if _far_below(views, name):
-                # "far below the other views", right of the cell's whisker, left of the text column, if it fits
+                # right of the cell's whisker, ending before the text column: a "weak spot" (not rare) gets
+                # one bold ink line level with its mark; any other far-below cell "far below / the rest" in
+                # grey italics on two lines level with the value and n lines
                 start = 100 * max(v_ for v_ in (c["pred"], c["hi"]) if v_ is not None)
                 start_pt = start * px + max(CAP_PT + 1.0, mark_radius_pt(t, C_SCALE)) + 2.0
-                txt_w = max(cd.text_width_pt(fig, val, FS["value"]), cd.text_width_pt(fig, fmt_n(c["n"]), FS["small"]))
-                end_pt = x_txt * px - txt_w - 2.5
+                ends = (x_txt * px - cd.text_width_pt(fig, val, FS["value"]) - 2.5,
+                        x_txt * px - cd.text_width_pt(fig, fmt_n(c["n"]), FS["small"]) - 2.5)
                 key = f"{t}:{name}"
-                if start_pt + far_w <= end_pt:
-                    ax.text(start_pt / px, i, "\n".join(far_lines), ha="left", va="center", fontsize=fs_far,
-                            color=style.INK_2, fontstyle="italic", linespacing=1.0, clip_on=False)
+                if _weak_spot(data["per_tier"][t], name):
+                    if start_pt + weak_w <= min(ends):
+                        ax.text(start_pt / px, i, weak_txt, ha="left", va="center", fontsize=FS["small"],
+                                color=style.INK, clip_on=False, path_effects=weak_fx, **weak_kw)
+                        notes["weak_spot_drawn"].append(key)
+                    else:
+                        notes["weak_spot_not_drawn"].append(key)
+                elif all(start_pt + w <= e for w, e in zip(far_w, ends)):
+                    for s, dy in zip(far_lines, C_LINE_DY):
+                        ax.text(start_pt / px, i + dy / py, s, ha="left", va="center", fontsize=fs_far,
+                                color=style.INK_2, fontstyle="italic", clip_on=False)
                     notes["far_below_drawn"].append(key)
                 else:
                     notes["far_below_not_drawn"].append(key)
@@ -744,12 +830,8 @@ def draw_panel_b(page: Page, y_top: float, h: float, data: dict, L: dict) -> Non
     ax.set_ylabel(L["y_b"], fontsize=FS["small"], color=style.INK_2, labelpad=2.0)
     x = np.linspace(0.0, CDF_MAX_DEG, 1801)
     base_curves = []
-    # the numbered-miss threshold of the per-episode figures: a thin labelled reference line
-    ax.axvline(REF_DEG, color=style.INK_2, lw=0.5, zorder=1.5)
     px = pts_per_unit(ax, "x")
     py = pts_per_unit(ax, "y")
-    ax.text(REF_DEG + 2.0 / px, 3.0 / py, L["ref_b"], ha="left", va="bottom", fontsize=FS["small"],
-            color=style.INK_2, path_effects=cd.HALO_THIN, zorder=7)
     for t in data["tiers"]:  # all baselines first (under every prediction curve), then the predictions A -> E
         e = data["per_tier"][t]["base_err_sorted"]
         if e.size:
@@ -761,6 +843,11 @@ def draw_panel_b(page: Page, y_top: float, h: float, data: dict, L: dict) -> Non
         if e.size:
             y = 100.0 * np.searchsorted(e, x, side="right") / e.size
             ax.plot(x, y, color=tier_color(t), lw=LINE_LW, zorder=3, solid_joinstyle="round")
+            # one tier marker on the curve (the key table on the right pairs it with the tier letter); the
+            # markers sit at staggered x so curves that run close together keep their markers apart
+            xm = CDF_MARK_X.get(t, CDF_MAX_DEG - 3.0)
+            ym = 100.0 * np.searchsorted(e, xm, side="right") / e.size
+            tier_mark(ax, xm, ym, t, zorder=4)
     # direct label for the dashed group: right-aligned near the axis end, under the lowest curve over its span
     if base_curves:
         x1 = CDF_MAX_DEG - 1.0
@@ -775,7 +862,7 @@ def draw_panel_b(page: Page, y_top: float, h: float, data: dict, L: dict) -> Non
 def draw_median_table(page: Page, y_top: float, plot_h: float, data: dict, L: dict) -> None:
     """Key table right of b: tier (its line, marker, letter) | prediction median | always-behind median (deg)."""
     fig = page.fig
-    x0 = LINE_X + LINE_W + 0.12
+    x0 = LINE_X + LINE_W + 0.10
     w = FIG_W - x0
     tiers = data["tiers"]
     heads = list(L["col_base"])
@@ -787,9 +874,11 @@ def draw_median_table(page: Page, y_top: float, plot_h: float, data: dict, L: di
     ax.axis("off")
     lh = line_h * 72.0
     y = (plot_h * 72.0 - n_lines * lh) / 2 + 0.5 * lh
-    col_base = w * 72.0 - 1.0
+    col_base = w * 72.0 - 3.0  # keep the last column off the page edge
     wv = cd.text_width_pt(fig, "99.9", FS["value"])
-    base_head_w = max(cd.text_width_pt(fig, s, FS["small"]) for s in heads)
+    # the last head line shares its row with the prediction's head; the lines above it stand alone and may
+    # reach further left
+    base_head_w = cd.text_width_pt(fig, heads[-1], FS["small"])
     col_pred = col_base - max(base_head_w, wv) - 5.0
     pred_head_w = cd.text_width_pt(fig, L["col_pred"], FS["small"])
     span_l = min(col_pred - pred_head_w, col_pred - wv)
@@ -804,12 +893,15 @@ def draw_median_table(page: Page, y_top: float, plot_h: float, data: dict, L: di
     for t in tiers:
         y += lh
         d = data["per_tier"][t]
-        ax.plot([1.0, 11.0], [y, y], color=tier_color(t), lw=LINE_LW + 0.2, solid_capstyle="butt")
-        tier_mark(ax, 6.0, y, t)
-        ax.text(14.0, y, t, ha="left", va="center", fontsize=FS["value"], fontweight="bold", color=style.INK)
+        # the key: a solid stretch of the tier's curve wearing its marker (long enough not to read as dashed)
+        ax.plot([0.5, 12.5], [y, y], color=tier_color(t), lw=LINE_LW + 0.2, solid_capstyle="butt")
+        tier_mark(ax, 6.5, y, t)
+        ax.text(14.5, y, t, ha="left", va="center", fontsize=FS["value"], fontweight="bold", color=style.INK)
         mv = d["median"][0]
         bv = d["base_median"][0]
-        ax.text(col_pred, y, "—" if mv is None else f"{mv:.1f}", ha="right", va="center", fontsize=FS["value"],
+        # the prediction's medians with two decimals, as in the ledger (they differ by tenths of a degree;
+        # one decimal would print C's 2.2486 as 2.2 next to the ledger's 2.25)
+        ax.text(col_pred, y, "—" if mv is None else f"{mv:.2f}", ha="right", va="center", fontsize=FS["value"],
                 color=style.INK)
         ax.text(col_base, y, "—" if bv is None else f"{bv:.1f}", ha="right", va="center", fontsize=FS["value"],
                 color=style.INK_2)
@@ -950,7 +1042,7 @@ def draw_panel_d(page: Page, y_top: float, h: float, data: dict, L: dict, notes:
             ax.plot([xa, xb], [ya, yb], color=col, lw=LINE_LW * (0.75 if faded else 1.0),
                     alpha=0.5 if faded else 1.0, zorder=3, solid_capstyle="round")
             obst.segment(xa, ya, xb, yb)
-        for xb, _, c in pts:
+        for k, (xb, _, c) in enumerate(pts):
             yb = 100 * c["pred"]
             if c["allowed"]:
                 tier_mark(ax, xb, yb, t, zorder=6)
@@ -959,20 +1051,22 @@ def draw_panel_d(page: Page, y_top: float, h: float, data: dict, L: dict, notes:
                     obst.segment(xb, 100 * c["lo"], xb, 100 * c["hi"], r_pt=CAP_PT + 0.4)
             else:
                 tier_mark(ax, xb, yb, t, hollow=True, zorder=6)
-                flags.append((xb, yb, c["n"], t))
+                if k < len(pts) - 1:  # the last point's n goes into the tier's end label instead
+                    flags.append((xb, yb, c["n"], t))
             obst.point(xb, yb, mark_radius_pt(t))
         if pts:
-            ends.append((pts[-1][0], 100 * pts[-1][2]["pred"], t))
+            last = pts[-1][2]
+            ends.append((pts[-1][0], 100 * last["pred"], t, None if last["allowed"] else last["n"]))
     # end labels right of the plot, dodged vertically, thin leaders from each series' last point
     x_lab = nb - 0.55 + 0.08
-    items = [(x, y, t) for x, y, t in ends]
+    items = list(ends)
     if base_ends:
-        items.append((max(x for x, _ in base_ends), float(np.mean([y for _, y in base_ends])), None))
+        items.append((max(x for x, _ in base_ends), float(np.mean([y for _, y in base_ends])), None, None))
     if items:
-        heights = [FS["value"] + 1.2 if t else FS["small"] + 1.2 for _, _, t in items]
-        placed = cd.dodge_1d([y * py for _, y, _ in items], heights, 0.0, 100 * py, 0.6)
+        heights = [FS["value"] + 1.2 if t else FS["small"] + 1.2 for _, _, t, _ in items]
+        placed = cd.dodge_1d([y * py for _, y, _, _ in items], heights, 0.0, 100 * py, 0.6)
         dx_pt = 1.0 / pts_per_unit(ax, "x")
-        for (x, y, t), yp in zip(items, placed):
+        for (x, y, t, n_last), yp in zip(items, placed):
             yp /= py
             if abs(yp - y) > 0.5 / py:
                 ax.plot([x + 3.2 * dx_pt, x_lab - 1.5 * dx_pt], [y, yp], color=style.AXIS, lw=0.5, clip_on=False,
@@ -980,6 +1074,11 @@ def draw_panel_d(page: Page, y_top: float, h: float, data: dict, L: dict, notes:
             if t:
                 ax.text(x_lab, yp, t, ha="left", va="center", fontsize=FS["value"], fontweight="bold",
                         color=style.INK, clip_on=False)
+                if n_last is not None:  # the tier's last cell is hollow (n < 100): its n beside the letter
+                    w = cd.text_width_pt(page.fig, t, FS["value"], fontweight="bold") + 2.5
+                    ax.text(x_lab + w * dx_pt, yp, L["flag_n"].format(n=fmt_n(n_last)), ha="left", va="center",
+                            fontsize=FS["small"], color=style.MUTED, fontstyle="italic", clip_on=False)
+                    notes["flags_d_drawn"].append(f"{t}:{n_last}")
             else:
                 ax.text(x_lab, yp, L["base_short"], ha="left", va="center", fontsize=FS["small"],
                         color=style.INK_2, clip_on=False)
@@ -996,6 +1095,7 @@ def draw_panel_d(page: Page, y_top: float, h: float, data: dict, L: dict, notes:
 # --------------------------------------------------------------------------- #
 LEG_INNER = 3.0  # glyph -> text (points)
 LEG_GAP_MIN, LEG_GAP_MAX = 12.0, 22.0  # between entries
+LEG_MARGIN_PT = 14.0  # a legend line keeps at least this far from either page edge
 
 
 def legend_entries(fig, L: dict, tiers: Sequence[str]) -> list:
@@ -1032,18 +1132,26 @@ def legend_entries(fig, L: dict, tiers: Sequence[str]) -> list:
 
 
 def legend_rows(entries: list, width_pt: float) -> List[list]:
-    """Greedy line breaking: as many entries per line as fit at the minimum gap."""
-    rows, cur, used = [], [], 0.0
-    for e in entries:
-        w = e[1] + LEG_INNER + e[3]
-        if cur and used + LEG_GAP_MIN + w > width_pt:
-            rows.append(cur)
-            cur, used = [], 0.0
-        used += (LEG_GAP_MIN if cur else 0.0) + w
-        cur.append(e)
-    if cur:
-        rows.append(cur)
-    return rows
+    """The fewest lines that fit (entries kept in order, at least the minimum gap between them); among the
+    splits into that many lines, the one whose longest line is shortest (no lone entry on a second line when a
+    balanced split fits)."""
+    from itertools import combinations
+
+    def line_w(group) -> float:
+        return sum(e[1] + LEG_INNER + e[3] for e in group) + LEG_GAP_MIN * (len(group) - 1)
+
+    n = len(entries)
+    for k in range(1, n + 1):
+        best = None
+        for cuts in combinations(range(1, n), k - 1):
+            bounds = (0,) + cuts + (n,)
+            groups = [entries[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+            widest = max(line_w(g) for g in groups)
+            if widest <= width_pt and (best is None or widest < best[0]):
+                best = (widest, groups)
+        if best is not None:
+            return best[1]
+    return [[e] for e in entries]
 
 
 def draw_legend(page: Page, y_top: float, rows: List[list]) -> None:
@@ -1057,7 +1165,7 @@ def draw_legend(page: Page, y_top: float, rows: List[list]) -> None:
     for r, row in enumerate(rows):
         y = (r + 0.55) * LEGEND_ROW_H * 72.0
         total = sum(gw + LEG_INNER + tw for _, gw, _, tw in row)
-        gap = min(LEG_GAP_MAX, (w_pt - 4.0 - total) / (len(row) - 1)) if len(row) > 1 else 0.0
+        gap = min(LEG_GAP_MAX, (w_pt - 2 * LEG_MARGIN_PT - total) / (len(row) - 1)) if len(row) > 1 else 0.0
         x = (w_pt - (total + gap * (len(row) - 1))) / 2.0
         for draw, gw, text, tw in row:
             draw(ax, x, y)
@@ -1073,7 +1181,7 @@ def layout_heights(n_tiers: int, legend_lines: int = 1) -> Tuple[float, float, f
     n = max(n_tiers, 1)
     line_min = TITLE_H + PLOT_MIN_H + LINE_BOTTOM
     top = max(TITLE_H + n * PITCH_MIN + AXIS_H, line_min)
-    bottom = max(TITLE_H + HDR_C + n * PITCH_MIN + AXIS_H, line_min)
+    bottom = max(TITLE_H + HDR_C + n * PITCH_C_MIN + AXIS_H, line_min)
     return top, bottom, top + ROW_GAP + bottom + LEGEND_ROW_H * legend_lines + 0.01
 
 
@@ -1081,6 +1189,23 @@ def _join(items: Sequence[str], lang: str) -> str:
     if lang == "zh":
         return "、".join(items)
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _tier_span(tiers: Sequence[str], lang: str) -> str:
+    """'A–D' for three or more consecutive tiers, else the tiers joined."""
+    idx = [cm.TIER_ORDER.index(t) for t in tiers]
+    if len(idx) >= 3 and idx == list(range(idx[0], idx[0] + len(idx))):
+        return f"{tiers[0]}–{tiers[-1]}"
+    return _join(list(tiers), lang)
+
+
+def _view_name(L: dict, name: str, lang: str) -> str:
+    v = L["views"][geo.VIEW_NAMES.index(name)]
+    return v.lower() if lang == "en" else v
+
+
+def _share(n: int, total: int) -> str:
+    return f"{100.0 * n / max(total, 1):.1f}"
 
 
 def caption_text(data: dict, lang: str, notes: Optional[dict] = None) -> str:
@@ -1091,7 +1216,7 @@ def caption_text(data: dict, lang: str, notes: Optional[dict] = None) -> str:
         absent = [t for t in cm.TIER_ORDER if t not in data["tiers"]
                   and (data["skipped"].get(t, "not dumped") == "not dumped") == (why == "not dumped")]
         if absent:
-            joined = ", ".join(absent) if lang == "en" else "、".join(absent)
+            joined = _join(absent, lang)
             missing += MISSING_TEXT[lang][why].format(s="s" if len(absent) > 1 else "", tiers=joined)
     reps = f"{data['reps']:,}" if lang == "en" else str(data["reps"])
     few = [t for t in data["tiers"] if 0 < data["per_tier"][t]["n_scenes"] < FEW_SCENES]
@@ -1103,11 +1228,42 @@ def caption_text(data: dict, lang: str, notes: Optional[dict] = None) -> str:
         coarse = COARSE_TEXT[lang][form].format(tiers=_join(few, lang), scenes=_join([str(s) for s in scenes], lang),
                                                 distinct=_join([f"{d:,}" if lang == "en" else str(d)
                                                                 for d in distinct], lang))
+    L = LABELS[lang]
     far = ""
-    if notes and notes.get("far_below_drawn"):
-        far = FAR_TEXT[lang].format(pt=f"{FAR_BELOW_PT:g}")
+    if notes and (notes.get("far_below_drawn") or notes.get("weak_spot_drawn")):
+        def cell_text(key: str) -> str:
+            t, name = key.split(":")
+            d = data["per_tier"][t]
+            c = d["view"][name]
+            return FAR_CELL_TEXT[lang].format(view=_view_name(L, name, lang), t=t, pct=fmt_pct(c["pred"]),
+                                              n=fmt_n(c["n"]), share=_share(c["n"], d["n"]))
+
+        weak = CELL_SEP[lang].join(cell_text(k) for k in notes.get("weak_spot_drawn", []))
+        farc = CELL_SEP[lang].join(cell_text(k) for k in notes.get("far_below_drawn", []))
+        form = "both" if weak and farc else "weak" if weak else "far"
+        far = FAR_TEXT[lang][form].format(pt=f"{FAR_BELOW_PT:g}", share=f"{100 * WEAK_SHARE:g}", weak=weak, far=farc)
+        for key in notes.get("weak_spot_drawn", []):
+            t, name = key.split(":")
+            others = [u for u in data["tiers"] if u != t]
+            if not others:
+                continue
+            other = max(data["per_tier"][u]["view"][name]["n"] / max(data["per_tier"][u]["n"], 1) for u in others)
+            d = data["per_tier"][t]
+            far += WEAK_WHY[lang].format(view=_view_name(L, name, lang), gloss=VIEW_GLOSS[lang].get(name, ""),
+                                         other=f"{100.0 * other:.1f}", others=_tier_span(others, lang),
+                                         each="各" if len(others) > 1 else "",
+                                         share=_share(d["view"][name]["n"], d["n"]), t=t)
+    nodata = ""
+    names_d = L["bins"][data["panel_d"]]
+    for b, bin_name in enumerate(names_d):
+        empty = [t for t in data["tiers"] if data["per_tier"][t]["family"][b][1]["n"] == 0]
+        if empty:
+            nodata += NODATA_TEXT[lang]["one" if len(empty) == 1 else "many"].format(tiers=_join(empty, lang),
+                                                                                     bins=bin_name)
+    where_fits = WHERE_FITS[lang] if notes and notes.get("flags_d_not_drawn") else ""
     return CAPTION[lang].format(tiers_text=tiers_text, missing=missing, reps=reps, seed=data["seed"],
-                                panel_d=PANEL_D_TEXT[lang][data["panel_d"]], coarse=coarse, far=far)
+                                panel_d=PANEL_D_TEXT[lang][data["panel_d"]], coarse=coarse, far=far,
+                                nodata=nodata, where_fits=where_fits)
 
 
 def _jsonable(data: dict) -> dict:
@@ -1129,7 +1285,7 @@ def make_metrics_figure(metrics_dir, out_stem="metrics", lang: str = "en", panel
                         reps: Optional[int] = None) -> dict:
     """Render the quantitative figure from a compute_metrics.py output dir.
 
-    Returns {"files": [pdf, png, caption], "stats": {...}, "size_in": (w, h)}.
+    Returns {"files": [pdf, png, caption], "stats": {...}, "size_in": (w, h), "warnings": [...]}.
     ``reps`` overrides the bootstrap size for the c/d cell intervals (default:
     metrics.json's, which also makes the headline CI check exact).
     ``stats["drawn"]`` lists the optional labels that were / were not drawn
@@ -1148,11 +1304,12 @@ def make_metrics_figure(metrics_dir, out_stem="metrics", lang: str = "en", panel
 
     L = LABELS[lang]
     fig = plt.figure(figsize=(FIG_W, 3.0))
-    rows = legend_rows(legend_entries(fig, L, data["tiers"]), FIG_W * 72.0 - 4.0)
+    rows = legend_rows(legend_entries(fig, L, data["tiers"]), FIG_W * 72.0 - 2 * LEG_MARGIN_PT)
     top_h, bot_h, height = layout_heights(len(data["tiers"]), len(rows))
     fig.set_size_inches(FIG_W, height)
     page = Page(fig, FIG_W, height)
-    notes = {"far_below_drawn": [], "far_below_not_drawn": [], "flags_d_drawn": [], "flags_d_not_drawn": []}
+    notes = {"far_below_drawn": [], "far_below_not_drawn": [], "weak_spot_drawn": [], "weak_spot_not_drawn": [],
+             "flags_d_drawn": [], "flags_d_not_drawn": []}
     y_bot = top_h + ROW_GAP
     draw_panel_a(page, 0.0, top_h, data, L)
     draw_panel_b(page, 0.0, top_h, data, L)
@@ -1171,7 +1328,10 @@ def make_metrics_figure(metrics_dir, out_stem="metrics", lang: str = "en", panel
     files.append(cap_path)
     stats = _jsonable(data)
     stats["drawn"] = notes
-    return {"files": [str(f) for f in files], "stats": stats, "size_in": (FIG_W, height)}
+    warnings_ = [f"panel c: no room for the 'far below the rest' label of {k}" for k in notes["far_below_not_drawn"]]
+    warnings_ += [f"panel c: no room for the 'weak spot' label of {k}" for k in notes["weak_spot_not_drawn"]]
+    warnings_ += [f"panel d: no room for the n label of the hollow cell {k}" for k in notes["flags_d_not_drawn"]]
+    return {"files": [str(f) for f in files], "stats": stats, "size_in": (FIG_W, height), "warnings": warnings_}
 
 
 def main(argv=None) -> int:
