@@ -6,10 +6,10 @@ pre-registered picks in ``cases.json`` (``select_cases.py``: the episode whose
 per-episode PCK@8 of the deployed model is the pattern's median; key rows = the
 scored rows just before, at and just after the turnaround, and the final row).
 On R2R routes the past lies behind the robot; on the way back along a designed
-route it moves into the FRONT view, which is rare in training.  The figure
-shows whatever the prediction does there, hit or miss, and the caption states
-the result (panel d's return-leg totals and the tier-E front- vs back-view
-PCK@8 from ``metrics.json``), not only the setup.
+route it moves into the FRONT view, which is rare on the R2R routes of
+training.  The figure shows whatever the prediction does there, hit or miss,
+and the caption states the result (panel d's return-leg totals and the tier-E
+front- vs back-view PCK@8 from ``metrics.json``), not only the setup.
 
 Only tier-E dumps are drawn: ``make_route_figure`` and ``make_route_figures``
 raise on anything else (the development stand-ins of the pre-E builds are
@@ -21,14 +21,15 @@ gutter, D4 one elevation-window rule stated in the caption, D5 notes wrapped,
 never dropped, D6 wording) plus:
 
 * no title: the claim and the result are the caption's first sentences;
-* a  Route (``fig_case.FittedRoutePanel``): cropped to the route plus
-  ``fig_case.ROUTE_PAD_M``, turned by a quarter turn when that shows it
-  larger; the route in two legs split where it turns back, outbound solid
-  and return dashed, each on its own right-hand side, chevrons for the
-  direction of travel, a diamond at the turn (a K position there shows as a
-  dot inside it), an open circle at the start; a legend in the panel names
-  the four; K badges fan out from the route with leaders that never cross;
-  one scale bar, always top left;
+* a  Route (``RoutePanel``: ``fig_case.FittedRoutePanel``, except that key
+  positions sharing a spot are labelled at their own arrow tips): cropped to
+  the route plus ``fig_case.ROUTE_PAD_M``, turned by a quarter turn when
+  that shows it larger; the route in two legs split where it turns back,
+  outbound solid and return dashed, each on its own right-hand side,
+  chevrons for the direction of travel, a diamond at the turn (a K position
+  there shows as a dot inside it), an open circle at the start; a legend in
+  the panel, on a light box, names the four; K badges fan out from the route
+  with leaders that never cross; one scale bar, always top left;
 * b  insets: the route so far in the same two leg styles; the scale bar in
   one corner for every block;
 * block headers name the key position's role ("after the turnaround");
@@ -38,11 +39,15 @@ never dropped, D6 wording) plus:
   two bars side by side with their counts printed: blue = past positions whose
   true direction lies in the front view, orange = how many of them the
   predicted affordance map gets right (joint PCK@8); the return leg is shaded
-  (diamond = the robot reaching the turn) and its totals are printed under the
-  chart, the blue count in ground-truth ink and the orange one in prediction
-  ink;
+  grey (diamond = the robot reaching the turn) and its totals are printed under
+  the chart, the blue count in ground-truth ink and the orange one in
+  prediction ink; the legend names the shading and the diamond separately,
+  the diamond with panel a's name for it;
+* a and the caption name the route as the gallery does ("out-and-back 1",
+  "loop 1": ``ROUTE_NAME``), never by its raw episode id;
 * caption: when key positions share one spot (the robot turns on the spot at
-  the turn, e.g. K2 and K3), it says so.
+  the turn, e.g. K2 and K3), it says so, and how (a) labels their arrows
+  (filled in after drawing, ``arrows_note``).
 
 Figure policy (user decision, 2026-09-24; as ``fig_case``): the figure shows
 the affordance map only and never mentions poses or their sources; the
@@ -78,11 +83,13 @@ from scripts.exp18.figures import common_draw as cd
 from scripts.exp18.figures import data as dd
 from scripts.exp18.figures import fig_case as fc
 from scripts.exp18.figures import style
+from scripts.exp18.topdown.topdown_io import EgoCrop, forward_from_c2w
 
 from matplotlib.patches import Rectangle  # noqa: E402
 
 ARM = fc.ARM  # the deployed model's prediction
-FRONT_SHARE_TRAINING = "0.27%"  # EXP-18 ledger (EXP-11): share of training labels in the front view
+# EXP-11 (ledger, cited by EXP-18): share of the past positions in R2R labels that lie in the front view
+FRONT_SHARE_TRAINING = "0.27%"
 
 # --------------------------------------------------------------------------- #
 # Labels (every string on the figure and in the caption)
@@ -115,14 +122,20 @@ LABELS: Dict[str, Dict[str, object]] = {
         "d_xlabel": "past positions (of 8)",
         "d_leg_front": "in the front view\n(ground truth)",
         "d_leg_hits": "predicted correctly",
-        "d_leg_back": {"out_and_back": "return leg", "loop": "return leg"},
+        "d_leg_back": "return leg",  # the grey shading; the diamond has its own entry, named as in (a) ("turn")
         "d_total_head": "Return leg in total:",
         "d_total_n": "{n} in the front view",
         "d_total_h": "{h} predicted correctly",
         "d_total_0": "Return leg: none in the front view",
-        "same_spot": "At the {turn} the robot turns on the spot, so {keys} share one position. ",
-        "scene_E": "unseen scene {scene}\nroute {short} · {T} frames",
-        "where": "unseen scene {scene}, route {short}",
+        "same_spot": "At the {turn} the robot turns on the spot, so {keys} share one position{arrows}. ",
+        "arrows_all": "; in (a) each of their labels points to the tip of its own arrow",
+        "arrows_tip": {1: "; in (a) the label of {keys} points to the tip of its own arrow",
+                       2: "; in (a) the labels of {keys} point to the tips of their own arrows"},
+        "arrows_dot": {1: ", that of {keys} to the shared dot (its arrow is the remaining one there)",
+                       2: ", those of {keys} to the shared dot (their arrows are the remaining ones there)"},
+        "scene_E": "unseen scene {scene}\n{route} · {T} frames",
+        "where": "unseen scene {scene}, {route}",
+        "route_raw": "route {short}",  # an episode id that is not exp18E_<scene>_<oab|loop><i>
     },
     "zh": {
         "claim": {"out_and_back": "去而复返：回程时部分历史位置来到机器人前方、落在前视里，预测 affordance map {verdict}。",
@@ -147,28 +160,37 @@ LABELS: Dict[str, Dict[str, object]] = {
         "d_xlabel": "历史位置个数（共 8 个）",
         "d_leg_front": "落在前视中（真值）",
         "d_leg_hits": "其中预测正确的",
-        "d_leg_back": {"out_and_back": "回程", "loop": "回程"},
+        "d_leg_back": "回程",
         "d_total_head": "回程合计：",
         "d_total_n": "前视中 {n} 个",
         "d_total_h": "其中预测正确 {h} 个",
         "d_total_0": "回程合计：前视中没有",
-        "same_spot": "机器人在{turn}原地转身，{keys} 位于同一位置。",
-        "scene_E": "未见场景 {scene}\n路线 {short} · {T} 帧",
-        "where": "未见场景 {scene}，路线 {short}",
+        "same_spot": "机器人在{turn}原地转身，{keys} 位于同一位置{arrows}。",
+        "arrows_all": "；(a) 中它们的标签各自指向自己箭头的尖端",
+        "arrows_tip": {1: "；(a) 中 {keys} 的标签指向其箭头的尖端", 2: "；(a) 中 {keys} 的标签各自指向自己箭头的尖端"},
+        "arrows_dot": {1: "，{keys} 的标签指向共同的圆点（其箭头是该处余下的一支）",
+                       2: "，{keys} 的标签指向共同的圆点（它们的箭头是该处余下的几支）"},
+        "scene_E": "未见场景 {scene}\n{route} · {T} 帧",
+        "where": "未见场景 {scene}，{route}",
+        "route_raw": "路线 {short}",
     },
 }
+# A designed route's display name, as the gallery writes it (fig_gallery LABELS "route"): the scene's routes counted
+# from 1, like the frames (episode id exp18E_<scene>_oab0 -> "out-and-back 1"); make_route_figure warns on a mismatch.
+ROUTE_NAME = {"en": {"oab": "out-and-back {i}", "loop": "loop {i}"},
+              "zh": {"oab": "去而复返 {i}", "loop": "绕圈 {i}"}}
 
 _RESULT = {
-    "en": {"main": ("Over the return leg's {rows} scored frames, {n} past positions lie in the front view and {h} of "
-                    "them are predicted correctly (joint PCK@8){out}. "),
-           "out_0": "; on the outbound leg none does",
+    "en": {"main": ("Summed over the return leg's {rows} scored frames (as in d), {n} past positions lie in the front "
+                    "view and {h} of them are predicted correctly (joint PCK@8){out}. "),
+           "out_0": "; on the outbound leg no past position lies in the front view",
            "out_n": "; on the outbound leg: {n} in the front view, {h} predicted correctly",
            "none": ("On this route no past position lies in the front view on the return leg ({rows} scored frames)"
                     "{out}. "),
            "tier": ("Over all {clips} designed routes, {front:.1f}% of past positions in the front view are predicted "
                     "correctly (n = {n_front:,}), against {back:.1f}% in the back view (n = {n_back:,}). ")},
-    "zh": {"main": "回程 {rows} 个评分帧中共有 {n} 个历史位置落在前视，预测正确 {h} 个（joint PCK@8）{out}。",
-           "out_0": "；去程中没有落在前视的",
+    "zh": {"main": "回程 {rows} 个评分帧逐帧累计（同 (d)），共有 {n} 个历史位置落在前视，预测正确 {h} 个（joint PCK@8）{out}。",
+           "out_0": "；去程中没有历史位置落在前视",
            "out_n": "；去程中落在前视的有 {n} 个，预测正确 {h} 个",
            "none": "这条路线的回程（{rows} 个评分帧）中没有落在前视的历史位置{out}。",
            "tier": ("全部 {clips} 条设计路线上，落在前视的历史位置预测正确 {front:.1f}%（n = {n_front}），"
@@ -178,31 +200,32 @@ _SETUP = {
     "en": {
         "out_and_back": ("Predicted affordance maps on a designed out-and-back route ({where}): the robot follows an "
                          "R2R reference path to its end and comes back along it. Past positions in the front view are "
-                         "rare in training ({share} of the past positions in the training labels). Key positions "
-                         "(pre-registered): the scored frames just before, nearest to and just after the turnaround, "
-                         "and the last frame. "
+                         "rare on the R2R routes the model is trained on ({share} of past positions in R2R labels). "
+                         "Key positions (pre-registered): the scored frames just before, nearest to and just after "
+                         "the turnaround, and the last frame. "
                          "(a) Route on the top-down map: outbound leg solid, return leg dashed, each drawn on its own "
                          "right-hand side so the two stay apart where the return retraces the outbound path; chevrons "
                          "give the direction of travel; diamond = turnaround (the end of the reference path), circle "
                          "= start; black dots with arrows = the key positions K1–K4 and the way the robot faces "
                          "there. "),
         "loop": ("Predicted affordance maps on a designed loop ({where}): the robot visits three waypoints on one "
-                 "floor and returns to its start. Past positions in the front view are rare in training ({share} of "
-                 "the past positions in the training labels). Key positions (pre-registered): the scored frames just "
-                 "before, at and just after the point farthest from the start, and the last frame. (a) Route on the "
+                 "floor and returns to its start. Past positions in the front view are rare on the R2R routes the "
+                 "model is trained on ({share} of past positions in R2R labels). Key positions (the pre-registered "
+                 "turnaround rule, read for a loop as the scored frame farthest from the start): that frame, the "
+                 "scored frames just before and just after it, and the last frame. (a) Route on the "
                  "top-down map: the leg up to the point farthest from the start (diamond) solid, the rest dashed, "
                  "each drawn on its own right-hand side; chevrons give the direction of travel; circle = start; "
                  "black dots with arrows = the key positions K1–K4 and the way the robot faces there. "),
     },
     "zh": {
         "out_and_back": ("设计的去而复返路线上的预测 affordance map（{where}）：机器人沿一条 R2R 参考路径走到头，再原路返回。"
-                         "落在前视的历史位置在训练中很少见（只占训练标签中历史位置的 {share}）。关键位置（预注册）：折返前、离折返最近、"
+                         "在模型训练所用的 R2R 路线上，落在前视的历史位置很少见（R2R 标签中只占 {share}）。关键位置（预注册）：折返前、离折返最近、"
                          "折返后的评分帧，以及末帧。(a) 俯视图上的路线：去程实线、回程虚线，各自画在行进方向的右侧，使原路"
                          "返回的两段不重叠；路线上的 V 形标记表示行进方向；菱形 = 折返点（参考路径的终点），圆圈 = 起点；带箭头的黑点 = "
                          "关键位置 K1–K4 及机器人在该处面对的方向。"),
-        "loop": ("设计的绕圈路线上的预测 affordance map（{where}）：机器人在同一层依次经过三个路点后回到起点。落在前视的"
-                 "历史位置在训练中很少见（只占训练标签中历史位置的 {share}）。关键位置（预注册）：离起点最远处之前、当时、之后的"
-                 "评分帧，以及末帧。(a) 俯视图上的路线：到最远点（菱形）为止实线，其后虚线，各自画在行进方向的右侧；"
+        "loop": ("设计的绕圈路线上的预测 affordance map（{where}）：机器人在同一层依次经过三个路点后回到起点。在模型训练"
+                 "所用的 R2R 路线上，落在前视的历史位置很少见（R2R 标签中只占 {share}）。关键位置（预注册的折返点规则；绕圈没有折返点，"
+                 "取离起点最远的评分帧）：该帧及其前、后的评分帧，以及末帧。(a) 俯视图上的路线：到最远点（菱形）为止实线，其后虚线，各自画在行进方向的右侧；"
                  "路线上的 V 形标记表示行进方向；圆圈 = 起点；带箭头的黑点 = 关键位置 K1–K4 及机器人在该处面对的方向。"),
     },
 }
@@ -212,11 +235,11 @@ _D = {
     "en": ("(d) One row per scored frame of the route, time running down (frame number on the left, counted from 1; "
            "K1–K4 on the right): the blue bar and its number = past positions whose true direction lies in the front "
            "view; the orange bar and its number under it = how many of them the predicted affordance map gets right "
-           "(joint PCK@8). Rows after the robot reaches the {turn} (diamond) are shaded as the return leg; its totals "
-           "are printed under the chart in the bars' colours."),
+           "(joint PCK@8). The diamond marks where the robot reaches the {turn}, as in (a); the rows after it are "
+           "shaded grey as the return leg, whose totals are printed under the chart in the bars' colours."),
     "zh": ("(d) 路线上每个评分帧一行，时间自上而下（左侧为帧号，从 1 数起；右侧 K1–K4 为关键位置）：蓝条及其数字 = 真值方向"
-           "落在前视的历史位置数；其下的橙条及其数字 = 其中预测 affordance map 判对的个数（joint PCK@8）。机器人到达{turn}"
-           "（菱形）之后的各行加阴影表示回程，图下用条形的颜色写有回程合计。"),
+           "落在前视的历史位置数；其下的橙条及其数字 = 其中预测 affordance map 判对的个数（joint PCK@8）。菱形标出机器人到达"
+           "{turn}之处（同 (a)），其后各行加灰色阴影表示回程，图下用条形的颜色写有回程合计。"),
 }
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +260,9 @@ D_BAR = 0.34  # bar thickness / row pitch
 D_BAR_GAP = 0.10  # gap between the two bars / row pitch
 D_LABEL_PAD = 1.3  # count label after its bar end
 D_K_FS = 5.6
+D_TURN_MS = 4.6  # the chart's diamond (marker size; the legend draws the same)
+D_TURN_HALF_PT = 0.5 * np.sqrt(2.0) * D_TURN_MS + 0.4  # its half width, edge included ("D" = a square turned 45 deg)
+D_TURN_INSET_PT = 1.4  # its right tip this far inside the shading's right edge
 FS = fc.FS
 GT_BAR_COLOR = style.GT_COLOR  # past positions in the front view (ground truth)
 PRED_BAR_COLOR = style.PRED_COLOR  # of these, predicted correctly (the prediction)
@@ -266,11 +292,6 @@ def wrap_mixed(fig, text: str, width_pt: float, fs: float, **kw) -> List[str]:
     return lines
 
 
-def route_frame(xz: np.ndarray, split: int, aspect_hw: float, pad: float):
-    """``common_draw.route_frame`` (kept here for callers of the first version)."""
-    return cd.route_frame(xz, split, aspect_hw, pad)
-
-
 def return_totals(tally: Sequence[dict], split: int) -> dict:
     back = [t for t in tally if t["t"] > split]
     out = [t for t in tally if t["t"] <= split]
@@ -278,6 +299,233 @@ def return_totals(tally: Sequence[dict], split: int) -> dict:
             "return_hits": sum(t["hits_front"] for t in back),
             "outbound_rows": len(out), "outbound_front": sum(t["n_front"] for t in out),
             "outbound_hits": sum(t["hits_front"] for t in out)}
+
+
+def route_name(dump: dd.Dump, lang: str) -> str:
+    """The route's display name, as the gallery writes it: "out-and-back 1" / "loop 2" (zh "去而复返 1" / "绕圈 2")
+    for episode id ``exp18E_<scene>_oab0`` / ``..._loop1``; any other id is shown as "route <id without the
+    scene prefix>"."""
+    ep = str(dump.episode_id)
+    m = re.match(rf"exp18E_{re.escape(str(dump.scene))}_(oab|loop)(\d+)$", ep)
+    if m is None:
+        return LABELS[lang]["route_raw"].format(short=ep.replace(f"exp18E_{dump.scene}_", ""))
+    return ROUTE_NAME[lang][m.group(1)].format(i=int(m.group(2)) + 1)
+
+
+def same_spot_groups(recs: Sequence[dd.CaseRow], tol_m: float = SAME_SPOT_M) -> List[List[int]]:
+    """Runs of consecutive key positions (indices) that lie within ``tol_m`` of each other (the robot turning on
+    the spot), each run of length >= 2."""
+    groups: List[List[int]] = []
+    for i in range(1, len(recs)):
+        if float(np.linalg.norm(recs[i].cur_pos - recs[i - 1].cur_pos)) <= tol_m:
+            if groups and groups[-1][-1] == i - 1:
+                groups[-1].append(i)
+            else:
+                groups.append([i - 1, i])
+    return groups
+
+
+# --------------------------------------------------------------------------- #
+# Panel a: the route
+# --------------------------------------------------------------------------- #
+class RoutePanel(fc.FittedRoutePanel):
+    """``fig_case.FittedRoutePanel`` with two changes: key positions that share a spot, and a backed legend.
+
+    The in-map legend sits on a light box (``_draw_legend``), so a dark patch
+    of the map cannot show between or behind its entries.
+
+    Where the robot turns on the spot (K2 and K3 at the turn) the key positions
+    share one dot and each has its own facing arrow.  The shared panel ties
+    every K badge to its dot, so the two arrows there cannot be told apart;
+    here a badge of such a group is tied to the tip of its own arrow instead
+    (placed beside it, with a leader when it has to move away), unless that
+    tip lands within ``TIP_CLEAR_PT`` of another key position's dot or arrow
+    tip (the label would read as that one's): then it stays on the shared
+    dot, and its arrow is the one there that no label points to.  Everything
+    else is ``FittedRoutePanel.__call__`` line for line (a local copy: the
+    shared layer belongs to ``fig_case``; proposed for it as an option).
+
+    ``groups``: the same-spot groups (key indices) to treat so (default:
+    ``same_spot_groups``); the caption names the same ones.  Set when drawn:
+    ``shared_keys`` (key indices tied to their arrow tips) and
+    ``tip_clear_pt`` (per key of a group: its tip's distance, pt, to the
+    nearest other key dot or arrow tip).
+    """
+
+    ARROW_PT = 13.0  # facing-arrow length (as FittedRoutePanel)
+    TIP_CLEAR_PT = 6.0  # an arrow tip this close to another key's dot or tip is not used as a label anchor
+
+    def __init__(self, *args, groups: Optional[Sequence[Sequence[int]]] = None, same_spot_m: float = SAME_SPOT_M,
+                 **kw):
+        super().__init__(*args, **kw)
+        self.groups = None if groups is None else [list(map(int, g)) for g in groups]
+        self.same_spot_m = float(same_spot_m)
+        self.shared_keys: List[int] = []
+        self.tip_clear_pt: Dict[str, float] = {}
+
+    def __call__(self, ax, level, dump: dd.Dump, recs: Sequence[dd.CaseRow], L: dict) -> None:
+        fig = ax.figure
+        world = dump.positions[:, [0, 2]]
+        box = ax.get_position()
+        w_pt = box.width * fig.get_size_inches()[0] * 72.0
+        h_pt = box.height * fig.get_size_inches()[1] * 72.0
+        top_pt, bot_pt = self.TOP_BAND_PT, self._bottom_band_pt(fig)
+        aspect = (h_pt - top_pt - bot_pt) / w_pt
+        if self._frame is None:
+            self._frame = cd.route_frame(world, self.split, aspect, self.pad)
+        centre, fwd = self._frame
+        frame = EgoCrop(centre, fwd, 1.0, 2)
+
+        def local(x, z):
+            a, b = frame.world_to_local(x, z)
+            return np.stack([np.asarray(a, dtype=float), np.asarray(b, dtype=float)], axis=-1)
+
+        xy = local(world[:, 0], world[:, 1])
+        # the route + pad, grown until every K position's facing arrow (13 pt) also fits with 3 pt to spare
+        pts = xy
+        for _ in range(3):
+            x0, x1, y0, y1 = cd.fit_limits(pts, pad=self.pad, aspect_hw=aspect)
+            m_per_pt = (x1 - x0) / w_pt
+            tips = []
+            for r in recs:
+                p = local(r.cur_pos[0], r.cur_pos[2])
+                fw = forward_from_c2w(r.cur_c2w)
+                f = local(centre[0] + fw[0], centre[1] + fw[1])
+                f = f / (np.linalg.norm(f) + 1e-12)
+                tips.append(p + f * 16.0 * m_per_pt)
+            tips = np.asarray(tips).reshape(-1, 2)
+            inside = (np.all(tips[:, 0] >= x0 + 3 * m_per_pt) and np.all(tips[:, 0] <= x1 - 3 * m_per_pt)
+                      and np.all(tips[:, 1] >= y0 + 3 * m_per_pt) and np.all(tips[:, 1] <= y1 - 3 * m_per_pt))
+            if inside:
+                break
+            pts = np.concatenate([xy, tips], axis=0)  # fit_limits pads them like the route
+        m_per_pt = (x1 - x0) / w_pt
+        limits = (x0, x1, y0 - bot_pt * m_per_pt, y1 + top_pt * m_per_pt)
+        half = 1.01 * max(abs(v) for v in limits)
+        img = (cd.mute_map(level.rgb(), sat=0.2, white=0.56) * 255).astype(np.uint8)
+        plate = tuple(int(round(255 * c)) for c in cd.MAP_PLATE)
+        n_px = int(np.clip(2 * half / level.mpp, 400, 2600))
+        crop = level.heading_up_crop(img, centre, forward_xz=fwd, half_size_m=half, out_px=n_px, fill=plate)
+        ax.imshow(crop.image, extent=crop.extent, interpolation="bilinear", zorder=0)
+        ax.set_xlim(limits[0], limits[1])
+        ax.set_ylim(limits[2], limits[3])
+        ax.set_autoscale_on(False)
+        ax.set_facecolor(cd.MAP_PLATE)
+        cd.clean_axes(ax, spines=True)
+        per_pt = cd.pts_to_data(ax, 1.0)[0]
+        if self.split is not None:
+            legs = cd.draw_route_legs(ax, xy, self.split, lw=0.95, offset_pt=1.6)
+            lines = [v for v in legs.values() if v is not None]
+        else:
+            ax.plot(xy[:, 0], xy[:, 1], color=style.INK_2, lw=1.0, solid_capstyle="round", solid_joinstyle="round",
+                    zorder=3)
+            lines = []
+        ax.plot(*xy[0], marker="o", ms=4.2, mfc="white", mec=style.INK_2, mew=0.9, zorder=6)
+        if self.split is not None:  # under the K dots: a K position at the turn shows as a dot inside the diamond
+            cd.turn_marker(ax, *xy[self.split], size=5.4, zorder=7.2)
+        # the only change: a key position sharing its spot is labelled at its own arrow's tip (see the docstring)
+        groups = self.groups if self.groups is not None else same_spot_groups(recs, self.same_spot_m)
+        in_group = {i for g in groups for i in g}
+        dots = [local(r.cur_pos[0], r.cur_pos[2]) for r in recs]
+        heads = []  # each key's arrow tip
+        for r, p in zip(recs, dots):
+            fw = forward_from_c2w(r.cur_c2w)
+            f = local(centre[0] + fw[0], centre[1] + fw[1])
+            heads.append(p + f / (np.linalg.norm(f) + 1e-12) * self.ARROW_PT * per_pt)
+        self.shared_keys, self.tip_clear_pt = [], {}
+        tips, anchors = [], []
+        for n, r in enumerate(recs):
+            p = dots[n]
+            fw = forward_from_c2w(r.cur_c2w)
+            f = local(centre[0] + fw[0], centre[1] + fw[1])
+            cd.heading_arrow(ax, p, f, self.ARROW_PT * per_pt, zorder=6)
+            ax.plot(*p, marker="o", ms=3.0, mfc=style.INK, mec="white", mew=0.5, zorder=7.4)
+            fn = f / (np.linalg.norm(f) + 1e-12)
+            side = np.array([-fn[1], fn[0]])
+            tips.append(np.concatenate([p + fn * per_pt * np.linspace(3.0, 15.0, 7)[:, None],
+                                        (p + fn * 11.0 * per_pt + side * 2.2 * per_pt)[None],
+                                        (p + fn * 11.0 * per_pt - side * 2.2 * per_pt)[None]]))
+            anchor = p
+            if n in in_group:
+                tip = p + fn * (self.ARROW_PT + 0.8) * per_pt
+                others = ([dots[m] for g in groups if n in g for m in range(len(recs)) if m not in g]
+                          + [heads[m] for m in range(len(recs)) if m != n])
+                clear = min([float(np.hypot(*((tip - q) / per_pt))) for q in others] + [999.0])
+                self.tip_clear_pt[f"K{n + 1}"] = round(clear, 1)
+                if clear >= self.TIP_CLEAR_PT:
+                    anchor = tip
+                    self.shared_keys.append(n)
+            anchors.append(anchor)
+        # the scale bar takes the top band, the legend the bottom band; the labels keep clear of both
+        obstacles = np.concatenate([xy] + lines + tips + ([xy[self.split][None]] if self.split is not None else []),
+                                   axis=0)
+        bar = cd.nice_length(0.4 * (limits[1] - limits[0]))
+        bar_box = (bar / per_pt + 2.0, 11.0)
+        bx = limits[0] + (4.0 + bar_box[0] / 2) * per_pt
+        by = limits[3] - (2.5 + bar_box[1] / 2) * per_pt
+        fixed = [(bx, by, *bar_box)]
+        if self.legend:
+            lw_pt = w_pt - 6.0
+            fixed.append(((limits[0] + limits[1]) / 2, limits[2] + (bot_pt / 2) * per_pt, lw_pt, bot_pt - 1.0))
+        k_boxes = [(cd.text_width_pt(fig, f"K{n + 1}", self.K_FS, fontweight="bold") + 3.2, 8.6)
+                   for n in range(len(recs))]
+        boxes = list(k_boxes)
+        if self.start_text:
+            anchors.append(xy[0])
+            boxes.append((cd.text_width_pt(fig, self.start_text, 5.8) + 1.5, 6.6))
+        centroid = xy.mean(0)
+        order_a = list(range(len(anchors)))
+        order_b = order_a[len(recs):] + order_a[:len(recs)]
+        tries = [cd.place_near(ax, anchors, obstacles, limits, boxes, fixed_boxes=fixed, order=o, clear_pt=6.0,
+                               radii_pt=(2.5, 4.5, 7.0, 10.0, 14.0, 19.0, 25.0, 32.0), n_dir=24,
+                               away_from=centroid, away_weight=1.2)
+                 for o in (order_a, order_b)]
+        placed = max(tries, key=lambda pl: (min(q[3] for q in pl), sum(q[3] for q in pl)))  # worst label first
+        nk = len(recs)
+        perm = cd.uncross([anchors[i] for i in range(nk)], [placed[i][:2] for i in range(nk)])
+        for n in range(nk):
+            x, y = placed[perm[n]][:2]
+            gap_pt = float(np.hypot(*((np.asarray([x, y]) - anchors[n]) / per_pt)))
+            if gap_pt > 0.5 * max(k_boxes[n]) + 3.0:
+                fc._leader(ax, anchors[n], (x, y), *k_boxes[n])
+            cd.key_badge(ax, x, y, f"K{n + 1}", fs=self.K_FS)
+        if self.start_text:
+            x, y, gap, _ = placed[nk]
+            if gap > 3.0:
+                fc._leader(ax, xy[0], (x, y), *boxes[nk], color=style.MUTED, lw=0.45, zorder=5.5)
+            ax.text(x, y, self.start_text, ha="center", va="center", fontsize=5.8, color=style.INK_2,
+                    path_effects=cd.HALO, zorder=8)
+        sb = cd.scale_bar(ax, bx - (bar_box[0] / 2 - 1.0) * per_pt, by - 3.0 * per_pt, bar, f"{bar:g} m")
+        self.scale_bar_inset_pt = round(cd.inset_from_frame_pt(ax, sb), 2)  # judge rule: >= 2 pt inside the map
+        if self.legend:
+            self._draw_legend(ax, limits, per_pt, w_pt, bot_pt)
+
+    LEGEND_BG_ALPHA = 0.88  # the in-map legend's backing box: the map shows through only faintly
+    LEGEND_BG_PAD_PT = 1.8
+
+    def _draw_legend(self, ax, limits, per_pt: float, w_pt: float, bot_pt: float) -> None:
+        """``FittedRoutePanel._draw_legend`` on a light box, so a dark patch of the map never shows between or
+        behind the entries (the box spans the entries' rows and columns, inside the bottom band)."""
+        from matplotlib.patches import FancyBboxPatch
+
+        fig = ax.figure
+        ncol, c1 = self._legend_cols(fig, w_pt)
+        n_rows = int(np.ceil(len(self.legend) / ncol))
+        widths = [self._item_w(fig, t) for _, t in self.legend]
+        right_pt = max((i % ncol) * (c1 + 6.0) + w for i, w in enumerate(widths))  # from the entries' left edge
+        pad = self.LEGEND_BG_PAD_PT
+        x_left = limits[0] + 4.0 * per_pt  # as the parent lays the entries out
+        y_top_c = limits[2] + (bot_pt - 2.5 - self.LEG_ROW_PT / 2) * per_pt  # first row's centre
+        top = y_top_c + (self.LEG_ROW_PT / 2 + pad) * per_pt
+        bottom = max(y_top_c - ((n_rows - 0.5) * self.LEG_ROW_PT + pad) * per_pt, limits[2] + 0.8 * per_pt)
+        x0 = max(x_left - pad * per_pt, limits[0] + 0.8 * per_pt)
+        x1 = min(x_left + (right_pt + pad) * per_pt, limits[1] - 0.8 * per_pt)
+        ax.add_patch(FancyBboxPatch((x0, bottom), x1 - x0, top - bottom,
+                                    boxstyle=f"round,pad=0,rounding_size={1.5 * per_pt}", fc="white",
+                                    ec=style.GRID, lw=0.4, alpha=self.LEGEND_BG_ALPHA, zorder=7.8))
+        self.legend_box_pt = (round((x0 - limits[0]) / per_pt, 1), round((bottom - limits[2]) / per_pt, 1),
+                              round((x1 - x0) / per_pt, 1), round((top - bottom) / per_pt, 1))
+        super()._draw_legend(ax, limits, per_pt, w_pt, bot_pt)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,8 +536,9 @@ class FrontPanel:
 
     Everything is laid out in points inside one axes (x right, y down from the
     panel's top), so text, bars and badges keep their sizes whatever height
-    column a leaves, top to bottom: title (wrapped), the three-entry legend
-    (blue bar, orange bar, return-leg shading with its diamond), "frame"
+    column a leaves, top to bottom: title (wrapped), the four-entry legend
+    (blue bar, orange bar, the grey return-leg shading, and the diamond under
+    the name panel a gives it: "turnaround" / "farthest point"), "frame"
     header, one row per scored frame (pitch ``D_ROW_MIN_PT``..``D_ROW_MAX_PT``;
     two bars side by side, each with its count printed after it), the 0/4/8
     axis, and the return-leg totals (a bold head line, then the blue count in
@@ -318,9 +567,9 @@ class FrontPanel:
         self.total_lines = [(line, color) for text, color in parts
                             for line in wrap_mixed(fig_m, text, self.W, D_TOTAL_FS, fontweight="bold")]
         self.title_lines = wrap_mixed(fig_m, LR["d_title"], self.W - D_TITLE_X, D_TITLE_FS)
-        self.legend = []
-        for kind, text in (("front", LR["d_leg_front"]), ("hits", LR["d_leg_hits"]),
-                           ("back", LR["d_leg_back"][pattern])):
+        self.legend = []  # the diamond keeps panel a's name for it ("turnaround" / "farthest point")
+        for kind, text in (("front", LR["d_leg_front"]), ("hits", LR["d_leg_hits"]), ("back", LR["d_leg_back"]),
+                           ("turn", LR["turn"][pattern])):
             self.legend.append((kind, wrap_mixed(fig_m, text, self.W - D_LEG_X, D_FS)))
         frame_w = max(cd.text_width_pt(fig_m, str(t["t"] + 1), D_FS) for t in self.tally) if self.tally else 8.0
         self.x0 = frame_w + 3.2  # chart's left edge (frame numbers right-aligned before it)
@@ -360,12 +609,14 @@ class FrontPanel:
         for i, line in enumerate(self.title_lines):
             ax.text(D_TITLE_X, y + i * D_TITLE_LH, line, ha="left", va="top", fontsize=D_TITLE_FS, color=style.INK)
         y += len(self.title_lines) * D_TITLE_LH + 2.4
-        # legend (before the chart: the reader meets the encoding first): blue, orange, the shading with the diamond
+        # legend (before the chart: the reader meets the encoding first): blue, orange, the grey return-leg shading,
+        # the diamond -- two entries, so the diamond means what it means in panel a
         for n_leg, (kind, lines) in enumerate(self.legend):
             ym = y + D_LH / 2
-            if kind == "back":
-                ax.add_patch(Rectangle((0.3, ym - 2.2), 7.0, 6.2, fc=SHADE, ec="none", alpha=0.9))
-                cd.turn_marker(ax, 3.8, ym - 2.2, size=3.6, zorder=6)  # on the shading's top edge, as in the chart
+            if kind == "back":  # the chart's shading, as drawn there
+                ax.add_patch(Rectangle((0.6, ym - 2.6), 6.4, 5.2, fc=SHADE, ec="none", alpha=0.75))
+            elif kind == "turn":  # the chart's diamond, same size
+                cd.turn_marker(ax, 3.8, ym, size=D_TURN_MS, zorder=6)
             else:
                 swatch = GT_BAR_COLOR if kind == "front" else PRED_BAR_COLOR
                 ax.add_patch(Rectangle((0.6, ym - 1.6), 6.4, 3.2, fc=swatch, ec="none"))
@@ -388,7 +639,16 @@ class FrontPanel:
         if first_back is not None:
             yb = rows_top + first_back * pitch
             ax.add_patch(Rectangle((x0, yb), cw, rows_bot - yb, fc=SHADE, ec="none", alpha=0.75, zorder=0))
-            cd.turn_marker(ax, x0 + cw - 3.0, yb, size=4.6, zorder=6)  # right end: clear of the counts
+            # the diamond at the shading's top right, its tip D_TURN_INSET_PT inside the shading's right edge (so
+            # it keeps clear of the K badges in the lane), but never onto the counts of the two rows it sits between
+            half = D_TURN_HALF_PT
+            near = [self.tally[i] for i in (first_back - 1, first_back) if 0 <= i < len(self.tally)]
+            counts_r = max([self._count_right(fig, x0, v, unit, cw) for t in near
+                            for v in (int(t["n_front"]), int(t["hits_front"]))] + [x0])
+            xd = max(x0 + cw - D_TURN_INSET_PT - half, counts_r + 1.2 + half)
+            xd = min(xd, x0 + cw - 3.0)  # at worst where it always was
+            cd.turn_marker(ax, xd, yb, size=D_TURN_MS, zorder=6)
+            self.layout["turn_marker_inset_pt"] = round(x0 + cw - (xd + half), 2)  # tip to the shading's right edge
             self.layout["return_from_row"] = first_back
         bt, bg = D_BAR * pitch, D_BAR_GAP * pitch
         for t, yc in zip(self.tally, centres):
@@ -418,7 +678,7 @@ class FrontPanel:
         # return-leg totals: head in ink, the blue count in ground-truth ink, the orange count in prediction ink
         for i, (line, color) in enumerate(self.total_lines):
             ax.text(0.0, y + i * D_TOTAL_LH, line, ha="left", va="top", fontsize=D_TOTAL_FS, color=color,
-                    fontweight="bold", path_effects=cd.bold_effects(line, color, stroke_pt=0.3))
+                    fontweight=cd.bold_weight(line), path_effects=cd.bold_effects(line, color, stroke_pt=0.3))
         y += len(self.total_lines) * D_TOTAL_LH + 1.0
         # K badges in the lane right of the chart, at their rows (moved apart with a leader only when needed)
         key_rows = []
@@ -444,6 +704,14 @@ class FrontPanel:
                             "panel_h_in": round(h, 3), "used_h_in": round(y / 72.0, 3)})
         if y > H + 0.5:
             self.warnings.append(f"panel d content {y:.1f} pt > panel {H:.1f} pt")
+
+    @staticmethod
+    def _count_right(fig, x0: float, v: int, unit: float, cw: float) -> float:
+        """Right end (pt) of what ``_count`` draws for a bar of ``v`` (the bar's end when the count sits inside
+        it)."""
+        tw = cd.text_width_pt(fig, str(v), D_FS)
+        xe = x0 + v * unit
+        return xe + D_LABEL_PAD + tw if xe + D_LABEL_PAD + tw <= x0 + cw else xe
 
     @staticmethod
     def _count(ax, fig, x0: float, v: int, unit: float, cw: float, yc: float, ink) -> None:
@@ -489,24 +757,28 @@ def _key_list(keys: Sequence[str], lang: str) -> str:
     return ", ".join(keys[:-1]) + " and " + keys[-1] if len(keys) > 1 else keys[0]
 
 
-def same_spot_groups(recs: Sequence[dd.CaseRow], tol_m: float = SAME_SPOT_M) -> List[List[int]]:
-    """Runs of consecutive key positions (indices) that lie within ``tol_m`` of each other (the robot turning on
-    the spot), each run of length >= 2."""
-    groups: List[List[int]] = []
-    for i in range(1, len(recs)):
-        if float(np.linalg.norm(recs[i].cur_pos - recs[i - 1].cur_pos)) <= tol_m:
-            if groups and groups[-1][-1] == i - 1:
-                groups[-1].append(i)
-            else:
-                groups.append([i - 1, i])
-    return groups
+def arrows_note(lang: str, keys: Sequence[str], at_tip: Sequence[str]) -> str:
+    """How panel a labels a group of key positions that share one spot: all at their own arrow tips, some (the
+    rest on the shared dot, their arrows by elimination), or none (the dot only; "")."""
+    LR = LABELS[lang]
+    tip = [k for k in keys if k in at_tip]
+    dot = [k for k in keys if k not in at_tip]
+    if not tip:
+        return ""
+    if not dot:
+        return LR["arrows_all"]
+    return (LR["arrows_tip"][min(len(tip), 2)].format(keys=_key_list(tip, lang))
+            + LR["arrows_dot"][min(len(dot), 2)].format(keys=_key_list(dot, lang)))
 
 
 def route_caption(lang: str, pattern: str, where: str, tot: dict, tier: Optional[dict] = None,
-                  same_spot: Optional[Sequence[Sequence[str]]] = None) -> str:
+                  same_spot: Optional[Sequence[Sequence[str]]] = None,
+                  arrows: Optional[Sequence[str]] = None) -> str:
     """Caption: claim + verdict, the return-leg result (panel d's totals), the tier-E front vs back numbers,
     the setup (with "K2 and K3 share one position" for key positions where the robot turns on the spot), then
-    panels a-d.  "{elev_window}" is left for ``fig_case`` (D4)."""
+    panels a-d.  "{elev_window}" is left for ``fig_case`` (D4); how panel a labels each same-spot group
+    (``arrows_note``) is known only once it is drawn, so without ``arrows`` it is left as "{arrows_<i>}" for
+    ``make_route_figure`` to fill in."""
     LR = LABELS[lang]
     R = _RESULT[lang]
     out = (R["out_0"] if tot["outbound_front"] == 0
@@ -524,10 +796,11 @@ def route_caption(lang: str, pattern: str, where: str, tot: dict, tier: Optional
     if tier is not None:
         text += R["tier"].format(**tier)
     text += _SETUP[lang][pattern].format(where=where, share=FRONT_SHARE_TRAINING)
-    for keys in same_spot or []:
-        text += LR["same_spot"].format(turn=LR["turn"][pattern], keys=_key_list(list(keys), lang))
+    for i, keys in enumerate(same_spot or []):
+        note = arrows[i] if arrows is not None else "{arrows_%d}" % i
+        text += LR["same_spot"].format(turn=LR["turn"][pattern], keys=_key_list(list(keys), lang), arrows=note)
     P = fc.CAPTION_PARTS[lang]
-    text += P["b"] + _B_LEGS[lang] + P["c"] + fc.caption_marks(lang) + sep
+    text += P["b"] + _B_LEGS[lang] + P["c"] + fc.CASE_MARKS + sep  # filled by fig_case with what the blocks show
     text += _D[lang].format(turn=LR["turn"][pattern])
     return text
 
@@ -579,14 +852,22 @@ def make_route_figure(dump_npz_path, pattern: str, rows: Optional[Sequence[int]]
     tot = return_totals(tally, split_frame)
     tier = tier_front_back(metrics_json)
     turn_keys = [n for n, role in enumerate(roles) if role == "turnaround"]
-    same_spot = [[f"K{i + 1}" for i in g] for g in same_spot_groups(recs) if set(g) & set(turn_keys)]
+    groups = [g for g in same_spot_groups(recs) if set(g) & set(turn_keys)]  # the robot turning on the spot
+    same_spot = [[f"K{i + 1}" for i in g] for g in groups]
     warnings: List[str] = []
     if tier is None:
         warnings.append(f"no tier-E front/back numbers (metrics.json {metrics_json}): caption sentence left out")
 
-    short = dump.episode_id.replace(f"exp18E_{dump.scene}_", "")
-    where = LR["where"].format(scene=dump.scene, short=short)
-    scene_text = LR["scene_E"].format(scene=dump.scene, short=short, T=dump.frame_count)
+    name = route_name(dump, lang)
+    where = LR["where"].format(scene=dump.scene, route=name)
+    scene_text = LR["scene_E"].format(scene=dump.scene, route=name, T=dump.frame_count)
+    try:  # one naming scheme with the gallery
+        from scripts.exp18.figures import fig_gallery as fg
+
+        if fg.LABELS[lang]["route"] != ROUTE_NAME[lang]:
+            warnings.append(f"route names differ from the gallery's: {ROUTE_NAME[lang]} vs {fg.LABELS[lang]['route']}")
+    except (ImportError, KeyError, AttributeError) as e:
+        warnings.append(f"could not compare route names with the gallery's ({e!r})")
 
     cd.setup(lang)
     import matplotlib.pyplot as plt  # after setup(): Agg backend, fonts registered
@@ -596,14 +877,24 @@ def make_route_figure(dump_npz_path, pattern: str, rows: Optional[Sequence[int]]
     plt.close(fig_m)
     legend = [("out", LR["leg_out"]), ("turn", LR["turn"][pattern]), ("back", LR["leg_back"]),
               ("start", LR["start"])]
+    panel = RoutePanel(split=split_frame, legend=legend, groups=groups)
     opts = fc.CaseOptions(
-        roles=role_txt, route_panel=fc.FittedRoutePanel(split=split_frame, legend=legend),
+        roles=role_txt, route_panel=panel,
         route_foot_h=front.min_h, route_foot=front, split_frame=split_frame, letters="slide", scene_text=scene_text,
         caption=route_caption(lang, pattern, where, tot, tier, same_spot))
     res = fc.make_case_figure(dump_npz_path, rows=rows, topdown_root=topdown_root,
                               clip_root_override=clip_root_override, out_stem=out_stem, lang=lang, options=opts)
     if res["notes_dropped"]:  # cannot happen (fig_case raises on an unaccounted slot); never hide a note
         raise RuntimeError(f"notes left out of the route figure: {res['notes_dropped']}")
+    # the caption says how panel a labelled each same-spot group, now that it is drawn
+    at_tip = [f"K{i + 1}" for i in panel.shared_keys]
+    cap_path = Path(next(f for f in res["files"] if f.endswith("_caption.txt")))
+    caption = cap_path.read_text(encoding="utf-8")
+    for i, keys in enumerate(same_spot):
+        caption = caption.replace("{arrows_%d}" % i, arrows_note(lang, keys, at_tip))
+    if "{arrows_" in caption:
+        raise RuntimeError(f"caption placeholder left in {cap_path}")
+    cap_path.write_text(caption, encoding="utf-8")
     if "foot_h" not in res["layout"]:
         raise RuntimeError("panel d was not drawn (fig_case left no room under the route panel)")
     if res["layout"]["foot_h"] < 1.2:
@@ -618,6 +909,10 @@ def make_route_figure(dump_npz_path, pattern: str, rows: Optional[Sequence[int]]
                       "front": {"n": int(fr.sum()), "hits": int((r.arms[ARM].joint8 & fr).sum())}})
     layout = dict(res["layout"])
     layout["panel_d"] = front.layout
+    layout["route_keys_at_arrow_tips"] = [f"K{i + 1}" for i in panel.shared_keys]
+    layout["route_tip_clear_pt"] = dict(panel.tip_clear_pt)
+    layout["route_legend_box_pt"] = getattr(panel, "legend_box_pt", None)
+    layout["route_name"] = name
     return {"files": res["files"], "pattern": pattern, "dump": str(dump.path), "rows": rows, "roles": list(roles),
             "split_frame": split_frame, "split_rule": split_info["rule"], "tally": tally, "tally_totals": tot,
             "tier_front_back": tier, "same_spot": same_spot, "stats": stats, "size_in": res["size_in"],
@@ -713,7 +1008,8 @@ def main(argv=None) -> int:
     ap.add_argument("--roles", default=None, help="with --dump and --rows: comma-separated select_cases roles")
     ap.add_argument("--split-frame", type=int, default=None, help="with --dump: frame where the route turns back")
     ap.add_argument("--dumps-root", default=None, help="with --cases: <root>/<tier>/<scene>/<clip>.npz")
-    ap.add_argument("--metrics-json", default=None, help="metrics.json (default: the cases' metrics_dir)")
+    ap.add_argument("--metrics-json", default=None,
+                    help="metrics.json (default: the cases' metrics_dir; with --dump $EXP18_ROOT/metrics)")
     ap.add_argument("--topdown-root", default=None, help="top-down map root (default $EXP18_ROOT/topdown)")
     ap.add_argument("--clip-root", default=None, help="local copy of the clips: <root>/<scene>/<clip>/chunks")
     ap.add_argument("--out-dir", default="routes")
@@ -738,10 +1034,15 @@ def main(argv=None) -> int:
             if rows is not None and roles is None:
                 roles = dd.ROUTE_ROLES[:len(rows)] if len(rows) == 4 else None
             stem = Path(args.out_dir) / (f"route_{args.pattern}" + ("" if lang == "en" else f"_{lang}"))
+            metrics_json = args.metrics_json
+            if metrics_json is None:  # the run's own metrics ($EXP18_ROOT/metrics) for the caption's tier sentence
+                from scripts.exp18.common import EXP_ROOT
+
+                metrics_json = EXP_ROOT / "metrics" / "metrics.json"
             results = [make_route_figure(args.dump, args.pattern, rows=rows, roles=roles,
                                          split_frame=args.split_frame, topdown_root=args.topdown_root,
                                          clip_root_override=args.clip_root, out_stem=stem, lang=lang,
-                                         metrics_json=args.metrics_json)]
+                                         metrics_json=metrics_json)]
         for r in results:
             for f in r["files"]:
                 print(f)

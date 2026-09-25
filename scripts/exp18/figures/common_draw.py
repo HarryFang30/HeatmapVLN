@@ -19,14 +19,22 @@ Visual vocabulary (one meaning per encoding, used by every EXP-18 figure):
 * **Misses (D1, D2).**  A slot is missed iff it fails joint PCK@8
   (``data.CaseRow.misses``); its number is ink in a small white disc ringed
   in dark orange (``miss_badge``), next to its own x or moved and joined to it
-  by a short ink leader (``place_miss_labels`` / ``draw_miss_labels``), with
-  an optional dotted connector from its true-bearing tick to the x
-  (``draw_miss_connectors``).  Never a blue badge on the orange row.
+  by a short ink leader, with an optional dotted connector (one per x) from a
+  true-bearing tick to the x.  ``plan_miss_badges`` lays out a whole row once
+  for every figure (``miss_connectors`` + ``place_miss_labels``: no overlaps,
+  no leader through another x or across a leader or connector, searched
+  beyond the greedy order when needed); ``draw_miss_connectors`` /
+  ``draw_miss_labels`` draw it.  Never a blue badge on the orange row.
 * **Row names (D3)** "ground truth" / "prediction" sit in a fixed gutter left
   of the strip with a tiny colour key (``gutter_row_label``), in every block.
 * **Elevation window (D4)**: ``elevation_window(rows)`` -- +-10 deg, widened
-  just enough for every GT-visible and drawn predicted peak of the rows shown,
-  at most +-45 deg; ``elevation_text`` words it for the caption.
+  just enough that every GT-visible and drawn predicted peak of the rows shown
+  lies ``EL_MARGIN`` (6 deg) inside, at most +-45 deg; ``elevation_text``
+  words it for the caption.
+* **Sector letters** of the local-map discs (``disc_sector_letters``) sit
+  outside the rim, never under a badge or leader: on the badge ring, slid
+  within the sector, or moved out past the badges into the free room around
+  the disc; R / B / L are left out where no such spot exists (F never is).
 * **Notes (D5)** are wrapped, never dropped: ``wrap_notes`` lays them out on
   as many lines as needed, ``draw_note`` draws one (blue badge for a slot no
   view shows, orange-ringed badge for a miss the model calls not visible).
@@ -36,8 +44,10 @@ Visual vocabulary (one meaning per encoding, used by every EXP-18 figure):
   given are desaturated and lightened; only the front view keeps its colour.
 * **Black = the robot** (arrowhead pointing where it faces) and key positions
   (``K1`` badges with a facing arrow).
-* Bold Chinese text is drawn with a thin stroke of its own colour
-  (``bold_effects``; the CJK font has no bold face).
+* Bold Chinese text is set in the regular weight (``bold_effects``): the CJK
+  font has no bold face, and the stroked fake bold smeared at print size;
+  emphasis comes from colour and size (``CJK_FAKE_BOLD`` turns the stroke back
+  on).
 
 The surround strip is the heading-centred ring of ``geo.stitch_ring`` rolled so
 that it starts at the left edge of the front view (bearing +45 deg) and runs
@@ -82,7 +92,9 @@ HALO_THIN = [pe.withStroke(linewidth=1.1, foreground="white")]
 BADGE_FS = 5.6
 STRIP_START_DEG = 45.0  # the strip starts at the front view's left edge
 EL_DEFAULT = 10.0  # D4: affordance map rows show +-10 deg of elevation ...
-EL_MARGIN = 3.0  # ... widened to include every peak with this much room for its mark ...
+# ... widened so every peak sits at least this far inside the row (6 deg = 5.2 pt in fig1 / fig4: the x's half
+# width 2.2 pt, a 2.6 pt stagger and a clear gap; 3 deg put the x of a peak at the window's edge on the frame) ...
+EL_MARGIN = 6.0
 EL_MAX = 45.0  # ... up to +-45 deg (a view's vertical field of view)
 GT_INK = style.GT_INK
 PRED_INK = style.PRED_INK
@@ -786,26 +798,45 @@ def _inner_obstacles(ax) -> list:
     return out
 
 
+LETTER_OUT_MAX_PT = 14.0  # a displaced sector letter moves at most this far out past the badge ring ...
+LETTER_OUT_SWING_DEG = 24.0  # ... within this angle of its sector centre
+LETTER_DEG_PT = 0.45  # spots are tried nearest first: 1 deg off the sector centre counts as 0.45 pt farther out
+LETTER_KEEPOUT_PT = 2.5  # clearance from ``keepout`` boxes (row names beside the disc)
+
+
 def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float]] = (), offset_pt: float = 5.2,
                         names=("F", "R", "B", "L"), fs: float = 6.0, letter_pt: float = 4.6,
                         displaced: str = "outward", rays: Sequence[float] = (), obstacles: str = "auto",
-                        bounds=None) -> None:
-    """Sector letters at the sector centres on the badge ring outside the rim, never under a badge.
+                        bounds=None, keepout: Sequence = (), required: Optional[Sequence[str]] = None) -> List[dict]:
+    """Sector letters outside the rim at the sector centres, never under a badge, a leader or a letter.
 
     Call after the badges, leaders, arrow and scale bar are drawn: with
     ``obstacles="auto"`` (default) every letter is tested against their real
-    drawn extents (a pill badge beside the disc reaches far out radially).  A
-    blocked letter first slides along the ring to the free spot nearest its
-    sector centre within +-38 deg (it stays in its own 90 deg sector); then
-    (``displaced="outward"`` or ``"slide"``) it moves radially outward past
-    the badges at its sector centre, up to 14 pt, while that stays clear and
-    inside ``bounds`` (a display-space box, default the axes: pass the free
-    room around the disc to let a blocked F or B sit just beyond the badges);
-    else it goes just inside the rim at the angle within +-38 deg of the
-    centre nearest to it that keeps clear of ``rays`` (plot angles of the
-    blue rays, degrees) and of the drawn dots and badges.
-    ``displaced="inside"`` skips the outward step.  ``obstacles="angles"``:
-    the old angular test against ``occupied`` only.
+    drawn extents (a pill badge beside the disc reaches far out radially) and
+    against ``keepout`` (display boxes or artists drawn elsewhere, e.g. the
+    row names beside the disc, kept ``LETTER_KEEPOUT_PT`` away).  A letter
+    sits on the badge ring at its sector centre, or slides along the ring
+    within +-38 deg (it stays in its own 90 deg sector), or
+    (``displaced="outward"`` / ``"slide"``, the default) moves out past the
+    badges -- up to ``LETTER_OUT_MAX_PT`` beyond the ring, within
+    ``LETTER_OUT_SWING_DEG`` of its centre -- while it stays clear and inside
+    ``bounds``: a display box, default the axes; pass the free room around
+    the disc (the whole gap between its neighbours) so the step can leave the
+    inset square.  Spots are tried nearest first (``LETTER_DEG_PT`` pt per
+    degree off the centre plus the points beyond the ring), so a letter
+    rather sits just past the badges in its own direction than far round
+    the ring.  A letter that still has no free spot outside the rim is
+    left out when it is not ``required`` (default: every letter but the first,
+    F: the strip's panel names already name the views, and a letter on the
+    map under the rays reads badly); a required one goes just inside the rim,
+    clear of ``rays`` (plot angles of the blue rays, degrees), the dots and
+    the badges.  ``displaced="inside"``: the older rule (ring at the centre,
+    else inside the rim, never left out).  ``obstacles="angles"``: the old
+    angular test against ``occupied`` only.
+
+    Returns one dict per letter: ``{"name", "mode", "theta", "radius_pt"}``,
+    ``mode`` one of "ring" (at its centre), "slid", "outward", "inside",
+    "omitted".
     """
     per_pt = pts_to_data(ax, 1.0)[0]
     px = ax.figure.dpi / 72.0
@@ -813,9 +844,22 @@ def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float
     ring_pt = r_pt + offset_pt
     inner_pt = r_pt - letter_pt / 2 - 2.4
     steps = sorted(np.arange(-38.0, 38.01, 1.0), key=lambda v: (abs(v), v))
+    rend = ax.figure.canvas.get_renderer()
     obst = _rendered_obstacles(ax) if obstacles == "auto" else []
+    for k in keepout:
+        bb = k if hasattr(k, "x0") else k.get_window_extent(rend)
+        obst.append(bb.padded(LETTER_KEEPOUT_PT * px))
     half_letter = math.degrees((letter_pt / 2 + 0.8) / ring_pt)
     ax_box = ax.get_window_extent() if bounds is None else bounds
+    required = (names[0],) if required is None else tuple(required)
+    if displaced == "inside":
+        required = tuple(names)
+    # every spot (points beyond the ring, degrees off the centre), nearest first
+    spots = [(0.0, float(d)) for d in steps]
+    if displaced in ("outward", "slide"):
+        spots += [(float(e), float(d)) for e in np.arange(1.0, LETTER_OUT_MAX_PT + 0.01, 1.0)
+                  for d in np.arange(-LETTER_OUT_SWING_DEG, LETTER_OUT_SWING_DEG + 0.01, 2.0)]
+    spots.sort(key=lambda ed: (ed[0] + LETTER_DEG_PT * abs(ed[1]), abs(ed[1]), ed[1]))
 
     def ang_free(th):
         return all(abs((th - t + 180) % 360 - 180) > w + half_letter for t, w in occupied)
@@ -828,14 +872,16 @@ def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float
         ok = [d for d in steps if dist[d] >= need]
         return th + (ok[0] if ok else max(steps, key=lambda d: dist[d]))
 
-    rend = ax.figure.canvas.get_renderer()
+    placed = []
     for name, centre_bearing in zip(names, geo.VIEW_YAWS_DEG):
         col = style.INK if name == names[0] else style.MUTED
         t = ax.text(0, 0, name, ha="center", va="center", fontsize=fs, fontweight="bold", color=col, zorder=6,
-                    path_effects=bold_effects(name, col, halo=1.1) if has_cjk(name) else HALO_THIN)
+                    path_effects=bold_effects(name, col, halo=1.1) if has_cjk(name) else HALO_THIN, clip_on=False)
         centre = 90.0 + centre_bearing
+        where = {}
 
         def put(th, radius_pt):
+            where.update(theta=float(th % 360.0), radius_pt=float(radius_pt))
             t.set_position((radius_pt * per_pt * math.cos(math.radians(th)),
                             radius_pt * per_pt * math.sin(math.radians(th))))
 
@@ -849,19 +895,17 @@ def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float
             return not any(bb.x0 - 0.8 * px < o.x1 and o.x0 < bb.x1 + 0.8 * px and bb.y0 - 0.8 * px < o.y1
                            and o.y0 < bb.y1 + 0.8 * px for o in obst)
 
-        done = False
-        for d in ([0.0] if displaced == "inside" else steps):
-            put(centre + d, ring_pt)
+        mode = None
+        for extra, d in ([(0.0, 0.0)] if displaced == "inside" else spots):
+            put(centre + d, ring_pt + extra)
             if free():
-                done = True
+                mode = "outward" if extra > 0 else ("ring" if d == 0.0 else "slid")
                 break
-        if not done and displaced in ("outward", "slide"):
-            for extra in np.arange(1.0, 14.01, 1.0):
-                put(centre, ring_pt + extra)
-                if free():
-                    done = True
-                    break
-        if not done and obstacles == "auto":  # just inside the rim, clear of the rays, dots and badges
+        if mode is None and name not in required:
+            t.remove()
+            placed.append({"name": name, "mode": "omitted", "theta": None, "radius_pt": None})
+            continue
+        if mode is None and obstacles == "auto":  # just inside the rim, clear of the rays, dots and badges
             inner_obst = obst + _inner_obstacles(ax)
             for rad in (inner_pt, inner_pt - 3.0, inner_pt - 6.0):
                 for d in steps:
@@ -869,14 +913,17 @@ def disc_sector_letters(ax, half_m: float, occupied: Sequence[Tuple[float, float
                     bb = t.get_window_extent(rend)
                     if not any(bb.x0 - 0.6 * px < o.x1 and o.x0 < bb.x1 + 0.6 * px and bb.y0 - 0.6 * px < o.y1
                                and o.y0 < bb.y1 + 0.6 * px for o in inner_obst):
-                        done = True
+                        mode = "inside"
                         break
-                if done:
+                if mode is not None:
                     break
-        if not done:
+        if mode is None:
             put(inside_angle(centre), inner_pt)
+            mode = "inside"
         if obstacles == "auto":
             obst.append(t.get_window_extent(rend))
+        placed.append({"name": name, "mode": mode, **where})
+    return placed
 
 
 def disc_direction_arrow(ax, half_m: float, start_bearing: float = STRIP_START_DEG, sweep_deg: float = 34.0,
@@ -922,8 +969,9 @@ def elevation_window(rows, arm: str = "vo", default: float = None, margin: float
 
     ``(lo, hi)`` degrees for the affordance map rows of one figure block showing
     ``rows`` (``data.CaseRow``): ``+-EL_DEFAULT`` (10 deg), widened on each side
-    just enough (``EL_MARGIN`` so the x mark fits, whole degrees) to include
-    every GT-visible slot's ground-truth peak and every drawn predicted peak
+    just enough (whole degrees) that every GT-visible slot's ground-truth peak
+    and every drawn predicted peak lies at least ``EL_MARGIN`` (6 deg) inside
+    it, so an x -- staggered or not -- stays clear of the row's frame
     (GT-visible slots with P(not visible) <= 0.5, ``CaseRow.peak_slots``), at
     most ``+-EL_MAX`` (45 deg, the views' own vertical field of view).  State it
     in the caption with ``elevation_text``.
@@ -1153,21 +1201,30 @@ def frame_label(frame_id: int, frame_count: int, lang: str = "en") -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Bold Chinese text: the CJK font has no bold face, so bold is drawn as a thin stroke of the text's own colour
+# Bold Chinese text: the CJK font has no bold face.  A thin stroke of the text's own colour used to fake it, but
+# at print size it closed the counters of dense glyphs (真值, 预测, 模型输入) and read as smeared, so CJK text asked
+# to be bold is set in the regular weight; its colour / size carry the emphasis.  True turns the stroke back on.
 # --------------------------------------------------------------------------- #
+CJK_FAKE_BOLD = False
 def has_cjk(text: str) -> bool:
     """True when ``text`` holds CJK ideographs or full-width forms."""
     return any("　" <= ch <= "鿿" or "＀" <= ch <= "￯" for ch in str(text))
 
 
+def bold_weight(text: str) -> str:
+    """``fontweight`` for text meant to be bold: "normal" when it holds CJK (the CJK glyphs cannot be bold, and
+    bold Latin digits beside regular CJK read as a mismatch, e.g. "主图候选 4（共 5 个）"), else "bold"."""
+    return "normal" if (has_cjk(text) and not CJK_FAKE_BOLD) else "bold"
+
+
 def bold_effects(text: str, color, halo: Optional[float] = None, stroke_pt: float = 0.45):
-    """``path_effects`` for bold ``text``: with CJK characters a ``stroke_pt`` stroke in ``color`` (fake bold,
-    since the CJK font has no bold face), under an optional white ``halo`` of that line width; ``None`` when
-    neither applies (Latin bold comes from the font)."""
+    """``path_effects`` for bold ``text``: an optional white ``halo`` of that line width; with CJK characters and
+    ``CJK_FAKE_BOLD`` also a ``stroke_pt`` stroke in ``color`` (fake bold; off by default: CJK bold text is set in
+    the regular weight, see above); ``None`` when neither applies (Latin bold comes from the font)."""
     effects = []
     if halo:
         effects.append(pe.Stroke(linewidth=halo, foreground="white"))
-    if has_cjk(text):
+    if CJK_FAKE_BOLD and has_cjk(text):
         effects.append(pe.Stroke(linewidth=stroke_pt, foreground=color))
     return effects + [pe.Normal()] if effects else None
 
@@ -1186,7 +1243,7 @@ def gutter_row_label(ax_row, text: str, kind: str, fs: float = ROW_LABEL_FS, gap
     just above the row's middle and a tiny colour ramp key (``key_w_pt`` x
     ``key_h_pt``) just below it, both ending ``gap_pt`` left of the row.  The
     same place in every block of every figure, whatever the maps show.  Bold
-    (a CJK name gets ``bold_effects``).  Returns ``(text, key_axes)`` so a
+    (a CJK name: regular weight, ``bold_effects``).  Returns ``(text, key_axes)`` so a
     caller can keep other marks clear of them.
     """
     fig = ax_row.figure
@@ -1421,116 +1478,416 @@ def peak_marks(row, arm: str, elev, ppd: float, merge_deg: float = MERGE_DEG, ma
     return marks
 
 
-def place_miss_labels(marks: Sequence[dict], ppd: float, elev, heat=None, below: bool = False,
-                      mark_pt: float = MARK_PT, lines: Sequence[Sequence[Tuple[float, float]]] = ()) -> dict:
-    """Where each numbered miss's badge goes (pure layout, strip degrees; D2).
+LEADER_CLEAR_PT = 0.6  # a moved badge's leader keeps this far from every other x / badge box ...
+GRAZE_SKIP_PT = 1.2  # ... past its first 1.2 pt (it starts at its own x)
+PROX_LEADER_PT, PROX_MARGIN_PT = 6.0, 1.5  # a leader this long names its x; else the badge must be clearly nearest it
+SEARCH_BUDGET = 150  # badge placements each layout search may try per row
+TOPK, TOPK_SEP_PT = 3, 3.0  # the search also tries each badge's 3 cheapest spots at least 3 pt apart
+ON_LINE_CLEAR_PT = 1.8  # a badge keeps this far from a dotted connector (its white outline takes 1.2 pt of it)
+LONG_LEADER_PT = 24.0  # a leader longer than this is a problem (the lane under the row is tried instead)
 
-    ``marks``: ``peak_marks`` output; one badge per miss mark.  A
-    badge sits beside its own x, or slides along one of the lanes inside the
+
+def _box_gap(a, b) -> float:
+    """Gap (pt) between two boxes (x0, x1, y0, y1); 0 when they touch or overlap."""
+    return math.hypot(max(0.0, a[0] - b[1], b[0] - a[1]), max(0.0, a[2] - b[3], b[2] - a[3]))
+
+
+def _is_miss(m: dict) -> bool:
+    return bool(m.get("miss", m.get("slot") is not None))
+
+
+def _miss_order(marks: Sequence[dict]) -> List[int]:
+    """Mark indices of the misses, left to right."""
+    return [j for j, m in sorted([(j, m) for j, m in enumerate(marks) if _is_miss(m)], key=lambda jm: jm[1]["x"])]
+
+
+def _segments_hit_boxes(ax_, ay_, bx_, by_, boxes) -> np.ndarray:
+    """(n, m) bool: segment i (arrays ``a`` -> ``b``) meets box j ``(x0, x1, y0, y1)`` (Liang-Barsky clipping)."""
+    B = np.asarray(boxes, dtype=float).reshape(-1, 4)
+    ax_, ay_ = np.asarray(ax_, float)[:, None], np.asarray(ay_, float)[:, None]
+    dx, dy = np.asarray(bx_, float)[:, None] - ax_, np.asarray(by_, float)[:, None] - ay_
+    t0 = np.zeros((ax_.shape[0], len(B)))
+    t1 = np.ones_like(t0)
+    ok = np.ones_like(t0, dtype=bool)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for p_, q_ in ((-dx, ax_ - B[None, :, 0]), (dx, B[None, :, 1] - ax_),
+                       (-dy, ay_ - B[None, :, 2]), (dy, B[None, :, 3] - ay_)):
+            p_ = np.broadcast_to(p_, t0.shape)
+            r = q_ / p_
+            ok &= ~((p_ == 0) & (q_ < 0))
+            t0 = np.where(p_ < 0, np.maximum(t0, r), t0)
+            t1 = np.where(p_ > 0, np.minimum(t1, r), t1)
+    return ok & (t0 <= t1)
+
+
+class _MissPlacer:
+    """Candidate spots and their cost for one miss badge at a time (``place_miss_labels``).
+
+    A badge sits beside its own x, or slides along one of the lanes inside the
     row (every 2 pt between the frame's inner edges), or -- with ``below`` --
-    in the lane ``BELOW_LANE_PT`` under the row.  It never overlaps another x
-    or badge, its leader (drawn when it is not level with its x or has slid
-    away) never runs through another x or badge, and a badge without a leader
-    is clearly nearer its own x than any other (``LABEL_CLEAR_PT``).  Among the
-    rest: nearest its x, inside the row before the lane below, then least heat
-    under it (``heat(x0, x1, y0, y1)`` in degrees, optional).  ``lines``:
-    polylines (strip degrees) a badge should not sit on (the dotted
-    connectors, ``miss_connectors``).  Returns
-    ``{"labels": {mark index: {"cx", "cy", "label", "slots", "leader": ((x0, y0),
-    (x1, y1)) or None, "below": bool}}, "clean": bool}`` -- ``clean`` False when some badge could
-    not avoid an overlap or a crossing (then call again with ``below=True``).
+    in the lane ``BELOW_LANE_PT`` under the row.  Cost, compared in order:
+    overlaps another x or badge; its leader runs through (or within
+    ``LEADER_CLEAR_PT`` of) another x or badge; its leader crosses a dotted
+    connector (``lines``) or an earlier badge's leader; it is not clearly
+    nearer its own x than any other (``LABEL_CLEAR_PT``, 2 pt with a leader);
+    it sits on (within ``ON_LINE_CLEAR_PT`` of) a connector; its leader is
+    longer than ``LONG_LEADER_PT``; overlap area; the soft cost (distance
+    from its x, a leader, the lane below); heat under it.  All candidates of a badge are
+    scored at once (numpy); results are cached per set of badges already
+    placed.
     """
-    lo, hi = elev_window(elev)
-    Ylo, Yhi, W = lo * ppd, hi * ppd, 360.0 * ppd
-    half = mark_pt / 2 + 0.8
-    bh = MISS_BH
-    boxes = [(m["x"] * ppd - half, m["x"] * ppd + half, m["y"] * ppd - half, m["y"] * ppd + half) for m in marks]
-    in_lo, in_hi = Ylo + bh + 0.9, Yhi - bh - 0.9
-    grid = list(np.arange(in_lo, in_hi + 1e-6, 2.0)) if in_hi >= in_lo else [(Ylo + Yhi) / 2]
-    below_y = Ylo - BELOW_LANE_PT
 
-    def gap(b, lo_, hi_, ylo, yhi):
-        b0, b1, c0, c1 = b
-        return math.hypot(max(0.0, b0 - hi_, lo_ - b1), max(0.0, c0 - yhi, ylo - c1))
+    def __init__(self, marks, ppd: float, elev, heat=None, below: bool = False, mark_pt: float = MARK_PT,
+                 lines=()):
+        self.marks, self.ppd, self.heat, self.below = marks, ppd, heat, below
+        lo, hi = elev_window(elev)
+        self.Ylo, self.Yhi, self.W = lo * ppd, hi * ppd, 360.0 * ppd
+        self.half = mark_pt / 2 + 0.8
+        self.bh = MISS_BH
+        half = self.half
+        self.boxes = [(m["x"] * ppd - half, m["x"] * ppd + half, m["y"] * ppd - half, m["y"] * ppd + half)
+                      for m in marks]
+        self.in_lo, self.in_hi = self.Ylo + self.bh + 0.9, self.Yhi - self.bh - 0.9
+        self.grid = (list(np.arange(self.in_lo, self.in_hi + 1e-6, 2.0)) if self.in_hi >= self.in_lo
+                     else [(self.Ylo + self.Yhi) / 2])
+        self.below_y = self.Ylo - BELOW_LANE_PT
+        self.segs = [(tuple(np.asarray(ln[0], float) * ppd), tuple(np.asarray(ln[-1], float) * ppd)) for ln in lines]
+        line_pts = []
+        for ln in lines:
+            q = np.asarray(ln, dtype=float) * ppd
+            for a_, b_ in zip(q[:-1], q[1:]):
+                n_ = max(2, int(np.hypot(*(b_ - a_)) / 1.0))
+                line_pts.append(np.linspace(a_, b_, n_))
+        self.line_pts = np.concatenate(line_pts) if line_pts else np.zeros((0, 2))
+        self._cache = {}
 
-    def overlap(b, lo_, hi_, ylo, yhi):
-        b0, b1, c0, c1 = b
-        return max(0.0, min(hi_, b1) - max(lo_, b0)) * max(0.0, min(yhi, c1) - max(ylo, c0))
+    def _candidates(self, j_own: int, bw: float):
+        """Candidate badge boxes of mark ``j_own`` (arrays): lo, hi, ly, sgn, shift, is_below."""
+        xp, yp = self.marks[j_own]["x"] * self.ppd, self.marks[j_own]["y"] * self.ppd
+        half, bh = self.half, self.bh
+        lanes = [(float(np.clip(yp, self.in_lo, self.in_hi)) if self.in_hi >= self.in_lo else self.grid[0], False)]
+        lanes += [(float(y), False) for y in self.grid]
+        if self.below:
+            lanes.append((self.below_y, True))
+        shifts = np.arange(0.0, 96.0, 1.5)
+        out = []
+        for ly, is_below in lanes:
+            for sgn in (1.0, -1.0):
+                a = xp + sgn * (half + 0.6 + shifts)
+                lo_ = a if sgn > 0 else a - bw
+                out.append(np.column_stack([lo_, lo_ + bw, np.full_like(a, ly), np.full_like(a, sgn), shifts,
+                                            np.full_like(a, float(is_below))]))
+            if abs(ly - yp) >= half + bh + 0.4:  # straight above / below its x
+                out.append(np.array([[xp - bw / 2, xp + bw / 2, ly, 0.0, 0.0, float(is_below)]]))
+        c = np.concatenate(out)
+        return c[(c[:, 0] >= 0.5) & (c[:, 1] <= self.W - 0.5)]
 
-    def crosses(p0, p1, skip):
-        ts = np.linspace(0.0, 1.0, 20)
-        qx, qy = p0[0] + ts * (p1[0] - p0[0]), p0[1] + ts * (p1[1] - p0[1])
-        return any(np.any((qx > b0 + 0.3) & (qx < b1 - 0.3) & (qy > c0 + 0.3) & (qy < c1 - 0.3))
-                   for j, (b0, b1, c0, c1) in enumerate(boxes) if j != skip)
-
-    line_pts = []
-    for ln in lines:
-        q = np.asarray(ln, dtype=float) * ppd
-        for a_, b_ in zip(q[:-1], q[1:]):
-            n_ = max(2, int(np.hypot(*(b_ - a_)) / 1.0))
-            line_pts.append(np.linspace(a_, b_, n_))
-    line_pts = np.concatenate(line_pts) if line_pts else np.zeros((0, 2))
-
-    def on_line(lo_, hi_, ylo, yhi):
-        if not len(line_pts):
-            return False
-        return bool(np.any((line_pts[:, 0] > lo_ - 0.4) & (line_pts[:, 0] < hi_ + 0.4)
-                           & (line_pts[:, 1] > ylo - 0.4) & (line_pts[:, 1] < yhi + 0.4)))
-
-    out, clean = {}, True
-    for j_own, m in sorted([(j, m) for j, m in enumerate(marks) if m.get("miss", m.get("slot") is not None)],
-                           key=lambda jm: jm[1]["x"]):
+    def place(self, j_own: int, placed: Sequence[tuple], k: int = 1):
+        """The best spot of miss mark ``j_own`` given ``placed`` = [(box, leader or None), ...] of the badges
+        already placed: ``(label entry, cost, (box, leader))``; with ``k`` > 1 a list of the ``k`` best spots
+        at least ``TOPK_SEP_PT`` apart."""
+        memo = (j_own, k, tuple(sorted((tuple(round(v, 3) for v in b), None if ld is None else
+                                        tuple(round(v, 3) for p in ld for v in p)) for b, ld in placed)))
+        if memo in self._cache:
+            return self._cache[memo]
+        ppd, half, bh = self.ppd, self.half, self.bh
+        boxes = self.boxes + [b for b, _ in placed]
+        leaders = self.segs + [ld for _, ld in placed if ld is not None]
+        m = self.marks[j_own]
         label = m.get("label") or slots_label(m["slots"])
         bw = badge_width_pt(label)
         xp, yp = m["x"] * ppd, m["y"] * ppd
-        others = [j for j in range(len(boxes)) if j != j_own]
-        lanes = [(float(np.clip(yp, in_lo, in_hi)) if in_hi >= in_lo else grid[0], False)]
-        lanes += [(float(y), False) for y in grid]
-        if below:
-            lanes.append((below_y, True))
-        best = None
-        for ly, is_below in lanes:
-            cands = []
-            for shift in np.arange(0.0, 96.0, 1.5):
-                for sgn in (1.0, -1.0):
-                    a = xp + sgn * (half + 0.6 + shift)
-                    lo_, hi_ = (a, a + bw) if sgn > 0 else (a - bw, a)
-                    cands.append((lo_, hi_, sgn, shift))
-            if abs(ly - yp) >= half + bh + 0.4:  # straight above / below its x
-                cands.append((xp - bw / 2, xp + bw / 2, 0.0, 0.0))
-            for lo_, hi_, sgn, shift in cands:
-                if lo_ < 0.5 or hi_ > W - 0.5:
-                    continue
-                ylo, yhi = ly - bh, ly + bh
-                hard = sum(overlap(boxes[j], lo_, hi_, ylo, yhi) for j in others)
-                if sgn == 0.0:
-                    hard += overlap(boxes[j_own], lo_, hi_, ylo, yhi)
-                cx = (lo_ + hi_) / 2
-                d = np.array([cx - xp, ly - yp])
-                dist = float(np.hypot(*d))
-                u = d / max(dist, 1e-9)
-                p0 = (xp + u[0] * half * 0.85, yp + u[1] * half * 0.85)
-                rb = bh if bw <= 7.5 else min(bw / 2 / (abs(u[0]) + 1e-9), bh / (abs(u[1]) + 1e-9))
-                p1 = (cx - u[0] * (rb + 0.2), ly - u[1] * (rb + 0.2))
-                leader = (shift > 0 or abs(ly - yp) > 1.5 or is_below or sgn == 0.0) and math.hypot(
-                    p1[0] - p0[0], p1[1] - p0[1]) >= 1.2
-                cross = leader and crosses(p0, p1, j_own)
-                near = min([gap(boxes[j], lo_, hi_, ylo, yhi) for j in others], default=99.0)
-                ambiguous = near < (LABEL_CLEAR_PT if not leader else 2.0)  # nearer another x than its own
-                soft = (shift + 0.8 * abs(ly - yp) + (2.0 if leader else 0.0)
-                        + 2.0 * max(0.0, LABEL_CLEAR_PT - near) + (8.0 if is_below else 0.0))
-                h = heat(lo_ / ppd, hi_ / ppd, ylo / ppd, yhi / ppd) if heat is not None else 0.0
-                cost = (hard > 0.01, cross, ambiguous, on_line(lo_, hi_, ylo, yhi), hard, soft, h)
-                if best is None or cost < best[0]:
-                    best = (cost, cx, ly, p0, p1, leader, is_below)
-        cost, cx, ly, p0, p1, leader, is_below = best
-        if cost[0] or cost[1]:
-            clean = False
-        out[j_own] = {"cx": cx / ppd, "cy": ly / ppd, "below": bool(is_below), "label": label,
-                      "slots": list(m["slots"]),
-                      "leader": ((p0[0] / ppd, p0[1] / ppd), (p1[0] / ppd, p1[1] / ppd)) if leader else None}
-        boxes.append((cx - bw / 2, cx + bw / 2, ly - bh, ly + bh))
-    return {"labels": out, "clean": clean}
+        O = np.array([boxes[j] for j in range(len(boxes)) if j != j_own], dtype=float).reshape(-1, 4)
+        C = self._candidates(j_own, bw)
+        lo_, hi_, ly, sgn, shift, is_below = C.T
+        ylo, yhi = ly - bh, ly + bh
+        n = len(C)
+
+        def overlap(B):  # (n, len(B)) overlap areas
+            w = np.clip(np.minimum(hi_[:, None], B[None, :, 1]) - np.maximum(lo_[:, None], B[None, :, 0]), 0, None)
+            h = np.clip(np.minimum(yhi[:, None], B[None, :, 3]) - np.maximum(ylo[:, None], B[None, :, 2]), 0, None)
+            return w * h
+
+        hard = overlap(O).sum(1) if len(O) else np.zeros(n)
+        own = overlap(np.array([boxes[j_own]], dtype=float))[:, 0]
+        hard = hard + np.where(sgn == 0.0, own, 0.0)
+        cx = (lo_ + hi_) / 2
+        dx, dy = cx - xp, ly - yp
+        dist = np.maximum(np.hypot(dx, dy), 1e-9)
+        ux, uy = dx / dist, dy / dist
+        p0x, p0y = xp + ux * half * 0.85, yp + uy * half * 0.85
+        rb = np.where(bw <= 7.5, bh, np.minimum(bw / 2 / (np.abs(ux) + 1e-9), bh / (np.abs(uy) + 1e-9)))
+        p1x, p1y = cx - ux * (rb + 0.2), ly - uy * (rb + 0.2)
+        leader = (((shift > 0) | (np.abs(ly - yp) > 1.5) | (is_below > 0) | (sgn == 0.0))
+                  & (np.hypot(p1x - p0x, p1y - p0y) >= 1.2))
+        # a leader through (or grazing, past its first GRAZE_SKIP_PT) another x or badge: exact segment tests
+        cross = np.zeros(n, dtype=bool)
+        if len(O):
+            inside = _segments_hit_boxes(p0x, p0y, p1x, p1y, O + np.array([0.3, -0.3, 0.3, -0.3]))
+            L_ = np.maximum(np.hypot(p1x - p0x, p1y - p0y), 1e-9)
+            g = np.minimum(GRAZE_SKIP_PT / L_, 1.0)
+            gx, gy = p0x + g * (p1x - p0x), p0y + g * (p1y - p0y)
+            clr = LEADER_CLEAR_PT
+            graze = _segments_hit_boxes(gx, gy, p1x, p1y, O + np.array([-clr, clr, -clr, clr]))
+            cross = leader & (inside | (graze & (g < 1.0)[:, None])).any(axis=1)
+        # a leader crossing a connector or an earlier leader (proper crossing)
+        lcross = np.zeros(n, dtype=bool)
+        if leaders:
+            S = np.array([[a[0], a[1], b[0], b[1]] for a, b in leaders], dtype=float)
+            q1x, q1y, q2x, q2y = (S[:, i][None, :] for i in range(4))
+            P0x, P0y, P1x, P1y = p0x[:, None], p0y[:, None], p1x[:, None], p1y[:, None]
+
+            def orient(ax_, ay_, bx_, by_, cx_, cy_):
+                return (bx_ - ax_) * (cy_ - ay_) - (by_ - ay_) * (cx_ - ax_)
+
+            d1 = orient(q1x, q1y, q2x, q2y, P0x, P0y)
+            d2 = orient(q1x, q1y, q2x, q2y, P1x, P1y)
+            d3 = orient(P0x, P0y, P1x, P1y, q1x, q1y)
+            d4 = orient(P0x, P0y, P1x, P1y, q2x, q2y)
+            lcross = leader & ((d1 * d2 < 0) & (d3 * d4 < 0)).any(axis=1)
+        if len(O):
+            gx = np.clip(np.maximum(O[None, :, 0] - hi_[:, None], lo_[:, None] - O[None, :, 1]), 0, None)
+            gy = np.clip(np.maximum(O[None, :, 2] - yhi[:, None], ylo[:, None] - O[None, :, 3]), 0, None)
+            near = np.hypot(gx, gy).min(axis=1)
+        else:
+            near = np.full(n, 99.0)
+        ambiguous = near < np.where(leader, 2.0, LABEL_CLEAR_PT)  # nearer another x than its own
+        lp = self.line_pts
+        if len(lp):
+            c_ = ON_LINE_CLEAR_PT
+            on_line = ((lp[None, :, 0] > lo_[:, None] - c_) & (lp[None, :, 0] < hi_[:, None] + c_)
+                       & (lp[None, :, 1] > ylo[:, None] - c_) & (lp[None, :, 1] < yhi[:, None] + c_)).any(axis=1)
+        else:
+            on_line = np.zeros(n, dtype=bool)
+        soft = (shift + 0.8 * np.abs(ly - yp) + np.where(leader, 2.0, 0.0)
+                + 2.0 * np.clip(LABEL_CLEAR_PT - near, 0, None) + np.where(is_below > 0, 8.0, 0.0))
+        far = leader & (np.hypot(p1x - p0x, p1y - p0y) > LONG_LEADER_PT)
+        terms = [hard > 0.01, cross, lcross, ambiguous, on_line, far, hard, soft]
+        order = np.lexsort([np.round(t.astype(float), 9) for t in reversed(terms)])
+        nflag = 6
+
+        def cost_of(i):
+            return tuple([bool(t[i]) for t in terms[:nflag]] + [float(t[i]) for t in terms[nflag:]])
+
+        def with_heat(idx):
+            """Break ties of the other terms by the heat under the badge (the last term)."""
+            if self.heat is None:
+                return [(cost_of(i) + (0.0,), i) for i in idx]
+            return sorted(((cost_of(i) + (float(self.heat(lo_[i] / ppd, hi_[i] / ppd, ylo[i] / ppd, yhi[i] / ppd)),),
+                            i) for i in idx), key=lambda t: t[0])
+
+        def entry(cost, i):
+            ld = ((p0x[i], p0y[i]), (p1x[i], p1y[i])) if leader[i] else None
+            lab = {"cx": cx[i] / ppd, "cy": ly[i] / ppd, "below": bool(is_below[i]), "label": label,
+                   "slots": list(m["slots"]),
+                   "leader": ((p0x[i] / ppd, p0y[i] / ppd), (p1x[i] / ppd, p1y[i] / ppd)) if leader[i] else None}
+            return lab, cost, ((cx[i] - bw / 2, cx[i] + bw / 2, ly[i] - bh, ly[i] + bh),
+                               None if ld is None else (tuple(map(float, ld[0])), tuple(map(float, ld[1]))))
+
+        if k == 1:
+            first = cost_of(order[0])
+            ties = [i for i in order[:64] if cost_of(i) == first]
+            cost, i = with_heat(ties)[0]
+            res = entry(cost, i)
+        else:
+            keep = []
+            for cost, i in with_heat(order[:400]):
+                if all(math.hypot(cx[i] - cx[q], ly[i] - ly[q]) >= TOPK_SEP_PT for _, q in keep):
+                    keep.append((cost, i))
+                    if len(keep) == k:
+                        break
+            res = [entry(c, i) for c, i in keep]
+        self._cache[memo] = res
+        return res
+
+
+def _as_layout(seq: Sequence[tuple]) -> dict:
+    """``place_miss_labels`` result from ``[(j, label entry, cost, (box, leader)), ...]`` (placing order)."""
+    return {"labels": {j: lab for j, lab, _, _ in seq}, "costs": {j: c for j, _, c, _ in seq},
+            "clean": not any(c[0] or c[1] for _, _, c, _ in seq)}
+
+
+def leader_crossings(placed: dict, lines: Sequence = ()) -> int:
+    """Crossings of a layout's leaders with each other and with the dotted connectors ``lines``."""
+    leaders = [lab["leader"] for lab in placed["labels"].values() if lab["leader"] is not None]
+    n = 0
+    for i, (a, b) in enumerate(leaders):
+        n += sum(_segments_cross(a, b, ln[0], ln[-1]) for ln in lines)
+        n += sum(_segments_cross(a, b, c, d) for c, d in leaders[i + 1:])
+    return n
+
+
+def unclear_badges(placed: dict, marks: Sequence[dict], ppd: float, mark_pt: float = MARK_PT) -> int:
+    """Badges that read as labelling another x: no leader or a short one (< ``PROX_LEADER_PT``) while another x
+    is about as close as their own (within ``PROX_MARGIN_PT``)."""
+    half = mark_pt / 2 + 0.8
+    xbox = [(m["x"] * ppd - half, m["x"] * ppd + half, m["y"] * ppd - half, m["y"] * ppd + half) for m in marks]
+    n = 0
+    for j, lab in placed["labels"].items():
+        bw = badge_width_pt(lab["label"])
+        cx, cy = lab["cx"] * ppd, lab["cy"] * ppd
+        box = (cx - bw / 2, cx + bw / 2, cy - MISS_BH, cy + MISS_BH)
+        lead = 0.0
+        if lab["leader"] is not None:
+            (x0, y0), (x1, y1) = lab["leader"]
+            lead = math.hypot(x1 - x0, y1 - y0) * ppd
+        if lead >= PROX_LEADER_PT:
+            continue
+        own = _box_gap(box, xbox[j])
+        other = min([_box_gap(box, b) for i, b in enumerate(xbox) if i != j], default=99.0)
+        n += other < own + PROX_MARGIN_PT
+    return n
+
+
+def layout_key(placed: dict, lines: Sequence, marks: Sequence[dict], ppd: float, mark_pt: float = MARK_PT) -> tuple:
+    """Badness of a miss-badge layout, compared in order: not clean (an overlap, or a leader through another x),
+    leader crossings (``leader_crossings``), badges nearer another x than their own, badges that read as
+    labelling another x (``unclear_badges``), badges on a connector, leaders longer than ``LONG_LEADER_PT``,
+    then the summed soft cost.  Every term
+    only grows as badges are added, so the key of a partial layout bounds all its completions."""
+    costs = list(placed["costs"].values())
+    return (not placed["clean"], leader_crossings(placed, lines), sum(bool(c[3]) for c in costs),
+            unclear_badges(placed, marks, ppd, mark_pt), sum(bool(c[4]) for c in costs),
+            sum(bool(c[5]) for c in costs), round(sum(c[7] for c in costs), 3))
+
+
+def place_miss_labels(marks: Sequence[dict], ppd: float, elev, heat=None, below: bool = False,
+                      mark_pt: float = MARK_PT, lines: Sequence[Sequence[Tuple[float, float]]] = (),
+                      search: bool = True) -> dict:
+    """Where each numbered miss's badge goes (pure layout, strip degrees; D2).
+
+    ``marks``: ``peak_marks`` output; one badge per miss mark, placed by
+    ``_MissPlacer`` (beside its own x, along a lane inside the row, or -- with
+    ``below`` -- in the lane ``BELOW_LANE_PT`` under the row; see its cost).
+    ``heat(x0, x1, y0, y1)`` (degrees, optional) breaks ties by the heat under
+    a badge; ``lines``: the dotted connectors (``miss_connectors``), which a
+    badge should not sit on and a leader should not cross.
+
+    Badges are placed left to right, each at its cheapest spot given the ones
+    before.  In a crowded row an early badge can take the one spot a later
+    one needed, so when that layout has a problem (anything ``layout_key``
+    counts before the soft cost) and ``search`` is on, two small depth-first
+    searches with branch and bound on ``layout_key`` look for a better one:
+    over placing orders, and left to right with each badge also tried at its
+    2nd and 3rd cheapest spot (``SEARCH_BUDGET`` placements each); ties keep
+    the left-to-right layout.
+
+    Returns ``{"labels": {mark index: {"cx", "cy", "label", "slots", "leader":
+    ((x0, y0), (x1, y1)) or None, "below": bool}}, "clean": bool, "costs",
+    "key", "crossings"}`` -- ``clean`` False when some badge overlaps another
+    x or badge or its leader runs through one (then call again with
+    ``below=True``); ``crossings``: leaders crossing a leader or connector.
+    """
+    P = _MissPlacer(marks, ppd, elev, heat=heat, below=below, mark_pt=mark_pt, lines=lines)
+    asc = _miss_order(marks)
+
+    def key_of(seq):
+        return layout_key(_as_layout(seq), lines, marks, ppd, mark_pt)
+
+    seq = []
+    for j in asc:
+        lab, cost, bl = P.place(j, [q[3] for q in seq])
+        seq.append((j, lab, cost, bl))
+    best = [key_of(seq), seq]
+    if search and any(best[0][:6]):
+        def done(prefix):
+            key = key_of(prefix)
+            if key < best[0]:
+                best[0], best[1] = key, list(prefix)
+
+        def promising(prefix):
+            return key_of(prefix) < best[0]  # else every completion is at least as bad
+
+        def by_order(prefix, remaining, budget):
+            if not remaining:
+                return done(prefix)
+            for j in remaining:
+                if budget[0] <= 0:
+                    return
+                budget[0] -= 1
+                nxt = prefix + [(j,) + P.place(j, [q[3] for q in prefix])]
+                if promising(nxt):
+                    by_order(nxt, [i for i in remaining if i != j], budget)
+
+        def by_spot(prefix, remaining, budget):
+            if not remaining:
+                return done(prefix)
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
+            j = remaining[0]
+            for choice in P.place(j, [q[3] for q in prefix], k=TOPK):
+                nxt = prefix + [(j,) + choice]
+                if promising(nxt):
+                    by_spot(nxt, remaining[1:], budget)
+
+        by_order([], asc, [SEARCH_BUDGET])
+        by_spot([], asc, [SEARCH_BUDGET])
+    out = _as_layout(best[1])
+    out["key"] = best[0]
+    out["crossings"] = best[0][1]
+    return out
+
+
+def plan_miss_badges(row, marks: Sequence[dict], ppd: float, elev, heat=None, mark_pt: float = MARK_PT,
+                     allow_below: bool = True, tag: str = "") -> dict:
+    """The whole D2 layout of one prediction row: dotted connectors, badge spots, the lane below if needed.
+
+    1. connectors = ``miss_connectors``; badges inside the row
+       (``place_miss_labels``);
+    2. if that layout has a problem (``layout_key`` before the soft cost) and
+       ``allow_below``: the same with the lane under the row, kept when
+       strictly better;
+    3. connectors are allowed, not required (D2): while a problem remains,
+       the connector whose removal helps most is left out (one at a time,
+       only when that is strictly better), and last the row without any.
+
+    Returns ``{"placed", "below", "connectors", "warnings", "key"}``;
+    ``connectors``: the dotted lines to draw (``draw_miss_connectors(...,
+    lines=...)``).
+    """
+    def layout(conn, search=True):
+        placed = place_miss_labels(marks, ppd, elev, heat=heat, below=False, mark_pt=mark_pt, lines=conn,
+                                   search=search)
+        below = False
+        if allow_below and any(placed["key"][:6]):
+            pb = place_miss_labels(marks, ppd, elev, heat=heat, below=True, mark_pt=mark_pt, lines=conn,
+                                   search=search)
+            if pb["key"][:6] < placed["key"][:6]:
+                placed, below = pb, any(v["below"] for v in pb["labels"].values())
+        return placed, below
+
+    def better(a, b):  # layout a = (placed, below) strictly better than b, and no lane below that b did without
+        return a[0]["key"][:6] < b[0]["key"][:6] and a[1] <= b[1]
+
+    conn = miss_connectors(row, marks, elev, ppd, mark_pt)
+    cur = layout(conn)
+    while conn and any(cur[0]["key"][:6]):
+        # removals ranked by the quick (greedy) layout, then laid out fully in that order: the first one that
+        # is strictly better is taken
+        trials = sorted(((layout(conn[:i] + conn[i + 1:], search=False), i) for i in range(len(conn))),
+                        key=lambda t: (t[0][0]["key"], t[0][1], t[1]))
+        for _, i in trials:
+            nxt = layout(conn[:i] + conn[i + 1:])
+            if better(nxt, cur):
+                cur, conn = nxt, conn[:i] + conn[i + 1:]
+                break
+        else:
+            break
+    if conn and any(cur[0]["key"][:6]):
+        alt = layout([])
+        if better(alt, cur):
+            cur, conn = alt, []
+    placed, below = cur
+    pre = f"{tag}: " if tag else ""
+    warnings = []
+    if below:
+        warnings.append(f"{pre}miss badges need the lane under the prediction row")
+    if not placed["clean"]:
+        warnings.append(f"{pre}a miss badge overlaps or its leader crosses another mark")
+    if placed["crossings"]:
+        warnings.append(f"{pre}a miss badge's leader crosses {placed['crossings']} connector(s) or leader(s)")
+    return {"placed": placed, "below": below, "connectors": conn, "warnings": warnings, "key": placed["key"]}
 
 
 def heat_lookup(strip: np.ndarray, elev):
@@ -1552,39 +1909,58 @@ def draw_peak_marks(ax, marks: Sequence[dict], size: float = MARK_PT) -> None:
 
 
 CONNECTOR_MAX_DEG = 45.0  # a miss farther than this from its true bearing gets no dotted connector
+CONNECTOR_CLEAR_PT = MARK_PT / 2 + 0.3  # ... nor one that passes closer than this to another x
 
 
 def miss_connectors(row, marks: Sequence[dict], elev, ppd: float, mark_pt: float = MARK_PT,
                     max_deg: float = CONNECTOR_MAX_DEG) -> List[list]:
-    """Per numbered miss: [(x0, y0), (x1, y1)] in strip degrees, from its true-bearing tick (the row's bottom
-    edge) to the edge of its own x -- none when the x sits on the tick, or lies more than ``max_deg`` along the
-    strip from it (a line across whole views would cross other marks; the numbers still pair the x with its
-    tick and lane badge)."""
+    """Dotted connectors (D2: allowed, not required): ``[(x0, y0), (x1, y1)]`` in strip degrees, at most one per
+    numbered miss x, from a true-bearing tick (the row's bottom edge) to the edge of the x.
+
+    A shared x ("4–5") gets one line, from the tick of its slots nearest to it
+    (a line per slot fanned out from one x); none when the x sits on the tick,
+    lies more than ``max_deg`` along the strip from it (a line across whole
+    views would cross other marks; the numbers still pair the x with its tick
+    and lane badge), passes within ``CONNECTOR_CLEAR_PT`` of another x (it
+    would read as joining that x to the tick), or crosses a shorter connector
+    (shorter lines are kept first)."""
     lo, _ = elev_window(elev)
-    out = []
-    for m in marks:
-        if not m.get("miss", m.get("slot") is not None):
+    cands = []
+    for j, m in enumerate(marks):
+        if not _is_miss(m):
             continue
-        for k in m["slots"]:
-            x0, y0 = float(strip_x(row.gt_bearing[k])), lo
-            if abs(m["x"] - x0) > max_deg:
-                continue
-            d = np.array([(m["x"] - x0) * ppd, (m["y"] - y0) * ppd])
-            n = float(np.hypot(*d))
-            if n < mark_pt / 2 + 1.5:
-                continue
-            end = np.array([m["x"], m["y"]]) - d / n * (mark_pt / 2 + 0.9) / ppd
-            out.append([(x0, y0), (float(end[0]), float(end[1]))])
-    return out
+        ticks = [float(strip_x(row.gt_bearing[k])) for k in m["slots"]]
+        x0 = min(ticks, key=lambda t: (abs(m["x"] - t), t))
+        y0 = lo
+        if abs(m["x"] - x0) > max_deg:
+            continue
+        d = np.array([(m["x"] - x0) * ppd, (m["y"] - y0) * ppd])
+        n = float(np.hypot(*d))
+        if n < mark_pt / 2 + 1.5:
+            continue
+        end = np.array([m["x"], m["y"]]) - d / n * (mark_pt / 2 + 0.9) / ppd
+        ts = np.linspace(0.0, 1.0, 60)
+        qx, qy = (x0 + ts * (end[0] - x0)) * ppd, (y0 + ts * (end[1] - y0)) * ppd
+        near = min((float(np.min(np.hypot(qx - o["x"] * ppd, qy - o["y"] * ppd)))
+                    for i, o in enumerate(marks) if i != j), default=float("inf"))
+        if near < CONNECTOR_CLEAR_PT:
+            continue
+        cands.append((n, [(x0, y0), (float(end[0]), float(end[1]))]))
+    kept = []
+    for _, ln in sorted(cands, key=lambda c: c[0]):
+        if not any(_segments_cross(ln[0], ln[1], q[0], q[1]) for q in kept):
+            kept.append(ln)
+    return sorted(kept, key=lambda ln: ln[1][0])
 
 
-def draw_miss_connectors(ax, row, marks: Sequence[dict], elev, ppd: float, mark_pt: float = MARK_PT) -> None:
-    """Thin dotted line from each miss's true-bearing tick (the row's bottom edge) to its own x (D2), when they
-    lie within ``CONNECTOR_MAX_DEG`` of each other.
+def draw_miss_connectors(ax, row, marks: Sequence[dict], elev, ppd: float, mark_pt: float = MARK_PT,
+                         lines: Optional[Sequence] = None) -> None:
+    """Thin dotted lines from a true-bearing tick (the row's bottom edge) to a miss's own x (D2): ``lines``
+    (``plan_miss_badges(...)["connectors"]``), default ``miss_connectors``.
 
     Drawn over the x marks (under badges and leaders), so a connector that
     passes another x visibly runs on to its own."""
-    for (x0, y0), (x1, y1) in miss_connectors(row, marks, elev, ppd, mark_pt):
+    for (x0, y0), (x1, y1) in (miss_connectors(row, marks, elev, ppd, mark_pt) if lines is None else lines):
         ax.plot([x0, x1], [y0, y1], color=style.INK_2, lw=0.55, ls=(0, (0.9, 1.1)), zorder=7.2,
                 clip_on=False, solid_capstyle="round", dash_capstyle="round")
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """EXP-18: render every paper figure from the metrics and the pre-registered cases, check the set, write a manifest.
 
-Inputs (all overridable): ``<EXP_ROOT>/metrics/metrics.json`` (+ ``slots``,
+Inputs (all overridable): ``<EXP_ROOT>/metrics/metrics.json`` (+ the ``slots``,
 ``episodes`` and ``rows`` tables) written by ``compute_metrics.py`` and
 ``<EXP_ROOT>/metrics/cases.json`` written by ``select_cases.py``; the dumps,
 top-down maps and clips those point to.
@@ -9,84 +9,69 @@ top-down maps and clips those point to.
 Outputs in ``--out-dir`` (default ``<EXP_ROOT>/figures``), each figure in every
 ``--langs`` language (English files carry no suffix, the others ``_<lang>``):
 
-  fig1_main_case             main case (fig_case): main-figure candidate ``--main-index``
-                             (default 1), drawn at its pre-registered key rows
-  fig2_gallery               gallery (fig_gallery): 10th / 50th / 90th percentile episode per tier
+  fig1_main_case             main case (fig_case): main-figure candidate ``--main-index`` (default 1)
+                             of the pre-registered tier-C candidates, drawn at its key rows
+  fig2_gallery               main-text gallery (fig_gallery, variant "main"): tiers C, D, E
   fig3_metrics               quantitative figure (fig_metrics)
-  fig4_route_<pattern>       designed-route figures (fig_routes): out_and_back, loop
-  supp/candidate<r>_<scene>_<clip>   every main-figure candidate (fig_case), r = its rank, titled
-                             "candidate r of n" with its rank statistic
+  fig4_route_<pattern>       designed-route figures (fig_routes): out_and_back, loop (tier-E picks only)
+  supp/candidate<k>_<scene>_<clip>   every pre-registered main-figure candidate (fig_case), titled
+                             "Main-figure candidate k of n" with |episode PCK@8 - tier median|
+  supp/figS_gallery_all      supplementary gallery (fig_gallery, variant "supp"): tiers A-E
   supp/anim_main_case        animation of the fig1 episode (fig_anim): .mp4 + .gif
-  manifest.json              every file with its sha256, the code version, the sha256 of the
-                             inputs, the main case and how it was chosen, the conventions the
-                             set follows, the checks and their findings, skipped / failed figures
+  manifest.json              every file with its sha256, the code version, the sha256 of the inputs,
+                             the main case, the conventions, the checks and their findings
   README.md                  the figures with their captions and the check results
 
-Main-figure candidates.  cases.json lists the pre-registered tier-C candidates
-(>= 4 scored rows, path >= 8 m, a row whose ground-truth bearings span >= 90 deg;
-ranked by |episode PCK@8 - tier median|, top 5).  R2R gives each path 3
-instructions, so several candidates can be one trajectory drawn twice; the
-candidates keep one episode per reference path (``(scene, trajectory_id)`` from
-the dump's metadata, else a hash of its reference path) and the next-ranked
-episode fills the slot.  When cases.json still holds such duplicates, the list
-is re-ranked here from the metrics tables with ``select_cases.main_figure``
-(the pre-registered rule itself) plus that step, and the manifest says so.
+Main-figure candidates (orchestrator decision D9).  cases.json ``main_figure``
+lists the pre-registered tier-C candidates (>= 4 scored frames, path >= 8 m, a
+frame whose ground-truth bearings span >= 90 deg; the top 5 by |episode PCK@8 -
+tier median|).  All of them are drawn as supplementary figures, in rank order,
+as pre-registered (no re-ranking, no de-duplication).  R2R gives each path
+several instructions, so two candidates can be one path: the candidates sharing
+a reference path (``trajectory_id`` from the dump metadata, else a hash of the
+reference path) say so in their captions (and fig1 / the animation, when the
+main case is one of them).  fig1 is candidate ``--main-index``, chosen after the
+candidates are rendered; its caption says it is one of the pre-registered
+candidates, all shown in the supplement.  No fallback: without a tier-C
+candidate list fig1, the candidates and the animation are not drawn.
 
-Main case fallback (tier C not scored yet, or no candidate met the criteria):
-the same rule applied to tier B (then A, D, E: the first tier with a
-candidate), one episode per reference path, the tier's gallery picks
-excluded so fig1 never repeats a fig2 tile.  fig1, the animation and the
-supplementary candidates are drawn from that list; captions, manifest and
-README.md call it a stand-in.  Without the episodes/rows tables there is no
-fallback and fig1 is skipped.
-
-Checks (``lint`` in the manifest; every error fails the run).
-  * Figure policy (user decision, 2026-09-24): no pose, pose source, odometry
-    or pose-arm wording anywhere (pattern stored as an id + sha256 only).
-    Scanned: the text every figure actually draws (a hook on
-    ``matplotlib.text.Text.draw`` records each string drawn while a job runs,
-    animation frames included), the captions, the modules' label tables
-    (strings of figures not drawn this run included), README.md and
-    manifest.json.  Localisation claims and "heading" wording are listed for
-    manual review, not errors.
-  * Terminology: the maps are "affordance map"; "heat row", "heatmap",
-    "热力行" and the like are errors in figure text, captions and label tables.
-  * Set consistency: one frame-label format per language, one qualifier per
-    view label ("Front · ..."), one wording of the 0 deg label, one heat-row
-    elevation window across fig_case / fig_gallery / fig_anim (recorded under
-    ``conventions``), fig1's episode not in the gallery.
-  * Parentheses (``ZH_PARENS``): zh figure text half-width () (Droid Sans
-    Fallback prints full-width ones with wide gaps); zh captions full-width （）
-    around or after Chinese text; en text never full-width.
-  * Colour: no colour literal or categorical palette in the figure modules
-    reuses the ground-truth blue or the prediction orange (hue within 20 deg,
-    saturation >= 0.25) except in a ground-truth / prediction role (the
-    enclosing name says gt / truth / history resp. pred / heat, or the line
-    carries ``# colour-role: ground truth`` / ``prediction``).
+Checks (``lint`` in the manifest; every error fails the run, exit 1):
+  * Figure policy (user decision): patterns ``POLICY_PATTERNS`` (pose / odometry
+    wording and the retired names of the affordance map) are errors in every
+    string a figure holds, the captions, the modules' label tables, README.md and
+    manifest.json; ``WARN_PATTERNS`` (localisation claims) are warnings.  Figure
+    text is gathered twice: every ``Text`` artist of a figure walked just before
+    it is drawn (``Figure.draw``: savefig, and the animation's canvas draws) and
+    every string actually drawn (``Text.draw``, animation blits included).  Only
+    a pattern id and where it was found are stored, never the words.
+  * Notes (D5): a module warning of the dropped-note / unaccounted-slot type, a
+    non-empty ``notes_dropped`` field, or an unaccounted slot (the modules raise)
+    fails that figure.
+  * Numbers (D1): every drawn row's numbered misses equal the slots table's joint
+    PCK@8 failures (tier + clip + row), and its hits / visible count equal the
+    tables'; the gallery's frame per tile follows D8.
+  * Elevation window (D4): every block's window is ``common_draw.elevation_window``
+    of the rows it shows (recomputed from the dumps), and every caption of a figure
+    with affordance-map rows states it.
+  * Set consistency (D6): one frame-label format per language ("frame N of T",
+    "第 N 帧（共 T 帧）"), one qualifier per view label, one wording of the 0 deg
+    label, fig1's episode not a gallery tile.
+  * Parentheses (D6): zh text uses full-width （） around or after Chinese text
+    (figure text and captions; half-width only for a panel letter "(a)",
+    coordinates and non-Chinese content); en text never full-width.
+  * Colour (D7): no colour in the figure modules reads as the ground-truth blue or
+    the prediction orange (hue within 20 deg) outside a ground-truth / prediction
+    role.
   * Text below ``MIN_FONT_PT`` at print size (static figures).
-  * Notes: a figure that leaves a slot's note out ("no room") fails its job.
-
-Warnings.  A job's warnings are gathered from (1) what the figure module
-returns (any ``warnings`` / ``problems`` list, any ``notes_dropped`` /
-``dropped_notes`` / ``notes_not_drawn`` field, at any depth), (2) Python
-warnings raised while it runs (``warnings.catch_warnings(record=True)``), and
-(3) lines it prints with a ``[fig_...]`` prefix (kept for modules that still
-print).
 
 Usage (repo root on PYTHONPATH; ``scripts/exp18/run_figures.sh`` wraps it):
   python -m scripts.exp18.figures.make_all [--exp-root DIR] [--metrics-dir DIR] [--cases FILE]
       [--out-dir DIR] [--langs en,zh] [--main-index 1] [--only fig1,supp,fig2,fig3,fig4,anim]
-      [--dumps-root DIR] [--topdown-root DIR] [--clip-root DIR] [--anim-size 1920x1080] [--clean]
-      [--case-layout revised|approved] [--case-options merge_notes,clamp_peaks,letters=slide] [--draft]
-fig1 and the candidates use fig_case's revised layout (``CaseOptions.revised()``: notes wrap
-instead of being dropped, misses numbered in a lane under the row, fixed row names, ...);
-``--case-layout approved`` draws the approved layout instead, and ``--case-options`` overrides
-single CaseOptions fields.  A stand-in fig1 carries a banner line saying so; each candidate a
-title "candidate k of n" with its rank statistic.
-Exit status: 0 when every attempted figure rendered and every check passed; 1 when a figure
-failed (an exception, or a note left out) or a check found an error; 2 on bad arguments.
-``--draft`` (development) records check errors and left-out notes but does not let them set
-the exit status.
+      [--dumps-root DIR] [--topdown-root DIR] [--clip-root DIR] [--anim-size 1920x1080] [--clean] [--draft]
+Exit status: 0 when every attempted figure rendered and every check passed; 1 when a figure failed (an
+exception, a dropped note or an unaccounted slot) or a check found an error; 2 on bad arguments.
+``--draft`` (development) records check errors but does not let them set the exit status (a failed figure
+still does).
 """
 from __future__ import annotations
 
@@ -97,8 +82,8 @@ import contextlib
 import datetime as _dt
 import functools
 import hashlib
-import io
 import json
+import math
 import os
 import platform
 import re
@@ -109,7 +94,7 @@ import traceback
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 SOURCE_ROOT = Path(__file__).resolve().parents[3]
 if str(SOURCE_ROOT) not in sys.path:
@@ -117,19 +102,22 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from scripts.exp18 import common  # noqa: E402
 
-SCHEMA = "heatmapvln-exp18-figures-v2"
+SCHEMA = "exp18-figures-v3"
 LANGS = ("en", "zh")
-GROUPS = ("fig1", "supp", "fig2", "fig3", "fig4", "anim")
+GROUPS = ("fig1", "supp", "fig2", "fig3", "fig4", "anim")  # --only
 TIER_ORDER = "ABCDE"
-FALLBACK_TIERS = ("B", "A", "D", "E")  # main-figure rule applied to the first of these with a candidate
+MAIN_TIER = "C"  # main-figure candidates: unseen scenes (pre-registered)
 ROUTE_PATTERNS = ("out_and_back", "loop")
+GALLERY_STEMS = {"main": ("fig2", "fig2_gallery", "fig2_gallery", ""),  # variant -> (group, id, stem, subdir)
+                 "supp": ("supp_gallery", "supp_gallery_all", "figS_gallery_all", "supp")}
 
 TITLES = {
     "fig1": "Main case: predicted affordance map vs ground truth at key positions",
-    "fig2": "Gallery: episodes at the 10th / 50th / 90th percentile of each tier",
+    "fig2": "Gallery (main text): unseen scenes, HM3D and designed routes",
     "fig3": "Accuracy of the predicted affordance map per tier",
     "fig4": "Designed routes: out-and-back and loop",
-    "supp": "Supplement: every main-figure candidate",
+    "supp": "Supplement: every pre-registered main-figure candidate",
+    "supp_gallery": "Supplement: gallery of all five tiers",
     "anim": "Supplement: animation of the main case",
 }
 PATTERN_TITLES = {"out_and_back": "out-and-back", "loop": "loop"}
@@ -137,65 +125,63 @@ PATTERN_TITLES = {"out_and_back": "out-and-back", "loop": "loop"}
 # --------------------------------------------------------------------------- #
 # Figure policy and the set's conventions
 # --------------------------------------------------------------------------- #
-POLICY_ID = "exp18-figure-policy-v2"
-# (rule, regex): words kept off every figure, caption, label table, README and manifest (error).
-# Rule labels are neutral on purpose: they are printed into README.md and manifest.json.
-POLICY_RULES = (
-    ("forbidden word, group 1", r"\bposes?\b|位姿|姿态"),
-    ("forbidden word, group 2", r"odom|\bVO\b|里程|\bAMB3R\b|\bSLAM\b"),
-    ("forbidden word, group 3", r"\bGT[- ]?pose|(?:\bGT|真值)[- ]?(?:arms?|臂)"),
+POLICY_ID = "exp18-figure-policy-v3"
+# (id, regex), case-insensitive.  Errors anywhere in figure text, captions, label tables, README.md and
+# manifest.json.  Only the ids are ever written out (README.md, manifest.json), never the words.
+POLICY_PATTERNS = (
+    ("P1", r"pose|VO\b|odometr|AMB3R|SLAM|odom|位姿|姿态|里程|heat ?row|heatmap|热力"),  # orchestrator's list
+    ("P2", r"(?:\bGT|真值)[- ]?(?:arms?|臂)"),  # the second prediction arm
+    ("P3", r"\bheat[- ](?:rows?|maps?|strips?|lines?)\b|热图"),  # other spellings of the retired map names
 )
-# Listed for manual review (not errors): localisation claims, pose-like wording.
-REVIEW_RULES = (
-    ("localisation claim", r"locali[sz]|定位"),
-    ("direction-of-travel wording", r"\bheading\b|朝向"),
-)
-# The maps are called "affordance map" (user decision): error in figure text, captions, label tables.
-TERM_RULES = (
-    ("name the maps 'affordance map'",
-     r"\bheat(?:[- ]?(?:rows?|maps?|strips?|ramps?|lines?))?\b|\bheatmaps?\b|热力|热图"),
-)
-POLICY_RE = re.compile("|".join(p for _, p in POLICY_RULES), re.I)
-_POLICY_C = [(n, re.compile(p, re.I)) for n, p in POLICY_RULES]
-_REVIEW_C = [(n, re.compile(p, re.I)) for n, p in REVIEW_RULES]
-_TERM_C = [(n, re.compile(p, re.I)) for n, p in TERM_RULES]
-POLICY_SHA256 = hashlib.sha256(json.dumps([POLICY_RULES, REVIEW_RULES, TERM_RULES], ensure_ascii=False)
+WARN_PATTERNS = (("W1", r"locali[sz]|定位"),)  # localisation claims: warnings, for manual review
+# The project's own name (repository and workspace paths in README.md / manifest.json) is not figure wording:
+# it is masked before the scan, so only that exact token is exempt.
+PROJECT_NAME_RE = re.compile(r"HeatmapVLN", re.I)
+_POLICY_C = [(i, re.compile(p, re.I)) for i, p in POLICY_PATTERNS]
+_WARN_C = [(i, re.compile(p, re.I)) for i, p in WARN_PATTERNS]
+POLICY_SHA256 = hashlib.sha256(json.dumps([POLICY_PATTERNS, WARN_PATTERNS], ensure_ascii=False)
                                .encode("utf-8")).hexdigest()
+# Written to README.md / manifest.json: neutral on purpose (they must not repeat the words they stand for).
+PATTERN_NOTES = {"P1": "orchestrator word list", "P2": "second-arm wording", "P3": "other spellings of the retired "
+                 "map names", "W1": "claims of where the robot is (warning)"}
 
 GT_BLUE, PRED_ORANGE = "#2a78d6", "#eb6834"
 COLOUR_ROLES = {  # role -> (reference colour, name tokens that make the colour legitimate)
     "ground truth": (GT_BLUE, {"gt", "truth", "ground", "hist", "history"}),
-    "prediction": (PRED_ORANGE, {"pred", "prediction", "predicted", "heat"}),
+    "prediction": (PRED_ORANGE, {"pred", "prediction", "predicted", "heat", "miss"}),  # miss rings are orange (D2)
 }
 HUE_TOL_DEG, MIN_SAT, MIN_VAL = 20.0, 0.25, 0.2
 MIN_FONT_PT = 5.5  # nothing smaller at print size (static figures are drawn at their print size)
 FONT_TOL_PT = 0.05
-EL_HEAT_MODULES = ("fig_case", "fig_gallery", "fig_anim")  # modules that draw the affordance-map rows
-ZH_PARENS = ("zh figure text: half-width () (the CJK font prints full-width ones with wide gaps); zh captions: "
-             "full-width （） around or after Chinese text, half-width only for panel letters (a), coordinates and "
-             "non-Chinese content; en: never full-width")
+ZH_PARENS = ("zh: full-width （） around or after Chinese text, in figure text and captions (half-width only for a "
+             "panel letter (a), coordinates and non-Chinese content); en: never full-width")
 COLOUR_MODULES = ("style", "common_draw", "fig_case", "fig_gallery", "fig_metrics", "fig_routes", "fig_anim")
-LABEL_MODULES = ("data", "fig_case", "fig_gallery", "fig_metrics", "fig_routes", "fig_anim")
+LABEL_MODULES = ("data", "common_draw", "fig_case", "fig_gallery", "fig_metrics", "fig_routes", "fig_anim")
+ROW_MODULES = ("fig_case", "fig_gallery", "fig_anim")  # modules that draw affordance-map rows themselves
 
-CJK = r"㐀-鿿豈-﫿"
+CJK = r"㐀-鿿豈-﫿"
 _CJK_RE = re.compile(f"[{CJK}]")
 _HALF_PAREN_RE = re.compile(r"\(([^()]*)\)")
 _PANEL_RE = re.compile(r"[a-h]")
 _TUPLE_RE = re.compile(r"[-−]?\d+(?:\.\d+)?(?:\s*,\s*[-−]?\d+(?:\.\d+)?)+")  # coordinates (32, 32)
 FRAME_FORMATS = {  # most specific first; each match is removed before the next pattern runs
     "en": (("frame N of T", r"\bframe\s+\d+\s+of\s+\d+"), ("frame N / T", r"\bframe\s+\d+\s*/\s*\d+"),
-           ("frame N", r"\bframe\s+\d+")),
-    "zh": (("第 N / T 帧", r"第\s*\d+\s*/\s*\d+\s*帧"), ("第 N 帧 / T", r"第\s*\d+\s*帧\s*/\s*\d+"),
+           ("frame N", r"\bframe\s+\d+\b(?![.,]\d|\s*°|°)")),  # not "this frame 1.3°" (an error value)
+    "zh": (("第 N 帧（共 T 帧）", r"第\s*\d+\s*帧\s*（\s*共\s*\d+\s*帧\s*）"), ("第 N / T 帧", r"第\s*\d+\s*/\s*\d+\s*帧"),
+           ("第 N 帧 / T", r"第\s*\d+\s*帧\s*/\s*\d+"), ("第 N 帧 (共 T 帧)", r"第\s*\d+\s*帧\s*\(\s*共\s*\d+\s*帧\s*\)"),
            ("第 N 帧", r"第\s*\d+\s*帧")),
 }
+FRAME_FORMAT_D6 = {"en": "frame N of T", "zh": "第 N 帧（共 T 帧）"}
 VIEW_LABEL_RE = {"en": re.compile(r"^(Front|Right|Back|Left)\s*·\s*(.+)$"),
                  "zh": re.compile(r"^(前|右|后|左)\s*·\s*(.+)$")}
 AHEAD_RE = re.compile(r"^0°\s*[(（]\s*(.+?)\s*[)）]$")
+ELEV_WORD = {"en": "elevation", "zh": "仰角"}  # a caption stating a window names it ...
+ELEV_RANGE = {"en": "{lo} to {hi}", "zh": "{lo} 至 {hi}"}  # ... and spells every window drawn like this
 
-# Text that must not be dropped: the figure modules report a note they could not place like this.
-DROPPED_RE = re.compile(r"no room for the note|notes? (?:dropped|not drawn|left out)|dropped notes?", re.I)
+# Module warnings that mean a slot is not accounted for in the figure (D5): these fail the figure.
+DEFECT_RE = re.compile(r"neither a badge nor a note|unaccounted|no badge (?:or|nor) (?:a )?note|no room for the note"
+                       r"|notes? (?:were |was )?(?:dropped|not drawn|left out|omitted)|dropped notes?", re.I)
 DROP_KEYS = ("notes_dropped", "dropped_notes", "notes_not_drawn")
-DIAG_RE = re.compile(r"^\[(fig_\w+|exp18 figures)\]\s*")
 _QUIET_WARNINGS = (DeprecationWarning, PendingDeprecationWarning, FutureWarning, ResourceWarning, ImportWarning)
 
 
@@ -210,34 +196,14 @@ def lang_stem(name: str, lang: str) -> str:
     return name if lang == "en" else f"{name}_{lang}"
 
 
-class _Tee(io.TextIOBase):
-    def __init__(self, stream):
-        self.stream, self.parts = stream, []
-
-    def write(self, s):
-        self.stream.write(s)
-        self.parts.append(s)
-        return len(s)
-
-    def flush(self):
-        self.stream.flush()
-
-
 @contextlib.contextmanager
-def diagnostics(printed: List[str], raised: List[str]):
-    """Inside the block: keep the figure modules' ``[fig_...]`` lines in ``printed`` and the Python
-    warnings raised (not deprecation noise) in ``raised``, echoing both."""
-    tee = _Tee(sys.stdout)
+def python_warnings(raised: List[str]):
+    """Inside the block: keep the Python warnings a figure module raises (not deprecation noise) in ``raised``."""
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         try:
-            with contextlib.redirect_stdout(tee):
-                yield
+            yield
         finally:
-            for line in "".join(tee.parts).splitlines():
-                line = line.strip()
-                if DIAG_RE.match(line) and line not in printed:
-                    printed.append(line)
             for w in rec:
                 if issubclass(w.category, _QUIET_WARNINGS):
                     continue
@@ -248,22 +214,30 @@ def diagnostics(printed: List[str], raised: List[str]):
 
 
 class TextSpy:
-    """Records every string matplotlib draws while ``current`` is set: savefig, canvas.draw and the
-    animation's draw_artist all pass through ``Text.draw`` (tick labels and annotations included).
-    ``current`` maps each string to the smallest font size (pt) it was drawn at."""
+    """Gathers figure text while ``current`` / ``walked`` are set.
+
+    * ``walked``: every ``Text`` artist of a figure (visible or not, tick labels and annotations included),
+      collected by walking the figure just before it is drawn (``Figure.draw``: every savefig, and each
+      canvas draw of the animation).
+    * ``current``: every string actually drawn (``Text.draw``, which the animation's blits also pass
+      through) -> the smallest font size (pt) it was drawn at.
+    """
 
     def __init__(self):
         self.current: Optional[Dict[str, float]] = None
-        self._orig = None
+        self.walked: Optional[Set[str]] = None
+        self._orig: Optional[tuple] = None
 
     def __enter__(self):
+        from matplotlib.figure import Figure
         from matplotlib.text import Text
 
-        orig = self._orig = Text.draw
+        orig_text, orig_fig = Text.draw, Figure.draw
+        self._orig = (orig_text, orig_fig)
         spy = self
 
-        @functools.wraps(orig)
-        def draw(text, renderer, *args, **kwargs):
+        @functools.wraps(orig_text)
+        def text_draw(text, renderer, *args, **kwargs):
             rec = spy.current
             if rec is not None:
                 try:
@@ -274,16 +248,31 @@ class TextSpy:
                             rec[s] = fs
                 except Exception:  # recording must never break a figure
                     pass
-            return orig(text, renderer, *args, **kwargs)
+            return orig_text(text, renderer, *args, **kwargs)
 
-        Text.draw = draw
+        @functools.wraps(orig_fig)
+        def figure_draw(fig, renderer, *args, **kwargs):
+            seen = spy.walked
+            if seen is not None:
+                try:
+                    for t in fig.findobj(Text):
+                        s = t.get_text()
+                        if s and s.strip():
+                            seen.add(s)
+                except Exception:
+                    pass
+            return orig_fig(fig, renderer, *args, **kwargs)
+
+        Text.draw = text_draw
+        Figure.draw = figure_draw
         return self
 
     def __exit__(self, *exc):
         if self._orig is not None:
+            from matplotlib.figure import Figure
             from matplotlib.text import Text
 
-            Text.draw = self._orig
+            Text.draw, Figure.draw = self._orig
         return False
 
 
@@ -347,7 +336,7 @@ _KEY_RENAME = {"vo": "prediction", "floor": "always_behind"}
 
 
 def public(obj):
-    """Manifest view of figure-module stats: the prediction is ``pred``, the second arm left out."""
+    """Manifest view of figure-module stats: the prediction is ``prediction``, the second arm left out."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -374,20 +363,20 @@ def public(obj):
 
 PICK_FIELDS = ("tier", "scene", "clip", "clip_key", "episode_id", "npz_path", "rank", "percentile", "n_scored_rows",
                "n_visible_slots", "path_length_m", "max_row_span_deg", "vo_pck8", "floor_pck8",
-               "vo_bearing_err_median", "abs_diff_from_tier_median", "path_key", "rank_before_dedupe")
+               "vo_bearing_err_median", "abs_diff_from_tier_median", "path_key", "same_path_as")
 
 
 def pick_summary(pick: dict) -> dict:
     return public({k: pick[k] for k in PICK_FIELDS if k in pick})
 
 
-def feedback(res) -> Tuple[List[str], List[str], bool]:
-    """Warnings and left-out notes a figure module returned: any ``warnings`` / ``problems`` list and any
+def feedback(res) -> Tuple[List[str], List[str]]:
+    """(warnings, defects) a figure module returned: any ``warnings`` / ``problems`` list and any
     ``notes_dropped`` / ``dropped_notes`` / ``notes_not_drawn`` field, at any depth, tagged with the
-    enclosing entry's tier / percentile / key / frame.  Third value: whether a drop field was present."""
+    enclosing entry's tier / percentile / key / frame.  Defects: every dropped note, and every warning of the
+    dropped-note / unaccounted-slot type (``DEFECT_RE``)."""
     warns: List[str] = []
-    dropped: List[str] = []
-    has_drop_field = False
+    defects: List[str] = []
 
     def tag(d: dict) -> str:
         parts = [f"{k} {d[k]}" for k in ("tier", "percentile", "pattern", "key", "frame")
@@ -395,18 +384,17 @@ def feedback(res) -> Tuple[List[str], List[str], bool]:
         return " ".join(parts)
 
     def walk(obj):
-        nonlocal has_drop_field
         if isinstance(obj, dict):
             t = tag(obj)
             for k, v in obj.items():
                 if k in ("warnings", "problems") and isinstance(v, (list, tuple)):
                     warns.extend(f"{t}: {x}" if t else str(x) for x in v if x)
                 elif k in DROP_KEYS:
-                    has_drop_field = True
                     if isinstance(v, (list, tuple)):
-                        dropped.extend(f"{t}: {x}" if t else str(x) for x in v if x is not None)
+                        defects.extend(f"{t}: note not drawn: {x}" if t else f"note not drawn: {x}"
+                                       for x in v if x is not None)
                     elif isinstance(v, (int, float)) and not isinstance(v, bool) and v:
-                        dropped.append(f"{t}: {int(v)} note(s) not drawn" if t else f"{int(v)} note(s) not drawn")
+                        defects.append(f"{t}: {int(v)} note(s) not drawn" if t else f"{int(v)} note(s) not drawn")
                 else:
                     walk(v)
         elif isinstance(obj, (list, tuple)):
@@ -414,15 +402,21 @@ def feedback(res) -> Tuple[List[str], List[str], bool]:
                 walk(v)
 
     walk(res)
-    return warns, dropped, has_drop_field
+    warns = list(dict.fromkeys(warns))
+    defects += [w for w in warns if DEFECT_RE.search(w)]
+    return warns, list(dict.fromkeys(defects))
 
 
-def prefix_caption(files: Iterable[str], text: str) -> None:
-    """Put ``text`` in front of the caption a figure module wrote (the ``*_caption.txt`` among ``files``)."""
+def edit_caption(files: Iterable[str], lang: str, prefix: str = "", suffix: str = "") -> None:
+    """Put ``prefix`` in front of / ``suffix`` after the caption a figure module wrote (``*_caption.txt``); zh
+    sentences are joined without a space."""
+    if not (prefix or suffix):
+        return
+    sep = "" if lang == "zh" else " "
     for f in files:
         if str(f).endswith("_caption.txt") and Path(f).is_file():
             body = Path(f).read_text(encoding="utf-8").strip()
-            Path(f).write_text(f"{text} {body}\n", encoding="utf-8")
+            Path(f).write_text(sep.join(s.strip() for s in (prefix, body, suffix) if s) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -439,8 +433,10 @@ class Entry:
     error: str = ""
     details: dict = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
-    dropped_notes: List[str] = field(default_factory=list)
+    defects: List[str] = field(default_factory=list)  # dropped notes / unaccounted slots (fail the figure)
     texts: Dict[str, float] = field(default_factory=dict)  # every string the figure drew -> smallest pt
+    walked: Set[str] = field(default_factory=set)  # every Text artist's string, walked before drawing
+    blocks: List[dict] = field(default_factory=list)  # affordance-map blocks drawn: rows and windows (checks)
     seconds: float = 0.0
 
 
@@ -457,8 +453,6 @@ class Context:
     topdown_root: Path
     clip_root: Optional[Path]
     anim_size: Tuple[int, int]
-    case_options: Dict[str, object] = field(default_factory=dict)  # fig_case.CaseOptions fields (fig1, supp)
-    case_layout: str = "revised"  # fig_case layout of fig1 and the candidates: revised | approved
     draft: bool = False
     cases: Optional[dict] = None
     metrics: Optional[dict] = None
@@ -466,17 +460,17 @@ class Context:
     main_case: dict = field(default_factory=dict)
     dumps_used: Dict[str, str] = field(default_factory=dict)  # npz path -> role
     spy: TextSpy = field(default_factory=TextSpy)
-    _tables: Optional[tuple] = None
+    _tables: Optional[dict] = None
 
     def run(self, group: str, fig_id: str, lang: str, fn: Callable[[], Tuple[List[str], dict]]) -> Entry:
         t0 = time.time()
         print(f"[make_all] {fig_id} ({lang}) ...", flush=True)
-        printed: List[str] = []
         raised: List[str] = []
         texts: Dict[str, float] = {}
-        self.spy.current = texts
+        walked: Set[str] = set()
+        self.spy.current, self.spy.walked = texts, walked
         try:
-            with diagnostics(printed, raised):
+            with python_warnings(raised):
                 files, details = fn()
             e = Entry(group, fig_id, lang, "ok", files=[str(f) for f in files], details=details)
         except Exception as exc:  # one figure failing must not stop the others
@@ -484,25 +478,22 @@ class Context:
             e = Entry(group, fig_id, lang, "failed", error=f"{type(exc).__name__}: {exc}", details={"traceback": tb[-12:]})
             print(f"[make_all] {fig_id} ({lang}) FAILED: {e.error}\n" + "\n".join(tb[-12:]), flush=True)
         finally:
-            self.spy.current = None
+            self.spy.current = self.spy.walked = None
         e.seconds = round(time.time() - t0, 1)
-        e.texts = texts
+        e.texts, e.walked = texts, walked
         own = list(e.details.pop("warnings", []))
-        fb_warn, fb_drop, has_drop_field = e.details.pop("_feedback", ([], [], False))
-        # printed lines that repeat a returned message are not listed twice
-        tails = [w.split(": ", 1)[-1].strip() for w in fb_warn + fb_drop]
-        printed = [p for p in printed if not any(t and p.endswith(t) for t in tails)]
-        e.warnings = list(dict.fromkeys(public(w) for w in own + fb_warn + fb_drop + raised + printed))
-        e.dropped_notes = [public(w) for w in (fb_drop if has_drop_field else
-                                               [w for w in raised + printed if DROPPED_RE.search(w)])]
-        if e.status == "ok" and e.dropped_notes:
-            # a slot whose note is missing is unaccounted for in the figure: the figure is not usable
+        fb_warn, fb_defects = e.details.pop("_feedback", ([], []))
+        e.blocks = e.details.pop("_blocks", [])
+        e.warnings = list(dict.fromkeys(public(w) for w in own + fb_warn + raised))
+        e.defects = list(dict.fromkeys(public(w) for w in fb_defects + [w for w in own + raised if DEFECT_RE.search(w)]))
+        if e.status == "ok" and e.defects:
+            # a slot left without a badge or a note is unaccounted for in the figure: the figure is not usable
             e.status = "failed"
-            e.error = (f"{len(e.dropped_notes)} note(s) left out of the figure: " + "; ".join(e.dropped_notes[:3])
-                       + (" ..." if len(e.dropped_notes) > 3 else ""))
+            e.error = (f"{len(e.defects)} slot(s) unaccounted for (dropped note / no badge): " + "; ".join(e.defects[:3])
+                       + (" ..." if len(e.defects) > 3 else ""))
         self.entries.append(e)
         print(f"[make_all] {fig_id} ({lang}) {e.status} in {e.seconds:.1f} s"
-              + (f" ({e.error})" if e.status == "failed" and e.dropped_notes else ""), flush=True)
+              + (f" ({e.error})" if e.status == "failed" and e.defects else ""), flush=True)
         return e
 
     def skip(self, group: str, fig_id: str, reason: str, langs: Optional[List[str]] = None) -> None:
@@ -510,27 +501,30 @@ class Context:
             self.entries.append(Entry(group, fig_id, lang, "skipped", reason=reason))
         print(f"[make_all] {fig_id}: skipped ({reason})", flush=True)
 
+    def fail(self, group: str, fig_id: str, reason: str) -> None:
+        for lang in self.langs:
+            self.entries.append(Entry(group, fig_id, lang, "failed", error=reason))
+        print(f"[make_all] {fig_id} FAILED: {reason}", flush=True)
+
     def stem(self, name: str, lang: str, sub: str = "") -> Path:
         d = self.out_dir / sub if sub else self.out_dir
         return d / lang_stem(name, lang)
 
-    def tables(self):
-        """(episodes, rows) written by compute_metrics.py, or None when either is missing."""
+    def tables(self) -> Optional[dict]:
+        """{"slots", "rows", "episodes"} written by compute_metrics.py, or None when one is missing."""
         if self._tables is None:
             try:
                 from scripts.exp18.compute_metrics import read_table
 
-                eps = read_table(self.metrics_dir / "episodes")
-                rows = read_table(self.metrics_dir / "rows")
-                self._tables = (eps, rows)
-            except Exception as exc:  # no tables: no re-ranking, no fallback
-                print(f"[make_all] no episodes/rows tables in {self.metrics_dir}: {type(exc).__name__}: {exc}")
-                self._tables = (None,)
-        return None if self._tables[0] is None else self._tables
+                self._tables = {name: read_table(self.metrics_dir / name) for name in ("slots", "rows", "episodes")}
+            except Exception as exc:  # no tables: the number checks report it
+                print(f"[make_all] no slots/rows/episodes tables in {self.metrics_dir}: {type(exc).__name__}: {exc}")
+                self._tables = {}
+        return self._tables or None
 
 
 # --------------------------------------------------------------------------- #
-# Main case: which episodes are candidates, which one is fig1, which rows
+# Main case: the pre-registered candidates, which one is fig1, which rows
 # --------------------------------------------------------------------------- #
 def resolve_dump(ctx: Context, pick: dict) -> Path:
     from scripts.exp18.figures import fig_routes as fr
@@ -540,7 +534,7 @@ def resolve_dump(ctx: Context, pick: dict) -> Path:
 
 def path_key(ctx: Context, pick: dict) -> str:
     """The episode's reference path: ``<scene>:trajectory <id>`` from the dump metadata, else a hash of
-    the reference path, else the clip itself (then nothing can be merged with it)."""
+    the reference path, else the clip itself (then nothing is matched with it)."""
     import numpy as np
 
     scene = pick.get("scene") or str(pick.get("clip_key", "")).split("/")[0]
@@ -559,108 +553,45 @@ def path_key(ctx: Context, pick: dict) -> str:
     return f"{pick.get('tier')}:{pick.get('clip_key')}"
 
 
-def rank_candidates(ctx: Context, tier: str, exclude: Iterable[str] = ()) -> Optional[dict]:
-    """Main-figure candidates of ``tier`` by the pre-registered rule (``select_cases.main_figure``), one
-    episode per reference path, episodes in ``exclude`` (clip keys) left out, top ``MAIN['top']``.
-    None without the metrics tables."""
-    tabs = ctx.tables()
-    if tabs is None:
-        return None
-    from scripts.exp18 import select_cases as sc
-
-    eps, rows = tabs
-    saved = sc.MAIN
-    sc.MAIN = dict(saved, tier=tier, top=10 ** 9)  # the whole ranking, same criteria / ties / key rows
-    try:
-        res = sc.main_figure(eps, rows)
-    finally:
-        sc.MAIN = saved
-    out = {"tier": tier, "status": res.get("status"), "reason": res.get("reason"),
-           "tier_median": res.get("tier_median_episode_vo_pck8"), "n_episodes": res.get("n_episodes"),
-           "n_meeting_criteria": res.get("n_candidates"), "criteria": dict(saved, tier=tier),
-           "selected": [], "skipped_same_path": [], "skipped_excluded": []}
-    exclude, seen = set(exclude), {}
-    for c in res.get("selected") or []:
-        if len(out["selected"]) >= saved["top"]:
-            break
-        if c.get("clip_key") in exclude:
-            out["skipped_excluded"].append(c["clip_key"])
-            continue
-        key = path_key(ctx, c)
-        if key in seen:
-            out["skipped_same_path"].append({"clip_key": c["clip_key"], "episode_id": c.get("episode_id"),
-                                             "same_path_as": seen[key]})
-            continue
-        seen[key] = c["clip_key"]
-        out["selected"].append(dict(c, rank_before_dedupe=c["rank"], rank=len(out["selected"]) + 1, path_key=key))
-    return out
-
-
 def gallery_keys(cases: dict, tier: str) -> List[str]:
     g = (cases.get("gallery") or {}).get(tier) or {}
     return [p.get("clip_key") for p in g.get("picks") or []]
 
 
 def choose_main_case(ctx: Context) -> dict:
-    """The candidates and the fig1 episode (candidate ``main_index``, 1-based)."""
-    cases = ctx.cases
-    mf = cases.get("main_figure") or {}
-    selected = sorted(mf.get("selected") or [], key=lambda s: int(s.get("rank", 0)))
-    choice: dict
-    if mf.get("status") == "ok" and selected:
-        tier = mf.get("tier", "C")
-        choice = {"source": "main_candidates", "tier": tier, "candidates_source": "cases.json",
-                  "tier_median": mf.get("tier_median_episode_vo_pck8"), "n_meeting_criteria": mf.get("n_candidates")}
-        keys = [path_key(ctx, c) for c in selected]
-        if len(set(keys)) < len(keys):
-            ranked = rank_candidates(ctx, tier)
-            if ranked and ranked["selected"]:
-                choice.update(candidates_source="re-ranked by make_all: pre-registered rule, one episode per "
-                                                "reference path (cases.json repeated a path)",
-                              skipped_same_path=ranked["skipped_same_path"], tier_median=ranked["tier_median"])
-                selected = ranked["selected"]
-            else:
-                choice["path_duplicates"] = [k for k in keys if keys.count(k) > 1]
-                selected = [dict(c, path_key=k) for c, k in zip(selected, keys)]
-        else:
-            selected = [dict(c, path_key=k) for c, k in zip(selected, keys)]
-    else:
-        why = (f"cases.json lists no main-figure candidate: {mf.get('n_candidates', 0)} of "
-               f"{mf.get('n_episodes', '?')} tier-{mf.get('tier', 'C')} episodes met the criteria"
-               if mf.get("status") == "ok" else
-               f"cases.json main_figure status '{mf.get('status', 'absent')}' (tier C not scored yet)")
-        tried = []
-        for tier in FALLBACK_TIERS:
-            ranked = rank_candidates(ctx, tier, exclude=gallery_keys(cases, tier))
-            if ranked is None:
-                return {"source": None, "reason": why + "; no episodes/rows tables in the metrics directory, so no "
-                                                        "fallback (the gallery picks are not reused)", "candidates": []}
-            if ranked["selected"]:
-                break
-            tried.append(f"{tier}: {ranked.get('n_meeting_criteria') or 0} meeting the criteria")
-        else:
-            return {"source": None, "reason": why + f"; no fallback tier has a candidate ({', '.join(tried)})",
-                    "candidates": []}
-        selected = ranked["selected"]
-        choice = {"source": "fallback_candidates", "tier": tier, "reason": why,
-                  "candidates_source": f"main-figure rule applied to tier {tier}, one episode per reference path, "
-                                       f"the tier-{tier} gallery picks excluded",
-                  "tier_median": ranked["tier_median"], "n_meeting_criteria": ranked["n_meeting_criteria"],
-                  "skipped_same_path": ranked["skipped_same_path"], "skipped_gallery": ranked["skipped_excluded"]}
-    choice.update(candidates=selected, n_candidates=len(selected))
-    if not 1 <= ctx.main_index <= len(selected):
+    """The pre-registered candidates (all of them, rank order) and the fig1 episode (candidate ``main_index``)."""
+    mf = (ctx.cases or {}).get("main_figure") or {}
+    if mf.get("status") != "ok" or not mf.get("selected"):
+        return {"source": None, "reason": f"cases.json main_figure status '{mf.get('status', 'absent')}' with "
+                                          f"{len(mf.get('selected') or [])} candidates"}
+    tier = mf.get("tier")
+    if tier != MAIN_TIER:
+        return {"source": None, "error": True,
+                "reason": f"cases.json main-figure candidates are tier {tier!r}; the main figure is drawn only from "
+                          f"tier {MAIN_TIER} (unseen scenes)"}
+    selected = sorted(mf["selected"], key=lambda s: int(s.get("rank", 0)))
+    bad = [c.get("clip_key") for c in selected if c.get("tier") != MAIN_TIER]
+    if bad:
+        return {"source": None, "error": True, "reason": f"candidates not from tier {MAIN_TIER}: {bad}"}
+    keys = [path_key(ctx, c) for c in selected]
+    cands = []
+    for c, k in zip(selected, keys):
+        twins = [int(o["rank"]) for o, ko in zip(selected, keys) if ko == k and o is not c]
+        cands.append(dict(c, path_key=k, same_path_as=twins))
+    choice = {"source": "main_candidates", "tier": tier, "candidates_source": "cases.json main_figure (pre-registered)",
+              "tier_median": mf.get("tier_median_episode_vo_pck8"), "n_meeting_criteria": mf.get("n_candidates"),
+              "n_episodes": mf.get("n_episodes"), "criteria": mf.get("criteria") or {},
+              "candidates": cands, "n_candidates": len(cands),
+              "shared_paths": sorted({tuple(sorted([int(c["rank"])] + c["same_path_as"])) for c in cands
+                                      if c["same_path_as"]})}
+    if not 1 <= ctx.main_index <= len(cands):
         choice.update(source=None, error=True,
-                      reason=f"--main-index {ctx.main_index}: there are {len(selected)} main-figure candidates")
+                      reason=f"--main-index {ctx.main_index}: there are {len(cands)} main-figure candidates")
         return choice
-    pick = selected[ctx.main_index - 1]
-    choice.update(pick=pick, rank=int(pick.get("rank", ctx.main_index)))
-    if choice["source"] == "main_candidates":
-        choice["note"] = (f"candidate {ctx.main_index} of {len(selected)} pre-registered tier-{choice['tier']} "
-                          f"main-figure candidates")
-    else:
-        choice["note"] = (f"STAND-IN: {choice['reason']}; fig1, the animation and the candidates come from the "
-                          f"main-figure rule applied to tier {choice['tier']} (gallery picks excluded, one episode "
-                          f"per reference path); fig1 is candidate {ctx.main_index} of {len(selected)}")
+    pick = cands[ctx.main_index - 1]
+    choice.update(pick=pick, rank=int(pick["rank"]),
+                  note=f"candidate {ctx.main_index} of {len(cands)} pre-registered tier-{tier} main-figure candidates "
+                       f"(--main-index {ctx.main_index})")
     return choice
 
 
@@ -682,8 +613,8 @@ def case_rows(dump, pick: dict) -> Tuple[List[int], str]:
     if len(set(rows)) == len(rows):
         return rows, "pre-registered key rows (first scored frame, widest ground-truth bearing span, last frame)"
     alt = dd.key_rows(dump, fc.ARM)
-    return alt, (f"key rows {rows} coincide; fig_case rule instead (a middle scored frame replaces the "
-                 f"duplicate): {alt}")
+    return alt, (f"pre-registered key rows {rows} coincide (widest span at the first or last frame); the middle "
+                 f"scored frame replaces the duplicate (fig_case rule, stated in the caption): {alt}")
 
 
 def prepare_main_case(ctx: Context) -> None:
@@ -714,114 +645,124 @@ def prepare_main_case(ctx: Context) -> None:
     ctx.dumps_used[str(npz)] = "main case"
 
 
-# Captions / titles saying where a candidate stands (en, zh).
-CAND_TITLE = {"en": "Main-figure candidate {k} of {n}", "zh": "主图候选 {k}(共 {n} 个)"}  # drawn: half-width
-CAND_NOTE = {"en": "|episode PCK@8 − tier median| = {d:.3f}{extra}", "zh": "|该集 PCK@8 − 该层中位数| = {d:.3f}{extra}"}
-CAND_NOTE_STANDIN = {"en": "  ·  stand-in from {tier_name}", "zh": "  ·  取自{tier_name}的替代"}
+# Titles / caption sentences of the candidates and the main case (en, zh; zh full-width （）, D6).
+CAND_TITLE = {"en": "Main-figure candidate {k} of {n}", "zh": "主图候选 {k}（共 {n} 个）"}
+# |episode PCK@8 - tier median| in percentage points (cases.json stores fractions: 0.0157 -> "1.6 points")
+CAND_NOTE = {"en": "(|episode PCK@8 − tier median| = {dpp:.1f} points)",
+             "zh": "|该集 PCK@8 − 该层中位数| = {dpp:.1f} 个百分点"}
+CAND_NOTE_PATH = {"en": " · same R2R path as candidate {others}", "zh": " · 与候选 {others} 为同一条 R2R 路径"}
 CAND_CAPTION = {
-    "en": "Main-figure candidate {k} of {n} ({tier_name}), ranked by |episode PCK@8 − tier median| = {d:.3f} "
-          "(tier median {med:.3f}); candidates have ≥ 4 scored frames, a path ≥ 8 m and a frame whose past positions "
-          "span ≥ 90° of bearing, one episode per reference path.",
-    "zh": "主图候选 {k}（共 {n} 个，{tier_name}），按 |该集 PCK@8 − 该层中位数| = {d:.3f} 升序排列（该层中位数 {med:.3f}）；"
-          "候选须有 ≥ 4 个评分帧、路径 ≥ 8 m、且至少一帧的历史位置方位跨度 ≥ 90°，每条参考路径只取一集。",
+    "en": "Supplementary figure: main-figure candidate {k} of {n} (episode PCK@8 {ep:.1f}%, tier median {med:.1f}%: "
+          "|episode PCK@8 − tier median| = {dpp:.1f} points). ",
+    "zh": "补充图：主图候选 {k}（共 {n} 个；该集 PCK@8 {ep:.1f}%，该层中位数 {med:.1f}%，|该集 PCK@8 − 该层中位数| = "
+          "{dpp:.1f} 个百分点）。",
 }
-STANDIN_BANNER = {  # drawn above fig1 when it is a stand-in (fig_case CaseOptions.banner)
-    "en": "Stand-in until the unseen scenes are scored: main-figure rule applied to {tier_name}, candidate {k} of {n}, "
-          "gallery episodes excluded",
-    "zh": "未见场景评分之前的替代：主图规则用于{tier_name}，候选 {k}/{n}，已排除画廊所用的集",
+CRITERIA = {
+    "en": "The {n} pre-registered candidates are the {tier_name} episodes whose episode PCK@8 is closest to the tier "
+          "median, among those with ≥ {min_rows} scored frames, a path ≥ {min_path:g} m and a frame whose past "
+          "positions span ≥ {min_span:g}° of bearing.",
+    "zh": "{n} 个预注册候选是{tier_name}中满足 ≥ {min_rows} 个评分帧、路径 ≥ {min_path:g} m、且至少一帧的历史位置方位跨度 "
+          "≥ {min_span:g}° 的集里，该集 PCK@8 最接近该层中位数的 {n} 集。",
 }
-STANDIN_CAPTION = {
-    "en": "[Stand-in until the unseen scenes are scored: the main-figure rule applied to {tier_name}, the gallery "
-          "episodes excluded.]",
-    "zh": "【未见场景评分之前的替代：主图规则用于{tier_name}，已排除画廊所用的集。】",
+SAME_PATH = {
+    "en": "Candidates {ranks} are {count} instructions for one R2R path (episodes {eps}): the route and the images "
+          "are the same, and the predictions differ slightly.",
+    "zh": "候选 {ranks} 是同一条 R2R 路径的{count}条指令（第 {eps} 集）：路线与图像相同，预测略有差异。",
 }
+MAIN_NOTE = {
+    "en": "The episode is one of the {n} pre-registered main-figure candidates, all {n} shown in the supplement.",
+    "zh": "该集是 {n} 个预注册主图候选之一，全部 {n} 个见补充材料。",
+}
+MAIN_TWIN = {
+    "en": "Episode {ep} (supplementary candidate {k}) is another instruction for the same R2R path.",
+    "zh": "第 {ep} 集（补充材料候选 {k}）是同一条 R2R 路径的另一条指令。",
+}
+COUNT_WORD = {"en": {2: "two", 3: "three", 4: "four", 5: "five"}, "zh": {2: "两", 3: "三", 4: "四", 5: "五"}}
+TIER_PLURAL = {"en": {"A": "training-scene", "B": "held-out-scene", "C": "unseen-scene", "D": "HM3D",
+                      "E": "designed-route"},
+               "zh": {"A": "训练场景", "B": "留出场景", "C": "未见场景（C 层）", "D": "HM3D 场景", "E": "设计路线"}}
 
 
-TIER_PLURAL_EN = {"A": "training scenes", "B": "held-out scenes", "C": "unseen scenes",
-                  "D": "HM3D scenes (cross-dataset)", "E": "designed routes"}
+def _join(items: List[str], lang: str) -> str:
+    if lang == "zh":
+        return items[0] if len(items) == 1 else "、".join(items[:-1]) + " 与 " + items[-1]
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def _tier_name(tier: str, lang: str) -> str:
-    """Tier as a plural noun phrase ("held-out scenes" / "留出场景")."""
-    if lang != "zh":
-        return TIER_PLURAL_EN.get(tier, f"tier {tier}")
-    from scripts.exp18.figures import data as dd
+def same_path_sentence(mc: dict, pick: dict, lang: str) -> str:
+    """"Candidates 2 and 4 are two instructions for one R2R path (episodes 1528 and 1529)." or ""."""
+    if not pick.get("same_path_as"):
+        return ""
+    ranks = sorted([int(pick["rank"])] + [int(r) for r in pick["same_path_as"]])
+    by_rank = {int(c["rank"]): c for c in mc.get("candidates") or []}
+    eps = [str(by_rank[r].get("episode_id")) for r in ranks if r in by_rank]
+    sep = "、" if lang == "zh" else None
+    return SAME_PATH[lang].format(ranks=_join([str(r) for r in ranks], lang),
+                                  count=COUNT_WORD[lang].get(len(ranks), str(len(ranks))),
+                                  eps=sep.join(eps) if sep else _join(eps, lang))
 
-    return getattr(dd, "TIER_NAMES_ZH", {}).get(tier, f"{tier} 层")
+
+def criteria_sentence(mc: dict, lang: str) -> str:
+    cr = mc.get("criteria") or {}
+    return CRITERIA[lang].format(n=mc.get("n_candidates"), tier_name=TIER_PLURAL[lang].get(mc.get("tier"), mc.get("tier")),
+                                 min_rows=int(cr.get("min_rows", 4)), min_path=float(cr.get("min_path_m", 8.0)),
+                                 min_span=float(cr.get("min_span_deg", 90.0)))
 
 
 def candidate_label(mc: dict, pick: dict, lang: str) -> dict:
-    """Title, title note and caption prefix of a supplementary candidate figure."""
+    """Title, title note and caption prefix of a supplementary candidate figure (D9)."""
     k, n = int(pick.get("rank", 0)), int(mc.get("n_candidates", 0))
-    d = float(pick.get("abs_diff_from_tier_median") or 0.0)
-    med = float(mc.get("tier_median") or 0.0)
-    tname = _tier_name(mc.get("tier", "C"), lang)
-    stand_in = mc.get("source") == "fallback_candidates"
-    extra = CAND_NOTE_STANDIN[lang].format(tier_name=tname) if stand_in else ""
-    cap = CAND_CAPTION[lang].format(k=k, n=n, d=d, med=med, tier_name=tname)
-    if stand_in:
-        cap = STANDIN_CAPTION[lang].format(tier_name=tname) + " " + cap
-    return {"title": CAND_TITLE[lang].format(k=k, n=n), "title_note": CAND_NOTE[lang].format(d=d, extra=extra),
-            "caption": cap}
+    dpp = 100.0 * float(pick.get("abs_diff_from_tier_median") or 0.0)  # percentage points
+    med = 100.0 * float(mc.get("tier_median") or 0.0)
+    ep = 100.0 * float(pick.get("vo_pck8") or 0.0)
+    note = CAND_NOTE[lang].format(dpp=dpp)
+    if pick.get("same_path_as"):
+        note += CAND_NOTE_PATH[lang].format(others=_join([str(r) for r in pick["same_path_as"]], lang))
+    cap = CAND_CAPTION[lang].format(k=k, n=n, dpp=dpp, med=med, ep=ep) + criteria_sentence(mc, lang)
+    sp = same_path_sentence(mc, pick, lang)
+    if sp:
+        cap += ("" if lang == "zh" else " ") + sp
+    return {"title": CAND_TITLE[lang].format(k=k, n=n), "title_note": note, "caption": cap}
+
+
+def main_case_suffix(mc: dict, lang: str) -> str:
+    """Sentences appended to the captions of fig1 and the animation: one of the candidates; a twin path."""
+    pick = mc["pick"]
+    parts = [MAIN_NOTE[lang].format(n=mc.get("n_candidates"))]
+    by_rank = {int(c["rank"]): c for c in mc.get("candidates") or []}
+    for r in pick.get("same_path_as") or []:
+        parts.append(MAIN_TWIN[lang].format(ep=by_rank[int(r)].get("episode_id"), k=int(r)))
+    return ("" if lang == "zh" else " ").join(parts)
 
 
 # --------------------------------------------------------------------------- #
 # Figure jobs
 # --------------------------------------------------------------------------- #
-def case_options(ctx: Context, **extra):
-    """fig_case.CaseOptions for fig1 / a candidate: the revised layout (unless --case-layout approved),
-    --case-options on top, then ``extra`` (title, banner, ...)."""
-    from scripts.exp18.figures import fig_case as fc
-
-    kw = dict(ctx.case_options)
-    kw.update({k: v for k, v in extra.items() if v is not None})
-    if ctx.case_layout == "revised":
-        if not hasattr(fc.CaseOptions, "revised"):
-            raise RuntimeError("fig_case has no CaseOptions.revised(); use --case-layout approved")
-        return fc.CaseOptions.revised(**kw)
-    return fc.CaseOptions(**kw) if kw else None
-
-
 def job_case(ctx: Context, pick: dict, rows: List[int], stem: Path, lang: str, rule: str,
-             label: Optional[dict] = None, caption_prefix: str = "", banner: Optional[str] = None):
+             label: Optional[dict] = None, caption_suffix: str = ""):
     from scripts.exp18.figures import fig_case as fc
 
     npz = resolve_dump(ctx, pick)
-    opts = case_options(ctx, title=label["title"] if label else None,
-                        title_note=label["title_note"] if label else None, banner=banner)
+    opts = fc.CaseOptions(title=label["title"] if label else None, title_note=label["title_note"] if label else None)
     res = fc.make_case_figure(str(npz), rows=rows, topdown_root=str(ctx.topdown_root),
                               clip_root_override=str(ctx.clip_root) if ctx.clip_root else None,
                               out_stem=str(stem), lang=lang, options=opts)
-    prefix = " ".join(s for s in (caption_prefix, label["caption"] if label else "") if s)
-    if prefix:
-        prefix_caption(res["files"], prefix)
+    edit_caption(res["files"], lang, prefix=label["caption"] if label else "", suffix=caption_suffix)
     details = {"case": pick_summary(pick), "rows": res["rows"], "rows_rule": rule,
                "frames": [s["frame"] for s in res["stats"]], "stats": public(res["stats"]),
-               "layout": ctx.case_layout, "layout_decisions": public(res.get("layout")),
-               "size_in": [round(v, 3) for v in res["size_in"]], "_feedback": feedback(res)}
+               "windows": res.get("windows"), "layout_decisions": public(res.get("layout")),
+               "size_in": [round(v, 3) for v in res["size_in"]], "_feedback": feedback(res),
+               "_blocks": [{"npz": str(npz), "tier": pick.get("tier"), "clip_key": pick.get("clip_key"),
+                            "rows": [int(s["row"])], "window": list(s["window"]), "stats": [public(s)]}
+                           for s in res["stats"]]}
     return res["files"], details
-
-
-def standin_prefix(mc: dict, lang: str) -> str:
-    if mc.get("source") != "fallback_candidates":
-        return ""
-    return STANDIN_CAPTION[lang].format(tier_name=_tier_name(mc["tier"], lang))
-
-
-def standin_banner(mc: dict, lang: str) -> Optional[str]:
-    if mc.get("source") != "fallback_candidates":
-        return None
-    return STANDIN_BANNER[lang].format(tier_name=_tier_name(mc["tier"], lang), k=mc.get("rank"),
-                                       n=mc.get("n_candidates"))
 
 
 def run_fig1(ctx: Context) -> None:
     mc = ctx.main_case
     if mc.get("source") is None:
         if mc.get("error"):
-            for lang in ctx.langs:
-                ctx.entries.append(Entry("fig1", "fig1_main_case", lang, "failed", error=mc["reason"]))
-            print(f"[make_all] fig1_main_case FAILED: {mc['reason']}")
+            ctx.fail("fig1", "fig1_main_case", mc["reason"])
         else:
             ctx.skip("fig1", "fig1_main_case", mc.get("reason", "no main case"))
         return
@@ -829,12 +770,9 @@ def run_fig1(ctx: Context) -> None:
         if mc.get("prepare_error"):
             ctx.run("fig1", "fig1_main_case", lang, lambda: _raise(mc["prepare_error"]))
             continue
-        e = ctx.run("fig1", "fig1_main_case", lang,
-                    lambda lang=lang: job_case(ctx, mc["pick"], mc["rows"], ctx.stem("fig1_main_case", lang), lang,
-                                               mc["rows_rule"], caption_prefix=standin_prefix(mc, lang),
-                                               banner=standin_banner(mc, lang)))
-        if mc["source"] == "fallback_candidates":
-            e.warnings.append(mc["note"])
+        ctx.run("fig1", "fig1_main_case", lang,
+                lambda lang=lang: job_case(ctx, mc["pick"], mc["rows"], ctx.stem("fig1_main_case", lang), lang,
+                                           mc["rows_rule"], caption_suffix=main_case_suffix(mc, lang)))
 
 
 def run_supp(ctx: Context) -> None:
@@ -842,12 +780,15 @@ def run_supp(ctx: Context) -> None:
     cands = mc.get("candidates") or []
     if not cands:
         reason = "no main-figure candidates" + (f": {mc['reason']}" if mc.get("reason") else "")
-        ctx.skip("supp", "supp_candidates", reason)
+        if mc.get("error"):
+            ctx.fail("supp", "supp_candidates", reason)
+        else:
+            ctx.skip("supp", "supp_candidates", reason)
         return
     from scripts.exp18.figures import data as dd
 
     for c in cands:
-        rank = int(c.get("rank", cands.index(c) + 1))
+        rank = int(c["rank"])
         name = f"candidate{rank}_{c.get('scene', 'scene')}_{c.get('clip', 'clip')}"
         fig_id = f"supp_candidate{rank}"
         prep: dict = {}
@@ -862,47 +803,61 @@ def run_supp(ctx: Context) -> None:
                 ctx.run("supp", fig_id, lang, lambda: _raise(prep["error"]))
                 continue
             ctx.run("supp", fig_id, lang,
-                    lambda lang=lang, c=c, name=name: job_case(ctx, c, prep["rows"], ctx.stem(name, lang, "supp"),
-                                                               lang, prep["rule"], label=candidate_label(mc, c, lang)))
-
-
-def gallery_tiers(cases: dict) -> Tuple[List[str], List[str]]:
-    gal = cases.get("gallery") or {}
-    present = [t for t in TIER_ORDER if (gal.get(t) or {}).get("status") == "ok" and (gal[t].get("picks") or [])]
-    return present, [t for t in TIER_ORDER if t not in present]
+                    lambda lang=lang, c=c, name=name, prep=prep: job_case(
+                        ctx, c, prep["rows"], ctx.stem(name, lang, "supp"), lang, prep["rule"],
+                        label=candidate_label(mc, c, lang)))
 
 
 def run_fig2(ctx: Context) -> None:
+    """The main-text gallery (tiers C, D, E) and the supplementary gallery (A-E), D8."""
     if ctx.cases is None:
-        ctx.skip("fig2", "fig2_gallery", "no cases.json")
+        for variant, (group, fig_id, _, _) in GALLERY_STEMS.items():
+            ctx.skip(group, fig_id, "no cases.json")
         return
-    present, missing = gallery_tiers(ctx.cases)
-    if not present:
-        ctx.skip("fig2", "fig2_gallery", "cases.json has no gallery picks for any tier")
-        return
-    for t in present:
-        for p in ctx.cases["gallery"][t]["picks"]:
+    from scripts.exp18.figures import fig_gallery as fg
+
+    gal = ctx.cases.get("gallery") or {}
+    for t in TIER_ORDER:
+        for p in (gal.get(t) or {}).get("picks") or []:
             try:
                 ctx.dumps_used.setdefault(str(resolve_dump(ctx, p)), f"gallery {t} P{p.get('percentile')}")
             except FileNotFoundError:
                 pass  # the gallery draws a placeholder tile and reports it
 
-    def job(lang: str):
-        from scripts.exp18.figures import fig_gallery as fg
-
+    def job(variant: str, lang: str):
+        group, fig_id, stem, sub = GALLERY_STEMS[variant]
         res = fg.make_gallery_figure(ctx.cases, dumps_root=str(ctx.dumps_root) if ctx.dumps_root else None,
                                      topdown_root=str(ctx.topdown_root),
                                      clip_root_override=str(ctx.clip_root) if ctx.clip_root else None,
-                                     out_stem=str(ctx.stem("fig2_gallery", lang)), lang=lang)
-        warnings_ = [f"tile {t['tier']} P{t['percentile']} drawn as a placeholder: {t['error']}"
-                     for t in res.get("tiles", []) if t.get("error")]
-        details = {"tiers": res.get("tiers"), "missing_tiers": res.get("missing_tiers"),
-                   "tiles": public(res.get("tiles")), "size_in": [round(v, 3) for v in res["size_in"]],
-                   "warnings": [public(w) for w in warnings_], "_feedback": feedback(res)}
+                                     out_stem=str(ctx.stem(stem, lang, sub)), lang=lang, metrics=str(ctx.metrics_dir),
+                                     variant=variant)
+        tiles = res.get("tiles") or []
+        missing = [f"tile {t['tier']} P{t['percentile']} drawn as a placeholder: {t['error']}"
+                   for t in tiles if t.get("error")]
+        blocks = []
+        picks = {(t, p.get("clip_key")): p for t in TIER_ORDER for p in (gal.get(t) or {}).get("picks") or []}
+        for tier, win in (res.get("windows") or {}).items():
+            tt = [t for t in tiles if t.get("tier") == tier and t.get("row") is not None]
+            blocks.append({"tier": tier, "window": list(win),
+                           "tiles": [{"npz": str(resolve_dump(ctx, picks[(tier, t["clip_key"])])), "tier": tier,
+                                      "clip_key": t["clip_key"], "row": int(t["row"]), "stats": public(t)}
+                                     for t in tt]})
+        details = {"variant": variant, "tiers": res.get("tiers"), "missing_tiers": res.get("missing_tiers"),
+                   "tiles": public(tiles), "windows": res.get("windows"),
+                   "size_in": [round(v, 3) for v in res["size_in"]], "height_limit_in": res.get("height_limit_in"),
+                   "min_font_pt": res.get("min_font_pt"), "caption_flags": res.get("caption_flags"),
+                   "warnings": [public(w) for w in missing], "_feedback": feedback(res), "_blocks": blocks}
         return res["files"], details
 
-    for lang in ctx.langs:
-        ctx.run("fig2", "fig2_gallery", lang, lambda lang=lang: job(lang))
+    for variant in ("main", "supp"):
+        group, fig_id, _, _ = GALLERY_STEMS[variant]
+        present = [t for t in fg.VARIANT_TIERS[variant]
+                   if (gal.get(t) or {}).get("status") == "ok" and (gal[t].get("picks") or [])]
+        if not present:
+            ctx.skip(group, fig_id, f"cases.json has no gallery picks for tiers {', '.join(fg.VARIANT_TIERS[variant])}")
+            continue
+        for lang in ctx.langs:
+            ctx.run(group, fig_id, lang, lambda variant=variant, lang=lang: job(variant, lang))
 
 
 def run_fig3(ctx: Context) -> None:
@@ -935,27 +890,30 @@ def run_fig4(ctx: Context) -> None:
             ctx.skip("fig4", f"fig4_route_{p}", "no cases.json")
         return
     pf = ctx.cases.get("pattern_figure") or {}
-    ok = [p for p in ROUTE_PATTERNS if isinstance(pf.get(p), dict) and pf[p].get("status") == "ok"]
+    ok = []
     for p in ROUTE_PATTERNS:
-        if p not in ok:
-            status = pf[p].get("status") if isinstance(pf.get(p), dict) else "absent"
-            ctx.skip("fig4", f"fig4_route_{p}", f"no tier-E {PATTERN_TITLES[p]} pick in cases.json (status {status}; "
-                                                f"tiers present: {', '.join(ctx.cases.get('tiers_present') or [])})")
+        pick = pf.get(p)
+        if not (isinstance(pick, dict) and pick.get("status") == "ok"):
+            status = pick.get("status") if isinstance(pick, dict) else "absent"
+            ctx.skip("fig4", f"fig4_route_{p}", f"no {PATTERN_TITLES[p]} pick in cases.json (status {status})")
+        elif str(pick.get("tier")) != "E":  # refuse: the route figures come from designed routes only
+            ctx.fail("fig4", f"fig4_route_{p}", f"the {PATTERN_TITLES[p]} pick {pick.get('clip_key')} is tier "
+                                                f"{pick.get('tier')!r}; route figures are drawn only from tier E")
+        else:
+            ok.append(p)
+            try:
+                ctx.dumps_used.setdefault(str(resolve_dump(ctx, pick)), f"route {p}")
+            except FileNotFoundError:
+                pass
     if not ok:
         return
-    for p in ok:
-        try:
-            ctx.dumps_used.setdefault(str(resolve_dump(ctx, pf[p])), f"route {p}")
-        except FileNotFoundError:
-            pass
-
     import tempfile
 
     from scripts.exp18.figures import fig_routes as fr
 
     def job(p: str, lang: str):
-        # fig_routes reads its picks from a cases.json file; hand it one holding only pattern p, so a
-        # pattern that fails (a dump missing, key rows not matching) does not take the other one with it
+        # fig_routes reads its picks from a cases.json file; hand it one holding only pattern p, so a pattern that
+        # fails (a dump missing, key rows not matching) does not take the other one with it
         one = dict(ctx.cases, pattern_figure={p: pf[p]})
         with tempfile.TemporaryDirectory(prefix="exp18_fig4_") as tmp:
             cases_p = Path(tmp) / f"cases_{p}.json"
@@ -963,7 +921,8 @@ def run_fig4(ctx: Context) -> None:
             res = fr.make_route_figures(str(cases_p), dumps_root=str(ctx.dumps_root) if ctx.dumps_root else None,
                                         topdown_root=str(ctx.topdown_root),
                                         clip_root_override=str(ctx.clip_root) if ctx.clip_root else None,
-                                        out_dir=str(ctx.out_dir), lang=lang)
+                                        out_dir=str(ctx.out_dir), lang=lang,
+                                        metrics_json=str(ctx.metrics_dir / "metrics.json"))
         if p not in res["figures"]:
             raise RuntimeError(f"fig_routes drew no {p} figure: {res['skipped'].get(p, 'no reason given')}")
         r = res["figures"][p]
@@ -973,30 +932,27 @@ def run_fig4(ctx: Context) -> None:
             dst = src.with_name("fig4_" + src.name)
             os.replace(src, dst)
             files.append(str(dst))
+        npz = str(r.get("dump") or resolve_dump(ctx, pf[p]))
         details = {"case": pick_summary(pf[p]), "rows": r.get("rows"), "roles": r.get("roles"),
                    "split_frame": r.get("split_frame"), "split_rule": r.get("split_rule"),
-                   "stand_in": r.get("stand_in"), "front_view_totals": public(r.get("tally_totals")),
-                   "stats": public(r.get("stats")), "size_in": [round(v, 3) for v in r["size_in"]],
-                   "_feedback": feedback(r)}
-        if r.get("stand_in"):
-            details["warnings"] = ["development stand-in: the pick is not a tier-E dump"]
+                   "front_view_totals": public(r.get("tally_totals")), "same_spot": r.get("same_spot"),
+                   "stats": public(r.get("stats")), "windows": r.get("windows"),
+                   "size_in": [round(v, 3) for v in r["size_in"]], "_feedback": feedback(r),
+                   "_blocks": [{"npz": npz, "tier": "E", "clip_key": pf[p].get("clip_key"), "rows": [int(s["row"])],
+                                "window": list(w), "stats": [public(s)]}
+                               for s, w in zip(r.get("stats") or [], r.get("windows") or [])]}
         return files, details
 
     for p in ok:
         for lang in ctx.langs:
             ctx.run("fig4", f"fig4_route_{p}", lang, lambda p=p, lang=lang: job(p, lang))
-    # fig_routes announces the patterns left out of the one-pattern file; those are not warnings
-    for e in ctx.entries:
-        if e.group == "fig4":
-            e.warnings = [w for w in e.warnings if not re.match(r"\[fig_routes\] \w+: skipped", w)]
 
 
 def run_anim(ctx: Context) -> None:
     mc = ctx.main_case
     if mc.get("source") is None:
         if mc.get("error"):
-            for lang in ctx.langs:
-                ctx.entries.append(Entry("anim", "supp_anim_main_case", lang, "failed", error=mc["reason"]))
+            ctx.fail("anim", "supp_anim_main_case", mc["reason"])
         else:
             ctx.skip("anim", "supp_anim_main_case", mc.get("reason", "no main case"))
         return
@@ -1010,15 +966,18 @@ def run_anim(ctx: Context) -> None:
                                 topdown_root=str(ctx.topdown_root),
                                 clip_root_override=str(ctx.clip_root) if ctx.clip_root else None, lang=lang,
                                 size=ctx.anim_size)
-        prefix = standin_prefix(mc, lang)
-        if prefix:
-            prefix_caption(res["files"], prefix)
+        edit_caption(res["files"], lang, suffix=main_case_suffix(mc, lang))
+        stats = res.get("stats") or []
         details = {"case": pick_summary(mc["pick"]), "rows": res.get("rows"), "video_frames": res.get("frames"),
                    "duration_s": round(res.get("duration_s", 0.0), 2), "size_px": list(res.get("size", ())),
-                   "fps": res.get("fps"), "encoder": res.get("encoder"), "render_s": round(res.get("render_s", 0.0), 1),
-                   "_feedback": feedback(res)}
-        if mc["source"] == "fallback_candidates":
-            details["warnings"] = [mc["note"]]
+                   "gif_size": res.get("gif_size"), "fps": res.get("fps"), "encoder": res.get("encoder"),
+                   "render_s": round(res.get("render_s", 0.0), 1), "caption_flags": res.get("caption_flags"),
+                   "queries": [public({k: s.get(k) for k in ("row", "frame", "frame_label", "vo", "floor", "misses",
+                                                             "elevation_window", "vertical_scale")}) for s in stats],
+                   "_feedback": feedback(res),
+                   "_blocks": [{"npz": mc["npz"], "tier": mc["pick"].get("tier"), "clip_key": mc["pick"].get("clip_key"),
+                                "rows": [int(s["row"])], "window": list(s["elevation_window"]), "stats": [public(s)]}
+                               for s in stats]}
         return res["files"], details
 
     for lang in ctx.langs:
@@ -1026,67 +985,64 @@ def run_anim(ctx: Context) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Checks: policy, terminology, zh parentheses, set consistency, colour, font size
+# Checks: policy, parentheses, set consistency, numbers, windows, colour, font size
 # --------------------------------------------------------------------------- #
-def _finding(level: str, rule: str, where: str, match: str = "", context: str = "", **extra) -> dict:
+def _finding(level: str, rule: str, where: str, **extra) -> dict:
     d = {"level": level, "rule": rule, "where": where}
-    if match:
-        d["match"] = match
-    if context:
-        d["context"] = context
-    d.update(extra)
+    d.update({k: v for k, v in extra.items() if v not in (None, "")})
     return d
 
 
-def _ctx(s: str, m: re.Match, pad: int = 40) -> str:
-    return s[max(0, m.start() - pad): m.end() + pad].replace("\n", " ")
+def _masked(s: str, m: re.Match, pad: int = 30) -> str:
+    """Context of a policy match with the match itself masked (printed to the log, never stored)."""
+    return (s[max(0, m.start() - pad): m.start()] + "▇" * max(1, len(m.group(0))) + s[m.end(): m.end() + pad]
+            ).replace("\n", " ")
 
 
-def word_findings(s: str, where: str, terms: bool = True, review: bool = True) -> List[dict]:
+def policy_findings(s: str, where: str, log: bool = True) -> List[dict]:
+    """Policy errors (P*) and warnings (W*) in ``s``: pattern id and place only."""
     out = []
-    for rules, level, on in ((_POLICY_C, "error", True), (_TERM_C, "error", terms), (_REVIEW_C, "review", review)):
-        if not on:
-            continue
-        for name, rx in rules:
-            for m in rx.finditer(s):
-                out.append(_finding(level, name if level != "error" or rules is _TERM_C else f"policy: {name}",
-                                    where, m.group(0), _ctx(s, m)))
+    s = PROJECT_NAME_RE.sub("<project>", s)
+    for rules, level in ((_POLICY_C, "error"), (_WARN_C, "warning")):
+        for pid, rx in rules:
+            m = rx.search(s)
+            if m:
+                out.append(_finding(level, "policy", where, pattern=pid))
+                if log:
+                    print(f"[make_all]   policy {level} {pid} in {where}: …{_masked(s, m)}…", flush=True)
     return out
 
 
-def paren_findings(s: str, lang: str, where: str, kind: str) -> List[dict]:
-    """The parentheses convention (``ZH_PARENS``); ``kind`` is "figure" (drawn text) or "caption"."""
+def paren_findings(s: str, lang: str, where: str) -> List[dict]:
+    """The parentheses convention (D6, ``ZH_PARENS``) in drawn text and captions."""
     out = []
-    full = re.search("[（）]", s)
-    if lang != "zh" or kind == "figure":
+    if lang != "zh":
+        full = re.search("[（）]", s)
         if full:
-            rule = ("zh figure text: use half-width ()" if lang == "zh" else "en text with a full-width parenthesis")
-            out.append(_finding("error", rule, where, full.group(0), _ctx(s, full, 20)))
+            out.append(_finding("error", "en text with a full-width parenthesis", where, match=full.group(0),
+                                context=s[max(0, full.start() - 20): full.end() + 20].replace("\n", " ")))
         return out
-    for m in _HALF_PAREN_RE.finditer(s):  # zh caption
+    for m in _HALF_PAREN_RE.finditer(s):
         inner = m.group(1).strip()
         if _PANEL_RE.fullmatch(inner) or _TUPLE_RE.fullmatch(inner):
             continue  # panel letter (a), coordinates (32, 32)
         before = s[:m.start()].rstrip()
         if _CJK_RE.search(inner) or (before and _CJK_RE.match(before[-1])):
-            out.append(_finding("error", "zh caption: use full-width （）", where, m.group(0), _ctx(s, m, 20)))
+            out.append(_finding("error", "zh text: use full-width （）", where, match=m.group(0)[:40],
+                                context=s[max(0, m.start() - 20): m.end() + 20].replace("\n", " ")))
     return out
 
 
-def text_findings(s: str, lang: str, where: str, kind: str) -> List[dict]:
-    return word_findings(s, where) + paren_findings(s, lang, where, kind)
-
-
-def _label_strings(obj, lang: Optional[str], path: str):
-    """(string, lang, path) for every string in a label table (lang from an 'en'/'zh' key on the way down)."""
+def _label_strings(obj, path: str):
+    """(string, path) for every string in a label table."""
     if isinstance(obj, str):
-        yield obj, lang, path
+        yield obj, path
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            yield from _label_strings(v, k if k in LANGS else lang, f"{path}[{k!r}]")
+            yield from _label_strings(v, f"{path}[{k!r}]")
     elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
-            yield from _label_strings(v, lang, f"{path}[{i}]")
+            yield from _label_strings(v, f"{path}[{i}]")
 
 
 def _import_fig_module(name: str):
@@ -1096,9 +1052,8 @@ def _import_fig_module(name: str):
 
 
 def label_table_findings() -> Tuple[List[dict], int]:
-    """Policy words and terminology in every module-level label table (``LABELS``, ``CAPTION*``,
-    ``*_TEXT``, ``*NAMES*``, ...), including strings of figures not drawn this run.  (Parentheses are
-    checked on what is drawn and on the captions: label tables also hold a layout's legacy wording.)"""
+    """Policy patterns in every module-level label table (``LABELS``, ``CAPTION*``, ``*_TEXT``, ``*NAMES*``, ...),
+    including strings of figures not drawn this run."""
     out, n = [], 0
     for mod_name in LABEL_MODULES:
         try:
@@ -1112,9 +1067,9 @@ def label_table_findings() -> Tuple[List[dict], int]:
                 continue
             if not re.search(r"LABEL|CAPTION|TEXT|NAMES|TITLE|^L[A-Z]?$|^LR$", name):
                 continue
-            for s, _lang, path in _label_strings(val, None, f"{mod_name}.{name}"):
+            for s, path in _label_strings(val, f"{mod_name}.{name}"):
                 n += 1
-                out += word_findings(s, path, review=False)
+                out += [f for f in policy_findings(s, path) if f["level"] == "error"]
     return out, n
 
 
@@ -1170,7 +1125,7 @@ def _context_names(node, parents: dict) -> List[str]:
 
 
 def colour_findings() -> List[dict]:
-    """Colours that read as the ground-truth blue or the prediction orange, used for anything else."""
+    """Colours that read as the ground-truth blue or the prediction orange, used for anything else (D7)."""
     out, reported = [], set()  # (module, colour) already reported as a literal
     for mod_name in COLOUR_MODULES:
         try:
@@ -1198,11 +1153,11 @@ def colour_findings() -> List[dict]:
                 continue
             reported.add((mod_name, node.value.strip().lower()))
             out.append(_finding("error", f"colour reads as the {role} colour but is used for something else",
-                                f"{mod_name}.py:{node.lineno}", node.value,
-                                f"{' / '.join(names[:4]) or 'module level'}: {line.strip()[:100]}"))
+                                f"{mod_name}.py:{node.lineno}", match=node.value,
+                                context=f"{' / '.join(names[:4]) or 'module level'}: {line.strip()[:100]}"))
         # categorical palettes built at runtime (e.g. from constants)
         for name, val in vars(mod).items():
-            if not re.search(r"colou?rs?$|palette", name, re.I):
+            if not re.search(r"colou?rs?$|palette|shades?$", name, re.I):
                 continue
             items = val.items() if isinstance(val, dict) else enumerate(val) if isinstance(val, (list, tuple)) else ()
             for key, c in items:
@@ -1212,26 +1167,7 @@ def colour_findings() -> List[dict]:
                 if (mod_name, str(c).strip().lower()) in reported:
                     continue  # the literal is already reported
                 out.append(_finding("error", f"categorical palette reuses the {role} colour",
-                                    f"{mod_name}.{name}[{key!r}]", str(c)))
-    return out
-
-
-def heat_windows() -> Dict[str, Optional[float]]:
-    out = {}
-    for mod_name in EL_HEAT_MODULES:
-        try:
-            v = getattr(_import_fig_module(mod_name), "EL_HEAT", None)
-            out[mod_name] = float(v) if v is not None else None
-        except Exception:
-            out[mod_name] = None
-    try:
-        from scripts.exp18.figures import common_draw as cd
-
-        for name in ("EL_HEAT", "HEAT_EL_DEG", "HEAT_ELEV_DEG"):
-            if hasattr(cd, name):
-                out[f"common_draw.{name}"] = float(getattr(cd, name))
-    except Exception:
-        pass
+                                    f"{mod_name}.{name}[{key!r}]", match=str(c)))
     return out
 
 
@@ -1243,6 +1179,23 @@ def frame_formats(s: str, lang: str) -> List[str]:
             if n:
                 found.append(fmt)
     return found
+
+
+def elevation_rule() -> dict:
+    """The one elevation-window rule (D4) as the shared layer defines it, and the modules' defaults."""
+    from scripts.exp18.figures import common_draw as cd
+
+    out = {"rule": "common_draw.elevation_window", "default_deg": float(cd.EL_DEFAULT), "max_deg": float(cd.EL_MAX),
+           "module_defaults": {}}
+    for mod_name in ROW_MODULES:
+        try:
+            mod = _import_fig_module(mod_name)
+        except Exception:
+            continue
+        v = getattr(mod, "EL_HEAT", None)
+        out["module_defaults"][mod_name] = float(v) if v is not None else None
+        out.setdefault("calls_rule", {})[mod_name] = "elevation_window(" in Path(mod.__file__).read_text("utf-8")
+    return out
 
 
 def set_findings(ctx: Context) -> Tuple[List[dict], dict]:
@@ -1266,9 +1219,11 @@ def set_findings(ctx: Context) -> Tuple[List[dict], dict]:
                 if m:
                     ahead.setdefault(e.lang, {}).setdefault(m.group(1), set()).add(e.fig_id)
     for lang, fmts in frames.items():
-        if len(fmts) > 1:
-            out.append(_finding("error", "frame labels use more than one format", f"all figures ({lang})",
-                                context="; ".join(f"'{f}' in {', '.join(sorted(v))}" for f, v in sorted(fmts.items()))))
+        other = {f: v for f, v in fmts.items() if f != FRAME_FORMAT_D6.get(lang)}
+        if other:
+            out.append(_finding("error", f"frame labels not in the D6 format '{FRAME_FORMAT_D6.get(lang)}'",
+                                f"all figures ({lang})",
+                                context="; ".join(f"'{f}' in {', '.join(sorted(v))}" for f, v in sorted(other.items()))))
     for (lang, view), quals in views.items():
         if len(quals) > 1:
             out.append(_finding("error", "one view is labelled in more than one way", f"all figures ({lang})",
@@ -1278,29 +1233,32 @@ def set_findings(ctx: Context) -> Tuple[List[dict], dict]:
         if len(quals) > 1:
             out.append(_finding("error", "the 0° label is worded in more than one way", f"all figures ({lang})",
                                 context="; ".join(f"'0° ({q})' in {', '.join(sorted(v))}" for q, v in sorted(quals.items()))))
-    windows = heat_windows()
-    known = {k: v for k, v in windows.items() if v is not None}
-    if len(set(known.values())) > 1:
-        out.append(_finding("error", "the affordance-map rows span different elevation windows",
-                            ", ".join(sorted(known)),
-                            context="; ".join(f"{k} ±{v:g}°" for k, v in sorted(known.items()))))
+    el = elevation_rule()
+    wrong = {m: v for m, v in el["module_defaults"].items() if v is not None and v != el["default_deg"]}
+    if wrong or el["default_deg"] != 10.0 or el["max_deg"] != 45.0:
+        out.append(_finding("error", "elevation-window defaults differ from D4 (±10°, up to ±45°)",
+                            "common_draw / " + ", ".join(sorted(wrong)),
+                            context=f"shared ±{el['default_deg']:g}° up to ±{el['max_deg']:g}°; "
+                                    + "; ".join(f"{k} ±{v:g}°" for k, v in sorted(wrong.items()))))
+    no_call = [m for m, ok in (el.get("calls_rule") or {}).items() if not ok]
+    if no_call:
+        out.append(_finding("error", "module draws affordance-map rows without common_draw.elevation_window",
+                            ", ".join(no_call)))
     # fig1 must not repeat a gallery tile
     mc = ctx.main_case
     drawn = {e.group for e in ctx.entries if e.status != "skipped"}
-    if mc.get("pick") and {"fig1", "fig2"} <= drawn and ctx.cases:
+    if mc.get("pick") and "fig1" in drawn and ({"fig2", "supp_gallery"} & drawn) and ctx.cases:
         t, key = mc["pick"].get("tier"), mc["pick"].get("clip_key")
         if key in gallery_keys(ctx.cases, t):
-            out.append(_finding("error", "fig1 shows an episode that is also a gallery tile", "fig1_main_case, fig2_gallery",
+            out.append(_finding("error", "fig1 shows an episode that is also a gallery tile", "fig1_main_case, galleries",
                                 context=f"tier {t} {key}; pick another candidate with --main-index"))
-    if mc.get("path_duplicates"):
-        out.append(_finding("error", "main-figure candidates repeat a reference path (no metrics tables to re-rank)",
-                            "supp", context=", ".join(sorted(set(mc["path_duplicates"])))))
     conventions = {
         "ground_truth_colour": GT_BLUE, "prediction_colour": PRED_ORANGE,
         "prediction_shown": "the deployed model's output",
+        "miss_rule": "joint PCK@8 failure (D1)",
         "zh_parentheses": ZH_PARENS,
         "min_font_pt": MIN_FONT_PT,
-        "heat_row_elevation_deg": windows,
+        "elevation_window": el,
         "frame_label_formats": {lang: sorted(f) for lang, f in frames.items()},
         "view_labels": {f"{lang}:{view}": sorted(q) for (lang, view), q in sorted(views.items())},
         "zero_bearing_label": {lang: sorted(q) for lang, q in ahead.items()},
@@ -1308,19 +1266,158 @@ def set_findings(ctx: Context) -> Tuple[List[dict], dict]:
     return out, conventions
 
 
+def _truth(tabs: dict) -> Callable[[str, str, int], Optional[dict]]:
+    """(tier, clip_key, row) -> {"misses": [1-based slots], "n", "hits", "pck8_row"} from the tables."""
+    slots, rows = tabs["slots"], tabs["rows"]
+    grp = {(t, c, int(r)): g for (t, c, r), g in slots.groupby(["tier", "clip_key", "row"])}
+    rrow = {(t, c, int(r)): v for t, c, r, v in zip(rows["tier"], rows["clip_key"], rows["row"], rows["vo_pck8_row"])}
+
+    def get(tier: str, clip_key: str, row: int) -> Optional[dict]:
+        g = grp.get((tier, clip_key, int(row)))
+        if g is None:
+            return None
+        g = g[g["gt_visible"].astype(bool)]
+        ok = g["pred_vo_joint8"].astype(bool).values
+        return {"misses": sorted(int(k) + 1 for k, h in zip(g["k"], ok) if not h), "n": int(len(g)),
+                "hits": int(ok.sum()), "pck8_row": rrow.get((tier, clip_key, int(row)))}
+
+    return get
+
+
+def _pred_summary(stats: dict) -> Optional[dict]:
+    for k in ("prediction", "vo"):
+        if isinstance(stats.get(k), dict):
+            return stats[k]
+    return None
+
+
+def number_findings(ctx: Context) -> Tuple[List[dict], dict]:
+    """D1 against the tables for every drawn row, D4 against ``elevation_window`` for every block, D8 for the
+    gallery tiles."""
+    out: List[dict] = []
+    summary = {"rows_checked": 0, "blocks_checked": 0, "tiles_checked_d8": 0}
+    tabs = ctx.tables()
+    drawn = [e for e in ctx.entries if e.status == "ok" and e.blocks]
+    if not drawn:
+        return out, summary
+    if tabs is None:
+        out.append(_finding("error", "cannot check the drawn numbers: no slots/rows/episodes tables",
+                            str(ctx.metrics_dir)))
+        return out, summary
+    truth = _truth(tabs)
+    from scripts.exp18.figures import common_draw as cd
+    from scripts.exp18.figures import data as dd
+
+    dumps: Dict[str, object] = {}
+
+    def case_row(npz: str, i: int):
+        if npz not in dumps:
+            dumps[npz] = dd.load_dump(npz)
+        return dd.case_row(dumps[npz], int(i))
+
+    for e in drawn:
+        where = f"{e.fig_id} ({e.lang})"
+        for b in e.blocks:
+            members = b["tiles"] if "tiles" in b else [dict(b, row=r, stats=s) for r, s in zip(b["rows"], b["stats"])]
+            for m in members:
+                summary["rows_checked"] += 1
+                tv = truth(m["tier"], m["clip_key"], m["row"])
+                st = m["stats"]
+                ps = _pred_summary(st) or {}
+                tag = f"{m['tier']} {m['clip_key']} row {m['row']}"
+                if tv is None:
+                    out.append(_finding("error", "D1: drawn row not in the slots table", where, context=tag))
+                    continue
+                drawn_m = sorted(int(k) for k in st.get("misses") or [])
+                if drawn_m != tv["misses"]:
+                    out.append(_finding("error", "D1: numbered misses differ from the slots table", where,
+                                        context=f"{tag}: drawn {drawn_m}, table {tv['misses']}"))
+                if (ps.get("n"), ps.get("hits")) != (tv["n"], tv["hits"]):
+                    out.append(_finding("error", "D1: hits / visible differ from the slots table", where,
+                                        context=f"{tag}: drawn {ps.get('hits')}/{ps.get('n')}, table "
+                                                f"{tv['hits']}/{tv['n']}"))
+                if tv["pck8_row"] is not None and tv["n"] and abs(tv["hits"] / tv["n"] - float(tv["pck8_row"])) > 1e-9:
+                    out.append(_finding("error", "D1: rows table PCK@8 differs from the slots table", where, context=tag))
+                if len(drawn_m) != tv["n"] - tv["hits"]:
+                    out.append(_finding("error", "D1: numbered misses != visible - hits", where, context=tag))
+            # D4: the block's window is the shared rule applied to the rows it shows
+            try:
+                recs = [case_row(m["npz"], m["row"]) for m in members]
+                want = tuple(float(v) for v in cd.elevation_window(recs))
+                got = tuple(float(v) for v in b["window"])
+                summary["blocks_checked"] += 1
+                if max(abs(a - c) for a, c in zip(want, got)) > 1e-6:
+                    out.append(_finding("error", "D4: elevation window is not elevation_window(rows shown)", where,
+                                        context=f"{b.get('tier')} rows {[m['row'] for m in members]}: drawn {got}, "
+                                                f"rule {want}"))
+            except Exception as exc:
+                out.append(_finding("error", "D4: cannot recompute an elevation window", where,
+                                    context=f"{type(exc).__name__}: {exc}"))
+        cap = caption_of(e)
+        if cap is not None and cap.is_file():
+            text = cap.read_text(encoding="utf-8")
+            wins = sorted({tuple(float(v) for v in b["window"]) for b in e.blocks})
+            missing = [w for w in wins if ELEV_RANGE[e.lang].format(lo=cd.fmt_deg(w[0]), hi=cd.fmt_deg(w[1])) not in text]
+            if ELEV_WORD[e.lang] not in text or missing:
+                out.append(_finding("error", "D4: caption does not state every elevation window drawn", where,
+                                    context=", ".join(f"{cd.fmt_deg(a)}..{cd.fmt_deg(b)}" for a, b in missing)))
+            else:
+                summary["captions_stating_windows"] = summary.get("captions_stating_windows", 0) + 1
+        if e.group in ("fig2", "supp_gallery"):
+            out += gallery_frame_findings(tabs, e, summary)
+    return out, summary
+
+
+def gallery_frame_findings(tabs: dict, e: Entry, summary: dict) -> List[dict]:
+    """D8: each tile shows the scored frame whose median bearing error is closest to the episode's median
+    (ties: wider ground-truth bearing span, then the earlier frame)."""
+    out = []
+    slots, rows, eps = tabs["slots"], tabs["rows"], tabs["episodes"]
+    for b in e.blocks:
+        for m in b["tiles"]:
+            tier, ck = m["tier"], m["clip_key"]
+            s = slots[(slots["tier"] == tier) & (slots["clip_key"] == ck) & slots["gt_visible"].astype(bool)
+                      & slots["vo_row"].astype(bool)]
+            err = s[s["pred_vo_bearing_err"].notna()]
+            if err.empty:
+                continue
+            ep_med = float(err["pred_vo_bearing_err"].median())
+            ep_tab = eps[(eps["tier"] == tier) & (eps["clip_key"] == ck)]["vo_bearing_err_median"]
+            r = rows[(rows["tier"] == tier) & (rows["clip_key"] == ck)].set_index("row")
+            best = None
+            for row, g in err.groupby("row"):
+                span = float(r.loc[row, "gt_bearing_span_deg"]) if row in r.index else 0.0
+                key = (round(abs(float(g["pred_vo_bearing_err"].median()) - ep_med), 9), -round(span, 9), int(row))
+                best = key if best is None or key < best else best
+            summary["tiles_checked_d8"] += 1
+            if best is not None and best[2] != int(m["row"]):
+                out.append(_finding("error", "D8: gallery tile is not the frame closest to the episode median",
+                                    f"{e.fig_id} ({e.lang})", context=f"{tier} {ck}: drawn row {m['row']}, rule row "
+                                                                      f"{best[2]}"))
+            if len(ep_tab) and abs(float(ep_tab.iloc[0]) - ep_med) > 1e-6:
+                out.append(_finding("error", "D8: episode median differs from the episodes table",
+                                    f"{e.fig_id} ({e.lang})", context=f"{tier} {ck}"))
+    return out
+
+
 def run_checks(ctx: Context, readme: Path) -> dict:
     """Every check except the manifest scan (done when the manifest is written)."""
     findings: List[dict] = []
-    checked = {"figure_texts": 0, "strings_drawn": 0, "captions": 0, "label_strings": 0, "readme": 0}
+    checked = {"figures": 0, "strings_drawn": 0, "text_artists_walked": 0, "captions": 0, "label_strings": 0,
+               "readme": 0}
     for e in ctx.entries:
         if e.status == "skipped":
             continue
         where = f"{e.fig_id} ({e.lang})"
-        if e.texts:
-            checked["figure_texts"] += 1
+        strings = set(e.texts) | e.walked
+        if strings:
+            checked["figures"] += 1
             checked["strings_drawn"] += len(e.texts)
+            checked["text_artists_walked"] += len(e.walked)
+        for s in sorted(strings):
+            findings += policy_findings(s, f"{where} figure text")
         for s in e.texts:
-            findings += text_findings(s, e.lang, f"{where} figure text", "figure")
+            findings += paren_findings(s, e.lang, f"{where} figure text")
         if e.group != "anim" and e.texts:
             small = sorted((fs, s) for s, fs in e.texts.items() if fs < MIN_FONT_PT - FONT_TOL_PT)
             if small:
@@ -1330,25 +1427,28 @@ def run_checks(ctx: Context, readme: Path) -> dict:
         cap = caption_of(e)
         if cap is not None and cap.is_file():
             checked["captions"] += 1
-            findings += text_findings(cap.read_text(encoding="utf-8"), e.lang, f"{where} caption", "caption")
+            text = cap.read_text(encoding="utf-8")
+            findings += policy_findings(text, f"{where} caption") + paren_findings(text, e.lang, f"{where} caption")
     lab, n = label_table_findings()
     checked["label_strings"] = n
     findings += lab
     findings += colour_findings()
     sf, conventions = set_findings(ctx)
     findings += sf
+    nf, numbers = number_findings(ctx)
+    findings += nf
     if readme.is_file():
         checked["readme"] = 1
-        findings += word_findings(readme.read_text(encoding="utf-8"), "README.md", terms=False, review=False)
-    # one finding per (rule, where, match)
-    uniq = list({(f["level"], f["rule"], f["where"], f.get("match", ""), f.get("context", "")): f
+        findings += policy_findings(readme.read_text(encoding="utf-8"), "README.md")
+    # one finding per (level, rule, where, pattern, match, context)
+    uniq = list({tuple(str(f.get(k, "")) for k in ("level", "rule", "where", "pattern", "match", "context")): f
                  for f in findings}.values())
-    return {"errors": [f for f in uniq if f["level"] == "error"], "review": [f for f in uniq if f["level"] == "review"],
-            "checked": checked, "conventions": conventions}
+    return {"errors": [f for f in uniq if f["level"] == "error"], "warnings": [f for f in uniq if f["level"] == "warning"],
+            "checked": checked, "numbers": numbers, "conventions": conventions}
 
 
 def manifest_policy_hits(manifest: dict) -> List[dict]:
-    """Policy words in the manifest itself (tracebacks and error texts are diagnostics and skipped)."""
+    """Policy patterns in the manifest itself (tracebacks and error texts are diagnostics and skipped)."""
     def strip(obj):
         if isinstance(obj, dict):
             return {k: strip(v) for k, v in obj.items() if k not in ("traceback", "error", "lint", "policy_check")}
@@ -1357,7 +1457,7 @@ def manifest_policy_hits(manifest: dict) -> List[dict]:
         return obj
 
     text = json.dumps(strip(manifest), ensure_ascii=False, default=str)
-    return [f for f in word_findings(text, "manifest.json", terms=False, review=False)]
+    return [f for f in policy_findings(text, "manifest.json") if f["level"] == "error"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1439,7 +1539,7 @@ def caption_of(e: Entry) -> Optional[Path]:
     return None
 
 
-SECTION_ORDER = ("fig1", "fig2", "fig3", "fig4", "supp", "anim")
+SECTION_ORDER = ("fig1", "fig2", "fig3", "fig4", "supp", "supp_gallery", "anim")
 
 
 def _sub_order(fig_id: str) -> tuple:
@@ -1457,9 +1557,11 @@ def figure_order(e: Entry) -> tuple:
 
 
 def _lint_line(f: dict) -> str:
-    """README line for a check finding; policy words themselves are not repeated (they are in the manifest)."""
-    shown = "" if f["rule"].startswith("policy") else (f" «{f['match']}»" if f.get("match") else "")
-    ctx_ = "" if f["rule"].startswith("policy") or f.get("match") else (f": {f['context']}" if f.get("context") else "")
+    """README / log line for a check finding; policy findings name only the pattern id (never the words)."""
+    if f["rule"] == "policy":
+        return f"- policy pattern {f['pattern']} ({PATTERN_NOTES.get(f['pattern'], '')}) — {f['where']}"
+    shown = f" «{f['match']}»" if f.get("match") else ""
+    ctx_ = f": {f['context']}" if f.get("context") else ""
     return f"- {f['rule']} — {f['where']}{shown}{ctx_}"
 
 
@@ -1471,7 +1573,7 @@ def write_readme(ctx: Context, manifest: dict) -> Path:
     L.append(f"Rendered {manifest['created_utc'][:19].replace('T', ' ')} UTC by "
              f"`scripts/exp18/figures/make_all.py` (code `{sha}`, EXP-18 sources sha256 "
              f"`{manifest['code']['digest']['sha256'][:16]}…`). Languages: {', '.join(ctx.langs)}."
-             + (" **Draft run** (check errors and left-out notes do not fail it)." if ctx.draft else "") + "\n")
+             + (" **Draft run** (check errors do not fail it)." if ctx.draft else "") + "\n")
     inp = manifest["inputs"]
     L.append("**Inputs.**\n")
     for key, label in (("metrics_json", "metrics"), ("cases_json", "cases"), ("slots", "slots table"),
@@ -1487,49 +1589,47 @@ def write_readme(ctx: Context, manifest: dict) -> Path:
     mc = manifest["main_case"]
     if mc.get("source") == "main_candidates":
         c = mc["case"]
-        L.append(f"**Main case (fig1, animation).** {mc['note']}: {c.get('tier')} `{c.get('clip_key')}`, episode "
-                 f"{c.get('episode_id')}, frames {mc.get('frames')} ({mc.get('rows_rule')}). Candidates: "
-                 f"{mc.get('candidates_source')}; all {mc['n_candidates']} are in `supp/`.\n")
-    elif mc.get("source") == "fallback_candidates":
-        c = mc["case"]
-        L.append(f"> **Main case (fig1, animation): STAND-IN.** {mc['reason']}. fig1, the animation and `supp/` use "
-                 f"the main-figure rule applied to tier {mc['tier']} (one episode per reference path, the tier-"
-                 f"{mc['tier']} gallery picks excluded, so fig1 repeats no gallery tile): candidate "
-                 f"{mc.get('main_index')} of {mc['n_candidates']}, `{c.get('clip_key')}`, episode "
-                 f"{c.get('episode_id')}, frames {mc.get('frames')}. Re-run once tier C is scored.\n")
+        shared = "; ".join("candidates " + " and ".join(str(r) for r in g) + " share one R2R path"
+                           for g in mc.get("shared_paths") or [])
+        L.append(f"**Main case (fig1, animation).** {mc['note']}: tier {c.get('tier')} `{c.get('clip_key')}`, episode "
+                 f"{c.get('episode_id')}, frames {[f + 1 for f in mc.get('frames') or []]} (1-based; "
+                 f"{mc.get('rows_rule')}). All {mc['n_candidates']} pre-registered candidates are drawn in `supp/`"
+                 + (f" ({shared})" if shared else "") + ". Re-render with `--main-index k` (or `MAIN_INDEX=k`) to make "
+                 "candidate k fig1.\n")
     else:
         L.append(f"> **Main case: none.** {mc.get('reason', '')}\n")
 
     lint = manifest.get("lint", {})
-    errs, rev = lint.get("errors", []), lint.get("review", [])
+    errs, warns = lint.get("errors", []), lint.get("warnings", [])
+    ch = lint.get("checked", {})
     L.append("## Checks\n")
-    L.append(f"Policy words (id `{POLICY_ID}`): {len(manifest['policy_check']['hits'])} hit(s) in "
-             f"{lint.get('checked', {}).get('strings_drawn', 0)} strings drawn by "
-             f"{lint.get('checked', {}).get('figure_texts', 0)} figures, {lint.get('checked', {}).get('captions', 0)} "
-             f"captions, {lint.get('checked', {}).get('label_strings', 0)} label-table strings, README.md and "
-             f"manifest.json. Check errors: **{len(errs)}**. Items for manual review: {len(rev)}. "
-             f"Notes left out of figures: **{manifest['counts']['notes_not_drawn']}**.\n")
+    L.append(f"Policy (id `{POLICY_ID}`, patterns {', '.join(i for i, _ in POLICY_PATTERNS)} = errors, "
+             f"{', '.join(i for i, _ in WARN_PATTERNS)} = warnings): "
+             f"{len(manifest['policy_check']['hits'])} error hit(s), {len(manifest['policy_check']['warnings'])} "
+             f"warning(s) in {ch.get('strings_drawn', 0)} strings drawn and {ch.get('text_artists_walked', 0)} "
+             f"text artists walked in {ch.get('figures', 0)} figures, {ch.get('captions', 0)} captions, "
+             f"{ch.get('label_strings', 0)} label-table strings, README.md and manifest.json. Numbers (D1 / D4 / D8): "
+             f"{lint.get('numbers', {}).get('rows_checked', 0)} drawn rows against the slots table, "
+             f"{lint.get('numbers', {}).get('blocks_checked', 0)} elevation windows recomputed, "
+             f"{lint.get('numbers', {}).get('tiles_checked_d8', 0)} gallery frames re-selected. Check errors: "
+             f"**{len(errs)}**. Slots unaccounted for (dropped notes): **{manifest['counts']['defects']}**.\n")
     if errs:
         L.append("**Errors** (each fails the run):\n")
         L += [_lint_line(f) for f in errs]
         L.append("")
-    if rev:
-        byrule: Dict[str, List[str]] = {}
-        for f in rev:
-            byrule.setdefault(f"{f['rule']} «{f.get('match', '')}»", []).append(f["where"])
-        L.append("**For manual review** (not errors):\n")
-        for k, where in byrule.items():
-            L.append(f"- {k}: {len(where)} place(s), e.g. {', '.join(where[:3])}")
+    if warns:
+        L.append("**Warnings** (for manual review):\n")
+        L += [_lint_line(f) for f in warns]
         L.append("")
     conv = lint.get("conventions", {})
     if conv:
-        win = conv.get("heat_row_elevation_deg", {})
+        el = conv.get("elevation_window", {})
         L.append("**Conventions.** Ground truth blue `" + conv["ground_truth_colour"] + "`, prediction orange `"
-                 + conv["prediction_colour"] + "`; zh parentheses: " + conv["zh_parentheses"]
-                 + f"; text ≥ {conv['min_font_pt']} pt; affordance-map rows ±elevation: "
-                 + ", ".join(f"{k} {v:g}°" if v is not None else f"{k} n/a" for k, v in win.items())
-                 + "; frame labels: " + "; ".join(f"{k}: {', '.join(v)}" for k, v in conv.get("frame_label_formats", {}).items())
-                 + ".\n")
+                 + conv["prediction_colour"] + "`; misses: " + conv.get("miss_rule", "") + "; parentheses: "
+                 + conv["zh_parentheses"] + f"; text ≥ {conv['min_font_pt']} pt; affordance-map rows: "
+                 + f"{el.get('rule')} (±{el.get('default_deg', 0):g}°, widened up to ±{el.get('max_deg', 0):g}°, stated "
+                 + "in each caption); frame labels: "
+                 + "; ".join(f"{k}: {', '.join(v)}" for k, v in conv.get("frame_label_formats", {}).items()) + ".\n")
 
     L.append("## Contents\n")
     L.append("| Figure | Language | Status | Files | Size |")
@@ -1555,9 +1655,8 @@ def write_readme(ctx: Context, manifest: dict) -> Path:
     for e in ents:
         for w in e.warnings:
             warn.setdefault(w, []).append(f"{e.fig_id} ({e.lang})")
-    warn.pop(mc.get("note"), None)  # the main-case note is the banner above
     if warn:
-        L.append("**Warnings.**\n")
+        L.append("**Layout notes the figure modules returned** (not errors).\n")
         for w, where in warn.items():
             L.append(f"- {w} [{', '.join(where)}]")
         L.append("")
@@ -1571,7 +1670,8 @@ def write_readme(ctx: Context, manifest: dict) -> Path:
     sections = [("fig1", "fig1_main_case"), ("fig2", "fig2_gallery"), ("fig3", "fig3_metrics")]
     sections += [("fig4", f"fig4_route_{p}") for p in ROUTE_PATTERNS]
     cand_ids = sorted({e.fig_id for e in ctx.entries if e.group == "supp"}, key=_sub_order)
-    sections += [("supp", fid) for fid in cand_ids] + [("anim", "supp_anim_main_case")]
+    sections += [("supp", fid) for fid in cand_ids]
+    sections += [("supp_gallery", "supp_gallery_all"), ("anim", "supp_anim_main_case")]
     for group, fid in sections:
         es = [e for e in ctx.entries if e.fig_id == fid]
         if not es:
@@ -1582,9 +1682,12 @@ def write_readme(ctx: Context, manifest: dict) -> Path:
         elif group == "supp" and fid != "supp_candidates":
             c = next((e.details["case"] for e in es if e.details.get("case")), {})
             title = (f"Main-figure candidate {_sub_order(fid)[0]} of {mc.get('n_candidates', '?')}"
-                     + (f": `{c['clip_key']}`" if c.get("clip_key") else "")
-                     + (f", |episode PCK@8 − tier median| = {c['abs_diff_from_tier_median']:.3f}"
-                        if c.get("abs_diff_from_tier_median") is not None else ""))
+                     + (f": `{c['clip_key']}`, episode {c.get('episode_id')}" if c.get("clip_key") else "")
+                     + (f", |episode PCK@8 − tier median| = {100 * c['abs_diff_from_tier_median']:.1f} points"
+                        if c.get("abs_diff_from_tier_median") is not None else "")
+                     + (f" (same R2R path as candidate {', '.join(str(r) for r in c['same_path_as'])})"
+                        if c.get("same_path_as") else "")
+                     + (" — **fig1**" if mc.get("rank") == _sub_order(fid)[0] else ""))
         L.append(f"## {fid}: {title}\n")
         for e in sorted(es, key=lambda x: LANGS.index(x.lang) if x.lang in LANGS else 9):
             if e.status == "skipped" or (e.status == "failed" and not e.files):
@@ -1611,9 +1714,9 @@ def build_manifest(ctx: Context, started: float, git: dict, digest: dict, fonts:
     produced = {r["path"] for e in ctx.entries for r in e.details.get("_files", [])}
     mc = ctx.main_case
     main_case = {k: public(mc.get(k)) for k in ("source", "note", "reason", "tier", "rank", "n_candidates",
-                                                 "candidates_source", "tier_median", "n_meeting_criteria",
-                                                 "skipped_same_path", "skipped_gallery", "path_duplicates", "npz",
-                                                 "rows", "frames", "rows_rule", "prepare_error")
+                                                 "candidates_source", "tier_median", "n_meeting_criteria", "n_episodes",
+                                                 "criteria", "shared_paths", "npz", "rows", "frames", "rows_rule",
+                                                 "prepare_error")
                  if mc.get(k) is not None}
     if mc.get("pick"):
         main_case["case"] = pick_summary(mc["pick"])
@@ -1638,12 +1741,11 @@ def build_manifest(ctx: Context, started: float, git: dict, digest: dict, fonts:
         figures.append({"id": e.fig_id, "group": e.group, "title": TITLES.get(e.group, ""), "lang": e.lang,
                         "status": e.status, "reason": e.reason or None, "error": e.error or None,
                         "files": recs, "caption_file": os.path.relpath(cap, ctx.out_dir) if cap else None,
-                        "seconds": e.seconds, "warnings": e.warnings, "notes_dropped": e.dropped_notes,
-                        "strings_drawn": len(e.texts), "min_font_pt": round(min(static), 2) if static else None,
-                        "details": d})
+                        "seconds": e.seconds, "warnings": e.warnings, "unaccounted_slots": e.defects,
+                        "strings_drawn": len(e.texts), "text_artists_walked": len(e.walked),
+                        "min_font_pt": round(min(static), 2) if static else None, "details": d})
     counts = {s: sum(1 for e in ctx.entries if e.status == s) for s in ("ok", "skipped", "failed")}
-    # a note a figure had no room for leaves that slot unaccounted for in the figure; its job failed
-    counts["notes_not_drawn"] = sum(len(e.dropped_notes) for e in ctx.entries)
+    counts["defects"] = sum(len(e.defects) for e in ctx.entries)
     dumps = {p: dict(input_record(Path(p)), role=role) for p, role in sorted(ctx.dumps_used.items())}
     return {
         "schema": SCHEMA,
@@ -1655,8 +1757,7 @@ def build_manifest(ctx: Context, started: float, git: dict, digest: dict, fonts:
                  "out_dir": str(ctx.out_dir), "langs": ctx.langs, "only": ctx.groups, "main_index": ctx.main_index,
                  "dumps_root": str(ctx.dumps_root) if ctx.dumps_root else None,
                  "topdown_root": str(ctx.topdown_root), "clip_root": str(ctx.clip_root) if ctx.clip_root else None,
-                 "anim_size": list(ctx.anim_size), "case_layout": ctx.case_layout,
-                 "case_options": ctx.case_options or None, "draft": ctx.draft},
+                 "anim_size": list(ctx.anim_size), "draft": ctx.draft},
         "inputs": {"metrics_json": input_record(ctx.metrics_dir / "metrics.json"),
                    "cases_json": input_record(ctx.cases_path),
                    "slots": table_record(ctx.metrics_dir / "slots"),
@@ -1686,26 +1787,6 @@ def _version(mod: str) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-CASE_FLAGS = ("merge_notes", "clamp_peaks")
-CASE_LETTERS = ("outward", "slide", "inside")
-
-
-def parse_case_options(text: str) -> Dict[str, object]:
-    """``"merge_notes,clamp_peaks,letters=slide"`` -> fig_case.CaseOptions keyword arguments."""
-    out: Dict[str, object] = {}
-    for item in (s.strip() for s in text.split(",")):
-        if not item:
-            continue
-        key, _, value = item.partition("=")
-        if key in CASE_FLAGS and not value:
-            out[key] = True
-        elif key == "letters" and value in CASE_LETTERS:
-            out[key] = value
-        else:
-            raise ValueError(f"--case-options {item!r}: use {', '.join(CASE_FLAGS)} or letters={'|'.join(CASE_LETTERS)}")
-    return out
-
-
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--exp-root", type=Path, default=common.EXP_ROOT, help="default $EXP18_ROOT (common.EXP_ROOT)")
@@ -1713,21 +1794,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--cases", type=Path, default=None, help="default <metrics-dir>/cases.json")
     ap.add_argument("--out-dir", type=Path, default=None, help="default <exp-root>/figures")
     ap.add_argument("--langs", default="en,zh", help="comma list of en, zh")
-    ap.add_argument("--main-index", type=int, default=1, help="main-figure candidate (1-based rank) drawn as fig1")
-    ap.add_argument("--only", default=",".join(GROUPS), help=f"comma list of {', '.join(GROUPS)}")
+    ap.add_argument("--main-index", type=int, default=1,
+                    help="pre-registered main-figure candidate (1-based rank) drawn as fig1 and animated")
+    ap.add_argument("--only", default=",".join(GROUPS), help=f"comma list of {', '.join(GROUPS)} "
+                                                              f"(fig2 draws both galleries)")
     ap.add_argument("--dumps-root", type=Path, default=None,
                     help="<root>/<tier>/<scene>/<clip>.npz (default: the npz_path recorded in cases.json)")
     ap.add_argument("--topdown-root", type=Path, default=None, help="default <exp-root>/topdown")
     ap.add_argument("--clip-root", type=Path, default=None, help="local copy of the clips (default: as recorded)")
     ap.add_argument("--anim-size", default="1920x1080", help="animation WxH, 16:9")
     ap.add_argument("--clean", action="store_true", help="first delete the files the previous manifest.json listed")
-    ap.add_argument("--case-layout", default="revised", choices=("revised", "approved"),
-                    help="fig_case layout of fig1 and the candidates (default revised: CaseOptions.revised())")
-    ap.add_argument("--case-options", default="",
-                    help="single fig_case.CaseOptions fields on top of the layout, comma list of merge_notes, "
-                         "clamp_peaks, letters=outward|slide|inside")
     ap.add_argument("--draft", action="store_true",
-                    help="development run: check errors and left-out notes are recorded but do not fail the run")
+                    help="development run: check errors are recorded but do not fail the run")
     args = ap.parse_args(argv)
     args.langs = [s.strip() for s in args.langs.split(",") if s.strip()]
     bad = [s for s in args.langs if s not in LANGS]
@@ -1742,10 +1820,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     except ValueError:
         ap.error(f"--anim-size {args.anim_size}: WxH")
     args.anim_size = (w, h)
-    try:
-        args.case_options = parse_case_options(args.case_options)
-    except ValueError as exc:
-        ap.error(str(exc))
     if args.main_index < 1:
         ap.error("--main-index is 1-based")
     return args
@@ -1760,8 +1834,7 @@ def main(argv=None) -> int:
                   out_dir=Path(args.out_dir or exp_root / "figures"), langs=args.langs,
                   groups=[g for g in GROUPS if g in args.only], main_index=args.main_index,
                   dumps_root=args.dumps_root, topdown_root=Path(args.topdown_root or exp_root / "topdown"),
-                  clip_root=args.clip_root, anim_size=args.anim_size, case_options=args.case_options,
-                  case_layout=args.case_layout, draft=args.draft)
+                  clip_root=args.clip_root, anim_size=args.anim_size, draft=args.draft)
     ctx.out_dir.mkdir(parents=True, exist_ok=True)
     (ctx.out_dir / "supp").mkdir(exist_ok=True)
     removed = clean_previous(ctx.out_dir) if args.clean else []
@@ -1787,6 +1860,8 @@ def main(argv=None) -> int:
         mc = ctx.main_case
         print(f"[make_all] main case: {mc.get('note') or mc.get('reason')}"
               + (f" -> {mc['pick'].get('clip_key')} rows {mc.get('rows')}" if mc.get("pick") else ""), flush=True)
+        for g in mc.get("shared_paths") or []:
+            print(f"[make_all] candidates {g} share one R2R path (their captions say so)", flush=True)
     steps = {"fig1": run_fig1, "supp": run_supp, "fig2": run_fig2, "fig3": run_fig3, "fig4": run_fig4,
              "anim": run_anim}
     with ctx.spy:
@@ -1795,18 +1870,21 @@ def main(argv=None) -> int:
                 steps[g](ctx)
 
     manifest = build_manifest(ctx, started, git, digest, fonts, removed)
-    manifest["policy_check"] = {"pattern_id": POLICY_ID, "pattern_sha256": POLICY_SHA256, "hits": []}
-    manifest["lint"] = {"errors": [], "review": [], "checked": {}, "conventions": {}}
+    manifest["policy_check"] = {"pattern_id": POLICY_ID, "pattern_sha256": POLICY_SHA256,
+                                "patterns": {i: PATTERN_NOTES[i] for i, _ in POLICY_PATTERNS + WARN_PATTERNS},
+                                "hits": [], "warnings": []}
+    manifest["lint"] = {"errors": [], "warnings": [], "checked": {}, "numbers": {}, "conventions": {}}
     readme = write_readme(ctx, manifest)  # first pass: the checks read the README ...
     lint = run_checks(ctx, readme)
     lint["errors"] += manifest_policy_hits(manifest)
     lint["checked"]["manifest"] = 1
     manifest["lint"] = lint
-    manifest["policy_check"]["hits"] = [f for f in lint["errors"] if f["rule"].startswith("policy")]
+    manifest["policy_check"]["hits"] = [f for f in lint["errors"] if f["rule"] == "policy"]
+    manifest["policy_check"]["warnings"] = [f for f in lint["warnings"] if f["rule"] == "policy"]
     manifest["policy_check"]["checked"] = lint["checked"]
     readme = write_readme(ctx, manifest)  # ... and the second pass reports them
-    for f in word_findings(readme.read_text(encoding="utf-8"), "README.md", terms=False, review=False):
-        if f not in lint["errors"]:
+    for f in policy_findings(readme.read_text(encoding="utf-8"), "README.md"):
+        if f["level"] == "error" and f not in lint["errors"]:
             lint["errors"].append(f)
             manifest["policy_check"]["hits"].append(f)
     (ctx.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False, default=str) + "\n",
@@ -1814,25 +1892,23 @@ def main(argv=None) -> int:
 
     c = manifest["counts"]
     errs = lint["errors"]
-    print(f"[make_all] {c['ok']} ok, {c['skipped']} skipped, {c['failed']} failed, {c['notes_not_drawn']} notes not "
-          f"drawn, {len(errs)} check errors, {len(lint['review'])} for review, in {manifest['elapsed_s']:.0f} s; "
+    print(f"[make_all] {c['ok']} ok, {c['skipped']} skipped, {c['failed']} failed, {c['defects']} unaccounted slots, "
+          f"{len(errs)} check errors, {len(lint['warnings'])} check warnings, in {manifest['elapsed_s']:.0f} s; "
           f"wrote {ctx.out_dir / 'manifest.json'} and {readme}")
     for e in sorted(ctx.entries, key=figure_order):
         if e.status != "ok":
             print(f"[make_all]   {e.status:7s} {e.fig_id} ({e.lang}): {e.reason or e.error}")
-    for w in [(e.fig_id, e.lang, w) for e in ctx.entries for w in e.warnings]:
-        print(f"[make_all]   warning {w[0]} ({w[1]}): {w[2]}")
     for f in errs:
-        print(f"[make_all]   CHECK {_lint_line(f)[2:]}" + (f" :: {f['context']}" if f.get("context") and f.get("match")
-                                                           and not f["rule"].startswith("policy") else ""))
+        print(f"[make_all]   CHECK {_lint_line(f)[2:]}")
+    for f in lint["warnings"]:
+        print(f"[make_all]   CHECK WARNING {_lint_line(f)[2:]}")
     if manifest["stale_files"]:
         print(f"[make_all]   {len(manifest['stale_files'])} files in {ctx.out_dir} not produced by this run")
-    crashed = any(e.status == "failed" and not e.dropped_notes for e in ctx.entries)
-    defects = bool(errs) or any(e.dropped_notes for e in ctx.entries)
-    if ctx.draft and defects and not crashed:
-        print("[make_all] draft run: check errors / left-out notes recorded, exit status 0")
+    failed = any(e.status == "failed" for e in ctx.entries)
+    if ctx.draft and errs and not failed:
+        print("[make_all] draft run: check errors recorded, exit status 0")
         return 0
-    return 1 if (crashed or defects) else 0
+    return 1 if (failed or errs) else 0
 
 
 if __name__ == "__main__":

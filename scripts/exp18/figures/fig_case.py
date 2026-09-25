@@ -31,10 +31,12 @@ Encodings (one meaning each; ``common_draw`` holds the shared vocabulary):
   spot share a badge, "1–6"); badges are dodged along the rim in bearing
   order (thin leader when moved; dots never move).  Sector letters F/R/B/L
   sit at the sector centres on the badge ring and are tested against the
-  drawn badges, leaders and scale bar: blocked, they slide within their own
-  sector, else move outward past the badges (into the free room of the block
-  above / below / beside the disc), else just inside the rim -- never under a
-  badge.  Each disc is as large as its rim badges allow: a pill badge ("1–3")
+  drawn badges, leaders, scale bar and the row names: blocked, they slide
+  within their own sector, else move out past the badges into the free room
+  around the disc (between column a and the strip, down to the next block);
+  a blocked R / B / L with no such spot is left out (the strip names the
+  views; the caption says so), never put on the map under the rays.  Each
+  disc is as large as its rim badges allow: a pill badge ("1–3")
   that would run into the row names or column a first nudges the disc
   sideways (<= 5 pt), then shrinks it (``fit_inset``).  The curved arrow
   (first block) shows where c starts and that it runs clockwise.  Scale bar
@@ -80,8 +82,12 @@ Encodings (one meaning each; ``common_draw`` holds the shared vocabulary):
     lane inside the row or to a lane under the row, joined by a short ink
     leader (white halo); misses whose peaks would print as one blot share one
     x and one badge ("4–5"); a thin dotted grey line joins the x to the slot's
-    true bearing (blue tick under the row) when they are < 45 deg apart
-    (``cd.CONNECTOR_MAX_DEG``).  Slots no view shows get no x
+    true bearing (blue tick under the row; one line per x, from the nearest of
+    a shared x's ticks) when they are < 45 deg apart (``cd.CONNECTOR_MAX_DEG``)
+    and the line passes no other x and crosses no other line
+    (``cd.miss_connectors``).  The whole row is laid out by
+    ``cd.plan_miss_badges`` (no badge on another x, no leader through an x or
+    across a leader or connector).  Slots no view shows get no x
     (their map shows in the row, their note gives P(not visible)).
   - short blue ticks under the prediction row repeat the true bearings.
 
@@ -233,7 +239,8 @@ CAPTION_PARTS = {
         "a": "(a) Route on the top-down map. ",
         "b": ("(b) Map around each key position, robot facing up; its rim is the bearing ring that (c) unrolls "
               "clockwise from the front view's left edge (arrow); dashed radii are the view seams. Blue lines run from "
-              "the robot through each past position (dot; 1 = oldest of the 8 queried) to its number on the rim. "),
+              "the robot through each past position (dot; 1 = oldest of the 8 queried) to its number on the rim; "
+              "F, R, B, L name the sectors (R, B or L is left out where the numbers fill its sector). "),
         "c": ("(c) The surround view on the same bearings: of the four current views, only the framed front view is "
               "given to the model; right, back and left are shown for reference (the model also receives the past "
               "frames' front images). Below it, the ground-truth affordance map (blue) and the predicted affordance "
@@ -246,9 +253,10 @@ CAPTION_PARTS = {
         "misses": ("A slot is missed when it fails joint PCK@8 (predicted view wrong, or peak more than 8 px of 64 from "
                    "the true peak in that view); its number, in a white disc ringed in orange, sits at its own × (joined "
                    "to it by a short dark leader where it had to move), and a dotted line joins the × to the slot's "
-                   "true bearing when they are less than 45° apart. A missed slot the model calls not visible (P(not visible) > 0.5) has no ×; its "
-                   "orange-ringed number is in the notes. Each block's numbered misses equal its visible slots minus "
-                   "its PCK@8 hits. "),
+                   "true bearing (one line per ×, only when they are less than 45° apart and the line passes no other "
+                   "× and crosses no other line). A missed slot the model calls not visible (P(not visible) > 0.5) "
+                   "has no ×; its orange-ringed number is in the notes. Each block's numbered misses equal its visible "
+                   "slots minus its PCK@8 hits. "),
         "ticks": "Blue ticks under the prediction repeat the true bearings. ",
         "notes": ("Notes above the images list past positions that no view shows (the previous frame at the robot, "
                   "or out of sight), with the predicted probability P(not visible); they are not scored and get no ×, "
@@ -263,14 +271,16 @@ CAPTION_PARTS = {
         "head": "同一集（{tier} {scene}，第 {ep} 集）{n} 个关键位置上的预测 affordance map（{rule}）。",
         "a": "(a) 俯视图上的路线。",
         "b": ("(b) 各关键位置的局部地图，机器人朝上；圆周就是 (c) 从前视左缘顺时针展开的方位环（箭头），虚线半径为视角分界。"
-              "蓝线从机器人穿过每个历史位置（圆点；8 个查询中 1 = 最早）连到圆周上的编号。"),
+              "蓝线从机器人穿过每个历史位置（圆点；8 个查询中 1 = 最早）连到圆周上的编号；前、右、后、左标出各扇区"
+              "（右、后、左所在扇区被编号占满时省略该字）。"),
         "c": ("(c) 同一方位轴上的环视：当前四个视角中只有加框的前视图输入模型，右/后/左仅作展示（模型另外还接收历史帧的前视图）。"
               "下方为真值 affordance map（蓝）与预测 affordance map（橙，即部署模型的输出）；{elev_window}（环视图为 ±15°）。"
               "每个槽位的图除以自身峰值（预测再乘以其预测可见概率），显示各槽位的最大值，两行都按该值线性着色。图在视角分界处截断，"
               "因为每个标签和预测都只落在一个 90° 视角里。"),
         "x": "×：真值可见的各槽位的预测峰值（命中的槽位 4° 内共用一个 ×；峰值重合的未命中槽位共用一个 × 和一个编号，如 4–5；相互挨着的上下错开）。",
         "misses": ("joint PCK@8 不通过（预测视角错误，或峰值在该视角中距真值峰值超过 8 px（共 64 px））即为未命中：其编号写在橙色描边"
-                   "的白色圆内，放在对应的 × 旁（需要挪开时用深色短线相连），两者相距 45° 以内时再用虚线把 × 连到该槽位的真值方位。模型判为不可见"
+                   "的白色圆内，放在对应的 × 旁（需要挪开时用深色短线相连）；两者相距 45° 以内、且虚线不经过其他 ×、不与其他线相交时，"
+                   "再用虚线把 × 连到该槽位的真值方位（每个 × 至多一条）。模型判为不可见"
                    "（预测不可见概率 > 0.5）的未命中槽位没有 ×，其橙色描边编号列在注释中。每个关键位置的编号未命中数等于可见槽位数"
                    "减去 PCK@8 命中数。"),
         "ticks": "预测行下方的蓝色短线重复真值方位。",
@@ -282,6 +292,57 @@ CAPTION_PARTS = {
 # The whole default caption with the fig_case key rule (kept as a name for callers).
 CAPTION = {lang: "".join(P[k] for k in ("head", "a", "b", "c", "x", "misses", "ticks", "notes", "headers"))
            for lang, P in CAPTION_PARTS.items()}
+# The mark / miss / note sentences as drawn (``caption_flags``): a clause is written only when some block of the
+# figure shows what it describes, so the caption never explains a mark the reader cannot find (as fig_gallery).
+# ``CAPTION_PARTS`` "x" / "misses" / "notes" stay the unconditional texts (``caption_marks`` without flags).
+MARKS_COND = {
+    "en": {
+        "x": "×: predicted peak of each slot visible in the ground truth ({share}touching marks are staggered vertically). ",
+        "share_hits": "hits within {merge:g}° share one ×; ",
+        "share_miss": "missed slots whose peaks coincide share one × and one number, e.g. {ex}; ",
+        "miss_def": ("A slot is missed when it fails joint PCK@8 (predicted view wrong, or peak more than 8 px of 64 "
+                     "from the true peak in that view)"),
+        "miss_x": ("; its number, in a white disc ringed in orange, sits at its own × (joined to it by a short dark "
+                   "leader where it had to move{below}){conn}. "),
+        "below": ", into a lane under the row where the row had no room",
+        "conn": (", and a dotted line joins the × to the slot's true bearing (one line per ×, only when they are less "
+                 "than 45° apart and the line passes no other × and crosses no other line)"),
+        "miss_end": ". ",
+        "pred_none": ("A missed slot the model calls not visible (P(not visible) > 0.5) has no ×; its orange-ringed "
+                      "number is in the notes. "),
+        "count": "Each block's numbered misses equal its visible slots minus its PCK@8 hits. ",
+        "no_miss": "; no slot shown here is missed. ",
+        "notes": ("Notes above the images list past positions that no view shows ({kinds}), with the predicted "
+                  "probability P(not visible); they are not scored and get no ×{fp}. "),
+        "fp": ", but those predicted visible (P(not visible) ≤ 0.5) still show in the orange row",
+        "k_prev": "the previous frame at the robot",
+        "k_at": "at the robot's current spot",
+        "k_at_prev": "at the robot's current spot, like the previous frame",
+        "k_out": "out of sight",
+        "k_join": (", or ", "; or "),
+    },
+    "zh": {
+        "x": "×：真值可见的各槽位的预测峰值（{share}相互挨着的上下错开）。",
+        "share_hits": "命中的槽位 {merge:g}° 内共用一个 ×；",
+        "share_miss": "峰值重合的未命中槽位共用一个 × 和一个编号，如 {ex}；",
+        "miss_def": "joint PCK@8 不通过（预测视角错误，或峰值在该视角中距真值峰值超过 8 px（共 64 px））即为未命中",
+        "miss_x": "：其编号写在橙色描边的白色圆内，放在对应的 × 旁（需要挪开时用深色短线相连{below}）{conn}。",
+        "below": "，行内放不下时移到行下方",
+        "conn": "；两者相距 45° 以内、且虚线不经过其他 ×、不与其他线相交时，再用虚线把 × 连到该槽位的真值方位（每个 × 至多一条）",
+        "miss_end": "。",
+        "pred_none": "模型判为不可见（预测不可见概率 > 0.5）的未命中槽位没有 ×，其橙色描边编号列在注释中。",
+        "count": "每个关键位置的编号未命中数等于可见槽位数减去 PCK@8 命中数。",
+        "no_miss": "；本图所画的槽位都没有未命中。",
+        "notes": "图像上方的注释列出任何视角都看不到的历史位置（{kinds}），并给出预测不可见概率；这些槽位不计分、没有 ×{fp}。",
+        "fp": "，但被预测为可见（预测不可见概率 ≤ 0.5）的仍会出现在橙色行中",
+        "k_prev": "与机器人重合的上一帧",
+        "k_at": "与机器人当前位置重合",
+        "k_at_prev": "与机器人当前位置重合，如上一帧",
+        "k_out": "视线之外",
+        "k_join": ("，或", "；或"),
+    },
+}
+CASE_MARKS = "{case_marks}"  # placeholder a caption carries until the figure is drawn (``make_case_figure``)
 
 
 @dataclass
@@ -303,8 +364,9 @@ class CaseOptions:
     * ``split_frame``: frame where the route turned back; insets past it draw
       the route so far as outbound (solid) and return (dashed) legs.
     * ``letters``: fallback of a blocked sector letter after sliding within
-      its sector: "outward" (default; R/L outward, then inside the rim),
-      "slide" (outward for all four, then inside) or "inside".
+      its sector: "outward" / "slide" (default; the same: out past the badges
+      into the free room around the disc, else R / B / L are left out and F
+      goes inside the rim) or "inside" (the older rule: inside the rim).
     * ``route_fit`` (default True): panel a cropped to the route plus
       ``ROUTE_PAD_M`` (``FittedRoutePanel``); False: the older whole-map panel.
     * ``scale_corner``: "fixed" (default; the insets' scale bars share the
@@ -785,7 +847,7 @@ def fit_inset(ax, r: dd.CaseRow, keepout: Sequence, margin_pt: float = 1.5) -> T
 def draw_inset(ax, level, dump: dd.Dump, r: dd.CaseRow, show_arrow: bool, L: dict,
                split_frame: Optional[int] = None, letters: str = "outward",
                scale_corner: Optional[float] = None, radius_frac: float = INSET_RADIUS_FRAC,
-               letter_bounds=None) -> None:
+               letter_bounds=None, letter_keepout: Sequence = ()) -> List[dict]:
     """Panel b for one key position (``split_frame`` / ``letters``: see :class:`CaseOptions`).
 
     Draw order: map disc, blue rays and dots, robot, rim badges (bearing
@@ -795,8 +857,11 @@ def draw_inset(ax, level, dump: dd.Dump, r: dd.CaseRow, show_arrow: bool, L: dic
     scale bar; default the free corner farthest from every badge.
     ``radius_frac``: disc radius / half the inset square (``fit_inset``).
     ``letter_bounds``: display box a displaced sector letter may use (default
-    the inset square), e.g. the free room above and below the disc in a tall
-    block, so a blocked F or B can sit just outside the badges.
+    the inset square): the free room around the disc, so a blocked letter can
+    sit just outside the badges; ``letter_keepout``: display boxes or artists
+    it must not touch there (row names, column a).  A blocked R / B / L with
+    no free spot outside the rim is left out (``cd.disc_sector_letters``).
+    Returns the sector letters' placements.
     """
     fwd = forward_from_c2w(r.cur_c2w)
     half = inset_half(r)
@@ -835,8 +900,8 @@ def draw_inset(ax, level, dump: dd.Dump, r: dd.CaseRow, show_arrow: bool, L: dic
     x = sx * (lim - 1.0 * per_pt)
     y = sy * (lim - (8.5 if sy > 0 else 2.5) * per_pt)
     cd.scale_bar(ax, x, y, bar, f"{bar:g} m", fs=5.6, ha="left" if sx < 0 else "right")
-    cd.disc_sector_letters(ax, half, occupied, names=L["sectors"], displaced=letters,
-                           rays=[90.0 + b for b in bearings], bounds=letter_bounds)
+    return cd.disc_sector_letters(ax, half, occupied, names=L["sectors"], displaced=letters,
+                                  rays=[90.0 + b for b in bearings], bounds=letter_bounds, keepout=letter_keepout)
 
 
 # --------------------------------------------------------------------------- #
@@ -921,6 +986,7 @@ class BlockPlan:
     note_lines: list
     hdr_lines: int = 1
     warnings: List[str] = field(default_factory=list)
+    connectors: list = field(default_factory=list)  # dotted lines drawn (``cd.plan_miss_badges``)
 
     @property
     def heat_h(self) -> float:
@@ -962,18 +1028,9 @@ def plan_block(fig_m, n: int, r: dd.CaseRow, L: dict, frame_count: int, role: Op
     gt_strip = cd.heat_strip(dd.gt_composite(r), HEAT_RING_W, win)
     pr_strip = cd.heat_strip(dd.pred_composite(r, arm), HEAT_RING_W, win)
     marks = cd.peak_marks(r, arm, win, PPD)
-    heat = cd.heat_lookup(pr_strip, win)
-    conn = cd.miss_connectors(r, marks, win, PPD)
-    placed = cd.place_miss_labels(marks, PPD, win, heat=heat, below=False, lines=conn)
-    below = False
-    if not placed["clean"]:
-        placed_b = cd.place_miss_labels(marks, PPD, win, heat=heat, below=True, lines=conn)
-        below = any(v["below"] for v in placed_b["labels"].values())
-        placed = placed_b
-        if below:
-            warnings.append(f"K{n + 1}: miss badges need the lane under the prediction row")
-        if not placed["clean"]:
-            warnings.append(f"K{n + 1}: a miss badge overlaps or its leader crosses another mark")
+    mp = cd.plan_miss_badges(r, marks, PPD, win, heat=cd.heat_lookup(pr_strip, win), tag=f"K{n + 1}")
+    placed, below = mp["placed"], mp["below"]
+    warnings += mp["warnings"]
     items = note_items(r, L, arm)
     lane_notes, note_lines = layout_notes(fig_m, items, lane_layout(r)[3])
     if len(note_lines) > 1:
@@ -986,7 +1043,7 @@ def plan_block(fig_m, n: int, r: dd.CaseRow, L: dict, frame_count: int, role: Op
     hdr_lines = 1 if X_INSET + w_left + 0.12 <= X_STRIP + W_STRIP - w_right else 2
     return BlockPlan(r=r, win=win, gt_strip=gt_strip, pr_strip=pr_strip, marks=marks, placed=placed, below=below,
                      items=items, lane_notes=lane_notes, note_lines=note_lines, hdr_lines=hdr_lines,
-                     warnings=warnings)
+                     warnings=warnings, connectors=mp["connectors"])
 
 
 def draw_block(page: Page, y_top: float, n: int, plan: BlockPlan, views: np.ndarray, arm: str, L: dict,
@@ -1008,7 +1065,7 @@ def draw_block(page: Page, y_top: float, n: int, plan: BlockPlan, views: np.ndar
     if role:
         w_frame = t_frame.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
         page.text(X_INSET + 0.25 + w_frame, y_mid, L["role_sep"] + role, ha="left", va="center",
-                  fontsize=FS["header"], color=style.INK, fontweight="bold",
+                  fontsize=FS["header"], color=style.INK, fontweight=cd.bold_weight(role),
                   path_effects=cd.bold_effects(role, style.INK))
     main, rest = _metrics_text(r, arm, L)
     x_end = X_STRIP + W_STRIP
@@ -1070,7 +1127,7 @@ def draw_block(page: Page, y_top: float, n: int, plan: BlockPlan, views: np.ndar
         _draw_note(ax_lane, x, it, y_badge)
 
     # ---- predicted peaks, misses (D1/D2)
-    cd.draw_miss_connectors(ax_pr, r, plan.marks, win, PPD)
+    cd.draw_miss_connectors(ax_pr, r, plan.marks, win, PPD, lines=plan.connectors)
     cd.draw_peak_marks(ax_pr, plan.marks)
     numbered = cd.draw_miss_labels(ax_pr, plan.placed)
 
@@ -1099,7 +1156,7 @@ def draw_top_band(page: Page, L: dict) -> None:
     q = W_STRIP / 4
     for v, name in enumerate(L["views"]):
         page.text(X_STRIP + (v + 0.5) * q, y_names, name, ha="center", va="center", fontsize=FS["name"],
-                  color=style.INK if v == 0 else style.INK_2, fontweight="bold" if v == 0 else "normal",
+                  color=style.INK if v == 0 else style.INK_2, fontweight=cd.bold_weight(name) if v == 0 else "normal",
                   path_effects=cd.bold_effects(name, style.INK) if v == 0 else None)
     # bracket over the three views not given to the model, its note set into the top line
     fig = page.fig
@@ -1176,19 +1233,78 @@ def numbered_misses(r: dd.CaseRow, arm: str = ARM) -> List[int]:
     return r.misses_with_peak(arm)
 
 
-def caption_marks(lang: str, opt: Optional[CaseOptions] = None) -> str:
-    """The x / miss / tick / note / header sentences of the caption (``opt`` accepted for compatibility)."""
+def caption_flags(plans: Sequence["BlockPlan"], arm: str = ARM) -> dict:
+    """What the drawn blocks contain, for the conditional sentences of ``caption_marks``."""
+    f = dict(share_hits=False, share_miss="", miss=False, miss_x=False, conn=False, below=False, pred_none=False,
+             notes=set(), at_prev=False, fp=False)
+    for p in plans:
+        for m in p.marks:
+            if len(m["slots"]) > 1:
+                if m.get("miss"):
+                    f["share_miss"] = f["share_miss"] or dd.group_label(m["slots"])
+                else:
+                    f["share_hits"] = True
+        f["miss"] |= bool(p.r.misses(arm))
+        f["miss_x"] |= bool(p.r.misses_with_peak(arm))
+        f["conn"] |= bool(p.connectors)
+        f["below"] |= bool(p.below)
+        for it in p.items:
+            if it["kind"] == "predicted_none":
+                f["pred_none"] = True
+            else:
+                f["notes"].add(it["kind"])
+                f["at_prev"] |= it["kind"] == "at_robot" and dd.K - 1 in it["slots"]
+        for note in dd.row_notes(p.r, arm):
+            if note["kind"] != "predicted_none" and min(note["p"]) <= 0.5:
+                f["fp"] = True
+    return f
+
+
+def caption_marks(lang: str, opt: Optional[CaseOptions] = None, flags: Optional[dict] = None) -> str:
+    """The x / miss / tick / note / header sentences of the caption.  Without ``flags`` the unconditional texts
+    (``CAPTION_PARTS``); with ``caption_flags`` of the drawn blocks only what the figure shows (``MARKS_COND``).
+    ``opt`` is accepted for compatibility."""
     P = CAPTION_PARTS[lang]
-    return P["x"] + P["misses"] + P["ticks"] + P["notes"] + P["headers"]
+    if flags is None:
+        return P["x"] + P["misses"] + P["ticks"] + P["notes"] + P["headers"]
+    M = MARKS_COND[lang]
+    share = (M["share_hits"].format(merge=cd.MERGE_DEG) if flags["share_hits"] else "") + (
+        M["share_miss"].format(ex=flags["share_miss"]) if flags["share_miss"] else "")
+    out = M["x"].format(share=share)
+    if flags["miss"]:
+        out += M["miss_def"]
+        out += (M["miss_x"].format(conn=M["conn"] if flags["conn"] else "", below=M["below"] if flags["below"] else "")
+                if flags["miss_x"] else M["miss_end"])
+        out += M["pred_none"] if flags["pred_none"] else ""
+        out += M["count"]
+    else:
+        out += M["miss_def"] + M["no_miss"]
+    out += P["ticks"]
+    kinds = flags["notes"]
+    if kinds:
+        parts = []
+        if "at_robot" in kinds:
+            parts.append(M["k_at_prev"] if (flags["at_prev"] or "previous" in kinds) else M["k_at"])
+        elif "previous" in kinds:
+            parts.append(M["k_prev"])
+        if "not_visible" in kinds:
+            parts.append(M["k_out"])
+        plain, after_comma = M["k_join"]
+        text = parts[0]
+        for q in parts[1:]:
+            text += (after_comma if ("," in text or "，" in text) else plain) + q
+        out += M["notes"].format(kinds=text, fp=M["fp"] if flags["fp"] else "")
+    return out + P["headers"]
 
 
 def case_caption(lang: str, opt: Optional[CaseOptions] = None, **fmt) -> str:
-    """Caption of the case figure from ``CAPTION_PARTS`` ("{elev_window}" left for ``make_case_figure``)."""
+    """Caption of the case figure from ``CAPTION_PARTS`` ("{elev_window}" and the mark sentences, ``CASE_MARKS``,
+    left for ``make_case_figure``, which knows what the blocks show)."""
     opt = opt or CaseOptions()
     P = CAPTION_PARTS[lang]
     fmt.setdefault("rule", opt.key_rule or KEY_RULE[lang])
     head = P["head"].format(**fmt)
-    return head + P["a"] + P["b"] + P["c"] + caption_marks(lang, opt)
+    return head + P["a"] + P["b"] + P["c"] + CASE_MARKS
 
 
 def window_caption(wins: Sequence[Tuple[float, float]], lang: str) -> str:
@@ -1291,7 +1407,8 @@ def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_ro
     page = Page(fig, height, y0=title_h)
     if opt.title:
         t = page.text(X_ROUTE, -title_h + 0.11, opt.title, ha="left", va="center", fontsize=FS["title"] + 0.8,
-                      fontweight="bold", color=style.INK, path_effects=cd.bold_effects(opt.title, style.INK))
+                      fontweight=cd.bold_weight(opt.title), color=style.INK,
+                      path_effects=cd.bold_effects(opt.title, style.INK))
         if opt.title_note:
             w = t.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
             page.text(X_ROUTE + w + 0.12, -title_h + 0.11, opt.title_note, ha="left", va="center",
@@ -1307,8 +1424,12 @@ def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_ro
         views = dd.surround_views(clip_dir, r.frame)
         ax_in, numbered = draw_block(page, y, n, plan, views, arm, L, last=(n == len(recs) - 1), role=roles[n],
                                      frame_count=dump.frame_count, keepout=keepout_artists)
-        y_lane = y + plan.top_h
-        insets.append((ax_in, page.bbox(X_INSET, y_lane, W_INSET, plan.body_h)))
+        # the free room around the disc a displaced sector letter may use: between column a and the strip, from
+        # under the block's header to the next block's header (or the legend); the row names are keepout
+        last = n == len(recs) - 1
+        y_end = y + plan.height + (AXIS_H - 0.03 if last else BLOCK_GAP - 0.02)
+        x_room = X_ROUTE + W_ROUTE + 0.02
+        insets.append((ax_in, page.bbox(x_room, y + HDR_H, X_STRIP - 0.02 - x_room, y_end - y - HDR_H)))
         badge_slots = [k for g in r.groups for k in g]
         note_slots = [k for it in plan.items for k in it["slots"]]
         in_notes = [k for it in plan.items if it["kind"] == "predicted_none" for k in it["slots"]]
@@ -1381,10 +1502,17 @@ def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_ro
                  for n, ((ax, _), r, (rf, _)) in enumerate(zip(insets, recs, fits))]
         corner, w = _choose_scale_corner_from(clear)
         warnings += w
+    letter_modes = []
     for n, ((ax_in, bounds), r, (rf, _)) in enumerate(zip(insets, recs, fits)):
         lvl = dd.topdown_level(dump, float(r.cur_pos[1]), root=topdown_root)
-        draw_inset(ax_in, lvl, dump, r, show_arrow=(n == 0), L=L, split_frame=opt.split_frame,
-                   letters=opt.letters, scale_corner=corner, radius_frac=rf, letter_bounds=bounds)
+        placed_letters = draw_inset(ax_in, lvl, dump, r, show_arrow=(n == 0), L=L, split_frame=opt.split_frame,
+                                    letters=opt.letters, scale_corner=corner, radius_frac=rf, letter_bounds=bounds,
+                                    letter_keepout=keepout)
+        letter_modes.append({p["name"]: p["mode"] for p in placed_letters})
+        inside = [p["name"] for p in placed_letters if p["mode"] == "inside"]
+        if inside:
+            warnings.append(f"K{n + 1}: sector letter {', '.join(inside)} of the local map sits inside the rim")
+    layout["sector_letters"] = letter_modes
     layout["scale_corner"] = corner
     layout["inset_radius_frac"] = [rf for rf, _ in fits]
     layout["inset_shift_pt"] = [dx for _, dx in fits]
@@ -1399,6 +1527,7 @@ def make_case_figure(dump_npz_path, rows: Optional[List[int]] = None, topdown_ro
     caption = opt.caption if opt.caption is not None else case_caption(
         lang, opt, n=len(recs), tier=dump.tier_name(lang), scene=dump.scene, ep=dump.episode_id)
     caption = caption.replace("{elev_window}", window_caption([p.win for p in plans], lang))
+    caption = caption.replace(CASE_MARKS, caption_marks(lang, opt, flags=caption_flags(plans, arm)))
     if opt.caption_extra:
         caption = caption.rstrip() + " " + opt.caption_extra
     cap_path = out.parent / (out.name + "_caption.txt")
