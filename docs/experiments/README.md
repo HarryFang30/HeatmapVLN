@@ -2209,6 +2209,48 @@ pLe4wQe7qrG_1777 在 500 步里只有 13 / 7 个就绪调用（大量原地转�
 3. 主图 5 个案例另做在线运行动画（MP4 / GIF）供补充材料与报告用。v1 图保留在 `figures/`，v2 在 `figures_v2/`。
 改版发生在看到结果之后，但它不选择案例、不选择时刻、不改任何数字；新增的时间线对所有集一视同仁，弱的集（楼梯、徘徊）照样画。
 
+**运行记录（5）：C500 停用后在 RTX 4090 部署机上重做 5 个主案例（2026-09-28，任何 4090 复跑之前写；判据与判定未改）.**
+C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz/` 没有迁出（4090 上没有 `model/`）：复跑追踪、重渲染、
+记录、图与 5 个主案例动画都只剩已发给用户的文件。用户要求在 4090 部署机（ssh `6024_fjl`，容器 `fjl-habitat`，
+`docs/ops/deploy_rtx4090.md` 在 EXP-18 分支上）从闭环复跑开始重做这 5 集、重新生成 5 个视频。
+1. **与 C500 相同的**：部署权重（`/workspace/weights/ppa_refine_v2_best.pth`，sha256 `0b5a0644…6d69`，与 C500 `best.pth` 逐字节相同）、
+   配置、模型 / VO 服务与客户端代码（除 EXP-19 的逐步记录钩子外与 4090 已验证的部署检出 `148e398` 逐字节相同）、协议种子 42、
+   客户端参数、追踪服务端与逐步记录、候选表与全部规则（主案例、关键时刻、每个时刻画什么）、作图与动画代码（仍用本分支的 `scripts/exp18`，
+   不取 EXP-18 分支后来的作图改动）、像素目标约定（固定为 C500 在 389 个就绪调用上自动判出的 `field_vu`：它由服务端代码决定、
+   与平台无关，5 集的样本不够自动判定规则的每侧 ≥ 5 个）。
+2. **平台不同，所以轨迹不会相同**：CUDA / RTX 4090 代替 MACA / C500，快系统噪声由 CUDA 生成器按调用播种、bf16 算子不同。部署说明 §3 的
+   金丝雀已经显示同一集会走出不同的路（zsNo4HB9uLZ_0001：C500 冒烟 15 次调用、NE 0.51 m（运行记录 3）；4090 金丝雀 14 次调用、
+   49 步、NE 0.27 m（部署说明 §3 与该次金丝雀的 `progress.json`））。
+   **4090 复跑既不是主表那次评测，也不是 C500 复跑。** 为此只换了启动层：`scripts/exp19/run_rerun_cuda.sh`（单一解释器、系统 Xvfb、
+   nvidia-smi 查卡、占位的 `PPA_*` 目录；其余照 `run_rerun.sh`）与 `run_post_cuda.sh`（重渲染 → 记录 → 时间线 → 动画的直接调用）。
+3. **缺的输入如何补**：候选文件由 `scripts/exp19/rebuild_cases.py` 按运行记录（1）的候选表重建并对照数据集核验（15 个候选、同一排序）；
+   主表日志随 C500 失去，**没有 eval-log 参照**。重渲染的采集器配置取 VLN-CE `3b0c5c0`（迁移说明里 C500 工作树的提交状态）；
+   俯视图按 EXP-18 默认参数在 4090 上重渲这 4 个场景。
+4. **检查与判据（开跑前写死）**：
+   - **冒烟门**：GPU 4 上追踪复跑非候选集 zsNo4HB9uLZ_0001（4090 金丝雀已用部署启动脚本、不带追踪跑过它；参照固定为
+     `/workspace/eval_runs/canary_cuda_seed42/` 的 `runtime/20260928_212453_1550/logs/client_shard_00.log`，sha256 `7c077a23…a501d`，
+     与 `workers/shard_00/progress.json`，sha256 `f4cf62a5…83b4`），用 `compare_run_to_log.py` 逐调用比较。两条硬门：
+     **第 0 次调用的慢系统文本与动作块逐字相同**（C500 代码等价门的 4090 版：追踪启动与部署启动在第一次调用上等价——同一配置、权重、
+     种子、客户端参数；第 0 次调用时历史头、桥与诊断都还没运行，逐步记录只写了起始状态，所以这道门看不到之后的影响），
+     且**冒烟集每个轨迹调用 `actions_match` 为真**；任一不过即停下查。第 0 次之后的调用与结局是否相同只报数：全部相同记为
+     "追踪与逐步记录在 4090 上逐调用中立"；有分歧则写明**分不清**是平台不确定还是追踪干扰（4090 上没有金丝雀的自重复），
+     不据此停跑。逐步记录的中立另有运行记录（1）第 5 条（开 / 关对照请求逐字节相同）作依据；诊断在响应定稿后、以新生成器运行。
+   - **追踪中立**：每个轨迹调用"重算动作块 = 响应动作块"必须 100% 成立，否则整批作废；完整性同 C500（`DONE` 为 `complete`）。
+   - **重渲染**：逐集 QA（传感器位姿 ≤ 1e-4，与客户端自己的前视帧 NCC 中位数 ≥ 0.9）不过即停。C500 的"采集器片段自检"要读
+     `r2r_panoramic_data_v2`，那份数据不在 4090 上，这次不做。
+   - **主案例**：照原规则，每类取排序中第一个 4090 复跑后仍满足类别谓词的候选。先只跑 5 个 #0；某类 #0 不满足时顺延 #1、再 #2
+     （`rebuild_cases.py --lists-only` 出列表、另起一次复跑、`merge_runs.py` 合并读取；合并要求两次复跑同一代码、都完整、无重复集），
+     不按好看挑；三个都不满足则该类不出视频并写明。
+   - **时间线自检**：检查 0–2（环视峰值、峰值对真值且优于镜像 / 互换、关键时刻行 = 图包）必须通过；检查 3、4（转向后来路方向的平移、
+     快系统路径方向）需要左右两种转向 / 转向调用，5 集可能凑不齐：**没有样本**时记为"测不了"，有样本而不过则停。
+   - **动画**：`animate_v2` 的一致性检查（关键调用对图包、就绪调用对时间线）与文字审计必须通过（退出码 0）。
+   - **本批数字只作描述**：`build_records` 在这 5 集上的数与 C500 同集并列报告，只比 C500 逐集表里还留着的量（结局、步数、就绪调用数、
+     PCK@8 与槽位数、平凡基线、H3 改变数；C500 逐集的 H2 没有保存下来，不比），**不改** EXP-19 的判定（判定之源仍是 C500 `runs/main`
+     的 15 集）。没有主表日志，代码等价门在结构上必然不过；`run_post_cuda.sh` 只容忍"代码等价门不过"与"未复跑的候选"两条原因，
+     追踪中立不过、有集没跑完、某类没有主案例都会停下。这批 metrics 是 void，不读作判定。
+5. **边界**：视频展示的是 4090 复跑。已交付的 C500 静态图（主图 T/F、逐集页）里同一集的轨迹与关键时刻可能与视频不同，
+   放进论文时只用一个来源，或者注明两者是两次复跑。
+
 ---
 
 ## 4. 公共资源
@@ -2266,13 +2308,13 @@ pLe4wQe7qrG_1777 在 500 步里只有 13 / 7 个就绪调用（大量原地转�
 | EXP-17 两臂训练（**已跑**，2026-09-06/07，8 卡 × 3.2 h × 2） | `model/exp17_cognition_prefix/exp17a/run_20260906_202621/`、`exp17b/run_20260907_001026/` |
 | EXP-17 生成式决策评测（**已跑** 四臂同口径，2026-09-08，判据来源） | `model/exp17_cognition_prefix/{exp17a,exp17b,exp14a,exp14b}/decisions_generated.json` |
 | EXP-17 位姿噪声读数（**已跑** exp17a/exp17b，0.2 m / 10°，边界②的规则来源） | `model/exp17_cognition_prefix/{exp17a,exp17b}/decisions_generated_posenoise.json` |
-| EXP-19 选集（15 个候选、分片、主表日志逐调用参照） | `model/exp19_behavior_viz/cases/{candidates.json, episode_lists/, eval_log_reference/}` |
-| EXP-19 闭环复跑追踪（**已跑** `main`，`e894d88`，3 卡 35 min；逐调用 json+npz、逐步状态、`DONE`） | `model/exp19_behavior_viz/runs/main/gpu{0,1,2}/{trace,steps,logs}/` |
-| EXP-19 重渲染（4 视角 HFOV 90 + 前视深度，自检逐帧一致） | `model/exp19_behavior_viz/renders/` |
-| EXP-19 指标与判定（判据来源） | `model/exp19_behavior_viz/metrics/{metrics.json, summary.md, calls.jsonl}` |
-| EXP-19 图（15 集逐集页 + 主图 T/F，中英，PDF/PNG/caption） | `model/exp19_behavior_viz/figures/`（`manifest.json` 记来源与 sha256） |
-| EXP-19 在线时间线数据（呈现用，不进判定；运行记录 4） | `model/exp19_behavior_viz/records_v2/<ep_key>_timeline.{npz,json}` + `timeline_self_check.json` |
-| EXP-19 图 v2（论文级改版：15 集逐集页含在线时间线、主图 T/F、主案例动画 MP4/GIF，中英） | `model/exp19_behavior_viz/figures_v2/`（`anim/` 为动画；`manifest.json` 记来源与 sha256） |
+| EXP-19 选集（15 个候选、分片、主表日志逐调用参照）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/cases/{candidates.json, episode_lists/, eval_log_reference/}` |
+| EXP-19 闭环复跑追踪（**已跑** `main`，`e894d88`，3 卡 35 min；逐调用 json+npz、逐步状态、`DONE`）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/runs/main/gpu{0,1,2}/{trace,steps,logs}/` |
+| EXP-19 重渲染（4 视角 HFOV 90 + 前视深度，自检逐帧一致）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/renders/` |
+| EXP-19 指标与判定（判据来源）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/metrics/{metrics.json, summary.md, calls.jsonl}` |
+| EXP-19 图（15 集逐集页 + 主图 T/F，中英，PDF/PNG/caption）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/figures/`（`manifest.json` 记来源与 sha256） |
+| EXP-19 在线时间线数据（呈现用，不进判定；运行记录 4）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/records_v2/<ep_key>_timeline.{npz,json}` + `timeline_self_check.json` |
+| EXP-19 图 v2（论文级改版：15 集逐集页含在线时间线、主图 T/F、主案例动画 MP4/GIF，中英）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/figures_v2/`（`anim/` 为动画；`manifest.json` 记来源与 sha256） |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |

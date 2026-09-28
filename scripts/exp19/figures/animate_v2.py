@@ -77,6 +77,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1155,7 +1156,7 @@ def render_frames(case: Case, lang: str, out: Path, steps: Sequence[int], worker
 
 
 def _run(cmd: List[str]) -> None:
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    res = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"{cmd[0]} failed ({res.returncode}):\n{res.stdout[-3000:]}")
 
@@ -1198,8 +1199,44 @@ def encode(frames: Path, seq: Sequence[int], mp4: Path, gif: Path, ffmpeg: str, 
     os.replace(tmp, gif)
 
 
+_FF_STREAM_RE = re.compile(r"Stream #0:\d+[^:]*: Video: ([^\s,]+)[^,]*, ([a-z0-9_]+)[^,]*(?:\([^)]*\))?[^\n]*?"
+                           r"(\d{2,5})x(\d{2,5})")
+_FF_FPS_RE = re.compile(r"Stream #0:\d+[^:]*: Video: [^\n]*?, (\d+(?:\.\d+)?) tbr")  # = ffprobe r_frame_rate
+_FF_DURATION_RE = re.compile(r"Duration: (\d+):(\d\d):(\d\d(?:\.\d+)?)")
+_FF_FRAMES_RE = re.compile(r"frame=\s*(\d+)")
+
+
+def parse_ffmpeg_probe(text: str) -> dict:
+    """``probe``'s fields from the stderr of ``ffmpeg -i <file> -map 0:v:0 -c copy -f null -`` (no ffprobe)."""
+    out = {}
+    m = _FF_STREAM_RE.search(text)
+    if m:
+        out.update(codec=m.group(1), pix_fmt=m.group(2), width=int(m.group(3)), height=int(m.group(4)))
+    m = _FF_FPS_RE.search(text)
+    if m:
+        fps = float(m.group(1))
+        out["frame_rate"] = f"{int(fps)}/1" if fps.is_integer() else m.group(1)
+    m = _FF_DURATION_RE.search(text)
+    if m:
+        out["duration_s"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    frames = _FF_FRAMES_RE.findall(text)
+    if frames:
+        out["frames"] = frames[-1]  # ffprobe reports nb_frames as a string too
+    return out
+
+
 def probe(path: Path, ffmpeg: str) -> dict:
     ffprobe = str(Path(ffmpeg).with_name("ffprobe"))
+    if not Path(ffprobe).is_file():
+        # e.g. imageio-ffmpeg's static binary, which ships without ffprobe: stream copy to null
+        # counts the packets (one per frame in these files) and prints the stream line.
+        res = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        info = parse_ffmpeg_probe(res.stdout) if res.returncode == 0 else {}
+        return {"width": info.get("width"), "height": info.get("height"), "codec": info.get("codec"),
+                "pix_fmt": info.get("pix_fmt"), "frame_rate": info.get("frame_rate"), "frames": info.get("frames"),
+                "duration_s": info.get("duration_s"), "bytes": path.stat().st_size if path.is_file() else None,
+                "probe_tool": "ffmpeg -c copy -f null (no ffprobe next to ffmpeg)"}
     res = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                           "stream=width,height,codec_name,pix_fmt,r_frame_rate,nb_frames:format=duration",
                           "-of", "json", str(path)], stdout=subprocess.PIPE, text=True)
