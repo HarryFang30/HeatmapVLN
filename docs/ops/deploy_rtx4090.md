@@ -67,5 +67,6 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_GPU_DE
 - **HuggingFace 不通**，下载权重用 `https://hf-mirror.com/<repo>/resolve/<commit>/<file>`；pip 用阿里云镜像。
 - 容器的 `.bashrc` 设了 `127.0.0.1:7890` 的代理，但代理并不存在。登录 shell 里装包或下载前先 `unset http_proxy https_proxy`（启动脚本已经处理）。
 - 容器是 Ubuntu 20.04，bash 5.0，**没有 `wait -n -p`**，所以不能直接用 C500 的启动脚本。
+- **`/workspace/habitat-sim` 不能删也不能挪。** site-packages 里的 `habitat_sim/_ext/*.so` 的 RUNPATH 写死为 `/workspace/habitat-sim/build/lib.linux-x86_64-cpython-311/habitat_sim/_ext`，Corrade 等库要从那里加载。真正运行时要用的只有这个 319 MB 的目录；其余的 `.git`（1.6 GB）和编译中间文件（约 2.7 GB）理论上能删，但没有验证过。
 - habitat-sim 是 GLX 版，必须有 X 服务。启动脚本为每张卡起一个 Xvfb，并按 TCP 探测就绪。NVIDIA GLX 渲染在这台机器上与 numba 冲突（`troubleshooting-guide.md` §12），所以默认走 llvmpipe。
 - 在容器里用 `pkill -f <模式>` 时，模式会匹配到 `bash -c` 自己那一行，把自己的 shell 杀掉。停进程请用 PID。
