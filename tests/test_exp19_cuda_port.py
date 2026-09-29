@@ -211,16 +211,37 @@ def test_probe_uses_ffmpeg_when_ffprobe_is_missing(tmp_path, monkeypatch):
     video.write_bytes(b"\0" * 10)
     seen = {}
 
+    framecrc = "#tb 0: 1/12288\n#media_type 0: video\n" + "".join(
+        f"0, {i * 1024}, {i * 1024}, 1024, 1500, 0x0000{i:04x}\n" for i in range(186))
+
     def fake_run(cmd, **kw):
         seen["cmd"], seen["stdin"] = cmd, kw.get("stdin")
-        return subprocess.CompletedProcess(cmd, 0, stdout=MP4_STDERR)
+        # ffmpeg 7.0 prints no "frame=" for a stream copy: the count must come from the framecrc lines
+        return subprocess.CompletedProcess(cmd, 0, stdout=framecrc, stderr=MP4_STDERR.split("frame=")[0])
 
     monkeypatch.setattr(an.subprocess, "run", fake_run)
     info = an.probe(video, str(tmp_path / "bin" / "ffmpeg-linux-x86_64-v7.0.2"))
-    assert seen["cmd"][1:] == ["-hide_banner", "-i", str(video), "-map", "0:v:0", "-c", "copy", "-f", "null", "-"]
+    assert seen["cmd"][1:] == ["-hide_banner", "-i", str(video), "-map", "0:v:0", "-c", "copy", "-f", "framecrc", "-"]
     assert seen["stdin"] == subprocess.DEVNULL
-    assert (info["width"], info["height"], info["frames"], info["bytes"]) == (1920, 1426, "36", 10)
-    assert "no ffprobe" in info["probe_tool"]
+    assert (info["width"], info["height"], info["frames"], info["bytes"]) == (1920, 1426, "186", 10)
+    assert info["frame_rate"] == "12/1" and info["duration_s"] == 3.0 and "no ffprobe" in info["probe_tool"]
+
+
+def test_label_box_centres_cover_the_placed_label():
+    """The badges avoid the start label where place_label put it: the stand-ins sit inside its box."""
+    an = pytest.importorskip("scripts.exp19.figures.animate_v2")
+    import numpy as np
+
+    per_pt, w_pt, fs = 0.01, 12.0, 6.0
+    p = np.array([2.0, 3.0])
+    for (ox, oy), ha, va in (((4.0, 0.0), "left", "center"), ((-4.0, 0.0), "right", "center"),
+                             ((0.0, 4.0), "center", "bottom"), ((0.0, -4.0), "center", "top")):
+        c = np.array(an.label_box_centres(p, (ox, oy), ha, va, w_pt, fs, per_pt))
+        w, h = w_pt * per_pt, fs * 1.15 * per_pt
+        assert np.ptp(c[:, 0]) == pytest.approx(w * 2 / 3) and np.ptp(c[:, 1]) == 0.0
+        mid_x = p[0] + ox * per_pt + {"left": w / 2, "right": -w / 2, "center": 0.0}[ha]
+        mid_z = p[1] - oy * per_pt + {"top": h / 2, "bottom": -h / 2, "center": 0.0}[va]
+        assert c[1] == pytest.approx([mid_x, mid_z])
 
 
 # --------------------------------------------------------------------------- #

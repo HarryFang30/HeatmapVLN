@@ -778,14 +778,16 @@ def draw_map(page: fb.Page, case: Case, t: int, A: dict, L: dict) -> None:
     d = route[min(3, len(route) - 1)] - route[0]
     d = -d / (np.linalg.norm(d) + 1e-9)
     avoid = np.concatenate([route, ref, key_xz]) if len(key_xz) else np.concatenate([route, ref])
-    (ox, oy), ha, va = p2.place_label(route[0], d, cd.text_width_pt(ax.figure, L["start"], p2.MIN_FS), p2.MIN_FS,
-                                      limits, per_pt, p2._densify(avoid, 2.0 * per_pt))
+    start_w = cd.text_width_pt(ax.figure, L["start"], p2.MIN_FS)
+    (ox, oy), ha, va = p2.place_label(route[0], d, start_w, p2.MIN_FS, limits, per_pt, p2._densify(avoid, 2.0 * per_pt))
     ax.annotate(L["start"], route[0], xytext=(ox, oy), textcoords="offset points", ha=ha, va=va, fontsize=p2.MIN_FS,
                 color=style.INK, path_effects=cd.HALO_THIN, zorder=5)
     ax.plot([gx], [gz], marker="*", ms=7.0, mfc=style.INK, mec="white", mew=0.5, zorder=6)
     points = np.concatenate([route, ref, [[gx, gz]], key_xz]) if len(key_xz) else \
         np.concatenate([route, ref, [[gx, gz]]])
-    boxes = [route[0] + d * 12.0 * per_pt, np.array([gx, gz - radius - 4.0 * per_pt])]
+    # the badges clear the start label where place_label actually put it (it need not be on side d)
+    boxes = label_box_centres(route[0], (ox, oy), ha, va, start_w, p2.MIN_FS, per_pt)
+    boxes.append(np.array([gx, gz - radius - 4.0 * per_pt]))
     for lab, p, s in keys:  # badge spots from every key moment, so a badge never moves once shown
         q = pn._badge_spot(p, points, np.array(boxes), limits, per_pt)
         boxes.append(q)
@@ -798,6 +800,16 @@ def draw_map(page: fb.Page, case: Case, t: int, A: dict, L: dict) -> None:
                  fs=p2.MIN_FS)
     pos = route[min(t, len(route) - 1)]
     position_mark(ax, pos[0], pos[1])
+
+
+def label_box_centres(p, offset, ha: str, va: str, width_pt: float, fs: float, per_pt: float) -> List[np.ndarray]:
+    """Badge-sized stand-ins for a label placed by ``p2.place_label`` at map point p: the centres of its left,
+    middle and right thirds (map units, +z down; the geometry of place_label's candidate boxes)."""
+    w, h = width_pt * per_pt, fs * 1.15 * per_pt
+    cx, cz = p[0] + offset[0] * per_pt, p[1] - offset[1] * per_pt
+    left = cx - (w if ha == "right" else (0.0 if ha == "left" else w / 2))
+    top = cz - (h if va == "bottom" else (0.0 if va == "top" else h / 2))
+    return [np.array([left + f * w, top + h / 2]) for f in (1 / 6, 1 / 2, 5 / 6)]
 
 
 POS_MS, POS_HALO = 4.5, 0.6  # current position: a plain filled ink dot (pt) with a thin white halo (pt)
@@ -1228,15 +1240,18 @@ def parse_ffmpeg_probe(text: str) -> dict:
 def probe(path: Path, ffmpeg: str) -> dict:
     ffprobe = str(Path(ffmpeg).with_name("ffprobe"))
     if not Path(ffprobe).is_file():
-        # e.g. imageio-ffmpeg's static binary, which ships without ffprobe: stream copy to null
-        # counts the packets (one per frame in these files) and prints the stream line.
-        res = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        info = parse_ffmpeg_probe(res.stdout) if res.returncode == 0 else {}
+        # e.g. imageio-ffmpeg's static binary, which ships without ffprobe: stream copy to framecrc writes one
+        # line per packet (= per frame in these files; ffmpeg 7 prints no "frame=" count for a stream copy) and
+        # the input's stream line goes to stderr.
+        res = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-map", "0:v:0", "-c", "copy", "-f", "framecrc",
+                              "-"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        info = parse_ffmpeg_probe(res.stderr) if res.returncode == 0 else {}
+        packets = sum(1 for line in res.stdout.splitlines() if line.strip() and not line.startswith("#"))
         return {"width": info.get("width"), "height": info.get("height"), "codec": info.get("codec"),
-                "pix_fmt": info.get("pix_fmt"), "frame_rate": info.get("frame_rate"), "frames": info.get("frames"),
+                "pix_fmt": info.get("pix_fmt"), "frame_rate": info.get("frame_rate"),
+                "frames": str(packets) if res.returncode == 0 and packets else info.get("frames"),
                 "duration_s": info.get("duration_s"), "bytes": path.stat().st_size if path.is_file() else None,
-                "probe_tool": "ffmpeg -c copy -f null (no ffprobe next to ffmpeg)"}
+                "probe_tool": "ffmpeg -c copy -f framecrc (no ffprobe next to ffmpeg)"}
     res = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                           "stream=width,height,codec_name,pix_fmt,r_frame_rate,nb_frames:format=duration",
                           "-of", "json", str(path)], stdout=subprocess.PIPE, text=True)
