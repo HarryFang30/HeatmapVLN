@@ -75,6 +75,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import os
 import re
@@ -785,12 +786,15 @@ def draw_map(page: fb.Page, case: Case, t: int, A: dict, L: dict) -> None:
     ax.plot([gx], [gz], marker="*", ms=7.0, mfc=style.INK, mec="white", mew=0.5, zorder=6)
     points = np.concatenate([route, ref, [[gx, gz]], key_xz]) if len(key_xz) else \
         np.concatenate([route, ref, [[gx, gz]]])
-    # the badges clear the start label where place_label actually put it (it need not be on side d)
-    boxes = label_box_centres(route[0], (ox, oy), ha, va, start_w, p2.MIN_FS, per_pt)
-    boxes.append(np.array([gx, gz - radius - 4.0 * per_pt]))
+    # the badges clear the start label where place_label actually put it (it need not be on side d), and their
+    # leaders keep off it, off the start ring and off the final position (the current-position dot at the end)
+    label = label_box_centres(route[0], (ox, oy), ha, va, start_w, p2.MIN_FS, per_pt)
+    boxes = label + [np.array([gx, gz - radius - 4.0 * per_pt])]
+    leaders = []
     for lab, p, s in keys:  # badge spots from every key moment, so a badge never moves once shown
-        q = pn._badge_spot(p, points, np.array(boxes), limits, per_pt)
+        q = badge_spot(p, points, np.array(boxes), limits, per_pt, [route[0], route[-1]], label, leaders)
         boxes.append(q)
+        leaders.append((p, q))
         if s <= t:
             ax.plot(*p, marker="o", ms=2.6, mfc=style.INK, mec="white", mew=0.4, zorder=7)
             ax.plot([p[0], q[0]], [p[1], q[1]], color=style.INK, lw=0.4, zorder=6.5)
@@ -800,6 +804,62 @@ def draw_map(page: fb.Page, case: Case, t: int, A: dict, L: dict) -> None:
                  fs=p2.MIN_FS)
     pos = route[min(t, len(route) - 1)]
     position_mark(ax, pos[0], pos[1])
+
+
+LEADER_CLEAR_PT = 4.0  # a leader passing closer than this to a keep-clear point crosses it
+
+
+def _segment_distance(k: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    return _segment_pass(k, a, b)[0]
+
+
+def _segment_pass(k: np.ndarray, a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+    """(distance from k to segment a-b, position t in [0, 1] of the closest point)."""
+    ab = b - a
+    t = float(np.clip(np.dot(k - a, ab) / max(float(np.dot(ab, ab)), 1e-12), 0.0, 1.0))
+    return float(np.linalg.norm(k - (a + t * ab))), t
+
+
+def badge_spot(p: np.ndarray, points: np.ndarray, boxes: np.ndarray, limits, per_pt: float,
+               keep_clear: Sequence[np.ndarray], label_clear: Sequence[np.ndarray] = (),
+               leaders: Sequence[Tuple[np.ndarray, np.ndarray]] = ()) -> np.ndarray:
+    """``pn._badge_spot`` (same candidates, same room score) plus: a leader p -> badge that passes by a
+    ``keep_clear`` marker (the start ring, the final position) or a ``label_clear`` point (the start label's
+    stand-ins) within ``LEADER_CLEAR_PT`` costs enough to lose to any clear candidate.  "Passes by" = the closest
+    point is inside the leader, not its start p: a leader leaving p away from a label next to p does not cross it,
+    and a marker at p itself never counts.  A badge that would sit on an earlier badge's leader (``leaders``,
+    (key point, badge) pairs) costs the same.  With nothing to keep clear this is exactly ``pn._badge_spot``."""
+    hw, hh = pn.BADGE_HALF_PT
+    kc = [np.asarray(k, dtype=np.float64) for k in list(keep_clear) + list(label_clear)]
+    lead_pts = [a + f * (b - a) for a, b in ((np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64))
+                                           for a, b in leaders) for f in np.linspace(0.0, 1.0, 25)]
+
+    def search(dists, angs):
+        best, best_score, best_cross = p, -np.inf, 0
+        for dist in dists:
+            for ang in angs:
+                q = p + np.array([math.cos(ang), math.sin(ang)]) * dist * per_pt
+                inside = (limits[0] + hw * per_pt < q[0] < limits[1] - hw * per_pt
+                          and limits[2] + hh * per_pt < q[1] < limits[3] - hh * per_pt)
+                room = float(np.min(np.linalg.norm(points - q, axis=1))) / per_pt
+                if len(boxes):  # separation of two badge-sized boxes (< 0: they overlap)
+                    gap = np.abs(np.asarray(boxes) - q) / per_pt - np.array([2 * hw, 2 * hh])
+                    room = min(room, 6.0 + float(np.min(np.max(gap, axis=1))))
+                passes = (_segment_pass(k, p, q) for k in kc)
+                crossings = sum(d / per_pt < LEADER_CLEAR_PT and t > 0.05 for d, t in passes)
+                crossings += sum(abs(x[0] - q[0]) / per_pt < hw and abs(x[1] - q[1]) / per_pt < hh
+                                 for x in lead_pts) > 0
+                score = room - 0.15 * dist - (0.0 if inside else 1e3) - 50.0 * crossings
+                if score > best_score:
+                    best, best_score, best_cross = q, score, crossings
+        return best, best_score, best_cross
+
+    best, score, crossing = search((11.0, 17.0, 23.0), np.radians(np.arange(0.0, 360.0, 30.0) + 15.0))
+    if crossing:  # a crowded spot: finer angles and longer leaders, kept only if they do better
+        wide = search((11.0, 17.0, 23.0, 29.0, 35.0), np.radians(np.arange(0.0, 360.0, 10.0) + 5.0))
+        if wide[1] > score:
+            best = wide[0]
+    return best
 
 
 def label_box_centres(p, offset, ha: str, va: str, width_pt: float, fs: float, per_pt: float) -> List[np.ndarray]:

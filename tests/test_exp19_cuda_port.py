@@ -330,3 +330,54 @@ def test_compare_run_to_log_trace_neutrality_gate(tmp_path):
                      "--require-call0"]) == 0
     assert cmp.main(["--run-dir", str(run), "--client-log", str(log), "--progress", str(prog),
                      "--require-neutral"]) == 1
+
+
+def test_badge_leaders_keep_off_the_start_label_and_the_final_position():
+    """A key point right next to the start label: pn._badge_spot's best spot draws its leader through the label;
+    badge_spot picks a spot whose leader stays clear, and still clears the other badges."""
+    an = pytest.importorskip("scripts.exp19.figures.animate_v2")
+    from scripts.exp19.figures import panels as pn
+    import numpy as np
+
+    per_pt = 0.02
+    limits = (0.0, 10.0, 0.0, 10.0)
+    p = np.array([5.0, 5.0])
+    route = np.array([[5.0, 5.0], [5.1, 5.0], [5.2, 5.05]])
+    points = route
+    # a label 10 pt below-left of p, and the final position 12 pt below-right: the naive spot's leader crosses one
+    label = [np.array([5.0 - 8 * per_pt + dx * per_pt, 5.0 + 10 * per_pt]) for dx in (-4.0, 0.0, 4.0)]
+    final = np.array([5.0 + 9 * per_pt, 5.0 + 9 * per_pt])
+    keep = label + [final]
+    boxes = np.array(label)
+    naive = pn._badge_spot(p, points, boxes, limits, per_pt)
+    ours = an.badge_spot(p, points, boxes, limits, per_pt, [final], label)
+    assert all(d / per_pt >= an.LEADER_CLEAR_PT or t <= 0.05 for d, t in (an._segment_pass(k, p, ours) for k in keep))
+    # a label right at the key point is never exempt: the leader leaves away from it
+    near = [np.array([5.0 + dx * per_pt, 5.0 + 3 * per_pt]) for dx in (-4.0, 0.0, 4.0)]
+    q = an.badge_spot(p, points, np.array(near), limits, per_pt, [], near)
+    assert all(d / per_pt >= an.LEADER_CLEAR_PT or t <= 0.05 for d, t in (an._segment_pass(k, p, q) for k in near))
+    assert q[1] < p[1]  # the label is below p (+z down), so the leader goes up
+    # a marker at p itself never counts: same spot as with nothing to keep clear
+    assert np.allclose(an.badge_spot(p, points, boxes, limits, per_pt, [p], []), naive)
+    gap = np.abs(boxes - ours) / per_pt - 2 * np.array(pn.BADGE_HALF_PT)  # badge vs each label stand-in
+    assert np.all(gap.max(axis=1) >= 0.0)
+    # with nothing to keep clear it is exactly pn._badge_spot
+    assert np.allclose(an.badge_spot(p, points, boxes, limits, per_pt, []), naive)
+    assert an._segment_distance(np.array([1.0, 1.0]), np.array([0.0, 0.0]), np.array([2.0, 0.0])) == pytest.approx(1.0)
+
+
+def test_a_later_badge_does_not_sit_on_an_earlier_leader():
+    an = pytest.importorskip("scripts.exp19.figures.animate_v2")
+    from scripts.exp19.figures import panels as pn
+    import numpy as np
+
+    per_pt, limits = 0.02, (0.0, 10.0, 0.0, 10.0)
+    p = np.array([5.0, 5.0])
+    points = np.array([[5.0, 5.0]])
+    free = an.badge_spot(p, points, np.zeros((0, 2)), limits, per_pt, [], [], [])
+    # an earlier leader running right through that spot
+    leader = (free - np.array([0.0, 20 * per_pt]), free + np.array([0.0, 20 * per_pt]))
+    q = an.badge_spot(p, points, np.zeros((0, 2)), limits, per_pt, [], [], [leader])
+    hw, hh = pn.BADGE_HALF_PT
+    xs = [leader[0] + f * (leader[1] - leader[0]) for f in np.linspace(0.0, 1.0, 101)]
+    assert not any(abs(x[0] - q[0]) / per_pt < hw and abs(x[1] - q[1]) / per_pt < hh for x in xs)
