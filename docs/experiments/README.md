@@ -2442,6 +2442,7 @@ C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz
 | EXP-19 图 v2（论文级改版：15 集逐集页含在线时间线、主图 T/F、主案例动画 MP4/GIF，中英）（C500 上，2026-09-28 起不可取） | `model/exp19_behavior_viz/figures_v2/`（`anim/` 为动画；`manifest.json` 记来源与 sha256） |
 | EXP-19 4090 重做（运行记录 5：主案例复跑 + 顺延、重渲染、记录（void，只作描述）、时间线、俯视图、**5 个主案例动画 MP4/GIF 中英**） | 4090 机 `6024_fjl:/home/fangjialei/exp19_behavior_viz_4090/`（容器 `/workspace/exp19_behavior_viz_4090/`）：`runs/{smoke4090,main4090,main4090_fb1,main4090_fb2,main4090_all}/`、`renders/`、`records/`、`metrics/`、`records_v2/`、`topdown/`、`figures_v2/anim_main4090_all/`（`manifest.json` 记来源、代码 sha256 与探测）、`checks/smoke4090_vs_canary.json`、`src_{c94c447,49b16d6,eac09bc}/` |
 | EXP-19 论文图两张（运行记录 6：图 A 关键时刻、图 B 在线时间线；IEEE 双栏，PDF/SVG/PNG，中英） | 4090 机 `6024_fjl:/home/fangjialei/exp19_behavior_viz_4090/figures_paper/`（`manifest.json` 记输入 / 输出 sha256、代码 sha256 与版式参数） |
+| 实时性计时金丝雀与 NavAgent 真服务端核验（2026-09-30，4090 GPU 4；都与 09-28 金丝雀逐调用相同；判据与结果见 `docs/ops/deploy_rtx4090.md` §5 末尾、`docs/deploy/navigation_interface.md` §12） | 4090 机 `6024_fjl:/home/fangjialei/verify_0930/`：`timing_canary/`（含 `latency/latency_summary.md`）、`navagent/`、`timing_canary_vs_canary.json`、`src_94146fa/` |
 | EXP-12 恢复状态几何 + 重访发生率（D1/D3a） | `model/exp12_recovery_gate/d1_d3a_recovery_geometry.json` |
 | EXP-12 逐状态记录（D1/D2/事后标签切分**共用**的 oracle 方向） | `model/exp12_recovery_gate/d1_per_state.jsonl` |
 | EXP-12 val_unseen 徘徊型失败（D3b，超额步数代理，**上界**） | `model/exp12_recovery_gate/d3b_wandering_failures.json` |
