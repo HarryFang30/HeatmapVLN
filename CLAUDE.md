@@ -225,6 +225,10 @@ bug，其实是桩没跟上 —— 加属性时记得同步更新桩。
 仓库内被 git 跟踪的文件已全部更新（233 处 / 75 个文件）；服务器上的残留都是
 `.pyc`、`.log` 这类 gitignore 产物，可忽略。
 
+**下一次搬家**照 `docs/ops/server_migration_2026-09.md` 做（目录分类与体积、未进 git 的改动、环境重建、路径替换、验收）。
+
+**RTX 4090 部署机**（ssh 别名 `6024_fjl`，容器 `fjl-habitat`，路径是 `/workspace/...`）的布局、启动脚本 `scripts/run_ppa_r2r_val_unseen_cuda.sh` 和坑见 `docs/ops/deploy_rtx4090.md`。
+
 ### 两个不能套用上述规则的例外
 
 - **conda 不在工作区下。** 旧脚本里的 `<旧根>/miniconda3/etc/profile.d/conda.sh`
