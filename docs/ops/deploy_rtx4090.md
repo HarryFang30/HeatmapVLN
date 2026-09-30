@@ -152,3 +152,19 @@ python scripts/tools/summarize_latency.py <输出目录>/workers --output-dir <�
 - **每个动作（摊销）**：`model`、`vo`、`simulator`、`timed_total`、`cycle_wall` 各自除以这次调用的动作块实际执行的动作数（没执行动作的调用不计）；`pooled` = 所有调用之和 / 总动作数。
 - 模型服务端、里程计服务端、客户端的逐阶段统计。
 - 显存：两个服务端的 `peak_allocated`、`peak_reserved`、`device_used`，每项给 n / 中位数 / 最大值。报最大值。
+
+### 计时中立性验证（预注册，2026-09-30，跑之前写）
+
+- **设置**：在单卡 GPU 4 上重跑 09-28 金丝雀的 4 集（分片 0、1 各 2 集，种子 42；模型与里程计同卡，和部署一致），
+  打开 `PPA_EVAL_TIMING=1`，代码用 `git archive` 导出的源码副本，不动部署检出。金丝雀当时是两卡两槽；这回单槽，按分片顺序跑。
+- **通过条件**，两条都要满足：
+  1. 两份客户端日志逐调用相同：用 `scripts/exp19/select_cases.parse_client_log` 解析，比较每次调用的步号、类型、
+     慢系统输出和动作块，比法与 `scripts/deploy/nav_agent_habitat_check.py` 的 `compare_logs` 相同。
+  2. 每集的结局相同：步数 49 / 105 / 89 / 94，成功与否、NE、SPL、注入次数 7 / 17 / 12 / 16。
+- **不通过**：只要有一处不同，就判定计时在 GPU 上不中立。这时不报任何延迟数字，先查原因。
+- **完整性**：计时文件的行数必须等于规划调用数，否则这次的延迟数字作废。
+- **能说明什么**：通过时，这次运行的延迟数字可以用来填 `docs/deploy/navigation_interface.md` §8。但注意三点：
+  - 计时会在每个阶段同步 CUDA，墙钟比不计时略慢；
+  - 样本只有 4 集，大约 100 次调用；
+  - 机器是多人共用的，CPU 渲染会受别人负载影响。
+

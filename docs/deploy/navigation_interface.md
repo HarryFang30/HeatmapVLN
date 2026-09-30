@@ -201,10 +201,16 @@ LOOK_DOWN 后当场重规划不算不同：仿真客户端这时第二次采集�
   - 另用一个 LOOK_DOWN 更密的脚本手工跑过 1 集（[3,5,0,0]、[1,1,1,5]、[5,5,1,0]、[5,0,0,0]、[1,5,0,0] 等，不在测试里）：53 个请求全部相同，11/11 次调用相同。
   - 对照（都是手工跑的，不在测试里）：去掉每步的相机复位后同一检查报不同；关掉水平重拍后，LOOK_DOWN 后当场重规划的那几次调用 `current/front` 报不同。
 
-待 GPU 验证：
+待 GPU 验证（预注册，2026-09-30，跑之前写）：
 
-- 在真服务端上用 `scripts/deploy/nav_agent_habitat_check.py` 跑金丝雀的 4 集，与 `/workspace/eval_runs/canary_cuda_seed42` 的客户端日志逐调用比对（`--compare-log`，要求全部相同）。
-- 计时运行，填 §8 的表。
+- **真服务端逐调用比对**：GPU 4 上用 `scripts/deploy/start_nav_servers_cuda.sh` 起服务端，服务端不开计时；NavAgent 只开客户端计时，这不改变请求。
+  - 用 `scripts/deploy/nav_agent_habitat_check.py` 跑 09-28 金丝雀的 4 集（分片 0、1 各 2 集，种子 42），分片各用 `--compare-log` 与
+    `/workspace/eval_runs/canary_cuda_seed42` 的对应客户端日志比对。
+  - **通过**：两个分片都报 `identical`，即每次调用的步号、类型、慢系统输出、动作块都相同，每集结局也相同。这时就可以说
+    "NavAgent 接真服务端时，在这 4 集上与部署的评测客户端逐调用相同"。
+  - **不通过**：任何一处不同都算，记下第一处不同的调用，先查原因，不改口径。
+  - 金丝雀里没有 LOOK_DOWN，所以这一项证明不了 LOOK_DOWN 相关路径；那部分仍只由上面的假服务端闭环覆盖。
+- **计时运行**：按 `docs/ops/deploy_rtx4090.md` §5 末尾的预注册跑，通过后再填 §8 的表。
 
 金丝雀里没有 LOOK_DOWN，LOOK_DOWN 相关的路径只由上面的闭环（假服务端）覆盖。
 
