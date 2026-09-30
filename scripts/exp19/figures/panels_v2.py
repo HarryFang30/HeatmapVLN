@@ -640,7 +640,7 @@ CLUSTER_PT = 21.6  # key positions closer than 0.3 in fan their badges out evenl
 
 def draw_route_map(ax, level, route_xz, ref_xz, start_xz, goal_xz, goal_radius: float, key_xz, key_labels,
                    start_label: str, radius_label: str, off_level: Optional[np.ndarray] = None,
-                   fs: float = MIN_FS, stop_mark: bool = True) -> dict:
+                   fs: float = MIN_FS, stop_mark: bool = True, leader_clear_pt: float = 0.0) -> dict:
     """Muted top-down map, reference path (grey dashed), executed route (ink), start, goal + success radius,
     where the rerun ended (small ink square) and the K badges.
 
@@ -650,6 +650,7 @@ def draw_route_map(ax, level, route_xz, ref_xz, start_xz, goal_xz, goal_radius: 
     of the badges and leaders; when no spot is clear it is left out (the open
     circle is in the legend).  Every text is ``fs`` >= 6 pt.  No heading arrow,
     nothing from a pose estimate: every mark is a recorded simulator position.
+    ``leader_clear_pt``: see ``badge_spots`` (0, the default: as before).
     Returns {"stop_drawn", "start_label"}.
     """
     route_xz = np.asarray(route_xz, dtype=np.float64).reshape(-1, 2)
@@ -682,7 +683,8 @@ def draw_route_map(ax, level, route_xz, ref_xz, start_xz, goal_xz, goal_radius: 
     dense = _densify(np.concatenate([route_xz, ref_xz]), 2.0 * per_pt)
     for p in key_xz:
         ax.plot(*p, marker="o", ms=2.6, mfc=style.INK, mec="white", mew=0.4, zorder=7)
-    spots = badge_spots(key_xz, np.concatenate([dense, points]), [radius_box], limits, per_pt)
+    spots = badge_spots(key_xz, np.concatenate([dense, points]), [radius_box], limits, per_pt,
+                        leader_clear_pt=leader_clear_pt)
     boxes = [radius_box]
     leaders = []
     for p, q, lab in zip(key_xz, spots, key_labels):
@@ -779,9 +781,19 @@ def covered_points(q, points: np.ndarray, per_pt: float) -> int:
     return int(np.sum((np.abs(points[:, 0] - q[0]) < hw * per_pt) & (np.abs(points[:, 1] - q[1]) < hh * per_pt)))
 
 
-def _config_score(ps, qs, points, fixed_boxes, limits, per_pt, dists) -> float:
+def _grazes(p, q, r, per_pt: float, clear_pt: float) -> bool:
+    """The leader p -> q passes within ``clear_pt`` of the point r beyond its own start (a leader leaving p away
+    from r does not count, however close p and r are)."""
+    p, q, r = (np.asarray(v, dtype=np.float64) for v in (p, q, r))
+    d = q - p
+    t = float(np.dot(r - p, d)) / max(float(np.dot(d, d)), 1e-18)
+    return 0.0 < t <= 1.0 and float(np.linalg.norm(p + t * d - r)) < clear_pt * per_pt
+
+
+def _config_score(ps, qs, points, fixed_boxes, limits, per_pt, dists, keys=None, clear_pt: float = 0.0) -> float:
     """Room around the badges (capped), minus leader length, minus the route points a badge hides and the leaders
-    that run through a badge or cross another leader."""
+    that run through a badge or cross another leader; with ``clear_pt`` > 0, also the leaders that pass within
+    ``clear_pt`` of another key position in ``keys`` (a leader grazing a neighbour's dot seems to point at both)."""
     hw, hh = BADGE_HALF
     score = 0.0
     boxes = list(fixed_boxes)
@@ -805,20 +817,26 @@ def _config_score(ps, qs, points, fixed_boxes, limits, per_pt, dists) -> float:
         for p2_, q2_ in list(zip(ps, qs))[i + 1:]:
             if _segs_cross(p, q, p2_, q2_):
                 score -= 40.0
+    if clear_pt > 0 and keys is not None:
+        for p, q in zip(ps, qs):
+            score -= 40.0 * sum(1 for r in keys if np.linalg.norm(np.asarray(r) - p) > 1e-6 * per_pt
+                                and _grazes(p, q, r, per_pt, clear_pt))
     return score
 
 
 def badge_spots(key_xz: np.ndarray, points: np.ndarray, fixed_boxes: Sequence[np.ndarray], limits,
-                per_pt: float) -> List[np.ndarray]:
+                per_pt: float, leader_clear_pt: float = 0.0) -> List[np.ndarray]:
     """Badge centres for every key position (map units).
 
     A lone key position: the spot with the most room 11-23 pt away (as v1).  A
     cluster (within 0.3 in): the badges fan out at even angles around the
     cluster's centre, the whole fan rotated and sized for the most room, each
     badge on the side of its own position (its angular order around the
-    centre), so leaders neither cross each other nor run through a badge.
+    centre), so leaders neither cross each other nor run through a badge.  ``leader_clear_pt`` > 0: leaders also
+    keep that far from the other key positions (``_config_score``; 0, the default, as before).
     """
     key_xz = np.asarray(key_xz, dtype=np.float64).reshape(-1, 2)
+    clear = {"keys": key_xz, "clear_pt": leader_clear_pt}
     spots: List[Optional[np.ndarray]] = [None] * len(key_xz)
     boxes = list(fixed_boxes)
     for group in sorted(clusters(key_xz, per_pt), key=len, reverse=True):
@@ -829,7 +847,7 @@ def badge_spots(key_xz: np.ndarray, points: np.ndarray, fixed_boxes: Sequence[np
             for dist in (11.0, 17.0, 23.0):
                 for ang in np.radians(np.arange(0.0, 360.0, 30.0) + 15.0):
                     q = p + np.array([math.cos(ang), math.sin(ang)]) * dist * per_pt
-                    s_ = _config_score([p], [q], points, boxes, limits, per_pt, [dist])
+                    s_ = _config_score([p], [q], points, boxes, limits, per_pt, [dist], **clear)
                     if s_ > best_s:
                         best, best_s = [q], s_
         else:
@@ -846,7 +864,7 @@ def badge_spots(key_xz: np.ndarray, points: np.ndarray, fixed_boxes: Sequence[np
                         qs = [None] * n
                         for rank, i in enumerate(order):
                             qs[i] = c + np.array([math.cos(angs[rank]), math.sin(angs[rank])]) * dist * per_pt
-                        s_ = _config_score(list(ps), qs, points, boxes, limits, per_pt, [dist] * n)
+                        s_ = _config_score(list(ps), qs, points, boxes, limits, per_pt, [dist] * n, **clear)
                         if s_ > best_s:
                             best, best_s = qs, s_
         if best is None:  # nothing fits on the map: badges on their positions

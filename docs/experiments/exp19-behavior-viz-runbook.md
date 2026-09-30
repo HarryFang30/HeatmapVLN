@@ -222,15 +222,15 @@ docker exec fjl-habitat bash -lc "cd $C/src_<SHA> && EXP18_FONT_DIR=$C/support/f
 
 **默认内容**：
 
-- 图 A 是 `--fig-a T1 T2 T3 --keys K1 K2 K4`，最多 4 个关键时刻，列宽自动缩。
-- 图 B 是 `--fig-b T1 T2 T3 F1`。
+- 图 A 是 `--fig-a T1 T2 T3`。每行画该集全部 4 个关键时刻，按时间先后编号 1–4。
+- 图 B 是 `--fig-b T1 T3 F1`。编号与图 A 相同：同一集、同一步，编号相同。
 - 行既可以写类别（取该类唯一的主案例），也可以直接写 `ep_key`。只出一张图时，另一张写空参数，例如 `--fig-a`。
 
 **输出**：`fig_{a_key_moments,b_online_timeline}_{en,zh}.{pdf,svg,png}`、`*_caption_{en,zh}.txt` 和 `manifest.json`。
 
 - manifest 按图合并：只重出一张图、或只重出一种语言时，另一张 / 另一语言的记录保留。
 - 版式参数是 `fig_paper.py` 顶部的 `FIG_A` / `FIG_B`，单位英寸。
-- 自检（重叠、出界、引线穿字、最小字号、高宽比 0.9–1.15）写在 manifest 的 `checks`，出问题时打 `WARNING`。
+- 自检（重叠、出界、引线穿字、最小字号、高宽比 0.77–0.83）写在 manifest 的 `checks`，出问题时打 `WARNING`。列宽与面板高度按高宽比 0.80 自动求解。
 
 **在 Illustrator / Inkscape 里微调前**，先装 `support/fonts/` 里的 Nimbus Sans 与 Droid Sans Fallback；不装的话软件会换字体，字宽一变，
 已经核过的间距就不再成立。

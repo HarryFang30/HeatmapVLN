@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""EXP-19 paper figures: IEEE double column (7.16 in wide), about 1:1, from the same records as ``fig_v2``.
+"""EXP-19 paper figures: IEEE double column (7.16 in wide), height 0.80 x width, from the same records as ``fig_v2``.
 
-Figure A -- what the robot saw and predicted at key moments.  One row per case (default T1, T2, T3)::
+Figure A -- key moments.  One row per case (default T1, T2, T3)::
 
-  (a) category · outcome
-      "instruction"
-  route map | K_a | K_b | K_c        (default K1, K2, K4; up to four)
+  (a) Multi-room, multi-turn  Success, 0.2 m
+  route map | 1 | 2 | 3 | 4
 
-  each key moment, top to bottom: the look-down image System 2 decided on (its pixel goal as a ring, the System 1
-  path as dots; K badge + step in its top corner, the executed action chunk in a bottom corner), the 360° history
-  affordance map strip (marks of past frames 1, 4, 8) and the 360° future affordance map strip.  Unlike the v2
-  overview: no past-frame thumbnails, no System 2 text line (the pixel goal is the ring), no timeline.
+  all key moments of the episode in time order, numbered 1-4 with black circles (the same circles on the route
+  map).  Each moment, top to bottom: the image System 2 decided on (pixel goal ring, System 1 path dots, its number
+  in the top-left corner, the executed action chunk as chips in a corner clear of the pixel goal, ``chips_corner``),
+  the 360° history affordance map strip (past frames 1, 4, 8 marked; a grey line joins a frame's predicted peak to
+  its true direction) and the 360° future affordance map strip.  The strip rows are named once (rotated, left of
+  the first row), the bearings once (under the first column of the last row).  The column width is solved so the
+  page is ``ASPECT`` x its width tall.
 
-Figure B -- the affordance maps online.  One row per case (default T1, T2, T3, F1)::
+Figure B -- the affordance maps online.  One row per case (default T1, T3, F1)::
 
-  (a) category · outcome
-      "instruction"
+  (a) Multi-room, multi-turn  Success, 0.2 m  “instruction ...”
   route map | online timeline: history panel, future panel, executed turns
 
   the step axis starts at the first call with an affordance map (``timeline_panel.crop_warmup``): the steps before
-  it are left out, not compressed; each column marks past frames 1, 4, 8 as one group (``Timeline.compact148``).
+  it are left out, not compressed; each column marks past frames 1, 4, 8 as one group (``Timeline.compact148``);
+  the key moments carry Figure A's circled numbers on their hairlines.  The panel heights are solved for ``ASPECT``.
+
+Key moments are numbered in time order (``time_numbers``), not by the rule that chose them (the bundle's K1-K4), so
+an episode in both figures carries the same numbers at the same steps; the captions name the rule behind each
+number from the branch each key moment took (``moment_rules``).
 
 Outputs per figure and language: PDF (TrueType text), SVG (live ``<text>``) and PNG (400 dpi), plus a caption
 ``.txt``; every text is real text (the route maps' white halos become small white boxes, ``editable_text``), so the
@@ -28,14 +34,14 @@ Fallback).  Images and affordance maps are embedded rasters.  The layout numbers
 ``FIG_B`` constants below.
 
 Policy as ``fig_v2``: no poses, VO or odometry; both heatmaps are "affordance map"; nothing is drawn from the future
-map to the actions (the captions say it does not feed them); the captions make no claim (the RTX 4090 batch is
-descriptive only, see the ledger's EXP-19 run record 5).
+map to the actions; the captions describe what is drawn and make no claim (the RTX 4090 batch is descriptive only,
+see the ledger's EXP-19 run record 5).
 
 Usage (repo root on PYTHONPATH)::
 
   python -m scripts.exp19.figures.fig_paper --records <EXP>/records --timelines <EXP>/records_v2 \\
       --topdown-root <EXP>/topdown --out-dir <EXP>/figures_paper [--lang en zh] \\
-      [--fig-a T1 T2 T3] [--fig-b T1 T2 T3 F1] [--keys K1 K2 K4]
+      [--fig-a T1 T2 T3] [--fig-b T1 T3 F1]
 """
 from __future__ import annotations
 
@@ -56,179 +62,127 @@ from scripts.exp19.figures import panels_v2 as p2
 from scripts.exp19.figures import timeline_panel as tp
 
 import matplotlib  # noqa: E402  (configured in setup())
+from matplotlib.patches import BoxStyle, Circle  # noqa: E402
 from matplotlib.text import Text  # noqa: E402
 
-MANIFEST_SCHEMA = "exp19-figures-paper-manifest-v2"
+MANIFEST_SCHEMA = "exp19-figures-paper-manifest-v3"
 PAPER_W = 7.16  # IEEE double column
 EDGE = 0.01  # the right-most frame lines stay this far inside the page
-ASPECT_RANGE = (0.9, 1.15)  # height / width the figures aim for ("about 1:1"); outside it is a warning
+ASPECT = 0.80  # height / width the layouts solve for ...
+ASPECT_RANGE = (0.77, 0.83)  # ... and outside this range is a warning
 FS = p2.FS
-LINE = f2.LINE
-KEY_LABELS = ("K1", "K2", "K3", "K4")
-
-FIG_A = {"k_w_max": 1.52, "route_w_min": 1.5, "k_gap": 0.08, "route_gap": 0.12, "title_h": 0.15,
-         "instr_gap": 0.035, "dec_gap": 0.03, "cap_h": 0.115, "strip_gap": 0.025, "chip_pt": 7.6,
-         "chip_inset_pt": 3.0, "ticks_h": 0.13, "row_gap": 0.1, "legend_gap": 0.07}
-FIG_B = {"route_w": 1.5, "ylab_min": 0.27, "title_h": 0.15, "instr_gap": 0.035, "badges": 0.12, "hist": 0.46,
-         "gap_first": 0.13, "gap": 0.08, "fut": 0.42, "hist_title": f2.HIST_TITLE_H, "ticks": 0.13, "row_gap": 0.1,
-         "legend_gap": 0.07}
+FS_TITLE, FS_BODY = 7.0, 6.3  # a row's title; its outcome
+LINE = 0.105  # in per 6-6.3 pt text line (wrapped heads)
+LEGEND_LINE = 0.13  # in per legend line: its goal glyph and circled number are taller than a text line
+LEADER_CLEAR_PT = 3.5  # a route map's leader keeps 2 pt off the rim of another key-moment dot (``draw_route``)
 DEFAULT_A = ("T1", "T2", "T3")
-DEFAULT_B = ("T1", "T2", "T3", "F1")
-DEFAULT_KEYS = ("K1", "K2", "K4")
+DEFAULT_B = ("T1", "T3", "F1")
 LETTERS = "abcdefghij"
+
+FIG_A = {"head_h": 0.16, "row_gap": 0.08, "route_gap": 0.05, "gutter": 0.11, "k_gap": 0.05, "dec_gap": 0.025,
+         "strip_gap": 0.02, "fut_elev": 36.0, "ticks_h": 0.12, "legend_gap": 0.09, "k_w_max": 1.45,
+         "route_w_min": 1.3, "chip_pt": 6.4, "chip_inset_pt": 2.4}
+FIG_B = {"top_pad": 0.02, "route_w": 1.53, "name_w": 0.20, "ylab": 0.28, "head_gap": 0.03, "badges": 0.13,
+         "gap": 0.055, "turn_gap": f2.TURN_GAP, "turn": f2.TURN_H, "ticks": 0.125, "row_gap": 0.11,
+         "legend_gap": 0.08, "hist_frac": 0.59, "panels_min": 0.5, "panels_max": 1.6}
 
 LABELS: Dict[str, Dict[str, object]] = {
     "en": {
         "letter": "({l})",
-        "outcome_success": "success: stopped {ne} m from the goal at step {steps}",
-        "outcome_stop": "failure: stopped {ne} m from the goal at step {steps}{os}",
-        "outcome_cap": "failure: {steps}-step limit, {ne} m from the goal{os}",
-        "outcome_other": "failure: ended at step {steps}, {ne} m from the goal{os}",
-        "outcome_os": "; it had been within {r:g} m earlier",
-        "cap_hist": "360° history affordance map",
-        "cap_fut": "360° future affordance map",
-        "panel_b_hist": "History affordance map",
-        "panel_b_fut": "Future affordance map",
-        "groups": ("Route", "History affordance map", "Future affordance map", "Decisions"),
+        "success": "Success, {ne} m",
+        "failure": "Failure, {ne} m",
+        "outcome_missing": "outcome not recorded",
+        "names": {"F1": "reached the goal area, stopped elsewhere"},  # else fb.CATEGORY_NAMES
+        "rows": ("History", "Future"),
         "legend": {
-            "route": "route / reference path",
-            "start_goal": "start / goal (3 m radius)",
-            "stop": "where the rerun ended",
-            "key": "key moment",
-            "hist": "predicted field",
-            "pred": "predicted peak of a past frame",
-            "gt": "true direction of that frame",
-            "pair": "peak joined to its true direction",
-            "frame": "framed: the model's 79° front view",
-            "slots_ov": "a column = one call; past frames 1, 4, 8",
-            "fut": "predicted field (darker = later)",
-            "path": "System 1 path",
-            "path_end": "System 1 path endpoint",
-            "goal": "pixel goal (System 2)",
-            "actions": "executed actions",
-            "turns": "executed turns (up = left)",
-            "nomap": "System 2 gave turns or STOP",
+            "route": "route", "ref": "reference path", "offlevel": "other floor", "start": "start",
+            "goal": "goal ({r:g} m)", "stop": "stop", "num": "key moment", "pgoal": "pixel goal",
+            "path": "System 1 path", "actions": "executed actions", "hist": "history affordance map",
+            "past": "past-frame direction, true / predicted", "past_b": "past-frame direction, true / predicted",
+            "fut": "future affordance map", "path_end": "System 1 path end", "turns": "executed turns (up = left)",
+            "nomap": "no affordance map",
         },
     },
     "zh": {
         "letter": "({l})",
-        "outcome_success": "成功：第 {steps} 步停在距目标 {ne} m 处",
-        "outcome_stop": "失败：第 {steps} 步停在距目标 {ne} m 处{os}",
-        "outcome_cap": "失败：撞上 {steps} 步上限，距目标 {ne} m{os}",
-        "outcome_other": "失败：第 {steps} 步结束，距目标 {ne} m{os}",
-        "outcome_os": "；此前曾到过目标 {r:g} m 以内",
-        "cap_hist": "360° 历史 affordance map",
-        "cap_fut": "360° 未来 affordance map",
-        "panel_b_hist": "历史 affordance map",
-        "panel_b_fut": "未来 affordance map",
-        "groups": ("路线", "历史 affordance map", "未来 affordance map", "决策"),
+        "success": "成功，{ne} m",
+        "failure": "失败，{ne} m",
+        "outcome_missing": "结局未记录",
+        "names": {},
+        "rows": ("历史", "未来"),
         "legend": {
-            "route": "执行路线 / 参考路径",
-            "start_goal": "起点 / 目标（3 m 半径）",
-            "stop": "复跑结束处",
-            "key": "关键时刻",
-            "hist": "预测场",
-            "pred": "历史帧的预测峰值",
-            "gt": "该帧的真实方向",
-            "pair": "峰值与真实方向连线",
-            "frame": "黑框 = 输入模型的 79° 前视",
-            "slots_ov": "一列 = 一次调用；画历史帧 1、4、8",
-            "fut": "预测场（越深越晚）",
-            "path": "快系统路径",
-            "path_end": "快系统路径终点",
-            "goal": "像素目标（慢系统）",
-            "actions": "执行的动作",
-            "turns": "执行的转向（上 = 左转）",
-            "nomap": "慢系统直接给出转向或停止",
+            "route": "路线", "ref": "参考路径", "offlevel": "另一楼层", "start": "起点", "goal": "目标（{r:g} m）",
+            "stop": "停止处", "num": "关键时刻", "pgoal": "像素目标", "path": "快系统路径", "actions": "执行的动作",
+            "hist": "历史 affordance map", "past": "历史帧方向：真实 / 预测", "past_b": "历史帧方向：真实 / 预测",
+            "fut": "未来 affordance map", "path_end": "快系统路径终点", "turns": "执行的转向（上 = 左）",
+            "nomap": "无 affordance map",
         },
     },
 }
-GROUPS_A = (("route", "start_goal", "stop", "key"), ("hist", "pred", "gt", "pair", "frame"), ("fut",),
-            ("path", "goal", "actions"))
-GROUPS_B = (("route", "start_goal", "stop", "key"), ("hist", "pred", "gt", "slots_ov"), ("fut",),
-            ("path_end", "turns", "nomap"))
 
-MARKS = {
-    "en": ("On the history {where}, orange dots are the predicted peaks and blue circles the true directions of past "
-           "frames 1 (the episode's first frame), 4 and 8 (the latest) of the eight given to System 2; the orange field "
-           "combines all eight. A circle without a dot: that frame was predicted not visible; a dot without a circle: "
-           "that frame is not visible from there."),
-    "zh": ("历史{where}上，橙点为预测峰值、蓝圈为真实方向，只画送入慢系统的 8 个历史帧中的第 1（本集第一帧）、4、8（最近一帧）帧，"
-           "橙色场综合全部 8 帧。有圈无点：模型认为该帧不可见；有点无圈：该帧从那里不可见。"),
+# How each numbered key moment was chosen, by the branch it took (``bd.KEY_BRANCHES``; fb.KEY_RULES in full).  The
+# head names the pool (System 2 calls with an affordance map = keysteps' ready calls), so "one" is always one of them:
+# the K2 fallback's "no later one" does not count the grey no-map calls, whose turns keysteps never looks at.
+RULES = {
+    "en": {"K1_first": "the first",
+           "K2_turn": "the later one with the largest executed turn",
+           "K2_fallback": "the one a third of the way through (no later one's executed turn reaches 30°)",
+           "K3_two_thirds": "the one nearest two thirds of the episode",
+           "K3_f1_closest": "the last one up to the closest approach to the goal",
+           "K3_f1_fallback_after": "the first one after the closest approach to the goal",
+           "K4_last": "the last",
+           "K4_shifted": "the latest one not chosen before",
+           "head": "Key moments {r} are chosen among the System 2 calls with an affordance map: {rules}",
+           "all": "The numbered key moments are all the System 2 calls with an affordance map",
+           "sep": ", ", "last": " and ", "case": "; in {l}, {parts}", "part": "{n} is {rule}",
+           "part_next": "{n} {rule}", "lt4": "; {l} has only {n}, all shown", "lt4_one": "; {l} has only one",
+           "end": "."},
+    "zh": {"K1_first": "第一次",
+           "K2_turn": "其后执行转角最大的一次",
+           "K2_fallback": "位于三分之一处的一次（其后没有一次执行转角达到 30°）",
+           "K3_two_thirds": "最接近本集 2/3 处的一次",
+           "K3_f1_closest": "最接近目标那一步及之前的最后一次",
+           "K3_f1_fallback_after": "最接近目标那一步之后的第一次",
+           "K4_last": "最后一次",
+           "K4_shifted": "此前未选中的最晚一次",
+           "head": "关键时刻 {r} 从给出 affordance map 的慢系统调用中选取：{rules}",
+           "all": "编号的关键时刻即全部给出 affordance map 的慢系统调用",
+           "sep": "、", "last": "和", "case": "；{l} 中{parts}", "part": " {n} 为{rule}", "part_next": "，{n} 为{rule}",
+           "lt4": "；{l} 只有 {n} 次，全部画出", "lt4_one": "；{l} 只有 1 次", "end": "。"},
 }
-MARKS_WHERE = {"en": {"a": "strips", "b": "panel"}, "zh": {"a": "条带", "b": "图"}}
+
+# Five sentences each.  A: the rows; the decision image; the two strips (with the display smoothing); the past-frame
+# marks; how the moments were chosen (``moment_rules``).  B: the rows; the axes; a column (with the smoothing); the
+# past-frame marks; the moments.
 CAPTION_A = {
-    "en": ("Closed-loop reruns of {n} R2R val_unseen episodes: {rows}. Each row: the executed route on the top-down map "
-           "with the key moments {keys}; then, at each key moment, the look-down image System 2 decided on (its pixel "
-           "goal as a ring, the System 1 path as black dots, the executed action chunk as chips: ↑ forward 0.25 m, ←/→ "
-           "turn 15°) and the 360° surroundings re-rendered at that position with the predicted history affordance map "
-           "(orange) and the predicted future affordance map (green, darker = later; the System 1 path overlaid as "
-           "black dots). {marks} A grey line joins a frame's peak to its true direction when the two are apart. Only "
-           "the framed front 79° of the surroundings was given to the model; the strips repeat 8° past ±180°. The "
-           "future affordance map does not feed the actions."),
-    "zh": ("{n} 集 R2R val_unseen 的闭环复跑：{rows}。每行依次为：俯视图上的执行路线与关键时刻 {keys}；各关键时刻慢系统据以决策的"
-           "下视帧（圈 = 像素目标，黑点 = 快系统路径，图像下角的方块 = 执行的动作块：↑ 前进 0.25 m，←/→ 转 15°），以及在该位置重"
-           "渲染的 360° 环视及其上的预测历史 affordance map（橙）与预测未来 affordance map（绿，越深越晚；黑点为叠加的快系统路径）。"
-           "{marks}同一帧的峰值与真实方向相距较远时以灰线相连。环视中只有黑框内的前视 79° 输入了模型；条带两端各重复 8°。未来 "
-           "affordance map 不回流到动作。"),
+    "en": ("Key moments of closed-loop R2R val-unseen episodes; headings give the outcome and the final distance to "
+           "the goal. Each moment shows the image on which System 2 placed its pixel goal (ring), with the System 1 "
+           "path (dots, also on the future map) and the executed actions (chips). Below it are the 360° history "
+           "(orange; camera's 79° view boxed) and future (green, darker = later) affordance maps, smoothed for display "
+           "(σ = {s:g}°). Blue circles and orange dots are the true and predicted directions of past frames 1 (oldest), "
+           "4 and 8 of the eight given to System 2{edge}. {rules}"),
+    "zh": ("闭环复跑（R2R val-unseen）的关键时刻；标题为结局与停止处到目标的距离。每个关键时刻上方为慢系统据以给出像素目标"
+           "（圈）的图像，叠有快系统路径（点，未来图上同）与执行的动作（方块）。下方为 360° 历史（橙，黑框为相机 79° 视野）"
+           "与未来（绿，越深越晚）affordance map，为显示做了平滑（σ = {s:g}°）。蓝圈与橙点为送入慢系统的 8 个历史帧中"
+           "第 1（最早）、4、8 帧的真实与预测方向{edge}。{rules}"),
 }
 CAPTION_B = {
-    "en": ("The affordance maps online in {n} R2R val_unseen reruns: {rows}. Each row: the route on the top-down map with "
-           "the key moments {keys}, and the timeline. x = step, from the first call with an affordance map (the steps "
-           "before it are not shown); y = bearing around the robot, up = left: the history panel runs ahead, left, "
-           "back, right, ahead from top to bottom; the future panel is centred on ahead, with back at its edges. Each "
-           "call that returned a pixel goal is a column spanning its executed action chunk, with that call's predicted "
-           "history affordance map (orange), the marks of its past frames, its predicted future affordance map (green, "
-           "darker = later) and the endpoint of its System 1 path (black dot). {marks} {grey}Executed turns are marked "
-           "below the panels (up = left). The future affordance map does not feed the actions."),
-    "zh": ("{n} 集 R2R val_unseen 复跑中在线运行的 affordance map：{rows}。每行为俯视图上带关键时刻 {keys} 的路线与时间线。横轴为"
-           "步数，从第一次给出 affordance map 的调用开始（此前的步数不画）；纵轴为机器人周围的方位，向上 = 向左：历史图自上而下为"
-           "前、左、后、右、前，未来图以正前方居中、上下两端为后。每次给出像素目标的调用占一列，跨它执行的动作块，列内为该次调用"
-           "的预测历史 affordance map（橙）、历史帧的标记、预测未来 affordance map（绿，越深越晚）及快系统路径终点（黑点）。{marks}"
-           "{grey}图下方为执行的转向（上 = 左转）。未来 affordance map 不回流到动作。"),
+    "en": ("Affordance maps predicted online in closed-loop R2R val-unseen episodes; headings give the outcome, the "
+           "final distance to the goal and the instruction. The x-axis is the step, starting at the first System 2 "
+           "call with an affordance map, and the y-axis the bearing around the robot (up = left){grey}. Each column is "
+           "one call, with its history (orange) and future (green, darker = later) affordance maps, smoothed for "
+           "display (σ = {s:g}°); black dots mark the end of its System 1 path. Blue circles and orange dots are the "
+           "true and predicted directions of past frames 1 (oldest), 4 and 8 of the eight given to System 2. {rules}"
+           "{stacked}"),
+    "zh": ("闭环复跑（R2R val-unseen）中在线预测的 affordance map；标题为结局、停止处到目标的距离与指令。横轴为步数，从第一次"
+           "给出 affordance map 的慢系统调用开始；纵轴为机器人周围的方位，向上 = 向左{grey}。每列为一次调用的历史（橙）与未来"
+           "（绿，越深越晚）affordance map，为显示做了平滑（σ = {s:g}°）；黑点为快系统路径终点。蓝圈与橙点为送入慢系统的 "
+           "8 个历史帧中第 1（最早）、4、8 帧的真实与预测方向。{rules}{stacked}"),
 }
-CAPTION_GREY = {"en": "Grey columns: System 2 answered with turns or STOP (no affordance map). ",
-                "zh": "灰列：慢系统直接给出转向或停止（没有 affordance map）。"}
-CAPTION_K3_ELSEWHERE = {"en": "(K3 is marked on the timelines of the companion figure.)",
-                        "zh": "（K3 标在另一张图的时间线上。）"}
-CAPTION_TAIL = {
-    "en": "Reruns on an RTX 4090, shown as examples; no claim is made from them.",
-    "zh": "复跑于 RTX 4090，仅作示例，不据此下结论。",
-}
-CAPTION_SMOOTH = {
-    "a": {"en": "The affordance maps are blurred for display (Gaussian, σ = {s:g}°); orange dots mark the unblurred peaks.",
-          "zh": "affordance map 为显示做了高斯平滑（σ = {s:g}°）；橙点为未平滑的峰值。"},
-    "b": {"en": ("The affordance maps are blurred in bearing for display (Gaussian, σ = {s:g}°); orange dots mark the "
-                 "unblurred peaks."),
-          "zh": "affordance map 在方位向为显示做了高斯平滑（σ = {s:g}°）；橙点为未平滑的峰值。"},
-}
-SHORT_RULES = {  # the key-moment rules by the branch each key moment took (``bd.KeyStep.branch``)
-    "en": {"K1_first": "the first call with an affordance map",
-           "K2_turn": ("the call with an affordance map, other than K1, whose executed chunk has the largest net turn "
-                       "(at least 30°; the earliest if tied)"),
-           "K2_fallback": ("the call a third of the way through the calls with an affordance map, as no other such "
-                           "call's chunk has a net turn of 30° or more"),
-           "K3_two_thirds": ("the call with an affordance map, other than K1 and K2, nearest two thirds of the "
-                             "episode's steps"),
-           "K3_f1_closest": ("the last call with an affordance map, other than K1 and K2, at or before the step "
-                             "closest to the goal"),
-           "K3_f1_fallback_after": ("the first call with an affordance map, other than K1 and K2, after the step "
-                                    "closest to the goal (none at or before it; not in the pre-registration)"),
-           "K4_last": "the last call with an affordance map",
-           "K4_shifted": "the latest call with an affordance map not already chosen",
-           "rule": "{label} = {rule}", "where": "; in {cases}, {label} = {rule}", "join": "; ", "cases": " and ",
-           "end": ".", "lt4": " In {case}, {text}", "order": " Key moments are numbered by these rules, not in time order."},
-    "zh": {"K1_first": "第一次给出 affordance map 的调用",
-           "K2_turn": "除 K1 外、给出 affordance map 的调用中执行动作块净转角最大者（≥ 30°，并列取最早）",
-           "K2_fallback": "这些调用中位于三分之一处者，因为其余调用的动作块净转角都不到 30°",
-           "K3_two_thirds": "除 K1、K2 外、步号最接近全集 2/3 的给出 affordance map 的调用",
-           "K3_f1_closest": "除 K1、K2 外，距目标最近那一步及其之前的最后一次给出 affordance map 的调用",
-           "K3_f1_fallback_after": "除 K1、K2 外，距目标最近那一步之后的第一次给出 affordance map 的调用（该步及之前没有；此兜底不在预注册中）",
-           "K4_last": "最后一次给出 affordance map 的调用",
-           "K4_shifted": "尚未被选的最晚一次给出 affordance map 的调用",
-           "rule": "{label} 为{rule}", "where": "；{cases} 中 {label} 为{rule}", "join": "；", "cases": "、",
-           "end": "。", "lt4": "{case} 中，{text}", "order": "关键时刻按上述规则编号，不按时间先后。"},
-}
+CAPTION_GREY = {"en": "; grey columns are calls without an affordance map", "zh": "；灰列为没有 affordance map 的调用"}
+CAPTION_EDGE = {"en": "; a triangle on a strip's edge marks a direction beyond its elevation range",
+                "zh": "；条带边缘的小三角表示超出其俯仰范围的方向"}
+
 
 
 # --------------------------------------------------------------------------- #
@@ -246,133 +200,224 @@ def paper_labels(lang: str) -> dict:
 
 def heading_weight(lang: str) -> str:
     """Bold headings in English; the only CJK face (Droid Sans Fallback) has one weight, so a zh heading in bold
-    would mix a bold "(a)" with regular CJK: zh headings are regular, one step larger."""
+    would mix a bold "(a)" with regular CJK: zh headings are regular, a little larger (``title_style``)."""
     return "bold" if lang == "en" else "normal"
 
 
-def cap_first(text: str, lang: str) -> str:
-    return text[:1].upper() + text[1:] if lang == "en" else text
-
-
-def outcome_short(b: bd.Bundle, L: dict) -> str:
-    o = b.outcome
-    if o is None:
-        return L["outcome_missing"]
-    ne = f"{o['ne_m']:.1f}" if fb._finite(o["ne_m"]) else "?"
-    if o["success"]:
-        return L["outcome_success"].format(steps=o["steps"], ne=ne)
-    os_note = L["outcome_os"].format(r=float(b.goal_radius_m)) if o["oracle_success"] else ""
-    key = {"stop": "outcome_stop", "step_cap": "outcome_cap"}.get(o["ended_by"], "outcome_other")
-    return L[key].format(steps=o["steps"], ne=ne, os=os_note)
+def title_style(lang: str) -> dict:
+    return {"fontsize": FS_TITLE if lang == "en" else FS_TITLE + 0.5, "fontweight": heading_weight(lang),
+            "color": style.INK}
 
 
 def category_of(b: bd.Bundle) -> str:
     return b.membership(main=True)["category"]
 
 
-def row_head(fig, b: bd.Bundle, letter: str, lang: str, L: dict, width: float) -> dict:
-    """The row's title (letter + category name), outcome, and the instruction wrapped to ``width`` (in)."""
+def case_title(b: bd.Bundle, letter: str, L: dict, lang: str) -> str:
+    """"(a) Multi-room, multi-turn": the letter and the category's name (``LABELS[...]["names"]`` first)."""
     cat = category_of(b)
-    name = cap_first(fb.CATEGORY_NAMES[lang][cat], lang)
-    instr = f2.wrap_ink(fig, f2.LABELS[lang]["instruction"].format(text=" ".join(b.instruction.split())), FS["small"],
-                        width * 72.0, fontstyle="italic")
-    return {"title": f"{L['letter'].format(l=letter)} {name}", "outcome": outcome_short(b, L), "instr": instr,
-            "cat": cat, "letter": letter, "name": fb.CATEGORY_NAMES[lang][cat]}
+    name = L["names"].get(cat, fb.CATEGORY_NAMES[lang][cat])
+    return f"{L['letter'].format(l=letter)} {name[:1].upper() + name[1:] if lang == 'en' else name}"
 
 
-def head_height(head: dict, g: dict) -> float:
-    return g["title_h"] + LINE * len(head["instr"]) + g["instr_gap"]
+def outcome_short(b: bd.Bundle, L: dict) -> str:
+    """"Success, 0.2 m": the outcome and the final distance to the goal."""
+    o = b.outcome
+    if o is None:
+        return L["outcome_missing"]
+    ne = f"{o['ne_m']:.1f}" if fb._finite(o["ne_m"]) else "?"
+    return L["success" if o["success"] else "failure"].format(ne=ne)
 
 
-def draw_head(page: fb.Page, y: float, head: dict, lang: str) -> None:
-    fig = page.fig
-    ax = page.pt_axes(0.0, y, PAPER_W, 0.15)
-    fs, w = (FS["head"] + 0.6 if lang == "en" else FS["head"] + 1.2), heading_weight(lang)
-    ax.text(0.0, 5.4, head["title"], ha="left", va="center", fontsize=fs, fontweight=w, color=style.INK)
-    xo = cd.text_width_pt(fig, head["title"], fs, fontweight=w) + 7.0
-    ax.text(xo, 5.4, head["outcome"], ha="left", va="center", fontsize=FS["small"], color=style.INK_2)
-    for j, line in enumerate(head["instr"]):
-        page.text(0.0, y + 0.15 + LINE * (j + 0.5), line, ha="left", va="center", fontsize=FS["small"],
-                  color=style.INK_2, fontstyle="italic")
+def time_order(keys: Sequence[bd.KeyStep]) -> List[bd.KeyStep]:
+    return sorted(keys, key=lambda k: (int(k.step), int(k.index)))
 
 
-def rule(page: fb.Page, y: float) -> None:
-    """A full-width hairline between rows (drawn unclipped: ``fb.Page.rule`` clips it to a 0.001-in axes)."""
-    ax = page.ax(0.0, y, PAPER_W, 0.001)
-    ax.axis("off")
-    ax.axhline(0.5, color=style.AXIS, lw=0.6, clip_on=False)
+def time_numbers(b: bd.Bundle) -> Dict[str, str]:
+    """Key label (K1-K4) -> its number in time order ("1"-"4"); the same in both figures."""
+    return {k.label: str(i + 1) for i, k in enumerate(time_order(b.keys))}
 
 
-GLYPH_W, GLYPH_TEXT_PT, LEGEND_GAP_PT = 14.0, f2.GLYPH_TEXT_PT, 10.0
+BADGE_PAD = 0.14  # circle padding of a key-moment number (x font size)
+
+
+def circle_badges(ax, labels) -> int:
+    """The black rounded badges the shared helpers draw (``cd.key_badge``: route map, decision image, timeline)
+    turned into circles, for the texts in ``labels``.  Returns how many were changed."""
+    n = 0
+    for t in ax.texts:
+        if t.get_text() in labels and t.get_bbox_patch() is not None:
+            t.get_bbox_patch().set_boxstyle("circle", pad=BADGE_PAD)
+            n += 1
+    return n
+
+
+def num_badge(ax, x: float, y: float, text: str, fs: float = p2.MIN_FS):
+    """A circled key-moment number, as ``circle_badges`` makes them (for the legend)."""
+    t = cd.key_badge(ax, x, y, text, fs=fs, zorder=11)
+    t.get_bbox_patch().set_boxstyle("circle", pad=BADGE_PAD)
+    return t
+
+
+def row_name(page: fb.Page, x: float, y: float, text: str, lang: str) -> None:
+    """The name of a strip row or timeline panel, centred on (x, y) in inches: rotated in English, upright characters
+    stacked in Chinese."""
+    kw = dict(ha="center", va="center", fontsize=p2.MIN_FS, color=style.INK_2)
+    if lang == "zh":
+        page.text(x, y, "\n".join(text), linespacing=1.05, **kw)
+    else:
+        page.text(x, y, text, rotation=90, **kw)
+
+
+def off_level_visible(b: bd.Bundle, topdown) -> bool:
+    """The route map shows dotted steps on another floor (at least ``fb.FLOOR_NOTE_MIN_M`` of them; shorter ones
+    hide under the start circle): the legend's "other floor" entry."""
+    off = fb.off_level_steps(b, topdown)
+    xz = b.xz("route_xz")
+    if off is None or not np.any(off) or len(xz) < 2:
+        return False
+    seg = np.asarray(off, dtype=bool)
+    seg = seg[1:] | seg[:-1]
+    return bool(np.linalg.norm(np.diff(xz, axis=0), axis=1)[seg].sum() >= fb.FLOOR_NOTE_MIN_M)
+
+
+def draw_route(page: fb.Page, x: float, y: float, w: float, h: float, b: bd.Bundle, topdown,
+               nums: Dict[str, str], L: dict) -> dict:
+    """Route map (``p2.draw_route_map``) with the key moments as circled numbers, no start / radius text (both are in
+    the legend); a leader keeps ``LEADER_CLEAR_PT`` off the other key-moment dots.  Returns its info ({"stop_drawn",
+    "start_label", "badges"})."""
+    ax = page.ax(x, y, w, h)
+    keys = time_order(b.keys)
+    labels = [nums[k.label] for k in keys]
+    info = p2.draw_route_map(ax, topdown[1] if topdown is not None else None, b.xz("route_xz"),
+                             b.xz("reference_path_xz"), b.start_xz, b.goal_xz, float(b.goal_radius_m),
+                             [k.position_xz for k in keys], labels, "", "", off_level=fb.off_level_steps(b, topdown),
+                             leader_clear_pt=LEADER_CLEAR_PT)
+    info["badges"] = circle_badges(ax, set(labels))
+    if topdown is None:
+        ax.text(0.5, 0.03, L["no_map"], transform=ax.transAxes, ha="center", va="bottom", fontsize=p2.MIN_FS,
+                color=style.INK_2, fontstyle="italic")
+    return info
+
+
+# --------------------------------------------------------------------------- #
+# Legend: centred lines of glyph + short text, groups kept together
+# --------------------------------------------------------------------------- #
+GLYPH_W = {"route": 12.0, "ref": 12.0, "offlevel": 12.0, "start": 5.0, "goal": 9.6, "stop": 4.0, "num": 8.6,
+           "pgoal": 7.0, "path": 11.0, "actions": 13.8, "hist": 12.0, "past": 15.0, "past_b": 10.0, "fut": 12.0,
+           "path_end": 3.2, "turns": 14.0, "nomap": 9.0}
+ITEM_GAP, GROUP_GAP, GLYPH_GAP = 7.0, 15.0, 2.6  # legend spacing (pt)
 
 
 def glyph(ax, key: str, x: float, y: float) -> None:
-    if key == "path_end":  # the timeline's one dot per column
-        p2.path_marks(ax, [x + GLYPH_W / 2], [y], ms=1.9 * tp.TL_MARK, rim=True, clip_on=False)
-    else:
-        p2.legend_glyph(ax, key, x, y, w=GLYPH_W)
+    """A legend glyph from x (its left edge), centred on y, point units (``GLYPH_W[key]`` wide)."""
+    if key == "route":
+        ax.plot([x, x + 12.0], [y, y], color=style.INK, lw=0.95, solid_capstyle="round")
+    elif key == "ref":
+        ax.plot([x, x + 12.0], [y, y], color=style.MUTED, lw=0.8, ls=(0, (3.0, 1.8)))
+    elif key == "offlevel":
+        ax.plot([x, x + 12.0], [y, y], color=style.MUTED, lw=0.9, ls=(0, (1.0, 1.4)), dash_capstyle="round")
+    elif key == "start":
+        ax.plot([x + 2.5], [y], marker="o", ms=4.0, mfc="white", mec=style.INK, mew=0.9)
+    elif key == "goal":
+        ax.add_patch(Circle((x + 4.8, y), 4.3, fc=cd.mix(style.INK, "white", 0.94), ec=style.INK_2, lw=0.5,
+                            ls=(0, (2.2, 1.6))))
+        ax.plot([x + 4.8], [y], marker="*", ms=6.0, mfc=style.INK, mec="white", mew=0.4)
+    elif key == "stop":
+        ax.plot([x + 2.0], [y], marker="s", ms=p2.STOP_MS, mfc=style.INK, mec="white", mew=0.45)
+    elif key == "num":
+        num_badge(ax, x + 4.3, y, "1")
+    elif key == "pgoal":
+        p2.goal_ring(ax, x + 3.5, y)
+    elif key == "path":
+        p2.path_marks(ax, [x + 1.0 + 3.2 * i for i in range(4)], [y] * 4, clip_on=False)
+    elif key == "actions":
+        p2.action_chip(ax, x, y, bd.FORWARD, size=6.4)
+        p2.action_chip(ax, x + 7.4, y, bd.LEFT, size=6.4)
+    elif key == "past":  # the strips: true direction, grey line, predicted peak
+        ax.plot([x + 2.2, x + 12.8], [y, y], color=p2.PAIR_COLOR, lw=p2.PAIR_LW, solid_capstyle="butt")
+        p2.gt_ring(ax, x + 2.2, y, clip_on=False)
+        p2.pred_dot(ax, x + 12.8, y, clip_on=False)
+    elif key == "past_b":  # the timeline: true direction, predicted peak
+        p2.gt_ring(ax, x + 2.2, y, clip_on=False)
+        p2.pred_dot(ax, x + 8.0, y, clip_on=False)
+    elif key == "path_end":
+        p2.path_marks(ax, [x + 1.6], [y], ms=1.9 * tp.TL_MARK, rim=True, clip_on=False)
+    else:  # hist, fut, turns, nomap
+        p2.legend_glyph(ax, key, x, y, w=GLYPH_W[key])
 
 
-def legend_layout(fig, groups: Sequence[Sequence[str]], names: Sequence[str], texts: Dict[str, str],
-                  width_pt: float, fs: float, head_weight: str) -> dict:
-    """One column per group (its name on top, entries below), in the figure's left-to-right order; while the
-    columns do not fit ``width_pt`` the widest entry is wrapped onto two lines.  Returns {"cols", "x", "rows"}."""
-    cols = [(name, [[k, [texts[k]]] for k in grp]) for name, grp in zip(names, groups) if grp]
-
-    def col_w(head, items):
-        w = cd.text_width_pt(fig, head, fs, fontweight=head_weight)
-        return max([w] + [GLYPH_TEXT_PT + max(cd.text_width_pt(fig, ln, fs) for ln in lines) for _, lines in items])
-
-    for _ in range(12):
-        widths = [col_w(h, it) for h, it in cols]
-        if sum(widths) + LEGEND_GAP_PT * (len(cols) - 1) <= width_pt:
-            break
-        c = int(np.argmax(widths))
-        single = [it for it in cols[c][1] if len(it[1]) == 1]
-        if not single:
-            break
-        it = max(single, key=lambda e: cd.text_width_pt(fig, e[1][0], fs))
-        text = it[1][0]
-        it[1] = f2.split_at_semicolon(text) or fb.wrap(fig, text, fs, cd.text_width_pt(fig, text, fs) * 0.6 + 6.0)[:2]
-    widths = [col_w(h, it) for h, it in cols]
-    spare = max(0.0, width_pt - sum(widths) - LEGEND_GAP_PT * (len(cols) - 1))
-    xs, x = [], 0.0
-    for w in widths:
-        xs.append(x)
-        x += w + LEGEND_GAP_PT + (spare / (len(cols) - 1) if len(cols) > 1 else 0.0)
-    rows = max(sum(len(lines) for _, lines in items) for _, items in cols) if cols else 0
-    return {"cols": cols, "x": xs, "rows": rows}
+def line_width(line: Sequence[Sequence[Tuple[str, str, float]]]) -> float:
+    return (sum(w for grp in line for _, _, w in grp) + sum(ITEM_GAP * (len(grp) - 1) for grp in line)
+            + GROUP_GAP * (len(line) - 1))
 
 
-def draw_legend(page: fb.Page, y: float, lay: dict, lang: str) -> float:
-    fs = FS["small"]
-    h = f2.LEGEND_HEAD_H + LINE * lay["rows"]
-    ax = page.pt_axes(0.0, y, PAPER_W, h)
-    top = h * 72.0
-    for (head, items), cx in zip(lay["cols"], lay["x"]):
-        ax.text(cx, top - f2.LEGEND_HEAD_H * 72.0 * 0.45, head, ha="left", va="center", fontsize=fs,
-                fontweight=heading_weight(lang), color=style.INK)
-        i = 0
-        for key, lines in items:
-            yy = top - f2.LEGEND_HEAD_H * 72.0 - (i + 0.5) * LINE * 72.0
-            glyph(ax, key, cx, yy - (len(lines) - 1) * LINE * 36.0)
-            for j, line in enumerate(lines):
-                ax.text(cx + GLYPH_TEXT_PT, yy - j * LINE * 72.0, line, ha="left", va="center", fontsize=fs,
-                        color=style.INK)
-            i += len(lines)
+def legend_lines(fig, groups: Sequence[Sequence[Tuple[str, str]]], width_pt: float,
+                 fs: float = p2.MIN_FS) -> List[List[List[Tuple[str, str, float]]]]:
+    """``groups`` of (key, text) flowed into lines ``width_pt`` wide: a group joins the current line when it fits,
+    else starts the next one; a group wider than a line is split between its items.  Returns lines of groups of
+    (key, text, width in pt)."""
+    lines: List[list] = [[]]
+    for grp in groups:
+        items = [(k, t, GLYPH_W[k] + GLYPH_GAP + cd.text_width_pt(fig, t, fs)) for k, t in grp]
+        if lines[-1] and line_width(lines[-1] + [items]) > width_pt:
+            lines.append([])
+        part: list = []
+        for it in items:
+            if part and line_width(lines[-1] + [part + [it]]) > width_pt:
+                lines[-1].append(part)
+                lines.append([])
+                part = []
+            part.append(it)
+        lines[-1].append(part)
+    return [ln for ln in lines if ln]
+
+
+def legend_height(lines) -> float:
+    return LEGEND_LINE * len(lines) + 0.02
+
+
+def draw_legend(page: fb.Page, y: float, lines, fs: float = p2.MIN_FS) -> float:
+    """The legend lines, each centred on the page; returns the height (in)."""
+    h = legend_height(lines)
+    width_pt = (PAPER_W - EDGE) * 72.0
+    ax = page.pt_axes(0.0, y, PAPER_W - EDGE, h, zorder=3)
+    for i, line in enumerate(lines):
+        x = (width_pt - line_width(line)) / 2.0
+        yy = h * 72.0 - (i + 0.5) * LEGEND_LINE * 72.0 - 0.5
+        for g, grp in enumerate(line):
+            if g:
+                x += GROUP_GAP
+            for j, (key, text, w) in enumerate(grp):
+                x += ITEM_GAP if j else 0.0
+                glyph(ax, key, x, yy)
+                ax.text(x + GLYPH_W[key] + GLYPH_GAP, yy, text, ha="left", va="center", fontsize=fs, color=style.INK)
+                x += w
     return h
 
 
-def legend_groups(groups, drop: Sequence[str]) -> Tuple[Tuple[str, ...], ...]:
-    return tuple(tuple(k for k in grp if k not in drop) for grp in groups)
+def route_group(L: dict, stop: bool, offlevel: bool, radius: float) -> List[Tuple[str, str]]:
+    T = L["legend"]
+    out = [("route", T["route"]), ("ref", T["ref"])] + ([("offlevel", T["offlevel"])] if offlevel else [])
+    out += [("start", T["start"]), ("goal", T["goal"].format(r=radius))] + ([("stop", T["stop"])] if stop else [])
+    return out + [("num", T["num"])]
 
 
-def legend_for(fig, groups, L: dict, lang: str) -> dict:
-    names = [n for n, grp in zip(L["groups"], groups) if grp]
-    return legend_layout(fig, [g for g in groups if g], names, L["legend"], PAPER_W * 72.0, FS["small"],
-                         heading_weight(lang))
+def legend_groups_a(L: dict, stop: bool, offlevel: bool, radius: float) -> List[List[Tuple[str, str]]]:
+    T = L["legend"]
+    return [route_group(L, stop, offlevel, radius), [(k, T[k]) for k in ("pgoal", "path", "actions")],
+            [(k, T[k]) for k in ("hist", "past", "fut")]]
 
 
+def legend_groups_b(L: dict, stop: bool, offlevel: bool, radius: float, nomap: bool) -> List[List[Tuple[str, str]]]:
+    T = L["legend"]
+    return [route_group(L, stop, offlevel, radius), [(k, T[k]) for k in (("turns", "nomap") if nomap else ("turns",))],
+            [(k, T[k]) for k in ("hist", "past_b", "fut", "path_end")]]
+
+
+# --------------------------------------------------------------------------- #
+# Checks, captions, output
+# --------------------------------------------------------------------------- #
 def editable_text(fig) -> int:
     """Texts drawn with a stroke halo (route-map labels, scale bar) come out as outlines in the PDF / SVG; give them a
     small white box instead, so every text on the page stays text.  Returns how many were changed."""
@@ -386,52 +431,31 @@ def editable_text(fig) -> int:
     return n
 
 
-def key_rules(cases: Sequence[Tuple[str, Sequence]], lang: str) -> str:
-    """How the drawn key moments were chosen, from the branch each one took: per label, the branch most rows took,
-    then the rows that took another (named with theirs); a row with fewer than four calls with an affordance map
-    (branch "all_lt4") gets its own sentence; the numbering-vs-time note only when some row runs against time.
-    ``cases``: (panel letter, key moments drawn) per row.  "" when nothing is drawn."""
-    R, full = SHORT_RULES[lang], fb.KEY_RULES[lang]
-    by_label: Dict[str, Dict[str, List[str]]] = {}
-    lt4 = []
-    for letter, keys in cases:
-        if any(k.branch == "all_lt4" for k in keys):
-            text = (full["all_lt4_one"] if len(keys) == 1 else full["all_lt4"]).format(
-                n=len(keys), labels=", ".join(k.label for k in keys))
-            lt4.append(R["lt4"].format(case=f"({letter})", text=text[:1].lower() + text[1:] if lang == "en" else text))
-            continue
-        for k in keys:
-            by_label.setdefault(k.label, {}).setdefault(k.branch, []).append(f"({letter})")
-    parts = []
-    for label in sorted(by_label):
-        items = sorted(by_label[label].items(), key=lambda kv: -len(kv[1]))
-        text = R["rule"].format(label=label, rule=R.get(items[0][0], full.get(items[0][0], items[0][0])))
-        for branch, where in items[1:]:
-            text += R["where"].format(cases=R["cases"].join(where), label=label,
-                                      rule=R.get(branch, full.get(branch, branch)))
-        parts.append(text)
-    out = (R["join"].join(parts) + R["end"]) if parts else ""
-    out += "".join(lt4)
-    against_time = any(int(b.step) < int(a.step) for _, keys in cases for a in keys for b in keys
-                       if str(b.label) > str(a.label))
-    if parts and against_time:
-        out += R["order"]
-    return out.strip()
+def badge_circles(fig) -> List[Tuple[str, float, float, float]]:
+    """(text, x, y, radius) in pixels of every circled number on the page."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    out = []
+    for t in fig.findobj(Text):
+        patch = t.get_bbox_patch()
+        if t.get_visible() and patch is not None and isinstance(patch.get_boxstyle(), BoxStyle.Circle):
+            bb = patch.get_window_extent(renderer)
+            out.append((t.get_text(), (bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2, min(bb.width, bb.height) / 2))
+    return out
 
 
-def rows_text(heads: Sequence[dict], lang: str) -> str:
-    return ("; " if lang == "en" else "；").join(f"({h['letter']}) {h['name']}" for h in heads)
-
-
-def join_caption(parts: Sequence[str], lang: str) -> str:
-    """Caption sentences joined (a space between English sentences, none between Chinese ones)."""
-    text = (" " if lang == "en" else "").join(p.strip() for p in parts if p and p.strip())
-    return " ".join(text.split()) if lang == "en" else text
+def badge_overlaps(fig, tol_px: float = 0.5) -> List[str]:
+    """Pairs of circled numbers whose circles touch (a text-box test would miss two round badges)."""
+    c = badge_circles(fig)
+    return [f"{a[0]!r} x {b[0]!r}" for i, a in enumerate(c) for b in c[i + 1:]
+            if np.hypot(a[1] - b[1], a[2] - b[2]) < a[3] + b[3] - tol_px]
 
 
 def audit(fig, height: float, name: str) -> dict:
-    """Layout checks: texts outside the page, overlapping texts, leaders crossing texts, smallest font, aspect."""
+    """Layout checks: texts outside the page, overlapping texts or circled numbers, leaders crossing texts, smallest
+    font, aspect."""
     outside, overlaps, crossings = f2.texts_outside(fig), f2.text_overlaps(fig), f2.leader_crossings(fig)
+    overlaps += badge_overlaps(fig)
     min_fs = f2.min_font_size(fig)
     aspect = height / PAPER_W
     warnings = []
@@ -447,6 +471,49 @@ def audit(fig, height: float, name: str) -> dict:
         warnings.append(f"{name}: height / width {aspect:.3f} outside {ASPECT_RANGE}")
     return {"outside": len(outside), "overlaps": len(overlaps), "leader_crossings": len(crossings),
             "min_font_pt": round(min_fs, 2), "aspect": round(aspect, 3), "warnings": warnings}
+
+
+def moment_rules(cases: Sequence[Tuple[str, Sequence]], lang: str) -> str:
+    """One sentence on how the numbered key moments were chosen, true for every row: per number, the rule (branch)
+    most rows took, then each row that took another rule at some number (named with its own rules); a row with
+    fewer than four calls with an affordance map (branch "all_lt4": all of them are drawn) is named as such, and when
+    every row is one, the sentence says just that.  ``cases``: (panel letter, key moments in time order) per row.
+    "" when nothing is drawn."""
+    R = RULES[lang]
+    full = [(f"({letter})", [k.branch for k in keys]) for letter, keys in cases if keys]
+    if not full:
+        return ""
+    regular = [br for _, br in full if "all_lt4" not in br]
+    if not regular:
+        return R["all"] + R["end"]
+    n = max(len(br) for br in regular)
+
+    def rule(branch: str) -> str:
+        return R.get(branch, fb.KEY_RULES[lang].get(branch, branch))
+
+    def listed(items: List[str]) -> str:  # "A, B and C" (zh: "A、B和C")
+        return items[0] if len(items) == 1 else R["sep"].join(items[:-1]) + R["last"] + items[-1]
+    majority = []
+    for i in range(n):
+        seen = [br[i] for br in regular if len(br) > i]
+        majority.append(max(dict.fromkeys(seen), key=seen.count))  # most rows; the earliest row's on a tie
+    out = R["head"].format(r=f"1–{n}", rules=listed([rule(b_) for b_ in majority]))
+    for letter, br in full:
+        if "all_lt4" in br:
+            out += R["lt4_one" if len(br) == 1 else "lt4"].format(l=letter, n=len(br))
+            continue
+        diff = [(i, b_) for i, b_ in enumerate(br) if b_ != majority[i]]
+        if diff:  # en "2 is A and 3 B"; zh " 2 为A，3 为B"
+            bits = [(R["part"] if j == 0 else R["part_next"]).format(n=i + 1, rule=rule(b_))
+                    for j, (i, b_) in enumerate(diff)]
+            out += R["case"].format(l=letter, parts=listed(bits) if lang == "en" else "".join(bits))
+    return out + R["end"]
+
+
+def join_caption(parts: Sequence[str], lang: str) -> str:
+    """Caption sentences joined (a space between English sentences, none between Chinese ones)."""
+    text = (" " if lang == "en" else "").join(p.strip() for p in parts if p and p.strip())
+    return " ".join(text.split()) if lang == "en" else text
 
 
 def save(fig, stem: Path, lang: str, caption: str) -> List[str]:
@@ -467,169 +534,262 @@ def save(fig, stem: Path, lang: str, caption: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 # Figure A: route + key moments
 # --------------------------------------------------------------------------- #
-def key_width(n_keys: int, g: dict = FIG_A) -> float:
-    """Width (in) of a key-moment column: ``k_w_max``, narrower when more columns would leave the route map less
-    than ``route_w_min``."""
-    room = PAPER_W - EDGE - g["route_w_min"] - g["route_gap"] - (n_keys - 1) * g["k_gap"]
-    return min(g["k_w_max"], room / max(n_keys, 1))
-
-
-def moment_rows(w: float, captions: bool, ticks: bool, g: dict = FIG_A) -> Dict[str, float]:
-    """Top offset (in) of every part of a key-moment column; ``captions``: the strip caption rows (first row only),
-    ``ticks``: the bearing labels under the future strip (last row only)."""
+def moment_rows(k_w: float, g: dict = FIG_A) -> Dict[str, float]:
+    """Top offset (in) of every part of a key-moment column ``k_w`` wide: decision image, history strip, future
+    strip; "end" = its height."""
     y, out = 0.0, {}
-    cap = g["cap_h"] if captions else 0.0
-    for name, h in (("dec", w * 0.75), ("gap1", g["dec_gap"]), ("cap_hist", cap),
-                    ("hist", p2.strip_height(w, p2.HIST_ELEV)), ("gap2", 0.0 if captions else g["strip_gap"]),
-                    ("cap_fut", cap), ("fut", p2.strip_height(w, p2.FUT_ELEV)), ("ticks", g["ticks_h"] if ticks else 0.0)):
+    for name, h in (("dec", 0.75 * k_w), ("gap1", g["dec_gap"]), ("hist", p2.strip_height(k_w, p2.HIST_ELEV)),
+                    ("gap2", g["strip_gap"]), ("fut", p2.strip_height(k_w, g["fut_elev"]))):
         out[name] = y
         y += h
     out["end"] = y
     return out
 
 
-def drawn_image_marks(ks: bd.KeyStep) -> np.ndarray:
-    """(u, v) of the marks ``p2.draw_decision_image`` draws: every waypoint it keeps inside the image, and the pixel
-    goal when inside."""
+def solve_a(n_rows: int, n_cols: int, legend_h: float, g: dict = FIG_A) -> Tuple[float, float, float]:
+    """(column width, route-map width, page height): the column width that makes the page ``ASPECT`` x its width
+    tall, capped at ``k_w_max`` and where the route map would be narrower than ``route_w_min``."""
+    fixed = n_rows * g["head_h"] + (n_rows - 1) * g["row_gap"] + g["ticks_h"] + g["legend_gap"] + legend_h
+    c0 = moment_rows(0.0, g)["end"]
+    c1 = moment_rows(1.0, g)["end"] - c0  # the column height is linear in its width
+    room = PAPER_W - EDGE - g["route_gap"] - g["gutter"] - (n_cols - 1) * g["k_gap"]
+    k_w = ((ASPECT * PAPER_W - fixed) / n_rows - c0) / c1
+    k_w = max(min(k_w, g["k_w_max"], (room - g["route_w_min"]) / n_cols), 0.3)
+    return k_w, room - n_cols * k_w, fixed + n_rows * moment_rows(k_w, g)["end"]
+
+
+def drawn_image_marks(ks: bd.KeyStep) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """((u, v) of the System 1 waypoints ``p2.draw_decision_image`` draws inside the image, the pixel goal's (u, v)
+    when it is drawn, else None)."""
     img = ks.decision_rgb
     h, w = img.shape[:2]
     uv = np.asarray(ks.path_uv, dtype=np.float64).reshape(-1, 2)
-    out = []
     if len(uv):
         uv = uv[p2.subsample_path(len(uv))]
-        inside = (uv[:, 0] >= -0.5) & (uv[:, 0] <= w - 0.5) & (uv[:, 1] >= -0.5) & (uv[:, 1] <= h - 0.5)
-        out += list(uv[inside])
+        uv = uv[(uv[:, 0] >= -0.5) & (uv[:, 0] <= w - 0.5) & (uv[:, 1] >= -0.5) & (uv[:, 1] <= h - 0.5)]
     goal = ks.pixel_goal_uv
-    if goal is not None and bd.goal_inside(goal, img.shape):
-        out.append(np.asarray(goal, dtype=np.float64).reshape(2))
-    return np.asarray(out, dtype=np.float64).reshape(-1, 2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2) if goal is not None and bd.goal_inside(goal, img.shape) \
+        else None
+    return uv, goal
+
+
+CHIP_CORNERS = ("right", "left", "top")  # bottom right, bottom left, top right (top left: the number), preferred first
+CHIP_AIR_PT = 3.0  # a System 1 waypoint this close to the chips counts as under them
+GOAL_R_PT = p2.GOAL_MS / 2 + 0.85  # the pixel goal ring's outer radius with its white halo (``p2.goal_ring``)
+
+
+def chips_box(ks: bd.KeyStep, w: float, width_pt: float, corner: str, air_pt: float = 0.0,
+              g: dict = FIG_A) -> Tuple[float, float, float, float]:
+    """(u0, v0, u1, v1) in image pixels of the chips drawn in ``corner`` of a decision image ``w`` in wide (their
+    inset included), grown by ``air_pt``."""
+    h_img, w_img = ks.decision_rgb.shape[:2]
+    per = w_img / (w * 72.0)  # image pixels per point
+    bw, bh = (width_pt + g["chip_inset_pt"] + air_pt) * per, (g["chip_pt"] + g["chip_inset_pt"] + air_pt) * per
+    u0, u1 = (0.0, bw) if corner == "left" else (w_img - bw, float(w_img))
+    v0, v1 = (0.0, bh) if corner == "top" else (h_img - bh, float(h_img))
+    return u0 - 0.5, v0 - 0.5, u1 - 0.5, v1 - 0.5
+
+
+def _inside(pts: np.ndarray, box) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    return (pts[:, 0] >= box[0]) & (pts[:, 0] <= box[2]) & (pts[:, 1] >= box[1]) & (pts[:, 1] <= box[3])
 
 
 def chips_corner(ks: bd.KeyStep, w: float, width_pt: float, g: dict = FIG_A) -> str:
-    """The bottom corner of the decision image for the executed-action chips: the right one, unless a drawn mark
-    (pixel goal or System 1 waypoint, ``drawn_image_marks``) falls under the chips there and none under the left."""
-    h_img, w_img = ks.decision_rgb.shape[:2]
-    per = w_img / (w * 72.0)  # image pixels per point
-    box_w, box_h = (width_pt + 2 * g["chip_inset_pt"]) * per, (g["chip_pt"] + 2 * g["chip_inset_pt"]) * per
-    pts = drawn_image_marks(ks)
-    if not len(pts):
-        return "right"
-    low = pts[:, 1] >= h_img - box_h - 6 * per
-    right = int(np.sum(low & (pts[:, 0] >= w_img - box_w - 6 * per)))
-    left = int(np.sum(low & (pts[:, 0] <= box_w + 6 * per)))
-    return "left" if right and not left else "right"
+    """The corner of the decision image for the executed-action chips: never one whose chips would touch the pixel
+    goal's ring (``GOAL_R_PT`` + 1 pt of air); among the others the one with the fewest System 1 waypoints under the
+    chips (``CHIP_AIR_PT`` of air), bottom right, bottom left, top right in that order on a tie, so top right only
+    when both bottom corners would cover something.  (Chips narrower than half the image: a ring touches one corner's
+    chips at most, so a corner free of it always exists.)"""
+    path, goal = drawn_image_marks(ks)
+
+    def cost(corner):
+        ring = chips_box(ks, w, width_pt, corner, GOAL_R_PT + 1.0, g)
+        covers_goal = goal is not None and bool(_inside(goal, ring)[0])
+        return covers_goal, int(np.sum(_inside(path, chips_box(ks, w, width_pt, corner, CHIP_AIR_PT, g)))), \
+            CHIP_CORNERS.index(corner)
+    return min(CHIP_CORNERS, key=cost)
+
+
+def chips_width(ks: bd.KeyStep, g: dict = FIG_A) -> float:
+    acts = [int(a) for a in ks.executed_actions]
+    return sum(p2.chip_width(a, g["chip_pt"]) for a in acts) + 1.5 * max(len(acts) - 1, 0)
 
 
 def draw_chips(page: fb.Page, x: float, y: float, w: float, ks: bd.KeyStep, g: dict = FIG_A) -> str:
-    """The executed action chunk as chips in a bottom corner of the decision image (``chips_corner``)."""
-    size, inset = g["chip_pt"], g["chip_inset_pt"]
-    acts = [int(a) for a in ks.executed_actions]
-    width = sum(p2.chip_width(a, size) for a in acts) + 1.5 * max(len(acts) - 1, 0)
-    corner = chips_corner(ks, w, width)
+    """The executed action chunk as chips in a corner of the decision image (``chips_corner``); returns it."""
+    size, inset, width = g["chip_pt"], g["chip_inset_pt"], chips_width(ks, g)
+    corner = chips_corner(ks, w, width, g)
     kax = page.pt_axes(x, y, w, w * 0.75, zorder=4)
-    x0 = w * 72.0 - inset - width if corner == "right" else inset
-    p2.action_chips(kax, x0, inset + size / 2, acts, size=size)
+    x0 = inset if corner == "left" else w * 72.0 - inset - width
+    yc = w * 0.75 * 72.0 - inset - size / 2 if corner == "top" else inset + size / 2
+    p2.action_chips(kax, x0, yc, [int(a) for a in ks.executed_actions], size=size)
     return corner
 
 
-def draw_moment(page: fb.Page, x: float, y: float, w: float, ks: bd.KeyStep, L: dict, captions: bool,
-                ticks: bool, first_col: bool = False) -> dict:
-    """One key moment: decision image (badge + step in its top corner, executed actions in a bottom corner),
-    360° history strip (past frames 1, 4, 8 marked), 360° future strip.  ``captions``: the strips' caption rows
-    (first row), with their text in the first column only."""
-    rows = moment_rows(w, captions, ticks)
-    dax = page.ax(x, y + rows["dec"], w, w * 0.75)
-    p2.draw_decision_image(dax, ks, tag=L["step"].format(s=ks.step), badge=ks.label)
-    corner = draw_chips(page, x, y + rows["dec"], w, ks)
-    if captions and first_col:
-        for key in ("cap_hist", "cap_fut"):
-            page.text(x, y + rows[key] + FIG_A["cap_h"] * 0.5, L[key], ha="left", va="center", fontsize=p2.MIN_FS,
-                      color=style.INK_2)
-    bax = page.ax(x, y + rows["hist"], w, p2.strip_height(w, p2.HIST_ELEV))
-    info = p2.draw_history_strip(bax, ks, f2._ring_px(w, 340), f2._ring_px(w, 272), slots=tp.OVERVIEW_SLOTS)
-    cax = page.ax(x, y + rows["fut"], w, p2.strip_height(w, p2.FUT_ELEV))
-    p2.draw_future_strip(cax, ks, f2._ring_px(w, 272))
+def draw_moment(page: fb.Page, x: float, y: float, k_w: float, ks: bd.KeyStep, num: str, L: dict,
+                ticks: bool, g: dict = FIG_A) -> dict:
+    """One key moment: decision image (its number top left, executed actions in a free corner), 360° history strip
+    (past frames 1, 4, 8 marked), 360° future strip; ``ticks``: the bearing labels under the future strip."""
+    rows = moment_rows(k_w, g)
+    dax = page.ax(x, y + rows["dec"], k_w, 0.75 * k_w)
+    p2.draw_decision_image(dax, ks, badge=num)
+    circle_badges(dax, {num})
+    corner = draw_chips(page, x, y + rows["dec"], k_w, ks, g)
+    hax = page.ax(x, y + rows["hist"], k_w, p2.strip_height(k_w, p2.HIST_ELEV))
+    info = p2.draw_history_strip(hax, ks, f2._ring_px(k_w, 340), f2._ring_px(k_w, 272), slots=tp.OVERVIEW_SLOTS)
+    fax = page.ax(x, y + rows["fut"], k_w, p2.strip_height(k_w, g["fut_elev"]))
+    p2.draw_future_strip(fax, ks, f2._ring_px(k_w, 272), elev=g["fut_elev"])
     if ticks:
-        p2.strip_ticks(cax, L["axis"])
-    return {**info, "chips_corner": corner}
+        p2.strip_ticks(fax, L["axis"])
+    _, goal = drawn_image_marks(ks)
+    box = chips_box(ks, k_w, chips_width(ks, g), corner, GOAL_R_PT, g)  # the ring touching the chips counts
+    return {**info, "chips_corner": corner, "chips_cover_goal": goal is not None and bool(_inside(goal, box)[0])}
+
+
+def draw_head_a(page: fb.Page, y: float, b: bd.Bundle, letter: str, lang: str, L: dict, g: dict = FIG_A) -> None:
+    """"(a) Multi-room, multi-turn  Success, 0.2 m" on one line."""
+    ax = page.pt_axes(0.0, y, PAPER_W - EDGE, g["head_h"])
+    yy = g["head_h"] * 72.0 * 0.45
+    title, st = case_title(b, letter, L, lang), title_style(lang)
+    ax.text(0.0, yy, title, ha="left", va="center", **st)
+    xo = cd.text_width_pt(page.fig, title, st["fontsize"], fontweight=st["fontweight"]) + 6.0
+    ax.text(xo, yy, outcome_short(b, L), ha="left", va="center", fontsize=FS_BODY, color=style.INK_2)
 
 
 def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_root,
-               keys: Sequence[str] = DEFAULT_KEYS, name: str = "fig_a_key_moments") -> dict:
+               name: str = "fig_a_key_moments") -> dict:
     setup(lang)
     import matplotlib.pyplot as plt
 
     L = paper_labels(lang)
     g = FIG_A
-    n_k = len(keys)
-    k_w = key_width(n_k)
-    route_w = PAPER_W - EDGE - n_k * k_w - (n_k - 1) * g["k_gap"] - g["route_gap"]
-    x_k = route_w + g["route_gap"]
-    fig = plt.figure(figsize=(PAPER_W, 10.0))
-    heads = [row_head(fig, b, LETTERS[i], lang, L, PAPER_W) for i, b in enumerate(bundles)]
-    chosen = [fb.main_keys_of(b, keys) for b in bundles]
-    last = len(bundles) - 1
-    body = [moment_rows(k_w, captions=(i == 0), ticks=(i == last))["end"] for i in range(len(bundles))]
-    route_h = [bh - (g["ticks_h"] if i == last else 0.0) for i, bh in enumerate(body)]  # flush with the strips
-    row_h = [head_height(h, g) + bh for h, bh in zip(heads, body)]
-    stops = [p2.stop_shown(b.xz("route_xz"), b.xz("reference_path_xz"), b.goal_xz, float(b.goal_radius_m), route_w,
-                           rh) for b, rh in zip(bundles, route_h)]
-    groups = legend_groups(GROUPS_A, [] if any(stops) else ["stop"])
-    lay = legend_for(fig, groups, L, lang)
-    lh = f2.LEGEND_HEAD_H + LINE * lay["rows"]
-    height = sum(row_h) + g["row_gap"] * last + g["legend_gap"] + lh + 0.02
+    n = len(bundles)
+    fig = plt.figure(figsize=(PAPER_W, 6.0))
+    moments = [time_order(b.keys) for b in bundles]
+    nums = [time_numbers(b) for b in bundles]
+    n_cols = max([len(m) for m in moments] + [1])
+    topdowns = [fb.resolve_level(b, topdown_root) for b in bundles]
+    radius = float(bundles[0].goal_radius_m) if bundles else 3.0
+    offlevel = any(off_level_visible(b, td) for b, td in zip(bundles, topdowns))
+    legend_h = legend_height([0, 0])  # the legend's height sets the maps' size, whose stop squares set the legend
+    for _ in range(2):
+        k_w, route_w, height = solve_a(n, n_cols, legend_h)
+        route_h = moment_rows(k_w)["end"]
+        stops = [p2.stop_shown(b.xz("route_xz"), b.xz("reference_path_xz"), b.goal_xz, float(b.goal_radius_m),
+                               route_w, route_h) for b in bundles]
+        lines = legend_lines(fig, legend_groups_a(L, any(stops), offlevel, radius), (PAPER_W - EDGE) * 72.0)
+        legend_h = legend_height(lines)
+    k_w, route_w, height = solve_a(n, n_cols, legend_h)
+    route_h = moment_rows(k_w)["end"]
     fig.set_size_inches(PAPER_W, height)
     page = fb.Page(fig, PAPER_W, height)
+    x_cols = route_w + g["route_gap"] + g["gutter"]
+    rows = moment_rows(k_w)
     y = 0.0
-    checks, edge, pairs, stop_drawn, corners = [], 0, 0, [], []
-    for i, (b, head, ch) in enumerate(zip(bundles, heads, chosen)):
-        draw_head(page, y, head, lang)
-        yb = y + head_height(head, g)
-        rinfo = f2.draw_route(page, 0.0, yb, route_w, route_h[i], b, fb.resolve_level(b, topdown_root), L,
-                              labels=[k.label for k in ch])
+    checks, edge, pairs, corners, cover, stop_drawn = [], 0, 0, [], 0, []
+    for i, (b, ms, nm, td) in enumerate(zip(bundles, moments, nums, topdowns)):
+        draw_head_a(page, y, b, LETTERS[i], lang, L)
+        yb = y + g["head_h"]
+        rinfo = draw_route(page, 0.0, yb, route_w, route_h, b, td, nm, L)
         stop_drawn.append(rinfo["stop_drawn"])
-        for c, ks in enumerate(ch):
-            info = draw_moment(page, x_k + c * (k_w + g["k_gap"]), yb, k_w, ks, L, captions=(i == 0),
-                               ticks=(i == last), first_col=(c == 0))
+        for c, ks in enumerate(ms):
+            info = draw_moment(page, x_cols + c * (k_w + g["k_gap"]), yb, k_w, ks, nm[ks.label], L,
+                               ticks=(i == n - 1 and c == 0))
             edge += info["edge"]
-            pairs += info.get("pairs", 0)
+            pairs += info["pairs"]
             corners.append(info["chips_corner"])
-        checks.append({"ep_key": b.ep_key, "category": head["cat"], "keys": [(k.label, int(k.step)) for k in ch],
-                       "stop_drawn": rinfo["stop_drawn"], "start_label": rinfo["start_label"]})
-        y += row_h[i] + g["row_gap"]
-        if i < last:
-            rule(page, y - g["row_gap"] / 2)
-    y += g["legend_gap"] - g["row_gap"]
-    rule(page, y - g["legend_gap"] / 2)
-    draw_legend(page, y, lay, lang)
+            cover += int(info["chips_cover_goal"])
+        if i == 0:  # the strip rows named once, in the gutter left of the first column
+            gx = route_w + g["route_gap"] + g["gutter"] * 0.42
+            for key, text in zip(("hist", "fut"), L["rows"]):
+                h_strip = p2.strip_height(k_w, p2.HIST_ELEV if key == "hist" else g["fut_elev"])
+                row_name(page, gx, yb + rows[key] + h_strip / 2, text, lang)
+        checks.append({"ep_key": b.ep_key, "category": category_of(b),
+                       "moments": [(k.label, nm[k.label], int(k.step), k.branch) for k in ms],
+                       "stop_drawn": rinfo["stop_drawn"], "route_badges": rinfo["badges"]})
+        y = yb + route_h + g["row_gap"]
+    y += g["ticks_h"] - g["row_gap"] + g["legend_gap"]
+    draw_legend(page, y, lines)
     n_halo = editable_text(fig)
-    labels = sorted({k.label for ch in chosen for k in ch})
-    rules = key_rules([(LETTERS[i], ch) for i, ch in enumerate(chosen)], lang)
-    k3_elsewhere = CAPTION_K3_ELSEWHERE[lang] if "K3" not in labels and any(
-        any(k.label == "K3" for k in b.keys) for b in bundles) else ""
-    caption = join_caption([CAPTION_A[lang].format(n=len(bundles), rows=rows_text(heads, lang),
-                                                   keys=("、" if lang == "zh" else ", ").join(labels),
-                                                   marks=MARKS[lang].format(where=MARKS_WHERE[lang]["a"])),
-                            rules, k3_elsewhere, f2.CAPTION_EDGE[lang] if edge else "", CAPTION_TAIL[lang],
-                            CAPTION_SMOOTH["a"][lang].format(s=p2.SMOOTH_DEG)], lang)
+    rules = moment_rules([(LETTERS[i], ms) for i, ms in enumerate(moments)], lang)
+    caption = join_caption([CAPTION_A[lang].format(rules=rules, edge=CAPTION_EDGE[lang] if edge else "",
+                                                   s=p2.SMOOTH_DEG)], lang)
     res = audit(fig, height, f"{name} [{lang}]")
     if stop_drawn != stops:
         res["warnings"].append(f"{name} [{lang}]: end-of-rerun squares drawn {stop_drawn} but planned {stops}")
+    if cover:
+        res["warnings"].append(f"{name} [{lang}]: executed-action chips cover {cover} pixel goals")
     files = save(fig, Path(out_dir) / name, lang, caption)
-    return {"files": files, "size_in": (PAPER_W, round(height, 3)), **res, "checks": checks, "edge_marks": edge,
-            "strip_pair_lines": pairs, "chips_corners": corners, "halo_texts_boxed": n_halo,
-            "caption_chars": len(caption)}
+    return {"files": files, "size_in": (PAPER_W, round(height, 3)), **res, "checks": checks,
+            "k_w_in": round(k_w, 3), "route_in": (round(route_w, 3), round(route_h, 3)), "edge_marks": edge,
+            "strip_pair_lines": pairs, "chips_corners": corners, "chips_cover_goal": cover,
+            "legend_lines": len(lines), "halo_texts_boxed": n_halo, "caption_chars": len(caption)}
 
 
 # --------------------------------------------------------------------------- #
 # Figure B: route + online timeline (the steps before the first affordance map left out)
 # --------------------------------------------------------------------------- #
-def timeline_block_h(badges_h: float, first: bool, g: dict = FIG_B) -> float:
-    """Height of a row's timeline block below the head: (history title +) badges + history + gap + future + turns +
-    step ticks."""
-    title = g["hist_title"] if first else 0.0
-    gap = g["gap_first"] if first else g["gap"]
-    return f2.timeline_height(g["hist"], gap, g["fut"], badges_h, title) + g["ticks"]
+RUN_GAP_PT = 4.0  # extra air between two style runs of a heading (title, outcome, instruction)
+
+
+def head_parts(b: bd.Bundle, letter: str, lang: str, L: dict) -> List[Tuple[str, dict]]:
+    """A heading's style runs: title, outcome, instruction in quotes (italic)."""
+    return [(case_title(b, letter, L, lang), title_style(lang)),
+            (outcome_short(b, L), {"fontsize": FS_BODY, "color": style.INK_2}),
+            (L["instruction"].format(text=" ".join(b.instruction.split())),
+             {"fontsize": p2.MIN_FS, "fontstyle": "italic", "color": style.INK_2})]
+
+
+def _font_kw(st: dict) -> dict:
+    return {k: v for k, v in st.items() if k in ("fontweight", "fontstyle")}
+
+
+def head_lines(fig, parts: Sequence[Tuple[str, dict]], width_pt: float) -> List[List[Tuple[int, str]]]:
+    """A run-in heading greedy-wrapped on measured word widths (an italic word's ink overhang counted): lines of
+    (style run, text) pieces."""
+    space = {i: cd.text_width_pt(fig, "a a", st["fontsize"], **_font_kw(st))
+             - cd.text_width_pt(fig, "aa", st["fontsize"], **_font_kw(st)) for i, (_, st) in enumerate(parts)}
+    lines: List[List[Tuple[int, str]]] = [[]]
+    cur = 0.0
+    for i, (text, st) in enumerate(parts):
+        for word in text.split():
+            ww = cd.text_width_pt(fig, word, st["fontsize"], **_font_kw(st))
+            if st.get("fontstyle") == "italic":
+                ww = max(ww, f2.ink_extent_pt(word, st["fontsize"], fontstyle="italic")[1])
+            sep = (space[i] + (RUN_GAP_PT if lines[-1][-1][0] != i else 0.0)) if lines[-1] else 0.0
+            if lines[-1] and cur + sep + ww > width_pt - f2.INK_MARGIN_PT:
+                lines.append([])
+                cur, sep = 0.0, 0.0
+            if lines[-1] and lines[-1][-1][0] == i:
+                lines[-1][-1] = (i, lines[-1][-1][1] + " " + word)
+            else:
+                lines[-1].append((i, word))
+            cur += sep + ww
+    return lines
+
+
+def draw_head_b(page: fb.Page, y: float, parts: Sequence[Tuple[str, dict]], lines) -> None:
+    fig = page.fig
+    for j, line in enumerate(lines):
+        x = 0.0
+        for r, (i, text) in enumerate(line):
+            st = parts[i][1]
+            if r:
+                x += cd.text_width_pt(fig, "a a", st["fontsize"], **_font_kw(st)) - \
+                    cd.text_width_pt(fig, "aa", st["fontsize"], **_font_kw(st)) + RUN_GAP_PT
+            page.text(x / 72.0, y + LINE * (j + 0.5), text, ha="left", va="center", **st)
+            x += cd.text_width_pt(fig, text, st["fontsize"], **_font_kw(st))
+
+
+def number_keys(tl: tp.Timeline, nums: Dict[str, str]) -> List[Tuple[str, str, int]]:
+    """Rename the timeline's key moments to their numbers in time order (``time_numbers``; in memory only), so the
+    shared badge row draws them.  Returns (label, number, step) per key moment on the timeline, in time order."""
+    rows = tl.key_rows()
+    out = sorted(((str(lab), nums.get(str(lab), str(lab)), int(tl.a["step"][r])) for lab, r in rows.items()),
+                 key=lambda t: t[2])
+    tl.a = {**tl.a, "key_labels": np.asarray([nums.get(str(lab), str(lab)) for lab in tl.a["key_labels"]])}
+    return out
 
 
 def visible_nomap(tl: tp.Timeline) -> bool:
@@ -644,6 +804,42 @@ def cropped_nomap_steps(tl: tp.Timeline) -> int:
     return int(round(sum(max(0.0, min(s1, x0) - max(s0, w)) for kind, s0, s1 in tl.spans() if kind == "nomap")))
 
 
+def draw_timeline(page: fb.Page, x: float, y: float, w: float, hh: float, fh: float, badges_h: float,
+                  tl: tp.Timeline, L: dict, g: dict = FIG_B) -> dict:
+    """Numbered badges on the key hairlines, history panel, future panel, executed-turn track with the step axis."""
+    bax = page.pt_axes(x, y, w, badges_h, zorder=6)
+    hax = page.ax(x, y + badges_h, w, hh)
+    fax = page.ax(x, y + badges_h + hh + g["gap"], w, fh)
+    tax = page.ax(x, y + badges_h + hh + g["gap"] + fh + g["turn_gap"], w, g["turn"])
+    info = tp.draw_history_panel(hax, tl, L["y_hist"], slots=tp.OVERVIEW_SLOTS)
+    plan = tp.mark_plan(tl, hax, tp.OVERVIEW_SLOTS)
+    info.update(tp.draw_future_panel(fax, tl, L["y_fut"], plan=plan))
+    info["turns_drawn"] = tp.draw_turn_track(tax, tl, L["turns"])
+    tp.step_axis(tax, tl, L["x_steps"])
+    items = tp.key_badges(bax, hax, tl)
+    circle_badges(bax, {it["label"] for it in items})
+    info["badges"] = [(it["label"], round(it["x"], 1), it["level"]) for it in items]
+    return info
+
+
+def stacked_sentence(checks: Sequence[dict], lang: str) -> str:
+    """A long rerun's timeline stacks all eight past frames' marks mid-column, for one call in k (``tp.mark_plan``),
+    so "past frames 1, 4 and 8" is not what its row shows: the caption says which rows (``fig_v2``'s sentence);
+    "" when every row marks frames 1, 4, 8 on every call."""
+    rows = [i for i, c in enumerate(checks) if c.get("mode") == "stacked"]
+    if not rows:
+        return ""
+    k = max(int(checks[i].get("marker_stride") or 1) for i in rows)
+    return (" " if lang == "en" else "") + f2.stride_sentence(lang, k, cases=[f"({LETTERS[i]})" for i in rows])
+
+
+def panel_heights(fixed: float, n: int, g: dict = FIG_B) -> Tuple[float, float]:
+    """(history, future) panel heights (in) that make the page ``ASPECT`` x its width tall, within
+    [``panels_min``, ``panels_max``] per row."""
+    both = min(max((ASPECT * PAPER_W - fixed) / max(n, 1), g["panels_min"]), g["panels_max"])
+    return both * g["hist_frac"], both * (1.0 - g["hist_frac"])
+
+
 def make_fig_b(bundles: Sequence[bd.Bundle], timelines: Sequence[tp.Timeline], out_dir: Path, lang: str,
                topdown_root, name: str = "fig_b_online_timeline") -> dict:
     setup(lang)
@@ -651,66 +847,82 @@ def make_fig_b(bundles: Sequence[bd.Bundle], timelines: Sequence[tp.Timeline], o
 
     L = paper_labels(lang)
     g = FIG_B
-    fig = plt.figure(figsize=(PAPER_W, 10.0))
-    heads = [row_head(fig, b, LETTERS[i], lang, L, PAPER_W) for i, b in enumerate(bundles)]
-    ylab_w = max(cd.text_width_pt(fig, t, p2.MIN_FS) for t in list(L["y_hist"]) + list(L["y_fut"]) + [L["turns"]])
-    tl_x = g["route_w"] + max(g["ylab_min"], (ylab_w + 9.0) / 72.0)
+    n = len(bundles)
+    fig = plt.figure(figsize=(PAPER_W, 6.0))
+    tl_x = g["route_w"] + g["name_w"] + g["ylab"]
     tl_w = PAPER_W - tl_x - EDGE
-    badges = []
-    for tl in timelines:
+    nums = [time_numbers(b) for b in bundles]
+    moments = []
+    for tl, nm in zip(timelines, nums):
         tp.crop_warmup(tl)
         tl.compact148 = True
-        badges.append(tp.badges_height_in(tp.badge_levels(fig, tl, tl_w * 72.0), g["badges"]))
-    badges_h = max(badges)
-    blocks = [timeline_block_h(badges_h, first=(i == 0)) for i in range(len(bundles))]
-    row_h = [head_height(h, g) + bh for h, bh in zip(heads, blocks)]
-    route_hs = [bh - g["ticks"] for bh in blocks]
-    stops = [p2.stop_shown(b.xz("route_xz"), b.xz("reference_path_xz"), b.goal_xz, float(b.goal_radius_m),
-                           g["route_w"], rh) for b, rh in zip(bundles, route_hs)]
+        moments.append(number_keys(tl, nm))
+    badges_h = max([tp.badges_height_in(tp.badge_levels(fig, tl, tl_w * 72.0), g["badges"]) for tl in timelines]
+                   or [g["badges"]])
+    parts = [head_parts(b, LETTERS[i], lang, L) for i, b in enumerate(bundles)]
+    heads = [head_lines(fig, p, (PAPER_W - EDGE) * 72.0) for p in parts]
+    head_h = [LINE * len(h) + g["head_gap"] for h in heads]
+    topdowns = [fb.resolve_level(b, topdown_root) for b in bundles]
+    radius = float(bundles[0].goal_radius_m) if bundles else 3.0
+    offlevel = any(off_level_visible(b, td) for b, td in zip(bundles, topdowns))
     grey = any(visible_nomap(tl) for tl in timelines)
-    groups = legend_groups(GROUPS_B, ([] if any(stops) else ["stop"]) + ([] if grey else ["nomap"]))
-    lay = legend_for(fig, groups, L, lang)
-    lh = f2.LEGEND_HEAD_H + LINE * lay["rows"]
-    last = len(bundles) - 1
-    height = sum(row_h) + g["row_gap"] * last + g["legend_gap"] + lh + 0.02
+    fixed_row = badges_h + g["gap"] + g["turn_gap"] + g["turn"] + g["ticks"]
+    fixed0 = g["top_pad"] + sum(head_h) + n * fixed_row + (n - 1) * g["row_gap"] + g["legend_gap"]
+    legend_h = legend_height([0, 0])  # two passes, as figure A
+    for _ in range(2):
+        hh, fh = panel_heights(fixed0 + legend_h, n)
+        route_h = fixed_row - g["ticks"] + hh + fh
+        stops = [p2.stop_shown(b.xz("route_xz"), b.xz("reference_path_xz"), b.goal_xz, float(b.goal_radius_m),
+                               g["route_w"], route_h) for b in bundles]
+        lines = legend_lines(fig, legend_groups_b(L, any(stops), offlevel, radius, grey), (PAPER_W - EDGE) * 72.0)
+        legend_h = legend_height(lines)
+    fixed = fixed0 + legend_h
+    hh, fh = panel_heights(fixed, n)
+    route_h = fixed_row - g["ticks"] + hh + fh
+    height = fixed + n * (hh + fh)
     fig.set_size_inches(PAPER_W, height)
     page = fb.Page(fig, PAPER_W, height)
-    y = 0.0
+    y = g["top_pad"]
     checks, stop_drawn = [], []
-    for i, (b, tl, head, route_h) in enumerate(zip(bundles, timelines, heads, route_hs)):
-        first = i == 0
-        draw_head(page, y, head, lang)
-        yb = y + head_height(head, g)
-        info = f2.draw_timeline(page, tl_x, yb, tl_w, g["hist"], g["gap_first"] if first else g["gap"], g["fut"],
-                                tl, L, badges_h=badges_h, fut_title=first, warmup_label=False,
-                                title_h=g["hist_title"] if first else 0.0, slots=tp.OVERVIEW_SLOTS)
-        info.pop("badges", None)
-        rinfo = f2.draw_route(page, 0.0, yb, g["route_w"], route_h, b, fb.resolve_level(b, topdown_root), L)
+    for i, (b, tl, nm, td) in enumerate(zip(bundles, timelines, nums, topdowns)):
+        draw_head_b(page, y, parts[i], heads[i])
+        yb = y + head_h[i]
+        info = draw_timeline(page, tl_x, yb, tl_w, hh, fh, badges_h, tl, L)
+        rinfo = draw_route(page, 0.0, yb, g["route_w"], route_h, b, td, nm, L)
         stop_drawn.append(rinfo["stop_drawn"])
-        checks.append({"ep_key": b.ep_key, "category": head["cat"], "x0_step": float(tl.x0),
+        if i == 0:  # the panels named once, 3 pt left of the widest tick label, clear of the route map
+            ticks_pt = tp.TICK_LEN + tp.TICK_PAD + max(cd.text_width_pt(fig, t, p2.MIN_FS) for t in
+                                                       list(L["y_hist"]) + list(L["y_fut"]) + [L["turns"]])
+            name_pt = max(cd.text_width_pt(fig, c, p2.MIN_FS) for c in "".join(L["rows"])) if lang == "zh" \
+                else p2.MIN_FS  # the stacked characters' width / the rotated line's height
+            gx = max(tl_x - (ticks_pt + 3.0 + name_pt / 2) / 72.0, g["route_w"] + g["name_w"] * 0.46)
+            for yc, text in zip((yb + badges_h + hh / 2, yb + badges_h + hh + g["gap"] + fh / 2), L["rows"]):
+                row_name(page, gx, yc, text, lang)
+        checks.append({"ep_key": b.ep_key, "category": category_of(b), "x0_step": float(tl.x0),
                        "first_ready_step": int(np.min(tl.a["step"])) if tl.R else None,
                        "warmup_end": int(tl.warmup_end()), "cropped_nomap_steps": cropped_nomap_steps(tl),
-                       "stop_drawn": rinfo["stop_drawn"], "start_label": rinfo["start_label"], **info})
-        y += row_h[i] + g["row_gap"]
-        if i < last:
-            rule(page, y - g["row_gap"] / 2)
+                       "moments": [(lab, num, st, next((k.branch for k in b.keys if k.label == lab), None))
+                                   for lab, num, st in moments[i]],
+                       "stop_drawn": rinfo["stop_drawn"], "route_badges": rinfo["badges"],
+                       **{k: v for k, v in info.items() if k in ("mode", "n_pred", "n_gt", "path_ends", "turns_drawn",
+                                                                  "badges", "compressed_warmup", "marker_stride")}})
+        y = yb + route_h + g["ticks"] + g["row_gap"]
     y += g["legend_gap"] - g["row_gap"]
-    rule(page, y - g["legend_gap"] / 2)
-    draw_legend(page, y, lay, lang)
+    draw_legend(page, y, lines)
     n_halo = editable_text(fig)
-    drawn_keys = [[k for k in b.keys if k.label in tl.key_rows()] for b, tl in zip(bundles, timelines)]
-    labels = sorted({k.label for ks in drawn_keys for k in ks})
-    rules = key_rules([(LETTERS[i], ks) for i, ks in enumerate(drawn_keys)], lang)
-    keys_text = (f"{labels[0]}–{labels[-1]}" if len(labels) > 2 else ("、" if lang == "zh" else " and ").join(labels))
-    caption = join_caption([CAPTION_B[lang].format(n=len(bundles), rows=rows_text(heads, lang), keys=keys_text,
-                                                   marks=MARKS[lang].format(where=MARKS_WHERE[lang]["b"]),
-                                                   grey=CAPTION_GREY[lang] if grey else ""),
-                            rules, CAPTION_TAIL[lang], CAPTION_SMOOTH["b"][lang].format(s=tp.TL_SMOOTH_DEG)], lang)
+    rules = moment_rules([(LETTERS[i], time_order(b.keys)) for i, b in enumerate(bundles)], lang)
+    caption = join_caption([CAPTION_B[lang].format(grey=CAPTION_GREY[lang] if grey else "", rules=rules,
+                                                   s=tp.TL_SMOOTH_DEG, stacked=stacked_sentence(checks, lang))], lang)
     res = audit(fig, height, f"{name} [{lang}]")
     if stop_drawn != stops:
         res["warnings"].append(f"{name} [{lang}]: end-of-rerun squares drawn {stop_drawn} but planned {stops}")
+    for b, ms in zip(bundles, moments):  # the timeline's numbered key moments are the bundle's, in time order
+        want = [(k.label, time_numbers(b)[k.label], int(k.step)) for k in time_order(b.keys)]
+        if list(ms) != want:
+            res["warnings"].append(f"{name} [{lang}]: {b.ep_key} timeline key moments {ms} != bundle {want}")
     files = save(fig, Path(out_dir) / name, lang, caption)
     return {"files": files, "size_in": (PAPER_W, round(height, 3)), **res, "checks": checks,
+            "panels_in": (round(hh, 3), round(fh, 3)), "timeline_w_in": round(tl_w, 3), "legend_lines": len(lines),
             "halo_texts_boxed": n_halo, "caption_chars": len(caption)}
 
 
@@ -742,13 +954,6 @@ def pick(bundles: Sequence[bd.Bundle], wanted: Sequence[str]) -> Tuple[List[bd.B
     return out, warnings
 
 
-def check_keys(keys: Sequence[str]) -> List[str]:
-    keys = list(keys)
-    if not keys or len(set(keys)) != len(keys) or any(k not in KEY_LABELS for k in keys):
-        raise SystemExit(f"--keys {keys}: want 1-4 distinct labels from {KEY_LABELS}")
-    return sorted(keys)
-
-
 def code_hashes() -> Dict[str, Optional[str]]:
     here = Path(__file__).parent
     exp18 = here.parents[1] / "exp18" / "figures"
@@ -767,13 +972,11 @@ def main(argv=None) -> int:
     ap.add_argument("--lang", nargs="+", default=["en", "zh"], choices=sorted(LABELS))
     ap.add_argument("--fig-a", nargs="*", default=list(DEFAULT_A), help="rows of figure A (categories or ep_keys)")
     ap.add_argument("--fig-b", nargs="*", default=list(DEFAULT_B), help="rows of figure B (categories or ep_keys)")
-    ap.add_argument("--keys", nargs="+", default=list(DEFAULT_KEYS), help="key moments of figure A (1-4 of K1-K4)")
     args = ap.parse_args(argv)
     out_dir = Path(args.out_dir)
     if out_dir.resolve().name in ("figures", "figures_v2"):
         print("refusing to write into the v1 / v2 figures dir", file=sys.stderr)
         return 2
-    keys = check_keys(args.keys)
     bundles = [bd.load_bundle(p) for p in bd.find_bundles(args.records)]
     jobs = []
     if args.fig_a:
@@ -796,11 +999,11 @@ def main(argv=None) -> int:
                                        "record": f2._sha256(rec)}})
         entry = figures.get(kind) if figures.get(kind, {}).get("cases") == sources else None
         entry = entry or {"figure": kind, "cases": sources, "files": {}, "size_in": {}, "checks": {}, "warnings": {}}
-        entry["args"] = {"rows": [s["ep_key"] for s in sources], **({"keys": keys} if kind == "fig_a" else {})}
+        entry["args"] = {"rows": [s["ep_key"] for s in sources]}
         for lang in args.lang:
             warnings = list(pick_warnings)
             if kind == "fig_a":
-                res = make_fig_a(members, out_dir, lang, args.topdown_root, keys=keys)
+                res = make_fig_a(members, out_dir, lang, args.topdown_root)
                 warnings += [f"{b.ep_key}: {w}" for b in members for w in bundle_warnings(b)]
             else:
                 tls = [tp.load_timeline(tp.timeline_path_for(args.timelines, b.ep_key),
@@ -817,7 +1020,7 @@ def main(argv=None) -> int:
             for w in entry["warnings"][lang]:
                 print(f"  WARNING {w}", file=sys.stderr)
         figures[kind] = entry
-    manifest = {"schema": MANIFEST_SCHEMA, "paper_width_in": PAPER_W, "aspect_range": ASPECT_RANGE,
+    manifest = {"schema": MANIFEST_SCHEMA, "paper_width_in": PAPER_W, "aspect": ASPECT, "aspect_range": ASPECT_RANGE,
                 "code_sha256": code_hashes(), "layout": {"fig_a": FIG_A, "fig_b": FIG_B},
                 "figures": [figures[k] for k in ("fig_a", "fig_b") if k in figures]}
     out_dir.mkdir(parents=True, exist_ok=True)
