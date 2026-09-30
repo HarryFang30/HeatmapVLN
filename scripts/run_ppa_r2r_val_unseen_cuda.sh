@@ -9,7 +9,8 @@
 #   - any number of GPU slots.  Each slot runs one model server, one VO server and one
 #     Xvfb, and works through its share of the 8 shards one after another;
 #   - an optional per-shard episode cap for canaries.  Capped or partial runs print a
-#     summary instead of merging.
+#     summary instead of merging;
+#   - optional latency timing (PPA_EVAL_TIMING=1, docs/ops/deploy_rtx4090.md section 5).
 #
 # Meant to run inside the fjl-habitat container (paths below are container paths).
 # Example canary on GPU 4, 2 episodes from each of shards 0 and 1:
@@ -49,6 +50,10 @@ GPU_CSV="${PPA_EVAL_GPU_DEVICES:-0}"
 VO_GPU_CSV="${PPA_EVAL_VO_GPU_DEVICES:-$GPU_CSV}"
 SHARD_CSV="${PPA_EVAL_SHARDS:-0,1,2,3,4,5,6,7}"
 MAX_EPISODES="${PPA_EVAL_MAX_EPISODES_PER_SHARD:-}"
+# 1: servers and clients time every stage (src/utils/latency.py); each client writes
+# <shard output>/timing/*.jsonl and the run ends with a latency summary.  Stages
+# synchronise CUDA, so a timed run is slower; the actions are the same.
+TIMING="${PPA_EVAL_TIMING:-0}"
 if [[ -n "$MAX_EPISODES" ]]; then
   default_output="$ROOT/eval_runs/canary_seed${PROTOCOL_SEED}"
 else
@@ -140,6 +145,9 @@ NUM_SLOTS="${#GPUS[@]}"
 [[ "$(printf '%s\n' "${GPUS[@]}" | sort -u | wc -l | tr -d ' ')" -eq "$NUM_SLOTS" ]] || die "GPU IDs must be unique"
 [[ "$PROTOCOL_SEED" =~ ^[0-9]+$ ]] || die "PPA_EVAL_PROTOCOL_SEED must be a non-negative integer"
 [[ -z "$MAX_EPISODES" || "$MAX_EPISODES" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_MAX_EPISODES_PER_SHARD must be a positive integer"
+[[ "$TIMING" =~ ^[01]$ ]] || die "PPA_EVAL_TIMING must be 0 or 1"
+# Always set, so a value left in the calling shell cannot switch timing on or off.
+export HEATMAPVLN_TIMING="$TIMING"
 for gpu in "${GPUS[@]}" "${VO_GPUS[@]}"; do
   [[ "$gpu" =~ ^[0-9]+$ ]] || die "invalid GPU ID: $gpu"
 done
@@ -151,7 +159,9 @@ for shard in "${SHARDS[@]}"; do
 done
 
 mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
-echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all}"
+# Timing logs newer than this marker belong to this run (--resume keeps older ones).
+[[ "$TIMING" -eq 0 ]] || touch "$RUNTIME_DIR/timing_start"
+echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING"
 echo "[ppa-eval] output=$OUTPUT_ROOT"
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
@@ -292,6 +302,18 @@ if [[ "$failed" -ne 0 ]]; then
     tail -60 "$RUNTIME_DIR/logs/client_shard_0${shard}.log" >&2 2>/dev/null || true
   done
   die "an evaluation slot failed"
+fi
+
+if [[ "$TIMING" -eq 1 ]]; then
+  mapfile -t timing_files < <(find "$WORKERS_DIR" -path '*/timing/*.jsonl' -newer "$RUNTIME_DIR/timing_start" | sort)
+  if (( ${#timing_files[@]} > 0 )); then
+    "$PYTHON" "$REPO/scripts/tools/summarize_latency.py" "${timing_files[@]}" --output-dir "$RUNTIME_DIR/latency" \
+      >"$RUNTIME_DIR/logs/latency_summary.log" 2>&1 \
+      && echo "[ppa-eval] latency summary=$RUNTIME_DIR/latency/latency_summary.md" \
+      || echo "[ppa-eval] WARNING: latency summary failed; see $RUNTIME_DIR/logs/latency_summary.log" >&2
+  else
+    echo "[ppa-eval] WARNING: timing was on but this run wrote no timing log" >&2
+  fi
 fi
 
 if [[ -z "$MAX_EPISODES" && "${#SHARDS[@]}" -eq "$NUM_SHARDS" ]]; then

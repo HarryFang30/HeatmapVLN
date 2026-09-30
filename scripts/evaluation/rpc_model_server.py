@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import sys
+import threading
 from concurrent import futures
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,13 @@ from src.models.action.treatment_spec import (
     TrajectoryPostprocessConfig,
     build_treatment_spec,
 )
+from src.utils.latency import (
+    TIMING_ENV,
+    StageTimer,
+    cuda_memory_mib,
+    reset_cuda_peak,
+    timing_enabled,
+)
 from src.utils.trajectory_direction import (
     align_trajectory_endpoint_heading,
     view_pixel_target_angle_deg,
@@ -78,6 +86,18 @@ from src.vo.rpc_protocol import (
 )
 
 LOGGER = logging.getLogger("heatmapvln-rpc-server")
+
+# Opt-in latency timing (src/utils/latency.py; HEATMAPVLN_TIMING=1 or --timing).
+# The servicer opens one StageTimer per request and the runtime reads it from
+# this thread-local, so _plan_panoramic_native keeps its (payload, blobs)
+# signature (the EXP-19 trace wraps it).  Off, every stage below is a no-op.
+_TIMING_OFF = StageTimer(enabled=False)
+_REQUEST_TIMING = threading.local()
+
+
+def _request_timer() -> StageTimer:
+    return getattr(_REQUEST_TIMING, "timer", _TIMING_OFF)
+
 
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
@@ -632,10 +652,11 @@ def _trajectory_debug_summary(
 
 
 def _pil_from_blob(blob: vla_pb2.BinaryBlob, image_size: tuple[int, int] | None = None) -> Image.Image:
-    arr = decode_jpeg_to_rgb(blob.data)
-    image = Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    if image_size is not None and image.size != image_size:
-        image = image.resize(image_size)
+    with _request_timer().stage("request_decode"):
+        arr = decode_jpeg_to_rgb(blob.data)
+        image = Image.fromarray(arr.astype(np.uint8)).convert("RGB")
+        if image_size is not None and image.size != image_size:
+            image = image.resize(image_size)
     return image
 
 
@@ -1051,32 +1072,34 @@ class HeatmapVLNRuntime:
             Image.new("RGB", current_front.size, color=(0, 0, 0))
             for _ in range(fixed_slots - len(history_front))
         ]
-        encoded = self.processor.image_processor(
-            images=list(history_front) + padding + [current_front],
-            return_tensors="pt",
-        )
-        required = {"pixel_values", "image_grid_thw"}
-        if required - set(encoded):
-            raise RuntimeError(
-                f"PPA image processor omitted {sorted(required - set(encoded))}"
+        # Timed only past the warm-up return above: warm-up calls run no History Head.
+        with _request_timer().stage("ppa_history_memory"):
+            encoded = self.processor.image_processor(
+                images=list(history_front) + padding + [current_front],
+                return_tensors="pt",
             )
-        relative = np.asarray(metadata["history_rel_poses"], dtype=np.float32)
-        if relative.shape != (len(history_front), 4):
-            raise RuntimeError("PPA pose/RGB history count diverged after validation")
-        padded_relative = np.zeros((fixed_slots, 4), dtype=np.float32)
-        padded_relative[: len(history_front)] = relative
-        history_mask = torch.zeros((1, fixed_slots), dtype=torch.bool)
-        history_mask[:, : len(history_front)] = True
-        output = self.model._forward_frozen_single_view_heatmap(
-            inputs={
-                "pixel_values": encoded["pixel_values"],
-                "image_grid_thw": encoded["image_grid_thw"],
-            },
-            num_histories=[fixed_slots],
-            history_rel_poses=torch.from_numpy(padded_relative).unsqueeze(0),
-            explicit_history_mask=history_mask,
-            return_memory_tokens=True,
-        )
+            required = {"pixel_values", "image_grid_thw"}
+            if required - set(encoded):
+                raise RuntimeError(
+                    f"PPA image processor omitted {sorted(required - set(encoded))}"
+                )
+            relative = np.asarray(metadata["history_rel_poses"], dtype=np.float32)
+            if relative.shape != (len(history_front), 4):
+                raise RuntimeError("PPA pose/RGB history count diverged after validation")
+            padded_relative = np.zeros((fixed_slots, 4), dtype=np.float32)
+            padded_relative[: len(history_front)] = relative
+            history_mask = torch.zeros((1, fixed_slots), dtype=torch.bool)
+            history_mask[:, : len(history_front)] = True
+            output = self.model._forward_frozen_single_view_heatmap(
+                inputs={
+                    "pixel_values": encoded["pixel_values"],
+                    "image_grid_thw": encoded["image_grid_thw"],
+                },
+                num_histories=[fixed_slots],
+                history_rel_poses=torch.from_numpy(padded_relative).unsqueeze(0),
+                explicit_history_mask=history_mask,
+                return_memory_tokens=True,
+            )
         required_output = {
             "history_memory",
             "history_memory_mask",
@@ -1436,6 +1459,7 @@ class HeatmapVLNRuntime:
         return response
 
     def _plan_panoramic_native(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
+        timer = _request_timer()
         phase = str(payload.get("phase", "joint")).lower()
         if phase not in {"joint", "system2", "front_system1"}:
             raise ValueError(f"Unsupported panoramic RPC phase={phase!r}")
@@ -1533,37 +1557,38 @@ class HeatmapVLNRuntime:
             front_condition_text = structured_condition_text("front", requested_pixel)
 
         native_prompt_images: list[Image.Image] | None = None
-        if native_internnav_two_turn and phase != "front_system1":
-            # Byte-exact certified-native prompt. construct_input_stage2 is the
-            # TRAINING contract; against the frozen released System2 its "\n"
-            # separators and appended instruction period measurably change
-            # greedy decoding, so evaluation must use the replica construction.
-            messages, native_prompt_images = build_native_messages(
-                instruction,
-                [history["front"] for history in history_panoramas],
-                current_views["front"],
+        with timer.stage("system2_turn1_prep"):
+            if native_internnav_two_turn and phase != "front_system1":
+                # Byte-exact certified-native prompt. construct_input_stage2 is the
+                # TRAINING contract; against the frozen released System2 its "\n"
+                # separators and appended instruction period measurably change
+                # greedy decoding, so evaluation must use the replica construction.
+                messages, native_prompt_images = build_native_messages(
+                    instruction,
+                    [history["front"] for history in history_panoramas],
+                    current_views["front"],
+                )
+            else:
+                messages = construct_input(
+                    current_views=current_views,
+                    history_panoramas=history_panoramas,
+                    instruction=instruction,
+                    pixel_goal=requested_pixel if requested_pixel is not None else [0, 0],
+                    assistant_text=front_condition_text,
+                    internnav_protocol=internnav_protocol,
+                    structured_pano_output=structured_pano_output,
+                )
+            if phase != "front_system1":
+                messages = [m for m in messages if m["role"] != "assistant"]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=phase != "front_system1",
+                return_dict=True,
+                return_tensors="pt",
             )
-        else:
-            messages = construct_input(
-                current_views=current_views,
-                history_panoramas=history_panoramas,
-                instruction=instruction,
-                pixel_goal=requested_pixel if requested_pixel is not None else [0, 0],
-                assistant_text=front_condition_text,
-                internnav_protocol=internnav_protocol,
-                structured_pano_output=structured_pano_output,
-            )
-        if phase != "front_system1":
-            messages = [m for m in messages if m["role"] != "assistant"]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=phase != "front_system1",
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        _normalize_multimodal_inputs(inputs)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            _normalize_multimodal_inputs(inputs)
 
         prompt_len = inputs["input_ids"].shape[1]
         native_first_output = ""
@@ -1589,7 +1614,7 @@ class HeatmapVLNRuntime:
             output_ids = torch.cat([inputs["input_ids"], oracle_suffix], dim=1)
             llm_output = oracle_system2_text
         else:
-            with torch.no_grad():
+            with torch.no_grad(), timer.stage("system2_turn1_generate"):
                 output_ids = self.model.qwen2_5_vl.model.generate(
                     **inputs,
                     max_new_tokens=128,
@@ -1608,23 +1633,24 @@ class HeatmapVLNRuntime:
                         "native two-turn lookdown requested outside the "
                         "native prompt construction path"
                     )
-                messages, native_prompt_images = append_native_lookdown_turn(
-                    messages,
-                    native_prompt_images,
-                    llm_output,
-                    lookdown_vlm_img,
-                )
-                inputs = self.processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                )
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                _normalize_multimodal_inputs(inputs)
+                with timer.stage("system2_turn2_prep"):
+                    messages, native_prompt_images = append_native_lookdown_turn(
+                        messages,
+                        native_prompt_images,
+                        llm_output,
+                        lookdown_vlm_img,
+                    )
+                    inputs = self.processor.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        return_dict=True,
+                        return_tensors="pt",
+                    )
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    _normalize_multimodal_inputs(inputs)
                 prompt_len = inputs["input_ids"].shape[1]
-                with torch.no_grad():
+                with torch.no_grad(), timer.stage("system2_turn2_generate"):
                     output_ids = self.model.qwen2_5_vl.model.generate(
                         **inputs,
                         max_new_tokens=128,
@@ -1811,58 +1837,63 @@ class HeatmapVLNRuntime:
                     metadata=ppa_pose_metadata,
                 )
             with torch.no_grad():
-                traj_hs = self.model.qwen2_5_vl.generate_latents(
-                    output_ids=condition_output_ids,
-                    pixel_values=inputs.get("pixel_values"),
-                    image_grid_thw=inputs.get("image_grid_thw"),
-                    latent_queries=lq,
-                    attention_mask=inputs.get("attention_mask"),
-                    mm_token_type_ids=inputs.get("mm_token_type_ids"),
-                )
-                if self.pano_latent_adapter is not None:
-                    traj_hs = _maybe_apply_pano_latent_adapter(
-                        traj_hs,
-                        self.pano_latent_adapter,
-                        view_id=pano_goal_view,
-                        pixel_goal=pixel_goal,
-                        image_size=vlm_image_size,
-                        cond_projector=self.model.nextdit_action_head.cond_projector
-                        if self.model.nextdit_action_head is not None
-                        else None,
+                with timer.stage("system1_condition_latents"):
+                    traj_hs = self.model.qwen2_5_vl.generate_latents(
+                        output_ids=condition_output_ids,
+                        pixel_values=inputs.get("pixel_values"),
+                        image_grid_thw=inputs.get("image_grid_thw"),
+                        latent_queries=lq,
+                        attention_mask=inputs.get("attention_mask"),
+                        mm_token_type_ids=inputs.get("mm_token_type_ids"),
                     )
-                if self.ppa_online_amb3r and ppa_past_output is not None:
-                    plan_z0, plan_z, plan_diagnostics = (
-                        self.model.past_plan_action.form_plan(
+                    if self.pano_latent_adapter is not None:
+                        traj_hs = _maybe_apply_pano_latent_adapter(
                             traj_hs,
-                            frozen_cond_projector=(
-                                self.model.nextdit_action_head.cond_projector
-                            ),
-                            history_memory=ppa_past_output["history_memory"],
-                            history_memory_mask=ppa_past_output[
-                                "history_memory_mask"
-                            ],
-                            return_diagnostics=True,
+                            self.pano_latent_adapter,
+                            view_id=pano_goal_view,
+                            pixel_goal=pixel_goal,
+                            image_size=vlm_image_size,
+                            cond_projector=self.model.nextdit_action_head.cond_projector
+                            if self.model.nextdit_action_head is not None
+                            else None,
                         )
-                    )
-                    trajectory = (
-                        self.model.nextdit_action_head.get_trajectory_from_projected(
+                if self.ppa_online_amb3r and ppa_past_output is not None:
+                    with timer.stage("ppa_bridge"):
+                        plan_z0, plan_z, plan_diagnostics = (
+                            self.model.past_plan_action.form_plan(
+                                traj_hs,
+                                frozen_cond_projector=(
+                                    self.model.nextdit_action_head.cond_projector
+                                ),
+                                history_memory=ppa_past_output["history_memory"],
+                                history_memory_mask=ppa_past_output[
+                                    "history_memory_mask"
+                                ],
+                                return_diagnostics=True,
+                            )
+                        )
+                    with timer.stage("system1_nextdit_sampling"):
+                        trajectory = (
+                            self.model.nextdit_action_head.get_trajectory_from_projected(
+                                plan_z,
+                                traj_images=traj_images,
+                                generator=trajectory_generator,
+                            )
+                        )
+                    # Diagnostics only: the Future Head does not feed the actions.
+                    with timer.stage("future_heatmap_diagnostics"):
+                        future_output = self.model.past_plan_action.decode_future(
                             plan_z,
-                            traj_images=traj_images,
-                            generator=trajectory_generator,
+                            past_output=ppa_past_output,
+                            past_head=self.model.heatmap_vln,
+                            time_mask=None,
                         )
-                    )
-                    future_output = self.model.past_plan_action.decode_future(
-                        plan_z,
-                        past_output=ppa_past_output,
-                        past_head=self.model.heatmap_vln,
-                        time_mask=None,
-                    )
-                    future_confidence = future_output[
-                        "future_visibility_probability"
-                    ].detach().float()
-                    future_peak = future_output[
-                        "future_heatmaps_gated"
-                    ].detach().float().amax(dim=(-2, -1))
+                        future_confidence = future_output[
+                            "future_visibility_probability"
+                        ].detach().float()
+                        future_peak = future_output[
+                            "future_heatmaps_gated"
+                        ].detach().float().amax(dim=(-2, -1))
                     response.update(
                         {
                             "ppa_applied": True,
@@ -1893,20 +1924,22 @@ class HeatmapVLNRuntime:
                 elif self.ppa_online_amb3r:
                     # Deployment is native until AMB3R's first official map
                     # endpoint; no zero pose token is ever fabricated.
-                    trajectory = _trajectory_from_condition(
-                        self.model.nextdit_action_head,
-                        traj_hs,
-                        traj_images=traj_images,
-                        generator=trajectory_generator,
-                    )
+                    with timer.stage("system1_nextdit_sampling"):
+                        trajectory = _trajectory_from_condition(
+                            self.model.nextdit_action_head,
+                            traj_hs,
+                            traj_images=traj_images,
+                            generator=trajectory_generator,
+                        )
                     response["ppa_skip_reason"] = "amb3r_map_warmup"
                 elif self.ppa_stage0_action_arm == "disabled":
-                    trajectory = _trajectory_from_condition(
-                        self.model.nextdit_action_head,
-                        traj_hs,
-                        traj_images=traj_images,
-                        generator=trajectory_generator,
-                    )
+                    with timer.stage("system1_nextdit_sampling"):
+                        trajectory = _trajectory_from_condition(
+                            self.model.nextdit_action_head,
+                            traj_hs,
+                            traj_images=traj_images,
+                            generator=trajectory_generator,
+                        )
                 else:
                     # Baseline deliberately uses the original unprojected API.
                     # Treatment traverses cond_projector -> exact-zero bridge ->
@@ -1946,19 +1979,20 @@ class HeatmapVLNRuntime:
                         )
             treatment_spec = None
             if self.ppa_stage0_action_arm == "disabled":
-                local_actions = _finalize_local_actions(
-                    traj_to_actions(
-                        trajectory,
-                        num_sample_trajs=self.num_sample_trajs,
-                        action_scale=self.action_scale,
-                        trajectory_selection=trajectory_selection,
-                        trajectory_x_sign=trajectory_x_sign,
-                        target_heading_deg=target_heading_deg,
+                with timer.stage("trajectory_to_actions"):
+                    local_actions = _finalize_local_actions(
+                        traj_to_actions(
+                            trajectory,
+                            num_sample_trajs=self.num_sample_trajs,
+                            action_scale=self.action_scale,
+                            trajectory_selection=trajectory_selection,
+                            trajectory_x_sign=trajectory_x_sign,
+                            target_heading_deg=target_heading_deg,
+                        )
                     )
-                )
-                if local_actions and local_actions[0] == ActionCode.STOP:
-                    local_actions = [ActionCode.LEFT]
-                    response["anti_deadlock"] = True
+                    if local_actions and local_actions[0] == ActionCode.STOP:
+                        local_actions = [ActionCode.LEFT]
+                        response["anti_deadlock"] = True
             else:
                 postprocess = TrajectoryPostprocessConfig(
                     num_sample_trajs=int(self.num_sample_trajs),
@@ -2018,13 +2052,27 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
         self.started = int(torch.cuda.Event(enable_timing=False) is not None)
         self.requests_processed = 0
         self.model_version = runtime.model_version
+        self.timing = timing_enabled()
 
     def InferJSON(self, request: vla_pb2.JSONRequest, context) -> vla_pb2.JSONResponse:
+        # Off (the default): a disabled timer, every stage a no-op, the response unchanged.
+        timer = StageTimer(enabled=self.timing, device=self.runtime.device)
+        _REQUEST_TIMING.timer = timer
         try:
-            payload = json.loads(request.json_payload) if request.json_payload else {}
-            if request.method != "plan_panoramic":
-                raise ValueError(f"Unsupported method: {request.method}")
-            output = self.runtime.plan_panoramic(payload, request.blobs)
+            # handler_total ends before the response JSON is serialised.
+            with timer.stage("handler_total"):
+                if timer.enabled:
+                    reset_cuda_peak(self.runtime.device)
+                with timer.stage("request_decode"):
+                    payload = json.loads(request.json_payload) if request.json_payload else {}
+                if request.method != "plan_panoramic":
+                    raise ValueError(f"Unsupported method: {request.method}")
+                output = self.runtime.plan_panoramic(payload, request.blobs)
+            if timer.enabled:
+                output["timing_ms"] = timer.as_dict()
+                memory = cuda_memory_mib(self.runtime.device)
+                if memory is not None:
+                    output["cuda_memory_mib"] = memory
             self.requests_processed += 1
             return vla_pb2.JSONResponse(
                 ts=request.ts,
@@ -2036,6 +2084,8 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             context.set_details(str(exc))
             context.set_code(grpc.StatusCode.INTERNAL)
             return vla_pb2.JSONResponse(ts=request.ts, json_payload=json.dumps({"ok": False, "error": str(exc)}))
+        finally:
+            _REQUEST_TIMING.timer = _TIMING_OFF
 
     def HealthCheck(self, request: vla_pb2.HealthCheckRequest, context) -> vla_pb2.HealthCheckResponse:
         return vla_pb2.HealthCheckResponse(
@@ -2120,6 +2170,14 @@ def parse_args() -> argparse.Namespace:
         help="Also decode the native first turn (adapters off) on every ready call and record agreement.",
     )
     parser.add_argument("--cognition_max_new_tokens", type=int, default=96)
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help=(
+            f"Same as {TIMING_ENV}=1: add per-stage timing_ms and the request's CUDA "
+            "memory to every response (stages synchronise CUDA; actions unchanged)."
+        ),
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -2130,6 +2188,10 @@ def main() -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.timing:
+        os.environ[TIMING_ENV] = "1"
+    if timing_enabled():
+        LOGGER.info("Latency timing enabled: responses carry timing_ms")
     runtime = HeatmapVLNRuntime(args)
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=args.workers),

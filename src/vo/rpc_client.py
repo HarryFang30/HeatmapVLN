@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 import numpy as np
@@ -60,6 +61,7 @@ class OnlineVORPCBridge:
         *,
         jpeg_quality: int = 95,
         jpeg_encoder: Callable[..., bytes] | None = None,
+        timing: bool = False,
     ) -> None:
         self.client = client
         self.jpeg_quality = int(jpeg_quality)
@@ -67,6 +69,10 @@ class OnlineVORPCBridge:
             raise ValueError("AMB3R VO JPEG quality must be in [1,100]")
         self.jpeg_encoder = jpeg_encoder
         self.ledger = VOFrameLedger()
+        # Opt-in latency record: one entry per RPC (round trip, the server's
+        # timing_ms and cuda_memory_mib), drained by the caller.  Off, no clock is read.
+        self.timing = bool(timing)
+        self.timing_entries: list[dict[str, Any]] = []
 
     @property
     def session_id(self) -> str:
@@ -80,7 +86,10 @@ class OnlineVORPCBridge:
         payload: dict[str, Any],
         blobs: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        start = time.perf_counter() if self.timing else None
         result = self.client.infer_json(method, payload, blobs)
+        if start is not None:
+            rpc_ms = (time.perf_counter() - start) * 1000.0
         if result is None:
             raise RuntimeError(f"AMB3R VO RPC returned no response for {method}")
         response, response_blobs = result
@@ -90,7 +99,21 @@ class OnlineVORPCBridge:
             )
         if not isinstance(response, dict):
             raise TypeError(f"AMB3R VO RPC {method} response must be a JSON object")
+        if start is not None:
+            self.timing_entries.append(
+                {
+                    "method": method,
+                    "rpc_ms": round(rpc_ms, 3),
+                    "server_ms": response.get("timing_ms"),
+                    "server_cuda_mib": response.get("cuda_memory_mib"),
+                }
+            )
         return response
+
+    def drain_timing(self) -> list[dict[str, Any]]:
+        """Return and clear the RPC timing entries recorded since the last drain."""
+        entries, self.timing_entries = self.timing_entries, []
+        return entries
 
     def reset_episode(self, session_id: str, *, max_frames: int) -> None:
         response = self._infer(

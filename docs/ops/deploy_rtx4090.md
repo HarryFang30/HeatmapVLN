@@ -70,3 +70,85 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_GPU_DE
 - **`/workspace/habitat-sim` 不能删也不能挪。** site-packages 里的 `habitat_sim/_ext/*.so` 的 RUNPATH 写死为 `/workspace/habitat-sim/build/lib.linux-x86_64-cpython-311/habitat_sim/_ext`，Corrade 等库要从那里加载。真正运行时要用的只有这个 319 MB 的目录；其余的 `.git`（1.6 GB）和编译中间文件（约 2.7 GB）理论上能删，但没有验证过。
 - habitat-sim 是 GLX 版，必须有 X 服务。启动脚本为每张卡起一个 Xvfb，并按 TCP 探测就绪。NVIDIA GLX 渲染在这台机器上与 numba 冲突（`troubleshooting-guide.md` §12），所以默认走 llvmpipe。
 - 在容器里用 `pkill -f <模式>` 时，模式会匹配到 `bash -c` 自己那一行，把自己的 shell 杀掉。停进程请用 PID。
+
+## 5. 实时性测试（逐阶段计时）
+
+默认关闭。关闭时服务端和客户端不读时钟、不做 CUDA 同步、响应不多任何字段、不写任何文件，请求和动作与部署逐字节相同。
+
+打开：启动脚本加 `PPA_EVAL_TIMING=1`，脚本给模型服务端、里程计服务端和客户端都导出 `HEATMAPVLN_TIMING=1`（单独起服务端时也可以加 `--timing`）。例（模型 4 号卡、里程计 5 号卡，分片 0、1 各 2 集，输出放新目录）：
+
+```bash
+docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_TIMING=1 PPA_EVAL_GPU_DEVICES=4 PPA_EVAL_VO_GPU_DEVICES=5 PPA_EVAL_SHARDS=0,1 PPA_EVAL_MAX_EPISODES_PER_SHARD=2 PPA_EVAL_OUTPUT_ROOT=/workspace/eval_runs/latency_seed42 bash scripts/run_ppa_r2r_val_unseen_cuda.sh'
+```
+
+- 服务端每个阶段前后各做一次 `torch.cuda.synchronize`（同步的是服务端自己用的那张卡：模型的 `--gpu_id`、里程计的 `--device`），量到的是 GPU 真正算完的时间。同步只挪了主机等待的位置，不改任何张量，所以动作应当不变，但整体会慢一点。
+- **"动作不变"要先在 GPU 上实测一次**：用 09-28 金丝雀的配置（4、5 号卡两个槽位，分片 0、1 各 2 集，种子 42）加 `PPA_EVAL_TIMING=1` 跑到新目录，用 `scripts/exp19/select_cases.py` 的 `parse_client_log` 读两边的客户端日志、`scripts/exp19/build_records.py` 的 `compare_calls` 逐调用比：每次调用的步号、`kind`、慢系统原文、动作块都相同，§3 表里的步数、注入生效次数、SR/SPL/NE 也相同，才算通过。
+  - 通过：带计时的全量评测的 SR/SPL 可以直接当基线用，全量基线和延迟表一次跑出来。
+  - 不通过：计时改变了行为，延迟数字一个都不报，SR/SPL 只认不计时的跑法，先查原因。
+- 模型和里程计默认同卡，会互相抢 GPU。要干净的数字，用 `PPA_EVAL_VO_GPU_DEVICES` 把里程计放到另一张卡（上例）。
+- 渲染走 llvmpipe（CPU），env.step 和全景采集都慢。这是模拟器开销，汇总里单列，**不算模型延迟**。
+- 换一个输出目录再跑：`--resume` 会跳过已跑的集，目录里旧的计时日志也还在。启动脚本只汇总本次运行新写的文件。
+- 全量 8 分片带计时也能正常合并：锁定计划的 `merge_shards.py` 只读每个分片的 `progress.json` 和 `result.json`（`tools/merge_shards.py:133-134`），不遍历分片目录，多出的 `timing/` 不影响它。
+
+### 输出
+
+- 客户端：`<输出目录>/workers/shard_0X/timing/client_<时间>_<pid>.jsonl`，每次规划调用一行（schema `heatmapvln-latency-v1`）。一行管一次调用加上它返回的动作块执行完为止，在下一次调用开始或该集结束时写出。
+- 两个服务端的响应都多两个字段（客户端的校验不拒收多出的键）：
+  - `timing_ms`：下表各阶段，毫秒。
+  - `cuda_memory_mib`（只在 CUDA 上有）：`peak_allocated`（本进程张量）和 `peak_reserved`（本进程缓存分配器占的池），都是本次请求内的峰值，每个请求前清零；`device_used` 是请求结束时整张卡已用的显存，含所有进程和 CUDA context。
+  - 客户端日志里模型的记在 `model_cuda_mib`，里程计的记在 `vo_rpc` 每一项的 `server_cuda_mib`。
+- **报部署显存看 `device_used`。** `peak_allocated` 只是 PyTorch 张量，比实际占用小很多：不含缓存池、CUDA context，也不含另一个服务端。
+  - 模型和里程计同卡时，`device_used` 就是两者合计（§2 实测空载约 36 GB）。
+  - 分卡时把两张卡的 `device_used` 相加。
+  - 卡上有别人的进程时，`device_used` 会把它们也算进去，这时改用两个服务端各自的 `peak_reserved` 相加，再每个进程加几百 MB 的 context。
+- 跑完自动汇总到 `<输出目录>/runtime/<时间戳>/latency/latency_summary.{md,json}`。手动汇总（目录或文件都行，同一次调用出现两次时取文件顺序里最后一行）：
+
+```bash
+python scripts/tools/summarize_latency.py <输出目录>/workers --output-dir <汇总目录>
+```
+
+### 各阶段
+
+模型服务端（`scripts/evaluation/rpc_model_server.py`，`timing_ms` 的键）：
+
+| 键 | 内容 |
+|---|---|
+| `request_decode` | JSON 解析 + 每张 JPEG 的解码和缩放 |
+| `system2_turn1_prep` | 慢系统第一轮：拼提示、chat template、分词和图像预处理、搬上 GPU |
+| `system2_turn1_generate` | 第一轮贪心解码（最多 128 个新 token） |
+| `system2_turn2_prep` / `system2_turn2_generate` | 第一轮答 `↓` 时的第二轮（加俯视图） |
+| `ppa_history_memory` | 历史头：历史帧 + 当前帧 → 记忆 token（只在位姿就绪时） |
+| `system1_condition_latents` | 带 latent query 的前向，得到快系统条件 |
+| `ppa_bridge` | cond_projector + 桥，得到修正后的条件（只在位姿就绪时） |
+| `system1_nextdit_sampling` | NextDiT 采样（32 条 × 10 步） |
+| `trajectory_to_actions` | 平均轨迹 → 离散动作（含 STOP→LEFT） |
+| `future_heatmap_diagnostics` | 未来头，只做诊断，不影响动作（只在位姿就绪时） |
+| `handler_total` | 整个请求，到序列化响应之前 |
+
+里程计服务端（`scripts/amb3r_vo/rpc_amb3r_vo_server.py`）：`jpeg_decode`；`ingest`（只存帧）、`ingest_map_init`（第 20 帧建图）或 `ingest_map_update`（每 8 帧扩图）；`query` 或 `query_map_update`（查询前先把没建图的尾巴建上）；`total`。
+
+客户端（`scripts/evaluation/r2r_val_unseen.py`，墙钟）：
+- `plan_ms`（每次调用）：`pano_capture`、`vo_query`、`lookdown_capture`、`model_encode`（请求里全部 JPEG 的编码）、`model_rpc`（模型 RPC 往返）。
+- `step_ms`（动作块执行期间，每次一个值）：`env_step`（每个动作一次）、`pano_capture`（排队动作前的历史全景）、`vo_ingest`（每个新帧）。
+- `vo_rpc`：同一时段里每次里程计 RPC 的往返和服务端 `timing_ms`；`cycle_wall_ms`：整段墙钟，含没计时的客户端开销。
+
+### 汇总怎么读
+
+按每次调用在模型服务端实际走的路径分组（看响应的 `kind` 和 `ppa_applied`），再报一个合计。只看 `pose_ready` 分组是错的：慢系统直接出箭头或停止的调用根本不跑快系统。09-28 金丝雀里，就绪调用有 29%、预热调用有 50% 是这种。
+
+| 组 | 条件 | 跑了什么 |
+|---|---|---|
+| `ppa` | `kind` 为 `trajectory` 且 `ppa_applied` | 慢系统 + 历史头 + 桥 + 快系统 + 未来头 |
+| `native_system1` | `kind` 为 `trajectory`，没注入 | 慢系统 + 原生快系统（部署里就是前 20 帧的建图预热） |
+| `system2_only` | 其他 `kind`（`native_actions`、`stop`、`fallback_stop`） | 只有慢系统 |
+| `all` | 全部 | 用来摊到每个动作 |
+
+- **相对 native 的额外开销**：直接读 `ppa` 组的 `ppa_history_memory` + `ppa_bridge`，再加里程计一栏。`future_heatmap_diagnostics` 只做诊断、不影响动作，单列说明。
+- 不要用 `ppa` 组减 `native_system1` 组：预热调用集中在每集开头，慢系统提示里的历史帧更少，两组的慢系统耗时本来就不同。
+
+每组有：
+
+- **每次调用**：`model`（编码 + 模型往返）、`vo`（位姿查询 + 这段里所有帧的写入）、`simulator`（全景、俯视图、env.step）、三者之和 `timed_total`、实测 `cycle_wall` 和差值 `untimed`；`plan_latency` 是从决定重规划到拿到动作的关键路径（只算调用侧各阶段）；`model_server` 是服务端 `handler_total`，`model_rpc_overhead` 是往返减去它（传输和序列化）。
+- **每个动作（摊销）**：`model`、`vo`、`simulator`、`timed_total`、`cycle_wall` 各自除以这次调用的动作块实际执行的动作数（没执行动作的调用不计）；`pooled` = 所有调用之和 / 总动作数。
+- 模型服务端、里程计服务端、客户端的逐阶段统计。
+- 显存：两个服务端的 `peak_allocated`、`peak_reserved`、`device_used`，每项给 n / 中位数 / 最大值。报最大值。

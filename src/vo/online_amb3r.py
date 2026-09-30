@@ -298,6 +298,11 @@ class OnlineAMB3RSession:
     def frame_count(self) -> int:
         return len(self._frames)
 
+    @property
+    def trajectory_revision(self) -> int:
+        """Bumped whenever the map is initialized or extended (read by RPC timing)."""
+        return self._trajectory_revision
+
     def reset(self, session_id: str, *, max_frames: int) -> dict[str, Any]:
         identifier = str(session_id).strip()
         if not identifier:

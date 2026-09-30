@@ -260,6 +260,7 @@ gym.spaces.Discrete = _PatchedDiscrete
 # ═══════════════════════════════════════════════════════════════════════
 
 import argparse
+import contextlib
 import copy
 import gzip
 import hashlib
@@ -269,6 +270,7 @@ import json
 import math
 import random
 import re
+import time
 from collections import OrderedDict
 from enum import IntEnum
 
@@ -336,6 +338,7 @@ from scripts.evaluation.rpc_protocol import (
     validate_rpc_progress_sampling_contract,
     validate_rpc_sampling_metadata,
 )
+from src.utils.latency import timing_enabled
 from src.utils.trajectory_direction import pano_recenter_turn
 # Load the two pure NumPy VO client modules without executing ``src.vo``'s
 # package initializer.  The Habitat/vlnce environment intentionally does not
@@ -3315,6 +3318,112 @@ def _run_eval_panoramic_vlm(
     print(f"Results saved to {os.path.join(output_path, 'result.json')}")
 
 
+class PlanCallTimingLog:
+    """Opt-in client latency log (HEATMAPVLN_TIMING=1): one JSON line per plan call.
+
+    A line covers one model plan call and the execution of the action chunk it
+    returned, so it is written when the next plan call starts or the episode
+    ends (the open line of a crashed episode is lost).  ``plan_ms`` sums the
+    call's own stages: pano_capture, vo_query, lookdown_capture, model_encode
+    (JPEG blobs) and model_rpc (infer_json round trip).  ``step_ms`` lists one
+    value per run of a stage while the chunk executed: env_step (one per
+    executed action), pano_capture (the history panorama before a queued
+    action) and vo_ingest (every new frame up to the one the next plan call
+    starts from; the episode's first frame goes with its first call).
+    ``vo_rpc`` holds the VO round trips and server timing_ms / cuda_memory_mib
+    of that window, ``model_server_ms`` / ``model_cuda_mib`` the model
+    server's timing_ms / cuda_memory_mib, and ``cycle_wall_ms`` the whole
+    window including untimed client work.  Client times are wall
+    clock: Habitat renders on the CPU here, so there is no device work to wait for.
+    """
+
+    SCHEMA = "heatmapvln-latency-v1"
+
+    def __init__(self, path: Path, vo_bridge: Any = None) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.vo_bridge = vo_bridge
+        self._episode: dict[str, Any] = {}
+        self._call: dict[str, Any] | None = None
+        self._in_plan = False
+        self._steps: dict[str, list[float]] = {}
+        self._vo_rpc: list[dict[str, Any]] = []
+        self._window_start = time.perf_counter()
+
+    def begin_episode(self, scene_id: str, episode_id: int) -> None:
+        self._episode = {
+            "episode": f"{scene_id}/{int(episode_id):04d}",
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+        }
+        self._call, self._in_plan = None, False
+        self._steps, self._vo_rpc = {}, []
+        if self.vo_bridge is not None:
+            self.vo_bridge.drain_timing()  # the reset_episode RPC
+        self._window_start = time.perf_counter()
+
+    @contextlib.contextmanager
+    def stage(self, name: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            ms = (time.perf_counter() - start) * 1000.0
+            vo_rpc = self.vo_bridge.drain_timing() if self.vo_bridge is not None else []
+            self._vo_rpc.extend(vo_rpc)
+            if self._in_plan:
+                plan = self._call["plan_ms"]
+                plan[name] = round(plan.get(name, 0.0) + ms, 3)
+            elif name != "vo_ingest" or vo_rpc:  # a repeated capture step makes no VO call
+                self._steps.setdefault(name, []).append(round(ms, 3))
+
+    def begin_call(self, call_index: int, step_id: int) -> None:
+        self._close(step_id)
+        self._call = {"call_index": int(call_index), "step": int(step_id), "plan_ms": {}}
+        self._in_plan = True
+
+    def end_plan(self, response: dict[str, Any], pose_ready: bool | None) -> None:
+        self._call.update(
+            {
+                "kind": response.get("kind"),
+                "pose_ready": pose_ready,
+                "ppa_applied": response.get("ppa_applied"),
+                "actions_returned": len(response.get("actions") or []),
+                "model_server_ms": response.get("timing_ms"),
+                "model_cuda_mib": response.get("cuda_memory_mib"),
+            }
+        )
+        self._in_plan = False
+
+    def end_episode(self, step_id: int) -> None:
+        self._close(step_id)
+        self._steps, self._vo_rpc = {}, []
+
+    def _close(self, step_id: int) -> None:
+        if self._call is None:
+            return  # no plan call yet: these steps join the first call's line
+        now = time.perf_counter()
+        record = {
+            "schema": self.SCHEMA,
+            **self._episode,
+            **self._call,
+            "actions_executed": int(step_id) - self._call["step"],
+            "cycle_wall_ms": round((now - self._window_start) * 1000.0, 3),
+            "step_ms": self._steps,
+            "vo_rpc": self._vo_rpc,
+        }
+        with open(self.path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        self._call, self._in_plan = None, False
+        self._steps, self._vo_rpc = {}, []
+        self._window_start = now
+
+
+def _timed(timing_log: PlanCallTimingLog | None, name: str):
+    """A client stage in the opt-in latency log; a no-op context when timing is off."""
+    return contextlib.nullcontext() if timing_log is None else timing_log.stage(name)
+
+
 def _rpc_blob_from_pil(name: str, image: Image.Image, quality: int) -> dict:
     from vla_rpc.core.image import encode_rgb_to_jpeg
 
@@ -3534,14 +3643,16 @@ def _rpc_plan_panoramic(
     model_pose_fields: dict[str, Any] | None = None,
     current_capture_step: int | None = None,
     history_capture_steps: list[int] | None = None,
+    timing_log: PlanCallTimingLog | None = None,
 ) -> dict:
     blobs = []
-    for view in ("front", "right", "back", "left"):
-        blobs.append(_rpc_blob_from_pil(f"current/{view}", current_views[view], jpeg_quality))
-    for idx, hist in enumerate(history_panoramas):
+    with _timed(timing_log, "model_encode"):
         for view in ("front", "right", "back", "left"):
-            blobs.append(_rpc_blob_from_pil(f"history/{idx}/{view}", hist[view], jpeg_quality))
-    blobs.append(_rpc_blob_from_pil("lookdown", lookdown_img, jpeg_quality))
+            blobs.append(_rpc_blob_from_pil(f"current/{view}", current_views[view], jpeg_quality))
+        for idx, hist in enumerate(history_panoramas):
+            for view in ("front", "right", "back", "left"):
+                blobs.append(_rpc_blob_from_pil(f"history/{idx}/{view}", hist[view], jpeg_quality))
+        blobs.append(_rpc_blob_from_pil("lookdown", lookdown_img, jpeg_quality))
 
     sampling_metadata = build_rpc_sampling_metadata(
         protocol_seed=protocol_seed,
@@ -3600,7 +3711,8 @@ def _rpc_plan_panoramic(
         rpc_method = NATIVE_INTERNNAV_RPC_METHOD
     else:
         rpc_method = "plan_panoramic"
-    result = client.infer_json(rpc_method, payload, blobs)
+    with _timed(timing_log, "model_rpc"):
+        result = client.infer_json(rpc_method, payload, blobs)
     if result is None:
         raise RuntimeError("RPC model server returned no response")
     response, _response_blobs = result
@@ -3943,6 +4055,7 @@ def run_eval_rpc_panoramic(args):
         vo_bridge = OnlineVORPCBridge(
             vo_client,
             jpeg_quality=args.amb3r_vo_rpc_jpeg_quality,
+            timing=timing_enabled(),
         )
         print(
             "Online AMB3R VO enabled: "
@@ -4108,6 +4221,13 @@ def run_eval_rpc_panoramic(args):
 
     output_path = args.output_path
     progress_file = _prepare_progress_file(args, output_path)
+    timing_log: PlanCallTimingLog | None = None
+    if timing_enabled():
+        timing_log = PlanCallTimingLog(
+            Path(output_path) / "timing" / f"client_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.jsonl",
+            vo_bridge=vo_bridge,
+        )
+        print(f"[latency] one line per plan call -> {timing_log.path}", flush=True)
     target_list, target_set = _episode_list_from_args(args)
     rpc_progress_contract = {
         **build_rpc_progress_sampling_contract(
@@ -4170,6 +4290,8 @@ def run_eval_rpc_panoramic(args):
                 f"{scene_id}/{episode_id:04d}",
                 max_frames=int(max_steps_per_episode) + 1,
             )
+        if timing_log is not None:
+            timing_log.begin_episode(scene_id, episode_id)
         if step_tracer is not None:
             step_tracer.begin_episode(scene_id, episode_id, episode, instruction, env._sim.get_agent(0).get_state())
 
@@ -4259,10 +4381,11 @@ def run_eval_rpc_panoramic(args):
                     raise RuntimeError(
                         "could not extract native horizontal front RGB for AMB3R"
                     )
-                current_vo_frame_id = vo_bridge.ingest_rgb(
-                    front_rgb,
-                    capture_step=step_id,
-                )
+                with _timed(timing_log, "vo_ingest"):
+                    current_vo_frame_id = vo_bridge.ingest_rgb(
+                        front_rgb,
+                        capture_step=step_id,
+                    )
             if step_tracer is not None:
                 step_tracer.record_state(
                     step_id,
@@ -4288,7 +4411,8 @@ def run_eval_rpc_panoramic(args):
                 continue
 
             if local_actions:
-                current_views = capture_panoramic_views(env, image_size=image_size)
+                with _timed(timing_log, "pano_capture"):
+                    current_views = capture_panoramic_views(env, image_size=image_size)
                 executed_history_panoramas.append(current_views)
                 if dagger_collector is not None:
                     executed_history_poses.append(
@@ -4310,7 +4434,8 @@ def run_eval_rpc_panoramic(args):
                     forward_action_count = 0
                     continue
                 before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
-                observations, done = _apply_habitat_action(env, action)
+                with _timed(timing_log, "env_step"):
+                    observations, done = _apply_habitat_action(env, action)
                 if before is not None:
                     print(
                         f"  [debug] executed local action={int(action)} {before} -> {_env_trace_summary(env)}",
@@ -4335,7 +4460,8 @@ def run_eval_rpc_panoramic(args):
                     f"  [debug] max System2 calls reached ({system2_calls}); stopping episode",
                     flush=True,
                 )
-                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                with _timed(timing_log, "env_step"):
+                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 if step_tracer is not None:
                     step_tracer.record_action(step_id, int(ActionCode.STOP), "max_system2_stop", None)
                 step_id += 1
@@ -4349,7 +4475,10 @@ def run_eval_rpc_panoramic(args):
                 )
                 continue
 
-            current_views = capture_panoramic_views(env, image_size=image_size)
+            if timing_log is not None:
+                timing_log.begin_call(system2_calls, step_id)
+            with _timed(timing_log, "pano_capture"):
+                current_views = capture_panoramic_views(env, image_size=image_size)
             if vo_bridge is not None and current_vo_frame_id is None:
                 raise RuntimeError("online AMB3R current frame identity is missing")
             prompt_history_indices = (
@@ -4371,10 +4500,11 @@ def run_eval_rpc_panoramic(args):
                     executed_history_vo_frame_ids[i]
                     for i in prompt_history_indices
                 ]
-                external_pose_fields = vo_bridge.query_model_pose_fields(
-                    current_frame_id=current_vo_frame_id,
-                    history_frame_ids=prompt_vo_ids,
-                )
+                with _timed(timing_log, "vo_query"):
+                    external_pose_fields = vo_bridge.query_model_pose_fields(
+                        current_frame_id=current_vo_frame_id,
+                        history_frame_ids=prompt_vo_ids,
+                    )
                 print(
                     "  [amb3r-vo] "
                     f"frame={external_pose_fields['vo_current_frame_id']} "
@@ -4392,17 +4522,18 @@ def run_eval_rpc_panoramic(args):
                     f"{_views_trace_summary(current_views)}",
                     flush=True,
                 )
-            lookdown_img = capture_lookdown_view(
-                env,
-                image_size=(
-                    # The released InternNav System2 was trained on 640x480
-                    # conversational lookdowns; the certified native replica
-                    # enforces that size, so the two-turn protocol must too.
-                    NATIVE_INTERNNAV_LOOKDOWN_SIZE
-                    if (native_internnav_rpc or rpc_internnav_two_turn)
-                    else traj_image_size
-                ),
-            )
+            with _timed(timing_log, "lookdown_capture"):
+                lookdown_img = capture_lookdown_view(
+                    env,
+                    image_size=(
+                        # The released InternNav System2 was trained on 640x480
+                        # conversational lookdowns; the certified native replica
+                        # enforces that size, so the two-turn protocol must too.
+                        NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                        if (native_internnav_rpc or rpc_internnav_two_turn)
+                        else traj_image_size
+                    ),
+                )
             executed_history_panoramas.append(current_views)
             if dagger_collector is not None:
                 executed_history_poses.append(
@@ -4461,7 +4592,13 @@ def run_eval_rpc_panoramic(args):
                 model_pose_fields=external_pose_fields,
                 current_capture_step=step_id,
                 history_capture_steps=prompt_history_steps,
+                timing_log=timing_log,
             )
+            if timing_log is not None:
+                timing_log.end_plan(
+                    response,
+                    None if external_pose_fields is None else external_pose_fields["pose_ready"],
+                )
             if vo_bridge is not None:
                 runtime_identity = response.get("ppa_runtime")
                 if runtime_identity not in ("ppa-online-amb3r-v1", "system2-cognition-arm-v1"):
@@ -4856,7 +4993,8 @@ def run_eval_rpc_panoramic(args):
 
             if response.get("terminal", False):
                 action = actions[0] if actions else ActionCode.STOP
-                observations, done = _apply_habitat_action(env, action)
+                with _timed(timing_log, "env_step"):
+                    observations, done = _apply_habitat_action(env, action)
                 if step_tracer is not None:
                     step_tracer.record_action(
                         step_id, action, "terminal", system2_calls - 1, response_kind=response.get("kind")
@@ -4874,7 +5012,8 @@ def run_eval_rpc_panoramic(args):
                 continue
 
             if not actions:
-                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+                with _timed(timing_log, "env_step"):
+                    observations, done = _apply_habitat_action(env, ActionCode.STOP)
                 if step_tracer is not None:
                     step_tracer.record_action(
                         step_id,
@@ -4902,7 +5041,8 @@ def run_eval_rpc_panoramic(args):
                 local_actions = []
                 continue
             before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
-            observations, done = _apply_habitat_action(env, first_action)
+            with _timed(timing_log, "env_step"):
+                observations, done = _apply_habitat_action(env, first_action)
             if before is not None:
                 print(
                     f"  [debug] executed first RPC action={int(first_action)} {before} -> {_env_trace_summary(env)}",
@@ -4922,6 +5062,8 @@ def run_eval_rpc_panoramic(args):
                 vlm_output=llm_output,
             )
 
+        if timing_log is not None:
+            timing_log.end_episode(step_id)
         if dagger_episode_active:
             dagger_episode_commit = dagger_collector.finalize_episode()
             if dagger_episode_commit is None:

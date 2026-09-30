@@ -22,11 +22,20 @@ Methods
 The request dispatcher is dependency-light and independently testable.  Torch,
 AMB3R, gRPC and the generated VLA protobuf modules are imported only while
 constructing or serving the real runtime.
+
+Opt-in timing (``--timing`` or ``HEATMAPVLN_TIMING=1``) adds ``timing_ms`` to
+every response: ``jpeg_decode``; ``ingest``, ``ingest_map_init`` or
+``ingest_map_update`` (by what the call did to the map); ``query`` or
+``query_map_update``; ``total`` (the dispatch).  Milliseconds, each stage
+bounded by CUDA synchronisation of ``--device``.  On CUDA it also adds
+``cuda_memory_mib`` (peak allocated / reserved during the call, whole-card use
+after it).  Off, responses are unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import signal
@@ -49,6 +58,33 @@ _METHOD_RESET = "reset_episode"
 _METHOD_INGEST = "ingest_frame"
 _METHOD_QUERY = "query_relative_poses"
 _SUPPORTED_METHODS = (_METHOD_RESET, _METHOD_INGEST, _METHOD_QUERY)
+
+
+class _TimingOff:
+    """Stand-in for a disabled ``src.utils.latency.StageTimer``: every call is a no-op.
+
+    That module is imported only when timing is on, because ``src/`` joins
+    ``sys.path`` late (``--repo``) and the dispatcher stays dependency-light.
+    """
+
+    enabled = False
+
+    def stage(self, _name: str) -> contextlib.AbstractContextManager[None]:
+        return contextlib.nullcontext()
+
+    def rename(self, _old: str, _new: str) -> None:
+        return None
+
+
+_TIMING_OFF = _TimingOff()
+
+
+def _map_event_suffix(before: Any, after: Any) -> str:
+    """Name what a call did to the AMB3R map from the session's trajectory revision."""
+
+    if not isinstance(before, int) or not isinstance(after, int) or after == before:
+        return ""
+    return "_map_init" if before == 0 else "_map_update"
 
 
 class OnlineAMB3RSessionLike(Protocol):
@@ -149,6 +185,8 @@ class AMB3RVORPCApplication:
         jpeg_decoder: Callable[[bytes], np.ndarray],
         translation_scale: float = 1.0,
         max_frames_limit: int = 4096,
+        timing: bool = False,
+        timing_device: Any = None,
     ) -> None:
         if not np.isfinite(translation_scale) or float(translation_scale) <= 0.0:
             raise ValueError("translation_scale must be a finite positive scalar")
@@ -159,6 +197,16 @@ class AMB3RVORPCApplication:
         self.translation_scale = float(translation_scale)
         self.max_frames_limit = int(max_frames_limit)
         self.requests_processed = 0
+        # Opt-in latency timing (HEATMAPVLN_TIMING=1 or --timing): per-stage
+        # timing_ms (and CUDA memory of timing_device) in each response.  Off,
+        # no clock is read and no field added.
+        self.timing = bool(timing)
+        self.timing_device = timing_device
+        self._latency = None
+        if self.timing:
+            from src.utils import latency
+
+            self._latency = latency
 
     @staticmethod
     def _response(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -180,19 +228,35 @@ class AMB3RVORPCApplication:
         itself intentionally has no lock or hidden retry semantics.
         """
 
-        if method == _METHOD_RESET:
-            output = self._reset(payload, blobs)
-        elif method == _METHOD_INGEST:
-            output = self._ingest(payload, blobs)
-        elif method == _METHOD_QUERY:
-            output = self._query(payload, blobs)
-        else:
-            raise ValueError(
-                f"Unsupported method {method!r}; expected one of "
-                + ", ".join(_SUPPORTED_METHODS)
-            )
+        timer = _TIMING_OFF
+        if self.timing:
+            timer = self._latency.StageTimer(enabled=True, device=self.timing_device)
+            if self.timing_device is not None:
+                self._latency.reset_cuda_peak(self.timing_device)
+        with timer.stage("total"):
+            if method == _METHOD_RESET:
+                output = self._reset(payload, blobs)
+            elif method == _METHOD_INGEST:
+                output = self._ingest(payload, blobs, timer)
+            elif method == _METHOD_QUERY:
+                output = self._query(payload, blobs, timer)
+            else:
+                raise ValueError(
+                    f"Unsupported method {method!r}; expected one of "
+                    + ", ".join(_SUPPORTED_METHODS)
+                )
         self.requests_processed += 1
-        return self._response(output)
+        response = self._response(output)
+        if timer.enabled:
+            response["timing_ms"] = timer.as_dict()
+            if self.timing_device is not None:
+                memory = self._latency.cuda_memory_mib(self.timing_device)
+                if memory is not None:
+                    response["cuda_memory_mib"] = memory
+        return response
+
+    def _trajectory_revision(self) -> Any:
+        return getattr(self.session, "trajectory_revision", None)
 
     def _reset(self, payload: Any, blobs: Sequence[Any]) -> dict[str, Any]:
         values = _strict_payload(payload, required={"session_id", "max_frames"})
@@ -248,7 +312,12 @@ class AMB3RVORPCApplication:
             )
         return np.ascontiguousarray(rgb)
 
-    def _ingest(self, payload: Any, blobs: Sequence[Any]) -> dict[str, Any]:
+    def _ingest(
+        self,
+        payload: Any,
+        blobs: Sequence[Any],
+        timer: Any = _TIMING_OFF,
+    ) -> dict[str, Any]:
         values = _strict_payload(
             payload,
             required={"session_id", "frame_id", "capture_step"},
@@ -256,35 +325,54 @@ class AMB3RVORPCApplication:
         identifier = _session_id(values)
         frame_id = _strict_int(values, "frame_id", minimum=0)
         capture_step = _strict_int(values, "capture_step", minimum=0)
-        frame_rgb = self._decode_front_jpeg(blobs)
-        return self.session.ingest(
-            identifier,
-            frame_id=frame_id,
-            frame_rgb=frame_rgb,
-            capture_step=capture_step,
-        )
+        with timer.stage("jpeg_decode"):
+            frame_rgb = self._decode_front_jpeg(blobs)
+        revision = self._trajectory_revision() if timer.enabled else None
+        # Timed as ingest, ingest_map_init or ingest_map_update by what it did to the map.
+        with timer.stage("ingest"):
+            result = self.session.ingest(
+                identifier,
+                frame_id=frame_id,
+                frame_rgb=frame_rgb,
+                capture_step=capture_step,
+            )
+        if timer.enabled:
+            suffix = _map_event_suffix(revision, self._trajectory_revision())
+            timer.rename("ingest", "ingest" + suffix)
+        return result
 
-    def _query(self, payload: Any, blobs: Sequence[Any]) -> dict[str, Any]:
+    def _query(
+        self,
+        payload: Any,
+        blobs: Sequence[Any],
+        timer: Any = _TIMING_OFF,
+    ) -> dict[str, Any]:
         values = _strict_payload(
             payload,
             required={"session_id", "current_frame_id", "history_frame_ids"},
         )
         if blobs:
             raise ValueError("query_relative_poses does not accept binary blobs")
-        result = self.session.query(
-            _session_id(values),
-            current_frame_id=_strict_int(
-                values,
-                "current_frame_id",
-                minimum=0,
-            ),
-            history_frame_ids=_history_ids(values),
-            # This is one deployment-wide calibration constant supplied only
-            # when starting the server.  The RPC client cannot fit or override
-            # it from GT for an episode.
-            translation_scale=self.translation_scale,
-        )
-        payload_result = result.to_payload()
+        revision = self._trajectory_revision() if timer.enabled else None
+        # Timed as query or query_map_update (the query first mapped the pending tail).
+        with timer.stage("query"):
+            result = self.session.query(
+                _session_id(values),
+                current_frame_id=_strict_int(
+                    values,
+                    "current_frame_id",
+                    minimum=0,
+                ),
+                history_frame_ids=_history_ids(values),
+                # This is one deployment-wide calibration constant supplied only
+                # when starting the server.  The RPC client cannot fit or override
+                # it from GT for an episode.
+                translation_scale=self.translation_scale,
+            )
+            payload_result = result.to_payload()
+        if timer.enabled:
+            suffix = _map_event_suffix(revision, self._trajectory_revision())
+            timer.rename("query", "query" + suffix)
         if not isinstance(payload_result, Mapping):
             raise TypeError("Online AMB3R query result must provide a JSON object")
         required_result_fields = {
@@ -320,6 +408,7 @@ def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
     ]
 
     from amb3r.model_zoo import load_model
+    from src.utils.latency import timing_enabled
     from src.vo.online_amb3r import build_online_amb3r_session
     from vla_rpc.core.image import decode_jpeg_to_rgb
 
@@ -338,6 +427,8 @@ def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
         jpeg_decoder=decode_jpeg_to_rgb,
         translation_scale=args.translation_scale,
         max_frames_limit=args.max_frames_limit,
+        timing=bool(args.timing) or timing_enabled(),
+        timing_device=args.device,
     )
 
 
@@ -415,6 +506,8 @@ def _serve(args: argparse.Namespace, application: AMB3RVORPCApplication) -> int:
         address,
         AMB3R_VO_RPC_PROTOCOL_VERSION,
     )
+    if application.timing:
+        LOGGER.info("Latency timing enabled: responses carry timing_ms")
 
     def _shutdown(_signum: int, _frame: Any) -> None:
         LOGGER.info("Stopping AMB3R-VO RPC server")
@@ -459,6 +552,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-frames-limit", type=int, default=4096)
     parser.add_argument("--max-message-mb", type=int, default=32)
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help=(
+            "Same as HEATMAPVLN_TIMING=1: add per-stage timing_ms and CUDA "
+            "memory to every response (stages synchronise --device; poses unchanged)"
+        ),
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
