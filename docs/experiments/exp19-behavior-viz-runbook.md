@@ -206,6 +206,35 @@ docker exec fjl-habitat bash -c "cd $C/src_$SHA && /opt/conda/bin/python -m scri
 # 之后的 run_post_cuda.sh 用 EXP19_RUN=main4090_all（从头走一遍各阶段；重渲染逐集重新核对输入）
 ```
 
+## 9. 论文图两张（IEEE 双栏；运行记录 6）
+
+纯 CPU，读 4090 批的 `records/`、`records_v2/` 和 `topdown/`。在 4090 容器里跑：
+
+```bash
+docker exec fjl-habitat bash -lc "cd $C/src_<SHA> && EXP18_FONT_DIR=$C/support/fonts \
+  EXP18_CJK_FONT=$C/support/fonts/DroidSansFallbackFull.ttf MPLBACKEND=Agg PYTHONPATH=\$PWD \
+  /opt/conda/bin/python -m scripts.exp19.figures.fig_paper --records $C/records --timelines $C/records_v2 \
+  --topdown-root $C/topdown --out-dir $C/figures_paper --lang en zh"
+```
+
+也可以把这三个目录和 `support/fonts/` 拷回本地，用 matplotlib 3.10.8、numpy 1.26.4 的环境跑同一条命令，结果与容器里一致。
+2026-09-30 的交付版就是本地渲染后拷上去的。
+
+**默认内容**：
+
+- 图 A 是 `--fig-a T1 T2 T3 --keys K1 K2 K4`，最多 4 个关键时刻，列宽自动缩。
+- 图 B 是 `--fig-b T1 T2 T3 F1`。
+- 行既可以写类别（取该类唯一的主案例），也可以直接写 `ep_key`。只出一张图时，另一张写空参数，例如 `--fig-a`。
+
+**输出**：`fig_{a_key_moments,b_online_timeline}_{en,zh}.{pdf,svg,png}`、`*_caption_{en,zh}.txt` 和 `manifest.json`。
+
+- manifest 按图合并：只重出一张图、或只重出一种语言时，另一张 / 另一语言的记录保留。
+- 版式参数是 `fig_paper.py` 顶部的 `FIG_A` / `FIG_B`，单位英寸。
+- 自检（重叠、出界、引线穿字、最小字号、高宽比 0.9–1.15）写在 manifest 的 `checks`，出问题时打 `WARNING`。
+
+**在 Illustrator / Inkscape 里微调前**，先装 `support/fonts/` 里的 Nimbus Sans 与 Droid Sans Fallback；不装的话软件会换字体，字宽一变，
+已经核过的间距就不再成立。
+
 ## 测试
 
 ```bash

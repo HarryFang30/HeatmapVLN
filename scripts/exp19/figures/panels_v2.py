@@ -361,7 +361,8 @@ def pair_segment(pred_b: float, pred_e: float, gt_b: float, gt_e: float) -> Tupl
     return pred_b, pred_e, pred_b + float(geo.wrap_deg(gt_b - pred_b)), gt_e
 
 
-def draw_history_strip(ax, ks: bd.KeyStep, width_px: int, heat_px: int, elev: float = HIST_ELEV) -> dict:
+def draw_history_strip(ax, ks: bd.KeyStep, width_px: int, heat_px: int, elev: float = HIST_ELEV,
+                       slots: Optional[Sequence[int]] = None) -> dict:
     """Muted surroundings, faint predicted history field (display-smoothed, ``smooth_ring_image``), and every past
     frame's marks at their own bearing AND elevation (the 64 x 256 geometry of the four label views,
     ``pn.pixel_to_ring``): a small dark-orange dot at the
@@ -369,6 +370,7 @@ def draw_history_strip(ax, ks: bd.KeyStep, width_px: int, heat_px: int, elev: fl
     the same past frame when they are apart (the error of that frame; a hit is a dot inside its circle, a miss
     never looks nested).  A mark beyond the strip's elevation band is a triangle on its edge (no hairline).  A
     mark near +-180 is drawn at every end where it fits whole; hairlines are drawn at both ends, clipped.
+    ``slots``: the past frames whose marks are drawn (default all; the field always combines every frame).
     Returns {"edge": marks drawn as edge triangles, "pairs": hairlines drawn, "scale": 1.0}.
     """
     composite = bd.history_pred_composite(ks.hist_pred, ks.hist_none, ks.hist_mask)
@@ -380,6 +382,8 @@ def draw_history_strip(ax, ks: bd.KeyStep, width_px: int, heat_px: int, elev: fl
     strip_seams(ax, elev, color="white", lw=HAIR)
     camera_frame(ax, elev)
     gt, pred = history_strip_marks(ks)
+    if slots is not None:
+        gt, pred = [m for m in gt if int(m[0]) in slots], [m for m in pred if int(m[0]) in slots]
     kx, ky = abs(cd.pts_to_data(ax, 1.0, 0.0)[0]), abs(cd.pts_to_data(ax, 0.0, 1.0)[1])  # deg per pt
     true_of = {int(k): (float(b), float(e)) for k, b, e in gt}
     pairs = 0
@@ -763,7 +767,21 @@ def clusters(key_xz: np.ndarray, per_pt: float, within_pt: float = CLUSTER_PT) -
     return list(groups.values())
 
 
+COVER_INSET_PT = 1.0  # route points this far inside a badge's box count as covered by it ...
+COVER_PENALTY = 5.0  # ... and each costs the configuration this much (points are ~2 pt apart along the route)
+
+
+def covered_points(q, points: np.ndarray, per_pt: float) -> int:
+    """How many of ``points`` a badge centred on ``q`` would hide (its box inset by ``COVER_INSET_PT``)."""
+    if not len(points):
+        return 0
+    hw, hh = BADGE_HALF[0] - COVER_INSET_PT, BADGE_HALF[1] - COVER_INSET_PT
+    return int(np.sum((np.abs(points[:, 0] - q[0]) < hw * per_pt) & (np.abs(points[:, 1] - q[1]) < hh * per_pt)))
+
+
 def _config_score(ps, qs, points, fixed_boxes, limits, per_pt, dists) -> float:
+    """Room around the badges (capped), minus leader length, minus the route points a badge hides and the leaders
+    that run through a badge or cross another leader."""
     hw, hh = BADGE_HALF
     score = 0.0
     boxes = list(fixed_boxes)
@@ -772,6 +790,7 @@ def _config_score(ps, qs, points, fixed_boxes, limits, per_pt, dists) -> float:
                   and limits[2] + hh * per_pt < q[1] < limits[3] - hh * per_pt)
         if not inside:
             return -np.inf
+        score -= COVER_PENALTY * covered_points(q, points, per_pt)
         room = float(np.min(np.linalg.norm(points - q, axis=1))) / per_pt if len(points) else 99.0
         for b in boxes:  # separation from badges / labels already placed (< 0: overlap)
             gap = max(b[0] - (q[0] + hw * per_pt), (q[0] - hw * per_pt) - b[2],

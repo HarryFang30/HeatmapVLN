@@ -210,6 +210,7 @@ class Timeline:
     x0: float = 0.0  # left end of the x axis (data units); > 0 when the warm-up is compressed
     wblock: float = 0.0  # width of the compressed warm-up block in step units (0 = the axis is linear)
     blocks: List[Tuple[float, float, float]] = field(default_factory=list)  # compressed no-map spans (s0, s1, width)
+    compact148: bool = False  # columns marking past frames 1, 4, 8 place them at COMPACT_148 (the paper figures)
 
     @property
     def R(self) -> int:
@@ -233,10 +234,15 @@ class Timeline:
         """The warm-up is compressed into a block."""
         return self.wblock > 0.0
 
+    @property
+    def cropped(self) -> bool:
+        """The axis starts at the first ready call (``crop_warmup``): the warm-up is left out, not compressed."""
+        return self.x0 > 0.0 and not self.compressed
+
     def knots(self) -> Tuple[np.ndarray, np.ndarray]:
         """(steps, x) of the piecewise-linear step axis: slope 1 outside the compressed blocks (x = step from the
         end of a compressed warm-up on, until the first compressed no-map block)."""
-        s_k, x_k = [0.0], [float(self.x0)]
+        s_k, x_k = [float(self.x0) if self.cropped else 0.0], [float(self.x0)]
         if self.compressed:
             w = float(self.warmup_end())
             s_k.append(w)
@@ -528,6 +534,8 @@ SLOT_LABEL_INSET_PT = 0.9  # "1" / "8" sit this far inside the first ready colum
 SLOT_LABEL_AIR_PT = 2.0  # ... and are drawn only when this much air is left between them
 ALL_SLOTS = tuple(range(NUM_SLOTS))
 OVERVIEW_SLOTS = (0, 3, 7)  # past frames 1, 4, 8: the overview, and every column too narrow for all 8
+COMPACT_148 = (0.2, 0.5, 0.8)  # with ``Timeline.compact148``: frames 1, 4, 8 at these fractions of their column, so
+# a call's three marks read as one group (spread by slot they sit at 1/16, 7/16, 15/16, next to the neighbours')
 HIST_TICKS = (0.0, 90.0, 180.0, 270.0, 360.0)  # history panel y, bottom to top: ahead, right, behind, left, ahead
 FUT_TICKS = (90.0, 0.0, -90.0)  # future panel: left, ahead, right (+-180 at the edges)
 BADGE_LEVEL_PT = 9.4  # a raised K badge sits this far above the first row
@@ -557,6 +565,16 @@ def _warmup_compressible(tl: Timeline, width_pt: float, block_pt: float) -> bool
     if w <= 0 or n <= w or width_pt <= 2 * block_pt or (len(steps) and int(steps.min()) < w):
         return False
     return w * width_pt / n > 1.25 * block_pt
+
+
+def crop_warmup(tl: Timeline) -> Timeline:
+    """Start the axis at the first ready call's step (the paper figures): the warm-up, and any call before the first
+    affordance map, is left out rather than compressed; the axis stays linear (x = step) with no break mark, and its
+    first tick is that step."""
+    tl.x0, tl.wblock, tl.blocks = 0.0, 0.0, []
+    if tl.R:
+        tl.x0 = float(np.min(np.asarray(tl.a["step"], dtype=np.float64)))
+    return tl
 
 
 def ready_cover(tl: Timeline) -> float:
@@ -780,14 +798,19 @@ def narrow_columns(plan: MarkPlan) -> List[int]:
     return sorted(r for r, s in plan.slots.items() if s != main)
 
 
-def slot_xs(tl: Timeline, r: int, spread_marks: bool) -> np.ndarray:
+def slot_xs(tl: Timeline, r: int, spread_marks: bool, marked: Optional[Sequence[int]] = None) -> np.ndarray:
     """[8] x of each slot's marks of ready call r: slot k at (k + 0.5) / 8 of the column (1 = oldest at the left),
-    or all at the column's centre when the marks are stacked.  The column is the call's own action chunk (its step
-    .. the next call), so the positions are known when the call is made."""
+    or all at the column's centre when the marks are stacked; with ``tl.compact148`` and a column marking exactly
+    frames 1, 4, 8 (``marked``), those at ``COMPACT_148``.  The column is the call's own action chunk (its step ..
+    the next call), so the positions are known when the call is made."""
     s0, s1 = float(tl.x_of(float(tl.a["step"][r]))), float(tl.x_of(float(tl.a["next_step"][r])))
-    if spread_marks:
-        return s0 + (np.arange(NUM_SLOTS) + 0.5) / NUM_SLOTS * (s1 - s0)
-    return np.full(NUM_SLOTS, (s0 + s1) / 2.0)
+    if not spread_marks:
+        return np.full(NUM_SLOTS, (s0 + s1) / 2.0)
+    xs = s0 + (np.arange(NUM_SLOTS) + 0.5) / NUM_SLOTS * (s1 - s0)
+    if tl.compact148 and marked is not None and tuple(sorted(marked)) == OVERVIEW_SLOTS:
+        for k, f in zip(OVERVIEW_SLOTS, COMPACT_148):
+            xs[k] = s0 + f * (s1 - s0)
+    return xs
 
 
 def marker_stride(tl: Timeline, ax) -> int:
@@ -822,7 +845,7 @@ def history_marks(tl: Timeline, rows: Sequence[int], spread_marks: bool = True, 
             marked = ALL_SLOTS if slots is None else slots
         keep = np.zeros(NUM_SLOTS, dtype=bool)
         keep[list(marked)] = True
-        xs = slot_xs(tl, r, sp) if xs_of is None else xs_of(r)
+        xs = slot_xs(tl, r, sp, marked) if xs_of is None else xs_of(r)
         gb = np.asarray(tl.a["hist_gt_bearing"][r], dtype=np.float64)
         ok = np.isfinite(gb) & np.asarray(tl.a["hist_gt_visible"][r], dtype=bool) & keep
         for k in np.nonzero(ok)[0]:
@@ -962,13 +985,19 @@ def hist_ticks(ax, labels: Sequence[str]) -> None:
     ax.set_yticklabels(list(labels))
 
 
+FUT_LABEL_CENTRE_PT = p2.MIN_FS + 0.8  # the +-90 lines at least this far from ahead: every label on its own line
+
+
 def fut_ticks(ax, labels: Sequence[str]) -> None:
-    """Future panel ticks: left +90, ahead 0, right -90 (``labels`` in that order).  The +90 label sits just
-    above its line and the -90 label just below, so the three never touch on a thin panel."""
+    """Future panel ticks: left +90, ahead 0, right -90 (``labels`` in that order).  On a thin panel the +90 label
+    sits just above its line and the -90 label just below, so the three never touch; where the lines are at least
+    ``FUT_LABEL_CENTRE_PT`` apart every label is centred on its line."""
     ax.set_yticks(list(FUT_TICKS))
     ax.set_yticklabels(list(labels))
     tl_ = ax.get_yticklabels()
-    if len(tl_) == 3:
+    lo, hi = ax.get_ylim()
+    h_pt = ax.get_position().height * ax.figure.get_figheight() * 72.0
+    if len(tl_) == 3 and 90.0 / (hi - lo) * h_pt < FUT_LABEL_CENTRE_PT:
         tl_[0].set_va("bottom")
         tl_[2].set_va("top")
 
@@ -1017,6 +1046,8 @@ def slot_end_labels(ax, tl: Timeline, plan: MarkPlan, fs: float = p2.MIN_FS) -> 
     when both edges are taken.  Returns the texts."""
     if not tl.R or plan.slots.get(0) is None:
         return []
+    if tl.compact148 and tuple(sorted(plan.slots.get(0) or ())) == OVERVIEW_SLOTS:
+        return compact_slot_labels(ax, tl, plan, fs)
     x0, x1 = float(tl.x_of(float(tl.a["step"][0]))), float(tl.x_of(float(tl.a["next_step"][0])))
     if not slot_labels_fit(ax.figure, (x1 - x0) * per_step_pt(tl, ax), fs):
         return []
@@ -1035,6 +1066,40 @@ def slot_end_labels(ax, tl: Timeline, plan: MarkPlan, fs: float = p2.MIN_FS) -> 
                         textcoords="offset points", ha=ha, va=va, fontsize=fs, color=style.INK_2,
                         annotation_clip=False, zorder=9)
         return ["1", str(NUM_SLOTS)]
+    return []
+
+
+def compact_slot_labels(ax, tl: Timeline, plan: MarkPlan, fs: float = p2.MIN_FS, search: int = 6) -> List[str]:
+    """"1", "4", "8" under (or over) the three marks of the first of the first ``search`` ready columns that draws a
+    mark for each of frames 1, 4 and 8 (``tl.compact148``), each centred on its mark's x, at the panel edge its
+    column's marks keep clear of.  Nothing when no such column is found or the labels would touch."""
+    lo, hi = ax.get_ylim()
+    h_pt = ax.get_position().height * ax.figure.get_figheight() * 72.0
+    zone = (fs + 3.0) / h_pt * (hi - lo)
+    per = per_step_pt(tl, ax)
+    for r in range(min(tl.R, search)):
+        if tuple(sorted(plan.slots.get(r) or ())) != OVERVIEW_SLOTS:
+            continue
+        xs = slot_xs(tl, r, True, OVERVIEW_SLOTS)
+        gt, pred = history_marks(tl, [r], plan=plan)
+        drawn = {round(x, 6) for x, _ in gt + pred}
+        if not all(round(float(xs[k]), 6) in drawn for k in OVERVIEW_SLOTS):
+            continue
+        widths = [cd.text_width_pt(ax.figure, str(k + 1), fs) for k in OVERVIEW_SLOTS]
+        gaps = [(float(xs[b]) - float(xs[a])) * per - (wa + wb) / 2
+                for (a, wa), (b, wb) in zip(zip(OVERVIEW_SLOTS, widths), list(zip(OVERVIEW_SLOTS, widths))[1:])]
+        if min(gaps) < SLOT_LABEL_AIR_PT:
+            return []
+        ys = [y for _, y in gt + pred]
+        for va, edge, dy in (("bottom", 0.0, 1.0), ("top", 1.0, -1.0)):
+            y_edge = lo if edge == 0.0 else hi
+            if any(abs(y - y_edge) < zone for y in ys):
+                continue
+            for k in OVERVIEW_SLOTS:
+                ax.annotate(str(k + 1), (float(xs[k]), edge), xycoords=("data", "axes fraction"), xytext=(0.0, dy),
+                            textcoords="offset points", ha="center", va=va, fontsize=fs, color=style.INK_2,
+                            annotation_clip=False, zorder=9)
+            return [str(k + 1) for k in OVERVIEW_SLOTS]
     return []
 
 
@@ -1094,6 +1159,8 @@ def axis_ticks(fig, tl: Timeline, per: float, fs: float = p2.MIN_FS) -> List[Tup
     warm-up's left end, W at its break, both ends of a no-map block) and the axis' end (the rerun's last step)
     first, then round steps inside the linear parts that keep clear of them (3 pt).  ``per``: points per x unit."""
     must: List[Tuple[float, str]] = []
+    if tl.cropped:
+        must.append((float(tl.x0), str(int(round(tl.x0)))))
     if tl.compressed:
         must += [(float(tl.x0), "0"), (float(tl.x_of(tl.warmup_end())), str(int(tl.warmup_end())))]
     for a, b, _ in sorted(tl.blocks):
@@ -1113,10 +1180,15 @@ def axis_ticks(fig, tl: Timeline, per: float, fs: float = p2.MIN_FS) -> List[Tup
     linear = [(float(s_k[i]), float(s_k[i + 1])) for i in range(len(s_k) - 1)
               if abs((x_k[i + 1] - x_k[i]) - (s_k[i + 1] - s_k[i])) < 1e-6 and s_k[i + 1] > s_k[i]]
     out = list(must)
+    x_end = float(tl.xlim()[1])
+
+    def half(x2, lab2):  # the axis-end label is right-aligned (``step_axis``): all of it lies left of its tick
+        w2 = cd.text_width_pt(fig, lab2, fs)
+        return w2 if abs(x2 - x_end) < 1e-9 else w2 / 2
 
     def clear(x, lab):
         for x2, lab2 in out:
-            gap = abs(x - x2) * per - (cd.text_width_pt(fig, lab, fs) + cd.text_width_pt(fig, lab2, fs)) / 2
+            gap = abs(x - x2) * per - cd.text_width_pt(fig, lab, fs) / 2 - half(x2, lab2)
             if gap < 3.0:
                 return False
         return True
@@ -1260,6 +1332,9 @@ def key_badges(badge_ax, data_ax, tl: Timeline, fs: float = p2.MIN_FS) -> List[d
     for it in items:
         y = y0 + it["level"] * BADGE_LEVEL_PT
         cd.key_badge(badge_ax, it["x"], y, it["label"], fs=fs)
-        badge_ax.plot([it["x"], it["target"]], [y - BADGE_HALF_H_PT, 0.0], color=style.INK, lw=KEY_LW, zorder=5,
+        # a badge pushed along its row (at the panel's end, or beside a raised neighbour's leader) but still over its
+        # hairline gets a straight leader down from its lower edge, not a short slanted stub
+        x_top = it["target"] if abs(it["x"] - it["target"]) <= it["w"] / 2 else it["x"]
+        badge_ax.plot([x_top, it["target"]], [y - BADGE_HALF_H_PT, 0.0], color=style.INK, lw=KEY_LW, zorder=5,
                       solid_capstyle="butt", gid=f"leader:{it['label']}")
     return items
