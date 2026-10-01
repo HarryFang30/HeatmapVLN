@@ -226,7 +226,8 @@ docker exec fjl-habitat bash -lc "cd $C/src_<SHA> && EXP18_FONT_DIR=$C/support/f
 - 图 B 是 `--fig-b T1 T3 F1`。编号与图 A 相同：同一集、同一步，编号相同。
 - 行既可以写类别（取该类唯一的主案例），也可以直接写 `ep_key`。只出一张图时，另一张写空参数，例如 `--fig-a`。
 
-**输出**：`fig_{a_key_moments,b_online_timeline}_{en,zh}.{pdf,svg,png}`、`*_caption_{en,zh}.txt` 和 `manifest.json`。
+**输出**：`fig_{a_key_moments,b_online_timeline}_{en,zh}.{pdf,svg,png,pptx}`、`*_caption_{en,zh}.txt` 和 `manifest.json`。
+环境里没有 python-pptx 时不出 `.pptx`，只打一行 note；`--no-pptx` 也可以跳过它。
 
 - manifest 按图合并：只重出一张图、或只重出一种语言时，另一张 / 另一语言的记录保留。
 - 版式参数是 `fig_paper.py` 顶部的 `FIG_A` / `FIG_B`，单位英寸。
@@ -234,6 +235,16 @@ docker exec fjl-habitat bash -lc "cd $C/src_<SHA> && EXP18_FONT_DIR=$C/support/f
 
 **在 Illustrator / Inkscape 里微调前**，先装 `support/fonts/` 里的 Nimbus Sans 与 Droid Sans Fallback；不装的话软件会换字体，字宽一变，
 已经核过的间距就不再成立。
+
+**PPT 版**（`pptx_export.py`）用来在 PowerPoint / WPS 里改图：
+
+- 每张图是一页幻灯片，大小与图相同。
+- 文字都是文本框，英文用 Arial（与 Nimbus Sans 字宽相同），中文用微软雅黑，Office 自带这两种字体，不用另装。
+- 圆圈编号和路线图标注的白底是形状，压在对应文字下面。
+- 其余内容按坐标轴切成 600 dpi 透明 PNG，每个面板一张图片，和该面板的文字编成一组；每行标题合成一个文本框。
+- 2026-09-30 用 PowerPoint for Mac 导出图 B（英文）的 PDF，与原图叠图核对：400 dpi 下文字与线条只差一两个像素。
+- PowerPoint 导出 PDF 时会把页面取整到 516 × 412 pt。
+- Finder 的空格预览（QuickLook）不认旋转和"不换行"，组内图片也会盖住形状，所以不能用它判断效果。
 
 ## 测试
 

@@ -27,11 +27,13 @@ Key moments are numbered in time order (``time_numbers``), not by the rule that 
 an episode in both figures carries the same numbers at the same steps; the captions name the rule behind each
 number from the branch each key moment took (``moment_rules``).
 
-Outputs per figure and language: PDF (TrueType text), SVG (live ``<text>``) and PNG (400 dpi), plus a caption
+Outputs per figure and language: PDF (TrueType text), SVG (live ``<text>``), PNG (400 dpi) and PPTX, plus a caption
 ``.txt``; every text is real text (the route maps' white halos become small white boxes, ``editable_text``), so the
 PDF / SVG can be fine-tuned in Illustrator or Inkscape once the fonts are installed (Nimbus Sans; zh: Droid Sans
-Fallback).  Images and affordance maps are embedded rasters.  The layout numbers (inches) are the ``FIG_A`` /
-``FIG_B`` constants below.
+Fallback).  Images and affordance maps are embedded rasters.  The PPTX (``pptx_export``) is one slide of the
+figure's size for PowerPoint / WPS: text boxes (Arial, Microsoft YaHei) and the circles of the numbers as shapes over
+one 600 dpi picture per panel, a panel's picture and texts grouped, a heading one text box.  The layout numbers
+(inches) are the ``FIG_A`` / ``FIG_B`` constants below.
 
 Policy as ``fig_v2``: no poses, VO or odometry; both heatmaps are "affordance map"; nothing is drawn from the future
 map to the actions; the captions describe what is drawn and make no claim (the RTX 4090 batch is descriptive only,
@@ -59,6 +61,7 @@ from scripts.exp19.figures import bundle as bd
 from scripts.exp19.figures import fig_behavior as fb
 from scripts.exp19.figures import fig_v2 as f2
 from scripts.exp19.figures import panels_v2 as p2
+from scripts.exp19.figures import pptx_export as px
 from scripts.exp19.figures import timeline_panel as tp
 
 import matplotlib  # noqa: E402  (configured in setup())
@@ -516,8 +519,9 @@ def join_caption(parts: Sequence[str], lang: str) -> str:
     return " ".join(text.split()) if lang == "en" else text
 
 
-def save(fig, stem: Path, lang: str, caption: str) -> List[str]:
-    """PDF (TrueType text), SVG (live text), PNG (400 dpi) and the caption."""
+def save(fig, stem: Path, lang: str, caption: str, pptx: bool = True) -> Tuple[List[str], dict]:
+    """PDF (TrueType text), SVG (live text), PNG (400 dpi), the caption and (``pptx``) the PowerPoint copy.  Returns
+    (files, the PPTX export's counts, or {"skipped": ...} without python-pptx)."""
     import matplotlib.pyplot as plt
 
     stem.parent.mkdir(parents=True, exist_ok=True)
@@ -525,10 +529,25 @@ def save(fig, stem: Path, lang: str, caption: str) -> List[str]:
     fig.savefig(files[0], dpi=300, bbox_inches=None)
     fig.savefig(files[1], dpi=300, bbox_inches=None)
     fig.savefig(files[2], dpi=400, bbox_inches=None)
-    plt.close(fig)
     cap = stem.parent / f"{stem.name}_caption_{lang}.txt"
     cap.write_text(caption + "\n", encoding="utf-8")
-    return [str(f) for f in files + [cap]]
+    files.append(cap)
+    info: dict = {}
+    out = stem.parent / f"{stem.name}_{lang}.pptx"
+    if not pptx and out.exists():
+        print(f"  note: {out.name} is from an earlier run (not rewritten)", file=sys.stderr)
+    if pptx:
+        try:
+            import pptx as _  # noqa: F401  (python-pptx)
+        except ImportError:
+            info = {"skipped": "python-pptx is not installed"}
+            print(f"  note: {out.name} not written ({info['skipped']})"
+                  + (", the one there is from an earlier run" if out.exists() else ""), file=sys.stderr)
+        else:
+            info = px.figure_to_pptx(fig, out)
+            files.append(Path(info["file"]))
+    plt.close(fig)
+    return [str(f) for f in files], info
 
 
 # --------------------------------------------------------------------------- #
@@ -652,13 +671,15 @@ def draw_head_a(page: fb.Page, y: float, b: bd.Bundle, letter: str, lang: str, L
     ax = page.pt_axes(0.0, y, PAPER_W - EDGE, g["head_h"])
     yy = g["head_h"] * 72.0 * 0.45
     title, st = case_title(b, letter, L, lang), title_style(lang)
-    ax.text(0.0, yy, title, ha="left", va="center", **st)
+    key = f"head-{letter}"  # one text box in the PPTX
+    px.same_box(ax.text(0.0, yy, title, ha="left", va="center", **st), key)
     xo = cd.text_width_pt(page.fig, title, st["fontsize"], fontweight=st["fontweight"]) + 6.0
-    ax.text(xo, yy, outcome_short(b, L), ha="left", va="center", fontsize=FS_BODY, color=style.INK_2)
+    px.same_box(ax.text(xo, yy, outcome_short(b, L), ha="left", va="center", fontsize=FS_BODY, color=style.INK_2),
+                key)
 
 
 def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_root,
-               name: str = "fig_a_key_moments") -> dict:
+               name: str = "fig_a_key_moments", pptx: bool = True) -> dict:
     setup(lang)
     import matplotlib.pyplot as plt
 
@@ -720,11 +741,12 @@ def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_r
         res["warnings"].append(f"{name} [{lang}]: end-of-rerun squares drawn {stop_drawn} but planned {stops}")
     if cover:
         res["warnings"].append(f"{name} [{lang}]: executed-action chips cover {cover} pixel goals")
-    files = save(fig, Path(out_dir) / name, lang, caption)
+    files, pinfo = save(fig, Path(out_dir) / name, lang, caption, pptx=pptx)
     return {"files": files, "size_in": (PAPER_W, round(height, 3)), **res, "checks": checks,
             "k_w_in": round(k_w, 3), "route_in": (round(route_w, 3), round(route_h, 3)), "edge_marks": edge,
             "strip_pair_lines": pairs, "chips_corners": corners, "chips_cover_goal": cover,
-            "legend_lines": len(lines), "halo_texts_boxed": n_halo, "caption_chars": len(caption)}
+            "legend_lines": len(lines), "halo_texts_boxed": n_halo, "caption_chars": len(caption),
+            "pptx": {k: v for k, v in pinfo.items() if k != "file"}}
 
 
 # --------------------------------------------------------------------------- #
@@ -771,6 +793,7 @@ def head_lines(fig, parts: Sequence[Tuple[str, dict]], width_pt: float) -> List[
 
 def draw_head_b(page: fb.Page, y: float, parts: Sequence[Tuple[str, dict]], lines) -> None:
     fig = page.fig
+    key = f"head-{y:.4f}"  # the heading's lines and runs: one text box in the PPTX
     for j, line in enumerate(lines):
         x = 0.0
         for r, (i, text) in enumerate(line):
@@ -778,7 +801,7 @@ def draw_head_b(page: fb.Page, y: float, parts: Sequence[Tuple[str, dict]], line
             if r:
                 x += cd.text_width_pt(fig, "a a", st["fontsize"], **_font_kw(st)) - \
                     cd.text_width_pt(fig, "aa", st["fontsize"], **_font_kw(st)) + RUN_GAP_PT
-            page.text(x / 72.0, y + LINE * (j + 0.5), text, ha="left", va="center", **st)
+            px.same_box(page.text(x / 72.0, y + LINE * (j + 0.5), text, ha="left", va="center", **st), key)
             x += cd.text_width_pt(fig, text, st["fontsize"], **_font_kw(st))
 
 
@@ -841,7 +864,7 @@ def panel_heights(fixed: float, n: int, g: dict = FIG_B) -> Tuple[float, float]:
 
 
 def make_fig_b(bundles: Sequence[bd.Bundle], timelines: Sequence[tp.Timeline], out_dir: Path, lang: str,
-               topdown_root, name: str = "fig_b_online_timeline") -> dict:
+               topdown_root, name: str = "fig_b_online_timeline", pptx: bool = True) -> dict:
     setup(lang)
     import matplotlib.pyplot as plt
 
@@ -920,10 +943,11 @@ def make_fig_b(bundles: Sequence[bd.Bundle], timelines: Sequence[tp.Timeline], o
         want = [(k.label, time_numbers(b)[k.label], int(k.step)) for k in time_order(b.keys)]
         if list(ms) != want:
             res["warnings"].append(f"{name} [{lang}]: {b.ep_key} timeline key moments {ms} != bundle {want}")
-    files = save(fig, Path(out_dir) / name, lang, caption)
+    files, pinfo = save(fig, Path(out_dir) / name, lang, caption, pptx=pptx)
     return {"files": files, "size_in": (PAPER_W, round(height, 3)), **res, "checks": checks,
             "panels_in": (round(hh, 3), round(fh, 3)), "timeline_w_in": round(tl_w, 3), "legend_lines": len(lines),
-            "halo_texts_boxed": n_halo, "caption_chars": len(caption)}
+            "halo_texts_boxed": n_halo, "caption_chars": len(caption),
+            "pptx": {k: v for k, v in pinfo.items() if k != "file"}}
 
 
 # --------------------------------------------------------------------------- #
@@ -958,7 +982,7 @@ def code_hashes() -> Dict[str, Optional[str]]:
     here = Path(__file__).parent
     exp18 = here.parents[1] / "exp18" / "figures"
     files = {n: here / n for n in ("fig_paper.py", "fig_v2.py", "panels_v2.py", "panels.py", "timeline_panel.py",
-                                   "bundle.py", "fig_behavior.py")}
+                                   "bundle.py", "fig_behavior.py", "pptx_export.py")}
     files.update({f"exp18/{n}": exp18 / n for n in ("common_draw.py", "style.py")})
     return {n: f2._sha256(p) for n, p in files.items()}
 
@@ -972,6 +996,7 @@ def main(argv=None) -> int:
     ap.add_argument("--lang", nargs="+", default=["en", "zh"], choices=sorted(LABELS))
     ap.add_argument("--fig-a", nargs="*", default=list(DEFAULT_A), help="rows of figure A (categories or ep_keys)")
     ap.add_argument("--fig-b", nargs="*", default=list(DEFAULT_B), help="rows of figure B (categories or ep_keys)")
+    ap.add_argument("--no-pptx", action="store_true", help="skip the PowerPoint copies")
     args = ap.parse_args(argv)
     out_dir = Path(args.out_dir)
     if out_dir.resolve().name in ("figures", "figures_v2"):
@@ -1003,14 +1028,14 @@ def main(argv=None) -> int:
         for lang in args.lang:
             warnings = list(pick_warnings)
             if kind == "fig_a":
-                res = make_fig_a(members, out_dir, lang, args.topdown_root)
+                res = make_fig_a(members, out_dir, lang, args.topdown_root, pptx=not args.no_pptx)
                 warnings += [f"{b.ep_key}: {w}" for b in members for w in bundle_warnings(b)]
             else:
                 tls = [tp.load_timeline(tp.timeline_path_for(args.timelines, b.ep_key),
                                         record_path=Path(args.records) / f"{b.ep_key}.json") for b in members]
                 warnings += [f"{b.ep_key}: {w}" for b, tl in zip(members, tls)
                              for w in bundle_warnings(b) + tl.warnings + tp.check_against_bundle(tl, b)]
-                res = make_fig_b(members, tls, out_dir, lang, args.topdown_root)
+                res = make_fig_b(members, tls, out_dir, lang, args.topdown_root, pptx=not args.no_pptx)
             entry["files"][lang] = {Path(f).name: f2._sha256(f) for f in res["files"]}
             entry["size_in"][lang] = res["size_in"]
             entry["checks"][lang] = {k: v for k, v in res.items() if k not in ("files", "size_in", "warnings")}

@@ -123,6 +123,11 @@ def test_a_round_tick_next_to_the_right_aligned_end_label_is_dropped():
 # --------------------------------------------------------------------------- #
 # Figures
 # --------------------------------------------------------------------------- #
+try:
+    import pptx  # noqa: F401  (python-pptx: the PowerPoint copies)
+    HAVE_PPTX = True
+except ImportError:
+    HAVE_PPTX = False
 POLICY_WORDS = ("pose", "odometry", " vo ", "heatmap", "no claim", "does not feed", "example", "accurate")
 
 
@@ -155,7 +160,8 @@ def test_render_both_figures_editable_clean_and_at_the_aspect(rendered):
             assert c["min_font_pt"] >= 6.0 and c["legend_lines"] == 2
             assert fig["warnings"][lang] == [], fig["warnings"][lang]
         files = [out / name for lang in ("en", "zh") for name in fig["files"][lang]]
-        assert sorted(f.suffix for f in files) == sorted([".pdf", ".svg", ".png", ".txt"] * 2)
+        want = [".pdf", ".svg", ".png", ".txt"] + ([".pptx"] if HAVE_PPTX else [])
+        assert sorted(f.suffix for f in files) == sorted(want * 2)
         assert all(f.stat().st_size > 0 for f in files)
         stem = "fig_a_key_moments" if fig["figure"] == "fig_a" else "fig_b_online_timeline"
         svg = (out / f"{stem}_en.svg").read_text(encoding="utf-8")
@@ -166,6 +172,30 @@ def test_render_both_figures_editable_clean_and_at_the_aspect(rendered):
     fb_checks = rendered["by"]["fig_b"]["checks"]["en"]["checks"][0]
     assert fb_checks["x0_step"] == fb_checks["first_ready_step"] > 0  # the warm-up is left out
     assert fb_checks["compressed_warmup"] is False
+
+
+def test_pptx_copies_have_one_box_per_heading_and_the_labels_once(rendered):
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.oxml.ns import qn
+
+    def leaves(shapes):
+        for sh in shapes:
+            yield from (leaves(sh.shapes) if sh.shape_type == 6 else [sh])
+    for stem in ("fig_a_key_moments", "fig_b_online_timeline"):
+        c = rendered["by"][stem[:5]]["checks"]["en"]["pptx"]
+        assert c["pictures"] > 10 and c["boxes"] >= 24 and c["remarks"] == [], c
+        shapes = list(leaves(Presentation(str(rendered["out"] / f"{stem}_en.pptx")).slides[0].shapes))
+        texts = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
+        heads = [t for t in texts if re.match(r"\([abc]\) ", t)]
+        assert len(heads) == 3, heads  # title, outcome (and in figure B the instruction): one text box per row
+        if stem.startswith("fig_b"):
+            assert all("“" in h for h in heads)  # the instruction joins its heading
+        for word in ("History", "Future"):
+            assert texts.count(word) == 1, word
+        ovals = [sh for sh in shapes if sh._element.find(qn("p:spPr")) is not None
+                 and getattr(sh._element.spPr.find(qn("a:prstGeom")), "get", lambda _: None)("prst") == "ellipse"]
+        assert len(ovals) == sum(t in "1234" for t in texts if len(t) == 1)  # a circle under every key-moment number
 
 
 def test_key_moments_are_numbered_in_time_order_and_alike_in_both_figures(rendered, synth):
