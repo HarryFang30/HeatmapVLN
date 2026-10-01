@@ -56,6 +56,12 @@ MAX_EPISODES="${PPA_EVAL_MAX_EPISODES_PER_SHARD:-}"
 TIMING="${PPA_EVAL_TIMING:-0}"
 # 1: EXP-20 A1, System1 samples from Z instead of the injected Z~ (rpc_model_server.py --ppa_bridge_off).
 BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
+# EXP-21 sensitivity: history frames K (client), System1 samples S and denoising steps M (server; empty = config).
+NUM_HISTORY="${PPA_EVAL_NUM_HISTORY:-8}"
+NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
+NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
+# Per-shard episode lists (shard_0N.json); another directory than the locked cohorts means a subset run: no merge.
+EPISODE_LISTS_DIR="${PPA_EVAL_EPISODE_LISTS_DIR:-$COHORTS_DIR}"
 if [[ -n "$MAX_EPISODES" ]]; then
   default_output="$ROOT/eval_runs/canary_seed${PROTOCOL_SEED}"
 else
@@ -151,6 +157,11 @@ NUM_SLOTS="${#GPUS[@]}"
 [[ "$BRIDGE_OFF" =~ ^[01]$ ]] || die "PPA_EVAL_BRIDGE_OFF must be 0 or 1"
 declare -a MODEL_EXTRA=()
 [[ "$BRIDGE_OFF" -eq 1 ]] && MODEL_EXTRA=(--ppa_bridge_off)
+[[ "$NUM_HISTORY" =~ ^[1-8]$ ]] || die "PPA_EVAL_NUM_HISTORY must be 1-8"
+[[ -z "$NUM_SAMPLE_TRAJS" || "$NUM_SAMPLE_TRAJS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_SAMPLE_TRAJS must be a positive integer"
+[[ -z "$NUM_INFERENCE_STEPS" || "$NUM_INFERENCE_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_INFERENCE_STEPS must be a positive integer"
+[[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
+[[ -n "$NUM_INFERENCE_STEPS" ]] && MODEL_EXTRA+=(--nextdit_num_inference_steps "$NUM_INFERENCE_STEPS")
 # Always set, so a value left in the calling shell cannot switch timing on or off.
 export HEATMAPVLN_TIMING="$TIMING"
 for gpu in "${GPUS[@]}" "${VO_GPUS[@]}"; do
@@ -160,6 +171,7 @@ done
 for shard in "${SHARDS[@]}"; do
   [[ "$shard" =~ ^[0-7]$ ]] || die "invalid shard: $shard"
   require_file "$COHORTS_DIR/shard_0${shard}.json"
+  require_file "$EPISODE_LISTS_DIR/shard_0${shard}.json"
   require_file "$COHORTS_DIR/dataset_shard_0${shard}.json.gz"
 done
 
@@ -168,6 +180,7 @@ mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 [[ "$TIMING" -eq 0 ]] || touch "$RUNTIME_DIR/timing_start"
 echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING bridge_off=$BRIDGE_OFF"
 echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
+echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} episode_lists=$EPISODE_LISTS_DIR"
 echo "[ppa-eval] output=$OUTPUT_ROOT"
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
@@ -251,6 +264,12 @@ PY
     grep -F "PPA bridge off (EXP-20 A1)" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
       || die "model slot $slot lacks bridge-off evidence"
   fi
+  for key in num_sample_trajs num_inference_steps; do
+    if { [[ "$key" == num_sample_trajs && -n "$NUM_SAMPLE_TRAJS" ]] || [[ "$key" == num_inference_steps && -n "$NUM_INFERENCE_STEPS" ]]; }; then
+      grep -F "Sensitivity override (EXP-21): nextdit.$key" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+        || die "model slot $slot lacks the $key override evidence"
+    fi
+  done
   echo "[ppa-eval] slot=$slot gpu=${GPUS[$slot]} vo_gpu=${VO_GPUS[$slot]} model=$model_addr vo=$vo_addr ready"
 done
 
@@ -276,9 +295,9 @@ run_shard() {
       --rpc_policy_mode heatmapvln \
       --scenes_dir "$SCENES_DIR" \
       --data_path "$COHORTS_DIR/dataset_shard_0${shard}.json.gz" \
-      --dataset_split val_unseen --episode_list "$COHORTS_DIR/shard_0${shard}.json" \
+      --dataset_split val_unseen --episode_list "$EPISODE_LISTS_DIR/shard_0${shard}.json" \
       --output_path "$output" --sim_gpu_id 0 \
-      --resize_w 384 --resize_h 384 --num_history 8 \
+      --resize_w 384 --resize_h 384 --num_history "$NUM_HISTORY" \
       --max_steps_per_episode 500 --max_system2_calls_per_episode 0 \
       --auto_stop_distance 0 --trajectory_selection mean \
       --trajectory_x_sign 1 --trajectory_heading_alignment none \
@@ -326,7 +345,7 @@ if [[ "$TIMING" -eq 1 ]]; then
   fi
 fi
 
-if [[ -z "$MAX_EPISODES" && "${#SHARDS[@]}" -eq "$NUM_SHARDS" ]]; then
+if [[ -z "$MAX_EPISODES" && "${#SHARDS[@]}" -eq "$NUM_SHARDS" && "$EPISODE_LISTS_DIR" == "$COHORTS_DIR" ]]; then
   PYTHONPATH="$RPC_PYTHONPATH" "$PYTHON" "$MERGE_TOOL" \
     --dataset "$DATASET" --cohorts-dir "$COHORTS_DIR" \
     --workers-dir "$WORKERS_DIR" --output-dir "$MERGED_DIR" \

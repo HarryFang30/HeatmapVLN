@@ -937,6 +937,19 @@ class HeatmapVLNRuntime:
         adapter_cfg = nextdit.get("pano_latent_adapter", {})
         if args.pano_latent_adapter_checkpoint and isinstance(adapter_cfg, dict):
             adapter_cfg["pretrained_path"] = ""
+        # EXP-21 sensitivity: System1's sample count S and denoising steps M.  The NextDiT head is built from this
+        # config and the action post-processing reads num_sample_trajs from it, so both follow the override.
+        for key, value in (
+            ("num_sample_trajs", getattr(args, "nextdit_num_sample_trajs", None)),
+            ("num_inference_steps", getattr(args, "nextdit_num_inference_steps", None)),
+        ):
+            if value is None:
+                continue
+            if int(value) < 1:
+                raise ValueError(f"nextdit.{key} must be a positive integer, got {value!r}")
+            nextdit = cfg.setdefault("model", {}).setdefault("action_head", {}).setdefault("nextdit", {})
+            LOGGER.info("Sensitivity override (EXP-21): nextdit.%s %s -> %d", key, nextdit.get(key), int(value))
+            nextdit[key] = int(value)
         return cfg
 
     def _load_model(self, args: argparse.Namespace, device: torch.device):
@@ -2182,6 +2195,18 @@ def parse_args() -> argparse.Namespace:
         help="Also decode the native first turn (adapters off) on every ready call and record agreement.",
     )
     parser.add_argument("--cognition_max_new_tokens", type=int, default=96)
+    parser.add_argument(
+        "--nextdit_num_sample_trajs",
+        type=int,
+        default=None,
+        help="EXP-21 sensitivity: System1 trajectory samples S (default: the config's, 32).",
+    )
+    parser.add_argument(
+        "--nextdit_num_inference_steps",
+        type=int,
+        default=None,
+        help="EXP-21 sensitivity: System1 denoising steps M (default: the config's, 10).",
+    )
     parser.add_argument(
         "--ppa_bridge_off",
         action="store_true",
