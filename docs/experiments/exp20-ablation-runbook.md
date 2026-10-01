@@ -57,7 +57,20 @@ docker exec -d fjl-habitat bash -lc "cd /workspace/exp20/src_<SHA> && \
 
 金丝雀的 SR 等数字只有 4 集，不作任何判断。
 
-## 3. 分析
+## 3. 自动调度（2026-09-30 起）
+
+用户要求：哪个臂的金丝雀通过，就直接开它的全量。容器里常驻
+`/workspace/exp20/orchestrate.sh`（仓库副本 `scripts/exp20/orchestrate.sh`），日志在 `/workspace/exp20/logs/orchestrate.out`。
+
+- **任务顺序**：A1 / A2 / A3 金丝雀 → A1 / A2 / A3 种子 42 → A0 种子 1337 → A1 / A2 / A3 种子 1337。
+- **占卡**：每个任务占一张空卡。空卡的标准是没有别的进程、显存占用不到 500 MiB；GPU 0 放宽到 4000 MiB 以下，因为用户同意与上面那个别人的空闲进程共用。
+- **金丝雀判定**：由 `scripts/exp20/canary_check.py` 按 §2 的条件判定，结果写到 `logs/canary_<臂>.verdict.json`。
+  - 通过的臂接着开全量；没通过的臂，它的全量标成 `state/<任务>.blocked`，不开。
+- **状态与续跑**：任务结束（不论退出码）写 `state/<任务>.exit`，不会自动重跑；重启调度脚本会跳过已结束、已跳过和仍在运行的任务。
+- **端口与显示号**：第 k 个任务用模型端口 52600+10k、里程计端口 52700+10k、显示号 390+10k，与手动起的 A0（52400 / 52500 / 360）错开。
+- **停止**：对 `orchestrate.sh` 的 PID 发 TERM。它停下后，已开的运行照常跑完。
+
+## 4. 分析
 
 - 每个臂对 A0，按同平台、同种子配对：`scripts/tools/paired_closed_loop_bootstrap.py`，2000 次重采样，两种子合并报 ΔSR / ΔSPL / ΔNE。
 - 判据只看配对 CI（台账 EXP-20）。论文表的取数规则单独写在台账里，不影响判读。
