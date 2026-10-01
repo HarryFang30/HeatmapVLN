@@ -687,6 +687,7 @@ class HeatmapVLNRuntime:
         self.ppa_online_amb3r = bool(
             getattr(args, "require_ppa_online_amb3r", False)
         )
+        self.ppa_bridge_off = bool(getattr(args, "ppa_bridge_off", False))
         self.system2_cognition_arm = bool(getattr(args, "system2_cognition_arm", False))
         self.cognition_audit_native = bool(getattr(args, "cognition_audit_native", False))
         self.cognition_max_new_tokens = int(getattr(args, "cognition_max_new_tokens", 96))
@@ -703,6 +704,13 @@ class HeatmapVLNRuntime:
         )
         self._preflight_ppa_stage0_action_arm()
         self.ppa_checkpoint_contract = self._preflight_ppa_online_amb3r()
+        if self.ppa_bridge_off:
+            if not self.ppa_online_amb3r:
+                raise RuntimeError("--ppa_bridge_off needs the formal PPA runtime (--require_ppa_online_amb3r)")
+            LOGGER.info(
+                "PPA bridge off (EXP-20 A1): the History Head and bridge run as deployed, "
+                "System1 samples from Z instead of the injected Z~"
+            )
         self.cognition_contract = self._preflight_system2_cognition_arm()
         if self.ppa_online_amb3r:
             self.model_version = (
@@ -1872,14 +1880,18 @@ class HeatmapVLNRuntime:
                                 return_diagnostics=True,
                             )
                         )
+                    bridge_off = getattr(self, "ppa_bridge_off", False)
                     with timer.stage("system1_nextdit_sampling"):
                         trajectory = (
                             self.model.nextdit_action_head.get_trajectory_from_projected(
-                                plan_z,
+                                # EXP-20 A1: the same call without the injection
+                                plan_z0 if bridge_off else plan_z,
                                 traj_images=traj_images,
                                 generator=trajectory_generator,
                             )
                         )
+                    if bridge_off:
+                        response["ppa_bridge_off"] = True
                     # Diagnostics only: the Future Head does not feed the actions.
                     with timer.stage("future_heatmap_diagnostics"):
                         future_output = self.model.past_plan_action.decode_future(
@@ -2170,6 +2182,15 @@ def parse_args() -> argparse.Namespace:
         help="Also decode the native first turn (adapters off) on every ready call and record agreement.",
     )
     parser.add_argument("--cognition_max_new_tokens", type=int, default=96)
+    parser.add_argument(
+        "--ppa_bridge_off",
+        action="store_true",
+        help=(
+            "EXP-20 A1 (no history injection): with --require_ppa_online_amb3r, run the History "
+            "Head and bridge as deployed but let System1 sample from Z instead of Z~ (same "
+            "per-call noise). Responses still report ppa_applied=true and add ppa_bridge_off=true."
+        ),
+    )
     parser.add_argument(
         "--timing",
         action="store_true",

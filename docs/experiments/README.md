@@ -2410,9 +2410,11 @@ C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz
 **设置.**
 - **模型**：A0 用部署权重与 `configs/ppa_action_refine_v2_8gpu.yaml`；A2 用 `exp05_v1_unconstrained_bridge_best_deployment_full.pth`；
   A3 用 `exp09c_stage3_ablation_best.pth`。两份消融权重都在本地 `~/HeatmapVLN_checkpoints/ablations/`，sha256 已核对（计划 §1.3）。
-- **A1**：同一部署权重，服务端 `--ppa_stage0_action_arm baseline`，走原生快系统路径（即 EXP-06 的零桥）。
-  启动脚本还没透传这个开关，脚本末尾"PPA 至少生效一次"的检查也要放开。实现后先跑 2 集金丝雀确认能运行，再开全量。
-- **A2 / A3**：开全量前各跑 2 集金丝雀，确认权重能加载、动作合理。
+- **A1**：同一部署权重，服务端加 `--ppa_bridge_off`（启动脚本 `PPA_EVAL_BRIDGE_OFF=1`）。
+  - 历史头和桥照常运行，快系统改用 Z（`plan_z0`）而不是注入后的 Z̃ 采样，每次调用的扩散噪声不变。
+    这和 EXP-19 H3 的反事实是同一个定义。
+  - 改动在任何结果之前（2026-09-30）。原先打算用的 `--ppa_stage0_action_arm baseline` 要求桥的输出层全零，部署权重过不了这一关，所以弃用。
+- **A1 / A2 / A3**：开全量前各跑 2 集金丝雀，通过条件写在 [exp20-ablation-runbook.md](exp20-ablation-runbook.md) §2。
 - **协议**：其余与主表相同（锁定的 8 分片集表、确定性采样、在线 AMB3R VO）。
 - **平台**：先用 4090（`scripts/run_ppa_r2r_val_unseen_cuda.sh`，只用空卡），之后用华为 8 卡新机器（要先移植）。
   每个数字都标平台；同一配对比较只在同平台内做。

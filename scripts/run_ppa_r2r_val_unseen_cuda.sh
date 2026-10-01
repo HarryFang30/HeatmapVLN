@@ -54,6 +54,8 @@ MAX_EPISODES="${PPA_EVAL_MAX_EPISODES_PER_SHARD:-}"
 # <shard output>/timing/*.jsonl and the run ends with a latency summary.  Stages
 # synchronise CUDA, so a timed run is slower; the actions are the same.
 TIMING="${PPA_EVAL_TIMING:-0}"
+# 1: EXP-20 A1, System1 samples from Z instead of the injected Z~ (rpc_model_server.py --ppa_bridge_off).
+BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
 if [[ -n "$MAX_EPISODES" ]]; then
   default_output="$ROOT/eval_runs/canary_seed${PROTOCOL_SEED}"
 else
@@ -146,6 +148,9 @@ NUM_SLOTS="${#GPUS[@]}"
 [[ "$PROTOCOL_SEED" =~ ^[0-9]+$ ]] || die "PPA_EVAL_PROTOCOL_SEED must be a non-negative integer"
 [[ -z "$MAX_EPISODES" || "$MAX_EPISODES" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_MAX_EPISODES_PER_SHARD must be a positive integer"
 [[ "$TIMING" =~ ^[01]$ ]] || die "PPA_EVAL_TIMING must be 0 or 1"
+[[ "$BRIDGE_OFF" =~ ^[01]$ ]] || die "PPA_EVAL_BRIDGE_OFF must be 0 or 1"
+declare -a MODEL_EXTRA=()
+[[ "$BRIDGE_OFF" -eq 1 ]] && MODEL_EXTRA=(--ppa_bridge_off)
 # Always set, so a value left in the calling shell cannot switch timing on or off.
 export HEATMAPVLN_TIMING="$TIMING"
 for gpu in "${GPUS[@]}" "${VO_GPUS[@]}"; do
@@ -161,7 +166,8 @@ done
 mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 # Timing logs newer than this marker belong to this run (--resume keeps older ones).
 [[ "$TIMING" -eq 0 ]] || touch "$RUNTIME_DIR/timing_start"
-echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING"
+echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING bridge_off=$BRIDGE_OFF"
+echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
 echo "[ppa-eval] output=$OUTPUT_ROOT"
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
@@ -191,7 +197,7 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
       --config "$PPA_CONFIG" --checkpoint "$PPA_CHECKPOINT" \
       --internnav_model_path "$INTERNNAV_MODEL_PATH" \
       --gpu_id 0 --host 127.0.0.1 --port $((MODEL_PORT_BASE + slot)) --workers 1 \
-      --require_deterministic_sampling --require_ppa_online_amb3r \
+      --require_deterministic_sampling --require_ppa_online_amb3r "${MODEL_EXTRA[@]}" \
       --log_level INFO >"$RUNTIME_DIR/logs/model_${slot}.log" 2>&1 &
   MODEL_PIDS[$slot]="$!"
   env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" CUDA_VISIBLE_DEVICES="${VO_GPUS[$slot]}" \
@@ -241,6 +247,10 @@ PY
   done
   grep -F "Formal PPA online AMB3R runtime enabled" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
     || die "model slot $slot lacks PPA preflight evidence"
+  if [[ "$BRIDGE_OFF" -eq 1 ]]; then
+    grep -F "PPA bridge off (EXP-20 A1)" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+      || die "model slot $slot lacks bridge-off evidence"
+  fi
   echo "[ppa-eval] slot=$slot gpu=${GPUS[$slot]} vo_gpu=${VO_GPUS[$slot]} model=$model_addr vo=$vo_addr ready"
 done
 
