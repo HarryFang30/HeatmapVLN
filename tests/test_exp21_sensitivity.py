@@ -98,3 +98,10 @@ def test_server_overrides_s_and_m_only_when_asked(runtime_cls):
         assert cfg == base
     with pytest.raises(ValueError, match="positive integer"):
         _cfg(runtime_cls, nextdit_num_sample_trajs=0, nextdit_num_inference_steps=None)
+
+
+def test_full_run_summary_reads_the_merged_progress_jsonl():
+    """The merge tool writes merged/progress.jsonl; the summary used to look for progress.json and fail a finished
+    full run with "no episodes were recorded" (A0 seed 42, 2026-10-02)."""
+    sh = LAUNCHER.read_text(encoding="utf-8")
+    assert '(root / "progress.jsonl", root / "progress.json")' in sh

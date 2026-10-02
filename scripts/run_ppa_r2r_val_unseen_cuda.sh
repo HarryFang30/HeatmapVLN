@@ -366,8 +366,8 @@ import sys
 from pathlib import Path
 
 root, expected, shards = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3].split(",")
-if expected:
-    files = [root / "progress.json"]
+if expected:  # the merge tool writes progress.jsonl
+    files = [path for path in (root / "progress.jsonl", root / "progress.json") if path.exists()][:1]
 else:
     files = [root / f"shard_0{s}" / "progress.json" for s in shards]
 rows = []
