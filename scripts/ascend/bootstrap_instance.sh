@@ -19,6 +19,8 @@ set -Eeuo pipefail
 
 ROOT="${PPA_EVAL_ROOT:-$HOME/work/zhr/zhr_1}"
 REPO="${PPA_EVAL_REPO:-$ROOT/HeatmapVLN}"
+# Same expression the server launcher uses, so both check the same tree.
+AMB3R_ROOT="${PPA_EVAL_AMB3R_ROOT:-$ROOT/amb3r}"
 PYTHON="${PPA_EVAL_PYTHON:-$ROOT/envs/ppa/bin/python}"
 TUNNEL_KEY_PUB="${PPA_TUNNEL_KEY_PUB:-$ROOT/tunnel/tunnel_key.pub}"
 ASCEND_ENV="${PPA_NPU_ASCEND_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
@@ -62,12 +64,18 @@ else
 fi
 
 # --- the share ---------------------------------------------------------------
-for path in "$ROOT" "$REPO" "$ROOT/amb3r/slam/slam_config.yaml" \
+for path in "$ROOT" "$REPO" "$AMB3R_ROOT/slam/slam_config.yaml" \
   "$ROOT/InternNav_Model/config.json" "$ROOT/weights/ppa_refine_v2_best.pth" \
-  "$ROOT/rpc/src/vla_rpc" "$ROOT/amb3r/checkpoints/DA3NESTED-GIANT-LARGE/model.safetensors"; do
+  "$ROOT/rpc/src/vla_rpc" "$AMB3R_ROOT/checkpoints/DA3NESTED-GIANT-LARGE/model.safetensors"; do
   [[ -e "$path" ]] || die "missing on the share: $path (is the right volume mounted?)"
 done
 ok "repo, weights, AMB3R tree and RPC tools present on the share"
+
+# Existence is not enough for the AMB3R tree: its two NPU fixes are applied by hand
+# and both fail silently when they are missing (fp32 mapping, fp16 DA3), so a clean
+# clone and a patched tree look identical to every check above.
+bash "$REPO/scripts/ascend/check_amb3r_patch.sh" "$AMB3R_ROOT" "$REPO/scripts/ascend/amb3r_npu.patch" \
+  || die "the AMB3R tree on the share is not the patched one (see above)"
 
 [[ -x "$PYTHON" ]] || die "missing environment: $PYTHON (rebuild it, see docs/ops/deploy_ascend_910b.md)"
 
@@ -125,8 +133,11 @@ if [[ -r "$TUNNEL_KEY_PUB" ]]; then
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
   touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
   key="$(tr -d '\n' < "$TUNNEL_KEY_PUB")"
-  comment="${key##* }"
-  [[ -n "$comment" ]] || die "$TUNNEL_KEY_PUB has no comment field to identify it by"
+  # Identify an existing authorization by the key material itself, never by the
+  # comment: comments are free text, and deleting every line that merely contains
+  # this one's comment as a substring would revoke someone else's key.
+  blob="$(printf '%s' "$key" | awk '{print $2}')"
+  [[ "$blob" =~ ^[A-Za-z0-9+/=]{40,}$ ]] || die "$TUNNEL_KEY_PUB does not look like an SSH public key"
   permit=""
   for slot in $(seq 0 $((MAX_SLOTS - 1))); do
     permit+=",permitopen=\"127.0.0.1:$((MODEL_PORT_BASE + slot))\""
@@ -135,12 +146,18 @@ if [[ -r "$TUNNEL_KEY_PUB" ]]; then
   # Forwarding only, and only to the slot ports: this key can neither open a shell
   # nor reach anything else on the instance.
   line="restrict,port-forwarding${permit} ${key}"
-  if grep -qF "$comment" "$HOME/.ssh/authorized_keys"; then
-    grep -vF "$comment" "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.new" || true
-    mv "$HOME/.ssh/authorized_keys.new" "$HOME/.ssh/authorized_keys"
-    chmod 600 "$HOME/.ssh/authorized_keys"
-  fi
-  printf '%s\n' "$line" >> "$HOME/.ssh/authorized_keys"
+  # One atomic replacement: drop this key's old authorization, append the new one,
+  # then rename over the file.  Filtering in place and appending afterwards left a
+  # window in which the tunnel key was not authorized at all.
+  new="$HOME/.ssh/authorized_keys.new.$$"
+  awk -v blob="$blob" '{
+    present = 0
+    for (i = 1; i <= NF; i++) if ($i == blob) present = 1
+    if (!present) print
+  }' "$HOME/.ssh/authorized_keys" > "$new"
+  printf '%s\n' "$line" >> "$new"
+  chmod 600 "$new"
+  mv -f "$new" "$HOME/.ssh/authorized_keys"
   ok "tunnel key authorized for ports ${MODEL_PORT_BASE}-$((MODEL_PORT_BASE + MAX_SLOTS - 1)) and ${VO_PORT_BASE}-$((VO_PORT_BASE + MAX_SLOTS - 1)), forwarding only"
 else
   warn "no tunnel public key at $TUNNEL_KEY_PUB; the client box will not be able to reach these servers"

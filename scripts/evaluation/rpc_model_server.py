@@ -715,6 +715,31 @@ def _warm_up_npu(device: torch.device) -> None:
     LOGGER.info("NPU op toolchain ready (conv2d and matmul in bf16 on %s)", device)
 
 
+def _npu_poison_after_failure(device: torch.device, exc: BaseException) -> str | None:
+    """After a failed request, whether the NPU itself can still compute.
+
+    An Ascend AICPU timeout (ACL error 507017) mid-request leaves the process alive
+    and listening: connect, HealthCheck and GetServerInfo keep succeeding, and only
+    the next request that reaches the device fails.  So the device is probed rather
+    than the exception read.  Bad payloads and numerical errors raise from the same
+    places as a device fault, but leave the stream healthy: for them the
+    synchronize returns and nothing is recorded.
+
+    Returns the original failure as a short reason when the device is gone.
+    """
+    try:
+        torch.npu.synchronize(device)
+    except Exception as sync_exc:
+        LOGGER.error(
+            "NPU device unusable after a failed request; HealthCheck now reports "
+            "NOT_SERVING (synchronize: %s: %s)",
+            type(sync_exc).__name__,
+            sync_exc,
+        )
+        return f"{type(exc).__name__}: {exc}"[:300]
+    return None
+
+
 def _resolve_device(args: argparse.Namespace) -> torch.device:
     """The accelerator named by ``--device``/``--gpu_id``.
 
@@ -2169,11 +2194,15 @@ class HeatmapVLNRuntime:
 
 
 class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
-    def __init__(self, runtime: HeatmapVLNRuntime):
+    def __init__(self, runtime: HeatmapVLNRuntime, server_instance: str = ""):
         self.runtime = runtime
         self.requests_processed = 0
         self.model_version = runtime.model_version
         self.timing = timing_enabled()
+        self.server_instance = server_instance
+        # Set once, on NPU only, when a failed request left the device unable to
+        # synchronize; from then on HealthCheck reports NOT_SERVING with it.
+        self.device_poison: str | None = None
 
     def InferJSON(self, request: vla_pb2.JSONRequest, context) -> vla_pb2.JSONResponse:
         # Off (the default): a disabled timer, every stage a no-op, the response unchanged.
@@ -2202,6 +2231,8 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             )
         except Exception as exc:
             LOGGER.exception("InferJSON failed")
+            if self.device_poison is None and self.runtime.device.type == "npu":
+                self.device_poison = _npu_poison_after_failure(self.runtime.device, exc)
             context.set_details(str(exc))
             context.set_code(grpc.StatusCode.INTERNAL)
             return vla_pb2.JSONResponse(ts=request.ts, json_payload=json.dumps({"ok": False, "error": str(exc)}))
@@ -2209,6 +2240,13 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             _REQUEST_TIMING.timer = _TIMING_OFF
 
     def HealthCheck(self, request: vla_pb2.HealthCheckRequest, context) -> vla_pb2.HealthCheckResponse:
+        if self.device_poison is not None:
+            return vla_pb2.HealthCheckResponse(
+                status=vla_pb2.HealthCheckResponse.NOT_SERVING,
+                message=self.device_poison,
+                version=PROTO_VERSION,
+                requests_processed=self.requests_processed,
+            )
         return vla_pb2.HealthCheckResponse(
             status=vla_pb2.HealthCheckResponse.SERVING,
             message="HeatmapVLN model server is running",
@@ -2234,8 +2272,26 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
                     if getattr(self.runtime, "system2_cognition_arm", False)
                     else []
                 ),
+                *self._instance_formats(),
             ],
         )
+
+    def _instance_formats(self) -> list[str]:
+        """What a client needs to tell this server from another on the same port.
+
+        The Ascend slots reuse the ports of the 4090's own local servers, and
+        model_version is built from a path component that two boxes can share, so
+        neither proves which machine answered.  Appended after every capability,
+        and only with --server_instance, so membership checks and the default
+        reply are unchanged.
+        """
+        if not self.server_instance:
+            return []
+        return [
+            f"heatmapvln-instance:{self.server_instance}",
+            f"heatmapvln-device:{self.runtime.device.type}",
+            f"heatmapvln-timing:{int(self.timing)}",
+        ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -2331,6 +2387,16 @@ def parse_args() -> argparse.Namespace:
             "every backend so platforms stay comparable."
         ),
     )
+    parser.add_argument(
+        "--server_instance",
+        default="",
+        help=(
+            "Token naming this server process. When set, GetServerInfo adds "
+            "heatmapvln-instance/-device/-timing entries to supported_formats and the "
+            "port is bound without SO_REUSEPORT, so a client can refuse a different "
+            "server that happens to listen on the same port. Empty changes nothing."
+        ),
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -2346,14 +2412,22 @@ def main() -> int:
     if timing_enabled():
         LOGGER.info("Latency timing enabled: responses carry timing_ms")
     runtime = HeatmapVLNRuntime(args)
+    options = [
+        ("grpc.max_send_message_length", 128 * 1024 * 1024),
+        ("grpc.max_receive_message_length", 128 * 1024 * 1024),
+    ]
+    if args.server_instance:
+        # gRPC binds with SO_REUSEPORT by default on Linux, so a second server
+        # started on an occupied port binds too and the kernel splits connections
+        # between the two.  A named instance must own its port or fail to start.
+        options.append(("grpc.so_reuseport", 0))
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=args.workers),
-        options=[
-            ("grpc.max_send_message_length", 128 * 1024 * 1024),
-            ("grpc.max_receive_message_length", 128 * 1024 * 1024),
-        ],
+        options=options,
     )
-    vla_pb2_grpc.add_VLAServicer_to_server(HeatmapVLNRPCServicer(runtime), server)
+    vla_pb2_grpc.add_VLAServicer_to_server(
+        HeatmapVLNRPCServicer(runtime, server_instance=args.server_instance), server
+    )
     address = f"{args.host}:{args.port}"
     bound_port = server.add_insecure_port(address)
     if bound_port == 0:

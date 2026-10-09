@@ -76,6 +76,16 @@ SHARD_RETRIES="${PPA_EVAL_SHARD_RETRIES:-0}"
 # The remote servers' runtime directory, copied or mounted here: servers.json plus
 # the startup logs, which is where the preflight evidence lives in external mode.
 EXTERNAL_SERVER_DIR="${PPA_EVAL_EXTERNAL_SERVER_DIR:-}"
+# 1: let a capped run resume or retry.  Off, because --max_episodes counts only
+# episodes that are not already done (r2r_val_unseen.py:_eval_limit), and the cap is
+# re-passed unchanged on every restart and every relaunch: a "4-episode canary" that
+# dies once quietly becomes 5, and with retries=2 up to 12, with nothing in
+# progress.json saying which rows were the extra ones.  Pin the episodes with
+# PPA_EVAL_EPISODE_LISTS_DIR instead (scripts/tools/make_episode_lists_from_run.py),
+# and then no cap is needed at all.
+ALLOW_CAPPED_RESUME="${PPA_EVAL_ALLOW_CAPPED_RESUME:-0}"
+# 1: accept servers built from a different commit than this client.
+ALLOW_COMMIT_MISMATCH="${PPA_EVAL_ALLOW_COMMIT_MISMATCH:-0}"
 if [[ -n "$MAX_EPISODES" ]]; then
   default_output="$ROOT/eval_runs/canary_seed${PROTOCOL_SEED}"
 else
@@ -205,6 +215,20 @@ if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
   [[ "$VO_GPU_CSV" == "$GPU_CSV" ]] \
     || die "PPA_EVAL_VO_GPU_DEVICES means nothing in external mode; the servers choose their own devices"
 fi
+[[ "$ALLOW_CAPPED_RESUME" =~ ^[01]$ ]] || die "PPA_EVAL_ALLOW_CAPPED_RESUME must be 0 or 1"
+[[ "$ALLOW_COMMIT_MISMATCH" =~ ^[01]$ ]] || die "PPA_EVAL_ALLOW_COMMIT_MISMATCH must be 0 or 1"
+# A capped run is a fixed, pre-registered sample, and both of these silently change
+# which episodes are in it.  Refused here rather than noticed afterwards, because
+# nothing downstream can tell a capped run's rows apart from a restart's.
+if [[ -n "$MAX_EPISODES" && "$ALLOW_CAPPED_RESUME" -eq 0 ]]; then
+  (( SHARD_RETRIES == 0 )) \
+    || die "PPA_EVAL_MAX_EPISODES_PER_SHARD with PPA_EVAL_SHARD_RETRIES=$SHARD_RETRIES would run $MAX_EPISODES more new episodes per restart; pin the episodes with PPA_EVAL_EPISODE_LISTS_DIR, or set PPA_EVAL_ALLOW_CAPPED_RESUME=1"
+  for shard in "${SHARDS[@]}"; do
+    progress="$WORKERS_DIR/shard_0${shard}/progress.json"
+    [[ -s "$progress" ]] \
+      && die "capped run into $progress, which already has $(wc -l < "$progress" | tr -d ' ') episode(s): --resume skips them and the cap would add $MAX_EPISODES more; use a fresh PPA_EVAL_OUTPUT_ROOT, or set PPA_EVAL_ALLOW_CAPPED_RESUME=1"
+  done
+fi
 for shard in "${SHARDS[@]}"; do
   [[ "$shard" =~ ^[0-7]$ ]] || die "invalid shard: $shard"
   require_file "$COHORTS_DIR/shard_0${shard}.json"
@@ -247,15 +271,32 @@ if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
     tcp_open $((VO_PORT_BASE + slot)) \
       || die "nothing is listening on 127.0.0.1:$((VO_PORT_BASE + slot)); is the SSH tunnel up?"
   done
+  # A server set that stopped, or a slot whose device died, must not be resumed
+  # against: the servers log the marker and report NOT_SERVING, but their ports can
+  # still be open through the tunnel.
+  [[ -e "$EXTERNAL_SERVER_DIR/STOPPED" ]] \
+    && die "$EXTERNAL_SERVER_DIR/STOPPED exists: that server set has already been stopped; start the servers again and copy the new runtime directory"
+  if [[ -e "$EXTERNAL_SERVER_DIR/RETIRED" ]]; then
+    cat "$EXTERNAL_SERVER_DIR/RETIRED" >&2
+    die "$EXTERNAL_SERVER_DIR/RETIRED exists: at least one slot was retired after its NPU became unusable (see above)"
+  fi
+  if [[ -d "$RUNTIME_DIR/external_server_logs" ]] \
+    && grep -rlF "NPU device unusable after a failed request" "$RUNTIME_DIR/external_server_logs" 2>/dev/null; then
+    die "an external server log reports its NPU unusable (listed above); restart the servers before running"
+  fi
+  CLIENT_COMMIT="$(git -c safe.directory="$REPO" -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
   "$CLIENT_PYTHON" - "$RUNTIME_DIR/external_servers.json" "$NUM_SLOTS" "$MODEL_PORT_BASE" "$VO_PORT_BASE" \
-    "$BRIDGE_OFF" <<'EXT' || die "external servers.json does not match this run"
+    "$BRIDGE_OFF" "$TIMING" "$NUM_SAMPLE_TRAJS" "$NUM_INFERENCE_STEPS" "$CLIENT_COMMIT" \
+    "$ALLOW_COMMIT_MISMATCH" <<'EXT' || die "external servers.json does not match this run"
 import json
+import re
 import sys
 
-path, slots, model_base, vo_base, bridge_off = sys.argv[1:6]
+(path, slots, model_base, vo_base, bridge_off, timing, num_sample_trajs,
+ num_inference_steps, client_commit, allow_commit_mismatch) = sys.argv[1:11]
 record = json.load(open(path, encoding="utf-8"))
 problems = []
-if record.get("schema") != "heatmapvln-npu-servers-v1":
+if record.get("schema") != "heatmapvln-npu-servers-v2":
     problems.append(f"unexpected schema {record.get('schema')!r}")
 if int(record.get("slots", 0)) < int(slots):
     problems.append(f"servers expose {record.get('slots')} slot(s), this run wants {slots}")
@@ -269,6 +310,32 @@ if record.get("vo_ports", [])[: int(slots)] != want_vo:
     problems.append(f"VO ports {record.get('vo_ports')} != {want_vo}")
 if int(record.get("bridge_off", 0)) != int(bridge_off):
     problems.append(f"servers bridge_off={record.get('bridge_off')}, this run sets {bridge_off}")
+# Timing is per process: with the client timed and the servers not, every check used
+# to pass and the latency summary silently covered client stages only.
+if int(record.get("timing", 0)) != int(timing):
+    problems.append(f"servers timing={record.get('timing')}, this run sets {timing}")
+# The arm is the servers' sampling configuration as much as the client's flags.
+for key, want in (("num_sample_trajs", num_sample_trajs), ("num_inference_steps", num_inference_steps)):
+    if str(record.get(key, "")) != str(want):
+        problems.append(f"servers {key}={record.get(key)!r}, this run sets {want!r}")
+# Written but never checked until now: a token-less or hand-started server set, or
+# one whose build cannot be identified, cannot be the subject of a recorded result.
+if not record.get("server_instance"):
+    problems.append("servers.json has no server_instance; start them with the launcher, not by hand")
+if record.get("device") != "npu":
+    problems.append(f"servers.json says device={record.get('device')!r}, expected 'npu'")
+if not re.fullmatch(r"[0-9a-f]{40}", str(record.get("repo_commit", ""))):
+    problems.append(f"servers.json repo_commit={record.get('repo_commit')!r} is not a commit")
+if int(record.get("repo_dirty", 0)) != 0:
+    problems.append("the servers ran from a dirty working tree (repo_dirty=1)")
+if (
+    str(record.get("repo_commit")) != client_commit
+    and int(allow_commit_mismatch) == 0
+):
+    problems.append(
+        f"servers ran {str(record.get('repo_commit'))[:12]}, this client is {client_commit[:12]}; "
+        "set PPA_EVAL_ALLOW_COMMIT_MISMATCH=1 if that is intended"
+    )
 if problems:
     print("external server mismatch: " + "; ".join(problems), file=sys.stderr)
     raise SystemExit(1)
@@ -309,11 +376,61 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
 done
 fi
 
+# Both servers of a slot answer, are healthy and speak their protocol.  In external
+# mode it also checks WHICH servers answered, against the recorded servers.json: a
+# TCP connect proves only that something holds the port, and the something it reaches
+# is the local ssh forwarder, so neither a dead remote server nor a local CUDA pair on
+# the same default ports can be told apart without asking the server who it is.
+# Exit 1: no usable answer (down, unhealthy, or still starting).  Exit 3: answered,
+# but it is not the recorded server set -- retrying cannot fix that.
+rpc_ready() {
+  PYTHONPATH="$RPC_PYTHONPATH" "$CLIENT_PYTHON" - "$1" "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" <<'PY' >/dev/null 2>&1
+import sys
+from vla_rpc.client import VLAClient
+
+model_address, vo_address, token, timing, rng_seed, model_version = (sys.argv[1:7] + [""] * 6)[:6]
+wanted = {model_address: ["ppa-online-amb3r-v1"], vo_address: ["json+jpeg"]}
+if token:
+    for address, expected in wanted.items():
+        expected += [f"heatmapvln-instance:{token}", "heatmapvln-device:npu", f"heatmapvln-timing:{int(timing)}"]
+    wanted[vo_address].append(f"heatmapvln-vo-rng-seed:{rng_seed}")
+for address, expected in wanted.items():
+    client = VLAClient(server_addr=address, timeout_ms=5000)
+    try:
+        client.connect()
+        info = client.get_server_info()
+        if not client.health_check() or info is None:
+            raise SystemExit(1)
+        formats = set(info.supported_formats)
+        protocol = expected[0]
+        if protocol not in formats:
+            raise SystemExit(1 if not token else 3)
+        if [item for item in expected[1:] if item not in formats]:
+            raise SystemExit(3)
+        # The build the servers.json evidence describes, as the server names it now.
+        if model_version and address == model_address and info.model_version != model_version:
+            raise SystemExit(3)
+    finally:
+        client.close()
+PY
+}
+
 echo "[ppa-eval] waiting for $((2 * NUM_SLOTS)) RPC servers"
 deadline=$(( $(date +%s) + SERVER_START_TIMEOUT_S ))
+# In external mode every readiness probe also demands this identity; empty locally,
+# which leaves the certified CUDA path checking exactly what it checked before.
+declare -a IDENTITY=()
+if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
+  external_instance="$("$CLIENT_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["server_instance"])' "$RUNTIME_DIR/external_servers.json")"
+  external_seed="$("$CLIENT_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["vo_rng_seed"])' "$RUNTIME_DIR/external_servers.json")"
+  external_model_version="$("$CLIENT_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["model_version"])' "$RUNTIME_DIR/external_servers.json")"
+fi
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   model_addr="127.0.0.1:$((MODEL_PORT_BASE + slot))"
   vo_addr="127.0.0.1:$((VO_PORT_BASE + slot))"
+  if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
+    IDENTITY=("$external_instance/slot$slot" "$TIMING" "$external_seed" "$external_model_version")
+  fi
   while true; do
     if [[ "$EXTERNAL_SERVERS" -eq 0 ]]; then
       kill -0 "${MODEL_PIDS[$slot]}" 2>/dev/null || { tail -120 "$RUNTIME_DIR/logs/model_${slot}.log" >&2; die "model server slot $slot exited"; }
@@ -323,25 +440,13 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
       tcp_open $((MODEL_PORT_BASE + slot)) || die "127.0.0.1:$((MODEL_PORT_BASE + slot)) stopped listening (remote server or tunnel down)"
       tcp_open $((VO_PORT_BASE + slot)) || die "127.0.0.1:$((VO_PORT_BASE + slot)) stopped listening (remote server or tunnel down)"
     fi
-    if PYTHONPATH="$RPC_PYTHONPATH" "$CLIENT_PYTHON" - "$model_addr" "$vo_addr" <<'PY' >/dev/null 2>&1
-import sys
-from vla_rpc.client import VLAClient
-
-for address, expected in ((sys.argv[1], "ppa-online-amb3r-v1"), (sys.argv[2], "json+jpeg")):
-    client = VLAClient(server_addr=address, timeout_ms=5000)
-    try:
-        client.connect()
-        info = client.get_server_info()
-        if not client.health_check() or info is None:
-            raise SystemExit(1)
-        if expected not in set(info.supported_formats):
-            raise SystemExit(2)
-    finally:
-        client.close()
-PY
-    then
+    rc=0
+    rpc_ready "$model_addr" "$vo_addr" "${IDENTITY[@]:-}" || rc=$?
+    if (( rc == 0 )); then
       break
     fi
+    (( rc != 3 )) \
+      || die "slot $slot: the servers on $model_addr / $vo_addr are not the ones in $EXTERNAL_SERVER_DIR/servers.json (wrong instance, device, timing or VO seed); is a local CUDA server holding these ports, or the tunnel pointing elsewhere?"
     (( $(date +%s) < deadline )) || die "RPC startup timeout at slot $slot"
     sleep 10
   done
@@ -413,10 +518,23 @@ run_shard() {
     # The episodes already recorded are kept; --resume skips them on the next attempt.
     echo "[ppa-eval] slot=$slot shard=$shard died; restarting (attempt $((attempt + 1))/$((SHARD_RETRIES + 1)))" >&2
     if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
-      # Wait for the tunnel and the remote servers to come back before trying again,
-      # otherwise the restart just fails on the first call too.
-      for _ in $(seq 1 60); do
-        tcp_open $((MODEL_PORT_BASE + slot)) && tcp_open $((VO_PORT_BASE + slot)) && break
+      # Wait for a server that answers a real RPC, not merely for an open port.  An
+      # Ascend device error leaves the process alive and LISTENing, and in external
+      # mode the thing that accepts the connection is the local ssh forwarder anyway,
+      # so the old tcp_open wait would return at once and the restarted client would
+      # burn every remaining retry on a server that cannot compute.
+      local identity=() recover_deadline=$(( $(date +%s) + SERVER_START_TIMEOUT_S )) probe=0
+      [[ -n "${external_instance:-}" ]] && identity=("$external_instance/slot$slot" "$TIMING" "$external_seed" "$external_model_version")
+      until rpc_ready "127.0.0.1:$((MODEL_PORT_BASE + slot))" "127.0.0.1:$((VO_PORT_BASE + slot))" "${identity[@]:-}"; do
+        probe=$?
+        if (( probe == 3 )); then
+          echo "[ppa-eval] slot=$slot shard=$shard: the servers on these ports are not the recorded set; giving up the shard" >&2
+          return 1
+        fi
+        if (( $(date +%s) >= recover_deadline )); then
+          echo "[ppa-eval] slot=$slot shard=$shard: no healthy RPC within ${SERVER_START_TIMEOUT_S}s; giving up the shard" >&2
+          return 1
+        fi
         sleep 10
       done
     fi
@@ -454,10 +572,17 @@ fi
 if [[ "$TIMING" -eq 1 ]]; then
   mapfile -t timing_files < <(find "$WORKERS_DIR" -path '*/timing/*.jsonl' -newer "$RUNTIME_DIR/timing_start" | sort)
   if (( ${#timing_files[@]} > 0 )); then
+    summary_rc=0
     "$PYTHON" "$REPO/scripts/tools/summarize_latency.py" "${timing_files[@]}" --output-dir "$RUNTIME_DIR/latency" \
-      >"$RUNTIME_DIR/logs/latency_summary.log" 2>&1 \
-      && echo "[ppa-eval] latency summary=$RUNTIME_DIR/latency/latency_summary.md" \
-      || echo "[ppa-eval] WARNING: latency summary failed; see $RUNTIME_DIR/logs/latency_summary.log" >&2
+      >"$RUNTIME_DIR/logs/latency_summary.log" 2>&1 || summary_rc=$?
+    case "$summary_rc" in
+      0) echo "[ppa-eval] latency summary=$RUNTIME_DIR/latency/latency_summary.md" ;;
+      # The summary exists but covers client stages only: timing is per process, so
+      # this is what a timed client in front of untimed servers produces.
+      3) echo "[ppa-eval] latency summary=$RUNTIME_DIR/latency/latency_summary.md"
+         echo "[ppa-eval] WARNING: the servers were not running with HEATMAPVLN_TIMING=1; the summary is client-side only and no end-to-end latency may be quoted from it" >&2 ;;
+      *) echo "[ppa-eval] WARNING: latency summary failed; see $RUNTIME_DIR/logs/latency_summary.log" >&2 ;;
+    esac
   else
     echo "[ppa-eval] WARNING: timing was on but this run wrote no timing log" >&2
   fi
@@ -516,6 +641,45 @@ if expected:
     summary["result"] = json.loads((root / "result.json").read_text())
 print(json.dumps(summary, sort_keys=True))
 PY
+
+# A pinned-list run must have produced exactly the pinned episodes.  The merge tool
+# enforces this for a full run, and a capped run has no fixed set to check against,
+# so without this an uncapped subset run was the one shape that could come out short
+# or long and still print "passed".  Printed after the summary, so a mismatch still
+# leaves the numbers visible, and then fails.
+set_rc=0
+if [[ -z "$MAX_EPISODES" ]]; then
+  "$PYTHON" - "$WORKERS_DIR" "$EPISODE_LISTS_DIR" "$SHARD_CSV" <<'PY' || set_rc=$?
+import json
+import sys
+from pathlib import Path
+
+workers, lists, shards = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3].split(",")
+problems = []
+for shard in shards:
+    listed = json.loads((lists / f"shard_0{shard}.json").read_text(encoding="utf-8"))
+    listed = listed.get("episodes", listed) if isinstance(listed, dict) else listed
+    want = {(str(item["scene_id"]), int(item["episode_id"])) for item in listed}
+    rows = [
+        json.loads(line)
+        for line in (workers / f"shard_0{shard}" / "progress.json").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if any(row.get("scene_id") is None or row.get("episode_id") is None for row in rows):
+        problems.append(f"shard {shard}: a progress row has no scene_id/episode_id, so the set cannot be checked")
+        continue
+    got = [(str(row["scene_id"]), int(row["episode_id"])) for row in rows]
+    if len(got) != len(set(got)):
+        problems.append(f"shard {shard}: {len(got) - len(set(got))} duplicate episode row(s)")
+    if set(got) != want:
+        missing, extra = sorted(want - set(got)), sorted(set(got) - want)
+        problems.append(f"shard {shard}: {len(missing)} listed episode(s) missing, {len(extra)} unlisted episode(s) present")
+if problems:
+    print("episode set mismatch: " + "; ".join(problems), file=sys.stderr)
+    raise SystemExit(1)
+PY
+fi
+(( set_rc == 0 )) || die "the recorded episodes are not the listed ones (see above)"
 
 echo "[ppa-eval] COMPLETE output=$OUTPUT_ROOT"
 echo "[ppa-eval] runtime logs=$RUNTIME_DIR/logs"

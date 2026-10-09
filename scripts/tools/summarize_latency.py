@@ -46,6 +46,13 @@ Sections
                    every process on it: model + VO when they share a card)
   client           client plan stages (per call) and step stages (per run)
 
+HEATMAPVLN_TIMING takes effect per process, so a client timed against servers
+that were not leaves every server-side table empty while the rest of the
+summary looks complete.  ``server_timing_missing`` counts the model-server
+calls and VO RPCs whose response carried no timing_ms; when either is nonzero
+the Markdown opens with a WARNING and the exit code is 3 (both files are still
+written).  Exit code 1: no timing records found.
+
 Usage:
   python scripts/tools/summarize_latency.py <eval output dir or timing files> [--output-dir DIR]
 """
@@ -258,6 +265,35 @@ def summarise_group(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def server_timing_missing(records: list[dict[str, Any]]) -> dict[str, int]:
+    """Server calls that came back without the server's own stage breakdown.
+
+    A server with timing on puts timing_ms in every response, so an answered
+    call without it means that server process ran untimed.  ``model_server_ms``
+    exists in a record only once the model server answered (end_plan), and
+    every ``vo_rpc`` entry is an answered VO RPC.
+    """
+    model = [r["model_server_ms"] for r in records if "model_server_ms" in r]
+    vo = [entry.get("server_ms") for r in records for entry in r.get("vo_rpc") or []]
+    return {
+        "model_server_calls": sum(1 for stages in model if not stages),
+        "model_server_calls_seen": len(model),
+        "vo_rpcs": sum(1 for stages in vo if not stages),
+        "vo_rpcs_seen": len(vo),
+    }
+
+
+def server_timing_warning(missing: dict[str, int]) -> str | None:
+    if not (missing["model_server_calls"] or missing["vo_rpcs"]):
+        return None
+    return (
+        f"WARNING: {missing['model_server_calls']} of {missing['model_server_calls_seen']} model-server calls "
+        f"and {missing['vo_rpcs']} of {missing['vo_rpcs_seen']} VO RPCs carry no server-side stages: "
+        "the server processes behind them were not running with HEATMAPVLN_TIMING=1, so this summary "
+        "covers client-side stages only for them and no end-to-end latency may be quoted from it."
+    )
+
+
 def summarise(records: list[dict[str, Any]], sources: list[str]) -> dict[str, Any]:
     groups: dict[str, Any] = {}
     for key, _title in GROUPS:
@@ -269,6 +305,7 @@ def summarise(records: list[dict[str, Any]], sources: list[str]) -> dict[str, An
         "sources": sources,
         "calls": len(records),
         "actions_executed": sum(int(r.get("actions_executed", 0)) for r in records),
+        "server_timing_missing": server_timing_missing(records),
         "groups": groups,
     }
 
@@ -297,9 +334,11 @@ def _memory_table(rows: dict[str, dict[str, Any]]) -> list[str]:
 
 
 def to_markdown(summary: dict[str, Any]) -> str:
-    lines = [
-        "# Latency summary",
-        "",
+    lines = ["# Latency summary", ""]
+    warning = server_timing_warning(summary["server_timing_missing"])
+    if warning is not None:
+        lines += [f"**{warning}**", ""]
+    lines += [
         f"{summary['calls']} plan calls, {summary['actions_executed']} executed actions, "
         f"from {len(summary['sources'])} file(s). Milliseconds; n / mean / median / p90.",
         "Simulator time (Habitat rendering, env.step) is reported apart from model and VO time.",
@@ -346,6 +385,10 @@ def main(argv: list[str] | None = None) -> int:
     (output_dir / "latency_summary.md").write_text(markdown)
     print(markdown)
     print(f"written: {output_dir / 'latency_summary.json'} and latency_summary.md")
+    warning = server_timing_warning(summary["server_timing_missing"])
+    if warning is not None:
+        print(warning, file=sys.stderr)
+        return 3
     return 0
 
 

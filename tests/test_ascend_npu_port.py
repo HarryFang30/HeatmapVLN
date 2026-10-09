@@ -14,6 +14,7 @@ import ast
 import importlib.util
 import json
 import re
+import shlex
 import sys
 import types
 from pathlib import Path
@@ -297,9 +298,19 @@ def test_npu_launcher_runs_servers_only_and_pins_the_reference_path():
         "Formal PPA online AMB3R runtime enabled",
         "Model server device: npu:0",
         "VO server device: npu:0",
-        "DA3_SDPA_QUERY_CHUNK_SIZE=256",
     ):
         assert f'grep -F "{evidence}"' in script
+    # The chunked-attention evidence must come from DA3, not from this script's own
+    # export.  Grepping "DA3_SDPA_QUERY_CHUNK_SIZE=256" -- which the VO server echoed
+    # back out of the environment the launcher had just set -- could not fail whatever
+    # DA3 did with the variable, and the deploy doc quoted it as proof the certified
+    # chunked path was taken.  tests/test_ascend_amb3r_patch_check.py covers the
+    # replacement in detail.
+    assert 'grep -F "DA3_SDPA_QUERY_CHUNK_SIZE=256"' not in script
+    assert (
+        'grep -F "DA3 attention: query_chunk=$DA3_SDPA_QUERY_CHUNK_SIZE (parsed by DA3), '
+        'memory_bounded=True"'
+    ) in script
 
 
 def test_npu_launcher_takes_only_free_cards_and_cleans_up():
@@ -311,34 +322,86 @@ def test_npu_launcher_takes_only_free_cards_and_cleans_up():
     assert "ASCEND_RT_VISIBLE_DEVICES is already set" in script
 
 
+def _server_flags(path: Path, server: str) -> dict[str, str]:
+    """Flags and VALUES of the `python -u "$SERVER"` invocation, up to the `&`.
+
+    Values, not just names: comparing names alone let the two halves drift in any
+    argument that both pass -- a different --map-every or --resolution on one
+    platform would have gone unnoticed, and the arms would no longer be comparable.
+    """
+    code = _code_only(path)
+    marker = f'-u "{server}"'
+    assert marker in code, f"{server} is never invoked in {path.name}"
+    block = code.split(marker, 1)[1].split("&\n", 1)[0]
+    block = block.replace("\\\n", " ")
+    tokens = shlex.split(block, comments=True)
+    flags: dict[str, str] = {}
+    current = None
+    for token in tokens:
+        if token.startswith("--"):
+            current = token
+            flags[current] = ""
+        elif current is not None:
+            flags[current] = f"{flags[current]} {token}".strip()
+    return flags
+
+
+# Flags whose value is legitimately platform-specific: the device itself, the port
+# expression, the VO seed CUDA got for free, and the instance token only the NPU
+# launcher issues.  Everything else must match on both sides, value included.
+PLATFORM_ONLY_FLAGS = {"--device", "--port", "--rng-seed", "--server_instance", "--server-instance"}
+
+
 def test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags():
     """The two halves must differ only in the device, or the arms are not comparable."""
-    def server_flags(path: Path, server: str) -> set[str]:
-        """Flags of the `python -u "$SERVER"` invocation, up to the backgrounding `&`."""
-        code = _code_only(path)
-        marker = f'-u "{server}"'
-        assert marker in code, f"{server} is never invoked in {path.name}"
-        block = code.split(marker, 1)[1].split("&\n", 1)[0]
-        return set(re.findall(r"--[a-z0-9_-]+", block))
+    for server, platform_only in (
+        ("$MODEL_SERVER", {"--device", "--port", "--server_instance"}),
+        ("$VO_SERVER", {"--device", "--port", "--rng-seed", "--server-instance"}),
+    ):
+        npu = _server_flags(NPU_LAUNCHER, server)
+        cuda = _server_flags(CUDA_LAUNCHER, server)
+        assert set(npu) ^ set(cuda) == platform_only - (set(npu) & set(cuda)), server
+        shared = (set(npu) & set(cuda)) - PLATFORM_ONLY_FLAGS
+        differing = {flag: (npu[flag], cuda[flag]) for flag in shared if npu[flag] != cuda[flag]}
+        assert differing == {}, f"{server} is passed different values: {differing}"
 
-    model_only_on_one = server_flags(NPU_LAUNCHER, "$MODEL_SERVER") ^ server_flags(
-        CUDA_LAUNCHER, "$MODEL_SERVER"
-    )
-    assert model_only_on_one == {"--device"}
+    # The EXP-20 / EXP-21 switches are built outside the invocation, so compare the
+    # lines that build them too: an override that reached only one platform would
+    # make the two halves different arms under the same name.
+    def model_extra(path: Path) -> list[str]:
+        return [
+            " ".join(line.split())
+            for line in _code_only(path).splitlines()
+            if "MODEL_EXTRA" in line and "declare" not in line
+        ]
 
-    vo_only_on_one = server_flags(NPU_LAUNCHER, "$VO_SERVER") ^ server_flags(
-        CUDA_LAUNCHER, "$VO_SERVER"
-    )
-    # The NPU half additionally seeds the VO RNG, which CUDA got for free.
-    assert vo_only_on_one == {"--rng-seed"}
+    assert model_extra(NPU_LAUNCHER) == model_extra(CUDA_LAUNCHER)
 
 
 def test_npu_launcher_publishes_what_the_client_needs():
     script = NPU_LAUNCHER.read_text(encoding="utf-8")
     assert "servers.json" in script
-    assert "heatmapvln-npu-servers-v1" in script
-    for key in ("model_ports", "vo_ports", "repo_commit", "vo_rng_seed", "bridge_off"):
+    # v2 adds what the client needs in order to tell WHICH servers answered: the
+    # ports cannot, since 52400+k / 52500+k are also the 4090's own defaults.
+    assert "heatmapvln-npu-servers-v2" in script
+    assert "heatmapvln-npu-servers-v1" not in script
+    for key in (
+        "model_ports",
+        "vo_ports",
+        "repo_commit",
+        "repo_dirty",
+        "vo_rng_seed",
+        "bridge_off",
+        "server_instance",
+        "model_version",
+        "num_sample_trajs",
+        "num_inference_steps",
+    ):
         assert key in script
+    # The commit must be read, not defaulted: "unknown" in servers.json would make
+    # the client's commit check vacuous.
+    assert "|| echo unknown" not in script
+    assert 'rev-parse HEAD' in script
 
 
 def test_client_external_mode_refuses_to_reuse_a_local_runs_directory():
@@ -360,8 +423,13 @@ def test_client_external_mode_refuses_to_reuse_a_local_runs_directory():
 def test_client_external_mode_checks_the_servers_match_the_run():
     script = CUDA_LAUNCHER.read_text(encoding="utf-8")
     assert "external servers.json does not match this run" in script
-    assert "heatmapvln-npu-servers-v1" in script
+    assert "heatmapvln-npu-servers-v2" in script
     assert "servers bridge_off=" in script
+    # tests/test_external_server_guards.py runs these checks; here we only pin that
+    # the launcher still asks for each of them, since ports alone cannot identify a
+    # server set that shares the 4090's own default ports.
+    for field in ("server_instance", "repo_commit", "repo_dirty", "timing", "device"):
+        assert field in script
 
 
 def test_cuda_launcher_still_defaults_to_local_cuda_servers():
@@ -408,5 +476,15 @@ def test_shard_restarts_are_opt_in_and_resume():
     assert "--resume" in script
     # A restart must append to the client log, not truncate the evidence of the death.
     assert '>>"$RUNTIME_DIR/logs/client_shard_0${shard}.log"' in script
-    # In external mode, wait for the tunnel to come back before retrying.
-    assert "tcp_open $((MODEL_PORT_BASE + slot)) && tcp_open $((VO_PORT_BASE + slot)) && break" in script
+    # In external mode a restart waits for a server that answers a real RPC, not for
+    # an open port: an Ascend device error leaves the process alive and LISTENing
+    # (observed: a VO server served HealthCheck, GetServerInfo and 19 ingests for an
+    # hour after its device died), and the thing that accepts the TCP connection is
+    # the local ssh forwarder in any case.  The old wait returned immediately and the
+    # restarted client burned every remaining retry on a server that could not compute.
+    assert "tcp_open $((MODEL_PORT_BASE + slot)) && tcp_open $((VO_PORT_BASE + slot)) && break" not in script
+    assert "until rpc_ready " in script
+    # Exit 3 means "answered, but not the recorded server set", which no amount of
+    # waiting fixes, so the shard is given up instead of retried.
+    assert "probe == 3" in script
+    assert "giving up the shard" in script

@@ -445,6 +445,10 @@ def _prepare_accelerator(device: str) -> None:
         backend.synchronize(device)
         LOGGER.info("NPU op toolchain ready (conv2d in bf16 on %s)", device)
     chunk = os.environ.get("DA3_SDPA_QUERY_CHUNK_SIZE", "")
+    # These are this process's INPUTS, echoed for the record.  bf16 here is
+    # is_bf16_supported(), which says the card can do bf16, not that any forward
+    # used it; the chunk size is what this server was handed, not what DA3 made of
+    # it.  _report_da3_attention below asks DA3 itself.
     LOGGER.info(
         "VO server device: %s (%s %s, bf16=%s, DA3_SDPA_QUERY_CHUNK_SIZE=%s, "
         "DA3_DISABLE_XFORMERS=%s)",
@@ -455,6 +459,66 @@ def _prepare_accelerator(device: str) -> None:
         chunk or "unset",
         os.environ.get("DA3_DISABLE_XFORMERS", "unset"),
     )
+
+
+def _report_da3_attention() -> None:
+    """What DA3 itself makes of the chunked-attention settings.
+
+    The launcher used to prove the chunked path by exporting
+    DA3_SDPA_QUERY_CHUNK_SIZE, having this server echo it back, and grepping its own
+    export: a check that could not fail whatever DA3 did with the variable, and the
+    deploy doc quoted it as proof the certified path was taken.  This asks the other
+    side instead -- DA3's own parser, and the attention function the dinov2 layers
+    actually bound -- so the line can be absent or wrong, which is the point of it.
+
+    Still not proof that a given forward chunked: that also depends on the query
+    length (memory_bounded_scaled_dot_product_attention falls through to plain SDPA
+    when query_length <= chunk_size).  Read-only and import-only: no device work, no
+    RNG, so it cannot move a served number on either platform.
+    """
+    try:
+        from depth_anything_3.model.dinov2.layers import attention as dinov2_attention
+        from depth_anything_3.model.utils.memory_bounded_attention import (
+            _configured_query_chunk_size,
+            memory_bounded_scaled_dot_product_attention,
+        )
+
+        bound = getattr(dinov2_attention, "memory_bounded_scaled_dot_product_attention", None)
+        LOGGER.info(
+            "DA3 attention: query_chunk=%s (parsed by DA3), memory_bounded=%s, xformers_disabled=%s",
+            _configured_query_chunk_size(),
+            bound is memory_bounded_scaled_dot_product_attention,
+            os.environ.get("DA3_DISABLE_XFORMERS", "") == "1",
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must not be able to stop a server
+        LOGGER.warning("could not read DA3's attention configuration (%s: %s)", type(exc).__name__, exc)
+
+
+def _npu_poison_after_failure(device: str, exc: BaseException) -> str | None:
+    """After a failed request, whether the NPU itself can still compute.
+
+    An Ascend AICPU timeout (ACL error 507017) mid-request leaves the process alive
+    and listening: HealthCheck, GetServerInfo, reset_episode and every ingest keep
+    succeeding, and only the next DA3 mapping forward fails.  So the device is
+    probed rather than the exception read: src/vo/online_amb3r.py raises
+    ValueError/RuntimeError for bad requests and numerical failures too, and those
+    leave the stream healthy, so the synchronize returns and nothing is recorded.
+
+    Returns the original failure as a short reason when the device is gone.
+    """
+    import torch
+
+    try:
+        torch.npu.synchronize(device)
+    except Exception as sync_exc:
+        LOGGER.error(
+            "NPU device unusable after a failed request; HealthCheck now reports "
+            "NOT_SERVING (synchronize: %s: %s)",
+            type(sync_exc).__name__,
+            sync_exc,
+        )
+        return f"{type(exc).__name__}: {exc}"[:300]
+    return None
 
 
 def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
@@ -482,6 +546,9 @@ def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
     from vla_rpc.core.image import decode_jpeg_to_rgb
 
     model = DA3(device=args.device, ckpt_path=str(checkpoint))
+    # After the model is built, so the import order of the DA3 package is the one the
+    # certified runs had.
+    _report_da3_attention()
     session = build_online_amb3r_session(
         model,
         cfg_path=cfg_path,
@@ -504,9 +571,32 @@ def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
 
 def _serve(args: argparse.Namespace, application: AMB3RVORPCApplication) -> int:
     import grpc
+    import torch
     from vla_rpc.proto import vla_pb2, vla_pb2_grpc
 
+    device_type = torch.device(args.device).type
+    rng_seed = "none" if args.rng_seed is None else str(args.rng_seed)
+    # The Ascend slots reuse the ports of the 4090's own local servers, and the
+    # model version is a constant, so without these a client cannot tell which
+    # machine (or which seed and timing setting) answered.  Appended after the
+    # existing format, and only with --server-instance.
+    instance_formats = (
+        [
+            f"heatmapvln-instance:{args.server_instance}",
+            f"heatmapvln-device:{device_type}",
+            f"heatmapvln-timing:{int(application.timing)}",
+            f"heatmapvln-vo-rng-seed:{rng_seed}",
+        ]
+        if args.server_instance
+        else []
+    )
+
     class AMB3RVOServicer(vla_pb2_grpc.VLAServicer):
+        def __init__(self) -> None:
+            # Set once, on NPU only, when a failed request left the device unable
+            # to synchronize; from then on HealthCheck reports NOT_SERVING with it.
+            self.device_poison: str | None = None
+
         def InferJSON(
             self,
             request: Any,
@@ -530,6 +620,8 @@ def _serve(args: argparse.Namespace, application: AMB3RVORPCApplication) -> int:
                 )
             except Exception as exc:
                 LOGGER.exception("InferJSON failed")
+                if self.device_poison is None and device_type == "npu":
+                    self.device_poison = _npu_poison_after_failure(args.device, exc)
                 context.set_details(str(exc))
                 context.set_code(grpc.StatusCode.INTERNAL)
                 return vla_pb2.JSONResponse(
@@ -542,6 +634,13 @@ def _serve(args: argparse.Namespace, application: AMB3RVORPCApplication) -> int:
                 )
 
         def HealthCheck(self, request: Any, context: Any) -> Any:
+            if self.device_poison is not None:
+                return vla_pb2.HealthCheckResponse(
+                    status=vla_pb2.HealthCheckResponse.NOT_SERVING,
+                    message=self.device_poison,
+                    version=AMB3R_VO_RPC_PROTOCOL_VERSION,
+                    requests_processed=application.requests_processed,
+                )
             return vla_pb2.HealthCheckResponse(
                 status=vla_pb2.HealthCheckResponse.SERVING,
                 message="AMB3R-VO online pose server is running",
@@ -554,17 +653,23 @@ def _serve(args: argparse.Namespace, application: AMB3RVORPCApplication) -> int:
                 version=AMB3R_VO_RPC_PROTOCOL_VERSION,
                 model_version=AMB3R_VO_RPC_MODEL_VERSION,
                 max_batch_size=1,
-                supported_formats=["json+jpeg"],
+                supported_formats=["json+jpeg", *instance_formats],
             )
 
+    options = [
+        ("grpc.max_send_message_length", args.max_message_mb * 1024 * 1024),
+        ("grpc.max_receive_message_length", args.max_message_mb * 1024 * 1024),
+    ]
+    if args.server_instance:
+        # gRPC binds with SO_REUSEPORT by default on Linux, so a second server
+        # started on an occupied port binds too and the kernel splits connections
+        # between the two.  A named instance must own its port or fail to start.
+        options.append(("grpc.so_reuseport", 0))
     # One worker is part of the correctness contract: the AMB3R map and
     # OnlineAMB3RSession state machine are mutable and session-scoped.
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=1),
-        options=[
-            ("grpc.max_send_message_length", args.max_message_mb * 1024 * 1024),
-            ("grpc.max_receive_message_length", args.max_message_mb * 1024 * 1024),
-        ],
+        options=options,
     )
     vla_pb2_grpc.add_VLAServicer_to_server(AMB3RVOServicer(), server)
     address = f"{args.host}:{args.port}"
@@ -576,6 +681,8 @@ def _serve(args: argparse.Namespace, application: AMB3RVORPCApplication) -> int:
         address,
         AMB3R_VO_RPC_PROTOCOL_VERSION,
     )
+    # Otherwise visible only in the process arguments; log-only, so no reply changes.
+    LOGGER.info("VO device RNG seed per reset_episode: %s", rng_seed)
     if application.timing:
         LOGGER.info("Latency timing enabled: responses carry timing_ms")
 
@@ -639,6 +746,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Same as HEATMAPVLN_TIMING=1: add per-stage timing_ms and CUDA "
             "memory to every response (stages synchronise --device; poses unchanged)"
+        ),
+    )
+    parser.add_argument(
+        "--server-instance",
+        default="",
+        help=(
+            "Token naming this server process. When set, GetServerInfo adds "
+            "heatmapvln-instance/-device/-timing/-vo-rng-seed entries to "
+            "supported_formats and the port is bound without SO_REUSEPORT, so a "
+            "client can refuse a different server that happens to listen on the "
+            "same port. Empty changes nothing."
         ),
     )
     parser.add_argument(
