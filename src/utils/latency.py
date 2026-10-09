@@ -1,15 +1,23 @@
 """Opt-in wall-clock timing for the deployed navigation stack.
 
 Off unless ``HEATMAPVLN_TIMING=1`` (or a caller passes ``enabled=True``). When off,
-every call is a no-op: no clock reads, no CUDA synchronisation, nothing added to
-payloads or responses, so served actions are byte-for-byte what they are without it.
+every call is a no-op: no clock reads, no accelerator synchronisation, nothing added
+to payloads or responses, so served actions are byte-for-byte what they are without it.
 
-When on, each stage boundary first waits for queued CUDA work
-(``torch.cuda.synchronize``), so a stage's time is the time its GPU work took rather
-than the time it took to enqueue it. Synchronising only moves the host's waiting
-point; it does not change any tensor, so timing does not change behaviour either.
-Give the timer the device the work runs on: ``torch.cuda.synchronize()`` without
-one waits on the current device (cuda:0 unless set), not on ``--gpu_id``'s.
+When on, each stage boundary first waits for queued accelerator work
+(``torch.cuda.synchronize`` / ``torch.npu.synchronize``), so a stage's time is the
+time its device work took rather than the time it took to enqueue it. Synchronising
+only moves the host's waiting point; it does not change any tensor, so timing does
+not change behaviour either.  Give the timer the device the work runs on:
+``synchronize()`` without one waits on the current device (index 0 unless set), not
+on ``--gpu_id``'s.
+
+Both NVIDIA CUDA and Ascend NPU are supported.  A device whose backend is named but
+unusable raises instead of timing nothing: a silently skipped synchronisation would
+measure kernel-launch time and report it as compute time, which is worse than no
+number at all.  The reported field keeps its wire name ``cuda_memory_mib`` on every
+backend, so client logs and ``scripts/tools/summarize_latency.py`` stay comparable
+across platforms.
 """
 
 from __future__ import annotations
@@ -21,55 +29,88 @@ from typing import Any, Callable, Dict, Iterator, Optional
 
 TIMING_ENV = "HEATMAPVLN_TIMING"
 
+# Accelerator backends, by torch device type.  Each exposes the synchronize /
+# reset_peak_memory_stats / max_memory_allocated / max_memory_reserved / mem_get_info
+# surface this module needs; torch.npu appears once torch_npu is imported.
+_ACCELERATOR_TYPES = ("cuda", "npu")
+
 
 def timing_enabled() -> bool:
     return os.environ.get(TIMING_ENV, "").strip().lower() not in ("", "0", "false", "no", "off")
 
 
-def _cuda_torch(device: Any = None) -> Any:
-    """torch when CUDA is usable and ``device`` (None: the current one) is a CUDA device."""
+def _backend(torch: Any, kind: str) -> Any:
+    """``torch.cuda`` / ``torch.npu`` if usable, else None."""
+    if kind == "npu":
+        try:
+            import torch_npu  # noqa: F401  (registers torch.npu)
+        except ImportError:
+            return None
+    module = getattr(torch, kind, None)
+    if module is None or not module.is_available():
+        return None
+    return module
+
+
+def _accelerator(device: Any = None) -> Any:
+    """The accelerator module ``device`` lives on, or None for CPU / no torch.
+
+    ``device`` None means "whichever accelerator is available". Naming an
+    accelerator device whose backend is unusable is an error, not a no-op.
+    """
     try:
         import torch
     except ImportError:
         return None
-    if not torch.cuda.is_available():
+    if device is None:
+        for kind in _ACCELERATOR_TYPES:
+            module = _backend(torch, kind)
+            if module is not None:
+                return module
         return None
-    if device is not None and torch.device(device).type != "cuda":
+    kind = torch.device(device).type
+    if kind not in _ACCELERATOR_TYPES:
         return None
-    return torch
+    module = _backend(torch, kind)
+    if module is None:
+        raise RuntimeError(
+            f"timing was asked to synchronise {device!r}, but the {kind} backend is "
+            "not usable here; refusing to report launch time as compute time"
+        )
+    return module
 
 
-def _cuda_sync_fn(device: Any = None) -> Callable[[], None]:
-    torch = _cuda_torch(device)
-    if torch is None:
+def _accel_sync_fn(device: Any = None) -> Callable[[], None]:
+    backend = _accelerator(device)
+    if backend is None:
         return lambda: None
     if device is None:
-        return torch.cuda.synchronize
-    return lambda: torch.cuda.synchronize(device)
+        return backend.synchronize
+    return lambda: backend.synchronize(device)
 
 
-def reset_cuda_peak(device: Any) -> None:
-    """Start a new peak-memory window on ``device``; a no-op off CUDA."""
-    torch = _cuda_torch(device)
-    if torch is not None:
-        torch.cuda.reset_peak_memory_stats(device)
+def reset_accel_peak(device: Any) -> None:
+    """Start a new peak-memory window on ``device``; a no-op on CPU."""
+    backend = _accelerator(device)
+    if backend is not None:
+        backend.reset_peak_memory_stats(device)
 
 
-def cuda_memory_mib(device: Any) -> Optional[Dict[str, float]]:
-    """GPU memory in MiB, or None off CUDA.
+def accel_memory_mib(device: Any) -> Optional[Dict[str, float]]:
+    """Accelerator memory in MiB, or None on CPU.
 
     ``peak_allocated`` / ``peak_reserved``: this process's tensors / its caching
-    allocator's pool, peak since the last ``reset_cuda_peak``.  ``device_used``: the
-    whole card in use right now, every process included (CUDA contexts, a model and
+    allocator's pool, peak since the last ``reset_accel_peak``.  ``device_used``: the
+    whole card in use right now, every process included (device contexts, a model and
     a VO server sharing the card, anyone else's jobs on it).
     """
-    torch = _cuda_torch(device)
-    if torch is None:
+    backend = _accelerator(device)
+    if backend is None:
         return None
-    free, total = torch.cuda.mem_get_info(device)
+    free, total = backend.mem_get_info(device)
     return {
-        "peak_allocated": round(torch.cuda.max_memory_allocated(device) / 2**20, 1),
-        "peak_reserved": round(torch.cuda.max_memory_reserved(device) / 2**20, 1),
+        "peak_allocated": round(backend.max_memory_allocated(device) / 2**20, 1),
+        "peak_reserved": round(backend.max_memory_reserved(device) / 2**20, 1),
         "device_used": round((total - free) / 2**20, 1),
     }
 
@@ -84,7 +125,7 @@ class StageTimer:
         self.ms: Dict[str, float] = {}
         self.counts: Dict[str, int] = {}
         self._sync: Callable[[], None] = (
-            _cuda_sync_fn(device) if (self.enabled and cuda_sync) else (lambda: None)
+            _accel_sync_fn(device) if (self.enabled and cuda_sync) else (lambda: None)
         )
 
     @contextlib.contextmanager

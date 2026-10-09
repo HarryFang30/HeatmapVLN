@@ -1,0 +1,45 @@
+diff --git a/slam/pipeline.py b/slam/pipeline.py
+index 9ac378b..2bdc413 100644
+--- a/slam/pipeline.py
++++ b/slam/pipeline.py
+@@ -16,7 +16,11 @@ class AMB3R_VO():
+ 
+     @torch.no_grad()
+     def local_mapping(self, views_all, cfg, init=False):
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        # Follow the tensors' device instead of naming cuda: on a non-CUDA
++        # accelerator torch only warns and runs the forward in fp32, which is a
++        # silent precision change rather than an error.
++        device_type = views_all['images'].device.type
++        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+             res = self.model.run_amb3r_vo(views_all, cfg, self.keyframe_memory if not init else None)
+         return res
+     
+diff --git a/thirdparty/depth_anything_3/api.py b/thirdparty/depth_anything_3/api.py
+index 08a8505..45da798 100644
+--- a/thirdparty/depth_anything_3/api.py
++++ b/thirdparty/depth_anything_3/api.py
+@@ -120,8 +120,21 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
+         Returns:
+             Dictionary containing model predictions
+         """
+-        # Determine optimal autocast dtype
+-        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
++        # The certified reference (RTX 4090) ran this forward in bf16.  Ask the
++        # device the tensors are on, not torch.cuda: off CUDA the CUDA probe is
++        # False and the forward would quietly drop to fp16.
++        device_type = image.device.type
++        backend = getattr(torch, device_type, None)
++        supports_bf16 = bool(
++            backend is not None
++            and getattr(backend, "is_bf16_supported", lambda: False)()
++        )
++        if not supports_bf16:
++            raise RuntimeError(
++                f"DA3 needs bf16 autocast (the reference dtype) but {device_type} "
++                "does not report bf16 support; refusing to run in fp16 silently"
++            )
++        autocast_dtype = torch.bfloat16
+         with torch.no_grad():
+             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
+                 return self.model(

@@ -120,6 +120,7 @@ class StatefulAMB3RBackend:
         device: str = "cuda:0",
         map_init_window: int = 20,
         map_every: int = 8,
+        rng_seed: int | None = None,
     ) -> None:
         if int(map_init_window) < 2:
             raise ValueError("map_init_window must be at least two")
@@ -131,7 +132,13 @@ class StatefulAMB3RBackend:
         self.device = str(device)
         self.map_init_window = int(map_init_window)
         self.map_every = int(map_every)
-        self.pipeline = AMB3R_VO(model, cfg_path=str(Path(cfg_path).expanduser()))
+        self.rng_seed = None if rng_seed is None else int(rng_seed)
+        # AMB3R_VO.__init__ does model.to(cfg.device), and the released slam_config.yaml
+        # pins device: 'cuda:0'.  Setting cfg.device after construction is too late --
+        # on a non-CUDA accelerator the constructor would already have raised, and on a
+        # multi-card CUDA host it would have placed the model on card 0 rather than the
+        # requested one.  Hand it a config that already names the device instead.
+        self.pipeline = AMB3R_VO(model, cfg_path=self._config_for_device(cfg_path, self.device))
         self.pipeline.cfg.device = self.device
         self.pipeline.cfg.map_init_window = self.map_init_window
         self.pipeline.cfg.map_every = self.map_every
@@ -141,10 +148,59 @@ class StatefulAMB3RBackend:
         self._max_frames = 0
         self._initialized = False
 
+    @staticmethod
+    def _config_for_device(cfg_path: str | Path, device: str) -> str:
+        """Path to the released config, or to a copy of it that names ``device``.
+
+        The copy differs from the released file in the ``device`` key and nothing
+        else, and is written next to a temporary directory that lives as long as the
+        process.  The original file is never modified: it belongs to the AMB3R
+        checkout, which the deployment keeps pristine.
+        """
+        import tempfile
+
+        from omegaconf import OmegaConf
+
+        source = Path(cfg_path).expanduser()
+        cfg = OmegaConf.load(str(source))
+        if str(cfg.get("device", "")) == str(device):
+            return str(source)
+        cfg.device = str(device)
+        directory = tempfile.mkdtemp(prefix="amb3r_vo_cfg_")
+        target = Path(directory) / source.name
+        OmegaConf.save(cfg, str(target))
+        return str(target)
+
+    def _seed_episode(self) -> None:
+        """Put the device RNG into a fixed state for this episode.
+
+        The DA3 forward draws from the device's *default* generator without seeding
+        it (``utils/alignment.py`` randperm for the quantile subsample, ``model/da3.py``
+        randint for the sky handling).  On CUDA that was still reproducible because a
+        CUDA default generator starts from a constant seed, so one process replaying
+        the same episodes in the same order drew the same numbers.  On Ascend the
+        default seed differs from process to process (measured: two fresh processes
+        reported different ``torch.npu.initial_seed()``), so without this the same
+        episode gives different poses on every run.
+
+        Seeding at every episode is also stronger than what CUDA gave us for free: an
+        episode's poses no longer depend on how many episodes the process served
+        before it, so a ``--resume`` run matches an uninterrupted one.
+        """
+        if self.rng_seed is None:
+            return
+        import torch
+
+        torch.manual_seed(self.rng_seed)
+        backend = getattr(torch, torch.device(self.device).type, None)
+        if backend is not None and hasattr(backend, "manual_seed_all"):
+            backend.manual_seed_all(self.rng_seed)
+
     def reset(self, *, max_frames: int) -> None:
         self._max_frames = int(max_frames)
         if self._max_frames < 1:
             raise ValueError("max_frames must be positive")
+        self._seed_episode()
         self.pipeline.keyframe_memory = None
         self._initialized = False
 
@@ -549,6 +605,7 @@ def build_online_amb3r_session(
     map_every: int = 8,
     max_history: int = 8,
     resolution: tuple[int, int] = (518, 392),
+    rng_seed: int | None = None,
 ) -> OnlineAMB3RSession:
     """Construct the released AMB3R backend and its online state machine."""
 
@@ -558,6 +615,7 @@ def build_online_amb3r_session(
         device=device,
         map_init_window=map_init_window,
         map_every=map_every,
+        rng_seed=rng_seed,
     )
     return OnlineAMB3RSession(
         backend,

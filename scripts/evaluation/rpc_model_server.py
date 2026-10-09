@@ -72,8 +72,8 @@ from src.models.action.treatment_spec import (
 from src.utils.latency import (
     TIMING_ENV,
     StageTimer,
-    cuda_memory_mib,
-    reset_cuda_peak,
+    accel_memory_mib,
+    reset_accel_peak,
     timing_enabled,
 )
 from src.utils.trajectory_direction import (
@@ -664,13 +664,55 @@ def _blobs_by_name(blobs) -> dict[str, vla_pb2.BinaryBlob]:
     return {blob.name: blob for blob in blobs}
 
 
+def _resolve_device(args: argparse.Namespace) -> torch.device:
+    """The accelerator named by ``--device``/``--gpu_id``.
+
+    An unavailable accelerator is an error.  Falling back to CPU would let the 7B
+    backbone, the PPA heads and the NextDiT sampler load and serve on CPU: nothing
+    raises, the launcher's health and preflight checks pass, and the run produces
+    plausible-looking numbers from a different device's RNG at a thousandth of the
+    speed.  CPU is therefore only ever chosen explicitly.
+    """
+    kind = str(getattr(args, "device", "cuda")).lower()
+    index = int(args.gpu_id)
+    if kind == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--device cuda but torch.cuda.is_available() is False; "
+                "refusing to fall back to CPU"
+            )
+        return torch.device(f"cuda:{index}")
+    if kind == "npu":
+        try:
+            # Registers the npu device type.  Never torch_npu.contrib.transfer_to_npu:
+            # rewriting torch.cuda.* globally would hide, not fix, CUDA assumptions.
+            import torch_npu
+        except ImportError as exc:
+            raise RuntimeError("--device npu but torch_npu cannot be imported") from exc
+        if not torch.npu.is_available():
+            raise RuntimeError("--device npu but torch.npu.is_available() is False")
+        torch.npu.set_device(index)
+        LOGGER.info(
+            "Model server device: npu:%d (torch %s, torch_npu %s, bf16=%s)",
+            index,
+            torch.__version__,
+            torch_npu.__version__,
+            torch.npu.is_bf16_supported(),
+        )
+        return torch.device(f"npu:{index}")
+    if kind == "cpu":
+        LOGGER.warning("Model server runs on CPU by explicit --device cpu")
+        return torch.device("cpu")
+    raise ValueError(f"unsupported --device {kind!r}")
+
+
 class HeatmapVLNRuntime:
     def __init__(self, args: argparse.Namespace):
         install_numpy_legacy_aliases()
         if os.environ.get("HEATMAPVLN_FORCE_FLASH_ATTN_STUB", "0") == "1":
             install_flash_attn_stub(LOGGER)
         self.args = args
-        self.device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+        self.device = _resolve_device(args)
         self.cfg = self._load_runtime_config(args)
         self.model, self.train_cfg = self._load_model(args, self.device)
         self.processor = self.model.qwen2_5_vl.processor
@@ -1036,8 +1078,9 @@ class HeatmapVLNRuntime:
                 )
         del checkpoint_state_dict
         del base_state_dict
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        accelerator = getattr(torch, device.type, None)
+        if device.type != "cpu" and accelerator is not None:
+            accelerator.empty_cache()
         model.eval()
         return model, self.cfg
 
@@ -2074,7 +2117,6 @@ class HeatmapVLNRuntime:
 class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
     def __init__(self, runtime: HeatmapVLNRuntime):
         self.runtime = runtime
-        self.started = int(torch.cuda.Event(enable_timing=False) is not None)
         self.requests_processed = 0
         self.model_version = runtime.model_version
         self.timing = timing_enabled()
@@ -2087,7 +2129,7 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             # handler_total ends before the response JSON is serialised.
             with timer.stage("handler_total"):
                 if timer.enabled:
-                    reset_cuda_peak(self.runtime.device)
+                    reset_accel_peak(self.runtime.device)
                 with timer.stage("request_decode"):
                     payload = json.loads(request.json_payload) if request.json_payload else {}
                 if request.method != "plan_panoramic":
@@ -2095,7 +2137,7 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
                 output = self.runtime.plan_panoramic(payload, request.blobs)
             if timer.enabled:
                 output["timing_ms"] = timer.as_dict()
-                memory = cuda_memory_mib(self.runtime.device)
+                memory = accel_memory_mib(self.runtime.device)
                 if memory is not None:
                     output["cuda_memory_mib"] = memory
             self.requests_processed += 1
@@ -2150,6 +2192,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pano_latent_adapter_checkpoint", default=None)
     parser.add_argument("--internnav_model_path", default=_default_internnav_model_path())
     parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument(
+        "--device",
+        choices=("cuda", "npu", "cpu"),
+        default="cuda",
+        help=(
+            "Accelerator type; --gpu_id is its index within it. An unavailable "
+            "accelerator is an error: CPU is used only when named here explicitly."
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--workers", type=int, default=1)
@@ -2220,8 +2271,10 @@ def parse_args() -> argparse.Namespace:
         "--timing",
         action="store_true",
         help=(
-            f"Same as {TIMING_ENV}=1: add per-stage timing_ms and the request's CUDA "
-            "memory to every response (stages synchronise CUDA; actions unchanged)."
+            f"Same as {TIMING_ENV}=1: add per-stage timing_ms and the request's "
+            "accelerator memory to every response (stages synchronise --device; "
+            "actions unchanged). The memory field keeps the name cuda_memory_mib on "
+            "every backend so platforms stay comparable."
         ),
     )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

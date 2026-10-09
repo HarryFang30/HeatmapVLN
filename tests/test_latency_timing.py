@@ -48,7 +48,7 @@ def _boom(*_args, **_kwargs):
 def no_clock(monkeypatch):
     """Any clock read or CUDA sync through src/utils/latency.py fails the test."""
     monkeypatch.setattr(latency, "time", SimpleNamespace(perf_counter=_boom))
-    monkeypatch.setattr(latency, "_cuda_sync_fn", _boom)
+    monkeypatch.setattr(latency, "_accel_sync_fn", _boom)
 
 
 class FakeClock:
@@ -97,7 +97,7 @@ def test_stage_timer_on_accumulates_counts_and_syncs(monkeypatch):
     clock = FakeClock()
     syncs = []
     monkeypatch.setattr(latency, "time", clock)
-    monkeypatch.setattr(latency, "_cuda_sync_fn", lambda _device: (lambda: syncs.append(clock.now)))
+    monkeypatch.setattr(latency, "_accel_sync_fn", lambda _device: (lambda: syncs.append(clock.now)))
     timer = latency.StageTimer(enabled=True)
     for ms in (250.0, 500.0):
         with timer.stage("generate"):
@@ -118,7 +118,7 @@ def test_stage_timer_on_accumulates_counts_and_syncs(monkeypatch):
 
 def test_stage_timer_without_cuda_sync_never_asks_for_it(monkeypatch):
     monkeypatch.setattr(latency, "time", FakeClock())
-    monkeypatch.setattr(latency, "_cuda_sync_fn", _boom)
+    monkeypatch.setattr(latency, "_accel_sync_fn", _boom)
     timer = latency.StageTimer(enabled=True, cuda_sync=False)
     with timer.stage("a"):
         pass
@@ -140,6 +140,17 @@ class _FakeCuda:
         monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 5 * 2**20)
         monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (40 * 2**20, 48 * 2**20))
 
+    def module(self) -> types.ModuleType:
+        """The same surface as a standalone module, for standing in as ``torch.npu``."""
+        module = types.ModuleType("fake_accelerator")
+        module.is_available = lambda: True
+        module.synchronize = lambda device=None: self.synced.append(device)
+        module.reset_peak_memory_stats = self.reset.append
+        module.max_memory_allocated = lambda device: 3 * 2**20
+        module.max_memory_reserved = lambda device: 5 * 2**20
+        module.mem_get_info = lambda device: (40 * 2**20, 48 * 2**20)
+        return module
+
 
 def test_stage_timer_syncs_the_device_it_is_given(monkeypatch):
     cuda = _FakeCuda()
@@ -151,15 +162,43 @@ def test_stage_timer_syncs_the_device_it_is_given(monkeypatch):
         assert cuda.synced == expected, device
 
 
-def test_cuda_memory_helpers(monkeypatch):
-    assert latency.cuda_memory_mib(torch.device("cpu")) is None
-    latency.reset_cuda_peak(torch.device("cpu"))  # no-op off CUDA
+def test_accel_memory_helpers(monkeypatch):
+    assert latency.accel_memory_mib(torch.device("cpu")) is None
+    latency.reset_accel_peak(torch.device("cpu"))  # no-op on CPU
     cuda = _FakeCuda()
     cuda.install(monkeypatch)
-    latency.reset_cuda_peak("cuda:1")
+    latency.reset_accel_peak("cuda:1")
     assert cuda.reset == ["cuda:1"]
-    assert latency.cuda_memory_mib("cuda:1") == {"peak_allocated": 3.0, "peak_reserved": 5.0, "device_used": 8.0}
-    assert latency.cuda_memory_mib(torch.device("cpu")) is None
+    assert latency.accel_memory_mib("cuda:1") == {"peak_allocated": 3.0, "peak_reserved": 5.0, "device_used": 8.0}
+    assert latency.accel_memory_mib(torch.device("cpu")) is None
+
+
+def test_naming_an_unusable_accelerator_raises_instead_of_timing_nothing(monkeypatch):
+    """A skipped synchronisation would report launch time as compute time."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for call in (
+        lambda: latency.StageTimer(enabled=True, device="cuda:0"),
+        lambda: latency.reset_accel_peak("cuda:0"),
+        lambda: latency.accel_memory_mib("cuda:0"),
+    ):
+        with pytest.raises(RuntimeError, match="not usable here"):
+            call()
+    # An unnamed device still means "whichever accelerator is available", or none.
+    assert latency.StageTimer(enabled=True, device=None) is not None
+
+
+def test_npu_is_an_accelerator_like_cuda(monkeypatch):
+    """The same helpers drive torch.npu, so Ascend runs are timed, not silently skipped."""
+    npu = _FakeCuda()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch, "npu", npu.module(), raising=False)
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    latency.reset_accel_peak("npu:1")
+    assert npu.reset == ["npu:1"]
+    assert latency.accel_memory_mib("npu:1") == {"peak_allocated": 3.0, "peak_reserved": 5.0, "device_used": 8.0}
+    with latency.StageTimer(enabled=True, device="npu:1").stage("a"):
+        pass
+    assert npu.synced == ["npu:1"] * 2
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +288,7 @@ def test_vo_server_on_reports_the_cuda_memory_of_its_device(monkeypatch):
 
 
 def test_vo_server_on_names_stages_by_map_event(monkeypatch):
-    monkeypatch.setattr(latency, "_cuda_sync_fn", lambda _device: (lambda: None))
+    monkeypatch.setattr(latency, "_accel_sync_fn", lambda _device: (lambda: None))
     off = _vo_sequence(_vo_application(timing=False))
     on = _vo_sequence(_vo_application(timing=True))
     assert [{k: v for k, v in r.items() if k != "timing_ms"} for r in on] == off
@@ -266,7 +305,7 @@ def test_vo_server_on_names_stages_by_map_event(monkeypatch):
 
 def test_vo_server_on_with_the_real_online_session(monkeypatch):
     online = pytest.importorskip("src.vo.online_amb3r")
-    monkeypatch.setattr(latency, "_cuda_sync_fn", lambda _device: (lambda: None))
+    monkeypatch.setattr(latency, "_accel_sync_fn", lambda _device: (lambda: None))
 
     class Backend:
         def reset(self, *, max_frames):
@@ -995,7 +1034,7 @@ def model_server(monkeypatch):
     from scripts.evaluation import rpc_model_server as server
     from vla_rpc.proto import vla_pb2
 
-    monkeypatch.setattr(latency, "_cuda_sync_fn", lambda _device: (lambda: None))
+    monkeypatch.setattr(latency, "_accel_sync_fn", lambda _device: (lambda: None))
     return server, vla_pb2
 
 
@@ -1005,7 +1044,7 @@ def test_model_server_timing_off_changes_nothing_and_on_only_adds_timing(model_s
     # Off: no clock, no sync, no CUDA memory call; the payload is what the runtime returned.
     with monkeypatch.context() as patch:
         patch.setattr(latency, "time", SimpleNamespace(perf_counter=_boom))
-        patch.setattr(latency, "_cuda_sync_fn", _boom)
+        patch.setattr(latency, "_accel_sync_fn", _boom)
         for name in ("reset_peak_memory_stats", "max_memory_allocated", "max_memory_reserved", "mem_get_info"):
             patch.setattr(torch.cuda, name, _boom)
         off = _infer(server, vla_pb2, monkeypatch, case, timing=False)

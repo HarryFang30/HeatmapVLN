@@ -1,0 +1,313 @@
+"""The Ascend NPU port: the device must be explicit, and never silently CPU.
+
+The whole risk of this port is a change that does not crash.  A device that falls
+back to CPU, a synchronisation that is skipped, a dtype that drops to fp16 or a
+chunked attention path that is silently not taken all leave a server that answers
+every request with different numbers.  These tests pin the places where that could
+happen; nothing here needs an NPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import importlib.util
+import json
+import re
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+MODEL_SERVER = REPO / "scripts" / "evaluation" / "rpc_model_server.py"
+VO_SERVER = REPO / "scripts" / "amb3r_vo" / "rpc_amb3r_vo_server.py"
+NPU_LAUNCHER = REPO / "scripts" / "ascend" / "run_ppa_servers_npu.sh"
+CUDA_LAUNCHER = REPO / "scripts" / "run_ppa_r2r_val_unseen_cuda.sh"
+AMB3R_PATCH = REPO / "scripts" / "ascend" / "amb3r_npu.patch"
+
+
+def _function_source(path: Path, name: str) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(path.read_text(encoding="utf-8"), node)
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def _load_resolve_device():
+    """``_resolve_device`` alone, so the test needs neither torch nor the model stack."""
+    source = _function_source(MODEL_SERVER, "_resolve_device")
+    torch = types.SimpleNamespace(
+        device=lambda spec: spec,
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        npu=types.SimpleNamespace(is_available=lambda: False, set_device=lambda index: None),
+        __version__="0.0",
+    )
+    namespace = {
+        "torch": torch,
+        "argparse": argparse,
+        "LOGGER": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
+    }
+    exec(compile(source, str(MODEL_SERVER), "exec"), namespace)
+    return namespace["_resolve_device"], torch
+
+
+def test_model_server_device_never_falls_back_to_cpu():
+    resolve, torch = _load_resolve_device()
+    args = argparse.Namespace(device="cuda", gpu_id=0)
+    with pytest.raises(RuntimeError, match="refusing to fall back to CPU"):
+        resolve(args)
+
+    torch.cuda.is_available = lambda: True
+    assert resolve(args) == "cuda:0"
+
+
+def test_model_server_npu_requires_a_real_npu(monkeypatch):
+    resolve, torch = _load_resolve_device()
+    args = argparse.Namespace(device="npu", gpu_id=3)
+
+    monkeypatch.setitem(sys.modules, "torch_npu", None)
+    with pytest.raises(RuntimeError, match="torch_npu cannot be imported"):
+        resolve(args)
+
+    monkeypatch.setitem(sys.modules, "torch_npu", types.SimpleNamespace(__version__="2.7.1"))
+    with pytest.raises(RuntimeError, match=r"torch\.npu\.is_available\(\) is False"):
+        resolve(args)
+
+    chosen = []
+    torch.npu.is_available = lambda: True
+    torch.npu.is_bf16_supported = lambda: True
+    torch.npu.set_device = chosen.append
+    assert resolve(args) == "npu:3"
+    assert chosen == [3]
+
+
+def test_model_server_cpu_is_only_ever_explicit():
+    resolve, _ = _load_resolve_device()
+    assert resolve(argparse.Namespace(device="cpu", gpu_id=0)) == "cpu"
+    with pytest.raises(ValueError, match="unsupported --device"):
+        resolve(argparse.Namespace(device="mps", gpu_id=0))
+
+
+def test_model_server_exposes_a_device_flag_defaulting_to_cuda():
+    source = MODEL_SERVER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    flags = {
+        call.args[0].value: {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+        }
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "add_argument"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+    }
+    assert "--device" in flags, "the accelerator type must be nameable, not inferred"
+    default = flags["--device"].get("default")
+    # The unchanged CUDA launcher passes no --device, so the default must stay cuda.
+    assert isinstance(default, ast.Constant) and default.value == "cuda"
+    choices = flags["--device"].get("choices")
+    assert choices is not None
+    assert {element.value for element in choices.elts} == {"cuda", "npu", "cpu"}
+
+
+def test_no_unconditional_cuda_calls_remain_in_the_servers():
+    """Any ``torch.cuda.X`` left on these paths would raise on a non-CUDA torch."""
+    for path in (MODEL_SERVER, VO_SERVER):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            value = node.value
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr == "cuda"
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "torch"
+            ):
+                offenders.append(f"{path.name}:{node.lineno} torch.cuda.{node.attr}")
+        # is_available is the one allowed use: it is how --device cuda is validated.
+        assert [item for item in offenders if not item.endswith("is_available")] == []
+
+
+def test_vo_server_constructs_da3_with_the_requested_device():
+    """load_model("da3") takes no device and would place the model on cuda regardless."""
+    source = VO_SERVER.read_text(encoding="utf-8")
+    assert 'load_model("da3"' not in source
+    assert "from amb3r.model_zoo import DA3" in source
+    assert re.search(r"DA3\(\s*device=args\.device", source)
+
+
+def test_vo_server_brings_up_and_checks_its_device():
+    source = _function_source(VO_SERVER, "_prepare_accelerator")
+    assert "torch_npu" in source
+    assert "is_available()" in source
+    assert "device_count()" in source
+    assert "set_device" in source
+    # The chunked-SDPA setting must be visible in the log, since taking the
+    # unchunked path is a ~20 GiB difference and not otherwise observable.
+    assert "DA3_SDPA_QUERY_CHUNK_SIZE" in source
+    body = VO_SERVER.read_text(encoding="utf-8")
+    assert "_prepare_accelerator(args.device)" in body
+
+
+def test_vo_server_can_seed_the_device_rng_per_episode():
+    source = VO_SERVER.read_text(encoding="utf-8")
+    assert '"--rng-seed"' in source
+    assert "rng_seed=args.rng_seed" in source
+
+    online = (REPO / "src" / "vo" / "online_amb3r.py").read_text(encoding="utf-8")
+    assert "def _seed_episode" in online
+    # Seeding belongs in the backend reset, which runs at every episode.
+    reset = _function_source(REPO / "src" / "vo" / "online_amb3r.py", "reset")
+    assert "_seed_episode()" in reset
+    assert "rng_seed=rng_seed" in online
+
+
+def test_vo_backend_hands_amb3r_a_config_that_already_names_the_device():
+    """AMB3R_VO.__init__ moves the model before any later cfg.device override."""
+    online = REPO / "src" / "vo" / "online_amb3r.py"
+    source = online.read_text(encoding="utf-8")
+    assert "AMB3R_VO(model, cfg_path=self._config_for_device(" in source
+    helper = _function_source(online, "_config_for_device")
+    assert "OmegaConf.load" in helper and "OmegaConf.save" in helper
+    # The released config belongs to the AMB3R checkout and must stay untouched.
+    assert "mkdtemp" in helper
+
+
+def test_config_for_device_copies_only_the_device_key(tmp_path):
+    omegaconf = pytest.importorskip("omegaconf")
+    online = REPO / "src" / "vo" / "online_amb3r.py"
+    source = _function_source(online, "_config_for_device")
+    namespace: dict = {"Path": Path}
+    exec(compile(f"import tempfile\n{source}", str(online), "exec"), namespace)
+    config_for_device = namespace["_config_for_device"]
+
+    original = tmp_path / "slam_config.yaml"
+    original.write_text("device: 'cuda:0'\nmap_every: 8\nblend: true\n", encoding="utf-8")
+    before = original.read_text(encoding="utf-8")
+
+    same = config_for_device(original, "cuda:0")
+    assert Path(same) == original, "an already-matching config is used as it is"
+
+    copy = Path(config_for_device(original, "npu:0"))
+    assert copy != original
+    assert original.read_text(encoding="utf-8") == before
+    written = omegaconf.OmegaConf.load(str(copy))
+    assert written.device == "npu:0"
+    assert written.map_every == 8 and written.blend is True
+
+
+def test_amb3r_patch_fixes_both_silent_precision_sites():
+    """The AMB3R tree is third-party, so its two NPU fixes ship as a tracked patch."""
+    patch = AMB3R_PATCH.read_text(encoding="utf-8")
+    assert "slam/pipeline.py" in patch and "thirdparty/depth_anything_3/api.py" in patch
+    # Removed: a cuda-named autocast (off CUDA torch only warns and runs fp32) and a
+    # cuda-only bf16 probe (off CUDA it is False, so the forward drops to fp16).
+    assert "-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):" in patch
+    assert "-        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16" in patch
+    assert "+        autocast_dtype = torch.bfloat16" in patch
+    assert "refusing to run in fp16 silently" in patch
+
+
+def test_npu_launcher_runs_servers_only_and_pins_the_reference_path():
+    script = NPU_LAUNCHER.read_text(encoding="utf-8")
+    # Servers only: no Habitat, no Xvfb, no dataset, no clients, no merge.
+    for absent in ("Xvfb", "r2r_val_unseen.py", "merge_shards", "SCENES_DIR", "--resume"):
+        assert absent not in script, f"the NPU half must not mention {absent}"
+    # Devices: Ascend ignores CUDA_VISIBLE_DEVICES, so using it would put every slot
+    # on card 0 while appearing to spread them.
+    assert "ASCEND_RT_VISIBLE_DEVICES=" in script
+    assert "CUDA_VISIBLE_DEVICES=\"${GPUS" not in script
+    assert "--device npu --gpu_id 0" in script
+    assert "--device npu:0" in script
+    # The certified DA3 path and the offline weights.
+    assert "DA3_DISABLE_XFORMERS=1" in script
+    assert "DA3_SDPA_QUERY_CHUNK_SIZE=256" in script
+    assert "HF_HUB_OFFLINE=1" in script
+    # A non-interactive shell does not necessarily load CANN.
+    assert 'source "$ASCEND_ENV"' in script
+    assert "127.0.0.1" in script and "0.0.0.0" not in script, "gRPC has no auth: bind loopback only"
+    # Evidence the client side greps for, and the device lines only this platform
+    # can get wrong.
+    for evidence in (
+        "Formal PPA online AMB3R runtime enabled",
+        "Model server device: npu:0",
+        "VO server device: npu:0",
+        "DA3_SDPA_QUERY_CHUNK_SIZE=256",
+    ):
+        assert f'grep -F "{evidence}"' in script
+
+
+def test_npu_launcher_takes_only_free_cards_and_cleans_up():
+    script = NPU_LAUNCHER.read_text(encoding="utf-8")
+    assert "npu-smi" in script
+    assert "PPA_NPU_MAX_USED_MIB" in script
+    assert "already has" in script  # the refusal message for a busy card
+    assert "trap cleanup EXIT" in script
+    assert "ASCEND_RT_VISIBLE_DEVICES is already set" in script
+
+
+def test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags():
+    """The two halves must differ only in the device, or the arms are not comparable."""
+    def server_flags(script: str, server: str) -> set[str]:
+        block = script.split(server, 1)[1]
+        block = block.split("&\n", 1)[0]
+        return {match for match in re.findall(r"--[a-z0-9_-]+", block)}
+
+    npu = NPU_LAUNCHER.read_text(encoding="utf-8")
+    cuda = CUDA_LAUNCHER.read_text(encoding="utf-8")
+
+    model_only_on_one = server_flags(npu, '"$MODEL_SERVER"') ^ server_flags(cuda, '"$MODEL_SERVER"')
+    assert model_only_on_one == {"--device"}
+
+    vo_only_on_one = server_flags(npu, '"$VO_SERVER"') ^ server_flags(cuda, '"$VO_SERVER"')
+    # The NPU half additionally seeds the VO RNG, which CUDA got for free.
+    assert vo_only_on_one == {"--rng-seed"}
+
+
+def test_npu_launcher_publishes_what_the_client_needs():
+    script = NPU_LAUNCHER.read_text(encoding="utf-8")
+    assert "servers.json" in script
+    assert "heatmapvln-npu-servers-v1" in script
+    for key in ("model_ports", "vo_ports", "repo_commit", "vo_rng_seed", "bridge_off"):
+        assert key in script
+
+
+def test_client_external_mode_refuses_to_reuse_a_local_runs_directory():
+    """Resuming into a CUDA-server directory would mix two platforms in one result."""
+    script = CUDA_LAUNCHER.read_text(encoding="utf-8")
+    assert 'EXTERNAL_SERVERS="${PPA_EVAL_EXTERNAL_SERVERS:-0}"' in script
+    assert "requires an explicit PPA_EVAL_OUTPUT_ROOT" in script
+    assert "requires PPA_EVAL_EXTERNAL_SERVER_DIR" in script
+    # External mode starts no servers of its own ...
+    assert 'if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then' in script
+    # ... and checks the tunnel instead of a local pid.
+    assert "is the SSH tunnel up?" in script
+    assert "stopped listening (remote server or tunnel down)" in script
+    # The preflight evidence comes from the servers' own archived log.
+    assert "external_server_logs" in script
+    assert 'require_file "$model_log"' in script
+
+
+def test_client_external_mode_checks_the_servers_match_the_run():
+    script = CUDA_LAUNCHER.read_text(encoding="utf-8")
+    assert "external servers.json does not match this run" in script
+    assert "heatmapvln-npu-servers-v1" in script
+    assert "servers bridge_off=" in script
+
+
+def test_cuda_launcher_still_defaults_to_local_cuda_servers():
+    """The 4090 runs must be unaffected: same command, same local servers."""
+    script = CUDA_LAUNCHER.read_text(encoding="utf-8")
+    assert "--device cuda:0" in script  # the VO server flag is unchanged
+    assert "--gpu_id 0 --host 127.0.0.1" in script  # the model server gets no --device
+    assert 'CUDA_VISIBLE_DEVICES="${GPUS[$slot]}"' in script
+    assert "PPA_EVAL_EXTERNAL_SERVERS:-0" in script  # off unless asked for

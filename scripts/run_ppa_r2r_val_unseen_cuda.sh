@@ -62,6 +62,14 @@ NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
 NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
 # Per-shard episode lists (shard_0N.json); another directory than the locked cohorts means a subset run: no merge.
 EPISODE_LISTS_DIR="${PPA_EVAL_EPISODE_LISTS_DIR:-$COHORTS_DIR}"
+# 1: the model and VO servers already run elsewhere (e.g. on Ascend NPUs, reached
+# through an SSH tunnel on 127.0.0.1:<port>).  This script then starts no servers and
+# only runs the clients; the client flags, protocol and merge stay exactly the same.
+# docs/ops/deploy_ascend_910b.md describes the split deployment.
+EXTERNAL_SERVERS="${PPA_EVAL_EXTERNAL_SERVERS:-0}"
+# The remote servers' runtime directory, copied or mounted here: servers.json plus
+# the startup logs, which is where the preflight evidence lives in external mode.
+EXTERNAL_SERVER_DIR="${PPA_EVAL_EXTERNAL_SERVER_DIR:-}"
 if [[ -n "$MAX_EPISODES" ]]; then
   default_output="$ROOT/eval_runs/canary_seed${PROTOCOL_SEED}"
 else
@@ -134,12 +142,21 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-for file in "$PPA_CHECKPOINT" "$PPA_CONFIG" "$MODEL_SERVER" "$VO_SERVER" "$CLIENT" "$MERGE_TOOL" "$DATASET" "$DA3_CHECKPOINT/model.safetensors" "$AMB3R_ROOT/slam/slam_config.yaml"; do
+for file in "$PPA_CONFIG" "$CLIENT" "$MERGE_TOOL" "$DATASET"; do
   require_file "$file"
 done
-for directory in "$REPO" "$RPC_ROOT/src/vla_rpc" "$INTERNNAV_MODEL_PATH" "$SCENES_DIR/mp3d" "$COHORTS_DIR"; do
+for directory in "$REPO" "$RPC_ROOT/src/vla_rpc" "$SCENES_DIR/mp3d" "$COHORTS_DIR"; do
   require_dir "$directory"
 done
+if [[ "$EXTERNAL_SERVERS" -eq 0 ]]; then
+  # Weights, the AMB3R tree and the server scripts are server-side inputs; in
+  # external mode they live on the machine that runs the servers.
+  for file in "$PPA_CHECKPOINT" "$MODEL_SERVER" "$VO_SERVER" \
+    "$DA3_CHECKPOINT/model.safetensors" "$AMB3R_ROOT/slam/slam_config.yaml"; do
+    require_file "$file"
+  done
+  require_dir "$INTERNNAV_MODEL_PATH"
+fi
 for executable in "$PYTHON" "$CLIENT_PYTHON" "$XVFB_BIN"; do
   [[ -n "$executable" && -x "$executable" ]] || die "missing executable: ${executable:-Xvfb}"
 done
@@ -168,6 +185,19 @@ for gpu in "${GPUS[@]}" "${VO_GPUS[@]}"; do
   [[ "$gpu" =~ ^[0-9]+$ ]] || die "invalid GPU ID: $gpu"
 done
 [[ "$(printf '%s\n' "${SHARDS[@]}" | sort -u | wc -l | tr -d ' ')" -eq "${#SHARDS[@]}" ]] || die "shard IDs must be unique"
+[[ "$EXTERNAL_SERVERS" =~ ^[01]$ ]] || die "PPA_EVAL_EXTERNAL_SERVERS must be 0 or 1"
+if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
+  # Without an explicit root the default would be this box's own CUDA output
+  # directory, and --resume would then skip episodes that CUDA servers produced,
+  # silently mixing two platforms into one result.
+  [[ -n "${PPA_EVAL_OUTPUT_ROOT:-}" ]] \
+    || die "PPA_EVAL_EXTERNAL_SERVERS=1 requires an explicit PPA_EVAL_OUTPUT_ROOT (never reuse a local-server run's directory)"
+  [[ -n "$EXTERNAL_SERVER_DIR" ]] \
+    || die "PPA_EVAL_EXTERNAL_SERVERS=1 requires PPA_EVAL_EXTERNAL_SERVER_DIR (the servers' runtime directory, for the preflight evidence)"
+  require_file "$EXTERNAL_SERVER_DIR/servers.json"
+  [[ "$VO_GPU_CSV" == "$GPU_CSV" ]] \
+    || die "PPA_EVAL_VO_GPU_DEVICES means nothing in external mode; the servers choose their own devices"
+fi
 for shard in "${SHARDS[@]}"; do
   [[ "$shard" =~ ^[0-7]$ ]] || die "invalid shard: $shard"
   require_file "$COHORTS_DIR/shard_0${shard}.json"
@@ -181,7 +211,7 @@ mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING bridge_off=$BRIDGE_OFF"
 echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
 echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} episode_lists=$EPISODE_LISTS_DIR"
-echo "[ppa-eval] output=$OUTPUT_ROOT"
+echo "[ppa-eval] output=$OUTPUT_ROOT external_servers=$EXTERNAL_SERVERS"
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   display_num=$((DISPLAY_BASE + slot))
@@ -199,9 +229,52 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   [[ "$ready" -eq 1 ]] || die "Xvfb slot $slot failed; see $RUNTIME_DIR/logs/xvfb_${slot}.log"
 done
 
+if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
+  # The servers run elsewhere; here there must already be something listening on
+  # each tunnelled port, and the archived startup evidence must come from them.
+  cp -a "$EXTERNAL_SERVER_DIR/servers.json" "$RUNTIME_DIR/external_servers.json"
+  [[ -d "$EXTERNAL_SERVER_DIR/logs" ]] && cp -a "$EXTERNAL_SERVER_DIR/logs" "$RUNTIME_DIR/external_server_logs"
+  for slot in $(seq 0 $((NUM_SLOTS - 1))); do
+    tcp_open $((MODEL_PORT_BASE + slot)) \
+      || die "nothing is listening on 127.0.0.1:$((MODEL_PORT_BASE + slot)); is the SSH tunnel up?"
+    tcp_open $((VO_PORT_BASE + slot)) \
+      || die "nothing is listening on 127.0.0.1:$((VO_PORT_BASE + slot)); is the SSH tunnel up?"
+  done
+  "$CLIENT_PYTHON" - "$RUNTIME_DIR/external_servers.json" "$NUM_SLOTS" "$MODEL_PORT_BASE" "$VO_PORT_BASE" \
+    "$BRIDGE_OFF" <<'EXT' || die "external servers.json does not match this run"
+import json
+import sys
+
+path, slots, model_base, vo_base, bridge_off = sys.argv[1:6]
+record = json.load(open(path, encoding="utf-8"))
+problems = []
+if record.get("schema") != "heatmapvln-npu-servers-v1":
+    problems.append(f"unexpected schema {record.get('schema')!r}")
+if int(record.get("slots", 0)) < int(slots):
+    problems.append(f"servers expose {record.get('slots')} slot(s), this run wants {slots}")
+# The tunnel maps each remote port to the same local port, so a mismatch here means
+# the clients would reach a different set of servers than the evidence describes.
+want_model = [int(model_base) + i for i in range(int(slots))]
+want_vo = [int(vo_base) + i for i in range(int(slots))]
+if record.get("model_ports", [])[: int(slots)] != want_model:
+    problems.append(f"model ports {record.get('model_ports')} != {want_model}")
+if record.get("vo_ports", [])[: int(slots)] != want_vo:
+    problems.append(f"VO ports {record.get('vo_ports')} != {want_vo}")
+if int(record.get("bridge_off", 0)) != int(bridge_off):
+    problems.append(f"servers bridge_off={record.get('bridge_off')}, this run sets {bridge_off}")
+if problems:
+    print("external server mismatch: " + "; ".join(problems), file=sys.stderr)
+    raise SystemExit(1)
+print(json.dumps({"external_servers": record}, sort_keys=True))
+EXT
+  echo "[ppa-eval] using external servers from $EXTERNAL_SERVER_DIR"
+else
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   runtime="$RUNTIME_DIR/slot_${slot}"
   mkdir -p "$runtime"/model/{tmp,xdg,hf,torch_extensions,triton,matplotlib} "$runtime"/vo/{tmp,xdg,hf,triton}
+  # A live port here means a stale server, or a tunnel left from an external-mode run.
+  tcp_open $((MODEL_PORT_BASE + slot)) && die "port $((MODEL_PORT_BASE + slot)) is already in use"
+  tcp_open $((VO_PORT_BASE + slot)) && die "port $((VO_PORT_BASE + slot)) is already in use"
   env PYTHONPATH="$RPC_PYTHONPATH" CUDA_VISIBLE_DEVICES="${GPUS[$slot]}" \
     TMPDIR="$runtime/model/tmp" XDG_CACHE_HOME="$runtime/model/xdg" HF_HOME="$runtime/model/hf" \
     TORCH_EXTENSIONS_DIR="$runtime/model/torch_extensions" TRITON_CACHE_DIR="$runtime/model/triton" \
@@ -227,6 +300,7 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   VO_PIDS[$slot]="$!"
   sleep "$SERVER_STAGGER_S"
 done
+fi
 
 echo "[ppa-eval] waiting for $((2 * NUM_SLOTS)) RPC servers"
 deadline=$(( $(date +%s) + SERVER_START_TIMEOUT_S ))
@@ -234,8 +308,14 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   model_addr="127.0.0.1:$((MODEL_PORT_BASE + slot))"
   vo_addr="127.0.0.1:$((VO_PORT_BASE + slot))"
   while true; do
-    kill -0 "${MODEL_PIDS[$slot]}" 2>/dev/null || { tail -120 "$RUNTIME_DIR/logs/model_${slot}.log" >&2; die "model server slot $slot exited"; }
-    kill -0 "${VO_PIDS[$slot]}" 2>/dev/null || { tail -120 "$RUNTIME_DIR/logs/vo_${slot}.log" >&2; die "VO server slot $slot exited"; }
+    if [[ "$EXTERNAL_SERVERS" -eq 0 ]]; then
+      kill -0 "${MODEL_PIDS[$slot]}" 2>/dev/null || { tail -120 "$RUNTIME_DIR/logs/model_${slot}.log" >&2; die "model server slot $slot exited"; }
+      kill -0 "${VO_PIDS[$slot]}" 2>/dev/null || { tail -120 "$RUNTIME_DIR/logs/vo_${slot}.log" >&2; die "VO server slot $slot exited"; }
+    else
+      # No local pid to watch: a vanished port means the remote server or the tunnel died.
+      tcp_open $((MODEL_PORT_BASE + slot)) || die "127.0.0.1:$((MODEL_PORT_BASE + slot)) stopped listening (remote server or tunnel down)"
+      tcp_open $((VO_PORT_BASE + slot)) || die "127.0.0.1:$((VO_PORT_BASE + slot)) stopped listening (remote server or tunnel down)"
+    fi
     if PYTHONPATH="$RPC_PYTHONPATH" "$CLIENT_PYTHON" - "$model_addr" "$vo_addr" <<'PY' >/dev/null 2>&1
 import sys
 from vla_rpc.client import VLAClient
@@ -258,15 +338,21 @@ PY
     (( $(date +%s) < deadline )) || die "RPC startup timeout at slot $slot"
     sleep 10
   done
-  grep -F "Formal PPA online AMB3R runtime enabled" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+  if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
+    model_log="$RUNTIME_DIR/external_server_logs/model_${slot}.log"
+  else
+    model_log="$RUNTIME_DIR/logs/model_${slot}.log"
+  fi
+  require_file "$model_log"
+  grep -F "Formal PPA online AMB3R runtime enabled" "$model_log" >/dev/null \
     || die "model slot $slot lacks PPA preflight evidence"
   if [[ "$BRIDGE_OFF" -eq 1 ]]; then
-    grep -F "PPA bridge off (EXP-20 A1)" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+    grep -F "PPA bridge off (EXP-20 A1)" "$model_log" >/dev/null \
       || die "model slot $slot lacks bridge-off evidence"
   fi
   for key in num_sample_trajs num_inference_steps; do
     if { [[ "$key" == num_sample_trajs && -n "$NUM_SAMPLE_TRAJS" ]] || [[ "$key" == num_inference_steps && -n "$NUM_INFERENCE_STEPS" ]]; }; then
-      grep -F "Sensitivity override (EXP-21): nextdit.$key" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+      grep -F "Sensitivity override (EXP-21): nextdit.$key" "$model_log" >/dev/null \
         || die "model slot $slot lacks the $key override evidence"
     fi
   done

@@ -38,6 +38,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -232,7 +233,7 @@ class AMB3RVORPCApplication:
         if self.timing:
             timer = self._latency.StageTimer(enabled=True, device=self.timing_device)
             if self.timing_device is not None:
-                self._latency.reset_cuda_peak(self.timing_device)
+                self._latency.reset_accel_peak(self.timing_device)
         with timer.stage("total"):
             if method == _METHOD_RESET:
                 output = self._reset(payload, blobs)
@@ -250,7 +251,7 @@ class AMB3RVORPCApplication:
         if timer.enabled:
             response["timing_ms"] = timer.as_dict()
             if self.timing_device is not None:
-                memory = self._latency.cuda_memory_mib(self.timing_device)
+                memory = self._latency.accel_memory_mib(self.timing_device)
                 if memory is not None:
                     response["cuda_memory_mib"] = memory
         return response
@@ -392,6 +393,50 @@ class AMB3RVORPCApplication:
         return dict(payload_result)
 
 
+def _prepare_accelerator(device: str) -> None:
+    """Bring up ``device`` and refuse to serve on a device that is not really there.
+
+    The DA3 forward is the whole cost of this server, so a device that silently
+    resolves elsewhere (or to CPU) would still answer every request, just with
+    different numbers and a hundredfold slower.  Checked at startup instead.
+    """
+    import torch
+
+    kind = torch.device(device).type
+    if kind == "cpu":
+        LOGGER.warning("VO server runs on CPU by explicit --device cpu")
+        return
+    if kind == "npu":
+        try:
+            import torch_npu  # noqa: F401  (registers torch.npu)
+        except ImportError as exc:
+            raise RuntimeError(f"--device {device} but torch_npu cannot be imported") from exc
+    backend = getattr(torch, kind, None)
+    if backend is None or not backend.is_available():
+        raise RuntimeError(f"--device {device} but the {kind} backend is not available here")
+    index = torch.device(device).index or 0
+    if index >= backend.device_count():
+        raise RuntimeError(
+            f"--device {device} but only {backend.device_count()} {kind} device(s) are visible"
+        )
+    backend.set_device(index)
+    # DA3's global attention runs over ~20 views x 1037 tokens.  Unchunked, the
+    # reference CUDA kernel materialises a 20.6 GiB bf16 score matrix, which is why
+    # the certified launcher sets a query chunk.  Serving without the variable set
+    # would silently take the unchunked path.
+    chunk = os.environ.get("DA3_SDPA_QUERY_CHUNK_SIZE", "")
+    LOGGER.info(
+        "VO server device: %s (%s %s, bf16=%s, DA3_SDPA_QUERY_CHUNK_SIZE=%s, "
+        "DA3_DISABLE_XFORMERS=%s)",
+        device,
+        kind,
+        torch.__version__,
+        getattr(backend, "is_bf16_supported", lambda: "unknown")(),
+        chunk or "unset",
+        os.environ.get("DA3_DISABLE_XFORMERS", "unset"),
+    )
+
+
 def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
     project_root = Path(args.repo).expanduser().resolve(strict=True)
     amb3r_root = Path(args.amb3r_root).expanduser().resolve(strict=True)
@@ -407,12 +452,16 @@ def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
         str(amb3r_root / "thirdparty"),
     ]
 
-    from amb3r.model_zoo import load_model
+    _prepare_accelerator(args.device)
+
+    # DA3 directly, not model_zoo.load_model("da3"): load_model takes no device and
+    # would place the backbone with DA3's own default .to("cuda"), ignoring --device.
+    from amb3r.model_zoo import DA3
     from src.utils.latency import timing_enabled
     from src.vo.online_amb3r import build_online_amb3r_session
     from vla_rpc.core.image import decode_jpeg_to_rgb
 
-    model = load_model("da3", ckpt_path=str(checkpoint))
+    model = DA3(device=args.device, ckpt_path=str(checkpoint))
     session = build_online_amb3r_session(
         model,
         cfg_path=cfg_path,
@@ -421,6 +470,7 @@ def _build_real_application(args: argparse.Namespace) -> AMB3RVORPCApplication:
         map_every=args.map_every,
         max_history=args.max_history,
         resolution=tuple(args.resolution),
+        rng_seed=args.rng_seed,
     )
     return AMB3RVORPCApplication(
         session,
@@ -552,6 +602,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-frames-limit", type=int, default=4096)
     parser.add_argument("--max-message-mb", type=int, default=32)
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=None,
+        help=(
+            "Re-seed the device RNG at every reset_episode. The DA3 forward subsamples "
+            "from the device's default generator without seeding it; on CUDA that was "
+            "reproducible because the default seed is a constant, on Ascend it is not. "
+            "Unset keeps the CUDA reference behaviour."
+        ),
+    )
     parser.add_argument(
         "--timing",
         action="store_true",
