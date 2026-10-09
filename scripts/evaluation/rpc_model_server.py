@@ -753,7 +753,9 @@ def _build_npu_profiler(directory: str, skip: int, calls: int):
     import torch_npu.profiler as profiler
 
     Path(directory).mkdir(parents=True, exist_ok=True)
-    experimental = profiler.experimental_config(
+    # torch_npu 2.7.1 exposes the config class as _ExperimentalConfig; the public name
+    # experimental_config is the module that holds it.
+    experimental = profiler._ExperimentalConfig(
         profiler_level=profiler.ProfilerLevel.Level1,
         aic_metrics=profiler.AiCMetrics.PipeUtilization,
     )
