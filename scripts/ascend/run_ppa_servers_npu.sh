@@ -161,16 +161,24 @@ RPC_PYTHONPATH="$RPC_ROOT/src:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 
 npu_used_mib() {
-  # "HBM-Usage(MB)" for one chip, from npu-smi's machine-readable per-device query.
-  npu-smi info -t usages -i "$1" 2>/dev/null \
-    | awk -F: '/HBM Usage Rate|HBM Capacity|Memory Usage Rate/ {next} /HBM Usage/ {gsub(/ /,"",$2); print $2; exit}'
-}
-
-npu_free_mib() {
+  # HBM-Usage(MB) of one chip, from the last "used / total" column of its row in
+  # the npu-smi table.  Every card shows a few GB in use even when idle (about
+  # 3.3 GB on this driver), so the threshold has to sit above that, not at zero.
   local id="$1" used
   used="$(npu-smi info 2>/dev/null | awk -v id="$id" '
-    $2 == id && $3 ~ /^910/ { want = 1; next }
-    want { n = split($0, f, "/"); gsub(/[^0-9]/, "", f[1]); print f[1] + 0; exit }
+    $2 == id && $3 ~ /910/ { want = 1; next }
+    want {
+      n = split($0, field, "|")
+      for (i = n; i >= 1; i--) {
+        if (field[i] ~ /[0-9]+ *\/ *[0-9]+/) {
+          split(field[i], pair, "/")
+          gsub(/[^0-9]/, "", pair[1])
+          print pair[1] + 0
+          exit
+        }
+      }
+      exit
+    }
   ')"
   printf '%s' "${used:-unknown}"
 }
@@ -182,7 +190,7 @@ echo "[ppa-npu] runtime=$RUNTIME_DIR"
 
 # The cards are shared with other users, like the 4090 box: only take free ones.
 for npu in "${NPUS[@]}" "${VO_NPUS[@]}"; do
-  used="$(npu_free_mib "$npu")"
+  used="$(npu_used_mib "$npu")"
   if [[ "$used" == "unknown" ]]; then
     die "could not read HBM use of NPU $npu from npu-smi"
   fi
