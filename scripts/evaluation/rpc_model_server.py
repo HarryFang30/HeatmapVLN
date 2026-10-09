@@ -764,7 +764,11 @@ def _build_npu_profiler(directory: str, skip: int, calls: int):
         schedule=profiler.schedule(wait=0, warmup=max(int(skip), 0), active=max(int(calls), 1), repeat=1),
         on_trace_ready=profiler.tensorboard_trace_handler(directory),
         record_shapes=True,
-        with_stack=False,
+        # Stacks are what make a profile actionable: the first profile of a plan call
+        # found 17001 aten::_local_scalar_dense (a one-scalar device-to-host copy, so a
+        # full synchronisation) costing 2.0 s, and without stacks there is no way to say
+        # which line asks for them.
+        with_stack=True,
         experimental_config=experimental,
     )
 
