@@ -178,6 +178,22 @@ for card in $(printf '%s\n' "${NPUS[@]}" "${VO_NPUS[@]}" | sort -nu); do
   fi
 done
 
+# Latency work only: an NPU profile of a few requests, written here, while the
+# server keeps serving.  Never set for a run whose numbers are reported -- profiling
+# perturbs exactly what it measures -- so it is deliberately not part of MODEL_EXTRA's
+# comparability contract and the launcher says so out loud.
+PROFILE_DIR="${PPA_NPU_PROFILE_DIR:-}"
+PROFILE_SKIP="${PPA_NPU_PROFILE_SKIP:-1}"
+PROFILE_CALLS="${PPA_NPU_PROFILE_CALLS:-2}"
+declare -a MODEL_PROFILE=()
+if [[ -n "$PROFILE_DIR" ]]; then
+  [[ "$PROFILE_SKIP" =~ ^(0|[1-9][0-9]*)$ ]] || die "PPA_NPU_PROFILE_SKIP must be a non-negative integer"
+  [[ "$PROFILE_CALLS" =~ ^[1-9][0-9]*$ ]] || die "PPA_NPU_PROFILE_CALLS must be a positive integer"
+  MODEL_PROFILE=(--profile_dir "$PROFILE_DIR" --profile_skip "$PROFILE_SKIP" --profile_calls "$PROFILE_CALLS")
+  printf '[ppa-npu] WARNING: profiling the model server into %s (skip %s, calls %s). This perturbs latency: do not report numbers from this run.\n' \
+    "$PROFILE_DIR" "$PROFILE_SKIP" "$PROFILE_CALLS" >&2
+fi
+
 declare -a MODEL_EXTRA=()
 [[ "$BRIDGE_OFF" -eq 1 ]] && MODEL_EXTRA=(--ppa_bridge_off)
 [[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
@@ -345,7 +361,8 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
       --internnav_model_path "$INTERNNAV_MODEL_PATH" \
       --device npu --gpu_id 0 --host 127.0.0.1 --port "$model_port" --workers 1 \
       --server_instance "$SERVER_INSTANCE/slot$slot" \
-      --require_deterministic_sampling --require_ppa_online_amb3r "${MODEL_EXTRA[@]}" \
+      --require_deterministic_sampling --require_ppa_online_amb3r \
+      "${MODEL_EXTRA[@]}" "${MODEL_PROFILE[@]}" \
       --log_level INFO >"$RUNTIME_DIR/logs/model_${slot}.log" 2>&1 &
   MODEL_PIDS[$slot]="$!"
   env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" \

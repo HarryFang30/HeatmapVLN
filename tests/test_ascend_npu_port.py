@@ -341,6 +341,11 @@ def _server_flags(path: Path, server: str) -> dict[str, str]:
         if token.startswith("--"):
             current = token
             flags[current] = ""
+        elif re.fullmatch(r"\$\{[A-Z_]+\[@\]\}", token):
+            # An array expansion carries its own flags at runtime, so it is a marker in
+            # its own right rather than the value of whatever flag precedes it.
+            flags[token] = ""
+            current = None
         elif current is not None:
             flags[current] = f"{flags[current]} {token}".strip()
     return flags
@@ -350,6 +355,11 @@ def _server_flags(path: Path, server: str) -> dict[str, str]:
 # expression, the VO seed CUDA got for free, and the instance token only the NPU
 # launcher issues.  Everything else must match on both sides, value included.
 PLATFORM_ONLY_FLAGS = {"--device", "--port", "--rng-seed", "--server_instance", "--server-instance"}
+# The NPU profiler is an engineering instrument for latency work, passed only when
+# PPA_NPU_PROFILE_DIR is set, and it exists only on this platform.  It is listed here
+# rather than silently tolerated so that adding any other NPU-only server flag has to
+# come past this line.
+NPU_ONLY_MARKERS = {"${MODEL_PROFILE[@]}"}
 
 
 def test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags():
@@ -360,7 +370,10 @@ def test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags():
     ):
         npu = _server_flags(NPU_LAUNCHER, server)
         cuda = _server_flags(CUDA_LAUNCHER, server)
-        assert set(npu) ^ set(cuda) == platform_only - (set(npu) & set(cuda)), server
+        only_on_one = (set(npu) ^ set(cuda)) - NPU_ONLY_MARKERS
+        assert only_on_one == platform_only - (set(npu) & set(cuda)), server
+        # Both halves must still expand the same EXP-20 / EXP-21 switch array.
+        assert "${MODEL_EXTRA[@]}" in npu and "${MODEL_EXTRA[@]}" in cuda or server == "$VO_SERVER"
         shared = (set(npu) & set(cuda)) - PLATFORM_ONLY_FLAGS
         differing = {flag: (npu[flag], cuda[flag]) for flag in shared if npu[flag] != cuda[flag]}
         assert differing == {}, f"{server} is passed different values: {differing}"
@@ -369,10 +382,13 @@ def test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags():
     # lines that build them too: an override that reached only one platform would
     # make the two halves different arms under the same name.
     def model_extra(path: Path) -> list[str]:
+        # The lines that BUILD the array, not the invocation that expands it: the two
+        # launchers may format the invocation differently, but an override that reached
+        # only one platform would make them different arms under the same name.
         return [
             " ".join(line.split())
             for line in _code_only(path).splitlines()
-            if "MODEL_EXTRA" in line and "declare" not in line
+            if ("MODEL_EXTRA=" in line or "MODEL_EXTRA+=" in line) and "declare" not in line
         ]
 
     assert model_extra(NPU_LAUNCHER) == model_extra(CUDA_LAUNCHER)
