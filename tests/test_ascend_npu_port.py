@@ -59,8 +59,30 @@ def _code_only(path: Path) -> str:
 
 
 def _load_resolve_device():
-    """``_resolve_device`` alone, so the test needs neither torch nor the model stack."""
-    source = _function_source(MODEL_SERVER, "_resolve_device")
+    """``_resolve_device`` alone, so the test needs neither torch nor the model stack.
+
+    The npu branch ends in two module-level helpers that need a real NPU.  They are
+    recording stubs here, so a test sees that the npu branch reached them and that
+    the certified cuda path and the cpu path did not.  Returns the function, the fake
+    torch and the list of recorded calls.
+    """
+    text = MODEL_SERVER.read_text(encoding="utf-8")
+    module = ast.parse(text)
+    functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+    # A stub stands in for a name, so a rename or a new argument in the server would
+    # leave these tests green while the real call fails.  Pin both to the call shape
+    # the stubs below accept.
+    for name, arity in (("_disable_fused_mha_fastpath", 0), ("_warm_up_npu", 1)):
+        helper = functions.get(name)
+        assert helper is not None, f"{name} is no longer a module-level function of {MODEL_SERVER}"
+        arguments = helper.args
+        assert len(arguments.posonlyargs + arguments.args) == arity, name
+        assert arguments.vararg is None and not arguments.kwonlyargs, name
+    node = functions["_resolve_device"]
+    # Padded to the function's own first line, so a traceback names the real line of
+    # rpc_model_server.py instead of a line counted from the start of the excerpt.
+    source = "\n" * (node.lineno - 1) + ast.get_source_segment(text, node)
+    calls = []
     torch = types.SimpleNamespace(
         device=lambda spec: spec,
         cuda=types.SimpleNamespace(is_available=lambda: False),
@@ -71,32 +93,38 @@ def _load_resolve_device():
         "torch": torch,
         "argparse": argparse,
         "LOGGER": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
+        "_disable_fused_mha_fastpath": lambda: calls.append("fastpath"),
+        "_warm_up_npu": lambda device: calls.append(("warm_up", device)),
     }
     exec(compile(source, str(MODEL_SERVER), "exec"), namespace)
-    return namespace["_resolve_device"], torch
+    return namespace["_resolve_device"], torch, calls
 
 
 def test_model_server_device_never_falls_back_to_cpu():
-    resolve, torch = _load_resolve_device()
+    resolve, torch, calls = _load_resolve_device()
     args = argparse.Namespace(device="cuda", gpu_id=0)
     with pytest.raises(RuntimeError, match="refusing to fall back to CPU"):
         resolve(args)
 
     torch.cuda.is_available = lambda: True
     assert resolve(args) == "cuda:0"
+    # The CUDA path is certified: it must not pick up the NPU-only setup.
+    assert calls == []
 
 
 def test_model_server_npu_requires_a_real_npu(monkeypatch):
-    resolve, torch = _load_resolve_device()
+    resolve, torch, calls = _load_resolve_device()
     args = argparse.Namespace(device="npu", gpu_id=3)
 
     monkeypatch.setitem(sys.modules, "torch_npu", None)
     with pytest.raises(RuntimeError, match="torch_npu cannot be imported"):
         resolve(args)
+    assert calls == []
 
     monkeypatch.setitem(sys.modules, "torch_npu", types.SimpleNamespace(__version__="2.7.1"))
     with pytest.raises(RuntimeError, match=r"torch\.npu\.is_available\(\) is False"):
         resolve(args)
+    assert calls == []
 
     chosen = []
     torch.npu.is_available = lambda: True
@@ -104,13 +132,16 @@ def test_model_server_npu_requires_a_real_npu(monkeypatch):
     torch.npu.set_device = chosen.append
     assert resolve(args) == "npu:3"
     assert chosen == [3]
+    # The fake torch.device returns its spec, so the warm-up records the string.
+    assert calls == ["fastpath", ("warm_up", "npu:3")]
 
 
 def test_model_server_cpu_is_only_ever_explicit():
-    resolve, _ = _load_resolve_device()
+    resolve, _, calls = _load_resolve_device()
     assert resolve(argparse.Namespace(device="cpu", gpu_id=0)) == "cpu"
     with pytest.raises(ValueError, match="unsupported --device"):
         resolve(argparse.Namespace(device="mps", gpu_id=0))
+    assert calls == []
 
 
 def test_model_server_exposes_a_device_flag_defaulting_to_cuda():

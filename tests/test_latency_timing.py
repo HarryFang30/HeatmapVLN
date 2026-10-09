@@ -193,6 +193,15 @@ def test_npu_is_an_accelerator_like_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch, "npu", npu.module(), raising=False)
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    # "npu" is a device type only once the real torch_npu has registered it, so on
+    # the 4090 and the C500 torch.device("npu:1") itself raises before latency ever
+    # reaches the fake backend.  latency reads nothing but .type from the result.
+    real = torch.device
+    monkeypatch.setattr(
+        torch,
+        "device",
+        lambda spec: types.SimpleNamespace(type="npu") if str(spec).startswith("npu") else real(spec),
+    )
     latency.reset_accel_peak("npu:1")
     assert npu.reset == ["npu:1"]
     assert latency.accel_memory_mib("npu:1") == {"peak_allocated": 3.0, "peak_reserved": 5.0, "device_used": 8.0}
