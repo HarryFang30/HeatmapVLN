@@ -40,8 +40,16 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_GPU_DE
 - 可以用 1–8 张卡。8 个分片轮流分给各张卡，每张卡依次跑自己分到的分片。
 - 模型服务端和里程计服务端默认放在同一张卡上，实测空载约 36 GB、运行中见到最高约 37 GB（48 GB 的卡）。显存不够时用 `PPA_EVAL_VO_GPU_DEVICES` 把里程计放到别的卡。
 - 冒烟 / 金丝雀：加 `PPA_EVAL_SHARDS=0,1 PPA_EVAL_MAX_EPISODES_PER_SHARD=2`，只打印汇总，不合并。
+  **带上限的运行每次都要换一个空的 `PPA_EVAL_OUTPUT_ROOT`，而且不能开 `PPA_EVAL_SHARD_RETRIES`。**
+  上限是对"新跑的集"计数的（`r2r_val_unseen.py` 的 `_eval_limit`），`--resume` 又会跳过已跑的集，
+  所以往已有结果的目录里再跑一次，是**另外**再跑 2 集新的——金丝雀就不是原来那 4 集了，而
+  `progress.json` 里看不出哪几行是后加的。现在这两种情况启动脚本会直接拒绝（exit 2），
+  真要续跑就显式加 `PPA_EVAL_ALLOW_CAPPED_RESUME=1`。要固定具体哪几集，用
+  `scripts/tools/make_episode_lists_from_run.py` 把参照运行的集钉成集表，配
+  `PPA_EVAL_EPISODE_LISTS_DIR` 用，然后不设上限（见 `deploy_ascend_910b.md` §6）。
 - 输出默认在 `/workspace/eval_runs/ppa_refine_v2_seed<种子>/`（金丝雀在 `canary_seed<种子>/`）。**换种子一定换输出目录**，否则 `--resume` 会跳过另一个种子已跑的集。
 - 跑满 8 个分片且不设上限时，会用锁定计划的 `merge_shards.py` 合并并自检，最后打印 `"status": "passed"`。
+- **不设上限的运行（含认证全量）跑完后还会核对一遍"记录下来的集"与"集表里的集"完全一致**：少一集、多一集、或同一集出现两行，启动脚本就失败。合并那条路本来就有这个自检，而不合并的子集运行以前**没有**——那是唯一一种能短一集或多一集还打印 `passed` 的跑法。
 - 长任务在宿主机上用 tmux 或 `docker exec -d … > log 2>&1` 挂起，ssh 断开不会影响。
 
 **速度**：每张卡约 1–1.3 秒一步（CPU 渲染 + 在线建图）。全量 1839 集在 2 张卡上大约一天。
@@ -81,6 +89,9 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_GPU_DE
 docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_TIMING=1 PPA_EVAL_GPU_DEVICES=4 PPA_EVAL_VO_GPU_DEVICES=5 PPA_EVAL_SHARDS=0,1 PPA_EVAL_MAX_EPISODES_PER_SHARD=2 PPA_EVAL_OUTPUT_ROOT=/workspace/eval_runs/latency_seed42 bash scripts/run_ppa_r2r_val_unseen_cuda.sh'
 ```
 
+- 上面这条命令的输出目录是固定的 `latency_seed42`，所以**第二次跑之前要先把它清掉或换个名字**：
+  带上限的运行往已有结果的目录里续跑会被拒绝（见 §2 那条）。否则它会悄悄给你另外 2 集，
+  计时统计也就不是同一个样本了。
 - 服务端每个阶段前后各做一次 `torch.cuda.synchronize`（同步的是服务端自己用的那张卡：模型的 `--gpu_id`、里程计的 `--device`），量到的是 GPU 真正算完的时间。同步只挪了主机等待的位置，不改任何张量，所以动作应当不变，但整体会慢一点。
 - **"动作不变"要先在 GPU 上实测一次**：用 09-28 金丝雀的配置（4、5 号卡两个槽位，分片 0、1 各 2 集，种子 42）加 `PPA_EVAL_TIMING=1` 跑到新目录，用 `scripts/exp19/select_cases.py` 的 `parse_client_log` 读两边的客户端日志、`scripts/exp19/build_records.py` 的 `compare_calls` 逐调用比：每次调用的步号、`kind`、慢系统原文、动作块都相同，§3 表里的步数、注入生效次数、SR/SPL/NE 也相同，才算通过。
   - 通过：带计时的全量评测的 SR/SPL 可以直接当基线用，全量基线和延迟表一次跑出来。

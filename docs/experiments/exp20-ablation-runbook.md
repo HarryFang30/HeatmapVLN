@@ -44,7 +44,12 @@ docker exec -d fjl-habitat bash -lc "cd /workspace/exp20/src_<SHA> && \
 ## 2. 开全量前的金丝雀（A1 / A2 / A3 各一次，种子 42）
 
 在上面的命令里加 `PPA_EVAL_SHARDS=0,1 PPA_EVAL_MAX_EPISODES_PER_SHARD=2`，输出目录用 `exp20_<arm>_canary`。
-这 4 集就是 09-28 金丝雀的 4 集。
+这 4 集就是 09-28 金丝雀的 4 集（`zsNo4HB9uLZ` 的 ep 1 / 25 在片 0，ep 2 / 26 在片 1）。
+
+**重跑某个臂的金丝雀时要换一个空目录**：带上限的运行往已有结果的目录里续跑现在会被拒绝
+（exit 2），因为上限只数"新跑的集"，续跑等于再加 2 集新的、样本就变了。要把这 4 集钉死而不靠
+上限，用 `scripts/tools/make_episode_lists_from_run.py --reference <09-28 金丝雀根> --shards 0,1
+--expect-per-shard 2` 生成集表，配 `PPA_EVAL_EPISODE_LISTS_DIR` 用并且不设上限。
 
 **通过条件**（开跑前写死）：
 
