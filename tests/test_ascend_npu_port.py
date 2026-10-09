@@ -28,12 +28,34 @@ CUDA_LAUNCHER = REPO / "scripts" / "run_ppa_r2r_val_unseen_cuda.sh"
 AMB3R_PATCH = REPO / "scripts" / "ascend" / "amb3r_npu.patch"
 
 
-def _function_source(path: Path, name: str) -> str:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return ast.get_source_segment(path.read_text(encoding="utf-8"), node)
+def _function_source(path: Path, name: str, *, inside: str | None = None) -> str:
+    """Source of a function, or of a method of the class named by ``inside``."""
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    scopes = [tree]
+    if inside is not None:
+        scopes = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == inside
+        ]
+        assert scopes, f"class {inside} not found in {path}"
+    for scope in scopes:
+        for node in ast.walk(scope):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(text, node)
     raise AssertionError(f"{name} not found in {path}")
+
+
+def _code_only(path: Path) -> str:
+    """The file without comment text, so a prose mention cannot stand in for code."""
+    lines = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        lines.append(line.split("  # ", 1)[0])
+    return "\n".join(lines)
 
 
 def _load_resolve_device():
@@ -139,7 +161,7 @@ def test_no_unconditional_cuda_calls_remain_in_the_servers():
 
 def test_vo_server_constructs_da3_with_the_requested_device():
     """load_model("da3") takes no device and would place the model on cuda regardless."""
-    source = VO_SERVER.read_text(encoding="utf-8")
+    source = _code_only(VO_SERVER)
     assert 'load_model("da3"' not in source
     assert "from amb3r.model_zoo import DA3" in source
     assert re.search(r"DA3\(\s*device=args\.device", source)
@@ -165,8 +187,10 @@ def test_vo_server_can_seed_the_device_rng_per_episode():
 
     online = (REPO / "src" / "vo" / "online_amb3r.py").read_text(encoding="utf-8")
     assert "def _seed_episode" in online
-    # Seeding belongs in the backend reset, which runs at every episode.
-    reset = _function_source(REPO / "src" / "vo" / "online_amb3r.py", "reset")
+    # Seeding belongs in the backend's own reset, which runs at every episode.
+    reset = _function_source(
+        REPO / "src" / "vo" / "online_amb3r.py", "reset", inside="StatefulAMB3RBackend"
+    )
     assert "_seed_episode()" in reset
     assert "rng_seed=rng_seed" in online
 
@@ -219,9 +243,10 @@ def test_amb3r_patch_fixes_both_silent_precision_sites():
 
 def test_npu_launcher_runs_servers_only_and_pins_the_reference_path():
     script = NPU_LAUNCHER.read_text(encoding="utf-8")
+    code = _code_only(NPU_LAUNCHER)
     # Servers only: no Habitat, no Xvfb, no dataset, no clients, no merge.
     for absent in ("Xvfb", "r2r_val_unseen.py", "merge_shards", "SCENES_DIR", "--resume"):
-        assert absent not in script, f"the NPU half must not mention {absent}"
+        assert absent not in code, f"the NPU half must not run {absent}"
     # Devices: Ascend ignores CUDA_VISIBLE_DEVICES, so using it would put every slot
     # on card 0 while appearing to spread them.
     assert "ASCEND_RT_VISIBLE_DEVICES=" in script
@@ -257,18 +282,22 @@ def test_npu_launcher_takes_only_free_cards_and_cleans_up():
 
 def test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags():
     """The two halves must differ only in the device, or the arms are not comparable."""
-    def server_flags(script: str, server: str) -> set[str]:
-        block = script.split(server, 1)[1]
-        block = block.split("&\n", 1)[0]
-        return {match for match in re.findall(r"--[a-z0-9_-]+", block)}
+    def server_flags(path: Path, server: str) -> set[str]:
+        """Flags of the `python -u "$SERVER"` invocation, up to the backgrounding `&`."""
+        code = _code_only(path)
+        marker = f'-u "{server}"'
+        assert marker in code, f"{server} is never invoked in {path.name}"
+        block = code.split(marker, 1)[1].split("&\n", 1)[0]
+        return set(re.findall(r"--[a-z0-9_-]+", block))
 
-    npu = NPU_LAUNCHER.read_text(encoding="utf-8")
-    cuda = CUDA_LAUNCHER.read_text(encoding="utf-8")
-
-    model_only_on_one = server_flags(npu, '"$MODEL_SERVER"') ^ server_flags(cuda, '"$MODEL_SERVER"')
+    model_only_on_one = server_flags(NPU_LAUNCHER, "$MODEL_SERVER") ^ server_flags(
+        CUDA_LAUNCHER, "$MODEL_SERVER"
+    )
     assert model_only_on_one == {"--device"}
 
-    vo_only_on_one = server_flags(npu, '"$VO_SERVER"') ^ server_flags(cuda, '"$VO_SERVER"')
+    vo_only_on_one = server_flags(NPU_LAUNCHER, "$VO_SERVER") ^ server_flags(
+        CUDA_LAUNCHER, "$VO_SERVER"
+    )
     # The NPU half additionally seeds the VO RNG, which CUDA got for free.
     assert vo_only_on_one == {"--rng-seed"}
 
