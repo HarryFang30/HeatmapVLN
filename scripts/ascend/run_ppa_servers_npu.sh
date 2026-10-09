@@ -203,6 +203,7 @@ PYTHONPATH="$RPC_PYTHONPATH" "$PYTHON" - <<'PY' || die "platform preflight faile
 import json
 import sys
 
+import numpy
 import torch
 import torch_npu  # noqa: F401
 import transformers
@@ -210,6 +211,17 @@ import transformers
 problems = []
 if transformers.__version__ != "4.51.0":
     problems.append(f"transformers {transformers.__version__} != 4.51.0 (runtime_compat gate)")
+# numpy 2 broke the ABI of the numpy-1 extensions in this environment, including
+# cv2 and the ones CANN's own op-compile toolchain imports.  The symptom was not an
+# import error at startup but a CANN kernel-bank failure on the first request, so
+# check the version and that cv2 really loads.
+if not numpy.__version__.startswith("1."):
+    problems.append(f"numpy {numpy.__version__} is not 1.x; the certified stack is 1.26.4")
+try:
+    import cv2
+except Exception as exc:  # noqa: BLE001 - any failure here is fatal and worth printing
+    problems.append(f"cv2 does not import ({type(exc).__name__}: {exc})")
+    cv2 = None
 if not torch.npu.is_available():
     problems.append("torch.npu.is_available() is False")
 elif not torch.npu.is_bf16_supported():
@@ -219,6 +231,8 @@ print(json.dumps({
     "torch": torch.__version__,
     "torch_npu": torch_npu.__version__,
     "transformers": transformers.__version__,
+    "numpy": numpy.__version__,
+    "cv2": getattr(cv2, "__version__", None),
     "npu_count": torch.npu.device_count() if torch.npu.is_available() else 0,
 }, sort_keys=True))
 if problems:
