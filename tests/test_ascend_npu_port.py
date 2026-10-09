@@ -340,3 +340,14 @@ def test_cuda_launcher_still_defaults_to_local_cuda_servers():
     assert "--gpu_id 0 --host 127.0.0.1" in script  # the model server gets no --device
     assert 'CUDA_VISIBLE_DEVICES="${GPUS[$slot]}"' in script
     assert "PPA_EVAL_EXTERNAL_SERVERS:-0" in script  # off unless asked for
+
+
+def test_npu_launcher_keeps_tmpdir_short_enough_for_an_af_unix_socket():
+    """CANN's kernel bank opens an AF_UNIX socket under TMPDIR, and 108 bytes is the limit."""
+    script = NPU_LAUNCHER.read_text(encoding="utf-8")
+    # Not under the timestamped runtime directory: that path alone crossed the limit,
+    # and the failure surfaced as an unrelated-looking ACL/GEInitialize error.
+    assert 'TMPDIR="$runtime/model/tmp"' not in script
+    assert 'TMPDIR="$model_tmp"' in script and 'TMPDIR="$vo_tmp"' in script
+    assert "AF_UNIX_MAX=108" in script
+    assert "too long for an AF_UNIX socket" in script

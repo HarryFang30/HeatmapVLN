@@ -160,6 +160,17 @@ RPC_PYTHONPATH="$RPC_ROOT/src:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 mkdir -p "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 
+# TMPDIR has to stay short, and not live under the timestamped runtime directory.
+# CANN initialises its kernel bank through multiprocessing.Manager, whose AF_UNIX
+# socket path is TMPDIR plus about 40 bytes of "/pymp-XXXXXXXX/listener-XXXXXXXX".
+# AF_UNIX allows 108 bytes in total, and a path under $RUNTIME_DIR/slot_N/model/tmp
+# crosses it: the model server then died with "AF_UNIX path too long" surfacing as
+# an unrelated-looking ACL_PRECISION_MODE / GEInitialize failure.
+TMP_ROOT="$ROOT/tmp"
+mkdir -p "$TMP_ROOT"
+AF_UNIX_MAX=108
+AF_UNIX_RESERVE=45
+
 npu_used_mib() {
   # HBM-Usage(MB) of one chip, from the last "used / total" column of its row in
   # the npu-smi table.  Every card shows a few GB in use even when idle (about
@@ -249,11 +260,18 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   tcp_open "$vo_port" && die "port $vo_port is already in use"
 
   runtime="$RUNTIME_DIR/slot_${slot}"
-  mkdir -p "$runtime"/model/{tmp,xdg,hf,matplotlib} "$runtime"/vo/{tmp,xdg,hf}
+  mkdir -p "$runtime"/model/{xdg,hf,matplotlib} "$runtime"/vo/{xdg,hf}
+  model_tmp="$TMP_ROOT/m${slot}"
+  vo_tmp="$TMP_ROOT/v${slot}"
+  mkdir -p "$model_tmp" "$vo_tmp"
+  for directory in "$model_tmp" "$vo_tmp"; do
+    (( ${#directory} + AF_UNIX_RESERVE <= AF_UNIX_MAX )) \
+      || die "TMPDIR $directory is too long for an AF_UNIX socket (${#directory} + $AF_UNIX_RESERVE > $AF_UNIX_MAX); use a shorter PPA_EVAL_ROOT"
+  done
   # Each server sees exactly one card, as npu:0.
   env PYTHONPATH="$RPC_PYTHONPATH" ASCEND_RT_VISIBLE_DEVICES="${NPUS[$slot]}" \
     OMP_NUM_THREADS="$THREADS_PER_SERVER" MKL_NUM_THREADS="$THREADS_PER_SERVER" \
-    TMPDIR="$runtime/model/tmp" XDG_CACHE_HOME="$runtime/model/xdg" HF_HOME="$runtime/model/hf" \
+    TMPDIR="$model_tmp" XDG_CACHE_HOME="$runtime/model/xdg" HF_HOME="$runtime/model/hf" \
     MPLCONFIGDIR="$runtime/model/matplotlib" HEATMAPVLN_FORCE_FLASH_ATTN_STUB=0 \
     "$PYTHON" -u "$MODEL_SERVER" \
       --config "$PPA_CONFIG" --checkpoint "$PPA_CHECKPOINT" \
@@ -265,7 +283,7 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" \
     ASCEND_RT_VISIBLE_DEVICES="${VO_NPUS[$slot]}" \
     OMP_NUM_THREADS="$THREADS_PER_SERVER" MKL_NUM_THREADS="$THREADS_PER_SERVER" \
-    TMPDIR="$runtime/vo/tmp" XDG_CACHE_HOME="$runtime/vo/xdg" HF_HOME="$runtime/vo/hf" \
+    TMPDIR="$vo_tmp" XDG_CACHE_HOME="$runtime/vo/xdg" HF_HOME="$runtime/vo/hf" \
     "$PYTHON" -u "$VO_SERVER" \
       --repo "$REPO" --amb3r-root "$AMB3R_ROOT" \
       --da3-checkpoint "$DA3_CHECKPOINT" --device npu:0 \
