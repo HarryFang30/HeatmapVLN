@@ -2416,6 +2416,19 @@ def main() -> int:
         ("grpc.max_send_message_length", 128 * 1024 * 1024),
         ("grpc.max_receive_message_length", 128 * 1024 * 1024),
     ]
+    # The client pings every 30 s (vla_rpc sync_client sets grpc.keepalive_time_ms
+    # 30000).  A gRPC server defaults to tolerating two pings per five minutes on a
+    # channel carrying no data, and then sends GOAWAY/ENHANCE_YOUR_CALM: measured
+    # twice on the 910B, the VO channel sits idle for minutes while the slower model
+    # call runs, the client's keepalive pings trip that limit, and the shard dies on
+    # "AMB3R VO RPC returned no response for ingest_frame" with the client having no
+    # RPC retry.  Accept the pings the client actually sends.  Transport only: no
+    # request, response or number changes, on either platform.
+    options += [
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.min_ping_interval_without_data_ms", 20000),
+        ("grpc.http2.max_pings_without_data", 0),
+    ]
     if args.server_instance:
         # gRPC binds with SO_REUSEPORT by default on Linux, so a second server
         # started on an occupied port binds too and the kernel splits connections
