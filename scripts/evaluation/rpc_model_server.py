@@ -664,6 +664,33 @@ def _blobs_by_name(blobs) -> dict[str, vla_pb2.BinaryBlob]:
     return {blob.name: blob for blob in blobs}
 
 
+def _warm_up_npu(device: torch.device) -> None:
+    """Make CANN build its op-compile toolchain now, not during the first request.
+
+    The first convolution on an Ascend device makes CANN initialise its kernel bank,
+    which forks a helper process.  Inside the loaded, serving process that fork
+    failed (EC0009, "multiprocessing.Manager instantiation failed"), so the server
+    started, passed every check, and then died on the first real request with
+    nothing but "RPC model server returned no response" on the client side.
+
+    Doing it here, in the main thread before the model is loaded, turns that into a
+    startup error.  It also keeps the compile cost out of the first episode.  The
+    ops below draw no random numbers and touch no model state, so they cannot
+    change what the server answers.  NPU only: the CUDA path is certified and gets
+    no extra work.
+    """
+    import torch.nn.functional as functional
+
+    with torch.no_grad():
+        image = torch.zeros(1, 3, 28, 28, device=device, dtype=torch.bfloat16)
+        kernel = torch.zeros(8, 3, 14, 14, device=device, dtype=torch.bfloat16)
+        functional.conv2d(image, kernel, stride=14)
+        square = torch.zeros(8, 8, device=device, dtype=torch.bfloat16)
+        square @ square
+    torch.npu.synchronize(device)
+    LOGGER.info("NPU op toolchain ready (conv2d and matmul in bf16 on %s)", device)
+
+
 def _resolve_device(args: argparse.Namespace) -> torch.device:
     """The accelerator named by ``--device``/``--gpu_id``.
 
@@ -692,6 +719,7 @@ def _resolve_device(args: argparse.Namespace) -> torch.device:
         if not torch.npu.is_available():
             raise RuntimeError("--device npu but torch.npu.is_available() is False")
         torch.npu.set_device(index)
+        device = torch.device(f"npu:{index}")
         LOGGER.info(
             "Model server device: npu:%d (torch %s, torch_npu %s, bf16=%s)",
             index,
@@ -699,7 +727,8 @@ def _resolve_device(args: argparse.Namespace) -> torch.device:
             torch_npu.__version__,
             torch.npu.is_bf16_supported(),
         )
-        return torch.device(f"npu:{index}")
+        _warm_up_npu(device)
+        return device
     if kind == "cpu":
         LOGGER.warning("Model server runs on CPU by explicit --device cpu")
         return torch.device("cpu")

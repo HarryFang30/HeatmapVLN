@@ -424,6 +424,19 @@ def _prepare_accelerator(device: str) -> None:
     # reference CUDA kernel materialises a 20.6 GiB bf16 score matrix, which is why
     # the certified launcher sets a query chunk.  Serving without the variable set
     # would silently take the unchunked path.
+    if kind == "npu":
+        # Make CANN build its op-compile toolchain now: inside the loaded, serving
+        # process that initialisation forks a helper and has been seen to fail, which
+        # would kill the first real request instead of the startup.  No RNG, no model
+        # state, so it cannot change the poses served.
+        import torch.nn.functional as functional
+
+        with torch.no_grad():
+            image = torch.zeros(1, 3, 28, 28, device=device, dtype=torch.bfloat16)
+            kernel = torch.zeros(8, 3, 14, 14, device=device, dtype=torch.bfloat16)
+            functional.conv2d(image, kernel, stride=14)
+        backend.synchronize(device)
+        LOGGER.info("NPU op toolchain ready (conv2d in bf16 on %s)", device)
     chunk = os.environ.get("DA3_SDPA_QUERY_CHUNK_SIZE", "")
     LOGGER.info(
         "VO server device: %s (%s %s, bf16=%s, DA3_SDPA_QUERY_CHUNK_SIZE=%s, "
