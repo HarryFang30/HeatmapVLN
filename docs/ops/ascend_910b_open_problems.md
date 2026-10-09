@@ -55,6 +55,78 @@
 
 ---
 
+## 0.5 2026-10-10 06:1x–06:48 的金丝雀重跑：两个根因分开了
+
+用钉死的集表、`SHARD_RETRIES=0`、机器上没有别的任务，重跑了两次（`npu_canary_seed42_run2`
+在 `d0bd852`、`run3` 在 `ffbe22e`）。结果把**两个一直被混在一起的故障**分开了。
+
+### ✅ 之前两次金丝雀死的根因不是 AICPU 超时，是 gRPC 保活策略
+
+客户端日志里写得很清楚：
+
+```
+Received a GOAWAY with error code ENHANCE_YOUR_CALM and debug data equal to "too_many_pings"
+Current keepalive time (before throttling): 30000ms
+RuntimeError: AMB3R VO RPC returned no response for ingest_frame
+```
+
+而且**上一次会话那次失败（10-09 19:05:35）的日志里是同一句**。所以本文件上一稿 §1.1 把它
+归给"根因 §3（AICPU 超时）"是**归错了**：那次 AICPU 超时（03:11:30）是另一套服务端上另一件事。
+
+机制：`vla_rpc` 的客户端设 `grpc.keepalive_time_ms=30000`（每 30 秒一个 ping），而 gRPC 服务端
+默认只容忍**一条没有数据流动的通道上、5 分钟内 2 个 ping**，超了就 GOAWAY 断连。昇腾上一次
+规划调用约 11 秒，模型服务端在算的时候里程计那条通道是空的，客户端的保活 ping 正好撞上。
+客户端对 RPC 失败零重试，一次 GOAWAY 带走整个分片。4090 上从没触发过（全量 1839 集跑完了），
+所以它一路活到了昇腾起步阶段。
+
+修在 `ffbe22e`：两个服务端允许空闲通道上的保活 ping、接受每 20 秒一个、不限 ping 数。纯传输层，
+不改任何请求/响应/数值，所以没有用 flag 门控。重跑后 `too_many_pings` 出现 **0 次**。
+
+**顺带得到一条数值中立的旁证**：`run2`（`d0bd852`）和 `run3`（`ffbe22e`）的第 1 集
+**逐位相同**——success 1.0、SPL 0.9649、NE 0.1478、48 步、注入 7 次。两个 commit 只差这个
+传输层选项，这正是它该有的样子。
+
+### ✅ 修掉保活之后，撞上的才是真的 AICPU 超时——而且这次条件很干净
+
+`run3` 的第 2 集死于：
+
+```
+StatusCode.INTERNAL ... AclrtSynchronizeStreamWithTimeout(copy_stream), error code is 507017
+The aicpu execution times out ... stream_id:2, task_id:34378
+```
+
+条件：**真实 Habitat 帧、单进程、整台机器上没有别的任务**。所以 §2.2 原来那条"并发相关"的
+假设**不再需要**了——不开并发、不喂噪声，它照样发生。
+
+两条新线索，留给下一次排查：
+
+- **它卡在同一个地方**：两次都是第 2 集的第一次建图前向（第 20 帧，`map_init_window=20`），
+  第 1 集整集没事。这像是跨集残留的状态，不像随机抖动。
+- **`task_id:34378` 和今天那次合成噪声的对照组（04:44:23）是同一个**，03:11:30 那次是 35086。
+  同一个 task id 出现两次，指向建图图里某个具体算子（AI CPU 算子跑在设备的 CPU 核上，
+  DA3 这条路上的候选是动态形状的 `nonzero`/`unique`/`randperm`/`randint` 之类）。
+
+### ✅ §2.4 的修法在一次**真的** 507017 上验证通过了
+
+这是上一稿列为"还没被真机触发过"的那条，现在触发了，整条链路按设计走完：
+
+| 时刻 | 发生了什么 |
+|---|---|
+| 06:48:17 | 里程计服务端自检：`NPU device unusable after a failed request; HealthCheck now reports NOT_SERVING (synchronize: RuntimeError: ... AclrtSynchronizeDeviceWithTimeout, error code is 507017)` |
+| 06:48:57 | 启动脚本发现标记：`slot 0: the vo server reports its NPU unusable; retiring the slot`，写 `RETIRED`（`slot=0 role=vo 2026-10-10T06:48:57+0800`）|
+| 之后 | 只有这一个槽，于是 `every slot has been retired` → 整体退出、`STOPPED` 写好、进程全清、卡 0 回到 3401 MiB |
+
+**顺带答了上一稿自己提的问题**：`torch.npu.synchronize()` 在那个状态下**会抛**，所以
+`NOT_SERVING` 这条路不是空的。修之前的同样情形会是：客户端死在那次 RPC 上，服务端继续
+LISTEN、设备已坏，开了重启保护的话客户端再把重试次数烧在一台永远答不上来的服务端上。
+
+### 所以金丝雀现在卡在哪
+
+**1 / 4 集**，卡在 AICPU 超时上。保活那条已经不是障碍了；在 AICPU 这条解决之前，
+H1（同机两遍逐调用一致）**没法测**——第 2 集过不去。
+
+---
+
 ## 1. 阻塞级：这台机器上还不能报任何数
 
 这一节和上一稿一样，一条都没少——它们**只能靠在机器上跑**来消掉。
@@ -68,7 +140,7 @@ zsNo4HB9uLZ / ep 1 — success 1.0, SPL 1.0000, NE 0.5101, steps 50,
 vlm_calls 14, trajectory_calls 11, ppa_applied 7, warmup 4
 ```
 
-第二集死在里程计的一次 RPC 上（根因 §3）。**910B 上没有 SR/SPL/NE，一个都没有。**
+第二集死在里程计的一次 RPC 上——**那次的根因是 gRPC 保活策略，不是 AICPU 超时，见 §0.5**，本文件上一稿在这里归错了。**910B 上没有 SR/SPL/NE，一个都没有。**
 这一集是开机观测，不是测量结果；台账里按这个口径记（EXP-22）。
 
 重跑时的要求已经写进代码了：集表钉死（不设 `PPA_EVAL_MAX_EPISODES_PER_SHARD`）、
@@ -115,7 +187,7 @@ vlm_calls 14, trajectory_calls 11, ppa_applied 7, warmup 4
 
 ---
 
-## 2. 仍然没有定论的根因：那次 AICPU 超时
+## 2. AICPU 超时：恢复性已有定论，触发条件仍然没有（§0.5 之后更新）
 
 这一节有新证据，结论比上一稿更硬，也更让人不安。
 
@@ -326,4 +398,4 @@ ingest——在一台已经不能算数的机器上全部通过**。所以修法
 4. 紧接着原样再跑一遍，做逐调用一致性比对（§1.2）。这步过了，昇腾才算"可用"。
 5. 计时中立性重做一次（§1.3），之后延迟数字才能进台账。
 6. 再决定要不要把 EXP-21 搬过来——前提是先在昇腾上跑出自己的 A0（约 22 小时）。
-7. AICPU 超时的根因（§2.2）：从"真实帧能不能复现"开始查，别从并发开始。
+7. ~~AICPU 超时：从"真实帧能不能复现"开始查~~ —— 已复现（§0.5）：真实帧、单进程、机器上没别的任务，卡在**第 2 集的第一次建图前向**，`task_id:34378`。**第 3、4 步现在被它堵着**，下一步应当从这里开始：先看第 1 集到第 2 集之间 AMB3R 侧留下了什么状态，再看那个 AI CPU 算子是哪一个。
