@@ -425,6 +425,13 @@ def _prepare_accelerator(device: str) -> None:
     # the certified launcher sets a query chunk.  Serving without the variable set
     # would silently take the unchunked path.
     if kind == "npu":
+        # torch's fused encoder-layer kernel has no NPU implementation and falls back
+        # to the CPU (measured 365x slower than the ordinary path), so take the
+        # ordinary one.  Logged because the two differ in summation order.
+        mha = getattr(torch.backends, "mha", None)
+        if mha is not None and hasattr(mha, "set_fastpath_enabled"):
+            mha.set_fastpath_enabled(False)
+            LOGGER.info("Fused MHA fastpath disabled (no NPU kernel; it falls back to the CPU)")
         # Make CANN build its op-compile toolchain now: inside the loaded, serving
         # process that initialisation forks a helper and has been seen to fail, which
         # would kill the first real request instead of the startup.  No RNG, no model

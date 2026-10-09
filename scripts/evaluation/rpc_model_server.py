@@ -664,6 +664,30 @@ def _blobs_by_name(blobs) -> dict[str, vla_pb2.BinaryBlob]:
     return {blob.name: blob for blob in blobs}
 
 
+def _disable_fused_mha_fastpath() -> bool:
+    """Stop ``nn.TransformerEncoder`` from taking a path that runs on the CPU.
+
+    torch's fused encoder-layer kernel has no NPU implementation, so torch_npu
+    silently falls back to the CPU for it: measured here at 1.35 s per forward
+    against 0.0037 s for the ordinary path, 365x slower.  The History Head and the
+    System1 condition encoder both go through those modules, which is most of why
+    they were the two slowest stages on this platform.
+
+    Both paths compute the same attention; they differ in kernel and in summation
+    order, so this is a platform choice and is logged as one.  It cannot be "the
+    same as CUDA" either way: on CUDA the fused kernel runs on the GPU, here it
+    would run on the CPU.
+    """
+    backend = getattr(torch.backends, "mha", None)
+    if backend is None or not hasattr(backend, "set_fastpath_enabled"):
+        LOGGER.warning("torch.backends.mha.set_fastpath_enabled is unavailable; "
+                       "fused encoder layers may fall back to the CPU")
+        return False
+    backend.set_fastpath_enabled(False)
+    LOGGER.info("Fused MHA fastpath disabled (it has no NPU kernel and falls back to the CPU)")
+    return True
+
+
 def _warm_up_npu(device: torch.device) -> None:
     """Make CANN build its op-compile toolchain now, not during the first request.
 
@@ -727,6 +751,7 @@ def _resolve_device(args: argparse.Namespace) -> torch.device:
             torch_npu.__version__,
             torch.npu.is_bf16_supported(),
         )
+        _disable_fused_mha_fastpath()
         _warm_up_npu(device)
         return device
     if kind == "cpu":

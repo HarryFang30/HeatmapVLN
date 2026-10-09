@@ -1,0 +1,38 @@
+# Packages the Ascend server environment adds on top of the ModelArts PyTorch image
+# (pytorch_2.7.1 / cann_8.3.rc1 / py_3.11 / aarch64 / snt9b), which already provides
+# torch 2.7.1, torch_npu 2.7.1, torchvision 0.22.1 and the CANN toolkit.
+#
+# Rebuild from scratch (only needed if the environment on the share is lost):
+#   conda create -y -p "$ROOT/envs/ppa" --clone PyTorch-2.7.1
+#   "$ROOT/envs/ppa/bin/python" -m pip install -r scripts/ascend/requirements-ascend.txt
+#   "$ROOT/envs/ppa/bin/python" -m pip install --no-deps "$ROOT/amb3r/checkpoints/deps/utils3d-0.0.2-py3-none-any.whl"
+# then re-check with scripts/ascend/bootstrap_instance.sh.
+#
+# Pins that are not negotiable:
+#  - transformers 4.51.0: src/models/runtime_compat.py refuses any other version.
+#  - numpy 1.26.4: numpy 2 leaves every numpy-1 C extension here ABI-broken, cv2 and
+#    the ones CANN's own op-compile toolchain imports included.  The failure does not
+#    appear at import time; it appears as CANN's kernel bank dying on the first served
+#    request (docs/ops/deploy_ascend_910b.md section 7).
+#  - protobuf 6.33.6: 3.20.2 predates the runtime_version check in the generated
+#    vla_rpc stubs.
+# The rest match the certified RTX 4090 container.
+#
+# utils3d is installed separately, with --no-deps, from the wheel in the AMB3R tree:
+# its dependency resolution pulls numpy 2.
+
+numpy==1.26.4
+transformers==4.51.0
+diffusers==0.36.0
+qwen-vl-utils==0.0.11
+accelerate==1.5.2
+peft==0.18.1
+safetensors==0.7.0
+timm==1.0.26
+numpy-quaternion==2024.0.13
+trimesh==4.11.5
+yacs==0.1.8
+addict==2.4.0
+pydantic==2.12.4
+protobuf==6.33.6
+grpcio-tools==1.80.0

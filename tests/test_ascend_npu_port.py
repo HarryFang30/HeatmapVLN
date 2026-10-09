@@ -351,3 +351,19 @@ def test_npu_launcher_keeps_tmpdir_short_enough_for_an_af_unix_socket():
     assert 'TMPDIR="$model_tmp"' in script and 'TMPDIR="$vo_tmp"' in script
     assert "AF_UNIX_MAX=108" in script
     assert "too long for an AF_UNIX socket" in script
+
+
+def test_both_servers_leave_the_fused_mha_fastpath_off_on_npu():
+    """The fused encoder-layer kernel has no NPU implementation and runs on the CPU."""
+    model = _code_only(MODEL_SERVER)
+    vo = _code_only(VO_SERVER)
+    assert "set_fastpath_enabled(False)" in model
+    assert "set_fastpath_enabled(False)" in vo
+    # Logged, because the fused and ordinary paths differ in summation order: this is
+    # a platform choice, not a free optimisation.
+    assert "Fused MHA fastpath disabled" in model
+    assert "Fused MHA fastpath disabled" in vo
+    # NPU only; the certified CUDA path keeps whatever torch picks there.
+    helper = _function_source(MODEL_SERVER, "_resolve_device")
+    assert "_disable_fused_mha_fastpath()" in helper
+    assert helper.index("kind == \"npu\"") < helper.index("_disable_fused_mha_fastpath()")
