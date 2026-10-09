@@ -29,7 +29,6 @@ PYTHON="${PPA_EVAL_PYTHON:-$ROOT/envs/ppa/bin/python}"
 
 PPA_CHECKPOINT="${PPA_EVAL_CHECKPOINT:-$ROOT/weights/ppa_refine_v2_best.pth}"
 PPA_CONFIG="${PPA_EVAL_CONFIG:-$REPO/configs/ppa_action_refine_v2_8gpu.yaml}"
-LOCKED_PLAN="${PPA_EVAL_LOCKED_PLAN:-$ROOT/evaluation_plans/internnav_native_r2r_val_unseen_8gpu_20260802}"
 
 MODEL_SERVER="$REPO/scripts/evaluation/rpc_model_server.py"
 VO_SERVER="$REPO/scripts/amb3r_vo/rpc_amb3r_vo_server.py"
@@ -111,7 +110,9 @@ for file in "$PPA_CHECKPOINT" "$PPA_CONFIG" "$MODEL_SERVER" "$VO_SERVER" \
   "$DA3_CHECKPOINT/model.safetensors" "$AMB3R_ROOT/slam/slam_config.yaml"; do
   require_file "$file"
 done
-for directory in "$REPO" "$RPC_ROOT/src/vla_rpc" "$INTERNNAV_MODEL_PATH" "$LOCKED_PLAN/tools"; do
+# The locked plan is a client-side input: it holds the cohorts, the dataset shards
+# and the merge tool, none of which either server imports.  It stays on the client box.
+for directory in "$REPO" "$RPC_ROOT/src/vla_rpc" "$INTERNNAV_MODEL_PATH"; do
   require_dir "$directory"
 done
 [[ -x "$PYTHON" ]] || die "missing executable: $PYTHON"
@@ -155,7 +156,7 @@ export DA3_SDPA_QUERY_CHUNK_SIZE=256
 export PYTHONDONTWRITEBYTECODE=1
 export HEATMAPVLN_TIMING="$TIMING"
 
-RPC_PYTHONPATH="$LOCKED_PLAN/tools:$RPC_ROOT/src:$REPO${PYTHONPATH:+:$PYTHONPATH}"
+RPC_PYTHONPATH="$RPC_ROOT/src:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 mkdir -p "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 
