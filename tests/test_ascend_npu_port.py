@@ -367,3 +367,15 @@ def test_both_servers_leave_the_fused_mha_fastpath_off_on_npu():
     helper = _function_source(MODEL_SERVER, "_resolve_device")
     assert "_disable_fused_mha_fastpath()" in helper
     assert helper.index("kind == \"npu\"") < helper.index("_disable_fused_mha_fastpath()")
+
+
+def test_shard_restarts_are_opt_in_and_resume():
+    """One failed RPC call raises and takes the whole shard; --resume bounds the loss."""
+    script = CUDA_LAUNCHER.read_text(encoding="utf-8")
+    assert 'SHARD_RETRIES="${PPA_EVAL_SHARD_RETRIES:-0}"' in script, "off by default: the certified runs used no retries"
+    assert "run_shard_once" in script and "run_shard() {" in script
+    assert "--resume" in script
+    # A restart must append to the client log, not truncate the evidence of the death.
+    assert '>>"$RUNTIME_DIR/logs/client_shard_0${shard}.log"' in script
+    # In external mode, wait for the tunnel to come back before retrying.
+    assert "tcp_open $((MODEL_PORT_BASE + slot)) && tcp_open $((VO_PORT_BASE + slot)) && break" in script

@@ -67,6 +67,12 @@ EPISODE_LISTS_DIR="${PPA_EVAL_EPISODE_LISTS_DIR:-$COHORTS_DIR}"
 # only runs the clients; the client flags, protocol and merge stay exactly the same.
 # docs/ops/deploy_ascend_910b.md describes the split deployment.
 EXTERNAL_SERVERS="${PPA_EVAL_EXTERNAL_SERVERS:-0}"
+# How many times to restart a client that dies mid-shard.  The client has no RPC
+# retry of its own: one failed call raises and takes the whole shard with it, which
+# over a 1839-episode run makes a single transient server or network hiccup expensive.
+# --resume makes a restart cost at most the episode that was in flight.  0 keeps the
+# original behaviour, which is what the certified CUDA runs used.
+SHARD_RETRIES="${PPA_EVAL_SHARD_RETRIES:-0}"
 # The remote servers' runtime directory, copied or mounted here: servers.json plus
 # the startup logs, which is where the preflight evidence lives in external mode.
 EXTERNAL_SERVER_DIR="${PPA_EVAL_EXTERNAL_SERVER_DIR:-}"
@@ -186,6 +192,7 @@ for gpu in "${GPUS[@]}" "${VO_GPUS[@]}"; do
 done
 [[ "$(printf '%s\n' "${SHARDS[@]}" | sort -u | wc -l | tr -d ' ')" -eq "${#SHARDS[@]}" ]] || die "shard IDs must be unique"
 [[ "$EXTERNAL_SERVERS" =~ ^[01]$ ]] || die "PPA_EVAL_EXTERNAL_SERVERS must be 0 or 1"
+[[ "$SHARD_RETRIES" =~ ^[0-9]+$ ]] || die "PPA_EVAL_SHARD_RETRIES must be a non-negative integer"
 if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
   # Without an explicit root the default would be this box's own CUDA output
   # directory, and --resume would then skip episodes that CUDA servers produced,
@@ -359,7 +366,7 @@ PY
   echo "[ppa-eval] slot=$slot gpu=${GPUS[$slot]} vo_gpu=${VO_GPUS[$slot]} model=$model_addr vo=$vo_addr ready"
 done
 
-run_shard() {
+run_shard_once() {
   local slot="$1" shard="$2"
   local output="$WORKERS_DIR/shard_0${shard}"
   local -a cap=()
@@ -389,10 +396,35 @@ run_shard() {
       --trajectory_x_sign 1 --trajectory_heading_alignment none \
       --system1_coord_order generated --no-pano_recenter_before_system1 \
       --no-debug_input_trace --debug_save_input_images 0 --resume "${cap[@]}" \
-      >"$RUNTIME_DIR/logs/client_shard_0${shard}.log" 2>&1
+      >>"$RUNTIME_DIR/logs/client_shard_0${shard}.log" 2>&1
 }
 
-echo "[ppa-eval] running shards $SHARD_CSV over $NUM_SLOTS slot(s)"
+run_shard() {
+  local slot="$1" shard="$2" attempt=0
+  while true; do
+    if run_shard_once "$slot" "$shard"; then
+      return 0
+    fi
+    (( attempt++ ))
+    if (( attempt > SHARD_RETRIES )); then
+      echo "[ppa-eval] slot=$slot shard=$shard failed after $attempt attempt(s)" >&2
+      return 1
+    fi
+    # The episodes already recorded are kept; --resume skips them on the next attempt.
+    echo "[ppa-eval] slot=$slot shard=$shard died; restarting (attempt $((attempt + 1))/$((SHARD_RETRIES + 1)))" >&2
+    if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
+      # Wait for the tunnel and the remote servers to come back before trying again,
+      # otherwise the restart just fails on the first call too.
+      for _ in $(seq 1 60); do
+        tcp_open $((MODEL_PORT_BASE + slot)) && tcp_open $((VO_PORT_BASE + slot)) && break
+        sleep 10
+      done
+    fi
+    sleep 15
+  done
+}
+
+echo "[ppa-eval] running shards $SHARD_CSV over $NUM_SLOTS slot(s) retries=$SHARD_RETRIES"
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   (
     set +e
