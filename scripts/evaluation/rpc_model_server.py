@@ -740,6 +740,33 @@ def _npu_poison_after_failure(device: torch.device, exc: BaseException) -> str |
     return None
 
 
+def _build_npu_profiler(directory: str, skip: int, calls: int):
+    """An NPU profiler over the next ``calls`` requests after ``skip``, or None.
+
+    Engineering instrument, not part of any served result: it is built only when
+    --profile-dir is given, and nothing here is imported or constructed otherwise.
+    The first requests of a process pay CANN's op compilation, so ``skip`` keeps that
+    out of the window.  Level1 plus PipeUtilization is what distinguishes "the device
+    is busy" from "the device is waiting for the host to send the next kernel", which
+    is the question any latency work on this platform has to answer first.
+    """
+    import torch_npu.profiler as profiler
+
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    experimental = profiler.experimental_config(
+        profiler_level=profiler.ProfilerLevel.Level1,
+        aic_metrics=profiler.AiCMetrics.PipeUtilization,
+    )
+    return profiler.profile(
+        activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        schedule=profiler.schedule(wait=0, warmup=max(int(skip), 0), active=max(int(calls), 1), repeat=1),
+        on_trace_ready=profiler.tensorboard_trace_handler(directory),
+        record_shapes=True,
+        with_stack=False,
+        experimental_config=experimental,
+    )
+
+
 def _resolve_device(args: argparse.Namespace) -> torch.device:
     """The accelerator named by ``--device``/``--gpu_id``.
 
@@ -2203,6 +2230,9 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
         # Set once, on NPU only, when a failed request left the device unable to
         # synchronize; from then on HealthCheck reports NOT_SERVING with it.
         self.device_poison: str | None = None
+        # None unless --profile-dir was given.  Stepped once per request; the trace is
+        # written when the scheduled window closes.
+        self.profiler = None
 
     def InferJSON(self, request: vla_pb2.JSONRequest, context) -> vla_pb2.JSONResponse:
         # Off (the default): a disabled timer, every stage a no-op, the response unchanged.
@@ -2238,6 +2268,8 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
             return vla_pb2.JSONResponse(ts=request.ts, json_payload=json.dumps({"ok": False, "error": str(exc)}))
         finally:
             _REQUEST_TIMING.timer = _TIMING_OFF
+            if self.profiler is not None:
+                self.profiler.step()
 
     def HealthCheck(self, request: vla_pb2.HealthCheckRequest, context) -> vla_pb2.HealthCheckResponse:
         if self.device_poison is not None:
@@ -2397,6 +2429,27 @@ def parse_args() -> argparse.Namespace:
             "server that happens to listen on the same port. Empty changes nothing."
         ),
     )
+    parser.add_argument(
+        "--profile_dir",
+        default="",
+        help=(
+            "Write an NPU profile of a few requests here, then keep serving. An "
+            "engineering instrument for latency work, never part of a reported run: "
+            "empty (the default) builds no profiler and changes nothing."
+        ),
+    )
+    parser.add_argument(
+        "--profile_skip",
+        type=int,
+        default=1,
+        help="Requests to let past before profiling, so CANN's op compilation stays out of the window.",
+    )
+    parser.add_argument(
+        "--profile_calls",
+        type=int,
+        default=2,
+        help="Requests to profile once --profile_dir is set.",
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -2438,9 +2491,16 @@ def main() -> int:
         futures.ThreadPoolExecutor(max_workers=args.workers),
         options=options,
     )
-    vla_pb2_grpc.add_VLAServicer_to_server(
-        HeatmapVLNRPCServicer(runtime, server_instance=args.server_instance), server
-    )
+    servicer = HeatmapVLNRPCServicer(runtime, server_instance=args.server_instance)
+    if args.profile_dir:
+        servicer.profiler = _build_npu_profiler(args.profile_dir, args.profile_skip, args.profile_calls)
+        servicer.profiler.start()
+        LOGGER.warning(
+            "NPU profiling on: skipping %d request(s), profiling %d into %s. "
+            "This perturbs latency and must not be used for a reported run.",
+            args.profile_skip, args.profile_calls, args.profile_dir,
+        )
+    vla_pb2_grpc.add_VLAServicer_to_server(servicer, server)
     address = f"{args.host}:{args.port}"
     bound_port = server.add_insecure_port(address)
     if bound_port == 0:

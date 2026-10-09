@@ -104,3 +104,45 @@ def test_the_keepalive_policy_is_not_gated_behind_a_flag():
         assert last_options > last_if, (
             f"{path.name} appears to gate the keepalive options behind a condition"
         )
+
+
+# ---------------------------------------------------------------------------
+# The NPU profiler hook, which exists for latency work only
+# ---------------------------------------------------------------------------
+def test_the_npu_profiler_is_off_and_inert_unless_asked_for():
+    """No profiler, no import and no step() unless --profile_dir is given.
+
+    It perturbs exactly what it measures, so it must be impossible to leave on by
+    accident: the flag defaults to empty, torch_npu.profiler is imported inside the
+    builder rather than at module scope, and the per-request step is guarded.
+    """
+    tree = ast.parse(MODEL_SERVER.read_text(encoding="utf-8"))
+    flags = {
+        call.args[0].value: {kw.arg: kw.value for kw in call.keywords}
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "add_argument"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+    }
+    default = flags["--profile_dir"].get("default")
+    assert isinstance(default, ast.Constant) and default.value == ""
+
+    builder = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_npu_profiler"
+    )
+    # The import lives inside the builder: a module-level one would load the profiler
+    # into every served process, including the certified CUDA one.
+    assert any(
+        isinstance(node, ast.Import) and any(a.name == "torch_npu.profiler" for a in node.names)
+        for node in ast.walk(builder)
+    ), "torch_npu.profiler must be imported inside the builder"
+    source = MODEL_SERVER.read_text(encoding="utf-8")
+    assert "import torch_npu.profiler" not in source.split("def _build_npu_profiler")[0]
+
+    # Built and started only behind the flag, and stepped only when it exists.
+    assert "if args.profile_dir:" in source
+    assert "if self.profiler is not None:\n                self.profiler.step()" in source
+    assert "self.profiler = None" in source
