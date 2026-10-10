@@ -203,6 +203,36 @@ class StatefulAMB3RBackend:
         self._seed_episode()
         self.pipeline.keyframe_memory = None
         self._initialized = False
+        self._release_cached_device_memory()
+
+    def _release_cached_device_memory(self) -> None:
+        """Give the previous episode's cached blocks back before the next map init.
+
+        Ascend only, and not a speed tweak: without it the second episode on a
+        server process hangs.  The keyframe memory has just been dropped, so this is
+        where the cache is largest, and the next thing to happen is the 20-view map
+        initialisation -- the biggest forward this server runs, and the one that
+        makes CANN's graph engine ask the device for its own workspace.  The 910B
+        card is 65536 MiB and the pair on it reserves about 62 GB under load (of
+        which only about 40 GB is live tensors), so that request came back
+        rt_ret:207001 for 831782912 bytes, the AI CPU then reported oom
+        (ret=0x7110012) and retried it every 1.1 s for ever.  Nothing failed: the
+        stream simply stopped draining, and the next host synchronisation --
+        whichever line it happened to be -- waited out CANN's nine-minute timeout
+        and raised 507017 there.  Measured twice, both times on the second episode.
+
+        Returning cached blocks cannot change a number: the allocator hands back
+        free blocks and re-acquires them on demand.  It is kept off CUDA anyway,
+        because that path is certified and does not have the problem.
+        """
+        import torch
+
+        kind = torch.device(self.device).type
+        if kind != "npu":
+            return
+        backend = getattr(torch, kind, None)
+        if backend is not None and hasattr(backend, "empty_cache"):
+            backend.empty_cache()
 
     @staticmethod
     def _as_model_batch(frames_rgb: np.ndarray):

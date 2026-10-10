@@ -216,6 +216,15 @@ export DA3_DISABLE_XFORMERS=1
 export DA3_SDPA_QUERY_CHUNK_SIZE=256
 export PYTHONDONTWRITEBYTECODE=1
 export HEATMAPVLN_TIMING="$TIMING"
+# Stop the caching allocator taking the whole card.  CANN's graph engine allocates
+# its own workspace from the same device memory -- about 800 MiB for the 20-view map
+# init -- and when it cannot get it the AI CPU reports oom (ret=0x7110012) and
+# retries for ever, which presents as a hang and then as ACL 507017 at whatever line
+# next synchronises.  Under load the pair on one card reserved about 62 of 65.5 GB
+# while only about 40 GB was live tensors, so most of that was fragmentation this
+# setting avoids.  It changes how memory is segmented, not what is computed.
+export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
+echo "[ppa-npu] pytorch_npu_alloc_conf=$PYTORCH_NPU_ALLOC_CONF"
 # The vision-tower pass reuse in generate_latents.  The counter and the window-mask
 # patch install themselves on NPU, but the reuse is opt-in in
 # src/models/qwen2_5_vl_vision_count.py (``_on`` wants exactly "1"), so without this

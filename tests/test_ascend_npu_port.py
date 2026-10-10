@@ -553,3 +553,35 @@ def test_npu_launcher_demands_the_vision_counter_report_the_reuse_state_it_set()
     counter = _code_only(REPO / "src" / "models" / "qwen2_5_vl_vision_count.py")
     assert "vision tower passes counted per request; reuse %s (%s), verify %s" in counter
     assert "REUSE_FLAG," in counter
+
+
+def test_vo_backend_returns_its_cache_before_the_next_map_init():
+    """The second episode on a server process hung without this, and nothing failed.
+
+    CANN's graph engine allocates its own device workspace -- about 800 MiB for the
+    20-view map init -- from the same memory the caching allocator is holding.  When
+    it cannot get it the AI CPU reports oom and retries for ever, so the stream stops
+    draining and the next host synchronisation waits out CANN's nine-minute timeout
+    and raises 507017 at whatever line it happens to be.  Dropping the keyframe
+    memory and then returning the cache is what makes room.
+    """
+    reset = _function_source(REPO / "src" / "vo" / "online_amb3r.py", "reset",
+                             inside="StatefulAMB3RBackend")
+    assert "_release_cached_device_memory()" in reset
+    # After the keyframe memory is dropped, which is when the cache is largest.
+    assert reset.index("keyframe_memory = None") < reset.index("_release_cached_device_memory()")
+
+    release = _function_source(REPO / "src" / "vo" / "online_amb3r.py",
+                               "_release_cached_device_memory", inside="StatefulAMB3RBackend")
+    assert "empty_cache" in release
+    # NPU only: the CUDA path is certified and does not have this problem.
+    assert 'kind != "npu"' in release
+    assert "return" in release
+
+
+def test_npu_launcher_keeps_device_memory_for_the_graph_engine():
+    """expandable_segments, or the allocator's fragmentation starves CANN's own."""
+    launcher = _code_only(NPU_LAUNCHER)
+    assert 'export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"' in launcher
+    # In the log, so a run that overrode it is visible afterwards.
+    assert "pytorch_npu_alloc_conf=$PYTORCH_NPU_ALLOC_CONF" in launcher
