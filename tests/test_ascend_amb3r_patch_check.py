@@ -39,6 +39,7 @@ VO_SERVER = REPO / "scripts" / "amb3r_vo" / "rpc_amb3r_vo_server.py"
 
 PIPELINE = "slam/pipeline.py"
 API = "thirdparty/depth_anything_3/api.py"
+ROPE = "thirdparty/depth_anything_3/model/dinov2/layers/rope.py"
 
 BASH = shutil.which("bash")
 GIT = shutil.which("git")
@@ -104,13 +105,13 @@ def _git_tree(root: Path, *, patched: bool) -> Path:
     """A git checkout whose HEAD is the unpatched base, with the work tree patched or not."""
     if GIT is None:
         pytest.skip("git is required for the checkout cases")
-    _write_tree(root, patched={PIPELINE: False, API: False})
+    _write_tree(root, patched={PIPELINE: False, API: False, ROPE: False})
     (root / "README.md").write_text("amb3r fixture\n", encoding="utf-8")
     _git(root, "init", "-q")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "base")
     if patched:
-        _write_tree(root, patched={PIPELINE: True, API: True})
+        _write_tree(root, patched={PIPELINE: True, API: True, ROPE: True})
     return root
 
 
@@ -135,12 +136,18 @@ def _tree_digest(root: Path) -> dict[str, tuple[str, int, int]]:
     return digest
 
 
-def test_fixture_images_come_from_both_files_of_the_patch():
+def test_fixture_images_come_from_every_file_of_the_patch():
     # If the parser silently dropped a file or a hunk, every case below would be
     # testing the check against something other than the patch.
-    assert set(IMAGES) == {PIPELINE, API}
+    assert set(IMAGES) == {PIPELINE, API, ROPE}
     for before, after in IMAGES.values():
         assert before != after
+    # The rope hunk is the one that stops a hang rather than a silent precision
+    # change, so pin both sides of it: the device read goes, the host bound arrives.
+    rope_before, rope_after = IMAGES[ROPE]
+    assert "max_position = int(positions.max()) + 1" in rope_before
+    assert "max_position = int(positions.max()) + 1" not in rope_after
+    assert "max_position = int(positions.shape[-2]) + 1" in rope_after
 
 
 
@@ -148,7 +155,7 @@ def test_fixture_images_come_from_both_files_of_the_patch():
 def test_patched_plain_directory_passes_with_a_non_git_warning(tmp_path):
     # A plain copy of the tree is still checkable by its two files.  Refusing it
     # would block a correct deployment for want of a .git directory.
-    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: True})
+    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: True, ROPE: True})
     result = _run(tree)
     assert result.returncode == 0, result.stderr
     assert "carries the NPU patch" in result.stdout
@@ -169,7 +176,7 @@ def test_patched_git_checkout_passes(tmp_path):
 
 def test_clean_clone_is_refused_for_the_fp32_mapping_forward(tmp_path):
     # The case the check exists for: before it, a clean clone passed every gate.
-    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: False, API: False})
+    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: False, API: False, ROPE: False})
     result = _run(tree)
     assert result.returncode == 2
     assert "not patched" in result.stderr
@@ -180,7 +187,7 @@ def test_clean_clone_is_refused_for_the_fp32_mapping_forward(tmp_path):
 def test_only_api_reverted_is_refused_for_fp16(tmp_path):
     # Each fix is checked on its own: a tree with the pipeline fix and a reverted
     # api.py would otherwise run DA3 in fp16 with no trace.
-    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: False})
+    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: False, ROPE: True})
     result = _run(tree)
     assert result.returncode == 2
     assert API in result.stderr and "fp16" in result.stderr
@@ -210,7 +217,7 @@ def test_missing_tree_is_refused_as_not_mounted(tmp_path):
 
 
 def test_missing_patch_file_is_refused(tmp_path):
-    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: True})
+    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: True, ROPE: True})
     result = _run(tree, str(tmp_path / "missing.patch"))
     assert result.returncode == 2
     assert "missing patch" in result.stderr
@@ -270,7 +277,7 @@ def test_refusal_carries_an_apply_command_that_actually_fixes_the_tree(tmp_path,
     else:
         if GIT is None:
             pytest.skip("git is required to run the printed apply command")
-        _write_tree(tree, patched={PIPELINE: False, API: False})
+        _write_tree(tree, patched={PIPELINE: False, API: False, ROPE: False})
     refused = _run(tree)
     assert refused.returncode == 2
     match = re.search(r"Apply it with: (git .* apply .*)$", refused.stderr, re.MULTILINE)
@@ -295,7 +302,7 @@ def test_check_never_writes_to_the_tree(tmp_path, state):
     if state.endswith("git"):
         tree = _git_tree(tmp_path / "amb3r", patched=patched)
     else:
-        tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: patched, API: patched})
+        tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: patched, API: patched, ROPE: patched})
     before = _tree_digest(tree)
     result = _run(tree)
     assert result.returncode == (0 if patched else 2), result.stderr
@@ -306,7 +313,7 @@ def test_repo_root_resolves_from_any_working_directory(tmp_path):
     # The launcher calls the check by absolute path, and the default patch is found
     # relative to the script.  If that resolution used the caller's cwd, the check
     # would refuse every tree for a "missing patch" from anywhere but the repo root.
-    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: True})
+    tree = _write_tree(tmp_path / "amb3r", patched={PIPELINE: True, API: True, ROPE: True})
     cwd = tmp_path / "somewhere" / "else"
     cwd.mkdir(parents=True)
     result = _run(tree, cwd=cwd)
@@ -314,7 +321,7 @@ def test_repo_root_resolves_from_any_working_directory(tmp_path):
     assert "missing patch" not in result.stderr
     # And the refusal names the repo's patch by its absolute path, so the printed
     # command works from where the operator stands.
-    unpatched = _write_tree(tmp_path / "clean", patched={PIPELINE: False, API: False})
+    unpatched = _write_tree(tmp_path / "clean", patched={PIPELINE: False, API: False, ROPE: False})
     refused = _run(unpatched, cwd=cwd)
     assert refused.returncode == 2
     assert str(PATCH) in refused.stderr

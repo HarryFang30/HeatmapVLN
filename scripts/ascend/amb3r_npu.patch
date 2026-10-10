@@ -43,3 +43,33 @@ index 08a8505..45da798 100644
          with torch.no_grad():
              with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
                  return self.model(
+diff --git a/thirdparty/depth_anything_3/model/dinov2/layers/rope.py b/thirdparty/depth_anything_3/model/dinov2/layers/rope.py
+index f75ba37..3a003af 100644
+--- a/thirdparty/depth_anything_3/model/dinov2/layers/rope.py
++++ b/thirdparty/depth_anything_3/model/dinov2/layers/rope.py
+@@ -179,8 +179,23 @@ class RotaryPositionEmbedding2D(nn.Module):
+         # Compute feature dimension for each spatial direction
+         feature_dim = tokens.size(-1) // 2
+ 
+-        # Get frequency components
+-        max_position = int(positions.max()) + 1
++        # Get frequency components.  The bound below comes from the token axis, not
++        # from positions.max(): that read is a device-to-host synchronisation, and on
++        # Ascend it hangs there (AI_CPU_Timeout / ACL 507017) and takes the whole
++        # device with it -- twice in two canary runs, in the 20-view map
++        # initialisation, under both synchronous and asynchronous dispatch.  It is
++        # called twice per attention block, so one forward did it about eighty times.
++        #
++        # Bit-exact, not approximate, for two reasons.  PositionGetter in this file is
++        # the only producer of `positions`: cartesian_prod(arange(h), arange(w)),
++        # optionally +1 with patch_start_idx zero rows prepended.  Every value is
++        # therefore at most max(h, w) <= h*w <= N, the token-axis length, so the exact
++        # max_position never exceeds N + 1.  And row i of the cos/sin table depends
++        # only on i (arange(seq_len) einsum inv_freq) while _apply_1d_rope reads row
++        # positions[k] through F.embedding, so a larger seq_len only appends rows that
++        # are never read.  At 518x392 with patch 14 the exact value is 38 and this
++        # bound is N + 1; the wider table costs a few MB once and is then cached.
++        max_position = int(positions.shape[-2]) + 1
+         cos_comp, sin_comp = self._compute_frequency_components(
+             feature_dim, max_position, tokens.device, tokens.dtype
+         )
