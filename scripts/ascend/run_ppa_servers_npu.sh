@@ -216,6 +216,16 @@ export DA3_DISABLE_XFORMERS=1
 export DA3_SDPA_QUERY_CHUNK_SIZE=256
 export PYTHONDONTWRITEBYTECODE=1
 export HEATMAPVLN_TIMING="$TIMING"
+# The vision-tower pass reuse in generate_latents.  The counter and the window-mask
+# patch install themselves on NPU, but the reuse is opt-in in
+# src/models/qwen2_5_vl_vision_count.py (``_on`` wants exactly "1"), so without this
+# line nothing turns it on and the -2749 ms on the heaviest call is simply not there.
+# EXP-22's 设置 records it as on by default and refusable with =0, which is what this
+# makes true, and setting it here also makes it symmetric across passes: the value is
+# in this log and the same for every slot, rather than in whoever's shell started the
+# servers.  =0 still refuses it.
+export HEATMAPVLN_QWEN_VISION_REUSE="${HEATMAPVLN_QWEN_VISION_REUSE:-1}"
+echo "[ppa-npu] qwen_vision_reuse=$HEATMAPVLN_QWEN_VISION_REUSE mask_patch=${HEATMAPVLN_QWEN_VISION_MASK_PATCH:-<on for npu>} pass_count=${HEATMAPVLN_QWEN_VISION_COUNT:-<on for npu>}"
 # torch_npu's async dispatch queue.  Deliberately not set here: the platform default
 # (on) measured 7.0-7.7% FASTER per plan call than TASK_QUEUE_ENABLE=0, in every call
 # class, over two passes each on two separately started servers, with all four
@@ -445,6 +455,26 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
     || die "model slot $slot lacks PPA preflight evidence"
   grep -F "Model server device: npu:0" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
     || die "model slot $slot did not report an NPU device"
+  # Which of the three vision settings this process actually came up with, in its own
+  # words.  The counter prints this after it has wrapped the tower's forward, so the
+  # line proves the wrapper went in (it refuses a transformers version or a forward
+  # signature it was not written against) and reports the reuse state it read from the
+  # environment.  It does not prove a reuse ever hit; the served responses'
+  # vision_tower counts do that.
+  grep -F "vision tower passes counted per request; reuse $(
+    [[ "$HEATMAPVLN_QWEN_VISION_REUSE" == "1" ]] && echo on || echo off
+  ) (HEATMAPVLN_QWEN_VISION_REUSE)" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+    || die "model slot $slot did not report the vision-tower pass counter with reuse=$HEATMAPVLN_QWEN_VISION_REUSE"
+  # That line is printed when the counter wraps the tower, which is before the model
+  # is built; refuse_reuse_on_adapted_tower can still turn the reuse off afterwards,
+  # when the built tower turns out to carry adapters that the pixels do not key.  Then
+  # the line above says "reuse on" and the server serves with it off.  Running without
+  # the reuse is safe -- it is the original computation -- but it is not the
+  # configuration EXP-22 names, so say so instead of serving a third thing.
+  if [[ "$HEATMAPVLN_QWEN_VISION_REUSE" == "1" ]]; then
+    grep -F "vision tower reuse disabled" "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+      && die "model slot $slot turned the vision-tower reuse off at model load (the tower carries adapters); set HEATMAPVLN_QWEN_VISION_REUSE=0 to run without it on purpose"
+  fi
   grep -F "VO server device: npu:0" "$RUNTIME_DIR/logs/vo_${slot}.log" >/dev/null \
     || die "VO slot $slot did not report an NPU device"
   # What DA3's own parser makes of the chunk size, read out of the module that

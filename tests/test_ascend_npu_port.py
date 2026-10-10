@@ -514,3 +514,42 @@ def test_shard_restarts_are_opt_in_and_resume():
     # waiting fixes, so the shard is given up instead of retried.
     assert "probe == 3" in script
     assert "giving up the shard" in script
+
+
+def test_npu_launcher_turns_the_vision_tower_reuse_on_itself():
+    """Nothing else does, and EXP-22 certifies the configuration this launcher starts.
+
+    The window-mask patch and the pass counter install themselves when the device is
+    an NPU, but the reuse is opt-in: ``_on`` in src/models/qwen2_5_vl_vision_count.py
+    wants the environment variable to be exactly "1".  Without an export here the
+    reuse is simply off, whatever the docs say, and the heaviest call keeps the
+    2749 ms the reuse was measured to remove.  Setting it in the launcher also makes
+    it symmetric across passes and puts the value in the log, instead of leaving it
+    to whichever shell started the servers.
+    """
+    launcher = _code_only(NPU_LAUNCHER)
+    assert 'export HEATMAPVLN_QWEN_VISION_REUSE="${HEATMAPVLN_QWEN_VISION_REUSE:-1}"' in launcher
+    # Refusable, as the pre-registration says: =0 survives the default expansion.
+    counter = _code_only(REPO / "src" / "models" / "qwen2_5_vl_vision_count.py")
+    assert 'os.environ.get(name, "").strip() == "1"' in counter
+    # And the value is in the log, so two passes can be compared on it.
+    assert "qwen_vision_reuse=$HEATMAPVLN_QWEN_VISION_REUSE" in launcher
+
+
+def test_npu_launcher_demands_the_vision_counter_report_the_reuse_state_it_set():
+    """An evidence line that can fail: it comes from the counter, after it wrapped.
+
+    The counter refuses to install against a transformers version or a tower forward
+    signature it was not written against, and returns False without raising, so the
+    server would serve with neither the counter nor the reuse and nothing else would
+    say so.  The grep also carries the reuse state, so a slot that somehow came up
+    with the other setting does not pass for this one.
+    """
+    launcher = _code_only(NPU_LAUNCHER)
+    assert "vision tower passes counted per request; reuse $(" in launcher
+    assert '[[ "$HEATMAPVLN_QWEN_VISION_REUSE" == "1" ]] && echo on || echo off' in launcher
+    assert "did not report the vision-tower pass counter with reuse=" in launcher
+    # The string has to be the one the counter actually logs.
+    counter = _code_only(REPO / "src" / "models" / "qwen2_5_vl_vision_count.py")
+    assert "vision tower passes counted per request; reuse %s (%s), verify %s" in counter
+    assert "REUSE_FLAG," in counter
