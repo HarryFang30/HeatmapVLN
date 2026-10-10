@@ -216,6 +216,16 @@ export DA3_DISABLE_XFORMERS=1
 export DA3_SDPA_QUERY_CHUNK_SIZE=256
 export PYTHONDONTWRITEBYTECODE=1
 export HEATMAPVLN_TIMING="$TIMING"
+# torch_npu's async dispatch queue.  Deliberately not set here: the platform default
+# (on) measured 7.0-7.7% FASTER per plan call than TASK_QUEUE_ENABLE=0, in every call
+# class, over two passes each on two separately started servers, with all four
+# pairwise comparisons identical field by field.  The 2026-10-09 canary carried =0 to
+# work around the AICPU timeout; it is a non-default, uncertified switch and it costs
+# speed, so a run that still sets it should be visible in this log.
+if [[ "${TASK_QUEUE_ENABLE:-}" == "0" ]]; then
+  printf '[ppa-npu] WARN TASK_QUEUE_ENABLE=0 is set: about 7%% slower per plan call and not a certified setting (ascend_910b_open_problems.md)\n' >&2
+fi
+echo "[ppa-npu] task_queue_enable=${TASK_QUEUE_ENABLE:-<platform default>}"
 
 RPC_PYTHONPATH="$RPC_ROOT/src:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
