@@ -688,6 +688,20 @@ def _disable_fused_mha_fastpath() -> bool:
     return True
 
 
+def _install_vision_mask_patch(device_type: str) -> bool:
+    """Read Qwen2.5-VL's vision window bounds once instead of once per window per layer.
+
+    An NPU profile of one steady-state plan call counted 16272 one-scalar device-to-host
+    copies at modeling_qwen2_5_vl.py:302, each a full synchronisation, costing 2.04 s of
+    a 5.4-5.9 s call.  src/models/qwen2_5_vl_vision_mask.py explains why the patched mask
+    is the same tensor, and refuses to install against a transformers it was not derived
+    from.  Called before the model is built, so the vision blocks pick it up.
+    """
+    from src.models.qwen2_5_vl_vision_mask import install_qwen2_5_vl_vision_mask_patch
+
+    return install_qwen2_5_vl_vision_mask_patch(device_type, LOGGER)
+
+
 def _warm_up_npu(device: torch.device) -> None:
     """Make CANN build its op-compile toolchain now, not during the first request.
 
@@ -810,6 +824,7 @@ def _resolve_device(args: argparse.Namespace) -> torch.device:
             torch.npu.is_bf16_supported(),
         )
         _disable_fused_mha_fastpath()
+        _install_vision_mask_patch("npu")
         _warm_up_npu(device)
         return device
     if kind == "cpu":

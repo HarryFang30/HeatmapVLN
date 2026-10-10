@@ -96,6 +96,7 @@ def _load_resolve_device():
         "LOGGER": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
         "_disable_fused_mha_fastpath": lambda: calls.append("fastpath"),
         "_warm_up_npu": lambda device: calls.append(("warm_up", device)),
+        "_install_vision_mask_patch": lambda device_type: calls.append(("vision_mask", device_type)),
     }
     exec(compile(source, str(MODEL_SERVER), "exec"), namespace)
     return namespace["_resolve_device"], torch, calls
@@ -134,7 +135,9 @@ def test_model_server_npu_requires_a_real_npu(monkeypatch):
     assert resolve(args) == "npu:3"
     assert chosen == [3]
     # The fake torch.device returns its spec, so the warm-up records the string.
-    assert calls == ["fastpath", ("warm_up", "npu:3")]
+    # The npu branch disables the fused MHA fastpath, installs the vision mask patch
+    # (both before the model is built) and warms the op toolchain, in that order.
+    assert calls == ["fastpath", ("vision_mask", "npu"), ("warm_up", "npu:3")]
 
 
 def test_model_server_cpu_is_only_ever_explicit():
