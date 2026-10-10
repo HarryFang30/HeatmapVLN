@@ -2647,6 +2647,10 @@ zsNo4HB9uLZ / 1，成功 1.0、SPL 1.0000、NE 0.5101、50 步，慢系统调用
   - **视觉塔过数计数器默认开**（`HEATMAPVLN_QWEN_VISION_COUNT=0` 可拒绝）。它不读设备数据、
     不改任何计算；开计时时它的数写在响应的 `vision_tower` 字段里，**不在 `timing_ms` 里**，
     所以 `summarize_latency.py` 的阶段完整性检查不受影响。
+  - **`generate_latents` 的视觉塔复用默认开**（`HEATMAPVLN_QWEN_VISION_REUSE=0` 可拒绝）。
+    最重那类调用 −2749 ms。证据两条：开/关各 14 次规划调用逐字段相同；
+    以及 `HEATMAPVLN_QWEN_VISION_REUSE_VERIFY=1` 下每次命中都重算再比，6/6 逐位相等、0 次不等
+    （顺带说明这台 NPU 上同输入的视觉塔是逐位确定的）。
   - 这三条都**没有过 H1**，和别的部署设置一样——H1 就是用来认证它们的。
     这一轮关于它们的证据只到"同一台机器、同一驱动、合成帧、14 次调用逐字段相同"，
     用的是 `scripts/tools/probe_plan_latency.py compare`，不是 `scripts/exp19/build_records.compare_calls`，
