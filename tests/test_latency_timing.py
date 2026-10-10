@@ -1069,6 +1069,11 @@ def test_model_server_timing_off_changes_nothing_and_on_only_adds_timing(model_s
     on = _infer(server, vla_pb2, monkeypatch, case, timing=True)
     on_payload = json.loads(on.json_payload)
     timing = on_payload.pop("timing_ms")
+    # Counts, not milliseconds, so they ride beside timing_ms rather than in it --
+    # summarize_latency.py and the assertions below read timing_ms as stage -> ms.
+    # This runtime is a stub with no vision tower, so the count is zero here; what
+    # the key pins is that timing on adds exactly these two and nothing else.
+    assert on_payload.pop("vision_tower") == {"vision_tower_calls": 0, "vision_tower_shapes": []}
     assert "cuda_memory_mib" not in on_payload  # CPU runtime
     assert on_payload == json.loads(off.json_payload)
     assert sorted(timing) == sorted(stages)

@@ -64,6 +64,8 @@ from src.models.heatmap.native_internnav_exact import (
 )
 from src.data.dagger_system2_sft import parse_cognition_prefix
 from src.models.qwen2_5_vl.integration import MEMORY_TOKEN_INDEX
+from src.models.qwen2_5_vl_vision_count import request_scope as _vision_request_scope
+from src.models.qwen2_5_vl_vision_count import stats as _vision_stats
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
 from src.models.action.treatment_spec import (
     TrajectoryPostprocessConfig,
@@ -702,6 +704,21 @@ def _install_vision_mask_patch(device_type: str) -> bool:
     return install_qwen2_5_vl_vision_mask_patch(device_type, LOGGER)
 
 
+def _install_vision_pass_counter(device_type: str) -> bool:
+    """Report how many times a request ran the vision tower, and on what shapes.
+
+    Several candidate fixes turn on that number -- the tower can run up to four times
+    in one plan call -- and every estimate of it so far rests on a profile that, by its
+    own kernel counts, was taken on a call that ran it once.  The counter reads no
+    device data, so it costs no synchronisation; its numbers land in ``timing_ms``.
+    src/models/qwen2_5_vl_vision_count.py also records why reusing a pass behind the
+    tower's back is not safe here.
+    """
+    from src.models.qwen2_5_vl_vision_count import install_qwen2_5_vl_vision_count
+
+    return install_qwen2_5_vl_vision_count(device_type, LOGGER)
+
+
 def _warm_up_npu(device: torch.device) -> None:
     """Make CANN build its op-compile toolchain now, not during the first request.
 
@@ -825,6 +842,7 @@ def _resolve_device(args: argparse.Namespace) -> torch.device:
         )
         _disable_fused_mha_fastpath()
         _install_vision_mask_patch("npu")
+        _install_vision_pass_counter("npu")
         _warm_up_npu(device)
         return device
     if kind == "cpu":
@@ -2260,8 +2278,10 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
         timer = StageTimer(enabled=self.timing, device=self.runtime.device)
         _REQUEST_TIMING.timer = timer
         try:
-            # handler_total ends before the response JSON is serialised.
-            with timer.stage("handler_total"):
+            # handler_total ends before the response JSON is serialised.  The vision
+            # scope wraps the same work: its cache and its pass counters belong to this
+            # request and are dropped before the reply (qwen2_5_vl_vision_reuse.py).
+            with _vision_request_scope(), timer.stage("handler_total"):
                 if timer.enabled:
                     reset_accel_peak(self.runtime.device)
                 with timer.stage("request_decode"):
@@ -2269,8 +2289,13 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
                 if request.method != "plan_panoramic":
                     raise ValueError(f"Unsupported method: {request.method}")
                 output = self.runtime.plan_panoramic(payload, request.blobs)
+                vision_stats = _vision_stats()
             if timer.enabled:
                 output["timing_ms"] = timer.as_dict()
+                # Beside timing_ms, not inside it: these are counts, and timing_ms is
+                # a map of stage name to milliseconds that summarize_latency.py and
+                # the timing-neutrality test both read as exactly that.
+                output["vision_tower"] = vision_stats
                 memory = accel_memory_mib(self.runtime.device)
                 if memory is not None:
                     output["cuda_memory_mib"] = memory
