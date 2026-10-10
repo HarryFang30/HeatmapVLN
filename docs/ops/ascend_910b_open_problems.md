@@ -545,14 +545,54 @@ ingest——在一台已经不能算数的机器上全部通过**。所以修法
 （`rpc_model_server.py:1327`），而这两个测试用 `object.__new__` 造桩，桩没跟上。
 干净 HEAD 加同一个 `PYTHONPATH` 复现一模一样的两条，所以**不是这一轮引入的**。
 
-⚠️ **不要顺手补这个桩。** 试过了：补上 `system2_cognition_arm = False` 之后，下一个缺的是
-`ppa_online_amb3r`（`rpc_model_server.py:1708`），而这一个不是机械填值——部署里它是 `True`
-（启动脚本传 `--require_ppa_online_amb3r`），而这两个测试是按 PPA 之前的两阶段协议写的
-（看它们设的 `has_nextdit` / `pano_latent_adapter`）。填 `False` 能让它们过，但那是在测一个
-部署根本不用的配置；填 `True` 会把它们送进没写过的分支。**决定这两个测试该断言什么，是关于
-旧两阶段协议的判断，不是补桩**——和 CLAUDE.md §4 里那条 `_dataloader_in_order_kwargs`
-collection error 同类，单独一件活。所以这台机器在 `PYTHONPATH` 设对时的基线就是
-**14 failed / 25 errors**。
+### ✅ 这两条已经处理掉了（2026-10-09）
+
+上一稿在这里写着"不要顺手补这个桩"，理由是 `ppa_online_amb3r` 在部署里是 `True`，填 `False`
+等于测一个部署不用的配置。**这个前提是错的。** 两阶段 recenter 和 formal online PPA 是**互斥的
+两条臂**，客户端有两道闸门明文拦着（`scripts/evaluation/r2r_val_unseen.py`，两处）：
+
+```
+formal online PPA uses native front-only InternNav and forbids pano_recenter_before_system1
+online AMB3R PPA requires --no-pano_recenter_before_system1
+```
+
+所以对走 `--pano_recenter_before_system1` 的那条臂，`ppa_online_amb3r = False` **就是部署里的
+值**，不是绕开 PPA 分支的填充。两阶段也不是"PPA 之前的旧协议"：客户端 recenter 之后照样发
+`phase="front_system1"`，服务端无条件广告 `...PANO_TWO_PHASE_FRONT_SYSTEM1` 能力，客户端还会
+校验这一相的三条不变量（pixel 回显、`pano_goal_view=="front"`、第二次 heading 对齐关掉）——
+正是这个测试断言的那三条。于是两条分开处理：
+
+- `test_two_phase_rpc_skips_system1_until_after_real_recenter` → **修桩保留**。补
+  `system2_cognition_arm = False` + `ppa_online_amb3r = False`，并把"为什么是 False"写在桩旁边。
+- `test_internnav_rpc_runs_second_lookdown_generation` → **退役**。它那条契约现在有三处按部署
+  形态写的覆盖：`tests/test_latency_timing.py` 的 `MODEL_CASES["ready_two_turns"]`（走 servicer，
+  `ppa_online_amb3r=True`、真 pose 字段、`phase="joint"`，断言 `system2_turn2_prep/_generate`
+  两个 stage，并用 sha256 钉住整个响应）、`tests/test_native_internnav_exact.py`
+  ::`test_lookdown_turn_appends_assistant_and_user`（消息结构比它更细）、以及同文件里仍然通过的
+  ::`test_internnav_lookdown_helpers_preserve_native_coordinate_order`（坐标序）。它自己其实已经
+  碰不到被测代码了：喂的是 384x384 lookdown，而 `ed46c76` 之后 native 路径对非
+  `NATIVE_LOOKDOWN_SIZE`（640x480）直接 fail closed；而且它走 `phase="system2"`，native 协议
+  根本见不到这一相（native InternNav 就是 PPA 臂，PPA 禁 recenter → 客户端只发 `"joint"`）。
+
+**边界**：只动了测试，生产代码一行没改；两阶段臂自己的闭环数据这一轮没测，这里只是把它的
+单测恢复成能守住契约的状态。
+
+**修完之后在 910B 上实测**（`e6c3844`，设了 `PYTHONPATH`，全量 384s）：
+
+```
+16 failed, 1872 passed, 28 skipped, 25 errors
+```
+
+两条 `test_rpc_pano_two_phase` 都不在里面了。**但这个数不是 14 - 2 = 12**，因为上面那张表少算了
+两件事（都不是这次引入的，`git log` 看这两个文件 8 月之后没动过）：
+
+| 漏掉的 | 数量 | 根因 |
+|---|---|---|
+| `test_stateful_amb3r_backend_contract.py` | 1 failed | 单独跑也挂，上一稿的四类里就没列过它 |
+| `test_heatmap_raw_logit_loss.py` | 4 failed | **单独跑 7 passed**，是被 `test_heatmap_nextdit_control.py` 污染的——同一个 `npu::npu_rms_norm` 根因泄到了后面的文件（按字母序紧挨着）。只跑这两个文件就能复现 |
+
+所以 `npu_rms_norm` 那一类的实际代价是 4 + 4，不是 4；而**这台机器在 `PYTHONPATH` 设对时的
+基线现在是 16 failed / 25 errors**，一条都不是测试本身的问题。
 
 以后跑全量**一定要设 `PYTHONPATH`**，否则会把真失败藏成 skip。
 

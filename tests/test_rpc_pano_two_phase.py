@@ -84,6 +84,18 @@ def _runtime():
     runtime.num_sample_trajs = 32
     runtime.action_scale = 4.0
     runtime.ppa_stage0_action_arm = "disabled"
+    # The deployed shape for the arm this test covers.  Two-phase recenter is by
+    # construction the *non*-PPA arm: the client refuses to launch the two
+    # together, in two separate guards --
+    #   "formal online PPA uses native front-only InternNav and forbids
+    #    pano_recenter_before_system1"
+    #   "online AMB3R PPA requires --no-pano_recenter_before_system1"
+    # -- so ppa_online_amb3r=False is what --pano_recenter_before_system1 really
+    # runs with, not a value picked to dodge the PPA branch.  The server
+    # advertises the two-phase capability unconditionally, and the PPA path has
+    # its own coverage in tests/test_latency_timing.py (MODEL_CASES).
+    runtime.ppa_online_amb3r = False
+    runtime.system2_cognition_arm = False
     return runtime, qwen
 
 
@@ -185,102 +197,24 @@ def test_internnav_lookdown_helpers_preserve_native_coordinate_order():
     assert second_messages[-1]["content"][1]["image"] is lookdown
 
 
-class _InternNavTokenizer:
-    eos_token_id = 99
-
-    def __init__(self):
-        self.decode_calls = 0
-
-    def decode(self, _ids, skip_special_tokens=True):
-        assert skip_special_tokens
-        self.decode_calls += 1
-        return "↓" if self.decode_calls == 1 else "216 308"
-
-
-class _InternNavProcessor:
-    def __init__(self):
-        self.tokenizer = _InternNavTokenizer()
-        self.template_calls = []
-
-    def apply_chat_template(self, messages, **kwargs):
-        self.template_calls.append((messages, kwargs))
-        assert kwargs["add_generation_prompt"] is True
-        length = 3 + len(self.template_calls)
-        return {
-            "input_ids": torch.arange(length).unsqueeze(0),
-            "attention_mask": torch.ones(1, length, dtype=torch.long),
-            "pixel_values": torch.zeros(1, 3, 2, 2),
-            "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
-        }
-
-
-def test_internnav_rpc_runs_second_lookdown_generation(monkeypatch):
-    monkeypatch.setattr(server, "_blobs_by_name", lambda _blobs: defaultdict(object))
-    monkeypatch.setattr(
-        server,
-        "_pil_from_blob",
-        lambda *_args, **_kwargs: Image.new("RGB", (384, 384)),
-    )
-
-    runtime = object.__new__(server.HeatmapVLNRuntime)
-    runtime.require_deterministic_sampling = False
-    runtime.device = torch.device("cpu")
-    runtime.processor = _InternNavProcessor()
-    runtime.train_cfg = {
-        "data": {
-            "image_size": [384, 384],
-            "trajectory": {
-                "traj_image_size": [224, 224],
-                "system2_sft_protocol": "internnav",
-                "structured_pano_output": False,
-            },
-        }
-    }
-    qwen = _Qwen()
-    runtime.model = SimpleNamespace(qwen2_5_vl=qwen)
-    runtime.pano_latent_adapter = None
-    runtime.has_nextdit = False
-    runtime.num_sample_trajs = 32
-    runtime.action_scale = 4.0
-    runtime.ppa_stage0_action_arm = "disabled"
-
-    response = runtime.plan_panoramic(
-        {
-            "phase": "system2",
-            "instruction": "go",
-            "num_history": 0,
-            "vlm_image_size": [384, 384],
-            "traj_image_size": [224, 224],
-        },
-        [],
-    )
-
-    assert qwen.generate_calls == 2
-    assert response["kind"] == "pano_goal"
-    assert response["pixel_goal"] == [308, 216]
-    assert response["pano_goal_view"] == "front"
-    assert response["native_first_output"] == "↓"
-    assert response["native_lookdown_turns"] == 1
-    assert response["native_front_only"] is True
-
-    first_messages = runtime.processor.template_calls[0][0]
-    second_messages = runtime.processor.template_calls[1][0]
-    first_images = [
-        item
-        for message in first_messages
-        for item in message["content"]
-        if item.get("type") == "image"
-    ]
-    second_images = [
-        item
-        for message in second_messages
-        for item in message["content"]
-        if item.get("type") == "image"
-    ]
-    assert len(first_images) == 1
-    assert len(second_images) == 2
-    assert [message["role"] for message in second_messages] == [
-        "user",
-        "assistant",
-        "user",
-    ]
+# test_internnav_rpc_runs_second_lookdown_generation lived here.  Retired: every
+# contract it held is now covered against the shape the native protocol is
+# actually deployed in, which this test was not.
+#
+#   - that a "down" first turn triggers a second generation carrying the
+#     lookdown frame:  tests/test_latency_timing.py MODEL_CASES["ready_two_turns"]
+#     drives it through the servicer with ppa_online_amb3r=True, real pose
+#     fields and phase="joint", asserts the system2_turn2_prep/_generate stages,
+#     and pins the whole response by sha256.
+#   - the two-turn message shape (one image, then assistant + a second user turn
+#     with two):  tests/test_native_internnav_exact.py
+#     ::test_lookdown_turn_appends_assistant_and_user, in more detail than here,
+#     plus ::test_lookdown_request_requires_leading_arrow_and_no_digits.
+#   - the "v u" -> [u, v] order:  test_internnav_lookdown_helpers_preserve_
+#     native_coordinate_order, just above.
+#
+# It had also drifted out of reach of the code it claimed to test: it fed a
+# 384x384 lookdown, where ed46c76 made the native path fail closed on anything
+# but NATIVE_LOOKDOWN_SIZE (640x480), and it drove phase="system2", which the
+# native protocol never sees -- native InternNav is the PPA arm, and PPA forbids
+# --pano_recenter_before_system1, so the client only ever sends phase="joint".
