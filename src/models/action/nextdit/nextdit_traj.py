@@ -34,8 +34,16 @@ from diffusers.models.normalization import (
 from diffusers.utils import is_torch_version, logging
 
 from ..heatmap_control import HeatmapControlAdapter
+from .diffusers_npu_compat import install_diffusers_rmsnorm_device_gate
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# diffusers picks npu_rms_norm by library availability, not by tensor device, which
+# makes every CPU forward of this stack raise on an Ascend host -- and the raise escapes
+# the layer checkpointing below with its saved-tensor hook still installed.  Done at
+# import because the classes are unusable on CPU until it is, so no entry point of ours
+# can be left to remember it.  No-op off Ascend; see diffusers_npu_compat.
+install_diffusers_rmsnorm_device_gate(logger)
 
 
 class LuminaNextDiTBlock(nn.Module):
