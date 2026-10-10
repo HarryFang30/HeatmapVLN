@@ -64,7 +64,10 @@ from src.models.heatmap.native_internnav_exact import (
 )
 from src.data.dagger_system2_sft import parse_cognition_prefix
 from src.models.qwen2_5_vl.integration import MEMORY_TOKEN_INDEX
+from src.models.qwen2_5_vl_vision_count import record_scope as _vision_record_scope
+from src.models.qwen2_5_vl_vision_count import refuse_reuse_on_adapted_tower
 from src.models.qwen2_5_vl_vision_count import request_scope as _vision_request_scope
+from src.models.qwen2_5_vl_vision_count import serve_scope as _vision_serve_scope
 from src.models.qwen2_5_vl_vision_count import stats as _vision_stats
 from src.models.runtime_compat import install_flash_attn_stub, install_numpy_legacy_aliases
 from src.models.action.treatment_spec import (
@@ -1059,6 +1062,16 @@ class HeatmapVLNRuntime:
             )
         self.model.requires_grad_(False)
         self.model.eval()
+        # The tower only exists now, so the reuse's one remaining precondition is
+        # checked here rather than at install: an adapter anywhere in the tower would
+        # make the pixels an incomplete cache key.  Nothing targets the tower today;
+        # this refuses rather than extends the key if that ever changes.
+        tower = getattr(getattr(self.model, "qwen2_5_vl", None), "model", None)
+        tower = getattr(getattr(tower, "model", tower), "visual", None) or getattr(tower, "visual", None)
+        if tower is not None:
+            refuse_reuse_on_adapted_tower(tower, LOGGER)
+        else:
+            LOGGER.info("Qwen2.5-VL vision tower not found for the reuse precondition check")
         LOGGER.info(
             "Formal PPA online AMB3R runtime enabled: checkpoint=%s tensors=%s",
             self.args.checkpoint,
@@ -1823,7 +1836,7 @@ class HeatmapVLNRuntime:
             output_ids = torch.cat([inputs["input_ids"], oracle_suffix], dim=1)
             llm_output = oracle_system2_text
         else:
-            with torch.no_grad(), timer.stage("system2_turn1_generate"):
+            with _vision_record_scope(), torch.no_grad(), timer.stage("system2_turn1_generate"):
                 output_ids = self.model.qwen2_5_vl.model.generate(
                     **inputs,
                     max_new_tokens=128,
@@ -1859,7 +1872,7 @@ class HeatmapVLNRuntime:
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
                     _normalize_multimodal_inputs(inputs)
                 prompt_len = inputs["input_ids"].shape[1]
-                with torch.no_grad(), timer.stage("system2_turn2_generate"):
+                with _vision_record_scope(), torch.no_grad(), timer.stage("system2_turn2_generate"):
                     output_ids = self.model.qwen2_5_vl.model.generate(
                         **inputs,
                         max_new_tokens=128,
@@ -2045,7 +2058,14 @@ class HeatmapVLNRuntime:
                     ],
                     metadata=ppa_pose_metadata,
                 )
-            with torch.no_grad():
+            # generate_latents re-encodes the pixel_values the last System 2 prefill
+            # already ran through the vision tower -- the same tensor object.  Its own
+            # ViT-block captures are dead: _vit_captures is read only inside
+            # native_single_view_feature_extractor.py (:170, :174, :202), always from
+            # extract_from_pixels, which clear()s first and raises if its own pass did
+            # not refill them, so no reader can pick up a capture this pass skipped.
+            # Nothing is served outside this scope (qwen2_5_vl_vision_count.py).
+            with _vision_serve_scope(), torch.no_grad():
                 with timer.stage("system1_condition_latents"):
                     traj_hs = self.model.qwen2_5_vl.generate_latents(
                         output_ids=condition_output_ids,
@@ -2280,7 +2300,7 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
         try:
             # handler_total ends before the response JSON is serialised.  The vision
             # scope wraps the same work: its cache and its pass counters belong to this
-            # request and are dropped before the reply (qwen2_5_vl_vision_reuse.py).
+            # request and are dropped before the reply (qwen2_5_vl_vision_count.py).
             with _vision_request_scope(), timer.stage("handler_total"):
                 if timer.enabled:
                     reset_accel_peak(self.runtime.device)

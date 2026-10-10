@@ -68,14 +68,18 @@ DECISION_FIELDS = (
     "history_capture_steps",
     "response",
 )
-# Keys a response carries only because timing is on: the stage times themselves, and
-# the accelerator memory reading taken beside them.  They are not decisions, and
-# comparing them would make every timing-on-vs-off run DIFFERENT for no reason.
-TIMING_MODE_KEYS = (
+# Keys a response carries as diagnostics rather than as an answer: the stage times, the
+# accelerator memory reading taken beside them, and how the server reached the answer
+# (how many vision-tower passes it ran, and which were served from an earlier one).
+# None is a decision.  Comparing them would make every timing-on-vs-off run DIFFERENT,
+# and would make an A/B of a reuse that is *meant* to change the pass count report a
+# difference for the one thing it is allowed to change.
+DIAGNOSTIC_KEYS = (
     "timing_ms",
     "server_timing_ms",
     "client_timing_ms",
     "cuda_memory_mib",
+    "vision_tower",
 )
 # Env this DRIVER ran with.  Deliberately named for what it is: the server is a
 # separate process, usually started from a different shell, so these say nothing about
@@ -126,7 +130,7 @@ def _call_record(call: Any) -> dict[str, Any]:
     for name in DECISION_FIELDS:
         value = getattr(call, name)
         if name == "response" and isinstance(value, dict):
-            value = {k: v for k, v in value.items() if k not in TIMING_MODE_KEYS}
+            value = {k: v for k, v in value.items() if k not in DIAGNOSTIC_KEYS}
         record[name] = value
     return record
 
@@ -276,7 +280,7 @@ def _decision(call: dict[str, Any], name: str) -> Any:
     """
     value = call.get(name)
     if name == "response" and isinstance(value, dict):
-        return {k: v for k, v in value.items() if k not in TIMING_MODE_KEYS}
+        return {k: v for k, v in value.items() if k not in DIAGNOSTIC_KEYS}
     return value
 
 

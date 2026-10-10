@@ -1073,7 +1073,11 @@ def test_model_server_timing_off_changes_nothing_and_on_only_adds_timing(model_s
     # summarize_latency.py and the assertions below read timing_ms as stage -> ms.
     # This runtime is a stub with no vision tower, so the count is zero here; what
     # the key pins is that timing on adds exactly these two and nothing else.
-    assert on_payload.pop("vision_tower") == {"vision_tower_calls": 0, "vision_tower_shapes": []}
+    assert on_payload.pop("vision_tower") == {
+        "vision_tower_calls": 0,
+        "vision_tower_shapes": [],
+        "vision_tower_reuse": [],
+    }
     assert "cuda_memory_mib" not in on_payload  # CPU runtime
     assert on_payload == json.loads(off.json_payload)
     assert sorted(timing) == sorted(stages)

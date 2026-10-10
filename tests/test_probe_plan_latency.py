@@ -105,7 +105,7 @@ def test_timing_is_never_part_of_the_comparison():
     """Compare timing and every A/B is DIFFERENT, which would make the tool useless."""
     assert "model_rpc_ms" not in probe.DECISION_FIELDS
     assert "step_wall_ms" not in probe.DECISION_FIELDS
-    for key in probe.TIMING_MODE_KEYS:
+    for key in probe.DIAGNOSTIC_KEYS:
         assert key not in probe.DECISION_FIELDS
 
 
@@ -167,6 +167,10 @@ def test_a_difference_in_timing_alone_is_not_a_difference(tmp_path):
         **slow["response"],
         "timing_ms": {"total": 9000.0},
         "cuda_memory_mib": {"peak_reserved": 33652.0},
+        # How the answer was reached, not what it was.  A reuse that removes a vision
+        # pass is *supposed* to change this; counting it would make the A/B that
+        # licenses the reuse report a difference for the only thing it may change.
+        "vision_tower": {"vision_tower_calls": 3, "vision_tower_reuse": ["record", "record", "hit"]},
     }
     b = _write(tmp_path, "b.json", _run_json(calls=[slow]))
     out = _run("compare", a, b)
