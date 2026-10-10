@@ -16,10 +16,17 @@ device time out of a 5.4-5.9 s call, and leaving the device idle for about half 
 
 Reading the whole vector once with ``.tolist()`` cannot change the mask: the same
 integers become the same slice bounds.  Measured on the 910B at the deployed shapes
-(12 views, 9408 patches, 147 windows), over 32 layers:
+(12 views, 9408 patches), over 32 layers:
 
     device-tensor bounds   1026.5 ms
     host ints (.tolist())   188.9 ms      and torch.equal(old, new) is True
+
+What is left after that is dispatch, not work: the loop issues one slice assignment
+per window, each writing a handful of bytes for about 40 us of host time, and the
+window count at the deployed grid is in the hundreds.  ``_window_mask`` writes the
+same tensor by comparing window ids, in four kernels regardless of the window count,
+and falls back to the loop when the windows do not cover the sequence (see its
+docstring).
 
 This is why it is worth doing on a platform where a synchronisation costs about
 120 us; on CUDA the same 16272 reads cost roughly a tenth of that, which is most of
@@ -40,6 +47,41 @@ from typing import Any, Optional, Tuple
 
 ENV_FLAG = "HEATMAPVLN_QWEN_VISION_MASK_PATCH"
 SUPPORTED_TRANSFORMERS = "4.51.0"
+
+
+def _window_mask(bounds: list, seq_length: int, device: Any) -> Any:
+    """The same mask upstream builds, in four kernels instead of one per window.
+
+    Upstream writes it window by window: a ``zeros`` plus one slice assignment per
+    window, so one launch per window plus the ``zeros``, repeated in all 32 vision
+    layers.  The slice assignments are tiny -- the cost is the dispatch, about 40 us
+    each, which measured 188.9 ms per tower pass.
+
+    Every position inside ``[bounds[i-1], bounds[i])`` carries window id ``i``, and
+    upstream's mask is True exactly where two positions share a window, so comparing
+    ids gives the identical boolean tensor.  That identity needs the windows to cover
+    the sequence: a position outside every window must be False against *everything*,
+    including itself, which an id comparison cannot express.  So when the bounds do not
+    cover ``[0, seq_length)`` this falls back to upstream's loop rather than guessing.
+    """
+    import torch
+
+    if len(bounds) >= 2 and bounds[0] == 0 and bounds[-1] == seq_length:
+        # Checked on the host: ``bounds`` is already a list, and asking the device
+        # whether the counts are non-negative would be one more scalar read per layer,
+        # which is the cost this whole patch exists to remove.
+        sizes = [bounds[i] - bounds[i - 1] for i in range(1, len(bounds))]
+        if all(size >= 0 for size in sizes):
+            counts = torch.tensor(sizes, device=device, dtype=torch.long)
+            ids = torch.repeat_interleave(
+                torch.arange(len(sizes), device=device, dtype=torch.long), counts
+            )
+            return (ids[:, None] == ids[None, :]).unsqueeze(0)
+
+    attention_mask = torch.zeros([1, seq_length, seq_length], device=device, dtype=torch.bool)
+    for i in range(1, len(bounds)):
+        attention_mask[..., bounds[i - 1] : bounds[i], bounds[i - 1] : bounds[i]] = True
+    return attention_mask
 
 
 def _patched_forward(original: Any):
@@ -71,11 +113,10 @@ def _patched_forward(original: Any):
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         # The one change: the bounds come back in a single copy rather than one per
-        # slice.  Same integers, so the same mask -- see this module's docstring.
-        bounds = cu_seqlens.tolist()
-        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        for i in range(1, len(bounds)):
-            attention_mask[..., bounds[i - 1] : bounds[i], bounds[i - 1] : bounds[i]] = True
+        # slice, and the mask is built by comparing window ids rather than written
+        # window by window.  Same integers and the same boolean pattern, so the same
+        # mask -- see this module's docstring and _window_mask.
+        attention_mask = _window_mask(cu_seqlens.tolist(), seq_length, q.device)
 
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
