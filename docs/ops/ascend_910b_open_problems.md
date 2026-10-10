@@ -523,7 +523,7 @@ ingest——在一台已经不能算数的机器上全部通过**。所以修法
 | 类 | 数量 | 根因 |
 |---|---|---|
 | `test_trajectory_dagger.py` / `_dataset.py` | 25 errors | 测试里**写死了 C500 的工作区路径** `/mnt/afs/liwenhao/agent/370910109`，这台机器上不存在 → `PermissionError: /mnt/afs` |
-| `test_heatmap_nextdit_control.py` | 4 failed | `NotImplementedError: Could not run 'npu::npu_rms_norm' with arguments from the 'CPU' backend`——装了 torch_npu 之后这条 CPU 路径就跑不了 |
+| ~~`test_heatmap_nextdit_control.py`~~ | ~~4 failed~~ | `npu::npu_rms_norm` 没有 CPU 实现。**✅ 2026-10-09 修掉了，见下面「npu_rms_norm 这一类」** |
 | `test_exp19_figures_v2.py` | 7 failed | 中文文本宽度/布局断言（字体与 C500 不同） |
 | `test_stage3_dataloader_order.py` | 1 error | 已知的 `_dataloader_in_order_kwargs` collection error，CLAUDE.md §4 写了不要顺手改 |
 
@@ -589,12 +589,75 @@ online AMB3R PPA requires --no-pano_recenter_before_system1
 | 漏掉的 | 数量 | 根因 |
 |---|---|---|
 | `test_stateful_amb3r_backend_contract.py` | 1 failed | 单独跑也挂，上一稿的四类里就没列过它 |
-| `test_heatmap_raw_logit_loss.py` | 4 failed | **单独跑 7 passed**，是被 `test_heatmap_nextdit_control.py` 污染的——同一个 `npu::npu_rms_norm` 根因泄到了后面的文件（按字母序紧挨着）。只跑这两个文件就能复现 |
+| ~~`test_heatmap_raw_logit_loss.py`~~ | ~~4 failed~~ | **单独跑 7 passed**，被 `test_heatmap_nextdit_control.py` 污染。**✅ 同一个修复一起解决了，见下一节** |
 
-所以 `npu_rms_norm` 那一类的实际代价是 4 + 4，不是 4；而**这台机器在 `PYTHONPATH` 设对时的
-基线现在是 16 failed / 25 errors**，一条都不是测试本身的问题。
+所以 `npu_rms_norm` 那一类的实际代价是 4 + 4，不是 4。
 
 以后跑全量**一定要设 `PYTHONPATH`**，否则会把真失败藏成 skip。
+
+### ✅ npu_rms_norm 这一类（2026-10-09）：diffusers 按"装没装"而不是"在哪张卡上"选 kernel
+
+`diffusers.models.normalization.RMSNorm.forward` 只看 `is_torch_npu_available()`，
+**从不看张量在哪**。装了 torch_npu 的机器上 CPU 张量也被送进 `npu_rms_norm`，而这个 op 没有
+CPU kernel。NextDiT 这一摞的 norm 全走 `LuminaRMSNormZero` / `LuminaLayerNormContinuous`，
+两者都委托给 `RMSNorm` 实例，所以**每一次 CPU forward 都挂**——那就是
+`test_heatmap_nextdit_control.py` 的 4 条。
+
+**而且它不止挂在本地。** `nextdit_traj` 训练时对每层做 non-reentrant 的
+`torch.utils.checkpoint`。这个报错是在 checkpoint 的 backward 里抛的，而 hook 是在一个再也不会
+被恢复的 generator 里进入的，于是 `saved_tensors_hooks.__exit__` 没跑，hook 泄在 TLS 里。
+**进程里下一个 `backward()`**——任何文件、任何测试——建图时就带上了这个 hook，去重算那个早就
+失败的 NextDiT frame，然后用同一条报错挂掉。`test_heatmap_raw_logit_loss.py` 里没有 NextDiT、
+没有 diffusers、没有 checkpoint，照样被打挂。
+
+最小复现（两条就够）：
+
+```
+pytest tests/test_heatmap_nextdit_control.py::test_gradient_checkpointing_receives_heatmap_inputs_and_backpropagates \
+       tests/test_heatmap_raw_logit_loss.py
+```
+
+把前面换成一条**不走 checkpoint** 的 nextdit 失败测试，`raw_logit_loss` 7 条全过——所以泄的是
+checkpoint，不是 `test_heatmap_nextdit_control.py` 自己干了什么（那个文件里一个 monkeypatch
+都没有）。**别照"某个测试留了脏东西"的方向查，查的是 checkpoint。**
+
+修法是把这个分支重新按**张量设备**判断：`src/models/action/nextdit/diffusers_npu_compat.py`，
+在 `nextdit_traj` import 时装上（全仓库唯一构造这些 norm 的地方）。
+
+- **NPU 张量走的还是 diffusers 原来那条路**，一个字节都没变（`device.type` 实测就是 `npu`，
+  kernel 在 NPU 张量上正常）。只有根本用不了这个 kernel 的张量走算术回退——对它们来说现在不是
+  "慢一点"，是"直接没有结果"。
+- **没装 torch_npu 就不装**：Mac / C500 上 `is_torch_npu_available()` 本来就是 False，diffusers
+  自己就走算术分支，所以不碰 C500 那条 1004 的基线。
+- 回退是 diffusers 那个 `else` 分支的逐行镜像，`tests/test_diffusers_rmsnorm_device_gate.py` 用三种
+  affine/bias 组合钉住它**逐位相等**，防止镜像漂成另一种归一化。
+
+**这一个根因修掉了 8 条**（4 条真失败 + 4 条被污染的），那两个文件一起跑现在是 15 passed。
+
+**边界**：没有加"清理泄漏 hook"的兜底——那要用 `torch._C._autograd` 的私有 API，而触发条件已经
+没了。但**将来任何在 checkpoint 里抛的 backward 都会再泄一次**，所以看到"某个不相干的测试报了
+别人的错"，先想这一条。
+
+### 910B 基线（2026-10-09，两个修复都算上）
+
+私有副本全量（从 `e6c3844` 导出到 `/home/ma-user/work/zhr/hv-leak`，**不碰共享部署 checkout**，
+那上面别的会话会留未提交改动）：
+
+```
+10 failed, 1886 passed, 28 skipped, 25 errors in 400s（6 分 40 秒）
+```
+
+这 10 条里有 2 条是 `test_rpc_pano_two_phase`——这个副本从 `e6c3844` 导的，没带上一节那个修复
+（它在分支上，还没进 `e6c3844`）。**两个修复都算上，这台机器的基线是 8 failed / 25 errors**：
+
+| 剩下的 | 数量 | 根因 |
+|---|---|---|
+| `test_exp19_figures_v2.py` | 7 failed | 中文字宽/布局断言（字体与 C500 不同）|
+| `test_stateful_amb3r_backend_contract.py` | 1 failed | 单独跑也挂 |
+| `test_trajectory_dagger*.py` + `test_stage3_dataloader_order.py` | 25 errors | 写死 C500 路径 + 已知的 `_dataloader_in_order_kwargs` |
+
+从 16 降到 8。剩下的两类都是独立的活：字宽断言要么换度量方式、要么标平台；25 errors 是把写死的
+C500 路径参数化。
 
 ---
 
