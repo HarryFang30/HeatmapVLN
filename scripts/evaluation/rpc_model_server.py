@@ -360,14 +360,6 @@ def _parse_pixel_goal(
     return None
 
 
-def _internnav_requests_lookdown(llm_output: str) -> bool:
-    """Match the released InternNav first-turn LOOKDOWN action."""
-    if re.search(r"\d", llm_output or ""):
-        return False
-    action_tokens = re.findall(r"STOP|[↑←→↓]", llm_output or "")
-    return bool(action_tokens) and action_tokens[0] == "↓"
-
-
 def _parse_internnav_pixel_goal(llm_output: str) -> list[int] | None:
     """Convert native System2 ``row col`` text into image ``[u, v]``."""
     if not re.search(r"\d", llm_output or ""):

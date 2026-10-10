@@ -161,10 +161,6 @@ def test_internnav_lookdown_helpers_preserve_native_coordinate_order():
     lookdown = Image.new("RGB", (384, 384))
     first_messages = [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
 
-    assert server._internnav_requests_lookdown("↓")
-    assert server._internnav_requests_lookdown("TILT DOWN ↓")
-    assert not server._internnav_requests_lookdown("216 308")
-    assert not server._internnav_requests_lookdown("←")
     assert server._parse_internnav_pixel_goal("216 308") == [308, 216]
 
     second_messages = server._append_internnav_lookdown_turn(
