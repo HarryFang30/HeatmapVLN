@@ -13,8 +13,9 @@ episodes outright in both PPA evaluations.
 
 This module ports the replica's prompt construction and action parsing
 verbatim so the v3 server can drive System2 byte-identically to the certified
-baseline.  It must never be used by training code: the training prompt
-contract stays in ``construct_input_stage2``.
+baseline.  Other training code keeps the ``construct_input_stage2`` contract,
+but EXP-23's System2 LoRA SFT (``src/data/s2_sft_dataset.py``) deliberately
+trains on this module, so that its inputs are the served inputs byte for byte.
 """
 
 from __future__ import annotations

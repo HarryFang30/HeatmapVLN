@@ -52,6 +52,10 @@ TIMING="${PPA_EVAL_TIMING:-0}"
 BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
 NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
 NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
+# EXP-23: a System2 LoRA directory (rpc_model_server.py --system2_lora_adapter): both
+# native turns decide with it, Z0 is computed with it off.  Empty serves the released
+# System2.  The sha256 of its weights goes into servers.json and the servers report it.
+SYSTEM2_LORA="${PPA_EVAL_SYSTEM2_LORA:-}"
 # Re-seed the VO device RNG at every episode.  Required for run-to-run reproducible
 # poses on Ascend, where the default device generator seed is not a constant.
 VO_RNG_SEED="${PPA_NPU_VO_RNG_SEED:-0}"
@@ -77,6 +81,15 @@ die() { printf '[ppa-npu] ERROR: %s\n' "$*" >&2; exit 2; }
 require_file() { [[ -s "$1" ]] || die "missing file: $1"; }
 require_dir() { [[ -d "$1" ]] || die "missing directory: $1"; }
 tcp_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# The same digest the model server reports for a System2 LoRA (hashlib over the file).
+file_sha256() {
+  "$PYTHON" -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1"
+}
 
 stop_pid() {
   local pid="${1:-}"
@@ -156,6 +169,13 @@ done
 [[ -z "$NUM_SAMPLE_TRAJS" || "$NUM_SAMPLE_TRAJS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_SAMPLE_TRAJS must be a positive integer"
 [[ -z "$NUM_INFERENCE_STEPS" || "$NUM_INFERENCE_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_INFERENCE_STEPS must be a positive integer"
 [[ "$VO_RNG_SEED" =~ ^[0-9]+$ ]] || die "PPA_NPU_VO_RNG_SEED must be a non-negative integer"
+SYSTEM2_LORA_SHA256=""
+if [[ -n "$SYSTEM2_LORA" ]]; then
+  require_file "$SYSTEM2_LORA/adapter_config.json"
+  require_file "$SYSTEM2_LORA/adapter_model.safetensors"
+  SYSTEM2_LORA="$(cd "$SYSTEM2_LORA" && pwd)"
+  SYSTEM2_LORA_SHA256="$(file_sha256 "$SYSTEM2_LORA/adapter_model.safetensors")" || die "could not hash $SYSTEM2_LORA"
+fi
 
 # What will actually sit on each card, checked before anything launches.  The
 # free-card read below cannot see this: it runs before this run's own servers exist,
@@ -198,6 +218,7 @@ declare -a MODEL_EXTRA=()
 [[ "$BRIDGE_OFF" -eq 1 ]] && MODEL_EXTRA=(--ppa_bridge_off)
 [[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
 [[ -n "$NUM_INFERENCE_STEPS" ]] && MODEL_EXTRA+=(--nextdit_num_inference_steps "$NUM_INFERENCE_STEPS")
+[[ -n "$SYSTEM2_LORA" ]] && MODEL_EXTRA+=(--system2_lora_adapter "$SYSTEM2_LORA")
 
 # Placeholders the train config expands on load; the eval never reads them.
 PLACEHOLDER_DIR="$RUNTIME_DIR/config_placeholders"
@@ -284,6 +305,7 @@ npu_used_mib() {
 
 echo "[ppa-npu] slots=$NUM_SLOTS npus=$NPU_CSV vo_npus=$VO_NPU_CSV timing=$TIMING bridge_off=$BRIDGE_OFF"
 echo "[ppa-npu] num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} vo_rng_seed=$VO_RNG_SEED"
+echo "[ppa-npu] system2_lora=${SYSTEM2_LORA:-none} sha256=${SYSTEM2_LORA_SHA256:-none}"
 echo "[ppa-npu] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
 echo "[ppa-npu] runtime=$RUNTIME_DIR instance=$SERVER_INSTANCE"
 
@@ -509,6 +531,12 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
         || die "model slot $slot lacks the $key override evidence"
     fi
   done
+  # The server's own account of the adapter it wrapped, by the bytes it hashed.
+  if [[ -n "$SYSTEM2_LORA_SHA256" ]]; then
+    grep -F "System2 LoRA adapter enabled: " "$RUNTIME_DIR/logs/model_${slot}.log" \
+      | grep -F "\"adapter_sha256\": \"$SYSTEM2_LORA_SHA256\"" >/dev/null \
+      || die "model slot $slot lacks System2 LoRA evidence for sha256 $SYSTEM2_LORA_SHA256"
+  fi
   # Every slot must be serving the same build, or the shards are not one arm.
   if [[ "${MODEL_VERSIONS[$slot]}" != "${MODEL_VERSIONS[0]}" ]]; then
     die "slot $slot reports model_version '${MODEL_VERSIONS[$slot]}' but slot 0 reports '${MODEL_VERSIONS[0]}'"
@@ -524,12 +552,14 @@ done
 "$PYTHON" - "$RUNTIME_DIR/servers.json" "$NUM_SLOTS" "$MODEL_PORT_BASE" "$VO_PORT_BASE" \
   "$NPU_CSV" "$VO_NPU_CSV" "$REPO_COMMIT" \
   "$VO_RNG_SEED" "$TIMING" "$BRIDGE_OFF" "$SERVER_INSTANCE" "${MODEL_VERSIONS[0]}" \
-  "$REPO_DIRTY" "$NUM_SAMPLE_TRAJS" "$NUM_INFERENCE_STEPS" <<'PY'
+  "$REPO_DIRTY" "$NUM_SAMPLE_TRAJS" "$NUM_INFERENCE_STEPS" "$SYSTEM2_LORA_SHA256" <<'PY'
 import json
 import sys
 
 (path, slots, model_base, vo_base, npus, vo_npus, commit, rng_seed, timing, bridge_off,
  instance, model_version, dirty, num_sample_trajs, num_inference_steps) = sys.argv[1:16]
+# EXP-23, appended last so a record without it reads as "the released System2".
+system2_lora_sha256 = sys.argv[16] if len(sys.argv) > 16 else ""
 record = {
     "schema": "heatmapvln-npu-servers-v2",
     "slots": int(slots),
@@ -548,6 +578,8 @@ record = {
     "model_version": model_version,
     "num_sample_trajs": num_sample_trajs,
     "num_inference_steps": num_inference_steps,
+    # sha256 of the System2 LoRA's adapter_model.safetensors; empty for the released System2.
+    "system2_lora_sha256": system2_lora_sha256,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(record, handle, indent=2, sort_keys=True)

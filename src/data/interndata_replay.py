@@ -179,22 +179,21 @@ def sample_jpegs(
     vlm_image_size: tuple[int, int] = (384, 384),
     jpeg_quality: int = 90,
     encode: Callable[[np.ndarray, int], bytes] | None = None,
-) -> tuple[list[bytes], bytes, bytes | None]:
-    """(history fronts, current front, lookdown or None) as the client would send them."""
+) -> tuple[list[bytes], bytes, bytes]:
+    """(history fronts, current front, lookdown) as the client would send them."""
     scene_dir = Path(scene_dir)
     encode = encode or _default_encode
     front = [
         _client_jpeg(_frame_path(scene_dir, FRONT_SETTING, sample.episode_index, f), vlm_image_size, jpeg_quality, encode)
         for f in (*sample.history_frame_ids, sample.frame_id)
     ]
-    lookdown = None
-    if sample.turn1 == IDX2ACTION[5]:
-        lookdown = _client_jpeg(
-            _frame_path(scene_dir, LOOKDOWN_SETTING, sample.episode_index, sample.frame_id),
-            None,
-            jpeg_quality,
-            encode,
-        )
+    # The client captures the lookdown on every call, whatever the answer turns out to be.
+    lookdown = _client_jpeg(
+        _frame_path(scene_dir, LOOKDOWN_SETTING, sample.episode_index, sample.frame_id),
+        None,
+        jpeg_quality,
+        encode,
+    )
     return front[:-1], front[-1], lookdown
 
 

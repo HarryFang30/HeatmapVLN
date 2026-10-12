@@ -265,6 +265,7 @@ import copy
 import gzip
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
 import math
@@ -1095,6 +1096,26 @@ def _preflight_trajectory_dagger_args(args) -> None:
         raise ValueError("Evaluation output and DAgger collection roots must be disjoint")
 
 
+def _preflight_s2_record_args(args) -> None:
+    """--s2_record_dir records the deployed policy's own calls; refuse runs that are not that policy."""
+    if not getattr(args, "s2_record_dir", None):
+        return
+    if not args.rpc_server:
+        raise ValueError("--s2_record_dir is wired into the RPC path only; it requires --rpc_server")
+    if bool(getattr(args, "oracle_system2", False)):
+        raise ValueError("--s2_record_dir records the model's own System2 answers; --oracle_system2 replaces them")
+    if float(args.auto_stop_distance) > 0.0:
+        raise ValueError("--s2_record_dir requires --auto_stop_distance 0: a privileged STOP is not the policy's")
+    if bool(args.pano_recenter_before_system1):
+        raise ValueError(
+            "--s2_record_dir records the joint front-only call; the two-phase recenter path "
+            "sends a second, unrecorded call"
+        )
+    if bool(getattr(args, "collect_trajectory_dagger", False)):
+        raise ValueError("--s2_record_dir and --collect_trajectory_dagger are separate collections; run one")
+    args.s2_record_dir = str(Path(args.s2_record_dir).expanduser().resolve())
+
+
 def _extract_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
     """Read a checkpoint and return the tensor state dict it contains."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -1607,12 +1628,17 @@ def capture_panoramic_views(
     return views
 
 
-def capture_lookdown_view(env, image_size: tuple = (224, 224)) -> Image.Image:
+def capture_lookdown_view(
+    env,
+    image_size: tuple = (224, 224),
+    depth_out: list | None = None,
+) -> Image.Image:
     """Look down 30° (2 × LOOKDOWN), capture RGB, then restore orientation.
 
     Unlike panoramic capture, this uses env.step() because the model was
     trained with exactly this procedure and the tilt sensor state must be
-    consistent.
+    consistent.  ``depth_out`` (EXP-23 records) receives a copy of the depth of
+    the same observation, still normalised, or None when it has no depth.
     """
     env.step(ActionCode.LOOKDOWN)
     obs = env.step(ActionCode.LOOKDOWN)
@@ -1621,6 +1647,9 @@ def capture_lookdown_view(env, image_size: tuple = (224, 224)) -> Image.Image:
     if rgb is None:
         rgb = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
     lookdown_img = _rgb_array_to_pil(rgb, image_size)
+    if depth_out is not None:
+        depth = obs.get("depth")
+        depth_out.append(None if depth is None else np.array(depth, dtype=np.float32, copy=True))
 
     env.step(ActionCode.LOOKUP)
     env.step(ActionCode.LOOKUP)
@@ -3437,6 +3466,318 @@ def _rpc_blob_from_pil(name: str, image: Image.Image, quality: int) -> dict:
     }
 
 
+_S2_RECORDS_PATH = _PROJECT_ROOT / "src" / "data" / "s2_records.py"
+
+
+def _load_s2_records_module():
+    """src/data/s2_records.py on its own: src.data's package initializer pulls in training code."""
+    name = "_heatmapvln_s2_records"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, _S2_RECORDS_PATH)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"could not load {_S2_RECORDS_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # dataclasses resolve the module while it executes
+        spec.loader.exec_module(module)
+    return module
+
+
+def _sha256_file(path: str | os.PathLike | None) -> str | None:
+    if not path or not Path(path).is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Server answer fields every calls.jsonl row carries (design §1); other scalar fields
+# of the response go to the row's "server_fields".
+_S2_RECORD_RESPONSE_FIELDS = (
+    "llm_output",
+    "native_first_output",
+    "native_lookdown_turns",
+    "kind",
+    "pixel_goal",
+    "actions",
+    "terminal",
+)
+_S2_RECORD_VO_FIELDS = (
+    "vo_current_frame_id",
+    "vo_history_frame_ids",
+    "pose_ready",
+    "vo_provider_phase",
+    "vo_trajectory_revision",
+)
+
+
+class S2RecordCollector:
+    """--s2_record_dir: every System2 call of an episode as one heatmapvln-s2-record-v1 tar.
+
+    EXP-23 component A (docs/experiments/exp23-s2-dagger-design.md §2).  The
+    collector only reads: the request blobs ``_rpc_plan_panoramic`` already put on
+    the wire, the depth of the env.step observation whose RGB became the lookdown,
+    and the ground-truth agent state and metrics.  It never steps, sets or renders,
+    so a seed gives the same actions with and without it.  Every episode is
+    committed when it ends, failed and step-capped ones included.
+
+    The record keeps one front per step, but a step can go out with two different
+    byte strings.  capture_panoramic_views renders the front with whatever sensor
+    pose the last env.step left, and the lookdown's 2 × LOOK_DOWN + 2 × LOOK_UP leaves
+    it a float off level until the next ``set_state(reset_sensors=True)``.  So the
+    first capture after a call differs from a re-capture at the same pose, and a
+    one-action chunk ([←, STOP, ...]) re-plans at exactly that step: the call sends the
+    clean re-capture as current, every later call the first capture as history.  The
+    episode is therefore buffered and each step keeps the bytes most calls sent (ties:
+    the first sent); a call that sent other bytes for a step lists it in
+    ``front_mismatch_steps`` (with the mean / max absolute pixel difference), and
+    ``front_sha256`` (prompt order, current last) names what every call sent, so a
+    consumer can drop or accept exactly the calls the record cannot reproduce.
+    """
+
+    SCHEMA = "heatmapvln-s2-collector-v1"
+
+    def __init__(self, root: str | os.PathLike, *, hab_cfg, run_meta: dict[str, Any]) -> None:
+        self.records = _load_s2_records_module()
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.depth_scale_m = self._check_camera(hab_cfg, self.records.CAMERA)
+        self.run_meta = dict(run_meta)
+        self._episode: dict[str, Any] | None = None
+
+    @staticmethod
+    def _check_camera(hab_cfg, camera: dict[str, float]) -> float:
+        """The record's CAMERA must be this Habitat config, or no consumer can project with it."""
+        sim = hab_cfg.SIMULATOR
+        rgb, depth = sim.RGB_SENSOR, sim.DEPTH_SENSOR
+        found = {
+            "width": [rgb.WIDTH, depth.WIDTH],
+            "height": [rgb.HEIGHT, depth.HEIGHT],
+            "hfov_deg": [rgb.HFOV, depth.HFOV],
+            "height_m": [rgb.POSITION[1], depth.POSITION[1]],
+            "lookdown_pitch_deg": [2 * sim.TILT_ANGLE],
+            "depth_max_m": [depth.MAX_DEPTH],
+        }
+        problems = {
+            key: values
+            for key, values in found.items()
+            if any(float(value) != float(camera[key]) for value in values)
+        }
+        if float(depth.MIN_DEPTH) != 0.0 or not bool(depth.NORMALIZE_DEPTH):
+            problems["depth_normalisation"] = [depth.MIN_DEPTH, depth.NORMALIZE_DEPTH]
+        if problems:
+            raise ValueError(
+                f"Habitat camera does not match the s2 record CAMERA {camera}: {problems}"
+            )
+        return float(depth.MAX_DEPTH)
+
+    def begin_episode(self, env, episode, *, scene_id: str, episode_id: int, instruction: str) -> None:
+        goals = [
+            {
+                "position": [float(v) for v in goal.position],
+                "radius": None if getattr(goal, "radius", None) is None else float(goal.radius),
+            }
+            for goal in episode.goals
+        ]
+        info = getattr(episode, "info", None)
+        trajectory_id = getattr(episode, "trajectory_id", None)
+        meta = {
+            **self.run_meta,
+            "collector": self.SCHEMA,
+            "trajectory_id": None if trajectory_id is None else int(trajectory_id),
+            # The text the server received (_normalize_instruction), then the dataset's.
+            "instruction": instruction,
+            "instruction_raw": str(episode.instruction.instruction_text),
+            "goals": goals,
+            "reference_path": _episode_reference_path(episode),
+            "start_position": [float(v) for v in episode.start_position],
+            "start_rotation_xyzw": [float(v) for v in episode.start_rotation],
+            "geodesic_distance": (
+                float(info["geodesic_distance"])
+                if isinstance(info, dict) and info.get("geodesic_distance") is not None
+                else None
+            ),
+            "pose_frame": "habitat_agent_body",
+        }
+        self._episode = {
+            "scene_id": str(scene_id),
+            "episode_id": int(episode_id),
+            "meta": meta,
+            "steps": [],
+            # (row, front sha per prompt slot, lookdown bytes, depth PNG)
+            "calls": [],
+            # step -> {sha256: bytes} in the order first sent, and how many calls sent each
+            "fronts": {},
+            "front_uses": {},
+        }
+        self.add_step(env, 0, action=None, phase="start", call_index=None)
+
+    def add_step(self, env, step_id: int, *, action: int | None, phase: str, call_index: int | None) -> None:
+        """The ground-truth pose after primitive step ``step_id`` (0 = the start pose)."""
+        state = env._sim.get_agent(0).get_state()
+        self._episode["steps"].append(
+            {
+                "step_id": int(step_id),
+                "position": [float(v) for v in state.position],
+                "rotation_wxyz": [float(v) for v in quaternion.as_float_array(state.rotation)],
+                "action": None if action is None else int(action),
+                "phase": str(phase),
+                "call_index": None if call_index is None else int(call_index),
+                "distance_to_goal": _metric_distance_to_goal(env),
+            }
+        )
+
+    def add_call(
+        self,
+        env,
+        *,
+        call_index: int,
+        step_id: int,
+        history_step_ids: list[int],
+        sent_blobs: list[dict],
+        lookdown_depth: np.ndarray | None,
+        response: dict[str, Any],
+        pose_fields: dict[str, Any] | None,
+    ) -> None:
+        blobs = {str(blob["name"]): blob for blob in sent_blobs}
+        history_step_ids = [int(step) for step in history_step_ids]
+        names = [f"history/{index}/front" for index in range(len(history_step_ids))] + ["current/front"]
+        sent_history = sum(1 for name in blobs if name.startswith("history/") and name.endswith("/front"))
+        if sent_history != len(history_step_ids) or any(name not in blobs for name in names + ["lookdown"]):
+            raise RuntimeError(
+                f"System2 call {call_index}: the request blobs do not match the prompt history "
+                f"steps {history_step_ids}: {sorted(blobs)}"
+            )
+        if lookdown_depth is None:
+            raise RuntimeError(
+                f"System2 call {call_index}: the lookdown observation has no 'depth'; "
+                "s2 records need the DEPTH_SENSOR of build_habitat_config"
+            )
+        episode = self._episode
+        front_sha: list[str] = []
+        for step, name in zip(history_step_ids + [int(step_id)], names):
+            data = bytes(blobs[name]["data"])
+            digest = hashlib.sha256(data).hexdigest()
+            front_sha.append(digest)
+            episode["fronts"].setdefault(step, {}).setdefault(digest, data)
+            uses = episode["front_uses"].setdefault(step, {})
+            uses[digest] = uses.get(digest, 0) + 1
+        lookdown = bytes(blobs["lookdown"]["data"])
+        depth = np.asarray(lookdown_depth, dtype=np.float64)
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        state = env._sim.get_agent(0).get_state()
+        row: dict[str, Any] = {
+            "call_index": int(call_index),
+            "step_id": int(step_id),
+            "history_step_ids": history_step_ids,
+        }
+        row.update({key: response.get(key) for key in _S2_RECORD_RESPONSE_FIELDS})
+        row.update(
+            {
+                "position": [float(v) for v in state.position],
+                "rotation_wxyz": [float(v) for v in quaternion.as_float_array(state.rotation)],
+                "distance_to_goal": _metric_distance_to_goal(env),
+                "sampling": response.get(HEATMAPVLN_RPC_SAMPLING_FIELD),
+                "front_sha256": front_sha,
+                "lookdown_sha256": hashlib.sha256(lookdown).hexdigest(),
+                "lookdown_size": [int(blobs["lookdown"]["width"]), int(blobs["lookdown"]["height"])],
+                "vo": (
+                    None
+                    if pose_fields is None
+                    else {key: pose_fields.get(key) for key in _S2_RECORD_VO_FIELDS}
+                ),
+            }
+        )
+        row["server_fields"] = {
+            key: value
+            for key, value in response.items()
+            if key not in row
+            and key != HEATMAPVLN_RPC_SAMPLING_FIELD
+            and (value is None or isinstance(value, (str, int, float, bool)))
+        }
+        # Kept as the record's own lossless PNG until commit, not as a float array.
+        depth_png = self.records.depth_to_png_bytes(depth * self.depth_scale_m)
+        episode["calls"].append((row, history_step_ids + [int(step_id)], lookdown, depth_png))
+
+    @staticmethod
+    def _pixel_difference(a: bytes, b: bytes) -> tuple[float, int]:
+        first = np.asarray(Image.open(io.BytesIO(a)).convert("RGB"), dtype=np.int16)
+        second = np.asarray(Image.open(io.BytesIO(b)).convert("RGB"), dtype=np.int16)
+        if first.shape != second.shape:
+            return float("inf"), 255
+        difference = np.abs(first - second)
+        return float(difference.mean()), int(difference.max())
+
+    def end_episode(
+        self,
+        *,
+        metrics: dict[str, Any],
+        steps: int,
+        system2_calls: int,
+        trajectory_calls: int,
+        episode_over: bool,
+    ) -> dict[str, Any]:
+        """Commit the episode; returns what the progress row keeps about the record."""
+        episode, self._episode = self._episode, None
+        writer = self.records.EpisodeRecordWriter(
+            root=self.root,
+            scene_id=episode["scene_id"],
+            episode_id=episode["episode_id"],
+            episode=episode["meta"],
+        )
+        for row in episode["steps"]:
+            extra = {key: value for key, value in row.items() if key not in ("step_id", "position", "rotation_wxyz")}
+            writer.add_step(row["step_id"], row["position"], row["rotation_wxyz"], **extra)
+        chosen: dict[int, str] = {}
+        for step, variants in episode["fronts"].items():
+            uses = episode["front_uses"][step]
+            chosen[step] = max(variants, key=lambda digest: uses[digest])  # ties: first sent
+            writer.add_front(step, variants[chosen[step]])
+        mismatch_calls = 0
+        for row, prompt_steps, lookdown, depth_png in episode["calls"]:
+            differences: dict[int, tuple[float, int]] = {}
+            for step, digest in zip(prompt_steps, row["front_sha256"]):
+                if digest != chosen[step]:
+                    mean, peak = self._pixel_difference(
+                        episode["fronts"][step][digest], episode["fronts"][step][chosen[step]]
+                    )
+                    previous = differences.get(step, (0.0, 0))
+                    differences[step] = (max(previous[0], mean), max(previous[1], peak))
+            row["front_mismatch_steps"] = list(differences)
+            row["front_mismatch_mean_abs_diff"] = [round(value[0], 4) for value in differences.values()]
+            row["front_mismatch_max_abs_diff"] = [value[1] for value in differences.values()]
+            mismatch_calls += int(bool(differences))
+            writer.add_call(
+                row,
+                lookdown_jpeg=lookdown,
+                lookdown_depth_m=self.records.depth_from_png_bytes(depth_png),
+            )
+        positions = np.asarray([row["position"] for row in episode["steps"]], dtype=np.float64)
+        path_length = float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum()) if len(positions) > 1 else 0.0
+        writer.episode["outcome"] = {
+            "success": float(metrics["success"]),
+            "spl": float(metrics["spl"]),
+            "distance_to_goal": float(metrics["distance_to_goal"]),
+            "oracle_success": float(metrics["oracle_success"]),
+            "path_length": path_length,
+            "steps": int(steps),
+            "system2_calls": int(system2_calls),
+            "trajectory_calls": int(trajectory_calls),
+            "episode_over": bool(episode_over),
+            "front_mismatch_calls": int(mismatch_calls),
+        }
+        path = writer.commit()
+        return {
+            "path": str(path),
+            "num_calls": len(writer.calls),
+            "num_steps": len(writer.steps),
+            "front_mismatch_calls": int(mismatch_calls),
+        }
+
+
 _ORACLE_PANO_VIEW_CENTERS_DEG: dict[str, float] = {
     "front": 0.0,
     "right": 90.0,
@@ -3644,6 +3985,7 @@ def _rpc_plan_panoramic(
     current_capture_step: int | None = None,
     history_capture_steps: list[int] | None = None,
     timing_log: PlanCallTimingLog | None = None,
+    sent_blobs: list[dict] | None = None,
 ) -> dict:
     blobs = []
     with _timed(timing_log, "model_encode"):
@@ -3653,6 +3995,9 @@ def _rpc_plan_panoramic(
             for view in ("front", "right", "back", "left"):
                 blobs.append(_rpc_blob_from_pil(f"history/{idx}/{view}", hist[view], jpeg_quality))
         blobs.append(_rpc_blob_from_pil("lookdown", lookdown_img, jpeg_quality))
+    if sent_blobs is not None:
+        # EXP-23 records keep the bytes that went on the wire, not a re-encode of them.
+        sent_blobs.extend(blobs)
 
     sampling_metadata = build_rpc_sampling_metadata(
         protocol_seed=protocol_seed,
@@ -4079,6 +4424,45 @@ def run_eval_rpc_panoramic(args):
         from scripts.exp19.step_trace import StepStateTracer
 
         step_tracer = StepStateTracer(args.step_state_trace_dir, hab_cfg.SIMULATOR.RGB_SENSOR)
+    s2_recorder: S2RecordCollector | None = None
+    if getattr(args, "s2_record_dir", None):
+        s2_recorder = S2RecordCollector(
+            args.s2_record_dir,
+            hab_cfg=hab_cfg,
+            run_meta={
+                "split": str(args.dataset_split),
+                "data_path": str(args.data_path),
+                "data_sha256": _sha256_file(args.data_path),
+                "episode_list": str(args.episode_list) if args.episode_list else None,
+                "episode_list_sha256": _sha256_file(args.episode_list),
+                "config_path": str(Path(args.config).resolve()),
+                "config_sha256": _sha256_file(args.config),
+                "client_code_sha256": _sha256_file(__file__),
+                "protocol_seed": int(args.rpc_protocol_seed),
+                "rpc_sampling_protocol": HEATMAPVLN_RPC_SAMPLING_PROTOCOL,
+                "rpc_protocol": HEATMAPVLN_RPC_PROTOCOL_VERSION,
+                "rpc_policy_mode": rpc_policy_mode,
+                "rpc_policy_fingerprint": rpc_policy_fingerprint or None,
+                "history_pose_source": str(args.history_pose_source),
+                "vlm_image_size": list(vlm_image_size),
+                "traj_image_size": list(traj_image_size),
+                "lookdown_image_size": list(
+                    NATIVE_INTERNNAV_LOOKDOWN_SIZE
+                    if (native_internnav_rpc or rpc_internnav_two_turn)
+                    else traj_image_size
+                ),
+                "num_history": int(num_history),
+                "rpc_jpeg_quality": int(args.rpc_jpeg_quality),
+                "max_steps_per_episode": int(max_steps_per_episode),
+                "server": {
+                    "address": str(args.rpc_server),
+                    "version": getattr(info, "version", None),
+                    "model_version": getattr(info, "model_version", None),
+                    "supported_formats": sorted(getattr(info, "supported_formats", None) or []),
+                },
+            },
+        )
+        print(f"[s2-record] System2 call records -> {args.s2_record_dir}", flush=True)
 
     dagger_api = None
     dagger_state = None
@@ -4371,6 +4755,10 @@ def run_eval_rpc_panoramic(args):
                 goal_pos=goal_pos.tolist(),
                 gt_path=gt_path,
             )
+        if s2_recorder is not None:
+            s2_recorder.begin_episode(
+                env, episode, scene_id=scene_id, episode_id=episode_id, instruction=instruction
+            )
 
         while (not done) and (step_id < max_steps_per_episode):
             sys.stdout.flush()
@@ -4407,6 +4795,10 @@ def run_eval_rpc_panoramic(args):
                     action=int(ActionCode.STOP),
                     image_size=image_size,
                 )
+                if s2_recorder is not None:
+                    s2_recorder.add_step(
+                        env, new_step_id, action=ActionCode.STOP, phase="auto_stop", call_index=None
+                    )
                 step_id = new_step_id
                 continue
 
@@ -4452,6 +4844,10 @@ def run_eval_rpc_panoramic(args):
                     action=int(action),
                     image_size=image_size,
                 )
+                if s2_recorder is not None:
+                    s2_recorder.add_step(
+                        env, step_id, action=action, phase="local_action", call_index=system2_calls - 1
+                    )
                 continue
 
             max_system2_calls = int(getattr(args, "max_system2_calls_per_episode", 0) or 0)
@@ -4473,6 +4869,10 @@ def run_eval_rpc_panoramic(args):
                     action=int(ActionCode.STOP),
                     image_size=image_size,
                 )
+                if s2_recorder is not None:
+                    s2_recorder.add_step(
+                        env, step_id, action=ActionCode.STOP, phase="max_system2_stop", call_index=None
+                    )
                 continue
 
             if timing_log is not None:
@@ -4522,6 +4922,9 @@ def run_eval_rpc_panoramic(args):
                     f"{_views_trace_summary(current_views)}",
                     flush=True,
                 )
+            # EXP-23 records: the lookdown's depth and the request's own blobs; None when off.
+            s2_lookdown_depth: list | None = [] if s2_recorder is not None else None
+            s2_sent_blobs: list[dict] | None = [] if s2_recorder is not None else None
             with _timed(timing_log, "lookdown_capture"):
                 lookdown_img = capture_lookdown_view(
                     env,
@@ -4533,6 +4936,7 @@ def run_eval_rpc_panoramic(args):
                         if (native_internnav_rpc or rpc_internnav_two_turn)
                         else traj_image_size
                     ),
+                    depth_out=s2_lookdown_depth,
                 )
             executed_history_panoramas.append(current_views)
             if dagger_collector is not None:
@@ -4593,6 +4997,7 @@ def run_eval_rpc_panoramic(args):
                 current_capture_step=step_id,
                 history_capture_steps=prompt_history_steps,
                 timing_log=timing_log,
+                sent_blobs=s2_sent_blobs,
             )
             if timing_log is not None:
                 timing_log.end_plan(
@@ -4648,6 +5053,17 @@ def run_eval_rpc_panoramic(args):
                 )
             elif actions:
                 print(f"  [debug] actions={actions}", flush=True)
+            if s2_recorder is not None:
+                s2_recorder.add_call(
+                    env,
+                    call_index=system2_calls - 1,
+                    step_id=step_id,
+                    history_step_ids=prompt_history_steps,
+                    sent_blobs=s2_sent_blobs,
+                    lookdown_depth=s2_lookdown_depth[-1] if s2_lookdown_depth else None,
+                    response=response,
+                    pose_fields=external_pose_fields,
+                )
 
             if step_recorder is not None:
                 state = env._sim.get_agent(0).get_state()
@@ -4719,6 +5135,14 @@ def run_eval_rpc_panoramic(args):
                         image_size=image_size,
                         vlm_output=llm_output,
                     )
+                    if s2_recorder is not None:
+                        s2_recorder.add_step(
+                            env,
+                            step_id,
+                            action=alignment_action,
+                            phase="pano_recenter",
+                            call_index=system2_calls - 1,
+                        )
 
                 if done or step_id >= max_steps_per_episode:
                     continue
@@ -5009,6 +5433,10 @@ def run_eval_rpc_panoramic(args):
                     image_size=image_size,
                     vlm_output=llm_output,
                 )
+                if s2_recorder is not None:
+                    s2_recorder.add_step(
+                        env, step_id, action=action, phase="rpc_terminal", call_index=system2_calls - 1
+                    )
                 continue
 
             if not actions:
@@ -5032,6 +5460,14 @@ def run_eval_rpc_panoramic(args):
                     image_size=image_size,
                     vlm_output=llm_output,
                 )
+                if s2_recorder is not None:
+                    s2_recorder.add_step(
+                        env,
+                        step_id,
+                        action=ActionCode.STOP,
+                        phase="rpc_empty_actions",
+                        call_index=system2_calls - 1,
+                    )
                 continue
 
             first_action = int(actions.pop(0))
@@ -5061,6 +5497,10 @@ def run_eval_rpc_panoramic(args):
                 image_size=image_size,
                 vlm_output=llm_output,
             )
+            if s2_recorder is not None:
+                s2_recorder.add_step(
+                    env, step_id, action=first_action, phase="rpc_first_action", call_index=system2_calls - 1
+                )
 
         if timing_log is not None:
             timing_log.end_episode(step_id)
@@ -5087,6 +5527,20 @@ def run_eval_rpc_panoramic(args):
         spls.append(metrics["spl"])
         oss.append(metrics["oracle_success"])
         nes.append(metrics["distance_to_goal"])
+        s2_record_summary = None
+        if s2_recorder is not None:
+            s2_record_summary = s2_recorder.end_episode(
+                metrics=metrics,
+                steps=step_id,
+                system2_calls=system2_calls,
+                trajectory_calls=trajectory_calls,
+                episode_over=bool(done),
+            )
+            print(
+                f"  [s2-record] {s2_record_summary['path']} calls={s2_record_summary['num_calls']} "
+                f"front_mismatch_calls={s2_record_summary['front_mismatch_calls']}",
+                flush=True,
+            )
         if step_recorder is not None:
             step_recorder.finalize(
                 scene_id=scene_id,
@@ -5151,6 +5605,8 @@ def run_eval_rpc_panoramic(args):
             "ppa_warmup_calls": int(ppa_warmup_calls),
             "cognition_applied_calls": int(cognition_applied_calls),
         }
+        if s2_record_summary is not None:
+            result["s2_record"] = s2_record_summary
         if stage0_action_trace:
             result["ppa_stage0_action_arm"] = stage0_action_trace[0]["arm"]
             result["ppa_stage0_action_trace"] = stage0_action_trace
@@ -6002,6 +6458,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--s2_record_dir",
+        type=str,
+        default=None,
+        help=(
+            "EXP-23 (RPC path only): write every System2 call of each episode -- the JPEG bytes "
+            "the request carried, the lookdown's metric depth, the server's answer and ground-truth "
+            "poses -- to <dir>/<scene>/<scene>_<episode>.s2rec.tar (src/data/s2_records.py). "
+            "Read-only: the actions are the same with and without it. Default: off."
+        ),
+    )
+    parser.add_argument(
         "--collect_trajectory_dagger",
         action="store_true",
         default=False,
@@ -6049,6 +6516,7 @@ def main():
         _preflight_checkpoint_args(args)
     _resolve_eval_paths(args, split=args.dataset_split)
     _preflight_trajectory_dagger_args(args)
+    _preflight_s2_record_args(args)
     run_eval(args)
 
 

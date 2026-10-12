@@ -23,6 +23,9 @@
 #   NAV_DA3_CHECKPOINT, NAV_CHECKPOINT, NAV_CONFIG, NAV_PYTHON   as in the launcher (PPA_EVAL_*)
 #   NAV_RUNTIME_DIR [$NAV_ROOT/nav_servers/<stamp>]              logs and caches
 #   NAV_SERVER_START_TIMEOUT_S [1800]
+#   NAV_SYSTEM2_LORA [PPA_EVAL_SYSTEM2_LORA, else none]   EXP-23 System2 LoRA directory
+#                                           (rpc_model_server.py --system2_lora_adapter): System2
+#                                           decides with it, System1's Z0 is computed without it
 #   HEATMAPVLN_TIMING                       passed through: servers that support it add timing_ms
 
 set -Eeuo pipefail
@@ -43,6 +46,7 @@ MODEL_PORT="${NAV_MODEL_PORT:-52400}"
 VO_PORT="${NAV_VO_PORT:-52500}"
 RUNTIME_DIR="${NAV_RUNTIME_DIR:-$ROOT/nav_servers/$(date +%Y%m%d_%H%M%S)_$$}"
 START_TIMEOUT_S="${NAV_SERVER_START_TIMEOUT_S:-1800}"
+SYSTEM2_LORA="${NAV_SYSTEM2_LORA:-${PPA_EVAL_SYSTEM2_LORA:-}}"
 
 MODEL_SERVER="$REPO/scripts/evaluation/rpc_model_server.py"
 VO_SERVER="$REPO/scripts/amb3r_vo/rpc_amb3r_vo_server.py"
@@ -60,6 +64,16 @@ done
 for value in "$GPU" "$VO_GPU" "$MODEL_PORT" "$VO_PORT"; do
   [[ "$value" =~ ^[0-9]+$ ]] || die "not a non-negative integer: $value"
 done
+declare -a MODEL_EXTRA=()
+SYSTEM2_LORA_SHA256=""
+if [[ -n "$SYSTEM2_LORA" ]]; then
+  for file in adapter_config.json adapter_model.safetensors; do
+    [[ -s "$SYSTEM2_LORA/$file" ]] || die "missing file: $SYSTEM2_LORA/$file"
+  done
+  SYSTEM2_LORA="$(cd "$SYSTEM2_LORA" && pwd)"
+  SYSTEM2_LORA_SHA256="$(sha256sum "$SYSTEM2_LORA/adapter_model.safetensors" | awk '{print $1}')"
+  MODEL_EXTRA+=(--system2_lora_adapter "$SYSTEM2_LORA")
+fi
 
 # Placeholders the train config expands on load; the servers never read them.
 PLACEHOLDER_DIR="$RUNTIME_DIR/config_placeholders"
@@ -124,7 +138,7 @@ env PYTHONPATH="$RPC_PYTHONPATH" CUDA_VISIBLE_DEVICES="$GPU" \
     --config "$PPA_CONFIG" --checkpoint "$PPA_CHECKPOINT" \
     --internnav_model_path "$INTERNNAV_MODEL_PATH" \
     --gpu_id 0 --host "$HOST" --port "$MODEL_PORT" --workers 1 \
-    --require_deterministic_sampling --require_ppa_online_amb3r \
+    --require_deterministic_sampling --require_ppa_online_amb3r "${MODEL_EXTRA[@]}" \
     --log_level INFO >"$RUNTIME_DIR/model.log" 2>&1 &
 MODEL_PID=$!
 env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" CUDA_VISIBLE_DEVICES="$VO_GPU" \
@@ -169,6 +183,12 @@ PY
 done
 grep -F "Formal PPA online AMB3R runtime enabled" "$RUNTIME_DIR/model.log" >/dev/null \
   || die "model server lacks the PPA preflight line"
+if [[ -n "$SYSTEM2_LORA_SHA256" ]]; then
+  grep -F "System2 LoRA adapter enabled: " "$RUNTIME_DIR/model.log" \
+    | grep -F "\"adapter_sha256\": \"$SYSTEM2_LORA_SHA256\"" >/dev/null \
+    || die "model server lacks System2 LoRA evidence for sha256 $SYSTEM2_LORA_SHA256"
+  echo "[nav-servers] System2 LoRA $SYSTEM2_LORA sha256=$SYSTEM2_LORA_SHA256 (Z0 from the released weights)"
+fi
 echo "[nav-servers] READY model=$HOST:$MODEL_PORT vo=$HOST:$VO_PORT (Ctrl-C stops both)"
 
 # bash 5.0 in the container has no `wait -n -p`: poll both.

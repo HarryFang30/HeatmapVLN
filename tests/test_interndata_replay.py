@@ -101,4 +101,4 @@ def test_scene_reader_and_client_image_path(tmp_path):
     assert seen[:-1] == [((384, 384, 3), 90)] * (len(history) + 1)
     assert seen[-1] == ((480, 640, 3), 90)  # lookdown keeps 640x480
     turn = next(s for s in samples if s.kind == "turn")
-    assert sample_jpegs(scene, turn, encode=encode)[2] is None
+    assert sample_jpegs(scene, turn, encode=encode)[2] == b"jpeg"  # captured on every call

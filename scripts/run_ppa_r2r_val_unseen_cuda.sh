@@ -60,6 +60,12 @@ BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
 NUM_HISTORY="${PPA_EVAL_NUM_HISTORY:-8}"
 NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
 NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
+# EXP-23: decide with a System2 LoRA (rpc_model_server.py --system2_lora_adapter); Z0 stays
+# the released weights'.  Local servers: the adapter directory.  External servers: a local
+# copy of that directory, or just the sha256 of its adapter_model.safetensors; servers.json
+# and the live servers must name the same adapter.  Empty: the released System2, and a
+# server set that serves any adapter is refused.
+SYSTEM2_LORA="${PPA_EVAL_SYSTEM2_LORA:-}"
 # Per-shard episode lists (shard_0N.json); another directory than the locked cohorts means a subset run: no merge.
 EPISODE_LISTS_DIR="${PPA_EVAL_EPISODE_LISTS_DIR:-$COHORTS_DIR}"
 # 1: the model and VO servers already run elsewhere (e.g. on Ascend NPUs, reached
@@ -131,6 +137,15 @@ die() { printf '[ppa-eval] ERROR: %s\n' "$*" >&2; exit 2; }
 require_file() { [[ -s "$1" ]] || die "missing file: $1"; }
 require_dir() { [[ -d "$1" ]] || die "missing directory: $1"; }
 tcp_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# The same digest the model server reports for a System2 LoRA (hashlib over the file).
+file_sha256() {
+  "$CLIENT_PYTHON" -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1"
+}
 
 stop_pid() {
   local pid="${1:-}"
@@ -215,6 +230,18 @@ if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
   [[ "$VO_GPU_CSV" == "$GPU_CSV" ]] \
     || die "PPA_EVAL_VO_GPU_DEVICES means nothing in external mode; the servers choose their own devices"
 fi
+SYSTEM2_LORA_SHA256=""
+if [[ -n "$SYSTEM2_LORA" ]]; then
+  if [[ "$EXTERNAL_SERVERS" -eq 1 && "$SYSTEM2_LORA" =~ ^[0-9a-f]{64}$ ]]; then
+    SYSTEM2_LORA_SHA256="$SYSTEM2_LORA"
+  else
+    require_file "$SYSTEM2_LORA/adapter_config.json"
+    require_file "$SYSTEM2_LORA/adapter_model.safetensors"
+    SYSTEM2_LORA="$(cd "$SYSTEM2_LORA" && pwd)"
+    SYSTEM2_LORA_SHA256="$(file_sha256 "$SYSTEM2_LORA/adapter_model.safetensors")" || die "could not hash $SYSTEM2_LORA"
+  fi
+fi
+[[ -n "$SYSTEM2_LORA" ]] && MODEL_EXTRA+=(--system2_lora_adapter "$SYSTEM2_LORA")
 [[ "$ALLOW_CAPPED_RESUME" =~ ^[01]$ ]] || die "PPA_EVAL_ALLOW_CAPPED_RESUME must be 0 or 1"
 [[ "$ALLOW_COMMIT_MISMATCH" =~ ^[01]$ ]] || die "PPA_EVAL_ALLOW_COMMIT_MISMATCH must be 0 or 1"
 # A capped run is a fixed, pre-registered sample, and both of these silently change
@@ -243,6 +270,7 @@ echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHAR
 echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
 echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} episode_lists=$EPISODE_LISTS_DIR"
 echo "[ppa-eval] output=$OUTPUT_ROOT external_servers=$EXTERNAL_SERVERS"
+echo "[ppa-eval] system2_lora=${SYSTEM2_LORA:-none} sha256=${SYSTEM2_LORA_SHA256:-none}"
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   display_num=$((DISPLAY_BASE + slot))
@@ -287,13 +315,14 @@ if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
   CLIENT_COMMIT="$(git -c safe.directory="$REPO" -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
   "$CLIENT_PYTHON" - "$RUNTIME_DIR/external_servers.json" "$NUM_SLOTS" "$MODEL_PORT_BASE" "$VO_PORT_BASE" \
     "$BRIDGE_OFF" "$TIMING" "$NUM_SAMPLE_TRAJS" "$NUM_INFERENCE_STEPS" "$CLIENT_COMMIT" \
-    "$ALLOW_COMMIT_MISMATCH" <<'EXT' || die "external servers.json does not match this run"
+    "$ALLOW_COMMIT_MISMATCH" "$SYSTEM2_LORA_SHA256" <<'EXT' || die "external servers.json does not match this run"
 import json
 import re
 import sys
 
 (path, slots, model_base, vo_base, bridge_off, timing, num_sample_trajs,
  num_inference_steps, client_commit, allow_commit_mismatch) = sys.argv[1:11]
+system2_lora_sha256 = sys.argv[11] if len(sys.argv) > 11 else ""
 record = json.load(open(path, encoding="utf-8"))
 problems = []
 if record.get("schema") != "heatmapvln-npu-servers-v2":
@@ -318,6 +347,12 @@ if int(record.get("timing", 0)) != int(timing):
 for key, want in (("num_sample_trajs", num_sample_trajs), ("num_inference_steps", num_inference_steps)):
     if str(record.get(key, "")) != str(want):
         problems.append(f"servers {key}={record.get(key)!r}, this run sets {want!r}")
+# So is the System2 LoRA (EXP-23); a record from before the field means none.
+if str(record.get("system2_lora_sha256") or "") != system2_lora_sha256:
+    problems.append(
+        f"servers system2_lora_sha256={record.get('system2_lora_sha256')!r}, "
+        f"this run expects {system2_lora_sha256!r} (PPA_EVAL_SYSTEM2_LORA)"
+    )
 # Written but never checked until now: a token-less or hand-started server set, or
 # one whose build cannot be identified, cannot be the subject of a recorded result.
 if not record.get("server_instance"):
@@ -382,13 +417,17 @@ fi
 # is the local ssh forwarder, so neither a dead remote server nor a local CUDA pair on
 # the same default ports can be told apart without asking the server who it is.
 # Exit 1: no usable answer (down, unhealthy, or still starting).  Exit 3: answered,
-# but it is not the recorded server set -- retrying cannot fix that.
+# but it is not the recorded server set -- retrying cannot fix that.  In both modes the
+# model server must name exactly the System2 LoRA this run expects, or none.
 rpc_ready() {
-  PYTHONPATH="$RPC_PYTHONPATH" "$CLIENT_PYTHON" - "$1" "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" <<'PY' >/dev/null 2>&1
+  PYTHONPATH="$RPC_PYTHONPATH" SYSTEM2_LORA_SHA256="$SYSTEM2_LORA_SHA256" \
+    "$CLIENT_PYTHON" - "$1" "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" <<'PY' >/dev/null 2>&1
+import os
 import sys
 from vla_rpc.client import VLAClient
 
 model_address, vo_address, token, timing, rng_seed, model_version = (sys.argv[1:7] + [""] * 6)[:6]
+lora = os.environ.get("SYSTEM2_LORA_SHA256", "")
 wanted = {model_address: ["ppa-online-amb3r-v1"], vo_address: ["json+jpeg"]}
 if token:
     for address, expected in wanted.items():
@@ -410,6 +449,10 @@ for address, expected in wanted.items():
         # The build the servers.json evidence describes, as the server names it now.
         if model_version and address == model_address and info.model_version != model_version:
             raise SystemExit(3)
+        if address == model_address:
+            served = sorted(item for item in formats if item.startswith("system2-lora-sha256:"))
+            if served != ([f"system2-lora-sha256:{lora}"] if lora else []):
+                raise SystemExit(3)
     finally:
         client.close()
 PY
@@ -446,7 +489,7 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
       break
     fi
     (( rc != 3 )) \
-      || die "slot $slot: the servers on $model_addr / $vo_addr are not the ones in $EXTERNAL_SERVER_DIR/servers.json (wrong instance, device, timing or VO seed); is a local CUDA server holding these ports, or the tunnel pointing elsewhere?"
+      || die "slot $slot: the servers on $model_addr / $vo_addr are not the ones in ${EXTERNAL_SERVER_DIR:-this run}${EXTERNAL_SERVER_DIR:+/servers.json} (wrong instance, device, timing, VO seed or System2 LoRA); is a local CUDA server holding these ports, or the tunnel pointing elsewhere?"
     (( $(date +%s) < deadline )) || die "RPC startup timeout at slot $slot"
     sleep 10
   done
@@ -468,6 +511,14 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
         || die "model slot $slot lacks the $key override evidence"
     fi
   done
+  # The server's own account of the adapter it wrapped, by the bytes it hashed.
+  if [[ -n "$SYSTEM2_LORA_SHA256" ]]; then
+    grep -F "System2 LoRA adapter enabled: " "$model_log" \
+      | grep -F "\"adapter_sha256\": \"$SYSTEM2_LORA_SHA256\"" >/dev/null \
+      || die "model slot $slot lacks System2 LoRA evidence for sha256 $SYSTEM2_LORA_SHA256"
+  elif grep -F "System2 LoRA adapter enabled: " "$model_log" >/dev/null; then
+    die "model slot $slot serves a System2 LoRA, but this run sets no PPA_EVAL_SYSTEM2_LORA"
+  fi
   echo "[ppa-eval] slot=$slot gpu=${GPUS[$slot]} vo_gpu=${VO_GPUS[$slot]} model=$model_addr vo=$vo_addr ready"
 done
 

@@ -9,6 +9,8 @@ receives discrete Habitat actions.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -111,6 +113,14 @@ PPA_ONLINE_AMB3R_CAPABILITY = "ppa-online-amb3r-v1"
 # EXP-17: the fine-tuned System2 decides (pose tokens + cognition prefix); Z0
 # for System1 is taken from the native weights with the adapters disabled.
 SYSTEM2_COGNITION_CAPABILITY = "system2-cognition-arm-v1"
+# EXP-23: a System2 LoRA makes both native turns; Z0 for System1 is taken with
+# the adapter disabled, so System1, the PPA bridge and the History Head get
+# exactly the inputs the released weights give them for that decision.
+SYSTEM2_LORA_CAPABILITY = "system2-lora-v1"
+SYSTEM2_LORA_SHA256_FORMAT = "system2-lora-sha256:"
+SYSTEM2_LORA_Z0_SOURCE = "adapters_disabled"
+SYSTEM2_LORA_WEIGHTS = "adapter_model.safetensors"
+SYSTEM2_LORA_CONFIG = "adapter_config.json"
 MEMORY_PLACEHOLDER_TOKEN = "<|fim_pad|>"
 LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
@@ -327,6 +337,128 @@ def _maybe_apply_pano_latent_adapter(
 
     out = adapter(traj_hs.to(dtype=adapter_dtype))
     return out.to(dtype=orig_dtype)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _wrap_system2_lora(hf_model: torch.nn.Module, adapter_dir: str) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Wrap the HF Qwen2.5-VL the native path calls with a frozen PEFT LoRA (EXP-23).
+
+    Fails closed on anything but a plain LoRA on the decoder's transformer blocks.
+    An adapter in the vision tower would change the History Head's input and make
+    the vision-pass reuse unsound (qwen2_5_vl_vision_count.py keys on pixels only);
+    and PEFT only *warns* about adapter keys that did not land, which would serve
+    the base model under the adapter's name.  So the tensors the model now holds are
+    compared with the file, key for key and value for value.
+
+    Returns the wrapped model and the identity responses and GetServerInfo carry.
+    """
+    from peft import PeftModel
+    from peft.tuners.lora import Linear as LoraLinear
+    from peft.tuners.lora import LoraLayer
+    from peft.utils import get_peft_model_state_dict
+    from safetensors import safe_open
+
+    directory = Path(adapter_dir).expanduser().resolve()
+    config_path = directory / SYSTEM2_LORA_CONFIG
+    weights_path = directory / SYSTEM2_LORA_WEIGHTS
+    for path in (config_path, weights_path):
+        if not path.is_file():
+            raise RuntimeError(f"System2 LoRA adapter {directory} has no {path.name}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    problems = []
+    if str(config.get("peft_type", "")).upper() != "LORA":
+        problems.append(f"peft_type={config.get('peft_type')!r}")
+    # Each of these adds weights or behaviour that disabling the adapter does not
+    # describe as "LoRA on the decoder blocks".
+    for key in ("modules_to_save", "trainable_token_indices", "layer_replication", "alora_invocation_tokens", "use_dora"):
+        if config.get(key):
+            problems.append(f"{key}={config.get(key)!r}")
+    if str(config.get("bias", "none")) != "none":
+        problems.append(f"bias={config.get('bias')!r}")
+    if problems:
+        raise RuntimeError(f"System2 LoRA adapter {directory} is not a plain LoRA: {'; '.join(problems)}")
+
+    with safe_open(str(weights_path), framework="pt") as handle:
+        saved = {key: handle.get_tensor(key) for key in handle.keys()}
+    if not saved:
+        raise RuntimeError(f"System2 LoRA adapter {weights_path} holds no tensors")
+    foreign = sorted(key for key in saved if not key.endswith((".lora_A.weight", ".lora_B.weight")))
+    if foreign:
+        raise RuntimeError(f"System2 LoRA adapter holds tensors that are not LoRA A/B weights: {foreign[:5]}")
+    nonfinite = sorted(key for key, value in saved.items() if not bool(torch.isfinite(value.float()).all()))
+    if nonfinite:
+        raise RuntimeError(f"System2 LoRA adapter has non-finite tensors: {nonfinite[:5]}")
+    if (
+        isinstance(hf_model, PeftModel)
+        or getattr(hf_model, "peft_config", None)
+        or getattr(hf_model, "_hf_peft_config_loaded", False)
+    ):
+        raise RuntimeError("the System2 backbone already carries a PEFT adapter; refusing to stack another")
+
+    wrapped = PeftModel.from_pretrained(hf_model, str(directory), is_trainable=False)
+    wrapped.requires_grad_(False)
+    wrapped.eval()
+
+    base = wrapped.get_base_model()
+    blocks = getattr(base.get_decoder(), "layers", None)
+    if not isinstance(blocks, torch.nn.ModuleList):
+        raise RuntimeError("could not locate the Qwen2.5-VL decoder's transformer blocks")
+    in_blocks = {id(module) for module in blocks.modules()}
+    adapted = [(name, module) for name, module in base.named_modules() if isinstance(module, LoraLayer)]
+    if not adapted:
+        raise RuntimeError(f"System2 LoRA adapter {directory} injected no LoRA layer into this model")
+    outside = [
+        name for name, module in adapted if id(module) not in in_blocks or not isinstance(module, LoraLinear)
+    ]
+    if outside:
+        raise RuntimeError(
+            "System2 LoRA adapter targets modules outside the language model's transformer blocks "
+            f"({len(outside)} of {len(adapted)}, e.g. {outside[:3]}); restrict target_modules to the decoder"
+        )
+
+    loaded = get_peft_model_state_dict(wrapped, save_embedding_layers=False)
+    missing = sorted(set(saved) - set(loaded))
+    unexpected = sorted(set(loaded) - set(saved))
+    if missing or unexpected:
+        raise RuntimeError(
+            "System2 LoRA adapter does not match this model key for key: "
+            f"{len(missing)} file tensors did not land (e.g. {missing[:3]}), "
+            f"{len(unexpected)} model tensors are not in the file (e.g. {unexpected[:3]})"
+        )
+    differing = sorted(
+        key for key, value in saved.items() if not torch.equal(loaded[key].detach().float().cpu(), value.float())
+    )
+    if differing:
+        raise RuntimeError(f"System2 LoRA tensors differ from the file after loading: {differing[:5]}")
+    device = next(base.parameters()).device
+    stray = sorted(name for name, value in wrapped.named_parameters() if "lora_" in name and value.device != device)
+    if stray:
+        raise RuntimeError(f"System2 LoRA tensors are not on {device}: {stray[:3]}")
+
+    contract = {
+        "capability": SYSTEM2_LORA_CAPABILITY,
+        "adapter_dir": str(directory),
+        "adapter_sha256": _sha256_file(weights_path),
+        "adapter_config_sha256": _sha256_file(config_path),
+        "z0_source": SYSTEM2_LORA_Z0_SOURCE,
+        "rank": config.get("r"),
+        "alpha": config.get("lora_alpha"),
+        "target_modules": sorted({name.rsplit(".", 1)[-1] for name, _ in adapted}),
+        "lora_layers": len(adapted),
+        "lora_tensors": len(saved),
+        # A freshly initialised adapter (B = 0) must serve byte-identically to none.
+        "lora_b_all_zero": all(
+            not bool(value.any()) for key, value in saved.items() if key.endswith(".lora_B.weight")
+        ),
+    }
+    return wrapped, contract
 
 
 def _normalize_multimodal_inputs(inputs: dict[str, torch.Tensor]) -> None:
@@ -884,6 +1016,8 @@ class HeatmapVLNRuntime:
             "require_deterministic_sampling=%s",
             self.require_deterministic_sampling,
         )
+        # Before the PPA preflight, so its vision-tower adapter check sees the wrapped model.
+        self.system2_lora = self._preflight_system2_lora()
         self._preflight_ppa_stage0_action_arm()
         self.ppa_checkpoint_contract = self._preflight_ppa_online_amb3r()
         if self.ppa_bridge_off:
@@ -904,6 +1038,57 @@ class HeatmapVLNRuntime:
             )
         else:
             self.model_version = "heatmapvln-r2r"
+        if self.system2_lora is not None:
+            # The checkpoint's run directory names the base; the adapter is named by its bytes.
+            self.model_version = f"{self.model_version}+system2-lora:{self.system2_lora['adapter_sha256']}"
+
+    def _preflight_system2_lora(self) -> dict[str, Any] | None:
+        """EXP-23: decide with a System2 LoRA, take Z0 from the released weights.
+
+        Both native turns run with the adapter on; ``generate_latents`` runs inside
+        ``adapters_disabled()``.  For a given decision System1, the PPA bridge and
+        the History Head (vision tower only, which the adapter may not touch) then
+        get exactly the inputs they get today, so none of them needs retraining.
+        Only the plain deployed path is served this way: modes with their own LoRA
+        or their own transform of Z0 are refused rather than combined.
+        """
+        adapter_dir = getattr(self.args, "system2_lora_adapter", None)
+        if not adapter_dir:
+            return None
+        if self.system2_cognition_arm:
+            raise RuntimeError("--system2_lora_adapter cannot be combined with --system2_cognition_arm (its own LoRA)")
+        if self.ppa_stage0_action_arm != "disabled":
+            raise RuntimeError("--system2_lora_adapter cannot run with the Stage-0 A/B mode")
+        if self.pano_latent_adapter is not None:
+            raise RuntimeError("--system2_lora_adapter forbids a panoramic latent adapter (it would transform Z0)")
+        if int(getattr(self.args, "workers", 1)) != 1:
+            # adapters_disabled() toggles the one shared model: a concurrent request
+            # would decide with the adapter off, and nothing would say so.
+            raise RuntimeError("--system2_lora_adapter needs --workers 1")
+        trajectory_cfg = self.train_cfg.get("data", {}).get("trajectory", {}) or {}
+        internnav_protocol = str(trajectory_cfg.get("system2_sft_protocol", "direct")).lower() == "internnav"
+        if not internnav_protocol or bool(trajectory_cfg.get("structured_pano_output", True)):
+            raise RuntimeError(
+                "--system2_lora_adapter serves the released two-turn InternNav protocol only "
+                "(data.trajectory.system2_sft_protocol=internnav, structured_pano_output=false): "
+                "the adapter is trained on build_native_messages prompts"
+            )
+        backbone = self.model.qwen2_5_vl
+        if bool(getattr(backbone.config, "use_lora", False)):
+            raise RuntimeError(
+                "--system2_lora_adapter needs the released System2 (model.llm.use_lora=false); "
+                "this config already wraps it in a LoRA"
+            )
+        wrapped, contract = _wrap_system2_lora(backbone.model, adapter_dir)
+        backbone.model = wrapped
+        LOGGER.info("System2 LoRA adapter enabled: %s", json.dumps(contract, sort_keys=True))
+        return contract
+
+    def _system1_condition_scope(self):
+        """Where Z0 is computed: the released weights whenever a System2 LoRA decides."""
+        if getattr(self, "system2_lora", None) is None:
+            return contextlib.nullcontext()
+        return self.model.qwen2_5_vl.adapters_disabled()
 
     def _preflight_system2_cognition_arm(self) -> dict[str, Any] | None:
         """Fail closed unless the loaded model is exactly an EXP-17 arm.
@@ -1892,6 +2077,12 @@ class HeatmapVLNRuntime:
             "kind": "unknown",
             "phase": phase,
         }
+        system2_lora = getattr(self, "system2_lora", None)
+        if system2_lora is not None:
+            response["system2_lora"] = {
+                "adapter_sha256": system2_lora["adapter_sha256"],
+                "z0_source": SYSTEM2_LORA_Z0_SOURCE,
+            }
         if self.ppa_online_amb3r:
             response.update(
                 {
@@ -2057,8 +2248,11 @@ class HeatmapVLNRuntime:
             # extract_from_pixels, which clear()s first and raises if its own pass did
             # not refill them, so no reader can pick up a capture this pass skipped.
             # Nothing is served outside this scope (qwen2_5_vl_vision_count.py).
+            # With a System2 LoRA the pass was recorded with the adapter on and is
+            # served with it off: still the same bits, because _wrap_system2_lora
+            # refuses any adapter in the tower.
             with _vision_serve_scope(), torch.no_grad():
-                with timer.stage("system1_condition_latents"):
+                with timer.stage("system1_condition_latents"), self._system1_condition_scope():
                     traj_hs = self.model.qwen2_5_vl.generate_latents(
                         output_ids=condition_output_ids,
                         pixel_values=inputs.get("pixel_values"),
@@ -2362,9 +2556,17 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
                     if getattr(self.runtime, "system2_cognition_arm", False)
                     else []
                 ),
+                *self._system2_lora_formats(),
                 *self._instance_formats(),
             ],
         )
+
+    def _system2_lora_formats(self) -> list[str]:
+        """Which adapter decides, by the sha256 of its weights; nothing without one."""
+        lora = getattr(self.runtime, "system2_lora", None)
+        if lora is None:
+            return []
+        return [SYSTEM2_LORA_CAPABILITY, f"{SYSTEM2_LORA_SHA256_FORMAT}{lora['adapter_sha256']}"]
 
     def _instance_formats(self) -> list[str]:
         """What a client needs to tell this server from another on the same port.
@@ -2446,6 +2648,16 @@ def parse_args() -> argparse.Namespace:
         help="Also decode the native first turn (adapters off) on every ready call and record agreement.",
     )
     parser.add_argument("--cognition_max_new_tokens", type=int, default=96)
+    parser.add_argument(
+        "--system2_lora_adapter",
+        default=None,
+        help=(
+            "EXP-23: a PEFT LoRA directory (adapter_config.json + adapter_model.safetensors) "
+            "for the released System2's decoder blocks. Both native turns decide with it; "
+            "System1's Z0 is computed with it disabled. Responses carry its sha256 under "
+            "system2_lora, model_version and GetServerInfo name it. Unset changes nothing."
+        ),
+    )
     parser.add_argument(
         "--nextdit_num_sample_trajs",
         type=int,
