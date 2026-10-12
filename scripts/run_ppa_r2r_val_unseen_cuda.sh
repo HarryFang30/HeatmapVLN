@@ -56,6 +56,9 @@ MAX_EPISODES="${PPA_EVAL_MAX_EPISODES_PER_SHARD:-}"
 TIMING="${PPA_EVAL_TIMING:-0}"
 # 1: EXP-20 A1, System1 samples from Z instead of the injected Z~ (rpc_model_server.py --ppa_bridge_off).
 BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
+# 1: the last of the 500 actions is reserved for STOP, so an episode that runs out of steps
+# ends with STOP where it stands (r2r_val_unseen.py --stop_at_step_budget).  0 keeps A0's protocol.
+STOP_AT_STEP_BUDGET="${PPA_EVAL_STOP_AT_STEP_BUDGET:-0}"
 # EXP-21 sensitivity: history frames K (client), System1 samples S and denoising steps M (server; empty = config).
 NUM_HISTORY="${PPA_EVAL_NUM_HISTORY:-8}"
 NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
@@ -203,6 +206,9 @@ NUM_SLOTS="${#GPUS[@]}"
 [[ -z "$MAX_EPISODES" || "$MAX_EPISODES" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_MAX_EPISODES_PER_SHARD must be a positive integer"
 [[ "$TIMING" =~ ^[01]$ ]] || die "PPA_EVAL_TIMING must be 0 or 1"
 [[ "$BRIDGE_OFF" =~ ^[01]$ ]] || die "PPA_EVAL_BRIDGE_OFF must be 0 or 1"
+[[ "$STOP_AT_STEP_BUDGET" =~ ^[01]$ ]] || die "PPA_EVAL_STOP_AT_STEP_BUDGET must be 0 or 1"
+declare -a CLIENT_EXTRA=()
+[[ "$STOP_AT_STEP_BUDGET" -eq 1 ]] && CLIENT_EXTRA=(--stop_at_step_budget)
 declare -a MODEL_EXTRA=()
 [[ "$BRIDGE_OFF" -eq 1 ]] && MODEL_EXTRA=(--ppa_bridge_off)
 [[ "$NUM_HISTORY" =~ ^[1-8]$ ]] || die "PPA_EVAL_NUM_HISTORY must be 1-8"
@@ -266,7 +272,7 @@ done
 mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 # Timing logs newer than this marker belong to this run (--resume keeps older ones).
 [[ "$TIMING" -eq 0 ]] || touch "$RUNTIME_DIR/timing_start"
-echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING bridge_off=$BRIDGE_OFF"
+echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING bridge_off=$BRIDGE_OFF stop_at_step_budget=$STOP_AT_STEP_BUDGET"
 echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
 echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} episode_lists=$EPISODE_LISTS_DIR"
 echo "[ppa-eval] output=$OUTPUT_ROOT external_servers=$EXTERNAL_SERVERS"
@@ -551,7 +557,7 @@ run_shard_once() {
       --auto_stop_distance 0 --trajectory_selection mean \
       --trajectory_x_sign 1 --trajectory_heading_alignment none \
       --system1_coord_order generated --no-pano_recenter_before_system1 \
-      --no-debug_input_trace --debug_save_input_images 0 --resume "${cap[@]}" \
+      --no-debug_input_trace --debug_save_input_images 0 --resume "${cap[@]}" "${CLIENT_EXTRA[@]}" \
       >>"$RUNTIME_DIR/logs/client_shard_0${shard}.log" 2>&1
 }
 

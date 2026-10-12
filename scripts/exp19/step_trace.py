@@ -73,6 +73,7 @@ ACTION_PHASES = (
     "pano_recenter",  # recenter turn (pano_recenter_before_system1 only)
     "max_system2_stop",  # --max_system2_calls_per_episode reached -> STOP
     "auto_stop",  # --auto_stop_distance privileged stop
+    "step_budget_stop",  # --stop_at_step_budget: the budget's last action is STOP
 )
 # The sites that act on a terminal / action-less response; they record its kind.
 RESPONSE_KIND_PHASES = ("terminal", "rpc_empty_actions")

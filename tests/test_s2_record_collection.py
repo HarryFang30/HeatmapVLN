@@ -384,7 +384,10 @@ class FakeVOBridge:
         return []
 
 
-def _run(client, monkeypatch, tmp_path: Path, *, mode: str, record: bool, tag: str, mismatch: bool = False):
+def _run(
+    client, monkeypatch, tmp_path: Path, *, mode: str, record: bool, tag: str, mismatch: bool = False,
+    extra_argv: tuple = (),
+):
     quaternion = pytest.importorskip("quaternion")
     env = FakeEnv(quaternion)
     server = FakeModelServer(client, mode, mismatch=mismatch)
@@ -436,6 +439,7 @@ def _run(client, monkeypatch, tmp_path: Path, *, mode: str, record: bool, tag: s
                  "--amb3r_vo_rpc_server", VO_ADDR]
     if record:
         argv += ["--s2_record_dir", str(records)]
+    argv += list(extra_argv)  # argparse keeps the last value of a repeated option
     monkeypatch.setattr(sys, "argv", argv)
     client.main()
     progress = [json.loads(line) for line in (output / "progress.json").read_text().splitlines() if line.strip()]
@@ -707,7 +711,7 @@ def test_every_recorder_use_in_the_loop_is_behind_its_guard():
     post_steps = [c for c in calls if isinstance(c.func, ast.Name) and c.func.id == "_record_post_action_step"]
     add_steps = [c for c in calls if isinstance(c.func, ast.Attribute) and c.func.attr == "add_step"
                  and isinstance(c.func.value, ast.Name) and c.func.value.id == "s2_recorder"]
-    assert len(add_steps) == len(post_steps) == 7
+    assert len(add_steps) == len(post_steps) == 8
     # Off, the two hooks into the request path are None: the calls are the pre-EXP-23 ones.
     for callee, keyword, name in (
         ("_rpc_plan_panoramic", "sent_blobs", "s2_sent_blobs"),
