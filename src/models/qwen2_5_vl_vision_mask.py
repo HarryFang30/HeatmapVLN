@@ -29,13 +29,25 @@ and falls back to the loop when the windows do not cover the sequence (see its
 docstring).
 
 This is why it is worth doing on a platform where a synchronisation costs about
-120 us; on CUDA the same 16272 reads cost roughly a tenth of that, which is most of
-the reason the 910B looked two to four times slower per call.
+120 us; on CUDA the same reads cost roughly a tenth of that, which is most of the
+reason the 910B looked two to four times slower per call.
 
-Installed on NPU only.  Not because it would be wrong on CUDA -- the mask is provably
-the same tensor -- but because the 4090's numbers are certified against the code as it
-stands, and there is no reason to touch that path without a run to back it.  The 910B
-has no A0 yet, so there is nothing there to invalidate.  Set
+A tenth of it is not nothing, and it has now been measured rather than divided.
+``scripts/tools/bench_vision_mask.py`` on a 4090, at the deployed grids and the real
+window partition, per construction (median of 9, interleaved arms):
+
+    bounds / shape        7056 patches, 144 windows    8620 patches, 174 windows
+    on the device                      6.80 ms                      8.29 ms
+    host ints                          1.24 ms                      1.50 ms
+    window ids                         0.22 ms                      0.26 ms
+
+Once per vision layer, so 28 windowed layers plus 4 full-attention blocks make a
+tower pass 192 ms before and 7.0 ms after at the turn-1 shape, 234 ms and 8.2 ms at
+turn 2; a trajectory+ppa call runs four passes, which is **853 ms before and 30 ms
+after** -- about 23% of the 3594 ms this platform's model server takes per plan call.
+
+Installed on NPU only, because the 4090's published numbers are certified against the
+code as it stands and a default CUDA server must keep running exactly that.  Set
 HEATMAPVLN_QWEN_VISION_MASK_PATCH=1 to install it anyway, or =0 to refuse.
 """
 

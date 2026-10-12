@@ -92,6 +92,11 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_TIMING
 - 上面这条命令的输出目录是固定的 `latency_seed42`，所以**第二次跑之前要先把它清掉或换个名字**：
   带上限的运行往已有结果的目录里续跑会被拒绝（见 §2 那条）。否则它会悄悄给你另外 2 集，
   计时统计也就不是同一个样本了。
+- **视觉窗口掩码补丁在这台机器上默认不装。** `HEATMAPVLN_QWEN_VISION_MASK_PATCH=1` 才装
+  （`HEATMAPVLN_QWEN_VISION_REUSE=1` 是另一个开关，省掉重复的那趟视觉塔）。装了就不是认证过的那套代码，
+  所以要配一次不装的运行作对照，并按本节末尾的计时中立性判据确认动作逐调用相同。
+  这个算子在 4090 上的基准（不需要起服务端）：`python scripts/tools/bench_vision_mask.py --device cuda:<卡>`，
+  结果见 `docs/experiments/exp20-latency-report.md` §8。
 - 服务端每个阶段前后各做一次 `torch.cuda.synchronize`（同步的是服务端自己用的那张卡：模型的 `--gpu_id`、里程计的 `--device`），量到的是 GPU 真正算完的时间。同步只挪了主机等待的位置，不改任何张量，所以动作应当不变，但整体会慢一点。
 - **"动作不变"要先在 GPU 上实测一次**：用 09-28 金丝雀的配置（4、5 号卡两个槽位，分片 0、1 各 2 集，种子 42）加 `PPA_EVAL_TIMING=1` 跑到新目录，用 `scripts/exp19/select_cases.py` 的 `parse_client_log` 读两边的客户端日志、`scripts/exp19/build_records.py` 的 `compare_calls` 逐调用比：每次调用的步号、`kind`、慢系统原文、动作块都相同，§3 表里的步数、注入生效次数、SR/SPL/NE 也相同，才算通过。
   - 通过：带计时的全量评测的 SR/SPL 可以直接当基线用，全量基线和延迟表一次跑出来。

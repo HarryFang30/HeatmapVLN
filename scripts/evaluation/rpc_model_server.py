@@ -816,6 +816,16 @@ def _resolve_device(args: argparse.Namespace) -> torch.device:
                 "--device cuda but torch.cuda.is_available() is False; "
                 "refusing to fall back to CPU"
             )
+        # Both Qwen patches are off on CUDA unless their own flag asks for them -- each
+        # installer returns False for a non-NPU device unless its variable is 1 -- so
+        # these two calls change nothing about a default CUDA server.  They are here
+        # because the escape hatch both modules document ("set ...=1 to install it
+        # anyway") was unreachable on CUDA while the only call sites sat in the NPU
+        # branch: the flag was read, found to say yes, and nothing asked.  Measuring
+        # what the mask patch is worth on a 4090 needed a server that could be told to
+        # run it.
+        _install_vision_mask_patch("cuda")
+        _install_vision_pass_counter("cuda")
         return torch.device(f"cuda:{index}")
     if kind == "npu":
         try:

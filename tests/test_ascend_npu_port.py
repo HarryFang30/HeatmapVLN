@@ -111,8 +111,14 @@ def test_model_server_device_never_falls_back_to_cpu():
 
     torch.cuda.is_available = lambda: True
     assert resolve(args) == "cuda:0"
-    # The CUDA path is certified: it must not pick up the NPU-only setup.
-    assert calls == []
+    # The CUDA path must not pick up the NPU-only setup: no fused-MHA fastpath change
+    # and no op-toolchain warm-up.  It does offer the two Qwen patches their flag, which
+    # is not the same as installing them -- each installer returns False on a non-NPU
+    # device unless its own variable is 1 (test_qwen_vision_mask_patch.py pins that), so
+    # a default CUDA server still runs unpatched transformers.  Before this call existed
+    # the flag could not be taken on CUDA at all, which is what made the mask patch
+    # unmeasurable on the 4090.
+    assert calls == [("vision_mask", "cuda"), ("vision_count", "cuda")]
 
 
 def test_model_server_npu_requires_a_real_npu(monkeypatch):
