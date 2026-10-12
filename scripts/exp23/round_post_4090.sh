@@ -38,6 +38,14 @@ EVAL_GPUS="${EXP23_EVAL_GPUS:-5,4,0}"
 CANARY_GPU="${EXP23_CANARY_GPU:-5}"
 SEEDS="${EXP23_SEEDS:-42 1337}"
 EVAL_ROOT="${EXP23_EVAL_ROOT:-/workspace/eval_runs}"
+# 1: the closed-loop runs use EXP-24's --stop_at_step_budget (user, 2026-10-13).  The
+# identity check below never does: it is about the code, against A0's protocol.  The
+# paired monitor scores a switched-on run under the standard protocol too (exactly
+# derivable), and the stop rule uses that one.
+STOP_AT_STEP_BUDGET="${EXP23_STOP_AT_STEP_BUDGET:-0}"
+[[ "$STOP_AT_STEP_BUDGET" =~ ^[01]$ ]] || { echo "EXP23_STOP_AT_STEP_BUDGET must be 0 or 1" >&2; exit 2; }
+RUN_SUFFIX=""
+[[ "$STOP_AT_STEP_BUDGET" -eq 1 ]] && RUN_SUFFIX="_stepbudget"
 declare -A A0_RUN=([42]=/workspace/eval_runs/exp20_a0_seed42_4090 [1337]=/workspace/eval_runs/exp20_a0_seed1337_4090)
 export PYTHONPATH="$WT:/workspace/rpc/src"
 
@@ -47,7 +55,7 @@ log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
 status() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" > "$ROUND_DIR/POST_STATUS"; log "STATUS $*"; }
 die() { status "STOPPED: $*"; chown -R 1015:1015 "$ROUND_DIR" 2>/dev/null; exit 2; }
 git -c safe.directory='*' -C "$WT" diff --quiet HEAD -- || die "$WT has uncommitted changes"
-log "round=$ROUND wt=$WT commit=$(git -c safe.directory='*' -C "$WT" rev-parse HEAD)"
+log "round=$ROUND wt=$WT commit=$(git -c safe.directory='*' -C "$WT" rev-parse HEAD) stop_at_step_budget=$STOP_AT_STEP_BUDGET"
 
 # 1 -------------------------------------------------------------------------------
 status "waiting for collection to stop"
@@ -123,13 +131,14 @@ chown -R 1015:1015 "$ROUND_DIR"
 
 # 6 -------------------------------------------------------------------------------
 for seed in $SEEDS; do
-  OUT="$EVAL_ROOT/exp23_r${ROUND}_seed${seed}_4090"
+  OUT="$EVAL_ROOT/exp23_r${ROUND}_seed${seed}_4090${RUN_SUFFIX}"
   status "closed loop seed $seed -> $OUT"
   # setsid run directly (no subshell): $! is then the leader of the run's own process
   # group, so the stop rule can TERM the launcher, its servers and its clients at once.
   cd "$WT"
   PPA_EVAL_ROOT=/workspace PPA_EVAL_REPO="$WT" PPA_EVAL_GPU_DEVICES="$EVAL_GPUS" PPA_EVAL_PROTOCOL_SEED="$seed" \
     PPA_EVAL_SYSTEM2_LORA="$ADAPTER" PPA_EVAL_OUTPUT_ROOT="$OUT" PPA_EVAL_DISPLAY_BASE=400 PPA_EVAL_SHARD_RETRIES=3 \
+    PPA_EVAL_STOP_AT_STEP_BUDGET="$STOP_AT_STEP_BUDGET" \
     setsid bash scripts/run_ppa_r2r_val_unseen_cuda.sh > "$ROUND_DIR/logs/eval_seed${seed}.log" 2>&1 &
   launcher=$!
   while kill -0 "$launcher" 2>/dev/null; do

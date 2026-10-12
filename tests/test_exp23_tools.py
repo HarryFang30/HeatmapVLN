@@ -48,3 +48,23 @@ def test_client_logs_compare_call_for_call(tmp_path):
     assert rc == 1 and report["shared_episodes"] == 2 and report["identical"] == 1
     diverged = next(e for e in report["episodes"] if not e["identical"])
     assert diverged["episode_id"] == 2 and diverged["first_divergence"]["call_index"] == 1
+
+
+def test_paired_monitor_scores_a_step_budget_run_both_ways(tmp_path):
+    ref = tmp_path / "ref.jsonl"
+    rows = [{"scene_id": "A", "episode_id": i, "success": 1.0, "spl": 0.9, "steps": 80, "ne": 0.5} for i in range(8)]
+    rows += [{"scene_id": "A", "episode_id": 8, "success": 0.0, "spl": 0.0, "steps": 500, "ne": 1.2},   # stuck at the goal
+             {"scene_id": "A", "episode_id": 9, "success": 0.0, "spl": 0.0, "steps": 500, "ne": 9.0}]   # lost
+    ref.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    cand = [dict(r, stop_at_step_budget=True, step_budget_stop=False) for r in rows[:8]]
+    cand += [{"scene_id": "A", "episode_id": 8, "success": 1.0, "spl": 0.1, "steps": 500, "ne": 1.2,
+              "stop_at_step_budget": True, "step_budget_stop": True},
+             {"scene_id": "A", "episode_id": 9, "success": 0.0, "spl": 0.0, "steps": 500, "ne": 9.0,
+              "stop_at_step_budget": True, "step_budget_stop": True}]
+    (tmp_path / "c.json").write_text("".join(json.dumps(r) + "\n" for r in cand))
+    out = tmp_path / "m.json"
+    paired_progress_monitor.main(["--candidate", str(tmp_path / "c.json"), "--reference", str(ref), "--out", str(out)])
+    report = json.loads(out.read_text())
+    assert report["sr"]["candidate"] == 80.0 and report["sr"]["delta_pt"] == 0.0   # standard: the budget STOP is no STOP
+    assert report["sr_step_budget"]["candidate"] == 90.0 and report["sr_step_budget"]["reference"] == 90.0
+    assert report["step_budget_stops"] == 2
