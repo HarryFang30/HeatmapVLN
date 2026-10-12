@@ -22,8 +22,8 @@ curve no single run ever produced: with the default minimised as well, six of th
 nine points land above it, which reads as a finding and is an artefact of the
 splice.
 
-The dashed line is the deployment value of that parameter (K=8, S=32, M=10).  It is
-the control each point was run against, not a point of the sweep.
+The deployment value of each parameter (K=8, S=32, M=10) is drawn as a point of the
+curve, in its place in the ordering, and marked with a ring and a bold tick label.
 
 Usage (repo root on PYTHONPATH)::
 
@@ -50,10 +50,15 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from scripts.exp18.figures import style  # noqa: E402
 
+# Each sweep is (name, deployment value, points in VALUE order).  The deployment
+# value is one of the points, with key None: it is the setting the model ships with,
+# so the curve has to pass through it rather than refer to it from the side -- a
+# reader needs to see where 8 sits between 7 and nothing, and that S=64 is above
+# S=32 rather than merely near a line.
 SWEEPS = (
-    ("K", 8, ((5, "k5"), (6, "k6"), (7, "k7"))),
-    ("S", 32, ((1, "s1"), (8, "s8"), (64, "s64"))),
-    ("M", 10, ((2, "m2"), (5, "m5"), (20, "m20"))),
+    ("K", 8, ((5, "k5"), (6, "k6"), (7, "k7"), (8, None))),
+    ("S", 32, ((1, "s1"), (8, "s8"), (32, None), (64, "s64"))),
+    ("M", 10, ((2, "m2"), (5, "m5"), (10, None), (20, "m20"))),
 )
 METRICS = (
     ("success", "SR", 100.0),
@@ -70,12 +75,12 @@ MS = 4.6
 L = {
     "en": {
         "xlabel": {"K": "history frames K", "S": "sampled trajectories S", "M": "denoising steps M"},
-        "default": "deployment value",
+        "deployed": "deployed",
         "ylab": {"SR": "SR (%)", "SPL": "SPL (%)", "NE": "NE (m)"},
     },
     "zh": {
         "xlabel": {"K": "历史帧数 K", "S": "采样条数 S", "M": "去噪步数 M"},
-        "default": "部署值",
+        "deployed": "部署值",
         "ylab": {"SR": "SR (%)", "SPL": "SPL (%)", "NE": "NE (m)"},
     },
 }
@@ -110,20 +115,31 @@ def draw(res: dict, plat: str, lang: str) -> plt.Figure:
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
             base = res["defaults"][plat][mkey] * scale
-            ys = [data[k][mkey]["treatment"] * scale for _, k in pts]
+            ys = [(base if k is None else data[k][mkey]["treatment"] * scale) for _, k in pts]
             xs = list(range(len(pts)))
-            ax.axhline(base, color=style.MUTED, linewidth=0.8, linestyle=(0, (3, 2)), zorder=1)
             ax.plot(xs, ys, color=LINE, linewidth=LW, marker="o", markersize=MS,
                     markeredgecolor=style.SURFACE, markeredgewidth=0.7, zorder=3)
+            # The deployment value is marked, not coloured differently: a ring over
+            # its marker plus a bold tick label, so it is identifiable in print and
+            # for a colour-blind reader without a legend.
+            di = next(i for i, (_, k) in enumerate(pts) if k is None)
+            ax.plot([xs[di]], [ys[di]], marker="o", markersize=MS + 4.2,
+                    markerfacecolor="none", markeredgecolor=LINE, markeredgewidth=1.1,
+                    zorder=4)
             ax.set_xticks(xs)
             ax.set_xticklabels([str(v) for v, _ in pts])
-            ax.set_xlim(-0.35, len(pts) - 0.65)
+            for i, lab in enumerate(ax.get_xticklabels()):
+                if i == di:
+                    lab.set_fontweight("bold")
+                    lab.set_color(style.INK)
+            # a little slack at both ends so the deployment ring is not clipped by a spine
+            ax.set_xlim(-0.5, len(pts) - 0.5)
             if r == len(METRICS) - 1:
                 ax.set_xlabel(t["xlabel"][pname])
             if c == 0:
                 ax.set_ylabel(t["ylab"][mname])
             if r == 0:
-                ax.set_title(f"{pname}  ({t['default']} {dflt})", color=style.INK, pad=4)
+                ax.set_title(f"{pname}  ({t['deployed']} {dflt})", color=style.INK, pad=4)
     return fig
 
 
@@ -140,15 +156,15 @@ def caption(res: dict, plat: str, lang: str) -> str:
             "parameter -- history frames K, sampled trajectories S, denoising steps M -- with the "
             "other two held at their deployment values; no retraining. Rows are SR, SPL and NE, one "
             f"metric per axis. All points come from one platform and the same {pts['k5']['n']} "
-            "episodes; the dashed line is the deployment value, the control each point was run "
-            f"against (SR {100 * d['success']:.1f}%). Shortening the history costs the most: SR falls "
+            "episodes. The ringed point with the bold tick label is the deployment value "
+            f"(SR {100 * d['success']:.1f}%). Shortening the history costs the most: SR falls "
             f"to {sr('k5'):.1f}% at K=5 and {sr('k6'):.1f}% at K=6. Cutting the sampled trajectories "
             f"to one ({sr('s1'):.1f}%) or the denoising steps to two ({sr('m2'):.1f}%) costs little, "
             "so compute is best saved on S and M rather than on K.")
     return (
         "部署模型的参数敏感性。每个面板只扫一个推理期参数——历史帧数 K、采样条数 S、去噪步数 M，"
         "其余两个保持部署值，都不用重训。三行分别是 SR、SPL、NE，每个指标占自己的坐标轴。"
-        f"所有点出自同一平台、同一组 {pts['k5']['n']} 集；虚线是部署值，也是各点的对照"
+        f"所有点出自同一平台、同一组 {pts['k5']['n']} 集；带圈、刻度加粗的那个点是部署值"
         f"（SR {100 * d['success']:.1f}%）。缩短历史的代价最大：K=5 降到 {sr('k5'):.1f}%、"
         f"K=6 降到 {sr('k6'):.1f}%。把采样条数砍到 1（{sr('s1'):.1f}%）或去噪步数砍到 2"
         f"（{sr('m2'):.1f}%）代价都很小，所以要省算力应该省 S 和 M，不要省 K。")
@@ -176,8 +192,11 @@ def main() -> None:
                     help="which run to draw; the figure itself carries no platform label")
     args = ap.parse_args()
     res = json.loads(args.results.read_text())
+    # key None is the deployment value, which comes from res["defaults"], not points
     missing = [k for _, _, pts in SWEEPS for _, k in pts
-               if k not in res["points"].get(args.platform, {})]
+               if k is not None and k not in res["points"].get(args.platform, {})]
+    if args.platform not in res.get("defaults", {}):
+        raise SystemExit(f"{args.platform} has no default point")
     if missing:
         raise SystemExit(f"{args.platform} is missing points: {missing}")
     for lang in args.lang:
