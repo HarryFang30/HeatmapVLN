@@ -538,3 +538,38 @@ def test_label_rows_carry_the_oracle_route_for_gate_g4():
     path = np.asarray(row["oracle_path"])
     assert path.ndim == 2 and path.shape[1] == 3 and len(path) >= 2
     assert np.all(np.linalg.norm(np.diff(path, axis=0), axis=1) <= 0.25 + 1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Pixel targets stay inside the released model's training window
+# --------------------------------------------------------------------------- #
+def test_a_route_leaving_sideways_gets_a_pixel_inside_the_window_not_on_the_border():
+    # 1 m ahead the route turns hard left and leaves the frame through its left edge.
+    route = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, -1.0], [-6.0, 0.0, -1.0]])
+    answer = _oracle(route)
+    assert answer.kind == "pixel"
+    u, v = answer.pixel
+    cfg = OracleConfig()
+    assert cfg.pixel_margin_u <= u <= CAM.width - 1 - cfg.pixel_margin_u
+    assert cfg.pixel_min_row <= v <= cfg.pixel_max_row
+    assert answer.debug["n_visible_in_window"] < answer.debug["n_visible"]  # the border band was there
+
+
+def test_a_route_visible_only_outside_the_window_turns_like_the_expert_data():
+    # Nothing passes a window this tight, so the visible route cannot become a pixel:
+    # the oracle turns towards it instead (left, the way the route goes).
+    route = np.array([[0.0, 0.0, 0.0], [-3.0, 0.0, -3.0]])
+    depth = floor_depth([0, 0, 0], FACE_NEG_Z)
+    answer = oracle_answer(
+        position=[0, 0, 0], rotation_wxyz=FACE_NEG_Z, distance_to_goal=5.0, route=route, depth_m=depth,
+        config=OracleConfig(pixel_max_row=0),
+    )
+    assert answer.kind == "turn" and set(answer.turn1) == {"←"}
+
+
+def test_the_config_digest_moves_with_the_rules_version(monkeypatch):
+    import src.data.s2_oracle_labels as labels
+
+    before = OracleConfig().digest()
+    monkeypatch.setattr(labels, "LABEL_RULES_VERSION", labels.LABEL_RULES_VERSION + 1)
+    assert OracleConfig().digest() != before

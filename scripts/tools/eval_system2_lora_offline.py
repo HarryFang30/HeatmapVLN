@@ -207,12 +207,26 @@ def _rate(numerator: int, denominator: int) -> float | None:
     return round(numerator / denominator, 6) if denominator else None
 
 
-def summarize_mode(rows: Sequence[Mapping[str, Any]], mode: str, *, r_stop_m: float, false_stop_m: float) -> dict[str, Any]:
+def summarize_mode(
+    rows: Sequence[Mapping[str, Any]], mode: str, *, r_stop_m: float, false_stop_m: float, device: str
+) -> dict[str, Any]:
+    """Gate readings for one decode mode ("on" / "off").
+
+    G0 replays only calls recorded on ``device`` (the platform this runs on): a CUDA
+    answer replayed on an NPU differs by a few pixels about 5% of the time, which says
+    nothing about whether the training inputs are aligned.  G1 asks whether the adapter
+    keeps the answers that were already right, so it compares the adapter-on answer
+    with the adapter-off answer on this same machine; the comparison with the recorded
+    answer stays as a report-only reading.
+    """
     def distance(row: Mapping[str, Any]) -> float | None:
         return row.get("distance_to_goal")
 
     every = [row[mode] for row in rows]
-    agree = [row[mode] for row in rows if row.get("agree") is True]
+    same_device = [row[mode] for row in rows if row.get("record_device") == device]
+    agree_rows = [row for row in rows if row.get("agree") is True]
+    agree = [row[mode] for row in agree_rows]
+    kept = sum(bool(row.get("on_off_identical")) for row in agree_rows) if mode == "on" else len(agree_rows)
     far = [row[mode] for row in rows if distance(row) is not None and distance(row) > false_stop_m]
     near = [row[mode] for row in rows if distance(row) is not None and distance(row) <= r_stop_m]
     disagree = [row[mode] for row in rows if row.get("agree") is False]
@@ -226,8 +240,13 @@ def summarize_mode(rows: Sequence[Mapping[str, Any]], mode: str, *, r_stop_m: fl
         "replay_exact": {"n": len(every), "matched": count(every, "exact_recorded"),
                          "rate": _rate(count(every, "exact_recorded"), len(every))},
         "stop_rate": _rate(count(every, "stop"), len(every)),
-        "G1_keep": {"n": len(agree), "matched": count(agree, "exact_recorded"),
-                    "rate": _rate(count(agree, "exact_recorded"), len(agree))},
+        "replay_exact_same_device": {"device": device, "n": len(same_device),
+                                     "matched": count(same_device, "exact_recorded"),
+                                     "rate": _rate(count(same_device, "exact_recorded"), len(same_device))},
+        "G1_keep": {"n": len(agree_rows), "matched": kept, "rate": _rate(kept, len(agree_rows)),
+                    "compares": "adapter on vs adapter off, same machine"},
+        "G1_keep_vs_recorded": {"n": len(agree), "matched": count(agree, "exact_recorded"),
+                                "rate": _rate(count(agree, "exact_recorded"), len(agree))},
         "G2_false_stop": {"n": len(far), "stops": count(far, "stop"),
                           "rate": _rate(count(far, "stop"), len(far)), "distance_gt_m": false_stop_m},
         "G3_stop_recall": {"n": len(near), "stops": count(near, "stop"),
@@ -252,7 +271,7 @@ def gate_report(on: Mapping[str, Any], off: Mapping[str, Any]) -> dict[str, Any]
         return {"value": value, "threshold": threshold, "direction": "<=" if upper else ">=", "pass": bool(passed)}
 
     gates = {
-        "G0_adapter_off_replay": gate(off["replay_exact"]["rate"], G0_THRESHOLD, upper=False),
+        "G0_adapter_off_replay": gate(off["replay_exact_same_device"]["rate"], G0_THRESHOLD, upper=False),
         "G1_keep": gate(on["G1_keep"]["rate"], G1_THRESHOLD, upper=False),
         "G2_false_stop": gate(on["G2_false_stop"]["rate"], G2_THRESHOLD, upper=True),
     }
@@ -327,6 +346,7 @@ def evaluate(args: argparse.Namespace) -> int:
         label = ref.label
         rows.append({
             "key": ref.key,
+            "record_device": ref.record_device,
             "uid": ref.uid,
             "scene_id": ref.scene_id,
             "kind": call.get("kind"),
@@ -344,7 +364,8 @@ def evaluate(args: argparse.Namespace) -> int:
     merged = gather_rank_rows(rows, rt, work_dir / "shards", "eval")
     if rt.is_main:
         summaries = {
-            mode: summarize_mode(merged, mode, r_stop_m=args.r_stop, false_stop_m=args.false_stop_distance)
+            mode: summarize_mode(merged, mode, r_stop_m=args.r_stop, false_stop_m=args.false_stop_distance,
+                                 device=rt.device.type)
             for mode in ("on", "off")
         }
         report = {

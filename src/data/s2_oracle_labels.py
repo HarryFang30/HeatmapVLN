@@ -76,6 +76,11 @@ Geodesic = Callable[[np.ndarray, np.ndarray], float]
 FindPath = Callable[[np.ndarray, np.ndarray], "np.ndarray | None"]
 
 
+# Bumped whenever a labelling rule changes, so the config digest -- and with it
+# label_s2_records.py's "already current" check -- moves even when no value does.
+LABEL_RULES_VERSION = 2  # 2: pixel targets kept inside InternData-N1's support window
+
+
 @dataclass(frozen=True)
 class OracleConfig:
     stop_radius_m: float = 2.0
@@ -90,13 +95,21 @@ class OracleConfig:
     max_turns: int = MAX_EXECUTED_ACTIONS
     agree_path_dist_m: float = 1.0
     agree_min_progress_m: float = 0.5
+    # Oracle pixel targets stay inside the window the released model was trained on.
+    # InternData-N1's 70,077 r2r lookdown goals span u in [33, 606] and v in [48, 455],
+    # and on in-place rotations the expert labeller drops a goal that drifts into the
+    # outer band (kept 0 of 192 times) for a nearer one or a turn.  A route visible only
+    # in that band therefore yields a turn, as it would there.
+    pixel_margin_u: int = 32
+    pixel_min_row: int = 32
+    pixel_max_row: int = 455
 
     @property
     def min_turn_deg(self) -> float:
         return self.turn_step_deg / 2.0
 
     def digest(self) -> str:
-        text = json.dumps(asdict(self), sort_keys=True)
+        text = json.dumps({"rules": LABEL_RULES_VERSION, **asdict(self)}, sort_keys=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
@@ -488,7 +501,15 @@ def oracle_answer(
         "n_samples": int(len(arc)),
         "n_visible": int(vis["visible"].sum()),
     }
-    usable = np.flatnonzero(vis["visible"] & (arc >= config.min_pixel_ahead_m))
+    col, row = vis["col"], vis["row"]
+    in_window = (
+        (col >= config.pixel_margin_u)
+        & (col <= camera.width - 1 - config.pixel_margin_u)
+        & (row >= config.pixel_min_row)
+        & (row <= config.pixel_max_row)
+    )
+    debug["n_visible_in_window"] = int((vis["visible"] & in_window).sum())
+    usable = np.flatnonzero(vis["visible"] & in_window & (arc >= config.min_pixel_ahead_m))
     if len(usable):
         i = int(usable[np.argmax(arc[usable])])
         u, v = int(vis["col"][i]), int(vis["row"][i])
@@ -654,6 +675,7 @@ def _route_for_row(route: np.ndarray | None) -> list[list[float]] | None:
 
 
 __all__ = [
+    "LABEL_RULES_VERSION",
     "LEFT_TEXT",
     "LOOKDOWN_TEXT",
     "LookdownCamera",

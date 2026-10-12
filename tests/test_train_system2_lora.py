@@ -287,14 +287,17 @@ def test_gate_summary_and_thresholds():
         return out
 
     rows = []
-    for i in range(10):  # agreeing, far: 9 kept, no stop
-        rows.append({"agree": True, "distance_to_goal": 6.0, "on": answer(exact=i > 0), "off": answer()})
-    rows.append({"agree": False, "distance_to_goal": 1.0, "on": answer(stop=True, exact=False, corrected=True, cls_match=True),
+    for i in range(10):  # agreeing, far: the adapter keeps 9 of the off answers, no stop
+        rows.append({"agree": True, "distance_to_goal": 6.0, "record_device": "npu", "on_off_identical": i > 0,
+                     "on": answer(exact=i > 0), "off": answer()})
+    rows.append({"agree": False, "distance_to_goal": 1.0, "record_device": "npu", "on_off_identical": False,
+                 "on": answer(stop=True, exact=False, corrected=True, cls_match=True),
                  "off": answer(exact=True, corrected=False, cls_match=False)})
-    rows.append({"agree": None, "distance_to_goal": None, "on": answer(), "off": answer()})
-    on = summarize_mode(rows, "on", r_stop_m=2.0, false_stop_m=3.0)
-    off = summarize_mode(rows, "off", r_stop_m=2.0, false_stop_m=3.0)
-    assert on["G1_keep"] == {"n": 10, "matched": 9, "rate": 0.9}
+    rows.append({"agree": None, "distance_to_goal": None, "record_device": "npu", "on_off_identical": True,
+                 "on": answer(), "off": answer()})
+    on = summarize_mode(rows, "on", r_stop_m=2.0, false_stop_m=3.0, device="npu")
+    off = summarize_mode(rows, "off", r_stop_m=2.0, false_stop_m=3.0, device="npu")
+    assert {k: on["G1_keep"][k] for k in ("n", "matched", "rate")} == {"n": 10, "matched": 9, "rate": 0.9}
     assert on["G2_false_stop"]["n"] == 10 and on["G2_false_stop"]["rate"] == 0.0
     assert on["G3_stop_recall"] == {"n": 1, "stops": 1, "rate": 1.0, "distance_le_m": 2.0}
     assert on["G4_correction"]["corrected_rate"] == 1.0 and off["G4_correction"]["corrected_rate"] == 0.0
@@ -303,4 +306,44 @@ def test_gate_summary_and_thresholds():
     assert gates["G0_adapter_off_replay"]["value"] == 1.0
     assert gates["G1_keep"]["pass"] and gates["G2_false_stop"]["pass"] and gates["all_pass"]
     rows[0]["on"]["stop"] = True  # one false stop in ten far calls
-    assert not gate_report(summarize_mode(rows, "on", r_stop_m=2.0, false_stop_m=3.0), off)["G2_false_stop"]["pass"]
+    assert not gate_report(summarize_mode(rows, "on", r_stop_m=2.0, false_stop_m=3.0, device="npu"), off)["G2_false_stop"]["pass"]
+
+
+def test_g0_counts_only_calls_recorded_on_this_platform():
+    def row(device, exact):
+        answer = {"stop": False, "exact_recorded": exact}
+        return {"agree": True, "distance_to_goal": 6.0, "record_device": device, "on_off_identical": True,
+                "on": dict(answer), "off": dict(answer)}
+
+    # NPU records replay exactly; a fifth of the CUDA records differ by a few pixels on the NPU.
+    rows = [row("npu", True) for _ in range(50)] + [row("cuda", i % 5 != 0) for i in range(50)]
+    off = summarize_mode(rows, "off", r_stop_m=2.0, false_stop_m=3.0, device="npu")
+    on = summarize_mode(rows, "on", r_stop_m=2.0, false_stop_m=3.0, device="npu")
+    assert off["replay_exact"]["rate"] == 0.9  # pooled: would fail the 0.98 line for a platform reason
+    assert off["replay_exact_same_device"] == {"device": "npu", "n": 50, "matched": 50, "rate": 1.0}
+    assert gate_report(on, off)["G0_adapter_off_replay"]["pass"]
+    assert on["G1_keep"]["rate"] == 1.0 and on["G1_keep_vs_recorded"]["rate"] == 0.9
+
+
+def test_stream_restart_shard_is_the_start_of_the_workers_round():
+    from scripts.train_system2_lora import stream_start_shard
+
+    # 256-sample shards, global batch 64 -> 4 steps per shard; 4 workers read 4 shards at a time.
+    assert stream_start_shard(0, 64, 256, 4) == 0
+    assert stream_start_shard(15, 64, 256, 4) == 0   # step 15 is still inside the first round of 4 shards
+    assert stream_start_shard(16, 64, 256, 4) == 4
+    assert stream_start_shard(100, 64, 256, 4) == 24  # 25 shards consumed; round 24-27 restarts whole
+    assert stream_start_shard(100, 64, 256, 0) == 25  # no workers: sequential
+
+
+def test_stream_resume_empties_the_buffer_and_names_the_restart_shard(tmp_path):
+    from types import SimpleNamespace
+
+    from scripts.train_system2_lora import prepare_stream_resume
+
+    for name in ("stream-000024.tar", "stream-000150.tar", "stream-000024.tar.done.r0", "stream_manifest.json"):
+        (tmp_path / name).write_text("x")
+    rt = SimpleNamespace(is_main=True, barrier=lambda: None, rank=0)
+    prepare_stream_resume(tmp_path, 24, rt, tmp_path / "log.jsonl")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["NEED_PUSH_FROM", "log.jsonl", "stream_manifest.json"]
+    assert (tmp_path / "NEED_PUSH_FROM").read_text().strip() == "24"

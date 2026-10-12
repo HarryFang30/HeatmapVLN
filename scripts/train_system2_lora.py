@@ -719,6 +719,43 @@ def train(args: argparse.Namespace, rt: Runtime) -> int:
     )
 
 
+def stream_start_shard(step: int, global_batch: int, shard_size: int, num_workers: int) -> int:
+    """First shard to read when (re)starting at optimizer ``step``.
+
+    DataLoader workers read shards round-robin, ``num_workers`` at a time, so at any
+    step the consumed samples are spread over the current round.  Restarting at the
+    start of that round re-reads at most one round of samples and never skips one.
+    """
+    workers = max(1, int(num_workers))
+    return (step * global_batch // (shard_size * workers)) * workers
+
+
+def prepare_stream_resume(stream_dir: Path, start_shard: int, rt: Runtime, log_path: Path) -> None:
+    """Empty the buffer before a resumed reader starts, and say where the pusher must restart.
+
+    The pusher keeps the buffer at its cap with shards far ahead of the reader, and
+    the shards between the checkpoint and the crash were read and deleted.  Unless the
+    buffer is emptied, the receiver answers BUSY to every re-push of those shards and
+    the readers wait for them forever.  The marker files go too: a re-read shard must
+    collect a fresh set.  (A first start does not clear anything: the pusher may
+    already be filling the buffer, out of order across its ports.)
+    """
+    if rt.is_main:
+        removed = 0
+        for path in list(stream_dir.glob("stream-*.tar")) + list(stream_dir.glob("stream-*.tar.done.r*")):
+            path.unlink(missing_ok=True)
+            removed += 1
+        (stream_dir / "NEED_PUSH_FROM").write_text(f"{start_shard}\n", encoding="utf-8")
+        _log(rt, log_path, {
+            "event": "stream_resume",
+            "start_shard": start_shard,
+            "buffer_files_removed": removed,
+            "action": f"stop the running pusher, then: stream_transfer.py push ... --start-shard {start_shard}",
+        })
+        LOGGER.warning("stream resume: buffer cleared; restart the pusher with --start-shard %d", start_shard)
+    rt.barrier()
+
+
 def train_from_stream(
     args: argparse.Namespace,
     rt: Runtime,
@@ -730,6 +767,8 @@ def train_from_stream(
 ) -> int:
     """Train from the shard stream the 4090 packed (design §4): one pass, in its order."""
     shard_size = int(stream["shard_size"])
+    if args.limit_samples:
+        raise RuntimeError("--limit-samples does not apply to a stream; pack a smaller stream or pass --max-steps")
     if int(stream["global_batch"]) != args.global_batch:
         raise RuntimeError(f"stream was packed for global batch {stream['global_batch']}, not {args.global_batch}")
     if shard_size % (args.global_batch) or args.global_batch % rt.world_size:
@@ -768,10 +807,9 @@ def train_from_stream(
                         "selection": stream["selection"], "drawn": stream["drawn"], "total_steps": total_steps})
 
     def make_loader(processor, collate, epoch: int, offset: int, step: int):
-        start_shard = step * args.global_batch // shard_size
+        start_shard = stream_start_shard(step, args.global_batch, shard_size, args.num_workers)
         if step:
-            # Shards before this one were read and deleted; the pusher has to restart here.
-            _log(rt, log_path, {"event": "stream_resume", "step": step, "start_shard": start_shard})
+            prepare_stream_resume(Path(args.stream_dir), start_shard, rt, log_path)
         dataset = StreamShardDataset(
             args.stream_dir,
             processor,
@@ -886,7 +924,12 @@ def _fit(
             # loss sum, samples, supervised tokens; fp32 because HCCL's fp64 support is not a given
             totals = torch.zeros(3, dtype=torch.float32, device=rt.device)
             for micro in range(accum):
-                batch = next(batches)
+                try:
+                    batch = next(batches)
+                except StopIteration:
+                    # Every rank holds the same number of samples, so they all get here at
+                    # the same step: fail loudly rather than step on a partial batch.
+                    raise RuntimeError(f"training data ran out at step {step}, micro-batch {micro}") from None
                 labels = batch["labels"].to(rt.device, non_blocking=True)
                 sync = micro == accum - 1 or not rt.distributed
                 with contextlib.nullcontext() if sync else ddp_model.no_sync():
@@ -980,7 +1023,12 @@ def parity_check(args: argparse.Namespace, rt: Runtime) -> int:
         ),
     )
     by_uid = {ref.uid: ref for ref in refs}
-    picks = [by_uid[k] for k in _stable_order(by_uid, args.seed)[: args.parity_check]]
+    # G0 is an alignment test: replay only calls this platform answered (record_device).
+    device = rt.device.type if args.parity_device == "auto" else args.parity_device
+    eligible = {k: r for k, r in by_uid.items() if device == "any" or r.record_device == device}
+    picks = [eligible[k] for k in _stable_order(eligible, args.seed)[: args.parity_check]]
+    if not picks:
+        raise RuntimeError(f"no recorded calls from device {device!r} to replay ({len(by_uid)} calls in total)")
     model, processor = load_system2(args.model_path, rt.device)
     if args.adapter:
         model = load_adapter(model, args.adapter)
@@ -1010,7 +1058,8 @@ def parity_check(args: argparse.Namespace, rt: Runtime) -> int:
         })
     merged = gather_rank_rows(rows, rt, output_dir / "parity_shards", "parity")
     if rt.is_main:
-        report = summarize_parity(merged, index_stats=dict(index_stats), split=args.parity_split, holdout=holdout)
+        report = summarize_parity(merged, index_stats=dict(index_stats), split=args.parity_split, holdout=holdout,
+                                  record_device=device)
         report.update({"adapter": str(args.adapter) if args.adapter else None, "provenance": provenance(),
                        "base_model": base_model_identity(args.model_path), "device": rt.device.type,
                        "world_size": rt.world_size})
@@ -1076,6 +1125,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--parity-check", type=int, default=0, metavar="N",
                         help="gate G0 instead of training: replay N recorded calls with adapters off")
     parser.add_argument("--parity-split", choices=("holdout", "train", "all"), default="holdout")
+    parser.add_argument("--parity-device", default="auto",
+                        help="replay only calls recorded on this device: auto (= this run's), npu, cuda, any")
     parser.add_argument("--adapter", default="", help="parity check: load this adapter and disable it")
     parser.add_argument("--lora-r", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)

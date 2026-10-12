@@ -116,6 +116,17 @@ def episode_samples(
     return out
 
 
+def client_instruction(raw: str) -> str:
+    """The instruction exactly as the deployed client sends it.
+
+    Mirrors ``scripts/evaluation/r2r_val_unseen.py::_normalize_instruction``: only a
+    final ``.``/``!``/``?`` is dropped, nothing is stripped.  R2R instructions end in
+    ``". "``, so they travel unchanged and the served prompt reads ``"... .  Where"``;
+    a stripped copy would put every replay prompt one token off the served one.
+    """
+    return raw[:-1] if raw.endswith((".", "!", "?")) else raw
+
+
 def scene_samples(scene_dir: str | Path, **kwargs) -> Iterator[ReplaySample]:
     """All replay samples of one extracted scene directory (``<scene>/meta``, ``data``)."""
     import pyarrow.parquet as pq
@@ -136,7 +147,7 @@ def scene_samples(scene_dir: str | Path, **kwargs) -> Iterator[ReplaySample]:
             yield from episode_samples(
                 scene_id=scene_id,
                 episode_index=index,
-                instruction=instruction.strip(),
+                instruction=client_instruction(instruction),
                 parquet_actions=table["action"],
                 goals=table[f"goal.{LOOKDOWN_SETTING}"],
                 relative_goal_frame_ids=table[f"relative_goal_frame_id.{LOOKDOWN_SETTING}"],
@@ -199,6 +210,7 @@ def sample_jpegs(
 
 __all__ = [
     "FRONT_SETTING",
+    "client_instruction",
     "IDX2ACTION",
     "LOOKDOWN_SETTING",
     "ReplaySample",

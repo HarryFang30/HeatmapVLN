@@ -82,6 +82,15 @@ RPC_TIMEOUT_MS="${PPA_EVAL_RPC_TIMEOUT_MS:-600000}"
 
 die() { printf '[s2-collect] ERROR: %s\n' "$*" >&2; exit 2; }
 require_file() { [[ -s "$1" ]] || die "missing file: $1"; }
+# The same digest the model server reports for a System2 LoRA (hashlib over the file).
+file_sha256() {
+  "$CLIENT_PYTHON" -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1"
+}
 require_dir() { [[ -d "$1" ]] || die "missing directory: $1"; }
 tcp_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
@@ -245,8 +254,13 @@ if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
   require_file "$EXTERNAL_SERVER_DIR/servers.json"
   [[ "$VO_GPU_CSV" == "$GPU_CSV" ]] \
     || die "PPA_EVAL_VO_GPU_DEVICES means nothing in external mode; the servers choose their own devices"
-  [[ -z "$SYSTEM2_LORA" ]] \
-    || die "PPA_EVAL_SYSTEM2_LORA is a local-server setting; start the external servers with the adapter instead"
+  # External servers are started with their adapter on their own side; here
+  # PPA_EVAL_SYSTEM2_LORA names the adapter they must be serving (a local copy of the
+  # directory, or its 64-hex sha256), and empty means the released System2.  Round 2
+  # collecting with the wrong policy would otherwise go unnoticed.
+  if [[ -n "$SYSTEM2_LORA" && ! "$SYSTEM2_LORA" =~ ^[0-9a-f]{64}$ ]]; then
+    require_file "$SYSTEM2_LORA/adapter_model.safetensors"
+  fi
 else
   # Each local slot holds one model + one VO server on its own card.
   [[ "$(printf '%s\n' "${GPUS[@]}" | sort -u | wc -l | tr -d ' ')" -eq "$NUM_SLOTS" ]] || die "GPU IDs must be unique"
@@ -296,17 +310,28 @@ if [[ "$EXTERNAL_SERVERS" -eq 1 ]]; then
     die "an external server log reports its NPU unusable (listed above); restart the servers before running"
   fi
   CLIENT_COMMIT="$(git -c safe.directory="$REPO" -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+  EXPECTED_LORA_SHA256=""
+  if [[ "$SYSTEM2_LORA" =~ ^[0-9a-f]{64}$ ]]; then
+    EXPECTED_LORA_SHA256="$SYSTEM2_LORA"
+  elif [[ -n "$SYSTEM2_LORA" ]]; then
+    EXPECTED_LORA_SHA256="$(file_sha256 "$SYSTEM2_LORA/adapter_model.safetensors")" || die "could not hash $SYSTEM2_LORA"
+  fi
   # Collection runs the deployed arm: bridge on, untimed, the config's S and M.
   "$CLIENT_PYTHON" - "$RUNTIME_DIR/external_servers.json" "$NUM_SLOTS" "$MODEL_PORT_BASE" "$VO_PORT_BASE" \
-    0 0 "" "" "$CLIENT_COMMIT" "$ALLOW_COMMIT_MISMATCH" <<'EXT' || die "external servers.json does not match this run"
+    0 0 "" "" "$CLIENT_COMMIT" "$ALLOW_COMMIT_MISMATCH" "$EXPECTED_LORA_SHA256" <<'EXT' || die "external servers.json does not match this run"
 import json
 import re
 import sys
 
 (path, slots, model_base, vo_base, bridge_off, timing, num_sample_trajs,
- num_inference_steps, client_commit, allow_commit_mismatch) = sys.argv[1:11]
+ num_inference_steps, client_commit, allow_commit_mismatch, expected_lora) = sys.argv[1:12]
 record = json.load(open(path, encoding="utf-8"))
 problems = []
+if str(record.get("system2_lora_sha256") or "") != expected_lora:
+    problems.append(
+        f"servers system2_lora_sha256={record.get('system2_lora_sha256')!r}, this run expects "
+        f"{expected_lora or 'none'!r} (PPA_EVAL_SYSTEM2_LORA)"
+    )
 if record.get("schema") != "heatmapvln-npu-servers-v2":
     problems.append(f"unexpected schema {record.get('schema')!r}")
 if int(record.get("slots", 0)) < int(slots):

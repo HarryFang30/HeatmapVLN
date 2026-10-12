@@ -87,7 +87,7 @@ def test_scene_reader_and_client_image_path(tmp_path):
 
     samples = list(scene_samples(scene))
     assert len(samples) == 18
-    assert {s.instruction for s in samples} == {"Walk forward.", "Go ahead."}
+    assert {s.instruction for s in samples} == {"Walk forward. ", "Go ahead. "}  # sent as is, never stripped
 
     seen = []
 
@@ -102,3 +102,19 @@ def test_scene_reader_and_client_image_path(tmp_path):
     assert seen[-1] == ((480, 640, 3), 90)  # lookdown keeps 640x480
     turn = next(s for s in samples if s.kind == "turn")
     assert sample_jpegs(scene, turn, encode=encode)[2] == b"jpeg"  # captured on every call
+
+
+def test_replay_instructions_follow_the_clients_normalisation():
+    import ast
+    from pathlib import Path
+
+    from src.data.interndata_replay import client_instruction
+
+    # The client's own function, read from its source so the two cannot drift apart.
+    source = Path(__file__).resolve().parents[1] / "scripts" / "evaluation" / "r2r_val_unseen.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_normalize_instruction")
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    for raw in ("Walk forward. ", "Walk forward.", "Stop!", "Where?", "no punctuation", "  padded  "):
+        assert client_instruction(raw) == namespace["_normalize_instruction"](raw)

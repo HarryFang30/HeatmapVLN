@@ -330,6 +330,7 @@ class CallRef:
     label: CallLabel | None = None
     turns: tuple[str, ...] | None = None
     weight: float = 1.0
+    record_device: str = "cuda"  # the server that answered: "npu" or "cuda" (see record_device)
 
     @property
     def key(self) -> str:
@@ -339,6 +340,21 @@ class CallRef:
     def uid(self) -> str:
         """Unique across roots: two rounds can record the same episode."""
         return f"{self.record_path}#{self.call_index}"
+
+
+def record_device(record: EpisodeRecord) -> str:
+    """Which accelerator served this record's calls: ``npu`` or ``cuda``.
+
+    The Ascend servers advertise ``heatmapvln-device:npu`` in their formats; the 4090's
+    own local servers carry no device tag.  Replaying a call on another platform than
+    the one that answered it is not an alignment test (CUDA and NPU numerics differ by a
+    few pixels on about 5% of answers, EXP-23 run 4).
+    """
+    formats = (record.episode.get("server") or {}).get("supported_formats") or []
+    for item in formats:
+        if str(item).startswith("heatmapvln-device:"):
+            return str(item).split(":", 1)[1]
+    return "cuda"
 
 
 def _pair_label_roots(
@@ -399,6 +415,7 @@ def index_calls(
                 stats["calls_without_label"] += len(record.calls)
                 continue
             stats["episodes"] += 1
+            device = record_device(record)
             for call in record.calls:
                 index = int(call["call_index"])
                 label = labels.get(index)
@@ -418,6 +435,7 @@ def index_calls(
                         recorded=recorded_turns(call),
                         distance_to_goal=float(distance) if distance is not None else None,
                         label=label,
+                        record_device=device,
                     )
                 )
                 stats["calls"] += 1
@@ -791,6 +809,7 @@ __all__ = [
     "normalize_label",
     "pil_from_jpeg",
     "pixel_uv",
+    "record_device",
     "recorded_turns",
     "select_training_refs",
     "summarize_refs",

@@ -175,6 +175,7 @@ def push(args: argparse.Namespace) -> int:
             except queue.Empty:
                 return
             attempts = 0
+            busy_since, last_note = 0.0, 0.0
             while True:
                 try:
                     reply = _push_one(port, src, name, args.timeout)
@@ -185,6 +186,11 @@ def push(args: argparse.Namespace) -> int:
                         print(f"{time.strftime('%H:%M:%S')} {reply} {name} port={port}", flush=True)
                     break
                 if reply == "BUSY":
+                    busy_since = busy_since or time.time()
+                    if time.time() - last_note >= 60:
+                        with lock:  # a stall shows up in the log instead of retrying silently
+                            print(f"{time.strftime('%H:%M:%S')} BUSY {name} port={port} for {time.time() - busy_since:.0f}s", flush=True)
+                        last_note = time.time()
                     time.sleep(args.busy_sleep)  # the buffer is full: the trainer has not caught up
                     continue
                 attempts += 1
