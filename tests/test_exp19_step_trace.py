@@ -325,7 +325,7 @@ def test_client_records_every_action_site_with_its_call_index():
     call_index = ast.dump(ast.parse("system2_calls - 1", mode="eval").body)
     none = ast.dump(ast.parse("None", mode="eval").body)
     for phase, arg in by_phase.items():
-        expected = none if phase in ("auto_stop", "max_system2_stop") else call_index
+        expected = none if phase in ("auto_stop", "max_system2_stop", "step_budget_stop") else call_index
         assert arg == expected, phase
     # env.step executions in the RPC loop == traced action sites (lookdown capture is a helper, not here).
     applies = [

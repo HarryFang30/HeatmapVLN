@@ -4255,6 +4255,11 @@ def run_eval_rpc_panoramic(args):
     image_size = vlm_image_size
     num_history = args.num_history
     max_steps_per_episode = args.max_steps_per_episode
+    # An episode that runs out of steps without calling STOP scores 0 however close it ends
+    # (Habitat's Success needs is_stop_called).  With --stop_at_step_budget the last action of
+    # the budget is reserved for STOP, so the episode still takes max_steps_per_episode actions.
+    stop_at_step_budget = bool(getattr(args, "stop_at_step_budget", False))
+    movement_step_limit = max_steps_per_episode - int(stop_at_step_budget)
     system1_coord_order = _system1_coord_order(args, panoramic_internnav_protocol=False)
     rpc_policy_mode = str(args.rpc_policy_mode)
     native_internnav_rpc = rpc_policy_mode == RPC_POLICY_INTERNNAV_NATIVE
@@ -4627,6 +4632,9 @@ def run_eval_rpc_panoramic(args):
         "habitat_turn_angle_deg": habitat_turn_angle_deg,
         "history_pose_source": str(args.history_pose_source),
     }
+    if stop_at_step_budget:
+        # Only when on, so runs without the flag keep the exact row schema they always had.
+        rpc_progress_contract["stop_at_step_budget"] = True
     sucs, spls, oss, nes, done_set = _load_progress(
         progress_file,
         expected_rpc_sampling_contract=rpc_progress_contract,
@@ -4760,7 +4768,7 @@ def run_eval_rpc_panoramic(args):
                 env, episode, scene_id=scene_id, episode_id=episode_id, instruction=instruction
             )
 
-        while (not done) and (step_id < max_steps_per_episode):
+        while (not done) and (step_id < movement_step_limit):
             sys.stdout.flush()
             current_vo_frame_id: int | None = None
             if vo_bridge is not None:
@@ -5108,7 +5116,7 @@ def run_eval_rpc_panoramic(args):
                 )
 
                 for alignment_action in alignment_actions:
-                    if done or step_id >= max_steps_per_episode:
+                    if done or step_id >= movement_step_limit:
                         break
                     before = _env_trace_summary(env) if _debug_input_trace_enabled(args) else None
                     observations, done = _apply_habitat_action(env, alignment_action)
@@ -5144,7 +5152,7 @@ def run_eval_rpc_panoramic(args):
                             call_index=system2_calls - 1,
                         )
 
-                if done or step_id >= max_steps_per_episode:
+                if done or step_id >= movement_step_limit:
                     continue
 
                 if alignment_actions:
@@ -5502,6 +5510,27 @@ def run_eval_rpc_panoramic(args):
                     env, step_id, action=first_action, phase="rpc_first_action", call_index=system2_calls - 1
                 )
 
+        step_budget_stop = stop_at_step_budget and not done
+        if step_budget_stop:
+            with _timed(timing_log, "env_step"):
+                observations, done = _apply_habitat_action(env, ActionCode.STOP)
+            if step_tracer is not None:
+                step_tracer.record_action(step_id, int(ActionCode.STOP), "step_budget_stop", None)
+            step_id += 1
+            print(f"  [step-budget] STOP at step {step_id} of {max_steps_per_episode}", flush=True)
+            _record_post_action_step(
+                step_recorder,
+                env,
+                step_id=step_id,
+                phase="step_budget_stop",
+                action=int(ActionCode.STOP),
+                image_size=image_size,
+            )
+            if s2_recorder is not None:
+                s2_recorder.add_step(
+                    env, step_id, action=ActionCode.STOP, phase="step_budget_stop", call_index=None
+                )
+
         if timing_log is not None:
             timing_log.end_episode(step_id)
         if dagger_episode_active:
@@ -5605,6 +5634,9 @@ def run_eval_rpc_panoramic(args):
             "ppa_warmup_calls": int(ppa_warmup_calls),
             "cognition_applied_calls": int(cognition_applied_calls),
         }
+        if stop_at_step_budget:
+            result["stop_at_step_budget"] = True
+            result["step_budget_stop"] = bool(step_budget_stop)
         if s2_record_summary is not None:
             result["s2_record"] = s2_record_summary
         if stage0_action_trace:
@@ -5662,6 +5694,8 @@ def run_eval_rpc_panoramic(args):
             "history_pose_source": str(args.history_pose_source),
         }
     )
+    if stop_at_step_budget:
+        final_result["stop_at_step_budget"] = True
 
     print("\n" + "=" * 60)
     print("Final Results:")
@@ -6367,6 +6401,16 @@ def main():
         help="Execute Habitat STOP once distance_to_goal is within this threshold; set <=0 to disable.",
     )
     parser.add_argument(
+        "--stop_at_step_budget",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "RPC path only: reserve the last of --max_steps_per_episode actions for STOP, so an "
+            "episode that runs out of steps ends with STOP where it stands instead of without one. "
+            "Uses no privileged state."
+        ),
+    )
+    parser.add_argument(
         "--max_system2_calls_per_episode",
         type=int,
         default=0,
@@ -6512,6 +6556,11 @@ def main():
         raise RuntimeError("--oracle_system2 currently requires --rpc_server")
     if args.step_state_trace_dir is not None and not args.rpc_server:
         raise ValueError("--step_state_trace_dir is wired into the RPC path only; it requires --rpc_server")
+    if args.stop_at_step_budget:
+        if not args.rpc_server:
+            raise ValueError("--stop_at_step_budget is wired into the RPC path only; it requires --rpc_server")
+        if int(args.max_steps_per_episode) < 2:
+            raise ValueError("--stop_at_step_budget needs --max_steps_per_episode >= 2")
     if not args.rpc_server:
         _preflight_checkpoint_args(args)
     _resolve_eval_paths(args, split=args.dataset_split)
