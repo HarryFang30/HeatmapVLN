@@ -48,3 +48,6 @@ docker exec fjl-habitat bash -lc "cd /workspace/exp20/src_3ffd382 && /opt/conda/
 
 - 默认点：从 A0 种子 42 全量（`/workspace/eval_runs/exp20_a0_seed42_4090/merged/progress.jsonl`）里取这 500 集。
 - 每个点与默认点按集配对，用 `scripts/tools/paired_closed_loop_bootstrap.py` 做 2000 次重采样。
+- 逐集文件在容器 `/workspace/exp21/analysis/<平台>_<点>.jsonl`，每集一行：4090 的点是该点 8 个
+  `workers/shard_0*/progress.json` 的行，`4090_default` 是上面那 500 集。配对 bootstrap 读的就是它们
+  （`boot_<平台>_<点>.json` 里记着输入）。
