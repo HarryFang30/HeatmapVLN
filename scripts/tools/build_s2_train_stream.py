@@ -123,6 +123,8 @@ def main(argv=None) -> int:
     parser.add_argument("--replay-fraction", type=float, default=0.3)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=float, default=1.0, help="expected passes over the selected DAgger calls")
+    parser.add_argument("--total-samples", type=int, default=0,
+                        help="draw exactly this many samples (rounded up to whole shards) instead of --epochs")
     parser.add_argument("--shard-size", type=int, default=256)
     parser.add_argument("--global-batch", type=int, default=64)
     parser.add_argument("--world-size", type=int, default=8)
@@ -183,7 +185,10 @@ def main(argv=None) -> int:
             replay_counts["samples"] = len(replay)
             replay_counts["scenes"] = len({i["sample"]["scene_id"] for i in replay})
 
-    total = math.ceil(args.epochs * len(selected) / (1.0 - (args.replay_fraction if replay_counts["samples"] else 0.0)))
+    if args.total_samples:
+        total = int(args.total_samples)
+    else:
+        total = math.ceil(args.epochs * len(selected) / (1.0 - (args.replay_fraction if replay_counts["samples"] else 0.0)))
     total = math.ceil(total / args.shard_size) * args.shard_size
     order = draw_order(weights, total, args.seed)
     drawn = Counter()
@@ -215,6 +220,7 @@ def main(argv=None) -> int:
         "global_batch": args.global_batch,
         "world_size": args.world_size,
         "epochs": args.epochs,
+        "total_samples_requested": args.total_samples,
         "replay_fraction": args.replay_fraction,
         "holdout": {"scenes": list(holdout), "salt": args.holdout_salt, "count": len(holdout)},
         "record_roots": [str(Path(r).resolve()) for r in args.record_root],

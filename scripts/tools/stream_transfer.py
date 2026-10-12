@@ -35,7 +35,7 @@ import threading
 import time
 from pathlib import Path
 
-NAME = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$")
+NAME = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+){0,2}$")  # e.g. records/<scene>/<file>
 CHUNK = 1 << 20
 
 

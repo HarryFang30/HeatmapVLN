@@ -156,7 +156,7 @@ def test_transfer_pushes_verifies_backs_off_and_skips(tmp_path):
             assert sock.makefile("rb").readline().strip() == b"BAD"
         time.sleep(0.05)
         assert sorted(p.name for p in dest.iterdir()) == ["b.tar"]
-        for name in ("../escape", "a/b/c", "/abs"):  # only a name or one subdir level, never upward
+        for name in ("../escape", "a/../../b", "a/b/c/d", "/abs"):  # at most two subdir levels, never upward
             with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
                 sock.sendall(json.dumps({"name": name, "size": 1, "sha256": "0" * 64}).encode() + b"\n")
                 assert sock.makefile("rb").readline().strip() == b"BAD"
