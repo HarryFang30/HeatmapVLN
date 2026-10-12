@@ -38,6 +38,7 @@ from src.data.s2_sft_dataset import (  # noqa: E402
     DEFAULT_DISAGREE_WEIGHT,
     DEFAULT_HOLDOUT_COUNT,
     DEFAULT_MAX_CALLS_PER_EPISODE,
+    DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE,
     DEFAULT_VLM_IMAGE_SIZE,
     HOLDOUT_SALT,
     RecordCache,
@@ -126,6 +127,7 @@ def main(argv=None) -> int:
     parser.add_argument("--global-batch", type=int, default=64)
     parser.add_argument("--world-size", type=int, default=8)
     parser.add_argument("--max-calls-per-episode", type=int, default=DEFAULT_MAX_CALLS_PER_EPISODE)
+    parser.add_argument("--max-stop-corrections-per-episode", type=int, default=DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE)
     parser.add_argument("--agree-weight", type=float, default=DEFAULT_AGREE_WEIGHT)
     parser.add_argument("--disagree-weight", type=float, default=DEFAULT_DISAGREE_WEIGHT)
     parser.add_argument("--holdout-count", type=int, default=DEFAULT_HOLDOUT_COUNT)
@@ -154,6 +156,7 @@ def main(argv=None) -> int:
         agree_weight=args.agree_weight,
         disagree_weight=args.disagree_weight,
         seed=args.seed,
+        max_stop_corrections_per_episode=args.max_stop_corrections_per_episode,
     )
     if not selected:
         raise SystemExit(f"no DAgger calls selected (index {dict(index_stats)}, selection {dict(select_stats)})")

@@ -64,6 +64,7 @@ from src.data.s2_sft_dataset import (  # noqa: E402
     DEFAULT_DISAGREE_WEIGHT,
     DEFAULT_HOLDOUT_COUNT,
     DEFAULT_MAX_CALLS_PER_EPISODE,
+    DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE,
     DEFAULT_VLM_IMAGE_SIZE,
     HOLDOUT_SALT,
     IGNORE_INDEX,
@@ -627,6 +628,7 @@ def train(args: argparse.Namespace, rt: Runtime) -> int:
             agree_weight=args.agree_weight,
             disagree_weight=args.disagree_weight,
             seed=args.seed,
+            max_stop_corrections_per_episode=args.max_stop_corrections_per_episode,
         )
         return selected, index_stats, select_stats
 
@@ -658,6 +660,7 @@ def train(args: argparse.Namespace, rt: Runtime) -> int:
         "steps_per_epoch": steps_per_epoch,
         "total_steps": total_steps,
         "max_calls_per_episode": args.max_calls_per_episode,
+        "max_stop_corrections_per_episode": args.max_stop_corrections_per_episode,
         "agree_weight": args.agree_weight,
         "disagree_weight": args.disagree_weight,
         "seed": args.seed,
@@ -1086,6 +1089,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=float, default=1.0, help="in weighted draws of len(selected) calls")
     parser.add_argument("--max-steps", type=int, default=None, help="optimizer steps; overrides --epochs (0 = save the init adapter)")
     parser.add_argument("--max-calls-per-episode", type=int, default=DEFAULT_MAX_CALLS_PER_EPISODE)
+    parser.add_argument("--max-stop-corrections-per-episode", type=int, default=DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE)
     parser.add_argument("--agree-weight", type=float, default=DEFAULT_AGREE_WEIGHT)
     parser.add_argument("--disagree-weight", type=float, default=DEFAULT_DISAGREE_WEIGHT)
     parser.add_argument("--limit-samples", type=int, default=0, help="smoke runs only")

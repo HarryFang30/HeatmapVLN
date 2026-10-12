@@ -471,3 +471,22 @@ def test_released_processor_prefix_and_labels(turns):
     text = processor.tokenizer.decode(supervised, skip_special_tokens=False)
     assert text == "".join(t + "<|im_end|>" for t in turns)
     assert sample["image_grid_thw"].shape[0] == len(images) + (len(turns) == 2)
+
+
+def test_only_the_earliest_stop_corrections_of_an_episode_are_kept(tmp_path):
+    # An agent spinning at the goal is corrected to STOP on every call; keep the first few.
+    calls = _calls(10)
+    path = _write_record(tmp_path / "rec", "1LXtFkjw3qL", 0, calls)
+    rows = [{"call_index": c["call_index"], "agree": False, "oracle_kind": "stop", "oracle_turn1": "STOP",
+             "oracle_turn2": None, "distance_to_goal": 1.0} for c in calls[:8]]
+    rows += [{"call_index": 8, "agree": True, "oracle_kind": "pixel", "oracle_turn1": "↓", "oracle_turn2": "245 320",
+              "distance_to_goal": 5.0},
+             {"call_index": 9, "agree": False, "oracle_kind": "turn", "oracle_turn1": "→", "oracle_turn2": None,
+              "distance_to_goal": 5.0}]
+    _write_labels(path, tmp_path / "lab", rows)
+    refs, _ = index_calls([tmp_path / "rec"], [tmp_path / "lab"], split="train", holdout=())
+    selected, stats = select_training_refs(refs, max_stop_corrections_per_episode=3)
+    assert [r.call_index for r in selected] == [0, 1, 2, 8, 9]
+    assert stats["dropped_stop_corrections"] == 5
+    everything, _ = select_training_refs(refs, max_stop_corrections_per_episode=None)
+    assert len(everything) == 10

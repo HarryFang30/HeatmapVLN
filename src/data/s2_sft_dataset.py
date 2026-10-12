@@ -85,6 +85,10 @@ STOP_TEXT = "STOP"
 # a request carries no vlm_image_size.  Records normally carry their own.
 DEFAULT_VLM_IMAGE_SIZE = (384, 384)
 DEFAULT_MAX_CALLS_PER_EPISODE = 48
+# An agent spinning inside the goal zone yields one STOP correction per call (32 of the
+# first smoke episode's 60 calls were such near-duplicates); the earliest few carry the
+# lesson "stop when you get here".
+DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE = 4
 DEFAULT_AGREE_WEIGHT = 1.0
 DEFAULT_DISAGREE_WEIGHT = 3.0
 DEFAULT_HOLDOUT_COUNT = 6
@@ -431,12 +435,15 @@ def select_training_refs(
     agree_weight: float = DEFAULT_AGREE_WEIGHT,
     disagree_weight: float = DEFAULT_DISAGREE_WEIGHT,
     seed: int = 0,
+    max_stop_corrections_per_episode: int | None = DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE,
 ) -> tuple[list[CallRef], Counter]:
     """Labelled, unskipped calls with targets and weights; at most N per episode.
 
-    Over-long episodes keep a seeded uniform subset (not, say, their disagreements
-    first): a loop episode is mostly disagreements about the same place, which is
-    exactly what the cap is for.
+    Only the earliest ``max_stop_corrections_per_episode`` calls an episode got wrong
+    by not stopping are kept (the rest are the same spin at the goal).  Over-long
+    episodes then keep a seeded uniform subset (not, say, their disagreements first):
+    a loop episode is mostly disagreements about the same place, which is exactly
+    what the cap is for.
     """
     stats: Counter = Counter()
     by_episode: "OrderedDict[str, list[CallRef]]" = OrderedDict()
@@ -450,6 +457,17 @@ def select_training_refs(
         by_episode.setdefault(ref.record_path, []).append(ref)
     selected: list[CallRef] = []
     for episode, calls in by_episode.items():
+        if max_stop_corrections_per_episode is not None:
+            kept, stops = [], 0
+            for ref in sorted(calls, key=lambda r: r.call_index):
+                corrected_to_stop = ref.label.agree is False and training_turns(ref.recorded, ref.label) == (STOP_TEXT,)
+                if corrected_to_stop:
+                    stops += 1
+                    if stops > max_stop_corrections_per_episode:
+                        stats["dropped_stop_corrections"] += 1
+                        continue
+                kept.append(ref)
+            calls = kept
         if max_calls_per_episode is not None and len(calls) > max_calls_per_episode:
             stats["capped_episodes"] += 1
             stats["dropped_by_cap"] += len(calls) - max_calls_per_episode
