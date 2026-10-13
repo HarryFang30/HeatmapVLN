@@ -162,3 +162,31 @@ def test_transfer_pushes_verifies_backs_off_and_skips(tmp_path):
                 assert sock.makefile("rb").readline().strip() == b"BAD"
     finally:
         server.shutdown()
+
+
+def test_push_into_a_foreign_listener_waits_and_never_counts_as_pushed(tmp_path, capsys):
+    import socketserver
+
+    from scripts.tools import stream_transfer as st
+
+    class Foreign(socketserver.StreamRequestHandler):  # what round 1 met: a model server on the port
+        def handle(self):
+            self.rfile.readline()
+            self.wfile.write(b"\x80\x04\x95\xfe\xff not a receiver\n")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.tar").write_bytes(b"x" * 10)
+    (tmp_path / "list").write_text("a.tar\n")
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Foreign)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert st._push_one(port, src, "a.tar", 10).startswith("FOREIGN")
+        code = st.main(["push", "--src", str(src), "--ports", str(port), "--files", str(tmp_path / "list"),
+                        "--retries", "2", "--foreign-sleep", "0"])
+    finally:
+        server.shutdown()
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "not a receiver yet" in out and "FAIL a.tar: FOREIGN" in out and "push finished: 0/1 ok" in out

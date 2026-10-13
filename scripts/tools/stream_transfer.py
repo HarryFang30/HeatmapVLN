@@ -18,6 +18,12 @@ Protocol, one file per connection: the client sends one JSON line
 ``{"name", "size", "sha256"}``; the server answers ``GO``, ``BUSY`` or
 ``EXISTS``; after ``GO`` exactly ``size`` bytes follow and the server answers
 ``DONE`` or ``BAD``.
+
+A reply outside that vocabulary means something else holds the port -- in EXP-23
+the 910B's model servers, which keep the tunnel ports until the collection is
+over (round 1 pushed into them and read garbage).  The pusher treats it like no
+receiver yet: it waits ``--foreign-sleep`` and retries, and only a file the
+receiver answered DONE or EXISTS for counts as pushed.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from pathlib import Path
 
 NAME = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+){0,2}$")  # e.g. records/<scene>/<file>
 CHUNK = 1 << 20
+REPLIES = frozenset({"GO", "BUSY", "EXISTS", "DONE", "BAD"})
 
 
 def _sha256(path: Path) -> str:
@@ -146,13 +153,22 @@ def _push_one(port: int, src: Path, name: str, timeout: float) -> str:
     header = json.dumps({"name": name, "size": size, "sha256": _sha256(path)}).encode() + b"\n"
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
         sock.sendall(header)
-        reply = sock.makefile("rb").readline().strip().decode()
+        reply = _reply(sock)
         if reply != "GO":
-            return reply or "NOREPLY"
+            return reply
         with open(path, "rb") as handle:
             for chunk in iter(lambda: handle.read(CHUNK), b""):
                 sock.sendall(chunk)
-        return sock.makefile("rb").readline().strip().decode() or "NOREPLY"
+        return _reply(sock)
+
+
+def _reply(sock: socket.socket) -> str:
+    """The receiver's one-line answer; ``FOREIGN ...`` for anything outside the protocol."""
+    line = sock.makefile("rb").readline(64).strip()
+    reply = line.decode("ascii", errors="replace")
+    if reply in REPLIES:
+        return reply
+    return f"FOREIGN {line[:16]!r}" if line else "NOREPLY"
 
 
 def push(args: argparse.Namespace) -> int:
@@ -166,6 +182,7 @@ def push(args: argparse.Namespace) -> int:
     for name in names:
         work.put(name)
     failed: list[str] = []
+    pushed: list[str] = []
     lock = threading.Lock()
 
     def worker(port: int) -> None:
@@ -179,10 +196,11 @@ def push(args: argparse.Namespace) -> int:
             while True:
                 try:
                     reply = _push_one(port, src, name, args.timeout)
-                except OSError as err:
-                    reply = f"ERR {err}"
+                except Exception as err:  # noqa: BLE001 -- a dead worker would strand its queue
+                    reply = f"ERR {type(err).__name__}: {err}"
                 if reply in ("DONE", "EXISTS"):
                     with lock:
+                        pushed.append(name)
                         print(f"{time.strftime('%H:%M:%S')} {reply} {name} port={port}", flush=True)
                     break
                 if reply == "BUSY":
@@ -199,15 +217,19 @@ def push(args: argparse.Namespace) -> int:
                         failed.append(name)
                         print(f"FAIL {name}: {reply}", flush=True)
                     break
-                time.sleep(10)
+                if reply.startswith("FOREIGN") and time.time() - last_note >= 60:
+                    with lock:
+                        print(f"{time.strftime('%H:%M:%S')} port={port} is not a receiver yet ({reply}); waiting", flush=True)
+                    last_note = time.time()
+                time.sleep(args.foreign_sleep if reply.startswith("FOREIGN") else 10)
 
     threads = [threading.Thread(target=worker, args=(int(p),)) for p in args.ports.split(",")]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    print(f"push finished: {len(names) - len(failed)}/{len(names)} ok", flush=True)
-    return 1 if failed else 0
+    print(f"push finished: {len(pushed)}/{len(names)} ok", flush=True)
+    return 0 if len(pushed) == len(names) else 1
 
 
 def main(argv=None) -> int:
@@ -223,6 +245,7 @@ def main(argv=None) -> int:
     p.add_argument("--start-shard", type=int, default=0)
     p.add_argument("--files", default="", help="push these paths (relative to --src, one per line) instead of a stream")
     p.add_argument("--busy-sleep", type=float, default=15.0)
+    p.add_argument("--foreign-sleep", type=float, default=60.0, help="wait after a reply from something that is not a receiver")
     p.add_argument("--retries", type=int, default=5)
     p.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args(argv)

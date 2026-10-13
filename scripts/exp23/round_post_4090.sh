@@ -13,10 +13,14 @@
 # Phases:
 #   1. wait for $ROUND_DIR/STOPPED_AT_N (scripts' stop_at_n) and for the replay pull;
 #   2. relabel every record (idempotent; the rules digest decides) and pack the stream;
-#   3. push the held-out records + labels (then HOLDOUT_DONE) and, in the background,
-#      the stream, through the tunnels (the pushers wait for the 910B receivers);
-#   4. identity check: the new code serving no adapter on the first episodes of shard 0,
+#   3. identity check: the new code serving no adapter on the first episodes of shard 0,
 #      call for call against A0 seed 42 (EXP-20) -- the pairing below assumes it;
+#   4. PUSH_AFTER_S after the collection stopped (the 910B's idle window plus the time
+#      it takes to stop its servers), push the held-out records + labels (then
+#      HOLDOUT_DONE) and, in the background, the stream, through the tunnels.  Until
+#      then the tunnel ports lead to the 910B's model servers: round 1 pushed into them,
+#      read garbage and reported success, and the 910B waited 90 min for a stream.  A
+#      push that still meets them now waits (stream_transfer.py, FOREIGN replies);
 #   5. fetch adapter_r$ROUND from the 910B's export port;
 #   6. full val_unseen with the adapter, seed 42 then seed 1337, each paired against the
 #      A0 run of its seed; paired_progress_monitor.py stops a run whose SR is >= 3 pt
@@ -38,6 +42,10 @@ EVAL_GPUS="${EXP23_EVAL_GPUS:-5,4,0}"
 CANARY_GPU="${EXP23_CANARY_GPU:-5}"
 SEEDS="${EXP23_SEEDS:-42 1337}"
 EVAL_ROOT="${EXP23_EVAL_ROOT:-/workspace/eval_runs}"
+# The 910B stops its servers after no client for 900 s (round_train_watch_910b.sh) and
+# needs ~3 min more to free the cards; a push before that would also keep its idle
+# clock from running out.
+PUSH_AFTER_S="${EXP23_PUSH_AFTER_S:-1200}"
 # 1: the closed-loop runs use EXP-24's --stop_at_step_budget (user, 2026-10-13).  The
 # identity check below never does: it is about the code, against A0's protocol.  The
 # paired monitor scores a switched-on run under the standard protocol too (exactly
@@ -76,6 +84,23 @@ rm -rf "$ROUND_DIR/stream"
 chown -R 1015:1015 "$ROUND_DIR"
 
 # 3 -------------------------------------------------------------------------------
+status "identity check against A0 seed 42"
+CANARY="$ROUND_DIR/canary_noadapter"
+rm -rf "$CANARY"
+( cd "$WT" && PPA_EVAL_ROOT=/workspace PPA_EVAL_REPO="$WT" PPA_EVAL_GPU_DEVICES="$CANARY_GPU" PPA_EVAL_SHARDS=0 \
+    PPA_EVAL_MAX_EPISODES_PER_SHARD=3 PPA_EVAL_PROTOCOL_SEED=42 PPA_EVAL_OUTPUT_ROOT="$CANARY" PPA_EVAL_DISPLAY_BASE=380 \
+    bash scripts/run_ppa_r2r_val_unseen_cuda.sh > "$ROUND_DIR/logs/canary.log" 2>&1 )
+"$PYTHON" "$WT/scripts/tools/compare_client_logs.py" --a "${A0_RUN[42]}/runtime/*/logs/client_shard_*.log" \
+  --b "$CANARY/runtime/*/logs/client_shard_*.log" --out "$ROUND_DIR/canary_identity.json" --require-identical >> "$LOG" 2>&1 \
+  || die "the new code without an adapter does not reproduce A0 call for call (see canary_identity.json); pairing invalid"
+log "identity check passed"
+
+# 4 -------------------------------------------------------------------------------
+pushable=$(( $(stat -c %Y "$ROUND_DIR/STOPPED_AT_N") + PUSH_AFTER_S ))
+if (( $(date +%s) < pushable )); then
+  status "waiting until $(date -u -d "@$pushable" +%FT%TZ) for the 910B receivers"
+  while (( $(date +%s) < pushable )); do sleep 30; done
+fi
 status "pushing"
 ( cd "$WT" && "$PYTHON" scripts/tools/stream_transfer.py push --src "$ROUND_DIR/stream" --ports "$STREAM_PORTS" \
     --retries 1000000 --busy-sleep 15 > "$ROUND_DIR/logs/push_stream.log" 2>&1 ) &
@@ -105,18 +130,6 @@ echo HOLDOUT_DONE > "$ROUND_DIR/holdout_done.list"
     --files "$ROUND_DIR/holdout_done.list" --retries 1000000 >> "$ROUND_DIR/logs/push_holdout.log" 2>&1 ) \
   || die "pushing HOLDOUT_DONE failed"
 log "held-out records pushed"
-
-# 4 -------------------------------------------------------------------------------
-status "identity check against A0 seed 42"
-CANARY="$ROUND_DIR/canary_noadapter"
-rm -rf "$CANARY"
-( cd "$WT" && PPA_EVAL_ROOT=/workspace PPA_EVAL_REPO="$WT" PPA_EVAL_GPU_DEVICES="$CANARY_GPU" PPA_EVAL_SHARDS=0 \
-    PPA_EVAL_MAX_EPISODES_PER_SHARD=3 PPA_EVAL_PROTOCOL_SEED=42 PPA_EVAL_OUTPUT_ROOT="$CANARY" PPA_EVAL_DISPLAY_BASE=380 \
-    bash scripts/run_ppa_r2r_val_unseen_cuda.sh > "$ROUND_DIR/logs/canary.log" 2>&1 )
-"$PYTHON" "$WT/scripts/tools/compare_client_logs.py" --a "${A0_RUN[42]}/runtime/*/logs/client_shard_*.log" \
-  --b "$CANARY/runtime/*/logs/client_shard_*.log" --out "$ROUND_DIR/canary_identity.json" --require-identical >> "$LOG" 2>&1 \
-  || die "the new code without an adapter does not reproduce A0 call for call (see canary_identity.json); pairing invalid"
-log "identity check passed"
 
 # 5 -------------------------------------------------------------------------------
 status "waiting for adapter_r$ROUND from the 910B"
