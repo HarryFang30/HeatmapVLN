@@ -490,3 +490,9 @@ def test_only_the_earliest_stop_corrections_of_an_episode_are_kept(tmp_path):
     assert stats["dropped_stop_corrections"] == 5
     everything, _ = select_training_refs(refs, max_stop_corrections_per_episode=None)
     assert len(everything) == 10
+    # STOP corrections can be weighted on their own; other disagreements keep theirs.
+    light, _ = select_training_refs(refs, max_stop_corrections_per_episode=3, disagree_weight=3.0,
+                                    stop_correction_weight=1.0)
+    assert [(r.call_index, r.weight) for r in light] == [(0, 1.0), (1, 1.0), (2, 1.0), (8, 1.0), (9, 3.0)]
+    default, _ = select_training_refs(refs, max_stop_corrections_per_episode=3, disagree_weight=3.0)
+    assert [r.weight for r in default] == [3.0, 3.0, 3.0, 1.0, 3.0]

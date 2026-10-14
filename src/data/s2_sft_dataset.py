@@ -454,8 +454,14 @@ def select_training_refs(
     disagree_weight: float = DEFAULT_DISAGREE_WEIGHT,
     seed: int = 0,
     max_stop_corrections_per_episode: int | None = DEFAULT_MAX_STOP_CORRECTIONS_PER_EPISODE,
+    stop_correction_weight: float | None = None,
 ) -> tuple[list[CallRef], Counter]:
     """Labelled, unskipped calls with targets and weights; at most N per episode.
+
+    ``stop_correction_weight`` weighs a disagreement whose target is STOP on its own
+    (None: like any disagreement).  Round 1 trained STOP corrections at the disagreement
+    weight and its adapter called STOP on 19% of held-out calls against the base model's
+    3%, with 4x the false stops beyond 3 m (EXP-23 run record 12).
 
     Only the earliest ``max_stop_corrections_per_episode`` calls an episode got wrong
     by not stopping are kept (the rest are the same spin at the goal).  Over-long
@@ -501,6 +507,8 @@ def select_training_refs(
             call_turns = training_turns(ref.recorded, ref.label)
             agree = bool(ref.label.agree)
             weight = float(agree_weight if agree else disagree_weight)
+            if not agree and stop_correction_weight is not None and call_turns == (STOP_TEXT,):
+                weight = float(stop_correction_weight)
             selected.append(dataclasses.replace(ref, turns=call_turns, weight=weight))
             stats["agree" if agree else "disagree"] += 1
             stats[f"target_{decision_class(call_turns[-1])}"] += 1
