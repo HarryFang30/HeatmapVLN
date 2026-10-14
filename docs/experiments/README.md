@@ -2515,7 +2515,20 @@ C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz
     每动作 1421.3 → 1266.1（−10.9%）。四个跑视觉塔的阶段各省 181 / 220 / 180 / 199 ms，其余阶段不动。
     按路径分组佐证：只跑 1 趟塔的 `system2_only` 省 183 ms，跑 3 趟的 `native_system1` 省 538 ms，跑 4 趟的 `ppa` 省 755 ms。
   - 汇总 JSON：[exp20-latency-arm-off-4090.json](exp20-latency-arm-off-4090.json)、[exp20-latency-arm-on-4090.json](exp20-latency-arm-on-4090.json)。
-- **能支撑到哪一步**：补丁在 4090 上值约 **0.75 s/次规划**，且在这 4 集 99 次调用上不改任何决定。
+- **第三臂：flash-attention 2（2026-10-13，用户装好之后加测）**。flash-attn 2.8.3.post1 不在 site-packages，
+  编在 `6024_fjl:/workspace/fa_build/site`，靠 `PYTHONPATH` 带入；配置 `model.llm.attn_implementation`
+  改成 `flash_attention_2`，加 `HEATMAPVLN_REQUIRE_FLASH_ATTN=1`，并核对日志 `(attn=flash_attention_2)`
+  且 `Attention fallback` 为 0 —— 这条路会静默回落 sdpa。
+  - **结果**：模型服务端 **3498.9 → 1865.7 ms（−46.7%）**，规划关键路径 5107.8 → 3472.0（−32.0%），
+    每动作 1421.3 → 1017.1（−28.4%）。四个跑视觉塔的阶段各省 349 / 464 / 353 / 466 ms，桥、NextDiT、
+    里程计、渲染不动；显存几乎不变（峰值保留 21800 → 21756 MiB）。
+  - **代价**：FA2 与 SDPA 在 bf16 下不是同一串数，**逐调用判据不过** —— 4 集的相同前缀只有 1 / 5 / 7 / 11 次调用，
+    调用数 99 → 82。汇总 SR 都是 100，SPL 87.0 → 93.43、NE 0.913 → 0.706，但这是 4 集，
+    **不能读成 FA2 更准**（完整模型换个种子就差 1.96 pt）。
+  - 汇总 JSON：[exp20-latency-arm-flash2-4090.json](exp20-latency-arm-flash2-4090.json)。
+- **能支撑到哪一步**：掩码补丁在 4090 上值约 **0.75 s/次规划**，且在这 4 集 99 次调用上不改任何决定；
+  FA2 值约 **1.63 s/次规划**，但它改决定，所以它的时间数和 SDPA 的 SR/SPL 不能并列引用。
+  要把 FA2 当部署配置，得用它自己跑一遍全量 1839 集。
   **不能**据此把补丁设成部署默认：全量 1839 集那张表是不带补丁跑的，SR / SPL 仍然只认那次运行；
   真要换默认，得在更大的样本上按同一判据再过一次。
 
