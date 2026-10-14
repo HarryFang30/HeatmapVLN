@@ -1,0 +1,1163 @@
+{
+  "schema": "heatmapvln-latency-summary-v1",
+  "sources": [
+    "/workspace/lat_1013/arm_on/workers/shard_00/timing/client_20261014_004821_788344.jsonl",
+    "/workspace/lat_1013/arm_on/workers/shard_01/timing/client_20261014_005141_789312.jsonl"
+  ],
+  "calls": 99,
+  "actions_executed": 337,
+  "server_timing_missing": {
+    "model_server_calls": 0,
+    "model_server_calls_seen": 99,
+    "vo_rpcs": 0,
+    "vo_rpcs_seen": 436
+  },
+  "groups": {
+    "ppa": {
+      "calls": 52,
+      "actions_executed": 196,
+      "per_call": {
+        "model": {
+          "n": 52,
+          "mean": 2858.713,
+          "median": 2789.531,
+          "p90": 2839.602
+        },
+        "vo": {
+          "n": 52,
+          "mean": 1472.699,
+          "median": 1448.675,
+          "p90": 1789.342
+        },
+        "simulator": {
+          "n": 52,
+          "mean": 700.751,
+          "median": 700.731,
+          "p90": 797.009
+        },
+        "timed_total": {
+          "n": 52,
+          "mean": 5032.163,
+          "median": 4984.525,
+          "p90": 5501.871
+        },
+        "cycle_wall": {
+          "n": 52,
+          "mean": 5033.279,
+          "median": 4985.648,
+          "p90": 5502.953
+        },
+        "untimed": {
+          "n": 52,
+          "mean": 1.117,
+          "median": 1.096,
+          "p90": 1.297
+        },
+        "plan_latency": {
+          "n": 52,
+          "mean": 4471.498,
+          "median": 4399.025,
+          "p90": 4894.063
+        },
+        "model_server": {
+          "n": 52,
+          "mean": 2814.134,
+          "median": 2744.163,
+          "p90": 2801.015
+        },
+        "model_rpc_overhead": {
+          "n": 52,
+          "mean": 14.325,
+          "median": 8.127,
+          "p90": 34.108
+        }
+      },
+      "per_action": {
+        "model": {
+          "n": 52,
+          "mean": 781.742,
+          "median": 699.523,
+          "p90": 938.495,
+          "pooled": 758.434
+        },
+        "vo": {
+          "n": 52,
+          "mean": 399.133,
+          "median": 371.169,
+          "p90": 492.261,
+          "pooled": 390.716
+        },
+        "simulator": {
+          "n": 52,
+          "mean": 188.353,
+          "median": 181.993,
+          "p90": 211.28,
+          "pooled": 185.913
+        },
+        "timed_total": {
+          "n": 52,
+          "mean": 1369.228,
+          "median": 1266.059,
+          "p90": 1598.229,
+          "pooled": 1335.064
+        },
+        "cycle_wall": {
+          "n": 52,
+          "mean": 1369.533,
+          "median": 1266.353,
+          "p90": 1598.596,
+          "pooled": 1335.36
+        }
+      },
+      "model_server": {
+        "request_decode": {
+          "n": 52,
+          "mean": 36.455,
+          "median": 36.322,
+          "p90": 37.947
+        },
+        "system2_turn1_prep": {
+          "n": 52,
+          "mean": 99.572,
+          "median": 81.316,
+          "p90": 83.9
+        },
+        "system2_turn1_generate": {
+          "n": 52,
+          "mean": 488.272,
+          "median": 488.332,
+          "p90": 490.041
+        },
+        "system2_turn2_prep": {
+          "n": 52,
+          "mean": 168.187,
+          "median": 127.828,
+          "p90": 160.388
+        },
+        "system2_turn2_generate": {
+          "n": 52,
+          "mean": 777.219,
+          "median": 779.546,
+          "p90": 783.111
+        },
+        "ppa_history_memory": {
+          "n": 52,
+          "mean": 400.523,
+          "median": 384.369,
+          "p90": 414.026
+        },
+        "system1_condition_latents": {
+          "n": 52,
+          "mean": 638.284,
+          "median": 639.376,
+          "p90": 640.312
+        },
+        "ppa_bridge": {
+          "n": 52,
+          "mean": 1.911,
+          "median": 1.292,
+          "p90": 1.497
+        },
+        "system1_nextdit_sampling": {
+          "n": 52,
+          "mean": 195.295,
+          "median": 194.188,
+          "p90": 198.477
+        },
+        "trajectory_to_actions": {
+          "n": 52,
+          "mean": 0.511,
+          "median": 0.522,
+          "p90": 0.603
+        },
+        "future_heatmap_diagnostics": {
+          "n": 52,
+          "mean": 1.842,
+          "median": 1.776,
+          "p90": 1.83
+        },
+        "handler_total": {
+          "n": 52,
+          "mean": 2814.134,
+          "median": 2744.163,
+          "p90": 2801.015
+        }
+      },
+      "cuda_memory_mib": {
+        "model.peak_allocated": {
+          "n": 52,
+          "median": 17350.9,
+          "max": 17351.2
+        },
+        "model.peak_reserved": {
+          "n": 52,
+          "median": 21800.0,
+          "max": 21800.0
+        },
+        "model.device_used": {
+          "n": 52,
+          "median": 37354.9,
+          "max": 37354.9
+        },
+        "vo.peak_allocated": {
+          "n": 248,
+          "median": 6520.2,
+          "max": 10684.3
+        },
+        "vo.peak_reserved": {
+          "n": 248,
+          "median": 14600.0,
+          "max": 14600.0
+        },
+        "vo.device_used": {
+          "n": 248,
+          "median": 37354.9,
+          "max": 37354.9
+        }
+      },
+      "vo_server": {
+        "ingest_frame.jpeg_decode": {
+          "n": 196,
+          "mean": 3.387,
+          "median": 3.558,
+          "p90": 4.519
+        },
+        "ingest_frame.ingest": {
+          "n": 196,
+          "mean": 7.164,
+          "median": 7.122,
+          "p90": 7.447
+        },
+        "ingest_frame.total": {
+          "n": 196,
+          "mean": 10.67,
+          "median": 10.756,
+          "p90": 11.796
+        },
+        "ingest_frame.round_trip": {
+          "n": 196,
+          "mean": 20.662,
+          "median": 15.997,
+          "p90": 38.466
+        },
+        "query_relative_poses.query_map_update": {
+          "n": 52,
+          "mean": 1372.968,
+          "median": 1360.646,
+          "p90": 1676.559
+        },
+        "query_relative_poses.total": {
+          "n": 52,
+          "mean": 1373.042,
+          "median": 1360.727,
+          "p90": 1676.635
+        },
+        "query_relative_poses.round_trip": {
+          "n": 52,
+          "mean": 1382.418,
+          "median": 1373.63,
+          "p90": 1685.084
+        }
+      },
+      "client": {
+        "plan.pano_capture": {
+          "n": 52,
+          "mean": 127.479,
+          "median": 126.451,
+          "p90": 133.422
+        },
+        "plan.vo_query": {
+          "n": 52,
+          "mean": 1382.601,
+          "median": 1373.806,
+          "p90": 1685.223
+        },
+        "plan.lookdown_capture": {
+          "n": 52,
+          "mean": 102.705,
+          "median": 101.859,
+          "p90": 131.312
+        },
+        "plan.model_encode": {
+          "n": 52,
+          "mean": 30.254,
+          "median": 30.197,
+          "p90": 33.031
+        },
+        "plan.model_rpc": {
+          "n": 52,
+          "mean": 2828.459,
+          "median": 2760.247,
+          "p90": 2808.978
+        },
+        "step.env_step": {
+          "n": 196,
+          "mean": 24.655,
+          "median": 23.543,
+          "p90": 33.987
+        },
+        "step.pano_capture": {
+          "n": 153,
+          "mean": 128.347,
+          "median": 127.892,
+          "p90": 133.029
+        },
+        "step.vo_ingest": {
+          "n": 196,
+          "mean": 23.903,
+          "median": 19.178,
+          "p90": 41.721
+        }
+      }
+    },
+    "native_system1": {
+      "calls": 13,
+      "actions_executed": 51,
+      "per_call": {
+        "model": {
+          "n": 13,
+          "mean": 2438.73,
+          "median": 2419.354,
+          "p90": 3387.511
+        },
+        "vo": {
+          "n": 13,
+          "mean": 763.903,
+          "median": 116.771,
+          "p90": 1932.1
+        },
+        "simulator": {
+          "n": 13,
+          "mean": 799.669,
+          "median": 815.274,
+          "p90": 827.139
+        },
+        "timed_total": {
+          "n": 13,
+          "mean": 4002.302,
+          "median": 3427.797,
+          "p90": 5146.493
+        },
+        "cycle_wall": {
+          "n": 13,
+          "mean": 4003.348,
+          "median": 3428.85,
+          "p90": 5147.702
+        },
+        "untimed": {
+          "n": 13,
+          "mean": 1.046,
+          "median": 1.051,
+          "p90": 1.222
+        },
+        "plan_latency": {
+          "n": 13,
+          "mean": 2720.513,
+          "median": 2692.459,
+          "p90": 3641.875
+        },
+        "model_server": {
+          "n": 13,
+          "mean": 2404.367,
+          "median": 2377.19,
+          "p90": 3351.834
+        },
+        "model_rpc_overhead": {
+          "n": 13,
+          "mean": 9.324,
+          "median": 7.066,
+          "p90": 10.543
+        }
+      },
+      "per_action": {
+        "model": {
+          "n": 13,
+          "mean": 625.191,
+          "median": 607.367,
+          "p90": 854.883,
+          "pooled": 621.637
+        },
+        "vo": {
+          "n": 13,
+          "mean": 203.211,
+          "median": 29.193,
+          "p90": 605.892,
+          "pooled": 194.72
+        },
+        "simulator": {
+          "n": 13,
+          "mean": 204.697,
+          "median": 205.033,
+          "p90": 209.643,
+          "pooled": 203.837
+        },
+        "timed_total": {
+          "n": 13,
+          "mean": 1033.1,
+          "median": 856.949,
+          "p90": 1610.825,
+          "pooled": 1020.195
+        },
+        "cycle_wall": {
+          "n": 13,
+          "mean": 1033.367,
+          "median": 857.212,
+          "p90": 1611.142,
+          "pooled": 1020.461
+        }
+      },
+      "model_server": {
+        "request_decode": {
+          "n": 13,
+          "mean": 32.654,
+          "median": 34.666,
+          "p90": 36.43
+        },
+        "system2_turn1_prep": {
+          "n": 13,
+          "mean": 160.286,
+          "median": 82.464,
+          "p90": 427.311
+        },
+        "system2_turn1_generate": {
+          "n": 13,
+          "mean": 442.743,
+          "median": 487.003,
+          "p90": 489.928
+        },
+        "system2_turn2_prep": {
+          "n": 13,
+          "mean": 277.681,
+          "median": 128.027,
+          "p90": 786.141
+        },
+        "system2_turn2_generate": {
+          "n": 13,
+          "mean": 714.015,
+          "median": 773.557,
+          "p90": 782.844
+        },
+        "system1_condition_latents": {
+          "n": 13,
+          "mean": 571.131,
+          "median": 637.957,
+          "p90": 639.476
+        },
+        "system1_nextdit_sampling": {
+          "n": 13,
+          "mean": 199.214,
+          "median": 194.461,
+          "p90": 207.628
+        },
+        "trajectory_to_actions": {
+          "n": 13,
+          "mean": 0.677,
+          "median": 0.712,
+          "p90": 0.8
+        },
+        "handler_total": {
+          "n": 13,
+          "mean": 2404.367,
+          "median": 2377.19,
+          "p90": 3351.834
+        }
+      },
+      "cuda_memory_mib": {
+        "model.peak_allocated": {
+          "n": 13,
+          "median": 17340.1,
+          "max": 17346.6
+        },
+        "model.peak_reserved": {
+          "n": 13,
+          "median": 21800.0,
+          "max": 21800.0
+        },
+        "model.device_used": {
+          "n": 13,
+          "median": 37354.9,
+          "max": 37354.9
+        },
+        "vo.peak_allocated": {
+          "n": 64,
+          "median": 6520.2,
+          "max": 11328.3
+        },
+        "vo.peak_reserved": {
+          "n": 64,
+          "median": 14600.0,
+          "max": 14600.0
+        },
+        "vo.device_used": {
+          "n": 64,
+          "median": 37354.9,
+          "max": 37354.9
+        }
+      },
+      "vo_server": {
+        "ingest_frame.jpeg_decode": {
+          "n": 51,
+          "mean": 3.461,
+          "median": 3.474,
+          "p90": 4.28
+        },
+        "ingest_frame.ingest": {
+          "n": 47,
+          "mean": 7.226,
+          "median": 7.172,
+          "p90": 7.712
+        },
+        "ingest_frame.ingest_map_init": {
+          "n": 4,
+          "mean": 2150.054,
+          "median": 1809.253,
+          "p90": 2768.606
+        },
+        "ingest_frame.total": {
+          "n": 51,
+          "mean": 178.84,
+          "median": 10.83,
+          "p90": 11.739
+        },
+        "ingest_frame.round_trip": {
+          "n": 51,
+          "mean": 189.162,
+          "median": 16.391,
+          "p90": 51.739
+        },
+        "query_relative_poses.query": {
+          "n": 13,
+          "mean": 0.134,
+          "median": 0.13,
+          "p90": 0.154
+        },
+        "query_relative_poses.total": {
+          "n": 13,
+          "mean": 0.235,
+          "median": 0.23,
+          "p90": 0.27
+        },
+        "query_relative_poses.round_trip": {
+          "n": 13,
+          "mean": 9.774,
+          "median": 4.563,
+          "p90": 22.711
+        }
+      },
+      "client": {
+        "plan.pano_capture": {
+          "n": 13,
+          "mean": 120.825,
+          "median": 121.67,
+          "p90": 126.787
+        },
+        "plan.vo_query": {
+          "n": 13,
+          "mean": 9.823,
+          "median": 4.624,
+          "p90": 22.787
+        },
+        "plan.lookdown_capture": {
+          "n": 13,
+          "mean": 151.135,
+          "median": 154.919,
+          "p90": 169.902
+        },
+        "plan.model_encode": {
+          "n": 13,
+          "mean": 25.039,
+          "median": 27.302,
+          "p90": 27.72
+        },
+        "plan.model_rpc": {
+          "n": 13,
+          "mean": 2413.691,
+          "median": 2391.628,
+          "p90": 3359.894
+        },
+        "step.env_step": {
+          "n": 51,
+          "mean": 38.062,
+          "median": 39.241,
+          "p90": 41.654
+        },
+        "step.pano_capture": {
+          "n": 39,
+          "mean": 126.129,
+          "median": 124.448,
+          "p90": 130.079
+        },
+        "step.vo_ingest": {
+          "n": 51,
+          "mean": 192.216,
+          "median": 19.454,
+          "p90": 54.685
+        }
+      }
+    },
+    "system2_only": {
+      "calls": 34,
+      "actions_executed": 90,
+      "per_call": {
+        "model": {
+          "n": 34,
+          "mean": 632.961,
+          "median": 663.722,
+          "p90": 717.868
+        },
+        "vo": {
+          "n": 34,
+          "mean": 965.674,
+          "median": 1202.183,
+          "p90": 1845.925
+        },
+        "simulator": {
+          "n": 34,
+          "mean": 572.405,
+          "median": 662.976,
+          "p90": 768.926
+        },
+        "timed_total": {
+          "n": 34,
+          "mean": 2171.04,
+          "median": 2164.097,
+          "p90": 3249.609
+        },
+        "cycle_wall": {
+          "n": 34,
+          "mean": 2172.076,
+          "median": 2164.968,
+          "p90": 3250.83
+        },
+        "untimed": {
+          "n": 34,
+          "mean": 1.036,
+          "median": 1.044,
+          "p90": 1.319
+        },
+        "plan_latency": {
+          "n": 34,
+          "mean": 1775.72,
+          "median": 2059.586,
+          "p90": 2719.279
+        },
+        "model_server": {
+          "n": 34,
+          "mean": 597.289,
+          "median": 612.728,
+          "p90": 672.557
+        },
+        "model_rpc_overhead": {
+          "n": 34,
+          "mean": 11.036,
+          "median": 8.481,
+          "p90": 23.436
+        }
+      },
+      "per_action": {
+        "model": {
+          "n": 34,
+          "mean": 350.852,
+          "median": 181.566,
+          "p90": 648.977,
+          "pooled": 239.119
+        },
+        "vo": {
+          "n": 34,
+          "mean": 518.636,
+          "median": 359.392,
+          "p90": 1209.733,
+          "pooled": 364.81
+        },
+        "simulator": {
+          "n": 34,
+          "mean": 255.824,
+          "median": 209.327,
+          "p90": 421.245,
+          "pooled": 216.242
+        },
+        "timed_total": {
+          "n": 34,
+          "mean": 1125.312,
+          "median": 768.395,
+          "p90": 2181.395,
+          "pooled": 820.171
+        },
+        "cycle_wall": {
+          "n": 34,
+          "mean": 1125.861,
+          "median": 768.693,
+          "p90": 2182.294,
+          "pooled": 820.562
+        }
+      },
+      "model_server": {
+        "request_decode": {
+          "n": 34,
+          "mean": 31.121,
+          "median": 34.951,
+          "p90": 36.566
+        },
+        "system2_turn1_prep": {
+          "n": 34,
+          "mean": 85.207,
+          "median": 80.734,
+          "p90": 82.988
+        },
+        "system2_turn1_generate": {
+          "n": 34,
+          "mean": 476.869,
+          "median": 488.45,
+          "p90": 549.744
+        },
+        "handler_total": {
+          "n": 34,
+          "mean": 597.289,
+          "median": 612.728,
+          "p90": 672.557
+        }
+      },
+      "cuda_memory_mib": {
+        "model.peak_allocated": {
+          "n": 34,
+          "median": 16865.1,
+          "max": 16869.2
+        },
+        "model.peak_reserved": {
+          "n": 34,
+          "median": 21800.0,
+          "max": 21800.0
+        },
+        "model.device_used": {
+          "n": 34,
+          "median": 37354.9,
+          "max": 37354.9
+        },
+        "vo.peak_allocated": {
+          "n": 124,
+          "median": 6520.2,
+          "max": 10918.0
+        },
+        "vo.peak_reserved": {
+          "n": 124,
+          "median": 14600.0,
+          "max": 14600.0
+        },
+        "vo.device_used": {
+          "n": 124,
+          "median": 37354.9,
+          "max": 37354.9
+        }
+      },
+      "vo_server": {
+        "ingest_frame.jpeg_decode": {
+          "n": 90,
+          "mean": 3.351,
+          "median": 3.247,
+          "p90": 4.527
+        },
+        "ingest_frame.ingest": {
+          "n": 90,
+          "mean": 7.289,
+          "median": 7.122,
+          "p90": 8.01
+        },
+        "ingest_frame.total": {
+          "n": 90,
+          "mean": 10.73,
+          "median": 10.676,
+          "p90": 11.731
+        },
+        "ingest_frame.round_trip": {
+          "n": 90,
+          "mean": 18.509,
+          "median": 15.962,
+          "p90": 31.518
+        },
+        "query_relative_poses.query": {
+          "n": 13,
+          "mean": 0.123,
+          "median": 0.124,
+          "p90": 0.16
+        },
+        "query_relative_poses.query_map_update": {
+          "n": 21,
+          "mean": 1452.484,
+          "median": 1354.533,
+          "p90": 2021.585
+        },
+        "query_relative_poses.total": {
+          "n": 34,
+          "mean": 897.254,
+          "median": 1176.919,
+          "p90": 1737.025
+        },
+        "query_relative_poses.round_trip": {
+          "n": 34,
+          "mean": 907.74,
+          "median": 1190.059,
+          "p90": 1741.365
+        }
+      },
+      "client": {
+        "plan.pano_capture": {
+          "n": 34,
+          "mean": 123.22,
+          "median": 122.189,
+          "p90": 129.338
+        },
+        "plan.vo_query": {
+          "n": 34,
+          "mean": 907.88,
+          "median": 1190.296,
+          "p90": 1741.562
+        },
+        "plan.lookdown_capture": {
+          "n": 34,
+          "mean": 111.66,
+          "median": 105.025,
+          "p90": 152.467
+        },
+        "plan.model_encode": {
+          "n": 34,
+          "mean": 24.636,
+          "median": 27.599,
+          "p90": 30.736
+        },
+        "plan.model_rpc": {
+          "n": 34,
+          "mean": 608.326,
+          "median": 635.979,
+          "p90": 685.659
+        },
+        "step.env_step": {
+          "n": 90,
+          "mean": 29.943,
+          "median": 29.145,
+          "p90": 40.035
+        },
+        "step.pano_capture": {
+          "n": 70,
+          "mean": 125.443,
+          "median": 125.428,
+          "p90": 130.48
+        },
+        "step.vo_ingest": {
+          "n": 90,
+          "mean": 21.833,
+          "median": 19.41,
+          "p90": 34.65
+        }
+      }
+    },
+    "all": {
+      "calls": 99,
+      "actions_executed": 337,
+      "per_call": {
+        "model": {
+          "n": 99,
+          "mean": 2039.164,
+          "median": 2769.615,
+          "p90": 2829.943
+        },
+        "vo": {
+          "n": 99,
+          "mean": 1205.495,
+          "median": 1424.284,
+          "p90": 1901.861
+        },
+        "simulator": {
+          "n": 99,
+          "mean": 669.661,
+          "median": 701.915,
+          "p90": 816.245
+        },
+        "timed_total": {
+          "n": 99,
+          "mean": 3914.321,
+          "median": 4721.891,
+          "p90": 5162.976
+        },
+        "cycle_wall": {
+          "n": 99,
+          "mean": 3915.4,
+          "median": 4722.949,
+          "p90": 5164.186
+        },
+        "untimed": {
+          "n": 99,
+          "mean": 1.08,
+          "median": 1.071,
+          "p90": 1.304
+        },
+        "plan_latency": {
+          "n": 99,
+          "mean": 3315.748,
+          "median": 4134.301,
+          "p90": 4495.629
+        },
+        "model_server": {
+          "n": 99,
+          "mean": 1998.986,
+          "median": 2728.595,
+          "p90": 2780.627
+        },
+        "model_rpc_overhead": {
+          "n": 99,
+          "mean": 12.539,
+          "median": 7.991,
+          "p90": 30.585
+        }
+      },
+      "per_action": {
+        "model": {
+          "n": 99,
+          "mean": 613.202,
+          "median": 692.649,
+          "p90": 923.722,
+          "pooled": 599.042
+        },
+        "vo": {
+          "n": 99,
+          "mean": 414.447,
+          "median": 365.911,
+          "p90": 734.117,
+          "pooled": 354.137
+        },
+        "simulator": {
+          "n": 99,
+          "mean": 213.671,
+          "median": 193.546,
+          "p90": 301.707,
+          "pooled": 196.725
+        },
+        "timed_total": {
+          "n": 99,
+          "mean": 1241.321,
+          "median": 1243.813,
+          "p90": 2021.865,
+          "pooled": 1149.904
+        },
+        "cycle_wall": {
+          "n": 99,
+          "mean": 1241.705,
+          "median": 1244.129,
+          "p90": 2022.65,
+          "pooled": 1150.221
+        }
+      },
+      "model_server": {
+        "request_decode": {
+          "n": 99,
+          "mean": 34.124,
+          "median": 35.669,
+          "p90": 37.694
+        },
+        "system2_turn1_prep": {
+          "n": 99,
+          "mean": 102.611,
+          "median": 81.253,
+          "p90": 88.18
+        },
+        "system2_turn1_generate": {
+          "n": 99,
+          "mean": 478.377,
+          "median": 488.25,
+          "p90": 547.639
+        },
+        "system2_turn2_prep": {
+          "n": 65,
+          "mean": 190.086,
+          "median": 127.954,
+          "p90": 181.579
+        },
+        "system2_turn2_generate": {
+          "n": 65,
+          "mean": 764.578,
+          "median": 778.252,
+          "p90": 783.318
+        },
+        "ppa_history_memory": {
+          "n": 52,
+          "mean": 400.523,
+          "median": 384.369,
+          "p90": 414.026
+        },
+        "system1_condition_latents": {
+          "n": 65,
+          "mean": 624.853,
+          "median": 639.242,
+          "p90": 640.252
+        },
+        "ppa_bridge": {
+          "n": 52,
+          "mean": 1.911,
+          "median": 1.292,
+          "p90": 1.497
+        },
+        "system1_nextdit_sampling": {
+          "n": 65,
+          "mean": 196.079,
+          "median": 194.229,
+          "p90": 201.237
+        },
+        "trajectory_to_actions": {
+          "n": 65,
+          "mean": 0.545,
+          "median": 0.558,
+          "p90": 0.7
+        },
+        "future_heatmap_diagnostics": {
+          "n": 52,
+          "mean": 1.842,
+          "median": 1.776,
+          "p90": 1.83
+        },
+        "handler_total": {
+          "n": 99,
+          "mean": 1998.986,
+          "median": 2728.595,
+          "p90": 2780.627
+        }
+      },
+      "cuda_memory_mib": {
+        "model.peak_allocated": {
+          "n": 99,
+          "median": 17344.6,
+          "max": 17351.2
+        },
+        "model.peak_reserved": {
+          "n": 99,
+          "median": 21800.0,
+          "max": 21800.0
+        },
+        "model.device_used": {
+          "n": 99,
+          "median": 37354.9,
+          "max": 37354.9
+        },
+        "vo.peak_allocated": {
+          "n": 436,
+          "median": 6520.2,
+          "max": 11328.3
+        },
+        "vo.peak_reserved": {
+          "n": 436,
+          "median": 14600.0,
+          "max": 14600.0
+        },
+        "vo.device_used": {
+          "n": 436,
+          "median": 37354.9,
+          "max": 37354.9
+        }
+      },
+      "vo_server": {
+        "ingest_frame.jpeg_decode": {
+          "n": 337,
+          "mean": 3.389,
+          "median": 3.474,
+          "p90": 4.504
+        },
+        "ingest_frame.ingest": {
+          "n": 333,
+          "mean": 7.206,
+          "median": 7.129,
+          "p90": 7.595
+        },
+        "ingest_frame.ingest_map_init": {
+          "n": 4,
+          "mean": 2150.054,
+          "median": 1809.253,
+          "p90": 2768.606
+        },
+        "ingest_frame.total": {
+          "n": 337,
+          "mean": 36.136,
+          "median": 10.778,
+          "p90": 11.76
+        },
+        "ingest_frame.round_trip": {
+          "n": 337,
+          "mean": 45.587,
+          "median": 16.048,
+          "p90": 38.285
+        },
+        "query_relative_poses.query": {
+          "n": 26,
+          "mean": 0.129,
+          "median": 0.13,
+          "p90": 0.16
+        },
+        "query_relative_poses.query_map_update": {
+          "n": 73,
+          "mean": 1395.843,
+          "median": 1355.735,
+          "p90": 1747.847
+        },
+        "query_relative_poses.total": {
+          "n": 99,
+          "mean": 1029.373,
+          "median": 1289.141,
+          "p90": 1693.786
+        },
+        "query_relative_poses.round_trip": {
+          "n": 99,
+          "mean": 1039.151,
+          "median": 1294.84,
+          "p90": 1697.742
+        }
+      },
+      "client": {
+        "plan.pano_capture": {
+          "n": 99,
+          "mean": 125.142,
+          "median": 124.613,
+          "p90": 131.002
+        },
+        "plan.vo_query": {
+          "n": 99,
+          "mean": 1039.302,
+          "median": 1295.077,
+          "p90": 1697.868
+        },
+        "plan.lookdown_capture": {
+          "n": 99,
+          "mean": 112.14,
+          "median": 107.459,
+          "p90": 154.924
+        },
+        "plan.model_encode": {
+          "n": 99,
+          "mean": 27.64,
+          "median": 28.141,
+          "p90": 32.405
+        },
+        "plan.model_rpc": {
+          "n": 99,
+          "mean": 2011.525,
+          "median": 2738.766,
+          "p90": 2800.75
+        },
+        "step.env_step": {
+          "n": 337,
+          "mean": 28.096,
+          "median": 26.45,
+          "p90": 39.925
+        },
+        "step.pano_capture": {
+          "n": 262,
+          "mean": 127.241,
+          "median": 126.876,
+          "p90": 131.957
+        },
+        "step.vo_ingest": {
+          "n": 337,
+          "mean": 48.822,
+          "median": 19.195,
+          "p90": 41.398
+        }
+      }
+    }
+  }
+}

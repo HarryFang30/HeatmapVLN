@@ -111,8 +111,14 @@ def test_model_server_device_never_falls_back_to_cpu():
 
     torch.cuda.is_available = lambda: True
     assert resolve(args) == "cuda:0"
-    # The CUDA path is certified: it must not pick up the NPU-only setup.
-    assert calls == []
+    # The CUDA path must not pick up the NPU-only setup: no fused-MHA fastpath change
+    # and no op-toolchain warm-up.  It does offer the two Qwen patches their flag, which
+    # is not the same as installing them -- each installer returns False on a non-NPU
+    # device unless its own variable is 1 (test_qwen_vision_mask_patch.py pins that), so
+    # a default CUDA server still runs unpatched transformers.  Before this call existed
+    # the flag could not be taken on CUDA at all, which is what made the mask patch
+    # unmeasurable on the 4090.
+    assert calls == [("vision_mask", "cuda"), ("vision_count", "cuda")]
 
 
 def test_model_server_npu_requires_a_real_npu(monkeypatch):
@@ -585,3 +591,66 @@ def test_npu_launcher_keeps_device_memory_for_the_graph_engine():
     assert 'export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"' in launcher
     # In the log, so a run that overrode it is visible afterwards.
     assert "pytorch_npu_alloc_conf=$PYTORCH_NPU_ALLOC_CONF" in launcher
+
+
+def _load_assert_attn():
+    """``_assert_attn_implementation`` out of the server source, without importing the server."""
+    import types
+
+    source = MODEL_SERVER.read_text()
+    start = source.index("def _assert_attn_implementation")
+    end = source.index("def _warm_up_npu", start)
+    namespace = {
+        "Any": object,
+        "Optional": object,
+        "LOGGER": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
+    }
+    exec(compile(source[start:end], str(MODEL_SERVER), "exec"), namespace)
+    return namespace["_assert_attn_implementation"]
+
+
+def _model_with_attn(loaded):
+    import types
+
+    return types.SimpleNamespace(qwen2_5_vl=types.SimpleNamespace(
+        config=types.SimpleNamespace(attn_implementation=loaded)))
+
+
+def test_the_server_refuses_to_serve_an_attention_it_was_not_given():
+    """The loader answers an unavailable flash_attention_2 with sdpa and a warning.
+
+    That is right for a tree that also runs on NPU, where flash-attn has no build, but it
+    means a run launched for flash attention can quietly be an sdpa run -- and the two do
+    not produce the same actions.  So when the caller names one, it is served or nothing is.
+    """
+    assert_attn = _load_assert_attn()
+
+    assert_attn(_model_with_attn("flash_attention_2"), "flash_attention_2")
+    assert_attn(_model_with_attn("sdpa"), "sdpa")
+    # Nothing requested: whatever the config said stands, which is how the Ascend launcher
+    # and every older command line run.
+    assert_attn(_model_with_attn("sdpa"), None)
+
+    with pytest.raises(RuntimeError, match="refusing to serve"):
+        assert_attn(_model_with_attn("sdpa"), "flash_attention_2")
+    # A backbone that never recorded one is a mismatch too, not a pass.
+    with pytest.raises(RuntimeError, match="refusing to serve"):
+        assert_attn(_model_with_attn(None), "flash_attention_2")
+
+
+def test_the_two_launchers_default_to_the_attention_their_hardware_has():
+    """One deliberate divergence between the halves, pinned rather than left to drift.
+
+    ``test_npu_launcher_and_cuda_launcher_pass_the_same_server_flags`` exists so the two
+    sides stay the same arm, and the mechanism here is identical on both -- the same
+    PPA_EVAL_ATTN_IMPL, the same MODEL_EXTRA line.  Only the DEFAULT differs: the 4090 has
+    flash-attn installed and runs it from 2026-10-13 (user's call), the NPU has no build of
+    it at all, so that half keeps the config's sdpa.  Both are pinned here, because a
+    default that drifted would change what an arm means without changing any command line.
+    """
+    cuda = CUDA_LAUNCHER.read_text(encoding="utf-8")
+    npu = NPU_LAUNCHER.read_text(encoding="utf-8")
+    assert 'ATTN_IMPL="${PPA_EVAL_ATTN_IMPL:-flash_attention_2}"' in cuda
+    assert 'ATTN_IMPL="${PPA_EVAL_ATTN_IMPL:-}"' in npu
+    for launcher in (cuda, npu):
+        assert '[[ -n "$ATTN_IMPL" ]] && MODEL_EXTRA+=(--attn_implementation "$ATTN_IMPL")' in launcher

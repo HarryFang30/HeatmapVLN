@@ -2500,6 +2500,43 @@ C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz
 **论文取数（用户 2026-09-30 定）.** 论文表里，消融各臂取两种子中较差的数，完整模型取较好的数。
 本条目和报告照常记录每个种子、每个平台的原始数字与上面的配对 CI。判据只按配对 CI 判，不受取数方式影响。
 
+**延迟补记（2026-10-12）：视觉窗口掩码算子在 4090 上的基准。** 用户问这个算子优化之后 4090 的实时性。
+- **先于任何数字的事实**：那个补丁（`src/models/qwen2_5_vl_vision_mask.py`）**在 4090 上一次都没装过**。
+  装它的调用点原来只在 `rpc_model_server.py:_resolve_device` 的 npu 分支里，CUDA 分支读不到它的开关；
+  4090 的部署检出还停在 `148e398e`，连这个文件都没有。所以延迟表第 1–6 节的数**没有过期**。
+  本次把调用点补到 cuda 分支（默认仍不装，两个安装函数各自的 flag 不为 1 就返回 False）。
+- **实测**（`scripts/tools/bench_vision_mask.py`，4090 GPU 4，9 次交错，中位数；结果 JSON 在
+  [exp20-vision-mask-bench-4090.json](exp20-vision-mask-bench-4090.json)）：每次掩码构造
+  6.80 → 0.22 ms（7056 patch / 144 窗口）、8.29 → 0.26 ms（8620 patch / 174 窗口），三条路逐位相同；
+  每趟视觉塔 192 → 7.0 ms 和 234 → 8.2 ms；一次带注入的规划调用跑四趟，**853 → 30 ms**。
+- **配对运行（2026-10-13，卡空出来之后补做）**：同样 4 集、单槽卡 4（模型与里程计同卡，即 09-30 的配置），
+  源码副本 `ace1ff8`，`PPA_EVAL_TIMING=1`，两臂唯一差别是 `HEATMAPVLN_QWEN_VISION_MASK_PATCH` 0/1。
+  - **判据先过**：4 集 **99 次调用逐调用相同**（步号 / kind / 慢系统原文 / 动作块，`compare_logs`），
+    每集 success / SPL / OS / NE 逐位相同，显存读数也逐位相同；关臂复现 09-28 金丝雀（SR 100 / SPL 87.0 / NE 0.913 / 注入 52）。
+  - **结果**：模型服务端 **3498.9 → 2744.2 ms（−754.7，−21.6%）**；规划关键路径 5107.8 → 4399.0（−13.9%）；
+    每动作 1421.3 → 1266.1（−10.9%）。四个跑视觉塔的阶段各省 181 / 220 / 180 / 199 ms，其余阶段不动。
+    按路径分组佐证：只跑 1 趟塔的 `system2_only` 省 183 ms，跑 3 趟的 `native_system1` 省 538 ms，跑 4 趟的 `ppa` 省 755 ms。
+  - 汇总 JSON：[exp20-latency-arm-off-4090.json](exp20-latency-arm-off-4090.json)、[exp20-latency-arm-on-4090.json](exp20-latency-arm-on-4090.json)。
+- **第三臂：flash-attention 2（2026-10-13，用户装好之后加测）**。flash-attn 2.8.3.post1 不在 site-packages，
+  编在 `6024_fjl:/workspace/fa_build/site`，靠 `PYTHONPATH` 带入；配置 `model.llm.attn_implementation`
+  改成 `flash_attention_2`，加 `HEATMAPVLN_REQUIRE_FLASH_ATTN=1`，并核对日志 `(attn=flash_attention_2)`
+  且 `Attention fallback` 为 0 —— 这条路会静默回落 sdpa。
+  - **结果**：模型服务端 **3498.9 → 1865.7 ms（−46.7%）**，规划关键路径 5107.8 → 3472.0（−32.0%），
+    每动作 1421.3 → 1017.1（−28.4%）。四个跑视觉塔的阶段各省 349 / 464 / 353 / 466 ms，桥、NextDiT、
+    里程计、渲染不动；显存几乎不变（峰值保留 21800 → 21756 MiB）。
+  - **代价**：FA2 与 SDPA 在 bf16 下不是同一串数，**逐调用判据不过** —— 4 集的相同前缀只有 1 / 5 / 7 / 11 次调用，
+    调用数 99 → 82。汇总 SR 都是 100，SPL 87.0 → 93.43、NE 0.913 → 0.706，但这是 4 集，
+    **不能读成 FA2 更准**（完整模型换个种子就差 1.96 pt）。
+  - 汇总 JSON：[exp20-latency-arm-flash2-4090.json](exp20-latency-arm-flash2-4090.json)。
+- **能支撑到哪一步**：掩码补丁在 4090 上值约 **0.75 s/次规划**，且在这 4 集 99 次调用上不改任何决定；
+  FA2 值约 **1.63 s/次规划**，但它改走法（4 集的相同前缀只有 1–11 次调用）。
+- **决定（用户 2026-10-13）**：两套数当同一套看，不为此重跑基线；**4090 上以后一律走 FA2**。
+  启动脚本 `scripts/run_ppa_r2r_val_unseen_cuda.sh` 的 `PPA_EVAL_ATTN_IMPL` 默认改成 `flash_attention_2`，
+  模型服务端新增 `--attn_implementation`，**拿不到就拒绝服务**（以前回落 sdpa 只留一行日志）。
+  昇腾那条启动脚本不传这个参数——NPU 没有 flash-attn 构建，继续 sdpa。
+  **不能**据此把补丁设成部署默认：全量 1839 集那张表是不带补丁跑的，SR / SPL 仍然只认那次运行；
+  真要换默认，得在更大的样本上按同一判据再过一次。
+
 
 ### EXP-21 参数敏感性：历史帧数 K、快系统采样条数 S、去噪步数 M
 

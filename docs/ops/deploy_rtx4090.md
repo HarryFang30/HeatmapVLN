@@ -38,6 +38,13 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_GPU_DE
 
 - 协议和客户端参数与 C500 上认证过的 8 卡评测相同：同一份 8 分片锁定队列、确定性采样、在线 AMB3R、llvmpipe CPU 渲染。
 - 可以用 1–8 张卡。8 个分片轮流分给各张卡，每张卡依次跑自己分到的分片。
+- **注意力实现：2026-10-13 起默认 `flash_attention_2`**（`PPA_EVAL_ATTN_IMPL`）。容器里装了
+  flash-attn 2.8.3.post1；实测模型服务端 3499 → 1866 ms、一次规划 5108 → 3472 ms
+  （`docs/experiments/exp20-latency-report.md` §9）。它和 sdpa 的 bf16 数值不同，动作会变。
+  要复现 2026-10-13 以前的运行就设 `PPA_EVAL_ATTN_IMPL=sdpa`。
+  启动脚本把它作为 `--attn_implementation` 传给模型服务端，**服务端拿不到就拒绝启动** ——
+  加载器本来会在 flash_attn 导不进或加载失败时悄悄回落 sdpa，只留一行 warning。
+  日志里确认两行：`Attention implementation confirmed: flash_attention_2`，以及没有 `Attention fallback`。
 - 模型服务端和里程计服务端默认放在同一张卡上，实测空载约 36 GB、运行中见到最高约 37 GB（48 GB 的卡）。显存不够时用 `PPA_EVAL_VO_GPU_DEVICES` 把里程计放到别的卡。
 - 冒烟 / 金丝雀：加 `PPA_EVAL_SHARDS=0,1 PPA_EVAL_MAX_EPISODES_PER_SHARD=2`，只打印汇总，不合并。
   **带上限的运行每次都要换一个空的 `PPA_EVAL_OUTPUT_ROOT`，而且不能开 `PPA_EVAL_SHARD_RETRIES`。**
@@ -92,6 +99,11 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_TIMING
 - 上面这条命令的输出目录是固定的 `latency_seed42`，所以**第二次跑之前要先把它清掉或换个名字**：
   带上限的运行往已有结果的目录里续跑会被拒绝（见 §2 那条）。否则它会悄悄给你另外 2 集，
   计时统计也就不是同一个样本了。
+- **视觉窗口掩码补丁在这台机器上默认不装。** `HEATMAPVLN_QWEN_VISION_MASK_PATCH=1` 才装
+  （`HEATMAPVLN_QWEN_VISION_REUSE=1` 是另一个开关，省掉重复的那趟视觉塔）。装了就不是认证过的那套代码，
+  所以要配一次不装的运行作对照，并按本节末尾的计时中立性判据确认动作逐调用相同。
+  这个算子在 4090 上的基准（不需要起服务端）：`python scripts/tools/bench_vision_mask.py --device cuda:<卡>`，
+  结果见 `docs/experiments/exp20-latency-report.md` §8。
 - 服务端每个阶段前后各做一次 `torch.cuda.synchronize`（同步的是服务端自己用的那张卡：模型的 `--gpu_id`、里程计的 `--device`），量到的是 GPU 真正算完的时间。同步只挪了主机等待的位置，不改任何张量，所以动作应当不变，但整体会慢一点。
 - **"动作不变"要先在 GPU 上实测一次**：用 09-28 金丝雀的配置（4、5 号卡两个槽位，分片 0、1 各 2 集，种子 42）加 `PPA_EVAL_TIMING=1` 跑到新目录，用 `scripts/exp19/select_cases.py` 的 `parse_client_log` 读两边的客户端日志、`scripts/exp19/build_records.py` 的 `compare_calls` 逐调用比：每次调用的步号、`kind`、慢系统原文、动作块都相同，§3 表里的步数、注入生效次数、SR/SPL/NE 也相同，才算通过。
   - 通过：带计时的全量评测的 SR/SPL 可以直接当基线用，全量基线和延迟表一次跑出来。

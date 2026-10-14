@@ -1,0 +1,161 @@
+{
+  "device": "cuda:0",
+  "device_name": "NVIDIA GeForce RTX 4090",
+  "torch": "2.11.0+cu128",
+  "transformers": "4.51.0",
+  "depth": 32,
+  "fullatt_block_indexes": [
+    7,
+    15,
+    23,
+    31
+  ],
+  "repeats": 9,
+  "passes": [
+    "9x28x28",
+    "9x28x28,1x34x46",
+    "9x28x28",
+    "9x28x28,1x34x46"
+  ],
+  "shapes": {
+    "9x28x28": {
+      "spec": "9x28x28",
+      "seq_length": 7056,
+      "images": 9,
+      "n_window": 144,
+      "window": {
+        "ms": {
+          "upstream_device": {
+            "median": 6.803994998335838,
+            "min": 6.764961406588554,
+            "max": 7.18262605369091,
+            "n": 9
+          },
+          "upstream_host": {
+            "median": 1.239587552845478,
+            "min": 1.2325514107942581,
+            "max": 1.291368156671524,
+            "n": 9
+          },
+          "window_id": {
+            "median": 0.22387690842151642,
+            "min": 0.21149683743715286,
+            "max": 0.35284366458654404,
+            "n": 9
+          }
+        },
+        "same_mask_as_upstream": {
+          "upstream_device": true,
+          "upstream_host": true,
+          "window_id": true
+        },
+        "spans": 144
+      },
+      "n_full": 9,
+      "full": {
+        "ms": {
+          "upstream_device": {
+            "median": 0.45963283628225327,
+            "min": 0.4566144198179245,
+            "max": 9.569679386913776,
+            "n": 9
+          },
+          "upstream_host": {
+            "median": 0.09351875633001328,
+            "min": 0.09186286479234695,
+            "max": 0.10034814476966858,
+            "n": 9
+          },
+          "window_id": {
+            "median": 0.184706412255764,
+            "min": 0.18060486763715744,
+            "max": 0.24114269763231277,
+            "n": 9
+          }
+        },
+        "same_mask_as_upstream": {
+          "upstream_device": true,
+          "upstream_host": true,
+          "window_id": true
+        },
+        "spans": 9
+      }
+    },
+    "9x28x28,1x34x46": {
+      "spec": "9x28x28,1x34x46",
+      "seq_length": 8620,
+      "images": 10,
+      "n_window": 174,
+      "window": {
+        "ms": {
+          "upstream_device": {
+            "median": 8.294195868074894,
+            "min": 8.280029520392418,
+            "max": 8.556663990020752,
+            "n": 9
+          },
+          "upstream_host": {
+            "median": 1.4976877719163895,
+            "min": 1.4782557263970375,
+            "max": 1.5025697648525238,
+            "n": 9
+          },
+          "window_id": {
+            "median": 0.26023760437965393,
+            "min": 0.2507902681827545,
+            "max": 0.32469816505908966,
+            "n": 9
+          }
+        },
+        "same_mask_as_upstream": {
+          "upstream_device": true,
+          "upstream_host": true,
+          "window_id": true
+        },
+        "spans": 174
+      },
+      "n_full": 10,
+      "full": {
+        "ms": {
+          "upstream_device": {
+            "median": 0.5456609651446342,
+            "min": 0.5433773621916771,
+            "max": 0.769137404859066,
+            "n": 9
+          },
+          "upstream_host": {
+            "median": 0.10579545050859451,
+            "min": 0.10361522436141968,
+            "max": 0.11647678911685944,
+            "n": 9
+          },
+          "window_id": {
+            "median": 0.22364407777786255,
+            "min": 0.2217758446931839,
+            "max": 0.2623582258820534,
+            "n": 9
+          }
+        },
+        "same_mask_as_upstream": {
+          "upstream_device": true,
+          "upstream_host": true,
+          "window_id": true
+        },
+        "spans": 10
+      }
+    }
+  },
+  "per_call_ms": {
+    "median": {
+      "upstream_device": 853.5410389304161,
+      "upstream_host": 154.88193184137344,
+      "window_id": 30.377216637134552
+    },
+    "min": {
+      "upstream_device": 850.5194261670113,
+      "upstream_host": 153.3690243959427,
+      "window_id": 29.107123613357544
+    }
+  },
+  "same_mask_everywhere": true
+}

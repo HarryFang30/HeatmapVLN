@@ -50,6 +50,12 @@ ASCEND_ENV="${PPA_NPU_ASCEND_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 # Same names as the CUDA launcher, so one set of exports drives both halves.
 TIMING="${PPA_EVAL_TIMING:-0}"
 BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
+# Same knob as the CUDA launcher, but EMPTY here on purpose: flash-attn has no NPU build,
+# so this half keeps whatever the config says (sdpa).  The mechanism is identical on both
+# sides so that one set of exports still drives both; only the default differs, because the
+# hardware does.  Setting this to flash_attention_2 here makes the server refuse to start,
+# which is the right answer rather than a silent fallback.
+ATTN_IMPL="${PPA_EVAL_ATTN_IMPL:-}"
 NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
 NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
 # EXP-23: a System2 LoRA directory (rpc_model_server.py --system2_lora_adapter): both
@@ -216,6 +222,7 @@ fi
 
 declare -a MODEL_EXTRA=()
 [[ "$BRIDGE_OFF" -eq 1 ]] && MODEL_EXTRA=(--ppa_bridge_off)
+[[ -n "$ATTN_IMPL" ]] && MODEL_EXTRA+=(--attn_implementation "$ATTN_IMPL")
 [[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
 [[ -n "$NUM_INFERENCE_STEPS" ]] && MODEL_EXTRA+=(--nextdit_num_inference_steps "$NUM_INFERENCE_STEPS")
 [[ -n "$SYSTEM2_LORA" ]] && MODEL_EXTRA+=(--system2_lora_adapter "$SYSTEM2_LORA")
