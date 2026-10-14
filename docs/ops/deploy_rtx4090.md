@@ -38,6 +38,13 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/HeatmapVLN && PPA_EVAL_GPU_DE
 
 - 协议和客户端参数与 C500 上认证过的 8 卡评测相同：同一份 8 分片锁定队列、确定性采样、在线 AMB3R、llvmpipe CPU 渲染。
 - 可以用 1–8 张卡。8 个分片轮流分给各张卡，每张卡依次跑自己分到的分片。
+- **注意力实现：2026-10-13 起默认 `flash_attention_2`**（`PPA_EVAL_ATTN_IMPL`）。容器里装了
+  flash-attn 2.8.3.post1；实测模型服务端 3499 → 1866 ms、一次规划 5108 → 3472 ms
+  （`docs/experiments/exp20-latency-report.md` §9）。它和 sdpa 的 bf16 数值不同，动作会变。
+  要复现 2026-10-13 以前的运行就设 `PPA_EVAL_ATTN_IMPL=sdpa`。
+  启动脚本把它作为 `--attn_implementation` 传给模型服务端，**服务端拿不到就拒绝启动** ——
+  加载器本来会在 flash_attn 导不进或加载失败时悄悄回落 sdpa，只留一行 warning。
+  日志里确认两行：`Attention implementation confirmed: flash_attention_2`，以及没有 `Attention fallback`。
 - 模型服务端和里程计服务端默认放在同一张卡上，实测空载约 36 GB、运行中见到最高约 37 GB（48 GB 的卡）。显存不够时用 `PPA_EVAL_VO_GPU_DEVICES` 把里程计放到别的卡。
 - 冒烟 / 金丝雀：加 `PPA_EVAL_SHARDS=0,1 PPA_EVAL_MAX_EPISODES_PER_SHARD=2`，只打印汇总，不合并。
   **带上限的运行每次都要换一个空的 `PPA_EVAL_OUTPUT_ROOT`，而且不能开 `PPA_EVAL_SHARD_RETRIES`。**

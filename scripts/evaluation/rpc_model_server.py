@@ -18,7 +18,7 @@ import sys
 import threading
 from concurrent import futures
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -714,6 +714,31 @@ def _install_vision_pass_counter(device_type: str) -> bool:
     return install_qwen2_5_vl_vision_count(device_type, LOGGER)
 
 
+def _assert_attn_implementation(model: Any, requested: Optional[str]) -> None:
+    """Refuse to serve when ``--attn_implementation`` was not honoured.
+
+    ``Qwen2_5VLIntegration._load_with_attn_fallback`` answers an unavailable or failing
+    flash_attention_2 by loading sdpa instead and logging one warning.  That is the right
+    default for a shared tree that also runs on NPU and on Blackwell, where flash-attn does
+    not exist -- but it means a run can be launched *for* flash attention, fall back, and
+    produce numbers nobody can tell apart from the sdpa ones afterwards.  The attention
+    implementation changes bf16 arithmetic and therefore the actions (measured: identical
+    prefixes of 1-11 calls out of 4 episodes), so this is a wrong answer, not a slow one.
+    When the caller named an implementation, it is served or nothing is.
+    """
+    if not requested:
+        return
+    loaded = getattr(getattr(model, "qwen2_5_vl", None), "config", None)
+    loaded = getattr(loaded, "attn_implementation", None)
+    if loaded != requested:
+        raise RuntimeError(
+            f"--attn_implementation {requested} was requested but the backbone loaded with "
+            f"{loaded!r}; refusing to serve. The loader falls back to sdpa when flash_attn "
+            "cannot be imported or the load fails -- see the warnings above for which."
+        )
+    LOGGER.info("Attention implementation confirmed: %s", loaded)
+
+
 def _warm_up_npu(device: torch.device) -> None:
     """Make CANN build its op-compile toolchain now, not during the first request.
 
@@ -865,6 +890,7 @@ class HeatmapVLNRuntime:
         self.device = _resolve_device(args)
         self.cfg = self._load_runtime_config(args)
         self.model, self.train_cfg = self._load_model(args, self.device)
+        _assert_attn_implementation(self.model, getattr(args, "attn_implementation", None))
         self.processor = self.model.qwen2_5_vl.processor
         self.processor.tokenizer.padding_side = "left"
         self.action_scale = self.train_cfg.get("data", {}).get("trajectory", {}).get("action_scale", 4.0)
@@ -1139,6 +1165,15 @@ class HeatmapVLNRuntime:
         adapter_cfg = nextdit.get("pano_latent_adapter", {})
         if args.pano_latent_adapter_checkpoint and isinstance(adapter_cfg, dict):
             adapter_cfg["pretrained_path"] = ""
+        attn = getattr(args, "attn_implementation", None)
+        if attn:
+            llm = cfg.setdefault("model", {}).setdefault("llm", {})
+            LOGGER.info("Attention override: model.llm.attn_implementation %s -> %s",
+                        llm.get("attn_implementation"), attn)
+            llm["attn_implementation"] = attn
+            if attn == "flash_attention_2":
+                # Fail at the import, before 15 GB of weights, rather than at the check below.
+                os.environ.setdefault("HEATMAPVLN_REQUIRE_FLASH_ATTN", "1")
         # EXP-21 sensitivity: System1's sample count S and denoising steps M.  The NextDiT head is built from this
         # config and the action post-processing reads num_sample_trajs from it, so both follow the override.
         for key, value in (
@@ -2456,6 +2491,16 @@ def parse_args() -> argparse.Namespace:
         help="Also decode the native first turn (adapters off) on every ready call and record agreement.",
     )
     parser.add_argument("--cognition_max_new_tokens", type=int, default=96)
+    parser.add_argument(
+        "--attn_implementation",
+        default=None,
+        choices=["sdpa", "flash_attention_2", "eager"],
+        help=(
+            "Override the config's model.llm.attn_implementation. The server then REFUSES to "
+            "serve if it did not get it, because the loader's fallback to sdpa is a log line, "
+            "not an error (default: whatever the config says)."
+        ),
+    )
     parser.add_argument(
         "--nextdit_num_sample_trajs",
         type=int,

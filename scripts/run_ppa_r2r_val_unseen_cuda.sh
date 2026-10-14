@@ -54,6 +54,13 @@ MAX_EPISODES="${PPA_EVAL_MAX_EPISODES_PER_SHARD:-}"
 # <shard output>/timing/*.jsonl and the run ends with a latency summary.  Stages
 # synchronise CUDA, so a timed run is slower; the actions are the same.
 TIMING="${PPA_EVAL_TIMING:-0}"
+# Attention implementation for the Qwen2.5-VL backbone, passed to the model server, which
+# refuses to serve if it does not get it (the loader's fallback to sdpa is a log line).
+# flash_attention_2 is the default HERE because this launcher is the CUDA one and the box
+# has flash-attn installed; it measured 3499 -> 1866 ms a plan call on the model server
+# (docs/experiments/exp20-latency-report.md §9).  The Ascend launcher does not pass this
+# at all -- flash-attn has no NPU build -- and sdpa reproduces the older runs.
+ATTN_IMPL="${PPA_EVAL_ATTN_IMPL:-flash_attention_2}"
 # 1: EXP-20 A1, System1 samples from Z instead of the injected Z~ (rpc_model_server.py --ppa_bridge_off).
 BRIDGE_OFF="${PPA_EVAL_BRIDGE_OFF:-0}"
 # EXP-21 sensitivity: history frames K (client), System1 samples S and denoising steps M (server; empty = config).
@@ -193,6 +200,7 @@ declare -a MODEL_EXTRA=()
 [[ "$NUM_HISTORY" =~ ^[1-8]$ ]] || die "PPA_EVAL_NUM_HISTORY must be 1-8"
 [[ -z "$NUM_SAMPLE_TRAJS" || "$NUM_SAMPLE_TRAJS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_SAMPLE_TRAJS must be a positive integer"
 [[ -z "$NUM_INFERENCE_STEPS" || "$NUM_INFERENCE_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_INFERENCE_STEPS must be a positive integer"
+[[ -n "$ATTN_IMPL" ]] && MODEL_EXTRA+=(--attn_implementation "$ATTN_IMPL")
 [[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
 [[ -n "$NUM_INFERENCE_STEPS" ]] && MODEL_EXTRA+=(--nextdit_num_inference_steps "$NUM_INFERENCE_STEPS")
 # Always set, so a value left in the calling shell cannot switch timing on or off.
@@ -241,7 +249,7 @@ mkdir -p "$WORKERS_DIR" "$MERGED_DIR" "$RUNTIME_DIR/logs" "$PLACEHOLDER_DIR"
 [[ "$TIMING" -eq 0 ]] || touch "$RUNTIME_DIR/timing_start"
 echo "[ppa-eval] slots=$NUM_SLOTS gpus=$GPU_CSV vo_gpus=$VO_GPU_CSV shards=$SHARD_CSV seed=$PROTOCOL_SEED max_episodes_per_shard=${MAX_EPISODES:-all} timing=$TIMING bridge_off=$BRIDGE_OFF"
 echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
-echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} episode_lists=$EPISODE_LISTS_DIR"
+echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} attn=${ATTN_IMPL:-config} episode_lists=$EPISODE_LISTS_DIR"
 echo "[ppa-eval] output=$OUTPUT_ROOT external_servers=$EXTERNAL_SERVERS"
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
