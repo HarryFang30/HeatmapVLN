@@ -10,6 +10,12 @@
 #
 #   EXP23_ROUND=1 nohup setsid bash scripts/exp23/round_post_4090.sh > /dev/null 2>&1 &
 #
+# EXP23_FROM_PHASE=N skips phases 1..N-1, e.g. 5 to restart a round on new code while it
+# waits for the adapter, without relabelling, repacking or pushing again.  The closed loop
+# runs the CUDA launcher's default attention, flash_attention_2 (user, 2026-10-13); the
+# identity check in phase 3 stays on sdpa, because A0 (EXP-20) ran sdpa and the check is
+# about the code, and FA2 never reproduces sdpa call for call.
+#
 # Phases:
 #   1. wait for $ROUND_DIR/STOPPED_AT_N (scripts' stop_at_n) and for the replay pull;
 #   2. relabel every record (idempotent; the rules digest decides) and pack the stream;
@@ -51,6 +57,8 @@ PUSH_AFTER_S="${EXP23_PUSH_AFTER_S:-1200}"
 # paired monitor scores a switched-on run under the standard protocol too (exactly
 # derivable), and the stop rule uses that one.
 STOP_AT_STEP_BUDGET="${EXP23_STOP_AT_STEP_BUDGET:-0}"
+FROM_PHASE="${EXP23_FROM_PHASE:-1}"
+[[ "$FROM_PHASE" =~ ^[1-5]$ ]] || { echo "EXP23_FROM_PHASE must be 1-5" >&2; exit 2; }
 [[ "$STOP_AT_STEP_BUDGET" =~ ^[01]$ ]] || { echo "EXP23_STOP_AT_STEP_BUDGET must be 0 or 1" >&2; exit 2; }
 RUN_SUFFIX=""
 [[ "$STOP_AT_STEP_BUDGET" -eq 1 ]] && RUN_SUFFIX="_stepbudget"
@@ -63,15 +71,18 @@ log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
 status() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" > "$ROUND_DIR/POST_STATUS"; log "STATUS $*"; }
 die() { status "STOPPED: $*"; chown -R 1015:1015 "$ROUND_DIR" 2>/dev/null; exit 2; }
 git -c safe.directory='*' -C "$WT" diff --quiet HEAD -- || die "$WT has uncommitted changes"
-log "round=$ROUND wt=$WT commit=$(git -c safe.directory='*' -C "$WT" rev-parse HEAD) stop_at_step_budget=$STOP_AT_STEP_BUDGET"
+log "round=$ROUND wt=$WT commit=$(git -c safe.directory='*' -C "$WT" rev-parse HEAD) stop_at_step_budget=$STOP_AT_STEP_BUDGET from_phase=$FROM_PHASE"
 
 # 1 -------------------------------------------------------------------------------
+if (( FROM_PHASE <= 1 )); then
 status "waiting for collection to stop"
 until [[ -e "$ROUND_DIR/STOPPED_AT_N" ]]; do sleep 120; done
 while pgrep -f '[p]ull_dirs\.py' >/dev/null; do sleep 60; done
 log "collection stopped; replay scenes: $(ls "$REPLAY_ROOT" | grep -vc '^\.')"
+fi
 
 # 2 -------------------------------------------------------------------------------
+if (( FROM_PHASE <= 2 )); then
 status "labelling"
 "$PYTHON" "$WT/scripts/tools/label_s2_records.py" --record_root "$ROUND_DIR/records" --label_root "$ROUND_DIR/labels" \
   --episodes "$EPISODES" --workers 32 --summary "$ROUND_DIR/labels/summary.json" >> "$LOG" 2>&1 \
@@ -82,20 +93,25 @@ rm -rf "$ROUND_DIR/stream"
   --replay-root "$REPLAY_ROOT" --out-dir "$ROUND_DIR/stream" --shard-size 256 --global-batch 64 --world-size 8 \
   --total-samples "$TOTAL_SAMPLES" --workers 24 >> "$LOG" 2>&1 || die "stream packing failed"
 chown -R 1015:1015 "$ROUND_DIR"
+fi
 
 # 3 -------------------------------------------------------------------------------
+if (( FROM_PHASE <= 3 )); then
 status "identity check against A0 seed 42"
 CANARY="$ROUND_DIR/canary_noadapter"
 rm -rf "$CANARY"
 ( cd "$WT" && PPA_EVAL_ROOT=/workspace PPA_EVAL_REPO="$WT" PPA_EVAL_GPU_DEVICES="$CANARY_GPU" PPA_EVAL_SHARDS=0 \
     PPA_EVAL_MAX_EPISODES_PER_SHARD=3 PPA_EVAL_PROTOCOL_SEED=42 PPA_EVAL_OUTPUT_ROOT="$CANARY" PPA_EVAL_DISPLAY_BASE=380 \
+    PPA_EVAL_ATTN_IMPL=sdpa \
     bash scripts/run_ppa_r2r_val_unseen_cuda.sh > "$ROUND_DIR/logs/canary.log" 2>&1 )
 "$PYTHON" "$WT/scripts/tools/compare_client_logs.py" --a "${A0_RUN[42]}/runtime/*/logs/client_shard_*.log" \
   --b "$CANARY/runtime/*/logs/client_shard_*.log" --out "$ROUND_DIR/canary_identity.json" --require-identical >> "$LOG" 2>&1 \
   || die "the new code without an adapter does not reproduce A0 call for call (see canary_identity.json); pairing invalid"
 log "identity check passed"
+fi
 
 # 4 -------------------------------------------------------------------------------
+if (( FROM_PHASE <= 4 )); then
 pushable=$(( $(stat -c %Y "$ROUND_DIR/STOPPED_AT_N") + PUSH_AFTER_S ))
 if (( $(date +%s) < pushable )); then
   status "waiting until $(date -u -d "@$pushable" +%FT%TZ) for the 910B receivers"
@@ -130,6 +146,7 @@ echo HOLDOUT_DONE > "$ROUND_DIR/holdout_done.list"
     --files "$ROUND_DIR/holdout_done.list" --retries 1000000 >> "$ROUND_DIR/logs/push_holdout.log" 2>&1 ) \
   || die "pushing HOLDOUT_DONE failed"
 log "held-out records pushed"
+fi
 
 # 5 -------------------------------------------------------------------------------
 status "waiting for adapter_r$ROUND from the 910B"
