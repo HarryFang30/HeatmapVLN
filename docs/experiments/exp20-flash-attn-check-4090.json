@@ -1,0 +1,145 @@
+{
+ "flash_attn": "2.8.3.post1",
+ "flash_attn_file": "/workspace/fa_build/site/flash_attn/__init__.py",
+ "ext_file": "/workspace/fa_build/site/flash_attn_2_cuda.cpython-311-x86_64-linux-gnu.so",
+ "torch": "2.11.0+cu128",
+ "transformers": "4.51.0",
+ "transformers_sees_flash_attn_2": true,
+ "modeling_has_varlen": true,
+ "modeling_has_rotary": true,
+ "gpu": "NVIDIA GeForce RTX 4090",
+ "capability": [
+  8,
+  9
+ ],
+ "kernel": {
+  "seq": 8620,
+  "windows": 174,
+  "heads": 16,
+  "head_dim": 80,
+  "fwd": {
+   "flash_attn": {
+    "max_abs": 0.007212400436401367,
+    "rel_l2": 0.0020849367137998343,
+    "min_token_cos": 0.9999934434890747
+   },
+   "sdpa_bf16": {
+    "max_abs": 0.007212400436401367,
+    "rel_l2": 0.0020772244315594435,
+    "min_token_cos": 0.9999945163726807
+   }
+  },
+  "dq": {
+   "flash_attn": {
+    "max_abs": 0.015625,
+    "rel_l2": 0.0027397789526730776,
+    "min_token_cos": 0.9997943043708801
+   },
+   "sdpa_bf16": {
+    "max_abs": 0.015625,
+    "rel_l2": 0.0032905666157603264,
+    "min_token_cos": 0.999794602394104
+   }
+  },
+  "dk": {
+   "flash_attn": {
+    "max_abs": 0.015625,
+    "rel_l2": 0.0027081205043941736,
+    "min_token_cos": 0.9999447464942932
+   },
+   "sdpa_bf16": {
+    "max_abs": 0.015625,
+    "rel_l2": 0.0032547248993068933,
+    "min_token_cos": 0.9999359250068665
+   }
+  },
+  "dv": {
+   "flash_attn": {
+    "max_abs": 0.015625,
+    "rel_l2": 0.0026123158168047667,
+    "min_token_cos": 0.9999880194664001
+   },
+   "sdpa_bf16": {
+    "max_abs": 0.015625,
+    "rel_l2": 0.002612257609143853,
+    "min_token_cos": 0.9999880194664001
+   }
+  }
+ },
+ "tower": {
+  "turn1_7056x9": {
+   "patches": 7056,
+   "sdpa_upstream": {
+    "vs_fp32": {
+     "max_abs": 3.9140400886535645,
+     "rel_l2": 0.03164169192314148,
+     "min_token_cos": 0.8526046872138977
+    },
+    "time": {
+     "median_ms": 452.77,
+     "min_ms": 451.66
+    }
+   },
+   "sdpa_mask_patch": {
+    "bit_identical_to_upstream": true,
+    "time": {
+     "median_ms": 266.24,
+     "min_ms": 266.09
+    }
+   },
+   "flash_attention_2": {
+    "vs_fp32": {
+     "max_abs": 4.3515400886535645,
+     "rel_l2": 0.03197222948074341,
+     "min_token_cos": 0.8230909109115601
+    },
+    "vs_sdpa_bf16": {
+     "max_abs": 3.5,
+     "rel_l2": 0.01833961345255375,
+     "min_token_cos": 0.9861568212509155
+    },
+    "time": {
+     "median_ms": 99.09,
+     "min_ms": 98.97
+    }
+   }
+  },
+  "turn2_8620x10": {
+   "patches": 8620,
+   "sdpa_upstream": {
+    "vs_fp32": {
+     "max_abs": 4.3880510330200195,
+     "rel_l2": 0.030810866504907608,
+     "min_token_cos": 0.9313704967498779
+    },
+    "time": {
+     "median_ms": 616.55,
+     "min_ms": 615.75
+    }
+   },
+   "sdpa_mask_patch": {
+    "bit_identical_to_upstream": true,
+    "time": {
+     "median_ms": 390.42,
+     "min_ms": 390.13
+    }
+   },
+   "flash_attention_2": {
+    "vs_fp32": {
+     "max_abs": 3.877859115600586,
+     "rel_l2": 0.030115745961666107,
+     "min_token_cos": 0.9295837879180908
+    },
+    "vs_sdpa_bf16": {
+     "max_abs": 4.0625,
+     "rel_l2": 0.01930776610970497,
+     "min_token_cos": 0.9504836797714233
+    },
+    "time": {
+     "median_ms": 127.7,
+     "min_ms": 127.58
+    }
+   }
+  }
+ }
+}

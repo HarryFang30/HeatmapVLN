@@ -222,3 +222,38 @@ python scripts/tools/summarize_latency.py <输出目录>/workers --output-dir <�
 - **相对 native 的额外开销**：每次规划多出历史认知头 0.59 s、桥约 1 ms、里程计查询约 1.3 s；每步多一次约 13 ms 的里程计写入；每集多一次首次建图。
 - **边界**：只有 4 集、99 次调用，都在同一个场景；机器是多人共用的，CPU 渲染受别人负载影响；这些数不能外推到别的卡或别的场景。
 
+
+## 6. FlashAttention 2（2026-10-14 编好，默认不用）
+
+**在哪**：`/workspace/fa_build/site`（flash-attn 2.8.3.post1；wheel 在 `/workspace/fa_build/dist/`）。
+**没有装进 `/opt/conda`**：要用就在命令前加 `PYTHONPATH=/workspace/fa_build/site`，不加就和以前一模一样。
+
+为什么不直接装进 `/opt/conda`：这台机器上所有任务共用这一个解释器，而 `flash_attention_2` 写在好几份配置里
+（`train_config_internnav_8gpu.yaml`、`train_stage3_pano_system1_h1024_8gpu.yaml` 等）。它们现在是因为
+flash_attn 不存在才**静默退回 SDPA**（`src/models/qwen2_5_vl/integration.py:_load_with_attn_fallback`），
+一旦装进去，下次启动就悄悄换了注意力实现。真要装进去，先确认没有任务在用这些配置，再：
+
+```bash
+docker exec fjl-habitat /opt/conda/bin/python -m pip install --no-deps /workspace/fa_build/dist/flash_attn-2.8.3.post1-cp311-cp311-linux_x86_64.whl
+```
+
+**为什么要自己编**：官方 wheel 只到 torch 2.8，这里是 torch 2.11；容器自带的 nvcc 是 11.3；pip 的
+`nvidia-cuda-nvcc-cu12` 只有 ptxas / libnvvm，没有 nvcc 本体。所以用 NVIDIA 的 redist 包拼了一个私有的
+CUDA 12.8.1 工具链（`/workspace/fa_build/cuda-12.8`；cuBLAS 等头文件取自 torch 自带的 cu12 wheel，版本与
+12.8.1 完全相同）。重来一遍：容器里 `bash scripts/tools/build_flash_attn_4090.sh`，约 11 分钟（`nice 19`、
+24 个并行任务）。只编 sm_80，和官方 wheel 一样在 4090（sm_89）上跑。
+**坑**：`docker exec` 的 PATH 里没有 `/opt/conda/bin`，找不到 ninja 时 torch 会悄悄改成逐个编译（几个小时），脚本已处理。
+
+**验证**（`scripts/tools/check_flash_attn_vision.py`，结果 `docs/experiments/exp20-flash-attn-check-4090.json`）：
+- transformers 4.51.0 认得它：`is_flash_attn_2_available()` 为真，Qwen2.5-VL 模块级的 varlen / rotary 导入都在。
+- 算子：第二轮形状的真实窗口划分（8620 token、174 窗口）上，和 fp32 参照比，前向误差与 SDPA bf16 相同
+  （相对 L2 0.0021 / 0.0021），反向 dq、dk、dv 为 0.0027 / 0.0027 / 0.0026（SDPA bf16 为 0.0033 / 0.0033 / 0.0026）。
+- 真实视觉塔（`InternNav_Model` 的 `visual.*`）：和 fp32 参照比一样准（相对 L2：FA2 0.032 / 0.030，
+  SDPA 0.032 / 0.031，第一轮 / 第二轮形状），但**不逐位相同**（FA2 对 SDPA bf16 相差约 1.9%）。
+- 快多少见 `docs/experiments/exp20-latency-report.md` §9。
+
+**切到 FA2 和打掩码补丁不是一回事。** 掩码补丁输出逐位相同，所以 §5 的计时中立性判据（动作逐调用相同）对它有意义；
+FA2 改了数值，动作会变，要按评测标准重跑 SR/SPL 才能说效果不变，跑个金丝雀不够。
+
+**怎么用**：模型服务端没有命令行开关，要一份把 `attn_implementation` 改成 `flash_attention_2` 的配置，
+再在启动命令前加 `PYTHONPATH=/workspace/fa_build/site`。这样整个模型（视觉塔和 LLM）都切 FA2——**这条路还没有端到端跑过**。

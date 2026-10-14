@@ -2513,6 +2513,19 @@ C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz
   要变成可报的数：按 `docs/ops/deploy_rtx4090.md` §5 开 `PPA_EVAL_TIMING=1`，配 `HEATMAPVLN_QWEN_VISION_MASK_PATCH=1`
   与不配各跑一次金丝雀，先按 §5 的计时中立性判据确认动作逐调用相同，再报阶段时间。
 
+**延迟补记（2026-10-14）：在 4090 上编好 FlashAttention 2。** 用户要求在 4090 环境装上 flash-attention。
+- **装在哪**：官方 wheel 只到 torch 2.8，容器是 torch 2.11、nvcc 11.3，所以用 NVIDIA redist 包拼了私有 CUDA 12.8.1
+  工具链，从源码编了 flash-attn 2.8.3.post1（`scripts/tools/build_flash_attn_4090.sh`，约 11 分钟）。
+  放在 `/workspace/fa_build/site`，靠 `PYTHONPATH` 启用，**没有进 `/opt/conda`**：好几份配置写着 `flash_attention_2`，
+  现在因缺包静默退回 SDPA，装进共享解释器会悄悄改掉它们（`docs/ops/deploy_rtx4090.md` §6）。
+- **验证**（`scripts/tools/check_flash_attn_vision.py`，[exp20-flash-attn-check-4090.json](exp20-flash-attn-check-4090.json)）：
+  transformers 4.51.0 认得它；算子前向、反向与 fp32 参照的误差不大于 SDPA bf16；真实视觉塔输出和 fp32 比一样准，
+  但与 SDPA 不逐位相同（相差约 1.9%）。
+- **视觉塔每趟**：452.8 / 616.6 ms（现在）→ 266.2 / 390.4 ms（掩码补丁）→ **99.1 / 127.7 ms（FA2）**；
+  每次规划四趟合计 2139 → 1313 → 454 ms。补丁那一行与 10-12 的算子基准吻合（186.5 / 226.1 vs 192 / 234 ms）。
+- **能支撑到哪一步**：只到视觉塔。FA2 改了数值，是另一个配置，**效果要重跑评测才能说不变**；端到端延迟
+  （减法预测 ~1.9 s/次规划）和 LLM 部分的收益都没测。
+
 
 ### EXP-21 参数敏感性：历史帧数 K、快系统采样条数 S、去噪步数 M
 
