@@ -17,9 +17,8 @@ The three implementations are switched by swapping each block's attention class:
 ``Qwen2_5_VLVisionSdpaAttention`` and ``Qwen2_5_VLVisionFlashAttention2`` share the
 same parameters and differ only in ``forward``, so one set of weights serves all three.
 
-Usage (inside the 4090 container, flash-attn on PYTHONPATH):
-    PYTHONPATH=/workspace/fa_build/site CUDA_VISIBLE_DEVICES=5 \\
-        /opt/conda/bin/python scripts/tools/check_flash_attn_vision.py --out fa_check.json
+Usage (inside the 4090 container; flash-attn installed, or a private build on PYTHONPATH):
+    CUDA_VISIBLE_DEVICES=5 /opt/conda/bin/python scripts/tools/check_flash_attn_vision.py --out fa_check.json
 """
 
 from __future__ import annotations

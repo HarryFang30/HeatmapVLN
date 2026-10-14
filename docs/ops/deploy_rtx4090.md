@@ -223,19 +223,16 @@ python scripts/tools/summarize_latency.py <输出目录>/workers --output-dir <�
 - **边界**：只有 4 集、99 次调用，都在同一个场景；机器是多人共用的，CPU 渲染受别人负载影响；这些数不能外推到别的卡或别的场景。
 
 
-## 6. FlashAttention 2（2026-10-14 编好，默认不用）
+## 6. FlashAttention 2（2026-10-14 编好并装进 `/opt/conda`）
 
-**在哪**：`/workspace/fa_build/site`（flash-attn 2.8.3.post1；wheel 在 `/workspace/fa_build/dist/`）。
-**没有装进 `/opt/conda`**：要用就在命令前加 `PYTHONPATH=/workspace/fa_build/site`，不加就和以前一模一样。
+**在哪**：`/opt/conda` 里的 flash-attn 2.8.3.post1（wheel 在 `/workspace/fa_build/dist/`，先拿来验证的那份独立副本
+`/workspace/fa_build/site` 也还在）。用户 2026-10-14 要求装进共享解释器，装之前确认过容器里没有在跑的模型或训练任务。
 
-为什么不直接装进 `/opt/conda`：这台机器上所有任务共用这一个解释器，而 `flash_attention_2` 写在好几份配置里
-（`train_config_internnav_8gpu.yaml`、`train_stage3_pano_system1_h1024_8gpu.yaml` 等）。它们现在是因为
+**装进去之后变了什么**：这台机器所有任务共用这一个解释器，而 `flash_attention_2` 写在好几份配置里
+（`train_config_internnav_8gpu.yaml`、`train_stage3_pano_system1_h1024_8gpu.yaml` 等）。它们以前是因为
 flash_attn 不存在才**静默退回 SDPA**（`src/models/qwen2_5_vl/integration.py:_load_with_attn_fallback`），
-一旦装进去，下次启动就悄悄换了注意力实现。真要装进去，先确认没有任务在用这些配置，再：
-
-```bash
-docker exec fjl-habitat /opt/conda/bin/python -m pip install --no-deps /workspace/fa_build/dist/flash_attn-2.8.3.post1-cp311-cp311-linux_x86_64.whl
-```
+**现在会真的用 FA2**。部署配置 `ppa_action_refine_v2_8gpu.yaml` 写的是 `sdpa`，不受影响——SDPA 那条路的代码一行没变。
+拿这些配置以前的结果做对照时要记得：以前它们跑的是 SDPA。卸掉：`/opt/conda/bin/python -m pip uninstall -y flash-attn`。
 
 **为什么要自己编**：官方 wheel 只到 torch 2.8，这里是 torch 2.11；容器自带的 nvcc 是 11.3；pip 的
 `nvidia-cuda-nvcc-cu12` 只有 ptxas / libnvvm，没有 nvcc 本体。所以用 NVIDIA 的 redist 包拼了一个私有的
@@ -255,5 +252,5 @@ CUDA 12.8.1 工具链（`/workspace/fa_build/cuda-12.8`；cuBLAS 等头文件取
 **切到 FA2 和打掩码补丁不是一回事。** 掩码补丁输出逐位相同，所以 §5 的计时中立性判据（动作逐调用相同）对它有意义；
 FA2 改了数值，动作会变，要按评测标准重跑 SR/SPL 才能说效果不变，跑个金丝雀不够。
 
-**怎么用**：模型服务端没有命令行开关，要一份把 `attn_implementation` 改成 `flash_attention_2` 的配置，
-再在启动命令前加 `PYTHONPATH=/workspace/fa_build/site`。这样整个模型（视觉塔和 LLM）都切 FA2——**这条路还没有端到端跑过**。
+**怎么用**：模型服务端没有命令行开关，要一份把 `attn_implementation` 改成 `flash_attention_2` 的配置。
+这样整个模型（视觉塔和 LLM）都切 FA2——**这条路还没有端到端跑过**。

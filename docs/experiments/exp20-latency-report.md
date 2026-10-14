@@ -156,7 +156,7 @@ K=8 时第一轮 9 张共 7056 patch、第二轮多一张共 8620 patch，正好
 ## 9. 换成 FlashAttention 2：视觉塔实测（2026-10-14）
 
 4090 上原来没有 flash-attn（官方 wheel 只到 torch 2.8，这里是 2.11）。2026-10-14 在容器里自己编了一份，
-放在独立目录、默认不用（`docs/ops/deploy_rtx4090.md` §6）。下面**只跑视觉塔**：真实权重（`InternNav_Model`
+已装进 `/opt/conda`；部署配置写的是 `sdpa`，所以部署本身不用它（`docs/ops/deploy_rtx4090.md` §6）。下面**只跑视觉塔**：真实权重（`InternNav_Model`
 的 `visual.*`）、部署形状、随机输入，三种实现共用同一份权重，每格是 10 次的中位数
 （`scripts/tools/check_flash_attn_vision.py`，GPU 0，卡上另有一个空闲进程；结果
 [exp20-flash-attn-check-4090.json](exp20-flash-attn-check-4090.json)）。

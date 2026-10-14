@@ -2516,8 +2516,9 @@ C500 开发机与它的 AFS 在 2026-09-28 不可用，`model/exp19_behavior_viz
 **延迟补记（2026-10-14）：在 4090 上编好 FlashAttention 2。** 用户要求在 4090 环境装上 flash-attention。
 - **装在哪**：官方 wheel 只到 torch 2.8，容器是 torch 2.11、nvcc 11.3，所以用 NVIDIA redist 包拼了私有 CUDA 12.8.1
   工具链，从源码编了 flash-attn 2.8.3.post1（`scripts/tools/build_flash_attn_4090.sh`，约 11 分钟）。
-  放在 `/workspace/fa_build/site`，靠 `PYTHONPATH` 启用，**没有进 `/opt/conda`**：好几份配置写着 `flash_attention_2`，
-  现在因缺包静默退回 SDPA，装进共享解释器会悄悄改掉它们（`docs/ops/deploy_rtx4090.md` §6）。
+  先放在独立目录验证，随后应用户要求装进 `/opt/conda`（装前确认容器里没有在跑的模型或训练任务）。
+  **副作用**：好几份配置写着 `flash_attention_2`，以前因缺包静默退回 SDPA，**从此真的用 FA2**；部署配置写的是 `sdpa`，
+  不受影响（`docs/ops/deploy_rtx4090.md` §6）。
 - **验证**（`scripts/tools/check_flash_attn_vision.py`，[exp20-flash-attn-check-4090.json](exp20-flash-attn-check-4090.json)）：
   transformers 4.51.0 认得它；算子前向、反向与 fp32 参照的误差不大于 SDPA bf16；真实视觉塔输出和 fp32 比一样准，
   但与 SDPA 不逐位相同（相差约 1.9%）。
