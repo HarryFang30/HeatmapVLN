@@ -62,6 +62,11 @@ while true; do
   sleep 60
 done
 log "no client for ${IDLE_S}s: collection is over"
+# From round 2 on, collect_servers_910b.sh ran the servers; idle ports after its servers
+# crashed are not the end of a collection, so stop here instead of training on the rest.
+if [[ "$(cut -d' ' -f2- "$ROUND_DIR/SERVERS_STATUS" 2>/dev/null)" == STOPPED* ]]; then
+  die "the collection servers failed: $(cat "$ROUND_DIR/SERVERS_STATUS")"
+fi
 
 # 2. stop the servers -----------------------------------------------------------
 status "stopping the collection servers"
