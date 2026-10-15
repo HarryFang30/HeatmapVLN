@@ -58,6 +58,7 @@
 | [EXP-23](#exp-23-system2-dagger-微调主模型在-r2r-ce-val_unseen-上的-sr-能涨多少) | 只靠训练刷分：在主模型自己访问的 train 状态上做 DAgger，LoRA 微调 System2（决策开适配器、Z0 关适配器），全量两种子与 A0 配对 | ⏳ | 判据已写死；采集器 / 标注器 / 训练器 / 服务端在建 |
 | [EXP-24](#exp-24-步数预算用完时发-stop撞上限的集能救回多少) | 步数预算的最后一个动作改为 STOP（`--stop_at_step_budget`）：撞 500 步上限、停在 3 m 内却因没调 STOP 判败的集能救回多少 | ⏸ | 开关已加（默认关）；A0 逐集事后分析预测合并 +1.74pt。**重跑核对用户 2026-10-12 取消**，数字只是事后预测 |
 | [EXP-25](#exp-25-转圈处的-stopspinbreak与导航池探针第一轮失败之后怎么提点) | EXP-23 第一轮失败后的提点路线：只在转圈处监督 STOP 的 LoRA（不用 oracle 转向/像素），并用 EnvDrop / val_seen / ScaleVLN 探针测导航池能否被新数据打开 | ⏳ | 判据 2026-10-15 写死；进行中 |
+| [EXP-26](#exp-26-scalevln-新场景-sft用底座自己格式的专家数据补没见过的场景) | 用 InternData-N1 ScaleVLN（HM3D 新场景、底座自己的标签格式）做 LoRA SFT，补 val_unseen 上随新场景而来的选错方向 | ⏳ | 判据 2026-10-15 写死；下载中 |
 
 ### 跨实验：未来头退化的三层证据链
 
@@ -3026,6 +3027,44 @@ SR 的空间（A0 两种子）：停止池（进过 3 m 圈却失败）8.1/9.6pt
    5 个 ScaleVLN（HM3D）场景（按 sha256 预先选定，7.95 GB 压缩包），只解 meta/data/两个视角 RGB（2.2 GB，压缩包已删），
    拉到 4090 `/workspace/exp23/data/interndata_n1/scalevln/`（446 集）。910B 上 `zhr_1/tmp/scalevln` 仍留 2.2 GB，待用户删。
    工具 `scripts/tools/teacher_forced_agreement.py`（`42cfa6f`）在 r2r 上前 100 个样本一致 0.99。
+
+8. **转向（用户 2026-10-15，在分叉出的会话里，看到 A 的 G-A 与 B1/B2 之后、任何 ScaleVLN 训练结果之前）**：
+   用户问"是在提点的路上还是陷入了局部最优"。回答：局部最优——两天半零提升，一直在给"自采 + 自写标签 + DAgger"打补丁；
+   停止池扣掉步数预算 STOP 后净增约 +0.6~1.2pt，低于两种子合并 SE 0.71。导航池（29pt）主要随新场景而来（B 6.3% vs 15.4%），
+   而 ScaleVLN（794 个 HM3D 新场景、底座自己的标签格式）被 InternNav 公开的 System2 训练注释掉、底座没见过。用户同意：
+   **主线改为 ScaleVLN SFT（EXP-26），A2 不训，EnvDrop 降为备选（GPU 空闲时采），A 的缩放若过 G-A 直接上 val（不跑金丝雀）**；
+   910B 存储上限放宽到 300 GB；此后两台机器由分叉出的会话统一调度（用户在原会话里确认）。
+
+---
+
+### EXP-26 ScaleVLN 新场景 SFT：用底座自己格式的专家数据补"没见过的场景"
+
+**问题.** EXP-25 的探针把 val_unseen 的导航失败（从没进 3 m 圈，A0 约 29pt）主要归到新场景：首个像素目标走错 B 在训练集 episode
+3.9%、val_seen 6.3%、val_unseen 15.4%；停在 7 m 外 E7 在 val_seen 9.0%、val_unseen 16.2%。底座在自己训练过的 InternData-N1 r2r 上
+teacher-forced 与专家决策类别一致 0.975（600 样本，`scripts/tools/teacher_forced_agreement.py`），在 ScaleVLN 新场景上的读数见 B3。
+ScaleVLN 在 InternNav 公开的 System2 训练脚本里被注释掉；StreamVLN 去掉 ScaleVLN 掉 2.9pt。问题：用 ScaleVLN 的专家数据
+（底座自己的标签格式，无需模拟器、无需我们写标签）做 LoRA SFT，能否在 val_unseen 上提点？
+
+**假设.** H-S：在 ~150 个 HM3D 场景的 ScaleVLN 专家样本上（混一半 InternData r2r 回放）做 LoRA SFT，能减少未见场景里的选错方向，
+val_unseen SR 提升。
+
+**判据（2026-10-15 13:00 CST 写死，在任何 ScaleVLN 训练或评测结果之前；B3 的完整读数不改这些判据）.**
+- O1（离线，新场景）：B3 的 5 个 ScaleVLN 场景（不进训练）上，teacher-forced 决策类别一致率比底座（同一批样本）高 ≥ +3pt。
+- O2（离线，保持）：r2r 的两个留出场景（17DRP5sb8fy、5LpN3gDmAk7，不进训练）上一致率比底座降 ≤ 1pt。
+- O3（离线，停止漂移）：EXP-23 留出记录上用 `stratified_gates.py`，远处 STOP 增量过 EXP-25 G-A 的 (b)（像素目标后 3–6 m ≤ +0.25pt、
+  转向后 3–6 m ≤ +0.4pt、>6 m ≤ +0.3pt），反向转过 (d)（≤1%）。O1–O3 全过才上 val。
+- V（val_unseen 种子 42，FA2，开步数预算 STOP，与 A0 配对；600 集 −3pt 停止规则照旧）：标准协议 ΔSR ≥ +1.0 → 跑种子 1337；
+  H-S 成立：两种子合并标准协议 ΔSR ≥ +1 且 95% 区间 >0（候选 FA2、A0 sdpa，见 EXP-23 run record 11）。机制读数（只报）：val 上的 B 与 E7。
+- 若 O1 不过（新场景一致率没涨）：LoRA 学不进 → 停在离线，不占 val；若 O1 过、O2/O3 不过：减回放外的步数或加大回放比例重训一次。
+
+**设置.**
+- 数据：910B 上用用户自己的 HF 登录下载 150 个 ScaleVLN 场景（794 个里按 sha256("exp25-scalevln-train:"+场景) 排序取前 150，
+  B3 的 5 个除外；260 GB 压缩包，只解 meta/data/125cm 0°/30° RGB，压缩包解完即删），拉到 4090 打包。
+- 样本（`scripts/tools/build_replay_stream.py`，样本与目标全由 `src/data/interndata_replay.py` 的专家规则生成）：ScaleVLN 32,000
+  （每场景先封顶 400，摊开到所有场景）+ InternData r2r 32,000（24 个训练场景，EXP-23 留出场景除外）；STOP 样本按 InternNav
+  的做法 ×5（保持底座的 STOP 校准）；修整到整片。
+- 训练：从底座新起 LoRA r32/α64，lr 5e-5，全局 batch 64，一遍（约 80k 样本、约 10 h），910B 8 卡；不含任何 DAgger 样本。
+- 评测机位：4090 GPU 0/4/5；EnvDrop 采集只在这些卡空闲时跑。
 
 ---
 
