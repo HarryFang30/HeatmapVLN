@@ -3081,15 +3081,23 @@ val_unseen SR 提升。
    910B 因此空了约 5.3 小时。之后的流程改为：任何一步卡住都不等齐，先用已有的往下走。
 4. **O2 的基准**：底座在 r2r 两个留出场景上一致 0.975（与 B3 同一工具、同一批样本规则）；O1 的基准是 B3 的 0.859。
 5. **S1 训练中**：11:45 UTC 起，1,264 步、每步约 28.6 s，预计 21:45 UTC 训完；中途检查点（每 100 步，保留最近 2 个）会先拿去做 O1/O2。
-6. **前提更正（2026-10-15 16:40 UTC，在任何 S1 离线或闭环结果之前）**：InternNav 只在 System2 单训脚本 `train_system2.sh` 里注释掉了
-   ScaleVLN，发布权重所出的 DualVLN 联合训练 `train_dual_system.sh` 用了 `scalevln_125cm_0_30%30`、`scalevln_60cm_30_30%30`；
-   用户确认 ScaleVLN 已训进底座。判据一字不改，读法改三处：
-   - S1 不是"补没见过的场景"，而是在底座训过的数据上加大 ScaleVLN 的权重再训一遍。InternNav 已用 794 个 HM3D 场景训过、底座在
-     val_unseen 上的 B 仍是 15.4%，"多给 HM3D 场景"这个杠杆基本已被拉过。预期下调（不进判据）：0 ~ +1pt，单种子检不出，必须两种子合并。
-   - B3 的 0.859 与 r2r 的 0.975 两边都是底座训过的数据，差的是 ScaleVLN 的标签更难预测（合成指令等），不是场景新。O1 过只说明
-     LoRA 动了模型，不说明新场景泛化；它仍是上 val 的必要条件，O2/O3 照旧挡坏模型。
-   - 若有增益，它是 System2 本身的改进，native 换上同一个适配器也会涨（同 EXP-24 的边界），不是方法相对 native 的增益。
+6. **前提更正（2026-10-15 16:20 UTC 写、16:50 UTC 改正机制，都在任何 S1 离线或闭环结果之前）**：
+   - 起因：InternNav 的 System2 单训脚本 `train_system2.sh` 注释掉了 ScaleVLN，而 DualVLN 联合训练 `train_dual_system.sh` 用了
+     `scalevln_125cm_0_30%30`、`scalevln_60cm_30_30%30`，一度据此记成"ScaleVLN 已训进底座"。**这条机制不对**：联合训练设
+     `--tune_mm_llm False`（及 vision、mlp 都 False），`internnav/trainer/internvla_n1_trainer.py` 据此冻结 `model.model` 与 `lm_head`，
+     只训 System1 各模块与 `latent_queries`，损失只有 System1 的 flow-matching，System2 的文本决策没在这一阶段见过 ScaleVLN。
+   - 真正没定的是 System2 自己的 SFT：DualVLN 报告说 System2 沿用 StreamVLN 的数据配方（含 ScaleVLN），而公开的 `train_system2.sh`
+     连 DAgger 数据都没有，不是发布权重的配方。所以底座 System2 见没见过 ScaleVLN 未定（推测更可能见过）。
+   - 判据一字不改。不论见没见过，读法改三处：(1) S1 的剂量（150 个场景、约 4 万 ScaleVLN 样本、LoRA 一遍，约为原 System2 SFT 样本量的 2%）
+     远小于外部参照里 ScaleVLN 的 +2.9pt（StreamVLN，全参、整份），预期下调（不进判据）到每种子约 0 ~ +1pt，单种子检不出，必须两种子合并。
+     (2) O1 的一致率只比决策类别，且留出场景与训练同源（同一 speaker 合成指令、同一标注管线），过 O1 只说明 LoRA 学进去了，不说明新场景泛化；
+     它仍是上 val 的必要条件，O2/O3 照旧挡坏模型。(3) 若有增益，它是 System2 本身的改进，native 换上同一个适配器也会涨（同 EXP-24 的边界）。
    - V 的候选定为训完的适配器。第 500 步检查点若过 O1–O3 照样开跑 val，但只当灾难检查（600 集停止规则），终版适配器过 O1–O3 即让卡。
+7. **训练器的损失归一化与 InternNav 不同（2026-10-15 16:50 UTC，在任何 S1 离线或闭环结果之前发现）**：`scripts/train_system2_lora.py` 的
+   `per_sample_token_mean_loss` 先在每个样本的监督 token 上求平均、再对样本等权平均；InternNav 用 HF Trainer 的 token 级平均。
+   STOP 样本只有约 2 个监督 token（STOP、`<|im_end|>`），像素样本约 10 个，于是首 token 的决策类别上 STOP 比底座训练时重约 5 倍、转向约 2–5 倍，
+   再叠加 STOP ×5 上采样，"按 InternNav 的做法保持 STOP 校准"不成立。EXP-23 第一轮、1b、A 都用的这个训练器，三者都多停，这可能是原因之一（未检验）。
+   S1 不中断：第 500 步的 O3（远处 STOP 增量）直接量它有没有多停。此后的训练改用 token 级平均（训练器加开关，默认不变以便复现旧运行）。
 
 ---
 
