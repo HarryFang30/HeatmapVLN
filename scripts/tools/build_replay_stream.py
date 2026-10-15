@@ -194,6 +194,10 @@ def main(argv=None) -> int:
         "epochs": 1.0,
         "replay_fraction": 1.0,
         "roots": {k: str(v.resolve()) for k, v in roots.items()},
+        # train_system2_lora.py copies these three into the adapter manifest; no DAgger records here
+        "record_roots": [],
+        "label_roots": [],
+        "replay_root": json.dumps({k: str(v.resolve()) for k, v in roots.items()}, sort_keys=True),
         "holdout": {"scenes": sorted(excluded), "count": len(excluded)},
         "selection": {
             "rule": "EXP-26: expert labels only (interndata_replay), per-scene cap, seeded draw, STOP upsampled",
