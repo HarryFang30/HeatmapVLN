@@ -1,0 +1,1475 @@
+{
+ "schema": "exp25-probe-sample-v1",
+ "split_file": "/workspace/R2R_VLNCE_v1-3_preprocessed/envdrop/envdrop.json.gz",
+ "split_sha256": "b9a90ebe186181843b090041876fb2255fb8f5a7a1c35bc38d339b595c47b66e",
+ "population": 146304,
+ "n": 300,
+ "seed": 25,
+ "rule": "scenes as strata, largest-remainder proportional allocation (ties by scene name); random.Random(seed).sample over ascending episode ids, scenes in sorted order, one generator; sample sorted by (scene, episode_id) and dealt round-robin into shards",
+ "scenes": 60,
+ "scenes_sampled": 54,
+ "per_scene": {
+  "17DRP5sb8fy": {
+   "episodes": 379,
+   "chosen": 1
+  },
+  "1LXtFkjw3qL": {
+   "episodes": 1385,
+   "chosen": 3
+  },
+  "1pXnuDYAj8r": {
+   "episodes": 1380,
+   "chosen": 3
+  },
+  "29hnd4uzFmX": {
+   "episodes": 2232,
+   "chosen": 5
+  },
+  "2n8kARJN3HM": {
+   "episodes": 5777,
+   "chosen": 12
+  },
+  "5LpN3gDmAk7": {
+   "episodes": 3147,
+   "chosen": 6
+  },
+  "5q7pvUzZiYa": {
+   "episodes": 948,
+   "chosen": 2
+  },
+  "759xd9YjKW5": {
+   "episodes": 680,
+   "chosen": 1
+  },
+  "7y3sRwLe3Va": {
+   "episodes": 1274,
+   "chosen": 3
+  },
+  "82sE5b5pLXE": {
+   "episodes": 3287,
+   "chosen": 7
+  },
+  "8WUmhLawc2A": {
+   "episodes": 2718,
+   "chosen": 6
+  },
+  "B6ByNegPMKs": {
+   "episodes": 6837,
+   "chosen": 14
+  },
+  "D7G3Y4RVNrH": {
+   "episodes": 272,
+   "chosen": 1
+  },
+  "D7N2EKCX4Sj": {
+   "episodes": 5142,
+   "chosen": 11
+  },
+  "E9uDoFAP3SH": {
+   "episodes": 7433,
+   "chosen": 15
+  },
+  "EDJbREhghzL": {
+   "episodes": 887,
+   "chosen": 2
+  },
+  "GdvgFV5R1Z5": {
+   "episodes": 25,
+   "chosen": 0
+  },
+  "HxpKQynjfin": {
+   "episodes": 162,
+   "chosen": 0
+  },
+  "JF19kD82Mey": {
+   "episodes": 149,
+   "chosen": 0
+  },
+  "JeFG25nYj2p": {
+   "episodes": 1394,
+   "chosen": 3
+  },
+  "JmbYfDe2QKZ": {
+   "episodes": 1236,
+   "chosen": 3
+  },
+  "PX4nDJXEHrG": {
+   "episodes": 7294,
+   "chosen": 15
+  },
+  "Pm6F8kyY3z2": {
+   "episodes": 189,
+   "chosen": 0
+  },
+  "PuKPg4mmafe": {
+   "episodes": 1072,
+   "chosen": 2
+  },
+  "S9hNv5qa7GM": {
+   "episodes": 2265,
+   "chosen": 5
+  },
+  "SN83YJsR3w2": {
+   "episodes": 5645,
+   "chosen": 12
+  },
+  "ULsKaCPVFJR": {
+   "episodes": 1196,
+   "chosen": 2
+  },
+  "Uxmj2M2itWa": {
+   "episodes": 2325,
+   "chosen": 5
+  },
+  "V2XKFyX4ASd": {
+   "episodes": 2140,
+   "chosen": 4
+  },
+  "VFuaQ6m2Qom": {
+   "episodes": 2287,
+   "chosen": 5
+  },
+  "VLzqgDo317F": {
+   "episodes": 1640,
+   "chosen": 3
+  },
+  "VVfe2KiqLaN": {
+   "episodes": 674,
+   "chosen": 1
+  },
+  "Vvot9Ly1tCj": {
+   "episodes": 5599,
+   "chosen": 11
+  },
+  "VzqfbhrpDEA": {
+   "episodes": 6497,
+   "chosen": 13
+  },
+  "XcA2TqTSSAj": {
+   "episodes": 185,
+   "chosen": 0
+  },
+  "YmJkqBEsHnH": {
+   "episodes": 35,
+   "chosen": 0
+  },
+  "ZMojNkEp431": {
+   "episodes": 1716,
+   "chosen": 4
+  },
+  "aayBHfsNo7d": {
+   "episodes": 609,
+   "chosen": 1
+  },
+  "ac26ZMwG7aT": {
+   "episodes": 4820,
+   "chosen": 10
+  },
+  "b8cTxDM8gDG": {
+   "episodes": 933,
+   "chosen": 2
+  },
+  "cV4RVeZvu5T": {
+   "episodes": 1102,
+   "chosen": 2
+  },
+  "dhjEzFoUFzH": {
+   "episodes": 6078,
+   "chosen": 12
+  },
+  "e9zR4mvMWw7": {
+   "episodes": 1179,
+   "chosen": 2
+  },
+  "gTV8FGcVJC9": {
+   "episodes": 4735,
+   "chosen": 10
+  },
+  "i5noydFURQK": {
+   "episodes": 665,
+   "chosen": 1
+  },
+  "jh4fc5c5qoQ": {
+   "episodes": 489,
+   "chosen": 1
+  },
+  "kEZ7cmS4wCh": {
+   "episodes": 4641,
+   "chosen": 10
+  },
+  "mJXqzFtmKg4": {
+   "episodes": 4627,
+   "chosen": 9
+  },
+  "p5wJjkQkbXX": {
+   "episodes": 3310,
+   "chosen": 7
+  },
+  "pRbA3pwrgk9": {
+   "episodes": 1454,
+   "chosen": 3
+  },
+  "qoiz87JEwZ2": {
+   "episodes": 1500,
+   "chosen": 3
+  },
+  "r1Q1Z4BcV1o": {
+   "episodes": 2064,
+   "chosen": 4
+  },
+  "r47D5H71a5s": {
+   "episodes": 1366,
+   "chosen": 3
+  },
+  "rPc6DW4iMge": {
+   "episodes": 1778,
+   "chosen": 4
+  },
+  "s8pcmisQ38h": {
+   "episodes": 316,
+   "chosen": 1
+  },
+  "sKLMLpTHeUy": {
+   "episodes": 1493,
+   "chosen": 3
+  },
+  "sT4fr6TAbpF": {
+   "episodes": 977,
+   "chosen": 2
+  },
+  "uNb9QFRL6hY": {
+   "episodes": 2852,
+   "chosen": 6
+  },
+  "ur6pFq6Qu1A": {
+   "episodes": 2087,
+   "chosen": 4
+  },
+  "vyrNrziPKCB": {
+   "episodes": 9726,
+   "chosen": 20
+  }
+ },
+ "shards": [
+  {
+   "shard": 0,
+   "episodes": 100,
+   "list_sha256": "637e4c8958d76fc3dabfcbf161a6f370db87556a139156007404951e685c6b77",
+   "dataset_sha256": "9c0b44f73b8316db653d9ef93e13932b78cfecd586cd7d12fea0fb62e45211c5"
+  },
+  {
+   "shard": 1,
+   "episodes": 100,
+   "list_sha256": "8d96525fef56d838f650d13c3d1f0ce5e882d1992eaaa33e66dd8b60bb35930c",
+   "dataset_sha256": "0b6c31784ff1a77e13dd5775028b42fb24c25cf532564f03cfefda141429f21f"
+  },
+  {
+   "shard": 2,
+   "episodes": 100,
+   "list_sha256": "5b440d1e834ce28cf44bd67a65699ec16c180bf2a594466a56f4afa24c4e381d",
+   "dataset_sha256": "1b672e7a1035abddff2a93194415e484c8cf57a06fcd9ae3170107247b463005"
+  }
+ ],
+ "episodes": [
+  {
+   "scene_id": "17DRP5sb8fy",
+   "episode_id": 111863
+  },
+  {
+   "scene_id": "1LXtFkjw3qL",
+   "episode_id": 113748
+  },
+  {
+   "scene_id": "1LXtFkjw3qL",
+   "episode_id": 114155
+  },
+  {
+   "scene_id": "1LXtFkjw3qL",
+   "episode_id": 114341
+  },
+  {
+   "scene_id": "1pXnuDYAj8r",
+   "episode_id": 91821
+  },
+  {
+   "scene_id": "1pXnuDYAj8r",
+   "episode_id": 92704
+  },
+  {
+   "scene_id": "1pXnuDYAj8r",
+   "episode_id": 93038
+  },
+  {
+   "scene_id": "29hnd4uzFmX",
+   "episode_id": 81290
+  },
+  {
+   "scene_id": "29hnd4uzFmX",
+   "episode_id": 81541
+  },
+  {
+   "scene_id": "29hnd4uzFmX",
+   "episode_id": 82195
+  },
+  {
+   "scene_id": "29hnd4uzFmX",
+   "episode_id": 82400
+  },
+  {
+   "scene_id": "29hnd4uzFmX",
+   "episode_id": 82885
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 106912
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 107375
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 107507
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 108477
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 108831
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 110089
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 110101
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 110388
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 110610
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 110714
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 111012
+  },
+  {
+   "scene_id": "2n8kARJN3HM",
+   "episode_id": 111518
+  },
+  {
+   "scene_id": "5LpN3gDmAk7",
+   "episode_id": 133339
+  },
+  {
+   "scene_id": "5LpN3gDmAk7",
+   "episode_id": 133362
+  },
+  {
+   "scene_id": "5LpN3gDmAk7",
+   "episode_id": 134859
+  },
+  {
+   "scene_id": "5LpN3gDmAk7",
+   "episode_id": 135085
+  },
+  {
+   "scene_id": "5LpN3gDmAk7",
+   "episode_id": 135542
+  },
+  {
+   "scene_id": "5LpN3gDmAk7",
+   "episode_id": 135714
+  },
+  {
+   "scene_id": "5q7pvUzZiYa",
+   "episode_id": 36357
+  },
+  {
+   "scene_id": "5q7pvUzZiYa",
+   "episode_id": 36375
+  },
+  {
+   "scene_id": "759xd9YjKW5",
+   "episode_id": 136720
+  },
+  {
+   "scene_id": "7y3sRwLe3Va",
+   "episode_id": 138356
+  },
+  {
+   "scene_id": "7y3sRwLe3Va",
+   "episode_id": 138692
+  },
+  {
+   "scene_id": "7y3sRwLe3Va",
+   "episode_id": 138817
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 20667
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 20675
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 21042
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 22041
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 22277
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 22927
+  },
+  {
+   "scene_id": "82sE5b5pLXE",
+   "episode_id": 23167
+  },
+  {
+   "scene_id": "8WUmhLawc2A",
+   "episode_id": 48925
+  },
+  {
+   "scene_id": "8WUmhLawc2A",
+   "episode_id": 49044
+  },
+  {
+   "scene_id": "8WUmhLawc2A",
+   "episode_id": 49280
+  },
+  {
+   "scene_id": "8WUmhLawc2A",
+   "episode_id": 50869
+  },
+  {
+   "scene_id": "8WUmhLawc2A",
+   "episode_id": 51066
+  },
+  {
+   "scene_id": "8WUmhLawc2A",
+   "episode_id": 51364
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 95526
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 96302
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 96701
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 98368
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 98461
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 98554
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 98940
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 99333
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 99477
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 99659
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 99901
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 101219
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 101484
+  },
+  {
+   "scene_id": "B6ByNegPMKs",
+   "episode_id": 101587
+  },
+  {
+   "scene_id": "D7G3Y4RVNrH",
+   "episode_id": 136342
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 51629
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 51869
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 51949
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 52864
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 53795
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 54564
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 54822
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 55101
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 55223
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 55432
+  },
+  {
+   "scene_id": "D7N2EKCX4Sj",
+   "episode_id": 55531
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 13468
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 13701
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 13964
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 14008
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 14478
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 14742
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 14859
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 15813
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 16459
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 16858
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 17663
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 18006
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 18550
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 19819
+  },
+  {
+   "scene_id": "E9uDoFAP3SH",
+   "episode_id": 20169
+  },
+  {
+   "scene_id": "EDJbREhghzL",
+   "episode_id": 145290
+  },
+  {
+   "scene_id": "EDJbREhghzL",
+   "episode_id": 145413
+  },
+  {
+   "scene_id": "JeFG25nYj2p",
+   "episode_id": 131819
+  },
+  {
+   "scene_id": "JeFG25nYj2p",
+   "episode_id": 131844
+  },
+  {
+   "scene_id": "JeFG25nYj2p",
+   "episode_id": 131992
+  },
+  {
+   "scene_id": "JmbYfDe2QKZ",
+   "episode_id": 142064
+  },
+  {
+   "scene_id": "JmbYfDe2QKZ",
+   "episode_id": 142153
+  },
+  {
+   "scene_id": "JmbYfDe2QKZ",
+   "episode_id": 142487
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 8137
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 8620
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 8674
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 9351
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 9396
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 9472
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 9701
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 9713
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 9932
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 10078
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 10330
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 10717
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 10819
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 11230
+  },
+  {
+   "scene_id": "PX4nDJXEHrG",
+   "episode_id": 12119
+  },
+  {
+   "scene_id": "PuKPg4mmafe",
+   "episode_id": 65614
+  },
+  {
+   "scene_id": "PuKPg4mmafe",
+   "episode_id": 65668
+  },
+  {
+   "scene_id": "S9hNv5qa7GM",
+   "episode_id": 89923
+  },
+  {
+   "scene_id": "S9hNv5qa7GM",
+   "episode_id": 90549
+  },
+  {
+   "scene_id": "S9hNv5qa7GM",
+   "episode_id": 90923
+  },
+  {
+   "scene_id": "S9hNv5qa7GM",
+   "episode_id": 91010
+  },
+  {
+   "scene_id": "S9hNv5qa7GM",
+   "episode_id": 91527
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 132
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 230
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 1446
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 1882
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 2122
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 2606
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 3422
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 4226
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 4641
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 4691
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 5002
+  },
+  {
+   "scene_id": "SN83YJsR3w2",
+   "episode_id": 5121
+  },
+  {
+   "scene_id": "ULsKaCPVFJR",
+   "episode_id": 140144
+  },
+  {
+   "scene_id": "ULsKaCPVFJR",
+   "episode_id": 140449
+  },
+  {
+   "scene_id": "Uxmj2M2itWa",
+   "episode_id": 46567
+  },
+  {
+   "scene_id": "Uxmj2M2itWa",
+   "episode_id": 46568
+  },
+  {
+   "scene_id": "Uxmj2M2itWa",
+   "episode_id": 46689
+  },
+  {
+   "scene_id": "Uxmj2M2itWa",
+   "episode_id": 47104
+  },
+  {
+   "scene_id": "Uxmj2M2itWa",
+   "episode_id": 48562
+  },
+  {
+   "scene_id": "V2XKFyX4ASd",
+   "episode_id": 129407
+  },
+  {
+   "scene_id": "V2XKFyX4ASd",
+   "episode_id": 129799
+  },
+  {
+   "scene_id": "V2XKFyX4ASd",
+   "episode_id": 130196
+  },
+  {
+   "scene_id": "V2XKFyX4ASd",
+   "episode_id": 130391
+  },
+  {
+   "scene_id": "VFuaQ6m2Qom",
+   "episode_id": 87598
+  },
+  {
+   "scene_id": "VFuaQ6m2Qom",
+   "episode_id": 87817
+  },
+  {
+   "scene_id": "VFuaQ6m2Qom",
+   "episode_id": 88689
+  },
+  {
+   "scene_id": "VFuaQ6m2Qom",
+   "episode_id": 88857
+  },
+  {
+   "scene_id": "VFuaQ6m2Qom",
+   "episode_id": 89410
+  },
+  {
+   "scene_id": "VLzqgDo317F",
+   "episode_id": 121790
+  },
+  {
+   "scene_id": "VLzqgDo317F",
+   "episode_id": 121858
+  },
+  {
+   "scene_id": "VLzqgDo317F",
+   "episode_id": 122159
+  },
+  {
+   "scene_id": "VVfe2KiqLaN",
+   "episode_id": 139850
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 67404
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 67873
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 67889
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 68036
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 68679
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 69052
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 69950
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 71796
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 71893
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 72318
+  },
+  {
+   "scene_id": "Vvot9Ly1tCj",
+   "episode_id": 72496
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 115336
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 115712
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 115866
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 116107
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 116462
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 116987
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 117266
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 117499
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 118878
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 119228
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 120761
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 120944
+  },
+  {
+   "scene_id": "VzqfbhrpDEA",
+   "episode_id": 120984
+  },
+  {
+   "scene_id": "ZMojNkEp431",
+   "episode_id": 86059
+  },
+  {
+   "scene_id": "ZMojNkEp431",
+   "episode_id": 86693
+  },
+  {
+   "scene_id": "ZMojNkEp431",
+   "episode_id": 87093
+  },
+  {
+   "scene_id": "ZMojNkEp431",
+   "episode_id": 87118
+  },
+  {
+   "scene_id": "aayBHfsNo7d",
+   "episode_id": 141487
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 60253
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 60379
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 61224
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 62007
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 62173
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 62193
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 62256
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 62447
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 63506
+  },
+  {
+   "scene_id": "ac26ZMwG7aT",
+   "episode_id": 64156
+  },
+  {
+   "scene_id": "b8cTxDM8gDG",
+   "episode_id": 137038
+  },
+  {
+   "scene_id": "b8cTxDM8gDG",
+   "episode_id": 137329
+  },
+  {
+   "scene_id": "cV4RVeZvu5T",
+   "episode_id": 128125
+  },
+  {
+   "scene_id": "cV4RVeZvu5T",
+   "episode_id": 128278
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 30087
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 30149
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 31618
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 32129
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 32254
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 32482
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 32629
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 33351
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 33369
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 33589
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 33681
+  },
+  {
+   "scene_id": "dhjEzFoUFzH",
+   "episode_id": 33796
+  },
+  {
+   "scene_id": "e9zR4mvMWw7",
+   "episode_id": 112365
+  },
+  {
+   "scene_id": "e9zR4mvMWw7",
+   "episode_id": 112677
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 123338
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 123665
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 123813
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 124030
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 124308
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 125186
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 126195
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 126470
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 126655
+  },
+  {
+   "scene_id": "gTV8FGcVJC9",
+   "episode_id": 127516
+  },
+  {
+   "scene_id": "i5noydFURQK",
+   "episode_id": 145822
+  },
+  {
+   "scene_id": "jh4fc5c5qoQ",
+   "episode_id": 113716
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 73259
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 73508
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 73533
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 73763
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 73810
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 74032
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 75297
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 75484
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 75985
+  },
+  {
+   "scene_id": "kEZ7cmS4wCh",
+   "episode_id": 77377
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 25320
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 25529
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 25597
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 25662
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 25749
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 26000
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 26696
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 29149
+  },
+  {
+   "scene_id": "mJXqzFtmKg4",
+   "episode_id": 29662
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 57350
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 57719
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 58236
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 58590
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 59174
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 59723
+  },
+  {
+   "scene_id": "p5wJjkQkbXX",
+   "episode_id": 59819
+  },
+  {
+   "scene_id": "pRbA3pwrgk9",
+   "episode_id": 66153
+  },
+  {
+   "scene_id": "pRbA3pwrgk9",
+   "episode_id": 66613
+  },
+  {
+   "scene_id": "pRbA3pwrgk9",
+   "episode_id": 67206
+  },
+  {
+   "scene_id": "qoiz87JEwZ2",
+   "episode_id": 78330
+  },
+  {
+   "scene_id": "qoiz87JEwZ2",
+   "episode_id": 78727
+  },
+  {
+   "scene_id": "qoiz87JEwZ2",
+   "episode_id": 79005
+  },
+  {
+   "scene_id": "r1Q1Z4BcV1o",
+   "episode_id": 79326
+  },
+  {
+   "scene_id": "r1Q1Z4BcV1o",
+   "episode_id": 79410
+  },
+  {
+   "scene_id": "r1Q1Z4BcV1o",
+   "episode_id": 79555
+  },
+  {
+   "scene_id": "r1Q1Z4BcV1o",
+   "episode_id": 80340
+  },
+  {
+   "scene_id": "r47D5H71a5s",
+   "episode_id": 24721
+  },
+  {
+   "scene_id": "r47D5H71a5s",
+   "episode_id": 24790
+  },
+  {
+   "scene_id": "r47D5H71a5s",
+   "episode_id": 24795
+  },
+  {
+   "scene_id": "rPc6DW4iMge",
+   "episode_id": 93270
+  },
+  {
+   "scene_id": "rPc6DW4iMge",
+   "episode_id": 93474
+  },
+  {
+   "scene_id": "rPc6DW4iMge",
+   "episode_id": 93530
+  },
+  {
+   "scene_id": "rPc6DW4iMge",
+   "episode_id": 94144
+  },
+  {
+   "scene_id": "s8pcmisQ38h",
+   "episode_id": 131421
+  },
+  {
+   "scene_id": "sKLMLpTHeUy",
+   "episode_id": 143348
+  },
+  {
+   "scene_id": "sKLMLpTHeUy",
+   "episode_id": 144064
+  },
+  {
+   "scene_id": "sKLMLpTHeUy",
+   "episode_id": 144638
+  },
+  {
+   "scene_id": "sT4fr6TAbpF",
+   "episode_id": 102131
+  },
+  {
+   "scene_id": "sT4fr6TAbpF",
+   "episode_id": 102692
+  },
+  {
+   "scene_id": "uNb9QFRL6hY",
+   "episode_id": 103582
+  },
+  {
+   "scene_id": "uNb9QFRL6hY",
+   "episode_id": 103784
+  },
+  {
+   "scene_id": "uNb9QFRL6hY",
+   "episode_id": 103946
+  },
+  {
+   "scene_id": "uNb9QFRL6hY",
+   "episode_id": 104607
+  },
+  {
+   "scene_id": "uNb9QFRL6hY",
+   "episode_id": 105095
+  },
+  {
+   "scene_id": "uNb9QFRL6hY",
+   "episode_id": 105695
+  },
+  {
+   "scene_id": "ur6pFq6Qu1A",
+   "episode_id": 84177
+  },
+  {
+   "scene_id": "ur6pFq6Qu1A",
+   "episode_id": 84532
+  },
+  {
+   "scene_id": "ur6pFq6Qu1A",
+   "episode_id": 85131
+  },
+  {
+   "scene_id": "ur6pFq6Qu1A",
+   "episode_id": 85339
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 37347
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 37778
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 38973
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 39358
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 39606
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 40005
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 40135
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 40498
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 40612
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 41167
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 41822
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 42012
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 42281
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 42371
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 43180
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 43640
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 43687
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 44012
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 44288
+  },
+  {
+   "scene_id": "vyrNrziPKCB",
+   "episode_id": 44683
+  }
+ ]
+}
