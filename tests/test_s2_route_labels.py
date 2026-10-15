@@ -53,10 +53,10 @@ def _call(answer):
 
 
 def _label(answer, *, previous=None, d=None, route=ROUTE, goal=GOAL, wall_z=None, config=RouteLabelConfig(),
-           depth="floor"):
+           depth=None):
     goal = np.asarray(goal, float)
     d = euclid([0, 0, 0], goal) if d is None else d
-    depth_m = floor_depth([0, 0, 0], FACE_NEG_Z, wall_z=wall_z) if depth == "floor" else depth
+    depth_m = floor_depth([0, 0, 0], FACE_NEG_Z, wall_z=wall_z) if depth is None else depth
     return label_route_call(
         model=parse_model_answer(_call(answer)),
         previous_model=None if previous is None else parse_model_answer(_call(previous)),
