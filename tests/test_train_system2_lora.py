@@ -17,6 +17,7 @@ from scripts.train_system2_lora import (
     gather_rank_rows,
     lora_config,
     lora_wrapped_modules,
+    micro_loss,
     per_sample_token_mean_loss,
     restore_checkpoint,
     save_checkpoint,
@@ -57,6 +58,23 @@ def test_loss_is_a_per_sample_mean_over_supervised_next_tokens():
     labels[1, 4] = IGNORE_INDEX
     with pytest.raises(RuntimeError, match="no supervised token"):
         per_sample_token_mean_loss(logits, labels)
+
+
+def test_token_normalisation_matches_one_token_mean_over_the_whole_step():
+    torch.manual_seed(1)
+    logits = [torch.randn(1, 6, 11) for _ in range(2)]
+    labels = [torch.full((1, 6), IGNORE_INDEX) for _ in range(2)]
+    labels[0][0, 1:3] = torch.tensor([4, 7])  # a 2-token answer (STOP-like)
+    labels[1][0, 1:6] = torch.tensor([1, 2, 3, 4, 5])  # a 5-token answer
+    tokens = sum(int((l[:, 1:] != IGNORE_INDEX).sum()) for l in labels)
+    scale = torch.tensor(1.0 / tokens)
+    total = sum(micro_loss(*per_sample_token_mean_loss(x, y), "token", 2, scale) for x, y in zip(logits, labels))
+    flat_logits = torch.cat([x[:, :-1].reshape(-1, 11) for x in logits])
+    flat_labels = torch.cat([y[:, 1:].reshape(-1) for y in labels])
+    torch.testing.assert_close(total, F.cross_entropy(flat_logits, flat_labels, ignore_index=IGNORE_INDEX))
+    by_sample = sum(micro_loss(*per_sample_token_mean_loss(x, y), "sample", 2) for x, y in zip(logits, labels))
+    want = sum(per_sample_token_mean_loss(x, y)[0].sum() for x, y in zip(logits, labels)) / 2
+    torch.testing.assert_close(by_sample, want)
 
 
 def test_loss_upcasts_bf16_logits_and_keeps_the_graph():

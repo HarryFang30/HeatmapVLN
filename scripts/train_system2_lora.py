@@ -404,6 +404,16 @@ def per_sample_token_mean_loss(logits: torch.Tensor, labels: torch.Tensor) -> tu
     return sums / counts.to(torch.float32), counts
 
 
+def micro_loss(per_sample: torch.Tensor, counts: torch.Tensor, mode: str, samples_per_rank_step: int,
+               token_scale: torch.Tensor | None = None) -> torch.Tensor:
+    """One micro-batch's share of the step loss.  ``sample``: every sample weighs the same.  ``token``: every
+    supervised token of the global batch weighs the same (InternNav's HF Trainer); ``token_scale`` is
+    world_size / the global batch's supervised-token count, the world size undoing DDP's mean over ranks."""
+    if mode == "token":
+        return (per_sample * counts).sum() * token_scale
+    return per_sample.sum() / samples_per_rank_step
+
+
 def warmup_cosine(total_steps: int, warmup_ratio: float):
     """LR multiplier: linear warmup over ``ceil(ratio * total)`` steps, then cosine to 0."""
     warmup = max(1, math.ceil(float(warmup_ratio) * total_steps)) if warmup_ratio > 0 else 0
@@ -666,6 +676,8 @@ def train(args: argparse.Namespace, rt: Runtime) -> int:
         "seed": args.seed,
         "gradient_checkpointing": not args.no_gradient_checkpointing,
     }
+    if args.loss_normalization != "sample":  # absent for the default, so older runs keep their run key
+        hyper["loss_normalization"] = args.loss_normalization
     run_key = hashlib.sha256(json.dumps({"hyper": hyper, "keys": keys_sha256}, sort_keys=True).encode()).hexdigest()
     _log(rt, log_path, {
         "event": "data",
@@ -802,6 +814,8 @@ def train_from_stream(
         "gradient_checkpointing": not args.no_gradient_checkpointing,
         "stream": {k: stream[k] for k in ("seed", "shard_size", "num_shards", "total_samples", "replay_fraction", "epochs")},
     }
+    if args.loss_normalization != "sample":
+        hyper["loss_normalization"] = args.loss_normalization
     run_key = hashlib.sha256(json.dumps({"hyper": hyper, "stream": stream_sha256}, sort_keys=True).encode()).hexdigest()
     _log(rt, log_path, {"event": "data", "stream_dir": args.stream_dir, "holdout_scenes": list(holdout),
                         "selection": stream["selection"], "drawn": stream["drawn"], "total_steps": total_steps})
@@ -923,19 +937,31 @@ def _fit(
                 break
             # loss sum, samples, supervised tokens; fp32 because HCCL's fp64 support is not a given
             totals = torch.zeros(3, dtype=torch.float32, device=rt.device)
+            micro_batches = []
             for micro in range(accum):
                 try:
-                    batch = next(batches)
+                    micro_batches.append(next(batches))
                 except StopIteration:
                     # Every rank holds the same number of samples, so they all get here at
                     # the same step: fail loudly rather than step on a partial batch.
                     raise RuntimeError(f"training data ran out at step {step}, micro-batch {micro}") from None
+            if args.loss_normalization == "token":
+                # InternNav's HF Trainer averages over tokens, so a 2-token STOP answer weighs less than a
+                # 10-token pixel answer; DDP averages over ranks, hence world_size / global token count.
+                window_tokens = torch.tensor(
+                    float(sum(int((b["labels"][:, 1:] != IGNORE_INDEX).sum()) for b in micro_batches)),
+                    dtype=torch.float32, device=rt.device)
+                if rt.distributed:
+                    dist.all_reduce(window_tokens)
+                token_scale = rt.world_size / window_tokens
+            for micro, batch in enumerate(micro_batches):
                 labels = batch["labels"].to(rt.device, non_blocking=True)
                 sync = micro == accum - 1 or not rt.distributed
                 with contextlib.nullcontext() if sync else ddp_model.no_sync():
                     logits = ddp_model(**_to_device(batch, rt.device), use_cache=False).logits
                     per_sample, counts = per_sample_token_mean_loss(logits, labels)
-                    (per_sample.sum() / (args.micro_batch * accum)).backward()
+                    micro_loss(per_sample, counts, args.loss_normalization, args.micro_batch * accum,
+                               token_scale if args.loss_normalization == "token" else None).backward()
                 totals[0] += per_sample.detach().sum()
                 totals[1] += float(per_sample.shape[0])
                 totals[2] += counts.sum().float()
@@ -1135,6 +1161,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--loss-normalization", choices=("sample", "token"), default="sample",
+                        help="sample: every sample weighs the same (EXP-23..26 S1); token: every supervised token "
+                             "of the global batch weighs the same, as in InternNav's System2 SFT")
     parser.add_argument("--global-batch", type=int, default=64)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=1.0, help="in weighted draws of len(selected) calls")
