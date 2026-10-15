@@ -60,6 +60,7 @@
 | [EXP-25](#exp-25-转圈处的-stopspinbreak与导航池探针第一轮失败之后怎么提点) | EXP-23 第一轮失败后的提点路线：只在转圈处监督 STOP 的 LoRA（不用 oracle 转向/像素），并用 EnvDrop / val_seen / ScaleVLN 探针测导航池能否被新数据打开 | ⏳ | 判据 2026-10-15 写死；进行中 |
 | [EXP-26](#exp-26-scalevln-新场景-sft用底座自己格式的专家数据补没见过的场景) | 用 InternData-N1 ScaleVLN（HM3D 新场景、底座自己的标签格式）做 LoRA SFT，补 val_unseen 上随新场景而来的选错方向 | ⏳ | S1 训练中（11:45 UTC 起）；V 门改为无效性中止（运行记录 8） |
 | [EXP-27](#exp-27-记忆指纹底座-system2-训没训过-scalevln) | 第 4n 帧对第 4n+2 帧的 teacher-forced 优势：底座 System2 训没训过 ScaleVLN，决定 S2 排不排 | ✖ | 开跑前取消：InternData 的 ScaleVLN（约 7.9 万集）就是底座训过的约 7.7 万条子集 |
+| [EXP-28](#exp-28-hm3d-场景里的闭环-on-policy-训练在底座没做过-dagger-的场景里纠正它自己的错误) | 在 HM3D 场景里闭环跑底座、用底座约定的标签或结局筛选做 on-policy 训练，打 val_unseen 的导航池 | ⏳ | 2026-10-15 用户批准；网格下载中、设计中；截止 10-20 14:00 UTC |
 
 ### 跨实验：未来头退化的三层证据链
 
@@ -3149,6 +3150,19 @@ ScaleVLN 的 4n 用 B3 已有的底座逐样本记录，同一工具同一设置
      ScaleVLN 里底座真正没见过的部分是原始数据集的其余部分（1,200 多个场景、490 万指令-轨迹对里，Gibson 场景与绝大多数 HM3D 轨迹），
      要用就得有场景网格自己渲染成底座的格式，另立条目。
    - 4090 上原本为它留的三卡时段改为继续采 EnvDrop（底座贪心，给结局筛选自训练提供指令池）；第 500 步 val 的撤销照常由守护脚本做。
+
+
+---
+
+### EXP-28 HM3D 场景里的闭环 on-policy 训练：在底座没做过 DAgger 的场景里纠正它自己的错误
+
+**缘起（用户 2026-10-15 18:40 UTC 批准路线与下载；截止 2026-10-20 14:00 UTC，即美东周二 10:00）.** EXP-27 取消时确认：底座的离线专家数据已含
+InternData 的 ScaleVLN（794 个 HM3D 场景），再做离线 SFT 没有增量；ScaleVLN 里没用过的 Gibson 场景只有未修复的原始渲染可用，而 ScaleVLN 自己的
+表 4 里未修复的 Gibson 不加分（76.59 → 76.33，修复后才 78.08），且我们的 LoRA 冻结视觉塔、吸收不了画面多样性，所以 Gibson 不下。
+剩下底座几乎肯定没吃过的信号：在 HM3D 场景里闭环跑底座自己、在它走偏的状态上的纠正（推测底座的 DAgger 只在 MP3D 上做过；底座在 HM3D 上
+teacher-forced 一致率 0.859，r2r 训练场景 0.975）。场景网格：`hm3d-train-habitat-v0.2.tar`（29.2 GB，habitat 格式含 navmesh，
+来源 huggingface.co/datasets/zhuhu00/hm3d 经 hf-mirror，许可由用户负责），下到 4090 `/workspace/exp23/data/hm3d`。
+问题 / 假设 / 判据 / 设置在任何 HM3D 闭环结果之前另行写死（设计 workflow `exp28-hm3d-onpolicy-design` 进行中）。
 
 ---
 
