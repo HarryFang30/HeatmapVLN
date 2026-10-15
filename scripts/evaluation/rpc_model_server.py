@@ -102,6 +102,31 @@ _TIMING_OFF = StageTimer(enabled=False)
 _REQUEST_TIMING = threading.local()
 
 
+SYSTEM2_SAMPLE_TEMPERATURE_ENV = "PPA_EVAL_SYSTEM2_SAMPLE_TEMPERATURE"
+SYSTEM2_SAMPLE_TOP_P_ENV = "PPA_EVAL_SYSTEM2_SAMPLE_TOP_P"
+
+
+def system2_sampling(environ: Optional[dict] = None) -> Optional[dict[str, float]]:
+    """System2's sampling settings, or None for the deployed greedy decoding.
+
+    Only rollouts for outcome-filtered self-training sample (``PPA_EVAL_SYSTEM2_SAMPLE_TEMPERATURE`` > 0);
+    unset or 0 leaves every generate call exactly as deployed.
+    """
+    environ = os.environ if environ is None else environ
+    raw = str(environ.get(SYSTEM2_SAMPLE_TEMPERATURE_ENV, "")).strip()
+    if not raw or float(raw) <= 0:
+        return None
+    return {"temperature": float(raw), "top_p": float(environ.get(SYSTEM2_SAMPLE_TOP_P_ENV, "1.0") or "1.0")}
+
+
+def system2_generate_kwargs(environ: Optional[dict] = None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"max_new_tokens": 128, "do_sample": False, "use_cache": True, "return_dict_in_generate": True}
+    sampling = system2_sampling(environ)
+    if sampling is not None:
+        kwargs.update(do_sample=True, **sampling)
+    return kwargs
+
+
 def _request_timer() -> StageTimer:
     return getattr(_REQUEST_TIMING, "timer", _TIMING_OFF)
 
@@ -1047,6 +1072,8 @@ class HeatmapVLNRuntime:
             self.pano_latent_adapter.eval()
             LOGGER.info("Using model-attached pano latent adapter")
         LOGGER.info("NextDiT action head available: %s", self.has_nextdit)
+        if system2_sampling() is not None:
+            LOGGER.warning("System2 SAMPLES (%s): rollouts for self-training only, never an evaluation", system2_sampling())
         LOGGER.info("action_scale=%s num_sample_trajs=%s", self.action_scale, self.num_sample_trajs)
         LOGGER.info(
             "require_deterministic_sampling=%s",
@@ -2061,10 +2088,7 @@ class HeatmapVLNRuntime:
             with _vision_record_scope(), torch.no_grad(), timer.stage("system2_turn1_generate"):
                 output_ids = self.model.qwen2_5_vl.model.generate(
                     **inputs,
-                    max_new_tokens=128,
-                    do_sample=False,
-                    use_cache=True,
-                    return_dict_in_generate=True,
+                    **system2_generate_kwargs(),
                 ).sequences
             llm_output = self.processor.tokenizer.decode(
                 output_ids[0][prompt_len:],
@@ -2097,10 +2121,7 @@ class HeatmapVLNRuntime:
                 with _vision_record_scope(), torch.no_grad(), timer.stage("system2_turn2_generate"):
                     output_ids = self.model.qwen2_5_vl.model.generate(
                         **inputs,
-                        max_new_tokens=128,
-                        do_sample=False,
-                        use_cache=True,
-                        return_dict_in_generate=True,
+                        **system2_generate_kwargs(),
                     ).sequences
                 llm_output = self.processor.tokenizer.decode(
                     output_ids[0][prompt_len:],
@@ -2122,6 +2143,9 @@ class HeatmapVLNRuntime:
             "kind": "unknown",
             "phase": phase,
         }
+        sampling = system2_sampling()
+        if sampling is not None and not oracle_system2_text and phase != "front_system1":
+            response["system2_sampling"] = sampling
         system2_lora = getattr(self, "system2_lora", None)
         if system2_lora is not None:
             response["system2_lora"] = {
