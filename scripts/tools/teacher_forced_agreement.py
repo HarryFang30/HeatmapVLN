@@ -310,7 +310,7 @@ def run(args: argparse.Namespace) -> int:
     dir_of = {d.name: d for d in scene_dirs}
     all_samples: list[ReplaySample] = []
     for scene_dir in scene_dirs:
-        all_samples.extend(scene_samples(scene_dir))
+        all_samples.extend(scene_samples(scene_dir, phase=args.frame_phase))
     picks, pick_stats = pick_samples(all_samples, max_per_scene=args.max_samples_per_scene, seed=args.seed)
     vlm_image_size = tuple(args.vlm_image_size)
     LOGGER.info("%d samples picked from %d scenes (%d built)", len(picks), len(scene_dirs), len(all_samples))
@@ -323,6 +323,7 @@ def run(args: argparse.Namespace) -> int:
         "selection": pick_stats,
         "settings": {
             "max_samples_per_scene": args.max_samples_per_scene,
+            "frame_phase": args.frame_phase,
             "seed": args.seed,
             "vlm_image_size": list(vlm_image_size),
             "jpeg_quality": args.jpeg_quality,
@@ -437,6 +438,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="summary json; rows go to <output>.calls.jsonl")
     parser.add_argument("--max-samples-per-scene", type=int, default=0, help="seeded uniform subset (0 = all)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--frame-phase", type=int, default=0,
+                        help="sample frames 4n+PHASE instead of InternNav's training grid 4n (EXP-27 memory test)")
     parser.add_argument("--vlm-image-size", type=int, nargs=2, default=list(DEFAULT_VLM_IMAGE_SIZE))
     parser.add_argument("--jpeg-quality", type=int, default=90, help="the client's --rpc_jpeg_quality")
     parser.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")

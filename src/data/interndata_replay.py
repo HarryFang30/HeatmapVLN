@@ -74,8 +74,16 @@ def episode_samples(
     sample_step: int = 4,
     num_history: int = 8,
     num_future_steps: int = 4,
+    phase: int = 0,
 ) -> list[ReplaySample]:
-    """InternNav's sample selection for one (episode, instruction) pair."""
+    """InternNav's sample selection for one (episode, instruction) pair.
+
+    ``phase`` shifts the grid to frames ``n * sample_step + phase`` with the same labelling rule; InternNav
+    trains on phase 0 only, so a model that memorised its training frames does better there than off-grid
+    (EXP-27).  Off the grid the final STOP sample, which sits on the same frame for every phase, is left out.
+    """
+    if not 0 <= phase < sample_step:
+        raise ValueError(f"phase must be in [0, {sample_step}), got {phase}")
     actions = [int(a) for a in list(parquet_actions)[1:]] + [0]
     length = len(actions)
     if length < 4:
@@ -95,8 +103,8 @@ def episode_samples(
         )
 
     for n in range(length // sample_step + 1):
-        t = n * sample_step
-        if t == length or t == length - 1:
+        t = n * sample_step + phase
+        if t >= length - 1:
             continue
         goal = [int(v) for v in goals[t]]
         if goal[0] == -1:
@@ -112,7 +120,8 @@ def episode_samples(
             if int(relative_goal_frame_ids[t]) < 3:
                 continue
             out.append(make(t, "pixel", IDX2ACTION[5], f"{goal[0]} {goal[1]}"))
-    out.append(make(length - 1, "stop", IDX2ACTION[0], None))
+    if phase == 0:
+        out.append(make(length - 1, "stop", IDX2ACTION[0], None))
     return out
 
 

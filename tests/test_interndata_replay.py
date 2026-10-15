@@ -47,6 +47,15 @@ def test_internnav_selection_on_a_real_episode():
     assert by_frame[30].history_frame_ids == (0, 4, 8, 12, 16, 20, 24, 29)
 
 
+def test_off_grid_phase_shifts_the_frames_and_drops_the_shared_stop():
+    got = _samples(phase=2)
+    assert got and all(s.frame_id % 4 == 2 for s in got)
+    assert all(s.kind != "stop" for s in got)
+    assert max(s.frame_id for s in got) < 30
+    with pytest.raises(ValueError, match="phase"):
+        _samples(phase=4)
+
+
 def test_near_goals_are_skipped():
     rel = list(REL)
     rel[24] = 2
