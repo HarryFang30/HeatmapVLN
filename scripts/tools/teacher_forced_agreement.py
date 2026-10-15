@@ -362,6 +362,7 @@ def run(args: argparse.Namespace) -> int:
         base_model_identity,
         greedy_native_decision,
         init_runtime,
+        load_adapter,
         load_system2,
         provenance,
         seed_everything,
@@ -375,6 +376,8 @@ def run(args: argparse.Namespace) -> int:
     LOGGER.info("%d already scored, %d to go", len(picks) - len(todo), len(todo))
     if todo:
         model, processor = load_system2(args.model_path, rt.device)
+        if args.adapter:  # EXP-26: the same agreement for a fine-tuned System2 (PEFT dir)
+            model = load_adapter(model, args.adapter)
         model.eval()
         with open(calls_path, "a", encoding="utf-8") as handle:
             for i, (sample, (messages, images, lookdown)) in enumerate(
@@ -404,6 +407,7 @@ def run(args: argparse.Namespace) -> int:
     report.update({
         "summary": summarize(rows),
         "base_model": base_model_identity(args.model_path),
+        "adapter": str(Path(args.adapter).resolve()) if args.adapter else None,
         "provenance": provenance(),
         "device": str(rt.device),
         "wall_seconds": round(time.time() - started, 1),
@@ -429,6 +433,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scene-root", required=True, help="directory of extracted InternData-N1 scene dirs")
     parser.add_argument("--scenes", default="", help="comma-separated scene dirs under --scene-root (default: all)")
     parser.add_argument("--model-path", required=True, help="the deployed InternNav_Model directory")
+    parser.add_argument("--adapter", default="", help="a System2 LoRA (PEFT dir) to attach; empty: the base model")
     parser.add_argument("--output", required=True, help="summary json; rows go to <output>.calls.jsonl")
     parser.add_argument("--max-samples-per-scene", type=int, default=0, help="seeded uniform subset (0 = all)")
     parser.add_argument("--seed", type=int, default=42)
