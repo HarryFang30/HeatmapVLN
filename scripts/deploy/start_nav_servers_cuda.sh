@@ -9,13 +9,13 @@
 # Meant for the fjl-habitat container (paths below are container paths).  Example, GPU 4:
 #   NAV_GPU=4 bash scripts/deploy/start_nav_servers_cuda.sh
 # Env (defaults in brackets):
-#   NAV_GPU [0], NAV_VO_GPU [NAV_GPU]      model and VO GPUs; together about 37 GB on one 48 GB card
+#   NAV_GPU [0], NAV_VO_GPU [NAV_GPU]      model and VO GPUs; together about 37-41 GB on one 48 GB card
 #   NAV_HOST [127.0.0.1]                    bind address of both servers.  The gRPC channel is
 #                                           insecure (no TLS, no auth).  fjl-habitat is on the docker
 #                                           bridge with no published ports, so 127.0.0.1 is reachable
 #                                           only inside the container; for a robot bind 0.0.0.0 and
 #                                           SSH-tunnel to the container's bridge IP
-#                                           (docs/deploy/navigation_interface.md section 2).
+#                                           (docs/deploy/navigation_interface.md section 4).
 #   NAV_MODEL_PORT [52400], NAV_VO_PORT [52500]   the evaluation launcher's slot k binds 52400+k /
 #                                           52500+k in the same container: pick free ports while it
 #                                           runs (a busy port is refused below).
