@@ -5,7 +5,7 @@
 
 > **到 2026-10-16 为止，我们的模型没有在真机上跑过。**
 > 下面的数字来自仿真（Habitat R2R-CE）、4090 上的服务端实测和底座自己的验收记录。
-> 接底座的代码只在模拟的底座客户端上跑通过；底座现在还缺一路下倾 30° 的相机（§6.2）。
+> 接底座的代码只在模拟的底座客户端上跑通过；下视相机按计划换下一路环视来装（§6.2），还没装。
 
 完整说明在 [`navigation_interface.md`](navigation_interface.md)（下文的 §n 都指它）。
 
@@ -24,7 +24,7 @@
     底座 robot_platform_ws：相机话题、相对动作、控制权
         │                                   │
         ▼                                   ▼
-Go2 EDU：自带前视相机、运动             下倾 30° 的相机：还没有，要加（§6.2）
+Go2 EDU：自带前视相机、运动             下视相机 down_camera（下倾 30°，换下 camera2，§6.2）
 ```
 
 ## 2. 输入和输出
@@ -49,7 +49,7 @@ with ROSPlatformClient() as robot, NavAgent("127.0.0.1:52400", "127.0.0.1:52500"
 |---|---|---|---|
 | **输入** | 每集一次 | 英文指令；`scene_id`（字符串）、`episode_id`（非负整数），两者决定模型采样用的随机种子，每次实跑换一个 `episode_id` | — |
 | **输入** | 每步一次 | `front_rgb`：上一个动作做完、停稳后在当前位姿拍的图，`numpy` 数组，`uint8`，形状 `(480, 640, 3)`，RGB | `robot.get_frame('front_camera', wait_new=True)` 的 1920×1080 JPEG，解码、去畸变、裁剪缩放后给（§6.4）；动作后连取两帧、用第二帧。上一个动作是 `LOOK_DOWN` 时改取下视相机。按官方的垂直 56° 推算，自带前视多半裁不出垂直 63.5°，这时只能居中裁 4:3 再缩放，视场和训练不同（§6.2） |
-| **输入** | 只在要规划的那一步 | `lookdown_fn()`：返回下倾 30° 的图，格式同上 | 下视相机（底座里还要加这一路，§6.2） |
+| **输入** | 只在要规划的那一步 | `lookdown_fn()`：返回下倾 30° 的图，格式同上 | `down_camera`：换下右侧环视 `camera2`、接在它 USB 口上的下倾 30° 相机（§6.2，还没装） |
 | **输入** | 只在一种情况 | `level_fn()`：上一个动作是 `LOOK_DOWN`、且这一步取到动作块里的 STOP（表示"在这里重新规划"）时调，返回水平的图，格式同上 | `front_camera` |
 | **输出** | 每步一次 | 一个 `Action` | `FORWARD` → `move_relative(distance=0.25)`；`TURN_LEFT` / `TURN_RIGHT` → `move_relative(angle=±15°，rad)`；`LOOK_DOWN` 不动、下一帧取下视相机；`STOP` 结束、`release()` |
 | **异常** | 任何一步 | `act()` 抛任何异常，或底座取图超时、`move_relative` 返回的 `state` 不是 `succeeded`、控制权丢失，本集都作废，不能在同一集里重试；`agent.done` 不会因异常变真 | `release()`，底座清零输出；新的一集重新 `reset()` |
@@ -65,10 +65,11 @@ with ROSPlatformClient() as robot, NavAgent("127.0.0.1:52400", "127.0.0.1:52500"
 | 1 | 用 `/workspace/nav_src_ded4bd3` 这份代码启动两个服务端，看到 `READY ... attn=flash_attention_2` | 4090 | §3 |
 | 2 | 先在 `~/.ssh/config` 加好 `6024_fjl`；在 `./platform shell` 里建 venv、装 vla_rpc，用 `14ac629` 或之后的检出跑 `python -m pytest tests/test_nav_agent.py --noconftest -q`，应为 23 passed | Orin | §4、§5 |
 | 3 | 开 ssh 隧道，构造一次 `NavAgent` 做连通自检 | Orin | §4 |
-| 4 | 停掉实机底座，`./platform run --backend sim --allow-motion`，用假服务端跑通取图、动作、释放控制权（模拟图是 256×192 占位图，下视相机先用 `front_camera` 代替，只测接线） | Orin | §6.5、§7 |
-| 5 | 实机只读（`./platform run`），只取图，检查前视、下视图 | Orin + Go2 | §6.2、§7 |
-| 6 | 实机只读 + 真服务端，动作只打印（去掉 `wait_for_motion_ready`、拿控制权和动作调用）；再 `--allow-motion` 单独试几次 0.25 m / ±15° | 全部 | §6.3、§7 |
-| 7 | 空旷房间、短指令实跑，有人拿遥控器跟着 | 全部 | §6.6、§7 |
+| 4 | 换下 `camera2`、装下倾 30° 的相机；底座配置里关掉 `camera2` 和 `side_panorama`、加 `down_camera`，重启底座 | Orin + Go2 | §6.2 |
+| 5 | 停掉实机底座，`./platform run --backend sim --allow-motion`，用假服务端跑通取图、动作、释放控制权（模拟图是 256×192 占位图，只测接线） | Orin | §6.5、§7 |
+| 6 | 实机只读（`./platform run`），`./platform cameras --cameras front_camera down_camera` 确认两路出图，再检查前视、下视图 | Orin + Go2 | §6.2、§7 |
+| 7 | 实机只读 + 真服务端，动作只打印（去掉 `wait_for_motion_ready`、拿控制权和动作调用）；再 `--allow-motion` 单独试几次 0.25 m / ±15° | 全部 | §6.3、§7 |
+| 8 | 空旷房间、短指令实跑，有人拿遥控器跟着 | 全部 | §6.6、§7 |
 
 ## 4. 要准备什么
 
@@ -76,7 +77,7 @@ with ROSPlatformClient() as robot, NavAgent("127.0.0.1:52400", "127.0.0.1:52500"
 |---|---|---|
 | 机器人 | 宇树 Go2 **EDU**，装好底座 `robot_platform_ws` 的 Orin | §5、§6 |
 | 前视相机 | 底座的 `front_camera`（Go2 自带，1920×1080，离地约 0.4 m（按 URDF 推算，待实测），没有标定）；用前先标一次内参 | §6.2 |
-| 下视相机 | **还没有**：一台固定下倾 30° 的 USB 相机，加进底座配置。Orin 上三路 USB 同时采集不稳，要换下一路环视（换了就没有 `side_panorama`）或先验证 | §6.2 |
+| 下视相机 | **还没装**：换下右侧环视 `camera2`（以它为例），在它的 USB 口装一台固定下倾 30°、朝正前方、尽量贴近自带前视的 USB 相机；底座配置里关掉 `camera2` 和 `side_panorama`、加 `down_camera`。环视只剩 `left_camera` | §6.2 |
 | Orin 环境 | ROS 2 Foxy 的系统 Python 3.8，加 numpy、Pillow、vla_rpc（从 4090 拷） | §5 |
 | 服务器 | 4090 上一张没有别人进程的 48 GB 卡（两个服务端同卡约 40 GiB；24 GB 的卡放不下一套） | §3、§8 |
 | 网络 | Orin 能 ssh 到 4090 宿主机（地址、账号、跳板向负责人要） | §4 |
@@ -107,7 +108,7 @@ with ROSPlatformClient() as robot, NavAgent("127.0.0.1:52400", "127.0.0.1:52500"
 **没验证过的**（附录 A），风险从大到小：
 
 1. **相机视点**：仿真是离地 1.25 m、水平、HFOV 79°；底座的自带前视离地约 0.4 m、广角有畸变。模型从没见过这种视角。
-2. **下视相机还没有**，装上以后它的高度、俯角也和仿真不同。
+2. **下视相机还没装**（方案见 §6.2），装上以后它的高度、俯角也和仿真不同。
 3. 真实图像、光照、运动模糊；动作执行误差；碰撞（模型完全不避障）。
 4. 里程计在真实相机上的尺度，以及起步原地转圈时是否稳定。
 5. Orin 到 4090 的网络延迟和抖动；从容器外经 ssh 隧道连服务端这条路没有端到端测过（4090 上的核验都在容器里连）；Orin 上的 Python 3.8 环境还没装过。

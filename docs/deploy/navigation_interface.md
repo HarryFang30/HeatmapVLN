@@ -5,7 +5,7 @@
 
 > **状态（2026-10-16）**：没有在任何真机上跑过。机器人侧客户端 `NavAgent` 接 4090 上的真服务端时，
 > SDPA 和 flash-attention 2 下都在 4 集仿真上与部署的评测客户端逐调用相同（附录 C）。接底座的一侧（§6）只有示意代码，
-> 只在模拟的底座客户端上跑通过；底座现在还缺一路下倾 30° 的相机（§6.2）。
+> 只在模拟的底座客户端上跑通过；下视相机按计划换下一路环视来装（§6.2），还没装。
 
 | 代码 | 作用 |
 |---|---|
@@ -49,8 +49,8 @@
         │                                   │
         │ 宇树接口（DDS）                    │ USB
         ▼                                   ▼
-Go2 EDU：自带前视相机、运动             环视相机 left_camera / camera2（只做记录）
-                                        下倾 30° 的相机：还没有，要加（§6.2）
+Go2 EDU：自带前视相机、运动             下视相机 down_camera（下倾 30°，接在换下的 camera2 的 USB 口，§6.2）
+                                        左侧环视 left_camera（只做记录）
 ```
 
 模型里三部分的叫法，后文会用到：
@@ -388,7 +388,7 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
 | 底座接口 | 我们怎么用 |
 |---|---|
 | `/platform/cameras/front_camera/frame`（客户端 `get_frame('front_camera')`） | `front_rgb` 和 `level_fn()` |
-| 一路下倾 30° 的相机 | `lookdown_fn()`，以及 `LOOK_DOWN` 之后那一帧的 `front_rgb`。**底座里现在没有这一路**，见 §6.2 |
+| `/platform/cameras/down_camera/frame`（按 §6.2 加进底座的下倾 30° 相机，还没装） | `lookdown_fn()`，以及 `LOOK_DOWN` 之后那一帧的 `front_rgb` |
 | `/platform/relative_motion`（`move_relative`） | 执行 `FORWARD`、`TURN_LEFT`、`TURN_RIGHT` |
 | `/platform/acquire_control`、`heartbeat`、`release_control` | 一集开始拿控制权，结束或出错时释放；心跳由客户端的后台线程每 0.25 s 发一次 |
 | `/platform/stop` | 人工急停 |
@@ -417,20 +417,49 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
     居中裁成 4:3 再缩放（PanaV 就是这样做的），结果按"视场与训练不同"来读。
 - 视点是最大的风险（附录 A）：模型只在 1.25 m 高、水平、79° 的视角上训练过。
 
-**下视图**：底座现在没有下倾 30° 的相机，这是接上去之前必须补的一块。
+**下视图：换下一路环视，装一台下倾 30° 的 USB 相机**（2026-10-16 定的方案，还没装）。
 
-- 慢系统在下视图上找像素目标，快系统也拿它当输入（§2.2），不能省，也不能拿前视图冒充。
-- 可以这样补：
-  1. 加一台 USB 相机，固定下倾 30°，在底座的 `config/platform.yaml` 里加一路（例如叫 `down_camera`，按 `/dev/v4l/by-path/`
-     稳定路径配置，写法照现有的 `left_camera`）。底座 README 写明这台 Orin 上三路 USB 相机同时采集不稳定，现在已经接了左右两路环视，
-     所以要么换下一路环视（它们只用于记录），要么先验证三路能稳定采集。这一步要底座的维护者一起做。
-     换下一路环视的话，`side_panorama` 也就没有了（它固定用 `left_camera` 和 `camera2` 两路合成），
-     第三视角记录改存剩下那一路的原图，也可以在配置里把 `side_panorama` 关掉。
-  2. 它装不到和自带前视相机同一个位置，所以记下它的高度、俯角和视场；处理流程（去畸变、裁剪、缩放）和前视一致。
-- 在补上之前，只能拿前视图当下视图跑**接线测试**（狗不动，或空旷处），这时模型的输入是错的，结果不算数。
+慢系统在下视图上找像素目标，快系统也拿它当输入（§2.2），不能省，也不能拿前视图冒充。底座原来没有这一路，按下面的办法补：
 
-**环视相机** `left_camera`、`camera2` 和它们合成的 `side_panorama`：约 120° 的鱼眼，朝两侧，只用于记录，不进模型。
-没换环视时，要留第三视角的现场记录就订阅 `side_panorama`（PanaV 默认 2 FPS 保存它）；底座只提供图像，保存归项目自己做。
+1. **换下一路环视**。底座 README 写明这台 Orin 上三路 USB 相机同时采集不稳定，所以不加第三路，而是把一路环视换成下视相机。
+   下面以换下右侧的 `camera2`（USB 端口 4.3）为例；换左侧 `left_camera` 就用它的端口 4.4。
+   代价是没有 `side_panorama` 了：它固定用 `left_camera` 和 `camera2` 两路合成。
+2. **装相机**：固定在机身上，朝正前方（左右不偏），下倾 30°。我们建议尽量贴近自带前视相机的位置和高度：仿真里前视图和下视图是
+   同一台相机转出来的，两张图最好从同一个视点拍。装牢、避免振动，最好用全局快门或运动模糊小的相机。
+   可以用新相机，也可以把换下的那只环视重新按这个朝向装（它是约 120° 的鱼眼，畸变大，标定后再用）。
+3. **改底座配置**：底座的 `config/platform.yaml` 的 `cameras` 里关掉 `camera2` 和 `side_panorama`，加一路 `down_camera`。
+   这是底座的工作区，和底座的维护者一起改，改完重启底座：
+
+   ```yaml
+     - name: camera2
+       # ……原有字段不变
+       enabled: false                 # 换下的那一路
+     - name: down_camera              # 新加：下倾 30° 的下视相机，接在原 camera2 的 USB 口
+       device: /dev/v4l/by-path/platform-3610000.xhci-usb-0:4.3:1.0-video-index0
+       frame_id: down_camera_optical
+       rotation_degrees: 0            # 按实际安装方向填，只支持 0 或 180
+       width: 1280
+       height: 720                    # 相机支持 4:3 就用 4:3（例如 1280×960）：16:9 时垂直视场常常不够（§6.4）
+       fps: 5
+       warmup_seconds: 5.0
+       enabled: true
+     - name: side_panorama
+       # ……原有字段不变
+       enabled: false                 # 少了 camera2 就合成不出来
+   ```
+
+   - 设备按 `/dev/v4l/by-path/` 的稳定路径认，不要按 `/dev/videoN` 编号认（重插以后编号会变）。
+   - 底座对 USB 相机一视同仁：按 `device` 打开、预热 5 s、按 `rotation_degrees` 旋转、编成 JPEG 发到
+     `/platform/cameras/down_camera/frame`，不用改底座代码；运动预检也不依赖哪一路相机。
+   - 底座自带的检查工具默认查 `side_panorama`，改完要显式传名字：`./platform cameras --cameras front_camera down_camera`
+     （图存在底座的 `runs/camera_check/`）。
+4. **标定**：和前视一样用棋盘格标一次内参（两台各标各的），再量一下实际俯角和离地高度，记下来。
+   §6.5 的 `preprocess` 每台相机用自己的内参。
+
+装好之前不能真跑：只能拿前视图当下视图做**接线测试**（狗不动，或空旷处），这时模型的输入是错的，结果不算数。
+
+**环视相机**：换完以后只剩左侧 `left_camera`（约 120° 的鱼眼，朝左），`side_panorama` 也关掉了。环视只用于记录，不进模型；
+要留第三视角的现场记录就订阅 `left_camera` 的原图（底座只提供图像，保存归项目自己做）。
 
 ### 6.3 动作：交给底座的相对动作
 
@@ -510,7 +539,7 @@ from robot_platform.ros_client import ROSPlatformClient
 from src.deploy import Action, NavAgent
 
 TURN = math.radians(15)
-DOWN_CAMERA = "down_camera"      # 底座里还没有这一路，见 §6.2
+DOWN_CAMERA = "down_camera"      # 按 §6.2 加进底座的下视相机
 
 
 def run_episode(instruction: str, run_id: int, preprocess: dict):
@@ -552,7 +581,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 
 ### 6.6 安全
 
-- **先在模拟里跑通**：`./platform run --backend sim --allow-motion` 和实机是同一套 ROS 接口，模拟后端会给 `config/platform.yaml` 里每一路已启用的相机发 256×192 的占位图（§7 第 4 步）。
+- **先在模拟里跑通**：`./platform run --backend sim --allow-motion` 和实机是同一套 ROS 接口，模拟后端会给 `config/platform.yaml` 里每一路已启用的相机发 256×192 的占位图（§7 第 5 步）。
 - **遥控器**：始终有人拿着 Go2 的遥控器跟在旁边。
 - **急停**：`ros2 service call /platform/stop std_srvs/srv/Trigger {}`，立即停止并释放控制权；程序里是 `robot.stop()`。
   这条命令要在另一个 `./platform shell` 里执行（开跑前先开好放着），保证和底座同一个 RMW、网卡和 domain。
@@ -574,23 +603,25 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 2. **Orin 装环境**：先按 §4 第 3 步在 `~/.ssh/config` 里加好 `Host 6024_fjl`，再按 §5 装环境、跑
    `python -m pytest tests/test_nav_agent.py --noconftest -q`。
 3. **开 ssh 隧道**，在 Orin 上构造一次 `NavAgent` 做连通自检（§4）。
-4. **模拟底座 + 假服务端**：先停掉正在跑的实机底座（两者抢同一把锁），`./platform run --backend sim --allow-motion`，把 §6.5 里的 `NavAgent(...)` 换成
-   `NavAgent(FakeModelServer(), FakeVOServer())` 跑一遍，确认取图、动作、释放控制权都通。模拟后端只给 `config/platform.yaml`
-   里已启用的相机发 256×192 的占位图，所以下视相机还没加进配置时，先把 `DOWN_CAMERA` 临时设成 `"front_camera"`；
-   `preprocess` 换成只解码再缩放：`{"front_camera": lambda jpeg: cv2.resize(decode_rgb(jpeg), (640, 480))}`，
+4. **装下视相机、改底座配置**（§6.2）：换下 `camera2`，装好下倾 30° 的相机，`platform.yaml` 里关掉 `camera2` 和
+   `side_panorama`、加 `down_camera`，重启底座。配置可以先改：模拟后端不会去打开设备。
+5. **模拟底座 + 假服务端**：先停掉正在跑的实机底座（两者抢同一把锁），`./platform run --backend sim --allow-motion`，
+   把 §6.5 里的 `NavAgent(...)` 换成 `NavAgent(FakeModelServer(), FakeVOServer())` 跑一遍，确认取图、动作、释放控制权都通。
+   模拟后端给配置里每一路已启用的相机（包括 `down_camera`）发 256×192 的占位图，所以 `preprocess` 换成只解码再缩放：
+   `f = lambda jpeg: cv2.resize(decode_rgb(jpeg), (640, 480))`，`preprocess = {"front_camera": f, "down_camera": f}`，
    不去畸变、不按 79° 裁剪。这一步只测接线。
-5. **实机只读，只取图**：`./platform run`（不带 `--allow-motion`），只调 `get_frame`。等过预热，存几帧经过 `preprocess` 的
-   前视图和下视图，检查是不是 RGB、方向对不对、视场对不对，下视相机是不是朝正前方（左右不偏）、俯角是不是 30°。
-6. **实机只读 + 真服务端**：动作只打印不执行，量规划延迟、取图等待和网络往返，和 §8 比。只读时 §6.5 的代码要去掉
+6. **实机只读，只取图**：`./platform run`（不带 `--allow-motion`），先 `./platform cameras --cameras front_camera down_camera`
+   确认两路都出图。等过预热，存几帧经过 `preprocess` 的前视图和下视图，检查是不是 RGB、方向对不对、视场对不对，
+   下视相机是不是朝正前方（左右不偏）、俯角是不是 30°。
+7. **实机只读 + 真服务端**：动作只打印不执行，量规划延迟、取图等待和网络往返，和 §8 比。只读时 §6.5 的代码要去掉
    `wait_for_motion_ready`、`acquire` 和三处 `move_relative`（改成 `print(action)`），并删掉其后的 `task["state"]` 检查；
    `release` 可以留着（没拿到控制权时它直接返回）。底座没开运动时前两个会直接报错，报错文案让你加 `--allow-motion`，
    这一步不要照做。取图不需要控制权。
-7. **允许运动，先不接模型**：`./platform run --allow-motion`，用 `move_relative` 做几次 0.25 m 和 ±15°，
+8. **允许运动，先不接模型**：`./platform run --allow-motion`，用 `move_relative` 做几次 0.25 m 和 ±15°，
    和 §6.3 里底座的实测数对一下（换了地面或负载要重测）。
-8. **接真服务端，开始动**：空旷房间、短指令，有人拿遥控器跟着。
-9. **每一步都留记录**，方便事后对照仿真：底座给的原始 JPEG（原样存，不要重新编码）、送进模型的 640×480 图、返回的动作；
-   `last_call` 的 `kind`、慢系统原文、`pose_ready`；底座返回的 `task` 结果和 `/platform/odom`；
-   没换环视时，需要第三视角就存 `side_panorama`。
+9. **接真服务端，开始动**：空旷房间、短指令，有人拿遥控器跟着。
+10. **每一步都留记录**，方便事后对照仿真：底座给的原始 JPEG（原样存，不要重新编码）、送进模型的 640×480 图、返回的动作；
+    `last_call` 的 `kind`、慢系统原文、`pose_ready`；底座返回的 `task` 结果和 `/platform/odom`；需要第三视角就存 `left_camera`。
 
 ---
 
@@ -684,7 +715,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 ## 附录 A 没有验证过的
 
 - 任何真实场景：真实图像、光照、运动模糊、动态障碍、动作执行误差、碰撞。
-- **我们的模型还没有接到底座上跑过**；底座还没有下倾 30° 的相机（§6.2）。
+- **我们的模型还没有接到底座上跑过**；下视相机按 §6.2 的方案还没装，装好以后它的高度、俯角、视场都要实测。
 - 与仿真不同的相机：自带前视离地约 0.4 m、广角有畸变、没有标定；下视图要用另一台相机拍（仿真里是同一台相机转动）。
 - 里程计在真实相机上的尺度（部署用固定的 `--translation-scale 1.0`），以及起步阶段只原地转圈时是否稳定。
 - 超过 500 步的长任务（里程计会话按 501 帧开，服务端上限 4096）。
@@ -772,7 +803,7 @@ Python 3.8 一条，不影响发出的请求）；服务端代码之后有改动
 
 **待实测：**
 
-- 下倾 30° 的相机：型号、安装高度、俯角、视场，以及接进底座后能否和两路环视一起稳定采集（§6.2）；
+- 下视相机：型号、安装高度、俯角、视场；换下 `camera2` 后，`left_camera` 加 `down_camera` 两路能否稳定采集（底座验证过的是两路环视，§6.2）；
 - 自带前视相机 1920×1080 这一路的内参和视场，以及它实际的离地高度和俯角（现在是按 URDF 推算的 0.37–0.40 m）；
 - 在我们的场地上，底座相对动作 0.25 m / ±15° 的误差和耗时；
 - Orin 到 4090 的网络往返；
