@@ -209,7 +209,8 @@ def test_builds_r2r_schema_episodes_scene_split_and_one_cohort(tmp_path, capsys)
         assert set(e["instruction"]) == {"instruction_text", "instruction_tokens"}
         assert set(e["goals"][0]) == {"position", "radius"}
         # info: R2R's geodesic_distance plus the navmesh the episode was filtered on (the client checks it).
-        assert e["info"] == {"geodesic_distance": 4.0 + e["trajectory_id"], "navmesh_sha256": FloorGeometry.sha256}
+        assert e["info"] == {"geodesic_distance": 4.0 + e["trajectory_id"], "navmesh_sha256": FloorGeometry.sha256,
+                         "source_trajectory_id": str(e["trajectory_id"])}
         hm3d_id = Path(e["scene_id"]).stem
         assert e["scene_id"] == f"hm3d/{hm3d_id}/{hm3d_id}.glb" and hm3d_id in heldout_ids | train_ids
         assert len(e["instruction"]["instruction_tokens"]) == TOKEN_LENGTH
@@ -332,7 +333,8 @@ def test_episodes_without_info_geodesic_are_dropped_unless_filled(tmp_path, caps
     pool = _load_gz(out / "pool.json.gz")
     assert len(pool["episodes"]) == 100 - 13
     for e in pool["episodes"]:
-        assert e["info"] == {"geodesic_distance": 4.0 + e["trajectory_id"], "navmesh_sha256": FloorGeometry.sha256}
+        assert e["info"] == {"geodesic_distance": 4.0 + e["trajectory_id"], "navmesh_sha256": FloorGeometry.sha256,
+                         "source_trajectory_id": str(e["trajectory_id"])}
 
 
 def test_a_scene_whose_navmesh_does_not_load_stops_the_build(tmp_path, capsys):
