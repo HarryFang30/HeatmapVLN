@@ -3347,6 +3347,22 @@ val_seen 与 val_unseen 的 SR 差约 11pt，全在"到不到"：
 - 总计约 23–39k 样本，360–600 步，约 2.8–4.7 h。
 - 开训前用 `--dry-run` 把组成写进台账。
 
+
+**运行记录.**
+1. **数据到位与开跑前的偏离（2026-10-16 02:00 UTC，在任何 HM3D 闭环结果之前）**：
+   - 标注：用户 2026-10-15 22:00 UTC 批准，用其 910B 上的 HF 登录下载 `cywan/StreamVLN-Trajectory-Data` 的
+     `ScaleVLN/scalevln_subset_150k.json.gz`（sha256 `23e31a05…81abdf`，与 C500 旧部署记录一致），经本机中转到 4090 `/workspace/exp28/data/`。
+     155,098 集、795 个场景；`trajectory_id` 是字符串（如 `scalevln_00000-kfPV7w3FaU5__fake_00015_00032`），换成其 sha256 前 48 位的整数，原串留在
+     `info.source_trajectory_id`；`instruction_tokens` 为 null，按 R2R train 词表补；`goals[].radius` 0.25（成功判定看配置的 3 m，不看它）。
+   - **`info.geodesic_distance` 全是 null**，预注册的"与 info.geodesic_distance 相差 ≤ max(1 m, 15%)"无从核对，改为 `--missing-info-geodesic fill`：
+     只要求 navmesh 上测地距离有限，起终点与参考路径点 snap ≤0.5 m 照旧，测地距离写回 info。
+   - **场景数**：第二批 InternData 的 150 个场景里有 6 个没拉到 4090（00046、00048、00302、00379、00434、00514），用现有的 294 + B3 5 个：
+     留出 20（B3 5 + 294 个里按哈希最小的 15），训练 279（预注册写 285）。
+   - 网格：HM3D v0.2 train 800 个场景全在（解包后补了 `train/` 一层）；这 299 个里原件 navmesh 241 个是 v1、58 个是 v2（0.1.7 读不了），
+     按预注册全部用客户端尺寸（高 1.5、半径 0.1，与 habitat-lab 与 habitat-sim 默认相同）重烘；v1 原件上的对照目前是边界差 0、面积比 1.000、32/32 点可行走。
+   - 与 InternData 的重叠率 55.2%（< 80%），按预注册留出 cohort 只取不重叠的集，训练 cohort 不过滤。
+   - 代码：`1ded1cb`（实现）、`21130e3`（navmesh 存盘核对不比上沿 y：0.1.7 存盘后上沿少了"智能体高度 + 一格"，多边形相同）、`7e3c454`（字符串 trajectory_id）。
+     4090 上 EXP-28 相关测试除两处 habitat 用例在同进程连跑时段错误（单独跑通过）外全过。
 ---
 
 ## 4. 公共资源
