@@ -168,8 +168,14 @@ class FakeEnv:
         self.primitive: list[tuple] = []  # every _apply_habitat_action, with the pose after it
         self.lookdown_depths: list[np.ndarray] = []  # the capture lookdown's observation
         self.in_primitive = False
+        self.geodesic_queries: list[tuple] = []  # the client's _check_reset_episode after each reset
         self._agent = SimpleNamespace(get_state=self._state, set_state=self._set_state)
-        self._sim = SimpleNamespace(get_agent=lambda index: self._agent, get_sensor_observations=self._observe)
+        self._sim = SimpleNamespace(
+            get_agent=lambda index: self._agent,
+            get_sensor_observations=self._observe,
+            pathfinder=SimpleNamespace(is_loaded=True),
+            geodesic_distance=self._geodesic,
+        )
 
     @property
     def key(self):
@@ -233,6 +239,11 @@ class FakeEnv:
 
     def _distance(self):
         return float(np.linalg.norm(self.position - np.asarray(self.current_episode.goals[0].position)))
+
+    def _geodesic(self, position_a, position_b, episode=None):
+        """HabitatSim.geodesic_distance on an open floor: the distance to the nearest goal."""
+        self.geodesic_queries.append((list(position_a), [list(end) for end in position_b], episode))
+        return min(float(np.linalg.norm(np.subtract(position_a, end))) for end in position_b)
 
     def get_metrics(self):
         distance = self._distance()

@@ -38,6 +38,18 @@ S0 (round 1b, EXP-23 run record 12): after a pixel 1-3 m STOP rate >= 0.10, or r
 >= 0.10, or turn direction differs from base >= 0.10 -> 1b does not run closed loop; a
 reversal <= 0.02 means the jitter diagnosis was wrong (recheck before training A).
 
+EXP-28's O3 (ledger EXP-28 D, written 2026-10-15 before any HM3D result) reads the same
+rows: (b), (c) and (d) as above, (e) at 0.92 without G0 (EXP-28 checks G0 on its own HM3D
+records), no (a), and one more, so that a candidate cannot pass by never stopping:
+
+====  ===============================================================  =============
+(f)   STOP rate at d <= 1 m (any previous call), adapter on            >= 0.75 x base
+      STOP rate after a pixel 1-3 m, adapter on                         >= 0.75 x base
+====  ===============================================================  =============
+
+``--gate exp28-o3`` makes that block (``O3_exp28``) decide the first line and the exit
+code; the default ``--gate ga`` keeps EXP-25's.
+
 Only the standard library and ``src.data.s2_records`` are imported, so it runs where the
 gates ran without touching an accelerator.  Prints PASS/FAIL first; exit 0 on PASS.
 """
@@ -78,6 +90,10 @@ S0_PIXEL_1_3 = 0.10
 S0_REVERSAL = 0.10
 S0_DIRECTION = 0.10
 S0_REVERSAL_RECHECK = 0.02
+# EXP-28 O3, written 2026-10-15 19:35 UTC before any HM3D result.
+O3_E_CLASS_AGREE_MIN = 0.92
+O3_F_STOP_KEEP = (3, 4)  # adapter-on STOP rate >= 3/4 of the base model's, on the same calls
+GATES = ("ga", "exp28-o3")
 
 _DIGIT = re.compile(r"\d")
 _INTEGER = re.compile(r"\d+")
@@ -180,6 +196,21 @@ def _criterion(value: float | None, threshold: float, direction: str, **extra: A
     return {"value": value, "threshold": threshold, "direction": direction, "pass": bool(ok), **extra}
 
 
+def _stop_keep(table: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
+    """(f): the adapter's STOP rate is at least O3_F_STOP_KEEP of the base model's on the same calls.
+
+    Compared in whole counts (``4 * on >= 3 * off``), so a rate exactly at the line passes; no
+    calls in the bin is unmeasured, a FAIL.
+    """
+    num, den = O3_F_STOP_KEEP
+    n = table["n"]
+    ratio = num / den
+    threshold = round(ratio * table["off_rate"], 6) if table["off_rate"] is not None else None
+    ok = bool(n) and den * table["on_stops"] >= num * table["off_stops"]
+    return {"value": table["on_rate"], "threshold": threshold, "direction": ">=", "pass": bool(ok), "n": n,
+            "base": table["off_rate"], "ratio_min": ratio, **extra}
+
+
 def _stop(row: Mapping[str, Any], mode: str) -> bool:
     return row[mode].get("class") == "stop"
 
@@ -254,6 +285,13 @@ def stratify(rows: Sequence[Mapping[str, Any]], report: Mapping[str, Any] | None
         "e_G0": _criterion(g0, E_G0_MIN, ">=", source="gate report G0_adapter_off_replay"),
     }
     ga_pass = all(c["pass"] for c in ga.values())
+    le1 = stop_table(rows, lambda r: dist(r) <= SPIN_M)
+    o3 = {key: ga[key] for key in ("b_pixel_3_6_stop_increase", "b_turn_3_6_stop_increase", "b_gt6_stop_increase",
+                                   "c_pixel_1_3_stop_rate", "d_post_turn_reversal",
+                                   "d_turn_direction_differs_from_base")}
+    o3["e_class_agree_ge3m"] = _criterion(_rate(agree, len(far)), O3_E_CLASS_AGREE_MIN, ">=", n=len(far), agree=agree)
+    o3["f_le1_stop_keep"] = _stop_keep(le1, state="d <= 1 m, any previous call")
+    o3["f_pixel_1_3_stop_keep"] = _stop_keep(pixel_1_3, state="previous call a pixel, 1 < d <= 3 m")
     s0_triggers = {
         "pixel_1_3_stop_rate": _criterion(pixel_1_3["on_rate"], S0_PIXEL_1_3, ">="),
         "post_turn_reversal": _criterion(rev_on["rate"], S0_REVERSAL, ">="),
@@ -265,6 +303,7 @@ def stratify(rows: Sequence[Mapping[str, Any]], report: Mapping[str, Any] | None
         "schema": SCHEMA,
         "rows_with_distance": len(rows),
         "G_A": {"criteria": ga, "all_pass": ga_pass},
+        "O3_exp28": {"criteria": o3, "all_pass": all(c["pass"] for c in o3.values())},
         "S0_round1b": {
             "triggers": s0_triggers,
             "closed_loop": "no" if s0_blocked else "not blocked by S0",
@@ -274,6 +313,7 @@ def stratify(rows: Sequence[Mapping[str, Any]], report: Mapping[str, Any] | None
         "report_only": {
             "spin_strict_ge1_earlier_within_1m": spin_strict,
             "gt6_any_previous": gt6,
+            "le1_any_previous": le1,
             "reversal_base": rev_off,
             "reversal_adapter": rev_on,
             "turn_direction": differs,
@@ -282,12 +322,21 @@ def stratify(rows: Sequence[Mapping[str, Any]], report: Mapping[str, Any] | None
     }
 
 
-def summary_line(result: Mapping[str, Any]) -> str:
-    ga = result["G_A"]["criteria"]
-    parts = [f"{k}={v['value']}{'' if v['pass'] else '(FAIL)'}" for k, v in ga.items()]
+def gate_block(result: Mapping[str, Any], gate: str = "ga") -> Mapping[str, Any]:
+    """The criteria block ``--gate`` decides on: EXP-25's G-A or EXP-28's O3."""
+    if gate not in GATES:
+        raise ValueError(f"gate must be one of {GATES}, not {gate!r}")
+    return result["G_A"] if gate == "ga" else result["O3_exp28"]
+
+
+def summary_line(result: Mapping[str, Any], gate: str = "ga") -> str:
+    block = gate_block(result, gate)
+    parts = [f"{k}={v['value']}{'' if v['pass'] else '(FAIL)'}" for k, v in block["criteria"].items()]
+    head = ("PASS" if block["all_pass"] else "FAIL") + (" G-A " if gate == "ga" else " EXP-28 O3 ") + " ".join(parts)
+    if gate != "ga":
+        return head
     s0 = result["S0_round1b"]
-    return (("PASS" if result["G_A"]["all_pass"] else "FAIL") + " G-A " + " ".join(parts)
-            + f" | S0 closed_loop={s0['closed_loop']} recheck_diagnosis={s0['reversal_le_0.02_recheck_diagnosis']}")
+    return head + f" | S0 closed_loop={s0['closed_loop']} recheck_diagnosis={s0['reversal_le_0.02_recheck_diagnosis']}"
 
 
 def main(argv=None) -> int:
@@ -296,6 +345,8 @@ def main(argv=None) -> int:
     parser.add_argument("--report", default="", help="gates_<stamp>.json (G0); default: beside --calls")
     parser.add_argument("--records", default="", help="re-root the rows' record paths here (<records>/<scene>/<file>)")
     parser.add_argument("--output", default="", help="default: <calls stem>.stratified.json beside --calls")
+    parser.add_argument("--gate", choices=GATES, default="ga",
+                        help="which block decides PASS/FAIL and the exit code: EXP-25's G-A or EXP-28's O3")
     args = parser.parse_args(argv)
     calls = Path(args.calls)
     report_path = Path(args.report) if args.report else calls.with_name(calls.name.replace(".calls.jsonl", ".json"))
@@ -306,12 +357,13 @@ def main(argv=None) -> int:
     joined, stats = attach_context(rows, Path(args.records) if args.records else None)
     result = stratify(joined, report)
     result["inputs"] = {"calls": str(calls.resolve()), "report": str(report_path) if report else None,
-                        "records": args.records or None, "join": dict(stats), "rows_in_file": len(rows)}
+                        "records": args.records or None, "join": dict(stats), "rows_in_file": len(rows),
+                        "gate": args.gate}
     output = Path(args.output) if args.output else calls.with_name(calls.name.replace(".calls.jsonl", "") + ".stratified.json")
     output.write_text(json.dumps(result, indent=1, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(summary_line(result))
+    print(summary_line(result, args.gate))
     print(f"[stratified] {dict(stats)} -> {output}", file=sys.stderr)
-    return 0 if result["G_A"]["all_pass"] else 1
+    return 0 if gate_block(result, args.gate)["all_pass"] else 1
 
 
 if __name__ == "__main__":

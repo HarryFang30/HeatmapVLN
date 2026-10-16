@@ -1434,9 +1434,79 @@ def build_habitat_config(args):
     return cfg
 
 
+# The client logs an episode as "Episode <scene>_<id>:", which scripts/exp25/probe_metrics.py
+# and scripts/exp19/select_cases.py parse with (\w+?)_(\d+): a key outside \w is dropped unseen.
+_SCENE_KEY_RE = re.compile(r"\w+")
+
+
+def _episode_scene_key(scene_id: str) -> str:
+    """``<root>/mp3d/<scene>/<scene>.glb`` -> ``<scene>``, the one key every tool derives.
+
+    The client keys a scene by its directory (progress rows, s2 records, the log, and
+    build_r2r_train_cohorts.scene_name); the fixed-cohort filter keyed it by the file stem,
+    and scripts/exp25/probe_metrics.py still does.  For MP3D the two are one name.  For
+    HM3D's own layout ``00xxx-<ID>/<ID>.basis.glb`` they are ``00xxx-<ID>`` and
+    ``<ID>.basis`` (no cohort key was found), and the log regex skips the hyphenated one.
+    So a scene sits at ``<scene>/<scene>.<ext>`` with ``<scene>`` one \\w+ token, as in
+    EXP-28's tree ``hm3d/<ID>/<ID>.glb``.
+    """
+    parts = str(scene_id).split("/")
+    scene = parts[-2]
+    if Path(parts[-1]).stem != scene or not _SCENE_KEY_RE.fullmatch(scene):
+        raise ValueError(
+            f"scene {scene_id!r} is not <scene>/<scene>.<ext> with <scene> a \\w+ token, so tools "
+            "would key its episodes differently; lay HM3D out as hm3d/<ID>/<ID>.glb (EXP-28)"
+        )
+    return scene
+
+
 def _habitat_episode_key(episode: Any) -> tuple[str, int]:
-    scene_id = Path(str(episode.scene_id)).stem
-    return scene_id, int(episode.episode_id)
+    return _episode_scene_key(episode.scene_id), int(episode.episode_id)
+
+
+def _episode_navmesh_sha256(episode: Any) -> str | None:
+    """The sha256 of the navmesh Habitat loads for an HM3D episode; None for MP3D.
+
+    habitat-sim 0.1.7 loads ``<scene file without extension>.navmesh``.  A scene in EXP-28's
+    tree ``hm3d/<ID>/<ID>.glb`` has a rebaked one, and an episode file may name its sha256
+    (``info.navmesh_sha256``, the navmesh it was filtered on), which must then match.  An MP3D
+    episode names none and sits under ``mp3d/``: nothing is read.
+    """
+    info = getattr(episode, "info", None)
+    expected = info.get("navmesh_sha256") if isinstance(info, dict) else None
+    if expected is None and str(episode.scene_id).split("/")[-3:-2] != ["hm3d"]:
+        return None
+    navmesh = os.path.splitext(str(episode.scene_id))[0] + ".navmesh"
+    actual = _sha256_file(navmesh)
+    if actual is None:
+        raise RuntimeError(f"episode {episode.episode_id}: no navmesh file {navmesh}")
+    if expected is not None and actual != str(expected):
+        raise RuntimeError(
+            f"episode {episode.episode_id}: navmesh {navmesh} has sha256 {actual}, "
+            f"but the episode file was built on {expected}"
+        )
+    return actual
+
+
+def _check_reset_episode(env, episode: Any) -> None:
+    """After env.reset(): the scene has a navmesh and the goal is reachable from the start.
+
+    habitat-sim 0.1.7's Python wrapper logs a navmesh as loaded without checking the native
+    return value, and cannot read HM3D v0.2's version-2 navmeshes, so a scene can come up
+    without one and the episode still runs, with every geodesic inf.  The geodesic is the same query DistanceToGoal makes,
+    without the episode, so no path cache is touched: it only reads the navmesh.  An HM3D
+    scene's navmesh file must also exist and be the one its episode file names, if any.
+    """
+    if not env._sim.pathfinder.is_loaded:
+        raise RuntimeError(f"episode {episode.episode_id}: no navmesh loaded for {episode.scene_id}")
+    geodesic = float(
+        env._sim.geodesic_distance(episode.start_position, [goal.position for goal in episode.goals])
+    )
+    if not math.isfinite(geodesic):
+        raise RuntimeError(
+            f"episode {episode.episode_id} in {episode.scene_id}: start-to-goal geodesic is {geodesic}"
+        )
+    _episode_navmesh_sha256(episode)
 
 
 def _create_habitat_env(hab_cfg, args):
@@ -2542,7 +2612,7 @@ def _run_eval_panoramic_vlm(
 
         observations = env.reset()
         episode = env.current_episode
-        scene_id = episode.scene_id.split("/")[-2]
+        scene_id = _episode_scene_key(episode.scene_id)
         episode_id = int(episode.episode_id)
         ep_key = (scene_id, episode_id)
 
@@ -2556,6 +2626,7 @@ def _run_eval_panoramic_vlm(
         if ep_key in done_set:
             continue
 
+        _check_reset_episode(env, episode)
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
@@ -3601,6 +3672,9 @@ class S2RecordCollector:
             ),
             "pose_frame": "habitat_agent_body",
         }
+        navmesh_sha256 = _episode_navmesh_sha256(episode)
+        if navmesh_sha256 is not None:  # HM3D (EXP-28); MP3D records keep their keys and bytes
+            meta["navmesh_sha256"] = navmesh_sha256
         self._episode = {
             "scene_id": str(scene_id),
             "episode_id": int(episode_id),
@@ -4662,7 +4736,7 @@ def run_eval_rpc_panoramic(args):
 
         observations = env.reset()
         episode = env.current_episode
-        scene_id = episode.scene_id.split("/")[-2]
+        scene_id = _episode_scene_key(episode.scene_id)
         episode_id = int(episode.episode_id)
         ep_key = (scene_id, episode_id)
         if ep_key in seen_episodes:
@@ -4673,6 +4747,7 @@ def run_eval_rpc_panoramic(args):
         if ep_key in done_set:
             continue
 
+        _check_reset_episode(env, episode)
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
@@ -5820,7 +5895,7 @@ def run_eval(args):
 
         observations = env.reset()
         episode = env.current_episode
-        scene_id = episode.scene_id.split("/")[-2]
+        scene_id = _episode_scene_key(episode.scene_id)
         episode_id = int(episode.episode_id)
         ep_key = (scene_id, episode_id)
 
@@ -5834,6 +5909,7 @@ def run_eval(args):
         if ep_key in done_set:
             continue
 
+        _check_reset_episode(env, episode)
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")

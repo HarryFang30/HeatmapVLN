@@ -15,15 +15,23 @@ The pose replay and the pixel projection are the 2026-10-15 research decompositi
 change: the logged actions of each call are replayed on the navmesh from the episode start (try_step, 0.25 m,
 15 deg), the 30 deg look-down 640x480 HFOV-79 camera at 1.25 m projects the pixel onto the floor plane.
 
+Navmeshes are read as <--scenes>/<scene>/<scene>.navmesh, <scene> being the middle part of the episode's
+``scene_id`` (``mp3d/<scene>/<scene>.glb``, EXP-28's ``hm3d/<ID>/<ID>.glb``).  The default is the MP3D tree; EXP-28
+Phase-0 points it at the rebaked v1 HM3D navmeshes (``/workspace/exp28/scene_datasets/hm3d``).  A navmesh that is
+missing or does not load (a v2 navmesh under Habitat-Sim 0.1.7) stops the run instead of giving inf geodesics.  An
+episode that names its navmesh (EXP-28's ``info.navmesh_sha256``, which the client also checks after each reset)
+must get exactly that file, so the replay runs on the navmesh the client walked; MP3D episodes name none.
+
   python scripts/exp25/probe_metrics.py --name val_seen --datasets <plan>/cohorts/dataset_shard_0*.json.gz \
       --progress '<run>/workers/shard_0*/progress.json' --logs '<run>/runtime/*/logs/client_shard_0*.log' \
-      --out <dir>
+      --out <dir> [--scenes /dataset/mp3d]
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -32,7 +40,8 @@ from multiprocessing import Pool
 
 import numpy as np
 
-SCENES = "/dataset/mp3d"
+DEFAULT_SCENES = "/dataset/mp3d"
+SCENES = DEFAULT_SCENES  # navmesh root, --scenes; set_scenes() also runs in every Pool worker
 
 # ---- parser: scripts/exp19/select_cases.py parse_client_log, verbatim regexes ----
 HEADER_RE = re.compile(r"^\[(\d+)/(\d+)\] Episode (\w+?)_(\d+): ")
@@ -113,13 +122,47 @@ F = (W / 2.0) / math.tan(math.radians(HFOV) / 2.0)
 CX, CY = (W - 1) / 2.0, (H - 1) / 2.0
 
 
+def set_scenes(root) -> None:
+    global SCENES
+    SCENES = str(root)
+
+
+def navmesh_path(scene: str) -> str:
+    return f"{SCENES}/{scene}/{scene}.navmesh"
+
+
 def pathfinder(scene):
     import habitat_sim
-    if scene not in _PF:
+    path = navmesh_path(scene)
+    if path not in _PF:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"no navmesh for scene {scene}: {path} (--scenes {SCENES})")
         pf = habitat_sim.PathFinder()
-        pf.load_nav_mesh(f"{SCENES}/{scene}/{scene}.navmesh")
-        _PF[scene] = pf
-    return _PF[scene]
+        loaded = pf.load_nav_mesh(path)  # is_loaded decides: 0.1.7's wrapper may not pass the native result on
+        if loaded is False or not pf.is_loaded:
+            raise RuntimeError(f"navmesh did not load (a v2 navmesh under Habitat-Sim 0.1.7?): {path}")
+        _PF[path] = pf
+    return _PF[path]
+
+
+_NAVMESH_SHA = {}
+
+
+def check_navmesh(scene, ep) -> None:
+    """The navmesh the episode file names (``info.navmesh_sha256``, EXP-28), if any, is the one at navmesh_path."""
+    expected = (ep.get("info") or {}).get("navmesh_sha256")
+    if expected is None:
+        return
+    path = navmesh_path(scene)
+    if path not in _NAVMESH_SHA:
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        _NAVMESH_SHA[path] = digest.hexdigest()
+    if _NAVMESH_SHA[path] != str(expected):
+        raise RuntimeError(f"episode {ep['episode_id']}: navmesh {path} has sha256 {_NAVMESH_SHA[path]}, but the "
+                           f"episode file was built on {expected} (--scenes {SCENES})")
 
 
 def geo(pf, a, ends):
@@ -175,6 +218,7 @@ def decompose(args):
     ep, block, prog_row = args
     scene = ep["scene_id"].split("/")[1]
     pf = pathfinder(scene)
+    check_navmesh(scene, ep)
     goal = [g["position"] for g in ep["goals"]]
     gpos = np.asarray(goal[0], dtype=np.float64)
     pos = np.asarray(ep["start_position"], dtype=np.float32)
@@ -367,7 +411,10 @@ def main(argv=None) -> int:
     ap.add_argument("--logs", nargs="+", required=True, help="glob(s) of client_shard_*.log, later files win")
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--scenes", default=DEFAULT_SCENES,
+                    help="navmesh root, <root>/<scene>/<scene>.navmesh (default: %(default)s)")
     args = ap.parse_args(argv)
+    set_scenes(args.scenes)
 
     eps = load_episodes(args.datasets)
     prog = load_progress(args.progress)
@@ -383,7 +430,7 @@ def main(argv=None) -> int:
             raise SystemExit(f"log/progress disagree for {k}: {f} vs success={r['success']} ne={r['ne']}")
     jobs = [(eps[k], blocks[k], prog[k]) for k in keys]
     jobs.sort(key=lambda j: j[0]["scene_id"])
-    with Pool(args.workers) as pool:
+    with Pool(args.workers, initializer=set_scenes, initargs=(args.scenes,)) as pool:
         rows = pool.map(decompose, jobs, chunksize=4)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, f"{args.name}.decomp.json"), "w") as fh:
