@@ -18,7 +18,7 @@ import hashlib
 import io
 import json
 from types import SimpleNamespace
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 from PIL import Image
@@ -41,7 +41,7 @@ from src.deploy.nav_agent import (
     _vo_protocol,
 )
 
-Recorder = Callable[[dict[str, Any]], None]
+Recorder = Callable[[Dict[str, Any]], None]  # typing.Dict: a runtime alias, and the Orin runs Python 3.8
 
 
 def decode_jpeg(data: bytes) -> np.ndarray:
