@@ -153,6 +153,23 @@ class FilterRule:
 # --------------------------------------------------------------------------- #
 # Scenes
 # --------------------------------------------------------------------------- #
+def trajectory_int(value: Any) -> int:
+    """The habitat-side integer of a source ``trajectory_id``.  StreamVLN's ScaleVLN subset writes strings
+    (``scalevln_00000-kfPV7w3FaU5__fake_00015_00032``); R2R writes ints.  A string maps to the first 48 bits of
+    its sha256 (155,098 episodes: collision odds about 4e-5, and check_route_geometry would catch one), and the
+    string itself is kept in ``info.source_trajectory_id``."""
+    if isinstance(value, bool):
+        raise TypeError(f"trajectory_id {value!r} is a bool")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty trajectory_id")
+    if text.isdigit():
+        return int(text)
+    return int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:12], 16)
+
+
 def parse_source_scene(scene_id: Any) -> tuple[str, str]:
     """``hm3d/00xxx-<ID>/<ID>.basis.glb`` (``train/`` optional) -> (``00xxx-<ID>``, ``<ID>``)."""
     match = SOURCE_SCENE.match(str(scene_id))
@@ -256,7 +273,7 @@ def index_source(episodes: Sequence[Any]) -> dict[str, list[dict[str, Any]]]:
         try:
             scene_dir, hm3d_id = parse_source_scene(episode["scene_id"])
             episode_id = int(episode["episode_id"])
-            int(episode["trajectory_id"])
+            trajectory_int(episode["trajectory_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise CohortError(
                 f"source episode[{index}] lacks a usable scene_id/episode_id/trajectory_id: {exc}"
@@ -393,11 +410,12 @@ def convert_episode(source: Mapping[str, Any], tokenizer: Callable[[str], list[i
     geodesic = info.get("geodesic_distance")
     return {
         "episode_id": episode_id,
-        "trajectory_id": int(source["trajectory_id"]),
+        "trajectory_id": trajectory_int(source["trajectory_id"]),
         "scene_id": hm3d_scene_id(hm3d_id),
         "start_position": _vec(source.get("start_position"), 3, f"{what} start_position"),
         "start_rotation": _vec(source.get("start_rotation"), 4, f"{what} start_rotation"),
-        "info": {"geodesic_distance": None if geodesic is None else float(geodesic)},
+        "info": {"geodesic_distance": None if geodesic is None else float(geodesic),
+                 "source_trajectory_id": str(source["trajectory_id"])},
         "goals": [{
             "position": _vec(goals[0].get("position"), 3, f"{what} goal"),
             "radius": float(goals[0].get("radius", 3.0)),

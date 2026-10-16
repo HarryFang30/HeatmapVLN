@@ -544,3 +544,14 @@ def test_split_reports_scenes_the_plain_hash_rule_would_have_held_out():
     assert split["interndata_scenes_without_episodes"] == sorted([missing, last])
     assert split["train"] == sorted(plain[3:-1])
     assert bhe.split_scenes(TRAIN_DIRS, B3, {*TRAIN_DIRS, *B3}, from_hash=2)["heldout_hash_skipped"] == []
+
+
+def test_string_trajectory_ids_map_to_stable_ints():
+    # StreamVLN's ScaleVLN subset writes trajectory_id as a string; R2R writes ints.
+    a = bhe.trajectory_int("scalevln_00000-kfPV7w3FaU5__fake_00015_00032")
+    assert a == bhe.trajectory_int("scalevln_00000-kfPV7w3FaU5__fake_00015_00032")
+    assert a != bhe.trajectory_int("scalevln_00000-kfPV7w3FaU5__fake_00015_00033")
+    assert 0 <= a < 2 ** 48
+    assert bhe.trajectory_int(7) == 7 and bhe.trajectory_int("12") == 12
+    with pytest.raises((TypeError, ValueError)):
+        bhe.trajectory_int("")
