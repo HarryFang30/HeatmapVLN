@@ -3,7 +3,7 @@
 给要把导航模型接到宇树 Go2 上的同事。一页纸的摘要见 [`README.md`](README.md)。
 
 > **状态（2026-10-15）**：没有在任何真机上跑过。机器人侧客户端 `NavAgent` 接 4090 上的真服务端时，
-> 在 4 集仿真上与部署的评测客户端逐调用相同（附录 C）；Go2 一侧（§6）只有没上过机的示意代码。
+> SDPA 和 flash-attention 2 下都在 4 集仿真上与部署的评测客户端逐调用相同（附录 C）；Go2 一侧（§6）只有没上过机的示意代码。
 
 | 代码 | 作用 |
 |---|---|
@@ -236,13 +236,18 @@ NavAgent(model, vo, *, protocol_seed=42, camera=CameraSpec(), timing=None,
 
 ### 3.1 先决条件
 
-- **代码**：部署检出 `/workspace/HeatmapVLN` 停在 `148e398`（2026-09-28），**没有** `scripts/deploy/` 和 `src/deploy/`。两种办法：
-  1. 用 09-30 验证过的源码副本 `/workspace/verify_0930/src_94146fa`（附录 C 的逐调用比对就是用它跑的）。
-  2. 按 `deploy_rtx4090.md` §4 的 git bundle 办法，把部署检出更新到含这两个目录的提交。
+- **代码**：服务端要从 `ded4bd3` 或之后的提交加载：`NAV_ATTN_IMPL` 开关在这个提交里，模型服务端的 `--attn_implementation`
+  从 `f61e9f7` 起才有。4090 上已经备好这样一份源码副本 `/workspace/nav_src_ded4bd3`（2026-10-15 用 `git archive` 导出，附录 C 的
+  核验就是用它跑的）。部署检出 `/workspace/HeatmapVLN`（`148e398`）和 09-30 的副本 `/workspace/verify_0930/src_94146fa` 都太旧。
+  要换更新的提交时，在本地检出里：
 
-  不管用哪份，启动时都要把 `NAV_REPO` 设成它：启动脚本从 `NAV_REPO`（默认 `/workspace/HeatmapVLN`）
-  加载两个服务端的代码。不设的话，两个服务端会从 `148e398` 那份旧检出加载：它的协议和身份与 `NavAgent` 一致，
-  启动、构造、调用都不会报错，但跑的是 09-28 的服务端代码（没有之后的改动，例如服务端计时），从报错上看不出来。
+  ```bash
+  git archive <提交> | ssh 6024_fjl 'mkdir ~/nav_src_<提交> && tar -x -C ~/nav_src_<提交>'
+  ```
+
+  容器里就是 `/workspace/nav_src_<提交>`。启动时要把 `NAV_REPO` 设成这份副本：启动脚本从 `NAV_REPO`（默认 `/workspace/HeatmapVLN`）
+  加载两个服务端的代码。不设的话会加载 `148e398` 那份旧检出，它不认 `--attn_implementation`，模型服务端起不来，启动脚本报
+  `model server exited` 并打出日志尾部。
 - **显卡**：开跑前看 `nvidia-smi`，找一张没有别人进程的卡：两个服务端同卡约要 40 GiB（§8）。
   没有空卡时，用 `NAV_VO_GPU` 分到两张卡：模型约 24 GiB、里程计约 17 GiB，各自再留几百 MiB 给 CUDA context。
 - **端口**：同一容器里在跑评测时（评测会在同一容器里并行起多套服务端，第 k 套占 52400+k / 52500+k），用 `NAV_MODEL_PORT` / `NAV_VO_PORT`
@@ -254,10 +259,11 @@ NavAgent(model, vo, *, protocol_seed=42, camera=CameraSpec(), timing=None,
 在宿主机上开 tmux（前台的 `docker exec` 会随 ssh 断开一起退出），然后：
 
 ```bash
-docker exec -it fjl-habitat bash -c 'cd /workspace/verify_0930/src_94146fa && NAV_REPO=$PWD NAV_GPU=4 NAV_HOST=0.0.0.0 bash scripts/deploy/start_nav_servers_cuda.sh'
+docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$PWD NAV_GPU=4 NAV_HOST=0.0.0.0 bash scripts/deploy/start_nav_servers_cuda.sh'
 ```
 
-- 看到 `[nav-servers] READY model=0.0.0.0:52400 vo=0.0.0.0:52500` 后再连。启动要几十秒到几分钟（加载权重），超时 30 分钟。
+- 看到 `[nav-servers] READY model=0.0.0.0:52400 vo=0.0.0.0:52500 attn=flash_attention_2` 后再连。启动要几十秒到几分钟
+  （加载权重；2026-10-15 实测约 20 秒），超时 30 分钟。
 - Ctrl-C 同时停两个服务端。日志在 `/workspace/nav_servers/<时间>_<pid>/` 的 `model.log`、`vo.log`（启动时会打印目录）。
 - `NAV_HOST=0.0.0.0` 是为了让机器人侧经 ssh 隧道连进来（§4）；只在容器里自测时可以去掉。
 
@@ -270,12 +276,12 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/verify_0930/src_94146fa && NA
 | `NAV_MODEL_PORT` / `NAV_VO_PORT` | `52400` / `52500` | 端口 |
 | `NAV_RUNTIME_DIR` | `/workspace/nav_servers/<时间>_<pid>` | 日志和缓存 |
 | `NAV_SERVER_START_TIMEOUT_S` | `1800` | 等两个服务端就绪的上限（秒） |
+| `NAV_ATTN_IMPL` | `flash_attention_2` | 模型服务端的注意力实现，设 `sdpa` 复现 09-30 的核验。服务端拿不到就拒绝启动；启动脚本还要在日志里看到确认才报 `READY` |
 | `HEATMAPVLN_TIMING` | 不设 | 设 `1` 时服务端逐阶段计时，每阶段做一次 CUDA 同步，只用于测延迟 |
 | `NAV_CHECKPOINT`、`NAV_CONFIG` 等 | 部署权重 `/workspace/weights/ppa_refine_v2_best.pth`、`configs/ppa_action_refine_v2_8gpu.yaml` | 一般不改，其余见脚本开头的注释 |
 
-**注意力实现**：这个启动脚本按部署配置走 SDPA（`model.llm.attn_implementation: sdpa`），§8 的延迟就是 SDPA 的数。
-评测启动脚本从 2026-10-13 起默认 flash-attention 2：4 集实测模型服务端 3.5 s → 1.9 s、一次规划 5.1 s → 3.5 s，
-但动作会变。这个启动脚本还没有这个开关。
+**注意力实现**：2026-10-15 起默认 flash-attention 2，与评测启动脚本（`PPA_EVAL_ATTN_IMPL`）相同。同样 4 集上它把模型服务端
+从 3.5 s 降到 1.9 s、一次规划从 5.1 s 降到 3.5 s（§8）。它和 SDPA 的 bf16 数值不同，同一集里的走法会变；那 4 集的成败不变。
 
 ---
 
@@ -474,7 +480,7 @@ def to_model_frame(rgb: np.ndarray, hfov_deg: float) -> np.ndarray:
 - 速度先保守：前进 ≤ 0.3 m/s，转向 ≤ 0.5 rad/s（InternNav 的上限是 0.6 m/s、0.5 rad/s，StreamVLN 是 1.0 m/s、1.2 rad/s）。
 - **为什么从当前位姿起算**：StreamVLN 在上一个目标位姿上累加，残差不积累，但里程计漂移会带进来；
   InternNav 从当前里程计起算，没走到位的部分直接丢掉。仿真里每个动作都相对当前状态，所以这里按当前位姿写，并把每步实际走了多少记进日志。
-- **走一步停一步**：公开的 Go2 部署端到端延迟大多在 0.3–1.3 s，我们每次规划要 2.5–5.3 s（§8），所以只能规划时原地站着等，
+- **走一步停一步**：公开的 Go2 部署端到端延迟大多在 0.3–1.3 s，我们每次规划要 1.2–3.3 s（默认的 flash-attention 2；SDPA 是 2.5–5.3 s，§8），所以只能规划时原地站着等，
   拿到动作再走。StreamVLN 也是规划时站着等。
 
 ### 6.5 示意代码
@@ -708,17 +714,30 @@ def run_episode(instruction: str, run_id: int, base: Go2Base, front_cam, down_ca
 各阶段的中位数不能直接相加；关键路径那一行是逐次求和后再取的中位数。
 模型服务端内部：慢系统两轮生成约 1.7 s、历史认知 0.58 s、快系统条件前向 0.85 s、快系统去噪采样 0.2 s。
 
+**flash-attention 2（启动脚本的默认）**：上面的全量是 SDPA 跑的。2026-10-15 用默认参数起机器人服务端，`NavAgent` 跑同样那 4 集
+（82 次规划，附录 C），规划步的 `act()` 中位数如下（含下视图取图，仿真里约 0.1 s）：
+
+| 调用类型 | 次数 | `act()` | 其中模型调用往返 | 其中位姿查询 |
+|---|---:|---:|---:|---:|
+| 带历史认知的轨迹调用（稳态） | 45 | **3316 ms** | 1865 ms | 1334 ms |
+| 预热期轨迹调用 | 13 | 1789 ms | 1626 ms | 1 ms |
+| 只有慢系统 | 24 | 1153 ms | 436 ms | 548 ms |
+
+省下的全在模型那边（SDPA 全量的模型调用往返是 3602 ms），里程计不受影响。这一列只有 4 集、一个场景，和上面全量不是同一批样本；
+同样 4 集上评测客户端的对照见 `exp20-latency-report.md` §9（模型服务端 3499 → 1866 ms、规划 5108 → 3472 ms）。
+
 **对真机意味着什么：**
 
-- 平均每 3.7 个动作规划一次（207970 / 56236）。规划是同步的：机器人每 1–4 步原地等 2.5–5.3 s，拿到动作才能继续。
-- 摊到每个动作的计算平均约 1.0 s（模型约 0.61 s、里程计约 0.37 s）。只看稳态的带历史认知调用约 1.3 s；
-  EXP-20 报告里的"每动作 1.46 s"还含仿真渲染。
+- 平均每 3.7 个动作规划一次（207970 / 56236）。规划是同步的：机器人每 1–4 步原地等，拿到动作才能继续。
+  默认的 flash-attention 2 下稳态约 3.3 s（SDPA 是 5.3 s），只跑慢系统的调用约 1.2 s（SDPA 2.5 s）。
+- 摊到每个动作的计算：SDPA 全量平均约 1.0 s（模型约 0.61 s、里程计约 0.37 s），flash-attention 2 只缩短模型那部分，约减半。
+  EXP-20 报告里的"每动作 1.46 s"是 SDPA 稳态、还含仿真渲染。
 - 再加上：Go2 走 0.25 m / 转 15° 再停稳的时间（§7 第 5 步实测）、网络往返（每步一次，每次规划再加两次）。
   相机读取已按仿真采集的时间（约 0.2 s）算在上表里，真实相机更慢就按差值加。
 - 取队列动作的 `act()` 只有一次里程计写入，通常十几毫秒；但第 20 帧那次写入会在服务端建第一张图，
   之后攒满 8 帧时写入也会顺带补建，所以偶尔会慢。
-- 采样条数和去噪步数只影响快系统去噪采样那 0.2 s，降它们省不了多少延迟；大头在慢系统和视觉编码上。
-  换 flash-attention 2，4 集实测模型服务端 3.5 s → 1.9 s（§3.2 末尾），这个启动脚本还没有这个开关。
+- 采样条数和去噪步数只影响快系统去噪采样那 0.2 s，降它们省不了多少延迟；大头在慢系统和视觉编码上，
+  flash-attention 2 省的正是这一块（上表）。
 
 **带宽**（Habitat 渲染图实测，真实相机的 JPEG 大小会不同）：每步里程计写入约 70 KB；有 8 帧历史时每次规划请求约 350 KB，
 其中 9 张 384×384 前视图各约 24 KB、下视图约 46 KB、27 张黑色占位图各约 3 KB。
@@ -791,6 +810,13 @@ LOOK_DOWN 后当场重新规划不算不同：仿真客户端这时会第二次�
 
 `NavAgent` 一侧的代码（`src/deploy/`、两个 RPC 协议文件、里程计客户端）从 `94146fa` 到现在没有改过；服务端代码之后有改动
 （昇腾移植、计时、keepalive 等），同样 4 集的评测在之后的提交上也逐调用复现过（`docs/experiments/exp20-latency-report.md` §8）。
+
+**接 flash-attention 2 的机器人服务端（2026-10-15，GPU 4，源码副本 `/workspace/nav_src_ded4bd3`）：通过。**
+用默认参数起 `start_nav_servers_cuda.sh`（日志有 `Attention implementation confirmed: flash_attention_2`，`READY ... attn=flash_attention_2`），
+`nav_agent_habitat_check.py` 跑同样 4 集，与 10-13 用评测启动脚本跑的 flash-attention 2 那一臂（`/workspace/lat_1013/arm_fa`，源码 `ace1ff8`；
+两边的服务端代码只差 `f61e9f7` 加的开关和核对）逐调用比对：13/13、20/20、28/28、21/21 次调用相同，每集结局和评测成绩相同。
+那一臂开着服务端计时、这次没开，动作仍然相同。产物在 `/workspace/nav_servers/fa2check_ded4bd3_navagent/`。
+调用数和 09-30 的 SDPA 核验不同（82 对 99），是因为两种注意力本来就走法不同（§3.2）。
 
 **§6.5 的示意代码（2026-10-15，模拟狗）**：把 §6.3、§6.5 的代码原样摘出来，配一个按 `unitree_sdk2_python`（`814556d`）签名写的
 模拟 SDK（500 Hz 状态、机体系积分、`Move` 保持 1 s、没有对端时阻塞到超时返回 3102）和本仓库的假服务端，跑一集 35 步（含 5 次 LOOK_DOWN、
