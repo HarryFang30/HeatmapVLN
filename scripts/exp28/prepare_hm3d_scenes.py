@@ -654,9 +654,14 @@ def pathfinder_summary(pf: Any, points: int = RANDOM_POINTS, seed: int = 0) -> d
 def summaries_match(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
     if not (a.get("is_loaded") and b.get("is_loaded")):
         return False
-    for row_a, row_b in zip(a["bounds"], b["bounds"]):
-        if any(abs(x - y) > BOUNDS_TOL for x, y in zip(row_a, row_b)):
-            return False
+    # The upper y bound is left out: on 0.1.7 the in-memory mesh's top reaches agent height plus a cell above
+    # the saved one's (00481-5jLhtVmWd5F: 8.066 m in memory, 6.466 m read back), with identical polygons.
+    (lo_a, hi_a), (lo_b, hi_b) = a["bounds"], b["bounds"]
+    pairs = list(zip(lo_a, lo_b)) + [(hi_a[0], hi_b[0]), (hi_a[2], hi_b[2])]
+    if any(abs(x - y) > BOUNDS_TOL for x, y in pairs):
+        return False
+    if a.get("random_points_navigable") != b.get("random_points_navigable"):
+        return False
     area_a, area_b = a.get("navigable_area"), b.get("navigable_area")
     if area_a is None or area_b is None:
         return area_a is None and area_b is None
