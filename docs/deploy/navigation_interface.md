@@ -1,24 +1,27 @@
 # 实机部署说明：4090 服务器 + 宇树 Go2
 
-给要把导航模型接到宇树 Go2 上的同事。一页纸的摘要见 [`README.md`](README.md)。
+给要把导航模型接到宇树 Go2 上的同事。机器狗一侧走实验室的 ROS 2 底座 `robot_platform_ws`：相机和运动都由底座提供，
+本文写的是我们这个项目怎么接上去。一页纸的摘要见 [`README.md`](README.md)。
 
-> **状态（2026-10-15）**：没有在任何真机上跑过。机器人侧客户端 `NavAgent` 接 4090 上的真服务端时，
-> SDPA 和 flash-attention 2 下都在 4 集仿真上与部署的评测客户端逐调用相同（附录 C）；Go2 一侧（§6）只有没上过机的示意代码。
+> **状态（2026-10-16）**：没有在任何真机上跑过。机器人侧客户端 `NavAgent` 接 4090 上的真服务端时，
+> SDPA 和 flash-attention 2 下都在 4 集仿真上与部署的评测客户端逐调用相同（附录 C）。接底座的一侧（§6）只有示意代码，
+> 只在模拟的底座客户端上跑通过；底座现在还缺一路下倾 30° 的相机（§6.2）。
 
 | 代码 | 作用 |
 |---|---|
 | `src/deploy/nav_agent.py` | 机器人侧客户端 `NavAgent`，纯 Python，不要 GPU、不要 torch |
 | `src/deploy/fake_servers.py` | 不要 GPU 的假服务端，用来先把机器人一侧跑通 |
 | `scripts/deploy/start_nav_servers_cuda.sh` | 4090 侧：在一张卡上起模型服务端和里程计服务端 |
+| `robot_platform.ros_client.ROSPlatformClient` | 底座提供（不在本仓库）：狗一侧的取图、控制权和相对动作 |
 
 **目录**
 
 1. 系统组成
 2. 输入与输出 ← 接口契约，接机器人前先读这一节
 3. 4090 侧：启动服务端
-4. 网络：让机器人侧电脑连到 4090
-5. 机器人侧电脑：环境与自检
-6. 接到 Go2
+4. 网络：让 Orin 连到 4090
+5. Orin：环境与自检
+6. 接到底座和 Go2
 7. 第一次上机的顺序
 8. 延迟、带宽与显存
 9. 失败、超时与重置
@@ -39,12 +42,15 @@
         ▲
         │  gRPC（vla_rpc：JSON + JPEG，无加密、无认证），走 ssh -L 隧道（§4）
         │
-机器人侧电脑（x86 笔记本 / NUC，背在狗上，Python 3.10，一个进程）
-    NavAgent  ·  两台相机的读取  ·  Go2 运动控制
+狗上的 Orin（Ubuntu 20.04 · ROS 2 Foxy · Python 3.8）
+    我们的进程：NavAgent + 底座的 ROS 客户端 ROSPlatformClient
+        │  ROS 2，同一个 domain
+    底座 robot_platform_ws：/platform/cameras/*、/platform/relative_motion、控制权
         │                                   │
-        │ 网线 192.168.123.x（DDS）          │ USB
+        │ 宇树接口（DDS）                    │ USB
         ▼                                   ▼
-Go2 EDU 本体（192.168.123.161）         前视相机（水平）+ 下视相机（下倾 30°）
+Go2 EDU：自带前视相机、运动             环视相机 left_camera / camera2（只做记录）
+                                        下倾 30° 的相机：还没有，要加（§6.2）
 ```
 
 模型里三部分的叫法，后文会用到：
@@ -83,7 +89,8 @@ with NavAgent("127.0.0.1:52400", "127.0.0.1:52500") as agent:   # 模型服务�
         pitch = action.camera_pitch_deg         # LOOK_DOWN 为 −30，其余为 0
 ```
 
-`robot.*` 是你们自己的函数。用两台固定相机时，`capture(pitch)` 在 `pitch < 0` 时读下视相机、否则读前视相机（§6.3）。
+`robot.*` 在这里是示意。接底座时取图和动作都走底座的 ROS 客户端，`capture(pitch)` 在 `pitch < 0` 时读下视相机、
+否则读前视相机，完整写法见 §6.5。
 
 ### 2.2 输入
 
@@ -105,15 +112,15 @@ with NavAgent("127.0.0.1:52400", "127.0.0.1:52500") as agent:   # 模型服务�
 | `lookdown_fn()` | 只在这一步要规划时调，每步最多一次（约每 1–4 步一次） | 同一位姿、**相对水平下倾 30°** 的图。慢系统在这张图上找像素目标，快系统也拿它当输入，不能省，也不能拿前视图冒充 |
 | `level_fn()` | 只在一种情况下调：上一个动作是 `LOOK_DOWN`，而这一步从队列里取到 STOP、当场重新规划。每步最多一次，先于 `lookdown_fn()` | 同一位姿、**水平**的图 |
 
-用一台带云台的相机时，`lookdown_fn` / `level_fn` 返回前要把相机恢复水平。用两台固定相机时，
-`lookdown_fn` 读下视相机，`level_fn` 读前视相机，不用管恢复（§6.3）。
+用一台带云台的相机时，`lookdown_fn` / `level_fn` 返回前要把相机恢复水平。用两台固定相机时（接底座就是这样：前视用自带的 `front_camera`，下视相机还要另加，§6.2），
+`lookdown_fn` 读下视相机，`level_fn` 读前视相机，不用管恢复（§6.2）。
 
 **三张图的格式都一样：**
 
 | 项 | 要求 | 说明 |
 |---|---|---|
 | 类型 | `numpy.ndarray`，`dtype=uint8`，形状 `(480, 640, 3)`，**RGB** 顺序 | 不是数组抛 `TypeError`，形状或 dtype 不对抛 `ValueError`。**不会替你缩放**。OpenCV 读出的是 BGR，要先 `cv2.cvtColor(img, cv2.COLOR_BGR2RGB)`，否则不报错但结果错 |
-| 视场 | 水平 79°（4:3 时垂直约 63.5°），针孔模型 | 仿真值。真实相机要先去畸变，再居中裁到水平 79°、4:3，最后缩放到 640×480（`to_model_frame`，§6.3）。水平小于 79°、或垂直小于 63.5° 的相机补不回来；16:9 的画面受限的是垂直方向，水平要 ≥ 约 95.5° |
+| 视场 | 水平 79°（4:3 时垂直约 63.5°），针孔模型 | 仿真值。真实相机要先去畸变，再居中裁到水平 79°、4:3，最后缩放到 640×480（`to_model_frame`，§6.4）。水平小于 79°、或垂直小于 63.5° 的相机补不回来；16:9 的画面受限的是垂直方向，水平要 ≥ 约 95.5° |
 | 安装 | 离地 1.25 m，朝正前方；前视水平，下视下倾 30° | 仿真值。装不到时记下实际高度和俯角 |
 | 曝光等 | 无要求 | 仿真里没有运动模糊、自动曝光；真机效果未知 |
 
@@ -285,10 +292,10 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
 
 ---
 
-## 4. 网络：让机器人侧电脑连到 4090
+## 4. 网络：让 Orin 连到 4090
 
-gRPC 没有加密和认证。`fjl-habitat` 在 docker 的 bridge 网络里、没有发布端口，所以服务端只绑 `127.0.0.1` 时，
-只有容器里的进程连得上。机器人在别处时：
+我们的进程跑在狗上的 Orin 上（§5）。gRPC 没有加密和认证。`fjl-habitat` 在 docker 的 bridge 网络里、没有发布端口，
+所以服务端只绑 `127.0.0.1` 时，只有容器里的进程连得上。从 Orin 连过去：
 
 1. 容器里启动时加 `NAV_HOST=0.0.0.0`（§3.2 的命令已经带了）。容器没有发布端口，只有宿主机和同一 docker 网桥能访问，
    不会暴露到公网网卡；但这台机器多人共用，别人也连得到这两个无认证端口，**用完就停**。
@@ -298,105 +305,180 @@ gRPC 没有加密和认证。`fjl-habitat` 在 docker 的 bridge 网络里、没
    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' fjl-habitat
    ```
 
-3. 在机器人侧电脑上开隧道。先在它的 `~/.ssh/config` 里加一个 `Host 6024_fjl`（HostName、User、端口向负责人要），
-   下面和 §5 的 ssh / scp 都用它；换了服务端端口就用换后的：
+3. 在 Orin 上开隧道。先在 Orin 的 `~/.ssh/config` 里加一个 `Host 6024_fjl`（HostName、User、端口、跳板向负责人要；
+   底座的 `examples/remote_inference/ssh_config` 有 PanaV 连远端 GPU 时的跳板写法可以照抄格式），下面和 §5 的 ssh / scp 都用它；
+   换了服务端端口就用换后的：
 
    ```bash
    ssh -N -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes -L 52400:<容器IP>:52400 -L 52500:<容器IP>:52500 6024_fjl
    ```
 
-4. 连通自检（先按 §5 装好环境）：在机器人侧电脑上构造一次 `NavAgent`，它会核对两个服务端的身份和协议版本，不对就抛异常：
+4. 连通自检（先按 §5 装好环境）：在 Orin 上构造一次 `NavAgent`，它会核对两个服务端的身份和协议版本，不对就抛异常：
 
    ```bash
    python -c "from src.deploy import NavAgent; NavAgent('127.0.0.1:52400', '127.0.0.1:52500').close(); print('ok')"
    ```
 
-5. 用 `ping` 量一下机器人侧电脑到 4090 的往返：每步多付一次，每次规划再多付两次（§2.7）。
+5. 量一下经隧道的往返（4090 走跳板时直接 `ping` 量的不是这条路）：每步多付一次，每次规划再多付两次（§2.7）。
 
-**不要把这两个端口发布或转发到公网网卡。**
+   ```bash
+   time python -c "from src.deploy import NavAgent; NavAgent('127.0.0.1:52400', '127.0.0.1:52500').close()"
+   ```
+
+**不要把这两个端口发布或转发到公网网卡。** 这条从容器外经隧道连进来的路径还没有端到端测过：4090 上的核验（附录 C）都是在容器里连的。
 
 ---
 
-## 5. 机器人侧电脑：环境与自检
+## 5. Orin：环境与自检
 
-- **机器选择**：
-  - 建议背一台 x86 笔记本或 NUC，装 Ubuntu 20.04 / 22.04，网线接 Go2（§6.2），另有无线连 4090。
-  - 也可以用 Go2 的扩展坞（Jetson Orin NX 16GB 或 Orin Nano 8GB，JetPack 5.1.1，aarch64，系统自带 Python 3.8），
-    但要多两步：另装一个 Python 3.10（例如 miniforge）；宇树 SDK 锁定的 `cyclonedds==0.10.2` 没有 Linux aarch64 的现成包，
-    要先从源码编译 C 版 CycloneDDS 0.10.x（`releases/0.10.x` 分支）再设 `CYCLONEDDS_HOME`。连 4090 的无线链路同样要配（§6.2）。
-    没有在扩展坞上试过。
-- **一个 Python 3.10 环境**，同时装 `NavAgent` 和宇树 SDK。`cyclonedds==0.10.2` 在 x86_64 Linux 上只有 Python 3.7–3.10 的现成包，
-  3.11 及以上在任何平台都没有，所以定 3.10。`vla_rpc` 不在 PyPI 上，它在 4090 宿主机的 `/home/fangjialei/rpc`
-  （容器里是 `/workspace/rpc`），先拷过来：
+我们的进程跑在狗上的 Orin 上，也就是底座 `robot_platform_ws` 所在的那台（Ubuntu 20.04、ROS 2 Foxy、Linux 用户 `irmv`，
+底座在 `/home/irmv/robot_platform_ws`），和底座在同一个 ROS domain 里。取图和运动都通过底座的 ROS 客户端（§6），
+所以这一侧不需要宇树 SDK，也不需要 x86 电脑。
+
+- **Python 用系统的 3.8**：底座的 ROS 客户端依赖 Foxy 的 `rclpy`，Foxy 只支持系统自带的 Python 3.8，`NavAgent` 和它在同一个进程里，
+  所以也是 3.8。numpy 1.24 是支持 3.8 的最后一版。
+- **环境要和底座一致**：`RMW_IMPLEMENTATION`（底座用 `rmw_cyclonedds_cpp`）和 DDS 网卡（默认 `eth0`）在底座的
+  `config/deployment.env` 里；ROS domain 不在里面，`./platform` 沿用当前终端的 `ROS_DOMAIN_ID`（没设就是 0），
+  所以启动底座和跑我们进程的终端里 `ROS_DOMAIN_ID` 要一样。最省事的是用底座的 `./platform shell` 开一个已经加载好
+  ROS、宇树和底座环境的 shell，在里面跑我们的进程。
+- **装法**：单独建一个 venv。rclpy 和底座的包不在系统 site-packages 里，是 `./platform shell` 通过 `PYTHONPATH` 加进来的，
+  所以每次都要先进 `./platform shell`，再激活这个 venv，再 `cd` 到本仓库根目录（`./platform shell` 打开后停在底座目录，
+  那里也有 `src/` 和 `tests/`）。在普通终端里激活这个 venv 是 import 不到 rclpy 的。`--system-site-packages` 是为了用上
+  系统里 apt 装的依赖。`vla_rpc` 不在 PyPI 上，它在 4090 宿主机的 `/home/fangjialei/rpc`（容器里是 `/workspace/rpc`），
+  用 §4 第 3 步配好的 `6024_fjl` 拷过来：
 
   ```bash
-  scp -r 6024_fjl:/home/fangjialei/rpc ./vla_rpc_src
-  pip install numpy pillow pytest
-  pip install -e ./vla_rpc_src                 # 会装 grpcio、grpcio-tools、protobuf、opencv-python
-  pip install -e <unitree_sdk2_python 源码目录>
+  cd /home/irmv/robot_platform_ws && ./platform shell      # ROS、宇树、底座环境都已加载
+  python3 -m venv --system-site-packages ~/heatmapvln_venv && source ~/heatmapvln_venv/bin/activate
+  python -m pip install --upgrade pip          # 20.04 自带的 pip 20.0 认不出 grpcio 的 aarch64 现成包，会改成从源码编译
+  scp -r 6024_fjl:/home/fangjialei/rpc ~/vla_rpc_src
+  pip install --upgrade "numpy==1.24.4" "pillow==10.4.0" pytest   # 和附录 C 实测的版本一致；不加 --upgrade 时系统里的旧版不会被换掉
+  pip install -e ~/vla_rpc_src                 # 会装 grpcio、grpcio-tools、protobuf、opencv-python
+  cd <本仓库根目录>
   ```
 
+  `python3 -m venv` 报 ensurepip 不可用时，要找底座的维护者装 `python3.8-venv`（需要 sudo）。
   本仓库不用装，也不要装 `requirements` 里的训练依赖：`NavAgent` 只导入几个纯 Python 模块，不要 torch。
-  检出一个含 `src/deploy/` 的提交（与 4090 上服务端那份同一个提交最好），在仓库根目录运行，或把它加进 `PYTHONPATH`。
+  检出 `14ac629` 或之后的提交（Python 3.8 上的自检要用到这次对 `fake_servers.py` 的修正；4090 上 `ded4bd3` 那份的
+  `nav_agent.py` 与它相同，发出的请求没有差别），在仓库根目录运行，或把它加进 `PYTHONPATH`。
 - **自检（不要 GPU、不要机器人）**：
 
   ```bash
   python -m pytest tests/test_nav_agent.py --noconftest -q
   ```
 
-  应为 23 passed。`--noconftest` 是必须的：`tests/conftest.py` 导入了 torch。2026-10-15 在 Python 3.10.17 +
-  numpy 2.2.6 + Pillow 12.3 上实测通过（macOS arm64；x86 Linux 上还没跑过）。
-- **假服务端**：没有 GPU 时先把机器人一侧跑通：`NavAgent(FakeModelServer(), FakeVOServer())`
+  应为 23 passed。`--noconftest` 是必须的：`tests/conftest.py` 导入了 torch。2026-10-16 在 Python 3.8.20 + numpy 1.24.4 +
+  Pillow 10.4.0 + vla_rpc（grpcio 1.70、protobuf 5.29、OpenCV 5.0）上实测通过，用 vla_rpc 的编码器跑一集假服务端也通过
+  （macOS arm64；还没在 Orin 上跑过）。
+- **假服务端**：没有 GPU 时先把这一侧跑通：`NavAgent(FakeModelServer(), FakeVOServer())`
   （`src/deploy/fake_servers.py`，按脚本返回动作，不代表模型行为）。还没装 vla_rpc 时加
   `jpeg_encoder=pil_jpeg_encoder`（三者都从 `src.deploy.fake_servers` 导入；PIL 编码的字节和部署不同，只能配假服务端用）。
 
 ---
 
-## 6. 接到 Go2
+## 6. 接到底座和 Go2
 
-**本节的状态**：依据是宇树官方文档、`unitree_sdk2_python` 源码（`814556d`，2026-09-21）和公开的 Go2 导航部署，
-2026-10-15 逐条核对过（附录 D）。**没有在真机上跑过。** 标"待实测"的数和示意代码里的参数，都要在 §7 的步骤里实测后再定。
+**本节的状态**：机器狗一侧走实验室的 ROS 2 底座 `robot_platform_ws`（下称"底座"）。依据是底座 2026-10-12 版的 README、VALIDATION、
+`docs/project_integration.md`、`docs/remote_inference.md`、`config/platform.yaml` 和 `src/robot_platform/robot_platform/ros_client.py`
+（底座的工作区，不在本仓库）。底座本身在真机上验证过取图和相对动作，PanaV 项目用它在真机上走完过一条完整路线；
+**我们的模型还没有接上去跑过**，§6.5 的代码只在模拟的底座客户端上跑通过（附录 C）。
 
-### 6.1 前提
+### 6.1 底座给什么，我们用什么
 
-- **型号**：Go2 **EDU**。AIR、PRO 不开放二次开发接口（规格表里的 Go2 X 写的是"基础支持"，没试过）。
-- **固件**：在 Unitree App 里查软件版本。下面都按 **≥ V1.1.6** 写，即 2025-05 发布的 V2.0 运动接口
-  （主运控服务叫 `mcf`；更早的固件叫 `sport_mode`，状态码的含义也不同）。`Move` 的范围是 vx −2.5~3.8 m/s、
-  vy ±1.0 m/s、vyaw ±4 rad/s，我们只用到 ≤ 0.3 m/s、≤ 0.5 rad/s。
-  低于 V1.1.6 时先升级固件：旧固件上 `error_code` 是错误码，示意代码按 `error_code` 判断状态的地方都不成立；
-  `Move` 保持 1 s、不滤波这两条也只在 V2.0 文档里写过。
-- **控制方式**：只用高层运动服务（`SportClient`）。不要碰底层电机控制：用它得先关掉主运控服务，否则两套控制同时下指令会失控。
-
-### 6.2 网络
-
-- 机器人侧电脑用网线接 Go2，IP 设在 `192.168.123.x`，宇树建议 `.222`（不能用 `.161`，那是 Go2 本体；扩展坞是 `.18`）。
-- 宇树写明开发**只支持有线**，所以连 4090 要另走一条：笔记本自带的无线网卡，或在狗上加装路由器。
-  公开部署也是这样做的：StreamVLN 的狗经 Wi-Fi 连远端 4090，作者建议在狗上加路由器提高带宽。
-- 宇树不支持在 Go2 内置计算机（`.161`）上跑用户程序，SDK 也不支持在 Mac、Windows 上开发。
-- **DDS 网卡**：`ChannelFactoryInitialize(0, "<网卡名>")`，网卡名是接 Go2 的那块（用 `ip addr` 查 `192.168.123.x` 那一块）。
-  不传就自动选，多网卡的机器上要显式传。
-
-### 6.3 两台相机 → `act()` 的三个输入
-
-两台相机都固定安装、没有云台，所以"把相机压到 −30°"变成"下一帧改从下视相机取"：
-
-| 接口 | 读哪台相机 |
+| 底座接口 | 我们怎么用 |
 |---|---|
-| `act()` 的 `front_rgb` | 上一个动作的 `camera_pitch_deg` 是 0 时读前视相机；是 −30 时（上一个动作是 `LOOK_DOWN`）读下视相机 |
-| `lookdown_fn()` | 下视相机 |
-| `level_fn()` | 前视相机 |
+| `/platform/cameras/front_camera/frame`（客户端 `get_frame('front_camera')`） | `front_rgb` 和 `level_fn()` |
+| 一路下倾 30° 的相机 | `lookdown_fn()`，以及 `LOOK_DOWN` 之后那一帧的 `front_rgb`。**底座里现在没有这一路**，见 §6.2 |
+| `/platform/relative_motion`（`move_relative`） | 执行 `FORWARD`、`TURN_LEFT`、`TURN_RIGHT` |
+| `/platform/acquire_control`、`heartbeat`、`release_control` | 一集开始拿控制权，结束或出错时释放；心跳由客户端的后台线程每 0.25 s 发一次 |
+| `/platform/stop` | 人工急停 |
+| `/platform/odom`、`/platform/observation`、环视相机 | 不进模型：位姿由 4090 上的里程计服务端从图像估计；环视只用于记录 |
 
-两台相机的内参、分辨率、处理流程要一致。每张图先去畸变，再经过下面的 `to_model_frame`：
+- 底座默认只读。只有用 `./platform run --allow-motion` 启动、而且我们拿到了控制权，底座才会让狗动。
+- **运动只走底座**：底座独占宇树的运动出口。不要在狗上另跑宇树 SDK、`sport_mode_ctrl` 或旧导航节点去发运动指令，会和底座争控制。
+- 同一时刻只有一个项目能持有控制权：PanaV 在跑时我们拿不到，反之亦然。
+- 这和 PanaV 的接法一样：图像和动作走底座的 ROS 接口，模型推理走另一条路（PanaV 用 HTTP，我们用 gRPC 隧道，§4）。
 
-- 去畸变用 `cv2.undistort(img, K, dist)`，不传新的内参矩阵，输出仍按原内参 `K` 成像。
-- 这时 `hfov_deg = 2·atan(w / (2·fx))`，`w` 是图宽，`fx` 取自 `K`。不要填产品页上的标称视场：填错不报错，只会裁错比例。
-- 这里按图像中心裁剪，主点 `cx`、`cy` 要接近图像中心。
+### 6.2 图像：前视相机和下视图
+
+**前视 `front_camera`**：Go2 自带的前视相机，底座通过宇树的 videohub 接口取图，是底座给导航模型的默认输入。
+
+- `robot.get_frame('front_camera', wait_new=True)` 返回 `{'jpeg': bytes, 'metadata': dict}`。底座实测是 1920×1080 的 JPEG，
+  配置 5 fps；元数据里有 `available`、`warming_up`、`age`、`width`、`height` 和 `calibrated`（现在是 false）。
+  客户端只返回 1 s 内到达的帧，等不到就抛 `RosPlatformError`。
+- 相机打开后，或者一次取图失败（例如宇树接口 0.8 s 没回应）之后，都有 5 s 预热，期间不发布图像。
+  所以每次 `get_frame` 的超时都要留到 6 s 以上（示意代码传 `timeout=10`），不只是第一帧。
+- 时间戳是底座收到图像的时间，相机不给采集时间。
+- **它和仿真里的相机差得很远**（§2.2 的要求）：
+  - 离地约 0.37–0.40 m（按官方 URDF 推算），仿真是 1.25 m。底座验收时存的样图就是贴着地面的视角。
+  - 广角，从底座存的样图看画面边缘有明显的桶形畸变；底座没有标定内参。官方写自带相机水平 100°、垂直 56°（指 1280×720），1920×1080 这一路没有数据。
+  - 所以先用棋盘格标一次内参，再按 §6.4 去畸变、裁到水平 79°、垂直 63.5°。官方的水平 100° 看着够（16:9 要 ≥ 约 95.5°），
+    但那是带畸变的画面；垂直只有 56°，去畸变以后只会更小，所以这一步多半会报错（以标定结果为准）。那就只能退一步：
+    居中裁成 4:3 再缩放（PanaV 就是这样做的），结果按"视场与训练不同"来读。
+- 视点是最大的风险（附录 A）：模型只在 1.25 m 高、水平、79° 的视角上训练过。
+
+**下视图**：底座现在没有下倾 30° 的相机，这是接上去之前必须补的一块。
+
+- 慢系统在下视图上找像素目标，快系统也拿它当输入（§2.2），不能省，也不能拿前视图冒充。
+- 可以这样补：
+  1. 加一台 USB 相机，固定下倾 30°，在底座的 `config/platform.yaml` 里加一路（例如叫 `down_camera`，按 `/dev/v4l/by-path/`
+     稳定路径配置，写法照现有的 `left_camera`）。底座 README 写明这台 Orin 上三路 USB 相机同时采集不稳定，现在已经接了左右两路环视，
+     所以要么换下一路环视（它们只用于记录），要么先验证三路能稳定采集。这一步要底座的维护者一起做。
+     换下一路环视的话，`side_panorama` 也就没有了（它固定用 `left_camera` 和 `camera2` 两路合成），
+     第三视角记录改存剩下那一路的原图，也可以在配置里把 `side_panorama` 关掉。
+  2. 它装不到和自带前视相机同一个位置，所以记下它的高度、俯角和视场；处理流程（去畸变、裁剪、缩放）和前视一致。
+- 在补上之前，只能拿前视图当下视图跑**接线测试**（狗不动，或空旷处），这时模型的输入是错的，结果不算数。
+
+**环视相机** `left_camera`、`camera2` 和它们合成的 `side_panorama`：约 120° 的鱼眼，朝两侧，只用于记录，不进模型。
+没换环视时，要留第三视角的现场记录就订阅 `side_panorama`（PanaV 默认 2 FPS 保存它）；底座只提供图像，保存归项目自己做。
+
+### 6.3 动作：交给底座的相对动作
+
+底座在 `relative` 模式下自己做闭环（50 Hz、PID，到位容差平移 3 cm、旋转 1°，速度够低持续 0.12 s 才算完成），
+我们只提交距离或角度，不用自己写控制器。角度左转为正、右转为负，单位 rad。
+
+| `Action` | 底座调用 | 底座实测（2026-10-08 调好 PID 后，单次） |
+|---|---|---|
+| `FORWARD` | `robot.move_relative(distance=0.25)` | 走了 0.241 m，用时 2.36 s；侧移约 2.6 cm，航向变了 +0.65° |
+| `TURN_LEFT` | `robot.move_relative(angle=math.radians(15))` | 转了 15.008°，2.42 s |
+| `TURN_RIGHT` | `robot.move_relative(angle=-math.radians(15))` | 转了 15.202°，2.24 s |
+| `LOOK_DOWN` | 不调用；下一帧改从下视相机取 | — |
+| `STOP` | 不调用；本集结束，`release()` | — |
+
+- `move_relative` 默认等动作做完再返回（`wait=True`，超时 30 s），返回 `{'task_id', 'state', 'reason'}`。
+  `state` 不是 `succeeded` 就按本集失败处理（§9）。
+- 底座的限速是平移 0.2 m/s、旋转 0.3 rad/s（在底座 `config/platform.yaml` 的 `motion` 里）；相对动作的平移在底座代码里
+  另外限到 0.15 m/s，改配置调不了。
+- 动作做完后取下一帧，要连取两次 `get_frame(..., wait_new=True)`、用第二帧。`wait_new` 只保证这一帧是调用之后才收到的，
+  不保证是调用之后才拍的：底座只记收到的时间，前视的取图请求可能在动作结束前就发出去了。第二帧的请求更晚，
+  加上底座要停稳 0.12 s 才判定动作完成，它几乎总是停稳以后的视点（§2.3），但底座不保证。配置是 5 fps，但前视每帧还要等一次宇树的取图请求（最长 0.8 s），
+  实际要等多久在 §7 量一下。
+- 动作是开环的：底座走到容差内就算完成，差的那点模型只能从下一帧看出来（§2.3）。
+- 底座的实测每种动作只有几次、一种地面；长 episode、不同地面和负载下的重复性，底座文档里写着还没验证。
+
+### 6.4 图像预处理
+
+底座给的是 JPEG，`act()` 要 640×480 的 RGB `uint8`（§2.2）。每张图都按同一条流程处理：
+
+1. **解码并转成 RGB**：OpenCV 解出来是 BGR，一定要转。
+2. **去畸变**：用标定时用的模型（针孔 `cv2.undistort(img, K, dist)`，鱼眼 `cv2.fisheye.undistortImage(img, K, D, Knew=K)`），
+   不传新的内参矩阵，输出仍按原内参 `K` 成像。这时 `hfov_deg = 2·atan(w / (2·fx))`，`w` 是图宽，`fx` 取自 `K`。
+   不要填产品页上的标称视场：填错不报错，只会裁错比例。
+3. **居中裁到水平 79°、4:3，缩放到 640×480**（`to_model_frame`）。这里按图像中心裁剪，主点 `cx`、`cy` 要接近图像中心。
 
 ```python
 import math
 
 import cv2
 import numpy as np
+
+
+def decode_rgb(jpeg: bytes) -> np.ndarray:
+    """底座的 JPEG → RGB uint8。"""
+    bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("invalid platform JPEG")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def to_model_frame(rgb: np.ndarray, hfov_deg: float) -> np.ndarray:
@@ -412,273 +494,103 @@ def to_model_frame(rgb: np.ndarray, hfov_deg: float) -> np.ndarray:
 ```
 
 保留的宽度占比是 tan 39.5° / tan(HFOV/2)，例如水平 90° 时约 0.824。高度按 4:3 跟着算，所以垂直视场也要够 63.5°：
-16:9 的画面水平要 ≥ 约 95.5°；16:10、水平 90° 的画面（例如 VLingNav 用的 D457 1280×800）刚好够，
-1280×720、水平 90° 的不够，函数会报错。
-
-**为什么用外接相机，不用 Go2 自带的**：
-
-- **视场对不上**：官方多媒体文档写自带相机 1280×720、水平 100°、垂直 56°、视频 15 Hz（FAQ 和产品页写"120°"，
-  没说是哪个方向；内参没有找到）。按垂直 56° 算，裁成 4:3 后水平只剩约 71°，小于模型要的 79°，补不回来。
-- **太低**：官方 URDF 里相机在机身原点前方 0.327 m、上方 0.043 m，水平朝前；机身离地约 0.33–0.36 m，
-  所以相机离地约 0.37–0.40 m（待实测）。仿真是 1.25 m。
-- **公开部署都用外接相机**：StreamVLN、Uni-NaVid 用 RealSense D455，VLingNav 用 D457，DyNaVLM 用 D435。
-  给出安装高度的几家都在 0.85–1 m：InternNav（上海 AI Lab 的开源导航项目，我们的慢系统和快系统就是在它发布的模型上做的）
-  建议 Go2 上约 1 m、下倾 15°，DyNaVLM 0.85 m、下倾 10°，SparseVideoNav 约 1 m。查过的 7 个部署里，
-  没有一个报告装在 1.25 m 水平或下倾 30°（StreamVLN、Uni-NaVid、VLingNav 没有给高度和俯角）。SparseVideoNav 还专门写了
-  这类基于大模型的导航对相机高度变化特别敏感。
-- **InternNav 作者的经验**（issue #295、#324、#157）：
-  - 相机高度、俯角和运动模糊对效果影响很大；动起来拍的模糊图会明显变差。
-  - 训练时相邻两帧大约隔 25 cm 或 15°，真机输入要和它一致。我们每个动作做完、停稳再拍，正好对得上。
-  - 他们早期也是一台水平、一台下倾的两台相机，下倾那台只在模型输出下视时用（和我们这套一样），
-    发现成功率没有明显差别，后来改成只用下倾那台。他们能这样做，是因为训练数据混了多种视角；我们的模型没有，所以两台都要。
-
-**安装建议**：
-
-- 用支架把两台相机装到接近 1.25 m：前视水平，下视下倾 30°，尽量上下对齐，固定牢、避免高频振动。
-- 选全局快门或运动模糊小的相机，动作做完、停稳后再拍。
-- 装不到 1.25 m 时，记下实际高度和俯角，结果要按"视点与训练不同"来读。
-- 相机装在机身上方时调用 `AutoRecoverySet(False)`：官方建议带负载时关掉跌倒自动翻身，免得翻身时压坏相机和支架。
-
-### 6.4 离散动作 → Go2 运动
-
-**接口事实**（V2.0，`unitree_sdk2_python`）：
-
-- **`Move(vx, vy, vyaw)`**：机体坐标系速度（X 向前、Y 向左、Z 向上），发出后不等应答。
-  返回 0 只表示消息发出去了，不代表机器人执行了；**没有对端时会阻塞到客户端超时、再返回 3102**，所以每次都要查返回码。
-- **指令保持**：最新一条 `Move` 维持 1 s，运控不对它做滤波，官方建议自己滤波后再发；不动时发 `Move(0, 0, 0)` 或 `StopMove()`。
-  所以一个动作执行期间要按固定频率重发。官方没给频率：StreamVLN、InternNav 的 Go2 客户端用 10 Hz，宇树的 C++ 示例用 200 Hz。
-  官方也没写死区：速度太小时狗可能不动。
-- **`StopMove()` 不只是停**：它还会把运动参数恢复成默认值，而且要等应答。所以动作之间用 `Move(0, 0, 0)` 停，
-  `StopMove()` 只在一集结束、超时和异常时用。
-- **先进入平衡站立再走**：
-  - `StandUp()` 是"站立锁定"（`error_code` 1002），官方提醒锁久了电机容易过热。issue #175 报告只调 `StandUp()` 时
-    `Move` 返回 0、狗却 4 秒到十几秒不动，`error_code` 一直停在 1002。
-  - `BalanceStand()` 从站立锁定切到"平衡站立"（1013）；旧版 AI 运动服务文档也建议调 `Move` 前先调一次它。
-  - 狗趴着、坐着或在阻尼状态时用 `RecoveryStand()`，官方写它会恢复到平衡站立。
-  - 示意代码等 `error_code` 变成 1013 再发 `Move`。**拿它当"能走了"的信号是我们的推断，官方没有写**，第一次上机时记下实际看到的值。
-- **状态**：订阅 `rt/sportmodestate`（`SportModeState_`，官方写 500 Hz）。平面位姿取 `position[0]`、`position[1]`
-  和 `imu_state.rpy[2]`（yaw）；`error_code` 在 V2.0 里是当前模式，不是错误码；`stamp` 是时间戳。
-- **位姿是腿式 + IMU 融合的里程计**，原点没有文档，所以每个动作都按"与起点之差"算。有第三方测量
-  （户外、带激光雷达负载）说它转角准、平移尺度不准；在 0.25 m / 15° 这么小的步长上误差多大，没有数据，待实测。
-- **方向**：按坐标系定义和右手定则，vyaw > 0 和 yaw 增大都是逆时针（向左转），但官方没有明写，§7 第 5 步要先确认。
-
-**映射**（每个动作都从**当前实测位姿**起算）：
-
-| `Action` | Go2 做什么 | 到位条件（待实测后调） |
-|---|---|---|
-| `FORWARD` | 沿当前朝向前进 0.25 m：按与起点的距离做 P 控制，同时用 vyaw 修正航向 | 距离误差 < 0.5 cm，或超时 |
-| `TURN_LEFT` / `TURN_RIGHT` | 原地转 +15° / −15°（±0.2618 rad），按 yaw 误差做 P 控制 | 角度误差 < 0.5°，或超时 |
-| `LOOK_DOWN` | 不动，下一帧从下视相机取（§6.3） | — |
-| `STOP` | `StopMove()`，本集结束 | — |
-
-- 到位后发 `Move(0, 0, 0)`，等机身停稳再拍下一帧。沉降时间待实测（示意代码先取 0.3 s）；公开的 Go2 客户端不等沉降，
-  但它们不要求每帧都是静止视点，我们要（§2.3）。
-- **要有最小速度**：只用比例控制时，速度随误差一起降到接近 0，每次都停在容差边上，少走的就是整个容差，还会一步步累加
-  （只用比例控制、容差 2 cm / 1.5° 时，理想跟踪的模拟里 FORWARD 每次只走 0.230 m、转向只转 13.6°）。所以示意代码给速度设了下限
-  （0.05 m/s、0.1 rad/s）、把容差收到 0.5 cm / 0.5°，并限制每个周期的速度变化（官方建议的滤波）。
-  最小速度和容差要在 §7 第 5 步一起实测：最小速度太小狗不动，太大会冲过头；容差太紧时，真机有延迟会来回找位置，直到超时。
-- 速度先保守：前进 ≤ 0.3 m/s，转向 ≤ 0.5 rad/s（InternNav 的上限是 0.6 m/s、0.5 rad/s，StreamVLN 是 1.0 m/s、1.2 rad/s）。
-- **为什么从当前位姿起算**：StreamVLN 在上一个目标位姿上累加，残差不积累，但里程计漂移会带进来；
-  InternNav 从当前里程计起算，没走到位的部分直接丢掉。仿真里每个动作都相对当前状态，所以这里按当前位姿写，并把每步实际走了多少记进日志。
-- **走一步停一步**：公开的 Go2 部署端到端延迟大多在 0.3–1.3 s，我们每次规划要 1.2–3.3 s（默认的 flash-attention 2；SDPA 是 2.5–5.3 s，§8），所以只能规划时原地站着等，
-  拿到动作再走。StreamVLN 也是规划时站着等。
+16:9 的画面（自带前视就是 16:9）水平要 ≥ 约 95.5°。
 
 ### 6.5 示意代码
 
-**没有在真机上跑过**，只在一个按真实 SDK 签名写的模拟狗上跑通过（附录 C）。`front_cam` / `down_cam` 是你们自己的相机读取函数，
-每次返回一张去畸变后的 RGB 图；`to_model_frame` 见 §6.3，放在同一个文件里。
+用底座的 ROS 客户端取图、执行动作，用 `NavAgent` 规划。**没有在真机或真底座上跑过**，只在一个按 `ros_client.py` 签名写的模拟客户端上
+跑通过（附录 C）。`preprocess` 是一个字典，每个相机一个函数：按 §6.4 用这台相机自己标定的内参拼好 `decode_rgb` → 去畸变 → `to_model_frame`，
+返回 640×480 RGB。两台相机的内参和视场不同，不能共用一个函数。要在 `./platform shell` 里、激活 §5 的 venv、`cd` 到本仓库后运行。
 
 ```python
 import math
-import threading
-import time
 
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
-from unitree_sdk2py.go2.sport.sport_client import SportClient
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+from robot_platform.ros_client import ROSPlatformClient
 
 from src.deploy import Action, NavAgent
 
-STAND_LOCKED, BALANCE_STAND = 1002, 1013     # V2.0 的 error_code：站立锁定、平衡站立
+TURN = math.radians(15)
+DOWN_CAMERA = "down_camera"      # 底座里还没有这一路，见 §6.2
 
 
-def wrap(a: float) -> float:
-    return (a + math.pi) % (2 * math.pi) - math.pi
-
-
-def check(code: int, what: str) -> None:
-    if code != 0:                            # 3102 = 没有对端、没发出去
-        raise RuntimeError(f"{what} returned {code}")
-
-
-def ramp(target: float, last: float, step: float) -> float:
-    """每个周期最多变 step：官方建议自己滤波后再发 Move（§6.4）。"""
-    return last + max(-step, min(step, target - last))
-
-
-def p_speed(err: float, k: float, v_min: float, v_max: float) -> float:
-    """比例控制，但不低于 v_min：官方没写死区，太慢狗可能不动（§6.4）。"""
-    return math.copysign(min(v_max, max(v_min, k * abs(err))), err)
-
-
-class Go2Base:
-    """离散动作 → Go2 高层速度指令，20 Hz 闭环在 rt/sportmodestate 上。"""
-
-    def __init__(self, nic: str, rate_hz: float = 20.0, settle_s: float = 0.3):
-        ChannelFactoryInitialize(0, nic)
-        self.dt, self.settle_s = 1.0 / rate_hz, settle_s
-        self._msg, self._stamp, self._t = None, None, 0.0
-        self._v = self._w = 0.0              # 上一次发出的速度，给 ramp 用
-        self._lock = threading.Lock()
-        self._sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
-        self._sub.Init(self._on_state, 10)
-        self.sport = SportClient()
-        self.sport.SetTimeout(10.0)
-        self.sport.Init()
-        check(self.sport.AutoRecoverySet(False), "AutoRecoverySet")   # 背着相机，关掉跌倒自动翻身（§6.3）
-        mode = self._latest().error_code
-        if mode == STAND_LOCKED:
-            check(self.sport.BalanceStand(), "BalanceStand")          # 站立锁定 → 平衡站立
-        elif mode != BALANCE_STAND:
-            check(self.sport.RecoveryStand(), "RecoveryStand")        # 趴着、坐着、阻尼等 → 平衡站立
-        self._wait_mode(BALANCE_STAND, timeout=10.0)  # 拿 1013 当"能走了"是推断，待实测（§6.4）
-        self.sport.SetTimeout(1.0)           # 之后 Move 没有对端时最多阻塞 1 s
-
-    def _on_state(self, msg):                # SDK 的读线程里调用，只存最新一帧
-        stamp = (msg.stamp.sec, msg.stamp.nanosec)
-        with self._lock:
-            if stamp != self._stamp:
-                self._stamp, self._t = stamp, time.monotonic()
-            self._msg = msg
-
-    def _latest(self, timeout: float = 2.0):
-        t_end = time.monotonic() + timeout
-        while True:
-            with self._lock:
-                msg = self._msg
-            if msg is not None:
-                return msg
-            if time.monotonic() > t_end:
-                raise RuntimeError("no rt/sportmodestate message")
-            time.sleep(0.05)
-
-    def _wait_mode(self, code: int, timeout: float):
-        t_end = time.monotonic() + timeout
-        while True:
-            now = self._latest().error_code
-            if now == code:
-                return
-            if time.monotonic() > t_end:
-                raise RuntimeError(f"Go2 did not reach error_code {code}, now {now}")
-            time.sleep(0.05)
-
-    def pose(self):
-        with self._lock:
-            msg, t = self._msg, self._t
-        if msg is None or time.monotonic() - t > 0.5:   # 时间戳 0.5 s 没往前走：当故障处理（issue #184 的症状）
-            raise RuntimeError("rt/sportmodestate is stale")
-        return msg.position[0], msg.position[1], msg.imu_state.rpy[2]
-
-    def _send(self, v: float, w: float):
-        check(self.sport.Move(v, 0.0, w), "Move")   # 指令只保持 1 s，所以每个周期重发
-        self._v, self._w = v, w
-
-    def _settle(self):
-        self._send(0.0, 0.0)                 # Move(0,0,0)：停下，但不重置运动参数
-        time.sleep(self.settle_s)            # 等停稳再拍下一帧
-
-    def stop(self):
-        """一集结束、超时或异常时用。StopMove 会把运动参数恢复成默认值（§6.4）。"""
-        self.sport.StopMove()                # 急停路径上不查返回码，免得盖住原来的异常
-        self._v = self._w = 0.0
-        time.sleep(self.settle_s)
-
-    def forward(self, dist=0.25, v_max=0.3, v_min=0.05, tol=0.005, timeout=6.0):
-        x0, y0, th0 = self.pose()
-        t_end = time.monotonic() + timeout
-        while True:
-            x, y, th = self.pose()
-            err = dist - ((x - x0) * math.cos(th0) + (y - y0) * math.sin(th0))
-            if abs(err) < tol:
-                break
-            if time.monotonic() > t_end:
-                self.stop()
-                raise RuntimeError(f"FORWARD timed out, {err:.3f} m left")
-            v = ramp(p_speed(err, 1.5, v_min, v_max), self._v, 0.05)
-            w = ramp(max(-0.3, min(0.3, 2.0 * wrap(th0 - th))), self._w, 0.1)
-            self._send(v, w)
-            time.sleep(self.dt)
-        self._settle()
-
-    def turn(self, deg, w_max=0.5, w_min=0.1, tol=math.radians(0.5), timeout=6.0):
-        _, _, th0 = self.pose()
-        target = wrap(th0 + math.radians(deg))
-        t_end = time.monotonic() + timeout
-        while True:
-            err = wrap(target - self.pose()[2])
-            if abs(err) < tol:
-                break
-            if time.monotonic() > t_end:
-                self.stop()
-                raise RuntimeError(f"TURN timed out, {math.degrees(err):.1f} deg left")
-            self._send(0.0, ramp(p_speed(err, 2.0, w_min, w_max), self._w, 0.1))
-            time.sleep(self.dt)
-        self._settle()
-
-
-def run_episode(instruction: str, run_id: int, base: Go2Base, front_cam, down_cam, hfov_deg: float):
-    front = lambda: to_model_frame(front_cam(), hfov_deg)
-    down = lambda: to_model_frame(down_cam(), hfov_deg)
-    with NavAgent("127.0.0.1:52400", "127.0.0.1:52500", on_log=print) as agent:   # 超时用默认 60 s（§9）
-        agent.reset(instruction, scene_id="go2lab", episode_id=run_id)   # 每次实跑换一个 run_id（§2.2）
-        pitch = 0.0
+def run_episode(instruction: str, run_id: int, preprocess: dict):
+    """preprocess = {"front_camera": f, DOWN_CAMERA: g}，每个函数把这台相机的 JPEG 变成 640x480 RGB（§6.4）。"""
+    with ROSPlatformClient(timeout=3.0) as robot, \
+            NavAgent("127.0.0.1:52400", "127.0.0.1:52500", on_log=print) as agent:
+        robot.wait_for_motion_ready(timeout=40, on_wait=print)   # 只等底座预检就绪，不拿控制权
+        robot.acquire(owner="heatmapvln", mode="relative")      # 之后客户端的后台线程每 0.25 s 发心跳
         try:
+            def grab(camera):
+                robot.get_frame(camera, timeout=10, wait_new=True)          # 这一帧可能是动作结束前请求的
+                frame = robot.get_frame(camera, timeout=10, wait_new=True)  # 第二帧几乎总是停稳以后的（§6.3）
+                return preprocess[camera](frame["jpeg"])
+
+            front = lambda: grab("front_camera")
+            down = lambda: grab(DOWN_CAMERA)
+            agent.reset(instruction, scene_id="go2lab", episode_id=run_id)   # 每次实跑换一个 run_id（§2.2）
+            pitch = 0.0
             while not agent.done:
-                frame = down() if pitch < 0 else front()                   # 上一个是 LOOK_DOWN 就读下视相机
-                action = agent.act(frame, down, front)                     # lookdown_fn=下视，level_fn=前视
+                frame = down() if pitch < 0 else front()                    # 上一个是 LOOK_DOWN 就读下视相机
+                action = agent.act(frame, down, front)                      # 规划这几秒里底座输出为零
                 pitch = action.camera_pitch_deg
                 if action is Action.FORWARD:
-                    base.forward(0.25)
+                    task = robot.move_relative(distance=0.25)
                 elif action is Action.TURN_LEFT:
-                    base.turn(+15)
+                    task = robot.move_relative(angle=TURN)
                 elif action is Action.TURN_RIGHT:
-                    base.turn(-15)
-                elif action is Action.STOP:
-                    base.stop()
-                # LOOK_DOWN：车体不动
+                    task = robot.move_relative(angle=-TURN)
+                else:
+                    continue                                                # LOOK_DOWN 不动；STOP 后 agent.done 为真
+                if task["state"] != "succeeded":
+                    raise RuntimeError(f"relative motion failed: {task}")
         finally:
-            base.stop()                      # 任何异常都先停下；本集作废，重新 reset（§9）
+            try:
+                robot.release()                  # 释放控制权，底座清零输出
+            except Exception as error:           # 控制权已经丢了（租约到期、急停、预检失效）时 release 也会报错
+                print("release:", error)
 ```
 
 ### 6.6 安全
 
-- **遥控器**：始终有人拿着 Go2 的遥控器跟在旁边。不要调 `SwitchJoystick(False)`：关掉之后推摇杆不再干预程序，遥控器就不能接管了。
-- **软急停**：程序里的急停用 `StopMove()`。`Damp()` 让所有关节进入阻尼、优先级最高，官方定位是突发情况下的急停；
-  关节只阻尼不保持，机身会趴下，只在意外时用。
-- **看门狗**：示意代码里状态时间戳 0.5 s 不往前走就报错停车，单个动作超时 6 s；`Move` 只保持 1 s，程序挂了狗最多再走 1 s。
-  有用户在 80 次运行里遇到 1 次运控卡死：里程计时间戳停住、遥控器全部失灵，只能断电（issue #184；他用的是 C++ SDK，
-  经避障服务发速度）。所以看门狗要有，也要能断电。
-- **碰撞**：模型没有任何避障，仿真里撞墙只是贴墙滑动。前几次在空旷房间、低速、短指令下跑。宇树另有避障服务
-  （`unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client.ObstaclesAvoidClient`），但它可能改写或拒绝运动，
-  和离散动作的语义不一致，先不要开。
+- **先在模拟里跑通**：`./platform run --backend sim --allow-motion` 和实机是同一套 ROS 接口，模拟后端会给 `config/platform.yaml` 里每一路已启用的相机发 256×192 的占位图（§7 第 4 步）。
+- **遥控器**：始终有人拿着 Go2 的遥控器跟在旁边。
+- **急停**：`ros2 service call /platform/stop std_srvs/srv/Trigger {}`，立即停止并释放控制权；程序里是 `robot.stop()`。
+  这条命令要在另一个 `./platform shell` 里执行（开跑前先开好放着），保证和底座同一个 RMW、网卡和 domain。
+- **掉线保护在底座里**：控制租约 1 s（客户端每 0.25 s 发心跳），我们的进程挂掉或断开后，底座在租约到期时清零输出。
+  出错时要取消动作、`release()`，并确认 `/platform/status` 里的 `output` 为零。
+- **心跳线程会悄悄退出**：底座客户端的心跳只要有一次调用超时（0.5 s）或出错，后台线程就退出，不会重启。1 s 后租约到期，
+  底座清零输出、收回控制权，下一个 `move_relative` 返回 `failed`（`reason` 以 `invalid_session:` 开头；动作进行中到期则是
+  `lease_expired`），`/platform/status` 的 `last_reason` 是 `lease_expired`。按本集失败处理就行，下一集 `acquire()` 会重新起心跳。
+- **碰撞**：模型没有任何避障，底座的第一版也不做绕障。前几次在空旷房间、低速、短指令下跑。
+- **不要同时开别的运动程序**（§6.1）。
 - **步数上限**：`max_steps` 默认 500，到了返回 `STOP`（§2.3）。
+- 相机装在机身上方时，按宇树的建议关掉跌倒自动翻身，免得翻身时压坏相机和支架（找底座的维护者确认怎么关）。
 
 ---
 
 ## 7. 第一次上机的顺序
 
 1. **4090 起服务端**（§3）。
-2. **机器人侧装环境**，跑 `python -m pytest tests/test_nav_agent.py --noconftest -q`（§5）。
-3. **开 ssh 隧道**，构造一次 `NavAgent` 做连通自检（§4）。
-4. **只接相机，狗不动**：用假服务端跑通循环。存几帧经过 `to_model_frame` 的图，检查是不是 RGB、方向对不对、
-   水平视场是不是 79°；检查前视、下视两台相机的画面是否上下对齐。
-5. **运动标定，不接模型**：先用很小的速度确认 `turn(+15)` 是向左（逆时针）转、`forward` 是向前走。
-   再在地上贴 0.25 m 刻度和 15° 角度线，`forward` 和 `turn` 各做 20 次，记录实测位移和转角的误差、
-   每个动作的耗时、停稳所需时间，据此调最小速度、容差、沉降时间。
-6. **接真服务端，狗不动**：动作只打印不执行，量规划延迟和网络往返，和 §8 比。
-7. **接真服务端，开始动**：空旷房间、短指令、低速，有人拿遥控器跟着。
-8. **每一步都留记录**，方便事后对照仿真：发给模型的图像、返回的动作；`last_call` 的 `kind`、慢系统原文、
-   `pose_ready`；Go2 的里程计位姿、各段耗时。
+2. **Orin 装环境**：先按 §4 第 3 步在 `~/.ssh/config` 里加好 `Host 6024_fjl`，再按 §5 装环境、跑
+   `python -m pytest tests/test_nav_agent.py --noconftest -q`。
+3. **开 ssh 隧道**，在 Orin 上构造一次 `NavAgent` 做连通自检（§4）。
+4. **模拟底座 + 假服务端**：先停掉正在跑的实机底座（两者抢同一把锁），`./platform run --backend sim --allow-motion`，把 §6.5 里的 `NavAgent(...)` 换成
+   `NavAgent(FakeModelServer(), FakeVOServer())` 跑一遍，确认取图、动作、释放控制权都通。模拟后端只给 `config/platform.yaml`
+   里已启用的相机发 256×192 的占位图，所以下视相机还没加进配置时，先把 `DOWN_CAMERA` 临时设成 `"front_camera"`；
+   `preprocess` 换成只解码再缩放：`{"front_camera": lambda jpeg: cv2.resize(decode_rgb(jpeg), (640, 480))}`，
+   不去畸变、不按 79° 裁剪。这一步只测接线。
+5. **实机只读，只取图**：`./platform run`（不带 `--allow-motion`），只调 `get_frame`。等过预热，存几帧经过 `preprocess` 的
+   前视图和下视图，检查是不是 RGB、方向对不对、视场对不对，下视相机是不是朝正前方（左右不偏）、俯角是不是 30°。
+6. **实机只读 + 真服务端**：动作只打印不执行，量规划延迟、取图等待和网络往返，和 §8 比。只读时 §6.5 的代码要去掉
+   `wait_for_motion_ready`、`acquire` 和三处 `move_relative`（改成 `print(action)`），并删掉其后的 `task["state"]` 检查；
+   `release` 可以留着（没拿到控制权时它直接返回）。底座没开运动时前两个会直接报错，报错文案让你加 `--allow-motion`，
+   这一步不要照做。取图不需要控制权。
+7. **允许运动，先不接模型**：`./platform run --allow-motion`，用 `move_relative` 做几次 0.25 m 和 ±15°，
+   和 §6.3 里底座的实测数对一下（换了地面或负载要重测）。
+8. **接真服务端，开始动**：空旷房间、短指令，有人拿遥控器跟着。
+9. **每一步都留记录**，方便事后对照仿真：底座给的原始 JPEG（原样存，不要重新编码）、送进模型的 640×480 图、返回的动作；
+   `last_call` 的 `kind`、慢系统原文、`pose_ready`；底座返回的 `task` 结果和 `/platform/odom`；
+   没换环视时，需要第三视角就存 `side_panorama`。
 
 ---
 
@@ -732,8 +644,10 @@ def run_episode(instruction: str, run_id: int, base: Go2Base, front_cam, down_ca
   默认的 flash-attention 2 下稳态约 3.3 s（SDPA 是 5.3 s），只跑慢系统的调用约 1.2 s（SDPA 2.5 s）。
 - 摊到每个动作的计算：SDPA 全量平均约 1.0 s（模型约 0.61 s、里程计约 0.37 s），flash-attention 2 只缩短模型那部分，约减半。
   EXP-20 报告里的"每动作 1.46 s"是 SDPA 稳态、还含仿真渲染。
-- 再加上：Go2 走 0.25 m / 转 15° 再停稳的时间（§7 第 5 步实测）、网络往返（每步一次，每次规划再加两次）。
-  相机读取已按仿真采集的时间（约 0.2 s）算在上表里，真实相机更慢就按差值加。
+- 再加上：底座执行一个动作约 2.2–2.4 s（§6.3，含停稳判断）、动作后连取两帧新图（按 5 fps 约 0.4 s，没实测），以及网络往返
+  （每步一次，每次规划再加两次）。仿真采集的时间（约 0.2 s）已经算在上表里。
+- 粗算：每个动作约 2.3 s 运动 + 摊下来约 0.7 s 规划（上一条的 1.0 s 里模型那 0.6 s 在 flash-attention 2 下约减半）
+  + 约 0.4 s 取图，一集 100 个动作大约 5–6 分钟。
 - 取队列动作的 `act()` 只有一次里程计写入，通常十几毫秒；但第 20 帧那次写入会在服务端建第一张图，
   之后攒满 8 帧时写入也会顺带补建，所以偶尔会慢。
 - 采样条数和去噪步数只影响快系统去噪采样那 0.2 s，降它们省不了多少延迟；大头在慢系统和视觉编码上，
@@ -753,12 +667,16 @@ def run_episode(instruction: str, run_id: int, base: Go2Base, front_cam, down_ca
 - **每集开始调用 `reset()`**，它会重置里程计会话（地图丢弃）。
 - **`act()` 抛出任何异常，本集就结束了**：机器人先停下，再 `reset()` 开新的一集。不能在同一集里重试：
   里程计那一侧已经记下了这一帧，重发会对不上帧号。之后再调 `act()` 会抛 `RuntimeError`，直到 `reset()`。
-  `agent.done` 不会因异常变真，所以循环不能只看它：示意代码（§6.5）用 `try/finally` 先停狗，再把异常抛出去。
+  `agent.done` 不会因异常变真，所以循环不能只看它：示意代码（§6.5）用 `try/finally` 先释放控制权（底座随即清零输出），再把异常抛出去。
 - 在 `reset()` 之前、或返回 `STOP` 之后调 `act()`，也抛 `RuntimeError`。
 - **超时**：`rpc_timeout_ms` 默认 60 s，评测一直用 600 s。按 §8，模型调用的 P90 是 3.8 s、位姿查询 2.0 s，60 s 有十几倍余量；
   服务端刚启动后的第一次调用没有单独测过，第一次连上时可以先传 `rpc_timeout_ms=600000`。超时或网络错误时 `act()` 抛 `RuntimeError`
   （vla_rpc 对任何 gRPC 错误都只返回空）。服务端报错的具体原因在服务端日志里（§3.2）。
 - **服务端重启或 ssh 隧道断开**：里程计会话丢失或连接中断，下一次 `act()` 会失败，同样停下、`reset()`。
+- **底座那一侧出错**：取图超时（`RosPlatformError: fresh frame timed out`）、动作没有成功（`state` 不是 `succeeded`）、
+  控制权丢失，都按本集失败处理：`release()`，确认输出为零，新的一集重新 `reset()`。底座的预检失效（例如桥接失联）时
+  底座自己停下并拒绝后续动作，按底座的约定不要自动恢复旧任务。
+  控制权已经丢了时 `release()` 会报 `invalid_session`，这本身不说明有问题，原因看 `/platform/status` 的 `last_reason`。
 - `NavAgent` 会核对服务端的回显（协议版本、采样种子记录、位姿是否就绪、是否只用了前视图），对不上就抛异常，不会带着错误的输入继续走。
 
 ---
@@ -766,14 +684,16 @@ def run_episode(instruction: str, run_id: int, base: Go2Base, front_cam, down_ca
 ## 附录 A 没有验证过的
 
 - 任何真实场景：真实图像、光照、运动模糊、动态障碍、动作执行误差、碰撞。
-- 与仿真不同的相机：HFOV、分辨率、畸变、安装高度、俯仰；用第二台相机拍下视图（仿真里是同一台相机转动）。
+- **我们的模型还没有接到底座上跑过**；底座还没有下倾 30° 的相机（§6.2）。
+- 与仿真不同的相机：自带前视离地约 0.4 m、广角有畸变、没有标定；下视图要用另一台相机拍（仿真里是同一台相机转动）。
 - 里程计在真实相机上的尺度（部署用固定的 `--translation-scale 1.0`），以及起步阶段只原地转圈时是否稳定。
 - 超过 500 步的长任务（里程计会话按 501 帧开，服务端上限 4096）。
 - 非英文或风格差别大的指令。
 - 机器人到服务端的网络延迟和抖动。
 - LOOK_DOWN 相关的路径只在假服务端闭环里测过：09-28 那 4 集里没有出现 LOOK_DOWN。
-- §6.5 的示意代码只在模拟狗上跑过（附录 C），真实的 Go2 会有延迟、死区和打滑。
-- `NavAgent` 在 x86 Linux 的 Python 3.10 上跑测试（3.10 只在 macOS arm64 上跑过，3.11 在 4090 容器里跑过）。
+- §6.5 的示意代码只在模拟的底座客户端上跑过（附录 C），没有接过真底座。
+- Orin 上的 Python 3.8 环境：3.8 只在 macOS arm64 上测过，还没在 Orin（aarch64）上装过。
+- 从容器外经 ssh 隧道连服务端：4090 上的核验都是在容器里连的。
 
 ## 附录 B 与仿真评测客户端的差异
 
@@ -808,7 +728,8 @@ LOOK_DOWN 后当场重新规划不算不同：仿真客户端这时会第二次�
 产物在 `6024_fjl:/home/fangjialei/verify_0930/navagent/shard_0{0,1}/`。所以能说的是："`NavAgent` 接真服务端时，
 在这 4 集上与部署的评测客户端逐调用相同。"那 4 集里没有 LOOK_DOWN，这部分只由上面的假服务端闭环覆盖。
 
-`NavAgent` 一侧的代码（`src/deploy/`、两个 RPC 协议文件、里程计客户端）从 `94146fa` 到现在没有改过；服务端代码之后有改动
+`nav_agent.py`、两个 RPC 协议文件、里程计客户端从 `94146fa` 到现在没有改过（`fake_servers.py` 只改了一处类型写法，见下面
+Python 3.8 一条，不影响发出的请求）；服务端代码之后有改动
 （昇腾移植、计时、keepalive 等），同样 4 集的评测在之后的提交上也逐调用复现过（`docs/experiments/exp20-latency-report.md` §8）。
 
 **接 flash-attention 2 的机器人服务端（2026-10-15，GPU 4，源码副本 `/workspace/nav_src_ded4bd3`）：通过。**
@@ -818,46 +739,41 @@ LOOK_DOWN 后当场重新规划不算不同：仿真客户端这时会第二次�
 那一臂开着服务端计时、这次没开，动作仍然相同。产物在 `/workspace/nav_servers/fa2check_ded4bd3_navagent/`。
 调用数和 09-30 的 SDPA 核验不同（82 对 99），是因为两种注意力本来就走法不同（§3.2）。
 
-**§6.5 的示意代码（2026-10-15，模拟狗）**：把 §6.3、§6.5 的代码原样摘出来，配一个按 `unitree_sdk2_python`（`814556d`）签名写的
-模拟 SDK（500 Hz 状态、机体系积分、`Move` 保持 1 s、没有对端时阻塞到超时返回 3102）和本仓库的假服务端，跑一集 35 步（含 5 次 LOOK_DOWN、
-2 次水平重拍）：取图路由全对；FORWARD 每次 0.245–0.248 m，转向 14.5–14.8°，方向正确；狗趴着、站立锁定、已在平衡站立三种起始状态都能进入 1013；
-到不了 1013、断开对端、状态时间戳冻结三种故障都会报错并停车。模拟狗是理想跟踪，不代表真机。
+**§6.5 的示意代码（2026-10-16，模拟的底座客户端）**：把 §6.4、§6.5 的代码原样摘出来，配一个按底座 `ros_client.py`
+（2026-10-12 版）的方法名和返回值写的模拟 `ROSPlatformClient`（前视、下视两路 1920×1080 JPEG，5 fps，`wait_new` 只给调用之后的新帧；
+`move_relative` 返回 `state`；控制权丢了时 `release()` 报 `invalid_session`）和本仓库的假服务端，在 Python 3.8 上跑：
+- 一集 35 步（5 次 `LOOK_DOWN`、2 次水平重拍）：取图路由全对，29 个运动动作各对应一次正确的 `move_relative`，`LOOK_DOWN` 和 `STOP` 不发动作；
+  每张送进 `act()` 的图都是连取两帧中的第二帧、经过对应相机自己的 `preprocess`，都是 640×480 `uint8`；开头拿控制权、结束释放。
+- 动作返回 `failed`：抛出这个动作的错误，控制权照样释放。
+- 中途丢了控制权：下一个动作返回 `failed`，`release()` 的报错只打印，抛出来的仍是动作失败本身。
+
+模拟客户端不代表真底座的时序和误差。
+
+**Python 3.8（2026-10-16，macOS arm64）**：`tests/test_nav_agent.py` 23 个、`tests/test_nav_servers_launcher.py` 4 个都通过
+（numpy 1.24.4、Pillow 10.4.0）；装上 vla_rpc（grpcio 1.70、protobuf 5.29、OpenCV 5.0）后用它的编码器跑一集假服务端也通过。
+为此把 `src/deploy/fake_servers.py` 里一处只有 3.9 才支持的类型写法改成了 `typing.Dict`（`14ac629`）。
 
 ## 附录 D 出处与待实测
 
-§6 的每条都在 2026-10-15 按下面的原始出处核对过。
+- **底座 `robot_platform_ws`**（2026-10-12 版，实验室的工作区，不在本仓库）：
+  - `README.md`：相机列表、`CameraFrame`、ROS 接口总览、控制权与模式、相对动作、急停；
+  - `VALIDATION.md`：前视相机接入（1920×1080、videohub）、两路环视、相对动作 PID 实测（0.25 m、±15°）、PanaV 实机全路线；
+  - `docs/project_integration.md`、`docs/remote_inference.md`、`config/platform.yaml`、`config/deployment.env`；
+  - `src/robot_platform/robot_platform/ros_client.py`（`get_frame`、`acquire`、`move_relative`、心跳）、`examples/panav_adapter.py`。
+- **宇树开发者文档**：多媒体（自带相机 1280×720、水平 100°、垂直 56°）：<https://doc-cdn.unitree.com/6/53/zh/6_53_zh>；
+  FAQ：<https://doc-cdn.unitree.com/6/60/en/6_60_en>；运动接口 V2.0（带负载时建议关掉自动翻身）：<https://doc-cdn.unitree.com/6/814/zh/6_814_zh>
+- **Go2 URDF**：<https://github.com/unitreerobotics/unitree_ros>（`5994d4f`），`robots/go2_description/urdf/go2_description.urdf` 的
+  `front_camera_joint`（机身原点前方 0.327 m、上方 0.043 m）；`unitree_sdk2`（`d1abf00`）`example/go2/go2_stand_example.cpp`
+  的站姿推算机身离地约 0.36 m，官方文档写默认站高 0.33 m，所以相机离地约 0.37–0.40 m。
+- **公开的 Go2 导航部署**（相机型号和安装高度）：StreamVLN `realworld/go2_vln_client.py`（`e48f6ff`）、论文 arXiv 2507.05240；
+  InternNav `scripts/realworld/`（`7a5c624`）、issue #295、#324、#157；Uni-NaVid arXiv 2412.06224 附录 XII；
+  VLingNav arXiv 2601.08665 §6.3.1；DyNaVLM arXiv 2506.15096 §V-A；SparseVideoNav arXiv 2602.05827 §IV；NaVILA arXiv 2412.04453 附录 C4。
+  给出高度的几家都在 0.85–1 m、下倾 10–15°；查过的 7 家都没报告装在 1.25 m 水平或下倾 30°。
 
-- **宇树开发者文档**（doc-cdn 页面，直接给 markdown）：
-  - 运动接口 V2.0（≥ V1.1.6）：<https://doc-cdn.unitree.com/6/814/zh/6_814_zh>：`Move` 范围、1 s 保持、不滤波、
-    `StandUp` 锁定（默认站高 0.33 m）与 `BalanceStand` 解锁、`RecoveryStand`、`StopMove` 重置参数、
-    `error_code` 模式表（1002 站立锁定、1013 平衡站立）、`Damp`、带负载关自动翻身
-  - 旧版运动服务（< V1.1.6）：<https://doc-cdn.unitree.com/6/55/zh/6_55_zh>；旧版 AI 运动服务：<https://doc-cdn.unitree.com/6/219/zh/6_219_zh>
-    （调 `Move` 前先调一次 `BalanceStand`）
-  - 快速开始、网络：<https://doc-cdn.unitree.com/6/45/en/6_45_en>；扩展坞：<https://doc-cdn.unitree.com/6/110/zh/6_110_zh>
-  - FAQ：<https://doc-cdn.unitree.com/6/60/en/6_60_en>（只支持有线、状态 500 Hz、EDU 才能开发）；规格：<https://doc-cdn.unitree.com/6/28/zh/6_28_zh>
-  - 坐标系：<https://doc-cdn.unitree.com/6/33/zh/6_33_zh>；里程计：<https://doc-cdn.unitree.com/6/72/zh/6_72_zh>
-  - 多媒体（相机）：<https://doc-cdn.unitree.com/6/53/zh/6_53_zh>
-- **`unitree_sdk2_python`**：<https://github.com/unitreerobotics/unitree_sdk2_python>（`814556d`）
-  - `go2/sport/sport_client.py`、`rpc/client_base.py`、`rpc/internal.py`（3102）、`core/channel.py`、
-    `idl/unitree_go/msg/dds_/_SportModeState_.py`、`go2/obstacles_avoid/obstacles_avoid_client.py`、`setup.py`（`cyclonedds==0.10.2`）
-  - issue #175（`StandUp` 后 `Move` 不动，`error_code` 停在 1002）、#184（运控卡死）
-- `unitree_sdk2`（C++，`d1abf00`）：`example/go2/go2_sport_client.cpp`（控制周期 5 ms）、
-  `example/go2/go2_stand_example.cpp`（站姿关节角，配 URDF 推算机身离地约 0.36 m）
-- PyPI `cyclonedds` 0.10.2 的文件列表：<https://pypi.org/project/cyclonedds/0.10.2/#files>
-- Go2 URDF：<https://github.com/unitreerobotics/unitree_ros>（`5994d4f`），`robots/go2_description/urdf/go2_description.urdf` 的 `front_camera_joint`
-- **公开的 Go2 导航部署**：
-  - StreamVLN `realworld/go2_vln_client.py`（`e48f6ff`）；论文 arXiv 2507.05240；issue #54、#60
-  - InternNav `scripts/realworld/`（`7a5c624`）；issue #295、#324、#157
-  - Uni-NaVid arXiv 2412.06224 附录 XII；VLingNav arXiv 2601.08665 §6.3.1；DyNaVLM arXiv 2506.15096 §V-A；
-    SparseVideoNav arXiv 2602.05827 §IV；NaVILA arXiv 2412.04453 附录 C4
-- Go2 里程计精度的第三方测量：arXiv 2506.09548（v2）
+**待实测：**
 
-**待实测**（文档里查不到）：
-
-- 固件版本；
-- 相机实际视场、内参和安装高度；
-- vyaw 的符号（应为逆时针为正）；
-- `Move` 合适的重发频率和最小有效速度（官方没有写死区）；
-- 动作后的沉降时间；
-- 0.25 m / 15° 上的里程计误差；
-- 机器人到 4090 的网络往返。
+- 下倾 30° 的相机：型号、安装高度、俯角、视场，以及接进底座后能否和两路环视一起稳定采集（§6.2）；
+- 自带前视相机 1920×1080 这一路的内参和视场，以及它实际的离地高度和俯角（现在是按 URDF 推算的 0.37–0.40 m）；
+- 在我们的场地上，底座相对动作 0.25 m / ±15° 的误差和耗时；
+- Orin 到 4090 的网络往返；
+- Orin 上的 Python 3.8 环境能否装上 vla_rpc 并通过 `tests/test_nav_agent.py`。
