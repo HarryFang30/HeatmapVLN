@@ -23,6 +23,12 @@
 #   NAV_DA3_CHECKPOINT, NAV_CHECKPOINT, NAV_CONFIG, NAV_PYTHON   as in the launcher (PPA_EVAL_*)
 #   NAV_RUNTIME_DIR [$NAV_ROOT/nav_servers/<stamp>]              logs and caches
 #   NAV_SERVER_START_TIMEOUT_S [1800]
+#   NAV_ATTN_IMPL [flash_attention_2]       Qwen2.5-VL attention, passed as rpc_model_server.py
+#                                           --attn_implementation, which refuses to serve if it does not
+#                                           get it.  Same default and same MODEL_EXTRA line as
+#                                           scripts/run_ppa_r2r_val_unseen_cuda.sh (PPA_EVAL_ATTN_IMPL);
+#                                           sdpa reproduces the 09-30 NavAgent check.  NAV_REPO must be a
+#                                           tree whose server has the flag (f61e9f7 or later).
 #   HEATMAPVLN_TIMING                       passed through: servers that support it add timing_ms
 
 set -Eeuo pipefail
@@ -43,6 +49,10 @@ MODEL_PORT="${NAV_MODEL_PORT:-52400}"
 VO_PORT="${NAV_VO_PORT:-52500}"
 RUNTIME_DIR="${NAV_RUNTIME_DIR:-$ROOT/nav_servers/$(date +%Y%m%d_%H%M%S)_$$}"
 START_TIMEOUT_S="${NAV_SERVER_START_TIMEOUT_S:-1800}"
+# flash_attention_2 measured 3499 -> 1866 ms a plan call on the model server
+# (docs/experiments/exp20-latency-report.md §9); it changes bf16 arithmetic, so the actions
+# differ from an sdpa run.
+ATTN_IMPL="${NAV_ATTN_IMPL:-flash_attention_2}"
 
 MODEL_SERVER="$REPO/scripts/evaluation/rpc_model_server.py"
 VO_SERVER="$REPO/scripts/amb3r_vo/rpc_amb3r_vo_server.py"
@@ -60,6 +70,8 @@ done
 for value in "$GPU" "$VO_GPU" "$MODEL_PORT" "$VO_PORT"; do
   [[ "$value" =~ ^[0-9]+$ ]] || die "not a non-negative integer: $value"
 done
+declare -a MODEL_EXTRA=()
+[[ -n "$ATTN_IMPL" ]] && MODEL_EXTRA+=(--attn_implementation "$ATTN_IMPL")
 
 # Placeholders the train config expands on load; the servers never read them.
 PLACEHOLDER_DIR="$RUNTIME_DIR/config_placeholders"
@@ -124,7 +136,7 @@ env PYTHONPATH="$RPC_PYTHONPATH" CUDA_VISIBLE_DEVICES="$GPU" \
     --config "$PPA_CONFIG" --checkpoint "$PPA_CHECKPOINT" \
     --internnav_model_path "$INTERNNAV_MODEL_PATH" \
     --gpu_id 0 --host "$HOST" --port "$MODEL_PORT" --workers 1 \
-    --require_deterministic_sampling --require_ppa_online_amb3r \
+    --require_deterministic_sampling --require_ppa_online_amb3r "${MODEL_EXTRA[@]}" \
     --log_level INFO >"$RUNTIME_DIR/model.log" 2>&1 &
 MODEL_PID=$!
 env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" CUDA_VISIBLE_DEVICES="$VO_GPU" \
@@ -139,7 +151,7 @@ env PYTHONPATH="$AMB3R_ROOT:$AMB3R_ROOT/thirdparty:$RPC_PYTHONPATH" CUDA_VISIBLE
     --max-frames-limit 4096 --max-message-mb 32 \
     --log-level INFO >"$RUNTIME_DIR/vo.log" 2>&1 &
 VO_PID=$!
-echo "[nav-servers] model pid=$MODEL_PID gpu=$GPU, vo pid=$VO_PID gpu=$VO_GPU; logs in $RUNTIME_DIR"
+echo "[nav-servers] model pid=$MODEL_PID gpu=$GPU attn=${ATTN_IMPL:-config}, vo pid=$VO_PID gpu=$VO_GPU; logs in $RUNTIME_DIR"
 
 deadline=$(( $(date +%s) + START_TIMEOUT_S ))
 while true; do
@@ -169,7 +181,11 @@ PY
 done
 grep -F "Formal PPA online AMB3R runtime enabled" "$RUNTIME_DIR/model.log" >/dev/null \
   || die "model server lacks the PPA preflight line"
-echo "[nav-servers] READY model=$HOST:$MODEL_PORT vo=$HOST:$VO_PORT (Ctrl-C stops both)"
+if [[ -n "$ATTN_IMPL" ]]; then
+  grep -F "Attention implementation confirmed: $ATTN_IMPL" "$RUNTIME_DIR/model.log" >/dev/null \
+    || die "model server did not confirm attention $ATTN_IMPL"
+fi
+echo "[nav-servers] READY model=$HOST:$MODEL_PORT vo=$HOST:$VO_PORT attn=${ATTN_IMPL:-config} (Ctrl-C stops both)"
 
 # bash 5.0 in the container has no `wait -n -p`: poll both.
 while kill -0 "$MODEL_PID" 2>/dev/null && kill -0 "$VO_PID" 2>/dev/null; do
