@@ -239,14 +239,15 @@ def test_captions_describe_without_policy_words_and_disclose_the_smoothing(rende
     for cap in (cap_a, cap_b):
         low = cap.lower()
         assert not any(w in low for w in POLICY_WORDS), cap
-        assert "past frames 1 (oldest), 4 and 8 of the eight given to System 2" in cap
-        assert "Key moments 1–4 are chosen among the System 2 calls with an affordance map: the first, " in cap
+        assert "past frames 1 (oldest), 4 and 8 of the eight given to the slow system" in cap
+        assert "Key moments 1–4 are chosen among the slow-system calls with trajectory fields: the first, " in cap
         assert 3 <= cap.count(". ") + 1 <= 5  # 3-5 sentences
         assert max(len(t.split()) for t in cap.split(". ")) <= 60, cap  # short sentences
     assert "executed actions (chips)" in cap_a and "pixel goal (ring)" in cap_a
-    assert "System 1 path (dots, also on the future map)" in cap_a  # the dots on the future strips
-    assert "history (orange; camera's 79° view boxed)" in cap_a  # the box is on the history strip only
-    assert "The x-axis is the step, starting at the first System 2 call" in cap_b  # the ticks are absolute steps
+    # the dots on the future strips
+    assert "fast-system trajectory (dots, also on the prospective trajectory field)" in cap_a
+    assert "historical (orange; camera's 79° view boxed)" in cap_a  # the box is on the history strip only
+    assert "The x-axis is the step, starting at the first slow-system call" in cap_b  # the ticks are absolute steps
     assert "up = left" in cap_b and "grey columns are calls without" in cap_b
     for name in ("fig_a_key_moments_caption_zh.txt", "fig_b_online_timeline_caption_zh.txt"):
         zh = (out / name).read_text(encoding="utf-8")
@@ -405,15 +406,15 @@ def test_moment_rules_follow_each_rows_branches():
     t1, f1 = fp.time_order(_keys(*T1_KEYS)), fp.time_order(_keys(*F1_KEYS))
     t2 = fp.time_order(_keys((20, "K1_first"), (28, "K2_fallback"), (36, "K3_two_thirds"), (52, "K4_last")))
     text = fp.moment_rules([("a", t1), ("b", t1), ("c", f1)], "en")
-    assert text == ("Key moments 1–4 are chosen among the System 2 calls with an affordance map: the first, the later "
-                    "one with the largest executed turn, the one nearest two thirds of the episode and the last; in "
-                    "(c), 2 is the last one up to the closest approach to the goal and 3 the one a third of the way "
+    assert text == ("Key moments 1–4 are chosen among the slow-system calls with trajectory fields: the first, the "
+                    "later one with the largest executed turn, the one nearest two thirds of the episode and the last; "
+                    "in (c), 2 is the last one up to the closest approach to the goal and 3 the one a third of the way "
                     "through (no later one's executed turn reaches 30°).")
     text = fp.moment_rules([("a", t1), ("b", t2), ("c", t1)], "en")
     assert text.endswith("; in (b), 2 is the one a third of the way through "
                          "(no later one's executed turn reaches 30°).")
     zh = fp.moment_rules([("a", t1), ("b", t1), ("c", f1)], "zh")
-    assert zh.startswith("关键时刻 1–4 从给出 affordance map 的慢系统调用中选取：第一次、其后执行转角最大的一次、")
+    assert zh.startswith("关键时刻 1–4 从给出轨迹场的慢系统调用中选取：第一次、其后执行转角最大的一次、")
     assert zh.endswith("；(c) 中 2 为最接近目标那一步及之前的最后一次，3 为位于三分之一处的一次（其后没有一次执行转角达到 30°）。")
     assert "(a)" not in fp.moment_rules([("a", t1)], "en")  # a row that took the common rules is not named
 

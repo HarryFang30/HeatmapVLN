@@ -35,9 +35,10 @@ figure's size for PowerPoint / WPS: text boxes (Arial, Microsoft YaHei) and the 
 one 600 dpi picture per panel, a panel's picture and texts grouped, a heading one text box.  The layout numbers
 (inches) are the ``FIG_A`` / ``FIG_B`` constants below.
 
-Policy as ``fig_v2``: no poses, VO or odometry; both heatmaps are "affordance map"; nothing is drawn from the future
-map to the actions; the captions describe what is drawn and make no claim (the RTX 4090 batch is descriptive only,
-see the ledger's EXP-19 run record 5).
+Policy as ``fig_v2``: no poses, VO or odometry; the two heatmaps are the paper's "historical / prospective trajectory
+field" and System 2 / System 1 its "slow / fast system" (``LABELS``, ``RULES``, ``CAPTION_*``); nothing is drawn from
+the future map to the actions; the captions describe what is drawn and make no claim (the RTX 4090 batch is
+descriptive only, see the ledger's EXP-19 run record 5).
 
 Usage (repo root on PYTHONPATH)::
 
@@ -100,10 +101,10 @@ LABELS: Dict[str, Dict[str, object]] = {
         "legend": {
             "route": "route", "ref": "reference path", "offlevel": "other floor", "start": "start",
             "goal": "goal ({r:g} m)", "stop": "stop", "num": "key moment", "pgoal": "pixel goal",
-            "path": "System 1 path", "actions": "executed actions", "hist": "history affordance map",
+            "path": "fast-system trajectory", "actions": "executed actions", "hist": "historical trajectory field",
             "past": "past-frame direction, true / predicted", "past_b": "past-frame direction, true / predicted",
-            "fut": "future affordance map", "path_end": "System 1 path end", "turns": "executed turns (up = left)",
-            "nomap": "no affordance map",
+            "fut": "prospective trajectory field", "path_end": "fast-system trajectory end",
+            "turns": "executed turns (up = left)", "nomap": "no trajectory field",
         },
     },
     "zh": {
@@ -115,10 +116,10 @@ LABELS: Dict[str, Dict[str, object]] = {
         "rows": ("历史", "未来"),
         "legend": {
             "route": "路线", "ref": "参考路径", "offlevel": "另一楼层", "start": "起点", "goal": "目标（{r:g} m）",
-            "stop": "停止处", "num": "关键时刻", "pgoal": "像素目标", "path": "快系统路径", "actions": "执行的动作",
-            "hist": "历史 affordance map", "past": "历史帧方向：真实 / 预测", "past_b": "历史帧方向：真实 / 预测",
-            "fut": "未来 affordance map", "path_end": "快系统路径终点", "turns": "执行的转向（上 = 左）",
-            "nomap": "无 affordance map",
+            "stop": "停止处", "num": "关键时刻", "pgoal": "像素目标", "path": "快系统轨迹", "actions": "执行的动作",
+            "hist": "历史轨迹场", "past": "历史帧方向：真实 / 预测", "past_b": "历史帧方向：真实 / 预测",
+            "fut": "前瞻轨迹场", "path_end": "快系统轨迹终点", "turns": "执行的转向（上 = 左）",
+            "nomap": "无轨迹场",
         },
     },
 }
@@ -135,8 +136,8 @@ RULES = {
            "K3_f1_fallback_after": "the first one after the closest approach to the goal",
            "K4_last": "the last",
            "K4_shifted": "the latest one not chosen before",
-           "head": "Key moments {r} are chosen among the System 2 calls with an affordance map: {rules}",
-           "all": "The numbered key moments are all the System 2 calls with an affordance map",
+           "head": "Key moments {r} are chosen among the slow-system calls with trajectory fields: {rules}",
+           "all": "The numbered key moments are all the slow-system calls with trajectory fields",
            "sep": ", ", "last": " and ", "case": "; in {l}, {parts}", "part": "{n} is {rule}",
            "part_next": "{n} {rule}", "lt4": "; {l} has only {n}, all shown", "lt4_one": "; {l} has only one",
            "end": "."},
@@ -148,8 +149,8 @@ RULES = {
            "K3_f1_fallback_after": "最接近目标那一步之后的第一次",
            "K4_last": "最后一次",
            "K4_shifted": "此前未选中的最晚一次",
-           "head": "关键时刻 {r} 从给出 affordance map 的慢系统调用中选取：{rules}",
-           "all": "编号的关键时刻即全部给出 affordance map 的慢系统调用",
+           "head": "关键时刻 {r} 从给出轨迹场的慢系统调用中选取：{rules}",
+           "all": "编号的关键时刻即全部给出轨迹场的慢系统调用",
            "sep": "、", "last": "和", "case": "；{l} 中{parts}", "part": " {n} 为{rule}", "part_next": "，{n} 为{rule}",
            "lt4": "；{l} 只有 {n} 次，全部画出", "lt4_one": "；{l} 只有 1 次", "end": "。"},
 }
@@ -159,30 +160,31 @@ RULES = {
 # past-frame marks; the moments.
 CAPTION_A = {
     "en": ("Key moments of closed-loop R2R val-unseen episodes; headings give the outcome and the final distance to "
-           "the goal. Each moment shows the image on which System 2 placed its pixel goal (ring), with the System 1 "
-           "path (dots, also on the future map) and the executed actions (chips). Below it are the 360° history "
-           "(orange; camera's 79° view boxed) and future (green, darker = later) affordance maps, smoothed for display "
-           "(σ = {s:g}°). Blue circles and orange dots are the true and predicted directions of past frames 1 (oldest), "
-           "4 and 8 of the eight given to System 2{edge}. {rules}"),
+           "the goal. Each moment shows the image on which the slow system placed its pixel goal (ring), with the "
+           "fast-system trajectory (dots, also on the prospective trajectory field) and the executed actions (chips). "
+           "Below it are the 360° historical (orange; camera's 79° view boxed) and prospective (green, darker = later) "
+           "trajectory fields, smoothed for display (σ = {s:g}°). Blue circles and orange dots are the true and "
+           "predicted directions of past frames 1 (oldest), 4 and 8 of the eight given to the slow system{edge}. "
+           "{rules}"),
     "zh": ("闭环复跑（R2R val-unseen）的关键时刻；标题为结局与停止处到目标的距离。每个关键时刻上方为慢系统据以给出像素目标"
-           "（圈）的图像，叠有快系统路径（点，未来图上同）与执行的动作（方块）。下方为 360° 历史（橙，黑框为相机 79° 视野）"
-           "与未来（绿，越深越晚）affordance map，为显示做了平滑（σ = {s:g}°）。蓝圈与橙点为送入慢系统的 8 个历史帧中"
+           "（圈）的图像，叠有快系统轨迹（点，前瞻轨迹场上同）与执行的动作（方块）。下方为 360° 历史（橙，黑框为相机 79° 视野）"
+           "与前瞻（绿，越深越晚）轨迹场，为显示做了平滑（σ = {s:g}°）。蓝圈与橙点为送入慢系统的 8 个历史帧中"
            "第 1（最早）、4、8 帧的真实与预测方向{edge}。{rules}"),
 }
 CAPTION_B = {
-    "en": ("Affordance maps predicted online in closed-loop R2R val-unseen episodes; headings give the outcome, the "
-           "final distance to the goal and the instruction. The x-axis is the step, starting at the first System 2 "
-           "call with an affordance map, and the y-axis the bearing around the robot (up = left){grey}. Each column is "
-           "one call, with its history (orange) and future (green, darker = later) affordance maps, smoothed for "
-           "display (σ = {s:g}°); black dots mark the end of its System 1 path. Blue circles and orange dots are the "
-           "true and predicted directions of past frames 1 (oldest), 4 and 8 of the eight given to System 2. {rules}"
-           "{stacked}"),
-    "zh": ("闭环复跑（R2R val-unseen）中在线预测的 affordance map；标题为结局、停止处到目标的距离与指令。横轴为步数，从第一次"
-           "给出 affordance map 的慢系统调用开始；纵轴为机器人周围的方位，向上 = 向左{grey}。每列为一次调用的历史（橙）与未来"
-           "（绿，越深越晚）affordance map，为显示做了平滑（σ = {s:g}°）；黑点为快系统路径终点。蓝圈与橙点为送入慢系统的 "
+    "en": ("Trajectory fields predicted online in closed-loop R2R val-unseen episodes; headings give the outcome, the "
+           "final distance to the goal and the instruction. The x-axis is the step, starting at the first slow-system "
+           "call with trajectory fields, and the y-axis the bearing around the robot (up = left){grey}. Each column is "
+           "one call, with its historical (orange) and prospective (green, darker = later) trajectory fields, smoothed "
+           "for display (σ = {s:g}°); black dots mark the end of its fast-system trajectory. Blue circles and orange "
+           "dots are the true and predicted directions of past frames 1 (oldest), 4 and 8 of the eight given to the "
+           "slow system. {rules}{stacked}"),
+    "zh": ("闭环复跑（R2R val-unseen）中在线预测的轨迹场；标题为结局、停止处到目标的距离与指令。横轴为步数，从第一次"
+           "给出轨迹场的慢系统调用开始；纵轴为机器人周围的方位，向上 = 向左{grey}。每列为一次调用的历史（橙）与前瞻"
+           "（绿，越深越晚）轨迹场，为显示做了平滑（σ = {s:g}°）；黑点为快系统轨迹终点。蓝圈与橙点为送入慢系统的 "
            "8 个历史帧中第 1（最早）、4、8 帧的真实与预测方向。{rules}{stacked}"),
 }
-CAPTION_GREY = {"en": "; grey columns are calls without an affordance map", "zh": "；灰列为没有 affordance map 的调用"}
+CAPTION_GREY = {"en": "; grey columns are calls without trajectory fields", "zh": "；灰列为没有轨迹场的调用"}
 CAPTION_EDGE = {"en": "; a triangle on a strip's edge marks a direction beyond its elevation range",
                 "zh": "；条带边缘的小三角表示超出其俯仰范围的方向"}
 
