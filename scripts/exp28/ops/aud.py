@@ -45,12 +45,12 @@ for f in glob.glob(os.path.join(a.label_root, "*", "*.s2labels.jsonl")):
         r = json.loads(line)
         if r.get("call_index", 0) >= a.first_calls or (r.get("distance_to_goal") or 0) <= a.min_distance:
             continue
-        k = arrows(r.get("model_turn1"))
-        if r.get("model_kind") == "turn" and k:
-            base_turns[k] += 1
         kind = r.get("kind")
         if kind not in ("correction", "anchor"):
             continue
+        k = arrows(r.get("model_turn1"))  # the base's own turn answer on this pool state (run record 8: same pool)
+        if r.get("model_kind") == "turn" and k:
+            base_turns[k] += 1
         kinds[kind] += 1
         t1 = r.get("target_turn1") or ""
         if "STOP" in t1.upper() or t1.strip() == "■":

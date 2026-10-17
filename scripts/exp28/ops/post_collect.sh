@@ -7,8 +7,7 @@
 #  4. push 150 npu-recorded training records (G0-npu) and the stream to the 910B (retrying until its receivers are up);
 #     meanwhile G0-cuda (2,000 cuda calls, adapters off) on GPUs 5,4,0;
 #  5. pull adapter_rX28C1 from the export port, run the offline gates (run_offline_gates.sh);
-#  6. gates say val -> start val_unseen seed 42 (round_post_4090.sh phase 5-6, step-budget STOP, 600-episode rule)
-#     and P's candidate arm (held-out shards 0-19 on the 910B's C1 servers).
+#  6. hand over to exp28_auto.sh (retries, val, P, seeds).
 WT=/workspace/exp23/wt_exp28; C=/workspace/exp28/collect_base; LR=/workspace/exp28/labels_base
 R1=/workspace/exp28/round1; X=/workspace/exp28/c1
 H=/workspace/exp28/episodes/splits/heldout_scenes.txt; T=/workspace/exp28/episodes/splits/train_scenes.txt
@@ -119,22 +118,18 @@ st "offline gates on $(sha256sum "$A/adapter_model.safetensors" | cut -c1-16)"
 EXP28_WT="$WT" EXP28_ADAPTER="$A" EXP28_NAME=c1 EXP28_HOLDOUT_SCENES_FILE="$H" EXP28_O4_RECORDS="$C/records" \
   EXP28_O1_BASE=/workspace/exp23/b3/scalevln_b3.json EXP28_O2_BASE=/workspace/exp23/exp26/base_r2r_holdout.json \
   bash scripts/exp28/run_offline_gates.sh > "$X/gates_run.log" 2>&1
-V=$(ls -t /workspace/exp28/gates/c1*/verdict.json 2>/dev/null | head -1)
+if [[ ! -s /workspace/exp28/gates/c1_a1/verdict.json ]]; then  # one more pass (it resumes its finished jobs)
+  st "gates wrote no verdict; running them once more"
+  EXP28_WT="$WT" EXP28_ADAPTER="$A" EXP28_NAME=c1 EXP28_HOLDOUT_SCENES_FILE="$H" EXP28_O4_RECORDS="$C/records" \
+    EXP28_O1_BASE=/workspace/exp23/b3/scalevln_b3.json EXP28_O2_BASE=/workspace/exp23/exp26/base_r2r_holdout.json \
+    bash scripts/exp28/run_offline_gates.sh > "$X/gates_run2.log" 2>&1
+fi
+[[ -s /workspace/exp28/gates/c1_a1/verdict.json ]] || die "the offline gates wrote no verdict ($(cat /workspace/exp28/gates/c1_a1/STATUS 2>/dev/null))"
+V=/workspace/exp28/gates/c1_a1/verdict.json
 next=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1])).get("next", "?"))' "$V" 2>/dev/null)
 st "gates: next=${next:-none} ($V)"
 
 # 6 ----------------------------------------------------------------------------
-if [[ "$next" == val ]]; then
-  st "val_unseen seed 42 (round_post_4090.sh phase 5-6)"
-  mkdir -p "$X/logs"
-  EXP23_ROUND=X28C1 EXP23_ROUND_DIR="$X" EXP23_WT="$WT" EXP23_STOP_AT_STEP_BUDGET=1 EXP23_FROM_PHASE=5 EXP23_SEEDS=42 \
-    nohup setsid bash scripts/exp23/round_post_4090.sh > /dev/null 2>&1 < /dev/null &
-  # P's candidate arm: the held-out cohort against the 910B's C1 servers (c1_910b.sh serves them after the export).
-  ( EXP28_MODE=external EXP28_TAG=c1 EXP28_ADAPTER="$A" EXP28_WT="$WT" EXP28_COHORT_DIR=/workspace/exp28/episodes/cohorts \
-      EXP28_OUT_DIR=/workspace/exp28/collect_c1 EXP28_SHARDS=0-19 EXP28_DISPLAY_BASE=761 \
-      setsid bash scripts/exp28/collect_4090.sh > /dev/null 2>&1 < /dev/null & )
-  st "DONE: val seed 42 and P started"
-else
-  st "DONE: no val (gates next=${next:-none}); the retry is the operator's call"
-fi
+# The rest of the decision tree (retries, val, P, seeds) is exp28_auto.sh's: it reads gates/c1_a1/verdict.json.
+st "DONE: gates next=${next:-none}; exp28_auto.sh takes over"
 chown -R 1015:1015 "$R1" "$X"
