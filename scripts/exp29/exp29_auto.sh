@@ -16,7 +16,7 @@ A0_DIR=/workspace/eval_runs/exp20_a0_seed42_4090
 declare -A A0=([42]=/workspace/eval_runs/exp20_a0_seed42_4090/merged/progress.jsonl
                [1337]=/workspace/eval_runs/exp20_a0_seed1337_4090/merged/progress.jsonl)
 GIVE_UP=$(date -d "2026-10-19T00:00:00Z" +%s)      # no adapter by then: two seeds cannot finish before 10-20 14:00
-LAST_1337=$(date -d "2026-10-19T20:00:00Z" +%s)    # a seed takes ~17.5 h
+LAST_1337=$(date -d "2026-10-20T06:00:00Z" +%s)    # moved 10-18 22:45 UTC after 20 h were lost to the expired export port: seed 1337 may end after the deadline
 export PYTHONPATH="$WT:/workspace/rpc/src"
 mkdir -p "$A" "$SIG" "$X/adapter_pull" "$X/logs"
 st() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$A/auto.log" > "$A/STATUS"; }
