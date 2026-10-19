@@ -62,7 +62,7 @@ term_val() {  # $1 output root: stop that val run (launcher process group, then 
 }
 merged_rows() { wc -l < "$1/merged/progress.jsonl" 2>/dev/null || echo 0; }
 run_val() {  # $1 seed, $2 abort rule (1/0). Returns 0 complete, 1 incomplete, 2 aborted by the rule, 3 withdrawn by P
-  local seed=$1 abort=$2 out="/workspace/eval_runs/exp28_${ROUND}_seed$1_4090_stepbudget" try rc launcher
+  local seed=$1 abort=$2 out="/workspace/eval_runs/exp29_${ROUND}_seed$1_4090_stepbudget" try rc launcher
   for try in 1 2 3; do  # the launcher resumes (--resume): a retry costs at most the episodes in flight
     st "val seed $seed ($ROUND), try $try -> $out"
     ( cd "$WT" && PPA_EVAL_ROOT=/workspace PPA_EVAL_REPO="$WT" PPA_EVAL_GPU_DEVICES=5,4,0 PPA_EVAL_PROTOCOL_SEED="$seed" \
