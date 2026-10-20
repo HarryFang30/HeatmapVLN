@@ -71,7 +71,10 @@ def main() -> int:
     T.seed_everything(args.seed, rt.device)
     model, processor = T.load_system2(args.model_path, rt.device)
     model.eval()
-    sample_kwargs = {**T.NATIVE_GENERATE_KWARGS, "do_sample": True, "temperature": args.temperature, "top_p": args.top_p}
+    # InternNav_Model's generation_config.json pins top_k 1 (and top_p 0.001, temperature 0.1): without top_k 0 here
+    # every "sample" would be the greedy token.  repetition_penalty (1.05) stays as served.
+    sample_kwargs = {**T.NATIVE_GENERATE_KWARGS, "do_sample": True, "temperature": args.temperature, "top_p": args.top_p,
+                     "top_k": 0}
 
     def decide(messages, images, lookdown, kwargs):
         inputs = T._served_inputs(processor, messages, rt.device)
