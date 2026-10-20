@@ -95,6 +95,8 @@ def main() -> int:
         agrees = [bool(G.judge(context, s)["agree"]) for s in row["samples"]]
         per_group[state["group"]].append({
             "key": key, "greedy_agree": bool(greedy["agree"]), "sample_agree": sum(agrees), "samples": len(agrees),
+            "oracle_kind": label.get("oracle_kind"), "rule": (label.get("debug") or {}).get("rule"),
+            "distance_to_goal": label.get("distance_to_goal"),
             "same_under_shuffle": same_answer(row["greedy_own"], row.get("greedy_shuf")) if row.get("greedy_shuf") else None})
 
     def read(rows):
@@ -124,6 +126,15 @@ def main() -> int:
     if t.get("same_under_shuffle") is not None:
         language = " | first-call errors ignore the instruction" if t["same_under_shuffle"] >= 0.80 else ""
     result["verdict"] = verdict
+    # report only (added after the verdict): the targets split by line B's rule for the call-0 state
+    by_rule = defaultdict(list)
+    for r in per_group["target"]:
+        by_rule[r["rule"] or str(r["oracle_kind"])].append(r)
+    result["target_by_rule"] = {k: read(v) for k, v in sorted(by_rule.items())}
+    with open(os.path.join(args.out, "probe1_states.jsonl"), "w", encoding="utf-8") as handle:
+        for group, rows in per_group.items():
+            for r in rows:
+                handle.write(json.dumps({"group": group, **r}) + "\n")
     os.makedirs(args.out, exist_ok=True)
     Path(args.out, "probe1.json").write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
     print(f"{verdict}{language} " + json.dumps({"target": t, "control": result["control"]}))
