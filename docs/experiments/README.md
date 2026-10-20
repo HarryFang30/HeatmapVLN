@@ -3748,6 +3748,358 @@ RFT 用的标签是模型自己在本集指令下、最后成功了的答案：�
 - **只报**：采样的整体救回率（应与 EXP-31 的 34.5% 相近）、每集步数、成功轨迹的调用数。
 - 训练配方、权重、离线门与评测在第二部分写死，**在开训之前**。
 
+**第二部分：训练配方、门与评测（写死的时间以本节提交的 git 时间为准，必须早于第一部分的任何读数；成功数、救回率、轨迹内容都算读数）.**
+
+设计来自 2026-10-20 的 workflow：4 个设计、3 个评审，合成如下。
+- 数据与配方取"保守 SFT"：模型自己的答案原样、×1、与底座自己的贪心成功集 1:1、只回放 r2r。
+- 第二遍用 System1 种子 42、留出场景上的迁移门 R：取"发散加权"方案。
+- val 的标准误按同种子相关来算，k=4 之前只做无效性停止：取"评测优先"方案。
+- P 用 EXP-28 的原线，只挡伤害。
+- 没采纳：发散 ×2/×3 加权、对比锚点、ScaleVLN 回放、DPO 或负权重、val 期间再采一轮、P 第二阶段、空训练对照。
+
+**假设.**
+- **H-32**：候选（`adapter_rX32R1`，或 F 的重试表给出的唯一一种重试形态）在 R2R-CE val_unseen 上（4090、sdpa、标准协议）满足 J 的"支持"线。
+- **机制预期（只报）**：
+  - R 门：留出场景的发散状态上，候选与"成功轨迹里的采样答案"的一致率高于底座（底座按构造为 0）。
+  - P：ΔSR_P > 0、ΔB < 0、步数耗尽份额下降（R0 是 1% 对 6%）。
+  - val：ΔOS > 0；反向转率与远处 STOP 不变。
+- **预期（推测，不进判据）**：
+  - 对 61.61 的池，每种子 +0.4pt，80% 主观区间 −1.0 ~ +1.5。
+  - 依据：
+    - 上限：采样多救回的 +11.0pt × val 失败份额约 38% ≈ +4pt，前提是完美选择器、完全迁移；
+    - 一遍 LoRA 吸收 10–30%；
+    - 从 HM3D 合成指令迁移到 MP3D 人写指令再打折；
+    - 任何 LoRA 的扰动代价约 −0.3±0.5。
+  - 概率：
+    - 过离线门与 P：约 0.45–0.55；
+    - 上了 val 之后 P(H)：约 0.15–0.25；
+    - 无条件：约 7–12%。
+
+**判据.**
+
+**A. 数据有效性（第一部分读数之前写死）**
+- **A1 采样确实开了**：
+  - 第一遍、第二遍、R0-S、留出采样，每个来源目录里的每份模型服务端日志都要匹配正则：
+    `System2 SAMPLES \((T=0\.7 top_p=0\.95|\{'temperature': 0\.7, 'top_p': 0\.95\})\)`
+    （910B 写法见 `serve_910b.sh:45`，4090 本地写法见 `rpc_model_server.py:1077-1078`，两种不同）。
+  - 服务端检出里有 `top_k=0`（`rpc_model_server.py:122-129`）。
+  - 锚点来源 `collect_base` 的日志一份都不能匹配。
+  - 不满足 → 该来源作废。
+- **A2 首调用同一性（S-check）**：第一遍 1,017 集的 call 0 答案（`recorded_turns`）与同集底座贪心记录的 call 0 逐字相同的比例必须 <0.90。
+  - call 0 的输入与 System1 种子无关；如果采样其实是贪心，这个比例应 ≥0.95。
+  - ≥0.90 → 第一遍作废，先查服务端。
+- **A3 救回率带**：第一遍成功率须在 [20%, 50%]。
+  - 带外 → 先核对 A1 与服务端提交。
+  - 两者都合规 → 照用，并在运行记录里写明。
+  - 任一不合规 → 作废重采。
+- **A4 System1 种子**：每条记录 `calls.jsonl` 的 `sampling.protocol_seed`（`r2r_val_unseen.py:3757`）必须与来源声明一致：
+  - 第一遍与 R0-S：1337；第二遍：42；第三遍：2024；留出采样：各自的种子；锚点：42。
+  - 不一致的记录剔除并计数；>1% → 停查。
+
+**B. 采集**
+- **B1 第二遍（写死：要跑）**
+  - 集：第一遍失败、且 R0-S 也没救回的集，约 620 集（590–730）。
+    - 建法同 `scripts/exp29/r0_cohort.sh`：链接目录，然后 `remaining_cohort.py --keep committed --num-shards 20`。
+  - 设置：
+    - 采样与第一部分相同：T 0.7、top_p 0.95、top_k 0，代码 `e515ec2` 起；
+    - **System1 种子 42**；标准协议；不开步数预算 STOP；
+    - 910B 卡 0–6 的采样服务端 + 4090 本地 3 个采样槽，按分片认领；
+    - 输出 `/workspace/exp32/p2`。
+  - 理由：
+    - 底座贪心正是在种子 42 下失败的。
+    - 每次调用的 System1 种子只由 (协议种子, 场景, 集, 调用序号) 决定（`rpc_protocol.py:100-123`）。
+    - 所以种子 42 的采样轨迹在第一个 System2 分叉之前与失败的贪心轨迹相同，它的成功必须来自 System2 的不同选择。
+    - 这去掉了"换 System1 种子就救回"的那条运气路径（R0 中占 23.5pt）。
+  - 截止：起跑后 7 h（按 `STATUS_*` 第一行的时间）。到点按 PID 停，已提交的照用，不再延。
+  - 只报：
+    - 救回率（未知，猜 15–25%）；
+    - 同平台的成功轨迹里，分叉前前缀与底座记录逐调用相同的比例。
+- **B2 剂量规则（写死）**：N_rft = 按 C 的规则选出的 RFT 样本数（`build_rft_stream.py --dry-run` 里 `category_rft_*` 之和）。
+  - 第二遍后 N_rft <4,000 → 跑第三遍：
+    - 集：仍没有任何成功轨迹的集；
+    - System1 种子 2024，起跑后 7 h 截止，输出 `/workspace/exp32/p3`；
+    - 之后不论多少都照训。
+  - 第三遍后 N_rft <2,000 → 不训，只报数据，EXP-32 停。
+- **B3 留出采样（只供 R 门，永不进训练）**
+  - 集：Phase-0 留出 400 集里底座失败的 112 集（`collect_base` 分片 0–19、success==0）。
+  - 设置：采样同上；System1 种子 42 与 1337 各一条，共 224 集；在 910B 训练期间用 4090 本地 3 个采样槽跑。
+  - 输出 `/workspace/exp32/heldout_s{42,1337}`。
+  - R 的发散状态 <150 → 加跑种子 2024 一遍；仍 <150 → R 只报，由 M 顶替（见 F）。
+
+**C. 训练流的精确规则**
+
+| # | 规则 |
+|---|---|
+| RF1 | **RFT 轨迹的来源**：第一遍 `/workspace/exp32/collect_a`、R0-S `/workspace/exp31/r0s`、第二遍 `/workspace/exp32/p2`（第三遍若触发也算）。<br>**入选条件**：<br>• `outcome.success == 1`（Habitat：3 m 内喊 STOP）；<br>• 记录已提交（tar + .sha256）；<br>• 场景在 279 个训练场景里，不在 20 个留出场景、也不在 EXP-23 的 6 个场景里；<br>• 服务端没挂适配器（`hm3d_route_gate.py:185` 的 `served_adapter` 为 None）。<br>**数量**：每集最多 2 条（第一遍 + R0-S）；同一集里 R0-S 与第一遍的 `recorded_turns` 逐调用全同 → 只留第一遍那条。 |
+| RF2 | **RFT 调用**：<br>• `call_index < 48`；<br>• 记录里的 `distance_to_goal > 3 m`（`r2r_val_unseen.py:3756`；`index_calls(require_labels=False)` 取的就是它，`s2_sft_dataset.py:426-428`）；<br>• 最终决策类（`s2_sft_dataset.py:149`）是 pixel、turn_left 或 turn_right。<br>缺距离、STOP、forward、invalid 一律不出样本，但要计数。成功轨迹的 STOP 只出现在 3 m 内，所以 RFT 部分没有 STOP 目标。 |
+| RF3 | **反向丢弃（同 R6）**：目标的净转向与上一次调用执行的净转向相反 → 丢弃（`build_route_stream.py:234,243`）。 |
+| RF4 | **目标**：记录里模型自己的答案原样（`s2_sft_dataset.py:205`；看过 ↓ 时两个回合都照抄）。<br>不用线 B、oracle 或专家标签（本条有意改掉 R13）。<br>除 RF2 的条件外，不再按距离、线 B、SPL 或调用序号筛。 |
+| RF5 | **锚点**：<br>• 来源 `/workspace/exp28/collect_base/records`：底座、无适配器、System1 种子 42、代码 `13a4328`；<br>• 只取分片 ≥20 且 success==1 的 2,331 集；<br>• 调用规则同 RF2、RF3；<br>• 排序键 sha256("exp32-anchor:32:"+uid)，每集最多 6 个；<br>• 总数 = N_rft（1:1）；池不够就全取并照报。<br>不用：R0-G 的救回、底座失败集、线 B 标签。 |
+| RF6 | **权重**：每个样本只出现一次，权重 ×1；不做发散加权，也不做 STOP 加权。 |
+| RF7 | **键**：`{scene}_{episode:06d}#{tag}.{call}`，tag ∈ {p1, r0s, p2, p3, g}。`merge_streams.py:243` 的 `sample_scene` 仍能从中解析出场景。 |
+| RF8 | **回放**：只用 InternData r2r（24 个训练场景，去掉 EXP-23 的 6 个留出），STOP ×5，占合流 20%。<br>不用 ScaleVLN 回放：它是 S1-TM 的成分，而且会撑高 O1。合流里的 STOP 只来自回放。 |
+| RF9 | **合流**：按种子洗牌一次，256 样本一片。与 R8 的不同之处（回放 20%、只有 r2r）用 `--allow-other-rules` 记进 manifest。<br>以下照旧硬拒：DAgger 部分的 STOP 目标、训练场景外的样本、留出泄漏（`merge_streams.py:454-456, 463-468, 477-479`）。 |
+
+预计规模（推测）：
+- 成功轨迹约 515–595 条，约 450–520 个不同的集：
+  - 第一遍约 350（34.5%；范围 285–420）；
+  - R0-S 69；
+  - 第二遍 95–175。
+- RFT 样本：每条约 14 个（11–19），合计约 7.5k（5.5–9k）。
+- 锚点：与 RFT 同数（池约 2.3 万）。
+- 回放：约 3.75k（STOP ×5 之后）。
+- 合计约 1.9 万 → 74 片 → 约 293 步（215–352）。STOP 份额约 6%。
+- RFT 里与贪心不同的目标猜 25–35%，即有效剂量约 1.9–2.6k 个调用（D3 实测，只报）。
+
+**D. 训练前检查（任一条不过就不训；修建流器，不放宽线）**
+- **D1 AUD**（`scripts/exp32/aud.py`）：
+  1. 留出泄漏为 0：没有样本来自 20 个留出 HM3D 场景、EXP-23 的 6 个场景，或 279 个训练场景之外。
+  2. RF1–RF7 全部成立：
+     - RFT 记录 success==1，且过 A1、A4；
+     - 锚点来自 `collect_base`、分片 ≥20、success==1、种子 42；
+     - STOP、forward、invalid 目标为 0；
+     - 丢弃后剩下的反向为 0；
+     - d ≤3 m 或 call ≥48 的样本为 0。
+  3. 按种子 32 抽 500 个 RFT 样本：打包的 turns 与 `recorded_turns` 逐字相同；历史、当前、俯视 JPEG 与记录里的文件逐字节相同。要求 500/500。
+  4. 合流的 STOP 份额在 [3%, 12%]。
+  5. B2 的剂量规则满足。
+  6. `git diff e515ec2 x32 -- src scripts/evaluation scripts/train_system2_lora.py scripts/run_*.sh scripts/ascend` 为空。
+- **D2 G0**：
+  - 910B 8 卡，`src_x32`，`--parity-check 2000 --parity-split all`，重放 R0-G 臂的记录（`/workspace/exp31/r0g`：`e515ec2`、npu、贪心）。
+  - 线：exact ≥0.98（`train_system2_lora.py:105`）。
+  - cuda 侧沿用 EXP-28 运行记录 10 的 0.998：客户端与输入构造在 `13a4328…x32` 之间没变（D1 第 6 条）。
+- **D3 采样剂量**：
+  - 910B 8 卡，在按种子 32 抽的 150 条 npu 成功 RFT 记录上跑 `--parity-check 2000 --parity-split all --parity-device npu`，即关适配器贪心重放，对比记录里的采样答案。
+  - 线：1 − exact ≥0.10。如果采样其实是贪心，exact 约 0.98。
+  - 只报：exact；`same_answer` 意义下的发散率（`scripts/exp30/probe_judge.py:33-46`）；有效剂量 = N_rft × 训练集内行的发散率。
+
+**E. 训练配方（与 S1-TM、V1、C1 相同，只换数据）**
+- 从底座新起 LoRA（R12）：
+  - r32 / α64 / dropout 0.05，只挂 LLM 的 q/k/v/o/gate/up/down（`train_system2_lora.py:96`），视觉塔冻结；
+  - lr 5e-5、warmup 3%、cosine、weight decay 0、grad clip 1.0；
+  - 全局 batch 64、micro 1、种子 42（默认值见 `:1144, :1157-1168`）；
+  - `--loss-normalization token`（默认是 sample，`:1164`）。
+- 命令（同 `c1_910b.sh:43-45`）：
+  ```
+  S2_LORA_MODE=train S2_LORA_STREAM_DIR=$D/stream S2_LORA_OUTPUT_DIR=$D/lora S2_LORA_NPU_DEVICES=0,1,2,3,4,5,6,7 \
+  S2_LORA_EXTRA_ARGS="--global-batch 64 --save-every 100 --num-workers 4 --log-every 10 --loss-normalization token --holdout-scenes $HOLD" \
+  bash scripts/ascend/run_s2_lora_train_npu.sh
+  ```
+  `$HOLD` = 合流 manifest 的 `holdout.scenes`；不一致训练器会拒（`:788-790`）。
+- 只训一遍：不加 `--max-steps`，不挑 checkpoint；`--save-every 100` 只为续训。
+- 导出 `adapter_rX32R1` 的条件：
+  - `train_log.jsonl` 有 done 事件；
+  - `manifest.json` 写着 `loss_normalization: token`；
+  - step 行数 = 合流的 total_samples / 64。
+- 部署：System2 的决策开适配器；System1 的 Z0 关适配器（`rpc_model_server.py:148`）。
+
+**F. 训练后的离线门**
+- 运行方式：
+  - 4090 cuda，贪心；候选与同卡关适配器在同一批样本上比；
+  - `run_offline_gates.sh` 原样，`EXP28_O3_MAX_CALLS=3000`；O1/O2 的底座文件同 EXP-29；
+  - 判定用 `hm3d_route_gate.py verdict --rules exp32`。
+- **O1**：B3 的 5 个 ScaleVLN 场景，3,500 样本，决策类别一致率 ≥ 底座 − 1.0pt（即 ≥0.849）。
+- **O2**：r2r 留出场景 17DRP5sb8fy、5LpN3gDmAk7，共 600 样本，≥ 底座 − 1.0pt（即 ≥0.965）。
+- **O3**（`exp28-o3`，EXP-23 的留出记录，3,000 个调用）：
+  - (b) 远处 STOP 增量：像素后 3–6 m ≤ +0.25pt；转向后 3–6 m ≤ +0.4pt；>6 m ≤ +0.3pt。
+  - (c) 像素后 1–3 m 的 STOP ≤5%。
+  - (d) 转向后反向转 ≤1%；转向方向与底座不同 ≤5%。
+  - (e) ≥3 m 处决策类别与底座一致 ≥0.92。
+  - (f) ≤1 m 处、像素后 1–3 m 处的 STOP 率都 ≥ 底座的 0.75 倍。
+- **O4_anchor**：HM3D 留出锚点状态上，候选保持底座决策类别的比例 ≥0.92。
+- **O4_stop**：>3 m 的 STOP 率 ≤ 底座的 1.5 倍。
+- **L（语言门，新）**：
+  - 状态：O5 的纠正状态里有同场景供体指令的那些（`hm3d_route_gate.py:217`）。直接读 `o4/hm3d.calls.jsonl`，不另解码。
+  - 敏感度：本集指令与供体指令下的贪心答案"不同"的状态占比。"不同"指不满足 `same_answer`：类别不同，或像素 u、v 任一差 >50 px，或转向方向相反。
+  - 线：候选的敏感度 ≥ 底座 − 5.0pt，用整数计数比较。
+  - 它防的是 C1 那种不看指令的路线先验（O5 比值 0.94）。纠正增益 ≤0 时 O5 的比值说明不了语言（`:780-781`），而 RFT 本来就不优化线 B。
+- **R（迁移门，新，`scripts/exp32/rft_gate.py`）**：
+  - 状态：B3 留出采样里**成功**轨迹中满足 RF2、RF3 的调用。
+  - 解码：在 4090 同一张卡上贪心解码候选（开适配器）与底座（`adapter_off`）。
+  - 发散状态：底座答案与记录的采样答案不 `same_answer` 的状态。
+  - Δ_R：发散状态上候选与记录答案 `same_answer` 的比例。底座按构造为 0。
+  - 线：Δ_R ≥0.05，且按集簇 bootstrap（20,000 次）的 95% 下界 >0。
+  - 加跑种子 2024 之后发散状态仍 <150 → R 只报，由 M 顶替。
+  - 只报：
+    - R_fail：同口径在**失败**的留出采样轨迹上的一致率；
+    - Δ_R − R_fail。
+- **M（是否学进，新，同一工具）**：
+  - 状态：D3 那 2,000 行里，属于训练流 RFT 部分、且 npu 底座重放与记录答案不 `same_answer` 的调用。
+  - 解码：4090 同卡贪心解码候选与底座。
+  - Δ_M = 一致率(候选) − 一致率(底座)。
+  - M 只用来决定重试类型。R 只报时，M 就是是否学进的门：Δ_M ≥0.15。
+- 只报：O4 纠正项、O5 比值、G-A (a)、类别混淆、像素越窗（u∉[100,540] 或 v∉[32,455]）。
+- **重试只有一次，类型预先定**：
+
+| 情况（第一次门） | 下一步 |
+|---|---|
+| 全过 | 进 P |
+| L 不过 | kill |
+| O1/O2/O3/O4_anchor/O4_stop 任一不过，R 过 | 做 lora_B ×0.5 的拷贝（`EXP28_ATTEMPT=2 EXP28_LORA_SCALE=0.5`），全部门重判；R 也用这份拷贝、同一条线 |
+| 同上一行，但 R 也不过 | kill |
+| 只有 R 不过，Δ_M <0.15 | 同一份流训两遍，重训一次（`double_stream.py`），全部门重判 |
+| 只有 R 不过，Δ_M ≥0.15 | kill（学进了，但不迁移） |
+| 第二次仍有任一条不过 | kill，不上 val |
+| 量不出（invalid） | 修好输入重跑，不算一次重试 |
+
+- 这些门是必要条件，不是充分条件：S1-TM 的 O1/O2 都在 ±1pt 内，闭环却是 −2.45pt（README:3582）。
+
+**G. HM3D 留出闭环代理 P**
+- 定位：与 F 并行；只挡伤害，不当效果证据。只认过了门的那一份适配器；重试换了适配器，P 就重跑。
+- 底座臂：Phase-0 的 400 个留出集。
+  - 来源：`collect_base` 分片 0–19，910B npu，`13a4328`。
+  - 设置：贪心，种子 42，500 步，不开步数预算 STOP。
+  - 读数：SR 72.0 / B 11.75 / E7 11.25。
+- 候选臂：
+  - 集：同一 cohort（`/workspace/exp28/episodes/cohorts`，part `heldout`，分片 0–19）；
+  - 910B：`serve_910b.sh` + `EXP28_ADAPTER`；`servers.json` 必须带适配器的 sha256（`serve_910b.sh:94`）；服务端日志不得匹配 A1 的正则；
+  - 4090：`collect_4090.sh` external 模式跑客户端；
+  - 其余设置同底座臂；输出 `/workspace/exp32/p_cand`。
+- 有效性：
+  - 复现核对：`/workspace/exp28/p_repro` 里最先提交的 10 集，用 `canary_compare.py --rerun-records … --reference-records … --min-identical-episodes 9` 比，须 ≥9/10 逐调用相同。
+    - 贪心路径在 `13a4328` 与 `x32` 之间没变：`e515ec2` 只动了采样分支。
+    - 不过 → 在 `x32` 上重跑底座 400 集（约 +5 h），P 改为对它判。
+  - 两臂都是 npu（`--require-device npu`）。
+  - 400 集都要配上，否则是 `incomplete`：补跑缺的集，不算 kill。
+- 判定：`--criteria exp28-p` 原线（`canary_compare.py:100-104, 263-277`）。任一条成立即 kill，不上 val、不重试：
+  - 配对标准协议 ΔSR ≤ −3.0pt；
+  - "停了但从没进过 3 m 圈"的份额 > 底座 + 3pt；
+  - 步数耗尽的份额 > 底座 + 3pt；
+  - 反向转 > 转向调用的 2%。
+- 误杀率（正态近似，SE 2.6–2.9pt 是推测）：真值 0 时约 14%，+1 时约 7%，+2 时约 3%。
+- 只报：
+  - 场景簇 bootstrap 区间（20,000 次）；
+  - ΔOS、ΔB、ΔE7；
+  - 112 个底座失败集救回了几个，288 个底座成功集坏了几个。
+
+**H. val 前的逐调用核对**
+- 设置：4090 GPU 5，sdpa，shard 0 的 3 集，种子 42；对 A0 种子 42 的客户端日志跑 `compare_client_logs.py --require-identical`；每项最多试 2 次。
+- (1) 无适配器：69/69。
+- (2) 无适配器 + 视觉掩码（`HEATMAPVLN_QWEN_VISION_MASK_PATCH=1`）：69/69。不过 → val 不开掩码。
+- (3) lora_B 全部置零的候选拷贝（掩码跟随 (2) 的结果）：69/69。
+- (1) 或 (3) 不过 → 不上 val。
+
+**J. val_unseen（唯一判据）**
+- **设置**：
+  - 4090 GPU 5/4/0，全量 1,839 集。
+  - `PPA_EVAL_ATTN_IMPL=sdpa` 必须显式写：启动器默认是 FA2（`run_ppa_r2r_val_unseen_cuda.sh:63`），而 `exp29_auto.sh` 的 `run_val` 没写这个变量（`:68-70`）。
+  - 掩码按 H(2) 的结果。
+  - `PPA_EVAL_STOP_AT_STEP_BUDGET=1`，按标准协议计分，步数预算 STOP 记失败。
+  - System2 开适配器，Z0 关适配器。
+  - `PPA_EVAL_SYSTEM2_SAMPLE_TEMPERATURE` 必须未设；服务端日志不得匹配 A1 的正则。
+  - 一个种子 1,839/1,839 才算跑完；`--resume` 最多续两次。
+- **种子顺序**：42 → 1337 → 2024 → 3407。
+- **参照池**：EXP-20 的 8 次 sdpa 全量 `/workspace/eval_runs/exp20_a{0,1,2,3}_seed{42,1337}_4090/merged/progress.jsonl`。
+  - 8 次的均值 61.61，SD 0.80。
+  - 种子 42 四臂均值 62.02（62.70 / 61.45 / 60.96 / 62.97）；种子 1337 四臂均值 61.20（60.74 / 61.34 / 61.50 / 61.23）。
+  - `pool_estimator.py` 从文件重算；与上面的数差 >0.01 → 停查。
+- **估计量**：Ê_k = (1/k)·Σ_s (SR_s − ref_s)。
+  - ref_42 = 62.02，ref_1337 = 61.20，ref_2024 = ref_3407 = 61.61。
+  - k=2 与 k=4 时，它就等于"候选的均值 − 61.61"。
+- **标准误**：SE_k = √(max(0.80, s_c)²/k + 0.41²)，s_c 是候选 k 个种子 SR 的样本 SD（k≥2）。
+  - 0.41 是考虑同种子相关之后池均值的 SE：同种子的另外三臂与 A0 只在 7.6–8.1% 的集上不一致，两个种子之间是 18.5%（README:2789）。
+  - 由此 SE_2 ≥0.699，SE_4 ≥0.573。
+- **停止规则**：
+  - 种子 42 配满 600 集时：对"种子 42 四臂的逐集均值"算 ΔSR，≤ −3.0 → 中止。
+    - 逐集均值由 `pool_estimator.py pool-ref` 写成 progress.jsonl，`paired_progress_monitor.py --min-episodes 600 --abort-delta -3.0` 原样读。
+  - 种子 42 跑完：Ê_1 = SR_42 − 62.02 ≤ −0.5 → 停，记"未支持（无效性）"。
+  - k=2（种子 1337 跑完）：
+    - Ê_2 ≥ max(1.0, 3.0·SE_2)（σ_c ≤0.80 时即 ≥2.10），且种子 42+1337 与 A0 的配对合并 ΔSR >0 → **支持（两种子提前）**；
+    - Ê_2 < +0.3 → 停：Ê_2 ≤ 0 记"未支持"，否则记"没测出来"。两种子不写"否定"。
+    - 其余 → 跑 2024 和 3407。
+  - k=4：
+    - **H-32 支持**须三条同时满足：
+      - Ê_4 ≥ +1.0；
+      - Ê_4 − 1.96·SE_4 > 0（σ_c ≤0.80 时即 Ê_4 > 1.123，4 种子 SR 均值 ≥62.74）；
+      - 种子 42+1337 与 A0 的配对合并 ΔSR > 0（`paired_closed_loop_bootstrap.py --standard-protocol`，20,000 次）。
+    - **否定**：Ê_4 ≤ 0。
+    - 其余：没测出来。
+  - 不加第 5 个种子（坑 20）。
+- **工作特性**（模拟。假设：候选种子 SD 0.80、池误差 SD 0.41、600 集规则按 SE 1.5pt 近似。没算"配对 vs A0 >0"这一条，加上它只会更低）：
+
+| 真值 Δ | P(支持) | P(种子 42 无效性停) | 期望种子数 |
+|---|---|---|---|
+| 0 | 0.02 | 0.30 | 2.3 |
+| +0.5 | 0.12 | 0.15 | 3.0 |
+| +1.0 | 0.37 | 0.06 | 3.4 |
+| +1.5 | 0.70 | 0.02 | 3.5 |
+| +2.0 | 0.91 | 0.01 | 3.1 |
+
+- 这套评测在 +1 处功效只有约 0.37：池均值的误差让可检出效应约有 1.15pt 的下限，再加候选种子也去不掉。
+- 第一份读数（种子 42）只对 62.02 和 A0 种子 42 的配对来报，不对 61.61 报：A0 种子 42 比池均值高 1.09，一个几乎没改动的适配器会借到这份运气。
+- 只报：
+  - 每种子与合并的配对 ΔSR / ΔSPL / ΔOS / ΔNE（对 A0，20,000 次）；
+  - 对 A0 两种子均值 61.72 的差；
+  - 开开关口径的 SR、ΔB、ΔE7、反向转率、停在圈外的份额；
+  - 逐集池参照的 bootstrap。
+
+**K. 多重性**：只有一个候选可能上 val：`adapter_rX32R1`，或重试表给出的那一种形态。val_unseen 不用于训练、挑 checkpoint 或挑缩放。
+
+**设置.**
+- **代码**：EXP-32 的实现提交记作 `x32`。
+  - 只新增 `scripts/exp32/`，只改 `scripts/exp28/merge_streams.py` 与 `scripts/exp28/hm3d_route_gate.py`。
+  - 4090 工作树 `/workspace/exp23/wt_x32`；910B 检出 `zhr_1/exp23/src_x32`。
+- **路径**：
+  - 第一遍：`/workspace/exp32/collect_a`（第一部分的输出目录）；
+  - 其余：
+
+| 用途 | 路径 |
+|---|---|
+| R0-S | `/workspace/exp31/r0s` |
+| 第二遍 | `/workspace/exp32/p2` |
+| 留出采样 | `/workspace/exp32/heldout_s{42,1337}` |
+| 回放流 | `/workspace/exp32/stream_replay_r2r` |
+| RFT 流 | `/workspace/exp32/stream_rft` |
+| 合流 | `/workspace/exp32/stream` |
+| 离线门 | `/workspace/exp28/gates/x32r1_a{1,2}` |
+| P | `/workspace/exp32/p_cand` |
+| val | `/workspace/eval_runs/exp32_X32R1_seed{s}_4090_stepbudget` |
+| 910B 工作目录（只写这里） | `~/work/zhr/zhr_1/exp32/` |
+
+- **建流**（4090 CPU）：
+  1. 回放流（现在就能建，不读第一部分）：
+     `build_replay_stream.py --root r2r=/workspace/exp23/data/interndata_n1/r2r --samples r2r=8000 --exclude-holdout --stop-upsample 5 --out-dir /workspace/exp32/stream_replay_r2r`
+  2. RFT 流：`scripts/exp32/build_rft_stream.py --no-pad …`（按 RF1–RF7）。
+  3. 合流：
+     `merge_streams.py --dagger-stream /workspace/exp32/stream_rft --replay-stream /workspace/exp32/stream_replay_r2r --holdout-scenes-file /workspace/exp28/episodes/splits/heldout_scenes.txt --replay-fraction 0.2 --replay-shares equal --allow-other-rules --out-dir /workspace/exp32/stream`
+  4. 开训前先跑 `--dry-run`，把组成写进台账。
+- **时间**：T0 = 第一遍结束。按第一部分提交时间 16:10 UTC 起跑、每小时 110–140 集推算，约在 10-21 01:00 UTC ±2 h。
+
+| 阶段 | 相对 T0 |
+|---|---|
+| 实现与测试（4090/910B）、本节提交、建回放流、写池参照 | T0 之前 |
+| A1–A4、建第二遍 cohort | 0 → +0.5 h |
+| 第二遍（约 620 集，上限 7 h） | +0.5 → 约 +6.5 h |
+| 建流、合流、AUD；910B 跑 G0 与 D3（各约 20 min，推测）；4090 本地开始留出采样 | +6.5 → +8 h |
+| 训练约 293 步（28.6 s/步，1.7–2.8 h）并导出 | +8 → 约 +10.5 h |
+| 留出采样结束（224 集，3 槽） | 约 +11.5 h |
+| P（4–5 h）与离线门（3.5–4.7 h）+ R/M 解码（0.5 h）并行；同卡争用另留 1 h | +10.5 → 约 +17 h |
+| H 的三项核对 | → 约 +18 h |
+| val 种子 42（20–25 h/种子；A0 实测 68 卡·时/种子，掩码约省 15%）：第一份 val 读数 | → +38~43 h，约 10-22 15:00–20:00 UTC |
+| 种子 1337（k=2 判定点） | → +58~68 h，约 10-23 |
+| 种子 2024、3407（H-32 判定） | → +98~118 h，约 10-25 |
+
+  - 滑动：×0.5 重试 +5 h；两遍重训 +10 h；第三遍 +7.5 h；P 的底座重跑 +5 h。
+- **运维**：
+  - 910B 导出端口 `serve_dirs`（52417）10-18 22:42 UTC 起给了 5 天，10-23 22:42 UTC 到期（README:3565）。训练开始前续到 ≥7 天；隧道同样。
+  - 服务寿命：第二遍的采样服务端 ≥10 h；P 的候选服务端 ≥12 h。
+  - 告警：任一采集槽 45 min 没有新提交的记录，或任一 `STATUS` 2 h 不变 → 告警。每个等待都设期限。
+  - 910B 约从 T0+17 h 起空闲。
+
+**边界（预先写）.**
+- 训练数据全部来自 HM3D 训练场景和 ScaleVLN 的 speaker 合成指令，而 val_unseen 是 MP3D 加人写指令。val 之前只有 O2 碰得到 val 的域；R 和 P 都在 HM3D 上。val 之前没有任何检验覆盖迁移。
+- 离线门与 P 都只挡伤害，不证明效果。P 的 SE 约 2.6–2.9pt，挡不住 −1 ~ −2pt 的伤害。
+- 没有空训练对照（只用锚点加回放训一遍）。所以 H-32 即使成立，也分不清贡献来自 RFT 目标还是"训练本身"。
+- 成功轨迹里有些坏决定是后来被救回的，它们也被原样训了。没有按几何进展过滤，因为那样会把路线先验带回来。
+- 第一遍与 R0-S 的成功里可能有约三分之二只靠 System1 运气（R0：换种子贪心救回 23.5%，采样 34.5%）。种子 42 只对第二遍的数据去掉了这条运气路径。
+- 参照池把 A0–A3 的两个种子当作可交换的；2024 与 3407 没有种子匹配的参照；池误差 0.41 是估计值。
+- 结论只对这一配方成立：T 0.7 / top_p 0.95、一轮 RFT、这个剂量、LoRA r32 训一遍。"否定"或"没测出来"不等于 RFT 这条路不行。
+- 若有增益，它属于 System2 本身的改进，native 换上同一个适配器也会受益。步数预算 STOP 带来的约 +1.7pt 不算方法增益。
+- sdpa 下长集不完全确定（EXP-24 有 4/69 集分叉），H 的 69/69 核对可能在重跑时不过。
+- 训练记录混有 4090（cuda）与 910B（npu）的答案：约 5% 的答案像素差 1–8 px（EXP-23 运行记录 4），只报份额。
+- 不检验任何认知或记忆方面的主张。
+
+
 ---
 
 ## 4. 公共资源
