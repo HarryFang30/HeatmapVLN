@@ -17,7 +17,8 @@ def test_greedy_generate_is_exactly_the_deployed_call_when_unset_or_zero():
 def test_a_positive_temperature_samples():
     env = {server.SYSTEM2_SAMPLE_TEMPERATURE_ENV: "0.7", server.SYSTEM2_SAMPLE_TOP_P_ENV: "0.9"}
     assert server.system2_sampling(env) == {"temperature": 0.7, "top_p": 0.9}
-    assert server.system2_generate_kwargs(env) == {**DEPLOYED, "do_sample": True, "temperature": 0.7, "top_p": 0.9}
+    assert server.system2_generate_kwargs(env) == {**DEPLOYED, "do_sample": True, "temperature": 0.7, "top_p": 0.9,
+                                                   "top_k": 0}
     assert server.system2_sampling({server.SYSTEM2_SAMPLE_TEMPERATURE_ENV: "1"})["top_p"] == 1.0
 
 

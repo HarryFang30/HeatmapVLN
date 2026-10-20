@@ -123,7 +123,9 @@ def system2_generate_kwargs(environ: Optional[dict] = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"max_new_tokens": 128, "do_sample": False, "use_cache": True, "return_dict_in_generate": True}
     sampling = system2_sampling(environ)
     if sampling is not None:
-        kwargs.update(do_sample=True, **sampling)
+        # InternNav_Model's generation_config.json pins top_k 1 (top_p 0.001, temperature 0.1); without top_k 0 the
+        # "sampled" answer is the greedy one (found by EXP-30, 2026-10-20).
+        kwargs.update(do_sample=True, top_k=0, **sampling)
     return kwargs
 
 
