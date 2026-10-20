@@ -9,6 +9,11 @@ Inputs, both packed on the 4090:
   --exclude-holdout --exclude-scenes <held-out HM3D scene dirs>`` over InternData r2r and
   ScaleVLN-train.
 
+EXP-32 passes ``scripts/exp32/build_rft_stream.py --no-pad`` (RF1-RF7: the model's own sampled
+answers on successful trajectories plus 1:1 base anchors) as ``--dagger-stream``, with one r2r
+replay root at ``--replay-fraction 0.2`` (RF8, RF9).  Its knobs are not EXP-28's, so it merges
+only with ``--allow-other-rules``; the checks refused always below hold for it unchanged.
+
 Every DAgger sample is taken once.  Replay is added until it makes up ``--replay-fraction``
 (0.3) of the stream, rounded up to whole shards, and split over the replay stream's roots by
 ``--replay-shares`` (default ``equal``: half r2r, half ScaleVLN).  Replay is drawn by key, so
@@ -92,6 +97,9 @@ from src.data.s2_stream import (  # noqa: E402
 
 BUILDER = "scripts/exp28/merge_streams.py (EXP-28)"
 DAGGER_BUILDER = "scripts/tools/build_route_stream.py"
+# EXP-32's RFT stream (RF1-RF7) stands in for the DAgger part; it is not built with EXP-28's knobs,
+# so it merges only with --allow-other-rules, and every always-refused check below still applies.
+RFT_BUILDER = "scripts/exp32/build_rft_stream.py"
 REPLAY_BUILDER = "scripts/tools/build_replay_stream.py"
 # The ledger's rules R1, R2, R6, R7 as build_route_stream.py's knobs; a DAgger stream built
 # otherwise is refused unless --allow-other-rules (and then the manifest says so).
@@ -439,8 +447,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     dagger_manifest, dagger, dagger_sha = load_stream(
         args.dagger_stream, schemas=(UNPADDED_SCHEMA, STREAM_SCHEMA), verify=verify)
     replay_manifest, replay, replay_sha = load_stream(args.replay_stream, schemas=(STREAM_SCHEMA,), verify=verify)
-    if not str(dagger_manifest.get("builder", "")).startswith(DAGGER_BUILDER):
-        raise SystemExit(f"{args.dagger_stream} was built by {dagger_manifest.get('builder')!r}, not {DAGGER_BUILDER}")
+    if not str(dagger_manifest.get("builder", "")).startswith((DAGGER_BUILDER, RFT_BUILDER)):
+        raise SystemExit(f"{args.dagger_stream} was built by {dagger_manifest.get('builder')!r}, "
+                         f"not {DAGGER_BUILDER} or {RFT_BUILDER}")
     if not str(replay_manifest.get("builder", "")).startswith(REPLAY_BUILDER):
         raise SystemExit(f"{args.replay_stream} was built by {replay_manifest.get('builder')!r}, not {REPLAY_BUILDER}")
     if any(e.source != "dagger" for e in dagger):

@@ -52,6 +52,19 @@ Subcommands::
              same stream for 2 epochs; O1, O2, O3 or O4's anchor / STOP item fails -> LoRA scale 0.5, no
              retraining, gate again; O5 fails -> kill; a second attempt that fails -> kill.  Exit 0 all
              pass, 1 a gate failed, 2 something could not be measured (next: invalid, not a retry).
+             ``--rules exp28`` is the default and writes exactly what it wrote before EXP-32.
+
+             ``--rules exp32`` (ledger EXP-32 第二部分 F, written before any part-1 reading) gates O1, O2, O3,
+             O4's anchor and STOP items, L and R; O4's correction item and O5 are report-only.  L reads
+             ``score``'s rows (``--o4-calls``, default <o4 stem>.calls.jsonl): on O5's states (corrections with a
+             same-scene donor instruction), the share whose greedy answer under the donor's instruction is not
+             ``same_answer`` (scripts/exp30/probe_judge.py: another class, a pixel more than 50 px away on
+             either axis, a turn the other way) as under the episode's own; the candidate's share >= the base's
+             - 5.0 pt in whole counts.  R is ``scripts/exp32/rft_gate.py score``'s gate (``--rgate``
+             rft_gate.json: R, or M when R is report-only) and must be of the adapter O4 decoded.  Retry: L
+             fails -> kill; O1, O2, O3, O4_anchor or O4_stop fails -> scale 0.5 if R passed, kill if not; only R
+             fails -> retrain on the same stream for 2 epochs if M says not learnt (D_M < 0.15), kill if learnt;
+             a second attempt that fails -> kill.  Same exit codes, its own schema.
 
     python scripts/exp28/hm3d_route_gate.py decode --record-root /workspace/exp28/gates/hm3d_heldout/records \\
         --label-root /workspace/exp28/gates/hm3d_heldout/labels --holdout-scenes-file heldout_scenes.txt \\
@@ -82,6 +95,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
+from scripts.exp30.probe_judge import same_answer  # noqa: E402
 from scripts.tools.stratified_gates import decision_class  # noqa: E402
 from scripts.tools import label_route_corrections as lr  # noqa: E402
 
@@ -117,6 +131,29 @@ RETRY_RULES = {
     "kill": "O5 failed (scaling does not change its ratio), or the one retry failed: the candidate does not go to val",
     "invalid": "a gate could not be measured (see notes: O4/O5 invalid or a smoke subset, O1/O2 not on the base's "
                "samples, O3 rows without records): fix the inputs and run this attempt again; it is not a retry",
+}
+
+# Ledger EXP-32 第二部分 F, written before any part-1 reading (verdict --rules exp32).
+VERDICT_SCHEMA_EXP32 = "heatmapvln-exp32-offline-gates-verdict-v1"
+RFT_GATE_SCHEMA = "heatmapvln-exp32-rft-gate-v1"  # scripts/exp32/rft_gate.py score's rft_gate.json
+L_MAX_DROP = Fraction(5, 100)
+HARM_GROUPS_EXP32 = ("O1", "O2", "O3", "O4_anchor", "O4_stop")
+GROUPS_EXP32 = HARM_GROUPS_EXP32 + ("L", "R")
+REPORT_ONLY_EXP32 = ("O4_correction", "O5")
+LEDGER_SIZES_EXP32 = {"O1": 3500, "O2": 600, "O3": 3000}  # F: B3's 3,500 samples, r2r's 600, O3's 3,000 calls
+RETRY_RULES_EXP32 = {
+    "val": "every gated item passed (O1, O2, O3, O4_anchor, O4_stop, L, R): the candidate goes on to P, which runs "
+           "beside these gates, and, unless P kills it, to val",
+    "scale_0.5": "O1, O2, O3, O4_anchor or O4_stop failed and R passed: a copy with lora_B x 0.5 (EXP28_ATTEMPT=2 "
+                 "EXP28_LORA_SCALE=0.5), every gate once more, R decoded on that copy against the same line",
+    "retrain_2_epochs": "only R failed and M says not learnt (D_M < 0.15): train the same stream twice "
+                        "(double_stream.py), once, and gate every item again",
+    "kill": "L failed; or O1, O2, O3, O4_anchor or O4_stop failed together with R; or only R failed with D_M >= 0.15 "
+            "(learnt, does not transfer); or the one retry failed: the candidate does not go to val",
+    "invalid": "a gate could not be measured (see notes: O4/O5/L invalid or a smoke subset, O1/O2 not on the base's "
+               "samples, O3 rows without records, rft_gate.json invalid or of another adapter or R waiting for B3's "
+               "seed-2024 pass, M unmeasured where the retry type needs it): fix the inputs and run this attempt "
+               "again; it is not a retry",
 }
 
 
@@ -738,27 +775,37 @@ def next_step(groups: Mapping[str, bool], attempt: int) -> str:
     return "retrain_2_epochs"
 
 
-def verdict(*, o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, Any], o4: Mapping[str, Any],
-            attempt: int) -> dict[str, Any]:
-    """``o1`` / ``o2``: ``compare_agreement`` results; ``o3``: a stratified result; ``o4``: this script's ``score``."""
+def _o5_criterion(o4: Mapping[str, Any]) -> Mapping[str, Any]:
+    return ((o4.get("O5") or {}).get("criteria") or {}).get("shuffle_vs_own_instruction") or {}
+
+
+def gate_groups(o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, Any],
+                o4: Mapping[str, Any]) -> dict[str, bool]:
+    """O1-O5 pass / fail, in ``GROUPS`` order, as both rule sets read them (an invalid O4/O5 passes nothing)."""
     if "O3_exp28" not in o3:
         raise ValueError("the O3 result has no O3_exp28 block: run stratified_gates.py from this commit")
     valid = bool(o4.get("valid"))
     criteria4 = (o4.get("O4") or {}).get("criteria") or {}
-    criterion5 = ((o4.get("O5") or {}).get("criteria") or {}).get("shuffle_vs_own_instruction") or {}
-    groups = {
+    return {
         "O1": bool(o1["pass"]),
         "O2": bool(o2["pass"]),
         "O3": bool(o3["O3_exp28"]["all_pass"]),
         "O4_correction": valid and bool((criteria4.get("correction_agree_gain") or {}).get("pass")),
         "O4_anchor": valid and bool((criteria4.get("anchor_class_keep") or {}).get("pass")),
         "O4_stop": valid and bool((criteria4.get("far_stop_vs_base") or {}).get("pass")),
-        "O5": valid and bool(criterion5.get("pass")),
+        "O5": valid and bool(_o5_criterion(o4).get("pass")),
     }
-    # Anything below makes the pass unreadable ("invalid": fix and run the attempt again), never a FAIL that
-    # would spend the one retry or kill the candidate.
+
+
+def input_problems(o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, Any],
+                   o4: Mapping[str, Any]) -> list[str]:
+    """Why O1-O5 cannot be read (empty: they can), for both rule sets.
+
+    Anything here makes the pass unreadable ("invalid": fix and run the attempt again), never a FAIL that
+    would spend the one retry or kill the candidate.
+    """
     problems = []
-    if not valid:
+    if not bool(o4.get("valid")):
         problems.append(f"O4/O5 measurement invalid: {o4.get('invalid')}")
     subset = (((o4.get("selection") or {}).get("settings") or {}).get("max_episodes"))
     if subset:
@@ -774,12 +821,11 @@ def verdict(*, o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, An
     if not rows3 or join3.get("rows") != rows3:
         problems.append(f"O3: {join3.get('rows')} of {rows3} decoded calls joined their records (records moved or "
                         "unreadable: stratified_gates.py drops those rows)")
-    measured = not problems
-    step = next_step(groups, attempt) if measured else "invalid"
-    notes = list(problems)
-    if criterion5.get("delta_corr_nonpositive"):
-        notes.append("O5 compares against delta_corr <= 0: its ratio says nothing about language; the ledger's "
-                     "rule order still applies")
+    return problems
+
+
+def _reference_notes(o1: Mapping[str, Any], o2: Mapping[str, Any], o4: Mapping[str, Any]) -> list[str]:
+    notes = []
     for name, result in (("O1", o1), ("O2", o2)):
         if result.get("same_samples") and result.get("n") and not result.get("base_reproduces_ledger"):
             notes.append(f"{name}: the base reference {result.get('base_rate')} is not the ledger's "
@@ -787,6 +833,21 @@ def verdict(*, o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, An
     missing = (o4.get("selection") or {}).get("scenes_without_records")
     if missing:
         notes.append(f"O4/O5: {len(missing)} held-out scenes have no base records: {missing}")
+    return notes
+
+
+def verdict(*, o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, Any], o4: Mapping[str, Any],
+            attempt: int) -> dict[str, Any]:
+    """``o1`` / ``o2``: ``compare_agreement`` results; ``o3``: a stratified result; ``o4``: this script's ``score``."""
+    groups = gate_groups(o1, o2, o3, o4)
+    problems = input_problems(o1, o2, o3, o4)
+    measured = not problems
+    step = next_step(groups, attempt) if measured else "invalid"
+    notes = list(problems)
+    if _o5_criterion(o4).get("delta_corr_nonpositive"):
+        notes.append("O5 compares against delta_corr <= 0: its ratio says nothing about language; the ledger's "
+                     "rule order still applies")
+    notes += _reference_notes(o1, o2, o4)
     return {
         "schema": VERDICT_SCHEMA,
         "attempt": attempt,
@@ -800,6 +861,170 @@ def verdict(*, o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, An
         "O3": o3["O3_exp28"],
         "O4": o4.get("O4"),
         "O5": o4.get("O5"),
+        "notes": notes,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Verdict under EXP-32's rules: L and R gate, O4's correction item and O5 report
+# --------------------------------------------------------------------------- #
+def read_rows(path: str | os.PathLike) -> list[dict[str, Any]]:
+    """``score``'s rows (``<output stem>.calls.jsonl``)."""
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _o5_states(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """O5's states among ``score``'s rows: the corrections with a same-scene donor (``shuffle_donors``)."""
+    return [r for r in rows
+            if r.get("label_kind") == "correction" and (r.get("shuffle") or {}).get("donor") is not None]
+
+
+def _has_shuffled(row: Mapping[str, Any]) -> bool:
+    shuffled = row.get("shuffled") or {}
+    return "on" in shuffled and "off" in shuffled
+
+
+def instruction_sensitivity(rows: Sequence[Mapping[str, Any]], arm: str) -> dict[str, Any]:
+    """L's reading of one arm (``on``: the candidate, ``off``: the base) on ``score``'s rows: among the corrections
+    with a shuffled answer, those whose answer under the donor's instruction is not ``same_answer`` as under the
+    episode's own (another class -- a turn the other way is one -- or a pixel more than 50 px away on either axis)."""
+    states = [r for r in rows if r.get("label_kind") == "correction" and _has_shuffled(r)]
+    how: Counter = Counter()
+    for row in states:
+        own, other = row[arm]["turns"], row["shuffled"][arm]["turns"]
+        if not same_answer(own, other):
+            same_class = bool(own) and bool(other) and decision_class(own[-1]) == decision_class(other[-1])
+            how["pixel_over_50px" if same_class else "class"] += 1
+    different = sum(how.values())
+    return {"n": len(states), "different": different, "rate": _rate(different, len(states)),
+            "different_by": dict(sorted(how.items()))}
+
+
+def language_gate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """L (ledger EXP-32 F): on O5's states, the candidate's instruction sensitivity >= the base's - 5.0 pt, compared
+    in whole counts (a value exactly on the line passes).  It is read only when every correction with a donor has
+    both shuffled answers; otherwise it fails here and ``verdict_exp32`` calls the pass invalid."""
+    with_donor = _o5_states(rows)
+    measured = [r for r in with_donor if _has_shuffled(r)]
+    n = len(measured)
+    on, off = instruction_sensitivity(measured, "on"), instruction_sensitivity(measured, "off")
+    complete = bool(n) and n == len(with_donor)
+    value = Fraction(on["different"], n) if n else None
+    base = Fraction(off["different"], n) if n else None
+    threshold = base - L_MAX_DROP if n else None
+    return _criterion(
+        value, threshold, ">=", complete and value >= threshold, n=n, on_different=on["different"],
+        base_different=off["different"], base_rate=_num(base), delta=_num(value - base) if n else None,
+        max_drop=float(L_MAX_DROP), on_different_by=on["different_by"], base_different_by=off["different_by"],
+        corrections_without_donor=sum(1 for r in rows if r.get("label_kind") == "correction") - len(with_donor),
+        corrections_not_decoded_shuffled=len(with_donor) - n, measured_every_correction_with_donor=complete,
+    )
+
+
+def _l_problems(lang: Mapping[str, Any], o4: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Why L cannot be read: an O5 state without its shuffled answers, or rows that are not the ones ``o4`` was
+    scored from (row count, O5's state count and its shuffled agreeing rates must all be ``o4``'s)."""
+    problems = []
+    if not lang["measured_every_correction_with_donor"]:
+        problems.append(f"L not measured on every correction with a donor: {lang['corrections_not_decoded_shuffled']} "
+                        f"of them have no shuffled answer" if lang["n"] else "L: no correction with a shuffled answer")
+    measured = [r for r in _o5_states(rows) if _has_shuffled(r)]
+    k = len(measured)
+    o5 = _o5_criterion(o4)
+    found = (len(rows), k, _rate(_shuffled_agreeing(measured, "on"), k), _rate(_shuffled_agreeing(measured, "off"), k))
+    scored = (((o4.get("join") or {}).get("stats") or {}).get("rows"), o5.get("n"), o5.get("on_rate_shuffled"),
+              o5.get("base_rate_shuffled"))
+    if found != scored:
+        problems.append(f"L: the rows file (rows, O5 states, shuffled agreeing rates on/off {list(found)}) is not the "
+                        f"one --o4 was scored from ({list(scored)})")
+    return problems
+
+
+def next_step_exp32(groups: Mapping[str, bool], attempt: int, *, m_learnt: bool | None) -> str:
+    """The pre-registered consequence of one EXP-32 gate pass (ledger EXP-32 F, "重试只有一次，类型预先定").
+
+    ``m_learnt``: rft_gate.json's M (D_M >= 0.15; None: not measured), read only when R alone failed; None
+    there gives "invalid", since the retry type cannot be read.
+    """
+    if all(groups[g] for g in GROUPS_EXP32):
+        return "val"
+    if attempt >= 2 or not groups["L"]:
+        return "kill"
+    if not all(groups[g] for g in HARM_GROUPS_EXP32):
+        return "scale_0.5" if groups["R"] else "kill"
+    if m_learnt is None:
+        return "invalid"
+    return "kill" if m_learnt else "retrain_2_epochs"
+
+
+def verdict_exp32(*, o1: Mapping[str, Any], o2: Mapping[str, Any], o3: Mapping[str, Any], o4: Mapping[str, Any],
+                  o4_rows: Sequence[Mapping[str, Any]], rgate: Mapping[str, Any], attempt: int) -> dict[str, Any]:
+    """EXP-32's verdict.  ``o1``-``o4`` as for ``verdict``; ``o4_rows``: ``score``'s rows beside ``o4`` (L);
+    ``rgate``: ``scripts/exp32/rft_gate.py score``'s rft_gate.json (R: its ``gate``, which is M when R is
+    report-only; its ``M.learnt`` picks the retry after R alone fails)."""
+    if rgate.get("schema") != RFT_GATE_SCHEMA:
+        raise ValueError(f"the R input is not scripts/exp32/rft_gate.py score's rft_gate.json "
+                         f"(schema {rgate.get('schema')!r})")
+    base = gate_groups(o1, o2, o3, o4)
+    valid4 = bool(o4.get("valid"))
+    lang = language_gate(o4_rows)
+    gate = rgate.get("gate") or {}
+    r_readable = bool(rgate.get("valid")) and gate.get("uses") in ("R", "M") and gate.get("pass") is not None
+    groups = {name: base[name] for name in HARM_GROUPS_EXP32}
+    groups["L"] = valid4 and bool(lang["pass"])
+    groups["R"] = r_readable and bool(gate["pass"])
+    m = rgate.get("M") or {}
+    m_learnt = m.get("learnt") if m.get("measured") else None
+    adapters = {"O4": (o4.get("join") or {}).get("adapter_sha256"), "R": rgate.get("adapter_sha256")}
+
+    problems = input_problems(o1, o2, o3, o4)
+    if valid4:
+        problems += _l_problems(lang, o4, o4_rows)
+    if not rgate.get("valid"):
+        problems.append(f"R/M measurement invalid (rft_gate.json): {rgate.get('invalid')}")
+    elif not r_readable:
+        problems.append(f"R cannot be read: gate {dict(gate)}")
+    elif valid4 and adapters["O4"] != adapters["R"]:
+        problems.append(f"R/M were decoded with adapter {adapters['R']}, O4 with {adapters['O4']}: R must read the "
+                        "adapter O1-O4 gate (after scale_0.5, the scaled copy)")
+    step = next_step_exp32(groups, attempt, m_learnt=m_learnt) if not problems else "invalid"
+    if step == "invalid" and not problems:
+        problems.append("only R failed and M was not measured (rft_gate.py score without --m-states): the retry type "
+                        "cannot be read")
+    measured = not problems
+    notes = list(problems)
+    if r_readable and gate.get("uses") == "M":
+        notes.append(f"R is report-only ({(rgate.get('R') or {}).get('divergent')} divergent states with B3's "
+                     "seed-2024 pass, under 150): M (D_M >= 0.15) stands in for it")
+    if _o5_criterion(o4).get("delta_corr_nonpositive"):
+        notes.append("O5 (report-only) compares against delta_corr <= 0: its ratio says nothing about language; L "
+                     "gates language")
+    sizes = {"O1": o1.get("n"), "O2": o2.get("n"), "O3": (o3.get("inputs") or {}).get("rows_in_file")}
+    for name, size in sizes.items():
+        if size != LEDGER_SIZES_EXP32[name]:
+            notes.append(f"{name}: {size} {'calls' if name == 'O3' else 'samples'}, the ledger's "
+                         f"{LEDGER_SIZES_EXP32[name]}")
+    notes += _reference_notes(o1, o2, o4)
+    notes += [f"rft_gate: {note}" for note in rgate.get("notes") or []]
+    return {
+        "schema": VERDICT_SCHEMA_EXP32,
+        "rules": "ledger EXP-32 第二部分 F, written before any part-1 reading",
+        "attempt": attempt,
+        "groups": groups,
+        "report_only_groups": {name: base[name] for name in REPORT_ONLY_EXP32},
+        "all_pass": measured and all(groups.values()),
+        "measured": measured,
+        "next": step,
+        "next_rule": RETRY_RULES_EXP32[step],
+        "O1": o1,
+        "O2": o2,
+        "O3": o3["O3_exp28"],
+        "O4": o4.get("O4"),
+        "O5": o4.get("O5"),
+        "L": lang,
+        "R": {key: rgate.get(key) for key in ("valid", "invalid", "gate", "R", "M", "R_fail", "delta_R_minus_R_fail")},
+        "G_A": o3.get("G_A"),
+        "adapter_sha256": adapters,
         "notes": notes,
     }
 
@@ -1033,25 +1258,30 @@ def run_verdict(args: argparse.Namespace) -> int:
     def load(path: str) -> dict[str, Any]:
         return json.loads(Path(path).read_text(encoding="utf-8"))
 
+    exp32 = args.rules == "exp32"
+    title = "EXP-32" if exp32 else "EXP-28"
     try:
-        result = verdict(
-            o1=compare_agreement(agreement_rows(args.o1), agreement_rows(args.o1_base), reference=O1_REFERENCE),
-            o2=compare_agreement(agreement_rows(args.o2), agreement_rows(args.o2_base), reference=O2_REFERENCE),
-            o3=load(args.o3),
-            o4=load(args.o4),
-            attempt=args.attempt,
-        )
+        o1 = compare_agreement(agreement_rows(args.o1), agreement_rows(args.o1_base), reference=O1_REFERENCE)
+        o2 = compare_agreement(agreement_rows(args.o2), agreement_rows(args.o2_base), reference=O2_REFERENCE)
+        if exp32:
+            result = verdict_exp32(o1=o1, o2=o2, o3=load(args.o3), o4=load(args.o4), o4_rows=read_rows(args.o4_calls),
+                                   rgate=load(args.rgate), attempt=args.attempt)
+        else:
+            result = verdict(o1=o1, o2=o2, o3=load(args.o3), o4=load(args.o4), attempt=args.attempt)
     except (ValueError, KeyError, OSError) as err:  # json errors are ValueErrors
         # A missing or foreign input: nothing was judged (exit 2, never the FAIL of exit 1).
-        print(f"INVALID EXP-28 offline gates attempt {args.attempt}: {type(err).__name__}: {err}", flush=True)
+        print(f"INVALID {title} offline gates attempt {args.attempt}: {type(err).__name__}: {err}", flush=True)
         return 2
-    result["inputs"] = {k: str(Path(getattr(args, k)).resolve()) for k in ("o1", "o1_base", "o2", "o2_base", "o3", "o4")}
+    keys = ("o1", "o1_base", "o2", "o2_base", "o3", "o4") + (("o4_calls", "rgate") if exp32 else ())
+    result["inputs"] = {k: str(Path(getattr(args, k)).resolve()) for k in keys}
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=1, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     groups = " ".join(f"{k}={'pass' if v else 'FAIL'}" for k, v in result["groups"].items())
+    if exp32 and (result["R"].get("gate") or {}).get("uses") == "M":
+        groups += " (R read from M: R is report-only)"
     head = "PASS" if result["all_pass"] else ("FAIL" if result["measured"] else "INVALID")
-    print(f"{head} EXP-28 offline gates attempt {args.attempt}: {groups} -> next: {result['next']}", flush=True)
+    print(f"{head} {title} offline gates attempt {args.attempt}: {groups} -> next: {result['next']}", flush=True)
     for note in result["notes"]:
         print(f"[verdict] {note}", file=sys.stderr)
     return 0 if result["all_pass"] else (1 if result["measured"] else 2)
@@ -1093,7 +1323,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sco.add_argument("--scenes-dir", required=True, help="holds <scene>/<scene>.navmesh (the labeller's)")
     sco.add_argument("--episodes", nargs="*", default=[], help="R2R-CE-format split json.gz, as given to the labeller")
 
-    ver = sub.add_parser("verdict", help="O1-O5 and the pre-registered next step")
+    ver = sub.add_parser("verdict", help="O1-O5 (or EXP-32's O1-O4, L, R) and the pre-registered next step")
     ver.add_argument("--o1", required=True, help="teacher_forced_agreement.py summary, candidate, B3's 5 scenes")
     ver.add_argument("--o1-base", required=True, help="the same samples, base model")
     ver.add_argument("--o2", required=True, help="teacher_forced_agreement.py summary, candidate, r2r held-out")
@@ -1102,7 +1332,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ver.add_argument("--o4", required=True, help="this script's score output (O4 and O5)")
     ver.add_argument("--attempt", type=int, choices=(1, 2), default=1, help="2: the one retry")
     ver.add_argument("--output", required=True)
-    return parser.parse_args(argv)
+    ver.add_argument("--rules", choices=("exp28", "exp32"), default="exp28",
+                     help="exp28: ledger EXP-28 D (O1-O5); exp32: ledger EXP-32 第二部分 F (O1-O4 without O4's "
+                          "correction item, L, R; needs --rgate)")
+    ver.add_argument("--o4-calls", default="", help="exp32: score's rows for L (default: <o4 stem>.calls.jsonl)")
+    ver.add_argument("--rgate", default="", help="exp32: scripts/exp32/rft_gate.py score's rft_gate.json")
+    args = parser.parse_args(argv)
+    if args.command == "verdict":
+        if args.rules == "exp32" and not args.rgate:
+            ver.error("--rules exp32 needs --rgate (scripts/exp32/rft_gate.py score's rft_gate.json)")
+        if args.rules == "exp28" and (args.rgate or args.o4_calls):
+            ver.error("--rgate and --o4-calls are read only under --rules exp32")
+        if args.rules == "exp32" and not args.o4_calls:
+            args.o4_calls = str(Path(args.o4).with_suffix(".calls.jsonl"))
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:

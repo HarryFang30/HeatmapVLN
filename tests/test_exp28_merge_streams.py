@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter
 
 import numpy as np
@@ -41,18 +42,21 @@ DEFAULT_LABELER = RouteLabelConfig().digest()
 
 
 def _dagger_stream(out, samples, shard_size=8, holdout=("00481-5jLhtVmWd5F",), knobs=None,
-                   train=("kfPV7w3FaU5",), labelers=None, anchors_capped=False):
-    """A DAgger stream manifest as build_route_stream.py --no-pad writes it (the fields merge reads)."""
+                   train=("kfPV7w3FaU5",), labelers=None, anchors_capped=False, builder=rs.BUILDER, labels=True,
+                   drawn=None):
+    """A DAgger stream manifest as build_route_stream.py --no-pad writes it (the fields merge reads).
+    ``builder`` / ``labels=False`` / ``drawn`` give the RFT stream's (build_rft_stream.py: no labels)."""
     keys = hashlib.sha256("\n".join(s.key + "|" + "\x1f".join(s.turns) for s in samples).encode()).hexdigest()
     knobs = dict({**ms.EXP28_DAGGER_KNOBS, "train_scenes_file": "/x/train_scenes.txt"} if knobs is None else knobs)
+    selection = {"selected_keys_sha256": keys, "knobs": knobs, "train_scenes": {"scenes": list(train)},
+                 "composition": {"anchors_capped_by_pool": anchors_capped}}
+    if labels:
+        selection["labels"] = {"labelers": labelers or {DEFAULT_LABELER: 1}, "lines": {"B": 1}}
     return _write_stream(out, samples, shard_size, {
-        "schema": rs.UNPADDED_SCHEMA, "builder": rs.BUILDER, "seed": 42, "replay_fraction": 0.0,
-        "holdout": {"scenes": list(holdout)}, "record_roots": ["/r"], "label_roots": ["/l"], "replay_root": "",
-        "selection": {"selected_keys_sha256": keys, "knobs": knobs,
-                      "train_scenes": {"scenes": list(train)},
-                      "labels": {"labelers": labelers or {DEFAULT_LABELER: 1}, "lines": {"B": 1}},
-                      "composition": {"anchors_capped_by_pool": anchors_capped}},
-        "drawn": {"dagger": len(samples), "category_B_anchor": len(samples)}})
+        "schema": rs.UNPADDED_SCHEMA, "builder": builder, "seed": 42, "replay_fraction": 0.0,
+        "holdout": {"scenes": list(holdout)}, "record_roots": ["/r"], "label_roots": ["/l"] if labels else [],
+        "replay_root": "", "selection": selection,
+        "drawn": drawn or {"dagger": len(samples), "category_B_anchor": len(samples)}})
 
 
 def _replay_samples(scenes, per_scene, stops_per_scene, rng):
@@ -67,9 +71,11 @@ def _replay_samples(scenes, per_scene, stops_per_scene, rng):
     return [out[int(i)] for i in rng.permutation(len(out))]
 
 
-def _replay_stream(tmp_path, samples, shard_size=8, stop_upsample=5, holdout=()):
+def _replay_stream(tmp_path, samples, shard_size=8, stop_upsample=5, holdout=(), root_scenes=None):
+    """``root_scenes``: replay root name -> its scene dirs (default: r2r and ScaleVLN, EXP-28's R8)."""
     roots = {}
-    for name, scenes in (("r2r", R2R_SCENES), ("scalevln", HM3D_SCENES + ["00481-5jLhtVmWd5F"])):
+    root_scenes = root_scenes or {"r2r": R2R_SCENES, "scalevln": HM3D_SCENES + ["00481-5jLhtVmWd5F"]}
+    for name, scenes in sorted(root_scenes.items()):
         roots[name] = tmp_path / f"root_{name}"
         for scene in scenes:
             (roots[name] / scene).mkdir(parents=True)
@@ -330,3 +336,115 @@ def test_a_dagger_sample_outside_the_training_scenes_is_refused_always(tmp_path)
     for extra in ((), ("--allow-other-rules",)):
         with pytest.raises(SystemExit, match="outside the stream's training scenes"):
             ms.main(_merge_argv(dagger, replay, held, tmp_path / "out", *extra))
+
+
+# --------------------------------------------------------------------------- #
+# EXP-32 (T1): the RFT stream as the DAgger part, one r2r replay root at 20%
+# --------------------------------------------------------------------------- #
+RFT_BUILDER_STRING = "scripts/exp32/build_rft_stream.py (EXP-32)"
+# the knobs build_rft_stream.py writes: not EXP-28's (no labels, 6 anchors per episode, no R2 cap)
+RFT_KNOBS = {"first_calls": 48, "min_distance": 3.0, "drop_reversals": True, "no_pad": True,
+             "max_anchors_per_episode": 6, "anchor_ratio": 1.0, "anchor_seed": 32, "max_trajectories_per_episode": 2,
+             "train_scenes_file": "/x/train_scenes.txt", "holdout_scenes_file": "/x/heldout_scenes.txt"}
+
+
+def _rft_samples(n, stop_at=None):
+    out = []
+    for i in range(n):
+        tag, turns = ("g", ("↓", f"{200 + i % 50} 300")) if i % 2 else ("p1", ("←←",))
+        if i == stop_at:
+            turns = ("STOP",)
+        out.append(_sample(f"kfPV7w3FaU5_{i // 10:06d}#{tag}.{i % 10}", "dagger", turns))
+    return out
+
+
+def _rft_stream(out, samples, shard_size=8):
+    drawn = {"dagger": len(samples), "category_rft_p1": sum("#p1." in s.key for s in samples),
+             "category_rft_r0s": 0, "category_rft_p2": 0, "category_rft_p3": 0,
+             "category_anchor": sum("#g." in s.key for s in samples)}
+    return _dagger_stream(out, samples, shard_size=shard_size, knobs=RFT_KNOBS, builder=RFT_BUILDER_STRING,
+                          labels=False, drawn=drawn)
+
+
+def _r2r_only_replay(tmp_path, per_scene=12, stops_per_scene=1, shard_size=8):
+    samples = _replay_samples(R2R_SCENES, per_scene, stops_per_scene, np.random.default_rng(0))
+    return _replay_stream(tmp_path, samples, shard_size=shard_size, root_scenes={"r2r": R2R_SCENES})
+
+
+def test_rft_keys_parse_to_their_scene():
+    assert ms.RFT_BUILDER == "scripts/exp32/build_rft_stream.py" and RFT_BUILDER_STRING.startswith(ms.RFT_BUILDER)
+    for tag in ("p1", "r0s", "p2", "p3", "g"):
+        assert ms.sample_scene(f"kfPV7w3FaU5_000012#{tag}.37") == "kfPV7w3FaU5"
+        assert ms.sample_scene(f"00100-AAAAAAAAAAA_306510#{tag}.0") == "00100-AAAAAAAAAAA"
+
+
+def test_an_rft_stream_merges_only_with_allow_other_rules(tmp_path):
+    dagger = _rft_stream(tmp_path / "d", _rft_samples(16))
+    held = tmp_path / "held.txt"
+    held.write_text("00481-5jLhtVmWd5F\n")
+    replay = _r2r_only_replay(tmp_path)
+    argv = _merge_argv(dagger, replay, held, tmp_path / "out", "--replay-fraction", "0.2")
+    with pytest.raises(SystemExit, match="EXP-28's rules"):
+        ms.main(argv)
+    assert ms.main(argv + ["--allow-other-rules"]) == 0
+    manifest = read_manifest(tmp_path / "out")
+    assert manifest["inputs"]["dagger"]["builder"] == RFT_BUILDER_STRING
+    mismatches = manifest["selection"]["dagger_rules"]["mismatches"]
+    assert mismatches["max_anchors_per_episode"] == 6 and mismatches["labelers"] is None
+    assert manifest["selection"]["merge_rules"]["mismatches"]["replay_fraction"] == 0.2
+    assert manifest["label_roots"] == [] and manifest["record_roots"] == ["/r"]
+    assert {k: v for k, v in manifest["drawn"].items() if k.startswith("category_rft")} == {
+        "category_rft_p1": 8, "category_rft_r0s": 0, "category_rft_p2": 0, "category_rft_p3": 0}
+    assert manifest["drawn"]["category_anchor"] == 8
+    samples = [s for shard in manifest["shards"] for s in read_shard(tmp_path / "out" / shard["name"])]
+    assert sum(s.source == "dagger" for s in samples) == 16 and not any(
+        s.turns[-1] == "STOP" for s in samples if s.source == "dagger")
+
+
+def test_a_stop_target_in_an_rft_stream_is_refused_always(tmp_path):
+    dagger = _rft_stream(tmp_path / "d", _rft_samples(16, stop_at=5))
+    held = tmp_path / "held.txt"
+    held.write_text("00481-5jLhtVmWd5F\n")
+    replay = _r2r_only_replay(tmp_path)
+    with pytest.raises(SystemExit, match="target STOP"):
+        ms.main(_merge_argv(dagger, replay, held, tmp_path / "out", "--replay-fraction", "0.2", "--allow-other-rules"))
+
+
+@pytest.mark.parametrize("builder", ["scripts/tools/build_s2_train_stream.py", "scripts/exp32/other.py (EXP-32)", ""])
+def test_an_unknown_builder_is_still_refused(tmp_path, builder):
+    dagger = _dagger_stream(tmp_path / "d", _rft_samples(16), knobs=RFT_KNOBS, builder=builder, labels=False)
+    held = tmp_path / "held.txt"
+    held.write_text("00481-5jLhtVmWd5F\n")
+    replay = _r2r_only_replay(tmp_path)
+    with pytest.raises(SystemExit, match="was built by"):
+        ms.main(_merge_argv(dagger, replay, held, tmp_path / "out", "--replay-fraction", "0.2", "--allow-other-rules"))
+
+
+@pytest.mark.parametrize("n", [1, 3, 4, 255, 256, 300, 1023, 7497, 15000])
+def test_a_fifth_replay_gives_whole_shards_of_n_plus_a_quarter(n):
+    total, replay = ms.stream_size(n, 0.2, 256)
+    assert total == math.ceil((n + math.ceil(n / 4)) / 256) * 256
+    assert replay == total - n and replay >= math.ceil(n / 4)
+
+
+def test_one_r2r_root_at_a_fifth_end_to_end(tmp_path):
+    n = 300
+    dagger = _rft_stream(tmp_path / "d", _rft_samples(n), shard_size=256)
+    held = tmp_path / "held.txt"
+    held.write_text("00481-5jLhtVmWd5F\n")
+    replay = _r2r_only_replay(tmp_path, per_scene=110, stops_per_scene=2, shard_size=256)
+    out = tmp_path / "out"
+    assert ms.main(["--dagger-stream", str(dagger), "--replay-stream", str(replay), "--holdout-scenes-file", str(held),
+                    "--out-dir", str(out), "--replay-fraction", "0.2", "--replay-shares", "equal",
+                    "--allow-other-rules", "--workers", "1"]) == 0  # shard 256, global batch 64, world size 8
+    manifest = read_manifest(out)
+    expected = math.ceil((n + math.ceil(n / 4)) / 256) * 256
+    assert manifest["total_samples"] == expected == 512 and manifest["num_shards"] == 2
+    assert manifest["drawn"]["replay"] == expected - n == manifest["drawn"]["replay_root_r2r"]
+    assert manifest["selection"]["composition"]["replay_by_dataset"] == {"r2r": expected - n}
+    assert manifest["selection"]["merge_rules"]["mismatches"] == {
+        "replay_fraction": 0.2, "replay_by_dataset": {"r2r": expected - n}}
+    samples = [s for shard in manifest["shards"] for s in read_shard(out / shard["name"])]
+    assert len(samples) == expected and Counter(s.source for s in samples) == {"dagger": n, "replay": expected - n}
+    stops = Counter(s.key for s in samples if s.turns == ("STOP",))
+    assert all(v == 5 for v in stops.values())  # STOP copies whole; STOPs only in replay
