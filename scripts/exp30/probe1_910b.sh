@@ -10,13 +10,14 @@ until [[ -s "$D/data/states.jsonl" ]]; do sleep 30; done
 n=$(wc -l < "$D/data/states.jsonl"); have=$(ls "$D"/data/records/*/*.s2rec.tar 2>/dev/null | wc -l)
 log "states $n, records $have"
 source /usr/local/Ascend/ascend-toolkit/set_env.sh >/dev/null 2>&1 || true
-export PYTHONPATH="$SRC"
+export PYTHONPATH="$SRC:$R/rpc/src"
 mkdir -p "$OUT" "$R/tmp/probe1"
 export TMPDIR="$R/tmp/probe1"
 cd "$SRC" || exit 2
 pids=()
 for i in 0 1 2 3 4 5 6 7; do
-  ASCEND_RT_VISIBLE_DEVICES=$i $P scripts/exp30/probe_decode.py --states "$D/data/states.jsonl" --record-parent "$D/data" \
+  mkdir -p "$R/tmp/probe1/$i"
+  ASCEND_RT_VISIBLE_DEVICES=$i TMPDIR="$R/tmp/probe1/$i" $P scripts/exp30/probe_decode.py --states "$D/data/states.jsonl" --record-parent "$D/data" \
     --model-path "$R/InternNav_Model" --out "$OUT" --shard "$i/8" --device npu > "$D/decode_$i.log" 2>&1 &
   pids+=($!)
 done
