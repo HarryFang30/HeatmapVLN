@@ -3,9 +3,10 @@
 给要把导航模型接到宇树 Go2 上的同事。机器狗一侧走实验室的 ROS 2 底座 `robot_platform_ws`：相机和运动都由底座提供，
 本文写的是我们这个项目怎么接上去。一页纸的摘要见 [`README.md`](README.md)。
 
-> **状态（2026-10-16）**：没有在任何真机上跑过。机器人侧客户端 `NavAgent` 接 4090 上的真服务端时，
+> **状态（2026-10-21）**：没有在任何真机上跑过。机器人侧客户端 `NavAgent` 接 4090 上的真服务端时，
 > SDPA 和 flash-attention 2 下都在 4 集仿真上与部署的评测客户端逐调用相同（附录 C）。接底座的一侧（§6）只有示意代码，
-> 只在模拟的底座客户端上跑通过；下视相机按计划换下一路环视来装（§6.2），还没装。
+> 只在模拟的底座客户端上跑通过。相机方案（2026-10-21 定）：一台 D455 装在支架上，约 0.7–1 m、固定下倾 15°，
+> 前视图和下视图都用它的同一帧（§6.2），还没装。
 
 | 代码 | 作用 |
 |---|---|
@@ -49,7 +50,7 @@
         │                                   │
         │ 宇树接口（DDS）                    │ USB
         ▼                                   ▼
-Go2 EDU：自带前视相机、运动             下视相机 down_camera（下倾 30°，接在换下的 camera2 的 USB 口，§6.2）
+Go2 EDU：运动（自带前视相机只做记录）  支架上的 D455（约 0.7–1 m、下倾 15°，接在换下的 camera2 的 USB 口，§6.2）
                                         左侧环视 left_camera（只做记录）
 ```
 
@@ -89,8 +90,8 @@ with NavAgent("127.0.0.1:52400", "127.0.0.1:52500") as agent:   # 模型服务�
         pitch = action.camera_pitch_deg         # LOOK_DOWN 为 −30，其余为 0
 ```
 
-`robot.*` 在这里是示意。接底座时取图和动作都走底座的 ROS 客户端，`capture(pitch)` 在 `pitch < 0` 时读下视相机、
-否则读前视相机，完整写法见 §6.5。
+`robot.*` 在这里是示意，写的是仿真里的语义（相机能转）。接底座时取图和动作都走底座的 ROS 客户端，而且相机是一台固定下倾的 D455：
+三个输入传同一帧，`pitch` 用不上，完整写法见 §6.5。
 
 ### 2.2 输入
 
@@ -109,11 +110,12 @@ with NavAgent("127.0.0.1:52400", "127.0.0.1:52500") as agent:   # 模型服务�
 | 输入 | 什么时候要 | 是什么 |
 |---|---|---|
 | `front_rgb` | 每次 `act()` | 上一个动作做完、停稳后，在**当前位姿**拍的图。俯仰 = 上一个动作的 `camera_pitch_deg`：通常水平；上一个动作是 `LOOK_DOWN` 时是下倾 30° |
-| `lookdown_fn()` | 只在这一步要规划时调，每步最多一次（约每 1–4 步一次） | 同一位姿、**相对水平下倾 30°** 的图。慢系统在这张图上找像素目标，快系统也拿它当输入，不能省，也不能拿前视图冒充 |
-| `level_fn()` | 只在一种情况下调：上一个动作是 `LOOK_DOWN`，而这一步从队列里取到 STOP、当场重新规划。每步最多一次，先于 `lookdown_fn()` | 同一位姿、**水平**的图 |
+| `lookdown_fn()` | 只在这一步要规划时调，每步最多一次（约每 1–4 步一次） | 仿真里是同一位姿、**相对水平下倾 30°** 的图。慢系统在这张图上找像素目标，快系统也拿它当输入，不能省。用一台已经固定下倾的相机时，就传这一步的同一帧（InternNav 实机的做法，§6.2）；不要传一张水平的图 |
+| `level_fn()` | 只在一种情况下调：上一个动作是 `LOOK_DOWN`，而这一步从队列里取到 STOP、当场重新规划。每步最多一次，先于 `lookdown_fn()` | 仿真里是同一位姿、**水平**的图。单台固定相机时也传同一帧 |
 
-用一台带云台的相机时，`lookdown_fn` / `level_fn` 返回前要把相机恢复水平。用两台固定相机时（接底座就是这样：前视用自带的 `front_camera`，下视相机还要另加，§6.2），
-`lookdown_fn` 读下视相机，`level_fn` 读前视相机，不用管恢复（§6.2）。
+三张图怎么取，看相机怎么装：
+- 一台带云台的相机（仿真就是这样）：`lookdown_fn` 压到 −30° 拍，`level_fn` 水平拍，返回前都把相机恢复水平。
+- 一台固定下倾的相机（接底座的方案，§6.2）：三个输入都传这一步的同一帧，`LOOK_DOWN` 时什么都不用做。
 
 **三张图的格式都一样：**
 
@@ -121,7 +123,7 @@ with NavAgent("127.0.0.1:52400", "127.0.0.1:52500") as agent:   # 模型服务�
 |---|---|---|
 | 类型 | `numpy.ndarray`，`dtype=uint8`，形状 `(480, 640, 3)`，**RGB** 顺序 | 不是数组抛 `TypeError`，形状或 dtype 不对抛 `ValueError`。**不会替你缩放**。OpenCV 读出的是 BGR，要先 `cv2.cvtColor(img, cv2.COLOR_BGR2RGB)`，否则不报错但结果错 |
 | 视场 | 水平 79°（4:3 时垂直约 63.5°），针孔模型 | 仿真值。真实相机要先去畸变，再居中裁到水平 79°、4:3，最后缩放到 640×480（`to_model_frame`，§6.4）。水平小于 79°、或垂直小于 63.5° 的相机补不回来；16:9 的画面受限的是垂直方向，水平要 ≥ 约 95.5° |
-| 安装 | 离地 1.25 m，朝正前方；前视水平，下视下倾 30° | 仿真值。装不到时记下实际高度和俯角 |
+| 安装 | 离地 1.25 m，朝正前方；前视水平，下视下倾 30° | 仿真值。实机按 §6.2：D455 约 0.7–1 m、固定下倾 15°，记下实际高度和俯角 |
 | 曝光等 | 无要求 | 仿真里没有运动模糊、自动曝光；真机效果未知 |
 
 ### 2.3 输出
@@ -133,7 +135,7 @@ with NavAgent("127.0.0.1:52400", "127.0.0.1:52500") as agent:   # 模型服务�
 | `FORWARD` | 1 | 沿当前朝向直行 0.25 m | 水平 |
 | `TURN_LEFT` | 2 | 原地逆时针转 15° | 水平 |
 | `TURN_RIGHT` | 3 | 原地顺时针转 15° | 水平 |
-| `LOOK_DOWN` | 5 | 车体不动 | 下倾 30°（两台相机时：改读下视相机） |
+| `LOOK_DOWN` | 5 | 车体不动 | 仿真里下倾 30°；单台固定下倾相机时照常取 |
 | `STOP` | 0 | 停下，本集结束（`agent.done` 变真） | 不再调用 `act()` |
 
 `action.camera_pitch_deg` 给出下一帧的俯仰（`LOOK_DOWN` 为 −30.0，其余 0.0）；常量
@@ -380,66 +382,73 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
 
 **本节的状态**：机器狗一侧走实验室的 ROS 2 底座 `robot_platform_ws`（下称"底座"）。依据是底座 2026-10-12 版的 README、VALIDATION、
 `docs/project_integration.md`、`docs/remote_inference.md`、`config/platform.yaml` 和 `src/robot_platform/robot_platform/ros_client.py`
-（底座的工作区，不在本仓库）。底座本身在真机上验证过取图和相对动作，PanaV 项目用它在真机上走完过一条完整路线；
-**我们的模型还没有接上去跑过**，§6.5 的代码只在模拟的底座客户端上跑通过（附录 C）。
+（底座的工作区，不在本仓库）；相机方案照 InternNav / DualVLN 在 Go2 上的实机做法（附录 D）。底座本身在真机上验证过取图和相对动作，
+PanaV 项目用它在真机上走完过一条完整路线；**我们的模型还没有接上去跑过**，§6.5 的代码只在模拟的底座客户端上跑通过（附录 C）。
 
 ### 6.1 底座给什么，我们用什么
 
 | 底座接口 | 我们怎么用 |
 |---|---|
-| `/platform/cameras/front_camera/frame`（客户端 `get_frame('front_camera')`） | `front_rgb` 和 `level_fn()` |
-| `/platform/cameras/down_camera/frame`（按 §6.2 加进底座的下倾 30° 相机，还没装） | `lookdown_fn()`，以及 `LOOK_DOWN` 之后那一帧的 `front_rgb` |
+| `/platform/cameras/nav_camera/frame`（按 §6.2 加进底座的 D455，客户端 `get_frame('nav_camera')`，还没装） | `front_rgb`、`lookdown_fn()`、`level_fn()` 都用它的同一帧 |
 | `/platform/relative_motion`（`move_relative`） | 执行 `FORWARD`、`TURN_LEFT`、`TURN_RIGHT` |
 | `/platform/acquire_control`、`heartbeat`、`release_control` | 一集开始拿控制权，结束或出错时释放；心跳由客户端的后台线程每 0.25 s 发一次 |
 | `/platform/stop` | 人工急停 |
-| `/platform/odom`、`/platform/observation`、环视相机 | 不进模型：位姿由 4090 上的里程计服务端从图像估计；环视只用于记录 |
+| `/platform/odom`、`/platform/observation`、自带前视 `front_camera`、环视 `left_camera` | 不进模型：位姿由 4090 上的里程计服务端从图像估计；两路相机只用于记录 |
 
 - 底座默认只读。只有用 `./platform run --allow-motion` 启动、而且我们拿到了控制权，底座才会让狗动。
 - **运动只走底座**：底座独占宇树的运动出口。不要在狗上另跑宇树 SDK、`sport_mode_ctrl` 或旧导航节点去发运动指令，会和底座争控制。
 - 同一时刻只有一个项目能持有控制权：PanaV 在跑时我们拿不到，反之亦然。
 - 这和 PanaV 的接法一样：图像和动作走底座的 ROS 接口，模型推理走另一条路（PanaV 用 HTTP，我们用 gRPC 隧道，§4）。
 
-### 6.2 图像：前视相机和下视图
+### 6.2 相机：一台 D455，装在支架上、固定下倾 15°
 
-**前视 `front_camera`**：Go2 自带的前视相机，底座通过宇树的 videohub 接口取图，是底座给导航模型的默认输入。
+2026-10-21 定的方案，还没装。
 
-- `robot.get_frame('front_camera', wait_new=True)` 返回 `{'jpeg': bytes, 'metadata': dict}`。底座实测是 1920×1080 的 JPEG，
-  配置 5 fps；元数据里有 `available`、`warming_up`、`age`、`width`、`height` 和 `calibrated`（现在是 false）。
-  客户端只返回 1 s 内到达的帧，等不到就抛 `RosPlatformError`。
-- 相机打开后，或者一次取图失败（例如宇树接口 0.8 s 没回应）之后，都有 5 s 预热，期间不发布图像。
-  所以每次 `get_frame` 的超时都要留到 6 s 以上（示意代码传 `timeout=10`），不只是第一帧。
-- 时间戳是底座收到图像的时间，相机不给采集时间。
-- **它和仿真里的相机差得很远**（§2.2 的要求）：
-  - 离地约 0.37–0.40 m（按官方 URDF 推算），仿真是 1.25 m。底座验收时存的样图就是贴着地面的视角。
-  - 广角，从底座存的样图看画面边缘有明显的桶形畸变；底座没有标定内参。官方写自带相机水平 100°、垂直 56°（指 1280×720），1920×1080 这一路没有数据。
-  - 所以先用棋盘格标一次内参，再按 §6.4 去畸变、裁到水平 79°、垂直 63.5°。官方的水平 100° 看着够（16:9 要 ≥ 约 95.5°），
-    但那是带畸变的画面；垂直只有 56°，去畸变以后只会更小，所以这一步多半会报错（以标定结果为准）。那就只能退一步：
-    居中裁成 4:3 再缩放（PanaV 就是这样做的），结果按"视场与训练不同"来读。
-- 视点是最大的风险（附录 A）：模型只在 1.25 m 高、水平、79° 的视角上训练过。
+**为什么这样装**（InternNav / DualVLN 在 Go2 上的实机做法，出处见附录 D）：
 
-**下视图：换下一路环视，装一台下倾 30° 的 USB 相机**（2026-10-16 定的方案，还没装）。
+- DualVLN 的实机实验用了 Turtlebot4、Go2 和 G1 三台机器人，都用 RealSense D455，"装在不同高度、下倾 15°"，模型放在远端 RTX 4090 上
+  （论文 §5.2；论文那时 Go2 上其实是两台相机，见下面 #295）。
+- Go2 上他们用官方 3D 打印件：`go2_stand.STEP` 把相机抬到约 0.7 m，`downwards_slope.3mf` 让相机下倾约 15°（维护者在 issue #194 的说法）。
+  维护者另外建议 Go2 上相机约 1 m（#295）；对别的机器人也说过 1 m 左右、要有下倾（#327，一台小车），至少 0.6 m（#175，G1 上的问题）。
+- **实机里的"下视"不转相机**：模型输出 `↓` 时，服务端把同一帧当下视图再跑一次（InternNav `scripts/realworld/http_internvla_server.py`）；
+  官方样例数据里 38 张下视图都和前一帧逐字节相同。早期他们在 Go2 上装过一台水平、一台下倾的两台相机，
+  维护者说改成一台对实机成功率没有明显影响（没给数字），之后只用下倾那一台（#295）。
+- 能这样用，是因为训练数据里本来就混了这种视角：除了仿真标准的 1.25 m 水平前视加 30° 下视（`125cm_0_30`），
+  还有 0.6 m、固定下倾 15° 或 30°、前视和下视用同一张图的数据（`60cm_15_15`、`60cm_30_30`）。维护者说加这些数据就是为了在
+  Go2、G1 这类高度不同的机器人上部署（#352）。
+- **对我们的模型**：慢系统和快系统是冻结的 InternVLA-N1 发布权重（`configs/ppa_action_refine_v2_8gpu.yaml` 只训
+  `past_plan_action` 和 `heatmap_vln`，其余在 `frozen_modules`）。维护者说这版权重训练时混了多视角数据（#295），开源训练脚本里有
+  0.6 m、下倾 15° 的数据（`60cm_15_15`）；0.7–1 m、下倾 15° 没有现成的训练视角，所以 0.7 m 离训练视角更近，1 m 是维护者的建议。
+  我们自己训练的历史认知和桥只见过 1.25 m 水平的视角，这一块在新视角下表现如何，要先在仿真里测（附录 A）。
+- **为什么不用 Go2 自带前视**：离地约 0.4 m（按 URDF 推算），低于维护者要求的 0.6 m（#175）。有用户相机约 50 cm 时效果差
+  （#337，维护者没确认是高度的原因）；也有用户说 Go2 上不抬高相机效果还可以（#327）。
+  它保留下来只做记录。
 
-慢系统在下视图上找像素目标，快系统也拿它当输入（§2.2），不能省，也不能拿前视图冒充。底座原来没有这一路，按下面的办法补：
+**装法：**
 
-1. **换下一路环视**。底座 README 写明这台 Orin 上三路 USB 相机同时采集不稳定，所以不加第三路，而是把一路环视换成下视相机。
-   下面以换下右侧的 `camera2`（USB 端口 4.3）为例；换左侧 `left_camera` 就用它的端口 4.4。
-   代价是没有 `side_panorama` 了：它固定用 `left_camera` 和 `camera2` 两路合成。
-2. **装相机**：固定在机身上，朝正前方（左右不偏），下倾 30°。我们建议尽量贴近自带前视相机的位置和高度：仿真里前视图和下视图是
-   同一台相机转出来的，两张图最好从同一个视点拍。装牢、避免振动，最好用全局快门或运动模糊小的相机。
-   可以用新相机，也可以把换下的那只环视重新按这个朝向装（它是约 120° 的鱼眼，畸变大，标定后再用）。
-3. **改底座配置**：底座的 `config/platform.yaml` 的 `cameras` 里关掉 `camera2` 和 `side_panorama`，加一路 `down_camera`。
+1. **相机**：Intel RealSense D455，只用它的彩色图。作者建议用全局快门的 D455，不用卷帘快门的 D435 系列，后者的运动模糊影响很大（#157、#109）。
+2. **支架**：先用 InternNav 官方的 `assets/3d_printing_files/go2_stand.STEP`（相机约 0.7 m）加一个 15° 楔块。
+   官方的楔块文件 `downwards_slope.3mf` 里没有模型网格，只有拓竹打印机切好的 G-code，别的打印机或切片软件用不了；
+   照维护者说的自己画一个 15° 的三角楔块（#194）。斜装以后 D455 对不上支架的螺孔，作者是用双面胶贴相机和楔块的（#343、#329）；
+   不管怎么固定，都要装牢、避免高频振动（#335）。
+   这个支架的文件名是"MID360+相机支架"，看起来设计上同时带一台 Livox Mid-360 激光雷达；底座这台狗已经有 Mid-360（`/livox/lidar`），
+   装之前先核对能不能和现有的雷达安装共用。
+   要抬到约 1 m 就得另做更高的杆，等仿真里不同高度的对比（附录 A）出来再定。
+3. **朝向**：朝正前方、左右不偏，下倾 15°。装好后量一下镜头中心离地高度和实际俯角，记下来，写进 §6.5 的 `MOUNT`。
+4. **接进底座**：D455 走 USB，接在换下的 `camera2` 的 USB 口（4.3）。这台 Orin 上三路 USB 相机同时采集不稳定（底座 README），
+   所以换下 `camera2`、关掉 `side_panorama`（它固定用 `left_camera` 和 `camera2` 两路合成），加一路 `nav_camera`。
    这是底座的工作区，和底座的维护者一起改，改完重启底座：
 
    ```yaml
      - name: camera2
        # ……原有字段不变
        enabled: false                 # 换下的那一路
-     - name: down_camera              # 新加：下倾 30° 的下视相机，接在原 camera2 的 USB 口
-       device: /dev/v4l/by-path/platform-3610000.xhci-usb-0:4.3:1.0-video-index0
-       frame_id: down_camera_optical
+     - name: nav_camera               # 新加：支架上的 D455，只用彩色图
+       device: /dev/v4l/by-path/<彩色节点的完整 by-path 名>   # 见下面第一条
+       frame_id: nav_camera_optical
        rotation_degrees: 0            # 按实际安装方向填，只支持 0 或 180
-       width: 1280
-       height: 720                    # 相机支持 4:3 就用 4:3（例如 1280×960）：16:9 时垂直视场常常不够（§6.4）
+       width: 640
+       height: 480                    # 4:3，就是模型要的尺寸
        fps: 5
        warmup_seconds: 5.0
        enabled: true
@@ -448,18 +457,24 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
        enabled: false                 # 少了 camera2 就合成不出来
    ```
 
-   - 设备按 `/dev/v4l/by-path/` 的稳定路径认，不要按 `/dev/videoN` 编号认（重插以后编号会变）。
-   - 底座对 USB 相机一视同仁：按 `device` 打开、预热 5 s、按 `rotation_degrees` 旋转、编成 JPEG 发到
-     `/platform/cameras/down_camera/frame`，不用改底座代码；运动预检也不依赖哪一路相机。
-   - 底座自带的检查工具默认查 `side_panorama`，改完要显式传名字：`./platform cameras --cameras front_camera down_camera`
-     （图存在底座的 `runs/camera_check/`）。
-4. **标定**：和前视一样用棋盘格标一次内参（两台各标各的），再量一下实际俯角和离地高度，记下来。
-   §6.5 的 `preprocess` 每台相机用自己的内参。
+   - D455 一台会出好几个 `/dev/video` 节点（深度、红外、彩色、元数据），而且深度和彩色在不同的 USB 接口上：彩色节点常见在另一个接口
+     （例如 `...:1.3-video-index0`），不在 `camera2` 原来那个 `...:1.0`。用 `ls -l /dev/v4l/by-path/` 和
+     `v4l2-ctl -d <节点> --list-formats-ext` 找列着 YUYV 的那个，那就是彩色；`device` 把它的 by-path 名整串照抄，不要只改末尾编号。
+   - 插上以后用 `lsusb -t` 看 D455 那一行的速率：5000M 是 USB 3，480M 是 USB 2。640×480 的彩色图在 USB 2 上也能出；
+     `left_camera` 在同一个 hub 的 4.4 上，两路共用 hub 的带宽，要在 §7 第 6 步确认两路都稳定，不稳定就换口，并把 `device` 改成新口的 by-path。
+   - 底座对 USB 相机一视同仁：按 `device` 用 V4L2 打开、预热 5 s、编成 JPEG 发到 `/platform/cameras/nav_camera/frame`，不用改底座代码，
+     运动预检也不依赖哪一路相机。但底座只验证过普通 USB 相机，D455 的彩色节点能不能这样稳定打开要先试（§7 第 6 步）。
+   - 底座自带的检查工具默认查 `side_panorama`，改完要显式传名字：`./platform cameras --cameras nav_camera`。
 
-装好之前不能真跑：只能拿前视图当下视图做**接线测试**（狗不动，或空旷处），这时模型的输入是错的，结果不算数。
+**视场**：InternNav 服务端给 D455 硬编码的内参是 640×480 下 fx = fy = 386.5，算出来水平约 79°、垂直约 64°，和仿真几乎一样，
+所以 640×480 的彩色图基本不用裁（§6.4）。以这台相机的出厂内参（装了 librealsense 的话用 `rs-enumerate-devices -c` 查）或标定为准。
 
-**环视相机**：换完以后只剩左侧 `left_camera`（约 120° 的鱼眼，朝左），`side_panorama` 也关掉了。环视只用于记录，不进模型；
-要留第三视角的现场记录就订阅 `left_camera` 的原图（底座只提供图像，保存归项目自己做）。
+**取帧**：`robot.get_frame('nav_camera', wait_new=True)` 返回 `{'jpeg': bytes, 'metadata': dict}`；客户端只返回 1 s 内到达的帧，
+等不到就抛 `RosPlatformError`。相机打开后有 5 s 预热；取图失败后底座先等 2 s 再重开、再预热 5 s，期间都不发布图像，
+所以每次 `get_frame` 的超时都要留到 8 s 以上（示意代码传 `timeout=10`）。时间戳是底座收到图像的时间。
+
+**只做记录的相机**：Go2 自带前视 `front_camera`（约 0.4 m，1920×1080）和左侧环视 `left_camera` 都还在，不进模型；
+要留现场记录就订阅它们的原图（底座只提供图像，保存归项目自己做）。
 
 ### 6.3 动作：交给底座的相对动作
 
@@ -471,7 +486,7 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
 | `FORWARD` | `robot.move_relative(distance=0.25)` | 走了 0.241 m，用时 2.36 s；侧移约 2.6 cm，航向变了 +0.65° |
 | `TURN_LEFT` | `robot.move_relative(angle=math.radians(15))` | 转了 15.008°，2.42 s |
 | `TURN_RIGHT` | `robot.move_relative(angle=-math.radians(15))` | 转了 15.202°，2.24 s |
-| `LOOK_DOWN` | 不调用；下一帧改从下视相机取 | — |
+| `LOOK_DOWN` | 不调用；相机是固定的，下一帧照常取 | — |
 | `STOP` | 不调用；本集结束，`release()` | — |
 
 - `move_relative` 默认等动作做完再返回（`wait=True`，超时 30 s），返回 `{'task_id', 'state', 'reason'}`。
@@ -479,21 +494,23 @@ docker exec -it fjl-habitat bash -c 'cd /workspace/nav_src_ded4bd3 && NAV_REPO=$
 - 底座的限速是平移 0.2 m/s、旋转 0.3 rad/s（在底座 `config/platform.yaml` 的 `motion` 里）；相对动作的平移在底座代码里
   另外限到 0.15 m/s，改配置调不了。
 - 动作做完后取下一帧，要连取两次 `get_frame(..., wait_new=True)`、用第二帧。`wait_new` 只保证这一帧是调用之后才收到的，
-  不保证是调用之后才拍的：底座只记收到的时间，前视的取图请求可能在动作结束前就发出去了。第二帧的请求更晚，
-  加上底座要停稳 0.12 s 才判定动作完成，它几乎总是停稳以后的视点（§2.3），但底座不保证。配置是 5 fps，但前视每帧还要等一次宇树的取图请求（最长 0.8 s），
-  实际要等多久在 §7 量一下。
+  不保证是调用之后才拍的：底座每 0.2 s 从 V4L2 缓冲里读一帧（请求的缓冲数是 1，驱动可能多留几帧），再由每 0.2 s 一次的定时器发布，
+  所以收到的帧可能是零点几秒前拍的。第二帧晚一个读周期，加上底座要停稳 0.12 s 才判定动作完成，一般已经是停稳以后的视点（§2.3），
+  但底座不保证。§7 第 6 步对着秒表拍一次，量出从拍到收到的延迟；超过 0.2 s 就改成连取三帧、用第三帧。
 - 动作是开环的：底座走到容差内就算完成，差的那点模型只能从下一帧看出来（§2.3）。
+- 单台固定相机时 `LOOK_DOWN` 不改变下一帧。模型连续给出 `LOOK_DOWN`（中间没有别的动作），说明它在这个视角下找不到要去的地方，
+  原地转不出来；示意代码连续 3 次就按本集失败处理（§9），再按 §7 第 7 步排查。
 - 底座的实测每种动作只有几次、一种地面；长 episode、不同地面和负载下的重复性，底座文档里写着还没验证。
+- 装了支架和 D455 以后重心变高、负载变了，而底座的相对动作 PID 是在没装支架时调的：§7 第 8 步要重新核对 0.25 m 和 ±15° 的误差和耗时。
 
 ### 6.4 图像预处理
 
-底座给的是 JPEG，`act()` 要 640×480 的 RGB `uint8`（§2.2）。每张图都按同一条流程处理：
+底座给的是 JPEG，`act()` 要 640×480 的 RGB `uint8`（§2.2）。D455 按 §6.2 的配置直接出 640×480、水平约 79°，所以通常只要解码、转 RGB：
 
 1. **解码并转成 RGB**：OpenCV 解出来是 BGR，一定要转。
-2. **去畸变**：用标定时用的模型（针孔 `cv2.undistort(img, K, dist)`，鱼眼 `cv2.fisheye.undistortImage(img, K, D, Knew=K)`），
-   不传新的内参矩阵，输出仍按原内参 `K` 成像。这时 `hfov_deg = 2·atan(w / (2·fx))`，`w` 是图宽，`fx` 取自 `K`。
-   不要填产品页上的标称视场：填错不报错，只会裁错比例。
-3. **居中裁到水平 79°、4:3，缩放到 640×480**（`to_model_frame`）。这里按图像中心裁剪，主点 `cx`、`cy` 要接近图像中心。
+2. **核对视场**：用出厂内参或标定算 `hfov = 2·atan(w / (2·fx))`（`w` 是图宽）。接近 79° 就不用裁；明显大于 79° 时用下面的
+   `to_model_frame` 居中裁到 79°、4:3 再缩放（主点要接近图像中心）；小于 79° 补不回来。
+3. **畸变**：D455 彩色图畸变小，InternNav 直接用原图。换成别的相机时先去畸变（针孔 `cv2.undistort(img, K, dist)`，不传新的内参矩阵）。
 
 ```python
 import math
@@ -511,7 +528,7 @@ def decode_rgb(jpeg: bytes) -> np.ndarray:
 
 
 def to_model_frame(rgb: np.ndarray, hfov_deg: float) -> np.ndarray:
-    """去畸变后的 RGB → 居中裁到水平 79°、4:3 → 640x480 uint8（§2.2）。视场不够时报错。"""
+    """RGB → 居中裁到水平 79°、4:3 → 640x480 uint8（§2.2）。视场不够时报错。"""
     h, w = rgb.shape[:2]
     cw = w * math.tan(math.radians(39.5)) / math.tan(math.radians(hfov_deg / 2))
     ch = cw * 3 / 4
@@ -522,46 +539,48 @@ def to_model_frame(rgb: np.ndarray, hfov_deg: float) -> np.ndarray:
     return np.ascontiguousarray(cv2.resize(crop, (640, 480), interpolation=cv2.INTER_AREA))
 ```
 
-保留的宽度占比是 tan 39.5° / tan(HFOV/2)，例如水平 90° 时约 0.824。高度按 4:3 跟着算，所以垂直视场也要够 63.5°：
-16:9 的画面（自带前视就是 16:9）水平要 ≥ 约 95.5°。
+保留的宽度占比是 tan 39.5° / tan(HFOV/2)；HFOV 就是 79° 时等于 1，只剩缩放。
 
 ### 6.5 示意代码
 
 用底座的 ROS 客户端取图、执行动作，用 `NavAgent` 规划。**没有在真机或真底座上跑过**，只在一个按 `ros_client.py` 签名写的模拟客户端上
-跑通过（附录 C）。`preprocess` 是一个字典，每个相机一个函数：按 §6.4 用这台相机自己标定的内参拼好 `decode_rgb` → 去畸变 → `to_model_frame`，
-返回 640×480 RGB。两台相机的内参和视场不同，不能共用一个函数。要在 `./platform shell` 里、激活 §5 的 venv、`cd` 到本仓库后运行。
+跑通过（附录 C）。`preprocess(jpeg)` 按 §6.4 把 D455 的 JPEG 变成 640×480 RGB（通常就是 `decode_rgb`）。
+要在 `./platform shell` 里、激活 §5 的 venv、`cd` 到本仓库后运行。
 
 ```python
 import math
 
 from robot_platform.ros_client import ROSPlatformClient
 
-from src.deploy import Action, NavAgent
+from src.deploy import Action, CameraSpec, NavAgent
 
 TURN = math.radians(15)
-DOWN_CAMERA = "down_camera"      # 按 §6.2 加进底座的下视相机
+CAMERA = "nav_camera"            # §6.2 加进底座的 D455
+# 实际装出来的高度和俯角（装好量过以后改）。和仿真不同只会打一条 warning，写上是为了日志里有记录。
+MOUNT = CameraSpec(height_m=0.7, pitch_deg=-15.0, lookdown_pitch_deg=-15.0)
 
 
-def run_episode(instruction: str, run_id: int, preprocess: dict):
-    """preprocess = {"front_camera": f, DOWN_CAMERA: g}，每个函数把这台相机的 JPEG 变成 640x480 RGB（§6.4）。"""
+def run_episode(instruction: str, run_id: int, preprocess):
+    """preprocess(jpeg) -> 640x480 RGB uint8（§6.4）。"""
     with ROSPlatformClient(timeout=3.0) as robot, \
-            NavAgent("127.0.0.1:52400", "127.0.0.1:52500", on_log=print) as agent:
+            NavAgent("127.0.0.1:52400", "127.0.0.1:52500", camera=MOUNT, on_log=print) as agent:
         robot.wait_for_motion_ready(timeout=40, on_wait=print)   # 只等底座预检就绪，不拿控制权
         robot.acquire(owner="heatmapvln", mode="relative")      # 之后客户端的后台线程每 0.25 s 发心跳
         try:
-            def grab(camera):
-                robot.get_frame(camera, timeout=10, wait_new=True)          # 这一帧可能是动作结束前请求的
-                frame = robot.get_frame(camera, timeout=10, wait_new=True)  # 第二帧几乎总是停稳以后的（§6.3）
-                return preprocess[camera](frame["jpeg"])
+            def grab():
+                robot.get_frame(CAMERA, timeout=10, wait_new=True)          # 这一帧可能是动作结束前拍的
+                frame = robot.get_frame(CAMERA, timeout=10, wait_new=True)  # 第二帧几乎总是停稳以后的（§6.3）
+                return preprocess(frame["jpeg"])
 
-            front = lambda: grab("front_camera")
-            down = lambda: grab(DOWN_CAMERA)
             agent.reset(instruction, scene_id="go2lab", episode_id=run_id)   # 每次实跑换一个 run_id（§2.2）
-            pitch = 0.0
+            look_downs = 0
             while not agent.done:
-                frame = down() if pitch < 0 else front()                    # 上一个是 LOOK_DOWN 就读下视相机
-                action = agent.act(frame, down, front)                      # 规划这几秒里底座输出为零
-                pitch = action.camera_pitch_deg
+                frame = grab()
+                same = lambda: frame                                        # 下视图和水平重拍都用这一帧（§6.2）
+                action = agent.act(frame, same, same)                      # 规划这几秒里底座输出为零
+                look_downs = look_downs + 1 if action is Action.LOOK_DOWN else 0
+                if look_downs >= 3:                                         # 相机固定，LOOK_DOWN 不改变画面（§6.3）
+                    raise RuntimeError("LOOK_DOWN 3 times in a row")
                 if action is Action.FORWARD:
                     task = robot.move_relative(distance=0.25)
                 elif action is Action.TURN_LEFT:
@@ -569,7 +588,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
                 elif action is Action.TURN_RIGHT:
                     task = robot.move_relative(angle=-TURN)
                 else:
-                    continue                                                # LOOK_DOWN 不动；STOP 后 agent.done 为真
+                    continue                                                # LOOK_DOWN 不动（相机是固定的）；STOP 后 agent.done 为真
                 if task["state"] != "succeeded":
                     raise RuntimeError(f"relative motion failed: {task}")
         finally:
@@ -581,7 +600,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 
 ### 6.6 安全
 
-- **先在模拟里跑通**：`./platform run --backend sim --allow-motion` 和实机是同一套 ROS 接口，模拟后端会给 `config/platform.yaml` 里每一路已启用的相机发 256×192 的占位图（§7 第 5 步）。
+- **先在模拟里跑通**：`./platform run --backend sim --allow-motion` 和实机是同一套 ROS 接口，模拟后端会给 `config/platform.yaml` 里每一路已启用的相机（包括 `nav_camera`）发 256×192 的占位图（§7 第 5 步）。
 - **遥控器**：始终有人拿着 Go2 的遥控器跟在旁边。
 - **急停**：`ros2 service call /platform/stop std_srvs/srv/Trigger {}`，立即停止并释放控制权；程序里是 `robot.stop()`。
   这条命令要在另一个 `./platform shell` 里执行（开跑前先开好放着），保证和底座同一个 RMW、网卡和 domain。
@@ -593,7 +612,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 - **碰撞**：模型没有任何避障，底座的第一版也不做绕障。前几次在空旷房间、低速、短指令下跑。
 - **不要同时开别的运动程序**（§6.1）。
 - **步数上限**：`max_steps` 默认 500，到了返回 `STOP`（§2.3）。
-- 相机装在机身上方时，按宇树的建议关掉跌倒自动翻身，免得翻身时压坏相机和支架（找底座的维护者确认怎么关）。
+- **支架让重心变高**：摔倒时支架和相机先着地。按宇树的建议，带负载时关掉跌倒自动翻身，免得翻身时压坏支架和相机（找底座的维护者确认怎么关）。
 
 ---
 
@@ -603,25 +622,26 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 2. **Orin 装环境**：先按 §4 第 3 步在 `~/.ssh/config` 里加好 `Host 6024_fjl`，再按 §5 装环境、跑
    `python -m pytest tests/test_nav_agent.py --noconftest -q`。
 3. **开 ssh 隧道**，在 Orin 上构造一次 `NavAgent` 做连通自检（§4）。
-4. **装下视相机、改底座配置**（§6.2）：换下 `camera2`，装好下倾 30° 的相机，`platform.yaml` 里关掉 `camera2` 和
-   `side_panorama`、加 `down_camera`，重启底座。配置可以先改：模拟后端不会去打开设备。
+4. **装支架和 D455、改底座配置**（§6.2）：打印官方支架，自己画一个 15° 楔块（官方的楔块文件别的打印机用不了），装好 D455，换下 `camera2`，`platform.yaml` 里关掉
+   `camera2` 和 `side_panorama`、加 `nav_camera`，重启底座。配置可以先改：模拟后端不会去打开设备。
 5. **模拟底座 + 假服务端**：先停掉正在跑的实机底座（两者抢同一把锁），`./platform run --backend sim --allow-motion`，
    把 §6.5 里的 `NavAgent(...)` 换成 `NavAgent(FakeModelServer(), FakeVOServer())` 跑一遍，确认取图、动作、释放控制权都通。
-   模拟后端给配置里每一路已启用的相机（包括 `down_camera`）发 256×192 的占位图，所以 `preprocess` 换成只解码再缩放：
-   `f = lambda jpeg: cv2.resize(decode_rgb(jpeg), (640, 480))`，`preprocess = {"front_camera": f, "down_camera": f}`，
-   不去畸变、不按 79° 裁剪。这一步只测接线。
-6. **实机只读，只取图**：`./platform run`（不带 `--allow-motion`），先 `./platform cameras --cameras front_camera down_camera`
-   确认两路都出图。等过预热，存几帧经过 `preprocess` 的前视图和下视图，检查是不是 RGB、方向对不对、视场对不对，
-   下视相机是不是朝正前方（左右不偏）、俯角是不是 30°。
+   模拟后端给配置里每一路已启用的相机发 256×192 的占位图，所以 `preprocess` 换成只解码再缩放：
+   `lambda jpeg: cv2.resize(decode_rgb(jpeg), (640, 480))`。这一步只测接线。
+6. **实机只读，只取图**：`./platform run`（不带 `--allow-motion`），先 `./platform cameras --cameras nav_camera` 确认出图，
+   等过预热再存几帧经过 `preprocess` 的图，检查是不是 RGB、方向对不对、视场对不对。核对俯角：640×480、fy 约 386 时，
+   下倾 15° 的地平线大约在从上往下第 137 行（240 − 386 × tan 15°），可以拿远处走廊的消失点对一下。量一下镜头离地高度。
 7. **实机只读 + 真服务端**：动作只打印不执行，量规划延迟、取图等待和网络往返，和 §8 比。只读时 §6.5 的代码要去掉
    `wait_for_motion_ready`、`acquire` 和三处 `move_relative`（改成 `print(action)`），并删掉其后的 `task["state"]` 检查；
    `release` 可以留着（没拿到控制权时它直接返回）。底座没开运动时前两个会直接报错，报错文案让你加 `--allow-motion`，
-   这一步不要照做。取图不需要控制权。
-8. **允许运动，先不接模型**：`./platform run --allow-motion`，用 `move_relative` 做几次 0.25 m 和 ±15°，
-   和 §6.3 里底座的实测数对一下（换了地面或负载要重测）。
+   这一步不要照做。取图不需要控制权。模型一直输出 `↓` 或 `LOOK_DOWN`、给不出像素目标时，先看日志：`↓` 之后是不是确实又规划了、
+   `lookdown_fn()` 传的是不是这一步新取的帧（不是旧帧或空图）；接线没问题再看相机是不是太平，把俯角再压低一点。
+   维护者在 InternNav #148 说这两种都可能。
+8. **允许运动，先不接模型**：`./platform run --allow-motion`，用 `move_relative` 做几次 0.25 m 和 ±15°，和 §6.3 里底座的实测数对一下。
+   装了支架以后重心和负载都变了，这一步不能省。
 9. **接真服务端，开始动**：空旷房间、短指令，有人拿遥控器跟着。
-10. **每一步都留记录**，方便事后对照仿真：底座给的原始 JPEG（原样存，不要重新编码）、送进模型的 640×480 图、返回的动作；
-    `last_call` 的 `kind`、慢系统原文、`pose_ready`；底座返回的 `task` 结果和 `/platform/odom`；需要第三视角就存 `left_camera`。
+10. **每一步都留记录**，方便事后对照仿真：`nav_camera` 的原始 JPEG（原样存，不要重新编码）、送进模型的 640×480 图、返回的动作；
+    `last_call` 的 `kind`、慢系统原文、`pose_ready`；底座返回的 `task` 结果和 `/platform/odom`；需要第三视角就存 `left_camera` 或 `front_camera`。
 
 ---
 
@@ -634,7 +654,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 `NavAgent` 自己 09-30 接真服务端跑过 4 集、99 次调用，带历史认知的规划步 `act()` 中位 5067 ms，与下表一致。
 
 **机器人每次规划要原地等多久**（规划关键路径 = 当前图采集 + 位姿查询 + 下视图采集 + 编码 + 模型调用；中位数）。
-两次采集在仿真里是渲染，合计约 0.2 s；真机上换成读两次相机。
+两次采集在仿真里是渲染，合计约 0.2 s；真机上只在 `act()` 之前读一次相机（连取两帧），下视用同一帧，不另取图。
 
 | 调用类型 | 次数 | 规划关键路径 | 其中模型服务端 |
 |---|---:|---:|---:|
@@ -648,7 +668,7 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 |---|---:|---:|
 | 当前图采集（仿真渲染；真机换成读相机） | 117 | 172 |
 | 里程计位姿查询（含补建图） | 1359 | 1965 |
-| 下视图采集（仿真渲染；真机换成读相机） | 92 | 210 |
+| 下视图采集（仿真渲染；单台固定相机时不另取图） | 92 | 210 |
 | 编码 | 32 | 37 |
 | 模型调用往返 | 3602 | 3775 |
 | **规划关键路径** | **5258** | **5965** |
@@ -715,8 +735,10 @@ def run_episode(instruction: str, run_id: int, preprocess: dict):
 ## 附录 A 没有验证过的
 
 - 任何真实场景：真实图像、光照、运动模糊、动态障碍、动作执行误差、碰撞。
-- **我们的模型还没有接到底座上跑过**；下视相机按 §6.2 的方案还没装，装好以后它的高度、俯角、视场都要实测。
-- 与仿真不同的相机：自带前视离地约 0.4 m、广角有畸变、没有标定；下视图要用另一台相机拍（仿真里是同一台相机转动）。
+- **我们的模型还没有接到底座上跑过**；支架和 D455 还没装，D455 的彩色节点经底座的 V4L2 采集也没试过（§6.2）。
+- **相机视点和仿真不同**：仿真是 1.25 m 水平前视加同一位置下倾 30° 的下视；实机是约 0.7–1 m、固定下倾 15°，下视用同一帧。
+  冻结的慢系统和快系统在训练里见过 0.6 m、下倾 15° 的视角（InternNav 的 `60cm_15_15`），0.7–1 m 没有；我们训练的历史认知和桥都没见过。
+  仿真里不同高度、俯角的对比在另一个会话里做（结果记在 `docs/experiments/`），出来之前不知道这一块会掉多少。
 - 里程计在真实相机上的尺度（部署用固定的 `--translation-scale 1.0`），以及起步阶段只原地转圈时是否稳定。
 - 超过 500 步的长任务（里程计会话按 501 帧开，服务端上限 4096）。
 - 非英文或风格差别大的指令。
@@ -770,13 +792,15 @@ Python 3.8 一条，不影响发出的请求）；服务端代码之后有改动
 那一臂开着服务端计时、这次没开，动作仍然相同。产物在 `/workspace/nav_servers/fa2check_ded4bd3_navagent/`。
 调用数和 09-30 的 SDPA 核验不同（82 对 99），是因为两种注意力本来就走法不同（§3.2）。
 
-**§6.5 的示意代码（2026-10-16，模拟的底座客户端）**：把 §6.4、§6.5 的代码原样摘出来，配一个按底座 `ros_client.py`
-（2026-10-12 版）的方法名和返回值写的模拟 `ROSPlatformClient`（前视、下视两路 1920×1080 JPEG，5 fps，`wait_new` 只给调用之后的新帧；
+**§6.5 的示意代码（2026-10-21，模拟的底座客户端）**：把 §6.4、§6.5 的代码原样摘出来，配一个按底座 `ros_client.py`
+（2026-10-12 版）的方法名和返回值写的模拟 `ROSPlatformClient`（一路 640×480 的 `nav_camera`，5 fps，`wait_new` 只给调用之后的新帧；
 `move_relative` 返回 `state`；控制权丢了时 `release()` 报 `invalid_session`）和本仓库的假服务端，在 Python 3.8 上跑：
-- 一集 35 步（5 次 `LOOK_DOWN`、2 次水平重拍）：取图路由全对，29 个运动动作各对应一次正确的 `move_relative`，`LOOK_DOWN` 和 `STOP` 不发动作；
-  每张送进 `act()` 的图都是连取两帧中的第二帧、经过对应相机自己的 `preprocess`，都是 640×480 `uint8`；开头拿控制权、结束释放。
+- 一集 35 步（5 次 `LOOK_DOWN`、13 次下视调用、2 次水平重拍）：只读 `nav_camera`，每步连取两帧、预处理一次；
+  `lookdown_fn` 和 `level_fn` 每次返回的都是这一步交给 `act()` 的同一帧；29 个运动动作各对应一次正确的 `move_relative`，
+  `LOOK_DOWN` 和 `STOP` 不发动作；`MOUNT` 照预期打出"和仿真不同"的 warning；开头拿控制权、结束释放。
 - 动作返回 `failed`：抛出这个动作的错误，控制权照样释放。
 - 中途丢了控制权：下一个动作返回 `failed`，`release()` 的报错只打印，抛出来的仍是动作失败本身。
+- 模型每次都给 `LOOK_DOWN`：连续 3 次后抛错结束本集，没有发任何动作，控制权照样释放；正常那集里有 5 次 `LOOK_DOWN`（最多连续 2 次），不触发。
 
 模拟客户端不代表真底座的时序和误差。
 
@@ -796,15 +820,30 @@ Python 3.8 一条，不影响发出的请求）；服务端代码之后有改动
 - **Go2 URDF**：<https://github.com/unitreerobotics/unitree_ros>（`5994d4f`），`robots/go2_description/urdf/go2_description.urdf` 的
   `front_camera_joint`（机身原点前方 0.327 m、上方 0.043 m）；`unitree_sdk2`（`d1abf00`）`example/go2/go2_stand_example.cpp`
   的站姿推算机身离地约 0.36 m，官方文档写默认站高 0.33 m，所以相机离地约 0.37–0.40 m。
+- **InternNav / DualVLN 的实机做法**（相机方案的依据）：
+  - 论文 arXiv 2512.08186 §5.2（Turtlebot4、Go2、G1，D455"装在不同高度、下倾 15°"，远端 RTX 4090）；InternVLA-N1 技术报告 §5.5 同样的说法；
+  - 仓库 <https://github.com/InternRobotics/InternNav>（`7a5c624`）：`assets/3d_printing_files/go2_stand.STEP`、`downwards_slope.3mf`（15° 楔块）；
+    `scripts/realworld/http_internvla_server.py`（模型输出 `↓` 时用同一帧再跑一次；D455 内参 640×480 下 fx = fy = 386.5）；
+    `assets/realworld_sample_data.tar.gz`（38 张下视图都和前一帧逐字节相同）；
+    `internnav/dataset/internvla_n1_lerobot_dataset.py`（`125cm_0_30`、`60cm_15_15`、`60cm_30_30` 等视角）、
+    `scripts/train/qwenvl_train/train_dual_system.sh`（训练混合这几种视角）；
+  - 维护者在 issue 里的说法：#194（支架约 0.7 m、楔块约 15°）、#295（Go2 建议约 1 m；从两台相机改成只用下倾那台）、
+    #327（一台小车：约 1 m、要有下倾；另有用户说 Go2 不抬高相机效果还可以）、#175（G1：至少 0.6 m、全局快门、要有下倾）、
+    #148（一直输出 ↓：先查 ↓ 之后有没有真的取下视图，也可能是相机太平）、#157（下倾 15°；D435i 运动模糊大，用 D455）、
+    #109（D455 全局快门、D435 卷帘快门）、#343（斜装后对不上螺孔，用双面胶贴）、#329（楔块用双面胶贴）、
+    #335（装牢防振）、#337（用户相机约 50 cm 时效果差，维护者没确认原因）、#352（多高度数据是为了 Go2、G1 部署）；
+    #194 里还有用户反映 `downwards_slope.3mf` 打不出来，维护者建议自己画三角楔块。
 - **公开的 Go2 导航部署**（相机型号和安装高度）：StreamVLN `realworld/go2_vln_client.py`（`e48f6ff`）、论文 arXiv 2507.05240；
-  InternNav `scripts/realworld/`（`7a5c624`）、issue #295、#324、#157；Uni-NaVid arXiv 2412.06224 附录 XII；
+  Uni-NaVid arXiv 2412.06224 附录 XII；
   VLingNav arXiv 2601.08665 §6.3.1；DyNaVLM arXiv 2506.15096 §V-A；SparseVideoNav arXiv 2602.05827 §IV；NaVILA arXiv 2412.04453 附录 C4。
   给出高度的几家都在 0.85–1 m、下倾 10–15°；查过的 7 家都没报告装在 1.25 m 水平或下倾 30°。
 
 **待实测：**
 
-- 下视相机：型号、安装高度、俯角、视场；换下 `camera2` 后，`left_camera` 加 `down_camera` 两路能否稳定采集（底座验证过的是两路环视，§6.2）；
-- 自带前视相机 1920×1080 这一路的内参和视场，以及它实际的离地高度和俯角（现在是按 URDF 推算的 0.37–0.40 m）；
-- 在我们的场地上，底座相对动作 0.25 m / ±15° 的误差和耗时；
+- D455：彩色节点能否经底座的 V4L2 稳定采集；换下 `camera2` 后，`left_camera` 加 `nav_camera` 两路能否稳定采集（底座验证过的是两路环视）；
+- D455 640×480 彩色图的实际内参和视场（现在是按 InternNav 硬编码的 fx 386.5 推算的约 79°）；
+- 支架装好后镜头的实际离地高度和俯角；
+- 装了支架以后，底座相对动作 0.25 m / ±15° 在我们场地上的误差和耗时；
+- 仿真里不同相机高度、俯角下我们模型的成绩（另一个会话在做）；
 - Orin 到 4090 的网络往返；
 - Orin 上的 Python 3.8 环境能否装上 vla_rpc 并通过 `tests/test_nav_agent.py`。
