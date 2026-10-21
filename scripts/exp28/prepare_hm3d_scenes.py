@@ -331,6 +331,19 @@ def _builder(tree: ast.Module) -> ast.FunctionDef:
     raise SystemExit(f"the client source has no top-level {CLIENT_BUILDER}()")
 
 
+def _helpers(tree: ast.Module, function: ast.FunctionDef) -> list[ast.FunctionDef]:
+    """The module's top-level functions ``function`` names, directly or through each other (e.g. ``_camera_mount``)."""
+    defs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name != function.name}
+    needed: dict[str, ast.FunctionDef] = {}
+    todo = [function]
+    while todo:
+        for node in ast.walk(todo.pop()):
+            if isinstance(node, ast.Name) and node.id in defs and node.id not in needed:
+                needed[node.id] = defs[node.id]
+                todo.append(defs[node.id])
+    return list(needed.values())
+
+
 def inspect_client_builder(source: str) -> dict:
     """What ``build_habitat_config`` starts from and what it assigns under ``SIMULATOR.AGENT_0``."""
     tree = ast.parse(source)
@@ -379,13 +392,15 @@ def build_client_config(source: str, resolve_import: Mapping[str, Any], args: An
     """Run the client's ``build_habitat_config`` as written, its imports bound from ``resolve_import``.
 
     ``resolve_import`` maps ``module.name`` (e.g. ``habitat.config.default.get_config``) to the object.
+    The top-level helpers the builder calls come along; anything else they name must be bound too.
     """
     tree = ast.parse(source)
     namespace: dict[str, Any] = {"__builtins__": builtins}
     for local, full in _import_table(tree).items():
         if full in resolve_import:
             namespace[local] = resolve_import[full]
-    module = ast.Module(body=[_builder(tree)], type_ignores=[])
+    builder = _builder(tree)
+    module = ast.Module(body=[*_helpers(tree, builder), builder], type_ignores=[])
     exec(compile(module, f"<client {CLIENT_BUILDER}>", "exec"), namespace)
     try:
         return namespace[CLIENT_BUILDER](args)

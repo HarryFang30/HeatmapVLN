@@ -70,6 +70,12 @@ STOP_AT_STEP_BUDGET="${PPA_EVAL_STOP_AT_STEP_BUDGET:-0}"
 NUM_HISTORY="${PPA_EVAL_NUM_HISTORY:-8}"
 NUM_SAMPLE_TRAJS="${PPA_EVAL_NUM_SAMPLE_TRAJS:-}"
 NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
+# EXP-33 camera mount (client only): sensor height in m, fixed pitch in degrees (negative = down),
+# and the look-down image: rotate (tilt 2 x 15 deg, as trained) or same_frame (one fixed camera, the
+# current front frame, as InternNav's Go2).  Empty = 1.25 m, level, rotate, with no flag passed.
+CAMERA_HEIGHT_M="${PPA_EVAL_CAMERA_HEIGHT_M:-}"
+CAMERA_PITCH_DEG="${PPA_EVAL_CAMERA_PITCH_DEG:-}"
+LOOKDOWN_MODE="${PPA_EVAL_LOOKDOWN_MODE:-}"
 # EXP-23: decide with a System2 LoRA (rpc_model_server.py --system2_lora_adapter); Z0 stays
 # the released weights'.  Local servers: the adapter directory.  External servers: a local
 # copy of that directory, or just the sha256 of its adapter_model.safetensors; servers.json
@@ -221,6 +227,12 @@ declare -a MODEL_EXTRA=()
 [[ "$NUM_HISTORY" =~ ^[1-8]$ ]] || die "PPA_EVAL_NUM_HISTORY must be 1-8"
 [[ -z "$NUM_SAMPLE_TRAJS" || "$NUM_SAMPLE_TRAJS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_SAMPLE_TRAJS must be a positive integer"
 [[ -z "$NUM_INFERENCE_STEPS" || "$NUM_INFERENCE_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PPA_EVAL_NUM_INFERENCE_STEPS must be a positive integer"
+[[ -z "$CAMERA_HEIGHT_M" || "$CAMERA_HEIGHT_M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PPA_EVAL_CAMERA_HEIGHT_M must be a number of metres"
+[[ -z "$CAMERA_PITCH_DEG" || "$CAMERA_PITCH_DEG" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || die "PPA_EVAL_CAMERA_PITCH_DEG must be a number of degrees"
+[[ -z "$LOOKDOWN_MODE" || "$LOOKDOWN_MODE" =~ ^(rotate|same_frame)$ ]] || die "PPA_EVAL_LOOKDOWN_MODE must be rotate or same_frame"
+[[ -n "$CAMERA_HEIGHT_M" ]] && CLIENT_EXTRA+=(--camera_height_m "$CAMERA_HEIGHT_M")
+[[ -n "$CAMERA_PITCH_DEG" ]] && CLIENT_EXTRA+=(--camera_pitch_deg "$CAMERA_PITCH_DEG")
+[[ -n "$LOOKDOWN_MODE" ]] && CLIENT_EXTRA+=(--lookdown_mode "$LOOKDOWN_MODE")
 [[ -n "$ATTN_IMPL" ]] && MODEL_EXTRA+=(--attn_implementation "$ATTN_IMPL")
 [[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
 [[ -n "$NUM_INFERENCE_STEPS" ]] && MODEL_EXTRA+=(--nextdit_num_inference_steps "$NUM_INFERENCE_STEPS")
@@ -285,6 +297,9 @@ echo "[ppa-eval] checkpoint=$PPA_CHECKPOINT config=$PPA_CONFIG"
 echo "[ppa-eval] num_history=$NUM_HISTORY num_sample_trajs=${NUM_SAMPLE_TRAJS:-config} num_inference_steps=${NUM_INFERENCE_STEPS:-config} attn=${ATTN_IMPL:-config} episode_lists=$EPISODE_LISTS_DIR"
 echo "[ppa-eval] output=$OUTPUT_ROOT external_servers=$EXTERNAL_SERVERS"
 echo "[ppa-eval] system2_lora=${SYSTEM2_LORA:-none} sha256=${SYSTEM2_LORA_SHA256:-none}"
+if [[ -n "$CAMERA_HEIGHT_M$CAMERA_PITCH_DEG$LOOKDOWN_MODE" ]]; then
+  echo "[ppa-eval] camera_height_m=${CAMERA_HEIGHT_M:-1.25} camera_pitch_deg=${CAMERA_PITCH_DEG:-0} lookdown_mode=${LOOKDOWN_MODE:-rotate}"
+fi
 
 for slot in $(seq 0 $((NUM_SLOTS - 1))); do
   display_num=$((DISPLAY_BASE + slot))
