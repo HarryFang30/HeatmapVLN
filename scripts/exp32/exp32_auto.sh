@@ -85,6 +85,9 @@ HELD_S=21600      # one held-out sampled seed (112 episodes, 3 slots, about 2.5 
 PUSH_S=43200; PARITY_S=14400; ADAPTER_S=43200; E2_S=64800; GATES_S=28800; DECODE_S=10800; P_S=43200
 SERVER_WAIT_S=14400  # a P try that still waits for its npu_servers_exp28_<tag> after 4 h is given up (not retried)
 CANARY_S=7200; VAL_S=144000  # val: 40 h a seed over all its tries (20-25 h expected)
+# EXP32_NO_PARITY=1 (the user's call, 2026-10-21, ledger EXP-32 运行记录 4): no G0/D3 -- D2 and D3 are not run, the
+# stream goes to the 910B right after D1, and M has no states (R gates as usual; M is needed only after R alone fails)
+NO_PARITY="${EXP32_NO_PARITY:-0}"
 
 mkdir -p "$A" "$SIG" "$X/logs" "$X/aud" "$X/adapter_pull"
 exec 3>&2  # x's walkthrough lines bypass every redirection
@@ -407,18 +410,19 @@ gates() {  # $1 adapter, $2 attempt, $3 lora scale: one gate pass (run_offline_g
   done
   return 1
 }
+m_args() { [[ "$NO_PARITY" == 1 ]] || printf '%s\n' --m-states "$1/m_states.jsonl"; }  # $1 rgate dir (none: no D3)
 rgate_decode() {  # $1 rgate dir, $2 adapter: rft_gate.py decode, one shard a card on $GPUS at once
-  local gl i rc=0 pids=()
-  IFS=',' read -r -a gl <<< "$GPUS"
+  local gl i rc=0 pids=() ma=()
+  IFS=',' read -r -a gl <<< "$GPUS"; mapfile -t ma < <(m_args "$1")
   for i in "${!gl[@]}"; do
     if [[ "$DRY" == 1 ]]; then
       x env CUDA_VISIBLE_DEVICES="${gl[$i]}" "$PY" "$WT/scripts/exp32/rft_gate.py" decode --r-states "$1/r_states.jsonl" \
-        --m-states "$1/m_states.jsonl" --adapter "$2" --model-path "$MODEL" --output "$1/rft_gate.json" \
+        ${ma[@]+"${ma[@]}"} --adapter "$2" --model-path "$MODEL" --output "$1/rft_gate.json" \
         --shard "$i/${#gl[@]}" --device cuda
       continue
     fi
     CUDA_VISIBLE_DEVICES="${gl[$i]}" timeout "$DECODE_S" "$PY" "$WT/scripts/exp32/rft_gate.py" decode \
-      --r-states "$1/r_states.jsonl" --m-states "$1/m_states.jsonl" --adapter "$2" --model-path "$MODEL" \
+      --r-states "$1/r_states.jsonl" ${ma[@]+"${ma[@]}"} --adapter "$2" --model-path "$MODEL" \
       --output "$1/rft_gate.json" --shard "$i/${#gl[@]}" --device cuda > "$1/decode_$i.log" 2>&1 &
     pids+=($!)
   done
@@ -431,14 +435,16 @@ r_sources() {  # R_SRC: select-r's sources, B3's seeds 42 and 1337, and 2024 onc
   return 0
 }
 r_measure() {  # $1 gate pass dir, $2 the adapter it gated: R and M into $1/rgate; returns score's exit (0, 1, 2 invalid)
-  local rg="$1/rgate" rc
-  mkdir -p "$rg"; r_sources
+  local rg="$1/rgate" rc ma=()
+  mkdir -p "$rg"; r_sources; mapfile -t ma < <(m_args "$rg")
   x "$PY" "$WT/scripts/exp32/rft_gate.py" select-r "${R_SRC[@]}" --holdout-scenes-file "$H" --failed \
     --output "$rg/r_states.jsonl" > "$rg/select_r.log" 2>&1 || return 2
-  x "$PY" "$WT/scripts/exp32/rft_gate.py" select-m --d3-calls "$PAR_D3/parity_g0.calls.jsonl" \
-    --rft-stream "$X/stream_rft" --output "$rg/m_states.jsonl" > "$rg/select_m.log" 2>&1 || return 2
+  if [[ "$NO_PARITY" != 1 ]]; then
+    x "$PY" "$WT/scripts/exp32/rft_gate.py" select-m --d3-calls "$PAR_D3/parity_g0.calls.jsonl" \
+      --rft-stream "$X/stream_rft" --output "$rg/m_states.jsonl" > "$rg/select_m.log" 2>&1 || return 2
+  fi
   rgate_decode "$rg" "$2" || { note "R/M decode failed ($rg/decode_*.log)"; return 2; }
-  x "$PY" "$WT/scripts/exp32/rft_gate.py" score --r-states "$rg/r_states.jsonl" --m-states "$rg/m_states.jsonl" \
+  x "$PY" "$WT/scripts/exp32/rft_gate.py" score --r-states "$rg/r_states.jsonl" ${ma[@]+"${ma[@]}"} \
     --adapter "$2" --output "$rg/rft_gate.json" > "$rg/score.txt" 2>&1
   rc=$?; [[ "$DRY" == 1 ]] && rc=$(dryval RGATE 0)
   log "R/M: $(head -n 1 "$rg/score.txt" 2>/dev/null)"
@@ -861,7 +867,9 @@ if [[ "$DRY" == 1 || ! -s "$X/stream_rft/stream_manifest.json" ]]; then
 fi
 note "RFT stream: $(tail -n 1 "$X/logs/stream_rft.log" 2>/dev/null)"
 G0D3_PID=""
-if [[ -e "$A/g0d3.pushed" ]] || adapter_pulled; then
+if [[ "$NO_PARITY" == 1 ]]; then
+  note "G0/D3 not run (EXP32_NO_PARITY=1, the user's call 2026-10-21): D2 and D3 skipped, M unmeasured"
+elif [[ -e "$A/g0d3.pushed" ]] || adapter_pulled; then
   log "G0's and D3's records went to the 910B before ($(cat "$A/g0d3.pushed" 2>/dev/null)): not again"
 else
   st "G0's and D3's records to the 910B ($G0D3_PORT)"
@@ -898,6 +906,7 @@ x "$PY" "$WT/scripts/exp32/aud.py" stream --stream "$X/stream" "${AUDV[@]}" --an
 rc=$?; [[ "$DRY" == 1 ]] && rc=$(dryval AUD 0)
 note "D1: $(grep -m1 '^AUD ' "$X/aud/stream.txt" 2>/dev/null | cut -c1-400)"
 [[ $rc -eq 0 ]] || finish "D1 (AUD) did not pass: no training; fix the builder, the lines stay ($X/aud/stream.txt)"
+if [[ "$NO_PARITY" != 1 ]]; then
 st "waiting for the G0/D3 push and G0's parity output ($PAR_G0_EXPORT on $EXPORT_PORT)"
 [[ -n "$G0D3_PID" ]] && { wait "$G0D3_PID" || finish "pushing G0's and D3's records failed ($A/push_g0d3.log)"; }
 par_until=$(( $(date +%s) + PARITY_S ))  # G0's and D3's exports share it
@@ -914,6 +923,7 @@ x "$PY" "$WT/scripts/exp32/aud.py" dose --parity-dir "$PAR_D3" --rft-stream "$X/
 rc=$?; [[ "$DRY" == 1 ]] && rc=$(dryval D3 0)
 note "D3: $(grep -m1 '^D3 ' "$X/aud/dose.txt" 2>/dev/null | cut -c1-400)"
 [[ $rc -eq 0 ]] || finish "D3 did not pass (1 - exact < 0.10, or unreadable): no training ($X/aud/dose.txt)"
+fi
 if [[ -e "$A/stream.pushed" ]] || adapter_pulled; then
   log "the stream went to the 910B before ($(cat "$A/stream.pushed" 2>/dev/null)): not again"
 else

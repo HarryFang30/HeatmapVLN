@@ -48,6 +48,7 @@ X=$E/round1/export; SRC="${EXP32_SRC:-$E/src_x32}"; P="${EXP32_PYTHON:-$R/envs/p
 STAG=rfts; SRUN="$R/exp28/serve_$STAG"         # pass 1's sampled set (serve_910b.sh's default run dir)
 SAMPLE_S=36000; PASS3_S=30600; P_SERVE_S=86400  # sampled sets live 10 h; pass 3 needs 8.5 h more; P's sets 24 h
 P2_HOLD_S=43200                                 # pass 2's set ends 12 h after stage 1 unless a signal came first
+NO_PARITY="${EXP32_NO_PARITY:-0}"  # 1: no G0/D3 (the user's call 2026-10-21, ledger EXP-32 运行记录 4): train on arrival
 DRY="${EXP32_DRY:-0}"; LOGF=$D/exp32.log; STATF=$D/STATUS; MAIN=1  # MAIN=0: smoke-train leaves receivers and $SIG alone
 export PYTHONPATH="$SRC:$R/rpc/src" TMPDIR="$R/tmp/x32/main"
 source /usr/local/Ascend/ascend-toolkit/set_env.sh >/dev/null 2>&1 || true
@@ -401,14 +402,16 @@ if [[ -d "$X/adapter_rX32R1" ]] && (( ! DRY )); then  # a restart after training
   log "adapter_rX32R1 is exported: the parity checks and the training are not rerun"
   stop_recv "$IN"; stop_recv "$D/stream"  # (a run that ended between the export and serving left them)
 else
-  recv "$IN" 52413 24 recv_parity
+  (( NO_PARITY )) || recv "$IN" 52413 24 recv_parity
   recv "$D/stream" 52414,52415,52416 60 recv_stream
-  if [[ "$(judge g0 "$D/g0_npu")" == PASS* && -d "$X/exp32_g0_npu" ]]; then log "G0-npu passed before; not rerun"
+  if (( NO_PARITY )); then log "G0 and D3 not run (EXP32_NO_PARITY=1, the user's call 2026-10-21): training on the stream"
+  elif [[ "$(judge g0 "$D/g0_npu")" == PASS* && -d "$X/exp32_g0_npu" ]]; then log "G0-npu passed before; not rerun"
   else
     await 28800 "R0-G's G0 records ($IN/G0_PUSHED)" test -e "$IN/G0_PUSHED"
     parity g0 "$IN/records" "--parity-split all"
   fi
-  if [[ "$(judge d3 "$D/d3_npu")" == PASS* && -d "$X/exp32_d3_npu" ]]; then log "D3 passed before; not rerun"
+  if (( NO_PARITY )); then :
+  elif [[ "$(judge d3 "$D/d3_npu")" == PASS* && -d "$X/exp32_d3_npu" ]]; then log "D3 passed before; not rerun"
   else
     await 28800 "the D3 records ($IN/D3_PUSHED)" test -e "$IN/D3_PUSHED"
     roots=""; for t in p1 r0s p2 p3; do [[ -d "$IN/$t" ]] && roots="${roots:+$roots:}$IN/$t"; done
