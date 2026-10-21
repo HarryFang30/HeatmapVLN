@@ -591,7 +591,13 @@ bash ~/work/zhr/zhr_1/HeatmapVLN/scripts/ascend/bootstrap_instance.sh
 5. 建好 `zhr_1/{tmp,logs,servers}`（`tmp` 只在把 `PPA_NPU_TMP_ROOT` 指回共享盘时才用，见 §7
    第一条）。
 
-**bootstrap 还从没在一个真正的新实例上跑过。** 现在这台是手工装起来的，脚本是按"应该这样"写的，
+**2026-10-21 第一次真换实例时踩到的三件事**（bootstrap 照常跑通，但不够）：
+- 共享盘挂在 `/mnt/sfs_turbo`，不是 `~/work`。要 `ln -s /mnt/sfs_turbo ~/work`，因为环境的 shebang 和前缀写死了 `/home/ma-user/work/...`。
+- 实例生成的 `~/.ssh/environment` 里有 **`TORCH_DEVICE_BACKEND_AUTOLOAD=0`**：torch_npu 不再随 `import torch` 自动注册，没显式 `import torch_npu` 的进程会在 `torch.device("npu")` 上报 `Expected one of cpu, cuda, ...`。2026-10-21 的 VO 服务端就是这样起不来的；训练没事，因为它显式 import。**起任何服务前先 `export TORCH_DEVICE_BACKEND_AUTOLOAD=1`**（`set_env.sh` 不会改回 0）。
+- CANN 从 8.3.RC1 变成了 8.5.2。bootstrap 只警告。
+- bootstrap 默认只给隧道授权 52400–07/52500–07。用 52410 段时要带 `PPA_EVAL_MODEL_PORT_BASE=52410 PPA_EVAL_VO_PORT_BASE=52510` 重跑。
+
+**bootstrap 第一次在真正的新实例上跑是 2026-10-21。** 现在这台是手工装起来的，脚本是按"应该这样"写的，
 不是按"这样试过"写的；第一次换实例要留返工时间。
 
 然后：本地把 SSH 别名指到新实例的地址和端口（`~/.ssh/modelarts_setup.sh '<控制台 SSH 地址>'`），
