@@ -88,6 +88,9 @@ CANARY_S=7200; VAL_S=144000  # val: 40 h a seed over all its tries (20-25 h expe
 # EXP32_NO_PARITY=1 (the user's call, 2026-10-21, ledger EXP-32 运行记录 4): no G0/D3 -- D2 and D3 are not run, the
 # stream goes to the 910B right after D1, and M has no states (R gates as usual; M is needed only after R alone fails)
 NO_PARITY="${EXP32_NO_PARITY:-0}"
+# EXP32_NO_P=1 (the user's call, 2026-10-21, ledger EXP-32 运行记录 6): P is not run -- the 910B's new instance cannot
+# serve closed-loop episodes (CANN 8.5.2).  The offline gates alone decide; P is recorded as 没测出来, never a pass.
+NO_P="${EXP32_NO_P:-0}"
 
 mkdir -p "$A" "$SIG" "$X/logs" "$X/aud" "$X/adapter_pull"
 exec 3>&2  # x's walkthrough lines bypass every redirection
@@ -566,6 +569,7 @@ p_collect() {  # background: the held-out cohort against the 910B's $1 servers i
   echo "$line" > "$A/P_$tag.collected"
 }
 p_start() {  # $1 tag, $2 adapter, $3 out: P's collection in the background
+  [[ "$NO_P" == 1 ]] && { log "P ($1) not started (EXP32_NO_P=1)"; return 0; }
   rm -f "$A/P_$1.collected"
   log "P: collecting against the 910B's $1 ($(sha16 "$2")) into $3"
   if [[ "$DRY" == 1 ]]; then p_collect "$@"; return; fi
@@ -995,12 +999,17 @@ esac
 note "candidate $ROUND ($(sha16 "$CAND")) passed its gates; P on the 910B's $PTAG"
 
 # 6 ------------------------------------------------------------------------------------------------------------
-p_final "$PTAG" "$POUT"; r=$?
-case $r in
-  0) note "P passed: $ROUND goes on to H and val" ;;
-  1) finish "P kill ($ROUND): no val, no retry" ;;
-  *) finish "P could not be judged ($ROUND): re-collect the missing episodes or fix the inputs; not a kill" ;;
-esac
+if [[ "$NO_P" == 1 ]]; then
+  note "P not run (EXP32_NO_P=1, the user's call 2026-10-21: the 910B's new instance cannot serve closed-loop" \
+    "episodes under CANN 8.5.2): 没测出来, not a pass; the offline gates alone sent $ROUND to H and val"
+else
+  p_final "$PTAG" "$POUT"; r=$?
+  case $r in
+    0) note "P passed: $ROUND goes on to H and val" ;;
+    1) finish "P kill ($ROUND): no val, no retry" ;;
+    *) finish "P could not be judged ($ROUND): re-collect the missing episodes or fix the inputs; not a kill" ;;
+  esac
+fi
 date -u +%FT%TZ > "$SIG/STOP_SERVING"; SIGNAL_S=7200 signal STOP_SERVING || note "could not send STOP_SERVING"
 
 # 7 ------------------------------------------------------------------------------------------------------------
