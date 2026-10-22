@@ -68,6 +68,7 @@ P1=/workspace/exp32/collect_a; R0S=/workspace/exp31/r0s; R0G=/workspace/exp31/r0
 C=/workspace/exp28/collect_base; COH=/workspace/exp28/episodes/cohorts; P_REPRO=/workspace/exp28/p_repro/records
 H=/workspace/exp28/episodes/splits/heldout_scenes.txt; T=/workspace/exp28/episodes/splits/train_scenes.txt
 R2R=/workspace/exp23/data/interndata_n1/r2r; MODEL=/workspace/InternNav_Model
+RPC_SRC="${EXP32_RPC_SRC:-/workspace/rpc/src}"  # vla_rpc, for the record readers (run_offline_gates.sh has its own)
 O1_BASE=/workspace/exp23/b3/scalevln_b3.json; O2_BASE=/workspace/exp23/exp26/base_r2r_holdout.json
 A0_DIR=/workspace/eval_runs/exp20_a0_seed42_4090
 declare -A A0=([42]=/workspace/eval_runs/exp20_a0_seed42_4090/merged/progress.jsonl
@@ -414,17 +415,19 @@ gates() {  # $1 adapter, $2 attempt, $3 lora scale: one gate pass (run_offline_g
   return 1
 }
 m_args() { [[ "$NO_PARITY" == 1 ]] || printf '%s\n' --m-states "$1/m_states.jsonl"; }  # $1 rgate dir (none: no D3)
-rgate_decode() {  # $1 rgate dir, $2 adapter: rft_gate.py decode, one shard a card on $GPUS at once
+rgate_decode() {  # $1 rgate dir, $2 adapter: rft_gate.py decode, one shard a card on $GPUS at once.  PYTHONPATH as
+                  # exp30/probe1_4090.sh sets it: inference_messages decodes the recorded JPEGs through vla_rpc.
   local gl i rc=0 pids=() ma=()
   IFS=',' read -r -a gl <<< "$GPUS"; mapfile -t ma < <(m_args "$1")
   for i in "${!gl[@]}"; do
     if [[ "$DRY" == 1 ]]; then
-      x env CUDA_VISIBLE_DEVICES="${gl[$i]}" "$PY" "$WT/scripts/exp32/rft_gate.py" decode --r-states "$1/r_states.jsonl" \
+      x env PYTHONPATH="$WT:$RPC_SRC" CUDA_VISIBLE_DEVICES="${gl[$i]}" "$PY" "$WT/scripts/exp32/rft_gate.py" decode \
+        --r-states "$1/r_states.jsonl" \
         ${ma[@]+"${ma[@]}"} --adapter "$2" --model-path "$MODEL" --output "$1/rft_gate.json" \
         --shard "$i/${#gl[@]}" --device cuda
       continue
     fi
-    CUDA_VISIBLE_DEVICES="${gl[$i]}" timeout "$DECODE_S" "$PY" "$WT/scripts/exp32/rft_gate.py" decode \
+    PYTHONPATH="$WT:$RPC_SRC" CUDA_VISIBLE_DEVICES="${gl[$i]}" timeout "$DECODE_S" "$PY" "$WT/scripts/exp32/rft_gate.py" decode \
       --r-states "$1/r_states.jsonl" ${ma[@]+"${ma[@]}"} --adapter "$2" --model-path "$MODEL" \
       --output "$1/rft_gate.json" --shard "$i/${#gl[@]}" --device cuda > "$1/decode_$i.log" 2>&1 &
     pids+=($!)
