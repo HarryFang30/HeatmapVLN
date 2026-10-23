@@ -4996,6 +4996,18 @@ Go2 自带的前相机离地约 0.4 m。买件、装件之前，先在 Habitat �
    - 流 `/workspace/exp34/stream/main`：73,216 条，其中 COR 23,396、AGR 23,396、TERM 11,698、REP 14,726；286 片，25 GB。
    - 流里 STOP 占 6.37%：≤1 m 是底座的 0.95 倍，1–3 m 是 1.03 倍，>3 m 为 0。反向转为 0，COR 里没有越窗像素。
    - 推到 worker-0 的 `zhr_1/exp34/stream/main`。
+4. **训练开跑（2026-10-23 19:36 UTC）**：
+   - worker-0 8 卡，代码 `zhr_1/exp34/src_x34`（45a62c0），输出 `zhr_1/exp34/train/X34M`。
+   - 共 1,144 步，约 42 s/步。
+   - 第 1 步 KL 为 0（lora_B=0），之后逐步上升。
+5. **B0 只留种子 1337，worker-1 改去采数据（用户 2026-10-23 23:1x UTC 定，在任何候选读数之前）**：
+   - B0 种子 42 在约 330 集时停掉；val 只在种子 1337 上与候选配对，即 k=1。
+     - 判据照运行记录 1 的写法，只是 k=1，SE 取 1,839 集逐集配对差的标准误。
+     - **支持** = 下界 > 0 且 ΔSPL ≥ −1.0；**否定** = Δ̂ ≤ 0；其余为没测出来。
+   - worker-1 的 8 槽改采下一轮数据：
+     - 新 EnvDrop cohort 5,000 条路线，54 个场景，种子 34，排除 EXP-25 的 2,500 条路线和 5 个 H 场景（`scripts/exp34/exclude_routes.py`，再接 `build_r2r_train_cohorts.py`）。
+     - 底座当司机，不接管。
+     - 输出 `/workspace/exp34/collect_envdrop2`。
 
 ---
 
