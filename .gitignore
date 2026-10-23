@@ -91,3 +91,6 @@ nohup.out
 # Microsoft Office lock/temp files
 ~$*
 **/~$*
+
+# Go2 run logs from scripts/deploy/run_go2.py (camera frames and step logs, per run)
+runs/
