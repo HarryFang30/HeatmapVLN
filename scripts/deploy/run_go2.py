@@ -67,6 +67,21 @@ def to_model_frame(jpeg: bytes, hfov_deg: float) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
 
 
+def next_jpeg(robot: Any, camera: str, timeout_s: float) -> bytes:
+    """The next new frame the base marks available; a warming-up or failing camera's frames are skipped.
+
+    The base's client already refuses frames older than 1 s; its README asks projects to wait for
+    the metadata's availability too, so warm-up frames never reach the model.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        frame = robot.get_frame(camera, timeout=timeout_s, wait_new=True)
+        if frame.get("metadata", {}).get("available", True) is not False:
+            return frame["jpeg"]
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"{camera} stays unavailable: {frame.get('metadata')}")
+
+
 def stop_reason(agent: NavAgent) -> str:
     """Why the episode ended (docs/deploy/navigation_interface.md §2.3)."""
     step = agent.last_step
@@ -131,7 +146,7 @@ def run_episode(
             t0 = time.monotonic()
             # The first new frame may have been taken before the motion ended; the next one hardly ever is.
             for _ in range(frames_per_step):
-                jpeg = robot.get_frame(camera, timeout=frame_timeout_s, wait_new=True)["jpeg"]
+                jpeg = next_jpeg(robot, camera, frame_timeout_s)
             frame = to_model_frame(jpeg, hfov_deg)
             step = agent.steps
             if log is not None:

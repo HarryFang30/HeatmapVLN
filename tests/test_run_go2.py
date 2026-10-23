@@ -115,6 +115,30 @@ def test_the_offline_check_passes(tmp_path):
     assert json.loads((tmp_path / "run" / "summary.json").read_text())["outcome"] == "model_stop"
 
 
+def test_frames_the_base_marks_unavailable_never_reach_the_model(tmp_path):
+    class WarmingUp(run_go2.OfflineRobot):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def get_frame(self, camera, timeout, wait_new):
+            self.calls += 1
+            frame = super().get_frame(camera, timeout, wait_new)
+            if self.calls <= 3:
+                return {"jpeg": b"not a jpeg", "metadata": {"available": False, "warming_up": True}}
+            return frame
+
+    robot = WarmingUp()
+    assert run_go2.next_jpeg(robot, "front_camera", 10.0) == robot.jpeg and robot.calls == 4
+
+    class Broken(run_go2.OfflineRobot):
+        def get_frame(self, camera, timeout, wait_new):
+            return {"jpeg": b"", "metadata": {"available": False, "error": "videohub down"}}
+
+    with pytest.raises(RuntimeError, match="stays unavailable"):
+        run_go2.next_jpeg(Broken(), "front_camera", 0.05)
+
+
 def test_a_frame_is_taken_twice_after_each_motion_and_the_second_is_used(tmp_path):
     class Counting(run_go2.OfflineRobot):
         def __init__(self):

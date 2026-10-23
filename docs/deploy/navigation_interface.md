@@ -477,7 +477,7 @@ python scripts/deploy/run_go2.py -i "Walk to the door and stop."             # �
 
 每一步它做的事：
 
-1. 连取两帧 `front_camera`，用第二帧（§6.3），裁剪缩放（§6.4）。
+1. 连取两帧 `front_camera`，用第二帧（§6.3）；底座元数据里标成不可用（预热、出错）的帧跳过，按底座 README 的要求不送进模型；再裁剪缩放（§6.4）。
 2. 交给 `NavAgent.act()`，前视、下视、水平重拍都传这一帧。
 3. `FORWARD` → `move_relative(distance=0.25)`；`TURN_LEFT` / `TURN_RIGHT` → `move_relative(angle=±15°)`；`LOOK_DOWN` 不动；`STOP` 结束。
 4. `move_relative` 不成功、连续 3 次 `LOOK_DOWN`、任何异常（包括 Ctrl-C）都结束本集，并且一定释放控制权。
@@ -529,7 +529,7 @@ python scripts/deploy/run_go2.py -i "Walk to the door and stop."             # �
 
 1. **4090 起服务端**（§3）。
 2. **Orin 装环境**（§5）：先按 §4 第 3 步在 `~/.ssh/config` 里加好 `Host 6024_fjl`，装好以后跑
-   `python -m pytest tests/test_nav_agent.py tests/test_run_go2.py --noconftest -q`（31 passed），
+   `python -m pytest tests/test_nav_agent.py tests/test_run_go2.py --noconftest -q`（32 passed），
    再跑 `python scripts/deploy/run_go2.py --offline`，最后一行是 `offline check OK`。
 3. **开 ssh 隧道**，在 Orin 上构造一次 `NavAgent` 做连通自检（§4）。
 4. **模拟底座 + 假服务端**：先停掉正在跑的实机底座（两者抢同一把锁），`./platform run --backend sim --allow-motion`，
@@ -695,7 +695,7 @@ Python 3.8 一条，不影响发出的请求）；服务端代码之后有改动
 调用数和 09-30 的 SDPA 核验不同（82 对 99），是因为两种注意力本来就走法不同（§3.2）。
 
 **§6.5 的脚本 `run_go2.py`（2026-10-23，Python 3.8.20、numpy 1.24.4、Pillow 10.4.0，macOS arm64）**：
-`tests/test_run_go2.py` 8 个和 `tests/test_nav_agent.py` 23 个都通过。用一个按底座 `ros_client.py`（2026-10-12 版）的方法名和返回值
+`tests/test_run_go2.py` 9 个和 `tests/test_nav_agent.py` 23 个都通过。用一个按底座 `ros_client.py`（2026-10-12 版）的方法名和返回值
 写的替身（1920×1080 的 `front_camera`、`move_relative` 返回 `state`）和本仓库的假服务端：
 - 裁剪：1920×1080、水平 100° 时居中裁 1328×996，缩到 640×480，是 RGB；视场不够时报错。
 - 一集 35 步（29 个运动动作、5 次 `LOOK_DOWN`、最后 `STOP`）：每步连取两帧、用第二帧；29 个运动动作各对应一次方向正确的 `move_relative`，
