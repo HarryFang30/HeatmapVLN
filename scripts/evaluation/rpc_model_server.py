@@ -898,6 +898,37 @@ def _assert_attn_implementation(model: Any, requested: Optional[str]) -> None:
     LOGGER.info("Attention implementation confirmed: %s", loaded)
 
 
+def _require_physical_tmpdir() -> None:
+    """Refuse to serve when TMPDIR holds a symlink, which breaks every JIT compile.
+
+    CANN's TBE whitelists the compile directory before compiling: it resolves the
+    directory, then compares it against the *literal* ``$TMPDIR``
+    (cann-8.5.2/.../tbe/tvm/contrib/ccec.py:1075 realpath, :1076 _check_tmpdir,
+    :852-875 the whitelist).  A TMPDIR that resolves elsewhere therefore fails that
+    comparison on every single compile in this process.
+
+    The symptoms name nothing useful: E40021 "dir path is invalid" against whichever
+    op reached TBE first (te_cast one run, te_transdata the next), plus "the current
+    working operator name is Conv2D"; the logged dirpath is the *un*resolved value and
+    looks perfectly legal.  Worse, the device is poisoned but the process keeps
+    serving -- 2026-10-22 on the nb2 instance (~/work is a symlink to /mnt/sfs_turbo)
+    all 7 EXP-32 slots lost every episode this way, with the one real cause buried
+    under 53 follow-on failures in the backbone.  The whole launch is wrong from the
+    first compile, so say so here rather than per request.  The conv2d below does not
+    catch it: it is served from the prebuilt kernel library on some CANN builds.
+    """
+    tmpdir = os.environ.get("TMPDIR", "")
+    if not tmpdir:
+        return
+    physical = os.path.realpath(tmpdir)
+    if physical != tmpdir:
+        raise RuntimeError(
+            f"TMPDIR={tmpdir!r} resolves to {physical!r}; CANN's TBE would reject every "
+            "JIT compile with E40021 'dir path is invalid'. Point TMPDIR (for the "
+            "certified launcher, PPA_NPU_TMP_ROOT) at the physical path instead."
+        )
+
+
 def _warm_up_npu(device: torch.device) -> None:
     """Make CANN build its op-compile toolchain now, not during the first request.
 
@@ -915,6 +946,7 @@ def _warm_up_npu(device: torch.device) -> None:
     """
     import torch.nn.functional as functional
 
+    _require_physical_tmpdir()
     with torch.no_grad():
         image = torch.zeros(1, 3, 28, 28, device=device, dtype=torch.bfloat16)
         kernel = torch.zeros(8, 3, 14, 14, device=device, dtype=torch.bfloat16)

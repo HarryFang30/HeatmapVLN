@@ -597,6 +597,79 @@ bash ~/work/zhr/zhr_1/HeatmapVLN/scripts/ascend/bootstrap_instance.sh
 - CANN 从 8.3.RC1 变成了 8.5.2。bootstrap 只警告。
 - bootstrap 默认只给隧道授权 52400–07/52500–07。用 52410 段时要带 `PPA_EVAL_MODEL_PORT_BASE=52410 PPA_EVAL_VO_PORT_BASE=52510` 重跑。
 
+### TMPDIR 必须是物理路径，否则 CANN 8.5.2 拒绝所有即时编译
+
+上面那条软链（`~/work` → `/mnt/sfs_turbo`）有个代价：同一份文件从此有两个前缀，而 CANN
+8.5.2 的 TBE 在编译前查一次路径白名单，比较的两边口径不一致。
+
+```
+cann-8.5.2/python/site-packages/tbe/tvm/contrib/ccec.py
+  :1075   dirpath = os.path.realpath(dirpath)   # 左边已解析成物理路径
+  :1076   _check_tmpdir(dirpath)
+  :852-875  要求 dirpath 以 /tmp、/var/tmp、/usr/tmp（或它们的 realpath），
+            或 $TMPDIR 的【字面值】开头，否则抛 EB0500 "dir path is invalid"
+```
+
+所以 `$TMPDIR` 里只要带软链，realpath 后的前缀就和字面值对不上，**这个进程里每一次即时
+编译都必然失败**，外层报 `E40021`。2026-10-22 EXP-32 的服务端 7 张卡同时栽在这里，20 个
+分片全废、0 条记录（台账 EXP-32 运行记录 6）。
+
+离线线（LoRA 训练、teacher-forced 解码）从来不挂，因为 `run_s2_lora_train_npu.sh:67` 本来
+就用 `realpath`。闭环线踩坑是因为 `run_ppa_servers_npu.sh:299` 曾用 bash 的**逻辑** `pwd`，
+它保留软链。这解释了"训练正常、只有闭环坏"的全部不对称。
+
+**症状没有一处指向真因，别被带偏：**
+
+- 报错里的 optype 是"谁先走到 TBE 就报谁"：一次 `te_cast`，复现时是 `te_transdata`，还会
+  顺口说 `the current working operator name is Conv2D`。算子本身都没问题。
+- 日志打印的 `dirpath` 是**未** realpath 的原值，看着完全合法；被检查的是它的 realpath。
+- **第一个倒下的进程可能是里程计，不是模型。** 复现的一臂里 `model_0.log` 全干净，E40021
+  只出现在 `vo_0.log`，客户端看到的是 `AMB3R VO RPC returned no response for ingest_frame`。
+  两种进程拿的是同一个坏 TMPDIR。
+- 一次失败后设备被毒化，但进程**不会自己退出**，继续接客不回包。后续每个请求都在 System2
+  侧以各种形态崩（`get_rope_index` 的 TypeError、tokenizer OverflowError），并伴随
+  `eos_token_id should consist of positive integers, but is tensor([151645, 151643])`——两个
+  正整数被设备判成了负数。**这些都是连带损害，不要去查它们。**
+- 失败发生在编译**之前**，所以 `kernel_meta` 下不会有 `.o`。判"编译是否真的成功"要数
+  `kernel_cache`（`ASCEND_CACHE_PATH`，没设就是 `~/atc_data`）里的 `.o`，**不要数
+  `cwd/kernel_meta` 下的**——那里成功时也常常是 0。
+- 复现失败必须同时给全新 cwd **和**全新 `ASCEND_CACHE_PATH`，否则会命中已缓存的 kernel，
+  拿到"不修也行"的假阴性。
+
+**不是**这些原因（都查过）：cwd、`kernel_meta` 的嵌套或 8.3 时代的残留、NFS 语义、CANN 版本
+本身、LoRA 适配器。同一张盘、同一个物理目录，换个写法就通。
+
+对照实验（2026-10-23，真实服务端、同 launcher、同代码树、同适配器、同 cwd，各给一个全新的
+`ASCEND_CACHE_PATH`，唯一差别是 TMPDIR 的拼写）：
+
+| TMPDIR | 结果 |
+|---|---|
+| `/home/ma-user/work/zhr/zhr_1/t/…`（软链拼写） | 第 7 次调用崩，E40021，签名与 10-22 逐字一致 |
+| `/mnt/sfs_turbo/zhr/zhr_1/t/…`（物理拼写） | 10/10 全成功；另一轮 22/22 |
+
+`run_ppa_servers_npu.sh` 现在用 `pwd -P`，两个服务端启动时也会断言
+`realpath($TMPDIR) == $TMPDIR`，不成立就拒绝起。**所以这个坑不该再出现**；下面是万一又碰到
+时的绕法（同一个物理目录，只换写法）：
+
+```bash
+# 直接调 launcher
+PPA_NPU_TMP_ROOT=/mnt/sfs_turbo/zhr/zhr_1/t bash scripts/ascend/run_ppa_servers_npu.sh
+
+# 走 scripts/exp28/serve_910b.sh（它内部写死 PPA_NPU_TMP_ROOT="$ROOT/t"，要从 ROOT 这层给）
+EXP23_ROOT=/mnt/sfs_turbo/zhr/zhr_1 EXP28_TAG=<tag> EXP28_SRC=<...> \
+  bash scripts/exp28/serve_910b.sh
+```
+
+修的时候**不要**把 `/mnt/sfs_turbo` 写死进脚本：老实例上 `~/work` 是真实挂载点，写死的物理
+路径换实例就废。`pwd -P` 两种实例上都对。
+
+两条附带的实测：首次动作头调用要约 20–31 s（TBE 即时编译），之后稳定在 0.6–0.7 s（进程内）
+或约 8.8 s（整条 plan 调用），别当成卡死；但**不要去开**
+`torch_npu.npu.set_compile_mode(jit_compile=True)`，那会让首次涨到约 400 s，必被 NavAgent
+默认的 60 s `rpc_timeout_ms` 打死（`src/deploy/nav_agent.py:285`）。另外停服不能只 TERM
+launcher 的 bash（实测 25 s 后 6 个进程还活着），要对全部 PID 先 TERM 再 `kill -9`，并手工清
+`$ROOT/t` 下残留的 `ppa-m*`/`ppa-v*`。
+
 **bootstrap 第一次在真正的新实例上跑是 2026-10-21。** 现在这台是手工装起来的，脚本是按"应该这样"写的，
 不是按"这样试过"写的；第一次换实例要留返工时间。
 

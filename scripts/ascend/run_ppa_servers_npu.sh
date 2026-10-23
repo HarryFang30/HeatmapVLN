@@ -296,7 +296,19 @@ TMP_ROOT="${PPA_NPU_TMP_ROOT:-/tmp}"
 mkdir -p "$TMP_ROOT"
 # Absolute, or the AF_UNIX length check below would measure a relative string while
 # the socket is bound under the full path.
-TMP_ROOT="$(cd "$TMP_ROOT" && pwd)" || die "PPA_NPU_TMP_ROOT is not usable: $TMP_ROOT"
+#
+# `pwd -P`, not `pwd`: physical, with every symlink resolved.  CANN's TBE checks the
+# compile directory against a whitelist before it compiles anything, and it resolves
+# the left side while comparing against the literal $TMPDIR
+# (cann-8.5.2/python/site-packages/tbe/tvm/contrib/ccec.py:1075 realpath, :1076
+# _check_tmpdir, :852-875 the whitelist).  So a TMPDIR holding a symlink fails that
+# check on *every* JIT compile in the process.  2026-10-22 on the nb2 instance, where
+# ~/work is a symlink to /mnt/sfs_turbo, this took out all 7 slots of the EXP-32
+# server as E40021 "dir path is invalid" -- naming a different op each time, because
+# whichever op reaches TBE first is the one that reports.  bash's `pwd` is logical and
+# keeps the symlink, so it was not enough.  The offline launcher never hit this: it
+# resolves with realpath already (run_s2_lora_train_npu.sh:67).
+TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)" || die "PPA_NPU_TMP_ROOT is not usable: $TMP_ROOT"
 AF_UNIX_MAX=108
 AF_UNIX_RESERVE=45
 
