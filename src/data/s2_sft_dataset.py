@@ -707,7 +707,10 @@ class S2SFTDataset(Dataset):
 
 
 def collate_sft(batch: Sequence[Mapping[str, Any]], *, pad_token_id: int) -> dict[str, Any]:
-    """Right-pad token rows; images of all rows are concatenated in row order."""
+    """Right-pad token rows; images of all rows are concatenated in row order.
+
+    ``kl`` is each row's KL-anchor tag (EXP-34), None where the sample has none.
+    """
     length = max(int(item["input_ids"].shape[0]) for item in batch)
     input_ids = torch.full((len(batch), length), int(pad_token_id), dtype=torch.long)
     attention_mask = torch.zeros((len(batch), length), dtype=torch.long)
@@ -722,6 +725,7 @@ def collate_sft(batch: Sequence[Mapping[str, Any]], *, pad_token_id: int) -> dic
         "attention_mask": attention_mask,
         "labels": labels,
         "keys": [item.get("key") for item in batch],
+        "kl": [item.get("kl") for item in batch],
     }
     if any("pixel_values" in item for item in batch):
         out["pixel_values"] = torch.cat([item["pixel_values"] for item in batch], dim=0)

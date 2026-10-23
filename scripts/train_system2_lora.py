@@ -23,6 +23,10 @@ Modes::
 ``--max-steps 0`` saves the freshly initialised adapter (B = 0) and stops.  This
 is the no-op adapter the server's byte-identity test needs.
 
+``--kl-beta B`` (EXP-34) adds B * KL(p_base || p_theta) on the supervised tokens of
+samples tagged ``kl: true``, p_base being the same model with the adapter off;
+``--keep-stream`` never deletes stream shards, so a resume reads them again.
+
 Outputs (``--output-dir``): ``adapter/`` (``adapter_config.json`` +
 ``adapter_model.safetensors``), ``manifest.json``, ``train_log.jsonl``, and
 ``checkpoints/step_*/`` (adapter + optimizer state, for ``--resume``).
@@ -405,13 +409,91 @@ def per_sample_token_mean_loss(logits: torch.Tensor, labels: torch.Tensor) -> tu
 
 
 def micro_loss(per_sample: torch.Tensor, counts: torch.Tensor, mode: str, samples_per_rank_step: int,
-               token_scale: torch.Tensor | None = None) -> torch.Tensor:
+               token_scale: torch.Tensor | None = None, *, kl_sum: torch.Tensor | None = None,
+               kl_beta: float = 0.0) -> torch.Tensor:
     """One micro-batch's share of the step loss.  ``sample``: every sample weighs the same.  ``token``: every
     supervised token of the global batch weighs the same (InternNav's HF Trainer); ``token_scale`` is
-    world_size / the global batch's supervised-token count, the world size undoing DDP's mean over ranks."""
+    world_size / the global batch's supervised-token count, the world size undoing DDP's mean over ranks.
+    ``kl_sum`` (token mode only) is the micro-batch's summed KL; the loss is then
+    (sum CE + kl_beta * sum KL) * token_scale, one denominator for both (ledger EXP-34 E)."""
     if mode == "token":
-        return (per_sample * counts).sum() * token_scale
+        total = (per_sample * counts).sum()
+        if kl_sum is not None:
+            total = total + kl_beta * kl_sum
+        return total * token_scale
+    if kl_sum is not None:
+        raise ValueError("the KL term shares the token-mode denominator; it needs loss normalization 'token'")
     return per_sample.sum() / samples_per_rank_step
+
+
+def kl_rows(batch: dict[str, Any]) -> torch.Tensor:
+    """Each row's ``kl`` tag as a bool tensor.  With ``--kl-beta`` > 0 every sample must carry one."""
+    rows = int(batch["labels"].shape[0])
+    tags = list(batch.get("kl") or [None] * rows)
+    keys = list(batch.get("keys") or [None] * rows)
+    missing = [key for key, tag in zip(keys, tags) if not isinstance(tag, bool)]
+    if missing:
+        raise RuntimeError(
+            f"--kl-beta > 0 needs a true/false kl tag on every sample; {len(missing)} in this micro-batch "
+            f"have none, e.g. {missing[:3]}"
+        )
+    return torch.tensor(tags, dtype=torch.bool)
+
+
+def kl_token_mask(labels: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """[B, L-1]: the supervised next-token positions of the rows tagged ``kl: true``."""
+    return (labels[:, 1:] != IGNORE_INDEX) & rows.to(labels.device)[:, None]
+
+
+def base_supervised_logits(peft_model, inputs: dict[str, torch.Tensor], mask: torch.Tensor) -> torch.Tensor:
+    """p_base's logits at ``mask`` ([N, V]): the same peft model, adapter disabled, no graph.
+
+    A plain full forward (vision tower included), not a shared-embedding shortcut.  Only
+    the masked rows are kept, so the [L, V] logits go before the training forward runs.
+    """
+    with torch.no_grad(), adapter_off(peft_model):
+        logits = peft_model(**inputs, use_cache=False).logits
+        return logits[:, :-1, :][mask]
+
+
+def supervised_kl_sum(logits: torch.Tensor, base_logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Sum over the masked positions of KL(p_base || p_theta) = sum_v p_base (log p_base - log p_theta), fp32."""
+    log_theta = F.log_softmax(logits[:, :-1, :][mask].float(), dim=-1)
+    log_base = F.log_softmax(base_logits.float(), dim=-1)
+    return (log_base.exp() * (log_base - log_theta)).sum()
+
+
+def micro_batch_loss(
+    ddp_model,
+    peft_model,
+    batch: dict[str, Any],
+    device: torch.device,
+    *,
+    mode: str,
+    samples_per_rank_step: int,
+    token_scale: torch.Tensor | None,
+    kl_beta: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+    """(loss to backward, per-sample CE, CE token counts, summed KL or None, KL token count).
+
+    ``kl_beta`` 0 is the CE-only trainer exactly: no adapter-off forward, the same loss
+    expression.  A micro-batch with no ``kl: true`` row skips the adapter-off forward
+    and adds an exact zero.
+    """
+    inputs = _to_device(batch, device)
+    labels = batch["labels"].to(device, non_blocking=True)
+    kl_sum, kl_tokens = None, 0
+    if kl_beta > 0:
+        mask = kl_token_mask(batch["labels"], kl_rows(batch))
+        kl_tokens = int(mask.sum())
+        mask = mask.to(device)
+        base = base_supervised_logits(peft_model, inputs, mask) if kl_tokens else None
+    logits = ddp_model(**inputs, use_cache=False).logits
+    per_sample, counts = per_sample_token_mean_loss(logits, labels)
+    if kl_beta > 0:
+        kl_sum = supervised_kl_sum(logits, base, mask) if kl_tokens else torch.zeros((), dtype=torch.float32, device=device)
+    loss = micro_loss(per_sample, counts, mode, samples_per_rank_step, token_scale, kl_sum=kl_sum, kl_beta=kl_beta)
+    return loss, per_sample, counts, kl_sum, kl_tokens
 
 
 def warmup_cosine(total_steps: int, warmup_ratio: float):
@@ -678,6 +760,8 @@ def train(args: argparse.Namespace, rt: Runtime) -> int:
     }
     if args.loss_normalization != "sample":  # absent for the default, so older runs keep their run key
         hyper["loss_normalization"] = args.loss_normalization
+    if args.kl_beta:  # likewise absent at 0
+        hyper["kl_beta"] = args.kl_beta
     run_key = hashlib.sha256(json.dumps({"hyper": hyper, "keys": keys_sha256}, sort_keys=True).encode()).hexdigest()
     _log(rt, log_path, {
         "event": "data",
@@ -735,11 +819,40 @@ def stream_start_shard(step: int, global_batch: int, shard_size: int, num_worker
     """First shard to read when (re)starting at optimizer ``step``.
 
     DataLoader workers read shards round-robin, ``num_workers`` at a time, so at any
-    step the consumed samples are spread over the current round.  Restarting at the
-    start of that round re-reads at most one round of samples and never skips one.
+    step the consumed samples are spread over the current round.  Reading restarts at
+    the start of that round, and ``stream_resume_skip`` drops what was already trained.
     """
     workers = max(1, int(num_workers))
     return (step * global_batch // (shard_size * workers)) * workers
+
+
+def stream_resume_skip(step: int, global_batch: int, shard_size: int, start_shard: int, rows_per_micro: int) -> int:
+    """Micro-batches a rank drops after opening the stream at ``start_shard``, to land on ``step``.
+
+    From the start of a workers' round the DataLoader's order is fixed by the worker
+    count alone, so dropping the ``step * global_batch - start_shard * shard_size``
+    samples trained before the checkpoint gives the uninterrupted run's batches exactly;
+    without it the round's head is trained twice and the stream's tail never.
+    ``rows_per_micro`` is world_size * micro_batch.
+    """
+    reread = int(step) * int(global_batch) - int(start_shard) * int(shard_size)
+    if reread < 0 or reread % int(rows_per_micro):
+        raise ValueError(f"step {step} does not lie after shard {start_shard} on a micro-batch boundary")
+    return reread // int(rows_per_micro)
+
+
+class _SkipHead:
+    """``loader`` iterated from its ``skip``-th batch on (a resume inside a workers' round)."""
+
+    def __init__(self, loader: DataLoader, skip: int):
+        self.loader, self.skip = loader, int(skip)
+
+    def __iter__(self):
+        batches = iter(self.loader)
+        for done in range(self.skip):
+            if next(batches, None) is None:
+                raise RuntimeError(f"the stream ran out after {done} of the {self.skip} micro-batches a resume skips")
+        return batches
 
 
 def prepare_stream_resume(stream_dir: Path, start_shard: int, rt: Runtime, log_path: Path) -> None:
@@ -766,6 +879,63 @@ def prepare_stream_resume(stream_dir: Path, start_shard: int, rt: Runtime, log_p
         })
         LOGGER.warning("stream resume: buffer cleared; restart the pusher with --start-shard %d", start_shard)
     rt.barrier()
+
+
+def clear_stream_markers(stream_dir: Path, start_shard: int, rt: Runtime, log_path: Path) -> None:
+    """``--keep-stream`` resume: every shard is still in the buffer, so only the done markers go.
+
+    Nothing is deleted or re-pushed; the readers start again at ``start_shard``.
+    """
+    if rt.is_main:
+        removed = 0
+        for path in list(stream_dir.glob("stream-*.tar.done.r*")):
+            path.unlink(missing_ok=True)
+            removed += 1
+        _log(rt, log_path, {"event": "stream_resume", "start_shard": start_shard, "keep_stream": True,
+                            "markers_removed": removed})
+    rt.barrier()
+
+
+def open_stream(args: argparse.Namespace, rt: Runtime, stream: dict[str, Any], processor, *, step: int,
+                log_path: Path) -> StreamShardDataset:
+    """The rank's reader from optimizer ``step`` on; a resume either keeps the stream or empties the buffer."""
+    shard_size = int(stream["shard_size"])
+    start_shard = stream_start_shard(step, args.global_batch, shard_size, args.num_workers)
+    if step and args.keep_stream:
+        clear_stream_markers(Path(args.stream_dir), start_shard, rt, log_path)
+    elif step:
+        prepare_stream_resume(Path(args.stream_dir), start_shard, rt, log_path)
+    return StreamShardDataset(
+        args.stream_dir,
+        processor,
+        rank=rt.rank,
+        world_size=rt.world_size,
+        start_shard=start_shard,
+        num_shards=int(stream["num_shards"]),
+        shard_size=shard_size,
+        wait_timeout_s=args.stream_wait_timeout,
+        delete_consumed=not args.keep_stream,
+    )
+
+
+def stream_loader(args: argparse.Namespace, rt: Runtime, stream: dict[str, Any], processor, collate, *, step: int,
+                  log_path: Path):
+    """The rank's micro-batches from optimizer ``step`` on, the same ones an uninterrupted run reads."""
+    dataset = open_stream(args, rt, stream, processor, step=step, log_path=log_path)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.micro_batch,
+        num_workers=args.num_workers,
+        collate_fn=collate,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
+    skip = stream_resume_skip(step, args.global_batch, int(stream["shard_size"]), dataset.start_shard,
+                              rt.world_size * args.micro_batch)
+    if not skip:
+        return loader
+    _log(rt, log_path, {"event": "stream_resume_skip", "step": step, "start_shard": dataset.start_shard,
+                        "skip_micro_batches": skip})
+    return _SkipHead(loader, skip)
 
 
 def train_from_stream(
@@ -816,31 +986,16 @@ def train_from_stream(
     }
     if args.loss_normalization != "sample":
         hyper["loss_normalization"] = args.loss_normalization
+    if args.kl_beta:
+        hyper["kl_beta"] = args.kl_beta
+    if args.keep_stream:  # the worker count fixes the read order a resume skips into
+        hyper["num_workers"] = args.num_workers
     run_key = hashlib.sha256(json.dumps({"hyper": hyper, "stream": stream_sha256}, sort_keys=True).encode()).hexdigest()
     _log(rt, log_path, {"event": "data", "stream_dir": args.stream_dir, "holdout_scenes": list(holdout),
                         "selection": stream["selection"], "drawn": stream["drawn"], "total_steps": total_steps})
 
     def make_loader(processor, collate, epoch: int, offset: int, step: int):
-        start_shard = stream_start_shard(step, args.global_batch, shard_size, args.num_workers)
-        if step:
-            prepare_stream_resume(Path(args.stream_dir), start_shard, rt, log_path)
-        dataset = StreamShardDataset(
-            args.stream_dir,
-            processor,
-            rank=rt.rank,
-            world_size=rt.world_size,
-            start_shard=start_shard,
-            num_shards=int(stream["num_shards"]),
-            shard_size=shard_size,
-            wait_timeout_s=args.stream_wait_timeout,
-        )
-        return DataLoader(
-            dataset,
-            batch_size=args.micro_batch,
-            num_workers=args.num_workers,
-            collate_fn=collate,
-            prefetch_factor=2 if args.num_workers > 0 else None,
-        )
+        return stream_loader(args, rt, stream, processor, collate, step=step, log_path=log_path)
 
     return _fit(
         args, rt,
@@ -935,8 +1090,9 @@ def _fit(
         for _ in range(offset, steps_per_epoch):
             if step >= total_steps:
                 break
-            # loss sum, samples, supervised tokens; fp32 because HCCL's fp64 support is not a given
-            totals = torch.zeros(3, dtype=torch.float32, device=rt.device)
+            # CE loss sum, samples, supervised (CE) tokens, KL sum, KL tokens; fp32 because HCCL's fp64
+            # support is not a given
+            totals = torch.zeros(5, dtype=torch.float32, device=rt.device)
             micro_batches = []
             for micro in range(accum):
                 try:
@@ -955,16 +1111,22 @@ def _fit(
                     dist.all_reduce(window_tokens)
                 token_scale = rt.world_size / window_tokens
             for micro, batch in enumerate(micro_batches):
-                labels = batch["labels"].to(rt.device, non_blocking=True)
                 sync = micro == accum - 1 or not rt.distributed
                 with contextlib.nullcontext() if sync else ddp_model.no_sync():
-                    logits = ddp_model(**_to_device(batch, rt.device), use_cache=False).logits
-                    per_sample, counts = per_sample_token_mean_loss(logits, labels)
-                    micro_loss(per_sample, counts, args.loss_normalization, args.micro_batch * accum,
-                               token_scale if args.loss_normalization == "token" else None).backward()
+                    loss, per_sample, counts, kl_sum, kl_tokens = micro_batch_loss(
+                        ddp_model, peft_model, batch, rt.device,
+                        mode=args.loss_normalization,
+                        samples_per_rank_step=args.micro_batch * accum,
+                        token_scale=token_scale if args.loss_normalization == "token" else None,
+                        kl_beta=args.kl_beta,
+                    )
+                    loss.backward()
                 totals[0] += per_sample.detach().sum()
                 totals[1] += float(per_sample.shape[0])
                 totals[2] += counts.sum().float()
+                if kl_sum is not None:
+                    totals[3] += kl_sum.detach()
+                    totals[4] += float(kl_tokens)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             optimizer.step()
             scheduler.step()
@@ -986,6 +1148,9 @@ def _fit(
                     "lr": scheduler.get_last_lr()[0],
                     "grad_norm": round(float(grad_norm), 6),
                     "supervised_tokens": int(totals[2]),
+                    "ce_tokens": int(totals[2]),
+                    "kl_tokens": int(totals[4]),
+                    "kl_mean": round(float(totals[3] / totals[4]), 6) if float(totals[4]) > 0 else None,
                     "s_per_step": round(elapsed / window_steps, 3),
                     "samples_per_s": round(window_steps * args.global_batch / max(elapsed, 1e-9), 3),
                     **memory_stats_gib(rt.device),
@@ -1164,6 +1329,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--loss-normalization", choices=("sample", "token"), default="sample",
                         help="sample: every sample weighs the same (EXP-23..26 S1); token: every supervised token "
                              "of the global batch weighs the same, as in InternNav's System2 SFT")
+    parser.add_argument("--kl-beta", type=float, default=0.0,
+                        help="EXP-34: add BETA * KL(p_base || p_theta) on the supervised tokens of samples tagged "
+                             "kl: true (p_base = adapter off), same denominator as the token-mean CE; "
+                             "0 = the CE-only trainer exactly")
     parser.add_argument("--global-batch", type=int, default=64)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=1.0, help="in weighted draws of len(selected) calls")
@@ -1183,11 +1352,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="train from the 4090-packed shard stream in this buffer dir (design §4) instead of records")
     parser.add_argument("--stream-wait-timeout", type=float, default=6 * 3600.0,
                         help="seconds a reader waits for the next shard before failing")
+    parser.add_argument("--keep-stream", action="store_true",
+                        help="never delete stream shards; a --resume then re-reads from its start shard instead "
+                             "of emptying the buffer for a re-push (EXP-34: the whole stream sits on /cache)")
     args = parser.parse_args(argv)
     if not args.stream_dir and not args.record_root:
         parser.error("--record-root is required unless --stream-dir is given")
     if args.stream_dir and args.parity_check:
         parser.error("--parity-check reads records, not a stream")
+    if args.keep_stream and not args.stream_dir:
+        parser.error("--keep-stream needs --stream-dir")
+    if args.kl_beta < 0:
+        parser.error("--kl-beta must be >= 0")
+    if args.kl_beta > 0 and args.loss_normalization != "token":
+        parser.error("--kl-beta shares the token-mean denominator: pass --loss-normalization token")
     return args
 
 

@@ -14,7 +14,8 @@ sample ``i`` (zero-padded to 6 digits):
 
 * ``{i}.json``  -- ``key``, ``source`` ("dagger" | "replay"), ``instruction``,
   ``turns`` (the supervised assistant turns), ``vlm_image_size``,
-  ``num_history``;
+  ``num_history``, and ``kl`` (EXP-34: whether the trainer's KL anchor applies
+  to this sample) when the packer set it;
 * ``{i}.h{k:02d}.jpg`` for ``k < num_history``, ``{i}.cur.jpg`` -- the front
   views as the client sent them;
 * ``{i}.look.jpg`` -- the 640x480 lookdown as sent.
@@ -63,6 +64,7 @@ class PackedSample:
     history_jpegs: tuple[bytes, ...]
     current_jpeg: bytes
     lookdown_jpeg: bytes
+    kl: bool | None = None  # None: not written, so shards packed before EXP-34 keep their bytes
 
 
 def write_shard(path: str | os.PathLike, samples: Sequence[PackedSample]) -> str:
@@ -80,6 +82,8 @@ def write_shard(path: str | os.PathLike, samples: Sequence[PackedSample]) -> str
                     "vlm_image_size": list(sample.vlm_image_size),
                     "num_history": len(sample.history_jpegs),
                 }
+                if sample.kl is not None:
+                    meta["kl"] = bool(sample.kl)
                 members = [(f"{i:06d}.json", json.dumps(meta, ensure_ascii=False).encode("utf-8"))]
                 members += [(f"{i:06d}.h{k:02d}.jpg", data) for k, data in enumerate(sample.history_jpegs)]
                 members += [(f"{i:06d}.cur.jpg", sample.current_jpeg), (f"{i:06d}.look.jpg", sample.lookdown_jpeg)]
@@ -105,6 +109,9 @@ def read_shard(path: str | os.PathLike) -> list[PackedSample]:
     i = 0
     while f"{i:06d}.json" in blobs:
         meta = json.loads(blobs[f"{i:06d}.json"])
+        kl = meta.get("kl")
+        if kl is not None and not isinstance(kl, bool):
+            raise ValueError(f"{path} sample {i}: kl is {kl!r}, not true/false")
         samples.append(
             PackedSample(
                 key=str(meta["key"]),
@@ -115,6 +122,7 @@ def read_shard(path: str | os.PathLike) -> list[PackedSample]:
                 history_jpegs=tuple(blobs[f"{i:06d}.h{k:02d}.jpg"] for k in range(int(meta["num_history"]))),
                 current_jpeg=blobs[f"{i:06d}.cur.jpg"],
                 lookdown_jpeg=blobs[f"{i:06d}.look.jpg"],
+                kl=kl,
             )
         )
         i += 1
@@ -156,6 +164,8 @@ class StreamShardDataset(IterableDataset):
     samples per shard.  When a rank finishes a shard it leaves a marker; whoever
     finds all ``world`` markers deletes the shard and the markers.  A shard that
     has not arrived yet is waited for (the 4090 pushes ahead of the reader).
+    With ``delete_consumed=False`` (the trainer's ``--keep-stream``) the markers are
+    still left but nothing is deleted, so the whole stream stays for a resume.
     """
 
     def __init__(
@@ -222,6 +232,8 @@ class StreamShardDataset(IterableDataset):
                 messages, images, lookdown = packed_inputs(sample)
                 encoded = encode_conversation(self.processor, messages, images, lookdown, sample.turns)
                 encoded["key"] = sample.key
+                if sample.kl is not None:
+                    encoded["kl"] = sample.kl
                 yield encoded
             self._finish(index)
 
