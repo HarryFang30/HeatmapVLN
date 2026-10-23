@@ -85,10 +85,12 @@ LETTERS = "abcdefghij"
 
 FIG_A = {"head_h": 0.16, "row_gap": 0.08, "route_gap": 0.05, "gutter": 0.11, "k_gap": 0.05, "dec_gap": 0.025,
          "strip_gap": 0.02, "fut_elev": 36.0, "ticks_h": 0.12, "legend_gap": 0.09, "k_w_max": 1.45,
-         "route_w_min": 1.3, "chip_pt": 6.4, "chip_inset_pt": 2.4}
+         "route_w_min": 1.3, "chip_pt": 6.4, "chip_inset_pt": 2.4, "map_label": 0.13}
 FIG_B = {"top_pad": 0.02, "route_w": 1.53, "name_w": 0.20, "ylab": 0.28, "head_gap": 0.03, "badges": 0.13,
          "gap": 0.055, "turn_gap": f2.TURN_GAP, "turn": f2.TURN_H, "ticks": 0.125, "row_gap": 0.11,
-         "legend_gap": 0.08, "hist_frac": 0.59, "panels_min": 0.5, "panels_max": 1.6}
+         "legend_gap": 0.08, "hist_frac": 0.59, "panels_min": 0.5, "panels_max": 1.6, "map_label": 0.13}
+# "map_label": a strip that wide at the left of the route column holds the first route map's name; the maps are
+# that much narrower, everything right of the route column stays put.
 
 LABELS: Dict[str, Dict[str, object]] = {
     "en": {
@@ -99,6 +101,7 @@ LABELS: Dict[str, Dict[str, object]] = {
         "names": {"F1": "reached the goal area, stopped elsewhere"},  # else fb.CATEGORY_NAMES
         "rows": ("History", "Future"),
         "row_dec": "Current view",  # figure A only, left of the first decision image
+        "row_map": "Top-down view",  # both figures, left of the first route map
         "legend": {
             "route": "route", "ref": "reference path", "offlevel": "other floor", "start": "start",
             "goal": "goal ({r:g} m)", "stop": "stop", "num": "key moment", "pgoal": "pixel goal",
@@ -116,6 +119,7 @@ LABELS: Dict[str, Dict[str, object]] = {
         "names": {},
         "rows": ("历史", "未来"),
         "row_dec": "当前观测",
+        "row_map": "俯视图",
         "legend": {
             "route": "路线", "ref": "参考路径", "offlevel": "另一楼层", "start": "起点", "goal": "目标（{r:g} m）",
             "stop": "停止处", "num": "关键时刻", "pgoal": "像素目标", "path": "快系统轨迹", "actions": "执行的动作",
@@ -702,7 +706,7 @@ def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_r
         k_w, route_w, height = solve_a(n, n_cols, legend_h)
         route_h = moment_rows(k_w)["end"]
         stops = [p2.stop_shown(b.xz("route_xz"), b.xz("reference_path_xz"), b.goal_xz, float(b.goal_radius_m),
-                               route_w, route_h) for b in bundles]
+                               route_w - g["map_label"], route_h) for b in bundles]
         lines = legend_lines(fig, legend_groups_a(L, any(stops), offlevel, radius), (PAPER_W - EDGE) * 72.0)
         legend_h = legend_height(lines)
     k_w, route_w, height = solve_a(n, n_cols, legend_h)
@@ -716,7 +720,7 @@ def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_r
     for i, (b, ms, nm, td) in enumerate(zip(bundles, moments, nums, topdowns)):
         draw_head_a(page, y, b, LETTERS[i], lang, L)
         yb = y + g["head_h"]
-        rinfo = draw_route(page, 0.0, yb, route_w, route_h, b, td, nm, L)
+        rinfo = draw_route(page, g["map_label"], yb, route_w - g["map_label"], route_h, b, td, nm, L)
         stop_drawn.append(rinfo["stop_drawn"])
         for c, ks in enumerate(ms):
             info = draw_moment(page, x_cols + c * (k_w + g["k_gap"]), yb, k_w, ks, nm[ks.label], L,
@@ -725,7 +729,8 @@ def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_r
             pairs += info["pairs"]
             corners.append(info["chips_corner"])
             cover += int(info["chips_cover_goal"])
-        if i == 0:  # the decision image and strip rows named once, in the gutter left of the first column
+        if i == 0:  # the route map named once left of it; the decision image and strip rows in the gutter
+            row_name(page, g["map_label"] / 2, yb + route_h / 2, L["row_map"], lang)
             gx = route_w + g["route_gap"] + g["gutter"] * 0.42
             row_name(page, gx, yb + rows["dec"] + 0.75 * k_w / 2, L["row_dec"], lang)
             for key, text in zip(("hist", "fut"), L["rows"]):
@@ -748,7 +753,8 @@ def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_r
         res["warnings"].append(f"{name} [{lang}]: executed-action chips cover {cover} pixel goals")
     files, pinfo = save(fig, Path(out_dir) / name, lang, caption, pptx=pptx)
     return {"files": files, "size_in": (PAPER_W, round(height, 3)), **res, "checks": checks,
-            "k_w_in": round(k_w, 3), "route_in": (round(route_w, 3), round(route_h, 3)), "edge_marks": edge,
+            "k_w_in": round(k_w, 3), "route_in": (round(route_w - g["map_label"], 3), round(route_h, 3)),
+            "map_label_in": g["map_label"], "edge_marks": edge,
             "strip_pair_lines": pairs, "chips_corners": corners, "chips_cover_goal": cover,
             "legend_lines": len(lines), "halo_texts_boxed": n_halo, "caption_chars": len(caption),
             "pptx": {k: v for k, v in pinfo.items() if k != "file"}}
@@ -901,7 +907,7 @@ def make_fig_b(bundles: Sequence[bd.Bundle], timelines: Sequence[tp.Timeline], o
         hh, fh = panel_heights(fixed0 + legend_h, n)
         route_h = fixed_row - g["ticks"] + hh + fh
         stops = [p2.stop_shown(b.xz("route_xz"), b.xz("reference_path_xz"), b.goal_xz, float(b.goal_radius_m),
-                               g["route_w"], route_h) for b in bundles]
+                               g["route_w"] - g["map_label"], route_h) for b in bundles]
         lines = legend_lines(fig, legend_groups_b(L, any(stops), offlevel, radius, grey), (PAPER_W - EDGE) * 72.0)
         legend_h = legend_height(lines)
     fixed = fixed0 + legend_h
@@ -916,9 +922,10 @@ def make_fig_b(bundles: Sequence[bd.Bundle], timelines: Sequence[tp.Timeline], o
         draw_head_b(page, y, parts[i], heads[i])
         yb = y + head_h[i]
         info = draw_timeline(page, tl_x, yb, tl_w, hh, fh, badges_h, tl, L)
-        rinfo = draw_route(page, 0.0, yb, g["route_w"], route_h, b, td, nm, L)
+        rinfo = draw_route(page, g["map_label"], yb, g["route_w"] - g["map_label"], route_h, b, td, nm, L)
         stop_drawn.append(rinfo["stop_drawn"])
-        if i == 0:  # the panels named once, 3 pt left of the widest tick label, clear of the route map
+        if i == 0:  # the route map named once left of it; the panels 3 pt left of the widest tick label
+            row_name(page, g["map_label"] / 2, yb + route_h / 2, L["row_map"], lang)
             ticks_pt = tp.TICK_LEN + tp.TICK_PAD + max(cd.text_width_pt(fig, t, p2.MIN_FS) for t in
                                                        list(L["y_hist"]) + list(L["y_fut"]) + [L["turns"]])
             name_pt = max(cd.text_width_pt(fig, c, p2.MIN_FS) for c in "".join(L["rows"])) if lang == "zh" \
