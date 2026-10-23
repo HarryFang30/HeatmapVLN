@@ -1,0 +1,238 @@
+{
+ "label": "r2r_train_round1",
+ "episodes": 3613,
+ "scenes": 55,
+ "SR": 86.0,
+ "OS": 93.91,
+ "cap_rate": 4.57,
+ "stopfar_rate": 9.47,
+ "calls_per_ep": {
+  "p10": 12.0,
+  "p25": 15.0,
+  "p50": 20.0,
+  "p75": 30.0,
+  "p90": 66.0,
+  "mean": 30.65,
+  "n": 3613
+ },
+ "calls_per_ep_succ": {
+  "p10": 12.0,
+  "p25": 14.0,
+  "p50": 19.0,
+  "p75": 26.0,
+  "p90": 40.0,
+  "mean": 23.72,
+  "n": 3107
+ },
+ "calls_per_ep_fail": {
+  "p10": 17.0,
+  "p25": 27.0,
+  "p50": 64.0,
+  "p75": 127.0,
+  "p90": 131.0,
+  "mean": 73.16,
+  "n": 506
+ },
+ "steps_per_ep": {
+  "p10": 40.0,
+  "p25": 50.0,
+  "p50": 68.0,
+  "p75": 105.0,
+  "p90": 241.0,
+  "mean": 110.0,
+  "n": 3613
+ },
+ "geo": {
+  "p10": 5.59,
+  "p25": 6.95,
+  "p50": 8.68,
+  "p75": 11.14,
+  "p90": 13.79,
+  "mean": 9.29,
+  "n": 3613
+ },
+ "steps_per_call": 3.59,
+ "maxdev": {
+  "p10": 0.24,
+  "p25": 0.34,
+  "p50": 0.53,
+  "p75": 1.12,
+  "p90": 3.08,
+  "mean": 1.22,
+  "n": 3613
+ },
+ "dev1": {
+  "trigger_rate": 26.79,
+  "trigger_rate_succ": 19.6,
+  "trigger_rate_fail": 70.95,
+  "fail_covered": 70.95,
+  "call_at_trigger": {
+   "p10": 3.0,
+   "p25": 5.0,
+   "p50": 11.0,
+   "p75": 25.0,
+   "p90": 58.3,
+   "mean": 21.76,
+   "n": 968
+  },
+  "step_at_trigger": {
+   "p10": 12.0,
+   "p25": 21.75,
+   "p50": 44.0,
+   "p75": 96.0,
+   "p90": 215.3,
+   "mean": 82.92,
+   "n": 968
+  },
+  "dgoal_at_trigger": {
+   "p10": 1.17,
+   "p25": 2.58,
+   "p50": 6.1,
+   "p75": 9.47,
+   "p90": 12.66,
+   "mean": 6.54,
+   "n": 968
+  },
+  "union_trigger_rate": 30.86,
+  "union_fail_covered": 100.0,
+  "expert_samples_per_takeover_ep": {
+   "p10": 2.45,
+   "p25": 3.92,
+   "p50": 8.27,
+   "p75": 12.93,
+   "p90": 17.21,
+   "mean": 9.09,
+   "n": 1115
+  },
+  "pre_takeover_calls_per_takeover_ep": {
+   "p10": 3.0,
+   "p25": 6.0,
+   "p50": 14.0,
+   "p75": 48.0,
+   "p90": 124.0,
+   "mean": 33.47,
+   "n": 1115
+  },
+  "samples_per_cohort_ep": {
+   "expert_only": 2.81,
+   "expert_plus_pre_takeover_calls": 13.13,
+   "all_calls_plus_expert": 26.9
+  }
+ },
+ "dev2": {
+  "trigger_rate": 15.97,
+  "trigger_rate_succ": 8.75,
+  "trigger_rate_fail": 60.28,
+  "fail_covered": 60.28,
+  "call_at_trigger": {
+   "p10": 4.0,
+   "p25": 6.0,
+   "p50": 13.0,
+   "p75": 29.0,
+   "p90": 72.0,
+   "mean": 24.76,
+   "n": 577
+  },
+  "step_at_trigger": {
+   "p10": 17.0,
+   "p25": 26.0,
+   "p50": 49.0,
+   "p75": 112.0,
+   "p90": 257.0,
+   "mean": 94.22,
+   "n": 577
+  },
+  "dgoal_at_trigger": {
+   "p10": 2.27,
+   "p25": 4.29,
+   "p50": 7.41,
+   "p75": 10.35,
+   "p90": 13.19,
+   "mean": 7.68,
+   "n": 577
+  },
+  "union_trigger_rate": 21.56,
+  "union_fail_covered": 100.0,
+  "expert_samples_per_takeover_ep": {
+   "p10": 3.68,
+   "p25": 5.44,
+   "p50": 9.1,
+   "p75": 13.62,
+   "p90": 17.19,
+   "mean": 9.86,
+   "n": 779
+  },
+  "pre_takeover_calls_per_takeover_ep": {
+   "p10": 5.0,
+   "p25": 8.0,
+   "p50": 19.0,
+   "p75": 76.5,
+   "p90": 127.0,
+   "mean": 44.17,
+   "n": 779
+  },
+  "samples_per_cohort_ep": {
+   "expert_only": 2.13,
+   "expert_plus_pre_takeover_calls": 11.65,
+   "all_calls_plus_expert": 28.7
+  }
+ },
+ "dev3": {
+  "trigger_rate": 10.32,
+  "trigger_rate_succ": 4.18,
+  "trigger_rate_fail": 48.02,
+  "fail_covered": 48.02,
+  "call_at_trigger": {
+   "p10": 6.0,
+   "p25": 9.0,
+   "p50": 15.0,
+   "p75": 33.0,
+   "p90": 72.4,
+   "mean": 27.62,
+   "n": 373
+  },
+  "step_at_trigger": {
+   "p10": 23.0,
+   "p25": 34.0,
+   "p50": 61.0,
+   "p75": 128.0,
+   "p90": 263.4,
+   "mean": 105.16,
+   "n": 373
+  },
+  "dgoal_at_trigger": {
+   "p10": 3.45,
+   "p25": 5.53,
+   "p50": 8.15,
+   "p75": 10.84,
+   "p90": 14.09,
+   "mean": 8.5,
+   "n": 373
+  },
+  "union_trigger_rate": 17.63,
+  "union_fail_covered": 100.0,
+  "expert_samples_per_takeover_ep": {
+   "p10": 2.91,
+   "p25": 5.65,
+   "p50": 9.34,
+   "p75": 13.51,
+   "p90": 17.53,
+   "mean": 10.02,
+   "n": 637
+  },
+  "pre_takeover_calls_per_takeover_ep": {
+   "p10": 7.0,
+   "p25": 13.0,
+   "p50": 30.0,
+   "p75": 108.0,
+   "p90": 129.0,
+   "mean": 54.17,
+   "n": 637
+  },
+  "samples_per_cohort_ep": {
+   "expert_only": 1.77,
+   "expert_plus_pre_takeover_calls": 11.32,
+   "all_calls_plus_expert": 29.92
+  }
+ }
+}

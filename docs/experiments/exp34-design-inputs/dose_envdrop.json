@@ -1,0 +1,122 @@
+{
+ "X2_K10": {
+  "n": 1771,
+  "takeover_rate": 54.6,
+  "why": {
+   "dev": 40.0,
+   "noprog": 7.8,
+   "stopfar": 6.4,
+   "cap": 0.4
+  },
+  "takeover_in_success": 24.6,
+  "call_at_trigger": {
+   "p10": 4.0,
+   "p25": 7.5,
+   "p50": 12.0,
+   "p75": 17.0,
+   "p90": 22.0,
+   "mean": 13.91,
+   "n": 967
+  },
+  "step_at_trigger": {
+   "p10": 18.0,
+   "p25": 31.0,
+   "p50": 48.0,
+   "p75": 68.0,
+   "p90": 89.0,
+   "mean": 55.84,
+   "n": 967
+  },
+  "dgoal_at_trigger": {
+   "p10": 2.25,
+   "p25": 3.68,
+   "p50": 6.39,
+   "p75": 10.34,
+   "p90": 13.99,
+   "mean": 7.49,
+   "n": 967
+  },
+  "E_per_takeover_ep": {
+   "p10": 4.0,
+   "p25": 6.0,
+   "p50": 10.0,
+   "p75": 15.0,
+   "p90": 20.0,
+   "mean": 11.21,
+   "n": 967
+  },
+  "per_cohort_ep": {
+   "E": 6.12,
+   "D8": 4.03,
+   "Dall48": 7.67,
+   "A": 8.76,
+   "core_E_D8": 10.15,
+   "all_E_Dall_A": 22.55
+  },
+  "sec_per_ep_takeover": 78.7,
+  "sec_per_ep_full_model": 117.7,
+  "eps_per_slot_hour_takeover": 45.7,
+  "eps_per_slot_hour_full": 30.6,
+  "steps_per_ep_recorded": 84.6
+ },
+ "X3_K10": {
+  "n": 1771,
+  "takeover_rate": 48.7,
+  "why": {
+   "dev": 25.5,
+   "noprog": 12.7,
+   "stopfar": 10.0,
+   "cap": 0.5
+  },
+  "takeover_in_success": 14.9,
+  "call_at_trigger": {
+   "p10": 6.0,
+   "p25": 10.0,
+   "p50": 14.0,
+   "p75": 19.0,
+   "p90": 24.0,
+   "mean": 15.84,
+   "n": 863
+  },
+  "step_at_trigger": {
+   "p10": 24.0,
+   "p25": 38.0,
+   "p50": 53.0,
+   "p75": 73.0,
+   "p90": 94.0,
+   "mean": 62.73,
+   "n": 863
+  },
+  "dgoal_at_trigger": {
+   "p10": 3.25,
+   "p25": 4.2,
+   "p50": 6.92,
+   "p75": 10.59,
+   "p90": 14.24,
+   "mean": 7.99,
+   "n": 863
+  },
+  "E_per_takeover_ep": {
+   "p10": 6.0,
+   "p25": 7.0,
+   "p50": 10.0,
+   "p75": 15.0,
+   "p90": 20.0,
+   "mean": 11.91,
+   "n": 863
+  },
+  "per_cohort_ep": {
+   "E": 5.81,
+   "D8": 3.76,
+   "Dall48": 7.67,
+   "A": 10.09,
+   "core_E_D8": 9.57,
+   "all_E_Dall_A": 23.56
+  },
+  "sec_per_ep_takeover": 84.7,
+  "sec_per_ep_full_model": 117.7,
+  "eps_per_slot_hour_takeover": 42.5,
+  "eps_per_slot_hour_full": 30.6,
+  "steps_per_ep_recorded": 88.7
+ }
+}
