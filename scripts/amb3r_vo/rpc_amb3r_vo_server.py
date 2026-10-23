@@ -438,6 +438,22 @@ def _prepare_accelerator(device: str) -> None:
         # state, so it cannot change the poses served.
         import torch.nn.functional as functional
 
+        # TMPDIR must resolve to itself, or CANN's TBE rejects every JIT compile in
+        # this process with E40021 "dir path is invalid": it resolves the compile
+        # directory, then compares it against the literal $TMPDIR
+        # (cann-8.5.2/.../tbe/tvm/contrib/ccec.py:1075-1076, :852-875).  This server
+        # is checked too, not only the model server: on 2026-10-22 the nb2 instance
+        # handed both the same bad TMPDIR, and in one reproduction the VO process was
+        # the one that died first -- whichever reaches TBE first reports.  The conv2d
+        # below does not catch it; it comes from the prebuilt kernel library.
+        tmpdir = os.environ.get("TMPDIR", "")
+        physical = os.path.realpath(tmpdir) if tmpdir else ""
+        if tmpdir and physical != tmpdir:
+            raise RuntimeError(
+                f"TMPDIR={tmpdir!r} resolves to {physical!r}; CANN's TBE would reject "
+                "every JIT compile with E40021 'dir path is invalid'. Point TMPDIR "
+                "(for the certified launcher, PPA_NPU_TMP_ROOT) at the physical path."
+            )
         with torch.no_grad():
             image = torch.zeros(1, 3, 28, 28, device=device, dtype=torch.bfloat16)
             kernel = torch.zeros(8, 3, 14, 14, device=device, dtype=torch.bfloat16)

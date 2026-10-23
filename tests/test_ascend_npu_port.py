@@ -484,6 +484,26 @@ def test_npu_launcher_keeps_tmpdir_short_enough_for_an_af_unix_socket():
     assert "too long for an AF_UNIX socket" in script
 
 
+def test_npu_launcher_resolves_tmpdir_to_a_physical_path():
+    """A symlink in TMPDIR makes CANN reject every JIT compile in the process."""
+    script = NPU_LAUNCHER.read_text(encoding="utf-8")
+    # bash's `pwd` is logical and keeps the symlink; TBE resolves the compile directory
+    # and then compares it against the literal $TMPDIR, so the two never match.
+    assert 'TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"' in script
+    assert 'TMP_ROOT="$(cd "$TMP_ROOT" && pwd)"' not in script
+
+
+def test_both_servers_refuse_a_symlinked_tmpdir_on_npu():
+    """Named here because the symptom (E40021 on a random op) names nothing useful.
+
+    Both servers are checked: they get the same TMPDIR from the launcher, and whichever
+    reaches TBE first is the one that reports.
+    """
+    for source in (_code_only(MODEL_SERVER), _code_only(VO_SERVER)):
+        assert "os.path.realpath(tmpdir)" in source
+        assert "E40021" in source
+
+
 def test_both_servers_leave_the_fused_mha_fastpath_off_on_npu():
     """The fused encoder-layer kernel has no NPU implementation and runs on the CPU."""
     model = _code_only(MODEL_SERVER)
