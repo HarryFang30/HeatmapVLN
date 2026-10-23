@@ -4969,6 +4969,34 @@ Go2 自带的前相机离地约 0.4 m。买件、装件之前，先在 Habitat �
 - **审稿二·910B 收流 `--cap-gb 80`**：改成 100。按新的组成，主流最大约 73 GB，80 的余量太小。
 - **审稿一·B1**（EnvDrop 部分同时剔除与 P_new 路线相交的集）：不需要单写。P_new 已剔除 H 场景，而 dev/P_hold 只在 H 里抽，按构造不相交。
 
+
+**运行记录.**
+1. **快路线（用户 2026-10-23 定，在任何候选读数之前）**：用户要求立刻开训，val 至多 2 个种子，不做偏离主线的检验。相对上面的判据与设置改了这些，其余照旧：
+   - **不新采接管数据**，B 节整节不做。只用 P_old：EnvDrop 1,771 集、R2R round1（去掉 H）、HM3D collect_base 训练场景 3,348 集。
+   - **标签改用线 B**（`label_route_corrections.py` / `s2_route_labels.py`，EXP-25/28 用过，K1 与 AUD 都过过），不用 C1 的后见 SPF 规则。C4 E0、C5 K1 不做。
+   - **建流**用 `scripts/exp34/build_exp34_stream.py`：
+     - COR = 线 B 的 correction，AGR = 线 B 的 anchor，1:1，每集 ≤6；
+     - TERM = d ≤3 m 的已执行底座调用，取 ⌈COR/2⌉；
+     - REP 占 20%，STOP ×5；
+     - kl：COR 为 false，其余为 true；
+     - cuda 来源的 AGR/TERM 用记录原文，不在 910B 上重解码。
+   - **不做**：X34-R、A1–A3、F0–F6、G、H。
+   - **训练配方照 E**：LoRA r64/α128，CE + 1.0·KL，token 平均，lr 5e-5，全局 batch 64，单遍。
+   - **val 改为 k=2**（种子 42、1337），两臂都在 910B 上、开预算、按实际跑法计分、按集配对。
+     - 估计量与 SE 同 J：Δ̂_2 和 SE_2。
+     - **支持** = Δ̂_2 − 1.96·SE_2 > 0 且 ΔSPL ≥ −1.0；**支持（≥+1）** 另要求 Δ̂_2 ≥ +1.0；**否定** = Δ̂_2 ≤ 0；其余为没测出来。
+     - 600 集伤害停照旧。
+   - **B0 不再和候选同时跑**：B0 的两个种子在训练期间先跑，候选之后在同一个 worker、同一个种子上跑。
+2. **B0 开跑（2026-10-23 18:56 UTC）**：
+   - 服务端：worker-1 跑种子 42（端口 52420/52520），worker-2 跑种子 1337（52430/52530），代码 `exp23/src_x32`（e941a3e）。用 `EXP23_ROOT=/mnt/sfs_turbo/zhr/zhr_1` 绕开 E40021。
+   - 客户端：4090 的 `/workspace/exp23/wt_x32`（2f88f73，`PPA_EVAL_ALLOW_COMMIT_MISMATCH=1`；两个提交之间没有服务端或客户端代码的改动）。
+   - 输出：`/workspace/eval_runs/exp34_B0_seed{42,1337}_910b_stepbudget`。
+3. **标签与流（2026-10-23 18:46–19:31 UTC）**：
+   - 线 B 标签：EnvDrop 1,771/1,771 集（纠正 9,290），R2R 4,005/4,005（纠正 8,417，含 H，建流时去掉），都在 `/workspace/exp34/labels/`。HM3D 用 EXP-28 现成的 `/workspace/exp28/labels_base`。
+   - 流 `/workspace/exp34/stream/main`：73,216 条，其中 COR 23,396、AGR 23,396、TERM 11,698、REP 14,726；286 片，25 GB。
+   - 流里 STOP 占 6.37%：≤1 m 是底座的 0.95 倍，1–3 m 是 1.03 倍，>3 m 为 0。反向转为 0，COR 里没有越窗像素。
+   - 推到 worker-0 的 `zhr_1/exp34/stream/main`。
+
 ---
 
 ## 4. 公共资源
