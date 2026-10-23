@@ -1430,8 +1430,55 @@ def build_habitat_config(args):
     cfg.TASK.ACTIONS.LOOK_UP.TYPE = "LookUpAction"
     cfg.TASK.ACTIONS.LOOK_DOWN.TYPE = "LookDownAction"
 
+    # EXP-33 camera mounts; without the flags the config above is untouched.
+    mount = _camera_mount(args)
+    if mount is not None:
+        for sensor in (cfg.SIMULATOR.RGB_SENSOR, cfg.SIMULATOR.DEPTH_SENSOR):
+            sensor.POSITION = [0, mount["height_m"], 0]
+            # Habitat's sensor ORIENTATION is Euler XYZ in radians; a negative x pitches the view down.
+            sensor.ORIENTATION = [math.radians(mount["pitch_deg"]), 0.0, 0.0]
+
     cfg.freeze()
     return cfg
+
+
+def _camera_mount(args) -> dict[str, Any] | None:
+    """The camera mount the EXP-33 flags ask for, or None when none of them is given.
+
+    One depth+RGB camera at ``height_m`` above the agent's base, pitched ``pitch_deg``
+    (negative = down) and fixed there.  ``lookdown`` is "rotate" (the sensor tilts
+    2 x TILT_ANGLE for the look-down image, as in training) or "same_frame" (one fixed
+    camera: the look-down image is the current front frame, as InternNav's real-world
+    server does).
+    """
+    height = getattr(args, "camera_height_m", None)
+    pitch = getattr(args, "camera_pitch_deg", None)
+    lookdown = getattr(args, "lookdown_mode", "rotate")
+    if height is None and pitch is None and lookdown == "rotate":
+        return None
+    return {
+        "height_m": 1.25 if height is None else float(height),
+        "pitch_deg": 0.0 if pitch is None else float(pitch),
+        "lookdown": str(lookdown),
+    }
+
+
+def _check_camera_mount(env, mount: dict[str, Any]) -> None:
+    """Fail unless Habitat's RGB sensor sits where ``mount`` says, relative to the agent's base."""
+    state = env._sim.get_agent(0).get_state()
+    sensor = (getattr(state, "sensor_states", None) or {}).get("rgb")
+    if sensor is None:
+        raise RuntimeError("camera mount check needs the RGB sensor state ('rgb')")
+    height = float(sensor.position[1]) - float(state.position[1])
+    body = quaternion.as_rotation_matrix(state.rotation)
+    camera = quaternion.as_rotation_matrix(sensor.rotation)
+    forward = body.T @ camera @ np.array([0.0, 0.0, -1.0])
+    pitch = math.degrees(math.asin(float(np.clip(forward[1], -1.0, 1.0))))
+    if abs(height - mount["height_m"]) > 1e-3 or abs(pitch - mount["pitch_deg"]) > 0.05:
+        raise RuntimeError(
+            f"camera mount not applied: sensor at {height:.4f} m, pitch {pitch:.3f} deg; "
+            f"asked for {mount['height_m']} m, {mount['pitch_deg']} deg"
+        )
 
 
 # The client logs an episode as "Episode <scene>_<id>:", which scripts/exp25/probe_metrics.py
@@ -1709,9 +1756,18 @@ def capture_lookdown_view(
     trained with exactly this procedure and the tilt sensor state must be
     consistent.  ``depth_out`` (EXP-23 records) receives a copy of the depth of
     the same observation, still normalised, or None when it has no depth.
+
+    With a single fixed camera (``--lookdown_mode same_frame``) nothing tilts: the
+    look-down image is the front frame where the sensor already points.
     """
-    env.step(ActionCode.LOOKDOWN)
-    obs = env.step(ActionCode.LOOKDOWN)
+    same_frame = _lookdown_reuses_front(env)
+    if same_frame:
+        if depth_out is not None:
+            raise RuntimeError("--lookdown_mode same_frame has no look-down depth for EXP-23 records")
+        obs = env._sim.get_sensor_observations()
+    else:
+        env.step(ActionCode.LOOKDOWN)
+        obs = env.step(ActionCode.LOOKDOWN)
 
     rgb = _extract_rgb_array(obs)
     if rgb is None:
@@ -1721,9 +1777,15 @@ def capture_lookdown_view(
         depth = obs.get("depth")
         depth_out.append(None if depth is None else np.array(depth, dtype=np.float32, copy=True))
 
-    env.step(ActionCode.LOOKUP)
-    env.step(ActionCode.LOOKUP)
+    if not same_frame:
+        env.step(ActionCode.LOOKUP)
+        env.step(ActionCode.LOOKUP)
     return lookdown_img
+
+
+def _lookdown_reuses_front(env) -> bool:
+    """True for a single fixed camera (EXP-33), set on the env by the RPC path; default False."""
+    return bool(getattr(env, "heatmapvln_lookdown_same_frame", False))
 
 
 def _eval_image_sizes(train_cfg: dict) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -1824,8 +1886,15 @@ def _vlm_requests_stop(llm_output: str) -> bool:
 
 
 def _apply_habitat_action(env, action: int):
-    """Execute one Habitat action; LOOKDOWN is issued twice like InternNav."""
-    if action == ActionCode.LOOKDOWN:
+    """Execute one Habitat action; LOOKDOWN is issued twice like InternNav.
+
+    A single fixed camera (EXP-33 same_frame) cannot tilt: LOOKDOWN still takes its step,
+    and the view is put back where it was (LOOK_DOWN, LOOK_UP) before anything sees it.
+    """
+    if action == ActionCode.LOOKDOWN and _lookdown_reuses_front(env):
+        env.step(ActionCode.LOOKDOWN)
+        observations = env.step(ActionCode.LOOKUP)
+    elif action == ActionCode.LOOKDOWN:
         env.step(action)
         observations = env.step(action)
     else:
@@ -4496,6 +4565,10 @@ def run_eval_rpc_panoramic(args):
     )
     print("Creating Habitat environment ...")
     env = _create_habitat_env(hab_cfg, args)
+    camera_mount = _camera_mount(args)
+    if camera_mount is not None:
+        env.heatmapvln_lookdown_same_frame = camera_mount["lookdown"] == "same_frame"
+        print(f"camera mount (EXP-33): {json.dumps(camera_mount, sort_keys=True)}", flush=True)
     num_episodes = len(list(env.episodes))
     print(f"Total episodes: {num_episodes}")
     step_tracer = None
@@ -4709,6 +4782,8 @@ def run_eval_rpc_panoramic(args):
     if stop_at_step_budget:
         # Only when on, so runs without the flag keep the exact row schema they always had.
         rpc_progress_contract["stop_at_step_budget"] = True
+    # Rows carry the mount only when one is set; None here also refuses those rows in a default run.
+    rpc_progress_contract["camera_mount"] = camera_mount
     sucs, spls, oss, nes, done_set = _load_progress(
         progress_file,
         expected_rpc_sampling_contract=rpc_progress_contract,
@@ -4748,6 +4823,8 @@ def run_eval_rpc_panoramic(args):
             continue
 
         _check_reset_episode(env, episode)
+        if camera_mount is not None:
+            _check_camera_mount(env, camera_mount)
         instruction = _normalize_instruction(episode.instruction.instruction_text)
         eval_count += 1
         print(f"\n[{eval_count}/{eval_limit}] Episode {scene_id}_{episode_id:04d}: {instruction[:80]}...")
@@ -5712,6 +5789,8 @@ def run_eval_rpc_panoramic(args):
         if stop_at_step_budget:
             result["stop_at_step_budget"] = True
             result["step_budget_stop"] = bool(step_budget_stop)
+        if camera_mount is not None:
+            result["camera_mount"] = camera_mount
         if s2_record_summary is not None:
             result["s2_record"] = s2_record_summary
         if stage0_action_trace:
@@ -5771,6 +5850,8 @@ def run_eval_rpc_panoramic(args):
     )
     if stop_at_step_budget:
         final_result["stop_at_step_budget"] = True
+    if camera_mount is not None:
+        final_result["camera_mount"] = camera_mount
 
     print("\n" + "=" * 60)
     print("Final Results:")
@@ -6487,6 +6568,28 @@ def main():
         ),
     )
     parser.add_argument(
+        "--camera_height_m",
+        type=float,
+        default=None,
+        help="EXP-33, RPC path only: RGB and depth sensor height above the agent's base in m (default 1.25).",
+    )
+    parser.add_argument(
+        "--camera_pitch_deg",
+        type=float,
+        default=None,
+        help="EXP-33, RPC path only: fixed pitch of the RGB and depth sensor in degrees, negative = down (default 0).",
+    )
+    parser.add_argument(
+        "--lookdown_mode",
+        choices=("rotate", "same_frame"),
+        default="rotate",
+        help=(
+            "EXP-33, RPC path only: rotate (default) tilts the sensor 2 x 15 deg for the look-down image; "
+            "same_frame is one fixed camera, as on InternNav's Go2: the look-down image is the current "
+            "front frame and a LOOKDOWN action takes its step without moving the view."
+        ),
+    )
+    parser.add_argument(
         "--max_system2_calls_per_episode",
         type=int,
         default=0,
@@ -6637,6 +6740,16 @@ def main():
             raise ValueError("--stop_at_step_budget is wired into the RPC path only; it requires --rpc_server")
         if int(args.max_steps_per_episode) < 2:
             raise ValueError("--stop_at_step_budget needs --max_steps_per_episode >= 2")
+    if _camera_mount(args) is not None:
+        if not args.rpc_server:
+            raise ValueError("--camera_height_m / --camera_pitch_deg / --lookdown_mode are wired into the RPC path only")
+        if args.camera_height_m is not None and not 0.0 < args.camera_height_m <= 2.0:
+            raise ValueError("--camera_height_m must be in (0, 2]")
+        if args.camera_pitch_deg is not None and not -60.0 <= args.camera_pitch_deg <= 60.0:
+            raise ValueError("--camera_pitch_deg must be in [-60, 60]")
+        # Both record the 1.25 m level camera of build_habitat_config's defaults.
+        if args.s2_record_dir is not None or args.collect_trajectory_dagger:
+            raise ValueError("a camera mount (EXP-33) is for evaluation only: no --s2_record_dir or --collect_trajectory_dagger")
     if not args.rpc_server:
         _preflight_checkpoint_args(args)
     _resolve_eval_paths(args, split=args.dataset_split)
