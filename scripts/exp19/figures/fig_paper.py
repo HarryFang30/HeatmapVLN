@@ -98,6 +98,7 @@ LABELS: Dict[str, Dict[str, object]] = {
         "outcome_missing": "outcome not recorded",
         "names": {"F1": "reached the goal area, stopped elsewhere"},  # else fb.CATEGORY_NAMES
         "rows": ("History", "Future"),
+        "row_dec": "Current view",  # figure A only, left of the first decision image
         "legend": {
             "route": "route", "ref": "reference path", "offlevel": "other floor", "start": "start",
             "goal": "goal ({r:g} m)", "stop": "stop", "num": "key moment", "pgoal": "pixel goal",
@@ -114,6 +115,7 @@ LABELS: Dict[str, Dict[str, object]] = {
         "outcome_missing": "结局未记录",
         "names": {},
         "rows": ("历史", "未来"),
+        "row_dec": "当前观测",
         "legend": {
             "route": "路线", "ref": "参考路径", "offlevel": "另一楼层", "start": "起点", "goal": "目标（{r:g} m）",
             "stop": "停止处", "num": "关键时刻", "pgoal": "像素目标", "path": "快系统轨迹", "actions": "执行的动作",
@@ -723,8 +725,9 @@ def make_fig_a(bundles: Sequence[bd.Bundle], out_dir: Path, lang: str, topdown_r
             pairs += info["pairs"]
             corners.append(info["chips_corner"])
             cover += int(info["chips_cover_goal"])
-        if i == 0:  # the strip rows named once, in the gutter left of the first column
+        if i == 0:  # the decision image and strip rows named once, in the gutter left of the first column
             gx = route_w + g["route_gap"] + g["gutter"] * 0.42
+            row_name(page, gx, yb + rows["dec"] + 0.75 * k_w / 2, L["row_dec"], lang)
             for key, text in zip(("hist", "fut"), L["rows"]):
                 h_strip = p2.strip_height(k_w, p2.HIST_ELEV if key == "hist" else g["fut_elev"])
                 row_name(page, gx, yb + rows[key] + h_strip / 2, text, lang)

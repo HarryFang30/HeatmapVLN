@@ -191,7 +191,7 @@ def test_pptx_copies_have_one_box_per_heading_and_the_labels_once(rendered):
         assert len(heads) == 3, heads  # title, outcome (and in figure B the instruction): one text box per row
         if stem.startswith("fig_b"):
             assert all("“" in h for h in heads)  # the instruction joins its heading
-        for word in ("History", "Future"):
+        for word in ("History", "Future") + (("Current view",) if stem.startswith("fig_a") else ()):
             assert texts.count(word) == 1, word
         ovals = [sh for sh in shapes if sh._element.find(qn("p:spPr")) is not None
                  and getattr(sh._element.spPr.find(qn("a:prstGeom")), "get", lambda _: None)("prst") == "ellipse"]
@@ -217,12 +217,13 @@ def test_key_moments_are_numbered_in_time_order_and_alike_in_both_figures(render
 def test_bearings_and_strip_rows_are_named_once(rendered):
     out = rendered["out"]
     en = (out / "fig_a_key_moments_en.svg").read_text(encoding="utf-8")
-    for word in ("ahead", "left", "right", "History", "Future"):
+    for word in ("ahead", "left", "right", "Current view", "History", "Future"):
         assert en.count(f">{word}</text>") == 1, word
     assert en.count(">back</text>") == 2  # both ends of the one labelled strip
     zh = (out / "fig_a_key_moments_zh.svg").read_text(encoding="utf-8")
-    for word in ("前", "左", "右", "历", "未"):  # zh row names are stacked upright characters
+    for word in ("左", "右", "当", "观", "历", "未"):  # zh row names are stacked upright characters
         assert zh.count(f">{word}</text>") == 1, word
+    assert zh.count(">前</text>") == 2  # the bearing and the second character of 当前观测
 
 
 def test_chips_in_the_rendered_figure_leave_every_pixel_goal_free(rendered):
