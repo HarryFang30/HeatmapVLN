@@ -7,7 +7,9 @@ For every committed ``*.s2rec.tar`` under ``--record_root`` this writes
 geodesic distance to the goal, the row ``kind`` (``correction`` / ``anchor`` / ``none``),
 the oracle's answer, the model's answer, whether they agree, why, and the SFT target.
 States within 3 m of the goal are rows with ``skip`` (line A owns them); no row ever
-targets STOP.  The rules live in ``src/data/s2_route_labels.py``; this script supplies
+targets STOP.  With ``--terminal_stop_radius_m`` > 0 (line C, EXP-35) those states are
+labelled too: STOP inside that radius, line B's route to the goal between it and 3 m.
+The rules live in ``src/data/s2_route_labels.py``; this script supplies
 Habitat geometry (``habitat_sim.PathFinder`` on ``<scenes_dir>/<scene>/<scene>.navmesh``:
 geodesics, paths, snapping -- no renderer, no GPU) and the recorded lookdown depth.
 
@@ -94,11 +96,11 @@ def label_record_rows(
     config: Any,
     camera: Any = None,
 ) -> list[dict[str, Any]]:
-    """Line-B rows of every call of ``record``.  ``geometry`` has ``geodesic``, ``find_path``, ``snap``."""
+    """Line-B (or C) rows of every call of ``record``.  ``geometry`` has ``geodesic``, ``find_path``, ``snap``."""
     camera = camera if camera is not None else ORL.LookdownCamera()
     ref, goal, start = base.resolve_episode_geometry(record.episode, dataset_entry)
     waypoints = ORL.route_waypoints(ref, goal)
-    remaining = segments = None  # only needed once a call is beyond the line-A radius
+    remaining = segments = None  # only needed once a call gets the route oracle
 
     steps = sorted(record.steps, key=lambda s: int(s["step_id"]))
     step_ids = [int(s["step_id"]) for s in steps]
@@ -118,7 +120,7 @@ def label_record_rows(
         d = geometry.geodesic(p, goal)
         model = ORL.parse_model_answer(call)
         route, depth, extra = None, None, {}
-        if math.isfinite(d) and d > config.label_min_distance_m:
+        if math.isfinite(d) and d > config.route_min_distance_m:
             if remaining is None:
                 remaining = ORL.remaining_reference_m(waypoints, geometry.geodesic)
                 segments = [geometry.find_path(waypoints[k], waypoints[k + 1]) for k in range(len(waypoints) - 1)]
@@ -127,6 +129,7 @@ def label_record_rows(
                 int(reached[upto]) if upto >= 0 else -1,
                 int(ORL.last_reached_by_step(p[None], waypoints, geometry.geodesic, config.reached_radius_m)[0]),
             )
+            last_reached = RL.rejoin_after(last_reached, len(waypoints), d, config)
             k_star, _ = ORL.choose_waypoint(
                 p, waypoints, last_reached, remaining, geometry.geodesic, slack_m=config.rejoin_slack_m
             )
@@ -578,6 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "label_s": round(time.time() - started, 1),
         "stats": stats_for(label_paths, outcomes),
     }
+    if config.line == RL.TERMINAL_LABEL_LINE:  # the part a line-B labelling of the same records must equal
+        summary["stats_beyond_line_a_radius"] = stats_for(label_paths, outcomes, min_distance_m=config.label_min_distance_m)
     if args.compare_label_root:
         compare_paths, compare_outcomes, missing = [], {}, 0
         for r in ok:

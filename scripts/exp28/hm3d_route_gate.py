@@ -433,7 +433,7 @@ def call_contexts(
         p = np.asarray(position, dtype=np.float64)
         d = geometry.geodesic(p, goal)
         route, depth = None, None
-        if math.isfinite(d) and d > config.label_min_distance_m:
+        if math.isfinite(d) and d > config.route_min_distance_m:
             if remaining is None:
                 remaining = ORL.remaining_reference_m(waypoints, geometry.geodesic)
                 segments = [geometry.find_path(waypoints[k], waypoints[k + 1]) for k in range(len(waypoints) - 1)]
@@ -442,6 +442,7 @@ def call_contexts(
                 int(reached[upto]) if upto >= 0 else -1,
                 int(ORL.last_reached_by_step(p[None], waypoints, geometry.geodesic, config.reached_radius_m)[0]),
             )
+            last_reached = RL.rejoin_after(last_reached, len(waypoints), d, config)
             k_star, _ = ORL.choose_waypoint(
                 p, waypoints, last_reached, remaining, geometry.geodesic, slack_m=config.rejoin_slack_m
             )

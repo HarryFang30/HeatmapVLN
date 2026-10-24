@@ -48,6 +48,21 @@ every rule that broke:
   when it looked down); a disagreeing call takes the oracle's answer; when the oracle has
   none (``skip``) the call has no target.
 
+Line C (EXP-35, ``terminal_stop_radius_m`` > 0) is line B plus the states line B leaves
+alone.  EXP-34's X34M, trained on line B, reached the goal more often than the base but
+lost most of the gain to not stopping there (circling to the step budget, or stopping just
+outside 3 m): nothing within 3 m had an expert label.  Line C adds one:
+
+* ``d <= terminal_stop_radius_m`` (1 m; the base's successes stop at a median 0.75 m):
+  STOP.  The model's STOP agrees; any other answer is corrected to STOP.
+* ``terminal_stop_radius_m < d <= 3 m``: line B's oracle, walking the route's last metres
+  to the goal; its pixel / turn answers are judged as beyond 3 m.  A STOP here agrees
+  (it ends the episode inside the success radius), so line C never teaches the model to
+  walk on from a stop that already succeeds.
+* Beyond 3 m nothing changes: a STOP still never agrees and is never a target, which is
+  what EXP-23 (STOP on the approach) and EXP-29 (STOP at spin traps, then more stops far
+  away) got wrong.
+
 Everything is numpy; geodesics and navmesh snapping are injected callables so the Habitat
 side (``scripts/tools/label_route_corrections.py``) stays thin and the rules test on a flat
 synthetic world.
@@ -67,6 +82,7 @@ from .s2_oracle_labels import (
     LOOKDOWN_TEXT,
     MAX_EXECUTED_ACTIONS,
     ORACLE_PATH_ROW_M,
+    STOP_TEXT,
     LookdownCamera,
     ModelAnswer,
     OracleAnswer,
@@ -84,6 +100,7 @@ from .s2_records import CAMERA
 # current" check -- moves even when no value does.
 ROUTE_RULES_VERSION = 1
 LABEL_LINE = "B"
+TERMINAL_LABEL_LINE = "C"
 
 Geodesic = Callable[[np.ndarray, np.ndarray], float]
 Snap = Callable[[np.ndarray], "np.ndarray | None"]
@@ -118,13 +135,34 @@ class RouteLabelConfig:
     # Agreement.
     agree_progress_ratio: float = 0.5
     progress_min_tdist_m: float = 0.25
+    # Line C: > 0 labels the states within label_min_distance_m too (STOP inside this radius).
+    terminal_stop_radius_m: float = 0.0
+
+    def __post_init__(self) -> None:
+        # Below pixel_min_ahead_m the remaining route is too short for any pixel goal, so the
+        # band between the radius and it would get only turns in place next to the goal.
+        r = self.terminal_stop_radius_m
+        if not (r == 0.0 or self.pixel_min_ahead_m <= r < self.label_min_distance_m):
+            raise ValueError("terminal_stop_radius_m must be 0 or in [pixel_min_ahead_m, label_min_distance_m)")
 
     @property
     def min_turn_deg(self) -> float:
         return self.turn_step_deg / 2.0
 
+    @property
+    def line(self) -> str:
+        return TERMINAL_LABEL_LINE if self.terminal_stop_radius_m > 0.0 else LABEL_LINE
+
+    @property
+    def route_min_distance_m(self) -> float:
+        """States farther than this from the goal get the route oracle."""
+        return self.terminal_stop_radius_m if self.line == TERMINAL_LABEL_LINE else self.label_min_distance_m
+
     def digest(self) -> str:
-        text = json.dumps({"route_rules": ROUTE_RULES_VERSION, **asdict(self)}, sort_keys=True)
+        fields = asdict(self)
+        if self.line == LABEL_LINE:
+            del fields["terminal_stop_radius_m"]  # line B's digest as it was before line C
+        text = json.dumps({"route_rules": ROUTE_RULES_VERSION, **fields}, sort_keys=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
@@ -136,6 +174,15 @@ def executed_turn_direction(answer: ModelAnswer | None) -> int:
     if answer is None or answer.kind != "turn":
         return 0
     return int(answer.turn_direction)
+
+
+def rejoin_after(last_reached: int, num_waypoints: int, distance_to_goal: float, config: RouteLabelConfig) -> int:
+    """The ``last_reached`` to hand ``choose_waypoint``.  Inside 3 m (line C) the goal is the only
+    candidate: the agent is already in the success region, and a waypoint it passed more than
+    ``reached_radius_m`` to the side would otherwise send the route (and the label) back round it."""
+    if distance_to_goal <= config.label_min_distance_m:
+        return max(int(last_reached), int(num_waypoints) - 2)
+    return int(last_reached)
 
 
 def turn_count(angle_deg: float, config: RouteLabelConfig) -> int:
@@ -361,7 +408,7 @@ def label_route_call(
     d = float(distance_to_goal)
     previous_direction = executed_turn_direction(previous_model)
     row: dict[str, Any] = {
-        "line": LABEL_LINE,
+        "line": config.line,
         "distance_to_goal": rounded(d),
         "model_kind": model.kind,
         "model_turn1": model.turn1,
@@ -385,8 +432,25 @@ def label_route_call(
     }
     if not math.isfinite(d):
         return {**row, **empty, "skip": True, "oracle_reason": "goal_unreachable", "reason": "goal_unreachable"}
-    if d <= config.label_min_distance_m:
+    terminal = config.line == TERMINAL_LABEL_LINE
+    if d <= config.label_min_distance_m and not terminal:
         return {**row, **empty, "skip": True, "oracle_reason": "within_line_a_radius", "reason": "within_line_a_radius"}
+    if terminal and d <= config.terminal_stop_radius_m:
+        agree = model.kind == "stop"
+        target = (model.turn1, model.turn2) if agree else (STOP_TEXT, None)
+        return {
+            **row,
+            **empty,
+            "skip": False,
+            "oracle_kind": "stop",
+            "oracle_reason": "within_stop_radius",
+            "oracle_turn1": STOP_TEXT,
+            "agree": agree,
+            "reason": "model_stop_within_stop_radius" if agree else f"model_{model.kind}_within_stop_radius",
+            "target_turn1": target[0],
+            "target_turn2": target[1],
+            "kind": "anchor" if agree else "correction",
+        }
 
     oracle = route_oracle(
         position=position,
@@ -408,7 +472,9 @@ def label_route_call(
                 debug["oracle_progress_ratio"] = rounded((d - g_point) / max(tdist, config.progress_min_tdist_m))
 
     agree: bool | None
-    if model.kind == "stop":
+    if model.kind == "stop" and terminal and d <= config.label_min_distance_m:
+        agree, reason = True, "model_stop_within_success_radius"
+    elif model.kind == "stop":
         agree, reason = False, "model_stop_beyond_radius"
     elif model.kind == "pixel":
         assert model.pixel is not None
@@ -494,6 +560,12 @@ def summary_view(row: Mapping[str, Any]) -> dict[str, Any]:
     else:
         kind = "none"
     progress = debug.get("model_progress") or {}
+    final_target = target2 if target2 is not None else target1  # as the server executes it
+    target_is_stop = (
+        final_target is not None
+        and not any(ch.isdigit() for ch in final_target)
+        and parse_native_tokens(final_target)[:1] == [STOP_TEXT]
+    )
     return {
         "d": row.get("distance_to_goal"),
         "skip": bool(row.get("skip")),
@@ -516,7 +588,7 @@ def summary_view(row: Mapping[str, Any]) -> dict[str, Any]:
         "target2": target2,
         "target_direction": answer_direction(target1, target2) if target1 is not None else 0,
         "target_is_pixel": target2 is not None and any(ch.isdigit() for ch in target2),
-        "target_is_stop": target1 is not None and target1.strip() == "STOP",
+        "target_is_stop": target_is_stop,
         "model_progress_ratio": progress.get("ratio"),
     }
 
@@ -525,6 +597,7 @@ __all__ = [
     "LABEL_LINE",
     "ROUTE_RULES_VERSION",
     "ROW_KINDS",
+    "TERMINAL_LABEL_LINE",
     "RouteLabelConfig",
     "angle_in_direction",
     "answer_direction",
@@ -532,6 +605,7 @@ __all__ = [
     "label_route_call",
     "pixel_floor_target",
     "pixel_progress",
+    "rejoin_after",
     "route_oracle",
     "summary_view",
     "turn_count",

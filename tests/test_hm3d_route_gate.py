@@ -196,6 +196,17 @@ def test_selection_refuses_labels_of_other_rules_or_records(tmp_path):
 # --------------------------------------------------------------------------- #
 # Line B's judgement in a recorded state
 # --------------------------------------------------------------------------- #
+def test_contexts_reproduce_the_line_c_labeller(tmp_path):
+    line_c = lr.RL.RouteLabelConfig(terminal_stop_radius_m=1.0)
+    record = EpisodeRecord(_record(tmp_path / "records", "flatA", 1))
+    rows = lr.label_record_rows(record, FlatWorld(), dataset_entry=None, config=line_c)
+    contexts = g.call_contexts(record, FlatWorld(), dataset_entry=None, config=line_c)
+    for row in rows:
+        recorded = [row["model_turn1"]] + ([row["model_turn2"]] if row["model_turn2"] is not None else [])
+        judged = g.judge(contexts[row["call_index"]], recorded)
+        assert (judged["agree"], judged["kind"], judged["reason"]) == (row["agree"], row["kind"], row["reason"])
+
+
 def test_contexts_reproduce_the_labeller_and_judge_any_answer(tmp_path):
     record = EpisodeRecord(_record(tmp_path / "records", "flatA", 1))
     rows = lr.label_record_rows(record, FlatWorld(), dataset_entry=None, config=CONFIG)

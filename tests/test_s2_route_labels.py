@@ -19,6 +19,7 @@ from src.data.s2_route_labels import (
     label_route_call,
     pixel_floor_target,
     route_oracle,
+    summary_view,
     turn_count,
 )
 from src.data.s2_sft_dataset import index_calls, normalize_label
@@ -45,6 +46,7 @@ def _call(answer):
         "right": {"llm_output": "→"},
         "cancel": {"llm_output": "←→"},
         "up": {"llm_output": "↑↑"},
+        "look_stop": {"llm_output": "STOP", "native_first_output": "↓", "native_lookdown_turns": 1},
     }
     if isinstance(answer, tuple):
         u, v = answer
@@ -377,6 +379,122 @@ def test_label_script_main_writes_statistics(tmp_path, monkeypatch):
     s2 = json.loads((tmp_path / "s2.json").read_text())
     assert s2["status"] == {"exists": 2}
     assert s2["compare"]["all"]["corrections"] == s2["stats"]["corrections"]
+
+
+# --------------------------------------------------------------------------- #
+# Line C (EXP-35): the states within 3 m get labels too
+# --------------------------------------------------------------------------- #
+LINE_C = RouteLabelConfig(terminal_stop_radius_m=1.0)
+
+
+def test_line_b_digest_is_untouched_by_the_line_c_field():
+    # the digest every line-B label file on the 4090 carries (EXP-34's stream was built from them)
+    assert RouteLabelConfig().digest() == "51ad02170787"
+    assert RouteLabelConfig().line == "B" and LINE_C.line == "C"
+    assert LINE_C.digest() != RouteLabelConfig().digest()
+    assert RouteLabelConfig(terminal_stop_radius_m=1.5).digest() != LINE_C.digest()
+    for bad in (-0.5, 0.5, 3.0, 4.0):  # 0.5: below pixel_min_ahead_m, no pixel could reach the goal
+        with pytest.raises(ValueError):
+            RouteLabelConfig(terminal_stop_radius_m=bad)
+
+
+def test_line_c_inside_the_stop_radius_targets_stop():
+    for answer in ("left", "up", "cancel", (320, 300)):
+        row = _label(answer, d=0.8, config=LINE_C)
+        assert row["line"] == "C" and row["skip"] is False and row["oracle_kind"] == "stop"
+        assert row["kind"] == "correction" and row["agree"] is False
+        assert (row["target_turn1"], row["target_turn2"]) == ("STOP", None)
+        assert not normalize_label({"call_index": 0, **row}).skip
+    row = _label("stop", d=0.8, config=LINE_C)
+    assert row["kind"] == "anchor" and row["agree"] is True and row["reason"] == "model_stop_within_stop_radius"
+    assert row["target_turn1"] == "STOP" and row["target_turn2"] is None
+    assert _label("left", d=1.0, config=LINE_C)["oracle_kind"] == "stop"  # the radius is inclusive
+
+
+def test_line_c_between_the_stop_radius_and_three_metres_walks_on_to_the_goal():
+    goal = np.array([0.0, 0.0, -2.0])  # 2 m straight ahead, the route in view
+    route = straight([0, 0, 0], goal)
+    row = _label("left", d=2.0, route=route, goal=goal, config=LINE_C)
+    assert row["skip"] is False and row["oracle_kind"] == "pixel" and row["kind"] == "correction"
+    assert row["reason"] == "turned_away_from_visible_route" and row["target_turn1"] == "↓"
+    assert row["debug"]["pixel_ahead_arc_m"] == pytest.approx(2.0, abs=0.11)  # the goal itself
+    stop = _label("stop", d=2.0, route=route, goal=goal, config=LINE_C)
+    assert stop["agree"] is True and stop["kind"] == "anchor" and stop["reason"] == "model_stop_within_success_radius"
+    assert stop["target_turn1"] == "STOP"
+    # a pixel that walks past the goal makes no progress towards it and is corrected
+    past = _label(_floor_pixel(0.0, -3.5), d=2.0, route=route, goal=goal, config=LINE_C)
+    assert past["agree"] is False and past["kind"] == "correction" and past["target_turn1"] == "↓"
+
+
+def test_line_c_beyond_three_metres_is_line_b():
+    for answer in ("stop", "left", "up", (320, 300), _floor_pixel(0.0, -2.0)):
+        b, c = _label(answer), _label(answer, config=LINE_C)
+        assert c["line"] == "C" and {**c, "line": "B"} == b
+    assert _label("stop", config=LINE_C)["target_turn1"] != "STOP"
+
+
+def test_label_script_line_c_labels_the_call_within_three_metres(tmp_path):
+    from scripts.tools import label_route_corrections as lr
+
+    path = _record(tmp_path / "records")
+    kwargs = dict(geometry_for_scene=lambda scene: FlatWorld(), dataset_index=None)
+    lr.label_record(path, label_root=tmp_path / "b", config=RouteLabelConfig(), **kwargs)
+    lr.label_record(path, label_root=tmp_path / "c", config=LINE_C, **kwargs)
+    b = read_labels(label_path_for(path, tmp_path / "b"))
+    c = read_labels(label_path_for(path, tmp_path / "c"))
+    drop = ("line", "labeler")
+    for rb, rc in zip(b[:3], c[:3]):
+        assert {k: v for k, v in rc.items() if k not in drop} == {k: v for k, v in rb.items() if k not in drop}
+    # call 3: 1.5 m short of the goal, facing it, answering a left turn: walk on to the goal
+    assert b[3]["skip"] is True
+    assert c[3]["skip"] is False and c[3]["kind"] == "correction" and c[3]["oracle_kind"] == "pixel"
+    assert c[3]["target_turn1"] == "↓" and c[3]["debug"]["k_star"] is not None
+    assert all(r["labeler"] == LINE_C.digest() for r in c)
+
+
+def test_line_c_stop_after_a_lookdown_is_a_stop_anchor_in_the_statistics():
+    for d in (0.8, 2.0):
+        goal = np.array([0.0, 0.0, -d])
+        row = _label("look_stop", d=d, route=straight([0, 0, 0], goal), goal=goal, config=LINE_C)
+        assert row["kind"] == "anchor" and (row["target_turn1"], row["target_turn2"]) == ("↓", "STOP")
+        assert summary_view(row)["target_is_stop"] is True
+    assert summary_view(_label("stop", d=0.8, config=LINE_C))["target_is_stop"] is True
+    assert summary_view(_label((320, 300)))["target_is_stop"] is False
+
+
+def _record_past_a_waypoint(root):
+    """The agent walked 1.05 m to the side of the last-but-one waypoint (never within 1 m of it)."""
+    reference = [[0.0, 0.0, 0.0], [0.0, 0.0, -6.0], [0.0, 0.0, -8.0]]
+    writer = EpisodeRecordWriter(
+        root=root, scene_id="flatScene", episode_id=7,
+        episode={"reference_path": reference, "goals": [{"position": reference[-1], "radius": 3.0}],
+                 "instruction": "walk ahead", "outcome": {"success": 0.0}},
+    )
+    poses = [([0.0, 0.0, 0.0], FACE_NEG_Z), ([1.05, 0.0, -3.0], FACE_NEG_Z), ([1.05, 0.0, -6.5], FACE_NEG_Z)]
+    for step, (position, rotation) in enumerate(poses):
+        writer.add_step(step, position, rotation)
+        writer.add_front(step, _jpeg((64, 48)))
+    for index, step in enumerate((0, 2)):
+        position, rotation = poses[step]
+        writer.add_call({"call_index": index, "step_id": step, "history_step_ids": [], "llm_output": "→",
+                         "native_first_output": "→", "native_lookdown_turns": 0, "kind": "native_actions"},
+                        lookdown_jpeg=_jpeg(), lookdown_depth_m=floor_depth(position, rotation))
+    return writer.commit()
+
+
+def test_line_c_inside_three_metres_heads_for_the_goal_not_a_missed_waypoint(tmp_path):
+    from scripts.tools import label_route_corrections as lr
+
+    path = _record_past_a_waypoint(tmp_path / "records")
+    lr.label_record(path, label_root=tmp_path / "c", geometry_for_scene=lambda scene: FlatWorld(),
+                    dataset_index=None, config=LINE_C)
+    far, near = read_labels(label_path_for(path, tmp_path / "c"))
+    assert far["debug"]["k_star"] == 1  # 8 m out: line B's rejoin, unchanged
+    # 1.83 m out, the goal 35 deg left and in view: a pixel at the goal, not 4 arrows back round (0, 0, -6)
+    assert near["distance_to_goal"] == pytest.approx(math.hypot(1.05, 1.5), abs=1e-3)
+    assert near["debug"]["k_star"] == 2 and near["oracle_kind"] == "pixel"
+    assert euclid(near["debug"]["pixel_point_world"], [0.0, 0.0, -8.0]) < 0.15
+    assert near["kind"] == "correction" and near["target_turn1"] == "↓"
 
 
 def test_round_one_rows_are_summarised_in_the_same_terms():
