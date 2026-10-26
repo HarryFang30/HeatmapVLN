@@ -14,6 +14,13 @@
 #   S2_LORA_ADAPTER     adapter to gate (eval; default $S2_LORA_OUTPUT_DIR/adapter)
 #   S2_LORA_EXTRA_ARGS  passed to the python entry point verbatim, e.g.
 #                       "--max-steps 20 --limit-samples 64 --save-every 0"
+#   S2_LORA_NNODES      training over several boxes (default 1): the same command on
+#                       every box, with S2_LORA_NODE_RANK (0..NNODES-1) and the
+#                       rendezvous S2_LORA_MASTER_ADDR / S2_LORA_MASTER_PORT, an address
+#                       of node 0 the others reach; the output and stream directories
+#                       must be on storage every box shares.  On the ModelArts job the
+#                       workers' cards talk over RoCE; give the worker's DNS name from
+#                       VC_WORKER_HOSTS, not MA_CURRENT_HOST_IP (the host's, unreachable).
 #
 # This box is shared and the user's rule is that nothing is written outside
 # $S2_LORA_ROOT (default ~/work/zhr/zhr_1): the output directory must be inside it,
@@ -40,6 +47,10 @@ STREAM_DIR="${S2_LORA_STREAM_DIR:-}"
 OUTPUT_DIR="${S2_LORA_OUTPUT_DIR:-}"
 PARITY_N="${S2_LORA_PARITY_N:-2000}"
 ADAPTER="${S2_LORA_ADAPTER:-}"
+NNODES="${S2_LORA_NNODES:-1}"
+NODE_RANK="${S2_LORA_NODE_RANK:-0}"
+MASTER_ADDR="${S2_LORA_MASTER_ADDR:-}"
+MASTER_PORT="${S2_LORA_MASTER_PORT:-}"
 read -r -a EXTRA_ARGS <<< "${S2_LORA_EXTRA_ARGS:-}"
 
 TMP_DIR=""
@@ -77,6 +88,13 @@ fi
 OUTPUT_DIR="$(inside_root "$OUTPUT_DIR")"
 [[ "$PARITY_N" =~ ^[1-9][0-9]*$ ]] || die "S2_LORA_PARITY_N must be a positive integer"
 [[ "$MAX_USED_MIB" =~ ^(0|[1-9][0-9]*)$ ]] || die "S2_LORA_MAX_USED_MIB must be a plain non-negative integer"
+[[ "$NNODES" =~ ^[1-9][0-9]*$ ]] || die "S2_LORA_NNODES must be a positive integer"
+[[ "$NODE_RANK" =~ ^(0|[1-9][0-9]*)$ ]] && (( NODE_RANK < NNODES )) || die "S2_LORA_NODE_RANK must be 0..$((NNODES - 1))"
+if (( NNODES > 1 )); then
+  [[ "$MODE" == "train" ]] || die "S2_LORA_NNODES > 1 is for training; parity and eval run on one box"
+  [[ -n "$MASTER_ADDR" ]] || die "S2_LORA_NNODES > 1 needs S2_LORA_MASTER_ADDR (node 0's address)"
+  [[ "$MASTER_PORT" =~ ^[1-9][0-9]*$ ]] && (( MASTER_PORT < 65536 )) || die "S2_LORA_MASTER_PORT must be a port number"
+fi
 [[ -x "$PYTHON" ]] || die "missing python: $PYTHON"
 [[ -d "$INTERNNAV_MODEL_PATH" ]] || die "missing InternNav model directory: $INTERNNAV_MODEL_PATH"
 [[ -d "$RPC_ROOT/src/vla_rpc" ]] || die "missing vla_rpc under $RPC_ROOT/src (the server's JPEG decoder)"
@@ -160,7 +178,10 @@ export HEATMAPVLN_SOURCE_FINGERPRINT
 
 REPO_COMMIT="$(git -c safe.directory="$REPO" -C "$REPO" rev-parse HEAD 2>/dev/null || echo none)"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-LOG="$OUTPUT_DIR/logs/${MODE}_${STAMP}.log"
+# Every box writes its own log into the shared output directory.
+NODE_TAG=""
+(( NNODES == 1 )) || NODE_TAG="_node$NODE_RANK"
+LOG="$OUTPUT_DIR/logs/${MODE}_${STAMP}${NODE_TAG}.log"
 
 declare -a ENTRY
 case "$MODE" in
@@ -182,14 +203,24 @@ case "$MODE" in
     ;;
 esac
 
+declare -a RDZV
+if (( NNODES > 1 )); then
+  # A static rendezvous at node 0's address: every box runs NPROC ranks, and the global
+  # rank of local rank l on box n is n * NPROC + l.
+  RDZV=(--nnodes "$NNODES" --node_rank "$NODE_RANK" --master_addr "$MASTER_ADDR" --master_port "$MASTER_PORT")
+else
+  # --standalone: a private rendezvous on a free local port, so two runs on this box
+  # cannot join each other.
+  RDZV=(--standalone --nnodes 1)
+fi
+
 {
   echo "[s2-lora] mode=$MODE npus=$NPU_CSV nproc=$NPROC repo=$REPO commit=${REPO_COMMIT:0:12}"
   echo "[s2-lora] fingerprint=$HEATMAPVLN_SOURCE_FINGERPRINT model=$INTERNNAV_MODEL_PATH"
   echo "[s2-lora] output=$OUTPUT_DIR tmp=$TMP_DIR alloc=$PYTORCH_NPU_ALLOC_CONF"
+  (( NNODES == 1 )) || echo "[s2-lora] node $NODE_RANK of $NNODES, rendezvous $MASTER_ADDR:$MASTER_PORT"
 } | tee -a "$LOG"
 
-# --standalone: a private rendezvous on a free local port, so two runs on this box
-# cannot join each other.
-"$PYTHON" -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node "$NPROC" \
+"$PYTHON" -m torch.distributed.run "${RDZV[@]}" --nproc_per_node "$NPROC" \
   "${ENTRY[@]}" --device npu --model-path "$INTERNNAV_MODEL_PATH" "${EXTRA_ARGS[@]}" \
   2>&1 | tee -a "$LOG"
