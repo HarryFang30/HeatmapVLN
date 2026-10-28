@@ -72,6 +72,50 @@ Subcommands::
         --shard 0/3 --shuffle-instructions --device cuda
     python scripts/exp28/hm3d_route_gate.py score <same selection flags> --scenes-dir \\
         /workspace/exp28/scene_datasets/hm3d --output <dir>/o4/hm3d.json
+
+``decode --on-mode`` (ledger EXP-37 设置 部署): what the "on" answer is.  ``adapter`` (the default) is the
+adapter's own greedy answer, as above.  ``base-stop`` is the answer the server's ``--system2_base_decides_stop``
+mode gives (``base-stop-v1``): the base (adapter off, the "off" arm) decodes first; if turn 1's first generated
+token is a STOP token (``STOP`` or `` STOP``, each checked to be a single token of the model's tokenizer) the
+answer is ``STOP`` and the adapter does not run (``stop_source`` base); otherwise the adapter decodes with those
+ids masked at turn 1's first generated position (``begin_suppress_tokens``; turn 2 as served), and an answer that
+still ends in the STOP class -- a later STOP, or no action token at all, the server's fallback stop -- is
+``stop_source`` adapter, anything else none.  Both arms keep the served decoding (``NATIVE_GENERATE_KWARGS`` =
+``rpc_model_server.system2_generate_kwargs()`` greedy, and InternNav_Model's generation_config, whose repetition
+penalty 1.05 applies to every generate call here as it does in the server).  The shuffled-instruction answers
+use the same mode.  Every decode row names its mode; a resume log of another mode is refused, and ``score``
+reads no rows of mixed modes (``join.on_mode`` says which it scored; rows without the field are ``adapter``).
+
+EXP-37 (G2 and the report-only O4 correction, O5 and L of the X37 adapter, read by
+``scripts/exp37/gate_verdict.py``).  O4/O5 so far always decoded on the 4090 (CUDA, ``run_offline_gates.sh``:
+C1, X29V1, X32R1 with 6 shards, 4.7-5.5 s per state there); the deployed card of X37 is the 910B, so it decodes
+there, 8 cards, one process per card (``PYTHONPATH`` must hold ``$R/rpc/src``); ``score`` needs habitat_sim's
+PathFinder and the HM3D navmeshes, so it runs on the 4090's CPU.  The held-out records live on the 4090
+(``hm3d_heldout/records`` links into ``collect_base/records``, about 1.8 GB), so they, their labels and the scene
+list are copied to the 910B first, flat into ``$R/exp37/gate/hm3d_heldout/{records,labels,heldout_scenes.txt}``,
+the layout ``scripts/exp37/run_gate_910b.sh`` reads (``X37_HM3D_DIR``) and which runs this decode (tar -h follows
+the links; the label files find their records by scene and file name, and ``score`` joins the rows by key, so the
+paths may differ).  The copy, from the operator's machine (literal paths: nothing is expanded there)::
+
+    ssh 6024_fjl 'docker exec fjl-habitat tar -C /workspace/exp28/gates/hm3d_heldout -chf - records labels \\
+        -C /workspace/exp28/episodes/splits heldout_scenes.txt' \\
+      | ssh modelarts_job 'D=/mnt/sfs_turbo/zhr/zhr_1/exp37/gate/hm3d_heldout && mkdir -p $D && tar -x -C $D'
+
+and the decode by hand, as run_gate_910b.sh's step 3 does (910B, R=/mnt/sfs_turbo/zhr/zhr_1, G=$R/exp37/gate,
+H=$G/hm3d_heldout, SRC a clean checkout of the commit under test)::
+
+    for i in 0 1 2 3 4 5 6 7; do
+      ASCEND_RT_VISIBLE_DEVICES=$i PYTHONPATH=$SRC:$R/rpc/src nohup $R/envs/ppa/bin/python \\
+        $SRC/scripts/exp28/hm3d_route_gate.py decode --record-root $H/records --label-root $H/labels \\
+        --holdout-scenes-file $H/heldout_scenes.txt --adapter $R/exp37/train/X37/adapter \\
+        --model-path $R/InternNav_Model --output $G/o4/hm3d.json \\
+        --shard $i/8 --shuffle-instructions --on-mode base-stop --device npu > $G/o4_$i.log 2>&1 &
+    done
+    # 4090 container, after copying $G/o4/hm3d.decode.shard*of08.jsonl to /workspace/exp37/gate/o4/
+    python scripts/exp28/hm3d_route_gate.py score --record-root /workspace/exp28/gates/hm3d_heldout/records \\
+        --label-root /workspace/exp28/gates/hm3d_heldout/labels \\
+        --holdout-scenes-file /workspace/exp28/episodes/splits/heldout_scenes.txt \\
+        --scenes-dir /workspace/exp28/scene_datasets/hm3d --output /workspace/exp37/gate/o4/hm3d.json
 """
 
 from __future__ import annotations
@@ -123,6 +167,10 @@ STATE_KINDS = ("correction", "anchor", "none")
 # scripts/evaluation/rpc_model_server.py: what a server serving a System2 LoRA advertises (records keep both)
 LORA_FORMAT_PREFIX = "system2-lora-sha256:"
 LORA_MODEL_TAG = "+system2-lora:"
+# decode --on-mode (see the module doc): the adapter's own answer, or the server's base-stop-v1 answer (EXP-37)
+ON_MODES = ("adapter", "base-stop")
+STOP_TOKEN_TEXTS = ("STOP", " STOP")  # what base-stop reads and masks at turn 1's first generated position
+BASE_STOP_ANSWER = "STOP"
 GROUPS = ("O1", "O2", "O3", "O4_correction", "O4_anchor", "O4_stop", "O5")
 RETRY_RULES = {
     "val": "every gate passed",
@@ -226,7 +274,8 @@ def served_adapter(episode: Mapping[str, Any]) -> str | None:
         if str(item).startswith(LORA_FORMAT_PREFIX):
             return str(item)[len(LORA_FORMAT_PREFIX):]
     version = str(server.get("model_version") or "")
-    return version.split(LORA_MODEL_TAG, 1)[1] if LORA_MODEL_TAG in version else None
+    # a mode suffix may follow the sha (EXP-37's "+base-stop-v1")
+    return version.split(LORA_MODEL_TAG, 1)[1].split("+", 1)[0] if LORA_MODEL_TAG in version else None
 
 
 def holdout_records(record_roots: Sequence[str | os.PathLike], scenes: Collection[str]) -> list[dict[str, Any]]:
@@ -486,6 +535,11 @@ def read_decode_rows(paths: Sequence[Path]) -> dict[str, dict[str, Any]]:
     return rows
 
 
+def row_on_mode(row: Mapping[str, Any]) -> str:
+    """A decode row's ``--on-mode`` (rows written before the option are the adapter's own answers)."""
+    return str(row.get("on_mode") or "adapter")
+
+
 def _needs_shuffle(state: Mapping[str, Any]) -> bool:
     return state["label_kind"] == "correction" and (state.get("shuffle") or {}).get("donor") is not None
 
@@ -498,8 +552,8 @@ def score_states(
     """States joined with their decoded answers and line B's judgement of each answer.
 
     ``contexts_for(record, call_indices)`` gives ``call_contexts`` for one record.  Raises
-    ``GateInvalid`` when a state was not decoded, rows of different adapters are mixed, or line B
-    does not reproduce the label file on the recorded answer.
+    ``GateInvalid`` when a state was not decoded, rows of different adapters or ``--on-mode`` s are mixed,
+    or line B does not reproduce the label file on the recorded answer.
     """
     missing = [s["key"] for s in states if s["key"] not in decoded]
     if missing:
@@ -507,6 +561,9 @@ def score_states(
     adapters = {decoded[s["key"]].get("adapter_sha256") for s in states}
     if len(adapters) != 1:
         raise GateInvalid(f"the decoded rows come from {len(adapters)} adapters: {sorted(map(str, adapters))}")
+    modes = {row_on_mode(decoded[s["key"]]) for s in states}
+    if len(modes) != 1 or not modes <= set(ON_MODES):
+        raise GateInvalid(f"the decoded rows come from {len(modes)} on-modes: {sorted(modes)} (one of {ON_MODES})")
     by_record: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for state in states:
         by_record[state["record_path"]].append(state)
@@ -553,7 +610,7 @@ def score_states(
         raise GateInvalid(f"{len(donor_mismatches)} shuffled answers were decoded with another donor; decode again "
                           f"into a fresh --output: {donor_mismatches[:3]}")
     stats["rows"] = len(rows)
-    return rows, {"adapter_sha256": next(iter(adapters)), "stats": dict(stats)}
+    return rows, {"adapter_sha256": next(iter(adapters)), "on_mode": next(iter(modes)), "stats": dict(stats)}
 
 
 def _criterion(value: Fraction | None, threshold: Fraction | None, direction: str, ok: bool,
@@ -698,6 +755,12 @@ def summarize(rows: Sequence[Mapping[str, Any]], *, shuffle_requested: bool) -> 
         "states": dict(Counter(r["label_kind"] for r in rows)),
         "episodes": len({r["record_key"] for r in rows}),
     }
+    if any("stop_source" in r["on"] for r in rows):  # --on-mode base-stop: who decided each on answer's STOP
+        report["on_stop_source"] = {
+            kind: dict(sorted(Counter(str(r["on"].get("stop_source")) for r in rows
+                                      if kind == "all" or r["label_kind"] == kind).items()))
+            for kind in ("all",) + STATE_KINDS
+        }
     return {
         "O4": {"criteria": o4, "all_pass": all(c["pass"] for c in o4.values())},
         "O5": {"criteria": {"shuffle_vs_own_instruction": o5}, "all_pass": bool(o5["pass"])},
@@ -1063,6 +1126,75 @@ class WithInstruction:
         return getattr(self._record, name)
 
 
+def stop_token_ids(tokenizer: Any) -> tuple[int, ...]:
+    """The ids of ``STOP_TOKEN_TEXTS`` in this tokenizer, each required to be one token (a fragment would let a
+    STOP through base-stop's first-position mask, and the base's STOP would go unread)."""
+    ids = []
+    for text in STOP_TOKEN_TEXTS:
+        got = [int(t) for t in tokenizer.encode(text, add_special_tokens=False)]
+        if len(got) != 1:
+            raise ValueError(f"{text!r} is not a single token in this tokenizer ({got}): base-stop cannot read or "
+                             "mask it at the first position")
+        ids.append(got[0])
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{STOP_TOKEN_TEXTS} share a token id ({ids})")
+    return tuple(ids)
+
+
+def greedy_first_token_decision(
+    model: Any, processor: Any, messages: list[dict], images: list, lookdown: Any, device: Any, *,
+    suppress_first: Sequence[int] = (),
+) -> tuple[tuple[str, ...], int | None]:
+    """``train_system2_lora.greedy_native_decision`` with the id of turn 1's first generated token beside the text.
+
+    ``suppress_first``: ids masked at turn 1's first generated position only (``begin_suppress_tokens``, the
+    server's base-stop decode); turn 2 decodes as served.  Empty: the very same generate calls as
+    ``greedy_native_decision`` (the tests pin the two together).
+    """
+    import torch
+
+    from scripts.train_system2_lora import NATIVE_GENERATE_KWARGS, _served_inputs
+    from src.models.heatmap.native_internnav_exact import append_native_lookdown_turn, native_requests_lookdown
+
+    kwargs = dict(NATIVE_GENERATE_KWARGS)
+    if suppress_first:
+        kwargs["begin_suppress_tokens"] = [int(t) for t in suppress_first]
+    with torch.no_grad():
+        inputs = _served_inputs(processor, messages, device)
+        prompt_len = inputs["input_ids"].shape[1]
+        output = model.generate(**inputs, **kwargs).sequences
+        first_id = int(output[0][prompt_len]) if output.shape[1] > prompt_len else None
+        first = processor.tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True)
+        if not native_requests_lookdown(first):
+            return (first,), first_id
+        messages, _ = append_native_lookdown_turn(messages, images, first, lookdown)
+        inputs = _served_inputs(processor, messages, device)
+        prompt_len = inputs["input_ids"].shape[1]
+        output = model.generate(**inputs, **NATIVE_GENERATE_KWARGS).sequences
+        return (first, processor.tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True)), first_id
+
+
+def base_stop_arms(decide: Callable[[bool, Sequence[int]], tuple[Sequence[str], int | None]],
+                   stop_ids: Sequence[int]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(on, off) of one prompt under ``--on-mode base-stop`` (the module doc).
+
+    ``decide(adapter_on, suppress_first)`` -> (turns, turn 1's first generated token id).  The base decodes
+    first, unmasked: that is the "off" arm, and its first token decides STOP.  The adapter runs only when it
+    does not.
+    """
+    stop_ids = tuple(int(t) for t in stop_ids)
+    off_turns, off_first = decide(False, ())
+    off = {**_arm(off_turns), "first_token_id": off_first}
+    if off_first is not None and int(off_first) in stop_ids:
+        on = {**_arm([BASE_STOP_ANSWER]), "first_token_id": None, "stop_source": "base"}
+    else:
+        on_turns, on_first = decide(True, stop_ids)
+        on = {**_arm(on_turns), "first_token_id": on_first}
+        # the server's stop or fallback_stop despite the mask: a STOP later in turn 1, or no action token at all
+        on["stop_source"] = "adapter" if on["class"] == "stop" else "none"
+    return on, off
+
+
 def _selection(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     scenes = list(args.scenes.split(",")) if args.scenes else []
     if args.holdout_scenes_file:
@@ -1098,7 +1230,8 @@ def decode(args: argparse.Namespace) -> int:
     if args.dry_run:
         shuffle = Counter("donor" if _needs_shuffle(s) else "none" for s in states if s["label_kind"] == "correction")
         print(json.dumps({"states": len(states), "shard": len(mine), "selection": meta,
-                          "corrections_shuffle": dict(shuffle)}, ensure_ascii=False), flush=True)
+                          "corrections_shuffle": dict(shuffle), "on_mode": args.on_mode},
+                         ensure_ascii=False), flush=True)
         return 0
 
     import torch
@@ -1119,8 +1252,12 @@ def decode(args: argparse.Namespace) -> int:
     others = {r.get("adapter_sha256") for r in done.values()} - {adapter_sha}
     if others:
         raise SystemExit(f"{rows_path} holds rows of another adapter {sorted(map(str, others))}; use another --output")
+    other_modes = {row_on_mode(r) for r in done.values()} - {args.on_mode}
+    if other_modes:
+        raise SystemExit(f"{rows_path} holds rows of --on-mode {sorted(other_modes)}, not {args.on_mode}; use another "
+                         "--output")
     todo = [s for s in mine if not (s["key"] in done and _complete(done[s["key"]], s, args.shuffle_instructions))]
-    LOGGER.info("%d already decoded, %d to go", len(mine) - len(todo), len(todo))
+    LOGGER.info("%d already decoded, %d to go (on-mode %s)", len(mine) - len(todo), len(todo), args.on_mode)
     if todo:
         rt = init_runtime(args.device)
         seed_everything(args.seed, rt.device)
@@ -1129,9 +1266,22 @@ def decode(args: argparse.Namespace) -> int:
         model.eval()
         records = RecordCache(8)
         size = tuple(args.default_vlm_image_size)
+        stop_ids = stop_token_ids(processor.tokenizer) if args.on_mode == "base-stop" else ()
+        if stop_ids:
+            LOGGER.info("base-stop: STOP token ids %s (%s)", list(stop_ids), list(STOP_TOKEN_TEXTS))
 
         def both(record_like, call):
             messages, images, lookdown = inference_messages(record_like, call, default_vlm_image_size=size)
+            if args.on_mode == "base-stop":
+                def decide(adapter_on, suppress):
+                    if adapter_on:
+                        return greedy_first_token_decision(model, processor, messages, images, lookdown, rt.device,
+                                                           suppress_first=suppress)
+                    with adapter_off(model):
+                        return greedy_first_token_decision(model, processor, messages, images, lookdown, rt.device,
+                                                           suppress_first=suppress)
+
+                return base_stop_arms(decide, stop_ids)
             with torch.no_grad():
                 on = greedy_native_decision(model, processor, messages, images, lookdown, rt.device)
                 with adapter_off(model):
@@ -1146,7 +1296,9 @@ def decode(args: argparse.Namespace) -> int:
                 on, off = both(record, call)
                 row = {"schema": DECODE_SCHEMA, "key": state["key"], "uid": state["uid"], "adapter_sha256": adapter_sha,
                        "device": rt.device.type, "record_device": record_device(record), "on": on, "off": off,
-                       "shuffle_instructions": bool(args.shuffle_instructions)}
+                       "shuffle_instructions": bool(args.shuffle_instructions), "on_mode": args.on_mode}
+                if stop_ids:
+                    row["stop_token_ids"] = list(stop_ids)
                 if args.shuffle_instructions and _needs_shuffle(state):
                     s_on, s_off = both(WithInstruction(record, state["shuffle"]["instruction"]), call)
                     row["shuffled"] = {"donor": state["shuffle"]["donor"], "on": s_on, "off": s_off}
@@ -1248,6 +1400,8 @@ def score(args: argparse.Namespace) -> int:
     o4, o5 = report["O4"], report["O5"]
     parts = [f"{k}={v['value']}{'' if v['pass'] else '(FAIL)'}" for k, v in
              {**o4["criteria"], **o5["criteria"]}.items()]
+    if report["join"]["on_mode"] != "adapter":
+        parts.append(f"(on-mode {report['join']['on_mode']})")
     print(("PASS" if o4["all_pass"] and o5["all_pass"] else "FAIL") + " O4/O5 " + " ".join(parts), flush=True)
     return 0 if o4["all_pass"] and o5["all_pass"] else 1
 
@@ -1314,6 +1468,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     dec.add_argument("--shard", default="0/1", help="i/n: decode the states whose key hashes to i")
     dec.add_argument("--shuffle-instructions", action="store_true",
                      help="O5: also decode every correction under another episode's instruction of its scene")
+    dec.add_argument("--on-mode", choices=ON_MODES, default="adapter",
+                     help="the on answer: the adapter's own (default), or base-stop: the server's "
+                          "--system2_base_decides_stop answer (STOP iff the base's first token is STOP, else the "
+                          "adapter with STOP masked at the first position; EXP-37)")
     dec.add_argument("--default-vlm-image-size", type=int, nargs=2, default=[384, 384])
     dec.add_argument("--device", choices=("auto", "cuda", "npu", "cpu"), default="auto")
     dec.add_argument("--log-every", type=int, default=100)

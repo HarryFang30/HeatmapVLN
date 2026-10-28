@@ -19,6 +19,8 @@ set -uo pipefail
 ROOT="${EXP23_ROOT:-$HOME/work/zhr/zhr_1}"
 TAG="${EXP28_TAG:?set EXP28_TAG, e.g. base or c1}"
 ADAPTER="${EXP28_ADAPTER:-}"
+# EXP-37: 1 = the base decides STOP, the adapter the rest (run_ppa_servers_npu.sh; needs an adapter).
+BASE_STOP="${PPA_EVAL_SYSTEM2_BASE_STOP:-0}"
 SRC="${EXP28_SRC:-$ROOT/exp23/src_tm}"
 EXPORT_DIR="${EXP28_EXPORT_DIR:-$ROOT/exp23/round1/export}"
 RUN_DIR="${EXP28_RUN_DIR:-$ROOT/exp28/serve_$TAG}"
@@ -40,7 +42,9 @@ die() { unpublish; status "STOPPED: $*"; exit 2; }
 
 [[ -d "$SRC/.git" ]] || die "no code checkout at $SRC"
 git -C "$SRC" diff --quiet HEAD -- || die "$SRC has uncommitted changes"
-log "tag=$TAG src=$SRC commit=$(git -C "$SRC" rev-parse HEAD) npus=$NPUS adapter=${ADAPTER:-none}"
+log "tag=$TAG src=$SRC commit=$(git -C "$SRC" rev-parse HEAD) npus=$NPUS adapter=${ADAPTER:-none} base_stop=$BASE_STOP"
+[[ "$BASE_STOP" =~ ^[01]$ ]] || die "PPA_EVAL_SYSTEM2_BASE_STOP must be 0 or 1"
+[[ "$BASE_STOP" -eq 1 && -z "$ADAPTER" ]] && die "PPA_EVAL_SYSTEM2_BASE_STOP=1 needs EXP28_ADAPTER"
 if [[ -n "${PPA_EVAL_SYSTEM2_SAMPLE_TEMPERATURE:-}" ]]; then
   log "System2 SAMPLES (T=$PPA_EVAL_SYSTEM2_SAMPLE_TEMPERATURE top_p=${PPA_EVAL_SYSTEM2_SAMPLE_TOP_P:-1.0})"
 fi
@@ -74,8 +78,8 @@ STAMP="exp28${TAG}_$(date +%Y%m%d_%H%M%S)"
 SERVER_LOG="$ROOT/logs/${STAMP}_servers.log"
 RUNTIME="$ROOT/servers/$STAMP"
 status "starting servers $STAMP"
-lora_env=()
-[[ -n "$ADAPTER" ]] && lora_env=(PPA_EVAL_SYSTEM2_LORA="$ADAPTER")
+lora_env=(PPA_EVAL_SYSTEM2_BASE_STOP="$BASE_STOP")
+[[ -n "$ADAPTER" ]] && lora_env+=(PPA_EVAL_SYSTEM2_LORA="$ADAPTER")
 # The trailing $STAMP is ignored by the launcher; it tags the command line for launcher_alive.
 ( cd "$SRC" && env PPA_EVAL_REPO="$SRC" PPA_NPU_DEVICES="$NPUS" PPA_EVAL_MODEL_PORT_BASE="$MODEL_PORT_BASE" \
     PPA_EVAL_VO_PORT_BASE="$VO_PORT_BASE" PPA_NPU_TMP_ROOT="$ROOT/t" PPA_EVAL_RUN_STAMP="$STAMP" \
@@ -94,6 +98,11 @@ if [[ -n "$ADAPTER_SHA" ]]; then
   grep -q "\"system2_lora_sha256\": \"$ADAPTER_SHA\"" "$RUNTIME/servers.json" || die "servers.json does not carry the adapter's sha256"
 else
   grep -q '"system2_lora_sha256": "[0-9a-f]' "$RUNTIME/servers.json" && die "servers.json names an adapter, the base was asked for"
+fi
+if [[ "$BASE_STOP" -eq 1 ]]; then
+  grep -q '"system2_base_stop": true' "$RUNTIME/servers.json" || die "servers.json does not record system2_base_stop true"
+else
+  grep -q '"system2_base_stop": true' "$RUNTIME/servers.json" && die "servers.json records system2_base_stop, it was not asked for"
 fi
 
 mkdir -p "$PUB.part"

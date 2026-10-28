@@ -82,6 +82,8 @@ LOOKDOWN_MODE="${PPA_EVAL_LOOKDOWN_MODE:-}"
 # and the live servers must name the same adapter.  Empty: the released System2, and a
 # server set that serves any adapter is refused.
 SYSTEM2_LORA="${PPA_EVAL_SYSTEM2_LORA:-}"
+# EXP-37: 1 runs the servers in base-decides-STOP mode (rpc_model_server.py --system2_base_decides_stop).
+SYSTEM2_BASE_STOP="${PPA_EVAL_SYSTEM2_BASE_STOP:-0}"
 # Per-shard episode lists (shard_0N.json); another directory than the locked cohorts means a subset run: no merge.
 EPISODE_LISTS_DIR="${PPA_EVAL_EPISODE_LISTS_DIR:-$COHORTS_DIR}"
 # 1: the model and VO servers already run elsewhere (e.g. on Ascend NPUs, reached
@@ -268,6 +270,7 @@ if [[ -n "$SYSTEM2_LORA" ]]; then
   fi
 fi
 [[ -n "$SYSTEM2_LORA" ]] && MODEL_EXTRA+=(--system2_lora_adapter "$SYSTEM2_LORA")
+[[ "$SYSTEM2_BASE_STOP" -eq 1 ]] && MODEL_EXTRA+=(--system2_base_decides_stop)
 [[ "$ALLOW_CAPPED_RESUME" =~ ^[01]$ ]] || die "PPA_EVAL_ALLOW_CAPPED_RESUME must be 0 or 1"
 [[ "$ALLOW_COMMIT_MISMATCH" =~ ^[01]$ ]] || die "PPA_EVAL_ALLOW_COMMIT_MISMATCH must be 0 or 1"
 # A capped run is a fixed, pre-registered sample, and both of these silently change

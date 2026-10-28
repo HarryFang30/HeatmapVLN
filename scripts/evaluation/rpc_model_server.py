@@ -129,6 +129,24 @@ def system2_generate_kwargs(environ: Optional[dict] = None) -> dict[str, Any]:
     return kwargs
 
 
+def _finish_system2_stop_source(response: dict[str, Any]) -> None:
+    """EXP-37: name who ended a base-decides-STOP call, and log it once per call.
+
+    ``_plan_panoramic_native`` records ``base`` when the released System2's first token
+    was STOP, ``none`` otherwise; a terminal STOP that the adapter still produced
+    (``stop`` from a STOP after its first position, or ``fallback_stop``) becomes
+    ``adapter`` here, after every return path of the call has been taken.  Calls that
+    never asked System2 (oracle text, front_system1) carry no field and log nothing.
+    """
+    source = response.get("system2_stop_source")
+    if source is None:
+        return
+    kind = response.get("kind")
+    if source == "none" and kind in {"stop", "fallback_stop"}:
+        source = response["system2_stop_source"] = "adapter"
+    LOGGER.info("System2 stop source: %s (kind %s)", source, kind)
+
+
 def _request_timer() -> StageTimer:
     return getattr(_REQUEST_TIMING, "timer", _TIMING_OFF)
 
@@ -148,6 +166,12 @@ SYSTEM2_LORA_SHA256_FORMAT = "system2-lora-sha256:"
 SYSTEM2_LORA_Z0_SOURCE = "adapters_disabled"
 SYSTEM2_LORA_WEIGHTS = "adapter_model.safetensors"
 SYSTEM2_LORA_CONFIG = "adapter_config.json"
+# EXP-37: the released System2 (the adapter disabled) decides STOP from its first
+# greedy turn-1 token; the adapter decodes everything else with STOP masked at its
+# first position.  Both spellings the tokenizer has for the word are masked.
+SYSTEM2_BASE_STOP_CAPABILITY = "system2-base-stop-v1"
+SYSTEM2_BASE_STOP_VERSION_SUFFIX = "+base-stop-v1"
+SYSTEM2_BASE_STOP_TEXTS = ("STOP", " STOP")
 MEMORY_PLACEHOLDER_TOKEN = "<|fim_pad|>"
 LOCAL_FJL_ROOT = Path(os.environ.get("HEATMAPVLN_FJL_ROOT", "/mnt/afs/liwenhao/agent/370910109"))
 LOCAL_INTERNNAV_MODEL_PATH = Path(
@@ -1083,6 +1107,7 @@ class HeatmapVLNRuntime:
         )
         # Before the PPA preflight, so its vision-tower adapter check sees the wrapped model.
         self.system2_lora = self._preflight_system2_lora()
+        self.system2_base_stop = self._preflight_system2_base_stop()
         self._preflight_ppa_stage0_action_arm()
         self.ppa_checkpoint_contract = self._preflight_ppa_online_amb3r()
         if self.ppa_bridge_off:
@@ -1106,6 +1131,49 @@ class HeatmapVLNRuntime:
         if self.system2_lora is not None:
             # The checkpoint's run directory names the base; the adapter is named by its bytes.
             self.model_version = f"{self.model_version}+system2-lora:{self.system2_lora['adapter_sha256']}"
+        if self.system2_base_stop is not None:
+            # After the sha, so a reader that splits on "+system2-lora:" must strip it.
+            self.model_version = f"{self.model_version}{SYSTEM2_BASE_STOP_VERSION_SUFFIX}"
+
+    def _preflight_system2_base_stop(self) -> dict[str, Any] | None:
+        """EXP-37: the released System2 decides STOP, the adapter decides where to go.
+
+        On every System2 call the base (adapter disabled) greedily produces the first
+        turn-1 token with the deployed generate kwargs, so the 1.05 repetition penalty
+        of the model's generation_config applies exactly as on a server with no
+        adapter.  A STOP token ends the call there; otherwise the adapter decodes as
+        usual with both STOP ids suppressed at its first generated position.
+        """
+        if not bool(getattr(self.args, "system2_base_decides_stop", False)):
+            return None
+        if self.system2_cognition_arm:
+            raise RuntimeError("--system2_base_decides_stop cannot be combined with --system2_cognition_arm")
+        if getattr(self, "system2_lora", None) is None:
+            raise RuntimeError(
+                "--system2_base_decides_stop needs --system2_lora_adapter: without an adapter "
+                "the base already decides everything"
+            )
+        if system2_sampling() is not None:
+            # The base's first token is the greedy one by definition of the mode; a
+            # sampled adapter decode would also draw from the unseeded global RNG
+            # after an extra pass, shifting every later draw.
+            raise RuntimeError(
+                f"--system2_base_decides_stop serves greedy decoding only; unset {SYSTEM2_SAMPLE_TEMPERATURE_ENV}"
+            )
+        tokenizer = self.processor.tokenizer
+        stop_ids: list[int] = []
+        for text in SYSTEM2_BASE_STOP_TEXTS:
+            ids = [int(i) for i in tokenizer.encode(text, add_special_tokens=False)]
+            if len(ids) != 1:
+                raise RuntimeError(
+                    f"{text!r} is not a single token in this tokenizer ({ids}); a first-token STOP "
+                    "decision would be reading a fragment"
+                )
+            stop_ids.append(ids[0])
+        if len(set(stop_ids)) != len(stop_ids):
+            raise RuntimeError(f"the STOP spellings {SYSTEM2_BASE_STOP_TEXTS} map to the same id {stop_ids}")
+        LOGGER.info("System2 base decides STOP enabled (stop ids %s)", stop_ids)
+        return {"stop_ids": stop_ids}
 
     def _preflight_system2_lora(self) -> dict[str, Any] | None:
         """EXP-23: decide with a System2 LoRA, take Z0 from the released weights.
@@ -1589,7 +1657,10 @@ class HeatmapVLNRuntime:
 
     def plan_panoramic(self, payload: dict[str, Any], blobs) -> dict[str, Any]:
         if not self.system2_cognition_arm:
-            return self._plan_panoramic_native(payload, blobs)
+            response = self._plan_panoramic_native(payload, blobs)
+            if getattr(self, "system2_base_stop", None) is not None:
+                _finish_system2_stop_source(response)
+            return response
         return self._plan_with_cognition_arm(payload, blobs)
 
     # ------------------------------------------------------------------
@@ -2066,6 +2137,8 @@ class HeatmapVLNRuntime:
         prompt_len = inputs["input_ids"].shape[1]
         native_first_output = ""
         native_lookdown_turns = 0
+        base_stop = getattr(self, "system2_base_stop", None)
+        base_stopped = False
         if phase == "front_system1":
             # Use the exact teacher-forced assistant turn produced by the
             # Stage1-S2 collator, including the chat-template terminator.
@@ -2087,11 +2160,38 @@ class HeatmapVLNRuntime:
             output_ids = torch.cat([inputs["input_ids"], oracle_suffix], dim=1)
             llm_output = oracle_system2_text
         else:
-            with _vision_record_scope(), torch.no_grad(), timer.stage("system2_turn1_generate"):
-                output_ids = self.model.qwen2_5_vl.model.generate(
-                    **inputs,
-                    **system2_generate_kwargs(),
-                ).sequences
+            turn1_suppress: dict[str, Any] = {}
+            if base_stop is not None:
+                # EXP-37: the released System2's first greedy token on the identical
+                # turn-1 inputs, with the deployed kwargs (so generation_config's 1.05
+                # repetition penalty applies as on a server with no adapter).  Its
+                # tower pass is recorded like turn 1's: the cache holds only the latest
+                # recorded pass, so the adapter's turn 1 (and turn 2 after a lookdown)
+                # overwrite it before generate_latents asks, which is served exactly
+                # what it is served without this pass.  The tower carries no adapter
+                # (_wrap_system2_lora), so the bits are the same either way.
+                base_kwargs = system2_generate_kwargs()
+                base_kwargs["max_new_tokens"] = 1
+                with _vision_record_scope(), torch.no_grad(), timer.stage("system2_base_stop_generate"):
+                    with self.model.qwen2_5_vl.adapters_disabled():
+                        base_ids = self.model.qwen2_5_vl.model.generate(
+                            **inputs,
+                            **base_kwargs,
+                        ).sequences
+                base_stopped = int(base_ids[0, prompt_len]) in base_stop["stop_ids"]
+                if base_stopped:
+                    output_ids = base_ids
+                else:
+                    # Masked at the first generated position only (begin_index is the
+                    # prompt length): a later STOP still parses as today.
+                    turn1_suppress = {"begin_suppress_tokens": list(base_stop["stop_ids"])}
+            if not base_stopped:
+                with _vision_record_scope(), torch.no_grad(), timer.stage("system2_turn1_generate"):
+                    output_ids = self.model.qwen2_5_vl.model.generate(
+                        **inputs,
+                        **system2_generate_kwargs(),
+                        **turn1_suppress,
+                    ).sequences
             llm_output = self.processor.tokenizer.decode(
                 output_ids[0][prompt_len:],
                 skip_special_tokens=True,
@@ -2154,6 +2254,9 @@ class HeatmapVLNRuntime:
                 "adapter_sha256": system2_lora["adapter_sha256"],
                 "z0_source": SYSTEM2_LORA_Z0_SOURCE,
             }
+        if base_stop is not None and not oracle_system2_text and phase != "front_system1":
+            # "none" may still become "adapter" in plan_panoramic (_finish_system2_stop_source).
+            response["system2_stop_source"] = "base" if base_stopped else "none"
         if self.ppa_online_amb3r:
             response.update(
                 {
@@ -2628,6 +2731,11 @@ class HeatmapVLNRPCServicer(vla_pb2_grpc.VLAServicer):
                     else []
                 ),
                 *self._system2_lora_formats(),
+                *(
+                    [SYSTEM2_BASE_STOP_CAPABILITY]
+                    if getattr(self.runtime, "system2_base_stop", None) is not None
+                    else []
+                ),
                 *self._instance_formats(),
             ],
         )
@@ -2727,6 +2835,16 @@ def parse_args() -> argparse.Namespace:
             "for the released System2's decoder blocks. Both native turns decide with it; "
             "System1's Z0 is computed with it disabled. Responses carry its sha256 under "
             "system2_lora, model_version and GetServerInfo name it. Unset changes nothing."
+        ),
+    )
+    parser.add_argument(
+        "--system2_base_decides_stop",
+        action="store_true",
+        help=(
+            "EXP-37 (needs --system2_lora_adapter, greedy decoding only): on every System2 call "
+            "the released weights (adapter disabled) produce the first turn-1 token; STOP ends the "
+            "call, otherwise the adapter decodes with STOP suppressed at its first position. "
+            "Responses carry system2_stop_source; model_version ends in +base-stop-v1."
         ),
     )
     parser.add_argument(

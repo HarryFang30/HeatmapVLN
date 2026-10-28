@@ -27,6 +27,13 @@ is the no-op adapter the server's byte-identity test needs.
 samples tagged ``kl: true``, p_base being the same model with the adapter off;
 ``--keep-stream`` never deletes stream shards, so a resume reads them again.
 
+``--objective dpo`` (EXP-37) trains on a pair stream (``pairs: true``): per pair,
+s(y) = the mean log-prob of y's supervised tokens, and the loss is AVERT's
+-log sigmoid(beta * [(s_theta(c) - s_ref(c)) - (s_theta(r) - s_ref(r))]) - lambda * s_theta(c),
+the reference being the same model with the adapter off; a step is the mean over
+its global batch of pairs.  No DDP wrapper there: the LoRA gradients are summed
+over ranks by hand once per optimizer step (:func:`allreduce_mean_grads`).
+
 Outputs (``--output-dir``): ``adapter/`` (``adapter_config.json`` +
 ``adapter_model.safetensors``), ``manifest.json``, ``train_log.jsonl``, and
 ``checkpoints/step_*/`` (adapter + optimizer state, for ``--resume``).
@@ -83,7 +90,7 @@ from src.data.s2_sft_dataset import (  # noqa: E402
     select_training_refs,
     summarize_refs,
 )
-from src.data.s2_stream import StreamShardDataset, read_manifest  # noqa: E402
+from src.data.s2_stream import StreamShardDataset, collate_pairs, is_pair_stream, read_manifest  # noqa: E402
 from src.models.heatmap.native_internnav_exact import (  # noqa: E402
     append_native_lookdown_turn,
     native_requests_lookdown,
@@ -494,6 +501,153 @@ def micro_batch_loss(
         kl_sum = supervised_kl_sum(logits, base, mask) if kl_tokens else torch.zeros((), dtype=torch.float32, device=device)
     loss = micro_loss(per_sample, counts, mode, samples_per_rank_step, token_scale, kl_sum=kl_sum, kl_beta=kl_beta)
     return loss, per_sample, counts, kl_sum, kl_tokens
+
+
+# ---------------------------------------------------------------------------
+# EXP-37: preference pairs (DPO)
+# ---------------------------------------------------------------------------
+
+
+def sequence_scores(model, batch: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(s [B], supervised-token counts [B]): s(y) = mean log-prob of each row's supervised tokens.
+
+    Exactly ``-per_sample_token_mean_loss``, i.e. the tokens the SFT cross-entropy
+    supervises (every assistant turn, ``<|im_end|>`` included); only those positions
+    are upcast, and the [L, V] logits go when this returns.
+    """
+    inputs = _to_device(batch, device)
+    labels = batch["labels"].to(device, non_blocking=True)
+    logits = model(**inputs, use_cache=False).logits
+    per_sample, counts = per_sample_token_mean_loss(logits, labels)
+    return -per_sample, counts
+
+
+def reference_scores(peft_model, batch: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """s_ref: the same peft model with the adapter disabled, no graph (as ``base_supervised_logits``)."""
+    with torch.no_grad(), adapter_off(peft_model):
+        return sequence_scores(peft_model, batch, device)
+
+
+def dpo_loss(s_pol_c: torch.Tensor, s_pol_r: torch.Tensor, s_ref_c: torch.Tensor, s_ref_r: torch.Tensor, *,
+             beta: float, nll_weight: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(per-pair loss, its DPO part, the margin), AVERT eq. 3-5 on length-normalised scores.
+
+    margin = (s_pol(c) - s_ref(c)) - (s_pol(r) - s_ref(r)); loss = -log sigmoid(beta * margin) - nll_weight * s_pol(c).
+    With the adapter at B = 0 every margin is exactly 0 and the loss is log 2 - nll_weight * s_pol(c).
+    """
+    margin = (s_pol_c - s_ref_c) - (s_pol_r - s_ref_r)
+    dpo = -F.logsigmoid(beta * margin)
+    return dpo - nll_weight * s_pol_c, dpo, margin
+
+
+def dpo_micro_batch_loss(
+    model,
+    peft_model,
+    batch: dict[str, Any],
+    device: torch.device,
+    *,
+    beta: float,
+    nll_weight: float,
+    pairs_per_rank_step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """(loss to backward, detached per-pair values) for one micro-batch of pairs (``collate_pairs``).
+
+    Four single-row forwards: the reference (adapter off, no graph) on chosen then rejected,
+    then the policy (``model``, with graph) on chosen then rejected.  The loss is the pairs'
+    sum over ``pairs_per_rank_step``, so a rank's accumulated gradient is the mean over its
+    pairs of the step and :func:`allreduce_mean_grads` makes it the global batch's mean.
+    """
+    chosen, rejected = batch["chosen"], batch["rejected"]
+    s_ref_c, _ = reference_scores(peft_model, chosen, device)
+    s_ref_r, _ = reference_scores(peft_model, rejected, device)
+    s_pol_c, counts_c = sequence_scores(model, chosen, device)
+    s_pol_r, counts_r = sequence_scores(model, rejected, device)
+    loss, dpo, margin = dpo_loss(s_pol_c, s_pol_r, s_ref_c, s_ref_r, beta=beta, nll_weight=nll_weight)
+    values = {
+        "loss": loss, "dpo": dpo, "margin": margin, "s_pol_c": s_pol_c, "s_pol_r": s_pol_r,
+        "s_ref_c": s_ref_c, "s_ref_r": s_ref_r, "tokens_c": counts_c, "tokens_r": counts_r,
+    }
+    return loss.sum() / pairs_per_rank_step, {k: v.detach() for k, v in values.items()}
+
+
+# Sums over a step's pairs, all-reduced once per step (fp32, as the SFT totals).
+DPO_TOTALS = ("loss", "dpo", "nll", "correct", "margin", "s_pol_c", "s_pol_r", "s_ref_c", "s_ref_r", "pairs",
+              "tokens_c", "tokens_r")
+
+
+def dpo_step_totals(values: dict[str, torch.Tensor]) -> torch.Tensor:
+    """One micro-batch's contribution to :data:`DPO_TOTALS`."""
+    sums = {
+        "loss": values["loss"].sum(), "dpo": values["dpo"].sum(), "nll": -values["s_pol_c"].sum(),
+        "correct": (values["margin"] > 0).sum(), "margin": values["margin"].sum(),
+        "s_pol_c": values["s_pol_c"].sum(), "s_pol_r": values["s_pol_r"].sum(),
+        "s_ref_c": values["s_ref_c"].sum(), "s_ref_r": values["s_ref_r"].sum(),
+        "pairs": torch.tensor(values["margin"].numel()), "tokens_c": values["tokens_c"].sum(),
+        "tokens_r": values["tokens_r"].sum(),
+    }
+    device = values["margin"].device
+    return torch.stack([sums[name].to(device=device, dtype=torch.float32) for name in DPO_TOTALS])
+
+
+def dpo_log_fields(totals: torch.Tensor, margin_abs_max: float, *, nll_weight: float) -> dict[str, Any]:
+    """The step's means over its pairs, for ``train_log.jsonl``.
+
+    ``zero_margin_loss`` = log 2 - nll_weight * mean s_pol(c), what the loss is when every margin
+    is 0: at step 1 (B = 0) ``loss`` must equal it and ``margin_abs_max`` must be 0.
+    """
+    t = dict(zip(DPO_TOTALS, (float(v) for v in totals.tolist())))
+    n = t["pairs"]
+    mean = lambda name: round(t[name] / n, 6)  # noqa: E731
+    return {
+        "loss": mean("loss"), "dpo_loss": mean("dpo"), "nll": mean("nll"), "reward_acc": mean("correct"),
+        "margin_mean": mean("margin"), "margin_abs_max": round(margin_abs_max, 6),
+        "s_pol_c": mean("s_pol_c"), "s_pol_r": mean("s_pol_r"), "s_ref_c": mean("s_ref_c"),
+        "s_ref_r": mean("s_ref_r"), "chosen_logratio": round((t["s_pol_c"] - t["s_ref_c"]) / n, 6),
+        "rejected_logratio": round((t["s_pol_r"] - t["s_ref_r"]) / n, 6),
+        "zero_margin_loss": round(math.log(2.0) + nll_weight * t["nll"] / n, 6),
+        "pairs": int(n), "tokens_c": int(t["tokens_c"]), "tokens_r": int(t["tokens_r"]),
+    }
+
+
+def broadcast_trainable(params: Sequence[torch.Tensor], rt: "Runtime") -> None:
+    """Rank 0's LoRA weights on every rank, the broadcast DDP makes when it wraps a model."""
+    if rt.distributed:
+        for p in params:
+            dist.broadcast(p.data, 0)
+
+
+def allreduce_mean_grads(params: Sequence[torch.Tensor], world_size: int, *, bucket_numel: int = 1 << 25) -> None:
+    """Each gradient := its mean over ranks (DDP's average), in flat fp32 buckets, once per optimizer step.
+
+    Every rank must call it with the same parameter list; a parameter no pair reached gets a
+    zero gradient so the collectives line up.
+    """
+    if world_size <= 1:
+        return
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+
+    def flush(bucket: list[torch.Tensor]) -> None:
+        flat = torch.cat([p.grad.reshape(-1) for p in bucket])
+        dist.all_reduce(flat)
+        flat.div_(world_size)
+        offset = 0
+        for p in bucket:
+            n = p.grad.numel()
+            p.grad.copy_(flat[offset : offset + n].view_as(p.grad))
+            offset += n
+
+    bucket: list[torch.Tensor] = []
+    size = 0
+    for p in params:
+        bucket.append(p)
+        size += p.grad.numel()
+        if size >= bucket_numel:
+            flush(bucket)
+            bucket, size = [], 0
+    if bucket:
+        flush(bucket)
 
 
 def warmup_cosine(total_steps: int, warmup_ratio: float):
@@ -915,6 +1069,7 @@ def open_stream(args: argparse.Namespace, rt: Runtime, stream: dict[str, Any], p
         shard_size=shard_size,
         wait_timeout_s=args.stream_wait_timeout,
         delete_consumed=not args.keep_stream,
+        pairs=args.objective == "dpo",
     )
 
 
@@ -951,6 +1106,11 @@ def train_from_stream(
     shard_size = int(stream["shard_size"])
     if args.limit_samples:
         raise RuntimeError("--limit-samples does not apply to a stream; pack a smaller stream or pass --max-steps")
+    pairs = is_pair_stream(stream)
+    if args.objective == "dpo" and not pairs:
+        raise RuntimeError(f"--objective dpo needs a pair stream (pairs: true); {args.stream_dir} is an SFT stream")
+    if args.objective != "dpo" and pairs:
+        raise RuntimeError(f"{args.stream_dir} is a pair stream (pairs: true); it trains only with --objective dpo")
     if int(stream["global_batch"]) != args.global_batch:
         raise RuntimeError(f"stream was packed for global batch {stream['global_batch']}, not {args.global_batch}")
     if shard_size % (args.global_batch) or args.global_batch % rt.world_size:
@@ -990,6 +1150,8 @@ def train_from_stream(
         hyper["kl_beta"] = args.kl_beta
     if args.keep_stream:  # the worker count fixes the read order a resume skips into
         hyper["num_workers"] = args.num_workers
+    if args.objective != "sft":  # absent for SFT, so older runs keep their run key
+        hyper.update(objective=args.objective, dpo_beta=args.dpo_beta, dpo_nll_weight=args.dpo_nll_weight)
     run_key = hashlib.sha256(json.dumps({"hyper": hyper, "stream": stream_sha256}, sort_keys=True).encode()).hexdigest()
     _log(rt, log_path, {"event": "data", "stream_dir": args.stream_dir, "holdout_scenes": list(holdout),
                         "selection": stream["selection"], "drawn": stream["drawn"], "total_steps": total_steps})
@@ -997,20 +1159,22 @@ def train_from_stream(
     def make_loader(processor, collate, epoch: int, offset: int, step: int):
         return stream_loader(args, rt, stream, processor, collate, step=step, log_path=log_path)
 
+    data_manifest = {
+        "stream_dir": str(Path(args.stream_dir).resolve()),
+        "stream_sha256": stream_sha256,
+        "record_roots": stream["record_roots"],
+        "label_roots": stream["label_roots"],
+        "replay_root": stream.get("replay_root", ""),
+        "selection": stream["selection"],
+        "drawn": stream["drawn"],
+    }
+    if pairs:
+        data_manifest.update(pairs=True, stream_schema=stream["schema"])
     return _fit(
         args, rt,
         output_dir=output_dir, log_path=log_path, started=started, holdout=holdout,
         hyper=hyper, run_key=run_key, total_steps=total_steps, steps_per_epoch=steps_per_epoch,
-        accum=accum, make_loader=make_loader,
-        data_manifest={
-            "stream_dir": str(Path(args.stream_dir).resolve()),
-            "stream_sha256": stream_sha256,
-            "record_roots": stream["record_roots"],
-            "label_roots": stream["label_roots"],
-            "replay_root": stream.get("replay_root", ""),
-            "selection": stream["selection"],
-            "drawn": stream["drawn"],
-        },
+        accum=accum, make_loader=make_loader, data_manifest=data_manifest,
     )
 
 
@@ -1057,8 +1221,13 @@ def _fit(
             step = restore_checkpoint(found[-1], peft_model, optimizer, scheduler, run_key=run_key)
             _log(rt, log_path, {"event": "resume", "checkpoint": str(found[-1]), "step": step})
 
+    dpo = args.objective == "dpo"
     ddp_model = peft_model
-    if rt.distributed:
+    if rt.distributed and dpo:
+        # Four forwards (two with a graph) per backward: no DDP reducer, the gradients are
+        # averaged by hand once per step (allreduce_mean_grads), DDP's start broadcast too.
+        broadcast_trainable(trainable, rt)
+    elif rt.distributed:
         from torch.nn.parallel import DistributedDataParallel
 
         # Every rank loads the same frozen weights from the same files, so only the
@@ -1074,7 +1243,7 @@ def _fit(
         )
     seed_everything(args.seed + 1009 * rt.rank + 7919 * step, rt.device)  # LoRA dropout differs per rank
 
-    collate = partial(collate_sft, pad_token_id=int(processor.tokenizer.pad_token_id))
+    collate = partial(collate_pairs if dpo else collate_sft, pad_token_id=int(processor.tokenizer.pad_token_id))
 
     accelerator = _accelerator(rt.device)
     if accelerator is not None and hasattr(accelerator, "reset_peak_memory_stats"):
@@ -1093,6 +1262,9 @@ def _fit(
             # CE loss sum, samples, supervised (CE) tokens, KL sum, KL tokens; fp32 because HCCL's fp64
             # support is not a given
             totals = torch.zeros(5, dtype=torch.float32, device=rt.device)
+            if dpo:
+                dpo_totals = torch.zeros(len(DPO_TOTALS), dtype=torch.float32, device=rt.device)
+                margin_abs_max = torch.zeros((), dtype=torch.float32, device=rt.device)
             micro_batches = []
             for micro in range(accum):
                 try:
@@ -1111,6 +1283,16 @@ def _fit(
                     dist.all_reduce(window_tokens)
                 token_scale = rt.world_size / window_tokens
             for micro, batch in enumerate(micro_batches):
+                if dpo:
+                    loss, values = dpo_micro_batch_loss(
+                        peft_model, peft_model, batch, rt.device,
+                        beta=args.dpo_beta, nll_weight=args.dpo_nll_weight,
+                        pairs_per_rank_step=args.micro_batch * accum,
+                    )
+                    loss.backward()
+                    dpo_totals += dpo_step_totals(values)
+                    margin_abs_max = torch.maximum(margin_abs_max, values["margin"].abs().max().float())
+                    continue
                 sync = micro == accum - 1 or not rt.distributed
                 with contextlib.nullcontext() if sync else ddp_model.no_sync():
                     loss, per_sample, counts, kl_sum, kl_tokens = micro_batch_loss(
@@ -1127,16 +1309,41 @@ def _fit(
                 if kl_sum is not None:
                     totals[3] += kl_sum.detach()
                     totals[4] += float(kl_tokens)
+            if dpo:
+                allreduce_mean_grads(trainable, rt.world_size)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
             window_steps += 1
-            if rt.distributed:
-                dist.all_reduce(totals)
-            last_loss = float(totals[0] / totals[1])
-            if step % args.log_every == 0 or step == total_steps:
+            if dpo:
+                if rt.distributed:
+                    dist.all_reduce(dpo_totals)
+                    dist.all_reduce(margin_abs_max, op=dist.ReduceOp.MAX)
+                dpo_fields = dpo_log_fields(dpo_totals, float(margin_abs_max), nll_weight=args.dpo_nll_weight)
+                last_loss = float(dpo_totals[DPO_TOTALS.index("loss")] / dpo_totals[DPO_TOTALS.index("pairs")])
+            else:
+                if rt.distributed:
+                    dist.all_reduce(totals)
+                last_loss = float(totals[0] / totals[1])
+            if (step % args.log_every == 0 or step == total_steps) and dpo:
+                if accelerator is not None and hasattr(accelerator, "synchronize"):
+                    accelerator.synchronize(rt.device)
+                elapsed = time.time() - window_start
+                _log(rt, log_path, {
+                    "event": "step",
+                    "step": step,
+                    "epoch": epoch,
+                    **dpo_fields,
+                    "lr": scheduler.get_last_lr()[0],
+                    "grad_norm": round(float(grad_norm), 6),
+                    "s_per_step": round(elapsed / window_steps, 3),
+                    "samples_per_s": round(window_steps * args.global_batch / max(elapsed, 1e-9), 3),
+                    **memory_stats_gib(rt.device),
+                })
+                window_start, window_steps = time.time(), 0
+            elif step % args.log_every == 0 or step == total_steps:
                 if accelerator is not None and hasattr(accelerator, "synchronize"):
                     accelerator.synchronize(rt.device)
                 elapsed = time.time() - window_start
@@ -1333,6 +1540,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="EXP-34: add BETA * KL(p_base || p_theta) on the supervised tokens of samples tagged "
                              "kl: true (p_base = adapter off), same denominator as the token-mean CE; "
                              "0 = the CE-only trainer exactly")
+    parser.add_argument("--objective", choices=("sft", "dpo"), default="sft",
+                        help="sft: cross-entropy on the stream's targets; dpo (EXP-37): AVERT's preference loss on "
+                             "a pair stream (pairs: true), reference = the same model with the adapter off")
+    parser.add_argument("--dpo-beta", type=float, default=0.5, help="--objective dpo: beta on the score margin")
+    parser.add_argument("--dpo-nll-weight", type=float, default=0.1,
+                        help="--objective dpo: lambda, the weight of -s_theta(chosen) added to every pair's loss")
     parser.add_argument("--global-batch", type=int, default=64)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=1.0, help="in weighted draws of len(selected) calls")
@@ -1366,6 +1579,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--kl-beta must be >= 0")
     if args.kl_beta > 0 and args.loss_normalization != "token":
         parser.error("--kl-beta shares the token-mean denominator: pass --loss-normalization token")
+    if args.objective == "dpo":
+        if not args.stream_dir:
+            parser.error("--objective dpo reads a pair stream: pass --stream-dir")
+        if args.kl_beta:
+            parser.error("--objective dpo has its own reference term; --kl-beta must be 0")
+        if args.loss_normalization != "sample":
+            parser.error("--objective dpo averages over pairs; --loss-normalization must stay 'sample'")
+        if args.micro_batch != 1:
+            parser.error("--objective dpo runs one pair per micro-batch: pass --micro-batch 1")
+        if not args.dpo_beta > 0 or args.dpo_nll_weight < 0:
+            parser.error("--dpo-beta must be > 0 and --dpo-nll-weight >= 0")
     return args
 
 

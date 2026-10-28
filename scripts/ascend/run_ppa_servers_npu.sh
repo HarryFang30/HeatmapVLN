@@ -62,6 +62,10 @@ NUM_INFERENCE_STEPS="${PPA_EVAL_NUM_INFERENCE_STEPS:-}"
 # native turns decide with it, Z0 is computed with it off.  Empty serves the released
 # System2.  The sha256 of its weights goes into servers.json and the servers report it.
 SYSTEM2_LORA="${PPA_EVAL_SYSTEM2_LORA:-}"
+# EXP-37 (rpc_model_server.py --system2_base_decides_stop): 1 lets the released System2
+# (the adapter off) decide STOP from its first greedy token on every call; the adapter
+# decodes everything else with STOP masked at its first position.  Needs the LoRA above.
+SYSTEM2_BASE_STOP="${PPA_EVAL_SYSTEM2_BASE_STOP:-0}"
 # Re-seed the VO device RNG at every episode.  Required for run-to-run reproducible
 # poses on Ascend, where the default device generator seed is not a constant.
 VO_RNG_SEED="${PPA_NPU_VO_RNG_SEED:-0}"
@@ -182,6 +186,10 @@ if [[ -n "$SYSTEM2_LORA" ]]; then
   SYSTEM2_LORA="$(cd "$SYSTEM2_LORA" && pwd)"
   SYSTEM2_LORA_SHA256="$(file_sha256 "$SYSTEM2_LORA/adapter_model.safetensors")" || die "could not hash $SYSTEM2_LORA"
 fi
+[[ "$SYSTEM2_BASE_STOP" =~ ^[01]$ ]] || die "PPA_EVAL_SYSTEM2_BASE_STOP must be 0 or 1"
+if [[ "$SYSTEM2_BASE_STOP" -eq 1 && -z "$SYSTEM2_LORA" ]]; then
+  die "PPA_EVAL_SYSTEM2_BASE_STOP=1 needs PPA_EVAL_SYSTEM2_LORA (without an adapter the base decides everything)"
+fi
 
 # What will actually sit on each card, checked before anything launches.  The
 # free-card read below cannot see this: it runs before this run's own servers exist,
@@ -226,6 +234,7 @@ declare -a MODEL_EXTRA=()
 [[ -n "$NUM_SAMPLE_TRAJS" ]] && MODEL_EXTRA+=(--nextdit_num_sample_trajs "$NUM_SAMPLE_TRAJS")
 [[ -n "$NUM_INFERENCE_STEPS" ]] && MODEL_EXTRA+=(--nextdit_num_inference_steps "$NUM_INFERENCE_STEPS")
 [[ -n "$SYSTEM2_LORA" ]] && MODEL_EXTRA+=(--system2_lora_adapter "$SYSTEM2_LORA")
+[[ "$SYSTEM2_BASE_STOP" -eq 1 ]] && MODEL_EXTRA+=(--system2_base_decides_stop)
 
 # Placeholders the train config expands on load; the eval never reads them.
 PLACEHOLDER_DIR="$RUNTIME_DIR/config_placeholders"
@@ -544,6 +553,12 @@ for slot in $(seq 0 $((NUM_SLOTS - 1))); do
       | grep -F "\"adapter_sha256\": \"$SYSTEM2_LORA_SHA256\"" >/dev/null \
       || die "model slot $slot lacks System2 LoRA evidence for sha256 $SYSTEM2_LORA_SHA256"
   fi
+  # EXP-37: the server's own start-up line, which it prints only after resolving the
+  # STOP ids from the tokenizer as single tokens.
+  if [[ "$SYSTEM2_BASE_STOP" -eq 1 ]]; then
+    grep -F "System2 base decides STOP enabled (stop ids " "$RUNTIME_DIR/logs/model_${slot}.log" >/dev/null \
+      || die "model slot $slot lacks System2 base-decides-STOP evidence"
+  fi
   # Every slot must be serving the same build, or the shards are not one arm.
   if [[ "${MODEL_VERSIONS[$slot]}" != "${MODEL_VERSIONS[0]}" ]]; then
     die "slot $slot reports model_version '${MODEL_VERSIONS[$slot]}' but slot 0 reports '${MODEL_VERSIONS[0]}'"
@@ -559,7 +574,7 @@ done
 "$PYTHON" - "$RUNTIME_DIR/servers.json" "$NUM_SLOTS" "$MODEL_PORT_BASE" "$VO_PORT_BASE" \
   "$NPU_CSV" "$VO_NPU_CSV" "$REPO_COMMIT" \
   "$VO_RNG_SEED" "$TIMING" "$BRIDGE_OFF" "$SERVER_INSTANCE" "${MODEL_VERSIONS[0]}" \
-  "$REPO_DIRTY" "$NUM_SAMPLE_TRAJS" "$NUM_INFERENCE_STEPS" "$SYSTEM2_LORA_SHA256" <<'PY'
+  "$REPO_DIRTY" "$NUM_SAMPLE_TRAJS" "$NUM_INFERENCE_STEPS" "$SYSTEM2_LORA_SHA256" "$SYSTEM2_BASE_STOP" <<'PY'
 import json
 import sys
 
@@ -567,6 +582,8 @@ import sys
  instance, model_version, dirty, num_sample_trajs, num_inference_steps) = sys.argv[1:16]
 # EXP-23, appended last so a record without it reads as "the released System2".
 system2_lora_sha256 = sys.argv[16] if len(sys.argv) > 16 else ""
+# EXP-37, likewise appended: a record without it reads as "the adapter decides STOP too".
+system2_base_stop = (sys.argv[17] if len(sys.argv) > 17 else "0") == "1"
 record = {
     "schema": "heatmapvln-npu-servers-v2",
     "slots": int(slots),
@@ -587,6 +604,8 @@ record = {
     "num_inference_steps": num_inference_steps,
     # sha256 of the System2 LoRA's adapter_model.safetensors; empty for the released System2.
     "system2_lora_sha256": system2_lora_sha256,
+    # EXP-37: the released System2 decides STOP (model_version ends in +base-stop-v1).
+    "system2_base_stop": system2_base_stop,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(record, handle, indent=2, sort_keys=True)
