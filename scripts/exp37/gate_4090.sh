@@ -6,7 +6,7 @@
 # X37_GATE_LANES (a GPU id per lane; two on one GPU share it, a process holds about 20 GB).  Rows resume.
 # G1 failing stops here: the one retry needs the 910B's cards and the training stream, neither of which is here.
 set -uo pipefail
-: "${X37_SHA:?the adapter's sha256}"
+: "${X37_SHA:?the sha256 of the adapter}"
 X=/workspace/exp37/run4090; SRC=/workspace/exp37/src_x37; PY=/opt/conda/bin/python
 G=$X/gate; ADAPTER=/workspace/exp37/x37_s400/adapter; PAIRS=/workspace/exp37/heldout_pairs_g1
 HM3D=/workspace/exp28/gates/hm3d_heldout; SCENES=/workspace/exp28/episodes/splits/heldout_scenes.txt
